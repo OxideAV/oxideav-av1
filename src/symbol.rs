@@ -57,16 +57,13 @@ impl<'a> SymbolDecoder<'a> {
             dif: 0,
             cnt: -15,
         };
-        // Seed the `dif` register by reading 15 bits.
-        me.dif = ((0x8000u32) << 1) ^ 0xFFFF; // placeholder (replaced below)
-                                              // Pre-load dif = (1<<15) - 1 - ReadBitsFromStream(15). Reading bits
-                                              // MSB-first from bytes.
+        // Seed `dif` per §9.3 init_symbol: dif = ((1 << 15) - 1) -
+        // ReadBitsFromStream(15), read MSB-first.
         let mut dif: u32 = 0;
         for _ in 0..15 {
             dif = (dif << 1) | me.read_bit();
         }
         me.dif = ((1 << 15) - 1) - dif;
-        // If dif ends up outside legal range the stream is broken.
         Ok(me)
     }
 
