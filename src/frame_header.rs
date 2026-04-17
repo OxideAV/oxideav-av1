@@ -1,21 +1,23 @@
 //! AV1 frame header OBU parser — §5.9.
 //!
-//! This is the most syntactically heavy header in AV1. We parse the leading
-//! fields exhaustively (enough to dispatch frame type, recover frame size,
-//! and emit codec parameters) and then stop at `tile_info()` — the
-//! quantizer, segmentation, loop filter, CDEF, restoration and global motion
-//! sections are skimmed only as far as needed for downstream tile-group
-//! payload framing. The latter sub-syntax is gated on flags from the
-//! sequence header and reference state, which we don't carry across frames
-//! in this initial parse-only crate.
+//! This is the most syntactically heavy header in AV1. We parse every
+//! field up to and including `tile_info()` (§5.9.15) — frame type,
+//! dimensions (with superres), render size, intrabc, interpolation filter,
+//! ref frame indices, tile column / row boundaries, and `TileSizeBytes`.
+//! The post-tile_info sub-sections (quantization, segmentation, deblock,
+//! CDEF, loop restoration, tx_mode, frame_reference_mode, skip_mode,
+//! global motion, film grain) are not parsed here; they are only needed
+//! for pixel reconstruction which lives outside this crate.
 //!
-//! For undecoded sub-sections we deliberately stop at a clearly-named
-//! boundary so the caller can tell where the parser gave up.
+//! The `frame_size_with_refs()` path (inter frame using reference-frame
+//! state) requires cross-frame state we don't yet carry — that case
+//! surfaces as `Error::Unsupported` with the exact §ref.
 
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::{ceil_log2, BitReader};
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
+use crate::tile_info::{mi_cols_rows, parse_tile_info, TileInfo};
 
 pub const NUM_REF_FRAMES: usize = 8;
 pub const REFS_PER_FRAME: usize = 7;
@@ -91,6 +93,11 @@ pub struct FrameHeader {
     pub allow_warped_motion: bool,
     pub reduced_tx_set: bool,
 
+    /// Parsed `tile_info()` (§5.9.15), when the parser advanced that far.
+    /// `None` for the `ShowExistingFrame` path and for frames where the
+    /// parser stopped earlier due to an unresolved dependency.
+    pub tile_info: Option<TileInfo>,
+
     /// Last successfully-parsed milestone — see `ParseDepth`.
     pub parse_depth: ParseDepth,
 }
@@ -104,6 +111,11 @@ pub enum ParseDepth {
     ShowExistingFrame,
     /// Fully parsed up to (but not including) `tile_info()`.
     UpToTileInfo,
+    /// Parsed through `tile_info()` (§5.9.15). All tile byte-boundary
+    /// information is available in `FrameHeader::tile_info`. Downstream
+    /// parsing (quantization, segmentation, loop filter, CDEF, LR, …)
+    /// is still out of scope for this crate.
+    ThroughTileInfo,
 }
 
 /// Parse a frame_header_obu / frame_obu payload. For OBU_FRAME the caller
@@ -111,6 +123,26 @@ pub enum ParseDepth {
 pub fn parse_frame_header(seq: &SequenceHeader, payload: &[u8]) -> Result<FrameHeader> {
     let mut br = BitReader::new(payload);
     parse_uncompressed_header(seq, &mut br)
+}
+
+/// Parse a frame_obu() payload (§5.10): `frame_header_obu()` followed by
+/// `byte_alignment()` then `tile_group_obu()`. Returns the parsed
+/// `FrameHeader` plus the byte offset into `payload` at which the tile
+/// group sub-OBU starts.
+pub fn parse_frame_obu<'a>(
+    seq: &SequenceHeader,
+    payload: &'a [u8],
+) -> Result<(FrameHeader, &'a [u8])> {
+    let mut br = BitReader::new(payload);
+    let fh = parse_uncompressed_header(seq, &mut br)?;
+    // `frame_obu()` applies byte_alignment() between the frame header and
+    // the tile_group sub-OBU.
+    br.byte_alignment()?;
+    let header_bytes = (br.bit_position() / 8) as usize;
+    if header_bytes > payload.len() {
+        return Err(Error::invalid("av1 frame_obu: header longer than payload"));
+    }
+    Ok((fh, &payload[header_bytes..]))
 }
 
 /// §5.9.1 uncompressed_header().
@@ -353,10 +385,18 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
         br.bit()?
     };
 
-    // We deliberately stop here. The remaining sub-sections (tile_info, quant,
-    // segmentation, deblock, cdef, lr, tx_mode, frame_reference_mode,
-    // skip_mode_params, global_motion_params, film_grain_params) are
-    // out of scope for parse-only.
+    // §5.9.15 tile_info() — comes immediately after
+    // `disable_frame_end_update_cdf`. The decoding-process calls in between
+    // (`init_non_coeff_cdfs`, `motion_field_estimation`, …) do not read
+    // bits from the stream.
+    let (mi_cols, mi_rows) = mi_cols_rows(frame_width, frame_height);
+    let tile_info = parse_tile_info(br, seq.use_128x128_superblock, mi_cols, mi_rows)?;
+    let parse_depth = ParseDepth::ThroughTileInfo;
+
+    // We stop here. The remaining sub-sections (quant, segmentation, deblock,
+    // cdef, lr, tx_mode, frame_reference_mode, skip_mode_params,
+    // global_motion_params, film_grain_params) are out of scope for this
+    // parse-only crate.
     let allow_warped_motion = false;
     let reduced_tx_set = false;
 
@@ -395,7 +435,8 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
         disable_frame_end_update_cdf,
         allow_warped_motion,
         reduced_tx_set,
-        parse_depth: ParseDepth::UpToTileInfo,
+        tile_info: Some(tile_info),
+        parse_depth,
     })
 }
 
@@ -445,6 +486,7 @@ fn finish_minimal(
         disable_frame_end_update_cdf: true,
         allow_warped_motion: false,
         reduced_tx_set: false,
+        tile_info: None,
         parse_depth,
     })
 }

@@ -1,21 +1,24 @@
 //! AV1 decoder shim.
 //!
-//! In this initial parse-only crate the decoder consumes packets and
-//! exercises the OBU + sequence-header + frame-header parsers, but never
-//! produces a video frame. Tile decode is the remaining work and dwarfs
-//! everything else (~20 KLOC of CDF / transforms / intra+inter prediction
-//! / loop restoration); see `tile_group::tile_decode_unsupported` for the
-//! exact §refs.
+//! The decoder consumes OBU streams, tracks the sequence header, parses
+//! the frame header through `tile_info()` (§5.9.15), and splits the
+//! `tile_group_obu()` payload into per-tile byte ranges accessible via
+//! `Av1Decoder::last_tile_payloads()`. Pixel reconstruction itself —
+//! partition walk + coefficient decode + prediction + transforms +
+//! deblock + CDEF + loop restoration — is not yet implemented. See
+//! `tile_group::tile_decode_unsupported` for the spec-section list the
+//! error message points at.
 
 use oxideav_codec::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 use crate::extradata::Av1CodecConfig;
-use crate::frame_header::{parse_frame_header, FrameHeader, FrameType};
+use crate::frame_header::{parse_frame_header, parse_frame_obu, FrameHeader};
 use crate::obu::{iter_obus, ObuType};
 use crate::sequence_header::{parse_sequence_header, SequenceHeader};
-use crate::tile_decode::TileDecoder;
-use crate::tile_group::tile_decode_unsupported;
+use crate::tile_group::{
+    parse_tile_group_header, split_tile_payloads, tile_decode_unsupported, TilePayload,
+};
 
 /// Build the registry-side decoder factory.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -28,6 +31,7 @@ pub struct Av1Decoder {
     last_frame_header: Option<FrameHeader>,
     last_error: Option<Error>,
     seen_frame: bool,
+    last_tile_payloads: Vec<TilePayload>,
 }
 
 impl Av1Decoder {
@@ -38,6 +42,7 @@ impl Av1Decoder {
             last_frame_header: None,
             last_error: None,
             seen_frame: false,
+            last_tile_payloads: Vec::new(),
         };
         // Bootstrap from extradata if present (av1C in MP4, codec private in
         // Matroska/WebM). Failures are recorded but not fatal at construction.
@@ -64,6 +69,15 @@ impl Av1Decoder {
         self.last_frame_header.as_ref()
     }
 
+    /// Tile byte-boundaries extracted from the most recently ingested
+    /// `OBU_FRAME` or `OBU_TILE_GROUP`. Each payload is described as an
+    /// `(offset, len)` pair; the offsets are relative to the `OBU_FRAME`
+    /// payload (for `OBU_TILE_GROUP` alone the caller owns the payload
+    /// buffer and can supply it explicitly).
+    pub fn last_tile_payloads(&self) -> &[TilePayload] {
+        &self.last_tile_payloads
+    }
+
     /// Walk the OBU stream in `packet.data`, updating internal state. Returns
     /// the first error encountered (if any).
     fn ingest(&mut self, data: &[u8]) -> Result<()> {
@@ -88,34 +102,57 @@ impl Av1Decoder {
                     let seq = self
                         .seq_header
                         .as_ref()
-                        .ok_or_else(|| Error::invalid("av1: frame_obu before sequence_header"))?;
-                    // OBU_FRAME = frame_header_obu() + tile_group_obu(). We
-                    // parse the header best-effort.
-                    let fh = parse_frame_header(seq, obu.payload)?;
-                    if !matches!(fh.frame_type, FrameType::Key | FrameType::Inter) {
-                        // Other frame types are syntactically supported; no-op.
-                    }
-                    self.last_frame_header = Some(fh.clone());
+                        .ok_or_else(|| Error::invalid("av1: frame_obu before sequence_header"))?
+                        .clone();
+                    // OBU_FRAME = frame_header_obu() + byte_alignment() +
+                    // tile_group_obu(). `parse_frame_obu` returns both the
+                    // header and the remaining tile-group payload slice.
+                    let (fh, tg_payload) = parse_frame_obu(&seq, obu.payload)?;
                     self.seen_frame = true;
-                    // Hand off to the tile-decode skeleton. Even though it
-                    // can't produce pixels yet, it surfaces a much more
-                    // precise §ref than `tile_decode_unsupported`. Pass an
-                    // empty payload if we couldn't compute the split;
-                    // `TileDecoder::new` will reject it.
-                    let seq_clone = seq.clone();
-                    let tile_payload = obu.payload;
-                    match TileDecoder::new(&seq_clone, &fh, tile_payload)
-                        .and_then(|mut td| td.decode())
-                    {
-                        Ok(_) => {}
-                        Err(Error::Unsupported(s)) => return Err(Error::Unsupported(s)),
-                        Err(e) => return Err(e),
+                    // Split the tile_group_obu into per-tile byte ranges so
+                    // callers can observe how many tiles the frame carries
+                    // and where each one lives, even though pixel decode is
+                    // still out of scope.
+                    if let Some(ti) = fh.tile_info.as_ref() {
+                        let tgh = parse_tile_group_header(tg_payload, ti)?;
+                        let mut tiles = split_tile_payloads(tg_payload, ti, &tgh)?;
+                        // Re-base offsets from the tile_group payload to the
+                        // enclosing OBU_FRAME payload for easier downstream
+                        // consumption (first-tile offset = frame-header +
+                        // tg-header length).
+                        let frame_header_len = obu.payload.len() - tg_payload.len();
+                        for t in &mut tiles {
+                            t.offset += frame_header_len;
+                        }
+                        self.last_tile_payloads = tiles;
+                    } else {
+                        self.last_tile_payloads.clear();
                     }
+                    self.last_frame_header = Some(fh);
+                    // Headers + tile boundaries are now available via
+                    // `last_frame_header()` / `last_tile_payloads()`.
+                    // Decoder body (partition tree + coefficient decode +
+                    // transforms + prediction + loop filter + CDEF + LR)
+                    // is not yet implemented.
+                    return Err(tile_decode_unsupported());
                 }
                 ObuType::TileGroup => {
-                    // Without a tile-payload boundary extracted from the
-                    // enclosing OBU_FRAME it's not safe to drive the tile
-                    // decoder here. Surface the historical message.
+                    // The frame header for this OBU_TILE_GROUP must have
+                    // been supplied by a preceding OBU_FRAME_HEADER. If we
+                    // have it (and therefore the tile geometry) we split
+                    // per-tile boundaries; if not we surface the historical
+                    // message.
+                    let Some(fh) = self.last_frame_header.as_ref() else {
+                        return Err(Error::invalid(
+                            "av1: OBU_TILE_GROUP without preceding frame_header",
+                        ));
+                    };
+                    let Some(ti) = fh.tile_info.as_ref() else {
+                        return Err(tile_decode_unsupported());
+                    };
+                    let tgh = parse_tile_group_header(obu.payload, ti)?;
+                    let tiles = split_tile_payloads(obu.payload, ti, &tgh)?;
+                    self.last_tile_payloads = tiles;
                     return Err(tile_decode_unsupported());
                 }
                 ObuType::Metadata | ObuType::TileList => {
@@ -168,6 +205,7 @@ impl Decoder for Av1Decoder {
         self.last_frame_header = None;
         self.last_error = None;
         self.seen_frame = false;
+        self.last_tile_payloads.clear();
         Ok(())
     }
 }

@@ -9,11 +9,13 @@
 //! filter §7.14, CDEF §7.15, loop restoration §7.17, super-resolution
 //! §7.16, film grain §7.20).
 //!
-//! This module is the **skeleton**. It runs as far as the symbol decoder
-//! initialisation and the partition decision for the first superblock,
-//! then returns a precise `Error::Unsupported` pointing at the next
-//! unimplemented step. Each boundary error names the exact spec clause so
-//! future work can pick up exactly where we stop.
+//! This module is the **skeleton** that pixel-reconstruction work will
+//! attach to. It initialises the symbol decoder, computes the superblock
+//! grid, and returns a precise `Error::Unsupported` at the first
+//! unimplemented step. Tile byte-boundaries (which tile a given range of
+//! compressed bytes belongs to) are a separate responsibility and live
+//! in [`crate::tile_group`] + [`crate::tile_info`]; they already work on
+//! real streams.
 //!
 //! The output target is `Yuv420P`. Pixel reconstruction for real frames
 //! will require shipping the remaining dozen or so features — this file

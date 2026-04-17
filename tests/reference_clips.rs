@@ -19,7 +19,8 @@
 use std::path::Path;
 
 use oxideav_av1::{
-    iter_obus, parse_frame_header, parse_sequence_header, Av1CodecConfig, Av1Decoder, ObuType,
+    iter_obus, parse_frame_header, parse_frame_obu, parse_sequence_header, Av1CodecConfig,
+    Av1Decoder, ObuType,
 };
 use oxideav_core::{CodecId, CodecParameters, Error, Packet, TimeBase};
 
@@ -200,6 +201,63 @@ fn decoder_extradata_picks_up_seq_header() {
     let sh = dec.sequence_header().expect("seq header from extradata");
     assert_eq!(sh.max_frame_width, 64);
     assert_eq!(sh.max_frame_height, 64);
+}
+
+#[test]
+fn frame_header_carries_tile_info_single_tile_clip() {
+    let Some(data) = read_fixture("/tmp/av1.ivf") else {
+        return;
+    };
+    let obus = ivf_concat_obus(&data).expect("ivf parse");
+    let mut sh = None;
+    let mut seen_tile_info = 0usize;
+    for o in iter_obus(&obus) {
+        let o = o.expect("obu parse");
+        match o.header.obu_type {
+            ObuType::SequenceHeader => {
+                sh = Some(parse_sequence_header(o.payload).expect("seq"));
+            }
+            ObuType::Frame => {
+                let s = sh.as_ref().expect("seq before frame");
+                let (fh, tg) = parse_frame_obu(s, o.payload).expect("parse_frame_obu");
+                let ti = fh.tile_info.as_ref().expect("tile_info present");
+                // Clip is 64x64 with --tile-columns=0 --tile-rows=0 → 1 tile.
+                assert_eq!(ti.tile_cols, 1, "expected 1 tile column");
+                assert_eq!(ti.tile_rows, 1, "expected 1 tile row");
+                assert_eq!(ti.tile_size_bytes, 0, "single tile omits size bytes");
+                assert!(
+                    !tg.is_empty(),
+                    "OBU_FRAME should have a tile_group payload for a non-empty frame"
+                );
+                seen_tile_info += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        seen_tile_info >= 1,
+        "expected at least one OBU_FRAME carrying tile_info"
+    );
+}
+
+#[test]
+fn decoder_exposes_tile_boundaries_for_single_tile_clip() {
+    let Some(data) = read_fixture("/tmp/av1.ivf") else {
+        return;
+    };
+    let obus = ivf_concat_obus(&data).expect("ivf parse");
+
+    let params = CodecParameters::video(CodecId::new(oxideav_av1::CODEC_ID_STR));
+    let mut dec = Av1Decoder::new(params);
+    let pkt = Packet::new(0, TimeBase::new(1, 24), obus);
+    // send_packet surfaces Unsupported because tile decode isn't
+    // implemented, but the tile byte-boundaries ARE extracted before the
+    // error is returned.
+    let _ = <Av1Decoder as oxideav_codec::Decoder>::send_packet(&mut dec, &pkt);
+    let tiles = dec.last_tile_payloads();
+    assert_eq!(tiles.len(), 1, "expected one tile from single-tile clip");
+    assert_eq!(tiles[0].tile_num, 0);
+    assert!(tiles[0].len > 0, "tile payload should be non-empty");
 }
 
 #[test]
