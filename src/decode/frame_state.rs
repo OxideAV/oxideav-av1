@@ -46,10 +46,9 @@ pub struct ModeInfo {
 
 /// Mutable per-frame decoder state.
 ///
-/// Carries the MI grid dimensions + per-MI-unit mode info. The shape
-/// is intentionally smaller than goavif's `FrameState`: there are no
-/// Y/U/V pixel planes and no CDEF index grid because Phase 2 stops
-/// before any pixel is reconstructed.
+/// Carries the MI grid dimensions + per-MI-unit mode info plus
+/// reconstructed Y/U/V plane buffers. Plane strides equal the plane
+/// widths (no left/right padding).
 pub struct FrameState {
     pub width: u32,
     pub height: u32,
@@ -65,6 +64,17 @@ pub struct FrameState {
     pub monochrome: bool,
     /// Sample bit depth — 8, 10, or 12.
     pub bit_depth: u32,
+    /// Luma plane — row-major `width * height` bytes (8-bit only in
+    /// Phase 3; 10/12-bit lands when the bit-depth plumbing does).
+    pub y_plane: Vec<u8>,
+    /// U plane — row-major `uv_width * uv_height` bytes.
+    pub u_plane: Vec<u8>,
+    /// V plane — row-major `uv_width * uv_height` bytes.
+    pub v_plane: Vec<u8>,
+    /// UV plane width after subsampling.
+    pub uv_width: u32,
+    /// UV plane height after subsampling.
+    pub uv_height: u32,
 }
 
 impl FrameState {
@@ -91,6 +101,16 @@ impl FrameState {
         let mi_cols = (width + 3) >> 2;
         let mi_rows = (height + 3) >> 2;
         let mi_len = (mi_cols as usize) * (mi_rows as usize);
+        let uv_width = if monochrome {
+            0
+        } else {
+            (width + sub_x) >> sub_x
+        };
+        let uv_height = if monochrome {
+            0
+        } else {
+            (height + sub_y) >> sub_y
+        };
         Self {
             width,
             height,
@@ -101,6 +121,19 @@ impl FrameState {
             sub_y,
             monochrome,
             bit_depth,
+            y_plane: vec![0u8; (width as usize) * (height as usize)],
+            u_plane: if monochrome {
+                Vec::new()
+            } else {
+                vec![0u8; (uv_width as usize) * (uv_height as usize)]
+            },
+            v_plane: if monochrome {
+                Vec::new()
+            } else {
+                vec![0u8; (uv_width as usize) * (uv_height as usize)]
+            },
+            uv_width,
+            uv_height,
         }
     }
 

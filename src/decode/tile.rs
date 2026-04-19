@@ -23,6 +23,7 @@ use crate::sequence_header::SequenceHeader;
 use crate::symbol::SymbolDecoder;
 use crate::tile_group::{parse_tile_group_header, split_tile_payloads, TilePayload};
 
+use super::coeffs::{q_index_to_ctx, CoeffCdfBank};
 use super::frame_state::FrameState;
 use super::modes::{IntraMode, INTRA_MODES, UV_MODES};
 use super::superblock;
@@ -83,6 +84,8 @@ pub struct TileDecoder<'a> {
     pub cfl_sign_cdf: Vec<u16>,
     pub cfl_alpha_cdf: Vec<Vec<u16>>,
     pub seg_cdf: Vec<Vec<u16>>,
+    /// Coefficient-CDF bank — all of §5.11.39's CDFs in one place.
+    pub coeff_bank: CoeffCdfBank,
 }
 
 impl<'a> TileDecoder<'a> {
@@ -99,6 +102,8 @@ impl<'a> TileDecoder<'a> {
         let allow_update = !frame.disable_cdf_update;
         let symbol = SymbolDecoder::new(tile_data, sz, allow_update)?;
         let sb_size = if seq.use_128x128_superblock { 128 } else { 64 };
+        let q_ctx = q_index_to_ctx(frame.quant.base_q_idx as i32);
+        let coeff_bank = CoeffCdfBank::new(q_ctx);
         let mut td = Self {
             seq,
             frame,
@@ -112,6 +117,7 @@ impl<'a> TileDecoder<'a> {
             cfl_sign_cdf: Vec::new(),
             cfl_alpha_cdf: Vec::new(),
             seg_cdf: Vec::new(),
+            coeff_bank,
         };
         td.init_cdfs();
         Ok(td)

@@ -1,45 +1,25 @@
-//! AV1 (AOMedia Video 1) — pure-Rust parse-only crate for oxideav.
+//! AV1 (AOMedia Video 1) — pure-Rust decoder for oxideav.
 //!
-//! Status: **parses every OBU up to and including `tile_info()` plus the
-//! `tile_group_obu()` framing header**, extracts per-tile byte boundaries,
-//! and stops before pixel reconstruction. Pixel decode is the bulk of an
-//! AV1 decoder (~20 KLOC of CDF + transforms + intra/inter prediction +
-//! deblock + CDEF + LR) and lands incrementally. What this crate does
-//! today:
+//! Phase 3 scope (this revision): OBU walk + sequence/frame headers +
+//! tile partition walk + mode decode + coefficient decode +
+//! dequantisation + inverse transform (4/8/16 DCT+ADST) + clip-add
+//! pixel reconstruction. A leaf block ≤ 16×16 with a decode-from-
+//! neighbors intra predictor (DC / V / H) completes end-to-end.
 //!
-//! * Walks the OBU stream (§5.3) and surfaces typed `Obu` values.
-//! * Parses sequence header OBUs (§5.5) — full color config, operating
-//!   points, all enable flags, optional timing / decoder model info.
-//! * Parses frame header OBUs (§5.9) fully including `tile_info()`
-//!   (§5.9.15) — frame type, dimensions (with superres), render size,
-//!   intrabc, interpolation filter, ref frame indices, tile column / row
-//!   boundaries, `TileSizeBytes`.
-//! * Parses the `OBU_FRAME` payload as `frame_header_obu() +
-//!   byte_alignment() + tile_group_obu()`, extracting per-tile byte
-//!   ranges via `split_tile_payloads()` / `parse_tile_group_header()`.
-//! * Parses the AV1CodecConfigurationRecord (`av1C`) used by MP4 and
-//!   Matroska, including the embedded sequence-header config OBU.
-//! * Registers a `Decoder` factory that ingests OBU streams and exposes
-//!   header-level state via `Av1Decoder::sequence_header()` /
-//!   `last_frame_header()` / `last_tile_payloads()`.
-//! * Ships the primitives that pixel reconstruction will call:
-//!     - Symbol (range / arithmetic) decoder (§4.10.4 + §9.3).
-//!     - Inverse 4×4 and 8×8 DCT-DCT transforms (§7.7).
-//!     - `DC_PRED` / `V_PRED` / `H_PRED` intra predictors (§7.11.2).
+//! Still deferred:
 //!
-//! `receive_frame()` returns `Error::Unsupported` because the following
-//! clauses are still unimplemented:
-//!
-//! * Default CDF tables (§9.4.1 / §9.4.2).
-//! * Partition quadtree walk + `decode_block()` (§5.11.4 – §5.11.14).
-//! * Coefficient decode + dequantisation (§5.11.39 / §7.12).
-//! * Transforms 16×16 / 32×32 / 64×64 plus the ADST / flipped-ADST /
-//!   identity / WHT / mixed paths (§7.7).
-//! * The other 10 intra prediction modes (directional, smooth, paeth)
-//!   (§7.11.2).
-//! * Inter prediction, compound modes (§7.11.3).
-//! * Quantisation / segmentation / loop filter / CDEF / loop restoration
-//!   / film grain (§5.9.16 – §5.9.22, §7.13 – §7.17, §7.20).
+//! * Transform sizes 32/64 + WHT + mixed V/H-identity (Phase 4,
+//!   §7.7 subclauses).
+//! * TX splitting for leaf blocks > 16×16 (§5.11.27, Phase 4).
+//! * The other 10 intra predictors — directional / smooth / paeth
+//!   (§7.11.2, Phase 5). Currently those modes fall back to DC to
+//!   keep the pipeline running; Phase 5 closes the fidelity gap.
+//! * Inter prediction (§7.11.3, Phase 6).
+//! * Segmentation Q overrides beyond SEG_LVL_ALT_Q; loop filter /
+//!   CDEF / LR / film grain (§7.13 – §7.17, §7.20, Phase 7).
+//! * Quantisation matrices (§5.9.12) — surfaces Unsupported when
+//!   `using_qmatrix` is set in the bitstream.
+//! * 10-/12-bit sample reconstruction (Phase 3 wires only 8-bit).
 //!
 //! Every error message includes the precise §ref so callers can see
 //! exactly where the decoder stopped.
@@ -56,6 +36,7 @@ pub mod frame_header;
 pub mod frame_header_tail;
 pub mod intra;
 pub mod obu;
+pub mod quant;
 pub mod sequence_header;
 pub mod symbol;
 pub mod tile_group;
@@ -69,12 +50,13 @@ pub const CODEC_ID_STR: &str = "av1";
 
 /// Register the AV1 decoder factory with a codec registry.
 ///
-/// The implementation declares `av1_sw_parse` to make it visible in
-/// `oxideav list` style output that this is the parse-and-frame build —
-/// headers, tile_info, and tile byte-boundaries are produced, but pixel
-/// reconstruction is still out of scope.
+/// The implementation declares `av1_sw_phase3` to make the build
+/// visible in `oxideav list`-style output: headers + partition walk +
+/// mode + coefficient decode + reconstruction for 4/8/16 TX blocks
+/// land, but 32/64 TX + TX splitting + the full intra predictor set
+/// are still deferred (see crate-level doc comment).
 pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("av1_sw_parse")
+    let caps = CodecCapabilities::video("av1_sw_phase3")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(16384, 16384);

@@ -16,9 +16,11 @@
 
 pub mod block;
 pub mod coeff_ctx;
+pub mod coeffs;
 pub mod frame_state;
 pub mod modes;
 pub mod partition;
+pub mod reconstruct;
 pub mod superblock;
 pub mod tile;
 pub mod tx_type_map;
