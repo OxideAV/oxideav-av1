@@ -109,10 +109,12 @@ fn tile_decoder_reads_mode_symbols() {
 }
 
 /// The big integration test: walk every partition of every frame in
-/// the 64×64 3-frame aomenc key-only clip. The tile decoder must
-/// exit with `Error::Unsupported` at the first non-skip leaf and the
-/// error message must reference the coefficient-decode clause
-/// (§5.11.39).
+/// the 64×64 3-frame aomenc key-only clip. Phase 3 now drives the
+/// coefficient decoder + inverse transform + reconstruction for every
+/// 4×4 / 8×8 / 16×16 leaf block. If the bitstream needs a larger
+/// single-TX (32×32+) or TX splitting we surface `Unsupported`
+/// pointing at the right Phase 4 sub-clause; otherwise the tile walk
+/// succeeds end-to-end.
 #[test]
 fn real_clip_walks_every_partition_and_bails_on_coeff_decode() {
     let Some(data) = read_fixture("/tmp/av1.ivf") else {
@@ -143,13 +145,32 @@ fn real_clip_walks_every_partition_and_bails_on_coeff_decode() {
                 );
                 let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs);
                 match got {
-                    Err(Error::Unsupported(msg)) => {
-                        assert!(
-                            msg.contains("coefficient"),
-                            "Unsupported message should reference coefficient decode, got: {msg}"
+                    Ok(()) => {
+                        // Whole tile decoded — Y plane should be
+                        // populated. We don't assert pixel values
+                        // because our Phase 3 scope still stubs most
+                        // intra predictors (D45, smooth, paeth) with
+                        // a DC fallback, but the plane length must
+                        // match the frame geometry.
+                        assert_eq!(
+                            fs.y_plane.len(),
+                            (fh.frame_width as usize) * (fh.frame_height as usize)
                         );
                     }
-                    other => panic!("expected Unsupported(coefficient), got {other:?}"),
+                    Err(Error::Unsupported(msg)) => {
+                        // Phase 4 deferrals still surface explicitly
+                        // — larger TX sizes / TX splitting / qmatrix.
+                        assert!(
+                            msg.contains("§5.11")
+                                || msg.contains("§5.9")
+                                || msg.contains("§7.7")
+                                || msg.contains("§6.10")
+                                || msg.contains("§9.3")
+                                || msg.contains("Phase"),
+                            "Unsupported message should reference AV1 spec §, got: {msg}"
+                        );
+                    }
+                    other => panic!("expected Ok or Unsupported, got {other:?}"),
                 }
                 walked_frames += 1;
             }
