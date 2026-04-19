@@ -49,6 +49,7 @@
 
 pub mod bitreader;
 pub mod cdfs;
+pub mod decode;
 pub mod decoder;
 pub mod extradata;
 pub mod frame_header;
@@ -57,7 +58,6 @@ pub mod intra;
 pub mod obu;
 pub mod sequence_header;
 pub mod symbol;
-pub mod tile_decode;
 pub mod tile_group;
 pub mod tile_info;
 pub mod transform;
