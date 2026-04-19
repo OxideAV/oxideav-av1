@@ -14,7 +14,6 @@
 
 use oxideav_av1::intra::{predict, IntraMode, Neighbours};
 use oxideav_av1::transform::{inverse_transform_add, TxType};
-use oxideav_core::Error;
 
 #[test]
 fn dc_pred_solid_patch_matches_spec_average() {
@@ -27,7 +26,7 @@ fn dc_pred_solid_patch_matches_spec_average() {
         left: Some(&left),
     };
     let mut dst = [0u8; 16];
-    predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
+    predict(IntraMode::DcPred, n, 4, 4, &mut dst, 4).unwrap();
     for &v in &dst {
         assert_eq!(v, 200, "DC_PRED must collapse a uniform border to itself");
     }
@@ -44,7 +43,7 @@ fn dc_pred_asymmetric_neighbours_round_to_spec() {
         left: Some(&left),
     };
     let mut dst = [0u8; 16];
-    predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
+    predict(IntraMode::DcPred, n, 4, 4, &mut dst, 4).unwrap();
     for &v in &dst {
         assert_eq!(v, 128, "asymmetric neighbours round per AV1 DC formula");
     }
@@ -58,7 +57,7 @@ fn v_pred_produces_vertical_stripes() {
         left: None,
     };
     let mut dst = [0u8; 16];
-    predict(IntraMode::V, n, 4, 4, &mut dst, 4).unwrap();
+    predict(IntraMode::VPred, n, 4, 4, &mut dst, 4).unwrap();
     for row in 0..4 {
         for c in 0..4 {
             assert_eq!(dst[row * 4 + c], above[c]);
@@ -74,7 +73,7 @@ fn h_pred_produces_horizontal_stripes() {
         left: Some(&left),
     };
     let mut dst = [0u8; 16];
-    predict(IntraMode::H, n, 4, 4, &mut dst, 4).unwrap();
+    predict(IntraMode::HPred, n, 4, 4, &mut dst, 4).unwrap();
     for row in 0..4 {
         for c in 0..4 {
             assert_eq!(dst[row * 4 + c], left[row]);
@@ -94,7 +93,7 @@ fn inverse_dct_zero_residual_preserves_predictor() {
         left: Some(&left),
     };
     let mut dst = [0u8; 16];
-    predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
+    predict(IntraMode::DcPred, n, 4, 4, &mut dst, 4).unwrap();
     let zero_coeffs = [0i32; 16];
     inverse_transform_add(TxType::DctDct, 4, 4, &zero_coeffs, &mut dst, 4).unwrap();
     for &v in &dst {
@@ -114,7 +113,7 @@ fn inverse_dct_8x8_zero_residual_preserves_predictor() {
         left: Some(&left),
     };
     let mut dst = [0u8; 64];
-    predict(IntraMode::Dc, n, 8, 8, &mut dst, 8).unwrap();
+    predict(IntraMode::DcPred, n, 8, 8, &mut dst, 8).unwrap();
     let zero_coeffs = [0i32; 64];
     inverse_transform_add(TxType::DctDct, 8, 8, &zero_coeffs, &mut dst, 8).unwrap();
     for &v in &dst {
@@ -136,7 +135,7 @@ fn full_solid_colour_path_yields_uniform_block() {
         left: Some(&left),
     };
     let mut block = [0u8; 16];
-    predict(IntraMode::Dc, n, 4, 4, &mut block, 4).unwrap();
+    predict(IntraMode::DcPred, n, 4, 4, &mut block, 4).unwrap();
     let zero = [0i32; 16];
     inverse_transform_add(TxType::DctDct, 4, 4, &zero, &mut block, 4).unwrap();
     for &v in &block {
@@ -148,25 +147,37 @@ fn full_solid_colour_path_yields_uniform_block() {
 }
 
 #[test]
-fn unsupported_intra_modes_have_precise_error_text() {
+fn all_intra_modes_produce_valid_output() {
+    // Phase 5 implements every intra predictor — no more Unsupported
+    // surface (CFL is exposed separately via predict::intra::cfl_pred).
+    // Any mode on a 4×4 block with flat neighbours should return clean
+    // u8 data in the [0, 255] range.
+    let above = [120u8; 4];
+    let left = [130u8; 4];
     let n = Neighbours {
-        above: None,
-        left: None,
+        above: Some(&above),
+        left: Some(&left),
     };
     let mut dst = [0u8; 16];
     for m in [
-        IntraMode::Paeth,
-        IntraMode::Smooth,
-        IntraMode::D45,
-        IntraMode::D135,
+        IntraMode::DcPred,
+        IntraMode::VPred,
+        IntraMode::HPred,
+        IntraMode::D45Pred,
+        IntraMode::D67Pred,
+        IntraMode::D113Pred,
+        IntraMode::D135Pred,
+        IntraMode::D157Pred,
+        IntraMode::D203Pred,
+        IntraMode::SmoothPred,
+        IntraMode::SmoothVPred,
+        IntraMode::SmoothHPred,
+        IntraMode::PaethPred,
     ] {
-        match predict(m, n, 4, 4, &mut dst, 4) {
-            Err(Error::Unsupported(s)) => {
-                assert!(s.contains(m.name()), "msg should name mode: {s}");
-                assert!(s.contains("§7.11.2"), "msg should ref §7.11.2: {s}");
-            }
-            other => panic!("expected Unsupported for {}, got {:?}", m.name(), other),
+        for v in dst.iter_mut() {
+            *v = 0;
         }
+        predict(m, n, 4, 4, &mut dst, 4).unwrap_or_else(|e| panic!("{}: {:?}", m.name(), e));
     }
 }
 
@@ -178,7 +189,7 @@ fn unsupported_transform_sizes_have_precise_error_text() {
     let coeffs = vec![0i32; 24 * 24];
     let mut dst = vec![0u8; 24 * 24];
     match inverse_transform_add(TxType::DctDct, 24, 24, &coeffs, &mut dst, 24) {
-        Err(Error::Unsupported(s)) => {
+        Err(oxideav_core::Error::Unsupported(s)) => {
             assert!(s.contains("24"), "msg should name size: {s}");
             assert!(s.contains("§7.7"), "msg should ref §7.7: {s}");
         }

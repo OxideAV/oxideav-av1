@@ -1,28 +1,19 @@
 //! AV1 superblock + leaf-block mode decoder + reconstruction —
-//! §5.11.4 + §5.11.8 + §5.11.18 + §5.11.39 + §7.7.
+//! §5.11.4 + §5.11.8 + §5.11.18 + §5.11.39 + §7.7 + §7.11.
 //!
 //! Ported from `github.com/KarpelesLab/goavif/av1/decoder/superblock.go`
-//! (MIT, KarpelesLab/goavif). Phase 3 lands coefficient decode +
-//! dequantisation + inverse transform + clip-add, replacing Phase 2's
-//! `Error::Unsupported("av1 coefficient decode pending (§5.11.39)")`
-//! bailout.
-//!
-//! Phase 3 scope:
-//!
-//! - Intra prediction: only `DC_PRED`, `V_PRED`, `H_PRED` are
-//!   implemented (via [`crate::intra::predict`]). Any other mode on a
-//!   non-skip block surfaces `Error::Unsupported` with `§7.11.2` in
-//!   the message.
-//! - Transform sizes: 4×4 / 8×8 / 16×16 (DCT_DCT only for Phase 3 —
-//!   ADST / mixed / flipped variants are decoded but silently fallback
-//!   to DCT_DCT when [`crate::transform::inverse_2d`] rejects them,
-//!   matching goavif's safety net).
-//! - Block sizes: leaf blocks ≤ 16×16 go through the single-TX path.
-//!   Larger leaf blocks surface `Error::Unsupported` citing §5.11.39.
+//! (MIT, KarpelesLab/goavif). Phase 5 wires the full intra predictor
+//! set (DC/V/H + 6 directional + 3 smooth + Paeth + CFL) and native
+//! 10/12-bit HBD paths; the pre-Phase-5 DC_PRED fallback is gone.
 
 use oxideav_core::{Error, Result};
 
-use crate::intra;
+use crate::predict::intra::{
+    cfl_pred, cfl_pred16, cfl_subsample, cfl_subsample16, dc_pred, dc_pred16, directional_pred,
+    directional_pred16, h_pred, h_pred16, mode_to_angle_map, paeth_pred, paeth_pred16,
+    smooth_h_pred, smooth_h_pred16, smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16,
+    v_pred, v_pred16,
+};
 use crate::quant;
 use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
 
@@ -164,29 +155,6 @@ pub fn decode_partition_node(
     }
 }
 
-/// Map a decoder-mode [`IntraMode`] to the intra predictor's
-/// [`intra::IntraMode`] enum.
-fn to_intra_mode(m: IntraMode) -> intra::IntraMode {
-    match m {
-        IntraMode::DcPred => intra::IntraMode::Dc,
-        IntraMode::VPred => intra::IntraMode::V,
-        IntraMode::HPred => intra::IntraMode::H,
-        IntraMode::D45Pred => intra::IntraMode::D45,
-        IntraMode::D135Pred => intra::IntraMode::D135,
-        IntraMode::D113Pred => intra::IntraMode::D113,
-        IntraMode::D157Pred => intra::IntraMode::D157,
-        IntraMode::D203Pred => intra::IntraMode::D203,
-        IntraMode::D67Pred => intra::IntraMode::D67,
-        IntraMode::SmoothPred => intra::IntraMode::Smooth,
-        IntraMode::SmoothVPred => intra::IntraMode::SmoothV,
-        IntraMode::SmoothHPred => intra::IntraMode::SmoothH,
-        IntraMode::PaethPred => intra::IntraMode::Paeth,
-        // CFL has no direct equivalent — caller should route to DC_PRED
-        // and apply the CFL-alpha on top. Phase 3 treats this as DC.
-        IntraMode::CflPred => intra::IntraMode::Dc,
-    }
-}
-
 /// Decode a single leaf coding block — §5.11.8 `decode_block`.
 pub fn decode_leaf_block(
     td: &mut TileDecoder<'_>,
@@ -307,9 +275,7 @@ pub fn decode_leaf_block(
     }
 
     // Luma path.
-    reconstruct_luma_block(
-        td, fs, x, y, bw, bh, y_mode, skip, segment_id,
-    )?;
+    reconstruct_luma_block(td, fs, x, y, bw, bh, y_mode, angle_delta_y, skip, segment_id)?;
 
     // Chroma path.
     if !fs.monochrome && num_planes >= 3 {
@@ -321,6 +287,7 @@ pub fn decode_leaf_block(
             bw,
             bh,
             uv_mode,
+            angle_delta_uv,
             skip,
             cfl_alpha_u,
             cfl_alpha_v,
@@ -342,6 +309,7 @@ fn reconstruct_luma_block(
     bw: u32,
     bh: u32,
     y_mode: IntraMode,
+    angle_delta: i8,
     skip: bool,
     segment_id: u8,
 ) -> Result<()> {
@@ -349,50 +317,46 @@ fn reconstruct_luma_block(
     let h = bh as usize;
     let stride = fs.width as usize;
 
+    // Predict + paste.
     if fs.bit_depth == 8 {
-        // Gather neighbor samples for intra prediction.
-        let (above_vec, left_vec) = gather_neighbors(
+        let pred = run_intra_prediction_u8(
             &fs.y_plane,
-            fs.width as usize,
+            stride,
             fs.height as usize,
             x as usize,
             y as usize,
             w,
             h,
+            y_mode,
+            angle_delta,
+            128,
         );
-        let pred = run_intra_prediction(y_mode, &above_vec, &left_vec, w, h, x > 0, y > 0)?;
         paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &pred, w, h);
     } else {
-        // HBD path: run prediction on the downshifted 8-bit gather, then
-        // re-upscale the predictor to bit_depth. Residual clip-add runs
-        // directly on the HBD plane below.
-        let (above8, left8) = gather_neighbors16(
+        let pred = run_intra_prediction_u16(
             &fs.y_plane16,
-            fs.width as usize,
+            stride,
             fs.height as usize,
             x as usize,
             y as usize,
             w,
             h,
+            y_mode,
+            angle_delta,
+            1u16 << (fs.bit_depth - 1),
             fs.bit_depth,
         );
-        let pred8 = run_intra_prediction(y_mode, &above8, &left8, w, h, x > 0, y > 0)?;
-        let pred16 = upshift_pred(&pred8, fs.bit_depth);
-        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &pred16, w, h);
+        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &pred, w, h);
     }
 
     if skip {
         return Ok(());
     }
 
-    // Non-skip: decode a single-TX residual. Supports square 4/8/16/32/64
-    // (the common AVIF-still shapes); other rectangular sizes still
-    // surface Unsupported until a later scope adds them.
     let (sz, num_coeffs, scan) = select_square_tx(w, h)?;
     let tx_idx = tx_size_idx(w, h)?;
     let nz = nz_map_ctx_offset(w, h)?;
 
-    // Read tx_type per spec §6.10.15 before the coefficient levels.
     let tx_type = td.decode_intra_tx_type(w, h, y_mode)?;
 
     let mut coeffs = decode_coefficients(
@@ -407,9 +371,6 @@ fn reconstruct_luma_block(
         h,
     )?;
 
-    // Dequantise each coefficient. For a clamped-scan (TX_64*N) only
-    // positions inside the 32×32 top-left region carry non-zero
-    // coefficients; the rest are already zero in the `coeffs` vec.
     let base_q = segmented_base_q(td, segment_id);
     let qv = quant::Params {
         base_q_idx: base_q,
@@ -425,11 +386,7 @@ fn reconstruct_luma_block(
         *c = dequant_coeff(*c, i, qv);
     }
 
-    // Inverse 2D transform.
     if let Err(e) = inverse_2d(&mut coeffs, tx_type, sz) {
-        // Unsupported (ty, sz) combination — fall back to DCT_DCT to
-        // keep the pipeline running rather than abort the whole frame.
-        // Mirrors goavif's `reconstructResidual` safety net.
         if matches!(e, Error::Unsupported(_)) {
             inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
         } else {
@@ -437,7 +394,6 @@ fn reconstruct_luma_block(
         }
     }
 
-    // Final shift + clip-add, depending on plane bit depth.
     let shift = residual_shift(w, h);
     for v in coeffs.iter_mut() {
         *v = round_shift(*v, shift);
@@ -457,20 +413,14 @@ fn reconstruct_luma_block(
 }
 
 /// Pick the `(TxSize, num_coeffs, scan)` triple for the given block
-/// dimensions. For TX_64x64 / TX_64x32 / TX_32x64 the coded region is
-/// clamped to the top-left 32×32 so `num_coeffs = 1024` and the scan
-/// maps back into the wider full-block buffer; `inverse_2d` still runs
-/// on the full coefficient grid (same behavior as libaom /
-/// goavif `selectTxParams`).
+/// dimensions.
 fn select_square_tx(w: usize, h: usize) -> Result<(TxSize, usize, Vec<usize>)> {
     match (w, h) {
-        // Squares.
         (4, 4) => Ok((TxSize::Tx4x4, 16, default_zigzag_scan(4, 4))),
         (8, 8) => Ok((TxSize::Tx8x8, 64, default_zigzag_scan(8, 8))),
         (16, 16) => Ok((TxSize::Tx16x16, 256, default_zigzag_scan(16, 16))),
         (32, 32) => Ok((TxSize::Tx32x32, 1024, default_zigzag_scan(32, 32))),
         (64, 64) => Ok((TxSize::Tx64x64, 1024, clamped_scan(32, 32, 64))),
-        // Rectangular — straight 2:1 / 1:2.
         (4, 8) => Ok((TxSize::Tx4x8, 32, default_zigzag_scan(4, 8))),
         (8, 4) => Ok((TxSize::Tx8x4, 32, default_zigzag_scan(8, 4))),
         (8, 16) => Ok((TxSize::Tx8x16, 128, default_zigzag_scan(8, 16))),
@@ -479,7 +429,6 @@ fn select_square_tx(w: usize, h: usize) -> Result<(TxSize, usize, Vec<usize>)> {
         (32, 16) => Ok((TxSize::Tx32x16, 512, default_zigzag_scan(32, 16))),
         (32, 64) => Ok((TxSize::Tx32x64, 1024, default_zigzag_scan(32, 32))),
         (64, 32) => Ok((TxSize::Tx64x32, 1024, clamped_scan(32, 32, 64))),
-        // Rectangular — 4:1 / 1:4.
         (4, 16) => Ok((TxSize::Tx4x16, 64, default_zigzag_scan(4, 16))),
         (16, 4) => Ok((TxSize::Tx16x4, 64, default_zigzag_scan(16, 4))),
         (8, 32) => Ok((TxSize::Tx8x32, 256, default_zigzag_scan(8, 32))),
@@ -493,7 +442,7 @@ fn select_square_tx(w: usize, h: usize) -> Result<(TxSize, usize, Vec<usize>)> {
 }
 
 /// Chroma counterpart of [`reconstruct_luma_block`] covering both U
-/// and V. Chroma dimensions are subsampled per `fs.sub_x` / `fs.sub_y`.
+/// and V.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_chroma_block(
     td: &mut TileDecoder<'_>,
@@ -503,9 +452,10 @@ fn reconstruct_chroma_block(
     bw: u32,
     bh: u32,
     uv_mode: IntraMode,
+    angle_delta_uv: i8,
     skip: bool,
-    _cfl_alpha_u: i32,
-    _cfl_alpha_v: i32,
+    cfl_alpha_u: i32,
+    cfl_alpha_v: i32,
     segment_id: u8,
 ) -> Result<()> {
     let sub_x = fs.sub_x;
@@ -522,64 +472,126 @@ fn reconstruct_chroma_block(
         return Ok(());
     }
 
+    // For CFL we need the reconstructed luma block as the AC template.
+    let cfl_luma_q3: Option<Vec<i32>> = if uv_mode == IntraMode::CflPred {
+        let luma_w = bw as usize;
+        let luma_h = bh as usize;
+        let mut luma_tight = vec![0i32; cw_clip * ch_clip];
+        if fs.bit_depth == 8 {
+            let mut luma = vec![0u8; luma_w * luma_h];
+            extract_block(
+                &fs.y_plane,
+                fs.width as usize,
+                x as usize,
+                y as usize,
+                luma_w,
+                luma_h,
+                &mut luma,
+            );
+            cfl_subsample(
+                &mut luma_tight,
+                &luma,
+                luma_w,
+                luma_h,
+                sub_x as usize,
+                sub_y as usize,
+            );
+        } else {
+            let mut luma = vec![0u16; luma_w * luma_h];
+            extract_block16(
+                &fs.y_plane16,
+                fs.width as usize,
+                x as usize,
+                y as usize,
+                luma_w,
+                luma_h,
+                &mut luma,
+            );
+            cfl_subsample16(
+                &mut luma_tight,
+                &luma,
+                luma_w,
+                luma_h,
+                sub_x as usize,
+                sub_y as usize,
+            );
+        }
+        Some(luma_tight)
+    } else {
+        None
+    };
+
     for plane_idx in 0..2u32 {
         let stride = uvw;
-        // CFL is treated as DC for Phase 3 (no real CFL math).
-        let mode = if uv_mode == IntraMode::CflPred {
+
+        let alpha = if plane_idx == 0 {
+            cfl_alpha_u
+        } else {
+            cfl_alpha_v
+        };
+
+        // For CFL, the base prediction is DC; then the luma AC is
+        // overlaid. For other modes, run the predictor directly.
+        let base_mode = if uv_mode == IntraMode::CflPred {
             IntraMode::DcPred
         } else {
             uv_mode
         };
+
         if fs.bit_depth == 8 {
-            let (above_vec, left_vec) = gather_neighbors(
-                if plane_idx == 0 {
-                    &fs.u_plane
-                } else {
-                    &fs.v_plane
-                },
-                uvw,
-                uvh,
-                cx,
-                cy,
-                cw_clip,
-                ch_clip,
+            let plane_ref: &[u8] = if plane_idx == 0 {
+                &fs.u_plane
+            } else {
+                &fs.v_plane
+            };
+            let mut pred = run_intra_prediction_u8(
+                plane_ref, stride, uvh, cx, cy, cw_clip, ch_clip, base_mode, angle_delta_uv, 128,
             );
-            let pred = run_intra_prediction(
-                mode,
-                &above_vec,
-                &left_vec,
-                cw_clip,
-                ch_clip,
-                cx > 0,
-                cy > 0,
-            )?;
+            if let Some(luma_q3) = &cfl_luma_q3 {
+                let dc_copy = pred.clone();
+                cfl_pred(&mut pred, cw_clip, ch_clip, luma_q3, &dc_copy, alpha);
+            }
             if plane_idx == 0 {
                 paste_block(&mut fs.u_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
             } else {
                 paste_block(&mut fs.v_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
             }
         } else {
-            let (above8, left8) = gather_neighbors16(
-                if plane_idx == 0 {
-                    &fs.u_plane16
-                } else {
-                    &fs.v_plane16
-                },
-                uvw,
+            let plane_ref: &[u16] = if plane_idx == 0 {
+                &fs.u_plane16
+            } else {
+                &fs.v_plane16
+            };
+            let mid = 1u16 << (fs.bit_depth - 1);
+            let mut pred = run_intra_prediction_u16(
+                plane_ref,
+                stride,
                 uvh,
                 cx,
                 cy,
                 cw_clip,
                 ch_clip,
+                base_mode,
+                angle_delta_uv,
+                mid,
                 fs.bit_depth,
             );
-            let pred8 =
-                run_intra_prediction(mode, &above8, &left8, cw_clip, ch_clip, cx > 0, cy > 0)?;
-            let pred16 = upshift_pred(&pred8, fs.bit_depth);
+            if let Some(luma_q3) = &cfl_luma_q3 {
+                let dc_copy = pred.clone();
+                cfl_pred16(
+                    &mut pred,
+                    cw_clip,
+                    ch_clip,
+                    luma_q3,
+                    &dc_copy,
+                    alpha,
+                    fs.bit_depth,
+                );
+            }
             if plane_idx == 0 {
-                paste_block16(&mut fs.u_plane16, stride, cx, cy, &pred16, cw_clip, ch_clip);
+                paste_block16(&mut fs.u_plane16, stride, cx, cy, &pred, cw_clip, ch_clip);
             } else {
-                paste_block16(&mut fs.v_plane16, stride, cx, cy, &pred16, cw_clip, ch_clip);
+                paste_block16(&mut fs.v_plane16, stride, cx, cy, &pred, cw_clip, ch_clip);
             }
         }
 
@@ -623,7 +635,6 @@ fn reconstruct_chroma_block(
             *c = dequant_coeff(*c, i, qv);
         }
 
-        // Chroma tx_type is always DCT_DCT in intra-only mode.
         inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
 
         let shift = residual_shift(cw_clip, ch_clip);
@@ -665,114 +676,220 @@ fn reconstruct_chroma_block(
     Ok(())
 }
 
-/// Downshift a 10/12-bit sample back to 8-bit for the intra
-/// predictor. AV1's intra predictor code path we ship is 8-bit only;
-/// running HBD through it produces coarser neighbors but keeps the
-/// pipeline alive (matching the Phase 4 scope note in the plan).
-#[inline]
-fn down8(v: u16, bd: u32) -> u8 {
-    let shift = bd.saturating_sub(8);
-    ((v as u32) >> shift).min(255) as u8
-}
-
-/// Gather a block's above-row and left-column from an HBD plane,
-/// down-shifted to 8-bit. Pads with the bit-depth midpoint when the
-/// edge is off the top/left of the plane.
+/// Run the u8 intra predictor against the reconstructed plane. Returns
+/// a tight `w*h` buffer of predicted samples.
 #[allow(clippy::too_many_arguments)]
-fn gather_neighbors16(
-    plane: &[u16],
-    plane_w: usize,
-    plane_h: usize,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    bit_depth: u32,
-) -> (Vec<u8>, Vec<u8>) {
-    let mid = down8(1u16 << (bit_depth - 1), bit_depth);
-    let mut above = vec![mid; w];
-    let mut left = vec![mid; h];
-    if y > 0 {
-        for (c, slot) in above.iter_mut().enumerate().take(w) {
-            let sx = (x + c).min(plane_w.saturating_sub(1));
-            *slot = down8(plane[(y - 1) * plane_w + sx], bit_depth);
-        }
-    }
-    if x > 0 {
-        for (r, slot) in left.iter_mut().enumerate().take(h) {
-            let sy = (y + r).min(plane_h.saturating_sub(1));
-            *slot = down8(plane[sy * plane_w + (x - 1)], bit_depth);
-        }
-    }
-    (above, left)
-}
-
-/// Up-shift an 8-bit predictor back to HBD (`bit_depth` in 10/12).
-fn upshift_pred(pred8: &[u8], bit_depth: u32) -> Vec<u16> {
-    let shift = bit_depth.saturating_sub(8);
-    pred8.iter().map(|&v| (v as u16) << shift).collect()
-}
-
-/// Gather a block's above-row and left-column from a reconstructed
-/// plane. Pads with `128` when either edge is off the top/left of
-/// the plane. Returns `(above, left)` with lengths `w` and `h`.
-fn gather_neighbors(
+fn run_intra_prediction_u8(
     plane: &[u8],
-    plane_w: usize,
-    plane_h: usize,
+    plane_stride: usize,
+    plane_height: usize,
     x: usize,
     y: usize,
     w: usize,
     h: usize,
-) -> (Vec<u8>, Vec<u8>) {
-    let mut above = vec![128u8; w];
-    let mut left = vec![128u8; h];
+    mode: IntraMode,
+    angle_delta: i8,
+    fallback: u8,
+) -> Vec<u8> {
+    // Extended neighbours for directional / filter-intra reads. Length
+    // covers the longest projection: above + right of block.
+    let ext_len = w + h + 4;
+    let (above_raw, left_raw, above_left) = gather_neighbors_u8(
+        plane,
+        plane_stride,
+        plane_height,
+        x,
+        y,
+        ext_len,
+        fallback,
+    );
+    let have_above = y > 0;
+    let have_left = x > 0;
+    let above = &above_raw[..];
+    let left = &left_raw[..];
+
+    let mut dst = vec![0u8; w * h];
+    match mode {
+        IntraMode::DcPred | IntraMode::CflPred => {
+            dc_pred(&mut dst, w, h, above, left, have_above, have_left, 8);
+        }
+        IntraMode::VPred => {
+            v_pred(&mut dst, w, h, above);
+        }
+        IntraMode::HPred => {
+            h_pred(&mut dst, w, h, left);
+        }
+        IntraMode::D45Pred
+        | IntraMode::D67Pred
+        | IntraMode::D113Pred
+        | IntraMode::D135Pred
+        | IntraMode::D157Pred
+        | IntraMode::D203Pred => {
+            let base = mode_to_angle_map(mode);
+            let angle = base + (angle_delta as i32) * 3;
+            directional_pred(&mut dst, w, h, above, left, angle);
+        }
+        IntraMode::SmoothPred => {
+            smooth_pred(&mut dst, w, h, above, left);
+        }
+        IntraMode::SmoothVPred => {
+            smooth_v_pred(&mut dst, w, h, above, left);
+        }
+        IntraMode::SmoothHPred => {
+            smooth_h_pred(&mut dst, w, h, above, left);
+        }
+        IntraMode::PaethPred => {
+            paeth_pred(&mut dst, w, h, above, left, above_left);
+        }
+    }
+    dst
+}
+
+/// u16 counterpart of [`run_intra_prediction_u8`].
+#[allow(clippy::too_many_arguments)]
+fn run_intra_prediction_u16(
+    plane: &[u16],
+    plane_stride: usize,
+    plane_height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    mode: IntraMode,
+    angle_delta: i8,
+    fallback: u16,
+    bit_depth: u32,
+) -> Vec<u16> {
+    let ext_len = w + h + 4;
+    let (above_raw, left_raw, above_left) = gather_neighbors_u16(
+        plane,
+        plane_stride,
+        plane_height,
+        x,
+        y,
+        ext_len,
+        fallback,
+    );
+    let have_above = y > 0;
+    let have_left = x > 0;
+    let above = &above_raw[..];
+    let left = &left_raw[..];
+
+    let mut dst = vec![0u16; w * h];
+    match mode {
+        IntraMode::DcPred | IntraMode::CflPred => {
+            dc_pred16(&mut dst, w, h, above, left, have_above, have_left, bit_depth);
+        }
+        IntraMode::VPred => {
+            v_pred16(&mut dst, w, h, above);
+        }
+        IntraMode::HPred => {
+            h_pred16(&mut dst, w, h, left);
+        }
+        IntraMode::D45Pred
+        | IntraMode::D67Pred
+        | IntraMode::D113Pred
+        | IntraMode::D135Pred
+        | IntraMode::D157Pred
+        | IntraMode::D203Pred => {
+            let base = mode_to_angle_map(mode);
+            let angle = base + (angle_delta as i32) * 3;
+            directional_pred16(&mut dst, w, h, above, left, angle, bit_depth);
+        }
+        IntraMode::SmoothPred => {
+            smooth_pred16(&mut dst, w, h, above, left);
+        }
+        IntraMode::SmoothVPred => {
+            smooth_v_pred16(&mut dst, w, h, above, left);
+        }
+        IntraMode::SmoothHPred => {
+            smooth_h_pred16(&mut dst, w, h, above, left);
+        }
+        IntraMode::PaethPred => {
+            paeth_pred16(&mut dst, w, h, above, left, above_left, bit_depth);
+        }
+    }
+    dst
+}
+
+/// Gather extended neighbour samples from a u8 plane. Returns
+/// `(above, left, above_left)` where `above` has `ext_len` samples
+/// (edge-replicated beyond the plane) and `left` has `ext_len` samples.
+fn gather_neighbors_u8(
+    plane: &[u8],
+    plane_stride: usize,
+    plane_height: usize,
+    x: usize,
+    y: usize,
+    ext_len: usize,
+    fallback: u8,
+) -> (Vec<u8>, Vec<u8>, u8) {
+    let mut above = vec![fallback; ext_len];
+    let mut left = vec![fallback; ext_len];
     if y > 0 {
-        for (c, slot) in above.iter_mut().enumerate().take(w) {
-            let sx = (x + c).min(plane_w.saturating_sub(1));
-            *slot = plane[(y - 1) * plane_w + sx];
+        let row = (y - 1) * plane_stride;
+        let max_x = plane_stride.saturating_sub(1);
+        for (c, slot) in above.iter_mut().enumerate() {
+            let sx = (x + c).min(max_x);
+            *slot = plane[row + sx];
         }
     }
     if x > 0 {
-        for (r, slot) in left.iter_mut().enumerate().take(h) {
-            let sy = (y + r).min(plane_h.saturating_sub(1));
-            *slot = plane[sy * plane_w + (x - 1)];
+        let max_y = plane_height.saturating_sub(1);
+        for (r, slot) in left.iter_mut().enumerate() {
+            let sy = (y + r).min(max_y);
+            *slot = plane[sy * plane_stride + (x - 1)];
         }
     }
-    (above, left)
+    let above_left = if x > 0 && y > 0 {
+        plane[(y - 1) * plane_stride + (x - 1)]
+    } else if y > 0 {
+        plane[(y - 1) * plane_stride + x]
+    } else if x > 0 {
+        plane[y * plane_stride + (x - 1)]
+    } else {
+        fallback
+    };
+    (above, left, above_left)
 }
 
-/// Run the intra predictor. Returns a `w*h` buffer of predicted
-/// samples. For Phase 3 only DC/V/H produce real output; directional
-/// / smooth / paeth modes fall back to DC_PRED to keep the pipeline
-/// running (matching goavif's safety net).
-fn run_intra_prediction(
-    mode: IntraMode,
-    above: &[u8],
-    left: &[u8],
-    w: usize,
-    h: usize,
-    have_left: bool,
-    have_above: bool,
-) -> Result<Vec<u8>> {
-    let mut dst = vec![0u8; w * h];
-    let ni = intra::Neighbours {
-        above: if have_above { Some(above) } else { None },
-        left: if have_left { Some(left) } else { None },
-    };
-    let im = to_intra_mode(mode);
-    match intra::predict(im, ni, w, h, &mut dst, w) {
-        Ok(()) => Ok(dst),
-        Err(Error::Unsupported(_)) | Err(Error::InvalidData(_)) => {
-            // Fallback to DC for any predictor Phase 4 doesn't
-            // implement, or when V_PRED / H_PRED fires with missing
-            // neighbors (boundary blocks). DC handles the None case by
-            // falling back to 128 mid-grey (spec §7.11.2.3).
-            intra::predict(intra::IntraMode::Dc, ni, w, h, &mut dst, w)?;
-            Ok(dst)
+/// u16 counterpart of [`gather_neighbors_u8`].
+fn gather_neighbors_u16(
+    plane: &[u16],
+    plane_stride: usize,
+    plane_height: usize,
+    x: usize,
+    y: usize,
+    ext_len: usize,
+    fallback: u16,
+) -> (Vec<u16>, Vec<u16>, u16) {
+    let mut above = vec![fallback; ext_len];
+    let mut left = vec![fallback; ext_len];
+    if y > 0 {
+        let row = (y - 1) * plane_stride;
+        let max_x = plane_stride.saturating_sub(1);
+        for (c, slot) in above.iter_mut().enumerate() {
+            let sx = (x + c).min(max_x);
+            *slot = plane[row + sx];
         }
-        Err(e) => Err(e),
     }
+    if x > 0 {
+        let max_y = plane_height.saturating_sub(1);
+        for (r, slot) in left.iter_mut().enumerate() {
+            let sy = (y + r).min(max_y);
+            *slot = plane[sy * plane_stride + (x - 1)];
+        }
+    }
+    let above_left = if x > 0 && y > 0 {
+        plane[(y - 1) * plane_stride + (x - 1)]
+    } else if y > 0 {
+        plane[(y - 1) * plane_stride + x]
+    } else if x > 0 {
+        plane[y * plane_stride + (x - 1)]
+    } else {
+        fallback
+    };
+    (above, left, above_left)
 }
 
 /// Copy a `w×h` block into a plane at `(x, y)`.
@@ -818,7 +935,6 @@ fn dequant_coeff(level: i32, pos: usize, qv: quant::Values) -> i32 {
 }
 
 /// Round-shift used to scale the residual back to the pixel domain.
-/// Matches goavif's `reconstructResidual` → `reconstruct.go`.
 fn residual_shift(w: usize, h: usize) -> u32 {
     crate::transform::inverse_shift(w, h)
 }
@@ -832,8 +948,7 @@ fn round_shift(x: i32, n: u32) -> i32 {
     }
 }
 
-/// Compute the segment-adjusted `base_q_index`. Matches goavif's
-/// `segmentedBaseQ`.
+/// Compute the segment-adjusted `base_q_index`.
 fn segmented_base_q(td: &TileDecoder<'_>, segment_id: u8) -> i32 {
     let base = td.frame.quant.base_q_idx as i32;
     if !td.frame.segmentation.enabled {
@@ -843,7 +958,6 @@ fn segmented_base_q(td: &TileDecoder<'_>, segment_id: u8) -> i32 {
     if sid >= td.frame.segmentation.feature_enabled.len() {
         return base;
     }
-    // SEG_LVL_ALT_Q is feature index 0.
     if !td.frame.segmentation.feature_enabled[sid][0] {
         return base;
     }

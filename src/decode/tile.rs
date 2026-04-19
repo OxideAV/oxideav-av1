@@ -54,7 +54,230 @@ pub fn decode_tile_group(
         let mut td = TileDecoder::new(seq, frame, bytes)?;
         td.decode(frame_state, tp)?;
     }
+    finish_frame(frame, frame_state);
     Ok(())
+}
+
+/// Run the post-reconstruction passes — deblocking, then CDEF — over
+/// the fully reconstructed planes. Called automatically by
+/// [`decode_tile_group`] after the last tile completes.
+///
+/// Intended to match the goavif `finishFrame` hook; we simplify by
+/// using a uniform edge grid (4-sample step) and the spec's
+/// `filter_level` threshold derivation. Loop restoration is deferred
+/// to Phase 7.
+pub fn finish_frame(frame: &FrameHeader, fs: &mut FrameState) {
+    apply_deblocking(frame, fs);
+    apply_cdef(frame, fs);
+}
+
+fn apply_deblocking(frame: &FrameHeader, fs: &mut FrameState) {
+    use crate::loopfilter::{
+        apply_frame_narrow, apply_frame_narrow16, derive_thresholds, scale_thresholds16,
+        uniform_grid, Plane, Plane16,
+    };
+    let lf = &frame.loop_filter;
+    // All planes use the same sharpness.
+    let sharp = lf.sharpness as i32;
+    let th_y = derive_thresholds(lf.level_y0 as i32, sharp);
+    let th_u = derive_thresholds(lf.level_u as i32, sharp);
+    let th_v = derive_thresholds(lf.level_v as i32, sharp);
+    let grid_y = uniform_grid(fs.width as usize, fs.height as usize, 4, 4);
+    let grid_uv = uniform_grid(fs.uv_width as usize, fs.uv_height as usize, 4, 4);
+
+    if fs.bit_depth == 8 {
+        if lf.level_y0 > 0 {
+            let width = fs.width as usize;
+            let height = fs.height as usize;
+            apply_frame_narrow(
+                Plane {
+                    pix: &mut fs.y_plane,
+                    stride: width,
+                    width,
+                    height,
+                },
+                &grid_y,
+                th_y,
+            );
+        }
+        if !fs.monochrome {
+            let uvw = fs.uv_width as usize;
+            let uvh = fs.uv_height as usize;
+            if lf.level_u > 0 {
+                apply_frame_narrow(
+                    Plane {
+                        pix: &mut fs.u_plane,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    &grid_uv,
+                    th_u,
+                );
+            }
+            if lf.level_v > 0 {
+                apply_frame_narrow(
+                    Plane {
+                        pix: &mut fs.v_plane,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    &grid_uv,
+                    th_v,
+                );
+            }
+        }
+    } else {
+        let bd = fs.bit_depth;
+        let th_y16 = scale_thresholds16(th_y, bd);
+        let th_u16 = scale_thresholds16(th_u, bd);
+        let th_v16 = scale_thresholds16(th_v, bd);
+        if lf.level_y0 > 0 {
+            let width = fs.width as usize;
+            let height = fs.height as usize;
+            apply_frame_narrow16(
+                Plane16 {
+                    pix: &mut fs.y_plane16,
+                    stride: width,
+                    width,
+                    height,
+                },
+                &grid_y,
+                th_y16,
+            );
+        }
+        if !fs.monochrome {
+            let uvw = fs.uv_width as usize;
+            let uvh = fs.uv_height as usize;
+            if lf.level_u > 0 {
+                apply_frame_narrow16(
+                    Plane16 {
+                        pix: &mut fs.u_plane16,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    &grid_uv,
+                    th_u16,
+                );
+            }
+            if lf.level_v > 0 {
+                apply_frame_narrow16(
+                    Plane16 {
+                        pix: &mut fs.v_plane16,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    &grid_uv,
+                    th_v16,
+                );
+            }
+        }
+    }
+}
+
+fn apply_cdef(frame: &FrameHeader, fs: &mut FrameState) {
+    use crate::cdef::{apply_frame, apply_frame16, Plane as CdefPlane, Plane16 as CdefPlane16};
+    let params = &frame.cdef;
+    // For a single-index (1-entry) CDEF, use cdef_idx=0. A spec-exact
+    // per-SB route lands with the mode-info tracking in the inter
+    // decoder; until then, if the bitstream encodes a single-strength
+    // entry we apply it uniformly, otherwise we skip.
+    if params.cdef_bits == 0 {
+        let pri_y = params.y_pri_strengths[0] as i32;
+        let sec_y = params.y_sec_strengths[0] as i32;
+        let pri_uv = params.uv_pri_strengths[0] as i32;
+        let sec_uv = params.uv_sec_strengths[0] as i32;
+        let damping = (params.cdef_damping_minus3 as i32) + 3;
+        if pri_y != 0 || sec_y != 0 {
+            if fs.bit_depth == 8 {
+                let width = fs.width as usize;
+                let height = fs.height as usize;
+                apply_frame(
+                    CdefPlane {
+                        pix: &mut fs.y_plane,
+                        stride: width,
+                        width,
+                        height,
+                    },
+                    pri_y,
+                    sec_y,
+                    damping,
+                );
+            } else {
+                let width = fs.width as usize;
+                let height = fs.height as usize;
+                apply_frame16(
+                    CdefPlane16 {
+                        pix: &mut fs.y_plane16,
+                        stride: width,
+                        width,
+                        height,
+                    },
+                    pri_y,
+                    sec_y,
+                    damping,
+                    fs.bit_depth,
+                );
+            }
+        }
+        if !fs.monochrome && (pri_uv != 0 || sec_uv != 0) {
+            let uvw = fs.uv_width as usize;
+            let uvh = fs.uv_height as usize;
+            let damp_uv = damping - 1;
+            if fs.bit_depth == 8 {
+                apply_frame(
+                    CdefPlane {
+                        pix: &mut fs.u_plane,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    pri_uv,
+                    sec_uv,
+                    damp_uv,
+                );
+                apply_frame(
+                    CdefPlane {
+                        pix: &mut fs.v_plane,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    pri_uv,
+                    sec_uv,
+                    damp_uv,
+                );
+            } else {
+                apply_frame16(
+                    CdefPlane16 {
+                        pix: &mut fs.u_plane16,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    pri_uv,
+                    sec_uv,
+                    damp_uv,
+                    fs.bit_depth,
+                );
+                apply_frame16(
+                    CdefPlane16 {
+                        pix: &mut fs.v_plane16,
+                        stride: uvw,
+                        width: uvw,
+                        height: uvh,
+                    },
+                    pri_uv,
+                    sec_uv,
+                    damp_uv,
+                    fs.bit_depth,
+                );
+            }
+        }
+    }
 }
 
 /// Per-tile decoder state. Owns a mutable copy of every CDF used by
