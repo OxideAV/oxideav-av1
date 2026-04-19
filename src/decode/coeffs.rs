@@ -162,12 +162,7 @@ impl CoeffCdfBank {
     /// from `base_q_idx`.
     pub fn new(q_ctx: usize) -> Self {
         let q_ctx = q_ctx.min(3);
-
-        // Helper to build an owned CDF copy with the default from a
-        // reference slice.
-        let clone_cdf = |c: &&'static [u16]| c.to_vec();
-
-        let mut bank = Self {
+        Self {
             q_ctx,
             txb_skip_cdf: std::array::from_fn(|tx| {
                 std::array::from_fn(|c| cdfs::DEFAULT_TXB_SKIP_CDF[tx][c].to_vec())
@@ -222,12 +217,7 @@ impl CoeffCdfBank {
             dc_sign_cdf: std::array::from_fn(|p| {
                 std::array::from_fn(|c| cdfs::DEFAULT_DC_SIGN_CDF[p][c].to_vec())
             }),
-        };
-        // Silence unused-helper-complaint if compiler ever inlines it
-        // away; this is a cheap sanity check.
-        let _ = clone_cdf;
-        bank.q_ctx = q_ctx;
-        bank
+        }
     }
 
     /// Read `txb_skip` flag.
