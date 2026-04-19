@@ -12,6 +12,7 @@
 use oxideav_codec::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
 
+use crate::decode::{decode_tile_group, FrameState};
 use crate::extradata::Av1CodecConfig;
 use crate::frame_header::{parse_frame_header, parse_frame_obu, FrameHeader};
 use crate::obu::{iter_obus, ObuType};
@@ -111,9 +112,8 @@ impl Av1Decoder {
                     self.seen_frame = true;
                     // Split the tile_group_obu into per-tile byte ranges so
                     // callers can observe how many tiles the frame carries
-                    // and where each one lives, even though pixel decode is
-                    // still out of scope.
-                    if let Some(ti) = fh.tile_info.as_ref() {
+                    // and where each one lives.
+                    let tile_decode_err = if let Some(ti) = fh.tile_info.as_ref() {
                         let tgh = parse_tile_group_header(tg_payload, ti)?;
                         let mut tiles = split_tile_payloads(tg_payload, ti, &tgh)?;
                         // Re-base offsets from the tile_group payload to the
@@ -125,16 +125,37 @@ impl Av1Decoder {
                             t.offset += frame_header_len;
                         }
                         self.last_tile_payloads = tiles;
+                        // Walk every tile through the Phase 2 mode decoder.
+                        // For a well-formed intra frame this reads every
+                        // partition + mode symbol and exits with
+                        // `Error::Unsupported` at the first non-skip leaf
+                        // (§5.11.39 coefficient decode pending).
+                        let sub_x = if seq.color_config.subsampling_x { 1 } else { 0 };
+                        let sub_y = if seq.color_config.subsampling_y { 1 } else { 0 };
+                        let mut fs = FrameState::with_bit_depth(
+                            fh.frame_width,
+                            fh.frame_height,
+                            sub_x,
+                            sub_y,
+                            seq.color_config.num_planes == 1,
+                            seq.color_config.bit_depth,
+                        );
+                        decode_tile_group(&seq, &fh, tg_payload, &mut fs)
                     } else {
                         self.last_tile_payloads.clear();
-                    }
+                        Err(tile_decode_unsupported())
+                    };
                     self.last_frame_header = Some(fh);
-                    // Headers + tile boundaries are now available via
-                    // `last_frame_header()` / `last_tile_payloads()`.
-                    // Decoder body (partition tree + coefficient decode +
-                    // transforms + prediction + loop filter + CDEF + LR)
-                    // is not yet implemented.
-                    return Err(tile_decode_unsupported());
+                    // Surface whatever the tile walker returned — for Phase
+                    // 2 this is `Error::Unsupported("av1 coefficient decode
+                    // pending (§5.11.39)")` on the first non-skip leaf of
+                    // any real encoded frame. Fully-skip frames would
+                    // succeed here, but that virtually never happens in
+                    // practice.
+                    return match tile_decode_err {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(e),
+                    };
                 }
                 ObuType::TileGroup => {
                     // The frame header for this OBU_TILE_GROUP must have
@@ -153,7 +174,20 @@ impl Av1Decoder {
                     let tgh = parse_tile_group_header(obu.payload, ti)?;
                     let tiles = split_tile_payloads(obu.payload, ti, &tgh)?;
                     self.last_tile_payloads = tiles;
-                    return Err(tile_decode_unsupported());
+                    let seq = self.seq_header.as_ref().ok_or_else(|| {
+                        Error::invalid("av1: OBU_TILE_GROUP before sequence_header")
+                    })?;
+                    let sub_x = if seq.color_config.subsampling_x { 1 } else { 0 };
+                    let sub_y = if seq.color_config.subsampling_y { 1 } else { 0 };
+                    let mut fs = FrameState::with_bit_depth(
+                        fh.frame_width,
+                        fh.frame_height,
+                        sub_x,
+                        sub_y,
+                        seq.color_config.num_planes == 1,
+                        seq.color_config.bit_depth,
+                    );
+                    return decode_tile_group(seq, fh, obu.payload, &mut fs);
                 }
                 ObuType::Metadata | ObuType::TileList => {
                     // Metadata is informational; tile_list is for large-scale
