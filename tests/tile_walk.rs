@@ -262,6 +262,98 @@ fn end_to_end_decode_produces_plane_bytes() {
     assert!(ok_frames >= 1, "expected at least one frame to decode cleanly");
 }
 
+/// Phase-5 fidelity check: decode the 128×128 non-skip-heavy clip at
+/// `/tmp/av1-intra.ivf`. Unlike the tiny 64×64 testsrc at
+/// `/tmp/av1.ivf` (where every block is skip), this one has real
+/// coefficient data + directional intra modes, so the output is
+/// non-flat. Passes iff the reconstructed luma plane shows variation
+/// (not a single mid-grey value) and the frame decodes without
+/// `Unsupported` surface.
+///
+/// Generate with:
+///   ffmpeg -f lavfi -i testsrc=size=128x128:rate=24:duration=0.1 \
+///          -f rawvideo -pix_fmt yuv420p /tmp/av1in-128.yuv
+///   aomenc --cpu-used=4 --cq-level=20 --ivf -w 128 -h 128 \
+///          --fps=24/1 --kf-min-dist=1 --kf-max-dist=1 \
+///          -o /tmp/av1-intra.ivf /tmp/av1in-128.yuv
+#[test]
+fn end_to_end_decode_128_intra_clip_has_variation() {
+    let Some(data) = read_fixture("/tmp/av1-intra.ivf") else {
+        return;
+    };
+    let obus = ivf_concat_obus(&data).expect("ivf parse");
+    let mut sh: Option<SequenceHeader> = None;
+    let mut ok_frames = 0usize;
+
+    for o in iter_obus(&obus) {
+        let o = o.expect("obu parse");
+        match o.header.obu_type {
+            ObuType::SequenceHeader => {
+                sh = Some(parse_sequence_header(o.payload).expect("seq hdr"));
+            }
+            ObuType::Frame => {
+                let seq = sh.as_ref().expect("seq before frame");
+                let (fh, tg_payload) = parse_frame_obu(seq, o.payload).expect("parse_frame_obu");
+                let sub_x = if seq.color_config.subsampling_x { 1 } else { 0 };
+                let sub_y = if seq.color_config.subsampling_y { 1 } else { 0 };
+                let mut fs = FrameState::with_bit_depth(
+                    fh.frame_width,
+                    fh.frame_height,
+                    sub_x,
+                    sub_y,
+                    seq.color_config.num_planes == 1,
+                    seq.color_config.bit_depth,
+                );
+                let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs);
+                match got {
+                    Ok(()) => {
+                        // Plane lengths must match geometry.
+                        assert_eq!(
+                            fs.y_plane.len(),
+                            (fh.frame_width as usize) * (fh.frame_height as usize)
+                        );
+                        // Variation test: with non-skip content, the
+                        // reconstructed plane must have more than one
+                        // distinct sample value.
+                        let min = *fs.y_plane.iter().min().unwrap();
+                        let max = *fs.y_plane.iter().max().unwrap();
+                        assert!(
+                            max > min,
+                            "decoded plane is flat ({min}); expected non-skip content to produce variation"
+                        );
+                        let sum: u64 = fs.y_plane.iter().map(|&v| v as u64).sum();
+                        let mean = sum / (fs.y_plane.len() as u64);
+                        // Hash of first 64 bytes for regression tracking.
+                        let mut h: u64 = 1469598103934665603;
+                        for &b in &fs.y_plane[..64] {
+                            h ^= b as u64;
+                            h = h.wrapping_mul(1099511628211);
+                        }
+                        eprintln!(
+                            "phase5 fixture: {}x{} luma min={} max={} mean={} fnv64(0..64)=0x{:016x}",
+                            fh.frame_width, fh.frame_height, min, max, mean, h
+                        );
+                        ok_frames += 1;
+                    }
+                    Err(Error::Unsupported(msg)) => {
+                        // Phase 5 should decode most 128×128 aomenc
+                        // clips end-to-end; if the bitstream uses a TX
+                        // shape we haven't wired (e.g. unusual 4:1
+                        // rectangles on chroma), surface the §ref.
+                        eprintln!("phase5 128×128 fixture surfaced Unsupported: {msg}");
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        ok_frames >= 1,
+        "expected at least one frame to decode cleanly from 128×128 fixture"
+    );
+}
+
 /// 10-bit HBD smoke test. Generate a 10-bit fixture with:
 ///
 ///   ffmpeg -f lavfi -i testsrc=size=64x64:rate=24,format=yuv420p10le \

@@ -29,4 +29,4 @@ pub use block::{BlockSize, PartitionType, SubBlock};
 pub use frame_state::{FrameState, ModeInfo};
 pub use modes::{IntraMode, UvMode, INTRA_MODES, UV_MODES};
 pub use partition::walk_partition;
-pub use tile::{decode_tile_group, TileDecoder};
+pub use tile::{decode_tile_group, finish_frame, TileDecoder};
