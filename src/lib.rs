@@ -56,6 +56,7 @@ pub mod frame_header;
 pub mod frame_header_tail;
 pub mod intra;
 pub mod obu;
+pub mod quant;
 pub mod sequence_header;
 pub mod symbol;
 pub mod tile_group;
