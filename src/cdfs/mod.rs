@@ -15,7 +15,16 @@
 //! ```sh
 //! (cd tools/gen_cdfs && go build . && ./oxideav-gen-cdfs) > src/cdfs/generated.rs
 //! ```
+//!
+//! The Loop Restoration per-unit CDFs (§5.11.40-.44) are hand-copied
+//! from `libaom/av1/common/entropymode.c` into `lr.rs` — they aren't
+//! part of goavif's CDF port because goavif short-circuits LR
+//! per-unit signalling.
 
 mod generated;
+mod lr;
 
 pub use generated::*;
+pub use lr::{
+    DEFAULT_SGRPROJ_RESTORE_CDF, DEFAULT_SWITCHABLE_RESTORE_CDF, DEFAULT_WIENER_RESTORE_CDF,
+};

@@ -19,14 +19,20 @@ use oxideav_core::{Error, Result};
 
 use crate::cdfs;
 use crate::frame_header::FrameHeader;
+use crate::frame_header_tail::RESTORATION_NONE;
 use crate::sequence_header::SequenceHeader;
 use crate::symbol::SymbolDecoder;
 use crate::tile_group::{parse_tile_group_header, split_tile_payloads, TilePayload};
 
 use super::coeffs::{q_index_to_ctx, CoeffCdfBank};
 use super::frame_state::FrameState;
+use super::lr_unit::{
+    decode_lr_unit as decode_lr_unit_impl, default_sgrproj_cdf, default_switchable_cdf,
+    default_wiener_cdf, LrRef,
+};
 use super::modes::{IntraMode, INTRA_MODES, UV_MODES};
 use super::superblock;
+use crate::lr::UnitParams as LrUnitParams;
 use crate::transform::TxType;
 
 /// Top-level entry point: walk every tile in a tile-group payload,
@@ -47,6 +53,9 @@ pub fn decode_tile_group(
             "av1 decode_tile_group: frame header missing tile_info (§5.9.15)",
         )
     })?;
+    // Allocate per-plane LR unit storage so the superblock walker can
+    // index into it. Must happen before any tile decodes.
+    alloc_lr_units(seq, frame, frame_state);
     let tgh = parse_tile_group_header(tile_payload, tile_info)?;
     let tiles = split_tile_payloads(tile_payload, tile_info, &tgh)?;
     for tp in &tiles {
@@ -58,17 +67,41 @@ pub fn decode_tile_group(
     Ok(())
 }
 
-/// Run the post-reconstruction passes — deblocking, then CDEF — over
-/// the fully reconstructed planes. Called automatically by
-/// [`decode_tile_group`] after the last tile completes.
+/// Size per-plane `lr_unit_info` storage from `log2_restoration_unit_size`
+/// (§5.9.20) so the superblock walker can index into it. Planes whose
+/// `FrameRestorationType == RESTORE_NONE` still get a 1×1 slot so
+/// out-of-range indexing clamps cleanly.
+fn alloc_lr_units(_seq: &SequenceHeader, frame: &FrameHeader, fs: &mut FrameState) {
+    let num_planes = if fs.monochrome { 1 } else { 3 };
+    for plane in 0..num_planes {
+        let log2 = frame.lr.log2_restoration_unit_size[plane];
+        let (pw, ph) = if plane == 0 {
+            (fs.width, fs.height)
+        } else {
+            (fs.uv_width, fs.uv_height)
+        };
+        let unit_size = if log2 == 0 { 64 } else { 1u32 << log2 };
+        // libaom `av1_lr_count_units`: round to nearest, minimum 1.
+        let horz = ((pw + unit_size / 2) / unit_size).max(1);
+        let vert = ((ph + unit_size / 2) / unit_size).max(1);
+        fs.alloc_lr_units(plane, unit_size, horz, vert);
+    }
+}
+
+/// Run the post-reconstruction passes — deblocking, CDEF, loop
+/// restoration, then film grain — over the fully reconstructed
+/// planes. Called automatically by [`decode_tile_group`] after the
+/// last tile completes.
 ///
-/// Intended to match the goavif `finishFrame` hook; we simplify by
-/// using a uniform edge grid (4-sample step) and the spec's
-/// `filter_level` threshold derivation. Loop restoration is deferred
-/// to Phase 7.
+/// Loop restoration consumes the per-unit parameters the superblock
+/// walker decoded into `fs.lr_unit_info[]` (§5.11.40-.44). Film grain
+/// synthesises the §7.20.2 32×32 tiled noise pattern when the frame
+/// header signals `apply_grain`.
 pub fn finish_frame(frame: &FrameHeader, fs: &mut FrameState) {
     apply_deblocking(frame, fs);
     apply_cdef(frame, fs);
+    apply_lr(frame, fs);
+    apply_film_grain(frame, fs);
 }
 
 fn apply_deblocking(frame: &FrameHeader, fs: &mut FrameState) {
@@ -280,6 +313,196 @@ fn apply_cdef(frame: &FrameHeader, fs: &mut FrameState) {
     }
 }
 
+/// Apply §5.11.40-.44 loop restoration across every plane whose
+/// `FrameRestorationType != RESTORE_NONE`, consulting the per-unit
+/// parameters that the superblock walker stored in `fs.lr_unit_info`.
+fn apply_lr(frame: &FrameHeader, fs: &mut FrameState) {
+    use crate::lr::{apply_frame, apply_frame16, Plane, Plane16};
+
+    let lr = &frame.lr;
+    if !lr.uses_lr {
+        return;
+    }
+    let num_planes = if fs.monochrome { 1 } else { 3 };
+    for plane in 0..num_planes {
+        if lr.frame_restoration_type[plane] == crate::frame_header_tail::RESTORATION_NONE {
+            continue;
+        }
+        let unit_size = fs.lr_unit_size[plane] as usize;
+        if unit_size == 0 {
+            continue;
+        }
+        let cols = fs.lr_cols[plane] as usize;
+        let units: Vec<crate::lr::UnitParams> = fs.lr_unit_info[plane].clone();
+        let params_for = |c: usize, r: usize| -> crate::lr::UnitParams {
+            let idx = r * cols + c;
+            units.get(idx).copied().unwrap_or_default()
+        };
+        if fs.bit_depth == 8 {
+            let (pix, width, height) = match plane {
+                0 => (&mut fs.y_plane, fs.width as usize, fs.height as usize),
+                1 => (&mut fs.u_plane, fs.uv_width as usize, fs.uv_height as usize),
+                _ => (&mut fs.v_plane, fs.uv_width as usize, fs.uv_height as usize),
+            };
+            let stride = width;
+            apply_frame(
+                Plane {
+                    pix,
+                    stride,
+                    width,
+                    height,
+                },
+                unit_size,
+                params_for,
+            );
+        } else {
+            let (pix, width, height) = match plane {
+                0 => (&mut fs.y_plane16, fs.width as usize, fs.height as usize),
+                1 => (
+                    &mut fs.u_plane16,
+                    fs.uv_width as usize,
+                    fs.uv_height as usize,
+                ),
+                _ => (
+                    &mut fs.v_plane16,
+                    fs.uv_width as usize,
+                    fs.uv_height as usize,
+                ),
+            };
+            let stride = width;
+            apply_frame16(
+                Plane16 {
+                    pix,
+                    stride,
+                    width,
+                    height,
+                },
+                unit_size,
+                params_for,
+                fs.bit_depth,
+            );
+        }
+    }
+}
+
+/// Run §7.20.2 film-grain synthesis on the reconstructed frame when
+/// the header carries a non-zero `grain_seed`.
+fn apply_film_grain(frame: &FrameHeader, fs: &mut FrameState) {
+    use crate::filmgrain::{
+        apply_with_template, apply_with_template16, new_chroma_template, new_luma_template,
+        scaling::{build_lut, Point},
+        Params as FgParams,
+    };
+
+    let g = &frame.film_grain;
+    if !g.apply_grain || g.grain_seed == 0 {
+        return;
+    }
+    let ar_lag = g.ar_coeff_lag as usize;
+    let ar_shift = g.ar_coeff_shift_minus6 as u32 + 6;
+    let scaling_shift = g.grain_scale_shift + 8;
+
+    // Luma.
+    if g.num_y_points > 0 {
+        let points: Vec<Point> = (0..g.num_y_points as usize)
+            .map(|i| Point {
+                value: g.point_y_value[i],
+                scale: g.point_y_scaling[i],
+            })
+            .collect();
+        let lut = build_lut(&points);
+        let y_coeffs_count = 2 * ar_lag * (ar_lag + 1);
+        let y_coeffs = &g.ar_coeffs_y[..y_coeffs_count.min(g.ar_coeffs_y.len())];
+        let tpl = new_luma_template(g.grain_seed, ar_lag, y_coeffs, ar_shift);
+        let p = FgParams {
+            grain_seed: g.grain_seed,
+            scaling_y: lut,
+            scaling_shift,
+            clip_to_restricted_range: g.clip_to_restricted_range,
+            overlap_flag: g.overlap_flag,
+            ..FgParams::default()
+        };
+        if fs.bit_depth == 8 {
+            let w = fs.width as usize;
+            let h = fs.height as usize;
+            apply_with_template(&mut fs.y_plane, w, h, w, &lut, &tpl, &p);
+        } else {
+            let w = fs.width as usize;
+            let h = fs.height as usize;
+            apply_with_template16(&mut fs.y_plane16, w, h, w, &lut, &tpl, &p, fs.bit_depth);
+        }
+    }
+
+    if fs.monochrome {
+        return;
+    }
+
+    let apply_chroma = |
+        scaling_values: &[u8],
+        scaling_scales: &[u8],
+        num_points: u8,
+        ar_coeffs: &[i8],
+        plane8: &mut Vec<u8>,
+        plane16: &mut Vec<u16>,
+        w: usize,
+        h: usize,
+        bd: u32,
+    | {
+        if num_points == 0 {
+            return;
+        }
+        let points: Vec<Point> = (0..num_points as usize)
+            .map(|i| Point {
+                value: scaling_values[i],
+                scale: scaling_scales[i],
+            })
+            .collect();
+        let lut = build_lut(&points);
+        let n_coeffs = (2 * ar_lag * (ar_lag + 1) + 1).min(ar_coeffs.len());
+        let c_coeffs = &ar_coeffs[..n_coeffs];
+        let seed = g.grain_seed ^ 0xA5A5;
+        let tpl = new_chroma_template(seed, ar_lag, c_coeffs, ar_shift);
+        let p = FgParams {
+            grain_seed: seed,
+            scaling_shift,
+            clip_to_restricted_range: g.clip_to_restricted_range,
+            overlap_flag: g.overlap_flag,
+            ..FgParams::default()
+        };
+        if bd == 8 {
+            apply_with_template(plane8, w, h, w, &lut, &tpl, &p);
+        } else {
+            apply_with_template16(plane16, w, h, w, &lut, &tpl, &p, bd);
+        }
+    };
+
+    let cw = fs.uv_width as usize;
+    let ch = fs.uv_height as usize;
+    let bd = fs.bit_depth;
+    apply_chroma(
+        &g.point_cb_value,
+        &g.point_cb_scaling,
+        g.num_cb_points,
+        &g.ar_coeffs_cb,
+        &mut fs.u_plane,
+        &mut fs.u_plane16,
+        cw,
+        ch,
+        bd,
+    );
+    apply_chroma(
+        &g.point_cr_value,
+        &g.point_cr_scaling,
+        g.num_cr_points,
+        &g.ar_coeffs_cr,
+        &mut fs.v_plane,
+        &mut fs.v_plane16,
+        cw,
+        ch,
+        bd,
+    );
+}
+
 /// Per-tile decoder state. Owns a mutable copy of every CDF used by
 /// Phase 2's partition / mode / segment / CFL / skip readers. The
 /// coefficient decoder (§5.11.39) is **not** instantiated here — the
@@ -317,6 +540,12 @@ pub struct TileDecoder<'a> {
     pub intra_ext_tx_cdf_set2: Vec<Vec<Vec<u16>>>,
     /// Coefficient-CDF bank — all of §5.11.39's CDFs in one place.
     pub coeff_bank: CoeffCdfBank,
+    /// §5.11.40-.44 Loop-Restoration per-unit CDFs.
+    pub switchable_restore_cdf: Vec<u16>,
+    pub wiener_restore_cdf: Vec<u16>,
+    pub sgrproj_restore_cdf: Vec<u16>,
+    /// Per-plane Wiener / SGR reference values (§5.11.42 / §5.11.44).
+    pub lr_ref: [LrRef; 3],
 }
 
 impl<'a> TileDecoder<'a> {
@@ -351,9 +580,34 @@ impl<'a> TileDecoder<'a> {
             intra_ext_tx_cdf_set1: Vec::new(),
             intra_ext_tx_cdf_set2: Vec::new(),
             coeff_bank,
+            switchable_restore_cdf: default_switchable_cdf(),
+            wiener_restore_cdf: default_wiener_cdf(),
+            sgrproj_restore_cdf: default_sgrproj_cdf(),
+            lr_ref: [LrRef::default(); 3],
         };
         td.init_cdfs();
         Ok(td)
+    }
+
+    /// Decode the next restoration unit's syntax for `plane` (spec
+    /// §5.11.40 `lr_unit_info()`). Mutates the tile-local LR
+    /// CDFs + per-plane reference values in place; returns the
+    /// decoded `UnitParams`. Callers should short-circuit when the
+    /// plane's `FrameRestorationType == RESTORE_NONE`.
+    pub fn decode_lr_unit(&mut self, plane: usize) -> Result<LrUnitParams> {
+        let rt = self.frame.lr.frame_restoration_type[plane];
+        if rt == RESTORATION_NONE {
+            return Ok(LrUnitParams::default());
+        }
+        decode_lr_unit_impl(
+            &mut self.symbol,
+            rt,
+            plane,
+            &mut self.lr_ref[plane],
+            &mut self.switchable_restore_cdf,
+            &mut self.wiener_restore_cdf,
+            &mut self.sgrproj_restore_cdf,
+        )
     }
 
     /// Initialise the per-tile CDFs from [`crate::cdfs`] defaults.

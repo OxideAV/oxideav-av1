@@ -28,6 +28,12 @@ use super::reconstruct::{clip_add_in_place, clip_add_in_place16};
 use super::tile::{cfl_alpha_ctx, cfl_signs, segment_id_ctx, TileDecoder};
 
 /// Decode one superblock at luma-sample position `(sb_x, sb_y)`.
+///
+/// Matches libaom's `decode_partition()` entry: before reading any
+/// partition / mode symbols we honour the spec §5.11.40 per-LR-unit
+/// signalling for each plane whose `FrameRestorationType != NONE`,
+/// consulting the tile-scoped `switchable_restore_cdf` /
+/// `wiener_restore_cdf` / `sgrproj_restore_cdf`.
 pub fn decode_superblock(
     td: &mut TileDecoder<'_>,
     fs: &mut FrameState,
@@ -39,7 +45,89 @@ pub fn decode_superblock(
     } else {
         BlockSize::Block64x64
     };
+    read_lr_unit_coeffs_for_sb(td, fs, sb_x, sb_y)?;
     decode_partition_node(td, fs, sb_x, sb_y, sb_bs)
+}
+
+/// For each plane, decode the per-unit LR parameters for every
+/// restoration unit whose top-left corner lies inside the `sb_size`
+/// superblock anchored at `(sb_x, sb_y)`. Mirrors libaom's
+/// `av1_loop_restoration_corners_in_sb` loop (§5.11.40).
+fn read_lr_unit_coeffs_for_sb(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    sb_x: u32,
+    sb_y: u32,
+) -> Result<()> {
+    let num_planes = td.seq.color_config.num_planes as usize;
+    let sb_size = td.sb_size;
+    for plane in 0..num_planes {
+        let rt = td.frame.lr.frame_restoration_type[plane];
+        if rt == crate::frame_header_tail::RESTORATION_NONE {
+            continue;
+        }
+        let unit_size = fs.lr_unit_size[plane];
+        if unit_size == 0 {
+            continue;
+        }
+        // Convert SB luma extent into plane-local samples — chroma is
+        // subsampled via the plane's `sub_x / sub_y`.
+        let (sub_x, sub_y) = if plane == 0 {
+            (0u32, 0u32)
+        } else {
+            (fs.sub_x, fs.sub_y)
+        };
+        let plane_x_start = sb_x >> sub_x;
+        let plane_y_start = sb_y >> sub_y;
+        let plane_x_end = ((sb_x + sb_size) >> sub_x).min(plane_width(fs, plane));
+        let plane_y_end = ((sb_y + sb_size) >> sub_y).min(plane_height(fs, plane));
+        if plane_x_start >= plane_x_end || plane_y_start >= plane_y_end {
+            continue;
+        }
+        // Compute the LR-unit column/row range whose top-left corner
+        // is inside the SB's plane rectangle. Since unit corners land
+        // on multiples of `unit_size`, we pick all units `u` such that
+        // `u * unit_size ∈ [plane_start, plane_end)` — i.e. the
+        // half-open range `[div_ceil_start, div_end)`.
+        let col_start = div_ceil_or_zero(plane_x_start, unit_size);
+        let col_end = div_ceil_or_zero(plane_x_end, unit_size);
+        let row_start = div_ceil_or_zero(plane_y_start, unit_size);
+        let row_end = div_ceil_or_zero(plane_y_end, unit_size);
+        let col_end = col_end.min(fs.lr_cols[plane]);
+        let row_end = row_end.min(fs.lr_rows[plane]);
+        for rrow in row_start..row_end {
+            for rcol in col_start..col_end {
+                let params = td.decode_lr_unit(plane)?;
+                *fs.lr_unit_mut(plane, rcol, rrow) = params;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plane_width(fs: &FrameState, plane: usize) -> u32 {
+    if plane == 0 {
+        fs.width
+    } else {
+        fs.uv_width
+    }
+}
+
+fn plane_height(fs: &FrameState, plane: usize) -> u32 {
+    if plane == 0 {
+        fs.height
+    } else {
+        fs.uv_height
+    }
+}
+
+/// Ceiling division `⌈a / b⌉`, returning 0 when `b == 0`.
+fn div_ceil_or_zero(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        0
+    } else {
+        a.div_ceil(b)
+    }
 }
 
 /// Recursively decode a partition node at `(x, y)` of size `bs`.
