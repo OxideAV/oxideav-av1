@@ -52,6 +52,7 @@ pub mod cdfs;
 pub mod decoder;
 pub mod extradata;
 pub mod frame_header;
+pub mod frame_header_tail;
 pub mod intra;
 pub mod obu;
 pub mod sequence_header;

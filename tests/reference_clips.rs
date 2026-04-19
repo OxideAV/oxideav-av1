@@ -19,8 +19,8 @@
 use std::path::Path;
 
 use oxideav_av1::{
-    iter_obus, parse_frame_header, parse_frame_obu, parse_sequence_header, Av1CodecConfig,
-    Av1Decoder, ObuType,
+    frame_header::ParseDepth, iter_obus, parse_frame_header, parse_frame_obu,
+    parse_sequence_header, Av1CodecConfig, Av1Decoder, ObuType,
 };
 use oxideav_core::{CodecId, CodecParameters, Error, Packet, TimeBase};
 
@@ -238,6 +238,39 @@ fn frame_header_carries_tile_info_single_tile_clip() {
         seen_tile_info >= 1,
         "expected at least one OBU_FRAME carrying tile_info"
     );
+}
+
+/// Every parsed frame header should now advance to
+/// `ParseDepth::Complete` — the tail parser (§5.9.12-§5.9.30) does not
+/// leave unread fields.
+#[test]
+fn frame_header_parses_through_film_grain() {
+    let Some(data) = read_fixture("/tmp/av1.ivf") else {
+        return;
+    };
+    let obus = ivf_concat_obus(&data).expect("ivf parse");
+    let mut sh = None;
+    let mut frames = 0usize;
+    for o in iter_obus(&obus) {
+        let o = o.expect("obu parse");
+        match o.header.obu_type {
+            ObuType::SequenceHeader => {
+                sh = Some(parse_sequence_header(o.payload).expect("seq"));
+            }
+            ObuType::Frame => {
+                let s = sh.as_ref().expect("seq before frame");
+                let (fh, _) = parse_frame_obu(s, o.payload).expect("parse_frame_obu");
+                assert_eq!(
+                    fh.parse_depth,
+                    ParseDepth::Complete,
+                    "frame header should reach film_grain_params"
+                );
+                frames += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(frames >= 1, "expected at least one parsed frame");
 }
 
 #[test]

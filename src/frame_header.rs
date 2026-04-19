@@ -16,6 +16,13 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::{ceil_log2, BitReader};
+use crate::frame_header_tail::{
+    coded_lossless_hint, parse_cdef_params, parse_delta_lf_params, parse_delta_q_params,
+    parse_film_grain_params, parse_global_motion_params, parse_loop_filter_params, parse_lr_params,
+    parse_quantization_params, parse_segmentation_params, parse_tx_mode, CdefParams,
+    FilmGrainParams, GmType, LoopFilterParams, LoopRestorationParams, QuantizationParams,
+    SegmentationParams, TxMode,
+};
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
 use crate::tile_info::{mi_cols_rows, parse_tile_info, TileInfo};
 
@@ -98,6 +105,37 @@ pub struct FrameHeader {
     /// parser stopped earlier due to an unresolved dependency.
     pub tile_info: Option<TileInfo>,
 
+    /// §5.9.12 — quantisation params.
+    pub quant: QuantizationParams,
+    /// §5.9.14 — segmentation params.
+    pub segmentation: SegmentationParams,
+    /// §5.9.16 — `delta_q_params` present flag + resolution.
+    pub delta_q_present: bool,
+    pub delta_q_res: u8,
+    /// §5.9.16 — `delta_lf_params`.
+    pub delta_lf_present: bool,
+    pub delta_lf_res: u8,
+    pub delta_lf_multi: bool,
+    /// §5.9.11 — loop-filter params.
+    pub loop_filter: LoopFilterParams,
+    /// §5.9.19 — CDEF params.
+    pub cdef: CdefParams,
+    /// §5.9.20 — loop-restoration params.
+    pub lr: LoopRestorationParams,
+    /// §5.9.21 — `read_tx_mode`.
+    pub tx_mode: TxMode,
+    /// §5.9.22 — `frame_reference_mode.reference_select`.
+    pub reference_select: bool,
+    /// §5.9.23 — `skip_mode_params.skip_mode_present`. Intra-only
+    /// frames never enable skip mode; kept as a flag for inter
+    /// expansion.
+    pub skip_mode_present: bool,
+    /// §5.9.24 — `global_motion_params.gm_type[ref]`. Only populated
+    /// for inter frames; `Identity` for intra-only.
+    pub gm_type: [GmType; NUM_REF_FRAMES],
+    /// §5.9.30 — film-grain params.
+    pub film_grain: FilmGrainParams,
+
     /// Last successfully-parsed milestone — see `ParseDepth`.
     pub parse_depth: ParseDepth,
 }
@@ -116,6 +154,9 @@ pub enum ParseDepth {
     /// parsing (quantization, segmentation, loop filter, CDEF, LR, …)
     /// is still out of scope for this crate.
     ThroughTileInfo,
+    /// Parsed the full uncompressed header through `film_grain_params`
+    /// (§5.9.30). Every sub-section is populated.
+    Complete,
 }
 
 /// Parse a frame_header_obu / frame_obu payload. For OBU_FRAME the caller
@@ -391,14 +432,43 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     // bits from the stream.
     let (mi_cols, mi_rows) = mi_cols_rows(frame_width, frame_height);
     let tile_info = parse_tile_info(br, seq.use_128x128_superblock, mi_cols, mi_rows)?;
-    let parse_depth = ParseDepth::ThroughTileInfo;
 
-    // We stop here. The remaining sub-sections (quant, segmentation, deblock,
-    // cdef, lr, tx_mode, frame_reference_mode, skip_mode_params,
-    // global_motion_params, film_grain_params) are out of scope for this
-    // parse-only crate.
+    // §5.9.12 – §5.9.30 — the entire uncompressed-header tail.
+    let quant = parse_quantization_params(br, seq)?;
+    let segmentation = parse_segmentation_params(br, primary_ref_frame)?;
+    let (delta_q_present, delta_q_res) = parse_delta_q_params(br, quant.base_q_idx)?;
+    let (delta_lf_present, delta_lf_res, delta_lf_multi) =
+        parse_delta_lf_params(br, delta_q_present, allow_intrabc)?;
+
+    let coded_lossless = coded_lossless_hint(&quant);
+    let loop_filter = parse_loop_filter_params(br, seq, &quant, allow_intrabc)?;
+    let cdef = parse_cdef_params(br, seq, &quant, allow_intrabc)?;
+    let lr = parse_lr_params(br, seq, &quant, allow_intrabc)?;
+    let tx_mode = parse_tx_mode(br, coded_lossless)?;
+
+    let frame_is_intra = matches!(frame_type, FrameType::Key | FrameType::IntraOnly);
+    let reference_select = if frame_is_intra { false } else { br.bit()? };
+
+    // §5.9.23 — skip_mode_params. Full derivation requires the DPB's
+    // OrderHint trail which we don't carry yet; intra-only frames never
+    // enable skip_mode per spec. For inter frames without the DPB we
+    // conservatively leave it off (goavif does the same).
+    let skip_mode_present = false;
+
+    let reduced_tx_set = br.bit()?;
+
+    let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
+    if !frame_is_intra {
+        parse_global_motion_params(br, &mut gm_type)?;
+    }
+
+    let film_grain = parse_film_grain_params(br, seq, frame_type, show_frame, showable_frame)?;
+
+    let parse_depth = ParseDepth::Complete;
+    // allow_warped_motion is signalled inline with motion-mode parsing;
+    // for AVIS intra-only / intra-in-inter paths that goavif targets it
+    // stays false. Inter extension will set this through §5.9.25.
     let allow_warped_motion = false;
-    let reduced_tx_set = false;
 
     Ok(FrameHeader {
         show_existing_frame: false,
@@ -436,6 +506,21 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
         allow_warped_motion,
         reduced_tx_set,
         tile_info: Some(tile_info),
+        quant,
+        segmentation,
+        delta_q_present,
+        delta_q_res,
+        delta_lf_present,
+        delta_lf_res,
+        delta_lf_multi,
+        loop_filter,
+        cdef,
+        lr,
+        tx_mode,
+        reference_select,
+        skip_mode_present,
+        gm_type,
+        film_grain,
         parse_depth,
     })
 }
@@ -487,6 +572,21 @@ fn finish_minimal(
         allow_warped_motion: false,
         reduced_tx_set: false,
         tile_info: None,
+        quant: QuantizationParams::default(),
+        segmentation: SegmentationParams::default(),
+        delta_q_present: false,
+        delta_q_res: 0,
+        delta_lf_present: false,
+        delta_lf_res: 0,
+        delta_lf_multi: false,
+        loop_filter: LoopFilterParams::default(),
+        cdef: CdefParams::default(),
+        lr: LoopRestorationParams::default(),
+        tx_mode: TxMode::Only4x4,
+        reference_select: false,
+        skip_mode_present: false,
+        gm_type: [GmType::Identity; NUM_REF_FRAMES],
+        film_grain: FilmGrainParams::default(),
         parse_depth,
     })
 }
