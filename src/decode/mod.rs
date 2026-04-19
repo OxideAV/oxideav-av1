@@ -18,6 +18,7 @@ pub mod block;
 pub mod coeff_ctx;
 pub mod coeffs;
 pub mod frame_state;
+pub mod lr_unit;
 pub mod modes;
 pub mod partition;
 pub mod reconstruct;

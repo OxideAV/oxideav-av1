@@ -21,6 +21,17 @@
 //! the public entrypoints. [`apply_frame`] drives all three planes
 //! with the chroma-from-luma blending prescribed by §7.20.3.2.
 
+// `clippy::needless_range_loop`: the per-block overlap state couples
+// `by/bx` to `right_seam/bottom_seam` reads AND writes (including
+// reads from `right_seam[by]` slot that's only populated once per
+// `by` iteration), so iterator-based rewrites obscure the algorithm.
+// `clippy::too_many_arguments`: the public entrypoints mirror the
+// libaom / goavif signatures (plane + dims + stride + scaling +
+// template + params + bit-depth); merging them into a struct helps
+// nothing.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
+
 use super::patch::Template;
 use super::rng::Rng;
 use super::scaling::ScalingLut;
@@ -113,8 +124,8 @@ pub fn apply_with_template(
     // directly above (2×32 samples, row-major). `right_seam[by]`
     // holds the last two cols of pre-overlap grain from the block
     // directly to the left (32×2 samples, row-major, 2 cols wide).
-    let block_cols = (w + 31) / 32;
-    let block_rows = (h + 31) / 32;
+    let block_cols = w.div_ceil(32);
+    let block_rows = h.div_ceil(32);
     let mut bottom_seam: Vec<Vec<i32>> = vec![Vec::new(); block_cols];
     let mut right_seam: Vec<Vec<i32>> = vec![Vec::new(); block_rows];
 
@@ -208,8 +219,8 @@ pub fn apply_with_template16(
     let (max_r, max_c) = offset_bounds(template);
     let mut rng = Rng::new(0);
 
-    let block_cols = (w + 31) / 32;
-    let block_rows = (h + 31) / 32;
+    let block_cols = w.div_ceil(32);
+    let block_rows = h.div_ceil(32);
     let mut bottom_seam: Vec<Vec<i32>> = vec![Vec::new(); block_cols];
     let mut right_seam: Vec<Vec<i32>> = vec![Vec::new(); block_rows];
 
@@ -264,16 +275,24 @@ pub fn apply_with_template16(
     }
 }
 
+/// Borrowed chroma-plane pair used by [`apply_frame`].
+pub struct ChromaPlanes<'a> {
+    pub u: &'a mut [u8],
+    pub v: &'a mut [u8],
+    pub w: usize,
+    pub h: usize,
+    pub stride: usize,
+}
+
 /// Run film-grain synthesis on all three 8-bit planes using the
-/// per-plane LUTs and templates carried in `p`. Pass `None` for `u/v`
-/// to leave chroma untouched.
-#[allow(clippy::too_many_arguments)]
+/// per-plane LUTs and templates carried in `p`. Pass `None` to skip
+/// chroma.
 pub fn apply_frame(
     y: &mut [u8],
     yw: usize,
     yh: usize,
     stride_y: usize,
-    uv: Option<(&mut [u8], &mut [u8], usize, usize, usize)>,
+    uv: Option<ChromaPlanes<'_>>,
     y_template: &Template,
     cb_template: &Template,
     cr_template: &Template,
@@ -283,17 +302,11 @@ pub fn apply_frame(
         return;
     }
     apply_with_template(y, yw, yh, stride_y, &p.scaling_y, y_template, p);
-    if let Some((u, v, cw, ch, stride_c)) = uv {
-        // Chroma uses a chroma-seeded template but the same tiling
-        // algorithm. Chroma's restricted-range high clip is 240 (not
-        // 235 like luma) — handle by building a chroma-specific
-        // Params instance.
-        let mut p_cb = p.clone();
-        p_cb.scaling_y = p.scaling_u;
-        apply_with_template_chroma(u, cw, ch, stride_c, &p.scaling_u, cb_template, &p_cb);
-        let mut p_cr = p.clone();
-        p_cr.scaling_y = p.scaling_v;
-        apply_with_template_chroma(v, cw, ch, stride_c, &p.scaling_v, cr_template, &p_cr);
+    if let Some(c) = uv {
+        // Chroma's restricted-range high clip is 240 (not 235 like
+        // luma) — [`apply_with_template_chroma`] handles this.
+        apply_with_template_chroma(c.u, c.w, c.h, c.stride, &p.scaling_u, cb_template, p);
+        apply_with_template_chroma(c.v, c.w, c.h, c.stride, &p.scaling_v, cr_template, p);
     }
 }
 
@@ -324,8 +337,8 @@ pub fn apply_with_template_chroma(
     let (max_r, max_c) = offset_bounds(template);
     let mut rng = Rng::new(0);
 
-    let block_cols = (w + 31) / 32;
-    let block_rows = (h + 31) / 32;
+    let block_cols = w.div_ceil(32);
+    let block_rows = h.div_ceil(32);
     let mut bottom_seam: Vec<Vec<i32>> = vec![Vec::new(); block_cols];
     let mut right_seam: Vec<Vec<i32>> = vec![Vec::new(); block_rows];
 
@@ -428,9 +441,10 @@ mod tests {
             ..Default::default()
         };
         apply_with_template(&mut plane, 32, 32, 32, &lut, &t, &p);
-        for &v in &plane {
-            assert!(v <= 255);
-        }
+        // u8 is always ≤ 255; this assertion simply documents we
+        // exercise the saturation path without escaping the type
+        // range.
+        assert_eq!(plane.len(), 32 * 32);
     }
 
     #[test]
@@ -462,7 +476,7 @@ mod tests {
         };
         apply_with_template16(&mut plane, 64, 64, 64, &lut, &t, &p, 10);
         for &v in &plane {
-            assert!(v >= 64 && v <= 940, "sample {v} escaped [64, 940]");
+            assert!((64..=940).contains(&v), "sample {v} escaped [64, 940]");
         }
     }
 
@@ -548,7 +562,13 @@ mod tests {
             w,
             h,
             w,
-            Some((&mut u, &mut v, cw, ch, cw)),
+            Some(ChromaPlanes {
+                u: &mut u,
+                v: &mut v,
+                w: cw,
+                h: ch,
+                stride: cw,
+            }),
             &yt,
             &ct,
             &ct,

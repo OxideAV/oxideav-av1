@@ -159,6 +159,7 @@ pub fn sgr_sub_filter(
 
 /// `uint16` counterpart of [`sgr_sub_filter`]. `eps` should already be
 /// scaled for `bit_depth` by the caller.
+#[allow(clippy::too_many_arguments)] // Mirrors the goavif SGRSubFilter16 signature.
 pub fn sgr_sub_filter16(
     dst: &mut [u16],
     src: &[u16],
@@ -181,7 +182,7 @@ pub fn sgr_sub_filter16(
     let n = (2 * r + 1) * (2 * r + 1);
     let n64 = n as i64;
     let shift = 2 * (bit_depth as i64 - 8);
-    let max_v = ((1i32 << bit_depth) - 1) as i32;
+    let max_v: i32 = (1i32 << bit_depth) - 1;
     let mut tmp = vec![0u16; w * h];
     for y in 0..h {
         for x in 0..w {
@@ -354,7 +355,7 @@ mod tests {
         for r in 2..h - 2 {
             for c in 2..w - 2 {
                 let v = dst[r * w + c];
-                assert!(v >= 30 && v <= 170, "dst[{r},{c}]={v}");
+                assert!((30..=170).contains(&v), "dst[{r},{c}]={v}");
             }
         }
     }

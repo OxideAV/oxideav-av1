@@ -55,24 +55,24 @@ fn tap_coeff(taps: WienerTaps, k: usize) -> i32 {
 /// Apply a 1-D 7-tap symmetric Wiener convolution across a row. Source
 /// samples are read with edge-clamped indexing.
 fn convolve_row(dst: &mut [u8], src: &[u8], w: usize, taps: WienerTaps) {
-    for i in 0..w {
+    for (i, slot) in dst.iter_mut().enumerate().take(w) {
         let mut acc: i32 = 0;
         for k in 0..7 {
             let j = (i as i32 + k as i32 - 3).clamp(0, (w as i32) - 1) as usize;
             acc += tap_coeff(taps, k) * src[j] as i32;
         }
-        dst[i] = clip8((acc + 64) >> 7);
+        *slot = clip8((acc + 64) >> 7);
     }
 }
 
 fn convolve_row16(dst: &mut [u16], src: &[u16], w: usize, taps: WienerTaps, bit_depth: u32) {
-    for i in 0..w {
+    for (i, slot) in dst.iter_mut().enumerate().take(w) {
         let mut acc: i32 = 0;
         for k in 0..7 {
             let j = (i as i32 + k as i32 - 3).clamp(0, (w as i32) - 1) as usize;
             acc += tap_coeff(taps, k) * src[j] as i32;
         }
-        dst[i] = clip_bd((acc + 64) >> 7, bit_depth);
+        *slot = clip_bd((acc + 64) >> 7, bit_depth);
     }
 }
 
@@ -108,6 +108,7 @@ pub fn apply_wiener(
 
 /// `uint16` counterpart of [`apply_wiener`]. Output is clipped to
 /// `[0, (1 << bit_depth) - 1]`.
+#[allow(clippy::too_many_arguments)] // Mirrors the goavif ApplyWiener16 signature.
 pub fn apply_wiener16(
     dst: &mut [u16],
     src: &[u16],
@@ -182,7 +183,7 @@ mod tests {
         for r in 2..h - 2 {
             for c in 2..w - 2 {
                 let v = dst[r * w + c];
-                assert!(v >= 20 && v <= 180, "dst[{r},{c}]={v}");
+                assert!((20..=180).contains(&v), "dst[{r},{c}]={v}");
             }
         }
     }

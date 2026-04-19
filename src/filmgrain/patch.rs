@@ -9,21 +9,11 @@ use super::ar::{apply_ar, generate_grain_template};
 
 /// Rectangular block of pre-computed grain samples. The spec builds a
 /// 73×73 luma template (§7.20.3.5); chroma uses 38×38 (§7.20.3.6).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Template {
     pub data: Vec<i16>,
     pub rows: usize,
     pub cols: usize,
-}
-
-impl Default for Template {
-    fn default() -> Self {
-        Self {
-            data: Vec::new(),
-            rows: 0,
-            cols: 0,
-        }
-    }
 }
 
 /// Build the 73×73 luma template with LFSR samples optionally shaped

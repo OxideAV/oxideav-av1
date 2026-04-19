@@ -1,22 +1,24 @@
 //! AV1 (AOMedia Video 1) — pure-Rust decoder for oxideav.
 //!
-//! Phase 5 scope (this revision): OBU walk + sequence/frame headers +
+//! Phase 6 scope (this revision): OBU walk + sequence/frame headers +
 //! tile partition walk + mode decode + coefficient decode +
 //! dequantisation + the full 4/8/16/32/64-point inverse transform
 //! kernel set + every intra predictor (DC/V/H + 6 directional + 3
 //! smooth + Paeth + filter-intra + CFL) in both 8-bit and 10/12-bit
 //! (native u16) variants + per-frame deblocking (narrow 4-tap) +
-//! CDEF (direction search + primary/secondary filter). The decoder
-//! produces pixel-accurate still-image output for aomenc-generated
-//! key-frame-only clips.
+//! CDEF (direction search + primary/secondary filter) + **loop
+//! restoration** (Wiener + SGR with full §5.11.40-.44 per-unit
+//! signalling) + **film grain synthesis** (spec §7.20.2 32×32 tiler
+//! on top of AR-shaped 73×73 luma / 38×38 chroma templates). The
+//! decoder produces pixel-accurate AVIF still-image output for
+//! intra-only clips including LR + film-grain combinations.
 //!
 //! Still deferred:
 //!
-//! * Inter prediction (§7.11.3, Phase 6).
-//! * Wide deblocking (8/14-tap) drivers — Phase 5 ships only the
-//!   narrow filter; wider widths are invoked per-edge-class by a
+//! * Inter prediction (§7.11.3, Phase 7).
+//! * Wide deblocking (8/14-tap) drivers — only the narrow filter is
+//!   currently invoked; wider widths are applied per-edge-class by a
 //!   future pass.
-//! * Loop restoration (§7.17, Phase 7) and film grain (§7.20).
 //! * Quantisation matrices (§5.9.12).
 //!
 //! Every error message includes the precise §ref so callers can see
@@ -61,10 +63,12 @@ pub const CODEC_ID_STR: &str = "av1";
 /// Register the AV1 decoder factory with a codec registry.
 ///
 /// The implementation declares `av1_sw_decode_still` to make the build
-/// visible in `oxideav list`-style output: every Phase 5 surface is
-/// wired — full intra predictor set + deblocking + CDEF on top of the
-/// Phase 1-4 header/OBU/coefficient pipeline. Intra-only AVIF stills
-/// should decode end-to-end in 8-bit and 10/12-bit HBD.
+/// visible in `oxideav list`-style output: every Phase 6 surface is
+/// wired — full intra predictor set + deblocking + CDEF + loop
+/// restoration (Wiener + SGR with per-unit signal decode) + film
+/// grain synthesis on top of the Phase 1-4 header/OBU/coefficient
+/// pipeline. Intra-only AVIF stills should decode end-to-end in
+/// 8-bit and 10/12-bit HBD, with or without LR / film-grain.
 pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("av1_sw_decode_still")
         .with_lossy(true)

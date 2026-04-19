@@ -34,10 +34,11 @@ impl Rng {
     }
 
     /// Advance one step and return the new state.
+    #[allow(clippy::should_implement_trait)] // Not an Iterator — returns u16 not Option<u16>.
     pub fn next(&mut self) -> u16 {
         // Taps: bits 0, 1, 3, 12.
-        let bit = ((self.state >> 0) ^ (self.state >> 1) ^ (self.state >> 3) ^ (self.state >> 12))
-            & 1;
+        let bit =
+            (self.state ^ (self.state >> 1) ^ (self.state >> 3) ^ (self.state >> 12)) & 1;
         self.state = (self.state >> 1) | (bit << 15);
         self.state
     }
@@ -84,7 +85,7 @@ mod tests {
         let mut r = Rng::new(0x4321);
         for _ in 0..1000 {
             let b = r.byte();
-            assert!(b >= -128 && b <= 127);
+            assert!((-128..=127).contains(&b));
         }
     }
 }

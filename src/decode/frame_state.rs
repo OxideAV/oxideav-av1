@@ -7,6 +7,8 @@
 //! drop the pixel buffers and keep only the MI grid plus the
 //! subsampling / bit-depth context needed by the chroma code paths.
 
+use crate::lr::UnitParams as LrUnitParams;
+
 use super::modes::IntraMode;
 
 /// Per-MI-unit (4×4 block) decoded mode information. Values are
@@ -82,6 +84,18 @@ pub struct FrameState {
     pub uv_width: u32,
     /// UV plane height after subsampling.
     pub uv_height: u32,
+
+    /// Per-restoration-unit LR parameters, indexed as
+    /// `lr_unit_info[plane][row * lr_cols[plane] + col]` (§5.11.40-.44).
+    /// Each inner `Vec` has `lr_cols[plane] * lr_rows[plane]` entries.
+    pub lr_unit_info: [Vec<LrUnitParams>; 3],
+    /// Number of restoration-unit columns per plane.
+    pub lr_cols: [u32; 3],
+    /// Number of restoration-unit rows per plane.
+    pub lr_rows: [u32; 3],
+    /// Per-plane restoration unit size in luma-plane samples (or
+    /// chroma-plane samples on planes 1/2 if subsampled).
+    pub lr_unit_size: [u32; 3],
 }
 
 impl FrameState {
@@ -167,7 +181,48 @@ impl FrameState {
             },
             uv_width,
             uv_height,
+            lr_unit_info: [Vec::new(), Vec::new(), Vec::new()],
+            lr_cols: [0, 0, 0],
+            lr_rows: [0, 0, 0],
+            lr_unit_size: [0, 0, 0],
         }
+    }
+
+    /// Allocate per-plane `lr_unit_info` storage sized for `cols × rows`
+    /// restoration units. Entries are initialised to `FilterType::None`
+    /// so unsignalled units pass through unchanged. Matches libaom's
+    /// `av1_alloc_restoration_struct`.
+    pub fn alloc_lr_units(
+        &mut self,
+        plane: usize,
+        unit_size_samples: u32,
+        cols: u32,
+        rows: u32,
+    ) {
+        self.lr_cols[plane] = cols;
+        self.lr_rows[plane] = rows;
+        self.lr_unit_size[plane] = unit_size_samples;
+        self.lr_unit_info[plane] =
+            vec![LrUnitParams::default(); (cols as usize) * (rows as usize)];
+    }
+
+    /// Index into the per-plane `lr_unit_info` table. Out-of-range
+    /// coordinates clip to the last entry in that plane.
+    pub fn lr_unit_mut(&mut self, plane: usize, col: u32, row: u32) -> &mut LrUnitParams {
+        let cols = self.lr_cols[plane].max(1) as usize;
+        let rows = self.lr_rows[plane].max(1) as usize;
+        let col = (col as usize).min(cols - 1);
+        let row = (row as usize).min(rows - 1);
+        &mut self.lr_unit_info[plane][row * cols + col]
+    }
+
+    /// Immutable counterpart of [`FrameState::lr_unit_mut`].
+    pub fn lr_unit_at(&self, plane: usize, col: u32, row: u32) -> &LrUnitParams {
+        let cols = self.lr_cols[plane].max(1) as usize;
+        let rows = self.lr_rows[plane].max(1) as usize;
+        let col = (col as usize).min(cols - 1);
+        let row = (row as usize).min(rows - 1);
+        &self.lr_unit_info[plane][row * cols + col]
     }
 
     /// Mutable access to the ModeInfo at `(mi_col, mi_row)`. Panics on

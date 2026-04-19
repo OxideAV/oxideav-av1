@@ -88,7 +88,7 @@ mod tests {
     fn template_range_is_signed_byte() {
         let g = generate_grain_template(32, 32, 0xABCD);
         for &v in &g {
-            assert!(v >= -128 && v <= 127, "sample {v} escaped signed-byte range");
+            assert!((-128..=127).contains(&v), "sample {v} escaped signed-byte range");
         }
     }
 
@@ -128,11 +128,11 @@ mod tests {
 
     #[test]
     fn results_stay_in_bounds() {
-        let mut g = generate_grain_template(32, 32, 0xA5A5u16 as u16);
+        let mut g = generate_grain_template(32, 32, 0xA5A5_u16);
         let coeffs = vec![127i8; (2 * 3 + 1) * 3 + 3];
         apply_ar(&mut g, 32, 32, 3, &coeffs, 6);
         for &v in &g {
-            assert!(v >= -2048 && v <= 2047);
+            assert!((-2048..=2047).contains(&v));
         }
     }
 }
