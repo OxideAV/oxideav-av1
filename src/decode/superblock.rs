@@ -836,6 +836,11 @@ fn reconstruct_inter_chroma_block(
 
 /// Reconstruct the Y plane for a single leaf block: predict → (if not
 /// skip) decode residual → inverse transform → clip-add into `fs.y_plane`.
+///
+/// AV1's max TX size is 64×64 (§5.11.27, Table `Max_Tx_Size_Rect`), so
+/// blocks of 128×128 / 128×64 / 64×128 are split into a 2×2 / 2×1 / 1×2
+/// grid of 64×64 TX units. Smaller blocks degenerate to a single TX
+/// unit (the loop runs once), matching the pre-split behaviour.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_luma_block(
     td: &mut TileDecoder<'_>,
@@ -897,11 +902,47 @@ fn reconstruct_luma_block(
         return Ok(());
     }
 
-    let (sz, num_coeffs, scan) = select_square_tx(w, h)?;
-    let tx_idx = tx_size_idx(w, h)?;
-    let nz = nz_map_ctx_offset(w, h)?;
-
+    // Block-level tx_type (§6.10.15): for blocks with area > 32×32 the
+    // ext-tx set is 0 (implicit DCT_DCT, no CDF read), so decoding the
+    // type once here covers every TX unit below without disturbing the
+    // symbol stream. For blocks with area ≤ 32×32 there is exactly one
+    // TX unit (since the block already fits inside a 64×64 TX), so
+    // reading the type once remains spec-correct.
     let tx_type = td.decode_intra_tx_type(w, h, y_mode)?;
+
+    let (tx_w, tx_h) = tx_unit_dims(w, h);
+    let cols = w / tx_w;
+    let rows = h / tx_h;
+    for ty in 0..rows {
+        for tx in 0..cols {
+            let ux = x as usize + tx * tx_w;
+            let uy = y as usize + ty * tx_h;
+            decode_one_luma_tx_unit(td, fs, ux, uy, tx_w, tx_h, tx_type, segment_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decode residual for a single luma TX unit at plane coordinates
+/// `(ux, uy)`, dimensions `tx_w × tx_h ≤ 64×64`. Reads coefficients,
+/// dequantises, inverse-transforms, and clip-adds into `fs.y_plane` /
+/// `fs.y_plane16`. The predictor must already be pasted into the
+/// destination plane by the caller.
+#[allow(clippy::too_many_arguments)]
+fn decode_one_luma_tx_unit(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    ux: usize,
+    uy: usize,
+    tx_w: usize,
+    tx_h: usize,
+    tx_type: TxType,
+    segment_id: u8,
+) -> Result<()> {
+    let stride = fs.width as usize;
+    let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
+    let tx_idx = tx_size_idx(tx_w, tx_h)?;
+    let nz = nz_map_ctx_offset(tx_w, tx_h)?;
 
     let mut coeffs = decode_coefficients(
         &mut td.symbol,
@@ -911,8 +952,8 @@ fn reconstruct_luma_block(
         num_coeffs,
         &scan,
         nz,
-        w,
-        h,
+        tx_w,
+        tx_h,
     )?;
 
     let base_q = segmented_base_q(td, segment_id);
@@ -938,54 +979,31 @@ fn reconstruct_luma_block(
         }
     }
 
-    let shift = residual_shift(w, h);
+    let shift = residual_shift(tx_w, tx_h);
     for v in coeffs.iter_mut() {
         *v = round_shift(*v, shift);
     }
     if fs.bit_depth == 8 {
-        let mut block = vec![0u8; w * h];
-        extract_block(
-            &fs.y_plane,
-            stride,
-            x as usize,
-            y as usize,
-            w,
-            h,
-            &mut block,
-        );
-        clip_add_in_place(&mut block, &coeffs, w, h);
-        paste_block(
-            &mut fs.y_plane,
-            stride,
-            x as usize,
-            y as usize,
-            &block,
-            w,
-            h,
-        );
+        let mut block = vec![0u8; tx_w * tx_h];
+        extract_block(&fs.y_plane, stride, ux, uy, tx_w, tx_h, &mut block);
+        clip_add_in_place(&mut block, &coeffs, tx_w, tx_h);
+        paste_block(&mut fs.y_plane, stride, ux, uy, &block, tx_w, tx_h);
     } else {
-        let mut block = vec![0u16; w * h];
-        extract_block16(
-            &fs.y_plane16,
-            stride,
-            x as usize,
-            y as usize,
-            w,
-            h,
-            &mut block,
-        );
-        clip_add_in_place16(&mut block, &coeffs, w, h, fs.bit_depth);
-        paste_block16(
-            &mut fs.y_plane16,
-            stride,
-            x as usize,
-            y as usize,
-            &block,
-            w,
-            h,
-        );
+        let mut block = vec![0u16; tx_w * tx_h];
+        extract_block16(&fs.y_plane16, stride, ux, uy, tx_w, tx_h, &mut block);
+        clip_add_in_place16(&mut block, &coeffs, tx_w, tx_h, fs.bit_depth);
+        paste_block16(&mut fs.y_plane16, stride, ux, uy, &block, tx_w, tx_h);
     }
     Ok(())
+}
+
+/// TX-unit dimensions for a leaf block of size `w × h` — per AV1's
+/// `Max_Tx_Size_Rect` rule any dimension larger than 64 samples splits
+/// into 64-wide (resp. 64-tall) TX units. Returns `(tx_w, tx_h)` such
+/// that `w % tx_w == 0` and `h % tx_h == 0`.
+#[inline]
+fn tx_unit_dims(w: usize, h: usize) -> (usize, usize) {
+    (w.min(64), h.min(64))
 }
 
 /// Pick the `(TxSize, num_coeffs, scan)` triple for the given block
@@ -1184,80 +1202,115 @@ fn reconstruct_chroma_block(
             continue;
         }
 
-        let (sz, num_coeffs, scan) = select_square_tx(cw_clip, ch_clip)?;
-        let tx_idx = tx_size_idx(cw_clip, ch_clip)?;
-        let nz = nz_map_ctx_offset(cw_clip, ch_clip)?;
-
-        let mut coeffs = decode_coefficients(
-            &mut td.symbol,
-            &mut td.coeff_bank,
-            tx_idx,
-            1, /* chroma */
-            num_coeffs,
-            &scan,
-            nz,
-            cw_clip,
-            ch_clip,
-        )?;
-
-        let base_q = segmented_base_q(td, segment_id);
-        let plane = if plane_idx == 0 {
-            quant::Plane::U
-        } else {
-            quant::Plane::V
-        };
-        let qv = quant::Params {
-            base_q_idx: base_q,
-            delta_q_y_dc: td.frame.quant.delta_q_y_dc as i32,
-            delta_q_u_dc: td.frame.quant.delta_q_u_dc as i32,
-            delta_q_u_ac: td.frame.quant.delta_q_u_ac as i32,
-            delta_q_v_dc: td.frame.quant.delta_q_v_dc as i32,
-            delta_q_v_ac: td.frame.quant.delta_q_v_ac as i32,
-            bit_depth: fs.bit_depth,
-        }
-        .compute(plane)?;
-        for (i, c) in coeffs.iter_mut().enumerate() {
-            *c = dequant_coeff(*c, i, qv);
-        }
-
-        inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
-
-        let shift = residual_shift(cw_clip, ch_clip);
-        for v in coeffs.iter_mut() {
-            *v = round_shift(*v, shift);
-        }
-
-        if fs.bit_depth == 8 {
-            let mut block = vec![0u8; cw_clip * ch_clip];
-            let plane_buf = if plane_idx == 0 {
-                &fs.u_plane
-            } else {
-                &fs.v_plane
-            };
-            extract_block(plane_buf, stride, cx, cy, cw_clip, ch_clip, &mut block);
-            clip_add_in_place(&mut block, &coeffs, cw_clip, ch_clip);
-            if plane_idx == 0 {
-                paste_block(&mut fs.u_plane, stride, cx, cy, &block, cw_clip, ch_clip);
-            } else {
-                paste_block(&mut fs.v_plane, stride, cx, cy, &block, cw_clip, ch_clip);
-            }
-        } else {
-            let mut block = vec![0u16; cw_clip * ch_clip];
-            let plane_buf = if plane_idx == 0 {
-                &fs.u_plane16
-            } else {
-                &fs.v_plane16
-            };
-            extract_block16(plane_buf, stride, cx, cy, cw_clip, ch_clip, &mut block);
-            clip_add_in_place16(&mut block, &coeffs, cw_clip, ch_clip, fs.bit_depth);
-            if plane_idx == 0 {
-                paste_block16(&mut fs.u_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
-            } else {
-                paste_block16(&mut fs.v_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
+        // Split the chroma block into ≤ 64×64 TX units when either
+        // dimension exceeds 64 (§5.11.27). For 4:2:0 this only happens
+        // under 4:4:4 sampling with bw/bh of 128 — for 4:2:0 a 128×128
+        // luma block already maps to 64×64 chroma and the loop runs once.
+        let (tx_w, tx_h) = tx_unit_dims(cw_clip, ch_clip);
+        let cols = cw_clip / tx_w;
+        let rows = ch_clip / tx_h;
+        for ty in 0..rows {
+            for txi in 0..cols {
+                let ux = cx + txi * tx_w;
+                let uy = cy + ty * tx_h;
+                decode_one_chroma_tx_unit(td, fs, plane_idx, ux, uy, tx_w, tx_h, segment_id)?;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Decode residual for a single chroma TX unit at plane coordinates
+/// `(ux, uy)`, dimensions `tx_w × tx_h ≤ 64×64`. `plane_idx = 0` → U,
+/// `plane_idx = 1` → V. The predictor (including any CFL overlay) must
+/// already be pasted into the destination plane by the caller. Chroma
+/// intra blocks use implicit `DCT_DCT` per §6.10.15 (the tx_set for
+/// chroma doesn't signal any alternative).
+#[allow(clippy::too_many_arguments)]
+fn decode_one_chroma_tx_unit(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    plane_idx: u32,
+    ux: usize,
+    uy: usize,
+    tx_w: usize,
+    tx_h: usize,
+    segment_id: u8,
+) -> Result<()> {
+    let stride = fs.uv_width as usize;
+    let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
+    let tx_idx = tx_size_idx(tx_w, tx_h)?;
+    let nz = nz_map_ctx_offset(tx_w, tx_h)?;
+
+    let mut coeffs = decode_coefficients(
+        &mut td.symbol,
+        &mut td.coeff_bank,
+        tx_idx,
+        1, /* chroma */
+        num_coeffs,
+        &scan,
+        nz,
+        tx_w,
+        tx_h,
+    )?;
+
+    let base_q = segmented_base_q(td, segment_id);
+    let plane = if plane_idx == 0 {
+        quant::Plane::U
+    } else {
+        quant::Plane::V
+    };
+    let qv = quant::Params {
+        base_q_idx: base_q,
+        delta_q_y_dc: td.frame.quant.delta_q_y_dc as i32,
+        delta_q_u_dc: td.frame.quant.delta_q_u_dc as i32,
+        delta_q_u_ac: td.frame.quant.delta_q_u_ac as i32,
+        delta_q_v_dc: td.frame.quant.delta_q_v_dc as i32,
+        delta_q_v_ac: td.frame.quant.delta_q_v_ac as i32,
+        bit_depth: fs.bit_depth,
+    }
+    .compute(plane)?;
+    for (i, c) in coeffs.iter_mut().enumerate() {
+        *c = dequant_coeff(*c, i, qv);
+    }
+
+    inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
+
+    let shift = residual_shift(tx_w, tx_h);
+    for v in coeffs.iter_mut() {
+        *v = round_shift(*v, shift);
+    }
+
+    if fs.bit_depth == 8 {
+        let mut block = vec![0u8; tx_w * tx_h];
+        let plane_buf = if plane_idx == 0 {
+            &fs.u_plane
+        } else {
+            &fs.v_plane
+        };
+        extract_block(plane_buf, stride, ux, uy, tx_w, tx_h, &mut block);
+        clip_add_in_place(&mut block, &coeffs, tx_w, tx_h);
+        if plane_idx == 0 {
+            paste_block(&mut fs.u_plane, stride, ux, uy, &block, tx_w, tx_h);
+        } else {
+            paste_block(&mut fs.v_plane, stride, ux, uy, &block, tx_w, tx_h);
+        }
+    } else {
+        let mut block = vec![0u16; tx_w * tx_h];
+        let plane_buf = if plane_idx == 0 {
+            &fs.u_plane16
+        } else {
+            &fs.v_plane16
+        };
+        extract_block16(plane_buf, stride, ux, uy, tx_w, tx_h, &mut block);
+        clip_add_in_place16(&mut block, &coeffs, tx_w, tx_h, fs.bit_depth);
+        if plane_idx == 0 {
+            paste_block16(&mut fs.u_plane16, stride, ux, uy, &block, tx_w, tx_h);
+        } else {
+            paste_block16(&mut fs.v_plane16, stride, ux, uy, &block, tx_w, tx_h);
+        }
+    }
     Ok(())
 }
 
