@@ -450,10 +450,27 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     let reference_select = if frame_is_intra { false } else { br.bit()? };
 
     // §5.9.23 — skip_mode_params. Full derivation requires the DPB's
-    // OrderHint trail which we don't carry yet; intra-only frames never
-    // enable skip_mode per spec. For inter frames without the DPB we
-    // conservatively leave it off (goavif does the same).
+    // OrderHint trail which we don't carry yet; intra-only frames
+    // never enable skip_mode per spec. For inter frames we
+    // conservatively leave it off (goavif does the same). The spec
+    // emits a presence bit only under specific OrderHint relationships
+    // (`reference_select && skip_mode_allowed`); without DPB state the
+    // simplest correct thing is to skip the bit entirely — for
+    // aomenc-produced AVIS clips `skip_mode_allowed` is false (no BWD
+    // + FWD ref pair) so the bit is absent from the bitstream.
     let skip_mode_present = false;
+
+    // §5.9.25 — allow_warped_motion. Present only when the sequence
+    // header set `enable_warped_motion`, the frame is non-intra, and
+    // not error-resilient. Comes BEFORE `reduced_tx_set` per spec.
+    let allow_warped_motion = if !frame_is_intra
+        && !error_resilient_mode
+        && seq.enable_warped_motion
+    {
+        br.bit()?
+    } else {
+        false
+    };
 
     let reduced_tx_set = br.bit()?;
 
@@ -465,10 +482,6 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     let film_grain = parse_film_grain_params(br, seq, frame_type, show_frame, showable_frame)?;
 
     let parse_depth = ParseDepth::Complete;
-    // allow_warped_motion is signalled inline with motion-mode parsing;
-    // for AVIS intra-only / intra-in-inter paths that goavif targets it
-    // stays false. Inter extension will set this through §5.9.25.
-    let allow_warped_motion = false;
 
     Ok(FrameHeader {
         show_existing_frame: false,

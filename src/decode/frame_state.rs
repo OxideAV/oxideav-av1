@@ -44,6 +44,14 @@ pub struct ModeInfo {
     pub dc_sign_v: i8,
     /// `txb_skip` — retained for Phase 3. All zero in Phase 2.
     pub txb_skip: bool,
+    /// `is_inter` — marks whether the block used inter prediction.
+    /// Used by the inter decoder to form the above/left context for
+    /// the `is_inter` CDF.
+    pub is_inter: bool,
+    /// Per-block MV (eighth-pel units). Only meaningful when
+    /// `is_inter` is true; `(0, 0)` otherwise.
+    pub mv_row: i32,
+    pub mv_col: i32,
 }
 
 /// Mutable per-frame decoder state.

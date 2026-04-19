@@ -188,9 +188,11 @@ pub fn parse_quantization_params(
     br: &mut BitReader<'_>,
     seq: &SequenceHeader,
 ) -> Result<QuantizationParams> {
+    let base_q_idx = br.f(8)? as u8;
+    let delta_q_y_dc = read_delta_q(br)?;
     let mut q = QuantizationParams {
-        base_q_idx: br.f(8)? as u8,
-        delta_q_y_dc: read_delta_q(br)?,
+        base_q_idx,
+        delta_q_y_dc,
         ..Default::default()
     };
     if seq.color_config.num_planes > 1 {
@@ -472,18 +474,106 @@ pub fn parse_global_motion_params(
             GmType::Identity
         };
         *slot = typ;
-        let extra_pairs = match typ {
-            GmType::Affine => 3,
-            GmType::RotZoom => 2,
-            GmType::Translation => 1,
-            GmType::Identity => 0,
-        };
-        for _ in 0..extra_pairs {
-            let _ = br.su(12)?;
-            let _ = br.su(12)?;
+        // Per §5.9.24 + §5.9.27 read_global_param — we don't retain
+        // the params for Phase 7 but must consume the right bit count.
+        // All reference params default to 0 (no DPB state), so
+        // `decode_signed_subexp_with_ref` uses reference = 0.
+        match typ {
+            GmType::Identity => {}
+            GmType::Translation => {
+                // params [0], [1] at translation precision.
+                read_global_param_no_ref(br, 0)?;
+                read_global_param_no_ref(br, 1)?;
+            }
+            GmType::RotZoom => {
+                read_global_param_no_ref(br, 2)?;
+                read_global_param_no_ref(br, 3)?;
+            }
+            GmType::Affine => {
+                read_global_param_no_ref(br, 2)?;
+                read_global_param_no_ref(br, 3)?;
+                read_global_param_no_ref(br, 4)?;
+                read_global_param_no_ref(br, 5)?;
+            }
         }
     }
     Ok(())
+}
+
+/// §5.9.27 `read_global_param(type, ref, idx)` with the simplifying
+/// assumption that the reference value is zero (no DPB state tracked
+/// in this parser). `idx` selects between translation (0/1) and alpha
+/// (2..=5) precision per §5.9.27.
+fn read_global_param_no_ref(br: &mut BitReader<'_>, _idx: usize) -> Result<()> {
+    // From spec §5.9.27 (global_motion_params → read_global_param):
+    // absBits = (idx < 2) ? GM_ABS_TRANS_ONLY_BITS (12) : GM_ABS_ALPHA_BITS (12)
+    // Spec GM_ABS_ALPHA_BITS=12, GM_ABS_TRANS_ONLY_BITS=12,
+    // GM_ABS_TRANS_BITS=12 (per §3 table). `_idx` is kept in the
+    // signature for documentation only. mx = 1 << absBits.
+    // decode_signed_subexp_with_ref(-mx, mx+1, 0) is read.
+    let abs_bits: u32 = 12;
+    let mx = 1u32 << abs_bits;
+    let _ = decode_signed_subexp_with_ref(br, -(mx as i32), (mx + 1) as i32, 0)?;
+    Ok(())
+}
+
+/// §5.9.28 `decode_signed_subexp_with_ref(low, high, r)`.
+fn decode_signed_subexp_with_ref(
+    br: &mut BitReader<'_>,
+    low: i32,
+    high: i32,
+    r: i32,
+) -> Result<i32> {
+    let mx = (high - low) as u32;
+    let r_shift = (r - low) as u32;
+    let x = decode_unsigned_subexp_with_ref(br, mx, r_shift)?;
+    Ok((x as i32) + low)
+}
+
+fn decode_unsigned_subexp_with_ref(
+    br: &mut BitReader<'_>,
+    mx: u32,
+    r: u32,
+) -> Result<u32> {
+    let v = decode_subexp(br, mx)?;
+    if (r << 1) <= mx {
+        Ok(inverse_recenter(r, v))
+    } else {
+        Ok(mx - 1 - inverse_recenter(mx - 1 - r, v))
+    }
+}
+
+fn decode_subexp(br: &mut BitReader<'_>, num_syms: u32) -> Result<u32> {
+    // Spec §5.9.29.
+    let mut i = 0u32;
+    let mut mk = 0u32;
+    let k = 3u32;
+    loop {
+        let b2 = if i == 0 { k } else { k + i - 1 };
+        let a = 1u32 << b2;
+        if num_syms <= mk + 3 * a {
+            let subexp_final = br.ns(num_syms - mk)?;
+            return Ok(subexp_final + mk);
+        }
+        let subexp_more_bits = br.f(1)?;
+        if subexp_more_bits == 1 {
+            i += 1;
+            mk += a;
+        } else {
+            let subexp_bits = br.f(b2)?;
+            return Ok(subexp_bits + mk);
+        }
+    }
+}
+
+fn inverse_recenter(r: u32, v: u32) -> u32 {
+    if v > 2 * r {
+        v
+    } else if v & 1 == 1 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
 }
 
 /// §5.9.30 `film_grain_params()`.

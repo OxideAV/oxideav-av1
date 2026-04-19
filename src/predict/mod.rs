@@ -2,7 +2,9 @@
 //!
 //! Ported from `github.com/KarpelesLab/goavif/av1/predict` (MIT,
 //! KarpelesLab/goavif). Phase 5 covers the full intra predictor set
-//! (13 luma modes + CFL + filter-intra). Inter prediction lands with
-//! Phase 6.
+//! (13 luma modes + CFL + filter-intra). Phase 7 adds the 8-tap
+//! sub-pel interpolation filters used by the inter path
+//! ([`interp`]).
 
+pub mod interp;
 pub mod intra;

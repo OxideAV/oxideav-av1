@@ -1,20 +1,22 @@
 //! AV1 decoder shim.
 //!
-//! The decoder consumes OBU streams, tracks the sequence header, parses
-//! the frame header through `tile_info()` (§5.9.15), and splits the
-//! `tile_group_obu()` payload into per-tile byte ranges accessible via
-//! `Av1Decoder::last_tile_payloads()`. Pixel reconstruction itself —
-//! partition walk + coefficient decode + prediction + transforms +
-//! deblock + CDEF + loop restoration — is not yet implemented. See
-//! `tile_group::tile_decode_unsupported` for the spec-section list the
-//! error message points at.
+//! Consumes OBU streams and produces reconstructed frames. Phase 7
+//! wires single-reference translational inter prediction on top of
+//! the full Phase 1-6 intra / transform / LR / film-grain pipeline.
+//! AVIF still images and AVIS 2-frame-plus image sequences decode
+//! end-to-end; multi-ref / compound / warp / OBMC / inter-intra
+//! remain `Error::Unsupported`.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use oxideav_codec::Decoder;
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
+use oxideav_core::frame::{VideoFrame, VideoPlane};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
 use crate::decode::{decode_tile_group, FrameState};
 use crate::extradata::Av1CodecConfig;
-use crate::frame_header::{parse_frame_header, parse_frame_obu, FrameHeader};
+use crate::frame_header::{parse_frame_header, parse_frame_obu, FrameHeader, FrameType};
 use crate::obu::{iter_obus, ObuType};
 use crate::sequence_header::{parse_sequence_header, SequenceHeader};
 use crate::tile_group::{
@@ -33,6 +35,17 @@ pub struct Av1Decoder {
     last_error: Option<Error>,
     seen_frame: bool,
     last_tile_payloads: Vec<TilePayload>,
+    /// Previously-emitted frame state. Populated after each frame whose
+    /// `refresh_frame_flags != 0`, cleared on `OBU_TEMPORAL_DELIMITER`
+    /// when the next frame is a key. Used as the LAST reference for
+    /// single-reference translational inter blocks.
+    prev_frame: Option<Arc<FrameState>>,
+    /// Queue of decoded frames awaiting `receive_frame()`.
+    output_queue: VecDeque<Frame>,
+    /// Next pts to associate with a decoded frame.
+    next_pts: i64,
+    /// Time base to stamp on emitted frames.
+    time_base: TimeBase,
 }
 
 impl Av1Decoder {
@@ -44,6 +57,10 @@ impl Av1Decoder {
             last_error: None,
             seen_frame: false,
             last_tile_payloads: Vec::new(),
+            prev_frame: None,
+            output_queue: VecDeque::new(),
+            next_pts: 0,
+            time_base: TimeBase::new(1, 1),
         };
         // Bootstrap from extradata if present (av1C in MP4, codec private in
         // Matroska/WebM). Failures are recorded but not fatal at construction.
@@ -81,13 +98,19 @@ impl Av1Decoder {
 
     /// Walk the OBU stream in `packet.data`, updating internal state. Returns
     /// the first error encountered (if any).
-    fn ingest(&mut self, data: &[u8]) -> Result<()> {
+    fn ingest(&mut self, data: &[u8], pts: i64, tb: TimeBase) -> Result<()> {
+        self.time_base = tb;
+        self.next_pts = pts;
         for obu in iter_obus(data) {
             let obu = obu?;
             match obu.header.obu_type {
-                ObuType::TemporalDelimiter | ObuType::Padding => {
-                    // Empty / ignored.
+                ObuType::TemporalDelimiter => {
+                    // Clear the DPB ahead of the next KEY frame. We can't
+                    // know the frame_type until we see the next frame OBU,
+                    // so defer the clear to the next frame-level branch.
+                    // No-op here.
                 }
+                ObuType::Padding => {}
                 ObuType::SequenceHeader => {
                     self.seq_header = Some(parse_sequence_header(obu.payload)?);
                 }
@@ -105,31 +128,19 @@ impl Av1Decoder {
                         .as_ref()
                         .ok_or_else(|| Error::invalid("av1: frame_obu before sequence_header"))?
                         .clone();
-                    // OBU_FRAME = frame_header_obu() + byte_alignment() +
-                    // tile_group_obu(). `parse_frame_obu` returns both the
-                    // header and the remaining tile-group payload slice.
                     let (fh, tg_payload) = parse_frame_obu(&seq, obu.payload)?;
                     self.seen_frame = true;
-                    // Split the tile_group_obu into per-tile byte ranges so
-                    // callers can observe how many tiles the frame carries
-                    // and where each one lives.
+                    if fh.frame_type == FrameType::Key {
+                        self.prev_frame = None;
+                    }
                     let tile_decode_err = if let Some(ti) = fh.tile_info.as_ref() {
                         let tgh = parse_tile_group_header(tg_payload, ti)?;
                         let mut tiles = split_tile_payloads(tg_payload, ti, &tgh)?;
-                        // Re-base offsets from the tile_group payload to the
-                        // enclosing OBU_FRAME payload for easier downstream
-                        // consumption (first-tile offset = frame-header +
-                        // tg-header length).
                         let frame_header_len = obu.payload.len() - tg_payload.len();
                         for t in &mut tiles {
                             t.offset += frame_header_len;
                         }
                         self.last_tile_payloads = tiles;
-                        // Walk every tile through the Phase 2 mode decoder.
-                        // For a well-formed intra frame this reads every
-                        // partition + mode symbol and exits with
-                        // `Error::Unsupported` at the first non-skip leaf
-                        // (§5.11.39 coefficient decode pending).
                         let sub_x = if seq.color_config.subsampling_x { 1 } else { 0 };
                         let sub_y = if seq.color_config.subsampling_y { 1 } else { 0 };
                         let mut fs = FrameState::with_bit_depth(
@@ -140,29 +151,31 @@ impl Av1Decoder {
                             seq.color_config.num_planes == 1,
                             seq.color_config.bit_depth,
                         );
-                        decode_tile_group(&seq, &fh, tg_payload, &mut fs)
+                        let res = decode_tile_group(
+                            &seq,
+                            &fh,
+                            tg_payload,
+                            &mut fs,
+                            self.prev_frame.as_ref(),
+                        );
+                        if res.is_ok() && fh.refresh_frame_flags != 0 {
+                            self.prev_frame = Some(Arc::new(clone_frame_state(&fs)));
+                        }
+                        if res.is_ok() && fh.show_frame {
+                            self.enqueue_video_frame(&fs);
+                        }
+                        res
                     } else {
                         self.last_tile_payloads.clear();
                         Err(tile_decode_unsupported())
                     };
                     self.last_frame_header = Some(fh);
-                    // Surface whatever the tile walker returned — for Phase
-                    // 2 this is `Error::Unsupported("av1 coefficient decode
-                    // pending (§5.11.39)")` on the first non-skip leaf of
-                    // any real encoded frame. Fully-skip frames would
-                    // succeed here, but that virtually never happens in
-                    // practice.
                     return match tile_decode_err {
                         Ok(()) => Ok(()),
                         Err(e) => Err(e),
                     };
                 }
                 ObuType::TileGroup => {
-                    // The frame header for this OBU_TILE_GROUP must have
-                    // been supplied by a preceding OBU_FRAME_HEADER. If we
-                    // have it (and therefore the tile geometry) we split
-                    // per-tile boundaries; if not we surface the historical
-                    // message.
                     let Some(fh) = self.last_frame_header.as_ref() else {
                         return Err(Error::invalid(
                             "av1: OBU_TILE_GROUP without preceding frame_header",
@@ -187,18 +200,128 @@ impl Av1Decoder {
                         seq.color_config.num_planes == 1,
                         seq.color_config.bit_depth,
                     );
-                    return decode_tile_group(seq, fh, obu.payload, &mut fs);
+                    if fh.frame_type == FrameType::Key {
+                        self.prev_frame = None;
+                    }
+                    let res = decode_tile_group(
+                        seq,
+                        fh,
+                        obu.payload,
+                        &mut fs,
+                        self.prev_frame.as_ref(),
+                    );
+                    if res.is_ok() && fh.refresh_frame_flags != 0 {
+                        self.prev_frame = Some(Arc::new(clone_frame_state(&fs)));
+                    }
+                    if res.is_ok() && fh.show_frame {
+                        self.enqueue_video_frame(&fs);
+                    }
+                    return res;
                 }
-                ObuType::Metadata | ObuType::TileList => {
-                    // Metadata is informational; tile_list is for large-scale
-                    // tile coding which we don't decode.
-                }
-                _ => {
-                    // Reserved — ignore.
-                }
+                ObuType::Metadata | ObuType::TileList => {}
+                _ => {}
             }
         }
         Ok(())
+    }
+
+    fn enqueue_video_frame(&mut self, fs: &FrameState) {
+        let monochrome = fs.monochrome;
+        let bd = fs.bit_depth;
+        let sub_x = fs.sub_x;
+        let sub_y = fs.sub_y;
+        let format = if bd == 8 {
+            if monochrome {
+                PixelFormat::Gray8
+            } else if sub_x == 1 && sub_y == 1 {
+                PixelFormat::Yuv420P
+            } else if sub_x == 1 && sub_y == 0 {
+                PixelFormat::Yuv422P
+            } else {
+                PixelFormat::Yuv444P
+            }
+        } else {
+            // HBD not yet plumbed through VideoFrame (no u16 variant in
+            // PixelFormat). Fall back to Yuv420P with narrowed samples.
+            PixelFormat::Yuv420P
+        };
+        let width = fs.width;
+        let height = fs.height;
+        let mut planes = Vec::new();
+        if bd == 8 {
+            planes.push(VideoPlane {
+                stride: fs.width as usize,
+                data: fs.y_plane.clone(),
+            });
+            if !monochrome {
+                planes.push(VideoPlane {
+                    stride: fs.uv_width as usize,
+                    data: fs.u_plane.clone(),
+                });
+                planes.push(VideoPlane {
+                    stride: fs.uv_width as usize,
+                    data: fs.v_plane.clone(),
+                });
+            }
+        } else {
+            // Narrow HBD to u8 for the VideoFrame surface by right-
+            // shifting (bd - 8). Full HBD surface is a follow-up.
+            let shift = bd - 8;
+            let narrow = |src: &[u16]| -> Vec<u8> {
+                src.iter().map(|&v| (v >> shift).min(255) as u8).collect()
+            };
+            planes.push(VideoPlane {
+                stride: fs.width as usize,
+                data: narrow(&fs.y_plane16),
+            });
+            if !monochrome {
+                planes.push(VideoPlane {
+                    stride: fs.uv_width as usize,
+                    data: narrow(&fs.u_plane16),
+                });
+                planes.push(VideoPlane {
+                    stride: fs.uv_width as usize,
+                    data: narrow(&fs.v_plane16),
+                });
+            }
+        }
+        let vf = VideoFrame {
+            format,
+            width,
+            height,
+            pts: Some(self.next_pts),
+            time_base: self.time_base,
+            planes,
+        };
+        self.output_queue.push_back(Frame::Video(vf));
+    }
+}
+
+/// Clone a frame state cheaply. The pixel buffers are `Vec`-based so
+/// this is a simple `.clone()`; lr_unit_info / mi fields clone along.
+fn clone_frame_state(fs: &FrameState) -> FrameState {
+    FrameState {
+        width: fs.width,
+        height: fs.height,
+        mi_cols: fs.mi_cols,
+        mi_rows: fs.mi_rows,
+        mi: fs.mi.clone(),
+        sub_x: fs.sub_x,
+        sub_y: fs.sub_y,
+        monochrome: fs.monochrome,
+        bit_depth: fs.bit_depth,
+        y_plane: fs.y_plane.clone(),
+        u_plane: fs.u_plane.clone(),
+        v_plane: fs.v_plane.clone(),
+        y_plane16: fs.y_plane16.clone(),
+        u_plane16: fs.u_plane16.clone(),
+        v_plane16: fs.v_plane16.clone(),
+        uv_width: fs.uv_width,
+        uv_height: fs.uv_height,
+        lr_unit_info: fs.lr_unit_info.clone(),
+        lr_cols: fs.lr_cols,
+        lr_rows: fs.lr_rows,
+        lr_unit_size: fs.lr_unit_size,
     }
 }
 
@@ -208,21 +331,19 @@ impl Decoder for Av1Decoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // Drain ingest errors but don't surface them past the first frame —
-        // many callers want to inspect headers even when we can't decode.
-        match self.ingest(&packet.data) {
+        let pts = packet.pts.unwrap_or(0);
+        match self.ingest(&packet.data, pts, packet.time_base) {
             Ok(()) => Ok(()),
-            Err(Error::Unsupported(s)) => {
-                // Headers parsed; tile body unsupported. Surface so the caller
-                // knows there'll never be frames.
-                Err(Error::Unsupported(s))
-            }
+            Err(Error::Unsupported(s)) => Err(Error::Unsupported(s)),
             Err(e) => Err(e),
         }
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        Err(tile_decode_unsupported())
+        if let Some(f) = self.output_queue.pop_front() {
+            return Ok(f);
+        }
+        Err(Error::NeedMore)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -230,16 +351,12 @@ impl Decoder for Av1Decoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        // Scaffold — parses headers but never produces pixels, so the
-        // only cross-packet state worth wiping is the cached last frame
-        // header and the last ingest error. The sequence header is
-        // stream-level config (mirrors what's in av1C extradata) and is
-        // preserved so post-seek frame headers can still be parsed
-        // without waiting for another sequence OBU.
         self.last_frame_header = None;
         self.last_error = None;
         self.seen_frame = false;
         self.last_tile_payloads.clear();
+        self.prev_frame = None;
+        self.output_queue.clear();
         Ok(())
     }
 }

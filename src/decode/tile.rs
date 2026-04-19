@@ -26,14 +26,18 @@ use crate::tile_group::{parse_tile_group_header, split_tile_payloads, TilePayloa
 
 use super::coeffs::{q_index_to_ctx, CoeffCdfBank};
 use super::frame_state::FrameState;
+use super::inter::InterDecoder;
 use super::lr_unit::{
     decode_lr_unit as decode_lr_unit_impl, default_sgrproj_cdf, default_switchable_cdf,
     default_wiener_cdf, LrRef,
 };
 use super::modes::{IntraMode, INTRA_MODES, UV_MODES};
 use super::superblock;
+use crate::frame_header::FrameType;
 use crate::lr::UnitParams as LrUnitParams;
 use crate::transform::TxType;
+
+use std::sync::Arc;
 
 /// Top-level entry point: walk every tile in a tile-group payload,
 /// running [`TileDecoder::decode`] on each. The underlying frame
@@ -42,11 +46,16 @@ use crate::transform::TxType;
 /// `tile_payload` is the entire tile-group OBU payload (header +
 /// per-tile size prefixes + concatenated tile data, as surfaced by
 /// [`crate::tile_group::split_tile_payloads`]).
+///
+/// `prev_frame`, if present, supplies the LAST reference for single-
+/// reference translational inter blocks. Intra frames ignore it; non-
+/// intra frames without a reference surface `Error::Unsupported`.
 pub fn decode_tile_group(
     seq: &SequenceHeader,
     frame: &FrameHeader,
     tile_payload: &[u8],
     frame_state: &mut FrameState,
+    prev_frame: Option<&Arc<FrameState>>,
 ) -> Result<()> {
     let tile_info = frame.tile_info.as_ref().ok_or_else(|| {
         Error::invalid(
@@ -60,7 +69,7 @@ pub fn decode_tile_group(
     let tiles = split_tile_payloads(tile_payload, tile_info, &tgh)?;
     for tp in &tiles {
         let bytes = &tile_payload[tp.offset..tp.offset + tp.len];
-        let mut td = TileDecoder::new(seq, frame, bytes)?;
+        let mut td = TileDecoder::new(seq, frame, bytes, prev_frame.cloned())?;
         td.decode(frame_state, tp)?;
     }
     finish_frame(frame, frame_state);
@@ -546,6 +555,12 @@ pub struct TileDecoder<'a> {
     pub sgrproj_restore_cdf: Vec<u16>,
     /// Per-plane Wiener / SGR reference values (§5.11.42 / §5.11.44).
     pub lr_ref: [LrRef; 3],
+    /// Inter-frame syntax reader. `None` for key / intra-only frames.
+    pub inter: Option<InterDecoder>,
+    /// Reference frame carried from the previous decoded frame —
+    /// supplies the LAST ref for single-reference translational inter
+    /// blocks. `None` on key frames.
+    pub prev_frame: Option<Arc<FrameState>>,
 }
 
 impl<'a> TileDecoder<'a> {
@@ -557,6 +572,7 @@ impl<'a> TileDecoder<'a> {
         seq: &'a SequenceHeader,
         frame: &'a FrameHeader,
         tile_data: &'a [u8],
+        prev_frame: Option<Arc<FrameState>>,
     ) -> Result<Self> {
         let sz = tile_data.len();
         let allow_update = !frame.disable_cdf_update;
@@ -564,6 +580,11 @@ impl<'a> TileDecoder<'a> {
         let sb_size = if seq.use_128x128_superblock { 128 } else { 64 };
         let q_ctx = q_index_to_ctx(frame.quant.base_q_idx as i32);
         let coeff_bank = CoeffCdfBank::new(q_ctx);
+        let inter = if matches!(frame.frame_type, FrameType::Inter | FrameType::Switch) {
+            Some(InterDecoder::new(frame.allow_high_precision_mv))
+        } else {
+            None
+        };
         let mut td = Self {
             seq,
             frame,
@@ -584,6 +605,8 @@ impl<'a> TileDecoder<'a> {
             wiener_restore_cdf: default_wiener_cdf(),
             sgrproj_restore_cdf: default_sgrproj_cdf(),
             lr_ref: [LrRef::default(); 3],
+            inter,
+            prev_frame,
         };
         td.init_cdfs();
         Ok(td)

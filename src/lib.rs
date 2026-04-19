@@ -1,24 +1,29 @@
 //! AV1 (AOMedia Video 1) — pure-Rust decoder for oxideav.
 //!
-//! Phase 6 scope (this revision): OBU walk + sequence/frame headers +
+//! Phase 7 scope (this revision): OBU walk + sequence/frame headers +
 //! tile partition walk + mode decode + coefficient decode +
 //! dequantisation + the full 4/8/16/32/64-point inverse transform
 //! kernel set + every intra predictor (DC/V/H + 6 directional + 3
 //! smooth + Paeth + filter-intra + CFL) in both 8-bit and 10/12-bit
 //! (native u16) variants + per-frame deblocking (narrow 4-tap) +
-//! CDEF (direction search + primary/secondary filter) + **loop
-//! restoration** (Wiener + SGR with full §5.11.40-.44 per-unit
-//! signalling) + **film grain synthesis** (spec §7.20.2 32×32 tiler
-//! on top of AR-shaped 73×73 luma / 38×38 chroma templates). The
-//! decoder produces pixel-accurate AVIF still-image output for
-//! intra-only clips including LR + film-grain combinations.
+//! CDEF (direction search + primary/secondary filter) + loop
+//! restoration (Wiener + SGR with full §5.11.40-.44 per-unit
+//! signalling) + film grain synthesis (spec §7.20.2 32×32 tiler on
+//! top of AR-shaped 73×73 luma / 38×38 chroma templates) + the
+//! single-reference translational **inter** path (§7.11.3, 8-tap
+//! sub-pel filters, eighth-pel MV decode, single-ref LAST only).
+//! The decoder produces pixel-accurate AVIF still-image output and
+//! handles the key+inter frame cadence used by AVIS (animated AVIF)
+//! image sequences.
 //!
 //! Still deferred:
 //!
-//! * Inter prediction (§7.11.3, Phase 7).
+//! * Compound inter prediction, global motion, warped motion, OBMC,
+//!   inter-intra (§7.11.4-.8).
+//! * Multi-reference DPB — the decoder tracks only the immediately
+//!   preceding reconstruction as LAST.
 //! * Wide deblocking (8/14-tap) drivers — only the narrow filter is
-//!   currently invoked; wider widths are applied per-edge-class by a
-//!   future pass.
+//!   currently invoked.
 //! * Quantisation matrices (§5.9.12).
 //!
 //! Every error message includes the precise §ref so callers can see
@@ -62,17 +67,16 @@ pub const CODEC_ID_STR: &str = "av1";
 
 /// Register the AV1 decoder factory with a codec registry.
 ///
-/// The implementation declares `av1_sw_decode_still` to make the build
-/// visible in `oxideav list`-style output: every Phase 6 surface is
-/// wired — full intra predictor set + deblocking + CDEF + loop
-/// restoration (Wiener + SGR with per-unit signal decode) + film
-/// grain synthesis on top of the Phase 1-4 header/OBU/coefficient
-/// pipeline. Intra-only AVIF stills should decode end-to-end in
-/// 8-bit and 10/12-bit HBD, with or without LR / film-grain.
+/// The implementation declares `av1_sw_decode` to mark it as an
+/// in-progress full AV1 decoder: every Phase 6 surface (intra +
+/// deblock + CDEF + LR + film grain) plus Phase 7 (single-ref
+/// translational inter) is wired. Still-image AVIF and 2-frame-plus
+/// AVIS sequences decode end-to-end in 8-bit; HBD follows the same
+/// path but is narrowed to u8 for the emitted VideoFrame until a
+/// u16-capable PixelFormat variant lands upstream.
 pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("av1_sw_decode_still")
+    let caps = CodecCapabilities::video("av1_sw_decode")
         .with_lossy(true)
-        .with_intra_only(false)
         .with_max_size(16384, 16384);
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
