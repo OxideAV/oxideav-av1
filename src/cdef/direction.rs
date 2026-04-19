@@ -63,8 +63,7 @@ pub fn find_direction(src: &[u8], stride: usize, x: usize, y: usize) -> (usize, 
         }
         cost[i] *= DIV_TABLE_FIND[8];
         for j in 0..3 {
-            cost[i] += (partial[i][j] * partial[i][j]
-                + partial[i][10 - j] * partial[i][10 - j])
+            cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j])
                 * DIV_TABLE_FIND[2 * j + 2];
         }
     }
@@ -133,8 +132,7 @@ pub fn find_direction16(
         }
         cost[i] *= DIV_TABLE_FIND[8];
         for j in 0..3 {
-            cost[i] += (partial[i][j] * partial[i][j]
-                + partial[i][10 - j] * partial[i][10 - j])
+            cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j])
                 * DIV_TABLE_FIND[2 * j + 2];
         }
     }

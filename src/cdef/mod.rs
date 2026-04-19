@@ -13,7 +13,7 @@ pub mod filter;
 pub mod frame;
 
 pub use direction::{find_direction, find_direction16, DIRECTIONS};
-pub use filter::{
-    constrain, filter_block, filter_block16, PRIMARY_TAPS, SECONDARY_TAPS,
+pub use filter::{constrain, filter_block, filter_block16, PRIMARY_TAPS, SECONDARY_TAPS};
+pub use frame::{
+    apply_frame, apply_frame16, apply_frame_per_sb, apply_frame_per_sb16, Plane, Plane16,
 };
-pub use frame::{apply_frame, apply_frame16, apply_frame_per_sb, apply_frame_per_sb16, Plane, Plane16};

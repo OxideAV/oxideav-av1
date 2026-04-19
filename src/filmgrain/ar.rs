@@ -37,7 +37,14 @@ pub fn generate_grain_template(cols: usize, rows: usize, mut seed: u16) -> Vec<i
 /// `shift` is `ar_coeff_shift` (6..=9) — the weighted sum is rounded
 /// by `1 << (shift - 1)` then right-shifted by `shift` before being
 /// added to the grain sample.
-pub fn apply_ar(grain: &mut [i16], cols: usize, rows: usize, lag: usize, coeffs: &[i8], shift: u32) {
+pub fn apply_ar(
+    grain: &mut [i16],
+    cols: usize,
+    rows: usize,
+    lag: usize,
+    coeffs: &[i8],
+    shift: u32,
+) {
     if lag == 0 {
         return;
     }
@@ -88,7 +95,10 @@ mod tests {
     fn template_range_is_signed_byte() {
         let g = generate_grain_template(32, 32, 0xABCD);
         for &v in &g {
-            assert!((-128..=127).contains(&v), "sample {v} escaped signed-byte range");
+            assert!(
+                (-128..=127).contains(&v),
+                "sample {v} escaped signed-byte range"
+            );
         }
     }
 

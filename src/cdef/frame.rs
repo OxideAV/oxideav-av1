@@ -25,14 +25,29 @@ pub fn apply_frame(p: Plane<'_>, pri_strength: i32, sec_strength: i32, damping: 
     if pri_strength == 0 && sec_strength == 0 {
         return;
     }
-    let Plane { pix, stride, width, height } = p;
+    let Plane {
+        pix,
+        stride,
+        width,
+        height,
+    } = p;
     let buf: Vec<u8> = pix.to_vec();
     let mut y = 0usize;
     while y + 8 <= height {
         let mut x = 0usize;
         while x + 8 <= width {
             let (dir, _) = find_direction(&buf, stride, x, y);
-            filter_block(pix, &buf, stride, x, y, dir, pri_strength, sec_strength, damping);
+            filter_block(
+                pix,
+                &buf,
+                stride,
+                x,
+                y,
+                dir,
+                pri_strength,
+                sec_strength,
+                damping,
+            );
             x += 8;
         }
         y += 8;
@@ -50,14 +65,30 @@ pub fn apply_frame16(
     if pri_strength == 0 && sec_strength == 0 {
         return;
     }
-    let Plane16 { pix, stride, width, height } = p;
+    let Plane16 {
+        pix,
+        stride,
+        width,
+        height,
+    } = p;
     let buf: Vec<u16> = pix.to_vec();
     let mut y = 0usize;
     while y + 8 <= height {
         let mut x = 0usize;
         while x + 8 <= width {
             let (dir, _) = find_direction16(&buf, stride, x, y, bit_depth);
-            filter_block16(pix, &buf, stride, x, y, dir, pri_strength, sec_strength, damping, bit_depth);
+            filter_block16(
+                pix,
+                &buf,
+                stride,
+                x,
+                y,
+                dir,
+                pri_strength,
+                sec_strength,
+                damping,
+                bit_depth,
+            );
             x += 8;
         }
         y += 8;
@@ -71,7 +102,12 @@ pub fn apply_frame_per_sb<F>(p: Plane<'_>, strength_fn: F, damping: i32)
 where
     F: Fn(usize, usize) -> (i32, i32),
 {
-    let Plane { pix, stride, width, height } = p;
+    let Plane {
+        pix,
+        stride,
+        width,
+        height,
+    } = p;
     let buf: Vec<u8> = pix.to_vec();
     let mut y = 0usize;
     while y + 8 <= height {
@@ -95,7 +131,12 @@ pub fn apply_frame_per_sb16<F>(p: Plane16<'_>, strength_fn: F, damping: i32, bit
 where
     F: Fn(usize, usize) -> (i32, i32),
 {
-    let Plane16 { pix, stride, width, height } = p;
+    let Plane16 {
+        pix,
+        stride,
+        width,
+        height,
+    } = p;
     let buf: Vec<u16> = pix.to_vec();
     let mut y = 0usize;
     while y + 8 <= height {
@@ -107,9 +148,7 @@ where
                 continue;
             }
             let (dir, _) = find_direction16(&buf, stride, x, y, bit_depth);
-            filter_block16(
-                pix, &buf, stride, x, y, dir, pri, sec, damping, bit_depth,
-            );
+            filter_block16(pix, &buf, stride, x, y, dir, pri, sec, damping, bit_depth);
             x += 8;
         }
         y += 8;

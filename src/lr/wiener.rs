@@ -144,9 +144,19 @@ mod tests {
     fn identity_preserves_sample(src_byte: u8) {
         let w = 8;
         let h = 8;
-        let src: Vec<u8> = (0..w * h).map(|i| ((i * 17) as u8).wrapping_mul(src_byte)).collect();
+        let src: Vec<u8> = (0..w * h)
+            .map(|i| ((i * 17) as u8).wrapping_mul(src_byte))
+            .collect();
         let mut dst = vec![0u8; w * h];
-        apply_wiener(&mut dst, &src, w, h, w, WienerTaps::IDENTITY, WienerTaps::IDENTITY);
+        apply_wiener(
+            &mut dst,
+            &src,
+            w,
+            h,
+            w,
+            WienerTaps::IDENTITY,
+            WienerTaps::IDENTITY,
+        );
         assert_eq!(dst, src);
     }
 
@@ -161,7 +171,15 @@ mod tests {
         let h = 8;
         let src = vec![123u8; w * h];
         let mut dst = vec![0u8; w * h];
-        apply_wiener(&mut dst, &src, w, h, w, WienerTaps::IDENTITY, WienerTaps::IDENTITY);
+        apply_wiener(
+            &mut dst,
+            &src,
+            w,
+            h,
+            w,
+            WienerTaps::IDENTITY,
+            WienerTaps::IDENTITY,
+        );
         for &v in &dst {
             assert_eq!(v, 123);
         }

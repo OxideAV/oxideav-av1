@@ -463,14 +463,12 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     // §5.9.25 — allow_warped_motion. Present only when the sequence
     // header set `enable_warped_motion`, the frame is non-intra, and
     // not error-resilient. Comes BEFORE `reduced_tx_set` per spec.
-    let allow_warped_motion = if !frame_is_intra
-        && !error_resilient_mode
-        && seq.enable_warped_motion
-    {
-        br.bit()?
-    } else {
-        false
-    };
+    let allow_warped_motion =
+        if !frame_is_intra && !error_resilient_mode && seq.enable_warped_motion {
+            br.bit()?
+        } else {
+            false
+        };
 
     let reduced_tx_set = br.bit()?;
 

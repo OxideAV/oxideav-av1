@@ -37,15 +37,7 @@ fn slice_unit(pix: &[u8], stride: usize, x: usize, y: usize, uw: usize, uh: usiz
     out
 }
 
-fn write_unit(
-    pix: &mut [u8],
-    stride: usize,
-    x: usize,
-    y: usize,
-    uw: usize,
-    uh: usize,
-    src: &[u8],
-) {
+fn write_unit(pix: &mut [u8], stride: usize, x: usize, y: usize, uw: usize, uh: usize, src: &[u8]) {
     for r in 0..uh {
         let off = (y + r) * stride + x;
         pix[off..off + uw].copy_from_slice(&src[r * uw..r * uw + uw]);

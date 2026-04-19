@@ -27,8 +27,8 @@
 
 use std::path::Path;
 
-use oxideav_av1::{iter_obus, parse_frame_header, parse_sequence_header, ObuType};
 use oxideav_av1::frame_header::FrameType;
+use oxideav_av1::{iter_obus, parse_frame_header, parse_sequence_header, ObuType};
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn read_fixture(path: &str) -> Option<Vec<u8>> {
@@ -95,7 +95,11 @@ fn fixture_has_one_key_then_one_inter() {
             }
         }
     }
-    assert_eq!(types.first(), Some(&FrameType::Key), "first frame should be Key");
+    assert_eq!(
+        types.first(),
+        Some(&FrameType::Key),
+        "first frame should be Key"
+    );
     assert!(
         types.iter().skip(1).any(|t| *t == FrameType::Inter),
         "second frame should be Inter, got {types:?}"
@@ -160,7 +164,12 @@ fn decoder_produces_both_frames_for_inter_fixture() {
         }
     }
 
-    assert_eq!(frames.len(), 2, "expected 2 decoded frames, got {}", frames.len());
+    assert_eq!(
+        frames.len(),
+        2,
+        "expected 2 decoded frames, got {}",
+        frames.len()
+    );
     let p0 = collect_video_planes(&frames[0]).expect("frame 0 video");
     let p1 = collect_video_planes(&frames[1]).expect("frame 1 video");
     assert_eq!(p0.width, 128);
@@ -183,5 +192,8 @@ fn decoder_produces_both_frames_for_inter_fixture() {
     );
 
     // The two frames must differ; testsrc animates between them.
-    assert_ne!(p0.y, p1.y, "frame 1 should differ from frame 0 (testsrc animates)");
+    assert_ne!(
+        p0.y, p1.y,
+        "frame 1 should differ from frame 0 (testsrc animates)"
+    );
 }

@@ -31,7 +31,9 @@ pub use dc::{dc_pred, dc_pred16};
 pub use directional::{directional_pred, directional_pred16, mode_to_angle_map};
 pub use filter::{filter_intra_pred, filter_intra_pred16, FILTER_INTRA_TAPS};
 pub use paeth::{paeth_pred, paeth_pred16};
-pub use smooth::{smooth_h_pred, smooth_h_pred16, smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16};
+pub use smooth::{
+    smooth_h_pred, smooth_h_pred16, smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16,
+};
 pub use vh::{h_pred, h_pred16, v_pred, v_pred16};
 
 use oxideav_core::{Error, Result};

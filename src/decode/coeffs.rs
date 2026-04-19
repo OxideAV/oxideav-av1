@@ -40,9 +40,7 @@ pub fn q_index_to_ctx(q: i32) -> usize {
 }
 
 /// `nz_map_ctx_offset_4x4` per libaom `av1/common/txb_common.c`.
-pub const NZ_MAP_CTX_OFFSET_4X4: [i8; 16] = [
-    0, 1, 6, 6, 1, 6, 6, 21, 6, 6, 21, 21, 6, 21, 21, 21,
-];
+pub const NZ_MAP_CTX_OFFSET_4X4: [i8; 16] = [0, 1, 6, 6, 1, 6, 6, 21, 6, 6, 21, 21, 6, 21, 21, 21];
 
 /// `nz_map_ctx_offset_8x8` per libaom.
 pub const NZ_MAP_CTX_OFFSET_8X8: [i8; 64] = [
@@ -441,8 +439,7 @@ pub fn decode_coefficients(
             };
             bank.read_base_level_eob(sym, tx_size_idx, plane_type, eob_base_ctx)? + 1
         } else {
-            let sig_ctx =
-                sig_coef_ctx_2d(r, c, w as i32, h as i32, &abs_levels, nz_map_offset, i);
+            let sig_ctx = sig_coef_ctx_2d(r, c, w as i32, h as i32, &abs_levels, nz_map_offset, i);
             bank.read_base_level(sym, tx_size_idx, plane_type, sig_ctx.max(0) as usize)?
         };
 
@@ -450,7 +447,8 @@ pub fn decode_coefficients(
         if level == 3 {
             for _br in 0..4 {
                 let br_ctx = level_ctx(r, c, w as i32, h as i32, &abs_levels);
-                let inc = bank.read_br_level(sym, tx_size_idx, plane_type, br_ctx.max(0) as usize)?;
+                let inc =
+                    bank.read_br_level(sym, tx_size_idx, plane_type, br_ctx.max(0) as usize)?;
                 level += inc as i32;
                 if inc < 3 {
                     break;

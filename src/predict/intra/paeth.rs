@@ -5,14 +5,7 @@
 //! it. Ported from goavif `av1/predict/intra_paeth.go` + `intra16.go`.
 
 /// 8-bit Paeth predictor.
-pub fn paeth_pred(
-    dst: &mut [u8],
-    w: usize,
-    h: usize,
-    above: &[u8],
-    left: &[u8],
-    above_left: u8,
-) {
+pub fn paeth_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8], above_left: u8) {
     for r in 0..h {
         for c in 0..w {
             let a = above[c] as i32;
@@ -75,7 +68,7 @@ mod tests {
         let above = [100u8; 4];
         let left = [100u8; 4];
         let mut dst = vec![0u8; 16];
-        paeth_pred(&mut dst, 4, 4, &above, &left, 100, );
+        paeth_pred(&mut dst, 4, 4, &above, &left, 100);
         for &v in &dst {
             assert_eq!(v, 100);
         }

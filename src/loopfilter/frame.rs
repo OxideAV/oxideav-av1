@@ -7,7 +7,10 @@
 //! approach for intra-only content); full per-edge tracking lands with
 //! the inter decoder.
 
-use super::narrow::{apply_horizontal_edge4, apply_horizontal_edge4_16, apply_vertical_edge4, apply_vertical_edge4_16, Thresholds, Thresholds16};
+use super::narrow::{
+    apply_horizontal_edge4, apply_horizontal_edge4_16, apply_vertical_edge4,
+    apply_vertical_edge4_16, Thresholds, Thresholds16,
+};
 
 /// A single u8 plane for the deblocking driver.
 pub struct Plane<'a> {
@@ -56,7 +59,12 @@ pub fn uniform_grid(w: usize, h: usize, cell_w: usize, cell_h: usize) -> EdgeGri
 pub fn apply_frame_narrow(p: Plane<'_>, grid: &EdgeGrid, th: Thresholds) {
     // Work around borrow-checker: we mutate `p.pix` across sequential
     // loops, each only inspecting one row/column at a time.
-    let Plane { pix, stride, width, height } = p;
+    let Plane {
+        pix,
+        stride,
+        width,
+        height,
+    } = p;
     for &x in &grid.edge_xs {
         if x < 2 || x + 2 > width {
             continue;
@@ -73,7 +81,12 @@ pub fn apply_frame_narrow(p: Plane<'_>, grid: &EdgeGrid, th: Thresholds) {
 
 /// 16-bit counterpart of [`apply_frame_narrow`].
 pub fn apply_frame_narrow16(p: Plane16<'_>, grid: &EdgeGrid, th: Thresholds16) {
-    let Plane16 { pix, stride, width, height } = p;
+    let Plane16 {
+        pix,
+        stride,
+        width,
+        height,
+    } = p;
     for &x in &grid.edge_xs {
         if x < 2 || x + 2 > width {
             continue;

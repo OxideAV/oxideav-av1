@@ -82,7 +82,11 @@ pub fn filter_intra_pred(
     above_left: u8,
     mode: usize,
 ) {
-    let mode = if mode >= FILTER_INTRA_TAPS.len() { 0 } else { mode };
+    let mode = if mode >= FILTER_INTRA_TAPS.len() {
+        0
+    } else {
+        mode
+    };
     let mut buf = [[0u8; 33]; 33];
     buf[0][0] = above_left;
     buf[0][1..=w].copy_from_slice(&above[..w]);
@@ -139,7 +143,11 @@ pub fn filter_intra_pred16(
     mode: usize,
     bit_depth: u32,
 ) {
-    let mode = if mode >= FILTER_INTRA_TAPS.len() { 0 } else { mode };
+    let mode = if mode >= FILTER_INTRA_TAPS.len() {
+        0
+    } else {
+        mode
+    };
     let max_v = ((1i32) << bit_depth) - 1;
     let mut buf = [[0u16; 33]; 33];
     buf[0][0] = above_left;

@@ -424,9 +424,7 @@ pub fn parse_lr_params(
             }
         }
         if planes > 1 {
-            if seq.color_config.subsampling_x
-                && seq.color_config.subsampling_y
-                && lr.uses_chroma_lr
+            if seq.color_config.subsampling_x && seq.color_config.subsampling_y && lr.uses_chroma_lr
             {
                 lr.log2_restoration_unit_size[1] =
                     lr.log2_restoration_unit_size[0] - br.f(1)? as u8;
@@ -530,11 +528,7 @@ fn decode_signed_subexp_with_ref(
     Ok((x as i32) + low)
 }
 
-fn decode_unsigned_subexp_with_ref(
-    br: &mut BitReader<'_>,
-    mx: u32,
-    r: u32,
-) -> Result<u32> {
+fn decode_unsigned_subexp_with_ref(br: &mut BitReader<'_>, mx: u32, r: u32) -> Result<u32> {
     let v = decode_subexp(br, mx)?;
     if (r << 1) <= mx {
         Ok(inverse_recenter(r, v))

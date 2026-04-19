@@ -77,10 +77,9 @@ impl TxType {
         match self {
             Self::DctDct | Self::AdstDct | Self::FlipAdstDct | Self::VDct => Kind::Dct,
             Self::DctAdst | Self::AdstAdst | Self::FlipAdstAdst | Self::VAdst => Kind::Adst,
-            Self::DctFlipAdst
-            | Self::AdstFlipAdst
-            | Self::FlipAdstFlipAdst
-            | Self::VFlipAdst => Kind::FlipAdst,
+            Self::DctFlipAdst | Self::AdstFlipAdst | Self::FlipAdstFlipAdst | Self::VFlipAdst => {
+                Kind::FlipAdst
+            }
             Self::IdtIdt | Self::HDct | Self::HAdst | Self::HFlipAdst => Kind::Idtx,
             Self::Wht => Kind::Wht,
         }
@@ -92,10 +91,9 @@ impl TxType {
         match self {
             Self::DctDct | Self::DctAdst | Self::DctFlipAdst | Self::HDct => Kind::Dct,
             Self::AdstDct | Self::AdstAdst | Self::AdstFlipAdst | Self::HAdst => Kind::Adst,
-            Self::FlipAdstDct
-            | Self::FlipAdstAdst
-            | Self::FlipAdstFlipAdst
-            | Self::HFlipAdst => Kind::FlipAdst,
+            Self::FlipAdstDct | Self::FlipAdstAdst | Self::FlipAdstFlipAdst | Self::HFlipAdst => {
+                Kind::FlipAdst
+            }
             Self::IdtIdt | Self::VDct | Self::VAdst | Self::VFlipAdst => Kind::Idtx,
             Self::Wht => Kind::Wht,
         }
@@ -106,10 +104,7 @@ impl TxType {
     pub fn row_flip(self) -> bool {
         matches!(
             self,
-            Self::DctFlipAdst
-                | Self::AdstFlipAdst
-                | Self::FlipAdstFlipAdst
-                | Self::VFlipAdst
+            Self::DctFlipAdst | Self::AdstFlipAdst | Self::FlipAdstFlipAdst | Self::VFlipAdst
         )
     }
 
@@ -117,10 +112,7 @@ impl TxType {
     pub fn col_flip(self) -> bool {
         matches!(
             self,
-            Self::FlipAdstDct
-                | Self::FlipAdstAdst
-                | Self::FlipAdstFlipAdst
-                | Self::HFlipAdst
+            Self::FlipAdstDct | Self::FlipAdstAdst | Self::FlipAdstFlipAdst | Self::HFlipAdst
         )
     }
 }
@@ -169,11 +161,7 @@ impl TxSize {
         match self {
             Self::Tx4x4 | Self::Tx4x8 | Self::Tx4x16 => 4,
             Self::Tx8x8 | Self::Tx8x4 | Self::Tx8x16 | Self::Tx8x32 => 8,
-            Self::Tx16x16
-            | Self::Tx16x8
-            | Self::Tx16x32
-            | Self::Tx16x4
-            | Self::Tx16x64 => 16,
+            Self::Tx16x16 | Self::Tx16x8 | Self::Tx16x32 | Self::Tx16x4 | Self::Tx16x64 => 16,
             Self::Tx32x32 | Self::Tx32x16 | Self::Tx32x64 | Self::Tx32x8 => 32,
             Self::Tx64x64 | Self::Tx64x32 | Self::Tx64x16 => 64,
         }
@@ -184,11 +172,7 @@ impl TxSize {
         match self {
             Self::Tx4x4 | Self::Tx8x4 | Self::Tx16x4 => 4,
             Self::Tx8x8 | Self::Tx4x8 | Self::Tx16x8 | Self::Tx32x8 => 8,
-            Self::Tx16x16
-            | Self::Tx8x16
-            | Self::Tx32x16
-            | Self::Tx4x16
-            | Self::Tx64x16 => 16,
+            Self::Tx16x16 | Self::Tx8x16 | Self::Tx32x16 | Self::Tx4x16 | Self::Tx64x16 => 16,
             Self::Tx32x32 | Self::Tx16x32 | Self::Tx64x32 | Self::Tx8x32 => 32,
             Self::Tx64x64 | Self::Tx32x64 | Self::Tx16x64 => 64,
         }

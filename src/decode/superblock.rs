@@ -18,12 +18,13 @@ use crate::quant;
 use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
 
 use super::block::{
-    block_size_log, half_below_size, horz4_size, quarter_size, vert4_size, BlockSize,
-    PartitionType,
+    block_size_log, half_below_size, horz4_size, quarter_size, vert4_size, BlockSize, PartitionType,
 };
 use super::coeffs::{decode_coefficients, nz_map_ctx_offset, tx_size_idx};
 use super::frame_state::FrameState;
-use super::inter_block::{decode_inter_block_syntax, mc_chroma_u16, mc_chroma_u8, mc_luma_u16, mc_luma_u8};
+use super::inter_block::{
+    decode_inter_block_syntax, mc_chroma_u16, mc_chroma_u8, mc_luma_u16, mc_luma_u8,
+};
 use super::modes::{mode_ctx_bucket, IntraMode};
 use super::mv::Mv;
 use super::reconstruct::{clip_add_in_place, clip_add_in_place16};
@@ -264,10 +265,7 @@ pub fn decode_leaf_block(
 
     // Inter frames route through the inter leaf decoder; intra / key /
     // intra-only frames use the original intra-only path below.
-    if matches!(
-        td.frame.frame_type,
-        FrameType::Inter | FrameType::Switch
-    ) {
+    if matches!(td.frame.frame_type, FrameType::Inter | FrameType::Switch) {
         return decode_inter_leaf_block(td, fs, x, y, bw, bh);
     }
 
@@ -278,12 +276,16 @@ pub fn decode_leaf_block(
     let have_left_mi = mi_col > 0 && mi_col - 1 < fs.mi_cols && mi_row < fs.mi_rows;
 
     let above_mode = if have_above_mi {
-        fs.mi_at(mi_col, mi_row - 1).mode.unwrap_or(IntraMode::DcPred)
+        fs.mi_at(mi_col, mi_row - 1)
+            .mode
+            .unwrap_or(IntraMode::DcPred)
     } else {
         IntraMode::DcPred
     };
     let left_mode = if have_left_mi {
-        fs.mi_at(mi_col - 1, mi_row).mode.unwrap_or(IntraMode::DcPred)
+        fs.mi_at(mi_col - 1, mi_row)
+            .mode
+            .unwrap_or(IntraMode::DcPred)
     } else {
         IntraMode::DcPred
     };
@@ -375,7 +377,18 @@ pub fn decode_leaf_block(
     }
 
     // Luma path.
-    reconstruct_luma_block(td, fs, x, y, bw, bh, y_mode, angle_delta_y, skip, segment_id)?;
+    reconstruct_luma_block(
+        td,
+        fs,
+        x,
+        y,
+        bw,
+        bh,
+        y_mode,
+        angle_delta_y,
+        skip,
+        segment_id,
+    )?;
 
     // Chroma path.
     if !fs.monochrome && num_planes >= 3 {
@@ -448,18 +461,7 @@ fn decode_inter_leaf_block(
                 mi.mv_col = 0;
             }
         }
-        reconstruct_luma_block(
-            td,
-            fs,
-            x,
-            y,
-            bw,
-            bh,
-            info.intra_y_mode,
-            0,
-            info.skip,
-            0,
-        )?;
+        reconstruct_luma_block(td, fs, x, y, bw, bh, info.intra_y_mode, 0, info.skip, 0)?;
         if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
             reconstruct_chroma_block(
                 td,
@@ -566,7 +568,15 @@ fn reconstruct_inter_luma_block(
             filt,
             fs.bit_depth,
         );
-        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &pred, w, h);
+        paste_block16(
+            &mut fs.y_plane16,
+            stride,
+            x as usize,
+            y as usize,
+            &pred,
+            w,
+            h,
+        );
     }
 
     if skip {
@@ -607,14 +617,46 @@ fn reconstruct_inter_luma_block(
     }
     if fs.bit_depth == 8 {
         let mut block = vec![0u8; w * h];
-        extract_block(&fs.y_plane, stride, x as usize, y as usize, w, h, &mut block);
+        extract_block(
+            &fs.y_plane,
+            stride,
+            x as usize,
+            y as usize,
+            w,
+            h,
+            &mut block,
+        );
         clip_add_in_place(&mut block, &coeffs, w, h);
-        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &block, w, h);
+        paste_block(
+            &mut fs.y_plane,
+            stride,
+            x as usize,
+            y as usize,
+            &block,
+            w,
+            h,
+        );
     } else {
         let mut block = vec![0u16; w * h];
-        extract_block16(&fs.y_plane16, stride, x as usize, y as usize, w, h, &mut block);
+        extract_block16(
+            &fs.y_plane16,
+            stride,
+            x as usize,
+            y as usize,
+            w,
+            h,
+            &mut block,
+        );
         clip_add_in_place16(&mut block, &coeffs, w, h, fs.bit_depth);
-        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &block, w, h);
+        paste_block16(
+            &mut fs.y_plane16,
+            stride,
+            x as usize,
+            y as usize,
+            &block,
+            w,
+            h,
+        );
     }
     Ok(())
 }
@@ -840,7 +882,15 @@ fn reconstruct_luma_block(
             1u16 << (fs.bit_depth - 1),
             fs.bit_depth,
         );
-        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &pred, w, h);
+        paste_block16(
+            &mut fs.y_plane16,
+            stride,
+            x as usize,
+            y as usize,
+            &pred,
+            w,
+            h,
+        );
     }
 
     if skip {
@@ -894,14 +944,46 @@ fn reconstruct_luma_block(
     }
     if fs.bit_depth == 8 {
         let mut block = vec![0u8; w * h];
-        extract_block(&fs.y_plane, stride, x as usize, y as usize, w, h, &mut block);
+        extract_block(
+            &fs.y_plane,
+            stride,
+            x as usize,
+            y as usize,
+            w,
+            h,
+            &mut block,
+        );
         clip_add_in_place(&mut block, &coeffs, w, h);
-        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &block, w, h);
+        paste_block(
+            &mut fs.y_plane,
+            stride,
+            x as usize,
+            y as usize,
+            &block,
+            w,
+            h,
+        );
     } else {
         let mut block = vec![0u16; w * h];
-        extract_block16(&fs.y_plane16, stride, x as usize, y as usize, w, h, &mut block);
+        extract_block16(
+            &fs.y_plane16,
+            stride,
+            x as usize,
+            y as usize,
+            w,
+            h,
+            &mut block,
+        );
         clip_add_in_place16(&mut block, &coeffs, w, h, fs.bit_depth);
-        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &block, w, h);
+        paste_block16(
+            &mut fs.y_plane16,
+            stride,
+            x as usize,
+            y as usize,
+            &block,
+            w,
+            h,
+        );
     }
     Ok(())
 }
@@ -1039,7 +1121,16 @@ fn reconstruct_chroma_block(
                 &fs.v_plane
             };
             let mut pred = run_intra_prediction_u8(
-                plane_ref, stride, uvh, cx, cy, cw_clip, ch_clip, base_mode, angle_delta_uv, 128,
+                plane_ref,
+                stride,
+                uvh,
+                cx,
+                cy,
+                cw_clip,
+                ch_clip,
+                base_mode,
+                angle_delta_uv,
+                128,
             );
             if let Some(luma_q3) = &cfl_luma_q3 {
                 let dc_copy = pred.clone();
@@ -1188,15 +1279,8 @@ fn run_intra_prediction_u8(
     // Extended neighbours for directional / filter-intra reads. Length
     // covers the longest projection: above + right of block.
     let ext_len = w + h + 4;
-    let (above_raw, left_raw, above_left) = gather_neighbors_u8(
-        plane,
-        plane_stride,
-        plane_height,
-        x,
-        y,
-        ext_len,
-        fallback,
-    );
+    let (above_raw, left_raw, above_left) =
+        gather_neighbors_u8(plane, plane_stride, plane_height, x, y, ext_len, fallback);
     let have_above = y > 0;
     let have_left = x > 0;
     let above = &above_raw[..];
@@ -1255,15 +1339,8 @@ fn run_intra_prediction_u16(
     bit_depth: u32,
 ) -> Vec<u16> {
     let ext_len = w + h + 4;
-    let (above_raw, left_raw, above_left) = gather_neighbors_u16(
-        plane,
-        plane_stride,
-        plane_height,
-        x,
-        y,
-        ext_len,
-        fallback,
-    );
+    let (above_raw, left_raw, above_left) =
+        gather_neighbors_u16(plane, plane_stride, plane_height, x, y, ext_len, fallback);
     let have_above = y > 0;
     let have_left = x > 0;
     let above = &above_raw[..];
@@ -1272,7 +1349,9 @@ fn run_intra_prediction_u16(
     let mut dst = vec![0u16; w * h];
     match mode {
         IntraMode::DcPred | IntraMode::CflPred => {
-            dc_pred16(&mut dst, w, h, above, left, have_above, have_left, bit_depth);
+            dc_pred16(
+                &mut dst, w, h, above, left, have_above, have_left, bit_depth,
+            );
         }
         IntraMode::VPred => {
             v_pred16(&mut dst, w, h, above);
@@ -1387,7 +1466,15 @@ fn gather_neighbors_u16(
 }
 
 /// Copy a `w×h` block into a plane at `(x, y)`.
-fn paste_block(plane: &mut [u8], stride: usize, x: usize, y: usize, src: &[u8], w: usize, h: usize) {
+fn paste_block(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    src: &[u8],
+    w: usize,
+    h: usize,
+) {
     for r in 0..h {
         let dst_off = (y + r) * stride + x;
         plane[dst_off..dst_off + w].copy_from_slice(&src[r * w..(r + 1) * w]);
@@ -1395,7 +1482,15 @@ fn paste_block(plane: &mut [u8], stride: usize, x: usize, y: usize, src: &[u8], 
 }
 
 /// Copy a `w×h` block out of a plane at `(x, y)`.
-fn extract_block(plane: &[u8], stride: usize, x: usize, y: usize, w: usize, h: usize, dst: &mut [u8]) {
+fn extract_block(
+    plane: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    dst: &mut [u8],
+) {
     for r in 0..h {
         let src_off = (y + r) * stride + x;
         dst[r * w..(r + 1) * w].copy_from_slice(&plane[src_off..src_off + w]);
@@ -1403,7 +1498,15 @@ fn extract_block(plane: &[u8], stride: usize, x: usize, y: usize, w: usize, h: u
 }
 
 /// 16-bit counterpart of [`paste_block`].
-fn paste_block16(plane: &mut [u16], stride: usize, x: usize, y: usize, src: &[u16], w: usize, h: usize) {
+fn paste_block16(
+    plane: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    src: &[u16],
+    w: usize,
+    h: usize,
+) {
     for r in 0..h {
         let dst_off = (y + r) * stride + x;
         plane[dst_off..dst_off + w].copy_from_slice(&src[r * w..(r + 1) * w]);
@@ -1411,7 +1514,15 @@ fn paste_block16(plane: &mut [u16], stride: usize, x: usize, y: usize, src: &[u1
 }
 
 /// 16-bit counterpart of [`extract_block`].
-fn extract_block16(plane: &[u16], stride: usize, x: usize, y: usize, w: usize, h: usize, dst: &mut [u16]) {
+fn extract_block16(
+    plane: &[u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    dst: &mut [u16],
+) {
     for r in 0..h {
         let src_off = (y + r) * stride + x;
         dst[r * w..(r + 1) * w].copy_from_slice(&plane[src_off..src_off + w]);

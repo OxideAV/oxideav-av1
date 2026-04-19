@@ -15,9 +15,9 @@ use crate::decode::modes::IntraMode;
 /// fixed-point.
 pub const DR_INTRA_DERIVATIVE: [i16; 90] = [
     0, 0, 0, 1023, 0, 0, 547, 0, 0, 372, 0, 0, 0, 0, 273, 0, 0, 215, 0, 0, 178, 0, 0, 151, 0, 0,
-    132, 0, 0, 116, 0, 0, 102, 0, 0, 0, 90, 0, 0, 80, 0, 0, 71, 0, 0, 64, 0, 0, 57, 0, 0, 51, 0,
-    0, 45, 0, 0, 0, 40, 0, 0, 35, 0, 0, 31, 0, 0, 27, 0, 0, 23, 0, 0, 19, 0, 0, 15, 0, 0, 0, 0,
-    11, 0, 0, 7, 0, 0, 3, 0, 0,
+    132, 0, 0, 116, 0, 0, 102, 0, 0, 0, 90, 0, 0, 80, 0, 0, 71, 0, 0, 64, 0, 0, 57, 0, 0, 51, 0, 0,
+    45, 0, 0, 0, 40, 0, 0, 35, 0, 0, 31, 0, 0, 27, 0, 0, 23, 0, 0, 19, 0, 0, 15, 0, 0, 0, 0, 11, 0,
+    0, 7, 0, 0, 3, 0, 0,
 ];
 
 /// Base angle (degrees) for each intra mode index; non-directional
@@ -71,14 +71,7 @@ fn get_dy(angle: i32) -> i32 {
 /// above/left slices must be "extended" — replicated to at least
 /// `(w + h + 1)` samples at each edge so the projection doesn't read
 /// out of range. Callers replicate the last sample as needed.
-pub fn directional_pred(
-    dst: &mut [u8],
-    w: usize,
-    h: usize,
-    above: &[u8],
-    left: &[u8],
-    angle: i32,
-) {
+pub fn directional_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8], angle: i32) {
     if angle > 0 && angle < 90 {
         dr_pred_above_zone(dst, w, h, above, get_dx(angle));
     } else if angle > 180 && angle < 270 {
@@ -137,7 +130,15 @@ fn dr_pred_left_zone(dst: &mut [u8], w: usize, h: usize, left: &[u8], dy: i32) {
     }
 }
 
-fn dr_pred_mixed_zone(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8], dx: i32, dy: i32) {
+fn dr_pred_mixed_zone(
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    above: &[u8],
+    left: &[u8],
+    dx: i32,
+    dy: i32,
+) {
     let max_a = above.len().saturating_sub(1);
     let max_l = left.len().saturating_sub(1);
     let inv_dy = dy;
@@ -324,7 +325,10 @@ mod tests {
             for c in 0..4 {
                 let v = dst[r * 4 + c];
                 if c > 0 {
-                    assert!(v >= prev, "row {r}: dst[{c}]={v} not monotonic after {prev}");
+                    assert!(
+                        v >= prev,
+                        "row {r}: dst[{c}]={v} not monotonic after {prev}"
+                    );
                 }
                 prev = v;
             }

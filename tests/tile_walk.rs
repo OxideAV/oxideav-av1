@@ -259,7 +259,10 @@ fn end_to_end_decode_produces_plane_bytes() {
             _ => {}
         }
     }
-    assert!(ok_frames >= 1, "expected at least one frame to decode cleanly");
+    assert!(
+        ok_frames >= 1,
+        "expected at least one frame to decode cleanly"
+    );
 }
 
 /// Phase-5 fidelity check: decode the 128×128 non-skip-heavy clip at
@@ -420,5 +423,8 @@ fn end_to_end_decode_hbd_produces_plane_bytes() {
             _ => {}
         }
     }
-    assert!(ok_frames >= 1, "expected at least one HBD frame to decode cleanly");
+    assert!(
+        ok_frames >= 1,
+        "expected at least one HBD frame to decode cleanly"
+    );
 }

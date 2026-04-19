@@ -142,9 +142,7 @@ pub fn filter4_16(
             v
         }
     };
-    let clip_u = |v: i32| -> u16 {
-        v.clamp(0, max_v) as u16
-    };
+    let clip_u = |v: i32| -> u16 { v.clamp(0, max_v) as u16 };
 
     let a = clip_s(p1 as i32 - q1 as i32);
     let a = if hev { 0 } else { a };

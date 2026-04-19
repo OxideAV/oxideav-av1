@@ -232,7 +232,8 @@ mod tests {
                 let want = src[(r + 3) * SRC_W + (c + 3)];
                 let got = dst[r * 8 + c];
                 assert_eq!(
-                    got, want,
+                    got,
+                    want,
                     "dst[{r},{c}] = {got}, want src[{}][{}] = {want}",
                     r + 3,
                     c + 3

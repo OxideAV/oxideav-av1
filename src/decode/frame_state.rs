@@ -200,18 +200,11 @@ impl FrameState {
     /// restoration units. Entries are initialised to `FilterType::None`
     /// so unsignalled units pass through unchanged. Matches libaom's
     /// `av1_alloc_restoration_struct`.
-    pub fn alloc_lr_units(
-        &mut self,
-        plane: usize,
-        unit_size_samples: u32,
-        cols: u32,
-        rows: u32,
-    ) {
+    pub fn alloc_lr_units(&mut self, plane: usize, unit_size_samples: u32, cols: u32, rows: u32) {
         self.lr_cols[plane] = cols;
         self.lr_rows[plane] = rows;
         self.lr_unit_size[plane] = unit_size_samples;
-        self.lr_unit_info[plane] =
-            vec![LrUnitParams::default(); (cols as usize) * (rows as usize)];
+        self.lr_unit_info[plane] = vec![LrUnitParams::default(); (cols as usize) * (rows as usize)];
     }
 
     /// Index into the per-plane `lr_unit_info` table. Out-of-range

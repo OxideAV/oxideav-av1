@@ -58,9 +58,7 @@ pub fn decode_tile_group(
     prev_frame: Option<&Arc<FrameState>>,
 ) -> Result<()> {
     let tile_info = frame.tile_info.as_ref().ok_or_else(|| {
-        Error::invalid(
-            "av1 decode_tile_group: frame header missing tile_info (§5.9.15)",
-        )
+        Error::invalid("av1 decode_tile_group: frame header missing tile_info (§5.9.15)")
     })?;
     // Allocate per-plane LR unit storage so the superblock walker can
     // index into it. Must happen before any tile decodes.
@@ -446,17 +444,15 @@ fn apply_film_grain(frame: &FrameHeader, fs: &mut FrameState) {
         return;
     }
 
-    let apply_chroma = |
-        scaling_values: &[u8],
-        scaling_scales: &[u8],
-        num_points: u8,
-        ar_coeffs: &[i8],
-        plane8: &mut Vec<u8>,
-        plane16: &mut Vec<u16>,
-        w: usize,
-        h: usize,
-        bd: u32,
-    | {
+    let apply_chroma = |scaling_values: &[u8],
+                        scaling_scales: &[u8],
+                        num_points: u8,
+                        ar_coeffs: &[i8],
+                        plane8: &mut Vec<u8>,
+                        plane16: &mut Vec<u16>,
+                        w: usize,
+                        h: usize,
+                        bd: u32| {
         if num_points == 0 {
             return;
         }
@@ -678,9 +674,11 @@ impl<'a> TileDecoder<'a> {
     /// end with every leaf marked skip; otherwise returns
     /// `Error::Unsupported("av1 coefficient decode pending (§5.11.39)")`.
     pub fn decode(&mut self, fs: &mut FrameState, tp: &TilePayload) -> Result<()> {
-        let tile_info = self.frame.tile_info.as_ref().ok_or_else(|| {
-            Error::invalid("av1 decode_tile: tile_info missing")
-        })?;
+        let tile_info = self
+            .frame
+            .tile_info
+            .as_ref()
+            .ok_or_else(|| Error::invalid("av1 decode_tile: tile_info missing"))?;
         // Tile extents in MI units (§5.11.1).
         let mi_col_start = tile_info.mi_col_starts[tp.tile_col as usize];
         let mi_col_end = tile_info.mi_col_starts[(tp.tile_col + 1) as usize];
@@ -723,11 +721,7 @@ impl<'a> TileDecoder<'a> {
 
     /// Decode the Y-plane intra mode for a KEY_FRAME block, given
     /// 5-bucket above/left contexts.
-    pub fn decode_intra_y_mode(
-        &mut self,
-        above_ctx: u32,
-        left_ctx: u32,
-    ) -> Result<IntraMode> {
+    pub fn decode_intra_y_mode(&mut self, above_ctx: u32, left_ctx: u32) -> Result<IntraMode> {
         let a = (above_ctx as usize).min(4);
         let l = (left_ctx as usize).min(4);
         let raw = self.symbol.decode_symbol(&mut self.kf_y_mode_cdf[a][l])?;
@@ -746,22 +740,19 @@ impl<'a> TileDecoder<'a> {
     /// Decode the UV-plane intra mode. `cfl_allowed` selects between
     /// the 13-symbol (CFL not allowed) and 14-symbol (CFL allowed)
     /// CDF sets.
-    pub fn decode_uv_mode(
-        &mut self,
-        y_mode: IntraMode,
-        cfl_allowed: bool,
-    ) -> Result<IntraMode> {
+    pub fn decode_uv_mode(&mut self, y_mode: IntraMode, cfl_allowed: bool) -> Result<IntraMode> {
         let cfl_idx = if cfl_allowed { 1 } else { 0 };
         let y_idx = y_mode as usize;
-        let raw = self.symbol.decode_symbol(&mut self.uv_mode_cdf[cfl_idx][y_idx])?;
+        let raw = self
+            .symbol
+            .decode_symbol(&mut self.uv_mode_cdf[cfl_idx][y_idx])?;
         if (raw as usize) >= UV_MODES {
             return Err(Error::invalid(format!(
                 "av1 uv_mode: symbol {raw} out of range (§5.11.18)"
             )));
         }
-        IntraMode::from_u32(raw).ok_or_else(|| {
-            Error::invalid(format!("av1 uv_mode: invalid mode {raw} (§5.11.18)"))
-        })
+        IntraMode::from_u32(raw)
+            .ok_or_else(|| Error::invalid(format!("av1 uv_mode: invalid mode {raw} (§5.11.18)")))
     }
 
     /// Decode `angle_delta` for a directional mode. `dir_idx` is the
@@ -899,12 +890,7 @@ fn intra_tx_type_for(tx_set: u32, raw: u32) -> TxType {
 /// Neighbor context for spatial segment prediction (§5.11.9). Counts
 /// the number of distinct non-zero `segment_id` values among the
 /// available above/left neighbors, clamped to 0..=2.
-pub fn segment_id_ctx(
-    above_id: u8,
-    left_id: u8,
-    have_above: bool,
-    have_left: bool,
-) -> u32 {
+pub fn segment_id_ctx(above_id: u8, left_id: u8, have_above: bool, have_left: bool) -> u32 {
     let mut count = 0u32;
     if have_above && above_id != 0 {
         count += 1;

@@ -21,8 +21,7 @@
 
 /// 5 neighbor positions sampled for a 2D scan's coefficient context:
 /// `(dr, dc)` offsets from the current `(r, c)`.
-const TEMPLATE_2D_OFFSETS: [(i32, i32); 5] =
-    [(0, 1), (1, 0), (1, 1), (0, 2), (2, 0)];
+const TEMPLATE_2D_OFFSETS: [(i32, i32); 5] = [(0, 1), (1, 0), (1, 1), (0, 2), (2, 0)];
 
 /// `sig_coef_ctx` for a coefficient at block position `(r, c)` in a
 /// block of width `w` and height `h`.

@@ -94,8 +94,14 @@ mod tests {
     #[test]
     fn clamps_below_first_point() {
         let lut = build_lut(&[
-            Point { value: 32, scale: 40 },
-            Point { value: 200, scale: 10 },
+            Point {
+                value: 32,
+                scale: 40,
+            },
+            Point {
+                value: 200,
+                scale: 10,
+            },
         ]);
         for i in 0..32 {
             assert_eq!(lut.0[i], 40);
@@ -105,8 +111,14 @@ mod tests {
     #[test]
     fn clamps_above_last_point() {
         let lut = build_lut(&[
-            Point { value: 32, scale: 40 },
-            Point { value: 200, scale: 10 },
+            Point {
+                value: 32,
+                scale: 40,
+            },
+            Point {
+                value: 200,
+                scale: 10,
+            },
         ]);
         for i in 201..256 {
             assert_eq!(lut.0[i], 10);
@@ -117,7 +129,10 @@ mod tests {
     fn interpolates_linearly() {
         let lut = build_lut(&[
             Point { value: 0, scale: 0 },
-            Point { value: 200, scale: 200 },
+            Point {
+                value: 200,
+                scale: 200,
+            },
         ]);
         assert!(lut.0[100] >= 95 && lut.0[100] <= 105);
         assert_eq!(lut.0[0], 0);

@@ -395,8 +395,8 @@ pub fn apply_with_template_chroma(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{new_luma_template, Point};
     use super::super::scaling::build_lut;
+    use super::super::{new_luma_template, Point};
     use super::*;
 
     #[test]
@@ -511,7 +511,10 @@ mod tests {
 
     #[test]
     fn overlap_changes_output_near_seams() {
-        let points = vec![Point { value: 128, scale: 255 }];
+        let points = vec![Point {
+            value: 128,
+            scale: 255,
+        }];
         let lut = build_lut(&points);
         let t = new_luma_template(0x1357, 0, &[], 7);
 
@@ -533,7 +536,11 @@ mod tests {
         // block after the first — with a 96×96 plane (3×3 blocks)
         // those seams cover many pixels and at least some should
         // differ from the non-overlap output.
-        let differ = plane_no.iter().zip(plane_yes.iter()).filter(|(a, b)| a != b).count();
+        let differ = plane_no
+            .iter()
+            .zip(plane_yes.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         assert!(differ > 0, "overlap mode produced no change vs non-overlap");
     }
 

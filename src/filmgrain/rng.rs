@@ -37,8 +37,7 @@ impl Rng {
     #[allow(clippy::should_implement_trait)] // Not an Iterator — returns u16 not Option<u16>.
     pub fn next(&mut self) -> u16 {
         // Taps: bits 0, 1, 3, 12.
-        let bit =
-            (self.state ^ (self.state >> 1) ^ (self.state >> 3) ^ (self.state >> 12)) & 1;
+        let bit = (self.state ^ (self.state >> 1) ^ (self.state >> 3) ^ (self.state >> 12)) & 1;
         self.state = (self.state >> 1) | (bit << 15);
         self.state
     }

@@ -48,7 +48,17 @@ pub fn motion_compensate(
     let vp = phase_y * 2;
 
     if hp == 0 && vp == 0 {
-        integer_copy_clamped(dst, w, h, ref_y, ref_w, ref_h, ref_stride, bx + int_x, by + int_y);
+        integer_copy_clamped(
+            dst,
+            w,
+            h,
+            ref_y,
+            ref_w,
+            ref_h,
+            ref_stride,
+            bx + int_x,
+            by + int_y,
+        );
         return;
     }
 
@@ -89,7 +99,17 @@ pub fn motion_compensate16(
     let vp = phase_y * 2;
 
     if hp == 0 && vp == 0 {
-        integer_copy_clamped16(dst, w, h, ref_y, ref_w, ref_h, ref_stride, bx + int_x, by + int_y);
+        integer_copy_clamped16(
+            dst,
+            w,
+            h,
+            ref_y,
+            ref_w,
+            ref_h,
+            ref_stride,
+            bx + int_x,
+            by + int_y,
+        );
         return;
     }
 
@@ -167,7 +187,15 @@ mod tests {
         }
         let mut dst = vec![0u8; w * h];
         motion_compensate(
-            &mut dst, w, h, &r, 64, 64, 64, 16, 16,
+            &mut dst,
+            w,
+            h,
+            &r,
+            64,
+            64,
+            64,
+            16,
+            16,
             Mv { row: 0, col: 0 },
             InterpFilter::Regular,
         );
@@ -192,7 +220,15 @@ mod tests {
         let mut dst = vec![0u8; w * h];
         // MV eighth-pel: col=16 → +2 integer pel; row=16 → +2.
         motion_compensate(
-            &mut dst, w, h, &r, 64, 64, 64, 10, 10,
+            &mut dst,
+            w,
+            h,
+            &r,
+            64,
+            64,
+            64,
+            10,
+            10,
             Mv { row: 16, col: 16 },
             InterpFilter::Regular,
         );
@@ -213,8 +249,19 @@ mod tests {
         // Block at (0, 0), MV ≈ -16 integer pel. All samples clamp to
         // the constant edge value 0x42.
         motion_compensate(
-            &mut dst, w, h, &r, 16, 16, 16, 0, 0,
-            Mv { row: -128, col: -128 },
+            &mut dst,
+            w,
+            h,
+            &r,
+            16,
+            16,
+            16,
+            0,
+            0,
+            Mv {
+                row: -128,
+                col: -128,
+            },
             InterpFilter::Regular,
         );
         for v in &dst {
@@ -234,9 +281,18 @@ mod tests {
         }
         let mut dst = vec![0u16; w * h];
         motion_compensate16(
-            &mut dst, w, h, &r, 32, 32, 32, 10, 10,
+            &mut dst,
+            w,
+            h,
+            &r,
+            32,
+            32,
+            32,
+            10,
+            10,
             Mv { row: 0, col: 0 },
-            InterpFilter::Regular, 10,
+            InterpFilter::Regular,
+            10,
         );
         for row in 0..h {
             for col in 0..w {

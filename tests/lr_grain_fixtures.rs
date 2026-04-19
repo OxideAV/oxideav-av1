@@ -111,8 +111,15 @@ fn lr_active_fixture_decodes_with_plane_variation() {
     // well within the 8-bit range and not collapse to a flat frame.
     assert!(mean > 30 && mean < 220, "unexpected mean luma {mean}");
     // Plane must show at least some inter-pixel variation.
-    let distinct = y.iter().copied().collect::<std::collections::HashSet<_>>().len();
-    assert!(distinct > 4, "decoded plane is too flat: {distinct} distinct samples");
+    let distinct = y
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct > 4,
+        "decoded plane is too flat: {distinct} distinct samples"
+    );
 }
 
 /// The film-grain fixture has `apply_grain=1` in the bitstream; the
@@ -129,7 +136,11 @@ fn film_grain_fixture_decodes_with_plane_variation() {
     let area = (w as u64) * (h as u64);
     let mean = sum / area;
     assert!(mean > 30 && mean < 220, "unexpected mean luma {mean}");
-    let distinct = y.iter().copied().collect::<std::collections::HashSet<_>>().len();
+    let distinct = y
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     assert!(
         distinct > 10,
         "grain-applied plane should be noisier — only {distinct} distinct samples"

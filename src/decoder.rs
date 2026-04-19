@@ -203,13 +203,8 @@ impl Av1Decoder {
                     if fh.frame_type == FrameType::Key {
                         self.prev_frame = None;
                     }
-                    let res = decode_tile_group(
-                        seq,
-                        fh,
-                        obu.payload,
-                        &mut fs,
-                        self.prev_frame.as_ref(),
-                    );
+                    let res =
+                        decode_tile_group(seq, fh, obu.payload, &mut fs, self.prev_frame.as_ref());
                     if res.is_ok() && fh.refresh_frame_flags != 0 {
                         self.prev_frame = Some(Arc::new(clone_frame_state(&fs)));
                     }

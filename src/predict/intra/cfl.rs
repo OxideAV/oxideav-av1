@@ -66,14 +66,7 @@ pub fn cfl_subsample16(
 ///
 /// `alpha` is signed Q6 (-16..=16 magnitude range × sign). Positive
 /// alpha copies the luma AC onto chroma; negative inverts.
-pub fn cfl_pred(
-    dst: &mut [u8],
-    w: usize,
-    h: usize,
-    luma_q3: &[i32],
-    dc_pred: &[u8],
-    alpha: i32,
-) {
+pub fn cfl_pred(dst: &mut [u8], w: usize, h: usize, luma_q3: &[i32], dc_pred: &[u8], alpha: i32) {
     let n = w * h;
     let sum: i64 = luma_q3.iter().take(n).map(|&v| v as i64).sum();
     let half = (n as i64) / 2;

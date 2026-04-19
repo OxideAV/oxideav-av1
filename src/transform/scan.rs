@@ -118,7 +118,10 @@ mod tests {
         for &p in &s {
             let r = p / 64;
             let c = p % 64;
-            assert!(r < 32 && c < 32, "pos {p} out of 32x32 subregion: r={r} c={c}");
+            assert!(
+                r < 32 && c < 32,
+                "pos {p} out of 32x32 subregion: r={r} c={c}"
+            );
         }
     }
 

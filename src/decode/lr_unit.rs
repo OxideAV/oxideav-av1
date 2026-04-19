@@ -279,19 +279,39 @@ fn read_sgrproj_filter(sd: &mut SymbolDecoder<'_>, ref_info: &mut LrRef) -> SgrP
 
     let (xq0, xq1) = if r0 == 0 {
         let xq0 = 0;
-        let xq1 =
-            decode_signed_subexp_with_ref(sd, min1, max1, ref_info.sgr_xqd[1], SGRPROJ_PRJ_SUBEXP_K);
+        let xq1 = decode_signed_subexp_with_ref(
+            sd,
+            min1,
+            max1,
+            ref_info.sgr_xqd[1],
+            SGRPROJ_PRJ_SUBEXP_K,
+        );
         (xq0, xq1)
     } else if r1 == 0 {
-        let xq0 =
-            decode_signed_subexp_with_ref(sd, min0, max0, ref_info.sgr_xqd[0], SGRPROJ_PRJ_SUBEXP_K);
+        let xq0 = decode_signed_subexp_with_ref(
+            sd,
+            min0,
+            max0,
+            ref_info.sgr_xqd[0],
+            SGRPROJ_PRJ_SUBEXP_K,
+        );
         let xq1 = ((1 << SGRPROJ_PRJ_BITS) - xq0).clamp(min1, max1);
         (xq0, xq1)
     } else {
-        let xq0 =
-            decode_signed_subexp_with_ref(sd, min0, max0, ref_info.sgr_xqd[0], SGRPROJ_PRJ_SUBEXP_K);
-        let xq1 =
-            decode_signed_subexp_with_ref(sd, min1, max1, ref_info.sgr_xqd[1], SGRPROJ_PRJ_SUBEXP_K);
+        let xq0 = decode_signed_subexp_with_ref(
+            sd,
+            min0,
+            max0,
+            ref_info.sgr_xqd[0],
+            SGRPROJ_PRJ_SUBEXP_K,
+        );
+        let xq1 = decode_signed_subexp_with_ref(
+            sd,
+            min1,
+            max1,
+            ref_info.sgr_xqd[1],
+            SGRPROJ_PRJ_SUBEXP_K,
+        );
         (xq0, xq1)
     };
 
@@ -461,8 +481,16 @@ mod tests {
         let mut sw = default_switchable_cdf();
         let mut we = default_wiener_cdf();
         let mut sg = default_sgrproj_cdf();
-        let got = decode_lr_unit(&mut sd, RESTORATION_NONE, 0, &mut refs, &mut sw, &mut we, &mut sg)
-            .expect("decode");
+        let got = decode_lr_unit(
+            &mut sd,
+            RESTORATION_NONE,
+            0,
+            &mut refs,
+            &mut sw,
+            &mut we,
+            &mut sg,
+        )
+        .expect("decode");
         assert_eq!(got.filter, FilterType::None);
     }
 }
