@@ -48,6 +48,7 @@
 //! Specification (2019-01-08)**: <https://aomediacodec.github.io/av1-spec/av1-spec.pdf>.
 
 pub mod bitreader;
+pub mod cdfs;
 pub mod decoder;
 pub mod extradata;
 pub mod frame_header;
