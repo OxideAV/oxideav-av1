@@ -839,8 +839,12 @@ fn reconstruct_inter_chroma_block(
 ///
 /// AV1's max TX size is 64×64 (§5.11.27, Table `Max_Tx_Size_Rect`), so
 /// blocks of 128×128 / 128×64 / 64×128 are split into a 2×2 / 2×1 / 1×2
-/// grid of 64×64 TX units. Smaller blocks degenerate to a single TX
-/// unit (the loop runs once), matching the pre-split behaviour.
+/// grid of ≤ 64×64 TX units. Intra prediction — including neighbour
+/// gathering and SMOOTH / PAETH tables — also runs at TX-unit
+/// granularity (libaom `build_intra_predictors` uses tx_size dims, not
+/// block dims; there are no SMOOTH weight tables beyond 64 samples).
+/// Smaller blocks produce a single iteration, matching the pre-split
+/// behaviour.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_luma_block(
     td: &mut TileDecoder<'_>,
@@ -856,51 +860,6 @@ fn reconstruct_luma_block(
 ) -> Result<()> {
     let w = bw as usize;
     let h = bh as usize;
-    let stride = fs.width as usize;
-
-    // Predict + paste.
-    if fs.bit_depth == 8 {
-        let pred = run_intra_prediction_u8(
-            &fs.y_plane,
-            stride,
-            fs.height as usize,
-            x as usize,
-            y as usize,
-            w,
-            h,
-            y_mode,
-            angle_delta,
-            128,
-        );
-        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &pred, w, h);
-    } else {
-        let pred = run_intra_prediction_u16(
-            &fs.y_plane16,
-            stride,
-            fs.height as usize,
-            x as usize,
-            y as usize,
-            w,
-            h,
-            y_mode,
-            angle_delta,
-            1u16 << (fs.bit_depth - 1),
-            fs.bit_depth,
-        );
-        paste_block16(
-            &mut fs.y_plane16,
-            stride,
-            x as usize,
-            y as usize,
-            &pred,
-            w,
-            h,
-        );
-    }
-
-    if skip {
-        return Ok(());
-    }
 
     // Block-level tx_type (§6.10.15): for blocks with area > 32×32 the
     // ext-tx set is 0 (implicit DCT_DCT, no CDF read), so decoding the
@@ -908,7 +867,13 @@ fn reconstruct_luma_block(
     // symbol stream. For blocks with area ≤ 32×32 there is exactly one
     // TX unit (since the block already fits inside a 64×64 TX), so
     // reading the type once remains spec-correct.
-    let tx_type = td.decode_intra_tx_type(w, h, y_mode)?;
+    let tx_type = if skip {
+        // No coefficients to transform — the tx_type is irrelevant and
+        // the symbol stream doesn't carry one anyway.
+        TxType::DctDct
+    } else {
+        td.decode_intra_tx_type(w, h, y_mode)?
+    };
 
     let (tx_w, tx_h) = tx_unit_dims(w, h);
     let cols = w / tx_w;
@@ -917,29 +882,82 @@ fn reconstruct_luma_block(
         for tx in 0..cols {
             let ux = x as usize + tx * tx_w;
             let uy = y as usize + ty * tx_h;
-            decode_one_luma_tx_unit(td, fs, ux, uy, tx_w, tx_h, tx_type, segment_id)?;
+            reconstruct_one_luma_tx_unit(
+                td,
+                fs,
+                ux,
+                uy,
+                tx_w,
+                tx_h,
+                y_mode,
+                angle_delta,
+                skip,
+                tx_type,
+                segment_id,
+            )?;
         }
     }
     Ok(())
 }
 
-/// Decode residual for a single luma TX unit at plane coordinates
-/// `(ux, uy)`, dimensions `tx_w × tx_h ≤ 64×64`. Reads coefficients,
-/// dequantises, inverse-transforms, and clip-adds into `fs.y_plane` /
-/// `fs.y_plane16`. The predictor must already be pasted into the
-/// destination plane by the caller.
+/// Predict + (optional) decode residual for a single luma TX unit at
+/// plane coordinates `(ux, uy)`, dimensions `tx_w × tx_h ≤ 64×64`. The
+/// predictor reads from the already-reconstructed samples above / left
+/// of this TX unit, so earlier TX units within the same block feed the
+/// later ones' neighbours — matching libaom's incremental
+/// `av1_predict_intra_block` per TX-size behaviour.
 #[allow(clippy::too_many_arguments)]
-fn decode_one_luma_tx_unit(
+fn reconstruct_one_luma_tx_unit(
     td: &mut TileDecoder<'_>,
     fs: &mut FrameState,
     ux: usize,
     uy: usize,
     tx_w: usize,
     tx_h: usize,
+    y_mode: IntraMode,
+    angle_delta: i8,
+    skip: bool,
     tx_type: TxType,
     segment_id: u8,
 ) -> Result<()> {
     let stride = fs.width as usize;
+
+    // Predict + paste.
+    if fs.bit_depth == 8 {
+        let pred = run_intra_prediction_u8(
+            &fs.y_plane,
+            stride,
+            fs.height as usize,
+            ux,
+            uy,
+            tx_w,
+            tx_h,
+            y_mode,
+            angle_delta,
+            128,
+        );
+        paste_block(&mut fs.y_plane, stride, ux, uy, &pred, tx_w, tx_h);
+    } else {
+        let pred = run_intra_prediction_u16(
+            &fs.y_plane16,
+            stride,
+            fs.height as usize,
+            ux,
+            uy,
+            tx_w,
+            tx_h,
+            y_mode,
+            angle_delta,
+            1u16 << (fs.bit_depth - 1),
+            fs.bit_depth,
+        );
+        paste_block16(&mut fs.y_plane16, stride, ux, uy, &pred, tx_w, tx_h);
+    }
+
+    if skip {
+        return Ok(());
+    }
+
     let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
     let tx_idx = tx_size_idx(tx_w, tx_h)?;
     let nz = nz_map_ctx_offset(tx_w, tx_h)?;
@@ -1036,7 +1054,9 @@ fn select_square_tx(w: usize, h: usize) -> Result<(TxSize, usize, Vec<usize>)> {
 }
 
 /// Chroma counterpart of [`reconstruct_luma_block`] covering both U
-/// and V.
+/// and V. Per-TX-unit prediction + residual mirrors libaom's
+/// `av1_predict_intra_block` so SMOOTH / PAETH tables (capped at 64
+/// samples) work for 128-wide blocks under 4:4:4 as well.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_chroma_block(
     td: &mut TileDecoder<'_>,
@@ -1067,6 +1087,7 @@ fn reconstruct_chroma_block(
     }
 
     // For CFL we need the reconstructed luma block as the AC template.
+    // Subsampling runs over the full block; per-TX slicing happens below.
     let cfl_luma_q3: Option<Vec<i32>> = if uv_mode == IntraMode::CflPred {
         let luma_w = bw as usize;
         let luma_h = bh as usize;
@@ -1115,105 +1136,57 @@ fn reconstruct_chroma_block(
         None
     };
 
-    for plane_idx in 0..2u32 {
-        let stride = uvw;
+    // For CFL, the base prediction is DC; then the luma AC is overlaid.
+    // For other modes, run the predictor directly.
+    let base_mode = if uv_mode == IntraMode::CflPred {
+        IntraMode::DcPred
+    } else {
+        uv_mode
+    };
 
+    let (tx_w, tx_h) = tx_unit_dims(cw_clip, ch_clip);
+    let cols = cw_clip / tx_w;
+    let rows = ch_clip / tx_h;
+
+    for plane_idx in 0..2u32 {
         let alpha = if plane_idx == 0 {
             cfl_alpha_u
         } else {
             cfl_alpha_v
         };
 
-        // For CFL, the base prediction is DC; then the luma AC is
-        // overlaid. For other modes, run the predictor directly.
-        let base_mode = if uv_mode == IntraMode::CflPred {
-            IntraMode::DcPred
-        } else {
-            uv_mode
-        };
-
-        if fs.bit_depth == 8 {
-            let plane_ref: &[u8] = if plane_idx == 0 {
-                &fs.u_plane
-            } else {
-                &fs.v_plane
-            };
-            let mut pred = run_intra_prediction_u8(
-                plane_ref,
-                stride,
-                uvh,
-                cx,
-                cy,
-                cw_clip,
-                ch_clip,
-                base_mode,
-                angle_delta_uv,
-                128,
-            );
-            if let Some(luma_q3) = &cfl_luma_q3 {
-                let dc_copy = pred.clone();
-                cfl_pred(&mut pred, cw_clip, ch_clip, luma_q3, &dc_copy, alpha);
-            }
-            if plane_idx == 0 {
-                paste_block(&mut fs.u_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
-            } else {
-                paste_block(&mut fs.v_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
-            }
-        } else {
-            let plane_ref: &[u16] = if plane_idx == 0 {
-                &fs.u_plane16
-            } else {
-                &fs.v_plane16
-            };
-            let mid = 1u16 << (fs.bit_depth - 1);
-            let mut pred = run_intra_prediction_u16(
-                plane_ref,
-                stride,
-                uvh,
-                cx,
-                cy,
-                cw_clip,
-                ch_clip,
-                base_mode,
-                angle_delta_uv,
-                mid,
-                fs.bit_depth,
-            );
-            if let Some(luma_q3) = &cfl_luma_q3 {
-                let dc_copy = pred.clone();
-                cfl_pred16(
-                    &mut pred,
-                    cw_clip,
-                    ch_clip,
-                    luma_q3,
-                    &dc_copy,
-                    alpha,
-                    fs.bit_depth,
-                );
-            }
-            if plane_idx == 0 {
-                paste_block16(&mut fs.u_plane16, stride, cx, cy, &pred, cw_clip, ch_clip);
-            } else {
-                paste_block16(&mut fs.v_plane16, stride, cx, cy, &pred, cw_clip, ch_clip);
-            }
-        }
-
-        if skip {
-            continue;
-        }
-
-        // Split the chroma block into ≤ 64×64 TX units when either
-        // dimension exceeds 64 (§5.11.27). For 4:2:0 this only happens
-        // under 4:4:4 sampling with bw/bh of 128 — for 4:2:0 a 128×128
-        // luma block already maps to 64×64 chroma and the loop runs once.
-        let (tx_w, tx_h) = tx_unit_dims(cw_clip, ch_clip);
-        let cols = cw_clip / tx_w;
-        let rows = ch_clip / tx_h;
         for ty in 0..rows {
             for txi in 0..cols {
                 let ux = cx + txi * tx_w;
                 let uy = cy + ty * tx_h;
-                decode_one_chroma_tx_unit(td, fs, plane_idx, ux, uy, tx_w, tx_h, segment_id)?;
+                // Extract the CFL luma slice corresponding to this TX
+                // unit so the overlay only mixes in the aligned AC band.
+                let cfl_tx_q3 = cfl_luma_q3.as_ref().map(|full| {
+                    let mut tile = vec![0i32; tx_w * tx_h];
+                    let col_off = txi * tx_w;
+                    let row_off = ty * tx_h;
+                    for r in 0..tx_h {
+                        let src_row = (row_off + r) * cw_clip + col_off;
+                        tile[r * tx_w..(r + 1) * tx_w]
+                            .copy_from_slice(&full[src_row..src_row + tx_w]);
+                    }
+                    tile
+                });
+                reconstruct_one_chroma_tx_unit(
+                    td,
+                    fs,
+                    plane_idx,
+                    ux,
+                    uy,
+                    tx_w,
+                    tx_h,
+                    base_mode,
+                    angle_delta_uv,
+                    skip,
+                    cfl_tx_q3.as_deref(),
+                    alpha,
+                    segment_id,
+                )?;
             }
         }
     }
@@ -1221,14 +1194,14 @@ fn reconstruct_chroma_block(
     Ok(())
 }
 
-/// Decode residual for a single chroma TX unit at plane coordinates
-/// `(ux, uy)`, dimensions `tx_w × tx_h ≤ 64×64`. `plane_idx = 0` → U,
-/// `plane_idx = 1` → V. The predictor (including any CFL overlay) must
-/// already be pasted into the destination plane by the caller. Chroma
-/// intra blocks use implicit `DCT_DCT` per §6.10.15 (the tx_set for
-/// chroma doesn't signal any alternative).
+/// Predict + (optional) decode residual for a single chroma TX unit at
+/// plane coordinates `(ux, uy)`, dimensions `tx_w × tx_h ≤ 64×64`.
+/// `plane_idx = 0` → U, `plane_idx = 1` → V. If `cfl_q3` is present it
+/// carries the subsampled-luma AC template for this exact TX unit and
+/// the predictor is CFL (base DC + luma overlay). Chroma residuals use
+/// implicit `DCT_DCT` per §6.10.15.
 #[allow(clippy::too_many_arguments)]
-fn decode_one_chroma_tx_unit(
+fn reconstruct_one_chroma_tx_unit(
     td: &mut TileDecoder<'_>,
     fs: &mut FrameState,
     plane_idx: u32,
@@ -1236,9 +1209,79 @@ fn decode_one_chroma_tx_unit(
     uy: usize,
     tx_w: usize,
     tx_h: usize,
+    base_mode: IntraMode,
+    angle_delta_uv: i8,
+    skip: bool,
+    cfl_q3: Option<&[i32]>,
+    alpha: i32,
     segment_id: u8,
 ) -> Result<()> {
     let stride = fs.uv_width as usize;
+    let uvh = fs.uv_height as usize;
+
+    // Predict + (CFL overlay) + paste.
+    if fs.bit_depth == 8 {
+        let plane_ref: &[u8] = if plane_idx == 0 {
+            &fs.u_plane
+        } else {
+            &fs.v_plane
+        };
+        let mut pred = run_intra_prediction_u8(
+            plane_ref,
+            stride,
+            uvh,
+            ux,
+            uy,
+            tx_w,
+            tx_h,
+            base_mode,
+            angle_delta_uv,
+            128,
+        );
+        if let Some(q3) = cfl_q3 {
+            let dc_copy = pred.clone();
+            cfl_pred(&mut pred, tx_w, tx_h, q3, &dc_copy, alpha);
+        }
+        if plane_idx == 0 {
+            paste_block(&mut fs.u_plane, stride, ux, uy, &pred, tx_w, tx_h);
+        } else {
+            paste_block(&mut fs.v_plane, stride, ux, uy, &pred, tx_w, tx_h);
+        }
+    } else {
+        let plane_ref: &[u16] = if plane_idx == 0 {
+            &fs.u_plane16
+        } else {
+            &fs.v_plane16
+        };
+        let mid = 1u16 << (fs.bit_depth - 1);
+        let mut pred = run_intra_prediction_u16(
+            plane_ref,
+            stride,
+            uvh,
+            ux,
+            uy,
+            tx_w,
+            tx_h,
+            base_mode,
+            angle_delta_uv,
+            mid,
+            fs.bit_depth,
+        );
+        if let Some(q3) = cfl_q3 {
+            let dc_copy = pred.clone();
+            cfl_pred16(&mut pred, tx_w, tx_h, q3, &dc_copy, alpha, fs.bit_depth);
+        }
+        if plane_idx == 0 {
+            paste_block16(&mut fs.u_plane16, stride, ux, uy, &pred, tx_w, tx_h);
+        } else {
+            paste_block16(&mut fs.v_plane16, stride, ux, uy, &pred, tx_w, tx_h);
+        }
+    }
+
+    if skip {
+        return Ok(());
+    }
+
     let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
     let tx_idx = tx_size_idx(tx_w, tx_h)?;
     let nz = nz_map_ctx_offset(tx_w, tx_h)?;
@@ -1621,4 +1664,70 @@ fn segmented_base_q(td: &TileDecoder<'_>, segment_id: u8) -> i32 {
     }
     let q = base + td.frame.segmentation.feature_data[sid][0] as i32;
     q.clamp(0, 255)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TX-unit sizing covers the cases spelled out by §5.11.27 / Table
+    // `Max_Tx_Size_Rect`: blocks up to 64 on either axis use a single
+    // TX, blocks wider/taller than 64 split into ≤ 64-wide / ≤ 64-tall
+    // TX units. Every block dim tested here is a multiple of the
+    // resulting TX dim, so the loop in reconstruct_luma_block cleanly
+    // iterates `(w / tx_w) × (h / tx_h)` units without remainders.
+    #[test]
+    fn tx_unit_dims_caps_at_64_samples() {
+        // Small blocks → single TX, unchanged.
+        assert_eq!(tx_unit_dims(4, 4), (4, 4));
+        assert_eq!(tx_unit_dims(8, 16), (8, 16));
+        assert_eq!(tx_unit_dims(32, 32), (32, 32));
+        assert_eq!(tx_unit_dims(64, 64), (64, 64));
+        assert_eq!(tx_unit_dims(64, 32), (64, 32));
+        assert_eq!(tx_unit_dims(16, 64), (16, 64));
+
+        // 128-wide / 128-tall blocks split along the oversized axis.
+        assert_eq!(tx_unit_dims(128, 128), (64, 64));
+        assert_eq!(tx_unit_dims(128, 64), (64, 64));
+        assert_eq!(tx_unit_dims(64, 128), (64, 64));
+
+        // The grid dimensions line up with the spec's Table
+        // `Max_Tx_Size_Rect` expectation of 2×2 / 2×1 / 1×2 TX units.
+        let (tw, th) = tx_unit_dims(128, 128);
+        assert_eq!((128 / tw, 128 / th), (2, 2));
+        let (tw, th) = tx_unit_dims(128, 64);
+        assert_eq!((128 / tw, 64 / th), (2, 1));
+        let (tw, th) = tx_unit_dims(64, 128);
+        assert_eq!((64 / tw, 128 / th), (1, 2));
+    }
+
+    // Sanity: every spec-valid 64×64-or-less TX size that the intra
+    // path may feed `select_square_tx` must succeed. 128×N does not
+    // and must still be rejected — callers are expected to loop over
+    // TX units instead of passing oversized dimensions directly.
+    #[test]
+    fn select_square_tx_rejects_oversized_blocks() {
+        for &(w, h) in &[
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (4, 8),
+            (8, 4),
+            (64, 32),
+            (32, 64),
+            (16, 64),
+            (64, 16),
+        ] {
+            assert!(
+                select_square_tx(w, h).is_ok(),
+                "expected TX {w}×{h} to be in the AV1 set"
+            );
+        }
+        // 128 on either axis is outside the spec's TX set.
+        assert!(select_square_tx(128, 128).is_err());
+        assert!(select_square_tx(128, 64).is_err());
+        assert!(select_square_tx(64, 128).is_err());
+    }
 }
