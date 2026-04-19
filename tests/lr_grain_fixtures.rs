@@ -85,7 +85,7 @@ fn decode_first_frame(path: &str) -> Option<(Vec<u8>, u32, u32, u64)> {
         sh.color_config.mono_chrome,
         sh.color_config.bit_depth,
     );
-    decode_tile_group(&sh, &fh, &tg, &mut fs).expect("tile_group decode");
+    decode_tile_group(&sh, &fh, &tg, &mut fs, None).expect("tile_group decode");
     let mut sum: u64 = 0;
     for &b in &fs.y_plane {
         sum = sum.wrapping_add(b as u64);

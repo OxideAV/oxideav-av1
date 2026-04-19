@@ -23,9 +23,12 @@ use super::block::{
 };
 use super::coeffs::{decode_coefficients, nz_map_ctx_offset, tx_size_idx};
 use super::frame_state::FrameState;
+use super::inter_block::{decode_inter_block_syntax, mc_chroma_u16, mc_chroma_u8, mc_luma_u16, mc_luma_u8};
 use super::modes::{mode_ctx_bucket, IntraMode};
+use super::mv::Mv;
 use super::reconstruct::{clip_add_in_place, clip_add_in_place16};
 use super::tile::{cfl_alpha_ctx, cfl_signs, segment_id_ctx, TileDecoder};
+use crate::frame_header::FrameType;
 
 /// Decode one superblock at luma-sample position `(sb_x, sb_y)`.
 ///
@@ -259,6 +262,15 @@ pub fn decode_leaf_block(
         return Ok(());
     }
 
+    // Inter frames route through the inter leaf decoder; intra / key /
+    // intra-only frames use the original intra-only path below.
+    if matches!(
+        td.frame.frame_type,
+        FrameType::Inter | FrameType::Switch
+    ) {
+        return decode_inter_leaf_block(td, fs, x, y, bw, bh);
+    }
+
     let mi_col = x >> 2;
     let mi_row = y >> 2;
 
@@ -383,6 +395,341 @@ pub fn decode_leaf_block(
         )?;
     }
 
+    Ok(())
+}
+
+/// Inter-frame leaf decode — reads block-level inter syntax, runs MC
+/// into a prediction buffer, then performs the existing residual /
+/// clip-add path on top. Intra-within-inter blocks surface
+/// `Error::Unsupported` in the narrow Phase 7 scope.
+fn decode_inter_leaf_block(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    x: u32,
+    y: u32,
+    bw: u32,
+    bh: u32,
+) -> Result<()> {
+    let info = decode_inter_block_syntax(td, fs, x, y, bw, bh)?;
+    if !info.is_inter {
+        return Err(Error::unsupported(
+            "av1 inter-intra / intra-within-inter leaf block pending (§5.11.22)",
+        ));
+    }
+    if td.prev_frame.is_none() {
+        return Err(Error::unsupported(
+            "av1 inter: missing reference frame for LAST-ref translational MC (§7.11.3)",
+        ));
+    }
+
+    let w = bw as usize;
+    let h = bh as usize;
+    let mi_col = x >> 2;
+    let mi_row = y >> 2;
+    // Record mode info on MI grid so neighbor contexts for subsequent
+    // blocks are accurate.
+    let mi_w = (bw + 3) >> 2;
+    let mi_h = (bh + 3) >> 2;
+    for mr in 0..mi_h {
+        for mc in 0..mi_w {
+            let cell_col = mi_col + mc;
+            let cell_row = mi_row + mr;
+            if cell_col >= fs.mi_cols || cell_row >= fs.mi_rows {
+                continue;
+            }
+            let mi = fs.mi_mut(cell_col, cell_row);
+            mi.mode = None;
+            mi.uv_mode = None;
+            mi.skip = info.skip;
+            mi.segment_id = 0;
+            mi.angle_delta = 0;
+            mi.angle_delta_uv = 0;
+            mi.cfl_alpha_u = 0;
+            mi.cfl_alpha_v = 0;
+            mi.is_inter = true;
+            mi.mv_row = info.mv.row;
+            mi.mv_col = info.mv.col;
+        }
+    }
+
+    reconstruct_inter_luma_block(td, fs, x, y, w, h, info.mv, info.skip, info.interp_filter)?;
+
+    if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
+        reconstruct_inter_chroma_block(td, fs, x, y, w, h, info.mv, info.skip, info.interp_filter)?;
+    }
+    Ok(())
+}
+
+/// Motion-compensate + residual-add for the luma plane on an inter
+/// leaf block.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter_luma_block(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    x: u32,
+    y: u32,
+    w: usize,
+    h: usize,
+    mv: Mv,
+    skip: bool,
+    filt: crate::predict::interp::InterpFilter,
+) -> Result<()> {
+    let stride = fs.width as usize;
+    let prev = td
+        .prev_frame
+        .as_ref()
+        .ok_or_else(|| Error::invalid("av1 inter: prev_frame checked earlier"))?;
+    if fs.bit_depth == 8 {
+        let pred = mc_luma_u8(
+            &prev.y_plane,
+            prev.width as usize,
+            prev.height as usize,
+            prev.width as usize,
+            x as i32,
+            y as i32,
+            w,
+            h,
+            mv,
+            filt,
+        );
+        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &pred, w, h);
+    } else {
+        let pred = mc_luma_u16(
+            &prev.y_plane16,
+            prev.width as usize,
+            prev.height as usize,
+            prev.width as usize,
+            x as i32,
+            y as i32,
+            w,
+            h,
+            mv,
+            filt,
+            fs.bit_depth,
+        );
+        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &pred, w, h);
+    }
+
+    if skip {
+        return Ok(());
+    }
+
+    let (sz, num_coeffs, scan) = select_square_tx(w, h)?;
+    let tx_idx = tx_size_idx(w, h)?;
+    let nz = nz_map_ctx_offset(w, h)?;
+    let mut coeffs = decode_coefficients(
+        &mut td.symbol,
+        &mut td.coeff_bank,
+        tx_idx,
+        0,
+        num_coeffs,
+        &scan,
+        nz,
+        w,
+        h,
+    )?;
+    let qv = quant::Params {
+        base_q_idx: td.frame.quant.base_q_idx as i32,
+        delta_q_y_dc: td.frame.quant.delta_q_y_dc as i32,
+        delta_q_u_dc: td.frame.quant.delta_q_u_dc as i32,
+        delta_q_u_ac: td.frame.quant.delta_q_u_ac as i32,
+        delta_q_v_dc: td.frame.quant.delta_q_v_dc as i32,
+        delta_q_v_ac: td.frame.quant.delta_q_v_ac as i32,
+        bit_depth: fs.bit_depth,
+    }
+    .compute(quant::Plane::Y)?;
+    for (i, c) in coeffs.iter_mut().enumerate() {
+        *c = dequant_coeff(*c, i, qv);
+    }
+    inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
+    let shift = residual_shift(w, h);
+    for v in coeffs.iter_mut() {
+        *v = round_shift(*v, shift);
+    }
+    if fs.bit_depth == 8 {
+        let mut block = vec![0u8; w * h];
+        extract_block(&fs.y_plane, stride, x as usize, y as usize, w, h, &mut block);
+        clip_add_in_place(&mut block, &coeffs, w, h);
+        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &block, w, h);
+    } else {
+        let mut block = vec![0u16; w * h];
+        extract_block16(&fs.y_plane16, stride, x as usize, y as usize, w, h, &mut block);
+        clip_add_in_place16(&mut block, &coeffs, w, h, fs.bit_depth);
+        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &block, w, h);
+    }
+    Ok(())
+}
+
+/// MC + residual for the chroma planes on an inter leaf block.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter_chroma_block(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    x: u32,
+    y: u32,
+    w: usize,
+    h: usize,
+    mv: Mv,
+    skip: bool,
+    filt: crate::predict::interp::InterpFilter,
+) -> Result<()> {
+    let sub_x = fs.sub_x;
+    let sub_y = fs.sub_y;
+    let cx = (x >> sub_x) as usize;
+    let cy = (y >> sub_y) as usize;
+    let cw = ((w as u32 >> sub_x).max(1)) as usize;
+    let ch = ((h as u32 >> sub_y).max(1)) as usize;
+    let uvw = fs.uv_width as usize;
+    let uvh = fs.uv_height as usize;
+    let cw_clip = cw.min(uvw.saturating_sub(cx));
+    let ch_clip = ch.min(uvh.saturating_sub(cy));
+    if cw_clip == 0 || ch_clip == 0 {
+        return Ok(());
+    }
+
+    let prev = td
+        .prev_frame
+        .as_ref()
+        .ok_or_else(|| Error::invalid("av1 inter: prev_frame checked earlier"))?;
+    let stride = uvw;
+
+    for plane_idx in 0..2u32 {
+        let pred = if fs.bit_depth == 8 {
+            let ref_plane = if plane_idx == 0 {
+                &prev.u_plane
+            } else {
+                &prev.v_plane
+            };
+            Some(mc_chroma_u8(
+                ref_plane,
+                prev.uv_width as usize,
+                prev.uv_height as usize,
+                prev.uv_width as usize,
+                cx as i32,
+                cy as i32,
+                cw_clip,
+                ch_clip,
+                mv,
+                sub_x,
+                sub_y,
+                filt,
+            ))
+        } else {
+            None
+        };
+        let pred16 = if fs.bit_depth > 8 {
+            let ref_plane = if plane_idx == 0 {
+                &prev.u_plane16
+            } else {
+                &prev.v_plane16
+            };
+            Some(mc_chroma_u16(
+                ref_plane,
+                prev.uv_width as usize,
+                prev.uv_height as usize,
+                prev.uv_width as usize,
+                cx as i32,
+                cy as i32,
+                cw_clip,
+                ch_clip,
+                mv,
+                sub_x,
+                sub_y,
+                filt,
+                fs.bit_depth,
+            ))
+        } else {
+            None
+        };
+
+        if fs.bit_depth == 8 {
+            let buf = pred.expect("u8 chroma predicted");
+            if plane_idx == 0 {
+                paste_block(&mut fs.u_plane, stride, cx, cy, &buf, cw_clip, ch_clip);
+            } else {
+                paste_block(&mut fs.v_plane, stride, cx, cy, &buf, cw_clip, ch_clip);
+            }
+        } else {
+            let buf = pred16.expect("u16 chroma predicted");
+            if plane_idx == 0 {
+                paste_block16(&mut fs.u_plane16, stride, cx, cy, &buf, cw_clip, ch_clip);
+            } else {
+                paste_block16(&mut fs.v_plane16, stride, cx, cy, &buf, cw_clip, ch_clip);
+            }
+        }
+
+        if skip {
+            continue;
+        }
+
+        // Chroma residual mirrors the intra chroma path.
+        let (sz, num_coeffs, scan) = select_square_tx(cw_clip, ch_clip)?;
+        let tx_idx = tx_size_idx(cw_clip, ch_clip)?;
+        let nz = nz_map_ctx_offset(cw_clip, ch_clip)?;
+        let mut coeffs = decode_coefficients(
+            &mut td.symbol,
+            &mut td.coeff_bank,
+            tx_idx,
+            1,
+            num_coeffs,
+            &scan,
+            nz,
+            cw_clip,
+            ch_clip,
+        )?;
+        let plane = if plane_idx == 0 {
+            quant::Plane::U
+        } else {
+            quant::Plane::V
+        };
+        let qv = quant::Params {
+            base_q_idx: td.frame.quant.base_q_idx as i32,
+            delta_q_y_dc: td.frame.quant.delta_q_y_dc as i32,
+            delta_q_u_dc: td.frame.quant.delta_q_u_dc as i32,
+            delta_q_u_ac: td.frame.quant.delta_q_u_ac as i32,
+            delta_q_v_dc: td.frame.quant.delta_q_v_dc as i32,
+            delta_q_v_ac: td.frame.quant.delta_q_v_ac as i32,
+            bit_depth: fs.bit_depth,
+        }
+        .compute(plane)?;
+        for (i, c) in coeffs.iter_mut().enumerate() {
+            *c = dequant_coeff(*c, i, qv);
+        }
+        inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
+        let shift = residual_shift(cw_clip, ch_clip);
+        for v in coeffs.iter_mut() {
+            *v = round_shift(*v, shift);
+        }
+        if fs.bit_depth == 8 {
+            let mut block = vec![0u8; cw_clip * ch_clip];
+            let plane_buf = if plane_idx == 0 {
+                &fs.u_plane
+            } else {
+                &fs.v_plane
+            };
+            extract_block(plane_buf, stride, cx, cy, cw_clip, ch_clip, &mut block);
+            clip_add_in_place(&mut block, &coeffs, cw_clip, ch_clip);
+            if plane_idx == 0 {
+                paste_block(&mut fs.u_plane, stride, cx, cy, &block, cw_clip, ch_clip);
+            } else {
+                paste_block(&mut fs.v_plane, stride, cx, cy, &block, cw_clip, ch_clip);
+            }
+        } else {
+            let mut block = vec![0u16; cw_clip * ch_clip];
+            let plane_buf = if plane_idx == 0 {
+                &fs.u_plane16
+            } else {
+                &fs.v_plane16
+            };
+            extract_block16(plane_buf, stride, cx, cy, cw_clip, ch_clip, &mut block);
+            clip_add_in_place16(&mut block, &coeffs, cw_clip, ch_clip, fs.bit_depth);
+            if plane_idx == 0 {
+                paste_block16(&mut fs.u_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
+            } else {
+                paste_block16(&mut fs.v_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
+            }
+        }
+    }
     Ok(())
 }
 
