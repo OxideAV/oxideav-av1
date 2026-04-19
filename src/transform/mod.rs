@@ -32,7 +32,7 @@ pub mod iwht4;
 pub mod scan;
 pub mod types;
 
-pub use scan::{default_zigzag_scan, inverse_scan};
+pub use scan::{clamped_scan, default_zigzag_scan, inverse_scan};
 pub use types::{Kind, TxSize, TxType};
 
 use oxideav_core::{Error, Result};

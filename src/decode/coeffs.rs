@@ -85,15 +85,19 @@ pub static NZ_MAP_CTX_OFFSET_32X32: [i8; 1024] = {
     t
 };
 
-/// Pick the nz_map_ctx_offset table for a given TX size. Phase 3 only
-/// handles 4×4, 8×8, 16×16.
+/// Pick the nz_map_ctx_offset table for a given TX size. The spec uses
+/// separate tables per non-square aspect; for Phase 4 scope (square
+/// sizes used by AVIF stills) we route 32×32 and 64×64 through the
+/// shared 32×32 table — libaom does the same for TX_64x64 because the
+/// coded region is clamped to the top-left 32×32.
 pub fn nz_map_ctx_offset(w: usize, h: usize) -> Result<&'static [i8]> {
     match (w, h) {
         (4, 4) => Ok(&NZ_MAP_CTX_OFFSET_4X4),
         (8, 8) => Ok(&NZ_MAP_CTX_OFFSET_8X8),
         (16, 16) => Ok(&NZ_MAP_CTX_OFFSET_16X16),
+        (32, 32) | (64, 64) | (64, 32) | (32, 64) => Ok(&NZ_MAP_CTX_OFFSET_32X32),
         _ => Err(Error::unsupported(format!(
-            "av1 coeffs: nz_map offset for {w}×{h} not available (§6.10.6; Phase 3 = 4/8/16 only)"
+            "av1 coeffs: nz_map offset for {w}×{h} not available (§6.10.6)"
         ))),
     }
 }

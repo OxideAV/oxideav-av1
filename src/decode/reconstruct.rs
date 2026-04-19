@@ -37,9 +37,20 @@ pub fn clip_add_in_place(dst: &mut [u8], residual: &[i32], w: usize, h: usize) {
     }
 }
 
+/// In-place clip-add where `dst` already holds the 10/12-bit
+/// predictor. Result clamped to `[0, (1 << bit_depth) - 1]`.
+pub fn clip_add_in_place16(dst: &mut [u16], residual: &[i32], w: usize, h: usize, bit_depth: u32) {
+    let n = w * h;
+    debug_assert_eq!(dst.len(), n);
+    debug_assert_eq!(residual.len(), n);
+    let max = ((1i32) << bit_depth) - 1;
+    for i in 0..n {
+        let v = dst[i] as i32 + residual[i];
+        dst[i] = v.clamp(0, max) as u16;
+    }
+}
+
 /// Clip-add into a 16-bit destination clamped to `[0, (1<<bit_depth)-1]`.
-/// Used by the 10-/12-bit pipelines — Phase 3 does not yet invoke it
-/// from the tile walker.
 pub fn clip_add16(
     dst: &mut [u16],
     pred: &[u16],

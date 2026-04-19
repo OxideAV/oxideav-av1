@@ -54,6 +54,22 @@ pub fn default_zigzag_scan(w: usize, h: usize) -> Vec<usize> {
     out
 }
 
+/// Build a scan order that visits `sub_w × sub_h` coefficients inside
+/// a `full_w`-wide block (spec §7.7.3). Used by TX_64×* where only the
+/// top-left 32×32 coefficients are coded and the rest are implicitly
+/// zero. Each returned position is `r * full_w + c` with `r < sub_h`
+/// and `c < sub_w`.
+pub fn clamped_scan(sub_w: usize, sub_h: usize, full_w: usize) -> Vec<usize> {
+    let base = default_zigzag_scan(sub_w, sub_h);
+    let mut out = Vec::with_capacity(base.len());
+    for &p in &base {
+        let r = p / sub_w;
+        let c = p % sub_w;
+        out.push(r * full_w + c);
+    }
+    out
+}
+
 /// Invert a scan order: given `scan[i] = block position`, return
 /// `iscan[pos] = i`.
 pub fn inverse_scan(scan: &[usize]) -> Vec<usize> {
@@ -90,6 +106,19 @@ mod tests {
         let inv = inverse_scan(&scan);
         for i in 0..scan.len() {
             assert_eq!(inv[scan[i]], i);
+        }
+    }
+
+    #[test]
+    fn clamped_scan_32x32_in_64_is_first_position_zero() {
+        let s = clamped_scan(32, 32, 64);
+        assert_eq!(s.len(), 32 * 32);
+        assert_eq!(s[0], 0);
+        // Every entry must lie in rows 0..32 of the full 64-wide block.
+        for &p in &s {
+            let r = p / 64;
+            let c = p % 64;
+            assert!(r < 32 && c < 32, "pos {p} out of 32x32 subregion: r={r} c={c}");
         }
     }
 

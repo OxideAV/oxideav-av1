@@ -172,16 +172,16 @@ fn unsupported_intra_modes_have_precise_error_text() {
 
 #[test]
 fn unsupported_transform_sizes_have_precise_error_text() {
-    // 32×32 is still a Phase 4 deferral — Phase 3 implements 4/8/16
-    // DCT + ADST but 32+ and the mixed / identity paths remain
-    // unsupported.
-    let coeffs = vec![0i32; 32 * 32];
-    let mut dst = vec![0u8; 32 * 32];
-    match inverse_transform_add(TxType::DctDct, 32, 32, &coeffs, &mut dst, 32) {
+    // Phase 4 extends the callable set to 4/8/16/32/64 square. Sizes
+    // outside that (e.g. 128×128 or odd widths) must still surface
+    // Unsupported.
+    let coeffs = vec![0i32; 24 * 24];
+    let mut dst = vec![0u8; 24 * 24];
+    match inverse_transform_add(TxType::DctDct, 24, 24, &coeffs, &mut dst, 24) {
         Err(Error::Unsupported(s)) => {
-            assert!(s.contains("32"), "msg should name size: {s}");
+            assert!(s.contains("24"), "msg should name size: {s}");
             assert!(s.contains("§7.7"), "msg should ref §7.7: {s}");
         }
-        other => panic!("expected Unsupported for 32×32 iDCT, got {other:?}"),
+        other => panic!("expected Unsupported for 24×24 iDCT, got {other:?}"),
     }
 }

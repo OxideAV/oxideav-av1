@@ -24,7 +24,7 @@ use oxideav_core::{Error, Result};
 
 use crate::intra;
 use crate::quant;
-use crate::transform::{default_zigzag_scan, inverse_2d, TxSize, TxType};
+use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
 
 use super::block::{
     block_size_log, half_below_size, horz4_size, quarter_size, vert4_size, BlockSize,
@@ -33,7 +33,7 @@ use super::block::{
 use super::coeffs::{decode_coefficients, nz_map_ctx_offset, tx_size_idx};
 use super::frame_state::FrameState;
 use super::modes::{mode_ctx_bucket, IntraMode};
-use super::reconstruct::clip_add_in_place;
+use super::reconstruct::{clip_add_in_place, clip_add_in_place16};
 use super::tile::{cfl_alpha_ctx, cfl_signs, segment_id_ctx, TileDecoder};
 
 /// Decode one superblock at luma-sample position `(sb_x, sb_y)`.
@@ -300,12 +300,6 @@ pub fn decode_leaf_block(
         }
     }
 
-    if fs.bit_depth != 8 {
-        return Err(Error::unsupported(format!(
-            "av1 superblock: bit_depth {} not supported in Phase 3 (§5.11 — only 8-bit)",
-            fs.bit_depth
-        )));
-    }
     if td.frame.quant.using_qmatrix {
         return Err(Error::unsupported(
             "av1 quantization matrices (§5.9.12) pending",
@@ -355,63 +349,67 @@ fn reconstruct_luma_block(
     let h = bh as usize;
     let stride = fs.width as usize;
 
-    // Gather neighbor samples for intra prediction.
-    let (above_vec, left_vec) = gather_neighbors(
-        &fs.y_plane,
-        fs.width as usize,
-        fs.height as usize,
-        x as usize,
-        y as usize,
-        w,
-        h,
-    );
-    let pred = run_intra_prediction(y_mode, &above_vec, &left_vec, w, h, x > 0, y > 0)?;
-
-    // Paste predictor into dst and, if non-skip, add residual.
-    paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &pred, w, h);
+    if fs.bit_depth == 8 {
+        // Gather neighbor samples for intra prediction.
+        let (above_vec, left_vec) = gather_neighbors(
+            &fs.y_plane,
+            fs.width as usize,
+            fs.height as usize,
+            x as usize,
+            y as usize,
+            w,
+            h,
+        );
+        let pred = run_intra_prediction(y_mode, &above_vec, &left_vec, w, h, x > 0, y > 0)?;
+        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &pred, w, h);
+    } else {
+        // HBD path: run prediction on the downshifted 8-bit gather, then
+        // re-upscale the predictor to bit_depth. Residual clip-add runs
+        // directly on the HBD plane below.
+        let (above8, left8) = gather_neighbors16(
+            &fs.y_plane16,
+            fs.width as usize,
+            fs.height as usize,
+            x as usize,
+            y as usize,
+            w,
+            h,
+            fs.bit_depth,
+        );
+        let pred8 = run_intra_prediction(y_mode, &above8, &left8, w, h, x > 0, y > 0)?;
+        let pred16 = upshift_pred(&pred8, fs.bit_depth);
+        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &pred16, w, h);
+    }
 
     if skip {
         return Ok(());
     }
 
-    // Non-skip: decode a single-TX residual. Block sizes > 16×16 are
-    // not yet handled (they would require TX splitting).
-    if w > 16 || h > 16 || w != h {
-        return Err(Error::unsupported(format!(
-            "av1 superblock: luma block {w}×{h} needs TX split (§5.11.27, Phase 4)"
-        )));
-    }
-    let sz = match (w, h) {
-        (4, 4) => TxSize::Tx4x4,
-        (8, 8) => TxSize::Tx8x8,
-        (16, 16) => TxSize::Tx16x16,
-        _ => unreachable!(),
-    };
+    // Non-skip: decode a single-TX residual. Supports square 4/8/16/32/64
+    // (the common AVIF-still shapes); other rectangular sizes still
+    // surface Unsupported until a later scope adds them.
+    let (sz, num_coeffs, scan) = select_square_tx(w, h)?;
     let tx_idx = tx_size_idx(w, h)?;
     let nz = nz_map_ctx_offset(w, h)?;
-    let scan = default_zigzag_scan(w, h);
 
-    // Phase 3: force DCT_DCT — the spec signals tx_type for ext-tx sets
-    // but our decoder doesn't read that symbol yet. Forcing DCT_DCT
-    // means bitstreams that encoded an ADST-path residual will
-    // reconstruct incorrectly, but for DC-only blocks (which only have
-    // a single DC coefficient) the result is bit-exact regardless of
-    // tx_type.
-    let tx_type = TxType::DctDct;
+    // Read tx_type per spec §6.10.15 before the coefficient levels.
+    let tx_type = td.decode_intra_tx_type(w, h, y_mode)?;
 
     let mut coeffs = decode_coefficients(
         &mut td.symbol,
         &mut td.coeff_bank,
         tx_idx,
         0, /* luma */
-        w * h,
+        num_coeffs,
         &scan,
         nz,
         w,
         h,
     )?;
 
-    // Dequantise each coefficient.
+    // Dequantise each coefficient. For a clamped-scan (TX_64*N) only
+    // positions inside the 32×32 top-left region carry non-zero
+    // coefficients; the rest are already zero in the `coeffs` vec.
     let base_q = segmented_base_q(td, segment_id);
     let qv = quant::Params {
         base_q_idx: base_q,
@@ -428,19 +426,51 @@ fn reconstruct_luma_block(
     }
 
     // Inverse 2D transform.
-    inverse_2d(&mut coeffs, tx_type, sz)?;
+    if let Err(e) = inverse_2d(&mut coeffs, tx_type, sz) {
+        // Unsupported (ty, sz) combination — fall back to DCT_DCT to
+        // keep the pipeline running rather than abort the whole frame.
+        // Mirrors goavif's `reconstructResidual` safety net.
+        if matches!(e, Error::Unsupported(_)) {
+            inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
+        } else {
+            return Err(e);
+        }
+    }
 
-    // Final shift + clip-add.
+    // Final shift + clip-add, depending on plane bit depth.
     let shift = residual_shift(w, h);
     for v in coeffs.iter_mut() {
         *v = round_shift(*v, shift);
     }
-    // Extract the block region, clip-add, write back.
-    let mut block = vec![0u8; w * h];
-    extract_block(&fs.y_plane, stride, x as usize, y as usize, w, h, &mut block);
-    clip_add_in_place(&mut block, &coeffs, w, h);
-    paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &block, w, h);
+    if fs.bit_depth == 8 {
+        let mut block = vec![0u8; w * h];
+        extract_block(&fs.y_plane, stride, x as usize, y as usize, w, h, &mut block);
+        clip_add_in_place(&mut block, &coeffs, w, h);
+        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &block, w, h);
+    } else {
+        let mut block = vec![0u16; w * h];
+        extract_block16(&fs.y_plane16, stride, x as usize, y as usize, w, h, &mut block);
+        clip_add_in_place16(&mut block, &coeffs, w, h, fs.bit_depth);
+        paste_block16(&mut fs.y_plane16, stride, x as usize, y as usize, &block, w, h);
+    }
     Ok(())
+}
+
+/// Pick the square `(TxSize, num_coeffs, scan)` triple for the given
+/// block side. For TX_64x64 the coded region is clamped to the top-left
+/// 32×32 so `num_coeffs = 1024` and the scan maps back into the 64-wide
+/// buffer; `inverse_2d` still runs on the full 64×64 coefficient grid.
+fn select_square_tx(w: usize, h: usize) -> Result<(TxSize, usize, Vec<usize>)> {
+    match (w, h) {
+        (4, 4) => Ok((TxSize::Tx4x4, 16, default_zigzag_scan(4, 4))),
+        (8, 8) => Ok((TxSize::Tx8x8, 64, default_zigzag_scan(8, 8))),
+        (16, 16) => Ok((TxSize::Tx16x16, 256, default_zigzag_scan(16, 16))),
+        (32, 32) => Ok((TxSize::Tx32x32, 1024, default_zigzag_scan(32, 32))),
+        (64, 64) => Ok((TxSize::Tx64x64, 1024, clamped_scan(32, 32, 64))),
+        _ => Err(Error::unsupported(format!(
+            "av1 superblock: non-square TX {w}×{h} pending (§5.11.27)"
+        ))),
+    }
 }
 
 /// Chroma counterpart of [`reconstruct_luma_block`] covering both U
@@ -475,66 +505,79 @@ fn reconstruct_chroma_block(
 
     for plane_idx in 0..2u32 {
         let stride = uvw;
-        let (above_vec, left_vec) = gather_neighbors(
-            if plane_idx == 0 {
-                &fs.u_plane
-            } else {
-                &fs.v_plane
-            },
-            uvw,
-            uvh,
-            cx,
-            cy,
-            cw_clip,
-            ch_clip,
-        );
         // CFL is treated as DC for Phase 3 (no real CFL math).
         let mode = if uv_mode == IntraMode::CflPred {
             IntraMode::DcPred
         } else {
             uv_mode
         };
-        let pred = run_intra_prediction(
-            mode,
-            &above_vec,
-            &left_vec,
-            cw_clip,
-            ch_clip,
-            cx > 0,
-            cy > 0,
-        )?;
-
-        if plane_idx == 0 {
-            paste_block(&mut fs.u_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
+        if fs.bit_depth == 8 {
+            let (above_vec, left_vec) = gather_neighbors(
+                if plane_idx == 0 {
+                    &fs.u_plane
+                } else {
+                    &fs.v_plane
+                },
+                uvw,
+                uvh,
+                cx,
+                cy,
+                cw_clip,
+                ch_clip,
+            );
+            let pred = run_intra_prediction(
+                mode,
+                &above_vec,
+                &left_vec,
+                cw_clip,
+                ch_clip,
+                cx > 0,
+                cy > 0,
+            )?;
+            if plane_idx == 0 {
+                paste_block(&mut fs.u_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
+            } else {
+                paste_block(&mut fs.v_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
+            }
         } else {
-            paste_block(&mut fs.v_plane, stride, cx, cy, &pred, cw_clip, ch_clip);
+            let (above8, left8) = gather_neighbors16(
+                if plane_idx == 0 {
+                    &fs.u_plane16
+                } else {
+                    &fs.v_plane16
+                },
+                uvw,
+                uvh,
+                cx,
+                cy,
+                cw_clip,
+                ch_clip,
+                fs.bit_depth,
+            );
+            let pred8 =
+                run_intra_prediction(mode, &above8, &left8, cw_clip, ch_clip, cx > 0, cy > 0)?;
+            let pred16 = upshift_pred(&pred8, fs.bit_depth);
+            if plane_idx == 0 {
+                paste_block16(&mut fs.u_plane16, stride, cx, cy, &pred16, cw_clip, ch_clip);
+            } else {
+                paste_block16(&mut fs.v_plane16, stride, cx, cy, &pred16, cw_clip, ch_clip);
+            }
         }
 
         if skip {
             continue;
         }
 
-        if cw_clip > 16 || ch_clip > 16 || cw_clip != ch_clip {
-            return Err(Error::unsupported(format!(
-                "av1 superblock: chroma block {cw_clip}×{ch_clip} needs TX split (§5.11.27, Phase 4)"
-            )));
-        }
-        let sz = match (cw_clip, ch_clip) {
-            (4, 4) => TxSize::Tx4x4,
-            (8, 8) => TxSize::Tx8x8,
-            (16, 16) => TxSize::Tx16x16,
-            _ => unreachable!(),
-        };
+        let (sz, num_coeffs, scan) = select_square_tx(cw_clip, ch_clip)?;
         let tx_idx = tx_size_idx(cw_clip, ch_clip)?;
         let nz = nz_map_ctx_offset(cw_clip, ch_clip)?;
-        let scan = default_zigzag_scan(cw_clip, ch_clip);
 
         let mut coeffs = decode_coefficients(
             &mut td.symbol,
             &mut td.coeff_bank,
             tx_idx,
             1, /* chroma */
-            cw_clip * ch_clip,
+            num_coeffs,
             &scan,
             nz,
             cw_clip,
@@ -561,6 +604,7 @@ fn reconstruct_chroma_block(
             *c = dequant_coeff(*c, i, qv);
         }
 
+        // Chroma tx_type is always DCT_DCT in intra-only mode.
         inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
 
         let shift = residual_shift(cw_clip, ch_clip);
@@ -568,22 +612,86 @@ fn reconstruct_chroma_block(
             *v = round_shift(*v, shift);
         }
 
-        let mut block = vec![0u8; cw_clip * ch_clip];
-        let plane_buf = if plane_idx == 0 {
-            &fs.u_plane
+        if fs.bit_depth == 8 {
+            let mut block = vec![0u8; cw_clip * ch_clip];
+            let plane_buf = if plane_idx == 0 {
+                &fs.u_plane
+            } else {
+                &fs.v_plane
+            };
+            extract_block(plane_buf, stride, cx, cy, cw_clip, ch_clip, &mut block);
+            clip_add_in_place(&mut block, &coeffs, cw_clip, ch_clip);
+            if plane_idx == 0 {
+                paste_block(&mut fs.u_plane, stride, cx, cy, &block, cw_clip, ch_clip);
+            } else {
+                paste_block(&mut fs.v_plane, stride, cx, cy, &block, cw_clip, ch_clip);
+            }
         } else {
-            &fs.v_plane
-        };
-        extract_block(plane_buf, stride, cx, cy, cw_clip, ch_clip, &mut block);
-        clip_add_in_place(&mut block, &coeffs, cw_clip, ch_clip);
-        if plane_idx == 0 {
-            paste_block(&mut fs.u_plane, stride, cx, cy, &block, cw_clip, ch_clip);
-        } else {
-            paste_block(&mut fs.v_plane, stride, cx, cy, &block, cw_clip, ch_clip);
+            let mut block = vec![0u16; cw_clip * ch_clip];
+            let plane_buf = if plane_idx == 0 {
+                &fs.u_plane16
+            } else {
+                &fs.v_plane16
+            };
+            extract_block16(plane_buf, stride, cx, cy, cw_clip, ch_clip, &mut block);
+            clip_add_in_place16(&mut block, &coeffs, cw_clip, ch_clip, fs.bit_depth);
+            if plane_idx == 0 {
+                paste_block16(&mut fs.u_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
+            } else {
+                paste_block16(&mut fs.v_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
+            }
         }
     }
 
     Ok(())
+}
+
+/// Downshift a 10/12-bit sample back to 8-bit for the intra
+/// predictor. AV1's intra predictor code path we ship is 8-bit only;
+/// running HBD through it produces coarser neighbors but keeps the
+/// pipeline alive (matching the Phase 4 scope note in the plan).
+#[inline]
+fn down8(v: u16, bd: u32) -> u8 {
+    let shift = bd.saturating_sub(8);
+    ((v as u32) >> shift).min(255) as u8
+}
+
+/// Gather a block's above-row and left-column from an HBD plane,
+/// down-shifted to 8-bit. Pads with the bit-depth midpoint when the
+/// edge is off the top/left of the plane.
+#[allow(clippy::too_many_arguments)]
+fn gather_neighbors16(
+    plane: &[u16],
+    plane_w: usize,
+    plane_h: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    bit_depth: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    let mid = down8(1u16 << (bit_depth - 1), bit_depth);
+    let mut above = vec![mid; w];
+    let mut left = vec![mid; h];
+    if y > 0 {
+        for (c, slot) in above.iter_mut().enumerate().take(w) {
+            let sx = (x + c).min(plane_w.saturating_sub(1));
+            *slot = down8(plane[(y - 1) * plane_w + sx], bit_depth);
+        }
+    }
+    if x > 0 {
+        for (r, slot) in left.iter_mut().enumerate().take(h) {
+            let sy = (y + r).min(plane_h.saturating_sub(1));
+            *slot = down8(plane[sy * plane_w + (x - 1)], bit_depth);
+        }
+    }
+    (above, left)
+}
+
+/// Up-shift an 8-bit predictor back to HBD (`bit_depth` in 10/12).
+fn upshift_pred(pred8: &[u8], bit_depth: u32) -> Vec<u16> {
+    let shift = bit_depth.saturating_sub(8);
+    pred8.iter().map(|&v| (v as u16) << shift).collect()
 }
 
 /// Gather a block's above-row and left-column from a reconstructed
@@ -636,13 +744,11 @@ fn run_intra_prediction(
     let im = to_intra_mode(mode);
     match intra::predict(im, ni, w, h, &mut dst, w) {
         Ok(()) => Ok(dst),
-        Err(Error::Unsupported(_)) => {
-            // Fallback to DC for any predictor Phase 3 doesn't
-            // implement (D45, smooth, paeth). This lets the tile
-            // walker progress through real clips rather than bailing;
-            // visual fidelity will suffer for blocks that needed the
-            // real predictor, but a later Phase 5 port of the full
-            // intra predictor set will close the gap.
+        Err(Error::Unsupported(_)) | Err(Error::InvalidData(_)) => {
+            // Fallback to DC for any predictor Phase 4 doesn't
+            // implement, or when V_PRED / H_PRED fires with missing
+            // neighbors (boundary blocks). DC handles the None case by
+            // falling back to 128 mid-grey (spec §7.11.2.3).
             intra::predict(intra::IntraMode::Dc, ni, w, h, &mut dst, w)?;
             Ok(dst)
         }
@@ -660,6 +766,22 @@ fn paste_block(plane: &mut [u8], stride: usize, x: usize, y: usize, src: &[u8], 
 
 /// Copy a `w×h` block out of a plane at `(x, y)`.
 fn extract_block(plane: &[u8], stride: usize, x: usize, y: usize, w: usize, h: usize, dst: &mut [u8]) {
+    for r in 0..h {
+        let src_off = (y + r) * stride + x;
+        dst[r * w..(r + 1) * w].copy_from_slice(&plane[src_off..src_off + w]);
+    }
+}
+
+/// 16-bit counterpart of [`paste_block`].
+fn paste_block16(plane: &mut [u16], stride: usize, x: usize, y: usize, src: &[u16], w: usize, h: usize) {
+    for r in 0..h {
+        let dst_off = (y + r) * stride + x;
+        plane[dst_off..dst_off + w].copy_from_slice(&src[r * w..(r + 1) * w]);
+    }
+}
+
+/// 16-bit counterpart of [`extract_block`].
+fn extract_block16(plane: &[u16], stride: usize, x: usize, y: usize, w: usize, h: usize, dst: &mut [u16]) {
     for r in 0..h {
         let src_off = (y + r) * stride + x;
         dst[r * w..(r + 1) * w].copy_from_slice(&plane[src_off..src_off + w]);
