@@ -195,68 +195,66 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     };
     let all_frames = (1u32 << NUM_REF_FRAMES) - 1;
 
-    if seq.reduced_still_picture_header {
-        return finish_minimal(
-            false,
-            0,
-            0,
-            FrameType::Key,
-            true,
-            true,
-            true,
-            ParseDepth::ShowExistingFrame,
-        );
-    }
-
-    let show_existing_frame = br.bit()?;
-    if show_existing_frame {
-        let frame_to_show_map_idx = br.f(3)? as u8;
-        if let Some(info) = seq.decoder_model_info {
-            if seq.decoder_model_info_present
-                && seq
-                    .timing_info
-                    .map(|t| !t.equal_picture_interval)
-                    .unwrap_or(true)
-            {
+    // §5.9.1 — when `reduced_still_picture_header` is set (the common
+    // AVIF still case) the show_existing_frame / frame_type / show_frame
+    // / showable_frame bits are NOT coded. The spec dictates fixed
+    // defaults and parsing continues on to the normal tail (q / seg /
+    // tile_info / …). Previous versions returned ParseDepth::ShowExisting-
+    // Frame with tile_info: None here, which caused AVIF stills to
+    // surface a "parse-only build" error from decoder.rs.
+    let (frame_type, show_frame, showable_frame) = if seq.reduced_still_picture_header {
+        (FrameType::Key, true, false)
+    } else {
+        let show_existing_frame = br.bit()?;
+        if show_existing_frame {
+            let frame_to_show_map_idx = br.f(3)? as u8;
+            if let Some(info) = seq.decoder_model_info {
+                if seq.decoder_model_info_present
+                    && seq
+                        .timing_info
+                        .map(|t| !t.equal_picture_interval)
+                        .unwrap_or(true)
+                {
+                    let _ = br.f(info.frame_presentation_time_length_minus_1 as u32 + 1)?;
+                }
+            }
+            let display_frame_id = if seq.frame_id_numbers_present {
+                br.f(id_len)?
+            } else {
+                0
+            };
+            // show_existing_frame takes subsequent state from the DPB's
+            // RefFrame[frame_to_show_map_idx] which we don't track yet.
+            return finish_minimal(
+                true,
+                frame_to_show_map_idx,
+                display_frame_id,
+                FrameType::Key,
+                true,
+                true,
+                false,
+                ParseDepth::ShowExistingFrame,
+            );
+        }
+        let frame_type = FrameType::from_u32(br.f(2)?);
+        let show_frame = br.bit()?;
+        if show_frame
+            && seq.decoder_model_info_present
+            && seq
+                .timing_info
+                .map(|t| !t.equal_picture_interval)
+                .unwrap_or(true)
+        {
+            if let Some(info) = seq.decoder_model_info {
                 let _ = br.f(info.frame_presentation_time_length_minus_1 as u32 + 1)?;
             }
         }
-        let display_frame_id = if seq.frame_id_numbers_present {
-            br.f(id_len)?
+        let showable_frame = if show_frame {
+            frame_type != FrameType::Key
         } else {
-            0
+            br.bit()?
         };
-        // Remaining state is taken from RefFrame[frame_to_show_map_idx] which we
-        // don't track in this initial parse-only build. Stop here.
-        return finish_minimal(
-            true,
-            frame_to_show_map_idx,
-            display_frame_id,
-            FrameType::Key, // unknown; placeholder
-            true,
-            true,
-            false,
-            ParseDepth::ShowExistingFrame,
-        );
-    }
-
-    let frame_type = FrameType::from_u32(br.f(2)?);
-    let show_frame = br.bit()?;
-    if show_frame
-        && seq.decoder_model_info_present
-        && seq
-            .timing_info
-            .map(|t| !t.equal_picture_interval)
-            .unwrap_or(true)
-    {
-        if let Some(info) = seq.decoder_model_info {
-            let _ = br.f(info.frame_presentation_time_length_minus_1 as u32 + 1)?;
-        }
-    }
-    let showable_frame = if show_frame {
-        frame_type != FrameType::Key
-    } else {
-        br.bit()?
+        (frame_type, show_frame, showable_frame)
     };
     let error_resilient_mode =
         if frame_type == FrameType::Switch || (frame_type == FrameType::Key && show_frame) {
