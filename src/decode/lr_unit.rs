@@ -124,7 +124,9 @@ fn decode_uniform(sd: &mut SymbolDecoder<'_>, n: u16) -> u16 {
     if n <= 1 {
         return 0;
     }
-    let l = (15 - (n as u32).leading_zeros()) as i32 + 1;
+    // `l = floor(log2(n)) + 1`, i.e. the bit-width needed to hold
+    // `n`. Guaranteed well-defined because `n >= 2` in this branch.
+    let l = n.ilog2() as i32 + 1;
     let m = (1i32 << l) - n as i32;
     let v = read_literal(sd, (l - 1) as u32) as i32;
     if v < m {
