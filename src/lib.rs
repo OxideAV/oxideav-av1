@@ -60,7 +60,7 @@ pub mod tile_group;
 pub mod tile_info;
 pub mod transform;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 pub const CODEC_ID_STR: &str = "av1";
@@ -76,11 +76,12 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(16384, 16384);
-    let cid = CodecId::new(CODEC_ID_STR);
-    reg.register_decoder_impl(cid.clone(), caps, decoder::make_decoder);
-
-    // AVI FourCC claim — `AV01` is the AOMedia-blessed code.
-    reg.claim_tag(cid, CodecTag::fourcc(b"AV01"), 10, None);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(decoder::make_decoder)
+            .tag(CodecTag::fourcc(b"AV01")),
+    );
 }
 
 pub use decoder::{make_decoder, Av1Decoder};
