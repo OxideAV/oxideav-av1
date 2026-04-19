@@ -5,19 +5,24 @@
 //!
 //! Two orthogonal axes:
 //!
-//! - [`TxType`] — one of 16 2D transform pairs (DCT/ADST/flipped
-//!   ADST/identity per row and column). The spec lists them in
-//!   §6.8.21 Table 13-4.
+//! - [`TxType`] — one of 17 2D transform pairs (DCT/ADST/flipped
+//!   ADST/identity/WHT per row and column). The spec lists them in
+//!   §6.8.21 Table 13-4 (plus the lossless-only WHT mode).
 //! - [`TxSize`] — transform dimensions. The low bits encode
 //!   `log2(width)` and the high bits `log2(height)`.
 //!
-//! Phase 3 only implements 4/8/16-point DCT + ADST (so the callable
-//! set is a strict subset of goavif's); every other combination surfaces
-//! `Error::Unsupported` at [`crate::transform::inverse_2d`] entry.
+//! Phase 4 adds the full 4/8/16/32/64-point kernel set (DCT across all
+//! five sizes, ADST + FlipADST up to 16, identity up to 32, WHT at 4).
+//! Unsupported combinations still surface `Error::Unsupported` at
+//! [`crate::transform::inverse_2d`] entry.
 
 use oxideav_core::{Error, Result};
 
-/// AV1 2D transform pair (§6.8.21).
+/// AV1 2D transform pair (§6.8.21). For each pair the first word names
+/// the column direction and the second the row direction — i.e.
+/// `AdstDct` means column=ADST, row=DCT. `IdtIdt` is identity-×-
+/// identity (§7.7.2.7). `Wht` is the lossless-only WHT4, selected by
+/// the spec only when `Lossless == 1`.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxType {
@@ -37,6 +42,8 @@ pub enum TxType {
     HAdst = 13,
     VFlipAdst = 14,
     HFlipAdst = 15,
+    /// 4-point Walsh-Hadamard (lossless only).
+    Wht = 16,
 }
 
 impl TxType {
@@ -58,12 +65,14 @@ impl TxType {
             13 => Self::HAdst,
             14 => Self::VFlipAdst,
             15 => Self::HFlipAdst,
+            16 => Self::Wht,
             _ => return Err(Error::invalid(format!("av1 tx: invalid tx_type {v}"))),
         })
     }
 
-    /// Row-direction kind (first character of the spec name —
-    /// e.g. `AdstDct` has DCT as its *row* kind).
+    /// Row-direction kind. For `FlipAdst*` entries the row direction
+    /// still uses the underlying ADST kernel — the flip is handled by
+    /// [`TxType::row_flip`].
     pub fn row_kind(self) -> Kind {
         match self {
             Self::DctDct | Self::AdstDct | Self::FlipAdstDct | Self::VDct => Kind::Dct,
@@ -73,10 +82,12 @@ impl TxType {
             | Self::FlipAdstFlipAdst
             | Self::VFlipAdst => Kind::FlipAdst,
             Self::IdtIdt | Self::HDct | Self::HAdst | Self::HFlipAdst => Kind::Idtx,
+            Self::Wht => Kind::Wht,
         }
     }
 
-    /// Column-direction kind.
+    /// Column-direction kind. See [`TxType::row_kind`] — the flip bit
+    /// is returned separately by [`TxType::col_flip`].
     pub fn col_kind(self) -> Kind {
         match self {
             Self::DctDct | Self::DctAdst | Self::DctFlipAdst | Self::HDct => Kind::Dct,
@@ -86,17 +97,45 @@ impl TxType {
             | Self::FlipAdstFlipAdst
             | Self::HFlipAdst => Kind::FlipAdst,
             Self::IdtIdt | Self::VDct | Self::VAdst | Self::VFlipAdst => Kind::Idtx,
+            Self::Wht => Kind::Wht,
         }
+    }
+
+    /// `true` when the row-direction output needs a buffer reversal
+    /// after the inverse kernel (the FlipADST branches).
+    pub fn row_flip(self) -> bool {
+        matches!(
+            self,
+            Self::DctFlipAdst
+                | Self::AdstFlipAdst
+                | Self::FlipAdstFlipAdst
+                | Self::VFlipAdst
+        )
+    }
+
+    /// `true` when the column-direction output needs a buffer reversal.
+    pub fn col_flip(self) -> bool {
+        matches!(
+            self,
+            Self::FlipAdstDct
+                | Self::FlipAdstAdst
+                | Self::FlipAdstFlipAdst
+                | Self::HFlipAdst
+        )
     }
 }
 
-/// 1-D transform kind (DCT / ADST / flipped ADST / identity).
+/// 1-D transform kind (DCT / ADST / flipped ADST / identity / WHT).
+/// `FlipAdst` is included so the dispatch table can be a flat
+/// `(Kind, length)` pair even when the flip is handled separately by
+/// the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Dct,
     Adst,
     FlipAdst,
     Idtx,
+    Wht,
 }
 
 /// AV1 transform size — values match the spec's `TxSize` enum.
@@ -177,6 +216,8 @@ mod tests {
     fn kind_for_dct_dct() {
         assert_eq!(TxType::DctDct.row_kind(), Kind::Dct);
         assert_eq!(TxType::DctDct.col_kind(), Kind::Dct);
+        assert!(!TxType::DctDct.row_flip());
+        assert!(!TxType::DctDct.col_flip());
     }
 
     #[test]
@@ -187,11 +228,26 @@ mod tests {
     }
 
     #[test]
+    fn flip_bits_for_flipadst_variants() {
+        // FlipAdstDct: column=FlipAdst → col_flip=true.
+        assert!(TxType::FlipAdstDct.col_flip());
+        assert!(!TxType::FlipAdstDct.row_flip());
+        // DctFlipAdst: row=FlipAdst → row_flip=true.
+        assert!(TxType::DctFlipAdst.row_flip());
+        assert!(!TxType::DctFlipAdst.col_flip());
+        // FlipAdstFlipAdst: both.
+        assert!(TxType::FlipAdstFlipAdst.row_flip());
+        assert!(TxType::FlipAdstFlipAdst.col_flip());
+    }
+
+    #[test]
     fn tx_size_dimensions_for_square() {
         assert_eq!(TxSize::Tx4x4.width(), 4);
         assert_eq!(TxSize::Tx4x4.height(), 4);
         assert_eq!(TxSize::Tx8x8.width(), 8);
         assert_eq!(TxSize::Tx16x16.height(), 16);
+        assert_eq!(TxSize::Tx32x32.width(), 32);
+        assert_eq!(TxSize::Tx64x64.width(), 64);
     }
 
     #[test]
@@ -199,5 +255,13 @@ mod tests {
         assert_eq!(TxSize::square(4), Some(TxSize::Tx4x4));
         assert_eq!(TxSize::square(32), Some(TxSize::Tx32x32));
         assert_eq!(TxSize::square(5), None);
+    }
+
+    #[test]
+    fn from_u32_covers_all_17() {
+        for v in 0..=16u32 {
+            assert!(TxType::from_u32(v).is_ok());
+        }
+        assert!(TxType::from_u32(17).is_err());
     }
 }
