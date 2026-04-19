@@ -411,21 +411,80 @@ fn decode_inter_leaf_block(
     bh: u32,
 ) -> Result<()> {
     let info = decode_inter_block_syntax(td, fs, x, y, bw, bh)?;
+    let w = bw as usize;
+    let h = bh as usize;
+    let mi_col = x >> 2;
+    let mi_row = y >> 2;
+
     if !info.is_inter {
-        return Err(Error::unsupported(
-            "av1 inter-intra / intra-within-inter leaf block pending (§5.11.22)",
-        ));
+        // Intra-within-inter: propagate mode info and reconstruct via
+        // the same intra pipeline used on key frames, with DC_PRED
+        // fallback for chroma (no angle_delta / CFL signalling).
+        let mi_w = (bw + 3) >> 2;
+        let mi_h = (bh + 3) >> 2;
+        let stored_uv = if fs.monochrome {
+            None
+        } else {
+            Some(IntraMode::DcPred)
+        };
+        for mr in 0..mi_h {
+            for mc in 0..mi_w {
+                let cell_col = mi_col + mc;
+                let cell_row = mi_row + mr;
+                if cell_col >= fs.mi_cols || cell_row >= fs.mi_rows {
+                    continue;
+                }
+                let mi = fs.mi_mut(cell_col, cell_row);
+                mi.mode = Some(info.intra_y_mode);
+                mi.uv_mode = stored_uv;
+                mi.skip = info.skip;
+                mi.segment_id = 0;
+                mi.angle_delta = 0;
+                mi.angle_delta_uv = 0;
+                mi.cfl_alpha_u = 0;
+                mi.cfl_alpha_v = 0;
+                mi.is_inter = false;
+                mi.mv_row = 0;
+                mi.mv_col = 0;
+            }
+        }
+        reconstruct_luma_block(
+            td,
+            fs,
+            x,
+            y,
+            bw,
+            bh,
+            info.intra_y_mode,
+            0,
+            info.skip,
+            0,
+        )?;
+        if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
+            reconstruct_chroma_block(
+                td,
+                fs,
+                x,
+                y,
+                bw,
+                bh,
+                IntraMode::DcPred,
+                0,
+                info.skip,
+                0,
+                0,
+                0,
+            )?;
+        }
+        return Ok(());
     }
+
     if td.prev_frame.is_none() {
         return Err(Error::unsupported(
             "av1 inter: missing reference frame for LAST-ref translational MC (§7.11.3)",
         ));
     }
 
-    let w = bw as usize;
-    let h = bh as usize;
-    let mi_col = x >> 2;
-    let mi_row = y >> 2;
     // Record mode info on MI grid so neighbor contexts for subsequent
     // blocks are accurate.
     let mi_w = (bw + 3) >> 2;

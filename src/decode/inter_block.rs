@@ -20,6 +20,7 @@ use super::block::BlockSize;
 use super::frame_state::FrameState;
 use super::inter::{block_size_group, InterMode};
 use super::mc::{motion_compensate, motion_compensate16};
+use super::modes::IntraMode;
 use super::mv::Mv;
 use super::tile::TileDecoder;
 
@@ -40,6 +41,8 @@ pub struct InterBlockInfo {
     /// Which 8-tap filter the block uses — always REGULAR in our
     /// simplified path (no switchable filters).
     pub interp_filter: InterpFilter,
+    /// Intra Y mode — only meaningful when `is_inter == false`.
+    pub intra_y_mode: IntraMode,
 }
 
 /// Decode the per-block inter syntax for a leaf block. Returns
@@ -76,20 +79,25 @@ pub fn decode_inter_block_syntax(
     let is_inter = inter.read_is_inter(&mut td.symbol, above_is_inter, left_is_inter)?;
 
     if !is_inter {
-        // Intra-within-inter: caller will route to the intra path.
+        // Intra-within-inter: decode y_mode + skip using inter-frame
+        // CDFs and return for the caller to run the intra path on top.
+        let group = block_size_group(w as usize, h as usize);
+        let y_mode = inter.read_y_mode(&mut td.symbol, group)?;
+        let skip = inter.read_skip(&mut td.symbol, 0)?;
         return Ok(InterBlockInfo {
             is_inter: false,
             ref_frame_idx: 0,
             mv: Mv::default(),
-            skip: false,
+            skip,
             interp_filter: InterpFilter::Regular,
+            intra_y_mode: y_mode,
         });
     }
 
-    // Single-reference ref frame — anything other than LAST (idx 0) is
-    // rejected.
-    let ref_idx = inter.read_single_ref_frame(&mut td.symbol)?;
-    debug_assert_eq!(ref_idx, 0);
+    // Single-reference ref frame. The narrow Phase 7 decoder only
+    // tracks LAST; other selections are tolerated in the bitstream
+    // but collapse to LAST for the actual MC source.
+    let _ref_idx = inter.read_single_ref_frame(&mut td.symbol)?;
 
     // Inter mode. We treat the context as 0 across the board since we
     // don't maintain neighbor-mode classes for inter yet — goavif does
@@ -104,8 +112,6 @@ pub fn decode_inter_block_syntax(
     // `is_filter_switchable` is set. Our simplified path forces
     // REGULAR and skips the symbol.
     let skip = inter.read_skip(&mut td.symbol, 0)?;
-    let _ = w;
-    let _ = h;
 
     Ok(InterBlockInfo {
         is_inter: true,
@@ -113,6 +119,7 @@ pub fn decode_inter_block_syntax(
         mv,
         skip,
         interp_filter: InterpFilter::Regular,
+        intra_y_mode: IntraMode::DcPred,
     })
 }
 

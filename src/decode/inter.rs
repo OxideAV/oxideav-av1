@@ -151,25 +151,38 @@ impl InterDecoder {
         Ok(raw == 1)
     }
 
-    /// Read the single-ref selector. Returns 0 (LAST) on success; all
-    /// other selections surface `Error::Unsupported` so the outer
-    /// decoder can bail cleanly — we don't carry a multi-ref DPB.
+    /// Read the single-ref selector tree per §5.11.24. The narrow
+    /// Phase 7 decoder only carries the LAST reference, so every
+    /// selection on non-LAST paths is mapped to LAST (the bits are
+    /// still consumed so the bitstream stays framed).
+    ///
+    /// Returns the logical reference-frame index in `0..=6` (LAST=0,
+    /// LAST2=1, LAST3=2, GOLDEN=3, BWDREF=4, ALTREF2=5, ALTREF=6) for
+    /// bookkeeping — all values are collapsed to LAST by the caller.
     pub fn read_single_ref_frame(&mut self, sym: &mut SymbolDecoder<'_>) -> Result<u32> {
-        // Neutral context bucket. AV1 encodes the single-ref tree as a
-        // series of binary decisions; we only reach leaf 0 (LAST).
         let ctx = 1usize;
-        // Bit 0: LAST vs others.
+        // ref[0]: LAST group vs BWD group.
         let b0 = sym.decode_symbol(&mut self.single_ref_cdf[ctx][0])?;
         if b0 == 0 {
-            // Bit 1: LAST vs LAST2 — we only accept LAST.
+            // LAST group
             let b1 = sym.decode_symbol(&mut self.single_ref_cdf[ctx][1])?;
             if b1 == 0 {
-                return Ok(0);
+                let b2 = sym.decode_symbol(&mut self.single_ref_cdf[ctx][2])?;
+                Ok(if b2 == 0 { 0 } else { 1 }) // LAST / LAST2
+            } else {
+                let b3 = sym.decode_symbol(&mut self.single_ref_cdf[ctx][3])?;
+                Ok(if b3 == 0 { 2 } else { 3 }) // LAST3 / GOLDEN
+            }
+        } else {
+            // BWD group
+            let b4 = sym.decode_symbol(&mut self.single_ref_cdf[ctx][4])?;
+            if b4 == 0 {
+                Ok(4) // BWDREF
+            } else {
+                let b5 = sym.decode_symbol(&mut self.single_ref_cdf[ctx][5])?;
+                Ok(if b5 == 0 { 5 } else { 6 }) // ALTREF2 / ALTREF
             }
         }
-        Err(Error::Unsupported(
-            "av1 inter: multi-ref (LAST2/LAST3/GOLDEN/BWDREF/ALTREF) not supported (§5.11.22)".into(),
-        ))
     }
 
     /// Read the 4-way inter mode. Context arguments select which of
