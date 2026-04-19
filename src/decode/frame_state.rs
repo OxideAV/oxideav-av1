@@ -64,13 +64,20 @@ pub struct FrameState {
     pub monochrome: bool,
     /// Sample bit depth — 8, 10, or 12.
     pub bit_depth: u32,
-    /// Luma plane — row-major `width * height` bytes (8-bit only in
-    /// Phase 3; 10/12-bit lands when the bit-depth plumbing does).
+    /// Luma plane — row-major `width * height` bytes (8-bit depth
+    /// only).
     pub y_plane: Vec<u8>,
     /// U plane — row-major `uv_width * uv_height` bytes.
     pub u_plane: Vec<u8>,
     /// V plane — row-major `uv_width * uv_height` bytes.
     pub v_plane: Vec<u8>,
+    /// 10/12-bit luma plane — row-major `width * height` samples.
+    /// Zero-length when `bit_depth == 8`.
+    pub y_plane16: Vec<u16>,
+    /// 10/12-bit U plane.
+    pub u_plane16: Vec<u16>,
+    /// 10/12-bit V plane.
+    pub v_plane16: Vec<u16>,
     /// UV plane width after subsampling.
     pub uv_width: u32,
     /// UV plane height after subsampling.
@@ -111,6 +118,13 @@ impl FrameState {
         } else {
             (height + sub_y) >> sub_y
         };
+        let use_hbd = bit_depth > 8;
+        let y_len = (width as usize) * (height as usize);
+        let uv_len = (uv_width as usize) * (uv_height as usize);
+        // Start planes at mid-grey for the given bit depth so fallback
+        // intra prediction has a sensible floor. 8-bit uses 128; the
+        // HBD midpoint is 128 << (bd-8).
+        let hbd_mid: u16 = 1u16 << (bit_depth - 1);
         Self {
             width,
             height,
@@ -121,16 +135,35 @@ impl FrameState {
             sub_y,
             monochrome,
             bit_depth,
-            y_plane: vec![0u8; (width as usize) * (height as usize)],
-            u_plane: if monochrome {
+            y_plane: if use_hbd {
                 Vec::new()
             } else {
-                vec![0u8; (uv_width as usize) * (uv_height as usize)]
+                vec![0u8; y_len]
             },
-            v_plane: if monochrome {
+            u_plane: if use_hbd || monochrome {
                 Vec::new()
             } else {
-                vec![0u8; (uv_width as usize) * (uv_height as usize)]
+                vec![0u8; uv_len]
+            },
+            v_plane: if use_hbd || monochrome {
+                Vec::new()
+            } else {
+                vec![0u8; uv_len]
+            },
+            y_plane16: if use_hbd {
+                vec![hbd_mid; y_len]
+            } else {
+                Vec::new()
+            },
+            u_plane16: if use_hbd && !monochrome {
+                vec![hbd_mid; uv_len]
+            } else {
+                Vec::new()
+            },
+            v_plane16: if use_hbd && !monochrome {
+                vec![hbd_mid; uv_len]
+            } else {
+                Vec::new()
             },
             uv_width,
             uv_height,

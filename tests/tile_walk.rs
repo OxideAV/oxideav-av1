@@ -183,13 +183,14 @@ fn real_clip_walks_every_partition_and_bails_on_coeff_decode() {
     );
 }
 
-/// End-to-end Phase 3 check: decode the aomenc clip and inspect the
-/// reconstructed luma plane. The bitstream at `/tmp/av1.ivf` contains
-/// three tiny 64×64 frames produced with `--cpu-used=8`, so its TX
-/// sizes are usually within Phase 3 scope. We don't pin exact pixel
-/// values (directional / smooth / paeth predictors are stubs), but
-/// plane lengths must match the frame geometry and the luma mean for
-/// a successful decode should land in a plausible grey-band range.
+/// End-to-end Phase 4 check: decode the aomenc 8-bit clip and inspect
+/// the reconstructed luma plane. The bitstream at `/tmp/av1.ivf` is
+/// three tiny 64×64 keyframes from `testsrc`, so every block size from
+/// 4×4 through 64×64 exercises the pipeline. Phase 4 closes the
+/// TX-size gap; every frame should decode without `Unsupported`. We
+/// don't pin exact pixel values (our intra-predictor port still stubs
+/// several directional / smooth / paeth modes), but the luma mean must
+/// land in a plausible grey-band range.
 #[test]
 fn end_to_end_decode_produces_plane_bytes() {
     let Some(data) = read_fixture("/tmp/av1.ivf") else {
@@ -197,6 +198,7 @@ fn end_to_end_decode_produces_plane_bytes() {
     };
     let obus = ivf_concat_obus(&data).expect("ivf parse");
     let mut sh: Option<SequenceHeader> = None;
+    let mut ok_frames = 0usize;
 
     for o in iter_obus(&obus) {
         let o = o.expect("obu parse");
@@ -220,7 +222,6 @@ fn end_to_end_decode_produces_plane_bytes() {
                 let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs);
                 match got {
                     Ok(()) => {
-                        // Luma plane must match the frame geometry.
                         assert_eq!(
                             fs.y_plane.len(),
                             (fh.frame_width as usize) * (fh.frame_height as usize)
@@ -235,22 +236,21 @@ fn end_to_end_decode_produces_plane_bytes() {
                                 (fs.uv_width as usize) * (fs.uv_height as usize)
                             );
                         }
-                        // Plausibility: a natural clip at 8-bit should
-                        // average somewhere in the mid-grey band for at
-                        // least one decoded frame. The test clip is
-                        // `testsrc` which is quite saturated so the
-                        // range is wide — accept anything in [0, 255]
-                        // without a panic.
                         let sum: u64 = fs.y_plane.iter().map(|&v| v as u64).sum();
                         let mean = sum / (fs.y_plane.len() as u64);
                         eprintln!(
-                            "decoded frame {}x{}: luma mean={} (range 0..=255)",
+                            "decoded frame {}x{}: luma mean={} (expected 32..=224)",
                             fh.frame_width, fh.frame_height, mean
                         );
+                        assert!(
+                            (32..=224).contains(&mean),
+                            "luma mean {mean} out of plausible range 32..=224",
+                        );
+                        ok_frames += 1;
                     }
                     Err(Error::Unsupported(msg)) => {
-                        eprintln!(
-                            "frame decode bailed (expected for some TX sizes): {msg}"
+                        panic!(
+                            "Phase 4 should decode this fixture end-to-end, got Unsupported: {msg}"
                         );
                     }
                     other => panic!("unexpected error: {other:?}"),
@@ -259,5 +259,74 @@ fn end_to_end_decode_produces_plane_bytes() {
             _ => {}
         }
     }
-    eprintln!("no frame decoded cleanly — all frames exercised deferred TX paths");
+    assert!(ok_frames >= 1, "expected at least one frame to decode cleanly");
+}
+
+/// 10-bit HBD smoke test. Generate a 10-bit fixture with:
+///
+///   ffmpeg -f lavfi -i testsrc=size=64x64:rate=24,format=yuv420p10le \
+///          -t 0.125 -pix_fmt yuv420p10le -f rawvideo /tmp/yuv420p10.raw
+///   aomenc -b 10 --input-bit-depth=10 --width=64 --height=64 --fps=24/1 \
+///          --passes=1 --end-usage=q --cq-level=40 --i420 --cpu-used=8 \
+///          --kf-min-dist=1 --kf-max-dist=1 -o /tmp/av1-10bit.ivf /tmp/yuv420p10.raw
+///
+/// If the fixture is missing the test skips silently.
+#[test]
+fn end_to_end_decode_hbd_produces_plane_bytes() {
+    let Some(data) = read_fixture("/tmp/av1-10bit.ivf") else {
+        return;
+    };
+    let obus = ivf_concat_obus(&data).expect("ivf parse");
+    let mut sh: Option<SequenceHeader> = None;
+    let mut ok_frames = 0usize;
+
+    for o in iter_obus(&obus) {
+        let o = o.expect("obu parse");
+        match o.header.obu_type {
+            ObuType::SequenceHeader => {
+                sh = Some(parse_sequence_header(o.payload).expect("seq hdr"));
+            }
+            ObuType::Frame => {
+                let seq = sh.as_ref().expect("seq before frame");
+                let (fh, tg_payload) = parse_frame_obu(seq, o.payload).expect("parse_frame_obu");
+                let sub_x = if seq.color_config.subsampling_x { 1 } else { 0 };
+                let sub_y = if seq.color_config.subsampling_y { 1 } else { 0 };
+                assert_eq!(seq.color_config.bit_depth, 10, "fixture must be 10-bit");
+                let mut fs = FrameState::with_bit_depth(
+                    fh.frame_width,
+                    fh.frame_height,
+                    sub_x,
+                    sub_y,
+                    seq.color_config.num_planes == 1,
+                    seq.color_config.bit_depth,
+                );
+                let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs);
+                match got {
+                    Ok(()) => {
+                        assert_eq!(
+                            fs.y_plane16.len(),
+                            (fh.frame_width as usize) * (fh.frame_height as usize)
+                        );
+                        let sum: u64 = fs.y_plane16.iter().map(|&v| v as u64).sum();
+                        let mean = sum / (fs.y_plane16.len() as u64);
+                        eprintln!(
+                            "decoded HBD frame {}x{}: luma mean={} (10-bit range 0..=1023)",
+                            fh.frame_width, fh.frame_height, mean
+                        );
+                        // 10-bit midpoint is 512; accept a wide window.
+                        assert!(mean < 1024, "luma mean {mean} exceeds 10-bit range");
+                        ok_frames += 1;
+                    }
+                    Err(Error::Unsupported(msg)) => {
+                        panic!(
+                            "Phase 4 HBD should decode this fixture end-to-end, got Unsupported: {msg}"
+                        );
+                    }
+                    other => panic!("unexpected error: {other:?}"),
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(ok_frames >= 1, "expected at least one HBD frame to decode cleanly");
 }

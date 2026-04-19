@@ -27,6 +27,7 @@ use super::coeffs::{q_index_to_ctx, CoeffCdfBank};
 use super::frame_state::FrameState;
 use super::modes::{IntraMode, INTRA_MODES, UV_MODES};
 use super::superblock;
+use crate::transform::TxType;
 
 /// Top-level entry point: walk every tile in a tile-group payload,
 /// running [`TileDecoder::decode`] on each. The underlying frame
@@ -84,6 +85,13 @@ pub struct TileDecoder<'a> {
     pub cfl_sign_cdf: Vec<u16>,
     pub cfl_alpha_cdf: Vec<Vec<u16>>,
     pub seg_cdf: Vec<Vec<u16>>,
+    /// Intra-frame `tx_type` CDF — set 1 (7 types, `tx_size_ctx ∈ 0..=3`,
+    /// intra_mode ∈ 0..=12). Used by blocks whose area ≤ 16×16.
+    pub intra_ext_tx_cdf_set1: Vec<Vec<Vec<u16>>>,
+    /// Intra-frame `tx_type` CDF — set 2 (5 types, same shape as set 1).
+    /// Used by blocks whose area ≤ 32×32. Blocks larger than 32×32 use
+    /// implicit DCT_DCT.
+    pub intra_ext_tx_cdf_set2: Vec<Vec<Vec<u16>>>,
     /// Coefficient-CDF bank — all of §5.11.39's CDFs in one place.
     pub coeff_bank: CoeffCdfBank,
 }
@@ -117,6 +125,8 @@ impl<'a> TileDecoder<'a> {
             cfl_sign_cdf: Vec::new(),
             cfl_alpha_cdf: Vec::new(),
             seg_cdf: Vec::new(),
+            intra_ext_tx_cdf_set1: Vec::new(),
+            intra_ext_tx_cdf_set2: Vec::new(),
             coeff_bank,
         };
         td.init_cdfs();
@@ -152,6 +162,14 @@ impl<'a> TileDecoder<'a> {
         self.seg_cdf = cdfs::DEFAULT_SPATIAL_PRED_SEG_TREE_CDF
             .iter()
             .map(|c| c.to_vec())
+            .collect();
+        self.intra_ext_tx_cdf_set1 = cdfs::DEFAULT_INTRA_EXT_TX_CDF_SET1
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
+            .collect();
+        self.intra_ext_tx_cdf_set2 = cdfs::DEFAULT_INTRA_EXT_TX_CDF_SET2
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
             .collect();
     }
 
@@ -287,6 +305,94 @@ impl<'a> TileDecoder<'a> {
     pub fn decode_cfl_alpha(&mut self, ctx: u32) -> Result<u32> {
         let ctx = (ctx as usize).min(5);
         self.symbol.decode_symbol(&mut self.cfl_alpha_cdf[ctx])
+    }
+
+    /// Decode the intra-frame `tx_type` for a transform of dimensions
+    /// `w × h` under Y intra mode `y_mode` (§6.10.15).
+    ///
+    /// The spec partitions TX sizes into three sets:
+    /// - `ExtTxSet = 0` (area > 32×32): implicit `DCT_DCT`, no symbol.
+    /// - `ExtTxSet = 1` (area ≤ 16×16): 7-type CDF (CDF set 1).
+    /// - `ExtTxSet = 2` (area ≤ 32×32): 5-type CDF (CDF set 2).
+    pub fn decode_intra_tx_type(
+        &mut self,
+        w: usize,
+        h: usize,
+        y_mode: IntraMode,
+    ) -> Result<TxType> {
+        let tx_set = ext_tx_set_for_intra(w, h);
+        if tx_set == 0 {
+            return Ok(TxType::DctDct);
+        }
+        let size_ctx = ext_tx_size_ctx(w, h);
+        let mode_idx = (y_mode as usize).min(12);
+        let raw = match tx_set {
+            1 => self
+                .symbol
+                .decode_symbol(&mut self.intra_ext_tx_cdf_set1[size_ctx][mode_idx])?,
+            2 => self
+                .symbol
+                .decode_symbol(&mut self.intra_ext_tx_cdf_set2[size_ctx][mode_idx])?,
+            _ => 0,
+        };
+        Ok(intra_tx_type_for(tx_set, raw))
+    }
+}
+
+/// Intra-frame ext-tx set per §6.10.15. Returns 0 for implicit
+/// `DCT_DCT`, 1 for the 7-type set (area ≤ 16×16), or 2 for the 5-type
+/// set (area ≤ 32×32).
+fn ext_tx_set_for_intra(w: usize, h: usize) -> u32 {
+    let area = w * h;
+    if area <= 16 * 16 {
+        1
+    } else if area <= 32 * 32 {
+        2
+    } else {
+        0
+    }
+}
+
+/// 4-way size context used to index the intra ext-tx CDFs: TX_4X4=0,
+/// TX_8X8=1, TX_16X16=2, TX_32X32=3. Non-square sizes map to the
+/// square equivalent by area.
+fn ext_tx_size_ctx(w: usize, h: usize) -> usize {
+    let area = w * h;
+    if area <= 4 * 4 {
+        0
+    } else if area <= 8 * 8 {
+        1
+    } else if area <= 16 * 16 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Map a raw symbol decoded via [`TileDecoder::decode_intra_tx_type`]
+/// into the spec's `TxType`. See spec §6.10.15 Table 13-4. `tx_set = 0`
+/// always implies `DCT_DCT`.
+fn intra_tx_type_for(tx_set: u32, raw: u32) -> TxType {
+    match tx_set {
+        1 => match raw {
+            0 => TxType::DctDct,
+            1 => TxType::AdstDct,
+            2 => TxType::DctAdst,
+            3 => TxType::AdstAdst,
+            4 => TxType::IdtIdt,
+            5 => TxType::VDct,
+            6 => TxType::HDct,
+            _ => TxType::DctDct,
+        },
+        2 => match raw {
+            0 => TxType::DctDct,
+            1 => TxType::AdstDct,
+            2 => TxType::DctAdst,
+            3 => TxType::AdstAdst,
+            4 => TxType::IdtIdt,
+            _ => TxType::DctDct,
+        },
+        _ => TxType::DctDct,
     }
 }
 

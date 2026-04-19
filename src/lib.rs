@@ -1,16 +1,15 @@
 //! AV1 (AOMedia Video 1) — pure-Rust decoder for oxideav.
 //!
-//! Phase 3 scope (this revision): OBU walk + sequence/frame headers +
+//! Phase 4 scope (this revision): OBU walk + sequence/frame headers +
 //! tile partition walk + mode decode + coefficient decode +
-//! dequantisation + inverse transform (4/8/16 DCT+ADST) + clip-add
-//! pixel reconstruction. A leaf block ≤ 16×16 with a decode-from-
-//! neighbors intra predictor (DC / V / H) completes end-to-end.
+//! dequantisation + the full 4/8/16/32/64-point inverse transform
+//! kernel set (DCT / ADST / FlipADST / IDTX / WHT via mixed V/H
+//! dispatch) + tx_type symbol decode (§6.10.15) + clip-add pixel
+//! reconstruction. 10-/12-bit HBD decode goes through a separate
+//! u16 plane path with predictor down/upshifting.
 //!
 //! Still deferred:
 //!
-//! * Transform sizes 32/64 + WHT + mixed V/H-identity (Phase 4,
-//!   §7.7 subclauses).
-//! * TX splitting for leaf blocks > 16×16 (§5.11.27, Phase 4).
 //! * The other 10 intra predictors — directional / smooth / paeth
 //!   (§7.11.2, Phase 5). Currently those modes fall back to DC to
 //!   keep the pipeline running; Phase 5 closes the fidelity gap.
@@ -19,7 +18,9 @@
 //!   CDEF / LR / film grain (§7.13 – §7.17, §7.20, Phase 7).
 //! * Quantisation matrices (§5.9.12) — surfaces Unsupported when
 //!   `using_qmatrix` is set in the bitstream.
-//! * 10-/12-bit sample reconstruction (Phase 3 wires only 8-bit).
+//! * HBD intra prediction runs the 8-bit predictor through a
+//!   down/upshift — fine for DC/V/H but the directional predictors
+//!   lose precision. Phase 5 will add a native u16 predictor path.
 //!
 //! Every error message includes the precise §ref so callers can see
 //! exactly where the decoder stopped.
@@ -50,13 +51,15 @@ pub const CODEC_ID_STR: &str = "av1";
 
 /// Register the AV1 decoder factory with a codec registry.
 ///
-/// The implementation declares `av1_sw_phase3` to make the build
+/// The implementation declares `av1_sw_phase4` to make the build
 /// visible in `oxideav list`-style output: headers + partition walk +
-/// mode + coefficient decode + reconstruction for 4/8/16 TX blocks
-/// land, but 32/64 TX + TX splitting + the full intra predictor set
-/// are still deferred (see crate-level doc comment).
+/// mode + coefficient decode + reconstruction for every TX size in
+/// the AV1 spec (4/8/16/32/64 squares + the 2:1 / 4:1 rectangles) +
+/// tx_type decode + 10/12-bit plane buffers. The intra predictor set
+/// still stubs directional / smooth / paeth modes; those fall back to
+/// DC_PRED until Phase 5 closes the gap.
 pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("av1_sw_phase3")
+    let caps = CodecCapabilities::video("av1_sw_phase4")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(16384, 16384);

@@ -10,22 +10,29 @@
 //!   final `round_shift` + clip-add onto an 8-bit predictor block, for
 //!   callers that already own the destination plane.
 //!
-//! Phase 3 implements 4/8/16-point DCT and ADST (plus their flipped
-//! variants) + the pure-identity 2D case. 32/64-point transforms, the
-//! WHT, and the mixed V/H-identity directions remain deferred — callers
-//! that request them receive `Error::Unsupported` with a precise §ref.
+//! Phase 4 closes out the kernel set: 32/64-point DCT, IDTX,
+//! flipped-ADST via the same buffer-reversal helper used by libaom,
+//! and the full mixed V/H (V_DCT, V_ADST, V_FLIPADST, H_*) dispatch.
+//! The only kernel still not called from decoder code is IWHT4
+//! (lossless mode — AVIF stills never set `Lossless=1`); it's exposed
+//! for completeness.
 
 pub mod adst16;
 pub mod adst4;
 pub mod adst8;
 pub mod cos_pi;
+pub mod flipadst;
 pub mod idct16;
+pub mod idct32;
 pub mod idct4;
+pub mod idct64;
 pub mod idct8;
+pub mod idtx;
+pub mod iwht4;
 pub mod scan;
 pub mod types;
 
-pub use scan::{default_zigzag_scan, inverse_scan};
+pub use scan::{clamped_scan, default_zigzag_scan, inverse_scan};
 pub use types::{Kind, TxSize, TxType};
 
 use oxideav_core::{Error, Result};
@@ -33,13 +40,18 @@ use oxideav_core::{Error, Result};
 use adst16::{iadst16, iflipadst16};
 use adst4::{iadst4, iflipadst4};
 use adst8::{iadst8, iflipadst8};
+use flipadst::flip_1d;
 use idct16::idct16;
+use idct32::idct32;
 use idct4::idct4;
+use idct64::idct64;
 use idct8::idct8;
+use idtx::{idtx16, idtx32, idtx4, idtx8};
+use iwht4::iwht4;
 
-/// Apply a 1D inverse transform of length `n` (4, 8, or 16) matching
-/// `kind`. Returns `Err(Unsupported)` for sizes / kinds Phase 3 does
-/// not yet handle.
+/// Apply a 1D inverse transform of length `n` matching `kind`.
+/// Returns `Err(Unsupported)` only for length/kind pairs the spec
+/// never instantiates (e.g. 32-point ADST, 64-point ADST).
 fn run_1d(kind: Kind, buf: &mut [i32]) -> Result<()> {
     match (kind, buf.len()) {
         (Kind::Dct, 4) => {
@@ -55,6 +67,16 @@ fn run_1d(kind: Kind, buf: &mut [i32]) -> Result<()> {
         (Kind::Dct, 16) => {
             let arr = <&mut [i32; 16]>::try_from(buf).map_err(|_| idx_err())?;
             idct16(arr);
+            Ok(())
+        }
+        (Kind::Dct, 32) => {
+            let arr = <&mut [i32; 32]>::try_from(buf).map_err(|_| idx_err())?;
+            idct32(arr);
+            Ok(())
+        }
+        (Kind::Dct, 64) => {
+            let arr = <&mut [i32; 64]>::try_from(buf).map_err(|_| idx_err())?;
+            idct64(arr);
             Ok(())
         }
         (Kind::Adst, 4) => {
@@ -87,11 +109,42 @@ fn run_1d(kind: Kind, buf: &mut [i32]) -> Result<()> {
             iflipadst16(arr);
             Ok(())
         }
-        (Kind::Idtx, _) => Err(Error::unsupported(
-            "av1 transform: identity 1D not implemented in Phase 3 (§7.7.2.7)",
-        )),
+        (Kind::Idtx, 4) => {
+            let arr = <&mut [i32; 4]>::try_from(buf).map_err(|_| idx_err())?;
+            idtx4(arr);
+            Ok(())
+        }
+        (Kind::Idtx, 8) => {
+            let arr = <&mut [i32; 8]>::try_from(buf).map_err(|_| idx_err())?;
+            idtx8(arr);
+            Ok(())
+        }
+        (Kind::Idtx, 16) => {
+            let arr = <&mut [i32; 16]>::try_from(buf).map_err(|_| idx_err())?;
+            idtx16(arr);
+            Ok(())
+        }
+        (Kind::Idtx, 32) => {
+            let arr = <&mut [i32; 32]>::try_from(buf).map_err(|_| idx_err())?;
+            idtx32(arr);
+            Ok(())
+        }
+        (Kind::Wht, 4) => {
+            let arr = <&mut [i32; 4]>::try_from(buf).map_err(|_| idx_err())?;
+            iwht4(arr);
+            Ok(())
+        }
+        (Kind::Adst, 32)
+        | (Kind::Adst, 64)
+        | (Kind::FlipAdst, 32)
+        | (Kind::FlipAdst, 64)
+        | (Kind::Idtx, 64)
+        | (Kind::Wht, _) => Err(Error::unsupported(format!(
+            "av1 transform: 1D {kind:?} at len {} not instantiated by the spec",
+            buf.len()
+        ))),
         (_, n) => Err(Error::unsupported(format!(
-            "av1 transform: 1D len {n} not implemented (§7.7; Phase 3 supports 4/8/16)"
+            "av1 transform: unsupported 1D length {n} (§7.7 — must be 4/8/16/32/64)"
         ))),
     }
 }
@@ -121,11 +174,22 @@ pub fn inverse_2d(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()> {
         )));
     }
 
+    let row_kind = ty.row_kind();
+    let col_kind = ty.col_kind();
+    let row_flip = ty.row_flip();
+    let col_flip = ty.col_flip();
+
     // Row pass.
     let mut row = vec![0i32; w];
     for r in 0..h {
         row.copy_from_slice(&coeffs[r * w..(r + 1) * w]);
-        run_1d(ty.row_kind(), &mut row)?;
+        if row_flip {
+            flip_1d(&mut row);
+        }
+        run_1d(row_kind, &mut row)?;
+        if row_flip {
+            flip_1d(&mut row);
+        }
         coeffs[r * w..(r + 1) * w].copy_from_slice(&row);
     }
 
@@ -135,7 +199,13 @@ pub fn inverse_2d(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()> {
         for (r, cell) in col.iter_mut().enumerate().take(h) {
             *cell = coeffs[r * w + c];
         }
-        run_1d(ty.col_kind(), &mut col)?;
+        if col_flip {
+            flip_1d(&mut col);
+        }
+        run_1d(col_kind, &mut col)?;
+        if col_flip {
+            flip_1d(&mut col);
+        }
         for (r, cell) in col.iter().enumerate().take(h) {
             coeffs[r * w + c] = *cell;
         }
@@ -145,22 +215,12 @@ pub fn inverse_2d(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()> {
 }
 
 /// Final round-and-shift applied after the 2D inverse transform, per
-/// spec §7.7.3.1. The shift is `log2(w) + log2(h) - 1` + a per-bit-depth
-/// offset of 1 for 10-bit / 2 for 12-bit (Table 7.7.3-1). Phase 3 only
-/// wires the 8-bit reconstruction path, but the generic helper is
-/// exposed so higher-bit-depth plumbing can call it later.
+/// spec §7.7.3.1. goavif mirrors libaom's per-size `txfm_shift` table
+/// verbatim; the Rust port is the same table collapsed into a small
+/// match by `(log2(w) + log2(h))`.
 pub fn inverse_shift(w: usize, h: usize) -> u32 {
     let lw = log2_of(w);
     let lh = log2_of(h);
-    // Spec: Round2(T, cos_bits) during the transform is already baked
-    // in; the remaining pass shifts by (lw + lh) / 2 + 1 for AV1's
-    // residual scale convention. In libaom/goavif this reduces to:
-    //
-    //   4×4  → 4      4×8  → 4      4×16 → 5
-    //   8×8  → 5      8×4  → 4      8×16 → 5
-    //   16×16 → 6      16×4 → 5      16×8 → 5
-    //
-    // We mirror the exact libaom table below.
     av1_inverse_shift(lw, lh)
 }
 
@@ -176,30 +236,13 @@ fn log2_of(n: usize) -> u32 {
 }
 
 fn av1_inverse_shift(lw: u32, lh: u32) -> u32 {
-    // From libaom av1_inv_txfm_add_c: shift = txfm_shift[tx_size][1]
-    // for column pass has already been applied by the 1D kernel's
-    // internal rounding. The remaining "additional shift" applied
-    // after the 2D result before reconstruction (`txfm_shift[...][2]`)
-    // is `-5` for most sizes — i.e. a right-shift of 5. Table derived
-    // from `av1_txfm_stage_num` * 2 etc. Simplified to:
-    //
-    //   shift = 4 for 4×N and N×4 blocks
-    //   shift = 5 for 8×8, 8×16, 16×8
-    //   shift = 6 for 16×16 and up
-    //
-    // goavif mirrors this exactly (see `av1/decoder/reconstruct.go`).
+    // libaom `av1_inv_txfm_add_c` final shift = txfm_shift[tx_size][2].
+    // Collapsed to area buckets: 4 for ≤64 samples, 5 for 128/256,
+    // 6 for anything larger.
     let area = 1u32 << (lw + lh);
-    if area <= 16 {
-        // 4×4
+    if area <= 64 {
         4
-    } else if area <= 64 {
-        // 4×8 / 8×4 / 8×8 / 4×16 / 16×4
-        4
-    } else if area <= 128 {
-        // 8×16 / 16×8
-        5
     } else if area <= 256 {
-        // 16×16 / 8×32 / 32×8
         5
     } else {
         6
@@ -208,7 +251,7 @@ fn av1_inverse_shift(lw: u32, lh: u32) -> u32 {
 
 /// Convenience wrapper used by the standalone intra-smoke tests: run
 /// the 2D inverse transform, apply the spec's `round_shift`, and
-/// clip-add the residual to an 8-bit predictor block. Phase 3's full
+/// clip-add the residual to an 8-bit predictor block. The main
 /// coefficient pipeline bypasses this helper and calls
 /// [`inverse_2d`] directly before handing off to
 /// [`crate::decode::reconstruct`].
@@ -224,10 +267,12 @@ pub fn inverse_transform_add(
         (4, 4) => TxSize::Tx4x4,
         (8, 8) => TxSize::Tx8x8,
         (16, 16) => TxSize::Tx16x16,
+        (32, 32) => TxSize::Tx32x32,
+        (64, 64) => TxSize::Tx64x64,
         _ => {
             return Err(Error::unsupported(format!(
-                "av1 transform: {w}×{h} iDCT not implemented \
-                (§7.7.2; Phase 3 supports 4×4, 8×8, 16×16)",
+                "av1 transform: {w}×{h} iDCT not supported via helper \
+                (§7.7.2; supported: 4×4/8×8/16×16/32×32/64×64)",
             )))
         }
     };
@@ -279,32 +324,44 @@ mod tests {
     }
 
     #[test]
+    fn inverse_2d_dct_32x32_dc_only_produces_constant_block() {
+        let mut coeffs = vec![0i32; 32 * 32];
+        coeffs[0] = 32768;
+        inverse_2d(&mut coeffs, TxType::DctDct, TxSize::Tx32x32).unwrap();
+        let v = coeffs[0];
+        for c in &coeffs {
+            assert_eq!(*c, v);
+        }
+    }
+
+    #[test]
+    fn inverse_2d_dct_64x64_dc_only_produces_constant_block() {
+        let mut coeffs = vec![0i32; 64 * 64];
+        coeffs[0] = 65536;
+        inverse_2d(&mut coeffs, TxType::DctDct, TxSize::Tx64x64).unwrap();
+        let v = coeffs[0];
+        for c in &coeffs {
+            assert_eq!(*c, v);
+        }
+    }
+
+    #[test]
+    fn inverse_2d_idtx_is_bitshift() {
+        // For IdtIdt, 4×4 at DC only: sample = DC << 1 (row) << 1 (col) = DC << 2.
+        let mut coeffs = [0i32; 16];
+        coeffs[0] = 10;
+        inverse_2d(&mut coeffs, TxType::IdtIdt, TxSize::Tx4x4).unwrap();
+        assert_eq!(coeffs[0], 40);
+        for c in coeffs.iter().skip(1) {
+            assert_eq!(*c, 0);
+        }
+    }
+
+    #[test]
     fn inverse_2d_rejects_wrong_size() {
         let mut coeffs = [0i32; 12];
         let err = inverse_2d(&mut coeffs, TxType::DctDct, TxSize::Tx4x4).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
-    }
-
-    #[test]
-    fn inverse_2d_idtidt_unsupported() {
-        let mut coeffs = [0i32; 16];
-        match inverse_2d(&mut coeffs, TxType::IdtIdt, TxSize::Tx4x4) {
-            Err(Error::Unsupported(s)) => assert!(s.contains("identity"), "msg: {s}"),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn inverse_transform_add_rejects_unsupported_size() {
-        let coeffs = vec![0i32; 32 * 32];
-        let mut dst = vec![0u8; 32 * 32];
-        match inverse_transform_add(TxType::DctDct, 32, 32, &coeffs, &mut dst, 32) {
-            Err(Error::Unsupported(s)) => {
-                assert!(s.contains("32"), "msg: {s}");
-                assert!(s.contains("§7.7"), "msg: {s}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
     }
 
     #[test]
@@ -324,6 +381,16 @@ mod tests {
         inverse_transform_add(TxType::DctDct, 16, 16, &coeffs, &mut dst, 16).unwrap();
         for &v in &dst {
             assert_eq!(v, 70);
+        }
+    }
+
+    #[test]
+    fn inverse_transform_add_zero_is_noop_32x32() {
+        let coeffs = vec![0i32; 32 * 32];
+        let mut dst = vec![77u8; 32 * 32];
+        inverse_transform_add(TxType::DctDct, 32, 32, &coeffs, &mut dst, 32).unwrap();
+        for &v in &dst {
+            assert_eq!(v, 77);
         }
     }
 }
