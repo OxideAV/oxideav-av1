@@ -85,20 +85,25 @@ pub static NZ_MAP_CTX_OFFSET_32X32: [i8; 1024] = {
     t
 };
 
-/// Pick the nz_map_ctx_offset table for a given TX size. The spec uses
-/// separate tables per non-square aspect; for Phase 4 scope (square
-/// sizes used by AVIF stills) we route 32×32 and 64×64 through the
-/// shared 32×32 table — libaom does the same for TX_64x64 because the
-/// coded region is clamped to the top-left 32×32.
+/// Pick the nz_map_ctx_offset table for a given TX size. For
+/// non-square shapes we route to the nearest square table by area
+/// (libaom / goavif use the same simplification for TX_64×N blocks:
+/// the coded region is clamped to the top-left 32×32 so the 32×32
+/// table covers everything we need).
 pub fn nz_map_ctx_offset(w: usize, h: usize) -> Result<&'static [i8]> {
-    match (w, h) {
-        (4, 4) => Ok(&NZ_MAP_CTX_OFFSET_4X4),
-        (8, 8) => Ok(&NZ_MAP_CTX_OFFSET_8X8),
-        (16, 16) => Ok(&NZ_MAP_CTX_OFFSET_16X16),
-        (32, 32) | (64, 64) | (64, 32) | (32, 64) => Ok(&NZ_MAP_CTX_OFFSET_32X32),
-        _ => Err(Error::unsupported(format!(
+    let area = w * h;
+    if area <= 16 {
+        Ok(&NZ_MAP_CTX_OFFSET_4X4)
+    } else if area <= 64 {
+        Ok(&NZ_MAP_CTX_OFFSET_8X8)
+    } else if area <= 256 {
+        Ok(&NZ_MAP_CTX_OFFSET_16X16)
+    } else if area <= 4096 {
+        Ok(&NZ_MAP_CTX_OFFSET_32X32)
+    } else {
+        Err(Error::unsupported(format!(
             "av1 coeffs: nz_map offset for {w}×{h} not available (§6.10.6)"
-        ))),
+        )))
     }
 }
 

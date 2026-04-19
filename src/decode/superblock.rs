@@ -456,19 +456,38 @@ fn reconstruct_luma_block(
     Ok(())
 }
 
-/// Pick the square `(TxSize, num_coeffs, scan)` triple for the given
-/// block side. For TX_64x64 the coded region is clamped to the top-left
-/// 32×32 so `num_coeffs = 1024` and the scan maps back into the 64-wide
-/// buffer; `inverse_2d` still runs on the full 64×64 coefficient grid.
+/// Pick the `(TxSize, num_coeffs, scan)` triple for the given block
+/// dimensions. For TX_64x64 / TX_64x32 / TX_32x64 the coded region is
+/// clamped to the top-left 32×32 so `num_coeffs = 1024` and the scan
+/// maps back into the wider full-block buffer; `inverse_2d` still runs
+/// on the full coefficient grid (same behavior as libaom /
+/// goavif `selectTxParams`).
 fn select_square_tx(w: usize, h: usize) -> Result<(TxSize, usize, Vec<usize>)> {
     match (w, h) {
+        // Squares.
         (4, 4) => Ok((TxSize::Tx4x4, 16, default_zigzag_scan(4, 4))),
         (8, 8) => Ok((TxSize::Tx8x8, 64, default_zigzag_scan(8, 8))),
         (16, 16) => Ok((TxSize::Tx16x16, 256, default_zigzag_scan(16, 16))),
         (32, 32) => Ok((TxSize::Tx32x32, 1024, default_zigzag_scan(32, 32))),
         (64, 64) => Ok((TxSize::Tx64x64, 1024, clamped_scan(32, 32, 64))),
+        // Rectangular — straight 2:1 / 1:2.
+        (4, 8) => Ok((TxSize::Tx4x8, 32, default_zigzag_scan(4, 8))),
+        (8, 4) => Ok((TxSize::Tx8x4, 32, default_zigzag_scan(8, 4))),
+        (8, 16) => Ok((TxSize::Tx8x16, 128, default_zigzag_scan(8, 16))),
+        (16, 8) => Ok((TxSize::Tx16x8, 128, default_zigzag_scan(16, 8))),
+        (16, 32) => Ok((TxSize::Tx16x32, 512, default_zigzag_scan(16, 32))),
+        (32, 16) => Ok((TxSize::Tx32x16, 512, default_zigzag_scan(32, 16))),
+        (32, 64) => Ok((TxSize::Tx32x64, 1024, default_zigzag_scan(32, 32))),
+        (64, 32) => Ok((TxSize::Tx64x32, 1024, clamped_scan(32, 32, 64))),
+        // Rectangular — 4:1 / 1:4.
+        (4, 16) => Ok((TxSize::Tx4x16, 64, default_zigzag_scan(4, 16))),
+        (16, 4) => Ok((TxSize::Tx16x4, 64, default_zigzag_scan(16, 4))),
+        (8, 32) => Ok((TxSize::Tx8x32, 256, default_zigzag_scan(8, 32))),
+        (32, 8) => Ok((TxSize::Tx32x8, 256, default_zigzag_scan(32, 8))),
+        (16, 64) => Ok((TxSize::Tx16x64, 512, clamped_scan(16, 32, 16))),
+        (64, 16) => Ok((TxSize::Tx64x16, 512, clamped_scan(32, 16, 64))),
         _ => Err(Error::unsupported(format!(
-            "av1 superblock: non-square TX {w}×{h} pending (§5.11.27)"
+            "av1 superblock: TX {w}×{h} not in the AV1 set (§5.11.27)"
         ))),
     }
 }
