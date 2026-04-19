@@ -82,7 +82,13 @@ impl<'a> TileDecoder<'a> {
         frame: &'a FrameHeader,
         tile_data: &'a [u8],
     ) -> Result<Self> {
-        let symbol = SymbolDecoder::new(tile_data)?;
+        // §9.2.1 init_symbol: the tile payload size is the entire
+        // slice. `disable_cdf_update` lives on the frame header
+        // (§5.9.11) — when false, each decode_symbol() call adapts
+        // the CDF in place.
+        let sz = tile_data.len();
+        let allow_update = !frame.disable_cdf_update;
+        let symbol = SymbolDecoder::new(tile_data, sz, allow_update)?;
         let sb_size_log2 = if seq.use_128x128_superblock { 7 } else { 6 };
         Ok(Self {
             seq,
