@@ -1,6 +1,4 @@
 //! `SMOOTH_PRED` / `SMOOTH_V_PRED` / `SMOOTH_H_PRED` — §7.11.2.6.
-//!
-//! Ported from goavif `av1/predict/intra_smooth.go` + `intra16.go`.
 
 /// SM_WEIGHTS table for block dimension 4.
 pub const SM_WEIGHTS4: [u16; 4] = [255, 149, 85, 64];

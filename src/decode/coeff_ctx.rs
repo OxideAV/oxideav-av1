@@ -1,8 +1,5 @@
 //! AV1 coefficient context derivation — §6.10.6 / §6.10.7.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/coeff_ctx.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! Coefficients are decoded in reverse scan order: first the
 //! coefficient at position `scan[eob-1]`, then `scan[eob-2]`, and so
 //! on down to the DC at `scan[0]`. The `sig_coef_ctx` used to select a

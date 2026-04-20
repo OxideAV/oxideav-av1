@@ -1,6 +1,4 @@
 //! CDEF direction search — §7.15.3.2.
-//!
-//! Ported from goavif `av1/cdef/direction.go` + `direction16.go`.
 
 /// `(row_offset, col_offset)` vectors for the 8 CDEF directions. Each
 /// direction has two "distances": distance 1 (immediate neighbours

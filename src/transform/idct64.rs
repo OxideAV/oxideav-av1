@@ -1,12 +1,9 @@
 //! 64-point inverse DCT — §7.7.2.1.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/idct64.go`
-//! (MIT, KarpelesLab/goavif). The 11-stage butterfly was transcribed
-//! from libaom's `av1_idct64` by the goavif author; this port preserves
-//! the original stage layout verbatim. The Go version ping-pongs two
-//! 64-slot scratch buffers (`output` and `step`); we do the same in
-//! Rust so the line-by-line sign / index pattern is auditable against
-//! libaom.
+//! The 11-stage butterfly is transcribed from libaom's `av1_idct64`
+//! and preserves the original stage layout verbatim. We ping-pong two
+//! 64-slot scratch buffers (`output` and `step`) so the line-by-line
+//! sign / index pattern is auditable against libaom.
 //!
 //! Do NOT reorder butterflies or merge stages: the spec's range-check
 //! tables depend on the exact intermediate precision at every stage.

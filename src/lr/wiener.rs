@@ -1,8 +1,5 @@
 //! Wiener 7×7 separable FIR — spec §7.17.3.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/lr/{wiener,wiener16}.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! The 7-element symmetric kernel is materialised from a 4-element
 //! tap array as:
 //!
@@ -108,7 +105,7 @@ pub fn apply_wiener(
 
 /// `uint16` counterpart of [`apply_wiener`]. Output is clipped to
 /// `[0, (1 << bit_depth) - 1]`.
-#[allow(clippy::too_many_arguments)] // Mirrors the goavif ApplyWiener16 signature.
+#[allow(clippy::too_many_arguments)] // Mirrors the 8-bit apply_wiener signature (dst+src+dims+taps+bit_depth).
 pub fn apply_wiener16(
     dst: &mut [u16],
     src: &[u16],

@@ -4,8 +4,6 @@
 //! `angle_delta ∈ {-3..3}` at 3° steps. Per-sample projection is
 //! formed along the chosen angle and sampled from the above/left
 //! neighbours via sub-pixel interpolation.
-//!
-//! Ported from goavif `av1/predict/intra_dr.go` + `intra16_dr.go`.
 
 use crate::decode::modes::IntraMode;
 

@@ -1,10 +1,9 @@
 //! AV1 sub-pel interpolation filters — §7.11.3.4.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/predict/interp.go` +
-//! `interp16.go` (MIT, KarpelesLab/goavif). A block is resampled by
-//! applying the horizontal 8-tap filter followed by the vertical
-//! 8-tap filter. Motion vectors carry eighth-pel precision; each axis
-//! phase is `(mv & 15)` (16 phases × 8 taps per filter set).
+//! A block is resampled by applying the horizontal 8-tap filter
+//! followed by the vertical 8-tap filter. Motion vectors carry
+//! eighth-pel precision; each axis phase is `(mv & 15)` (16 phases ×
+//! 8 taps per filter set).
 //!
 //! Three filter sets are used by AVIF content: REGULAR / SMOOTH /
 //! SHARP. The 4th libaom filter (REGULAR_PRESET_BILINEAR) is not
@@ -23,8 +22,8 @@ pub enum InterpFilter {
 
 impl InterpFilter {
     /// Map a raw symbol value to an `InterpFilter`. Unknown values
-    /// collapse to `Regular` — matches goavif which also tolerates
-    /// out-of-range inputs without erroring.
+    /// collapse to `Regular` — we tolerate out-of-range inputs without
+    /// erroring so corrupt bitstreams don't hard-fault the decoder.
     pub fn from_u32(v: u32) -> Self {
         match v {
             1 => Self::Smooth,

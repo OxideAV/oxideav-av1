@@ -1,5 +1,4 @@
-//! Frame-level CDEF driver — ported from goavif `av1/cdef/frame.go` +
-//! `filter16.go`'s plane helpers.
+//! Frame-level CDEF driver (8-bit + HBD plane helpers).
 
 use super::direction::{find_direction, find_direction16};
 use super::filter::{filter_block, filter_block16};
@@ -178,7 +177,7 @@ mod tests {
     fn apply_frame_flat_interior_preserved() {
         // Flat input yields flat interior samples; edge samples may
         // shift by a few levels due to the CDEF_VERY_LARGE sentinel
-        // being substituted for out-of-range reads (matches goavif).
+        // being substituted for out-of-range reads.
         let mut pix = vec![100u8; 16 * 16];
         let p = Plane {
             pix: &mut pix,

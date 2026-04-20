@@ -1,8 +1,5 @@
 //! Self-guided restoration (SGR) — spec §7.17.4.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/lr/{sgr,sgr16}.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! SGR runs a variance-adaptive box filter whose output blends toward
 //! the local mean in flat regions and toward the input in high-variance
 //! regions. The single-pass sub-filter is:
@@ -159,7 +156,7 @@ pub fn sgr_sub_filter(
 
 /// `uint16` counterpart of [`sgr_sub_filter`]. `eps` should already be
 /// scaled for `bit_depth` by the caller.
-#[allow(clippy::too_many_arguments)] // Mirrors the goavif SGRSubFilter16 signature.
+#[allow(clippy::too_many_arguments)] // Mirrors the 8-bit SGR sub-filter signature (dst+src+dims+taps+bit_depth+eps).
 pub fn sgr_sub_filter16(
     dst: &mut [u16],
     src: &[u16],

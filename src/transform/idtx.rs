@@ -1,9 +1,7 @@
 //! Identity inverse transforms — §7.7.2.7.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/idtx.go`
-//! (MIT, KarpelesLab/goavif). The IDTX kernels leave their input
-//! structurally unchanged and apply a size-dependent scale that the
-//! spec's txfm_range tables expect:
+//! The IDTX kernels leave their input structurally unchanged and apply
+//! a size-dependent scale that the spec's txfm_range tables expect:
 //!
 //! - `idtx4` / `idtx8` / `idtx16` — left-shift by 1.
 //! - `idtx32` — no scaling (the range table already accounts for

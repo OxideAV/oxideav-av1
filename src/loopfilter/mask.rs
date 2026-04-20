@@ -1,6 +1,4 @@
 //! Deblocking threshold derivation — §7.14.3.
-//!
-//! Ported from goavif `av1/loopfilter/mask.go`.
 
 use super::narrow::Thresholds;
 

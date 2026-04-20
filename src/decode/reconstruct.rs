@@ -1,9 +1,5 @@
 //! AV1 residual-to-pixel reconstruction — §7.7.4 final step.
 //!
-//! Ported from
-//! `github.com/KarpelesLab/goavif/av1/decoder/reconstruct.go` (MIT,
-//! KarpelesLab/goavif).
-//!
 //! After the 2D inverse transform produces a signed `i32` residual
 //! block, each coefficient is added to the predictor and clipped to
 //! the plane's sample range. Phase 3 wires only the 8-bit path; the

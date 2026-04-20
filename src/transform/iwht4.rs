@@ -1,10 +1,9 @@
 //! 4-point inverse Walsh-Hadamard transform — §7.7.2.6.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/iwht4.go`
-//! (MIT, KarpelesLab/goavif). Used by AV1's lossless-only coding
-//! path; the `UNIT_QUANT_SHIFT = 2` constant is baked into the first
-//! four shifts below. libaom: "4-point reversible, orthonormal inverse
-//! WHT in 3.5 adds, 0.5 shifts per pixel."
+//! Used by AV1's lossless-only coding path; the `UNIT_QUANT_SHIFT = 2`
+//! constant is baked into the first four shifts below. libaom:
+//! "4-point reversible, orthonormal inverse WHT in 3.5 adds, 0.5
+//! shifts per pixel."
 
 const UNIT_QUANT_SHIFT: u32 = 2;
 

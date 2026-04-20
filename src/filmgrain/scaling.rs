@@ -1,9 +1,6 @@
 //! Piecewise-linear scaling LUT for film grain intensity shaping
 //! (spec §7.20.3.3).
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/filmgrain/scaling.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! AV1 transmits up to 14 `(value, scale)` control points per plane;
 //! decoders expand them into a 256-entry LUT by piecewise-linear
 //! interpolation between consecutive points. Values below the first

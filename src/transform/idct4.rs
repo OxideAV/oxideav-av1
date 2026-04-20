@@ -1,7 +1,4 @@
 //! 4-point inverse DCT — §7.7.2.1.
-//!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/idct4.go`
-//! (MIT, KarpelesLab/goavif).
 
 use super::cos_pi::{half_btf, COS_PI};
 

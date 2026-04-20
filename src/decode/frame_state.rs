@@ -1,11 +1,8 @@
 //! Mutable per-frame state for the AV1 mode decoder.
 //!
-//! Adapted from the `FrameState` struct in
-//! `github.com/KarpelesLab/goavif/av1/decoder/superblock.go` (MIT,
-//! KarpelesLab/goavif). The goavif version also carries reconstructed
-//! pixel planes + CDEF signalling; for Phase 2 (mode decode only) we
-//! drop the pixel buffers and keep only the MI grid plus the
-//! subsampling / bit-depth context needed by the chroma code paths.
+//! For Phase 2 (mode decode only) this struct omits reconstructed
+//! pixel planes and CDEF signalling and keeps only the MI grid plus
+//! the subsampling / bit-depth context needed by the chroma code paths.
 
 use crate::lr::UnitParams as LrUnitParams;
 

@@ -1,9 +1,8 @@
 //! Grain template generation (spec §7.20.2 / §7.20.3.5 / §7.20.3.6).
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/filmgrain/patch.go`
-//! (MIT, KarpelesLab/goavif). The template is a pre-computed block
-//! of grain samples shaped by the AR model: 73×73 for luma, 38×38 for
-//! 4:2:0 chroma. Apply time looks up 32×32 sub-patches.
+//! The template is a pre-computed block of grain samples shaped by
+//! the AR model: 73×73 for luma, 38×38 for 4:2:0 chroma. Apply time
+//! looks up 32×32 sub-patches.
 
 use super::ar::{apply_ar, generate_grain_template};
 

@@ -1,9 +1,8 @@
 //! AV1 intra prediction mode taxonomy — §6.4.1 / §5.11.18
 //! `intra_mode_info`.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/modes.go`
-//! (MIT, KarpelesLab/goavif). Numeric values match the bitstream
-//! encoding so they can be decoded from CDFs without translation.
+//! Numeric values match the bitstream encoding so they can be decoded
+//! from CDFs without translation.
 //!
 //! This module only defines the enum shape + the context-bucket helper
 //! the mode decoder needs. The actual `DC_PRED` / `V_PRED` / `H_PRED`
@@ -129,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_directional_matches_goavif() {
+    fn is_directional_matches_spec() {
         let cases: &[(IntraMode, bool)] = &[
             (IntraMode::DcPred, false),
             (IntraMode::VPred, false),

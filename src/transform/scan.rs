@@ -1,8 +1,5 @@
 //! AV1 default zig-zag scan orders — §7.9.2.1.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/scan.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! Each scan order is a permutation of the row-major block positions.
 //! `scan[i]` returns the row-major position of the `i`-th coefficient in
 //! scan order. The default AV1 scan alternates antidiagonals:

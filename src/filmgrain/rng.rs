@@ -1,9 +1,6 @@
 //! 16-bit linear-feedback shift register for AV1 film grain synthesis
 //! (spec §7.20.2).
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/filmgrain/rng.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! The generator XORs taps at bits 0, 1, 3 and 12 and shifts the
 //! result into bit 15. The spec seeds the RNG from `grain_seed` plus
 //! row/column offsets so that the noise is deterministic for any

@@ -1,12 +1,10 @@
 //! 32-point inverse DCT — §7.7.2.1.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/idct32.go`
-//! (MIT, KarpelesLab/goavif). This is a 9-stage butterfly transcribed
-//! directly from libaom's `av1_idct32`. The Go port uses two scratch
-//! 32-slot buffers (`out` and `step`) that ping-pong the way libaom
-//! swaps `bf0` / `bf1`; the Rust port keeps that structure verbatim so
-//! the butterfly constants stay identical and the sign pattern is easy
-//! to audit against the reference.
+//! 9-stage butterfly transcribed directly from libaom's `av1_idct32`.
+//! We use two scratch 32-slot buffers (`out` and `step`) that ping-pong
+//! the way libaom swaps `bf0` / `bf1`, so the butterfly constants stay
+//! identical and the sign pattern is easy to audit against the
+//! reference.
 
 use super::cos_pi::{half_btf, COS_PI};
 

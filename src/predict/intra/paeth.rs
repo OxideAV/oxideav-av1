@@ -1,8 +1,8 @@
 //! `PAETH_PRED` — §7.11.2.4.
 //!
 //! For each (r, c) pick the reference (above[c], left[r], aboveLeft)
-//! whose predictor ray (`above[c] + left[r] - aboveLeft`) is closest to
-//! it. Ported from goavif `av1/predict/intra_paeth.go` + `intra16.go`.
+//! whose predictor ray (`above[c] + left[r] - aboveLeft`) is closest
+//! to it.
 
 /// 8-bit Paeth predictor.
 pub fn paeth_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8], above_left: u8) {

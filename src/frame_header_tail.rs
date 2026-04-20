@@ -1,6 +1,5 @@
 //! Frame-header post-`tile_info()` sub-sections.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/obu/*_params.go`.
 //! Covers §5.9.12 quantization, §5.9.14 segmentation, §5.9.16
 //! delta_q / delta_lf, §5.9.11 loop_filter, §5.9.19 cdef, §5.9.20 lr,
 //! §5.9.21 read_tx_mode, §5.9.22 frame_reference_mode, §5.9.23
@@ -307,7 +306,9 @@ pub fn parse_delta_lf_params(
     Ok((present, res, multi))
 }
 
-/// Coded-lossless hint — simplified form tracked by goavif.
+/// Coded-lossless hint — simplified form (all q-related deltas zero +
+/// `base_q_idx == 0`). The exhaustive §6.8.2 test also checks every
+/// segment's per-plane q_index; intra-only callers don't need it.
 pub fn coded_lossless_hint(q: &QuantizationParams) -> bool {
     q.base_q_idx == 0
         && q.delta_q_y_dc == 0
@@ -451,9 +452,9 @@ pub fn parse_tx_mode(br: &mut BitReader<'_>, coded_lossless: bool) -> Result<TxM
 
 /// §5.9.24 `global_motion_params()` — parse and discard the
 /// coefficients. The still-image decoder never uses them and the
-/// bit-width heuristic here is a deliberate simplification (matches
-/// goavif). Required for correct bit-stream framing on inter frames
-/// only; intra-only callers never reach this.
+/// bit-width heuristic here is a deliberate simplification. Required
+/// for correct bit-stream framing on inter frames only; intra-only
+/// callers never reach this.
 pub fn parse_global_motion_params(
     br: &mut BitReader<'_>,
     gm_type_out: &mut [GmType; NUM_REF_FRAMES],

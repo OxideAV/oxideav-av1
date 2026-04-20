@@ -1,8 +1,5 @@
 //! AV1 intra transform-type mapping — §6.10.15.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/tx_type_map.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! Two intra extended-tx sets are used depending on TX area:
 //!
 //! - `EXT_TX_SET_INTRA_1` (txSet=1, 7 types): used for TX blocks of

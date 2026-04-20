@@ -1,11 +1,8 @@
 //! AV1 tile decoder — §5.11 `decode_tile`.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/tile.go`
-//! (MIT, KarpelesLab/goavif). The goavif port also carries the
-//! coefficient decoder (`CoeffDecoder`) and optional inter-frame
-//! syntax reader (`InterDecoder`); Phase 2 keeps only the symbol
-//! decoder + the CDF bank required by the partition / mode /
-//! segment / CFL / skip readers.
+//! Phase 2 keeps only the symbol decoder + the CDF bank required by
+//! the partition / mode / segment / CFL / skip readers. Coefficient
+//! decode and inter-frame syntax live in sibling modules.
 //!
 //! The top-level entry point is [`decode_tile_group`]. It iterates
 //! over every tile in the `OBU_FRAME` / `OBU_TILE_GROUP` payload and
@@ -703,9 +700,8 @@ impl<'a> TileDecoder<'a> {
 
     // ----- Symbol-level primitives. -----
     //
-    // Each mirrors a goavif TileDecoder method, minus the bounds
-    // check style (goavif silently clamps out-of-range contexts; we
-    // clamp too so invalid inputs don't panic).
+    // Each wraps one of the tile decoder's CDFs; out-of-range contexts
+    // are clamped silently so invalid inputs don't panic.
 
     /// Decode a partition symbol for a square block of BSL class
     /// `bsl_ctx` (0..=4) and left/above context `ctx` (0..=3).
@@ -918,7 +914,7 @@ pub fn cfl_signs(joint: u32) -> (i32, i32) {
 }
 
 /// CFL alpha CDF context for a given joint sign + plane. Matches
-/// libaom's CFL_ALPHA_CTX mapping (goavif parity).
+/// libaom's CFL_ALPHA_CTX mapping.
 pub fn cfl_alpha_ctx(joint: u32, plane: u32) -> u32 {
     let (su, sv) = cfl_signs(joint);
     if plane == 0 {

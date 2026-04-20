@@ -3,8 +3,6 @@
 //! Block is processed in 4×2 cells; each cell predicts 8 new samples
 //! from a row of 5 above samples (including the top-left corner) and 2
 //! left samples via an 8×7 coefficient matrix per mode.
-//!
-//! Ported from goavif `av1/predict/intra_filter.go`.
 
 /// Five learned tap sets from libaom's `av1_filter_intra_taps`. Shape:
 /// `[mode][output_idx][input_idx]`. The 8 outputs are the 8 samples of a

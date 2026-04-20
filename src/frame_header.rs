@@ -450,12 +450,12 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     // §5.9.23 — skip_mode_params. Full derivation requires the DPB's
     // OrderHint trail which we don't carry yet; intra-only frames
     // never enable skip_mode per spec. For inter frames we
-    // conservatively leave it off (goavif does the same). The spec
-    // emits a presence bit only under specific OrderHint relationships
-    // (`reference_select && skip_mode_allowed`); without DPB state the
-    // simplest correct thing is to skip the bit entirely — for
-    // aomenc-produced AVIS clips `skip_mode_allowed` is false (no BWD
-    // + FWD ref pair) so the bit is absent from the bitstream.
+    // conservatively leave it off. The spec emits a presence bit only
+    // under specific OrderHint relationships (`reference_select &&
+    // skip_mode_allowed`); without DPB state the simplest correct
+    // thing is to skip the bit entirely — for aomenc-produced AVIS
+    // clips `skip_mode_allowed` is false (no BWD + FWD ref pair) so
+    // the bit is absent from the bitstream.
     let skip_mode_present = false;
 
     // §5.9.25 — allow_warped_motion. Present only when the sequence

@@ -3,8 +3,8 @@
 //! AV1 sign​als per-restoration-unit filter choice + coefficients in
 //! the range-coded tile payload. This module implements that decode
 //! so the tile decoder can feed real per-unit parameters into the
-//! [`crate::lr`] filter primitives instead of the goavif "default
-//! params" shortcut (which effectively disabled Wiener / SGR tuning).
+//! [`crate::lr`] filter primitives instead of a "default params"
+//! shortcut (which effectively disables Wiener / SGR tuning).
 //!
 //! Call [`decode_lr_unit`] once per plane×unit at the 64/128/256-aligned
 //! super-block boundary that marks the start of each restoration unit

@@ -1,11 +1,9 @@
 //! AV1 inter-frame leaf-block decode — §6.10.23.
 //!
-//! Ported from goavif (MIT, KarpelesLab/goavif) —
-//! `av1/decoder/inter_block.go` and `inter_block16.go`. The port reads
-//! the block-level inter syntax (is_inter, single-ref, inter_mode,
-//! MV, skip), runs motion compensation into a prediction buffer, and
-//! hands the resulting samples to the existing residual / clip-add
-//! pipeline.
+//! Reads the block-level inter syntax (is_inter, single-ref,
+//! inter_mode, MV, skip), runs motion compensation into a prediction
+//! buffer, and hands the resulting samples to the existing residual /
+//! clip-add pipeline.
 //!
 //! Narrow scope matching Phase 7: single-reference translational
 //! inter with explicit NEWMV (or zero-MV fallback for GLOBALMV /
@@ -100,8 +98,7 @@ pub fn decode_inter_block_syntax(
     let _ref_idx = inter.read_single_ref_frame(&mut td.symbol)?;
 
     // Inter mode. We treat the context as 0 across the board since we
-    // don't maintain neighbor-mode classes for inter yet — goavif does
-    // the same in its narrow path.
+    // don't maintain neighbor-mode classes for inter yet.
     let mode = inter.read_inter_mode(&mut td.symbol, 0, 0, 0)?;
     let mv = match mode {
         InterMode::NewMv => inter.read_mv(&mut td.symbol)?,

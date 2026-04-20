@@ -1,8 +1,7 @@
 //! 8-point inverse ADST — §7.7.2.4.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/adst8.go`
-//! (MIT, KarpelesLab/goavif). Mirrors libaom's `av1_iadst8`: 7-stage
-//! butterfly with bit-reverse permutation + final alternating negations.
+//! Mirrors libaom's `av1_iadst8`: 7-stage butterfly with bit-reverse
+//! permutation + final alternating negations.
 
 use super::cos_pi::{half_btf, COS_PI};
 

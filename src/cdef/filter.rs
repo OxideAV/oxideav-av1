@@ -1,6 +1,4 @@
 //! CDEF primary + secondary filter — §7.15.3.3.
-//!
-//! Ported from goavif `av1/cdef/filter.go` + `filter16.go`.
 
 use super::direction::DIRECTIONS;
 
@@ -97,10 +95,10 @@ pub fn filter_block(
 }
 
 fn sample_clamped(src: &[u8], stride: usize, col: i32, row: i32) -> i32 {
-    // Matches goavif `sampleClamped`: negative coords clamp to 0, but
-    // positive out-of-range reads fall through to the `CDEF_VERY_LARGE`
-    // sentinel (128 for 8-bit). This preserves goavif's edge-artifact
-    // behavior rather than edge-replicating.
+    // Negative coords clamp to 0, but positive out-of-range reads
+    // fall through to the `CDEF_VERY_LARGE` sentinel (128 for 8-bit).
+    // This preserves libaom's edge-artifact behavior rather than
+    // edge-replicating.
     let row = row.max(0) as usize;
     let col = col.max(0) as usize;
     let idx = row.saturating_mul(stride).saturating_add(col);

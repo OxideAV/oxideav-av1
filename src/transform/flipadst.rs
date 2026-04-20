@@ -1,9 +1,8 @@
 //! Flipped-ADST inverse transforms — §7.7.2.2.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/flipadst.go`
-//! (MIT, KarpelesLab/goavif). Flipped-ADST is the same as inverse ADST
-//! followed by a reversal of the spatial-domain output: the forward
-//! direction reverses its output order, so the inverse mirrors it.
+//! Flipped-ADST is the same as inverse ADST followed by a reversal of
+//! the spatial-domain output: the forward direction reverses its
+//! output order, so the inverse mirrors it.
 //!
 //! The 4/8/16-point variants live alongside `iadst4/8/16` (see
 //! [`crate::transform::adst4`] etc.) — this file carries only the

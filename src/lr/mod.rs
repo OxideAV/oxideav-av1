@@ -12,12 +12,9 @@
 //! Per-restoration-unit signalling (`use_wiener` / `use_sgrproj` flags
 //! plus delta-coded coefficient blobs — §5.11.40-.44) lives with the
 //! tile decoder in [`crate::decode::lr_unit`]. This module provides
-//! the filter primitives.
-//!
-//! Ported from `github.com/KarpelesLab/goavif/av1/lr/*` (MIT,
-//! KarpelesLab/goavif), extended with a full-frame driver that
-//! consults a caller-supplied per-unit parameter table instead of the
-//! goavif "default unit params" shortcut.
+//! the filter primitives plus a full-frame driver that consults a
+//! caller-supplied per-unit parameter table (rather than any
+//! "default unit params" shortcut).
 
 pub mod frame;
 pub mod sgr;

@@ -1,8 +1,5 @@
 //! AV1 transform taxonomy — §6.8.21 + §7.7.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/types.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! Two orthogonal axes:
 //!
 //! - [`TxType`] — one of 17 2D transform pairs (DCT/ADST/flipped

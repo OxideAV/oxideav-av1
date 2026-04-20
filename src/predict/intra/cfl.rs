@@ -3,8 +3,6 @@
 //! CFL reconstructs chroma by combining a per-block DC-style prediction
 //! with a scaled, AC-only copy of the co-located reconstructed luma
 //! block.
-//!
-//! Ported from goavif `av1/predict/intra_cfl.go`.
 
 /// Compute the chroma-resolution luma average by block-averaging
 /// `recon_luma` per the given subsampling factors. Output `dst` carries

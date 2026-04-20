@@ -1,11 +1,8 @@
 //! AV1 block-size + partition-type tables — §3 `BLOCK_*` / `PARTITION_*`.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/block.go` +
-//! `partition.go` (MIT, KarpelesLab/goavif). The goavif port is shaped
-//! around Go's pixel-reconstruction helper; for oxideav's Phase 2 (mode
-//! decode only, no coefficient decode, no pixel reconstruction) we keep
-//! the same block-size / partition-type taxonomy and drop the
-//! reconstruction-specific types.
+//! For Phase 2 (mode decode only, no coefficient decode, no pixel
+//! reconstruction) we keep the spec's block-size / partition-type
+//! taxonomy and drop the reconstruction-specific types.
 
 /// `BlockSize` identifies one of AV1's block shapes (spec §3 `BLOCK_*`).
 #[repr(u8)]

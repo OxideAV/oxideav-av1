@@ -1,8 +1,7 @@
 //! Wide (8-tap) deblocking filter — §7.14.4.3 + §7.14.6.3.
 //!
-//! Ported from goavif `av1/loopfilter/wide.go`. Operates on 8 samples
-//! straddling the edge (p3..p0 | q0..q3) and replaces the inner 6
-//! (p2..p0, q0..q2) with weighted 8-tap averages.
+//! Operates on 8 samples straddling the edge (p3..p0 | q0..q3) and
+//! replaces the inner 6 (p2..p0, q0..q2) with weighted 8-tap averages.
 
 #[inline]
 fn abs_diff(a: u8, b: u8) -> u8 {

@@ -1,8 +1,7 @@
 //! AV1 inter-frame syntax reader — narrow single-reference subset.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/inter.go`
-//! (MIT, KarpelesLab/goavif). Implements the narrow subset required by
-//! AVIF image-sequence (AVIS) content:
+//! Implements the narrow subset required by AVIF image-sequence (AVIS)
+//! content:
 //!
 //! - `is_inter` per-block flag.
 //! - Single-reference ref-frame pick (LAST only).

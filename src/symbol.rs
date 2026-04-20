@@ -1,9 +1,8 @@
 //! AV1 range-coder symbol decoder.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/entropy/decoder.go`
-//! (MIT) which in turn mirrors libaom's `daala_bitreader`. Sections §3
-//! (arithmetic coder) + §9.2 (symbol coding) + §9.4 (CDF adaptation) of
-//! the AV1 specification (2019-01-08).
+//! Mirrors libaom's `daala_bitreader`. Sections §3 (arithmetic coder) +
+//! §9.2 (symbol coding) + §9.4 (CDF adaptation) of the AV1
+//! specification (2019-01-08).
 //!
 //! CDFs are stored in **wire format**: `cdf[0..N-2]` = Q15
 //! `P(X>i) * 32768` values (monotonically decreasing), `cdf[N-1]` = 0
@@ -53,8 +52,7 @@ impl<'a> SymbolDecoder<'a> {
     /// Initialise per §9.2.1.
     ///
     /// `sz` is the number of payload bytes the decoder may consume
-    /// (equivalent to goavif's `Decoder.Init` `sz` argument — usually
-    /// the tile size). Clamped to `data.len()`.
+    /// (usually the tile size). Clamped to `data.len()`.
     ///
     /// When `allow_update` is true, each subsequent `decode_symbol()`
     /// call adapts the CDF in-place per §9.4.
@@ -229,10 +227,9 @@ pub fn update_cdf(cdf: &mut [u16], n: usize, symbol: usize) {
         }
         let v = *entry as u32;
         // Arithmetic-shift semantics: `(v - tmp) >> rate` with sign
-        // extension — goavif relies on Go's two's-complement wrap with
-        // `uint32 - uint32 >> rate` acting as a logical shift of the
-        // wrapped difference. In Rust, we reproduce that by casting to
-        // i32 for the difference then back.
+        // extension. libaom relies on C's implementation-defined
+        // right-shift of a signed difference; we reproduce that by
+        // casting to i32 for the difference then back.
         let diff = (v as i32) - (tmp as i32);
         let shifted = diff >> rate;
         *entry = (v as i32 - shifted) as u16;
@@ -304,12 +301,11 @@ mod tests {
         assert!(s < 4, "partition-8x8 must produce symbol in 0..=3, got {s}");
     }
 
-    /// Cross-validated against goavif's `entropy.Decoder` — for the
+    /// Golden vector for the range-coder symbol decoder: for the
     /// same input buffer + CDF + adaptation, 32 consecutive decoded
-    /// symbols must match byte-for-byte. The Go reference was captured
-    /// with `cmd/check_goavif_symbol` in tools/ (not shipped).
+    /// symbols must match byte-for-byte across builds.
     #[test]
-    fn decode_symbols_match_goavif() {
+    fn decode_symbols_match_reference() {
         let mut buf = [0u8; 256];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = ((i * 37) ^ 0x5A) as u8;

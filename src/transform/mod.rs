@@ -1,7 +1,6 @@
 //! AV1 inverse transforms — §7.7.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/*` (MIT,
-//! KarpelesLab/goavif). The public entry points are:
+//! The public entry points are:
 //!
 //! - [`inverse_2d`] — run the row-then-column 1D inverse transforms
 //!   over a `w × h` coefficient block. Output overwrites the input
@@ -215,9 +214,8 @@ pub fn inverse_2d(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()> {
 }
 
 /// Final round-and-shift applied after the 2D inverse transform, per
-/// spec §7.7.3.1. goavif mirrors libaom's per-size `txfm_shift` table
-/// verbatim; the Rust port is the same table collapsed into a small
-/// match by `(log2(w) + log2(h))`.
+/// spec §7.7.3.1. Mirrors libaom's per-size `txfm_shift` table
+/// verbatim, collapsed into a small match by `(log2(w) + log2(h))`.
 pub fn inverse_shift(w: usize, h: usize) -> u32 {
     let lw = log2_of(w);
     let lh = log2_of(h);

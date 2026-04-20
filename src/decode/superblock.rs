@@ -1,10 +1,9 @@
 //! AV1 superblock + leaf-block mode decoder + reconstruction —
 //! §5.11.4 + §5.11.8 + §5.11.18 + §5.11.39 + §7.7 + §7.11.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/superblock.go`
-//! (MIT, KarpelesLab/goavif). Phase 5 wires the full intra predictor
-//! set (DC/V/H + 6 directional + 3 smooth + Paeth + CFL) and native
-//! 10/12-bit HBD paths; the pre-Phase-5 DC_PRED fallback is gone.
+//! Phase 5 wires the full intra predictor set (DC/V/H + 6 directional
+//! + 3 smooth + Paeth + CFL) and native 10/12-bit HBD paths; the
+//! pre-Phase-5 DC_PRED fallback is gone.
 
 use oxideav_core::{Error, Result};
 

@@ -1,7 +1,4 @@
 //! 4-point inverse ADST — §7.7.2.3.
-//!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/adst4.go`
-//! (MIT, KarpelesLab/goavif).
 
 use super::cos_pi::{round2, COS_BITS, SIN_PI_1_9, SIN_PI_2_9, SIN_PI_3_9, SIN_PI_4_9};
 

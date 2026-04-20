@@ -1,13 +1,12 @@
 //! AV1 intra prediction primitives — §7.11.2.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/predict` (MIT,
-//! KarpelesLab/goavif). This module implements every AV1 intra
-//! prediction mode — the 3 "plain" modes (DC, V, H), the 6
-//! directional modes (D45, D67, D113, D135, D157, D203), the 3 smooth
-//! variants, Paeth, plus the chroma-from-luma (CFL) and filter-intra
-//! helpers. Each predictor has both an 8-bit (`u8`) and a high-bit-depth
-//! (`u16`) path for the 10/12-bit decoder; the HBD variants pass the
-//! bit depth through so out-of-range samples can be clipped.
+//! Implements every AV1 intra prediction mode — the 3 "plain" modes
+//! (DC, V, H), the 6 directional modes (D45, D67, D113, D135, D157,
+//! D203), the 3 smooth variants, Paeth, plus the chroma-from-luma
+//! (CFL) and filter-intra helpers. Each predictor has both an 8-bit
+//! (`u8`) and a high-bit-depth (`u16`) path for the 10/12-bit decoder;
+//! the HBD variants pass the bit depth through so out-of-range samples
+//! can be clipped.
 //!
 //! The public `IntraMode` re-exports the decoder's mode taxonomy
 //! ([`crate::decode::modes::IntraMode`]) so callers don't need a second
@@ -60,8 +59,8 @@ pub struct Neighbours<'a> {
 /// row-major into `dst` with stride `dst_stride`.
 ///
 /// For directional / smooth / Paeth modes, missing neighbours are
-/// substituted with 128 mid-grey (matching goavif's edge-replication
-/// behavior for the intra-only still-image path).
+/// substituted with 128 mid-grey (the intra-only still-image path's
+/// edge-replication behavior).
 pub fn predict(
     mode: IntraMode,
     n: Neighbours<'_>,

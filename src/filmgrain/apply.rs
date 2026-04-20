@@ -1,7 +1,7 @@
 //! Spec-correct 32×32 film-grain tiler (§7.20.2 + §7.20.3).
 //!
-//! This replaces the goavif per-pixel LFSR shortcut with the real
-//! spec-mandated pipeline:
+//! Implements the real spec-mandated pipeline (rather than a per-pixel
+//! LFSR shortcut):
 //!
 //! 1. A full-frame AR-shaped grain template is built once per frame
 //!    (luma 73×73, chroma 38×38 — see [`super::patch`]).
@@ -25,10 +25,9 @@
 // `by/bx` to `right_seam/bottom_seam` reads AND writes (including
 // reads from `right_seam[by]` slot that's only populated once per
 // `by` iteration), so iterator-based rewrites obscure the algorithm.
-// `clippy::too_many_arguments`: the public entrypoints mirror the
-// libaom / goavif signatures (plane + dims + stride + scaling +
-// template + params + bit-depth); merging them into a struct helps
-// nothing.
+// `clippy::too_many_arguments`: the public entrypoints mirror libaom's
+// signatures (plane + dims + stride + scaling + template + params +
+// bit-depth); merging them into a struct helps nothing.
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 

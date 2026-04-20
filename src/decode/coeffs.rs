@@ -1,8 +1,5 @@
 //! AV1 coefficient decoder — §5.11.39 / §6.10.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/coeffs.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! For each non-skip transform block the bitstream carries:
 //!
 //! 1. `txb_skip` — if true, the whole TX block is zero.
@@ -85,9 +82,9 @@ pub static NZ_MAP_CTX_OFFSET_32X32: [i8; 1024] = {
 
 /// Pick the nz_map_ctx_offset table for a given TX size. For
 /// non-square shapes we route to the nearest square table by area
-/// (libaom / goavif use the same simplification for TX_64×N blocks:
-/// the coded region is clamped to the top-left 32×32 so the 32×32
-/// table covers everything we need).
+/// (libaom uses the same simplification for TX_64×N blocks: the coded
+/// region is clamped to the top-left 32×32 so the 32×32 table covers
+/// everything we need).
 pub fn nz_map_ctx_offset(w: usize, h: usize) -> Result<&'static [i8]> {
     let area = w * h;
     if area <= 16 {
@@ -145,8 +142,7 @@ fn eob_pt_to_eob(pt: u32) -> (u32, u32) {
 }
 
 /// Per-tile CDF bank + dispatcher for coefficient-related symbols.
-/// Mirrors goavif's `CoeffDecoder` but uses the already-opened
-/// [`SymbolDecoder`] owned by the tile decoder.
+/// Uses the already-opened [`SymbolDecoder`] owned by the tile decoder.
 pub struct CoeffCdfBank {
     pub q_ctx: usize,
     pub txb_skip_cdf: [[Vec<u16>; 13]; 5],
@@ -393,7 +389,7 @@ pub fn decode_coefficients(
 ) -> Result<Vec<i32>> {
     let mut coeffs = vec![0i32; w * h];
 
-    // `txb_skip` — context=0 per goavif parity.
+    // `txb_skip` — context=0 for the single-context Phase-3 path.
     if bank.read_txb_skip(sym, tx_size_idx, 0)? {
         return Ok(coeffs);
     }
@@ -531,7 +527,7 @@ mod tests {
     #[test]
     fn decode_coefficients_reads_without_panic() {
         // Brute-force several seeds; at least one should decode cleanly
-        // or produce a skip. No panics allowed (mirrors goavif's test).
+        // or produce a skip. No panics allowed.
         let scan = default_zigzag_scan(4, 4);
         let mut any_success = false;
         for seed in 0u8..32 {
@@ -555,8 +551,7 @@ mod tests {
             }
         }
         // The assertion is soft — the point is no panics. If nothing
-        // decoded cleanly, print a log line instead of failing, to
-        // mirror goavif.
+        // decoded cleanly, print a log line instead of failing.
         let _ = any_success;
     }
 }

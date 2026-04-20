@@ -1,8 +1,6 @@
 //! `DC_PRED` — §7.11.2.3. Mean of available neighbours, rounded
 //! half-up. When neither neighbour is available the half-range value
 //! `1 << (bitDepth - 1)` is used (128 for 8-bit).
-//!
-//! Ported from goavif `av1/predict/intra_dc.go`.
 
 /// 8-bit DC predictor. `dst` is row-major, tight (`stride == w`).
 #[allow(clippy::too_many_arguments)]
@@ -86,7 +84,6 @@ mod tests {
 
     #[test]
     fn dc_both_neighbours() {
-        // Matches goavif TestDCPredBothNeighbors.
         let mut dst = vec![0u8; 16];
         let above = [10, 20, 30, 40];
         let left = [40, 50, 60, 70];

@@ -1,6 +1,4 @@
 //! Narrow (4-tap) deblocking filter — §7.14.4 + §7.14.6.2.
-//!
-//! Ported from goavif `av1/loopfilter/narrow.go` + `narrow16.go`.
 
 /// Deblocking threshold triple. All values are expressed for 8-bit
 /// depth; [`scale_thresholds16`] scales them for 10/12-bit inputs.

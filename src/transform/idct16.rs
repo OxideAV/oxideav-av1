@@ -1,8 +1,6 @@
 //! 16-point inverse DCT — §7.7.2.1.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/idct16.go`
-//! (MIT, KarpelesLab/goavif). Follows the spec's 7-stage butterfly
-//! decomposition.
+//! Follows the spec's 7-stage butterfly decomposition.
 
 use super::cos_pi::{half_btf, COS_PI};
 

@@ -1,8 +1,7 @@
 //! AV1 film grain synthesis — spec §7.20.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/filmgrain/*` (MIT,
-//! KarpelesLab/goavif), extended with the spec-correct §7.20.2 32×32
-//! tiler that replaces the goavif per-pixel LFSR shortcut.
+//! Implements the spec-correct §7.20.2 32×32 tiler rather than a
+//! per-pixel LFSR shortcut.
 //!
 //! Film grain is a post-processing pass that adds structured noise to
 //! decoded pixels, preserving the look of photographic grain after

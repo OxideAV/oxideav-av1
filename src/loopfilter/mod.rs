@@ -1,9 +1,7 @@
 //! AV1 deblocking loop filter — §7.14.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/loopfilter` (MIT,
-//! KarpelesLab/goavif). Implements the per-8×8-MI-pair narrow/wide
-//! deblocking filter that runs after coefficient reconstruction and
-//! before CDEF.
+//! Implements the per-8×8-MI-pair narrow/wide deblocking filter that
+//! runs after coefficient reconstruction and before CDEF.
 //!
 //! The core pieces:
 //!

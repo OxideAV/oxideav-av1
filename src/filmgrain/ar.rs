@@ -1,8 +1,5 @@
 //! Auto-regressive grain shaping (spec §7.20.3.3) + seeded raw noise
 //! template generator.
-//!
-//! Ported from `github.com/KarpelesLab/goavif/av1/filmgrain/ar.go`
-//! (MIT, KarpelesLab/goavif).
 
 use super::rng::Rng;
 

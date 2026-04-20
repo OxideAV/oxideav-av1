@@ -1,10 +1,8 @@
 //! Per-plane loop-restoration frame driver.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/lr/{frame,frame16}.go`
-//! (MIT, KarpelesLab/goavif). The goavif driver takes a
-//! `UnitFn` closure that provides per-unit parameters by coordinate;
-//! we keep that signature so tests can exercise the filter without
-//! plumbing the full tile decoder, but the production path is a
+//! The driver takes a `UnitFn` closure that provides per-unit
+//! parameters by coordinate so tests can exercise the filter without
+//! plumbing the full tile decoder; the production path is a
 //! pre-materialised table of [`super::UnitParams`] fed in from the
 //! tile-level per-unit signal decoder (§5.11.40-.44).
 

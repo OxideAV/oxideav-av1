@@ -1,9 +1,6 @@
 //! AV1 dequantisation tables + per-plane DC/AC quantiser computation
 //! (§7.12.2).
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/quant/{quant,dequant,
-//! tables,tables_hdr}.go` (MIT, KarpelesLab/goavif).
-//!
 //! The uncompressed header carries a `base_q_idx` (0..=255) plus signed
 //! deltas for each `(plane, DC|AC)` pair. For each plane the decoder
 //! computes `q = clip_u8(base + delta)` and looks the dequantiser up in

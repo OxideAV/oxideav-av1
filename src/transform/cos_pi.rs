@@ -1,8 +1,5 @@
 //! AV1 transform cosine / sine constants — §7.7.1.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/cos_pi.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! `COS_PI[k] = round(cos(k * π / 128) * 2^COS_BITS)` for `k ∈ 0..=64`,
 //! with `COS_BITS = 12`. The spec references a handful of landmarks:
 //!

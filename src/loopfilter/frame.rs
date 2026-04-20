@@ -1,11 +1,9 @@
-//! Frame-level deblocking driver — ported from goavif
-//! `av1/loopfilter/frame.go` + `frame16.go`.
+//! Frame-level deblocking driver.
 //!
 //! The AV1 spec actually walks every 4-sample edge and only filters
 //! where transform-block boundaries fall. For the intra-only still-image
-//! path we start with a simpler grid-based driver (matches goavif's
-//! approach for intra-only content); full per-edge tracking lands with
-//! the inter decoder.
+//! path we start with a simpler grid-based driver; full per-edge
+//! tracking lands with the inter decoder.
 
 use super::narrow::{
     apply_horizontal_edge4, apply_horizontal_edge4_16, apply_vertical_edge4,

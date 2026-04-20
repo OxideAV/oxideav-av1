@@ -1,9 +1,8 @@
 //! AV1 motion vector decoder — §5.11.25 / §6.10.31.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/mv.go`
-//! (MIT, KarpelesLab/goavif). Decodes joint / sign / class /
-//! bits / fractional / high-precision components of a single motion
-//! vector diff symbol, returning the MV in eighth-pel units.
+//! Decodes joint / sign / class / bits / fractional / high-precision
+//! components of a single motion vector diff symbol, returning the MV
+//! in eighth-pel units.
 //!
 //! Phase 7 scope: only `ReadMv` is exercised (for NEWMV). NEARESTMV /
 //! NEARMV / GLOBALMV degrade to zero-MV without a real ref-MV list;
@@ -203,8 +202,8 @@ mod tests {
     use crate::cdfs;
     use crate::symbol::SymbolDecoder;
 
-    // Minimal CDF encoder mirroring goavif `entropy.Encoder` behaviour
-    // enough to drive the symbol decoder for these tests.
+    // Minimal CDF encoder: mirrors the range-coder adaptation step
+    // well enough to drive the symbol decoder for these tests.
     //
     // Rather than re-implementing the range coder, we synthesise a
     // plausible bitstream by picking a single CDF symbol that the

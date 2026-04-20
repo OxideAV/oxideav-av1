@@ -1,7 +1,5 @@
 //! `V_PRED` / `H_PRED` — §7.11.2.2. Copy the above row down / left
 //! column across, respectively.
-//!
-//! Ported from goavif `av1/predict/intra_vh.go`.
 
 /// Vertical predictor: each row of `dst` is a copy of `above[..w]`.
 pub fn v_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8]) {

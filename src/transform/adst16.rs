@@ -1,10 +1,8 @@
 //! 16-point inverse ADST — §7.7.2.4.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/transform/adst16.go`
-//! (MIT, KarpelesLab/goavif). Mirrors libaom's `av1_iadst16`: 9-stage
-//! butterfly with the spec's bit-reverse permutation, six rotation
-//! stages, three pair add/sub stages, and a final permutation with
-//! alternating negations.
+//! Mirrors libaom's `av1_iadst16`: 9-stage butterfly with the spec's
+//! bit-reverse permutation, six rotation stages, three pair add/sub
+//! stages, and a final permutation with alternating negations.
 
 use super::cos_pi::{half_btf, COS_PI};
 

@@ -1,8 +1,5 @@
 //! AV1 partition-tree walker — §5.11.4 `decode_partition`.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/partition.go`
-//! (MIT, KarpelesLab/goavif).
-//!
 //! [`walk_partition`] is a pure geometry helper: it implements the
 //! recursion shape of §5.11.4 but does not read any bits from the
 //! bitstream. The caller supplies an `oracle` that picks the partition

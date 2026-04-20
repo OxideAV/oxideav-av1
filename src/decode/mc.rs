@@ -1,10 +1,9 @@
 //! AV1 motion compensation — §7.11.3 single-reference translational.
 //!
-//! Ported from `github.com/KarpelesLab/goavif/av1/decoder/mc.go` +
-//! `mc16.go` (MIT, KarpelesLab/goavif). Produces a predicted block of
-//! samples from a reference plane by combining integer-pel offset +
-//! 8-tap sub-pel interpolation, with edge-clamp on source reads so MVs
-//! that point past the frame boundary still return valid samples.
+//! Produces a predicted block of samples from a reference plane by
+//! combining integer-pel offset + 8-tap sub-pel interpolation, with
+//! edge-clamp on source reads so MVs that point past the frame
+//! boundary still return valid samples.
 //!
 //! MV components are in eighth-pel units. Integer MV (`hp == vp == 0`)
 //! takes the direct-copy fast path; otherwise we stage a

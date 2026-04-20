@@ -15,9 +15,10 @@
 //! - 2-symbol CDFs: `[Q15_p_gt_0, 0_sentinel, 0_counter]`.
 //! - 3-symbol switchable CDF: `[Q15_p_gt_0, Q15_p_gt_1, 0_sentinel, 0_counter]`.
 //!
-//! These CDFs are NOT part of goavif's generated table — goavif does
-//! not decode per-unit LR signalling, whereas oxideav implements the
-//! full §5.11.40-.44 path.
+//! These CDFs are NOT part of the auto-generated table in
+//! [`generated`](super::generated) — the generator does not cover
+//! per-unit LR signalling, whereas oxideav implements the full
+//! §5.11.40-.44 path.
 
 /// Switchable-type CDF — 3 symbols: 0 = `RESTORE_NONE`, 1 =
 /// `RESTORE_WIENER`, 2 = `RESTORE_SGRPROJ`. Read only when the frame
