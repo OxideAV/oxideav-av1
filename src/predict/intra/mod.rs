@@ -20,6 +20,7 @@
 pub mod cfl;
 pub mod dc;
 pub mod directional;
+pub mod edge;
 pub mod filter;
 pub mod paeth;
 pub mod smooth;
@@ -28,6 +29,10 @@ pub mod vh;
 pub use cfl::{cfl_pred, cfl_pred16, cfl_subsample, cfl_subsample16};
 pub use dc::{dc_pred, dc_pred16};
 pub use directional::{directional_pred, directional_pred16, mode_to_angle_map};
+pub use edge::{
+    edge_filter, edge_filter16, edge_filter_strength, edge_upsample, edge_upsample16,
+    edge_use_upsample, EdgeFilterStrength, INTRA_EDGE_KERNEL, INTRA_EDGE_TAPS,
+};
 pub use filter::{filter_intra_pred, filter_intra_pred16, FILTER_INTRA_TAPS};
 pub use paeth::{paeth_pred, paeth_pred16};
 pub use smooth::{
