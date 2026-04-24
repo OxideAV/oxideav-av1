@@ -4,6 +4,40 @@
 //! Phase 5 wires the full intra predictor set (DC/V/H + 6 directional
 //! + 3 smooth + Paeth + CFL) and native 10/12-bit HBD paths; the
 //! pre-Phase-5 DC_PRED fallback is gone.
+//!
+//! # Known syntax-level gaps (ordered by testsrc PSNR impact)
+//!
+//! Round-5 diagnosis of the testsrc 64×64 fixture confirmed the
+//! decoded Y plane collapses to a single 64×64 DC_PRED block with
+//! all-zero coefficients (PSNR ~11 dB) even though the encoder
+//! produced rich content. Root cause is symbol-stream desync driven
+//! by several missing / mis-ordered reads relative to §5.11.5
+//! `decode_block`:
+//!
+//! - `read_block_tx_size()` (§5.11.16) — **never called**. For
+//!   `TxMode == TX_MODE_SELECT` on `MiSize > 4×4` intra blocks the
+//!   spec reads a `tx_depth` symbol (§5.11.15). We skip it and read
+//!   coefficients at the wrong TX size. This single omission alone
+//!   desyncs every subsequent symbol.
+//! - `read_skip()` ordering — the spec's `intra_frame_mode_info()`
+//!   reads skip *before* the y_mode / uv_mode. We read it after.
+//! - `read_cdef()`, `read_delta_qindex()`, `read_delta_lf()` — our
+//!   current code reads `read_cdef` only after mode, and never reads
+//!   the delta-Q / delta-LF symbols the encoder writes per-SB when
+//!   `delta_q_present` is set.
+//! - `filter_intra_mode_info()` (§5.11.24) — never called. Has its
+//!   own CDF which is also absent from `cdfs::generated`.
+//! - `palette_mode_info()` (§5.11.25) — not called; when
+//!   `allow_screen_content_tools` is set the encoder can emit
+//!   palette tokens that desync us.
+//! - `use_intrabc` (§5.11.7) — not read when
+//!   `allow_screen_content_tools`.
+//!
+//! Closing this gap requires a rework of `decode_leaf_block` to
+//! match §5.11.5 line-for-line plus generating the missing CDFs
+//! (filter_intra, delta_q, delta_lf, intrabc). Out of scope for
+//! Round 5's 2 h budget — flagged here so a future round can tackle
+//! it as a dedicated pass.
 
 use oxideav_core::{Error, Result};
 
