@@ -110,6 +110,45 @@ fn read_lr_unit_coeffs_for_sb(
     Ok(())
 }
 
+/// Spec §5.11.56 `read_cdef()`. Called per leaf block just after the
+/// `skip` flag is decoded. If the 64×64 luma region enclosing `(x, y)`
+/// has not yet had `cdef_idx` signalled (`-1` sentinel) and CDEF is
+/// active for the frame, consume `cdef_bits` literal bits and stamp
+/// the result over the enclosing 64×64 block.
+fn read_cdef(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    x: u32,
+    y: u32,
+    skip: bool,
+) -> Result<()> {
+    if skip
+        || !td.seq.enable_cdef
+        || td.frame.allow_intrabc
+        || crate::frame_header_tail::coded_lossless_hint(&td.frame.quant)
+    {
+        return Ok(());
+    }
+    let cdef_bits = td.frame.cdef.cdef_bits as u32;
+    let sb_col = x >> 6;
+    let sb_row = y >> 6;
+    if *fs.cdef_idx_mut(x, y) != -1 {
+        return Ok(());
+    }
+    let idx = if cdef_bits == 0 {
+        0
+    } else {
+        td.symbol.read_literal(cdef_bits) as i8
+    };
+    // Stamp across the 64×64 region (single entry per 64×64 in storage).
+    let cols = fs.cdef_sb_cols.max(1) as usize;
+    let rows = fs.cdef_sb_rows.max(1) as usize;
+    let sc = (sb_col as usize).min(cols - 1);
+    let sr = (sb_row as usize).min(rows - 1);
+    fs.cdef_idx[sr * cols + sc] = idx;
+    Ok(())
+}
+
 fn plane_width(fs: &FrameState, plane: usize) -> u32 {
     if plane == 0 {
         fs.width
@@ -318,6 +357,11 @@ pub fn decode_leaf_block(
 
     let skip = td.decode_skip(0)?;
 
+    // Spec §5.11.56 read_cdef(): at the first non-skip block in each
+    // 64×64 luma region, read `cdef_bits` literal bits of cdef_idx and
+    // stamp that value over the entire 64×64 region.
+    read_cdef(td, fs, x, y, skip)?;
+
     let num_planes = td.seq.color_config.num_planes;
     let mut uv_mode = y_mode;
     let mut angle_delta_uv: i8 = 0;
@@ -425,6 +469,8 @@ fn decode_inter_leaf_block(
     bh: u32,
 ) -> Result<()> {
     let info = decode_inter_block_syntax(td, fs, x, y, bw, bh)?;
+    // Spec §5.11.56 read_cdef() — also applies to inter leaves.
+    read_cdef(td, fs, x, y, info.skip)?;
     let w = bw as usize;
     let h = bh as usize;
     let mi_col = x >> 2;

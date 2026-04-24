@@ -101,6 +101,17 @@ pub struct FrameState {
     /// Per-plane restoration unit size in luma-plane samples (or
     /// chroma-plane samples on planes 1/2 if subsampled).
     pub lr_unit_size: [u32; 3],
+
+    /// Per-64×64-luma-SB `cdef_idx`, indexed as
+    /// `cdef_idx[sb_row * cdef_sb_cols + sb_col]`. `-1` means no CDEF
+    /// filtering applied to this SB (spec §5.11.55 / §5.11.56).
+    /// Initialised to `-1` on frame setup; stamped in by the leaf-block
+    /// walker on the first non-skip block in each 64×64 region.
+    pub cdef_idx: Vec<i8>,
+    /// Number of 64×64-SB columns — `(width + 63) >> 6`.
+    pub cdef_sb_cols: u32,
+    /// Number of 64×64-SB rows — `(height + 63) >> 6`.
+    pub cdef_sb_rows: u32,
 }
 
 impl FrameState {
@@ -190,7 +201,34 @@ impl FrameState {
             lr_cols: [0, 0, 0],
             lr_rows: [0, 0, 0],
             lr_unit_size: [0, 0, 0],
+            cdef_idx: {
+                let cols = (width + 63) >> 6;
+                let rows = (height + 63) >> 6;
+                vec![-1i8; (cols as usize) * (rows as usize)]
+            },
+            cdef_sb_cols: (width + 63) >> 6,
+            cdef_sb_rows: (height + 63) >> 6,
         }
+    }
+
+    /// Mutable access to the per-64×64 SB `cdef_idx` entry covering
+    /// the luma-sample `(x, y)`. Out-of-range coords clip to the
+    /// nearest SB.
+    pub fn cdef_idx_mut(&mut self, x: u32, y: u32) -> &mut i8 {
+        let cols = self.cdef_sb_cols.max(1) as usize;
+        let rows = self.cdef_sb_rows.max(1) as usize;
+        let sb_col = ((x >> 6) as usize).min(cols - 1);
+        let sb_row = ((y >> 6) as usize).min(rows - 1);
+        &mut self.cdef_idx[sb_row * cols + sb_col]
+    }
+
+    /// Immutable counterpart of [`Self::cdef_idx_mut`].
+    pub fn cdef_idx_at(&self, sb_col: u32, sb_row: u32) -> i8 {
+        let cols = self.cdef_sb_cols.max(1) as usize;
+        let rows = self.cdef_sb_rows.max(1) as usize;
+        let sb_col = (sb_col as usize).min(cols - 1);
+        let sb_row = (sb_row as usize).min(rows - 1);
+        self.cdef_idx[sb_row * cols + sb_col]
     }
 
     /// Allocate per-plane `lr_unit_info` storage sized for `cols × rows`

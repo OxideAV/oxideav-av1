@@ -18,9 +18,10 @@ pub const DIRECTIONS: [[[i32; 2]; 2]; 8] = [
 /// `div_table` ({0, 840/1, 840/2, ..., 840/8}).
 pub const DIV_TABLE_FIND: [i32; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
 
-/// 8-way direction search on an 8×8 block (libaom `cdef_find_dir_c`).
-/// Returns `(direction, variance_diff)` where the variance diff is
-/// between the chosen direction's cost and its orthogonal sibling.
+/// 8-way direction search on an 8×8 block — spec §7.15.2. Returns
+/// `(direction, var)` where `var = (bestCost - cost[(yDir+4)&7]) >> 10`
+/// per the spec's final step. Downstream driver then uses `var` to
+/// derive `varStr` (§7.15.1 step 4).
 #[allow(clippy::needless_range_loop)]
 pub fn find_direction(src: &[u8], stride: usize, x: usize, y: usize) -> (usize, i32) {
     let mut partial = [[0i32; 15]; 8];
@@ -75,7 +76,7 @@ pub fn find_direction(src: &[u8], stride: usize, x: usize, y: usize) -> (usize, 
         }
     }
     let ortho_cost = cost[dir ^ 4];
-    (dir, best_cost - ortho_cost)
+    (dir, (best_cost - ortho_cost) >> 10)
 }
 
 /// 16-bit counterpart of [`find_direction`]. Centres samples around
@@ -144,7 +145,7 @@ pub fn find_direction16(
         }
     }
     let ortho_cost = cost[dir ^ 4];
-    (dir, best_cost - ortho_cost)
+    (dir, (best_cost - ortho_cost) >> 10)
 }
 
 #[cfg(test)]

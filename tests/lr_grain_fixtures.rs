@@ -93,6 +93,35 @@ fn decode_first_frame(path: &str) -> Option<(Vec<u8>, u32, u32, u64)> {
     Some((fs.y_plane, fs.width, fs.height, sum))
 }
 
+/// The CDEF-active fixture is a 256×256 intra AV1 still encoded via
+/// aomenc with `--enable-cdef=1`. Running it end-to-end exercises the
+/// spec-exact §7.15 per-SB CDEF driver: each 64×64 SB gets its own
+/// `cdef_idx` from the bitstream and the luma direction search + var-
+/// scaled strength adjustment runs per 8×8 block. The test checks the
+/// plane decodes with plausible content (no NaN / saturated output).
+#[test]
+fn cdef_active_fixture_decodes_with_plane_variation() {
+    let Some((y, w, h, sum)) = decode_first_frame("tests/fixtures/cdef_active.ivf") else {
+        return;
+    };
+    assert_eq!((w, h), (256, 256));
+    assert!(!y.is_empty());
+    let area = (w as u64) * (h as u64);
+    let mean = sum / area;
+    // testsrc pattern has ~mid-grey luma mean; after CDEF the value
+    // should remain well within 8-bit bounds and not collapse.
+    assert!(mean > 30 && mean < 220, "unexpected mean luma {mean}");
+    let distinct = y
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct > 16,
+        "CDEF-filtered plane too flat: {distinct} distinct samples"
+    );
+}
+
 /// The LR-active fixture should decode to non-trivial plane content.
 /// Mean luma after full pipeline (including LR) should land in a
 /// reasonable range (test-src pattern has mean ~ 128 with deblock +

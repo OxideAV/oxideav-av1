@@ -216,104 +216,163 @@ fn apply_deblocking(frame: &FrameHeader, fs: &mut FrameState) {
 }
 
 fn apply_cdef(frame: &FrameHeader, fs: &mut FrameState) {
-    use crate::cdef::{apply_frame, apply_frame16, Plane as CdefPlane, Plane16 as CdefPlane16};
+    use crate::cdef::{
+        apply_frame_spec, apply_frame_spec16, Plane as CdefPlane, Plane16 as CdefPlane16,
+        SbStrengths,
+    };
     let params = &frame.cdef;
-    // For a single-index (1-entry) CDEF, use cdef_idx=0. A spec-exact
-    // per-SB route lands with the mode-info tracking in the inter
-    // decoder; until then, if the bitstream encodes a single-strength
-    // entry we apply it uniformly, otherwise we skip.
-    if params.cdef_bits == 0 {
-        let pri_y = params.y_pri_strengths[0] as i32;
-        let sec_y = params.y_sec_strengths[0] as i32;
-        let pri_uv = params.uv_pri_strengths[0] as i32;
-        let sec_uv = params.uv_sec_strengths[0] as i32;
-        let damping = (params.cdef_damping_minus3 as i32) + 3;
-        if pri_y != 0 || sec_y != 0 {
-            if fs.bit_depth == 8 {
-                let width = fs.width as usize;
-                let height = fs.height as usize;
-                apply_frame(
-                    CdefPlane {
-                        pix: &mut fs.y_plane,
-                        stride: width,
-                        width,
-                        height,
-                    },
-                    pri_y,
-                    sec_y,
-                    damping,
-                );
-            } else {
-                let width = fs.width as usize;
-                let height = fs.height as usize;
-                apply_frame16(
-                    CdefPlane16 {
-                        pix: &mut fs.y_plane16,
-                        stride: width,
-                        width,
-                        height,
-                    },
-                    pri_y,
-                    sec_y,
-                    damping,
-                    fs.bit_depth,
-                );
-            }
+    // The spec (§7.15) dispatches CDEF per 64×64 luma SB using the
+    // per-SB `cdef_idx` stamped in by the leaf-block walker. Any SB
+    // whose `cdef_idx` is still `-1` (skip-block SBs, lossless, intrabc
+    // path, or disabled) is passed through unchanged.
+    let damping_base = (params.cdef_damping_minus3 as i32) + 3;
+    let cdef_idx = fs.cdef_idx.clone();
+    let cdef_cols = fs.cdef_sb_cols as usize;
+    let strengths = move |sb_col: usize, sb_row: usize| -> Option<SbStrengths> {
+        let row = sb_row.min((fs_cdef_rows(cdef_idx.len(), cdef_cols)).saturating_sub(1));
+        let col = sb_col.min(cdef_cols.saturating_sub(1));
+        let idx = cdef_idx.get(row * cdef_cols + col).copied().unwrap_or(-1);
+        if idx < 0 {
+            return None;
         }
-        if !fs.monochrome && (pri_uv != 0 || sec_uv != 0) {
-            let uvw = fs.uv_width as usize;
-            let uvh = fs.uv_height as usize;
-            let damp_uv = damping - 1;
-            if fs.bit_depth == 8 {
-                apply_frame(
-                    CdefPlane {
-                        pix: &mut fs.u_plane,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    pri_uv,
-                    sec_uv,
-                    damp_uv,
-                );
-                apply_frame(
-                    CdefPlane {
-                        pix: &mut fs.v_plane,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    pri_uv,
-                    sec_uv,
-                    damp_uv,
-                );
-            } else {
-                apply_frame16(
-                    CdefPlane16 {
-                        pix: &mut fs.u_plane16,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    pri_uv,
-                    sec_uv,
-                    damp_uv,
-                    fs.bit_depth,
-                );
-                apply_frame16(
-                    CdefPlane16 {
-                        pix: &mut fs.v_plane16,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    pri_uv,
-                    sec_uv,
-                    damp_uv,
-                    fs.bit_depth,
-                );
-            }
+        let i = (idx as usize) & 0x7;
+        Some(SbStrengths {
+            pri_y: params.y_pri_strengths[i] as i32,
+            sec_y: params.y_sec_strengths[i] as i32,
+            pri_uv: params.uv_pri_strengths[i] as i32,
+            sec_uv: params.uv_sec_strengths[i] as i32,
+            damping: damping_base,
+        })
+    };
+
+    let sb_size_luma = 64usize; // §7.15 uses 64×64 CDEF blocks regardless of SB_128 mode.
+    let width = fs.width as usize;
+    let height = fs.height as usize;
+    let uvw = fs.uv_width as usize;
+    let uvh = fs.uv_height as usize;
+    let sub_x = fs.sub_x;
+    let sub_y = fs.sub_y;
+    let bit_depth = fs.bit_depth;
+    let mut dir_table = Vec::new();
+    let sb_cols = (width + 63) >> 6;
+    let sb_rows = (height + 63) >> 6;
+
+    if bit_depth == 8 {
+        apply_frame_spec(
+            CdefPlane {
+                pix: &mut fs.y_plane,
+                stride: width,
+                width,
+                height,
+            },
+            0,
+            0,
+            0,
+            sb_size_luma,
+            &mut dir_table,
+            sb_cols,
+            sb_rows,
+            0,
+            &strengths,
+        );
+        if !fs.monochrome {
+            apply_frame_spec(
+                CdefPlane {
+                    pix: &mut fs.u_plane,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                },
+                1,
+                sub_x,
+                sub_y,
+                sb_size_luma,
+                &mut dir_table,
+                sb_cols,
+                sb_rows,
+                0,
+                &strengths,
+            );
+            apply_frame_spec(
+                CdefPlane {
+                    pix: &mut fs.v_plane,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                },
+                2,
+                sub_x,
+                sub_y,
+                sb_size_luma,
+                &mut dir_table,
+                sb_cols,
+                sb_rows,
+                0,
+                &strengths,
+            );
         }
+    } else {
+        apply_frame_spec16(
+            CdefPlane16 {
+                pix: &mut fs.y_plane16,
+                stride: width,
+                width,
+                height,
+            },
+            0,
+            0,
+            0,
+            sb_size_luma,
+            &mut dir_table,
+            sb_cols,
+            sb_rows,
+            bit_depth,
+            &strengths,
+        );
+        if !fs.monochrome {
+            apply_frame_spec16(
+                CdefPlane16 {
+                    pix: &mut fs.u_plane16,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                },
+                1,
+                sub_x,
+                sub_y,
+                sb_size_luma,
+                &mut dir_table,
+                sb_cols,
+                sb_rows,
+                bit_depth,
+                &strengths,
+            );
+            apply_frame_spec16(
+                CdefPlane16 {
+                    pix: &mut fs.v_plane16,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                },
+                2,
+                sub_x,
+                sub_y,
+                sb_size_luma,
+                &mut dir_table,
+                sb_cols,
+                sb_rows,
+                bit_depth,
+                &strengths,
+            );
+        }
+    }
+}
+
+fn fs_cdef_rows(total: usize, cols: usize) -> usize {
+    if cols == 0 {
+        0
+    } else {
+        total / cols
     }
 }
 

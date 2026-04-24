@@ -317,6 +317,9 @@ fn clone_frame_state(fs: &FrameState) -> FrameState {
         lr_cols: fs.lr_cols,
         lr_rows: fs.lr_rows,
         lr_unit_size: fs.lr_unit_size,
+        cdef_idx: fs.cdef_idx.clone(),
+        cdef_sb_cols: fs.cdef_sb_cols,
+        cdef_sb_rows: fs.cdef_sb_rows,
     }
 }
 
