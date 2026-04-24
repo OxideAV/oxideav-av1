@@ -5,40 +5,47 @@
 //! 3 smooth + Paeth + CFL) and native 10/12-bit HBD paths; the
 //! pre-Phase-5 DC_PRED fallback is gone.
 //!
-//! # Round 6 status
+//! # Round 7 status
 //!
-//! Round 6 landed the two biggest desync fixes flagged by Round 5:
+//! Round 7 layered the remaining small syntax items on top of Round 6's
+//! `read_block_tx_size()` + `read_skip()` ordering fixes:
 //!
-//! - **`read_block_tx_size()` (§5.11.16)** — now wired. For
-//!   `TxMode == TX_MODE_SELECT` on `MiSize > 4×4` intra blocks the
-//!   decoder reads the `tx_depth` symbol via
-//!   [`tile::TileDecoder::decode_tx_depth`] and stores the resulting
-//!   `TxSize` on the MI grid, so downstream blocks can derive the
-//!   `(aboveW >= maxTxWidth) + (leftH >= maxTxHeight)` context (spec
-//!   §9.4.8). `reconstruct_luma_block` now walks TX units sized to
-//!   the decoded `TxSize` — not the block footprint — matching
-//!   §5.11.34 `residual()`.
-//! - **`read_skip()` ordering** — spec §5.11.7
-//!   `intra_frame_mode_info()` reads `skip → segment → cdef → mode`;
-//!   our decoder now matches that order (previously read skip after
-//!   the mode/angle_delta symbols, which shifted the whole symbol
-//!   stream).
+//! - **`read_delta_qindex()` (§5.11.12)** + **`read_delta_lf()`
+//!   (§5.11.13)** — now called per leaf block with the spec-mandated
+//!   `MiSize == sbSize && skip` short-circuit and the
+//!   `delta_q_present` / `delta_lf_present` + `delta_lf_multi`
+//!   gating. Bits are consumed but not yet applied to `CurrentQIndex`
+//!   / `DeltaLF[i]` (tracker is pending — trivial when any real-world
+//!   clip enables `--deltaq-mode=1`). Fixtures that keep both flags at
+//!   zero (all the current `aomenc` / `avifenc` presets) are bit-
+//!   identical.
+//! - **`use_intrabc` (§5.11.7)** — now read when `allow_intrabc`. A
+//!   `true` value surfaces `Error::Unsupported` because the IntraBC
+//!   motion path (§7.11.3.2) isn't wired yet, but the symbol is
+//!   consumed in either case so downstream syntax stays aligned.
+//! - **`filter_intra_mode_info()` (§5.11.24)** — the two CDFs are
+//!   added as hand-transcribed tables in [`crate::cdfs::extra`] (the
+//!   generator doesn't emit them) and are consulted on the spec's
+//!   eligible DC-PRED-on-≤32×32 blocks. Pixel-level application of
+//!   the recursive filter-intra predictor (§7.11.2.3) is deferred:
+//!   the mode is stored on the MI grid so a later round can use it
+//!   without re-reading the bitstream.
 //!
-//! # Remaining syntax-level gaps (Round 7+)
+//! # Remaining syntax-level gaps (Round 8+)
 //!
-//! - `read_delta_qindex()` + `read_delta_lf()` — never called. Per
-//!   §5.11.11/§5.11.12 these only fire when `delta_q_present` / the
-//!   corresponding LF flag are set, so AVIF stills tend to skip them
-//!   anyway, but any encoder that does enable per-SB deltas desyncs.
-//! - `use_intrabc` (§5.11.7) — not read when `allow_intrabc`.
-//! - `filter_intra_mode_info()` (§5.11.24) — never called. CDF still
-//!   absent from `cdfs::generated`.
 //! - `palette_mode_info()` (§5.11.25) — not called; palette tokens
-//!   still desync the stream when `allow_screen_content_tools` is
-//!   set.
+//!   still desync the stream when `allow_screen_content_tools` is set
+//!   and a block is ≥ 8×8 and ≤ 64×64.
+//! - Per-block `CurrentQIndex` / `DeltaLF[]` tracker — we read the
+//!   bits but don't yet apply them, so fixtures that actually enable
+//!   per-SB QP deltas will reconstruct with the frame-level Q.
+//! - Filter-intra prediction (§7.11.2.3) — CDF consumed, predictor
+//!   still routes through DC_PRED.
+//! - Var-tx inter path (`read_var_tx_size`) — still not wired; inter
+//!   blocks with sub-block TX splits fall back to the block footprint.
 //! - Inter path (`decode_inter_leaf_block`) still reads `skip` after
 //!   `y_mode` for intra-within-inter blocks — §5.11.23 sequencing
-//!   applies there too but is out of the Round 6 scope.
+//!   applies there too but is out of Round 7 scope.
 
 use oxideav_core::{Error, Result};
 
@@ -87,6 +94,11 @@ pub fn decode_superblock(
     } else {
         BlockSize::Block64x64
     };
+    // Spec §5.11.4 top-of-SB: `ReadDeltas = delta_q_present`. The
+    // per-leaf `intra_frame_mode_info()` / `inter_frame_mode_info()`
+    // clears it back to `false` once a non-degenerate block has
+    // consumed the delta symbols.
+    td.read_deltas = td.frame.delta_q_present;
     read_lr_unit_coeffs_for_sb(td, fs, sb_x, sb_y)?;
     decode_partition_node(td, fs, sb_x, sb_y, sb_bs)
 }
@@ -384,14 +396,15 @@ pub fn decode_leaf_block(
     //   2. read_skip
     //   3. intra_segment_id  (if !SegIdPreSkip)
     //   4. read_cdef
-    //   5. (skipped for now: read_delta_qindex, read_delta_lf,
-    //       use_intrabc — see round-5 decode_leaf_block notes)
-    //   6. intra_frame_y_mode + intra_angle_info_y
-    //   7. uv_mode + intra_angle_info_uv + read_cfl_alphas
-    //   8. (skipped for now: palette_mode_info, filter_intra_mode_info)
+    //   5. read_delta_qindex  (gated on ReadDeltas=delta_q_present)
+    //   6. read_delta_lf      (gated on delta_lf_present)
+    //   7. use_intrabc        (only when allow_intrabc)
+    //   8. intra_frame_y_mode + intra_angle_info_y
+    //   9. uv_mode + intra_angle_info_uv + read_cfl_alphas
+    //  10. palette_mode_info()  (still skipped — Round 8+)
+    //  11. filter_intra_mode_info()
     // Then §5.11.5 `decode_block()` calls `read_block_tx_size()` to
-    // pull the TX_SIZE symbol — this is what Round 5 diagnosed as the
-    // single biggest desync driver.
+    // pull the TX_SIZE symbol.
 
     let seg_enabled = td.frame.segmentation.enabled && td.frame.segmentation.update_map;
     let seg_pre_skip = td.frame.segmentation.seg_id_pre_skip;
@@ -412,6 +425,29 @@ pub fn decode_leaf_block(
     // 64×64 luma region, read `cdef_bits` literal bits of cdef_idx and
     // stamp that value over the entire 64×64 region.
     read_cdef(td, fs, x, y, skip)?;
+
+    // Spec §5.11.12/§5.11.13 — per-block delta Q / LF. Both reads are
+    // no-ops when the corresponding frame-level flag is off (which is
+    // the common case for AVIF / low-CPU `aomenc` output), but we must
+    // still perform the `MiSize == sbSize && skip` guard from the spec.
+    // `ReadDeltas` is cleared right after the LF delta read so later
+    // blocks in the same SB don't re-consume the symbols.
+    read_delta_qindex_for_block(td, bs, skip)?;
+    read_delta_lf_for_block(td, bs, skip)?;
+    td.read_deltas = false;
+
+    // Spec §5.11.7 — `use_intrabc` fires only for intra frames that
+    // opted into screen-content tools. Until the IntraBC motion path
+    // is implemented (§7.11.3 / §7.9.1) we surface an
+    // `Error::Unsupported` rather than try to reconstruct the block.
+    if td.frame.allow_intrabc {
+        let use_intrabc = td.decode_use_intrabc()?;
+        if use_intrabc {
+            return Err(Error::unsupported(
+                "av1 intra-block-copy (§5.11.7 use_intrabc) pending",
+            ));
+        }
+    }
 
     let y_mode = td.decode_intra_y_mode(mode_ctx_bucket(above_mode), mode_ctx_bucket(left_mode))?;
     let angle_delta_y = if y_mode.is_directional() {
@@ -451,6 +487,13 @@ pub fn decode_leaf_block(
         }
     }
 
+    // Spec §5.11.24 `filter_intra_mode_info()` — gated on
+    // `enable_filter_intra && YMode == DC_PRED && PaletteSizeY == 0 &&
+    // max(block_w, block_h) <= 32`. Our palette path isn't decoded
+    // yet so `PaletteSizeY` is structurally 0 here.
+    let (use_filter_intra, filter_intra_mode) =
+        read_filter_intra_mode_info(td, bs, y_mode, bw, bh)?;
+
     // Spec §5.11.5 `decode_block()` line "read_block_tx_size()".
     // For intra frames the `is_inter` branch of §5.11.16 collapses to
     // `read_tx_size(!skip || !is_inter)` = `read_tx_size(true)`; see
@@ -480,6 +523,8 @@ pub fn decode_leaf_block(
             mi.cfl_alpha_v = cfl_alpha_v;
             mi.tx_size = Some(tx_size);
             mi.mi_size_idx = mi_size_idx;
+            mi.use_filter_intra = use_filter_intra;
+            mi.filter_intra_mode = filter_intra_mode;
         }
     }
 
@@ -616,6 +661,111 @@ fn tx_depth_ctx(fs: &FrameState, mi_col: u32, mi_row: u32, max_rect_tx_size: TxS
     let a = if above_w >= max_tx_w { 1 } else { 0 };
     let l = if left_h >= max_tx_h { 1 } else { 0 };
     a + l
+}
+
+/// Spec §5.11.12 `read_delta_qindex()` — tile-level wrapper that
+/// honours the `MiSize == sbSize && skip` short-circuit and the
+/// `ReadDeltas` guard (itself set to `delta_q_present` at SB top,
+/// cleared after the first block). Intentionally drops the decoded
+/// magnitude: Round 7 just needs the bits consumed so the range-coder
+/// stays aligned. A full implementation will feed the delta into a
+/// per-SB `CurrentQIndex` tracker (§5.11.5 `decode_block` step
+/// "CurrentQIndex = …"). Returns `Ok(())` in all cases.
+fn read_delta_qindex_for_block(td: &mut TileDecoder<'_>, bs: BlockSize, skip: bool) -> Result<()> {
+    if !td.frame.delta_q_present {
+        return Ok(());
+    }
+    let sb_bs = if td.seq.use_128x128_superblock {
+        BlockSize::Block128x128
+    } else {
+        BlockSize::Block64x64
+    };
+    if bs == sb_bs && skip {
+        return Ok(());
+    }
+    if !td.read_deltas {
+        return Ok(());
+    }
+    // Read — we don't currently track per-SB Q deltas, but bits must
+    // still be consumed when the frame enabled them.
+    let _ = td.decode_delta_qindex()?;
+    Ok(())
+}
+
+/// Spec §5.11.13 `read_delta_lf()` — mirrors
+/// [`read_delta_qindex_for_block`] but honours the `delta_lf_multi`
+/// flag (which selects between 1 and `FRAME_LF_COUNT` symbols). Note
+/// that `read_delta_lf()`'s outer guard is `ReadDeltas` — not
+/// `delta_lf_present` — and `ReadDeltas` gets cleared right after
+/// the two delta calls per §5.11.7, so this fires at most once per
+/// SB regardless of `delta_lf_present`.
+fn read_delta_lf_for_block(td: &mut TileDecoder<'_>, bs: BlockSize, skip: bool) -> Result<()> {
+    if !td.frame.delta_q_present {
+        // ReadDeltas is derived from delta_q_present, so when that
+        // flag is 0 neither `read_delta_qindex` nor `read_delta_lf`
+        // ever consumes bits.
+        return Ok(());
+    }
+    let sb_bs = if td.seq.use_128x128_superblock {
+        BlockSize::Block128x128
+    } else {
+        BlockSize::Block64x64
+    };
+    if bs == sb_bs && skip {
+        return Ok(());
+    }
+    if !td.read_deltas {
+        return Ok(());
+    }
+    if !td.frame.delta_lf_present {
+        return Ok(());
+    }
+    let num_planes = td.seq.color_config.num_planes;
+    let lf_count = if td.frame.delta_lf_multi {
+        if num_planes > 1 {
+            super::tile::FRAME_LF_COUNT
+        } else {
+            super::tile::FRAME_LF_COUNT - 2
+        }
+    } else {
+        1
+    };
+    for i in 0..lf_count {
+        let _ = td.decode_delta_lf_abs(i)?;
+    }
+    Ok(())
+}
+
+/// Spec §5.11.24 `filter_intra_mode_info()`. Returns
+/// `(use_filter_intra, filter_intra_mode)`; both zero when the
+/// block is ineligible or the encoder declined filter-intra. Per the
+/// spec the read fires only when:
+///   - `enable_filter_intra` (sequence header)
+///   - `YMode == DC_PRED`
+///   - `PaletteSizeY == 0` (palette path not decoded — always true
+///     here until Round 8)
+///   - `max(Block_Width, Block_Height) <= 32`
+fn read_filter_intra_mode_info(
+    td: &mut TileDecoder<'_>,
+    bs: BlockSize,
+    y_mode: IntraMode,
+    bw: u32,
+    bh: u32,
+) -> Result<(bool, u8)> {
+    if !td.seq.enable_filter_intra || y_mode != IntraMode::DcPred || bw.max(bh) > 32 {
+        return Ok((false, 0));
+    }
+    let bs_idx = bs as usize;
+    let use_fi = td.decode_use_filter_intra(bs_idx)?;
+    if !use_fi {
+        return Ok((false, 0));
+    }
+    let mode_raw = td.decode_filter_intra_mode()?;
+    // The CDF emits 5 symbols (FILTER_DC_PRED..FILTER_PAETH_PRED).
+    // Clamp defensively so an out-of-range value doesn't propagate
+    // into the predictor tables.
+    let mode = mode_raw.min(4) as u8;
+    Ok((true, mode))
 }
 
 /// Inter-frame leaf decode — reads block-level inter syntax, runs MC

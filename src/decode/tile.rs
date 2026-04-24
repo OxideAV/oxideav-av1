@@ -36,6 +36,24 @@ use crate::transform::TxType;
 
 use std::sync::Arc;
 
+/// §9.4.1 `FRAME_LF_COUNT` — the number of per-frame loop-filter
+/// strength values. Used to size the delta-lf-multi CDF / state
+/// arrays. Matches the spec's constants table.
+pub const FRAME_LF_COUNT: usize = 4;
+
+/// §9.4.1 `DELTA_Q_SMALL` — symbol value that indicates the
+/// alternative literal-bits encoding of `delta_q_abs`. Shared with
+/// `DELTA_LF_SMALL` per the spec.
+pub const DELTA_Q_SMALL: u32 = 3;
+
+/// §9.4.1 `DELTA_LF_SMALL` — mirrors [`DELTA_Q_SMALL`] for the LF
+/// delta symbol.
+pub const DELTA_LF_SMALL: u32 = 3;
+
+/// §9.4.1 `MAX_LOOP_FILTER` — saturation bound for the clipped LF
+/// delta accumulator. Value is 63 per the spec constants table.
+pub const MAX_LOOP_FILTER: i32 = 63;
+
 /// Top-level entry point: walk every tile in a tile-group payload,
 /// running [`TileDecoder::decode`] on each. The underlying frame
 /// state is mutated in place.
@@ -604,6 +622,18 @@ pub struct TileDecoder<'a> {
     /// Used by blocks whose area ≤ 32×32. Blocks larger than 32×32 use
     /// implicit DCT_DCT.
     pub intra_ext_tx_cdf_set2: Vec<Vec<Vec<u16>>>,
+    /// `delta_q_abs` CDF — §5.11.12. Single 4-symbol CDF, no context.
+    pub delta_q_cdf: Vec<u16>,
+    /// `delta_lf_abs` CDF — §5.11.13. In multi mode the decoder needs
+    /// one CDF per LF frame index, so we keep `FRAME_LF_COUNT` copies.
+    pub delta_lf_cdf: Vec<Vec<u16>>,
+    /// `use_intrabc` CDF — §5.11.7. 2-symbol.
+    pub intrabc_cdf: Vec<u16>,
+    /// `use_filter_intra` CDF — §5.11.24, indexed by `MiSize` (22
+    /// block sizes). 2-symbol per size.
+    pub use_filter_intra_cdf: Vec<Vec<u16>>,
+    /// `filter_intra_mode` CDF — §5.11.24, 5-symbol.
+    pub filter_intra_mode_cdf: Vec<u16>,
     /// Coefficient-CDF bank — all of §5.11.39's CDFs in one place.
     pub coeff_bank: CoeffCdfBank,
     /// §5.11.40-.44 Loop-Restoration per-unit CDFs.
@@ -618,6 +648,12 @@ pub struct TileDecoder<'a> {
     /// supplies the LAST ref for single-reference translational inter
     /// blocks. `None` on key frames.
     pub prev_frame: Option<Arc<FrameState>>,
+    /// Spec §5.11.5 `ReadDeltas`. Set to `delta_q_present` at the start
+    /// of each superblock (§5.11.4 top-of-SB hook) and cleared by the
+    /// first block's `intra_frame_mode_info()` / `inter_frame_mode_info()`
+    /// call once it has consumed the delta symbols. Held on the tile
+    /// decoder so individual leaf calls can inspect / clear it.
+    pub read_deltas: bool,
 }
 
 impl<'a> TileDecoder<'a> {
@@ -658,6 +694,11 @@ impl<'a> TileDecoder<'a> {
             seg_cdf: Vec::new(),
             intra_ext_tx_cdf_set1: Vec::new(),
             intra_ext_tx_cdf_set2: Vec::new(),
+            delta_q_cdf: Vec::new(),
+            delta_lf_cdf: Vec::new(),
+            intrabc_cdf: Vec::new(),
+            use_filter_intra_cdf: Vec::new(),
+            filter_intra_mode_cdf: Vec::new(),
             coeff_bank,
             switchable_restore_cdf: default_switchable_cdf(),
             wiener_restore_cdf: default_wiener_cdf(),
@@ -665,6 +706,7 @@ impl<'a> TileDecoder<'a> {
             lr_ref: [LrRef::default(); 3],
             inter,
             prev_frame,
+            read_deltas: false,
         };
         td.init_cdfs();
         Ok(td)
@@ -733,6 +775,19 @@ impl<'a> TileDecoder<'a> {
             .iter()
             .map(|row| row.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
             .collect();
+        self.delta_q_cdf = cdfs::DEFAULT_DELTA_Q_CDF.to_vec();
+        // Spec §5.11.13 / §9.4.1: `FRAME_LF_COUNT == 4` copies in the
+        // multi path. We allocate them unconditionally; the decoder
+        // skips reads when `delta_lf_multi` is cleared.
+        self.delta_lf_cdf = (0..FRAME_LF_COUNT)
+            .map(|_| cdfs::DEFAULT_DELTA_LF_CDF.to_vec())
+            .collect();
+        self.intrabc_cdf = cdfs::DEFAULT_INTRABC_CDF.to_vec();
+        self.use_filter_intra_cdf = cdfs::DEFAULT_USE_FILTER_INTRA_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.filter_intra_mode_cdf = cdfs::DEFAULT_FILTER_INTRA_MODE_CDF.to_vec();
     }
 
     /// Walk the tile's superblock grid and decode every MI unit's
@@ -910,6 +965,78 @@ impl<'a> TileDecoder<'a> {
             _ => 0,
         };
         Ok(intra_tx_type_for(tx_set, raw))
+    }
+
+    /// §5.11.12 `read_delta_qindex()` — reads the `delta_q_abs`
+    /// symbol, then optionally a literal-bits tail + sign bit. Returns
+    /// the decoded `reducedDeltaQIndex` (before multiplying by
+    /// `1 << delta_q_res`); callers apply the shift when updating
+    /// `CurrentQIndex`.
+    ///
+    /// Caller MUST gate this on the spec's `ReadDeltas` predicate
+    /// (i.e. `delta_q_present` for the frame, and the block is not the
+    /// whole-SB skip degenerate case — see §5.11.12).
+    pub fn decode_delta_qindex(&mut self) -> Result<i32> {
+        let mut delta_q_abs = self.symbol.decode_symbol(&mut self.delta_q_cdf)?;
+        if delta_q_abs == DELTA_Q_SMALL {
+            let delta_q_rem_bits = self.symbol.read_literal(3) + 1;
+            let delta_q_abs_bits = self.symbol.read_literal(delta_q_rem_bits);
+            delta_q_abs = delta_q_abs_bits + (1 << delta_q_rem_bits) + 1;
+        }
+        if delta_q_abs != 0 {
+            let sign = self.symbol.read_literal(1);
+            let v = delta_q_abs as i32;
+            Ok(if sign != 0 { -v } else { v })
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// §5.11.13 `read_delta_lf()` — decodes a single `delta_lf_abs`
+    /// (+ optional literal tail + sign) for LF frame-index `lf_idx`.
+    /// The caller is responsible for honouring `delta_lf_multi` and
+    /// the `MiSize == sbSize && skip` short-circuit.
+    pub fn decode_delta_lf_abs(&mut self, lf_idx: usize) -> Result<i32> {
+        let lf_idx = lf_idx.min(FRAME_LF_COUNT - 1);
+        let mut delta_lf_abs = self.symbol.decode_symbol(&mut self.delta_lf_cdf[lf_idx])?;
+        if delta_lf_abs == DELTA_LF_SMALL {
+            let n = self.symbol.read_literal(3) + 1;
+            let bits = self.symbol.read_literal(n);
+            delta_lf_abs = bits + (1 << n) + 1;
+        }
+        if delta_lf_abs != 0 {
+            let sign = self.symbol.read_literal(1);
+            let v = delta_lf_abs as i32;
+            Ok(if sign != 0 { -v } else { v })
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// §5.11.7 `use_intrabc` — 2-symbol flag read only when
+    /// `allow_intrabc` is true for the frame. Returns `true` when the
+    /// block uses intra block-copy.
+    pub fn decode_use_intrabc(&mut self) -> Result<bool> {
+        let raw = self.symbol.decode_symbol(&mut self.intrabc_cdf)?;
+        Ok(raw != 0)
+    }
+
+    /// §5.11.24 `use_filter_intra` — 2-symbol flag, indexed by
+    /// `MiSize`. Caller must have already checked the eligibility
+    /// predicate (enable_filter_intra && YMode==DC_PRED && PaletteSizeY
+    /// == 0 && max(bw,bh) <= 32).
+    pub fn decode_use_filter_intra(&mut self, bs_idx: usize) -> Result<bool> {
+        let bs_idx = bs_idx.min(self.use_filter_intra_cdf.len() - 1);
+        let raw = self
+            .symbol
+            .decode_symbol(&mut self.use_filter_intra_cdf[bs_idx])?;
+        Ok(raw != 0)
+    }
+
+    /// §5.11.24 `filter_intra_mode` — 5-symbol CDF. Only read when
+    /// [`Self::decode_use_filter_intra`] returned true.
+    pub fn decode_filter_intra_mode(&mut self) -> Result<u32> {
+        self.symbol.decode_symbol(&mut self.filter_intra_mode_cdf)
     }
 }
 

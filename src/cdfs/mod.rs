@@ -20,9 +20,14 @@
 //! part of the auto-generated set because the generator doesn't cover
 //! per-unit LR signalling.
 
+mod extra;
 mod generated;
 mod lr;
 
+pub use extra::{
+    DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF, DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTRABC_CDF,
+    DEFAULT_USE_FILTER_INTRA_CDF,
+};
 pub use generated::*;
 pub use lr::{
     DEFAULT_SGRPROJ_RESTORE_CDF, DEFAULT_SWITCHABLE_RESTORE_CDF, DEFAULT_WIENER_RESTORE_CDF,

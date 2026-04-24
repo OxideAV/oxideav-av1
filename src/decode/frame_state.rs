@@ -58,6 +58,14 @@ pub struct ModeInfo {
     /// Per-MI block size (spec `MiSizes[row][col]`), also needed for
     /// `tx_depth`'s inter-block context derivation.
     pub mi_size_idx: u8,
+    /// Spec §5.11.24 `use_filter_intra` — `true` when the recursive
+    /// filter-intra path (§7.11.2.3) is in play. Only meaningful on
+    /// intra blocks predicted with `DC_PRED` on sizes ≤ 32×32.
+    pub use_filter_intra: bool,
+    /// Spec §5.11.24 `filter_intra_mode`. One of 0..=4
+    /// (`FILTER_DC_PRED..FILTER_PAETH_PRED`). Unused when
+    /// `use_filter_intra` is `false`.
+    pub filter_intra_mode: u8,
 }
 
 /// Mutable per-frame decoder state.
