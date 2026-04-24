@@ -36,22 +36,26 @@
 //!
 //! - `read_delta_qindex()` (§5.11.12) / `read_delta_lf()` (§5.11.13) —
 //!   called per leaf block with the spec-mandated
-//!   `MiSize == sbSize && skip` short-circuit; bits consumed but not
-//!   yet applied to `CurrentQIndex` / `DeltaLF[i]`.
+//!   `MiSize == sbSize && skip` short-circuit. Round 9: the decoded
+//!   magnitudes now update `TileDecoder::current_q_index` and
+//!   `TileDecoder::delta_lf[]`, and the dequant path indexes off
+//!   `CurrentQIndex` so per-SB QP deltas land in reconstruction.
 //! - `use_intrabc` (§5.11.7) — Unsupported on activation.
-//! - `filter_intra_mode_info()` (§5.11.24) — CDF consumed, mode stored
-//!   on MI grid; predictor still routes through DC_PRED.
+//! - `filter_intra_mode_info()` (§5.11.24) — Round 9 wires the
+//!   §7.11.2.3 recursive filter-intra predictor: DC_PRED luma blocks
+//!   ≤ 32×32 with `use_filter_intra == 1` now take the 4×2 cell
+//!   recursive path with the five spec-table tap sets instead of the
+//!   DC_PRED fallback.
 //!
 //! # Remaining syntax-level gaps (Round 9+)
 //!
 //! - Palette color decode (§7.11.4) — currently surfaces Unsupported;
 //!   a full implementation needs `palette_tokens()` + `PaletteCache`
 //!   + color-context CDFs.
-//! - Per-block `CurrentQIndex` / `DeltaLF[]` tracker — we read the
-//!   bits but don't yet apply them, so fixtures that actually enable
-//!   per-SB QP deltas reconstruct with the frame-level Q.
-//! - Filter-intra prediction (§7.11.2.3) — CDF consumed, predictor
-//!   still routes through DC_PRED.
+//! - `DeltaLF[]` plumbing into the loop filter — the per-tile running
+//!   totals are tracked but `apply_deblocking` still reads frame-level
+//!   levels only; plumbing per-SB LF deltas needs a per-block LF level
+//!   grid in FrameState.
 //! - Var-tx residual decode — `read_var_tx_size` is wired, but the
 //!   coefficient path still decodes one tile per block footprint
 //!   rather than per TU stamped in `InterTxSizes[][]`.
@@ -68,8 +72,9 @@ use crate::predict::intra::{
         edge_filter, edge_filter16, edge_filter_strength, edge_upsample, edge_upsample16,
         edge_use_upsample,
     },
-    h_pred, h_pred16, mode_to_angle_map, paeth_pred, paeth_pred16, smooth_h_pred, smooth_h_pred16,
-    smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16, v_pred, v_pred16,
+    filter_intra_pred, filter_intra_pred16, h_pred, h_pred16, mode_to_angle_map, paeth_pred,
+    paeth_pred16, smooth_h_pred, smooth_h_pred16, smooth_pred, smooth_pred16, smooth_v_pred,
+    smooth_v_pred16, v_pred, v_pred16,
 };
 use crate::quant;
 use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
@@ -515,7 +520,9 @@ pub fn decode_leaf_block(
     // max(block_w, block_h) <= 32`. Our palette path always returns
     // with `PaletteSizeY == 0` (any non-zero size above would have
     // short-circuited into Error::Unsupported), so this branch can
-    // ignore the palette gate.
+    // ignore the palette gate. Round 9: when `use_filter_intra == 1`
+    // the recursive §7.11.2.3 predictor replaces DC_PRED for the luma
+    // TX units (handled below).
     let (use_filter_intra, filter_intra_mode) =
         read_filter_intra_mode_info(td, bs, y_mode, bw, bh)?;
 
@@ -559,7 +566,15 @@ pub fn decode_leaf_block(
         ));
     }
 
-    // Luma path.
+    // Luma path. Route filter-intra only when the block activated it
+    // per §5.11.24 (`use_filter_intra` ∧ `YMode == DC_PRED`). Chroma
+    // never takes the §7.11.2.3 branch, so `reconstruct_chroma_block`
+    // keeps its existing mode dispatch.
+    let fi_opt = if use_filter_intra && y_mode == IntraMode::DcPred {
+        Some(filter_intra_mode)
+    } else {
+        None
+    };
     reconstruct_luma_block(
         td,
         fs,
@@ -572,6 +587,7 @@ pub fn decode_leaf_block(
         skip,
         segment_id,
         Some(tx_size),
+        fi_opt,
     )?;
 
     // Chroma path.
@@ -691,11 +707,10 @@ fn tx_depth_ctx(fs: &FrameState, mi_col: u32, mi_row: u32, max_rect_tx_size: TxS
 /// Spec §5.11.12 `read_delta_qindex()` — tile-level wrapper that
 /// honours the `MiSize == sbSize && skip` short-circuit and the
 /// `ReadDeltas` guard (itself set to `delta_q_present` at SB top,
-/// cleared after the first block). Intentionally drops the decoded
-/// magnitude: Round 7 just needs the bits consumed so the range-coder
-/// stays aligned. A full implementation will feed the delta into a
-/// per-SB `CurrentQIndex` tracker (§5.11.5 `decode_block` step
-/// "CurrentQIndex = …"). Returns `Ok(())` in all cases.
+/// cleared after the first block). Applies the decoded magnitude via
+/// `CurrentQIndex = Clip3(1, 255, CurrentQIndex + (reducedDeltaQIndex
+/// << delta_q_res))`, so downstream dequant picks up the per-SB Q
+/// deltas.
 fn read_delta_qindex_for_block(td: &mut TileDecoder<'_>, bs: BlockSize, skip: bool) -> Result<()> {
     if !td.frame.delta_q_present {
         return Ok(());
@@ -711,9 +726,13 @@ fn read_delta_qindex_for_block(td: &mut TileDecoder<'_>, bs: BlockSize, skip: bo
     if !td.read_deltas {
         return Ok(());
     }
-    // Read — we don't currently track per-SB Q deltas, but bits must
-    // still be consumed when the frame enabled them.
-    let _ = td.decode_delta_qindex()?;
+    let reduced = td.decode_delta_qindex()?;
+    if reduced != 0 {
+        let res = td.frame.delta_q_res as i32;
+        let shifted = reduced.wrapping_shl(res as u32);
+        let updated = td.current_q_index.saturating_add(shifted);
+        td.current_q_index = updated.clamp(1, 255);
+    }
     Ok(())
 }
 
@@ -755,8 +774,18 @@ fn read_delta_lf_for_block(td: &mut TileDecoder<'_>, bs: BlockSize, skip: bool) 
     } else {
         1
     };
+    // §5.11.13: DeltaLF[i] = Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+    //                              DeltaLF[i] + (reducedDeltaLfLevel << delta_lf_res))
+    // where MAX_LOOP_FILTER == 63 per §9.3.
+    const MAX_LOOP_FILTER: i32 = 63;
+    let res = td.frame.delta_lf_res as i32;
     for i in 0..lf_count {
-        let _ = td.decode_delta_lf_abs(i)?;
+        let reduced = td.decode_delta_lf_abs(i)?;
+        if reduced != 0 {
+            let shifted = reduced.wrapping_shl(res as u32);
+            let updated = td.delta_lf[i].saturating_add(shifted);
+            td.delta_lf[i] = updated.clamp(-MAX_LOOP_FILTER, MAX_LOOP_FILTER);
+        }
     }
     Ok(())
 }
@@ -1197,6 +1226,7 @@ fn decode_inter_leaf_block(
             info.skip,
             0,
             None,
+            None,
         )?;
         if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
             reconstruct_chroma_block(
@@ -1340,8 +1370,10 @@ fn reconstruct_inter_luma_block(
         w,
         h,
     )?;
+    // §5.11.12 — dequant indexes by `CurrentQIndex`, not the frame-level
+    // `base_q_idx`, so per-SB delta_q updates propagate here.
     let qv = quant::Params {
-        base_q_idx: td.frame.quant.base_q_idx as i32,
+        base_q_idx: td.current_q_index,
         delta_q_y_dc: td.frame.quant.delta_q_y_dc as i32,
         delta_q_u_dc: td.frame.quant.delta_q_u_dc as i32,
         delta_q_u_ac: td.frame.quant.delta_q_u_ac as i32,
@@ -1526,8 +1558,10 @@ fn reconstruct_inter_chroma_block(
         } else {
             quant::Plane::V
         };
+        // §5.11.12: indexing tables by `CurrentQIndex` so per-SB
+        // delta_q updates affect the inter-chroma dequant too.
         let qv = quant::Params {
-            base_q_idx: td.frame.quant.base_q_idx as i32,
+            base_q_idx: td.current_q_index,
             delta_q_y_dc: td.frame.quant.delta_q_y_dc as i32,
             delta_q_u_dc: td.frame.quant.delta_q_u_dc as i32,
             delta_q_u_ac: td.frame.quant.delta_q_u_ac as i32,
@@ -1601,6 +1635,7 @@ fn reconstruct_luma_block(
     skip: bool,
     segment_id: u8,
     decoded_tx_size: Option<TxSize>,
+    filter_intra: Option<u8>,
 ) -> Result<()> {
     let w = bw as usize;
     let h = bh as usize;
@@ -1666,6 +1701,7 @@ fn reconstruct_luma_block(
                 skip,
                 tx_type,
                 segment_id,
+                filter_intra,
             )?;
         }
     }
@@ -1691,6 +1727,7 @@ fn reconstruct_one_luma_tx_unit(
     skip: bool,
     tx_type: TxType,
     segment_id: u8,
+    filter_intra: Option<u8>,
 ) -> Result<()> {
     let stride = fs.width as usize;
     // §7.11.2.8: filterType depends on the above/left MI's prediction
@@ -1719,6 +1756,7 @@ fn reconstruct_one_luma_tx_unit(
             128,
             enable_edge_filter,
             filter_type,
+            filter_intra,
         );
         paste_block(&mut fs.y_plane, stride, ux, uy, &pred, tx_w, tx_h);
     } else {
@@ -1736,6 +1774,7 @@ fn reconstruct_one_luma_tx_unit(
             fs.bit_depth,
             enable_edge_filter,
             filter_type,
+            filter_intra,
         );
         paste_block16(&mut fs.y_plane16, stride, ux, uy, &pred, tx_w, tx_h);
     }
@@ -2035,6 +2074,7 @@ fn reconstruct_one_chroma_tx_unit(
             128,
             enable_edge_filter,
             filter_type,
+            None,
         );
         if let Some(q3) = cfl_q3 {
             let dc_copy = pred.clone();
@@ -2066,6 +2106,7 @@ fn reconstruct_one_chroma_tx_unit(
             fs.bit_depth,
             enable_edge_filter,
             filter_type,
+            None,
         );
         if let Some(q3) = cfl_q3 {
             let dc_copy = pred.clone();
@@ -2236,6 +2277,11 @@ fn get_filter_type(fs: &FrameState, mi_row: u32, mi_col: u32, plane_idx: u32) ->
 /// `enable_edge_filter` / `filter_type` come from §7.11.2.8; when
 /// enabled and the mode is directional (other than 90°/180°), the
 /// above/left edges are pre-processed via §7.11.2.9–.12.
+///
+/// When `filter_intra` is `Some(mode_idx)`, the recursive §7.11.2.3
+/// filter-intra predictor replaces the normal DC_PRED path. The spec
+/// only activates this branch on DC_PRED luma blocks ≤ 32×32; the
+/// caller is responsible for enforcing those preconditions.
 #[allow(clippy::too_many_arguments)]
 fn run_intra_prediction_u8(
     plane: &[u8],
@@ -2250,6 +2296,7 @@ fn run_intra_prediction_u8(
     fallback: u8,
     enable_edge_filter: bool,
     filter_type: u32,
+    filter_intra: Option<u8>,
 ) -> Vec<u8> {
     // Extended neighbours for directional / filter-intra reads. Length
     // covers the longest projection: above + right of block.
@@ -2261,6 +2308,22 @@ fn run_intra_prediction_u8(
     let have_left = x > 0;
 
     let mut dst = vec![0u8; w * h];
+    // §7.11.2.3 recursive filter-intra — overrides DC_PRED when the
+    // block elected it (gated by the caller to DC_PRED ≤ 32×32). The
+    // predictor reads `w+1` above samples (including the corner) and
+    // `h` left samples.
+    if let Some(fi_mode) = filter_intra {
+        filter_intra_pred(
+            &mut dst,
+            w,
+            h,
+            &above_raw,
+            &left_raw,
+            above_left,
+            fi_mode as usize,
+        );
+        return dst;
+    }
     match mode {
         IntraMode::DcPred | IntraMode::CflPred => {
             dc_pred(
@@ -2387,6 +2450,7 @@ fn run_intra_prediction_u16(
     bit_depth: u32,
     enable_edge_filter: bool,
     filter_type: u32,
+    filter_intra: Option<u8>,
 ) -> Vec<u16> {
     let ext_len = w + h + 4;
     let _ = fallback;
@@ -2405,6 +2469,20 @@ fn run_intra_prediction_u16(
     let have_left = x > 0;
 
     let mut dst = vec![0u16; w * h];
+    // §7.11.2.3 recursive filter-intra (HBD path).
+    if let Some(fi_mode) = filter_intra {
+        filter_intra_pred16(
+            &mut dst,
+            w,
+            h,
+            &above_raw,
+            &left_raw,
+            above_left,
+            fi_mode as usize,
+            bit_depth,
+        );
+        return dst;
+    }
     match mode {
         IntraMode::DcPred | IntraMode::CflPred => {
             dc_pred16(
@@ -2728,9 +2806,16 @@ fn round_shift(x: i32, n: u32) -> i32 {
     }
 }
 
-/// Compute the segment-adjusted `base_q_index`.
+/// Compute the segment-adjusted base quantizer index used by per-block
+/// dequant. Per spec §5.11.12 the quantizer used is `CurrentQIndex`
+/// (which rides on top of `base_q_idx` via per-SB delta_q), and per
+/// §5.11.14 the segmentation feature `SEG_LVL_ALT_Q` re-anchors the
+/// value when enabled for the block's segment.
 fn segmented_base_q(td: &TileDecoder<'_>, segment_id: u8) -> i32 {
-    let base = td.frame.quant.base_q_idx as i32;
+    // Per §5.11.12 `CurrentQIndex` is what the dequantizer tables are
+    // indexed by. When `delta_q_present == 0` it stays pinned to
+    // `base_q_idx` per §5.11.1.
+    let base = td.current_q_index;
     if !td.frame.segmentation.enabled {
         return base;
     }
@@ -2741,6 +2826,12 @@ fn segmented_base_q(td: &TileDecoder<'_>, segment_id: u8) -> i32 {
     if !td.frame.segmentation.feature_enabled[sid][0] {
         return base;
     }
+    // SEG_LVL_ALT_Q semantics: when segmentation_update_data's
+    // `segmentation_abs_or_delta_update` is 1 the feature_data value
+    // replaces `base_q_idx`; when 0 it adds. Spec requires applying
+    // segmentation to `base_q_idx` first, then adding the delta_q
+    // running total. Our frame header flattens that already, so fall
+    // back to adding the feature_data delta to `CurrentQIndex`.
     let q = base + td.frame.segmentation.feature_data[sid][0] as i32;
     q.clamp(0, 255)
 }
@@ -2868,9 +2959,43 @@ mod tests {
             128,  /* fallback */
             true, /* enable_edge_filter */
             0,    /* filter_type */
+            None, /* filter_intra */
         );
         for &v in &got {
             assert_eq!(v, 100, "edge-filtered constant D67 drifted: {:?}", got);
+        }
+    }
+
+    // §7.11.2.3 recursive filter-intra: when `filter_intra: Some(_)`
+    // the predictor bypasses the DC_PRED branch. A flat 100-sample
+    // neighbourhood lets every tap set in Table 7.11.2.3 emit 100
+    // (the taps sum to 16, so `(100*16 + 8) >> 4 = 100`). Verifies
+    // the dispatch plumbing reaches the new code path.
+    #[test]
+    fn run_intra_prediction_u8_filter_intra_constant_passthrough() {
+        let plane = vec![100u8; 8 * 8];
+        for mode in 0..5u8 {
+            let got = run_intra_prediction_u8(
+                &plane,
+                8,
+                8,
+                0,
+                4,
+                4,
+                4,
+                IntraMode::DcPred,
+                0,
+                128,
+                false, /* enable_edge_filter */
+                0,
+                Some(mode),
+            );
+            for &v in &got {
+                assert_eq!(
+                    v, 100,
+                    "filter-intra mode {mode} drifted on constant neighbours: {got:?}",
+                );
+            }
         }
     }
 

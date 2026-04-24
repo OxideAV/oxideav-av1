@@ -664,6 +664,21 @@ pub struct TileDecoder<'a> {
     /// call once it has consumed the delta symbols. Held on the tile
     /// decoder so individual leaf calls can inspect / clear it.
     pub read_deltas: bool,
+    /// Spec §5.11.12 `CurrentQIndex` — per-tile running quantizer index
+    /// that rides on top of `base_q_idx`. Initialised to `base_q_idx` at
+    /// tile entry (§5.11.1 `decode_tiles`) and updated by every
+    /// `read_delta_qindex()` call to
+    /// `Clip3(1, 255, CurrentQIndex + (reducedDeltaQIndex << delta_q_res))`.
+    /// Consumed by the luma/chroma dequantizers so per-SB Q deltas land
+    /// in reconstruction.
+    pub current_q_index: i32,
+    /// Spec §5.11.13 `DeltaLF[i]` — per-tile running loop-filter level
+    /// deltas, one entry per LF frame-index (`FRAME_LF_COUNT == 4`).
+    /// Zeroed at tile entry per §5.11.2 `decode_tile`, updated by
+    /// `read_delta_lf()` (§5.11.13). Tracked here so a future loop-filter
+    /// pass can consume the deltas; `apply_deblocking` currently uses
+    /// frame-level levels only.
+    pub delta_lf: [i32; FRAME_LF_COUNT],
 }
 
 impl<'a> TileDecoder<'a> {
@@ -720,6 +735,10 @@ impl<'a> TileDecoder<'a> {
             inter,
             prev_frame,
             read_deltas: false,
+            // §5.11.1: `CurrentQIndex = base_q_idx` at tile entry.
+            current_q_index: frame.quant.base_q_idx as i32,
+            // §5.11.2: `for (i=0; i < FRAME_LF_COUNT; i++) DeltaLF[i] = 0`.
+            delta_lf: [0; FRAME_LF_COUNT],
         };
         td.init_cdfs();
         Ok(td)
