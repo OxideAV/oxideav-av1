@@ -8,10 +8,12 @@
 use oxideav_core::{Error, Result};
 
 use crate::predict::intra::{
-    cfl_pred, cfl_pred16, cfl_subsample, cfl_subsample16, dc_pred, dc_pred16, directional_pred,
-    directional_pred16, h_pred, h_pred16, mode_to_angle_map, paeth_pred, paeth_pred16,
-    smooth_h_pred, smooth_h_pred16, smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16,
-    v_pred, v_pred16,
+    cfl_pred, cfl_pred16, cfl_subsample, cfl_subsample16, dc_pred, dc_pred16, directional_pred_ext,
+    directional_pred16_ext, edge::{
+        edge_filter, edge_filter16, edge_filter_strength, edge_upsample, edge_upsample16,
+        edge_use_upsample,
+    }, h_pred, h_pred16, mode_to_angle_map, paeth_pred, paeth_pred16, smooth_h_pred,
+    smooth_h_pred16, smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16, v_pred, v_pred16,
 };
 use crate::quant;
 use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
@@ -920,6 +922,16 @@ fn reconstruct_one_luma_tx_unit(
     segment_id: u8,
 ) -> Result<()> {
     let stride = fs.width as usize;
+    // §7.11.2.8: filterType depends on the above/left MI's prediction
+    // mode. MiRow/MiCol here are in luma-MI units (4×4 samples).
+    let mi_col_u = (ux >> 2) as u32;
+    let mi_row_u = (uy >> 2) as u32;
+    let enable_edge_filter = td.seq.enable_intra_edge_filter;
+    let filter_type = if enable_edge_filter {
+        get_filter_type(fs, mi_row_u, mi_col_u, 0)
+    } else {
+        0
+    };
 
     // Predict + paste.
     if fs.bit_depth == 8 {
@@ -934,6 +946,8 @@ fn reconstruct_one_luma_tx_unit(
             y_mode,
             angle_delta,
             128,
+            enable_edge_filter,
+            filter_type,
         );
         paste_block(&mut fs.y_plane, stride, ux, uy, &pred, tx_w, tx_h);
     } else {
@@ -949,6 +963,8 @@ fn reconstruct_one_luma_tx_unit(
             angle_delta,
             1u16 << (fs.bit_depth - 1),
             fs.bit_depth,
+            enable_edge_filter,
+            filter_type,
         );
         paste_block16(&mut fs.y_plane16, stride, ux, uy, &pred, tx_w, tx_h);
     }
@@ -1217,6 +1233,16 @@ fn reconstruct_one_chroma_tx_unit(
 ) -> Result<()> {
     let stride = fs.uv_width as usize;
     let uvh = fs.uv_height as usize;
+    // §7.11.2.8 applies per-plane. Convert chroma plane coords back to
+    // luma-MI units via sub_x / sub_y.
+    let mi_col_u = ((ux as u32) << fs.sub_x) >> 2;
+    let mi_row_u = ((uy as u32) << fs.sub_y) >> 2;
+    let enable_edge_filter = td.seq.enable_intra_edge_filter;
+    let filter_type = if enable_edge_filter {
+        get_filter_type(fs, mi_row_u, mi_col_u, plane_idx + 1)
+    } else {
+        0
+    };
 
     // Predict + (CFL overlay) + paste.
     if fs.bit_depth == 8 {
@@ -1236,6 +1262,8 @@ fn reconstruct_one_chroma_tx_unit(
             base_mode,
             angle_delta_uv,
             128,
+            enable_edge_filter,
+            filter_type,
         );
         if let Some(q3) = cfl_q3 {
             let dc_copy = pred.clone();
@@ -1265,6 +1293,8 @@ fn reconstruct_one_chroma_tx_unit(
             angle_delta_uv,
             mid,
             fs.bit_depth,
+            enable_edge_filter,
+            filter_type,
         );
         if let Some(q3) = cfl_q3 {
             let dc_copy = pred.clone();
@@ -1356,8 +1386,74 @@ fn reconstruct_one_chroma_tx_unit(
     Ok(())
 }
 
+/// Spec §7.11.2.8 `get_filter_type`: 1 if either the block immediately
+/// above or to the left uses one of the three SMOOTH_* intra modes.
+/// Returns 0 otherwise (including when the neighbour is unavailable or
+/// was inter-coded).
+///
+/// `plane_idx` is 0 for Y, 1/2 for chroma. Chroma planes shift the MI
+/// lookup by subsampling per the spec so 4:2:0 blocks read the correct
+/// 4×4 MI cell.
+fn get_filter_type(
+    fs: &FrameState,
+    mi_row: u32,
+    mi_col: u32,
+    plane_idx: u32,
+) -> u32 {
+    let is_smooth = |mode_opt: Option<IntraMode>| -> bool {
+        matches!(
+            mode_opt,
+            Some(IntraMode::SmoothPred | IntraMode::SmoothVPred | IntraMode::SmoothHPred)
+        )
+    };
+    let sub_x = fs.sub_x;
+    let sub_y = fs.sub_y;
+    let mut above_smooth = false;
+    let mut left_smooth = false;
+    if mi_row > 0 {
+        let mut r = mi_row - 1;
+        let mut c = mi_col;
+        if plane_idx > 0 {
+            if sub_x == 1 && (mi_col & 1) == 0 && c + 1 < fs.mi_cols {
+                c += 1;
+            }
+            if sub_y == 1 && (mi_row & 1) == 1 && r > 0 {
+                r -= 1;
+            }
+        }
+        if r < fs.mi_rows && c < fs.mi_cols {
+            let mi = fs.mi_at(c, r);
+            // §7.11.2.8 is_smooth: non-luma inter blocks return 0.
+            let mode = if plane_idx == 0 { mi.mode } else if mi.is_inter { None } else { mi.uv_mode };
+            above_smooth = is_smooth(mode);
+        }
+    }
+    if mi_col > 0 {
+        let mut r = mi_row;
+        let mut c = mi_col - 1;
+        if plane_idx > 0 {
+            if sub_x == 1 && (mi_col & 1) == 1 && c > 0 {
+                c -= 1;
+            }
+            if sub_y == 1 && (mi_row & 1) == 0 && r + 1 < fs.mi_rows {
+                r += 1;
+            }
+        }
+        if r < fs.mi_rows && c < fs.mi_cols {
+            let mi = fs.mi_at(c, r);
+            let mode = if plane_idx == 0 { mi.mode } else if mi.is_inter { None } else { mi.uv_mode };
+            left_smooth = is_smooth(mode);
+        }
+    }
+    if above_smooth || left_smooth { 1 } else { 0 }
+}
+
 /// Run the u8 intra predictor against the reconstructed plane. Returns
 /// a tight `w*h` buffer of predicted samples.
+///
+/// `enable_edge_filter` / `filter_type` come from §7.11.2.8; when
+/// enabled and the mode is directional (other than 90°/180°), the
+/// above/left edges are pre-processed via §7.11.2.9–.12.
 #[allow(clippy::too_many_arguments)]
 fn run_intra_prediction_u8(
     plane: &[u8],
@@ -1370,6 +1466,8 @@ fn run_intra_prediction_u8(
     mode: IntraMode,
     angle_delta: i8,
     fallback: u8,
+    enable_edge_filter: bool,
+    filter_type: u32,
 ) -> Vec<u8> {
     // Extended neighbours for directional / filter-intra reads. Length
     // covers the longest projection: above + right of block.
@@ -1378,19 +1476,17 @@ fn run_intra_prediction_u8(
         gather_neighbors_u8(plane, plane_stride, plane_height, x, y, ext_len, fallback);
     let have_above = y > 0;
     let have_left = x > 0;
-    let above = &above_raw[..];
-    let left = &left_raw[..];
 
     let mut dst = vec![0u8; w * h];
     match mode {
         IntraMode::DcPred | IntraMode::CflPred => {
-            dc_pred(&mut dst, w, h, above, left, have_above, have_left, 8);
+            dc_pred(&mut dst, w, h, &above_raw, &left_raw, have_above, have_left, 8);
         }
         IntraMode::VPred => {
-            v_pred(&mut dst, w, h, above);
+            v_pred(&mut dst, w, h, &above_raw);
         }
         IntraMode::HPred => {
-            h_pred(&mut dst, w, h, left);
+            h_pred(&mut dst, w, h, &left_raw);
         }
         IntraMode::D45Pred
         | IntraMode::D67Pred
@@ -1399,23 +1495,94 @@ fn run_intra_prediction_u8(
         | IntraMode::D157Pred
         | IntraMode::D203Pred => {
             let base = mode_to_angle_map(mode);
-            let angle = base + (angle_delta as i32) * 3;
-            directional_pred(&mut dst, w, h, above, left, angle);
+            let p_angle = base + (angle_delta as i32) * 3;
+            let above_delta = p_angle - 90;
+            let left_delta = p_angle - 180;
+            // Clone into mutable buffers so edge_filter can operate in place.
+            let mut above = above_raw.clone();
+            let mut left = left_raw.clone();
+            let mut upsample_above = false;
+            let mut upsample_left = false;
+            if enable_edge_filter && p_angle != 90 && p_angle != 180 {
+                if have_above {
+                    let strength =
+                        edge_filter_strength(w as u32, h as u32, filter_type, above_delta);
+                    edge_filter(&mut above, strength);
+                }
+                if have_left {
+                    let strength =
+                        edge_filter_strength(w as u32, h as u32, filter_type, left_delta);
+                    edge_filter(&mut left, strength);
+                }
+                if edge_use_upsample(w as u32, h as u32, filter_type, above_delta) {
+                    above = upsample_edge_u8(&above, w, h, p_angle < 90);
+                    upsample_above = true;
+                }
+                if edge_use_upsample(w as u32, h as u32, filter_type, left_delta) {
+                    left = upsample_edge_u8(&left, h, w, p_angle > 180);
+                    upsample_left = true;
+                }
+            }
+            directional_pred_ext(
+                &mut dst,
+                w,
+                h,
+                &above,
+                &left,
+                p_angle,
+                upsample_above,
+                upsample_left,
+            );
         }
         IntraMode::SmoothPred => {
-            smooth_pred(&mut dst, w, h, above, left);
+            smooth_pred(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothVPred => {
-            smooth_v_pred(&mut dst, w, h, above, left);
+            smooth_v_pred(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothHPred => {
-            smooth_h_pred(&mut dst, w, h, above, left);
+            smooth_h_pred(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::PaethPred => {
-            paeth_pred(&mut dst, w, h, above, left, above_left);
+            paeth_pred(&mut dst, w, h, &above_raw, &left_raw, above_left);
         }
     }
     dst
+}
+
+/// Run [`edge_upsample`] against a caller-gathered extended edge slice
+/// and return the upsampled buffer laid out so that `out[0]` maps to
+/// spec `AboveRow[0]` (or `LeftCol[0]`) in the 2×-density frame —
+/// i.e. the sample immediately after the corner.
+///
+/// `primary` is the block dimension along the edge (w for above, h for
+/// left); `secondary` is the other dimension. `extends_into` is `true`
+/// when `pAngle < 90` (for above) or `pAngle > 180` (for left), meaning
+/// the projection reads past the block's immediate edge.
+fn upsample_edge_u8(edge: &[u8], primary: usize, secondary: usize, extends_into: bool) -> Vec<u8> {
+    // §7.11.2.6: numPx for above is `w + (pAngle < 90 ? h : 0)`.
+    let num_px = primary + if extends_into { secondary } else { 0 };
+    // edge_upsample's convention: buf[0] = spec index -2, buf[1] =
+    // spec index -1 (corner), buf[2..=num_px+1] = spec 0..num_px-1.
+    // Our gathered `edge` has `edge[0]` = spec AboveRow[0]; the corner
+    // sample is not directly available here (callers in the intra path
+    // store it separately), but the upsampler reads spec -1 only for
+    // its `dup[0]` fallback — replicating `edge[0]` there is a safe
+    // edge-extension behaviour consistent with §7.11.2.11.
+    let mut buf = vec![0u8; 2 * num_px + 2];
+    buf[1] = edge[0];
+    for i in 0..num_px {
+        let src = edge.get(i).copied().unwrap_or_else(|| {
+            *edge.last().expect("upsample_edge_u8: empty edge slice")
+        });
+        buf[i + 2] = src;
+    }
+    edge_upsample(&mut buf, num_px);
+    // After upsample, buf[0]=spec -2, buf[1]=spec -1 (corner),
+    // buf[2]=spec 0. Strip the two leading slots so out[0] = spec 0
+    // in the 2×-density frame.
+    buf.drain(..2);
+    buf
 }
 
 /// u16 counterpart of [`run_intra_prediction_u8`].
@@ -1432,27 +1599,27 @@ fn run_intra_prediction_u16(
     angle_delta: i8,
     fallback: u16,
     bit_depth: u32,
+    enable_edge_filter: bool,
+    filter_type: u32,
 ) -> Vec<u16> {
     let ext_len = w + h + 4;
     let (above_raw, left_raw, above_left) =
         gather_neighbors_u16(plane, plane_stride, plane_height, x, y, ext_len, fallback);
     let have_above = y > 0;
     let have_left = x > 0;
-    let above = &above_raw[..];
-    let left = &left_raw[..];
 
     let mut dst = vec![0u16; w * h];
     match mode {
         IntraMode::DcPred | IntraMode::CflPred => {
             dc_pred16(
-                &mut dst, w, h, above, left, have_above, have_left, bit_depth,
+                &mut dst, w, h, &above_raw, &left_raw, have_above, have_left, bit_depth,
             );
         }
         IntraMode::VPred => {
-            v_pred16(&mut dst, w, h, above);
+            v_pred16(&mut dst, w, h, &above_raw);
         }
         IntraMode::HPred => {
-            h_pred16(&mut dst, w, h, left);
+            h_pred16(&mut dst, w, h, &left_raw);
         }
         IntraMode::D45Pred
         | IntraMode::D67Pred
@@ -1461,23 +1628,81 @@ fn run_intra_prediction_u16(
         | IntraMode::D157Pred
         | IntraMode::D203Pred => {
             let base = mode_to_angle_map(mode);
-            let angle = base + (angle_delta as i32) * 3;
-            directional_pred16(&mut dst, w, h, above, left, angle, bit_depth);
+            let p_angle = base + (angle_delta as i32) * 3;
+            let above_delta = p_angle - 90;
+            let left_delta = p_angle - 180;
+            let mut above = above_raw.clone();
+            let mut left = left_raw.clone();
+            let mut upsample_above = false;
+            let mut upsample_left = false;
+            if enable_edge_filter && p_angle != 90 && p_angle != 180 {
+                if have_above {
+                    let strength =
+                        edge_filter_strength(w as u32, h as u32, filter_type, above_delta);
+                    edge_filter16(&mut above, strength, bit_depth);
+                }
+                if have_left {
+                    let strength =
+                        edge_filter_strength(w as u32, h as u32, filter_type, left_delta);
+                    edge_filter16(&mut left, strength, bit_depth);
+                }
+                if edge_use_upsample(w as u32, h as u32, filter_type, above_delta) {
+                    above = upsample_edge_u16(&above, w, h, p_angle < 90, bit_depth);
+                    upsample_above = true;
+                }
+                if edge_use_upsample(w as u32, h as u32, filter_type, left_delta) {
+                    left = upsample_edge_u16(&left, h, w, p_angle > 180, bit_depth);
+                    upsample_left = true;
+                }
+            }
+            directional_pred16_ext(
+                &mut dst,
+                w,
+                h,
+                &above,
+                &left,
+                p_angle,
+                bit_depth,
+                upsample_above,
+                upsample_left,
+            );
         }
         IntraMode::SmoothPred => {
-            smooth_pred16(&mut dst, w, h, above, left);
+            smooth_pred16(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothVPred => {
-            smooth_v_pred16(&mut dst, w, h, above, left);
+            smooth_v_pred16(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothHPred => {
-            smooth_h_pred16(&mut dst, w, h, above, left);
+            smooth_h_pred16(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::PaethPred => {
-            paeth_pred16(&mut dst, w, h, above, left, above_left, bit_depth);
+            paeth_pred16(&mut dst, w, h, &above_raw, &left_raw, above_left, bit_depth);
         }
     }
     dst
+}
+
+/// HBD twin of [`upsample_edge_u8`].
+fn upsample_edge_u16(
+    edge: &[u16],
+    primary: usize,
+    secondary: usize,
+    extends_into: bool,
+    bit_depth: u32,
+) -> Vec<u16> {
+    let num_px = primary + if extends_into { secondary } else { 0 };
+    let mut buf = vec![0u16; 2 * num_px + 2];
+    buf[1] = edge[0];
+    for i in 0..num_px {
+        let src = edge.get(i).copied().unwrap_or_else(|| {
+            *edge.last().expect("upsample_edge_u16: empty edge slice")
+        });
+        buf[i + 2] = src;
+    }
+    edge_upsample16(&mut buf, num_px, bit_depth);
+    buf.drain(..2);
+    buf
 }
 
 /// Gather extended neighbour samples from a u8 plane. Returns
@@ -1728,5 +1953,69 @@ mod tests {
         assert!(select_square_tx(128, 128).is_err());
         assert!(select_square_tx(128, 64).is_err());
         assert!(select_square_tx(64, 128).is_err());
+    }
+
+    // §7.11.2.8: filterType should be 1 when either MI neighbour is a
+    // smooth-family intra mode, 0 otherwise (and 0 when no neighbours
+    // exist at all).
+    #[test]
+    fn get_filter_type_detects_smooth_above() {
+        let mut fs = FrameState::new(32, 32, 1, 1, false);
+        // Mark the MI cell directly above (0, 0) as SMOOTH_PRED.
+        fs.mi_mut(0, 0).mode = Some(IntraMode::SmoothPred);
+        // Query for MI at (col=0, row=1) — above is row 0.
+        assert_eq!(get_filter_type(&fs, 1, 0, 0), 1);
+    }
+
+    #[test]
+    fn get_filter_type_detects_smooth_left() {
+        let mut fs = FrameState::new(32, 32, 1, 1, false);
+        fs.mi_mut(0, 0).mode = Some(IntraMode::SmoothHPred);
+        // Query for MI at (col=1, row=0) — left is col 0.
+        assert_eq!(get_filter_type(&fs, 0, 1, 0), 1);
+    }
+
+    #[test]
+    fn get_filter_type_zero_for_non_smooth() {
+        let mut fs = FrameState::new(32, 32, 1, 1, false);
+        fs.mi_mut(0, 0).mode = Some(IntraMode::DcPred);
+        fs.mi_mut(1, 0).mode = Some(IntraMode::D45Pred);
+        assert_eq!(get_filter_type(&fs, 1, 1, 0), 0);
+    }
+
+    #[test]
+    fn get_filter_type_frame_edge_returns_zero() {
+        let fs = FrameState::new(32, 32, 1, 1, false);
+        // At the top-left corner neither neighbour exists.
+        assert_eq!(get_filter_type(&fs, 0, 0, 0), 0);
+    }
+
+    // Sanity that `run_intra_prediction_u8` with edge filter enabled on
+    // a flat neighbour pattern yields a constant output — the low-pass
+    // kernels and upsample polyphase are both normalised so uniform
+    // input must pass through unchanged.
+    #[test]
+    fn run_intra_prediction_u8_constant_edges_passthrough_with_edge_filter() {
+        // 8×8 plane filled with constant 100 surrounds a 4×4 block at
+        // (0, 4). With y > 0 and x == 0, only the above edge feeds the
+        // predictor; D67 projects into it.
+        let plane = vec![100u8; 8 * 8];
+        let got = run_intra_prediction_u8(
+            &plane,
+            8, /* stride */
+            8, /* height */
+            0, /* x */
+            4, /* y */
+            4, /* w */
+            4, /* h */
+            IntraMode::D67Pred,
+            0, /* angle_delta */
+            128, /* fallback */
+            true, /* enable_edge_filter */
+            0,    /* filter_type */
+        );
+        for &v in &got {
+            assert_eq!(v, 100, "edge-filtered constant D67 drifted: {:?}", got);
+        }
     }
 }

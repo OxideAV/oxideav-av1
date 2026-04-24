@@ -70,12 +70,36 @@ fn get_dy(angle: i32) -> i32 {
 /// `(w + h + 1)` samples at each edge so the projection doesn't read
 /// out of range. Callers replicate the last sample as needed.
 pub fn directional_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8], angle: i32) {
+    directional_pred_ext(dst, w, h, above, left, angle, false, false);
+}
+
+/// Extended directional predictor that accepts per-edge upsample flags
+/// (§7.11.2.6 when `enable_intra_edge_filter` applies). When
+/// `upsample_above`/`upsample_left` is `true`, the corresponding edge
+/// has 2× sample density — `above[2*k]` = spec `AboveRow[2*k - 2 + ??]`
+/// depending on the spec's +2 offset convention used by the upsampler.
+/// Callers that upsample with [`super::edge::edge_upsample`] get a
+/// slice laid out with spec index `-2` at `above[0]`, so they must
+/// strip the first sample (shift by 1) before passing here.
+#[allow(clippy::too_many_arguments)]
+pub fn directional_pred_ext(
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    above: &[u8],
+    left: &[u8],
+    angle: i32,
+    upsample_above: bool,
+    upsample_left: bool,
+) {
+    let ua = if upsample_above { 1 } else { 0 };
+    let ul = if upsample_left { 1 } else { 0 };
     if angle > 0 && angle < 90 {
-        dr_pred_above_zone(dst, w, h, above, get_dx(angle));
+        dr_pred_above_zone(dst, w, h, above, get_dx(angle), ua);
     } else if angle > 180 && angle < 270 {
-        dr_pred_left_zone(dst, w, h, left, get_dy(angle));
+        dr_pred_left_zone(dst, w, h, left, get_dy(angle), ul);
     } else if angle > 90 && angle < 180 {
-        dr_pred_mixed_zone(dst, w, h, above, left, get_dx(angle), get_dy(angle));
+        dr_pred_mixed_zone(dst, w, h, above, left, get_dx(angle), get_dy(angle), ua, ul);
     } else if angle == 90 {
         // Vertical — identical to V_PRED on the above row.
         for r in 0..h {
@@ -94,13 +118,15 @@ pub fn directional_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: 
     }
 }
 
-fn dr_pred_above_zone(dst: &mut [u8], w: usize, h: usize, above: &[u8], dx: i32) {
+fn dr_pred_above_zone(dst: &mut [u8], w: usize, h: usize, above: &[u8], dx: i32, up: u32) {
+    // Spec §7.11.2.6 pAngle < 90 path. When `up` is 1 the above edge has
+    // 2× density. The shift is `6 - up` for base and `<< up` for shift.
     let max_idx = above.len().saturating_sub(1);
     for r in 0..h {
-        let offset = ((r as i32) + 1) * dx;
+        let idx = ((r as i32) + 1) * dx;
         for c in 0..w {
-            let base = (c as i32) + (offset >> 6);
-            let shift = (offset >> 1) & 0x1F;
+            let base = (idx >> (6 - up as i32)) + ((c as i32) << up);
+            let shift = ((idx << up as i32) >> 1) & 0x1F;
             let b1 = base.max(0) as usize;
             let b2 = (base + 1).max(0) as usize;
             let b1 = b1.min(max_idx);
@@ -111,13 +137,13 @@ fn dr_pred_above_zone(dst: &mut [u8], w: usize, h: usize, above: &[u8], dx: i32)
     }
 }
 
-fn dr_pred_left_zone(dst: &mut [u8], w: usize, h: usize, left: &[u8], dy: i32) {
+fn dr_pred_left_zone(dst: &mut [u8], w: usize, h: usize, left: &[u8], dy: i32, up: u32) {
     let max_idx = left.len().saturating_sub(1);
     for r in 0..h {
         for c in 0..w {
-            let offset = ((c as i32) + 1) * dy;
-            let base = (r as i32) + (offset >> 6);
-            let shift = (offset >> 1) & 0x1F;
+            let idx = ((c as i32) + 1) * dy;
+            let base = (idx >> (6 - up as i32)) + ((r as i32) << up);
+            let shift = ((idx << up as i32) >> 1) & 0x1F;
             let b1 = base.max(0) as usize;
             let b2 = (base + 1).max(0) as usize;
             let b1 = b1.min(max_idx);
@@ -128,6 +154,7 @@ fn dr_pred_left_zone(dst: &mut [u8], w: usize, h: usize, left: &[u8], dy: i32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dr_pred_mixed_zone(
     dst: &mut [u8],
     w: usize,
@@ -136,17 +163,20 @@ fn dr_pred_mixed_zone(
     left: &[u8],
     dx: i32,
     dy: i32,
+    ua: u32,
+    ul: u32,
 ) {
+    // §7.11.2.6 pAngle in (90, 180). The `base < 0` fallback path reads
+    // from the left column. `ua` / `ul` scale the index shift per edge.
     let max_a = above.len().saturating_sub(1);
     let max_l = left.len().saturating_sub(1);
-    let inv_dy = dy;
     for r in 0..h {
         for c in 0..w {
             let x_off = -((r as i32) + 1) * dx + ((c as i32) + 1) * 64;
-            let y_off = -((c as i32) + 1) * inv_dy + ((r as i32) + 1) * 64;
+            let y_off = -((c as i32) + 1) * dy + ((r as i32) + 1) * 64;
             if x_off >= 0 {
-                let base = x_off >> 6;
-                let shift = (x_off >> 1) & 0x1F;
+                let base = x_off >> (6 - ua as i32);
+                let shift = ((x_off << ua as i32) >> 1) & 0x1F;
                 let b1 = base.max(0) as usize;
                 let b2 = (base + 1).max(0) as usize;
                 let b1 = b1.min(max_a);
@@ -154,8 +184,8 @@ fn dr_pred_mixed_zone(
                 let v = ((above[b1] as i32) * (32 - shift) + (above[b2] as i32) * shift + 16) >> 5;
                 dst[r * w + c] = v.clamp(0, 255) as u8;
             } else {
-                let base = y_off >> 6;
-                let shift = (y_off >> 1) & 0x1F;
+                let base = y_off >> (6 - ul as i32);
+                let shift = ((y_off << ul as i32) >> 1) & 0x1F;
                 let b1 = base.max(0) as usize;
                 let b2 = (base + 1).max(0) as usize;
                 let b1 = b1.min(max_l);
@@ -178,13 +208,43 @@ pub fn directional_pred16(
     angle: i32,
     bit_depth: u32,
 ) {
+    directional_pred16_ext(dst, w, h, above, left, angle, bit_depth, false, false);
+}
+
+/// Extended HBD directional predictor with per-edge upsample flags —
+/// HBD twin of [`directional_pred_ext`].
+#[allow(clippy::too_many_arguments)]
+pub fn directional_pred16_ext(
+    dst: &mut [u16],
+    w: usize,
+    h: usize,
+    above: &[u16],
+    left: &[u16],
+    angle: i32,
+    bit_depth: u32,
+    upsample_above: bool,
+    upsample_left: bool,
+) {
+    let ua = if upsample_above { 1 } else { 0 };
+    let ul = if upsample_left { 1 } else { 0 };
     let max_v = ((1i32) << bit_depth) - 1;
     if angle > 0 && angle < 90 {
-        dr_pred_above_zone16(dst, w, h, above, get_dx(angle), max_v);
+        dr_pred_above_zone16(dst, w, h, above, get_dx(angle), max_v, ua);
     } else if angle > 180 && angle < 270 {
-        dr_pred_left_zone16(dst, w, h, left, get_dy(angle), max_v);
+        dr_pred_left_zone16(dst, w, h, left, get_dy(angle), max_v, ul);
     } else if angle > 90 && angle < 180 {
-        dr_pred_mixed_zone16(dst, w, h, above, left, get_dx(angle), get_dy(angle), max_v);
+        dr_pred_mixed_zone16(
+            dst,
+            w,
+            h,
+            above,
+            left,
+            get_dx(angle),
+            get_dy(angle),
+            max_v,
+            ua,
+            ul,
+        );
     } else if angle == 90 {
         for r in 0..h {
             for c in 0..w {
@@ -201,13 +261,21 @@ pub fn directional_pred16(
     }
 }
 
-fn dr_pred_above_zone16(dst: &mut [u16], w: usize, h: usize, above: &[u16], dx: i32, max_v: i32) {
+fn dr_pred_above_zone16(
+    dst: &mut [u16],
+    w: usize,
+    h: usize,
+    above: &[u16],
+    dx: i32,
+    max_v: i32,
+    up: u32,
+) {
     let max_idx = above.len().saturating_sub(1);
     for r in 0..h {
-        let offset = ((r as i32) + 1) * dx;
+        let idx = ((r as i32) + 1) * dx;
         for c in 0..w {
-            let base = (c as i32) + (offset >> 6);
-            let shift = (offset >> 1) & 0x1F;
+            let base = (idx >> (6 - up as i32)) + ((c as i32) << up);
+            let shift = ((idx << up as i32) >> 1) & 0x1F;
             let b1 = base.max(0) as usize;
             let b2 = (base + 1).max(0) as usize;
             let b1 = b1.min(max_idx);
@@ -218,13 +286,21 @@ fn dr_pred_above_zone16(dst: &mut [u16], w: usize, h: usize, above: &[u16], dx: 
     }
 }
 
-fn dr_pred_left_zone16(dst: &mut [u16], w: usize, h: usize, left: &[u16], dy: i32, max_v: i32) {
+fn dr_pred_left_zone16(
+    dst: &mut [u16],
+    w: usize,
+    h: usize,
+    left: &[u16],
+    dy: i32,
+    max_v: i32,
+    up: u32,
+) {
     let max_idx = left.len().saturating_sub(1);
     for r in 0..h {
         for c in 0..w {
-            let offset = ((c as i32) + 1) * dy;
-            let base = (r as i32) + (offset >> 6);
-            let shift = (offset >> 1) & 0x1F;
+            let idx = ((c as i32) + 1) * dy;
+            let base = (idx >> (6 - up as i32)) + ((r as i32) << up);
+            let shift = ((idx << up as i32) >> 1) & 0x1F;
             let b1 = base.max(0) as usize;
             let b2 = (base + 1).max(0) as usize;
             let b1 = b1.min(max_idx);
@@ -245,17 +321,18 @@ fn dr_pred_mixed_zone16(
     dx: i32,
     dy: i32,
     max_v: i32,
+    ua: u32,
+    ul: u32,
 ) {
     let max_a = above.len().saturating_sub(1);
     let max_l = left.len().saturating_sub(1);
-    let inv_dy = dy;
     for r in 0..h {
         for c in 0..w {
             let x_off = -((r as i32) + 1) * dx + ((c as i32) + 1) * 64;
-            let y_off = -((c as i32) + 1) * inv_dy + ((r as i32) + 1) * 64;
+            let y_off = -((c as i32) + 1) * dy + ((r as i32) + 1) * 64;
             if x_off >= 0 {
-                let base = x_off >> 6;
-                let shift = (x_off >> 1) & 0x1F;
+                let base = x_off >> (6 - ua as i32);
+                let shift = ((x_off << ua as i32) >> 1) & 0x1F;
                 let b1 = base.max(0) as usize;
                 let b2 = (base + 1).max(0) as usize;
                 let b1 = b1.min(max_a);
@@ -263,8 +340,8 @@ fn dr_pred_mixed_zone16(
                 let v = ((above[b1] as i32) * (32 - shift) + (above[b2] as i32) * shift + 16) >> 5;
                 dst[r * w + c] = v.clamp(0, max_v) as u16;
             } else {
-                let base = y_off >> 6;
-                let shift = (y_off >> 1) & 0x1F;
+                let base = y_off >> (6 - ul as i32);
+                let shift = ((y_off << ul as i32) >> 1) & 0x1F;
                 let b1 = base.max(0) as usize;
                 let b2 = (base + 1).max(0) as usize;
                 let b1 = b1.min(max_l);

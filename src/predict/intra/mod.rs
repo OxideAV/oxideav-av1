@@ -28,7 +28,10 @@ pub mod vh;
 
 pub use cfl::{cfl_pred, cfl_pred16, cfl_subsample, cfl_subsample16};
 pub use dc::{dc_pred, dc_pred16};
-pub use directional::{directional_pred, directional_pred16, mode_to_angle_map};
+pub use directional::{
+    directional_pred, directional_pred16, directional_pred16_ext, directional_pred_ext,
+    mode_to_angle_map,
+};
 pub use edge::{
     edge_filter, edge_filter16, edge_filter_strength, edge_upsample, edge_upsample16,
     edge_use_upsample, EdgeFilterStrength, INTRA_EDGE_KERNEL, INTRA_EDGE_TAPS,
