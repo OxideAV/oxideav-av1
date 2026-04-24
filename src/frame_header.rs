@@ -133,6 +133,12 @@ pub struct FrameHeader {
     /// §5.9.24 — `global_motion_params.gm_type[ref]`. Only populated
     /// for inter frames; `Identity` for intra-only.
     pub gm_type: [GmType; NUM_REF_FRAMES],
+    /// §5.9.24 — `global_motion_params.gm_params[ref][0..=5]`. Stored
+    /// as signed integers at their spec precision (§5.9.27): `[0]/[1]`
+    /// are the translation components (1/8-pel for TRANSLATION, 1/16-
+    /// pel for higher types); `[2..=5]` are the alpha / affine warp
+    /// coefficients. Only populated for inter frames.
+    pub gm_params: [[i32; 6]; NUM_REF_FRAMES],
     /// §5.9.30 — film-grain params.
     pub film_grain: FilmGrainParams,
 
@@ -471,8 +477,9 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     let reduced_tx_set = br.bit()?;
 
     let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
+    let mut gm_params = [[0i32; 6]; NUM_REF_FRAMES];
     if !frame_is_intra {
-        parse_global_motion_params(br, &mut gm_type)?;
+        parse_global_motion_params(br, &mut gm_type, &mut gm_params)?;
     }
 
     let film_grain = parse_film_grain_params(br, seq, frame_type, show_frame, showable_frame)?;
@@ -529,6 +536,7 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
         reference_select,
         skip_mode_present,
         gm_type,
+        gm_params,
         film_grain,
         parse_depth,
     })
@@ -595,6 +603,7 @@ fn finish_minimal(
         reference_select: false,
         skip_mode_present: false,
         gm_type: [GmType::Identity; NUM_REF_FRAMES],
+        gm_params: [[0i32; 6]; NUM_REF_FRAMES],
         film_grain: FilmGrainParams::default(),
         parse_depth,
     })

@@ -450,16 +450,22 @@ pub fn parse_tx_mode(br: &mut BitReader<'_>, coded_lossless: bool) -> Result<TxM
     })
 }
 
-/// §5.9.24 `global_motion_params()` — parse and discard the
-/// coefficients. The still-image decoder never uses them and the
-/// bit-width heuristic here is a deliberate simplification. Required
-/// for correct bit-stream framing on inter frames only; intra-only
-/// callers never reach this.
+/// §5.9.24 `global_motion_params()` — parse per-reference global
+/// motion `gm_type[]` plus the six warp parameters per slot. The
+/// translation components (indices 0, 1 — ie `gm_params[ref][0]` for
+/// Y offset and `[1]` for X offset) are retained so the inter decoder
+/// can honour GLOBALMV against TRANSLATION slots without DPB state
+/// tracking. The higher-order alpha params (2..=5) are parsed and
+/// discarded — RotZoom / Affine warp MC is still unimplemented.
+///
+/// Required for correct bit-stream framing on inter frames only;
+/// intra-only callers never reach this.
 pub fn parse_global_motion_params(
     br: &mut BitReader<'_>,
     gm_type_out: &mut [GmType; NUM_REF_FRAMES],
+    gm_params_out: &mut [[i32; 6]; NUM_REF_FRAMES],
 ) -> Result<()> {
-    for slot in gm_type_out.iter_mut().skip(1) {
+    for (i, slot) in gm_type_out.iter_mut().enumerate().skip(1) {
         let is_global = br.bit()?;
         let typ = if is_global {
             if br.bit()? {
@@ -473,26 +479,29 @@ pub fn parse_global_motion_params(
             GmType::Identity
         };
         *slot = typ;
-        // Per §5.9.24 + §5.9.27 read_global_param — we don't retain
-        // the params for Phase 7 but must consume the right bit count.
-        // All reference params default to 0 (no DPB state), so
-        // `decode_signed_subexp_with_ref` uses reference = 0.
+        // Per §5.9.24 + §5.9.27 read_global_param. All reference params
+        // default to 0 (no DPB state), so `decode_signed_subexp_with_ref`
+        // uses reference = 0.
         match typ {
-            GmType::Identity => {}
+            GmType::Identity => {
+                gm_params_out[i] = [0i32; 6];
+            }
             GmType::Translation => {
-                // params [0], [1] at translation precision.
-                read_global_param_no_ref(br, 0)?;
-                read_global_param_no_ref(br, 1)?;
+                let p0 = read_global_param_with_ref(br, 0)?;
+                let p1 = read_global_param_with_ref(br, 1)?;
+                gm_params_out[i] = [p0, p1, 0, 0, 0, 0];
             }
             GmType::RotZoom => {
-                read_global_param_no_ref(br, 2)?;
-                read_global_param_no_ref(br, 3)?;
+                let p2 = read_global_param_with_ref(br, 2)?;
+                let p3 = read_global_param_with_ref(br, 3)?;
+                gm_params_out[i] = [0, 0, p2, p3, 0, 0];
             }
             GmType::Affine => {
-                read_global_param_no_ref(br, 2)?;
-                read_global_param_no_ref(br, 3)?;
-                read_global_param_no_ref(br, 4)?;
-                read_global_param_no_ref(br, 5)?;
+                let p2 = read_global_param_with_ref(br, 2)?;
+                let p3 = read_global_param_with_ref(br, 3)?;
+                let p4 = read_global_param_with_ref(br, 4)?;
+                let p5 = read_global_param_with_ref(br, 5)?;
+                gm_params_out[i] = [0, 0, p2, p3, p4, p5];
             }
         }
     }
@@ -502,8 +511,10 @@ pub fn parse_global_motion_params(
 /// §5.9.27 `read_global_param(type, ref, idx)` with the simplifying
 /// assumption that the reference value is zero (no DPB state tracked
 /// in this parser). `idx` selects between translation (0/1) and alpha
-/// (2..=5) precision per §5.9.27.
-fn read_global_param_no_ref(br: &mut BitReader<'_>, _idx: usize) -> Result<()> {
+/// (2..=5) precision per §5.9.27. Returns the decoded parameter at
+/// whatever precision the spec assigns to `idx` — callers are
+/// responsible for the precision shift.
+fn read_global_param_with_ref(br: &mut BitReader<'_>, _idx: usize) -> Result<i32> {
     // From spec §5.9.27 (global_motion_params → read_global_param):
     // absBits = (idx < 2) ? GM_ABS_TRANS_ONLY_BITS (12) : GM_ABS_ALPHA_BITS (12)
     // Spec GM_ABS_ALPHA_BITS=12, GM_ABS_TRANS_ONLY_BITS=12,
@@ -512,8 +523,7 @@ fn read_global_param_no_ref(br: &mut BitReader<'_>, _idx: usize) -> Result<()> {
     // decode_signed_subexp_with_ref(-mx, mx+1, 0) is read.
     let abs_bits: u32 = 12;
     let mx = 1u32 << abs_bits;
-    let _ = decode_signed_subexp_with_ref(br, -(mx as i32), (mx + 1) as i32, 0)?;
-    Ok(())
+    decode_signed_subexp_with_ref(br, -(mx as i32), (mx + 1) as i32, 0)
 }
 
 /// §5.9.28 `decode_signed_subexp_with_ref(low, high, r)`.

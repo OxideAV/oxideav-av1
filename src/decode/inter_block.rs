@@ -145,26 +145,96 @@ pub fn decode_inter_block_syntax(
 }
 
 /// Derive a translational MV for GLOBALMV using the LAST slot's
-/// global-motion parameters. Our frame header parser stores only the
-/// `gm_type[]` discriminator (§5.9.24 params are consumed but not
-/// retained), so for non-Identity / non-Translation slots we fall back
-/// to zero-MV. Identity always yields zero. Translation will be wired
-/// once `gm_params[]` is surfaced — until then the return value
-/// matches the previous zero-MV behaviour for GLOBAL blocks.
+/// global-motion parameters (§7.10 / §7.11.3.6). Identity / RotZoom /
+/// Affine without warp support all collapse to zero-MV; TRANSLATION
+/// uses the stored `gm_params[LAST][0..=1]` components (row, col).
+///
+/// Spec §3 `GM_PARAM_TRANS_PREC` = 3 for TRANSLATION-only: the param
+/// bits encode 1/8-pel offsets directly, matching [`Mv`]'s precision.
+/// For higher-order global motion the translation components use
+/// 1/16-pel (`GM_PARAM_TRANS_BITS` path); in that case we scale down.
 fn global_mv_for_last(frame: &crate::frame_header::FrameHeader) -> Mv {
-    use crate::frame_header_tail::GmType;
     // LAST is ref index 1 in AV1's reference slot numbering (0 = intra,
     // 1 = LAST, ... per spec §3). Our narrow decoder collapses to
     // slot 1 for single-ref inter.
-    let gm = frame.gm_type.get(1).copied().unwrap_or(GmType::Identity);
+    translate_gm(
+        frame.gm_type.get(1).copied().unwrap_or_default(),
+        frame.gm_params.get(1).copied().unwrap_or([0; 6]),
+    )
+}
+
+/// Pure helper: convert `(gm_type, gm_params)` to an [`Mv`]. Extracted
+/// from [`global_mv_for_last`] so unit tests don't need to build a
+/// full [`FrameHeader`].
+fn translate_gm(gm: crate::frame_header_tail::GmType, params: [i32; 6]) -> Mv {
+    use crate::frame_header_tail::GmType;
     match gm {
-        GmType::Identity | GmType::RotZoom | GmType::Affine => Mv::default(),
-        GmType::Translation => {
-            // Translation params are not currently retained by the
-            // header parser; fall back to zero until they are.
-            Mv::default()
-        }
+        GmType::Identity => Mv::default(),
+        GmType::Translation => Mv {
+            row: params[0],
+            col: params[1],
+        },
+        // Higher-order global motion: translation component is stored
+        // at 1/16-pel when paired with alpha coefficients, but our
+        // narrow path has no warp engine — fall back to zero-MV.
+        GmType::RotZoom | GmType::Affine => Mv::default(),
     }
+}
+
+/// Run compound bi-prediction MC for a single luma block (§7.11.3.9
+/// `AverageMc`). Fetches both references via the single-ref MC path,
+/// then averages them. `ref0 / ref1` are the two reference planes;
+/// `mv0 / mv1` are their respective MVs.
+#[allow(clippy::too_many_arguments)]
+pub fn compound_mc_luma_u8(
+    ref0: &[u8],
+    ref1: &[u8],
+    ref_w: usize,
+    ref_h: usize,
+    ref_stride: usize,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    mv0: Mv,
+    mv1: Mv,
+    filt: InterpFilter,
+) -> Vec<u8> {
+    use super::mc::average_mc_u8;
+    let p0 = mc_luma_u8(ref0, ref_w, ref_h, ref_stride, x, y, w, h, mv0, filt);
+    let p1 = mc_luma_u8(ref1, ref_w, ref_h, ref_stride, x, y, w, h, mv1, filt);
+    let mut out = vec![0u8; w * h];
+    average_mc_u8(&p0, &p1, &mut out);
+    out
+}
+
+/// HBD counterpart of [`compound_mc_luma_u8`].
+#[allow(clippy::too_many_arguments)]
+pub fn compound_mc_luma_u16(
+    ref0: &[u16],
+    ref1: &[u16],
+    ref_w: usize,
+    ref_h: usize,
+    ref_stride: usize,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    mv0: Mv,
+    mv1: Mv,
+    filt: InterpFilter,
+    bit_depth: u32,
+) -> Vec<u16> {
+    use super::mc::average_mc_u16;
+    let p0 = mc_luma_u16(
+        ref0, ref_w, ref_h, ref_stride, x, y, w, h, mv0, filt, bit_depth,
+    );
+    let p1 = mc_luma_u16(
+        ref1, ref_w, ref_h, ref_stride, x, y, w, h, mv1, filt, bit_depth,
+    );
+    let mut out = vec![0u16; w * h];
+    average_mc_u16(&p0, &p1, &mut out, bit_depth);
+    out
 }
 
 /// Run luma motion compensation for a single block into an owned
@@ -270,4 +340,57 @@ pub fn mc_chroma_u16(
 /// Map `BlockSize` to `block_size_group` bucket.
 pub fn block_size_group_for(bs: BlockSize) -> usize {
     block_size_group(bs.width() as usize, bs.height() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_header_tail::GmType;
+
+    #[test]
+    fn translate_gm_identity_is_zero() {
+        let mv = translate_gm(GmType::Identity, [100, 200, 0, 0, 0, 0]);
+        assert_eq!(mv, Mv::default());
+    }
+
+    #[test]
+    fn translate_gm_translation_round_trips_params() {
+        let mv = translate_gm(GmType::Translation, [12, -34, 0, 0, 0, 0]);
+        assert_eq!(mv.row, 12);
+        assert_eq!(mv.col, -34);
+    }
+
+    #[test]
+    fn translate_gm_rotzoom_falls_back_to_zero() {
+        // Without a warp engine, RotZoom reduces to zero-MV even when
+        // the params carry a non-zero translation slot.
+        let mv = translate_gm(GmType::RotZoom, [0, 0, 1 << 14, 0, 0, 0]);
+        assert_eq!(mv, Mv::default());
+    }
+
+    #[test]
+    fn compound_mc_luma_averages_two_refs() {
+        let w = 8;
+        let h = 8;
+        let ref0 = vec![100u8; 32 * 32];
+        let ref1 = vec![200u8; 32 * 32];
+        let out = compound_mc_luma_u8(
+            &ref0,
+            &ref1,
+            32,
+            32,
+            32,
+            10,
+            10,
+            w,
+            h,
+            Mv { row: 0, col: 0 },
+            Mv { row: 0, col: 0 },
+            InterpFilter::Regular,
+        );
+        // Average of 100 and 200 with +1 round is 150.
+        for v in out {
+            assert_eq!(v, 150u8);
+        }
+    }
 }
