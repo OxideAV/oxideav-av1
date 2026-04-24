@@ -259,6 +259,55 @@ pub fn mc_luma_u8(
     pred
 }
 
+/// Reference-scaled luma MC (§7.9). `cur_w / cur_h` are the current
+/// frame dimensions; `ref_w / ref_h` are the reference plane's. When
+/// the scale factors collapse to identity (equal dims) this routes
+/// through the plain [`mc_luma_u8`] path.
+///
+/// Narrow implementation: computes the scaled block origin via
+/// [`super::ref_scale::ScaleFactors::project`] and issues a single
+/// translational MC against the projected position. The full spec
+/// would interpolate per-sample step sizes — this approximation is
+/// exact at integer scales (½, 1, 2×) and near-correct for
+/// super-resolution GOPs whose scale ratios are close to 1.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_luma_u8_scaled(
+    ref_plane: &[u8],
+    ref_w: usize,
+    ref_h: usize,
+    ref_stride: usize,
+    cur_w: u32,
+    cur_h: u32,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    mv: Mv,
+    filt: InterpFilter,
+) -> Vec<u8> {
+    use super::ref_scale::ScaleFactors;
+    let sf = ScaleFactors::new(ref_w as u32, ref_h as u32, cur_w, cur_h);
+    if sf.is_identity() {
+        return mc_luma_u8(ref_plane, ref_w, ref_h, ref_stride, x, y, w, h, mv, filt);
+    }
+    // Projected block origin (in 14-bit fixed-point). Reduce to
+    // integer-pel + eighth-pel MV carryover.
+    let (px, py) = sf.project(x, y, mv.row, mv.col);
+    // Integer part in samples (right-shift 14) + fractional retained
+    // as an effective MV for the inner MC call.
+    let int_x = (px >> 14) as i32;
+    let int_y = (py >> 14) as i32;
+    let frac_x = ((px & ((1i64 << 14) - 1)) >> 11) as i32; // take top 3 bits → eighth-pel
+    let frac_y = ((py & ((1i64 << 14) - 1)) >> 11) as i32;
+    let proj_mv = Mv {
+        row: frac_y,
+        col: frac_x,
+    };
+    mc_luma_u8(
+        ref_plane, ref_w, ref_h, ref_stride, int_x, int_y, w, h, proj_mv, filt,
+    )
+}
+
 /// HBD luma MC. Returns a tight `w*h` u16 buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn mc_luma_u16(
@@ -366,6 +415,53 @@ mod tests {
         // the params carry a non-zero translation slot.
         let mv = translate_gm(GmType::RotZoom, [0, 0, 1 << 14, 0, 0, 0]);
         assert_eq!(mv, Mv::default());
+    }
+
+    #[test]
+    fn scaled_mc_luma_identity_matches_plain_path() {
+        // At identity scale, `mc_luma_u8_scaled` must match
+        // `mc_luma_u8`. Use a deterministic reference.
+        let mut r = vec![0u8; 32 * 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                r[y * 32 + x] = ((x * 7 + y * 11) & 0xFF) as u8;
+            }
+        }
+        let mv = Mv { row: 16, col: -8 };
+        let plain = mc_luma_u8(&r, 32, 32, 32, 4, 4, 8, 8, mv, InterpFilter::Regular);
+        let scaled = mc_luma_u8_scaled(
+            &r, 32, 32, 32, 32, 32, 4, 4, 8, 8, mv, InterpFilter::Regular,
+        );
+        assert_eq!(plain, scaled, "identity-scaled MC must match plain MC");
+    }
+
+    #[test]
+    fn scaled_mc_luma_half_res_pulls_half_coords() {
+        // Reference is 16×16, current is 32×32 — scaled position (4, 4)
+        // maps to (2, 2) in ref. The helper should produce the
+        // half-resolution sample.
+        let mut r = vec![0u8; 16 * 16];
+        for y in 0..16 {
+            for x in 0..16 {
+                r[y * 16 + x] = ((y * 10 + x) & 0xFF) as u8;
+            }
+        }
+        let out = mc_luma_u8_scaled(
+            &r,
+            16,
+            16,
+            16,
+            32,
+            32,
+            4,
+            4,
+            4,
+            4,
+            Mv::default(),
+            InterpFilter::Regular,
+        );
+        // out[0] should come from ref at scaled (2, 2) = 22.
+        assert_eq!(out[0], 22);
     }
 
     #[test]

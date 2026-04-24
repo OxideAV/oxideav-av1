@@ -24,7 +24,7 @@ use super::block::{
 use super::coeffs::{decode_coefficients, nz_map_ctx_offset, tx_size_idx};
 use super::frame_state::FrameState;
 use super::inter_block::{
-    decode_inter_block_syntax, mc_chroma_u16, mc_chroma_u8, mc_luma_u16, mc_luma_u8,
+    decode_inter_block_syntax, mc_chroma_u16, mc_chroma_u8, mc_luma_u16, mc_luma_u8_scaled,
 };
 use super::modes::{mode_ctx_bucket, IntraMode};
 use super::mv::Mv;
@@ -588,11 +588,18 @@ fn reconstruct_inter_luma_block(
         .as_ref()
         .ok_or_else(|| Error::invalid("av1 inter: prev_frame checked earlier"))?;
     if fs.bit_depth == 8 {
-        let pred = mc_luma_u8(
+        // §7.9 reference scaling: if the previous frame's resolution
+        // differs from the current frame's, route through the scaled
+        // MC helper which projects the block origin + MV into the
+        // reference coordinate system. Matching-dim case collapses to
+        // the plain `mc_luma_u8` path inside the helper.
+        let pred = mc_luma_u8_scaled(
             &prev.y_plane,
             prev.width as usize,
             prev.height as usize,
             prev.width as usize,
+            fs.width,
+            fs.height,
             x as i32,
             y as i32,
             w,
