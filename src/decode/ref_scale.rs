@@ -59,8 +59,10 @@ impl ScaleFactors {
         // x_step multiply (since x_step is in 1/(1<<14) of reference
         // over current and position is integer).
         // Refined: ref_x_subpel = x * x_step + (mv_col * x_step) / 8
-        let ref_x = (x as i64) * (self.x_step as i64) + ((mv_col as i64) * (self.x_step as i64)) / 8;
-        let ref_y = (y as i64) * (self.y_step as i64) + ((mv_row as i64) * (self.y_step as i64)) / 8;
+        let ref_x =
+            (x as i64) * (self.x_step as i64) + ((mv_col as i64) * (self.x_step as i64)) / 8;
+        let ref_y =
+            (y as i64) * (self.y_step as i64) + ((mv_row as i64) * (self.y_step as i64)) / 8;
         (ref_x, ref_y)
     }
 }

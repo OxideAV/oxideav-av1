@@ -1,53 +1,56 @@
 //! AV1 superblock + leaf-block mode decoder + reconstruction —
 //! §5.11.4 + §5.11.8 + §5.11.18 + §5.11.39 + §7.7 + §7.11.
 //!
-//! Phase 5 wires the full intra predictor set (DC/V/H + 6 directional
-//! + 3 smooth + Paeth + CFL) and native 10/12-bit HBD paths; the
+//! Phase 5 wires the full intra predictor set (DC/V/H + 6 directional +
+//! 3 smooth + Paeth + CFL) and native 10/12-bit HBD paths; the
 //! pre-Phase-5 DC_PRED fallback is gone.
 //!
-//! # Known syntax-level gaps (ordered by testsrc PSNR impact)
+//! # Round 6 status
 //!
-//! Round-5 diagnosis of the testsrc 64×64 fixture confirmed the
-//! decoded Y plane collapses to a single 64×64 DC_PRED block with
-//! all-zero coefficients (PSNR ~11 dB) even though the encoder
-//! produced rich content. Root cause is symbol-stream desync driven
-//! by several missing / mis-ordered reads relative to §5.11.5
-//! `decode_block`:
+//! Round 6 landed the two biggest desync fixes flagged by Round 5:
 //!
-//! - `read_block_tx_size()` (§5.11.16) — **never called**. For
+//! - **`read_block_tx_size()` (§5.11.16)** — now wired. For
 //!   `TxMode == TX_MODE_SELECT` on `MiSize > 4×4` intra blocks the
-//!   spec reads a `tx_depth` symbol (§5.11.15). We skip it and read
-//!   coefficients at the wrong TX size. This single omission alone
-//!   desyncs every subsequent symbol.
-//! - `read_skip()` ordering — the spec's `intra_frame_mode_info()`
-//!   reads skip *before* the y_mode / uv_mode. We read it after.
-//! - `read_cdef()`, `read_delta_qindex()`, `read_delta_lf()` — our
-//!   current code reads `read_cdef` only after mode, and never reads
-//!   the delta-Q / delta-LF symbols the encoder writes per-SB when
-//!   `delta_q_present` is set.
-//! - `filter_intra_mode_info()` (§5.11.24) — never called. Has its
-//!   own CDF which is also absent from `cdfs::generated`.
-//! - `palette_mode_info()` (§5.11.25) — not called; when
-//!   `allow_screen_content_tools` is set the encoder can emit
-//!   palette tokens that desync us.
-//! - `use_intrabc` (§5.11.7) — not read when
-//!   `allow_screen_content_tools`.
+//!   decoder reads the `tx_depth` symbol via
+//!   [`tile::TileDecoder::decode_tx_depth`] and stores the resulting
+//!   `TxSize` on the MI grid, so downstream blocks can derive the
+//!   `(aboveW >= maxTxWidth) + (leftH >= maxTxHeight)` context (spec
+//!   §9.4.8). `reconstruct_luma_block` now walks TX units sized to
+//!   the decoded `TxSize` — not the block footprint — matching
+//!   §5.11.34 `residual()`.
+//! - **`read_skip()` ordering** — spec §5.11.7
+//!   `intra_frame_mode_info()` reads `skip → segment → cdef → mode`;
+//!   our decoder now matches that order (previously read skip after
+//!   the mode/angle_delta symbols, which shifted the whole symbol
+//!   stream).
 //!
-//! Closing this gap requires a rework of `decode_leaf_block` to
-//! match §5.11.5 line-for-line plus generating the missing CDFs
-//! (filter_intra, delta_q, delta_lf, intrabc). Out of scope for
-//! Round 5's 2 h budget — flagged here so a future round can tackle
-//! it as a dedicated pass.
+//! # Remaining syntax-level gaps (Round 7+)
+//!
+//! - `read_delta_qindex()` + `read_delta_lf()` — never called. Per
+//!   §5.11.11/§5.11.12 these only fire when `delta_q_present` / the
+//!   corresponding LF flag are set, so AVIF stills tend to skip them
+//!   anyway, but any encoder that does enable per-SB deltas desyncs.
+//! - `use_intrabc` (§5.11.7) — not read when `allow_intrabc`.
+//! - `filter_intra_mode_info()` (§5.11.24) — never called. CDF still
+//!   absent from `cdfs::generated`.
+//! - `palette_mode_info()` (§5.11.25) — not called; palette tokens
+//!   still desync the stream when `allow_screen_content_tools` is
+//!   set.
+//! - Inter path (`decode_inter_leaf_block`) still reads `skip` after
+//!   `y_mode` for intra-within-inter blocks — §5.11.23 sequencing
+//!   applies there too but is out of the Round 6 scope.
 
 use oxideav_core::{Error, Result};
 
 use crate::predict::intra::{
-    cfl_pred, cfl_pred16, cfl_subsample, cfl_subsample16, dc_pred, dc_pred16, directional_pred_ext,
-    directional_pred16_ext, edge::{
+    cfl_pred, cfl_pred16, cfl_subsample, cfl_subsample16, dc_pred, dc_pred16,
+    directional_pred16_ext, directional_pred_ext,
+    edge::{
         edge_filter, edge_filter16, edge_filter_strength, edge_upsample, edge_upsample16,
         edge_use_upsample,
-    }, h_pred, h_pred16, mode_to_angle_map, paeth_pred, paeth_pred16, smooth_h_pred,
-    smooth_h_pred16, smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16, v_pred, v_pred16,
+    },
+    h_pred, h_pred16, mode_to_angle_map, paeth_pred, paeth_pred16, smooth_h_pred, smooth_h_pred16,
+    smooth_pred, smooth_pred16, smooth_v_pred, smooth_v_pred16, v_pred, v_pred16,
 };
 use crate::quant;
 use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
@@ -374,12 +377,41 @@ pub fn decode_leaf_block(
         0
     };
 
-    let segment_id = if td.frame.segmentation.enabled && td.frame.segmentation.update_map {
+    // Spec §5.11.7 `intra_frame_mode_info()` ordering — issue the
+    // reads in the exact sequence the bitstream expects so the
+    // symbol stream stays aligned:
+    //   1. intra_segment_id  (if SegIdPreSkip)
+    //   2. read_skip
+    //   3. intra_segment_id  (if !SegIdPreSkip)
+    //   4. read_cdef
+    //   5. (skipped for now: read_delta_qindex, read_delta_lf,
+    //       use_intrabc — see round-5 decode_leaf_block notes)
+    //   6. intra_frame_y_mode + intra_angle_info_y
+    //   7. uv_mode + intra_angle_info_uv + read_cfl_alphas
+    //   8. (skipped for now: palette_mode_info, filter_intra_mode_info)
+    // Then §5.11.5 `decode_block()` calls `read_block_tx_size()` to
+    // pull the TX_SIZE symbol — this is what Round 5 diagnosed as the
+    // single biggest desync driver.
+
+    let seg_enabled = td.frame.segmentation.enabled && td.frame.segmentation.update_map;
+    let seg_pre_skip = td.frame.segmentation.seg_id_pre_skip;
+    let mut segment_id: u8 = 0;
+    if seg_enabled && seg_pre_skip {
         let ctx = segment_id_ctx(above_seg, left_seg, have_above_mi, have_left_mi);
-        td.decode_segment_id(ctx)?
-    } else {
-        0
-    };
+        segment_id = td.decode_segment_id(ctx)?;
+    }
+
+    let skip = td.decode_skip(0)?;
+
+    if seg_enabled && !seg_pre_skip {
+        let ctx = segment_id_ctx(above_seg, left_seg, have_above_mi, have_left_mi);
+        segment_id = td.decode_segment_id(ctx)?;
+    }
+
+    // Spec §5.11.56 read_cdef(): at the first non-skip block in each
+    // 64×64 luma region, read `cdef_bits` literal bits of cdef_idx and
+    // stamp that value over the entire 64×64 region.
+    read_cdef(td, fs, x, y, skip)?;
 
     let y_mode = td.decode_intra_y_mode(mode_ctx_bucket(above_mode), mode_ctx_bucket(left_mode))?;
     let angle_delta_y = if y_mode.is_directional() {
@@ -388,13 +420,6 @@ pub fn decode_leaf_block(
     } else {
         0
     };
-
-    let skip = td.decode_skip(0)?;
-
-    // Spec §5.11.56 read_cdef(): at the first non-skip block in each
-    // 64×64 luma region, read `cdef_bits` literal bits of cdef_idx and
-    // stamp that value over the entire 64×64 region.
-    read_cdef(td, fs, x, y, skip)?;
 
     let num_planes = td.seq.color_config.num_planes;
     let mut uv_mode = y_mode;
@@ -426,10 +451,17 @@ pub fn decode_leaf_block(
         }
     }
 
+    // Spec §5.11.5 `decode_block()` line "read_block_tx_size()".
+    // For intra frames the `is_inter` branch of §5.11.16 collapses to
+    // `read_tx_size(!skip || !is_inter)` = `read_tx_size(true)`; see
+    // `read_intra_block_tx_size` below for the symbol read.
+    let tx_size = read_intra_block_tx_size(td, fs, bs, mi_col, mi_row, skip)?;
+
     // Propagate mode info to every MI cell the block covers.
     let mi_w = (bw + 3) >> 2;
     let mi_h = (bh + 3) >> 2;
     let stored_uv = if fs.monochrome { None } else { Some(uv_mode) };
+    let mi_size_idx = bs as u8;
     for mr in 0..mi_h {
         for mc in 0..mi_w {
             let cell_col = mi_col + mc;
@@ -446,6 +478,8 @@ pub fn decode_leaf_block(
             mi.angle_delta_uv = angle_delta_uv;
             mi.cfl_alpha_u = cfl_alpha_u;
             mi.cfl_alpha_v = cfl_alpha_v;
+            mi.tx_size = Some(tx_size);
+            mi.mi_size_idx = mi_size_idx;
         }
     }
 
@@ -467,6 +501,7 @@ pub fn decode_leaf_block(
         angle_delta_y,
         skip,
         segment_id,
+        Some(tx_size),
     )?;
 
     // Chroma path.
@@ -488,6 +523,99 @@ pub fn decode_leaf_block(
     }
 
     Ok(())
+}
+
+/// §5.11.16 `read_block_tx_size()` — intra branch. For intra-key /
+/// intra-only frames `is_inter == 0`, so the var-tx sub-path is
+/// unreachable and we always take the `read_tx_size(!skip ||
+/// !is_inter)` = `read_tx_size(true)` leg.
+///
+/// The call is load-bearing even when the decoder still recomputes the
+/// TX dims from the block footprint downstream: reading the `tx_depth`
+/// symbol keeps the range coder aligned with the encoder's bitstream
+/// (spec §5.11.16 is the single biggest desync driver flagged by
+/// Round 5).
+///
+/// Returns the decoded `TxSize` — the value the spec stores as
+/// `TxSize` / `InterTxSizes` — so subsequent blocks can derive the
+/// `tx_depth` neighbour context.
+fn read_intra_block_tx_size(
+    td: &mut TileDecoder<'_>,
+    fs: &FrameState,
+    bs: BlockSize,
+    mi_col: u32,
+    mi_row: u32,
+    skip: bool,
+) -> Result<TxSize> {
+    // §5.11.15: Lossless path pins TxSize to TX_4X4, no symbol.
+    let lossless = crate::frame_header_tail::coded_lossless_hint(&td.frame.quant);
+    if lossless {
+        return Ok(TxSize::Tx4x4);
+    }
+    let max_rect_tx_size = bs.max_tx_size_rect().unwrap_or(TxSize::Tx4x4);
+    let max_tx_depth = bs.max_tx_depth();
+    // For intra (is_inter = 0), allowSelect = !skip || !is_inter = true.
+    let allow_select = true;
+    let tx_mode_select = matches!(td.frame.tx_mode, crate::frame_header_tail::TxMode::Select);
+    if bs as u32 > BlockSize::Block4x4 as u32 && allow_select && tx_mode_select && max_tx_depth > 0
+    {
+        let ctx = tx_depth_ctx(fs, mi_col, mi_row, max_rect_tx_size);
+        let raw = td.decode_tx_depth(max_tx_depth, ctx)?;
+        // The `tx_depth` symbol ranges over 0..=(max_encoded_depth),
+        // where encoded depth maxes out at 2 per the spec note.
+        let mut tx = max_rect_tx_size;
+        for _ in 0..raw {
+            tx = tx.split();
+        }
+        Ok(tx)
+    } else {
+        // `skip` intentionally unused here — §5.11.16 still assigns
+        // `TxSize = maxRectTxSize` when `tx_depth` isn't read.
+        let _ = skip;
+        Ok(max_rect_tx_size)
+    }
+}
+
+/// §5.11.16 `tx_depth` CDF context. Per spec:
+///   ctx = (aboveW >= maxTxWidth) + (leftH >= maxTxHeight)
+/// where `aboveW` and `leftH` come from the helpers
+/// `get_above_tx_width` / `get_left_tx_height` (spec §9.4.8).
+///
+/// For intra key frames `IsInters[...]` is always 0, so the
+/// `IsInters`-gated branches in those helpers collapse to their
+/// non-inter leg (use `Tx_Width/Tx_Height[InterTxSizes[...]]`).
+fn tx_depth_ctx(fs: &FrameState, mi_col: u32, mi_row: u32, max_rect_tx_size: TxSize) -> u32 {
+    let max_tx_w = max_rect_tx_size.width() as u32;
+    let max_tx_h = max_rect_tx_size.height() as u32;
+
+    let above_w = if mi_row > 0 && mi_col < fs.mi_cols {
+        // Row just above is present.
+        let above = fs.mi_at(mi_col, mi_row - 1);
+        if let Some(tx) = above.tx_size {
+            tx.width() as u32
+        } else {
+            // Unknown → treat as 64 (max), matching `!AvailU` in spec.
+            64
+        }
+    } else {
+        // !AvailU → get_above_tx_width returns 64.
+        64
+    };
+
+    let left_h = if mi_col > 0 && mi_row < fs.mi_rows {
+        let left = fs.mi_at(mi_col - 1, mi_row);
+        if let Some(tx) = left.tx_size {
+            tx.height() as u32
+        } else {
+            64
+        }
+    } else {
+        64
+    };
+
+    let a = if above_w >= max_tx_w { 1 } else { 0 };
+    let l = if left_h >= max_tx_h { 1 } else { 0 };
+    a + l
 }
 
 /// Inter-frame leaf decode — reads block-level inter syntax, runs MC
@@ -542,7 +670,23 @@ fn decode_inter_leaf_block(
                 mi.mv_col = 0;
             }
         }
-        reconstruct_luma_block(td, fs, x, y, bw, bh, info.intra_y_mode, 0, info.skip, 0)?;
+        // Inter-within-inter intra blocks don't read `tx_depth` yet
+        // (the var-tx inter path is out of scope for Round 6), so pass
+        // `None` and let reconstruct_luma_block use its pre-Round-6
+        // 64-sample cap fallback.
+        reconstruct_luma_block(
+            td,
+            fs,
+            x,
+            y,
+            bw,
+            bh,
+            info.intra_y_mode,
+            0,
+            info.skip,
+            0,
+            None,
+        )?;
         if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
             reconstruct_chroma_block(
                 td,
@@ -945,9 +1089,29 @@ fn reconstruct_luma_block(
     angle_delta: i8,
     skip: bool,
     segment_id: u8,
+    decoded_tx_size: Option<TxSize>,
 ) -> Result<()> {
     let w = bw as usize;
     let h = bh as usize;
+
+    // §5.11.16 provided a `TxSize` for this block. When present, use it
+    // to partition the block into TX units — this replaces the legacy
+    // `tx_unit_dims(w, h)` 64-sample cap with the spec's `(tx_depth,
+    // maxRectTxSize)` pairing. When absent (inter paths not yet wired
+    // to the var-tx decoder) we fall back to the pre-Round-6 behaviour.
+    let (tx_w, tx_h) = match decoded_tx_size {
+        Some(ts) => (ts.width().min(w), ts.height().min(h)),
+        None => tx_unit_dims(w, h),
+    };
+    // Guard against degenerate dims — the block footprint must divide
+    // the TX dimensions cleanly; when it doesn't we fall back to the
+    // block size (effectively one TX unit) to avoid a divide-by-zero /
+    // partial-coverage walk.
+    let (tx_w, tx_h) = if tx_w == 0 || tx_h == 0 || w % tx_w != 0 || h % tx_h != 0 {
+        tx_unit_dims(w, h)
+    } else {
+        (tx_w, tx_h)
+    };
 
     // Block-level tx_type (§6.10.15): for blocks with area > 32×32 the
     // ext-tx set is 0 (implicit DCT_DCT, no CDF read), so decoding the
@@ -955,21 +1119,30 @@ fn reconstruct_luma_block(
     // symbol stream. For blocks with area ≤ 32×32 there is exactly one
     // TX unit (since the block already fits inside a 64×64 TX), so
     // reading the type once remains spec-correct.
-    let tx_type = if skip {
-        // No coefficients to transform — the tx_type is irrelevant and
-        // the symbol stream doesn't carry one anyway.
+    //
+    // Per §5.11.47 the `intra_tx_type` symbol is read **per TX unit**,
+    // not per block — we approximate by reading once per block when the
+    // block has only a single TX unit, and once per TX unit otherwise.
+    let single_tx_unit = (w == tx_w) && (h == tx_h);
+    let block_tx_type = if skip || !single_tx_unit {
         TxType::DctDct
     } else {
-        td.decode_intra_tx_type(w, h, y_mode)?
+        td.decode_intra_tx_type(tx_w, tx_h, y_mode)?
     };
 
-    let (tx_w, tx_h) = tx_unit_dims(w, h);
     let cols = w / tx_w;
     let rows = h / tx_h;
     for ty in 0..rows {
         for tx in 0..cols {
             let ux = x as usize + tx * tx_w;
             let uy = y as usize + ty * tx_h;
+            let tx_type = if skip {
+                TxType::DctDct
+            } else if single_tx_unit {
+                block_tx_type
+            } else {
+                td.decode_intra_tx_type(tx_w, tx_h, y_mode)?
+            };
             reconstruct_one_luma_tx_unit(
                 td,
                 fs,
@@ -1481,12 +1654,7 @@ fn reconstruct_one_chroma_tx_unit(
 /// `plane_idx` is 0 for Y, 1/2 for chroma. Chroma planes shift the MI
 /// lookup by subsampling per the spec so 4:2:0 blocks read the correct
 /// 4×4 MI cell.
-fn get_filter_type(
-    fs: &FrameState,
-    mi_row: u32,
-    mi_col: u32,
-    plane_idx: u32,
-) -> u32 {
+fn get_filter_type(fs: &FrameState, mi_row: u32, mi_col: u32, plane_idx: u32) -> u32 {
     let is_smooth = |mode_opt: Option<IntraMode>| -> bool {
         matches!(
             mode_opt,
@@ -1511,7 +1679,13 @@ fn get_filter_type(
         if r < fs.mi_rows && c < fs.mi_cols {
             let mi = fs.mi_at(c, r);
             // §7.11.2.8 is_smooth: non-luma inter blocks return 0.
-            let mode = if plane_idx == 0 { mi.mode } else if mi.is_inter { None } else { mi.uv_mode };
+            let mode = if plane_idx == 0 {
+                mi.mode
+            } else if mi.is_inter {
+                None
+            } else {
+                mi.uv_mode
+            };
             above_smooth = is_smooth(mode);
         }
     }
@@ -1528,11 +1702,21 @@ fn get_filter_type(
         }
         if r < fs.mi_rows && c < fs.mi_cols {
             let mi = fs.mi_at(c, r);
-            let mode = if plane_idx == 0 { mi.mode } else if mi.is_inter { None } else { mi.uv_mode };
+            let mode = if plane_idx == 0 {
+                mi.mode
+            } else if mi.is_inter {
+                None
+            } else {
+                mi.uv_mode
+            };
             left_smooth = is_smooth(mode);
         }
     }
-    if above_smooth || left_smooth { 1 } else { 0 }
+    if above_smooth || left_smooth {
+        1
+    } else {
+        0
+    }
 }
 
 /// Run the u8 intra predictor against the reconstructed plane. Returns
@@ -1568,7 +1752,9 @@ fn run_intra_prediction_u8(
     let mut dst = vec![0u8; w * h];
     match mode {
         IntraMode::DcPred | IntraMode::CflPred => {
-            dc_pred(&mut dst, w, h, &above_raw, &left_raw, have_above, have_left, 8);
+            dc_pred(
+                &mut dst, w, h, &above_raw, &left_raw, have_above, have_left, 8,
+            );
         }
         IntraMode::VPred => {
             v_pred(&mut dst, w, h, &above_raw);
@@ -1660,9 +1846,10 @@ fn upsample_edge_u8(edge: &[u8], primary: usize, secondary: usize, extends_into:
     let mut buf = vec![0u8; 2 * num_px + 2];
     buf[1] = edge[0];
     for i in 0..num_px {
-        let src = edge.get(i).copied().unwrap_or_else(|| {
-            *edge.last().expect("upsample_edge_u8: empty edge slice")
-        });
+        let src = edge
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| *edge.last().expect("upsample_edge_u8: empty edge slice"));
         buf[i + 2] = src;
     }
     edge_upsample(&mut buf, num_px);
@@ -1692,8 +1879,17 @@ fn run_intra_prediction_u16(
 ) -> Vec<u16> {
     let ext_len = w + h + 4;
     let _ = fallback;
-    let (above_raw, left_raw, above_left) =
-        gather_neighbors_u16(plane, plane_stride, plane_height, x, y, w, h, ext_len, bit_depth);
+    let (above_raw, left_raw, above_left) = gather_neighbors_u16(
+        plane,
+        plane_stride,
+        plane_height,
+        x,
+        y,
+        w,
+        h,
+        ext_len,
+        bit_depth,
+    );
     let have_above = y > 0;
     let have_left = x > 0;
 
@@ -1784,9 +1980,10 @@ fn upsample_edge_u16(
     let mut buf = vec![0u16; 2 * num_px + 2];
     buf[1] = edge[0];
     for i in 0..num_px {
-        let src = edge.get(i).copied().unwrap_or_else(|| {
-            *edge.last().expect("upsample_edge_u16: empty edge slice")
-        });
+        let src = edge
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| *edge.last().expect("upsample_edge_u16: empty edge slice"));
         buf[i + 2] = src;
     }
     edge_upsample16(&mut buf, num_px, bit_depth);
@@ -2156,13 +2353,46 @@ mod tests {
             4, /* w */
             4, /* h */
             IntraMode::D67Pred,
-            0, /* angle_delta */
-            128, /* fallback */
+            0,    /* angle_delta */
+            128,  /* fallback */
             true, /* enable_edge_filter */
             0,    /* filter_type */
         );
         for &v in &got {
             assert_eq!(v, 100, "edge-filtered constant D67 drifted: {:?}", got);
         }
+    }
+
+    // §5.11.16 / §9.4.8: `tx_depth` context is
+    //   (aboveW >= maxTxWidth) + (leftH >= maxTxHeight).
+    // Without neighbours both `aboveW` and `leftH` clamp to 64, so for
+    // any `maxRectTxSize` ≤ 64×64 the ctx is 2. A smaller neighbour
+    // TX drops the corresponding term to 0.
+    #[test]
+    fn tx_depth_ctx_edges_without_neighbours_collapse_to_two() {
+        let fs = FrameState::new(32, 32, 1, 1, false);
+        // Top-left corner — both AvailU and AvailL are false.
+        assert_eq!(tx_depth_ctx(&fs, 0, 0, TxSize::Tx32x32), 2);
+    }
+
+    #[test]
+    fn tx_depth_ctx_small_above_neighbour_drops_above_term() {
+        let mut fs = FrameState::new(32, 32, 1, 1, false);
+        // Stamp a 4×4 TX on (0, 0); querying (0, 1) uses that as above.
+        fs.mi_mut(0, 0).tx_size = Some(TxSize::Tx4x4);
+        // For maxRectTxSize = Tx16x16 the above term is 0 (4 < 16),
+        // but left clamps to 64 → ctx = 0 + 1 = 1.
+        assert_eq!(tx_depth_ctx(&fs, 0, 1, TxSize::Tx16x16), 1);
+    }
+
+    #[test]
+    fn tx_depth_ctx_large_neighbours_give_two() {
+        let mut fs = FrameState::new(64, 64, 1, 1, false);
+        fs.mi_mut(0, 0).tx_size = Some(TxSize::Tx32x32);
+        fs.mi_mut(1, 0).tx_size = Some(TxSize::Tx32x32);
+        fs.mi_mut(0, 1).tx_size = Some(TxSize::Tx32x32);
+        // Query (1, 1) — above is (1, 0), left is (0, 1). Both 32 ≥ 16,
+        // so ctx = 1 + 1 = 2.
+        assert_eq!(tx_depth_ctx(&fs, 1, 1, TxSize::Tx16x16), 2);
     }
 }

@@ -80,15 +80,7 @@ pub fn motion_compensate(
     filt: InterpFilter,
 ) {
     // §7.11.3.3 clamp MV to `[-MV_BORDER, frame + MV_BORDER]`.
-    let mv = clamp_mv_to_frame(
-        mv,
-        bx,
-        by,
-        w as i32,
-        h as i32,
-        ref_w as i32,
-        ref_h as i32,
-    );
+    let mv = clamp_mv_to_frame(mv, bx, by, w as i32, h as i32, ref_w as i32, ref_h as i32);
     let int_x = mv.col >> 3;
     let int_y = mv.row >> 3;
     let phase_x = (mv.col & 7) as usize;
@@ -145,15 +137,7 @@ pub fn motion_compensate16(
     bit_depth: u32,
 ) {
     // §7.11.3.3 clamp MV to `[-MV_BORDER, frame + MV_BORDER]`.
-    let mv = clamp_mv_to_frame(
-        mv,
-        bx,
-        by,
-        w as i32,
-        h as i32,
-        ref_w as i32,
-        ref_h as i32,
-    );
+    let mv = clamp_mv_to_frame(mv, bx, by, w as i32, h as i32, ref_w as i32, ref_h as i32);
     let int_x = mv.col >> 3;
     let int_y = mv.row >> 3;
     let phase_x = (mv.col & 7) as usize;
@@ -389,7 +373,10 @@ mod tests {
         // MV that would land ~4000 samples past the right edge is
         // clipped. Integer part clamps to frame_w + MV_BORDER - bx =
         // 128 + 128 - 0 = 256.
-        let mv = Mv { row: 0, col: 4000 * 8 };
+        let mv = Mv {
+            row: 0,
+            col: 4000 * 8,
+        };
         let out = clamp_mv_to_frame(mv, 0, 0, 16, 16, 128, 128);
         assert_eq!(out.col >> 3, 256);
         // Fractional component preserved.
@@ -398,7 +385,10 @@ mod tests {
 
     #[test]
     fn clamp_mv_preserves_fractional_phase() {
-        let mv = Mv { row: 0, col: -99999 };
+        let mv = Mv {
+            row: 0,
+            col: -99999,
+        };
         let frac = mv.col & 7;
         let out = clamp_mv_to_frame(mv, 0, 0, 16, 16, 64, 64);
         assert_eq!(out.col & 7, frac);

@@ -48,11 +48,7 @@ pub fn adjust_pri_strength(pri_str: i32, var: i32) -> i32 {
         return 0;
     }
     let v6 = var >> 6;
-    let var_str = if v6 != 0 {
-        floor_log2(v6).min(12)
-    } else {
-        0
-    };
+    let var_str = if v6 != 0 { floor_log2(v6).min(12) } else { 0 };
     (pri_str * (4 + var_str) + 8) >> 4
 }
 
@@ -451,19 +447,7 @@ mod tests {
         let stride = 16;
         let src: Vec<u8> = (0..16 * 16).map(|i| ((i * 13) & 0xFF) as u8).collect();
         let mut dst = src.clone();
-        filter_block_spec(
-            &mut dst,
-            &src,
-            stride,
-            4,
-            4,
-            2,
-            20,
-            10,
-            6,
-            0,
-            |_, _| false,
-        );
+        filter_block_spec(&mut dst, &src, stride, 4, 4, 2, 20, 10, 6, 0, |_, _| false);
         for r in 4..12 {
             for c in 4..12 {
                 assert_eq!(dst[r * stride + c], src[r * stride + c]);
@@ -476,19 +460,9 @@ mod tests {
         let stride = 24;
         let src = vec![100u8; 24 * 24];
         let mut dst = src.clone();
-        filter_block_spec(
-            &mut dst,
-            &src,
-            stride,
-            8,
-            8,
-            2,
-            20,
-            10,
-            6,
-            0,
-            |r, c| r >= 0 && c >= 0 && (r as usize) < 24 && (c as usize) < 24,
-        );
+        filter_block_spec(&mut dst, &src, stride, 8, 8, 2, 20, 10, 6, 0, |r, c| {
+            r >= 0 && c >= 0 && (r as usize) < 24 && (c as usize) < 24
+        });
         // Neighbourhood = 100, x0 = 100 -> constrain(0,...) = 0 -> sum=0
         // -> out = 100, clipped to min=max=100.
         for r in 8..16 {
@@ -510,19 +484,9 @@ mod tests {
             }
         }
         let mut dst = src.clone();
-        filter_block_spec(
-            &mut dst,
-            &src,
-            stride,
-            8,
-            8,
-            2,
-            60,
-            30,
-            6,
-            0,
-            |r, c| r >= 0 && c >= 0 && (r as usize) < 24 && (c as usize) < 24,
-        );
+        filter_block_spec(&mut dst, &src, stride, 8, 8, 2, 60, 30, 6, 0, |r, c| {
+            r >= 0 && c >= 0 && (r as usize) < 24 && (c as usize) < 24
+        });
         for r in 8..16 {
             for c in 8..16 {
                 let v = dst[r * stride + c];

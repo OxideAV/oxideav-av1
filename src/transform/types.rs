@@ -187,6 +187,33 @@ impl TxSize {
             _ => None,
         }
     }
+
+    /// `Split_Tx_Size[t]` per AV1 spec §Additional tables — the
+    /// transform one depth level below `self`. `Tx4x4` is a fixed
+    /// point.
+    pub fn split(self) -> TxSize {
+        match self {
+            Self::Tx4x4 => Self::Tx4x4,
+            Self::Tx8x8 => Self::Tx4x4,
+            Self::Tx16x16 => Self::Tx8x8,
+            Self::Tx32x32 => Self::Tx16x16,
+            Self::Tx64x64 => Self::Tx32x32,
+            Self::Tx4x8 => Self::Tx4x4,
+            Self::Tx8x4 => Self::Tx4x4,
+            Self::Tx8x16 => Self::Tx8x8,
+            Self::Tx16x8 => Self::Tx8x8,
+            Self::Tx16x32 => Self::Tx16x16,
+            Self::Tx32x16 => Self::Tx16x16,
+            Self::Tx32x64 => Self::Tx32x32,
+            Self::Tx64x32 => Self::Tx32x32,
+            Self::Tx4x16 => Self::Tx4x8,
+            Self::Tx16x4 => Self::Tx8x4,
+            Self::Tx8x32 => Self::Tx8x16,
+            Self::Tx32x8 => Self::Tx16x8,
+            Self::Tx16x64 => Self::Tx16x32,
+            Self::Tx64x16 => Self::Tx32x16,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +271,32 @@ mod tests {
             assert!(TxType::from_u32(v).is_ok());
         }
         assert!(TxType::from_u32(17).is_err());
+    }
+
+    // §Additional tables `Split_Tx_Size`: each square size splits to the
+    // next-smaller square; rectangular splits keep the longer axis
+    // halving first. `Tx4x4` is a fixed point.
+    #[test]
+    fn split_follows_spec_table() {
+        assert_eq!(TxSize::Tx4x4.split(), TxSize::Tx4x4);
+        assert_eq!(TxSize::Tx8x8.split(), TxSize::Tx4x4);
+        assert_eq!(TxSize::Tx16x16.split(), TxSize::Tx8x8);
+        assert_eq!(TxSize::Tx32x32.split(), TxSize::Tx16x16);
+        assert_eq!(TxSize::Tx64x64.split(), TxSize::Tx32x32);
+
+        // Rectangular splits keep the longer axis halving first.
+        assert_eq!(TxSize::Tx4x8.split(), TxSize::Tx4x4);
+        assert_eq!(TxSize::Tx8x16.split(), TxSize::Tx8x8);
+        assert_eq!(TxSize::Tx16x32.split(), TxSize::Tx16x16);
+        assert_eq!(TxSize::Tx32x64.split(), TxSize::Tx32x32);
+        assert_eq!(TxSize::Tx64x32.split(), TxSize::Tx32x32);
+
+        // §Additional tables Split_Tx_Size row for 1:4 aspect sizes.
+        assert_eq!(TxSize::Tx4x16.split(), TxSize::Tx4x8);
+        assert_eq!(TxSize::Tx16x4.split(), TxSize::Tx8x4);
+        assert_eq!(TxSize::Tx8x32.split(), TxSize::Tx8x16);
+        assert_eq!(TxSize::Tx32x8.split(), TxSize::Tx16x8);
+        assert_eq!(TxSize::Tx16x64.split(), TxSize::Tx16x32);
+        assert_eq!(TxSize::Tx64x16.split(), TxSize::Tx32x16);
     }
 }

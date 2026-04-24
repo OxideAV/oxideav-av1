@@ -430,7 +430,18 @@ mod tests {
         let mv = Mv { row: 16, col: -8 };
         let plain = mc_luma_u8(&r, 32, 32, 32, 4, 4, 8, 8, mv, InterpFilter::Regular);
         let scaled = mc_luma_u8_scaled(
-            &r, 32, 32, 32, 32, 32, 4, 4, 8, 8, mv, InterpFilter::Regular,
+            &r,
+            32,
+            32,
+            32,
+            32,
+            32,
+            4,
+            4,
+            8,
+            8,
+            mv,
+            InterpFilter::Regular,
         );
         assert_eq!(plain, scaled, "identity-scaled MC must match plain MC");
     }

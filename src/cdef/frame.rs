@@ -541,7 +541,10 @@ mod tests {
         // One SB of 64 blocks of 8x8.
         assert_eq!(dir_table.len(), 64);
         // First block should be direction horizontal (2) with nonzero var.
-        assert!(dir_table[0].1 > 0, "expected nonzero var, got {dir_table:?}");
+        assert!(
+            dir_table[0].1 > 0,
+            "expected nonzero var, got {dir_table:?}"
+        );
         assert_eq!(dir_table[0].0, 2);
     }
 }

@@ -5,6 +5,7 @@
 //! the subsampling / bit-depth context needed by the chroma code paths.
 
 use crate::lr::UnitParams as LrUnitParams;
+use crate::transform::TxSize;
 
 use super::modes::IntraMode;
 
@@ -49,6 +50,14 @@ pub struct ModeInfo {
     /// `is_inter` is true; `(0, 0)` otherwise.
     pub mv_row: i32,
     pub mv_col: i32,
+    /// Per-MI transform size chosen for this block — spec's
+    /// `InterTxSizes[row][col]`. Stored so neighbouring blocks can
+    /// derive the `tx_depth` context (§5.11.16 / §9.4.8). `None` until
+    /// the block's `read_block_tx_size()` has run.
+    pub tx_size: Option<TxSize>,
+    /// Per-MI block size (spec `MiSizes[row][col]`), also needed for
+    /// `tx_depth`'s inter-block context derivation.
+    pub mi_size_idx: u8,
 }
 
 /// Mutable per-frame decoder state.

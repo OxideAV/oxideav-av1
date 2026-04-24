@@ -83,6 +83,70 @@ impl BlockSize {
     pub fn max_tx_size(self) -> (u32, u32) {
         (self.width().min(64), self.height().min(64))
     }
+
+    /// `Max_Tx_Size_Rect[MiSize]` per AV1 spec §Additional tables.
+    /// Returns the largest transform (square or rectangular) that can
+    /// be used for blocks of this size — used by §5.11.15
+    /// `read_tx_size()` to initialise `TxSize`. Returns `None` when
+    /// `self == Invalid`.
+    pub fn max_tx_size_rect(self) -> Option<crate::transform::TxSize> {
+        use crate::transform::TxSize;
+        Some(match self {
+            Self::Block4x4 => TxSize::Tx4x4,
+            Self::Block4x8 => TxSize::Tx4x8,
+            Self::Block8x4 => TxSize::Tx8x4,
+            Self::Block8x8 => TxSize::Tx8x8,
+            Self::Block8x16 => TxSize::Tx8x16,
+            Self::Block16x8 => TxSize::Tx16x8,
+            Self::Block16x16 => TxSize::Tx16x16,
+            Self::Block16x32 => TxSize::Tx16x32,
+            Self::Block32x16 => TxSize::Tx32x16,
+            Self::Block32x32 => TxSize::Tx32x32,
+            Self::Block32x64 => TxSize::Tx32x64,
+            Self::Block64x32 => TxSize::Tx64x32,
+            Self::Block64x64 => TxSize::Tx64x64,
+            Self::Block64x128 => TxSize::Tx64x64,
+            Self::Block128x64 => TxSize::Tx64x64,
+            Self::Block128x128 => TxSize::Tx64x64,
+            Self::Block4x16 => TxSize::Tx4x16,
+            Self::Block16x4 => TxSize::Tx16x4,
+            Self::Block8x32 => TxSize::Tx8x32,
+            Self::Block32x8 => TxSize::Tx32x8,
+            Self::Block16x64 => TxSize::Tx16x64,
+            Self::Block64x16 => TxSize::Tx64x16,
+            Self::Invalid => return None,
+        })
+    }
+
+    /// `Max_Tx_Depth[MiSize]` per AV1 spec §5.11.15. Picks which
+    /// `tx_depth` CDF category (8×8 / 16×16 / 32×32 / 64×64) applies
+    /// when reading `tx_depth`. Returns 0 for `Block4x4` (no tx_depth
+    /// symbol needed) and `Invalid`.
+    pub fn max_tx_depth(self) -> u32 {
+        match self {
+            Self::Block4x4 => 0,
+            Self::Block4x8 | Self::Block8x4 | Self::Block8x8 => 1,
+            Self::Block8x16
+            | Self::Block16x8
+            | Self::Block16x16
+            | Self::Block4x16
+            | Self::Block16x4 => 2,
+            Self::Block16x32
+            | Self::Block32x16
+            | Self::Block32x32
+            | Self::Block8x32
+            | Self::Block32x8 => 3,
+            Self::Block32x64
+            | Self::Block64x32
+            | Self::Block64x64
+            | Self::Block64x128
+            | Self::Block128x64
+            | Self::Block128x128
+            | Self::Block16x64
+            | Self::Block64x16 => 4,
+            Self::Invalid => 0,
+        }
+    }
 }
 
 /// `PartitionType` enumerates the partition decisions at each node of
@@ -231,6 +295,59 @@ mod tests {
     fn quarter_of_64x64_is_32x32() {
         assert_eq!(quarter_size(BlockSize::Block64x64), BlockSize::Block32x32);
         assert_eq!(quarter_size(BlockSize::Block4x4), BlockSize::Invalid);
+    }
+
+    // §Additional tables `Max_Tx_Size_Rect` — each block size picks the
+    // largest TX that fits. Square blocks map to the square TX of the
+    // same side; rectangular blocks pick the matching rectangle; 128+
+    // blocks cap at 64×64.
+    #[test]
+    fn max_tx_size_rect_matches_spec_table() {
+        use crate::transform::TxSize;
+        assert_eq!(BlockSize::Block4x4.max_tx_size_rect(), Some(TxSize::Tx4x4));
+        assert_eq!(BlockSize::Block8x8.max_tx_size_rect(), Some(TxSize::Tx8x8));
+        assert_eq!(
+            BlockSize::Block32x32.max_tx_size_rect(),
+            Some(TxSize::Tx32x32)
+        );
+        assert_eq!(
+            BlockSize::Block64x64.max_tx_size_rect(),
+            Some(TxSize::Tx64x64)
+        );
+        // §5.11.27 — 128-wide/tall blocks cap the TX at 64×64.
+        assert_eq!(
+            BlockSize::Block128x128.max_tx_size_rect(),
+            Some(TxSize::Tx64x64)
+        );
+        assert_eq!(
+            BlockSize::Block128x64.max_tx_size_rect(),
+            Some(TxSize::Tx64x64)
+        );
+        // Rectangular entries.
+        assert_eq!(BlockSize::Block4x8.max_tx_size_rect(), Some(TxSize::Tx4x8));
+        assert_eq!(
+            BlockSize::Block16x32.max_tx_size_rect(),
+            Some(TxSize::Tx16x32)
+        );
+        assert_eq!(
+            BlockSize::Block64x16.max_tx_size_rect(),
+            Some(TxSize::Tx64x16)
+        );
+    }
+
+    // §5.11.15 `Max_Tx_Depth` table — Block4x4 is depth 0 (no symbol),
+    // 8×8 family is 1, 16×16 family is 2, 32×32 family is 3, 64×64 and
+    // bigger are 4.
+    #[test]
+    fn max_tx_depth_matches_spec_table() {
+        assert_eq!(BlockSize::Block4x4.max_tx_depth(), 0);
+        assert_eq!(BlockSize::Block8x8.max_tx_depth(), 1);
+        assert_eq!(BlockSize::Block4x8.max_tx_depth(), 1);
+        assert_eq!(BlockSize::Block16x16.max_tx_depth(), 2);
+        assert_eq!(BlockSize::Block16x4.max_tx_depth(), 2);
+        assert_eq!(BlockSize::Block32x32.max_tx_depth(), 3);
+        assert_eq!(BlockSize::Block64x64.max_tx_depth(), 4);
+        assert_eq!(BlockSize::Block128x128.max_tx_depth(), 4);
     }
 
     #[test]

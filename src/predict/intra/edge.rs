@@ -33,11 +33,7 @@ pub type EdgeFilterStrength = u8;
 /// Filter taps from `Intra_Edge_Kernel` (§7.11.2.12). Indexed by
 /// `strength - 1` (strength 0 is a no-op so it's not in the table).
 /// Each row is 5 taps applied with a Round2(·, 4) rounding.
-pub const INTRA_EDGE_KERNEL: [[i32; 5]; 3] = [
-    [0, 4, 8, 4, 0],
-    [0, 5, 6, 5, 0],
-    [2, 4, 4, 4, 2],
-];
+pub const INTRA_EDGE_KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
 
 /// Number of taps in the intra edge filter kernel — `INTRA_EDGE_TAPS`
 /// from §7.11.2.12.

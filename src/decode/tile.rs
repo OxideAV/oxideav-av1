@@ -589,6 +589,11 @@ pub struct TileDecoder<'a> {
     pub uv_mode_cdf: Vec<Vec<Vec<u16>>>,
     pub angle_delta_cdf: Vec<Vec<u16>>,
     pub skip_cdf: Vec<Vec<u16>>,
+    /// `tx_depth` CDF — §5.11.16 / §9.4.8. Indexed as
+    /// `tx_size_cdf[maxTxDepthClass][ctx]` where `maxTxDepthClass ∈
+    /// 0..=3` maps to Max_Tx_Depth ∈ {1, 2, 3, 4}. `ctx` is the 3-way
+    /// above/left neighbour context.
+    pub tx_size_cdf: Vec<Vec<Vec<u16>>>,
     pub cfl_sign_cdf: Vec<u16>,
     pub cfl_alpha_cdf: Vec<Vec<u16>>,
     pub seg_cdf: Vec<Vec<u16>>,
@@ -647,6 +652,7 @@ impl<'a> TileDecoder<'a> {
             uv_mode_cdf: Vec::new(),
             angle_delta_cdf: Vec::new(),
             skip_cdf: Vec::new(),
+            tx_size_cdf: Vec::new(),
             cfl_sign_cdf: Vec::new(),
             cfl_alpha_cdf: Vec::new(),
             seg_cdf: Vec::new(),
@@ -706,6 +712,10 @@ impl<'a> TileDecoder<'a> {
             .map(|c| c.to_vec())
             .collect();
         self.skip_cdf = cdfs::DEFAULT_SKIP_CDF.iter().map(|c| c.to_vec()).collect();
+        self.tx_size_cdf = cdfs::DEFAULT_TX_SIZE_CDF
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
+            .collect();
         self.cfl_sign_cdf = cdfs::DEFAULT_CFL_SIGN_CDF.to_vec();
         self.cfl_alpha_cdf = cdfs::DEFAULT_CFL_ALPHA_CDF
             .iter()
@@ -830,6 +840,24 @@ impl<'a> TileDecoder<'a> {
         let ctx = (ctx as usize).min(2);
         let raw = self.symbol.decode_symbol(&mut self.skip_cdf[ctx])?;
         Ok(raw != 0)
+    }
+
+    /// Decode `tx_depth` per §5.11.16 / §9.4.8.
+    ///
+    /// `max_tx_depth` is the spec's `Max_Tx_Depth[MiSize]` (must be
+    /// ≥ 1 — the caller short-circuits `Block4x4`). `ctx` is the 3-way
+    /// neighbour context from `(aboveW >= maxTxWidth) + (leftH >=
+    /// maxTxHeight)` (clamped to `0..=2`). Returns the decoded
+    /// `tx_depth ∈ 0..=2`.
+    pub fn decode_tx_depth(&mut self, max_tx_depth: u32, ctx: u32) -> Result<u32> {
+        // `DEFAULT_TX_SIZE_CDF` shape is `[4][3][…]`:
+        //   class 0 → Max_Tx_Depth = 1 (8×8 CDF, 2 symbols)
+        //   class 1 → Max_Tx_Depth = 2 (16×16 CDF, 3 symbols)
+        //   class 2 → Max_Tx_Depth = 3 (32×32 CDF, 3 symbols)
+        //   class 3 → Max_Tx_Depth = 4 (64×64 CDF, 3 symbols)
+        let class = max_tx_depth.saturating_sub(1).min(3) as usize;
+        let ctx = (ctx as usize).min(2);
+        self.symbol.decode_symbol(&mut self.tx_size_cdf[class][ctx])
     }
 
     /// Decode the segment_id for a block (spatial prediction,

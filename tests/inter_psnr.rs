@@ -73,7 +73,12 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
     10.0 * (255.0 * 255.0 / mse).log10()
 }
 
-fn measure(fixture: &str, ref_yuv: &str, w: usize, h: usize) -> Option<(f64, f64, f64, f64, f64, f64)> {
+fn measure(
+    fixture: &str,
+    ref_yuv: &str,
+    w: usize,
+    h: usize,
+) -> Option<(f64, f64, f64, f64, f64, f64)> {
     let data = read_fixture(fixture)?;
     let raw_ref = read_fixture(ref_yuv)?;
     let pkts = ivf_packet_slices(&data).expect("ivf parse");
@@ -91,8 +96,12 @@ fn measure(fixture: &str, ref_yuv: &str, w: usize, h: usize) -> Option<(f64, f64
         }
     }
     assert_eq!(frames.len(), 2);
-    let Frame::Video(v0) = &frames[0] else { panic!() };
-    let Frame::Video(v1) = &frames[1] else { panic!() };
+    let Frame::Video(v0) = &frames[0] else {
+        panic!()
+    };
+    let Frame::Video(v1) = &frames[1] else {
+        panic!()
+    };
     assert_eq!(v1.width as usize, w);
     assert_eq!(v1.height as usize, h);
     let uvw = w / 2;
@@ -201,4 +210,73 @@ fn inter_psnr_testsrc_64() {
     };
     eprintln!("testsrc64 K-frame PSNR: Y={kfy:.2} U={kfu:.2} V={kfv:.2}");
     eprintln!("testsrc64 P-frame PSNR: Y={pfy:.2} U={pfu:.2} V={pfv:.2}");
+}
+
+/// Pure-intra single-frame AV1 (aomenc --kf-min-dist=1 --kf-max-dist=1
+/// --limit=1) — isolates the intra read path from the inter ref-list /
+/// MV / `read_skip` inter-frame desync, so movements in this PSNR
+/// value correspond directly to gains in §5.11.5–.16 correctness.
+///
+/// Recreate inputs with:
+/// ```sh
+/// ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=1:duration=0.5" \
+///     -f rawvideo -pix_fmt yuv420p /tmp/testsrc64.yuv
+/// aomenc --ivf -w 64 -h 64 --fps=1/1 --cpu-used=8 --cq-level=40 \
+///     --tile-columns=0 --tile-rows=0 \
+///     --kf-min-dist=1 --kf-max-dist=1 \
+///     --lag-in-frames=0 --passes=1 --end-usage=q \
+///     --enable-cdef=0 --enable-restoration=0 --enable-qm=0 \
+///     --enable-fwd-kf=0 --auto-alt-ref=0 \
+///     --enable-global-motion=0 --enable-warped-motion=0 \
+///     --error-resilient=1 --deltaq-mode=0 --loopfilter-control=0 \
+///     --limit=1 \
+///     -o /tmp/testsrc64-still.ivf /tmp/testsrc64.yuv
+/// ffmpeg -y -i /tmp/testsrc64-still.ivf -f rawvideo -pix_fmt yuv420p \
+///     /tmp/testsrc64-still-ref.yuv
+/// ```
+#[test]
+fn intra_psnr_testsrc_still_64() {
+    let Some(data) = read_fixture("/tmp/testsrc64-still.ivf") else {
+        return;
+    };
+    let Some(raw_ref) = read_fixture("/tmp/testsrc64-still-ref.yuv") else {
+        return;
+    };
+    let pkts = ivf_packet_slices(&data).expect("ivf parse");
+    assert!(!pkts.is_empty());
+
+    let params = CodecParameters::video(CodecId::new(oxideav_av1::CODEC_ID_STR));
+    let mut dec = oxideav_av1::make_decoder(&params).expect("build decoder");
+    let tb = TimeBase::new(1, 1);
+    let mut frames: Vec<Frame> = Vec::new();
+    for (i, bytes) in pkts.iter().take(1).enumerate() {
+        let pkt = Packet::new(0, tb, bytes.clone()).with_pts(i as i64);
+        if let Err(e) = dec.send_packet(&pkt) {
+            eprintln!("intra-still send_packet: {e:?}");
+            return;
+        }
+        while let Ok(f) = dec.receive_frame() {
+            frames.push(f);
+        }
+    }
+    if frames.is_empty() {
+        eprintln!("intra-still produced no frames — skipping");
+        return;
+    }
+    let Frame::Video(v) = &frames[0] else {
+        return;
+    };
+    let w = v.width as usize;
+    let h = v.height as usize;
+    let uvw = w / 2;
+    let uvh = h / 2;
+    let y_len = w * h;
+    let uv_len = uvw * uvh;
+    let ref_y = &raw_ref[0..y_len];
+    let ref_u = &raw_ref[y_len..y_len + uv_len];
+    let ref_v = &raw_ref[y_len + uv_len..y_len + 2 * uv_len];
+    let py = psnr(&v.planes[0].data, ref_y);
+    let pu = psnr(&v.planes[1].data, ref_u);
+    let pv = psnr(&v.planes[2].data, ref_v);
+    eprintln!("testsrc64 intra-still PSNR: Y={py:.2} dB U={pu:.2} dB V={pv:.2} dB");
 }
