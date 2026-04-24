@@ -634,6 +634,16 @@ pub struct TileDecoder<'a> {
     pub use_filter_intra_cdf: Vec<Vec<u16>>,
     /// `filter_intra_mode` CDF — §5.11.24, 5-symbol.
     pub filter_intra_mode_cdf: Vec<u16>,
+    /// `has_palette_y` CDF — §5.11.46. Indexed as
+    /// `[bsizeCtx = Mi_Width_Log2 + Mi_Height_Log2 - 2 ∈ 0..=6][ctx ∈
+    /// 0..=2]`, 2-symbol each.
+    pub palette_y_mode_cdf: Vec<Vec<Vec<u16>>>,
+    /// `has_palette_uv` CDF — §5.11.46. Indexed as
+    /// `[(PaletteSizeY > 0) ? 1 : 0]`, 2-symbol each.
+    pub palette_uv_mode_cdf: Vec<Vec<u16>>,
+    /// `txfm_split` CDF — §5.11.17 var-tx partition flag.
+    /// `TXFM_PARTITION_CONTEXTS = 21`; 2-symbol each.
+    pub txfm_split_cdf: Vec<Vec<u16>>,
     /// Coefficient-CDF bank — all of §5.11.39's CDFs in one place.
     pub coeff_bank: CoeffCdfBank,
     /// §5.11.40-.44 Loop-Restoration per-unit CDFs.
@@ -699,6 +709,9 @@ impl<'a> TileDecoder<'a> {
             intrabc_cdf: Vec::new(),
             use_filter_intra_cdf: Vec::new(),
             filter_intra_mode_cdf: Vec::new(),
+            palette_y_mode_cdf: Vec::new(),
+            palette_uv_mode_cdf: Vec::new(),
+            txfm_split_cdf: Vec::new(),
             coeff_bank,
             switchable_restore_cdf: default_switchable_cdf(),
             wiener_restore_cdf: default_wiener_cdf(),
@@ -788,6 +801,20 @@ impl<'a> TileDecoder<'a> {
             .map(|c| c.to_vec())
             .collect();
         self.filter_intra_mode_cdf = cdfs::DEFAULT_FILTER_INTRA_MODE_CDF.to_vec();
+        // §5.11.46 palette CDFs — 2-symbol flags. Shape: `[7][3][…]`
+        // for Y (bsizeCtx × neighbour-palette ctx), `[2][…]` for UV.
+        self.palette_y_mode_cdf = cdfs::DEFAULT_PALETTE_Y_MODE_CDF
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
+            .collect();
+        self.palette_uv_mode_cdf = cdfs::DEFAULT_PALETTE_UV_MODE_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.txfm_split_cdf = cdfs::DEFAULT_TXFM_SPLIT_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
     }
 
     /// Walk the tile's superblock grid and decode every MI unit's
@@ -1037,6 +1064,41 @@ impl<'a> TileDecoder<'a> {
     /// [`Self::decode_use_filter_intra`] returned true.
     pub fn decode_filter_intra_mode(&mut self) -> Result<u32> {
         self.symbol.decode_symbol(&mut self.filter_intra_mode_cdf)
+    }
+
+    /// §5.11.46 `has_palette_y` — 2-symbol flag. `bsize_ctx` is the
+    /// spec's `Mi_Width_Log2[MiSize] + Mi_Height_Log2[MiSize] - 2`
+    /// value (0..=6 for the eligible BLOCK_8X8..BLOCK_64X64 range).
+    /// `neighbor_ctx` is `(AvailU && PaletteSizeAbove > 0) + (AvailL
+    /// && PaletteSizeLeft > 0)`, clamped to 0..=2.
+    pub fn decode_has_palette_y(&mut self, bsize_ctx: usize, neighbor_ctx: usize) -> Result<bool> {
+        let bs = bsize_ctx.min(self.palette_y_mode_cdf.len() - 1);
+        let nc = neighbor_ctx.min(self.palette_y_mode_cdf[bs].len() - 1);
+        let raw = self
+            .symbol
+            .decode_symbol(&mut self.palette_y_mode_cdf[bs][nc])?;
+        Ok(raw != 0)
+    }
+
+    /// §5.11.46 `has_palette_uv` — 2-symbol flag. `ctx` is the spec's
+    /// `(PaletteSizeY > 0) ? 1 : 0`. Only called when `HasChroma &&
+    /// UVMode == DC_PRED`.
+    pub fn decode_has_palette_uv(&mut self, ctx: usize) -> Result<bool> {
+        let c = ctx.min(self.palette_uv_mode_cdf.len() - 1);
+        let raw = self
+            .symbol
+            .decode_symbol(&mut self.palette_uv_mode_cdf[c])?;
+        Ok(raw != 0)
+    }
+
+    /// §5.11.17 `txfm_split` — 2-symbol flag signalling whether a
+    /// var-tx inter transform unit splits further. `ctx` is the
+    /// §9.4.8 formula `(txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 -
+    /// maxTxSz) * 6 + above + left`, clamped to `0..=20`.
+    pub fn decode_txfm_split(&mut self, ctx: usize) -> Result<bool> {
+        let c = ctx.min(self.txfm_split_cdf.len() - 1);
+        let raw = self.symbol.decode_symbol(&mut self.txfm_split_cdf[c])?;
+        Ok(raw != 0)
     }
 }
 

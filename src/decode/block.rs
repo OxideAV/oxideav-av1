@@ -259,6 +259,43 @@ pub fn vert4_size(bs: BlockSize) -> BlockSize {
     }
 }
 
+/// Reverse lookup: turn a `(width, height)` luma pair into the matching
+/// `BlockSize` enumerator, or `BlockSize::Invalid` if no entry exists.
+/// Useful on the inter-decode path where the caller has `bw / bh` in
+/// samples but needs the `MiSize` index for CDF / context lookups.
+pub fn block_size_from_wh(w: u32, h: u32) -> BlockSize {
+    for (i, (bw, bh)) in BLOCK_WIDTHS.iter().zip(BLOCK_HEIGHTS.iter()).enumerate() {
+        if *bw == w && *bh == h {
+            return match i {
+                0 => BlockSize::Block4x4,
+                1 => BlockSize::Block4x8,
+                2 => BlockSize::Block8x4,
+                3 => BlockSize::Block8x8,
+                4 => BlockSize::Block8x16,
+                5 => BlockSize::Block16x8,
+                6 => BlockSize::Block16x16,
+                7 => BlockSize::Block16x32,
+                8 => BlockSize::Block32x16,
+                9 => BlockSize::Block32x32,
+                10 => BlockSize::Block32x64,
+                11 => BlockSize::Block64x32,
+                12 => BlockSize::Block64x64,
+                13 => BlockSize::Block64x128,
+                14 => BlockSize::Block128x64,
+                15 => BlockSize::Block128x128,
+                16 => BlockSize::Block4x16,
+                17 => BlockSize::Block16x4,
+                18 => BlockSize::Block8x32,
+                19 => BlockSize::Block32x8,
+                20 => BlockSize::Block16x64,
+                21 => BlockSize::Block64x16,
+                _ => BlockSize::Invalid,
+            };
+        }
+    }
+    BlockSize::Invalid
+}
+
 /// BSL (block-size-log) category used for the partition CDF index:
 /// 0 = 8×8, 1 = 16×16, 2 = 32×32, 3 = 64×64, 4 = 128×128.
 pub fn block_size_log(bs: BlockSize) -> u32 {

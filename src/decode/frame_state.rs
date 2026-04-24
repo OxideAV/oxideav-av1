@@ -66,6 +66,15 @@ pub struct ModeInfo {
     /// (`FILTER_DC_PRED..FILTER_PAETH_PRED`). Unused when
     /// `use_filter_intra` is `false`.
     pub filter_intra_mode: u8,
+    /// Spec §5.11.46 `PaletteSizeY` — number of palette colors on the
+    /// luma plane (0 when the block isn't palette-coded). Zero until
+    /// the palette path is wired; held on the MI grid so future
+    /// palette-aware blocks can form the `has_palette_y` neighbour
+    /// context (§9.4.6).
+    pub palette_size_y: u8,
+    /// Spec §5.11.46 `PaletteSizeUV`. Same treatment as
+    /// `palette_size_y`.
+    pub palette_size_uv: u8,
 }
 
 /// Mutable per-frame decoder state.

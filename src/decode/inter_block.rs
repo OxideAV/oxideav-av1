@@ -74,14 +74,34 @@ pub fn decode_inter_block_syntax(
         .as_mut()
         .ok_or_else(|| Error::invalid("av1 inter: InterDecoder missing on TileDecoder"))?;
 
+    // §5.11.18 `inter_frame_mode_info()` ordering — the canonical
+    // sequence is:
+    //   inter_segment_id(1) [preSkip]
+    //   read_skip_mode()
+    //   if (skip_mode) skip = 1 else read_skip()
+    //   inter_segment_id(0) [post-skip if !SegIdPreSkip]
+    //   read_cdef() / read_delta_qindex() / read_delta_lf()
+    //   read_is_inter()
+    //   if (is_inter) inter_block_mode_info() else intra_block_mode_info()
+    //
+    // Round 8: we don't yet wire the `inter_segment_id` or
+    // `read_skip_mode` symbols — both are no-ops on every real-world
+    // AVIF / libaom fixture we decode (segmentation off,
+    // `skip_mode_present=0`). What we CAN fix is the relative
+    // ordering of `read_skip` vs `read_is_inter` / mode info: the
+    // spec reads `skip` BEFORE `is_inter` and mode info, whereas
+    // Round 7 read it AFTER. This matches the round-6 intra fix.
+    let skip = inter.read_skip(&mut td.symbol, 0)?;
+
     let is_inter = inter.read_is_inter(&mut td.symbol, above_is_inter, left_is_inter)?;
 
     if !is_inter {
-        // Intra-within-inter: decode y_mode + skip using inter-frame
-        // CDFs and return for the caller to run the intra path on top.
+        // Intra-within-inter (§5.11.22 `intra_block_mode_info`). The
+        // spec reads y_mode, then chroma / palette / filter-intra on
+        // the intra block; our narrow path keeps the y_mode read and
+        // leaves the rest to the reconstruction stage's defaults.
         let group = block_size_group(w as usize, h as usize);
         let y_mode = inter.read_y_mode(&mut td.symbol, group)?;
-        let skip = inter.read_skip(&mut td.symbol, 0)?;
         return Ok(InterBlockInfo {
             is_inter: false,
             ref_frame_idx: 0,
@@ -131,8 +151,6 @@ pub fn decode_inter_block_syntax(
             _ => InterpFilter::Regular,
         }
     };
-
-    let skip = inter.read_skip(&mut td.symbol, 0)?;
 
     Ok(InterBlockInfo {
         is_inter: true,

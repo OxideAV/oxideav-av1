@@ -6,6 +6,8 @@
 //! - §5.11.7 / §5.11.12 / §5.11.13 delta-q / delta-lf flags
 //! - §5.11.7 `use_intrabc` flag
 //! - §5.11.24 `use_filter_intra` + `filter_intra_mode`
+//! - §5.11.46 `has_palette_y` + `has_palette_uv`
+//! - §5.11.17 `txfm_split` (var-tx partition flag)
 //!
 //! Wire format matches the rest of [`crate::cdfs`]: for an `N`-symbol
 //! CDF the array is `[p_gt_0, p_gt_1, …, p_gt_{N-2}, 0_sentinel,
@@ -65,3 +67,57 @@ pub static DEFAULT_USE_FILTER_INTRA_CDF: [&[u16]; 22] = [
 /// `{p_gt_0, p_gt_1, p_gt_2, p_gt_3, 32768, 0}`; we store the
 /// same values but replace the 32768 with our 0 sentinel.
 pub const DEFAULT_FILTER_INTRA_MODE_CDF: [u16; 6] = [8949, 12776, 17211, 29558, 0, 0];
+
+/// `has_palette_y` CDF — §5.11.46 / §9.4
+/// `Default_Palette_Y_Mode_Cdf[PALETTE_BLOCK_SIZE_CONTEXTS=7][
+/// PALETTE_Y_MODE_CONTEXTS=3][3]`. Indexed as
+/// `[bsizeCtx][ctx]` where `bsizeCtx = Mi_Width_Log2[MiSize] +
+/// Mi_Height_Log2[MiSize] - 2` runs 0..=6 for the eligible
+/// `BLOCK_8X8..BLOCK_64X64` range, and `ctx = (AvailU &&
+/// PaletteSizes[0][row-1][col] > 0) + (AvailL &&
+/// PaletteSizes[0][row][col-1] > 0)` is 0..=2. Each entry is a
+/// 2-symbol `{p_gt_0, 0_sentinel, 0_counter}` tuple.
+pub static DEFAULT_PALETTE_Y_MODE_CDF: [[[u16; 3]; 3]; 7] = [
+    [[31676, 0, 0], [3419, 0, 0], [1261, 0, 0]],
+    [[31912, 0, 0], [2859, 0, 0], [980, 0, 0]],
+    [[31823, 0, 0], [3400, 0, 0], [781, 0, 0]],
+    [[32030, 0, 0], [3561, 0, 0], [904, 0, 0]],
+    [[32309, 0, 0], [7337, 0, 0], [1462, 0, 0]],
+    [[32265, 0, 0], [4015, 0, 0], [1521, 0, 0]],
+    [[32450, 0, 0], [7946, 0, 0], [129, 0, 0]],
+];
+
+/// `has_palette_uv` CDF — §5.11.46 / §9.4
+/// `Default_Palette_Uv_Mode_Cdf[PALETTE_UV_MODE_CONTEXTS=2][3]`.
+/// Indexed as `[ctx]` where `ctx = (PaletteSizeY > 0) ? 1 : 0`.
+/// 2-symbol flag per entry.
+pub static DEFAULT_PALETTE_UV_MODE_CDF: [[u16; 3]; 2] = [[32461, 0, 0], [21488, 0, 0]];
+
+/// `txfm_split` CDF — §5.11.17 / §9.4
+/// `Default_Txfm_Split_Cdf[TXFM_PARTITION_CONTEXTS=21][3]`. 2-symbol
+/// flag per entry, indexed by the §9.4 `ctx` formula:
+/// `ctx = (txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 +
+/// above + left`.
+pub static DEFAULT_TXFM_SPLIT_CDF: [[u16; 3]; 21] = [
+    [28581, 0, 0],
+    [23846, 0, 0],
+    [20847, 0, 0],
+    [24315, 0, 0],
+    [18196, 0, 0],
+    [12133, 0, 0],
+    [18791, 0, 0],
+    [10887, 0, 0],
+    [11005, 0, 0],
+    [27179, 0, 0],
+    [20004, 0, 0],
+    [11281, 0, 0],
+    [26549, 0, 0],
+    [19308, 0, 0],
+    [14224, 0, 0],
+    [28015, 0, 0],
+    [21546, 0, 0],
+    [14400, 0, 0],
+    [28165, 0, 0],
+    [22401, 0, 0],
+    [16088, 0, 0],
+];

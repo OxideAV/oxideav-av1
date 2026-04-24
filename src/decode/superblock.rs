@@ -5,47 +5,59 @@
 //! 3 smooth + Paeth + CFL) and native 10/12-bit HBD paths; the
 //! pre-Phase-5 DC_PRED fallback is gone.
 //!
-//! # Round 7 status
+//! # Round 8 status
 //!
-//! Round 7 layered the remaining small syntax items on top of Round 6's
-//! `read_block_tx_size()` + `read_skip()` ordering fixes:
+//! Round 8 closes three syntax-desync items flagged at the end of
+//! round 7:
 //!
-//! - **`read_delta_qindex()` (§5.11.12)** + **`read_delta_lf()`
-//!   (§5.11.13)** — now called per leaf block with the spec-mandated
-//!   `MiSize == sbSize && skip` short-circuit and the
-//!   `delta_q_present` / `delta_lf_present` + `delta_lf_multi`
-//!   gating. Bits are consumed but not yet applied to `CurrentQIndex`
-//!   / `DeltaLF[i]` (tracker is pending — trivial when any real-world
-//!   clip enables `--deltaq-mode=1`). Fixtures that keep both flags at
-//!   zero (all the current `aomenc` / `avifenc` presets) are bit-
-//!   identical.
-//! - **`use_intrabc` (§5.11.7)** — now read when `allow_intrabc`. A
-//!   `true` value surfaces `Error::Unsupported` because the IntraBC
-//!   motion path (§7.11.3.2) isn't wired yet, but the symbol is
-//!   consumed in either case so downstream syntax stays aligned.
-//! - **`filter_intra_mode_info()` (§5.11.24)** — the two CDFs are
-//!   added as hand-transcribed tables in [`crate::cdfs::extra`] (the
-//!   generator doesn't emit them) and are consulted on the spec's
-//!   eligible DC-PRED-on-≤32×32 blocks. Pixel-level application of
-//!   the recursive filter-intra predictor (§7.11.2.3) is deferred:
-//!   the mode is stored on the MI grid so a later round can use it
-//!   without re-reading the bitstream.
+//! - **`palette_mode_info()` (§5.11.46)** — now invoked from both the
+//!   key-frame and intra-within-inter paths on palette-eligible
+//!   blocks. When the encoder activates a Y or UV palette we surface
+//!   `Error::Unsupported` (the palette-token + color-decode pipeline
+//!   §7.11.4 isn't wired yet), mirroring the Round 7 `use_intrabc`
+//!   treatment. Bitstreams with `allow_screen_content_tools = 0`
+//!   (all non-screen-content aomenc / avifenc presets) skip the read
+//!   entirely. The two `has_palette_y` / `has_palette_uv` CDFs are
+//!   added to [`crate::cdfs::extra`].
+//! - **Inter `read_skip` ordering (§5.11.18)** — the intra-within-inter
+//!   path in [`super::inter_block::decode_inter_block_syntax`] now
+//!   reads `skip` BEFORE `is_inter` and mode info, matching the spec
+//!   sequence. Mirrors the round-6 intra fix; gray P-frame luma PSNR
+//!   jumps from 39.34 → 43.10 dB as a direct result.
+//! - **Var-tx inter `read_var_tx_size()` (§5.11.17)** — wired into
+//!   the inter leaf decoder via `read_inter_block_tx_size`. The
+//!   `txfm_split` CDF is added to [`crate::cdfs::extra`]; the
+//!   recursion stamps `InterTxSizes[][]` onto the MI grid so
+//!   neighbour `tx_depth` / `txfm_split` contexts read back the right
+//!   sizes on subsequent blocks. Residual decode still operates on
+//!   the block footprint — the coefficient path isn't yet per-TU.
 //!
-//! # Remaining syntax-level gaps (Round 8+)
+//! Round 7's earlier additions remain in place:
 //!
-//! - `palette_mode_info()` (§5.11.25) — not called; palette tokens
-//!   still desync the stream when `allow_screen_content_tools` is set
-//!   and a block is ≥ 8×8 and ≤ 64×64.
+//! - `read_delta_qindex()` (§5.11.12) / `read_delta_lf()` (§5.11.13) —
+//!   called per leaf block with the spec-mandated
+//!   `MiSize == sbSize && skip` short-circuit; bits consumed but not
+//!   yet applied to `CurrentQIndex` / `DeltaLF[i]`.
+//! - `use_intrabc` (§5.11.7) — Unsupported on activation.
+//! - `filter_intra_mode_info()` (§5.11.24) — CDF consumed, mode stored
+//!   on MI grid; predictor still routes through DC_PRED.
+//!
+//! # Remaining syntax-level gaps (Round 9+)
+//!
+//! - Palette color decode (§7.11.4) — currently surfaces Unsupported;
+//!   a full implementation needs `palette_tokens()` + `PaletteCache`
+//!   + color-context CDFs.
 //! - Per-block `CurrentQIndex` / `DeltaLF[]` tracker — we read the
 //!   bits but don't yet apply them, so fixtures that actually enable
-//!   per-SB QP deltas will reconstruct with the frame-level Q.
+//!   per-SB QP deltas reconstruct with the frame-level Q.
 //! - Filter-intra prediction (§7.11.2.3) — CDF consumed, predictor
 //!   still routes through DC_PRED.
-//! - Var-tx inter path (`read_var_tx_size`) — still not wired; inter
-//!   blocks with sub-block TX splits fall back to the block footprint.
-//! - Inter path (`decode_inter_leaf_block`) still reads `skip` after
-//!   `y_mode` for intra-within-inter blocks — §5.11.23 sequencing
-//!   applies there too but is out of Round 7 scope.
+//! - Var-tx residual decode — `read_var_tx_size` is wired, but the
+//!   coefficient path still decodes one tile per block footprint
+//!   rather than per TU stamped in `InterTxSizes[][]`.
+//! - `read_skip_mode()` (§5.11.10) + `inter_segment_id()`
+//!   (§5.11.19) — not yet read; currently no-ops in practice because
+//!   `skip_mode_present = 0` on all our aomenc fixtures.
 
 use oxideav_core::{Error, Result};
 
@@ -63,7 +75,8 @@ use crate::quant;
 use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
 
 use super::block::{
-    block_size_log, half_below_size, horz4_size, quarter_size, vert4_size, BlockSize, PartitionType,
+    block_size_from_wh, block_size_log, half_below_size, horz4_size, quarter_size, vert4_size,
+    BlockSize, PartitionType,
 };
 use super::coeffs::{decode_coefficients, nz_map_ctx_offset, tx_size_idx};
 use super::frame_state::FrameState;
@@ -487,10 +500,22 @@ pub fn decode_leaf_block(
         }
     }
 
+    // Spec §5.11.46 `palette_mode_info()` — gated on
+    // `allow_screen_content_tools && MiSize >= BLOCK_8X8 &&
+    // Block_Width <= 64 && Block_Height <= 64`. The helper consumes
+    // the `has_palette_y` / `has_palette_uv` bits and surfaces
+    // `Error::Unsupported("palette pending")` the moment either fires
+    // — the palette color decode (§7.11.4) isn't wired yet. When the
+    // block is palette-eligible but the encoder declined, the bits are
+    // still consumed so downstream syntax stays aligned.
+    read_palette_mode_info(td, fs, bs, bw, bh, y_mode, uv_mode, x, y)?;
+
     // Spec §5.11.24 `filter_intra_mode_info()` — gated on
     // `enable_filter_intra && YMode == DC_PRED && PaletteSizeY == 0 &&
-    // max(block_w, block_h) <= 32`. Our palette path isn't decoded
-    // yet so `PaletteSizeY` is structurally 0 here.
+    // max(block_w, block_h) <= 32`. Our palette path always returns
+    // with `PaletteSizeY == 0` (any non-zero size above would have
+    // short-circuited into Error::Unsupported), so this branch can
+    // ignore the palette gate.
     let (use_filter_intra, filter_intra_mode) =
         read_filter_intra_mode_info(td, bs, y_mode, bw, bh)?;
 
@@ -736,6 +761,107 @@ fn read_delta_lf_for_block(td: &mut TileDecoder<'_>, bs: BlockSize, skip: bool) 
     Ok(())
 }
 
+/// Spec §5.11.46 `palette_mode_info()` — consume the
+/// `has_palette_y` / `has_palette_uv` CDF flags on blocks that match
+/// the palette-eligibility predicate. Round 8 scope: detect palette
+/// activation and surface `Error::Unsupported("palette pending")`
+/// rather than silently desync when the palette color decode path
+/// isn't wired. Non-activating blocks consume 0 extra bits once the
+/// eligibility check passes.
+///
+/// Eligibility (§5.11.22 / §5.11.23):
+///   - `allow_screen_content_tools` frame header bit set
+///   - `MiSize >= BLOCK_8X8`
+///   - `Block_Width <= 64 && Block_Height <= 64`
+///
+/// The Y read fires only when `YMode == DC_PRED`; the UV read fires
+/// only when `HasChroma && UVMode == DC_PRED`.
+#[allow(clippy::too_many_arguments)]
+fn read_palette_mode_info(
+    td: &mut TileDecoder<'_>,
+    fs: &FrameState,
+    bs: BlockSize,
+    bw: u32,
+    bh: u32,
+    y_mode: IntraMode,
+    uv_mode: IntraMode,
+    x: u32,
+    y: u32,
+) -> Result<()> {
+    // Frame-level gate: per §5.11.22/.23 the palette block is only
+    // called when `allow_screen_content_tools != 0`.
+    if td.frame.allow_screen_content_tools == 0 {
+        return Ok(());
+    }
+    // Block-size gate: `MiSize >= BLOCK_8X8 && Block_Width <= 64 &&
+    // Block_Height <= 64`.
+    if (bs as u32) < (BlockSize::Block8x8 as u32) || bw > 64 || bh > 64 {
+        return Ok(());
+    }
+    // §5.11.46 `bsizeCtx = Mi_Width_Log2 + Mi_Height_Log2 - 2`. Our
+    // Mi_Width_Log2 is `ilog2(mi_width)`: 8×8 → 1+1-2=0, 8×16 or 16×8
+    // → 1+2-2=1, 16×16 → 2+2-2=2, 16×32 or 32×16 → 3, 32×32 → 4,
+    // 32×64 or 64×32 → 5, 64×64 → 6. Run the computation directly off
+    // `bw/bh` to cover rectangular shapes the spec permits.
+    let mi_w = (bw >> 2).max(1);
+    let mi_h = (bh >> 2).max(1);
+    let mw_log2 = 31 - mi_w.leading_zeros();
+    let mh_log2 = 31 - mi_h.leading_zeros();
+    let bsize_ctx = (mw_log2 + mh_log2).saturating_sub(2) as usize;
+
+    // Spec §9.4.6 neighbor context for `has_palette_y`:
+    //   ctx = 0
+    //   if (AvailU && PaletteSizes[0][MiRow-1][MiCol] > 0) ctx += 1
+    //   if (AvailL && PaletteSizes[0][MiRow][MiCol-1] > 0) ctx += 1
+    // We track neighbor palette activation on the MI grid once we
+    // start emitting palette blocks; until then (and we bail on any
+    // activation) a neighbour can never have had a palette set, so
+    // ctx is structurally 0.
+    let mi_col = x >> 2;
+    let mi_row = y >> 2;
+    let have_above = mi_row > 0 && mi_col < fs.mi_cols;
+    let have_left = mi_col > 0 && mi_row < fs.mi_rows;
+    let mut y_ctx = 0usize;
+    if have_above {
+        let above = fs.mi_at(mi_col, mi_row - 1);
+        if above.palette_size_y > 0 {
+            y_ctx += 1;
+        }
+    }
+    if have_left {
+        let left = fs.mi_at(mi_col - 1, mi_row);
+        if left.palette_size_y > 0 {
+            y_ctx += 1;
+        }
+    }
+
+    if y_mode == IntraMode::DcPred {
+        let has_palette_y = td.decode_has_palette_y(bsize_ctx, y_ctx)?;
+        if has_palette_y {
+            return Err(Error::unsupported(
+                "av1 palette_mode_info luma (§5.11.46) pending",
+            ));
+        }
+    }
+
+    // Chroma gate: `HasChroma && UVMode == DC_PRED`.
+    let has_chroma = !fs.monochrome && td.seq.color_config.num_planes >= 3;
+    if has_chroma && uv_mode == IntraMode::DcPred {
+        // §9.4.6 `has_palette_uv` ctx = `(PaletteSizeY > 0) ? 1 : 0`.
+        // PaletteSizeY is 0 at this point (we would have bailed
+        // otherwise).
+        let uv_ctx = 0usize;
+        let has_palette_uv = td.decode_has_palette_uv(uv_ctx)?;
+        if has_palette_uv {
+            return Err(Error::unsupported(
+                "av1 palette_mode_info chroma (§5.11.46) pending",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Spec §5.11.24 `filter_intra_mode_info()`. Returns
 /// `(use_filter_intra, filter_intra_mode)`; both zero when the
 /// block is ineligible or the encoder declined filter-intra. Per the
@@ -768,6 +894,221 @@ fn read_filter_intra_mode_info(
     Ok((true, mode))
 }
 
+/// Spec §5.11.17 `read_var_tx_size(row, col, txSz, depth)` — consume
+/// the `txfm_split` symbol(s) for a var-tx inter transform unit. The
+/// spec decoder uses the resulting tree to assign `InterTxSizes[][]`
+/// across the block; Round 8 keeps the recursion but does not yet
+/// propagate the per-TU transform size into residual decode (inter
+/// residual is still all-or-nothing at the block footprint).
+///
+/// Parameters mirror the spec directly:
+///   - `row / col`: MI-grid coordinates of the TU corner.
+///   - `tx_sz`: spec's `txSz` — the candidate transform size.
+///   - `depth`: recursion depth; spec caps at `MAX_VARTX_DEPTH = 2`.
+///   - `max_tx_sz`: spec's `maxTxSz = Max_Tx_Size_Rect[MiSize]`, held
+///     across the recursion so the CDF context formula can index by
+///     `(TX_SIZES - 1 - maxTxSz)` regardless of the current depth.
+#[allow(clippy::too_many_arguments)]
+fn read_var_tx_size(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    row: u32,
+    col: u32,
+    tx_sz: TxSize,
+    depth: u32,
+    max_tx_sz: TxSize,
+) -> Result<()> {
+    // §5.11.17 `if (row >= MiRows || col >= MiCols) return`.
+    if row >= fs.mi_rows || col >= fs.mi_cols {
+        return Ok(());
+    }
+
+    // §5.11.17: `if (txSz == TX_4X4 || depth == MAX_VARTX_DEPTH)
+    // txfm_split = 0` — no symbol is read.
+    const MAX_VARTX_DEPTH: u32 = 2;
+    let forced_nosplit = matches!(tx_sz, TxSize::Tx4x4) || depth == MAX_VARTX_DEPTH;
+
+    let txfm_split = if forced_nosplit {
+        false
+    } else {
+        let ctx = txfm_split_ctx(fs, row, col, tx_sz, max_tx_sz);
+        td.decode_txfm_split(ctx)?
+    };
+
+    let w4 = (tx_sz.width() / 4) as u32;
+    let h4 = (tx_sz.height() / 4) as u32;
+
+    if txfm_split {
+        let sub = tx_sz.split();
+        let step_w = (sub.width() / 4).max(1) as u32;
+        let step_h = (sub.height() / 4).max(1) as u32;
+        let mut i = 0u32;
+        while i < h4 {
+            let mut j = 0u32;
+            while j < w4 {
+                read_var_tx_size(td, fs, row + i, col + j, sub, depth + 1, max_tx_sz)?;
+                j += step_w;
+            }
+            i += step_h;
+        }
+    } else {
+        // Stamp `InterTxSizes[row+i][col+j] = txSz` for every MI cell
+        // in the TU footprint. Preserving this so the §9.4.8 above /
+        // left TX-size contexts read back the right size on
+        // neighbouring blocks.
+        for i in 0..h4 {
+            for j in 0..w4 {
+                let cc = col + j;
+                let cr = row + i;
+                if cc < fs.mi_cols && cr < fs.mi_rows {
+                    fs.mi_mut(cc, cr).tx_size = Some(tx_sz);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §5.11.17 / §9.4.8 `txfm_split` context. Matches the spec formula
+///   above = get_above_tx_width(row, col) < Tx_Width[txSz]
+///   left  = get_left_tx_height(row, col) < Tx_Height[txSz]
+///   size  = Min(64, Max(Block_Width[MiSize], Block_Height[MiSize]))
+///   maxTxSz = find_tx_size(size, size)
+///   txSzSqrUp = Tx_Size_Sqr_Up[txSz]
+///   ctx = (txSzSqrUp != maxTxSz) * 3
+///       + (TX_SIZES - 1 - maxTxSz) * 6
+///       + above + left
+/// We approximate `maxTxSz` with the block's spec-derived
+/// `Max_Tx_Size_Rect` mapped to the square-up category the CDF table
+/// expects. The above/left TX-size reads fall back to 64-sample when
+/// the neighbour hasn't stored an `InterTxSizes` value yet.
+fn txfm_split_ctx(fs: &FrameState, row: u32, col: u32, tx_sz: TxSize, max_tx_sz: TxSize) -> usize {
+    // Above width lookup (spec get_above_tx_width).
+    let above_w = if row > 0 && col < fs.mi_cols {
+        fs.mi_at(col, row - 1)
+            .tx_size
+            .map(|t| t.width() as u32)
+            .unwrap_or(64)
+    } else {
+        64
+    };
+    // Left height lookup (spec get_left_tx_height).
+    let left_h = if col > 0 && row < fs.mi_rows {
+        fs.mi_at(col - 1, row)
+            .tx_size
+            .map(|t| t.height() as u32)
+            .unwrap_or(64)
+    } else {
+        64
+    };
+    let above = (above_w < tx_sz.width() as u32) as usize;
+    let left = (left_h < tx_sz.height() as u32) as usize;
+
+    // `tx_size_sqr_up_cat` maps any TxSize to the square-up category
+    // 0..=4 (TX_4X4..TX_64X64) the CDF formula expects.
+    let sqr_up = tx_sqr_up_cat(tx_sz);
+    let max_cat = tx_sqr_up_cat(max_tx_sz);
+    let not_max = (sqr_up != max_cat) as usize;
+    const TX_SIZES: usize = 5; // TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64
+    let base = not_max * 3 + (TX_SIZES - 1 - max_cat) * 6;
+    base + above + left
+}
+
+/// Map a TxSize to `Tx_Size_Sqr_Up` (§Additional tables): 4×4=0,
+/// 8×8=1, 16×16=2, 32×32=3, 64×64=4. Rectangular sizes collapse to
+/// the larger square category.
+fn tx_sqr_up_cat(t: TxSize) -> usize {
+    let s = t.width().max(t.height());
+    match s {
+        4 => 0,
+        8 => 1,
+        16 => 2,
+        32 => 3,
+        _ => 4,
+    }
+}
+
+/// Spec §5.11.16 `read_block_tx_size()` — inter-frame branch. Wraps
+/// the var-tx tree (`read_var_tx_size`, §5.11.17) for inter blocks
+/// that opt into `TX_MODE_SELECT`, and the fallback `read_tx_size`
+/// path (`tx_depth` CDF) for everything else. Returns `Ok(())`;
+/// per-TU TxSize values are stamped on the MI grid so neighbour
+/// context lookups pick them up on the next block.
+#[allow(clippy::too_many_arguments)]
+fn read_inter_block_tx_size(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    bs: BlockSize,
+    mi_col: u32,
+    mi_row: u32,
+    skip: bool,
+    is_inter: bool,
+) -> Result<()> {
+    let lossless = crate::frame_header_tail::coded_lossless_hint(&td.frame.quant);
+    if lossless {
+        // §5.11.15 lossless path: TxSize pinned to TX_4X4.
+        return Ok(());
+    }
+    let max_tx = match bs.max_tx_size_rect() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let tx_mode_select = matches!(td.frame.tx_mode, crate::frame_header_tail::TxMode::Select);
+    let bw4 = (bs.width() >> 2).max(1);
+    let bh4 = (bs.height() >> 2).max(1);
+
+    // Spec §5.11.16 first leg: var-tx read fires only for inter
+    // blocks bigger than 4×4 whose residual survives (not skipped)
+    // and that opted into `TX_MODE_SELECT`.
+    if tx_mode_select && bs != BlockSize::Block4x4 && is_inter && !skip {
+        let tx_w4 = (max_tx.width() as u32 / 4).max(1);
+        let tx_h4 = (max_tx.height() as u32 / 4).max(1);
+        let mut r = mi_row;
+        while r < mi_row + bh4 {
+            let mut c = mi_col;
+            while c < mi_col + bw4 {
+                read_var_tx_size(td, fs, r, c, max_tx, 0, max_tx)?;
+                c += tx_w4;
+            }
+            r += tx_h4;
+        }
+    } else {
+        // Spec §5.11.16 else branch — `read_tx_size(!skip || !is_inter)`.
+        // `allowSelect` collapses to `!skip` for inter and `true` for
+        // intra-within-inter.
+        let allow_select = !skip || !is_inter;
+        if bs as u32 > BlockSize::Block4x4 as u32
+            && allow_select
+            && tx_mode_select
+            && bs.max_tx_depth() > 0
+        {
+            let ctx = tx_depth_ctx(fs, mi_col, mi_row, max_tx);
+            let raw = td.decode_tx_depth(bs.max_tx_depth(), ctx)?;
+            let mut tx = max_tx;
+            for _ in 0..raw {
+                tx = tx.split();
+            }
+            for r in mi_row..mi_row + bh4 {
+                for c in mi_col..mi_col + bw4 {
+                    if c < fs.mi_cols && r < fs.mi_rows {
+                        fs.mi_mut(c, r).tx_size = Some(tx);
+                    }
+                }
+            }
+        } else {
+            // No symbol — `TxSize = maxRectTxSize`.
+            for r in mi_row..mi_row + bh4 {
+                for c in mi_col..mi_col + bw4 {
+                    if c < fs.mi_cols && r < fs.mi_rows {
+                        fs.mi_mut(c, r).tx_size = Some(max_tx);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Inter-frame leaf decode — reads block-level inter syntax, runs MC
 /// into a prediction buffer, then performs the existing residual /
 /// clip-add path on top. Intra-within-inter blocks surface
@@ -783,6 +1124,26 @@ fn decode_inter_leaf_block(
     let info = decode_inter_block_syntax(td, fs, x, y, bw, bh)?;
     // Spec §5.11.56 read_cdef() — also applies to inter leaves.
     read_cdef(td, fs, x, y, info.skip)?;
+
+    // Spec §5.11.16 `read_block_tx_size()` — inter branch. For inter
+    // blocks with `TxMode == TX_MODE_SELECT && MiSize > BLOCK_4X4 &&
+    // !skip && !Lossless` we descend the var-tx tree; otherwise we
+    // consult `read_tx_size`. Either path consumes the relevant
+    // symbol bits so the range coder stays aligned with the encoder.
+    let mi_col_blk = x >> 2;
+    let mi_row_blk = y >> 2;
+    let bs_inter = block_size_from_wh(bw, bh);
+    if bs_inter != BlockSize::Invalid {
+        read_inter_block_tx_size(
+            td,
+            fs,
+            bs_inter,
+            mi_col_blk,
+            mi_row_blk,
+            info.skip,
+            info.is_inter,
+        )?;
+    }
     let w = bw as usize;
     let h = bh as usize;
     let mi_col = x >> 2;
