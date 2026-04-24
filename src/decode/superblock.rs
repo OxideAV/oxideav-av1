@@ -2966,6 +2966,53 @@ mod tests {
         }
     }
 
+    // §5.11.12 CurrentQIndex update arithmetic — mirror the spec's
+    // `Clip3(1, 255, CurrentQIndex + (reducedDeltaQIndex << delta_q_res))`
+    // for standalone verification. Doesn't exercise the CDF read path
+    // (that needs real bitstream material); purely the clamping
+    // arithmetic so future refactors can't silently wander.
+    fn apply_delta_q(current: i32, reduced: i32, res: i32) -> i32 {
+        if reduced == 0 {
+            return current;
+        }
+        let shifted = reduced.wrapping_shl(res as u32);
+        current.saturating_add(shifted).clamp(1, 255)
+    }
+
+    #[test]
+    fn current_qindex_update_clips_to_spec_range() {
+        // Positive delta within range accumulates.
+        assert_eq!(apply_delta_q(100, 5, 2), 120);
+        // Delta with res=0 lands unshifted.
+        assert_eq!(apply_delta_q(100, 5, 0), 105);
+        // Upper clamp at 255.
+        assert_eq!(apply_delta_q(250, 10, 2), 255);
+        // Lower clamp at 1 (not 0 — spec Clip3(1, 255, …)).
+        assert_eq!(apply_delta_q(5, -10, 0), 1);
+        // Zero reduced leaves state untouched.
+        assert_eq!(apply_delta_q(123, 0, 4), 123);
+    }
+
+    // §5.11.13 DeltaLF update arithmetic — twin of the above for the
+    // loop-filter delta running total. Clamping is symmetric at
+    // ±MAX_LOOP_FILTER=63 per §9.3.
+    fn apply_delta_lf(current: i32, reduced: i32, res: i32) -> i32 {
+        if reduced == 0 {
+            return current;
+        }
+        let shifted = reduced.wrapping_shl(res as u32);
+        current.saturating_add(shifted).clamp(-63, 63)
+    }
+
+    #[test]
+    fn delta_lf_update_clips_at_max_loop_filter() {
+        assert_eq!(apply_delta_lf(0, 5, 0), 5);
+        assert_eq!(apply_delta_lf(0, 5, 2), 20);
+        assert_eq!(apply_delta_lf(60, 10, 0), 63);
+        assert_eq!(apply_delta_lf(-60, -10, 0), -63);
+        assert_eq!(apply_delta_lf(10, 0, 2), 10);
+    }
+
     // §7.11.2.3 recursive filter-intra: when `filter_intra: Some(_)`
     // the predictor bypasses the DC_PRED branch. A flat 100-sample
     // neighbourhood lets every tap set in Table 7.11.2.3 emit 100
