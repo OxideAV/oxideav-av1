@@ -9,10 +9,54 @@
 //! takes the direct-copy fast path; otherwise we stage a
 //! `(w+7)×(h+7)` padded reference region and call the 8-tap filter in
 //! [`crate::predict::interp`].
+//!
+//! Spec §7.11.3.3 `motion_vector_clamping`: MV is clamped so the
+//! predicted block stays within `[-MV_BORDER, frame_w + MV_BORDER]` on
+//! each axis. `MV_BORDER` is 128 samples (spec §3 constants table).
 
 use crate::predict::interp::{interp_sub_pel, interp_sub_pel16, InterpFilter};
 
 use super::mv::Mv;
+
+/// §7.11.3.3 `MV_BORDER` — 128 luma samples on every side of the
+/// reference frame where MVs may still point before the clamp pulls
+/// them in. Equivalent constant for chroma planes is divided by the
+/// subsampling factor; callers pre-scale the MV before calling into
+/// this module.
+pub const MV_BORDER: i32 = 128;
+
+/// Clamp the block-relative MV so that `(bx + int_x, by + int_y)` lands
+/// inside the reference frame expanded by `MV_BORDER` on each side.
+/// Returns a clamped [`Mv`] in eighth-pel units. Spec §7.11.3.3.
+///
+/// The clamp is applied at integer-pel precision; fractional phases
+/// are preserved so sub-pel filtering lands on the same sample.
+pub fn clamp_mv_to_frame(
+    mv: Mv,
+    bx: i32,
+    by: i32,
+    bw: i32,
+    bh: i32,
+    frame_w: i32,
+    frame_h: i32,
+) -> Mv {
+    // Separate integer and fractional components (eighth-pel units).
+    let int_col = mv.col >> 3;
+    let frac_col = mv.col & 7;
+    let int_row = mv.row >> 3;
+    let frac_row = mv.row & 7;
+    // Allowed integer offsets per spec §7.11.3.3.
+    let min_col = -bx - MV_BORDER - bw;
+    let max_col = frame_w - bx + MV_BORDER;
+    let min_row = -by - MV_BORDER - bh;
+    let max_row = frame_h - by + MV_BORDER;
+    let int_col = int_col.clamp(min_col, max_col);
+    let int_row = int_row.clamp(min_row, max_row);
+    Mv {
+        col: (int_col << 3) | frac_col,
+        row: (int_row << 3) | frac_row,
+    }
+}
 
 /// Produce a `w×h` 8-bit predicted block at `dst` using the reference
 /// plane `ref_y` at logical position `(bx + mv.col, by + mv.row)` with
@@ -35,6 +79,16 @@ pub fn motion_compensate(
     mv: Mv,
     filt: InterpFilter,
 ) {
+    // §7.11.3.3 clamp MV to `[-MV_BORDER, frame + MV_BORDER]`.
+    let mv = clamp_mv_to_frame(
+        mv,
+        bx,
+        by,
+        w as i32,
+        h as i32,
+        ref_w as i32,
+        ref_h as i32,
+    );
     let int_x = mv.col >> 3;
     let int_y = mv.row >> 3;
     let phase_x = (mv.col & 7) as usize;
@@ -90,6 +144,16 @@ pub fn motion_compensate16(
     filt: InterpFilter,
     bit_depth: u32,
 ) {
+    // §7.11.3.3 clamp MV to `[-MV_BORDER, frame + MV_BORDER]`.
+    let mv = clamp_mv_to_frame(
+        mv,
+        bx,
+        by,
+        w as i32,
+        h as i32,
+        ref_w as i32,
+        ref_h as i32,
+    );
     let int_x = mv.col >> 3;
     let int_y = mv.row >> 3;
     let phase_x = (mv.col & 7) as usize;
@@ -167,6 +231,50 @@ fn integer_copy_clamped16(
             let sx = (bx + c as i32).clamp(0, (src_w as i32) - 1) as usize;
             dst[r * w + c] = src[sy * src_stride + sx];
         }
+    }
+}
+
+/// Bi-prediction averaging — spec §7.11.3.9 `AverageMc`.
+///
+/// Combines two per-block single-reference prediction buffers into
+/// one via `(p0 + p1 + 1) >> 1`. Used for compound inter prediction
+/// when both references are active and no mask is applied.
+pub fn average_mc_u8(p0: &[u8], p1: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(p0.len(), p1.len());
+    debug_assert_eq!(p0.len(), dst.len());
+    for i in 0..p0.len() {
+        dst[i] = (((p0[i] as u16) + (p1[i] as u16) + 1) >> 1) as u8;
+    }
+}
+
+/// HBD counterpart of [`average_mc_u8`]. `bit_depth` selects the
+/// clipping range (unused in the average itself, kept for signature
+/// parity with the other HBD calls).
+pub fn average_mc_u16(p0: &[u16], p1: &[u16], dst: &mut [u16], _bit_depth: u32) {
+    debug_assert_eq!(p0.len(), p1.len());
+    debug_assert_eq!(p0.len(), dst.len());
+    for i in 0..p0.len() {
+        dst[i] = (((p0[i] as u32) + (p1[i] as u32) + 1) >> 1) as u16;
+    }
+}
+
+/// Masked-compound blend — simplified §7.11.3.9 `BlendMc` path using a
+/// raw 0..=64 weight per sample. `mask[i]` is the weight applied to
+/// `p0[i]`; `(64 - mask[i])` is applied to `p1[i]`. Output is rounded
+/// half-up.
+///
+/// Full AV1 wedge / diffwt / smooth-ii masks are generated from §7.11.3
+/// tables; this helper takes a pre-computed mask so callers can plug
+/// it in once the mask-generator is wired.
+pub fn blend_mc_u8(p0: &[u8], p1: &[u8], mask: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(p0.len(), p1.len());
+    debug_assert_eq!(p0.len(), mask.len());
+    debug_assert_eq!(p0.len(), dst.len());
+    for i in 0..p0.len() {
+        let m = mask[i] as u32;
+        let inv = 64 - m;
+        let v = ((p0[i] as u32) * m + (p1[i] as u32) * inv + 32) >> 6;
+        dst[i] = v.min(255) as u8;
     }
 }
 
@@ -266,6 +374,71 @@ mod tests {
         for v in &dst {
             assert_eq!(*v, 0x42);
         }
+    }
+
+    #[test]
+    fn clamp_mv_keeps_in_bounds_mvs_unchanged() {
+        // A small MV well inside the frame is passed through.
+        let mv = Mv { row: 40, col: -32 };
+        let out = clamp_mv_to_frame(mv, 16, 16, 8, 8, 128, 128);
+        assert_eq!(out, mv);
+    }
+
+    #[test]
+    fn clamp_mv_pulls_far_mvs_to_border() {
+        // MV that would land ~4000 samples past the right edge is
+        // clipped. Integer part clamps to frame_w + MV_BORDER - bx =
+        // 128 + 128 - 0 = 256.
+        let mv = Mv { row: 0, col: 4000 * 8 };
+        let out = clamp_mv_to_frame(mv, 0, 0, 16, 16, 128, 128);
+        assert_eq!(out.col >> 3, 256);
+        // Fractional component preserved.
+        assert_eq!(out.col & 7, 0);
+    }
+
+    #[test]
+    fn clamp_mv_preserves_fractional_phase() {
+        let mv = Mv { row: 0, col: -99999 };
+        let frac = mv.col & 7;
+        let out = clamp_mv_to_frame(mv, 0, 0, 16, 16, 64, 64);
+        assert_eq!(out.col & 7, frac);
+    }
+
+    #[test]
+    fn average_mc_u8_round_half_up() {
+        let p0 = vec![10u8, 11, 12, 13];
+        let p1 = vec![20u8, 21, 22, 23];
+        let mut dst = vec![0u8; 4];
+        average_mc_u8(&p0, &p1, &mut dst);
+        // (10+20+1)>>1=15, (11+21+1)>>1=16, ...
+        assert_eq!(dst, vec![15u8, 16, 17, 18]);
+    }
+
+    #[test]
+    fn average_mc_u16_round_half_up() {
+        let p0 = vec![100u16, 200, 300];
+        let p1 = vec![120u16, 220, 320];
+        let mut dst = vec![0u16; 3];
+        average_mc_u16(&p0, &p1, &mut dst, 10);
+        assert_eq!(dst, vec![110u16, 210, 310]);
+    }
+
+    #[test]
+    fn blend_mc_u8_linear_weights() {
+        let p0 = vec![0u8, 128, 255];
+        let p1 = vec![255u8, 128, 0];
+        // All-zero mask: blend = p1.
+        let mut dst = vec![0u8; 3];
+        blend_mc_u8(&p0, &p1, &[0, 0, 0], &mut dst);
+        assert_eq!(dst, vec![255u8, 128, 0]);
+        // All-64 mask: blend = p0.
+        let mut dst = vec![0u8; 3];
+        blend_mc_u8(&p0, &p1, &[64, 64, 64], &mut dst);
+        assert_eq!(dst, vec![0u8, 128, 255]);
+        // Half mask: mid.
+        let mut dst = vec![0u8; 3];
+        blend_mc_u8(&p0, &p1, &[32, 32, 32], &mut dst);
+        assert_eq!(dst, vec![128u8, 128, 128]);
     }
 
     #[test]

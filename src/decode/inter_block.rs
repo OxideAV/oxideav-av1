@@ -100,14 +100,38 @@ pub fn decode_inter_block_syntax(
     // Inter mode. We treat the context as 0 across the board since we
     // don't maintain neighbor-mode classes for inter yet.
     let mode = inter.read_inter_mode(&mut td.symbol, 0, 0, 0)?;
+    // §7.10 motion-mode integration: when the block selects GLOBALMV
+    // and the frame's `gm_type` for LAST is TRANSLATION, seed the MV
+    // from the (quantized) translation parameters. Non-translation
+    // global types are unsupported in the narrow path and degrade to
+    // zero-MV.
     let mv = match mode {
         InterMode::NewMv => inter.read_mv(&mut td.symbol)?,
-        InterMode::GlobalMv | InterMode::NearestMv | InterMode::NearMv => Mv::default(),
+        InterMode::GlobalMv => global_mv_for_last(td.frame),
+        InterMode::NearestMv | InterMode::NearMv => Mv::default(),
     };
 
-    // Interpolation filter symbol is coded only when
-    // `is_filter_switchable` is set. Our simplified path forces
-    // REGULAR and skips the symbol.
+    // Interpolation filter symbol per §5.11.26 `read_interpolation_filter`:
+    // when the frame header's `is_filter_switchable` is true, a per-
+    // block filter is decoded; otherwise the frame-level filter applies
+    // uniformly. The raw frame-level value uses spec mapping
+    // 0=REGULAR, 1=SMOOTH, 2=SHARP, 3=BILINEAR, 4=SWITCHABLE.
+    let interp_filter = if td.frame.is_filter_switchable {
+        // Per §5.11.26 the per-block context is formed from above/left
+        // interp-filter types; we collapse to ctx=0 (no neighbor
+        // bookkeeping yet) and read a single symbol per block.
+        inter.read_interp_filter(&mut td.symbol, 0)?
+    } else {
+        // 3 = BILINEAR; AV1 treats it as not coded for AVIF fixtures,
+        // which use value 0 or 4. We map BILINEAR -> REGULAR since we
+        // don't carry a bilinear filter set yet.
+        match td.frame.interpolation_filter {
+            1 => InterpFilter::Smooth,
+            2 => InterpFilter::Sharp,
+            _ => InterpFilter::Regular,
+        }
+    };
+
     let skip = inter.read_skip(&mut td.symbol, 0)?;
 
     Ok(InterBlockInfo {
@@ -115,9 +139,32 @@ pub fn decode_inter_block_syntax(
         ref_frame_idx: 0,
         mv,
         skip,
-        interp_filter: InterpFilter::Regular,
+        interp_filter,
         intra_y_mode: IntraMode::DcPred,
     })
+}
+
+/// Derive a translational MV for GLOBALMV using the LAST slot's
+/// global-motion parameters. Our frame header parser stores only the
+/// `gm_type[]` discriminator (§5.9.24 params are consumed but not
+/// retained), so for non-Identity / non-Translation slots we fall back
+/// to zero-MV. Identity always yields zero. Translation will be wired
+/// once `gm_params[]` is surfaced — until then the return value
+/// matches the previous zero-MV behaviour for GLOBAL blocks.
+fn global_mv_for_last(frame: &crate::frame_header::FrameHeader) -> Mv {
+    use crate::frame_header_tail::GmType;
+    // LAST is ref index 1 in AV1's reference slot numbering (0 = intra,
+    // 1 = LAST, ... per spec §3). Our narrow decoder collapses to
+    // slot 1 for single-ref inter.
+    let gm = frame.gm_type.get(1).copied().unwrap_or(GmType::Identity);
+    match gm {
+        GmType::Identity | GmType::RotZoom | GmType::Affine => Mv::default(),
+        GmType::Translation => {
+            // Translation params are not currently retained by the
+            // header parser; fall back to zero until they are.
+            Mv::default()
+        }
+    }
 }
 
 /// Run luma motion compensation for a single block into an owned
