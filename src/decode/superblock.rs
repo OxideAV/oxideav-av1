@@ -1525,8 +1525,9 @@ fn run_intra_prediction_u8(
     // Extended neighbours for directional / filter-intra reads. Length
     // covers the longest projection: above + right of block.
     let ext_len = w + h + 4;
+    let _ = fallback;
     let (above_raw, left_raw, above_left) =
-        gather_neighbors_u8(plane, plane_stride, plane_height, x, y, ext_len, fallback);
+        gather_neighbors_u8(plane, plane_stride, plane_height, x, y, w, h, ext_len, 8);
     let have_above = y > 0;
     let have_left = x > 0;
 
@@ -1656,8 +1657,9 @@ fn run_intra_prediction_u16(
     filter_type: u32,
 ) -> Vec<u16> {
     let ext_len = w + h + 4;
+    let _ = fallback;
     let (above_raw, left_raw, above_left) =
-        gather_neighbors_u16(plane, plane_stride, plane_height, x, y, ext_len, fallback);
+        gather_neighbors_u16(plane, plane_stride, plane_height, x, y, w, h, ext_len, bit_depth);
     let have_above = y > 0;
     let have_left = x > 0;
 
@@ -1758,82 +1760,140 @@ fn upsample_edge_u16(
     buf
 }
 
-/// Gather extended neighbour samples from a u8 plane. Returns
-/// `(above, left, above_left)` where `above` has `ext_len` samples
-/// (edge-replicated beyond the plane) and `left` has `ext_len` samples.
+/// Gather extended neighbour samples from a u8 plane per AV1
+/// §7.11.2.1. Returns `(above, left, above_left)` where `above` and
+/// `left` each have `ext_len` samples (typically `w + h`).
+///
+/// `w` and `h` are the transform-block dimensions driving the
+/// `aboveLimit`/`leftLimit` clamping from the spec: without knowledge
+/// of `haveAboveRight`/`haveBelowLeft` we use the conservative form
+/// (`aboveLimit = x + w - 1`, `leftLimit = y + h - 1`) so indices past
+/// the block's right/below edges replicate the last valid sample —
+/// never read into un-reconstructed territory.
+///
+/// Unavailability substitution matches the spec:
+/// - `haveAbove=0, haveLeft=1` → `AboveRow[i] = CurrFrame[y][x-1]`
+/// - `haveAbove=1, haveLeft=0` → `LeftCol[i]  = CurrFrame[y-1][x]`
+/// - neither → `AboveRow = (1<<(bd-1)) - 1`, `LeftCol = (1<<(bd-1)) + 1`
+/// - Corner `AboveRow[-1]` follows the 4-case derivation in §7.11.2.1.
+#[allow(clippy::too_many_arguments)]
 fn gather_neighbors_u8(
     plane: &[u8],
     plane_stride: usize,
     plane_height: usize,
     x: usize,
     y: usize,
+    w: usize,
+    h: usize,
     ext_len: usize,
-    fallback: u8,
+    bit_depth: u32,
 ) -> (Vec<u8>, Vec<u8>, u8) {
-    let mut above = vec![fallback; ext_len];
-    let mut left = vec![fallback; ext_len];
-    if y > 0 {
+    let have_above = y > 0;
+    let have_left = x > 0;
+    let max_x = plane_stride.saturating_sub(1);
+    let max_y = plane_height.saturating_sub(1);
+    let mid_above: u8 = ((1u32 << (bit_depth - 1)).saturating_sub(1)).min(255) as u8;
+    let mid_left: u8 = ((1u32 << (bit_depth - 1)) + 1).min(255) as u8;
+
+    let mut above = vec![mid_above; ext_len];
+    let mut left = vec![mid_left; ext_len];
+
+    if !have_above && have_left {
+        let v = plane[y * plane_stride + (x - 1)];
+        for slot in above.iter_mut() {
+            *slot = v;
+        }
+    } else if have_above {
+        let above_limit = max_x.min(x + w.saturating_sub(1));
         let row = (y - 1) * plane_stride;
-        let max_x = plane_stride.saturating_sub(1);
         for (c, slot) in above.iter_mut().enumerate() {
-            let sx = (x + c).min(max_x);
+            let sx = (x + c).min(above_limit);
             *slot = plane[row + sx];
         }
     }
-    if x > 0 {
-        let max_y = plane_height.saturating_sub(1);
+
+    if !have_left && have_above {
+        let v = plane[(y - 1) * plane_stride + x];
+        for slot in left.iter_mut() {
+            *slot = v;
+        }
+    } else if have_left {
+        let left_limit = max_y.min(y + h.saturating_sub(1));
         for (r, slot) in left.iter_mut().enumerate() {
-            let sy = (y + r).min(max_y);
+            let sy = (y + r).min(left_limit);
             *slot = plane[sy * plane_stride + (x - 1)];
         }
     }
-    let above_left = if x > 0 && y > 0 {
+
+    let above_left = if have_above && have_left {
         plane[(y - 1) * plane_stride + (x - 1)]
-    } else if y > 0 {
+    } else if have_above {
         plane[(y - 1) * plane_stride + x]
-    } else if x > 0 {
+    } else if have_left {
         plane[y * plane_stride + (x - 1)]
     } else {
-        fallback
+        (1u32 << (bit_depth - 1)).min(255) as u8
     };
     (above, left, above_left)
 }
 
 /// u16 counterpart of [`gather_neighbors_u8`].
+#[allow(clippy::too_many_arguments)]
 fn gather_neighbors_u16(
     plane: &[u16],
     plane_stride: usize,
     plane_height: usize,
     x: usize,
     y: usize,
+    w: usize,
+    h: usize,
     ext_len: usize,
-    fallback: u16,
+    bit_depth: u32,
 ) -> (Vec<u16>, Vec<u16>, u16) {
-    let mut above = vec![fallback; ext_len];
-    let mut left = vec![fallback; ext_len];
-    if y > 0 {
+    let have_above = y > 0;
+    let have_left = x > 0;
+    let max_x = plane_stride.saturating_sub(1);
+    let max_y = plane_height.saturating_sub(1);
+    let mid_above: u16 = (1u16 << (bit_depth - 1)).saturating_sub(1);
+    let max_sample: u16 = ((1u32 << bit_depth) - 1) as u16;
+    let mid_left: u16 = ((1u16 << (bit_depth - 1)) + 1).min(max_sample);
+
+    let mut above = vec![mid_above; ext_len];
+    let mut left = vec![mid_left; ext_len];
+
+    if !have_above && have_left {
+        let v = plane[y * plane_stride + (x - 1)];
+        for slot in above.iter_mut() {
+            *slot = v;
+        }
+    } else if have_above {
+        let above_limit = max_x.min(x + w.saturating_sub(1));
         let row = (y - 1) * plane_stride;
-        let max_x = plane_stride.saturating_sub(1);
         for (c, slot) in above.iter_mut().enumerate() {
-            let sx = (x + c).min(max_x);
+            let sx = (x + c).min(above_limit);
             *slot = plane[row + sx];
         }
     }
-    if x > 0 {
-        let max_y = plane_height.saturating_sub(1);
+    if !have_left && have_above {
+        let v = plane[(y - 1) * plane_stride + x];
+        for slot in left.iter_mut() {
+            *slot = v;
+        }
+    } else if have_left {
+        let left_limit = max_y.min(y + h.saturating_sub(1));
         for (r, slot) in left.iter_mut().enumerate() {
-            let sy = (y + r).min(max_y);
+            let sy = (y + r).min(left_limit);
             *slot = plane[sy * plane_stride + (x - 1)];
         }
     }
-    let above_left = if x > 0 && y > 0 {
+    let above_left = if have_above && have_left {
         plane[(y - 1) * plane_stride + (x - 1)]
-    } else if y > 0 {
+    } else if have_above {
         plane[(y - 1) * plane_stride + x]
-    } else if x > 0 {
+    } else if have_left {
         plane[y * plane_stride + (x - 1)]
     } else {
-        fallback
+        1u16 << (bit_depth - 1)
     };
     (above, left, above_left)
 }
