@@ -431,17 +431,15 @@ fn svtav1_skip_mode_compound_decodes_real_pixels() {
         }
     }
 
-    // Round 15 update: with the §8.2.6 symbol-decoder fix the
-    // SVT-AV1 fixture's first inter frame now exercises the real
-    // syntax path (not the previous all-DC_PRED fallback). It surfaces
-    // pre-existing chroma TX-size gaps (`Subsampled_Size` not yet
-    // wired — §5.11.27) before reaching the SKIP_MODE compound frame,
-    // so this test downgrades the SKIP_MODE assertion to informational
-    // until the chroma-TX work lands. The compound-MC dispatch itself
-    // is exercised by `compound_mc_luma_*` unit tests in
-    // `inter_block.rs`.
-    eprintln!(
-        "skip_mode_frame_decoded={decoded_skip_mode_frame} multi_ref_planes_seen={multi_ref_planes_at_decode}"
+    // Round 16 update: §5.11.38 `Subsampled_Size` + §7.13.3 dequant /
+    // inter-pass clips landed; the SKIP_MODE compound frame now reaches
+    // block decode with both reference planes available and exercises
+    // the §7.11.3.9 compound-MC dispatch end-to-end on real bitstream.
+    // Promote to a hard assertion to lock the win for future bisection.
+    assert!(
+        decoded_skip_mode_frame && multi_ref_planes_at_decode,
+        "SKIP_MODE compound frame must decode end-to-end with multi-ref planes \
+         (decoded={decoded_skip_mode_frame} multi_ref_planes={multi_ref_planes_at_decode})"
     );
 }
 

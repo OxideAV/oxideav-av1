@@ -1643,8 +1643,10 @@ fn reconstruct_inter_chroma_block(
     let sub_y = fs.sub_y;
     let cx = (x >> sub_x) as usize;
     let cy = (y >> sub_y) as usize;
-    let cw = ((w as u32 >> sub_x).max(1)) as usize;
-    let ch = ((h as u32 >> sub_y).max(1)) as usize;
+    // §5.11.38 Subsampled_Size — narrow luma blocks (e.g. 16×4 under
+    // 4:2:0) collapse to a valid chroma residual size (8×4) instead of
+    // the naive 8×2 that would not exist in the AV1 TX set.
+    let (cw, ch) = chroma_residual_dims(w, h, sub_x, sub_y);
     let uvw = fs.uv_width as usize;
     let uvh = fs.uv_height as usize;
     let cw_clip = cw.min(uvw.saturating_sub(cx));
@@ -1889,8 +1891,8 @@ fn reconstruct_skip_mode_compound_chroma(
     let sub_y = fs.sub_y;
     let cx = (x >> sub_x) as usize;
     let cy = (y >> sub_y) as usize;
-    let cw = ((w as u32 >> sub_x).max(1)) as usize;
-    let ch = ((h as u32 >> sub_y).max(1)) as usize;
+    // §5.11.38 Subsampled_Size — see the inter chroma path's note.
+    let (cw, ch) = chroma_residual_dims(w, h, sub_x, sub_y);
     let uvw = fs.uv_width as usize;
     let uvh = fs.uv_height as usize;
     let cw_clip = cw.min(uvw.saturating_sub(cx));
@@ -2237,6 +2239,38 @@ fn tx_unit_dims(w: usize, h: usize) -> (usize, usize) {
     (w.min(64), h.min(64))
 }
 
+/// Chroma residual block dimensions for a luma block of size `bw × bh`
+/// at subsampling `(sub_x, sub_y)`, per AV1 §5.11.38
+/// `get_plane_residual_size( subsize, plane>0 )` ⇒
+/// `Subsampled_Size[ MiSize ][ subx ][ suby ]`.
+///
+/// The naive `(bw >> sub_x, bh >> sub_y)` mapping produces invalid
+/// chroma TX dimensions for narrow luma blocks (e.g. `Block16x4` under
+/// 4:2:0 would naively give 8×2, but 8×2 is not in the AV1 TX set —
+/// the spec collapses it to 8×4). When the lookup table emits
+/// `BlockSize::Invalid` (a combination the bitstream is required not
+/// to emit per §5.11.38 conformance note: "It is a requirement of
+/// bitstream conformance that get_plane_residual_size( subSize, 1 ) is
+/// not equal to BLOCK_INVALID") we fall back to the naive halving so
+/// that any out-of-spec encoder still hits a typed error downstream
+/// rather than a silent miscompute. Returns `(cw, ch)` in chroma
+/// samples, always at least 1×1.
+#[inline]
+fn chroma_residual_dims(bw: usize, bh: usize, sub_x: u32, sub_y: u32) -> (usize, usize) {
+    use crate::decode::block::block_size_from_wh;
+    let bs = block_size_from_wh(bw as u32, bh as u32);
+    let sub_bs = bs.subsampled_size(sub_x, sub_y);
+    if sub_bs == BlockSize::Invalid {
+        // Spec violation by the encoder, but keep the halving
+        // behaviour so downstream `select_square_tx` surfaces a
+        // descriptive error rather than panicking on a 0-sized dim.
+        let cw = ((bw as u32 >> sub_x).max(1)) as usize;
+        let ch = ((bh as u32 >> sub_y).max(1)) as usize;
+        return (cw, ch);
+    }
+    (sub_bs.width() as usize, sub_bs.height() as usize)
+}
+
 /// Pick the `(TxSize, num_coeffs, scan)` triple for the given block
 /// dimensions.
 fn select_square_tx(w: usize, h: usize) -> Result<(TxSize, usize, Vec<usize>)> {
@@ -2289,8 +2323,10 @@ fn reconstruct_chroma_block(
     let sub_y = fs.sub_y;
     let cx = (x >> sub_x) as usize;
     let cy = (y >> sub_y) as usize;
-    let cw = ((bw >> sub_x).max(1)) as usize;
-    let ch = ((bh >> sub_y).max(1)) as usize;
+    // §5.11.38 Subsampled_Size — narrow luma blocks (e.g. 16×4 under
+    // 4:2:0) collapse to a valid chroma residual size (8×4) instead
+    // of the naive 8×2.
+    let (cw, ch) = chroma_residual_dims(bw as usize, bh as usize, sub_x, sub_y);
     let uvw = fs.uv_width as usize;
     let uvh = fs.uv_height as usize;
     let cw_clip = cw.min(uvw.saturating_sub(cx));
@@ -3171,13 +3207,28 @@ fn extract_block16(
 }
 
 /// Dequantise a single coefficient — DC for `pos == 0`, AC otherwise.
+///
+/// Per spec §7.13.3 (step f) the dequantised value must be clipped to
+/// `Clip3(-(1 << (7 + BitDepth)), (1 << (7 + BitDepth)) - 1, dq2)`
+/// before reaching the inverse transform — without this the row /
+/// column butterfly multiplications can overflow `i32` on aggressive
+/// (real-encoder) coefficient streams. For 8-bit content this gives
+/// the conventional `±32767` range; the parameter `bit_depth` lets
+/// 10/12-bit pipelines widen it correctly.
 #[inline]
 fn dequant_coeff(level: i32, pos: usize, qv: quant::Values) -> i32 {
     let q = if pos == 0 { qv.dc } else { qv.ac };
     if q == 0 {
         return 0;
     }
-    level.saturating_mul(q as i32)
+    let raw = level.saturating_mul(q as i32);
+    let lim_shift = 7u32.saturating_add(qv.bit_depth);
+    let lim = if lim_shift >= 31 {
+        i32::MAX
+    } else {
+        1i32 << lim_shift
+    };
+    raw.clamp(-lim, lim - 1)
 }
 
 /// Round-shift used to scale the residual back to the pixel domain.

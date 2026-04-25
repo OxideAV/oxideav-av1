@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 16 — implement §5.11.38 `Subsampled_Size[][2][2]` table on
+  `BlockSize` and route every chroma reconstruction (`reconstruct_inter_chroma_block`,
+  `reconstruct_skip_mode_compound_chroma`, `reconstruct_chroma_block`)
+  through it via the new `chroma_residual_dims` helper. Eliminates the
+  bogus 8×2 / 2×8 chroma TX dispatches that bailed real-encoder
+  bitstreams; narrow luma blocks (16×4, 4×16, etc.) now produce the
+  spec-correct 8×4 / 4×8 chroma TX.
+- round 16 — apply §7.13.3 step-f dequant clip
+  (`±(1 << (7 + BitDepth))`) inside `dequant_coeff` and the
+  inter-pass `colClampRange = 16` clip inside `inverse_2d`. Stops
+  `i32` overflow in `half_btf` on real-encoder coefficient streams
+  that the round-15 §8.2.6 fix newly exposed. Promote
+  `svtav1_skip_mode_compound_decodes_real_pixels` to a hard
+  assertion: SVT-AV1 SkipMode compound frame now decodes end-to-end
+  with multi-ref planes.
+
 - round 12 — wire §5.11.10 read_skip_mode + §5.11.19 inter_segment_id
   end-to-end on the inter leaf path (DEFAULT_SEGMENT_ID_PREDICTED_CDF
   added; new `decode_skip_mode` / `decode_seg_id_predicted` /

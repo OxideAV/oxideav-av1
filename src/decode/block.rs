@@ -78,6 +78,169 @@ impl BlockSize {
         (mw, mh)
     }
 
+    /// `Subsampled_Size[ subsize ][ subx ][ suby ]` per AV1 spec
+    /// §5.11.38 (table on p.88). Maps a luma block size + chroma
+    /// subsampling factors to the chroma residual block size — used by
+    /// `get_plane_residual_size( subsize, plane )`. Returns
+    /// `BlockSize::Invalid` for spec entries marked `BLOCK_INVALID`
+    /// (combinations the encoder must not emit; bitstream conformance
+    /// requires `get_plane_residual_size( ., 1 ) != BLOCK_INVALID`).
+    ///
+    /// Without this table a naive `(w >> sub_x) × (h >> sub_y)` halving
+    /// produces TX dimensions like 8×2 or 2×8 for narrow inter blocks
+    /// (e.g. `Block16x4` + 4:2:0), which are not in the AV1 TX set —
+    /// the spec collapses them to 8×4 (resp. 4×8) instead. See spec
+    /// table excerpt:
+    ///   { {BLOCK_16X4,  BLOCK_INVALID},  {BLOCK_8X4,  BLOCK_8X4} },
+    ///   { {BLOCK_4X16,  BLOCK_4X8},      {BLOCK_INVALID, BLOCK_4X8} },
+    pub fn subsampled_size(self, sub_x: u32, sub_y: u32) -> BlockSize {
+        // Indexing: `[subx as usize][suby as usize]`. Spec lays out
+        // entries as `[subx][suby]` in `Subsampled_Size[][2][2]`.
+        let sx = (sub_x & 1) as usize;
+        let sy = (sub_y & 1) as usize;
+        // Each row matches one luma block size in the spec table order.
+        // Inner literals are flattened to `[(0,0),(0,1),(1,0),(1,1)]`.
+        const I: BlockSize = BlockSize::Invalid;
+        let row: [BlockSize; 4] = match self {
+            BlockSize::Block4x4 => [
+                BlockSize::Block4x4, // (0,0)
+                BlockSize::Block4x4, // (0,1)
+                BlockSize::Block4x4, // (1,0)
+                BlockSize::Block4x4, // (1,1)
+            ],
+            BlockSize::Block4x8 => [
+                BlockSize::Block4x8, // (0,0)
+                BlockSize::Block4x4, // (0,1)
+                I,                   // (1,0)
+                BlockSize::Block4x4, // (1,1)
+            ],
+            BlockSize::Block8x4 => [
+                BlockSize::Block8x4, // (0,0)
+                I,                   // (0,1)
+                BlockSize::Block4x4, // (1,0)
+                BlockSize::Block4x4, // (1,1)
+            ],
+            BlockSize::Block8x8 => [
+                BlockSize::Block8x8,
+                BlockSize::Block8x4,
+                BlockSize::Block4x8,
+                BlockSize::Block4x4,
+            ],
+            BlockSize::Block8x16 => [
+                BlockSize::Block8x16,
+                BlockSize::Block8x8,
+                I,
+                BlockSize::Block4x8,
+            ],
+            BlockSize::Block16x8 => [
+                BlockSize::Block16x8,
+                I,
+                BlockSize::Block8x8,
+                BlockSize::Block8x4,
+            ],
+            BlockSize::Block16x16 => [
+                BlockSize::Block16x16,
+                BlockSize::Block16x8,
+                BlockSize::Block8x16,
+                BlockSize::Block8x8,
+            ],
+            BlockSize::Block16x32 => [
+                BlockSize::Block16x32,
+                BlockSize::Block16x16,
+                I,
+                BlockSize::Block8x16,
+            ],
+            BlockSize::Block32x16 => [
+                BlockSize::Block32x16,
+                I,
+                BlockSize::Block16x16,
+                BlockSize::Block16x8,
+            ],
+            BlockSize::Block32x32 => [
+                BlockSize::Block32x32,
+                BlockSize::Block32x16,
+                BlockSize::Block16x32,
+                BlockSize::Block16x16,
+            ],
+            BlockSize::Block32x64 => [
+                BlockSize::Block32x64,
+                BlockSize::Block32x32,
+                I,
+                BlockSize::Block16x32,
+            ],
+            BlockSize::Block64x32 => [
+                BlockSize::Block64x32,
+                I,
+                BlockSize::Block32x32,
+                BlockSize::Block32x16,
+            ],
+            BlockSize::Block64x64 => [
+                BlockSize::Block64x64,
+                BlockSize::Block64x32,
+                BlockSize::Block32x64,
+                BlockSize::Block32x32,
+            ],
+            BlockSize::Block64x128 => [
+                BlockSize::Block64x128,
+                BlockSize::Block64x64,
+                I,
+                BlockSize::Block32x64,
+            ],
+            BlockSize::Block128x64 => [
+                BlockSize::Block128x64,
+                I,
+                BlockSize::Block64x64,
+                BlockSize::Block64x32,
+            ],
+            BlockSize::Block128x128 => [
+                BlockSize::Block128x128,
+                BlockSize::Block128x64,
+                BlockSize::Block64x128,
+                BlockSize::Block64x64,
+            ],
+            BlockSize::Block4x16 => [
+                BlockSize::Block4x16,
+                BlockSize::Block4x8,
+                I,
+                BlockSize::Block4x8,
+            ],
+            BlockSize::Block16x4 => [
+                BlockSize::Block16x4,
+                I,
+                BlockSize::Block8x4,
+                BlockSize::Block8x4,
+            ],
+            BlockSize::Block8x32 => [
+                BlockSize::Block8x32,
+                BlockSize::Block8x16,
+                I,
+                BlockSize::Block4x16,
+            ],
+            BlockSize::Block32x8 => [
+                BlockSize::Block32x8,
+                I,
+                BlockSize::Block16x8,
+                BlockSize::Block16x4,
+            ],
+            BlockSize::Block16x64 => [
+                BlockSize::Block16x64,
+                BlockSize::Block16x32,
+                I,
+                BlockSize::Block8x32,
+            ],
+            BlockSize::Block64x16 => [
+                BlockSize::Block64x16,
+                I,
+                BlockSize::Block32x16,
+                BlockSize::Block32x8,
+            ],
+            BlockSize::Invalid => [I, I, I, I],
+        };
+        // Ordering inside `row` is `(subx,suby) ∈ {(0,0),(0,1),(1,0),(1,1)}`.
+        let idx = (sx << 1) | sy;
+        row[idx]
+    }
+
     /// Largest transform that fits in this block, capped at 64×64 (AV1
     /// hard ceiling). Used by the implicit-TX path.
     pub fn max_tx_size(self) -> (u32, u32) {
@@ -385,6 +548,58 @@ mod tests {
         assert_eq!(BlockSize::Block32x32.max_tx_depth(), 3);
         assert_eq!(BlockSize::Block64x64.max_tx_depth(), 4);
         assert_eq!(BlockSize::Block128x128.max_tx_depth(), 4);
+    }
+
+    // §5.11.38 `Subsampled_Size` — narrow blocks must collapse to a
+    // valid AV1 chroma TX size under 4:2:0, not the naive 8×2 / 2×8
+    // halving. Exercise the spec's BLOCK_INVALID entries too so future
+    // refactors can't silently turn them into garbage TX dispatches.
+    #[test]
+    fn subsampled_size_matches_spec_table() {
+        // 4:0:0 (sub_x=0, sub_y=0) is always identity.
+        assert_eq!(
+            BlockSize::Block16x4.subsampled_size(0, 0),
+            BlockSize::Block16x4
+        );
+        // 4:2:0 (sub_x=1, sub_y=1) — narrow forms collapse, not halve.
+        assert_eq!(
+            BlockSize::Block16x4.subsampled_size(1, 1),
+            BlockSize::Block8x4
+        );
+        assert_eq!(
+            BlockSize::Block4x16.subsampled_size(1, 1),
+            BlockSize::Block4x8
+        );
+        // 4:2:2 (sub_x=1, sub_y=0) — pure horizontal halve.
+        assert_eq!(
+            BlockSize::Block16x16.subsampled_size(1, 0),
+            BlockSize::Block8x16
+        );
+        // Several BLOCK_INVALID entries; encoder must avoid them.
+        assert_eq!(
+            BlockSize::Block16x4.subsampled_size(0, 1),
+            BlockSize::Invalid
+        );
+        assert_eq!(
+            BlockSize::Block4x16.subsampled_size(1, 0),
+            BlockSize::Invalid
+        );
+        assert_eq!(
+            BlockSize::Block8x4.subsampled_size(0, 1),
+            BlockSize::Invalid
+        );
+        // Square block under 4:2:0 simply halves both dims.
+        assert_eq!(
+            BlockSize::Block64x64.subsampled_size(1, 1),
+            BlockSize::Block32x32
+        );
+        // 128 chroma still exists per spec (no cap until TX dispatch).
+        assert_eq!(
+            BlockSize::Block128x128.subsampled_size(0, 0),
+            BlockSize::Block128x128
+        );
+        // Invalid in → Invalid out.
+        assert_eq!(BlockSize::Invalid.subsampled_size(1, 1), BlockSize::Invalid);
     }
 
     #[test]

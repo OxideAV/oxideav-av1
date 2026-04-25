@@ -192,6 +192,19 @@ pub fn inverse_2d(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()> {
         coeffs[r * w..(r + 1) * w].copy_from_slice(&row);
     }
 
+    // §7.13.3 between row and column passes: clip the intermediate
+    // residual to `colClampRange = max(BitDepth + 6, 16)` bits before
+    // the column transform consumes it. We don't carry BitDepth here,
+    // so use the conservative 16-bit envelope (matches 8-bit and is
+    // a valid super-set for 10/12-bit content; the dequant clip in
+    // §7.13.3 step f bounds the 10/12-bit input separately). Without
+    // this clip aggressive coefficient streams overflow `i32` inside
+    // the butterfly (`half_btf`) — observed on real SVT-AV1 frames.
+    const COL_CLAMP_LIMIT: i32 = 1 << 15; // 2^(16-1)
+    for v in coeffs.iter_mut() {
+        *v = (*v).clamp(-COL_CLAMP_LIMIT, COL_CLAMP_LIMIT - 1);
+    }
+
     // Column pass.
     let mut col = vec![0i32; h];
     for c in 0..w {

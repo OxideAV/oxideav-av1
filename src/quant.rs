@@ -43,11 +43,14 @@ pub struct Params {
 
 /// Per-plane pair of DC / AC dequantisers. Units are Q0 integers;
 /// applied as `raw_coeff * dequant` after reading residuals from the
-/// coefficient decoder.
+/// coefficient decoder. `bit_depth` carries through so that callers
+/// can apply the §7.13.3 step-f clip (`±(1 << (7 + BitDepth))`)
+/// without having to plumb the sequence header separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Values {
     pub dc: u16,
     pub ac: u16,
+    pub bit_depth: u32,
 }
 
 impl Params {
@@ -83,6 +86,7 @@ impl Params {
         Ok(Values {
             dc: dc_tab[clip_q(q_dc) as usize],
             ac: ac_tab[clip_q(q_ac) as usize],
+            bit_depth: self.bit_depth,
         })
     }
 }
