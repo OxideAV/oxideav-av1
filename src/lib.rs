@@ -60,8 +60,8 @@ pub mod intra {
     pub use crate::predict::intra::{predict, IntraMode, Neighbours};
 }
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 pub const CODEC_ID_STR: &str = "av1";
 

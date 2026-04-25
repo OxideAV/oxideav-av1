@@ -10,8 +10,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use oxideav_codec::Decoder;
 use oxideav_core::frame::{VideoFrame, VideoPlane};
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
 use crate::decode::{decode_tile_group, FrameState};

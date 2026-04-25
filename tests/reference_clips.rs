@@ -286,7 +286,7 @@ fn decoder_exposes_tile_boundaries_for_single_tile_clip() {
     // send_packet surfaces Unsupported because tile decode isn't
     // implemented, but the tile byte-boundaries ARE extracted before the
     // error is returned.
-    let _ = <Av1Decoder as oxideav_codec::Decoder>::send_packet(&mut dec, &pkt);
+    let _ = <Av1Decoder as oxideav_core::Decoder>::send_packet(&mut dec, &pkt);
     let tiles = dec.last_tile_payloads();
     assert_eq!(tiles.len(), 1, "expected one tile from single-tile clip");
     assert_eq!(tiles[0].tile_num, 0);
