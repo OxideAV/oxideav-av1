@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-av1/compare/v0.1.0...v0.1.1) - 2026-04-25
+
+### Fixed
+
+- fix CI clippy + pin release-plz to 0.1.x
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- round 9b — unit tests for delta_q / delta_lf apply arithmetic
+- round 9a — filter-intra dispatch + CurrentQIndex/DeltaLF apply
+- round 8 — palette_mode_info + var-tx inter + inter-skip ordering
+- round 7 — wire delta_q/lf + use_intrabc + filter_intra_mode_info (§5.11.7/.12/.13/.24)
+- wire read_block_tx_size() + fix read_skip ordering (§5.11.5/.7/.16)
+- document testsrc luma gap root causes (investigation notes)
+- spec-correct intra neighbor gathering (§7.11.2.1)
+- §7.9 reference scaling scaffolding + scaled luma MC
+- retain global-motion params + compound luma MC skeleton (§7.10 / §7.11.3.9)
+- round-4 inter MC — §7.11.3.3 MV clamp + §5.11.26 per-block interp filter
+- spec-exact per-SB CDEF (§7.15 + §5.11.56)
+- wire intra edge filter + upsample into TX-unit predictors
+- add intra edge filter + upsample (§7.11.2.9-.12)
+- drop goavif origin markers (self-port; no third-party attribution needed)
+- add AVIF-still 128×128-SB decode fixture + test
+- run intra prediction per TX unit, not per block (§7.11.2)
+- split 128×N intra blocks into 64×64 TX units (§5.11.27)
+- fix reduced_still_picture_header parsing (§5.9.1)
+- release v0.0.4
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-av1/compare/v0.0.3...v0.1.0) - 2026-04-19
 
 ### Other
