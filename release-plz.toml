@@ -6,3 +6,11 @@ allow_dirty = false
 
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
+
+# Stay on the 0.1.x train. The decoder API surface is still in flux —
+# round-by-round refactors keep tripping `cargo-semver-checks` and
+# release-plz proposes 0.2.0 as a result. Disable the semver-driven
+# bump so release-plz only acts on conventional-commit hints (fix: →
+# patch). When the public API stabilises, drop this line and
+# version-bump deliberately.
+semver_check = false

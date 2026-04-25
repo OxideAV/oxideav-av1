@@ -387,11 +387,7 @@ fn apply_cdef(frame: &FrameHeader, fs: &mut FrameState) {
 }
 
 fn fs_cdef_rows(total: usize, cols: usize) -> usize {
-    if cols == 0 {
-        0
-    } else {
-        total / cols
-    }
+    total.checked_div(cols).unwrap_or(0)
 }
 
 /// Apply §5.11.40-.44 loop restoration across every plane whose
