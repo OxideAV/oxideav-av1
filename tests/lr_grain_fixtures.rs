@@ -202,3 +202,80 @@ fn phase5_fixture_still_produces_deterministic_luma() {
     let mean = sum / area;
     assert!(mean > 30 && mean < 220, "unexpected mean luma {mean}");
 }
+
+/// Round 10: aomenc with `--tune-content=screen` produces an AV1
+/// stream that flips on `allow_screen_content_tools`, which in turn
+/// drives the encoder's palette-coded blocks (§5.11.46 +
+/// §5.11.49). Before Round 10 the decoder bailed with
+/// `Error::Unsupported("av1 palette_mode_info luma pending")` the
+/// instant any block activated the `has_palette_y` flag. With the
+/// `palette_tokens()` + `predict_palette` path now wired the same
+/// fixture should decode end to end and produce a non-flat luma
+/// plane.
+#[test]
+fn palette_screen_fixture_decodes_with_plane_variation() {
+    let Some((y, w, h, sum)) = decode_first_frame("tests/fixtures/palette_screen.ivf") else {
+        return;
+    };
+    assert_eq!((w, h), (64, 64));
+    assert!(!y.is_empty());
+    let area = (w as u64) * (h as u64);
+    let mean = sum / area;
+    assert!(mean > 30 && mean < 220, "unexpected mean luma {mean}");
+    let distinct = y
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct > 4,
+        "palette-coded plane is too flat: {distinct} distinct samples"
+    );
+}
+
+/// Round 10 PSNR check: decode the same palette fixture and compare
+/// against the libdav1d reference dump at `/tmp/av1_palette_ref.yuv`.
+/// The reference is generated alongside the fixture with:
+///   ffmpeg -y -i tests/fixtures/palette_screen.ivf \
+///       -f rawvideo -pix_fmt yuv420p /tmp/av1_palette_ref.yuv
+/// Skipped when the reference file isn't present.
+#[test]
+fn palette_screen_fixture_psnr_vs_reference() {
+    use std::path::Path as P;
+    let ref_path = "/tmp/av1_palette_ref.yuv";
+    if !P::new(ref_path).exists() {
+        eprintln!("reference {ref_path} missing — skipping");
+        return;
+    }
+    let Some((y, w, h, _sum)) = decode_first_frame("tests/fixtures/palette_screen.ivf") else {
+        return;
+    };
+    let yref = std::fs::read(ref_path).expect("read ref");
+    let area = (w * h) as usize;
+    if yref.len() < area {
+        panic!("ref shorter than expected ({})", yref.len());
+    }
+    let yref_y = &yref[..area];
+    let mse: f64 = y
+        .iter()
+        .zip(yref_y.iter())
+        .map(|(a, b)| {
+            let d = (*a as f64) - (*b as f64);
+            d * d
+        })
+        .sum::<f64>()
+        / (area as f64);
+    let psnr = if mse <= 1e-10 {
+        99.99
+    } else {
+        10.0 * (255.0_f64 * 255.0 / mse).log10()
+    };
+    eprintln!("palette_screen 64x64 — Y PSNR vs reference: {psnr:.2} dB");
+    // testsrc-style fixtures land around ~11 dB on the narrow Round-9
+    // decoder (no var-tx residual-per-TU yet, no read_skip_mode), so
+    // we set the floor at 8 dB — well above the “random output”
+    // baseline (≈4-6 dB) but below the cq=20 ceiling (~30 dB) that a
+    // full bit-exact decoder would hit. The point is to catch
+    // CDF-desync regressions, not to gate on residual quality.
+    assert!(psnr > 8.0, "palette_screen PSNR collapsed to {psnr:.2} dB");
+}

@@ -637,6 +637,19 @@ pub struct TileDecoder<'a> {
     /// `has_palette_uv` CDF — §5.11.46. Indexed as
     /// `[(PaletteSizeY > 0) ? 1 : 0]`, 2-symbol each.
     pub palette_uv_mode_cdf: Vec<Vec<u16>>,
+    /// `palette_size_y_minus_2` CDF — §5.11.46 / §9.4. Indexed as
+    /// `[bsizeCtx ∈ 0..=6]`. 7-symbol (palette sizes 2..=8 → values
+    /// 0..=6).
+    pub palette_y_size_cdf: Vec<Vec<u16>>,
+    /// `palette_size_uv_minus_2` CDF — §5.11.46 / §9.4. Same shape
+    /// as the Y variant.
+    pub palette_uv_size_cdf: Vec<Vec<u16>>,
+    /// `palette_color_idx_y` CDFs — one bank per palette size
+    /// (2..=8 → indices 0..=6), each `[ctx ∈ 0..=4]`-indexed. The
+    /// inner CDF has `palette_size`-many real symbols.
+    pub palette_y_color_cdfs: [Vec<Vec<u16>>; 7],
+    /// `palette_color_idx_uv` CDFs — chroma counterpart.
+    pub palette_uv_color_cdfs: [Vec<Vec<u16>>; 7],
     /// `txfm_split` CDF — §5.11.17 var-tx partition flag.
     /// `TXFM_PARTITION_CONTEXTS = 21`; 2-symbol each.
     pub txfm_split_cdf: Vec<Vec<u16>>,
@@ -722,6 +735,10 @@ impl<'a> TileDecoder<'a> {
             filter_intra_mode_cdf: Vec::new(),
             palette_y_mode_cdf: Vec::new(),
             palette_uv_mode_cdf: Vec::new(),
+            palette_y_size_cdf: Vec::new(),
+            palette_uv_size_cdf: Vec::new(),
+            palette_y_color_cdfs: Default::default(),
+            palette_uv_color_cdfs: Default::default(),
             txfm_split_cdf: Vec::new(),
             coeff_bank,
             switchable_restore_cdf: default_switchable_cdf(),
@@ -823,6 +840,75 @@ impl<'a> TileDecoder<'a> {
             .map(|row| row.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
             .collect();
         self.palette_uv_mode_cdf = cdfs::DEFAULT_PALETTE_UV_MODE_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        // §5.11.46 palette size CDFs — 7-symbol (sizes 2..=8 ⇒
+        // signal value 0..=6). Indexed by bsizeCtx ∈ 0..=6.
+        self.palette_y_size_cdf = cdfs::DEFAULT_PALETTE_Y_SIZE_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_size_cdf = cdfs::DEFAULT_PALETTE_UV_SIZE_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        // §5.11.49 palette colour-index CDFs — one bank per palette
+        // size, each `[ctx ∈ 0..=4]`. Slot `[k]` holds the CDF for
+        // PaletteSize == k+2.
+        self.palette_y_color_cdfs[0] = cdfs::DEFAULT_PALETTE_Y_COLOR_SIZE_2_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_y_color_cdfs[1] = cdfs::DEFAULT_PALETTE_Y_COLOR_SIZE_3_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_y_color_cdfs[2] = cdfs::DEFAULT_PALETTE_Y_COLOR_SIZE_4_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_y_color_cdfs[3] = cdfs::DEFAULT_PALETTE_Y_COLOR_SIZE_5_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_y_color_cdfs[4] = cdfs::DEFAULT_PALETTE_Y_COLOR_SIZE_6_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_y_color_cdfs[5] = cdfs::DEFAULT_PALETTE_Y_COLOR_SIZE_7_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_y_color_cdfs[6] = cdfs::DEFAULT_PALETTE_Y_COLOR_SIZE_8_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_color_cdfs[0] = cdfs::DEFAULT_PALETTE_UV_COLOR_SIZE_2_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_color_cdfs[1] = cdfs::DEFAULT_PALETTE_UV_COLOR_SIZE_3_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_color_cdfs[2] = cdfs::DEFAULT_PALETTE_UV_COLOR_SIZE_4_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_color_cdfs[3] = cdfs::DEFAULT_PALETTE_UV_COLOR_SIZE_5_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_color_cdfs[4] = cdfs::DEFAULT_PALETTE_UV_COLOR_SIZE_6_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_color_cdfs[5] = cdfs::DEFAULT_PALETTE_UV_COLOR_SIZE_7_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.palette_uv_color_cdfs[6] = cdfs::DEFAULT_PALETTE_UV_COLOR_SIZE_8_CDF
             .iter()
             .map(|c| c.to_vec())
             .collect();
@@ -1104,6 +1190,51 @@ impl<'a> TileDecoder<'a> {
             .symbol
             .decode_symbol(&mut self.palette_uv_mode_cdf[c])?;
         Ok(raw != 0)
+    }
+
+    /// §5.11.46 `palette_size_y_minus_2` — 7-symbol size value
+    /// (encoded palette sizes 2..=8 → raw 0..=6). `bsize_ctx` is the
+    /// `Mi_Width_Log2 + Mi_Height_Log2 - 2` value (0..=6).
+    pub fn decode_palette_size_y(&mut self, bsize_ctx: usize) -> Result<u32> {
+        let bs = bsize_ctx.min(self.palette_y_size_cdf.len() - 1);
+        let raw = self
+            .symbol
+            .decode_symbol(&mut self.palette_y_size_cdf[bs])?;
+        Ok(raw)
+    }
+
+    /// §5.11.46 `palette_size_uv_minus_2` — chroma counterpart.
+    pub fn decode_palette_size_uv(&mut self, bsize_ctx: usize) -> Result<u32> {
+        let bs = bsize_ctx.min(self.palette_uv_size_cdf.len() - 1);
+        let raw = self
+            .symbol
+            .decode_symbol(&mut self.palette_uv_size_cdf[bs])?;
+        Ok(raw)
+    }
+
+    /// §5.11.49 `palette_color_idx_y` / `palette_color_idx_uv` — read
+    /// one palette colour index. The CDF is selected by
+    /// `(palette_size, ctx)` and the inner alphabet has `palette_size`
+    /// symbols. `is_y` flips between the Y and UV colour CDF banks.
+    pub fn decode_palette_color_idx(
+        &mut self,
+        palette_size: u8,
+        ctx: usize,
+        is_y: bool,
+    ) -> Result<u32> {
+        if !(2..=8).contains(&palette_size) {
+            return Err(Error::invalid(format!(
+                "av1 palette_color_idx: palette_size {palette_size} out of range (§5.11.49)"
+            )));
+        }
+        let bank_idx = (palette_size - 2) as usize;
+        let bank = if is_y {
+            &mut self.palette_y_color_cdfs[bank_idx]
+        } else {
+            &mut self.palette_uv_color_cdfs[bank_idx]
+        };
+        let c = ctx.min(bank.len() - 1);
+        self.symbol.decode_symbol(&mut bank[c])
     }
 
     /// §5.11.17 `txfm_split` — 2-symbol flag signalling whether a

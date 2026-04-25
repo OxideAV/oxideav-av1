@@ -47,11 +47,18 @@
 //!   recursive path with the five spec-table tap sets instead of the
 //!   DC_PRED fallback.
 //!
-//! # Remaining syntax-level gaps (Round 9+)
+//! # Round 10 status
 //!
-//! - Palette color decode (§7.11.4) — currently surfaces Unsupported;
-//!   a full implementation needs `palette_tokens()` + `PaletteCache`
-//!   + color-context CDFs.
+//! - **Palette mode (§5.11.46 + §5.11.49 + §5.11.50 + §7.11.4)** — the
+//!   full palette pipeline now lives in [`crate::decode::palette`].
+//!   `palette_mode_info()` decodes the size + colour list (cache-aware
+//!   `get_palette_cache`, delta-encoded V plane), `palette_tokens()`
+//!   walks the anti-diagonal map with the §5.11.50 colour-context
+//!   hash, and `predict_palette` (§7.11.4) replaces the prediction +
+//!   residual stages on the affected plane(s). Bitstreams that
+//!   previously bailed with `palette pending` decode end to end.
+//!
+//! # Remaining syntax-level gaps (Round 11+)
 //! - `DeltaLF[]` plumbing into the loop filter — the per-tile running
 //!   totals are tracked but `apply_deblocking` still reads frame-level
 //!   levels only; plumbing per-SB LF deltas needs a per-block LF level
@@ -505,26 +512,23 @@ pub fn decode_leaf_block(
         }
     }
 
-    // Spec §5.11.46 `palette_mode_info()` — gated on
-    // `allow_screen_content_tools && MiSize >= BLOCK_8X8 &&
-    // Block_Width <= 64 && Block_Height <= 64`. The helper consumes
-    // the `has_palette_y` / `has_palette_uv` bits and surfaces
-    // `Error::Unsupported("palette pending")` the moment either fires
-    // — the palette color decode (§7.11.4) isn't wired yet. When the
-    // block is palette-eligible but the encoder declined, the bits are
-    // still consumed so downstream syntax stays aligned.
-    read_palette_mode_info(td, fs, bs, bw, bh, y_mode, uv_mode, x, y)?;
+    // Spec §5.11.46 `palette_mode_info()` + §5.11.49 `palette_tokens()` —
+    // Round 10 wires the full palette path. Eligibility and the
+    // 0-bit fast-out for non-screen-content frames live inside
+    // [`read_palette_mode_info`]; the returned `PaletteBlock` is
+    // empty when the block declined palette coding.
+    let palette = read_palette_mode_info(td, fs, bs, bw, bh, y_mode, uv_mode, x, y)?;
 
     // Spec §5.11.24 `filter_intra_mode_info()` — gated on
     // `enable_filter_intra && YMode == DC_PRED && PaletteSizeY == 0 &&
-    // max(block_w, block_h) <= 32`. Our palette path always returns
-    // with `PaletteSizeY == 0` (any non-zero size above would have
-    // short-circuited into Error::Unsupported), so this branch can
-    // ignore the palette gate. Round 9: when `use_filter_intra == 1`
-    // the recursive §7.11.2.3 predictor replaces DC_PRED for the luma
-    // TX units (handled below).
-    let (use_filter_intra, filter_intra_mode) =
-        read_filter_intra_mode_info(td, bs, y_mode, bw, bh)?;
+    // max(block_w, block_h) <= 32`. Now respects the actual decoded
+    // palette state: filter-intra and palette are mutually exclusive
+    // on the luma plane.
+    let (use_filter_intra, filter_intra_mode) = if palette.has_y() {
+        (false, 0)
+    } else {
+        read_filter_intra_mode_info(td, bs, y_mode, bw, bh)?
+    };
 
     // Spec §5.11.5 `decode_block()` line "read_block_tx_size()".
     // For intra frames the `is_inter` branch of §5.11.16 collapses to
@@ -537,6 +541,22 @@ pub fn decode_leaf_block(
     let mi_h = (bh + 3) >> 2;
     let stored_uv = if fs.monochrome { None } else { Some(uv_mode) };
     let mi_size_idx = bs as u8;
+    // Pre-build the palette colour arrays so the per-MI propagation
+    // doesn't reallocate; spec §5.11.5 stamps `PaletteSizes[][]` and
+    // `PaletteColors[][][]` over every MI cell the block covers.
+    let mut pal_y = [0u16; 8];
+    let mut pal_u = [0u16; 8];
+    let mut pal_v = [0u16; 8];
+    if palette.has_y() {
+        let n = palette.colors_y.len().min(8);
+        pal_y[..n].copy_from_slice(&palette.colors_y[..n]);
+    }
+    if palette.has_uv() {
+        let n = palette.colors_u.len().min(8);
+        pal_u[..n].copy_from_slice(&palette.colors_u[..n]);
+        let n = palette.colors_v.len().min(8);
+        pal_v[..n].copy_from_slice(&palette.colors_v[..n]);
+    }
     for mr in 0..mi_h {
         for mc in 0..mi_w {
             let cell_col = mi_col + mc;
@@ -557,6 +577,11 @@ pub fn decode_leaf_block(
             mi.mi_size_idx = mi_size_idx;
             mi.use_filter_intra = use_filter_intra;
             mi.filter_intra_mode = filter_intra_mode;
+            mi.palette_size_y = palette.size_y;
+            mi.palette_size_uv = palette.size_uv;
+            mi.palette_colors_y = pal_y;
+            mi.palette_colors_u = pal_u;
+            mi.palette_colors_v = pal_v;
         }
     }
 
@@ -575,37 +600,74 @@ pub fn decode_leaf_block(
     } else {
         None
     };
-    reconstruct_luma_block(
-        td,
-        fs,
-        x,
-        y,
-        bw,
-        bh,
-        y_mode,
-        angle_delta_y,
-        skip,
-        segment_id,
-        Some(tx_size),
-        fi_opt,
-    )?;
-
-    // Chroma path.
-    if !fs.monochrome && num_planes >= 3 {
-        reconstruct_chroma_block(
+    if palette.has_y() {
+        // Spec §7.11.4: when PaletteSizeY > 0 the predictor is
+        // `palette[map[y][x]]` and there is no residual. Skip the
+        // entire reconstruct_luma_block call; the colours have been
+        // stamped onto the plane by the helper.
+        crate::decode::palette::apply_palette_luma(fs, &palette, (x, y), x, y, bw, bh);
+    } else {
+        reconstruct_luma_block(
             td,
             fs,
             x,
             y,
             bw,
             bh,
-            uv_mode,
-            angle_delta_uv,
+            y_mode,
+            angle_delta_y,
             skip,
-            cfl_alpha_u,
-            cfl_alpha_v,
             segment_id,
+            Some(tx_size),
+            fi_opt,
         )?;
+    }
+
+    // Chroma path.
+    if !fs.monochrome && num_planes >= 3 {
+        if palette.has_uv() {
+            // §7.11.4 chroma palette path. Coordinates and the
+            // colour map are stored at chroma resolution.
+            let bx_uv = x >> fs.sub_x;
+            let by_uv = y >> fs.sub_y;
+            let bw_uv = bw >> fs.sub_x;
+            let bh_uv = bh >> fs.sub_y;
+            crate::decode::palette::apply_palette_chroma(
+                fs,
+                &palette,
+                1,
+                (bx_uv, by_uv),
+                bx_uv,
+                by_uv,
+                bw_uv,
+                bh_uv,
+            );
+            crate::decode::palette::apply_palette_chroma(
+                fs,
+                &palette,
+                2,
+                (bx_uv, by_uv),
+                bx_uv,
+                by_uv,
+                bw_uv,
+                bh_uv,
+            );
+        } else {
+            reconstruct_chroma_block(
+                td,
+                fs,
+                x,
+                y,
+                bw,
+                bh,
+                uv_mode,
+                angle_delta_uv,
+                skip,
+                cfl_alpha_u,
+                cfl_alpha_v,
+                segment_id,
+            )?;
+        }
     }
 
     Ok(())
@@ -790,13 +852,10 @@ fn read_delta_lf_for_block(td: &mut TileDecoder<'_>, bs: BlockSize, skip: bool) 
     Ok(())
 }
 
-/// Spec §5.11.46 `palette_mode_info()` — consume the
-/// `has_palette_y` / `has_palette_uv` CDF flags on blocks that match
-/// the palette-eligibility predicate. Round 8 scope: detect palette
-/// activation and surface `Error::Unsupported("palette pending")`
-/// rather than silently desync when the palette color decode path
-/// isn't wired. Non-activating blocks consume 0 extra bits once the
-/// eligibility check passes.
+/// Spec §5.11.46 `palette_mode_info()` + §5.11.49 `palette_tokens()` —
+/// fully decode the palette state for `(x, y, bw, bh)`. Returns an
+/// empty `PaletteBlock` for blocks the encoder declined to palette-code
+/// (the bits are still consumed so the symbol stream stays aligned).
 ///
 /// Eligibility (§5.11.22 / §5.11.23):
 ///   - `allow_screen_content_tools` frame header bit set
@@ -816,16 +875,18 @@ fn read_palette_mode_info(
     uv_mode: IntraMode,
     x: u32,
     y: u32,
-) -> Result<()> {
+) -> Result<crate::decode::palette::PaletteBlock> {
+    use crate::decode::palette::{decode_palette_mode_info, PaletteBlock};
+
     // Frame-level gate: per §5.11.22/.23 the palette block is only
     // called when `allow_screen_content_tools != 0`.
     if td.frame.allow_screen_content_tools == 0 {
-        return Ok(());
+        return Ok(PaletteBlock::default());
     }
     // Block-size gate: `MiSize >= BLOCK_8X8 && Block_Width <= 64 &&
     // Block_Height <= 64`.
     if (bs as u32) < (BlockSize::Block8x8 as u32) || bw > 64 || bh > 64 {
-        return Ok(());
+        return Ok(PaletteBlock::default());
     }
     // §5.11.46 `bsizeCtx = Mi_Width_Log2 + Mi_Height_Log2 - 2`. Our
     // Mi_Width_Log2 is `ilog2(mi_width)`: 8×8 → 1+1-2=0, 8×16 or 16×8
@@ -838,57 +899,19 @@ fn read_palette_mode_info(
     let mh_log2 = 31 - mi_h.leading_zeros();
     let bsize_ctx = (mw_log2 + mh_log2).saturating_sub(2) as usize;
 
-    // Spec §9.4.6 neighbor context for `has_palette_y`:
-    //   ctx = 0
-    //   if (AvailU && PaletteSizes[0][MiRow-1][MiCol] > 0) ctx += 1
-    //   if (AvailL && PaletteSizes[0][MiRow][MiCol-1] > 0) ctx += 1
-    // We track neighbor palette activation on the MI grid once we
-    // start emitting palette blocks; until then (and we bail on any
-    // activation) a neighbour can never have had a palette set, so
-    // ctx is structurally 0.
-    let mi_col = x >> 2;
-    let mi_row = y >> 2;
-    let have_above = mi_row > 0 && mi_col < fs.mi_cols;
-    let have_left = mi_col > 0 && mi_row < fs.mi_rows;
-    let mut y_ctx = 0usize;
-    if have_above {
-        let above = fs.mi_at(mi_col, mi_row - 1);
-        if above.palette_size_y > 0 {
-            y_ctx += 1;
-        }
-    }
-    if have_left {
-        let left = fs.mi_at(mi_col - 1, mi_row);
-        if left.palette_size_y > 0 {
-            y_ctx += 1;
-        }
-    }
-
-    if y_mode == IntraMode::DcPred {
-        let has_palette_y = td.decode_has_palette_y(bsize_ctx, y_ctx)?;
-        if has_palette_y {
-            return Err(Error::unsupported(
-                "av1 palette_mode_info luma (§5.11.46) pending",
-            ));
-        }
-    }
-
-    // Chroma gate: `HasChroma && UVMode == DC_PRED`.
     let has_chroma = !fs.monochrome && td.seq.color_config.num_planes >= 3;
-    if has_chroma && uv_mode == IntraMode::DcPred {
-        // §9.4.6 `has_palette_uv` ctx = `(PaletteSizeY > 0) ? 1 : 0`.
-        // PaletteSizeY is 0 at this point (we would have bailed
-        // otherwise).
-        let uv_ctx = 0usize;
-        let has_palette_uv = td.decode_has_palette_uv(uv_ctx)?;
-        if has_palette_uv {
-            return Err(Error::unsupported(
-                "av1 palette_mode_info chroma (§5.11.46) pending",
-            ));
-        }
-    }
-
-    Ok(())
+    decode_palette_mode_info(
+        td,
+        fs,
+        bsize_ctx,
+        bw,
+        bh,
+        y_mode == IntraMode::DcPred,
+        uv_mode == IntraMode::DcPred,
+        has_chroma,
+        x,
+        y,
+    )
 }
 
 /// Spec §5.11.24 `filter_intra_mode_info()`. Returns

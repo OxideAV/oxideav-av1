@@ -67,14 +67,26 @@ pub struct ModeInfo {
     /// `use_filter_intra` is `false`.
     pub filter_intra_mode: u8,
     /// Spec §5.11.46 `PaletteSizeY` — number of palette colors on the
-    /// luma plane (0 when the block isn't palette-coded). Zero until
-    /// the palette path is wired; held on the MI grid so future
-    /// palette-aware blocks can form the `has_palette_y` neighbour
-    /// context (§9.4.6).
+    /// luma plane (0 when the block isn't palette-coded). Held on the
+    /// MI grid so neighbour blocks can form the `has_palette_y`
+    /// context (§9.4.6) and pull the colours into their cache
+    /// (§5.11.46 `get_palette_cache`).
     pub palette_size_y: u8,
     /// Spec §5.11.46 `PaletteSizeUV`. Same treatment as
     /// `palette_size_y`.
     pub palette_size_uv: u8,
+    /// Spec §5.11.46 `PaletteColors[0][...]` — Y palette colours,
+    /// sorted ascending. First `palette_size_y` entries valid; the
+    /// rest are zero-padded.
+    pub palette_colors_y: [u16; 8],
+    /// Spec §5.11.46 `PaletteColors[1][...]` — U palette colours,
+    /// sorted ascending. First `palette_size_uv` entries valid.
+    pub palette_colors_u: [u16; 8],
+    /// V palette colours — emitted alongside U by `palette_mode_info`
+    /// but kept in the encoder's order (the spec's
+    /// `delta_encode_palette_colors_v` path may emit them in a
+    /// non-sorted sequence). First `palette_size_uv` entries valid.
+    pub palette_colors_v: [u16; 8],
 }
 
 /// Mutable per-frame decoder state.
@@ -298,6 +310,24 @@ impl FrameState {
     pub fn mi_at(&self, mi_col: u32, mi_row: u32) -> &ModeInfo {
         let idx = (mi_row as usize) * (self.mi_cols as usize) + (mi_col as usize);
         &self.mi[idx]
+    }
+
+    /// Spec §5.11.46 helper — return the palette colour list stored
+    /// at MI cell `(mi_col, mi_row)` for `plane` (0 = Y, 1 = UV).
+    /// Length matches the MI's recorded palette size; an empty slice
+    /// means the cell isn't palette-coded.
+    pub fn palette_colors_at(&self, plane: usize, mi_col: u32, mi_row: u32) -> &[u16] {
+        let mi = self.mi_at(mi_col, mi_row);
+        match plane {
+            0 => {
+                let n = mi.palette_size_y as usize;
+                &mi.palette_colors_y[..n.min(8)]
+            }
+            _ => {
+                let n = mi.palette_size_uv as usize;
+                &mi.palette_colors_u[..n.min(8)]
+            }
+        }
     }
 }
 

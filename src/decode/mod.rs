@@ -20,6 +20,7 @@ pub mod lr_unit;
 pub mod mc;
 pub mod modes;
 pub mod mv;
+pub mod palette;
 pub mod partition;
 pub mod reconstruct;
 pub mod ref_scale;
