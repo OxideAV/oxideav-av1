@@ -58,7 +58,10 @@ pub fn narrow_mask(p1: u8, p0: u8, q0: u8, q1: u8, th: Thresholds) -> bool {
     if abs_diff(q1, q0) > th.blimit {
         return false;
     }
-    if abs_diff(p0, q0) * 2 + abs_diff(p1, q1) / 2 > th.limit {
+    // Widen to u16 — `abs_diff(p0, q0) * 2` can otherwise overflow u8
+    // (an edge with a 200-step jump produces 400). Spec §7.14.4.2.
+    let combined = (abs_diff(p0, q0) as u16) * 2 + (abs_diff(p1, q1) as u16) / 2;
+    if combined > th.limit as u16 {
         return false;
     }
     true
@@ -72,7 +75,11 @@ pub fn narrow_mask16(p1: u16, p0: u16, q0: u16, q1: u16, th: Thresholds16) -> bo
     if abs_diff16(q1, q0) > th.blimit {
         return false;
     }
-    if abs_diff16(p0, q0) * 2 + abs_diff16(p1, q1) / 2 > th.limit {
+    // Widen to u32 to avoid u16 overflow on 12-bit samples
+    // (max abs_diff is 4095, so `* 2 = 8190` still fits u16, but a
+    // 16-bit-depth scaled limit comparison is safer in u32).
+    let combined = (abs_diff16(p0, q0) as u32) * 2 + (abs_diff16(p1, q1) as u32) / 2;
+    if combined > th.limit as u32 {
         return false;
     }
     true

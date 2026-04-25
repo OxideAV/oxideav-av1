@@ -16,17 +16,21 @@
 
 /// `delta_q_abs` CDF — 4 symbols (`0..=DELTA_Q_SMALL`, with
 /// `DELTA_Q_SMALL == 3` in the spec constants table). Spec
-/// §9.4 `Default_Delta_Q_Cdf[DELTA_Q_SMALL + 2]`.
-pub const DEFAULT_DELTA_Q_CDF: [u16; 5] = [28160, 32120, 32677, 0, 0];
+/// §9.4 `Default_Delta_Q_Cdf[DELTA_Q_SMALL + 2] =
+/// {28160, 32120, 32677, 32768, 0}`. Stored values are
+/// `32768 - cdf_spec[i]` (survival function) per the wire convention
+/// in [`crate::cdfs`].
+pub const DEFAULT_DELTA_Q_CDF: [u16; 5] = [4608, 648, 91, 0, 0];
 
 /// `delta_lf_abs` CDF — 4 symbols, same shape / same default values
 /// as the delta-q CDF. Spec §9.4 `Default_Delta_Lf_Cdf[DELTA_LF_SMALL
-/// + 2]`.
-pub const DEFAULT_DELTA_LF_CDF: [u16; 5] = [28160, 32120, 32677, 0, 0];
+/// + 2] = {28160, 32120, 32677, 32768, 0}`. Stored as survival values.
+pub const DEFAULT_DELTA_LF_CDF: [u16; 5] = [4608, 648, 91, 0, 0];
 
 /// `use_intrabc` CDF — 2-symbol flag. Spec §9.4
-/// `Default_Intrabc_Cdf[2 + 1]`.
-pub const DEFAULT_INTRABC_CDF: [u16; 3] = [30531, 0, 0];
+/// `Default_Intrabc_Cdf[2 + 1] = {30531, 32768, 0}`. Stored as
+/// `32768 - 30531 = 2237` per the wire convention.
+pub const DEFAULT_INTRABC_CDF: [u16; 3] = [2237, 0, 0];
 
 /// `use_filter_intra` CDF — 2-symbol flag, indexed by `MiSize` (22
 /// block-size entries). Spec §9.4
@@ -36,26 +40,26 @@ pub const DEFAULT_INTRABC_CDF: [u16; 3] = [30531, 0, 0];
 /// rows (index 10..=15 in the outer dim, plus 20..=21 — see
 /// spec note).
 pub static DEFAULT_USE_FILTER_INTRA_CDF: [&[u16]; 22] = [
-    &[4621, 0, 0],  // BLOCK_4X4
-    &[6743, 0, 0],  // BLOCK_4X8
-    &[5893, 0, 0],  // BLOCK_8X4
-    &[7866, 0, 0],  // BLOCK_8X8
-    &[12551, 0, 0], // BLOCK_8X16
-    &[9394, 0, 0],  // BLOCK_16X8
-    &[12408, 0, 0], // BLOCK_16X16
-    &[14301, 0, 0], // BLOCK_16X32
-    &[12756, 0, 0], // BLOCK_32X16
-    &[22343, 0, 0], // BLOCK_32X32
+    &[28147, 0, 0], // BLOCK_4X4   (32768 - 4621)
+    &[26025, 0, 0], // BLOCK_4X8   (32768 - 6743)
+    &[26875, 0, 0], // BLOCK_8X4   (32768 - 5893)
+    &[24902, 0, 0], // BLOCK_8X8   (32768 - 7866)
+    &[20217, 0, 0], // BLOCK_8X16  (32768 - 12551)
+    &[23374, 0, 0], // BLOCK_16X8  (32768 - 9394)
+    &[20360, 0, 0], // BLOCK_16X16 (32768 - 12408)
+    &[18467, 0, 0], // BLOCK_16X32 (32768 - 14301)
+    &[20012, 0, 0], // BLOCK_32X16 (32768 - 12756)
+    &[10425, 0, 0], // BLOCK_32X32 (32768 - 22343)
     &[16384, 0, 0], // BLOCK_32X64  (never used — pad)
     &[16384, 0, 0], // BLOCK_64X32  (never used — pad)
     &[16384, 0, 0], // BLOCK_64X64  (never used — pad)
     &[16384, 0, 0], // BLOCK_64X128 (never used — pad)
     &[16384, 0, 0], // BLOCK_128X64 (never used — pad)
     &[16384, 0, 0], // BLOCK_128X128(never used — pad)
-    &[12770, 0, 0], // BLOCK_4X16
-    &[10368, 0, 0], // BLOCK_16X4
-    &[20229, 0, 0], // BLOCK_8X32
-    &[18101, 0, 0], // BLOCK_32X8
+    &[19998, 0, 0], // BLOCK_4X16  (32768 - 12770)
+    &[22400, 0, 0], // BLOCK_16X4  (32768 - 10368)
+    &[12539, 0, 0], // BLOCK_8X32  (32768 - 20229)
+    &[14667, 0, 0], // BLOCK_32X8  (32768 - 18101)
     &[16384, 0, 0], // BLOCK_16X64  (never used — pad)
     &[16384, 0, 0], // BLOCK_64X16  (never used — pad)
 ];
@@ -63,10 +67,11 @@ pub static DEFAULT_USE_FILTER_INTRA_CDF: [&[u16]; 22] = [
 /// `filter_intra_mode` CDF — 5 symbols (`FILTER_DC_PRED`,
 /// `FILTER_V_PRED`, `FILTER_H_PRED`, `FILTER_D157_PRED`,
 /// `FILTER_PAETH_PRED`; spec §6.10.23). Spec §9.4
-/// `Default_Filter_Intra_Mode_Cdf[6]` — the 6-element literal is
-/// `{p_gt_0, p_gt_1, p_gt_2, p_gt_3, 32768, 0}`; we store the
-/// same values but replace the 32768 with our 0 sentinel.
-pub const DEFAULT_FILTER_INTRA_MODE_CDF: [u16; 6] = [8949, 12776, 17211, 29558, 0, 0];
+/// `Default_Filter_Intra_Mode_Cdf[6] =
+/// {8949, 12776, 17211, 29558, 32768, 0}` is in cumulative form.
+/// Stored as `32768 - cdf_spec[i]` survival values so the wire
+/// convention in [`crate::cdfs`] holds.
+pub const DEFAULT_FILTER_INTRA_MODE_CDF: [u16; 6] = [23819, 19992, 15557, 3210, 0, 0];
 
 /// `has_palette_y` CDF — §5.11.46 / §9.4
 /// `Default_Palette_Y_Mode_Cdf[PALETTE_BLOCK_SIZE_CONTEXTS=7][
@@ -264,27 +269,28 @@ pub const PALETTE_COLOR_HASH_MULTIPLIERS: [u32; 3] = [1, 2, 2];
 /// `Default_Txfm_Split_Cdf[TXFM_PARTITION_CONTEXTS=21][3]`. 2-symbol
 /// flag per entry, indexed by the §9.4 `ctx` formula:
 /// `ctx = (txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 +
-/// above + left`.
+/// above + left`. Spec values `{x, 32768, 0}` are cumulative; stored
+/// as `32768 - x` (survival) per the wire convention.
 pub static DEFAULT_TXFM_SPLIT_CDF: [[u16; 3]; 21] = [
-    [28581, 0, 0],
-    [23846, 0, 0],
-    [20847, 0, 0],
-    [24315, 0, 0],
-    [18196, 0, 0],
-    [12133, 0, 0],
-    [18791, 0, 0],
-    [10887, 0, 0],
-    [11005, 0, 0],
-    [27179, 0, 0],
-    [20004, 0, 0],
-    [11281, 0, 0],
-    [26549, 0, 0],
-    [19308, 0, 0],
-    [14224, 0, 0],
-    [28015, 0, 0],
-    [21546, 0, 0],
-    [14400, 0, 0],
-    [28165, 0, 0],
-    [22401, 0, 0],
-    [16088, 0, 0],
+    [4187, 0, 0],  // 32768 - 28581
+    [8922, 0, 0],  // 32768 - 23846
+    [11921, 0, 0], // 32768 - 20847
+    [8453, 0, 0],  // 32768 - 24315
+    [14572, 0, 0], // 32768 - 18196
+    [20635, 0, 0], // 32768 - 12133
+    [13977, 0, 0], // 32768 - 18791
+    [21881, 0, 0], // 32768 - 10887
+    [21763, 0, 0], // 32768 - 11005
+    [5589, 0, 0],  // 32768 - 27179
+    [12764, 0, 0], // 32768 - 20004
+    [21487, 0, 0], // 32768 - 11281
+    [6219, 0, 0],  // 32768 - 26549
+    [13460, 0, 0], // 32768 - 19308
+    [18544, 0, 0], // 32768 - 14224
+    [4753, 0, 0],  // 32768 - 28015
+    [11222, 0, 0], // 32768 - 21546
+    [18368, 0, 0], // 32768 - 14400
+    [4603, 0, 0],  // 32768 - 28165
+    [10367, 0, 0], // 32768 - 22401
+    [16680, 0, 0], // 32768 - 16088
 ];
