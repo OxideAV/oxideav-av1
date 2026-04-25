@@ -294,3 +294,12 @@ pub static DEFAULT_TXFM_SPLIT_CDF: [[u16; 3]; 21] = [
     [10367, 0, 0], // 32768 - 22401
     [16680, 0, 0], // 32768 - 16088
 ];
+
+/// `seg_id_predicted` CDF — §5.11.19 / §9.4
+/// `Default_Segment_Id_Predicted_Cdf[SEGMENT_ID_PREDICTED_CONTEXTS=3][3]`.
+/// 2-symbol flag per entry, indexed by the §9.4 ctx formula
+/// `ctx = AboveSegPredContext[MiCol] + LeftSegPredContext[MiRow]`
+/// (clamped to 0..=2). Spec defaults are `{ 128*128 = 16384, 32768, 0 }`
+/// (cumulative form). Stored as `32768 - 16384 = 16384` (survival).
+pub static DEFAULT_SEGMENT_ID_PREDICTED_CDF: [[u16; 3]; 3] =
+    [[16384, 0, 0], [16384, 0, 0], [16384, 0, 0]];

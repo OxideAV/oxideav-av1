@@ -1179,6 +1179,19 @@ fn decode_inter_leaf_block(
     // Spec §5.11.56 read_cdef() — also applies to inter leaves.
     read_cdef(td, fs, x, y, info.skip)?;
 
+    // Spec §5.11.18 — `read_delta_qindex` / `read_delta_lf` belong to
+    // the inter mode-info read sequence too (Round 12 fix; the intra
+    // path already calls them at line 462). Both are no-ops when
+    // `delta_q_present` is off (true for our aomenc fixtures), but the
+    // SB-level `ReadDeltas` flag must still be cleared for the next
+    // block so the symbols don't get re-consumed.
+    let bs_inter = block_size_from_wh(bw, bh);
+    if bs_inter != BlockSize::Invalid {
+        read_delta_qindex_for_block(td, bs_inter, info.skip)?;
+        read_delta_lf_for_block(td, bs_inter, info.skip)?;
+    }
+    td.read_deltas = false;
+
     // Spec §5.11.16 `read_block_tx_size()` — inter branch. For inter
     // blocks with `TxMode == TX_MODE_SELECT && MiSize > BLOCK_4X4 &&
     // !skip && !Lossless` we descend the var-tx tree; otherwise we
@@ -1186,7 +1199,6 @@ fn decode_inter_leaf_block(
     // symbol bits so the range coder stays aligned with the encoder.
     let mi_col_blk = x >> 2;
     let mi_row_blk = y >> 2;
-    let bs_inter = block_size_from_wh(bw, bh);
     if bs_inter != BlockSize::Invalid {
         read_inter_block_tx_size(
             td,
@@ -1225,7 +1237,8 @@ fn decode_inter_leaf_block(
                 mi.mode = Some(info.intra_y_mode);
                 mi.uv_mode = stored_uv;
                 mi.skip = info.skip;
-                mi.segment_id = 0;
+                mi.skip_mode = false;
+                mi.segment_id = info.segment_id;
                 mi.angle_delta = 0;
                 mi.angle_delta_uv = 0;
                 mi.cfl_alpha_u = 0;
@@ -1293,7 +1306,8 @@ fn decode_inter_leaf_block(
             mi.mode = None;
             mi.uv_mode = None;
             mi.skip = info.skip;
-            mi.segment_id = 0;
+            mi.skip_mode = info.skip_mode;
+            mi.segment_id = info.segment_id;
             mi.angle_delta = 0;
             mi.angle_delta_uv = 0;
             mi.cfl_alpha_u = 0;

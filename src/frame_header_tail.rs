@@ -18,7 +18,12 @@ use crate::sequence_header::SequenceHeader;
 
 pub const MAX_SEGMENTS: usize = 8;
 pub const SEG_LVL_MAX: usize = 8;
+/// §3.4 — `SEG_LVL_REF_FRAME` index for the per-segment ref-frame feature.
 pub const SEG_LVL_REF_FRAME: usize = 5;
+/// §3.4 — `SEG_LVL_SKIP` index for the per-segment skip feature.
+pub const SEG_LVL_SKIP: usize = 6;
+/// §3.4 — `SEG_LVL_GLOBALMV` index for the per-segment global-MV feature.
+pub const SEG_LVL_GLOBALMV: usize = 7;
 pub const PRIMARY_REF_NONE: u32 = 7;
 pub const TOTAL_REFS_PER_FRAME: usize = 8;
 
@@ -78,6 +83,21 @@ pub struct SegmentationParams {
     pub feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
     pub seg_id_pre_skip: bool,
     pub last_active_seg_id: u8,
+}
+
+impl SegmentationParams {
+    /// §5.11.14 `seg_feature_active_idx(idx, feature)` — returns
+    /// `segmentation_enabled && FeatureEnabled[idx][feature]`. The
+    /// feature index is one of the `SEG_LVL_*` constants.
+    #[inline]
+    pub fn feature_active(&self, segment_id: u8, feature: usize) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let sid = (segment_id as usize).min(MAX_SEGMENTS - 1);
+        let f = feature.min(SEG_LVL_MAX - 1);
+        self.feature_enabled[sid][f]
+    }
 }
 
 /// §5.9.11 `loop_filter_params()`.

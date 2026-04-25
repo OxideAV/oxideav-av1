@@ -611,6 +611,14 @@ pub struct TileDecoder<'a> {
     pub cfl_sign_cdf: Vec<u16>,
     pub cfl_alpha_cdf: Vec<Vec<u16>>,
     pub seg_cdf: Vec<Vec<u16>>,
+    /// `seg_id_predicted` CDF — §5.11.19 / §9.4. Indexed by the
+    /// `AboveSegPredContext + LeftSegPredContext` 3-way ctx. 2-symbol
+    /// flag per entry.
+    pub seg_id_predicted_cdf: Vec<Vec<u16>>,
+    /// `skip_mode` CDF — §5.11.10 / §9.4. Indexed by the
+    /// `AboveSkipModes + LeftSkipModes` 3-way ctx. 2-symbol flag per
+    /// entry. Only consulted when `frame.skip_mode_present` is true.
+    pub skip_mode_cdf: Vec<Vec<u16>>,
     /// Intra-frame `tx_type` CDF — set 1 (7 types, `tx_size_ctx ∈ 0..=3`,
     /// intra_mode ∈ 0..=12). Used by blocks whose area ≤ 16×16.
     pub intra_ext_tx_cdf_set1: Vec<Vec<Vec<u16>>>,
@@ -726,6 +734,8 @@ impl<'a> TileDecoder<'a> {
             cfl_sign_cdf: Vec::new(),
             cfl_alpha_cdf: Vec::new(),
             seg_cdf: Vec::new(),
+            seg_id_predicted_cdf: Vec::new(),
+            skip_mode_cdf: Vec::new(),
             intra_ext_tx_cdf_set1: Vec::new(),
             intra_ext_tx_cdf_set2: Vec::new(),
             delta_q_cdf: Vec::new(),
@@ -809,6 +819,16 @@ impl<'a> TileDecoder<'a> {
             .map(|c| c.to_vec())
             .collect();
         self.seg_cdf = cdfs::DEFAULT_SPATIAL_PRED_SEG_TREE_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        // §5.11.19 `seg_id_predicted` — 3-context 2-symbol CDF.
+        self.seg_id_predicted_cdf = cdfs::DEFAULT_SEGMENT_ID_PREDICTED_CDF
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        // §5.11.10 `skip_mode` — 3-context 2-symbol CDF.
+        self.skip_mode_cdf = cdfs::DEFAULT_SKIP_MODE_CDF
             .iter()
             .map(|c| c.to_vec())
             .collect();
@@ -1049,6 +1069,32 @@ impl<'a> TileDecoder<'a> {
         let ctx = (ctx as usize).min(2);
         let raw = self.symbol.decode_symbol(&mut self.seg_cdf[ctx])?;
         Ok(raw as u8)
+    }
+
+    /// §5.11.19 `seg_id_predicted` — 2-symbol flag indicating whether
+    /// the temporally-predicted segment_id (spatial-min over the
+    /// previous frame's `PrevSegmentIds[][]`) should be reused for
+    /// this block. `ctx` is `AboveSegPredContext + LeftSegPredContext`,
+    /// clamped to `0..=2`. Only consulted when `segmentation_enabled
+    /// && segmentation_update_map && segmentation_temporal_update`.
+    pub fn decode_seg_id_predicted(&mut self, ctx: u32) -> Result<bool> {
+        let ctx = (ctx as usize).min(2);
+        let raw = self
+            .symbol
+            .decode_symbol(&mut self.seg_id_predicted_cdf[ctx])?;
+        Ok(raw != 0)
+    }
+
+    /// §5.11.10 `read_skip_mode` — 2-symbol flag enabling the AV1
+    /// SKIP_MODE compound coding. `ctx` is the §9.4 `AboveSkipModes +
+    /// LeftSkipModes` 3-way ctx (clamped). Caller must already have
+    /// short-circuited on the spec gating predicates
+    /// (`!skip_mode_present`, `seg_feature_active(SEG_LVL_SKIP / REF /
+    /// GLOBALMV)`, `Block_Width < 8`, `Block_Height < 8`).
+    pub fn decode_skip_mode(&mut self, ctx: u32) -> Result<bool> {
+        let ctx = (ctx as usize).min(2);
+        let raw = self.symbol.decode_symbol(&mut self.skip_mode_cdf[ctx])?;
+        Ok(raw != 0)
     }
 
     /// Decode the CFL joint-sign symbol (0..=7). Spec §6.10.14.

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- round 12 — wire §5.11.10 read_skip_mode + §5.11.19 inter_segment_id
+  end-to-end on the inter leaf path (DEFAULT_SEGMENT_ID_PREDICTED_CDF
+  added; new `decode_skip_mode` / `decode_seg_id_predicted` /
+  `seg_feature_active` helpers; `InterBlockInfo` now carries `skip_mode`
+  + `segment_id`; `MiInfo` gained a `skip_mode` field for the §9.4 ctx).
+  Inter-leaf path also gained the spec-mandated read_delta_qindex /
+  read_delta_lf calls (no-op on aomenc fixtures, but bitstream-correct).
+- read_skip ctx now sums above/left Skips[][] neighbours per §9.4
+  (was hard-coded to 0).
+- ns(1) underflow guard in BitReader — fixes a crash on SVT-AV1 fixtures
+  whose tile_info / dim signalling reaches the n=1 branch.
+
 ## [0.1.1](https://github.com/OxideAV/oxideav-av1/compare/v0.1.0...v0.1.1) - 2026-04-25
 
 ### Fixed

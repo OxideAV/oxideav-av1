@@ -23,6 +23,12 @@ pub struct ModeInfo {
     /// Skip flag — `true` means the residual for this block is all
     /// zero (prediction only output). §5.11.13.
     pub skip: bool,
+    /// Spec §5.11.10 `SkipModes[row][col]` — `true` when the block
+    /// activated AV1 SKIP_MODE compound prediction. Tracked on the MI
+    /// grid so neighbour blocks can form the §9.4 `skip_mode` ctx.
+    /// Always `false` until [`crate::frame_header::FrameHeader::skip_mode_present`]
+    /// is set (reading the bit is gated on that frame-header flag).
+    pub skip_mode: bool,
     /// `segment_id` — 0..=7 per §5.11.9. Left at 0 when segmentation
     /// is disabled.
     pub segment_id: u8,

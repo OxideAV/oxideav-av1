@@ -164,6 +164,12 @@ impl<'a> BitReader<'a> {
         if n == 0 {
             return Err(Error::invalid("av1 ns: n must be > 0"));
         }
+        // Spec §4.10.6: when only one symbol fits (n == 1), w == 0 and
+        // the function returns 0 without consuming any bits. Round 12
+        // overflow guard — previously `f(w - 1)` underflowed on n=1.
+        if n == 1 {
+            return Ok(0);
+        }
         let w = ceil_log2(n);
         let m = (1u32 << w) - n;
         let v = self.f(w - 1)?;
@@ -274,5 +280,18 @@ mod tests {
         assert_eq!(ceil_log2(5), 3);
         assert_eq!(ceil_log2(8), 3);
         assert_eq!(ceil_log2(9), 4);
+    }
+
+    #[test]
+    fn ns_n_equals_one_returns_zero_without_consuming_bits() {
+        // Round 12 fix — ns(1) used to underflow `w - 1` because
+        // ceil_log2(1) == 0. Spec §4.10.6: when only one symbol fits,
+        // the field returns 0 without reading any bits.
+        let data = [0xFFu8];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.ns(1).unwrap(), 0);
+        // No bits should have been consumed — a follow-up f(1) returns
+        // the high bit of the byte (1).
+        assert_eq!(br.f(1).unwrap(), 1);
     }
 }
