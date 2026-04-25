@@ -170,13 +170,22 @@ impl Av1Decoder {
                             tg_payload,
                             &mut fs,
                             self.prev_frame.as_ref(),
+                            &self.dpb,
                         );
                         if res.is_ok() && fh.refresh_frame_flags != 0 {
-                            self.prev_frame = Some(Arc::new(clone_frame_state(&fs)));
-                            // §7.20 refresh DPB OrderHints for the
-                            // selected slots so the next inter frame's
-                            // skip-mode derivation sees this frame.
-                            self.dpb.refresh(fh.refresh_frame_flags, fh.order_hint);
+                            // §7.20 reference_frame_update_process —
+                            // install both the OrderHint *and* the
+                            // reconstructed planes into every slot
+                            // selected by `refresh_frame_flags`. Round
+                            // 14 routes the planes through the DPB so
+                            // SKIP_MODE compound MC can fetch from two
+                            // independent references; the single-ref
+                            // `prev_frame` field is kept as a fallback
+                            // for the LAST translational MC path.
+                            let arc = Arc::new(clone_frame_state(&fs));
+                            self.prev_frame = Some(arc.clone());
+                            self.dpb
+                                .refresh_with_frame(fh.refresh_frame_flags, fh.order_hint, arc);
                         }
                         if res.is_ok() && fh.show_frame {
                             self.enqueue_video_frame(&fs);
@@ -187,10 +196,15 @@ impl Av1Decoder {
                         Err(tile_decode_unsupported())
                     };
                     self.last_frame_header = Some(fh);
-                    return match tile_decode_err {
-                        Ok(()) => Ok(()),
-                        Err(e) => Err(e),
-                    };
+                    // Round 14: AV1 packets routinely carry multiple
+                    // `OBU_FRAME` units (e.g. an Inter frame whose ref
+                    // is built then immediately a `show_existing_frame`
+                    // pulls a slot for output). Don't `return` on the
+                    // first Frame OBU — keep walking the packet so
+                    // subsequent frames in the same packet are also
+                    // decoded. Surface the first hard error encountered.
+                    tile_decode_err?;
+                    continue;
                 }
                 ObuType::TileGroup => {
                     let Some(fh) = self.last_frame_header.as_ref() else {
@@ -221,16 +235,25 @@ impl Av1Decoder {
                         self.prev_frame = None;
                         self.dpb.reset();
                     }
-                    let res =
-                        decode_tile_group(seq, fh, obu.payload, &mut fs, self.prev_frame.as_ref());
+                    let res = decode_tile_group(
+                        seq,
+                        fh,
+                        obu.payload,
+                        &mut fs,
+                        self.prev_frame.as_ref(),
+                        &self.dpb,
+                    );
                     if res.is_ok() && fh.refresh_frame_flags != 0 {
-                        self.prev_frame = Some(Arc::new(clone_frame_state(&fs)));
-                        self.dpb.refresh(fh.refresh_frame_flags, fh.order_hint);
+                        let arc = Arc::new(clone_frame_state(&fs));
+                        self.prev_frame = Some(arc.clone());
+                        self.dpb
+                            .refresh_with_frame(fh.refresh_frame_flags, fh.order_hint, arc);
                     }
                     if res.is_ok() && fh.show_frame {
                         self.enqueue_video_frame(&fs);
                     }
-                    return res;
+                    res?;
+                    continue;
                 }
                 ObuType::Metadata | ObuType::TileList => {}
                 _ => {}

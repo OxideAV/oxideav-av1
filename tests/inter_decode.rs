@@ -326,3 +326,146 @@ fn svtav1_clip_exposes_skip_mode_allowed_after_key() {
         "svtav1: skip_mode_allowed seen={allowed_seen}, skip_mode_present seen={present_seen}"
     );
 }
+
+/// Round 14 visibility: with the multi-ref DPB now installed, the
+/// SVT-AV1 fixture's SKIP_MODE compound frame (pkt 1, second Frame
+/// OBU, `skip_mode_present=true`, `SkipModeFrame=[1, 5]`) must
+/// decode to completion against two independent reference planes
+/// pulled from the DPB — and the DPB must carry the planes from
+/// both `SkipModeFrame[0]` and `SkipModeFrame[1]` slots after the
+/// previous frame's reconstruction. Walks the OBUs manually so a
+/// parse failure on the trailing `show_existing_frame` packets
+/// doesn't mask the SKIP_MODE block-decode result. The actual
+/// pixel-perfect PSNR is bounded by upstream intra-decode accuracy
+/// for SVT-AV1 fixtures (a separate work item); here we assert the
+/// compound-MC dispatch ran end-to-end without panic / Unsupported.
+#[test]
+fn svtav1_skip_mode_compound_decodes_real_pixels() {
+    use oxideav_av1::decode::{decode_tile_group, FrameState};
+    use oxideav_av1::dpb::Dpb;
+    use oxideav_av1::frame_header::parse_frame_obu_with_dpb;
+    use std::sync::Arc;
+
+    let Some(data) = read_fixture("/tmp/av1_inter.ivf") else {
+        return;
+    };
+    let pkts = ivf_packet_slices(&data).expect("ivf parse");
+    if pkts.len() < 2 {
+        return;
+    }
+
+    let mut seq: Option<oxideav_av1::sequence_header::SequenceHeader> = None;
+    let mut dpb = Dpb::new();
+    let mut prev: Option<Arc<FrameState>> = None;
+    let mut decoded_skip_mode_frame = false;
+    let mut multi_ref_planes_at_decode = false;
+
+    for pkt in pkts.iter().take(2) {
+        for o in iter_obus(pkt) {
+            let o = match o {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            match o.header.obu_type {
+                ObuType::SequenceHeader => {
+                    seq = oxideav_av1::parse_sequence_header(o.payload).ok();
+                }
+                ObuType::Frame => {
+                    let s = match seq.as_ref() {
+                        Some(x) => x,
+                        None => continue,
+                    };
+                    let (fh, tg) = match parse_frame_obu_with_dpb(s, o.payload, &dpb) {
+                        Ok(x) => x,
+                        Err(_) => break,
+                    };
+                    if fh.frame_type == FrameType::Key {
+                        prev = None;
+                        dpb.reset();
+                    }
+                    if fh.skip_mode_present {
+                        // Spec §7.20 invariant: by the time a SKIP_MODE
+                        // frame reaches block decode, the slots named
+                        // by `SkipModeFrame[0..=1]` (via the chain
+                        // `LAST_FRAME + i -> ref_frame_idx[i] -> DPB
+                        // slot`) must carry reconstructed planes from
+                        // earlier frames' refresh_frame_flags fills.
+                        let i0 = (fh.skip_mode_frame[0] - 1) as usize;
+                        let i1 = (fh.skip_mode_frame[1] - 1) as usize;
+                        let slot0 = fh.ref_frame_idx[i0] as usize;
+                        let slot1 = fh.ref_frame_idx[i1] as usize;
+                        if dpb.frame_at(slot0).is_some() && dpb.frame_at(slot1).is_some() {
+                            multi_ref_planes_at_decode = true;
+                        }
+                    }
+                    let sub_x = if s.color_config.subsampling_x { 1 } else { 0 };
+                    let sub_y = if s.color_config.subsampling_y { 1 } else { 0 };
+                    let mut fs = FrameState::with_bit_depth(
+                        fh.frame_width,
+                        fh.frame_height,
+                        sub_x,
+                        sub_y,
+                        s.color_config.num_planes == 1,
+                        s.color_config.bit_depth,
+                    );
+                    let res = decode_tile_group(s, &fh, tg, &mut fs, prev.as_ref(), &dpb);
+                    if res.is_err() {
+                        eprintln!("decode failed (acceptable): {:?}", res.err());
+                        break;
+                    }
+                    if fh.skip_mode_present {
+                        decoded_skip_mode_frame = true;
+                        eprintln!(
+                            "SKIP_MODE frame oh={} decoded; SkipModeFrame={:?} ref_frame_idx={:?}",
+                            fh.order_hint, fh.skip_mode_frame, fh.ref_frame_idx
+                        );
+                    }
+                    if fh.refresh_frame_flags != 0 {
+                        let arc = Arc::new(super_clone_state(&fs));
+                        prev = Some(arc.clone());
+                        dpb.refresh_with_frame(fh.refresh_frame_flags, fh.order_hint, arc);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        decoded_skip_mode_frame,
+        "expected at least one SKIP_MODE frame in pkt 1 of /tmp/av1_inter.ivf"
+    );
+    assert!(
+        multi_ref_planes_at_decode,
+        "Round 14 invariant: DPB must carry planes for both SkipModeFrame slots when SKIP_MODE frame decodes"
+    );
+}
+
+fn super_clone_state(fs: &oxideav_av1::decode::FrameState) -> oxideav_av1::decode::FrameState {
+    oxideav_av1::decode::FrameState {
+        width: fs.width,
+        height: fs.height,
+        mi_cols: fs.mi_cols,
+        mi_rows: fs.mi_rows,
+        mi: fs.mi.clone(),
+        sub_x: fs.sub_x,
+        sub_y: fs.sub_y,
+        monochrome: fs.monochrome,
+        bit_depth: fs.bit_depth,
+        y_plane: fs.y_plane.clone(),
+        u_plane: fs.u_plane.clone(),
+        v_plane: fs.v_plane.clone(),
+        y_plane16: fs.y_plane16.clone(),
+        u_plane16: fs.u_plane16.clone(),
+        v_plane16: fs.v_plane16.clone(),
+        uv_width: fs.uv_width,
+        uv_height: fs.uv_height,
+        lr_unit_info: fs.lr_unit_info.clone(),
+        lr_cols: fs.lr_cols,
+        lr_rows: fs.lr_rows,
+        lr_unit_size: fs.lr_unit_size,
+        cdef_idx: fs.cdef_idx.clone(),
+        cdef_sb_cols: fs.cdef_sb_cols,
+        cdef_sb_rows: fs.cdef_sb_rows,
+    }
+}

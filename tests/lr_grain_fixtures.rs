@@ -93,7 +93,7 @@ fn decode_first_frame(path: &str) -> Option<(Vec<u8>, u32, u32, u64)> {
     // a "mean grey, >= 16 distinct samples" tile for these tests to
     // accept. We preserve that relaxed fixture-smoke contract here by
     // treating the spec-correct Unsupported as skip.
-    if let Err(e) = decode_tile_group(&sh, &fh, &tg, &mut fs, None) {
+    if let Err(e) = decode_tile_group(&sh, &fh, &tg, &mut fs, None, &oxideav_av1::dpb::Dpb::new()) {
         eprintln!("fixture {path}: decode_tile_group {e:?} — skipping");
         return None;
     }

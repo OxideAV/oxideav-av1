@@ -769,7 +769,7 @@ pub(crate) fn derive_skip_mode_allowed(
 
     for (i, &slot_idx) in ref_frame_idx.iter().enumerate().take(REFS_PER_FRAME) {
         let slot = slot_idx as usize;
-        let dpb_slot = dpb.slots.get(slot).copied().unwrap_or_default();
+        let dpb_slot = dpb.slots.get(slot).cloned().unwrap_or_default();
         if !dpb_slot.valid {
             // Without a valid DPB entry we don't know this slot's
             // OrderHint — exclude it from skip-mode bracketing.
@@ -815,7 +815,7 @@ pub(crate) fn derive_skip_mode_allowed(
     let mut second_forward_hint: u32 = 0;
     for (i, &slot_idx) in ref_frame_idx.iter().enumerate().take(REFS_PER_FRAME) {
         let slot = slot_idx as usize;
-        let dpb_slot = dpb.slots.get(slot).copied().unwrap_or_default();
+        let dpb_slot = dpb.slots.get(slot).cloned().unwrap_or_default();
         if !dpb_slot.valid {
             continue;
         }
@@ -872,10 +872,12 @@ mod skip_mode_tests {
         dpb.slots[0] = crate::dpb::RefSlot {
             order_hint: 2,
             valid: true,
+            frame: None,
         };
         dpb.slots[1] = crate::dpb::RefSlot {
             order_hint: 6,
             valid: true,
+            frame: None,
         };
         // ref_frame_idx[0] -> slot 0 (past), ref_frame_idx[1] -> slot 1
         // (future). Other refs reuse slot 0.
@@ -896,10 +898,12 @@ mod skip_mode_tests {
         dpb.slots[0] = crate::dpb::RefSlot {
             order_hint: 2,
             valid: true,
+            frame: None,
         };
         dpb.slots[1] = crate::dpb::RefSlot {
             order_hint: 1,
             valid: true,
+            frame: None,
         };
         let mut refs = [0u32; REFS_PER_FRAME];
         refs[0] = 0;
@@ -921,6 +925,7 @@ mod skip_mode_tests {
         dpb.slots[0] = crate::dpb::RefSlot {
             order_hint: 2,
             valid: true,
+            frame: None,
         };
         let refs = [0u32; REFS_PER_FRAME]; // all -> slot 0
         let (allowed, frames) = derive_skip_mode_allowed(false, true, true, 8, 4, &refs, &dpb);

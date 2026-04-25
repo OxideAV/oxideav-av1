@@ -95,7 +95,8 @@ use super::block::{
 use super::coeffs::{decode_coefficients, nz_map_ctx_offset, tx_size_idx};
 use super::frame_state::FrameState;
 use super::inter_block::{
-    decode_inter_block_syntax, mc_chroma_u16, mc_chroma_u8, mc_luma_u16, mc_luma_u8_scaled,
+    compound_mc_luma_u16, compound_mc_luma_u8, decode_inter_block_syntax, mc_chroma_u16,
+    mc_chroma_u8, mc_luma_u16, mc_luma_u8_scaled, InterBlockInfo,
 };
 use super::modes::{mode_ctx_bucket, IntraMode};
 use super::mv::Mv;
@@ -1285,7 +1286,17 @@ fn decode_inter_leaf_block(
         return Ok(());
     }
 
-    if td.prev_frame.is_none() {
+    // §7.20: locate the SKIP_MODE references (when active) in the
+    // multi-ref DPB before checking the LAST fallback, so a frame
+    // whose only available reference is via the multi-ref DPB still
+    // decodes its SKIP_MODE blocks.
+    let skip_mode_refs = if info.skip_mode {
+        skip_mode_dpb_refs(td, &info)
+    } else {
+        None
+    };
+
+    if td.prev_frame.is_none() && skip_mode_refs.is_none() {
         return Err(Error::unsupported(
             "av1 inter: missing reference frame for LAST-ref translational MC (§7.11.3)",
         ));
@@ -1318,12 +1329,76 @@ fn decode_inter_leaf_block(
         }
     }
 
+    if let Some((ref0, ref1)) = skip_mode_refs {
+        // §7.11.3.9 SKIP_MODE compound MC — average the two predictions
+        // from `SkipModeFrame[0..=1]`. NEAREST_NEAREST_MV decoding
+        // requires the §7.10 ref-MV list (deferred); zero-MVs are
+        // exact for static content.
+        reconstruct_skip_mode_compound_luma(
+            td,
+            fs,
+            x,
+            y,
+            w,
+            h,
+            info.mv,
+            info.mv1,
+            info.skip,
+            info.interp_filter,
+            &ref0,
+            &ref1,
+        )?;
+        if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
+            reconstruct_skip_mode_compound_chroma(
+                td,
+                fs,
+                x,
+                y,
+                w,
+                h,
+                info.mv,
+                info.mv1,
+                info.skip,
+                info.interp_filter,
+                &ref0,
+                &ref1,
+            )?;
+        }
+        return Ok(());
+    }
+
     reconstruct_inter_luma_block(td, fs, x, y, w, h, info.mv, info.skip, info.interp_filter)?;
 
     if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
         reconstruct_inter_chroma_block(td, fs, x, y, w, h, info.mv, info.skip, info.interp_filter)?;
     }
     Ok(())
+}
+
+/// §7.20 helper — look up the two reference frame slots for a
+/// SKIP_MODE block from the tile decoder's DPB. Returns
+/// `Some((ref0, ref1))` only when both slots are valid AND have
+/// reconstructed planes installed; otherwise the caller falls back to
+/// the single-ref translational path.
+fn skip_mode_dpb_refs(
+    td: &TileDecoder<'_>,
+    info: &InterBlockInfo,
+) -> Option<(std::sync::Arc<FrameState>, std::sync::Arc<FrameState>)> {
+    // SkipModeFrame[i] is stored as `LAST_FRAME + i` (1..=7). The
+    // logical reference index `i` indexes `ref_frame_idx[i-1]` to
+    // pick the actual DPB slot per §5.11.25.
+    let s0 = info.skip_mode_frames[0];
+    let s1 = info.skip_mode_frames[1];
+    if s0 < 1 || s1 < 1 {
+        return None;
+    }
+    let i0 = (s0 - 1) as usize;
+    let i1 = (s1 - 1) as usize;
+    let slot0 = *td.frame.ref_frame_idx.get(i0)? as usize;
+    let slot1 = *td.frame.ref_frame_idx.get(i1)? as usize;
+    let f0 = td.dpb.frame_at(slot0)?.clone();
+    let f1 = td.dpb.frame_at(slot1)?.clone();
+    Some((f0, f1))
 }
 
 /// Motion-compensate + residual-add for the luma plane on an inter
@@ -1720,6 +1795,204 @@ fn reconstruct_inter_chroma_block(
                 paste_block16(&mut fs.u_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
             } else {
                 paste_block16(&mut fs.v_plane16, stride, cx, cy, &block, cw_clip, ch_clip);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §7.11.3.9 SKIP_MODE compound luma — fetch a prediction from each
+/// of the two SkipMode references, average them, then add the
+/// (transmitted-zero) residual. SKIP_MODE blocks always carry
+/// `skip == 1` per the spec — `read_skip` was forced to 1 in
+/// `inter_block.rs` — so we never decode coefficients here.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_skip_mode_compound_luma(
+    _td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    x: u32,
+    y: u32,
+    w: usize,
+    h: usize,
+    mv0: Mv,
+    mv1: Mv,
+    _skip: bool,
+    filt: crate::predict::interp::InterpFilter,
+    ref0: &FrameState,
+    ref1: &FrameState,
+) -> Result<()> {
+    let stride = fs.width as usize;
+    if fs.bit_depth == 8 {
+        let pred = compound_mc_luma_u8(
+            &ref0.y_plane,
+            &ref1.y_plane,
+            ref0.width as usize,
+            ref0.height as usize,
+            ref0.width as usize,
+            x as i32,
+            y as i32,
+            w,
+            h,
+            mv0,
+            mv1,
+            filt,
+        );
+        paste_block(&mut fs.y_plane, stride, x as usize, y as usize, &pred, w, h);
+    } else {
+        let pred = compound_mc_luma_u16(
+            &ref0.y_plane16,
+            &ref1.y_plane16,
+            ref0.width as usize,
+            ref0.height as usize,
+            ref0.width as usize,
+            x as i32,
+            y as i32,
+            w,
+            h,
+            mv0,
+            mv1,
+            filt,
+            fs.bit_depth,
+        );
+        paste_block16(
+            &mut fs.y_plane16,
+            stride,
+            x as usize,
+            y as usize,
+            &pred,
+            w,
+            h,
+        );
+    }
+    // SKIP_MODE forces `skip == 1` so there's no residual to decode.
+    Ok(())
+}
+
+/// §7.11.3.9 SKIP_MODE compound chroma — analogue of
+/// [`reconstruct_skip_mode_compound_luma`] for the U/V planes.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_skip_mode_compound_chroma(
+    _td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    x: u32,
+    y: u32,
+    w: usize,
+    h: usize,
+    mv0: Mv,
+    mv1: Mv,
+    _skip: bool,
+    filt: crate::predict::interp::InterpFilter,
+    ref0: &FrameState,
+    ref1: &FrameState,
+) -> Result<()> {
+    let sub_x = fs.sub_x;
+    let sub_y = fs.sub_y;
+    let cx = (x >> sub_x) as usize;
+    let cy = (y >> sub_y) as usize;
+    let cw = ((w as u32 >> sub_x).max(1)) as usize;
+    let ch = ((h as u32 >> sub_y).max(1)) as usize;
+    let uvw = fs.uv_width as usize;
+    let uvh = fs.uv_height as usize;
+    let cw_clip = cw.min(uvw.saturating_sub(cx));
+    let ch_clip = ch.min(uvh.saturating_sub(cy));
+    if cw_clip == 0 || ch_clip == 0 {
+        return Ok(());
+    }
+    let stride = uvw;
+    for plane_idx in 0..2u32 {
+        if fs.bit_depth == 8 {
+            let r0 = if plane_idx == 0 {
+                &ref0.u_plane
+            } else {
+                &ref0.v_plane
+            };
+            let r1 = if plane_idx == 0 {
+                &ref1.u_plane
+            } else {
+                &ref1.v_plane
+            };
+            let p0 = mc_chroma_u8(
+                r0,
+                ref0.uv_width as usize,
+                ref0.uv_height as usize,
+                ref0.uv_width as usize,
+                cx as i32,
+                cy as i32,
+                cw_clip,
+                ch_clip,
+                mv0,
+                sub_x,
+                sub_y,
+                filt,
+            );
+            let p1 = mc_chroma_u8(
+                r1,
+                ref1.uv_width as usize,
+                ref1.uv_height as usize,
+                ref1.uv_width as usize,
+                cx as i32,
+                cy as i32,
+                cw_clip,
+                ch_clip,
+                mv1,
+                sub_x,
+                sub_y,
+                filt,
+            );
+            let mut buf = vec![0u8; cw_clip * ch_clip];
+            super::mc::average_mc_u8(&p0, &p1, &mut buf);
+            if plane_idx == 0 {
+                paste_block(&mut fs.u_plane, stride, cx, cy, &buf, cw_clip, ch_clip);
+            } else {
+                paste_block(&mut fs.v_plane, stride, cx, cy, &buf, cw_clip, ch_clip);
+            }
+        } else {
+            let r0 = if plane_idx == 0 {
+                &ref0.u_plane16
+            } else {
+                &ref0.v_plane16
+            };
+            let r1 = if plane_idx == 0 {
+                &ref1.u_plane16
+            } else {
+                &ref1.v_plane16
+            };
+            let p0 = mc_chroma_u16(
+                r0,
+                ref0.uv_width as usize,
+                ref0.uv_height as usize,
+                ref0.uv_width as usize,
+                cx as i32,
+                cy as i32,
+                cw_clip,
+                ch_clip,
+                mv0,
+                sub_x,
+                sub_y,
+                filt,
+                fs.bit_depth,
+            );
+            let p1 = mc_chroma_u16(
+                r1,
+                ref1.uv_width as usize,
+                ref1.uv_height as usize,
+                ref1.uv_width as usize,
+                cx as i32,
+                cy as i32,
+                cw_clip,
+                ch_clip,
+                mv1,
+                sub_x,
+                sub_y,
+                filt,
+                fs.bit_depth,
+            );
+            let mut buf = vec![0u16; cw_clip * ch_clip];
+            super::mc::average_mc_u16(&p0, &p1, &mut buf, fs.bit_depth);
+            if plane_idx == 0 {
+                paste_block16(&mut fs.u_plane16, stride, cx, cy, &buf, cw_clip, ch_clip);
+            } else {
+                paste_block16(&mut fs.v_plane16, stride, cx, cy, &buf, cw_clip, ch_clip);
             }
         }
     }

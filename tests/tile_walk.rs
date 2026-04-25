@@ -83,7 +83,8 @@ fn tile_decoder_init_reads_partition_symbol() {
         return;
     };
     let tile_data = vec![0xA5u8; 64];
-    let mut td = TileDecoder::new(&seq, &fh, &tile_data, None).expect("init");
+    let mut td =
+        TileDecoder::new(&seq, &fh, &tile_data, None, oxideav_av1::dpb::Dpb::new()).expect("init");
     let pt = td.decode_partition(0, 0).expect("partition symbol");
     assert!(pt < 4, "partition symbol out of 0..=3: {pt}");
 }
@@ -99,7 +100,8 @@ fn tile_decoder_reads_mode_symbols() {
     for (i, b) in tile_data.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(13).wrapping_add(7);
     }
-    let mut td = TileDecoder::new(&seq, &fh, &tile_data, None).expect("init");
+    let mut td =
+        TileDecoder::new(&seq, &fh, &tile_data, None, oxideav_av1::dpb::Dpb::new()).expect("init");
     let _ = td.decode_partition(0, 0).expect("partition");
     let y_mode = td.decode_intra_y_mode(0, 0).expect("y mode");
     assert!((y_mode as u32) < 13, "y mode out of range: {:?}", y_mode);
@@ -143,7 +145,14 @@ fn real_clip_walks_every_partition_and_bails_on_coeff_decode() {
                     seq.color_config.num_planes == 1,
                     seq.color_config.bit_depth,
                 );
-                let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs, None);
+                let got: Result<()> = decode_tile_group(
+                    seq,
+                    &fh,
+                    tg_payload,
+                    &mut fs,
+                    None,
+                    &oxideav_av1::dpb::Dpb::new(),
+                );
                 match got {
                     Ok(()) => {
                         // Whole tile decoded — Y plane should be
@@ -219,7 +228,14 @@ fn end_to_end_decode_produces_plane_bytes() {
                     seq.color_config.num_planes == 1,
                     seq.color_config.bit_depth,
                 );
-                let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs, None);
+                let got: Result<()> = decode_tile_group(
+                    seq,
+                    &fh,
+                    tg_payload,
+                    &mut fs,
+                    None,
+                    &oxideav_av1::dpb::Dpb::new(),
+                );
                 match got {
                     Ok(()) => {
                         assert_eq!(
@@ -307,7 +323,14 @@ fn end_to_end_decode_128_intra_clip_has_variation() {
                     seq.color_config.num_planes == 1,
                     seq.color_config.bit_depth,
                 );
-                let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs, None);
+                let got: Result<()> = decode_tile_group(
+                    seq,
+                    &fh,
+                    tg_payload,
+                    &mut fs,
+                    None,
+                    &oxideav_av1::dpb::Dpb::new(),
+                );
                 match got {
                     Ok(()) => {
                         // Plane lengths must match geometry.
@@ -395,7 +418,14 @@ fn end_to_end_decode_hbd_produces_plane_bytes() {
                     seq.color_config.num_planes == 1,
                     seq.color_config.bit_depth,
                 );
-                let got: Result<()> = decode_tile_group(seq, &fh, tg_payload, &mut fs, None);
+                let got: Result<()> = decode_tile_group(
+                    seq,
+                    &fh,
+                    tg_payload,
+                    &mut fs,
+                    None,
+                    &oxideav_av1::dpb::Dpb::new(),
+                );
                 match got {
                     Ok(()) => {
                         assert_eq!(

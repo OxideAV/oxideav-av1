@@ -15,6 +15,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::cdfs;
+use crate::dpb::Dpb;
 use crate::frame_header::FrameHeader;
 use crate::frame_header_tail::RESTORATION_NONE;
 use crate::sequence_header::SequenceHeader;
@@ -65,12 +66,17 @@ pub const MAX_LOOP_FILTER: i32 = 63;
 /// `prev_frame`, if present, supplies the LAST reference for single-
 /// reference translational inter blocks. Intra frames ignore it; non-
 /// intra frames without a reference surface `Error::Unsupported`.
+///
+/// `dpb` carries the §7.20 reconstructed picture buffer so SKIP_MODE
+/// compound MC can fetch from `SkipModeFrame[0..=1]` independently
+/// (Round 14 wiring).
 pub fn decode_tile_group(
     seq: &SequenceHeader,
     frame: &FrameHeader,
     tile_payload: &[u8],
     frame_state: &mut FrameState,
     prev_frame: Option<&Arc<FrameState>>,
+    dpb: &Dpb,
 ) -> Result<()> {
     let tile_info = frame.tile_info.as_ref().ok_or_else(|| {
         Error::invalid("av1 decode_tile_group: frame header missing tile_info (§5.9.15)")
@@ -82,7 +88,7 @@ pub fn decode_tile_group(
     let tiles = split_tile_payloads(tile_payload, tile_info, &tgh)?;
     for tp in &tiles {
         let bytes = &tile_payload[tp.offset..tp.offset + tp.len];
-        let mut td = TileDecoder::new(seq, frame, bytes, prev_frame.cloned())?;
+        let mut td = TileDecoder::new(seq, frame, bytes, prev_frame.cloned(), dpb.clone())?;
         td.decode(frame_state, tp)?;
     }
     finish_frame(frame, frame_state);
@@ -686,6 +692,11 @@ pub struct TileDecoder<'a> {
     /// supplies the LAST ref for single-reference translational inter
     /// blocks. `None` on key frames.
     pub prev_frame: Option<Arc<FrameState>>,
+    /// §7.20 reference picture buffer — every slot's reconstructed
+    /// planes (when present) plus per-slot OrderHint. Round 14 wires
+    /// this so SKIP_MODE compound MC (§7.11.3.9) can dispatch to two
+    /// independent references named by `SkipModeFrame[0..=1]`.
+    pub dpb: Dpb,
     /// Spec §5.11.5 `ReadDeltas`. Set to `delta_q_present` at the start
     /// of each superblock (§5.11.4 top-of-SB hook) and cleared by the
     /// first block's `intra_frame_mode_info()` / `inter_frame_mode_info()`
@@ -719,6 +730,7 @@ impl<'a> TileDecoder<'a> {
         frame: &'a FrameHeader,
         tile_data: &'a [u8],
         prev_frame: Option<Arc<FrameState>>,
+        dpb: Dpb,
     ) -> Result<Self> {
         let sz = tile_data.len();
         let allow_update = !frame.disable_cdf_update;
@@ -779,6 +791,7 @@ impl<'a> TileDecoder<'a> {
             left_seg_pred,
             inter,
             prev_frame,
+            dpb,
             read_deltas: false,
             // §5.11.1: `CurrentQIndex = base_q_idx` at tile entry.
             current_q_index: frame.quant.base_q_idx as i32,

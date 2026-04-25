@@ -51,6 +51,14 @@ pub struct InterBlockInfo {
     pub interp_filter: InterpFilter,
     /// Intra Y mode — only meaningful when `is_inter == false`.
     pub intra_y_mode: IntraMode,
+    /// Spec §5.11.25 / §7.11.3.9 — the two reference-frame logical
+    /// indices (`LAST_FRAME + i` form, 1..=7) used by SKIP_MODE
+    /// compound prediction. Both entries are zero when `skip_mode`
+    /// is `false`.
+    pub skip_mode_frames: [u8; 2],
+    /// Spec §7.11.3.9 — secondary MV for the second reference in
+    /// compound prediction. Zero when `skip_mode` is `false`.
+    pub mv1: Mv,
 }
 
 /// Decode the per-block inter syntax for a leaf block. Returns
@@ -211,6 +219,8 @@ pub fn decode_inter_block_syntax(
             segment_id,
             interp_filter: InterpFilter::Regular,
             intra_y_mode: y_mode,
+            skip_mode_frames: [0, 0],
+            mv1: Mv::default(),
         });
     }
 
@@ -218,21 +228,18 @@ pub fn decode_inter_block_syntax(
         // Spec §5.11.18 / §5.11.25: when skip_mode is set, the
         // bitstream omits `read_ref_frames`, `inter_block_mode_info`,
         // etc. The block uses the implicit `SkipModeFrame[0..=1]`
-        // reference pair (derived in §5.9.21 and now plumbed via
+        // reference pair (derived in §5.9.21 and exposed via
         // `td.frame.skip_mode_frame`) and the NEAREST_NEAREST_MV
-        // compound mode. Decoding NEAREST_NEAREST_MV requires the
-        // §7.10 ref-MV list which the narrow Phase 7 decoder doesn't
-        // build, so we collapse to zero-MV against our single-DPB
-        // LAST surrogate. The bitstream consumes no further symbols
-        // on this block; the SkipModeFrame indices are surfaced to
-        // the caller via `ref_frame_idx` so future rounds wiring
-        // multi-ref DPB compound MC can dispatch from here.
+        // compound mode. Round 14 routes both references through the
+        // multi-ref DPB so reconstruction can run real compound MC.
+        // The §7.10 ref-MV list isn't built yet, so we collapse the
+        // NEAREST MVs to zero — accurate for static content; future
+        // rounds will derive non-zero NEAREST_NEAREST_MV.
         return Ok(InterBlockInfo {
             is_inter: true,
-            // Pull the lower SkipModeFrame index — `LAST_FRAME + i`
-            // form. Stored as the logical reference (1..=7); the
-            // single-ref MC path treats anything except `1` (LAST)
-            // as missing and falls back to prev_frame.
+            // Carry the low SkipModeFrame index in `ref_frame_idx` so
+            // the single-ref MC fallback still works when the multi-
+            // ref DPB hasn't populated the slot.
             ref_frame_idx: td.frame.skip_mode_frame[0],
             mv: Mv::default(),
             skip,
@@ -244,6 +251,8 @@ pub fn decode_inter_block_syntax(
                 _ => InterpFilter::Regular,
             },
             intra_y_mode: IntraMode::DcPred,
+            skip_mode_frames: td.frame.skip_mode_frame,
+            mv1: Mv::default(),
         });
     }
 
@@ -296,6 +305,8 @@ pub fn decode_inter_block_syntax(
         segment_id,
         interp_filter,
         intra_y_mode: IntraMode::DcPred,
+        skip_mode_frames: [0, 0],
+        mv1: Mv::default(),
     })
 }
 
@@ -797,6 +808,8 @@ mod tests {
             segment_id: 0,
             interp_filter: InterpFilter::Regular,
             intra_y_mode: IntraMode::DcPred,
+            skip_mode_frames: [0, 0],
+            mv1: Mv::default(),
         };
         assert!(!info.skip_mode);
         assert_eq!(info.segment_id, 0);

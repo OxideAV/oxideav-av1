@@ -62,7 +62,14 @@ fn avif_still_with_128x128_superblock_decodes_end_to_end() {
                 // `Unsupported` until the IntraBC motion path lands.
                 // Skip those gracefully so this test keeps checking the
                 // 128×128 TX split path for non-SCT bitstreams.
-                match decode_tile_group(s, &fh, tg_payload, &mut fs, None) {
+                match decode_tile_group(
+                    s,
+                    &fh,
+                    tg_payload,
+                    &mut fs,
+                    None,
+                    &oxideav_av1::dpb::Dpb::new(),
+                ) {
                     Ok(()) => {}
                     Err(e) if format!("{e:?}").contains("intra-block-copy") => {
                         eprintln!("fixture uses IntraBC — skipping TX-split assertion: {e:?}");
