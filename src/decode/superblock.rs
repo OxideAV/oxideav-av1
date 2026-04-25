@@ -63,9 +63,11 @@
 //!   totals are tracked but `apply_deblocking` still reads frame-level
 //!   levels only; plumbing per-SB LF deltas needs a per-block LF level
 //!   grid in FrameState.
-//! - Var-tx residual decode — `read_var_tx_size` is wired, but the
-//!   coefficient path still decodes one tile per block footprint
-//!   rather than per TU stamped in `InterTxSizes[][]`.
+//! - Var-tx residual decode — Round 11 added the §5.11.36
+//!   `transform_tree` walker for inter luma; chroma still rides the
+//!   single-TU residual path (chroma's TU is generally `uvTx =
+//!   Max_Tx_Size_Rect[get_plane_residual_size(MiSize, plane)]`, so
+//!   var-tx doesn't apply directly).
 //! - `read_skip_mode()` (§5.11.10) + `inter_segment_id()`
 //!   (§5.11.19) — not yet read; currently no-ops in practice because
 //!   `skip_mode_present = 0` on all our aomenc fixtures.
@@ -1379,6 +1381,82 @@ fn reconstruct_inter_luma_block(
         return Ok(());
     }
 
+    // §5.11.36 transform_tree: when var-tx is in effect (the block
+    // exceeds Max_Tx_Size_Rect[MiSize]), `read_var_tx_size` already
+    // stamped per-MI `tx_size` values, and the residual is signalled
+    // as one independent transform_block per leaf TU. Walk the tree
+    // here in spec order, decoding/dequantising/inverse-transforming
+    // each TU into the prediction buffer in place.
+    transform_tree_inter_luma(td, fs, x, y, w as u32, h as u32)
+}
+
+/// §5.11.36 `transform_tree(startX, startY, w, h)` — recursive walk
+/// over the per-TU residuals signalled by `read_var_tx_size`. The
+/// per-MI `tx_size` stored on `fs.mi` plays the role of the spec's
+/// `InterTxSizes[row][col]`. Each leaf TU is decoded with one
+/// `decode_coefficients` call; the inverse transform output is added
+/// to the prediction in place.
+fn transform_tree_inter_luma(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    start_x: u32,
+    start_y: u32,
+    w: u32,
+    h: u32,
+) -> Result<()> {
+    let max_x = fs.mi_cols * 4;
+    let max_y = fs.mi_rows * 4;
+    if start_x >= max_x || start_y >= max_y {
+        return Ok(());
+    }
+    let row = start_y >> 2;
+    let col = start_x >> 2;
+    // `InterTxSizes[row][col]` — fall back to a TU sized to the
+    // current footprint if the stamp is missing (defensive; the
+    // var-tx walker should always have stamped here for inter blocks).
+    let leaf_tx = fs
+        .mi_at(col, row)
+        .tx_size
+        .unwrap_or_else(|| TxSize::square((w.min(h) as usize).max(4)).unwrap_or(TxSize::Tx4x4));
+    let luma_w = leaf_tx.width() as u32;
+    let luma_h = leaf_tx.height() as u32;
+    if w <= luma_w && h <= luma_h {
+        // Leaf — decode residual for this TU.
+        return inter_luma_residual_tu(td, fs, start_x, start_y, w as usize, h as usize);
+    }
+    if w > h {
+        let half = w / 2;
+        transform_tree_inter_luma(td, fs, start_x, start_y, half, h)?;
+        transform_tree_inter_luma(td, fs, start_x + half, start_y, half, h)?;
+    } else if w < h {
+        let half = h / 2;
+        transform_tree_inter_luma(td, fs, start_x, start_y, w, half)?;
+        transform_tree_inter_luma(td, fs, start_x, start_y + half, w, half)?;
+    } else {
+        let half_w = w / 2;
+        let half_h = h / 2;
+        transform_tree_inter_luma(td, fs, start_x, start_y, half_w, half_h)?;
+        transform_tree_inter_luma(td, fs, start_x + half_w, start_y, half_w, half_h)?;
+        transform_tree_inter_luma(td, fs, start_x, start_y + half_h, half_w, half_h)?;
+        transform_tree_inter_luma(td, fs, start_x + half_w, start_y + half_h, half_w, half_h)?;
+    }
+    Ok(())
+}
+
+/// §5.11.34 `transform_block` — luma plane only. Decodes the
+/// residual for one transform unit at (x, y) of size (w, h) and adds
+/// it to the existing pixels in `fs.y_plane(16)`. `select_square_tx`
+/// already accepts every AV1 rectangular TU size, so we don't need a
+/// special case here for non-square TUs.
+fn inter_luma_residual_tu(
+    td: &mut TileDecoder<'_>,
+    fs: &mut FrameState,
+    x: u32,
+    y: u32,
+    w: usize,
+    h: usize,
+) -> Result<()> {
+    let stride = fs.width as usize;
     let (sz, num_coeffs, scan) = select_square_tx(w, h)?;
     let tx_idx = tx_size_idx(w, h)?;
     let nz = nz_map_ctx_offset(w, h)?;
