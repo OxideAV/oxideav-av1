@@ -85,6 +85,23 @@ impl<'a> SymbolDecoder<'a> {
     /// a 0 sentinel, and the adaptive-update counter. Returns a value
     /// in `0..N-1`. Adapts the CDF in place when `allow_update` was
     /// set at construction.
+    ///
+    /// Implements §8.2.6 `read_symbol`. The wire format here is the
+    /// **inverse CDF** (as produced by libaom's `AOM_CDFn` / our
+    /// generator), so each `cdf[symbol]` already equals the spec's
+    /// `f = (1 << 15) - cdf_forward[symbol]`. The §8.2.6 inner loop is:
+    /// ```text
+    ///   cur = SymbolRange
+    ///   do {
+    ///     symbol++
+    ///     prev = cur
+    ///     cur = ((R >> 8) * (cdf[symbol] >> 6)) >> 1 + 4*(N-symbol-1)
+    ///   } while (SymbolValue < cur)
+    ///   SymbolRange = prev - cur
+    ///   SymbolValue -= cur
+    /// ```
+    /// (note: spec's "f" is our `cdf[symbol]` directly, since the wire
+    /// format is the inverse CDF).
     pub fn decode_symbol(&mut self, cdf: &mut [u16]) -> Result<u32> {
         if cdf.len() < 2 {
             return Err(Error::invalid("av1 symbol: CDF too short"));
@@ -96,26 +113,37 @@ impl<'a> SymbolDecoder<'a> {
             return Ok(0);
         }
         let n = n_with_sentinel;
+        // §8.2.6: cur starts at SymbolRange (so prev becomes
+        // SymbolRange on the first iteration when symbol == 0).
+        let mut cur: u32 = self.symbol_range;
+        let mut prev: u32;
         let mut symbol: usize = 0;
-        let mut prob: u32;
         loop {
+            prev = cur;
             let f = cdf[symbol] as u32;
-            let mut factor = ((self.symbol_range >> 8) * (f >> PROB_SHIFT)) >> (7 - PROB_SHIFT);
-            factor += MIN_PROB * (n as u32 - symbol as u32 - 1);
-            prob = self.symbol_range - factor;
-            if self.symbol_value >= prob {
-                self.symbol_value -= prob;
-                self.symbol_range -= prob;
-                symbol += 1;
-                if symbol == n - 1 {
-                    // Last symbol is implicit — no further range update.
-                    break;
-                }
-            } else {
-                self.symbol_range = prob;
+            cur = ((self.symbol_range >> 8) * (f >> PROB_SHIFT)) >> (7 - PROB_SHIFT);
+            cur += MIN_PROB * (n as u32 - symbol as u32 - 1);
+            if self.symbol_value >= cur {
+                // Spec's `do { ... } while (SymbolValue < cur)` — exit
+                // condition is `SymbolValue >= cur`. The selected
+                // symbol's interval is [cur, prev).
+                break;
+            }
+            symbol += 1;
+            if symbol >= n - 1 {
+                // The last (implicit) symbol — its lower bound is 0
+                // and we re-enter the body with f = 0 ⇒ cur = 0; that
+                // would always satisfy `SymbolValue >= 0`, so we
+                // short-circuit and treat `symbol = n - 1` as the
+                // result. Update prev/cur to the spec-equivalent
+                // values for the SymbolRange/Value adjustment below.
+                prev = cur;
+                cur = 0;
                 break;
             }
         }
+        self.symbol_range = prev - cur;
+        self.symbol_value -= cur;
         self.renormalise();
         if self.allow_update {
             update_cdf(cdf, n, symbol);
@@ -123,29 +151,39 @@ impl<'a> SymbolDecoder<'a> {
         Ok(symbol as u32)
     }
 
-    /// Decode a single bit with P(bit=1) given directly as a Q15
-    /// probability (`0..=32768`). This is the §9.2.5 `boolean(p)` path
-    /// used by a handful of uncompressed-looking literals (cdef_idx,
-    /// etc.) that ride the range coder.
+    /// Decode a single bit per §8.2.3, parameterised by `p = P(bit=1)`
+    /// in Q15 (`0..=32768`). The §8.2.3 path itself only uses
+    /// `p = 1<<14` (50/50); accepting an arbitrary `p` lets us also
+    /// drive the rare boolean reads (cdef_idx etc.) that ride the
+    /// range coder via a direct Q15 probability.
+    ///
+    /// Internally a 2-symbol read with cdf `{(1<<15)-p, 1<<15, 0}` —
+    /// in our inverse wire format that's `cdf[0] = p`. We inline the
+    /// 2-symbol path of `decode_symbol` so the per-bit cost stays
+    /// minimal.
     pub fn decode_bool(&mut self, p: u32) -> u32 {
-        let mut split = ((self.symbol_range - 1) * p) >> 15;
-        split += MIN_PROB;
-        let bit;
-        if self.symbol_value < split {
-            self.symbol_range = split;
-            bit = 0;
+        // §8.2.6 `cur` for symbol 0, with f = (1<<15) - cdf_spec[0] = p:
+        //   cur = ((R >> 8) * (p >> 6)) >> 1 + 4*(N - 0 - 1) = ... + 4
+        let mut cur = ((self.symbol_range >> 8) * (p >> PROB_SHIFT)) >> (7 - PROB_SHIFT);
+        cur += MIN_PROB;
+        let prev = self.symbol_range;
+        let bit = if self.symbol_value >= cur {
+            // Exit at symbol 0 (spec returns 0 when SV >= cur). The
+            // caller uses bit=1 for the high-prob side per
+            // `read_symbol`'s convention.
+            self.symbol_range = prev - cur;
+            self.symbol_value -= cur;
+            0
         } else {
-            self.symbol_range -= split;
-            self.symbol_value -= split;
-            bit = 1;
-        }
+            // Advance to symbol 1 (the implicit last). cur becomes 0.
+            self.symbol_range = cur;
+            1
+        };
         self.renormalise();
         bit
     }
 
-    /// Read `n` raw 50/50 bools (spec §5.9.3 `L(n)` — not to be
-    /// confused with the SPS/HDR bit reader `f(n)`). `n` must be in
-    /// `0..=32`.
+    /// Read `n` raw 50/50 bools (§8.2.5 `read_literal`).
     pub fn read_literal(&mut self, n: u32) -> u32 {
         let mut v = 0u32;
         for _ in 0..n {
@@ -162,12 +200,30 @@ impl<'a> SymbolDecoder<'a> {
         self.max_bits
     }
 
+    /// §8.2.6 step 6 of the renormalisation: advance `SymbolValue` and
+    /// `SymbolRange` by `bits = 15 - FloorLog2(SymbolRange)` new bits
+    /// from the bitstream. The XOR with `((SymbolValue + 1) << bits) -
+    /// 1` is what makes our internal `SymbolValue` match the spec's —
+    /// this is the bit-COMPLEMENTING form, which is necessary because
+    /// init_symbol XORs with `(1<<15)-1` at start.
     fn renormalise(&mut self) {
-        while self.symbol_range < SYMBOL_CARRY {
-            self.symbol_range <<= 1;
-            self.symbol_value = (self.symbol_value << 1) | self.read_bits(1);
-            self.max_bits -= 1;
+        if self.symbol_range >= SYMBOL_CARRY {
+            return;
         }
+        // FloorLog2(SymbolRange): how many bits the range occupies.
+        // bits = 15 - FloorLog2(SymbolRange)
+        let bits = 15 - floor_log2(self.symbol_range);
+        // SymbolRange <<= bits brings range back into [2^15, 2^16).
+        self.symbol_range <<= bits;
+        // Read `bits` new bits, padded if past payload.
+        let max_avail = self.max_bits.max(0) as u32;
+        let num_bits = bits.min(max_avail);
+        let new_data = self.read_bits(num_bits as usize);
+        let padded_data = new_data << (bits - num_bits);
+        // §8.2.6: SymbolValue = paddedData ^ (((SymbolValue + 1) << bits) - 1)
+        let mask = ((self.symbol_value + 1) << bits).wrapping_sub(1);
+        self.symbol_value = padded_data ^ mask;
+        self.max_bits -= bits as i64;
     }
 
     fn read_bits(&mut self, n: usize) -> u32 {
@@ -190,6 +246,14 @@ impl<'a> SymbolDecoder<'a> {
         self.bit_pos += 1;
         b as u32
     }
+}
+
+/// `FloorLog2(x)` — spec §4.7.2: largest integer `k` such that
+/// `(1 << k) <= x`. For `x == 0` the result is undefined; callers
+/// guarantee `x > 0` (renormalise only runs while `range > 0`).
+fn floor_log2(x: u32) -> u32 {
+    debug_assert!(x > 0);
+    31 - x.leading_zeros()
 }
 
 /// CDF adaptation per §9.4.
@@ -258,9 +322,12 @@ mod tests {
 
     #[test]
     fn decode_bool_extreme_prob() {
-        // P(bit=1) ≈ 32767 / 32768 ≈ 1.0, but with an all-zero buffer
-        // the interval register is far from the top — first call should
-        // still return 0.
+        // §8.2.6 with `p = 32767` ≈ P(bit=1) ≈ 1: the very first
+        // symbol of an all-zero buffer (max SymbolValue = 0x7FFF)
+        // should land in the high-prob slice. After the round-15
+        // §8.2.6 fix the spec convention applies: `0` is the
+        // high-prob branch (the loop exits immediately when
+        // `SymbolValue >= cur`), so the result is `0`.
         let buf = [0u8; 32];
         let mut d = SymbolDecoder::new(&buf, 32, false).expect("init");
         let bit = d.decode_bool(32767);
@@ -276,24 +343,23 @@ mod tests {
     }
 
     #[test]
-    fn decode_symbol_two_way_selects_higher_on_zero_bits() {
+    fn decode_symbol_two_way_picks_high_prob_on_zero_bits() {
         // 2-symbol CDF with 50/50 split stored as wire form
         // [32768 - 16384, 0, 0] = [16384, 0, 0]. With an all-zero
-        // buffer the seeded symbol_value is ~0x7FFF, which is > prob
-        // on the first iteration → symbol 1 selected.
+        // buffer the seeded symbol_value is 0x7FFF (max). Per §8.2.6
+        // the first iteration computes cur = R/2 + 4 ≈ 16388, and
+        // since SymbolValue (0x7FFF=32767) >= cur the loop exits
+        // immediately with symbol = 0.
         let buf = [0u8; 8];
         let mut d = SymbolDecoder::new(&buf, 8, false).expect("init");
         let mut cdf: Vec<u16> = vec![16384, 0, 0];
         let s = d.decode_symbol(&mut cdf).expect("decode");
-        assert_eq!(s, 1);
+        assert_eq!(s, 0);
     }
 
     #[test]
     fn decode_partition_cdf_block_8x8() {
-        // Exercise a real default CDF from the generator. The exact
-        // output depends on the stream but we just want to confirm
-        // that decoding proceeds without panic and returns a valid
-        // symbol in range.
+        // Sanity: real default CDF decode returns a value in range.
         let buf = [0xAAu8; 16];
         let mut d = SymbolDecoder::new(&buf, 16, true).expect("init");
         let mut cdf = crate::cdfs::DEFAULT_PARTITION_CDF[0].to_vec();
@@ -301,9 +367,32 @@ mod tests {
         assert!(s < 4, "partition-8x8 must produce symbol in 0..=3, got {s}");
     }
 
-    /// Golden vector for the range-coder symbol decoder: for the
+    /// §8.2.6 worked example: with `buf = [0xAA; 16]` the first 15
+    /// bits are `0x5555`, so after init `SymbolValue = 0x7FFF ^
+    /// 0x5555 = 0x2AAA = 10922`. For `cdf = [13636, 7258, 2376, 0,
+    /// 0]` the §8.2.6 loop is:
+    ///
+    ///   - symbol=0, cur = (32768>>8)*(13636>>6)>>1 + 4*3 = 13644.
+    ///     SymbolValue (10922) < cur → continue.
+    ///   - symbol=1, cur = (32768>>8)*(7258>>6)>>1 + 4*2 = 7240.
+    ///     SymbolValue (10922) >= cur → exit.
+    ///
+    /// → returned symbol = 1. This locks in the spec convention so a
+    /// future regression that re-introduces the round-1..14
+    /// inverted-decoder bug is caught on this single test.
+    #[test]
+    fn decode_partition_cdf_block_8x8_spec_value() {
+        let buf = [0xAAu8; 16];
+        let mut d = SymbolDecoder::new(&buf, 16, false).expect("init");
+        let mut cdf = crate::cdfs::DEFAULT_PARTITION_CDF[0].to_vec();
+        let s = d.decode_symbol(&mut cdf).expect("decode");
+        assert_eq!(s, 1, "spec §8.2.6 returns symbol 1 here, got {s}");
+    }
+
+    /// Golden vector for the §8.2.6-correct symbol decoder: for the
     /// same input buffer + CDF + adaptation, 32 consecutive decoded
-    /// symbols must match byte-for-byte across builds.
+    /// symbols must match byte-for-byte across builds. Captured after
+    /// the round-15 spec fix.
     #[test]
     fn decode_symbols_match_reference() {
         let mut buf = [0u8; 256];
@@ -313,8 +402,8 @@ mod tests {
         let mut d = SymbolDecoder::new(&buf, buf.len(), true).expect("init");
         let mut cdf = crate::cdfs::DEFAULT_PARTITION_CDF[0].to_vec();
         let expected = [
-            1, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 2, 2, 1, 2, 3, 0, 2, 0, 3, 3, 0, 1, 0, 0, 0, 0, 3, 0,
-            0, 3, 2,
+            0, 1, 0, 0, 3, 3, 3, 0, 2, 0, 1, 0, 0, 0, 3, 0, 3, 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3,
+            3, 0, 3,
         ];
         let got: Vec<u32> = (0..32)
             .map(|_| d.decode_symbol(&mut cdf).expect("decode"))
