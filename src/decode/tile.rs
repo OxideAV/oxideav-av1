@@ -669,6 +669,17 @@ pub struct TileDecoder<'a> {
     pub sgrproj_restore_cdf: Vec<u16>,
     /// Per-plane Wiener / SGR reference values (§5.11.42 / §5.11.44).
     pub lr_ref: [LrRef; 3],
+    /// §5.11.19 / §9.4 — `AboveSegPredContext[MiCol]`. One entry per
+    /// MI column, stamped by `inter_segment_id` whenever a block reads
+    /// or implicitly fixes its `seg_id_predicted` flag (per the
+    /// `for(i)` loops in §5.11.19). Cleared at tile entry per the
+    /// general "Above context arrays start at 0" rule (§5.11.1 /
+    /// §5.11.49). Used to form the 3-way context for the next block's
+    /// `seg_id_predicted` symbol.
+    pub above_seg_pred: Vec<u8>,
+    /// §5.11.19 / §9.4 — `LeftSegPredContext[MiRow]`. One entry per
+    /// MI row, stamped by `inter_segment_id`. Cleared at tile entry.
+    pub left_seg_pred: Vec<u8>,
     /// Inter-frame syntax reader. `None` for key / intra-only frames.
     pub inter: Option<InterDecoder>,
     /// Reference frame carried from the previous decoded frame —
@@ -720,6 +731,15 @@ impl<'a> TileDecoder<'a> {
         } else {
             None
         };
+        // §5.11.19 / §11.5 — `Above*Context[]` and `Left*Context[]`
+        // arrays are zero-initialised for each tile (the spec phrasing
+        // is "set equal to 0"). The seg-pred arrays span the full MI
+        // grid in each direction so they index by absolute MiCol /
+        // MiRow without per-tile origin bookkeeping.
+        let mi_cols = (frame.frame_width + 3) >> 2;
+        let mi_rows = (frame.frame_height + 3) >> 2;
+        let above_seg_pred = vec![0u8; mi_cols.max(1) as usize];
+        let left_seg_pred = vec![0u8; mi_rows.max(1) as usize];
         let mut td = Self {
             seq,
             frame,
@@ -755,6 +775,8 @@ impl<'a> TileDecoder<'a> {
             wiener_restore_cdf: default_wiener_cdf(),
             sgrproj_restore_cdf: default_sgrproj_cdf(),
             lr_ref: [LrRef::default(); 3],
+            above_seg_pred,
+            left_seg_pred,
             inter,
             prev_frame,
             read_deltas: false,
@@ -1083,6 +1105,53 @@ impl<'a> TileDecoder<'a> {
             .symbol
             .decode_symbol(&mut self.seg_id_predicted_cdf[ctx])?;
         Ok(raw != 0)
+    }
+
+    /// §5.11.19 / §9.4 — current `seg_id_predicted` ctx for the block
+    /// rooted at `(mi_col, mi_row)`. Sums the most-recent
+    /// `AboveSegPredContext[mi_col]` and `LeftSegPredContext[mi_row]`
+    /// stamps; both arrays default to 0 at tile entry so the first
+    /// block sees ctx == 0.
+    pub fn seg_id_predicted_ctx(&self, mi_col: u32, mi_row: u32) -> u32 {
+        let above = self
+            .above_seg_pred
+            .get(mi_col as usize)
+            .copied()
+            .unwrap_or(0) as u32;
+        let left = self
+            .left_seg_pred
+            .get(mi_row as usize)
+            .copied()
+            .unwrap_or(0) as u32;
+        above + left
+    }
+
+    /// §5.11.19 — stamp the `seg_id_predicted` value across a block's
+    /// MI extent so subsequent blocks see the updated context. `bw4 /
+    /// bh4` are the block dimensions in 4×4 MI units.
+    pub fn stamp_seg_id_predicted(
+        &mut self,
+        mi_col: u32,
+        mi_row: u32,
+        bw4: u32,
+        bh4: u32,
+        v: bool,
+    ) {
+        let v = v as u8;
+        let cols = self.above_seg_pred.len() as u32;
+        let rows = self.left_seg_pred.len() as u32;
+        for i in 0..bw4 {
+            let c = mi_col + i;
+            if c < cols {
+                self.above_seg_pred[c as usize] = v;
+            }
+        }
+        for i in 0..bh4 {
+            let r = mi_row + i;
+            if r < rows {
+                self.left_seg_pred[r as usize] = v;
+            }
+        }
     }
 
     /// §5.11.10 `read_skip_mode` — 2-symbol flag enabling the AV1

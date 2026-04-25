@@ -37,6 +37,7 @@ pub mod cdef;
 pub mod cdfs;
 pub mod decode;
 pub mod decoder;
+pub mod dpb;
 pub mod extradata;
 pub mod filmgrain;
 pub mod frame_header;

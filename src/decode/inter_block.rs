@@ -215,16 +215,25 @@ pub fn decode_inter_block_syntax(
     }
 
     if skip_mode {
-        // Spec §5.11.18: when skip_mode is set, the bitstream omits
-        // `read_ref_frames`, `inter_block_mode_info`, etc. — the
-        // block uses the implicit SkipModeFrame[0..=1] reference pair
-        // and the NEAREST_NEAREST_MV compound mode. Our narrow Phase
-        // 7 decoder doesn't carry the SkipModeFrame derivation, so
-        // we collapse to zero-MV LAST-ref single-reference inter.
-        // The bitstream consumes no further symbols on this block.
+        // Spec §5.11.18 / §5.11.25: when skip_mode is set, the
+        // bitstream omits `read_ref_frames`, `inter_block_mode_info`,
+        // etc. The block uses the implicit `SkipModeFrame[0..=1]`
+        // reference pair (derived in §5.9.21 and now plumbed via
+        // `td.frame.skip_mode_frame`) and the NEAREST_NEAREST_MV
+        // compound mode. Decoding NEAREST_NEAREST_MV requires the
+        // §7.10 ref-MV list which the narrow Phase 7 decoder doesn't
+        // build, so we collapse to zero-MV against our single-DPB
+        // LAST surrogate. The bitstream consumes no further symbols
+        // on this block; the SkipModeFrame indices are surfaced to
+        // the caller via `ref_frame_idx` so future rounds wiring
+        // multi-ref DPB compound MC can dispatch from here.
         return Ok(InterBlockInfo {
             is_inter: true,
-            ref_frame_idx: 0,
+            // Pull the lower SkipModeFrame index — `LAST_FRAME + i`
+            // form. Stored as the logical reference (1..=7); the
+            // single-ref MC path treats anything except `1` (LAST)
+            // as missing and falls back to prev_frame.
+            ref_frame_idx: td.frame.skip_mode_frame[0],
             mv: Mv::default(),
             skip,
             skip_mode: true,
@@ -342,11 +351,11 @@ fn read_skip_mode_for_block(
 /// - We don't yet carry a `PrevSegmentIds[][]` map from the previous
 ///   frame, so the `predictedSegmentId` path defaults to 0 when no
 ///   previous frame is available.
-/// - We don't track `AboveSegPredContext / LeftSegPredContext` arrays
-///   either, so the seg_id_predicted CDF context degrades to 0. This
-///   is exact when segmentation is off (the only case our fixtures
-///   exercise — both reads short-circuit on `segmentation_enabled =
-///   false`).
+/// - Round 13 wires the `AboveSegPredContext / LeftSegPredContext`
+///   arrays via `td.seg_id_predicted_ctx` / `td.stamp_seg_id_predicted`
+///   so the seg_id_predicted CDF picks the spec-correct 3-way ctx
+///   instead of always 0. The arrays are zeroed at tile entry per
+///   §11.5.
 #[allow(clippy::too_many_arguments)]
 fn inter_segment_id(
     td: &mut TileDecoder<'_>,
@@ -369,6 +378,9 @@ fn inter_segment_id(
     // when there's no prev frame.
     let predicted_segment_id = predicted_segment_id_from_prev(td, mi_col, mi_row, w, h);
 
+    let bw4 = ((w + 3) >> 2).max(1);
+    let bh4 = ((h + 3) >> 2).max(1);
+
     if td.frame.segmentation.update_map {
         if pre_skip && !td.frame.segmentation.seg_id_pre_skip {
             // Spec: pre-skip pass with !SegIdPreSkip simply resets the
@@ -379,14 +391,20 @@ fn inter_segment_id(
             // Post-skip pass.
             if skip {
                 // Skip-block bypass: no temporal pred, just read.
+                // §5.11.19 also stamps `AboveSegPredContext /
+                // LeftSegPredContext` to 0 along the block extent.
+                td.stamp_seg_id_predicted(mi_col, mi_row, bw4, bh4, false);
                 let sid = td.decode_segment_id(seg_ctx)?;
                 return Ok(sid);
             }
         }
         if td.frame.segmentation.temporal_update {
-            // Read seg_id_predicted; on 1, reuse predicted value;
-            // on 0, fall through to spatial read.
-            let pred = td.decode_seg_id_predicted(0)?;
+            // Read seg_id_predicted with the proper §9.4 ctx, then
+            // stamp the result across the block's MI extent so
+            // neighbour blocks see the updated above/left contexts.
+            let ctx = td.seg_id_predicted_ctx(mi_col, mi_row);
+            let pred = td.decode_seg_id_predicted(ctx)?;
+            td.stamp_seg_id_predicted(mi_col, mi_row, bw4, bh4, pred);
             if pred {
                 return Ok(predicted_segment_id);
             }

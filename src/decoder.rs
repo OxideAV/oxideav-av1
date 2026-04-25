@@ -15,8 +15,11 @@ use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
 use crate::decode::{decode_tile_group, FrameState};
+use crate::dpb::Dpb;
 use crate::extradata::Av1CodecConfig;
-use crate::frame_header::{parse_frame_header, parse_frame_obu, FrameHeader, FrameType};
+use crate::frame_header::{
+    parse_frame_header_with_dpb, parse_frame_obu_with_dpb, FrameHeader, FrameType,
+};
 use crate::obu::{iter_obus, ObuType};
 use crate::sequence_header::{parse_sequence_header, SequenceHeader};
 use crate::tile_group::{
@@ -40,6 +43,11 @@ pub struct Av1Decoder {
     /// when the next frame is a key. Used as the LAST reference for
     /// single-reference translational inter blocks.
     prev_frame: Option<Arc<FrameState>>,
+    /// §7.20 DPB OrderHint trail. Refreshed after each successfully-
+    /// decoded frame per `refresh_frame_flags`; consulted by
+    /// `parse_frame_header_with_dpb` to derive `skipModeAllowed`
+    /// (§5.9.21).
+    dpb: Dpb,
     /// Queue of decoded frames awaiting `receive_frame()`.
     output_queue: VecDeque<Frame>,
     /// Next pts to associate with a decoded frame.
@@ -58,6 +66,7 @@ impl Av1Decoder {
             seen_frame: false,
             last_tile_payloads: Vec::new(),
             prev_frame: None,
+            dpb: Dpb::new(),
             output_queue: VecDeque::new(),
             next_pts: 0,
             time_base: TimeBase::new(1, 1),
@@ -118,7 +127,7 @@ impl Av1Decoder {
                     let seq = self.seq_header.as_ref().ok_or_else(|| {
                         Error::invalid("av1: frame_header before sequence_header")
                     })?;
-                    let fh = parse_frame_header(seq, obu.payload)?;
+                    let fh = parse_frame_header_with_dpb(seq, obu.payload, &self.dpb)?;
                     self.last_frame_header = Some(fh);
                     self.seen_frame = true;
                 }
@@ -128,10 +137,14 @@ impl Av1Decoder {
                         .as_ref()
                         .ok_or_else(|| Error::invalid("av1: frame_obu before sequence_header"))?
                         .clone();
-                    let (fh, tg_payload) = parse_frame_obu(&seq, obu.payload)?;
+                    let (fh, tg_payload) = parse_frame_obu_with_dpb(&seq, obu.payload, &self.dpb)?;
                     self.seen_frame = true;
                     if fh.frame_type == FrameType::Key {
                         self.prev_frame = None;
+                        // §5.9.4 mark_ref_frames: a KEY frame implicitly
+                        // resets the DPB so subsequent skip-mode
+                        // derivations don't reference stale OrderHints.
+                        self.dpb.reset();
                     }
                     let tile_decode_err = if let Some(ti) = fh.tile_info.as_ref() {
                         let tgh = parse_tile_group_header(tg_payload, ti)?;
@@ -160,6 +173,10 @@ impl Av1Decoder {
                         );
                         if res.is_ok() && fh.refresh_frame_flags != 0 {
                             self.prev_frame = Some(Arc::new(clone_frame_state(&fs)));
+                            // §7.20 refresh DPB OrderHints for the
+                            // selected slots so the next inter frame's
+                            // skip-mode derivation sees this frame.
+                            self.dpb.refresh(fh.refresh_frame_flags, fh.order_hint);
                         }
                         if res.is_ok() && fh.show_frame {
                             self.enqueue_video_frame(&fs);
@@ -202,11 +219,13 @@ impl Av1Decoder {
                     );
                     if fh.frame_type == FrameType::Key {
                         self.prev_frame = None;
+                        self.dpb.reset();
                     }
                     let res =
                         decode_tile_group(seq, fh, obu.payload, &mut fs, self.prev_frame.as_ref());
                     if res.is_ok() && fh.refresh_frame_flags != 0 {
                         self.prev_frame = Some(Arc::new(clone_frame_state(&fs)));
+                        self.dpb.refresh(fh.refresh_frame_flags, fh.order_hint);
                     }
                     if res.is_ok() && fh.show_frame {
                         self.enqueue_video_frame(&fs);
@@ -354,6 +373,7 @@ impl Decoder for Av1Decoder {
         self.seen_frame = false;
         self.last_tile_payloads.clear();
         self.prev_frame = None;
+        self.dpb.reset();
         self.output_queue.clear();
         Ok(())
     }

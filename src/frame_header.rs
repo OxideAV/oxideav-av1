@@ -16,6 +16,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::{ceil_log2, BitReader};
+use crate::dpb::{get_relative_dist, Dpb};
 use crate::frame_header_tail::{
     coded_lossless_hint, parse_cdef_params, parse_delta_lf_params, parse_delta_q_params,
     parse_film_grain_params, parse_global_motion_params, parse_loop_filter_params, parse_lr_params,
@@ -31,6 +32,13 @@ pub const REFS_PER_FRAME: usize = 7;
 pub const SUPERRES_DENOM_BITS: u32 = 3;
 pub const SUPERRES_DENOM_MIN: u32 = 9;
 pub const SUPERRES_NUM: u32 = 8;
+
+/// §3 reference-frame numbering — `INTRA_FRAME = 0`, `LAST_FRAME = 1`,
+/// `LAST2 = 2`, `LAST3 = 3`, `GOLDEN = 4`, `BWDREF = 5`, `ALTREF2 = 6`,
+/// `ALTREF = 7`. The skip-mode derivation in §5.9.21 stores
+/// `SkipModeFrame[0..=1]` as `LAST_FRAME + i` where `i` is a
+/// `ref_frame_idx` index in `0..REFS_PER_FRAME`.
+pub const LAST_FRAME: u8 = 1;
 
 /// `frame_type` values §5.9.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,8 +136,22 @@ pub struct FrameHeader {
     pub reference_select: bool,
     /// §5.9.23 — `skip_mode_params.skip_mode_present`. Intra-only
     /// frames never enable skip mode; kept as a flag for inter
-    /// expansion.
+    /// expansion. Only ever `true` when `skip_mode_allowed` is `true`
+    /// and the frame header's `skip_mode_present` bit was 1.
     pub skip_mode_present: bool,
+    /// §5.9.21 derived `skipModeAllowed` — `true` iff the OrderHint
+    /// trail of the chosen references brackets the current frame's
+    /// `OrderHint` (forward + backward, or two distinct forward refs).
+    /// Drives whether the bitstream emits the `skip_mode_present`
+    /// bit at all (§5.9.22 last clause).
+    pub skip_mode_allowed: bool,
+    /// §5.9.21 / §7.9.2 `SkipModeFrame[0..=1]` — the two reference-
+    /// frame slots a SKIP_MODE block uses for compound prediction.
+    /// Stored as `LAST_FRAME + i` (i.e. logical reference indices
+    /// `1..=7`); both entries are `0` when `skip_mode_allowed` is
+    /// `false`. The convention `SkipModeFrame[0] < SkipModeFrame[1]`
+    /// is preserved per spec (`Min`/`Max` of the bracketing pair).
+    pub skip_mode_frame: [u8; 2],
     /// §5.9.24 — `global_motion_params.gm_type[ref]`. Only populated
     /// for inter frames; `Identity` for intra-only.
     pub gm_type: [GmType; NUM_REF_FRAMES],
@@ -167,9 +189,25 @@ pub enum ParseDepth {
 
 /// Parse a frame_header_obu / frame_obu payload. For OBU_FRAME the caller
 /// must subsequently parse `tile_group_obu` from the remaining bytes.
+///
+/// Convenience entry point: passes an empty DPB so `skipModeAllowed`
+/// is always derived as `false`. Use [`parse_frame_header_with_dpb`]
+/// when reference OrderHints are tracked across frames.
 pub fn parse_frame_header(seq: &SequenceHeader, payload: &[u8]) -> Result<FrameHeader> {
+    parse_frame_header_with_dpb(seq, payload, &Dpb::new())
+}
+
+/// DPB-aware frame_header parser. The supplied [`Dpb`] supplies the
+/// per-slot `RefOrderHint[]` values consulted by the §5.9.21 skip-mode
+/// allowed derivation; an empty DPB falls through to
+/// `skipModeAllowed = 0` exactly like the legacy entry point.
+pub fn parse_frame_header_with_dpb(
+    seq: &SequenceHeader,
+    payload: &[u8],
+    dpb: &Dpb,
+) -> Result<FrameHeader> {
     let mut br = BitReader::new(payload);
-    parse_uncompressed_header(seq, &mut br)
+    parse_uncompressed_header(seq, &mut br, dpb)
 }
 
 /// Parse a frame_obu() payload (§5.10): `frame_header_obu()` followed by
@@ -180,8 +218,18 @@ pub fn parse_frame_obu<'a>(
     seq: &SequenceHeader,
     payload: &'a [u8],
 ) -> Result<(FrameHeader, &'a [u8])> {
+    parse_frame_obu_with_dpb(seq, payload, &Dpb::new())
+}
+
+/// DPB-aware [`parse_frame_obu`] variant — see
+/// [`parse_frame_header_with_dpb`] for the DPB rationale.
+pub fn parse_frame_obu_with_dpb<'a>(
+    seq: &SequenceHeader,
+    payload: &'a [u8],
+    dpb: &Dpb,
+) -> Result<(FrameHeader, &'a [u8])> {
     let mut br = BitReader::new(payload);
-    let fh = parse_uncompressed_header(seq, &mut br)?;
+    let fh = parse_uncompressed_header(seq, &mut br, dpb)?;
     // `frame_obu()` applies byte_alignment() between the frame header and
     // the tile_group sub-OBU.
     br.byte_alignment()?;
@@ -193,7 +241,11 @@ pub fn parse_frame_obu<'a>(
 }
 
 /// §5.9.1 uncompressed_header().
-fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Result<FrameHeader> {
+fn parse_uncompressed_header(
+    seq: &SequenceHeader,
+    br: &mut BitReader<'_>,
+    dpb: &Dpb,
+) -> Result<FrameHeader> {
     let id_len = if seq.frame_id_numbers_present {
         seq.additional_frame_id_length_minus_1 as u32 + seq.delta_frame_id_length_minus_2 as u32 + 3
     } else {
@@ -453,16 +505,24 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
     let frame_is_intra = matches!(frame_type, FrameType::Key | FrameType::IntraOnly);
     let reference_select = if frame_is_intra { false } else { br.bit()? };
 
-    // §5.9.23 — skip_mode_params. Full derivation requires the DPB's
-    // OrderHint trail which we don't carry yet; intra-only frames
-    // never enable skip_mode per spec. For inter frames we
-    // conservatively leave it off. The spec emits a presence bit only
-    // under specific OrderHint relationships (`reference_select &&
-    // skip_mode_allowed`); without DPB state the simplest correct
-    // thing is to skip the bit entirely — for aomenc-produced AVIS
-    // clips `skip_mode_allowed` is false (no BWD + FWD ref pair) so
-    // the bit is absent from the bitstream.
-    let skip_mode_present = false;
+    // §5.9.21 / §5.9.22 — skip_mode_params. The derivation walks the
+    // chosen reference frames' `OrderHint`s (sourced from the DPB's
+    // `RefOrderHint[]` array per §5.9.4 / §5.9.16) to find the two
+    // refs bracketing the current frame's `OrderHint`. Forward+
+    // backward OR a pair of distinct forward refs both unlock
+    // `skipModeAllowed`; intra-only / single-reference / order-hint-
+    // disabled frames yield `0` and the `skip_mode_present` bit is
+    // omitted from the bitstream.
+    let (skip_mode_allowed, skip_mode_frame) = derive_skip_mode_allowed(
+        frame_is_intra,
+        reference_select,
+        seq.enable_order_hint,
+        seq.order_hint_bits,
+        order_hint,
+        &ref_frame_idx,
+        dpb,
+    );
+    let skip_mode_present = if skip_mode_allowed { br.bit()? } else { false };
 
     // §5.9.25 — allow_warped_motion. Present only when the sequence
     // header set `enable_warped_motion`, the frame is non-intra, and
@@ -535,6 +595,8 @@ fn parse_uncompressed_header(seq: &SequenceHeader, br: &mut BitReader<'_>) -> Re
         tx_mode,
         reference_select,
         skip_mode_present,
+        skip_mode_allowed,
+        skip_mode_frame,
         gm_type,
         gm_params,
         film_grain,
@@ -602,6 +664,8 @@ fn finish_minimal(
         tx_mode: TxMode::Only4x4,
         reference_select: false,
         skip_mode_present: false,
+        skip_mode_allowed: false,
+        skip_mode_frame: [0; 2],
         gm_type: [GmType::Identity; NUM_REF_FRAMES],
         gm_params: [[0i32; 6]; NUM_REF_FRAMES],
         film_grain: FilmGrainParams::default(),
@@ -664,4 +728,203 @@ fn parse_render_size(
 #[allow(dead_code)]
 pub(crate) fn _bit_field_width_for(seq: &SequenceHeader) -> u32 {
     ceil_log2(seq.max_frame_width)
+}
+
+/// §5.9.21 / §7.9.2 — derive `(skipModeAllowed, SkipModeFrame[0..=1])`.
+///
+/// Walks `ref_frame_idx[0..REFS_PER_FRAME]` looking up the per-slot
+/// `RefOrderHint[]` from the supplied [`Dpb`]. The two outputs match
+/// the spec: a forward+backward bracketing pair (smallest gap on
+/// each side of the current `OrderHint`) sets
+/// `SkipModeFrame[0..=1] = (Min, Max)` of the bracketing indices;
+/// when no backward reference exists, the spec falls back to a pair
+/// of forward references — `(forwardIdx, secondForwardIdx)` — chosen
+/// by largest gap between them. Slots whose DPB entry is invalid are
+/// treated as if `RefOrderHint == 0` AND skipped from the candidate
+/// pool, since an invalid slot cannot be used for compound prediction.
+///
+/// Returned `SkipModeFrame[0..=1]` values are stored as `LAST_FRAME +
+/// i` per spec (logical reference indices `1..=7`); both entries
+/// default to `0` when the derivation rejects (`skipModeAllowed = 0`).
+pub(crate) fn derive_skip_mode_allowed(
+    frame_is_intra: bool,
+    reference_select: bool,
+    enable_order_hint: bool,
+    order_hint_bits: u32,
+    order_hint: u32,
+    ref_frame_idx: &[u32; REFS_PER_FRAME],
+    dpb: &Dpb,
+) -> (bool, [u8; 2]) {
+    // Spec gating: the entire derivation collapses to 0 for
+    // intra-only frames, single-reference inter frames, or sequences
+    // without OrderHint signalling.
+    if frame_is_intra || !reference_select || !enable_order_hint {
+        return (false, [0, 0]);
+    }
+
+    let mut forward_idx: i32 = -1;
+    let mut forward_hint: u32 = 0;
+    let mut backward_idx: i32 = -1;
+    let mut backward_hint: u32 = 0;
+
+    for (i, &slot_idx) in ref_frame_idx.iter().enumerate().take(REFS_PER_FRAME) {
+        let slot = slot_idx as usize;
+        let dpb_slot = dpb.slots.get(slot).copied().unwrap_or_default();
+        if !dpb_slot.valid {
+            // Without a valid DPB entry we don't know this slot's
+            // OrderHint — exclude it from skip-mode bracketing.
+            continue;
+        }
+        let ref_hint = dpb_slot.order_hint;
+        let cmp_to_cur = get_relative_dist(ref_hint, order_hint, order_hint_bits);
+        if cmp_to_cur < 0 {
+            // Forward (past) reference. Track the largest forward
+            // hint (= closest to the current frame from the past).
+            if forward_idx < 0 || get_relative_dist(ref_hint, forward_hint, order_hint_bits) > 0 {
+                forward_idx = i as i32;
+                forward_hint = ref_hint;
+            }
+        } else if cmp_to_cur > 0 {
+            // Backward (future) reference. Track the smallest backward
+            // hint (= closest to the current frame from the future).
+            if backward_idx < 0 || get_relative_dist(ref_hint, backward_hint, order_hint_bits) < 0 {
+                backward_idx = i as i32;
+                backward_hint = ref_hint;
+            }
+        }
+    }
+
+    if forward_idx < 0 {
+        // No forward reference — skip mode requires at least one.
+        return (false, [0, 0]);
+    }
+
+    if backward_idx >= 0 {
+        // Forward + backward case: SkipModeFrame[0..=1] are the
+        // (Min, Max) of the two bracketing indices, stored as
+        // `LAST_FRAME + i`.
+        let lo = forward_idx.min(backward_idx) as u8;
+        let hi = forward_idx.max(backward_idx) as u8;
+        return (true, [LAST_FRAME + lo, LAST_FRAME + hi]);
+    }
+
+    // Forward-only case: search for a second forward reference whose
+    // OrderHint sits earlier than `forwardHint` (chosen by largest
+    // backward gap from `forwardHint`).
+    let mut second_forward_idx: i32 = -1;
+    let mut second_forward_hint: u32 = 0;
+    for (i, &slot_idx) in ref_frame_idx.iter().enumerate().take(REFS_PER_FRAME) {
+        let slot = slot_idx as usize;
+        let dpb_slot = dpb.slots.get(slot).copied().unwrap_or_default();
+        if !dpb_slot.valid {
+            continue;
+        }
+        let ref_hint = dpb_slot.order_hint;
+        if get_relative_dist(ref_hint, forward_hint, order_hint_bits) < 0
+            && (second_forward_idx < 0
+                || get_relative_dist(ref_hint, second_forward_hint, order_hint_bits) > 0)
+        {
+            second_forward_idx = i as i32;
+            second_forward_hint = ref_hint;
+        }
+    }
+    if second_forward_idx < 0 {
+        return (false, [0, 0]);
+    }
+    let lo = forward_idx.min(second_forward_idx) as u8;
+    let hi = forward_idx.max(second_forward_idx) as u8;
+    (true, [LAST_FRAME + lo, LAST_FRAME + hi])
+}
+
+#[cfg(test)]
+mod skip_mode_tests {
+    use super::*;
+
+    #[test]
+    fn intra_or_no_reference_select_returns_zero() {
+        let dpb = Dpb::new();
+        let refs = [0u32; REFS_PER_FRAME];
+        // Intra frame -> always disallowed.
+        let (allowed, frames) = derive_skip_mode_allowed(true, true, true, 8, 4, &refs, &dpb);
+        assert!(!allowed);
+        assert_eq!(frames, [0, 0]);
+        // No reference_select (single-ref frame) -> disallowed.
+        let (allowed, _) = derive_skip_mode_allowed(false, false, true, 8, 4, &refs, &dpb);
+        assert!(!allowed);
+        // OrderHint disabled at the sequence level -> disallowed.
+        let (allowed, _) = derive_skip_mode_allowed(false, true, false, 8, 4, &refs, &dpb);
+        assert!(!allowed);
+    }
+
+    #[test]
+    fn empty_dpb_is_disallowed() {
+        let dpb = Dpb::new();
+        let refs = [0u32; REFS_PER_FRAME];
+        let (allowed, _) = derive_skip_mode_allowed(false, true, true, 8, 4, &refs, &dpb);
+        assert!(!allowed);
+    }
+
+    #[test]
+    fn forward_plus_backward_picks_min_max_indices() {
+        // OrderHint window = 8 bits. Current frame OrderHint = 4.
+        // Slots: 0 -> hint=2 (past), 1 -> hint=6 (future).
+        let mut dpb = Dpb::new();
+        dpb.slots[0] = crate::dpb::RefSlot {
+            order_hint: 2,
+            valid: true,
+        };
+        dpb.slots[1] = crate::dpb::RefSlot {
+            order_hint: 6,
+            valid: true,
+        };
+        // ref_frame_idx[0] -> slot 0 (past), ref_frame_idx[1] -> slot 1
+        // (future). Other refs reuse slot 0.
+        let mut refs = [0u32; REFS_PER_FRAME];
+        refs[1] = 1;
+        let (allowed, frames) = derive_skip_mode_allowed(false, true, true, 8, 4, &refs, &dpb);
+        assert!(allowed);
+        // Forward index = 0 (past), Backward index = 1 (future).
+        // SkipModeFrame[0] = LAST_FRAME + 0 = 1, SkipModeFrame[1] =
+        // LAST_FRAME + 1 = 2.
+        assert_eq!(frames, [LAST_FRAME, LAST_FRAME + 1]);
+    }
+
+    #[test]
+    fn forward_only_two_distinct_picks_widest_pair() {
+        // Both refs in the past — forward-only branch fires.
+        let mut dpb = Dpb::new();
+        dpb.slots[0] = crate::dpb::RefSlot {
+            order_hint: 2,
+            valid: true,
+        };
+        dpb.slots[1] = crate::dpb::RefSlot {
+            order_hint: 1,
+            valid: true,
+        };
+        let mut refs = [0u32; REFS_PER_FRAME];
+        refs[0] = 0;
+        refs[1] = 1;
+        // Other ref slots invalid (default).
+        let (allowed, frames) = derive_skip_mode_allowed(false, true, true, 8, 4, &refs, &dpb);
+        assert!(allowed);
+        // forwardIdx tracks closest-to-current = i=0 (hint=2);
+        // secondForwardIdx tracks earlier = i=1 (hint=1). Result is
+        // (Min, Max) = (0, 1).
+        assert_eq!(frames, [LAST_FRAME, LAST_FRAME + 1]);
+    }
+
+    #[test]
+    fn forward_only_single_ref_is_disallowed() {
+        // One past reference repeated across all slots — no second
+        // distinct forward ref -> disallowed.
+        let mut dpb = Dpb::new();
+        dpb.slots[0] = crate::dpb::RefSlot {
+            order_hint: 2,
+            valid: true,
+        };
+        let refs = [0u32; REFS_PER_FRAME]; // all -> slot 0
+        let (allowed, frames) = derive_skip_mode_allowed(false, true, true, 8, 4, &refs, &dpb);
+        assert!(!allowed);
+        assert_eq!(frames, [0, 0]);
+    }
 }

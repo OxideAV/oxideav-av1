@@ -257,3 +257,72 @@ fn decoder_does_not_panic_on_svtav1_compound_clip() {
     }
     eprintln!("svtav1 inter clip decoded {decoded} frame(s)");
 }
+
+/// Round 13 visibility check — once the DPB-aware parser
+/// (`parse_frame_header_with_dpb`) is wired, the SVT-AV1 compound
+/// fixture's second frame should expose `skip_mode_allowed = true`
+/// (forward + backward bracketing pair available in the DPB after
+/// the key frame). This test is informational only; it logs the
+/// frame header's flags without asserting on PSNR.
+#[test]
+fn svtav1_clip_exposes_skip_mode_allowed_after_key() {
+    use oxideav_av1::dpb::Dpb;
+    use oxideav_av1::frame_header::{parse_frame_header_with_dpb, FrameType};
+
+    let Some(data) = read_fixture("/tmp/av1_inter.ivf") else {
+        return;
+    };
+    let pkts = ivf_packet_slices(&data).expect("ivf parse");
+    let mut seq = None;
+    let mut dpb = Dpb::new();
+    let mut allowed_seen = false;
+    let mut present_seen = false;
+    for (i, pkt) in pkts.iter().enumerate() {
+        for o in iter_obus(pkt) {
+            let o = match o {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+            match o.header.obu_type {
+                ObuType::SequenceHeader => {
+                    seq = parse_sequence_header(o.payload).ok();
+                }
+                ObuType::Frame | ObuType::FrameHeader => {
+                    let s = match seq.as_ref() {
+                        Some(x) => x,
+                        None => return,
+                    };
+                    let Ok(fh) = parse_frame_header_with_dpb(s, o.payload, &dpb) else {
+                        eprintln!("pkt {i} parse failed");
+                        return;
+                    };
+                    if fh.skip_mode_allowed {
+                        allowed_seen = true;
+                    }
+                    if fh.skip_mode_present {
+                        present_seen = true;
+                    }
+                    eprintln!(
+                        "pkt {i} type={:?} order_hint={} refresh=0x{:02x} skip_mode_allowed={} skip_mode_present={} skip_mode_frame={:?}",
+                        fh.frame_type,
+                        fh.order_hint,
+                        fh.refresh_frame_flags,
+                        fh.skip_mode_allowed,
+                        fh.skip_mode_present,
+                        fh.skip_mode_frame
+                    );
+                    if fh.frame_type == FrameType::Key {
+                        dpb.reset();
+                    }
+                    if fh.refresh_frame_flags != 0 {
+                        dpb.refresh(fh.refresh_frame_flags, fh.order_hint);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    eprintln!(
+        "svtav1: skip_mode_allowed seen={allowed_seen}, skip_mode_present seen={present_seen}"
+    );
+}
