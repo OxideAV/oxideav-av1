@@ -25,6 +25,17 @@ use crate::frame_header::NUM_REF_FRAMES;
 /// frame state (post-CDEF / post-LR), shared via `Arc` so refreshes
 /// are O(1). `valid` is `true` iff the slot has ever been refreshed
 /// since reset.
+///
+/// `saved_gm_params` mirrors §7.4 `save_grain_params` /
+/// `save_loop_filter_params` / `save_segmentation_params` for the
+/// global-motion sub-state — the array of 6-element warp parameter
+/// vectors per reference frame (`SavedGmParams[][]`). The next inter
+/// frame whose `primary_ref_frame != PRIMARY_REF_NONE` retrieves
+/// `PrevGmParams` from this slot via `load_previous` (§7.20). Round 18
+/// installs this so non-error-resilient inter frames that encode warp
+/// params relative to the saved values can be decoded without bitstream
+/// desync (the prior identity-default fallback over-read up to ~30 bits
+/// of subexp data per affected ref).
 #[derive(Clone, Default)]
 pub struct RefSlot {
     pub order_hint: u32,
@@ -33,6 +44,11 @@ pub struct RefSlot {
     /// slot (§7.20). `None` when the slot was refreshed for OrderHint
     /// only — the planes path is best-effort and lazily populated.
     pub frame: Option<Arc<FrameState>>,
+    /// `SavedGmParams[ref][idx]` per spec §7.4 — the 6-element warp
+    /// matrix per ref slot at the time this DPB slot was last
+    /// refreshed. Index 0..=7 maps to LAST_FRAME..=ALTREF_FRAME (slot
+    /// 0 / INTRA_FRAME unused).
+    pub saved_gm_params: [[i32; 6]; NUM_REF_FRAMES],
 }
 
 impl std::fmt::Debug for RefSlot {
@@ -43,6 +59,22 @@ impl std::fmt::Debug for RefSlot {
             .field("frame", &self.frame.is_some())
             .finish()
     }
+}
+
+/// `gm_params` array shape used by both the parser
+/// (`parse_global_motion_params`) and the DPB save/load helpers.
+pub type GmParamsArray = [[i32; 6]; NUM_REF_FRAMES];
+
+fn identity_gm_params() -> GmParamsArray {
+    let mut out = [[0i32; 6]; NUM_REF_FRAMES];
+    // Spec §5.9.24: gm_params[ref][i] = (i % 3 == 2) ? 1<<WARPEDMODEL_PREC_BITS : 0
+    // for i in 0..6. WARPEDMODEL_PREC_BITS = 16.
+    let alpha_identity: i32 = 1 << 16;
+    for slot in out.iter_mut() {
+        slot[2] = alpha_identity;
+        slot[5] = alpha_identity;
+    }
+    out
 }
 
 /// Decoded Picture Buffer — `NUM_REF_FRAMES` slots, indexed 0..=7.
@@ -89,6 +121,7 @@ impl Dpb {
                     order_hint,
                     valid: true,
                     frame: None,
+                    saved_gm_params: identity_gm_params(),
                 };
             }
         }
@@ -107,9 +140,49 @@ impl Dpb {
                     order_hint,
                     valid: true,
                     frame: Some(frame.clone()),
+                    saved_gm_params: identity_gm_params(),
                 };
             }
         }
+    }
+
+    /// §7.20 — extended refresh that ALSO carries the just-decoded
+    /// frame's `gm_params[][]` into the saved state of every refreshed
+    /// slot. Used by the inter decode path so subsequent frames whose
+    /// `primary_ref_frame` points back here get a non-identity
+    /// `PrevGmParams` for §5.9.25 `read_global_param`. Falls back to
+    /// the identity-default refresh path when the just-decoded frame
+    /// itself was intra-only (the `gm_params` argument is then
+    /// identity by construction).
+    pub fn refresh_with_gm(
+        &mut self,
+        mask: u8,
+        order_hint: u32,
+        frame: Option<Arc<FrameState>>,
+        gm_params: &GmParamsArray,
+    ) {
+        for i in 0..NUM_REF_FRAMES {
+            if (mask >> i) & 1 == 1 {
+                self.slots[i] = RefSlot {
+                    order_hint,
+                    valid: true,
+                    frame: frame.clone(),
+                    saved_gm_params: *gm_params,
+                };
+            }
+        }
+    }
+
+    /// Return a copy of the `SavedGmParams[]` array stored on slot
+    /// `slot_idx`, or `None` when the slot has never been refreshed
+    /// (the parser then falls back to the identity-default `r=0` per
+    /// `setup_past_independence`).
+    pub fn saved_gm_params_for(&self, slot_idx: usize) -> Option<GmParamsArray> {
+        let s = self.slots.get(slot_idx)?;
+        if !s.valid {
+            return None;
+        }
+        Some(s.saved_gm_params)
     }
 
     /// Reset every slot to invalid. Called on key-frame decode start
@@ -243,5 +316,25 @@ mod tests {
             assert!(s.frame.is_none());
             assert!(!s.valid);
         }
+    }
+
+    /// `refresh_with_gm` round-trips the saved-GmParams pointer through
+    /// `saved_gm_params_for` for refreshed slots, and returns `None`
+    /// for slots that have never been refreshed.
+    #[test]
+    fn refresh_with_gm_persists_saved_params() {
+        let mut dpb = Dpb::new();
+        let mut gm = [[0i32; 6]; NUM_REF_FRAMES];
+        // Slot 1 entry: a deliberately non-identity vector so the
+        // round-trip is visible.
+        gm[1] = [10, 20, 30, 40, 50, 60];
+        dpb.refresh_with_gm(0b00000001, 99, None, &gm);
+        let loaded = dpb.saved_gm_params_for(0).expect("slot 0 valid");
+        assert_eq!(loaded[1], [10, 20, 30, 40, 50, 60]);
+        // Untouched slot returns None.
+        assert!(dpb.saved_gm_params_for(7).is_none());
+        // Reset clears saved params too.
+        dpb.reset();
+        assert!(dpb.saved_gm_params_for(0).is_none());
     }
 }

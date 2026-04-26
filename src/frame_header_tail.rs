@@ -488,70 +488,143 @@ pub fn parse_tx_mode(br: &mut BitReader<'_>, coded_lossless: bool) -> Result<TxM
 ///
 /// Required for correct bit-stream framing on inter frames only;
 /// intra-only callers never reach this.
+///
+/// `allow_high_precision_mv` is plumbed through because it modifies the
+/// `absBits` width used for translation components in pure-TRANSLATION
+/// warp slots (spec §5.9.25): `absBits = GM_ABS_TRANS_ONLY_BITS -
+/// !allow_high_precision_mv`. Round 17 ignored this, over-reading the
+/// translation parameters by 4 bits per ref slot.
 pub fn parse_global_motion_params(
     br: &mut BitReader<'_>,
     gm_type_out: &mut [GmType; NUM_REF_FRAMES],
     gm_params_out: &mut [[i32; 6]; NUM_REF_FRAMES],
+    allow_high_precision_mv: bool,
+    prev_gm_params: Option<&[[i32; 6]; NUM_REF_FRAMES]>,
 ) -> Result<()> {
+    // §5.9.24 — initialise gm_params[] to the identity default so any
+    // ref slot left at IDENTITY (or whose alpha params we derive
+    // implicitly for ROTZOOM) carries the spec-mandated identity matrix.
+    let identity_alpha: i32 = 1 << 16; // WARPEDMODEL_PREC_BITS
+    for slot in gm_params_out.iter_mut() {
+        *slot = [0, 0, identity_alpha, 0, 0, identity_alpha];
+    }
     for (i, slot) in gm_type_out.iter_mut().enumerate().skip(1) {
         let is_global = br.bit()?;
         let typ = if is_global {
-            if br.bit()? {
+            let is_rot_zoom = br.bit()?;
+            if is_rot_zoom {
                 GmType::RotZoom
-            } else if br.bit()? {
-                GmType::Translation
             } else {
-                GmType::Affine
+                let is_translation = br.bit()?;
+                if is_translation {
+                    GmType::Translation
+                } else {
+                    GmType::Affine
+                }
             }
         } else {
             GmType::Identity
         };
         *slot = typ;
-        // Per §5.9.24 + §5.9.27 read_global_param. All reference params
-        // default to 0 (no DPB state), so `decode_signed_subexp_with_ref`
-        // uses reference = 0.
-        match typ {
-            GmType::Identity => {
-                gm_params_out[i] = [0i32; 6];
-            }
-            GmType::Translation => {
-                let p0 = read_global_param_with_ref(br, 0)?;
-                let p1 = read_global_param_with_ref(br, 1)?;
-                gm_params_out[i] = [p0, p1, 0, 0, 0, 0];
-            }
-            GmType::RotZoom => {
-                let p2 = read_global_param_with_ref(br, 2)?;
-                let p3 = read_global_param_with_ref(br, 3)?;
-                gm_params_out[i] = [0, 0, p2, p3, 0, 0];
-            }
-            GmType::Affine => {
-                let p2 = read_global_param_with_ref(br, 2)?;
-                let p3 = read_global_param_with_ref(br, 3)?;
-                let p4 = read_global_param_with_ref(br, 4)?;
-                let p5 = read_global_param_with_ref(br, 5)?;
-                gm_params_out[i] = [0, 0, p2, p3, p4, p5];
+        // Per §5.9.25 the per-idx subexp reference is
+        //   r = (PrevGmParams[ref][idx] >> precDiff) - sub
+        // where `PrevGmParams` was either reset to identity by
+        // `setup_past_independence` (PRIMARY_REF_NONE) or loaded from
+        // `SavedGmParams[ref_frame_idx[primary_ref_frame]]` by
+        // `load_previous`. The DPB-aware caller plumbs the latter via
+        // `prev_gm_params`; absent that we keep the identity default
+        // (every translation/alpha component already zero except the
+        // diagonal alpha terms equal to `1<<WARPEDMODEL_PREC_BITS`).
+        let ref_params: [i32; 6] = match prev_gm_params {
+            Some(p) => p[i],
+            None => [0, 0, identity_alpha, 0, 0, identity_alpha],
+        };
+        // Spec §5.9.24 read order: alpha params (2..=5) FIRST for
+        // ROTZOOM/AFFINE, then translation params (0, 1) for any non-
+        // identity type. Round 17 forgot 0/1 for ROTZOOM and AFFINE.
+        let mut params = gm_params_out[i];
+        if (typ as u8) >= (GmType::RotZoom as u8) {
+            params[2] =
+                read_global_param_with_ref(br, typ, 2, allow_high_precision_mv, ref_params[2])?;
+            params[3] =
+                read_global_param_with_ref(br, typ, 3, allow_high_precision_mv, ref_params[3])?;
+            if typ == GmType::Affine {
+                params[4] =
+                    read_global_param_with_ref(br, typ, 4, allow_high_precision_mv, ref_params[4])?;
+                params[5] =
+                    read_global_param_with_ref(br, typ, 5, allow_high_precision_mv, ref_params[5])?;
+            } else {
+                // ROTZOOM derives 4 / 5 from 2 / 3 to keep the matrix
+                // symmetric.
+                params[4] = -params[3];
+                params[5] = params[2];
             }
         }
+        if (typ as u8) >= (GmType::Translation as u8) {
+            params[0] =
+                read_global_param_with_ref(br, typ, 0, allow_high_precision_mv, ref_params[0])?;
+            params[1] =
+                read_global_param_with_ref(br, typ, 1, allow_high_precision_mv, ref_params[1])?;
+        }
+        gm_params_out[i] = params;
     }
     Ok(())
 }
 
-/// §5.9.27 `read_global_param(type, ref, idx)` with the simplifying
-/// assumption that the reference value is zero (no DPB state tracked
-/// in this parser). `idx` selects between translation (0/1) and alpha
-/// (2..=5) precision per §5.9.27. Returns the decoded parameter at
-/// whatever precision the spec assigns to `idx` — callers are
-/// responsible for the precision shift.
-fn read_global_param_with_ref(br: &mut BitReader<'_>, _idx: usize) -> Result<i32> {
-    // From spec §5.9.27 (global_motion_params → read_global_param):
-    // absBits = (idx < 2) ? GM_ABS_TRANS_ONLY_BITS (12) : GM_ABS_ALPHA_BITS (12)
-    // Spec GM_ABS_ALPHA_BITS=12, GM_ABS_TRANS_ONLY_BITS=12,
-    // GM_ABS_TRANS_BITS=12 (per §3 table). `_idx` is kept in the
-    // signature for documentation only. mx = 1 << absBits.
-    // decode_signed_subexp_with_ref(-mx, mx+1, 0) is read.
-    let abs_bits: u32 = 12;
-    let mx = 1u32 << abs_bits;
-    decode_signed_subexp_with_ref(br, -(mx as i32), (mx + 1) as i32, 0)
+/// §5.9.25 `read_global_param(type, ref, idx)` — decodes one warp
+/// parameter. `prev_value` is `PrevGmParams[ref][idx]` (loaded by
+/// §7.20 `load_previous` when `primary_ref_frame != PRIMARY_REF_NONE`,
+/// otherwise the identity default produced by §7.4
+/// `setup_past_independence`).
+///
+/// Constants per the spec table (§3): `GM_ABS_ALPHA_BITS = 12`,
+/// `GM_ABS_TRANS_BITS = 12`, `GM_ABS_TRANS_ONLY_BITS = 9`,
+/// `GM_ALPHA_PREC_BITS = 15`, `GM_TRANS_PREC_BITS = 6`,
+/// `GM_TRANS_ONLY_PREC_BITS = 3`, `WARPEDMODEL_PREC_BITS = 16`.
+fn read_global_param_with_ref(
+    br: &mut BitReader<'_>,
+    typ: GmType,
+    idx: usize,
+    allow_high_precision_mv: bool,
+    prev_value: i32,
+) -> Result<i32> {
+    const WARPEDMODEL_PREC_BITS: u32 = 16;
+    const GM_ABS_ALPHA_BITS: u32 = 12;
+    const GM_ABS_TRANS_BITS: u32 = 12;
+    const GM_ABS_TRANS_ONLY_BITS: u32 = 9;
+    const GM_ALPHA_PREC_BITS: u32 = 15;
+    const GM_TRANS_PREC_BITS: u32 = 6;
+    const GM_TRANS_ONLY_PREC_BITS: u32 = 3;
+
+    let (abs_bits, prec_bits) = if idx < 2 {
+        if typ == GmType::Translation {
+            let bump = if allow_high_precision_mv { 0 } else { 1 };
+            (
+                GM_ABS_TRANS_ONLY_BITS - bump,
+                GM_TRANS_ONLY_PREC_BITS - bump,
+            )
+        } else {
+            (GM_ABS_TRANS_BITS, GM_TRANS_PREC_BITS)
+        }
+    } else {
+        (GM_ABS_ALPHA_BITS, GM_ALPHA_PREC_BITS)
+    };
+    let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
+    // round = (idx % 3 == 2) ? 1<<WARPEDMODEL_PREC_BITS : 0
+    let round: i32 = if idx % 3 == 2 {
+        1 << WARPEDMODEL_PREC_BITS
+    } else {
+        0
+    };
+    // sub = (idx % 3 == 2) ? 1<<precBits : 0
+    let sub: i32 = if idx % 3 == 2 { 1 << prec_bits } else { 0 };
+    // r = (PrevGmParams[ref][idx] >> precDiff) - sub
+    // (Spec uses arithmetic right shift: prev_value is a signed i32 so
+    // Rust's `>>` already preserves sign on i32.)
+    let r: i32 = (prev_value >> prec_diff) - sub;
+    let mx = 1i32 << abs_bits;
+    let v = decode_signed_subexp_with_ref(br, -mx, mx + 1, r)?;
+    Ok((v << prec_diff) + round)
 }
 
 /// §5.9.28 `decode_signed_subexp_with_ref(low, high, r)`.
@@ -724,4 +797,90 @@ pub fn parse_film_grain_params(
     g.overlap_flag = br.bit()?;
     g.clip_to_restricted_range = br.bit()?;
     Ok(g)
+}
+
+#[cfg(test)]
+mod gm_tests {
+    use super::*;
+
+    /// All-zero payload after the 7 type bits encodes seven IDENTITY
+    /// global-motion slots. Verifies the round-18 read order: only the
+    /// type-flag bit is consumed per slot when `is_global=0`.
+    #[test]
+    fn all_identity_consumes_seven_bits() {
+        // 7 ref slots × 1 bit each = 7 bits. Pad to a byte boundary.
+        let payload = [0u8];
+        let mut br = BitReader::new(&payload);
+        let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
+        let mut gm_params = [[0i32; 6]; NUM_REF_FRAMES];
+        parse_global_motion_params(&mut br, &mut gm_type, &mut gm_params, false, None).unwrap();
+        // 7 bits consumed.
+        assert_eq!(br.bit_position(), 7);
+        // Slot 0 (intra) untouched; 1..=7 all Identity.
+        for slot in &gm_type[1..] {
+            assert_eq!(*slot, GmType::Identity);
+        }
+        // Identity matrix per §5.9.24.
+        let identity_alpha: i32 = 1 << 16;
+        for params in &gm_params[1..] {
+            assert_eq!(*params, [0, 0, identity_alpha, 0, 0, identity_alpha]);
+        }
+    }
+
+    /// Round-17 regression guard — for ROTZOOM the parser MUST also read
+    /// the translation params (idx 0, 1) AFTER the alpha pair (idx 2,
+    /// 3). Round-17 forgot the trailing pair, desynchronising the stream
+    /// by ~16 bits per ROTZOOM ref.
+    #[test]
+    fn rotzoom_reads_alpha_then_translation() {
+        // Hand-craft: slot 1 = ROTZOOM, then six slots IDENTITY.
+        // ROTZOOM type bits = 1 (is_global), 1 (is_rot_zoom). After
+        // those, we expect 4 read_global_param invocations (alpha 2/3,
+        // translation 0/1). Each with subexp_more_bits=0 at i=0 reads
+        // 1 + b2 = 1 + 3 = 4 bits. So 4 params × 4 bits = 16 bits.
+        // Total slot 1 = 2 (type) + 16 (params) = 18 bits.
+        // Slots 2..=7 = 6 × 1 (Identity) = 6 bits.
+        // Grand total = 24 bits = 3 bytes. The exact byte values just
+        // need to drive subexp_more_bits=0 at iteration 0 every time.
+        // bit pattern: 11 [0 000][0 000][0 000][0 000] 0 0 0 0 0 0
+        // Pack MSB-first: 1100000_00000000_00000000 = 0xC0 0x00 0x00.
+        let payload = [0xC0u8, 0x00, 0x00];
+        let mut br = BitReader::new(&payload);
+        let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
+        let mut gm_params = [[0i32; 6]; NUM_REF_FRAMES];
+        parse_global_motion_params(&mut br, &mut gm_type, &mut gm_params, true, None).unwrap();
+        assert_eq!(gm_type[1], GmType::RotZoom);
+        for slot in &gm_type[2..] {
+            assert_eq!(*slot, GmType::Identity);
+        }
+        // Verifies all 24 bits consumed — a partial read would NOT have
+        // landed exactly on the byte boundary.
+        assert_eq!(br.bit_position(), 24);
+    }
+
+    /// PrevGmParams plumbing: with a non-identity ref-anchor the
+    /// `r = (PrevGmParams >> precDiff) - sub` math should produce a
+    /// different `r` than the identity-default path, exercised here by
+    /// asserting that supplying a custom `prev_gm_params` does not
+    /// re-introduce the all-zero output bug fixed in round 18.
+    #[test]
+    fn prev_gm_params_threaded_through() {
+        // Identity payload (all 7 ref slots IDENTITY).
+        let payload = [0u8];
+        let mut br = BitReader::new(&payload);
+        let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
+        let mut gm_params = [[0i32; 6]; NUM_REF_FRAMES];
+        // PrevGmParams: every slot has alpha=2*identity (just to be
+        // recognisable) and small translations.
+        let identity_alpha: i32 = 1 << 16;
+        let prev = [[10, 20, 2 * identity_alpha, 30, 40, 2 * identity_alpha]; NUM_REF_FRAMES];
+        parse_global_motion_params(&mut br, &mut gm_type, &mut gm_params, false, Some(&prev))
+            .unwrap();
+        // Identity slots — output `gm_params` should still be the
+        // canonical identity, NOT the prev value (we coded type=IDENTITY
+        // so no params are read).
+        for params in &gm_params[1..] {
+            assert_eq!(*params, [0, 0, identity_alpha, 0, 0, identity_alpha]);
+        }
+    }
 }

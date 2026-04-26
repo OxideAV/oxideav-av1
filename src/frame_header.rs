@@ -22,7 +22,7 @@ use crate::frame_header_tail::{
     parse_film_grain_params, parse_global_motion_params, parse_loop_filter_params, parse_lr_params,
     parse_quantization_params, parse_segmentation_params, parse_tx_mode, CdefParams,
     FilmGrainParams, GmType, LoopFilterParams, LoopRestorationParams, QuantizationParams,
-    SegmentationParams, TxMode,
+    SegmentationParams, TxMode, PRIMARY_REF_NONE,
 };
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
 use crate::tile_info::{mi_cols_rows, parse_tile_info, TileInfo};
@@ -546,9 +546,36 @@ fn parse_uncompressed_header(
     let reduced_tx_set = br.bit()?;
 
     let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
-    let mut gm_params = [[0i32; 6]; NUM_REF_FRAMES];
+    // §5.9.24: gm_params[ref][i] = (i % 3 == 2) ? 1<<WARPEDMODEL_PREC_BITS : 0
+    // for ref = LAST_FRAME..ALTREF_FRAME, before any per-frame coding.
+    // The previous all-zero default broke the saved-state chain — when
+    // an intra frame's gm_params got copied into SavedGmParams[], the
+    // next inter frame loaded `[0,0,0,0,0,0]` and computed a negative
+    // `r = -sub` for the alpha components, derailing decode_subexp.
+    let identity_alpha: i32 = 1 << 16;
+    let mut gm_params = [[0, 0, identity_alpha, 0, 0, identity_alpha]; NUM_REF_FRAMES];
     if !frame_is_intra {
-        parse_global_motion_params(br, &mut gm_type, &mut gm_params)?;
+        // §5.9.24 / §5.9.25 — `read_global_param`'s reference value
+        // `r = (PrevGmParams[ref][idx] >> precDiff) - sub` requires the
+        // `PrevGmParams[]` slot loaded by `load_previous()` whenever
+        // `primary_ref_frame != PRIMARY_REF_NONE` (§7.4 / §7.20). Round
+        // 18 wires the DPB-saved-GmParams pointer through so non-error-
+        // resilient inter frames can re-anchor the subexp decoder on the
+        // ref's actual saved warp matrix instead of the identity default.
+        // Falls back to identity when the slot has never been refreshed.
+        let prev_gm_params = if primary_ref_frame == PRIMARY_REF_NONE {
+            None
+        } else {
+            let slot_idx = ref_frame_idx[primary_ref_frame as usize] as usize;
+            dpb.saved_gm_params_for(slot_idx)
+        };
+        parse_global_motion_params(
+            br,
+            &mut gm_type,
+            &mut gm_params,
+            allow_high_precision_mv,
+            prev_gm_params.as_ref(),
+        )?;
     }
 
     let film_grain = parse_film_grain_params(br, seq, frame_type, show_frame, showable_frame)?;
@@ -676,7 +703,8 @@ fn finish_minimal(
         skip_mode_allowed: false,
         skip_mode_frame: [0; 2],
         gm_type: [GmType::Identity; NUM_REF_FRAMES],
-        gm_params: [[0i32; 6]; NUM_REF_FRAMES],
+        // Identity warp matrix per §5.9.24 — alpha diagonals = 1<<16.
+        gm_params: [[0, 0, 1 << 16, 0, 0, 1 << 16]; NUM_REF_FRAMES],
         film_grain: FilmGrainParams::default(),
         parse_depth,
     })
@@ -882,11 +910,13 @@ mod skip_mode_tests {
             order_hint: 2,
             valid: true,
             frame: None,
+            ..Default::default()
         };
         dpb.slots[1] = crate::dpb::RefSlot {
             order_hint: 6,
             valid: true,
             frame: None,
+            ..Default::default()
         };
         // ref_frame_idx[0] -> slot 0 (past), ref_frame_idx[1] -> slot 1
         // (future). Other refs reuse slot 0.
@@ -908,11 +938,13 @@ mod skip_mode_tests {
             order_hint: 2,
             valid: true,
             frame: None,
+            ..Default::default()
         };
         dpb.slots[1] = crate::dpb::RefSlot {
             order_hint: 1,
             valid: true,
             frame: None,
+            ..Default::default()
         };
         let mut refs = [0u32; REFS_PER_FRAME];
         refs[0] = 0;
@@ -935,6 +967,7 @@ mod skip_mode_tests {
             order_hint: 2,
             valid: true,
             frame: None,
+            ..Default::default()
         };
         let refs = [0u32; REFS_PER_FRAME]; // all -> slot 0
         let (allowed, frames) = derive_skip_mode_allowed(false, true, true, 8, 4, &refs, &dpb);

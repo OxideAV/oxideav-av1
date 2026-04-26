@@ -181,11 +181,19 @@ impl Av1Decoder {
                             // SKIP_MODE compound MC can fetch from two
                             // independent references; the single-ref
                             // `prev_frame` field is kept as a fallback
-                            // for the LAST translational MC path.
+                            // for the LAST translational MC path. Round
+                            // 18 also propagates the just-decoded frame's
+                            // `gm_params[][]` into `SavedGmParams[]` so
+                            // §5.9.25 `read_global_param` on subsequent
+                            // inter frames anchors `r` on the right ref.
                             let arc = Arc::new(clone_frame_state(&fs));
                             self.prev_frame = Some(arc.clone());
-                            self.dpb
-                                .refresh_with_frame(fh.refresh_frame_flags, fh.order_hint, arc);
+                            self.dpb.refresh_with_gm(
+                                fh.refresh_frame_flags,
+                                fh.order_hint,
+                                Some(arc),
+                                &fh.gm_params,
+                            );
                         }
                         if res.is_ok() && fh.show_frame {
                             self.enqueue_video_frame(&fs);
@@ -246,8 +254,12 @@ impl Av1Decoder {
                     if res.is_ok() && fh.refresh_frame_flags != 0 {
                         let arc = Arc::new(clone_frame_state(&fs));
                         self.prev_frame = Some(arc.clone());
-                        self.dpb
-                            .refresh_with_frame(fh.refresh_frame_flags, fh.order_hint, arc);
+                        self.dpb.refresh_with_gm(
+                            fh.refresh_frame_flags,
+                            fh.order_hint,
+                            Some(arc),
+                            &fh.gm_params,
+                        );
                     }
                     if res.is_ok() && fh.show_frame {
                         self.enqueue_video_frame(&fs);
