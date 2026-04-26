@@ -113,8 +113,8 @@ fn measure(
     let Frame::Video(v1) = &frames[1] else {
         panic!()
     };
-    assert_eq!(v1.width as usize, w);
-    assert_eq!(v1.height as usize, h);
+    assert_eq!(v1.planes[0].stride, w);
+    assert_eq!(v1.planes[0].data.len() / v1.planes[0].stride, h);
     let uvw = w / 2;
     let uvh = h / 2;
     let y_len = w * h;
@@ -175,8 +175,8 @@ fn inter_first_pframe_psnr_vs_libaom() {
     let Frame::Video(v1) = &frames[1] else {
         panic!("frame 1 not video");
     };
-    let w = v1.width as usize;
-    let h = v1.height as usize;
+    let w = v1.planes[0].stride;
+    let h = if w == 0 { 0 } else { v1.planes[0].data.len() / w };
     let uvw = w / 2;
     let uvh = h / 2;
     let y_len = w * h;
@@ -287,8 +287,8 @@ fn intra_psnr_testsrc_still_64() {
     let Frame::Video(v) = &frames[0] else {
         return;
     };
-    let w = v.width as usize;
-    let h = v.height as usize;
+    let w = v.planes[0].stride;
+    let h = if w == 0 { 0 } else { v.planes[0].data.len() / w };
     let uvw = w / 2;
     let uvh = h / 2;
     let y_len = w * h;

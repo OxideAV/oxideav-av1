@@ -118,12 +118,19 @@ fn collect_video_planes(f: &Frame) -> Option<VideoPlanes> {
     let Frame::Video(v) = f else {
         return None;
     };
-    let y = v.planes.first()?.data.clone();
+    let y_plane = v.planes.first()?;
+    let width = y_plane.stride as u32;
+    let height = if width == 0 {
+        0
+    } else {
+        (y_plane.data.len() / y_plane.stride) as u32
+    };
+    let y = y_plane.data.clone();
     let _u = v.planes.get(1).map(|p| p.data.clone());
     let _v = v.planes.get(2).map(|p| p.data.clone());
     Some(VideoPlanes {
-        width: v.width,
-        height: v.height,
+        width,
+        height,
         y,
         _u,
         _v,

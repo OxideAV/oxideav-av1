@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use oxideav_core::frame::{VideoFrame, VideoPlane};
 use oxideav_core::Decoder;
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase};
 
 use crate::decode::{decode_tile_group, FrameState};
 use crate::dpb::Dpb;
@@ -265,25 +265,6 @@ impl Av1Decoder {
     fn enqueue_video_frame(&mut self, fs: &FrameState) {
         let monochrome = fs.monochrome;
         let bd = fs.bit_depth;
-        let sub_x = fs.sub_x;
-        let sub_y = fs.sub_y;
-        let format = if bd == 8 {
-            if monochrome {
-                PixelFormat::Gray8
-            } else if sub_x == 1 && sub_y == 1 {
-                PixelFormat::Yuv420P
-            } else if sub_x == 1 && sub_y == 0 {
-                PixelFormat::Yuv422P
-            } else {
-                PixelFormat::Yuv444P
-            }
-        } else {
-            // HBD not yet plumbed through VideoFrame (no u16 variant in
-            // PixelFormat). Fall back to Yuv420P with narrowed samples.
-            PixelFormat::Yuv420P
-        };
-        let width = fs.width;
-        let height = fs.height;
         let mut planes = Vec::new();
         if bd == 8 {
             planes.push(VideoPlane {
@@ -323,11 +304,7 @@ impl Av1Decoder {
             }
         }
         let vf = VideoFrame {
-            format,
-            width,
-            height,
             pts: Some(self.next_pts),
-            time_base: self.time_base,
             planes,
         };
         self.output_queue.push_back(Frame::Video(vf));
