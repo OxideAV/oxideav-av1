@@ -176,7 +176,7 @@ fn inter_first_pframe_psnr_vs_libaom() {
         panic!("frame 1 not video");
     };
     let w = v1.planes[0].stride;
-    let h = if w == 0 { 0 } else { v1.planes[0].data.len() / w };
+    let h = v1.planes[0].data.len().checked_div(w).unwrap_or(0);
     let uvw = w / 2;
     let uvh = h / 2;
     let y_len = w * h;
@@ -288,7 +288,7 @@ fn intra_psnr_testsrc_still_64() {
         return;
     };
     let w = v.planes[0].stride;
-    let h = if w == 0 { 0 } else { v.planes[0].data.len() / w };
+    let h = v.planes[0].data.len().checked_div(w).unwrap_or(0);
     let uvw = w / 2;
     let uvh = h / 2;
     let y_len = w * h;

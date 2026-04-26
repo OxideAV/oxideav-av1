@@ -388,10 +388,19 @@ fn parse_uncompressed_header(
         br.f(8)? as u8
     };
 
+    // §5.9.2 — ref_order_hint is gated by `error_resilient_mode &&
+    // enable_order_hint` (under the outer `!FrameIsIntra ||
+    // refresh_frame_flags != allFrames` umbrella). Round 17 fixed an
+    // over-read here that consumed 8 * OrderHintBits extra bits on every
+    // non-error-resilient inter frame — the over-read happened to land
+    // inside the long key/inter payloads from aomenc but tripped the
+    // bitreader on SVT-AV1's small "non-shown overlay" frame OBUs (pkt
+    // 1 frames 3-5 of `/tmp/av1_inter.ivf`).
+    let frame_is_intra_for_check = matches!(frame_type, FrameType::Key | FrameType::IntraOnly);
     let mut ref_order_hint = [0u32; NUM_REF_FRAMES];
-    if (frame_type != FrameType::Key || !show_frame)
+    if (!frame_is_intra_for_check || refresh_frame_flags != all_frames as u8)
+        && error_resilient_mode
         && seq.enable_order_hint
-        && (error_resilient_mode || frame_type != FrameType::Key)
     {
         for v in ref_order_hint.iter_mut() {
             *v = br.f(seq.order_hint_bits)?;

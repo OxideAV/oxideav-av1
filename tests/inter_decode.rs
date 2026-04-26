@@ -450,6 +450,77 @@ fn svtav1_skip_mode_compound_decodes_real_pixels() {
     );
 }
 
+/// Round 17 regression: every Frame OBU in `/tmp/av1_inter.ivf` packet 1
+/// (SVT-AV1's first temporal-unit overlay group) MUST get past the
+/// frame-header parser without the bitreader running out of bits. Before
+/// the §5.9.2 `ref_order_hint` gating fix and the §5.9.20 `lr_unit_shift`
+/// inversion fix, every "non-shown overlay" Frame OBU in this group
+/// failed with `out of bits` because the over-reads consumed bytes the
+/// 16-23 byte payloads simply did not have.
+#[test]
+fn svtav1_pkt1_frame_obus_parse_without_bitreader_underrun() {
+    use oxideav_av1::dpb::Dpb;
+    use oxideav_av1::frame_header::parse_frame_obu_with_dpb;
+
+    let Some(data) = read_fixture("/tmp/av1_inter.ivf") else {
+        return;
+    };
+    let pkts = ivf_packet_slices(&data).expect("ivf parse");
+    if pkts.len() < 2 {
+        return;
+    }
+
+    let mut seq = None;
+    for o in iter_obus(&pkts[0]) {
+        let o = o.expect("iter pkt0");
+        if o.header.obu_type == ObuType::SequenceHeader {
+            seq = parse_sequence_header(o.payload).ok();
+        }
+    }
+    let seq = seq.expect("seq header in pkt 0");
+
+    let mut dpb = Dpb::new();
+    // Re-parse pkt 0's key Frame OBU into the DPB so pkt 1 has the
+    // bracketing references available.
+    for o in iter_obus(&pkts[0]) {
+        let o = o.expect("iter pkt0");
+        if o.header.obu_type == ObuType::Frame {
+            let (fh, _) = parse_frame_obu_with_dpb(&seq, o.payload, &dpb).expect("pkt0 key");
+            if fh.frame_type == FrameType::Key {
+                dpb.reset();
+            }
+            if fh.refresh_frame_flags != 0 {
+                dpb.refresh(fh.refresh_frame_flags, fh.order_hint);
+            }
+        }
+    }
+
+    let mut frame_obu_count = 0u32;
+    for o in iter_obus(&pkts[1]) {
+        let o = o.expect("iter pkt1");
+        if o.header.obu_type != ObuType::Frame {
+            continue;
+        }
+        frame_obu_count += 1;
+        let r = parse_frame_obu_with_dpb(&seq, o.payload, &dpb);
+        assert!(
+            r.is_ok(),
+            "pkt 1 Frame OBU #{frame_obu_count} (offset={} plen={}) failed: {:?}",
+            o.offset,
+            o.payload.len(),
+            r.err()
+        );
+        let (fh, _) = r.unwrap();
+        if fh.refresh_frame_flags != 0 {
+            dpb.refresh(fh.refresh_frame_flags, fh.order_hint);
+        }
+    }
+    assert!(
+        frame_obu_count >= 5,
+        "pkt 1 should contain at least 5 Frame OBUs (the SkipMode overlay group); saw {frame_obu_count}"
+    );
+}
+
 fn super_clone_state(fs: &oxideav_av1::decode::FrameState) -> oxideav_av1::decode::FrameState {
     oxideav_av1::decode::FrameState {
         width: fs.width,

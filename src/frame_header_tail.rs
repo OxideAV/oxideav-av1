@@ -439,10 +439,18 @@ pub fn parse_lr_params(
         if seq.use_128x128_superblock {
             lr.log2_restoration_unit_size[0] = br.f(1)? as u8 + 7;
         } else {
-            lr.log2_restoration_unit_size[0] = br.f(1)? as u8 + 6;
-            if lr.log2_restoration_unit_size[0] == 6 {
-                lr.log2_restoration_unit_size[0] += br.f(1)? as u8;
-            }
+            // §5.9.20: lr_unit_shift f(1); if 1, read lr_unit_extra_shift
+            // f(1) and add. log2 = lr_unit_shift + 6.
+            //   shift=0 → 1 bit, log2=6
+            //   shift=1, extra=0 → 2 bits, log2=7
+            //   shift=1, extra=1 → 2 bits, log2=8
+            // Round 17: previous code read the extra bit when shift==0
+            // (inverted) and could never reach log2=8 — over-read by 1
+            // bit on every non-128 frame whose first plane uses
+            // restoration. SVT-AV1 SkipMode overlay frames tripped this.
+            let shift = br.f(1)? as u8;
+            let extra = if shift != 0 { br.f(1)? as u8 } else { 0 };
+            lr.log2_restoration_unit_size[0] = 6 + shift + extra;
         }
         if planes > 1 {
             if seq.color_config.subsampling_x && seq.color_config.subsampling_y && lr.uses_chroma_lr
