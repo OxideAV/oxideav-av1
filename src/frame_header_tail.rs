@@ -858,6 +858,40 @@ mod gm_tests {
         assert_eq!(br.bit_position(), 24);
     }
 
+    /// AFFINE GM with identity prev consumes exactly 26 bits at minimum
+    /// for slot 1 (3 type bits + 6 params × 4-bit minimum = 27 — but the
+    /// test allows variability). This locks down the read order spec-
+    /// compliance: alphas first (2,3,4,5), then translations (0,1).
+    ///
+    /// Used as a regression guard alongside the round-18 ROTZOOM test —
+    /// any reordering of the affine read sequence would either over- or
+    /// under-consume bits and break this expectation.
+    #[test]
+    fn affine_minimum_bit_count_for_identity_prev() {
+        // Slot 1 = AFFINE: type bits = 1 (is_global) + 0 (is_rot_zoom)
+        // + 0 (is_translation) → 3 bits. Then 6 params, each minimum 4
+        // bits via subexp_more_bits=0 + b2=3 read = 4 bits.
+        // Slot 1 total = 3 + 24 = 27 bits.
+        // Slots 2..=7 IDENTITY = 6 × 1 = 6 bits.
+        // Grand total = 33 bits → needs 5 bytes (40 bits) of zeros after
+        // the type prefix. Pack MSB-first:
+        //   100 000_0 000_0 000_0 000_0 000_0 000_0 000_0 0_000000
+        //   = 1000_0000 0000_0000 0000_0000 0000_0000 0000_0000
+        //   = 0x80 0x00 0x00 0x00 0x00
+        let payload = [0x80u8, 0x00, 0x00, 0x00, 0x00];
+        let mut br = BitReader::new(&payload);
+        let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
+        let mut gm_params = [[0i32; 6]; NUM_REF_FRAMES];
+        parse_global_motion_params(&mut br, &mut gm_type, &mut gm_params, false, None).unwrap();
+        assert_eq!(gm_type[1], GmType::Affine);
+        for slot in &gm_type[2..] {
+            assert_eq!(*slot, GmType::Identity);
+        }
+        // Bits consumed = 3 (slot 1 type) + 6 * 4 (slot 1 params) +
+        //                 6 * 1 (slots 2..=7 type) = 33 bits.
+        assert_eq!(br.bit_position(), 33);
+    }
+
     /// PrevGmParams plumbing: with a non-identity ref-anchor the
     /// `r = (PrevGmParams >> precDiff) - sub` math should produce a
     /// different `r` than the identity-default path, exercised here by

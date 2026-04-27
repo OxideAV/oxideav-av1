@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 19 — `tests/svtav1_chain_walk.rs` chain-walk diagnostic.
+  Walks every Frame OBU in `/tmp/av1_inter.ivf` with the §7.20
+  `Dpb::refresh_with_gm` chain wired through and asserts a
+  `parsed_ok ≥ 38 / total ≥ 44` floor; on failure it reports the
+  first-fail `(packet, frame#)`. The current SVT-AV1 fixture (48
+  Frame OBUs across 48 IVF packets) parses 38/48 cleanly; the 10
+  remaining frames all fail with `out of bits` inside
+  `parse_global_motion_params` for slot 2 (AFFINE) — investigation
+  notes captured inline in the test docstring + workspace README.
+  Skipped if the fixture is missing so CI without ffmpeg/libsvtav1
+  installed remains green.
+- round 19 — `frame_header_tail::gm_tests::affine_minimum_bit_count_for_identity_prev`
+  locks down the spec read order for AFFINE warps with the identity-
+  default `prev_gm_params`: 3 type bits + 6 params × 4-bit minimum
+  subexp + 6 trailing IDENTITY slots = exactly 33 consumed bits. Pairs
+  with the round-18 ROTZOOM regression guard so any future reordering
+  of `read_global_param_with_ref` in `parse_global_motion_params`
+  trips a focused unit test instead of only the integration-level
+  `svtav1_chain_walk_baseline_38_of_48` assertion.
+
 - round 16 — implement §5.11.38 `Subsampled_Size[][2][2]` table on
   `BlockSize` and route every chroma reconstruction (`reconstruct_inter_chroma_block`,
   `reconstruct_skip_mode_compound_chroma`, `reconstruct_chroma_block`)
