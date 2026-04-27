@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-av1/compare/v0.1.1...v0.1.2) - 2026-04-27
+
+### Other
+
+- round 19 — SVT-AV1 chain-walk diagnostic + AFFINE bit-count guard
+- round 18 — global_motion_params §5.9.24/.25 read order + abs_bits + PrevGmParams plumbing
+- round 17 — fix §5.9.2 ref_order_hint gating + §5.9.20 lr_unit_shift inversion
+- adopt slim VideoFrame/AudioFrame shape
+- round 16 — wire §5.11.38 Subsampled_Size + §7.13.3 dequant clips
+- round 15 — fix inverted §8.2.6 read_symbol (root-cause of all-128 luma)
+- round 14 — multi-ref DPB planes + SKIP_MODE compound MC (§7.20 / §7.11.3.9)
+- round 13 — derive skipModeAllowed from DPB OrderHint trail (§5.9.21)
+- round 12 — wire §5.11.10 read_skip_mode + §5.11.19 inter_segment_id
+- round 11 — §5.11.36 transform_tree walker for inter luma residual
+- round 11 — fix non-palette CDF wire format (extra.rs + lr.rs)
+- round 10 — palette mode end-to-end (§5.11.46 + §5.11.49 + §7.11.4)
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - round 19 — `tests/svtav1_chain_walk.rs` chain-walk diagnostic.
