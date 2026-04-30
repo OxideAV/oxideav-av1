@@ -240,12 +240,33 @@ pub fn parse_frame_obu_with_dpb<'a>(
     Ok((fh, &payload[header_bytes..]))
 }
 
+/// `AV1_TRACE_BITS=1` env-gated bit-position trace used to bisect
+/// uncompressed_header bit-account regressions. Returns `true` when
+/// the env var is set to a non-empty, non-"0" value. The check is
+/// performed lazily on each call (cheap; the eprintln branch is what
+/// matters). Off by default — zero overhead in production builds.
+fn av1_trace_bits() -> bool {
+    match std::env::var("AV1_TRACE_BITS") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
+}
+
 /// §5.9.1 uncompressed_header().
 fn parse_uncompressed_header(
     seq: &SequenceHeader,
     br: &mut BitReader<'_>,
     dpb: &Dpb,
 ) -> Result<FrameHeader> {
+    let trace = av1_trace_bits();
+    macro_rules! tp {
+        ($br:expr, $tag:literal) => {
+            if trace {
+                eprintln!("AV1_TRACE_BITS: {} bit_pos={}", $tag, $br.bit_position());
+            }
+        };
+    }
+    tp!(br, "enter_uncompressed_header");
     let id_len = if seq.frame_id_numbers_present {
         seq.additional_frame_id_length_minus_1 as u32 + seq.delta_frame_id_length_minus_2 as u32 + 3
     } else {
@@ -357,6 +378,7 @@ fn parse_uncompressed_header(
     } else {
         0
     };
+    tp!(br, "after_order_hint");
     let primary_ref_frame = if frame_type == FrameType::Key
         || frame_type == FrameType::IntraOnly
         || error_resilient_mode
@@ -365,6 +387,7 @@ fn parse_uncompressed_header(
     } else {
         br.f(3)?
     };
+    tp!(br, "after_primary_ref_frame");
 
     // Decoder model buffer-removal-time (§5.9.4): we skim the structure but
     // do not retain values.
@@ -387,6 +410,7 @@ fn parse_uncompressed_header(
     } else {
         br.f(8)? as u8
     };
+    tp!(br, "after_refresh_frame_flags");
 
     // §5.9.2 — ref_order_hint is gated by `error_resilient_mode &&
     // enable_order_hint` (under the outer `!FrameIsIntra ||
@@ -429,6 +453,7 @@ fn parse_uncompressed_header(
     };
     let (render_and_frame_size_different, render_width, render_height) =
         parse_render_size(br, frame_width, frame_height)?;
+    tp!(br, "after_render_size");
 
     // Align: from §5.9.5: allow_intrabc only when intra_only/key + allow_screen_content_tools
     let allow_intrabc = if (frame_type == FrameType::Key || frame_type == FrameType::IntraOnly)
@@ -448,6 +473,7 @@ fn parse_uncompressed_header(
     let mut is_motion_mode_switchable = false;
     let mut use_ref_frame_mvs = false;
     if frame_type == FrameType::Inter || frame_type == FrameType::Switch {
+        tp!(br, "before_frame_refs_block");
         // frame_refs_short_signaling
         let frame_refs_short_signaling = if seq.enable_order_hint {
             br.bit()?
@@ -455,10 +481,20 @@ fn parse_uncompressed_header(
             false
         };
         if frame_refs_short_signaling {
-            let _last = br.f(3)?;
-            let _golden = br.f(3)?;
-            // Real implementation runs set_frame_refs() to fill the rest;
-            // we don't emulate it.
+            let last_frame_idx = br.f(3)? as u8;
+            let gold_frame_idx = br.f(3)? as u8;
+            // §7.8 set_frame_refs(): compute the remaining
+            // ref_frame_idx[] entries from the DPB's RefOrderHint[]
+            // trail. Bit-neutral (no bitstream side effects) but lets
+            // the §7.20 PrevGmParams chain consult the correct slot
+            // for chained inter frames.
+            ref_frame_idx = set_frame_refs(
+                last_frame_idx,
+                gold_frame_idx,
+                order_hint,
+                seq.order_hint_bits,
+                dpb,
+            );
         }
         for v in ref_frame_idx.iter_mut() {
             if !frame_refs_short_signaling {
@@ -483,6 +519,7 @@ fn parse_uncompressed_header(
         } else {
             br.bit()?
         };
+        tp!(br, "after_frame_refs_block");
     }
 
     let disable_frame_end_update_cdf = if seq.reduced_still_picture_header || disable_cdf_update {
@@ -490,6 +527,7 @@ fn parse_uncompressed_header(
     } else {
         br.bit()?
     };
+    tp!(br, "after_disable_frame_end_update_cdf");
 
     // §5.9.15 tile_info() — comes immediately after
     // `disable_frame_end_update_cdf`. The decoding-process calls in between
@@ -497,22 +535,32 @@ fn parse_uncompressed_header(
     // bits from the stream.
     let (mi_cols, mi_rows) = mi_cols_rows(frame_width, frame_height);
     let tile_info = parse_tile_info(br, seq.use_128x128_superblock, mi_cols, mi_rows)?;
+    tp!(br, "after_tile_info");
 
     // §5.9.12 – §5.9.30 — the entire uncompressed-header tail.
     let quant = parse_quantization_params(br, seq)?;
+    tp!(br, "after_quant");
     let segmentation = parse_segmentation_params(br, primary_ref_frame)?;
+    tp!(br, "after_segmentation");
     let (delta_q_present, delta_q_res) = parse_delta_q_params(br, quant.base_q_idx)?;
+    tp!(br, "after_delta_q");
     let (delta_lf_present, delta_lf_res, delta_lf_multi) =
         parse_delta_lf_params(br, delta_q_present, allow_intrabc)?;
+    tp!(br, "after_delta_lf");
 
     let coded_lossless = coded_lossless_hint(&quant);
     let loop_filter = parse_loop_filter_params(br, seq, &quant, allow_intrabc)?;
+    tp!(br, "after_loop_filter");
     let cdef = parse_cdef_params(br, seq, &quant, allow_intrabc)?;
+    tp!(br, "after_cdef");
     let lr = parse_lr_params(br, seq, &quant, allow_intrabc)?;
+    tp!(br, "after_lr");
     let tx_mode = parse_tx_mode(br, coded_lossless)?;
+    tp!(br, "after_tx_mode");
 
     let frame_is_intra = matches!(frame_type, FrameType::Key | FrameType::IntraOnly);
     let reference_select = if frame_is_intra { false } else { br.bit()? };
+    tp!(br, "after_reference_select");
 
     // §5.9.21 / §5.9.22 — skip_mode_params. The derivation walks the
     // chosen reference frames' `OrderHint`s (sourced from the DPB's
@@ -532,6 +580,7 @@ fn parse_uncompressed_header(
         dpb,
     );
     let skip_mode_present = if skip_mode_allowed { br.bit()? } else { false };
+    tp!(br, "after_skip_mode_present");
 
     // §5.9.25 — allow_warped_motion. Present only when the sequence
     // header set `enable_warped_motion`, the frame is non-intra, and
@@ -542,8 +591,10 @@ fn parse_uncompressed_header(
         } else {
             false
         };
+    tp!(br, "after_allow_warped_motion");
 
     let reduced_tx_set = br.bit()?;
+    tp!(br, "after_reduced_tx_set");
 
     let mut gm_type = [GmType::Identity; NUM_REF_FRAMES];
     // §5.9.24: gm_params[ref][i] = (i % 3 == 2) ? 1<<WARPEDMODEL_PREC_BITS : 0
@@ -767,6 +818,197 @@ pub(crate) fn _bit_field_width_for(seq: &SequenceHeader) -> u32 {
     ceil_log2(seq.max_frame_width)
 }
 
+/// §7.8 set_frame_refs process — compute `ref_frame_idx[0..REFS_PER_FRAME]`
+/// from the explicitly-signalled `last_frame_idx` / `gold_frame_idx` plus
+/// the DPB's `RefOrderHint[]` trail. Used when `frame_refs_short_signaling
+/// = 1` in the uncompressed header (§5.9.2).
+///
+/// Reference name → `ref_frame_idx[]` index mapping (spec §3, indices
+/// shifted by `LAST_FRAME = 1`):
+///   - `LAST_FRAME` → 0
+///   - `LAST2_FRAME` → 1
+///   - `LAST3_FRAME` → 2
+///   - `GOLDEN_FRAME` → 3
+///   - `BWDREF_FRAME` → 4
+///   - `ALTREF2_FRAME` → 5
+///   - `ALTREF_FRAME` → 6
+///
+/// Algorithm (verbatim §7.8):
+///   1. Initialise every entry of `ref_frame_idx[]` to -1, then set
+///      LAST=last_frame_idx, GOLDEN=gold_frame_idx.
+///   2. Build `shiftedOrderHints[i] = curFrameHint + get_relative_dist(
+///      RefOrderHint[i], OrderHint)` with `curFrameHint = 1 <<
+///      (OrderHintBits - 1)`.
+///   3. ALTREF picks the latest backward (≥ curFrameHint) candidate.
+///   4. BWDREF picks the earliest backward.
+///   5. ALTREF2 picks the earliest remaining backward (post-BWDREF).
+///   6. The forward chain `Ref_Frame_List = {LAST2, LAST3, BWDREF,
+///      ALTREF2, ALTREF}` fills its still-unset entries with
+///      successively-later forward references (latest first).
+///   7. Any remaining unset slots take the global earliest output-
+///      order reference (§7.8 last paragraph).
+///
+/// Slots whose DPB entry is invalid (`!valid`) cannot be used for
+/// candidate selection (steps 3-7); the explicit LAST / GOLDEN slots
+/// are kept unconditionally per the literal spec text. The function
+/// is bit-neutral — it consumes no bitstream bits — and can be called
+/// safely for fixtures with empty / partial DPBs (returns all zeros
+/// for unfilled entries which matches the prior fallback behaviour).
+pub(crate) fn set_frame_refs(
+    last_frame_idx: u8,
+    gold_frame_idx: u8,
+    order_hint: u32,
+    order_hint_bits: u32,
+    dpb: &Dpb,
+) -> [u32; REFS_PER_FRAME] {
+    // §3 named indices (shifted by `- LAST_FRAME` to fit ref_frame_idx[]).
+    const LAST: usize = 0; // LAST_FRAME - LAST_FRAME
+    const GOLDEN: usize = 3; // GOLDEN_FRAME - LAST_FRAME
+    const BWDREF: usize = 4; // BWDREF_FRAME - LAST_FRAME
+    const ALTREF2: usize = 5; // ALTREF2_FRAME - LAST_FRAME
+    const ALTREF: usize = 6; // ALTREF_FRAME - LAST_FRAME
+
+    let mut ref_frame_idx: [i32; REFS_PER_FRAME] = [-1; REFS_PER_FRAME];
+    ref_frame_idx[LAST] = last_frame_idx as i32;
+    ref_frame_idx[GOLDEN] = gold_frame_idx as i32;
+
+    let mut used_frame = [false; NUM_REF_FRAMES];
+    if (last_frame_idx as usize) < NUM_REF_FRAMES {
+        used_frame[last_frame_idx as usize] = true;
+    }
+    if (gold_frame_idx as usize) < NUM_REF_FRAMES {
+        used_frame[gold_frame_idx as usize] = true;
+    }
+
+    // §7.8 falls back to all-zero ref_frame_idx[] (then explicit LAST /
+    // GOLDEN above) when OrderHint signalling is disabled. Without
+    // OrderHints we can't run the chain — short-circuit to leave the
+    // rest as `0` (the implicit "shared earliest" fallback).
+    if order_hint_bits == 0 {
+        let mut out = [0u32; REFS_PER_FRAME];
+        for (i, v) in out.iter_mut().enumerate() {
+            *v = ref_frame_idx[i].max(0) as u32;
+        }
+        return out;
+    }
+
+    let cur_frame_hint: i32 = 1 << (order_hint_bits - 1);
+    let mut shifted_order_hints = [0i32; NUM_REF_FRAMES];
+    for (i, slot) in dpb.slots.iter().enumerate() {
+        if slot.valid {
+            shifted_order_hints[i] =
+                cur_frame_hint + get_relative_dist(slot.order_hint, order_hint, order_hint_bits);
+        } else {
+            // Mark as "earlier than any valid frame" so that step 7's
+            // global earliest scan won't pick an invalid slot if any
+            // valid slot exists. We sentinel using i32::MIN.
+            shifted_order_hints[i] = i32::MIN;
+        }
+    }
+
+    // ALTREF: find_latest_backward — latest hint ≥ curFrameHint.
+    let mut latest_order_hint = i32::MIN;
+    let mut altref_ref: i32 = -1;
+    for (i, &hint) in shifted_order_hints.iter().enumerate() {
+        if used_frame[i] || !dpb.slots[i].valid {
+            continue;
+        }
+        if hint >= cur_frame_hint && (altref_ref < 0 || hint >= latest_order_hint) {
+            altref_ref = i as i32;
+            latest_order_hint = hint;
+        }
+    }
+    if altref_ref >= 0 {
+        ref_frame_idx[ALTREF] = altref_ref;
+        used_frame[altref_ref as usize] = true;
+    }
+
+    // BWDREF: find_earliest_backward — earliest hint ≥ curFrameHint.
+    let mut earliest_order_hint = i32::MAX;
+    let mut bwdref_ref: i32 = -1;
+    for (i, &hint) in shifted_order_hints.iter().enumerate() {
+        if used_frame[i] || !dpb.slots[i].valid {
+            continue;
+        }
+        if hint >= cur_frame_hint && (bwdref_ref < 0 || hint < earliest_order_hint) {
+            bwdref_ref = i as i32;
+            earliest_order_hint = hint;
+        }
+    }
+    if bwdref_ref >= 0 {
+        ref_frame_idx[BWDREF] = bwdref_ref;
+        used_frame[bwdref_ref as usize] = true;
+    }
+
+    // ALTREF2: find_earliest_backward (after BWDREF claim).
+    let mut earliest_order_hint = i32::MAX;
+    let mut altref2_ref: i32 = -1;
+    for (i, &hint) in shifted_order_hints.iter().enumerate() {
+        if used_frame[i] || !dpb.slots[i].valid {
+            continue;
+        }
+        if hint >= cur_frame_hint && (altref2_ref < 0 || hint < earliest_order_hint) {
+            altref2_ref = i as i32;
+            earliest_order_hint = hint;
+        }
+    }
+    if altref2_ref >= 0 {
+        ref_frame_idx[ALTREF2] = altref2_ref;
+        used_frame[altref2_ref as usize] = true;
+    }
+
+    // Forward fill in Ref_Frame_List order: LAST2, LAST3, BWDREF,
+    // ALTREF2, ALTREF (indices 1, 2, 4, 5, 6).
+    const REF_FRAME_LIST: [usize; 5] = [1, 2, BWDREF, ALTREF2, ALTREF];
+    for &slot in REF_FRAME_LIST.iter() {
+        if ref_frame_idx[slot] < 0 {
+            // find_latest_forward — latest hint < curFrameHint.
+            let mut latest_order_hint = i32::MIN;
+            let mut chosen: i32 = -1;
+            for (i, &hint) in shifted_order_hints.iter().enumerate() {
+                if used_frame[i] || !dpb.slots[i].valid {
+                    continue;
+                }
+                if hint < cur_frame_hint && (chosen < 0 || hint >= latest_order_hint) {
+                    chosen = i as i32;
+                    latest_order_hint = hint;
+                }
+            }
+            if chosen >= 0 {
+                ref_frame_idx[slot] = chosen;
+                used_frame[chosen as usize] = true;
+            }
+        }
+    }
+
+    // Final fallback — use the global earliest valid output-order slot
+    // for any still-unset entry (§7.8 last paragraph). When NO slots
+    // are valid we leave the unset entries at 0 (matches the prior
+    // fallback behaviour for empty-DPB / first-inter-frame edge cases).
+    let mut earliest_order_hint = i32::MAX;
+    let mut earliest: i32 = -1;
+    for (i, &hint) in shifted_order_hints.iter().enumerate() {
+        if !dpb.slots[i].valid {
+            continue;
+        }
+        if earliest < 0 || hint < earliest_order_hint {
+            earliest = i as i32;
+            earliest_order_hint = hint;
+        }
+    }
+    let mut out = [0u32; REFS_PER_FRAME];
+    for (i, v) in out.iter_mut().enumerate() {
+        if ref_frame_idx[i] >= 0 {
+            *v = ref_frame_idx[i] as u32;
+        } else if earliest >= 0 {
+            *v = earliest as u32;
+        } else {
+            *v = 0;
+        }
+    }
+    out
+}
+
 /// §5.9.21 / §7.9.2 — derive `(skipModeAllowed, SkipModeFrame[0..=1])`.
 ///
 /// Walks `ref_frame_idx[0..REFS_PER_FRAME]` looking up the per-slot
@@ -973,5 +1215,177 @@ mod skip_mode_tests {
         let (allowed, frames) = derive_skip_mode_allowed(false, true, true, 8, 4, &refs, &dpb);
         assert!(!allowed);
         assert_eq!(frames, [0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod set_frame_refs_tests {
+    use super::*;
+    use crate::dpb::RefSlot;
+
+    /// §7.8 — Empty DPB: no slot is valid, so both LAST and GOLDEN are
+    /// the explicitly-signalled indices and the rest fall back to 0
+    /// (the implicit "earliest valid" path is skipped). This matches
+    /// the prior all-zero ref_frame_idx[] fallback for first-inter-
+    /// frame edge cases.
+    #[test]
+    fn empty_dpb_keeps_explicit_last_and_golden_only() {
+        let dpb = Dpb::new();
+        let out = set_frame_refs(2, 5, 4, 7, &dpb);
+        assert_eq!(out[0], 2); // LAST_FRAME = last_frame_idx
+        assert_eq!(out[3], 5); // GOLDEN_FRAME = gold_frame_idx
+                               // ALTREF / BWDREF / ALTREF2 / LAST2 / LAST3 left at the
+                               // earliest fallback (= 0 when no valid slots).
+        for &v in out.iter() {
+            assert!(v < NUM_REF_FRAMES as u32);
+        }
+    }
+
+    /// §7.8 — Forward+backward DPB: cur=4 (OrderHintBits=3, range
+    /// 0..7). Slot 0 = past (hint=2), slot 1 = future (hint=6), slot 2
+    /// = future (hint=5), slot 3 = past (hint=1). last_frame_idx=0,
+    /// gold_frame_idx=3. ALTREF picks the latest backward (slot 1,
+    /// shifted hint = 4 + (6-4) = 6); BWDREF picks the earliest
+    /// backward of remaining (slot 2 with shifted hint=5); ALTREF2 has
+    /// no remaining backward.
+    #[test]
+    fn picks_latest_backward_for_altref_and_earliest_for_bwdref() {
+        let mut dpb = Dpb::new();
+        dpb.slots[0] = RefSlot {
+            order_hint: 2,
+            valid: true,
+            frame: None,
+            ..Default::default()
+        };
+        dpb.slots[1] = RefSlot {
+            order_hint: 6,
+            valid: true,
+            frame: None,
+            ..Default::default()
+        };
+        dpb.slots[2] = RefSlot {
+            order_hint: 5,
+            valid: true,
+            frame: None,
+            ..Default::default()
+        };
+        dpb.slots[3] = RefSlot {
+            order_hint: 1,
+            valid: true,
+            frame: None,
+            ..Default::default()
+        };
+        // last=0 (past), gold=3 (past). cur=4, OrderHintBits=3 (range 0..7).
+        let out = set_frame_refs(0, 3, 4, 3, &dpb);
+        assert_eq!(out[0], 0); // LAST_FRAME
+        assert_eq!(out[3], 3); // GOLDEN_FRAME
+                               // ALTREF (idx 6 in ref_frame_idx[]) = slot 1 (hint=6, latest
+                               // backward).
+        assert_eq!(out[6], 1);
+        // BWDREF (idx 4) = slot 2 (hint=5, earliest backward after
+        // ALTREF claimed slot 1).
+        assert_eq!(out[4], 2);
+    }
+
+    /// §7.8 — All-forward DPB (no backward refs): ALTREF / BWDREF /
+    /// ALTREF2 are NOT set in steps 3-5 (their "≥ curFrameHint" gate
+    /// fails). Step 6 fills them via Ref_Frame_List using
+    /// find_latest_forward.
+    #[test]
+    fn all_forward_dpb_falls_through_to_forward_chain() {
+        let mut dpb = Dpb::new();
+        // All slots are past references (hint < cur=4).
+        for (i, oh) in [0, 1, 2, 3].iter().enumerate() {
+            dpb.slots[i] = RefSlot {
+                order_hint: *oh,
+                valid: true,
+                frame: None,
+                ..Default::default()
+            };
+        }
+        let out = set_frame_refs(0, 3, 4, 3, &dpb);
+        assert_eq!(out[0], 0); // LAST
+        assert_eq!(out[3], 3); // GOLDEN
+                               // ALTREF (idx 6), BWDREF (idx 4), ALTREF2 (idx 5) and LAST2
+                               // (idx 1) / LAST3 (idx 2) all filled by find_latest_forward.
+                               // Each should point to a valid slot in 0..=3 (no out-of-range).
+        for &v in out.iter() {
+            assert!((v as usize) < 4);
+        }
+        // Ref_Frame_List order is [LAST2, LAST3, BWDREF, ALTREF2,
+        // ALTREF]. The first entry (LAST2) gets the LATEST remaining
+        // forward (slot 2 with hint=2, since slots 0 and 3 were claimed
+        // for LAST/GOLDEN).
+        assert_eq!(out[1], 2);
+        assert_eq!(out[2], 1);
+    }
+
+    /// §7.8 — `order_hint_bits == 0` short-circuit path. Without
+    /// OrderHints the chain search is meaningless; we keep the
+    /// explicit LAST/GOLDEN and leave the rest at 0.
+    #[test]
+    fn order_hint_disabled_short_circuits() {
+        let mut dpb = Dpb::new();
+        dpb.slots[3] = RefSlot {
+            order_hint: 0,
+            valid: true,
+            frame: None,
+            ..Default::default()
+        };
+        let out = set_frame_refs(2, 5, 0, 0, &dpb);
+        assert_eq!(out[0], 2);
+        assert_eq!(out[3], 5);
+        // Other slots remain 0 (the spec leaves ref_frame_idx[] at -1
+        // initially, and our impl resolves -1 → max(0) = 0).
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[4], 0);
+        assert_eq!(out[5], 0);
+        assert_eq!(out[6], 0);
+    }
+
+    /// Bit-neutrality: set_frame_refs is a pure function on (idx_bits,
+    /// OrderHints). It must NOT touch the bit reader. We can't test
+    /// that directly without a reader, but we verify that calling it
+    /// twice with the same inputs returns identical outputs.
+    #[test]
+    fn deterministic_for_identical_inputs() {
+        let mut dpb = Dpb::new();
+        dpb.slots[0] = RefSlot {
+            order_hint: 1,
+            valid: true,
+            frame: None,
+            ..Default::default()
+        };
+        dpb.slots[5] = RefSlot {
+            order_hint: 7,
+            valid: true,
+            frame: None,
+            ..Default::default()
+        };
+        let a = set_frame_refs(0, 5, 4, 3, &dpb);
+        let b = set_frame_refs(0, 5, 4, 3, &dpb);
+        assert_eq!(a, b);
+    }
+
+    /// `dpb.saved_gm_params_for(ref_frame_idx[primary_ref_frame])`
+    /// regression: with set_frame_refs the LAST_FRAME slot resolves
+    /// to `last_frame_idx` (not 0), so a non-zero `last_frame_idx`
+    /// supplied via short-signaling now points to the correct DPB slot
+    /// and `saved_gm_params_for` returns the warp matrix saved by that
+    /// reference frame.
+    #[test]
+    fn primary_ref_zero_picks_last_frame_idx_slot() {
+        let mut dpb = Dpb::new();
+        // Slot 5 is the "real" LAST_FRAME for this inter frame. Save
+        // a non-identity gm_params there so the test can verify the
+        // lookup is plumbed correctly.
+        let mut gm = [[0i32; 6]; NUM_REF_FRAMES];
+        gm[1] = [123, 456, 1 << 16, 0, 0, 1 << 16];
+        dpb.refresh_with_gm(1 << 5, 4, None, &gm);
+        let out = set_frame_refs(5, 0, 4, 3, &dpb);
+        assert_eq!(out[0], 5); // LAST_FRAME -> slot 5
+        let saved = dpb.saved_gm_params_for(out[0] as usize).expect("slot 5");
+        assert_eq!(saved[1], [123, 456, 1 << 16, 0, 0, 1 << 16]);
     }
 }

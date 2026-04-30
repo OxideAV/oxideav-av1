@@ -501,6 +501,15 @@ pub fn parse_global_motion_params(
     allow_high_precision_mv: bool,
     prev_gm_params: Option<&[[i32; 6]; NUM_REF_FRAMES]>,
 ) -> Result<()> {
+    let trace = std::env::var("AV1_TRACE_BITS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if trace {
+        eprintln!(
+            "AV1_TRACE_BITS: enter parse_global_motion_params bit_pos={}",
+            br.bit_position()
+        );
+    }
     // §5.9.24 — initialise gm_params[] to the identity default so any
     // ref slot left at IDENTITY (or whose alpha params we derive
     // implicitly for ROTZOOM) carries the spec-mandated identity matrix.
@@ -509,6 +518,13 @@ pub fn parse_global_motion_params(
         *slot = [0, 0, identity_alpha, 0, 0, identity_alpha];
     }
     for (i, slot) in gm_type_out.iter_mut().enumerate().skip(1) {
+        if trace {
+            eprintln!(
+                "AV1_TRACE_BITS: gm slot {} entry bit_pos={}",
+                i,
+                br.bit_position()
+            );
+        }
         let is_global = br.bit()?;
         let typ = if is_global {
             let is_rot_zoom = br.bit()?;
@@ -526,6 +542,14 @@ pub fn parse_global_motion_params(
             GmType::Identity
         };
         *slot = typ;
+        if trace {
+            eprintln!(
+                "AV1_TRACE_BITS: gm slot {} type={:?} bit_pos={}",
+                i,
+                typ,
+                br.bit_position()
+            );
+        }
         // Per §5.9.25 the per-idx subexp reference is
         //   r = (PrevGmParams[ref][idx] >> precDiff) - sub
         // where `PrevGmParams` was either reset to identity by
