@@ -101,43 +101,63 @@ for t in &tiles {
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-## Inverse transform — round 22
+## Inverse transform — round 23
 
-The inverse-2D dispatcher now ships **two** entry points:
+The inverse-2D dispatcher ships **two** entry points:
 
-- `transform::inverse_2d` — the original PSNR-tuned path used by
-  `decode/superblock.rs`; preserved verbatim (legacy IDTX magnitudes,
-  bucketed post-2D `inverse_shift`).
-- `transform::inverse_2d_spec` — the spec-faithful §7.13.3
-  implementation. Per-shape `Transform_Row_Shift[TX_SIZES_ALL]`
-  applied between row and column passes, constant `colShift = 4`
-  after the column pass, and the rectangular
-  `Round2(T[j] * 2896, 12)` per-element pre-row scale fired only for
-  `|log2W - log2H| == 1` (the 2:1 aspect shapes — Tx4x8/Tx8x4/Tx8x16/
-  Tx16x8/Tx16x32/Tx32x16/Tx32x64/Tx64x32). The 1:4 / 4:1 shapes
-  (Tx4x16/Tx16x4/Tx8x32/Tx32x8/Tx16x64/Tx64x16) and squares correctly
-  skip the 2896 scale per spec. Identity 1-D kernels dispatch through
-  the new `transform::idtx_spec` module that ships the spec
-  magnitudes (`Round2(T*5793, 12)` ≈ ×√2 at length 4, ×2 at 8,
+- `transform::inverse_2d_spec` — the **live** path used by
+  `decode/superblock.rs` since round 23. Spec-faithful §7.13.3
+  implementation: per-shape `Transform_Row_Shift[TX_SIZES_ALL]` applied
+  between row and column passes, constant `colShift = 4` after the
+  column pass, and the rectangular `Round2(T[j] * 2896, 12)`
+  per-element pre-row scale fired only for `|log2W - log2H| == 1`
+  (the 2:1 aspect shapes — Tx4x8/Tx8x4/Tx8x16/Tx16x8/Tx16x32/Tx32x16/
+  Tx32x64/Tx64x32). The 1:4 / 4:1 shapes (Tx4x16/Tx16x4/Tx8x32/
+  Tx32x8/Tx16x64/Tx64x16) and squares correctly skip the 2896 scale
+  per spec. Identity 1-D kernels dispatch through the
+  `transform::idtx_spec` module that ships the spec magnitudes
+  (`Round2(T*5793, 12)` ≈ ×√2 at length 4, ×2 at 8,
   `Round2(T*11586, 12)` ≈ ×2√2 at 16, ×4 at 32) per
   §7.13.2.11/12/13/14, replacing the uniform-`<<= 1` legacy variants
-  on the new path. The new path drops the `flip_1d` wrapper used by
+  on the new path. The path drops the `flip_1d` wrapper used by
   `inverse_2d` for FLIPADST kernels: `iflipadst*` already reverses
   its own output, so wrapping pre-flip + post-flip cancelled the
   kernel's reverse and produced `IADST(reverse(input))` instead of
   the spec-equivalent `reverse(IADST(input))`.
+- `transform::inverse_2d` — legacy 2D entry that performs row/column
+  passes without per-pass round-shifts. Preserved as a reference
+  implementation (used by the `inverse_transform_add` smoke-test
+  wrapper and as the equivalence target in
+  `round23_inverse_2d_spec_matches_legacy_for_aligned_squares`,
+  which pins byte-for-byte agreement with the spec path on Tx4x4
+  and Tx32x32 squares).
 
-Caller migration (switching `decode/superblock.rs` to
-`inverse_2d_spec`) needs the per-shape `residual_shift` accounting
-revised in tandem and is deferred to a follow-up round; the new path
-is exercised by 9 unit tests covering: the row-shift table verbatim;
-spec coverage of every TX_TYPE × TX_SIZE pair the bitstream may carry
-(159 of 323 — full INTER_1 set on Sqr_Up≤16, INTER_3 on Sqr_Up=32,
-DCTONLY on Sqr_Up=64); the rectangular 2896 trigger gate; DC-constant
-reconstruction across all 14 rectangular shapes; spec IDTX magnitudes;
-the iflipadst-equals-reverse-iadst invariant; and the
-spec-disallowed kernel rejection set (Adst@32/64, FlipAdst@32/64,
-Idtx@64, Wht@non-4).
+Round-23 caller migration: all four `decode/superblock.rs` call sites
+(intra Y DCT-only path, intra chroma DCT-only path, intra Y arbitrary
+TX_TYPE with DctDct fallback, intra chroma DCT-only chroma path) now
+dispatch through `inverse_2d_spec`. The legacy
+`residual_shift`/`round_shift` post-2D scaling that compensated for
+`inverse_2d`'s lack of per-pass shifts is removed in tandem — the
+spec path bakes those shifts into the kernel itself, so leaving the
+post-call shift in would double-shift and crater PSNR. Sacred
+invariants (`svtav1_skip_mode_compound_decodes_real_pixels`,
+`svtav1_chain_walk_round21_full_pass`, `svt_av1_intra_psnr_vs_reference`)
+all pass post-migration. Intra-fixture luma PSNR vs the libdav1d
+reference moved 8.85 dB → 9.49 dB on `tests/fixtures/svt_av1_intra_64.ivf`
+(slight improvement; the headroom is bounded by upstream palette /
+lookahead / edge-filter work still pending).
+
+The transform module now carries 13 unit tests covering: the
+row-shift table verbatim; spec coverage of every TX_TYPE × TX_SIZE
+pair the bitstream may carry (159 of 323 — full INTER_1 set on
+Sqr_Up≤16, INTER_3 on Sqr_Up=32, DCTONLY on Sqr_Up=64); the
+rectangular 2896 trigger gate; DC-constant reconstruction across all
+14 rectangular shapes; spec IDTX magnitudes; the
+iflipadst-equals-reverse-iadst invariant; the spec-disallowed kernel
+rejection set (Adst@32/64, FlipAdst@32/64, Idtx@64, Wht@non-4); and
+(round 23) the legacy/spec equivalence on Tx4x4 + Tx32x32 with
+non-trivial coefficients plus a compile-time witness pinning the
+spec entry-point signature that `decode/superblock.rs` imports.
 
 ## SVT-AV1 chain status
 

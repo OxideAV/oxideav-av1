@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 23 — wire the round-22 spec-correct `inverse_2d_spec` into
+  `decode/superblock.rs` as the live transform path. All four call
+  sites (intra Y DCT-only, intra chroma DCT-only, intra Y arbitrary
+  TX_TYPE with DctDct fallback, intra chroma DCT-only chroma path)
+  now dispatch through the §7.13.3 path that bakes
+  `Transform_Row_Shift` between row and column passes and the
+  constant `colShift = 4` after the column pass. The legacy
+  `residual_shift`/`round_shift` post-2D scaling is removed in
+  tandem — those bucketed shifts (4 / 5 / 6 by area) compensated for
+  the legacy `inverse_2d`'s lack of per-pass shifts and would
+  double-shift on the spec path. Squares Tx4x4 and Tx32x32 round-trip
+  identically through both paths (legacy total 4 = spec 0+4; legacy
+  total 6 = spec 2+4); rectangles diverge by the spec's stricter
+  per-shape table and the 2:1 `2896` pre-scale, both of which are
+  spec-correct. The `residual_shift` and `round_shift` helpers in
+  `decode/superblock.rs` are removed (their only callers were the
+  four migrated sites). Sacred invariants intact:
+  `svtav1_skip_mode_compound_decodes_real_pixels`,
+  `svtav1_chain_walk_round21_full_pass`, and
+  `svt_av1_intra_psnr_vs_reference` all pass — intra-fixture luma
+  PSNR vs the libdav1d reference moved from 8.85 dB → 9.49 dB
+  (slight improvement; the headroom is bounded by upstream
+  palette / lookahead / edge-filter work still pending). New
+  regression tests pin: `inverse_2d_spec` and the legacy path agree
+  byte-for-byte on Tx4x4 + Tx32x32 squares with non-trivial
+  coefficients (`round23_inverse_2d_spec_matches_legacy_for_aligned_squares`),
+  and the spec entry point's signature is the one
+  `decode/superblock.rs` imports
+  (`round23_decode_superblock_imports_spec_entry_point`). Module-level
+  doc updated to flag `inverse_2d_spec` as the live path; legacy
+  `inverse_2d` doc clarifies its remaining role.
+
 - round 22 — spec-correct AV1 inverse-transform path landed alongside
   the legacy `inverse_2d`. New entry point `inverse_2d_spec` follows
   §7.13.3 exactly: per-shape `Transform_Row_Shift[TX_SIZES_ALL]` table

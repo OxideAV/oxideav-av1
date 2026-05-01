@@ -86,7 +86,7 @@ use crate::predict::intra::{
     smooth_v_pred16, v_pred, v_pred16,
 };
 use crate::quant;
-use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d, TxSize, TxType};
+use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d_spec, TxSize, TxType};
 
 use super::block::{
     block_size_from_wh, block_size_log, half_below_size, horz4_size, quarter_size, vert4_size,
@@ -1575,11 +1575,10 @@ fn inter_luma_residual_tu(
     for (i, c) in coeffs.iter_mut().enumerate() {
         *c = dequant_coeff(*c, i, qv);
     }
-    inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
-    let shift = residual_shift(w, h);
-    for v in coeffs.iter_mut() {
-        *v = round_shift(*v, shift);
-    }
+    // Round 23: spec-correct path applies per-shape Transform_Row_Shift
+    // between row and column passes plus colShift = 4 after the column
+    // pass (§7.13.3) — caller no longer applies a separate post-2D shift.
+    inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
     if fs.bit_depth == 8 {
         let mut block = vec![0u8; w * h];
         extract_block(
@@ -1765,11 +1764,9 @@ fn reconstruct_inter_chroma_block(
         for (i, c) in coeffs.iter_mut().enumerate() {
             *c = dequant_coeff(*c, i, qv);
         }
-        inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
-        let shift = residual_shift(cw_clip, ch_clip);
-        for v in coeffs.iter_mut() {
-            *v = round_shift(*v, shift);
-        }
+        // Round 23: spec path bakes per-shape row/col shifts into the
+        // 2D transform; no separate residual_shift required.
+        inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
         if fs.bit_depth == 8 {
             let mut block = vec![0u8; cw_clip * ch_clip];
             let plane_buf = if plane_idx == 0 {
@@ -2204,18 +2201,16 @@ fn reconstruct_one_luma_tx_unit(
         *c = dequant_coeff(*c, i, qv);
     }
 
-    if let Err(e) = inverse_2d(&mut coeffs, tx_type, sz) {
+    // Round 23: spec-correct 2D transform — bakes Transform_Row_Shift +
+    // colShift = 4 inside, so no separate post-2D residual_shift.
+    if let Err(e) = inverse_2d_spec(&mut coeffs, tx_type, sz) {
         if matches!(e, Error::Unsupported(_)) {
-            inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
+            inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
         } else {
             return Err(e);
         }
     }
 
-    let shift = residual_shift(tx_w, tx_h);
-    for v in coeffs.iter_mut() {
-        *v = round_shift(*v, shift);
-    }
     if fs.bit_depth == 8 {
         let mut block = vec![0u8; tx_w * tx_h];
         extract_block(&fs.y_plane, stride, ux, uy, tx_w, tx_h, &mut block);
@@ -2583,12 +2578,9 @@ fn reconstruct_one_chroma_tx_unit(
         *c = dequant_coeff(*c, i, qv);
     }
 
-    inverse_2d(&mut coeffs, TxType::DctDct, sz)?;
-
-    let shift = residual_shift(tx_w, tx_h);
-    for v in coeffs.iter_mut() {
-        *v = round_shift(*v, shift);
-    }
+    // Round 23: spec-correct 2D transform — bakes Transform_Row_Shift +
+    // colShift = 4 inside, so no separate post-2D residual_shift.
+    inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
 
     if fs.bit_depth == 8 {
         let mut block = vec![0u8; tx_w * tx_h];
@@ -3229,20 +3221,6 @@ fn dequant_coeff(level: i32, pos: usize, qv: quant::Values) -> i32 {
         1i32 << lim_shift
     };
     raw.clamp(-lim, lim - 1)
-}
-
-/// Round-shift used to scale the residual back to the pixel domain.
-fn residual_shift(w: usize, h: usize) -> u32 {
-    crate::transform::inverse_shift(w, h)
-}
-
-#[inline]
-fn round_shift(x: i32, n: u32) -> i32 {
-    if n == 0 {
-        x
-    } else {
-        (x + (1 << (n - 1))) >> n
-    }
 }
 
 /// Compute the segment-adjusted base quantizer index used by per-block
