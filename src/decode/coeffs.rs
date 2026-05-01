@@ -14,7 +14,9 @@
 //! All CDFs come from [`crate::cdfs`]; the coefficient-context
 //! derivation lives in [`super::coeff_ctx`]. The output of
 //! [`decode_coefficients`] is a row-major `w × h` signed `i32` block
-//! suitable for `inverse_2d`.
+//! suitable for [`crate::transform::inverse_2d_spec`] (the live r23
+//! spec-correct §7.13.3 path; the legacy [`crate::transform::inverse_2d`]
+//! is preserved only for reference equivalence tests).
 
 use oxideav_core::{Error, Result};
 

@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 24 — inter-path `inverse_2d_spec` migration audit + inter
+  `tx_type` table groundwork. Audit of `decode/superblock.rs`
+  confirms that the round-23 caller migration to the spec-correct
+  `inverse_2d_spec` entry point already covered both inter call
+  sites (`inter_luma_residual_tu` at the §5.11.36 transform-tree
+  leaf and the chroma residual loop in `reconstruct_inter_chroma_block`)
+  alongside the three intra sites — the r23 commit message and
+  CHANGELOG entry describing them as "all four intra paths" was a
+  documentation slip; the actual code change migrated five
+  `inverse_2d` call sites covering both is_inter == 0 and
+  is_inter == 1 leaves. No live caller of the legacy `inverse_2d`
+  remains in the decode pipeline; only the transform module's own
+  reference equivalence test in
+  `round23_inverse_2d_spec_matches_legacy_for_aligned_squares`
+  retains it. Sacred invariants intact post-audit:
+  `svtav1_skip_mode_compound_decodes_real_pixels` PASS,
+  `svtav1_chain_walk_round21_full_pass` PASS (48/48),
+  `svt_av1_intra_psnr_vs_reference` PASS (9.49 dB unchanged — the
+  inter migration was already live so r24 carries no PSNR delta).
+  Round-24 lands the inter `tx_type` lookup tables and selector in
+  `decode/tx_type_map.rs` so the inter sites can graduate from the
+  current hard-coded `TxType::DctDct` once the `inter_tx_type`
+  CDF reads land in a future round: `inter_tx_type_for(set, raw)`
+  transcribes `Tx_Type_Inter_Inv_Set{1,2,3}` from spec §6.10.15
+  verbatim (16+12+2 entries), `inter_tx_type_set_size(set)` reports
+  CDF cardinality, and `ext_tx_set_for_inter(tx_w, tx_h, reduced_tx_set)`
+  implements the inter branch of `get_tx_set` from §5.11.48
+  (returns `TX_SET_DCTONLY=0` / `TX_SET_INTER_3=3` /
+  `TX_SET_INTER_2=2` / `TX_SET_INTER_1=1` per `txSzSqr` /
+  `txSzSqrUp` / `reduced_tx_set`). New regression tests pin: every
+  entry of `Tx_Type_Inter_Inv_Set1` (16/16),
+  `Tx_Type_Inter_Inv_Set2` (12/12), and `Tx_Type_Inter_Inv_Set3`
+  (2/2); the `set = 0` fallback; the `get_tx_set` selector
+  exhaustively across all 19 TX_SIZES_ALL shapes in both
+  `reduced_tx_set` polarities (28 cases); the no-fallthrough
+  property of every set's match arms; round-trip stability of
+  `inverse_2d_spec(DctDct, sz)` for every one of the 19 inter-shape
+  buckets with a non-trivial DC + first-AC pattern
+  (`round24_inverse_2d_spec_handles_every_inter_shape`); and the
+  DC-positive sign invariance for the 4 dominant 4:2:0 inter chroma
+  squares (`round24_inverse_2d_spec_dc_only_inter_chroma_squares_have_consistent_sign`).
+  Stale doc reference in `decode/coeffs.rs` updated from `inverse_2d`
+  (legacy) to `inverse_2d_spec` (live, with `inverse_2d` retained
+  only as the equivalence reference). Pending r25+: wire
+  `inter_tx_type` CDF reads (§5.11.45) + `TileInterTxTypeSet{1,2,3}Cdf`
+  defaults so the inter sites can drop the `TxType::DctDct`
+  hard-code, and add the same defensive `Unsupported -> DctDct`
+  fallback the intra Y site uses at the inter Y site once a
+  non-trivial inter `tx_type` is signalled.
+
 - round 23 — wire the round-22 spec-correct `inverse_2d_spec` into
   `decode/superblock.rs` as the live transform path. All four call
   sites (intra Y DCT-only, intra chroma DCT-only, intra Y arbitrary

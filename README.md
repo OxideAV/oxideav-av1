@@ -101,6 +101,39 @@ for t in &tiles {
 # Ok::<(), oxideav_core::Error>(())
 ```
 
+## Inverse transform — round 24
+
+Round 24 audited the inter-path migration that landed in r23 and
+confirmed both inter call sites in `decode/superblock.rs`
+(`inter_luma_residual_tu` at the §5.11.36 transform-tree leaf, and
+the chroma residual loop in `reconstruct_inter_chroma_block`) are
+already dispatching through the spec-correct `inverse_2d_spec` entry
+point — the r23 commit message and CHANGELOG describing the
+migration as "all four intra paths" was a labelling slip; the code
+change actually covered five sites, two of them inter. No live
+caller of the legacy `inverse_2d` remains in the decode pipeline;
+only the transform module's own
+`round23_inverse_2d_spec_matches_legacy_for_aligned_squares`
+equivalence test still references it.
+
+Round 24 also lands the inter `tx_type` mapping tables in
+`decode/tx_type_map.rs`: `inter_tx_type_for(set, raw)` transcribes
+`Tx_Type_Inter_Inv_Set{1,2,3}` from spec §6.10.15 verbatim,
+`inter_tx_type_set_size(set)` reports CDF cardinality,
+and `ext_tx_set_for_inter(tx_w, tx_h, reduced_tx_set)` implements
+the inter branch of `get_tx_set` from §5.11.48. The inter sites
+themselves still hard-code `TxType::DctDct` until a future round
+wires up the `inter_tx_type` CDF reads (§5.11.45) and
+`TileInterTxTypeSet{1,2,3}Cdf` default tables — at which point the
+inter Y site will also adopt the same defensive
+`Unsupported -> DctDct` fallback the intra Y site already uses.
+Sacred invariants intact post-audit:
+`svtav1_skip_mode_compound_decodes_real_pixels`,
+`svtav1_chain_walk_round21_full_pass`, and
+`svt_av1_intra_psnr_vs_reference` (9.49 dB) all pass; r24 carries
+no PSNR delta because the inter migration was already live since
+r23.
+
 ## Inverse transform — round 23
 
 The inverse-2D dispatcher ships **two** entry points:

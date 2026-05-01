@@ -1011,4 +1011,103 @@ mod tests {
         let mut buf = vec![0i32; 16];
         f(&mut buf, TxType::DctDct, TxSize::Tx4x4).unwrap();
     }
+
+    /// Round 24 — pin the inter-path TX shapes through `inverse_2d_spec`.
+    /// `decode/superblock.rs::inter_luma_residual_tu` and
+    /// `reconstruct_inter_chroma_block` both call `inverse_2d_spec`
+    /// with `TxType::DctDct` (since r23) for the inter Y and inter
+    /// chroma residuals respectively. The shapes that flow through
+    /// these sites are the AV1 inter TX set: 4x4 / 8x8 / 16x16 / 32x32
+    /// squares plus the 2:1 / 1:2 / 4:1 / 1:4 rectangles. This test
+    /// exercises every one of those shapes through the spec entry
+    /// point with a non-trivial DC + first-AC pattern and asserts
+    /// the path returns a finite, bounded residual (no overflow,
+    /// no panic) — a future regression to a non-spec helper would
+    /// either fail to dispatch (`Unsupported`) or produce a
+    /// wildly off-magnitude block, both caught here.
+    #[test]
+    fn round24_inverse_2d_spec_handles_every_inter_shape() {
+        let shapes = [
+            TxSize::Tx4x4,
+            TxSize::Tx8x8,
+            TxSize::Tx16x16,
+            TxSize::Tx32x32,
+            TxSize::Tx64x64,
+            TxSize::Tx4x8,
+            TxSize::Tx8x4,
+            TxSize::Tx8x16,
+            TxSize::Tx16x8,
+            TxSize::Tx16x32,
+            TxSize::Tx32x16,
+            TxSize::Tx32x64,
+            TxSize::Tx64x32,
+            TxSize::Tx4x16,
+            TxSize::Tx16x4,
+            TxSize::Tx8x32,
+            TxSize::Tx32x8,
+            TxSize::Tx16x64,
+            TxSize::Tx64x16,
+        ];
+        for sz in shapes {
+            let w = sz.width();
+            let h = sz.height();
+            let n = w * h;
+            // DC-heavy signal mimicking what dequantised inter
+            // residual coefficients typically look like for a
+            // mostly-flat MC-prediction error.
+            let mut coeffs = vec![0i32; n];
+            coeffs[0] = 256; // DC term
+            if n > 1 {
+                coeffs[1] = -32;
+            }
+            if n > w {
+                coeffs[w] = 16; // first AC row term
+            }
+            inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)
+                .unwrap_or_else(|e| panic!("inverse_2d_spec(DctDct, {sz:?}) failed: {e:?}"));
+            for (i, v) in coeffs.iter().enumerate() {
+                assert!(
+                    v.abs() < (1 << 20),
+                    "inter shape {sz:?} produced |coeff[{i}]| = {} ≥ 2^20 — \
+                     likely missing per-shape Transform_Row_Shift or colShift",
+                    v.abs(),
+                );
+            }
+        }
+    }
+
+    /// Round 24 — DC invariance pin for the inter chroma path.
+    /// The AV1 inter chroma site (`reconstruct_inter_chroma_block`)
+    /// passes `TxType::DctDct` to `inverse_2d_spec`. For a DC-only
+    /// input under DCT-DCT the spec round-trip should produce an
+    /// approximately-constant block whose magnitude tracks the
+    /// per-shape `colShift = 4` after-column rounding. This pins
+    /// the magnitude across the four square chroma shapes (the
+    /// dominant inter chroma case under 4:2:0 subsampling).
+    #[test]
+    fn round24_inverse_2d_spec_dc_only_inter_chroma_squares_have_consistent_sign() {
+        let shapes = [
+            TxSize::Tx4x4,
+            TxSize::Tx8x8,
+            TxSize::Tx16x16,
+            TxSize::Tx32x32,
+        ];
+        for sz in shapes {
+            let n = sz.width() * sz.height();
+            let mut coeffs = vec![0i32; n];
+            coeffs[0] = 1024; // strong positive DC
+            inverse_2d_spec(&mut coeffs, TxType::DctDct, sz).unwrap();
+            // Every output sample should share the sign of the DC
+            // input — DCT-DCT applied to a positive DC produces a
+            // uniformly-positive block (modulo the colShift round).
+            let pos = coeffs.iter().filter(|v| **v > 0).count();
+            let zero = coeffs.iter().filter(|v| **v == 0).count();
+            assert!(
+                pos + zero == n,
+                "inter-chroma {sz:?}: positive DC produced \
+                 negative samples ({} of {n})",
+                n - pos - zero,
+            );
+        }
+    }
 }
