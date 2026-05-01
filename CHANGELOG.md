@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 22 — spec-correct AV1 inverse-transform path landed alongside
+  the legacy `inverse_2d`. New entry point `inverse_2d_spec` follows
+  §7.13.3 exactly: per-shape `Transform_Row_Shift[TX_SIZES_ALL]` table
+  applied between row and column passes, constant `colShift = 4` after
+  the column pass, and the rectangular `Round2(T[j] * 2896, 12)`
+  per-element pre-row scale fired only for `|log2W - log2H| == 1`
+  (the 2:1 aspect shapes — Tx4x8/Tx8x4/Tx8x16/Tx16x8/Tx16x32/Tx32x16/
+  Tx32x64/Tx64x32). 1:4 and 4:1 shapes (Tx4x16/Tx16x4/Tx8x32/Tx32x8/
+  Tx16x64/Tx64x16) and squares correctly skip it. New
+  `transform/idtx_spec.rs` module ships the spec-magnitude IDTX
+  kernels (`idtx4_spec`: `Round2(T*5793, 12)` ≈ ×√2;
+  `idtx8_spec`: ×2; `idtx16_spec`: `Round2(T*11586, 12)` ≈ ×2√2;
+  `idtx32_spec`: ×4) per §7.13.2.11/12/13/14, replacing the
+  uniform-`<<= 1` legacy variants on the new path. The new path also
+  drops the redundant `flip_1d` wrapper used by `inverse_2d` for
+  FLIPADST kernels — `iflipadst*` already reverses its own output, so
+  wrapping with pre-flip + post-flip cancelled the kernel's reverse
+  and produced `IADST(reverse(input))` instead of the spec-equivalent
+  `reverse(IADST(input))`. The legacy `inverse_2d` is preserved
+  verbatim because its callers in `decode/superblock.rs` are
+  PSNR-calibrated against the legacy IDTX magnitudes and the bucketed
+  post-2D `inverse_shift`; switching them over to `inverse_2d_spec`
+  needs the per-shape `residual_shift` accounting revised in tandem
+  and is deferred to the caller-migration round. New tests pin: the
+  full `Transform_Row_Shift` table verbatim
+  (`transform_row_shift_matches_spec_table`); every spec-allowed
+  TX_TYPE × TX_SIZE pair (159 of 323 — 9 sizes × 16 types in the
+  full INTER_1 set + 5 sizes × 2 types in INTER_3 + 5 sizes × 1 type
+  in DCTONLY — `inverse_2d_spec_covers_every_spec_allowed_pair`);
+  spec-correct IDTX magnitudes per length (`idtx4_spec_unit_and_scale`,
+  `idtx16_spec_unit_and_scale`, `idtx32_spec_quadruples_each_sample`);
+  the rectangular 2896 trigger gate
+  (`inverse_2d_spec_rect_2896_pre_scale_only_2to1`); DC-constant
+  reconstruction across all 14 rectangular shapes
+  (`inverse_2d_spec_dct_dc_constant_across_all_rectangles`); the
+  `iflipadst4 == reverse(iadst4)` invariant
+  (`inverse_2d_spec_flipadst_uses_kernel_internal_reverse`); and the
+  spec-disallowed kernel rejection set
+  (`inverse_2d_spec_rejects_disallowed_kernels`).
 - round 21 — fix §5.9.2 inter-branch ORDER: `frame_size()` and
   `render_size()` now run AFTER the `ref_frame_idx[]` loop, not
   before. The previous ordering happened to consume the same total

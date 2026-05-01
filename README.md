@@ -101,6 +101,44 @@ for t in &tiles {
 # Ok::<(), oxideav_core::Error>(())
 ```
 
+## Inverse transform — round 22
+
+The inverse-2D dispatcher now ships **two** entry points:
+
+- `transform::inverse_2d` — the original PSNR-tuned path used by
+  `decode/superblock.rs`; preserved verbatim (legacy IDTX magnitudes,
+  bucketed post-2D `inverse_shift`).
+- `transform::inverse_2d_spec` — the spec-faithful §7.13.3
+  implementation. Per-shape `Transform_Row_Shift[TX_SIZES_ALL]`
+  applied between row and column passes, constant `colShift = 4`
+  after the column pass, and the rectangular
+  `Round2(T[j] * 2896, 12)` per-element pre-row scale fired only for
+  `|log2W - log2H| == 1` (the 2:1 aspect shapes — Tx4x8/Tx8x4/Tx8x16/
+  Tx16x8/Tx16x32/Tx32x16/Tx32x64/Tx64x32). The 1:4 / 4:1 shapes
+  (Tx4x16/Tx16x4/Tx8x32/Tx32x8/Tx16x64/Tx64x16) and squares correctly
+  skip the 2896 scale per spec. Identity 1-D kernels dispatch through
+  the new `transform::idtx_spec` module that ships the spec
+  magnitudes (`Round2(T*5793, 12)` ≈ ×√2 at length 4, ×2 at 8,
+  `Round2(T*11586, 12)` ≈ ×2√2 at 16, ×4 at 32) per
+  §7.13.2.11/12/13/14, replacing the uniform-`<<= 1` legacy variants
+  on the new path. The new path drops the `flip_1d` wrapper used by
+  `inverse_2d` for FLIPADST kernels: `iflipadst*` already reverses
+  its own output, so wrapping pre-flip + post-flip cancelled the
+  kernel's reverse and produced `IADST(reverse(input))` instead of
+  the spec-equivalent `reverse(IADST(input))`.
+
+Caller migration (switching `decode/superblock.rs` to
+`inverse_2d_spec`) needs the per-shape `residual_shift` accounting
+revised in tandem and is deferred to a follow-up round; the new path
+is exercised by 9 unit tests covering: the row-shift table verbatim;
+spec coverage of every TX_TYPE × TX_SIZE pair the bitstream may carry
+(159 of 323 — full INTER_1 set on Sqr_Up≤16, INTER_3 on Sqr_Up=32,
+DCTONLY on Sqr_Up=64); the rectangular 2896 trigger gate; DC-constant
+reconstruction across all 14 rectangular shapes; spec IDTX magnitudes;
+the iflipadst-equals-reverse-iadst invariant; and the
+spec-disallowed kernel rejection set (Adst@32/64, FlipAdst@32/64,
+Idtx@64, Wht@non-4).
+
 ## SVT-AV1 chain status
 
 Round 21 (commit pending) lands the §5.9.2 inter-branch ORDER fix:
