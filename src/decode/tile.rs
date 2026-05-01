@@ -31,6 +31,7 @@ use super::lr_unit::{
 };
 use super::modes::{IntraMode, INTRA_MODES, UV_MODES};
 use super::superblock;
+use super::tx_type_map::{ext_tx_set_for_inter, inter_tx_type_for};
 use crate::frame_header::FrameType;
 use crate::lr::UnitParams as LrUnitParams;
 use crate::transform::TxType;
@@ -632,6 +633,18 @@ pub struct TileDecoder<'a> {
     /// Used by blocks whose area ≤ 32×32. Blocks larger than 32×32 use
     /// implicit DCT_DCT.
     pub intra_ext_tx_cdf_set2: Vec<Vec<Vec<u16>>>,
+    /// Inter-frame `tx_type` CDF — set 1 (16 types, indexed by
+    /// `Tx_Size_Sqr[txSz] ∈ {TX_4X4=0, TX_8X8=1}`). §5.11.45 / §9.4
+    /// `Default_Inter_Tx_Type_Set1_Cdf[2][17]`.
+    pub inter_ext_tx_cdf_set1: Vec<Vec<u16>>,
+    /// Inter-frame `tx_type` CDF — set 2 (12 types, single context;
+    /// only consulted when `Tx_Size_Sqr[txSz] == TX_16X16`). §5.11.45 /
+    /// §9.4 `Default_Inter_Tx_Type_Set2_Cdf[13]`.
+    pub inter_ext_tx_cdf_set2: Vec<u16>,
+    /// Inter-frame `tx_type` CDF — set 3 (2 types, indexed by
+    /// `Tx_Size_Sqr[txSz] ∈ {TX_4X4=0..TX_32X32=3}`). §5.11.45 / §9.4
+    /// `Default_Inter_Tx_Type_Set3_Cdf[4][3]`.
+    pub inter_ext_tx_cdf_set3: Vec<Vec<u16>>,
     /// `delta_q_abs` CDF — §5.11.12. Single 4-symbol CDF, no context.
     pub delta_q_cdf: Vec<u16>,
     /// `delta_lf_abs` CDF — §5.11.13. In multi mode the decoder needs
@@ -770,6 +783,9 @@ impl<'a> TileDecoder<'a> {
             skip_mode_cdf: Vec::new(),
             intra_ext_tx_cdf_set1: Vec::new(),
             intra_ext_tx_cdf_set2: Vec::new(),
+            inter_ext_tx_cdf_set1: Vec::new(),
+            inter_ext_tx_cdf_set2: Vec::new(),
+            inter_ext_tx_cdf_set3: Vec::new(),
             delta_q_cdf: Vec::new(),
             delta_lf_cdf: Vec::new(),
             intrabc_cdf: Vec::new(),
@@ -874,6 +890,19 @@ impl<'a> TileDecoder<'a> {
         self.intra_ext_tx_cdf_set2 = cdfs::DEFAULT_INTRA_EXT_TX_CDF_SET2
             .iter()
             .map(|row| row.iter().map(|c| c.to_vec()).collect::<Vec<_>>())
+            .collect();
+        // §5.11.45 / §9.4 — three default inter ext-tx CDFs. Set 1 is
+        // 2 contexts × 16-symbol; set 2 is single 12-symbol; set 3 is
+        // 4 contexts × 2-symbol. Stored owned so the range coder can
+        // adapt them in place.
+        self.inter_ext_tx_cdf_set1 = cdfs::DEFAULT_INTER_EXT_TX_CDF_SET1
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        self.inter_ext_tx_cdf_set2 = cdfs::DEFAULT_INTER_EXT_TX_CDF_SET2.to_vec();
+        self.inter_ext_tx_cdf_set3 = cdfs::DEFAULT_INTER_EXT_TX_CDF_SET3
+            .iter()
+            .map(|c| c.to_vec())
             .collect();
         self.delta_q_cdf = cdfs::DEFAULT_DELTA_Q_CDF.to_vec();
         // Spec §5.11.13 / §9.4.1: `FRAME_LF_COUNT == 4` copies in the
@@ -1223,6 +1252,51 @@ impl<'a> TileDecoder<'a> {
         Ok(intra_tx_type_for(tx_set, raw))
     }
 
+    /// Decode the inter-frame `tx_type` for a TU of dimensions `w × h`
+    /// (§5.11.45 / §5.11.47 / §6.10.15). Mirrors the intra path:
+    ///
+    /// - `set = 0` (`TX_SET_DCTONLY`, `txSzSqrUp > TX_32X32`): no
+    ///   symbol; implicit `DCT_DCT`.
+    /// - `set = 1` (`TX_SET_INTER_1`, `txSzSqr ≤ TX_8X8`): 16-symbol
+    ///   CDF indexed by `Tx_Size_Sqr[txSz] ∈ {0, 1}`.
+    /// - `set = 2` (`TX_SET_INTER_2`, `txSzSqr == TX_16X16`):
+    ///   single-context 12-symbol CDF.
+    /// - `set = 3` (`TX_SET_INTER_3`, `reduced_tx_set` or
+    ///   `txSzSqrUp == TX_32X32`): 2-symbol CDF indexed by
+    ///   `Tx_Size_Sqr[txSz] ∈ {0..=3}`.
+    ///
+    /// Caller passes `reduced_tx_set` from the frame header. The
+    /// returned [`TxType`] is the spec's `Tx_Type_Inter_Inv_Set*[raw]`
+    /// lookup; out-of-range raw symbols safely fall back to `DCT_DCT`.
+    pub fn decode_inter_tx_type(
+        &mut self,
+        w: usize,
+        h: usize,
+        reduced_tx_set: bool,
+    ) -> Result<TxType> {
+        let set = ext_tx_set_for_inter(w as u32, h as u32, reduced_tx_set);
+        if set == 0 {
+            return Ok(TxType::DctDct);
+        }
+        // Tx_Size_Sqr index: min(log2W, log2H) - 2 ⇒ TX_4X4=0..TX_32X32=3.
+        let size_sqr = tx_size_sqr_index(w, h);
+        let raw = match set {
+            1 => {
+                let ctx = size_sqr.min(self.inter_ext_tx_cdf_set1.len().saturating_sub(1));
+                self.symbol
+                    .decode_symbol(&mut self.inter_ext_tx_cdf_set1[ctx])?
+            }
+            2 => self.symbol.decode_symbol(&mut self.inter_ext_tx_cdf_set2)?,
+            3 => {
+                let ctx = size_sqr.min(self.inter_ext_tx_cdf_set3.len().saturating_sub(1));
+                self.symbol
+                    .decode_symbol(&mut self.inter_ext_tx_cdf_set3[ctx])?
+            }
+            _ => 0,
+        };
+        Ok(inter_tx_type_for(set, raw))
+    }
+
     /// §5.11.12 `read_delta_qindex()` — reads the `delta_q_abs`
     /// symbol, then optionally a literal-bits tail + sign bit. Returns
     /// the decoded `reducedDeltaQIndex` (before multiplying by
@@ -1406,6 +1480,20 @@ fn ext_tx_size_ctx(w: usize, h: usize) -> usize {
     }
 }
 
+/// `Tx_Size_Sqr[txSz]` as a TX_SIZES index (0=TX_4X4 .. 3=TX_32X32).
+/// Computed from the TU dimensions per the spec table — `min(log2W,
+/// log2H) - 2`. Used to index the inter ext-tx set 1 / set 3 CDFs.
+fn tx_size_sqr_index(w: usize, h: usize) -> usize {
+    let m = w.min(h);
+    match m {
+        4 => 0,
+        8 => 1,
+        16 => 2,
+        32 => 3,
+        _ => 3, // TX_64X64 / oversize collapses to the largest CDF row.
+    }
+}
+
 /// Map a raw symbol decoded via [`TileDecoder::decode_intra_tx_type`]
 /// into the spec's `TxType`. See spec §6.10.15 Table 13-4. `tx_set = 0`
 /// always implies `DCT_DCT`.
@@ -1525,5 +1613,62 @@ mod tests {
         // For plane=1 (V), sign_v == 0 when joint in {1, 6}.
         assert_eq!(cfl_alpha_ctx(1, 1), 0);
         assert_eq!(cfl_alpha_ctx(6, 1), 0);
+    }
+
+    /// Round 25 — `Tx_Size_Sqr` indexing for the inter ext-tx CDFs.
+    /// The min-side mapping must produce the spec's TX_SIZES enum
+    /// values (TX_4X4=0, TX_8X8=1, TX_16X16=2, TX_32X32=3) for every
+    /// shape the inter sets actually consult.
+    #[test]
+    fn tx_size_sqr_index_table() {
+        assert_eq!(tx_size_sqr_index(4, 4), 0);
+        assert_eq!(tx_size_sqr_index(8, 8), 1);
+        assert_eq!(tx_size_sqr_index(16, 16), 2);
+        assert_eq!(tx_size_sqr_index(32, 32), 3);
+        // 2:1 / 1:4 rectangles fold to the min side.
+        assert_eq!(tx_size_sqr_index(8, 4), 0);
+        assert_eq!(tx_size_sqr_index(4, 8), 0);
+        assert_eq!(tx_size_sqr_index(16, 4), 0);
+        assert_eq!(tx_size_sqr_index(4, 16), 0);
+        assert_eq!(tx_size_sqr_index(16, 8), 1);
+        assert_eq!(tx_size_sqr_index(32, 8), 1);
+        assert_eq!(tx_size_sqr_index(32, 16), 2);
+        assert_eq!(tx_size_sqr_index(16, 64), 2);
+    }
+
+    /// Round 25 — pin the wire shape of the inter ext-tx CDFs the
+    /// inter Y site reads. Each CDF must have `N+1` entries (N inverted
+    /// probabilities + 1 update counter), with the (N-1)th entry the
+    /// 0 sentinel and the Nth entry the 0 update counter.
+    #[test]
+    fn inter_ext_tx_cdf_shapes_match_spec() {
+        // Set 1: 16-symbol, 2 contexts.
+        assert_eq!(cdfs::DEFAULT_INTER_EXT_TX_CDF_SET1.len(), 2);
+        for row in cdfs::DEFAULT_INTER_EXT_TX_CDF_SET1 {
+            assert_eq!(row.len(), 17, "set1 row must hold 17 entries");
+            assert_eq!(row[15], 0, "set1 sentinel must be 0");
+            assert_eq!(row[16], 0, "set1 counter must start at 0");
+        }
+        // Set 2: 12-symbol, single context.
+        assert_eq!(cdfs::DEFAULT_INTER_EXT_TX_CDF_SET2.len(), 13);
+        assert_eq!(cdfs::DEFAULT_INTER_EXT_TX_CDF_SET2[11], 0);
+        assert_eq!(cdfs::DEFAULT_INTER_EXT_TX_CDF_SET2[12], 0);
+        // Set 3: 2-symbol, 4 contexts.
+        assert_eq!(cdfs::DEFAULT_INTER_EXT_TX_CDF_SET3.len(), 4);
+        for row in cdfs::DEFAULT_INTER_EXT_TX_CDF_SET3 {
+            assert_eq!(row.len(), 3, "set3 row must hold 3 entries");
+            assert_eq!(row[1], 0);
+            assert_eq!(row[2], 0);
+        }
+        // Set 1 must be monotonically decreasing in each row (wire
+        // form is `Q15 P(X>i)*32768`, decreasing).
+        for row in cdfs::DEFAULT_INTER_EXT_TX_CDF_SET1 {
+            for win in row[..15].windows(2) {
+                assert!(win[0] >= win[1], "wire CDF must be decreasing");
+            }
+        }
+        for win in cdfs::DEFAULT_INTER_EXT_TX_CDF_SET2[..11].windows(2) {
+            assert!(win[0] >= win[1], "wire CDF set2 must be decreasing");
+        }
     }
 }

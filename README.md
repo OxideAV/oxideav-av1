@@ -101,6 +101,32 @@ for t in &tiles {
 # Ok::<(), oxideav_core::Error>(())
 ```
 
+## Inverse transform — round 25
+
+Round 25 wires the `inter_tx_type` symbol read into the inter Y site.
+Three default CDFs from spec §9.4 join `cdfs/extra.rs` —
+`DEFAULT_INTER_EXT_TX_CDF_SET1[2][17]`, `…SET2[13]`, and
+`…SET3[4][3]` — each in the wire-form `32768 - cdf_spec[i]`
+survival convention so the range coder hot loop indexes
+without a subtraction.  `TileDecoder::decode_inter_tx_type(w, h,
+reduced_tx_set)` consults them through the existing
+`ext_tx_set_for_inter` selector and `inter_tx_type_for` inverse
+map (the r24 groundwork in `decode/tx_type_map.rs`), then
+`inter_luma_residual_tu` in `decode/superblock.rs` graduates
+from the previous hard-coded `TxType::DctDct` to the
+symbol-driven type with the same defensive `Unsupported ->
+DctDct` fallback the intra Y site uses.  Inter chroma stays at
+`DctDct` for this round — §5.11.40 derives chroma in
+`is_inter == 1` from the corresponding luma `TxTypes[y4][x4]`
+via `is_tx_type_in_set`, which needs the `TxTypes[][]` array
+that isn't currently tracked.  Inter P-frame Y-PSNR vs
+libdav1d / libaom on the canonical
+`/tmp/av1-inter.ivf` (testsrc 128×128, --cq-level=50) moves
+9.49 dB → 10.31 dB (+0.82 dB).  The SVT-AV1 chain stays
+48/48 (`svtav1_chain_walk_round21_full_pass`) and the intra
+sacred-invariant (`svt_av1_intra_psnr_vs_reference`) is
+unchanged.
+
 ## Inverse transform — round 24
 
 Round 24 audited the inter-path migration that landed in r23 and

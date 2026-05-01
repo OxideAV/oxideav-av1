@@ -303,3 +303,43 @@ pub static DEFAULT_TXFM_SPLIT_CDF: [[u16; 3]; 21] = [
 /// (cumulative form). Stored as `32768 - 16384 = 16384` (survival).
 pub static DEFAULT_SEGMENT_ID_PREDICTED_CDF: [[u16; 3]; 3] =
     [[16384, 0, 0], [16384, 0, 0], [16384, 0, 0]];
+
+/// Inter-frame `tx_type` CDF — set 1 (16 symbols, indexed by
+/// `Tx_Size_Sqr[txSz] ∈ {TX_4X4, TX_8X8} = {0, 1}`). Spec §9.4
+/// `Default_Inter_Tx_Type_Set1_Cdf[2][17]`. Each row is the cumulative
+/// form ending in `..., 32768, 0`; stored here as the survival form
+/// `32768 - cdf_spec[i]` per the wire convention (so the trailing
+/// 32768 sentinel becomes 0 and the 0 update counter stays 0).
+/// Used by inter blocks with `txSzSqr ≤ TX_8X8` and neither
+/// `reduced_tx_set` nor `txSzSqrUp == TX_32X32` set.
+pub static DEFAULT_INTER_EXT_TX_CDF_SET1: [[u16; 17]; 2] = [
+    [
+        28310, 27208, 25073, 23059, 19438, 17979, 15231, 12502, 11264, 9920, 8834, 7294, 5041,
+        3853, 2137, 0, 0,
+    ],
+    [
+        31123, 30195, 27990, 27057, 24961, 24146, 22246, 17411, 15094, 12360, 10251, 7758, 5652,
+        3912, 2019, 0, 0,
+    ],
+];
+
+/// Inter-frame `tx_type` CDF — set 2 (12 symbols, single context — the
+/// spec only ever consults this CDF for `Tx_Size_Sqr[txSz] == TX_16X16`).
+/// Spec §9.4 `Default_Inter_Tx_Type_Set2_Cdf[13]`. Stored as the
+/// `32768 - cdf_spec[i]` survival form so the trailing 32768 sentinel
+/// becomes 0 and the 0 counter stays 0.
+pub static DEFAULT_INTER_EXT_TX_CDF_SET2: [u16; 13] = [
+    31998, 30347, 27543, 19861, 16949, 13841, 11207, 8679, 6173, 4242, 2239, 0, 0,
+];
+
+/// Inter-frame `tx_type` CDF — set 3 (2 symbols, indexed by
+/// `Tx_Size_Sqr[txSz] ∈ {TX_4X4, TX_8X8, TX_16X16, TX_32X32} = {0..3}`).
+/// Spec §9.4 `Default_Inter_Tx_Type_Set3_Cdf[4][3]`. Each row is the
+/// cumulative form `{x, 32768, 0}`; stored as `32768 - x` survival.
+/// Selected when `reduced_tx_set` is set OR `txSzSqrUp == TX_32X32`.
+pub static DEFAULT_INTER_EXT_TX_CDF_SET3: [[u16; 3]; 4] = [
+    [16384, 0, 0], // 32768 - 16384
+    [28601, 0, 0], // 32768 - 4167
+    [30770, 0, 0], // 32768 - 1998
+    [32020, 0, 0], // 32768 - 748
+];

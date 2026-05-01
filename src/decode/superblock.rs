@@ -1575,10 +1575,27 @@ fn inter_luma_residual_tu(
     for (i, c) in coeffs.iter_mut().enumerate() {
         *c = dequant_coeff(*c, i, qv);
     }
+    // §5.11.45 / §5.11.47 — read the inter `tx_type` symbol per TU under
+    // the §9.4 `TileInterTxTypeSet{1,2,3}Cdf` defaults. `set = 0`
+    // (TX_SET_DCTONLY) carries no symbol; the helper short-circuits to
+    // `DctDct`. Round 25 graduates the inter Y site from the previous
+    // hard-coded `TxType::DctDct`.
+    let reduced_tx_set = td.frame.reduced_tx_set;
+    let tx_type = td.decode_inter_tx_type(w, h, reduced_tx_set)?;
     // Round 23: spec-correct path applies per-shape Transform_Row_Shift
     // between row and column passes plus colShift = 4 after the column
     // pass (§7.13.3) — caller no longer applies a separate post-2D shift.
-    inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
+    // Defensive `Unsupported -> DctDct` fallback mirrors the intra Y site:
+    // shapes the spec allows but `inverse_2d_spec` doesn't yet implement
+    // (e.g. ADST × 64 row variants) degrade to DCT_DCT rather than
+    // bailing the whole frame.
+    if let Err(e) = inverse_2d_spec(&mut coeffs, tx_type, sz) {
+        if matches!(e, Error::Unsupported(_)) {
+            inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
+        } else {
+            return Err(e);
+        }
+    }
     if fs.bit_depth == 8 {
         let mut block = vec![0u8; w * h];
         extract_block(

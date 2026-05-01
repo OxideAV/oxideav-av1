@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 25 — wire `inter_tx_type` CDF reads into the inter Y site
+  (§5.11.45 / §5.11.47). Three new default CDF tables transcribed
+  verbatim from spec §9.4 land in `cdfs/extra.rs` —
+  `DEFAULT_INTER_EXT_TX_CDF_SET1[2][17]` (16-symbol, 2 contexts on
+  `Tx_Size_Sqr[txSz]`), `DEFAULT_INTER_EXT_TX_CDF_SET2[13]`
+  (12-symbol, single 16×16 context), and
+  `DEFAULT_INTER_EXT_TX_CDF_SET3[4][3]` (2-symbol, 4 contexts).
+  Each entry carries the wire-form `32768 - cdf_spec[i]` survival
+  values so the range coder hot loop indexes without subtraction;
+  trailing 32768 sentinel becomes `0` and the update counter starts
+  at `0`. New `TileDecoder::decode_inter_tx_type(w, h,
+  reduced_tx_set)` consults these CDFs through the existing
+  `ext_tx_set_for_inter` selector + `inter_tx_type_for` inverse map
+  from r24's `decode/tx_type_map.rs`. The inter Y site
+  (`inter_luma_residual_tu` in `decode/superblock.rs`) now graduates
+  from the previous hard-coded `TxType::DctDct` to the symbol-driven
+  type, with the same defensive `Unsupported -> DctDct` fallback the
+  intra Y site uses (line 2206 pattern) — shapes the spec allows but
+  `inverse_2d_spec` doesn't yet implement degrade gracefully instead
+  of bailing the frame. Inter chroma stays at `DctDct` for this
+  round (per §5.11.40 chroma in `is_inter == 1` derives its
+  `TxType` from the corresponding luma `TxTypes[y4][x4]` via
+  `is_tx_type_in_set`; a clean wire-in there needs the
+  `TxTypes[][]` array which is deferred). Sacred invariants intact:
+  `svtav1_chain_walk_round21_full_pass` still 48/48,
+  `svt_av1_intra_psnr_vs_reference` unchanged. Inter P-frame Y-PSNR
+  vs libdav1d / libaom on the canonical `/tmp/av1-inter.ivf`
+  fixture (testsrc 128×128, 2 frames, --cq-level=50) moves from
+  9.49 dB → 10.31 dB (+0.82 dB) — closer to the 11+ dB target;
+  remaining gap is bounded by the chroma TX-type derivation, the
+  read-deltas / segmentation Q-zero gating, and other inter-path
+  spec gaps. New regression tests pin the wire shape of each
+  default inter ext-tx CDF
+  (`inter_ext_tx_cdf_shapes_match_spec` — entry counts, sentinel
+  positions, monotonic Q15 decreasing) and the `Tx_Size_Sqr` 4-way
+  index helper (`tx_size_sqr_index_table` — squares + 2:1 + 1:4
+  rectangles fold to the min side per the spec table). Total test
+  count: 380 → 382 across the crate.
+
 - round 24 — inter-path `inverse_2d_spec` migration audit + inter
   `tx_type` table groundwork. Audit of `decode/superblock.rs`
   confirms that the round-23 caller migration to the spec-correct
