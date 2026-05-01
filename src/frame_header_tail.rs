@@ -345,21 +345,42 @@ pub fn parse_loop_filter_params(
     q: &QuantizationParams,
     allow_intrabc: bool,
 ) -> Result<LoopFilterParams> {
+    let trace = std::env::var("AV1_TRACE_BITS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    macro_rules! tp {
+        ($tag:literal) => {
+            if trace {
+                eprintln!(
+                    "AV1_TRACE_BITS:   lf {} bit_pos={}",
+                    $tag,
+                    br.bit_position()
+                );
+            }
+        };
+    }
     let mut lf = LoopFilterParams::default();
     if coded_lossless_hint(q) || allow_intrabc {
         lf.mode_ref_delta_enabled = true;
+        tp!("early_return");
         return Ok(lf);
     }
     lf.level_y0 = br.f(6)? as u8;
+    tp!("after_level_y0");
     lf.level_y1 = br.f(6)? as u8;
+    tp!("after_level_y1");
     if seq.color_config.num_planes > 1 && (lf.level_y0 != 0 || lf.level_y1 != 0) {
         lf.level_u = br.f(6)? as u8;
         lf.level_v = br.f(6)? as u8;
+        tp!("after_uv_levels");
     }
     lf.sharpness = br.f(3)? as u8;
+    tp!("after_sharpness");
     lf.mode_ref_delta_enabled = br.bit()?;
+    tp!("after_delta_enabled");
     if lf.mode_ref_delta_enabled {
         lf.mode_ref_delta_update = br.bit()?;
+        tp!("after_delta_update");
         if lf.mode_ref_delta_update {
             for d in lf.ref_deltas.iter_mut() {
                 if br.bit()? {
@@ -371,6 +392,7 @@ pub fn parse_loop_filter_params(
                     *d = br.su(7)? as i8;
                 }
             }
+            tp!("after_deltas");
         }
     }
     Ok(lf)

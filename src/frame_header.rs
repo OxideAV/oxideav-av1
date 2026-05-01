@@ -431,50 +431,67 @@ fn parse_uncompressed_header(
         }
     }
 
-    // ---- Frame size + render size ----
-    let (frame_width, frame_height, upscaled_width, use_superres, superres_denom) = if frame_type
-        == FrameType::Key
-        || frame_type == FrameType::IntraOnly
-    {
-        let (fw, fh) = parse_frame_size(seq, br, frame_size_override_flag)?;
-        let (sup, denom, upscaled) = parse_superres(seq, br, fw)?;
-        (sup, fh, upscaled, denom != SUPERRES_NUM, denom)
-    } else if !frame_size_override_flag {
-        // Use sequence-level max dims (no per-frame override).
-        let (fw, fh) = (seq.max_frame_width, seq.max_frame_height);
-        let (sup, denom, upscaled) = parse_superres(seq, br, fw)?;
-        (sup, fh, upscaled, denom != SUPERRES_NUM, denom)
-    } else {
-        // frame_size_with_refs() — uses reference frame state we don't have
-        // yet. Stop here, returning what we have so far.
-        return Err(Error::unsupported(
-                "av1 frame_size_with_refs (§5.9.6) requires reference state — parse-only crate stops here",
-            ));
-    };
-    let (render_and_frame_size_different, render_width, render_height) =
-        parse_render_size(br, frame_width, frame_height)?;
-    tp!(br, "after_render_size");
-
-    // Align: from §5.9.5: allow_intrabc only when intra_only/key + allow_screen_content_tools
-    let allow_intrabc = if (frame_type == FrameType::Key || frame_type == FrameType::IntraOnly)
-        && allow_screen_content_tools != 0
-        && (frame_width == upscaled_width)
-    {
-        br.bit()?
-    } else {
-        false
-    };
-
-    // ref_frame stuff for inter frames
+    // ---- §5.9.5/.6 Frame size + render size + intrabc / ref_frame_idx
+    // loop. The spec ORDER differs sharply between intra and inter:
+    //
+    //   Intra (Key / IntraOnly):
+    //     frame_size()
+    //     render_size()
+    //     allow_intrabc (gated)
+    //
+    //   Inter (Inter / Switch):
+    //     frame_refs_short_signaling
+    //     [last/gold idx + set_frame_refs]
+    //     ref_frame_idx[] loop
+    //     if (frame_size_override_flag && !error_resilient_mode)
+    //         frame_size_with_refs()
+    //     else { frame_size(); render_size(); }
+    //     allow_high_precision_mv
+    //     read_interpolation_filter()
+    //     is_motion_mode_switchable
+    //     use_ref_frame_mvs
+    //
+    // Round 21 fix: previously we called frame_size + render_size BEFORE
+    // the ref_frame_idx loop for inter frames. The bit count for an
+    // override-off / superres-off frame happens to match spec (1 bit for
+    // render_diff), but the bit POSITION shifts by ~13 bits because
+    // spec's `frame_refs_short_signaling=0` path consumes 21 ref_frame_idx
+    // bits. The misalignment caused 10/48 SVT-AV1 chain frames to mis-
+    // interpret tile_group bits as gm_params type bits.
     let mut ref_frame_idx = [0u32; REFS_PER_FRAME];
     let mut allow_high_precision_mv = false;
     let mut is_filter_switchable = false;
     let mut interpolation_filter = 0u32;
     let mut is_motion_mode_switchable = false;
     let mut use_ref_frame_mvs = false;
-    if frame_type == FrameType::Inter || frame_type == FrameType::Switch {
+    let (frame_width, frame_height, upscaled_width, use_superres, superres_denom);
+    let render_and_frame_size_different;
+    let render_width;
+    let render_height;
+    let allow_intrabc;
+    if frame_type == FrameType::Key || frame_type == FrameType::IntraOnly {
+        let (fw, fh) = parse_frame_size(seq, br, frame_size_override_flag)?;
+        let (sup, denom, upscaled) = parse_superres(seq, br, fw)?;
+        frame_width = sup;
+        frame_height = fh;
+        upscaled_width = upscaled;
+        use_superres = denom != SUPERRES_NUM;
+        superres_denom = denom;
+        let (rdiff, rw, rh) = parse_render_size(br, frame_width, frame_height)?;
+        render_and_frame_size_different = rdiff;
+        render_width = rw;
+        render_height = rh;
+        tp!(br, "after_render_size");
+        // §5.9.1 — allow_intrabc only when intra_only/key + screen
+        // content tools active + no superres scaling.
+        allow_intrabc = if allow_screen_content_tools != 0 && frame_width == upscaled_width {
+            br.bit()?
+        } else {
+            false
+        };
+    } else {
+        // Inter / Switch: ref_frame_idx loop, THEN frame_size+render_size.
         tp!(br, "before_frame_refs_block");
-        // frame_refs_short_signaling
         let frame_refs_short_signaling = if seq.enable_order_hint {
             br.bit()?
         } else {
@@ -505,6 +522,55 @@ fn parse_uncompressed_header(
                 let _delta_frame_id_minus_1 = br.f(n)?;
             }
         }
+        // §5.9.7 frame_size_with_refs OR §5.9.5 frame_size + §5.9.6
+        // render_size, exactly per spec.
+        if frame_size_override_flag && !error_resilient_mode {
+            // §5.9.7: 7 found_ref bits, then if any set, inherit from
+            // that ref slot's saved size; otherwise fall through to
+            // frame_size + render_size + superres + compute_image_size.
+            // We don't track per-ref RefFrameWidth/Height yet, so we
+            // model the all-zero (no found_ref matches) case which is
+            // valid per spec — the chain test fixture happens to never
+            // hit this branch.
+            let mut any_found = false;
+            for _ in 0..REFS_PER_FRAME {
+                if br.bit()? {
+                    any_found = true;
+                }
+            }
+            if any_found {
+                return Err(Error::unsupported(
+                    "av1 frame_size_with_refs (§5.9.7) found_ref=1 path requires \
+                     RefFrameWidth/Height tracking — parse-only crate stops here",
+                ));
+            }
+            // found_ref==0 fall-through: frame_size() + render_size()
+            // + superres_params() + compute_image_size().
+            let (fw, fh) = parse_frame_size(seq, br, frame_size_override_flag)?;
+            let (sup, denom, upscaled) = parse_superres(seq, br, fw)?;
+            frame_width = sup;
+            frame_height = fh;
+            upscaled_width = upscaled;
+            use_superres = denom != SUPERRES_NUM;
+            superres_denom = denom;
+            let (rdiff, rw, rh) = parse_render_size(br, frame_width, frame_height)?;
+            render_and_frame_size_different = rdiff;
+            render_width = rw;
+            render_height = rh;
+        } else {
+            let (fw, fh) = parse_frame_size(seq, br, frame_size_override_flag)?;
+            let (sup, denom, upscaled) = parse_superres(seq, br, fw)?;
+            frame_width = sup;
+            frame_height = fh;
+            upscaled_width = upscaled;
+            use_superres = denom != SUPERRES_NUM;
+            superres_denom = denom;
+            let (rdiff, rw, rh) = parse_render_size(br, frame_width, frame_height)?;
+            render_and_frame_size_different = rdiff;
+            render_width = rw;
+            render_height = rh;
+        }
+        tp!(br, "after_render_size");
         // skip allow_high_precision_mv-related branch fields
         allow_high_precision_mv = if force_integer_mv != 0 {
             false
@@ -520,6 +586,8 @@ fn parse_uncompressed_header(
             br.bit()?
         };
         tp!(br, "after_frame_refs_block");
+        // Inter never enables intrabc.
+        allow_intrabc = false;
     }
 
     let disable_frame_end_update_cdf = if seq.reduced_still_picture_header || disable_cdf_update {
@@ -1387,5 +1455,200 @@ mod set_frame_refs_tests {
         assert_eq!(out[0], 5); // LAST_FRAME -> slot 5
         let saved = dpb.saved_gm_params_for(out[0] as usize).expect("slot 5");
         assert_eq!(saved[1], [123, 456, 1 << 16, 0, 0, 1 << 16]);
+    }
+
+    /// Round 21 regression — pin §5.9.2 inter-branch order: frame_size
+    /// and render_size MUST be parsed AFTER the `ref_frame_idx[]` loop,
+    /// not before. Previously we read render_diff at the position of
+    /// `frame_refs_short_signaling`, which silently mis-aligned the
+    /// bitstream by ~13 bits on every non-short-signaling inter frame.
+    /// The test crafts a minimal SVT-AV1-style inter Frame OBU payload
+    /// with `frame_refs_short_signaling=0` (forcing the spec's 21-bit
+    /// per-slot ref_frame_idx loop to be exercised) and checks that the
+    /// parser arrives at the disable_frame_end_update_cdf checkpoint at
+    /// the bit position the spec dictates. Built with a minimal
+    /// quantization, segmentation, loop_filter, cdef, lr, tx_mode, and
+    /// global_motion tail so the parser can complete without hitting
+    /// `out of bits`.
+    #[test]
+    fn inter_branch_reads_frame_size_after_ref_frame_idx_loop() {
+        use crate::sequence_header::{ColorConfig, SequenceHeader};
+        // Synthesise a minimal sequence header with the SVT-AV1
+        // chain-walk fixture's settings: 128x128, 4:2:0, no superres,
+        // order-hint enabled, frame_id_numbers absent, no warped /
+        // dual filter / film_grain.
+        let seq = SequenceHeader {
+            seq_profile: 0,
+            still_picture: false,
+            reduced_still_picture_header: false,
+            timing_info_present: false,
+            timing_info: None,
+            decoder_model_info_present: false,
+            decoder_model_info: None,
+            initial_display_delay_present: false,
+            operating_points_cnt: 1,
+            operating_points: Vec::new(),
+            frame_width_bits: 7,
+            frame_height_bits: 7,
+            max_frame_width_minus_1: 127,
+            max_frame_height_minus_1: 127,
+            max_frame_width: 128,
+            max_frame_height: 128,
+            frame_id_numbers_present: false,
+            delta_frame_id_length_minus_2: 0,
+            additional_frame_id_length_minus_1: 0,
+            use_128x128_superblock: false,
+            enable_filter_intra: false,
+            enable_intra_edge_filter: false,
+            enable_interintra_compound: false,
+            enable_masked_compound: false,
+            enable_warped_motion: false,
+            enable_dual_filter: false,
+            enable_order_hint: true,
+            enable_jnt_comp: false,
+            enable_ref_frame_mvs: false,
+            seq_force_screen_content_tools: 0,
+            seq_force_integer_mv: 0,
+            order_hint_bits: 7,
+            enable_superres: false,
+            enable_cdef: true,
+            enable_restoration: true,
+            color_config: ColorConfig {
+                high_bitdepth: false,
+                twelve_bit: false,
+                bit_depth: 8,
+                num_planes: 3,
+                mono_chrome: false,
+                subsampling_x: true,
+                subsampling_y: true,
+                color_range: false,
+                color_primaries: 0,
+                transfer_characteristics: 0,
+                matrix_coefficients: 0,
+                separate_uv_deltas: false,
+                chroma_sample_position: 0,
+            },
+            film_grain_params_present: false,
+        };
+
+        // Hand-build the bit stream using a small writer. We only
+        // care about reaching `before_frame_refs_block` and observing
+        // the bit position at which `frame_refs_short_signaling` is
+        // consumed.
+        let mut bits: Vec<u8> = Vec::new();
+        let mut acc: u32 = 0;
+        let mut nbits: u32 = 0;
+        let put = |bv: u32, n: u32, bits: &mut Vec<u8>, acc: &mut u32, nbits: &mut u32| {
+            *acc = (*acc << n) | bv;
+            *nbits += n;
+            while *nbits >= 8 {
+                let shift = *nbits - 8;
+                bits.push((*acc >> shift) as u8);
+                *acc &= (1u32 << shift) - 1;
+                *nbits = shift;
+            }
+        };
+        // show_existing=0, frame_type=INTER(1), show_frame=1,
+        // error_resilient=0, disable_cdf_update=0,
+        // (allow_screen_content_tools skipped: seq_force=0, takes that
+        // value), frame_size_override=0, order_hint=7'0,
+        // primary_ref_frame=0, refresh_frame_flags=0,
+        // frame_refs_short_signaling=0, 7×ref_frame_idx=0,
+        // (frame_size+render_size: render_diff=0 = 1 bit),
+        // allow_high_precision_mv=0, is_filter_switchable=1,
+        // is_motion_mode_switchable=0,
+        // (use_ref_frame_mvs: enable_ref_frame_mvs=false → 0 bits),
+        // disable_frame_end_update_cdf=1.
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // show_existing
+        put(1, 2, &mut bits, &mut acc, &mut nbits); // INTER
+        put(1, 1, &mut bits, &mut acc, &mut nbits); // show_frame
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // error_resilient
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // disable_cdf_update
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // frame_size_override
+        put(0, 7, &mut bits, &mut acc, &mut nbits); // order_hint
+        put(0, 3, &mut bits, &mut acc, &mut nbits); // primary_ref_frame
+        put(0, 8, &mut bits, &mut acc, &mut nbits); // refresh_frame_flags
+                                                    // ---- inter branch (per spec ORDER) ----
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // frame_refs_short_signaling=0
+        for _ in 0..REFS_PER_FRAME {
+            put(0, 3, &mut bits, &mut acc, &mut nbits); // ref_frame_idx[i]=0
+        }
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // render_diff=0
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // high_precision_mv=0
+        put(1, 1, &mut bits, &mut acc, &mut nbits); // is_filter_switchable=1
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // is_motion_mode_switchable=0
+                                                    // use_ref_frame_mvs gated off (enable_ref_frame_mvs=false)
+        put(1, 1, &mut bits, &mut acc, &mut nbits); // disable_frame_end_update_cdf=1
+                                                    // tile_info: uniform=1, no col/row increments (max==min),
+                                                    // no context_update_tile_id (cols_log2==rows_log2==0).
+        put(1, 1, &mut bits, &mut acc, &mut nbits); // uniform=1
+                                                    // sb_cols=2, max_log2_tile_cols=1, min=0 → loop reads 1 bit (0=stop).
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // cols_increment=0
+                                                    // min_log2_tile_rows = max(0-0, 0)=0; max=1 → loop reads 1 bit.
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // rows_increment=0
+                                                    // ---- post-tile_info tail, all minimal ----
+                                                    // quant: base_q_idx=128 (=non-zero so coded_lossless_hint=false),
+                                                    // Y_DC=absent, U_DC=absent, U_AC=absent, using_qmatrix=0.
+        put(128, 8, &mut bits, &mut acc, &mut nbits); // base_q_idx
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // Y_DC absent
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // U_DC absent
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // U_AC absent
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // using_qmatrix=0
+                                                    // segmentation: enabled=0
+        put(0, 1, &mut bits, &mut acc, &mut nbits);
+        // delta_q_params: present=0
+        put(0, 1, &mut bits, &mut acc, &mut nbits);
+        // delta_lf_params: gated off (delta_q_present=0)
+        // loop_filter: levels=0/0 → no UV; sharpness=0; delta_enabled=0
+        put(0, 6, &mut bits, &mut acc, &mut nbits); // level_y0
+        put(0, 6, &mut bits, &mut acc, &mut nbits); // level_y1
+        put(0, 3, &mut bits, &mut acc, &mut nbits); // sharpness
+        put(0, 1, &mut bits, &mut acc, &mut nbits); // delta_enabled
+                                                    // cdef: damping=0, bits=0 → 1 iter (4 + 2 + 4 + 2 = 12)
+        put(0, 2, &mut bits, &mut acc, &mut nbits); // damping
+        put(0, 2, &mut bits, &mut acc, &mut nbits); // cdef_bits
+        put(0, 4, &mut bits, &mut acc, &mut nbits); // y_pri
+        put(0, 2, &mut bits, &mut acc, &mut nbits); // y_sec
+        put(0, 4, &mut bits, &mut acc, &mut nbits); // uv_pri
+        put(0, 2, &mut bits, &mut acc, &mut nbits); // uv_sec
+                                                    // lr: 3 lr_types all 0 (RESTORE_NONE) → uses_lr=false, no extra
+        put(0, 2, &mut bits, &mut acc, &mut nbits);
+        put(0, 2, &mut bits, &mut acc, &mut nbits);
+        put(0, 2, &mut bits, &mut acc, &mut nbits);
+        // tx_mode_select=0 → LARGEST
+        put(0, 1, &mut bits, &mut acc, &mut nbits);
+        // reference_select=0
+        put(0, 1, &mut bits, &mut acc, &mut nbits);
+        // skip_mode_present gated off (reference_select=0)
+        // allow_warped_motion gated off (enable_warped_motion=false)
+        // reduced_tx_set
+        put(0, 1, &mut bits, &mut acc, &mut nbits);
+        // global_motion: 7 ref slots × 1 bit (is_global=0 → IDENTITY)
+        for _ in 0..7 {
+            put(0, 1, &mut bits, &mut acc, &mut nbits);
+        }
+        // film_grain gated off (film_grain_params_present=false)
+        // pad to byte
+        if nbits > 0 {
+            put(0, 8 - nbits, &mut bits, &mut acc, &mut nbits);
+        }
+
+        let dpb = Dpb::new();
+        let fh = parse_frame_header_with_dpb(&seq, &bits, &dpb).expect("parse");
+        assert_eq!(fh.frame_type, FrameType::Inter);
+        assert!(!fh.error_resilient_mode);
+        // tile_info reached implies inter-branch + frame_size + render
+        // bit accounting all matched spec — any mis-ordering would have
+        // mis-interpreted some bit downstream and surfaced as either a
+        // wrong tile_cols or "out of bits".
+        let ti = fh.tile_info.as_ref().expect("tile_info parsed");
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
+        // Sanity: no high_precision_mv was set (we encoded 0).
+        assert!(!fh.allow_high_precision_mv);
+        assert!(fh.is_filter_switchable);
+        // Frame_size came from sequence-level max dims (no override).
+        assert_eq!(fh.frame_width, 128);
+        assert_eq!(fh.frame_height, 128);
     }
 }

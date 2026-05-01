@@ -101,6 +101,23 @@ for t in &tiles {
 # Ok::<(), oxideav_core::Error>(())
 ```
 
+## SVT-AV1 chain status
+
+Round 21 (commit pending) lands the §5.9.2 inter-branch ORDER fix:
+`frame_size()` and `render_size()` are now parsed AFTER the
+`ref_frame_idx[]` loop, matching the spec exactly. Previously
+they ran before it, which mis-aligned the bitstream by ~13 bits on
+every non-short-signaling inter frame (the bit COUNT happened to
+match the `frame_size_override=0` / `enable_superres=false` case but
+the bit POSITIONS shifted because spec's `frame_refs_short_signaling=0`
+path consumes a 21-bit per-slot ref_frame_idx loop before render_size).
+The mis-alignment caused 10/48 SVT-AV1 chain frames to mis-interpret
+tile_group bits as `gm_params` type bits — surfacing as
+`parse_global_motion_params` AFFINE overruns or `parse_lr_params`
+`out of bits`. After r21, `svtav1_chain_walk` reaches **48/48** Frame
+OBUs (was 38/48 in r20). The `AV1_TRACE_BITS=1` env-gated diagnostic
+is retained for future bisects.
+
 ## What's missing
 
 `Av1Decoder::receive_frame()` returns `Error::Unsupported`. To produce
@@ -128,10 +145,11 @@ crate names its §ref):
   `tile_info()` (§5.9.16 onwards).
 - **Deblock / CDEF / LR / superres / film grain** post-processing
   passes (§7.14 – §7.20).
-- **Cross-frame reference state** — `frame_size_with_refs()` and the
-  whole inter-frame machinery. Key and intra-only frames work as far as
-  tile boundaries; inter frames that rely on `frame_size_with_refs()`
-  currently return `Error::Unsupported`.
+- **Cross-frame reference state** — `frame_size_with_refs()` (§5.9.7)
+  parses its 7 `found_ref` bits per r21 but still returns
+  `Error::Unsupported` when any are set, since `RefFrameWidth[]` /
+  `RefFrameHeight[]` per-DPB-slot tracking is pending. The found_ref-
+  all-zero fall-through (regular `frame_size + render_size`) works.
 - **10+ bit-depth decode** — the pixel primitives are `u8`-only; 10 /
   12-bit paths land together with the coefficient decode.
 

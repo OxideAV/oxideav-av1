@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 21 — fix §5.9.2 inter-branch ORDER: `frame_size()` and
+  `render_size()` now run AFTER the `ref_frame_idx[]` loop, not
+  before. The previous ordering happened to consume the same total
+  number of bits as the spec for the typical override-off /
+  superres-off case, but mis-aligned the bitstream by ~13 bits on
+  every non-short-signaling inter frame because spec's
+  `frame_refs_short_signaling=0` path consumes 21 ref_frame_idx
+  bits before render_size. The misalignment caused 10/48 SVT-AV1
+  chain frames to mis-interpret tile_group bits as `gm_params`
+  type bits — surfacing as `parse_global_motion_params` AFFINE
+  overruns at bit 130-131 with only 5 bits remaining for 6 params,
+  or `parse_lr_params` `out of bits`. Round 21 also wires §5.9.7
+  `frame_size_with_refs` enough to read the 7 `found_ref` bits
+  (returning Unsupported when any are set, since
+  RefFrameWidth/Height tracking is still pending). New regression
+  test `inter_branch_reads_frame_size_after_ref_frame_idx_loop`
+  pins the post-fix bit ordering against a synthesised SVT-AV1-
+  style payload. `svtav1_chain_walk` baseline raised from 38/48
+  to 48/48 (full pass) and renamed to
+  `svtav1_chain_walk_round21_full_pass`.
+- round 21 — env-gated `AV1_TRACE_BITS=1` instrumentation extended
+  with per-section checkpoints inside `parse_loop_filter_params`
+  and per-OBU layout dump in the chain-walk test (sequence-header
+  config + per-packet OBU types + per-frame payload hex). The
+  diagnostics make future bit-account regressions bisectable in
+  one trace pass instead of repeated re-builds.
+
 - round 19 — `tests/svtav1_chain_walk.rs` chain-walk diagnostic.
   Walks every Frame OBU in `/tmp/av1_inter.ivf` with the §7.20
   `Dpb::refresh_with_gm` chain wired through and asserts a

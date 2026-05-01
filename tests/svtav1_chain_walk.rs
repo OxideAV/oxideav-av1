@@ -1,23 +1,21 @@
-//! r19 chain-walk diagnostic for SVT-AV1 fixtures.
+//! r19 chain-walk diagnostic for SVT-AV1 fixtures (post-r21 baseline).
 //!
 //! Walks every Frame OBU in `/tmp/av1_inter.ivf` (a 48-frame SVT-AV1
 //! fixture; see `tests/inter_decode.rs` for the regen recipe) with
 //! the §7.20 DPB refresh chain wired through (`refresh_with_gm`) and
-//! reports `(parsed_ok, total)`. The fixture, when present, is
-//! required to surface at least the round-18 baseline (38/48 Frame
-//! OBUs); subsequent rounds tighten the bound as more spec edges are
-//! covered.
+//! reports `(parsed_ok, total)`. The fixture, when present, must
+//! parse 100% (48/48) — round 21 fixed the §5.9.2 inter-branch order
+//! (frame_size + render_size now run AFTER the ref_frame_idx loop) so
+//! the parser no longer mis-aligns the bitstream by ~13 bits on every
+//! non-short-signaling inter frame.
 //!
 //! When the fixture is missing the test is a no-op so CI doesn't need
 //! ffmpeg / libsvtav1 installed.
 //!
-//! Why this test exists: the README r18 line cited "SVT-AV1 35/44
-//! Frame OBUs (chain prerequisite for r19)" with no in-tree assertion
-//! capturing the metric. r19 adds this so any regression in the
-//! parsing chain (frame_header bit accounting, DPB save/load of
-//! `gm_params`, `set_frame_refs()` understanding) shows up
-//! immediately, even before the deeper "decode every frame to pixels"
-//! tests can be brought back online.
+//! `AV1_TRACE_BITS=1` enables a per-OBU diagnostic trail (sequence
+//! header config, packet OBU layout, per-frame bit checkpoints) that
+//! made the r21 bisect possible; gated off in normal runs to keep the
+//! output clean.
 
 use std::path::Path;
 
@@ -55,14 +53,14 @@ fn ivf_packet_slices(data: &[u8]) -> Option<Vec<Vec<u8>>> {
 
 /// Walk every Frame OBU across the IVF, refreshing the DPB with the
 /// just-decoded `gm_params` per §7.20 so primary_ref_frame chains see
-/// the right `PrevGmParams[]` values. Asserts that we parse at least
-/// 38 frames OK out of 48 — the round-18 baseline. Failures of
-/// "out of bits" inside `parse_global_motion_params` tend to
-/// indicate either a missing `set_frame_refs()` (§7.8) implementation
-/// or a downstream bit-account miscount; both are tracked as r19+
-/// pending items.
+/// the right `PrevGmParams[]` values. Asserts that we parse 100%
+/// (48/48) — the round-21 baseline. The §5.9.2 inter-branch order
+/// fix unblocked the 10 frames that previously over-read past the
+/// OBU end inside `parse_global_motion_params` / `parse_lr_params`.
+/// Any regression of frame_size/render_size placement (or §5.9.7
+/// frame_size_with_refs found_ref bit count) trips immediately.
 #[test]
-fn svtav1_chain_walk_baseline_38_of_48() {
+fn svtav1_chain_walk_round21_full_pass() {
     let Some(data) = read_fixture("/tmp/av1_inter.ivf") else {
         return;
     };
@@ -76,6 +74,39 @@ fn svtav1_chain_walk_baseline_38_of_48() {
         }
     }
     let seq = seq.expect("seq header in pkt 0");
+    if std::env::var("AV1_TRACE_BITS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "AV1_TRACE_BITS: seq enable_cdef={} enable_restoration={} use_128={} sx={} sy={} planes={} mono={} order_hint_bits={} enable_order_hint={} enable_warped_motion={} sep_uv={} enable_superres={} enable_ref_frame_mvs={} reduced_still={} fid_present={} fwbits={} fhbits={} max_w={} max_h={}",
+            seq.enable_cdef,
+            seq.enable_restoration,
+            seq.use_128x128_superblock,
+            seq.color_config.subsampling_x,
+            seq.color_config.subsampling_y,
+            seq.color_config.num_planes,
+            seq.color_config.mono_chrome,
+            seq.order_hint_bits,
+            seq.enable_order_hint,
+            seq.enable_warped_motion,
+            seq.color_config.separate_uv_deltas,
+            seq.enable_superres,
+            seq.enable_ref_frame_mvs,
+            seq.reduced_still_picture_header,
+            seq.frame_id_numbers_present,
+            seq.frame_width_bits,
+            seq.frame_height_bits,
+            seq.max_frame_width,
+            seq.max_frame_height,
+        );
+        eprintln!(
+            "AV1_TRACE_BITS: seq force_screen={} force_intmv={} fgp_present={}",
+            seq.seq_force_screen_content_tools,
+            seq.seq_force_integer_mv,
+            seq.film_grain_params_present,
+        );
+    }
 
     let mut dpb = Dpb::new();
     let mut total = 0u32;
@@ -83,12 +114,42 @@ fn svtav1_chain_walk_baseline_38_of_48() {
     let mut first_fail: Option<(usize, u32)> = None;
 
     for (pi, pkt) in pkts.iter().enumerate() {
+        if std::env::var("AV1_TRACE_BITS")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+        {
+            let mut types = Vec::new();
+            for o in iter_obus(pkt).flatten() {
+                types.push(format!("{:?}({}b)", o.header.obu_type, o.payload.len()));
+            }
+            eprintln!(
+                "AV1_TRACE_BITS: pkt#{} ({} bytes) OBUs: {}",
+                pi,
+                pkt.len(),
+                types.join(",")
+            );
+        }
         for o in iter_obus(pkt) {
             let Ok(o) = o else { continue };
             if o.header.obu_type != ObuType::Frame {
                 continue;
             }
             total += 1;
+            if std::env::var("AV1_TRACE_BITS")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false)
+            {
+                let mut bytes = String::new();
+                for b in o.payload {
+                    bytes.push_str(&format!("{:02x}", b));
+                }
+                eprintln!(
+                    "AV1_TRACE_BITS: frame#{} payload={} bytes [{}]",
+                    total,
+                    o.payload.len(),
+                    bytes,
+                );
+            }
             match parse_frame_obu_with_dpb(&seq, o.payload, &dpb) {
                 Ok((fh, _)) => {
                     ok += 1;
@@ -120,9 +181,13 @@ fn svtav1_chain_walk_baseline_38_of_48() {
     if let Some((pi, n)) = first_fail {
         eprintln!("svtav1_chain_walk: first fail = pkt {pi} Frame #{n}");
     }
+    // Round 21 (post-fix): the §5.9.2 inter-branch order fix unblocks all
+    // 48 Frame OBUs in the SVT-AV1 fixture. Pin the new floor so any
+    // regression of the frame_size/render_size placement (or the §5.9.7
+    // frame_size_with_refs found_ref bit count) trips immediately.
     assert!(
-        ok >= 38,
-        "regressed below round-18 baseline: only {ok}/{total} Frame OBUs parsed"
+        ok >= 48,
+        "regressed below round-21 baseline: only {ok}/{total} Frame OBUs parsed"
     );
     // Total varies with the fixture — accept any plausible length so
     // CI doesn't break on encoder quirks across libsvtav1 versions.
