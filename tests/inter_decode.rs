@@ -547,5 +547,6 @@ fn super_clone_state(fs: &oxideav_av1::decode::FrameState) -> oxideav_av1::decod
         cdef_idx: fs.cdef_idx.clone(),
         cdef_sb_cols: fs.cdef_sb_cols,
         cdef_sb_rows: fs.cdef_sb_rows,
+        tx_types: fs.tx_types.clone(),
     }
 }

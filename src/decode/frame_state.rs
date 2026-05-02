@@ -5,7 +5,7 @@
 //! the subsampling / bit-depth context needed by the chroma code paths.
 
 use crate::lr::UnitParams as LrUnitParams;
-use crate::transform::TxSize;
+use crate::transform::{TxSize, TxType};
 
 use super::modes::IntraMode;
 
@@ -156,6 +156,14 @@ pub struct FrameState {
     pub cdef_sb_cols: u32,
     /// Number of 64×64-SB rows — `(height + 63) >> 6`.
     pub cdef_sb_rows: u32,
+
+    /// Spec §5.11.40 / §6.10.15 `TxTypes[row][col]` — luma transform
+    /// type stamped per 4×4 luma sample cell. Indexed as
+    /// `tx_types[mi_row * mi_cols + mi_col]`. Initialised to
+    /// `TxType::DctDct` and rewritten by both the intra and inter Y
+    /// reconstruction paths so the chroma `compute_tx_type` (§5.11.40
+    /// `if (plane != 0)` branch) can read the adjacent luma cell.
+    pub tx_types: Vec<TxType>,
 }
 
 impl FrameState {
@@ -252,6 +260,7 @@ impl FrameState {
             },
             cdef_sb_cols: (width + 63) >> 6,
             cdef_sb_rows: (height + 63) >> 6,
+            tx_types: vec![TxType::DctDct; mi_len],
         }
     }
 
@@ -318,6 +327,52 @@ impl FrameState {
         &self.mi[idx]
     }
 
+    /// Spec §5.11.40 — read the `TxTypes[mi_row][mi_col]` stamp for
+    /// the luma 4×4 cell at `(mi_col, mi_row)`. Out-of-range coords
+    /// clip to the grid edge so the chroma `compute_tx_type` site can
+    /// project even when its `Max(MiCol, blockX << subsampling_x)`
+    /// expression spills past the active picture.
+    pub fn tx_types_at(&self, mi_col: u32, mi_row: u32) -> TxType {
+        let cols = self.mi_cols.max(1) as usize;
+        let rows = self.mi_rows.max(1) as usize;
+        let c = (mi_col as usize).min(cols - 1);
+        let r = (mi_row as usize).min(rows - 1);
+        self.tx_types[r * cols + c]
+    }
+
+    /// Spec §5.11.40 — stamp the luma `TxTypes[y4 + j][x4 + i] = ty`
+    /// loop over a TU footprint of `(tu_w_4x4, tu_h_4x4)` 4×4 cells
+    /// rooted at `(mi_col, mi_row)`. Used by both the intra and inter
+    /// Y reconstruction paths so the chroma site can pull the
+    /// neighbouring luma's TX type per the spec's per-plane formula.
+    /// Cells past the right/bottom MI grid edge are silently dropped.
+    pub fn stamp_tx_types(
+        &mut self,
+        mi_col: u32,
+        mi_row: u32,
+        tu_w_4x4: u32,
+        tu_h_4x4: u32,
+        ty: TxType,
+    ) {
+        let cols = self.mi_cols as usize;
+        let rows = self.mi_rows as usize;
+        let c0 = mi_col as usize;
+        let r0 = mi_row as usize;
+        for j in 0..(tu_h_4x4 as usize) {
+            let r = r0 + j;
+            if r >= rows {
+                break;
+            }
+            for i in 0..(tu_w_4x4 as usize) {
+                let c = c0 + i;
+                if c >= cols {
+                    break;
+                }
+                self.tx_types[r * cols + c] = ty;
+            }
+        }
+    }
+
     /// Spec §5.11.46 helper — return the palette colour list stored
     /// at MI cell `(mi_col, mi_row)` for `plane` (0 = Y, 1 = UV).
     /// Length matches the MI's recorded palette size; an empty slice
@@ -365,5 +420,54 @@ mod tests {
         fs.mi_mut(3, 5).segment_id = 2;
         assert!(fs.mi_at(3, 5).skip);
         assert_eq!(fs.mi_at(3, 5).segment_id, 2);
+    }
+
+    /// Task #167 — TxTypes grid is allocated MI-cell-sized, defaults
+    /// to DctDct, and `stamp_tx_types` walks the TU footprint without
+    /// spilling past the grid edge.
+    #[test]
+    fn tx_types_grid_default_and_stamp() {
+        let mut fs = FrameState::new(32, 32, 1, 1, false);
+        // 32×32 luma → 8×8 MI grid → 64 TxType cells.
+        assert_eq!(fs.tx_types.len(), 64);
+        for t in &fs.tx_types {
+            assert_eq!(*t, TxType::DctDct);
+        }
+        // Stamp a 4×4 TU (1×1 in MI cells) at (3, 5). Only that one
+        // cell should change.
+        fs.stamp_tx_types(3, 5, 1, 1, TxType::AdstDct);
+        assert_eq!(fs.tx_types_at(3, 5), TxType::AdstDct);
+        assert_eq!(fs.tx_types_at(2, 5), TxType::DctDct);
+        assert_eq!(fs.tx_types_at(3, 4), TxType::DctDct);
+        // Stamp an 8×8 TU (2×2) at (0, 0). Four cells flip.
+        fs.stamp_tx_types(0, 0, 2, 2, TxType::IdtIdt);
+        for r in 0..2u32 {
+            for c in 0..2u32 {
+                assert_eq!(fs.tx_types_at(c, r), TxType::IdtIdt);
+            }
+        }
+        // Out-of-range MI coords clip to the last row/col rather
+        // than panicking — important for the spec's
+        // `Max(MiCol, blockX << subsampling_x)` chroma site whose
+        // expression can land on the last cell.
+        assert_eq!(fs.tx_types_at(99, 99), fs.tx_types_at(7, 7));
+    }
+
+    /// Task #167 — stamping past the right/bottom MI grid edge
+    /// silently truncates rather than wrapping or panicking.
+    #[test]
+    fn tx_types_stamp_clips_at_grid_edge() {
+        let mut fs = FrameState::new(32, 32, 1, 1, false);
+        // 8×8 MI grid; stamp a 4×4 TU starting at (6, 6) — only
+        // the bottom-right 2×2 corner is in-bounds.
+        fs.stamp_tx_types(6, 6, 4, 4, TxType::HDct);
+        for r in 6..8u32 {
+            for c in 6..8u32 {
+                assert_eq!(fs.tx_types_at(c, r), TxType::HDct);
+            }
+        }
+        // Cells outside the corner stay at the default.
+        assert_eq!(fs.tx_types_at(5, 7), TxType::DctDct);
+        assert_eq!(fs.tx_types_at(7, 5), TxType::DctDct);
     }
 }

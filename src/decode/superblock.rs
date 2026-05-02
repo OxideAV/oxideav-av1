@@ -102,6 +102,7 @@ use super::modes::{mode_ctx_bucket, IntraMode};
 use super::mv::Mv;
 use super::reconstruct::{clip_add_in_place, clip_add_in_place16};
 use super::tile::{cfl_alpha_ctx, cfl_signs, segment_id_ctx, TileDecoder};
+use super::tx_type_map::compute_inter_chroma_tx_type;
 use crate::frame_header::FrameType;
 
 /// Decode one superblock at luma-sample position `(sb_x, sb_y)`.
@@ -1582,6 +1583,15 @@ fn inter_luma_residual_tu(
     // hard-coded `TxType::DctDct`.
     let reduced_tx_set = td.frame.reduced_tx_set;
     let tx_type = td.decode_inter_tx_type(w, h, reduced_tx_set)?;
+    // §5.11.40 — stamp `TxTypes[y4 + j][x4 + i]` over the TU footprint
+    // so the chroma `compute_tx_type` site (which reads the adjacent
+    // luma cell per the `if (plane != 0)` branch) sees a real value.
+    // Dimensions are in 4×4 luma cells.
+    let tu_w_4x4 = (w as u32).div_ceil(4);
+    let tu_h_4x4 = (h as u32).div_ceil(4);
+    let mi_col_tu = x >> 2;
+    let mi_row_tu = y >> 2;
+    fs.stamp_tx_types(mi_col_tu, mi_row_tu, tu_w_4x4, tu_h_4x4, tx_type);
     // Round 23: spec-correct path applies per-shape Transform_Row_Shift
     // between row and column passes plus colShift = 4 after the column
     // pass (§7.13.3) — caller no longer applies a separate post-2D shift.
@@ -1781,9 +1791,39 @@ fn reconstruct_inter_chroma_block(
         for (i, c) in coeffs.iter_mut().enumerate() {
             *c = dequant_coeff(*c, i, qv);
         }
+        // §5.11.40 chroma branch — read the luma `TxTypes[y4][x4]`
+        // stamped by `inter_luma_residual_tu`, then validate against
+        // the inter ext-tx set for the chroma TU shape and fall back
+        // to `DctDct` when the membership check fails. The luma
+        // sample coords for the spec's `Max(MiCol, blockX << subX)`
+        // expression collapse to the chroma block origin scaled back
+        // up by `sub_x/sub_y` (since `blockX,blockY` are in 4×4
+        // chroma cells the chroma plane sees `cx,cy` in samples
+        // already).
+        let luma_x4 = (cx as u32) >> 2 << sub_x;
+        let luma_y4 = (cy as u32) >> 2 << sub_y;
+        let mi_col_at = (x >> 2).max(luma_x4);
+        let mi_row_at = (y >> 2).max(luma_y4);
+        let luma_tx_type = fs.tx_types_at(mi_col_at, mi_row_at);
+        let reduced_tx_set = td.frame.reduced_tx_set;
+        let chroma_tx_type = compute_inter_chroma_tx_type(
+            luma_tx_type,
+            cw_clip as u32,
+            ch_clip as u32,
+            reduced_tx_set,
+        );
         // Round 23: spec path bakes per-shape row/col shifts into the
         // 2D transform; no separate residual_shift required.
-        inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
+        // Defensive `Unsupported -> DctDct` mirrors the inter Y site
+        // (line 1657) — chroma TX shapes the kernel doesn't yet
+        // implement degrade rather than fail the frame.
+        if let Err(e) = inverse_2d_spec(&mut coeffs, chroma_tx_type, sz) {
+            if matches!(e, Error::Unsupported(_)) {
+                inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
+            } else {
+                return Err(e);
+            }
+        }
         if fs.bit_depth == 8 {
             let mut block = vec![0u8; cw_clip * ch_clip];
             let plane_buf = if plane_idx == 0 {
@@ -2082,6 +2122,8 @@ fn reconstruct_luma_block(
 
     let cols = w / tx_w;
     let rows = h / tx_h;
+    let tu_w_4x4 = (tx_w as u32).div_ceil(4);
+    let tu_h_4x4 = (tx_h as u32).div_ceil(4);
     for ty in 0..rows {
         for tx in 0..cols {
             let ux = x as usize + tx * tx_w;
@@ -2093,6 +2135,13 @@ fn reconstruct_luma_block(
             } else {
                 td.decode_intra_tx_type(tx_w, tx_h, y_mode)?
             };
+            // §5.11.40 — stamp `TxTypes[y4+j][x4+i]` over this TU so a
+            // later chroma reconstruction can pull the luma TX type
+            // for the adjacent 4×4 luma cell. Stamps even for `skip`
+            // (DCT_DCT is the spec's all-zero branch initialiser).
+            let mi_col_tu = (ux as u32) >> 2;
+            let mi_row_tu = (uy as u32) >> 2;
+            fs.stamp_tx_types(mi_col_tu, mi_row_tu, tu_w_4x4, tu_h_4x4, tx_type);
             reconstruct_one_luma_tx_unit(
                 td,
                 fs,

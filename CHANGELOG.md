@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- task #167 — wire AV1 inter chroma `tx_type` derivation per spec
+  §5.11.40 `compute_tx_type`. `FrameState` grows a per-MI-cell
+  `tx_types: Vec<TxType>` grid (initialised to `DctDct`), with
+  `tx_types_at(mi_col, mi_row)` reads and `stamp_tx_types(...)`
+  writes that walk a TU footprint in 4×4 luma cells. Both the inter
+  Y site (`inter_luma_residual_tu`) and the intra Y site
+  (`reconstruct_one_luma_tx_unit`) stamp the freshly-decoded luma
+  TX type over the TU footprint so the chroma path can read the
+  adjacent luma cell. The inter chroma site
+  (`reconstruct_inter_chroma_block`) now derives the chroma TX type
+  via a new `compute_inter_chroma_tx_type(luma_tx, c_tx_w, c_tx_h,
+  reduced_tx_set)` helper in `decode/tx_type_map.rs` — implements
+  the spec's `txType = TxTypes[Max(MiRow, blockY << subY)][Max(
+  MiCol, blockX << subX)]` lookup followed by the
+  `is_tx_type_in_set` membership check (codified as
+  `is_inter_tx_type_in_set` from the spec's `Tx_Type_In_Set_Inter`
+  matrix: set1 admits 16, set2 admits 12 — excluding the V_/H_
+  ADST/FlipADST quartet — set3 admits only `IDTX`/`DCT_DCT`,
+  set0/`TX_SET_DCTONLY` admits only `DCT_DCT`). The chroma site
+  applies the derived type with the same defensive
+  `Unsupported -> DctDct` fallback already in place at the inter Y
+  site (line 1657) — TX shapes the spec allows but
+  `inverse_2d_spec` doesn't yet implement degrade rather than fail
+  the frame. Sacred invariants intact: 339 lib tests (was 335),
+  inter P-frame PSNR steady at Y=10.30 / U=8.12 / V=10.10 dB on the
+  testsrc/aomenc fixture (chroma TX types in this clip are
+  predominantly DCT_DCT or fall outside the chroma set; the
+  pass-through wins land in higher-motion content where the inter
+  Y site signals non-DCT types that survive the chroma-set
+  membership check), `svtav1_chain_walk_round21_full_pass` still
+  passes (48/48 when fixture present), `cargo fmt` and
+  `cargo clippy --no-deps -- -D warnings` clean. New regression
+  tests: `is_inter_tx_type_in_set_matches_spec_matrix` pins every
+  cell of the 4×16 spec membership matrix;
+  `compute_inter_chroma_tx_type_passthrough_and_fallback` covers
+  set1/set2/set3/DCTONLY plus the `reduced_tx_set` gate;
+  `tx_types_grid_default_and_stamp` and
+  `tx_types_stamp_clips_at_grid_edge` pin the FrameState helpers
+  (default `DctDct`, footprint stamp, edge clipping for the spec's
+  `Max(...)` corner expression).
+
 - round 25 — wire `inter_tx_type` CDF reads into the inter Y site
   (§5.11.45 / §5.11.47). Three new default CDF tables transcribed
   verbatim from spec §9.4 land in `cdfs/extra.rs` —

@@ -214,6 +214,54 @@ pub fn inter_tx_type_set_size(set: u32) -> u32 {
     }
 }
 
+/// Spec §5.11.40 / §6.10.15 `is_tx_type_in_set` — inter side. Returns
+/// `true` when the candidate `tx_type` is a member of the inter
+/// extended-tx `set` (one of 1/2/3, with 0 the DCT-only fallback that
+/// always reports `false` outside `DctDct`).
+///
+/// Encoded directly from the spec's `Tx_Type_In_Set_Inter` membership
+/// matrix (06.bitstream.syntax.md): set1 admits all 16 types, set2
+/// admits 12 (excludes the V_/H_ ADST/FlipADST quartet), set3 admits
+/// only `IDTX` and `DCT_DCT`.
+pub fn is_inter_tx_type_in_set(set: u32, tx_type: TxType) -> bool {
+    match set {
+        1 => true,
+        2 => !matches!(
+            tx_type,
+            TxType::VAdst | TxType::HAdst | TxType::VFlipAdst | TxType::HFlipAdst
+        ),
+        3 => matches!(tx_type, TxType::IdtIdt | TxType::DctDct),
+        _ => matches!(tx_type, TxType::DctDct),
+    }
+}
+
+/// Spec §5.11.40 chroma branch of `compute_tx_type` for inter blocks.
+/// Maps the luma `tx_type` (read from `TxTypes[y4][x4]`) into the
+/// chroma TX type for a chroma TU of dimensions `(c_tx_w, c_tx_h)`,
+/// honouring the `reduced_tx_set` gate and falling back to `DctDct`
+/// when the luma TX type isn't valid for the chroma extended-tx set.
+///
+/// Returns `DctDct` for TX sizes whose `txSzSqrUp > TX_32X32` (the
+/// `TX_SET_DCTONLY` short-circuit), matching the spec's first
+/// `if (Lossless || txSzSqrUp > TX_32X32) return DCT_DCT` line.
+pub fn compute_inter_chroma_tx_type(
+    luma_tx_type: TxType,
+    c_tx_w: u32,
+    c_tx_h: u32,
+    reduced_tx_set: bool,
+) -> TxType {
+    let set = ext_tx_set_for_inter(c_tx_w, c_tx_h, reduced_tx_set);
+    if set == 0 {
+        // TX_SET_DCTONLY — every TX > 32×32 collapses to DCT_DCT.
+        return TxType::DctDct;
+    }
+    if is_inter_tx_type_in_set(set, luma_tx_type) {
+        luma_tx_type
+    } else {
+        TxType::DctDct
+    }
+}
+
 /// Tiny `log2(n)` for AV1 TX side lengths (one of 4/8/16/32/64).
 /// Returns 0 for unsupported inputs so the inter-set selector
 /// degrades to `TX_SET_DCTONLY` rather than panicking.
@@ -337,6 +385,115 @@ mod tests {
         // Out-of-range raw → DctDct.
         assert_eq!(inter_tx_type_for(3, 2), TxType::DctDct);
         assert_eq!(inter_tx_type_set_size(3), 2);
+    }
+
+    /// Round 25 / task #167 — `is_inter_tx_type_in_set` membership
+    /// matrix matches `Tx_Type_In_Set_Inter` from spec §6.10.15
+    /// (06.bitstream.syntax.md). Set1 admits all 16 types; set2
+    /// excludes the V_/H_ ADST/FlipADST quartet (4 entries); set3
+    /// admits only `IDTX` and `DCT_DCT`. Set0 (DCTONLY) reports false
+    /// outside `DctDct`.
+    #[test]
+    fn is_inter_tx_type_in_set_matches_spec_matrix() {
+        let all = [
+            TxType::DctDct,
+            TxType::AdstDct,
+            TxType::DctAdst,
+            TxType::AdstAdst,
+            TxType::FlipAdstDct,
+            TxType::DctFlipAdst,
+            TxType::FlipAdstFlipAdst,
+            TxType::AdstFlipAdst,
+            TxType::FlipAdstAdst,
+            TxType::IdtIdt,
+            TxType::VDct,
+            TxType::HDct,
+            TxType::VAdst,
+            TxType::HAdst,
+            TxType::VFlipAdst,
+            TxType::HFlipAdst,
+        ];
+        // Set1: all 16 in.
+        for t in all {
+            assert!(is_inter_tx_type_in_set(1, t), "set1 must admit {t:?}");
+        }
+        // Set2: 12 in (excludes V_ADST, H_ADST, V_FLIPADST, H_FLIPADST).
+        let set2_excluded = [
+            TxType::VAdst,
+            TxType::HAdst,
+            TxType::VFlipAdst,
+            TxType::HFlipAdst,
+        ];
+        for t in all {
+            let want = !set2_excluded.contains(&t);
+            assert_eq!(
+                is_inter_tx_type_in_set(2, t),
+                want,
+                "set2 membership wrong for {t:?}",
+            );
+        }
+        // Set3: only IDTX + DCT_DCT.
+        for t in all {
+            let want = matches!(t, TxType::IdtIdt | TxType::DctDct);
+            assert_eq!(
+                is_inter_tx_type_in_set(3, t),
+                want,
+                "set3 membership wrong for {t:?}",
+            );
+        }
+        // Set0 (DCTONLY) — only DCT_DCT.
+        for t in all {
+            let want = matches!(t, TxType::DctDct);
+            assert_eq!(
+                is_inter_tx_type_in_set(0, t),
+                want,
+                "set0 membership wrong for {t:?}",
+            );
+        }
+    }
+
+    /// Round 25 / task #167 — `compute_inter_chroma_tx_type` honours
+    /// the spec's chroma branch of §5.11.40 `compute_tx_type`:
+    /// luma TX type passes through when in the chroma TX set, else
+    /// `DctDct`. TX > 32×32 short-circuits to `DctDct` regardless.
+    #[test]
+    fn compute_inter_chroma_tx_type_passthrough_and_fallback() {
+        // 16×16 chroma TU under reduced_tx_set=false → set2 (12 types).
+        // Set2 admits AdstDct → passes through.
+        assert_eq!(
+            compute_inter_chroma_tx_type(TxType::AdstDct, 16, 16, false),
+            TxType::AdstDct,
+        );
+        // Set2 excludes VAdst → falls back to DctDct.
+        assert_eq!(
+            compute_inter_chroma_tx_type(TxType::VAdst, 16, 16, false),
+            TxType::DctDct,
+        );
+        // 8×8 chroma TU → set1 (16 types) → VAdst passes.
+        assert_eq!(
+            compute_inter_chroma_tx_type(TxType::VAdst, 8, 8, false),
+            TxType::VAdst,
+        );
+        // 32×32 chroma TU → set3 (only IDTX/DCT_DCT) → AdstDct
+        // collapses to DctDct.
+        assert_eq!(
+            compute_inter_chroma_tx_type(TxType::AdstDct, 32, 32, false),
+            TxType::DctDct,
+        );
+        assert_eq!(
+            compute_inter_chroma_tx_type(TxType::IdtIdt, 32, 32, false),
+            TxType::IdtIdt,
+        );
+        // reduced_tx_set forces set3 even on 8×8.
+        assert_eq!(
+            compute_inter_chroma_tx_type(TxType::AdstDct, 8, 8, true),
+            TxType::DctDct,
+        );
+        // 64×64 chroma TU → DCTONLY short-circuit.
+        assert_eq!(
+            compute_inter_chroma_tx_type(TxType::AdstDct, 64, 64, false),
+            TxType::DctDct,
+        );
     }
 
     /// Round 24 — `set = 0` (`TX_SET_DCTONLY`) carries no symbol;
