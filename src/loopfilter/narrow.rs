@@ -51,35 +51,46 @@ fn abs_diff16(a: u16, b: u16) -> u16 {
 
 /// Report whether the 4-tap narrow filter should be applied given the
 /// four samples straddling the edge.
+///
+/// Per spec §7.14.6.2:
+/// * `abs(p1 - p0) > limit` → mask reject,
+/// * `abs(q1 - q0) > limit` → mask reject,
+/// * `abs(p0 - q0) * 2 + abs(p1 - q1) / 2 > blimit` → mask reject.
+///
+/// Earlier revisions of this file had `limit` and `blimit` swapped in
+/// both checks; the swap was symmetric so SVT-AV1 fixtures (which
+/// use small frame-level levels) still passed, but the resulting
+/// per-pair check was effectively a no-op while the cross-edge
+/// check was over-strict. Round 24 (#192) restored spec ordering.
 pub fn narrow_mask(p1: u8, p0: u8, q0: u8, q1: u8, th: Thresholds) -> bool {
-    if abs_diff(p1, p0) > th.blimit {
+    if abs_diff(p1, p0) > th.limit {
         return false;
     }
-    if abs_diff(q1, q0) > th.blimit {
+    if abs_diff(q1, q0) > th.limit {
         return false;
     }
     // Widen to u16 — `abs_diff(p0, q0) * 2` can otherwise overflow u8
-    // (an edge with a 200-step jump produces 400). Spec §7.14.4.2.
+    // (an edge with a 200-step jump produces 400). Spec §7.14.6.2.
     let combined = (abs_diff(p0, q0) as u16) * 2 + (abs_diff(p1, q1) as u16) / 2;
-    if combined > th.limit as u16 {
+    if combined > th.blimit as u16 {
         return false;
     }
     true
 }
 
-/// 16-bit narrow mask.
+/// 16-bit narrow mask. See [`narrow_mask`] for the spec ordering.
 pub fn narrow_mask16(p1: u16, p0: u16, q0: u16, q1: u16, th: Thresholds16) -> bool {
-    if abs_diff16(p1, p0) > th.blimit {
+    if abs_diff16(p1, p0) > th.limit {
         return false;
     }
-    if abs_diff16(q1, q0) > th.blimit {
+    if abs_diff16(q1, q0) > th.limit {
         return false;
     }
     // Widen to u32 to avoid u16 overflow on 12-bit samples
     // (max abs_diff is 4095, so `* 2 = 8190` still fits u16, but a
     // 16-bit-depth scaled limit comparison is safer in u32).
     let combined = (abs_diff16(p0, q0) as u32) * 2 + (abs_diff16(p1, q1) as u32) / 2;
-    if combined > th.limit as u32 {
+    if combined > th.blimit as u32 {
         return false;
     }
     true
@@ -256,9 +267,10 @@ mod tests {
 
     #[test]
     fn mask_flat_edge() {
+        // Spec ordering: limit < blimit. Uniform samples pass.
         let th = Thresholds {
-            limit: 20,
-            blimit: 10,
+            limit: 10,
+            blimit: 20,
             thresh: 8,
         };
         assert!(narrow_mask(100, 100, 100, 100, th));
@@ -267,19 +279,22 @@ mod tests {
     #[test]
     fn mask_rejects_big_jump() {
         let th = Thresholds {
-            limit: 20,
-            blimit: 10,
+            limit: 10,
+            blimit: 20,
             thresh: 8,
         };
+        // p1==p0 and q1==q0 (limit check passes); but the cross-
+        // edge step (200-100)*2 = 200 blows past blimit.
         assert!(!narrow_mask(100, 100, 200, 200, th));
     }
 
     #[test]
     fn filter4_softens_block_edge() {
+        // For lvl=30, sharp=0 spec gives limit=15, blimit=79.
         let th = Thresholds {
-            limit: 30,
-            blimit: 10,
-            thresh: 8,
+            limit: 15,
+            blimit: 79,
+            thresh: 1,
         };
         let (p1, p0, q0, q1) = (110u8, 110u8, 120u8, 120u8);
         assert!(narrow_mask(p1, p0, q0, q1, th));
@@ -298,9 +313,9 @@ mod tests {
             2,
             2,
             Thresholds {
-                limit: 30,
-                blimit: 10,
-                thresh: 8,
+                limit: 15,
+                blimit: 79,
+                thresh: 1,
             },
         );
         assert!(img[1] > 110);

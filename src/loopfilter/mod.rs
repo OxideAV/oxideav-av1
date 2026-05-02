@@ -11,11 +11,17 @@
 //! * [`wide::Filter8`] — 8-tap wide deblocker.
 //! * [`frame::ApplyFrameNarrow`] — drive the narrow filter over a plane.
 
+pub mod edge;
 pub mod frame;
 pub mod mask;
 pub mod narrow;
 pub mod wide;
 
+pub use edge::{
+    apply_plane as apply_plane_edges, apply_plane16 as apply_plane_edges16, derive_lvl,
+    filter_len_for, filter_size, EdgePlane, EdgePlane16, LfModeType, MiGrid, MiInfo, INTRA_FRAME,
+    LAST_FRAME, MAX_LOOP_FILTER as EDGE_MAX_LOOP_FILTER, SEG_LVL_ALT_LF_Y_V,
+};
 pub use frame::{apply_frame_narrow, apply_frame_narrow16, uniform_grid, EdgeGrid, Plane, Plane16};
 pub use mask::derive_thresholds;
 pub use narrow::{

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- task #192 — full per-MI per-edge AV1 loop filter pass per spec
+  §7.14.1 .. §7.14.6. New `loopfilter::edge` module replaces the
+  uniform-grid driver in `apply_deblocking`. Implements: per-pass
+  per-plane level lookup (`level_y0` for vertical, `level_y1` for
+  horizontal, scalar `level_u/v` for chroma), §7.14.5 strength
+  selection (segmentation `SEG_LVL_ALT_LF_*` adjustments + ref +
+  mode deltas with the `n_shift = lvl >> 5` scaling), §7.14.2
+  `isBlockEdge`/`isTxEdge`/`applyFilter` derivation against the
+  per-MI block-size + tx-size grid, §7.14.3 `filter_size`
+  (chroma capped at 8) + §7.14.6.1 `filter_len` dispatch (4 / 6 /
+  8 / 16 taps), and §7.14.6.4 wide-filter dispatch when `flatMask`
+  triggers on luma edges with `filter_size >= 8`. Vertical pass
+  runs before horizontal per §7.14.1. Bonus side fix: spec-correct
+  ordering in `narrow::narrow_mask{,16}` — earlier revisions had
+  `limit` and `blimit` swapped in both checks (symmetric so SVT
+  fixtures still passed at small frame-level levels), now matches
+  §7.14.6.2 verbatim. New `tests/loop_filter_fixture.rs` decodes a
+  bundled SVT-AV1 fixture (`tests/fixtures/lf_active.ivf`,
+  ~1.1KB) with `enable-cdef=0:enable-restoration=0` so any pixel
+  change comes from the deblock pass; asserts the plane decodes
+  without flattening.
+
 - task #167 — wire AV1 inter chroma `tx_type` derivation per spec
   §5.11.40 `compute_tx_type`. `FrameState` grows a per-MI-cell
   `tx_types: Vec<TxType>` grid (initialised to `DctDct`), with
@@ -49,6 +71,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tx_types_stamp_clips_at_grid_edge` pin the FrameState helpers
   (default `DctDct`, footprint stamp, edge clipping for the spec's
   `Max(...)` corner expression).
+
+- round 26 — palette finalization for the intra-within-inter path
+  (§5.11.22 `intra_block_mode_info` + §5.11.46 `palette_mode_info` +
+  §5.11.49 `palette_tokens`). The intra-only key-frame palette
+  pipeline that landed in r10 (palette colour decode + per-pixel
+  index decode + §7.11.4 `predict_palette` reconstruction) is now
+  also driven from inter frames whose blocks select the
+  intra-within-inter mode. `decode_inter_block_syntax` adds a
+  `read_palette_for_intra_within_inter` helper that runs the spec
+  eligibility gates (`MiSize >= BLOCK_8X8`, `Block_Width <= 64`,
+  `Block_Height <= 64`, `allow_screen_content_tools != 0`,
+  `YMode == DC_PRED`) and consumes the palette syntax bits at the
+  spec-correct position in the bitstream sequence; the resulting
+  `PaletteBlock` is carried back via a new `palette:
+  Option<PaletteBlock>` field on `InterBlockInfo` (which switched
+  from `Copy` to `Clone` to accommodate the heap-allocated colour
+  map). The inter-leaf reconstruction site
+  (`decode_inter_leaf_block` in `decode/superblock.rs`) consumes
+  the palette in the `!is_inter` branch: `apply_palette_luma` /
+  `apply_palette_chroma` replace the prediction + residual loop
+  when the plane is palette-coded, and the per-MI propagation now
+  also stamps `palette_size_y` / `palette_size_uv` /
+  `palette_colors_*` so the next block's `get_palette_cache`
+  neighbour walk picks up the colours. Narrow-path scope intact:
+  the existing intra-within-inter path still skips angle deltas,
+  `uv_mode`, and CFL alpha reads (assuming the spec's `UVMode ==
+  DC_PRED` collapse), which is the same regime under which palette
+  is most commonly emitted by encoders. Sacred invariants intact:
+  `svtav1_chain_walk_round21_full_pass` still 48/48,
+  `svt_av1_intra_psnr_vs_reference` unchanged at 9.49 dB,
+  `palette_screen_fixture_decodes_with_plane_variation` still
+  passes, and the libdav1d cross-check
+  (`palette_screen_fixture_psnr_vs_reference`) still reports
+  ~8.56 dB Y-PSNR vs the libdav1d reference YUV. New regression
+  tests pin: `Option<PaletteBlock>` round-trips through
+  `InterBlockInfo::clone`
+  (`inter_block_info_palette_round_trips_through_clone`); the
+  §5.11.50 `palette_color_ctx_from_hash` clamps oversize hash
+  values into the `Palette_Color_Context` table range
+  (`palette_color_ctx_from_hash_clamps_oversize_hash`); and
+  `apply_palette_luma` writes the looked-up colour into the frame
+  plane verbatim with no residual addition
+  (`apply_palette_luma_writes_colors_into_frame`). Total test
+  count: 382 → 385 across the crate.
 
 - round 25 — wire `inter_tx_type` CDF reads into the inter Y site
   (§5.11.45 / §5.11.47). Three new default CDF tables transcribed

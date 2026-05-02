@@ -21,11 +21,12 @@ use super::inter::{block_size_group, InterMode};
 use super::mc::{motion_compensate, motion_compensate16};
 use super::modes::IntraMode;
 use super::mv::Mv;
+use super::palette::PaletteBlock;
 use super::tile::{segment_id_ctx, TileDecoder};
 
 /// Result of decoding the block-level inter syntax. The caller uses
 /// this to drive the subsequent reconstruction/residual passes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct InterBlockInfo {
     /// `true` when the bitstream flagged this block as inter.
     pub is_inter: bool,
@@ -59,6 +60,14 @@ pub struct InterBlockInfo {
     /// Spec §7.11.3.9 — secondary MV for the second reference in
     /// compound prediction. Zero when `skip_mode` is `false`.
     pub mv1: Mv,
+    /// Spec §5.11.22 / §5.11.46 / §5.11.49 — palette state for
+    /// intra-within-inter blocks (`is_inter == false` path). `None`
+    /// for inter blocks (palette is intra-only per §5.11.23 line
+    /// "PaletteSizeY = 0; PaletteSizeUV = 0") and for intra blocks
+    /// that declined palette coding. When set, the reconstruction
+    /// stage replaces the prediction + residual loop with the
+    /// `palette[map[y][x]]` lookup per §7.11.4.
+    pub palette: Option<PaletteBlock>,
 }
 
 /// Decode the per-block inter syntax for a leaf block. Returns
@@ -205,11 +214,22 @@ pub fn decode_inter_block_syntax(
 
     if !is_inter {
         // Intra-within-inter (§5.11.22 `intra_block_mode_info`). The
-        // spec reads y_mode, then chroma / palette / filter-intra on
-        // the intra block; our narrow path keeps the y_mode read and
-        // leaves the rest to the reconstruction stage's defaults.
+        // spec reads y_mode, then `intra_angle_info_y`, then UV mode
+        // / `read_cfl_alphas` / `intra_angle_info_uv` (gated on
+        // HasChroma + UV_CFL_PRED), then `palette_mode_info` and
+        // `filter_intra_mode_info`. Our narrow path keeps the y_mode
+        // read and the palette read (which is the dominant
+        // screen-content path); angle deltas, uv_mode, and CFL stay
+        // collapsed to their defaults (0 / DcPred / 0). The palette
+        // read is bitstream-aligned at this position only when the
+        // narrow assumptions hold — `y_mode == DcPred` (no intra
+        // angle delta), `uv_mode == DcPred` (no UV angle delta, no
+        // CFL alpha) — both of which the spec also requires for
+        // palette to be non-zero (palette gating: YMode == DC_PRED
+        // && UVMode == DC_PRED).
         let group = block_size_group(w as usize, h as usize);
         let y_mode = inter.read_y_mode(&mut td.symbol, group)?;
+        let palette = read_palette_for_intra_within_inter(td, fs, w, h, y_mode, x, y)?;
         return Ok(InterBlockInfo {
             is_inter: false,
             ref_frame_idx: 0,
@@ -221,6 +241,7 @@ pub fn decode_inter_block_syntax(
             intra_y_mode: y_mode,
             skip_mode_frames: [0, 0],
             mv1: Mv::default(),
+            palette,
         });
     }
 
@@ -253,6 +274,7 @@ pub fn decode_inter_block_syntax(
             intra_y_mode: IntraMode::DcPred,
             skip_mode_frames: td.frame.skip_mode_frame,
             mv1: Mv::default(),
+            palette: None,
         });
     }
 
@@ -307,7 +329,75 @@ pub fn decode_inter_block_syntax(
         intra_y_mode: IntraMode::DcPred,
         skip_mode_frames: [0, 0],
         mv1: Mv::default(),
+        palette: None,
     })
+}
+
+/// Spec §5.11.46 + §5.11.49 — drive the palette decode for the
+/// intra-within-inter case. Returns `None` for blocks the encoder
+/// declined to palette-code (or for blocks ineligible per the spec
+/// gates: `MiSize >= BLOCK_8X8`, `Block_Width <= 64`,
+/// `Block_Height <= 64`, `allow_screen_content_tools`, and
+/// `YMode == DC_PRED`). The narrow intra-within-inter path treats
+/// `UVMode == DC_PRED` (no UV mode is read here), so the chroma
+/// palette also only fires when that assumption holds —
+/// `decode_palette_mode_info` enforces the gate internally.
+///
+/// `bsize_ctx` matches the keyframe-intra path
+/// (`Mi_Width_Log2 + Mi_Height_Log2 - 2`), computed from the block
+/// dimensions in 4×4 MI units to cover both squares and the
+/// rectangular shapes the spec permits.
+fn read_palette_for_intra_within_inter(
+    td: &mut TileDecoder<'_>,
+    fs: &FrameState,
+    bw: u32,
+    bh: u32,
+    y_mode: IntraMode,
+    x: u32,
+    y: u32,
+) -> Result<Option<PaletteBlock>> {
+    use super::palette::decode_palette_mode_info;
+
+    // Frame-level gate — `allow_screen_content_tools != 0`. Without
+    // it the encoder may not emit `palette_mode_info()` at all, so
+    // the read must also be skipped.
+    if td.frame.allow_screen_content_tools == 0 {
+        return Ok(None);
+    }
+    // Block-size gate — `MiSize >= BLOCK_8X8 && Block_Width <= 64 &&
+    // Block_Height <= 64`. Block_8x8 is `min(bw, bh) >= 8`; we
+    // collapse the test to the dimension predicates directly.
+    if bw < 8 || bh < 8 || bw > 64 || bh > 64 {
+        return Ok(None);
+    }
+    let mi_w = (bw >> 2).max(1);
+    let mi_h = (bh >> 2).max(1);
+    let mw_log2 = 31 - mi_w.leading_zeros();
+    let mh_log2 = 31 - mi_h.leading_zeros();
+    let bsize_ctx = (mw_log2 + mh_log2).saturating_sub(2) as usize;
+
+    let has_chroma = !fs.monochrome && td.seq.color_config.num_planes >= 3;
+    // The narrow intra-within-inter path doesn't read UV mode and
+    // assumes UVMode == DC_PRED, so the chroma palette gate `uv_mode
+    // == DC_PRED` is true by construction. Y palette still gated on
+    // the actually-decoded `y_mode`.
+    let blk = decode_palette_mode_info(
+        td,
+        fs,
+        bsize_ctx,
+        bw,
+        bh,
+        y_mode == IntraMode::DcPred,
+        true,
+        has_chroma,
+        x,
+        y,
+    )?;
+    if blk.active() {
+        Ok(Some(blk))
+    } else {
+        Ok(None)
+    }
 }
 
 /// §5.11.10 `read_skip_mode` — runs the gating predicate then
@@ -810,9 +900,60 @@ mod tests {
             intra_y_mode: IntraMode::DcPred,
             skip_mode_frames: [0, 0],
             mv1: Mv::default(),
+            palette: None,
         };
         assert!(!info.skip_mode);
         assert_eq!(info.segment_id, 0);
+        assert!(info.palette.is_none());
+    }
+
+    /// Round-26 palette finalization: an intra-within-inter
+    /// `InterBlockInfo` carrying a `PaletteBlock` round-trips through
+    /// `Clone` without losing the colour map or palette sizes. Pins
+    /// the contract that the field lives on the heap (the `PaletteBlock`
+    /// struct holds `Vec<u8>` for the index map) but the wrapping
+    /// `Option<PaletteBlock>` is `Clone`able alongside the rest of the
+    /// info so the inter-leaf reconstruction path can pass it by
+    /// reference without forcing the caller to manage two values.
+    #[test]
+    fn inter_block_info_palette_round_trips_through_clone() {
+        use super::super::palette::PaletteBlock;
+        let mut blk = PaletteBlock {
+            size_y: 3,
+            size_uv: 0,
+            bit_depth: 8,
+            colors_y: vec![10u16, 90, 200],
+            ..PaletteBlock::default()
+        };
+        blk.color_map_y = vec![0u8, 1, 2, 1, 0, 2, 1, 0, 2, 1, 0, 1, 2, 0, 1, 2];
+        blk.map_w_y = 4;
+        blk.map_h_y = 4;
+        let info = InterBlockInfo {
+            is_inter: false,
+            ref_frame_idx: 0,
+            mv: Mv::default(),
+            skip: false,
+            skip_mode: false,
+            segment_id: 0,
+            interp_filter: InterpFilter::Regular,
+            intra_y_mode: IntraMode::DcPred,
+            skip_mode_frames: [0, 0],
+            mv1: Mv::default(),
+            palette: Some(blk),
+        };
+        let cloned = info.clone();
+        assert!(!cloned.is_inter);
+        let p = cloned.palette.expect("palette preserved on clone");
+        assert!(p.has_y());
+        assert_eq!(p.size_y, 3);
+        assert_eq!(p.colors_y, vec![10u16, 90, 200]);
+        assert_eq!(p.color_map_y.len(), 16);
+        assert_eq!(p.map_w_y, 4);
+        // Reconstructing via PaletteBlock::luma_sample at (0, 0)
+        // returns the colour at index 0 — colors_y[0] = 10.
+        assert_eq!(p.luma_sample(0, 0), 10);
+        // (1, 0) → map idx 1 → colors_y[1] = 90.
+        assert_eq!(p.luma_sample(1, 0), 90);
     }
 
     #[test]

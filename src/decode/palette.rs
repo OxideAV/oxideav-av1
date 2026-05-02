@@ -874,4 +874,78 @@ mod tests {
         assert_eq!(decode_uniform_ns(&mut sd, 0), 0);
         assert_eq!(decode_uniform_ns(&mut sd, 1), 0);
     }
+
+    /// Round-26 palette finalization: `palette_color_ctx_from_hash`
+    /// folds the §5.11.50 `ColorContextHash` into the
+    /// `Palette_Color_Context[0..=8]` table from §9.3 — the hash is
+    /// clamped to 0..=8 before indexing. Verifies the clamp catches
+    /// hash values larger than the table covers (which can arise from
+    /// the multiplier sums in pathological 3-neighbour patterns).
+    #[test]
+    fn palette_color_ctx_from_hash_clamps_oversize_hash() {
+        // The internal `PALETTE_COLOR_CONTEXT[]` table is 9 entries
+        // (indices 0..=8). Hashes 0..=8 yield specific contexts; any
+        // value at or above 8 must clamp to the last entry.
+        let ctx_8 = palette_color_ctx_from_hash(8);
+        let ctx_huge = palette_color_ctx_from_hash(u32::MAX);
+        assert_eq!(
+            ctx_8, ctx_huge,
+            "oversize hash must clamp into the §9.3 table range"
+        );
+        // Different small hashes can map to different contexts (or
+        // the same — the spec table has 5 buckets) but the value must
+        // stay below `PALETTE_COLOR_CONTEXTS = 5`.
+        for h in 0..=PALETTE_MAX_COLOR_CONTEXT_HASH {
+            let c = palette_color_ctx_from_hash(h as u32);
+            assert!(
+                c < PALETTE_COLOR_CONTEXTS,
+                "ctx {c} exceeds PALETTE_COLOR_CONTEXTS"
+            );
+        }
+    }
+
+    /// Round-26 palette finalization: `apply_palette_luma` writes the
+    /// looked-up colour into the frame's luma plane. Pins the
+    /// reconstruction step of §7.11.4 — the predictor is replaced
+    /// wholesale by `palette[map[y][x]]` so output samples match the
+    /// palette colour list exactly (no residual addition).
+    #[test]
+    fn apply_palette_luma_writes_colors_into_frame() {
+        use super::super::frame_state::FrameState;
+
+        let mut fs = FrameState::with_bit_depth(8, 4, 1, 1, false, 8);
+        let blk = PaletteBlock {
+            size_y: 3,
+            size_uv: 0,
+            bit_depth: 8,
+            colors_y: vec![5u16, 100, 250],
+            color_map_y: vec![
+                // 4×4 colour map — each cell picks one of 3 palette
+                // entries. Layout: row 0 = [0,1,2,0], row 1 = [1,2,0,1],
+                // row 2 = [2,0,1,2], row 3 = [0,1,2,0].
+                0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0,
+            ],
+            map_w_y: 4,
+            map_h_y: 4,
+            ..PaletteBlock::default()
+        };
+
+        apply_palette_luma(&mut fs, &blk, (0, 0), 0, 0, 4, 4);
+
+        // Verify that each y-plane pixel matches the palette colour
+        // pulled from the map. The luma plane is 8×4 — only the left
+        // 4×4 was written.
+        let y = &fs.y_plane;
+        // Row 0: colors[0,1,2,0] = [5, 100, 250, 5].
+        assert_eq!(y[0], 5);
+        assert_eq!(y[1], 100);
+        assert_eq!(y[2], 250);
+        assert_eq!(y[3], 5);
+        // Row 1: colors[1,2,0,1] = [100, 250, 5, 100]. Row stride is
+        // `fs.width = 8`.
+        assert_eq!(y[8], 100);
+        assert_eq!(y[8 + 1], 250);
+        assert_eq!(y[8 + 2], 5);
+        assert_eq!(y[8 + 3], 100);
+    }
 }

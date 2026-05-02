@@ -101,6 +101,36 @@ for t in &tiles {
 # Ok::<(), oxideav_core::Error>(())
 ```
 
+## Palette mode — round 26
+
+Round 26 finalizes the §5.11.46 / §5.11.49 palette path. The
+intra-only key-frame palette pipeline that landed in r10 (palette
+colour list decode + cache-aware merge, §5.11.50 anti-diagonal
+colour-index map decode with the 3-neighbour ColorContextHash, and
+§7.11.4 `predict_palette` reconstruction) is now also driven from
+the intra-within-inter path inside inter frames. A new
+`read_palette_for_intra_within_inter` helper in
+`decode/inter_block.rs` runs the spec eligibility gates
+(`MiSize >= BLOCK_8X8`, `Block_Width <= 64`, `Block_Height <= 64`,
+`allow_screen_content_tools != 0`, `YMode == DC_PRED`) and consumes
+the palette syntax bits at the spec-correct position; the decoded
+`PaletteBlock` is carried back via a new `palette:
+Option<PaletteBlock>` field on `InterBlockInfo` (which switched
+from `Copy` to `Clone` to fit the heap-allocated colour map). The
+inter-leaf reconstruction site (`decode_inter_leaf_block` in
+`decode/superblock.rs`) consumes the palette in the `!is_inter`
+branch: `apply_palette_luma` / `apply_palette_chroma` replace the
+prediction + residual loop when the plane is palette-coded, and
+the per-MI propagation now also stamps `palette_size_y`,
+`palette_size_uv`, and `palette_colors_*` so the next block's
+`get_palette_cache` neighbour walk picks up the colours correctly.
+Sacred invariants intact:
+`svtav1_chain_walk_round21_full_pass` still 48/48,
+`svt_av1_intra_psnr_vs_reference` unchanged at 9.49 dB,
+`palette_screen_fixture_decodes_with_plane_variation` still
+passes, and the libdav1d cross-check on `palette_screen.ivf`
+reports ~8.56 dB Y-PSNR (well above the 8.0 dB regression floor).
+
 ## Inverse transform — round 25
 
 Round 25 wires the `inter_tx_type` symbol read into the inter Y site.
@@ -246,8 +276,9 @@ crate names its §ref):
 - **Partition quadtree** walk (§5.11.4) and the remaining partition
   shapes beyond `PARTITION_NONE`.
 - **`decode_block()` per-symbol syntax** — `skip`, `tx_size`, `tx_type`,
-  `intra_y_mode`, `uv_mode`, angle deltas, CFL, palette, coefficient
-  decode (§5.11.5 – §5.11.39).
+  `intra_y_mode`, `uv_mode`, angle deltas, CFL, coefficient decode
+  (§5.11.5 – §5.11.39). Palette is wired since r10 (key-frame intra)
+  and r26 (intra-within-inter).
 - **Dequantisation + AC/DC scaling** (§7.12).
 - **Remaining inverse transforms** — 16x16 / 32x32 / 64x64 sizes, ADST,
   flipped ADST, identity, WHT, and the mixed (V*/H*) combinations

@@ -430,7 +430,8 @@ pub fn decode_leaf_block(
     //   7. use_intrabc        (only when allow_intrabc)
     //   8. intra_frame_y_mode + intra_angle_info_y
     //   9. uv_mode + intra_angle_info_uv + read_cfl_alphas
-    //  10. palette_mode_info()  (still skipped — Round 8+)
+    //  10. palette_mode_info()  (Round 10 — key-frame intra; Round 26 —
+    //                            also intra-within-inter)
     //  11. filter_intra_mode_info()
     // Then §5.11.5 `decode_block()` calls `read_block_tx_size()` to
     // pull the TX_SIZE symbol.
@@ -924,8 +925,8 @@ fn read_palette_mode_info(
 /// spec the read fires only when:
 ///   - `enable_filter_intra` (sequence header)
 ///   - `YMode == DC_PRED`
-///   - `PaletteSizeY == 0` (palette path not decoded — always true
-///     here until Round 8)
+///   - `PaletteSizeY == 0` (callers gate on `palette.has_y()` since
+///     r10 — filter-intra and palette are mutually exclusive)
 ///   - `max(Block_Width, Block_Height) <= 32`
 fn read_filter_intra_mode_info(
     td: &mut TileDecoder<'_>,
@@ -1228,6 +1229,28 @@ fn decode_inter_leaf_block(
         } else {
             Some(IntraMode::DcPred)
         };
+        // Pre-build palette colour arrays so the per-MI propagation
+        // (§5.11.5 stamps `PaletteSizes[][]` and `PaletteColors[][][]`
+        // over every MI cell) doesn't reallocate. Mirrors the
+        // keyframe-intra path at line 547.
+        let mut pal_y = [0u16; 8];
+        let mut pal_u = [0u16; 8];
+        let mut pal_v = [0u16; 8];
+        let (pal_size_y, pal_size_uv) = if let Some(p) = info.palette.as_ref() {
+            if p.has_y() {
+                let n = p.colors_y.len().min(8);
+                pal_y[..n].copy_from_slice(&p.colors_y[..n]);
+            }
+            if p.has_uv() {
+                let n = p.colors_u.len().min(8);
+                pal_u[..n].copy_from_slice(&p.colors_u[..n]);
+                let n = p.colors_v.len().min(8);
+                pal_v[..n].copy_from_slice(&p.colors_v[..n]);
+            }
+            (p.size_y, p.size_uv)
+        } else {
+            (0u8, 0u8)
+        };
         for mr in 0..mi_h {
             for mc in 0..mi_w {
                 let cell_col = mi_col + mc;
@@ -1248,41 +1271,83 @@ fn decode_inter_leaf_block(
                 mi.is_inter = false;
                 mi.mv_row = 0;
                 mi.mv_col = 0;
+                mi.palette_size_y = pal_size_y;
+                mi.palette_size_uv = pal_size_uv;
+                mi.palette_colors_y = pal_y;
+                mi.palette_colors_u = pal_u;
+                mi.palette_colors_v = pal_v;
             }
         }
-        // Inter-within-inter intra blocks don't read `tx_depth` yet
-        // (the var-tx inter path is out of scope for Round 6), so pass
-        // `None` and let reconstruct_luma_block use its pre-Round-6
-        // 64-sample cap fallback.
-        reconstruct_luma_block(
-            td,
-            fs,
-            x,
-            y,
-            bw,
-            bh,
-            info.intra_y_mode,
-            0,
-            info.skip,
-            0,
-            None,
-            None,
-        )?;
-        if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
-            reconstruct_chroma_block(
+        // §7.11.4 luma palette path — when palette is active the
+        // predictor is `palette[map[y][x]]` and there is no
+        // residual; skip the entire reconstruct_luma_block call.
+        // Otherwise drop into the standard intra reconstruction
+        // (no `tx_depth` available yet — the var-tx inter path is
+        // out of scope for Round 6, so pass `None`).
+        let palette_y_active = info.palette.as_ref().map(|p| p.has_y()).unwrap_or(false);
+        if palette_y_active {
+            let p = info.palette.as_ref().unwrap();
+            crate::decode::palette::apply_palette_luma(fs, p, (x, y), x, y, bw, bh);
+        } else {
+            reconstruct_luma_block(
                 td,
                 fs,
                 x,
                 y,
                 bw,
                 bh,
-                IntraMode::DcPred,
+                info.intra_y_mode,
                 0,
                 info.skip,
                 0,
-                0,
-                0,
+                None,
+                None,
             )?;
+        }
+        if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
+            let palette_uv_active = info.palette.as_ref().map(|p| p.has_uv()).unwrap_or(false);
+            if palette_uv_active {
+                let p = info.palette.as_ref().unwrap();
+                let bx_uv = x >> fs.sub_x;
+                let by_uv = y >> fs.sub_y;
+                let bw_uv = bw >> fs.sub_x;
+                let bh_uv = bh >> fs.sub_y;
+                crate::decode::palette::apply_palette_chroma(
+                    fs,
+                    p,
+                    1,
+                    (bx_uv, by_uv),
+                    bx_uv,
+                    by_uv,
+                    bw_uv,
+                    bh_uv,
+                );
+                crate::decode::palette::apply_palette_chroma(
+                    fs,
+                    p,
+                    2,
+                    (bx_uv, by_uv),
+                    bx_uv,
+                    by_uv,
+                    bw_uv,
+                    bh_uv,
+                );
+            } else {
+                reconstruct_chroma_block(
+                    td,
+                    fs,
+                    x,
+                    y,
+                    bw,
+                    bh,
+                    IntraMode::DcPred,
+                    0,
+                    info.skip,
+                    0,
+                    0,
+                    0,
+                )?;
+            }
         }
         return Ok(());
     }

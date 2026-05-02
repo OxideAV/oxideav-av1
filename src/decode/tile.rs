@@ -135,107 +135,154 @@ pub fn finish_frame(frame: &FrameHeader, fs: &mut FrameState) {
 
 fn apply_deblocking(frame: &FrameHeader, fs: &mut FrameState) {
     use crate::loopfilter::{
-        apply_frame_narrow, apply_frame_narrow16, derive_thresholds, scale_thresholds16,
-        uniform_grid, Plane, Plane16,
+        apply_plane_edges, apply_plane_edges16, EdgePlane, EdgePlane16, LfModeType, MiGrid, MiInfo,
+        INTRA_FRAME, LAST_FRAME,
     };
     let lf = &frame.loop_filter;
-    // All planes use the same sharpness.
-    let sharp = lf.sharpness as i32;
-    let th_y = derive_thresholds(lf.level_y0 as i32, sharp);
-    let th_u = derive_thresholds(lf.level_u as i32, sharp);
-    let th_v = derive_thresholds(lf.level_v as i32, sharp);
-    let grid_y = uniform_grid(fs.width as usize, fs.height as usize, 4, 4);
-    let grid_uv = uniform_grid(fs.uv_width as usize, fs.uv_height as usize, 4, 4);
+    let seg = &frame.segmentation;
+    if lf.level_y0 == 0 && lf.level_y1 == 0 && lf.level_u == 0 && lf.level_v == 0 {
+        return;
+    }
+    // Translate the FrameState's MI grid to a per-cell `MiInfo`
+    // that the edge driver can consume. Block / TX dimensions come
+    // from the per-MI `mi_size_idx` and `tx_size` slots stamped by
+    // the leaf walker; missing entries default to 4×4.
+    let mi_cols = fs.mi_cols as usize;
+    let mi_rows = fs.mi_rows as usize;
+    let mut cells = Vec::with_capacity(mi_cols * mi_rows);
+    for r in 0..mi_rows {
+        for c in 0..mi_cols {
+            let m = &fs.mi[r * mi_cols + c];
+            let (block_w, block_h) = block_dims_from_idx(m.mi_size_idx);
+            let (tx_w, tx_h) = match m.tx_size {
+                Some(ts) => (ts.width(), ts.height()),
+                None => (4, 4),
+            };
+            let (ref_frame, mode_type) = if m.is_inter {
+                // Narrow inter path always rides on LAST_FRAME (idx 0).
+                // GLOBALMV / GLOBAL_GLOBALMV would keep modeType==0
+                // per §7.14.4; without an explicit mode slot we infer
+                // from a zero MV (good enough for the zero-MV cases
+                // SVT-AV1's narrow path produces).
+                let mt = if m.mv_row == 0 && m.mv_col == 0 {
+                    LfModeType::Zero
+                } else {
+                    LfModeType::One
+                };
+                (LAST_FRAME, mt)
+            } else {
+                (INTRA_FRAME, LfModeType::Zero)
+            };
+            cells.push(MiInfo {
+                ref_frame,
+                mode_type,
+                skip: m.skip,
+                segment_id: m.segment_id,
+                tx_w: tx_w.min(255) as u8,
+                tx_h: tx_h.min(255) as u8,
+                block_w: block_w.min(255) as u8,
+                block_h: block_h.min(255) as u8,
+                delta_lf: 0,
+            });
+        }
+    }
+    let grid = MiGrid {
+        cells: &cells,
+        mi_cols,
+        mi_rows,
+        sub_x: fs.sub_x as usize,
+        sub_y: fs.sub_y as usize,
+    };
 
     if fs.bit_depth == 8 {
-        if lf.level_y0 > 0 {
-            let width = fs.width as usize;
-            let height = fs.height as usize;
-            apply_frame_narrow(
-                Plane {
-                    pix: &mut fs.y_plane,
-                    stride: width,
-                    width,
-                    height,
-                },
-                &grid_y,
-                th_y,
-            );
-        }
+        let width = fs.width as usize;
+        let height = fs.height as usize;
+        let uvw = fs.uv_width as usize;
+        let uvh = fs.uv_height as usize;
+        apply_plane_edges(
+            EdgePlane {
+                pix: &mut fs.y_plane,
+                stride: width,
+                width,
+                height,
+            },
+            0,
+            &grid,
+            lf,
+            seg,
+        );
         if !fs.monochrome {
-            let uvw = fs.uv_width as usize;
-            let uvh = fs.uv_height as usize;
-            if lf.level_u > 0 {
-                apply_frame_narrow(
-                    Plane {
-                        pix: &mut fs.u_plane,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    &grid_uv,
-                    th_u,
-                );
-            }
-            if lf.level_v > 0 {
-                apply_frame_narrow(
-                    Plane {
-                        pix: &mut fs.v_plane,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    &grid_uv,
-                    th_v,
-                );
-            }
+            apply_plane_edges(
+                EdgePlane {
+                    pix: &mut fs.u_plane,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                },
+                1,
+                &grid,
+                lf,
+                seg,
+            );
+            apply_plane_edges(
+                EdgePlane {
+                    pix: &mut fs.v_plane,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                },
+                2,
+                &grid,
+                lf,
+                seg,
+            );
         }
     } else {
+        let width = fs.width as usize;
+        let height = fs.height as usize;
+        let uvw = fs.uv_width as usize;
+        let uvh = fs.uv_height as usize;
         let bd = fs.bit_depth;
-        let th_y16 = scale_thresholds16(th_y, bd);
-        let th_u16 = scale_thresholds16(th_u, bd);
-        let th_v16 = scale_thresholds16(th_v, bd);
-        if lf.level_y0 > 0 {
-            let width = fs.width as usize;
-            let height = fs.height as usize;
-            apply_frame_narrow16(
-                Plane16 {
-                    pix: &mut fs.y_plane16,
-                    stride: width,
-                    width,
-                    height,
-                },
-                &grid_y,
-                th_y16,
-            );
-        }
+        apply_plane_edges16(
+            EdgePlane16 {
+                pix: &mut fs.y_plane16,
+                stride: width,
+                width,
+                height,
+                bit_depth: bd,
+            },
+            0,
+            &grid,
+            lf,
+            seg,
+        );
         if !fs.monochrome {
-            let uvw = fs.uv_width as usize;
-            let uvh = fs.uv_height as usize;
-            if lf.level_u > 0 {
-                apply_frame_narrow16(
-                    Plane16 {
-                        pix: &mut fs.u_plane16,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    &grid_uv,
-                    th_u16,
-                );
-            }
-            if lf.level_v > 0 {
-                apply_frame_narrow16(
-                    Plane16 {
-                        pix: &mut fs.v_plane16,
-                        stride: uvw,
-                        width: uvw,
-                        height: uvh,
-                    },
-                    &grid_uv,
-                    th_v16,
-                );
-            }
+            apply_plane_edges16(
+                EdgePlane16 {
+                    pix: &mut fs.u_plane16,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                    bit_depth: bd,
+                },
+                1,
+                &grid,
+                lf,
+                seg,
+            );
+            apply_plane_edges16(
+                EdgePlane16 {
+                    pix: &mut fs.v_plane16,
+                    stride: uvw,
+                    width: uvw,
+                    height: uvh,
+                    bit_depth: bd,
+                },
+                2,
+                &grid,
+                lf,
+                seg,
+            );
         }
     }
 }
@@ -395,6 +442,40 @@ fn apply_cdef(frame: &FrameHeader, fs: &mut FrameState) {
 
 fn fs_cdef_rows(total: usize, cols: usize) -> usize {
     total.checked_div(cols).unwrap_or(0)
+}
+
+/// Translate a stored `mi_size_idx` (matches [`crate::decode::block::BlockSize`]
+/// discriminant) to a `(width, height)` pair in luma samples. Falls
+/// back to 4×4 for unknown / `Invalid` values so the loop filter
+/// stays conservative.
+fn block_dims_from_idx(idx: u8) -> (usize, usize) {
+    use crate::decode::block::BlockSize;
+    let bs = match idx {
+        0 => BlockSize::Block4x4,
+        1 => BlockSize::Block4x8,
+        2 => BlockSize::Block8x4,
+        3 => BlockSize::Block8x8,
+        4 => BlockSize::Block8x16,
+        5 => BlockSize::Block16x8,
+        6 => BlockSize::Block16x16,
+        7 => BlockSize::Block16x32,
+        8 => BlockSize::Block32x16,
+        9 => BlockSize::Block32x32,
+        10 => BlockSize::Block32x64,
+        11 => BlockSize::Block64x32,
+        12 => BlockSize::Block64x64,
+        13 => BlockSize::Block64x128,
+        14 => BlockSize::Block128x64,
+        15 => BlockSize::Block128x128,
+        16 => BlockSize::Block4x16,
+        17 => BlockSize::Block16x4,
+        18 => BlockSize::Block8x32,
+        19 => BlockSize::Block32x8,
+        20 => BlockSize::Block16x64,
+        21 => BlockSize::Block64x16,
+        _ => return (4, 4),
+    };
+    (bs.width() as usize, bs.height() as usize)
 }
 
 /// Apply §5.11.40-.44 loop restoration across every plane whose
