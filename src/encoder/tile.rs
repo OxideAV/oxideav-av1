@@ -16,7 +16,7 @@
 //!    that actually carries a symbol under the round-2 frame header):
 //!    - `segmentation_enabled = 0` ⇒ no `segment_id` read;
 //!    - `enable_cdef = 0` and `skip` short-circuit ⇒ `read_cdef` reads
-//!       no bits;
+//!      no bits;
 //!    - `delta_q_present = 0` ⇒ `read_delta_qindex` / `read_delta_lf`
 //!      read no bits;
 //!    - `allow_intrabc = 0` ⇒ `use_intrabc` read suppressed.
@@ -72,7 +72,7 @@ pub const ROUND1_STUB_TILE_BYTES: usize = 16;
 /// Round-3 callers should prefer [`write_tile_group_skip_intra_64`],
 /// which produces a decoder-readable single-SB single-block stream.
 pub fn write_tile_group_stub() -> Vec<u8> {
-    let mut bw = BitWriter::new();
+    let bw = BitWriter::new();
     let _ = bw.is_byte_aligned();
     let mut out = bw.finish();
     out.extend(std::iter::repeat(0u8).take(ROUND1_STUB_TILE_BYTES));

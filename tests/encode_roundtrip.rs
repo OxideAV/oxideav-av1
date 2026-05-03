@@ -183,7 +183,6 @@ fn round3_self_decode_32x32_keyframe() {
 /// only the `dav1d` CLI binary as an opaque validator.
 #[test]
 fn round3_dav1d_self_decode_64x64_keyframe() {
-    use std::io::Write;
     use std::process::{Command, Stdio};
 
     // Probe for dav1d. Soft-skip when absent.

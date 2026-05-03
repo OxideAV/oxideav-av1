@@ -8,7 +8,7 @@
 //! * `su(n, v)` — write a signed two's-complement `n`-bit field. §4.10.5 inverse.
 //! * `uvlc(v)`  — write a universal variable-length code. §4.10.3 inverse.
 //! * `leb128(v)`— write a little-endian variable-length unsigned integer
-//!                with continuation bit `0x80`. §4.10.5 inverse.
+//!   with continuation bit `0x80`. §4.10.5 inverse.
 //!
 //! A `BitWriter` accumulates bits into a `Vec<u8>` and exposes
 //! `byte_align(pad_with_one_zero=…)` so callers can implement the
@@ -161,7 +161,7 @@ impl BitWriter {
     /// shifting the buffer).
     pub fn leb128_fixed(&mut self, value: u64, fixed_len: usize) {
         debug_assert!(self.is_byte_aligned());
-        debug_assert!(fixed_len >= 1 && fixed_len <= 8);
+        debug_assert!((1..=8).contains(&fixed_len));
         let mut v = value;
         for i in 0..fixed_len {
             let mut byte = (v & 0x7f) as u8;

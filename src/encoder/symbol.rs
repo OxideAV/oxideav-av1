@@ -230,9 +230,7 @@ impl SymbolEncoder {
         let leading_zeros = total_bits.saturating_sub(v_low_bits);
         // Emit `leading_zeros` zero bits, then v_low's bits MSB-first.
         let mut out_bits: Vec<bool> = Vec::with_capacity(total_bits as usize);
-        for _ in 0..leading_zeros {
-            out_bits.push(false);
-        }
+        out_bits.resize(leading_zeros as usize, false);
         // Append v_low's bits, MSB-first across bytes and within each byte.
         // If v_low has MORE bits than `total_bits` (unlikely but
         // possible if the encoder added too much to v_low), truncate
@@ -263,7 +261,7 @@ impl SymbolEncoder {
             }
         }
         // Pack out_bits into bytes MSB-first.
-        let mut out: Vec<u8> = Vec::with_capacity((out_bits.len() + 7) / 8);
+        let mut out: Vec<u8> = Vec::with_capacity(out_bits.len().div_ceil(8));
         let mut acc: u8 = 0;
         let mut bits_in_acc: u32 = 0;
         for b in &out_bits {
@@ -356,9 +354,9 @@ impl SymbolEncoder {
         // Add delta_bytes[i] (LSB-first) to v_low's LSB-i-th byte,
         // walking up through the array.
         let mut carry: u16 = 0;
-        for i in 0..4 {
+        for (i, &db) in delta_bytes.iter().enumerate() {
             let pos = self.v_low.len() - 1 - i;
-            let sum = self.v_low[pos] as u16 + delta_bytes[i] as u16 + carry;
+            let sum = self.v_low[pos] as u16 + db as u16 + carry;
             self.v_low[pos] = (sum & 0xFF) as u8;
             carry = sum >> 8;
         }
