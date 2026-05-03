@@ -1,4 +1,5 @@
-//! AV1 encoder — round 2 (forward range coder + framing).
+//! AV1 encoder — round 3 (decoder-readable single-SB still-picture
+//! output).
 //!
 //! Scope statement (round 1, May 2026 — shipped):
 //!
@@ -10,7 +11,7 @@
 //!   LR / film-grain features off.
 //! - Tile-group OBU body — round-1 PLACEHOLDER (16-byte zero stub).
 //!
-//! Round 2 (May 2026 — in progress):
+//! Round 2 (May 2026 — shipped):
 //!
 //! - **Forward range coder** ([`symbol::SymbolEncoder`]) — bit-exact
 //!   inverse of [`crate::symbol::SymbolDecoder`], pinned by
@@ -19,46 +20,47 @@
 //!   streams. Uses a wide-bigint V-tracking representation rather
 //!   than the streaming carry-deferral scheme libaom uses; correct
 //!   for round-2 single-superblock payloads (<1 KB) but a future
-//!   round-3+ optimisation can switch to a precarry-buffer encoder
-//!   if memory matters.
+//!   optimisation can switch to a precarry-buffer encoder if memory
+//!   matters.
+//! - **Forward 4×4 DCT** ([`transform::fdct4x4`]) — algebraic inverse
+//!   of [`crate::transform::idct4`], cascade-pinned against
+//!   `inverse_2d_spec` for `Tx4x4`.
 //!
-//! ## Round 3+ checklist
+//! Round 3 (May 2026 — shipped):
 //!
-//! Items 2-6 below were originally scoped for round 2 but the
-//! forward range coder turned out to be the biggest engineering
-//! risk; round 2 ships only item 1 cleanly. Items 2-6 are deferred
-//! with the following acceptance criteria:
+//! - **PARTITION_NONE / skip=1 / DC_PRED intra emit** ([`tile::write_tile_group_skip_intra_64`])
+//!   — mirrors [`crate::decode::superblock::decode_superblock`] for a
+//!   single-tile single-64×64-SB single-block stream. Self-roundtrips
+//!   through [`crate::Av1Decoder`] and (when present on PATH) the
+//!   `dav1d` binary.
+//! - **TX-type DCT_DCT implicit** — `skip=1` short-circuits both luma
+//!   and chroma `tx_type` reads in `reconstruct_one_*_tx_unit`, so
+//!   DCT_DCT is implicit with no symbol on the wire.
+//! - **4×4 DCT roundtrip tightened** to ≤1 LSB (DC) / ≤2 LSB (AC) per
+//!   cell, replacing round 2's defensive ±32-64 LSB.
+//! - **Coefficient encoder skeleton** ([`coeffs::CoeffCdfBankEnc`]) —
+//!   ships only `write_txb_skip` + the CDF init shape that mirrors
+//!   the decoder side. Full coefficient stream encode (eob, base
+//!   levels, br, signs, golomb tail) is round 4+.
 //!
-//! 2. **Partition emit** — single 64×64 SB, no recursive partitioning.
-//!    Mirrors [`crate::decode::superblock::decode_partition_node`]:
-//!    write `partition_cdf[bsl_ctx*4 + ctx]` symbol with above/left
-//!    context = 0/0 for the first SB. The CDF lives in
-//!    [`crate::cdfs::DEFAULT_PARTITION_CDF`].
-//! 3. **DC_PRED intra mode emit** — mirror the decoder's neighbour
-//!    derivation in
-//!    [`crate::decode::superblock::decode_leaf_block`]: read
-//!    `mode_ctx_bucket(above_mode)` × `mode_ctx_bucket(left_mode)`
-//!    and emit through `kf_y_mode_cdf[a][l]` from
-//!    [`crate::cdfs::DEFAULT_KF_Y_MODE_CDF`]. Also requires emitting
-//!    `skip` / `segment_id` / `cdef` / `delta_q` / `delta_lf` (most
-//!    of these are no-ops because the round-2 frame header turns the
-//!    features off).
-//! 4. **TX-type emit** — DCT_DCT only. Skipped if `coded_lossless`
-//!    forces `Only4x4`; otherwise mirror
-//!    [`crate::decode::tile::TileDecoder::decode_tx_depth`] +
-//!    `decode_tx_type` reads.
-//! 5. **Forward 4×4 DCT** in [`transform`] — currently only
-//!    `residual4x4` shipped. Pin against `inverse_2d_spec` for ±1
-//!    LSB roundtrip.
-//! 6. **Coefficient entropy emit** — `txb_skip` / `eob_pt` /
-//!    `coeff_base_*` / signs / Golomb-Rice tail. Mirror
-//!    [`crate::decode::coeffs::decode_coefficients`].
-//! 7. **dav1d cross-validation** — gate on items 1-6 producing a
-//!    decoder-readable stream first.
+//! ## Round 4+ checklist
 //!
-//! Each numbered item is a substantial chunk of work; round 2
-//! intentionally lands the entropy coder first so rounds 3+ can
-//! focus on the per-block syntax in isolation.
+//! 1. **Coefficient entropy emit** ([`coeffs`]) — `eob_pt` /
+//!    `eob_extra` / `coeff_base_*` / `coeff_br_*` / signs / Golomb-
+//!    Rice tail. Mirror [`crate::decode::coeffs::decode_coefficients`]
+//!    on the forward side.
+//! 2. **Non-skip leaf block path** — wire `skip=0` into the tile
+//!    writer, which then needs the full forward chain: residual
+//!    compute → fdct4x4 → quantise → coefficient emit.
+//! 3. **Larger transform sizes** ([`transform`]) — `fdct8`, `fdct16`,
+//!    `fdct32`, `fdct64` 1-D kernels + the rectangular shapes.
+//! 4. **Larger superblocks / partitioning** — recursive partitioning
+//!    above 64×64 (PARTITION_SPLIT), then PARTITION_HORZ / VERT etc.
+//! 5. **Multi-tile frames** — `tile_size_bytes` prefix per tile.
+//! 6. **Frames > 64×64** — implicit PARTITION_SPLIT at frame
+//!    boundaries (currently the encoder relies on the self-decoder
+//!    auto-clipping a Block64x64 leaf to the actual frame width; a
+//!    spec-strict external decoder may reject sub-64 frames).
 
 pub mod bitwriter;
 pub mod coeffs;
