@@ -41,8 +41,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, TimeBase};
 use oxideav_av1::decoder::Av1Decoder;
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, TimeBase};
 
 const IVF_HEADER_SIGNATURE_LEN: usize = 4;
 const IVF_FRAME_HEADER_LEN: usize = 12;
@@ -359,8 +359,7 @@ fn decode_fixture(case: &CorpusCase) -> Option<DecodeReport> {
                     for p in 0..case.pix_fmt.planes() {
                         let (pw, ph) = case.pix_fmt.plane_dims(case.width, case.height, p);
                         let plane_bytes = pw * ph * bps;
-                        let ref_plane =
-                            &ref_slice[ref_off_within..ref_off_within + plane_bytes];
+                        let ref_plane = &ref_slice[ref_off_within..ref_off_within + plane_bytes];
                         ref_off_within += plane_bytes;
                         let our_plane = match vf.planes.get(p) {
                             Some(pl) => pl.data.as_slice(),
