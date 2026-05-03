@@ -245,6 +245,17 @@ impl SymbolEncoder {
             .flat_map(|byte| (0..8).rev().map(move |i| (byte >> i) & 1 == 1))
             .collect();
         let skip = total_v_bits.len().saturating_sub(total_bits as usize);
+        // Sanity-pin: any bits we skip from the front of v_low MUST be
+        // zero. v_low's value is bounded by 2^(15 + scale) = 2^total_bits
+        // by construction, so its top (v_low.len()*8 - total_bits) bits
+        // are all zero unless the encoder has overflowed (a bug).
+        for &b in total_v_bits.iter().take(skip) {
+            debug_assert!(
+                !b,
+                "av1 SymbolEncoder::finish — non-zero bit in skipped \
+                 prefix of v_low (encoder overflowed beyond 2^{total_bits})"
+            );
+        }
         for &b in total_v_bits.iter().skip(skip) {
             out_bits.push(b);
             if out_bits.len() == total_bits as usize {
@@ -326,35 +337,44 @@ impl SymbolEncoder {
     /// Add `delta` to `v_low` (MSB-first big-endian bigint). `delta`
     /// is a u32 already in the same basis as v_low (bake pending
     /// shifts before calling this).
+    ///
+    /// Implementation: extends v_low to at least 4 bytes (the width of
+    /// `delta`), then performs in-place big-endian add from LSB up,
+    /// propagating carry through prepended bytes if needed. Avoids
+    /// the `Vec::insert` shift-on-every-step pitfall by pre-extending
+    /// once at the start.
     fn add_to_v_low(&mut self, delta: u32) {
         if delta == 0 {
             return;
         }
-        // Add delta as 4 bytes (LSB-first internally).
+        // Ensure v_low has at least 4 bytes so the LSB-aligned add
+        // doesn't need mid-loop inserts. Prepend zero bytes if needed.
+        while self.v_low.len() < 4 {
+            self.v_low.insert(0, 0);
+        }
         let delta_bytes = delta.to_le_bytes();
+        // Add delta_bytes[i] (LSB-first) to v_low's LSB-i-th byte,
+        // walking up through the array.
         let mut carry: u16 = 0;
-        let mut i: usize = 0;
-        // Walk v_low from the LSB end (= last element, since v_low is MSB-first).
-        while i < 4 || carry != 0 {
-            let pos = self.v_low.len();
-            let pos_offset = i;
-            let v_idx = pos.checked_sub(1 + pos_offset);
-            let dbyte = if i < 4 { delta_bytes[i] as u16 } else { 0 };
-            match v_idx {
-                Some(idx) => {
-                    let sum = self.v_low[idx] as u16 + dbyte + carry;
-                    self.v_low[idx] = (sum & 0xFF) as u8;
+        for i in 0..4 {
+            let pos = self.v_low.len() - 1 - i;
+            let sum = self.v_low[pos] as u16 + delta_bytes[i] as u16 + carry;
+            self.v_low[pos] = (sum & 0xFF) as u8;
+            carry = sum >> 8;
+        }
+        // Any remaining carry propagates into higher bytes of v_low.
+        let mut i = 4;
+        while carry != 0 {
+            let pos_opt = self.v_low.len().checked_sub(1 + i);
+            match pos_opt {
+                Some(pos) => {
+                    let sum = self.v_low[pos] as u16 + carry;
+                    self.v_low[pos] = (sum & 0xFF) as u8;
                     carry = sum >> 8;
                 }
                 None => {
-                    let sum = dbyte + carry;
-                    if sum != 0 {
-                        self.v_low.insert(0, (sum & 0xFF) as u8);
-                        carry = sum >> 8;
-                    } else {
-                        // No more bytes to add and no carry to propagate.
-                        return;
-                    }
+                    self.v_low.insert(0, (carry & 0xFF) as u8);
+                    carry >>= 8;
                 }
             }
             i += 1;
