@@ -301,7 +301,36 @@ crate names its §ref):
 - **10+ bit-depth decode** — the pixel primitives are `u8`-only; 10 /
   12-bit paths land together with the coefficient decode.
 
-Encoder: out of scope. This crate is decoder-side.
+## Encoder — round 1 (intra-only headers)
+
+The `encoder` module ships the AV1 bitstream framing + sequence /
+frame-header writers behind an `Av1Encoder` that implements
+`oxideav_core::Encoder`. Round 1 scope:
+
+- OBU framing (header + leb128 size prefix, TD + SH + FRAME).
+- Sequence Header — profile 0 (8-bit 4:2:0),
+  `reduced_still_picture_header = 1`. CDEF / restoration / superres /
+  film grain / 128×128 SB all off.
+- Frame Header — KEY / show / error_resilient. Single tile, single
+  64×64 superblock. Configurable `base_q_idx`.
+- Encoder envelope: width / height multiples of 8, ≤ 64×64, Yuv420P.
+
+Tile-group payload is a 16-byte zero stub — the recursive arithmetic
+coder + partition / mode / coefficient encoder is round 2+ work.
+Round 2 needs to land:
+
+1. Forward range coder (carry-out byte queue + `od_ec_enc_done` tail).
+2. Partition / intra-mode / TX-type emit (DC_PRED + DCT_DCT only for
+   round 2 first cut).
+3. Forward 4×4 DCT pinned against `inverse_2d_spec` for `±1 LSB`
+   roundtrip.
+4. Coefficient entropy emit (`txb_skip` / `eob_pt` /
+   `coeff_base_*` / signs / Golomb-Rice tail).
+5. dav1d cross-validation.
+
+Self-roundtrip via the in-tree decoder gets header parse end-to-end;
+the tile group decode surfaces `Error::Unsupported` until the entropy
+coder ships.
 
 ## Codec ID
 
