@@ -261,44 +261,57 @@ mod tests {
         );
     }
 
-    /// **Round-trip pin**: for a representative probe input,
-    /// `inverse_2d_spec(fdct4x4(x))` returns approximately `x` (within
-    /// ±N LSB after the shift cancellation).
-    ///
-    /// The exact tolerance depends on the kernel's intermediate
-    /// rounding precision; a forward DCT followed by inverse DCT
-    /// generally shouldn't lose more than a handful of LSBs per cell
-    /// for 8-bit input.
+    /// **Round-trip pin (DC)**: a constant input must reconstruct
+    /// exactly. The fdct4x4 + colShift=4 cascade gain is exactly 32×
+    /// for the DC channel (the kernel's `2 * cos(π/4)` ≈ 5793/4096
+    /// factor squared, then `<<2` pre-shift, divided by `>>4`
+    /// post-shift). For input `k`, the DC coefficient lands at
+    /// ~`32k`, and the inverse recovers `k` cleanly within rounding.
     #[test]
-    fn fdct4x4_then_inverse_is_near_identity_dc() {
+    fn fdct4x4_then_inverse_is_exact_dc() {
         let original = [50i32; 16];
         let mut buf = original;
         fdct4x4(&mut buf);
-        // Note: this calls inverse_2d_spec which expects coefficients
-        // produced by the spec's forward DCT (which is the algebraic
-        // inverse of the decoder kernel). Our fdct4x4 may have a
-        // scaling mismatch with what inverse_2d_spec expects — the
-        // round-trip pin would catch this.
         inverse_2d_spec(&mut buf, TxType::DctDct, TxSize::Tx4x4).unwrap();
-        // Allow up to ±32 LSB tolerance for the cascade — the exact
-        // tolerance depends on the round-shift accounting and is
-        // tightened in round 3 once the kernel's normalisation is
-        // pinned against fixture vectors.
+        // Round-3 pin: DC channel reconstructs within ±1 LSB across
+        // the entire block (was ±32 in round 2's loose pin).
         for (i, (a, b)) in original.iter().zip(buf.iter()).enumerate() {
             let diff = (a - b).abs();
             assert!(
-                diff <= 32,
-                "fdct4x4 ↻ inverse_2d_spec @ idx {i}: orig {a}, got {b}, diff {diff}"
+                diff <= 1,
+                "fdct4x4 DC roundtrip @ idx {i}: orig {a}, got {b}, diff {diff}"
             );
         }
     }
 
-    /// Same round-trip pin for an AC-only input: a flat 4×4 of
-    /// `[100, 100, 100, 100]` repeated rows minus DC contribution.
-    /// This exercises the AC kernels (X[1], X[2], X[3] paths).
+    /// **Round-trip pin (DC, multi-magnitude)**: pin the DC roundtrip
+    /// across a sweep of magnitudes (positive, zero, negative,
+    /// near-saturation 8-bit residual range).
     #[test]
-    fn fdct4x4_then_inverse_is_near_identity_ac() {
-        // Probe input: rising staircase.
+    fn fdct4x4_then_inverse_is_exact_dc_sweep() {
+        for &k in &[-127i32, -64, -1, 0, 1, 50, 100, 127] {
+            let original = [k; 16];
+            let mut buf = original;
+            fdct4x4(&mut buf);
+            inverse_2d_spec(&mut buf, TxType::DctDct, TxSize::Tx4x4).unwrap();
+            for (i, (a, b)) in original.iter().zip(buf.iter()).enumerate() {
+                let diff = (a - b).abs();
+                assert!(
+                    diff <= 1,
+                    "fdct4x4 DC sweep k={k} @ idx {i}: orig {a}, got {b}, diff {diff}"
+                );
+            }
+        }
+    }
+
+    /// **Round-trip pin (AC, staircase)**: a rising-staircase input —
+    /// exercises X[1], X[2], X[3] AC paths simultaneously across both
+    /// rows and columns. Algebraic cascade error is bounded by ~1 LSB
+    /// because the kernel's `2 * cos(π/4)` and `cos(π/8) / cos(3π/8)`
+    /// rotation matrices are unitary modulo the 12-bit cosine table
+    /// rounding.
+    #[test]
+    fn fdct4x4_then_inverse_is_near_identity_ac_staircase() {
         let mut original = [0i32; 16];
         for r in 0..4 {
             for c in 0..4 {
@@ -308,12 +321,59 @@ mod tests {
         let mut buf = original;
         fdct4x4(&mut buf);
         inverse_2d_spec(&mut buf, TxType::DctDct, TxSize::Tx4x4).unwrap();
-        // Loose tolerance for round-2; tightened in round 3.
+        // Round-3 pin: ≤ 1 LSB per cell (was ±64 in round 2's loose
+        // pin). Manually traced 16 cells, all reconstruct exactly.
         for (i, (a, b)) in original.iter().zip(buf.iter()).enumerate() {
             let diff = (a - b).abs();
             assert!(
-                diff <= 64,
-                "fdct4x4 AC roundtrip @ idx {i}: orig {a}, got {b}, diff {diff}"
+                diff <= 1,
+                "fdct4x4 AC staircase roundtrip @ idx {i}: orig {a}, got {b}, diff {diff}"
+            );
+        }
+    }
+
+    /// **Round-trip pin (AC, antisymmetric)**: a `[k, 0, 0, -k]`-style
+    /// input concentrated on the X[1] / X[3] AC terms — pins the
+    /// half_btf rotation path at high amplitude.
+    #[test]
+    fn fdct4x4_then_inverse_is_near_identity_antisymmetric() {
+        let mut original = [0i32; 16];
+        for r in 0..4 {
+            original[r * 4] = 100;
+            original[r * 4 + 3] = -100;
+        }
+        let mut buf = original;
+        fdct4x4(&mut buf);
+        inverse_2d_spec(&mut buf, TxType::DctDct, TxSize::Tx4x4).unwrap();
+        for (i, (a, b)) in original.iter().zip(buf.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= 1,
+                "fdct4x4 antisymmetric roundtrip @ idx {i}: orig {a}, got {b}, diff {diff}"
+            );
+        }
+    }
+
+    /// **Round-trip pin (mixed gradient + offset)**: combines a DC
+    /// offset with a column-direction gradient. Pins both the DC
+    /// (X[0]) and AC1 (X[1]) cascade paths in tandem.
+    #[test]
+    fn fdct4x4_then_inverse_is_near_identity_mixed() {
+        let mut original = [0i32; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                // Constant 50 + a vertical gradient.
+                original[r * 4 + c] = 50 + (r as i32 - 2) * 10;
+            }
+        }
+        let mut buf = original;
+        fdct4x4(&mut buf);
+        inverse_2d_spec(&mut buf, TxType::DctDct, TxSize::Tx4x4).unwrap();
+        for (i, (a, b)) in original.iter().zip(buf.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= 2,
+                "fdct4x4 mixed roundtrip @ idx {i}: orig {a}, got {b}, diff {diff}"
             );
         }
     }
