@@ -38,8 +38,11 @@
 pub mod bitwriter;
 pub mod frame_header;
 pub mod obu;
+pub mod quant;
 pub mod sequence_header;
+pub mod symbol;
 pub mod tile;
+pub mod transform;
 
 use std::collections::VecDeque;
 
