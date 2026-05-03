@@ -84,12 +84,82 @@ fn round1_frame_header_decodes_to_keyframe_intra_only() {
     assert_eq!(ti.tile_rows, 1);
     assert_eq!(ti.tile_size_bytes, 0);
 
-    // Round 1: tile group is the 16-byte stub. Round 2+ replaces this
-    // with a real entropy-coded payload.
-    assert_eq!(
-        tg_payload.len(),
-        oxideav_av1::encoder::tile::ROUND1_STUB_TILE_BYTES
-    );
+    // Round 3: tile group is a real entropy-coded payload (PARTITION_NONE
+    // + skip=1 + DC_PRED y/uv) for the single 64×64 SB. Bounded above
+    // by ~32 bytes for the few symbols emitted.
+    assert!(tg_payload.len() >= 2);
+    assert!(tg_payload.len() <= 32);
+}
+
+/// Round-3 — push the encoder output through the full
+/// [`oxideav_av1::Av1Decoder`] and confirm a `Frame::Video` with the
+/// declared dimensions comes out the other side. This is the strongest
+/// self-roundtrip pin: every symbol the encoder emits must be exactly
+/// what the decoder expects (any drift surfaces as `Error::Invalid`
+/// from the partition / mode CDFs, or as a downstream
+/// `Error::Unsupported` from a coefficient read that we shouldn't be
+/// triggering).
+#[test]
+fn round3_self_decode_64x64_keyframe() {
+    use oxideav_av1::{Av1Decoder, CODEC_ID_STR};
+    use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, MediaType, Packet, TimeBase};
+
+    let seq = SequenceConfig {
+        width: 64,
+        height: 64,
+    };
+    let frame = FrameConfig { base_q_idx: 100 };
+    let bytes = write_keyframe_stream(&seq, &frame);
+
+    let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    params.width = Some(64);
+    params.height = Some(64);
+    params.media_type = MediaType::Video;
+    let mut dec = Av1Decoder::new(params);
+
+    let pkt = Packet::new(0, TimeBase::new(1, 30), bytes);
+    dec.send_packet(&pkt)
+        .expect("decoder accepts encoder output");
+    let frame = dec.receive_frame().expect("decoder yields a frame");
+    let Frame::Video(vf) = frame else {
+        panic!("expected Frame::Video");
+    };
+    // 4:2:0 ⇒ 3 planes for non-monochrome 8-bit.
+    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.planes[0].data.len(), 64 * 64);
+    assert_eq!(vf.planes[1].data.len(), 32 * 32);
+    assert_eq!(vf.planes[2].data.len(), 32 * 32);
+}
+
+#[test]
+fn round3_self_decode_32x32_keyframe() {
+    use oxideav_av1::{Av1Decoder, CODEC_ID_STR};
+    use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, MediaType, Packet, TimeBase};
+
+    let seq = SequenceConfig {
+        width: 32,
+        height: 32,
+    };
+    let frame = FrameConfig { base_q_idx: 80 };
+    let bytes = write_keyframe_stream(&seq, &frame);
+
+    let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    params.width = Some(32);
+    params.height = Some(32);
+    params.media_type = MediaType::Video;
+    let mut dec = Av1Decoder::new(params);
+
+    let pkt = Packet::new(0, TimeBase::new(1, 30), bytes);
+    dec.send_packet(&pkt)
+        .expect("decoder accepts encoder output");
+    let frame = dec.receive_frame().expect("decoder yields a frame");
+    let Frame::Video(vf) = frame else {
+        panic!("expected Frame::Video");
+    };
+    assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.planes[0].data.len(), 32 * 32);
+    assert_eq!(vf.planes[1].data.len(), 16 * 16);
+    assert_eq!(vf.planes[2].data.len(), 16 * 16);
 }
 
 /// Round-2 — the forward range coder ([`oxideav_av1::encoder::symbol::

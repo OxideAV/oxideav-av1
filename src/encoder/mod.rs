@@ -108,7 +108,9 @@ pub fn write_keyframe_stream(seq: &EncSequence, frame: &EncFrame) -> Vec<u8> {
     let seq_payload = write_sequence_header_payload(seq);
     write_obu(&mut out, ObuType::SequenceHeader, &seq_payload);
     let mut frame_obu_payload = write_frame_header_body(seq, frame);
-    let tile_group_body = tile::write_tile_group_stub();
+    // Round 3: emit a real entropy-coded single-superblock all-skip
+    // DC_PRED tile group instead of the round-1 16-byte zero stub.
+    let tile_group_body = tile::write_tile_group_skip_intra_64(seq);
     frame_obu_payload.extend_from_slice(&tile_group_body);
     write_obu(&mut out, ObuType::Frame, &frame_obu_payload);
     out
@@ -350,8 +352,11 @@ mod tests {
         assert_eq!(fh.frame_width, 32);
         assert_eq!(fh.frame_height, 32);
         assert_eq!(fh.quant.base_q_idx, 80);
-        // Tile group payload is the round-1 stub.
-        assert_eq!(tg.len(), tile::ROUND1_STUB_TILE_BYTES);
+        // Round 3: tile group is a real entropy-coded payload — at
+        // least 2 bytes (`SymbolDecoder::init_symbol` requirement) but
+        // bounded above by ~8 bytes for the few symbols emitted.
+        assert!(tg.len() >= 2);
+        assert!(tg.len() <= 32);
     }
 
     fn make_params(width: u32, height: u32) -> CodecParameters {
