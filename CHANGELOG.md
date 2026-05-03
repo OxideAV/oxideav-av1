@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-av1/compare/v0.1.1...v0.1.2) - 2026-05-03
+
+### Other
+
+- drop duplicate semver_check key
+- silence field_reassign_with_default in tests
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- full per-MI per-edge loop_filter (task #192)
+- task #167 — derive inter chroma tx_type per spec §5.11.40
+- round 25 — wire inter_tx_type CDF reads into inter Y site
+- round 24 — inter-path inverse_2d_spec audit + inter tx_type tables
+- round 23 — wire inverse_2d_spec into decode/superblock.rs
+- round 22 — spec-correct inverse_2d_spec + idtx_spec module
+- r21 — fix §5.9.2 inter-branch order (frame_size after ref_frame_idx)
+- round 20 — §7.8 set_frame_refs() + AV1_TRACE_BITS env-gated diagnostic
+- round 19 — SVT-AV1 chain-walk diagnostic + AFFINE bit-count guard
+- round 18 — global_motion_params §5.9.24/.25 read order + abs_bits + PrevGmParams plumbing
+- round 17 — fix §5.9.2 ref_order_hint gating + §5.9.20 lr_unit_shift inversion
+- adopt slim VideoFrame/AudioFrame shape
+- round 16 — wire §5.11.38 Subsampled_Size + §7.13.3 dequant clips
+- round 15 — fix inverted §8.2.6 read_symbol (root-cause of all-128 luma)
+- round 14 — multi-ref DPB planes + SKIP_MODE compound MC (§7.20 / §7.11.3.9)
+- round 13 — derive skipModeAllowed from DPB OrderHint trail (§5.9.21)
+- round 12 — wire §5.11.10 read_skip_mode + §5.11.19 inter_segment_id
+- round 11 — §5.11.36 transform_tree walker for inter luma residual
+- round 11 — fix non-palette CDF wire format (extra.rs + lr.rs)
+- round 10 — palette mode end-to-end (§5.11.46 + §5.11.49 + §7.11.4)
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - task #192 — full per-MI per-edge AV1 loop filter pass per spec
