@@ -61,6 +61,7 @@
 //! focus on the per-block syntax in isolation.
 
 pub mod bitwriter;
+pub mod coeffs;
 pub mod frame_header;
 pub mod obu;
 pub mod quant;
