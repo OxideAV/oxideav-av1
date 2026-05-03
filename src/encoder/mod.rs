@@ -1,6 +1,6 @@
-//! AV1 encoder — round 1 (intra-only keyframe headers).
+//! AV1 encoder — round 2 (forward range coder + framing).
 //!
-//! Scope statement (round 1, May 2026):
+//! Scope statement (round 1, May 2026 — shipped):
 //!
 //! - Bitstream framing (OBU header + leb128 size prefix).
 //! - Sequence Header OBU body — profile 0 / 8-bit 4:2:0 /
@@ -8,32 +8,57 @@
 //! - Frame Header OBU body — single KEY frame, single tile, single
 //!   64×64 superblock, fixed `base_q_idx`, all loop-filter / CDEF /
 //!   LR / film-grain features off.
-//! - Tile-group OBU body — round-1 PLACEHOLDER. The recursive
-//!   arithmetic coder + per-block partition / mode / coefficient
-//!   syntax is **not yet implemented**; the encoder emits a 16-byte
-//!   zero stub so the decoder's `parse_tile_group_header` +
-//!   `split_tile_payloads` succeed but the actual symbol decode is a
-//!   round 2+ deliverable.
+//! - Tile-group OBU body — round-1 PLACEHOLDER (16-byte zero stub).
 //!
-//! ## Round 2+ checklist
+//! Round 2 (May 2026 — in progress):
 //!
-//! 1. Forward range coder (mirror of [`crate::symbol::SymbolDecoder`]).
-//! 2. Partition emit — round 1 frames are 16×16 / 32×32 / 64×64; the
-//!    partition tree is `PARTITION_NONE` at every node down to a
-//!    single block per superblock.
-//! 3. Intra mode emit — DC_PRED only. The decoder's CDF for
-//!    `intra_frame_y_mode_cdf` indexes by neighbour modes; the
-//!    encoder must mirror the context derivation.
-//! 4. TX-type emit — DCT_DCT only.
-//! 5. Forward 4×4 DCT + quantisation (`fdct4x4` + Q-step from
-//!    [`crate::quant`]).
-//! 6. Coefficient entropy emit — `txb_skip` / `eob_pt` /
-//!    `coeff_base_*` / sign bits / Golomb-Rice tail.
-//! 7. Cross-validate against `dav1d`.
+//! - **Forward range coder** ([`symbol::SymbolEncoder`]) — bit-exact
+//!   inverse of [`crate::symbol::SymbolDecoder`], pinned by
+//!   `decode(encode(symbols)) == symbols` roundtrip tests on the
+//!   default partition CDF and a representative mix of bool/symbol
+//!   streams. Uses a wide-bigint V-tracking representation rather
+//!   than the streaming carry-deferral scheme libaom uses; correct
+//!   for round-2 single-superblock payloads (<1 KB) but a future
+//!   round-3+ optimisation can switch to a precarry-buffer encoder
+//!   if memory matters.
 //!
-//! Each numbered item is a substantial chunk of work; round 1
-//! intentionally lands the framing first so subsequent rounds can
-//! focus on the entropy + reconstruction loops in isolation.
+//! ## Round 3+ checklist
+//!
+//! Items 2-6 below were originally scoped for round 2 but the
+//! forward range coder turned out to be the biggest engineering
+//! risk; round 2 ships only item 1 cleanly. Items 2-6 are deferred
+//! with the following acceptance criteria:
+//!
+//! 2. **Partition emit** — single 64×64 SB, no recursive partitioning.
+//!    Mirrors [`crate::decode::superblock::decode_partition_node`]:
+//!    write `partition_cdf[bsl_ctx*4 + ctx]` symbol with above/left
+//!    context = 0/0 for the first SB. The CDF lives in
+//!    [`crate::cdfs::DEFAULT_PARTITION_CDF`].
+//! 3. **DC_PRED intra mode emit** — mirror the decoder's neighbour
+//!    derivation in
+//!    [`crate::decode::superblock::decode_leaf_block`]: read
+//!    `mode_ctx_bucket(above_mode)` × `mode_ctx_bucket(left_mode)`
+//!    and emit through `kf_y_mode_cdf[a][l]` from
+//!    [`crate::cdfs::DEFAULT_KF_Y_MODE_CDF`]. Also requires emitting
+//!    `skip` / `segment_id` / `cdef` / `delta_q` / `delta_lf` (most
+//!    of these are no-ops because the round-2 frame header turns the
+//!    features off).
+//! 4. **TX-type emit** — DCT_DCT only. Skipped if `coded_lossless`
+//!    forces `Only4x4`; otherwise mirror
+//!    [`crate::decode::tile::TileDecoder::decode_tx_depth`] +
+//!    `decode_tx_type` reads.
+//! 5. **Forward 4×4 DCT** in [`transform`] — currently only
+//!    `residual4x4` shipped. Pin against `inverse_2d_spec` for ±1
+//!    LSB roundtrip.
+//! 6. **Coefficient entropy emit** — `txb_skip` / `eob_pt` /
+//!    `coeff_base_*` / signs / Golomb-Rice tail. Mirror
+//!    [`crate::decode::coeffs::decode_coefficients`].
+//! 7. **dav1d cross-validation** — gate on items 1-6 producing a
+//!    decoder-readable stream first.
+//!
+//! Each numbered item is a substantial chunk of work; round 2
+//! intentionally lands the entropy coder first so rounds 3+ can
+//! focus on the per-block syntax in isolation.
 
 pub mod bitwriter;
 pub mod frame_header;
