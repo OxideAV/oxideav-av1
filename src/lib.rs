@@ -38,6 +38,7 @@ pub mod cdfs;
 pub mod decode;
 pub mod decoder;
 pub mod dpb;
+pub mod encoder;
 pub mod extradata;
 pub mod filmgrain;
 pub mod frame_header;
@@ -83,11 +84,13 @@ pub fn register(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
             .tag(CodecTag::fourcc(b"AV01")),
     );
 }
 
 pub use decoder::{make_decoder, Av1Decoder};
+pub use encoder::{make_encoder, write_keyframe_stream, Av1Encoder, FrameConfig, SequenceConfig};
 pub use extradata::Av1CodecConfig;
 pub use frame_header::{parse_frame_header, parse_frame_obu, FrameHeader, FrameType, ParseDepth};
 pub use obu::{iter_obus, parse_config_obus, parse_obu_header, read_obu, Obu, ObuHeader, ObuType};
