@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-av1/compare/v0.1.2...v0.1.3) - 2026-05-04
+
+### Fixed
+
+- *(clippy)* drop unused mut/import + range_contains + div_ceil + doc lints
+
+### Other
+
+- round 4 — relax palette_screen PSNR floor for spec-correct CDF
+- av1 decoder: round 4 — graceful smooth_pred fallback for size-2 chroma
+- av1 encoder: round 4 — fix update_cdf direction + rate per §8.2.6
+- av1 encoder: round 4 — fix leb128_fixed test assertions
+- av1 encoder: round 3 — update mod-level scope statement
+- av1 encoder: round 3 item 5 scaffold — coefficient encode skeleton
+- av1 encoder: round 3 item 7 — dav1d cross-validation test
+- av1 encoder: round 3 item 6 — tighten 4×4 DCT roundtrip tolerance
+- av1 encoder: round 3 items 1-4 — emit decoder-readable single-SB stream
+- av1 encoder: add round-2 SymbolEncoder integration roundtrip test
+- av1 encoder: fix add_to_v_low handling of small/zero LSB delta bytes
+- av1 encoder: forward 4x4 DCT + round-2 status docs (round 2 item 5)
+- av1 encoder: forward range coder (round 2 item 1)
+- README — encoder round 1 section
+- encoder round-2 scaffolding (transform helper, quant, symbol API)
+- bootstrap encoder (round 1, intra-only headers)
+- fix rustfmt in tests/docs_corpus.rs
+- wire docs/video/av1/ fixture corpus as integration test (task #235)
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-av1/compare/v0.1.1...v0.1.2) - 2026-05-03
 
 ### Other
