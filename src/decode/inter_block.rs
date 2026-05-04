@@ -275,14 +275,10 @@ pub fn decode_inter_block_syntax(
             // §5.11.18 / §9.4 cfl_allowed gate for the 14-symbol UV
             // CDF: `max(W, H) <= 32` (or chroma-residual 4×4 in the
             // coded-lossless case).
-            let lossless =
-                crate::frame_header_tail::coded_lossless_hint(&td.frame.quant);
+            let lossless = crate::frame_header_tail::coded_lossless_hint(&td.frame.quant);
             let chroma_4x4 = if lossless {
                 crate::decode::superblock::chroma_residual_dims(
-                    w as usize,
-                    h as usize,
-                    fs.sub_x,
-                    fs.sub_y,
+                    w as usize, h as usize, fs.sub_x, fs.sub_y,
                 ) == (4, 4)
             } else {
                 false
