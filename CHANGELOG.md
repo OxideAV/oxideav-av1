@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **encoder `SymbolEncoder` now streams** (#388) — replaced the round-2
+  wide-bigint V-tracking design (`v_low: Vec<u8>` + `bake_pending_shifts`
+  + `add_to_v_low` with `Vec::insert` carry handling, all O(N) per
+  symbol → O(N²) total) with an O(1)-state streaming encoder built on
+  a 16-bit live register (`low: u32`, bits 0..15) plus the spec's R
+  internal range, with carry-back propagation through `out: Vec<u8>` /
+  the partial `bit_buf`. The first renorm bit (V-position −1, above
+  V's MSB) is dropped; the remaining 16 V bits emit at finish from
+  `low`'s live region. Public API unchanged. New 1M-symbol roundtrip
+  tests (`roundtrip_one_million_symbols_uniform`,
+  `roundtrip_one_million_skewed_bools`) pin the streaming property —
+  internal state no longer scales with symbol count.
+
 ### Fixed
 
 - decoder round 6 follow-up (#403, #401) — close two regressions

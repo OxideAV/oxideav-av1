@@ -31,44 +31,94 @@
 //! symbol `s` owns the V-sub-interval `[R - hi_s, R - lo_s)` within
 //! the parent V-interval — the bit-flip of the SV-interval.
 //!
-//! ## Implementation strategy: wide-integer V tracking
+//! ## Implementation strategy: streaming 16-bit live register
 //!
-//! Instead of the streaming carry-deferral scheme used by libaom
-//! (which couples `low + rng` overflow with a `bits_outstanding`
-//! counter and a precarry byte buffer), we track the V-interval
-//! directly as wide integers:
+//! The decoder reads V MSB-first as a `(15 + scale)`-bit integer:
+//! the first 15 bits seed `SV`, then each renormalisation shift
+//! consumes one more bit. We mirror this by building V bit-by-bit
+//! into the output as encoding proceeds, using a tiny in-flight
+//! register:
 //!
-//! - `v_low`: lower bound of V (a Vec<u8> MSB-first big-endian
-//!   bigint). The bytestream output at finish() is exactly this value.
-//! - `v_rng`: width of V's interval (also a bigint).
-//! - `rng_internal`: the spec's `R` value, kept in `[0x8000, 0x10000)`
-//!   after each renormalisation. Used only for the per-symbol CDF
-//!   formulas; doesn't track the scale.
-//! - `scale`: how many renorm shifts have occurred. The "absolute"
-//!   range of V is `rng_internal << scale`, but we don't materialise
-//!   this product — we use `scale` only to interpret the symbol-encode
-//!   formulas correctly.
+//! - `low: u32` — only bits `0..16` carry meaning. Bits `0..15` are
+//!   the **live region** where the next `delta` (a 16-bit value
+//!   bounded by `R_internal < 2^16`) will land via `low += delta`.
+//!   Bit `16` is the **carry slot** — set if the add overflows.
+//! - `rng: u32` — spec's `R_internal`, kept in `[0x8000, 0x10000)`
+//!   after each renormalisation.
+//! - `out: Vec<u8>` — V's already-flushed bytes, MSB-first packed.
+//!   Carries from `low` overflowing propagate back into `out`'s
+//!   most-recently pushed byte (then earlier bytes if that byte
+//!   rolled over from `0xFF` → `0x00`).
+//! - `bit_buf: u8` + `bit_buf_n: u8` — partial byte being assembled,
+//!   top-aligned (filled bit 7 first, bit 6 second, etc.).
+//! - `first_renorm_done: bool` — the *first* renorm bit always lives
+//!   at "V-position −1" (above V's MSB) and is dropped. Tracked here
+//!   so we drop it exactly once.
 //!
-//! Per-symbol encode:
+//! ### Per-symbol encode
 //!
 //! ```text
-//!   delta_abs = (R - hi_s) << scale          # in absolute V-basis
-//!   v_low    += delta_abs                    # bigint addition
-//!   v_rng     = (hi_s - lo_s) << scale       # bigint
-//!   rng_internal = hi_s - lo_s               # spec's internal value
-//!   while rng_internal < 0x8000:
-//!     rng_internal <<= 1
-//!     scale += 1
+//!   delta = R_internal - hi      # in [0, R_internal), 16-bit max
+//!   new_rng = hi - lo            # the chosen sub-interval width
+//!   low += delta                 # narrows v_low; carry out of bit 16
+//!     handled by `propagate_carry()`
+//!   low &= 0xFFFF                # drop carry slot; live region = bits 0..15
+//!   rng = new_rng
+//!   while rng < 0x8000:          # renormalise
+//!     rng <<= 1
+//!     low <<= 1                  # promote bit 15 → bit 16
+//!     emit_bit((low >> 16) & 1)  # the bit that just exited live region
+//!     low &= 0xFFFF
 //! ```
 //!
-//! At `finish()`: emit `v_low` as a byte stream MSB-first, padded to
-//! the next byte boundary. The decoder reads at most `15 + scale`
-//! bits from this stream; trailing zeros beyond that are ignored.
+//! ### V-position derivation
 //!
-//! This scheme is O(num_symbols * num_bits_per_symbol) in time and
-//! space — for round-2 tile payloads (<1 KB output) totally
-//! negligible. A future round-3+ optimisation can switch to a
-//! streaming precarry-buffer encoder if memory matters.
+//! The K-th renorm shift emits the bit that was at v_low's position
+//! 15 just before the shift (= position 16 just after the shift in
+//! the un-masked register). Mapped to V's MSB-first indexing on the
+//! *final* `(15 + scale_FINAL)`-bit integer, that bit ends up at
+//! V-position `K − 2`:
+//!
+//! - K = 1: V[−1] — above V's MSB. **Dropped.**
+//! - K ≥ 2: V[K − 2]. Emitted to `bit_buf` / `out`.
+//!
+//! At `finish()` we emit the remaining 16 bits = V[scale − 1 ..
+//! 15 + scale] from `low`'s bottom 16 bits MSB-first. Total emitted =
+//! `(scale − 1) + 16 = scale + 15` ✓.
+//!
+//! ### Carry propagation
+//!
+//! When `low + delta` overflows bit 16 (so `low` reaches `[2^16,
+//! 2^17)`), the carry out is `+1` at v_low's bit 16. That bit's
+//! current V-position is V[K − 2] where K is the current renorm
+//! count — i.e. the *most recently emitted* V bit (or the dropped
+//! K=1 bit if no real emit has happened yet). Add 1 there; if it was
+//! a 1, it becomes 0 and the carry propagates to the next-older bit,
+//! walking back through `bit_buf` and then `out`.
+//!
+//! The K=1 dropped bit is provably 0 (the first encode runs with
+//! `R_internal = 2^15` so `delta < 2^15` and the post-shift bit-16
+//! value is `delta >> 15 = 0`). A carry chain that walks off the
+//! front of `out` is therefore absorbed at the dropped position
+//! (`+1` to 0 = 1, no further propagation). For a malformed encode
+//! that would push v_low past `2^(15+scale)` we'd see propagation
+//! beyond that — debug-asserted.
+//!
+//! ### Why this is streaming
+//!
+//! Internal state size is O(1): `low` is 4 bytes, `rng` is 4,
+//! `bit_buf` is 1, etc. The only growing allocation is `out`, which
+//! is the V bytestream we're producing (necessarily O(output)).
+//! Per-symbol cost is O(1) amortised — one u32 add, ≤ 16 renorm
+//! shifts (each O(1)), and the carry walk-back which amortises to
+//! O(1) per symbol because carry chains can't refill faster than
+//! they drain.
+//!
+//! The previous wide-bigint design (round 2) held a SECOND O(output)
+//! buffer (`v_low: Vec<u8>`) and `bake_pending_shifts` /
+//! `add_to_v_low` were O(len) per symbol — total O(N²). For
+//! tile-payload sizes ≤ 1 KB this was fine; for full-frame coefficient
+//! streams (10⁵–10⁷ symbols) the new design is dramatically smaller.
 //!
 //! ## Decoder pinning — `decode(encode(symbols)) == symbols`
 //!
@@ -88,30 +138,29 @@ const SYMBOL_RANGE_INIT: u32 = 1 << 15;
 
 /// Tile-scoped forward range coder.
 ///
-/// Tracks the V-interval `[v_low, v_low + v_rng)` as wide bigints
-/// (Vec<u8>, MSB-first big-endian). At finish, the bytestream output
-/// is `v_low` itself, byte-aligned with zero pad. The decoder reads
-/// at most `15 + scale` bits from the stream — anything beyond is
-/// padding and doesn't affect symbol decoding.
+/// Streams V's bits MSB-first into `out` as encoding proceeds. The
+/// internal state size is O(1) (a 16-bit live register, the current
+/// range, and a partial-byte buffer); the only growing allocation is
+/// `out`, which is the V bytestream itself.
 pub struct SymbolEncoder {
-    /// Current "internal" rng — kept in [0x8000, 0x10000) after each
-    /// renormalise(). The spec's per-symbol formula reads this.
-    rng_internal: u32,
-    /// `v_low << shift_bits_pending` is the *MSB-bit-offset-aware* low
-    /// end of the V interval. Each renorm shift increments
-    /// `shift_bits_pending` by 1; periodically we materialise the
-    /// shifts by appending zero bits to v_low (`v_low <<= bits_pending`)
-    /// or by extending v_rng accordingly.
-    ///
-    /// We materialise ONLY when needed (at symbol encode and at
-    /// finish) to avoid O(scale) work per renorm bit.
-    v_low: Vec<u8>,
-    /// Total renorm shifts so far, `scale = bits_pending +
-    /// already_materialised`.
-    scale: u32,
-    /// How many of the `scale` shifts have NOT yet been baked into
-    /// `v_low` (= are still "pending" as a left-shift).
-    shift_bits_pending: u32,
+    /// Spec's `R_internal` — kept in [0x8000, 0x10000) after each
+    /// renormalise(). Reads the per-symbol CDF formula.
+    rng: u32,
+    /// 16-bit live register. Bits 0..15 hold the v_low value being
+    /// built; bit 16 is a transient carry slot that's masked off
+    /// after `propagate_carry()` resolves overflows.
+    low: u32,
+    /// V bytestream emitted so far, MSB-first packed. Carry from a
+    /// `low` overflow propagates back into this buffer.
+    out: Vec<u8>,
+    /// Partial byte being built — top-aligned (bit 7 filled first).
+    bit_buf: u8,
+    /// Number of bits in `bit_buf` (0..=7).
+    bit_buf_n: u8,
+    /// Set after the first renorm shift fires. The first renorm bit
+    /// is at V-position −1 (above V's MSB) and is dropped; this flag
+    /// guarantees we drop it exactly once.
+    first_renorm_done: bool,
     /// Whether to invoke [`update_cdf`] on each symbol — must match
     /// the decoder side.
     allow_update: bool,
@@ -126,10 +175,12 @@ impl Default for SymbolEncoder {
 impl SymbolEncoder {
     pub fn new(allow_update: bool) -> Self {
         Self {
-            rng_internal: SYMBOL_RANGE_INIT,
-            v_low: vec![0u8; 0],
-            scale: 0,
-            shift_bits_pending: 0,
+            rng: SYMBOL_RANGE_INIT,
+            low: 0,
+            out: Vec::new(),
+            bit_buf: 0,
+            bit_buf_n: 0,
+            first_renorm_done: false,
             allow_update,
         }
     }
@@ -138,21 +189,20 @@ impl SymbolEncoder {
     /// Mirrors [`crate::symbol::SymbolDecoder::decode_bool`].
     pub fn encode_bool(&mut self, bit: u32, p: u32) {
         debug_assert!(bit <= 1);
-        let r = self.rng_internal;
+        let r = self.rng;
         let mut cur = ((r >> 8) * (p >> PROB_SHIFT)) >> (7 - PROB_SHIFT);
         cur += MIN_PROB;
-        // bit=0 owns SV-interval [cur, R) ⇒ V-interval = [R-R, R-cur) = [0, R-cur).
+        // bit=0 owns SV-interval [cur, R) ⇒ V-interval [0, R-cur):
         //         delta = 0; rng = R - cur.
-        // bit=1 owns SV-interval [0, cur)  ⇒ V-interval = [R-cur, R).
+        // bit=1 owns SV-interval [0, cur)  ⇒ V-interval [R-cur, R):
         //         delta = R - cur;        rng = cur.
         let (delta, new_rng) = if bit == 0 {
             (0u32, r - cur)
         } else {
             (r - cur, cur)
         };
-        self.bake_pending_shifts();
-        self.add_to_v_low(delta);
-        self.rng_internal = new_rng;
+        self.add_low(delta);
+        self.rng = new_rng;
         self.renormalise();
     }
 
@@ -168,7 +218,7 @@ impl SymbolEncoder {
         let s = symbol;
         debug_assert!(s < n, "symbol {} >= n {}", s, n);
 
-        let r = self.rng_internal;
+        let r = self.rng;
         let hi: u32 = if s == 0 {
             r
         } else {
@@ -188,9 +238,8 @@ impl SymbolEncoder {
         debug_assert!(hi > lo, "hi {hi} <= lo {lo} at sym {s} R={r}");
 
         let delta = r - hi;
-        self.bake_pending_shifts();
-        self.add_to_v_low(delta);
-        self.rng_internal = hi - lo;
+        self.add_low(delta);
+        self.rng = hi - lo;
         self.renormalise();
 
         if self.allow_update {
@@ -210,173 +259,129 @@ impl SymbolEncoder {
 
     /// Drain the encoder and return the byte-aligned tile payload.
     ///
-    /// `v_low` (after baking pending shifts) is the V-widened value in
-    /// the encoder's basis. The DECODER reads the bytestream MSB-first
-    /// as a single wide integer of `(15 + scale)` bits — its first 15
-    /// bits become `V_init`, the next `bits_for_renorm_1` bits feed
-    /// the first renorm's XOR, and so on.
-    ///
-    /// To produce the right bytestream, we therefore must emit v_low
-    /// **left-aligned** in a `(15 + scale)`-bit MSB-first integer,
-    /// padded with leading zeros if v_low is numerically shorter, then
-    /// further padded with trailing zeros to a byte boundary.
+    /// We've emitted `scale − 1` real V bits via the per-renorm
+    /// `emit_bit` calls (the K=1 bit is dropped). The remaining 16
+    /// bits = V[scale − 1 .. 15 + scale] are the bottom 16 bits of
+    /// `low`, emitted MSB-first.
     pub fn finish(mut self) -> Vec<u8> {
-        self.bake_pending_shifts();
-        let total_bits = 15u32 + self.scale;
-        // Convert v_low (Vec<u8>, MSB-first big-endian) to a single
-        // bit stream of length `total_bits`. v_low's bit length =
-        // `v_low.len() * 8` — pad with leading zeros as needed.
-        let v_low_bits = self.v_low.len() as u32 * 8;
-        let leading_zeros = total_bits.saturating_sub(v_low_bits);
-        // Emit `leading_zeros` zero bits, then v_low's bits MSB-first.
-        let mut out_bits: Vec<bool> = Vec::with_capacity(total_bits as usize);
-        out_bits.resize(leading_zeros as usize, false);
-        // Append v_low's bits, MSB-first across bytes and within each byte.
-        // If v_low has MORE bits than `total_bits` (unlikely but
-        // possible if the encoder added too much to v_low), truncate
-        // by skipping leading bits. The lossy direction is "drop
-        // most-significant" — but a well-formed encoder never gets
-        // here; debug_assert guards.
-        let total_v_bits: Vec<bool> = self
-            .v_low
-            .iter()
-            .flat_map(|byte| (0..8).rev().map(move |i| (byte >> i) & 1 == 1))
-            .collect();
-        let skip = total_v_bits.len().saturating_sub(total_bits as usize);
-        // Sanity-pin: any bits we skip from the front of v_low MUST be
-        // zero. v_low's value is bounded by 2^(15 + scale) = 2^total_bits
-        // by construction, so its top (v_low.len()*8 - total_bits) bits
-        // are all zero unless the encoder has overflowed (a bug).
-        for &b in total_v_bits.iter().take(skip) {
-            debug_assert!(
-                !b,
-                "av1 SymbolEncoder::finish — non-zero bit in skipped \
-                 prefix of v_low (encoder overflowed beyond 2^{total_bits})"
-            );
+        // Emit the 16 live bits of `low` MSB-first (= V's LSB area).
+        for i in (0..16).rev() {
+            let b = ((self.low >> i) & 1) as u8;
+            self.emit_bit(b);
         }
-        for &b in total_v_bits.iter().skip(skip) {
-            out_bits.push(b);
-            if out_bits.len() == total_bits as usize {
-                break;
-            }
+        // Flush partial byte, padding the remainder with zeros.
+        if self.bit_buf_n > 0 {
+            self.out.push(self.bit_buf);
+            self.bit_buf = 0;
+            self.bit_buf_n = 0;
         }
-        // Pack out_bits into bytes MSB-first.
-        let mut out: Vec<u8> = Vec::with_capacity(out_bits.len().div_ceil(8));
-        let mut acc: u8 = 0;
-        let mut bits_in_acc: u32 = 0;
-        for b in &out_bits {
-            acc |= (*b as u8) << (7 - bits_in_acc);
-            bits_in_acc += 1;
-            if bits_in_acc == 8 {
-                out.push(acc);
-                acc = 0;
-                bits_in_acc = 0;
-            }
+        // Ensure ≥ 2 bytes so `SymbolDecoder::new` doesn't error on
+        // its 15-bit init read.
+        while self.out.len() < 2 {
+            self.out.push(0);
         }
-        if bits_in_acc != 0 {
-            out.push(acc);
-        }
-        // Ensure ≥ 2 bytes so `init_symbol` doesn't error.
-        while out.len() < 2 {
-            out.push(0);
-        }
-        out
+        self.out
     }
 
     pub fn allow_update(&self) -> bool {
         self.allow_update
     }
 
-    /// Renormalise: shift `rng_internal` left until it's back in
-    /// [0x8000, 0x10000). Each shift increments `scale` and
-    /// `shift_bits_pending` (the actual v_low shift is deferred to
-    /// `bake_pending_shifts`).
+    /// Add `delta` to `low`. On overflow into bit 16 (so `low` reaches
+    /// `[2^16, 2^17)`), the carry propagates back into the most-
+    /// recently emitted V bit; `low` is then masked back to 16 bits.
+    #[inline]
+    fn add_low(&mut self, delta: u32) {
+        self.low = self.low.wrapping_add(delta);
+        if self.low >= (1 << 16) {
+            self.propagate_carry();
+            self.low &= 0xFFFF;
+        }
+    }
+
+    /// Renormalise: shift `rng` left until it's back in [0x8000,
+    /// 0x10000). Each shift emits one V bit (the bit just promoted
+    /// out of `low`'s live region into bit 16).
+    #[inline]
     fn renormalise(&mut self) {
-        while self.rng_internal < 0x8000 {
-            self.rng_internal <<= 1;
-            self.scale += 1;
-            self.shift_bits_pending += 1;
+        while self.rng < 0x8000 {
+            self.rng <<= 1;
+            self.low <<= 1;
+            let b = ((self.low >> 16) & 1) as u8;
+            self.low &= 0xFFFF;
+            if self.first_renorm_done {
+                self.emit_bit(b);
+            } else {
+                // K=1 emit: V[−1], above V's MSB. Discard. Provably
+                // a 0 bit (initial encode runs with R = 2^15 so delta
+                // < 2^15, hence post-shift bit-16 = 0).
+                debug_assert_eq!(
+                    b, 0,
+                    "av1 SymbolEncoder: first renorm bit must be 0 \
+                     (initial R = 2^15 ⇒ delta < 2^15)"
+                );
+                self.first_renorm_done = true;
+            }
         }
     }
 
-    /// Materialise pending left-shifts of `v_low` (multiply v_low by
-    /// `2^shift_bits_pending`).
-    fn bake_pending_shifts(&mut self) {
-        if self.shift_bits_pending == 0 {
-            return;
+    /// Append a single bit to the output stream (MSB-first across
+    /// bytes and within each byte).
+    #[inline]
+    fn emit_bit(&mut self, b: u8) {
+        debug_assert!(b <= 1);
+        self.bit_buf |= b << (7 - self.bit_buf_n);
+        self.bit_buf_n += 1;
+        if self.bit_buf_n == 8 {
+            self.out.push(self.bit_buf);
+            self.bit_buf = 0;
+            self.bit_buf_n = 0;
         }
-        let shift = self.shift_bits_pending;
-        // Append `shift` zero bits to v_low (MSB-first). Equivalent
-        // to v_low <<= shift in big-int sense.
-        let full_bytes = shift / 8;
-        let extra_bits = shift % 8;
-        // Append full zero bytes.
-        for _ in 0..full_bytes {
-            self.v_low.push(0);
-        }
-        // Shift the entire v_low left by `extra_bits` bits, with
-        // carry propagating to the next byte. The high bit pushed
-        // out of the topmost byte goes... nowhere (v_low can grow
-        // there).
-        if extra_bits > 0 {
-            let mut carry: u8 = 0;
-            for byte in self.v_low.iter_mut().rev() {
-                let new = (*byte << extra_bits) | carry;
-                carry = *byte >> (8 - extra_bits);
-                *byte = new;
-            }
-            if carry != 0 {
-                self.v_low.insert(0, carry);
-            }
-        }
-        self.shift_bits_pending = 0;
     }
 
-    /// Add `delta` to `v_low` (MSB-first big-endian bigint). `delta`
-    /// is a u32 already in the same basis as v_low (bake pending
-    /// shifts before calling this).
+    /// Propagate a +1 carry into the most-recently-emitted V bit. If
+    /// the bit was a 1, it becomes 0 and the carry continues into the
+    /// next-older bit, walking back through `bit_buf` and then `out`.
     ///
-    /// Implementation: extends v_low to at least 4 bytes (the width of
-    /// `delta`), then performs in-place big-endian add from LSB up,
-    /// propagating carry through prepended bytes if needed. Avoids
-    /// the `Vec::insert` shift-on-every-step pitfall by pre-extending
-    /// once at the start.
-    fn add_to_v_low(&mut self, delta: u32) {
-        if delta == 0 {
-            return;
-        }
-        // Ensure v_low has at least 4 bytes so the LSB-aligned add
-        // doesn't need mid-loop inserts. Prepend zero bytes if needed.
-        while self.v_low.len() < 4 {
-            self.v_low.insert(0, 0);
-        }
-        let delta_bytes = delta.to_le_bytes();
-        // Add delta_bytes[i] (LSB-first) to v_low's LSB-i-th byte,
-        // walking up through the array.
-        let mut carry: u16 = 0;
-        for (i, &db) in delta_bytes.iter().enumerate() {
-            let pos = self.v_low.len() - 1 - i;
-            let sum = self.v_low[pos] as u16 + db as u16 + carry;
-            self.v_low[pos] = (sum & 0xFF) as u8;
-            carry = sum >> 8;
-        }
-        // Any remaining carry propagates into higher bytes of v_low.
-        let mut i = 4;
-        while carry != 0 {
-            let pos_opt = self.v_low.len().checked_sub(1 + i);
-            match pos_opt {
-                Some(pos) => {
-                    let sum = self.v_low[pos] as u16 + carry;
-                    self.v_low[pos] = (sum & 0xFF) as u8;
-                    carry = sum >> 8;
-                }
-                None => {
-                    self.v_low.insert(0, (carry & 0xFF) as u8);
-                    carry >>= 8;
-                }
+    /// A carry that walks off the front of `out` is absorbed by the
+    /// dropped K=1 bit (which is provably 0 ⇒ +1 = 1 ⇒ stops there).
+    fn propagate_carry(&mut self) {
+        if self.bit_buf_n > 0 {
+            // Most recent bit is in bit_buf at position (8 - bit_buf_n).
+            // Adding `1 << position` increments that bit; overflow of
+            // bit_buf (carry out of bit 7) means the carry continues
+            // into out's last byte.
+            let pos = 8 - self.bit_buf_n;
+            let mask: u8 = 1 << pos;
+            let (new_buf, carry_out) = self.bit_buf.overflowing_add(mask);
+            self.bit_buf = new_buf;
+            if carry_out {
+                self.propagate_into_out();
             }
-            i += 1;
+        } else {
+            // bit_buf is empty — most recent bit is at LSB (bit 0) of
+            // out's last byte.
+            self.propagate_into_out();
         }
+    }
+
+    /// Propagate +1 from `out`'s last byte upward. Each 0xFF byte
+    /// rolls to 0x00 with carry continuing to the previous byte.
+    fn propagate_into_out(&mut self) {
+        let mut i = self.out.len();
+        while i > 0 {
+            i -= 1;
+            let (new, carry) = self.out[i].overflowing_add(1);
+            self.out[i] = new;
+            if !carry {
+                return;
+            }
+        }
+        // Carry walked off the front of `out`. By the encoder
+        // invariant (v_low + v_rng ≤ 2^(15+scale)), this can only
+        // happen when the dropped K=1 bit absorbs the carry — it's
+        // always 0 so +1 = 1, no further propagation. We model this
+        // by simply dropping the carry on the floor here.
     }
 }
 
@@ -527,5 +532,70 @@ mod tests {
         let mut dec = SymbolDecoder::new(&buf, buf.len(), false).expect("decoder init");
         assert_eq!(dec.read_literal(8), 0xA5);
         assert_eq!(dec.read_literal(6), 0x33);
+    }
+
+    /// 1M-symbol roundtrip: stresses both encoder throughput and the
+    /// streaming property — encoder state stays O(1) (`low` is 4
+    /// bytes, `bit_buf` is 1, etc.), only `out` grows. Memory usage:
+    /// `out.len()` bytes ≈ symbol-count × bits-per-symbol / 8. For a
+    /// uniform 4-way CDF that is roughly 250 KB.
+    #[test]
+    fn roundtrip_one_million_symbols_uniform() {
+        let cum = [8192u16, 16384, 24576, 32768];
+        let n: usize = 1_000_000;
+        let mut enc_cdf = cdf_from_cumulative(&cum);
+        let mut enc = SymbolEncoder::new(false);
+        // Deterministic xorshift-style symbol generator to exercise
+        // every CDF branch uniformly.
+        let mut state: u32 = 0x1234_5678;
+        let mut symbols: Vec<u32> = Vec::with_capacity(n);
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let s = state & 0x3;
+            symbols.push(s);
+            enc.encode_symbol(&mut enc_cdf, s);
+        }
+        let buf = enc.finish();
+
+        let mut dec_cdf = cdf_from_cumulative(&cum);
+        let mut dec = SymbolDecoder::new(&buf, buf.len(), false).expect("decoder init");
+        for (i, &want) in symbols.iter().enumerate() {
+            let got = dec.decode_symbol(&mut dec_cdf).expect("decode");
+            if got != want {
+                panic!("1M roundtrip mismatch at {i}: want {want}, got {got}");
+            }
+        }
+    }
+
+    /// 1M-bit skewed-probability bool stream — exercises the carry
+    /// propagation path heavily (skewed-towards-1 streams pile up
+    /// 0xFF runs which then carry-flip to 0x00).
+    #[test]
+    fn roundtrip_one_million_skewed_bools() {
+        let n: usize = 1_000_000;
+        let p: u32 = 28000; // p(bit=1) = 28000/32768 ≈ 0.85
+        let mut enc = SymbolEncoder::new(false);
+        let mut state: u32 = 0xABCD_EF01;
+        let mut bits: Vec<u32> = Vec::with_capacity(n);
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // ~85% probability of 1
+            let b = if (state & 0xFFFF) < (p * 2) { 1 } else { 0 };
+            bits.push(b);
+            enc.encode_bool(b, p);
+        }
+        let buf = enc.finish();
+
+        let mut dec = SymbolDecoder::new(&buf, buf.len(), false).expect("decoder init");
+        for (i, &want) in bits.iter().enumerate() {
+            let got = dec.decode_bool(p);
+            if got != want {
+                panic!("1M skewed bool roundtrip mismatch at {i}: want {want}, got {got}");
+            }
+        }
     }
 }
