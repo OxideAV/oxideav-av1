@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- decoder round 6 follow-up (#403, #401) — close two regressions
+  introduced by the round-6 (#394) spec/clipped split:
+  - **#403 OOB panic**: `gather_neighbors_*` panicked with
+    `index out of bounds` when the SPEC TU walk in
+    `reconstruct_luma_block` / `reconstruct_chroma_block` placed a TU
+    whose top-left already sits past the frame plane (e.g.
+    Block128x128 at y=640 in a 722-tall frame walked at tx_h=16; or
+    any block at the right edge of a frame whose width isn't a
+    multiple of the SB size). The OOB TUs paste-collapse to a no-op
+    but the predictor's neighbor gather still tried to read
+    `(uy-1) * stride + sx` past the plane buffer. Fix: skip the
+    predict + paste step for fully-OOB TUs (`wr_w == 0 || wr_h == 0`)
+    while still consuming residual symbols when `!skip` so the range
+    coder stays synchronized with the §5.11.34 SPEC-dim walk.
+    Repro: oxideav-avif `decoder_pipes_through_av1_errors_cleanly` on
+    `kimono_rotate90`.
+  - **#401 `TX 4×32 not in the AV1 set`**: the round-6 helper
+    `bs_or_clipped_spec(d)` rounded a clipped block dim UP to the
+    next power-of-two ({4, 8, 16, 32, 64, 128}), but for blocks like
+    Block16x64 clipped at the right edge to bw=5 the actual SPEC dim
+    is 16 — `bs_or_clipped_spec(5)=8` produced the wrong spec shape
+    and downstream `chroma_residual_dims(8, 64, 1, 1)` landed on
+    `(spec_cw, spec_ch) = (4, 32)` which is not in the AV1 TX set.
+    Fix: thread the original `bs: BlockSize` through
+    `decode_inter_leaf_block` / `reconstruct_luma_block` /
+    `reconstruct_chroma_block` and recover spec dims directly from
+    `bs.width()` / `bs.height()`. Removes the now-unused
+    `bs_or_clipped_spec` helper. The super-resolution ReportOnly
+    fixture now reaches `visible_produced=1/1` (pending the §7.16
+    super-res upscale step).
+
 - decoder round 6 (#394) — replace the round-5 `run_smooth_padded_*`
   super-resolution shim with the proper spec/clipped split through
   the `reconstruct_luma_block` / `reconstruct_chroma_block` chain.
