@@ -2296,53 +2296,62 @@ fn reconstruct_luma_block(
     decoded_tx_size: Option<TxSize>,
     filter_intra: Option<u8>,
 ) -> Result<()> {
-    let w = bw as usize;
-    let h = bh as usize;
+    // Round 6 #394: the AV1 partition tree assigns a power-of-two
+    // block size; `bw / bh` from `decode_leaf_block` are the FRAME-EDGE
+    // CLIPPED dims (e.g. width 5 instead of 8 on the rightmost SB of
+    // a `super_resolution` upscaled frame). Per §7.11.2 / §5.11.27 the
+    // predictor and the inverse-transform residual operate at the
+    // SPEC block size; only the plane writes are clipped. Thread both
+    // sets through the reconstruct chain so the spec-defined SMOOTH /
+    // directional / TX kernels see their power-of-two inputs and the
+    // shim added in 7d1f297 (`run_smooth_padded_*`) goes away.
+    let spec_w = bs_or_clipped_spec(bw) as usize;
+    let spec_h = bs_or_clipped_spec(bh) as usize;
+    let wr_w = bw as usize;
+    let wr_h = bh as usize;
 
     // §5.11.16 provided a `TxSize` for this block. When present, use it
-    // to partition the block into TX units — this replaces the legacy
-    // `tx_unit_dims(w, h)` 64-sample cap with the spec's `(tx_depth,
-    // maxRectTxSize)` pairing. When absent (inter paths not yet wired
-    // to the var-tx decoder) we fall back to the pre-Round-6 behaviour.
+    // to partition the SPEC-sized block into TX units — clipping the
+    // TX dim against the (spec) block dim only, never against the
+    // frame edge. The plane-write clip happens at paste time inside
+    // each TX unit.
     let (tx_w, tx_h) = match decoded_tx_size {
-        Some(ts) => (ts.width().min(w), ts.height().min(h)),
-        None => tx_unit_dims(w, h),
+        Some(ts) => (ts.width().min(spec_w), ts.height().min(spec_h)),
+        None => tx_unit_dims(spec_w, spec_h),
     };
-    // Guard against degenerate dims — the block footprint must divide
-    // the TX dimensions cleanly; when it doesn't we fall back to the
-    // block size (effectively one TX unit) to avoid a divide-by-zero /
-    // partial-coverage walk.
-    let (tx_w, tx_h) = if tx_w == 0 || tx_h == 0 || w % tx_w != 0 || h % tx_h != 0 {
-        tx_unit_dims(w, h)
+    let (tx_w, tx_h) = if tx_w == 0 || tx_h == 0 || spec_w % tx_w != 0 || spec_h % tx_h != 0 {
+        tx_unit_dims(spec_w, spec_h)
     } else {
         (tx_w, tx_h)
     };
 
-    // Block-level tx_type (§6.10.15): for blocks with area > 32×32 the
-    // ext-tx set is 0 (implicit DCT_DCT, no CDF read), so decoding the
-    // type once here covers every TX unit below without disturbing the
-    // symbol stream. For blocks with area ≤ 32×32 there is exactly one
-    // TX unit (since the block already fits inside a 64×64 TX), so
-    // reading the type once remains spec-correct.
-    //
-    // Per §5.11.47 the `intra_tx_type` symbol is read **per TX unit**,
-    // not per block — we approximate by reading once per block when the
-    // block has only a single TX unit, and once per TX unit otherwise.
-    let single_tx_unit = (w == tx_w) && (h == tx_h);
+    let single_tx_unit = (spec_w == tx_w) && (spec_h == tx_h);
     let block_tx_type = if skip || !single_tx_unit {
         TxType::DctDct
     } else {
         td.decode_intra_tx_type(tx_w, tx_h, y_mode)?
     };
 
-    let cols = w / tx_w;
-    let rows = h / tx_h;
+    let cols = spec_w / tx_w;
+    let rows = spec_h / tx_h;
     let tu_w_4x4 = (tx_w as u32).div_ceil(4);
     let tu_h_4x4 = (tx_h as u32).div_ceil(4);
+    let frame_w = fs.width as usize;
+    let frame_h = fs.height as usize;
     for ty in 0..rows {
         for tx in 0..cols {
             let ux = x as usize + tx * tx_w;
             let uy = y as usize + ty * tx_h;
+            // Each TU is independent in the bitstream (§5.11.39 reads
+            // per-TU), so even TUs whose top-left lies outside the
+            // frame edge still consume their symbols. We DO read /
+            // dequant the residual for them, but the plane-write step
+            // collapses to a no-op when the in-bounds rectangle is
+            // empty.
+            let wr_tu_w = wr_w.saturating_sub(tx * tx_w);
+            let wr_tu_h = wr_h.saturating_sub(ty * tx_h);
+            let wr_tu_w = wr_tu_w.min(frame_w.saturating_sub(ux)).min(tx_w);
+            let wr_tu_h = wr_tu_h.min(frame_h.saturating_sub(uy)).min(tx_h);
             let tx_type = if skip {
                 TxType::DctDct
             } else if single_tx_unit {
@@ -2350,10 +2359,10 @@ fn reconstruct_luma_block(
             } else {
                 td.decode_intra_tx_type(tx_w, tx_h, y_mode)?
             };
-            // §5.11.40 — stamp `TxTypes[y4+j][x4+i]` over this TU so a
-            // later chroma reconstruction can pull the luma TX type
-            // for the adjacent 4×4 luma cell. Stamps even for `skip`
-            // (DCT_DCT is the spec's all-zero branch initialiser).
+            // §5.11.40 — stamp the TU's TxType over its MI cells so
+            // later chroma reconstruction can pull it. Stamp at SPEC
+            // dim (clip against MI grid only) since out-of-frame cells
+            // never get queried.
             let mi_col_tu = (ux as u32) >> 2;
             let mi_row_tu = (uy as u32) >> 2;
             fs.stamp_tx_types(mi_col_tu, mi_row_tu, tu_w_4x4, tu_h_4x4, tx_type);
@@ -2364,6 +2373,8 @@ fn reconstruct_luma_block(
                 uy,
                 tx_w,
                 tx_h,
+                wr_tu_w,
+                wr_tu_h,
                 y_mode,
                 angle_delta,
                 skip,
@@ -2374,6 +2385,27 @@ fn reconstruct_luma_block(
         }
     }
     Ok(())
+}
+
+/// For the round-6 #394 spec/clipped split: when the block extent we
+/// were handed by `decode_leaf_block` is already a power-of-two TX
+/// dimension (the common, non-frame-edge case) the two are equal.
+/// Frame-edge non-power-of-two clips round UP to the next AV1 TX dim
+/// in `{4, 8, 16, 32, 64, 128}` so the predictor / residual run at
+/// the spec block size. The SMOOTH weight tables exist only for
+/// these dims, which is why the prior `run_smooth_padded_*` shim had
+/// to pad up; threading the spec dim downstream removes the need.
+#[inline]
+fn bs_or_clipped_spec(d: u32) -> u32 {
+    match d {
+        0 => 0,
+        1..=4 => 4,
+        5..=8 => 8,
+        9..=16 => 16,
+        17..=32 => 32,
+        33..=64 => 64,
+        _ => 128,
+    }
 }
 
 /// Predict + (optional) decode residual for a single luma TX unit at
@@ -2390,6 +2422,8 @@ fn reconstruct_one_luma_tx_unit(
     uy: usize,
     tx_w: usize,
     tx_h: usize,
+    wr_w: usize,
+    wr_h: usize,
     y_mode: IntraMode,
     angle_delta: i8,
     skip: bool,
@@ -2409,9 +2443,11 @@ fn reconstruct_one_luma_tx_unit(
         0
     };
 
-    // Predict + paste.
+    // Predict at SPEC TX size; paste only the in-bounds rectangle.
+    // Round 6 #394 — see `reconstruct_luma_block` for the
+    // spec-vs-clipped split rationale.
     if fs.bit_depth == 8 {
-        let pred = run_intra_prediction_u8(
+        let mut pred = run_intra_prediction_u8(
             &fs.y_plane,
             stride,
             fs.height as usize,
@@ -2426,9 +2462,37 @@ fn reconstruct_one_luma_tx_unit(
             filter_type,
             filter_intra,
         );
-        paste_block(&mut fs.y_plane, stride, ux, uy, &pred, tx_w, tx_h);
+        if skip {
+            paste_block_clipped(
+                &mut fs.y_plane,
+                stride,
+                ux,
+                uy,
+                &pred,
+                tx_w,
+                tx_h,
+                wr_w,
+                wr_h,
+            );
+            return Ok(());
+        }
+        // Decode + dequant + IDCT residual at spec TX size; add to
+        // the spec-sized predictor in place; paste clipped.
+        let coeffs = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type)?;
+        clip_add_in_place(&mut pred, &coeffs, tx_w, tx_h);
+        paste_block_clipped(
+            &mut fs.y_plane,
+            stride,
+            ux,
+            uy,
+            &pred,
+            tx_w,
+            tx_h,
+            wr_w,
+            wr_h,
+        );
     } else {
-        let pred = run_intra_prediction_u16(
+        let mut pred = run_intra_prediction_u16(
             &fs.y_plane16,
             stride,
             fs.height as usize,
@@ -2444,13 +2508,50 @@ fn reconstruct_one_luma_tx_unit(
             filter_type,
             filter_intra,
         );
-        paste_block16(&mut fs.y_plane16, stride, ux, uy, &pred, tx_w, tx_h);
+        if skip {
+            paste_block_clipped16(
+                &mut fs.y_plane16,
+                stride,
+                ux,
+                uy,
+                &pred,
+                tx_w,
+                tx_h,
+                wr_w,
+                wr_h,
+            );
+            return Ok(());
+        }
+        let coeffs = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type)?;
+        clip_add_in_place16(&mut pred, &coeffs, tx_w, tx_h, fs.bit_depth);
+        paste_block_clipped16(
+            &mut fs.y_plane16,
+            stride,
+            ux,
+            uy,
+            &pred,
+            tx_w,
+            tx_h,
+            wr_w,
+            wr_h,
+        );
     }
+    Ok(())
+}
 
-    if skip {
-        return Ok(());
-    }
-
+/// Decode + dequant + 2D inverse transform for a single luma TX unit
+/// at SPEC TX dimensions. Caller owns the predictor and the paste; this
+/// just returns the post-IDCT residual in row-major order. Used by the
+/// round-6 #394 spec-vs-clipped split so the residual stays
+/// spec-aligned even when only `wr_w × wr_h` of it ends up on the plane.
+fn decode_dequant_idct_luma(
+    td: &mut TileDecoder<'_>,
+    fs: &FrameState,
+    segment_id: u8,
+    tx_w: usize,
+    tx_h: usize,
+    tx_type: TxType,
+) -> Result<Vec<i32>> {
     let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
     let tx_idx = tx_size_idx(tx_w, tx_h)?;
     let nz = nz_map_ctx_offset(tx_w, tx_h)?;
@@ -2482,8 +2583,6 @@ fn reconstruct_one_luma_tx_unit(
         *c = dequant_coeff(*c, i, qv);
     }
 
-    // Round 23: spec-correct 2D transform — bakes Transform_Row_Shift +
-    // colShift = 4 inside, so no separate post-2D residual_shift.
     if let Err(e) = inverse_2d_spec(&mut coeffs, tx_type, sz) {
         if matches!(e, Error::Unsupported(_)) {
             inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
@@ -2491,19 +2590,7 @@ fn reconstruct_one_luma_tx_unit(
             return Err(e);
         }
     }
-
-    if fs.bit_depth == 8 {
-        let mut block = vec![0u8; tx_w * tx_h];
-        extract_block(&fs.y_plane, stride, ux, uy, tx_w, tx_h, &mut block);
-        clip_add_in_place(&mut block, &coeffs, tx_w, tx_h);
-        paste_block(&mut fs.y_plane, stride, ux, uy, &block, tx_w, tx_h);
-    } else {
-        let mut block = vec![0u16; tx_w * tx_h];
-        extract_block16(&fs.y_plane16, stride, ux, uy, tx_w, tx_h, &mut block);
-        clip_add_in_place16(&mut block, &coeffs, tx_w, tx_h, fs.bit_depth);
-        paste_block16(&mut fs.y_plane16, stride, ux, uy, &block, tx_w, tx_h);
-    }
-    Ok(())
+    Ok(coeffs)
 }
 
 /// TX-unit dimensions for a leaf block of size `w × h` — per AV1's
@@ -2599,24 +2686,32 @@ fn reconstruct_chroma_block(
     let sub_y = fs.sub_y;
     let cx = (x >> sub_x) as usize;
     let cy = (y >> sub_y) as usize;
-    // §5.11.38 Subsampled_Size — narrow luma blocks (e.g. 16×4 under
-    // 4:2:0) collapse to a valid chroma residual size (8×4) instead
-    // of the naive 8×2.
-    let (cw, ch) = chroma_residual_dims(bw as usize, bh as usize, sub_x, sub_y);
+    // Round 6 #394 spec/clipped split (chroma): the AV1 partition tree
+    // assigns power-of-two block dims; `bw / bh` from `decode_leaf_block`
+    // are the FRAME-EDGE clipped dims. Round chroma TX sizing up to
+    // the spec dim and clip writes against the chroma plane edge only
+    // at paste time. SMOOTH / TX kernels see power-of-two inputs.
+    let spec_bw = bs_or_clipped_spec(bw) as usize;
+    let spec_bh = bs_or_clipped_spec(bh) as usize;
+    let (spec_cw, spec_ch) = chroma_residual_dims(spec_bw, spec_bh, sub_x, sub_y);
+    let (cw_wr, ch_wr) = chroma_residual_dims(bw as usize, bh as usize, sub_x, sub_y);
     let uvw = fs.uv_width as usize;
     let uvh = fs.uv_height as usize;
-    let cw_clip = cw.min(uvw.saturating_sub(cx));
-    let ch_clip = ch.min(uvh.saturating_sub(cy));
-    if cw_clip == 0 || ch_clip == 0 {
+    let cw_wr = cw_wr.min(uvw.saturating_sub(cx));
+    let ch_wr = ch_wr.min(uvh.saturating_sub(cy));
+    if cw_wr == 0 || ch_wr == 0 {
         return Ok(());
     }
 
     // For CFL we need the reconstructed luma block as the AC template.
-    // Subsampling runs over the full block; per-TX slicing happens below.
+    // Use the WRITTEN luma footprint (which lands inside the frame
+    // plane); the chroma TU walks the SPEC chroma dims, so any CFL
+    // overlay outside the in-frame region uses zero-filled luma which
+    // never reaches the plane via the clipped paste.
     let cfl_luma_q3: Option<Vec<i32>> = if uv_mode == IntraMode::CflPred {
         let luma_w = bw as usize;
         let luma_h = bh as usize;
-        let mut luma_tight = vec![0i32; cw_clip * ch_clip];
+        let mut luma_tight = vec![0i32; cw_wr * ch_wr];
         if fs.bit_depth == 8 {
             let mut luma = vec![0u8; luma_w * luma_h];
             extract_block(
@@ -2661,17 +2756,18 @@ fn reconstruct_chroma_block(
         None
     };
 
-    // For CFL, the base prediction is DC; then the luma AC is overlaid.
-    // For other modes, run the predictor directly.
     let base_mode = if uv_mode == IntraMode::CflPred {
         IntraMode::DcPred
     } else {
         uv_mode
     };
 
-    let (tx_w, tx_h) = tx_unit_dims(cw_clip, ch_clip);
-    let cols = cw_clip / tx_w;
-    let rows = ch_clip / tx_h;
+    // Use SPEC chroma dims for TX-unit selection so the per-TU
+    // predictor sees power-of-two dims; clip per-TU paste against the
+    // (frame-edge-clipped) chroma extent.
+    let (tx_w, tx_h) = tx_unit_dims(spec_cw, spec_ch);
+    let cols = spec_cw / tx_w;
+    let rows = spec_ch / tx_h;
 
     for plane_idx in 0..2u32 {
         let alpha = if plane_idx == 0 {
@@ -2684,16 +2780,30 @@ fn reconstruct_chroma_block(
             for txi in 0..cols {
                 let ux = cx + txi * tx_w;
                 let uy = cy + ty * tx_h;
+                // Per-TU clipping: how much of this spec-sized TU
+                // lands inside the (frame-edge-clipped) chroma extent.
+                let wr_tu_w = cw_wr.saturating_sub(txi * tx_w).min(tx_w);
+                let wr_tu_h = ch_wr.saturating_sub(ty * tx_h).min(tx_h);
                 // Extract the CFL luma slice corresponding to this TX
                 // unit so the overlay only mixes in the aligned AC band.
+                // The luma_tight buffer is sized at `cw_wr × ch_wr`,
+                // so only the in-frame TUs contribute non-zero samples.
                 let cfl_tx_q3 = cfl_luma_q3.as_ref().map(|full| {
                     let mut tile = vec![0i32; tx_w * tx_h];
                     let col_off = txi * tx_w;
                     let row_off = ty * tx_h;
                     for r in 0..tx_h {
-                        let src_row = (row_off + r) * cw_clip + col_off;
-                        tile[r * tx_w..(r + 1) * tx_w]
-                            .copy_from_slice(&full[src_row..src_row + tx_w]);
+                        let dst = &mut tile[r * tx_w..(r + 1) * tx_w];
+                        let src_r = row_off + r;
+                        if src_r >= ch_wr {
+                            continue;
+                        }
+                        let cols_in = (cw_wr.saturating_sub(col_off)).min(tx_w);
+                        if cols_in == 0 {
+                            continue;
+                        }
+                        let src_row = src_r * cw_wr + col_off;
+                        dst[..cols_in].copy_from_slice(&full[src_row..src_row + cols_in]);
                     }
                     tile
                 });
@@ -2705,6 +2815,8 @@ fn reconstruct_chroma_block(
                     uy,
                     tx_w,
                     tx_h,
+                    wr_tu_w,
+                    wr_tu_h,
                     base_mode,
                     angle_delta_uv,
                     skip,
@@ -2734,6 +2846,8 @@ fn reconstruct_one_chroma_tx_unit(
     uy: usize,
     tx_w: usize,
     tx_h: usize,
+    wr_w: usize,
+    wr_h: usize,
     base_mode: IntraMode,
     angle_delta_uv: i8,
     skip: bool,
@@ -2754,7 +2868,9 @@ fn reconstruct_one_chroma_tx_unit(
         0
     };
 
-    // Predict + (CFL overlay) + paste.
+    // Predict + (CFL overlay) + clipped paste. Round 6 #394: predictor
+    // and residual run at SPEC TX dim; only the in-frame `wr_w × wr_h`
+    // rectangle is written back to the chroma plane.
     if fs.bit_depth == 8 {
         let plane_ref: &[u8] = if plane_idx == 0 {
             &fs.u_plane
@@ -2780,10 +2896,17 @@ fn reconstruct_one_chroma_tx_unit(
             let dc_copy = pred.clone();
             cfl_pred(&mut pred, tx_w, tx_h, q3, &dc_copy, alpha);
         }
-        if plane_idx == 0 {
-            paste_block(&mut fs.u_plane, stride, ux, uy, &pred, tx_w, tx_h);
-        } else {
-            paste_block(&mut fs.v_plane, stride, ux, uy, &pred, tx_w, tx_h);
+        if !skip {
+            let coeffs = decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h)?;
+            clip_add_in_place(&mut pred, &coeffs, tx_w, tx_h);
+        }
+        if wr_w > 0 && wr_h > 0 {
+            let target: &mut [u8] = if plane_idx == 0 {
+                &mut fs.u_plane
+            } else {
+                &mut fs.v_plane
+            };
+            paste_block_clipped(target, stride, ux, uy, &pred, tx_w, tx_h, wr_w, wr_h);
         }
     } else {
         let plane_ref: &[u16] = if plane_idx == 0 {
@@ -2812,17 +2935,32 @@ fn reconstruct_one_chroma_tx_unit(
             let dc_copy = pred.clone();
             cfl_pred16(&mut pred, tx_w, tx_h, q3, &dc_copy, alpha, fs.bit_depth);
         }
-        if plane_idx == 0 {
-            paste_block16(&mut fs.u_plane16, stride, ux, uy, &pred, tx_w, tx_h);
-        } else {
-            paste_block16(&mut fs.v_plane16, stride, ux, uy, &pred, tx_w, tx_h);
+        if !skip {
+            let coeffs = decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h)?;
+            clip_add_in_place16(&mut pred, &coeffs, tx_w, tx_h, fs.bit_depth);
+        }
+        if wr_w > 0 && wr_h > 0 {
+            let target: &mut [u16] = if plane_idx == 0 {
+                &mut fs.u_plane16
+            } else {
+                &mut fs.v_plane16
+            };
+            paste_block_clipped16(target, stride, ux, uy, &pred, tx_w, tx_h, wr_w, wr_h);
         }
     }
+    Ok(())
+}
 
-    if skip {
-        return Ok(());
-    }
-
+/// Decode + dequant + 2D inverse transform for a single chroma TX
+/// unit at SPEC TX dimensions. Mirrors [`decode_dequant_idct_luma`].
+fn decode_dequant_idct_chroma(
+    td: &mut TileDecoder<'_>,
+    fs: &FrameState,
+    segment_id: u8,
+    plane_idx: u32,
+    tx_w: usize,
+    tx_h: usize,
+) -> Result<Vec<i32>> {
     let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
     let tx_idx = tx_size_idx(tx_w, tx_h)?;
     let nz = nz_map_ctx_offset(tx_w, tx_h)?;
@@ -2859,40 +2997,8 @@ fn reconstruct_one_chroma_tx_unit(
         *c = dequant_coeff(*c, i, qv);
     }
 
-    // Round 23: spec-correct 2D transform — bakes Transform_Row_Shift +
-    // colShift = 4 inside, so no separate post-2D residual_shift.
     inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
-
-    if fs.bit_depth == 8 {
-        let mut block = vec![0u8; tx_w * tx_h];
-        let plane_buf = if plane_idx == 0 {
-            &fs.u_plane
-        } else {
-            &fs.v_plane
-        };
-        extract_block(plane_buf, stride, ux, uy, tx_w, tx_h, &mut block);
-        clip_add_in_place(&mut block, &coeffs, tx_w, tx_h);
-        if plane_idx == 0 {
-            paste_block(&mut fs.u_plane, stride, ux, uy, &block, tx_w, tx_h);
-        } else {
-            paste_block(&mut fs.v_plane, stride, ux, uy, &block, tx_w, tx_h);
-        }
-    } else {
-        let mut block = vec![0u16; tx_w * tx_h];
-        let plane_buf = if plane_idx == 0 {
-            &fs.u_plane16
-        } else {
-            &fs.v_plane16
-        };
-        extract_block16(plane_buf, stride, ux, uy, tx_w, tx_h, &mut block);
-        clip_add_in_place16(&mut block, &coeffs, tx_w, tx_h, fs.bit_depth);
-        if plane_idx == 0 {
-            paste_block16(&mut fs.u_plane16, stride, ux, uy, &block, tx_w, tx_h);
-        } else {
-            paste_block16(&mut fs.v_plane16, stride, ux, uy, &block, tx_w, tx_h);
-        }
-    }
-    Ok(())
+    Ok(coeffs)
 }
 
 /// Spec §7.11.2.8 `get_filter_type`: 1 if either the block immediately
@@ -3080,75 +3186,19 @@ fn run_intra_prediction_u8(
             );
         }
         IntraMode::SmoothPred => {
-            run_smooth_padded_u8(&mut dst, w, h, &above_raw, &left_raw, smooth_pred);
+            smooth_pred(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothVPred => {
-            run_smooth_padded_u8(&mut dst, w, h, &above_raw, &left_raw, smooth_v_pred);
+            smooth_v_pred(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothHPred => {
-            run_smooth_padded_u8(&mut dst, w, h, &above_raw, &left_raw, smooth_h_pred);
+            smooth_h_pred(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::PaethPred => {
             paeth_pred(&mut dst, w, h, &above_raw, &left_raw, above_left);
         }
     }
     dst
-}
-
-/// SMOOTH-family predictors only have spec-defined weight tables for
-/// power-of-two dimensions in {4, 8, 16, 32, 64}. Frame-edge clipping
-/// (e.g. super-resolution upscaled-width fixtures) can produce blocks
-/// whose `w` or `h` falls between table entries (e.g. 5, 6, 7). The
-/// spec predicts at the FULL block-size grid and clips writes; our
-/// reconstruct path collapses both into the clipped dimension, so
-/// here we round the requested `(w, h)` UP to the next power-of-two
-/// table entry, run the SMOOTH kernel into a padded scratch, then
-/// copy back the `w × h` top-left rectangle. Sizes already in the
-/// valid set (and the size-2 edge case the spec forbids — it never
-/// reaches us today now that #386 closed the chroma-syntax desync)
-/// pass through unchanged.
-fn run_smooth_padded_u8(
-    dst: &mut [u8],
-    w: usize,
-    h: usize,
-    above: &[u8],
-    left: &[u8],
-    kernel: impl Fn(&mut [u8], usize, usize, &[u8], &[u8]),
-) {
-    let pw = next_smooth_dim(w);
-    let ph = next_smooth_dim(h);
-    if pw == w && ph == h {
-        kernel(dst, w, h, above, left);
-        return;
-    }
-    let mut padded = vec![0u8; pw * ph];
-    let mut a_ext = above.to_vec();
-    while a_ext.len() < pw {
-        a_ext.push(*a_ext.last().unwrap_or(&128));
-    }
-    let mut l_ext = left.to_vec();
-    while l_ext.len() < ph {
-        l_ext.push(*l_ext.last().unwrap_or(&128));
-    }
-    kernel(&mut padded, pw, ph, &a_ext, &l_ext);
-    for r in 0..h {
-        dst[r * w..(r + 1) * w].copy_from_slice(&padded[r * pw..r * pw + w]);
-    }
-}
-
-/// Round `n` up to the next size in the SMOOTH weight tables
-/// `{4, 8, 16, 32, 64}`. Sizes already in the set pass through; sizes
-/// above 64 panic (no caller can legally reach this — the spec caps
-/// SMOOTH at 64×64 per §7.11.2.6).
-fn next_smooth_dim(n: usize) -> usize {
-    match n {
-        0..=4 => 4,
-        5..=8 => 8,
-        9..=16 => 16,
-        17..=32 => 32,
-        33..=64 => 64,
-        _ => panic!("predict: smooth: dimension {n} > 64 (§7.11.2.6 cap)"),
-    }
 }
 
 /// Run [`edge_upsample`] against a caller-gathered extended edge slice
@@ -3295,49 +3345,19 @@ fn run_intra_prediction_u16(
             );
         }
         IntraMode::SmoothPred => {
-            run_smooth_padded_u16(&mut dst, w, h, &above_raw, &left_raw, smooth_pred16);
+            smooth_pred16(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothVPred => {
-            run_smooth_padded_u16(&mut dst, w, h, &above_raw, &left_raw, smooth_v_pred16);
+            smooth_v_pred16(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::SmoothHPred => {
-            run_smooth_padded_u16(&mut dst, w, h, &above_raw, &left_raw, smooth_h_pred16);
+            smooth_h_pred16(&mut dst, w, h, &above_raw, &left_raw);
         }
         IntraMode::PaethPred => {
             paeth_pred16(&mut dst, w, h, &above_raw, &left_raw, above_left, bit_depth);
         }
     }
     dst
-}
-
-/// HBD twin of [`run_smooth_padded_u8`].
-fn run_smooth_padded_u16(
-    dst: &mut [u16],
-    w: usize,
-    h: usize,
-    above: &[u16],
-    left: &[u16],
-    kernel: impl Fn(&mut [u16], usize, usize, &[u16], &[u16]),
-) {
-    let pw = next_smooth_dim(w);
-    let ph = next_smooth_dim(h);
-    if pw == w && ph == h {
-        kernel(dst, w, h, above, left);
-        return;
-    }
-    let mut padded = vec![0u16; pw * ph];
-    let mut a_ext = above.to_vec();
-    while a_ext.len() < pw {
-        a_ext.push(*a_ext.last().unwrap_or(&512));
-    }
-    let mut l_ext = left.to_vec();
-    while l_ext.len() < ph {
-        l_ext.push(*l_ext.last().unwrap_or(&512));
-    }
-    kernel(&mut padded, pw, ph, &a_ext, &l_ext);
-    for r in 0..h {
-        dst[r * w..(r + 1) * w].copy_from_slice(&padded[r * pw..r * pw + w]);
-    }
 }
 
 /// HBD twin of [`upsample_edge_u8`].
@@ -3517,6 +3537,33 @@ fn paste_block(
     }
 }
 
+/// Copy the top-left `wr_w × wr_h` rectangle of a `src_w × src_h`
+/// source block into the plane at `(x, y)`. Used for the
+/// frame-edge non-power-of-two clipping path (§5.11.5 +
+/// `super_resolution` etc.) where the predictor / residual operate
+/// at the spec block size but only `wr_w × wr_h` samples can land
+/// inside the frame plane. The src buffer remains laid out at the
+/// full `src_w` row stride so the predictor can run its full-size
+/// kernel without padding.
+#[allow(clippy::too_many_arguments)]
+fn paste_block_clipped(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    src: &[u8],
+    src_w: usize,
+    _src_h: usize,
+    wr_w: usize,
+    wr_h: usize,
+) {
+    for r in 0..wr_h {
+        let dst_off = (y + r) * stride + x;
+        let src_off = r * src_w;
+        plane[dst_off..dst_off + wr_w].copy_from_slice(&src[src_off..src_off + wr_w]);
+    }
+}
+
 /// Copy a `w×h` block out of a plane at `(x, y)`.
 fn extract_block(
     plane: &[u8],
@@ -3546,6 +3593,26 @@ fn paste_block16(
     for r in 0..h {
         let dst_off = (y + r) * stride + x;
         plane[dst_off..dst_off + w].copy_from_slice(&src[r * w..(r + 1) * w]);
+    }
+}
+
+/// 16-bit counterpart of [`paste_block_clipped`].
+#[allow(clippy::too_many_arguments)]
+fn paste_block_clipped16(
+    plane: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    src: &[u16],
+    src_w: usize,
+    _src_h: usize,
+    wr_w: usize,
+    wr_h: usize,
+) {
+    for r in 0..wr_h {
+        let dst_off = (y + r) * stride + x;
+        let src_off = r * src_w;
+        plane[dst_off..dst_off + wr_w].copy_from_slice(&src[src_off..src_off + wr_w]);
     }
 }
 

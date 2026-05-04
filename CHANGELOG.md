@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- decoder round 6 (#394) — replace the round-5 `run_smooth_padded_*`
+  super-resolution shim with the proper spec/clipped split through
+  the `reconstruct_luma_block` / `reconstruct_chroma_block` chain.
+  The previous shim rounded up SMOOTH-only block dims to the next
+  power-of-two table slot to keep the kernel from panicking on a
+  width-5 block at the right frame edge of the `super-resolution`
+  ReportOnly fixture, but every other predictor + the residual /
+  inverse-transform path still ran at the clipped dim — which broke
+  the spec contract that prediction operates at the FULL block size
+  and only plane writes are clipped. Result: the SMOOTH path produced
+  divergent samples past the clip line, and the residual was
+  decoded against an invalid TX shape (e.g. `TX 5×16 not in the AV1
+  set`).
+
+  Now `reconstruct_luma_block` / `reconstruct_chroma_block` derive
+  `(spec_w, spec_h)` from the input clipped `(bw, bh)` via
+  `bs_or_clipped_spec` (rounds 1..=4→4, 5..=8→8, 9..=16→16, etc.),
+  walk TX units at the spec dim, and pass `(tx_w, tx_h)` (spec) +
+  `(wr_w, wr_h)` (clipped against frame edge) to the per-TU
+  reconstruct. The TU reconstruct runs the predictor + IDCT residual
+  + clip-add at the SPEC dim into a `tx_w × tx_h` scratch, then
+  `paste_block_clipped(_, ..., src_w=tx_w, wr_w, wr_h)` writes only
+  the in-frame rectangle.
+
+  `run_smooth_padded_u8 / u16` and `next_smooth_dim` are removed —
+  the SMOOTH dispatch now calls `smooth_pred*` directly with the
+  spec dim. Two new helpers — `decode_dequant_idct_luma` /
+  `_chroma` — factor out the per-TU residual decode (was inlined
+  twice in the bit-depth dispatch).
+
+  Test impact: corpus aggregate exact-pixel counts unchanged at
+  power-of-two block sizes (the spec rounding is identity there).
+  `super-resolution` ReportOnly fixture now reaches the next
+  unsupported TX shape (`TX 4×32 not in the AV1 set`) instead of
+  panicking on `TX 5×16`. All 471 local tests green.
+
 - decoder round 6 (#393) — extend the round-5 six-fix pattern
   (`HasChroma` / `intra_angle_info_y` / `angle_delta_cdf` index /
   `cfl_signs` / `cfl_alpha_ctx` / `cfl_allowed`) to the
