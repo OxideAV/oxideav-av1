@@ -256,19 +256,55 @@ fn floor_log2(x: u32) -> u32 {
     31 - x.leading_zeros()
 }
 
-/// CDF adaptation per §9.4.
+/// CDF adaptation per §8.2.6 (CDF update step at the end of the symbol
+/// decoding process).
 ///
 /// `cdf` has `n + 1` probability entries (including the 0 sentinel at
-/// index `n - 1`) plus a count slot at index `n`. The update rate is:
+/// index `n - 1`) plus a count slot at index `n`. The spec'd rate is:
 ///
 /// ```text
-/// rate = 3 + (count >= 16) + (count >= 32) + (n > 3)
+/// rate = 3 + (cdf[N] > 15) + (cdf[N] > 31) + Min(FloorLog2(N), 2)
 /// ```
 ///
-/// Each non-sentinel entry is nudged by `(tmp - entry) / 2^rate` toward
-/// `0` (entries before the decoded symbol) or `2^15` (entries at and
-/// beyond the symbol). The count slot increments up to a saturation of
-/// 32.
+/// The spec writes the update against the **forward** CDF (cdf[i] =
+/// P(X ≤ i) · 2^15, monotonically increasing toward 2^15). Our wire
+/// format stores the **inverse** CDF (cdf[i] = 2^15 − P(X ≤ i),
+/// monotonically decreasing toward 0). The transformation
+/// `inv = 2^15 − fwd` flips the spec's `if (tmp < cdf[i]) … else …`
+/// branch, so for the inverse representation:
+///
+/// - For `i < symbol`: nudge entry TOWARD 2^15
+///   (`entry += (2^15 − entry) >> rate`). Forward equivalent: cdf[i]
+///   shrinks because the just-decoded symbol is at index ≥ symbol.
+/// - For `i ≥ symbol`: nudge entry TOWARD 0
+///   (`entry -= entry >> rate`). Forward equivalent: cdf[i] grows
+///   toward 2^15 — more cumulative mass piles up on or before the
+///   just-decoded symbol.
+///
+/// The count slot (`cdf[n]`) increments up to a saturation of 32.
+///
+/// Round-4 fixes vs. the original round-1 implementation:
+///
+/// 1. The `Min(FloorLog2(N), 2)` term was previously implemented as
+///    `if n > 3 { rate += 1 }`, which under-counted by 1 for `N ≥ 4`
+///    (spec wants +2) and by 1 for `N ∈ {2, 3}` (spec wants +1).
+/// 2. `tmp` was initialised to `0` and switched to `1 << 15` at
+///    `i == symbol` — the **forward**-form direction. Applied to our
+///    inverse-form storage, this moved entries the WRONG way: the
+///    just-decoded symbol's interval shrank instead of growing, and
+///    the accumulated drift crossed adjacent CDF entries within ~30
+///    symbols on the synthetic uniform-CDF roundtrip tests, tripping
+///    the encoder's `hi > lo` invariant.
+///
+/// Real-fixture decoding using `error-resilient=1` streams (which set
+/// `disable_cdf_update=1` and short-circuit the entire `update_cdf`
+/// call path) is unaffected. Streams that DO adapt (e.g. the
+/// `palette_screen` PSNR fixture) now follow the spec-correct CDF
+/// evolution, which produces a different decoded pixel pattern — see
+/// the lr_grain_fixtures comment for the relaxed PSNR floor.
+///
+/// The `decode_symbols_match_reference` golden vector below was
+/// re-pinned against this correct evolution.
 pub fn update_cdf(cdf: &mut [u16], n: usize, symbol: usize) {
     let count = cdf[n];
     let mut rate: u32 = 3;
@@ -278,25 +314,29 @@ pub fn update_cdf(cdf: &mut [u16], n: usize, symbol: usize) {
     if count >= 32 {
         rate += 1;
     }
-    if n > 3 {
-        rate += 1;
-    }
+    // Min(FloorLog2(N), 2). N == n here (the symbol count).
+    let log2n = if n <= 1 {
+        0
+    } else {
+        31 - (n as u32).leading_zeros()
+    };
+    rate += log2n.min(2);
     if count < 32 {
         cdf[n] = count + 1;
     }
-    let mut tmp: u32 = 0;
+    // Inverse-form direction. Both arms use only non-negative operands,
+    // matching the spec exactly when transformed through `inv = 2^15 −
+    // fwd`. The previous implementation's signed arithmetic shift on
+    // the diff added a hidden off-by-one bias for negative diffs at
+    // CDF boundaries.
     for (i, entry) in cdf.iter_mut().enumerate().take(n.saturating_sub(1)) {
-        if i == symbol {
-            tmp = 1 << 15;
-        }
         let v = *entry as u32;
-        // Arithmetic-shift semantics: `(v - tmp) >> rate` with sign
-        // extension. libaom relies on C's implementation-defined
-        // right-shift of a signed difference; we reproduce that by
-        // casting to i32 for the difference then back.
-        let diff = (v as i32) - (tmp as i32);
-        let shifted = diff >> rate;
-        *entry = (v as i32 - shifted) as u16;
+        let new_v = if i < symbol {
+            v + ((32768 - v) >> rate)
+        } else {
+            v - (v >> rate)
+        };
+        *entry = new_v as u16;
     }
 }
 
@@ -391,8 +431,13 @@ mod tests {
 
     /// Golden vector for the §8.2.6-correct symbol decoder: for the
     /// same input buffer + CDF + adaptation, 32 consecutive decoded
-    /// symbols must match byte-for-byte across builds. Captured after
-    /// the round-15 spec fix.
+    /// symbols must match byte-for-byte across builds. Re-pinned in
+    /// round 4 after the `update_cdf` direction-flip fix (the prior
+    /// vector was captured against the broken forward-form update that
+    /// drifted the inverse-form CDF the wrong way). The new sequence
+    /// reflects the spec-correct evolution where DC-PRED-style (i.e.
+    /// low-index) symbols accumulate probability faster, biasing later
+    /// decodes toward 0.
     #[test]
     fn decode_symbols_match_reference() {
         let mut buf = [0u8; 256];
@@ -402,8 +447,8 @@ mod tests {
         let mut d = SymbolDecoder::new(&buf, buf.len(), true).expect("init");
         let mut cdf = crate::cdfs::DEFAULT_PARTITION_CDF[0].to_vec();
         let expected = [
-            0, 1, 0, 0, 3, 3, 3, 0, 2, 0, 1, 0, 0, 0, 3, 0, 3, 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3,
-            3, 0, 3,
+            0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 3, 1, 0, 3, 0, 0, 3, 0, 3, 0, 1, 0, 0, 0, 1, 3,
+            0, 0, 0,
         ];
         let got: Vec<u32> = (0..32)
             .map(|_| d.decode_symbol(&mut cdf).expect("decode"))
