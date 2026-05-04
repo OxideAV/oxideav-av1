@@ -3075,34 +3075,13 @@ fn run_intra_prediction_u8(
             );
         }
         IntraMode::SmoothPred => {
-            run_smooth_padded_u8(
-                &mut dst,
-                w,
-                h,
-                &above_raw,
-                &left_raw,
-                |buf, pw, ph, a, l| smooth_pred(buf, pw, ph, a, l),
-            );
+            run_smooth_padded_u8(&mut dst, w, h, &above_raw, &left_raw, smooth_pred);
         }
         IntraMode::SmoothVPred => {
-            run_smooth_padded_u8(
-                &mut dst,
-                w,
-                h,
-                &above_raw,
-                &left_raw,
-                |buf, pw, ph, a, l| smooth_v_pred(buf, pw, ph, a, l),
-            );
+            run_smooth_padded_u8(&mut dst, w, h, &above_raw, &left_raw, smooth_v_pred);
         }
         IntraMode::SmoothHPred => {
-            run_smooth_padded_u8(
-                &mut dst,
-                w,
-                h,
-                &above_raw,
-                &left_raw,
-                |buf, pw, ph, a, l| smooth_h_pred(buf, pw, ph, a, l),
-            );
+            run_smooth_padded_u8(&mut dst, w, h, &above_raw, &left_raw, smooth_h_pred);
         }
         IntraMode::PaethPred => {
             paeth_pred(&mut dst, w, h, &above_raw, &left_raw, above_left);
@@ -3311,34 +3290,13 @@ fn run_intra_prediction_u16(
             );
         }
         IntraMode::SmoothPred => {
-            run_smooth_padded_u16(
-                &mut dst,
-                w,
-                h,
-                &above_raw,
-                &left_raw,
-                |buf, pw, ph, a, l| smooth_pred16(buf, pw, ph, a, l),
-            );
+            run_smooth_padded_u16(&mut dst, w, h, &above_raw, &left_raw, smooth_pred16);
         }
         IntraMode::SmoothVPred => {
-            run_smooth_padded_u16(
-                &mut dst,
-                w,
-                h,
-                &above_raw,
-                &left_raw,
-                |buf, pw, ph, a, l| smooth_v_pred16(buf, pw, ph, a, l),
-            );
+            run_smooth_padded_u16(&mut dst, w, h, &above_raw, &left_raw, smooth_v_pred16);
         }
         IntraMode::SmoothHPred => {
-            run_smooth_padded_u16(
-                &mut dst,
-                w,
-                h,
-                &above_raw,
-                &left_raw,
-                |buf, pw, ph, a, l| smooth_h_pred16(buf, pw, ph, a, l),
-            );
+            run_smooth_padded_u16(&mut dst, w, h, &above_raw, &left_raw, smooth_h_pred16);
         }
         IntraMode::PaethPred => {
             paeth_pred16(&mut dst, w, h, &above_raw, &left_raw, above_left, bit_depth);
