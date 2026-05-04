@@ -52,6 +52,23 @@ pub struct InterBlockInfo {
     pub interp_filter: InterpFilter,
     /// Intra Y mode — only meaningful when `is_inter == false`.
     pub intra_y_mode: IntraMode,
+    /// Intra UV mode — only meaningful when `is_inter == false &&
+    /// has_chroma`. Spec §5.11.22 reads `uv_mode` after the y_mode +
+    /// `intra_angle_info_y` reads. Defaults to `DcPred` when chroma
+    /// syntax doesn't fire (monochrome, narrow chroma footprint, etc.).
+    pub intra_uv_mode: IntraMode,
+    /// Spec §5.11.42 `intra_angle_info_y`: signed angle delta in
+    /// `-3..=3` for directional luma modes, `0` otherwise.
+    pub intra_angle_delta_y: i8,
+    /// Spec §5.11.43 `intra_angle_info_uv`: signed angle delta for
+    /// directional UV modes, `0` otherwise.
+    pub intra_angle_delta_uv: i8,
+    /// Spec §5.11.45 / §6.10.14 — CFL alpha for U plane (signed,
+    /// `-16..=16`). Zero unless `intra_uv_mode == CflPred`.
+    pub intra_cfl_alpha_u: i32,
+    /// Spec §5.11.45 / §6.10.14 — CFL alpha for V plane (signed,
+    /// `-16..=16`). Zero unless `intra_uv_mode == CflPred`.
+    pub intra_cfl_alpha_v: i32,
     /// Spec §5.11.25 / §7.11.3.9 — the two reference-frame logical
     /// indices (`LAST_FRAME + i` form, 1..=7) used by SKIP_MODE
     /// compound prediction. Both entries are zero when `skip_mode`
@@ -213,22 +230,94 @@ pub fn decode_inter_block_syntax(
     };
 
     if !is_inter {
-        // Intra-within-inter (§5.11.22 `intra_block_mode_info`). The
-        // spec reads y_mode, then `intra_angle_info_y`, then UV mode
-        // / `read_cfl_alphas` / `intra_angle_info_uv` (gated on
-        // HasChroma + UV_CFL_PRED), then `palette_mode_info` and
-        // `filter_intra_mode_info`. Our narrow path keeps the y_mode
-        // read and the palette read (which is the dominant
-        // screen-content path); angle deltas, uv_mode, and CFL stay
-        // collapsed to their defaults (0 / DcPred / 0). The palette
-        // read is bitstream-aligned at this position only when the
-        // narrow assumptions hold — `y_mode == DcPred` (no intra
-        // angle delta), `uv_mode == DcPred` (no UV angle delta, no
-        // CFL alpha) — both of which the spec also requires for
-        // palette to be non-zero (palette gating: YMode == DC_PRED
-        // && UVMode == DC_PRED).
+        // Intra-within-inter (§5.11.22 `intra_block_mode_info`). Spec
+        // syntax order: `y_mode` → `intra_angle_info_y` → (chroma:
+        // `uv_mode` → `read_cfl_alphas` → `intra_angle_info_uv`) →
+        // `palette_mode_info` → `filter_intra_mode_info`. Round 6
+        // applied the keyframe-intra `HasChroma` + angle-delta-ctx +
+        // cfl-signs/cfl-alpha-ctx + cfl_allowed gates here (#393):
+        // the previous narrow path emitted DC defaults for chroma
+        // even when the bitstream had carried real chroma syntax.
         let group = block_size_group(w as usize, h as usize);
         let y_mode = inter.read_y_mode(&mut td.symbol, group)?;
+        // §5.11.42 — angle_delta_y is gated on directional mode AND
+        // `MiSize >= BLOCK_8X8` (i.e. block_w >= 8 && block_h >= 8).
+        let mi_size_ge_8x8 = w >= 8 && h >= 8;
+        let intra_angle_delta_y = if y_mode.is_directional() && mi_size_ge_8x8 {
+            // §9.4 angle_delta_y CDF: indexed by `mode - V_PRED`.
+            let dir_idx = (y_mode as u32) - (IntraMode::VPred as u32);
+            td.decode_angle_delta(dir_idx)? as i8
+        } else {
+            0
+        };
+
+        // §5.11.5 `HasChroma` — chroma syntax fires only when the
+        // block isn't the "left" half / "top" half of a shared
+        // chroma footprint in subsampled formats. Identical predicate
+        // to the keyframe-intra path so the range coder stays aligned
+        // with the encoder for narrow blocks (bw==4 / bh==4).
+        let bw4 = (w + 3) >> 2;
+        let bh4 = (h + 3) >> 2;
+        let has_chroma = crate::decode::superblock::compute_has_chroma(
+            fs,
+            td.seq.color_config.num_planes,
+            mi_col,
+            mi_row,
+            bw4,
+            bh4,
+        );
+
+        let mut intra_uv_mode = IntraMode::DcPred;
+        let mut intra_angle_delta_uv: i8 = 0;
+        let mut intra_cfl_alpha_u: i32 = 0;
+        let mut intra_cfl_alpha_v: i32 = 0;
+        if !fs.monochrome && td.seq.color_config.num_planes >= 3 && has_chroma {
+            // §5.11.18 / §9.4 cfl_allowed gate for the 14-symbol UV
+            // CDF: `max(W, H) <= 32` (or chroma-residual 4×4 in the
+            // coded-lossless case).
+            let lossless =
+                crate::frame_header_tail::coded_lossless_hint(&td.frame.quant);
+            let chroma_4x4 = if lossless {
+                crate::decode::superblock::chroma_residual_dims(
+                    w as usize,
+                    h as usize,
+                    fs.sub_x,
+                    fs.sub_y,
+                ) == (4, 4)
+            } else {
+                false
+            };
+            let cfl_allowed = chroma_4x4 || (w.max(h) <= 32);
+            intra_uv_mode = td.decode_uv_mode(y_mode, cfl_allowed)?;
+            // §5.11.43 intra_angle_info_uv — also gated on MiSize >=
+            // BLOCK_8X8.
+            if intra_uv_mode.is_directional() && mi_size_ge_8x8 {
+                let dir_idx = (intra_uv_mode as u32) - (IntraMode::VPred as u32);
+                intra_angle_delta_uv = td.decode_angle_delta(dir_idx)? as i8;
+            }
+            // §5.11.45 / §6.10.14 read_cfl_alphas — joint sign drives
+            // the per-plane sign; magnitudes only fire when the sign
+            // is non-zero. `cfl_alpha_ctx(joint, plane)` matches the
+            // keyframe-intra path.
+            if intra_uv_mode == IntraMode::CflPred {
+                use super::tile::{cfl_alpha_ctx, cfl_signs};
+                let joint = td.decode_cfl_sign()?;
+                let (su, sv) = cfl_signs(joint);
+                let mag_u = if su != 0 {
+                    (td.decode_cfl_alpha(cfl_alpha_ctx(joint, 0))? as i32) + 1
+                } else {
+                    0
+                };
+                let mag_v = if sv != 0 {
+                    (td.decode_cfl_alpha(cfl_alpha_ctx(joint, 1))? as i32) + 1
+                } else {
+                    0
+                };
+                intra_cfl_alpha_u = su * mag_u;
+                intra_cfl_alpha_v = sv * mag_v;
+            }
+        }
+
         let palette = read_palette_for_intra_within_inter(td, fs, w, h, y_mode, x, y)?;
         return Ok(InterBlockInfo {
             is_inter: false,
@@ -239,6 +328,11 @@ pub fn decode_inter_block_syntax(
             segment_id,
             interp_filter: InterpFilter::Regular,
             intra_y_mode: y_mode,
+            intra_uv_mode,
+            intra_angle_delta_y,
+            intra_angle_delta_uv,
+            intra_cfl_alpha_u,
+            intra_cfl_alpha_v,
             skip_mode_frames: [0, 0],
             mv1: Mv::default(),
             palette,
@@ -272,6 +366,11 @@ pub fn decode_inter_block_syntax(
                 _ => InterpFilter::Regular,
             },
             intra_y_mode: IntraMode::DcPred,
+            intra_uv_mode: IntraMode::DcPred,
+            intra_angle_delta_y: 0,
+            intra_angle_delta_uv: 0,
+            intra_cfl_alpha_u: 0,
+            intra_cfl_alpha_v: 0,
             skip_mode_frames: td.frame.skip_mode_frame,
             mv1: Mv::default(),
             palette: None,
@@ -327,6 +426,11 @@ pub fn decode_inter_block_syntax(
         segment_id,
         interp_filter,
         intra_y_mode: IntraMode::DcPred,
+        intra_uv_mode: IntraMode::DcPred,
+        intra_angle_delta_y: 0,
+        intra_angle_delta_uv: 0,
+        intra_cfl_alpha_u: 0,
+        intra_cfl_alpha_v: 0,
         skip_mode_frames: [0, 0],
         mv1: Mv::default(),
         palette: None,
@@ -898,6 +1002,11 @@ mod tests {
             segment_id: 0,
             interp_filter: InterpFilter::Regular,
             intra_y_mode: IntraMode::DcPred,
+            intra_uv_mode: IntraMode::DcPred,
+            intra_angle_delta_y: 0,
+            intra_angle_delta_uv: 0,
+            intra_cfl_alpha_u: 0,
+            intra_cfl_alpha_v: 0,
             skip_mode_frames: [0, 0],
             mv1: Mv::default(),
             palette: None,
@@ -937,6 +1046,11 @@ mod tests {
             segment_id: 0,
             interp_filter: InterpFilter::Regular,
             intra_y_mode: IntraMode::DcPred,
+            intra_uv_mode: IntraMode::DcPred,
+            intra_angle_delta_y: 0,
+            intra_angle_delta_uv: 0,
+            intra_cfl_alpha_u: 0,
+            intra_cfl_alpha_v: 0,
             skip_mode_frames: [0, 0],
             mv1: Mv::default(),
             palette: Some(blk),

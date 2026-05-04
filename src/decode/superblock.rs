@@ -748,7 +748,7 @@ pub fn decode_leaf_block(
 /// even MiCol) or the "top" half (bh4=1, sub_y=1, even MiRow) of a
 /// shared chroma footprint. The bottom-right sibling owns the chroma
 /// syntax read; the others contribute zero chroma symbols.
-fn compute_has_chroma(
+pub(crate) fn compute_has_chroma(
     fs: &FrameState,
     num_planes: u8,
     mi_col: u32,
@@ -779,7 +779,7 @@ fn compute_has_chroma(
 /// the full 8-luma-sample chroma block. The caller has already
 /// validated `HasChroma==1`, i.e. the block is the bottom-right of
 /// the shared footprint.
-fn shared_chroma_footprint(
+pub(crate) fn shared_chroma_footprint(
     x: u32,
     y: u32,
     bw: u32,
@@ -1349,14 +1349,19 @@ fn decode_inter_leaf_block(
 
     if !info.is_inter {
         // Intra-within-inter: propagate mode info and reconstruct via
-        // the same intra pipeline used on key frames, with DC_PRED
-        // fallback for chroma (no angle_delta / CFL signalling).
+        // the same intra pipeline used on key frames. Round 6 (#393)
+        // wires the spec-correct chroma syntax that
+        // `decode_inter_block_syntax` now reads — uv_mode +
+        // angle_delta_uv + cfl_alphas — so the chroma reconstruct no
+        // longer collapses to DC defaults when the block carried real
+        // chroma symbols. Same six-fix pattern as the keyframe-intra
+        // path landed in 7d1f297.
         let mi_w = (bw + 3) >> 2;
         let mi_h = (bh + 3) >> 2;
         let stored_uv = if fs.monochrome {
             None
         } else {
-            Some(IntraMode::DcPred)
+            Some(info.intra_uv_mode)
         };
         // Pre-build palette colour arrays so the per-MI propagation
         // (§5.11.5 stamps `PaletteSizes[][]` and `PaletteColors[][][]`
@@ -1393,10 +1398,10 @@ fn decode_inter_leaf_block(
                 mi.skip = info.skip;
                 mi.skip_mode = false;
                 mi.segment_id = info.segment_id;
-                mi.angle_delta = 0;
-                mi.angle_delta_uv = 0;
-                mi.cfl_alpha_u = 0;
-                mi.cfl_alpha_v = 0;
+                mi.angle_delta = info.intra_angle_delta_y;
+                mi.angle_delta_uv = info.intra_angle_delta_uv;
+                mi.cfl_alpha_u = info.intra_cfl_alpha_u;
+                mi.cfl_alpha_v = info.intra_cfl_alpha_v;
                 mi.is_inter = false;
                 mi.mv_row = 0;
                 mi.mv_col = 0;
@@ -1426,9 +1431,9 @@ fn decode_inter_leaf_block(
                 bw,
                 bh,
                 info.intra_y_mode,
-                0,
+                info.intra_angle_delta_y,
                 info.skip,
-                0,
+                info.segment_id,
                 None,
                 None,
             )?;
@@ -1471,12 +1476,12 @@ fn decode_inter_leaf_block(
                     cy_origin,
                     cbw,
                     cbh,
-                    IntraMode::DcPred,
-                    0,
+                    info.intra_uv_mode,
+                    info.intra_angle_delta_uv,
                     info.skip,
-                    0,
-                    0,
-                    0,
+                    info.intra_cfl_alpha_u,
+                    info.intra_cfl_alpha_v,
+                    info.segment_id,
                 )?;
             }
         }
@@ -2527,7 +2532,7 @@ fn tx_unit_dims(w: usize, h: usize) -> (usize, usize) {
 /// rather than a silent miscompute. Returns `(cw, ch)` in chroma
 /// samples, always at least 1×1.
 #[inline]
-fn chroma_residual_dims(bw: usize, bh: usize, sub_x: u32, sub_y: u32) -> (usize, usize) {
+pub(crate) fn chroma_residual_dims(bw: usize, bh: usize, sub_x: u32, sub_y: u32) -> (usize, usize) {
     use crate::decode::block::block_size_from_wh;
     let bs = block_size_from_wh(bw as u32, bh as u32);
     let sub_bs = bs.subsampled_size(sub_x, sub_y);

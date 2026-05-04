@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- decoder round 6 (#393) — extend the round-5 six-fix pattern
+  (`HasChroma` / `intra_angle_info_y` / `angle_delta_cdf` index /
+  `cfl_signs` / `cfl_alpha_ctx` / `cfl_allowed`) to the
+  intra-within-inter branch in `decode_inter_leaf_block`. The
+  bitstream-syntax reads already happened on the keyframe-intra path
+  after 7d1f297, but `decode_inter_block_syntax` still emitted the
+  collapsed-DC defaults (`uv_mode = DcPred`, `angle_delta_*` = 0,
+  `cfl_alpha_*` = 0) and the inter leaf reconstruction blindly fed
+  those defaults to `reconstruct_chroma_block` — silently dropping
+  every chroma-syntax read inside an inter frame's intra-within-inter
+  block. Fix:
+  1. Read `intra_angle_info_y` (`MiSize >= BLOCK_8X8` + directional).
+  2. Compute `HasChroma` per §5.11.5 with `compute_has_chroma` (now
+     `pub(crate)`); skip chroma syntax on the "left" / "top" half
+     of a shared 4:2:x footprint.
+  3. Compute the §9.4 `cfl_allowed` predicate using the spec
+     `max(W, H) <= 32` rule (with the `chroma_residual_dims`-equals-
+     4×4 lossless override) before reading `uv_mode` so the
+     `CflAllowed=1` 14-symbol CDF only fires for eligible blocks.
+  4. Read `intra_angle_info_uv` (same MiSize gate).
+  5. Read `read_cfl_alphas` via `cfl_signs` + `cfl_alpha_ctx` for
+     `uv_mode == CFL_PRED` blocks.
+  Carry the new fields (`intra_uv_mode`, `intra_angle_delta_y`,
+  `intra_angle_delta_uv`, `intra_cfl_alpha_u/_v`) on `InterBlockInfo`
+  and thread them into the per-MI `mi_mut` writes plus the
+  `reconstruct_luma_block` / `reconstruct_chroma_block` calls so the
+  intra-within-inter branch produces real prediction values for the
+  chroma plane instead of always falling back to DC. `chroma_residual_dims`
+  and `shared_chroma_footprint` were lifted to `pub(crate)` for the
+  shared call site.
+
+  Test impact (corpus PSNR drift, ReportOnly):
+  - `obu-with-extension-headers`: 276 → 284 exact pixels (+0.06pp,
+    UV max-diff 187 → 162). Two-visible-frame inter clip with
+    intra-within-inter blocks.
+  - `show-existing-frame`: 616 → 657 exact pixels (+0.05pp, UV
+    max-diff 238 → 249). 13-visible-frame mixed intra/inter clip.
+  - All other corpus tests unchanged. Full test suite (471 cases)
+    green via `CARGO_TARGET_DIR=/tmp/oxideav-av1-target cargo test
+    -j 2 -- --test-threads 4`.
+
 - decoder round 5 — close 6 spec-syntax desync bugs uncovered by the
   round-4 spec-correct `update_cdf` evolution and remove the
   `SM_WEIGHTS2` band-aid from the SMOOTH predictor:
