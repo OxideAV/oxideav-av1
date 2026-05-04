@@ -390,6 +390,18 @@ pub fn decode_leaf_block(
     let mi_col = x >> 2;
     let mi_row = y >> 2;
 
+    // §5.11.5 `HasChroma`: gates whether chroma syntax is read AND
+    // whether chroma reconstruction fires. For 4:2:0, narrow blocks
+    // (bw4==1 with sub_x==1 / bh4==1 with sub_y==1) at even MI rows /
+    // cols share a chroma block with the next MI sibling — the
+    // bottom-right luma block is the one that owns the chroma syntax.
+    // §5.11.7 `intra_frame_mode_info()` gates the `uv_mode` symbol on
+    // `HasChroma`; reading it unconditionally desyncs the range coder.
+    let bw4 = (bw + 3) >> 2;
+    let bh4 = (bh + 3) >> 2;
+    let has_chroma =
+        compute_has_chroma(fs, td.seq.color_config.num_planes, mi_col, mi_row, bw4, bh4);
+
     let have_above_mi = mi_row > 0 && mi_row - 1 < fs.mi_rows && mi_col < fs.mi_cols;
     let have_left_mi = mi_col > 0 && mi_col - 1 < fs.mi_cols && mi_row < fs.mi_rows;
 
@@ -444,7 +456,19 @@ pub fn decode_leaf_block(
         segment_id = td.decode_segment_id(ctx)?;
     }
 
-    let skip = td.decode_skip(0)?;
+    // §9.4 skip context: sum of above/left Skips[][] neighbours.
+    let above_skip_flag = if have_above_mi {
+        fs.mi_at(mi_col, mi_row - 1).skip
+    } else {
+        false
+    };
+    let left_skip_flag = if have_left_mi {
+        fs.mi_at(mi_col - 1, mi_row).skip
+    } else {
+        false
+    };
+    let skip_ctx = (above_skip_flag as u32) + (left_skip_flag as u32);
+    let skip = td.decode_skip(skip_ctx)?;
 
     if seg_enabled && !seg_pre_skip {
         let ctx = segment_id_ctx(above_seg, left_seg, have_above_mi, have_left_mi);
@@ -480,8 +504,17 @@ pub fn decode_leaf_block(
     }
 
     let y_mode = td.decode_intra_y_mode(mode_ctx_bucket(above_mode), mode_ctx_bucket(left_mode))?;
-    let angle_delta_y = if y_mode.is_directional() {
-        let dir_idx = (y_mode as u32) - (IntraMode::D45Pred as u32);
+    // §5.11.42 intra_angle_info_y(): the `angle_delta_y` symbol fires
+    // only when MiSize >= BLOCK_8X8 (and the mode is directional).
+    // Reading it unconditionally on Block4x4/4x8/8x4 desyncs the
+    // range coder.
+    let mi_size_ge_8x8 = (bs as u32) >= (BlockSize::Block8x8 as u32);
+    let angle_delta_y = if y_mode.is_directional() && mi_size_ge_8x8 {
+        // §9.4 angle_delta_y CDF: indexed by `YMode - V_PRED`, NOT
+        // `YMode - D45_PRED`. The CDF table has 8 slots
+        // (V/H/D45/D135/D113/D157/D203/D67); the directional modes
+        // start at index 2.
+        let dir_idx = (y_mode as u32) - (IntraMode::VPred as u32);
         td.decode_angle_delta(dir_idx)? as i8
     } else {
         0
@@ -492,11 +525,28 @@ pub fn decode_leaf_block(
     let mut angle_delta_uv: i8 = 0;
     let mut cfl_alpha_u: i32 = 0;
     let mut cfl_alpha_v: i32 = 0;
-    if !fs.monochrome && num_planes >= 3 {
-        let cfl_allowed = true;
+    // §5.11.7: uv_mode + intra_angle_info_uv + read_cfl_alphas are
+    // gated on HasChroma. A bw4==1 / bh4==1 narrow block at an even
+    // MI col / row in 4:2:x doesn't read these symbols at all — the
+    // syntax fires on the bottom-right sibling instead.
+    if !fs.monochrome && num_planes >= 3 && has_chroma {
+        // §9.4 uv_mode CDF select: CflAllowed CDF when
+        // `max(Block_Width, Block_Height) <= 32` (or, in lossless,
+        // when chroma residual is 4×4). Reading the wider 14-symbol
+        // CFL_ALLOWED CDF on a 64-wide block desyncs the range
+        // coder for the next symbol.
+        let lossless = crate::frame_header_tail::coded_lossless_hint(&td.frame.quant);
+        let chroma_4x4 = if lossless {
+            chroma_residual_dims(bw as usize, bh as usize, fs.sub_x, fs.sub_y) == (4, 4)
+        } else {
+            false
+        };
+        let cfl_allowed = chroma_4x4 || (bw.max(bh) <= 32);
         uv_mode = td.decode_uv_mode(y_mode, cfl_allowed)?;
-        if uv_mode.is_directional() {
-            let dir_idx = (uv_mode as u32) - (IntraMode::D45Pred as u32);
+        // §5.11.43 intra_angle_info_uv() also gated on MiSize >= 8×8.
+        if uv_mode.is_directional() && mi_size_ge_8x8 {
+            // Same indexing as angle_delta_y: `UVMode - V_PRED`.
+            let dir_idx = (uv_mode as u32) - (IntraMode::VPred as u32);
             angle_delta_uv = td.decode_angle_delta(dir_idx)? as i8;
         }
         if uv_mode == IntraMode::CflPred {
@@ -522,7 +572,7 @@ pub fn decode_leaf_block(
     // 0-bit fast-out for non-screen-content frames live inside
     // [`read_palette_mode_info`]; the returned `PaletteBlock` is
     // empty when the block declined palette coding.
-    let palette = read_palette_mode_info(td, fs, bs, bw, bh, y_mode, uv_mode, x, y)?;
+    let palette = read_palette_mode_info(td, fs, bs, bw, bh, y_mode, uv_mode, x, y, has_chroma)?;
 
     // Spec §5.11.24 `filter_intra_mode_info()` — gated on
     // `enable_filter_intra && YMode == DC_PRED && PaletteSizeY == 0 &&
@@ -628,15 +678,24 @@ pub fn decode_leaf_block(
         )?;
     }
 
-    // Chroma path.
-    if !fs.monochrome && num_planes >= 3 {
+    // Chroma path. Per §5.11.5 only fires when HasChroma is true —
+    // narrow blocks (bw4==1 / bh4==1) at the "left" / "top" half of
+    // a shared chroma footprint defer to the sibling that owns the
+    // chroma syntax read above.
+    if !fs.monochrome && num_planes >= 3 && has_chroma {
         if palette.has_uv() {
             // §7.11.4 chroma palette path. Coordinates and the
-            // colour map are stored at chroma resolution.
-            let bx_uv = x >> fs.sub_x;
-            let by_uv = y >> fs.sub_y;
-            let bw_uv = bw >> fs.sub_x;
-            let bh_uv = bh >> fs.sub_y;
+            // colour map are stored at chroma resolution. When this
+            // luma block is the bottom-right of a shared chroma
+            // footprint, expand back to cover the full footprint
+            // (which is exactly what HasChroma=1 implies for narrow
+            // blocks).
+            let (cx_origin, cy_origin, cbw, cbh) =
+                shared_chroma_footprint(x, y, bw, bh, fs.sub_x, fs.sub_y);
+            let bx_uv = cx_origin >> fs.sub_x;
+            let by_uv = cy_origin >> fs.sub_y;
+            let bw_uv = cbw >> fs.sub_x;
+            let bh_uv = cbh >> fs.sub_y;
             crate::decode::palette::apply_palette_chroma(
                 fs,
                 &palette,
@@ -658,13 +717,19 @@ pub fn decode_leaf_block(
                 bh_uv,
             );
         } else {
+            // For narrow blocks the chroma footprint covers the
+            // sibling(s) too — expand the luma origin / dims so the
+            // chroma TX sized off `chroma_residual_dims` lands on a
+            // valid AV1 TX shape.
+            let (cx_origin, cy_origin, cbw, cbh) =
+                shared_chroma_footprint(x, y, bw, bh, fs.sub_x, fs.sub_y);
             reconstruct_chroma_block(
                 td,
                 fs,
-                x,
-                y,
-                bw,
-                bh,
+                cx_origin,
+                cy_origin,
+                cbw,
+                cbh,
                 uv_mode,
                 angle_delta_uv,
                 skip,
@@ -676,6 +741,66 @@ pub fn decode_leaf_block(
     }
 
     Ok(())
+}
+
+/// Compute `HasChroma` per AV1 spec §5.11.5: chroma syntax / decode
+/// fires only when the block isn't the "left" half (bw4=1, sub_x=1,
+/// even MiCol) or the "top" half (bh4=1, sub_y=1, even MiRow) of a
+/// shared chroma footprint. The bottom-right sibling owns the chroma
+/// syntax read; the others contribute zero chroma symbols.
+fn compute_has_chroma(
+    fs: &FrameState,
+    num_planes: u8,
+    mi_col: u32,
+    mi_row: u32,
+    bw4: u32,
+    bh4: u32,
+) -> bool {
+    if fs.monochrome || num_planes < 3 {
+        return false;
+    }
+    let sub_x = fs.sub_x;
+    let sub_y = fs.sub_y;
+    if bh4 == 1 && sub_y == 1 && (mi_row & 1) == 0 {
+        return false;
+    }
+    if bw4 == 1 && sub_x == 1 && (mi_col & 1) == 0 {
+        return false;
+    }
+    true
+}
+
+/// For a luma block of size `(bw, bh)` at sample origin `(x, y)`,
+/// return the chroma footprint expressed back in luma coordinates
+/// `(cx, cy, cbw, cbh)`. For wide enough blocks this is just
+/// `(x, y, bw, bh)`. For narrow blocks (`bw==4` with `sub_x==1` /
+/// `bh==4` with `sub_y==1`) the chroma footprint is shared with the
+/// preceding sibling so we expand the origin / dimensions to cover
+/// the full 8-luma-sample chroma block. The caller has already
+/// validated `HasChroma==1`, i.e. the block is the bottom-right of
+/// the shared footprint.
+fn shared_chroma_footprint(
+    x: u32,
+    y: u32,
+    bw: u32,
+    bh: u32,
+    sub_x: u32,
+    sub_y: u32,
+) -> (u32, u32, u32, u32) {
+    let mut cx = x;
+    let mut cbw = bw;
+    if bw == 4 && sub_x == 1 {
+        // Chroma footprint covers the previous luma sibling too.
+        cx = x.saturating_sub(4);
+        cbw = 8;
+    }
+    let mut cy = y;
+    let mut cbh = bh;
+    if bh == 4 && sub_y == 1 {
+        cy = y.saturating_sub(4);
+        cbh = 8;
+    }
+    (cx, cy, cbw, cbh)
 }
 
 /// §5.11.16 `read_block_tx_size()` — intra branch. For intra-key /
@@ -880,6 +1005,7 @@ fn read_palette_mode_info(
     uv_mode: IntraMode,
     x: u32,
     y: u32,
+    has_chroma: bool,
 ) -> Result<crate::decode::palette::PaletteBlock> {
     use crate::decode::palette::{decode_palette_mode_info, PaletteBlock};
 
@@ -904,7 +1030,6 @@ fn read_palette_mode_info(
     let mh_log2 = 31 - mi_h.leading_zeros();
     let bsize_ctx = (mw_log2 + mh_log2).saturating_sub(2) as usize;
 
-    let has_chroma = !fs.monochrome && td.seq.color_config.num_planes >= 3;
     decode_palette_mode_info(
         td,
         fs,
@@ -1217,6 +1342,10 @@ fn decode_inter_leaf_block(
     let h = bh as usize;
     let mi_col = x >> 2;
     let mi_row = y >> 2;
+    let bw4 = (bw + 3) >> 2;
+    let bh4 = (bh + 3) >> 2;
+    let has_chroma =
+        compute_has_chroma(fs, td.seq.color_config.num_planes, mi_col, mi_row, bw4, bh4);
 
     if !info.is_inter {
         // Intra-within-inter: propagate mode info and reconstruct via
@@ -1304,14 +1433,16 @@ fn decode_inter_leaf_block(
                 None,
             )?;
         }
-        if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
+        if !fs.monochrome && td.seq.color_config.num_planes >= 3 && has_chroma {
             let palette_uv_active = info.palette.as_ref().map(|p| p.has_uv()).unwrap_or(false);
+            let (cx_origin, cy_origin, cbw, cbh) =
+                shared_chroma_footprint(x, y, bw, bh, fs.sub_x, fs.sub_y);
             if palette_uv_active {
                 let p = info.palette.as_ref().unwrap();
-                let bx_uv = x >> fs.sub_x;
-                let by_uv = y >> fs.sub_y;
-                let bw_uv = bw >> fs.sub_x;
-                let bh_uv = bh >> fs.sub_y;
+                let bx_uv = cx_origin >> fs.sub_x;
+                let by_uv = cy_origin >> fs.sub_y;
+                let bw_uv = cbw >> fs.sub_x;
+                let bh_uv = cbh >> fs.sub_y;
                 crate::decode::palette::apply_palette_chroma(
                     fs,
                     p,
@@ -1336,10 +1467,10 @@ fn decode_inter_leaf_block(
                 reconstruct_chroma_block(
                     td,
                     fs,
-                    x,
-                    y,
-                    bw,
-                    bh,
+                    cx_origin,
+                    cy_origin,
+                    cbw,
+                    cbh,
                     IntraMode::DcPred,
                     0,
                     info.skip,
@@ -1414,14 +1545,16 @@ fn decode_inter_leaf_block(
             &ref0,
             &ref1,
         )?;
-        if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
+        if !fs.monochrome && td.seq.color_config.num_planes >= 3 && has_chroma {
+            let (cx_origin, cy_origin, cbw, cbh) =
+                shared_chroma_footprint(x, y, bw, bh, fs.sub_x, fs.sub_y);
             reconstruct_skip_mode_compound_chroma(
                 td,
                 fs,
-                x,
-                y,
-                w,
-                h,
+                cx_origin,
+                cy_origin,
+                cbw as usize,
+                cbh as usize,
                 info.mv,
                 info.mv1,
                 info.skip,
@@ -1435,8 +1568,20 @@ fn decode_inter_leaf_block(
 
     reconstruct_inter_luma_block(td, fs, x, y, w, h, info.mv, info.skip, info.interp_filter)?;
 
-    if !fs.monochrome && td.seq.color_config.num_planes >= 3 {
-        reconstruct_inter_chroma_block(td, fs, x, y, w, h, info.mv, info.skip, info.interp_filter)?;
+    if !fs.monochrome && td.seq.color_config.num_planes >= 3 && has_chroma {
+        let (cx_origin, cy_origin, cbw, cbh) =
+            shared_chroma_footprint(x, y, bw, bh, fs.sub_x, fs.sub_y);
+        reconstruct_inter_chroma_block(
+            td,
+            fs,
+            cx_origin,
+            cy_origin,
+            cbw as usize,
+            cbh as usize,
+            info.mv,
+            info.skip,
+            info.interp_filter,
+        )?;
     }
     Ok(())
 }
@@ -2930,19 +3075,96 @@ fn run_intra_prediction_u8(
             );
         }
         IntraMode::SmoothPred => {
-            smooth_pred(&mut dst, w, h, &above_raw, &left_raw);
+            run_smooth_padded_u8(
+                &mut dst,
+                w,
+                h,
+                &above_raw,
+                &left_raw,
+                |buf, pw, ph, a, l| smooth_pred(buf, pw, ph, a, l),
+            );
         }
         IntraMode::SmoothVPred => {
-            smooth_v_pred(&mut dst, w, h, &above_raw, &left_raw);
+            run_smooth_padded_u8(
+                &mut dst,
+                w,
+                h,
+                &above_raw,
+                &left_raw,
+                |buf, pw, ph, a, l| smooth_v_pred(buf, pw, ph, a, l),
+            );
         }
         IntraMode::SmoothHPred => {
-            smooth_h_pred(&mut dst, w, h, &above_raw, &left_raw);
+            run_smooth_padded_u8(
+                &mut dst,
+                w,
+                h,
+                &above_raw,
+                &left_raw,
+                |buf, pw, ph, a, l| smooth_h_pred(buf, pw, ph, a, l),
+            );
         }
         IntraMode::PaethPred => {
             paeth_pred(&mut dst, w, h, &above_raw, &left_raw, above_left);
         }
     }
     dst
+}
+
+/// SMOOTH-family predictors only have spec-defined weight tables for
+/// power-of-two dimensions in {4, 8, 16, 32, 64}. Frame-edge clipping
+/// (e.g. super-resolution upscaled-width fixtures) can produce blocks
+/// whose `w` or `h` falls between table entries (e.g. 5, 6, 7). The
+/// spec predicts at the FULL block-size grid and clips writes; our
+/// reconstruct path collapses both into the clipped dimension, so
+/// here we round the requested `(w, h)` UP to the next power-of-two
+/// table entry, run the SMOOTH kernel into a padded scratch, then
+/// copy back the `w × h` top-left rectangle. Sizes already in the
+/// valid set (and the size-2 edge case the spec forbids — it never
+/// reaches us today now that #386 closed the chroma-syntax desync)
+/// pass through unchanged.
+fn run_smooth_padded_u8(
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    above: &[u8],
+    left: &[u8],
+    kernel: impl Fn(&mut [u8], usize, usize, &[u8], &[u8]),
+) {
+    let pw = next_smooth_dim(w);
+    let ph = next_smooth_dim(h);
+    if pw == w && ph == h {
+        kernel(dst, w, h, above, left);
+        return;
+    }
+    let mut padded = vec![0u8; pw * ph];
+    let mut a_ext = above.to_vec();
+    while a_ext.len() < pw {
+        a_ext.push(*a_ext.last().unwrap_or(&128));
+    }
+    let mut l_ext = left.to_vec();
+    while l_ext.len() < ph {
+        l_ext.push(*l_ext.last().unwrap_or(&128));
+    }
+    kernel(&mut padded, pw, ph, &a_ext, &l_ext);
+    for r in 0..h {
+        dst[r * w..(r + 1) * w].copy_from_slice(&padded[r * pw..r * pw + w]);
+    }
+}
+
+/// Round `n` up to the next size in the SMOOTH weight tables
+/// `{4, 8, 16, 32, 64}`. Sizes already in the set pass through; sizes
+/// above 64 panic (no caller can legally reach this — the spec caps
+/// SMOOTH at 64×64 per §7.11.2.6).
+fn next_smooth_dim(n: usize) -> usize {
+    match n {
+        0..=4 => 4,
+        5..=8 => 8,
+        9..=16 => 16,
+        17..=32 => 32,
+        33..=64 => 64,
+        _ => panic!("predict: smooth: dimension {n} > 64 (§7.11.2.6 cap)"),
+    }
 }
 
 /// Run [`edge_upsample`] against a caller-gathered extended edge slice
@@ -3089,19 +3311,70 @@ fn run_intra_prediction_u16(
             );
         }
         IntraMode::SmoothPred => {
-            smooth_pred16(&mut dst, w, h, &above_raw, &left_raw);
+            run_smooth_padded_u16(
+                &mut dst,
+                w,
+                h,
+                &above_raw,
+                &left_raw,
+                |buf, pw, ph, a, l| smooth_pred16(buf, pw, ph, a, l),
+            );
         }
         IntraMode::SmoothVPred => {
-            smooth_v_pred16(&mut dst, w, h, &above_raw, &left_raw);
+            run_smooth_padded_u16(
+                &mut dst,
+                w,
+                h,
+                &above_raw,
+                &left_raw,
+                |buf, pw, ph, a, l| smooth_v_pred16(buf, pw, ph, a, l),
+            );
         }
         IntraMode::SmoothHPred => {
-            smooth_h_pred16(&mut dst, w, h, &above_raw, &left_raw);
+            run_smooth_padded_u16(
+                &mut dst,
+                w,
+                h,
+                &above_raw,
+                &left_raw,
+                |buf, pw, ph, a, l| smooth_h_pred16(buf, pw, ph, a, l),
+            );
         }
         IntraMode::PaethPred => {
             paeth_pred16(&mut dst, w, h, &above_raw, &left_raw, above_left, bit_depth);
         }
     }
     dst
+}
+
+/// HBD twin of [`run_smooth_padded_u8`].
+fn run_smooth_padded_u16(
+    dst: &mut [u16],
+    w: usize,
+    h: usize,
+    above: &[u16],
+    left: &[u16],
+    kernel: impl Fn(&mut [u16], usize, usize, &[u16], &[u16]),
+) {
+    let pw = next_smooth_dim(w);
+    let ph = next_smooth_dim(h);
+    if pw == w && ph == h {
+        kernel(dst, w, h, above, left);
+        return;
+    }
+    let mut padded = vec![0u16; pw * ph];
+    let mut a_ext = above.to_vec();
+    while a_ext.len() < pw {
+        a_ext.push(*a_ext.last().unwrap_or(&512));
+    }
+    let mut l_ext = left.to_vec();
+    while l_ext.len() < ph {
+        l_ext.push(*l_ext.last().unwrap_or(&512));
+    }
+    kernel(&mut padded, pw, ph, &a_ext, &l_ext);
+    for r in 0..h {
+        dst[r * w..(r + 1) * w].copy_from_slice(&padded[r * pw..r * pw + w]);
+    }
 }
 
 /// HBD twin of [`upsample_edge_u8`].

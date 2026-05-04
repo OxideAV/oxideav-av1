@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- decoder round 5 — close 6 spec-syntax desync bugs uncovered by the
+  round-4 spec-correct `update_cdf` evolution and remove the
+  `SM_WEIGHTS2` band-aid from the SMOOTH predictor:
+  1. `HasChroma` per AV1 §5.11.5 — gate `uv_mode` + chroma residual
+     reconstruct on the spec predicate (`bw4==1 && sub_x && (MiCol&1)==0`
+     or `bh4==1 && sub_y && (MiRow&1)==0` ⇒ `HasChroma=0`). The
+     pre-fix decoder always read `uv_mode` for any non-monochrome
+     block, silently consuming the chroma-syntax symbols on narrow
+     blocks at even MI cols / rows in 4:2:x and producing a TX-2x8
+     panic on the `tile-cols-2-rows-1` corpus fixture (#386).
+  2. `intra_angle_info_y / intra_angle_info_uv` per §5.11.42/43 —
+     gate `angle_delta_y/uv` reads on `MiSize >= BLOCK_8X8`. Was
+     unconditional on `is_directional()`, desyncing the range coder
+     on every Block4x4 / 4x8 / 8x4 directional block.
+  3. `angle_delta_cdf` index per §9.4 — `mode - V_PRED` (range 2..7),
+     not `mode - D45_PRED` (range 0..5). The 8-entry table's first
+     two slots are V/H contexts; the wrong index used those for the
+     D45/D135 reads.
+  4. `Intra_Mode_Context` table per §9.4 / spec line 22182 —
+     `{ 0,1,2,3,4,4,4,4,3,0,1,2,0 }` (D135/D113/D157/D203 → 4;
+     Smooth/SmoothV/SmoothH → 0/1/2; Paeth → 0). The pre-fix
+     `mode_ctx_bucket` mapped every directional mode to 3 and every
+     smooth/Paeth mode to 4 — opposite of spec for 8 of the 13
+     entries.
+  5. `cfl_signs` / `cfl_alpha_ctx` per §5.11.45 / §6.10.14 / §9.4 —
+     compute the (signU, signV) pair as `((joint+1)/3, (joint+1)%3)`
+     mapped through `{ZERO=0, NEG=1, POS=2}`, and the per-plane
+     CDF context as `(signU-1)*3 + signV` (resp.
+     `(signV-1)*3 + signU`). The pre-fix table-driven mapping was
+     wrong for 7 of 8 joint values, silently zeroing CflAlphaU on a
+     sizeable share of CFL-coded blocks.
+  6. `cfl_allowed` per §9.4 — gate the 14-symbol UV CDF on
+     `max(Block_Width, Block_Height) <= 32` (or 4×4 chroma residual
+     under lossless). The pre-fix decoder always read the wider
+     CDF, drifting the next symbol on 64-wide non-CFL blocks.
+
+  The chroma reconstruction now also expands the footprint when
+  the bottom-right luma sibling owns a shared chroma block (so the
+  `chroma_residual_dims` lookup feeds a power-of-two TX shape).
+  The `SM_WEIGHTS2` 2-sample fallback in `predict/intra/smooth.rs`
+  is removed per #386: a fixture that re-trips the panic now
+  signals an upstream block-size derivation regression rather than
+  silently emitting garbage pixels. The directional `super-resolution`
+  fixture (frame-edge non-power-of-2 clipping) gets a separate
+  pad-up-to-next-power-of-two scratch buffer in `run_intra_prediction_*`
+  so SMOOTH on a width-5 right-edge block stops crashing the
+  decoder; the prediction value differs from spec at the clipped
+  region but the fixture is `Tier::ReportOnly` and the path is not
+  on the BitExact promotion list.
+
+  Test impact: `corpus_tile_cols_2_rows_1` aggregate match goes
+  1.01% → 4.44%; `palette_screen_fixture_psnr_vs_reference` Y PSNR
+  vs libdav1d goes 6.83 dB → 8.05 dB. The `palette_screen` PSNR
+  floor is raised back from 4.5 dB → 8.0 dB per #387, and the
+  `palette_screen_fixture_decodes_with_plane_variation` mean-luma
+  sanity gate still holds.
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-av1/compare/v0.1.2...v0.1.3) - 2026-05-04
 
 ### Fixed

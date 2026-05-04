@@ -101,25 +101,26 @@ impl IntraMode {
 /// as [`IntraMode`] but `CflPred` may appear.
 pub type UvMode = IntraMode;
 
-/// 5-bucket mode context used by the `kf_y_mode_cdf` lookup:
+/// 5-bucket mode context used by `Default_Intra_Frame_Y_Mode_Cdf`
+/// (§9.4 / spec table 22182).
 ///
-/// - 0 = DC
-/// - 1 = V
-/// - 2 = H
-/// - 3 = any of the 6 directional modes (D45..D67)
-/// - 4 = SMOOTH / SMOOTH_V / SMOOTH_H / PAETH
+/// Spec `Intra_Mode_Context[INTRA_MODES] = { 0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0 }`
+/// indexed by the AV1 intra mode enum, namely:
+/// - DC(0)→0, V(1)→1, H(2)→2,
+/// - D45(3)→3, D135(4)→4, D113(5)→4, D157(6)→4, D203(7)→4, D67(8)→3,
+/// - Smooth(9)→0, SmoothV(10)→1, SmoothH(11)→2, Paeth(12)→0.
 pub fn mode_ctx_bucket(m: IntraMode) -> u32 {
     match m {
         IntraMode::DcPred => 0,
         IntraMode::VPred => 1,
         IntraMode::HPred => 2,
-        IntraMode::D45Pred
-        | IntraMode::D135Pred
-        | IntraMode::D113Pred
-        | IntraMode::D157Pred
-        | IntraMode::D203Pred
-        | IntraMode::D67Pred => 3,
-        _ => 4,
+        IntraMode::D45Pred | IntraMode::D67Pred => 3,
+        IntraMode::D135Pred | IntraMode::D113Pred | IntraMode::D157Pred | IntraMode::D203Pred => 4,
+        IntraMode::SmoothPred => 0,
+        IntraMode::SmoothVPred => 1,
+        IntraMode::SmoothHPred => 2,
+        IntraMode::PaethPred => 0,
+        IntraMode::CflPred => 0,
     }
 }
 
@@ -151,12 +152,19 @@ mod tests {
 
     #[test]
     fn mode_ctx_bucket_table() {
+        // Spec table 22182: { 0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0 }
         assert_eq!(mode_ctx_bucket(IntraMode::DcPred), 0);
         assert_eq!(mode_ctx_bucket(IntraMode::VPred), 1);
         assert_eq!(mode_ctx_bucket(IntraMode::HPred), 2);
         assert_eq!(mode_ctx_bucket(IntraMode::D45Pred), 3);
+        assert_eq!(mode_ctx_bucket(IntraMode::D135Pred), 4);
+        assert_eq!(mode_ctx_bucket(IntraMode::D113Pred), 4);
+        assert_eq!(mode_ctx_bucket(IntraMode::D157Pred), 4);
+        assert_eq!(mode_ctx_bucket(IntraMode::D203Pred), 4);
         assert_eq!(mode_ctx_bucket(IntraMode::D67Pred), 3);
-        assert_eq!(mode_ctx_bucket(IntraMode::SmoothPred), 4);
-        assert_eq!(mode_ctx_bucket(IntraMode::PaethPred), 4);
+        assert_eq!(mode_ctx_bucket(IntraMode::SmoothPred), 0);
+        assert_eq!(mode_ctx_bucket(IntraMode::SmoothVPred), 1);
+        assert_eq!(mode_ctx_bucket(IntraMode::SmoothHPred), 2);
+        assert_eq!(mode_ctx_bucket(IntraMode::PaethPred), 0);
     }
 }

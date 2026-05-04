@@ -20,29 +20,17 @@ pub const SM_WEIGHTS64: [u16; 64] = [
     44, 41, 39, 36, 34, 32, 30, 28, 26, 24, 23, 21, 20, 18, 17, 16, 15, 14, 13, 12, 11, 10, 10,
 ];
 
-/// SM_WEIGHTS table for block dimension 2 — degenerate fallback only.
-/// Per AV1 spec §7.11.2.6 the SMOOTH family is undefined for 2-sample
-/// dimensions and the bitstream is expected never to select it for
-/// such a block. In practice an upstream decoder bug (e.g. a wrong
-/// chroma intra mode coming out of the round-4 spec-corrected
-/// `update_cdf` path on a fixture our decoder hasn't otherwise been
-/// fully validated against) can still land us here — returning a
-/// degenerate 2-entry slice instead of panicking lets the
-/// `Tier::ReportOnly` corpus tests record divergence rather than
-/// crash the entire test binary. The numeric values are linear
-/// extrapolation from the size-4 table's first / second positions and
-/// produce a roughly sensible 2-sample interpolation; their EXACT
-/// value is not load-bearing because no valid bitstream should reach
-/// this slice.
-pub const SM_WEIGHTS2: [u16; 2] = [255, 128];
-
 /// Return the `sm_weights` entry for a given power-of-two dimension in
-/// {2, 4, 8, 16, 32, 64}. Sizes 4-64 are spec-defined; size 2 is the
-/// degenerate fallback documented on `SM_WEIGHTS2`. Panics for any
-/// other size.
+/// {4, 8, 16, 32, 64}. Per AV1 spec §7.11.2.6 the SMOOTH family is
+/// undefined for 2-sample dimensions and the bitstream is required
+/// never to select it for such a block. Hitting any other size here
+/// means the upstream block-size derivation (chroma footprint,
+/// `HasChroma` gating, partition split, …) handed us a shape the
+/// codec never produces and is a hard decoder bug. Panics in that
+/// case so the caller surfaces it loudly rather than silently
+/// producing garbage pixels.
 pub fn sm_weight_table(n: usize) -> &'static [u16] {
     match n {
-        2 => &SM_WEIGHTS2,
         4 => &SM_WEIGHTS4,
         8 => &SM_WEIGHTS8,
         16 => &SM_WEIGHTS16,

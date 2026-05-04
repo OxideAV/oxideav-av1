@@ -1169,7 +1169,8 @@ impl<'a> TileDecoder<'a> {
     }
 
     /// Decode `angle_delta` for a directional mode. `dir_idx` is the
-    /// directional mode index (`y_mode - D45_PRED`, in 0..=7).
+    /// CDF index per spec §9.4: `mode - V_PRED` (so the 6 directional
+    /// modes hit slots 2..=7 of the 8-entry `angle_delta_cdf` table).
     /// Returns the signed delta in `-3..=3`.
     pub fn decode_angle_delta(&mut self, dir_idx: u32) -> Result<i32> {
         if dir_idx >= 8 {
@@ -1617,51 +1618,64 @@ pub fn segment_id_ctx(above_id: u8, left_id: u8, have_above: bool, have_left: bo
 }
 
 /// Split a CFL joint-sign symbol into `(sign_u, sign_v)` where each
-/// element is -1, 0, or +1. Spec §6.10.14.
+/// element is -1, 0, or +1. Spec §5.11.45 / §6.10.14:
+///
+///   signU = (cfl_alpha_signs + 1) / 3
+///   signV = (cfl_alpha_signs + 1) % 3
+///
+/// then map { ZERO=0 → 0, NEG=1 → -1, POS=2 → +1 }.
+///
+/// Round-5 fix: the previous mapping used a hand-rolled table that
+/// didn't match the spec arithmetic — joint=3 in particular returned
+/// `(0,-1)` instead of the spec's `(-1,-1)`, which silently zeroed
+/// CflAlphaU on a sizeable share of CFL-coded blocks.
 pub fn cfl_signs(joint: u32) -> (i32, i32) {
-    match joint {
-        0 => (-1, -1),
-        1 => (-1, 0),
-        2 => (-1, 1),
-        3 => (0, -1),
-        4 => (0, 1),
-        5 => (1, -1),
-        6 => (1, 0),
-        7 => (1, 1),
-        _ => (0, 0),
-    }
+    let v = (joint + 1) as i32;
+    let su_code = v / 3;
+    let sv_code = v % 3;
+    let to_sign = |c: i32| -> i32 {
+        match c {
+            0 => 0,
+            1 => -1,
+            2 => 1,
+            _ => 0,
+        }
+    };
+    (to_sign(su_code), to_sign(sv_code))
 }
 
-/// CFL alpha CDF context for a given joint sign + plane. Matches
-/// libaom's CFL_ALPHA_CTX mapping.
+/// CFL alpha CDF context for a given joint sign + plane. Per AV1
+/// spec §9.4 (table at lines 21164-21227 of the spec text):
+///
+/// - cfl_alpha_u CDF ctx = `(signU - 1) * 3 + signV`, defined when
+///   signU != 0 (joint ∈ {2..=7}).
+/// - cfl_alpha_v CDF ctx = `(signV - 1) * 3 + signU`, defined when
+///   signV != 0 (joint ∈ {0,1,3,4,6,7}).
+///
+/// where the spec sign codes are { ZERO=0, NEG=1, POS=2 } — i.e.
+/// `signU = (joint + 1) / 3`, `signV = (joint + 1) % 3`.
+///
+/// Returns 0 when the requested plane's sign is zero (the caller
+/// will not actually issue a CDF read in that case; we keep the
+/// branch so callers can treat the helper as total).
+///
+/// Round-5 fix: the previous table-based mapping followed the
+/// pre-round-5 broken `cfl_signs` enumeration; both helpers shifted
+/// in lock-step.
 pub fn cfl_alpha_ctx(joint: u32, plane: u32) -> u32 {
-    let (su, sv) = cfl_signs(joint);
+    let v = (joint + 1) as i32;
+    let su_code = v / 3; // 0=ZERO, 1=NEG, 2=POS
+    let sv_code = v % 3;
     if plane == 0 {
-        if su == 0 {
+        if su_code == 0 {
             return 0;
         }
-        match joint {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            5 => 3,
-            6 => 4,
-            7 => 5,
-            _ => 0,
-        }
+        ((su_code - 1) * 3 + sv_code) as u32
     } else {
-        if sv == 0 {
+        if sv_code == 0 {
             return 0;
         }
-        match joint {
-            0 => 0,
-            3 => 1,
-            5 => 2,
-            2 => 3,
-            4 => 4,
-            7 => 5,
-            _ => 0,
-        }
+        ((sv_code - 1) * 3 + su_code) as u32
     }
 }
 
@@ -1681,19 +1695,34 @@ mod tests {
 
     #[test]
     fn cfl_signs_table() {
-        assert_eq!(cfl_signs(0), (-1, -1));
+        // Spec §6.10.14:
+        //   joint | (signU, signV)
+        //   0     | (ZERO, NEG)  → ( 0, -1)
+        //   1     | (ZERO, POS)  → ( 0, +1)
+        //   2     | (NEG,  ZERO) → (-1,  0)
+        //   3     | (NEG,  NEG)  → (-1, -1)
+        //   4     | (NEG,  POS)  → (-1, +1)
+        //   5     | (POS,  ZERO) → (+1,  0)
+        //   6     | (POS,  NEG)  → (+1, -1)
+        //   7     | (POS,  POS)  → (+1, +1)
+        assert_eq!(cfl_signs(0), (0, -1));
+        assert_eq!(cfl_signs(1), (0, 1));
+        assert_eq!(cfl_signs(2), (-1, 0));
+        assert_eq!(cfl_signs(3), (-1, -1));
+        assert_eq!(cfl_signs(4), (-1, 1));
+        assert_eq!(cfl_signs(5), (1, 0));
+        assert_eq!(cfl_signs(6), (1, -1));
         assert_eq!(cfl_signs(7), (1, 1));
-        assert_eq!(cfl_signs(3), (0, -1));
     }
 
     #[test]
     fn cfl_alpha_ctx_plane_zero_when_sign_zero() {
-        // For plane=0 (U), sign_u == 0 when joint in {3, 4}.
-        assert_eq!(cfl_alpha_ctx(3, 0), 0);
-        assert_eq!(cfl_alpha_ctx(4, 0), 0);
-        // For plane=1 (V), sign_v == 0 when joint in {1, 6}.
-        assert_eq!(cfl_alpha_ctx(1, 1), 0);
-        assert_eq!(cfl_alpha_ctx(6, 1), 0);
+        // For plane=0 (U), sign_u == 0 when joint in {0, 1}.
+        assert_eq!(cfl_alpha_ctx(0, 0), 0);
+        assert_eq!(cfl_alpha_ctx(1, 0), 0);
+        // For plane=1 (V), sign_v == 0 when joint in {2, 5}.
+        assert_eq!(cfl_alpha_ctx(2, 1), 0);
+        assert_eq!(cfl_alpha_ctx(5, 1), 0);
     }
 
     /// Round 25 — `Tx_Size_Sqr` indexing for the inter ext-tx CDFs.

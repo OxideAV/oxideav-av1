@@ -271,27 +271,39 @@ fn palette_screen_fixture_psnr_vs_reference() {
         10.0 * (255.0_f64 * 255.0 / mse).log10()
     };
     eprintln!("palette_screen 64x64 — Y PSNR vs reference: {psnr:.2} dB");
-    // Round 4: the round-1 `update_cdf` had two bugs (rate
-    // under-counted by 1 for N≥4, and the inverse-CDF direction was
-    // flipped relative to spec §8.2.6). Fixing them changed the
-    // decoded symbol stream for fixtures that DO adapt CDF state mid-
-    // tile (palette_screen has `disable_cdf_update=0`); the resulting
-    // pixel pattern diverges further from libaom's reference because
-    // the rest of the round-9 decoder (palette lookahead, var-tx
-    // residual-per-TU, read_skip_mode, etc.) was implicitly tuned
-    // against the broken CDF evolution. PSNR dropped from ~11 dB
-    // pre-fix to ~5 dB post-fix.
+    // Round 5 raised the floor back to 8 dB after closing the
+    // downstream decoder gaps that the round-4 spec-correct
+    // `update_cdf` exposed:
     //
-    // The threshold is lowered to 4.5 dB to stay above the “random
-    // output” baseline (≈4 dB for an aligned-but-unrelated stream)
-    // while letting the spec-correct CDF behaviour land. Future
-    // rounds will close the downstream decoder gaps, at which point
-    // the PSNR will recover and this floor should be raised.
+    // 1. `HasChroma` per §5.11.5 — gate `uv_mode` + chroma
+    //    reconstruct on the spec predicate (was always-true for
+    //    non-monochrome, which silently consumed chroma-syntax
+    //    symbols on narrow blocks at even MI cols / rows in 4:2:x).
+    // 2. `intra_angle_info_y/uv` per §5.11.42/43 — gate angle delta
+    //    reads on `MiSize >= BLOCK_8X8` (was unconditional).
+    // 3. `angle_delta_cdf` index per §9.4 — `mode - V_PRED`, NOT
+    //    `mode - D45_PRED` (the wrong index used the V/H slots
+    //    in the 8-entry table for D45/D135).
+    // 4. `mode_ctx_bucket` per spec table 22182
+    //    `Intra_Mode_Context[INTRA_MODES] = { 0,1,2,3,4,4,4,4,3,0,1,2,0 }`
+    //    — was a hand-rolled table that mapped every directional
+    //    mode to 3 and every smooth/Paeth mode to 4 (opposite of
+    //    spec for D135/D113/D157/D203 + Smooth/SmoothV/SmoothH/
+    //    Paeth).
+    // 5. `cfl_signs` per §6.10.14 — was a 7-of-8-wrong hand table
+    //    versus `signU=(joint+1)/3, signV=(joint+1)%3`. The
+    //    matching `cfl_alpha_ctx` mapping was reworked to
+    //    `(signU-1)*3 + signV` per §9.4.
+    // 6. `cfl_allowed` per §9.4 — gate the 14-symbol UV CDF on
+    //    `max(W,H) <= 32` (or 4×4 chroma residual under lossless).
+    //
+    // PSNR moved 6.83 dB (broken) → 8.05 dB (post-round-5).
     assert!(
-        psnr > 4.5,
-        "palette_screen PSNR collapsed to {psnr:.2} dB (round-4 floor 4.5 dB \
-         tolerates downstream-decoder gaps re-exposed by the spec-correct \
-         update_cdf; future rounds should raise this back toward the \
-         pre-round-4 11 dB once palette / var-tx / skip-mode bugs are closed)"
+        psnr >= 8.0,
+        "palette_screen PSNR collapsed to {psnr:.2} dB (round-5 floor 8.0 dB \
+         after closing HasChroma / angle-delta-ctx / mode-bucket / cfl-signs / \
+         cfl-allowed gaps); regression hint — check the chroma-syntax read \
+         gating + the spec-table indexings flagged in the round-5 commit \
+         for `palette_screen`)"
     );
 }
