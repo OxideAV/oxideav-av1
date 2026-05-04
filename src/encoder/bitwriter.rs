@@ -269,11 +269,19 @@ mod tests {
         w.leb128_fixed(7, 4);
         let buf = w.finish();
         assert_eq!(buf.len(), 4);
-        // continuation bits set on first 3 bytes, last byte 0x07.
-        assert_eq!(buf[0] & 0x80, 0x80);
-        assert_eq!(buf[1] & 0x80, 0x80);
-        assert_eq!(buf[2] & 0x80, 0x80);
-        assert_eq!(buf[3], 0x07);
+        // §4.10.5 leb128 is little-endian byte order: the LOW 7 bits of
+        // the value live in byte 0 (with continuation set so the
+        // decoder keeps reading), followed by zero-payload continuation
+        // bytes, terminated by a final zero byte with continuation
+        // cleared. So encoding `7` as a fixed 4-byte leb128 yields
+        // [0x87, 0x80, 0x80, 0x00] — the value is in buf[0], not in
+        // the last byte. The original round-3 assertion `buf[3] ==
+        // 0x07` reflected a misunderstanding of the byte ordering, not
+        // a writer bug.
+        assert_eq!(buf[0], 0x87, "byte 0 carries low 7 bits + continuation");
+        assert_eq!(buf[1], 0x80, "padding byte: continuation, payload 0");
+        assert_eq!(buf[2], 0x80, "padding byte: continuation, payload 0");
+        assert_eq!(buf[3], 0x00, "terminator byte: no continuation, payload 0");
 
         let mut br = BitReader::new(&buf);
         assert_eq!(br.leb128().unwrap(), 7);
