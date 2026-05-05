@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-av1/compare/v0.1.3...v0.1.4) - 2026-05-04
+
+### Fixed
+
+- *(clippy)* replace redundant smooth_pred closures with direct fn refs
+
+### Other
+
+- rewrite SymbolEncoder as streaming 16-bit live register ([#388](https://github.com/OxideAV/oxideav-av1/pull/388))
+- av1 decoder: round 6 follow-up — close #403 OOB + #401 wrong spec dim
+- av1 decoder: round 6 #394 — replace run_smooth_padded_* shim with spec/clipped split
+- cargo fmt — collapse rust-formatter splits in #393 changes
+- av1 decoder: round 6 #393 — extend round-5 six-fix pattern to inter intra-within-inter
+- av1 decoder: round 5 — close 6 spec-syntax desync bugs (#386, #387)
+
 ### Changed
 
 - **encoder `SymbolEncoder` now streams** (#388) — replaced the round-2
