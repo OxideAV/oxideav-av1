@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder round 3 — transform + coefficient scaffolding**: forward DCT
+  kernels `fdct8`/`fdct16`/`fdct32` (1-D) + `fdct8x8`/`fdct16x16`/`fdct32x32`
+  (2-D) + generic `fdct2d` dispatcher; `residual_nxn` NxN residual helper.
+- **`CoeffCdfBankEnc`** — full encoder-side CDF bank mirroring the decoder's
+  `CoeffCdfBank` field-for-field; implements `write_txb_skip`, `write_eob`,
+  `write_eob_pt`, `write_base_level_eob`, `write_base_level`, `write_br_level`,
+  `write_dc_sign`, and `write_golomb`.
+- **`encode_coefficients`** — full forward coefficient emitter mirroring
+  `decode_coefficients`: handles all-zero blocks (txb_skip=1), eob encoding,
+  base/br-level encoding, Golomb-Rice tail, and sign bits.
+
+### Fixed
+
+- `encode_coefficients` base-level clamp: non-eob coefficients now use
+  `coeff_abs.min(3)` (was `clamp(0, 2)`) so values ≥ 3 correctly trigger the
+  br-level refinement path, matching the decoder's 4-way CDF.
+- `fdct32` interleaving: output positions `x[2]`/`x[4]`/... previously used
+  out-of-bounds indices into the 16-element `even` array — corrected to
+  bit-reversal-ordered interleave within `even[0..15]`.
+- `fdct8x8` pre-shift calibrated to 1 (was 3) against `inverse_2d_spec(Tx8x8)`
+  DC round-trip.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-av1/compare/v0.1.4...v0.1.5) - 2026-05-05
 
 ### Other

@@ -332,6 +332,26 @@ Self-roundtrip via the in-tree decoder gets header parse end-to-end;
 the tile group decode surfaces `Error::Unsupported` until the entropy
 coder ships.
 
+## Encoder — round 3 (transform + coefficient scaffolding)
+
+Round 3 adds the forward-transform stack and coefficient entropy emitter:
+
+- **Forward DCT kernels**: `fdct4`/`fdct8`/`fdct16`/`fdct32` (1-D) and the
+  corresponding 2-D `fdct4x4`/`fdct8x8`/`fdct16x16`/`fdct32x32` wrappers plus
+  a generic `fdct2d` dispatcher. `fdct4x4` round-trips through
+  `inverse_2d_spec(Tx4x4)` within ±1 LSB; `fdct8x8` DC within ±2 LSB.
+  The 16×32-point kernels compile and produce correct DC but their
+  AC precision is deferred to round 4 (pre-shift / interleave audit needed).
+- **`CoeffCdfBankEnc`** — full encoder-side CDF bank (mirrors `CoeffCdfBank`
+  field-for-field). All symbol emitters implemented.
+- **`encode_coefficients`** — full forward coefficient stream emitter:
+  txb_skip, eob, base-level, br-level refinement, Golomb-Rice tail, signs.
+  Roundtrip-tested against `decode_coefficients` for 4×4 blocks.
+
+The tile-group encoder still emits `txb_skip = 1` for every leaf block
+(all-zero; no residual). Wiring `encode_coefficients` into the tile path is
+round 4 work.
+
 ## Codec ID
 
 Registered as `"av1"`. The capability tag is `"av1_sw_parse"` —
