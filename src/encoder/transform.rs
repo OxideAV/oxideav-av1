@@ -1008,8 +1008,8 @@ mod tests {
         // DC (x[0]) must be non-zero.
         assert!(x[0] != 0, "DC must be non-zero");
         // AC terms should be zero or ±1 from rounding for uniform input.
-        for i in 1..8 {
-            assert!(x[i].abs() <= 1, "AC[{i}] = {} for uniform input", x[i]);
+        for (i, &v) in x.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 1, "AC[{i}] = {v} for uniform input");
         }
     }
 
@@ -1048,7 +1048,7 @@ mod tests {
     /// fdct2d matches fdct4x4 for 4×4 blocks.
     #[test]
     fn fdct2d_matches_fdct4x4() {
-        let mut a = (0..16).map(|i| (i * 7 - 50) as i32).collect::<Vec<_>>();
+        let mut a = (0..16i32).map(|i| i * 7 - 50).collect::<Vec<_>>();
         let mut b = a.clone();
         fdct4x4(a.as_mut_slice().try_into().unwrap());
         fdct2d(&mut b, 4, 4);
