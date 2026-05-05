@@ -63,7 +63,7 @@ pub mod intra {
 }
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
-use oxideav_core::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 
 pub const CODEC_ID_STR: &str = "av1";
 
@@ -76,7 +76,7 @@ pub const CODEC_ID_STR: &str = "av1";
 /// AVIS sequences decode end-to-end in 8-bit; HBD follows the same
 /// path but is narrowed to u8 for the emitted VideoFrame until a
 /// u16-capable PixelFormat variant lands upstream.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("av1_sw_decode")
         .with_lossy(true)
         .with_max_size(16384, 16384);
@@ -87,6 +87,16 @@ pub fn register(reg: &mut CodecRegistry) {
             .encoder(encoder::make_encoder)
             .tag(CodecTag::fourcc(b"AV01")),
     );
+}
+
+/// Unified registration entry point: install the AV1 codec factories
+/// into the codec sub-registry of a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that need
+/// only the codec sub-registry can keep using [`register_codecs`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
 }
 
 pub use decoder::{make_decoder, Av1Decoder};
@@ -100,3 +110,21 @@ pub use sequence_header::{
 };
 pub use tile_group::{parse_tile_group_header, split_tile_payloads, TileGroupHeader, TilePayload};
 pub use tile_info::{mi_cols_rows, parse_tile_info, tile_log2, TileInfo};
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+    use oxideav_core::{CodecId, CodecParameters, RuntimeContext};
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("av1 decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+    }
+}
