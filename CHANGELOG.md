@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-av1/compare/v0.1.5...v0.1.6) - 2026-05-07
+
+### Other
+
+- encoder round 40: wire encode_coefficients into tile-group leaf
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- fix needless_range_loop and unnecessary_cast in new transform tests
+- encoder round 3: forward DCT kernels + full coefficient emitter
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+
 ### Added
 
 - **Encoder round 40 — non-skip tile-group leaf wired**: new
