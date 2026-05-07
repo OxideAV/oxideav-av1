@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder round 40 — non-skip tile-group leaf wired**: new
+  `tile::write_tile_group_intra_64(seq, base_q_idx)` walks the full
+  `decode_coefficients` mirror per plane (one 64×64 luma TU + two 32×32
+  chroma TUs at 4:2:0; or 256 4×4 luma TUs in the lossless branch) with
+  all-zero residuals, replacing the round-3 block-level `skip = 1`
+  shortcut. `Av1Encoder::send_frame` now produces a stream that
+  exercises every coefficient symbol path the decoder reads on the
+  intra non-skip leg (`txb_skip` per plane), not the skip bypass. Both
+  in-tree decoder self-roundtrips (32×32 and 64×64 keyframes) and the
+  unit tests under `encoder::tile::tests` pin DC_PRED no-neighbour
+  reconstruction at Y mean = 128.
+- **`uv_mode` CDF select fix** (latent bug surfaced during round 40):
+  the writers now mirror the decoder's `cfl_allowed = (bw.max(bh) <= 32)`
+  test and pick `uv_mode_cdf[0][0]` for 64×64 frames (cfl_allowed=false)
+  / `uv_mode_cdf[1][0]` for ≤32 frames (cfl_allowed=true). The round-3
+  writer hard-coded `[1][0]` which range-coder-diverged on 64×64; the
+  in-tree decoder happened to also tolerate the divergence on its
+  non-strict path but `dav1d` rejected the stream.
 - **Encoder round 3 — transform + coefficient scaffolding**: forward DCT
   kernels `fdct8`/`fdct16`/`fdct32` (1-D) + `fdct8x8`/`fdct16x16`/`fdct32x32`
   (2-D) + generic `fdct2d` dispatcher; `residual_nxn` NxN residual helper.

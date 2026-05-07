@@ -348,9 +348,38 @@ Round 3 adds the forward-transform stack and coefficient entropy emitter:
   txb_skip, eob, base-level, br-level refinement, Golomb-Rice tail, signs.
   Roundtrip-tested against `decode_coefficients` for 4×4 blocks.
 
-The tile-group encoder still emits `txb_skip = 1` for every leaf block
-(all-zero; no residual). Wiring `encode_coefficients` into the tile path is
-round 4 work.
+## Encoder — round 40 (coefficient stream wired into tile leaf)
+
+Round 40 lands the deferred round-3 followup: `encode_coefficients` is now
+called from the tile-group writer per plane. The new
+`tile::write_tile_group_intra_64(seq, base_q_idx)` emits **`skip = 0`** at
+the block level and walks the decoder's per-plane coefficient path:
+
+- **Non-lossless** (`base_q_idx > 0`): one 64×64 luma TU (DCT_DCT
+  implicit because area > 32×32) plus two 32×32 chroma TUs (one each for
+  U / V at 4:2:0).
+- **Coded-lossless** (`base_q_idx == 0`): 256 × 4×4 luma TUs (the spec
+  pins luma block TxSize to `Tx4x4` in lossless) plus the same 32×32
+  chroma TUs (chroma sizing is independent of the block-level TxSize in
+  this implementation).
+
+Each TU currently emits an all-zero residual, so every plane sends a
+`txb_skip = true` symbol and the reconstructed output equals the round-3
+DC_PRED-no-neighbours mid-grey 128 fill. The bitstream is now
+`>= round-3` size with the entropy state diverged: the decoder reads three
+extra `txb_skip` symbols per block before short-circuiting, exercising the
+full non-skip leg. Self-roundtrip via `Av1Decoder` is pinned at 32×32 and
+64×64.
+
+Round 40 also fixed a latent `uv_mode_cdf` mis-index that desynced the
+encoder's range coder on 64×64 streams (the round-3 writer hard-coded
+`cfl_idx = 1`; the decoder picks `cfl_idx = 0` for blocks where
+`max(bw, bh) > 32`). `dav1d` would still reject the round-3 stream
+end-to-end (multiple downstream symbols absent), but the corrected
+`cfl_allowed` gating is a prerequisite for round-41+ production-quality
+emit. Round 41 will replace the all-zero residual with a quantised
+forward-DCT residual and wire the larger-than-4×4 transform sizes already
+shipped in `encoder::transform`.
 
 ## Codec ID
 

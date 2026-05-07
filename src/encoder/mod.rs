@@ -111,9 +111,16 @@ pub fn write_keyframe_stream(seq: &EncSequence, frame: &EncFrame) -> Vec<u8> {
     let seq_payload = write_sequence_header_payload(seq);
     write_obu(&mut out, ObuType::SequenceHeader, &seq_payload);
     let mut frame_obu_payload = write_frame_header_body(seq, frame);
-    // Round 3: emit a real entropy-coded single-superblock all-skip
-    // DC_PRED tile group instead of the round-1 16-byte zero stub.
-    let tile_group_body = tile::write_tile_group_skip_intra_64(seq);
+    // Round 40: emit a NON-skip single-superblock single-block tile
+    // group that walks the full `decode_coefficients` mirror per plane
+    // (with all-zero residuals that match the DC_PRED-no-neighbours
+    // reconstruction). Round 3's `write_tile_group_skip_intra_64` is
+    // preserved for OBU framing tests but no longer the production
+    // path — the round-3 stream emitted ZERO coefficient symbols on
+    // the wire (block-level skip = 1), which left
+    // [`tile::write_tile_group_intra_64`] / `encode_coefficients`
+    // standalone-tested but not exercised end-to-end.
+    let tile_group_body = tile::write_tile_group_intra_64(seq, frame.base_q_idx);
     frame_obu_payload.extend_from_slice(&tile_group_body);
     write_obu(&mut out, ObuType::Frame, &frame_obu_payload);
     out
