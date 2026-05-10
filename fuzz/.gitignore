@@ -12,6 +12,7 @@ corpus/*
 !corpus/panic_free_decode/
 corpus/panic_free_decode/*
 !corpus/panic_free_decode/golomb-overflow.bin
+!corpus/panic_free_decode/mc-empty-ref-oob.bin
 !corpus/ffmpeg_oracle_decode/
 corpus/ffmpeg_oracle_decode/*
 !corpus/ffmpeg_oracle_decode/dimension-mismatch-49w.bin

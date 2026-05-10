@@ -79,6 +79,14 @@ pub fn motion_compensate(
     mv: Mv,
     filt: InterpFilter,
 ) {
+    // Defensive: a malformed bitstream / fuzz input could call us with
+    // an empty `ref_y` buffer (e.g. a reference plane that was never
+    // populated because the producing frame errored). The clamp logic
+    // below would otherwise dereference out-of-bounds.
+    if ref_y.is_empty() || ref_w == 0 || ref_h == 0 || ref_stride == 0 || dst.is_empty() {
+        return;
+    }
+
     // §7.11.3.3 clamp MV to `[-MV_BORDER, frame + MV_BORDER]`.
     let mv = clamp_mv_to_frame(mv, bx, by, w as i32, h as i32, ref_w as i32, ref_h as i32);
     let int_x = mv.col >> 3;
@@ -114,7 +122,11 @@ pub fn motion_compensate(
         let sy = (by + int_y + r as i32 - 3).clamp(0, (ref_h as i32) - 1) as usize;
         for c in 0..w + 7 {
             let sx = (bx + int_x + c as i32 - 3).clamp(0, (ref_w as i32) - 1) as usize;
-            pad[r * pad_stride + c] = ref_y[sy * ref_stride + sx];
+            let idx = sy * ref_stride + sx;
+            // Guard against ref_w/ref_h overshooting the actual buffer.
+            if idx < ref_y.len() {
+                pad[r * pad_stride + c] = ref_y[idx];
+            }
         }
     }
     interp_sub_pel(dst, w, h, &pad, pad_stride, hp, vp, filt);
@@ -136,6 +148,11 @@ pub fn motion_compensate16(
     filt: InterpFilter,
     bit_depth: u32,
 ) {
+    // See `motion_compensate` for the empty-buffer rationale.
+    if ref_y.is_empty() || ref_w == 0 || ref_h == 0 || ref_stride == 0 || dst.is_empty() {
+        return;
+    }
+
     // §7.11.3.3 clamp MV to `[-MV_BORDER, frame + MV_BORDER]`.
     let mv = clamp_mv_to_frame(mv, bx, by, w as i32, h as i32, ref_w as i32, ref_h as i32);
     let int_x = mv.col >> 3;
@@ -167,7 +184,10 @@ pub fn motion_compensate16(
         let sy = (by + int_y + r as i32 - 3).clamp(0, (ref_h as i32) - 1) as usize;
         for c in 0..w + 7 {
             let sx = (bx + int_x + c as i32 - 3).clamp(0, (ref_w as i32) - 1) as usize;
-            pad[r * pad_stride + c] = ref_y[sy * ref_stride + sx];
+            let idx = sy * ref_stride + sx;
+            if idx < ref_y.len() {
+                pad[r * pad_stride + c] = ref_y[idx];
+            }
         }
     }
     interp_sub_pel16(dst, w, h, &pad, pad_stride, hp, vp, filt, bit_depth);
@@ -187,11 +207,18 @@ fn integer_copy_clamped(
     bx: i32,
     by: i32,
 ) {
+    if src.is_empty() || src_w == 0 || src_h == 0 || src_stride == 0 || dst.is_empty() {
+        return;
+    }
     for r in 0..h {
         let sy = (by + r as i32).clamp(0, (src_h as i32) - 1) as usize;
         for c in 0..w {
             let sx = (bx + c as i32).clamp(0, (src_w as i32) - 1) as usize;
-            dst[r * w + c] = src[sy * src_stride + sx];
+            let dst_idx = r * w + c;
+            let src_idx = sy * src_stride + sx;
+            if dst_idx < dst.len() && src_idx < src.len() {
+                dst[dst_idx] = src[src_idx];
+            }
         }
     }
 }
@@ -209,11 +236,18 @@ fn integer_copy_clamped16(
     bx: i32,
     by: i32,
 ) {
+    if src.is_empty() || src_w == 0 || src_h == 0 || src_stride == 0 || dst.is_empty() {
+        return;
+    }
     for r in 0..h {
         let sy = (by + r as i32).clamp(0, (src_h as i32) - 1) as usize;
         for c in 0..w {
             let sx = (bx + c as i32).clamp(0, (src_w as i32) - 1) as usize;
-            dst[r * w + c] = src[sy * src_stride + sx];
+            let dst_idx = r * w + c;
+            let src_idx = sy * src_stride + sx;
+            if dst_idx < dst.len() && src_idx < src.len() {
+                dst[dst_idx] = src[src_idx];
+            }
         }
     }
 }
