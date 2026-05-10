@@ -348,9 +348,20 @@ impl CoeffCdfBank {
 }
 
 /// Read a Golomb-Rice coded non-negative integer from the range
-/// coder's bypass bits (§9.3). Returns `x - 1` where `x` is the
+/// coder's bypass bits (§5.11.39). Returns `x - 1` where `x` is the
 /// reconstructed `(1 << length)`-prefixed value.
-fn read_golomb(sym: &mut SymbolDecoder<'_>) -> u32 {
+///
+/// The unary prefix is bounded at 31 leading zero bits because the
+/// reconstructed `x` must fit in a `u32` — `length` data bits are
+/// shifted into `x = 1`, so `length == 32` would shift the leading 1
+/// off the top of `x` (`1u32 << 32` overflows). On a fuzz-supplied
+/// bitstream that produces 32 leading zero bits the AV1 coefficient
+/// stream is not representable in u32 and we surface a decode error
+/// rather than silently truncating; a libavif-encoded frame
+/// previously panicked here with "attempt to subtract with overflow"
+/// (oxideav-avif fuzz CI run 25623885786, target
+/// `libavif_encode_oxideav_decode`).
+fn read_golomb(sym: &mut SymbolDecoder<'_>) -> Result<u32> {
     let mut length = 0u32;
     while length < 32 {
         if sym.decode_bool(16384) != 0 {
@@ -358,11 +369,16 @@ fn read_golomb(sym: &mut SymbolDecoder<'_>) -> u32 {
         }
         length += 1;
     }
+    if length >= 32 {
+        return Err(Error::invalid(
+            "av1 read_golomb: unary prefix > 31 zero bits — value would overflow u32 (§5.11.39)",
+        ));
+    }
     let mut x: u32 = 1;
     for _ in 0..length {
         x = (x << 1) | sym.decode_bool(16384);
     }
-    x - 1
+    Ok(x - 1)
 }
 
 /// Decode a `w × h` transform block's coefficients into a row-major
@@ -453,7 +469,7 @@ pub fn decode_coefficients(
                 }
             }
             if level >= 15 {
-                level += read_golomb(sym) as i32;
+                level += read_golomb(sym)? as i32;
             }
         }
 
@@ -555,5 +571,65 @@ mod tests {
         // The assertion is soft — the point is no panics. If nothing
         // decoded cleanly, print a log line instead of failing.
         let _ = any_success;
+    }
+
+    /// Regression test for the `read_golomb` integer-overflow panic.
+    ///
+    /// The original implementation allowed the unary-prefix loop to
+    /// reach `length = 32`, which then drove `for _ in 0..32 { x = (x
+    /// << 1) | bit; }` and overflowed `1u32 << 32`. The follow-up
+    /// `x - 1` then underflowed and panicked with `"attempt to
+    /// subtract with overflow"` (oxideav-avif fuzz CI run
+    /// 25623885786 / target `libavif_encode_oxideav_decode`).
+    ///
+    /// This test brute-forces a wide spread of seed buffers through
+    /// `read_golomb` directly and asserts that the function returns —
+    /// either with a value or with an `Error::InvalidData`, but never
+    /// via a panic. A bitstream that legitimately demands a length-32
+    /// prefix is now reported as an error rather than truncated.
+    #[test]
+    fn read_golomb_does_not_panic_on_long_unary_prefixes() {
+        // Spread of byte fills: 0x00 (drives the range coder toward
+        // long zero-bit runs), 0xFF (long one-bit runs), and several
+        // adversarial patterns. We assert that calling read_golomb
+        // 64 times on each buffer never panics — the previous
+        // implementation panicked on the first 0x00 buffer because
+        // long zero runs collapsed into length = 32.
+        let fills: [u8; 6] = [0x00, 0xFF, 0xAA, 0x55, 0x80, 0x01];
+        for &fill in &fills {
+            let buf = [fill; 256];
+            let mut sym = SymbolDecoder::new(&buf, buf.len(), false).expect("symbol init");
+            let mut errs = 0;
+            let mut oks = 0;
+            for _ in 0..64 {
+                match read_golomb(&mut sym) {
+                    Ok(_) => oks += 1,
+                    Err(_) => errs += 1,
+                }
+            }
+            // Combined count must equal the loop count — any panic
+            // would abort the loop before we got here.
+            assert_eq!(
+                oks + errs,
+                64,
+                "read_golomb panicked or aborted early for fill 0x{fill:02X}"
+            );
+        }
+    }
+
+    /// Pin the spec-conformant smallest values: with no leading zero
+    /// bits the golomb prefix is "1" and the decoded value is 0.
+    /// Constructing this against a real range coder requires a
+    /// pre-computed buffer; we instead verify the boundary path
+    /// indirectly via the encoder/decoder roundtrip in
+    /// `crate::encoder::coeffs::tests::encode_coefficients_roundtrip_*`.
+    /// Here we just assert that `read_golomb` is now fallible (the
+    /// signature change required at every call site to surface the
+    /// length-overflow case) — a compile-only contract test.
+    #[test]
+    fn read_golomb_signature_returns_result() {
+        let buf = [0xFFu8; 8];
+        let mut sym = SymbolDecoder::new(&buf, buf.len(), false).expect("symbol init");
+        let _: Result<u32> = read_golomb(&mut sym);
     }
 }

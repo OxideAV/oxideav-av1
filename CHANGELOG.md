@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`decode::coeffs::read_golomb` integer-overflow panic**: the unary
+  prefix loop allowed `length` to reach 32, after which the data-bit
+  loop shifted `1u32` left by 32 positions — overflowed and wrapped to
+  0, then `x - 1` underflowed and panicked with `"attempt to subtract
+  with overflow"`. The function now caps the prefix at 31 zero bits
+  (the largest value that keeps `x` representable in `u32`) and
+  returns `Result<u32>`, surfacing length-32 prefixes as
+  `Error::InvalidData` rather than aborting the process. Triggered by
+  the oxideav-avif fuzz CI nightly (run 25623885786, target
+  `libavif_encode_oxideav_decode`) on a libavif-encoded bitstream
+  whose Golomb tail happened to range-code into a 32-zero unary
+  prefix; pinned by `decode::coeffs::tests::read_golomb_does_not_panic_on_long_unary_prefixes`.
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-av1/compare/v0.1.5...v0.1.6) - 2026-05-07
 
 ### Other
