@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-av1/compare/v0.1.6...v0.1.7) - 2026-05-10
+
+### Other
+
+- fix read_golomb subtract-with-overflow on length-32 prefixes
+
 ### Fixed
 
 - **`decode::coeffs::read_golomb` integer-overflow panic**: the unary
