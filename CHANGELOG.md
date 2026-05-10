@@ -7,26 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fuzz infrastructure under `fuzz/`**: cargo-fuzz harnesses with three
+  targets — `panic_free_decode` (asserts `Av1Decoder::send_packet`
+  returns a `Result` on arbitrary bytes), `roundtrip` (encode→decode
+  self-roundtrip on the round-1 envelope), and `ffmpeg_oracle_decode`
+  (cross-decode against libavcodec via `libloading` runtime dlopen,
+  no `*-sys` dep). Daily CI workflow (`.github/workflows/fuzz.yml`)
+  splits a 30-minute budget across the three targets; the oracle
+  skips silently with `[oracle skip]` when libavcodec isn't installed
+  (no `#[ignore]` shortcut). The `read_golomb` regression input
+  (`ff 0a 0a ff ff 22`) is pinned as a `panic_free_decode` corpus
+  seed.
+
+### Fixed
+
+- **`transform::half_btf` / `round2` overflow panic**: the spec's
+  reference C uses `int32_t` and relies on defined-behaviour
+  wraparound; Rust's debug arithmetic panics on `panic_const_add_overflow`
+  / `panic_const_mul_overflow` instead. Widened both to `i64`
+  internally with `i32`-saturating output so spec-correct inputs stay
+  identity-valued and pathological inputs lose precision rather than
+  aborting. Coupled with a new `±2^19` row-input clamp in
+  `transform::inverse_2d_spec` (matching §7.13.3's `BitDepth + 7`
+  envelope) so the row pass cannot drive `iadst16` / `idct32` /
+  `idct64` butterflies into accumulation overflow. Surfaced by the
+  new `panic_free_decode` fuzz target.
+- **`transform::idtx_spec` / `transform::idtx` multiply-overflow
+  panic**: replaced raw `*v * 5793` / `*v * 11586` / `*v <<= 1` with
+  `i64`-widened-and-saturated arithmetic in the spec IDTX kernels
+  and `saturating_mul(2)` in the legacy ones. Surfaced via the same
+  fuzz target on a different code path.
+- **`lr::sgr::sgr_sub_filter` and `apply_sgr` overflow panic**: the
+  8-bit SGR sub-filter accumulated `n * sum_sq - sum * sum` in `i32`
+  and multiplied the result by `eps`, overflowing on malformed
+  bitstreams; the per-pixel SGR blend in `apply_sgr` similarly
+  multiplied `xq[i] * d` in `i32`. Both are now `i64`-widened with
+  saturating arithmetic to match the existing `apply_sgr16` path.
+- **`predict::intra::smooth::sm_weight_table` panic on unsupported
+  block dimensions**: replaced the `panic!` arm with an empty-slice
+  return; every `smooth_pred*` caller now early-returns when either
+  dimension's weight table is empty (same soft-fail discipline the
+  rest of the predictors already use).
+- **`predict::intra::filter::filter_intra_pred` / `_pred16` OOB
+  panic**: the 8-bit and 16-bit FilterIntra predictors slice-indexed
+  `buf[0][1..=w]` against a `[u8/u16; 33]` row, panicking when a
+  malformed bitstream reached them with `w > 32`. Per spec §7.11.2.4
+  FilterIntra is restricted to `bsize <= BLOCK_32X32`; both functions
+  now early-return on out-of-range or short slices.
+
 ## [0.1.7](https://github.com/OxideAV/oxideav-av1/compare/v0.1.6...v0.1.7) - 2026-05-10
 
 ### Other
 
 - fix read_golomb subtract-with-overflow on length-32 prefixes
-
-### Fixed
-
-- **`decode::coeffs::read_golomb` integer-overflow panic**: the unary
-  prefix loop allowed `length` to reach 32, after which the data-bit
-  loop shifted `1u32` left by 32 positions — overflowed and wrapped to
-  0, then `x - 1` underflowed and panicked with `"attempt to subtract
-  with overflow"`. The function now caps the prefix at 31 zero bits
-  (the largest value that keeps `x` representable in `u32`) and
-  returns `Result<u32>`, surfacing length-32 prefixes as
-  `Error::InvalidData` rather than aborting the process. Triggered by
-  the oxideav-avif fuzz CI nightly (run 25623885786, target
-  `libavif_encode_oxideav_decode`) on a libavif-encoded bitstream
-  whose Golomb tail happened to range-code into a 32-zero unary
-  prefix; pinned by `decode::coeffs::tests::read_golomb_does_not_panic_on_long_unary_prefixes`.
 
 ## [0.1.6](https://github.com/OxideAV/oxideav-av1/compare/v0.1.5...v0.1.6) - 2026-05-07
 

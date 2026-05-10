@@ -1,0 +1,14 @@
+target
+artifacts
+coverage
+Cargo.lock
+
+# libfuzzer accumulates a per-target corpus under fuzz/corpus/<target>/
+# during local runs. CI persists its own corpus via actions/cache, and
+# the reusable crate-fuzz workflow re-mines it across runs. We don't
+# track the bulk corpus in git (it'd grow unbounded) — only the
+# explicit regression seeds checked in via `!` overrides below.
+corpus/*
+!corpus/panic_free_decode/
+corpus/panic_free_decode/*
+!corpus/panic_free_decode/golomb-overflow.bin
