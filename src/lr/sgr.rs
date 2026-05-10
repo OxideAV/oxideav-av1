@@ -125,28 +125,36 @@ pub fn sgr_sub_filter(
         }
         return;
     }
-    let n = (2 * r + 1) * (2 * r + 1);
+    // Widen sum / sum_sq / multiplications to `i64`. With `r ≤ 3` and
+    // 8-bit samples the spec-correct envelope is small (`sum ≤ 49 *
+    // 255 ≈ 12k`, `sum_sq ≤ 49 * 65k ≈ 3.2M`, `p * eps ≤ 1.5e8 * 2^8 ≈
+    // 4e10` which already overflows `i32`); a malformed `eps` from a
+    // fuzz input pushes things even further. Using `i64` throughout
+    // makes the kernel panic-free while preserving the spec-correct
+    // arithmetic exactly.
+    let n: i64 = ((2 * r + 1) * (2 * r + 1)) as i64;
+    let eps64 = eps as i64;
     let mut tmp = vec![0u8; w * h];
     for y in 0..h {
         for x in 0..w {
-            let mut sum = 0i32;
-            let mut sum_sq = 0i32;
+            let mut sum: i64 = 0;
+            let mut sum_sq: i64 = 0;
             for dy in -r..=r {
                 let yy = clamp_i(y as i32 + dy, 0, h as i32 - 1) as usize;
                 for dx in -r..=r {
                     let xx = clamp_i(x as i32 + dx, 0, w as i32 - 1) as usize;
-                    let s = src[yy * stride + xx] as i32;
+                    let s = src[yy * stride + xx] as i64;
                     sum += s;
                     sum_sq += s * s;
                 }
             }
             let p = (n * sum_sq - sum * sum).max(0);
-            let z = (((p * eps) + (1 << 19)) >> 20).clamp(0, 255);
-            let a = SGR_X_BY_XPLUS1[z as usize] as i32;
+            let z = (((p.saturating_mul(eps64)) + (1 << 19)) >> 20).clamp(0, 255) as usize;
+            let a = SGR_X_BY_XPLUS1[z] as i64;
             let mean = sum / n;
-            let pix = src[y * stride + x] as i32;
+            let pix = src[y * stride + x] as i64;
             let out = (a * pix + (256 - a) * mean + 128) >> 8;
-            tmp[y * w + x] = out.clamp(0, 255) as u8;
+            tmp[y * w + x] = (out as i32).clamp(0, 255) as u8;
         }
     }
     for y in 0..h {
@@ -232,7 +240,12 @@ pub fn apply_sgr(dst: &mut [u8], src: &[u8], w: usize, h: usize, stride: usize, 
             let pix = src[y * stride + x] as i32;
             let d0 = flt0[y * w + x] as i32 - pix;
             let d1 = flt1[y * w + x] as i32 - pix;
-            let v = pix + ((p.xq[0] * d0 + p.xq[1] * d1 + 32) >> 6);
+            // Widen the per-pixel blend to `i64` — `xq` carries
+            // signed Q6 weights signaled per restoration unit, and a
+            // malformed bitstream could deliver values that overflow
+            // `i32` when multiplied by an 8-bit difference.
+            let blend = (p.xq[0] as i64) * (d0 as i64) + (p.xq[1] as i64) * (d1 as i64) + 32;
+            let v = (pix as i64) + (blend >> 6);
             dst[y * stride + x] = v.clamp(0, 255) as u8;
         }
     }
@@ -266,8 +279,10 @@ pub fn apply_sgr16(
             let pix = src[y * stride + x] as i32;
             let d0 = flt0[y * w + x] as i32 - pix;
             let d1 = flt1[y * w + x] as i32 - pix;
-            let v = pix + ((p.xq[0] * d0 + p.xq[1] * d1 + 32) >> 6);
-            dst[y * stride + x] = v.clamp(0, max_v) as u16;
+            // See `apply_sgr` for the i64-widening rationale.
+            let blend = (p.xq[0] as i64) * (d0 as i64) + (p.xq[1] as i64) * (d1 as i64) + 32;
+            let v = (pix as i64) + (blend >> 6);
+            dst[y * stride + x] = v.clamp(0, max_v as i64) as u16;
         }
     }
 }

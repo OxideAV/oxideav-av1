@@ -27,7 +27,13 @@ use super::cos_pi::round2;
 /// row pre-scale.
 pub fn idtx4_spec(x: &mut [i32; 4]) {
     for v in x.iter_mut() {
-        *v = round2(*v * 5793, 12);
+        // Widen to `i64` so pathological out-of-envelope inputs (e.g.
+        // a fuzz bitstream that drove a giant value past the row-pass
+        // pre-clip) cannot panic on `panic_const_mul_overflow`. Spec-
+        // correct inputs (post-dequant, BitDepth ≤ 12) sit comfortably
+        // below 2^19; saturating back to `i32` is identity for them.
+        let prod = (*v as i64) * 5793;
+        *v = round2(prod.clamp(i32::MIN as i64, i32::MAX as i64) as i32, 12);
     }
 }
 
@@ -38,7 +44,7 @@ pub fn idtx4_spec(x: &mut [i32; 4]) {
 /// table without crossing modules.
 pub fn idtx8_spec(x: &mut [i32; 8]) {
     for v in x.iter_mut() {
-        *v *= 2;
+        *v = v.saturating_mul(2);
     }
 }
 
@@ -47,14 +53,17 @@ pub fn idtx8_spec(x: &mut [i32; 8]) {
 /// `11586 / 4096 ≈ 2.8286 ≈ 2√2`.
 pub fn idtx16_spec(x: &mut [i32; 16]) {
     for v in x.iter_mut() {
-        *v = round2(*v * 11586, 12);
+        // See `idtx4_spec` for the i64-widening rationale — same
+        // overflow-on-malformed-input pattern, larger multiplier.
+        let prod = (*v as i64) * 11586;
+        *v = round2(prod.clamp(i32::MIN as i64, i32::MAX as i64) as i32, 12);
     }
 }
 
 /// 32-point spec IDTX — `T[i] = T[i] * 4`.
 pub fn idtx32_spec(x: &mut [i32; 32]) {
     for v in x.iter_mut() {
-        *v *= 4;
+        *v = v.saturating_mul(4);
     }
 }
 

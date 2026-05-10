@@ -6,25 +6,31 @@
 //! - `idtx4` / `idtx8` / `idtx16` — left-shift by 1.
 //! - `idtx32` — no scaling (the range table already accounts for
 //!   identity at N = 32).
+//!
+//! The shift is realised as `saturating_mul(2)` instead of `<<= 1`
+//! because the latter panics on debug overflow when `*v` has its sign
+//! bit set; saturating-doubling preserves the spec identity scale for
+//! in-envelope inputs and prevents the panic on pathological fuzz
+//! inputs that drive a giant value past the row-pass pre-clip.
 
 /// 4-point identity inverse transform.
 pub fn idtx4(x: &mut [i32; 4]) {
     for v in x.iter_mut() {
-        *v <<= 1;
+        *v = v.saturating_mul(2);
     }
 }
 
 /// 8-point identity inverse transform.
 pub fn idtx8(x: &mut [i32; 8]) {
     for v in x.iter_mut() {
-        *v <<= 1;
+        *v = v.saturating_mul(2);
     }
 }
 
 /// 16-point identity inverse transform.
 pub fn idtx16(x: &mut [i32; 16]) {
     for v in x.iter_mut() {
-        *v <<= 1;
+        *v = v.saturating_mul(2);
     }
 }
 

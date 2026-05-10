@@ -85,6 +85,13 @@ pub fn filter_intra_pred(
     } else {
         mode
     };
+    // Spec §7.11.2.4 restricts FilterIntra to `bsize <= BLOCK_32X32`,
+    // so 32 is the maximum legitimate `w`/`h`. A malformed bitstream
+    // (or a fuzz input) could reach here with a larger size — bail
+    // out rather than OOB-panic on the `buf` indexing below.
+    if w > 32 || h > 32 || above.len() < w || left.len() < h || dst.len() < w * h {
+        return;
+    }
     let mut buf = [[0u8; 33]; 33];
     buf[0][0] = above_left;
     buf[0][1..=w].copy_from_slice(&above[..w]);
@@ -146,6 +153,11 @@ pub fn filter_intra_pred16(
     } else {
         mode
     };
+    // Spec §7.11.2.4 restricts FilterIntra to `bsize <= BLOCK_32X32`;
+    // bail on out-of-range or short slices (fuzz / malformed inputs).
+    if w > 32 || h > 32 || above.len() < w || left.len() < h || dst.len() < w * h {
+        return;
+    }
     let max_v = ((1i32) << bit_depth) - 1;
     let mut buf = [[0u16; 33]; 33];
     buf[0][0] = above_left;

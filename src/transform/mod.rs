@@ -435,6 +435,22 @@ pub fn inverse_2d_spec(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()>
     // sequence that algebraically cancelled the kernel's own reverse
     // and yielded `IADST(reverse(input))` — not spec-equivalent).
 
+    // §7.13.3 row-input clip: the dequant step bounds residual
+    // magnitude at `max(BitDepth + 7, 16)` bits. Without an explicit
+    // clamp here, an arbitrary `coeffs` buffer (e.g. from a fuzz
+    // input that stresses the coefficient decoder, or a malformed
+    // bitstream that snuck a giant value past dequant) can drive the
+    // row-pass butterfly into `i32` overflow inside the half_btf
+    // additions — observed via `panic_const_add_overflow` in
+    // `iadst16` stage 3 from oxideav-av1 fuzz CI. Clamp at
+    // ±(2^19 − 1) (`BitDepth=12` envelope) so the spec-correct
+    // bitstreams pass through unchanged while pathological inputs
+    // surface as visually-clipped reconstruction rather than a panic.
+    const ROW_CLAMP_LIMIT: i32 = 1 << 19;
+    for v in coeffs.iter_mut() {
+        *v = (*v).clamp(-ROW_CLAMP_LIMIT, ROW_CLAMP_LIMIT - 1);
+    }
+
     // Row pass.
     let mut row = vec![0i32; w];
     for r in 0..h {
@@ -454,6 +470,9 @@ pub fn inverse_2d_spec(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()>
         }
         if needs_2896 {
             for cell in row.iter_mut() {
+                // The pre-row clip bounds `*cell` to ±2^19. The
+                // 2896 multiplier cannot overflow `i32` at that
+                // magnitude (2^19 * 2896 ≈ 1.5e9 < 2.15e9 = i32::MAX).
                 *cell = round2(*cell * 2896, 12);
             }
         }

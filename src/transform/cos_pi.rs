@@ -37,18 +37,38 @@ pub const SIN_PI_4_9: i32 = 3803;
 
 /// `round((w0 * in0 + w1 * in1) / 2^COS_BITS)` with symmetric
 /// rounding. Spec §7.7.1.2.
+///
+/// Internally widened to `i64` so intermediate values cannot overflow
+/// — at full envelope (cos ≤ 2^12, post-butterfly inputs ≤ 2^23) the
+/// `w0 * in0 + w1 * in1 + (1 << 11)` expression reaches 2^36, well
+/// past `i32::MAX`. The spec's reference C uses `int32_t` and relies
+/// on C's defined-behaviour wraparound; Rust panics on debug overflow,
+/// so we widen to `i64` and saturate the final result back into
+/// `i32` to mirror the spec's expected envelope without aborting.
+/// Saturation is the right "fail soft" behaviour for malformed
+/// bitstreams: spec-correct inputs never approach `i32::MAX`, so the
+/// saturating clamp is identity for them; pathological inputs lose a
+/// little precision rather than aborting the process.
 #[inline]
 pub fn half_btf(w0: i32, in0: i32, w1: i32, in1: i32) -> i32 {
-    (w0 * in0 + w1 * in1 + (1 << (COS_BITS - 1))) >> COS_BITS
+    let acc = (w0 as i64) * (in0 as i64) + (w1 as i64) * (in1 as i64) + (1i64 << (COS_BITS - 1));
+    (acc >> COS_BITS).clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
 /// `round2(x, shift) = (x + (1 << (shift-1))) >> shift`.
+///
+/// Widened to `i64` for the rounding addition so the
+/// `x + (1 << (shift-1))` step cannot overflow when `x` is near
+/// `i32::MAX` (only reachable in malformed bitstreams; saturating
+/// back to `i32` preserves the spec-correct identity behaviour for
+/// in-range inputs).
 #[inline]
 pub fn round2(x: i32, shift: u32) -> i32 {
     if shift == 0 {
         x
     } else {
-        (x + (1 << (shift - 1))) >> shift
+        let acc = (x as i64) + (1i64 << (shift - 1));
+        ((acc >> shift).clamp(i32::MIN as i64, i32::MAX as i64)) as i32
     }
 }
 

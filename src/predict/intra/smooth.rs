@@ -26,9 +26,11 @@ pub const SM_WEIGHTS64: [u16; 64] = [
 /// never to select it for such a block. Hitting any other size here
 /// means the upstream block-size derivation (chroma footprint,
 /// `HasChroma` gating, partition split, …) handed us a shape the
-/// codec never produces and is a hard decoder bug. Panics in that
-/// case so the caller surfaces it loudly rather than silently
-/// producing garbage pixels.
+/// codec never produces. The original implementation panicked here;
+/// fuzz inputs surfaced that as a process-aborting decoder panic, so
+/// we now return an empty slice and rely on the `smooth_pred*`
+/// callers to early-return when either dimension's weight table is
+/// empty (preserving a "soft fail on malformed input" discipline).
 pub fn sm_weight_table(n: usize) -> &'static [u16] {
     match n {
         4 => &SM_WEIGHTS4,
@@ -36,8 +38,16 @@ pub fn sm_weight_table(n: usize) -> &'static [u16] {
         16 => &SM_WEIGHTS16,
         32 => &SM_WEIGHTS32,
         64 => &SM_WEIGHTS64,
-        _ => panic!("predict: sm_weights: unsupported block size {n}"),
+        _ => &[],
     }
+}
+
+/// True iff a slice from [`sm_weight_table`] is non-empty AND
+/// big enough for the requested dimension. Used by every smooth_*
+/// predictor as a guard against malformed-input dimensions.
+#[inline]
+fn weights_ok(slice: &[u16], n: usize) -> bool {
+    !slice.is_empty() && slice.len() >= n
 }
 
 /// SMOOTH_PRED: all 4 edges participate — above row, left column,
@@ -45,6 +55,16 @@ pub fn sm_weight_table(n: usize) -> &'static [u16] {
 pub fn smooth_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8]) {
     let wh = sm_weight_table(h);
     let ww = sm_weight_table(w);
+    if !weights_ok(wh, h)
+        || !weights_ok(ww, w)
+        || above.len() < w
+        || left.len() < h
+        || dst.len() < w * h
+        || w == 0
+        || h == 0
+    {
+        return;
+    }
     let below_pred = left[h - 1] as u32;
     let right_pred = above[w - 1] as u32;
     for r in 0..h {
@@ -64,6 +84,15 @@ pub fn smooth_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8]
 /// `left[h - 1]`.
 pub fn smooth_v_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8]) {
     let wh = sm_weight_table(h);
+    if !weights_ok(wh, h)
+        || above.len() < w
+        || left.len() < h
+        || dst.len() < w * h
+        || w == 0
+        || h == 0
+    {
+        return;
+    }
     let below_pred = left[h - 1] as u32;
     for r in 0..h {
         let wr = wh[r] as u32;
@@ -78,6 +107,15 @@ pub fn smooth_v_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u
 /// `above[w - 1]`.
 pub fn smooth_h_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u8]) {
     let ww = sm_weight_table(w);
+    if !weights_ok(ww, w)
+        || above.len() < w
+        || left.len() < h
+        || dst.len() < w * h
+        || w == 0
+        || h == 0
+    {
+        return;
+    }
     let right_pred = above[w - 1] as u32;
     for r in 0..h {
         for c in 0..w {
@@ -92,6 +130,16 @@ pub fn smooth_h_pred(dst: &mut [u8], w: usize, h: usize, above: &[u8], left: &[u
 pub fn smooth_pred16(dst: &mut [u16], w: usize, h: usize, above: &[u16], left: &[u16]) {
     let wh = sm_weight_table(h);
     let ww = sm_weight_table(w);
+    if !weights_ok(wh, h)
+        || !weights_ok(ww, w)
+        || above.len() < w
+        || left.len() < h
+        || dst.len() < w * h
+        || w == 0
+        || h == 0
+    {
+        return;
+    }
     let below_pred = left[h - 1] as u32;
     let right_pred = above[w - 1] as u32;
     for r in 0..h {
@@ -110,6 +158,15 @@ pub fn smooth_pred16(dst: &mut [u16], w: usize, h: usize, above: &[u16], left: &
 /// 16-bit SMOOTH_V_PRED.
 pub fn smooth_v_pred16(dst: &mut [u16], w: usize, h: usize, above: &[u16], left: &[u16]) {
     let wh = sm_weight_table(h);
+    if !weights_ok(wh, h)
+        || above.len() < w
+        || left.len() < h
+        || dst.len() < w * h
+        || w == 0
+        || h == 0
+    {
+        return;
+    }
     let below_pred = left[h - 1] as u32;
     for r in 0..h {
         let wr = wh[r] as u32;
@@ -123,6 +180,15 @@ pub fn smooth_v_pred16(dst: &mut [u16], w: usize, h: usize, above: &[u16], left:
 /// 16-bit SMOOTH_H_PRED.
 pub fn smooth_h_pred16(dst: &mut [u16], w: usize, h: usize, above: &[u16], left: &[u16]) {
     let ww = sm_weight_table(w);
+    if !weights_ok(ww, w)
+        || above.len() < w
+        || left.len() < h
+        || dst.len() < w * h
+        || w == 0
+        || h == 0
+    {
+        return;
+    }
     let right_pred = above[w - 1] as u32;
     for r in 0..h {
         for c in 0..w {
