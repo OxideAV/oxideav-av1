@@ -95,28 +95,28 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    // Width / height match would be a strong signal — but raw "frame
-    // 0 vs frame 0" comparison is brittle: the two decoders may pick
-    // different output orderings (e.g. one of them re-emits a
-    // `show_existing_frame` slot before the other), and a malformed
-    // packet can drive partial decode where ffmpeg accepts but
-    // produces a re-scaled / cropped surface our decoder doesn't.
-    // Treat dimension mismatch as an oracle disagreement (logged) and
-    // skip the strict pixel comparison rather than fail the run —
-    // false positives from harness brittleness aren't useful signal.
-    // The per-pixel comparison below still fires when both decoders
-    // agree on dimensions; that's the assertion we want to keep
-    // strict because a wrong YUV pattern is unambiguously a bug.
+    // Width / height match is a strong signal — both decoders parsed
+    // the same `UpscaledWidth × FrameHeight` per §5.9.5/§5.9.6/§7.18.2.
+    // Round 42 relaxed this to a logged-only disagreement to mask a
+    // round-trippable test case where libavcodec returned 49 (the spec-
+    // mandated `UpscaledWidth`) but our decoder returned the coded
+    // post-superres `FrameWidth` (26). The fix landed in this round:
+    // the decoder now refuses superres frames as `Error::Unsupported`
+    // (matching its existing valid-but-NYI policy for compound / warp /
+    // OBMC) so the early-return at the `our_send.is_err()` branch
+    // above handles them. Surfaces that survive to here either had no
+    // superres or are valid spec-correct dim agreements; treat any
+    // mismatch as a real decoder bug.
     let our_w = our0.planes[0].stride as u32;
     let h_from_y = (our0.planes[0].data.len() / our0.planes[0].stride) as u32;
-    if our_w != avc0.width || h_from_y != avc0.height {
-        eprintln!(
-            "[oracle disagreement] frame 0 size mismatch: \
-             ours={our_w}x{h_from_y} avc={}x{}",
-            avc0.width, avc0.height
-        );
-        return;
-    }
+    assert!(
+        our_w == avc0.width && h_from_y == avc0.height,
+        "frame 0 size mismatch vs libavcodec (per AV1 spec §7.18.2 the \
+         output surface is UpscaledWidth × FrameHeight): \
+         ours={our_w}x{h_from_y} avc={}x{}",
+        avc0.width,
+        avc0.height
+    );
 
     // Pixel comparison only when ffmpeg gave us 4:2:0 (pix_fmt==0).
     // Other pix_fmts (HBD, 422, 444, GRAY8) skip the per-pixel check

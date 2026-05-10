@@ -139,6 +139,29 @@ impl Av1Decoder {
                         .clone();
                     let (fh, tg_payload) = parse_frame_obu_with_dpb(&seq, obu.payload, &self.dpb)?;
                     self.seen_frame = true;
+                    // Per §5.9.8 superres_params + §7.18.2 output process:
+                    // the displayed surface width is `UpscaledWidth`, not
+                    // the coded `FrameWidth`. The decoder pipeline below
+                    // operates on the coded plane and we have not yet
+                    // implemented the §7.16 upscaling/loop-restoration
+                    // half. Emitting a frame at coded width when
+                    // `use_superres == 1` would publish a surface whose
+                    // dimensions disagree with every other AV1 decoder
+                    // (libavcodec returns 49w on the
+                    // `dimension-mismatch-49w.bin` corpus seed; we used
+                    // to return the coded 26w, which was the round-42
+                    // ffmpeg-oracle disagreement). Refuse the frame as
+                    // valid-but-NYI rather than silently mis-publish.
+                    if fh.use_superres {
+                        self.last_frame_header = Some(fh);
+                        return Err(Error::unsupported(
+                            "av1 frame_obu: superres upscaling (§7.16, \
+                             §5.9.8 superres_params) is not implemented; \
+                             emitting a frame at coded `FrameWidth` would \
+                             violate §7.18.2 output process which mandates \
+                             `w = UpscaledWidth`",
+                        ));
+                    }
                     if fh.frame_type == FrameType::Key {
                         self.prev_frame = None;
                         // §5.9.4 mark_ref_frames: a KEY frame implicitly
@@ -220,6 +243,20 @@ impl Av1Decoder {
                             "av1: OBU_TILE_GROUP without preceding frame_header",
                         ));
                     };
+                    // §7.18.2 output process — see the OBU_FRAME branch
+                    // above for the rationale: with `use_superres == 1`
+                    // the published surface must be `UpscaledWidth ×
+                    // FrameHeight`, but the §7.16 upscaling step is
+                    // unimplemented. Refuse rather than emit at coded
+                    // FrameWidth.
+                    if fh.use_superres {
+                        return Err(Error::unsupported(
+                            "av1 tile_group: superres upscaling (§7.16, \
+                             §5.9.8 superres_params) is not implemented; \
+                             refusing to publish a surface at coded \
+                             `FrameWidth` per §7.18.2",
+                        ));
+                    }
                     let Some(ti) = fh.tile_info.as_ref() else {
                         return Err(tile_decode_unsupported());
                     };

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **ffmpeg_oracle_decode dimension disagreement** on the
+  `dimension-mismatch-49w.bin` fuzz seed (round 42 logged-only
+  disagreement; round 43 fixes the underlying bug). On a profile-2
+  reduced-still-picture input with `enable_superres=1`, libavcodec
+  reported the spec-mandated `49 × 3` output surface while our
+  decoder emitted the coded post-superres `26 × 3` plane. AV1 spec
+  §7.18.2 (intermediate output preparation) is unambiguous: the
+  output `w = UpscaledWidth`, not coded `FrameWidth`. The §7.16
+  upscaling step that bridges coded → upscaled is unimplemented in
+  this crate, so emitting at the coded dimension would publish a
+  surface every other AV1 decoder disagrees with. `Av1Decoder::ingest`
+  now refuses any `OBU_FRAME` / `OBU_TILE_GROUP` whose `FrameHeader`
+  has `use_superres == true` with `Error::Unsupported`, matching the
+  existing valid-but-NYI policy for compound / warp / OBMC /
+  inter-intra. The fuzz oracle's pre-existing `our_send.is_err()`
+  early-return then handles the disagreement cleanly. The dimension
+  assertion in `ffmpeg_oracle_decode` is restored to a strict
+  `assert!`. Pinned by
+  `tests/superres_oracle_corpus.rs` against the original 196-byte
+  corpus seed.
+
 ### Added
 
 - **Fuzz infrastructure under `fuzz/`**: cargo-fuzz harnesses with three
