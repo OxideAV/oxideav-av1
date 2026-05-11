@@ -1825,8 +1825,21 @@ fn inter_luma_residual_tu(
     // (TX_SET_DCTONLY) carries no symbol; the helper short-circuits to
     // `DctDct`. Round 25 graduates the inter Y site from the previous
     // hard-coded `TxType::DctDct`.
+    //
+    // Round 46 (#776 follow-up): §5.11.47 ALSO gates the symbol on
+    // `qindex_for_block > 0` (qindex resolves to the SEG_LVL_ALT_Q
+    // override when enabled for the block's segment; else base_q_idx).
+    // For `coded_lossless` frames the conditional false-branch returns
+    // `TxType = DCT_DCT` without consuming a symbol — match that
+    // behaviour so the entropy decoder stays synced.
     let reduced_tx_set = td.frame.reduced_tx_set;
-    let tx_type = td.decode_inter_tx_type(w, h, reduced_tx_set)?;
+    let seg_id_inter = fs.mi_at(x >> 2, y >> 2).segment_id;
+    let qindex_for_block = segmented_base_q(td, seg_id_inter);
+    let tx_type = if qindex_for_block > 0 {
+        td.decode_inter_tx_type(w, h, reduced_tx_set)?
+    } else {
+        TxType::DctDct
+    };
     // §5.11.40 — stamp `TxTypes[y4 + j][x4 + i]` over the TU footprint
     // so the chroma `compute_tx_type` site (which reads the adjacent
     // luma cell per the `if (plane != 0)` branch) sees a real value.
@@ -2391,7 +2404,19 @@ fn reconstruct_luma_block(
     };
 
     let single_tx_unit = (spec_w == tx_w) && (spec_h == tx_h);
-    let block_tx_type = if skip || !single_tx_unit {
+    // Spec §5.11.47 `transform_type` — the intra_tx_type symbol is
+    // READ ONLY WHEN `set > 0 && qindex > 0` (with qindex from the
+    // per-segment SEG_LVL_ALT_Q feature when enabled, else base_q_idx).
+    // For `coded_lossless` frames (`base_q_idx == 0`) the conditional
+    // false-branch returns `TxType = DCT_DCT` WITHOUT consuming a
+    // symbol. Issue #776 round 46: previously we called
+    // `decode_intra_tx_type` unconditionally, reading a phantom symbol
+    // that desynced the entropy decoder for the coefficient reads —
+    // surfacing as the Y=128 collapse on the avif-fuzz divergence
+    // 1×1 lossless YUV444 KEY frame.
+    let qindex_for_block = segmented_base_q(td, segment_id);
+    let read_tx_type = qindex_for_block > 0;
+    let block_tx_type = if skip || !single_tx_unit || !read_tx_type {
         TxType::DctDct
     } else {
         td.decode_intra_tx_type(tx_w, tx_h, y_mode)?
@@ -2417,7 +2442,7 @@ fn reconstruct_luma_block(
             let wr_tu_h = wr_h.saturating_sub(ty * tx_h);
             let wr_tu_w = wr_tu_w.min(frame_w.saturating_sub(ux)).min(tx_w);
             let wr_tu_h = wr_tu_h.min(frame_h.saturating_sub(uy)).min(tx_h);
-            let tx_type = if skip {
+            let tx_type = if skip || !read_tx_type {
                 TxType::DctDct
             } else if single_tx_unit {
                 block_tx_type
@@ -2626,8 +2651,12 @@ fn decode_dequant_idct_luma(
     // Spec §5.11.39 ctx — `compute_tx_type` returns DCT_DCT for
     // lossless TUs (§5.11.40 `if (Lossless || ...) return DCT_DCT`),
     // and the intra branch reads `TxTypes[blockY][blockX]` which the
-    // decoder has already stamped. For round 45 we plumb the actual
+    // decoder has already stamped. Round 45 plumbs the actual
     // `tx_type` into the ctx — TxClass routing handles all cases.
+    // Round 46 (#776 follow-up): the caller now spec-correctly gates
+    // the `decode_intra_tx_type` symbol on §5.11.47's `qindex > 0`
+    // condition, so for `coded_lossless` the `tx_type` arg lands as
+    // `DctDct` here without a phantom entropy read above.
     let block_x_4 = plane_x >> 2;
     let block_y_4 = plane_y >> 2;
     let mut coeffs = {

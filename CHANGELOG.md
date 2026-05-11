@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **§5.11.47 `transform_type` symbol-gate** — workspace task #776
+  round 46. The intra (`reconstruct_luma_block`) and inter
+  (`inter_luma_residual_tu`) Y-plane reconstruction sites were
+  calling `decode_intra_tx_type` / `decode_inter_tx_type`
+  UNCONDITIONALLY whenever `single_tx_unit && !skip`. Per AV1 spec
+  §5.11.47 the `transform_type` symbol is read only when both
+  `set > 0` AND `qindex_for_block > 0` (qindex resolves to the
+  per-segment `SEG_LVL_ALT_Q` override when enabled, else
+  `base_q_idx`); the conditional false-branch returns
+  `TxType = DCT_DCT` without consuming a symbol. For
+  `coded_lossless` frames (`base_q_idx == 0`) we were reading a
+  phantom symbol that desynced the range coder for the subsequent
+  §5.11.39 coefficient reads — surfacing as the Y=128 collapse on
+  the avif-fuzz divergence 1×1 lossless YUV444 KEY frame
+  (`oxideav-avif` fuzz run `25642881651` `divergence.avif`). Both
+  call sites now compute `qindex_for_block` via the existing
+  `segmented_base_q(td, segment_id)` helper and short-circuit to
+  `TxType::DctDct` when `qindex == 0`. Pinned by
+  `tests/issue_765_4x4_identity_yuv444.rs ::
+  issue_776_round46_lossless_y_plane_no_longer_collapses_to_predictor`
+  which decodes the same OBU stream and asserts Y differs from the
+  128 predictor default. Remaining libavif divergence
+  (oxi Y=129/U=129/V=129 vs libavif Y=254/U=254/V=230) is the
+  lossless WHT residual scaling, tracked separately.
+
 - **ffmpeg_oracle_decode dimension disagreement** on the
   `dimension-mismatch-49w.bin` fuzz seed (round 42 logged-only
   disagreement; round 43 fixes the underlying bug). On a profile-2
