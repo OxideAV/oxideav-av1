@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **§7.7.4 / §7.13.2.10 lossless WHT scaling — verified spec-correct
+  (workspace task #786)**. Round 47. Audit triggered by the
+  fuzz-tracked `y_plane_divergence_match.avif` regression. Two
+  outcomes:
+  1. The 27-byte `OBU_STREAM` embedded in
+     `tests/issue_765_4x4_identity_yuv444.rs` did **not** match the
+     `mdat` payload of
+     `crates/oxideav-avif/tests/fixtures/fuzz/y_plane_divergence_match.avif`
+     (the first 13 bytes — sequence/frame header — matched; the 14
+     tail-end bytes were unrelated). The test is now rewritten with
+     the actual `mdat` bytes
+     (`12 00 0a 04 38 00 0e 49 32 11 10 00 00 19 b9 ca e3 37 39 09 47 d9 6e 65 96 64 af`).
+     Cross-decode against `dav1d 1.5.3` and `avifdec` (libavif) on
+     the corrected bitstream yields `(Y, U, V) = (133, 197, 215)`,
+     not the `(254, 254, 230)` figure quoted in the pre-r47 test
+     comment (which appears to have been a libavif-RGB-converted
+     value, not the raw YUV plane).
+  2. With the corrected bitstream `oxideav-av1` decodes to
+     `(Y, U, V) = (130, 128, 128)` — a Y delta of 3 LSB and chroma
+     deltas of 69/87 LSB versus `dav1d`. Hand-tracing the §7.13.2.10
+     WHT through the in-bounds Y TU's dequantised coefficients
+     `[12, 4, 0, 0, 8, -4, 0, 0, -4, 8, 0, 0, 0, 0, 0, 0]` (row
+     pass `shift = 2`, column pass `shift = 0` per §7.7.4 lines
+     16891 / 16914) produces residual `(0,0) = 2`, exactly matching
+     our runtime output. The WHT row + column shifts, the dequant
+     multiplier (`q = DC8[0] = AC8[0] = 4` per §7.12.2), and the
+     §7.7.4 reconstruct add-without-Round2 step are all
+     spec-correct. The remaining pixel divergence is upstream of
+     the WHT — the §5.11.39 / §9.4 coefficient entropy decoder
+     reads different `level` values than `dav1d` for the same range
+     coder state. Tracked as a follow-up against `decode_coefficients_spec`
+     contexts / CDF lookups, **not** the WHT path. Pinned by
+     `transform::iwht4::tests::iwht4_2d_divergence_y_tu_matches_spec`
+     and `tests/issue_786_lossless_wht_residual_scaling.rs`.
+
 - **§5.11.47 `transform_type` symbol-gate** — workspace task #776
   round 46. The intra (`reconstruct_luma_block`) and inter
   (`inter_luma_residual_tu`) Y-plane reconstruction sites were

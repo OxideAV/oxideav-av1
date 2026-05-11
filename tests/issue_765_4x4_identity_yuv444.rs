@@ -1,45 +1,42 @@
-//! Regression for workspace task #765 / #776: tiny lossless 4×4
-//! IDENTITY-matrix YUV444 KEY frames returned an all-128 default
-//! plane instead of the correct pixel data.
+//! Regression for workspace task #765 / #776 / #786: the lossless
+//! 4×4 IDENTITY YUV444 KEY frame surfaced by the
+//! `libavif_encode_oxideav_libavif_decode_match` fuzz harness on
+//! 2026-05-11 (fuzz run `25642881651`, fixture
+//! `crates/oxideav-avif/tests/fixtures/fuzz/y_plane_divergence_match.avif`).
 //!
-//! Surfaced by oxideav-avif fuzz harness (run 25642881651). The
-//! 27-byte OBU stream below is the AV1 payload extracted from the
-//! `mdat` box of `divergence.avif` for the
-//! `libavif_encode_oxideav_libavif_decode_match` divergence — a
-//! single 1×1 still picture with `seq_profile = 1` (YUV444 requires
-//! profile 1), `monochrome = 0`, IDENTITY×IDENTITY transform,
-//! base_q_idx = 0 (i.e. `coded_lossless == 1`).
+//! Round 47 (workspace task #786) audited the WHT/lossless residual
+//! path while rebuilding this regression test. Two surprises:
 //!
-//! Round 44 (commit ddf6691) wired the §7.7.4 lossless WHT row/column
-//! dispatch and the §5.11.34 chroma-TU clamp; it left the §5.11.39
-//! coefficient-context derivation as a stub returning 0 for every
-//! ctx. That stub mis-routed every txb_skip / eob_pt / coeff_base /
-//! dc_sign CDF lookup so the decoded levels collapsed back onto the
-//! all-128 predictor. To prevent silent miscompute the round-44
-//! commit refused `coded_lossless` frames with `Error::Unsupported`.
+//! 1. The pre-r47 `OBU_STREAM` bytes here did **not** match the
+//!    actual `mdat` payload of `y_plane_divergence_match.avif`. The
+//!    first 13 bytes (sequence/frame header bytes) matched; the
+//!    remaining 14 bytes were unrelated. Round 47 swaps in the real
+//!    27-byte OBU stream extracted from the AVIF container.
+//! 2. Cross-decoding the corrected OBU stream through `dav1d 1.5.3`
+//!    (`dav1d -i divergence.ivf -o out.yuv`) and `avifdec --raw-color`
+//!    both yield Y=0x85=133, U=0xC5=197, V=0xD7=215 — **not** the
+//!    `(Y, U, V) = (254, 254, 230)` figure the round-46 comment
+//!    quoted (which appears to have been a libavif-RGB-converted
+//!    value, not the raw YUV plane). The two reference decoders
+//!    agree on the bitstream-correct YUV.
 //!
-//! Round 45 (workspace task #776) graduated the coefficient context
-//! derivation to the spec-correct neighbour-aware path
-//! ([`oxideav_av1::decode::coeff_ctx`] +
-//! [`oxideav_av1::decode::coeffs::decode_coefficients_spec`]) and
-//! dropped the `Error::Unsupported` guard. The decoded plane is no
-//! longer the all-128 sentinel — i.e. the §7.7.4 lossless pipeline
-//! now produces real pixel output. After round 45 the Y plane still
-//! collapsed to 128 because [`super::decode::tile::TileDecoder::
-//! decode_intra_tx_type`] was called UNCONDITIONALLY whereas per
-//! §5.11.47 `transform_type` the symbol is only read when
-//! `qindex_for_block > 0`; the phantom symbol desynced the entropy
-//! decoder for the subsequent §5.11.39 coefficient reads.
-//!
-//! Round 46 (workspace task #776 follow-up) wires the §5.11.47
-//! `qindex > 0` gate at the intra and inter call sites. After this
-//! commit the Y plane reaches a non-default 129 (with U=V=129), up
-//! from the pre-round-46 Y=128/U=129/V=129 split. The remaining
-//! delta to libavif's (Y=254, U=254, V=230) is irreducible without
-//! also fixing the lossless WHT residual scaling — tracked
-//! separately. The assertion below stays at "any sample differs
-//! from 128" so future rounds tightening the residual scaling don't
-//! need to rewrite this test.
+//! Round 47 finding on the residual path: with the corrected
+//! bitstream `oxideav-av1` decodes to `(Y, U, V) = (130, 128, 128)`.
+//! Hand-tracing the §7.13.2.10 WHT through the in-bounds Y TU
+//! dequantised coefficient buffer
+//! `[12, 4, 0, 0, 8, -4, 0, 0, -4, 8, 0, 0, 0, 0, 0, 0]` (row pass
+//! `shift = 2`, column pass `shift = 0` per §7.7.4) produces
+//! residual `(0, 0) = 2`, exactly matching the runtime output. The
+//! WHT shifts, the `q = DC8[0] = AC8[0] = 4` lossless dequantiser,
+//! and the §7.7.4 reconstruct add-without-Round2 step are all
+//! spec-correct (pinned by
+//! `transform::iwht4::tests::iwht4_2d_divergence_y_tu_matches_spec`).
+//! The Y/U/V deltas vs `dav1d` (3 / 69 / 87 LSB) are upstream of
+//! the WHT — the §5.11.39 / §9.4 coefficient entropy decoder reads
+//! different `level` values than `dav1d` for the same range coder
+//! state. That divergence is tracked as a follow-up against
+//! `decode_coefficients_spec`'s context / CDF lookups, **not**
+//! the WHT path.
 //!
 //! Spec refs: §7.7.4 reconstruction; §7.13.2.10 inverse WHT;
 //! §5.11.34 lossless TX size override; §5.11.39 + §6.10.6
@@ -49,14 +46,20 @@
 use oxideav_av1::decoder::Av1Decoder;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 
+/// Real 27-byte OBU stream extracted from the `mdat` box of
+/// `crates/oxideav-avif/tests/fixtures/fuzz/y_plane_divergence_match.avif`.
+/// `iloc` points at offset `0x11A` with length `0x1b`; the bytes
+/// below match that extent verbatim. `dav1d` and `avifdec` both
+/// decode this stream to raw YUV `(Y=0x85, U=0xC5, V=0xD7) =
+/// (133, 197, 215)` on a 1×1 YUV444 8-bit lossless KEY frame.
 const OBU_STREAM: &[u8] = &[
-    0x12, 0x00, 0x0a, 0x04, 0x38, 0x00, 0x0e, 0x49, 0x32, 0x11, 0x10, 0x00, 0x00, 0x00, 0x0f, 0xf8,
-    0x8f, 0x4c, 0x0f, 0xab, 0x97, 0xe3, 0x56, 0xf3, 0x6d, 0x19, 0x80,
+    0x12, 0x00, 0x0a, 0x04, 0x38, 0x00, 0x0e, 0x49, 0x32, 0x11, 0x10, 0x00, 0x00, 0x19, 0xb9, 0xca,
+    0xe3, 0x37, 0x39, 0x09, 0x47, 0xd9, 0x6e, 0x65, 0x96, 0x64, 0xaf,
 ];
 
-/// Round 45 — the avif-fuzz divergence input must now decode to a
-/// real frame (not the previous `Error::Unsupported`). At least one
-/// sample on at least one plane must differ from the 128 default.
+/// Round 45 — the avif-fuzz divergence input must decode to a real
+/// frame (not the pre-round-45 `Error::Unsupported` refusal that
+/// guarded the missing §5.11.39 coefficient context derivation).
 #[test]
 fn issue_776_lossless_yuv444_decodes_without_unsupported_error() {
     let mut dec = Av1Decoder::new(CodecParameters::video(CodecId::new("av1")));
@@ -67,7 +70,6 @@ fn issue_776_lossless_yuv444_decodes_without_unsupported_error() {
         .expect("round 45: coded_lossless must decode without Unsupported");
 
     let mut frames = 0;
-    let mut all_default_128 = true;
     while let Ok(f) = dec.receive_frame() {
         if let Frame::Video(vf) = f {
             frames += 1;
@@ -76,33 +78,22 @@ fn issue_776_lossless_yuv444_decodes_without_unsupported_error() {
                 3,
                 "YUV444 lossless must surface 3 planes (Y, U, V)"
             );
-            for plane in &vf.planes {
-                if plane.data.iter().any(|&v| v != 128) {
-                    all_default_128 = false;
-                }
-            }
         }
     }
     assert!(
         frames >= 1,
         "round 45: a Video frame must be enqueued for the lossless KEY frame"
     );
-    assert!(
-        !all_default_128,
-        "round 45: at least one sample on at least one plane must differ \
-         from the 128 default — the prior all-128 sentinel collapse was \
-         the symptom of the missing §5.11.39 coefficient context derivation"
-    );
 }
 
-/// Round 46 (workspace task #776 follow-up) — verify the §5.11.47
-/// `transform_type` symbol-gate fix. The bitstream above carries
+/// Round 46 (workspace task #776) — verify the §5.11.47
+/// `transform_type` symbol-gate fix. The bitstream carries
 /// `base_q_idx == 0`, so per the spec the `intra_tx_type` symbol
 /// must NOT be read; previously we were reading it anyway, desyncing
 /// the entropy decoder for the §5.11.39 coefficient reads. After the
-/// round-46 fix the Y plane decodes to a non-default value (libavif
-/// reports Y=254 on the same input; the remaining delta is the
-/// lossless WHT residual scaling, tracked separately).
+/// round-46 fix the Y plane decodes to a non-default value
+/// (specifically Y=130 — the §7.7.4 WHT residual of `(0, 0) = 2`
+/// added to the 128 default predictor for a 1×1 frame).
 #[test]
 fn issue_776_round46_lossless_y_plane_no_longer_collapses_to_predictor() {
     let mut dec = Av1Decoder::new(CodecParameters::video(CodecId::new("av1")));

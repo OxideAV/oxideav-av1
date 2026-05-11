@@ -131,6 +131,32 @@ Sacred invariants intact:
 passes, and the libdav1d cross-check on `palette_screen.ivf`
 reports ~8.56 dB Y-PSNR (well above the 8.0 dB regression floor).
 
+## Inverse transform — round 47 (lossless WHT audit)
+
+Round 47 (workspace task #786) audited the §7.7.4 / §7.13.2.10
+lossless WHT residual path against the
+`y_plane_divergence_match.avif` 1×1 lossless YUV444 KEY frame.
+Findings:
+
+- The `inverse_2d_spec_lossless` dispatcher in `transform/mod.rs`
+  applies the §7.7.4 row pass with `shift = 2` and column pass with
+  `shift = 0` (§7.13.2.10), `rowShift = colShift = 0` between passes,
+  and no `Round2()` step before clip-add — spec-correct.
+- The lossless dequantiser is `q = DC8[0] = AC8[0] = 4` from the
+  §7.12.2 tables, applied as `level * q` per §7.12.3 step (c)
+  with `dqDenom = 1` for TX_4X4.
+- For the in-bounds Y TU's dequantised buffer
+  `[12, 4, 0, 0, 8, -4, 0, 0, -4, 8, 0, 0, 0, 0, 0, 0]`, the spec
+  WHT yields `(0, 0) = 2` (hand-traced in
+  `iwht4_2d_divergence_y_tu_matches_spec`), matching runtime output
+  exactly. `dav1d 1.5.3` and `avifdec` both decode the same OBU to
+  `(Y, U, V) = (133, 197, 215)`; oxideav decodes to
+  `(130, 128, 128)`. The 3-LSB Y delta and 69 / 87-LSB chroma
+  deltas are upstream of the WHT — the §5.11.39 / §9.4 coefficient
+  entropy decoder reads different `level` values for the same
+  range coder state, tracked as the next divergence-closing work
+  item.
+
 ## Inverse transform — round 25
 
 Round 25 wires the `inter_tx_type` symbol read into the inter Y site.
