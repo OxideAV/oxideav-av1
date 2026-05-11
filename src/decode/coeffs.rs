@@ -23,7 +23,12 @@ use oxideav_core::{Error, Result};
 use crate::cdfs;
 use crate::symbol::SymbolDecoder;
 
-use super::coeff_ctx::{level_ctx, sig_coef_ctx_2d};
+use crate::transform::TxType;
+
+use super::coeff_ctx::{
+    coeff_base_eob_from_base, coeff_br_ctx_spec, dc_sign_ctx_spec, eob_pt_ctx, get_coeff_base_ctx,
+    level_ctx, sig_coef_ctx_2d, txb_skip_ctx_spec, TxClass, COEFF_BASE_RANGE, NUM_BASE_LEVELS,
+};
 
 /// Map a `base_q_idx` to the 4-way `TOKEN_CDF_Q_CTXS` bucket (§7.12.4).
 pub fn q_index_to_ctx(q: i32) -> usize {
@@ -489,6 +494,293 @@ pub fn decode_coefficients(
     }
 
     Ok(coeffs)
+}
+
+/// Per-plane neighbour context arrays passed into
+/// [`decode_coefficients_spec`] (§5.11.39 / §6.10.6).
+pub struct LevelCtxArrays<'a> {
+    pub above_level: &'a mut [u8],
+    pub left_level: &'a mut [u8],
+    pub above_dc: &'a mut [u8],
+    pub left_dc: &'a mut [u8],
+    /// Per-plane MI grid extents — used for the spec's
+    /// `if (x4 + k < maxX4)` guards.
+    pub max_x4: usize,
+    pub max_y4: usize,
+}
+
+/// Spec-correct AV1 coefficient decoder — §5.11.39 / §9.4.
+///
+/// Round-45 graduation of [`decode_coefficients`] that wires the
+/// full neighbour-aware context derivation:
+///
+/// * `txb_skip` ctx polls the per-plane Above/LeftLevelContext
+///   arrays (vs hard-coded 0 in the legacy entry point).
+/// * `eob_pt` ctx is `0`/`1` driven by `get_tx_class`.
+/// * `coeff_base` / `coeff_base_eob` ctx is from
+///   `get_coeff_base_ctx(txSz, plane, x4, y4, scan[c], c, isEob)`
+///   per §5.11.39.
+/// * `coeff_br` ctx is from `Mag_Ref_Offset_With_Tx_Class`.
+/// * `dc_sign` ctx is from the per-plane Above/LeftDcContext arrays.
+///
+/// On success the per-plane context arrays are updated in place per
+/// the spec's `culLevel` / `dcCategory` propagation.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_coefficients_spec(
+    sym: &mut SymbolDecoder<'_>,
+    bank: &mut CoeffCdfBank,
+    tx_size_idx: usize,
+    plane_type: usize,
+    num_coeffs: usize,
+    scan: &[usize],
+    w: usize,
+    h: usize,
+    tx_type: TxType,
+    block_x_4: usize,
+    block_y_4: usize,
+    bw: usize,
+    bh: usize,
+    level_ctx: &mut LevelCtxArrays<'_>,
+) -> Result<Vec<i32>> {
+    let mut coeffs = vec![0i32; w * h];
+    let tx_class = TxClass::from_tx_type(tx_type);
+    let plane = if plane_type == 0 { 0 } else { 1 };
+
+    // Project the TU footprint onto the plane's Above/Left arrays.
+    let w4 = w.div_ceil(4);
+    let h4 = h.div_ceil(4);
+
+    let (top_lvl, left_lvl) = if plane == 0 {
+        let mut top: i32 = 0;
+        let mut left: i32 = 0;
+        for k in 0..w4 {
+            let x = block_x_4 + k;
+            if x < level_ctx.max_x4 {
+                if let Some(&v) = level_ctx.above_level.get(x) {
+                    top = top.max(v as i32);
+                }
+            }
+        }
+        for k in 0..h4 {
+            let y = block_y_4 + k;
+            if y < level_ctx.max_y4 {
+                if let Some(&v) = level_ctx.left_level.get(y) {
+                    left = left.max(v as i32);
+                }
+            }
+        }
+        (top, left)
+    } else {
+        let mut above: i32 = 0;
+        let mut left: i32 = 0;
+        for k in 0..w4 {
+            let x = block_x_4 + k;
+            if x < level_ctx.max_x4 {
+                let lv = level_ctx.above_level.get(x).copied().unwrap_or(0) as i32;
+                let dc = level_ctx.above_dc.get(x).copied().unwrap_or(0) as i32;
+                above |= lv | dc;
+            }
+        }
+        for k in 0..h4 {
+            let y = block_y_4 + k;
+            if y < level_ctx.max_y4 {
+                let lv = level_ctx.left_level.get(y).copied().unwrap_or(0) as i32;
+                let dc = level_ctx.left_dc.get(y).copied().unwrap_or(0) as i32;
+                left |= lv | dc;
+            }
+        }
+        (above, left)
+    };
+
+    let txb_ctx = txb_skip_ctx_spec(
+        plane, top_lvl, left_lvl, bw as i32, bh as i32, w as i32, h as i32,
+    )
+    .max(0) as usize;
+
+    if bank.read_txb_skip(sym, tx_size_idx, txb_ctx)? {
+        clear_level_ctx_footprint(level_ctx, block_x_4, block_y_4, w4, h4);
+        return Ok(coeffs);
+    }
+
+    let eob_ctx_v = eob_pt_ctx(tx_class).max(0) as usize;
+    let eob = bank.read_eob(sym, num_coeffs, tx_size_idx, plane_type, eob_ctx_v)?;
+    let eob = (eob as usize).clamp(1, num_coeffs);
+
+    if num_coeffs > 1024 {
+        return Err(Error::unsupported(
+            "av1 coeffs: num_coeffs > 1024 not supported (§9.3.3)",
+        ));
+    }
+    if scan.len() < eob {
+        return Err(Error::invalid(format!(
+            "av1 coeffs: scan too short ({}) for eob {eob}",
+            scan.len()
+        )));
+    }
+
+    let mut quant_abs = vec![0i32; w * h];
+
+    let (bwl, adj_height): (u32, i32) = match tx_size_idx.min(4) {
+        0 => (2, 4),
+        1 => (3, 8),
+        2 => (4, 16),
+        3 => (5, 32),
+        _ => (5, 32),
+    };
+
+    for i in (0..eob).rev() {
+        let pos = scan[i];
+        if pos >= w * h {
+            return Err(Error::invalid(format!(
+                "av1 coeffs: scan pos {pos} ≥ block size {}",
+                w * h
+            )));
+        }
+
+        let base_level: u32 = if i == eob - 1 {
+            let base_ctx = get_coeff_base_ctx(
+                tx_size_idx,
+                tx_class,
+                bwl,
+                adj_height,
+                &quant_abs,
+                pos,
+                i,
+                true,
+            );
+            let eob_base_ctx = coeff_base_eob_from_base(base_ctx).max(0) as usize;
+            bank.read_base_level_eob(sym, tx_size_idx, plane_type, eob_base_ctx)? + 1
+        } else {
+            let base_ctx = get_coeff_base_ctx(
+                tx_size_idx,
+                tx_class,
+                bwl,
+                adj_height,
+                &quant_abs,
+                pos,
+                i,
+                false,
+            );
+            bank.read_base_level(sym, tx_size_idx, plane_type, base_ctx.max(0) as usize)?
+        };
+
+        let mut level = base_level as i32;
+        if level > NUM_BASE_LEVELS {
+            for _br in 0..(COEFF_BASE_RANGE / 3) {
+                let br = coeff_br_ctx_spec(tx_class, bwl, adj_height, &quant_abs, pos);
+                let inc = bank.read_br_level(sym, tx_size_idx, plane_type, br.max(0) as usize)?;
+                level += inc as i32;
+                if (inc as i32) < 3 {
+                    break;
+                }
+            }
+            if level >= NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE {
+                level += read_golomb(sym)? as i32;
+            }
+        }
+
+        quant_abs[pos] = level;
+        coeffs[pos] = level;
+    }
+
+    let mut dc_category: u8 = 0;
+    if coeffs[scan[0]] > 0 {
+        let above_slice: Vec<u8> = (0..w4)
+            .filter_map(|k| {
+                let x = block_x_4 + k;
+                if x < level_ctx.max_x4 {
+                    level_ctx.above_dc.get(x).copied()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let left_slice: Vec<u8> = (0..h4)
+            .filter_map(|k| {
+                let y = block_y_4 + k;
+                if y < level_ctx.max_y4 {
+                    level_ctx.left_dc.get(y).copied()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let dc_ctx = dc_sign_ctx_spec(&above_slice, &left_slice).max(0) as usize;
+        let neg = bank.read_dc_sign(sym, plane_type, dc_ctx)?;
+        if neg {
+            coeffs[scan[0]] = -coeffs[scan[0]];
+            dc_category = 1;
+        } else {
+            dc_category = 2;
+        }
+    }
+    for &pos in scan.iter().take(eob).skip(1) {
+        if coeffs[pos] > 0 && sym.decode_bool(16384) != 0 {
+            coeffs[pos] = -coeffs[pos];
+        }
+    }
+
+    let mut cul_level: u32 = 0;
+    for &v in &coeffs {
+        cul_level = cul_level.saturating_add(v.unsigned_abs());
+    }
+    let cul_level = cul_level.min(63) as u8;
+    for k in 0..w4 {
+        let x = block_x_4 + k;
+        if x < level_ctx.max_x4 {
+            if x < level_ctx.above_level.len() {
+                level_ctx.above_level[x] = cul_level;
+            }
+            if x < level_ctx.above_dc.len() {
+                level_ctx.above_dc[x] = dc_category;
+            }
+        }
+    }
+    for k in 0..h4 {
+        let y = block_y_4 + k;
+        if y < level_ctx.max_y4 {
+            if y < level_ctx.left_level.len() {
+                level_ctx.left_level[y] = cul_level;
+            }
+            if y < level_ctx.left_dc.len() {
+                level_ctx.left_dc[y] = dc_category;
+            }
+        }
+    }
+
+    Ok(coeffs)
+}
+
+/// Helper — clear Above/Left context cells across a TU footprint.
+fn clear_level_ctx_footprint(
+    level_ctx: &mut LevelCtxArrays<'_>,
+    block_x_4: usize,
+    block_y_4: usize,
+    w4: usize,
+    h4: usize,
+) {
+    for k in 0..w4 {
+        let x = block_x_4 + k;
+        if x < level_ctx.max_x4 {
+            if x < level_ctx.above_level.len() {
+                level_ctx.above_level[x] = 0;
+            }
+            if x < level_ctx.above_dc.len() {
+                level_ctx.above_dc[x] = 0;
+            }
+        }
+    }
+    for k in 0..h4 {
+        let y = block_y_4 + k;
+        if y < level_ctx.max_y4 {
+            if y < level_ctx.left_level.len() {
+                level_ctx.left_level[y] = 0;
+            }
+            if y < level_ctx.left_dc.len() {
+                level_ctx.left_dc[y] = 0;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

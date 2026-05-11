@@ -94,7 +94,7 @@ use super::block::{
     block_size_from_wh, block_size_log, half_below_size, horz4_size, quarter_size, vert4_size,
     BlockSize, PartitionType,
 };
-use super::coeffs::{decode_coefficients, nz_map_ctx_offset, tx_size_idx};
+use super::coeffs::{decode_coefficients_spec, nz_map_ctx_offset, tx_size_idx};
 use super::frame_state::FrameState;
 use super::inter_block::{
     compound_mc_luma_u16, compound_mc_luma_u8, decode_inter_block_syntax, mc_chroma_u16,
@@ -1771,18 +1771,40 @@ fn inter_luma_residual_tu(
     let stride = fs.width as usize;
     let (sz, num_coeffs, scan) = select_square_tx(w, h)?;
     let tx_idx = tx_size_idx(w, h)?;
-    let nz = nz_map_ctx_offset(w, h)?;
-    let mut coeffs = decode_coefficients(
-        &mut td.symbol,
-        &mut td.coeff_bank,
-        tx_idx,
-        0,
-        num_coeffs,
-        &scan,
-        nz,
-        w,
-        h,
-    )?;
+    let _ = nz_map_ctx_offset(w, h)?; // legacy table — spec ctx replaces it.
+                                      // Spec §5.11.39: PlaneTxType is computed per the decoded
+                                      // `transform_type()` for plane=0. For inter blocks the symbol is
+                                      // read AFTER the coefficient decoder per our existing flow, so
+                                      // assume DCT_DCT (TX_CLASS_2D) for the ctx — the lossless branch
+                                      // (the round-45 target) likewise returns DCT_DCT per §5.11.40.
+    let coeff_tx_type = TxType::DctDct;
+    let block_x_4 = (x as usize) >> 2;
+    let block_y_4 = (y as usize) >> 2;
+    let mut coeffs = {
+        let mut lvl = super::tile::level_ctx_for_plane(
+            &mut td.above_level_ctx,
+            &mut td.left_level_ctx,
+            &mut td.above_dc_ctx,
+            &mut td.left_dc_ctx,
+            0,
+        );
+        decode_coefficients_spec(
+            &mut td.symbol,
+            &mut td.coeff_bank,
+            tx_idx,
+            0,
+            num_coeffs,
+            &scan,
+            w,
+            h,
+            coeff_tx_type,
+            block_x_4,
+            block_y_4,
+            w,
+            h,
+            &mut lvl,
+        )?
+    };
     // §5.11.12 — dequant indexes by `CurrentQIndex`, not the frame-level
     // `base_q_idx`, so per-SB delta_q updates propagate here.
     let qv = quant::Params {
@@ -1986,18 +2008,36 @@ fn reconstruct_inter_chroma_block(
         // Chroma residual mirrors the intra chroma path.
         let (sz, num_coeffs, scan) = select_square_tx(cw_clip, ch_clip)?;
         let tx_idx = tx_size_idx(cw_clip, ch_clip)?;
-        let nz = nz_map_ctx_offset(cw_clip, ch_clip)?;
-        let mut coeffs = decode_coefficients(
-            &mut td.symbol,
-            &mut td.coeff_bank,
-            tx_idx,
-            1,
-            num_coeffs,
-            &scan,
-            nz,
-            cw_clip,
-            ch_clip,
-        )?;
+        let _ = nz_map_ctx_offset(cw_clip, ch_clip)?;
+        let coeff_tx_type = TxType::DctDct;
+        let block_x_4 = cx >> 2;
+        let block_y_4 = cy >> 2;
+        let plane_for_ctx = (plane_idx as usize) + 1;
+        let mut coeffs = {
+            let mut lvl = super::tile::level_ctx_for_plane(
+                &mut td.above_level_ctx,
+                &mut td.left_level_ctx,
+                &mut td.above_dc_ctx,
+                &mut td.left_dc_ctx,
+                plane_for_ctx,
+            );
+            decode_coefficients_spec(
+                &mut td.symbol,
+                &mut td.coeff_bank,
+                tx_idx,
+                1,
+                num_coeffs,
+                &scan,
+                cw_clip,
+                ch_clip,
+                coeff_tx_type,
+                block_x_4,
+                block_y_4,
+                cw_clip,
+                ch_clip,
+                &mut lvl,
+            )?
+        };
         let plane = if plane_idx == 0 {
             quant::Plane::U
         } else {
@@ -2463,7 +2503,7 @@ fn reconstruct_one_luma_tx_unit(
     let oob_tu = wr_w == 0 || wr_h == 0;
     if oob_tu {
         if !skip {
-            let _ = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type)?;
+            let _ = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type, ux, uy)?;
         }
         return Ok(());
     }
@@ -2502,7 +2542,7 @@ fn reconstruct_one_luma_tx_unit(
         }
         // Decode + dequant + IDCT residual at spec TX size; add to
         // the spec-sized predictor in place; paste clipped.
-        let coeffs = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type)?;
+        let coeffs = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type, ux, uy)?;
         clip_add_in_place(&mut pred, &coeffs, tx_w, tx_h);
         paste_block_clipped(
             &mut fs.y_plane,
@@ -2546,7 +2586,7 @@ fn reconstruct_one_luma_tx_unit(
             );
             return Ok(());
         }
-        let coeffs = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type)?;
+        let coeffs = decode_dequant_idct_luma(td, fs, segment_id, tx_w, tx_h, tx_type, ux, uy)?;
         clip_add_in_place16(&mut pred, &coeffs, tx_w, tx_h, fs.bit_depth);
         paste_block_clipped16(
             &mut fs.y_plane16,
@@ -2568,6 +2608,7 @@ fn reconstruct_one_luma_tx_unit(
 /// just returns the post-IDCT residual in row-major order. Used by the
 /// round-6 #394 spec-vs-clipped split so the residual stays
 /// spec-aligned even when only `wr_w × wr_h` of it ends up on the plane.
+#[allow(clippy::too_many_arguments)]
 fn decode_dequant_idct_luma(
     td: &mut TileDecoder<'_>,
     fs: &FrameState,
@@ -2575,22 +2616,45 @@ fn decode_dequant_idct_luma(
     tx_w: usize,
     tx_h: usize,
     tx_type: TxType,
+    plane_x: usize,
+    plane_y: usize,
 ) -> Result<Vec<i32>> {
     let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
     let tx_idx = tx_size_idx(tx_w, tx_h)?;
-    let nz = nz_map_ctx_offset(tx_w, tx_h)?;
+    let _ = nz_map_ctx_offset(tx_w, tx_h)?;
 
-    let mut coeffs = decode_coefficients(
-        &mut td.symbol,
-        &mut td.coeff_bank,
-        tx_idx,
-        0, /* luma */
-        num_coeffs,
-        &scan,
-        nz,
-        tx_w,
-        tx_h,
-    )?;
+    // Spec §5.11.39 ctx — `compute_tx_type` returns DCT_DCT for
+    // lossless TUs (§5.11.40 `if (Lossless || ...) return DCT_DCT`),
+    // and the intra branch reads `TxTypes[blockY][blockX]` which the
+    // decoder has already stamped. For round 45 we plumb the actual
+    // `tx_type` into the ctx — TxClass routing handles all cases.
+    let block_x_4 = plane_x >> 2;
+    let block_y_4 = plane_y >> 2;
+    let mut coeffs = {
+        let mut lvl = super::tile::level_ctx_for_plane(
+            &mut td.above_level_ctx,
+            &mut td.left_level_ctx,
+            &mut td.above_dc_ctx,
+            &mut td.left_dc_ctx,
+            0,
+        );
+        decode_coefficients_spec(
+            &mut td.symbol,
+            &mut td.coeff_bank,
+            tx_idx,
+            0, /* luma */
+            num_coeffs,
+            &scan,
+            tx_w,
+            tx_h,
+            tx_type,
+            block_x_4,
+            block_y_4,
+            tx_w,
+            tx_h,
+            &mut lvl,
+        )?
+    };
 
     let base_q = segmented_base_q(td, segment_id);
     let qv = quant::Params {
@@ -2931,7 +2995,7 @@ fn reconstruct_one_chroma_tx_unit(
     let oob_tu = wr_w == 0 || wr_h == 0;
     if oob_tu {
         if !skip {
-            let _ = decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h)?;
+            let _ = decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h, ux, uy)?;
         }
         return Ok(());
     }
@@ -2964,7 +3028,8 @@ fn reconstruct_one_chroma_tx_unit(
             cfl_pred(&mut pred, tx_w, tx_h, q3, &dc_copy, alpha);
         }
         if !skip {
-            let coeffs = decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h)?;
+            let coeffs =
+                decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h, ux, uy)?;
             clip_add_in_place(&mut pred, &coeffs, tx_w, tx_h);
         }
         let target: &mut [u8] = if plane_idx == 0 {
@@ -3001,7 +3066,8 @@ fn reconstruct_one_chroma_tx_unit(
             cfl_pred16(&mut pred, tx_w, tx_h, q3, &dc_copy, alpha, fs.bit_depth);
         }
         if !skip {
-            let coeffs = decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h)?;
+            let coeffs =
+                decode_dequant_idct_chroma(td, fs, segment_id, plane_idx, tx_w, tx_h, ux, uy)?;
             clip_add_in_place16(&mut pred, &coeffs, tx_w, tx_h, fs.bit_depth);
         }
         let target: &mut [u16] = if plane_idx == 0 {
@@ -3016,6 +3082,7 @@ fn reconstruct_one_chroma_tx_unit(
 
 /// Decode + dequant + 2D inverse transform for a single chroma TX
 /// unit at SPEC TX dimensions. Mirrors [`decode_dequant_idct_luma`].
+#[allow(clippy::too_many_arguments)]
 fn decode_dequant_idct_chroma(
     td: &mut TileDecoder<'_>,
     fs: &FrameState,
@@ -3023,22 +3090,42 @@ fn decode_dequant_idct_chroma(
     plane_idx: u32,
     tx_w: usize,
     tx_h: usize,
+    plane_x: usize,
+    plane_y: usize,
 ) -> Result<Vec<i32>> {
     let (sz, num_coeffs, scan) = select_square_tx(tx_w, tx_h)?;
     let tx_idx = tx_size_idx(tx_w, tx_h)?;
-    let nz = nz_map_ctx_offset(tx_w, tx_h)?;
+    let _ = nz_map_ctx_offset(tx_w, tx_h)?;
 
-    let mut coeffs = decode_coefficients(
-        &mut td.symbol,
-        &mut td.coeff_bank,
-        tx_idx,
-        1, /* chroma */
-        num_coeffs,
-        &scan,
-        nz,
-        tx_w,
-        tx_h,
-    )?;
+    let coeff_tx_type = TxType::DctDct;
+    let block_x_4 = plane_x >> 2;
+    let block_y_4 = plane_y >> 2;
+    let plane_for_ctx = (plane_idx as usize) + 1;
+    let mut coeffs = {
+        let mut lvl = super::tile::level_ctx_for_plane(
+            &mut td.above_level_ctx,
+            &mut td.left_level_ctx,
+            &mut td.above_dc_ctx,
+            &mut td.left_dc_ctx,
+            plane_for_ctx,
+        );
+        decode_coefficients_spec(
+            &mut td.symbol,
+            &mut td.coeff_bank,
+            tx_idx,
+            1, /* chroma */
+            num_coeffs,
+            &scan,
+            tx_w,
+            tx_h,
+            coeff_tx_type,
+            block_x_4,
+            block_y_4,
+            tx_w,
+            tx_h,
+            &mut lvl,
+        )?
+    };
 
     let base_q = segmented_base_q(td, segment_id);
     let plane = if plane_idx == 0 {

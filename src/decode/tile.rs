@@ -812,6 +812,19 @@ pub struct TileDecoder<'a> {
     /// pass can consume the deltas; `apply_deblocking` currently uses
     /// frame-level levels only.
     pub delta_lf: [i32; FRAME_LF_COUNT],
+
+    /// §5.11.39 / §6.10.6 `AboveLevelContext[plane][x4]` — per-MI-cell
+    /// `culLevel` accumulator per plane, polled by `txb_skip_ctx` and
+    /// `dc_sign_ctx`. Indexed `[plane][x4]` where `x4` is in 4×4-cell
+    /// units on the plane (chroma is subsampled).
+    pub above_level_ctx: [Vec<u8>; 3],
+    /// §5.11.39 / §6.10.6 `LeftLevelContext[plane][y4]`.
+    pub left_level_ctx: [Vec<u8>; 3],
+    /// §5.11.39 / §6.10.6 `AboveDcContext[plane][x4]` — 2-bit DC sign
+    /// category (0=zero/absent, 1=positive, 2=negative).
+    pub above_dc_ctx: [Vec<u8>; 3],
+    /// §5.11.39 / §6.10.6 `LeftDcContext[plane][y4]`.
+    pub left_dc_ctx: [Vec<u8>; 3],
 }
 
 impl<'a> TileDecoder<'a> {
@@ -846,6 +859,33 @@ impl<'a> TileDecoder<'a> {
         let mi_rows = (frame.frame_height + 3) >> 2;
         let above_seg_pred = vec![0u8; mi_cols.max(1) as usize];
         let left_seg_pred = vec![0u8; mi_rows.max(1) as usize];
+        // §5.11.39 / §6.10.6: per-plane Above/Left context arrays at
+        // 4×4-cell granularity. Plane-0 spans the full MI grid; chroma
+        // planes shrink by `subsampling_x/y`.
+        let sub_x = if seq.color_config.subsampling_x { 1 } else { 0 };
+        let sub_y = if seq.color_config.subsampling_y { 1 } else { 0 };
+        let chroma_x4 = ((mi_cols + (1 << sub_x) - 1) >> sub_x).max(1) as usize;
+        let chroma_y4 = ((mi_rows + (1 << sub_y) - 1) >> sub_y).max(1) as usize;
+        let above_level_ctx = [
+            vec![0u8; mi_cols.max(1) as usize],
+            vec![0u8; chroma_x4],
+            vec![0u8; chroma_x4],
+        ];
+        let left_level_ctx = [
+            vec![0u8; mi_rows.max(1) as usize],
+            vec![0u8; chroma_y4],
+            vec![0u8; chroma_y4],
+        ];
+        let above_dc_ctx = [
+            vec![0u8; mi_cols.max(1) as usize],
+            vec![0u8; chroma_x4],
+            vec![0u8; chroma_x4],
+        ];
+        let left_dc_ctx = [
+            vec![0u8; mi_rows.max(1) as usize],
+            vec![0u8; chroma_y4],
+            vec![0u8; chroma_y4],
+        ];
         let mut td = Self {
             seq,
             frame,
@@ -894,10 +934,16 @@ impl<'a> TileDecoder<'a> {
             current_q_index: frame.quant.base_q_idx as i32,
             // §5.11.2: `for (i=0; i < FRAME_LF_COUNT; i++) DeltaLF[i] = 0`.
             delta_lf: [0; FRAME_LF_COUNT],
+            above_level_ctx,
+            left_level_ctx,
+            above_dc_ctx,
+            left_dc_ctx,
         };
         td.init_cdfs();
         Ok(td)
     }
+
+    // (Helper `level_ctx_for_plane` is a free fn — see [`level_ctx_for_plane`].)
 
     /// Decode the next restoration unit's syntax for `plane` (spec
     /// §5.11.40 `lr_unit_info()`). Mutates the tile-local LR
@@ -1676,6 +1722,35 @@ pub fn cfl_alpha_ctx(joint: u32, plane: u32) -> u32 {
             return 0;
         }
         ((sv_code - 1) * 3 + su_code) as u32
+    }
+}
+
+/// Build a [`super::coeffs::LevelCtxArrays`] view over a tile's
+/// per-plane Above/Left context arrays for `plane ∈ 0..=2`.
+///
+/// Free function rather than a method so callers can pass
+/// `&mut td.symbol` and `&mut td.coeff_bank` to
+/// [`super::coeffs::decode_coefficients_spec`] alongside the returned
+/// view without tripping the borrow checker (the view borrows only the
+/// 4 per-plane Vec fields, not the rest of `TileDecoder`).
+pub fn level_ctx_for_plane<'r>(
+    above_level_ctx: &'r mut [Vec<u8>; 3],
+    left_level_ctx: &'r mut [Vec<u8>; 3],
+    above_dc_ctx: &'r mut [Vec<u8>; 3],
+    left_dc_ctx: &'r mut [Vec<u8>; 3],
+    plane: usize,
+) -> super::coeffs::LevelCtxArrays<'r> {
+    let p = plane.min(2);
+    let max_x4 = above_level_ctx[p].len();
+    let max_y4 = left_level_ctx[p].len();
+    // index_mut panics on OOB but plane is clamped to 2.
+    super::coeffs::LevelCtxArrays {
+        above_level: above_level_ctx[p].as_mut_slice(),
+        left_level: left_level_ctx[p].as_mut_slice(),
+        above_dc: above_dc_ctx[p].as_mut_slice(),
+        left_dc: left_dc_ctx[p].as_mut_slice(),
+        max_x4,
+        max_y4,
     }
 }
 
