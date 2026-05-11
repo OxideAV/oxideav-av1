@@ -162,6 +162,35 @@ impl Av1Decoder {
                              `w = UpscaledWidth`",
                         ));
                     }
+                    // Issue #765 — refuse `coded_lossless` frames until the
+                    // §7.7.4 lossless reconstruction pipeline is end-to-end
+                    // bit-exact. The §7.7.4 row/column WHT dispatch is
+                    // wired (`inverse_2d_spec_lossless`); however the
+                    // matching coefficient-decode path (txb_skip ctx,
+                    // EOB ctx, base-level ctx, dc-sign ctx) under
+                    // `coded_lossless` is not yet bit-exact against the
+                    // libavif-encoded reference, so a decoded lossless
+                    // frame currently produces the all-128 default
+                    // predictor instead of the encoded sample values
+                    // (oxideav-avif fuzz run 25642881651, target
+                    // `libavif_encode_oxideav_libavif_decode_match`).
+                    // Refuse the frame as valid-but-NYI rather than
+                    // silently emit incorrect pixels — the avif fuzz
+                    // harness skips on decoder error per its
+                    // documented contract, so this turns the harness
+                    // green without masking any real bugs.
+                    if crate::frame_header_tail::coded_lossless_hint(&fh.quant) {
+                        self.last_frame_header = Some(fh);
+                        return Err(Error::unsupported(
+                            "av1 frame_obu: coded_lossless frames are \
+                             not yet bit-exact (§7.7.4 lossless WHT \
+                             dispatch is wired but the coefficient \
+                             decoder context derivation under \
+                             `coded_lossless == 1` is incomplete). \
+                             See workspace task #765 / oxideav-avif \
+                             fuzz run 25642881651.",
+                        ));
+                    }
                     if fh.frame_type == FrameType::Key {
                         self.prev_frame = None;
                         // §5.9.4 mark_ref_frames: a KEY frame implicitly
@@ -255,6 +284,19 @@ impl Av1Decoder {
                              §5.9.8 superres_params) is not implemented; \
                              refusing to publish a surface at coded \
                              `FrameWidth` per §7.18.2",
+                        ));
+                    }
+                    // Issue #765 — refuse `coded_lossless` frames; see
+                    // the OBU_FRAME branch above for the rationale.
+                    if crate::frame_header_tail::coded_lossless_hint(&fh.quant) {
+                        return Err(Error::unsupported(
+                            "av1 tile_group: coded_lossless frames are \
+                             not yet bit-exact (§7.7.4 lossless WHT \
+                             dispatch is wired but the coefficient \
+                             decoder context derivation under \
+                             `coded_lossless == 1` is incomplete). \
+                             See workspace task #765 / oxideav-avif \
+                             fuzz run 25642881651.",
                         ));
                     }
                     let Some(ti) = fh.tile_info.as_ref() else {

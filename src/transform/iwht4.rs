@@ -1,18 +1,33 @@
-//! 4-point inverse Walsh-Hadamard transform — §7.7.2.6.
+//! 4-point inverse Walsh-Hadamard transform — §7.13.2.10.
 //!
-//! Used by AV1's lossless-only coding path; the `UNIT_QUANT_SHIFT = 2`
-//! constant is baked into the first four shifts below. libaom:
-//! "4-point reversible, orthonormal inverse WHT in 3.5 adds, 0.5
-//! shifts per pixel."
+//! Used by AV1's lossless-only coding path. The §7.13.2.10 process
+//! takes a `shift` parameter; the spec's §7.7.4 reconstruction loop
+//! invokes the row pass with `shift = 2` and the column pass with
+//! `shift = 0`. The `UNIT_QUANT_SHIFT = 2` legacy entry point
+//! (`iwht4`) is preserved for the standalone smoke-tests; callers in
+//! the live reconstruction pipeline use [`iwht4_with_shift`] so
+//! both passes match the spec.
+//! libaom: "4-point reversible, orthonormal inverse WHT in 3.5 adds,
+//! 0.5 shifts per pixel."
 
 const UNIT_QUANT_SHIFT: u32 = 2;
 
 /// In-place 4-point inverse WHT. `x` must have exactly 4 entries.
+///
+/// Uses the legacy `UNIT_QUANT_SHIFT = 2` pre-scale; equivalent to
+/// [`iwht4_with_shift`]`(x, 2)`.
 pub fn iwht4(x: &mut [i32; 4]) {
-    let mut a = x[0] >> UNIT_QUANT_SHIFT;
-    let mut c = x[1] >> UNIT_QUANT_SHIFT;
-    let mut d = x[2] >> UNIT_QUANT_SHIFT;
-    let mut b = x[3] >> UNIT_QUANT_SHIFT;
+    iwht4_with_shift(x, UNIT_QUANT_SHIFT);
+}
+
+/// In-place 4-point inverse WHT — §7.13.2.10 with a caller-supplied
+/// `shift`. Per §7.7.4 the row pass uses `shift = 2` and the column
+/// pass uses `shift = 0`.
+pub fn iwht4_with_shift(x: &mut [i32; 4], shift: u32) {
+    let mut a = x[0] >> shift;
+    let mut c = x[1] >> shift;
+    let mut d = x[2] >> shift;
+    let mut b = x[3] >> shift;
     a += c;
     d -= b;
     let e = (a - d) >> 1;

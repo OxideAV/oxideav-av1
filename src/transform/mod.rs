@@ -57,7 +57,7 @@ use idct64::idct64;
 use idct8::idct8;
 use idtx::{idtx16, idtx32, idtx4, idtx8};
 use idtx_spec::{idtx16_spec, idtx32_spec, idtx4_spec, idtx8_spec};
-use iwht4::iwht4;
+use iwht4::{iwht4, iwht4_with_shift};
 
 /// Apply a 1D inverse transform of length `n` matching `kind`.
 /// Returns `Err(Unsupported)` only for length/kind pairs the spec
@@ -506,6 +506,64 @@ pub fn inverse_2d_spec(coeffs: &mut [i32], ty: TxType, sz: TxSize) -> Result<()>
         }
     }
 
+    Ok(())
+}
+
+/// Spec-correct 2D inverse transform for the AV1 **lossless** path —
+/// §7.7.4 reconstruction with `Lossless = 1` plus §7.13.2.10
+/// (Inverse Walsh-Hadamard).
+///
+/// Differs from [`inverse_2d_spec`] in four places, all dictated by
+/// the spec §7.7.4 `Lossless` branches:
+///
+/// 1. Both row and column transforms are forced to inverse WHT
+///    regardless of the bitstream-signalled `PlaneTxType` (which is
+///    `DCT_DCT` for lossless TUs per §5.11.40).
+/// 2. The row pass uses `iwht4` with `shift = 2`; the column pass
+///    uses `shift = 0` (`iwht4_with_shift`). Per §7.7.4 lines 16891
+///    and 16914.
+/// 3. `rowShift = 0` and `colShift = 0` — the per-shape
+///    `Transform_Row_Shift` and the constant `colShift = 4` are both
+///    bypassed when `Lossless` is true.
+/// 4. The 2:1 aspect `Round2(T*2896, 12)` pre-row scale does not
+///    apply (lossless TUs are always 4×4 per §5.11.34, so the aspect
+///    branch is unreachable; we still document the bypass for
+///    clarity).
+///
+/// Only `TxSize::Tx4x4` is accepted — the AV1 spec forces every
+/// lossless TU to 4×4 (§5.11.34: `txSz = Lossless ? TX_4X4 :
+/// get_tx_size(...)`).
+pub fn inverse_2d_spec_lossless(coeffs: &mut [i32], sz: TxSize) -> Result<()> {
+    if sz != TxSize::Tx4x4 {
+        return Err(Error::invalid(format!(
+            "av1 transform: lossless path requires TX_4X4 (§5.11.34), got {sz:?}"
+        )));
+    }
+    if coeffs.len() != 16 {
+        return Err(Error::invalid(format!(
+            "av1 transform: lossless 4×4 expects 16 coeffs, got {}",
+            coeffs.len()
+        )));
+    }
+    // Row pass — IWHT with shift = 2 per §7.7.4.
+    let mut row = [0i32; 4];
+    for r in 0..4 {
+        row.copy_from_slice(&coeffs[r * 4..(r + 1) * 4]);
+        iwht4_with_shift(&mut row, 2);
+        coeffs[r * 4..(r + 1) * 4].copy_from_slice(&row);
+    }
+    // Column pass — IWHT with shift = 0 per §7.7.4. No inter-pass
+    // round-shift, no col-shift.
+    let mut col = [0i32; 4];
+    for c in 0..4 {
+        for (r, cell) in col.iter_mut().enumerate() {
+            *cell = coeffs[r * 4 + c];
+        }
+        iwht4_with_shift(&mut col, 0);
+        for (r, cell) in col.iter().enumerate() {
+            coeffs[r * 4 + c] = *cell;
+        }
+    }
     Ok(())
 }
 

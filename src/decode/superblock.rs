@@ -86,7 +86,9 @@ use crate::predict::intra::{
     smooth_v_pred16, v_pred, v_pred16,
 };
 use crate::quant;
-use crate::transform::{clamped_scan, default_zigzag_scan, inverse_2d_spec, TxSize, TxType};
+use crate::transform::{
+    clamped_scan, default_zigzag_scan, inverse_2d_spec, inverse_2d_spec_lossless, TxSize, TxType,
+};
 
 use super::block::{
     block_size_from_wh, block_size_log, half_below_size, horz4_size, quarter_size, vert4_size,
@@ -1819,7 +1821,12 @@ fn inter_luma_residual_tu(
     // shapes the spec allows but `inverse_2d_spec` doesn't yet implement
     // (e.g. ADST × 64 row variants) degrade to DCT_DCT rather than
     // bailing the whole frame.
-    if let Err(e) = inverse_2d_spec(&mut coeffs, tx_type, sz) {
+    // Issue #765: when the frame is `coded_lossless`, dispatch through
+    // the §7.7.4 lossless branch (forced WHT × WHT, rowShift = colShift
+    // = 0). See `decode_dequant_idct_luma`.
+    if crate::frame_header_tail::coded_lossless_hint(&td.frame.quant) {
+        inverse_2d_spec_lossless(&mut coeffs, sz)?;
+    } else if let Err(e) = inverse_2d_spec(&mut coeffs, tx_type, sz) {
         if matches!(e, Error::Unsupported(_)) {
             inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
         } else {
@@ -2037,7 +2044,11 @@ fn reconstruct_inter_chroma_block(
         // Defensive `Unsupported -> DctDct` mirrors the inter Y site
         // (line 1657) — chroma TX shapes the kernel doesn't yet
         // implement degrade rather than fail the frame.
-        if let Err(e) = inverse_2d_spec(&mut coeffs, chroma_tx_type, sz) {
+        // Issue #765: lossless frames dispatch through the §7.7.4
+        // WHT × WHT lossless branch.
+        if crate::frame_header_tail::coded_lossless_hint(&td.frame.quant) {
+            inverse_2d_spec_lossless(&mut coeffs, sz)?;
+        } else if let Err(e) = inverse_2d_spec(&mut coeffs, chroma_tx_type, sz) {
             if matches!(e, Error::Unsupported(_)) {
                 inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
             } else {
@@ -2596,7 +2607,19 @@ fn decode_dequant_idct_luma(
         *c = dequant_coeff(*c, i, qv);
     }
 
-    if let Err(e) = inverse_2d_spec(&mut coeffs, tx_type, sz) {
+    // §7.7.4 Lossless branch — both row and column transforms are
+    // forced to inverse WHT (regardless of the `DCT_DCT` returned by
+    // `compute_tx_type` per §5.11.40 for lossless TUs), with
+    // `rowShift = colShift = 0`. Issue #765 (oxideav-avif fuzz run
+    // 25642881651): without this branch the IWHT is bypassed and the
+    // residual stays at the dequantised coefficient magnitudes, then
+    // the per-shape `Transform_Row_Shift = 0` for TX_4X4 plus the
+    // `colShift = 4` `Round2` shrinks every sample to ~0 — yielding
+    // the all-128 default-predictor output observed in the fuzz
+    // diagnostic bundle for lossless YUV444 1×1 KEY frames.
+    if crate::frame_header_tail::coded_lossless_hint(&td.frame.quant) {
+        inverse_2d_spec_lossless(&mut coeffs, sz)?;
+    } else if let Err(e) = inverse_2d_spec(&mut coeffs, tx_type, sz) {
         if matches!(e, Error::Unsupported(_)) {
             inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
         } else {
@@ -2785,7 +2808,19 @@ fn reconstruct_chroma_block(
     // Use SPEC chroma dims for TX-unit selection so the per-TU
     // predictor sees power-of-two dims; clip per-TU paste against the
     // (frame-edge-clipped) chroma extent.
-    let (tx_w, tx_h) = tx_unit_dims(spec_cw, spec_ch);
+    //
+    // §5.11.34 / §7.7.4 lossless override: when `coded_lossless` is
+    // true, every chroma TU is forced to 4×4 regardless of the block
+    // size. Without this override the chroma path would dispatch the
+    // entire spec_cw × spec_ch chroma block as a single TU (e.g.
+    // 64×64 for a Block128x128 SB under YUV444), feeding
+    // `inverse_2d_spec_lossless` a 64×64 input that the spec
+    // forbids. Issue #765 (oxideav-avif fuzz run 25642881651).
+    let (tx_w, tx_h) = if crate::frame_header_tail::coded_lossless_hint(&td.frame.quant) {
+        (4usize.min(spec_cw), 4usize.min(spec_ch))
+    } else {
+        tx_unit_dims(spec_cw, spec_ch)
+    };
     let cols = spec_cw / tx_w;
     let rows = spec_ch / tx_h;
 
@@ -3025,7 +3060,12 @@ fn decode_dequant_idct_chroma(
         *c = dequant_coeff(*c, i, qv);
     }
 
-    inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
+    // §7.7.4 Lossless branch — see `decode_dequant_idct_luma`.
+    if crate::frame_header_tail::coded_lossless_hint(&td.frame.quant) {
+        inverse_2d_spec_lossless(&mut coeffs, sz)?;
+    } else {
+        inverse_2d_spec(&mut coeffs, TxType::DctDct, sz)?;
+    }
     Ok(coeffs)
 }
 
