@@ -131,6 +131,33 @@ Sacred invariants intact:
 passes, and the libdav1d cross-check on `palette_screen.ivf`
 reports ~8.56 dB Y-PSNR (well above the 8.0 dB regression floor).
 
+## Partition tree — round 48 (force-split for tiny frames)
+
+Round 48 (workspace task #791) lands two §5.11.4 / §5.11.39 spec-fidelity
+fixes uncovered by hand-tracing the lossless 1×1 YUV444 KEY frame in
+`y_plane_divergence_match.avif`:
+
+- **§5.11.4 partition force-split** — `decode_partition_node` now
+  honours the spec's `hasRows = (r + halfBlock4x4) < MiRows` /
+  `hasCols = (c + halfBlock4x4) < MiCols` tests. When both flags are
+  false (frames smaller than `halfBlock4x4` luma 4×4 cells in either
+  dim) the partition collapses to `PARTITION_SPLIT` WITHOUT a symbol
+  read; previously the decoder emitted a phantom multi-symbol
+  partition CDF read at every recursion level. The `hasCols`-only
+  and `hasRows`-only branches use the §5.11.4 / §9.4 derived
+  `split_or_horz` / `split_or_vert` 2-symbol CDFs constructed from
+  the per-bsl partition CDF.
+- **§5.11.39 sign loop** — moved the Golomb tail extension from the
+  reverse `coeff_br` loop into the forward sign loop where the spec
+  interleaves it with the per-coefficient `sign_bit` read. No-op for
+  TUs that don't saturate; spec-faithful for those that do.
+
+`tests/issue_791_partition_force_split_for_tiny_frames.rs` pins the
+post-fix decode output. The §5.11.39 entropy decoder still reads
+sign bits for the divergence fixture's luma TU that diverge from
+`dav1d`'s reference — closing that gap is the next divergence-closing
+work item.
+
 ## Inverse transform — round 47 (lossless WHT audit)
 
 Round 47 (workspace task #786) audited the §7.7.4 / §7.13.2.10

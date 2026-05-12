@@ -665,6 +665,9 @@ pub fn decode_coefficients_spec(
         };
 
         let mut level = base_level as i32;
+        // §5.11.39 spec: only `coeff_br` is read in the reverse-scan
+        // pass. The Golomb tail is part of the FORWARD sign loop and
+        // is interleaved with the sign reads (see below).
         if level > NUM_BASE_LEVELS {
             for _br in 0..(COEFF_BASE_RANGE / 3) {
                 let br = coeff_br_ctx_spec(tx_class, bwl, adj_height, &quant_abs, pos);
@@ -674,50 +677,71 @@ pub fn decode_coefficients_spec(
                     break;
                 }
             }
-            if level >= NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE {
-                level += read_golomb(sym)? as i32;
-            }
         }
 
         quant_abs[pos] = level;
         coeffs[pos] = level;
     }
 
+    // §5.11.39 forward sign loop — interleaves the per-coefficient
+    // sign read with the Golomb tail extension. Reading the Golomb
+    // tail in the reverse-scan pass (alongside `coeff_br`) instead of
+    // here would desync the range coder vs the spec for any TU that
+    // saturates a level to `NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE`.
+    // The previous (round-45) implementation hoisted the Golomb read
+    // into the reverse loop, which happened not to fire for the small
+    // levels in the typical TU but is a real spec deviation that
+    // surfaces on highly textured content. Workspace task #791.
     let mut dc_category: u8 = 0;
-    if coeffs[scan[0]] > 0 {
-        let above_slice: Vec<u8> = (0..w4)
-            .filter_map(|k| {
-                let x = block_x_4 + k;
-                if x < level_ctx.max_x4 {
-                    level_ctx.above_dc.get(x).copied()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let left_slice: Vec<u8> = (0..h4)
-            .filter_map(|k| {
-                let y = block_y_4 + k;
-                if y < level_ctx.max_y4 {
-                    level_ctx.left_dc.get(y).copied()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let dc_ctx = dc_sign_ctx_spec(&above_slice, &left_slice).max(0) as usize;
-        let neg = bank.read_dc_sign(sym, plane_type, dc_ctx)?;
-        if neg {
-            coeffs[scan[0]] = -coeffs[scan[0]];
-            dc_category = 1;
+    let above_slice: Vec<u8> = (0..w4)
+        .filter_map(|k| {
+            let x = block_x_4 + k;
+            if x < level_ctx.max_x4 {
+                level_ctx.above_dc.get(x).copied()
+            } else {
+                None
+            }
+        })
+        .collect();
+    let left_slice: Vec<u8> = (0..h4)
+        .filter_map(|k| {
+            let y = block_y_4 + k;
+            if y < level_ctx.max_y4 {
+                level_ctx.left_dc.get(y).copied()
+            } else {
+                None
+            }
+        })
+        .collect();
+    let dc_ctx = dc_sign_ctx_spec(&above_slice, &left_slice).max(0) as usize;
+    for c_idx in 0..eob {
+        let pos = scan[c_idx];
+        let mut level = coeffs[pos];
+        if level == 0 {
+            continue;
+        }
+        let sign_neg = if c_idx == 0 {
+            bank.read_dc_sign(sym, plane_type, dc_ctx)?
         } else {
-            dc_category = 2;
+            sym.decode_bool(16384) != 0
+        };
+        // Golomb tail extension — only at saturation level.
+        if level >= NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE {
+            // Spec §5.11.39: `Quant[pos] = x + COEFF_BASE_RANGE +
+            // NUM_BASE_LEVELS` where `x = (1 << (length - 1)) | data`.
+            // Our `read_golomb` returns `x - 1`, so total = base + 1
+            // = level + (x - 1) — semantically equivalent because
+            // `level == NUM_BASE_LEVELS + 1 + COEFF_BASE_RANGE = 15`
+            // already and `x + 14 = 15 + (x - 1)`.
+            level += read_golomb(sym)? as i32;
         }
-    }
-    for &pos in scan.iter().take(eob).skip(1) {
-        if coeffs[pos] > 0 && sym.decode_bool(16384) != 0 {
-            coeffs[pos] = -coeffs[pos];
+        if pos == scan[0] && level > 0 {
+            dc_category = if sign_neg { 1 } else { 2 };
         }
+        if sign_neg {
+            level = -level;
+        }
+        coeffs[pos] = level;
     }
 
     let mut cul_level: u32 = 0;

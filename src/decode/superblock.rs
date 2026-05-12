@@ -255,6 +255,27 @@ fn div_ceil_or_zero(a: u32, b: u32) -> u32 {
 }
 
 /// Recursively decode a partition node at `(x, y)` of size `bs`.
+///
+/// Spec §5.11.4: `decode_partition( r, c, bSize )` first computes
+/// `hasRows = (r + halfBlock4x4) < MiRows` and
+/// `hasCols = (c + halfBlock4x4) < MiCols`. The `partition` symbol
+/// read depends on which of those flags are set:
+///
+/// * `hasRows && hasCols` — read full multi-symbol `partition` CDF.
+/// * `hasCols` only — `partition` is forced to `PARTITION_SPLIT` or
+///   `PARTITION_HORZ` via the `split_or_horz` 1-bit symbol.
+/// * `hasRows` only — `PARTITION_SPLIT` or `PARTITION_VERT` via
+///   `split_or_vert`.
+/// * Neither — `partition = PARTITION_SPLIT` is forced WITHOUT
+///   reading any symbol.
+///
+/// The neither-flag branch is exercised by tiny frames (e.g. the
+/// 1×1 lossless YUV444 KEY frame in the avif fuzz fixture
+/// `y_plane_divergence_match.avif`); without the force-split short
+/// circuit the entropy decoder would consume phantom partition
+/// symbols at every recursion level and desync from the spec, then
+/// expand the leaf into the full SB footprint with hundreds of
+/// out-of-frame TUs (workspace task #791 / round 48 root cause).
 pub fn decode_partition_node(
     td: &mut TileDecoder<'_>,
     fs: &mut FrameState,
@@ -277,13 +298,43 @@ pub fn decode_partition_node(
     let hw = w / 2;
     let hh = h / 2;
 
+    // Spec §5.11.4 hasRows / hasCols — MI-cell units (4×4 luma).
+    let r_mi = y >> 2;
+    let c_mi = x >> 2;
+    let half_block_4x4 = bs.mi_width() >> 1;
+    let has_rows = (r_mi + half_block_4x4) < fs.mi_rows;
+    let has_cols = (c_mi + half_block_4x4) < fs.mi_cols;
+
     let bsl = block_size_log(bs);
     let above_ctx = 0u32;
     let left_ctx = 0u32;
-    let pt_raw = td.decode_partition(bsl, above_ctx * 2 + left_ctx)?;
-    let pt = PartitionType::from_u32(pt_raw).ok_or_else(|| {
-        Error::invalid(format!("av1 partition: invalid symbol {pt_raw} (§5.11.4)"))
-    })?;
+    let ctx = above_ctx * 2 + left_ctx;
+    let pt = if !has_rows && !has_cols {
+        // Force split — no symbol read (spec §5.11.4 final `else`).
+        PartitionType::Split
+    } else if has_rows && has_cols {
+        let pt_raw = td.decode_partition(bsl, ctx)?;
+        PartitionType::from_u32(pt_raw).ok_or_else(|| {
+            Error::invalid(format!("av1 partition: invalid symbol {pt_raw} (§5.11.4)"))
+        })?
+    } else if has_cols {
+        // `split_or_horz` — 2-symbol derived CDF from the per-bsl
+        // partition CDF (§5.11.4 / §9.4 `split_or_horz`).
+        let split = td.decode_split_or_horz(bsl, ctx, bs)?;
+        if split {
+            PartitionType::Split
+        } else {
+            PartitionType::Horz
+        }
+    } else {
+        // `split_or_vert` (has_rows only).
+        let split = td.decode_split_or_vert(bsl, ctx, bs)?;
+        if split {
+            PartitionType::Split
+        } else {
+            PartitionType::Vert
+        }
+    };
 
     match pt {
         PartitionType::None => decode_leaf_block(td, fs, x, y, bs),

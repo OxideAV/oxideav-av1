@@ -22,6 +22,7 @@ use crate::sequence_header::SequenceHeader;
 use crate::symbol::SymbolDecoder;
 use crate::tile_group::{parse_tile_group_header, split_tile_payloads, TilePayload};
 
+use super::block::BlockSize;
 use super::coeffs::{q_index_to_ctx, CoeffCdfBank};
 use super::frame_state::FrameState;
 use super::inter::InterDecoder;
@@ -1178,6 +1179,39 @@ impl<'a> TileDecoder<'a> {
         self.symbol.decode_symbol(&mut self.partition_cdf[cdf_idx])
     }
 
+    /// Decode the §5.11.4 / §9.4 `split_or_horz` symbol — a 2-way
+    /// derived CDF used when the block extends past the bottom edge
+    /// of the frame (so a vertical split is the only legal "split"
+    /// option). Returns `true` for `PARTITION_SPLIT`, `false` for
+    /// `PARTITION_HORZ`.
+    pub fn decode_split_or_horz(&mut self, bsl_ctx: u32, ctx: u32, bs: BlockSize) -> Result<bool> {
+        let cdf_idx = (bsl_ctx * 4 + ctx) as usize;
+        if cdf_idx >= self.partition_cdf.len() {
+            return Err(Error::invalid(format!(
+                "av1 split_or_horz: ctx index {cdf_idx} out of range (§5.11.4)"
+            )));
+        }
+        let mut derived = derived_split_or_horz_cdf(&self.partition_cdf[cdf_idx], bs);
+        let s = self.symbol.decode_symbol(&mut derived)?;
+        Ok(s == 1)
+    }
+
+    /// Decode the §5.11.4 / §9.4 `split_or_vert` symbol — a 2-way
+    /// derived CDF used when the block extends past the right edge
+    /// of the frame. Returns `true` for `PARTITION_SPLIT`, `false`
+    /// for `PARTITION_VERT`.
+    pub fn decode_split_or_vert(&mut self, bsl_ctx: u32, ctx: u32, bs: BlockSize) -> Result<bool> {
+        let cdf_idx = (bsl_ctx * 4 + ctx) as usize;
+        if cdf_idx >= self.partition_cdf.len() {
+            return Err(Error::invalid(format!(
+                "av1 split_or_vert: ctx index {cdf_idx} out of range (§5.11.4)"
+            )));
+        }
+        let mut derived = derived_split_or_vert_cdf(&self.partition_cdf[cdf_idx], bs);
+        let s = self.symbol.decode_symbol(&mut derived)?;
+        Ok(s == 1)
+    }
+
     /// Decode the Y-plane intra mode for a KEY_FRAME block, given
     /// 5-bucket above/left contexts.
     pub fn decode_intra_y_mode(&mut self, above_ctx: u32, left_ctx: u32) -> Result<IntraMode> {
@@ -1577,6 +1611,102 @@ impl<'a> TileDecoder<'a> {
         Ok(raw != 0)
     }
 }
+
+/// Build the 2-symbol §5.11.4 / §9.4 `split_or_horz` derived CDF
+/// from the per-bsl partition CDF.
+///
+/// Spec form (with cumulative-prob CDFs ascending to `1<<15`):
+/// ```text
+/// psum = sum of probs(VERT, SPLIT, HORZ_A, VERT_A, VERT_B
+///                     [, VERT_4 if bSize != BLOCK_128X128])
+/// cdf[0] = (1 << 15) - psum
+/// cdf[1] = 1 << 15
+/// cdf[2] = 0   // counter slot
+/// ```
+///
+/// In our wire format, `cdf_inv[i] = (1<<15) - cdf_spec[i]`, so the
+/// returned 3-entry slice is `[psum, 0, 0]` (the second 0 is the
+/// `decode_symbol` adaptive-counter slot).
+fn derived_split_or_horz_cdf(partition_cdf_inv: &[u16], bs: BlockSize) -> Vec<u16> {
+    let psum = partition_psum_inv(
+        partition_cdf_inv,
+        &[
+            PARTITION_VERT_IDX,
+            PARTITION_SPLIT_IDX,
+            PARTITION_HORZ_A_IDX,
+            PARTITION_VERT_A_IDX,
+            PARTITION_VERT_B_IDX,
+        ],
+        if bs == BlockSize::Block128x128 {
+            None
+        } else {
+            Some(PARTITION_VERT_4_IDX)
+        },
+    );
+    vec![psum, 0, 0]
+}
+
+/// Build the 2-symbol §5.11.4 / §9.4 `split_or_vert` derived CDF.
+/// Mirror of [`derived_split_or_horz_cdf`] with the spec's
+/// horizontal-side `psum` summands.
+fn derived_split_or_vert_cdf(partition_cdf_inv: &[u16], bs: BlockSize) -> Vec<u16> {
+    let psum = partition_psum_inv(
+        partition_cdf_inv,
+        &[
+            PARTITION_HORZ_IDX,
+            PARTITION_SPLIT_IDX,
+            PARTITION_HORZ_A_IDX,
+            PARTITION_HORZ_B_IDX,
+            PARTITION_VERT_A_IDX,
+        ],
+        if bs == BlockSize::Block128x128 {
+            None
+        } else {
+            Some(PARTITION_HORZ_4_IDX)
+        },
+    );
+    vec![psum, 0, 0]
+}
+
+/// Sum of per-symbol probabilities at `idxs` (and optionally one
+/// extra `idx`), expressed in the inverse-CDF form. For our cdf_inv,
+/// `prob(i) = cdf_inv[i-1] - cdf_inv[i]` (with `cdf_inv[-1] = 1<<15`
+/// and `cdf_inv[N-1] = 0`). Out-of-range indices contribute 0 — this
+/// happens when the partition CDF is shorter than the spec's full
+/// 10-symbol form (e.g. BLOCK_128X128 omits the `_4` symbols).
+fn partition_psum_inv(cdf_inv: &[u16], idxs: &[usize], extra: Option<usize>) -> u16 {
+    let n = cdf_inv.len().saturating_sub(1); // last entry is the counter slot
+    let prob = |i: usize| -> i32 {
+        if i >= n {
+            return 0;
+        }
+        let prev: i32 = if i == 0 {
+            1 << 15
+        } else {
+            cdf_inv[i - 1] as i32
+        };
+        let cur: i32 = cdf_inv[i] as i32;
+        (prev - cur).max(0)
+    };
+    let mut psum: i32 = 0;
+    for &i in idxs {
+        psum += prob(i);
+    }
+    if let Some(i) = extra {
+        psum += prob(i);
+    }
+    psum.clamp(0, 1 << 15) as u16
+}
+
+const PARTITION_HORZ_IDX: usize = 1;
+const PARTITION_VERT_IDX: usize = 2;
+const PARTITION_SPLIT_IDX: usize = 3;
+const PARTITION_HORZ_A_IDX: usize = 4;
+const PARTITION_HORZ_B_IDX: usize = 5;
+const PARTITION_VERT_A_IDX: usize = 6;
+const PARTITION_VERT_B_IDX: usize = 7;
+const PARTITION_HORZ_4_IDX: usize = 8;
+const PARTITION_VERT_4_IDX: usize = 9;
 
 /// Intra-frame ext-tx set per §6.10.15. Returns 0 for implicit
 /// `DCT_DCT`, 1 for the 7-type set (area ≤ 16×16), or 2 for the 5-type

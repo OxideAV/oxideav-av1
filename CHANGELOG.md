@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **§5.11.4 partition tree — honour `hasRows` / `hasCols` force-split
+  (workspace task #791)**. Round 48. The partition decoder
+  (`decode_partition_node`) unconditionally read the multi-symbol
+  `partition` CDF at every recursion level, ignoring the spec's
+  `hasRows = (r + halfBlock4x4) < MiRows` /
+  `hasCols = (c + halfBlock4x4) < MiCols` short-circuits. For tiny
+  frames where both flags resolve to false at every level (the
+  lossless 1×1 YUV444 KEY frame in
+  `crates/oxideav-avif/tests/fixtures/fuzz/y_plane_divergence_match.avif`
+  is the canonical case) the spec emits **zero** partition symbols
+  before reaching BLOCK_4X4 — but the pre-fix decoder consumed five
+  phantom symbols at SB → 64 → 32 → 16 → 8 then expanded the
+  resulting (often `PARTITION_NONE`) interpretation into 1024 phantom
+  4×4 TUs spanning the entire 128×128 SB footprint. Each phantom TU
+  pulled coefficient symbols from the bitstream that the encoder
+  never emitted, sliding the entropy state for any subsequent frame.
+  Post-fix, the SB walk traverses 5 zero-symbol force-split levels
+  and decodes exactly one in-frame TU per plane, getting our luma
+  level magnitudes (`[4, 0, 0, 0, 3, 0, 0, 0, 6, 1, 0, 0, 1, 1, 0, 0]`)
+  into agreement with `dav1d`'s reference. The `hasCols` /
+  `hasRows`-only branches use the §5.11.4 / §9.4 derived
+  `split_or_horz` / `split_or_vert` 2-symbol CDFs constructed from
+  the per-bsl partition CDF (`derived_split_or_horz_cdf` /
+  `derived_split_or_vert_cdf` in `decode/tile.rs`). Pinned by
+  `tests/issue_791_partition_force_split_for_tiny_frames.rs`.
+
+- **§5.11.39 sign loop — interleave Golomb tail with sign reads
+  (workspace task #791)**. Round 48 follow-up. The previous
+  implementation read the Golomb tail extension in the reverse-scan
+  pass alongside `coeff_br`, but the spec's §5.11.39 forward sign
+  loop interleaves the per-coefficient `sign_bit` read with the
+  Golomb tail extension (`if (Quant[pos] > NUM_BASE_LEVELS +
+  COEFF_BASE_RANGE) { golomb }`). The reorder is functionally
+  equivalent for typical low-magnitude TUs (no level reaches the
+  `15` saturation threshold) but matches the spec verbatim for any
+  TU that does saturate, eliminating a latent desync source on
+  highly textured content.
+
 - **§7.7.4 / §7.13.2.10 lossless WHT scaling — verified spec-correct
   (workspace task #786)**. Round 47. Audit triggered by the
   fuzz-tracked `y_plane_divergence_match.avif` regression. Two
