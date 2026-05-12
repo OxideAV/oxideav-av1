@@ -361,6 +361,34 @@ mod tests {
     }
 
     #[test]
+    fn decode_bool_and_decode_symbol_two_way_agree() {
+        // For any 2-symbol CDF [p, 0, 0], decode_symbol must produce
+        // the same symbol value AND post-state as decode_bool(p).
+        let buf = [0xA5u8, 0x5A, 0xAA, 0x55, 0xC3, 0x3C, 0xFF, 0x00, 0x80, 0x80];
+        for p in [16384u32, 16768, 19712, 13952, 17536] {
+            let mut d1 = SymbolDecoder::new(&buf, buf.len(), false).expect("init");
+            let mut d2 = SymbolDecoder::new(&buf, buf.len(), false).expect("init");
+            for _ in 0..3 {
+                let mut cdf: Vec<u16> = vec![p as u16, 0, 0];
+                let s = d1.decode_symbol(&mut cdf).expect("decode");
+                let b = d2.decode_bool(p);
+                assert_eq!(
+                    s, b,
+                    "decode_symbol and decode_bool disagree on p={p}: {s} vs {b}"
+                );
+                assert_eq!(
+                    d1.symbol_value, d2.symbol_value,
+                    "SV disagree after p={p} decode"
+                );
+                assert_eq!(
+                    d1.symbol_range, d2.symbol_range,
+                    "range disagree after p={p} decode"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn decode_bool_extreme_prob() {
         // §8.2.6 with `p = 32767` ≈ P(bit=1) ≈ 1: the very first
         // symbol of an all-zero buffer (max SymbolValue = 0x7FFF)

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Investigation
+
+- **§5.11.39 / §9.4.7 sign-bit divergence vs `dav1d` — round 49
+  audit, root cause UNRESOLVED (workspace task #796)**. The 1×1
+  lossless YUV444 KEY frame in
+  `crates/oxideav-avif/tests/fixtures/fuzz/y_plane_divergence_match.avif`
+  decodes Y luma level magnitudes that match `dav1d 1.5.3` exactly
+  (`[4, 0, 0, 0, 3, 0, 0, 0, 6, 1, 0, 0, 1, 1, 0, 0]`) after the
+  round-48 partition force-split fix, but 4 of 5 AC `sign_bit L(1)`
+  reads (at scan indices 2, 8, 9, 10; positions 4, 9, 12, 13) come
+  out negative while `dav1d` reads all 5 as positive. The DC sign
+  (scan index 0, position 0) decodes correctly via the `dc_sign`
+  context-coded symbol. Forcing all AC sign reads to `+` empirically
+  produces the `dav1d` / `avifdec --raw-color` reference YUV
+  `(133, 197, 215)`; the live decoder produces `(130, 128, 128)`.
+  Audit-trail: the §5.11.39 forward sign loop, §9.4.7 `dc_sign_ctx`
+  derivation, `decode_bool(16384)` 50/50 read, `decode_symbol`
+  2-symbol path, dc_sign CDF wire-format conversion, §8.2.6
+  renormalise step, §9.4 CDF adaptation rate, Default_Scan_4x4
+  order, §5.11.40 `compute_tx_type` lossless return, and §5.11.47
+  `transform_type` qindex gating all matched the spec to the byte.
+  The divergence is consistent with an entropy-state delta vs
+  `dav1d` that is too small to flip any of the 4-way `coeff_base` /
+  `coeff_br` symbols (which sit on probability mass thresholds far
+  from 0.5) but just large enough to flip 4 of 5 50/50 literal sign
+  bits. Adding `symbol::tests::decode_bool_and_decode_symbol_two_way_agree`
+  pins the equivalence of `decode_bool(p)` and `decode_symbol(&mut
+  [p, 0, 0])` so a regression in that path would surface there.
+  Sentinel pinned by `tests/issue_796_sign_bits_match_dav1d.rs` —
+  closing this will lift Y from `130` to `133` (and the chroma
+  cascade from `(128, 128)` to `(197, 215)`).
+
 ### Fixed
 
 - **§5.11.4 partition tree — honour `hasRows` / `hasCols` force-split

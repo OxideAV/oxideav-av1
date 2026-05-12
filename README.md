@@ -158,6 +158,46 @@ sign bits for the divergence fixture's luma TU that diverge from
 `dav1d`'s reference — closing that gap is the next divergence-closing
 work item.
 
+## Sign-bit divergence — round 49 audit (workspace task #796)
+
+Round 49 followed up the round-48 partition fix with a full audit of
+the remaining §5.11.39 / §9.4.7 sign-bit divergence on the
+`y_plane_divergence_match.avif` luma TU. The luma level magnitudes
+(`[4, 0, 0, 0, 3, 0, 0, 0, 6, 1, 0, 0, 1, 1, 0, 0]`) match `dav1d
+1.5.3` exactly, the DC sign decodes correctly through the
+`dc_sign_cdf[plane=0][ctx=0]` context-coded symbol, but 4 of the 5 AC
+`sign_bit L(1)` literal reads come out negative while `dav1d` reads
+all 5 as positive. Forcing the AC signs to `+` empirically lifts the
+WHT residual at (0, 0) from `2` to `5` and produces the dav1d-matching
+`(Y, U, V) = (133, 197, 215)` output via a chroma cascade (chroma
+`txb_skip` flips from `1` to `0`).
+
+The audit covered:
+
+- §5.11.39 forward sign loop ordering and `c == 0` gating.
+- §9.4.7 `dc_sign_ctx` derivation against `AboveDcContext` /
+  `LeftDcContext` neighbour polling.
+- `decode_bool(16384)` 50/50 bit read vs the equivalent
+  `decode_symbol(&mut [16384, 0, 0])` 2-symbol path (pinned by
+  `symbol::tests::decode_bool_and_decode_symbol_two_way_agree`).
+- `dc_sign_cdf` wire-format conversion against `Default_Dc_Sign_Cdf`
+  forward CDF values.
+- §8.2.6 renormalise step including `paddedData ^ (((SV+1)<<bits)-1)`.
+- §9.4 CDF adaptation rate `3 + (cdf[N]>15) + (cdf[N]>31) +
+  Min(FloorLog2(N), 2)`.
+- Default_Scan_4x4 order against §7.16.4 spec table.
+- `compute_tx_type` lossless `return DCT_DCT` short-circuit (§5.11.40).
+- §5.11.47 `transform_type` `qindex > 0` symbol gating.
+
+None of these surfaced a spec divergence. The remaining divergence is
+consistent with an entropy-state delta vs `dav1d` that is too small
+to flip any of the 4-way `coeff_base` / `coeff_br` symbols (which sit
+on probability mass thresholds far from 0.5) but just large enough to
+flip 4 of 5 50/50 literal `sign_bit` reads. Pinning sentinel:
+`tests/issue_796_sign_bits_match_dav1d.rs`. Closing this will lift
+the round-48 test's Y from `130` to `133` (and U/V from `(128, 128)`
+to `(197, 215)`).
+
 ## Inverse transform — round 47 (lossless WHT audit)
 
 Round 47 (workspace task #786) audited the §7.7.4 / §7.13.2.10
