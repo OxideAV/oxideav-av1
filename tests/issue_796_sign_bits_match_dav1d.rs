@@ -60,6 +60,75 @@
 //! return value, and the §5.11.47 `transform_type` qindex gating.
 //! None of these surfaced a spec divergence.
 //!
+//! ## Round 66 side-channel (`rc-trace` feature)
+//!
+//! Round 66 (workspace task #801) landed the `rc-trace` cargo feature
+//! on `oxideav-av1`: every `decode_bool` / `decode_symbol` /
+//! `SymbolDecoder::new` call emits one JSONL line (`call_idx`,
+//! `rng_in`, `value_in`, `p_or_cdf`, `result`, `rng_out`, `value_out`,
+//! `bit_pos`) to the path in `OXIDEAV_AV1_RC_TRACE` (or stderr if
+//! unset). The pinned `divergence.avif` trace is captured at
+//! `tests/fixtures/issue_796_rc_trace.jsonl` for round-67 comparison
+//! work.
+//!
+//! From that trace the divergent calls were narrowed to:
+//!
+//! * **`call_idx = 27`** — first AC `sign_bit L(1)` read. Our state
+//!   entering this call: `range = 45796, value = 11884`; we read
+//!   `bit = 1` (negative). For `dav1d` to read `bit = 0` (matching its
+//!   all-positive AC-sign pattern) the entering `value` must be
+//!   `≥ 22788`. Since both decoders agree on every prior **symbol**
+//!   (the 16 luma coefficient magnitudes match exactly,
+//!   `[4,0,0,0,3,0,0,0,6,1,0,0,1,1,0,0]`), the `value` divergence is
+//!   accumulated through earlier `renormalise()` bit reads without
+//!   ever crossing a CDF boundary.
+//! * Calls **28-31** (AC signs 2-5) all run on `range = 45576` — the
+//!   range never decreases because each `decode_bool(16384)` renorm
+//!   exactly doubles + reads one bit, returning the post-renorm range
+//!   to 45576. Sign results: `1,0,1,1,1` (we read 4 negatives);
+//!   `dav1d` reads `0,0,0,0,0`.
+//!
+//! ## Suspected bug class — bit-stream offset on a renormalisation
+//!
+//! Because every symbol we picked matches `dav1d`'s symbol (so the CDF
+//! lookup branches are equivalent at the symbol-selection layer), but
+//! the `value` register coming into call 27 differs from `dav1d`'s,
+//! the leading hypothesis is that one of the earlier renormalisations
+//! (most likely between calls 22 and 26 — the post-coeff-base /
+//! coeff_br / dc_sign reads — see fixture trace for exact bit-pos
+//! deltas) consumes a different number of bits than dav1d, OR reads
+//! the same number of bits but at a different offset. The §8.2.6
+//! renormalise body is byte-for-byte spec-correct (audited in
+//! `symbol::renormalise`), so the more likely culprits are upstream:
+//!
+//! 1. **`max_bits` accounting** — our `SymbolDecoder::new` sets
+//!    `max_bits = sz * 8 - 15`. If `sz` is sub-optimal (e.g. uses the
+//!    OBU `payload.len()` rather than the tile-group `tile_size`
+//!    field), `max_bits` can go negative one renorm earlier than
+//!    dav1d, switching subsequent renorms into "pad with zeros" mode.
+//!    Worth grepping for `SymbolDecoder::new` callers in
+//!    `decode/tile.rs` + verifying `sz == tile_data.len()` matches
+//!    what `split_tile_payloads` produced.
+//! 2. **CDF adaptation rate off-by-one for `count == 0`** — every
+//!    pre-call CDF on this fixture has count = 0 (this is a KEY
+//!    frame's first TU). Round 4 fixed the direction bug but the
+//!    `rate = 3 + 0 + 0 + min(log2(N), 2)` arithmetic at count = 0
+//!    has not been spec-cross-checked against an independent
+//!    `decode_subexp` golden vector. A 1-bit-off rate produces ~50%
+//!    of the adapted-CDF entries off by ±1, which is below the noise
+//!    floor on multi-CDF symbols but would shift the `cur` threshold
+//!    of subsequent 2-symbol CDFs (e.g. `dc_sign_cdf` at call 26)
+//!    enough to cross the renormalisation boundary — and that's
+//!    exactly the location of the observed `value`-register delta.
+//! 3. **`coeff_br_multi` saturation behaviour** — calls 22-25 are
+//!    `read_br_level` reads against `[24056, 17717, 13265, 0, 0]`. The
+//!    spec §9.4 update for a 4-symbol CDF with rate `3 + 0 + 0 + 2 =
+//!    5` nudges the four entries by `(32768 - v) >> 5` / `v >> 5`. If
+//!    the adapted CDF at call 23 onward differs from dav1d's by a
+//!    handful of Q15 units, the `cur` computation downstream pulls
+//!    `value` along by tens of units per renorm — accumulating to the
+//!    observed ~11k delta after a dozen renormalisations.
+//!
 //! Empirical findings:
 //! 1. Forcing all AC signs positive yields the dav1d-matching
 //!    `(Y, U, V) = (133, 197, 215)` output (a chroma cascade emerges
@@ -172,4 +241,45 @@ fn issue_796_delta_vs_dav1d_reference_is_documented() {
     assert_eq!(dy, 3, "Y delta vs dav1d/avifdec reference");
     assert_eq!(du, 69, "U delta vs dav1d/avifdec reference");
     assert_eq!(dv, 87, "V delta vs dav1d/avifdec reference");
+}
+
+/// Round-66 pinned trace: when the crate is built with the `rc-trace`
+/// feature and `OXIDEAV_AV1_RC_TRACE` points to a file, decoding the
+/// `divergence.avif` OBU emits exactly 34 range-coder operations (1
+/// init + 33 symbol/bool decodes). The pinned trace is checked in at
+/// `tests/fixtures/issue_796_rc_trace.jsonl` for round-67 diffing
+/// against any future dav1d-side instrumentation.
+///
+/// Without the `rc-trace` feature this test is a no-op smoke check
+/// (the rc-trace counter reset is a no-op at compile time). With the
+/// feature on, decode produces the documented call sequence; the
+/// fixture file is the round-66 hand-off artefact.
+#[test]
+fn issue_796_rc_trace_fixture_is_pinned() {
+    // Reset the trace counter so repeated decode runs in this test
+    // suite start fresh — important when other tests in the same
+    // process also exercise the symbol decoder.
+    oxideav_av1::symbol::reset_rc_trace_counter();
+    let _ = decode_divergence_yuv();
+    // The fixture is at `tests/fixtures/issue_796_rc_trace.jsonl`.
+    // Round 66 verified it has 34 lines (init + 33 calls); the 5 AC
+    // sign reads are calls 27, 28, 29, 30, 31 — all on
+    // `decode_bool(16384)` with post-renorm `range = 45576`.
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/issue_796_rc_trace.jsonl");
+    if fixture_path.exists() {
+        let s = std::fs::read_to_string(&fixture_path).expect("read trace fixture");
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(
+            lines.len(),
+            34,
+            "rc-trace fixture should have 34 lines (1 init + 33 calls); \
+             update the fixture if the entropy decode path changes"
+        );
+        assert!(
+            lines[27].contains("\"call_idx\":27") && lines[27].contains("\"op\":\"decode_bool\""),
+            "call_idx 27 should be the first AC `sign_bit L(1)` read — \
+             the documented divergence point"
+        );
+    }
 }

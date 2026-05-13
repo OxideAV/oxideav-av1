@@ -198,6 +198,23 @@ flip 4 of 5 50/50 literal `sign_bit` reads. Pinning sentinel:
 the round-48 test's Y from `130` to `133` (and U/V from `(128, 128)`
 to `(197, 215)`).
 
+## Range-coder trace — round 66 (`rc-trace` feature)
+
+Workspace task #801 added a `rc-trace` cargo feature that lets callers
+dump every range-coder operation to JSONL for cross-decoder
+comparison. Enable with `--features rc-trace` and point
+`OXIDEAV_AV1_RC_TRACE=/tmp/our.jsonl` at the desired sink (omit to
+stream to stderr). Each line is `{call_idx, op, rng_in, value_in,
+p_or_cdf, result, rng_out, value_out, bit_pos}`. The feature is gated
+behind `#[cfg(feature = "rc-trace")]` so the default build pays no
+runtime cost. The pinned `divergence.avif` trace lives at
+`tests/fixtures/issue_796_rc_trace.jsonl`. Round 66 used it to narrow
+the §5.11.39 / §9.4.7 sign-bit divergence to **`call_idx = 27`** —
+the first AC `sign_bit L(1)` read entering with `range = 45796,
+value = 11884` against the same `range` `dav1d` produces but a
+different `value` register; see `tests/issue_796_sign_bits_match_dav1d.rs`
+for the three hand-off hypotheses targeting round 67.
+
 ## Inverse transform — round 47 (lossless WHT audit)
 
 Round 47 (workspace task #786) audited the §7.7.4 / §7.13.2.10

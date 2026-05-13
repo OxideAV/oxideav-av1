@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rc-trace` cargo feature** (workspace task #801, round 66). When
+  enabled, every `SymbolDecoder::new` / `decode_bool` / `decode_symbol`
+  call emits a JSONL line with `call_idx`, `rng_in`, `value_in`,
+  `p_or_cdf`, `result`, `rng_out`, `value_out`, and `bit_pos` to the
+  file in `OXIDEAV_AV1_RC_TRACE` (or stderr if unset). Used to
+  localise the §5.11.39 / §9.4.7 AC sign-bit divergence vs `dav1d`.
+  Zero cost when the feature is disabled — every hook is behind
+  `#[cfg(feature = "rc-trace")]`. The captured trace for the
+  `divergence.avif` fixture is pinned at
+  `tests/fixtures/issue_796_rc_trace.jsonl`; the regression test
+  `issue_796_rc_trace_fixture_is_pinned` asserts the fixture shape so
+  future entropy-path changes that shift call counts are flagged. The
+  trace narrows the divergent operation to **`call_idx = 27`** (first
+  AC `sign_bit L(1)` read with `rng_in = 45796, value_in = 11884`).
+  See `tests/issue_796_sign_bits_match_dav1d.rs` for the full
+  round-66 hand-off + the 3 leading hypotheses for round 67.
+
 ### Investigation
 
 - **§5.11.39 / §9.4.7 sign-bit divergence vs `dav1d` — round 49

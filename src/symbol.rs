@@ -23,6 +23,74 @@
 
 use oxideav_core::{Error, Result};
 
+#[cfg(feature = "rc-trace")]
+mod rc_trace {
+    //! Range-coder trace emitter (gated on the `rc-trace` cargo feature).
+    //!
+    //! Emits one JSONL line per `decode_bool` / `decode_symbol` call to
+    //! either the file at `OXIDEAV_AV1_RC_TRACE` (truncated on first
+    //! write) or stderr if the env var is unset.
+    //!
+    //! Used by workspace task #801 (issue #796 follow-up) to localise
+    //! the §5.11.39 AC-sign entropy divergence vs `dav1d 1.5.3`.
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static CALL_IDX: AtomicU64 = AtomicU64::new(0);
+    static SINK: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+    static SINK_INIT: std::sync::Once = std::sync::Once::new();
+
+    fn ensure_sink() {
+        SINK_INIT.call_once(|| {
+            if let Ok(path) = std::env::var("OXIDEAV_AV1_RC_TRACE") {
+                if let Ok(f) = File::create(&path) {
+                    *SINK.lock().unwrap() = Some(BufWriter::new(f));
+                }
+            }
+        });
+    }
+
+    pub(super) fn reset() {
+        CALL_IDX.store(0, Ordering::SeqCst);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit(
+        op: &str,
+        rng_in: u32,
+        value_in: u32,
+        p_or_cdf: u32,
+        result: u32,
+        rng_out: u32,
+        value_out: u32,
+        bit_pos: usize,
+    ) {
+        ensure_sink();
+        let idx = CALL_IDX.fetch_add(1, Ordering::SeqCst);
+        let line = format!(
+            "{{\"call_idx\":{idx},\"op\":\"{op}\",\"rng_in\":{rng_in},\
+             \"value_in\":{value_in},\"p_or_cdf\":{p_or_cdf},\"result\":{result},\
+             \"rng_out\":{rng_out},\"value_out\":{value_out},\"bit_pos\":{bit_pos}}}\n"
+        );
+        let mut guard = SINK.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.flush();
+        } else {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
+}
+
+/// Reset the rc-trace call counter (gated on `rc-trace`). No-op when
+/// the feature is disabled.
+pub fn reset_rc_trace_counter() {
+    #[cfg(feature = "rc-trace")]
+    rc_trace::reset();
+}
+
 /// Low-probability floor per symbol (libaom `EC_MIN_PROB`).
 pub const MIN_PROB: u32 = 4;
 
@@ -76,6 +144,17 @@ impl<'a> SymbolDecoder<'a> {
         let buf_val = me.read_bits(num_bits);
         let padded_buf = buf_val << (15 - num_bits as u32);
         me.symbol_value = ((1u32 << 15) - 1) ^ padded_buf;
+        #[cfg(feature = "rc-trace")]
+        rc_trace::emit(
+            "init",
+            0,
+            0,
+            sz as u32,
+            buf_val,
+            me.symbol_range,
+            me.symbol_value,
+            me.bit_pos,
+        );
         Ok(me)
     }
 
@@ -106,6 +185,8 @@ impl<'a> SymbolDecoder<'a> {
         if cdf.len() < 2 {
             return Err(Error::invalid("av1 symbol: CDF too short"));
         }
+        #[cfg(feature = "rc-trace")]
+        let (rng_in, value_in, p_or_cdf) = (self.symbol_range, self.symbol_value, cdf[0] as u32);
         // N = number of symbols; cdf has N+1 entries (including the
         // sentinel) plus the counter tail slot.
         let n_with_sentinel = cdf.len() - 1;
@@ -148,6 +229,17 @@ impl<'a> SymbolDecoder<'a> {
         if self.allow_update {
             update_cdf(cdf, n, symbol);
         }
+        #[cfg(feature = "rc-trace")]
+        rc_trace::emit(
+            "decode_symbol",
+            rng_in,
+            value_in,
+            p_or_cdf,
+            symbol as u32,
+            self.symbol_range,
+            self.symbol_value,
+            self.bit_pos,
+        );
         Ok(symbol as u32)
     }
 
@@ -162,6 +254,8 @@ impl<'a> SymbolDecoder<'a> {
     /// 2-symbol path of `decode_symbol` so the per-bit cost stays
     /// minimal.
     pub fn decode_bool(&mut self, p: u32) -> u32 {
+        #[cfg(feature = "rc-trace")]
+        let (rng_in, value_in) = (self.symbol_range, self.symbol_value);
         // §8.2.6 `cur` for symbol 0, with f = (1<<15) - cdf_spec[0] = p:
         //   cur = ((R >> 8) * (p >> 6)) >> 1 + 4*(N - 0 - 1) = ... + 4
         let mut cur = ((self.symbol_range >> 8) * (p >> PROB_SHIFT)) >> (7 - PROB_SHIFT);
@@ -180,6 +274,17 @@ impl<'a> SymbolDecoder<'a> {
             1
         };
         self.renormalise();
+        #[cfg(feature = "rc-trace")]
+        rc_trace::emit(
+            "decode_bool",
+            rng_in,
+            value_in,
+            p,
+            bit,
+            self.symbol_range,
+            self.symbol_value,
+            self.bit_pos,
+        );
         bit
     }
 

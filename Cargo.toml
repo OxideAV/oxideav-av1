@@ -15,3 +15,11 @@ categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[features]
+default = []
+# Emit one JSONL line per range-coder operation to the file path in
+# `OXIDEAV_AV1_RC_TRACE` (or stderr if unset). Used to localise entropy
+# divergences vs `dav1d`'s pixel-domain output — see workspace task #801
+# / `tests/issue_796_*`. Zero cost when disabled (all hooks compile out).
+rc-trace = []

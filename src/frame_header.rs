@@ -343,6 +343,7 @@ fn parse_uncompressed_header(
         };
 
     let disable_cdf_update = br.bit()?;
+    tp!(br, "after_disable_cdf_update");
     let allow_screen_content_tools =
         if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS {
             br.f(1)?
