@@ -515,6 +515,84 @@ mod tests {
         assert_eq!(cdf[3], 1, "count slot must increment on update");
     }
 
+    /// Round-67 (task #801) Phase-2 cross-check: spec §9.4 update
+    /// (forward form, lines 19815-19823 of `docs/video/av1/av1-spec.txt`)
+    /// transformed through `inv = (1<<15) - fwd` must produce the same
+    /// post-state as our wire-form [`update_cdf`].
+    ///
+    /// Worked example: forward CDF `[10000, 20000, 30000, 32768, 0]`,
+    /// decoded symbol = 1, count = 0, N = 4 → rate = 3 + 0 + 0 + 2 = 5.
+    ///
+    /// Spec forward update (line 19815-19823):
+    /// - `i=0` (`tmp=0`, `tmp < cdf[i]` → branch a): `cdf[0] -= (10000 - 0) >> 5 = 312` → `cdf[0] = 9688`.
+    /// - `i=1` (sticky `tmp=32768`, `tmp >= cdf[i]` → branch b): `cdf[1] += (32768 - 20000) >> 5 = 399` → `cdf[1] = 20399`.
+    /// - `i=2` (`tmp=32768`, branch b): `cdf[2] += (32768 - 30000) >> 5 = 86` → `cdf[2] = 30086`.
+    /// - sentinel `cdf[3] = 32768` not touched (loop is `i < N - 1`).
+    /// - count `cdf[4] += 1` → 1.
+    ///
+    /// Inverse (wire) input: `[22768, 12768, 2768, 0, 0]`.
+    /// Wire post-state (after our code): each entry equals
+    /// `32768 - forward_post` for `i < N - 1`, sentinel + count
+    /// unchanged from spec post-state.
+    #[test]
+    fn update_cdf_matches_spec_forward_form_worked_example() {
+        // Wire-form (inverse) of forward `[10000, 20000, 30000, 32768, 0]`.
+        let mut wire: Vec<u16> = vec![22768, 12768, 2768, 0, 0];
+        update_cdf(&mut wire, 4, 1);
+        // Forward post-state derived above + sentinel + count.
+        let expected_forward = [9688u16, 20399, 30086, 32768, 1];
+        for i in 0..3 {
+            let derived_forward = 32768u32 - wire[i] as u32;
+            assert_eq!(
+                derived_forward, expected_forward[i] as u32,
+                "wire[{i}]={} ⇒ forward = {derived_forward}, spec expects {}",
+                wire[i], expected_forward[i]
+            );
+        }
+        assert_eq!(wire[3], 0, "sentinel (wire) must remain 0");
+        assert_eq!(wire[4], 1, "count must increment to 1");
+    }
+
+    /// Round-67 (task #801) Phase-2 cross-check at the AV1-specific
+    /// `count=0, N=2, rate=4` configuration that drives every
+    /// `decode_bool(16384)` AC-sign read on the divergence fixture
+    /// (calls 27..31 in `tests/fixtures/issue_796_rc_trace.jsonl`).
+    /// Spec §9.4: with cdf `[16384, 32768, 0]` (forward) and decoded
+    /// symbol `s`, rate = 3 + 0 + 0 + min(log2(2)=1, 2) = 4.
+    ///
+    /// - For `s = 0`: i=0 (`tmp=32768`, branch b) → cdf[0] +=
+    ///   (32768 - 16384) >> 4 = 1024 → cdf[0] = 17408. Wire: 15360.
+    /// - For `s = 1`: i=0 (`tmp=0`, branch a) → cdf[0] -=
+    ///   (16384 - 0) >> 4 = 1024 → cdf[0] = 15360. Wire: 17408.
+    ///
+    /// Note: `decode_bool` does NOT call `update_cdf` (the spec at
+    /// line 19689 says implementations may skip the update because the
+    /// cdf is discarded). This test pins the math for any non-`bool`
+    /// 2-symbol CDF.
+    #[test]
+    fn update_cdf_2sym_count0_rate4_matches_spec() {
+        // Wire-form `[16384, 0, 0]` ↔ forward `[16384, 32768, 0]`.
+        let mut wire = vec![16384u16, 0, 0];
+        update_cdf(&mut wire, 2, 0);
+        // For symbol=0: forward post = 17408. Wire = 32768 - 17408 = 15360.
+        assert_eq!(
+            wire[0], 15360,
+            "wire[0] for s=0 expected 15360, got {}",
+            wire[0]
+        );
+        assert_eq!(wire[2], 1, "count must increment");
+
+        let mut wire = vec![16384u16, 0, 0];
+        update_cdf(&mut wire, 2, 1);
+        // For symbol=1: forward post = 15360. Wire = 32768 - 15360 = 17408.
+        assert_eq!(
+            wire[0], 17408,
+            "wire[0] for s=1 expected 17408, got {}",
+            wire[0]
+        );
+        assert_eq!(wire[2], 1, "count must increment");
+    }
+
     #[test]
     fn decode_symbol_two_way_picks_high_prob_on_zero_bits() {
         // 2-symbol CDF with 50/50 split stored as wire form

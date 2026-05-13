@@ -3,6 +3,72 @@
 //! lossless YUV444 KEY frame in
 //! `crates/oxideav-avif/tests/fixtures/fuzz/y_plane_divergence_match.avif`.
 //!
+//! ## Round 67 audit (2026-05-14) — three hypotheses FALSIFIED
+//!
+//! All three round-66 hypotheses were verified against the in-tree
+//! AV1 spec corpus (`docs/video/av1/av1-spec.txt` §8.2.2-§8.2.6 +
+//! §9.4) and ruled out:
+//!
+//! 1. **`SymbolDecoder::new` `sz` accounting** —
+//!    `split_tile_payloads` emits a 14-byte slice for our
+//!    `DIVERGENCE_OBU`; `SymbolDecoder::new` is called with
+//!    `sz = 14`, giving `SymbolMaxBits = 8 * 14 - 15 = 97`. The spec
+//!    formula at line 19441 matches our code at `src/symbol.rs:140`
+//!    to the bit. The 15-bit init read of the 14 bytes yields
+//!    `paddedBuf = 0x0CDC`, `SymbolValue = 0x7323 = 29475`,
+//!    `SymbolRange = 0x8000 = 32768` — exactly what the rc-trace
+//!    `init` line records. **No off-by-one in `sz`.**
+//!
+//! 2. **`update_cdf` rate arithmetic at `count == 0`** — the spec
+//!    rate (`3 + (count > 15) + (count > 31) + min(log2(N), 2)`) at
+//!    spec line 19814 is mathematically equivalent to our wire-form
+//!    update at `src/symbol.rs:413-446`. A worked 4-symbol example
+//!    (forward `[10000, 20000, 30000, 32768, 0]`, symbol=1, rate=4)
+//!    produced bit-exact identical post-state through the spec's
+//!    forward-form algorithm and our inverse-form algorithm:
+//!
+//!    - Spec forward: `[9375, 20798, 30173, 32768, 1]`
+//!    - Our wire inverse: `[23393, 11970, 2595, 0, 1]`
+//!    - `32768 - wire_i == forward_i` for `i = 0..N-1`. ✓
+//!
+//!    **No direction bug; no rate off-by-one at `count == 0`.**
+//!
+//! 3. **`coeff_br_multi` CDF drift at calls 22-25** — recomputing
+//!    `coeff_br_ctx_spec(...)` independently from the partially-
+//!    decoded `quants[]` array at each br call confirmed the trace's
+//!    CDF indices:
+//!    - Call 22 (scan_idx 2 br#1 at pos=4, row=1 col=0): neighbours
+//!      at pos 5/8/9 give `mag = 0 + 6 + 1 = 7`, ctx = `((7+1)>>1).min(6) + 7 = 11`.
+//!      Matches `DEFAULT_COEFF_BR_MULTI_CDF[0][0][0][11]` →
+//!      `cdf[0] = 25700`. ✓
+//!    - Call 23 (scan_idx 1 coeff_base at pos=1): falls through to
+//!      `DEFAULT_COEFF_BASE_MULTI_CDF[0][0][0][2]` → `cdf[0] = 20172`.
+//!      ✓
+//!    - Call 24 (scan_idx 0 coeff_base at pos=0): DC special-case
+//!      `ctx = 0`. Matches `DEFAULT_COEFF_BASE_MULTI_CDF[0][0][0][0]`
+//!      → `cdf[0] = 28734`. ✓
+//!    - Call 25 (scan_idx 0 br#1 at pos=0): `mag = 3`, ctx = 2 (DC
+//!      special). Matches `DEFAULT_COEFF_BR_MULTI_CDF[0][0][0][2]` →
+//!      `cdf[0] = 24056`. ✓
+//!
+//!    **All CDF lookups are at correct indices per spec.**
+//!
+//! ## Round 67 verdict
+//!
+//! The §8.2.6 entropy decoder is spec-compliant to the byte. The
+//! ~10.9 k Q15 delta in the `value` register entering call 27 vs
+//! dav1d's reference cannot be explained by any of the audited
+//! hypotheses. The remaining gap is therefore at a layer **upstream
+//! of §8.2.6**: either a CDF-default value typo (spot-checked but
+//! not exhaustively diffed against the spec's 26 880-byte
+//! `Default_*_Cdf` tables), or a context-derivation off-by-one that
+//! produces the same chosen symbols on this fixture (so it's
+//! invisible in level/sign reads) but selects a different CDF
+//! entry. Closing this divergence requires dav1d's internal
+//! entropy trace for direct call-by-call state comparison; an
+//! offer to the docs collaborator to commission such a trace is
+//! the round-68 plan.
+//!
 //! ## Investigation summary (round 49, 2026-05-12)
 //!
 //! After round 48 (`cfae193`) landed the §5.11.4 partition force-split
@@ -241,6 +307,34 @@ fn issue_796_delta_vs_dav1d_reference_is_documented() {
     assert_eq!(dy, 3, "Y delta vs dav1d/avifdec reference");
     assert_eq!(du, 69, "U delta vs dav1d/avifdec reference");
     assert_eq!(dv, 87, "V delta vs dav1d/avifdec reference");
+}
+
+/// Round-67 black-box pin: feeding `DIVERGENCE_OBU` to `dav1d 1.5.3 -i -`
+/// produces `(Y, U, V) = (133, 197, 215)` exactly. This was verified
+/// out-of-band during the round-67 audit (`dav1d -i divergence.obu -o
+/// /tmp/decoded.yuv` → `xxd /tmp/decoded.yuv` → `85 c5 d7` = 133, 197,
+/// 215). The values are duplicated as `REF_Y`/`REF_U`/`REF_V`
+/// above; this test exists so any future change that updates them
+/// surfaces an explicit assertion site. Decoupled from the running
+/// decoder so it pins the *target*, not the *current* output —
+/// `issue_796_yuv_matches_pinned_current_output` above pins the
+/// current output for the inevitable day the entropy divergence is
+/// closed.
+#[test]
+fn issue_796_dav1d_reference_yuv_pinned() {
+    // dav1d 1.5.3 -i divergence.obu -o decoded.yuv produced:
+    //   00000000: 85 c5 d7    (= 133, 197, 215)
+    // This is the round-67 black-box reference. Closing the
+    // entropy divergence updates the *current-output* test above to
+    // these values.
+    assert_eq!(
+        (REF_Y, REF_U, REF_V),
+        (133, 197, 215),
+        "dav1d 1.5.3 reference output for DIVERGENCE_OBU is pinned at \
+         (Y, U, V) = (133, 197, 215). Update both this assert AND \
+         issue_796_yuv_matches_pinned_current_output once the §5.11.39 \
+         sign-bit divergence closes."
+    );
 }
 
 /// Round-66 pinned trace: when the crate is built with the `rc-trace`

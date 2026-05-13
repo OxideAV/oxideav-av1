@@ -215,6 +215,55 @@ value = 11884` against the same `range` `dav1d` produces but a
 different `value` register; see `tests/issue_796_sign_bits_match_dav1d.rs`
 for the three hand-off hypotheses targeting round 67.
 
+## Sign-bit divergence — round 67 audit (workspace task #801)
+
+Round 67 ruled out the three leading round-66 hypotheses by direct
+cross-check against the in-tree AV1 spec corpus at
+`docs/video/av1/av1-spec.txt`:
+
+- **Hypothesis 1 — `SymbolDecoder::new` `sz` accounting.**
+  `split_tile_payloads` emits a 14-byte slice for our fixture
+  (frame OBU payload 17 B − uncompressed header 3 B). The
+  resulting `SymbolMaxBits = 8 × 14 − 15 = 97` matches §8.2.2
+  line 19441 to the bit. The 15-bit init read yields the exact
+  `value = 0x7323 = 29475` recorded by the rc-trace `init` line.
+  **Falsified — no off-by-one.**
+- **Hypothesis 2 — `update_cdf` rate arithmetic at `count == 0`.**
+  The spec's forward-form update (lines 19811-19823) was
+  analytically transformed to our wire-form (inverse) update and
+  cross-verified with two worked examples:
+    - `N=4`, `symbol=1`, `rate=5`, forward
+      `[10000, 20000, 30000, 32768, 0]` → forward post
+      `[9688, 20399, 30086, 32768, 1]`. Wire equivalent matches
+      bit-for-bit.
+    - `N=2`, `symbol ∈ {0, 1}`, `rate=4` (the AC-sign config) →
+      forward post `[17408 | 15360, 32768, 1]`. Wire matches.
+  Both checks now ride as
+  `symbol::tests::update_cdf_matches_spec_forward_form_worked_example`
+  and `update_cdf_2sym_count0_rate4_matches_spec`.
+  **Falsified — algorithm is direction-correct, rate-correct.**
+- **Hypothesis 3 — `coeff_br_multi` CDF drift at calls 22-25.**
+  Each call's `coeff_br_ctx_spec` ctx was recomputed independently
+  from the partially-decoded `quants[]` at that scan_idx:
+    - Call 22 (scan_idx 2 br#1 at pos=4): ctx=11. ✓
+    - Call 23 (scan_idx 1 coeff_base at pos=1): ctx=2. ✓
+    - Call 24 (scan_idx 0 coeff_base at pos=0): ctx=0. ✓
+    - Call 25 (scan_idx 0 br#1 at pos=0): ctx=2. ✓
+  All CDF lookups land on the spec-correct index.
+  **Falsified — CDFs are not drifting between us and dav1d.**
+
+Round-67 verdict: the §8.2.6 entropy decoder is spec-compliant.
+The ~10.9 k Q15 delta in the value register entering call 27 is
+upstream of §8.2.6 — either a spec-table typo not yet bisected
+or a context-derivation off-by-one that produces the same chosen
+symbols on this fixture (invisible to the rc-trace's symbol-result
+gate). Closing the divergence requires **dav1d's internal entropy
+trace** for direct call-by-call state comparison; that is the
+round-68 plan. Black-box verification:
+`dav1d 1.5.3 -i divergence.obu -o /tmp/decoded.yuv` produces
+exactly `(133, 197, 215)`, pinned now in
+`tests/issue_796_sign_bits_match_dav1d.rs::issue_796_dav1d_reference_yuv_pinned`.
+
 ## Inverse transform — round 47 (lossless WHT audit)
 
 Round 47 (workspace task #786) audited the §7.7.4 / §7.13.2.10

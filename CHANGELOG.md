@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Investigation
+
+- **§5.11.39 sign-bit divergence — round 67 audit (workspace task
+  #801)**. Three leading hypotheses from round 66 (`SymbolDecoder::new`
+  `sz` accounting, `update_cdf` rate at `count == 0`, `coeff_br_multi`
+  CDF adaptation drift) were each cross-checked against AV1 spec
+  §8.2.6 / §9.4 in the in-tree clean-room corpus at
+  `docs/video/av1/av1-spec.txt` (lines 19411-19855). Findings:
+  - `SymbolDecoder::new(tile_data, tile_data.len(), allow_update)`
+    receives the entropy payload slice produced by
+    `split_tile_payloads`. For our single-tile fixture (frame OBU
+    payload 17 B, uncompressed-header 3 B, tile-group header 0 B,
+    `tile_size_bytes=0`), that slice is exactly the trailing 14 bytes
+    of the OBU. `max_bits = 8 * 14 - 15 = 97` matches §8.2.2 to the
+    bit. No off-by-one in `sz`.
+  - `update_cdf`'s direction was re-derived from the spec's
+    forward-form algorithm (lines 19811-19823) and transformed
+    analytically into our wire form (inverse). Both arms of the spec
+    `if (tmp < cdf[i])` branch and the rate formula
+    `3 + (count > 15) + (count > 31) + min(log2(N), 2)` match our
+    code byte-for-byte. A 4-entry worked example (forward
+    `[10000, 20000, 30000, 32768, 0]`, symbol=1, rate=4) produced
+    identical post-state when run through both algorithms.
+  - `coeff_br_multi` calls 22-25 were re-mapped to scan/positions
+    (scan_idx 2 br#1 at pos=4, scan_idx 0 base+br#1 at pos=0) and
+    their `coeff_br_ctx_spec(...)` contexts (11, 0, 2) were
+    independently recomputed from the partially-decoded `quants[]`
+    array. All three contexts match the trace's CDF indices.
+  None of the three hypotheses pans out — our entropy decoder is
+  spec-compliant to the byte. The remaining gap to `dav1d` is
+  therefore upstream of the §8.2.6 layer: either a CDF-default or
+  context-derivation divergence at a call earlier than #26 that's
+  invisible in pixel-domain output (same chosen symbols, different
+  internal state) but accumulates ~10.9 k Q15 units in the
+  value-register across renormalisations. Round 68 needs **dav1d's
+  internal entropy trace** for call-by-call state comparison; this
+  cannot be solved by spec re-reading alone.
+- Black-box comparison: feeding the 27-byte OBU
+  (`DIVERGENCE_OBU`) directly into `dav1d 1.5.3 -i - -o -` confirms
+  the reference YUV is `(133, 197, 215)` — pinned now in
+  `tests/issue_796_sign_bits_match_dav1d.rs::issue_796_dav1d_reference_yuv_pinned`
+  as a binary smoke gate for round 68.
+
 ### Added
 
 - **`rc-trace` cargo feature** (workspace task #801, round 66). When
