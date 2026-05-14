@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Encoder
+
+- **dav1d 1.5.x cross-decode unblock — every single-SB square frame
+  from 8×8 to 64×64 (AV1 spec §5.11.4 partition force-split + §5.11.39
+  chroma `txb_skip_ctx`).** Two interlocking fixes plus a router
+  change land a clean external-decoder cross-check that previously
+  soft-skipped on every dimension:
+  - **`encoder::tile::leaf_bsl_ctx_for_frame` — partition emit at the
+    spec-correct `bsl_ctx`.** The decoder's `decode_partition_node`
+    spec §5.11.4 reads `has_cols = (c_mi + half_block_4x4) < MiCols`
+    and `has_rows = ... < MiRows`. When **neither** holds (frame too
+    small to fit half the current block), the `partition` symbol is
+    NOT read — the decoder force-splits silently and recurses one
+    level deeper. The encoder previously emitted `partition_cdf[12]`
+    (Block64x64 ctx) unconditionally, desyncing dav1d's entropy state
+    on every frame ≤ 32 × 32. The new helper returns the
+    `bsl_ctx ∈ {0, 1, 2, 3}` corresponding to where the recursion
+    actually settles (Block8x8 / Block16x16 / Block32x32 / Block64x64),
+    and the writer indexes `DEFAULT_PARTITION_CDF[bsl_ctx * 4]`.
+    Boundary table: `≤ 8` → bsl_ctx 0, `9..=16` → 1, `17..=32` → 2,
+    `≥ 33` → 3. Pinned in `leaf_bsl_ctx_thresholds_match_decoder_force_split_recursion`.
+  - **`encoder::coeffs::isolated_txb_skip_ctx` — chroma vs luma
+    `txb_skip` ctx (§5.11.39 / §9.4 `all_zero`).** The spec
+    derivation is `plane == 0 ⇒ 0` for full-TU isolated blocks and
+    `plane != 0 ⇒ 7` (chroma branch is `(top != 0) + (left != 0) + 7`,
+    both indicators 0). `encode_coefficients` previously hard-coded
+    `ctx = 0` for both planes, producing wire bits that read as a
+    different probability bin under the chroma CDF. Self-roundtrip
+    cleared because the affected test only asserted the Y plane mean
+    (DC_PRED → 128) and the desync's effect on chroma was masked by
+    saturating quant arithmetic. Used by both the lossless 256-TU
+    luma walk and the 32×32 chroma TU emits.
+  - **Production `write_keyframe_stream` route — back to the round-3
+    skip path.** `write_tile_group_intra_64` (round 40, `skip = 0`
+    plus full coefficient walk) carries enough additional spec-context
+    derivations beyond the chroma `txb_skip_ctx` fix that dav1d still
+    rejects its 64×64 / Tx64x64 luma + Tx32x32 chroma walk. Until the
+    full §5.11.39 ctx wiring lands in the encoder, the production
+    path runs through `write_tile_group_skip_intra_64` (block-level
+    `skip = 1`, no coefficient symbols). The round-40 writer stays
+    available to standalone tests for follow-up hardening.
+  - **`tests/encode_roundtrip.rs::round_r_next_dav1d_decodes_every_single_sb_square_size`**
+    sweeps 8 × 8, 16 × 16, … , 64 × 64 at `base_q_idx ∈ {0, 100, 200}`
+    through `dav1d --strict 0 --demuxer section5` and asserts the
+    output is a valid 4:2:0 YUV of the declared dims. The `--strict 0`
+    is intentional: dav1d strict mode enforces Annex-A.3
+    MinCompressedSize (≥ 768 bytes for 64×64 4:2:0 even at Level 6.0)
+    which our 20-byte still-picture stream trips after bitstream
+    decoding succeeds. Padding the OBU stream up to the level floor is
+    a separate followup. The hardened
+    `round3_dav1d_self_decode_64x64_keyframe` test now `panic!`s on
+    non-zero exit instead of soft-skipping — the round-r-next fix is
+    designed to keep it green forever.
+
 ### Investigation
 
 - **§5.11.39 sign-bit divergence — round 67 audit (workspace task

@@ -314,6 +314,33 @@ fn write_golomb(sym: &mut SymbolEncoder, value: u32) {
 ///
 /// Returns `true` if any non-zero coefficient was emitted (i.e.
 /// `txb_skip == false`).
+/// Spec-correct `txb_skip_ctx` for an isolated TX block (no above /
+/// left neighbours, full TU footprint matching block dims). Mirrors
+/// [`crate::decode::coeff_ctx::txb_skip_ctx_spec`] with `top = left =
+/// 0` and `bw == w && bh == h`:
+///
+/// * `plane_type == 0` (luma) ⇒ `0`  — `bw == w && bh == h` short-
+///   circuit returns 0 in the spec.
+/// * `plane_type != 0` (chroma) ⇒ `7` — chroma branch is `(top != 0) +
+///   (left != 0) + 7`, both indicators 0 ⇒ 7.
+///
+/// Round-r-next bug: `encode_coefficients` previously hard-coded
+/// `ctx = 0` for **both** luma AND chroma. The decoder side reads
+/// chroma `txb_skip` from `txb_skip_cdf[tx][7]` (very different
+/// distribution from `[tx][0]`), so the wire bits were interpreted
+/// against the wrong probability and dav1d would refuse the frame.
+/// Self-roundtrip happened to clear because the test only asserted
+/// the Y plane mean; the chroma plane was reconstructed to the
+/// predictor (128) by accident through saturating quant arithmetic.
+#[inline]
+pub fn isolated_txb_skip_ctx(plane_type: usize) -> usize {
+    if plane_type == 0 {
+        0
+    } else {
+        7
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn encode_coefficients(
     sym: &mut SymbolEncoder,
@@ -329,13 +356,22 @@ pub fn encode_coefficients(
 ) -> bool {
     use crate::decode::coeff_ctx::{level_ctx, sig_coef_ctx_2d};
 
+    // Spec §5.11.39 / §9.4 `all_zero` — `txb_skip` reads from the
+    // `txb_skip_cdf[tx_size_idx][txb_ctx]` CDF where `txb_ctx` depends
+    // on the plane and the immediate above / left neighbours. The
+    // round-40 encoder only ever emits a single isolated 64×64 SB with
+    // no neighbours, so we can hard-derive the spec ctx via
+    // [`isolated_txb_skip_ctx`]; non-isolated encodes will need a
+    // future neighbour-aware path mirroring the decoder.
+    let txb_ctx = isolated_txb_skip_ctx(plane_type);
+
     // txb_skip: emit 1 (skip) if all zero.
     let eob_pos = scan.iter().take(num_coeffs).rposition(|&p| coeffs[p] != 0);
     if eob_pos.is_none() {
-        bank.write_txb_skip(sym, tx_size_idx, 0, true);
+        bank.write_txb_skip(sym, tx_size_idx, txb_ctx, true);
         return false;
     }
-    bank.write_txb_skip(sym, tx_size_idx, 0, false);
+    bank.write_txb_skip(sym, tx_size_idx, txb_ctx, false);
 
     let eob = eob_pos.unwrap() + 1; // 1-based
 

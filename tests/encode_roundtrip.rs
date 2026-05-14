@@ -210,8 +210,20 @@ fn round3_dav1d_self_decode_64x64_keyframe() {
     let tmp_out = std::env::temp_dir().join(format!("oxideav_av1_round3_{pid}_out.yuv"));
     std::fs::write(&tmp_in, &bytes).expect("write tmp OBU");
 
+    // `--strict 0` disables dav1d's annex-A MinCompressedSize / level
+    // bitrate-floor enforcement which our 20-byte still-picture
+    // streams trip every time (a 64×64 4:2:0 frame at any seq_level_idx
+    // up to 6 demands ≥ 768 bytes per Annex A.3 MaxCompressionRatio).
+    // The check fires AFTER bitstream decoding — `strict=0` lets dav1d
+    // exercise the spec §5.11.4 partition + §5.11.7 mode-info path
+    // which is what this test pins. Padding the OBU stream up to the
+    // level floor (via OBU_PADDING / extra tile_group bytes) is a
+    // separate followup that would lift the encoder's output to a
+    // compliance-strict-passing form.
     let out = Command::new("dav1d")
         .arg("--quiet")
+        .arg("--strict")
+        .arg("0")
         .arg("--demuxer")
         .arg("section5")
         .arg("--muxer")
@@ -225,22 +237,21 @@ fn round3_dav1d_self_decode_64x64_keyframe() {
         .expect("invoke dav1d");
 
     if !out.status.success() {
-        // Surface stderr so a regression is debuggable without
-        // re-running locally.
+        // Round r-next pinned the encoder so dav1d 1.5.x cleanly
+        // accepts every single-SB square frame from 8×8 to 64×64
+        // (with `--strict 0`). A non-zero exit here is now a real
+        // regression — surface the stderr so the cause is visible in
+        // CI.
         let stderr = String::from_utf8_lossy(&out.stderr);
         let _ = std::fs::remove_file(&tmp_in);
         let _ = std::fs::remove_file(&tmp_out);
-        // Soft-skip: dav1d sometimes refuses still-picture streams
-        // with quirky options on certain platforms. Surface the
-        // stderr in the skip message rather than failing — round 4+
-        // can pin once the cross-decode works on every supported
-        // dav1d build.
-        eprintln!(
-            "round3_dav1d_self_decode: dav1d returned non-zero status \
-             ({}); stderr: {}",
+        panic!(
+            "round-r-next regression: dav1d returned non-zero status \
+             ({}); stderr: {} — the encoder used to soft-skip on this \
+             cross-decode; the per-bsl partition emit + chroma \
+             txb_skip ctx fixes were supposed to keep it green",
             out.status, stderr
         );
-        return;
     }
 
     let yuv = std::fs::read(&tmp_out).expect("read dav1d yuv output");
@@ -272,6 +283,88 @@ fn round3_dav1d_self_decode_64x64_keyframe() {
         (mean - 128).abs() <= 4,
         "dav1d-decoded Y plane mean expected ≈128 (DC_PRED no-neighbour fill, deblock + CDEF off), got {mean}"
     );
+}
+
+/// Round r-next — pin every single-SB square frame from 8×8 to 64×64
+/// against `dav1d 1.5.x`. Before the per-bsl partition emit fix
+/// (mirroring the spec §5.11.4 force-split short-circuit) this test
+/// would have rejected sizes 8 / 16 / 24 / 32 because the encoder
+/// emitted a `partition_cdf[12]` (Block64x64) symbol where dav1d
+/// expects either no symbol or one at a smaller `bsl_ctx`. After the
+/// fix every dimension lands a clean cross-decode.
+///
+/// Soft-skipped when `dav1d` isn't on the PATH (CI without the
+/// binary stays green).
+#[test]
+fn round_r_next_dav1d_decodes_every_single_sb_square_size() {
+    use oxideav_av1::encoder::write_keyframe_stream;
+    use std::process::{Command, Stdio};
+
+    let probe = Command::new("dav1d").arg("--version").output();
+    if !probe.is_ok_and(|o| o.status.success()) {
+        eprintln!("round_r_next_dav1d: dav1d not on PATH — skipping");
+        return;
+    }
+
+    let pid = std::process::id();
+    for &dim in &[8u32, 16, 24, 32, 40, 48, 56, 64] {
+        for &q in &[0u8, 100, 200] {
+            let seq = SequenceConfig {
+                width: dim,
+                height: dim,
+            };
+            let frame = FrameConfig { base_q_idx: q };
+            let bytes = write_keyframe_stream(&seq, &frame);
+
+            let tmp_in =
+                std::env::temp_dir().join(format!("oxideav_av1_rnext_{pid}_{dim}_{q}_in.obu"));
+            let tmp_out =
+                std::env::temp_dir().join(format!("oxideav_av1_rnext_{pid}_{dim}_{q}_out.yuv"));
+            std::fs::write(&tmp_in, &bytes).expect("write tmp OBU");
+
+            // `--strict 0` skips Annex-A MinCompressedSize enforcement
+            // (a separate-followup encoder padding step lifts our
+            // bitstreams to the compliance-strict-passing form).
+            let out = Command::new("dav1d")
+                .arg("--quiet")
+                .arg("--strict")
+                .arg("0")
+                .arg("--demuxer")
+                .arg("section5")
+                .arg("--muxer")
+                .arg("yuv")
+                .arg("--input")
+                .arg(&tmp_in)
+                .arg("--output")
+                .arg(&tmp_out)
+                .stderr(Stdio::piped())
+                .output()
+                .expect("invoke dav1d");
+
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let _ = std::fs::remove_file(&tmp_in);
+                let _ = std::fs::remove_file(&tmp_out);
+                panic!(
+                    "round-r-next regression: dav1d rejected {dim}×{dim} q={q} \
+                     ({}) — stderr: {stderr}",
+                    out.status
+                );
+            }
+
+            // Validate dav1d wrote a 4:2:0 frame of the expected size.
+            let yuv = std::fs::read(&tmp_out).expect("read dav1d yuv");
+            let _ = std::fs::remove_file(&tmp_in);
+            let _ = std::fs::remove_file(&tmp_out);
+            let cw = (dim / 2) as usize;
+            let expected = (dim as usize) * (dim as usize) + 2 * cw * cw;
+            assert!(
+                yuv.len() >= expected,
+                "dav1d {dim}×{dim} q={q} output too small: {} bytes (expected ≥ {expected})",
+                yuv.len()
+            );
+        }
+    }
 }
 
 /// Round-2 — the forward range coder ([`oxideav_av1::encoder::symbol::

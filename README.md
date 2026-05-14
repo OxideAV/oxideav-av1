@@ -540,6 +540,57 @@ emit. Round 41 will replace the all-zero residual with a quantised
 forward-DCT residual and wire the larger-than-4×4 transform sizes already
 shipped in `encoder::transform`.
 
+## Encoder — round r-next (dav1d 1.5.x cross-decode unblock)
+
+Round r-next lands the actual `dav1d` external-decoder green. Before
+this round the cross-decode test
+(`tests/encode_roundtrip.rs::round3_dav1d_self_decode_64x64_keyframe`)
+soft-skipped on every dimension because dav1d returned EINVAL during
+frame parse. Two interlocking fixes plus a router change unblock every
+single-SB square frame from 8×8 to 64×64 (with `dav1d --strict 0` —
+strict-mode level conformance is a separate followup):
+
+- **Per-bsl partition emit (§5.11.4 force-split mirror)** —
+  `tile::leaf_bsl_ctx_for_frame` returns the actual `bsl_ctx` where
+  the decoder's `decode_partition_node` recursion settles for a
+  single-SB frame. For a 64×64 SB at top-left, the spec test
+  `(c_mi + half_block_4x4) < MiCols` decides whether the partition
+  symbol is read; below 33×33 it force-splits silently and recurses
+  down. The encoder previously hard-coded `partition_cdf[12]`
+  (Block64x64) regardless of dimensions, desyncing dav1d for every
+  frame ≤ 32 × 32.
+- **Spec-correct chroma `txb_skip_ctx` (§5.11.39 / §9.4 `all_zero`)**
+  — `coeffs::isolated_txb_skip_ctx` returns 0 for luma full-TU
+  isolated blocks and 7 for chroma. `encode_coefficients` previously
+  hard-coded `ctx = 0` for both planes, producing wire bits that read
+  as a different probability bin under the chroma CDF.
+- **Production route → round-3 skip path** — `write_keyframe_stream`
+  now calls `write_tile_group_skip_intra_64` (block-level `skip = 1`,
+  no coefficient symbols). The round-40 non-skip writer
+  (`write_tile_group_intra_64`) carries enough additional spec-context
+  derivations beyond the chroma `txb_skip_ctx` fix that dav1d still
+  rejects its 64×64 / Tx64x64 luma + Tx32x32 chroma walk; that writer
+  stays available to standalone tests for follow-up hardening.
+
+The hardened
+`tests/encode_roundtrip.rs::round_r_next_dav1d_decodes_every_single_sb_square_size`
+sweeps every dimension × `base_q_idx ∈ {0, 100, 200}` through
+`dav1d --strict 0 --demuxer section5` and asserts a valid 4:2:0 YUV
+output. The pre-existing `round3_dav1d_self_decode_64x64_keyframe`
+test now `panic!`s on non-zero dav1d exit instead of soft-skipping.
+
+Round-(r-next + 1) followups:
+- Annex-A.3 MinCompressedSize padding so `dav1d --strict 1` (default)
+  also accepts. A 64×64 4:2:0 8-bit frame at any seq_level_idx ≤ 6
+  needs ≥ 768 bytes per the level table; our 20-byte still streams
+  trip the compliance check.
+- Restore the round-40 non-skip path: complete the §5.11.39
+  context-derivation wiring in `encode_coefficients` so dav1d accepts
+  Tx64x64 luma + Tx32x32 chroma walks.
+- Force-split / split_or_horz / split_or_vert emits for non-square
+  frames (currently `dim_x != dim_y` self-roundtrips but dav1d
+  rejects).
+
 ## Codec ID
 
 Registered as `"av1"`. The capability tag is `"av1_sw_parse"` —

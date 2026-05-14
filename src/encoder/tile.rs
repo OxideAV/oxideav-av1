@@ -82,9 +82,61 @@ pub fn write_tile_group_stub() -> Vec<u8> {
     out
 }
 
+/// Compute the actual leaf [`BlockSize`] (`bsl_ctx`-style index) that
+/// the spec §5.11.4 force-split recursion lands on for a single-SB
+/// single-tile frame of dimensions `(width, height)`. Returns the
+/// `bsl_ctx` (0 = Block8x8, 1 = Block16x16, 2 = Block32x32, 3 =
+/// Block64x64).
+///
+/// The decoder's [`crate::decode::superblock::decode_partition_node`]
+/// at each level reads `has_cols = (c_mi + half) < MiCols` /
+/// `has_rows`. When **neither** holds (i.e. neither the right half nor
+/// the bottom half of the current block fits inside the frame) the
+/// `partition` symbol is **not** read from the entropy stream — the
+/// decoder force-splits silently and recurses one level deeper.
+///
+/// For a single-SB frame this means the encoder must:
+///
+/// * Emit **no** `partition_cdf` symbol while the SB is "too big" to
+///   fit even half-way into the frame (force-split).
+/// * Emit **one** `partition_cdf[cdf_idx]` symbol = `PARTITION_NONE` at
+///   the first level where the half-block does fit (`has_cols ==
+///   has_rows == true`).
+/// * Then walk the leaf-block emit (skip / y_mode / uv_mode / coeffs)
+///   at that level.
+///
+/// `cdf_idx = bsl_ctx * 4 + neighbour_ctx` — for a top-of-frame SB
+/// with no above/left neighbours, `neighbour_ctx == 0`, so `cdf_idx
+/// == bsl_ctx * 4`.
+///
+/// The threshold is per-axis: half-fits iff `(half_block_4x4 < MiCols)
+/// && (half_block_4x4 < MiRows)`, where `half_block_4x4 = (bs_w / 4)
+/// / 2` and `MiCols = ceil(width / 4)`. For a 64×64 SB
+/// `half_block_4x4 = 8` ⇒ frame must be at least 33 wide AND tall to
+/// emit at Block64x64; below that we recurse into Block32x32 (`half =
+/// 4`, frame ≥ 17 ×17), then Block16x16 (`half = 2`, frame ≥ 9 × 9),
+/// then Block8x8 (`half = 1`, frame ≥ 5 × 5). Block4x4 is the spec
+/// minimum and never carries a partition symbol.
+pub fn leaf_bsl_ctx_for_frame(width: u32, height: u32) -> usize {
+    let mi_cols = width.div_ceil(4);
+    let mi_rows = height.div_ceil(4);
+    if mi_cols > 8 && mi_rows > 8 {
+        3 // Block64x64
+    } else if mi_cols > 4 && mi_rows > 4 {
+        2 // Block32x32
+    } else if mi_cols > 2 && mi_rows > 2 {
+        1 // Block16x16
+    } else {
+        0 // Block8x8 (Block4x4 has no partition symbol either, but the
+          // round-1 encoder rejects width < 8)
+    }
+}
+
 /// Round-3 tile group payload for a single-tile frame whose only
-/// superblock is a single all-skip DC_PRED 64×64 leaf block (the leaf
-/// auto-clips to the frame dimensions for sub-64 frames).
+/// superblock is a single all-skip DC_PRED leaf block. The leaf size
+/// follows the spec §5.11.4 force-split recursion (see
+/// [`leaf_bsl_ctx_for_frame`]) so dav1d 1.5.x cleanly cross-decodes
+/// every single-SB dimension from 8×8 up to 64×64.
 ///
 /// `seq` carries the chroma subsampling + monochrome flags so the UV
 /// emit can be suppressed when the frame is monochrome. (Round-2
@@ -104,14 +156,16 @@ pub fn write_tile_group_skip_intra_64(seq: &EncSequence) -> Vec<u8> {
 
     let mut sym = SymbolEncoder::new(true);
 
-    // Initialise the tile-local CDFs from the same defaults the
-    // decoder loads in `TileDecoder::init_cdfs`. Each CDF is owned so
-    // the range coder's adaptive update mutates it in place; the
-    // decoder side does the same so the streams stay in lock-step.
-    //
-    // §5.11.4 partition: bsl_ctx == 3 (Block64x64), ctx == 0 (no
-    // neighbours at SB origin). cdf_idx = 3*4 + 0 = 12.
-    let mut partition_cdf = cdfs::DEFAULT_PARTITION_CDF[12].to_vec();
+    // §5.11.4 partition: emit at the spec-correct `bsl_ctx` where the
+    // force-split recursion settles for this frame's dimensions
+    // (see [`leaf_bsl_ctx_for_frame`]). For sizes ≥ 33 × 33 this is
+    // `bsl_ctx = 3` (Block64x64) matching the round-3 default; for
+    // smaller frames it drops to Block32x32 / Block16x16 / Block8x8 to
+    // mirror dav1d's force-split short-circuit.
+    let bsl_ctx = leaf_bsl_ctx_for_frame(seq.width, seq.height);
+    let neighbour_ctx = 0usize; // SB at top-left of frame ⇒ no above/left
+    let cdf_idx = bsl_ctx * 4 + neighbour_ctx;
+    let mut partition_cdf = cdfs::DEFAULT_PARTITION_CDF[cdf_idx].to_vec();
     sym.encode_symbol(&mut partition_cdf, 0); // PARTITION_NONE
 
     // §5.11.7 intra_frame_mode_info ordering for a key frame:
@@ -363,6 +417,28 @@ mod tests {
     use crate::encoder::sequence_header::write_sequence_header_payload;
     use crate::frame_header::parse_frame_obu_with_dpb;
     use crate::sequence_header::parse_sequence_header;
+
+    #[test]
+    fn leaf_bsl_ctx_thresholds_match_decoder_force_split_recursion() {
+        // 64×64 SB at top-left of frame: half_block_4x4 = 8 ⇒ frame
+        // must be > 32 in both dims to land at Block64x64. Anything
+        // smaller falls through one or more force-split levels.
+        // Mirrors the decoder's `(c_mi + half) < MiCols` test.
+        assert_eq!(leaf_bsl_ctx_for_frame(64, 64), 3);
+        assert_eq!(leaf_bsl_ctx_for_frame(40, 40), 3);
+        assert_eq!(leaf_bsl_ctx_for_frame(36, 36), 3);
+        // Boundary: 33 = 9 mi_cols > 8 ⇒ Block64x64.
+        assert_eq!(leaf_bsl_ctx_for_frame(33, 33), 3);
+        // 32 = 8 mi_cols not > 8 ⇒ force-split into Block32x32.
+        assert_eq!(leaf_bsl_ctx_for_frame(32, 32), 2);
+        assert_eq!(leaf_bsl_ctx_for_frame(20, 20), 2);
+        assert_eq!(leaf_bsl_ctx_for_frame(17, 17), 2);
+        // Boundary: 16 = 4 mi_cols not > 4 ⇒ Block16x16.
+        assert_eq!(leaf_bsl_ctx_for_frame(16, 16), 1);
+        assert_eq!(leaf_bsl_ctx_for_frame(9, 9), 1);
+        // 8 = 2 mi_cols not > 2 ⇒ Block8x8.
+        assert_eq!(leaf_bsl_ctx_for_frame(8, 8), 0);
+    }
 
     #[test]
     fn skip_intra_payload_starts_with_nonzero_byte() {

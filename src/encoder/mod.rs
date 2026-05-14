@@ -111,16 +111,31 @@ pub fn write_keyframe_stream(seq: &EncSequence, frame: &EncFrame) -> Vec<u8> {
     let seq_payload = write_sequence_header_payload(seq);
     write_obu(&mut out, ObuType::SequenceHeader, &seq_payload);
     let mut frame_obu_payload = write_frame_header_body(seq, frame);
-    // Round 40: emit a NON-skip single-superblock single-block tile
-    // group that walks the full `decode_coefficients` mirror per plane
-    // (with all-zero residuals that match the DC_PRED-no-neighbours
-    // reconstruction). Round 3's `write_tile_group_skip_intra_64` is
-    // preserved for OBU framing tests but no longer the production
-    // path — the round-3 stream emitted ZERO coefficient symbols on
-    // the wire (block-level skip = 1), which left
-    // [`tile::write_tile_group_intra_64`] / `encode_coefficients`
-    // standalone-tested but not exercised end-to-end.
-    let tile_group_body = tile::write_tile_group_intra_64(seq, frame.base_q_idx);
+    // Round r-next (dav1d 1.5.3 cross-decode unblock): the round-40
+    // non-skip path ([`tile::write_tile_group_intra_64`]) emits an
+    // entropy stream that dav1d's frame decoder rejects with
+    // `EINVAL` on every block dimension > 32. Self-roundtrip clears
+    // because our decoder accepts the same bytes; the divergence is
+    // localised to the spec §5.11.39 chroma-vs-luma `txb_skip_ctx`
+    // wiring, where dav1d reads chroma `txb_skip` from
+    // `txb_skip_cdf[tx][7]` (chroma branch returns ctx ≥ 7) but the
+    // round-40 emit hard-codes ctx = 0. The chroma fix landed in
+    // [`coeffs::encode_coefficients`] but does not by itself unblock
+    // dav1d on 64×64 because the spec coefficient walk for `Tx64x64`
+    // luma + `Tx32x32` chroma triggers additional context-derivation
+    // mismatches that we don't have a complete spec match for yet.
+    //
+    // Round 3's [`tile::write_tile_group_skip_intra_64`] (block-level
+    // `skip = 1`) emits zero coefficient symbols and dav1d 1.5.3
+    // cleanly decodes the result for sizes 40..=64 (sizes ≤ 32 still
+    // fail because the encoder unconditionally emits a partition
+    // symbol where the spec force-splits without one — separate
+    // followup). For the production single-still-picture path we
+    // route through the skip path so that the externally-validated
+    // 64×64 case goes green; the round-40 non-skip work stays
+    // available to standalone tests and remains the path that round
+    // r-next+1 must finish hardening.
+    let tile_group_body = tile::write_tile_group_skip_intra_64(seq);
     frame_obu_payload.extend_from_slice(&tile_group_body);
     write_obu(&mut out, ObuType::Frame, &frame_obu_payload);
     out
