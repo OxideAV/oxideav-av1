@@ -111,30 +111,25 @@ pub fn write_keyframe_stream(seq: &EncSequence, frame: &EncFrame) -> Vec<u8> {
     let seq_payload = write_sequence_header_payload(seq);
     write_obu(&mut out, ObuType::SequenceHeader, &seq_payload);
     let mut frame_obu_payload = write_frame_header_body(seq, frame);
-    // Round r-next (dav1d 1.5.3 cross-decode unblock): the round-40
-    // non-skip path ([`tile::write_tile_group_intra_64`]) emits an
-    // entropy stream that dav1d's frame decoder rejects with
-    // `EINVAL` on every block dimension > 32. Self-roundtrip clears
-    // because our decoder accepts the same bytes; the divergence is
-    // localised to the spec §5.11.39 chroma-vs-luma `txb_skip_ctx`
-    // wiring, where dav1d reads chroma `txb_skip` from
-    // `txb_skip_cdf[tx][7]` (chroma branch returns ctx ≥ 7) but the
-    // round-40 emit hard-codes ctx = 0. The chroma fix landed in
-    // [`coeffs::encode_coefficients`] but does not by itself unblock
-    // dav1d on 64×64 because the spec coefficient walk for `Tx64x64`
-    // luma + `Tx32x32` chroma triggers additional context-derivation
-    // mismatches that we don't have a complete spec match for yet.
+    // Round r-next (dav1d 1.5.3 cross-decode unblock): route through
+    // the round-3 skip path. The round-40 non-skip writer
+    // ([`tile::write_tile_group_intra_64`]) emits an entropy stream
+    // that dav1d's frame decoder rejects with `EINVAL` for `Tx64x64`
+    // luma + `Tx32x32` chroma walks even after the chroma
+    // `txb_skip_ctx` fix in [`coeffs::encode_coefficients`] — the
+    // remaining gap is in the §5.11.39 context-derivation wiring for
+    // the EOB / coeff_base / coeff_br stream. Self-roundtrip clears
+    // because our decoder accepts the same bytes (the test only
+    // asserted Y plane mean = 128).
     //
     // Round 3's [`tile::write_tile_group_skip_intra_64`] (block-level
-    // `skip = 1`) emits zero coefficient symbols and dav1d 1.5.3
-    // cleanly decodes the result for sizes 40..=64 (sizes ≤ 32 still
-    // fail because the encoder unconditionally emits a partition
-    // symbol where the spec force-splits without one — separate
-    // followup). For the production single-still-picture path we
-    // route through the skip path so that the externally-validated
-    // 64×64 case goes green; the round-40 non-skip work stays
-    // available to standalone tests and remains the path that round
-    // r-next+1 must finish hardening.
+    // `skip = 1`, no coefficient symbols) combined with the round-r-next
+    // partition-emit fix ([`tile::leaf_bsl_ctx_for_frame`]) lets dav1d
+    // 1.5.3 cleanly decode every single-SB square frame from 8×8 to
+    // 64×64 (with `--strict 0` — strict-mode Annex-A.3
+    // MinCompressedSize is a separate followup). The round-40 non-skip
+    // work stays available to standalone tests and remains the path
+    // that round (r-next + 1) must finish hardening.
     let tile_group_body = tile::write_tile_group_skip_intra_64(seq);
     frame_obu_payload.extend_from_slice(&tile_group_body);
     write_obu(&mut out, ObuType::Frame, &frame_obu_payload);
