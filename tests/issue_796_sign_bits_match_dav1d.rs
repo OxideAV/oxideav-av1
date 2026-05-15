@@ -69,6 +69,32 @@
 //! offer to the docs collaborator to commission such a trace is
 //! the round-68 plan.
 //!
+//! ## Round 68 black-box probe (2026-05-15)
+//!
+//! `dav1d 1.5.3` exposes only YUV decode + MD5 verify; there is no
+//! public CLI flag for internal range-coder state. A single-bit-flip
+//! sweep across all 110 bits of `tile_data[0..14]` (with
+//! `--strict 0`) yielded 16 successful decodes; **none** lift the
+//! `(U, V)` tuple from `(128, 128)` toward `(197, 215)`. Bit-positions
+//! 24..50 keep `Y = 133` — these are the bits dav1d consumes during
+//! luma-coefficient decode, where our entropy reads them identically.
+//! Bit_pos=46 perturbs dav1d to `(133, 129, 128)` — pinned in
+//! `tests/issue_796_dav1d_blackbox.rs::issue_796_dav1d_blackbox_bit_flip_46_perturbs_chroma`.
+//!
+//! The full round-68 audit (CDF-table dimensionality survey, dav1d
+//! binary surface inventory, three remaining hypotheses for round 69)
+//! is in
+//! `docs/video/av1/specs/dav1d-range-coder-divergence-call-idx-27.md`.
+//!
+//! Round-68 net new finding: `DEFAULT_COEFF_BASE_EOB_MULTI_CDF`,
+//! `DEFAULT_TXB_SKIP_CDF`, and `DEFAULT_DC_SIGN_CDF` are stored
+//! WITHOUT the spec's `COEFF_CDF_Q_CTXS = 4` outer dimension. For
+//! this fixture (`base_q_idx = 0` lossless, q_ctx=0) the stored
+//! slice is the q_ctx=0 row, so the divergence fixture decodes
+//! against spec-correct CDFs and the missing dim is NOT the
+//! divergence cause. For `q_ctx > 0` the decoder will silently read
+//! the wrong CDF entries — a separate latent bug filed for round 69.
+//!
 //! ## Investigation summary (round 49, 2026-05-12)
 //!
 //! After round 48 (`cfae193`) landed the §5.11.4 partition force-split

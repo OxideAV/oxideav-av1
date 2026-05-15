@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Investigation
+
+- **§5.11.39 sign-bit divergence — round 68 black-box probe (workspace
+  task #801)**. With the round-67 audit having ruled out every
+  hypothesis derivable from the spec PDF alone, round 68 attacked the
+  divergence via dav1d 1.5.3 binary surface. dav1d exposes only YUV
+  decode + MD5 verify; there is no public CLI flag for internal
+  range-coder state. A single-bit-flip sweep across all 110 bits of
+  `tile_data[0..14]` (with `--strict 0`) yielded 16 successful decodes;
+  none lift the `(U, V)` from `(128, 128)` toward the reference
+  `(197, 215)`. Bit-positions 24..50 keep `Y = 133` — these are the
+  bits dav1d consumes during luma-coefficient decode and our entropy
+  reads them identically.
+
+  **Round-68 net deliverables**:
+  - `docs/video/av1/specs/dav1d-range-coder-divergence-call-idx-27.md`
+    — clean-room behavioural trace documenting the bit-flip sweep
+    methodology, every CDF entry verified against the spec at q_ctx=0,
+    and the three remaining hypotheses for round 69.
+  - **CDF-table dimensionality audit (latent fragility, not the
+    divergence cause)**: `DEFAULT_COEFF_BASE_EOB_MULTI_CDF`,
+    `DEFAULT_TXB_SKIP_CDF`, and `DEFAULT_DC_SIGN_CDF` are all stored
+    without the spec's `COEFF_CDF_Q_CTXS = 4` outer dimension. For
+    `q_ctx = 0` (this fixture's `base_q_idx = 0` lossless case) the
+    stored slice happens to be the q_ctx=0 row, so the divergence
+    fixture decodes against spec-correct CDFs. For `q_ctx > 0` the
+    decoder will silently read the wrong CDF entries — a separate bug
+    surfacing on every non-lossless stream and a candidate cause for
+    other observed dav1d-divergent cases. Filed as a round-69 fix
+    target.
+  - **dav1d binary smoke test — `tests/issue_796_dav1d_blackbox.rs`**
+    asserts `(133, 197, 215)` from `dav1d -i divergence.obu -o -.yuv -q`
+    so any future dav1d update that changes the reference is loud
+    instead of silent. Skipped (with a printed reason) when `dav1d` is
+    not on `PATH`, so CI without dav1d still passes.
+
 ### Encoder
 
 - **dav1d 1.5.x cross-decode unblock — every single-SB square frame
