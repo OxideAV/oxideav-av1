@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Investigation
+
+- **§5.11.39 sign-bit divergence — round 72 rc-trace per-call tagging
+  (workspace task #801)**. The `rc-trace` cargo feature gained a
+  per-call `tag` field. Every wrapper in
+  `decode::coeffs::CoeffCdfBank` (txb_skip / eob_pt / eob_extra /
+  coeff_base_eob / coeff_base / coeff_br / dc_sign), every
+  symbol-decoder dispatch on `decode::tile::TileDecoder` (partition /
+  skip / kf_y_mode / uv_mode / angle_delta / use_filter_intra /
+  filter_intra_mode / palette_y_mode), and the AC sign / Golomb
+  unary+data / eob_extra bypass reads in
+  `decode::coeffs::{decode_coefficients, decode_coefficients_spec,
+  read_golomb}` now push a short identifier of the CDF table being
+  consulted + the `(q, tx, plane, ctx)` tuple via
+  `crate::symbol::set_rc_trace_tag(&str)` immediately before each
+  symbol read. The pinned trace fixture
+  `tests/fixtures/issue_796_rc_trace.jsonl` carries the tagged
+  sequence, and `issue_796_rc_trace_fixture_is_pinned` asserts the
+  call_idx=4/5 reads carry `use_filter_intra_cdf` /
+  `filter_intra_mode_cdf` labels and call_idx=27..=31 carry the
+  `ac_sign_bypass` label, so a future edit that takes any of these
+  off the tagged path surfaces explicitly.
+
+  **Round-72 attribution of calls 1..=33 (full sequence pinned in
+  the test docstring)**:
+  - Calls 1..=5: `skip_cdf` / `kf_y_mode_cdf` / `uv_mode_cdf` /
+    `use_filter_intra_cdf` / `filter_intra_mode_cdf`.
+  - Calls 6..=11: §5.11.39 entry — `txb_skip` / `eob_multi16` /
+    `eob_extra` high+bypass / `coeff_base_eob_multi`.
+  - Calls 12..=25: reverse-scan `coeff_base_multi` /
+    `coeff_br_multi` for the 10 non-eob coefficients.
+  - Call 26: `dc_sign_cdf` (DC sign — correct, matches dav1d).
+  - Calls 27..=31: 5 AC `sign_bit L(1)` bypass reads — the
+    divergent ops vs dav1d's all-positive AC signs.
+  - Calls 32..=33: chroma `txb_skip_cdf[ctx=7]` — both planes
+    decoded as skip, which is the cascade artefact that lands chroma
+    at `(128, 128)` instead of `(197, 215)`.
+
+  **Round-72 net finding**: every call in the sequence is at the
+  spec-mandated CDF table with the spec-mandated context. The
+  call_idx=4/5 filter-intra reads fire because spec line 4177
+  unconditionally invokes `filter_intra_mode_info()` for intra-frame
+  blocks, and §5.11.24's syntactic gate `enable_filter_intra=1 &&
+  YMode==DC_PRED && PaletteSizeY==0 && Max(BW,BH)<=32` is satisfied
+  by this fixture (`enable_filter_intra=1` per the round-72 frame-
+  header probe). dav1d MUST read them too on this fixture per spec
+  conformance; suppressing them in our decoder regresses Y from
+  `130` to `128` (also-falsified during round 72). The divergence
+  is therefore not "we read 2 extra symbols" — it must be inside
+  the renormalise bit-padding sequence between calls 1 and 26.
+
+  **Round-72 frame-header probe**: a one-shot test (since deleted)
+  dumped every parsed flag in §5.5 (sequence header) and §5.9
+  (frame header) for the divergence fixture. All values match the
+  hand-decoded bitstream: `seq_profile=1`, `still_picture=1`,
+  `reduced_still_picture_header=1`, `max_frame_width=1`,
+  `max_frame_height=1`, `use_128x128_superblock=1`,
+  `enable_filter_intra=1`, `enable_cdef=0`, `enable_restoration=1`,
+  `frame_type=KEY`, `show_frame=1`, `error_resilient_mode=1`
+  (forced by spec lines 2617-2619 for KEY+show_frame),
+  `disable_cdf_update=0` (1st bit of frame header = 0),
+  `tx_mode=Only4x4` (coded_lossless), `base_q_idx=0`,
+  `allow_screen_content_tools=0`, `allow_intrabc=0`,
+  `delta_q_present=0`, `segmentation.enabled=0`. Falsifies the
+  round-68 hypothesis #3 (`frame-header field misparse`).
+
+  **Round-73 attack vector**: the remaining unfalsified hypothesis
+  is that one of the §8.2.6 renormalise steps between calls 1 and
+  26 consumes a different number of bits than dav1d, OR that one
+  CDF entry differs by Q15 units enough to shift the `cur` /
+  `value` register by exactly the observed ~10 904 Q15 delta at
+  call 27 — without ever crossing a symbol-pick boundary on the
+  high-skew CDFs in between. With the per-call tagging now
+  available, the cleanest next step is a side-by-side trace diff
+  vs an externally captured dav1d state log. Per
+  `feedback_no_external_libs` we cannot author the dav1d
+  instrumentation; pinning would require a commissioned trace
+  from the docs collaborator.
+
+### Added
+
+- **`oxideav_av1::symbol::set_rc_trace_tag(&str)` public surface**
+  (gated on `rc-trace`). No-op when the feature is disabled (the
+  function body compiles to nothing), so decoder call sites can
+  unconditionally call `crate::symbol::set_rc_trace_tag(&format!(…))`
+  without paying any runtime cost in the production build. The
+  emitted tag is consumed by the next `decode_symbol` / `decode_bool`
+  / `init` and reset to empty afterward — so any unsynchronised
+  follow-on read surfaces with `"tag":""` in the JSONL, which the
+  pinned fixture treats as a regression signal.
+
 ### Fixed
 
 - **Coefficient CDF tables now carry the spec-mandated

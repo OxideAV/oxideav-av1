@@ -239,6 +239,11 @@ impl CoeffCdfBank {
     ) -> Result<bool> {
         let tx = tx_size_idx.min(4);
         let ctx = ctx.min(12);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "txb_skip_cdf[q={}][tx={tx}][ctx={ctx}]",
+            self.q_ctx
+        ));
         let v = sym.decode_symbol(&mut self.txb_skip_cdf[tx][ctx])?;
         Ok(v != 0)
     }
@@ -253,6 +258,11 @@ impl CoeffCdfBank {
     ) -> Result<u32> {
         let plane_type = plane_type.min(1);
         let eob_ctx = eob_ctx.min(1);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "eob_multi{num_coeffs}_cdf[q={}][p={plane_type}][ctx={eob_ctx}]",
+            self.q_ctx
+        ));
         let cdf = match num_coeffs {
             16 => &mut self.eob_multi16_cdf[plane_type][eob_ctx],
             32 => &mut self.eob_multi32_cdf[plane_type][eob_ctx],
@@ -288,9 +298,16 @@ impl CoeffCdfBank {
             return Ok(bin_start);
         }
         let eob_coef_ctx = ((pt as usize).saturating_sub(2)).min(8);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "eob_extra_cdf[q={}][tx={tx}][p={plane_type}][ctx={eob_coef_ctx}] high_bit",
+            self.q_ctx
+        ));
         let high_bit = sym.decode_symbol(&mut self.eob_extra_cdf[tx][plane_type][eob_coef_ctx])?;
         let mut offset = high_bit << (extra - 1);
         for b in (0..(extra - 1)).rev() {
+            #[cfg(feature = "rc-trace")]
+            crate::symbol::set_rc_trace_tag(&format!("eob_extra_bypass bit{b}"));
             offset |= sym.decode_bool(16384) << b;
         }
         Ok(bin_start + offset)
@@ -307,6 +324,11 @@ impl CoeffCdfBank {
         let tx = tx_size_idx.min(4);
         let plane_type = plane_type.min(1);
         let ctx = eob_base_ctx.min(3);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "coeff_base_eob_multi_cdf[q={}][tx={tx}][p={plane_type}][ctx={ctx}]",
+            self.q_ctx
+        ));
         sym.decode_symbol(&mut self.coeff_base_eob_multi_cdf[tx][plane_type][ctx])
     }
 
@@ -321,6 +343,11 @@ impl CoeffCdfBank {
         let tx = tx_size_idx.min(4);
         let plane_type = plane_type.min(1);
         let ctx = sig_ctx.min(41);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "coeff_base_multi_cdf[q={}][tx={tx}][p={plane_type}][ctx={ctx}]",
+            self.q_ctx
+        ));
         sym.decode_symbol(&mut self.coeff_base_multi_cdf[tx][plane_type][ctx])
     }
 
@@ -335,6 +362,11 @@ impl CoeffCdfBank {
         let tx = tx_size_idx.min(4);
         let plane_type = plane_type.min(1);
         let ctx = br_ctx.min(20);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "coeff_br_multi_cdf[q={}][tx={tx}][p={plane_type}][ctx={ctx}]",
+            self.q_ctx
+        ));
         sym.decode_symbol(&mut self.coeff_br_multi_cdf[tx][plane_type][ctx])
     }
 
@@ -347,6 +379,11 @@ impl CoeffCdfBank {
     ) -> Result<bool> {
         let plane_type = plane_type.min(1);
         let ctx = ctx.min(2);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "dc_sign_cdf[q={}][p={plane_type}][ctx={ctx}]",
+            self.q_ctx
+        ));
         let v = sym.decode_symbol(&mut self.dc_sign_cdf[plane_type][ctx])?;
         Ok(v != 0)
     }
@@ -369,6 +406,8 @@ impl CoeffCdfBank {
 fn read_golomb(sym: &mut SymbolDecoder<'_>) -> Result<u32> {
     let mut length = 0u32;
     while length < 32 {
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!("golomb_unary len={length}"));
         if sym.decode_bool(16384) != 0 {
             break;
         }
@@ -381,6 +420,8 @@ fn read_golomb(sym: &mut SymbolDecoder<'_>) -> Result<u32> {
     }
     let mut x: u32 = 1;
     for _ in 0..length {
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!("golomb_data bit{}", length - 1));
         x = (x << 1) | sym.decode_bool(16384);
     }
     Ok(x - 1)
@@ -488,8 +529,12 @@ pub fn decode_coefficients(
         coeffs[scan[0]] = -coeffs[scan[0]];
     }
     for &pos in scan.iter().take(eob).skip(1) {
-        if coeffs[pos] > 0 && sym.decode_bool(16384) != 0 {
-            coeffs[pos] = -coeffs[pos];
+        if coeffs[pos] > 0 {
+            #[cfg(feature = "rc-trace")]
+            crate::symbol::set_rc_trace_tag(&format!("ac_sign_bypass_legacy pos={pos}"));
+            if sym.decode_bool(16384) != 0 {
+                coeffs[pos] = -coeffs[pos];
+            }
         }
     }
 
@@ -723,6 +768,10 @@ pub fn decode_coefficients_spec(
         let sign_neg = if c_idx == 0 {
             bank.read_dc_sign(sym, plane_type, dc_ctx)?
         } else {
+            #[cfg(feature = "rc-trace")]
+            crate::symbol::set_rc_trace_tag(&format!(
+                "ac_sign_bypass plane={plane_type} c_idx={c_idx} pos={pos}"
+            ));
             sym.decode_bool(16384) != 0
         };
         // Golomb tail extension — only at saturation level.

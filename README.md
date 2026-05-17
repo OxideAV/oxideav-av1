@@ -264,6 +264,36 @@ round-68 plan. Black-box verification:
 exactly `(133, 197, 215)`, pinned now in
 `tests/issue_796_sign_bits_match_dav1d.rs::issue_796_dav1d_reference_yuv_pinned`.
 
+## Sign-bit divergence — round 72 rc-trace tagging (workspace task #801)
+
+Round 72 extended the `rc-trace` feature with a per-call `tag`
+field — every wrapper in `CoeffCdfBank` /
+`TileDecoder` symbol dispatchers and the bypass-bit sites in
+`decode::coeffs::{decode_coefficients, decode_coefficients_spec,
+read_golomb}` push a short identifier of the CDF table being
+consulted plus its `(q, tx, plane, ctx)` tuple via
+`crate::symbol::set_rc_trace_tag(&str)` immediately before the
+symbol read. The pinned fixture
+`tests/fixtures/issue_796_rc_trace.jsonl` now carries the labelled
+sequence, and the regression test asserts that the AC sign reads
+(calls 27..=31) plus the filter-intra reads (calls 4..=5) keep
+their tags so a future refactor that takes them off the
+instrumented path is loud.
+
+Round-72 also confirmed via a one-shot frame-header probe that
+every parsed §5.5 / §5.9 flag on this fixture matches a hand-
+decoded bitstream walk — `enable_filter_intra=1`,
+`disable_cdf_update=0`, `error_resilient_mode=1` (spec-forced for
+KEY+show_frame), `tx_mode=Only4x4` (coded_lossless),
+`base_q_idx=0`. This falsifies the round-68 hypothesis #3
+(frame-header field misparse). The remaining unfalsified attack
+surface is a renormalise-step bit-padding divergence between the
+two decoders, or a single CDF-entry Q15 typo that shifts the
+value register without crossing any symbol-pick boundary on the
+high-skew CDFs through call 26. Round 73 needs a
+dav1d-side state log for the divergence fixture; nothing in the
+in-tree spec corpus distinguishes the two trajectories.
+
 ## Inverse transform — round 47 (lossless WHT audit)
 
 Round 47 (workspace task #786) audited the §7.7.4 / §7.13.2.10

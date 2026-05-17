@@ -1176,6 +1176,10 @@ impl<'a> TileDecoder<'a> {
                 "av1 decode_partition: ctx index {cdf_idx} out of range (§5.11.4)"
             )));
         }
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "partition_cdf[bsl={bsl_ctx}*4+ctx={ctx}={cdf_idx}]"
+        ));
         self.symbol.decode_symbol(&mut self.partition_cdf[cdf_idx])
     }
 
@@ -1217,6 +1221,8 @@ impl<'a> TileDecoder<'a> {
     pub fn decode_intra_y_mode(&mut self, above_ctx: u32, left_ctx: u32) -> Result<IntraMode> {
         let a = (above_ctx as usize).min(4);
         let l = (left_ctx as usize).min(4);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!("kf_y_mode_cdf[a={a}][l={l}]"));
         let raw = self.symbol.decode_symbol(&mut self.kf_y_mode_cdf[a][l])?;
         if (raw as usize) >= INTRA_MODES {
             return Err(Error::invalid(format!(
@@ -1236,6 +1242,10 @@ impl<'a> TileDecoder<'a> {
     pub fn decode_uv_mode(&mut self, y_mode: IntraMode, cfl_allowed: bool) -> Result<IntraMode> {
         let cfl_idx = if cfl_allowed { 1 } else { 0 };
         let y_idx = y_mode as usize;
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!(
+            "uv_mode_cdf[cfl={cfl_idx}][y_idx={y_idx}({y_mode:?})]"
+        ));
         let raw = self
             .symbol
             .decode_symbol(&mut self.uv_mode_cdf[cfl_idx][y_idx])?;
@@ -1258,6 +1268,8 @@ impl<'a> TileDecoder<'a> {
                 "av1 angle_delta: dir_idx {dir_idx} out of range (§5.11.18)"
             )));
         }
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!("angle_delta_cdf[dir={dir_idx}]"));
         let raw = self
             .symbol
             .decode_symbol(&mut self.angle_delta_cdf[dir_idx as usize])?;
@@ -1267,6 +1279,8 @@ impl<'a> TileDecoder<'a> {
     /// Decode the `skip` flag given a context `0..=2`.
     pub fn decode_skip(&mut self, ctx: u32) -> Result<bool> {
         let ctx = (ctx as usize).min(2);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!("skip_cdf[ctx={ctx}]"));
         let raw = self.symbol.decode_symbol(&mut self.skip_cdf[ctx])?;
         Ok(raw != 0)
     }
@@ -1519,6 +1533,8 @@ impl<'a> TileDecoder<'a> {
     /// == 0 && max(bw,bh) <= 32).
     pub fn decode_use_filter_intra(&mut self, bs_idx: usize) -> Result<bool> {
         let bs_idx = bs_idx.min(self.use_filter_intra_cdf.len() - 1);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!("use_filter_intra_cdf[bs={bs_idx}]"));
         let raw = self
             .symbol
             .decode_symbol(&mut self.use_filter_intra_cdf[bs_idx])?;
@@ -1528,6 +1544,8 @@ impl<'a> TileDecoder<'a> {
     /// §5.11.24 `filter_intra_mode` — 5-symbol CDF. Only read when
     /// [`Self::decode_use_filter_intra`] returned true.
     pub fn decode_filter_intra_mode(&mut self) -> Result<u32> {
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag("filter_intra_mode_cdf");
         self.symbol.decode_symbol(&mut self.filter_intra_mode_cdf)
     }
 
@@ -1539,6 +1557,8 @@ impl<'a> TileDecoder<'a> {
     pub fn decode_has_palette_y(&mut self, bsize_ctx: usize, neighbor_ctx: usize) -> Result<bool> {
         let bs = bsize_ctx.min(self.palette_y_mode_cdf.len() - 1);
         let nc = neighbor_ctx.min(self.palette_y_mode_cdf[bs].len() - 1);
+        #[cfg(feature = "rc-trace")]
+        crate::symbol::set_rc_trace_tag(&format!("palette_y_mode_cdf[bs={bs}][nc={nc}]"));
         let raw = self
             .symbol
             .decode_symbol(&mut self.palette_y_mode_cdf[bs][nc])?;

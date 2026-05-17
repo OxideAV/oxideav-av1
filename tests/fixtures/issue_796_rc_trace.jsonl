@@ -1,34 +1,34 @@
-{"call_idx":0,"op":"init","rng_in":0,"value_in":0,"p_or_cdf":14,"result":3292,"rng_out":32768,"value_out":29475,"bit_pos":15}
-{"call_idx":1,"op":"decode_symbol","rng_in":32768,"value_in":29475,"p_or_cdf":1097,"result":0,"rng_out":63352,"value_out":56766,"bit_pos":16}
-{"call_idx":2,"op":"decode_symbol","rng_in":63352,"value_in":56766,"p_or_cdf":17180,"result":0,"rng_out":60412,"value_out":47240,"bit_pos":17}
-{"call_idx":3,"op":"decode_symbol","rng_in":60412,"value_in":47240,"p_or_cdf":22361,"result":0,"rng_out":38706,"value_out":12362,"bit_pos":18}
-{"call_idx":4,"op":"decode_symbol","rng_in":38706,"value_in":12362,"p_or_cdf":28147,"result":1,"rng_out":33148,"value_out":12362,"bit_pos":18}
-{"call_idx":5,"op":"decode_symbol","rng_in":33148,"value_in":12362,"p_or_cdf":23819,"result":3,"rng_out":49808,"value_out":36535,"bit_pos":20}
-{"call_idx":6,"op":"decode_symbol","rng_in":49808,"value_in":36535,"p_or_cdf":919,"result":0,"rng_out":48446,"value_out":35173,"bit_pos":20}
-{"call_idx":7,"op":"decode_symbol","rng_in":48446,"value_in":35173,"p_or_cdf":31928,"result":4,"rng_out":41111,"value_out":35173,"bit_pos":20}
-{"call_idx":8,"op":"decode_symbol","rng_in":41111,"value_in":35173,"p_or_cdf":25147,"result":0,"rng_out":38988,"value_out":15237,"bit_pos":22}
-{"call_idx":9,"op":"decode_bool","rng_in":38988,"value_in":15237,"p_or_cdf":16384,"result":1,"rng_out":38920,"value_out":30474,"bit_pos":23}
-{"call_idx":10,"op":"decode_bool","rng_in":38920,"value_in":30474,"p_or_cdf":16384,"result":0,"rng_out":38920,"value_out":22029,"bit_pos":24}
-{"call_idx":11,"op":"decode_symbol","rng_in":38920,"value_in":22029,"p_or_cdf":7842,"result":0,"rng_out":59280,"value_out":25498,"bit_pos":25}
-{"call_idx":12,"op":"decode_symbol","rng_in":59280,"value_in":25498,"p_or_cdf":19725,"result":1,"rng_out":47364,"value_out":27188,"bit_pos":26}
-{"call_idx":13,"op":"decode_symbol","rng_in":47364,"value_in":27188,"p_or_cdf":20132,"result":1,"rng_out":39598,"value_out":35860,"bit_pos":27}
-{"call_idx":14,"op":"decode_symbol","rng_in":39598,"value_in":35860,"p_or_cdf":12101,"result":0,"rng_out":50066,"value_out":42591,"bit_pos":28}
-{"call_idx":15,"op":"decode_symbol","rng_in":50066,"value_in":42591,"p_or_cdf":11723,"result":0,"rng_out":64424,"value_out":49475,"bit_pos":29}
-{"call_idx":16,"op":"decode_symbol","rng_in":64424,"value_in":49475,"p_or_cdf":11357,"result":0,"rng_out":42199,"value_out":27250,"bit_pos":29}
-{"call_idx":17,"op":"decode_symbol","rng_in":42199,"value_in":27250,"p_or_cdf":20526,"result":0,"rng_out":63788,"value_out":3994,"bit_pos":31}
-{"call_idx":18,"op":"decode_symbol","rng_in":63788,"value_in":3994,"p_or_cdf":24617,"result":3,"rng_out":61768,"value_out":15977,"bit_pos":33}
-{"call_idx":19,"op":"decode_symbol","rng_in":61768,"value_in":15977,"p_or_cdf":21932,"result":3,"rng_out":40736,"value_out":31955,"bit_pos":34}
-{"call_idx":20,"op":"decode_symbol","rng_in":40736,"value_in":31955,"p_or_cdf":22270,"result":0,"rng_out":52552,"value_out":17428,"bit_pos":36}
-{"call_idx":21,"op":"decode_symbol","rng_in":52552,"value_in":17428,"p_or_cdf":26460,"result":3,"rng_out":36702,"value_out":34857,"bit_pos":37}
-{"call_idx":22,"op":"decode_symbol","rng_in":36702,"value_in":34857,"p_or_cdf":25700,"result":0,"rng_out":64152,"value_out":49392,"bit_pos":40}
-{"call_idx":23,"op":"decode_symbol","rng_in":64152,"value_in":49392,"p_or_cdf":20172,"result":0,"rng_out":49530,"value_out":20011,"bit_pos":41}
-{"call_idx":24,"op":"decode_symbol","rng_in":49530,"value_in":20011,"p_or_cdf":28734,"result":3,"rng_out":60416,"value_out":40023,"bit_pos":42}
-{"call_idx":25,"op":"decode_symbol","rng_in":60416,"value_in":40023,"p_or_cdf":24056,"result":1,"rng_out":46744,"value_out":29788,"bit_pos":44}
-{"call_idx":26,"op":"decode_symbol","rng_in":46744,"value_in":29788,"p_or_cdf":16768,"result":0,"rng_out":45796,"value_out":11884,"bit_pos":45}
-{"call_idx":27,"op":"decode_bool","rng_in":45796,"value_in":11884,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":23769,"bit_pos":46}
-{"call_idx":28,"op":"decode_bool","rng_in":45576,"value_in":23769,"p_or_cdf":16384,"result":0,"rng_out":45576,"value_out":1963,"bit_pos":47}
-{"call_idx":29,"op":"decode_bool","rng_in":45576,"value_in":1963,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":3926,"bit_pos":48}
-{"call_idx":30,"op":"decode_bool","rng_in":45576,"value_in":3926,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":7853,"bit_pos":49}
-{"call_idx":31,"op":"decode_bool","rng_in":45576,"value_in":7853,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":15707,"bit_pos":50}
-{"call_idx":32,"op":"decode_symbol","rng_in":45576,"value_in":15707,"p_or_cdf":25114,"result":1,"rng_out":34892,"value_out":15707,"bit_pos":50}
-{"call_idx":33,"op":"decode_symbol","rng_in":34892,"value_in":15707,"p_or_cdf":25592,"result":1,"rng_out":54272,"value_out":31415,"bit_pos":51}
+{"call_idx":0,"op":"init","tag":"","rng_in":0,"value_in":0,"p_or_cdf":14,"result":3292,"rng_out":32768,"value_out":29475,"bit_pos":15}
+{"call_idx":1,"op":"decode_symbol","tag":"skip_cdf[ctx=0]","rng_in":32768,"value_in":29475,"p_or_cdf":1097,"result":0,"rng_out":63352,"value_out":56766,"bit_pos":16}
+{"call_idx":2,"op":"decode_symbol","tag":"kf_y_mode_cdf[a=0][l=0]","rng_in":63352,"value_in":56766,"p_or_cdf":17180,"result":0,"rng_out":60412,"value_out":47240,"bit_pos":17}
+{"call_idx":3,"op":"decode_symbol","tag":"uv_mode_cdf[cfl=1][y_idx=0(DcPred)]","rng_in":60412,"value_in":47240,"p_or_cdf":22361,"result":0,"rng_out":38706,"value_out":12362,"bit_pos":18}
+{"call_idx":4,"op":"decode_symbol","tag":"use_filter_intra_cdf[bs=0]","rng_in":38706,"value_in":12362,"p_or_cdf":28147,"result":1,"rng_out":33148,"value_out":12362,"bit_pos":18}
+{"call_idx":5,"op":"decode_symbol","tag":"filter_intra_mode_cdf","rng_in":33148,"value_in":12362,"p_or_cdf":23819,"result":3,"rng_out":49808,"value_out":36535,"bit_pos":20}
+{"call_idx":6,"op":"decode_symbol","tag":"txb_skip_cdf[q=0][tx=0][ctx=0]","rng_in":49808,"value_in":36535,"p_or_cdf":919,"result":0,"rng_out":48446,"value_out":35173,"bit_pos":20}
+{"call_idx":7,"op":"decode_symbol","tag":"eob_multi16_cdf[q=0][p=0][ctx=0]","rng_in":48446,"value_in":35173,"p_or_cdf":31928,"result":4,"rng_out":41111,"value_out":35173,"bit_pos":20}
+{"call_idx":8,"op":"decode_symbol","tag":"eob_extra_cdf[q=0][tx=0][p=0][ctx=2] high_bit","rng_in":41111,"value_in":35173,"p_or_cdf":25147,"result":0,"rng_out":38988,"value_out":15237,"bit_pos":22}
+{"call_idx":9,"op":"decode_bool","tag":"eob_extra_bypass bit1","rng_in":38988,"value_in":15237,"p_or_cdf":16384,"result":1,"rng_out":38920,"value_out":30474,"bit_pos":23}
+{"call_idx":10,"op":"decode_bool","tag":"eob_extra_bypass bit0","rng_in":38920,"value_in":30474,"p_or_cdf":16384,"result":0,"rng_out":38920,"value_out":22029,"bit_pos":24}
+{"call_idx":11,"op":"decode_symbol","tag":"coeff_base_eob_multi_cdf[q=0][tx=0][p=0][ctx=3]","rng_in":38920,"value_in":22029,"p_or_cdf":7842,"result":0,"rng_out":59280,"value_out":25498,"bit_pos":25}
+{"call_idx":12,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=7]","rng_in":59280,"value_in":25498,"p_or_cdf":19725,"result":1,"rng_out":47364,"value_out":27188,"bit_pos":26}
+{"call_idx":13,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=7]","rng_in":47364,"value_in":27188,"p_or_cdf":20132,"result":1,"rng_out":39598,"value_out":35860,"bit_pos":27}
+{"call_idx":14,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=6]","rng_in":39598,"value_in":35860,"p_or_cdf":12101,"result":0,"rng_out":50066,"value_out":42591,"bit_pos":28}
+{"call_idx":15,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=6]","rng_in":50066,"value_in":42591,"p_or_cdf":11723,"result":0,"rng_out":64424,"value_out":49475,"bit_pos":29}
+{"call_idx":16,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=6]","rng_in":64424,"value_in":49475,"p_or_cdf":11357,"result":0,"rng_out":42199,"value_out":27250,"bit_pos":29}
+{"call_idx":17,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=7]","rng_in":42199,"value_in":27250,"p_or_cdf":20526,"result":0,"rng_out":63788,"value_out":3994,"bit_pos":31}
+{"call_idx":18,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=8]","rng_in":63788,"value_in":3994,"p_or_cdf":24617,"result":3,"rng_out":61768,"value_out":15977,"bit_pos":33}
+{"call_idx":19,"op":"decode_symbol","tag":"coeff_br_multi_cdf[q=0][tx=0][p=0][ctx=16]","rng_in":61768,"value_in":15977,"p_or_cdf":21932,"result":3,"rng_out":40736,"value_out":31955,"bit_pos":34}
+{"call_idx":20,"op":"decode_symbol","tag":"coeff_br_multi_cdf[q=0][tx=0][p=0][ctx=16]","rng_in":40736,"value_in":31955,"p_or_cdf":22270,"result":0,"rng_out":52552,"value_out":17428,"bit_pos":36}
+{"call_idx":21,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=4]","rng_in":52552,"value_in":17428,"p_or_cdf":26460,"result":3,"rng_out":36702,"value_out":34857,"bit_pos":37}
+{"call_idx":22,"op":"decode_symbol","tag":"coeff_br_multi_cdf[q=0][tx=0][p=0][ctx=11]","rng_in":36702,"value_in":34857,"p_or_cdf":25700,"result":0,"rng_out":64152,"value_out":49392,"bit_pos":40}
+{"call_idx":23,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=2]","rng_in":64152,"value_in":49392,"p_or_cdf":20172,"result":0,"rng_out":49530,"value_out":20011,"bit_pos":41}
+{"call_idx":24,"op":"decode_symbol","tag":"coeff_base_multi_cdf[q=0][tx=0][p=0][ctx=0]","rng_in":49530,"value_in":20011,"p_or_cdf":28734,"result":3,"rng_out":60416,"value_out":40023,"bit_pos":42}
+{"call_idx":25,"op":"decode_symbol","tag":"coeff_br_multi_cdf[q=0][tx=0][p=0][ctx=2]","rng_in":60416,"value_in":40023,"p_or_cdf":24056,"result":1,"rng_out":46744,"value_out":29788,"bit_pos":44}
+{"call_idx":26,"op":"decode_symbol","tag":"dc_sign_cdf[q=0][p=0][ctx=0]","rng_in":46744,"value_in":29788,"p_or_cdf":16768,"result":0,"rng_out":45796,"value_out":11884,"bit_pos":45}
+{"call_idx":27,"op":"decode_bool","tag":"ac_sign_bypass plane=0 c_idx=2 pos=4","rng_in":45796,"value_in":11884,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":23769,"bit_pos":46}
+{"call_idx":28,"op":"decode_bool","tag":"ac_sign_bypass plane=0 c_idx=3 pos=8","rng_in":45576,"value_in":23769,"p_or_cdf":16384,"result":0,"rng_out":45576,"value_out":1963,"bit_pos":47}
+{"call_idx":29,"op":"decode_bool","tag":"ac_sign_bypass plane=0 c_idx=8 pos=9","rng_in":45576,"value_in":1963,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":3926,"bit_pos":48}
+{"call_idx":30,"op":"decode_bool","tag":"ac_sign_bypass plane=0 c_idx=9 pos=12","rng_in":45576,"value_in":3926,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":7853,"bit_pos":49}
+{"call_idx":31,"op":"decode_bool","tag":"ac_sign_bypass plane=0 c_idx=10 pos=13","rng_in":45576,"value_in":7853,"p_or_cdf":16384,"result":1,"rng_out":45576,"value_out":15707,"bit_pos":50}
+{"call_idx":32,"op":"decode_symbol","tag":"txb_skip_cdf[q=0][tx=0][ctx=7]","rng_in":45576,"value_in":15707,"p_or_cdf":25114,"result":1,"rng_out":34892,"value_out":15707,"bit_pos":50}
+{"call_idx":33,"op":"decode_symbol","tag":"txb_skip_cdf[q=0][tx=0][ctx=7]","rng_in":34892,"value_in":15707,"p_or_cdf":25592,"result":1,"rng_out":54272,"value_out":31415,"bit_pos":51}

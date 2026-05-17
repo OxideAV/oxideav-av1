@@ -96,6 +96,75 @@
 //! round 70 by relocating the three tables to
 //! `src/cdfs/coeff_q_ctx.rs` with the spec-mandated outer dim.
 //!
+//! ## Round 72 (2026-05-17) — per-call rc-trace tagging
+//!
+//! Round 72 extended the `rc-trace` feature with a `tag` field
+//! pushed by `crate::symbol::set_rc_trace_tag(&str)` right before
+//! every `decode_symbol` / `decode_bool` / `SymbolDecoder::new`
+//! emit. Every wrapper in `decode::coeffs::CoeffCdfBank`,
+//! `decode::tile::TileDecoder` (skip / kf_y_mode / uv_mode /
+//! partition / angle_delta / use_filter_intra / filter_intra_mode /
+//! has_palette_y), and the AC sign / Golomb / eob-extra bypass
+//! sites in `decode::coeffs::{decode_coefficients,
+//! decode_coefficients_spec, read_golomb}` now stamp a short
+//! identifier of the CDF table being looked up plus the (q, tx,
+//! plane, ctx) tuple. The pinned trace fixture
+//! `tests/fixtures/issue_796_rc_trace.jsonl` carries the labelled
+//! sequence so any future "tag":"" line in the JSONL is an
+//! immediate signal that a new call site forgot to tag.
+//!
+//! **Tagged trace surfaces the exact call sequence for this
+//! fixture**:
+//!
+//! | call_idx | tag                                            | result |
+//! |---------:|------------------------------------------------|-------:|
+//! |        0 | (init, paddedBuf=0x0CDC ⇒ value=29475)         |   3292 |
+//! |        1 | `skip_cdf[ctx=0]`                              |      0 |
+//! |        2 | `kf_y_mode_cdf[a=0][l=0]`                      |      0 |
+//! |        3 | `uv_mode_cdf[cfl=1][y_idx=0(DcPred)]`          |      0 |
+//! |        4 | `use_filter_intra_cdf[bs=0]`                   |      1 |
+//! |        5 | `filter_intra_mode_cdf`                        |      3 |
+//! |        6 | `txb_skip_cdf[q=0][tx=0][ctx=0]`               |      0 |
+//! |        7 | `eob_multi16_cdf[q=0][p=0][ctx=0]`             |      4 |
+//! |        8 | `eob_extra_cdf[q=0][tx=0][p=0][ctx=2] high_bit`|      0 |
+//! |    9..10 | `eob_extra_bypass bit{1,0}`                    |   1, 0 |
+//! |       11 | `coeff_base_eob_multi_cdf[q=0][tx=0][p=0][ctx=3]`|    0 |
+//! |   12..21 | `coeff_base_multi_cdf[…][ctx=∈{7,6,4,8}]` mixed|  multi |
+//! |       22 | `coeff_br_multi_cdf[q=0][tx=0][p=0][ctx=11]`   |      0 |
+//! |   23..25 | `coeff_base_multi_cdf` / `coeff_br_multi_cdf`  |  multi |
+//! |       26 | `dc_sign_cdf[q=0][p=0][ctx=0]`                 |      0 |
+//! |   27..31 | `ac_sign_bypass plane=0 c_idx=…`               | 1,0,1,1,1 |
+//! |   32..33 | `txb_skip_cdf[q=0][tx=0][ctx=7]` (chroma)      |   1, 1 |
+//!
+//! **Round-72 finding**: the read sequence matches spec §5.11.7
+//! exactly — skip → kf_y_mode → uv_mode → filter_intra_mode_info
+//! (which reads use_filter_intra + filter_intra_mode per §5.11.24
+//! because `enable_filter_intra=1`, `YMode=DC_PRED`,
+//! `PaletteSizeY=0`, `Max(BW,BH)=4≤32`) → coefficient decode. No
+//! "missing" reads. The pre-call-27 value-register evolution
+//! therefore must diverge from dav1d's purely through the
+//! renormalise bit-padding path — calls 4 and 5 are not the
+//! divergence (dav1d, being spec-compliant, must read them too on
+//! a fixture with `enable_filter_intra=1` per spec line 4177).
+//!
+//! Round-72 also confirmed via a one-shot probe test that the
+//! frame-header parse is correct: `error_resilient_mode = true`
+//! (forced for KEY+show_frame per spec lines 2617-2619),
+//! `disable_cdf_update = false`, `tx_mode = Only4x4`,
+//! `base_q_idx = 0`, all segmentation / delta-Q / delta-LF /
+//! allow_screen_content_tools / allow_intrabc are off. Falsifies
+//! hypothesis #3 from the round-68 trace doc.
+//!
+//! **Round-73 attack vector**: replace the call_idx-27 break-even
+//! analysis with a **call-by-call value-register diff vs an
+//! externally captured dav1d state trace**. Per
+//! `feedback_no_external_libs` we cannot author the dav1d
+//! instrumentation; the cleanest path is to commission a docs
+//! collaborator to capture dav1d's internal symbol_value /
+//! symbol_range registers per call for this fixture, then pin them
+//! in this test as a side-by-side comparison. Even one call's
+//! divergence localises the bug.
+//!
 //! ## Investigation summary (round 49, 2026-05-12)
 //!
 //! After round 48 (`cfae193`) landed the §5.11.4 partition force-split
@@ -385,7 +454,12 @@ fn issue_796_rc_trace_fixture_is_pinned() {
     // The fixture is at `tests/fixtures/issue_796_rc_trace.jsonl`.
     // Round 66 verified it has 34 lines (init + 33 calls); the 5 AC
     // sign reads are calls 27, 28, 29, 30, 31 — all on
-    // `decode_bool(16384)` with post-renorm `range = 45576`.
+    // `decode_bool(16384)` with post-renorm `range = 45576`. Round 72
+    // added the per-call `tag` field — every emit site sets a short
+    // identifier ("skip_cdf[ctx=0]", "kf_y_mode_cdf[a=0][l=0]",
+    // "txb_skip_cdf[q=0][tx=0][ctx=0]", …) right before the symbol
+    // read; an empty tag in the JSONL flags a call site that forgot
+    // to label itself (a regression worth chasing).
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/issue_796_rc_trace.jsonl");
     if fixture_path.exists() {
@@ -401,6 +475,31 @@ fn issue_796_rc_trace_fixture_is_pinned() {
             lines[27].contains("\"call_idx\":27") && lines[27].contains("\"op\":\"decode_bool\""),
             "call_idx 27 should be the first AC `sign_bit L(1)` read — \
              the documented divergence point"
+        );
+        // Round-72 tag check: the AC sign reads (calls 27..=31) MUST
+        // carry the `ac_sign_bypass` tag so a future refactor that
+        // moves the sign loop elsewhere is loud, not silent.
+        for (offset, line) in lines.iter().enumerate().take(32).skip(27) {
+            assert!(
+                line.contains("\"tag\":\"ac_sign_bypass"),
+                "call_idx {offset} should carry the ac_sign_bypass tag — \
+                 the round-72 trace identifies the divergent §5.11.39 \
+                 reads via this label; missing tag means a future edit \
+                 took the sign read off the tagged path"
+            );
+        }
+        // Round-72 finding: calls 4..=5 are the §5.11.24 filter-intra
+        // reads (`use_filter_intra` + `filter_intra_mode`) that fire
+        // unconditionally for this DC_PRED 4×4 fixture per spec line
+        // 4177. The pinned tags surface these as the first two
+        // post-mode-info reads in the trace.
+        assert!(
+            lines[4].contains("\"tag\":\"use_filter_intra_cdf"),
+            "call_idx 4 should be the §5.11.24 use_filter_intra read"
+        );
+        assert!(
+            lines[5].contains("\"tag\":\"filter_intra_mode_cdf"),
+            "call_idx 5 should be the §5.11.24 filter_intra_mode read"
         );
     }
 }

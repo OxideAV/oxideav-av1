@@ -33,6 +33,13 @@ mod rc_trace {
     //!
     //! Used by workspace task #801 (issue #796 follow-up) to localise
     //! the §5.11.39 AC-sign entropy divergence vs `dav1d 1.5.3`.
+    //!
+    //! Round 72 added the per-call `tag` field: decoder call sites
+    //! push a short string identifier (CDF table name + context) via
+    //! [`super::set_rc_trace_tag`] right before each symbol read. The
+    //! tag is consumed on emit and reset to the empty string, so any
+    //! site that forgets to tag shows as `""` — easy to spot in the
+    //! JSONL.
     use std::fs::File;
     use std::io::{BufWriter, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +48,10 @@ mod rc_trace {
     static CALL_IDX: AtomicU64 = AtomicU64::new(0);
     static SINK: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
     static SINK_INIT: std::sync::Once = std::sync::Once::new();
+
+    thread_local! {
+        static TAG: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
 
     fn ensure_sink() {
         SINK_INIT.call_once(|| {
@@ -54,6 +65,34 @@ mod rc_trace {
 
     pub(super) fn reset() {
         CALL_IDX.store(0, Ordering::SeqCst);
+        TAG.with(|t| t.borrow_mut().clear());
+    }
+
+    pub(super) fn set_tag(s: &str) {
+        TAG.with(|t| {
+            let mut g = t.borrow_mut();
+            g.clear();
+            g.push_str(s);
+        });
+    }
+
+    fn take_tag() -> String {
+        TAG.with(|t| std::mem::take(&mut *t.borrow_mut()))
+    }
+
+    /// Escape `"` and `\` for embedding in a JSON string field. Used
+    /// only for the `tag` field so callers can include CDF table
+    /// names with array indices without worrying about JSON quoting.
+    fn escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -69,8 +108,11 @@ mod rc_trace {
     ) {
         ensure_sink();
         let idx = CALL_IDX.fetch_add(1, Ordering::SeqCst);
+        let tag = take_tag();
+        let tag_esc = escape(&tag);
         let line = format!(
-            "{{\"call_idx\":{idx},\"op\":\"{op}\",\"rng_in\":{rng_in},\
+            "{{\"call_idx\":{idx},\"op\":\"{op}\",\"tag\":\"{tag_esc}\",\
+             \"rng_in\":{rng_in},\
              \"value_in\":{value_in},\"p_or_cdf\":{p_or_cdf},\"result\":{result},\
              \"rng_out\":{rng_out},\"value_out\":{value_out},\"bit_pos\":{bit_pos}}}\n"
         );
@@ -89,6 +131,20 @@ mod rc_trace {
 pub fn reset_rc_trace_counter() {
     #[cfg(feature = "rc-trace")]
     rc_trace::reset();
+}
+
+/// Tag the next `decode_symbol` / `decode_bool` / `init` call with a
+/// short caller-supplied identifier (e.g. CDF table name + context
+/// indices). Gated on `rc-trace`; no-op when the feature is disabled
+/// so it costs nothing in the production build. The tag is consumed
+/// by the next emit and reset to empty, so back-to-back symbol reads
+/// without their own `set_rc_trace_tag` call will surface as `""` in
+/// the JSONL output — making "I forgot to label this site" visible
+/// instead of silently inheriting the previous tag.
+#[allow(unused_variables)]
+pub fn set_rc_trace_tag(tag: &str) {
+    #[cfg(feature = "rc-trace")]
+    rc_trace::set_tag(tag);
 }
 
 /// Low-probability floor per symbol (libaom `EC_MIN_PROB`).
