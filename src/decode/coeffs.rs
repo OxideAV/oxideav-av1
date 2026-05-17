@@ -175,7 +175,7 @@ impl CoeffCdfBank {
         Self {
             q_ctx,
             txb_skip_cdf: std::array::from_fn(|tx| {
-                std::array::from_fn(|c| cdfs::DEFAULT_TXB_SKIP_CDF[tx][c].to_vec())
+                std::array::from_fn(|c| cdfs::DEFAULT_TXB_SKIP_CDF[q_ctx][tx][c].to_vec())
             }),
             eob_multi16_cdf: std::array::from_fn(|p| {
                 std::array::from_fn(|c| cdfs::DEFAULT_EOB_MULTI16_CDF[q_ctx][p][c].to_vec())
@@ -206,7 +206,7 @@ impl CoeffCdfBank {
             coeff_base_eob_multi_cdf: std::array::from_fn(|tx| {
                 std::array::from_fn(|p| {
                     std::array::from_fn(|c| {
-                        cdfs::DEFAULT_COEFF_BASE_EOB_MULTI_CDF[tx][p][c].to_vec()
+                        cdfs::DEFAULT_COEFF_BASE_EOB_MULTI_CDF[q_ctx][tx][p][c].to_vec()
                     })
                 })
             }),
@@ -225,7 +225,7 @@ impl CoeffCdfBank {
                 })
             }),
             dc_sign_cdf: std::array::from_fn(|p| {
-                std::array::from_fn(|c| cdfs::DEFAULT_DC_SIGN_CDF[p][c].to_vec())
+                std::array::from_fn(|c| cdfs::DEFAULT_DC_SIGN_CDF[q_ctx][p][c].to_vec())
             }),
         }
     }
@@ -856,6 +856,74 @@ mod tests {
         // Clamps above 3.
         let b = CoeffCdfBank::new(99);
         assert_eq!(b.q_ctx, 3);
+    }
+
+    /// Regression for the round-69 latent CDF-dimensionality bug. The
+    /// three coefficient CDF tables that the spec indexes by
+    /// `COEFF_CDF_Q_CTXS` (`Default_Txb_Skip_Cdf`, `Default_Dc_Sign_Cdf`,
+    /// `Default_Coeff_Base_Eob_Cdf`) used to be stored without the outer
+    /// dim — so `q_ctx ∈ {1, 2, 3}` silently read the `q_ctx = 0` slice
+    /// instead. This test pins the spec-mandated divergence:
+    ///
+    /// - `txb_skip_cdf[tx=0][ctx=0]` differs across `q_ctx` (AV1 spec
+    ///   §9.4 "Additional tables", `Default_Txb_Skip_Cdf` first row of
+    ///   each q-context block: 31849 → 30371 → 29614 → 26887, wire-format
+    ///   `32768 - v` → 919, 2397, 3154, 5881).
+    /// - `coeff_base_eob_multi_cdf[tx=0][p=0][ctx=0]` differs too
+    ///   (spec values 17837 → 17560 → 20092 → 22497, wire-format 14931,
+    ///   15208, 12676, 10271).
+    /// - `dc_sign_cdf[p=0][ctx=0]` is intentionally constant across all
+    ///   four `q_ctx` slices per spec — pin that as well so a future
+    ///   refactor cannot accidentally re-collapse the outer dim.
+    #[test]
+    fn cdf_bank_picks_q_ctx_specific_slice() {
+        // First-bin survival values from each q_ctx slice.
+        let txb_skip_q0 = CoeffCdfBank::new(0).txb_skip_cdf[0][0][0];
+        let txb_skip_q1 = CoeffCdfBank::new(1).txb_skip_cdf[0][0][0];
+        let txb_skip_q2 = CoeffCdfBank::new(2).txb_skip_cdf[0][0][0];
+        let txb_skip_q3 = CoeffCdfBank::new(3).txb_skip_cdf[0][0][0];
+        assert_eq!(
+            (txb_skip_q0, txb_skip_q1, txb_skip_q2, txb_skip_q3),
+            (919u16, 2397u16, 3154u16, 5881u16),
+            "txb_skip_cdf must vary by q_ctx (spec §9.4 Default_Txb_Skip_Cdf)"
+        );
+
+        let eob_q0 = CoeffCdfBank::new(0).coeff_base_eob_multi_cdf[0][0][0][0];
+        let eob_q1 = CoeffCdfBank::new(1).coeff_base_eob_multi_cdf[0][0][0][0];
+        let eob_q2 = CoeffCdfBank::new(2).coeff_base_eob_multi_cdf[0][0][0][0];
+        let eob_q3 = CoeffCdfBank::new(3).coeff_base_eob_multi_cdf[0][0][0][0];
+        assert_eq!(
+            (eob_q0, eob_q1, eob_q2, eob_q3),
+            (14931u16, 15208u16, 12676u16, 10271u16),
+            "coeff_base_eob_multi_cdf must vary by q_ctx (spec §9.4 Default_Coeff_Base_Eob_Cdf)"
+        );
+
+        // dc_sign_cdf is spec-identical across all 4 q_ctx slices but
+        // must still be wired through the outer index so the data flow
+        // matches its siblings.
+        for q in 0..=3 {
+            let bank = CoeffCdfBank::new(q);
+            assert_eq!(
+                bank.dc_sign_cdf[0][0][0], 16768u16,
+                "dc_sign_cdf[p=0][ctx=0][0] is spec-identical for q_ctx={q}"
+            );
+        }
+    }
+
+    /// Q-context derivation per §9.4.2 step 1 — pinned to the boundary
+    /// values asserted in [`q_index_to_ctx_boundaries`] so any future
+    /// edit to `q_index_to_ctx` that breaks the dispatch will surface
+    /// here too, alongside the table-slice regression above.
+    #[test]
+    fn base_q_idx_drives_non_zero_q_ctx_bank() {
+        // base_q_idx = 100 → q_ctx = 1 (§9.4.2)
+        let bank = CoeffCdfBank::new(q_index_to_ctx(100));
+        assert_eq!(bank.q_ctx, 1);
+        assert_eq!(bank.txb_skip_cdf[0][0][0], 2397u16);
+        // base_q_idx = 200 → q_ctx = 3
+        let bank = CoeffCdfBank::new(q_index_to_ctx(200));
+        assert_eq!(bank.q_ctx, 3);
+        assert_eq!(bank.txb_skip_cdf[0][0][0], 5881u16);
     }
 
     #[test]

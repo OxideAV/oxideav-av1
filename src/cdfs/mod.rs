@@ -19,11 +19,22 @@
 //! from `libaom/av1/common/entropymode.c` into `lr.rs` — they aren't
 //! part of the auto-generated set because the generator doesn't cover
 //! per-unit LR signalling.
+//!
+//! The three coefficient CDF tables that are indexed by the per-frame
+//! Q context (`COEFF_CDF_Q_CTXS = 4`) live in [`coeff_q_ctx`]. They are
+//! hand-transcribed from the AV1 spec PDF because the upstream
+//! `goavif` reference package — and therefore the generator output —
+//! collapses the outer `[COEFF_CDF_Q_CTXS]` axis (a latent
+//! dimensionality bug for non-lossless / `base_q_idx > 0` streams).
 
+mod coeff_q_ctx;
 mod extra;
 mod generated;
 mod lr;
 
+pub use coeff_q_ctx::{
+    DEFAULT_COEFF_BASE_EOB_MULTI_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_TXB_SKIP_CDF,
+};
 pub use extra::{
     DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF, DEFAULT_FILTER_INTRA_MODE_CDF,
     DEFAULT_INTER_EXT_TX_CDF_SET1, DEFAULT_INTER_EXT_TX_CDF_SET2, DEFAULT_INTER_EXT_TX_CDF_SET3,

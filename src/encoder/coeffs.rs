@@ -61,7 +61,7 @@ impl CoeffCdfBankEnc {
         Self {
             q_ctx,
             txb_skip_cdf: std::array::from_fn(|tx| {
-                std::array::from_fn(|c| cdfs::DEFAULT_TXB_SKIP_CDF[tx][c].to_vec())
+                std::array::from_fn(|c| cdfs::DEFAULT_TXB_SKIP_CDF[q_ctx][tx][c].to_vec())
             }),
             eob_multi16_cdf: std::array::from_fn(|p| {
                 std::array::from_fn(|c| cdfs::DEFAULT_EOB_MULTI16_CDF[q_ctx][p][c].to_vec())
@@ -92,7 +92,7 @@ impl CoeffCdfBankEnc {
             coeff_base_eob_multi_cdf: std::array::from_fn(|tx| {
                 std::array::from_fn(|p| {
                     std::array::from_fn(|c| {
-                        cdfs::DEFAULT_COEFF_BASE_EOB_MULTI_CDF[tx][p][c].to_vec()
+                        cdfs::DEFAULT_COEFF_BASE_EOB_MULTI_CDF[q_ctx][tx][p][c].to_vec()
                     })
                 })
             }),
@@ -111,7 +111,7 @@ impl CoeffCdfBankEnc {
                 })
             }),
             dc_sign_cdf: std::array::from_fn(|p| {
-                std::array::from_fn(|c| cdfs::DEFAULT_DC_SIGN_CDF[p][c].to_vec())
+                std::array::from_fn(|c| cdfs::DEFAULT_DC_SIGN_CDF[q_ctx][p][c].to_vec())
             }),
         }
     }

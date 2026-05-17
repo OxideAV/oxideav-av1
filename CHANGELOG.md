@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Coefficient CDF tables now carry the spec-mandated
+  `[COEFF_CDF_Q_CTXS = 4]` outer dimension (round 70).** Three default
+  CDF tables (`Default_Txb_Skip_Cdf`, `Default_Dc_Sign_Cdf`,
+  `Default_Coeff_Base_Eob_Cdf` — known here under their libaom-style
+  names `DEFAULT_TXB_SKIP_CDF`, `DEFAULT_DC_SIGN_CDF`,
+  `DEFAULT_COEFF_BASE_EOB_MULTI_CDF`) previously lacked the outer
+  Q-context axis required by AV1 §9.4 / Annex E. The upstream `goavif`
+  reference package (driving `tools/gen_cdfs`) collapses the axis, and
+  the generated `src/cdfs/generated.rs` reproduced the bug. For
+  `base_q_idx > 0` streams (`q_ctx ∈ {1, 2, 3}`) the decoder would
+  silently read the wrong CDF slice and mis-decode coefficient skip /
+  EOB / DC-sign symbols. The three tables are now hand-transcribed
+  from the AV1 spec PDF into `src/cdfs/coeff_q_ctx.rs` with the full
+  4-way outer dim, and `tools/gen_cdfs` was updated to skip them on
+  regen (`OVERRIDE_NAMES`). The `q_ctx = 0` slice is byte-identical to
+  the previously emitted values, so the existing lossless fixtures
+  (including the round-68 `issue_796` divergence corpus) are
+  unaffected. Two new regression tests
+  (`cdf_bank_picks_q_ctx_specific_slice` and
+  `base_q_idx_drives_non_zero_q_ctx_bank` in `decode::coeffs::tests`)
+  pin the spec-mandated per-q_ctx variation so a future refactor
+  cannot re-collapse the outer dim. No reference codec source was
+  consulted — every q_ctx slice came from
+  `docs/video/av1/av1-spec.txt`.
+
 ### Investigation
 
 - **§5.11.39 sign-bit divergence — round 68 black-box probe (workspace

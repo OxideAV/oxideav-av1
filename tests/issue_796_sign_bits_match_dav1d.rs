@@ -87,13 +87,14 @@
 //! `docs/video/av1/specs/dav1d-range-coder-divergence-call-idx-27.md`.
 //!
 //! Round-68 net new finding: `DEFAULT_COEFF_BASE_EOB_MULTI_CDF`,
-//! `DEFAULT_TXB_SKIP_CDF`, and `DEFAULT_DC_SIGN_CDF` are stored
+//! `DEFAULT_TXB_SKIP_CDF`, and `DEFAULT_DC_SIGN_CDF` were stored
 //! WITHOUT the spec's `COEFF_CDF_Q_CTXS = 4` outer dimension. For
 //! this fixture (`base_q_idx = 0` lossless, q_ctx=0) the stored
-//! slice is the q_ctx=0 row, so the divergence fixture decodes
-//! against spec-correct CDFs and the missing dim is NOT the
-//! divergence cause. For `q_ctx > 0` the decoder will silently read
-//! the wrong CDF entries — a separate latent bug filed for round 69.
+//! slice was the q_ctx=0 row, so the divergence fixture decodes
+//! against spec-correct CDFs and the missing dim was NOT the
+//! divergence cause. The latent `q_ctx > 0` bug was fixed in
+//! round 70 by relocating the three tables to
+//! `src/cdfs/coeff_q_ctx.rs` with the spec-mandated outer dim.
 //!
 //! ## Investigation summary (round 49, 2026-05-12)
 //!
