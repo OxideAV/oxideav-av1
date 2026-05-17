@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-av1/compare/v0.1.7...v0.1.8) - 2026-05-17
+
+### Other
+
+- round 72 — rc-trace per-call tagging localises §5.11.39 divergence to renorm path ([#801](https://github.com/OxideAV/oxideav-av1/pull/801))
+- thread COEFF_CDF_Q_CTXS outer dim through coefficient CDFs
+- round 68 — dav1d binary-surface probe + CDF q_ctx audit ([#801](https://github.com/OxideAV/oxideav-av1/pull/801))
+- clarify round-r-next comment — partition fix covers all sizes 8..=64
+- dav1d 1.5.x cross-decode unblock — every single-SB square 8×8..64×64
+- round 67 — three §5.11.39 hypotheses falsified, divergence stays upstream of §8.2.6 ([#801](https://github.com/OxideAV/oxideav-av1/pull/801))
+- round 66 rc-trace feature localises §5.11.39 divergence to call_idx 27 ([#801](https://github.com/OxideAV/oxideav-av1/pull/801))
+- round 49 sign-bit divergence audit ([#796](https://github.com/OxideAV/oxideav-av1/pull/796))
+- spec-correct §5.11.4 partition force-split + §5.11.39 sign loop per #791
+- audit §7.7.4 lossless WHT residual scaling per #786
+- gate transform_type symbol on qindex per §5.11.47
+- spec-correct §5.11.39 coefficient context derivation
+- refuse coded_lossless until §7.7.4 IWHT dispatch + coeff ctx land
+- refuse superres frames so output dim matches §7.18.2 (UpscaledWidth)
+- harden motion compensation against empty/short reference buffers
+- relax dimension-mismatch assertion to logged disagreement
+- add cargo-fuzz infrastructure + ffmpeg-via-libloading oracle
+- harden 5 panic paths surfaced by new fuzz harness
+
 ### Investigation
 
 - **§5.11.39 sign-bit divergence — round 72 rc-trace per-call tagging
