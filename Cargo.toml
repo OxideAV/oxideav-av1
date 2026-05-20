@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-av1"
+version = "0.1.7"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-av1"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust AV1 codec — orphan-rebuild scaffold pending clean-room re-implementation."
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-av1"
+keywords = ["multimedia", "video", "av1", "codec", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
