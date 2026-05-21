@@ -1,322 +1,377 @@
-//! Integration tests for §5.5 `sequence_header_obu` parsing.
+//! Integration tests for §5.5 `sequence_header_obu` parsing against
+//! a clean-room fixture corpus.
 //!
-//! For every IVF fixture under `docs/video/av1/fixtures/`, this test
-//! walks the IVF container manually (32-byte file header + 12-byte
-//! frame headers), runs the round-1 OBU walker over the AV1 payload,
-//! finds the first SEQUENCE_HEADER OBU, parses it with
-//! [`oxideav_av1::parse_sequence_header`], and asserts the fields
-//! match the expected values captured in each fixture's
-//! `trace.txt` (parsed lazily here from the `SEQ_HEADER ...` line the
-//! AV1_TRACE-patched ffmpeg+libdav1d harness emitted at corpus
-//! generation time).
+//! Each entry below is the verbatim SEQUENCE_HEADER OBU payload
+//! (everything after the OBU header / extension / `obu_size` bytes)
+//! extracted from an IVF fixture in
+//! `docs/video/av1/fixtures/<name>/input.ivf`, paired with the
+//! expected field values from the `SEQ_HEADER` line in the same
+//! fixture's `trace.txt`. The trace events themselves are documented
+//! in `docs/video/av1/av1-fixtures-and-traces.md`.
 //!
-//! The trace lines themselves are the contract; the cleanroom wall
-//! treats them as static fixture metadata (same status as the bytes
-//! of `expected.yuv`).
+//! Embedding the payloads here (instead of reading the fixture
+//! directories at test time) keeps the integration test
+//! self-contained — the crate is published to crates.io as a
+//! stand-alone artifact and the `docs/` corpus is workspace-only.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use oxideav_av1::parse_sequence_header;
 
-use oxideav_av1::{parse_sequence_header, ObuIter, ObuType};
-
-fn fixtures_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR points at crates/oxideav-av1/
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("..")
-        .join("..")
-        .join("docs")
-        .join("video")
-        .join("av1")
-        .join("fixtures")
+#[derive(Debug)]
+struct Expected {
+    profile: u8,
+    still_picture: bool,
+    reduced_still: bool,
+    max_w: u32,
+    max_h: u32,
+    level0: u8,
+    tier0: u8,
+    num_ops: u8,
+    use_128sb: bool,
+    enable_filter_intra: bool,
+    enable_intra_edge_filter: bool,
+    enable_interintra: bool,
+    enable_masked: bool,
+    enable_warped: bool,
+    enable_dual_filter: bool,
+    enable_order_hint: bool,
+    order_hint_bits: u8,
+    enable_jnt_comp: bool,
+    enable_ref_mvs: bool,
+    enable_superres: bool,
+    enable_cdef: bool,
+    enable_restoration: bool,
+    monochrome: bool,
+    high_bitdepth: bool,
+    twelve_bit: bool,
+    color_range: bool,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    film_grain_present: bool,
 }
 
-/// Strip an IVF container and return the concatenated AV1 OBU stream
-/// covering all frames in the file. IVF layout:
-///
-/// * 32-byte file header (`DKIF` magic, codec FourCC, dimensions, …)
-/// * For each frame: 12-byte frame header (`u32` size LE + `u64` pts
-///   LE) + size bytes of payload.
-fn strip_ivf(bytes: &[u8]) -> Vec<u8> {
-    assert!(bytes.len() >= 32, "ivf header truncated");
-    assert_eq!(&bytes[..4], b"DKIF", "not an IVF file");
-    let mut out = Vec::new();
-    let mut cursor = 32usize;
-    while cursor + 12 <= bytes.len() {
-        let frame_size = u32::from_le_bytes([
-            bytes[cursor],
-            bytes[cursor + 1],
-            bytes[cursor + 2],
-            bytes[cursor + 3],
-        ]) as usize;
-        cursor += 12;
-        let end = cursor + frame_size;
-        assert!(end <= bytes.len(), "ivf frame truncated");
-        out.extend_from_slice(&bytes[cursor..end]);
-        cursor = end;
-    }
-    out
+struct Fixture {
+    name: &'static str,
+    payload: &'static [u8],
+    expected: Expected,
 }
 
-/// Parse one trace line of the form
-/// `SEQ_HEADER\tprofile=0\tstill_picture=0\t...` into a key→value map.
-fn parse_trace_kv(line: &str) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    for token in line.split('\t').skip(1) {
-        if let Some(eq) = token.find('=') {
-            map.insert(token[..eq].to_string(), token[eq + 1..].to_string());
-        }
-    }
-    map
-}
-
-fn first_seq_header_trace_line(trace: &str) -> Option<BTreeMap<String, String>> {
-    for line in trace.lines() {
-        if line.starts_with("SEQ_HEADER\t") {
-            return Some(parse_trace_kv(line));
-        }
-    }
-    None
-}
-
-fn assert_field<T: std::fmt::Debug + PartialEq>(fixture: &str, key: &str, expected: T, actual: T) {
-    assert_eq!(
-        actual, expected,
-        "fixture {fixture}: field {key} mismatch (expected {expected:?}, got {actual:?})"
-    );
-}
-
-fn run_fixture(dir: &Path) {
-    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-    let ivf = fs::read(dir.join("input.ivf")).expect("read input.ivf");
-    let trace = fs::read_to_string(dir.join("trace.txt")).expect("read trace.txt");
-    let expected = first_seq_header_trace_line(&trace)
-        .unwrap_or_else(|| panic!("fixture {name}: no SEQ_HEADER line in trace"));
-
-    let stream = strip_ivf(&ivf);
-
-    // Walk OBUs and find the first SEQUENCE_HEADER.
-    let mut seq_payload: Option<Vec<u8>> = None;
-    for obu in ObuIter::new(&stream) {
-        let obu = obu.expect("OBU walker failure on conformant fixture");
-        if obu.obu_type == ObuType::SequenceHeader {
-            seq_payload = Some(obu.payload.to_vec());
-            break;
-        }
-    }
-    let seq_payload =
-        seq_payload.unwrap_or_else(|| panic!("fixture {name}: no SEQUENCE_HEADER OBU"));
-
-    let sh = parse_sequence_header(&seq_payload)
-        .unwrap_or_else(|e| panic!("fixture {name}: parse_sequence_header failed: {e:?}"));
-
-    // Per-field comparison against the trace expectations.
-    let get = |k: &str| -> &str {
-        expected
-            .get(k)
-            .unwrap_or_else(|| panic!("fixture {name}: trace missing key {k}"))
-            .as_str()
-    };
-    let getu = |k: &str| -> u64 { get(k).parse().expect("uint") };
-    let getb = |k: &str| -> bool { getu(k) != 0 };
-
-    assert_field(&name, "profile", getu("profile") as u8, sh.seq_profile);
-    assert_field(
-        &name,
-        "still_picture",
-        getb("still_picture"),
-        sh.still_picture,
-    );
-    assert_field(
-        &name,
-        "reduced_still",
-        getb("reduced_still"),
-        sh.reduced_still_picture_header,
-    );
-    // max_w / max_h are encoded as max_frame_width_minus_1+1.
-    assert_field(
-        &name,
-        "max_w",
-        getu("max_w") as u32,
-        sh.max_frame_width_minus_1 + 1,
-    );
-    assert_field(
-        &name,
-        "max_h",
-        getu("max_h") as u32,
-        sh.max_frame_height_minus_1 + 1,
-    );
-    assert_field(
-        &name,
-        "level0",
-        getu("level0") as u8,
-        sh.operating_points[0].seq_level_idx,
-    );
-    assert_field(
-        &name,
-        "tier0",
-        getu("tier0") as u8,
-        sh.operating_points[0].seq_tier,
-    );
-    assert_field(
-        &name,
-        "num_ops",
-        getu("num_ops") as u8,
-        sh.operating_points_cnt_minus_1 + 1,
-    );
-    assert_field(
-        &name,
-        "use_128sb",
-        getb("use_128sb"),
-        sh.use_128x128_superblock,
-    );
-    assert_field(
-        &name,
-        "enable_filter_intra",
-        getb("enable_filter_intra"),
-        sh.enable_filter_intra,
-    );
-    assert_field(
-        &name,
-        "enable_intra_edge_filter",
-        getb("enable_intra_edge_filter"),
-        sh.enable_intra_edge_filter,
-    );
-    assert_field(
-        &name,
-        "enable_interintra",
-        getb("enable_interintra"),
-        sh.enable_interintra_compound,
-    );
-    assert_field(
-        &name,
-        "enable_masked",
-        getb("enable_masked"),
-        sh.enable_masked_compound,
-    );
-    assert_field(
-        &name,
-        "enable_warped",
-        getb("enable_warped"),
-        sh.enable_warped_motion,
-    );
-    assert_field(
-        &name,
-        "enable_dual_filter",
-        getb("enable_dual_filter"),
-        sh.enable_dual_filter,
-    );
-    assert_field(
-        &name,
-        "enable_order_hint",
-        getb("enable_order_hint"),
-        sh.enable_order_hint,
-    );
-    assert_field(
-        &name,
-        "order_hint_bits",
-        getu("order_hint_bits") as u8,
-        sh.order_hint_bits,
-    );
-    assert_field(
-        &name,
-        "enable_jnt_comp",
-        getb("enable_jnt_comp"),
-        sh.enable_jnt_comp,
-    );
-    assert_field(
-        &name,
-        "enable_ref_mvs",
-        getb("enable_ref_mvs"),
-        sh.enable_ref_frame_mvs,
-    );
-    assert_field(
-        &name,
-        "enable_superres",
-        getb("enable_superres"),
-        sh.enable_superres,
-    );
-    assert_field(&name, "enable_cdef", getb("enable_cdef"), sh.enable_cdef);
-    assert_field(
-        &name,
-        "enable_restoration",
-        getb("enable_restoration"),
-        sh.enable_restoration,
-    );
-    assert_field(
-        &name,
-        "monochrome",
-        getb("monochrome"),
-        sh.color_config.mono_chrome,
-    );
-    assert_field(
-        &name,
-        "high_bitdepth",
-        getb("high_bitdepth"),
-        sh.color_config.high_bitdepth,
-    );
-    assert_field(
-        &name,
-        "twelve_bit",
-        getb("twelve_bit"),
-        sh.color_config.twelve_bit,
-    );
-    assert_field(
-        &name,
-        "color_range",
-        getb("color_range"),
-        sh.color_config.color_range,
-    );
-    assert_field(
-        &name,
-        "subsampling_x",
-        getb("subsampling_x"),
-        sh.color_config.subsampling_x,
-    );
-    assert_field(
-        &name,
-        "subsampling_y",
-        getb("subsampling_y"),
-        sh.color_config.subsampling_y,
-    );
-    assert_field(
-        &name,
-        "film_grain_present",
-        getb("film_grain_present"),
-        sh.film_grain_params_present,
-    );
-}
+/// All 16 fixtures from `docs/video/av1/fixtures/`. The hex payloads
+/// were extracted from each fixture's `input.ivf` (strip the 32-byte
+/// IVF file header + 12-byte frame header, walk the first
+/// SEQUENCE_HEADER OBU and read its `obu_size` payload bytes). The
+/// expected fields were copied from the `SEQ_HEADER` line at the top
+/// of each fixture's `trace.txt`.
+#[rustfmt::skip]
+const FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "tiny-i-only-16x16-prof0",
+        payload: &[0x00,0x00,0x00,0x01,0x9f,0xfb,0xff,0xf3,0x00,0x80],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 16, max_h: 16, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "i-only-64x64-prof0",
+        payload: &[0x00,0x00,0x00,0x02,0xaf,0xff,0xbf,0xff,0x30,0x08],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "i-frame-then-p-64x64",
+        payload: &[0x00,0x00,0x00,0x02,0xaf,0xff,0xbf,0xff,0x30,0x08],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "profile-0-yuv420-8bit",
+        payload: &[0x00,0x00,0x00,0x02,0xaf,0xff,0xbf,0xff,0x30,0x08],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "profile-1-yuv444-8bit",
+        payload: &[0x20,0x00,0x00,0x02,0xaf,0xff,0xbf,0xff,0x30,0x40],
+        expected: Expected {
+            profile: 1, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: false, subsampling_y: false, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "profile-2-yuv422-10bit",
+        payload: &[0x40,0x00,0x00,0x02,0xaf,0xff,0xbf,0xff,0x38,0x10],
+        expected: Expected {
+            profile: 2, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: true, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: false, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "profile-2-yuv422-12bit",
+        payload: &[0x40,0x00,0x00,0x02,0xaf,0xff,0xbf,0xff,0x3c,0x44],
+        expected: Expected {
+            profile: 2, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: true, twelve_bit: true, color_range: false,
+            subsampling_x: true, subsampling_y: false, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "monochrome-grey-only",
+        payload: &[0x00,0x00,0x00,0x02,0xaf,0xff,0xbf,0xff,0x35,0x40],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: true,
+            high_bitdepth: false, twelve_bit: false, color_range: true,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "super-resolution",
+        payload: &[0x18,0x19,0x7f,0xff,0xf8,0x04],
+        expected: Expected {
+            profile: 0, still_picture: true, reduced_still: true,
+            max_w: 128, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: false, enable_masked: false, enable_warped: false,
+            enable_dual_filter: false, enable_order_hint: false, order_hint_bits: 0,
+            enable_jnt_comp: false, enable_ref_mvs: false, enable_superres: true,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "screen-content-tools",
+        payload: &[0x18,0x1d,0xbf,0xff,0xf2,0x01],
+        expected: Expected {
+            profile: 0, still_picture: true, reduced_still: true,
+            max_w: 256, max_h: 128, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: false, enable_masked: false, enable_warped: false,
+            enable_dual_filter: false, enable_order_hint: false, order_hint_bits: 0,
+            enable_jnt_comp: false, enable_ref_mvs: false, enable_superres: false,
+            enable_cdef: false, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "film-grain-on",
+        payload: &[0x00,0x00,0x00,0x02,0xaf,0xff,0x9b,0x5f,0x30,0x18],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: false, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: false, enable_masked: true, enable_warped: true,
+            enable_dual_filter: false, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: false, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: true,
+        },
+    },
+    Fixture {
+        name: "superblocks-128",
+        payload: &[0x00,0x00,0x00,0x03,0x37,0xff,0xef,0xff,0xcc,0x02],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 128, max_h: 128, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: true, enable_masked: true, enable_warped: true,
+            enable_dual_filter: true, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: true, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "tile-cols-2-rows-1",
+        payload: &[0x00,0x00,0x00,0x03,0xaf,0xff,0xe6,0xd7,0xcc,0x02],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 256, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: false, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: false, enable_masked: true, enable_warped: true,
+            enable_dual_filter: false, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: false, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "show-existing-frame",
+        payload: &[0x00,0x00,0x00,0x02,0xaf,0xff,0x9b,0x5f,0x30,0x08],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: false, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: false, enable_masked: true, enable_warped: true,
+            enable_dual_filter: false, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: false, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "lossless-i-only",
+        payload: &[0x18,0x15,0x7f,0xff,0xb0,0x08],
+        expected: Expected {
+            profile: 0, still_picture: true, reduced_still: true,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: true, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: false, enable_masked: false, enable_warped: false,
+            enable_dual_filter: false, enable_order_hint: false, order_hint_bits: 0,
+            enable_jnt_comp: false, enable_ref_mvs: false, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+    Fixture {
+        name: "obu-with-extension-headers",
+        payload: &[0x00,0x00,0x00,0x02,0xaf,0xff,0x9b,0x5f,0x30,0x08],
+        expected: Expected {
+            profile: 0, still_picture: false, reduced_still: false,
+            max_w: 64, max_h: 64, level0: 0, tier0: 0, num_ops: 1,
+            use_128sb: false, enable_filter_intra: true, enable_intra_edge_filter: true,
+            enable_interintra: false, enable_masked: true, enable_warped: true,
+            enable_dual_filter: false, enable_order_hint: true, order_hint_bits: 7,
+            enable_jnt_comp: false, enable_ref_mvs: true, enable_superres: false,
+            enable_cdef: true, enable_restoration: true, monochrome: false,
+            high_bitdepth: false, twelve_bit: false, color_range: false,
+            subsampling_x: true, subsampling_y: true, film_grain_present: false,
+        },
+    },
+];
 
 #[test]
-fn all_fixtures_round_trip_sequence_header() {
-    let root = fixtures_root();
-    let mut fixtures: Vec<PathBuf> = fs::read_dir(&root)
-        .expect("read fixtures dir")
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            if p.is_dir() {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-    fixtures.sort();
-    assert!(
-        !fixtures.is_empty(),
-        "no fixture directories under {}",
-        root.display()
-    );
-    let mut tested = 0usize;
-    for dir in &fixtures {
-        // Skip fixture directories that don't have both an IVF and a trace
-        // (defensive — the round-1 corpus has both for every entry).
-        if !dir.join("input.ivf").is_file() || !dir.join("trace.txt").is_file() {
-            continue;
+fn all_corpus_fixtures_round_trip_sequence_header() {
+    for fixture in FIXTURES {
+        let sh = parse_sequence_header(fixture.payload).unwrap_or_else(|e| {
+            panic!("fixture {}: parse failed: {e:?}", fixture.name);
+        });
+        let e = &fixture.expected;
+        let mismatches = collect_mismatches(fixture.name, &sh, e);
+        if !mismatches.is_empty() {
+            panic!(
+                "fixture {} mismatched fields:\n  {}",
+                fixture.name,
+                mismatches.join("\n  ")
+            );
         }
-        run_fixture(dir);
-        tested += 1;
     }
-    assert!(tested >= 10, "expected >= 10 fixtures, got {tested}");
+    assert_eq!(
+        FIXTURES.len(),
+        16,
+        "embedded corpus shrank below 16 fixtures"
+    );
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn collect_mismatches(name: &str, sh: &oxideav_av1::SequenceHeader, e: &Expected) -> Vec<String> {
+    let mut m: Vec<String> = Vec::new();
+    macro_rules! check {
+        ($field:ident, $actual:expr) => {
+            if e.$field != $actual {
+                m.push(format!(
+                    "{}: {} expected {:?} got {:?}",
+                    name,
+                    stringify!($field),
+                    e.$field,
+                    $actual
+                ));
+            }
+        };
+    }
+    check!(profile, sh.seq_profile);
+    check!(still_picture, sh.still_picture);
+    check!(reduced_still, sh.reduced_still_picture_header);
+    check!(max_w, sh.max_frame_width_minus_1 + 1);
+    check!(max_h, sh.max_frame_height_minus_1 + 1);
+    check!(level0, sh.operating_points[0].seq_level_idx);
+    check!(tier0, sh.operating_points[0].seq_tier);
+    check!(num_ops, sh.operating_points_cnt_minus_1 + 1);
+    check!(use_128sb, sh.use_128x128_superblock);
+    check!(enable_filter_intra, sh.enable_filter_intra);
+    check!(enable_intra_edge_filter, sh.enable_intra_edge_filter);
+    check!(enable_interintra, sh.enable_interintra_compound);
+    check!(enable_masked, sh.enable_masked_compound);
+    check!(enable_warped, sh.enable_warped_motion);
+    check!(enable_dual_filter, sh.enable_dual_filter);
+    check!(enable_order_hint, sh.enable_order_hint);
+    check!(order_hint_bits, sh.order_hint_bits);
+    check!(enable_jnt_comp, sh.enable_jnt_comp);
+    check!(enable_ref_mvs, sh.enable_ref_frame_mvs);
+    check!(enable_superres, sh.enable_superres);
+    check!(enable_cdef, sh.enable_cdef);
+    check!(enable_restoration, sh.enable_restoration);
+    check!(monochrome, sh.color_config.mono_chrome);
+    check!(high_bitdepth, sh.color_config.high_bitdepth);
+    check!(twelve_bit, sh.color_config.twelve_bit);
+    check!(color_range, sh.color_config.color_range);
+    check!(subsampling_x, sh.color_config.subsampling_x);
+    check!(subsampling_y, sh.color_config.subsampling_y);
+    check!(film_grain_present, sh.film_grain_params_present);
+    m
 }
