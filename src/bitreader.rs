@@ -8,11 +8,11 @@
 //! bit position; reads past the end of the underlying buffer fail with
 //! [`Error::UnexpectedEnd`].
 //!
-//! Only the primitives needed by §5.5 (`sequence_header_obu`) are
-//! exposed in this round:
+//! The primitives needed by the rounds shipped so far:
 //!
 //!   * [`BitReader::f`] — `f(n)` per §4.10.2 / §8.1
 //!   * [`BitReader::uvlc`] — `uvlc()` per §4.10.3
+//!   * [`BitReader::su`] — `su(n)` per §4.10.6
 //!
 //! `leb128()` (§4.10.5) is byte-aligned and already implemented in
 //! [`crate::obu::parse_leb128`] against the raw payload slice.
@@ -60,6 +60,24 @@ impl<'a> BitReader<'a> {
             x = (x << 1) | u64::from(self.read_bit()?);
         }
         Ok(x)
+    }
+
+    /// `su(n)` per §4.10.6 — signed integer reconstructed from the
+    /// bottom `n` bits of a two's-complement integer. The high bit of
+    /// the read `n`-bit value is the sign bit.
+    ///
+    /// `n` must be in `1..=32`. The result fits in `i32`.
+    pub(crate) fn su(&mut self, n: u32) -> Result<i32, Error> {
+        debug_assert!((1..=32).contains(&n));
+        let value = self.f(n)? as u32;
+        let sign_mask: u32 = 1 << (n - 1);
+        if value & sign_mask != 0 {
+            // value - 2 * signMask reinterpreted in i64 to avoid wrap.
+            let v = i64::from(value) - (i64::from(sign_mask) << 1);
+            Ok(v as i32)
+        } else {
+            Ok(value as i32)
+        }
     }
 
     /// `uvlc()` per §4.10.3.
@@ -158,6 +176,31 @@ mod tests {
         let mut br = BitReader::new(&[0b0010_0000]);
         assert_eq!(br.uvlc().unwrap(), 3);
         assert_eq!(br.position(), 5);
+    }
+
+    #[test]
+    fn su_positive_value() {
+        // su(7) reading 0010101 = 21 (positive — top bit of 7 is 0).
+        // Encode in one byte high nibble: 0010_1010 = 0x2A, position
+        // 0..6 spans the high seven bits = 0010_101 = 21.
+        let mut br = BitReader::new(&[0b0010_1010]);
+        assert_eq!(br.su(7).unwrap(), 21);
+        assert_eq!(br.position(), 7);
+    }
+
+    #[test]
+    fn su_negative_value() {
+        // su(7) reading 1111111 = -1 (signMask bit set, value=127,
+        // 127 - 128 = -1).
+        let mut br = BitReader::new(&[0b1111_1110]);
+        assert_eq!(br.su(7).unwrap(), -1);
+    }
+
+    #[test]
+    fn su_min_negative() {
+        // su(7) reading 1000000 = signMask only ⇒ 64 - 128 = -64.
+        let mut br = BitReader::new(&[0b1000_0000]);
+        assert_eq!(br.su(7).unwrap(), -64);
     }
 
     #[test]

@@ -6,6 +6,75 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 5 — Uncompressed-header tail sub-syntaxes (§5.9.10 /
+  §5.9.11 / §5.9.12 / §5.9.13).** New `uncompressed_header_tail`
+  module exposes three standalone parser entry points that take a
+  byte slice + the relevant `SequenceHeader`-derived flags and
+  return a parsed descriptor:
+
+  * `parse_interpolation_filter(payload) -> (InterpolationFilter,
+    usize)` — §5.9.10. Reads `is_filter_switchable` (`f(1)`) +
+    optional `interpolation_filter` (`f(2)`), returning the
+    `InterpolationFilter` enum (`Eighttap` / `EighttapSmooth` /
+    `EighttapSharp` / `Bilinear` / `Switchable`) per §6.8.9.
+
+  * `parse_loop_filter_params(payload, num_planes, coded_lossless,
+    allow_intrabc) -> (LoopFilterParams, usize)` — §5.9.11. Honours
+    the `(CodedLossless || allow_intrabc)` short-circuit (no bits
+    read, `loop_filter_ref_deltas` reset to the spec's literal
+    defaults `[INTRA=1, LAST=0, LAST2=0, LAST3=0, GOLDEN=-1,
+    BWDREF=0, ALTREF2=-1, ALTREF=-1]`). For the full path: four
+    `loop_filter_level[]` `f(6)` slots (with the `NumPlanes > 1 &&
+    (loop_filter_level[0] || loop_filter_level[1])` gate on the
+    chroma pair), `loop_filter_sharpness` (`f(3)`),
+    `loop_filter_delta_enabled` (`f(1)`), `loop_filter_delta_update`
+    (`f(1)`), and the per-slot update walk: for each of
+    `TOTAL_REFS_PER_FRAME = 8` ref-deltas an `update_ref_delta`
+    (`f(1)`) gate that conditionally reads `loop_filter_ref_deltas[i]`
+    as `su(7)`, then the same pattern for the 2 mode-deltas.
+
+  * `parse_quantization_params(payload, num_planes,
+    separate_uv_delta_q) -> (QuantizationParams, usize)` — §5.9.12
+    + §5.9.13. Reads `base_q_idx` (`f(8)`), `DeltaQYDc` via
+    `read_delta_q()` (a `delta_coded` `f(1)` gate followed by a
+    conditional `su(1+6) = su(7)` signed offset), the chroma block
+    (`diff_uv_delta` `f(1)` only when `NumPlanes > 1 &&
+    separate_uv_delta_q`, `DeltaQUDc` / `DeltaQUAc` via
+    `read_delta_q()` when `NumPlanes > 1`, V mirrors U when
+    `diff_uv_delta == 0`), and the qmatrix block (`using_qmatrix`
+    `f(1)` plus `qm_y` / `qm_u` / `qm_v` `f(4)` each, where `qm_v`
+    is read separately only when `separate_uv_delta_q == 1`).
+
+  New types: `InterpolationFilter` enum + `LoopFilterParams` /
+  `QuantizationParams` structs. New constants:
+  `TOTAL_REFS_PER_FRAME = 8`, `LOOP_FILTER_REF_DELTAS_DEFAULT`,
+  `LOOP_FILTER_MODE_DELTAS_DEFAULT`. New bitreader primitive:
+  internal `BitReader::su(n)` per §4.10.6, the signed-integer
+  descriptor used by `loop_filter_ref_deltas[i]` /
+  `loop_filter_mode_deltas[i]` / the `delta_q` field of
+  `read_delta_q()`.
+
+  The three sub-syntaxes are exposed as **standalone** parser
+  entry points rather than wired into the streaming
+  `parse_frame_header` walk: the intervening §5.9.2 syntax
+  (`allow_intrabc`, `disable_frame_end_update_cdf`, `tile_info()`,
+  `segmentation_params()`, `delta_q_params()`, `delta_lf_params()`)
+  sits between round 4's stop point and these calls. The next
+  round can stitch them into the streaming parser as the
+  intervening syntaxes land.
+
+  Validation: 18 new unit tests across the three sub-syntaxes —
+  switchable + each of the four non-switchable interpolation
+  filters + truncated-input + raw-roundtrip for §5.9.10; the
+  `CodedLossless` short-circuit + the `allow_intrabc` short-circuit
+  + full-path-levels-only + 3-plane chroma-level gating + mono
+  skip-plane-2/3 + delta-update walk with sparse updates for
+  §5.9.11; mono + 3-plane non-separate + 3-plane separate with
+  `diff_uv_delta = 1` + `using_qmatrix` with V-mirrors-U +
+  truncated-input for §5.9.12. Plus 3 new `BitReader::su(n)` tests
+  (positive / negative / minimum negative). Total bitreader tests
+  10 → 13, total crate tests 36 → 57.
+
 * **Round 4 — Frame-size sub-syntax block (§5.9.5–§5.9.9).** The
   `parse_frame_header()` parser is extended past `refresh_frame_flags`
   to consume the four §5.9 frame-size sub-syntaxes in spec order:

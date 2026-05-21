@@ -48,6 +48,31 @@
 //!     so inter-frame parsing still stops at `refresh_frame_flags`
 //!     with `frame_size = None`. See [`frame_header`].
 //!
+//!   * **Round 5.** Uncompressed-header tail sub-syntaxes — §5.9.10
+//!     `read_interpolation_filter()` (returns
+//!     [`InterpolationFilter`]), §5.9.11 `loop_filter_params()`
+//!     (returns [`LoopFilterParams`] with the `CodedLossless ||
+//!     allow_intrabc` short-circuit, the four `loop_filter_level[]`
+//!     fields with the `NumPlanes > 1 && (level[0] || level[1])`
+//!     gate on the chroma slots, the `f(3)` `loop_filter_sharpness`,
+//!     and the `loop_filter_delta_enabled / delta_update /
+//!     update_ref_delta[i] / update_mode_delta[i]` per-slot
+//!     update walk over `TOTAL_REFS_PER_FRAME = 8` ref-deltas + 2
+//!     mode-deltas with `su(7)` signed offsets), and §5.9.12
+//!     `quantization_params()` + §5.9.13 `read_delta_q()` (returns
+//!     [`QuantizationParams`] with `base_q_idx`, the four
+//!     `delta_q_y_dc / delta_q_u_dc / delta_q_u_ac / delta_q_v_dc /
+//!     delta_q_v_ac` per-plane offsets, `diff_uv_delta` /
+//!     `using_qmatrix` / `qm_y` / `qm_u` / `qm_v`). The three
+//!     sub-syntaxes are exposed as standalone parser entry points
+//!     ([`parse_interpolation_filter`], [`parse_loop_filter_params`],
+//!     [`parse_quantization_params`]) because the §5.9.2 tail isn't
+//!     yet streamable end-to-end — the intervening syntax
+//!     (`allow_intrabc`, `disable_frame_end_update_cdf`,
+//!     `tile_info()`, `segmentation_params()`, `delta_q_params()`,
+//!     `delta_lf_params()`) sits between round 4's stop point and
+//!     these calls. See [`uncompressed_header_tail`].
+//!
 //! Frame decoding past `compute_image_size()` (`allow_intrabc`,
 //! tile parsing, transform / quantisation, in-loop filters, film
 //! grain) is still out of scope. [`decode_av1`] / [`encode_av1`]
@@ -61,6 +86,7 @@ mod bitreader;
 pub mod frame_header;
 pub mod obu;
 pub mod sequence_header;
+pub mod uncompressed_header_tail;
 
 pub use frame_header::{
     parse_frame_header, FrameHeader, FrameSize, FrameType, NUM_REF_FRAMES, PRIMARY_REF_NONE,
@@ -70,6 +96,11 @@ pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
 pub use sequence_header::{
     parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
     SequenceHeader, TimingInfo,
+};
+pub use uncompressed_header_tail::{
+    parse_interpolation_filter, parse_loop_filter_params, parse_quantization_params,
+    InterpolationFilter, LoopFilterParams, QuantizationParams, LOOP_FILTER_MODE_DELTAS_DEFAULT,
+    LOOP_FILTER_REF_DELTAS_DEFAULT, TOTAL_REFS_PER_FRAME,
 };
 
 /// Crate-local error type.

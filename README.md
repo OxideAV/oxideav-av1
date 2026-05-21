@@ -2,9 +2,9 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-21
+## Status — 2026-05-22
 
-**Clean-room rebuild, round 4.** The crate's prior implementation was
+**Clean-room rebuild, round 5.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -80,6 +80,48 @@ Bitstream parsing currently covers:
   / `RefFrameHeight[]` / `RefRenderWidth[]` / `RefRenderHeight[]` —
   not yet tracked across calls).
 
+* **§5.9.10 / §5.9.11 / §5.9.12 / §5.9.13 — Uncompressed-header
+  tail sub-syntaxes (round 5).** Three standalone parser entry
+  points landed in a new `uncompressed_header_tail` module:
+  * `parse_interpolation_filter` (§5.9.10) — reads
+    `is_filter_switchable` + optional `f(2)` `interpolation_filter`,
+    returning a typed `InterpolationFilter` enum (`Eighttap` /
+    `EighttapSmooth` / `EighttapSharp` / `Bilinear` / `Switchable`)
+    per §6.8.9.
+  * `parse_loop_filter_params` (§5.9.11) — honours the
+    `CodedLossless || allow_intrabc` short-circuit (no bits read,
+    `loop_filter_ref_deltas` reset to the spec's literal defaults
+    `INTRA = 1`, `LAST/LAST2/LAST3/BWDREF = 0`, `GOLDEN/ALTREF2/
+    ALTREF = -1`), then for the full path reads the four
+    `loop_filter_level[]` slots (with the `NumPlanes > 1 &&
+    (level[0] || level[1])` gate on the chroma pair), the `f(3)`
+    `loop_filter_sharpness`, and the `loop_filter_delta_enabled /
+    delta_update / update_ref_delta[i] / update_mode_delta[i]`
+    per-slot update walk over `TOTAL_REFS_PER_FRAME = 8`
+    ref-deltas + 2 mode-deltas with `su(7)` signed offsets.
+  * `parse_quantization_params` (§5.9.12 + §5.9.13) — reads
+    `base_q_idx` (`f(8)`), the four `delta_q_*` per-plane offsets
+    via `read_delta_q()` (each a `delta_coded` gate followed by a
+    `su(7)` signed offset), the `diff_uv_delta` /
+    `separate_uv_delta_q` chroma-coupling logic that mirrors V to
+    U when `diff_uv_delta == 0`, and the `using_qmatrix` / `qm_y` /
+    `qm_u` / `qm_v` quantizer-matrix selection.
+  These three calls are **not** wired into the streaming
+  `parse_frame_header` walk yet — the intervening §5.9.2 syntax
+  (`allow_intrabc`, `disable_frame_end_update_cdf`, `tile_info()`,
+  `segmentation_params()`, `delta_q_params()`, `delta_lf_params()`)
+  sits between round 4's stop point and these calls. The next
+  round can stitch them in as the intervening syntaxes land.
+
+  New types: `InterpolationFilter`, `LoopFilterParams`,
+  `QuantizationParams`. New constant: `TOTAL_REFS_PER_FRAME = 8`.
+  New bitreader primitive: `BitReader::su(n)` (§4.10.6). 21 new
+  unit tests cover all three sub-syntaxes (switchable +
+  non-switchable interpolation, short-circuit + full-path
+  loop_filter with mono/3-plane gating + delta update walk,
+  mono/3-plane quantization with and without `separate_uv_delta_q`
+  and with/without `using_qmatrix`) and `su(7)` boundary values.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -134,6 +176,12 @@ filters, film grain) is **not yet implemented**. `decode_av1` and
     `found_ref == 0` branch only), §5.9.8 (`superres_params`),
     §5.9.9 (`compute_image_size`), §6.8.4 / §6.8.5 / §6.8.6 /
     §6.8.7 / §6.8.8 (semantics).
+  * Round 5: §3 (constants — `TOTAL_REFS_PER_FRAME`,
+    `INTRA_FRAME`, `LAST_FRAME`, `GOLDEN_FRAME`, `BWDREF_FRAME`,
+    `ALTREF_FRAME`, `ALTREF2_FRAME`), §4.10.6 (`su(n)`), §5.9.10
+    (`read_interpolation_filter`), §5.9.11 (`loop_filter_params`),
+    §5.9.12 (`quantization_params`), §5.9.13 (`read_delta_q`),
+    §6.8.9 / §6.8.10 / §6.8.11 / §6.8.12 (semantics).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
