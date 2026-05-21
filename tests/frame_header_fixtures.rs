@@ -29,7 +29,7 @@
 //! post-override value; the raw bit is preserved as documentation
 //! only.
 
-use oxideav_av1::{parse_frame_header, parse_sequence_header, FrameType};
+use oxideav_av1::{parse_frame_header, parse_sequence_header, FrameType, SUPERRES_NUM};
 
 #[derive(Debug)]
 struct Expected {
@@ -48,6 +48,25 @@ struct Expected {
     order_hint: u32,
     primary_ref_frame: u8,
     refresh_frame_flags: u8,
+    /// `w=` column from the `FRAME_HEADER` trace line.
+    ///
+    /// Per `docs/video/av1/av1-fixtures-and-traces.md` §"`FRAME_HEADER`"
+    /// this is `frame_width_minus_1 + 1` — i.e. the coded
+    /// **pre-superres** width that §5.9.8 then assigns to
+    /// `UpscaledWidth` before downscaling to the
+    /// session-FrameWidth. The asserted value below is
+    /// [`FrameSize::upscaled_width`].
+    trace_w: u32,
+    /// `h=` column from the `FRAME_HEADER` trace line —
+    /// `frame_height_minus_1 + 1`. Super-resolution is horizontal
+    /// only so this equals [`FrameSize::frame_height`].
+    trace_h: u32,
+    /// `use_superres` column.
+    use_superres: bool,
+    /// `coded_denom` column. The implied `SuperresDenom` is
+    /// `coded_denom + 9` when `use_superres == 1`, otherwise
+    /// `SUPERRES_NUM = 8`.
+    coded_denom: u8,
 }
 
 struct Fixture {
@@ -77,6 +96,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: false, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 16, trace_h: 16, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -92,6 +112,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -107,6 +128,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -122,6 +144,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -137,6 +160,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -152,6 +176,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: false, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -167,6 +192,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -182,6 +208,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -197,6 +224,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 128, trace_h: 64, use_superres: true, coded_denom: 3,
         },
     },
     Fixture {
@@ -212,6 +240,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 256, trace_h: 128, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -227,6 +256,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -242,6 +272,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: false, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 128, trace_h: 128, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -257,6 +288,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 256, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -273,6 +305,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: false, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -288,6 +321,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
     Fixture {
@@ -303,6 +337,7 @@ const FIXTURES: &[Fixture] = &[
             error_resilient_mode: true, disable_cdf_update: false,
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
+            trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
         },
     },
 ];
@@ -340,6 +375,76 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
         check!(order_hint);
         check!(primary_ref_frame);
         check!(refresh_frame_flags);
+
+        // Round 4: every fixture's first frame is intra so
+        // `frame_size` is `Some`. Each trace's `w=` column is the
+        // pre-superres width (i.e. `UpscaledWidth`); `h=` is the
+        // height as-is. For the `super-resolution` fixture the
+        // post-superres `FrameWidth` is `(128*8 + 6) / 12 = 85` and
+        // `MiCols = 2 * ((85+7) >> 3) = 22`; every other fixture's
+        // `FrameWidth` equals `UpscaledWidth`.
+        let fs = fh
+            .frame_size
+            .unwrap_or_else(|| panic!("fixture {}: expected frame_size = Some(..)", fx.name));
+        if fs.upscaled_width != fx.expected.trace_w {
+            mismatches.push(format!(
+                "{}: upscaled_width expected {} (trace w) got {}",
+                fx.name, fx.expected.trace_w, fs.upscaled_width,
+            ));
+        }
+        if fs.frame_height != fx.expected.trace_h {
+            mismatches.push(format!(
+                "{}: frame_height expected {} (trace h) got {}",
+                fx.name, fx.expected.trace_h, fs.frame_height,
+            ));
+        }
+        if fs.use_superres != fx.expected.use_superres {
+            mismatches.push(format!(
+                "{}: use_superres expected {} got {}",
+                fx.name, fx.expected.use_superres, fs.use_superres,
+            ));
+        }
+        if fs.coded_denom != fx.expected.coded_denom {
+            mismatches.push(format!(
+                "{}: coded_denom expected {} got {}",
+                fx.name, fx.expected.coded_denom, fs.coded_denom,
+            ));
+        }
+        let expected_superres_denom = if fx.expected.use_superres {
+            u32::from(fx.expected.coded_denom) + 9
+        } else {
+            SUPERRES_NUM
+        };
+        if fs.superres_denom != expected_superres_denom {
+            mismatches.push(format!(
+                "{}: superres_denom expected {} got {}",
+                fx.name, expected_superres_denom, fs.superres_denom,
+            ));
+        }
+        let expected_frame_width = (fx.expected.trace_w * SUPERRES_NUM
+            + expected_superres_denom / 2)
+            / expected_superres_denom;
+        if fs.frame_width != expected_frame_width {
+            mismatches.push(format!(
+                "{}: frame_width (post-superres) expected {} got {}",
+                fx.name, expected_frame_width, fs.frame_width,
+            ));
+        }
+        let expected_mi_cols = 2 * ((expected_frame_width + 7) >> 3);
+        let expected_mi_rows = 2 * ((fx.expected.trace_h + 7) >> 3);
+        if fs.mi_cols != expected_mi_cols {
+            mismatches.push(format!(
+                "{}: mi_cols expected {} got {}",
+                fx.name, expected_mi_cols, fs.mi_cols,
+            ));
+        }
+        if fs.mi_rows != expected_mi_rows {
+            mismatches.push(format!(
+                "{}: mi_rows expected {} got {}",
+                fx.name, expected_mi_rows, fs.mi_rows,
+            ));
+        }
+
         if !mismatches.is_empty() {
             panic!(
                 "fixture {} mismatched fields:\n  {}",

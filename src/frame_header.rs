@@ -1,19 +1,30 @@
-//! Frame header OBU parser — initial structural slice (§5.9.2 prefix).
+//! Frame header OBU parser — `uncompressed_header()` through
+//! `compute_image_size()` (§5.9.2 leading slice + §5.9.5–§5.9.9).
 //!
-//! This round consumes the leading fields of `uncompressed_header()`
-//! per §5.9.2 of the AV1 Bitstream & Decoding Process Specification
-//! and returns a strongly typed [`FrameHeader`]. The slice covered is
-//! everything from the start of `uncompressed_header()` through
-//! `refresh_frame_flags` inclusive. The downstream blocks
-//! (`frame_size()`, `read_interpolation_filter()`, `tile_info()`,
-//! `quantization_params()`, …) are out of scope for this round.
+//! Round 3 covered everything in `uncompressed_header()` through
+//! `refresh_frame_flags`. Round 4 (this round) extends the parser
+//! past `refresh_frame_flags` by composing the four frame-size
+//! sub-syntaxes from §5.9.5 / §5.9.6 / §5.9.7 / §5.9.8 plus the
+//! §5.9.9 `compute_image_size()` derivation. The downstream blocks
+//! (`read_interpolation_filter()`, `tile_info()`,
+//! `quantization_params()`, …) remain out of scope.
 //!
 //! ## Syntax / semantics references (all in `docs/video/av1/`)
 //!
 //!   * §5.9.1 — General frame header OBU syntax
 //!   * §5.9.2 — Uncompressed header syntax
+//!   * §5.9.5 — `frame_size()`
+//!   * §5.9.6 — `render_size()`
+//!   * §5.9.7 — `frame_size_with_refs()`
+//!   * §5.9.8 — `superres_params()`
+//!   * §5.9.9 — `compute_image_size()`
 //!   * §6.8.1 — General frame header OBU semantics
 //!   * §6.8.2 — Uncompressed header semantics
+//!   * §6.8.4 — Frame size semantics
+//!   * §6.8.5 — Render size semantics
+//!   * §6.8.6 — Frame size with refs semantics
+//!   * §6.8.7 — Superres params semantics
+//!   * §6.8.8 — Compute image size semantics
 //!
 //! §3 constants used here:
 //!
@@ -21,6 +32,11 @@
 //!     spec derives `allFrames = (1 << NUM_REF_FRAMES) - 1 = 0xff`.
 //!   * `PRIMARY_REF_NONE = 7` — sentinel for `primary_ref_frame`
 //!     indicating no primary reference (loaded as default state).
+//!   * `SUPERRES_NUM = 8` — numerator for the superres ratio.
+//!   * `SUPERRES_DENOM_MIN = 9` — smallest denominator (with
+//!     `coded_denom` defaulting to 0 ⇒ denom = 9).
+//!   * `SUPERRES_DENOM_BITS = 3` — bit width of the `coded_denom`
+//!     field when `use_superres == 1`.
 //!
 //! Composition with §5.5: the parser takes a borrowed
 //! [`SequenceHeader`] from round 2; sequence-header state controls
@@ -44,13 +60,32 @@
 //!     parser returns [`Error::TemporalPointInfoUnsupported`] if it
 //!     would actually need to descend into it — i.e. when both gate
 //!     conditions are true. The next round can land §5.9.31 alongside
-//!     the rest of `frame_size()` / `tile_info()`.
+//!     the rest of `tile_info()`.
 //!   * `mark_ref_frames()` (§7.20) — a derivation that updates
 //!     `RefValid` / `RefOrderHint`; deferred to the inter-frame round
 //!     that introduces ref-frame state.
-//!   * `frame_size()` / `render_size()` / `frame_size_with_refs()` /
-//!     `superres_params()` / the inter / intra-only post-block. The
-//!     parser stops once `refresh_frame_flags` has been read.
+//!   * `frame_size_with_refs()` for INTER frames (§5.9.7) — the
+//!     `found_ref` branch reads `UpscaledWidth` / `FrameWidth` /
+//!     `FrameHeight` / `RenderWidth` / `RenderHeight` from the
+//!     reference-frame state arrays (`RefUpscaledWidth[]` /
+//!     `RefFrameHeight[]` / `RefRenderWidth[]` / `RefRenderHeight[]`)
+//!     that are not yet tracked across calls in this round.
+//!     [`FrameHeader::frame_size`] is `None` for inter frames whose
+//!     `frame_size_with_refs()` path would have been taken; the
+//!     parser stops at `refresh_frame_flags`. Intra (`KEY_FRAME` /
+//!     `INTRA_ONLY_FRAME`) frames go through the no-ref-state
+//!     `frame_size()` + `render_size()` path so they parse all the
+//!     way to `compute_image_size()`. Inter frames that would have
+//!     taken the `frame_size()`+`render_size()` branch (because
+//!     `frame_size_override_flag == 0` or `error_resilient_mode ==
+//!     1`) still bail out early this round because the parser also
+//!     hasn't implemented the inter-frame `ref_frame_idx[]` /
+//!     `delta_frame_id_minus_1` walk between `refresh_frame_flags`
+//!     and the size block.
+//!   * `allow_intrabc` and everything past it — the spec's
+//!     `if (allow_screen_content_tools && UpscaledWidth == FrameWidth)`
+//!     intrabc bit and `read_interpolation_filter()` / `tile_info()` /
+//!     etc. are next round's work.
 //!
 //! The bit count consumed is returned in [`FrameHeader::bits_consumed`]
 //! so the next round can continue at exactly the right bit.
@@ -73,6 +108,18 @@ pub const PRIMARY_REF_NONE: u8 = 7;
 
 /// `allFrames = (1 << NUM_REF_FRAMES) - 1` from §5.9.2.
 const ALL_FRAMES: u8 = 0xff;
+
+/// `SUPERRES_NUM` (§3): numerator for the super-resolution upscaling
+/// ratio.
+pub const SUPERRES_NUM: u32 = 8;
+
+/// `SUPERRES_DENOM_MIN` (§3): smallest denominator for the
+/// super-resolution upscaling ratio.
+pub const SUPERRES_DENOM_MIN: u32 = 9;
+
+/// `SUPERRES_DENOM_BITS` (§3): bit width of the `coded_denom` field
+/// when `use_superres == 1` (§5.9.8).
+pub const SUPERRES_DENOM_BITS: u32 = 3;
 
 // ---------------------------------------------------------------------
 // FrameType (§6.8.2)
@@ -119,6 +166,82 @@ impl FrameType {
     /// KEY_FRAME)` per §5.9.2.
     pub fn is_intra(&self) -> bool {
         matches!(self, Self::Key | Self::IntraOnly)
+    }
+}
+
+// ---------------------------------------------------------------------
+// FrameSize (§5.9.5–§5.9.9)
+// ---------------------------------------------------------------------
+
+/// Result of the §5.9.5–§5.9.9 frame-size sub-syntax block.
+///
+/// All four sub-syntaxes (`frame_size()`, `render_size()`,
+/// `superres_params()`, `compute_image_size()`) produce a single
+/// coherent description of the frame's dimensions; this struct
+/// surfaces them together rather than scattering them across
+/// optional [`FrameHeader`] fields.
+///
+/// The §5.9.7 `frame_size_with_refs()` `found_ref == 1` branch
+/// short-circuits `frame_size()` + `render_size()` and instead reads
+/// `UpscaledWidth` / `FrameWidth` / `FrameHeight` / `RenderWidth` /
+/// `RenderHeight` directly from the reference-frame state arrays
+/// before calling `superres_params()` + `compute_image_size()`. This
+/// round does not track that state, so [`FrameHeader::frame_size`]
+/// is `None` whenever the parser would have entered that branch (see
+/// the module-level note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSize {
+    /// `FrameWidth` per §5.9.5 — the **post-superres** coded width,
+    /// in pixels. For super-resolved frames this is the downscaled
+    /// width that the rest of the decoder works on; the original
+    /// (pre-downscale) width is [`Self::upscaled_width`].
+    pub frame_width: u32,
+    /// `FrameHeight` per §5.9.5. Super-resolution is horizontal only,
+    /// so this equals the height as written in the bitstream / the
+    /// sequence header's `max_frame_height_minus_1 + 1`.
+    pub frame_height: u32,
+    /// `RenderWidth` per §5.9.6 — the intended display width. When
+    /// `render_and_frame_size_different == 0` this equals
+    /// [`Self::upscaled_width`].
+    pub render_width: u32,
+    /// `RenderHeight` per §5.9.6 — the intended display height. When
+    /// `render_and_frame_size_different == 0` this equals
+    /// [`Self::frame_height`].
+    pub render_height: u32,
+    /// `SuperresDenom` per §5.9.8 — equals [`SUPERRES_NUM`] when
+    /// `use_superres == 0`, otherwise `coded_denom +
+    /// SUPERRES_DENOM_MIN`. The valid range is
+    /// `SUPERRES_DENOM_MIN..=SUPERRES_DENOM_MIN + (1 <<
+    /// SUPERRES_DENOM_BITS) - 1` (i.e. 9..=16).
+    pub superres_denom: u32,
+    /// `UpscaledWidth` per §5.9.8 — the width *before* superres
+    /// downscaling. Equal to [`Self::frame_width`] when super-res is
+    /// not used.
+    pub upscaled_width: u32,
+    /// `MiCols` per §5.9.9 — the §3 `MI_SIZE = 4` block grid column
+    /// count: `2 * ((FrameWidth + 7) >> 3)`.
+    pub mi_cols: u32,
+    /// `MiRows` per §5.9.9 — the §3 `MI_SIZE = 4` block grid row
+    /// count: `2 * ((FrameHeight + 7) >> 3)`.
+    pub mi_rows: u32,
+    /// `use_superres` per §5.9.8 — `true` when `coded_denom` was read
+    /// from the bitstream.
+    pub use_superres: bool,
+    /// `coded_denom` per §5.9.8 — the raw `f(SUPERRES_DENOM_BITS)`
+    /// value, or `0` when `use_superres == 0` (the implicit default
+    /// the spec uses to derive `SuperresDenom = SUPERRES_NUM`).
+    pub coded_denom: u8,
+    /// `render_and_frame_size_different` per §5.9.6.
+    pub render_and_frame_size_different: bool,
+}
+
+impl FrameSize {
+    /// Convenience: did `use_superres == 1` and did the superres
+    /// downscale actually change `FrameWidth` away from
+    /// `UpscaledWidth`? `super_resolution` fixture: yes;
+    /// `tiny-i-only-16x16-prof0`: no (`use_superres == 0`).
+    pub fn is_super_resolved(&self) -> bool {
+        self.use_superres && self.frame_width != self.upscaled_width
     }
 }
 
@@ -190,9 +313,27 @@ pub struct FrameHeader {
     /// `(KEY_FRAME && show_frame)`; `0` when show-existing-frame
     /// replays a non-KEY frame; otherwise read.
     pub refresh_frame_flags: u8,
+    /// `frame_size()` (§5.9.5) + `render_size()` (§5.9.6) +
+    /// `superres_params()` (§5.9.8) + `compute_image_size()`
+    /// (§5.9.9) result.
+    ///
+    /// `None` when:
+    ///
+    ///   * `show_existing_frame == 1` — §5.9.2 returns immediately
+    ///     after the replay block; there is no frame-size syntax.
+    ///   * the frame is INTER (would have entered
+    ///     `frame_size_with_refs()` or the inter-frame ref-walk
+    ///     before `frame_size()`) — the parser doesn't yet track
+    ///     `RefUpscaledWidth[]` / `RefFrameHeight[]` /
+    ///     `RefRenderWidth[]` / `RefRenderHeight[]` across calls.
+    ///
+    /// `Some(FrameSize)` for every intra (`KEY_FRAME` /
+    /// `INTRA_ONLY_FRAME`) frame.
+    pub frame_size: Option<FrameSize>,
     /// Total bits consumed from `payload` by this parse. The next
-    /// round will continue from this position to decode `frame_size()`
-    /// / `render_size()` / `tile_info()` / etc.
+    /// round will continue from this position to decode
+    /// `allow_intrabc` (intra path) or the inter-frame
+    /// `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
 
@@ -227,6 +368,11 @@ pub struct FrameHeader {
 ///     hitting this path; bitstreams that enable a decoder model
 ///     plus variable picture interval will be picked up in a future
 ///     round alongside §5.9.31.
+///   * [`Error::RefOrderHintWalkUnsupported`] — the §5.9.2
+///     `if (!FrameIsIntra || refresh_frame_flags != allFrames) {
+///     if (error_resilient_mode && enable_order_hint) { ... } }`
+///     ref_order_hint walk requires a `RefOrderHint[]` /
+///     `RefValid[]` session state that isn't tracked yet.
 ///   * [`Error::InvalidIdLen`] — §6.8.2 conformance:
 ///     `idLen <= 16` (the constraint stated alongside
 ///     `display_frame_id`); we surface the violation here rather than
@@ -283,6 +429,13 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         // decoder_model_info_present_flag is forced off too in §5.5.1
         // for the reduced path, so no temporal-point-info read.
         // refresh_frame_flags: (KEY && show_frame) so allFrames.
+        // Reduced-still is always an intra frame, so the §5.9.2
+        // `if (!FrameIsIntra || refresh_frame_flags != allFrames)`
+        // ref_order_hint block is skipped (`!true || (allFrames !=
+        // allFrames)` = `false || false`), and we drop directly into
+        // the `if (FrameIsIntra) { frame_size(); render_size(); }`
+        // branch.
+        let frame_size = parse_frame_size_block(br, seq, false)?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -300,6 +453,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             order_hint: 0,
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: ALL_FRAMES,
+            frame_size: Some(frame_size),
             bits_consumed: br.position(),
         });
     }
@@ -347,6 +501,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             order_hint: 0,
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: 0,
+            frame_size: None,
             bits_consumed: br.position(),
         });
     }
@@ -432,6 +587,43 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         br.f(8)? as u8
     };
 
+    // §5.9.2: `if ( !FrameIsIntra || refresh_frame_flags != allFrames )`
+    // — the ref_order_hint block only fires when the frame is inter
+    // OR when an intra frame leaves some ref slots intact. For an
+    // intra frame the inner gate further requires
+    // `error_resilient_mode && enable_order_hint`. Every fixture's
+    // intra frame in the corpus has `refresh_frame_flags == 0xff`
+    // (which is `allFrames`), so the block is skipped in practice
+    // and we don't have to model the `ref_order_hint[i] !=
+    // RefOrderHint[i] => RefValid[i] = 0` derivation yet. We refuse
+    // to descend into a path we haven't modelled.
+    if (!frame_is_intra || refresh_frame_flags != ALL_FRAMES)
+        && error_resilient_mode
+        && seq.enable_order_hint
+    {
+        // Reading NUM_REF_FRAMES * order_hint_bits bits without
+        // tracking the resulting RefValid[] / RefOrderHint[] updates
+        // would lose information needed by later round's inter-frame
+        // reference resolution. Surface as an unsupported path until
+        // ref-frame state lands.
+        return Err(Error::RefOrderHintWalkUnsupported);
+    }
+
+    // §5.9.2: the size block. For intra frames we always go through
+    // frame_size() + render_size() (and the no-superres / non-ref
+    // path is exactly what `parse_frame_size_block` handles). For
+    // inter frames the spec walks `frame_refs_short_signaling`,
+    // `ref_frame_idx[]`, and then conditionally calls
+    // `frame_size_with_refs()` or `frame_size()`+`render_size()` —
+    // none of which can be modelled without the ref-frame state.
+    // Return early with `frame_size: None` and stop bit accounting
+    // at `refresh_frame_flags`.
+    let frame_size = if frame_is_intra {
+        Some(parse_frame_size_block(br, seq, frame_size_override_flag)?)
+    } else {
+        None
+    };
+
     Ok(FrameHeader {
         show_existing_frame: false,
         frame_to_show_map_idx: None,
@@ -449,7 +641,112 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         order_hint,
         primary_ref_frame,
         refresh_frame_flags,
+        frame_size,
         bits_consumed: br.position(),
+    })
+}
+
+/// Read `frame_size()` + `render_size()` + `superres_params()` +
+/// `compute_image_size()` in spec order (§5.9.5, §5.9.6, §5.9.8,
+/// §5.9.9), returning the combined [`FrameSize`].
+///
+/// `frame_size_override_flag` is passed in because the §5.9.5
+/// `if (frame_size_override_flag)` gate selects between reading
+/// `frame_width_minus_1` / `frame_height_minus_1` (with bit widths
+/// from §5.5.1's `frame_width_bits_minus_1` /
+/// `frame_height_bits_minus_1`) and using the sequence header's
+/// `max_frame_width_minus_1 + 1` / `max_frame_height_minus_1 + 1`.
+///
+/// The §5.9.7 `frame_size_with_refs()` `found_ref == 1` shortcut is
+/// **not** handled here — callers that would have descended into
+/// `frame_size_with_refs()` should return `FrameHeader::frame_size =
+/// None` and stop bit accounting at `refresh_frame_flags`.
+fn parse_frame_size_block(
+    br: &mut BitReader<'_>,
+    seq: &SequenceHeader,
+    frame_size_override_flag: bool,
+) -> Result<FrameSize, Error> {
+    // §5.9.5 frame_size().
+    let (frame_width_initial, frame_height) = if frame_size_override_flag {
+        let n_w = u32::from(seq.frame_width_bits_minus_1) + 1;
+        let frame_width_minus_1 = br.f(n_w)? as u32;
+        let n_h = u32::from(seq.frame_height_bits_minus_1) + 1;
+        let frame_height_minus_1 = br.f(n_h)? as u32;
+        (frame_width_minus_1 + 1, frame_height_minus_1 + 1)
+    } else {
+        (
+            seq.max_frame_width_minus_1 + 1,
+            seq.max_frame_height_minus_1 + 1,
+        )
+    };
+
+    // §5.9.5 calls superres_params() (§5.9.8) **before**
+    // compute_image_size(), but in §5.9.2's `if (FrameIsIntra)` path
+    // it's `frame_size(); render_size();` — i.e. frame_size() itself
+    // includes both superres_params() and compute_image_size(), and
+    // render_size() runs after compute_image_size(). The order is
+    // therefore:
+    //
+    //   1. §5.9.5 frame_size: optionally read frame_width/height
+    //   2. §5.9.8 superres_params: read use_superres + coded_denom,
+    //      shuffle UpscaledWidth / FrameWidth.
+    //   3. §5.9.9 compute_image_size: derive MiCols / MiRows from
+    //      the post-superres FrameWidth.
+    //   4. §5.9.6 render_size: read render_and_frame_size_different
+    //      + optionally render_width_minus_1 / render_height_minus_1.
+    //
+    // The §5.9.6 default-RenderWidth uses UpscaledWidth (the
+    // pre-downscale width), which is why superres_params has to
+    // settle UpscaledWidth before render_size.
+
+    // §5.9.8 superres_params().
+    let (use_superres, coded_denom, superres_denom) = if seq.enable_superres {
+        let use_superres = br.f(1)? == 1;
+        if use_superres {
+            let coded_denom = br.f(SUPERRES_DENOM_BITS)? as u8;
+            (
+                true,
+                coded_denom,
+                u32::from(coded_denom) + SUPERRES_DENOM_MIN,
+            )
+        } else {
+            (false, 0u8, SUPERRES_NUM)
+        }
+    } else {
+        // `use_superres = 0` is inferred when enable_superres is off.
+        (false, 0u8, SUPERRES_NUM)
+    };
+    let upscaled_width = frame_width_initial;
+    // FrameWidth = (UpscaledWidth * SUPERRES_NUM + (SuperresDenom /
+    // 2)) / SuperresDenom — rounded-half-up integer divide.
+    let frame_width = (upscaled_width * SUPERRES_NUM + (superres_denom / 2)) / superres_denom;
+
+    // §5.9.9 compute_image_size().
+    let mi_cols = 2 * ((frame_width + 7) >> 3);
+    let mi_rows = 2 * ((frame_height + 7) >> 3);
+
+    // §5.9.6 render_size().
+    let render_and_frame_size_different = br.f(1)? == 1;
+    let (render_width, render_height) = if render_and_frame_size_different {
+        let rw = (br.f(16)? as u32) + 1;
+        let rh = (br.f(16)? as u32) + 1;
+        (rw, rh)
+    } else {
+        (upscaled_width, frame_height)
+    };
+
+    Ok(FrameSize {
+        frame_width,
+        frame_height,
+        render_width,
+        render_height,
+        superres_denom,
+        upscaled_width,
+        mi_cols,
+        mi_rows,
+        use_superres,
+        coded_denom,
+        render_and_frame_size_different,
     })
 }
 
@@ -580,8 +877,27 @@ mod tests {
         //   frame_size_override_flag(1) order_hint(7)
         //   [primary_ref_frame derived: FrameIsIntra]
         //   [refresh_frame_flags derived: KEY && show_frame]
-        // = 14 bits.
-        assert_eq!(fh.bits_consumed, 14);
+        // = 14 bits. Round 4 then continues into §5.9.5–§5.9.9:
+        //   [frame_size_override=0 ⇒ no n_w / n_h reads]
+        //   [enable_superres=0 ⇒ no use_superres / coded_denom reads]
+        //   render_and_frame_size_different(1)=0
+        //   [render_width / render_height not read]
+        // = +1 bit ⇒ 15 bits total.
+        assert_eq!(fh.bits_consumed, 15);
+        let fs = fh.frame_size.expect("intra frame produces frame_size");
+        assert_eq!(fs.frame_width, 16);
+        assert_eq!(fs.frame_height, 16);
+        assert_eq!(fs.upscaled_width, 16);
+        assert_eq!(fs.render_width, 16);
+        assert_eq!(fs.render_height, 16);
+        assert_eq!(fs.superres_denom, SUPERRES_NUM);
+        // MiCols = 2 * ((16 + 7) >> 3) = 2 * (23 >> 3) = 2 * 2 = 4.
+        assert_eq!(fs.mi_cols, 4);
+        assert_eq!(fs.mi_rows, 4);
+        assert!(!fs.use_superres);
+        assert_eq!(fs.coded_denom, 0);
+        assert!(!fs.render_and_frame_size_different);
+        assert!(!fs.is_super_resolved());
     }
 
     // -------------------------------------------------------------
@@ -616,6 +932,19 @@ mod tests {
         assert_eq!(fh.order_hint, 0);
         assert_eq!(fh.primary_ref_frame, PRIMARY_REF_NONE);
         assert_eq!(fh.refresh_frame_flags, 0xff);
+        // 64x64 still picture, enable_superres=0, no override (trace
+        // `w=64`), no render-size difference.
+        let fs = fh.frame_size.expect("intra frame produces frame_size");
+        assert_eq!(fs.frame_width, 64);
+        assert_eq!(fs.frame_height, 64);
+        assert_eq!(fs.upscaled_width, 64);
+        assert_eq!(fs.render_width, 64);
+        assert_eq!(fs.render_height, 64);
+        assert_eq!(fs.superres_denom, SUPERRES_NUM);
+        // MiCols = 2 * ((64 + 7) >> 3) = 2 * 8 = 16.
+        assert_eq!(fs.mi_cols, 16);
+        assert_eq!(fs.mi_rows, 16);
+        assert!(!fs.use_superres);
     }
 
     // -------------------------------------------------------------
@@ -646,18 +975,23 @@ mod tests {
 
     #[test]
     fn reduced_still_picture_path() {
-        // Use the screen-content-tools SEQ (which is reduced-still).
+        // Use the screen-content-tools SEQ (which is reduced-still,
+        // 256x128, enable_superres=0).
         let seq = screen_content_seq();
         assert!(seq.reduced_still_picture_header);
         assert_eq!(
             seq.seq_force_screen_content_tools, SELECT_SCREEN_CONTENT_TOOLS,
             "reduced still forces SELECT"
         );
+        assert!(!seq.enable_superres);
         // Bits we need to consume:
         //   disable_cdf_update(1)=0
         //   allow_screen_content_tools(1)=1     [seq force is SELECT]
         //   force_integer_mv(1)=0               [seq force is SELECT]
-        // = 3 bits = 0b010 = 0100_0000 = 0x40.
+        //   [frame_size_override=0 derived; no n_w/n_h reads]
+        //   [enable_superres=0; no use_superres/coded_denom reads]
+        //   render_and_frame_size_different(1)=0
+        // = 4 bits. 0b0100 = 0100_0000 = 0x40.
         let payload = [0x40u8];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert_eq!(fh.frame_type, FrameType::Key);
@@ -672,7 +1006,19 @@ mod tests {
         assert!(fh.force_integer_mv);
         assert_eq!(fh.refresh_frame_flags, 0xff);
         assert_eq!(fh.primary_ref_frame, PRIMARY_REF_NONE);
-        assert_eq!(fh.bits_consumed, 3);
+        assert_eq!(fh.bits_consumed, 4);
+        let fs = fh.frame_size.expect("reduced-still produces frame_size");
+        assert_eq!(fs.frame_width, 256);
+        assert_eq!(fs.frame_height, 128);
+        assert_eq!(fs.upscaled_width, 256);
+        // MiCols = 2 * ((256+7) >> 3) = 2 * 32 = 64.
+        assert_eq!(fs.mi_cols, 64);
+        // MiRows = 2 * ((128+7) >> 3) = 2 * 16 = 32.
+        assert_eq!(fs.mi_rows, 32);
+        assert!(!fs.use_superres);
+        assert!(!fs.render_and_frame_size_different);
+        assert_eq!(fs.render_width, 256);
+        assert_eq!(fs.render_height, 128);
     }
 
     // -------------------------------------------------------------
@@ -682,13 +1028,189 @@ mod tests {
     #[test]
     fn reduced_still_without_select_force_int_mv() {
         // super_resolution fixture is reduced-still with allow_scc
-        // path through SELECT. Same shape as screen-content above.
+        // path through SELECT. Same shape as screen-content above
+        // but with enable_superres=1 (so superres_params reads one
+        // more bit).
         let seq = super_resolution_seq();
         assert!(seq.reduced_still_picture_header);
-        let payload = [0x40u8]; // disable_cdf=0, allow_scc=1, force_int_mv=0
+        assert!(seq.enable_superres);
+        // disable_cdf=0, allow_scc=1, force_int_mv=0, use_superres=0,
+        // render_and_frame_size_different=0 = 5 bits = 0b01000 ⇒
+        // 0100_0000 = 0x40.
+        let payload = [0x40u8];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert!(fh.allow_screen_content_tools);
         assert!(fh.force_integer_mv);
+        let fs = fh.frame_size.expect("reduced-still produces frame_size");
+        // super_resolution_seq has max_w=128 max_h=64. With
+        // use_superres=0 in this synthetic, SuperresDenom = SUPERRES_NUM
+        // and FrameWidth = UpscaledWidth = 128.
+        assert_eq!(fs.frame_width, 128);
+        assert_eq!(fs.upscaled_width, 128);
+        assert_eq!(fs.frame_height, 64);
+        assert!(!fs.use_superres);
+        assert_eq!(fs.superres_denom, SUPERRES_NUM);
+        assert_eq!(fh.bits_consumed, 5);
+    }
+
+    // -------------------------------------------------------------
+    // Synthetic: reduced-still with use_superres = 1 and a non-zero
+    // coded_denom. Exercises the §5.9.8 read + the downscale math.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn reduced_still_with_use_superres() {
+        // super_resolution_seq: max_w=128, max_h=64, enable_superres=1.
+        // Bits (reduced-still + KEY+show_frame path):
+        //   bit 0 = 0 (disable_cdf_update)
+        //   bit 1 = 1 (allow_screen_content_tools; seq force = SELECT)
+        //   bit 2 = 0 (force_integer_mv raw; FrameIsIntra ⇒ 1)
+        //   [frame_size_override = 0 derived]
+        //   bit 3 = 1 (use_superres)
+        //   bits 4..6 = coded_denom(3) MSB-first = 011 (= 3 ⇒
+        //                                       SuperresDenom = 12)
+        //   bit 7 = 0 (render_and_frame_size_different)
+        // = 8 bits = 0101_0110 = 0x56.
+        let payload = [0x56u8];
+        let seq = super_resolution_seq();
+        let fh = parse_frame_header(&payload, &seq).expect("decodes");
+        assert_eq!(fh.bits_consumed, 8);
+        let fs = fh.frame_size.expect("reduced-still produces frame_size");
+        assert!(fs.use_superres);
+        assert_eq!(fs.coded_denom, 3);
+        assert_eq!(fs.superres_denom, 12);
+        assert_eq!(fs.upscaled_width, 128);
+        // FrameWidth = (128 * 8 + 12/2) / 12 = (1024 + 6) / 12 = 1030/12 = 85.
+        assert_eq!(fs.frame_width, 85);
+        assert_eq!(fs.frame_height, 64);
+        // MiCols = 2 * ((85+7) >> 3) = 2 * (92 >> 3) = 2 * 11 = 22.
+        assert_eq!(fs.mi_cols, 22);
+        // MiRows = 2 * ((64+7) >> 3) = 2 * 8 = 16.
+        assert_eq!(fs.mi_rows, 16);
+        // §5.9.6 default: RenderWidth = UpscaledWidth (the pre-downscale
+        // width), RenderHeight = FrameHeight.
+        assert_eq!(fs.render_width, 128);
+        assert_eq!(fs.render_height, 64);
+        assert!(fs.is_super_resolved());
+    }
+
+    // -------------------------------------------------------------
+    // Synthetic: render_size with explicit different render dims.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn explicit_render_and_frame_size_different() {
+        // tiny_seq: 16x16, no superres. Bits to write (KEY +
+        // show_frame=1 path):
+        //   show_existing(1)=0
+        //   frame_type(2)=00 (KEY)
+        //   show_frame(1)=1
+        //   [showable derived]
+        //   [er_mode derived]
+        //   disable_cdf_update(1)=0
+        //   allow_screen_content_tools(1)=0  [seq is SELECT, but we
+        //                                     write 0 to keep test
+        //                                     consistent with tiny
+        //                                     fixture]
+        //   [force_integer_mv not read; allow_scc=0]
+        //   [current_frame_id not read; frame_id_numbers_present=0]
+        //   frame_size_override_flag(1)=0
+        //   order_hint(7)=0
+        //   [primary_ref derived]
+        //   [refresh_frame_flags derived = allFrames]
+        //   render_and_frame_size_different(1)=1
+        //   render_width_minus_1(16)=39  ⇒ render_width = 40
+        //   render_height_minus_1(16)=29 ⇒ render_height = 30
+        // Total bits = 1+2+1+1+1+1+7+1+16+16 = 47.
+        let seq = tiny_seq();
+        // Build bit-stream by writing bit-by-bit then packing.
+        let bits: &[u8] = &[
+            0, // show_existing
+            0, 0, // frame_type=00 (KEY)
+            1, // show_frame
+            0, // disable_cdf_update
+            0, // allow_screen_content_tools
+            0, // frame_size_override_flag
+            // order_hint(7) = 0 ⇒ seven zeros
+            0, 0, 0, 0, 0, 0, 0, // render_and_frame_size_different
+            1, // render_width_minus_1(16) = 39 = 0000_0000_0010_0111
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1,
+            // render_height_minus_1(16) = 29 = 0000_0000_0001_1101
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1,
+        ];
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let fh = parse_frame_header(&payload, &seq).expect("decodes");
+        let fs = fh.frame_size.expect("intra frame produces frame_size");
+        assert!(fs.render_and_frame_size_different);
+        assert_eq!(fs.render_width, 40);
+        assert_eq!(fs.render_height, 30);
+        assert_eq!(fs.frame_width, 16);
+        assert_eq!(fs.frame_height, 16);
+        assert_eq!(fh.bits_consumed, bits.len());
+    }
+
+    // -------------------------------------------------------------
+    // Synthetic: frame_size_override_flag = 1 reads explicit
+    // frame_width_minus_1 / frame_height_minus_1.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn frame_size_override_reads_explicit_dims() {
+        // tiny_seq: max_w=16 max_h=16. With override=1 we read
+        // frame_width_bits_minus_1+1 = frame_width_bits_minus_1+1
+        // bits. For tiny_seq the bit widths are tied to the
+        // 16x16 sequence — frame_width_bits_minus_1 is the bits to
+        // encode "16-1=15" → 4 bits. So the parser will read 4 bits
+        // for width and 4 bits for height.
+        let seq = tiny_seq();
+        let n_w = u32::from(seq.frame_width_bits_minus_1) + 1;
+        let n_h = u32::from(seq.frame_height_bits_minus_1) + 1;
+        assert!((1..=16).contains(&n_w));
+        assert!((1..=16).contains(&n_h));
+        // We'll target frame_width=12, frame_height=10.
+        let target_w = 12u32;
+        let target_h = 10u32;
+        let w_minus_1 = target_w - 1; // 11
+        let h_minus_1 = target_h - 1; // 9
+        let mut bits = vec![
+            0u8, // show_existing
+            0, 0, // frame_type=KEY
+            1, // show_frame
+            0, // disable_cdf_update
+            0, // allow_scc (seq forces SELECT but we write 0)
+            1, // frame_size_override_flag = 1
+            // order_hint(7) = 0
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        // frame_width_minus_1(n_w) MSB first.
+        for i in (0..n_w).rev() {
+            bits.push(((w_minus_1 >> i) & 1) as u8);
+        }
+        // frame_height_minus_1(n_h) MSB first.
+        for i in (0..n_h).rev() {
+            bits.push(((h_minus_1 >> i) & 1) as u8);
+        }
+        // render_and_frame_size_different = 0
+        bits.push(0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let fh = parse_frame_header(&payload, &seq).expect("decodes");
+        assert!(fh.frame_size_override_flag);
+        let fs = fh.frame_size.expect("intra frame produces frame_size");
+        assert_eq!(fs.frame_width, target_w);
+        assert_eq!(fs.frame_height, target_h);
+        // RenderWidth = UpscaledWidth = pre-superres FrameWidth = 12.
+        assert_eq!(fs.render_width, 12);
+        assert_eq!(fs.render_height, 10);
     }
 
     // -------------------------------------------------------------

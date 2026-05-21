@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-21
 
-**Clean-room rebuild, round 3.** The crate's prior implementation was
+**Clean-room rebuild, round 4.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -60,6 +60,26 @@ Bitstream parsing currently covers:
   if it would have to descend, but none of the 16 fixtures
   triggers it.
 
+* **§5.9.5 / §5.9.6 / §5.9.8 / §5.9.9 — Frame-size sub-syntax
+  block (round 4).** The same `parse_frame_header()` now drops
+  past `refresh_frame_flags` into the four frame-size sub-syntaxes
+  and returns a typed `FrameSize`: `frame_width` (post-superres),
+  `frame_height`, `render_width`, `render_height`, `superres_denom`
+  (in `9..=16` when `use_superres == 1`, otherwise `SUPERRES_NUM
+  = 8`), `upscaled_width` (pre-superres), `mi_cols`, `mi_rows`
+  (the `MI_SIZE = 4` block grid via `2 * ((dim + 7) >> 3)`), and
+  the three sub-syntax-input fields (`use_superres`, `coded_denom`,
+  `render_and_frame_size_different`). For super-resolved frames the
+  rounded-half-up downscale `FrameWidth = (UpscaledWidth *
+  SUPERRES_NUM + SuperresDenom / 2) / SuperresDenom` is applied
+  literally per §5.9.8. `FrameHeader::frame_size` is
+  `Some(FrameSize)` for every intra (`KEY_FRAME` /
+  `INTRA_ONLY_FRAME`) frame and `None` for show-existing-frame
+  replays and inter frames (the §5.9.7 `frame_size_with_refs()`
+  `found_ref == 1` branch needs ref-frame state — `RefUpscaledWidth[]`
+  / `RefFrameHeight[]` / `RefRenderWidth[]` / `RefRenderHeight[]` —
+  not yet tracked across calls).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -71,17 +91,21 @@ Validation: all 16 IVF fixtures under
 both the first sequence header bit-exact against the `SEQ_HEADER`
 line captured in each fixture's `trace.txt`, and the first frame
 OBU's leading uncompressed-header slice bit-exact against the
-`FRAME_HEADER idx=0` line in the same trace (for the 12 columns
-this parser owns: `show_existing` / `frame_to_show` / `frame_type` /
-`show_frame` / `showable` / `error_resilient` /
-`disable_cdf_update` / `allow_screen_content` / `force_integer_mv` /
-`order_hint` / `primary_ref_frame` / `refresh_flags`).
+`FRAME_HEADER idx=0` line in the same trace. Round 4 extends the
+trace columns asserted per fixture from 12 to 17 (adding `w`, `h`,
+`use_superres`, `coded_denom`, plus a derived assertion ladder
+computing `superres_denom` / post-superres `frame_width` /
+`mi_cols` / `mi_rows` from the §5.9.5 / §5.9.8 / §5.9.9 formulas).
+The `super-resolution` fixture exercises the §5.9.8 downscale
+(`UpscaledWidth = 128`, `coded_denom = 3` ⇒ `SuperresDenom = 12`,
+post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
+`MiCols = 22`); every other fixture is `use_superres == 0` with
+`FrameWidth == UpscaledWidth`.
 
-Frame decoding past `refresh_frame_flags` (`frame_size()` /
-`render_size()` / `tile_info()`, motion vectors, transform /
-quantisation, in-loop filters, film grain) is **not yet
-implemented**. `decode_av1` and `encode_av1` still return
-`Error::NotImplemented`.
+Frame decoding past `compute_image_size()` (`allow_intrabc`,
+`tile_info()`, motion vectors, transform / quantisation, in-loop
+filters, film grain) is **not yet implemented**. `decode_av1` and
+`encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -104,6 +128,12 @@ implemented**. `decode_av1` and `encode_av1` still return
     through `refresh_frame_flags`), §6.8.1 / §6.8.2 (semantics +
     conformance, including the `idLen <= 16` constraint on
     `display_frame_id`).
+  * Round 4: §3 (constants — `SUPERRES_NUM`, `SUPERRES_DENOM_MIN`,
+    `SUPERRES_DENOM_BITS`, `MI_SIZE`), §5.9.5 (`frame_size`),
+    §5.9.6 (`render_size`), §5.9.7 (`frame_size_with_refs` — the
+    `found_ref == 0` branch only), §5.9.8 (`superres_params`),
+    §5.9.9 (`compute_image_size`), §6.8.4 / §6.8.5 / §6.8.6 /
+    §6.8.7 / §6.8.8 (semantics).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

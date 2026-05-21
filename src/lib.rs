@@ -31,10 +31,27 @@
 //!     round-2's `SequenceHeader` to drive every conditional read.
 //!     See [`frame_header`].
 //!
-//! Frame decoding past `refresh_frame_flags` (tile parsing,
-//! transform / quantisation, in-loop filters, film grain) is still
-//! out of scope. [`decode_av1`] / [`encode_av1`] continue to return
-//! [`Error::NotImplemented`].
+//!   * **Round 4.** Frame-size sub-syntax block per §5.9.5
+//!     (`frame_size`) + §5.9.6 (`render_size`) + §5.9.8
+//!     (`superres_params`) + §5.9.9 (`compute_image_size`). For
+//!     every intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frame in the
+//!     §5.9.2 syntax tree, [`parse_frame_header`] now drops into
+//!     `frame_size()` + `render_size()` after `refresh_frame_flags`
+//!     and surfaces the eight-field [`FrameSize`] descriptor
+//!     (`frame_width` / `frame_height` / `render_width` /
+//!     `render_height` / `superres_denom` / `upscaled_width` /
+//!     `mi_cols` / `mi_rows`). The §5.9.7 `frame_size_with_refs()`
+//!     `found_ref` shortcut is **not** implemented yet — it reads
+//!     `RefUpscaledWidth[]` / `RefFrameHeight[]` /
+//!     `RefRenderWidth[]` / `RefRenderHeight[]` from a
+//!     reference-frame state table this round does not track —
+//!     so inter-frame parsing still stops at `refresh_frame_flags`
+//!     with `frame_size = None`. See [`frame_header`].
+//!
+//! Frame decoding past `compute_image_size()` (`allow_intrabc`,
+//! tile parsing, transform / quantisation, in-loop filters, film
+//! grain) is still out of scope. [`decode_av1`] / [`encode_av1`]
+//! continue to return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -46,7 +63,8 @@ pub mod obu;
 pub mod sequence_header;
 
 pub use frame_header::{
-    parse_frame_header, FrameHeader, FrameType, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+    parse_frame_header, FrameHeader, FrameSize, FrameType, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+    SUPERRES_DENOM_BITS, SUPERRES_DENOM_MIN, SUPERRES_NUM,
 };
 pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
 pub use sequence_header::{
@@ -93,6 +111,17 @@ pub enum Error {
     /// implemented yet; every fixture in this round's corpus parses
     /// without ever triggering this path.
     TemporalPointInfoUnsupported,
+    /// The frame-header parser hit the §5.9.2 `if (!FrameIsIntra ||
+    /// refresh_frame_flags != allFrames) { if (error_resilient_mode
+    /// && enable_order_hint) { ... } }` ref_order_hint walk. The
+    /// reads themselves are simple (`NUM_REF_FRAMES *
+    /// order_hint_bits` bits of `f(...)`), but the spec then
+    /// requires per-slot `RefValid[i] = 0` updates against the
+    /// session's `RefOrderHint[]` array. We don't yet track that
+    /// state across calls, so we refuse to descend rather than
+    /// silently discard the updates. No fixture in the current
+    /// corpus exercises this path.
+    RefOrderHintWalkUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -135,6 +164,10 @@ impl core::fmt::Display for Error {
             Self::TemporalPointInfoUnsupported => write!(
                 f,
                 "oxideav-av1: temporal_point_info() / decoder-model framing not implemented yet (§5.9.31)"
+            ),
+            Self::RefOrderHintWalkUnsupported => write!(
+                f,
+                "oxideav-av1: ref_order_hint walk in §5.9.2 needs RefOrderHint[] state (not yet tracked)"
             ),
         }
     }

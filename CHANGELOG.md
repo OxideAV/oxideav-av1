@@ -6,6 +6,75 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 4 — Frame-size sub-syntax block (§5.9.5–§5.9.9).** The
+  `parse_frame_header()` parser is extended past `refresh_frame_flags`
+  to consume the four §5.9 frame-size sub-syntaxes in spec order:
+  `frame_size()` (§5.9.5) reads `frame_width_minus_1` /
+  `frame_height_minus_1` (with bit widths from §5.5.1's
+  `frame_width_bits_minus_1` / `frame_height_bits_minus_1`) when
+  `frame_size_override_flag == 1`, otherwise it falls back to the
+  sequence header's `max_frame_width_minus_1 + 1` /
+  `max_frame_height_minus_1 + 1`; `superres_params()` (§5.9.8) reads
+  `use_superres` + `coded_denom` (gated by `enable_superres`),
+  computes `SuperresDenom = coded_denom + SUPERRES_DENOM_MIN` (or
+  `SUPERRES_NUM` when superres is off), assigns
+  `UpscaledWidth = FrameWidth`, and applies the rounded-half-up
+  downscale `FrameWidth = (UpscaledWidth * SUPERRES_NUM +
+  SuperresDenom / 2) / SuperresDenom`; `compute_image_size()` (§5.9.9)
+  derives `MiCols = 2 * ((FrameWidth + 7) >> 3)` and
+  `MiRows = 2 * ((FrameHeight + 7) >> 3)` (the §3 `MI_SIZE = 4` block
+  grid); `render_size()` (§5.9.6) reads
+  `render_and_frame_size_different`, optional 16-bit
+  `render_width_minus_1` / `render_height_minus_1`, and defaults
+  `RenderWidth = UpscaledWidth` / `RenderHeight = FrameHeight` per
+  §6.8.5.
+
+  Surfaces a new [`FrameSize`] struct with the eight requested
+  fields (`frame_width`, `frame_height`, `render_width`,
+  `render_height`, `superres_denom`, `upscaled_width`, `mi_cols`,
+  `mi_rows`) plus the three sub-syntax-input fields (`use_superres`,
+  `coded_denom`, `render_and_frame_size_different`) and a
+  convenience `is_super_resolved()` predicate. [`FrameHeader`] now
+  carries an `Option<FrameSize>` populated for every intra (`KEY` /
+  `INTRA_ONLY`) frame; inter frames keep `frame_size = None` for
+  this round because the §5.9.7 `frame_size_with_refs()`
+  `found_ref == 1` branch reads `RefUpscaledWidth[]` /
+  `RefFrameHeight[]` / `RefRenderWidth[]` / `RefRenderHeight[]`
+  from a reference-frame state table not yet tracked across calls.
+
+  New `SUPERRES_NUM = 8` / `SUPERRES_DENOM_MIN = 9` /
+  `SUPERRES_DENOM_BITS = 3` constants from §3 of the AV1
+  Bitstream & Decoding Process Specification. New
+  `Error::RefOrderHintWalkUnsupported` variant surfaces the §5.9.2
+  `error_resilient_mode && enable_order_hint` ref_order_hint walk
+  that requires per-slot `RefOrderHint[]` / `RefValid[]` state
+  (no fixture in the current corpus exercises it).
+
+  Validation: four new unit tests cover the explicit-render-size
+  branch (`render_and_frame_size_different == 1` with non-default
+  `render_width` / `render_height`), the
+  `frame_size_override_flag == 1` branch (reads
+  `frame_width_minus_1` / `frame_height_minus_1` against
+  `frame_width_bits_minus_1` / `frame_height_bits_minus_1`), the
+  `use_superres == 1` branch with `coded_denom == 3` (asserts
+  `SuperresDenom = 12`, post-downscale `FrameWidth = 85`, `MiCols
+  = 22` against the spec's rounded-half-up formula), and the
+  `enable_superres == 1` + `use_superres == 0` reduced-still
+  case. Existing unit tests grow to assert the new
+  [`FrameHeader::frame_size`] field on the two real-OBU fixtures
+  (tiny-i-only-16x16 / show-existing-frame underlying KEY) and the
+  two synthetic reduced-still vectors. The integration test
+  (`tests/frame_header_fixtures.rs`) is extended with five new
+  trace columns per fixture — `trace_w`, `trace_h`,
+  `use_superres`, `coded_denom`, and a derived assertion ladder
+  computing the expected `superres_denom` / post-superres
+  `frame_width` / `mi_cols` / `mi_rows` against the §5.9.5–§5.9.9
+  formulas — so all 16 fixtures cross-validate eight
+  [`FrameSize`] fields against the `FRAME_HEADER` trace line, and
+  the round 3 12-column assertions still pass byte-exact (now
+  17 × 16 = 272 field assertions per run of the integration
+  test).
+
 * **Round 3 — Uncompressed-header prefix parse (§5.9.2).** New
   `frame_header` module implements `parse_frame_header()` consuming
   the leading slice of `uncompressed_header()` per §5.9.2 of the AV1
