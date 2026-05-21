@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-21
 
-**Clean-room rebuild, round 2.** The crate's prior implementation was
+**Clean-room rebuild, round 3.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -36,6 +36,30 @@ Bitstream parsing currently covers:
   bitstream-conformance gates (`seq_profile <= 2`,
   `reduced_still_picture_header == 1 ⇒ still_picture == 1`).
 
+* **§5.9.2 — Uncompressed-header prefix parse (round 3).**
+  `parse_frame_header()` consumes the leading slice of
+  `uncompressed_header()` and returns a typed `FrameHeader`:
+  `show_existing_frame` plus the optional `frame_to_show_map_idx`
+  and `display_frame_id` for the show-existing replay path,
+  `frame_type` (`KEY_FRAME` / `INTER_FRAME` / `INTRA_ONLY_FRAME` /
+  `SWITCH_FRAME`), `show_frame`, `showable_frame`,
+  `error_resilient_mode`, `disable_cdf_update`,
+  `allow_screen_content_tools`, `force_integer_mv` (with the
+  §5.9.2 `FrameIsIntra` override applied), `current_frame_id`
+  (only when the sequence header opted into frame-id numbering),
+  `frame_size_override_flag`, `order_hint` (width derived from
+  §5.5.1's `order_hint_bits`), `primary_ref_frame` (with
+  `PRIMARY_REF_NONE` for intra / error-resilient frames), and
+  `refresh_frame_flags` (with the SWITCH or KEY-with-show_frame
+  derivation to `allFrames = 0xff`). The reduced-still-picture
+  collapse from §5.9.2 is honoured. Bit-count consumed is reported
+  via `FrameHeader::bits_consumed` for the next round.
+  `temporal_point_info()` (§5.9.31) call sites — gated by
+  `decoder_model_info_present_flag && !equal_picture_interval` —
+  are stubbed; the parser returns `Error::TemporalPointInfoUnsupported`
+  if it would have to descend, but none of the 16 fixtures
+  triggers it.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -44,12 +68,19 @@ Validation: all 16 IVF fixtures under
 `film-grain-on`, `superblocks-128`, `tile-cols-2-rows-1`,
 `show-existing-frame`, `lossless-i-only`, `i-frame-then-p-64x64`,
 `obu-with-extension-headers`, `profile-0-yuv420-8bit`) round-trip
-the first sequence header bit-exact against the `SEQ_HEADER` line
-captured in each fixture's `trace.txt`.
+both the first sequence header bit-exact against the `SEQ_HEADER`
+line captured in each fixture's `trace.txt`, and the first frame
+OBU's leading uncompressed-header slice bit-exact against the
+`FRAME_HEADER idx=0` line in the same trace (for the 12 columns
+this parser owns: `show_existing` / `frame_to_show` / `frame_type` /
+`show_frame` / `showable` / `error_resilient` /
+`disable_cdf_update` / `allow_screen_content` / `force_integer_mv` /
+`order_hint` / `primary_ref_frame` / `refresh_flags`).
 
-Frame decoding (`frame_header_obu`, tile parsing, motion vectors,
-transform / quantisation, in-loop filters, film grain) is **not
-yet implemented**. `decode_av1` and `encode_av1` still return
+Frame decoding past `refresh_frame_flags` (`frame_size()` /
+`render_size()` / `tile_info()`, motion vectors, transform /
+quantisation, in-loop filters, film grain) is **not yet
+implemented**. `decode_av1` and `encode_av1` still return
 `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
@@ -67,6 +98,12 @@ yet implemented**. `decode_av1` and `encode_av1` still return
     (`timing_info`), §5.5.4 (`decoder_model_info`), §5.5.5
     (`operating_parameters_info`), §6.4.1 / §6.4.2 (semantics +
     conformance), §8.1 (`read_bit`).
+  * Round 3: §3 (constants — `NUM_REF_FRAMES`, `PRIMARY_REF_NONE`),
+    §5.9.1 (`frame_header_obu` framing), §5.9.2
+    (`uncompressed_header` leading slice — `show_existing_frame`
+    through `refresh_frame_flags`), §6.8.1 / §6.8.2 (semantics +
+    conformance, including the `idLen <= 16` constraint on
+    `display_frame_id`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

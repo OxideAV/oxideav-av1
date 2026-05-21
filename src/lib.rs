@@ -20,9 +20,20 @@
 //!     plus a bit-position so the trailing-bits accounting from
 //!     §5.3.1 can plug in cleanly next round. See [`sequence_header`].
 //!
-//! Frame decoding (`frame_header_obu`, tile parsing, transform /
-//! quantisation, in-loop filters, film grain) is still out of scope.
-//! [`decode_av1`] / [`encode_av1`] continue to return
+//!   * **Round 3.** Leading slice of `uncompressed_header()` per
+//!     §5.9.2 — `show_existing_frame` / `frame_to_show_map_idx` /
+//!     `display_frame_id` / `frame_type` / `show_frame` /
+//!     `showable_frame` / `error_resilient_mode` /
+//!     `disable_cdf_update` / `allow_screen_content_tools` /
+//!     `force_integer_mv` / `current_frame_id` /
+//!     `frame_size_override_flag` / `order_hint` /
+//!     `primary_ref_frame` / `refresh_frame_flags`. Composes with
+//!     round-2's `SequenceHeader` to drive every conditional read.
+//!     See [`frame_header`].
+//!
+//! Frame decoding past `refresh_frame_flags` (tile parsing,
+//! transform / quantisation, in-loop filters, film grain) is still
+//! out of scope. [`decode_av1`] / [`encode_av1`] continue to return
 //! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
@@ -30,9 +41,13 @@
 use oxideav_core::RuntimeContext;
 
 mod bitreader;
+pub mod frame_header;
 pub mod obu;
 pub mod sequence_header;
 
+pub use frame_header::{
+    parse_frame_header, FrameHeader, FrameType, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+};
 pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
 pub use sequence_header::{
     parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
@@ -67,6 +82,17 @@ pub enum Error {
     /// `reduced_still_picture_header == 1` but `still_picture == 0`,
     /// in violation of the §6.4.1 conformance requirement.
     ReducedStillRequiresStill,
+    /// `idLen` (= `additional_frame_id_length_minus_1 +
+    /// `delta_frame_id_length_minus_2 + 3`) exceeded the §6.8.2
+    /// requirement that the bit width of `display_frame_id` /
+    /// `current_frame_id` must not exceed 16.
+    InvalidIdLen,
+    /// The frame-header parser hit a `temporal_point_info()` call
+    /// site (§5.9.31) — i.e. `decoder_model_info_present_flag &&
+    /// !equal_picture_interval`. Decoder-model frame timing isn't
+    /// implemented yet; every fixture in this round's corpus parses
+    /// without ever triggering this path.
+    TemporalPointInfoUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -101,6 +127,14 @@ impl core::fmt::Display for Error {
             Self::ReducedStillRequiresStill => write!(
                 f,
                 "oxideav-av1: reduced_still_picture_header == 1 requires still_picture == 1 (§6.4.1)"
+            ),
+            Self::InvalidIdLen => write!(
+                f,
+                "oxideav-av1: idLen (delta_frame_id_length_minus_2 + additional_frame_id_length_minus_1 + 3) exceeded 16 (§6.8.2)"
+            ),
+            Self::TemporalPointInfoUnsupported => write!(
+                f,
+                "oxideav-av1: temporal_point_info() / decoder-model framing not implemented yet (§5.9.31)"
             ),
         }
     }
