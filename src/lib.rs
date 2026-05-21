@@ -1,27 +1,43 @@
 //! # oxideav-av1
 //!
 //! **Status:** orphan-rebuild scaffold (post 2026-05-20 audit), clean
-//! room round 1 in progress.
+//! room rebuild in progress.
 //!
-//! The decoder/encoder pipeline is not wired up yet. Round 1 adds the
-//! OBU bytestream walker described in §5.3.1 of the AV1 Bitstream &
-//! Decoding Process Specification — i.e. it can identify the OBU
-//! boundaries in a low-overhead bitstream and surface the
-//! `obu_type` / `obu_extension_flag` / `obu_has_size_field` fields
-//! plus the `obu_size` (`leb128`) payload length and slice for each
-//! unit. Frame decoding remains unimplemented.
+//! The decoder/encoder pipeline is not wired up yet. Bitstream
+//! parsing has reached:
 //!
-//! See [`obu`] for the walker. The legacy [`decode_av1`] /
-//! [`encode_av1`] entry points still return [`Error::NotImplemented`]
-//! pending the frame-decoding work.
+//!   * **Round 1.** OBU bytestream walker described in §5.3 of the
+//!     AV1 Bitstream & Decoding Process Specification — boundaries
+//!     in a low-overhead bitstream plus `obu_type` /
+//!     `obu_extension_flag` / `obu_has_size_field` / `temporal_id` /
+//!     `spatial_id` / `obu_size` fields and a payload slice for each
+//!     unit. See [`obu`].
+//!
+//!   * **Round 2.** Sequence header OBU parse per §5.5
+//!     (`sequence_header_obu`, `color_config`, `timing_info`,
+//!     `decoder_model_info`, `operating_parameters_info`). Returns a
+//!     strongly typed [`sequence_header::SequenceHeader`] descriptor
+//!     plus a bit-position so the trailing-bits accounting from
+//!     §5.3.1 can plug in cleanly next round. See [`sequence_header`].
+//!
+//! Frame decoding (`frame_header_obu`, tile parsing, transform /
+//! quantisation, in-loop filters, film grain) is still out of scope.
+//! [`decode_av1`] / [`encode_av1`] continue to return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 use oxideav_core::RuntimeContext;
 
+mod bitreader;
 pub mod obu;
+pub mod sequence_header;
 
 pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
+pub use sequence_header::{
+    parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
+    SequenceHeader, TimingInfo,
+};
 
 /// Crate-local error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +61,12 @@ pub enum Error {
     Leb128TooLong,
     /// An `obu_size` value did not fit in `usize` on this target.
     SizeOverflow,
+    /// `seq_profile` was greater than 2 — values 3..=7 are reserved
+    /// per §6.4.1.
+    ReservedProfile(u8),
+    /// `reduced_still_picture_header == 1` but `still_picture == 0`,
+    /// in violation of the §6.4.1 conformance requirement.
+    ReducedStillRequiresStill,
 }
 
 impl core::fmt::Display for Error {
@@ -72,6 +94,14 @@ impl core::fmt::Display for Error {
             Self::SizeOverflow => {
                 write!(f, "oxideav-av1: obu_size did not fit in usize on this target")
             }
+            Self::ReservedProfile(p) => write!(
+                f,
+                "oxideav-av1: seq_profile {p} is reserved (only 0..=2 are conformant, §6.4.1)"
+            ),
+            Self::ReducedStillRequiresStill => write!(
+                f,
+                "oxideav-av1: reduced_still_picture_header == 1 requires still_picture == 1 (§6.4.1)"
+            ),
         }
     }
 }
