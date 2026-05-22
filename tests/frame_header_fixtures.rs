@@ -81,6 +81,15 @@ struct Expected {
     /// read collapses to 0 bits, and the parser surfaces the
     /// `tile_size_bytes = 1` default for the trailing field).
     context_update_tile_id: u32,
+    /// `base_q_idx` column (§5.9.12). Round 7 wired
+    /// `quantization_params()` into the streaming walk so this is
+    /// asserted against `FrameHeader::quantization_params.base_q_idx`.
+    trace_base_q_idx: u8,
+    /// `seg_enabled` column (§5.9.14). Round 7 wired
+    /// `segmentation_params()` into the streaming walk. The 16-fixture
+    /// corpus uniformly reports `seg_enabled=0`, exercising the
+    /// 1-bit short-circuit path.
+    trace_seg_enabled: bool,
 }
 
 struct Fixture {
@@ -112,6 +121,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 16, trace_h: 16, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -129,6 +139,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -146,6 +157,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 95, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -163,6 +175,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -180,6 +193,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -197,6 +211,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -214,6 +229,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -231,6 +247,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -248,6 +265,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 128, trace_h: 64, use_superres: true, coded_denom: 3,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 160, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -265,6 +283,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 256, trace_h: 128, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 80, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -282,6 +301,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -299,6 +319,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 128, trace_h: 128, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 128, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -316,6 +337,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 256, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 2, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 120, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -334,6 +356,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 34, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -351,6 +374,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 0, trace_seg_enabled: false,
         },
     },
     Fixture {
@@ -368,6 +392,7 @@ const FIXTURES: &[Fixture] = &[
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
+            trace_base_q_idx: 106, trace_seg_enabled: false,
         },
     },
 ];
@@ -521,6 +546,48 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
                 fx.name,
                 ti.tile_rows,
                 oxideav_av1::MAX_TILE_ROWS,
+            ));
+        }
+
+        // Round 7: §5.9.12 quantization_params + §5.9.14
+        // segmentation_params wired into the streaming walk.
+        let qp = fh.quantization_params.as_ref().unwrap_or_else(|| {
+            panic!(
+                "fixture {}: expected quantization_params = Some(..)",
+                fx.name
+            )
+        });
+        if qp.base_q_idx != fx.expected.trace_base_q_idx {
+            mismatches.push(format!(
+                "{}: base_q_idx expected {} got {}",
+                fx.name, fx.expected.trace_base_q_idx, qp.base_q_idx,
+            ));
+        }
+        let sp = fh.segmentation_params.as_ref().unwrap_or_else(|| {
+            panic!(
+                "fixture {}: expected segmentation_params = Some(..)",
+                fx.name
+            )
+        });
+        if sp.enabled != fx.expected.trace_seg_enabled {
+            mismatches.push(format!(
+                "{}: seg_enabled expected {} got {}",
+                fx.name, fx.expected.trace_seg_enabled, sp.enabled,
+            ));
+        }
+        // §6.8.13 trailing derivation: when no feature is active,
+        // SegIdPreSkip = 0 and LastActiveSegId = 0. The corpus is
+        // uniformly seg_enabled=0, so this MUST hold for every entry.
+        if sp.seg_id_pre_skip {
+            mismatches.push(format!(
+                "{}: seg_id_pre_skip expected false (no active features) got true",
+                fx.name,
+            ));
+        }
+        if sp.last_active_seg_id != 0 {
+            mismatches.push(format!(
+                "{}: last_active_seg_id expected 0 (no active features) got {}",
+                fx.name, sp.last_active_seg_id,
             ));
         }
 

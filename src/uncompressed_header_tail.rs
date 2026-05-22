@@ -1,13 +1,16 @@
 //! Sub-syntax functions called from the tail of
-//! `uncompressed_header()` (§5.9.2) — landed in round 5 of the
-//! clean-room rebuild. None of them are wired into the streaming
-//! [`crate::parse_frame_header`] walk yet (the intervening
-//! `allow_intrabc` / `disable_frame_end_update_cdf` / `tile_info()` /
-//! `segmentation_params()` / `delta_q_params()` / `delta_lf_params()`
-//! syntax sits between the round-4 stop point and these calls); they
-//! are instead exposed as standalone parser entry points that operate
-//! on a byte slice. The next round can stitch them into the streaming
-//! parser as the intervening syntaxes land.
+//! `uncompressed_header()` (§5.9.2). Rounds 5–7 of the clean-room
+//! rebuild landed `read_interpolation_filter()` (§5.9.10),
+//! `loop_filter_params()` (§5.9.11), `quantization_params()` (§5.9.12),
+//! and — added this round — `segmentation_params()` (§5.9.14).
+//!
+//! `quantization_params()` and `segmentation_params()` are also wired
+//! into the streaming [`crate::parse_frame_header`] walk (intra path)
+//! since they sit before the remaining `delta_q_params()` /
+//! `delta_lf_params()` / `loop_filter_params()` / `cdef_params()` /
+//! `lr_params()` block. The standalone entry points remain available so
+//! callers that want to exercise the parsers on a raw byte slice can do
+//! so without rebuilding a `SequenceHeader` and a streaming context.
 //!
 //! ## Syntax / semantics references (all in `docs/video/av1/`)
 //!
@@ -15,13 +18,16 @@
 //!   * §5.9.11 — `loop_filter_params()`
 //!   * §5.9.12 — `quantization_params()`
 //!   * §5.9.13 — `read_delta_q()` (helper for §5.9.12)
+//!   * §5.9.14 — `segmentation_params()`
 //!   * §6.8.9  — Interpolation filter semantics
 //!   * §6.8.10 — Loop filter semantics
 //!   * §6.8.11 — Quantization params semantics
 //!   * §6.8.12 — Delta quantizer semantics
+//!   * §6.8.13 — Segmentation params semantics
 //!   * §4.10.6 — `su(n)` signed-integer descriptor (used for
-//!     `loop_filter_ref_deltas` / `loop_filter_mode_deltas` and the
-//!     `delta_q` field of `read_delta_q()`).
+//!     `loop_filter_ref_deltas` / `loop_filter_mode_deltas` / the
+//!     `delta_q` field of `read_delta_q()` / signed `feature_value`
+//!     reads inside `segmentation_params()`).
 //!
 //! ## §3 constants referenced here
 //!
@@ -29,6 +35,14 @@
 //!     types including the implicit `INTRA_FRAME`. Used as the loop
 //!     bound for the `loop_filter_ref_deltas[i]` update walk inside
 //!     `loop_filter_params()`.
+//!   * `MAX_SEGMENTS = 8` — number of segments per §5.9.14.
+//!   * `SEG_LVL_MAX = 8` — number of per-segment features per §5.9.14.
+//!   * `SEG_LVL_ALT_Q = 0` / `SEG_LVL_ALT_LF_Y_V = 1` /
+//!     `SEG_LVL_ALT_LF_Y_H = 2` / `SEG_LVL_ALT_LF_U = 3` /
+//!     `SEG_LVL_ALT_LF_V = 4` / `SEG_LVL_REF_FRAME = 5` /
+//!     `SEG_LVL_SKIP = 6` / `SEG_LVL_GLOBALMV = 7` — feature indices.
+//!   * `MAX_LOOP_FILTER = 63` — clip bound for the four loop-filter
+//!     features (per §5.9.14 `Segmentation_Feature_Max`).
 
 use crate::bitreader::BitReader;
 use crate::Error;
@@ -40,6 +54,75 @@ use crate::Error;
 /// `TOTAL_REFS_PER_FRAME` per §3 — `INTRA_FRAME` plus the seven
 /// inter-prediction reference frame types.
 pub const TOTAL_REFS_PER_FRAME: usize = 8;
+
+/// `MAX_SEGMENTS` per §3 — number of segments allowed in the
+/// segmentation map (§5.9.14 outer loop bound).
+pub const MAX_SEGMENTS: usize = 8;
+
+/// `SEG_LVL_MAX` per §3 — number of segment features per
+/// §5.9.14 inner loop bound.
+pub const SEG_LVL_MAX: usize = 8;
+
+/// `SEG_LVL_ALT_Q` per §3 — feature index 0 (quantiser delta).
+pub const SEG_LVL_ALT_Q: usize = 0;
+
+/// `SEG_LVL_ALT_LF_Y_V` per §3 — feature index 1 (vertical-luma
+/// loop-filter delta).
+pub const SEG_LVL_ALT_LF_Y_V: usize = 1;
+
+/// `SEG_LVL_ALT_LF_Y_H` per §3 — feature index 2 (horizontal-luma
+/// loop-filter delta).
+pub const SEG_LVL_ALT_LF_Y_H: usize = 2;
+
+/// `SEG_LVL_ALT_LF_U` per §3 — feature index 3 (U-plane loop-filter
+/// delta).
+pub const SEG_LVL_ALT_LF_U: usize = 3;
+
+/// `SEG_LVL_ALT_LF_V` per §3 — feature index 4 (V-plane loop-filter
+/// delta).
+pub const SEG_LVL_ALT_LF_V: usize = 4;
+
+/// `SEG_LVL_REF_FRAME` per §3 — feature index 5 (reference frame).
+/// `SegIdPreSkip` is set when any active feature has `j >=
+/// SEG_LVL_REF_FRAME` (§5.9.14 trailing derivation).
+pub const SEG_LVL_REF_FRAME: usize = 5;
+
+/// `SEG_LVL_SKIP` per §3 — feature index 6 (skip).
+pub const SEG_LVL_SKIP: usize = 6;
+
+/// `SEG_LVL_GLOBALMV` per §3 — feature index 7 (global MV).
+pub const SEG_LVL_GLOBALMV: usize = 7;
+
+/// `MAX_LOOP_FILTER` per §3 — clipping limit for the four
+/// loop-filter features in `Segmentation_Feature_Max` (§5.9.14).
+pub const MAX_LOOP_FILTER: i16 = 63;
+
+/// `Segmentation_Feature_Bits[ SEG_LVL_MAX ]` table from §5.9.14:
+/// the bit width of `feature_value` for each feature index (or 0
+/// when the feature has no associated value).
+pub const SEGMENTATION_FEATURE_BITS: [u32; SEG_LVL_MAX] = [8, 6, 6, 6, 6, 3, 0, 0];
+
+/// `Segmentation_Feature_Signed[ SEG_LVL_MAX ]` table from §5.9.14:
+/// 1 for features whose value is read as `su(1+bitsToRead)`, 0 for
+/// features whose value is read as `f(bitsToRead)`.
+pub const SEGMENTATION_FEATURE_SIGNED: [bool; SEG_LVL_MAX] =
+    [true, true, true, true, true, false, false, false];
+
+/// `Segmentation_Feature_Max[ SEG_LVL_MAX ]` table from §5.9.14:
+/// the absolute-value clip bound for each feature. Indices 6 and 7
+/// have a max of 0 (skip / globalmv are boolean — they have no
+/// associated value, so `feature_value = 0` is forced through
+/// `Clip3(0, 0, ...)`).
+pub const SEGMENTATION_FEATURE_MAX: [i16; SEG_LVL_MAX] = [
+    255,
+    MAX_LOOP_FILTER,
+    MAX_LOOP_FILTER,
+    MAX_LOOP_FILTER,
+    MAX_LOOP_FILTER,
+    7,
+    0,
+    0,
+];
 
 // ---------------------------------------------------------------------
 // §5.9.10 read_interpolation_filter
@@ -410,6 +493,193 @@ fn read_delta_q(br: &mut BitReader<'_>) -> Result<i8, Error> {
         Ok(br.su(7)? as i8)
     } else {
         Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------
+// §5.9.14 segmentation_params
+// ---------------------------------------------------------------------
+
+/// Parsed `segmentation_params()` per §5.9.14.
+///
+/// The decoded `FeatureEnabled[i][j]` / `FeatureData[i][j]` arrays from
+/// the §5.9.14 inner loop are surfaced as `segment_feature_active` /
+/// `segment_feature_data` (outer index `i` ∈ `0..MAX_SEGMENTS`, inner
+/// index `j` ∈ `0..SEG_LVL_MAX`).
+///
+/// When `segmentation_enabled == 0` the spec leaves
+/// `FeatureEnabled[i][j]` / `FeatureData[i][j]` at their previous-frame
+/// (or `setup_past_independence`-reset) values; this structural parser
+/// reports a fully-zero array in that case because the standalone walk
+/// does not carry per-session history. The streaming-parser caller in
+/// `parse_frame_header` follows the same convention — the persistence
+/// model is the next round's `load_segmentation_params()` work.
+///
+/// When `segmentation_enabled == 1 && segmentation_update_data == 0`
+/// the spec keeps the existing per-segment feature data; this
+/// structural parser also reports zeros in that case, with
+/// [`Self::segmentation_update_data`] left `false` so a session-aware
+/// layer can detect the "use saved state" branch and substitute the
+/// loaded data.
+///
+/// The §5.9.14 trailing derivations `SegIdPreSkip` and `LastActiveSegId`
+/// are also surfaced as [`Self::seg_id_pre_skip`] and
+/// [`Self::last_active_seg_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentationParams {
+    /// `segmentation_enabled` (`f(1)`).
+    pub enabled: bool,
+    /// `segmentation_update_map`. Per §5.9.14: forced to `1` when
+    /// `primary_ref_frame == PRIMARY_REF_NONE`; otherwise read as
+    /// `f(1)`. `false` when `enabled == 0`.
+    pub update_map: bool,
+    /// `segmentation_temporal_update`. Per §5.9.14: forced to `0` when
+    /// `primary_ref_frame == PRIMARY_REF_NONE`; otherwise read as
+    /// `f(1)` only when `update_map == 1`. `false` when `enabled == 0`.
+    pub temporal_update: bool,
+    /// `segmentation_update_data`. Per §5.9.14: forced to `1` when
+    /// `primary_ref_frame == PRIMARY_REF_NONE`; otherwise read as
+    /// `f(1)`. `false` when `enabled == 0`.
+    pub update_data: bool,
+    /// `FeatureEnabled[i][j]` from the §5.9.14 inner loop.
+    pub segment_feature_active: [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
+    /// `FeatureData[i][j]` from the §5.9.14 inner loop, after the
+    /// `Clip3(-limit, limit, feature_value)` / `Clip3(0, limit,
+    /// feature_value)` clamp. Stored as `i16` to fit the worst-case
+    /// signed range `[-255, 255]` of `SEG_LVL_ALT_Q`.
+    pub segment_feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+    /// `SegIdPreSkip` trailing derivation: `1` if any active feature has
+    /// `j >= SEG_LVL_REF_FRAME`, otherwise `0`.
+    pub seg_id_pre_skip: bool,
+    /// `LastActiveSegId` trailing derivation: highest segment index `i`
+    /// with at least one active feature. `0` when no feature is active.
+    pub last_active_seg_id: u8,
+}
+
+impl SegmentationParams {
+    /// The §5.9.14 disabled-path output: every slot zeroed.
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            update_map: false,
+            temporal_update: false,
+            update_data: false,
+            segment_feature_active: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            segment_feature_data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+            seg_id_pre_skip: false,
+            last_active_seg_id: 0,
+        }
+    }
+}
+
+/// Parse `segmentation_params()` per §5.9.14.
+///
+/// `primary_ref_frame` is the §5.9.2 `primary_ref_frame` value — the
+/// `PRIMARY_REF_NONE = 7` sentinel collapses the three update flags
+/// to fixed values (`update_map = 1`, `temporal_update = 0`,
+/// `update_data = 1`).
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+pub fn parse_segmentation_params(
+    payload: &[u8],
+    primary_ref_frame: u8,
+) -> Result<(SegmentationParams, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let s = read_segmentation_params(&mut br, primary_ref_frame)?;
+    Ok((s, br.position()))
+}
+
+pub(crate) fn read_segmentation_params(
+    br: &mut BitReader<'_>,
+    primary_ref_frame: u8,
+) -> Result<SegmentationParams, Error> {
+    let enabled = br.f(1)? == 1;
+    if !enabled {
+        return Ok(SegmentationParams::disabled());
+    }
+
+    let (update_map, temporal_update, update_data) =
+        if primary_ref_frame == crate::frame_header::PRIMARY_REF_NONE {
+            // §5.9.14: `primary_ref_frame == PRIMARY_REF_NONE` collapses
+            // the three update flags to fixed values without reading.
+            (true, false, true)
+        } else {
+            let um = br.f(1)? == 1;
+            let tu = if um { br.f(1)? == 1 } else { false };
+            let ud = br.f(1)? == 1;
+            (um, tu, ud)
+        };
+
+    let mut feature_active = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+    let mut feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+
+    if update_data {
+        for i in 0..MAX_SEGMENTS {
+            for j in 0..SEG_LVL_MAX {
+                let feature_enabled = br.f(1)? == 1;
+                feature_active[i][j] = feature_enabled;
+                let clipped = if feature_enabled {
+                    let bits_to_read = SEGMENTATION_FEATURE_BITS[j];
+                    let limit = SEGMENTATION_FEATURE_MAX[j];
+                    if SEGMENTATION_FEATURE_SIGNED[j] {
+                        // §5.9.14 reads `su(1+bitsToRead)` even when
+                        // `bitsToRead == 0`. For indices 6/7 the bits
+                        // are 0 and signed flag is 0, so this branch
+                        // doesn't fire; defensive nonetheless.
+                        let feature_value = br.su(1 + bits_to_read)?;
+                        clip3_i32(-i32::from(limit), i32::from(limit), feature_value) as i16
+                    } else if bits_to_read == 0 {
+                        // §5.9.14: `feature_value = 0` initialiser
+                        // stands when `bits_to_read == 0`. Clip3 with
+                        // limit == 0 forces 0.
+                        0
+                    } else {
+                        let feature_value = br.f(bits_to_read)? as i32;
+                        clip3_i32(0, i32::from(limit), feature_value) as i16
+                    }
+                } else {
+                    0
+                };
+                feature_data[i][j] = clipped;
+            }
+        }
+    }
+
+    // §5.9.14 trailing derivation of SegIdPreSkip / LastActiveSegId.
+    let mut seg_id_pre_skip = false;
+    let mut last_active_seg_id: u8 = 0;
+    for (i, row) in feature_active.iter().enumerate() {
+        for (j, &active) in row.iter().enumerate() {
+            if active {
+                last_active_seg_id = i as u8;
+                if j >= SEG_LVL_REF_FRAME {
+                    seg_id_pre_skip = true;
+                }
+            }
+        }
+    }
+
+    Ok(SegmentationParams {
+        enabled,
+        update_map,
+        temporal_update,
+        update_data,
+        segment_feature_active: feature_active,
+        segment_feature_data: feature_data,
+        seg_id_pre_skip,
+        last_active_seg_id,
+    })
+}
+
+/// `Clip3(a, b, x)` per §"Conventions": clamp `x` to `[a, b]`.
+fn clip3_i32(a: i32, b: i32, x: i32) -> i32 {
+    if x < a {
+        a
+    } else if x > b {
+        b
+    } else {
+        x
     }
 }
 
@@ -827,6 +1097,235 @@ mod tests {
     fn quantization_unexpected_end() {
         let payload: [u8; 0] = [];
         let err = parse_quantization_params(&payload, 1, false).expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.14 segmentation_params
+    // -----------------------------------------------------------------
+
+    use crate::frame_header::PRIMARY_REF_NONE;
+
+    #[test]
+    fn segmentation_disabled_one_bit() {
+        // segmentation_enabled = 0 ⇒ 1 bit consumed, every field 0.
+        let payload = [0b0000_0000u8];
+        let (s, n) = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect("decodes");
+        assert!(!s.enabled);
+        assert!(!s.update_map);
+        assert!(!s.temporal_update);
+        assert!(!s.update_data);
+        assert_eq!(
+            s.segment_feature_active,
+            [[false; SEG_LVL_MAX]; MAX_SEGMENTS]
+        );
+        assert_eq!(s.segment_feature_data, [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS]);
+        assert!(!s.seg_id_pre_skip);
+        assert_eq!(s.last_active_seg_id, 0);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn segmentation_primary_ref_none_no_active_features() {
+        // segmentation_enabled = 1, primary_ref_frame == PRIMARY_REF_NONE
+        // ⇒ update_map=1, temporal_update=0, update_data=1 (no
+        // bitstream reads for the update flags). Then update_data=1
+        // walks 8×8 = 64 feature_enabled bits, all zero ⇒ no further
+        // reads. Total = 1 + 64 = 65 bits.
+        let mut bits = vec![1u8]; // segmentation_enabled
+                                  // 64 zero `feature_enabled` bits — one per (segment, feature)
+                                  // slot, all disabled.
+        bits.resize(1 + MAX_SEGMENTS * SEG_LVL_MAX, 0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let (s, n) = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect("decodes");
+        assert!(s.enabled);
+        assert!(s.update_map);
+        assert!(!s.temporal_update);
+        assert!(s.update_data);
+        for i in 0..MAX_SEGMENTS {
+            for j in 0..SEG_LVL_MAX {
+                assert!(!s.segment_feature_active[i][j]);
+                assert_eq!(s.segment_feature_data[i][j], 0);
+            }
+        }
+        assert!(!s.seg_id_pre_skip);
+        assert_eq!(s.last_active_seg_id, 0);
+        assert_eq!(n, bits.len());
+    }
+
+    #[test]
+    fn segmentation_with_primary_ref_reads_three_update_bits() {
+        // primary_ref_frame = 0 (i.e. != PRIMARY_REF_NONE):
+        //   segmentation_enabled = 1
+        //   segmentation_update_map = 1
+        //   segmentation_temporal_update = 1
+        //   segmentation_update_data = 0
+        //   ⇒ no inner-loop reads.
+        //   = 4 bits.
+        let payload = [0b1110_0000u8];
+        let (s, n) = parse_segmentation_params(&payload, 0).expect("decodes");
+        assert!(s.enabled);
+        assert!(s.update_map);
+        assert!(s.temporal_update);
+        assert!(!s.update_data);
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn segmentation_update_map_zero_skips_temporal_bit() {
+        // primary_ref_frame=0, segmentation_enabled=1, update_map=0
+        // (so temporal_update is NOT read), update_data=0. = 3 bits.
+        let payload = [0b1000_0000u8];
+        let (s, n) = parse_segmentation_params(&payload, 0).expect("decodes");
+        assert!(s.enabled);
+        assert!(!s.update_map);
+        assert!(!s.temporal_update);
+        assert!(!s.update_data);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn segmentation_feature_alt_q_signed() {
+        // primary_ref_frame == PRIMARY_REF_NONE ⇒ no update-flag reads.
+        // segmentation_enabled = 1, update_data = 1.
+        // Segment 0:
+        //   feature 0 (ALT_Q): enabled=1, value = su(9) = -50.
+        //     Encode -50 in 9-bit two's complement: 2^9 - 50 = 462 = 0b1_1100_1110.
+        //   features 1..7: enabled=0.
+        // Segments 1..7: feature_enabled[*][*] = 0 ⇒ 7 × 8 = 56 bits.
+        let mut bits = vec![1u8]; // segmentation_enabled
+                                  // Segment 0, feature 0: enabled=1, su(9) = -50 ⇒ 462 = 0b111001110.
+        bits.push(1); // feature_enabled
+        for i in (0..9).rev() {
+            bits.push(((462u32 >> i) & 1) as u8);
+        }
+        // Segment 0, features 1..=7: enabled=0 — 7 zero bits.
+        // Then segments 1..=7, all 8 features: enabled=0 — 7×8 = 56 zero
+        // bits.
+        let tail_zeros = (SEG_LVL_MAX - 1) + (MAX_SEGMENTS - 1) * SEG_LVL_MAX;
+        bits.resize(bits.len() + tail_zeros, 0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let (s, n) = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect("decodes");
+        assert!(s.enabled);
+        assert!(s.segment_feature_active[0][SEG_LVL_ALT_Q]);
+        assert_eq!(s.segment_feature_data[0][SEG_LVL_ALT_Q], -50);
+        // All other features inactive.
+        for i in 0..MAX_SEGMENTS {
+            for j in 0..SEG_LVL_MAX {
+                if (i, j) != (0, SEG_LVL_ALT_Q) {
+                    assert!(!s.segment_feature_active[i][j]);
+                }
+            }
+        }
+        // Active features at j=0 ⇒ SegIdPreSkip stays 0.
+        assert!(!s.seg_id_pre_skip);
+        // Active in segment 0 only.
+        assert_eq!(s.last_active_seg_id, 0);
+        // Total bits: 1 (enabled) + 1 (fe) + 9 (su) + 7 (zero fe for rest of seg 0)
+        //           + 7 segments × 8 features (zero fe) = 1 + 1 + 9 + 7 + 56 = 74.
+        assert_eq!(n, 74);
+    }
+
+    #[test]
+    fn segmentation_feature_alt_q_clipped_high() {
+        // SEG_LVL_ALT_Q has bits=8, signed=1, max=255.
+        // su(1+8) = su(9) range is [-256, 255]. We pick +256 (=0x100,
+        // 9 bits = 0b1_0000_0000 = sign bit set ⇒ decodes to -256),
+        // which is clipped to -255 by Clip3(-255, 255, -256).
+        let mut bits = vec![1u8]; // segmentation_enabled
+        bits.push(1); // feature_enabled[0][0]
+        for i in (0..9).rev() {
+            bits.push(((0x100u32 >> i) & 1) as u8);
+        }
+        // Segment 0 features 1..=7 disabled (7 zero bits) plus
+        // segments 1..=7 × 8 features all disabled (56 zero bits).
+        let tail_zeros = (SEG_LVL_MAX - 1) + (MAX_SEGMENTS - 1) * SEG_LVL_MAX;
+        bits.resize(bits.len() + tail_zeros, 0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let (s, _) = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect("decodes");
+        // Clip3(-255, 255, -256) = -255.
+        assert_eq!(s.segment_feature_data[0][SEG_LVL_ALT_Q], -255);
+    }
+
+    #[test]
+    fn segmentation_feature_ref_frame_unsigned() {
+        // SEG_LVL_REF_FRAME has bits=3, signed=0, max=7.
+        // Encode feature_value = 6 = 0b110 as f(3).
+        let mut bits = vec![1u8]; // segmentation_enabled
+                                  // Segment 0, features 0..=4: enabled=0 (5 zero bits).
+        bits.resize(bits.len() + SEG_LVL_REF_FRAME, 0);
+        // Segment 0, feature 5 (SEG_LVL_REF_FRAME): enabled=1, value=6.
+        bits.push(1);
+        for i in (0..3).rev() {
+            bits.push(((6u32 >> i) & 1) as u8);
+        }
+        // Segment 0, features 6/7 disabled (2 zero bits) plus
+        // segments 1..=7 × 8 features all disabled (56 zero bits).
+        let tail_zeros = 2 + (MAX_SEGMENTS - 1) * SEG_LVL_MAX;
+        bits.resize(bits.len() + tail_zeros, 0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let (s, _) = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect("decodes");
+        assert!(s.segment_feature_active[0][SEG_LVL_REF_FRAME]);
+        assert_eq!(s.segment_feature_data[0][SEG_LVL_REF_FRAME], 6);
+        // Feature j=5 = SEG_LVL_REF_FRAME ⇒ SegIdPreSkip becomes 1.
+        assert!(s.seg_id_pre_skip);
+        assert_eq!(s.last_active_seg_id, 0);
+    }
+
+    #[test]
+    fn segmentation_feature_skip_no_value_bits() {
+        // SEG_LVL_SKIP (j=6) has bits=0 ⇒ no feature_value read,
+        // feature_data forced to 0. Activate it for segment 3.
+        let mut bits = vec![1u8]; // segmentation_enabled
+                                  // Segments 0..=2: all 8 features enabled=0 (24 zero bits)
+                                  // plus segment 3 features 0..=5 disabled (6 zero bits).
+        bits.resize(bits.len() + 3 * SEG_LVL_MAX + SEG_LVL_SKIP, 0);
+        bits.push(1); // feature_enabled[3][6]
+        bits.push(0); // feature_enabled[3][7]
+                      // Segments 4..=7: all 8 features enabled=0 — 4×8 = 32 zero bits.
+        bits.resize(bits.len() + (MAX_SEGMENTS - 4) * SEG_LVL_MAX, 0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let (s, n) = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect("decodes");
+        assert!(s.segment_feature_active[3][SEG_LVL_SKIP]);
+        assert_eq!(s.segment_feature_data[3][SEG_LVL_SKIP], 0);
+        // Feature j=6 >= SEG_LVL_REF_FRAME ⇒ SegIdPreSkip=1.
+        assert!(s.seg_id_pre_skip);
+        // Active in segment 3 ⇒ last_active_seg_id = 3.
+        assert_eq!(s.last_active_seg_id, 3);
+        // Total bits = 1 (enabled) + 64 (8 feature_enabled bits × 8 segs)
+        //   + 0 (no value bits for skip). = 65.
+        assert_eq!(n, 65);
+    }
+
+    #[test]
+    fn segmentation_unexpected_end() {
+        let payload: [u8; 0] = [];
+        let err = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect_err("must err");
         assert_eq!(err, Error::UnexpectedEnd);
     }
 }

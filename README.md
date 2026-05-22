@@ -158,6 +158,50 @@ Bitstream parsing currently covers:
   The `tile-cols-2-rows-1` fixture exercises a real 2-tile
   layout (`TileColsLog2 = 1`).
 
+* **§5.9.12 `quantization_params()` + §5.9.14
+  `segmentation_params()` wired into the streaming parser (round
+  7).** After `tile_info()` the parser now consumes the
+  quantization_params block (already implemented standalone in
+  round 5) — `base_q_idx` (`f(8)`), the per-plane `delta_q_*`
+  offsets via `read_delta_q()` (`delta_coded` `f(1)` gate + `su(7)`
+  signed offset), the chroma `diff_uv_delta` / V-mirrors-U logic,
+  and the `using_qmatrix` / `qm_y` / `qm_u` / `qm_v` quantizer-
+  matrix block — and surfaces a typed `QuantizationParams` on
+  `FrameHeader::quantization_params`. Then the new
+  segmentation_params routine reads `segmentation_enabled` and,
+  when enabled, either reads the three update flags or uses the
+  §5.9.14 `primary_ref_frame == PRIMARY_REF_NONE` collapse
+  (`update_map=1` / `temporal_update=0` / `update_data=1`, no
+  bitstream reads). For `update_data=1` the inner loop walks all
+  8 segments × 8 features, reading `feature_enabled` and (when
+  active) `su(1+bits)` or `f(bits)` per the `Segmentation_Feature_Bits`
+  / `Segmentation_Feature_Signed` / `Segmentation_Feature_Max`
+  Table 5.9.14 tables. The §5.9.14 trailing `SegIdPreSkip` /
+  `LastActiveSegId` derivations are surfaced. New type
+  `SegmentationParams` exposing `enabled`, `update_map`,
+  `temporal_update`, `update_data`,
+  `segment_feature_active: [[bool; SEG_LVL_MAX]; MAX_SEGMENTS]`,
+  `segment_feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS]`,
+  `seg_id_pre_skip`, `last_active_seg_id`. New public §3 constants:
+  `MAX_SEGMENTS = 8`, `SEG_LVL_MAX = 8`, `SEG_LVL_ALT_Q = 0`,
+  `SEG_LVL_ALT_LF_Y_V = 1`, `SEG_LVL_ALT_LF_Y_H = 2`,
+  `SEG_LVL_ALT_LF_U = 3`, `SEG_LVL_ALT_LF_V = 4`,
+  `SEG_LVL_REF_FRAME = 5`, `SEG_LVL_SKIP = 6`,
+  `SEG_LVL_GLOBALMV = 7`, `MAX_LOOP_FILTER = 63`. New public Table
+  5.9.14 tables: `SEGMENTATION_FEATURE_BITS`,
+  `SEGMENTATION_FEATURE_SIGNED`, `SEGMENTATION_FEATURE_MAX`. New
+  standalone parser entry point `parse_segmentation_params`. 10
+  new tests (9 standalone — disabled / PRIMARY_REF_NONE collapse /
+  three-bit update walk / `update_map=0` skips temporal /
+  signed `SEG_LVL_ALT_Q` value `-50` / clipped at the `-255` floor
+  / unsigned `SEG_LVL_REF_FRAME=6` sets `SegIdPreSkip=1` /
+  zero-width `SEG_LVL_SKIP` sets `LastActiveSegId=3` /
+  unexpected-end — plus 1 streaming-parser synthetic with
+  `SEG_LVL_ALT_Q` active value `-123`). The 16-fixture
+  frame-header integration test gains two new asserted trace
+  columns (`base_q_idx`, `seg_enabled`) plus a `SegIdPreSkip = 0`
+  / `LastActiveSegId = 0` invariant guard.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -180,10 +224,13 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `tile_info()` (tile-content decode — motion
-vectors, transform / quantisation, in-loop filters, film grain)
-is **not yet implemented**. `decode_av1` and `encode_av1` still
-return `Error::NotImplemented`.
+Frame decoding past `segmentation_params()` (the remaining
+uncompressed-header tail — `delta_q_params()`, `delta_lf_params()`,
+`loop_filter_params()` streaming wire-in, `cdef_params()`,
+`lr_params()` — plus tile-content decode — motion vectors,
+transform / quantisation, in-loop filters, film grain) is **not
+yet implemented**. `decode_av1` and `encode_av1` still return
+`Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -227,6 +274,15 @@ return `Error::NotImplemented`.
     §5.9.16 (`tile_log2`), §6.8.14 (semantics + conformance —
     `TileCols <= MAX_TILE_COLS`, `TileRows <= MAX_TILE_ROWS`,
     `context_update_tile_id < TileCols * TileRows`).
+  * Round 7: §3 (constants — `MAX_SEGMENTS`, `SEG_LVL_MAX`,
+    `SEG_LVL_ALT_Q`, `SEG_LVL_ALT_LF_Y_V`, `SEG_LVL_ALT_LF_Y_H`,
+    `SEG_LVL_ALT_LF_U`, `SEG_LVL_ALT_LF_V`, `SEG_LVL_REF_FRAME`,
+    `SEG_LVL_SKIP`, `SEG_LVL_GLOBALMV`, `MAX_LOOP_FILTER`),
+    §"Conventions" (`Clip3`), §5.9.2 (the `quantization_params()`
+    + `segmentation_params()` placement after `tile_info()` in the
+    `if (FrameIsIntra)` block), §5.9.14 (`segmentation_params`),
+    §6.8.13 (semantics — `SegIdPreSkip` / `LastActiveSegId`
+    derivations).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

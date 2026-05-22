@@ -6,6 +6,64 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 7 — `quantization_params()` (§5.9.12) + `segmentation_params()`
+  (§5.9.14) wired into the streaming `parse_frame_header` walk.** For
+  intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frames the parser now
+  descends past `tile_info()` into `quantization_params()` (already
+  implemented standalone in round 5) and then into the new
+  `segmentation_params()` routine: `segmentation_enabled` (`f(1)`),
+  then — when `primary_ref_frame == PRIMARY_REF_NONE` — the three
+  update flags collapse to `update_map=1` / `temporal_update=0` /
+  `update_data=1` with no bitstream reads; otherwise the three flags
+  are read (`update_map` always, `temporal_update` only when
+  `update_map=1`, `update_data` always). When `update_data=1` the
+  inner loop walks all 8 × 8 = 64 `feature_enabled` bits and, for each
+  active feature, reads `su(1 + Segmentation_Feature_Bits[j])` (signed
+  features 0..=4) or `f(Segmentation_Feature_Bits[j])` (unsigned
+  feature 5) and clips against `Segmentation_Feature_Max[j]`. The
+  §5.9.14 trailing `SegIdPreSkip` / `LastActiveSegId` derivations are
+  computed.
+
+  New type `SegmentationParams { enabled, update_map, temporal_update,
+  update_data, segment_feature_active: [[bool; SEG_LVL_MAX];
+  MAX_SEGMENTS], segment_feature_data: [[i16; SEG_LVL_MAX];
+  MAX_SEGMENTS], seg_id_pre_skip, last_active_seg_id }`. Two new
+  fields on `FrameHeader`: `quantization_params:
+  Option<QuantizationParams>` and `segmentation_params:
+  Option<SegmentationParams>` (both `Some` for intra frames, `None`
+  for inter / show-existing replays). New §3 constants: `MAX_SEGMENTS
+  = 8`, `SEG_LVL_MAX = 8`, `SEG_LVL_ALT_Q = 0`, `SEG_LVL_ALT_LF_Y_V =
+  1`, `SEG_LVL_ALT_LF_Y_H = 2`, `SEG_LVL_ALT_LF_U = 3`,
+  `SEG_LVL_ALT_LF_V = 4`, `SEG_LVL_REF_FRAME = 5`, `SEG_LVL_SKIP = 6`,
+  `SEG_LVL_GLOBALMV = 7`, `MAX_LOOP_FILTER = 63`. Three Table 5.9.14
+  tables also exposed: `SEGMENTATION_FEATURE_BITS = [8, 6, 6, 6, 6, 3,
+  0, 0]`, `SEGMENTATION_FEATURE_SIGNED = [1, 1, 1, 1, 1, 0, 0, 0]`,
+  `SEGMENTATION_FEATURE_MAX = [255, 63, 63, 63, 63, 7, 0, 0]`. New
+  standalone parser entry point `parse_segmentation_params(payload,
+  primary_ref_frame) -> (SegmentationParams, usize)`.
+
+  Validation: 9 new unit tests for the standalone
+  `parse_segmentation_params` (disabled / `PRIMARY_REF_NONE` collapse
+  with all-inactive features / primary-ref three-bit update walk /
+  `update_map=0` skips `temporal_update` / signed-feature `su(9)`
+  with `SEG_LVL_ALT_Q` value `-50` / signed-feature clipped at the
+  `-255` floor when reading `feature_value = -256` / unsigned
+  `SEG_LVL_REF_FRAME` `f(3)=6` setting `seg_id_pre_skip=1` /
+  `SEG_LVL_SKIP` zero-width with `last_active_seg_id=3` /
+  unexpected-end), 1 new streaming-parser synthetic
+  (`segmentation_enabled=1` with `SEG_LVL_ALT_Q` active value `-123`),
+  and the 16-fixture frame-header integration test gains two new
+  asserted trace columns (`base_q_idx`, `seg_enabled`) plus a
+  `SegIdPreSkip = 0` / `LastActiveSegId = 0` invariant guard (every
+  corpus fixture is `seg_enabled=0`).
+
+  Followups: §5.9.15 `delta_q_params()`, §5.9.16 `delta_lf_params()`,
+  §5.9.11 `loop_filter_params()` (full streaming wire-in;
+  short-circuit `CodedLossless || allow_intrabc` already modelled
+  standalone), §5.9.17 `cdef_params()`, §5.9.20 `lr_params()`. After
+  those, the streaming `parse_frame_header` walk reaches
+  `read_tx_mode()`.
+
 * **Round 6 — `allow_intrabc` (§5.9.3) +
   `disable_frame_end_update_cdf` + `tile_info()` (§5.9.15) wired
   into the streaming `parse_frame_header` walk.** For intra

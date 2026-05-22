@@ -82,19 +82,39 @@
 //!     [`QuantizationParams`] with `base_q_idx`, the four
 //!     `delta_q_y_dc / delta_q_u_dc / delta_q_u_ac / delta_q_v_dc /
 //!     delta_q_v_ac` per-plane offsets, `diff_uv_delta` /
-//!     `using_qmatrix` / `qm_y` / `qm_u` / `qm_v`). The three
-//!     sub-syntaxes are exposed as standalone parser entry points
+//!     `using_qmatrix` / `qm_y` / `qm_u` / `qm_v`). These remain
+//!     available as standalone parser entry points
 //!     ([`parse_interpolation_filter`], [`parse_loop_filter_params`],
-//!     [`parse_quantization_params`]) because the §5.9.2 tail isn't
-//!     yet streamable end-to-end — the intervening syntax
-//!     (`allow_intrabc`, `disable_frame_end_update_cdf`,
-//!     `tile_info()`, `segmentation_params()`, `delta_q_params()`,
-//!     `delta_lf_params()`) sits between round 4's stop point and
-//!     these calls. See [`uncompressed_header_tail`].
+//!     [`parse_quantization_params`]) for callers that want to
+//!     exercise the parsers on a raw byte slice. See
+//!     [`uncompressed_header_tail`].
 //!
-//! Frame decoding past `tile_info()` (tile-content decode — transform /
-//! quantisation, in-loop filters, motion vectors, film grain) is still
-//! out of scope. [`decode_av1`] / [`encode_av1`] continue to return
+//!   * **Round 7.** §5.9.12 `quantization_params()` and §5.9.14
+//!     `segmentation_params()` wired into the streaming
+//!     [`parse_frame_header`] walk (intra path). After `tile_info()`
+//!     the parser now consumes `quantization_params()` and surfaces a
+//!     typed [`QuantizationParams`] on [`FrameHeader::quantization_params`],
+//!     then `segmentation_params()` and surfaces a typed
+//!     [`SegmentationParams`] on [`FrameHeader::segmentation_params`]
+//!     covering `segmentation_enabled`, `segmentation_update_map`,
+//!     `segmentation_temporal_update`, `segmentation_update_data`,
+//!     the full §5.9.14 `FeatureEnabled[i][j]` /
+//!     `FeatureData[i][j]` 8×8 table (`segment_feature_active` /
+//!     `segment_feature_data`), and the §5.9.14 trailing
+//!     `SegIdPreSkip` / `LastActiveSegId` derivations. The §5.9.14
+//!     `primary_ref_frame == PRIMARY_REF_NONE` collapse is honoured
+//!     (`update_map = 1`, `temporal_update = 0`, `update_data = 1`,
+//!     no bitstream reads for the three update flags). Per-feature
+//!     `Segmentation_Feature_Bits` / `Segmentation_Feature_Signed` /
+//!     `Segmentation_Feature_Max` Table 5.9.14 tables are exposed as
+//!     [`SEGMENTATION_FEATURE_BITS`] / [`SEGMENTATION_FEATURE_SIGNED`]
+//!     / [`SEGMENTATION_FEATURE_MAX`]. See
+//!     [`uncompressed_header_tail::parse_segmentation_params`].
+//!
+//! Frame decoding past `segmentation_params()` (the remaining tail —
+//! `delta_q_params()` / `delta_lf_params()` / `loop_filter_params()` /
+//! `cdef_params()` / `lr_params()` / tile-content decode) is still out
+//! of scope. [`decode_av1`] / [`encode_av1`] continue to return
 //! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
@@ -122,8 +142,12 @@ pub use tile_info::{
 };
 pub use uncompressed_header_tail::{
     parse_interpolation_filter, parse_loop_filter_params, parse_quantization_params,
-    InterpolationFilter, LoopFilterParams, QuantizationParams, LOOP_FILTER_MODE_DELTAS_DEFAULT,
-    LOOP_FILTER_REF_DELTAS_DEFAULT, TOTAL_REFS_PER_FRAME,
+    parse_segmentation_params, InterpolationFilter, LoopFilterParams, QuantizationParams,
+    SegmentationParams, LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT,
+    MAX_LOOP_FILTER, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
+    SEGMENTATION_FEATURE_SIGNED, SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H,
+    SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME,
+    SEG_LVL_SKIP, TOTAL_REFS_PER_FRAME,
 };
 
 /// Crate-local error type.

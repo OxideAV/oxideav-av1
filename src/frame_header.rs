@@ -1,19 +1,20 @@
 //! Frame header OBU parser — `uncompressed_header()` through
-//! `tile_info()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc` +
-//! §5.9.5–§5.9.9 + §5.9.15).
+//! `segmentation_params()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc`
+//! + §5.9.5–§5.9.9 + §5.9.12 + §5.9.14 + §5.9.15).
 //!
 //! Round 3 covered everything in `uncompressed_header()` through
 //! `refresh_frame_flags`. Round 4 extended the parser past
 //! `refresh_frame_flags` with the four frame-size sub-syntaxes from
 //! §5.9.5 / §5.9.6 / §5.9.7 / §5.9.8 plus the §5.9.9
-//! `compute_image_size()` derivation. Round 6 (this round) wires the
-//! §5.9.3 `allow_intrabc` `f(1)` slot (gated by
-//! `allow_screen_content_tools && UpscaledWidth == FrameWidth`) and
-//! the §5.9.15 `tile_info()` walk into the streaming parser for intra
-//! frames. The downstream blocks (`quantization_params()`,
-//! `segmentation_params()`, `loop_filter_params()`, …) remain
-//! standalone for now (they're available via the
-//! [`crate::uncompressed_header_tail`] entry points).
+//! `compute_image_size()` derivation. Round 6 wired the §5.9.3
+//! `allow_intrabc` `f(1)` slot (gated by `allow_screen_content_tools &&
+//! UpscaledWidth == FrameWidth`) and the §5.9.15 `tile_info()` walk
+//! into the streaming parser for intra frames. Round 7 (this round)
+//! wires §5.9.12 `quantization_params()` and §5.9.14
+//! `segmentation_params()` after `tile_info()`. The downstream blocks
+//! (`delta_q_params()`, `delta_lf_params()`, `loop_filter_params()`,
+//! `cdef_params()`, `lr_params()`, …) remain to be wired in subsequent
+//! rounds.
 //!
 //! ## Syntax / semantics references (all in `docs/video/av1/`)
 //!
@@ -99,6 +100,9 @@
 use crate::bitreader::BitReader;
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
 use crate::tile_info::{read_tile_info, TileInfo};
+use crate::uncompressed_header_tail::{
+    read_quantization_params, read_segmentation_params, QuantizationParams, SegmentationParams,
+};
 use crate::Error;
 
 // ---------------------------------------------------------------------
@@ -359,10 +363,18 @@ pub struct FrameHeader {
     /// state to fully parse `frame_size_with_refs()`. `Some(TileInfo)`
     /// for every intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frame.
     pub tile_info: Option<TileInfo>,
+    /// `quantization_params()` (§5.9.12) result. `Some` whenever
+    /// `tile_info` is `Some` (intra frames); `None` for inter / show-
+    /// existing-frame paths that stop before this point.
+    pub quantization_params: Option<QuantizationParams>,
+    /// `segmentation_params()` (§5.9.14) result. `Some` whenever
+    /// `quantization_params` is `Some` (intra frames); `None` for inter
+    /// / show-existing-frame paths that stop before this point.
+    pub segmentation_params: Option<SegmentationParams>,
     /// Total bits consumed from `payload` by this parse. The next
     /// round will continue from this position to decode
-    /// `quantization_params()` (intra path) or the inter-frame
-    /// `frame_refs_short_signaling` block (inter path).
+    /// `delta_q_params()` / `delta_lf_params()` (intra path) or the
+    /// inter-frame `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
 
@@ -476,6 +488,16 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             frame_size.mi_rows,
             seq.use_128x128_superblock,
         )?);
+        // §5.9.2 spec order after tile_info(): quantization_params()
+        // then segmentation_params(). The reduced-still path is an
+        // intra (KEY) frame with primary_ref_frame = PRIMARY_REF_NONE,
+        // so segmentation collapses to the no-prev-ref branch.
+        let quantization_params = read_quantization_params(
+            br,
+            seq.color_config.num_planes,
+            seq.color_config.separate_uv_delta_q,
+        )?;
+        let segmentation_params = read_segmentation_params(br, PRIMARY_REF_NONE)?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -497,6 +519,8 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             allow_intrabc,
             disable_frame_end_update_cdf,
             tile_info,
+            quantization_params: Some(quantization_params),
+            segmentation_params: Some(segmentation_params),
             bits_consumed: br.position(),
         });
     }
@@ -548,6 +572,8 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             allow_intrabc: false,
             disable_frame_end_update_cdf: false,
             tile_info: None,
+            quantization_params: None,
+            segmentation_params: None,
             bits_consumed: br.position(),
         });
     }
@@ -664,7 +690,14 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
     // none of which can be modelled without the ref-frame state.
     // Return early with `frame_size: None` and stop bit accounting
     // at `refresh_frame_flags`.
-    let (frame_size, allow_intrabc, disable_frame_end_update_cdf, tile_info) = if frame_is_intra {
+    let (
+        frame_size,
+        allow_intrabc,
+        disable_frame_end_update_cdf,
+        tile_info,
+        quantization_params,
+        segmentation_params,
+    ) = if frame_is_intra {
         let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
         let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
         // §5.9.2 disable_frame_end_update_cdf — read as `f(1)` unless
@@ -677,9 +710,20 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             br.f(1)? == 1
         };
         let ti = read_tile_info(br, fs.mi_cols, fs.mi_rows, seq.use_128x128_superblock)?;
-        (Some(fs), aib, dfeuc, Some(ti))
+        // §5.9.2 spec order after tile_info(): quantization_params()
+        // (§5.9.12) then segmentation_params() (§5.9.14). Both depend
+        // on session state already settled by this point:
+        // num_planes / separate_uv_delta_q from the sequence header,
+        // primary_ref_frame from the per-frame slot above.
+        let qp = read_quantization_params(
+            br,
+            seq.color_config.num_planes,
+            seq.color_config.separate_uv_delta_q,
+        )?;
+        let sp = read_segmentation_params(br, primary_ref_frame)?;
+        (Some(fs), aib, dfeuc, Some(ti), Some(qp), Some(sp))
     } else {
-        (None, false, false, None)
+        (None, false, false, None, None, None)
     };
 
     Ok(FrameHeader {
@@ -703,6 +747,8 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         allow_intrabc,
         disable_frame_end_update_cdf,
         tile_info,
+        quantization_params,
+        segmentation_params,
         bits_consumed: br.position(),
     })
 }
@@ -966,8 +1012,34 @@ mod tests {
         //    TileRowsLog2 both saturate at 0 ⇒ no increment reads]
         //   [TileColsLog2==0 && TileRowsLog2==0 ⇒ no
         //    context_update_tile_id / tile_size_bytes_minus_1 reads]
-        // = +2 bits ⇒ 17 bits total.
-        assert_eq!(fh.bits_consumed, 17);
+        // = +2 bits ⇒ 17 bits. Round 7 adds:
+        //   quantization_params: base_q_idx(8)=120,
+        //     DeltaQYDc.delta_coded(1)=0, DeltaQUDc.delta_coded(1)=0,
+        //     DeltaQUAc.delta_coded(1)=0,
+        //     [V mirrors U: no read], using_qmatrix(1)=0
+        //   = +12 bits.
+        //   segmentation_params: seg_enabled(1)=0 ⇒ +1 bit, no further reads.
+        // = 30 bits total.
+        assert_eq!(fh.bits_consumed, 30);
+        let qp = fh
+            .quantization_params
+            .as_ref()
+            .expect("intra frame produces quantization_params");
+        assert_eq!(qp.base_q_idx, 120, "trace base_q_idx=120");
+        assert_eq!(qp.delta_q_y_dc, 0);
+        assert_eq!(qp.delta_q_u_dc, 0);
+        assert_eq!(qp.delta_q_u_ac, 0);
+        assert!(!qp.using_qmatrix);
+        let sp = fh
+            .segmentation_params
+            .as_ref()
+            .expect("intra frame produces segmentation_params");
+        assert!(!sp.enabled);
+        assert!(!sp.update_map);
+        assert!(!sp.temporal_update);
+        assert!(!sp.update_data);
+        assert!(!sp.seg_id_pre_skip);
+        assert_eq!(sp.last_active_seg_id, 0);
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);
@@ -1098,8 +1170,12 @@ mod tests {
         //   [no row-increment reads: maxLog2TileRows=0]
         //   [no context_update_tile_id / tile_size_bytes reads:
         //    TileColsLog2==0 && TileRowsLog2==0]
-        // = 7 bits = 0b0100_0100 = 0x44.
-        let payload = [0x44u8];
+        // = 7 bits = 0b0100_0100 = 0x44. Round 7 appends:
+        //   base_q_idx(8) = 0, three delta_q delta_coded(1) = 0 each,
+        //   using_qmatrix(1) = 0, seg_enabled(1) = 0 ⇒ +13 zero bits.
+        // Total = 20 bits = 0b0100_0100 0000_0000 0000_0000 = three
+        // zero-padded bytes. 0x44, 0x00, 0x00.
+        let payload = [0x44u8, 0x00, 0x00];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert_eq!(fh.frame_type, FrameType::Key);
         assert!(fh.frame_is_intra);
@@ -1114,7 +1190,12 @@ mod tests {
         assert_eq!(fh.refresh_frame_flags, 0xff);
         assert_eq!(fh.primary_ref_frame, PRIMARY_REF_NONE);
         assert!(!fh.allow_intrabc);
-        assert_eq!(fh.bits_consumed, 7);
+        assert_eq!(fh.bits_consumed, 20);
+        let qp = fh.quantization_params.as_ref().expect("intra has qp");
+        assert_eq!(qp.base_q_idx, 0);
+        assert!(!qp.using_qmatrix);
+        let sp = fh.segmentation_params.as_ref().expect("intra has sp");
+        assert!(!sp.enabled);
         let fs = fh.frame_size.expect("reduced-still produces frame_size");
         assert_eq!(fs.frame_width, 256);
         assert_eq!(fs.frame_height, 128);
@@ -1153,8 +1234,10 @@ mod tests {
         //   uniform_tile_spacing_flag(1)=1
         //   [128x64 use_128sb=1 ⇒ sbCols=sbRows=1 ⇒ no
         //    increment / context_update_tile_id reads]
-        // = 7 bits total. 0b0100_0010 = 0x42.
-        let payload = [0x42u8];
+        // = 7 bits. Round 7 appends 13 zero bits for quant +
+        // segmentation (same as the screen-content reduced-still test
+        // above). Total = 20 bits. 0x42 0x00 0x00.
+        let payload = [0x42u8, 0x00, 0x00];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert!(fh.allow_screen_content_tools);
         assert!(fh.force_integer_mv);
@@ -1168,7 +1251,9 @@ mod tests {
         assert!(!fs.use_superres);
         assert_eq!(fs.superres_denom, SUPERRES_NUM);
         assert!(!fh.allow_intrabc);
-        assert_eq!(fh.bits_consumed, 7);
+        assert_eq!(fh.bits_consumed, 20);
+        let sp = fh.segmentation_params.as_ref().expect("intra has sp");
+        assert!(!sp.enabled);
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);
@@ -1197,11 +1282,12 @@ mod tests {
         //   bit 8 = 1 (uniform_tile_spacing_flag)
         //   [85x64 use_128sb=1: sbCols=sbRows=1 ⇒ no increment reads;
         //    TileColsLog2==0 && TileRowsLog2==0 ⇒ no trailing reads]
-        // = 9 bits. Byte 0 = 0101_0110 = 0x56, byte 1 = 1000_0000 = 0x80.
-        let payload = [0x56u8, 0x80u8];
+        // = 9 bits. Round 7 appends 13 zero bits for quant + seg.
+        // Total = 22 bits. Bytes: 0101_0110 1000_0000 0000_0000 = 0x56 0x80 0x00.
+        let payload = [0x56u8, 0x80u8, 0x00u8];
         let seq = super_resolution_seq();
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
-        assert_eq!(fh.bits_consumed, 9);
+        assert_eq!(fh.bits_consumed, 22);
         let fs = fh.frame_size.expect("reduced-still produces frame_size");
         assert!(fs.use_superres);
         assert_eq!(fs.coded_denom, 3);
@@ -1276,7 +1362,15 @@ mod tests {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1,
             // disable_frame_end_update_cdf = 0
             0, // uniform_tile_spacing_flag = 1
-            1,
+            1, // Round 7 trailing zero bits:
+            //   quantization_params: base_q_idx(8)=0, 3× delta_coded(1)=0,
+            //     using_qmatrix(1)=0 = 12 bits.
+            //   segmentation_params: seg_enabled(1)=0 = 1 bit.
+            // = +13 zero bits.
+            0, 0, 0, 0, 0, 0, 0, 0, // base_q_idx = 0
+            0, 0, 0, // three delta_coded gates
+            0, // using_qmatrix
+            0, // seg_enabled
         ];
         let mut payload = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
@@ -1343,6 +1437,11 @@ mod tests {
         // uniform_tile_spacing_flag = 1; 12x10 with use_128sb=1 ⇒
         // MiCols=MiRows=4 ⇒ sbCols=sbRows=1 ⇒ no further reads.
         bits.push(1);
+        // Round 7: quant + segmentation trailing block — all zero bits.
+        //   base_q_idx(8)=0, 3× delta_coded(1)=0, using_qmatrix(1)=0
+        //   = 12 zero bits for quantization_params.
+        //   seg_enabled(1)=0 = 1 zero bit for segmentation_params.
+        bits.resize(bits.len() + 13, 0);
         let mut payload = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
             if b != 0 {
@@ -1414,8 +1513,9 @@ mod tests {
         //   [256x128 use_128sb=1 ⇒ sbCols=2, maxLog2TileCols=1.
         //    Need increment_tile_cols_log2(1)=0 to stop at TileColsLog2=0
         //    (single tile column).]
-        // = 7 bits. 0b0100_1010 = 0x4A.
-        let payload = [0x4Au8];
+        // = 7 bits. 0b0100_1010 = 0x4A. Round 7: +13 zero bits for quant +
+        // segmentation ⇒ 0x4A, 0x00, 0x00.
+        let payload = [0x4Au8, 0x00, 0x00];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert!(fh.allow_intrabc);
         assert!(fh.disable_frame_end_update_cdf, "reduced-still derives 1");
@@ -1446,9 +1546,11 @@ mod tests {
         //   [TileRowsLog2 stays at 0]
         //   context_update_tile_id(1)=1  [TileRowsLog2 + TileColsLog2 = 1]
         //   tile_size_bytes_minus_1(2)=10 ⇒ TileSizeBytes = 3.
-        // = 10 bits. Layout: 0 1 0 0 0 1 1 1 | 1 0 (padded with zeros)
-        // = 0x47 0x80.
-        let payload = [0x47u8, 0x80u8];
+        // = 10 bits. Round 7: +13 zero bits for quant + segmentation
+        // ⇒ 23 total bits, padded with zeros. Layout:
+        //   0 1 0 0 0 1 1 1 | 1 0 0 0 0 0 0 0 | 0 0 0 0 0 0 0 0 0
+        // = 0x47 0x80 0x00.
+        let payload = [0x47u8, 0x80u8, 0x00u8];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         let ti = fh.tile_info.as_ref().expect("intra has tile_info");
         assert_eq!(ti.tile_cols, 2);
@@ -1456,5 +1558,96 @@ mod tests {
         assert_eq!(ti.tile_cols_log2, 1);
         assert_eq!(ti.context_update_tile_id, 1);
         assert_eq!(ti.tile_size_bytes, 3);
+    }
+
+    // -------------------------------------------------------------
+    // Round 7: streaming-parser synthetic with segmentation_enabled = 1
+    // and a single active per-segment feature.
+    // -------------------------------------------------------------
+
+    /// Build a reduced-still bitstream (screen-content seq) that walks
+    /// past `tile_info()` with `tile_cols = tile_rows = 1` and then
+    /// activates `SEG_LVL_ALT_Q` on segment 0 with a non-zero signed
+    /// `feature_value`.
+    ///
+    /// `primary_ref_frame == PRIMARY_REF_NONE` (reduced-still KEY) so
+    /// segmentation_params collapses the three update flags to fixed
+    /// values (`update_map=1`, `temporal_update=0`, `update_data=1`),
+    /// and the per-segment per-feature inner loop walks 8×8 = 64
+    /// feature_enabled bits plus the `su(9)` payload for the one
+    /// active feature.
+    #[test]
+    fn segmentation_streaming_synthetic_alt_q_active() {
+        use crate::uncompressed_header_tail::{
+            MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_MAX, SEG_LVL_REF_FRAME,
+        };
+        let seq = screen_content_seq();
+        // Pre-segmentation bits: same as the reduced_still_picture_path
+        // test up through the tile_info() block + the trailing
+        // quantization_params (12 zero bits). Then the §5.9.14 walk
+        // reads its own bits: 1 (seg_enabled) + 64 (feature_enabled)
+        // + 9 (su for the one active feature).
+        let mut bits: Vec<u8> = vec![
+            0, 1, 0, // disable_cdf_update / allow_scc / force_int_mv
+            0, // render_and_frame_size_different
+            0, // allow_intrabc
+            // disable_frame_end_update_cdf is derived (reduced-still ⇒ 1, no bit)
+            1, // uniform_tile_spacing_flag
+            0, // increment_tile_cols_log2 (stops at TileColsLog2 = 0)
+            // increment_tile_rows_log2 not read (maxLog2TileRows = 0)
+            // no context_update_tile_id / tile_size_bytes reads.
+            // base_q_idx(8) = 0
+            0, 0, 0, 0, 0, 0, 0, 0, // delta_q_y_dc.delta_coded
+            0, // delta_q_u_dc.delta_coded
+            0, // delta_q_u_ac.delta_coded
+            0, // using_qmatrix
+            0,
+        ];
+        // Segmentation:
+        bits.push(1); // segmentation_enabled
+                      // primary_ref_frame == PRIMARY_REF_NONE ⇒ no update-flag reads.
+                      // Segment 0 features:
+                      // feature 0 (SEG_LVL_ALT_Q): enabled=1, su(9) value = -123.
+                      // -123 in 9-bit two's complement: 2^9 - 123 = 389 = 0b1_1000_0101.
+        bits.push(1); // feature_enabled[0][0]
+        for i in (0..9).rev() {
+            bits.push(((389u32 >> i) & 1) as u8);
+        }
+        // Segment 0 features 1..=7 disabled (7 zero bits) plus
+        // segments 1..=7 × 8 features all disabled (56 zero bits).
+        let tail_zeros = (SEG_LVL_MAX - 1) + (MAX_SEGMENTS - 1) * SEG_LVL_MAX;
+        bits.resize(bits.len() + tail_zeros, 0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let fh = parse_frame_header(&payload, &seq).expect("decodes");
+        let sp = fh.segmentation_params.as_ref().expect("intra has sp");
+        assert!(sp.enabled);
+        // primary_ref_frame == PRIMARY_REF_NONE collapses the three
+        // update flags without bitstream reads.
+        assert!(sp.update_map);
+        assert!(!sp.temporal_update);
+        assert!(sp.update_data);
+        assert!(sp.segment_feature_active[0][SEG_LVL_ALT_Q]);
+        assert_eq!(sp.segment_feature_data[0][SEG_LVL_ALT_Q], -123);
+        for i in 0..MAX_SEGMENTS {
+            for j in 0..SEG_LVL_MAX {
+                if (i, j) != (0, SEG_LVL_ALT_Q) {
+                    assert!(
+                        !sp.segment_feature_active[i][j],
+                        "feature ({i},{j}) must be inactive"
+                    );
+                    assert_eq!(sp.segment_feature_data[i][j], 0);
+                }
+            }
+        }
+        // SEG_LVL_ALT_Q is index 0 < SEG_LVL_REF_FRAME ⇒ SegIdPreSkip stays 0.
+        assert!(!sp.seg_id_pre_skip);
+        assert_eq!(SEG_LVL_ALT_Q, 0);
+        assert_eq!(SEG_LVL_REF_FRAME, 5);
+        assert_eq!(sp.last_active_seg_id, 0);
     }
 }
