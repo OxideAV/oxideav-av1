@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-22
 
-**Clean-room rebuild, round 5.** The crate's prior implementation was
+**Clean-room rebuild, round 6.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -122,6 +122,42 @@ Bitstream parsing currently covers:
   mono/3-plane quantization with and without `separate_uv_delta_q`
   and with/without `using_qmatrix`) and `su(7)` boundary values.
 
+* **§5.9.3 `allow_intrabc` + §5.9.15 `tile_info()` wired into the
+  streaming parser (round 6).** For intra frames whose
+  `allow_screen_content_tools && UpscaledWidth == FrameWidth`
+  conjunction holds, the `parse_frame_header` walk now consumes
+  the §5.9.3 `f(1)` `allow_intrabc` slot; otherwise the §5.9.2
+  `allow_intrabc = 0` initialiser stands. The
+  `disable_frame_end_update_cdf` bit (gated by
+  `!reduced_still_picture_header && !disable_cdf_update`) is
+  consumed next, then `tile_info()` per §5.9.15 walks the
+  per-frame tile layout: the uniform-spacing path uses
+  `increment_tile_cols_log2` / `increment_tile_rows_log2` loops
+  capped at `tile_log2(1, min(sbCols, MAX_TILE_COLS))` /
+  `tile_log2(1, min(sbRows, MAX_TILE_ROWS))`; the non-uniform
+  path uses `ns(maxWidth)` / `ns(maxHeight)` for
+  `width_in_sbs_minus_1` / `height_in_sbs_minus_1` via the new
+  `BitReader::ns(n)` §4.10.7 primitive. `context_update_tile_id`
+  (`f(TileColsLog2 + TileRowsLog2)`) +
+  `tile_size_bytes_minus_1` (`f(2)`) are read when at least one
+  of the log2 counts is non-zero. New type `TileInfo` exposes
+  `uniform_tile_spacing_flag`, `tile_cols`, `tile_rows`,
+  `tile_cols_log2`, `tile_rows_log2`, `context_update_tile_id`,
+  `tile_size_bytes`, `mi_col_starts` (`MiColStarts[0..=TileCols]`),
+  and `mi_row_starts`. New public §3 constants:
+  `MAX_TILE_WIDTH = 4096`, `MAX_TILE_AREA = 4096 * 2304`,
+  `MAX_TILE_ROWS = MAX_TILE_COLS = 64`. New fields on
+  `FrameHeader`: `allow_intrabc`, `disable_frame_end_update_cdf`,
+  `tile_info: Option<TileInfo>` (the latter `None` for inter
+  frames + show-existing-frame replays). 11 new tests (7 for
+  `tile_info` + 3 for `ns(n)` + 2 for the streaming-parser
+  integration); the 16-fixture frame-header integration test
+  gains 4 new asserted trace columns (`allow_intrabc`,
+  `tile_cols`, `tile_rows`, `context_update_tile_id`) plus a
+  §6.8.14 `MAX_TILE_COLS` / `MAX_TILE_ROWS` conformance guard.
+  The `tile-cols-2-rows-1` fixture exercises a real 2-tile
+  layout (`TileColsLog2 = 1`).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -144,10 +180,10 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `compute_image_size()` (`allow_intrabc`,
-`tile_info()`, motion vectors, transform / quantisation, in-loop
-filters, film grain) is **not yet implemented**. `decode_av1` and
-`encode_av1` still return `Error::NotImplemented`.
+Frame decoding past `tile_info()` (tile-content decode — motion
+vectors, transform / quantisation, in-loop filters, film grain)
+is **not yet implemented**. `decode_av1` and `encode_av1` still
+return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -182,6 +218,15 @@ filters, film grain) is **not yet implemented**. `decode_av1` and
     (`read_interpolation_filter`), §5.9.11 (`loop_filter_params`),
     §5.9.12 (`quantization_params`), §5.9.13 (`read_delta_q`),
     §6.8.9 / §6.8.10 / §6.8.11 / §6.8.12 (semantics).
+  * Round 6: §3 (constants — `MAX_TILE_WIDTH`, `MAX_TILE_AREA`,
+    `MAX_TILE_ROWS`, `MAX_TILE_COLS`), §4.7 (`FloorLog2`),
+    §4.10.7 (`ns(n)`), §5.9.2 (the `allow_intrabc` +
+    `disable_frame_end_update_cdf` + `tile_info()` placement
+    inside the `if (FrameIsIntra)` block / `reduced_still_picture
+    header || disable_cdf_update` gate), §5.9.15 (`tile_info`),
+    §5.9.16 (`tile_log2`), §6.8.14 (semantics + conformance —
+    `TileCols <= MAX_TILE_COLS`, `TileRows <= MAX_TILE_ROWS`,
+    `context_update_tile_id < TileCols * TileRows`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

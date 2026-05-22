@@ -13,11 +13,23 @@
 //!   * [`BitReader::f`] — `f(n)` per §4.10.2 / §8.1
 //!   * [`BitReader::uvlc`] — `uvlc()` per §4.10.3
 //!   * [`BitReader::su`] — `su(n)` per §4.10.6
+//!   * [`BitReader::ns`] — `ns(n)` per §4.10.7
 //!
 //! `leb128()` (§4.10.5) is byte-aligned and already implemented in
 //! [`crate::obu::parse_leb128`] against the raw payload slice.
 
 use crate::Error;
+
+/// `FloorLog2(x)` per §4.7: floor of log base 2 of `x`. For `x == 0`
+/// we return 0 (the §4.7 helper is undefined at zero; ns() is only
+/// invoked with `n >= 1`, so this convention is never reached).
+fn floor_log2(x: u32) -> u32 {
+    if x == 0 {
+        0
+    } else {
+        31 - x.leading_zeros()
+    }
+}
 
 /// MSB-first bit reader.
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +90,36 @@ impl<'a> BitReader<'a> {
         } else {
             Ok(value as i32)
         }
+    }
+
+    /// `ns(n)` per §4.10.7 — unsigned non-symmetric encoded integer in
+    /// the range `0..n`. `n` must be `>= 1`. The encoding uses
+    /// `FloorLog2(n)` bits when the value is in the lower part of the
+    /// range and `FloorLog2(n) + 1` bits otherwise — i.e. saves one
+    /// bit for values `0..(2^w - n)` where `w = FloorLog2(n) + 1`.
+    ///
+    /// The body is the literal §4.10.7 definition:
+    /// ```text
+    ///   w = FloorLog2(n) + 1
+    ///   m = (1 << w) - n
+    ///   v = f(w - 1)
+    ///   if (v < m) return v
+    ///   extra_bit = f(1)
+    ///   return (v << 1) - m + extra_bit
+    /// ```
+    pub(crate) fn ns(&mut self, n: u32) -> Result<u32, Error> {
+        debug_assert!(n >= 1);
+        // FloorLog2(n) + 1 = bit width needed to represent n - 1 + 1.
+        // For n = 1, w = 1 and we should read 0 bits (the only legal
+        // value is 0). The reference returns v from f(0) = 0 directly.
+        let w = floor_log2(n) + 1;
+        let m = (1u32 << w) - n;
+        let v = self.f(w - 1)? as u32;
+        if v < m {
+            return Ok(v);
+        }
+        let extra_bit = self.f(1)? as u32;
+        Ok((v << 1) - m + extra_bit)
     }
 
     /// `uvlc()` per §4.10.3.
@@ -201,6 +243,48 @@ mod tests {
         // su(7) reading 1000000 = signMask only ⇒ 64 - 128 = -64.
         let mut br = BitReader::new(&[0b1000_0000]);
         assert_eq!(br.su(7).unwrap(), -64);
+    }
+
+    #[test]
+    fn ns_n_equals_1_reads_zero_bits() {
+        // For n = 1, w = 1 ⇒ f(0) returns 0 ⇒ v = 0 ⇒ return v.
+        let mut br = BitReader::new(&[0xFF]);
+        assert_eq!(br.ns(1).unwrap(), 0);
+        assert_eq!(br.position(), 0);
+    }
+
+    #[test]
+    fn ns_n_equals_5_table_matches_spec() {
+        // Spec table:
+        //   value 0 ⇒ "00"  (2 bits)
+        //   value 1 ⇒ "01"  (2 bits)
+        //   value 2 ⇒ "10"  (2 bits)
+        //   value 3 ⇒ "110" (3 bits)
+        //   value 4 ⇒ "111" (3 bits)
+        //
+        // Concatenate "00 01 10 110 111" = 0b00_01_10_110_111
+        //  = 12 bits = 0000_0110_1101_11.. with two MSB tail bits free.
+        // Bit string  = 0001 1011 0111 ⇒ bytes 0x1B, 0x70 (high nibble).
+        let bytes = [0b0001_1011u8, 0b0111_0000u8];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(br.ns(5).unwrap(), 0);
+        assert_eq!(br.ns(5).unwrap(), 1);
+        assert_eq!(br.ns(5).unwrap(), 2);
+        assert_eq!(br.ns(5).unwrap(), 3);
+        assert_eq!(br.ns(5).unwrap(), 4);
+    }
+
+    #[test]
+    fn ns_n_equals_power_of_two_collapses_to_fn() {
+        // For n = 4: w = 3, m = (1 << 3) - 4 = 4. f(2) returns v in
+        // 0..=3, all of which are < m ⇒ no extra_bit ever read.
+        // Equivalent to f(2). Encode 0 1 2 3 = 00 01 10 11 = 0b00011011 = 0x1B.
+        let mut br = BitReader::new(&[0x1B]);
+        assert_eq!(br.ns(4).unwrap(), 0);
+        assert_eq!(br.ns(4).unwrap(), 1);
+        assert_eq!(br.ns(4).unwrap(), 2);
+        assert_eq!(br.ns(4).unwrap(), 3);
+        assert_eq!(br.position(), 8);
     }
 
     #[test]

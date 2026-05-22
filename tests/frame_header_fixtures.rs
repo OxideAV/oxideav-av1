@@ -67,6 +67,20 @@ struct Expected {
     /// `coded_denom + 9` when `use_superres == 1`, otherwise
     /// `SUPERRES_NUM = 8`.
     coded_denom: u8,
+    /// `allow_intrabc` column. Round 6 reads the §5.9.3 `f(1)` slot
+    /// when `allow_screen_content_tools && UpscaledWidth ==
+    /// FrameWidth`; otherwise the §5.9.2 initialiser `allow_intrabc =
+    /// 0` stands.
+    allow_intrabc: bool,
+    /// `tile_cols` column. The §5.9.15 `TileCols` derivation result.
+    tile_cols: u32,
+    /// `tile_rows` column.
+    tile_rows: u32,
+    /// `context_update_tile_id` column. `0` for fixtures that have
+    /// only a single tile (the spec `f(TileRowsLog2 + TileColsLog2)`
+    /// read collapses to 0 bits, and the parser surfaces the
+    /// `tile_size_bytes = 1` default for the trailing field).
+    context_update_tile_id: u32,
 }
 
 struct Fixture {
@@ -97,6 +111,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: false, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 16, trace_h: 16, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -113,6 +128,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -129,6 +145,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -145,6 +162,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -161,6 +179,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -177,6 +196,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: false, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -193,6 +213,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -209,6 +230,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -225,6 +247,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 128, trace_h: 64, use_superres: true, coded_denom: 3,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -241,6 +264,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 256, trace_h: 128, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -257,6 +281,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -273,6 +298,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: false, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 128, trace_h: 128, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -289,6 +315,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 256, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 2, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -306,6 +333,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -322,6 +350,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
     Fixture {
@@ -338,6 +367,7 @@ const FIXTURES: &[Fixture] = &[
             allow_screen_content_tools: true, force_integer_mv: true,
             order_hint: 0, primary_ref_frame: 7, refresh_frame_flags: 0xff,
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
+            allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
         },
     },
 ];
@@ -442,6 +472,55 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
             mismatches.push(format!(
                 "{}: mi_rows expected {} got {}",
                 fx.name, expected_mi_rows, fs.mi_rows,
+            ));
+        }
+
+        // Round 6: §5.9.3 allow_intrabc + §5.9.15 tile_info.
+        if fh.allow_intrabc != fx.expected.allow_intrabc {
+            mismatches.push(format!(
+                "{}: allow_intrabc expected {} got {}",
+                fx.name, fx.expected.allow_intrabc, fh.allow_intrabc,
+            ));
+        }
+        let ti = fh
+            .tile_info
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture {}: expected tile_info = Some(..)", fx.name));
+        if ti.tile_cols != fx.expected.tile_cols {
+            mismatches.push(format!(
+                "{}: tile_cols expected {} got {}",
+                fx.name, fx.expected.tile_cols, ti.tile_cols,
+            ));
+        }
+        if ti.tile_rows != fx.expected.tile_rows {
+            mismatches.push(format!(
+                "{}: tile_rows expected {} got {}",
+                fx.name, fx.expected.tile_rows, ti.tile_rows,
+            ));
+        }
+        if ti.context_update_tile_id != fx.expected.context_update_tile_id {
+            mismatches.push(format!(
+                "{}: context_update_tile_id expected {} got {}",
+                fx.name, fx.expected.context_update_tile_id, ti.context_update_tile_id,
+            ));
+        }
+        // §6.8.14 conformance: TileCols <= MAX_TILE_COLS, TileRows <=
+        // MAX_TILE_ROWS, context_update_tile_id < TileCols * TileRows.
+        // Surface here so a regression in the parser would trip.
+        if ti.tile_cols > oxideav_av1::MAX_TILE_COLS {
+            mismatches.push(format!(
+                "{}: TileCols ({}) exceeded MAX_TILE_COLS ({})",
+                fx.name,
+                ti.tile_cols,
+                oxideav_av1::MAX_TILE_COLS,
+            ));
+        }
+        if ti.tile_rows > oxideav_av1::MAX_TILE_ROWS {
+            mismatches.push(format!(
+                "{}: TileRows ({}) exceeded MAX_TILE_ROWS ({})",
+                fx.name,
+                ti.tile_rows,
+                oxideav_av1::MAX_TILE_ROWS,
             ));
         }
 

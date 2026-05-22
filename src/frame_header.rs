@@ -1,13 +1,19 @@
 //! Frame header OBU parser — `uncompressed_header()` through
-//! `compute_image_size()` (§5.9.2 leading slice + §5.9.5–§5.9.9).
+//! `tile_info()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc` +
+//! §5.9.5–§5.9.9 + §5.9.15).
 //!
 //! Round 3 covered everything in `uncompressed_header()` through
-//! `refresh_frame_flags`. Round 4 (this round) extends the parser
-//! past `refresh_frame_flags` by composing the four frame-size
-//! sub-syntaxes from §5.9.5 / §5.9.6 / §5.9.7 / §5.9.8 plus the
-//! §5.9.9 `compute_image_size()` derivation. The downstream blocks
-//! (`read_interpolation_filter()`, `tile_info()`,
-//! `quantization_params()`, …) remain out of scope.
+//! `refresh_frame_flags`. Round 4 extended the parser past
+//! `refresh_frame_flags` with the four frame-size sub-syntaxes from
+//! §5.9.5 / §5.9.6 / §5.9.7 / §5.9.8 plus the §5.9.9
+//! `compute_image_size()` derivation. Round 6 (this round) wires the
+//! §5.9.3 `allow_intrabc` `f(1)` slot (gated by
+//! `allow_screen_content_tools && UpscaledWidth == FrameWidth`) and
+//! the §5.9.15 `tile_info()` walk into the streaming parser for intra
+//! frames. The downstream blocks (`quantization_params()`,
+//! `segmentation_params()`, `loop_filter_params()`, …) remain
+//! standalone for now (they're available via the
+//! [`crate::uncompressed_header_tail`] entry points).
 //!
 //! ## Syntax / semantics references (all in `docs/video/av1/`)
 //!
@@ -92,6 +98,7 @@
 
 use crate::bitreader::BitReader;
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
+use crate::tile_info::{read_tile_info, TileInfo};
 use crate::Error;
 
 // ---------------------------------------------------------------------
@@ -256,7 +263,7 @@ impl FrameSize {
 /// §5.9.2 / §6.8.2 inferred default (e.g. `error_resilient_mode = true`
 /// when `frame_type == SWITCH_FRAME` or `frame_type == KEY_FRAME &&
 /// show_frame`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameHeader {
     /// `show_existing_frame` (§5.9.2 / §6.8.2). Inferred to `false`
     /// when `reduced_still_picture_header == 1`.
@@ -330,9 +337,31 @@ pub struct FrameHeader {
     /// `Some(FrameSize)` for every intra (`KEY_FRAME` /
     /// `INTRA_ONLY_FRAME`) frame.
     pub frame_size: Option<FrameSize>,
+    /// `allow_intrabc` per §5.9.3 — the `f(1)` slot inside
+    /// `uncompressed_header()` for intra frames, gated by
+    /// `allow_screen_content_tools && UpscaledWidth == FrameWidth`.
+    /// `false` when the gate is not satisfied (the spec's
+    /// `allow_intrabc = 0` initialiser at the top of §5.9.2 stands) or
+    /// when the parser stopped before this point (inter frames whose
+    /// `frame_size_with_refs()` walk isn't modelled yet, or
+    /// show-existing-frame replays).
+    pub allow_intrabc: bool,
+    /// `disable_frame_end_update_cdf` per §5.9.2 — read as `f(1)` when
+    /// `!reduced_still_picture_header && !disable_cdf_update`,
+    /// otherwise derived to `true`. Sits between the
+    /// `if (FrameIsIntra) { … allow_intrabc … }` block and the
+    /// `tile_info()` call, so it must be consumed before the tile
+    /// walk for the bit-position accounting to align with the spec.
+    pub disable_frame_end_update_cdf: bool,
+    /// `tile_info()` (§5.9.15) result. `None` for inter frames /
+    /// show-existing-frame replays — those branches stop at
+    /// `refresh_frame_flags` because the inter path needs ref-frame
+    /// state to fully parse `frame_size_with_refs()`. `Some(TileInfo)`
+    /// for every intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frame.
+    pub tile_info: Option<TileInfo>,
     /// Total bits consumed from `payload` by this parse. The next
     /// round will continue from this position to decode
-    /// `allow_intrabc` (intra path) or the inter-frame
+    /// `quantization_params()` (intra path) or the inter-frame
     /// `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
@@ -436,6 +465,17 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         // the `if (FrameIsIntra) { frame_size(); render_size(); }`
         // branch.
         let frame_size = parse_frame_size_block(br, seq, false)?;
+        let allow_intrabc = read_allow_intrabc(br, allow_screen_content_tools, &frame_size)?;
+        // §5.9.2 disable_frame_end_update_cdf gate. In the reduced-still
+        // path `reduced_still_picture_header` is true ⇒ derived to 1, no
+        // read. We still surface the value on `FrameHeader`.
+        let disable_frame_end_update_cdf = true;
+        let tile_info = Some(read_tile_info(
+            br,
+            frame_size.mi_cols,
+            frame_size.mi_rows,
+            seq.use_128x128_superblock,
+        )?);
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -454,6 +494,9 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: ALL_FRAMES,
             frame_size: Some(frame_size),
+            allow_intrabc,
+            disable_frame_end_update_cdf,
+            tile_info,
             bits_consumed: br.position(),
         });
     }
@@ -502,6 +545,9 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: 0,
             frame_size: None,
+            allow_intrabc: false,
+            disable_frame_end_update_cdf: false,
+            tile_info: None,
             bits_consumed: br.position(),
         });
     }
@@ -618,10 +664,22 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
     // none of which can be modelled without the ref-frame state.
     // Return early with `frame_size: None` and stop bit accounting
     // at `refresh_frame_flags`.
-    let frame_size = if frame_is_intra {
-        Some(parse_frame_size_block(br, seq, frame_size_override_flag)?)
+    let (frame_size, allow_intrabc, disable_frame_end_update_cdf, tile_info) = if frame_is_intra {
+        let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
+        let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
+        // §5.9.2 disable_frame_end_update_cdf — read as `f(1)` unless
+        // `reduced_still_picture_header || disable_cdf_update`. The
+        // reduced-still path is the early return above; here we know
+        // `reduced_still_picture_header == false`.
+        let dfeuc = if disable_cdf_update {
+            true
+        } else {
+            br.f(1)? == 1
+        };
+        let ti = read_tile_info(br, fs.mi_cols, fs.mi_rows, seq.use_128x128_superblock)?;
+        (Some(fs), aib, dfeuc, Some(ti))
     } else {
-        None
+        (None, false, false, None)
     };
 
     Ok(FrameHeader {
@@ -642,8 +700,26 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         primary_ref_frame,
         refresh_frame_flags,
         frame_size,
+        allow_intrabc,
+        disable_frame_end_update_cdf,
+        tile_info,
         bits_consumed: br.position(),
     })
+}
+
+/// `allow_intrabc` per §5.9.3 path of §5.9.2: read `f(1)` only when
+/// `allow_screen_content_tools && UpscaledWidth == FrameWidth`.
+/// Otherwise the §5.9.2 `allow_intrabc = 0` initialiser stands.
+fn read_allow_intrabc(
+    br: &mut BitReader<'_>,
+    allow_screen_content_tools: bool,
+    fs: &FrameSize,
+) -> Result<bool, Error> {
+    if allow_screen_content_tools && fs.upscaled_width == fs.frame_width {
+        Ok(br.f(1)? == 1)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Read `frame_size()` + `render_size()` + `superres_params()` +
@@ -882,8 +958,23 @@ mod tests {
         //   [enable_superres=0 ⇒ no use_superres / coded_denom reads]
         //   render_and_frame_size_different(1)=0
         //   [render_width / render_height not read]
-        // = +1 bit ⇒ 15 bits total.
-        assert_eq!(fh.bits_consumed, 15);
+        // = +1 bit ⇒ 15 bits. Round 6 adds:
+        //   [allow_intrabc not read: allow_scc=0]
+        //   disable_frame_end_update_cdf(1)=0
+        //   uniform_tile_spacing_flag(1)=1
+        //   [16x16 + use_128sb=1 ⇒ sbCols=sbRows=1 ⇒ TileColsLog2 /
+        //    TileRowsLog2 both saturate at 0 ⇒ no increment reads]
+        //   [TileColsLog2==0 && TileRowsLog2==0 ⇒ no
+        //    context_update_tile_id / tile_size_bytes_minus_1 reads]
+        // = +2 bits ⇒ 17 bits total.
+        assert_eq!(fh.bits_consumed, 17);
+        let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
+        assert!(ti.uniform_tile_spacing_flag);
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
+        assert_eq!(ti.context_update_tile_id, 0);
+        assert!(!fh.allow_intrabc);
+        assert!(!fh.disable_frame_end_update_cdf);
         let fs = fh.frame_size.expect("intra frame produces frame_size");
         assert_eq!(fs.frame_width, 16);
         assert_eq!(fs.frame_height, 16);
@@ -945,6 +1036,14 @@ mod tests {
         assert_eq!(fs.mi_cols, 16);
         assert_eq!(fs.mi_rows, 16);
         assert!(!fs.use_superres);
+        // allow_scc=1, UpscaledWidth=FrameWidth=64 ⇒ allow_intrabc IS read.
+        // Trace says allow_intrabc=0.
+        assert!(!fh.allow_intrabc);
+        // 64x64 use_128sb=0: sbCols=sbRows=1 ⇒ single tile (uniform-
+        // spacing-flag bit value doesn't change the semantic result).
+        let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
     }
 
     // -------------------------------------------------------------
@@ -991,8 +1090,16 @@ mod tests {
         //   [frame_size_override=0 derived; no n_w/n_h reads]
         //   [enable_superres=0; no use_superres/coded_denom reads]
         //   render_and_frame_size_different(1)=0
-        // = 4 bits. 0b0100 = 0100_0000 = 0x40.
-        let payload = [0x40u8];
+        //   allow_intrabc(1)=0       [allow_scc=1, UpscaledWidth==FrameWidth]
+        //   uniform_tile_spacing_flag(1)=1
+        //   increment_tile_cols_log2(1)=0   [stop: 256x128 use_128sb=1 ⇒
+        //                                    sbCols=2, maxLog2TileCols=1;
+        //                                    TileColsLog2 stays at 0]
+        //   [no row-increment reads: maxLog2TileRows=0]
+        //   [no context_update_tile_id / tile_size_bytes reads:
+        //    TileColsLog2==0 && TileRowsLog2==0]
+        // = 7 bits = 0b0100_0100 = 0x44.
+        let payload = [0x44u8];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert_eq!(fh.frame_type, FrameType::Key);
         assert!(fh.frame_is_intra);
@@ -1006,7 +1113,8 @@ mod tests {
         assert!(fh.force_integer_mv);
         assert_eq!(fh.refresh_frame_flags, 0xff);
         assert_eq!(fh.primary_ref_frame, PRIMARY_REF_NONE);
-        assert_eq!(fh.bits_consumed, 4);
+        assert!(!fh.allow_intrabc);
+        assert_eq!(fh.bits_consumed, 7);
         let fs = fh.frame_size.expect("reduced-still produces frame_size");
         assert_eq!(fs.frame_width, 256);
         assert_eq!(fs.frame_height, 128);
@@ -1019,6 +1127,10 @@ mod tests {
         assert!(!fs.render_and_frame_size_different);
         assert_eq!(fs.render_width, 256);
         assert_eq!(fs.render_height, 128);
+        let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
+        assert!(ti.uniform_tile_spacing_flag);
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
     }
 
     // -------------------------------------------------------------
@@ -1035,9 +1147,14 @@ mod tests {
         assert!(seq.reduced_still_picture_header);
         assert!(seq.enable_superres);
         // disable_cdf=0, allow_scc=1, force_int_mv=0, use_superres=0,
-        // render_and_frame_size_different=0 = 5 bits = 0b01000 ⇒
-        // 0100_0000 = 0x40.
-        let payload = [0x40u8];
+        // render_and_frame_size_different=0 = 5 bits.
+        // Round 6 adds:
+        //   allow_intrabc(1)=0   [allow_scc=1, UpscaledWidth=128==FrameWidth=128]
+        //   uniform_tile_spacing_flag(1)=1
+        //   [128x64 use_128sb=1 ⇒ sbCols=sbRows=1 ⇒ no
+        //    increment / context_update_tile_id reads]
+        // = 7 bits total. 0b0100_0010 = 0x42.
+        let payload = [0x42u8];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert!(fh.allow_screen_content_tools);
         assert!(fh.force_integer_mv);
@@ -1050,7 +1167,12 @@ mod tests {
         assert_eq!(fs.frame_height, 64);
         assert!(!fs.use_superres);
         assert_eq!(fs.superres_denom, SUPERRES_NUM);
-        assert_eq!(fh.bits_consumed, 5);
+        assert!(!fh.allow_intrabc);
+        assert_eq!(fh.bits_consumed, 7);
+        let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
+        assert!(ti.uniform_tile_spacing_flag);
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
     }
 
     // -------------------------------------------------------------
@@ -1070,11 +1192,16 @@ mod tests {
         //   bits 4..6 = coded_denom(3) MSB-first = 011 (= 3 ⇒
         //                                       SuperresDenom = 12)
         //   bit 7 = 0 (render_and_frame_size_different)
-        // = 8 bits = 0101_0110 = 0x56.
-        let payload = [0x56u8];
+        //   Round 6 adds:
+        //   [allow_intrabc not read: UpscaledWidth=128 != FrameWidth=85]
+        //   bit 8 = 1 (uniform_tile_spacing_flag)
+        //   [85x64 use_128sb=1: sbCols=sbRows=1 ⇒ no increment reads;
+        //    TileColsLog2==0 && TileRowsLog2==0 ⇒ no trailing reads]
+        // = 9 bits. Byte 0 = 0101_0110 = 0x56, byte 1 = 1000_0000 = 0x80.
+        let payload = [0x56u8, 0x80u8];
         let seq = super_resolution_seq();
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
-        assert_eq!(fh.bits_consumed, 8);
+        assert_eq!(fh.bits_consumed, 9);
         let fs = fh.frame_size.expect("reduced-still produces frame_size");
         assert!(fs.use_superres);
         assert_eq!(fs.coded_denom, 3);
@@ -1092,6 +1219,13 @@ mod tests {
         assert_eq!(fs.render_width, 128);
         assert_eq!(fs.render_height, 64);
         assert!(fs.is_super_resolved());
+        // UpscaledWidth=128 != FrameWidth=85 ⇒ allow_intrabc gate fails,
+        // §5.9.2 initialiser stands.
+        assert!(!fh.allow_intrabc);
+        let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
+        assert!(ti.uniform_tile_spacing_flag);
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
     }
 
     // -------------------------------------------------------------
@@ -1121,7 +1255,10 @@ mod tests {
         //   render_and_frame_size_different(1)=1
         //   render_width_minus_1(16)=39  ⇒ render_width = 40
         //   render_height_minus_1(16)=29 ⇒ render_height = 30
-        // Total bits = 1+2+1+1+1+1+7+1+16+16 = 47.
+        //   [allow_intrabc not read: allow_scc=0]
+        //   disable_frame_end_update_cdf(1)=0
+        //   uniform_tile_spacing_flag(1)=1   [tile_info on 16x16]
+        // Total bits = 1+2+1+1+1+1+7+1+16+16+1+1 = 49.
         let seq = tiny_seq();
         // Build bit-stream by writing bit-by-bit then packing.
         let bits: &[u8] = &[
@@ -1137,6 +1274,9 @@ mod tests {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1,
             // render_height_minus_1(16) = 29 = 0000_0000_0001_1101
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1,
+            // disable_frame_end_update_cdf = 0
+            0, // uniform_tile_spacing_flag = 1
+            1,
         ];
         let mut payload = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
@@ -1197,6 +1337,12 @@ mod tests {
         }
         // render_and_frame_size_different = 0
         bits.push(0);
+        // [allow_intrabc not read: allow_scc=0]
+        // disable_frame_end_update_cdf = 0
+        bits.push(0);
+        // uniform_tile_spacing_flag = 1; 12x10 with use_128sb=1 ⇒
+        // MiCols=MiRows=4 ⇒ sbCols=sbRows=1 ⇒ no further reads.
+        bits.push(1);
         let mut payload = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
             if b != 0 {
@@ -1211,6 +1357,9 @@ mod tests {
         // RenderWidth = UpscaledWidth = pre-superres FrameWidth = 12.
         assert_eq!(fs.render_width, 12);
         assert_eq!(fs.render_height, 10);
+        let ti = fh.tile_info.as_ref().expect("intra has tile_info");
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
     }
 
     // -------------------------------------------------------------
@@ -1239,5 +1388,73 @@ mod tests {
         let payload: [u8; 0] = [];
         let err = parse_frame_header(&payload, &seq).expect_err("must error");
         assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -------------------------------------------------------------
+    // Round 6: synthetic allow_intrabc = 1 path
+    // -------------------------------------------------------------
+
+    /// `allow_intrabc` is gated by
+    /// `allow_screen_content_tools && UpscaledWidth == FrameWidth`.
+    /// Use the screen-content-tools (reduced-still) sequence which
+    /// has `seq_force_screen_content_tools = SELECT` and
+    /// `enable_superres = 0`, then write `allow_intrabc = 1` into the
+    /// bitstream.
+    #[test]
+    fn allow_intrabc_read_when_gated() {
+        let seq = screen_content_seq();
+        // Bits (reduced-still + KEY+show_frame path):
+        //   disable_cdf_update(1)=0
+        //   allow_screen_content_tools(1)=1
+        //   force_integer_mv(1)=0
+        //   render_and_frame_size_different(1)=0
+        //   allow_intrabc(1)=1
+        //   [disable_frame_end_update_cdf derived 1 in reduced-still]
+        //   uniform_tile_spacing_flag(1)=1
+        //   [256x128 use_128sb=1 ⇒ sbCols=2, maxLog2TileCols=1.
+        //    Need increment_tile_cols_log2(1)=0 to stop at TileColsLog2=0
+        //    (single tile column).]
+        // = 7 bits. 0b0100_1010 = 0x4A.
+        let payload = [0x4Au8];
+        let fh = parse_frame_header(&payload, &seq).expect("decodes");
+        assert!(fh.allow_intrabc);
+        assert!(fh.disable_frame_end_update_cdf, "reduced-still derives 1");
+        let ti = fh.tile_info.as_ref().expect("intra has tile_info");
+        assert_eq!(ti.tile_cols, 1);
+        assert_eq!(ti.tile_rows, 1);
+    }
+
+    // -------------------------------------------------------------
+    // Round 6: synthetic with TileColsLog2 > 0 ⇒
+    // context_update_tile_id read.
+    // -------------------------------------------------------------
+
+    /// Build a reduced-still bitstream that lands on TileColsLog2=1
+    /// with a non-zero `context_update_tile_id`.
+    #[test]
+    fn context_update_tile_id_read_when_log2_nonzero() {
+        let seq = screen_content_seq();
+        // Bits:
+        //   disable_cdf_update(1)=0
+        //   allow_screen_content_tools(1)=1
+        //   force_integer_mv(1)=0
+        //   render_and_frame_size_different(1)=0
+        //   allow_intrabc(1)=0
+        //   uniform_tile_spacing_flag(1)=1
+        //   increment_tile_cols_log2(1)=1  ⇒ TileColsLog2 = 1
+        //   [maxLog2TileCols=1, loop exits]
+        //   [TileRowsLog2 stays at 0]
+        //   context_update_tile_id(1)=1  [TileRowsLog2 + TileColsLog2 = 1]
+        //   tile_size_bytes_minus_1(2)=10 ⇒ TileSizeBytes = 3.
+        // = 10 bits. Layout: 0 1 0 0 0 1 1 1 | 1 0 (padded with zeros)
+        // = 0x47 0x80.
+        let payload = [0x47u8, 0x80u8];
+        let fh = parse_frame_header(&payload, &seq).expect("decodes");
+        let ti = fh.tile_info.as_ref().expect("intra has tile_info");
+        assert_eq!(ti.tile_cols, 2);
+        assert_eq!(ti.tile_rows, 1);
+        assert_eq!(ti.tile_cols_log2, 1);
+        assert_eq!(ti.context_update_tile_id, 1);
+        assert_eq!(ti.tile_size_bytes, 3);
     }
 }

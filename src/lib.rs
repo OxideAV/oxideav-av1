@@ -48,6 +48,25 @@
 //!     so inter-frame parsing still stops at `refresh_frame_flags`
 //!     with `frame_size = None`. See [`frame_header`].
 //!
+//!   * **Round 6.** `allow_intrabc` (§5.9.3 path of §5.9.2) +
+//!     `tile_info()` (§5.9.15) wired into the streaming
+//!     [`parse_frame_header`] walk. For intra frames whose
+//!     `allow_screen_content_tools && UpscaledWidth == FrameWidth`
+//!     conjunction holds, the parser now consumes the `allow_intrabc`
+//!     `f(1)` slot — otherwise the spec's `allow_intrabc = 0`
+//!     initialiser stands. After the `frame_size()` / `render_size()`
+//!     block (intra path), the parser then walks `tile_info()` per
+//!     §5.9.15 and surfaces a typed [`tile_info::TileInfo`]
+//!     (`uniform_tile_spacing_flag`, `tile_cols`, `tile_rows`,
+//!     `tile_cols_log2`, `tile_rows_log2`, `context_update_tile_id`,
+//!     `tile_size_bytes`, `mi_col_starts`, `mi_row_starts`). The
+//!     non-uniform-spacing path consumes the `ns(maxWidth)` /
+//!     `ns(maxHeight)` `width_in_sbs_minus_1` / `height_in_sbs_minus_1`
+//!     fields via the new [`bitreader::BitReader::ns`] primitive
+//!     (§4.10.7). Tile-content decode (motion vectors, transform /
+//!     quantisation, in-loop filters, film grain) is still out of
+//!     scope. See [`tile_info`].
+//!
 //!   * **Round 5.** Uncompressed-header tail sub-syntaxes — §5.9.10
 //!     `read_interpolation_filter()` (returns
 //!     [`InterpolationFilter`]), §5.9.11 `loop_filter_params()`
@@ -73,10 +92,10 @@
 //!     `delta_lf_params()`) sits between round 4's stop point and
 //!     these calls. See [`uncompressed_header_tail`].
 //!
-//! Frame decoding past `compute_image_size()` (`allow_intrabc`,
-//! tile parsing, transform / quantisation, in-loop filters, film
-//! grain) is still out of scope. [`decode_av1`] / [`encode_av1`]
-//! continue to return [`Error::NotImplemented`].
+//! Frame decoding past `tile_info()` (tile-content decode — transform /
+//! quantisation, in-loop filters, motion vectors, film grain) is still
+//! out of scope. [`decode_av1`] / [`encode_av1`] continue to return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -86,6 +105,7 @@ mod bitreader;
 pub mod frame_header;
 pub mod obu;
 pub mod sequence_header;
+pub mod tile_info;
 pub mod uncompressed_header_tail;
 
 pub use frame_header::{
@@ -96,6 +116,9 @@ pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
 pub use sequence_header::{
     parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
     SequenceHeader, TimingInfo,
+};
+pub use tile_info::{
+    parse_tile_info, TileInfo, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH,
 };
 pub use uncompressed_header_tail::{
     parse_interpolation_filter, parse_loop_filter_params, parse_quantization_params,

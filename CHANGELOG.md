@@ -6,6 +6,69 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 6 — `allow_intrabc` (§5.9.3) +
+  `disable_frame_end_update_cdf` + `tile_info()` (§5.9.15) wired
+  into the streaming `parse_frame_header` walk.** For intra
+  (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frames whose
+  `allow_screen_content_tools && UpscaledWidth == FrameWidth`
+  conjunction holds, the parser now consumes the §5.9.3 `f(1)`
+  `allow_intrabc` slot — otherwise the §5.9.2 `allow_intrabc = 0`
+  initialiser stands. The `disable_frame_end_update_cdf` `f(1)`
+  bit is consumed next (gated off `reduced_still_picture_header ||
+  disable_cdf_update`). Finally `tile_info()` per §5.9.15 walks
+  the per-frame tile layout via either the uniform-spacing path
+  (`increment_tile_cols_log2` / `increment_tile_rows_log2` loops
+  capped at `tile_log2(1, min(sbCols, MAX_TILE_COLS))` /
+  `tile_log2(1, min(sbRows, MAX_TILE_ROWS))`) or the non-uniform
+  path (`ns(maxWidth)` / `ns(maxHeight)` `width_in_sbs_minus_1` /
+  `height_in_sbs_minus_1` reads). The
+  `context_update_tile_id` (`f(TileColsLog2 + TileRowsLog2)`) +
+  `tile_size_bytes_minus_1` (`f(2)`) trailing reads are gated by
+  `TileColsLog2 > 0 || TileRowsLog2 > 0`. Three new fields on
+  `FrameHeader`: `allow_intrabc`, `disable_frame_end_update_cdf`,
+  `tile_info: Option<TileInfo>`.
+
+  New module: `tile_info`. New public types:
+  `TileInfo { uniform_tile_spacing_flag, tile_cols, tile_rows,
+  tile_cols_log2, tile_rows_log2, context_update_tile_id,
+  tile_size_bytes, mi_col_starts, mi_row_starts }`. New
+  standalone entry point: `parse_tile_info(payload, mi_cols,
+  mi_rows, use_128x128_superblock) -> (TileInfo, usize)`. New
+  public constants from §3: `MAX_TILE_WIDTH = 4096`,
+  `MAX_TILE_AREA = 4096 * 2304`, `MAX_TILE_ROWS = 64`,
+  `MAX_TILE_COLS = 64`. New internal bitreader primitive:
+  `BitReader::ns(n)` per §4.10.7 — the non-symmetric unsigned
+  descriptor used for the non-uniform-spacing
+  `width_in_sbs_minus_1` / `height_in_sbs_minus_1` reads.
+
+  Because the §5.9.2 syntax tree carries
+  `disable_frame_end_update_cdf` between `allow_intrabc` and
+  `tile_info()`, the streaming parser also consumes that bit (and
+  the `FrameHeader::disable_frame_end_update_cdf` field is now
+  surfaced). For inter frames + show-existing-frame replays the
+  parser still stops at `refresh_frame_flags` (the
+  `frame_size_with_refs()` / `ref_frame_idx[]` walks remain
+  un-modelled), so `tile_info` is `None` in those cases.
+
+  `FrameHeader` is no longer `Copy` (the `TileInfo` arrays make
+  it `!Copy`); it remains `Clone + PartialEq + Eq`.
+
+  Validation: 11 new unit tests (7 for `tile_info` standalone
+  including `tile_log2` table, 16×16 single-tile uniform / 256×64
+  two-column uniform / 64×64 single-superblock / 128×128 with
+  use_128x128_superblock=1 / non-uniform two-column / truncated
+  payload), 3 for the `BitReader::ns(n)` descriptor (n=1, n=5
+  table check, n=power-of-two collapse), and 2 for the
+  streaming-parser integration (`allow_intrabc = 1` via the
+  screen-content seq, `context_update_tile_id` read when
+  `TileColsLog2 + TileRowsLog2 > 0`). The 16-fixture frame-header
+  integration test gains four new asserted trace columns
+  (`allow_intrabc`, `tile_cols`, `tile_rows`,
+  `context_update_tile_id`) plus the `MAX_TILE_COLS` /
+  `MAX_TILE_ROWS` conformance guard from §6.8.14. The
+  `tile-cols-2-rows-1` fixture exercises a real 2-tile layout
+  (`TileColsLog2 = 1`, `TileSizeBytes` read).
+
 * **Round 5 — Uncompressed-header tail sub-syntaxes (§5.9.10 /
   §5.9.11 / §5.9.12 / §5.9.13).** New `uncompressed_header_tail`
   module exposes three standalone parser entry points that take a
