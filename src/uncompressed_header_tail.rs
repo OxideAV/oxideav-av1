@@ -1,16 +1,18 @@
 //! Sub-syntax functions called from the tail of
-//! `uncompressed_header()` (§5.9.2). Rounds 5–7 of the clean-room
+//! `uncompressed_header()` (§5.9.2). Rounds 5–8 of the clean-room
 //! rebuild landed `read_interpolation_filter()` (§5.9.10),
 //! `loop_filter_params()` (§5.9.11), `quantization_params()` (§5.9.12),
-//! and — added this round — `segmentation_params()` (§5.9.14).
+//! `segmentation_params()` (§5.9.14), and — added this round —
+//! `delta_q_params()` (§5.9.17) + `delta_lf_params()` (§5.9.18).
 //!
-//! `quantization_params()` and `segmentation_params()` are also wired
-//! into the streaming [`crate::parse_frame_header`] walk (intra path)
-//! since they sit before the remaining `delta_q_params()` /
-//! `delta_lf_params()` / `loop_filter_params()` / `cdef_params()` /
-//! `lr_params()` block. The standalone entry points remain available so
-//! callers that want to exercise the parsers on a raw byte slice can do
-//! so without rebuilding a `SequenceHeader` and a streaming context.
+//! `quantization_params()`, `segmentation_params()`,
+//! `delta_q_params()`, and `delta_lf_params()` are also wired into the
+//! streaming [`crate::parse_frame_header`] walk (intra path) since they
+//! sit before the remaining `loop_filter_params()` (streaming wire-in)
+//! / `cdef_params()` / `lr_params()` block. The standalone entry points
+//! remain available so callers that want to exercise the parsers on a
+//! raw byte slice can do so without rebuilding a `SequenceHeader` and a
+//! streaming context.
 //!
 //! ## Syntax / semantics references (all in `docs/video/av1/`)
 //!
@@ -19,11 +21,15 @@
 //!   * §5.9.12 — `quantization_params()`
 //!   * §5.9.13 — `read_delta_q()` (helper for §5.9.12)
 //!   * §5.9.14 — `segmentation_params()`
+//!   * §5.9.17 — `delta_q_params()`
+//!   * §5.9.18 — `delta_lf_params()`
 //!   * §6.8.9  — Interpolation filter semantics
 //!   * §6.8.10 — Loop filter semantics
 //!   * §6.8.11 — Quantization params semantics
 //!   * §6.8.12 — Delta quantizer semantics
 //!   * §6.8.13 — Segmentation params semantics
+//!   * §6.8.15 — Quantizer index delta params semantics
+//!   * §6.8.16 — Loop filter delta params semantics
 //!   * §4.10.6 — `su(n)` signed-integer descriptor (used for
 //!     `loop_filter_ref_deltas` / `loop_filter_mode_deltas` / the
 //!     `delta_q` field of `read_delta_q()` / signed `feature_value`
@@ -669,6 +675,132 @@ pub(crate) fn read_segmentation_params(
         segment_feature_data: feature_data,
         seg_id_pre_skip,
         last_active_seg_id,
+    })
+}
+
+// ---------------------------------------------------------------------
+// §5.9.17 delta_q_params
+// ---------------------------------------------------------------------
+
+/// Parsed `delta_q_params()` per §5.9.17.
+///
+/// Per the syntax the `delta_q_present` `f(1)` slot is read only when
+/// `base_q_idx > 0`; otherwise it stays at its `delta_q_present = 0`
+/// initialiser and no bit is consumed. `delta_q_res` (the `f(2)` left
+/// shift applied to decoded quantiser-index deltas — §6.8.15) is read
+/// only when `delta_q_present == 1`, otherwise it stays 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeltaQParams {
+    /// `delta_q_present` — whether per-block quantiser-index deltas are
+    /// signalled at superblock granularity (§6.8.15).
+    pub delta_q_present: bool,
+    /// `delta_q_res` (`f(2)`) — left shift applied to decoded quantiser
+    /// index delta values. `0` when `delta_q_present == 0`.
+    pub delta_q_res: u8,
+}
+
+/// Parse `delta_q_params()` per §5.9.17 from a raw byte slice.
+///
+/// `base_q_idx` is §5.9.12's `base_q_idx`; the `delta_q_present` slot is
+/// only read when it is greater than 0.
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+pub fn parse_delta_q_params(
+    payload: &[u8],
+    base_q_idx: u8,
+) -> Result<(DeltaQParams, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let d = read_delta_q_params(&mut br, base_q_idx)?;
+    Ok((d, br.position()))
+}
+
+pub(crate) fn read_delta_q_params(
+    br: &mut BitReader<'_>,
+    base_q_idx: u8,
+) -> Result<DeltaQParams, Error> {
+    // §5.9.17: delta_q_res / delta_q_present default to 0.
+    let mut delta_q_present = false;
+    let mut delta_q_res = 0u8;
+    if base_q_idx > 0 {
+        delta_q_present = br.f(1)? == 1;
+    }
+    if delta_q_present {
+        delta_q_res = br.f(2)? as u8;
+    }
+    Ok(DeltaQParams {
+        delta_q_present,
+        delta_q_res,
+    })
+}
+
+// ---------------------------------------------------------------------
+// §5.9.18 delta_lf_params
+// ---------------------------------------------------------------------
+
+/// Parsed `delta_lf_params()` per §5.9.18.
+///
+/// The whole block is gated on `delta_q_present` (from §5.9.17). When
+/// it is set, `delta_lf_present` is read as `f(1)` only when
+/// `!allow_intrabc` (§5.9.18); when `delta_lf_present == 1` the
+/// `delta_lf_res` (`f(2)`) and `delta_lf_multi` (`f(1)`) fields follow.
+/// All three default to 0 / false otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeltaLfParams {
+    /// `delta_lf_present` — whether per-block loop-filter deltas are
+    /// signalled (§6.8.16).
+    pub delta_lf_present: bool,
+    /// `delta_lf_res` (`f(2)`) — left shift applied to decoded
+    /// loop-filter delta values. `0` when `delta_lf_present == 0`.
+    pub delta_lf_res: u8,
+    /// `delta_lf_multi` — when set, separate loop-filter deltas are
+    /// sent for horizontal-luma / vertical-luma / U / V edges; when
+    /// clear, a single delta applies to all edges (§6.8.16). `false`
+    /// when `delta_lf_present == 0`.
+    pub delta_lf_multi: bool,
+}
+
+/// Parse `delta_lf_params()` per §5.9.18 from a raw byte slice.
+///
+/// `delta_q_present` is §5.9.17's `delta_q_present` (the whole block is
+/// a no-op when it is `false`). `allow_intrabc` is §5.9.3's
+/// `allow_intrabc` (the `delta_lf_present` slot is suppressed when it
+/// is `true`).
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+pub fn parse_delta_lf_params(
+    payload: &[u8],
+    delta_q_present: bool,
+    allow_intrabc: bool,
+) -> Result<(DeltaLfParams, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let d = read_delta_lf_params(&mut br, delta_q_present, allow_intrabc)?;
+    Ok((d, br.position()))
+}
+
+pub(crate) fn read_delta_lf_params(
+    br: &mut BitReader<'_>,
+    delta_q_present: bool,
+    allow_intrabc: bool,
+) -> Result<DeltaLfParams, Error> {
+    // §5.9.18: all three fields default to 0 / false.
+    let mut delta_lf_present = false;
+    let mut delta_lf_res = 0u8;
+    let mut delta_lf_multi = false;
+    if delta_q_present {
+        if !allow_intrabc {
+            delta_lf_present = br.f(1)? == 1;
+        }
+        if delta_lf_present {
+            delta_lf_res = br.f(2)? as u8;
+            delta_lf_multi = br.f(1)? == 1;
+        }
+    }
+    Ok(DeltaLfParams {
+        delta_lf_present,
+        delta_lf_res,
+        delta_lf_multi,
     })
 }
 
@@ -1326,6 +1458,114 @@ mod tests {
     fn segmentation_unexpected_end() {
         let payload: [u8; 0] = [];
         let err = parse_segmentation_params(&payload, PRIMARY_REF_NONE).expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.17 delta_q_params
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn delta_q_base_q_idx_zero_reads_nothing() {
+        // base_q_idx == 0 ⇒ the `delta_q_present` `f(1)` slot is not
+        // read; delta_q_present stays 0 and 0 bits are consumed even on
+        // an empty payload.
+        let payload: [u8; 0] = [];
+        let (d, n) = parse_delta_q_params(&payload, 0).expect("decodes");
+        assert!(!d.delta_q_present);
+        assert_eq!(d.delta_q_res, 0);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn delta_q_present_zero_reads_one_bit() {
+        // base_q_idx > 0, delta_q_present = 0 (single 0 bit), no
+        // delta_q_res read. 1 bit consumed.
+        let payload = [0b0000_0000u8];
+        let (d, n) = parse_delta_q_params(&payload, 120).expect("decodes");
+        assert!(!d.delta_q_present);
+        assert_eq!(d.delta_q_res, 0);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn delta_q_present_one_reads_res() {
+        // base_q_idx > 0, delta_q_present = 1, delta_q_res = f(2) = 10
+        // (= 2). bits: 1 10 = 110 = 0b1100_0000 = 0xC0. 3 bits.
+        let payload = [0b1100_0000u8];
+        let (d, n) = parse_delta_q_params(&payload, 120).expect("decodes");
+        assert!(d.delta_q_present);
+        assert_eq!(d.delta_q_res, 2);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn delta_q_present_bit_unexpected_end() {
+        // base_q_idx > 0 but no bytes ⇒ reading delta_q_present errors.
+        let payload: [u8; 0] = [];
+        let err = parse_delta_q_params(&payload, 120).expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.18 delta_lf_params
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn delta_lf_gated_off_when_delta_q_absent() {
+        // delta_q_present == false ⇒ the whole block is skipped; all
+        // fields stay default and 0 bits are consumed.
+        let payload: [u8; 0] = [];
+        let (d, n) = parse_delta_lf_params(&payload, false, false).expect("decodes");
+        assert!(!d.delta_lf_present);
+        assert_eq!(d.delta_lf_res, 0);
+        assert!(!d.delta_lf_multi);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn delta_lf_present_zero_reads_one_bit() {
+        // delta_q_present, !allow_intrabc ⇒ read delta_lf_present = 0
+        // (single 0 bit), no further reads. 1 bit consumed.
+        let payload = [0b0000_0000u8];
+        let (d, n) = parse_delta_lf_params(&payload, true, false).expect("decodes");
+        assert!(!d.delta_lf_present);
+        assert_eq!(d.delta_lf_res, 0);
+        assert!(!d.delta_lf_multi);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn delta_lf_present_full_path() {
+        // delta_q_present, !allow_intrabc ⇒ delta_lf_present = 1,
+        // delta_lf_res = f(2) = 11 (= 3), delta_lf_multi = f(1) = 1.
+        // bits: 1 11 1 = 1111 = 0b1111_0000 = 0xF0. 4 bits consumed.
+        let payload = [0b1111_0000u8];
+        let (d, n) = parse_delta_lf_params(&payload, true, false).expect("decodes");
+        assert!(d.delta_lf_present);
+        assert_eq!(d.delta_lf_res, 3);
+        assert!(d.delta_lf_multi);
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn delta_lf_suppressed_by_allow_intrabc() {
+        // delta_q_present but allow_intrabc ⇒ delta_lf_present slot is
+        // not read; stays 0. No bits consumed even on empty payload.
+        let payload: [u8; 0] = [];
+        let (d, n) = parse_delta_lf_params(&payload, true, true).expect("decodes");
+        assert!(!d.delta_lf_present);
+        assert_eq!(d.delta_lf_res, 0);
+        assert!(!d.delta_lf_multi);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn delta_lf_present_bit_unexpected_end() {
+        // delta_q_present, !allow_intrabc, empty payload ⇒ reading
+        // delta_lf_present errors.
+        let payload: [u8; 0] = [];
+        let err = parse_delta_lf_params(&payload, true, false).expect_err("must err");
         assert_eq!(err, Error::UnexpectedEnd);
     }
 }

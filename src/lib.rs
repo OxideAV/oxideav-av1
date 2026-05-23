@@ -111,11 +111,28 @@
 //!     / [`SEGMENTATION_FEATURE_MAX`]. See
 //!     [`uncompressed_header_tail::parse_segmentation_params`].
 //!
-//! Frame decoding past `segmentation_params()` (the remaining tail —
-//! `delta_q_params()` / `delta_lf_params()` / `loop_filter_params()` /
-//! `cdef_params()` / `lr_params()` / tile-content decode) is still out
-//! of scope. [`decode_av1`] / [`encode_av1`] continue to return
-//! [`Error::NotImplemented`].
+//!   * **Round 8.** §5.9.17 `delta_q_params()` and §5.9.18
+//!     `delta_lf_params()` wired into the streaming
+//!     [`parse_frame_header`] walk (intra path). After
+//!     `segmentation_params()` the parser consumes `delta_q_params()`
+//!     and surfaces a typed [`DeltaQParams`] on
+//!     [`FrameHeader::delta_q_params`] (`delta_q_present` — read as
+//!     `f(1)` only when `base_q_idx > 0`; `delta_q_res` — `f(2)`,
+//!     read only when `delta_q_present == 1`), then `delta_lf_params()`
+//!     and surfaces a typed [`DeltaLfParams`] on
+//!     [`FrameHeader::delta_lf_params`] (`delta_lf_present` — gated on
+//!     `delta_q_present` and suppressed when `allow_intrabc == 1`;
+//!     `delta_lf_res` / `delta_lf_multi` — read only when
+//!     `delta_lf_present == 1`). Both remain available as standalone
+//!     parser entry points
+//!     ([`uncompressed_header_tail::parse_delta_q_params`] /
+//!     [`uncompressed_header_tail::parse_delta_lf_params`]).
+//!
+//! Frame decoding past `delta_lf_params()` (the remaining tail —
+//! `loop_filter_params()` streaming wire-in / `cdef_params()` /
+//! `lr_params()` / `read_tx_mode()` / `frame_reference_mode()` /
+//! tile-content decode) is still out of scope. [`decode_av1`] /
+//! [`encode_av1`] continue to return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -141,13 +158,13 @@ pub use tile_info::{
     parse_tile_info, TileInfo, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH,
 };
 pub use uncompressed_header_tail::{
-    parse_interpolation_filter, parse_loop_filter_params, parse_quantization_params,
-    parse_segmentation_params, InterpolationFilter, LoopFilterParams, QuantizationParams,
-    SegmentationParams, LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT,
-    MAX_LOOP_FILTER, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
-    SEGMENTATION_FEATURE_SIGNED, SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H,
-    SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME,
-    SEG_LVL_SKIP, TOTAL_REFS_PER_FRAME,
+    parse_delta_lf_params, parse_delta_q_params, parse_interpolation_filter,
+    parse_loop_filter_params, parse_quantization_params, parse_segmentation_params, DeltaLfParams,
+    DeltaQParams, InterpolationFilter, LoopFilterParams, QuantizationParams, SegmentationParams,
+    LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT, MAX_LOOP_FILTER, MAX_SEGMENTS,
+    SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX, SEGMENTATION_FEATURE_SIGNED,
+    SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H, SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q,
+    SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, TOTAL_REFS_PER_FRAME,
 };
 
 /// Crate-local error type.

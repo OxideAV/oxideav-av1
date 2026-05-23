@@ -2,9 +2,9 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-22
+## Status — 2026-05-24
 
-**Clean-room rebuild, round 6.** The crate's prior implementation was
+**Clean-room rebuild, round 8.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -202,6 +202,36 @@ Bitstream parsing currently covers:
   columns (`base_q_idx`, `seg_enabled`) plus a `SegIdPreSkip = 0`
   / `LastActiveSegId = 0` invariant guard.
 
+* **§5.9.17 `delta_q_params()` + §5.9.18 `delta_lf_params()` wired
+  into the streaming parser (round 8).** After `segmentation_params()`
+  the parser now consumes `delta_q_params()` per §5.9.17 — the
+  `delta_q_present` `f(1)` slot is read only when `base_q_idx > 0`
+  (otherwise the §5.9.17 `delta_q_present = 0` initialiser stands and
+  no bit is consumed), and `delta_q_res` (`f(2)`) follows only when
+  `delta_q_present == 1` — then `delta_lf_params()` per §5.9.18: the
+  whole block is gated on `delta_q_present`, the `delta_lf_present`
+  `f(1)` slot is suppressed when `allow_intrabc == 1`, and
+  `delta_lf_res` (`f(2)`) + `delta_lf_multi` (`f(1)`) follow only when
+  `delta_lf_present == 1`. New types `DeltaQParams`
+  (`delta_q_present`, `delta_q_res`) and `DeltaLfParams`
+  (`delta_lf_present`, `delta_lf_res`, `delta_lf_multi`) surface on
+  `FrameHeader::delta_q_params` / `FrameHeader::delta_lf_params`
+  (`Some` for intra frames, `None` for inter / show-existing-frame
+  paths). New standalone parser entry points `parse_delta_q_params` /
+  `parse_delta_lf_params`. 9 new unit tests (3 for `delta_q_params` —
+  `base_q_idx == 0` no-read / `delta_q_present == 0` 1-bit /
+  `delta_q_present == 1` reads `delta_q_res` — plus an
+  unexpected-end; 5 for `delta_lf_params` — gated-off when
+  `delta_q_present == 0` / `delta_lf_present == 0` 1-bit / full path
+  reading `delta_lf_res` + `delta_lf_multi` / suppressed by
+  `allow_intrabc` / unexpected-end). The 16-fixture frame-header
+  integration test gains two new asserted trace columns
+  (`delta_q_present`, `delta_lf_present`) plus `delta_q_res = 0` /
+  `delta_lf_res = 0` / `delta_lf_multi = false` invariant guards. The
+  `lossless-i-only` fixture (`base_q_idx = 0`) exercises the §5.9.17
+  no-read branch; every other fixture reads exactly one
+  `delta_q_present` bit (all 0).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -224,13 +254,13 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `segmentation_params()` (the remaining
-uncompressed-header tail — `delta_q_params()`, `delta_lf_params()`,
-`loop_filter_params()` streaming wire-in, `cdef_params()`,
-`lr_params()` — plus tile-content decode — motion vectors,
-transform / quantisation, in-loop filters, film grain) is **not
-yet implemented**. `decode_av1` and `encode_av1` still return
-`Error::NotImplemented`.
+Frame decoding past `delta_lf_params()` (the remaining
+uncompressed-header tail — `loop_filter_params()` streaming
+wire-in, `cdef_params()`, `lr_params()`, `read_tx_mode()`,
+`frame_reference_mode()` — plus tile-content decode — motion
+vectors, transform / quantisation, in-loop filters, film grain)
+is **not yet implemented**. `decode_av1` and `encode_av1` still
+return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -283,6 +313,15 @@ yet implemented**. `decode_av1` and `encode_av1` still return
     `if (FrameIsIntra)` block), §5.9.14 (`segmentation_params`),
     §6.8.13 (semantics — `SegIdPreSkip` / `LastActiveSegId`
     derivations).
+  * Round 8: §5.9.2 (the `delta_q_params()` + `delta_lf_params()`
+    placement after `segmentation_params()` in the
+    `if (FrameIsIntra)` block), §5.9.17 (`delta_q_params` — the
+    `base_q_idx > 0` gate on `delta_q_present`, the `delta_q_present`
+    gate on `delta_q_res`), §5.9.18 (`delta_lf_params` — the
+    `delta_q_present` gate on the block, the `!allow_intrabc` gate on
+    `delta_lf_present`, the `delta_lf_present` gate on `delta_lf_res`
+    / `delta_lf_multi`), §6.8.15 (quantizer-index delta semantics),
+    §6.8.16 (loop-filter delta semantics).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

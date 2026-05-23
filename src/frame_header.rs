@@ -1,6 +1,6 @@
 //! Frame header OBU parser — `uncompressed_header()` through
-//! `segmentation_params()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc`
-//! + §5.9.5–§5.9.9 + §5.9.12 + §5.9.14 + §5.9.15).
+//! `delta_lf_params()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc`
+//! + §5.9.5–§5.9.9 + §5.9.12 + §5.9.14 + §5.9.15 + §5.9.17 + §5.9.18).
 //!
 //! Round 3 covered everything in `uncompressed_header()` through
 //! `refresh_frame_flags`. Round 4 extended the parser past
@@ -9,10 +9,11 @@
 //! `compute_image_size()` derivation. Round 6 wired the §5.9.3
 //! `allow_intrabc` `f(1)` slot (gated by `allow_screen_content_tools &&
 //! UpscaledWidth == FrameWidth`) and the §5.9.15 `tile_info()` walk
-//! into the streaming parser for intra frames. Round 7 (this round)
-//! wires §5.9.12 `quantization_params()` and §5.9.14
-//! `segmentation_params()` after `tile_info()`. The downstream blocks
-//! (`delta_q_params()`, `delta_lf_params()`, `loop_filter_params()`,
+//! into the streaming parser for intra frames. Round 7 wired §5.9.12
+//! `quantization_params()` and §5.9.14 `segmentation_params()` after
+//! `tile_info()`. Round 8 (this round) wires §5.9.17 `delta_q_params()`
+//! and §5.9.18 `delta_lf_params()` after `segmentation_params()`. The
+//! downstream blocks (`loop_filter_params()` streaming wire-in,
 //! `cdef_params()`, `lr_params()`, …) remain to be wired in subsequent
 //! rounds.
 //!
@@ -25,6 +26,10 @@
 //!   * §5.9.7 — `frame_size_with_refs()`
 //!   * §5.9.8 — `superres_params()`
 //!   * §5.9.9 — `compute_image_size()`
+//!   * §5.9.17 — `delta_q_params()` (via
+//!     [`crate::uncompressed_header_tail::parse_delta_q_params`])
+//!   * §5.9.18 — `delta_lf_params()` (via
+//!     [`crate::uncompressed_header_tail::parse_delta_lf_params`])
 //!   * §6.8.1 — General frame header OBU semantics
 //!   * §6.8.2 — Uncompressed header semantics
 //!   * §6.8.4 — Frame size semantics
@@ -32,6 +37,8 @@
 //!   * §6.8.6 — Frame size with refs semantics
 //!   * §6.8.7 — Superres params semantics
 //!   * §6.8.8 — Compute image size semantics
+//!   * §6.8.15 — Quantizer index delta params semantics
+//!   * §6.8.16 — Loop filter delta params semantics
 //!
 //! §3 constants used here:
 //!
@@ -89,10 +96,11 @@
 //!     hasn't implemented the inter-frame `ref_frame_idx[]` /
 //!     `delta_frame_id_minus_1` walk between `refresh_frame_flags`
 //!     and the size block.
-//!   * `allow_intrabc` and everything past it — the spec's
-//!     `if (allow_screen_content_tools && UpscaledWidth == FrameWidth)`
-//!     intrabc bit and `read_interpolation_filter()` / `tile_info()` /
-//!     etc. are next round's work.
+//!   * `loop_filter_params()` streaming wire-in (§5.9.11),
+//!     `cdef_params()` (§5.9.19), `lr_params()` (§5.9.20),
+//!     `read_tx_mode()` (§5.9.21), `frame_reference_mode()` (§5.9.23),
+//!     and everything past `delta_lf_params()` — next round's work. The
+//!     intra path now parses through `delta_lf_params()` (§5.9.18).
 //!
 //! The bit count consumed is returned in [`FrameHeader::bits_consumed`]
 //! so the next round can continue at exactly the right bit.
@@ -101,7 +109,8 @@ use crate::bitreader::BitReader;
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
 use crate::tile_info::{read_tile_info, TileInfo};
 use crate::uncompressed_header_tail::{
-    read_quantization_params, read_segmentation_params, QuantizationParams, SegmentationParams,
+    read_delta_lf_params, read_delta_q_params, read_quantization_params, read_segmentation_params,
+    DeltaLfParams, DeltaQParams, QuantizationParams, SegmentationParams,
 };
 use crate::Error;
 
@@ -371,10 +380,23 @@ pub struct FrameHeader {
     /// `quantization_params` is `Some` (intra frames); `None` for inter
     /// / show-existing-frame paths that stop before this point.
     pub segmentation_params: Option<SegmentationParams>,
+    /// `delta_q_params()` (§5.9.17) result. `Some` whenever
+    /// `segmentation_params` is `Some` (intra frames); `None` for inter
+    /// / show-existing-frame paths that stop before this point. The
+    /// `delta_q_present` `f(1)` slot is only consumed when
+    /// `base_q_idx > 0`.
+    pub delta_q_params: Option<DeltaQParams>,
+    /// `delta_lf_params()` (§5.9.18) result. `Some` whenever
+    /// `delta_q_params` is `Some` (intra frames); `None` for inter /
+    /// show-existing-frame paths. The block is a no-op when
+    /// `delta_q_present == 0`, and the `delta_lf_present` slot is
+    /// suppressed when `allow_intrabc == 1`.
+    pub delta_lf_params: Option<DeltaLfParams>,
     /// Total bits consumed from `payload` by this parse. The next
-    /// round will continue from this position to decode
-    /// `delta_q_params()` / `delta_lf_params()` (intra path) or the
-    /// inter-frame `frame_refs_short_signaling` block (inter path).
+    /// round will continue from this position to decode the
+    /// `loop_filter_params()` streaming wire-in / `cdef_params()` /
+    /// `lr_params()` block (intra path) or the inter-frame
+    /// `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
 
@@ -498,6 +520,14 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             seq.color_config.separate_uv_delta_q,
         )?;
         let segmentation_params = read_segmentation_params(br, PRIMARY_REF_NONE)?;
+        // §5.9.2 spec order after segmentation_params(): delta_q_params()
+        // (§5.9.17) then delta_lf_params() (§5.9.18). delta_q_params reads
+        // the `delta_q_present` `f(1)` slot only when `base_q_idx > 0`;
+        // delta_lf_params is a no-op when `delta_q_present == 0` and its
+        // `delta_lf_present` slot is suppressed when `allow_intrabc == 1`.
+        let delta_q_params = read_delta_q_params(br, quantization_params.base_q_idx)?;
+        let delta_lf_params =
+            read_delta_lf_params(br, delta_q_params.delta_q_present, allow_intrabc)?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -521,6 +551,8 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             tile_info,
             quantization_params: Some(quantization_params),
             segmentation_params: Some(segmentation_params),
+            delta_q_params: Some(delta_q_params),
+            delta_lf_params: Some(delta_lf_params),
             bits_consumed: br.position(),
         });
     }
@@ -574,6 +606,8 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             tile_info: None,
             quantization_params: None,
             segmentation_params: None,
+            delta_q_params: None,
+            delta_lf_params: None,
             bits_consumed: br.position(),
         });
     }
@@ -697,6 +731,8 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         tile_info,
         quantization_params,
         segmentation_params,
+        delta_q_params,
+        delta_lf_params,
     ) = if frame_is_intra {
         let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
         let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
@@ -721,9 +757,25 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             seq.color_config.separate_uv_delta_q,
         )?;
         let sp = read_segmentation_params(br, primary_ref_frame)?;
-        (Some(fs), aib, dfeuc, Some(ti), Some(qp), Some(sp))
+        // §5.9.2 spec order after segmentation_params(): delta_q_params()
+        // (§5.9.17) then delta_lf_params() (§5.9.18). delta_q reads its
+        // `delta_q_present` slot only when `base_q_idx > 0`; delta_lf is
+        // a no-op when `delta_q_present == 0` and its `delta_lf_present`
+        // slot is suppressed when `allow_intrabc == 1`.
+        let dq = read_delta_q_params(br, qp.base_q_idx)?;
+        let dlf = read_delta_lf_params(br, dq.delta_q_present, aib)?;
+        (
+            Some(fs),
+            aib,
+            dfeuc,
+            Some(ti),
+            Some(qp),
+            Some(sp),
+            Some(dq),
+            Some(dlf),
+        )
     } else {
-        (None, false, false, None, None, None)
+        (None, false, false, None, None, None, None, None)
     };
 
     Ok(FrameHeader {
@@ -749,6 +801,8 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         tile_info,
         quantization_params,
         segmentation_params,
+        delta_q_params,
+        delta_lf_params,
         bits_consumed: br.position(),
     })
 }
@@ -1019,8 +1073,13 @@ mod tests {
         //     [V mirrors U: no read], using_qmatrix(1)=0
         //   = +12 bits.
         //   segmentation_params: seg_enabled(1)=0 ⇒ +1 bit, no further reads.
-        // = 30 bits total.
-        assert_eq!(fh.bits_consumed, 30);
+        // = 30 bits. Round 8 adds:
+        //   delta_q_params: base_q_idx(120) > 0 ⇒ delta_q_present(1)=0
+        //     read ⇒ +1 bit; delta_q_present=0 ⇒ no delta_q_res read.
+        //   delta_lf_params: delta_q_present=0 ⇒ whole block skipped,
+        //     no bits read.
+        // = 31 bits total.
+        assert_eq!(fh.bits_consumed, 31);
         let qp = fh
             .quantization_params
             .as_ref()
@@ -1040,6 +1099,21 @@ mod tests {
         assert!(!sp.update_data);
         assert!(!sp.seg_id_pre_skip);
         assert_eq!(sp.last_active_seg_id, 0);
+        let dq = fh
+            .delta_q_params
+            .as_ref()
+            .expect("intra frame produces delta_q_params");
+        // base_q_idx=120 > 0 ⇒ delta_q_present read, trace says 0.
+        assert!(!dq.delta_q_present);
+        assert_eq!(dq.delta_q_res, 0);
+        let dlf = fh
+            .delta_lf_params
+            .as_ref()
+            .expect("intra frame produces delta_lf_params");
+        // delta_q_present=0 ⇒ whole delta_lf_params block is a no-op.
+        assert!(!dlf.delta_lf_present);
+        assert_eq!(dlf.delta_lf_res, 0);
+        assert!(!dlf.delta_lf_multi);
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);

@@ -6,6 +6,48 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 8 — `delta_q_params()` (§5.9.17) + `delta_lf_params()`
+  (§5.9.18) wired into the streaming `parse_frame_header` walk.** For
+  intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frames the parser now
+  descends past `segmentation_params()` into `delta_q_params()`: the
+  `delta_q_present` `f(1)` slot is read only when `base_q_idx > 0`
+  (otherwise the §5.9.17 `delta_q_present = 0` initialiser stands, no
+  bit consumed), and `delta_q_res` (`f(2)`) follows only when
+  `delta_q_present == 1`. Then `delta_lf_params()`: the whole block is
+  gated on `delta_q_present`, the `delta_lf_present` `f(1)` slot is
+  suppressed when `allow_intrabc == 1`, and `delta_lf_res` (`f(2)`) +
+  `delta_lf_multi` (`f(1)`) follow only when `delta_lf_present == 1`.
+
+  New types `DeltaQParams { delta_q_present, delta_q_res }` and
+  `DeltaLfParams { delta_lf_present, delta_lf_res, delta_lf_multi }`.
+  Two new fields on `FrameHeader`: `delta_q_params:
+  Option<DeltaQParams>` and `delta_lf_params: Option<DeltaLfParams>`
+  (both `Some` for intra frames, `None` for inter / show-existing
+  replays). New standalone parser entry points
+  `parse_delta_q_params(payload, base_q_idx) -> (DeltaQParams, usize)`
+  and `parse_delta_lf_params(payload, delta_q_present, allow_intrabc)
+  -> (DeltaLfParams, usize)`.
+
+  Validation: 9 new unit tests (3 for `delta_q_params` —
+  `base_q_idx == 0` reads nothing / `delta_q_present == 0` 1-bit /
+  `delta_q_present == 1` reads `delta_q_res` — plus an unexpected-end;
+  5 for `delta_lf_params` — gated off when `delta_q_present == 0` /
+  `delta_lf_present == 0` 1-bit / full path reading `delta_lf_res` +
+  `delta_lf_multi` / suppressed by `allow_intrabc` / unexpected-end).
+  The 16-fixture frame-header integration test gains two new asserted
+  trace columns (`delta_q_present`, `delta_lf_present`) plus
+  `delta_q_res = 0` / `delta_lf_res = 0` / `delta_lf_multi = false`
+  invariant guards (every corpus fixture is `delta_q_present=0` /
+  `delta_lf_present=0`; `lossless-i-only` has `base_q_idx=0` so it
+  exercises the §5.9.17 no-read branch). The `parses_tiny_key_frame_
+  prefix` unit-test bit-count rises from 30 to 31 (one extra
+  `delta_q_present` bit for `base_q_idx=120`).
+
+  Followups: §5.9.11 `loop_filter_params()` (full streaming wire-in;
+  short-circuit `CodedLossless || allow_intrabc` already modelled
+  standalone), §5.9.19 `cdef_params()`, §5.9.20 `lr_params()`,
+  §5.9.21 `read_tx_mode()`, §5.9.23 `frame_reference_mode()`.
+
 * **Round 7 — `quantization_params()` (§5.9.12) + `segmentation_params()`
   (§5.9.14) wired into the streaming `parse_frame_header` walk.** For
   intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frames the parser now

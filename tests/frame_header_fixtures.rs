@@ -90,6 +90,17 @@ struct Expected {
     /// corpus uniformly reports `seg_enabled=0`, exercising the
     /// 1-bit short-circuit path.
     trace_seg_enabled: bool,
+    /// `delta_q_present` column (§5.9.17). Round 8 wired
+    /// `delta_q_params()` into the streaming walk. The corpus uniformly
+    /// reports `delta_q_present=0`; the `lossless-i-only` fixture has
+    /// `base_q_idx=0` so its `delta_q_present` slot is not even read.
+    trace_delta_q_present: bool,
+    /// `delta_lf_present` column (§5.9.18). Round 8 wired
+    /// `delta_lf_params()` into the streaming walk. The corpus uniformly
+    /// reports `delta_lf_present=0`; because every fixture has
+    /// `delta_q_present=0` the whole `delta_lf_params()` block is a
+    /// no-op (no bits read).
+    trace_delta_lf_present: bool,
 }
 
 struct Fixture {
@@ -122,6 +133,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 16, trace_h: 16, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -140,6 +152,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -158,6 +171,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 95, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -176,6 +190,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -194,6 +209,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -212,6 +228,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -230,6 +247,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -248,6 +266,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -266,6 +285,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 128, trace_h: 64, use_superres: true, coded_denom: 3,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 160, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -284,6 +304,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 256, trace_h: 128, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 80, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -302,6 +323,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -320,6 +342,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 128, trace_h: 128, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 128, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -338,6 +361,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 256, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 2, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -357,6 +381,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 34, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -375,6 +400,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 0, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
     Fixture {
@@ -393,6 +419,7 @@ const FIXTURES: &[Fixture] = &[
             trace_w: 64, trace_h: 64, use_superres: false, coded_denom: 0,
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 106, trace_seg_enabled: false,
+            trace_delta_q_present: false, trace_delta_lf_present: false,
         },
     },
 ];
@@ -588,6 +615,46 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
             mismatches.push(format!(
                 "{}: last_active_seg_id expected 0 (no active features) got {}",
                 fx.name, sp.last_active_seg_id,
+            ));
+        }
+
+        // Round 8: §5.9.17 delta_q_params + §5.9.18 delta_lf_params
+        // wired into the streaming walk.
+        let dq = fh
+            .delta_q_params
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture {}: expected delta_q_params = Some(..)", fx.name));
+        if dq.delta_q_present != fx.expected.trace_delta_q_present {
+            mismatches.push(format!(
+                "{}: delta_q_present expected {} got {}",
+                fx.name, fx.expected.trace_delta_q_present, dq.delta_q_present,
+            ));
+        }
+        // §5.9.17: delta_q_res stays 0 whenever delta_q_present == 0.
+        // The whole corpus is delta_q_present=0, so this MUST hold.
+        if !dq.delta_q_present && dq.delta_q_res != 0 {
+            mismatches.push(format!(
+                "{}: delta_q_res expected 0 (delta_q_present==0) got {}",
+                fx.name, dq.delta_q_res,
+            ));
+        }
+        let dlf = fh
+            .delta_lf_params
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture {}: expected delta_lf_params = Some(..)", fx.name));
+        if dlf.delta_lf_present != fx.expected.trace_delta_lf_present {
+            mismatches.push(format!(
+                "{}: delta_lf_present expected {} got {}",
+                fx.name, fx.expected.trace_delta_lf_present, dlf.delta_lf_present,
+            ));
+        }
+        // §5.9.18: delta_lf_res / delta_lf_multi stay 0 / false when
+        // delta_lf_present == 0. The corpus is uniformly
+        // delta_lf_present=0 (since delta_q_present=0), so this MUST hold.
+        if !dlf.delta_lf_present && (dlf.delta_lf_res != 0 || dlf.delta_lf_multi) {
+            mismatches.push(format!(
+                "{}: delta_lf_res/multi expected 0/false (delta_lf_present==0) got {}/{}",
+                fx.name, dlf.delta_lf_res, dlf.delta_lf_multi,
             ));
         }
 
