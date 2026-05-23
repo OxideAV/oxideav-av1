@@ -127,12 +127,26 @@
 //!     parser entry points
 //!     ([`uncompressed_header_tail::parse_delta_q_params`] /
 //!     [`uncompressed_header_tail::parse_delta_lf_params`]).
+//!   * **Round 9 — §5.9.11 `loop_filter_params()`** wired into the
+//!     streaming [`parse_frame_header`] walk (intra path). After
+//!     `delta_lf_params()` the parser derives `CodedLossless` from the
+//!     §5.9.2 lines that scan `LosslessArray[]` over the per-segment
+//!     qindexes (`get_qindex(1, segmentId)` with the §8.7 ignore-delta
+//!     branch and the `SEG_LVL_ALT_Q` `Clip3(0, 255, ..)` clamp), then
+//!     consumes `loop_filter_params()` and surfaces a typed
+//!     [`LoopFilterParams`] on [`FrameHeader::loop_filter_params`]. The
+//!     §5.9.11 `CodedLossless || allow_intrabc` short-circuit consumes
+//!     no bits and resets the ref-deltas to their §5.9.11 defaults; the
+//!     full path reads the four `loop_filter_level[]` slots (chroma pair
+//!     gated on `NumPlanes > 1 && (level[0] || level[1])`), the `f(3)`
+//!     `loop_filter_sharpness`, and the
+//!     `loop_filter_delta_enabled` / `delta_update` per-slot update walk.
 //!
-//! Frame decoding past `delta_lf_params()` (the remaining tail —
-//! `loop_filter_params()` streaming wire-in / `cdef_params()` /
-//! `lr_params()` / `read_tx_mode()` / `frame_reference_mode()` /
-//! tile-content decode) is still out of scope. [`decode_av1`] /
-//! [`encode_av1`] continue to return [`Error::NotImplemented`].
+//! Frame decoding past `loop_filter_params()` (the remaining tail —
+//! `cdef_params()` / `lr_params()` / `read_tx_mode()` /
+//! `frame_reference_mode()` / tile-content decode) is still out of
+//! scope. [`decode_av1`] / [`encode_av1`] continue to return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 

@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-24
 
-**Clean-room rebuild, round 8.** The crate's prior implementation was
+**Clean-room rebuild, round 9.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -232,6 +232,39 @@ Bitstream parsing currently covers:
   no-read branch; every other fixture reads exactly one
   `delta_q_present` bit (all 0).
 
+* **§5.9.11 `loop_filter_params()` wired into the streaming parser
+  (round 9).** After `delta_lf_params()` the parser now derives
+  `CodedLossless` per the §5.9.2 lines that scan `LosslessArray[]` over
+  the eight per-segment qindexes — `get_qindex(1, segmentId)` (the §8.7
+  ignore-delta branch) returns `base_q_idx`, or
+  `Clip3(0, 255, base_q_idx + FeatureData[segmentId][SEG_LVL_ALT_Q])`
+  when `seg_feature_active_idx(segmentId, SEG_LVL_ALT_Q)` is set; a
+  segment is lossless when its qindex is 0 and all five §5.9.12
+  `DeltaQ?*` offsets are 0 — and then consumes `loop_filter_params()`
+  per §5.9.11. The `CodedLossless || allow_intrabc` short-circuit
+  consumes no bits and resets `loop_filter_ref_deltas` to the spec
+  defaults; the full path reads the four `loop_filter_level[]` slots
+  (chroma `[2]`/`[3]` gated on `NumPlanes > 1 && (level[0] ||
+  level[1])`), the `f(3)` `loop_filter_sharpness`, and the
+  `loop_filter_delta_enabled` / `delta_update` per-slot update walk. The
+  routine itself landed standalone in round 5
+  (`parse_loop_filter_params`); this round adds the streaming wire-in
+  plus the new `compute_coded_lossless` derivation. New field
+  `FrameHeader::loop_filter_params: Option<LoopFilterParams>` (`Some`
+  for intra frames, `None` for inter / show-existing replays). 6 new
+  unit tests (5 for `compute_coded_lossless` covering the lossless /
+  non-lossless / non-zero-delta / `SEG_LVL_ALT_Q`-clamp / seg-disabled
+  branches, 1 streaming full-path test with non-zero loop-filter
+  levels); the `parses_tiny_key_frame_prefix` bit-count rises 31 → 48.
+  The 16-fixture frame-header integration test gains five new asserted
+  trace columns (`lf_y`, `lf_uv0`, `lf_uv1`, `lf_sharp`,
+  `lf_delta_enabled`) mapped to `loop_filter_level[0, 2, 3]` /
+  `loop_filter_sharpness` / `loop_filter_delta_enabled` per §6.8.10. The
+  `lossless-i-only` fixture (`base_q_idx = 0`, `lf_delta_enabled = 0`)
+  exercises the §5.9.11 short-circuit and validates the `CodedLossless`
+  derivation; the other 15 take the full path (several with non-zero
+  chroma levels, e.g. `film-grain-on` `lf_y=4 / lf_uv0=14 / lf_uv1=11`).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -254,11 +287,10 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `delta_lf_params()` (the remaining
-uncompressed-header tail — `loop_filter_params()` streaming
-wire-in, `cdef_params()`, `lr_params()`, `read_tx_mode()`,
-`frame_reference_mode()` — plus tile-content decode — motion
-vectors, transform / quantisation, in-loop filters, film grain)
+Frame decoding past `loop_filter_params()` (the remaining
+uncompressed-header tail — `cdef_params()`, `lr_params()`,
+`read_tx_mode()`, `frame_reference_mode()` — plus tile-content decode —
+motion vectors, transform / quantisation, in-loop filters, film grain)
 is **not yet implemented**. `decode_av1` and `encode_av1` still
 return `Error::NotImplemented`.
 
@@ -322,6 +354,15 @@ return `Error::NotImplemented`.
     `delta_lf_present`, the `delta_lf_present` gate on `delta_lf_res`
     / `delta_lf_multi`), §6.8.15 (quantizer-index delta semantics),
     §6.8.16 (loop-filter delta semantics).
+  * Round 9: §5.9.2 (the `CodedLossless` / `AllLossless` derivation
+    lines and the `loop_filter_params()` placement after
+    `delta_lf_params()` in the `if (FrameIsIntra)` block), §5.9.11
+    (`loop_filter_params` — the `CodedLossless || allow_intrabc`
+    short-circuit, the `NumPlanes > 1 && (level[0] || level[1])` gate on
+    the chroma levels, the delta-update walk), §8.7 (`get_qindex`
+    `ignoreDeltaQ` branch + the `SEG_LVL_ALT_Q` `Clip3(0, 255, ..)`
+    clamp), §5.9.14's `seg_feature_active_idx`, §6.8.10 (loop-filter
+    level / sharpness semantics).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

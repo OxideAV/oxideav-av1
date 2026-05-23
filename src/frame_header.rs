@@ -1,6 +1,6 @@
 //! Frame header OBU parser — `uncompressed_header()` through
-//! `delta_lf_params()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc`
-//! + §5.9.5–§5.9.9 + §5.9.12 + §5.9.14 + §5.9.15 + §5.9.17 + §5.9.18).
+//! `loop_filter_params()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc`
+//! + §5.9.5–§5.9.9 + §5.9.11 + §5.9.12 + §5.9.14 + §5.9.15 + §5.9.17 + §5.9.18).
 //!
 //! Round 3 covered everything in `uncompressed_header()` through
 //! `refresh_frame_flags`. Round 4 extended the parser past
@@ -11,11 +11,13 @@
 //! UpscaledWidth == FrameWidth`) and the §5.9.15 `tile_info()` walk
 //! into the streaming parser for intra frames. Round 7 wired §5.9.12
 //! `quantization_params()` and §5.9.14 `segmentation_params()` after
-//! `tile_info()`. Round 8 (this round) wires §5.9.17 `delta_q_params()`
-//! and §5.9.18 `delta_lf_params()` after `segmentation_params()`. The
-//! downstream blocks (`loop_filter_params()` streaming wire-in,
-//! `cdef_params()`, `lr_params()`, …) remain to be wired in subsequent
-//! rounds.
+//! `tile_info()`. Round 8 wired §5.9.17 `delta_q_params()` and §5.9.18
+//! `delta_lf_params()` after `segmentation_params()`. Round 9 (this
+//! round) derives `CodedLossless` from the §5.9.2 `LosslessArray[]`
+//! scan and wires §5.9.11 `loop_filter_params()` after
+//! `delta_lf_params()`. The downstream blocks (`cdef_params()`,
+//! `lr_params()`, `read_tx_mode()`, `frame_reference_mode()`, …) remain
+//! to be wired in subsequent rounds.
 //!
 //! ## Syntax / semantics references (all in `docs/video/av1/`)
 //!
@@ -26,6 +28,9 @@
 //!   * §5.9.7 — `frame_size_with_refs()`
 //!   * §5.9.8 — `superres_params()`
 //!   * §5.9.9 — `compute_image_size()`
+//!   * §5.9.11 — `loop_filter_params()` (via
+//!     [`crate::uncompressed_header_tail::parse_loop_filter_params`];
+//!     `CodedLossless` derived in-module via `compute_coded_lossless`)
 //!   * §5.9.17 — `delta_q_params()` (via
 //!     [`crate::uncompressed_header_tail::parse_delta_q_params`])
 //!   * §5.9.18 — `delta_lf_params()` (via
@@ -37,8 +42,11 @@
 //!   * §6.8.6 — Frame size with refs semantics
 //!   * §6.8.7 — Superres params semantics
 //!   * §6.8.8 — Compute image size semantics
+//!   * §6.8.10 — Loop filter params semantics
 //!   * §6.8.15 — Quantizer index delta params semantics
 //!   * §6.8.16 — Loop filter delta params semantics
+//!   * §8.7 — `get_qindex()` (the `ignoreDeltaQ` branch that feeds
+//!     the `CodedLossless` derivation)
 //!
 //! §3 constants used here:
 //!
@@ -96,11 +104,11 @@
 //!     hasn't implemented the inter-frame `ref_frame_idx[]` /
 //!     `delta_frame_id_minus_1` walk between `refresh_frame_flags`
 //!     and the size block.
-//!   * `loop_filter_params()` streaming wire-in (§5.9.11),
-//!     `cdef_params()` (§5.9.19), `lr_params()` (§5.9.20),
+//!   * `cdef_params()` (§5.9.19), `lr_params()` (§5.9.20),
 //!     `read_tx_mode()` (§5.9.21), `frame_reference_mode()` (§5.9.23),
-//!     and everything past `delta_lf_params()` — next round's work. The
-//!     intra path now parses through `delta_lf_params()` (§5.9.18).
+//!     and everything past `loop_filter_params()` — next round's work.
+//!     The intra path now parses through `loop_filter_params()`
+//!     (§5.9.11).
 //!
 //! The bit count consumed is returned in [`FrameHeader::bits_consumed`]
 //! so the next round can continue at exactly the right bit.
@@ -109,8 +117,9 @@ use crate::bitreader::BitReader;
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
 use crate::tile_info::{read_tile_info, TileInfo};
 use crate::uncompressed_header_tail::{
-    read_delta_lf_params, read_delta_q_params, read_quantization_params, read_segmentation_params,
-    DeltaLfParams, DeltaQParams, QuantizationParams, SegmentationParams,
+    read_delta_lf_params, read_delta_q_params, read_loop_filter_params, read_quantization_params,
+    read_segmentation_params, DeltaLfParams, DeltaQParams, LoopFilterParams, QuantizationParams,
+    SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q,
 };
 use crate::Error;
 
@@ -392,11 +401,18 @@ pub struct FrameHeader {
     /// `delta_q_present == 0`, and the `delta_lf_present` slot is
     /// suppressed when `allow_intrabc == 1`.
     pub delta_lf_params: Option<DeltaLfParams>,
+    /// `loop_filter_params()` (§5.9.11) result. `Some` whenever
+    /// `delta_lf_params` is `Some` (intra frames); `None` for inter /
+    /// show-existing-frame paths. The §5.9.11 `CodedLossless ||
+    /// allow_intrabc` short-circuit consumes no bits and resets the
+    /// ref-deltas to their §5.9.11 defaults; `CodedLossless` is derived
+    /// from the §5.9.2 lines that scan `LosslessArray[]` over the
+    /// segment qindexes (via §8.7's `get_qindex(1, segmentId)`).
+    pub loop_filter_params: Option<LoopFilterParams>,
     /// Total bits consumed from `payload` by this parse. The next
     /// round will continue from this position to decode the
-    /// `loop_filter_params()` streaming wire-in / `cdef_params()` /
-    /// `lr_params()` block (intra path) or the inter-frame
-    /// `frame_refs_short_signaling` block (inter path).
+    /// `cdef_params()` / `lr_params()` block (intra path) or the
+    /// inter-frame `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
 
@@ -528,6 +544,17 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         let delta_q_params = read_delta_q_params(br, quantization_params.base_q_idx)?;
         let delta_lf_params =
             read_delta_lf_params(br, delta_q_params.delta_q_present, allow_intrabc)?;
+        // §5.9.2 lines after delta_lf_params(): derive CodedLossless by
+        // scanning LosslessArray[] over the segment qindexes, then
+        // loop_filter_params() (§5.9.11). The §5.9.11 short-circuit
+        // fires when CodedLossless || allow_intrabc.
+        let coded_lossless = compute_coded_lossless(&quantization_params, &segmentation_params);
+        let loop_filter_params = read_loop_filter_params(
+            br,
+            seq.color_config.num_planes,
+            coded_lossless,
+            allow_intrabc,
+        )?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -553,6 +580,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             segmentation_params: Some(segmentation_params),
             delta_q_params: Some(delta_q_params),
             delta_lf_params: Some(delta_lf_params),
+            loop_filter_params: Some(loop_filter_params),
             bits_consumed: br.position(),
         });
     }
@@ -608,6 +636,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             segmentation_params: None,
             delta_q_params: None,
             delta_lf_params: None,
+            loop_filter_params: None,
             bits_consumed: br.position(),
         });
     }
@@ -733,6 +762,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         segmentation_params,
         delta_q_params,
         delta_lf_params,
+        loop_filter_params,
     ) = if frame_is_intra {
         let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
         let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
@@ -764,6 +794,13 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         // slot is suppressed when `allow_intrabc == 1`.
         let dq = read_delta_q_params(br, qp.base_q_idx)?;
         let dlf = read_delta_lf_params(br, dq.delta_q_present, aib)?;
+        // §5.9.2 lines after delta_lf_params(): derive CodedLossless by
+        // scanning LosslessArray[] over the segment qindexes (§8.7
+        // get_qindex(1, segmentId)), then loop_filter_params()
+        // (§5.9.11). The §5.9.11 short-circuit fires on
+        // CodedLossless || allow_intrabc.
+        let coded_lossless = compute_coded_lossless(&qp, &sp);
+        let lf = read_loop_filter_params(br, seq.color_config.num_planes, coded_lossless, aib)?;
         (
             Some(fs),
             aib,
@@ -773,9 +810,10 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             Some(sp),
             Some(dq),
             Some(dlf),
+            Some(lf),
         )
     } else {
-        (None, false, false, None, None, None, None, None)
+        (None, false, false, None, None, None, None, None, None)
     };
 
     Ok(FrameHeader {
@@ -803,8 +841,61 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         segmentation_params,
         delta_q_params,
         delta_lf_params,
+        loop_filter_params,
         bits_consumed: br.position(),
     })
+}
+
+/// Derive `CodedLossless` per the §5.9.2 lines that follow
+/// `delta_lf_params()`:
+///
+/// ```text
+/// CodedLossless = 1
+/// for ( segmentId = 0; segmentId < MAX_SEGMENTS; segmentId++ ) {
+///     qindex = get_qindex( 1, segmentId )
+///     LosslessArray[ segmentId ] = qindex == 0 && DeltaQYDc == 0 &&
+///                                  DeltaQUAc == 0 && DeltaQUDc == 0 &&
+///                                  DeltaQVAc == 0 && DeltaQVDc == 0
+///     if ( !LosslessArray[ segmentId ] )
+///         CodedLossless = 0
+/// }
+/// ```
+///
+/// `get_qindex( 1, segmentId )` (the §8.7 quantiser-index function with
+/// `ignoreDeltaQ == 1`) is, for the uncompressed-header derivation:
+///   * `Clip3( 0, 255, base_q_idx + FeatureData[ segmentId ][
+///     SEG_LVL_ALT_Q ] )` when `seg_feature_active_idx( segmentId,
+///     SEG_LVL_ALT_Q ) == segmentation_enabled &&
+///     FeatureEnabled[ segmentId ][ SEG_LVL_ALT_Q ]` is 1;
+///   * `base_q_idx` otherwise.
+///
+/// All four `DeltaQ?Ac` / `DeltaQ?Dc` checks reduce to the four
+/// non-Y-AC `delta_q_*` offsets the §5.9.12 parse already surfaced on
+/// [`QuantizationParams`] (`DeltaQYDc` plus the U/V DC/AC pair).
+fn compute_coded_lossless(qp: &QuantizationParams, sp: &SegmentationParams) -> bool {
+    // The DeltaQ?* == 0 conjunction is segment-independent: when any of
+    // the five §5.9.12 offsets is non-zero, no segment can be lossless.
+    let deltas_all_zero = qp.delta_q_y_dc == 0
+        && qp.delta_q_u_dc == 0
+        && qp.delta_q_u_ac == 0
+        && qp.delta_q_v_dc == 0
+        && qp.delta_q_v_ac == 0;
+    if !deltas_all_zero {
+        return false;
+    }
+    for segment_id in 0..MAX_SEGMENTS {
+        // get_qindex( 1, segmentId ) with ignoreDeltaQ = 1.
+        let qindex = if sp.enabled && sp.segment_feature_active[segment_id][SEG_LVL_ALT_Q] {
+            let data = i32::from(sp.segment_feature_data[segment_id][SEG_LVL_ALT_Q]);
+            (i32::from(qp.base_q_idx) + data).clamp(0, 255)
+        } else {
+            i32::from(qp.base_q_idx)
+        };
+        if qindex != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// `allow_intrabc` per §5.9.3 path of §5.9.2: read `f(1)` only when
@@ -1078,8 +1169,17 @@ mod tests {
         //     read ⇒ +1 bit; delta_q_present=0 ⇒ no delta_q_res read.
         //   delta_lf_params: delta_q_present=0 ⇒ whole block skipped,
         //     no bits read.
-        // = 31 bits total.
-        assert_eq!(fh.bits_consumed, 31);
+        // = 31 bits. Round 9 adds loop_filter_params (§5.9.11):
+        //   [base_q_idx=120, no delta_q offsets, seg disabled ⇒
+        //    CodedLossless=0 ⇒ full path, NOT short-circuit]
+        //   loop_filter_level[0](6)=0  loop_filter_level[1](6)=0
+        //   [level[0]==0 && level[1]==0 ⇒ no chroma level[2]/[3] reads]
+        //   loop_filter_sharpness(3)=0  loop_filter_delta_enabled(1)=1
+        //   loop_filter_delta_update(1)=0
+        //   [delta_update=0 ⇒ no ref/mode-delta update walk]
+        //   = +17 bits.
+        // = 48 bits total.
+        assert_eq!(fh.bits_consumed, 48);
         let qp = fh
             .quantization_params
             .as_ref()
@@ -1114,6 +1214,17 @@ mod tests {
         assert!(!dlf.delta_lf_present);
         assert_eq!(dlf.delta_lf_res, 0);
         assert!(!dlf.delta_lf_multi);
+        let lf = fh
+            .loop_filter_params
+            .as_ref()
+            .expect("intra frame produces loop_filter_params");
+        // base_q_idx=120, no delta offsets, seg disabled ⇒
+        // CodedLossless=0 ⇒ §5.9.11 full path (NOT short-circuit).
+        assert!(!lf.short_circuited);
+        assert_eq!(lf.loop_filter_level, [0, 0, 0, 0]);
+        assert_eq!(lf.loop_filter_sharpness, 0);
+        assert!(lf.loop_filter_delta_enabled);
+        assert!(!lf.loop_filter_delta_update);
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);
@@ -1723,5 +1834,211 @@ mod tests {
         assert_eq!(SEG_LVL_ALT_Q, 0);
         assert_eq!(SEG_LVL_REF_FRAME, 5);
         assert_eq!(sp.last_active_seg_id, 0);
+        // Round 9: with base_q_idx=0, no delta offsets, and segment 0's
+        // SEG_LVL_ALT_Q = -123 clamping qindex to Clip3(0,255,-123)=0,
+        // every segment qindex is 0 ⇒ CodedLossless=1 ⇒ §5.9.11
+        // short-circuit (no bits read, delta_enabled=0).
+        let lf = fh
+            .loop_filter_params
+            .as_ref()
+            .expect("intra has loop_filter_params");
+        assert!(lf.short_circuited);
+        assert!(!lf.loop_filter_delta_enabled);
+        assert_eq!(lf.loop_filter_level, [0, 0, 0, 0]);
+    }
+
+    // -------------------------------------------------------------
+    // Round 9: compute_coded_lossless unit coverage
+    // -------------------------------------------------------------
+
+    #[test]
+    fn coded_lossless_true_when_base_q_zero_no_deltas_seg_off() {
+        let qp = QuantizationParams {
+            base_q_idx: 0,
+            delta_q_y_dc: 0,
+            diff_uv_delta: false,
+            delta_q_u_dc: 0,
+            delta_q_u_ac: 0,
+            delta_q_v_dc: 0,
+            delta_q_v_ac: 0,
+            using_qmatrix: false,
+            qm_y: 0,
+            qm_u: 0,
+            qm_v: 0,
+        };
+        let sp = SegmentationParams::disabled();
+        assert!(compute_coded_lossless(&qp, &sp));
+    }
+
+    #[test]
+    fn coded_lossless_false_when_base_q_nonzero() {
+        let qp = QuantizationParams {
+            base_q_idx: 120,
+            delta_q_y_dc: 0,
+            diff_uv_delta: false,
+            delta_q_u_dc: 0,
+            delta_q_u_ac: 0,
+            delta_q_v_dc: 0,
+            delta_q_v_ac: 0,
+            using_qmatrix: false,
+            qm_y: 0,
+            qm_u: 0,
+            qm_v: 0,
+        };
+        let sp = SegmentationParams::disabled();
+        assert!(!compute_coded_lossless(&qp, &sp));
+    }
+
+    #[test]
+    fn coded_lossless_false_when_any_delta_q_nonzero() {
+        // Even with base_q_idx==0, a non-zero DeltaQ?* breaks lossless
+        // for all segments (the conjunction is segment-independent).
+        let qp = QuantizationParams {
+            base_q_idx: 0,
+            delta_q_y_dc: 0,
+            diff_uv_delta: false,
+            delta_q_u_dc: 0,
+            delta_q_u_ac: -3,
+            delta_q_v_dc: 0,
+            delta_q_v_ac: 0,
+            using_qmatrix: false,
+            qm_y: 0,
+            qm_u: 0,
+            qm_v: 0,
+        };
+        let sp = SegmentationParams::disabled();
+        assert!(!compute_coded_lossless(&qp, &sp));
+    }
+
+    #[test]
+    fn coded_lossless_alt_q_clamps_to_zero() {
+        // base_q_idx=120 but segment 0's SEG_LVL_ALT_Q = -200 clamps its
+        // qindex to Clip3(0,255,120-200)=0. The other 7 segments keep
+        // qindex=120 (≠0), so CodedLossless is still 0.
+        let qp = QuantizationParams {
+            base_q_idx: 120,
+            delta_q_y_dc: 0,
+            diff_uv_delta: false,
+            delta_q_u_dc: 0,
+            delta_q_u_ac: 0,
+            delta_q_v_dc: 0,
+            delta_q_v_ac: 0,
+            using_qmatrix: false,
+            qm_y: 0,
+            qm_u: 0,
+            qm_v: 0,
+        };
+        let mut sp = SegmentationParams::disabled();
+        sp.enabled = true;
+        sp.segment_feature_active[0][SEG_LVL_ALT_Q] = true;
+        sp.segment_feature_data[0][SEG_LVL_ALT_Q] = -200;
+        assert!(!compute_coded_lossless(&qp, &sp));
+
+        // Now make EVERY segment's ALT_Q clamp its qindex to 0.
+        for seg in sp.segment_feature_active.iter_mut() {
+            seg[SEG_LVL_ALT_Q] = true;
+        }
+        for seg in sp.segment_feature_data.iter_mut() {
+            seg[SEG_LVL_ALT_Q] = -200;
+        }
+        assert!(compute_coded_lossless(&qp, &sp));
+    }
+
+    #[test]
+    fn coded_lossless_alt_q_ignored_when_segmentation_disabled() {
+        // FeatureEnabled is meaningless unless segmentation_enabled is
+        // set; seg_feature_active_idx ANDs with segmentation_enabled.
+        // With seg disabled and base_q_idx=0, qindex stays base_q_idx=0.
+        let qp = QuantizationParams {
+            base_q_idx: 0,
+            delta_q_y_dc: 0,
+            diff_uv_delta: false,
+            delta_q_u_dc: 0,
+            delta_q_u_ac: 0,
+            delta_q_v_dc: 0,
+            delta_q_v_ac: 0,
+            using_qmatrix: false,
+            qm_y: 0,
+            qm_u: 0,
+            qm_v: 0,
+        };
+        let mut sp = SegmentationParams::disabled();
+        // active flag set but enabled=false ⇒ seg_feature_active_idx=0.
+        sp.segment_feature_active[0][SEG_LVL_ALT_Q] = true;
+        sp.segment_feature_data[0][SEG_LVL_ALT_Q] = 50;
+        assert!(compute_coded_lossless(&qp, &sp));
+    }
+
+    // -------------------------------------------------------------
+    // Round 9: streaming loop_filter_params full path (non-lossless)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn loop_filter_streaming_full_path_with_levels() {
+        // screen_content_seq is reduced-still 256x128 profile-0
+        // (NumPlanes=3). Build a payload that reaches loop_filter_params
+        // with a non-zero base_q_idx (⇒ CodedLossless=0 ⇒ full path) and
+        // non-zero loop_filter_level[0], exercising the chroma level[2]/
+        // [3] reads.
+        let seq = screen_content_seq();
+        let mut bits: Vec<u8> = vec![
+            0, 1, 0, // disable_cdf_update / allow_scc / force_int_mv
+            0, // render_and_frame_size_different
+            0, // allow_intrabc
+            // disable_frame_end_update_cdf derived (reduced-still ⇒ 1).
+            1, // uniform_tile_spacing_flag
+            0, // increment_tile_cols_log2 (stops at 0)
+        ];
+        // quantization_params: base_q_idx(8) = 40 (non-lossless),
+        // three delta_coded(1)=0, using_qmatrix(1)=0.
+        for i in (0..8).rev() {
+            bits.push(((40u32 >> i) & 1) as u8);
+        }
+        bits.extend_from_slice(&[0, 0, 0, 0]); // 3 delta_coded + using_qmatrix
+                                               // segmentation_enabled(1)=0.
+        bits.push(0);
+        // delta_q_params: base_q_idx>0 ⇒ delta_q_present(1)=0.
+        bits.push(0);
+        // delta_lf_params: delta_q_present=0 ⇒ no bits.
+        // loop_filter_params (§5.9.11), full path (CodedLossless=0):
+        //   loop_filter_level[0](6) = 9
+        for i in (0..6).rev() {
+            bits.push(((9u32 >> i) & 1) as u8);
+        }
+        //   loop_filter_level[1](6) = 0
+        bits.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        //   level[0]!=0 ⇒ chroma level[2](6)=16, level[3](6)=7.
+        for i in (0..6).rev() {
+            bits.push(((16u32 >> i) & 1) as u8);
+        }
+        for i in (0..6).rev() {
+            bits.push(((7u32 >> i) & 1) as u8);
+        }
+        //   loop_filter_sharpness(3) = 2
+        for i in (0..3).rev() {
+            bits.push(((2u32 >> i) & 1) as u8);
+        }
+        //   loop_filter_delta_enabled(1) = 0 (stop; no update walk).
+        bits.push(0);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        let fh = parse_frame_header(&payload, &seq).expect("decodes");
+        let qp = fh.quantization_params.as_ref().expect("intra has qp");
+        assert_eq!(qp.base_q_idx, 40);
+        let lf = fh
+            .loop_filter_params
+            .as_ref()
+            .expect("intra has loop_filter_params");
+        assert!(!lf.short_circuited);
+        assert_eq!(lf.loop_filter_level[0], 9);
+        assert_eq!(lf.loop_filter_level[1], 0);
+        assert_eq!(lf.loop_filter_level[2], 16);
+        assert_eq!(lf.loop_filter_level[3], 7);
+        assert_eq!(lf.loop_filter_sharpness, 2);
+        assert!(!lf.loop_filter_delta_enabled);
     }
 }

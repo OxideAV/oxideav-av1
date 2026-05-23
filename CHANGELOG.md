@@ -6,6 +6,60 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 9 — `loop_filter_params()` (§5.9.11) wired into the streaming
+  `parse_frame_header` walk.** For intra (`KEY_FRAME` /
+  `INTRA_ONLY_FRAME`) frames the parser now descends past
+  `delta_lf_params()` into the §5.9.2 lines that derive `CodedLossless`
+  and then `loop_filter_params()`. `CodedLossless` is computed by
+  scanning `LosslessArray[]` over the eight per-segment qindexes:
+  `get_qindex(1, segmentId)` (the §8.7 quantiser-index function with
+  `ignoreDeltaQ == 1`) returns `base_q_idx`, or — when
+  `seg_feature_active_idx(segmentId, SEG_LVL_ALT_Q)` is set —
+  `Clip3(0, 255, base_q_idx + FeatureData[segmentId][SEG_LVL_ALT_Q])`;
+  a segment is lossless when its qindex is 0 and all five §5.9.12
+  `DeltaQ?*` offsets are 0. The §5.9.11 `CodedLossless || allow_intrabc`
+  short-circuit consumes no bits and resets `loop_filter_ref_deltas` to
+  the spec defaults; the full path reads the four `loop_filter_level[]`
+  slots (chroma pair `[2]`/`[3]` gated on `NumPlanes > 1 &&
+  (loop_filter_level[0] || loop_filter_level[1])`), the `f(3)`
+  `loop_filter_sharpness`, and the `loop_filter_delta_enabled` /
+  `loop_filter_delta_update` per-slot update walk over
+  `TOTAL_REFS_PER_FRAME` ref-deltas + 2 mode-deltas. The
+  `loop_filter_params()` routine itself was already implemented
+  standalone in round 5 (`parse_loop_filter_params`); this round adds
+  the streaming wire-in plus the `compute_coded_lossless` derivation.
+
+  New field on `FrameHeader`: `loop_filter_params: Option<LoopFilterParams>`
+  (`Some` for intra frames, `None` for inter / show-existing replays).
+
+  Validation: 6 new unit tests — 5 for `compute_coded_lossless`
+  (base_q_idx=0 + no deltas + seg-off ⇒ lossless / base_q_idx≠0 ⇒ not
+  lossless / any non-zero `DeltaQ?*` ⇒ not lossless / per-segment
+  `SEG_LVL_ALT_Q` clamp to 0 across all 8 segments ⇒ lossless /
+  `SEG_LVL_ALT_Q` ignored when `segmentation_enabled == 0`), and 1
+  streaming full-path test asserting non-zero `loop_filter_level[0,2,3]`
+  + sharpness. The `segmentation_streaming_synthetic_alt_q_active` test
+  gains a short-circuit assertion (its `SEG_LVL_ALT_Q = -123` clamps
+  every qindex to 0 ⇒ `CodedLossless = 1`). The
+  `parses_tiny_key_frame_prefix` `bits_consumed` assertion rises from 31
+  to 48 (the §5.9.11 full path reads
+  `loop_filter_level[0]`(6) + `[1]`(6) + sharpness(3) +
+  delta_enabled(1) + delta_update(1) = 17 bits). The 16-fixture
+  frame-header integration test gains five new asserted trace columns
+  (`lf_y`, `lf_uv0`, `lf_uv1`, `lf_sharp`, `lf_delta_enabled`) mapped to
+  `loop_filter_level[0, 2, 3]` / `loop_filter_sharpness` /
+  `loop_filter_delta_enabled` per §6.8.10; the `lossless-i-only` fixture
+  (`base_q_idx = 0`, `lf_delta_enabled = 0`) exercises the §5.9.11
+  short-circuit and confirms `CodedLossless` is derived correctly,
+  while the other 15 fixtures exercise the full bitstream path (several
+  with non-zero chroma loop-filter levels, e.g. `film-grain-on`
+  `lf_y=4 / lf_uv0=14 / lf_uv1=11`).
+
+  Followups: §5.9.19 `cdef_params()`, §5.9.20 `lr_params()`, §5.9.21
+  `read_tx_mode()`, §5.9.23 `frame_reference_mode()`. After those, the
+  streaming `parse_frame_header` walk reaches `skip_mode_params()` /
+  `global_motion_params()` / `film_grain_params()`.
+
 * **Round 8 — `delta_q_params()` (§5.9.17) + `delta_lf_params()`
   (§5.9.18) wired into the streaming `parse_frame_header` walk.** For
   intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frames the parser now

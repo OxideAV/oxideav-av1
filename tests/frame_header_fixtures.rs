@@ -101,6 +101,23 @@ struct Expected {
     /// `delta_q_present=0` the whole `delta_lf_params()` block is a
     /// no-op (no bits read).
     trace_delta_lf_present: bool,
+    /// `lf_y` column (§5.9.11). `loop_filter_level[0]`. Round 9 wired
+    /// `loop_filter_params()` into the streaming walk; this asserts
+    /// against `FrameHeader::loop_filter_params.loop_filter_level[0]`.
+    trace_lf_y: u8,
+    /// `lf_uv0` column (§5.9.11). `loop_filter_level[2]` — read only
+    /// when `NumPlanes > 1 && (loop_filter_level[0] ||
+    /// loop_filter_level[1])`, `0` otherwise.
+    trace_lf_uv0: u8,
+    /// `lf_uv1` column (§5.9.11). `loop_filter_level[3]`.
+    trace_lf_uv1: u8,
+    /// `lf_sharp` column (§5.9.11). `loop_filter_sharpness`.
+    trace_lf_sharp: u8,
+    /// `lf_delta_enabled` column (§5.9.11). `loop_filter_delta_enabled`.
+    /// `0` only for `lossless-i-only` (the §5.9.11 `CodedLossless`
+    /// short-circuit fires and consumes no bits); `1` for every other
+    /// fixture.
+    trace_lf_delta_enabled: bool,
 }
 
 struct Fixture {
@@ -134,6 +151,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -153,6 +172,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -172,6 +193,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 95, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 10, trace_lf_uv1: 4,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -191,6 +214,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -210,6 +235,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 4, trace_lf_uv1: 4,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -229,6 +256,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 4, trace_lf_uv1: 6,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -248,6 +277,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -267,6 +298,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -286,6 +319,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 160, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 12, trace_lf_uv0: 14, trace_lf_uv1: 16,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -305,6 +340,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 80, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -324,6 +361,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 4, trace_lf_uv0: 14, trace_lf_uv1: 11,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -343,6 +382,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 128, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 13, trace_lf_uv0: 19, trace_lf_uv1: 14,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -362,6 +403,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 2, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 120, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 9, trace_lf_uv0: 16, trace_lf_uv1: 7,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -382,6 +425,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 34, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 4, trace_lf_uv0: 2, trace_lf_uv1: 4,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
     Fixture {
@@ -401,6 +446,11 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 0, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            // base_q_idx=0, no delta_q offsets, seg disabled ⇒
+            // CodedLossless=1 ⇒ §5.9.11 short-circuit: all levels 0,
+            // delta_enabled=0, no bits read.
+            trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: false,
         },
     },
     Fixture {
@@ -420,6 +470,8 @@ const FIXTURES: &[Fixture] = &[
             allow_intrabc: false, tile_cols: 1, tile_rows: 1, context_update_tile_id: 0,
             trace_base_q_idx: 106, trace_seg_enabled: false,
             trace_delta_q_present: false, trace_delta_lf_present: false,
+            trace_lf_y: 4, trace_lf_uv0: 5, trace_lf_uv1: 7,
+            trace_lf_sharp: 0, trace_lf_delta_enabled: true,
         },
     },
 ];
@@ -655,6 +707,61 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
             mismatches.push(format!(
                 "{}: delta_lf_res/multi expected 0/false (delta_lf_present==0) got {}/{}",
                 fx.name, dlf.delta_lf_res, dlf.delta_lf_multi,
+            ));
+        }
+
+        // Round 9: §5.9.11 loop_filter_params wired into the streaming
+        // walk, gated by the §5.9.2-derived CodedLossless. The trace's
+        // lf_y / lf_uv0 / lf_uv1 columns are loop_filter_level[0, 2, 3]
+        // (§6.8.10); lf_sharp is loop_filter_sharpness; lf_delta_enabled
+        // is loop_filter_delta_enabled. The `lossless-i-only` fixture is
+        // the §5.9.11 short-circuit (CodedLossless=1 ⇒ levels 0,
+        // delta_enabled=0, zero bits read); every other fixture takes
+        // the full bitstream path.
+        let lf = fh.loop_filter_params.as_ref().unwrap_or_else(|| {
+            panic!(
+                "fixture {}: expected loop_filter_params = Some(..)",
+                fx.name
+            )
+        });
+        if lf.loop_filter_level[0] != fx.expected.trace_lf_y {
+            mismatches.push(format!(
+                "{}: loop_filter_level[0] (lf_y) expected {} got {}",
+                fx.name, fx.expected.trace_lf_y, lf.loop_filter_level[0],
+            ));
+        }
+        if lf.loop_filter_level[2] != fx.expected.trace_lf_uv0 {
+            mismatches.push(format!(
+                "{}: loop_filter_level[2] (lf_uv0) expected {} got {}",
+                fx.name, fx.expected.trace_lf_uv0, lf.loop_filter_level[2],
+            ));
+        }
+        if lf.loop_filter_level[3] != fx.expected.trace_lf_uv1 {
+            mismatches.push(format!(
+                "{}: loop_filter_level[3] (lf_uv1) expected {} got {}",
+                fx.name, fx.expected.trace_lf_uv1, lf.loop_filter_level[3],
+            ));
+        }
+        if lf.loop_filter_sharpness != fx.expected.trace_lf_sharp {
+            mismatches.push(format!(
+                "{}: loop_filter_sharpness (lf_sharp) expected {} got {}",
+                fx.name, fx.expected.trace_lf_sharp, lf.loop_filter_sharpness,
+            ));
+        }
+        if lf.loop_filter_delta_enabled != fx.expected.trace_lf_delta_enabled {
+            mismatches.push(format!(
+                "{}: loop_filter_delta_enabled (lf_delta_enabled) expected {} got {}",
+                fx.name, fx.expected.trace_lf_delta_enabled, lf.loop_filter_delta_enabled,
+            ));
+        }
+        // The §5.9.11 short-circuit (CodedLossless || allow_intrabc)
+        // implies delta_enabled == 0 and short_circuited == true; every
+        // non-short-circuit fixture reads at least the two
+        // loop_filter_level[0,1] + sharpness + delta_enabled bits.
+        if fx.expected.trace_lf_delta_enabled && lf.short_circuited {
+            mismatches.push(format!(
+                "{}: full-path fixture unexpectedly took §5.9.11 short-circuit",
+                fx.name,
             ));
         }
 
