@@ -118,6 +118,42 @@ struct Expected {
     /// short-circuit fires and consumes no bits); `1` for every other
     /// fixture.
     trace_lf_delta_enabled: bool,
+    /// `damping` column from the `CDEF` trace line (§5.9.19).
+    /// `CdefDamping = cdef_damping_minus_3 + 3`. `3` for the two
+    /// short-circuit fixtures (`lossless-i-only` CodedLossless;
+    /// `screen-content-tools` whose sequence header has `enable_cdef=0`,
+    /// so the §5.9.19 `!enable_cdef` branch fires).
+    trace_cdef_damping: u8,
+    /// `bits` column from the `CDEF` trace line (§5.9.19). `cdef_bits`,
+    /// the number of strength entries is `1 << cdef_bits`. `0` for all
+    /// but `superblocks-128` / `tile-cols-2-rows-1` (`bits=1`).
+    trace_cdef_bits: u8,
+    /// `y_pri[0]` from the `CDEF` trace line — `cdef_y_pri_strength[0]`.
+    trace_cdef_y_pri0: u8,
+    /// `uv_pri[0]` from the `CDEF` trace line —
+    /// `cdef_uv_pri_strength[0]`. `0` for `monochrome-grey-only`
+    /// (`NumPlanes == 1` ⇒ the §5.9.19 chroma reads are skipped).
+    trace_cdef_uv_pri0: u8,
+    /// `y_sec[0]` from the `CDEF` trace line — the **raw** signalled
+    /// `cdef_y_sec_strength[0]` *before* the §5.9.19 `== 3 ⇒ += 1`
+    /// adjustment (the trace logs the raw bitstream value). The test
+    /// applies the adjustment to derive the parser's stored value.
+    trace_cdef_y_sec0_raw: u8,
+    /// `uv_sec[0]` from the `CDEF` trace line — the **raw** signalled
+    /// `cdef_uv_sec_strength[0]` before the §5.9.19 adjustment.
+    trace_cdef_uv_sec0_raw: u8,
+}
+
+/// Apply the §5.9.19 secondary-strength adjustment: a raw value of `3`
+/// is stored as `4`. The `CDEF` trace lines log the raw bitstream
+/// value, so the integration test maps the raw expectation through this
+/// to compare against [`oxideav_av1::CdefParams`].
+fn cdef_sec_adjust(raw: u8) -> u8 {
+    if raw == 3 {
+        4
+    } else {
+        raw
+    }
 }
 
 struct Fixture {
@@ -153,6 +189,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
         },
     },
     Fixture {
@@ -174,6 +213,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 12,
+            trace_cdef_y_sec0_raw: 3, trace_cdef_uv_sec0_raw: 1,
         },
     },
     Fixture {
@@ -195,6 +237,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 10, trace_lf_uv1: 4,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 2,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 3,
         },
     },
     Fixture {
@@ -216,6 +261,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 2, trace_cdef_uv_pri0: 3,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
         },
     },
     Fixture {
@@ -237,6 +285,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 4, trace_lf_uv1: 4,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 10, trace_cdef_uv_pri0: 0,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 3,
         },
     },
     Fixture {
@@ -258,6 +309,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 4, trace_lf_uv1: 6,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 6, trace_cdef_uv_pri0: 1,
+            trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 3,
         },
     },
     Fixture {
@@ -279,6 +333,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 1, trace_cdef_uv_pri0: 1,
+            trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 1,
         },
     },
     Fixture {
@@ -300,6 +357,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 1, trace_cdef_uv_pri0: 0,
+            trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 0,
         },
     },
     Fixture {
@@ -321,6 +381,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 12, trace_lf_uv0: 14, trace_lf_uv1: 16,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 5, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 2, trace_cdef_uv_pri0: 14,
+            trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
         },
     },
     Fixture {
@@ -342,6 +405,13 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            // enable_cdef=0 in this fixture's sequence header ⇒ the
+            // §5.9.19 `!enable_cdef` short-circuit fires (damping=3,
+            // bits=0, all strengths 0) even though loop_filter took the
+            // full path.
+            trace_cdef_damping: 3, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
         },
     },
     Fixture {
@@ -363,6 +433,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 4, trace_lf_uv0: 14, trace_lf_uv1: 11,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 8,
+            trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
         },
     },
     Fixture {
@@ -384,6 +457,10 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 13, trace_lf_uv0: 19, trace_lf_uv1: 14,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            // cdef_bits=1 ⇒ 2 strength entries; we assert index 0 here.
+            trace_cdef_damping: 5, trace_cdef_bits: 1,
+            trace_cdef_y_pri0: 6, trace_cdef_uv_pri0: 7,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
         },
     },
     Fixture {
@@ -405,6 +482,10 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 9, trace_lf_uv0: 16, trace_lf_uv1: 7,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            // cdef_bits=1 ⇒ 2 strength entries; we assert index 0 here.
+            trace_cdef_damping: 4, trace_cdef_bits: 1,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
+            trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
         },
     },
     Fixture {
@@ -427,6 +508,12 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 4, trace_lf_uv0: 2, trace_lf_uv1: 4,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            // This fixture tests the underlying (hidden) KEY OBU; its
+            // CDEF trace line (idx=0) is damping=3, bits=0,
+            // uv_pri[0]=2, uv_sec[0]=2.
+            trace_cdef_damping: 3, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 2,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 2,
         },
     },
     Fixture {
@@ -451,6 +538,11 @@ const FIXTURES: &[Fixture] = &[
             // delta_enabled=0, no bits read.
             trace_lf_y: 0, trace_lf_uv0: 0, trace_lf_uv1: 0,
             trace_lf_sharp: 0, trace_lf_delta_enabled: false,
+            // CodedLossless ⇒ §5.9.19 short-circuit (damping=3, bits=0,
+            // all strengths 0).
+            trace_cdef_damping: 3, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
+            trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
         },
     },
     Fixture {
@@ -472,6 +564,9 @@ const FIXTURES: &[Fixture] = &[
             trace_delta_q_present: false, trace_delta_lf_present: false,
             trace_lf_y: 4, trace_lf_uv0: 5, trace_lf_uv1: 7,
             trace_lf_sharp: 0, trace_lf_delta_enabled: true,
+            trace_cdef_damping: 4, trace_cdef_bits: 0,
+            trace_cdef_y_pri0: 2, trace_cdef_uv_pri0: 8,
+            trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
         },
     },
 ];
@@ -762,6 +857,73 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
             mismatches.push(format!(
                 "{}: full-path fixture unexpectedly took §5.9.11 short-circuit",
                 fx.name,
+            ));
+        }
+
+        // Round 10: §5.9.19 cdef_params wired into the streaming walk.
+        // The `CDEF` trace line (idx=0) carries damping / bits / the
+        // index-0 strengths. The §5.9.19 secondary `== 3 ⇒ += 1`
+        // adjustment means the trace's raw sec values map through
+        // `cdef_sec_adjust` to the parser's stored values. The
+        // short-circuit fixtures (`lossless-i-only` CodedLossless;
+        // `screen-content-tools` !enable_cdef) carry damping=3, bits=0,
+        // zero strengths.
+        let cdef = fh
+            .cdef_params
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture {}: expected cdef_params = Some(..)", fx.name));
+        if cdef.cdef_damping != fx.expected.trace_cdef_damping {
+            mismatches.push(format!(
+                "{}: cdef_damping expected {} got {}",
+                fx.name, fx.expected.trace_cdef_damping, cdef.cdef_damping,
+            ));
+        }
+        if cdef.cdef_bits != fx.expected.trace_cdef_bits {
+            mismatches.push(format!(
+                "{}: cdef_bits expected {} got {}",
+                fx.name, fx.expected.trace_cdef_bits, cdef.cdef_bits,
+            ));
+        }
+        if cdef.cdef_y_pri_strength[0] != fx.expected.trace_cdef_y_pri0 {
+            mismatches.push(format!(
+                "{}: cdef_y_pri_strength[0] expected {} got {}",
+                fx.name, fx.expected.trace_cdef_y_pri0, cdef.cdef_y_pri_strength[0],
+            ));
+        }
+        if cdef.cdef_uv_pri_strength[0] != fx.expected.trace_cdef_uv_pri0 {
+            mismatches.push(format!(
+                "{}: cdef_uv_pri_strength[0] expected {} got {}",
+                fx.name, fx.expected.trace_cdef_uv_pri0, cdef.cdef_uv_pri_strength[0],
+            ));
+        }
+        let expected_y_sec0 = cdef_sec_adjust(fx.expected.trace_cdef_y_sec0_raw);
+        if cdef.cdef_y_sec_strength[0] != expected_y_sec0 {
+            mismatches.push(format!(
+                "{}: cdef_y_sec_strength[0] expected {} (raw {}) got {}",
+                fx.name,
+                expected_y_sec0,
+                fx.expected.trace_cdef_y_sec0_raw,
+                cdef.cdef_y_sec_strength[0],
+            ));
+        }
+        let expected_uv_sec0 = cdef_sec_adjust(fx.expected.trace_cdef_uv_sec0_raw);
+        if cdef.cdef_uv_sec_strength[0] != expected_uv_sec0 {
+            mismatches.push(format!(
+                "{}: cdef_uv_sec_strength[0] expected {} (raw {}) got {}",
+                fx.name,
+                expected_uv_sec0,
+                fx.expected.trace_cdef_uv_sec0_raw,
+                cdef.cdef_uv_sec_strength[0],
+            ));
+        }
+        // §5.9.19 short-circuit invariant: the two fixtures whose CDEF
+        // trace shows damping=3 with all-zero strengths must have
+        // short_circuited == true; all others took the full bit path.
+        let cdef_is_short = fx.name == "lossless-i-only" || fx.name == "screen-content-tools";
+        if cdef.short_circuited != cdef_is_short {
+            mismatches.push(format!(
+                "{}: cdef short_circuited expected {} got {}",
+                fx.name, cdef_is_short, cdef.short_circuited,
             ));
         }
 

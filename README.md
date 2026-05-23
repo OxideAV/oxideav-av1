@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-24
 
-**Clean-room rebuild, round 9.** The crate's prior implementation was
+**Clean-room rebuild, round 10.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -265,6 +265,41 @@ Bitstream parsing currently covers:
   derivation; the other 15 take the full path (several with non-zero
   chroma levels, e.g. `film-grain-on` `lf_y=4 / lf_uv0=14 / lf_uv1=11`).
 
+* **§5.9.19 `cdef_params()` wired into the streaming parser (round
+  10).** After `loop_filter_params()` the parser now consumes
+  `cdef_params()` per §5.9.19. The `CodedLossless || allow_intrabc ||
+  !enable_cdef` short-circuit consumes no bits and leaves `cdef_bits =
+  0`, `CdefDamping = 3`, and all four strength arrays zeroed; the full
+  path reads `cdef_damping_minus_3` (`f(2)`, `CdefDamping =
+  cdef_damping_minus_3 + 3`), `cdef_bits` (`f(2)`), then for each of the
+  `1 << cdef_bits` entries the `cdef_y_pri_strength[i]` (`f(4)`) /
+  `cdef_y_sec_strength[i]` (`f(2)`) pair plus, when `NumPlanes > 1`, the
+  `cdef_uv_pri_strength[i]` (`f(4)`) / `cdef_uv_sec_strength[i]` (`f(2)`)
+  pair. The §5.9.19 secondary `== 3 ⇒ += 1` adjustment is applied
+  literally (a raw `3` is stored as `4`). New type `CdefParams`
+  (`cdef_damping`, `cdef_bits`, the four `cdef_*_strength: [u8; 8]`
+  arrays, `short_circuited`). New public §3-derived constant
+  `CDEF_MAX_STRENGTHS = 8` (the loop bound `1 << cdef_bits` with
+  `cdef_bits` an `f(2)` value is at most 8). New standalone parser entry
+  point `parse_cdef_params`. New field `FrameHeader::cdef_params:
+  Option<CdefParams>` (`Some` for intra frames, `None` for inter /
+  show-existing replays). 8 new unit tests (short-circuit on each of the
+  three gate conditions, full-path single-entry 3-plane,
+  secondary-`3⇒4` for both Y/UV, monochrome chroma-skip, 8-entry
+  `cdef_bits=3` loop bound, unexpected-end); the
+  `parses_tiny_key_frame_prefix` bit-count rises 48 → 64. The 16-fixture
+  frame-header integration test gains six new asserted trace columns
+  (`cdef_damping`, `cdef_bits`, `cdef_y_pri_strength[0]`,
+  `cdef_uv_pri_strength[0]`, `cdef_y_sec_strength[0]`,
+  `cdef_uv_sec_strength[0]`) sourced from each fixture's `CDEF idx=0`
+  trace line, plus a short-circuit invariant. The `CDEF` trace lines were
+  empirically confirmed to log the raw pre-adjustment secondary strength
+  (a value of `3` appears, which the parser stores as `4`); the test maps
+  the raw expectation through the adjustment. `lossless-i-only`
+  (CodedLossless) and `screen-content-tools` (`enable_cdef=0`) exercise
+  the short-circuit; the other 14 take the full path (e.g.
+  `super-resolution` `damping=5 / cdef_y_pri=2 / cdef_uv_pri=14`).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -287,9 +322,9 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `loop_filter_params()` (the remaining
-uncompressed-header tail — `cdef_params()`, `lr_params()`,
-`read_tx_mode()`, `frame_reference_mode()` — plus tile-content decode —
+Frame decoding past `cdef_params()` (the remaining
+uncompressed-header tail — `lr_params()`, `read_tx_mode()`,
+`frame_reference_mode()` — plus tile-content decode —
 motion vectors, transform / quantisation, in-loop filters, film grain)
 is **not yet implemented**. `decode_av1` and `encode_av1` still
 return `Error::NotImplemented`.
@@ -363,6 +398,15 @@ return `Error::NotImplemented`.
     `ignoreDeltaQ` branch + the `SEG_LVL_ALT_Q` `Clip3(0, 255, ..)`
     clamp), §5.9.14's `seg_feature_active_idx`, §6.8.10 (loop-filter
     level / sharpness semantics).
+  * Round 10: §5.9.2 (the `cdef_params()` placement after
+    `loop_filter_params()` in the `if (FrameIsIntra)` block), §5.9.19
+    (`cdef_params` — the `CodedLossless || allow_intrabc || !enable_cdef`
+    short-circuit, the `CdefDamping = cdef_damping_minus_3 + 3`
+    derivation, the `1 << cdef_bits` strength loop, the `NumPlanes > 1`
+    gate on the chroma strengths, the secondary `== 3 ⇒ += 1`
+    adjustment), §5.5.1 (`enable_cdef`), §6.4 (`enable_cdef`
+    semantics), §6.10.14 (CDEF params semantics — `cdef_damping_minus_3`
+    / `cdef_bits` / `cdef_*_pri_strength` / `cdef_*_sec_strength`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

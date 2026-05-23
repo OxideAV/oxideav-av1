@@ -6,6 +6,48 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 10 — `cdef_params()` (§5.9.19) wired into the streaming
+  `parse_frame_header` walk.** For intra (`KEY_FRAME` /
+  `INTRA_ONLY_FRAME`) frames the parser now descends past
+  `loop_filter_params()` into `cdef_params()`. The §5.9.19
+  `CodedLossless || allow_intrabc || !enable_cdef` short-circuit consumes
+  no bits and leaves `cdef_bits = 0`, `CdefDamping = 3`, and all four
+  strength arrays at their index-0 zero defaults. The full path reads
+  `cdef_damping_minus_3` (`f(2)`, `CdefDamping = cdef_damping_minus_3 +
+  3`), `cdef_bits` (`f(2)`), and then for each of the `1 << cdef_bits`
+  entries `cdef_y_pri_strength[i]` (`f(4)`) / `cdef_y_sec_strength[i]`
+  (`f(2)`) and — when `NumPlanes > 1` — `cdef_uv_pri_strength[i]`
+  (`f(4)`) / `cdef_uv_sec_strength[i]` (`f(2)`). The §5.9.19 secondary
+  `== 3 ⇒ += 1` adjustment (raw `3` stored as `4`) is applied to both Y
+  and UV secondary strengths.
+
+  New type `CdefParams` (`cdef_damping`, `cdef_bits`, the four
+  `cdef_*_strength` arrays, `short_circuited`) with a `short_circuit()`
+  constructor. New constant `CDEF_MAX_STRENGTHS = 8`. New standalone
+  parser entry point `parse_cdef_params`. New field on `FrameHeader`:
+  `cdef_params: Option<CdefParams>` (`Some` for intra frames, `None` for
+  inter / show-existing replays). Wired into both intra paths
+  (reduced-still and non-reduced).
+
+  Validation: 8 new unit tests — short-circuit on each of the three gate
+  conditions (CodedLossless / allow_intrabc / !enable_cdef), full-path
+  single-entry 3-plane decode, the `sec == 3 ⇒ 4` adjustment for both Y
+  and UV, monochrome (`NumPlanes == 1`) chroma-skip, the 8-entry
+  (`cdef_bits = 3`) loop bound, and unexpected-end. The 16-fixture
+  frame-header integration test gains six new asserted trace columns
+  (`cdef_damping`, `cdef_bits`, `cdef_y_pri_strength[0]`,
+  `cdef_uv_pri_strength[0]`, `cdef_y_sec_strength[0]`,
+  `cdef_uv_sec_strength[0]`) sourced from each fixture's `CDEF idx=0`
+  trace line, plus a short-circuit invariant (`lossless-i-only`
+  CodedLossless and `screen-content-tools` `enable_cdef=0` short-circuit;
+  the other 14 take the full path). The `CDEF` trace lines were
+  empirically confirmed to log the **raw** pre-adjustment secondary
+  strength (values of `3` appear in the trace, which the parser stores
+  as `4`); the integration test maps the raw expectation through the
+  adjustment. The `parses_tiny_key_frame_prefix` `bits_consumed`
+  assertion rises from 48 to 64 (the §5.9.19 full path reads 2 + 2 + 16
+  = 16 bits for one 3-plane entry).
+
 * **Round 9 — `loop_filter_params()` (§5.9.11) wired into the streaming
   `parse_frame_header` walk.** For intra (`KEY_FRAME` /
   `INTRA_ONLY_FRAME`) frames the parser now descends past

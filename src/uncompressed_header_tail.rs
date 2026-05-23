@@ -804,6 +804,157 @@ pub(crate) fn read_delta_lf_params(
     })
 }
 
+// ---------------------------------------------------------------------
+// §5.9.19 cdef_params
+// ---------------------------------------------------------------------
+
+/// Maximum number of CDEF strength entries. `cdef_bits` is read as
+/// `f(2)`, so its value is in `0..=3` and the §5.9.19 loop runs
+/// `1 << cdef_bits` ≤ `1 << 3 = 8` times. The four strength arrays are
+/// therefore sized at 8.
+pub const CDEF_MAX_STRENGTHS: usize = 8;
+
+/// Parsed `cdef_params()` per §5.9.19 + §6.10.14.
+///
+/// CDEF (constrained directional enhancement filter) deringing
+/// parameters. When the §5.9.19 short-circuit fires (`CodedLossless ||
+/// allow_intrabc || !enable_cdef`) the spec leaves `cdef_bits = 0`,
+/// `CdefDamping = 3`, and the four strength arrays at their index-0
+/// zero defaults; [`Self::short_circuited`] records that no bits were
+/// read.
+///
+/// For the full path the parser reads `cdef_damping_minus_3` (`f(2)`,
+/// `CdefDamping = cdef_damping_minus_3 + 3`), `cdef_bits` (`f(2)`), and
+/// then for each of the `1 << cdef_bits` entries reads
+/// `cdef_y_pri_strength[i]` (`f(4)`) / `cdef_y_sec_strength[i]`
+/// (`f(2)`) and, when `NumPlanes > 1`, `cdef_uv_pri_strength[i]`
+/// (`f(4)`) / `cdef_uv_sec_strength[i]` (`f(2)`). The §5.9.19 secondary
+/// `== 3 ⇒ += 1` adjustment (so a raw `3` becomes `4`) is applied
+/// literally to both the Y and UV secondary strengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdefParams {
+    /// `CdefDamping` = `cdef_damping_minus_3 + 3`. `3` on the
+    /// short-circuit path.
+    pub cdef_damping: u8,
+    /// `cdef_bits` (`f(2)`). `0` on the short-circuit path. The number
+    /// of valid strength entries is `1 << cdef_bits`.
+    pub cdef_bits: u8,
+    /// `cdef_y_pri_strength[0..(1 << cdef_bits)]`. Each `f(4)`.
+    pub cdef_y_pri_strength: [u8; CDEF_MAX_STRENGTHS],
+    /// `cdef_y_sec_strength[0..(1 << cdef_bits)]`. Each `f(2)`, with the
+    /// §5.9.19 `== 3 ⇒ += 1` adjustment so a stored value is in
+    /// `{0, 1, 2, 4}`.
+    pub cdef_y_sec_strength: [u8; CDEF_MAX_STRENGTHS],
+    /// `cdef_uv_pri_strength[0..(1 << cdef_bits)]`. Each `f(4)`. All 0
+    /// when `NumPlanes == 1` (monochrome) — the §5.9.19 chroma reads
+    /// are gated on `NumPlanes > 1`.
+    pub cdef_uv_pri_strength: [u8; CDEF_MAX_STRENGTHS],
+    /// `cdef_uv_sec_strength[0..(1 << cdef_bits)]`. Each `f(2)` with the
+    /// same `== 3 ⇒ += 1` adjustment. All 0 when `NumPlanes == 1`.
+    pub cdef_uv_sec_strength: [u8; CDEF_MAX_STRENGTHS],
+    /// Whether the §5.9.19 short-circuit (`CodedLossless ||
+    /// allow_intrabc || !enable_cdef`) fired and the parser returned
+    /// without reading any bits.
+    pub short_circuited: bool,
+}
+
+impl CdefParams {
+    /// The §5.9.19 short-circuit-path output (no bits consumed):
+    /// `cdef_bits = 0`, `CdefDamping = 3`, all strengths 0.
+    pub const fn short_circuit() -> Self {
+        Self {
+            cdef_damping: 3,
+            cdef_bits: 0,
+            cdef_y_pri_strength: [0; CDEF_MAX_STRENGTHS],
+            cdef_y_sec_strength: [0; CDEF_MAX_STRENGTHS],
+            cdef_uv_pri_strength: [0; CDEF_MAX_STRENGTHS],
+            cdef_uv_sec_strength: [0; CDEF_MAX_STRENGTHS],
+            short_circuited: true,
+        }
+    }
+}
+
+/// Parse `cdef_params()` per §5.9.19 from a raw byte slice.
+///
+/// `num_planes` is §5.5.2's `NumPlanes` derived value (1 for
+/// monochrome, otherwise 3). `coded_lossless`, `allow_intrabc`, and
+/// `enable_cdef` are the runtime / sequence-header flags from §5.9.2 /
+/// §5.5.1 that select the short-circuit path; standalone callers that
+/// want the full bitstream path can pass `coded_lossless = false,
+/// allow_intrabc = false, enable_cdef = true`.
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+pub fn parse_cdef_params(
+    payload: &[u8],
+    num_planes: u8,
+    coded_lossless: bool,
+    allow_intrabc: bool,
+    enable_cdef: bool,
+) -> Result<(CdefParams, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let cdef = read_cdef_params(
+        &mut br,
+        num_planes,
+        coded_lossless,
+        allow_intrabc,
+        enable_cdef,
+    )?;
+    Ok((cdef, br.position()))
+}
+
+pub(crate) fn read_cdef_params(
+    br: &mut BitReader<'_>,
+    num_planes: u8,
+    coded_lossless: bool,
+    allow_intrabc: bool,
+    enable_cdef: bool,
+) -> Result<CdefParams, Error> {
+    // §5.9.19 short-circuit: no bits read, all strengths zero.
+    if coded_lossless || allow_intrabc || !enable_cdef {
+        return Ok(CdefParams::short_circuit());
+    }
+
+    let cdef_damping_minus_3 = br.f(2)? as u8;
+    let cdef_damping = cdef_damping_minus_3 + 3;
+    let cdef_bits = br.f(2)? as u8;
+
+    let mut cdef_y_pri_strength = [0u8; CDEF_MAX_STRENGTHS];
+    let mut cdef_y_sec_strength = [0u8; CDEF_MAX_STRENGTHS];
+    let mut cdef_uv_pri_strength = [0u8; CDEF_MAX_STRENGTHS];
+    let mut cdef_uv_sec_strength = [0u8; CDEF_MAX_STRENGTHS];
+
+    // `1 << cdef_bits` ≤ 8 (cdef_bits is f(2) ⇒ 0..=3).
+    let count = 1usize << cdef_bits;
+    for i in 0..count {
+        cdef_y_pri_strength[i] = br.f(4)? as u8;
+        let mut y_sec = br.f(2)? as u8;
+        // §5.9.19: `if (cdef_y_sec_strength[i] == 3) += 1`.
+        if y_sec == 3 {
+            y_sec += 1;
+        }
+        cdef_y_sec_strength[i] = y_sec;
+        if num_planes > 1 {
+            cdef_uv_pri_strength[i] = br.f(4)? as u8;
+            let mut uv_sec = br.f(2)? as u8;
+            if uv_sec == 3 {
+                uv_sec += 1;
+            }
+            cdef_uv_sec_strength[i] = uv_sec;
+        }
+    }
+
+    Ok(CdefParams {
+        cdef_damping,
+        cdef_bits,
+        cdef_y_pri_strength,
+        cdef_y_sec_strength,
+        cdef_uv_pri_strength,
+        cdef_uv_sec_strength,
+        short_circuited: false,
+    })
+}
+
 /// `Clip3(a, b, x)` per §"Conventions": clamp `x` to `[a, b]`.
 fn clip3_i32(a: i32, b: i32, x: i32) -> i32 {
     if x < a {
@@ -1566,6 +1717,177 @@ mod tests {
         // delta_lf_present errors.
         let payload: [u8; 0] = [];
         let err = parse_delta_lf_params(&payload, true, false).expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.19 cdef_params
+    // -----------------------------------------------------------------
+
+    /// Pack an MSB-first bit list into a byte buffer.
+    fn pack_bits(bits: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                payload[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        payload
+    }
+
+    #[test]
+    fn cdef_short_circuit_coded_lossless() {
+        // CodedLossless ⇒ short-circuit, no bits read.
+        let payload: [u8; 0] = [];
+        let (c, n) = parse_cdef_params(&payload, 3, true, false, true).expect("decodes");
+        assert!(c.short_circuited);
+        assert_eq!(c.cdef_damping, 3);
+        assert_eq!(c.cdef_bits, 0);
+        assert_eq!(c.cdef_y_pri_strength, [0; CDEF_MAX_STRENGTHS]);
+        assert_eq!(c.cdef_y_sec_strength, [0; CDEF_MAX_STRENGTHS]);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn cdef_short_circuit_allow_intrabc() {
+        let payload: [u8; 0] = [];
+        let (c, n) = parse_cdef_params(&payload, 3, false, true, true).expect("decodes");
+        assert!(c.short_circuited);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn cdef_short_circuit_enable_cdef_off() {
+        // !enable_cdef ⇒ short-circuit even when lossless/intrabc clear.
+        let payload: [u8; 0] = [];
+        let (c, n) = parse_cdef_params(&payload, 3, false, false, false).expect("decodes");
+        assert!(c.short_circuited);
+        assert_eq!(c.cdef_damping, 3);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn cdef_full_path_single_entry_3plane() {
+        // num_planes=3, full path, cdef_bits=0 ⇒ 1 entry.
+        //   cdef_damping_minus_3 = 2 (f2) = 10  ⇒ CdefDamping = 5
+        //   cdef_bits            = 0 (f2) = 00
+        //   entry 0:
+        //     cdef_y_pri_strength  = 9  (f4) = 1001
+        //     cdef_y_sec_strength  = 1  (f2) = 01
+        //     cdef_uv_pri_strength = 6  (f4) = 0110
+        //     cdef_uv_sec_strength = 2  (f2) = 10
+        // Total = 2+2 + 4+2+4+2 = 16 bits.
+        let bits: &[u8] = &[
+            1, 0, // damping_minus_3 = 2
+            0, 0, // cdef_bits = 0
+            1, 0, 0, 1, // y_pri = 9
+            0, 1, // y_sec = 1
+            0, 1, 1, 0, // uv_pri = 6
+            1, 0, // uv_sec = 2
+        ];
+        let payload = pack_bits(bits);
+        let (c, n) = parse_cdef_params(&payload, 3, false, false, true).expect("decodes");
+        assert!(!c.short_circuited);
+        assert_eq!(c.cdef_damping, 5);
+        assert_eq!(c.cdef_bits, 0);
+        assert_eq!(c.cdef_y_pri_strength[0], 9);
+        assert_eq!(c.cdef_y_sec_strength[0], 1);
+        assert_eq!(c.cdef_uv_pri_strength[0], 6);
+        assert_eq!(c.cdef_uv_sec_strength[0], 2);
+        // Unused entries stay 0.
+        assert_eq!(c.cdef_y_pri_strength[1], 0);
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn cdef_sec_strength_three_becomes_four() {
+        // §5.9.19: cdef_*_sec_strength == 3 is bumped to 4.
+        //   damping_minus_3 = 0, cdef_bits = 0
+        //   entry 0:
+        //     y_pri = 0  (f4) = 0000
+        //     y_sec = 3  (f2) = 11  ⇒ stored 4
+        //     uv_pri= 0  (f4) = 0000
+        //     uv_sec= 3  (f2) = 11  ⇒ stored 4
+        let bits: &[u8] = &[
+            0, 0, // damping_minus_3 = 0
+            0, 0, // cdef_bits = 0
+            0, 0, 0, 0, // y_pri = 0
+            1, 1, // y_sec = 3 -> 4
+            0, 0, 0, 0, // uv_pri = 0
+            1, 1, // uv_sec = 3 -> 4
+        ];
+        let payload = pack_bits(bits);
+        let (c, n) = parse_cdef_params(&payload, 3, false, false, true).expect("decodes");
+        assert_eq!(c.cdef_y_sec_strength[0], 4);
+        assert_eq!(c.cdef_uv_sec_strength[0], 4);
+        assert_eq!(c.cdef_damping, 3);
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn cdef_full_path_mono_skips_chroma() {
+        // num_planes=1 ⇒ the `NumPlanes > 1` chroma reads are skipped.
+        //   damping_minus_3 = 1, cdef_bits = 1 ⇒ 2 entries
+        //   entry 0: y_pri = 15 (1111), y_sec = 2 (10)
+        //   entry 1: y_pri = 8  (1000), y_sec = 0 (00)
+        // Total = 2 + 2 + (4+2)*2 = 16 bits.
+        let bits: &[u8] = &[
+            0, 1, // damping_minus_3 = 1 ⇒ CdefDamping 4
+            0, 1, // cdef_bits = 1 ⇒ 2 entries
+            1, 1, 1, 1, // entry0 y_pri = 15
+            1, 0, // entry0 y_sec = 2
+            1, 0, 0, 0, // entry1 y_pri = 8
+            0, 0, // entry1 y_sec = 0
+        ];
+        let payload = pack_bits(bits);
+        let (c, n) = parse_cdef_params(&payload, 1, false, false, true).expect("decodes");
+        assert!(!c.short_circuited);
+        assert_eq!(c.cdef_damping, 4);
+        assert_eq!(c.cdef_bits, 1);
+        assert_eq!(c.cdef_y_pri_strength[0], 15);
+        assert_eq!(c.cdef_y_sec_strength[0], 2);
+        assert_eq!(c.cdef_y_pri_strength[1], 8);
+        assert_eq!(c.cdef_y_sec_strength[1], 0);
+        // No chroma reads happened.
+        assert_eq!(c.cdef_uv_pri_strength, [0; CDEF_MAX_STRENGTHS]);
+        assert_eq!(c.cdef_uv_sec_strength, [0; CDEF_MAX_STRENGTHS]);
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn cdef_full_path_eight_entries() {
+        // cdef_bits = 3 ⇒ 1 << 3 = 8 entries; num_planes=1 to keep it
+        // compact. Each entry: y_pri (f4) + y_sec (f2) = 6 bits.
+        // Header = 2 (damping) + 2 (cdef_bits) = 4 bits.
+        // Total = 4 + 8*6 = 52 bits.
+        let mut bits: Vec<u8> = Vec::new();
+        bits.extend_from_slice(&[0, 0]); // damping_minus_3 = 0
+        bits.extend_from_slice(&[1, 1]); // cdef_bits = 3
+        for i in 0..8u8 {
+            // y_pri = i (f4)
+            for b in (0..4).rev() {
+                bits.push((i >> b) & 1);
+            }
+            // y_sec = 1 (f2) = 01
+            bits.push(0);
+            bits.push(1);
+        }
+        let payload = pack_bits(&bits);
+        let (c, n) = parse_cdef_params(&payload, 1, false, false, true).expect("decodes");
+        assert_eq!(c.cdef_bits, 3);
+        for i in 0..8usize {
+            assert_eq!(c.cdef_y_pri_strength[i], i as u8);
+            assert_eq!(c.cdef_y_sec_strength[i], 1);
+        }
+        assert_eq!(n, 52);
+    }
+
+    #[test]
+    fn cdef_full_path_unexpected_end() {
+        // Full path but empty payload ⇒ reading cdef_damping_minus_3
+        // errors.
+        let payload: [u8; 0] = [];
+        let err = parse_cdef_params(&payload, 3, false, false, true).expect_err("must err");
         assert_eq!(err, Error::UnexpectedEnd);
     }
 }

@@ -117,9 +117,9 @@ use crate::bitreader::BitReader;
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
 use crate::tile_info::{read_tile_info, TileInfo};
 use crate::uncompressed_header_tail::{
-    read_delta_lf_params, read_delta_q_params, read_loop_filter_params, read_quantization_params,
-    read_segmentation_params, DeltaLfParams, DeltaQParams, LoopFilterParams, QuantizationParams,
-    SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q,
+    read_cdef_params, read_delta_lf_params, read_delta_q_params, read_loop_filter_params,
+    read_quantization_params, read_segmentation_params, CdefParams, DeltaLfParams, DeltaQParams,
+    LoopFilterParams, QuantizationParams, SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q,
 };
 use crate::Error;
 
@@ -409,9 +409,15 @@ pub struct FrameHeader {
     /// from the §5.9.2 lines that scan `LosslessArray[]` over the
     /// segment qindexes (via §8.7's `get_qindex(1, segmentId)`).
     pub loop_filter_params: Option<LoopFilterParams>,
+    /// `cdef_params()` (§5.9.19) result. `Some` whenever
+    /// `loop_filter_params` is `Some` (intra frames); `None` for inter /
+    /// show-existing-frame paths. The §5.9.19 `CodedLossless ||
+    /// allow_intrabc || !enable_cdef` short-circuit consumes no bits and
+    /// leaves `cdef_bits = 0` / `CdefDamping = 3` with zero strengths.
+    pub cdef_params: Option<CdefParams>,
     /// Total bits consumed from `payload` by this parse. The next
     /// round will continue from this position to decode the
-    /// `cdef_params()` / `lr_params()` block (intra path) or the
+    /// `lr_params()` / `read_tx_mode()` block (intra path) or the
     /// inter-frame `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
@@ -555,6 +561,16 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             coded_lossless,
             allow_intrabc,
         )?;
+        // §5.9.2 spec order after loop_filter_params(): cdef_params()
+        // (§5.9.19). The §5.9.19 short-circuit fires on `CodedLossless
+        // || allow_intrabc || !enable_cdef`.
+        let cdef_params = read_cdef_params(
+            br,
+            seq.color_config.num_planes,
+            coded_lossless,
+            allow_intrabc,
+            seq.enable_cdef,
+        )?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -581,6 +597,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             delta_q_params: Some(delta_q_params),
             delta_lf_params: Some(delta_lf_params),
             loop_filter_params: Some(loop_filter_params),
+            cdef_params: Some(cdef_params),
             bits_consumed: br.position(),
         });
     }
@@ -637,6 +654,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             delta_q_params: None,
             delta_lf_params: None,
             loop_filter_params: None,
+            cdef_params: None,
             bits_consumed: br.position(),
         });
     }
@@ -763,6 +781,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         delta_q_params,
         delta_lf_params,
         loop_filter_params,
+        cdef_params,
     ) = if frame_is_intra {
         let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
         let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
@@ -801,6 +820,16 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         // CodedLossless || allow_intrabc.
         let coded_lossless = compute_coded_lossless(&qp, &sp);
         let lf = read_loop_filter_params(br, seq.color_config.num_planes, coded_lossless, aib)?;
+        // §5.9.2 spec order after loop_filter_params(): cdef_params()
+        // (§5.9.19). The §5.9.19 short-circuit fires on `CodedLossless
+        // || allow_intrabc || !enable_cdef`.
+        let cdef = read_cdef_params(
+            br,
+            seq.color_config.num_planes,
+            coded_lossless,
+            aib,
+            seq.enable_cdef,
+        )?;
         (
             Some(fs),
             aib,
@@ -811,9 +840,10 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             Some(dq),
             Some(dlf),
             Some(lf),
+            Some(cdef),
         )
     } else {
-        (None, false, false, None, None, None, None, None, None)
+        (None, false, false, None, None, None, None, None, None, None)
     };
 
     Ok(FrameHeader {
@@ -842,6 +872,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         delta_q_params,
         delta_lf_params,
         loop_filter_params,
+        cdef_params,
         bits_consumed: br.position(),
     })
 }
@@ -1178,8 +1209,15 @@ mod tests {
         //   loop_filter_delta_update(1)=0
         //   [delta_update=0 ⇒ no ref/mode-delta update walk]
         //   = +17 bits.
-        // = 48 bits total.
-        assert_eq!(fh.bits_consumed, 48);
+        // = 48 bits. Round 10 adds cdef_params (§5.9.19):
+        //   [enable_cdef=1, CodedLossless=0, allow_intrabc=0 ⇒ full path]
+        //   cdef_damping_minus_3(2)=1  cdef_bits(2)=0
+        //   entry 0 (NumPlanes=3): cdef_y_pri_strength(4)=0
+        //     cdef_y_sec_strength(2)=0  cdef_uv_pri_strength(4)=0
+        //     cdef_uv_sec_strength(2)=0
+        //   = +16 bits.
+        // = 64 bits total.
+        assert_eq!(fh.bits_consumed, 64);
         let qp = fh
             .quantization_params
             .as_ref()
@@ -1225,6 +1263,19 @@ mod tests {
         assert_eq!(lf.loop_filter_sharpness, 0);
         assert!(lf.loop_filter_delta_enabled);
         assert!(!lf.loop_filter_delta_update);
+        let cdef = fh
+            .cdef_params
+            .as_ref()
+            .expect("intra frame produces cdef_params");
+        // enable_cdef=1, CodedLossless=0 ⇒ §5.9.19 full path. Trace
+        // CDEF idx=0: damping=4, bits=0, all strengths 0.
+        assert!(!cdef.short_circuited);
+        assert_eq!(cdef.cdef_damping, 4);
+        assert_eq!(cdef.cdef_bits, 0);
+        assert_eq!(cdef.cdef_y_pri_strength[0], 0);
+        assert_eq!(cdef.cdef_y_sec_strength[0], 0);
+        assert_eq!(cdef.cdef_uv_pri_strength[0], 0);
+        assert_eq!(cdef.cdef_uv_sec_strength[0], 0);
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);
