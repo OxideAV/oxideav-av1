@@ -1,6 +1,7 @@
 //! Frame header OBU parser — `uncompressed_header()` through
-//! `loop_filter_params()` (§5.9.2 leading slice + §5.9.3 `allow_intrabc`
-//! + §5.9.5–§5.9.9 + §5.9.11 + §5.9.12 + §5.9.14 + §5.9.15 + §5.9.17 + §5.9.18).
+//! `read_tx_mode()` (§5.9.2 leading slice, §5.9.3 `allow_intrabc`,
+//! §5.9.5–§5.9.9, §5.9.11, §5.9.12, §5.9.14, §5.9.15, §5.9.17, §5.9.18,
+//! §5.9.19, §5.9.20, §5.9.21).
 //!
 //! Round 3 covered everything in `uncompressed_header()` through
 //! `refresh_frame_flags`. Round 4 extended the parser past
@@ -12,12 +13,14 @@
 //! into the streaming parser for intra frames. Round 7 wired §5.9.12
 //! `quantization_params()` and §5.9.14 `segmentation_params()` after
 //! `tile_info()`. Round 8 wired §5.9.17 `delta_q_params()` and §5.9.18
-//! `delta_lf_params()` after `segmentation_params()`. Round 9 (this
-//! round) derives `CodedLossless` from the §5.9.2 `LosslessArray[]`
-//! scan and wires §5.9.11 `loop_filter_params()` after
-//! `delta_lf_params()`. The downstream blocks (`cdef_params()`,
-//! `lr_params()`, `read_tx_mode()`, `frame_reference_mode()`, …) remain
-//! to be wired in subsequent rounds.
+//! `delta_lf_params()` after `segmentation_params()`. Round 9 derived
+//! `CodedLossless` from the §5.9.2 `LosslessArray[]` scan and wired
+//! §5.9.11 `loop_filter_params()` after `delta_lf_params()`. Round 10
+//! wired §5.9.19 `cdef_params()`; round 11 wired §5.9.20 `lr_params()`
+//! (deriving `AllLossless`). Round 12 (this round) wires §5.9.21
+//! `read_tx_mode()` after `lr_params()`. The downstream blocks
+//! (`frame_reference_mode()`, `skip_mode_params()`, …) remain to be
+//! wired in subsequent rounds.
 //!
 //! ## Syntax / semantics references (all in `docs/video/av1/`)
 //!
@@ -35,6 +38,13 @@
 //!     [`crate::uncompressed_header_tail::parse_delta_q_params`])
 //!   * §5.9.18 — `delta_lf_params()` (via
 //!     [`crate::uncompressed_header_tail::parse_delta_lf_params`])
+//!   * §5.9.19 — `cdef_params()` (via
+//!     [`crate::uncompressed_header_tail::parse_cdef_params`])
+//!   * §5.9.20 — `lr_params()` (via
+//!     [`crate::uncompressed_header_tail::parse_lr_params`])
+//!   * §5.9.21 — `read_tx_mode()` (via
+//!     [`crate::uncompressed_header_tail::parse_tx_mode`])
+//!   * §6.8.21 — TX mode semantics
 //!   * §6.8.1 — General frame header OBU semantics
 //!   * §6.8.2 — Uncompressed header semantics
 //!   * §6.8.4 — Frame size semantics
@@ -118,9 +128,9 @@ use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CO
 use crate::tile_info::{read_tile_info, TileInfo};
 use crate::uncompressed_header_tail::{
     read_cdef_params, read_delta_lf_params, read_delta_q_params, read_loop_filter_params,
-    read_lr_params, read_quantization_params, read_segmentation_params, CdefParams, DeltaLfParams,
-    DeltaQParams, LoopFilterParams, LrParams, QuantizationParams, SegmentationParams, MAX_SEGMENTS,
-    SEG_LVL_ALT_Q,
+    read_lr_params, read_quantization_params, read_segmentation_params, read_tx_mode, CdefParams,
+    DeltaLfParams, DeltaQParams, LoopFilterParams, LrParams, QuantizationParams,
+    SegmentationParams, TxMode, MAX_SEGMENTS, SEG_LVL_ALT_Q,
 };
 use crate::Error;
 
@@ -424,9 +434,16 @@ pub struct FrameHeader {
     /// derived as `CodedLossless && (FrameWidth == UpscaledWidth)` —
     /// i.e. `CodedLossless` with no active super-resolution downscale.
     pub lr_params: Option<LrParams>,
+    /// `read_tx_mode()` (§5.9.21) result. `Some` whenever `lr_params` is
+    /// `Some` (intra frames); `None` for inter / show-existing-frame
+    /// paths. When `CodedLossless == 1` the §5.9.21 first branch forces
+    /// [`TxMode::Only4x4`] with no bits read; otherwise the `f(1)`
+    /// `tx_mode_select` slot selects [`TxMode::TxModeSelect`] (`1`) or
+    /// [`TxMode::TxModeLargest`] (`0`).
+    pub tx_mode: Option<TxMode>,
     /// Total bits consumed from `payload` by this parse. The next
     /// round will continue from this position to decode the
-    /// `read_tx_mode()` block (intra path) or the inter-frame
+    /// `frame_reference_mode()` block (intra path) or the inter-frame
     /// `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
@@ -596,6 +613,10 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             allow_intrabc,
             seq.enable_restoration,
         )?;
+        // §5.9.2 spec order after lr_params(): read_tx_mode() (§5.9.21).
+        // No bits when CodedLossless == 1 (TxMode = ONLY_4X4); otherwise
+        // one `tx_mode_select` `f(1)` bit.
+        let tx_mode = read_tx_mode(br, coded_lossless)?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -624,6 +645,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             loop_filter_params: Some(loop_filter_params),
             cdef_params: Some(cdef_params),
             lr_params: Some(lr_params),
+            tx_mode: Some(tx_mode),
             bits_consumed: br.position(),
         });
     }
@@ -682,6 +704,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             loop_filter_params: None,
             cdef_params: None,
             lr_params: None,
+            tx_mode: None,
             bits_consumed: br.position(),
         });
     }
@@ -810,6 +833,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         loop_filter_params,
         cdef_params,
         lr_params,
+        tx_mode,
     ) = if frame_is_intra {
         let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
         let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
@@ -877,6 +901,10 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             aib,
             seq.enable_restoration,
         )?;
+        // §5.9.2 spec order after lr_params(): read_tx_mode() (§5.9.21).
+        // No bits when CodedLossless == 1 (TxMode = ONLY_4X4); otherwise
+        // one `tx_mode_select` `f(1)` bit.
+        let tx = read_tx_mode(br, coded_lossless)?;
         (
             Some(fs),
             aib,
@@ -889,10 +917,11 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             Some(lf),
             Some(cdef),
             Some(lr),
+            Some(tx),
         )
     } else {
         (
-            None, false, false, None, None, None, None, None, None, None, None,
+            None, false, false, None, None, None, None, None, None, None, None, None,
         )
     };
 
@@ -924,6 +953,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         loop_filter_params,
         cdef_params,
         lr_params,
+        tx_mode,
         bits_consumed: br.position(),
     })
 }
@@ -1273,8 +1303,12 @@ mod tests {
         //   NumPlanes=3 ⇒ lr_type[0..3] each f(2): 6 bits. Trace shows
         //   y=0/u=0/v=0 ⇒ UsesLr=0 ⇒ no unit_shift / uv_shift bits.
         //   = +6 bits.
-        // = 70 bits total.
-        assert_eq!(fh.bits_consumed, 70);
+        // = 70 bits. Round 12 adds read_tx_mode (§5.9.21):
+        //   [CodedLossless=0 ⇒ tx_mode_select(1) read; trace tx_mode=1
+        //    ⇒ TX_MODE_LARGEST ⇒ tx_mode_select=0]
+        //   = +1 bit.
+        // = 71 bits total.
+        assert_eq!(fh.bits_consumed, 71);
         let qp = fh
             .quantization_params
             .as_ref()
@@ -1333,6 +1367,10 @@ mod tests {
         assert_eq!(cdef.cdef_y_sec_strength[0], 0);
         assert_eq!(cdef.cdef_uv_pri_strength[0], 0);
         assert_eq!(cdef.cdef_uv_sec_strength[0], 0);
+        let tx = fh.tx_mode.expect("intra frame produces tx_mode");
+        // CodedLossless=0 ⇒ §5.9.21 reads tx_mode_select; trace tx_mode=1
+        // ⇒ TX_MODE_LARGEST.
+        assert_eq!(tx, TxMode::TxModeLargest);
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);
@@ -1612,6 +1650,8 @@ mod tests {
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);
         assert_eq!(ti.tile_rows, 1);
+        // base_q_idx=0 ⇒ CodedLossless=1 ⇒ §5.9.21 ONLY_4X4, no bits read.
+        assert_eq!(fh.tx_mode, Some(TxMode::Only4x4));
     }
 
     // -------------------------------------------------------------
@@ -1960,6 +2000,8 @@ mod tests {
         assert!(lf.short_circuited);
         assert!(!lf.loop_filter_delta_enabled);
         assert_eq!(lf.loop_filter_level, [0, 0, 0, 0]);
+        // CodedLossless=1 ⇒ §5.9.21 ONLY_4X4 with no bits read.
+        assert_eq!(fh.tx_mode, Some(TxMode::Only4x4));
     }
 
     // -------------------------------------------------------------
@@ -2155,5 +2197,9 @@ mod tests {
         assert_eq!(lf.loop_filter_level[3], 7);
         assert_eq!(lf.loop_filter_sharpness, 2);
         assert!(!lf.loop_filter_delta_enabled);
+        // base_q_idx=40 ⇒ CodedLossless=0 ⇒ §5.9.21 reads the
+        // `tx_mode_select` bit from the zero-padded tail (= 0) ⇒
+        // TX_MODE_LARGEST.
+        assert_eq!(fh.tx_mode, Some(TxMode::TxModeLargest));
     }
 }

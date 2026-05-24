@@ -6,6 +6,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 12 — `read_tx_mode()` (§5.9.21) wired into the streaming
+  `parse_frame_header` walk.** For intra (`KEY_FRAME` /
+  `INTRA_ONLY_FRAME`) frames the parser now descends past `lr_params()`
+  into `read_tx_mode()`. When `CodedLossless == 1` the §5.9.21 first
+  branch consumes no bits and forces `TxMode = ONLY_4X4`; otherwise the
+  `f(1)` `tx_mode_select` slot selects `TX_MODE_SELECT` (`1`) or
+  `TX_MODE_LARGEST` (`0`). `CodedLossless` is the same value already
+  derived in-module for the §5.9.11 / §5.9.19 short-circuits.
+
+  New type `TxMode` (a 3-variant enum with §6.8.21 symbol-value
+  discriminants `Only4x4 = 0, TxModeLargest = 1, TxModeSelect = 2` plus
+  an `as_u8()` accessor). New constant `TX_MODES = 3`. New standalone
+  parser entry point `parse_tx_mode(payload, coded_lossless) ->
+  (TxMode, usize)`. New field on `FrameHeader`: `tx_mode: Option<TxMode>`
+  (`Some` for intra frames, `None` for inter / show-existing replays).
+  Wired into both intra paths (reduced-still and non-reduced).
+
+  Validation: 6 new unit tests — the §6.8.21 symbol values + `TX_MODES`
+  count, the `CodedLossless == 1 ⇒ ONLY_4X4` no-bits-read path (twice:
+  empty buffer and a buffer whose bit is ignored), `tx_mode_select = 1 ⇒
+  TX_MODE_SELECT`, `tx_mode_select = 0 ⇒ TX_MODE_LARGEST`, and the
+  unexpected-end case. The 16-fixture frame-header integration test
+  gains one new asserted trace column (`tx_mode` from each fixture's
+  `FRAME_HEADER` trace line, compared against the parsed `TxMode`'s
+  §6.8.21 symbol value) plus a `ONLY_4X4 ⇒ CodedLossless` invariant
+  (only `lossless-i-only` is CodedLossless). The corpus exercises all
+  three values: `tx_mode = 0` (`lossless-i-only`, the no-bits path),
+  `tx_mode = 1` (`tiny-i-only-16x16-prof0`, `monochrome-grey-only`,
+  `profile-1-yuv444-8bit`, `profile-2-yuv422-12bit`), and `tx_mode = 2`
+  (the other 11). The `parses_tiny_key_frame_prefix` `bits_consumed`
+  assertion rises from 70 to 71 (one `tx_mode_select` bit for the
+  non-lossless `tiny-i-only`).
+
 * **Round 11 — `lr_params()` (§5.9.20) wired into the streaming
   `parse_frame_header` walk.** For intra (`KEY_FRAME` /
   `INTRA_ONLY_FRAME`) frames the parser now descends past

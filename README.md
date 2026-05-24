@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-24
 
-**Clean-room rebuild, round 11.** The crate's prior implementation was
+**Clean-room rebuild, round 12.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -350,6 +350,30 @@ Bitstream parsing currently covers:
   short-circuit (the only fixture that does); the other 10 walk the
   full LR path with all three planes RESTORE_NONE / `UsesLr = 0`.
 
+* **§5.9.21 `read_tx_mode()` wired into the streaming parser (round
+  12).** After `lr_params()` the parser now consumes `read_tx_mode()`
+  per §5.9.21. When `CodedLossless == 1` the first branch fires:
+  no bits are read and `TxMode = ONLY_4X4`. Otherwise a single
+  `tx_mode_select` (`f(1)`) bit selects `TX_MODE_SELECT` (`1`) or
+  `TX_MODE_LARGEST` (`0`). New type `TxMode` (3-variant enum with
+  §6.8.21 symbol discriminants `Only4x4 = 0`, `TxModeLargest = 1`,
+  `TxModeSelect = 2`). New constant `TX_MODES = 3`. New standalone
+  parser entry point `parse_tx_mode`. New field
+  `FrameHeader::tx_mode: Option<TxMode>` (`Some` for intra frames,
+  `None` for inter / show-existing replays). 6 new unit tests (the
+  §6.8.21 symbol values + count, the CodedLossless no-bits path twice,
+  `tx_mode_select` set/clear, unexpected-end); the
+  `parses_tiny_key_frame_prefix` bit-count rises 70 → 71. The 16-fixture
+  frame-header integration test gains one new asserted trace column
+  (`tx_mode` from each fixture's `FRAME_HEADER` trace line) plus a
+  `ONLY_4X4 ⇒ CodedLossless` invariant. The corpus exercises all three
+  values: `lossless-i-only` is the only `tx_mode = 0` (ONLY_4X4,
+  CodedLossless, no-bits path); `tiny-i-only-16x16-prof0`,
+  `monochrome-grey-only`, `profile-1-yuv444-8bit`, and
+  `profile-2-yuv422-12bit` are `tx_mode = 1` (TX_MODE_LARGEST,
+  `tx_mode_select = 0`); the other 11 are `tx_mode = 2`
+  (TX_MODE_SELECT, `tx_mode_select = 1`).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -372,8 +396,9 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `lr_params()` (the remaining uncompressed-header
-tail — `read_tx_mode()`, `frame_reference_mode()` — plus tile-content
+Frame decoding past `read_tx_mode()` (the remaining uncompressed-header
+tail — `frame_reference_mode()`, `skip_mode_params()`,
+`global_motion_params()`, `film_grain_params()` — plus tile-content
 decode — motion vectors, transform / quantisation, in-loop filters,
 film grain) is **not yet implemented**. `decode_av1` and `encode_av1`
 still return `Error::NotImplemented`.
@@ -472,6 +497,13 @@ still return `Error::NotImplemented`.
     `>> lr_uv_shift` for chroma), §5.5.1 (`enable_restoration`,
     `use_128x128_superblock`), §6.10.15 (Loop restoration params
     semantics — the `FrameRestorationType` symbol-value table).
+  * Round 12: §3 (constant — `TX_MODES = 3`), §5.9.2 (the
+    `read_tx_mode()` placement after `lr_params()` in the
+    `if (FrameIsIntra)` block), §5.9.21 (`read_tx_mode` — the
+    `CodedLossless == 1 ⇒ TxMode = ONLY_4X4` no-bits branch and the
+    `tx_mode_select` `f(1)` ⇒ `TX_MODE_SELECT` / `TX_MODE_LARGEST`
+    selection), §6.8.21 (TX mode semantics — the `TxMode` symbol-value
+    table `ONLY_4X4 = 0`, `TX_MODE_LARGEST = 1`, `TX_MODE_SELECT = 2`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

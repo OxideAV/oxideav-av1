@@ -3,15 +3,16 @@
 //! rebuild landed `read_interpolation_filter()` (§5.9.10),
 //! `loop_filter_params()` (§5.9.11), `quantization_params()` (§5.9.12),
 //! `segmentation_params()` (§5.9.14), `delta_q_params()` (§5.9.17),
-//! `delta_lf_params()` (§5.9.18), `cdef_params()` (§5.9.19), and — added
-//! this round — `lr_params()` (§5.9.20).
+//! `delta_lf_params()` (§5.9.18), `cdef_params()` (§5.9.19),
+//! `lr_params()` (§5.9.20), and — added this round —
+//! `read_tx_mode()` (§5.9.21).
 //!
 //! `quantization_params()`, `segmentation_params()`,
-//! `delta_q_params()`, `delta_lf_params()`, `cdef_params()`, and
-//! `lr_params()` are also wired into the streaming
+//! `delta_q_params()`, `delta_lf_params()`, `cdef_params()`,
+//! `lr_params()`, and `read_tx_mode()` are also wired into the streaming
 //! [`crate::parse_frame_header`] walk (intra path) since they sit
-//! before the remaining `read_tx_mode()` / `frame_reference_mode()`
-//! block. The standalone entry points
+//! before the remaining `frame_reference_mode()` block. The standalone
+//! entry points
 //! remain available so callers that want to exercise the parsers on a
 //! raw byte slice can do so without rebuilding a `SequenceHeader` and a
 //! streaming context.
@@ -27,6 +28,8 @@
 //!   * §5.9.18 — `delta_lf_params()`
 //!   * §5.9.19 — `cdef_params()`
 //!   * §5.9.20 — `lr_params()`
+//!   * §5.9.21 — `read_tx_mode()`
+//!   * §6.8.21 — TX mode semantics
 //!   * §6.10.14 — CDEF params semantics
 //!   * §6.10.15 — Loop restoration params semantics
 //!   * §6.8.9  — Interpolation filter semantics
@@ -1207,6 +1210,84 @@ pub(crate) fn read_lr_params(
         lr_uv_shift,
         loop_restoration_size,
         short_circuited: false,
+    })
+}
+
+// ---------------------------------------------------------------------
+// §5.9.21 read_tx_mode
+// ---------------------------------------------------------------------
+
+/// `TX_MODES` per §3 — the number of distinct `TxMode` values.
+pub const TX_MODES: u8 = 3;
+
+/// `TxMode` per §5.9.21 + §6.8.21.
+///
+/// Specifies how the per-block transform size is determined. The numeric
+/// discriminants are the §6.8.21 `TxMode` symbol values, which is also
+/// the encoding the `FRAME_HEADER` trace lines log for the `tx_mode`
+/// column:
+///
+/// ```text
+///   0  ONLY_4X4
+///   1  TX_MODE_LARGEST
+///   2  TX_MODE_SELECT
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TxMode {
+    /// `ONLY_4X4` (0) — the inverse transform uses only 4×4 transforms.
+    /// Selected unconditionally when `CodedLossless == 1`.
+    Only4x4 = 0,
+    /// `TX_MODE_LARGEST` (1) — the inverse transform uses the largest
+    /// transform size that fits inside the block.
+    TxModeLargest = 1,
+    /// `TX_MODE_SELECT` (2) — the transform size is signalled explicitly
+    /// per block.
+    TxModeSelect = 2,
+}
+
+impl TxMode {
+    /// The §6.8.21 `TxMode` symbol value (0..=2).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Parse `read_tx_mode()` per §5.9.21 from a raw byte slice.
+///
+/// When `coded_lossless` is `true` the §5.9.21 first branch fires: no
+/// bits are read and `TxMode = ONLY_4X4`. Otherwise the parser reads
+/// `tx_mode_select` (`f(1)`): `1` ⇒ `TX_MODE_SELECT`, `0` ⇒
+/// `TX_MODE_LARGEST`.
+///
+/// `coded_lossless` is the §5.9.2 `CodedLossless` derived value
+/// (see [`crate::frame_header`]'s `compute_coded_lossless`).
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+pub fn parse_tx_mode(payload: &[u8], coded_lossless: bool) -> Result<(TxMode, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let tx_mode = read_tx_mode(&mut br, coded_lossless)?;
+    Ok((tx_mode, br.position()))
+}
+
+pub(crate) fn read_tx_mode(br: &mut BitReader<'_>, coded_lossless: bool) -> Result<TxMode, Error> {
+    // §5.9.21:
+    //   if ( CodedLossless == 1 ) {
+    //       TxMode = ONLY_4X4
+    //   } else {
+    //       tx_mode_select  f(1)
+    //       TxMode = tx_mode_select ? TX_MODE_SELECT : TX_MODE_LARGEST
+    //   }
+    if coded_lossless {
+        return Ok(TxMode::Only4x4);
+    }
+    let tx_mode_select = br.f(1)? == 1;
+    Ok(if tx_mode_select {
+        TxMode::TxModeSelect
+    } else {
+        TxMode::TxModeLargest
     })
 }
 
@@ -2507,6 +2588,66 @@ mod tests {
         let empty: [u8; 0] = [];
         let err = parse_lr_params(&empty, 1, false, false, false, false, false, true)
             .expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.21 read_tx_mode
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tx_mode_symbol_values() {
+        // §6.8.21 TxMode symbol values + §3 TX_MODES count.
+        assert_eq!(TxMode::Only4x4.as_u8(), 0);
+        assert_eq!(TxMode::TxModeLargest.as_u8(), 1);
+        assert_eq!(TxMode::TxModeSelect.as_u8(), 2);
+        assert_eq!(TX_MODES, 3);
+    }
+
+    #[test]
+    fn tx_mode_coded_lossless_only_4x4_no_bits() {
+        // §5.9.21 CodedLossless == 1 ⇒ TxMode = ONLY_4X4, no bits read.
+        let payload: [u8; 0] = [];
+        let (tx, n) = parse_tx_mode(&payload, true).expect("decodes");
+        assert_eq!(tx, TxMode::Only4x4);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn tx_mode_select_set_reads_one_bit() {
+        // §5.9.21 CodedLossless == 0, tx_mode_select = 1 ⇒ TX_MODE_SELECT.
+        let payload = pack_bits(&[1]);
+        let (tx, n) = parse_tx_mode(&payload, false).expect("decodes");
+        assert_eq!(tx, TxMode::TxModeSelect);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn tx_mode_select_clear_is_largest() {
+        // §5.9.21 CodedLossless == 0, tx_mode_select = 0 ⇒ TX_MODE_LARGEST.
+        let payload = pack_bits(&[0]);
+        let (tx, n) = parse_tx_mode(&payload, false).expect("decodes");
+        assert_eq!(tx, TxMode::TxModeLargest);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn tx_mode_coded_lossless_ignores_bitstream() {
+        // Even with a set `tx_mode_select` bit available, the §5.9.21
+        // CodedLossless first branch consumes no bits and returns
+        // ONLY_4X4.
+        let payload = pack_bits(&[1]);
+        let (tx, n) = parse_tx_mode(&payload, true).expect("decodes");
+        assert_eq!(tx, TxMode::Only4x4);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn tx_mode_unexpected_end() {
+        // CodedLossless == 0 with no bytes ⇒ the tx_mode_select read
+        // errors.
+        let empty: [u8; 0] = [];
+        let err = parse_tx_mode(&empty, false).expect_err("must err");
         assert_eq!(err, Error::UnexpectedEnd);
     }
 }

@@ -30,7 +30,8 @@
 //! only.
 
 use oxideav_av1::{
-    parse_frame_header, parse_sequence_header, FrameRestorationType, FrameType, SUPERRES_NUM,
+    parse_frame_header, parse_sequence_header, FrameRestorationType, FrameType, TxMode,
+    SUPERRES_NUM,
 };
 
 #[derive(Debug)]
@@ -167,6 +168,12 @@ struct Expected {
     /// `uv_shift` from the `LOOP_RESTORATION` trace line — `lr_uv_shift`
     /// (0 or 1). `0` for every corpus fixture.
     trace_lr_uv_shift: u8,
+    /// `tx_mode` column from the `FRAME_HEADER` trace line (§5.9.21).
+    /// `0` = ONLY_4X4 (CodedLossless ⇒ no bits read, only
+    /// `lossless-i-only`), `1` = TX_MODE_LARGEST (`tx_mode_select = 0`),
+    /// `2` = TX_MODE_SELECT (`tx_mode_select = 1`). Asserted against
+    /// [`oxideav_av1::TxMode`] via its §6.8.21 symbol value.
+    trace_tx_mode: u8,
 }
 
 /// Apply the §5.9.19 secondary-strength adjustment: a raw value of `3`
@@ -219,6 +226,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 1,
         },
     },
     Fixture {
@@ -245,6 +253,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 3, trace_cdef_uv_sec0_raw: 1,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 2,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -271,6 +280,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 3,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 2,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -297,6 +307,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -323,6 +334,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 3,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 1,
         },
     },
     Fixture {
@@ -349,6 +361,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 3,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -375,6 +388,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 1,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 1,
         },
     },
     Fixture {
@@ -401,6 +415,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 0,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 1,
         },
     },
     Fixture {
@@ -427,6 +442,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
             trace_lr_y_type: 2, trace_lr_u_type: 2, trace_lr_v_type: 2,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -457,6 +473,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -483,6 +500,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -510,6 +528,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
             trace_lr_y_type: 3, trace_lr_u_type: 3, trace_lr_v_type: 0,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -537,6 +556,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -572,6 +592,7 @@ const FIXTURES: &[Fixture] = &[
             // UsesLr = 0 ⇒ no shift bits, all sizes 0.
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
     Fixture {
@@ -606,6 +627,7 @@ const FIXTURES: &[Fixture] = &[
             // UsesLr = 0, no bits read.
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 0,
         },
     },
     Fixture {
@@ -632,6 +654,7 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
+            trace_tx_mode: 2,
         },
     },
 ];
@@ -1088,6 +1111,33 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
                     fx.name, expected_size0, lr.loop_restoration_size[0],
                 ));
             }
+        }
+
+        // §5.9.21 read_tx_mode: the `FRAME_HEADER` trace logs the §6.8.21
+        // `TxMode` symbol value (0 = ONLY_4X4, 1 = TX_MODE_LARGEST,
+        // 2 = TX_MODE_SELECT). Assert the parsed [`TxMode`] against it.
+        let tx = fh
+            .tx_mode
+            .unwrap_or_else(|| panic!("fixture {}: expected tx_mode = Some(..)", fx.name));
+        if tx.as_u8() != fx.expected.trace_tx_mode {
+            mismatches.push(format!(
+                "{}: tx_mode expected {} got {} ({:?})",
+                fx.name,
+                fx.expected.trace_tx_mode,
+                tx.as_u8(),
+                tx,
+            ));
+        }
+        // §5.9.21 invariant: ONLY_4X4 (tx_mode == 0) is reachable only via
+        // the CodedLossless branch (no bits read). Of the corpus, only
+        // `lossless-i-only` is CodedLossless.
+        let tx_is_only_4x4 = tx == TxMode::Only4x4;
+        let expect_only_4x4 = fx.name == "lossless-i-only";
+        if tx_is_only_4x4 != expect_only_4x4 {
+            mismatches.push(format!(
+                "{}: tx_mode ONLY_4X4 (CodedLossless) expected {} got {}",
+                fx.name, expect_only_4x4, tx_is_only_4x4,
+            ));
         }
 
         if !mismatches.is_empty() {
