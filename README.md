@@ -442,6 +442,36 @@ Bitstream parsing currently covers:
   13 byte-exact unit tests (hand-traced single decodes + term-by-term
   §8.3 update checks + padding-zero / underflow edge cases).
 
+* **§9.4 default CDF tables + §8.3.1 / §8.3.2 selection — intra-frame
+  mode / partition subset (round 16).** A new `cdf` module transcribes
+  the §9.4 `Default_Intra_Frame_Y_Mode_Cdf` (5×5×14), the five
+  `Default_Partition_W{8,16,32,64,128}_Cdf` tables, `Default_Skip_Cdf`,
+  and `Default_Segment_Id_Cdf` verbatim from the spec — every row is
+  length `N + 1` with `row[N-1] == 1 << 15` and `row[N]` the §8.3
+  adaptation counter, exactly as `SymbolDecoder::read_symbol` expects.
+  `TileCdfContext::new_from_defaults` performs the §8.3.1 init step
+  ("each `Tile*Cdf` array is set equal to a copy of `Default_*_Cdf`"),
+  producing a mutable per-tile working set. The §8.3.2 selection
+  surfaces a `&mut [u16]` row for each element: `intra_frame_y_mode`
+  (`[abovemode][leftmode]`), `partition` (array-by-`bsl`, row-by-`ctx`),
+  `skip` (`[ctx]`), `segment_id` (`[ctx]`) — passed straight to
+  `read_symbol`. Scalar context helpers `intra_mode_ctx` /
+  `partition_ctx` / `skip_ctx` / `segment_id_ctx` compute the index from
+  the neighbour inputs the (future) tile walk supplies. The remaining
+  ~100 §9.4 tables, the `init_coeff_cdfs` coefficient set, and the
+  other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
+  `tx_depth` / `txfm_split` / the motion-vector + uv-mode groups) are a
+  clear followup. 9 new unit tests: §8.3.1 byte-exact copy + the
+  `cdf[N-1] == 32768` / `cdf[N] == 0` invariant on every transcribed
+  row; working-copy independence from the immutable defaults;
+  `Intra_Mode_Context[]` term-by-term; `partition_ctx` / `skip_ctx` /
+  `segment_id_ctx` formulae across all branches; `partition_cdf`
+  selected by `bsl` returning the right row lengths and the
+  default-row contents; and two end-to-end decodes driving the real
+  `SymbolDecoder` through a default-CDF row (a `skip` decode that
+  exercises the §8.3 update path, and a `partition` multisymbol decode
+  with the update disabled).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -478,10 +508,14 @@ decode pipeline; and tile-content decode (motion vectors, transform /
 quantisation, in-loop filters, film-grain synthesis) is unstarted. The
 §8.2 symbol (arithmetic) decoder — the engine all tile-content reads run
 on — now exists as a standalone, byte-exact `SymbolDecoder` (round 15);
-what it still needs to drive real tiles is the §8.2.2 default CDF tables
-and the §8.3.2 CDF-selection process that maps each `S`-typed syntax
-element to its context CDF. `decode_av1` and `encode_av1` still return
-`Error::NotImplemented`.
+round 16 lands the §9.4 default CDF tables and the §8.3.1 / §8.3.2
+selection for a bounded **intra-frame mode / partition** syntax group
+(`intra_frame_y_mode` / `partition` / `skip` / `segment_id`), with the
+remaining ~100 §9.4 tables, the `init_coeff_cdfs` coefficient set, and
+the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
+`tx_depth` / `txfm_split` / motion-vector + uv-mode groups) a mechanical
+followup against the same `TileCdfContext` shape. `decode_av1` and
+`encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -618,6 +652,19 @@ element to its context CDF. `decode_av1` and `encode_av1` still return
     `SymbolMaxBits >= -14` conformance gate), §8.2.5 (`read_literal`),
     §8.2.6 (`read_symbol` — the CDF-adaptive symbol search loop + the
     seven-step renormalisation), §8.3 (the adaptive-rate CDF update).
+  * Round 16: §3 / §9.3 (constants — `INTRA_MODES = 13`,
+    `INTRA_MODE_CONTEXTS = 5`, `PARTITION_CONTEXTS = 4`,
+    `SKIP_CONTEXTS = 3`, `SEGMENT_ID_CONTEXTS = 3`, `MAX_SEGMENTS = 8`),
+    §8.3.1 (the "set equal to a copy of `Default_*_Cdf`" init step that
+    seeds the per-tile `Tile*Cdf` working set), §8.3.2 (selection
+    paragraphs for `intra_frame_y_mode` — including the
+    `Intra_Mode_Context[ INTRA_MODES ] = { 0, 1, 2, 3, 4, 4, 4, 4, 3, 0,
+    1, 2, 0 }` array — `partition` with the `bsl` / `ctx = left * 2 +
+    above` derivation, `skip` with the neighbour-`Skips[]` sum, and
+    `segment_id` with the `prevUL / prevU / prevL` branch ladder), §9.4
+    (default CDF table values for `Default_Intra_Frame_Y_Mode_Cdf`,
+    `Default_Partition_W{8,16,32,64,128}_Cdf`, `Default_Skip_Cdf`,
+    `Default_Segment_Id_Cdf`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

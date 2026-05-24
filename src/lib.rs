@@ -238,10 +238,32 @@
 //!     `decode_subexp_bool` (§5.9.28 bool variant), and §8.2.4
 //!     `exit_symbol` (trailing-bit accounting + byte-alignment advance,
 //!     rejecting the `SymbolMaxBits < -14` conformance violation via
-//!     [`Error::SymbolExitUnderflow`]). The default CDF tables (§8.2.2)
+//!     [`Error::SymbolExitUnderflow`]). The default CDF tables (§9.4)
 //!     and the §8.3.2 CDF-selection process are out of scope this round —
 //!     they land with the tile-content decode that consumes them. See
 //!     [`symbol_decoder`].
+//!
+//!   * **Round 16.** The §9.4 default CDF tables and the §8.3.1 /
+//!     §8.3.2 CDF-selection process for a bounded **intra-frame mode /
+//!     partition** syntax group, in a new [`cdf`] module. Transcribes
+//!     [`DEFAULT_INTRA_FRAME_Y_MODE_CDF`] (the `intra_frame_y_mode`
+//!     5×5×14 table), the five `DEFAULT_PARTITION_W{8,16,32,64,128}_CDF`
+//!     tables (the `partition` element), [`DEFAULT_SKIP_CDF`], and
+//!     [`DEFAULT_SEGMENT_ID_CDF`] verbatim from §9.4. [`TileCdfContext`]
+//!     implements §8.3.1 (`new_from_defaults` copies every `Default_*`
+//!     table into a per-tile, mutable `Tile*Cdf` working set that the
+//!     §8.2 [`SymbolDecoder`] adapts in place), and the §8.3.2 selection
+//!     surfaces a `&mut [u16]` row for each element — `intra_frame_y_mode`
+//!     (`[abovemode][leftmode]`), `partition` (array-by-`bsl`, row-by-`ctx`),
+//!     `skip` (`[ctx]`), and `segment_id` (`[ctx]`) — feeding
+//!     [`SymbolDecoder::read_symbol`] directly. The scalar §8.3.2
+//!     context-derivation helpers ([`intra_mode_ctx`] / [`partition_ctx`]
+//!     / [`skip_ctx`] / [`segment_id_ctx`]) compute the index from
+//!     neighbour inputs the (future) tile walk supplies. The remaining
+//!     ~100 §9.4 tables, the `init_coeff_cdfs` coefficient set, and the
+//!     other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
+//!     `tx_depth` / `txfm_split` / the motion-vector + uv-mode groups)
+//!     are a clear followup. See [`cdf`].
 //!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
@@ -255,6 +277,7 @@
 use oxideav_core::RuntimeContext;
 
 mod bitreader;
+pub mod cdf;
 pub mod frame_header;
 pub mod obu;
 pub mod sequence_header;
@@ -262,6 +285,13 @@ pub mod symbol_decoder;
 pub mod tile_info;
 pub mod uncompressed_header_tail;
 
+pub use cdf::{
+    intra_mode_ctx, partition_ctx, segment_id_ctx, skip_ctx, TileCdfContext,
+    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_PARTITION_W128_CDF, DEFAULT_PARTITION_W16_CDF,
+    DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF, DEFAULT_PARTITION_W8_CDF,
+    DEFAULT_SEGMENT_ID_CDF, DEFAULT_SKIP_CDF, INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS,
+    PARTITION_CONTEXTS, SEGMENT_ID_CONTEXTS, SKIP_CONTEXTS,
+};
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
     InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,

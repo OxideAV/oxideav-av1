@@ -6,6 +6,45 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 16 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (intra-frame mode / partition subset).** A new `cdf` module
+  transcribes the §9.4 `Default_Intra_Frame_Y_Mode_Cdf` (5×5×14), the
+  five `Default_Partition_W{8,16,32,64,128}_Cdf` tables (the `partition`
+  element), `Default_Skip_Cdf`, and `Default_Segment_Id_Cdf` verbatim,
+  every row laid out as the `N + 1` slot
+  `[..cumulative.., 1 << 15, 0_counter]` `SymbolDecoder::read_symbol`
+  consumes. `TileCdfContext::new_from_defaults` performs the §8.3.1 init
+  step ("each `Tile*Cdf` array is set equal to a copy of
+  `Default_*_Cdf`"). The §8.3.2 selection surfaces a `&mut [u16]` row
+  for each carried element — `intra_frame_y_mode`
+  (`[abovemode][leftmode]`), `partition` (array-by-`bsl` /
+  row-by-`ctx`), `skip` (`[ctx]`), `segment_id` (`[ctx]`) — fed straight
+  to `SymbolDecoder::read_symbol`. Scalar context helpers
+  `intra_mode_ctx` / `partition_ctx` / `skip_ctx` / `segment_id_ctx`
+  compute the index from the neighbour inputs the (future) tile walk
+  supplies. The remaining ~100 §9.4 tables, the `init_coeff_cdfs`
+  coefficient set, and the other §8.3.2 selections (`split_or_horz` /
+  `split_or_vert` / `tx_depth` / `txfm_split` / motion-vector + uv-mode
+  groups) are a mechanical followup against the same `TileCdfContext`
+  shape. New public API: `TileCdfContext`, `DEFAULT_*_CDF` constants
+  (`DEFAULT_INTRA_FRAME_Y_MODE_CDF`, `DEFAULT_PARTITION_W{8,16,32,64,128}_CDF`,
+  `DEFAULT_SKIP_CDF`, `DEFAULT_SEGMENT_ID_CDF`), constants
+  (`INTRA_MODES`, `INTRA_MODE_CONTEXTS`, `INTRA_MODE_CONTEXT`,
+  `PARTITION_CONTEXTS`, `SKIP_CONTEXTS`, `SEGMENT_ID_CONTEXTS`), and the
+  four context-derivation helpers.
+
+  9 new unit tests: §8.3.1 byte-exact copy + the
+  `cdf[N - 1] == 32768` / `cdf[N] == 0` invariant on every transcribed
+  row; working-copy independence from the immutable §9.4 source;
+  `Intra_Mode_Context[]` term-by-term; the `partition_ctx` (`left * 2 +
+  above`) / `skip_ctx` (neighbour sum) / `segment_id_ctx` (four-branch)
+  formulae; `partition_cdf` selected by `bsl` returning the right row
+  lengths and the default-row contents; and two end-to-end decodes
+  driving the real `SymbolDecoder` through a default-CDF row (a `skip`
+  decode that exercises the §8.3 update path — asserting the counter
+  advances and the `Default_*` source is left untouched — and a
+  `partition` multisymbol decode with `disable_cdf_update == true`).
+
 * **Round 15 — the §8.2 symbol (arithmetic / msac) decoder.** A new
   standalone `symbol_decoder` module implements the AV1 entropy engine
   end-to-end: §8.2.2 `init_symbol(sz)` (the `numBits = Min(sz*8, 15)`
