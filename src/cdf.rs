@@ -48,13 +48,31 @@
 //!       * `Default_Mv_Fr_Cdf` (`mv_fr`)
 //!       * `Default_Mv_Hp_Cdf` (`mv_hp`)
 //!
-//! The remaining ~90 `Default_*_Cdf` arrays of §9.4 (the y_mode,
-//! uv_mode, angle-delta, tx-size, coefficient, palette, … groups),
-//! the `init_coeff_cdfs` coefficient tables, and the §8.3.2
-//! `split_or_horz` / `split_or_vert` / `tx_depth` / `txfm_split` / …
-//! selections are a clear followup: each is a mechanical transcription
-//! of one §9.4 table plus its §8.3.2 paragraph, slotted into the same
-//! [`TileCdfContext`] shape used here.
+//!   * **Inter-mode / reference-frame** (round 18): `new_mv`,
+//!     `zero_mv`, `ref_mv`, `drl_mode`, `is_inter`, `comp_mode`,
+//!     `skip_mode`, `comp_ref`, `comp_bwdref`, `single_ref`,
+//!     `compound_mode`, `comp_ref_type`, `uni_comp_ref`.
+//!
+//!   * **Palette / filter-intra / CFL** (round 19):
+//!       * `Default_Filter_Intra_Mode_Cdf` (`filter_intra_mode`)
+//!       * `Default_Filter_Intra_Cdf` (`use_filter_intra`)
+//!       * `Default_Palette_Y_Mode_Cdf` (`has_palette_y`)
+//!       * `Default_Palette_Uv_Mode_Cdf` (`has_palette_uv`)
+//!       * `Default_Palette_Y_Size_Cdf` (`palette_size_y_minus_2`)
+//!       * `Default_Palette_Uv_Size_Cdf` (`palette_size_uv_minus_2`)
+//!       * `Default_Palette_Size_{2..8}_Y_Color_Cdf` (`palette_color_idx_y`)
+//!       * `Default_Palette_Size_{2..8}_Uv_Color_Cdf` (`palette_color_idx_uv`)
+//!       * `Default_Cfl_Sign_Cdf` (`cfl_alpha_signs`)
+//!       * `Default_Cfl_Alpha_Cdf` (`cfl_alpha_u` / `cfl_alpha_v`)
+//!
+//! The remaining `Default_*_Cdf` arrays of §9.4 (the y_mode,
+//! uv_mode, angle-delta, transform (`tx_size` / `tx_type` /
+//! `inter_tx_type` / `intra_tx_type`), coefficient, interpolation,
+//! motion-mode, … groups), the `init_coeff_cdfs` coefficient tables,
+//! and the §8.3.2 `split_or_horz` / `split_or_vert` / `tx_depth` /
+//! `txfm_split` / … selections are a clear followup: each is a
+//! mechanical transcription of one §9.4 table plus its §8.3.2
+//! paragraph, slotted into the same [`TileCdfContext`] shape used here.
 //!
 //! All values are transcribed directly from `docs/video/av1/av1-spec`
 //! §8.3 and §9.4 — no external source consulted.
@@ -190,6 +208,80 @@ pub const COMP_NEWMV_CTXS: usize = 5;
 /// `TileCompoundModeCdf` row.
 pub const COMPOUND_MODE_CTX_MAP: [[usize; COMP_NEWMV_CTXS]; 3] =
     [[0, 1, 1, 1, 1], [1, 2, 3, 4, 4], [4, 4, 5, 6, 7]];
+
+// ---------------------------------------------------------------------
+// §3 palette / filter-intra / CFL constants (round 19).
+// ---------------------------------------------------------------------
+
+/// `BLOCK_SIZES` (§3) — number of different block sizes. Also the first
+/// dimension of `Default_Filter_Intra_Cdf` (indexed by `MiSize`). Per the
+/// §9.4 note, first-dimension indices 10..=15 and 20..=21 are never
+/// reached by the `use_filter_intra` selection but the table is still
+/// transcribed full-width.
+pub const BLOCK_SIZES: usize = 22;
+
+/// `FILTER_INTRA_MODES` (§3) — number of values for `filter_intra_mode`
+/// (the length of `Default_Filter_Intra_Mode_Cdf` is this + 1).
+pub const FILTER_INTRA_MODES: usize = 5;
+
+/// `PALETTE_BLOCK_SIZE_CONTEXTS` (§3) — number of `bsizeCtx` values for
+/// palette block size. `bsizeCtx = Mi_Width_Log2[ MiSize ] +
+/// Mi_Height_Log2[ MiSize ] - 2` (§5.11.46), in `0..PALETTE_BLOCK_SIZE_CONTEXTS`.
+pub const PALETTE_BLOCK_SIZE_CONTEXTS: usize = 7;
+
+/// `PALETTE_Y_MODE_CONTEXTS` (§3) — number of `has_palette_y` contexts.
+pub const PALETTE_Y_MODE_CONTEXTS: usize = 3;
+
+/// `PALETTE_UV_MODE_CONTEXTS` (§3) — number of `has_palette_uv` contexts.
+pub const PALETTE_UV_MODE_CONTEXTS: usize = 2;
+
+/// `PALETTE_SIZES` (§3) — number of values for `palette_size`
+/// (`palette_size_y_minus_2` / `palette_size_uv_minus_2` code this many
+/// symbols; the cumulative-array length is this + 1).
+pub const PALETTE_SIZES: usize = 7;
+
+/// `PALETTE_COLORS` (§3) — maximum palette size (the largest
+/// `palette_color_idx_*` symbol count). The per-size colour-index CDFs
+/// run from size 2 to size `PALETTE_COLORS` inclusive.
+pub const PALETTE_COLORS: usize = 8;
+
+/// `PALETTE_COLOR_CONTEXTS` (§3) — number of `ctx` values for
+/// `palette_color_idx_*` (the colour-index CDFs' first dimension).
+pub const PALETTE_COLOR_CONTEXTS: usize = 5;
+
+/// `PALETTE_NUM_NEIGHBORS` (§3) — number of neighbours considered when
+/// computing the palette colour-context hash.
+pub const PALETTE_NUM_NEIGHBORS: usize = 3;
+
+/// `PALETTE_MAX_COLOR_CONTEXT_HASH` (§3) — number of distinct colour
+/// context hash values (the `Palette_Color_Context` map is indexed by
+/// `0..=PALETTE_MAX_COLOR_CONTEXT_HASH`).
+pub const PALETTE_MAX_COLOR_CONTEXT_HASH: usize = 8;
+
+/// `Palette_Color_Context[ PALETTE_MAX_COLOR_CONTEXT_HASH + 1 ]`
+/// (§9.4 additional tables) — maps a `ColorContextHash` to the
+/// `palette_color_idx_*` context. The `-1` entries are hashes that the
+/// §5.11.50 derivation never produces, so they are never accessed; they
+/// are stored as `i8` to carry the spec's sentinel verbatim.
+pub const PALETTE_COLOR_CONTEXT: [i8; PALETTE_MAX_COLOR_CONTEXT_HASH + 1] =
+    [-1, -1, 0, -1, -1, 4, 3, 2, 1];
+
+/// `Palette_Color_Hash_Multipliers[ PALETTE_NUM_NEIGHBORS ]`
+/// (§9.4 additional tables) — the per-neighbour weights summed into the
+/// `ColorContextHash`.
+pub const PALETTE_COLOR_HASH_MULTIPLIERS: [u32; PALETTE_NUM_NEIGHBORS] = [1, 2, 2];
+
+/// `CFL_JOINT_SIGNS` (§3) — number of values for `cfl_alpha_signs` (the
+/// `Default_Cfl_Sign_Cdf` cumulative-array length is this + 1).
+pub const CFL_JOINT_SIGNS: usize = 8;
+
+/// `CFL_ALPHABET_SIZE` (§3) — number of values for `cfl_alpha_u` /
+/// `cfl_alpha_v` (the `Default_Cfl_Alpha_Cdf` inner length is this + 1).
+pub const CFL_ALPHABET_SIZE: usize = 16;
+
+/// `CFL_ALPHA_CONTEXTS` (§3) — number of `ctx` values for `cfl_alpha_u` /
+/// `cfl_alpha_v` (the `Default_Cfl_Alpha_Cdf` first dimension).
+pub const CFL_ALPHA_CONTEXTS: usize = 6;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -636,6 +728,258 @@ pub const DEFAULT_UNI_COMP_REF_CDF: [[[u16; 3]; UNIDIR_COMP_REFS - 1]; REF_CONTE
 ];
 
 // ---------------------------------------------------------------------
+// §9.4 palette / filter-intra / CFL default CDF tables (round 19).
+//
+// Per §8.3.1 each working `*Cdf` array "is set to a copy of" its
+// `Default_*_Cdf` (no per-context broadcast for this group). Each
+// innermost array has length `N + 1`: `N` cumulative frequencies (the
+// last `1 << 15 == 32768`) followed by the §8.3 adaptation counter,
+// which starts at 0.
+// ---------------------------------------------------------------------
+
+/// `Default_Filter_Intra_Mode_Cdf[ FILTER_INTRA_MODES + 1 ]` (§9.4).
+/// Codes the 5-value `filter_intra_mode`.
+pub const DEFAULT_FILTER_INTRA_MODE_CDF: [u16; FILTER_INTRA_MODES + 1] =
+    [8949, 12776, 17211, 29558, 32768, 0];
+
+/// `Default_Filter_Intra_Cdf[ BLOCK_SIZES ][ 3 ]` (§9.4). Binary; codes
+/// `use_filter_intra` per §8.3.2 `TileFilterIntraCdf[ MiSize ]`. Per the
+/// §9.4 note, first-dimension indices 10..=15 and 20..=21 are never
+/// reached but are transcribed verbatim.
+pub const DEFAULT_FILTER_INTRA_CDF: [[u16; 3]; BLOCK_SIZES] = [
+    [4621, 32768, 0],
+    [6743, 32768, 0],
+    [5893, 32768, 0],
+    [7866, 32768, 0],
+    [12551, 32768, 0],
+    [9394, 32768, 0],
+    [12408, 32768, 0],
+    [14301, 32768, 0],
+    [12756, 32768, 0],
+    [22343, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [12770, 32768, 0],
+    [10368, 32768, 0],
+    [20229, 32768, 0],
+    [18101, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+];
+
+/// `Default_Palette_Y_Mode_Cdf[ PALETTE_BLOCK_SIZE_CONTEXTS ][ PALETTE_Y_MODE_CONTEXTS ][ 3 ]`
+/// (§9.4). Binary; codes `has_palette_y` per §8.3.2
+/// `TilePaletteYModeCdf[ bsizeCtx ][ ctx ]`.
+pub const DEFAULT_PALETTE_Y_MODE_CDF: [[[u16; 3]; PALETTE_Y_MODE_CONTEXTS];
+    PALETTE_BLOCK_SIZE_CONTEXTS] = [
+    [[31676, 32768, 0], [3419, 32768, 0], [1261, 32768, 0]],
+    [[31912, 32768, 0], [2859, 32768, 0], [980, 32768, 0]],
+    [[31823, 32768, 0], [3400, 32768, 0], [781, 32768, 0]],
+    [[32030, 32768, 0], [3561, 32768, 0], [904, 32768, 0]],
+    [[32309, 32768, 0], [7337, 32768, 0], [1462, 32768, 0]],
+    [[32265, 32768, 0], [4015, 32768, 0], [1521, 32768, 0]],
+    [[32450, 32768, 0], [7946, 32768, 0], [129, 32768, 0]],
+];
+
+/// `Default_Palette_Uv_Mode_Cdf[ PALETTE_UV_MODE_CONTEXTS ][ 3 ]` (§9.4).
+/// Binary; codes `has_palette_uv` per §8.3.2 `TilePaletteUVModeCdf[ ctx ]`.
+pub const DEFAULT_PALETTE_UV_MODE_CDF: [[u16; 3]; PALETTE_UV_MODE_CONTEXTS] =
+    [[32461, 32768, 0], [21488, 32768, 0]];
+
+/// `Default_Palette_Y_Size_Cdf[ PALETTE_BLOCK_SIZE_CONTEXTS ][ PALETTE_SIZES + 1 ]`
+/// (§9.4). Codes the 7-value `palette_size_y_minus_2` per §8.3.2
+/// `TilePaletteYSizeCdf[ bsizeCtx ]`.
+pub const DEFAULT_PALETTE_Y_SIZE_CDF: [[u16; PALETTE_SIZES + 1]; PALETTE_BLOCK_SIZE_CONTEXTS] = [
+    [7952, 13000, 18149, 21478, 25527, 29241, 32768, 0],
+    [7139, 11421, 16195, 19544, 23666, 28073, 32768, 0],
+    [7788, 12741, 17325, 20500, 24315, 28530, 32768, 0],
+    [8271, 14064, 18246, 21564, 25071, 28533, 32768, 0],
+    [12725, 19180, 21863, 24839, 27535, 30120, 32768, 0],
+    [9711, 14888, 16923, 21052, 25661, 27875, 32768, 0],
+    [14940, 20797, 21678, 24186, 27033, 28999, 32768, 0],
+];
+
+/// `Default_Palette_Uv_Size_Cdf[ PALETTE_BLOCK_SIZE_CONTEXTS ][ PALETTE_SIZES + 1 ]`
+/// (§9.4). Codes the 7-value `palette_size_uv_minus_2` per §8.3.2
+/// `TilePaletteUVSizeCdf[ bsizeCtx ]`.
+pub const DEFAULT_PALETTE_UV_SIZE_CDF: [[u16; PALETTE_SIZES + 1]; PALETTE_BLOCK_SIZE_CONTEXTS] = [
+    [8713, 19979, 27128, 29609, 31331, 32272, 32768, 0],
+    [5839, 15573, 23581, 26947, 29848, 31700, 32768, 0],
+    [4426, 11260, 17999, 21483, 25863, 29430, 32768, 0],
+    [3228, 9464, 14993, 18089, 22523, 27420, 32768, 0],
+    [3768, 8886, 13091, 17852, 22495, 27207, 32768, 0],
+    [2464, 8451, 12861, 21632, 25525, 28555, 32768, 0],
+    [1269, 5435, 10433, 18963, 21700, 25865, 32768, 0],
+];
+
+/// `Default_Palette_Size_2_Y_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 3 ]`
+/// (§9.4). Codes the 2-value `palette_color_idx_y` for `PaletteSizeY == 2`.
+pub const DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF: [[u16; 3]; PALETTE_COLOR_CONTEXTS] = [
+    [28710, 32768, 0],
+    [16384, 32768, 0],
+    [10553, 32768, 0],
+    [27036, 32768, 0],
+    [31603, 32768, 0],
+];
+
+/// `Default_Palette_Size_3_Y_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 4 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF: [[u16; 4]; PALETTE_COLOR_CONTEXTS] = [
+    [27877, 30490, 32768, 0],
+    [11532, 25697, 32768, 0],
+    [6544, 30234, 32768, 0],
+    [23018, 28072, 32768, 0],
+    [31915, 32385, 32768, 0],
+];
+
+/// `Default_Palette_Size_4_Y_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 5 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF: [[u16; 5]; PALETTE_COLOR_CONTEXTS] = [
+    [25572, 28046, 30045, 32768, 0],
+    [9478, 21590, 27256, 32768, 0],
+    [7248, 26837, 29824, 32768, 0],
+    [19167, 24486, 28349, 32768, 0],
+    [31400, 31825, 32250, 32768, 0],
+];
+
+/// `Default_Palette_Size_5_Y_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 6 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_5_Y_COLOR_CDF: [[u16; 6]; PALETTE_COLOR_CONTEXTS] = [
+    [24779, 26955, 28576, 30282, 32768, 0],
+    [8669, 20364, 24073, 28093, 32768, 0],
+    [4255, 27565, 29377, 31067, 32768, 0],
+    [19864, 23674, 26716, 29530, 32768, 0],
+    [31646, 31893, 32147, 32426, 32768, 0],
+];
+
+/// `Default_Palette_Size_6_Y_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 7 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_6_Y_COLOR_CDF: [[u16; 7]; PALETTE_COLOR_CONTEXTS] = [
+    [23132, 25407, 26970, 28435, 30073, 32768, 0],
+    [7443, 17242, 20717, 24762, 27982, 32768, 0],
+    [6300, 24862, 26944, 28784, 30671, 32768, 0],
+    [18916, 22895, 25267, 27435, 29652, 32768, 0],
+    [31270, 31550, 31808, 32059, 32353, 32768, 0],
+];
+
+/// `Default_Palette_Size_7_Y_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 8 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_7_Y_COLOR_CDF: [[u16; 8]; PALETTE_COLOR_CONTEXTS] = [
+    [23105, 25199, 26464, 27684, 28931, 30318, 32768, 0],
+    [6950, 15447, 18952, 22681, 25567, 28563, 32768, 0],
+    [7560, 23474, 25490, 27203, 28921, 30708, 32768, 0],
+    [18544, 22373, 24457, 26195, 28119, 30045, 32768, 0],
+    [31198, 31451, 31670, 31882, 32123, 32391, 32768, 0],
+];
+
+/// `Default_Palette_Size_8_Y_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 9 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_8_Y_COLOR_CDF: [[u16; 9]; PALETTE_COLOR_CONTEXTS] = [
+    [21689, 23883, 25163, 26352, 27506, 28827, 30195, 32768, 0],
+    [6892, 15385, 17840, 21606, 24287, 26753, 29204, 32768, 0],
+    [5651, 23182, 25042, 26518, 27982, 29392, 30900, 32768, 0],
+    [19349, 22578, 24418, 25994, 27524, 29031, 30448, 32768, 0],
+    [31028, 31270, 31504, 31705, 31927, 32153, 32392, 32768, 0],
+];
+
+/// `Default_Palette_Size_2_Uv_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 3 ]`
+/// (§9.4). Codes the 2-value `palette_color_idx_uv` for `PaletteSizeUV == 2`.
+pub const DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF: [[u16; 3]; PALETTE_COLOR_CONTEXTS] = [
+    [29089, 32768, 0],
+    [16384, 32768, 0],
+    [8713, 32768, 0],
+    [29257, 32768, 0],
+    [31610, 32768, 0],
+];
+
+/// `Default_Palette_Size_3_Uv_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 4 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF: [[u16; 4]; PALETTE_COLOR_CONTEXTS] = [
+    [25257, 29145, 32768, 0],
+    [12287, 27293, 32768, 0],
+    [7033, 27960, 32768, 0],
+    [20145, 25405, 32768, 0],
+    [30608, 31639, 32768, 0],
+];
+
+/// `Default_Palette_Size_4_Uv_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 5 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF: [[u16; 5]; PALETTE_COLOR_CONTEXTS] = [
+    [24210, 27175, 29903, 32768, 0],
+    [9888, 22386, 27214, 32768, 0],
+    [5901, 26053, 29293, 32768, 0],
+    [18318, 22152, 28333, 32768, 0],
+    [30459, 31136, 31926, 32768, 0],
+];
+
+/// `Default_Palette_Size_5_Uv_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 6 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_5_UV_COLOR_CDF: [[u16; 6]; PALETTE_COLOR_CONTEXTS] = [
+    [22980, 25479, 27781, 29986, 32768, 0],
+    [8413, 21408, 24859, 28874, 32768, 0],
+    [2257, 29449, 30594, 31598, 32768, 0],
+    [19189, 21202, 25915, 28620, 32768, 0],
+    [31844, 32044, 32281, 32518, 32768, 0],
+];
+
+/// `Default_Palette_Size_6_Uv_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 7 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_6_UV_COLOR_CDF: [[u16; 7]; PALETTE_COLOR_CONTEXTS] = [
+    [22217, 24567, 26637, 28683, 30548, 32768, 0],
+    [7307, 16406, 19636, 24632, 28424, 32768, 0],
+    [4441, 25064, 26879, 28942, 30919, 32768, 0],
+    [17210, 20528, 23319, 26750, 29582, 32768, 0],
+    [30674, 30953, 31396, 31735, 32207, 32768, 0],
+];
+
+/// `Default_Palette_Size_7_Uv_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 8 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_7_UV_COLOR_CDF: [[u16; 8]; PALETTE_COLOR_CONTEXTS] = [
+    [21239, 23168, 25044, 26962, 28705, 30506, 32768, 0],
+    [6545, 15012, 18004, 21817, 25503, 28701, 32768, 0],
+    [3448, 26295, 27437, 28704, 30126, 31442, 32768, 0],
+    [15889, 18323, 21704, 24698, 26976, 29690, 32768, 0],
+    [30988, 31204, 31479, 31734, 31983, 32325, 32768, 0],
+];
+
+/// `Default_Palette_Size_8_Uv_Color_Cdf[ PALETTE_COLOR_CONTEXTS ][ 9 ]` (§9.4).
+pub const DEFAULT_PALETTE_SIZE_8_UV_COLOR_CDF: [[u16; 9]; PALETTE_COLOR_CONTEXTS] = [
+    [21442, 23288, 24758, 26246, 27649, 28980, 30563, 32768, 0],
+    [5863, 14933, 17552, 20668, 23683, 26411, 29273, 32768, 0],
+    [3415, 25810, 26877, 27990, 29223, 30394, 31618, 32768, 0],
+    [17965, 20084, 22232, 23974, 26274, 28402, 30390, 32768, 0],
+    [31190, 31329, 31516, 31679, 31825, 32026, 32322, 32768, 0],
+];
+
+/// `Default_Cfl_Sign_Cdf[ CFL_JOINT_SIGNS + 1 ]` (§9.4). Codes the
+/// 8-value `cfl_alpha_signs` per §8.3.2 `TileCflSignCdf`.
+pub const DEFAULT_CFL_SIGN_CDF: [u16; CFL_JOINT_SIGNS + 1] =
+    [1418, 2123, 13340, 18405, 26972, 28343, 32294, 32768, 0];
+
+/// `Default_Cfl_Alpha_Cdf[ CFL_ALPHA_CONTEXTS ][ CFL_ALPHABET_SIZE + 1 ]`
+/// (§9.4). Codes the 16-value `cfl_alpha_u` / `cfl_alpha_v` per §8.3.2
+/// `TileCflAlphaCdf[ ctx ]`.
+pub const DEFAULT_CFL_ALPHA_CDF: [[u16; CFL_ALPHABET_SIZE + 1]; CFL_ALPHA_CONTEXTS] = [
+    [
+        7637, 20719, 31401, 32481, 32657, 32688, 32692, 32696, 32700, 32704, 32708, 32712, 32716,
+        32720, 32724, 32768, 0,
+    ],
+    [
+        14365, 23603, 28135, 31168, 32167, 32395, 32487, 32573, 32620, 32647, 32668, 32672, 32676,
+        32680, 32684, 32768, 0,
+    ],
+    [
+        11532, 22380, 28445, 31360, 32349, 32523, 32584, 32649, 32673, 32677, 32681, 32685, 32689,
+        32693, 32697, 32768, 0,
+    ],
+    [
+        26990, 31402, 32282, 32571, 32692, 32696, 32700, 32704, 32708, 32712, 32716, 32720, 32724,
+        32728, 32732, 32768, 0,
+    ],
+    [
+        17248, 26058, 28904, 30608, 31305, 31877, 32126, 32321, 32394, 32464, 32516, 32560, 32576,
+        32593, 32622, 32768, 0,
+    ],
+    [
+        14738, 21678, 25779, 27901, 29024, 30302, 30980, 31843, 32144, 32413, 32520, 32594, 32622,
+        32656, 32660, 32768, 0,
+    ],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -725,6 +1069,57 @@ pub struct TileCdfContext {
     /// `TileUniCompRefCdf[ REF_CONTEXTS ][ UNIDIR_COMP_REFS - 1 ]`
     /// (§8.3.1).
     pub uni_comp_ref: [[[u16; 3]; UNIDIR_COMP_REFS - 1]; REF_CONTEXTS],
+
+    // -----------------------------------------------------------------
+    // Round 19 — palette / filter-intra / CFL working CDFs. §8.3.1
+    // enumerates each as "`*Cdf` is set to a copy of `Default_*_Cdf`"
+    // (no per-context broadcast for this group).
+    // -----------------------------------------------------------------
+    /// `TileFilterIntraModeCdf` (§8.3.1).
+    pub filter_intra_mode: [u16; FILTER_INTRA_MODES + 1],
+    /// `TileFilterIntraCdf[ BLOCK_SIZES ]` (§8.3.1).
+    pub filter_intra: [[u16; 3]; BLOCK_SIZES],
+    /// `TilePaletteYModeCdf[ PALETTE_BLOCK_SIZE_CONTEXTS ][ PALETTE_Y_MODE_CONTEXTS ]`
+    /// (§8.3.1).
+    pub palette_y_mode: [[[u16; 3]; PALETTE_Y_MODE_CONTEXTS]; PALETTE_BLOCK_SIZE_CONTEXTS],
+    /// `TilePaletteUVModeCdf[ PALETTE_UV_MODE_CONTEXTS ]` (§8.3.1).
+    pub palette_uv_mode: [[u16; 3]; PALETTE_UV_MODE_CONTEXTS],
+    /// `TilePaletteYSizeCdf[ PALETTE_BLOCK_SIZE_CONTEXTS ]` (§8.3.1).
+    pub palette_y_size: [[u16; PALETTE_SIZES + 1]; PALETTE_BLOCK_SIZE_CONTEXTS],
+    /// `TilePaletteUVSizeCdf[ PALETTE_BLOCK_SIZE_CONTEXTS ]` (§8.3.1).
+    pub palette_uv_size: [[u16; PALETTE_SIZES + 1]; PALETTE_BLOCK_SIZE_CONTEXTS],
+    /// `TilePaletteSize2YColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_2_y_color: [[u16; 3]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize3YColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_3_y_color: [[u16; 4]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize4YColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_4_y_color: [[u16; 5]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize5YColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_5_y_color: [[u16; 6]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize6YColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_6_y_color: [[u16; 7]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize7YColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_7_y_color: [[u16; 8]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize8YColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_8_y_color: [[u16; 9]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize2UVColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_2_uv_color: [[u16; 3]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize3UVColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_3_uv_color: [[u16; 4]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize4UVColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_4_uv_color: [[u16; 5]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize5UVColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_5_uv_color: [[u16; 6]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize6UVColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_6_uv_color: [[u16; 7]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize7UVColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_7_uv_color: [[u16; 8]; PALETTE_COLOR_CONTEXTS],
+    /// `TilePaletteSize8UVColorCdf[ PALETTE_COLOR_CONTEXTS ]` (§8.3.1).
+    pub palette_size_8_uv_color: [[u16; 9]; PALETTE_COLOR_CONTEXTS],
+    /// `TileCflSignCdf` (§8.3.1).
+    pub cfl_sign: [u16; CFL_JOINT_SIGNS + 1],
+    /// `TileCflAlphaCdf[ CFL_ALPHA_CONTEXTS ]` (§8.3.1).
+    pub cfl_alpha: [[u16; CFL_ALPHABET_SIZE + 1]; CFL_ALPHA_CONTEXTS],
 }
 
 impl TileCdfContext {
@@ -782,6 +1177,30 @@ impl TileCdfContext {
             compound_mode: DEFAULT_COMPOUND_MODE_CDF,
             comp_ref_type: DEFAULT_COMP_REF_TYPE_CDF,
             uni_comp_ref: DEFAULT_UNI_COMP_REF_CDF,
+
+            // Round 19 — palette / filter-intra / CFL group.
+            filter_intra_mode: DEFAULT_FILTER_INTRA_MODE_CDF,
+            filter_intra: DEFAULT_FILTER_INTRA_CDF,
+            palette_y_mode: DEFAULT_PALETTE_Y_MODE_CDF,
+            palette_uv_mode: DEFAULT_PALETTE_UV_MODE_CDF,
+            palette_y_size: DEFAULT_PALETTE_Y_SIZE_CDF,
+            palette_uv_size: DEFAULT_PALETTE_UV_SIZE_CDF,
+            palette_size_2_y_color: DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
+            palette_size_3_y_color: DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
+            palette_size_4_y_color: DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,
+            palette_size_5_y_color: DEFAULT_PALETTE_SIZE_5_Y_COLOR_CDF,
+            palette_size_6_y_color: DEFAULT_PALETTE_SIZE_6_Y_COLOR_CDF,
+            palette_size_7_y_color: DEFAULT_PALETTE_SIZE_7_Y_COLOR_CDF,
+            palette_size_8_y_color: DEFAULT_PALETTE_SIZE_8_Y_COLOR_CDF,
+            palette_size_2_uv_color: DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF,
+            palette_size_3_uv_color: DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF,
+            palette_size_4_uv_color: DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF,
+            palette_size_5_uv_color: DEFAULT_PALETTE_SIZE_5_UV_COLOR_CDF,
+            palette_size_6_uv_color: DEFAULT_PALETTE_SIZE_6_UV_COLOR_CDF,
+            palette_size_7_uv_color: DEFAULT_PALETTE_SIZE_7_UV_COLOR_CDF,
+            palette_size_8_uv_color: DEFAULT_PALETTE_SIZE_8_UV_COLOR_CDF,
+            cfl_sign: DEFAULT_CFL_SIGN_CDF,
+            cfl_alpha: DEFAULT_CFL_ALPHA_CDF,
         }
     }
 
@@ -1011,6 +1430,108 @@ impl TileCdfContext {
     pub fn uni_comp_ref_cdf(&mut self, ctx: usize, p: usize) -> &mut [u16] {
         &mut self.uni_comp_ref[ctx][p]
     }
+
+    // -----------------------------------------------------------------
+    // Round 19 — palette / filter-intra / CFL §8.3.2 selectors. The
+    // caller pre-computes each `ctx` from the §5.11.x neighbour state
+    // (helpers [`palette_y_mode_ctx`], [`palette_uv_mode_ctx`],
+    // [`palette_color_ctx`], [`cfl_alpha_u_ctx`], [`cfl_alpha_v_ctx`]
+    // cover the parts that need only scalar inputs; `bsizeCtx` is the
+    // §5.11.46 block-size mapping the tile walk supplies).
+    // -----------------------------------------------------------------
+
+    /// §8.3.2 `use_filter_intra`: the cdf is `TileFilterIntraCdf[ MiSize ]`.
+    pub fn filter_intra_cdf(&mut self, mi_size: usize) -> &mut [u16] {
+        &mut self.filter_intra[mi_size]
+    }
+
+    /// §8.3.2 `filter_intra_mode`: the cdf is `TileFilterIntraModeCdf`
+    /// (a single context-free row).
+    pub fn filter_intra_mode_cdf(&mut self) -> &mut [u16] {
+        &mut self.filter_intra_mode
+    }
+
+    /// §8.3.2 `has_palette_y`: the cdf is
+    /// `TilePaletteYModeCdf[ bsizeCtx ][ ctx ]`. `bsizeCtx` is the
+    /// §5.11.46 block-size class (in `0..PALETTE_BLOCK_SIZE_CONTEXTS`);
+    /// `ctx` is the neighbour-palette count (see [`palette_y_mode_ctx`],
+    /// in `0..PALETTE_Y_MODE_CONTEXTS`).
+    pub fn palette_y_mode_cdf(&mut self, bsize_ctx: usize, ctx: usize) -> &mut [u16] {
+        &mut self.palette_y_mode[bsize_ctx][ctx]
+    }
+
+    /// §8.3.2 `has_palette_uv`: the cdf is `TilePaletteUVModeCdf[ ctx ]`,
+    /// with `ctx = (PaletteSizeY > 0) ? 1 : 0` (see [`palette_uv_mode_ctx`]).
+    pub fn palette_uv_mode_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.palette_uv_mode[ctx]
+    }
+
+    /// §8.3.2 `palette_size_y_minus_2`: the cdf is
+    /// `TilePaletteYSizeCdf[ bsizeCtx ]`.
+    pub fn palette_y_size_cdf(&mut self, bsize_ctx: usize) -> &mut [u16] {
+        &mut self.palette_y_size[bsize_ctx]
+    }
+
+    /// §8.3.2 `palette_size_uv_minus_2`: the cdf is
+    /// `TilePaletteUVSizeCdf[ bsizeCtx ]`.
+    pub fn palette_uv_size_cdf(&mut self, bsize_ctx: usize) -> &mut [u16] {
+        &mut self.palette_uv_size[bsize_ctx]
+    }
+
+    /// §8.3.2 `palette_color_idx_y`: the cdf is
+    /// `TilePaletteSize{2..8}YColorCdf[ ctx ]`, selected by `PaletteSizeY`
+    /// (in `2..=PALETTE_COLORS`). `ctx = Palette_Color_Context[ ColorContextHash ]`
+    /// (see [`palette_color_ctx`], in `0..PALETTE_COLOR_CONTEXTS`).
+    ///
+    /// Returns `None` for a `palette_size_y` outside `2..=PALETTE_COLORS`
+    /// (a caller bug — the colour-index syntax is never reached otherwise).
+    pub fn palette_y_color_cdf(&mut self, palette_size_y: usize, ctx: usize) -> Option<&mut [u16]> {
+        match palette_size_y {
+            2 => Some(&mut self.palette_size_2_y_color[ctx]),
+            3 => Some(&mut self.palette_size_3_y_color[ctx]),
+            4 => Some(&mut self.palette_size_4_y_color[ctx]),
+            5 => Some(&mut self.palette_size_5_y_color[ctx]),
+            6 => Some(&mut self.palette_size_6_y_color[ctx]),
+            7 => Some(&mut self.palette_size_7_y_color[ctx]),
+            8 => Some(&mut self.palette_size_8_y_color[ctx]),
+            _ => None,
+        }
+    }
+
+    /// §8.3.2 `palette_color_idx_uv`: the cdf is
+    /// `TilePaletteSize{2..8}UVColorCdf[ ctx ]`, selected by `PaletteSizeUV`
+    /// (in `2..=PALETTE_COLORS`). `ctx = Palette_Color_Context[ ColorContextHash ]`.
+    ///
+    /// Returns `None` for a `palette_size_uv` outside `2..=PALETTE_COLORS`.
+    pub fn palette_uv_color_cdf(
+        &mut self,
+        palette_size_uv: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16]> {
+        match palette_size_uv {
+            2 => Some(&mut self.palette_size_2_uv_color[ctx]),
+            3 => Some(&mut self.palette_size_3_uv_color[ctx]),
+            4 => Some(&mut self.palette_size_4_uv_color[ctx]),
+            5 => Some(&mut self.palette_size_5_uv_color[ctx]),
+            6 => Some(&mut self.palette_size_6_uv_color[ctx]),
+            7 => Some(&mut self.palette_size_7_uv_color[ctx]),
+            8 => Some(&mut self.palette_size_8_uv_color[ctx]),
+            _ => None,
+        }
+    }
+
+    /// §8.3.2 `cfl_alpha_signs`: the cdf is `TileCflSignCdf` (a single
+    /// context-free row).
+    pub fn cfl_sign_cdf(&mut self) -> &mut [u16] {
+        &mut self.cfl_sign
+    }
+
+    /// §8.3.2 `cfl_alpha_u` / `cfl_alpha_v`: the cdf is
+    /// `TileCflAlphaCdf[ ctx ]`, with `ctx` from [`cfl_alpha_u_ctx`] /
+    /// [`cfl_alpha_v_ctx`] (in `0..CFL_ALPHA_CONTEXTS`).
+    pub fn cfl_alpha_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.cfl_alpha[ctx]
+    }
 }
 
 impl Default for TileCdfContext {
@@ -1194,6 +1715,67 @@ pub fn compound_mode_ctx(ref_mv_context: usize, new_mv_context: usize) -> usize 
     let row = (ref_mv_context >> 1).min(COMPOUND_MODE_CTX_MAP.len() - 1);
     let col = new_mv_context.min(COMP_NEWMV_CTXS - 1);
     COMPOUND_MODE_CTX_MAP[row][col]
+}
+
+// ---------------------------------------------------------------------
+// Round 19 — palette / filter-intra / CFL §8.3.2 context helpers. Each
+// computes a `ctx` from the scalar neighbour inputs the §5.11.x syntax
+// supplies (the §5.11.46 `bsizeCtx` itself comes from the block-size
+// tables in the tile walk and is passed through directly).
+// ---------------------------------------------------------------------
+
+/// §8.3.2 `has_palette_y` context:
+///
+/// ```text
+///   ctx = 0
+///   if ( AvailU && PaletteSizes[ 0 ][ MiRow - 1 ][ MiCol ] > 0 ) ctx += 1
+///   if ( AvailL && PaletteSizes[ 0 ][ MiRow ][ MiCol - 1 ] > 0 ) ctx += 1
+/// ```
+///
+/// The caller passes whether the above / left neighbour (when available)
+/// carries a non-empty Y palette. Returns a value in
+/// `0..PALETTE_Y_MODE_CONTEXTS`.
+pub fn palette_y_mode_ctx(above_has_palette: bool, left_has_palette: bool) -> usize {
+    above_has_palette as usize + left_has_palette as usize
+}
+
+/// §8.3.2 `has_palette_uv` context: `ctx = (PaletteSizeY > 0) ? 1 : 0`.
+/// Returns a value in `0..PALETTE_UV_MODE_CONTEXTS`.
+pub fn palette_uv_mode_ctx(palette_size_y: usize) -> usize {
+    (palette_size_y > 0) as usize
+}
+
+/// §8.3.2 `palette_color_idx_y` / `palette_color_idx_uv` context:
+/// `ctx = Palette_Color_Context[ ColorContextHash ]`.
+///
+/// The §5.11.50 colour-context derivation only ever produces a
+/// `ColorContextHash` for which [`PALETTE_COLOR_CONTEXT`] holds a
+/// non-negative entry; this helper returns `None` for the spec's `-1`
+/// sentinels (which "will never be accessed") and for an out-of-range
+/// hash. On the valid path the result is in `0..PALETTE_COLOR_CONTEXTS`.
+pub fn palette_color_ctx(color_context_hash: usize) -> Option<usize> {
+    let mapped = *PALETTE_COLOR_CONTEXT.get(color_context_hash)?;
+    if mapped < 0 {
+        None
+    } else {
+        Some(mapped as usize)
+    }
+}
+
+/// §8.3.2 `cfl_alpha_u` context: `ctx = (signU - 1) * 3 + signV`, which
+/// the spec notes equals `cfl_alpha_signs - 2`. `sign_u` / `sign_v` are
+/// the §5.11.45 joint-sign components (`CFL_SIGN_ZERO == 0`,
+/// `CFL_SIGN_NEG == 1`, `CFL_SIGN_POS == 2`). Only reached when
+/// `sign_u != CFL_SIGN_ZERO`, so the result is in `0..CFL_ALPHA_CONTEXTS`.
+pub fn cfl_alpha_u_ctx(sign_u: usize, sign_v: usize) -> usize {
+    (sign_u - 1) * 3 + sign_v
+}
+
+/// §8.3.2 `cfl_alpha_v` context: `ctx = (signV - 1) * 3 + signU`. Only
+/// reached when `sign_v != CFL_SIGN_ZERO`, so the result is in
+/// `0..CFL_ALPHA_CONTEXTS`.
+pub fn cfl_alpha_v_ctx(sign_u: usize, sign_v: usize) -> usize {
+    (sign_v - 1) * 3 + sign_u
 }
 
 #[cfg(test)]
@@ -1937,5 +2519,294 @@ mod tests {
         assert!(sym < COMPOUND_MODES as u32, "compound_mode is in 0..8");
         // disable_cdf_update was true ⇒ row untouched.
         assert_eq!(ctx.compound_mode[7], DEFAULT_COMPOUND_MODE_CDF[7]);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 19 — palette / filter-intra / CFL default CDF tests.
+    // -----------------------------------------------------------------
+
+    /// §9.4 dimensions for every palette / filter-intra / CFL table,
+    /// matching the spec's declared array shapes, and the §8.2.6
+    /// well-formedness invariant (`cdf[N-1] == 32768`, `cdf[N] == 0`) on
+    /// every transcribed row.
+    #[test]
+    fn palette_group_table_dimensions_and_invariants() {
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+
+        // Filter-intra.
+        assert_eq!(DEFAULT_FILTER_INTRA_MODE_CDF.len(), FILTER_INTRA_MODES + 1);
+        check(&DEFAULT_FILTER_INTRA_MODE_CDF);
+        assert_eq!(DEFAULT_FILTER_INTRA_CDF.len(), BLOCK_SIZES);
+        for r in &DEFAULT_FILTER_INTRA_CDF {
+            assert_eq!(r.len(), 3);
+            check(r);
+        }
+
+        // Palette mode / size.
+        assert_eq!(
+            DEFAULT_PALETTE_Y_MODE_CDF.len(),
+            PALETTE_BLOCK_SIZE_CONTEXTS
+        );
+        for plane in &DEFAULT_PALETTE_Y_MODE_CDF {
+            assert_eq!(plane.len(), PALETTE_Y_MODE_CONTEXTS);
+            for r in plane {
+                assert_eq!(r.len(), 3);
+                check(r);
+            }
+        }
+        assert_eq!(DEFAULT_PALETTE_UV_MODE_CDF.len(), PALETTE_UV_MODE_CONTEXTS);
+        for r in &DEFAULT_PALETTE_UV_MODE_CDF {
+            check(r);
+        }
+        assert_eq!(
+            DEFAULT_PALETTE_Y_SIZE_CDF.len(),
+            PALETTE_BLOCK_SIZE_CONTEXTS
+        );
+        assert_eq!(
+            DEFAULT_PALETTE_UV_SIZE_CDF.len(),
+            PALETTE_BLOCK_SIZE_CONTEXTS
+        );
+        for r in &DEFAULT_PALETTE_Y_SIZE_CDF {
+            assert_eq!(r.len(), PALETTE_SIZES + 1);
+            check(r);
+        }
+        for r in &DEFAULT_PALETTE_UV_SIZE_CDF {
+            assert_eq!(r.len(), PALETTE_SIZES + 1);
+            check(r);
+        }
+
+        // Palette colour-index: a size-K table codes K symbols (row len
+        // K + 1), with PALETTE_COLOR_CONTEXTS rows each.
+        macro_rules! check_color {
+            ($tab:expr, $size:expr) => {{
+                assert_eq!($tab.len(), PALETTE_COLOR_CONTEXTS);
+                for r in &$tab {
+                    assert_eq!(r.len(), $size + 1, "size-{} table row len", $size);
+                    check(r);
+                }
+            }};
+        }
+        check_color!(DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF, 2);
+        check_color!(DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF, 3);
+        check_color!(DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF, 4);
+        check_color!(DEFAULT_PALETTE_SIZE_5_Y_COLOR_CDF, 5);
+        check_color!(DEFAULT_PALETTE_SIZE_6_Y_COLOR_CDF, 6);
+        check_color!(DEFAULT_PALETTE_SIZE_7_Y_COLOR_CDF, 7);
+        check_color!(DEFAULT_PALETTE_SIZE_8_Y_COLOR_CDF, 8);
+        check_color!(DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, 2);
+        check_color!(DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, 3);
+        check_color!(DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, 4);
+        check_color!(DEFAULT_PALETTE_SIZE_5_UV_COLOR_CDF, 5);
+        check_color!(DEFAULT_PALETTE_SIZE_6_UV_COLOR_CDF, 6);
+        check_color!(DEFAULT_PALETTE_SIZE_7_UV_COLOR_CDF, 7);
+        check_color!(DEFAULT_PALETTE_SIZE_8_UV_COLOR_CDF, 8);
+
+        // CFL.
+        assert_eq!(DEFAULT_CFL_SIGN_CDF.len(), CFL_JOINT_SIGNS + 1);
+        check(&DEFAULT_CFL_SIGN_CDF);
+        assert_eq!(DEFAULT_CFL_ALPHA_CDF.len(), CFL_ALPHA_CONTEXTS);
+        for r in &DEFAULT_CFL_ALPHA_CDF {
+            assert_eq!(r.len(), CFL_ALPHABET_SIZE + 1);
+            check(r);
+        }
+    }
+
+    /// §9.4 hand-picked byte-exact values, spot-checking each table type
+    /// at a row the spec lists explicitly.
+    #[test]
+    fn palette_group_byte_exact_values() {
+        assert_eq!(
+            DEFAULT_FILTER_INTRA_MODE_CDF,
+            [8949, 12776, 17211, 29558, 32768, 0]
+        );
+        // Filter-intra MiSize 0 and the "never used" filler at index 10.
+        assert_eq!(DEFAULT_FILTER_INTRA_CDF[0], [4621, 32768, 0]);
+        assert_eq!(DEFAULT_FILTER_INTRA_CDF[10], [16384, 32768, 0]);
+        // Palette Y-mode last block-size context, third ctx (the
+        // distinctive `{ 129, .. }` row).
+        assert_eq!(DEFAULT_PALETTE_Y_MODE_CDF[6][2], [129, 32768, 0]);
+        assert_eq!(DEFAULT_PALETTE_UV_MODE_CDF[1], [21488, 32768, 0]);
+        assert_eq!(
+            DEFAULT_PALETTE_Y_SIZE_CDF[0],
+            [7952, 13000, 18149, 21478, 25527, 29241, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_PALETTE_UV_SIZE_CDF[6],
+            [1269, 5435, 10433, 18963, 21700, 25865, 32768, 0]
+        );
+        // Largest Y colour table, last ctx.
+        assert_eq!(
+            DEFAULT_PALETTE_SIZE_8_Y_COLOR_CDF[4],
+            [31028, 31270, 31504, 31705, 31927, 32153, 32392, 32768, 0]
+        );
+        // Smallest UV colour table.
+        assert_eq!(DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF[2], [8713, 32768, 0]);
+        assert_eq!(
+            DEFAULT_CFL_SIGN_CDF,
+            [1418, 2123, 13340, 18405, 26972, 28343, 32294, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_CFL_ALPHA_CDF[0],
+            [
+                7637, 20719, 31401, 32481, 32657, 32688, 32692, 32696, 32700, 32704, 32708, 32712,
+                32716, 32720, 32724, 32768, 0
+            ]
+        );
+    }
+
+    /// §8.3.1 init step for the palette / filter-intra / CFL group: every
+    /// working array matches its §9.4 default verbatim.
+    #[test]
+    fn init_from_defaults_copies_palette_group() {
+        let ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.filter_intra_mode, DEFAULT_FILTER_INTRA_MODE_CDF);
+        assert_eq!(ctx.filter_intra, DEFAULT_FILTER_INTRA_CDF);
+        assert_eq!(ctx.palette_y_mode, DEFAULT_PALETTE_Y_MODE_CDF);
+        assert_eq!(ctx.palette_uv_mode, DEFAULT_PALETTE_UV_MODE_CDF);
+        assert_eq!(ctx.palette_y_size, DEFAULT_PALETTE_Y_SIZE_CDF);
+        assert_eq!(ctx.palette_uv_size, DEFAULT_PALETTE_UV_SIZE_CDF);
+        assert_eq!(
+            ctx.palette_size_2_y_color,
+            DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF
+        );
+        assert_eq!(
+            ctx.palette_size_8_y_color,
+            DEFAULT_PALETTE_SIZE_8_Y_COLOR_CDF
+        );
+        assert_eq!(
+            ctx.palette_size_2_uv_color,
+            DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF
+        );
+        assert_eq!(
+            ctx.palette_size_8_uv_color,
+            DEFAULT_PALETTE_SIZE_8_UV_COLOR_CDF
+        );
+        assert_eq!(ctx.cfl_sign, DEFAULT_CFL_SIGN_CDF);
+        assert_eq!(ctx.cfl_alpha, DEFAULT_CFL_ALPHA_CDF);
+    }
+
+    /// §8.3.2 `palette_color_idx_*` array selection by `PaletteSize`:
+    /// a size-K palette selects the size-K colour table (row length
+    /// `K + 1`), and out-of-range sizes return `None`.
+    #[test]
+    fn palette_color_cdf_selected_by_size() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        for size in 2..=PALETTE_COLORS {
+            assert_eq!(
+                ctx.palette_y_color_cdf(size, 0).unwrap().len(),
+                size + 1,
+                "Y size-{size} colour row length"
+            );
+            assert_eq!(
+                ctx.palette_uv_color_cdf(size, 0).unwrap().len(),
+                size + 1,
+                "UV size-{size} colour row length"
+            );
+        }
+        assert!(ctx.palette_y_color_cdf(1, 0).is_none());
+        assert!(ctx.palette_y_color_cdf(9, 0).is_none());
+        assert!(ctx.palette_uv_color_cdf(1, 0).is_none());
+        assert!(ctx.palette_uv_color_cdf(9, 0).is_none());
+        // The selected row matches the §9.4 default for that ctx.
+        assert_eq!(
+            ctx.palette_y_color_cdf(4, 3).unwrap(),
+            &DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF[3]
+        );
+    }
+
+    /// §8.3.2 `has_palette_y` / `has_palette_uv` context formulas.
+    #[test]
+    fn palette_mode_contexts() {
+        assert_eq!(palette_y_mode_ctx(false, false), 0);
+        assert_eq!(palette_y_mode_ctx(true, false), 1);
+        assert_eq!(palette_y_mode_ctx(false, true), 1);
+        assert_eq!(palette_y_mode_ctx(true, true), 2);
+        assert_eq!(palette_uv_mode_ctx(0), 0);
+        assert_eq!(palette_uv_mode_ctx(4), 1);
+    }
+
+    /// §8.3.2 `Palette_Color_Context[ ColorContextHash ]` mapping: the
+    /// `-1` sentinels yield `None`, the rest map per the spec table.
+    #[test]
+    fn palette_color_context_map() {
+        // { -1, -1, 0, -1, -1, 4, 3, 2, 1 }
+        assert_eq!(palette_color_ctx(0), None);
+        assert_eq!(palette_color_ctx(1), None);
+        assert_eq!(palette_color_ctx(2), Some(0));
+        assert_eq!(palette_color_ctx(3), None);
+        assert_eq!(palette_color_ctx(4), None);
+        assert_eq!(palette_color_ctx(5), Some(4));
+        assert_eq!(palette_color_ctx(6), Some(3));
+        assert_eq!(palette_color_ctx(7), Some(2));
+        assert_eq!(palette_color_ctx(8), Some(1));
+        // Out of range.
+        assert_eq!(palette_color_ctx(9), None);
+        // Every valid result is a PALETTE_COLOR_CONTEXTS index.
+        for h in 0..=PALETTE_MAX_COLOR_CONTEXT_HASH {
+            if let Some(c) = palette_color_ctx(h) {
+                assert!(c < PALETTE_COLOR_CONTEXTS);
+            }
+        }
+        assert_eq!(PALETTE_COLOR_HASH_MULTIPLIERS, [1, 2, 2]);
+    }
+
+    /// §8.3.2 `cfl_alpha_u` / `cfl_alpha_v` context formulas. The spec
+    /// notes `cfl_alpha_u` ctx == `cfl_alpha_signs - 2`; check that
+    /// identity across every joint-sign value that decodes a U component
+    /// (`signU != CFL_SIGN_ZERO`), with the §5.11.45 joint decomposition
+    /// `signU = (cfl_alpha_signs + 1) / 3`, `signV = (cfl_alpha_signs + 1) % 3`.
+    #[test]
+    fn cfl_alpha_contexts() {
+        // Spot-check both formulas against the §8.3.2 tables.
+        // cfl_alpha_u: (signU - 1) * 3 + signV.
+        assert_eq!(cfl_alpha_u_ctx(1, 0), 0);
+        assert_eq!(cfl_alpha_u_ctx(2, 2), 5);
+        // cfl_alpha_v: (signV - 1) * 3 + signU.
+        assert_eq!(cfl_alpha_v_ctx(0, 1), 0);
+        assert_eq!(cfl_alpha_v_ctx(2, 2), 5);
+
+        // The §8.3.2 note: for cfl_alpha_u, ctx == cfl_alpha_signs - 2.
+        for joint in 0..CFL_JOINT_SIGNS {
+            let sign_u = (joint + 1) / 3;
+            let sign_v = (joint + 1) % 3;
+            if sign_u != 0 {
+                let ctx = cfl_alpha_u_ctx(sign_u, sign_v);
+                assert_eq!(ctx, joint - 2, "cfl_alpha_u ctx == cfl_alpha_signs - 2");
+                assert!(ctx < CFL_ALPHA_CONTEXTS);
+            }
+            if sign_v != 0 {
+                assert!(cfl_alpha_v_ctx(sign_u, sign_v) < CFL_ALPHA_CONTEXTS);
+            }
+        }
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a
+    /// `cfl_alpha_u` (16-value) default CDF selected by §8.3.2
+    /// `cfl_alpha_u_ctx`, confirming the selected row matches the §9.4
+    /// default and a valid §8.2.6 decode lands in range and adapts.
+    #[test]
+    fn decode_cfl_alpha_through_default_cdf() {
+        // signU = 1, signV = 0 ⇒ ctx = 0.
+        let ctx_idx = cfl_alpha_u_ctx(1, 0);
+        assert_eq!(ctx_idx, 0);
+
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+        let before = ctx.cfl_alpha;
+
+        let row = ctx.cfl_alpha_cdf(ctx_idx);
+        assert_eq!(row, &DEFAULT_CFL_ALPHA_CDF[0]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(sym < CFL_ALPHABET_SIZE as u32, "cfl_alpha is in 0..16");
+
+        // §8.3 update ran (disable_cdf_update == false): the row changed
+        // but the §9.4 source is immutable.
+        assert_ne!(ctx.cfl_alpha, before, "read_symbol must adapt the CDF");
+        assert_eq!(DEFAULT_CFL_ALPHA_CDF[0][0], 7637);
     }
 }

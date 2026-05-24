@@ -558,6 +558,49 @@ Bitstream parsing currently covers:
   the `compound_mode` (8-value) default CDF row selected by
   `compound_mode_ctx(4, 4) = 7`.
 
+* **§9.4 default CDF tables + §8.3.1 / §8.3.2 selection — palette /
+  filter-intra / CFL subset (round 19).** Extends `cdf` with the
+  filter-intra group (`Default_Filter_Intra_Mode_Cdf` 5-value,
+  `Default_Filter_Intra_Cdf[ BLOCK_SIZES ]` binary with the §9.4
+  "indices 10–15 / 20–21 never used" filler preserved), the palette
+  group (`Default_Palette_Y_Mode_Cdf[ 7 ][ 3 ]`,
+  `Default_Palette_Uv_Mode_Cdf[ 2 ]`,
+  `Default_Palette_{Y,Uv}_Size_Cdf[ 7 ]` 7-value, and the fourteen
+  `Default_Palette_Size_{2..8}_{Y,Uv}_Color_Cdf[ 5 ]` colour-index
+  tables whose symbol count grows with `PaletteSize`), and the CFL
+  group (`Default_Cfl_Sign_Cdf` 8-value,
+  `Default_Cfl_Alpha_Cdf[ 6 ][ 17 ]` 16-value) — all transcribed
+  verbatim from §9.4 with the §3 constants `BLOCK_SIZES = 22`,
+  `FILTER_INTRA_MODES = 5`, `PALETTE_BLOCK_SIZE_CONTEXTS = 7`,
+  `PALETTE_{Y,UV}_MODE_CONTEXTS = 3/2`, `PALETTE_SIZES = 7`,
+  `PALETTE_COLORS = 8`, `PALETTE_COLOR_CONTEXTS = 5`,
+  `CFL_JOINT_SIGNS = 8`, `CFL_ALPHABET_SIZE = 16`,
+  `CFL_ALPHA_CONTEXTS = 6` and the `Palette_Color_Context` /
+  `Palette_Color_Hash_Multipliers` additional-tables arrays re-exposed
+  at the crate root. `new_from_defaults` performs the §8.3.1 init step
+  for every array. The §8.3.2 selection surfaces ten `&mut [u16]`
+  accessors — `filter_intra_cdf(MiSize)`, `filter_intra_mode_cdf()`,
+  `palette_y_mode_cdf(bsizeCtx, ctx)`, `palette_uv_mode_cdf(ctx)`,
+  `palette_{y,uv}_size_cdf(bsizeCtx)`,
+  `palette_{y,uv}_color_cdf(PaletteSize, ctx)` (size-keyed, `Option`
+  for out-of-range), `cfl_sign_cdf()`, `cfl_alpha_cdf(ctx)`. Scalar
+  §8.3.2 helpers `palette_y_mode_ctx(above, left)`,
+  `palette_uv_mode_ctx(PaletteSizeY)`,
+  `palette_color_ctx(ColorContextHash)` (the `Palette_Color_Context`
+  lookup returning `None` for the spec's `-1` sentinels), and
+  `cfl_alpha_{u,v}_ctx(signU, signV)` (`(signU-1)*3+signV` /
+  `(signV-1)*3+signU`, with the §8.3.2 `ctx == cfl_alpha_signs - 2`
+  identity checked) compute each `ctx` from scalar neighbour inputs.
+  8 new unit tests (190 in src/, up from 182): full dimension audit of
+  every palette / filter-intra / CFL table with the §8.2.6
+  `cdf[N-1] == 32768` / `cdf[N] == 0` invariant on every row;
+  hand-picked byte-exact spot-checks; §8.3.1 init copy; size-keyed
+  colour-CDF selection (row length `K+1` for size `K`, `None` outside
+  `2..=8`); the palette/CFL context formulas; the
+  `Palette_Color_Context` sentinel map; and an end-to-end §8.2
+  `SymbolDecoder` decode driving the 16-value `cfl_alpha_u` default
+  CDF row selected by `cfl_alpha_u_ctx(1, 0) = 0`.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,

@@ -6,6 +6,31 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 19 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (palette / filter-intra / CFL subset).** Extends `cdf` with the
+  filter-intra (`Default_Filter_Intra_Mode_Cdf`,
+  `Default_Filter_Intra_Cdf`), palette (`Default_Palette_Y_Mode_Cdf`,
+  `Default_Palette_Uv_Mode_Cdf`, `Default_Palette_Y_Size_Cdf`,
+  `Default_Palette_Uv_Size_Cdf`, and the fourteen
+  `Default_Palette_Size_{2..8}_{Y,Uv}_Color_Cdf` colour-index tables),
+  and CFL (`Default_Cfl_Sign_Cdf`, `Default_Cfl_Alpha_Cdf`) default
+  tables — all transcribed verbatim from §9.4. New §3 constants
+  `BLOCK_SIZES`, `FILTER_INTRA_MODES`, `PALETTE_BLOCK_SIZE_CONTEXTS`,
+  `PALETTE_Y_MODE_CONTEXTS`, `PALETTE_UV_MODE_CONTEXTS`,
+  `PALETTE_SIZES`, `PALETTE_COLORS`, `PALETTE_COLOR_CONTEXTS`,
+  `PALETTE_NUM_NEIGHBORS`, `PALETTE_MAX_COLOR_CONTEXT_HASH`,
+  `CFL_JOINT_SIGNS`, `CFL_ALPHABET_SIZE`, `CFL_ALPHA_CONTEXTS`, the
+  `PALETTE_COLOR_CONTEXT` / `PALETTE_COLOR_HASH_MULTIPLIERS`
+  additional-tables arrays, all listed `DEFAULT_*_CDF` tables, the ten
+  `*_cdf` selectors (`filter_intra_cdf`, `filter_intra_mode_cdf`,
+  `palette_y_mode_cdf`, `palette_uv_mode_cdf`, `palette_y_size_cdf`,
+  `palette_uv_size_cdf`, `palette_y_color_cdf`, `palette_uv_color_cdf`,
+  `cfl_sign_cdf`, `cfl_alpha_cdf`), and the five `*_ctx` helpers
+  (`palette_y_mode_ctx`, `palette_uv_mode_ctx`, `palette_color_ctx`,
+  `cfl_alpha_u_ctx`, `cfl_alpha_v_ctx`). `TileCdfContext::new_from_defaults`
+  performs the §8.3.1 init step for every new array. 8 new unit tests
+  (190 in src/, up from 182).
+
 * **Round 18 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (inter-mode / reference-frame subset).** Extends `cdf` with the 13
   remaining `Default_*_Cdf` tables that drive every inter-block mode
