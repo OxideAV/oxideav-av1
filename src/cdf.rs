@@ -125,6 +125,73 @@ pub const MV_OFFSET_BITS: usize = 10;
 pub const MV_COMPS: usize = 2;
 
 // ---------------------------------------------------------------------
+// §3 inter-mode / reference-frame constants (round 18).
+// ---------------------------------------------------------------------
+
+/// `NEW_MV_CONTEXTS` (§3) — number of contexts for `new_mv`.
+pub const NEW_MV_CONTEXTS: usize = 6;
+
+/// `ZERO_MV_CONTEXTS` (§3) — number of contexts for `zero_mv`.
+pub const ZERO_MV_CONTEXTS: usize = 2;
+
+/// `REF_MV_CONTEXTS` (§3) — number of contexts for `ref_mv`.
+pub const REF_MV_CONTEXTS: usize = 6;
+
+/// `DRL_MODE_CONTEXTS` (§3) — number of contexts for `drl_mode`.
+pub const DRL_MODE_CONTEXTS: usize = 3;
+
+/// `IS_INTER_CONTEXTS` (§3) — number of contexts for `is_inter`.
+pub const IS_INTER_CONTEXTS: usize = 4;
+
+/// `COMP_INTER_CONTEXTS` (§3) — number of contexts for `comp_mode`.
+pub const COMP_INTER_CONTEXTS: usize = 5;
+
+/// `SKIP_MODE_CONTEXTS` (§3) — number of contexts for `skip_mode`.
+pub const SKIP_MODE_CONTEXTS: usize = 3;
+
+/// `REF_CONTEXTS` (§3) — number of contexts for `single_ref`, `comp_ref`,
+/// `comp_bwdref`, and `uni_comp_ref`.
+pub const REF_CONTEXTS: usize = 3;
+
+/// `FWD_REFS` (§3) — number of forward reference syntax elements (the
+/// `Default_Comp_Ref_Cdf` second dimension is `FWD_REFS - 1`).
+pub const FWD_REFS: usize = 4;
+
+/// `BWD_REFS` (§3) — number of backward reference syntax elements (the
+/// `Default_Comp_Bwd_Ref_Cdf` second dimension is `BWD_REFS - 1`).
+pub const BWD_REFS: usize = 3;
+
+/// `SINGLE_REFS` (§3) — number of single-reference syntax elements (the
+/// `Default_Single_Ref_Cdf` second dimension is `SINGLE_REFS - 1`).
+pub const SINGLE_REFS: usize = 7;
+
+/// `UNIDIR_COMP_REFS` (§3) — number of unidirectional-compound reference
+/// syntax elements (the `Default_Uni_Comp_Ref_Cdf` second dimension is
+/// `UNIDIR_COMP_REFS - 1`).
+pub const UNIDIR_COMP_REFS: usize = 4;
+
+/// `COMP_REF_TYPE_CONTEXTS` (§3) — number of contexts for `comp_ref_type`.
+pub const COMP_REF_TYPE_CONTEXTS: usize = 5;
+
+/// `COMPOUND_MODES` (§3) — number of values for `compound_mode`.
+pub const COMPOUND_MODES: usize = 8;
+
+/// `COMPOUND_MODE_CONTEXTS` (§3) — number of contexts for `compound_mode`.
+pub const COMPOUND_MODE_CONTEXTS: usize = 8;
+
+/// `COMP_NEWMV_CTXS` (§3) — number of new-mv values used when
+/// constructing the compound-mode context (the second axis of
+/// `Compound_Mode_Ctx_Map`).
+pub const COMP_NEWMV_CTXS: usize = 5;
+
+/// `Compound_Mode_Ctx_Map[ 3 ][ COMP_NEWMV_CTXS ]` (§8.3.2) — maps the
+/// `(RefMvContext >> 1, Min(NewMvContext, COMP_NEWMV_CTXS - 1))` pair to
+/// the `compound_mode` context index used to select the
+/// `TileCompoundModeCdf` row.
+pub const COMPOUND_MODE_CTX_MAP: [[usize; COMP_NEWMV_CTXS]; 3] =
+    [[0, 1, 1, 1, 1], [1, 2, 3, 4, 4], [4, 4, 5, 6, 7]];
+
+// ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
 //
 // Each innermost array has length `N + 1`: `N` cumulative frequencies
@@ -416,6 +483,159 @@ pub const DEFAULT_MV_FR_CDF: [[u16; MV_JOINTS + 1]; MV_COMPS] = [
 pub const DEFAULT_MV_HP_CDF: [u16; 3] = [128 * 128, 32768, 0];
 
 // ---------------------------------------------------------------------
+// §9.4 inter-mode / reference-frame default CDF tables (round 18).
+//
+// Per §8.3.1 each of `NewMvCdf`, `ZeroMvCdf`, `RefMvCdf`, `DrlModeCdf`,
+// `IsInterCdf`, `CompModeCdf`, `SkipModeCdf`, `CompRefCdf`,
+// `CompBwdRefCdf`, `SingleRefCdf`, `CompoundModeCdf`, `CompRefTypeCdf`,
+// `UniCompRefCdf` "is set to a copy of" the corresponding `Default_*_Cdf`.
+//
+// Each innermost array has length `N + 1`: `N` cumulative frequencies
+// (the last `1 << 15 == 32768`) followed by the §8.3 adaptation
+// counter, which starts at 0.
+// ---------------------------------------------------------------------
+
+/// `Default_New_Mv_Cdf[ NEW_MV_CONTEXTS ][ 3 ]` (§9.4). Binary; codes
+/// `new_mv` ("is the predicted mv a NEWMV?") per §8.3.2 selection
+/// `TileNewMvCdf[ NewMvContext ]`.
+pub const DEFAULT_NEW_MV_CDF: [[u16; 3]; NEW_MV_CONTEXTS] = [
+    [24035, 32768, 0],
+    [16630, 32768, 0],
+    [15339, 32768, 0],
+    [8386, 32768, 0],
+    [12222, 32768, 0],
+    [4676, 32768, 0],
+];
+
+/// `Default_Zero_Mv_Cdf[ ZERO_MV_CONTEXTS ][ 3 ]` (§9.4). Binary; codes
+/// `zero_mv` per §8.3.2 `TileZeroMvCdf[ ZeroMvContext ]`.
+pub const DEFAULT_ZERO_MV_CDF: [[u16; 3]; ZERO_MV_CONTEXTS] = [[2175, 32768, 0], [1054, 32768, 0]];
+
+/// `Default_Ref_Mv_Cdf[ REF_MV_CONTEXTS ][ 3 ]` (§9.4). Binary; codes
+/// `ref_mv` per §8.3.2 `TileRefMvCdf[ RefMvContext ]`.
+pub const DEFAULT_REF_MV_CDF: [[u16; 3]; REF_MV_CONTEXTS] = [
+    [23974, 32768, 0],
+    [24188, 32768, 0],
+    [17848, 32768, 0],
+    [28622, 32768, 0],
+    [24312, 32768, 0],
+    [19923, 32768, 0],
+];
+
+/// `Default_Drl_Mode_Cdf[ DRL_MODE_CONTEXTS ][ 3 ]` (§9.4). Binary; codes
+/// `drl_mode` per §8.3.2 `TileDrlModeCdf[ DrlCtxStack[ idx ] ]`.
+pub const DEFAULT_DRL_MODE_CDF: [[u16; 3]; DRL_MODE_CONTEXTS] =
+    [[13104, 32768, 0], [24560, 32768, 0], [18945, 32768, 0]];
+
+/// `Default_Is_Inter_Cdf[ IS_INTER_CONTEXTS ][ 3 ]` (§9.4). Binary; codes
+/// `is_inter` per §8.3.2 `TileIsInterCdf[ ctx ]`.
+pub const DEFAULT_IS_INTER_CDF: [[u16; 3]; IS_INTER_CONTEXTS] = [
+    [806, 32768, 0],
+    [16662, 32768, 0],
+    [20186, 32768, 0],
+    [26538, 32768, 0],
+];
+
+/// `Default_Comp_Mode_Cdf[ COMP_INTER_CONTEXTS ][ 3 ]` (§9.4). Binary;
+/// codes `comp_mode` per §8.3.2 `TileCompModeCdf[ ctx ]`.
+pub const DEFAULT_COMP_MODE_CDF: [[u16; 3]; COMP_INTER_CONTEXTS] = [
+    [26828, 32768, 0],
+    [24035, 32768, 0],
+    [12031, 32768, 0],
+    [10640, 32768, 0],
+    [2901, 32768, 0],
+];
+
+/// `Default_Skip_Mode_Cdf[ SKIP_MODE_CONTEXTS ][ 3 ]` (§9.4). Binary;
+/// codes `skip_mode` per §8.3.2 `TileSkipModeCdf[ ctx ]`.
+pub const DEFAULT_SKIP_MODE_CDF: [[u16; 3]; SKIP_MODE_CONTEXTS] =
+    [[32621, 32768, 0], [20708, 32768, 0], [8127, 32768, 0]];
+
+/// `Default_Comp_Ref_Cdf[ REF_CONTEXTS ][ FWD_REFS - 1 ][ 3 ]` (§9.4).
+/// Binary; codes `comp_ref` / `comp_ref_p1` / `comp_ref_p2` per §8.3.2
+/// `TileCompRefCdf[ ctx ][ 0..2 ]`.
+pub const DEFAULT_COMP_REF_CDF: [[[u16; 3]; FWD_REFS - 1]; REF_CONTEXTS] = [
+    [[4946, 32768, 0], [9468, 32768, 0], [1503, 32768, 0]],
+    [[19891, 32768, 0], [22441, 32768, 0], [15160, 32768, 0]],
+    [[30731, 32768, 0], [31059, 32768, 0], [27544, 32768, 0]],
+];
+
+/// `Default_Comp_Bwd_Ref_Cdf[ REF_CONTEXTS ][ BWD_REFS - 1 ][ 3 ]`
+/// (§9.4). Binary; codes `comp_bwdref` / `comp_bwdref_p1` per §8.3.2
+/// `TileCompBwdRefCdf[ ctx ][ 0..1 ]`.
+pub const DEFAULT_COMP_BWD_REF_CDF: [[[u16; 3]; BWD_REFS - 1]; REF_CONTEXTS] = [
+    [[2235, 32768, 0], [1423, 32768, 0]],
+    [[17182, 32768, 0], [15175, 32768, 0]],
+    [[30606, 32768, 0], [30489, 32768, 0]],
+];
+
+/// `Default_Single_Ref_Cdf[ REF_CONTEXTS ][ SINGLE_REFS - 1 ][ 3 ]`
+/// (§9.4). Binary; codes `single_ref_p1` .. `single_ref_p6` per §8.3.2
+/// `TileSingleRefCdf[ ctx ][ 0..5 ]` (the 6th `single_ref_p*` slot
+/// `[5]` is `single_ref_p6` per the §8.3.2 list).
+pub const DEFAULT_SINGLE_REF_CDF: [[[u16; 3]; SINGLE_REFS - 1]; REF_CONTEXTS] = [
+    [
+        [4897, 32768, 0],
+        [1555, 32768, 0],
+        [4236, 32768, 0],
+        [8650, 32768, 0],
+        [904, 32768, 0],
+        [1444, 32768, 0],
+    ],
+    [
+        [16973, 32768, 0],
+        [16751, 32768, 0],
+        [19647, 32768, 0],
+        [24773, 32768, 0],
+        [11014, 32768, 0],
+        [15087, 32768, 0],
+    ],
+    [
+        [29744, 32768, 0],
+        [30279, 32768, 0],
+        [31194, 32768, 0],
+        [31895, 32768, 0],
+        [26875, 32768, 0],
+        [30304, 32768, 0],
+    ],
+];
+
+/// `Default_Compound_Mode_Cdf[ COMPOUND_MODE_CONTEXTS ][ COMPOUND_MODES + 1 ]`
+/// (§9.4). Codes the 8-value `compound_mode` per §8.3.2
+/// `TileCompoundModeCdf[ ctx ]`, where `ctx` is taken from
+/// `Compound_Mode_Ctx_Map[ RefMvContext >> 1 ][ Min(NewMvContext,
+/// COMP_NEWMV_CTXS - 1) ]`.
+pub const DEFAULT_COMPOUND_MODE_CDF: [[u16; COMPOUND_MODES + 1]; COMPOUND_MODE_CONTEXTS] = [
+    [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768, 0],
+    [10730, 19452, 21145, 22749, 24039, 25131, 28724, 32768, 0],
+    [10664, 20221, 21588, 22906, 24295, 25387, 28436, 32768, 0],
+    [13298, 16984, 20471, 24182, 25067, 25736, 26422, 32768, 0],
+    [18904, 23325, 25242, 27432, 27898, 28258, 30758, 32768, 0],
+    [10725, 17454, 20124, 22820, 24195, 25168, 26046, 32768, 0],
+    [17125, 24273, 25814, 27492, 28214, 28704, 30592, 32768, 0],
+    [13046, 23214, 24505, 25942, 27435, 28442, 29330, 32768, 0],
+];
+
+/// `Default_Comp_Ref_Type_Cdf[ COMP_REF_TYPE_CONTEXTS ][ 3 ]` (§9.4).
+/// Binary; codes `comp_ref_type` per §8.3.2 `TileCompRefTypeCdf[ ctx ]`.
+pub const DEFAULT_COMP_REF_TYPE_CDF: [[u16; 3]; COMP_REF_TYPE_CONTEXTS] = [
+    [1198, 32768, 0],
+    [2070, 32768, 0],
+    [9166, 32768, 0],
+    [7499, 32768, 0],
+    [22475, 32768, 0],
+];
+
+/// `Default_Uni_Comp_Ref_Cdf[ REF_CONTEXTS ][ UNIDIR_COMP_REFS - 1 ][ 3 ]`
+/// (§9.4). Binary; codes `uni_comp_ref` / `uni_comp_ref_p1` /
+/// `uni_comp_ref_p2` per §8.3.2 `TileUniCompRefCdf[ ctx ][ 0..2 ]`.
+pub const DEFAULT_UNI_COMP_REF_CDF: [[[u16; 3]; UNIDIR_COMP_REFS - 1]; REF_CONTEXTS] = [
+    [[5284, 32768, 0], [3865, 32768, 0], [3128, 32768, 0]],
+    [[23152, 32768, 0], [14173, 32768, 0], [15270, 32768, 0]],
+    [[31774, 32768, 0], [25120, 32768, 0], [26710, 32768, 0]],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -473,6 +693,38 @@ pub struct TileCdfContext {
     pub mv_fr: [[[u16; MV_JOINTS + 1]; MV_COMPS]; MV_CONTEXTS],
     /// `TileMvHpCdf[ MV_CONTEXTS ][ 2 ]` (§8.3.1).
     pub mv_hp: [[[u16; 3]; MV_COMPS]; MV_CONTEXTS],
+
+    // -----------------------------------------------------------------
+    // Round 18 — inter-mode / reference-frame working CDFs. §8.3.1
+    // enumerates each as "`*Cdf` is set to a copy of `Default_*_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileNewMvCdf[ NEW_MV_CONTEXTS ]` (§8.3.1).
+    pub new_mv: [[u16; 3]; NEW_MV_CONTEXTS],
+    /// `TileZeroMvCdf[ ZERO_MV_CONTEXTS ]` (§8.3.1).
+    pub zero_mv: [[u16; 3]; ZERO_MV_CONTEXTS],
+    /// `TileRefMvCdf[ REF_MV_CONTEXTS ]` (§8.3.1).
+    pub ref_mv: [[u16; 3]; REF_MV_CONTEXTS],
+    /// `TileDrlModeCdf[ DRL_MODE_CONTEXTS ]` (§8.3.1).
+    pub drl_mode: [[u16; 3]; DRL_MODE_CONTEXTS],
+    /// `TileIsInterCdf[ IS_INTER_CONTEXTS ]` (§8.3.1).
+    pub is_inter: [[u16; 3]; IS_INTER_CONTEXTS],
+    /// `TileCompModeCdf[ COMP_INTER_CONTEXTS ]` (§8.3.1).
+    pub comp_mode: [[u16; 3]; COMP_INTER_CONTEXTS],
+    /// `TileSkipModeCdf[ SKIP_MODE_CONTEXTS ]` (§8.3.1).
+    pub skip_mode: [[u16; 3]; SKIP_MODE_CONTEXTS],
+    /// `TileCompRefCdf[ REF_CONTEXTS ][ FWD_REFS - 1 ]` (§8.3.1).
+    pub comp_ref: [[[u16; 3]; FWD_REFS - 1]; REF_CONTEXTS],
+    /// `TileCompBwdRefCdf[ REF_CONTEXTS ][ BWD_REFS - 1 ]` (§8.3.1).
+    pub comp_bwd_ref: [[[u16; 3]; BWD_REFS - 1]; REF_CONTEXTS],
+    /// `TileSingleRefCdf[ REF_CONTEXTS ][ SINGLE_REFS - 1 ]` (§8.3.1).
+    pub single_ref: [[[u16; 3]; SINGLE_REFS - 1]; REF_CONTEXTS],
+    /// `TileCompoundModeCdf[ COMPOUND_MODE_CONTEXTS ]` (§8.3.1).
+    pub compound_mode: [[u16; COMPOUND_MODES + 1]; COMPOUND_MODE_CONTEXTS],
+    /// `TileCompRefTypeCdf[ COMP_REF_TYPE_CONTEXTS ]` (§8.3.1).
+    pub comp_ref_type: [[u16; 3]; COMP_REF_TYPE_CONTEXTS],
+    /// `TileUniCompRefCdf[ REF_CONTEXTS ][ UNIDIR_COMP_REFS - 1 ]`
+    /// (§8.3.1).
+    pub uni_comp_ref: [[[u16; 3]; UNIDIR_COMP_REFS - 1]; REF_CONTEXTS],
 }
 
 impl TileCdfContext {
@@ -515,6 +767,21 @@ impl TileCdfContext {
             mv_bit: [mv_bit_row; MV_CONTEXTS],
             mv_fr: [DEFAULT_MV_FR_CDF; MV_CONTEXTS],
             mv_hp: [mv_hp_row; MV_CONTEXTS],
+
+            // Round 18 — inter-mode / reference-frame group.
+            new_mv: DEFAULT_NEW_MV_CDF,
+            zero_mv: DEFAULT_ZERO_MV_CDF,
+            ref_mv: DEFAULT_REF_MV_CDF,
+            drl_mode: DEFAULT_DRL_MODE_CDF,
+            is_inter: DEFAULT_IS_INTER_CDF,
+            comp_mode: DEFAULT_COMP_MODE_CDF,
+            skip_mode: DEFAULT_SKIP_MODE_CDF,
+            comp_ref: DEFAULT_COMP_REF_CDF,
+            comp_bwd_ref: DEFAULT_COMP_BWD_REF_CDF,
+            single_ref: DEFAULT_SINGLE_REF_CDF,
+            compound_mode: DEFAULT_COMPOUND_MODE_CDF,
+            comp_ref_type: DEFAULT_COMP_REF_TYPE_CDF,
+            uni_comp_ref: DEFAULT_UNI_COMP_REF_CDF,
         }
     }
 
@@ -640,6 +907,110 @@ impl TileCdfContext {
     pub fn mv_hp_cdf(&mut self, mv_ctx: usize, comp: usize) -> &mut [u16] {
         &mut self.mv_hp[mv_ctx][comp]
     }
+
+    // -----------------------------------------------------------------
+    // Round 18 — inter-mode / reference-frame §8.3.2 selectors. The
+    // caller pre-computes the §8.3.2 `ctx` (the spec has explicit
+    // formulas for each — see [`is_inter_ctx`], [`skip_mode_ctx`],
+    // [`ref_count_ctx`], [`compound_mode_ctx`]; the `comp_mode` and
+    // `comp_ref_type` formulas need full tile-walk neighbour state and
+    // are deferred) and passes the index straight to the array lookup.
+    // -----------------------------------------------------------------
+
+    /// §8.3.2 `new_mv`: the cdf is `TileNewMvCdf[ NewMvContext ]`. The
+    /// `NewMvContext` is supplied by `find_mv_stack()` (in `0..NEW_MV_CONTEXTS`).
+    pub fn new_mv_cdf(&mut self, new_mv_context: usize) -> &mut [u16] {
+        &mut self.new_mv[new_mv_context]
+    }
+
+    /// §8.3.2 `zero_mv`: the cdf is `TileZeroMvCdf[ ZeroMvContext ]`.
+    /// `ZeroMvContext` in `0..ZERO_MV_CONTEXTS`.
+    pub fn zero_mv_cdf(&mut self, zero_mv_context: usize) -> &mut [u16] {
+        &mut self.zero_mv[zero_mv_context]
+    }
+
+    /// §8.3.2 `ref_mv`: the cdf is `TileRefMvCdf[ RefMvContext ]`.
+    /// `RefMvContext` in `0..REF_MV_CONTEXTS`.
+    pub fn ref_mv_cdf(&mut self, ref_mv_context: usize) -> &mut [u16] {
+        &mut self.ref_mv[ref_mv_context]
+    }
+
+    /// §8.3.2 `drl_mode`: the cdf is `TileDrlModeCdf[ DrlCtxStack[ idx ] ]`.
+    /// The caller supplies the `DrlCtxStack[ idx ]` value in
+    /// `0..DRL_MODE_CONTEXTS`.
+    pub fn drl_mode_cdf(&mut self, drl_ctx: usize) -> &mut [u16] {
+        &mut self.drl_mode[drl_ctx]
+    }
+
+    /// §8.3.2 `is_inter`: the cdf is `TileIsInterCdf[ ctx ]`, with `ctx`
+    /// computed by [`is_inter_ctx`] (in `0..IS_INTER_CONTEXTS`).
+    pub fn is_inter_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.is_inter[ctx]
+    }
+
+    /// §8.3.2 `comp_mode`: the cdf is `TileCompModeCdf[ ctx ]`. `ctx` is
+    /// supplied in `0..COMP_INTER_CONTEXTS`; its §8.3.2 derivation needs
+    /// `AvailU` / `AvailL` / `AboveSingle` / `LeftSingle` /
+    /// `AboveRefFrame[0]` / `LeftRefFrame[0]` / `AboveIntra` /
+    /// `LeftIntra` from the tile walk plus the spec's `check_backward(ref)`
+    /// `(ref >= BWDREF_FRAME) && (ref <= ALTREF_FRAME)` predicate, so the
+    /// branch ladder lives in the (future) tile-walk crate rather than as
+    /// a standalone helper here.
+    pub fn comp_mode_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.comp_mode[ctx]
+    }
+
+    /// §8.3.2 `skip_mode`: the cdf is `TileSkipModeCdf[ ctx ]`, with
+    /// `ctx` computed by [`skip_mode_ctx`] (in `0..SKIP_MODE_CONTEXTS`).
+    pub fn skip_mode_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.skip_mode[ctx]
+    }
+
+    /// §8.3.2 `comp_ref`: the cdf is `TileCompRefCdf[ ctx ][ p ]`, with
+    /// `p ∈ {0, 1, 2}` selecting `comp_ref` / `comp_ref_p1` /
+    /// `comp_ref_p2` (§8.3.2). `ctx` is `ref_count_ctx(..)` per the
+    /// matching §8.3.2 paragraph.
+    pub fn comp_ref_cdf(&mut self, ctx: usize, p: usize) -> &mut [u16] {
+        &mut self.comp_ref[ctx][p]
+    }
+
+    /// §8.3.2 `comp_bwdref`: the cdf is `TileCompBwdRefCdf[ ctx ][ p ]`,
+    /// with `p ∈ {0, 1}` selecting `comp_bwdref` / `comp_bwdref_p1`.
+    pub fn comp_bwd_ref_cdf(&mut self, ctx: usize, p: usize) -> &mut [u16] {
+        &mut self.comp_bwd_ref[ctx][p]
+    }
+
+    /// §8.3.2 `single_ref_p{1..6}`: the cdf is
+    /// `TileSingleRefCdf[ ctx ][ p ]`, with `p ∈ {0..5}` selecting
+    /// `single_ref_p1` .. `single_ref_p6` (the §8.3.2 list maps each
+    /// to the `comp_*` paragraph that defines its `ctx`).
+    pub fn single_ref_cdf(&mut self, ctx: usize, p: usize) -> &mut [u16] {
+        &mut self.single_ref[ctx][p]
+    }
+
+    /// §8.3.2 `compound_mode`: the cdf is `TileCompoundModeCdf[ ctx ]`,
+    /// with `ctx = Compound_Mode_Ctx_Map[ RefMvContext >> 1 ]
+    /// [ Min(NewMvContext, COMP_NEWMV_CTXS - 1) ]`. See
+    /// [`compound_mode_ctx`].
+    pub fn compound_mode_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.compound_mode[ctx]
+    }
+
+    /// §8.3.2 `comp_ref_type`: the cdf is `TileCompRefTypeCdf[ ctx ]`,
+    /// with `ctx` computed by the multi-branch paragraph in §8.3.2 (in
+    /// `0..COMP_REF_TYPE_CONTEXTS`). The branch evaluator belongs in
+    /// the (future) tile walk; this selector takes the already-computed
+    /// index.
+    pub fn comp_ref_type_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.comp_ref_type[ctx]
+    }
+
+    /// §8.3.2 `uni_comp_ref{,_p1,_p2}`: the cdf is
+    /// `TileUniCompRefCdf[ ctx ][ p ]`, with `p ∈ {0, 1, 2}` selecting
+    /// `uni_comp_ref` / `uni_comp_ref_p1` / `uni_comp_ref_p2`.
+    pub fn uni_comp_ref_cdf(&mut self, ctx: usize, p: usize) -> &mut [u16] {
+        &mut self.uni_comp_ref[ctx][p]
+    }
 }
 
 impl Default for TileCdfContext {
@@ -735,6 +1106,94 @@ pub fn mv_ctx(use_intrabc: bool) -> usize {
     } else {
         0
     }
+}
+
+// ---------------------------------------------------------------------
+// Round 18 — inter-mode / reference-frame §8.3.2 context helpers. Each
+// directly transcribes one §8.3.2 paragraph (the scalar fragment that
+// needs only neighbour-summary inputs; the AvailU/AvailL gating and the
+// neighbour ref-frame lookups belong to the tile walk).
+// ---------------------------------------------------------------------
+
+/// §8.3.2 `is_inter` context:
+///
+/// ```text
+///   if ( AvailU && AvailL )
+///        ctx = (LeftIntra && AboveIntra) ? 3 : LeftIntra || AboveIntra
+///   else if ( AvailU || AvailL )
+///        ctx = 2 * (AvailU ? AboveIntra : LeftIntra)
+///   else
+///        ctx = 0
+/// ```
+///
+/// Each input is `Some(true)` (neighbour is intra) / `Some(false)`
+/// (neighbour is inter), or `None` if the neighbour is unavailable.
+pub fn is_inter_ctx(above_intra: Option<bool>, left_intra: Option<bool>) -> usize {
+    match (above_intra, left_intra) {
+        (Some(a), Some(l)) => {
+            if a && l {
+                3
+            } else {
+                (a || l) as usize
+            }
+        }
+        (Some(a), None) => 2 * (a as usize),
+        (None, Some(l)) => 2 * (l as usize),
+        (None, None) => 0,
+    }
+}
+
+/// §8.3.2 `skip_mode` context: sum of the neighbour `SkipModes[]` flags
+/// (0 if the neighbour is unavailable).
+///
+/// ```text
+///   ctx = 0
+///   if ( AvailU ) ctx += SkipModes[ MiRow - 1 ][ MiCol ]
+///   if ( AvailL ) ctx += SkipModes[ MiRow ][ MiCol - 1 ]
+/// ```
+///
+/// Result in `0..SKIP_MODE_CONTEXTS`.
+pub fn skip_mode_ctx(above_skip_mode: u8, left_skip_mode: u8) -> usize {
+    (above_skip_mode + left_skip_mode) as usize
+}
+
+/// §8.3.2 `ref_count_ctx` (the inner helper used by every
+/// `single_ref_p*` / `comp_ref` / `comp_bwdref` / `uni_comp_ref_p*`
+/// selection):
+///
+/// ```text
+///   if ( counts0 < counts1 )       return 0
+///   else if ( counts0 == counts1 ) return 1
+///   else                           return 2
+/// ```
+///
+/// Result in `0..REF_CONTEXTS`.
+pub fn ref_count_ctx(counts0: u32, counts1: u32) -> usize {
+    use core::cmp::Ordering;
+    match counts0.cmp(&counts1) {
+        Ordering::Less => 0,
+        Ordering::Equal => 1,
+        Ordering::Greater => 2,
+    }
+}
+
+/// §8.3.2 `compound_mode` context:
+///
+/// ```text
+///   ctx = Compound_Mode_Ctx_Map[ RefMvContext >> 1 ]
+///                              [ Min(NewMvContext, COMP_NEWMV_CTXS - 1) ]
+/// ```
+///
+/// `ref_mv_context` is the §8.3.2 `RefMvContext`; `new_mv_context` is the
+/// §8.3.2 `NewMvContext`. Returns a value in `0..COMPOUND_MODE_CONTEXTS`.
+///
+/// The `RefMvContext >> 1` selects one of the three [`COMPOUND_MODE_CTX_MAP`]
+/// rows; the `Min(.., COMP_NEWMV_CTXS - 1)` clamps the `NewMvContext`
+/// to the map's 5-wide second axis.
+pub fn compound_mode_ctx(ref_mv_context: usize, new_mv_context: usize) -> usize {
+    let row = (ref_mv_context >> 1).min(COMPOUND_MODE_CTX_MAP.len() - 1);
+    let col = new_mv_context.min(COMP_NEWMV_CTXS - 1);
+    COMPOUND_MODE_CTX_MAP[row][col]
 }
 
 #[cfg(test)]
@@ -1129,5 +1588,354 @@ mod tests {
 
         // disable_cdf_update was true ⇒ the row is untouched.
         assert_eq!(ctx.mv_bit[mctx][1][3], DEFAULT_MV_BIT_CDF[3]);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 18 — inter-mode / reference-frame default CDF tests.
+    // -----------------------------------------------------------------
+
+    /// (a) Table dimensions match §9.4 verbatim for every new
+    /// inter-mode / ref-frame array.
+    #[test]
+    fn inter_default_cdf_dimensions_match_spec() {
+        assert_eq!(DEFAULT_NEW_MV_CDF.len(), NEW_MV_CONTEXTS);
+        assert_eq!(DEFAULT_ZERO_MV_CDF.len(), ZERO_MV_CONTEXTS);
+        assert_eq!(DEFAULT_REF_MV_CDF.len(), REF_MV_CONTEXTS);
+        assert_eq!(DEFAULT_DRL_MODE_CDF.len(), DRL_MODE_CONTEXTS);
+        assert_eq!(DEFAULT_IS_INTER_CDF.len(), IS_INTER_CONTEXTS);
+        assert_eq!(DEFAULT_COMP_MODE_CDF.len(), COMP_INTER_CONTEXTS);
+        assert_eq!(DEFAULT_SKIP_MODE_CDF.len(), SKIP_MODE_CONTEXTS);
+        assert_eq!(DEFAULT_COMP_REF_TYPE_CDF.len(), COMP_REF_TYPE_CONTEXTS);
+
+        // Binary CDFs all have 3 slots = N + 1 with N = 2.
+        for row in &DEFAULT_NEW_MV_CDF {
+            assert_eq!(row.len(), 3);
+        }
+        for row in &DEFAULT_IS_INTER_CDF {
+            assert_eq!(row.len(), 3);
+        }
+
+        // Three-axis ref CDFs.
+        assert_eq!(DEFAULT_COMP_REF_CDF.len(), REF_CONTEXTS);
+        for row in &DEFAULT_COMP_REF_CDF {
+            assert_eq!(row.len(), FWD_REFS - 1);
+        }
+        assert_eq!(DEFAULT_COMP_BWD_REF_CDF.len(), REF_CONTEXTS);
+        for row in &DEFAULT_COMP_BWD_REF_CDF {
+            assert_eq!(row.len(), BWD_REFS - 1);
+        }
+        assert_eq!(DEFAULT_SINGLE_REF_CDF.len(), REF_CONTEXTS);
+        for row in &DEFAULT_SINGLE_REF_CDF {
+            assert_eq!(row.len(), SINGLE_REFS - 1);
+        }
+        assert_eq!(DEFAULT_UNI_COMP_REF_CDF.len(), REF_CONTEXTS);
+        for row in &DEFAULT_UNI_COMP_REF_CDF {
+            assert_eq!(row.len(), UNIDIR_COMP_REFS - 1);
+        }
+
+        // Compound-mode CDF: 8 ctxs × (8 + 1) cumulatives.
+        assert_eq!(DEFAULT_COMPOUND_MODE_CDF.len(), COMPOUND_MODE_CONTEXTS);
+        for row in &DEFAULT_COMPOUND_MODE_CDF {
+            assert_eq!(row.len(), COMPOUND_MODES + 1);
+        }
+
+        // §8.2.6 invariants on every transcribed row.
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+        for r in &DEFAULT_NEW_MV_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_ZERO_MV_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_REF_MV_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_DRL_MODE_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_IS_INTER_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_COMP_MODE_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_SKIP_MODE_CDF {
+            check(r);
+        }
+        for a in &DEFAULT_COMP_REF_CDF {
+            for r in a {
+                check(r);
+            }
+        }
+        for a in &DEFAULT_COMP_BWD_REF_CDF {
+            for r in a {
+                check(r);
+            }
+        }
+        for a in &DEFAULT_SINGLE_REF_CDF {
+            for r in a {
+                check(r);
+            }
+        }
+        for r in &DEFAULT_COMPOUND_MODE_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_COMP_REF_TYPE_CDF {
+            check(r);
+        }
+        for a in &DEFAULT_UNI_COMP_REF_CDF {
+            for r in a {
+                check(r);
+            }
+        }
+    }
+
+    /// (a) Byte-exact §9.4 verbatim values for hand-picked rows of every
+    /// new inter-mode / ref-frame default array — every literal that
+    /// appears in the spec table is read back unchanged.
+    #[test]
+    fn inter_default_cdf_byte_exact_values() {
+        assert_eq!(DEFAULT_NEW_MV_CDF[0], [24035, 32768, 0]);
+        assert_eq!(DEFAULT_NEW_MV_CDF[5], [4676, 32768, 0]);
+        assert_eq!(DEFAULT_ZERO_MV_CDF[0], [2175, 32768, 0]);
+        assert_eq!(DEFAULT_ZERO_MV_CDF[1], [1054, 32768, 0]);
+        assert_eq!(DEFAULT_REF_MV_CDF[3], [28622, 32768, 0]);
+        assert_eq!(DEFAULT_DRL_MODE_CDF[1], [24560, 32768, 0]);
+        assert_eq!(DEFAULT_IS_INTER_CDF[0], [806, 32768, 0]);
+        assert_eq!(DEFAULT_IS_INTER_CDF[3], [26538, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_MODE_CDF[2], [12031, 32768, 0]);
+        assert_eq!(DEFAULT_SKIP_MODE_CDF[0], [32621, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_REF_CDF[0][0], [4946, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_REF_CDF[2][2], [27544, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_BWD_REF_CDF[0][0], [2235, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_BWD_REF_CDF[2][1], [30489, 32768, 0]);
+        assert_eq!(DEFAULT_SINGLE_REF_CDF[0][0], [4897, 32768, 0]);
+        assert_eq!(DEFAULT_SINGLE_REF_CDF[1][3], [24773, 32768, 0]);
+        assert_eq!(DEFAULT_SINGLE_REF_CDF[2][5], [30304, 32768, 0]);
+        assert_eq!(
+            DEFAULT_COMPOUND_MODE_CDF[0],
+            [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_COMPOUND_MODE_CDF[7],
+            [13046, 23214, 24505, 25942, 27435, 28442, 29330, 32768, 0]
+        );
+        assert_eq!(DEFAULT_COMP_REF_TYPE_CDF[0], [1198, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_REF_TYPE_CDF[4], [22475, 32768, 0]);
+        assert_eq!(DEFAULT_UNI_COMP_REF_CDF[1][2], [15270, 32768, 0]);
+    }
+
+    /// (b) §8.3.1 init places every §9.4 row into the corresponding
+    /// `Tile*Cdf` working slot of the freshly-constructed
+    /// `TileCdfContext`.
+    #[test]
+    fn init_from_defaults_copies_inter_tables() {
+        let ctx = TileCdfContext::new_from_defaults();
+
+        assert_eq!(ctx.new_mv, DEFAULT_NEW_MV_CDF);
+        assert_eq!(ctx.zero_mv, DEFAULT_ZERO_MV_CDF);
+        assert_eq!(ctx.ref_mv, DEFAULT_REF_MV_CDF);
+        assert_eq!(ctx.drl_mode, DEFAULT_DRL_MODE_CDF);
+        assert_eq!(ctx.is_inter, DEFAULT_IS_INTER_CDF);
+        assert_eq!(ctx.comp_mode, DEFAULT_COMP_MODE_CDF);
+        assert_eq!(ctx.skip_mode, DEFAULT_SKIP_MODE_CDF);
+        assert_eq!(ctx.comp_ref, DEFAULT_COMP_REF_CDF);
+        assert_eq!(ctx.comp_bwd_ref, DEFAULT_COMP_BWD_REF_CDF);
+        assert_eq!(ctx.single_ref, DEFAULT_SINGLE_REF_CDF);
+        assert_eq!(ctx.compound_mode, DEFAULT_COMPOUND_MODE_CDF);
+        assert_eq!(ctx.comp_ref_type, DEFAULT_COMP_REF_TYPE_CDF);
+        assert_eq!(ctx.uni_comp_ref, DEFAULT_UNI_COMP_REF_CDF);
+    }
+
+    /// (b) §8.3.1 init + §8.3.2 selection: at a hand-picked
+    /// `(frame_type, ctx)` tuple — here the intra-only "tile init" path
+    /// for the `comp_ref` syntax — the selected row is exactly the
+    /// `Default_Comp_Ref_Cdf[ ctx ][ p ]` value from §9.4.
+    ///
+    /// AV1 §8.3.1 always seeds `Tile*Cdf` from the same `Default_*_Cdf`
+    /// regardless of `frame_type` (the only `frame_type`-keyed variant
+    /// is `intra_frame_y_mode`, which uses a separate `Y_Mode_Cdf` table
+    /// for non-intra frames — out of this round's scope). So we exercise
+    /// every § member here with both extremes of its `ctx` index.
+    #[test]
+    fn inter_selectors_return_default_rows_at_hand_picked_ctx() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        // (frame_type=key-or-intra-only, new_mv, ctx=0).
+        assert_eq!(ctx.new_mv_cdf(0), &DEFAULT_NEW_MV_CDF[0]);
+        assert_eq!(
+            ctx.new_mv_cdf(NEW_MV_CONTEXTS - 1),
+            &DEFAULT_NEW_MV_CDF[NEW_MV_CONTEXTS - 1]
+        );
+        assert_eq!(ctx.zero_mv_cdf(0), &DEFAULT_ZERO_MV_CDF[0]);
+        assert_eq!(ctx.zero_mv_cdf(1), &DEFAULT_ZERO_MV_CDF[1]);
+        assert_eq!(ctx.ref_mv_cdf(0), &DEFAULT_REF_MV_CDF[0]);
+        assert_eq!(ctx.ref_mv_cdf(5), &DEFAULT_REF_MV_CDF[5]);
+        assert_eq!(ctx.drl_mode_cdf(0), &DEFAULT_DRL_MODE_CDF[0]);
+        assert_eq!(ctx.drl_mode_cdf(2), &DEFAULT_DRL_MODE_CDF[2]);
+        assert_eq!(ctx.is_inter_cdf(0), &DEFAULT_IS_INTER_CDF[0]);
+        assert_eq!(ctx.is_inter_cdf(3), &DEFAULT_IS_INTER_CDF[3]);
+        assert_eq!(ctx.comp_mode_cdf(0), &DEFAULT_COMP_MODE_CDF[0]);
+        assert_eq!(ctx.comp_mode_cdf(4), &DEFAULT_COMP_MODE_CDF[4]);
+        assert_eq!(ctx.skip_mode_cdf(0), &DEFAULT_SKIP_MODE_CDF[0]);
+        assert_eq!(ctx.skip_mode_cdf(2), &DEFAULT_SKIP_MODE_CDF[2]);
+        assert_eq!(ctx.comp_ref_cdf(0, 0), &DEFAULT_COMP_REF_CDF[0][0]);
+        assert_eq!(ctx.comp_ref_cdf(2, 2), &DEFAULT_COMP_REF_CDF[2][2]);
+        assert_eq!(ctx.comp_bwd_ref_cdf(0, 0), &DEFAULT_COMP_BWD_REF_CDF[0][0]);
+        assert_eq!(ctx.comp_bwd_ref_cdf(2, 1), &DEFAULT_COMP_BWD_REF_CDF[2][1]);
+        assert_eq!(ctx.single_ref_cdf(0, 0), &DEFAULT_SINGLE_REF_CDF[0][0]);
+        assert_eq!(ctx.single_ref_cdf(2, 5), &DEFAULT_SINGLE_REF_CDF[2][5]);
+        assert_eq!(ctx.compound_mode_cdf(0), &DEFAULT_COMPOUND_MODE_CDF[0]);
+        assert_eq!(ctx.compound_mode_cdf(7), &DEFAULT_COMPOUND_MODE_CDF[7]);
+        assert_eq!(ctx.comp_ref_type_cdf(0), &DEFAULT_COMP_REF_TYPE_CDF[0]);
+        assert_eq!(ctx.comp_ref_type_cdf(4), &DEFAULT_COMP_REF_TYPE_CDF[4]);
+        assert_eq!(ctx.uni_comp_ref_cdf(0, 0), &DEFAULT_UNI_COMP_REF_CDF[0][0]);
+        assert_eq!(ctx.uni_comp_ref_cdf(2, 2), &DEFAULT_UNI_COMP_REF_CDF[2][2]);
+    }
+
+    /// §8.3.1 independence for the inter group: adapting the working
+    /// copy must not mutate the §9.4 source (the next tile re-inits
+    /// from it).
+    #[test]
+    fn inter_working_copy_is_independent_of_defaults() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        ctx.new_mv_cdf(0)[0] = 7;
+        ctx.comp_ref_cdf(1, 2)[0] = 13;
+        ctx.compound_mode_cdf(3)[5] = 999;
+
+        assert_ne!(ctx.new_mv[0][0], DEFAULT_NEW_MV_CDF[0][0]);
+        assert_ne!(ctx.comp_ref[1][2][0], DEFAULT_COMP_REF_CDF[1][2][0]);
+        assert_ne!(ctx.compound_mode[3][5], DEFAULT_COMPOUND_MODE_CDF[3][5]);
+
+        // §9.4 sources untouched.
+        assert_eq!(DEFAULT_NEW_MV_CDF[0], [24035, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_REF_CDF[1][2], [15160, 32768, 0]);
+        assert_eq!(DEFAULT_COMPOUND_MODE_CDF[3][5], 25736);
+    }
+
+    /// §8.3.2 `is_inter` context branches — every neighbour-availability
+    /// + intra-flag combination per the §8.3.2 paragraph.
+    #[test]
+    fn is_inter_context_branches() {
+        // AvailU && AvailL.
+        assert_eq!(is_inter_ctx(Some(false), Some(false)), 0); // both inter
+        assert_eq!(is_inter_ctx(Some(true), Some(false)), 1); // exactly one intra
+        assert_eq!(is_inter_ctx(Some(false), Some(true)), 1);
+        assert_eq!(is_inter_ctx(Some(true), Some(true)), 3); // both intra
+
+        // AvailU XOR AvailL.
+        assert_eq!(is_inter_ctx(Some(true), None), 2);
+        assert_eq!(is_inter_ctx(Some(false), None), 0);
+        assert_eq!(is_inter_ctx(None, Some(true)), 2);
+        assert_eq!(is_inter_ctx(None, Some(false)), 0);
+
+        // Neither available.
+        assert_eq!(is_inter_ctx(None, None), 0);
+
+        // Every result is a valid IS_INTER context index.
+        for above in [None, Some(false), Some(true)] {
+            for left in [None, Some(false), Some(true)] {
+                assert!(is_inter_ctx(above, left) < IS_INTER_CONTEXTS);
+            }
+        }
+    }
+
+    /// §8.3.2 `skip_mode` context: sum of neighbour `SkipModes[]`.
+    #[test]
+    fn skip_mode_context_sum() {
+        assert_eq!(skip_mode_ctx(0, 0), 0);
+        assert_eq!(skip_mode_ctx(1, 0), 1);
+        assert_eq!(skip_mode_ctx(0, 1), 1);
+        assert_eq!(skip_mode_ctx(1, 1), 2);
+        for a in 0..=1 {
+            for l in 0..=1 {
+                assert!(skip_mode_ctx(a, l) < SKIP_MODE_CONTEXTS);
+            }
+        }
+    }
+
+    /// §8.3.2 `ref_count_ctx` three-branch ladder.
+    #[test]
+    fn ref_count_context_branches() {
+        assert_eq!(ref_count_ctx(0, 1), 0);
+        assert_eq!(ref_count_ctx(3, 4), 0);
+        assert_eq!(ref_count_ctx(0, 0), 1);
+        assert_eq!(ref_count_ctx(7, 7), 1);
+        assert_eq!(ref_count_ctx(2, 1), 2);
+        assert_eq!(ref_count_ctx(99, 0), 2);
+        // Every result is a valid REF_CONTEXTS index.
+        for c0 in 0..3 {
+            for c1 in 0..3 {
+                assert!(ref_count_ctx(c0, c1) < REF_CONTEXTS);
+            }
+        }
+    }
+
+    /// §8.3.2 `compound_mode` context: the `Compound_Mode_Ctx_Map`
+    /// lookup with the `RefMvContext >> 1` / `Min(NewMvContext,
+    /// COMP_NEWMV_CTXS - 1)` indexing — three hand-picked entries from
+    /// each of the three map rows.
+    #[test]
+    fn compound_mode_context_map_lookup() {
+        // Row 0 (RefMvContext >> 1 == 0): map = { 0, 1, 1, 1, 1 }.
+        assert_eq!(compound_mode_ctx(0, 0), 0);
+        assert_eq!(compound_mode_ctx(1, 1), 1); // 1 >> 1 == 0
+        assert_eq!(compound_mode_ctx(0, 4), 1);
+
+        // Row 1 (RefMvContext >> 1 == 1): map = { 1, 2, 3, 4, 4 }.
+        assert_eq!(compound_mode_ctx(2, 0), 1);
+        assert_eq!(compound_mode_ctx(2, 2), 3);
+        assert_eq!(compound_mode_ctx(3, 3), 4); // 3 >> 1 == 1
+
+        // Row 2 (RefMvContext >> 1 == 2): map = { 4, 4, 5, 6, 7 }.
+        assert_eq!(compound_mode_ctx(4, 0), 4);
+        assert_eq!(compound_mode_ctx(4, 4), 7);
+        assert_eq!(compound_mode_ctx(5, 2), 5); // 5 >> 1 == 2
+
+        // The `Min(.., COMP_NEWMV_CTXS - 1)` clamp: anything ≥ 4 is
+        // treated as 4.
+        assert_eq!(compound_mode_ctx(4, 99), 7);
+        // The map has only 3 rows; anything beyond row 2 saturates at
+        // row 2 (the §8.3.2 spec doesn't define a fourth row — every
+        // valid `RefMvContext` value yields `RefMvContext >> 1 < 3`,
+        // since `RefMvContext < REF_MV_CONTEXTS == 6`).
+        assert_eq!(compound_mode_ctx(REF_MV_CONTEXTS - 1, 0), 4);
+
+        // Every result is a valid COMPOUND_MODE_CONTEXTS index.
+        for r in 0..REF_MV_CONTEXTS {
+            for n in 0..NEW_MV_CONTEXTS {
+                assert!(compound_mode_ctx(r, n) < COMPOUND_MODE_CONTEXTS);
+            }
+        }
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a
+    /// `compound_mode` (8-value) default CDF selected by §8.3.2
+    /// `compound_mode_ctx`, confirming the §8.3.2-selected row matches
+    /// the §9.4 default and a valid §8.2.6 decode lands in range.
+    #[test]
+    fn decode_compound_mode_through_default_cdf() {
+        // Pick a hand-picked (RefMvContext, NewMvContext) pair so that
+        // `compound_mode_ctx` lands on row 7 (= map[2][4]).
+        let cm_ctx = compound_mode_ctx(4, 4);
+        assert_eq!(cm_ctx, 7);
+
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        // §8.3.2 selection: `TileCompoundModeCdf[ cm_ctx ]` equals
+        // `Default_Compound_Mode_Cdf[ 7 ]` since we just init'd.
+        let row = ctx.compound_mode_cdf(cm_ctx);
+        assert_eq!(row, &DEFAULT_COMPOUND_MODE_CDF[7]);
+
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(sym < COMPOUND_MODES as u32, "compound_mode is in 0..8");
+        // disable_cdf_update was true ⇒ row untouched.
+        assert_eq!(ctx.compound_mode[7], DEFAULT_COMPOUND_MODE_CDF[7]);
     }
 }

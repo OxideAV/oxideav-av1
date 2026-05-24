@@ -288,6 +288,36 @@
 //!     other §8.3.2 selections are a mechanical followup against the
 //!     same [`TileCdfContext`] shape.
 //!
+//!   * **Round 18.** The §9.4 default CDF tables and the §8.3.1 /
+//!     §8.3.2 selection for the **inter-mode / reference-frame**
+//!     syntax group, extending [`cdf`]. Transcribes the 13 remaining
+//!     `Default_*_Cdf` tables driving every inter-block mode and
+//!     reference syntax: [`DEFAULT_NEW_MV_CDF`], [`DEFAULT_ZERO_MV_CDF`],
+//!     [`DEFAULT_REF_MV_CDF`], [`DEFAULT_DRL_MODE_CDF`],
+//!     [`DEFAULT_IS_INTER_CDF`], [`DEFAULT_COMP_MODE_CDF`],
+//!     [`DEFAULT_SKIP_MODE_CDF`], [`DEFAULT_COMP_REF_CDF`],
+//!     [`DEFAULT_COMP_BWD_REF_CDF`], [`DEFAULT_SINGLE_REF_CDF`],
+//!     [`DEFAULT_COMPOUND_MODE_CDF`], [`DEFAULT_COMP_REF_TYPE_CDF`],
+//!     [`DEFAULT_UNI_COMP_REF_CDF`] verbatim from §9.4, plus the §8.3.2
+//!     [`COMPOUND_MODE_CTX_MAP`] lookup table. [`TileCdfContext`] grows
+//!     the corresponding `Tile*Cdf` fields, [`TileCdfContext::new_from_defaults`]
+//!     seeds them per §8.3.1, and the §8.3.2 selection surfaces
+//!     `&mut [u16]` rows for every element: `new_mv_cdf` / `zero_mv_cdf` /
+//!     `ref_mv_cdf` / `drl_mode_cdf` / `is_inter_cdf` / `comp_mode_cdf` /
+//!     `skip_mode_cdf` / `comp_ref_cdf` / `comp_bwd_ref_cdf` /
+//!     `single_ref_cdf` / `compound_mode_cdf` / `comp_ref_type_cdf` /
+//!     `uni_comp_ref_cdf`. Scalar §8.3.2 context helpers
+//!     [`is_inter_ctx`] (the `(AvailU, AvailL) × (AboveIntra, LeftIntra)`
+//!     branch ladder), [`skip_mode_ctx`] (neighbour `SkipModes[]` sum),
+//!     [`ref_count_ctx`] (`<` / `==` / `>` three-branch shared by every
+//!     `single_ref_p*` / `comp_ref` / `comp_bwdref` / `uni_comp_ref_p*`
+//!     paragraph), and [`compound_mode_ctx`] (`Compound_Mode_Ctx_Map`
+//!     lookup) compute each `ctx` from the neighbour-summary inputs the
+//!     (future) tile walk supplies. The remaining ~80 §9.4 tables
+//!     (y_mode, uv_mode, angle-delta, tx-size, coefficient, palette, …)
+//!     are a mechanical followup against the same [`TileCdfContext`]
+//!     shape.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -309,14 +339,22 @@ pub mod tile_info;
 pub mod uncompressed_header_tail;
 
 pub use cdf::{
-    intra_mode_ctx, mv_ctx, partition_ctx, segment_id_ctx, skip_ctx, TileCdfContext, CLASS0_SIZE,
-    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
-    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
-    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_PARTITION_W128_CDF,
-    DEFAULT_PARTITION_W16_CDF, DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF,
-    DEFAULT_PARTITION_W8_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SKIP_CDF, INTRA_MODES,
-    INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, MV_CLASSES, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT,
-    MV_JOINTS, MV_OFFSET_BITS, PARTITION_CONTEXTS, SEGMENT_ID_CONTEXTS, SKIP_CONTEXTS,
+    compound_mode_ctx, intra_mode_ctx, is_inter_ctx, mv_ctx, partition_ctx, ref_count_ctx,
+    segment_id_ctx, skip_ctx, skip_mode_ctx, TileCdfContext, BWD_REFS, CLASS0_SIZE, COMPOUND_MODES,
+    COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS,
+    COMP_REF_TYPE_CONTEXTS, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMP_BWD_REF_CDF,
+    DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DRL_MODE_CDF,
+    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MV_BIT_CDF,
+    DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF,
+    DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF,
+    DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF, DEFAULT_PARTITION_W128_CDF, DEFAULT_PARTITION_W16_CDF,
+    DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF, DEFAULT_PARTITION_W8_CDF,
+    DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF,
+    DEFAULT_SKIP_MODE_CDF, DEFAULT_UNI_COMP_REF_CDF, DEFAULT_ZERO_MV_CDF, DRL_MODE_CONTEXTS,
+    FWD_REFS, INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MV_CLASSES,
+    MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS,
+    PARTITION_CONTEXTS, REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SINGLE_REFS,
+    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UNIDIR_COMP_REFS, ZERO_MV_CONTEXTS,
 };
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,

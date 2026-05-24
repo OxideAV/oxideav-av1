@@ -2,9 +2,9 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-24
+## Status — 2026-05-25
 
-**Clean-room rebuild, round 17.** The crate's prior implementation was
+**Clean-room rebuild, round 18.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -504,6 +504,60 @@ Bitstream parsing currently covers:
   that exercises the §8.3 update path and a binary `mv_bit` decode
   with `disable_cdf_update == true`).
 
+* **§9.4 default CDF tables + §8.3.1 / §8.3.2 selection — inter-mode /
+  reference-frame subset (round 18).** Extends `cdf` with the 13
+  `Default_*_Cdf` tables that drive every inter-block mode and reference
+  syntax: `Default_New_Mv_Cdf`, `Default_Zero_Mv_Cdf`,
+  `Default_Ref_Mv_Cdf`, `Default_Drl_Mode_Cdf`, `Default_Is_Inter_Cdf`,
+  `Default_Comp_Mode_Cdf`, `Default_Skip_Mode_Cdf`,
+  `Default_Comp_Ref_Cdf`, `Default_Comp_Bwd_Ref_Cdf`,
+  `Default_Single_Ref_Cdf`, `Default_Compound_Mode_Cdf`,
+  `Default_Comp_Ref_Type_Cdf`, `Default_Uni_Comp_Ref_Cdf` —
+  all transcribed verbatim from §9.4 with the §3 constants
+  `NEW_MV_CONTEXTS = 6`, `ZERO_MV_CONTEXTS = 2`, `REF_MV_CONTEXTS = 6`,
+  `DRL_MODE_CONTEXTS = 3`, `IS_INTER_CONTEXTS = 4`,
+  `COMP_INTER_CONTEXTS = 5`, `SKIP_MODE_CONTEXTS = 3`, `REF_CONTEXTS = 3`,
+  `FWD_REFS = 4`, `BWD_REFS = 3`, `SINGLE_REFS = 7`,
+  `UNIDIR_COMP_REFS = 4`, `COMP_REF_TYPE_CONTEXTS = 5`,
+  `COMPOUND_MODES = 8`, `COMPOUND_MODE_CONTEXTS = 8`, `COMP_NEWMV_CTXS = 5`
+  re-exposed at the crate root. `TileCdfContext::new_from_defaults`
+  performs the §8.3.1 init step for every new array. The §8.3.2
+  selection surfaces 13 `&mut [u16]` accessors —
+  `new_mv_cdf` / `zero_mv_cdf` / `ref_mv_cdf` / `drl_mode_cdf` /
+  `is_inter_cdf` / `comp_mode_cdf` / `skip_mode_cdf` / `comp_ref_cdf` /
+  `comp_bwd_ref_cdf` / `single_ref_cdf` / `compound_mode_cdf` /
+  `comp_ref_type_cdf` / `uni_comp_ref_cdf` — feeding straight into
+  `SymbolDecoder::read_symbol`. Scalar §8.3.2 context helpers
+  `is_inter_ctx(above_intra, left_intra)` (`AvailU && AvailL` /
+  `AvailU XOR AvailL` / neither-avail branches per the spec ladder),
+  `skip_mode_ctx(above, left)` (sum of neighbour `SkipModes[]`),
+  `ref_count_ctx(c0, c1)` (the `<` / `==` / `>` three-branch ladder
+  shared by every `single_ref_p*` / `comp_ref` / `comp_bwdref` /
+  `uni_comp_ref_p*` paragraph), and `compound_mode_ctx(ref_mv_ctx,
+  new_mv_ctx)` (the `Compound_Mode_Ctx_Map[ RefMvContext >> 1 ][
+  Min(NewMvContext, COMP_NEWMV_CTXS - 1) ]` lookup, with the
+  `COMPOUND_MODE_CTX_MAP` table itself surfaced as a public constant)
+  compute each `ctx` from the neighbour-summary inputs the (future)
+  tile walk supplies. 10 new unit tests (182 in src/, up from 172):
+  table-dimension audit verifying every new `Default_*_Cdf` shape
+  matches the spec literal (with the §8.2.6 `cdf[N - 1] == 32768` /
+  `cdf[N] == 0` invariant enforced on every row); hand-picked
+  byte-exact spot-checks across all 13 tables (every literal that
+  appears at a row boundary read back unchanged); §8.3.1 init copies
+  every default into the corresponding `Tile*Cdf` slot; §8.3.2
+  selectors return the right default row at every hand-picked
+  `(frame_type, ctx)` tuple — both extremes of every `ctx` index for
+  all 13 syntax elements; working-copy independence — adapting
+  `new_mv` / `comp_ref` / `compound_mode` does not mutate the §9.4
+  source; §8.3.2 `is_inter_ctx` branch coverage (all 9 above/left
+  combinations); `skip_mode_ctx` (the 4 neighbour-flag pairs);
+  `ref_count_ctx` (the 3 ordering branches); `compound_mode_ctx` (one
+  spot-check from each of the 3 `COMPOUND_MODE_CTX_MAP` rows plus the
+  `Min(.., COMP_NEWMV_CTXS - 1)` clamp + the `RefMvContext >> 1`
+  saturation); and an end-to-end §8.2 `SymbolDecoder` decode driving
+  the `compound_mode` (8-value) default CDF row selected by
+  `compound_mode_ctx(4, 4) = 7`.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -546,12 +600,18 @@ selection for a bounded **intra-frame mode / partition** syntax group
 extends the same `TileCdfContext` shape with the **motion-vector
 component** subset (`mv_joint` / `mv_sign` / `mv_class` /
 `mv_class0_bit` / `mv_class0_fr` / `mv_class0_hp` / `mv_bit` / `mv_fr`
-/ `mv_hp`) and the §5.11.31 `MvCtx` derivation. The remaining ~90
-§9.4 tables (y_mode, uv_mode, angle-delta, tx-size, coefficient,
-palette, …), the `init_coeff_cdfs` coefficient set, and the other
-§8.3.2 selections (`split_or_horz` / `split_or_vert` / `tx_depth` /
-`txfm_split` / `uv_mode` / `new_mv` / `zero_mv` / `ref_mv` / …) are a
-mechanical followup against the same `TileCdfContext` shape.
+/ `mv_hp`) and the §5.11.31 `MvCtx` derivation; round 18 extends it
+again with the **inter-mode / reference-frame** subset (`new_mv` /
+`zero_mv` / `ref_mv` / `drl_mode` / `is_inter` / `comp_mode` /
+`skip_mode` / `comp_ref{,_p1,_p2}` / `comp_bwdref{,_p1}` /
+`single_ref_p{1..6}` / `compound_mode` / `comp_ref_type` /
+`uni_comp_ref{,_p1,_p2}`) plus the §8.3.2 context helpers
+`is_inter_ctx` / `skip_mode_ctx` / `ref_count_ctx` / `compound_mode_ctx`.
+The remaining ~80 §9.4 tables (y_mode, uv_mode, angle-delta, tx-size,
+coefficient, palette, …), the `init_coeff_cdfs` coefficient set, and
+the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
+`tx_depth` / `txfm_split` / `uv_mode` / …) are a mechanical followup
+against the same `TileCdfContext` shape.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
@@ -723,6 +783,46 @@ mechanical followup against the same `TileCdfContext` shape.
     `Default_Mv_Class_Cdf`, `Default_Mv_Class0_Bit_Cdf`,
     `Default_Mv_Class0_Fr_Cdf`, `Default_Mv_Class0_Hp_Cdf`,
     `Default_Mv_Bit_Cdf`, `Default_Mv_Fr_Cdf`, `Default_Mv_Hp_Cdf`).
+  * Round 18: §3 (constants — `NEW_MV_CONTEXTS = 6`,
+    `ZERO_MV_CONTEXTS = 2`, `REF_MV_CONTEXTS = 6`, `DRL_MODE_CONTEXTS = 3`,
+    `IS_INTER_CONTEXTS = 4`, `COMP_INTER_CONTEXTS = 5`,
+    `SKIP_MODE_CONTEXTS = 3`, `REF_CONTEXTS = 3`, `FWD_REFS = 4`,
+    `BWD_REFS = 3`, `SINGLE_REFS = 7`, `UNIDIR_COMP_REFS = 4`,
+    `COMP_REF_TYPE_CONTEXTS = 5`, `COMPOUND_MODES = 8`,
+    `COMPOUND_MODE_CONTEXTS = 8`, `COMP_NEWMV_CTXS = 5`), §8.3.1 (the
+    "set to a copy of `Default_*_Cdf`" init step for `NewMvCdf`,
+    `ZeroMvCdf`, `RefMvCdf`, `DrlModeCdf`, `IsInterCdf`, `CompModeCdf`,
+    `SkipModeCdf`, `CompRefCdf`, `CompBwdRefCdf`, `SingleRefCdf`,
+    `CompoundModeCdf`, `CompRefTypeCdf`, `UniCompRefCdf`), §8.3.2 (the
+    selection paragraphs — `new_mv: TileNewMvCdf[ NewMvContext ]`,
+    `zero_mv: TileZeroMvCdf[ ZeroMvContext ]`,
+    `ref_mv: TileRefMvCdf[ RefMvContext ]`,
+    `drl_mode: TileDrlModeCdf[ DrlCtxStack[ idx ] ]`, the
+    `is_inter` context ladder over `(AvailU, AvailL) × (AboveIntra,
+    LeftIntra)`, `comp_mode: TileCompModeCdf[ ctx ]`, `skip_mode:
+    TileSkipModeCdf[ ctx ]` with the neighbour `SkipModes[]` sum,
+    `comp_ref{,_p1,_p2}: TileCompRefCdf[ ctx ][ 0..2 ]` with
+    `ctx = ref_count_ctx(last12Count, last3GoldCount)` / `..(lastCount,
+    last2Count)` / `..(last3Count, goldCount)`, `comp_bwdref{,_p1}:
+    TileCompBwdRefCdf[ ctx ][ 0..1 ]` with `ctx = ref_count_ctx(
+    brfarf2Count, arfCount)` / `..(brfCount, arf2Count)`,
+    `single_ref_p{1..6}: TileSingleRefCdf[ ctx ][ 0..5 ]` (the
+    cross-referenced `single_ref_p2` ↔ `comp_bwdref` / `_p3` ↔
+    `comp_ref` / `_p4` ↔ `comp_ref_p1` / `_p5` ↔ `comp_ref_p2` / `_p6` ↔
+    `comp_bwdref_p1` mappings), `compound_mode: TileCompoundModeCdf[ ctx ]`
+    with `ctx = Compound_Mode_Ctx_Map[ RefMvContext >> 1 ][ Min(
+    NewMvContext, COMP_NEWMV_CTXS - 1) ]`, `comp_ref_type:
+    TileCompRefTypeCdf[ ctx ]` (taken as a precomputed index — the
+    nine-branch `aboveCompInter` / `leftCompInter` / `is_samedir_ref_pair`
+    ladder is the tile walk's responsibility), `uni_comp_ref{,_p1,_p2}:
+    TileUniCompRefCdf[ ctx ][ 0..2 ]`), and §9.4 (default CDF table
+    values for `Default_New_Mv_Cdf`, `Default_Zero_Mv_Cdf`,
+    `Default_Ref_Mv_Cdf`, `Default_Drl_Mode_Cdf`, `Default_Is_Inter_Cdf`,
+    `Default_Comp_Mode_Cdf`, `Default_Skip_Mode_Cdf`,
+    `Default_Comp_Ref_Cdf`, `Default_Comp_Bwd_Ref_Cdf`,
+    `Default_Single_Ref_Cdf`, `Default_Compound_Mode_Cdf`,
+    `Default_Comp_Ref_Type_Cdf`, `Default_Uni_Comp_Ref_Cdf`, plus the
+    `Compound_Mode_Ctx_Map[ 3 ][ COMP_NEWMV_CTXS ]` table).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

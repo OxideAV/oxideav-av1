@@ -6,6 +6,63 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 18 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (inter-mode / reference-frame subset).** Extends `cdf` with the 13
+  remaining `Default_*_Cdf` tables that drive every inter-block mode
+  and reference syntax: `Default_New_Mv_Cdf`, `Default_Zero_Mv_Cdf`,
+  `Default_Ref_Mv_Cdf`, `Default_Drl_Mode_Cdf`, `Default_Is_Inter_Cdf`,
+  `Default_Comp_Mode_Cdf`, `Default_Skip_Mode_Cdf`,
+  `Default_Comp_Ref_Cdf`, `Default_Comp_Bwd_Ref_Cdf`,
+  `Default_Single_Ref_Cdf`, `Default_Compound_Mode_Cdf`,
+  `Default_Comp_Ref_Type_Cdf`, `Default_Uni_Comp_Ref_Cdf` — all
+  transcribed verbatim from §9.4, plus the §8.3.2
+  `Compound_Mode_Ctx_Map[ 3 ][ COMP_NEWMV_CTXS ]` lookup table.
+  `TileCdfContext::new_from_defaults` performs the §8.3.1 init step
+  ("`*Cdf` is set to a copy of `Default_*_Cdf`") for every new array.
+  The §8.3.2 selection surfaces 13 new `&mut [u16]` accessors —
+  `new_mv_cdf` / `zero_mv_cdf` / `ref_mv_cdf` / `drl_mode_cdf` /
+  `is_inter_cdf` / `comp_mode_cdf` / `skip_mode_cdf` / `comp_ref_cdf` /
+  `comp_bwd_ref_cdf` / `single_ref_cdf` / `compound_mode_cdf` /
+  `comp_ref_type_cdf` / `uni_comp_ref_cdf` — feeding straight into
+  `SymbolDecoder::read_symbol`. Scalar §8.3.2 context helpers
+  `is_inter_ctx`, `skip_mode_ctx`, `ref_count_ctx`, and
+  `compound_mode_ctx` compute each `ctx` from the neighbour-summary
+  inputs the (future) tile walk supplies. New public API:
+  `DEFAULT_NEW_MV_CDF`, `DEFAULT_ZERO_MV_CDF`, `DEFAULT_REF_MV_CDF`,
+  `DEFAULT_DRL_MODE_CDF`, `DEFAULT_IS_INTER_CDF`, `DEFAULT_COMP_MODE_CDF`,
+  `DEFAULT_SKIP_MODE_CDF`, `DEFAULT_COMP_REF_CDF`,
+  `DEFAULT_COMP_BWD_REF_CDF`, `DEFAULT_SINGLE_REF_CDF`,
+  `DEFAULT_COMPOUND_MODE_CDF`, `DEFAULT_COMP_REF_TYPE_CDF`,
+  `DEFAULT_UNI_COMP_REF_CDF`, `COMPOUND_MODE_CTX_MAP`, the 13
+  `*_cdf` selectors, the four `*_ctx` helpers, and the §3 constants
+  `NEW_MV_CONTEXTS`, `ZERO_MV_CONTEXTS`, `REF_MV_CONTEXTS`,
+  `DRL_MODE_CONTEXTS`, `IS_INTER_CONTEXTS`, `COMP_INTER_CONTEXTS`,
+  `SKIP_MODE_CONTEXTS`, `REF_CONTEXTS`, `FWD_REFS`, `BWD_REFS`,
+  `SINGLE_REFS`, `UNIDIR_COMP_REFS`, `COMP_REF_TYPE_CONTEXTS`,
+  `COMPOUND_MODES`, `COMPOUND_MODE_CONTEXTS`, `COMP_NEWMV_CTXS`. The
+  remaining ~80 §9.4 tables (y_mode, uv_mode, angle-delta, tx-size,
+  coefficient, palette, …) are a mechanical followup against the same
+  `TileCdfContext` shape.
+
+  10 new unit tests (172 → 182 in src/): table-dimension audit
+  verifying every new `Default_*_Cdf` shape matches the spec literal
+  (with the §8.2.6 `cdf[N - 1] == 32768` / `cdf[N] == 0` invariant
+  enforced on every row); hand-picked byte-exact spot-checks across
+  all 13 tables (every literal that appears at a row boundary read
+  back unchanged); §8.3.1 init copies every default into the
+  corresponding `Tile*Cdf` slot; §8.3.2 selectors return the right
+  default row at every hand-picked `(frame_type, ctx)` tuple — both
+  extremes of every `ctx` index for all 13 syntax elements;
+  working-copy independence — adapting `new_mv` / `comp_ref` /
+  `compound_mode` does not mutate the §9.4 source; §8.3.2
+  `is_inter_ctx` branch coverage (all 9 above/left combinations);
+  `skip_mode_ctx` (the 4 neighbour-flag pairs); `ref_count_ctx` (the 3
+  ordering branches); `compound_mode_ctx` (one spot-check from each of
+  the 3 `COMPOUND_MODE_CTX_MAP` rows plus the `Min(.., COMP_NEWMV_CTXS
+  - 1)` clamp + the `RefMvContext >> 1` saturation); and an end-to-end
+  §8.2 `SymbolDecoder` decode driving the `compound_mode` (8-value)
+  default CDF row selected by `compound_mode_ctx(4, 4) = 7`.
+
 * **Round 17 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (motion-vector component subset).** Extends `cdf` with the nine
   `Default_Mv_*_Cdf` tables transcribed verbatim from §9.4
