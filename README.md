@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-24
 
-**Clean-room rebuild, round 12.** The crate's prior implementation was
+**Clean-room rebuild, round 17.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -472,6 +472,38 @@ Bitstream parsing currently covers:
   exercises the §8.3 update path, and a `partition` multisymbol decode
   with the update disabled).
 
+* **§9.4 default CDF tables + §8.3.1 / §8.3.2 selection — motion-vector
+  component subset (round 17).** Extends `cdf` with the nine
+  `Default_Mv_*_Cdf` tables transcribed verbatim from §9.4
+  (`Default_Mv_Joint_Cdf`, `Default_Mv_Sign_Cdf`, `Default_Mv_Class_Cdf`,
+  `Default_Mv_Class0_Bit_Cdf`, `Default_Mv_Class0_Fr_Cdf`,
+  `Default_Mv_Class0_Hp_Cdf`, `Default_Mv_Bit_Cdf`, `Default_Mv_Fr_Cdf`,
+  `Default_Mv_Hp_Cdf` — the `216*128` / `136*128` / … fixed-point
+  notation expanded). `TileCdfContext::new_from_defaults` performs the
+  §8.3.1 init step ("`Mv*Cdf[ i ]` is set equal to a copy of
+  `Default_Mv_*_Cdf` for `i = 0..MV_CONTEXTS-1`"), broadcasting the
+  per-`comp` flat defaults to both `comp = 0..1` slots. The §8.3.2
+  selection surfaces nine new `&mut [u16]` accessors —
+  `mv_joint_cdf(MvCtx)`, `mv_sign_cdf(MvCtx, comp)`,
+  `mv_class_cdf(MvCtx, comp)`, `mv_class0_bit_cdf(MvCtx, comp)`,
+  `mv_class0_fr_cdf(MvCtx, comp, mv_class0_bit)`,
+  `mv_class0_hp_cdf(MvCtx, comp)`, `mv_bit_cdf(MvCtx, comp, i)`,
+  `mv_fr_cdf(MvCtx, comp)`, `mv_hp_cdf(MvCtx, comp)` — yielding the
+  row `SymbolDecoder::read_symbol` consumes. The §5.11.31
+  `MvCtx = use_intrabc ? MV_INTRABC_CONTEXT : 0` derivation is exposed
+  as the `mv_ctx` helper. 7 new unit tests: every §9.4 transcribed
+  value asserted byte-exact (including the expanded `*128` fixed-point);
+  §8.3.1 init copies the default into every `MV_CONTEXTS × MV_COMPS`
+  slot with the `cdf[N - 1] == 32768` / `cdf[N] == 0` invariant on
+  every row; the §5.11.31 `mv_ctx` derivation matches the spec; §8.3.2
+  selectors return the right default row for every
+  `(MvCtx, comp, *)` indexing variant; working-copy independence —
+  adapting `mv_joint` / `mv_sign` / `mv_class0_fr` / `mv_bit` does not
+  mutate the §9.4 source; and two end-to-end decodes driving the real
+  `SymbolDecoder` through a default CDF (a 4-value `mv_joint` decode
+  that exercises the §8.3 update path and a binary `mv_bit` decode
+  with `disable_cdf_update == true`).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -510,12 +542,17 @@ quantisation, in-loop filters, film-grain synthesis) is unstarted. The
 on — now exists as a standalone, byte-exact `SymbolDecoder` (round 15);
 round 16 lands the §9.4 default CDF tables and the §8.3.1 / §8.3.2
 selection for a bounded **intra-frame mode / partition** syntax group
-(`intra_frame_y_mode` / `partition` / `skip` / `segment_id`), with the
-remaining ~100 §9.4 tables, the `init_coeff_cdfs` coefficient set, and
-the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
-`tx_depth` / `txfm_split` / motion-vector + uv-mode groups) a mechanical
-followup against the same `TileCdfContext` shape. `decode_av1` and
-`encode_av1` still return `Error::NotImplemented`.
+(`intra_frame_y_mode` / `partition` / `skip` / `segment_id`); round 17
+extends the same `TileCdfContext` shape with the **motion-vector
+component** subset (`mv_joint` / `mv_sign` / `mv_class` /
+`mv_class0_bit` / `mv_class0_fr` / `mv_class0_hp` / `mv_bit` / `mv_fr`
+/ `mv_hp`) and the §5.11.31 `MvCtx` derivation. The remaining ~90
+§9.4 tables (y_mode, uv_mode, angle-delta, tx-size, coefficient,
+palette, …), the `init_coeff_cdfs` coefficient set, and the other
+§8.3.2 selections (`split_or_horz` / `split_or_vert` / `tx_depth` /
+`txfm_split` / `uv_mode` / `new_mv` / `zero_mv` / `ref_mv` / …) are a
+mechanical followup against the same `TileCdfContext` shape.
+`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -665,6 +702,27 @@ followup against the same `TileCdfContext` shape. `decode_av1` and
     (default CDF table values for `Default_Intra_Frame_Y_Mode_Cdf`,
     `Default_Partition_W{8,16,32,64,128}_Cdf`, `Default_Skip_Cdf`,
     `Default_Segment_Id_Cdf`).
+  * Round 17: §3 (constants — `MV_CONTEXTS = 2`,
+    `MV_INTRABC_CONTEXT = 1`, `MV_JOINTS = 4`, `MV_CLASSES = 11`,
+    `CLASS0_SIZE = 2`, `MV_OFFSET_BITS = 10`), §5.11.31 (`read_mv()` —
+    the `MvCtx = use_intrabc ? MV_INTRABC_CONTEXT : 0` derivation),
+    §5.11.32 (`read_mv_component()` — the per-`comp` walk through
+    `mv_sign` / `mv_class` / `mv_class0_bit` / `mv_class0_fr` /
+    `mv_class0_hp` / `mv_bit` / `mv_fr` / `mv_hp`), §8.3.1 (the
+    per-`i = 0..MV_CONTEXTS-1` / per-`comp = 0..1` "set equal to a copy
+    of `Default_Mv_*_Cdf`" init step for the nine `Mv*Cdf` working
+    arrays), §8.3.2 (the selection paragraphs — `mv_joint:
+    TileMvJointCdf[ MvCtx ]`, `mv_sign: TileMvSignCdf[ MvCtx ][ comp ]`,
+    `mv_class: TileMvClassCdf[ MvCtx ][ comp ]`, `mv_class0_bit:
+    TileMvClass0BitCdf[ MvCtx ][ comp ]`, `mv_class0_fr:
+    TileMvClass0FrCdf[ MvCtx ][ comp ][ mv_class0_bit ]`,
+    `mv_class0_hp: TileMvClass0HpCdf[ MvCtx ][ comp ]`, `mv_fr:
+    TileMvFrCdf[ MvCtx ][ comp ]`, `mv_hp: TileMvHpCdf[ MvCtx ][ comp ]`,
+    `mv_bit: TileMvBitCdf[ MvCtx ][ comp ][ i ]`), §9.4 (default CDF
+    table values for `Default_Mv_Joint_Cdf`, `Default_Mv_Sign_Cdf`,
+    `Default_Mv_Class_Cdf`, `Default_Mv_Class0_Bit_Cdf`,
+    `Default_Mv_Class0_Fr_Cdf`, `Default_Mv_Class0_Hp_Cdf`,
+    `Default_Mv_Bit_Cdf`, `Default_Mv_Fr_Cdf`, `Default_Mv_Hp_Cdf`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

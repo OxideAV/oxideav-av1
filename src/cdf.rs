@@ -29,17 +29,28 @@
 //!
 //! ## Scope (bounded subset)
 //!
-//! Only the tables and selection rules for the intra-frame mode /
-//! partition group land here:
+//! Two §9.4 groups currently land here:
 //!
-//!   * `Default_Intra_Frame_Y_Mode_Cdf` (`intra_frame_y_mode`)
-//!   * `Default_Partition_W8/W16/W32/W64/W128_Cdf` (`partition`)
-//!   * `Default_Skip_Cdf` (`skip`)
-//!   * `Default_Segment_Id_Cdf` (`segment_id`)
+//!   * **Intra-frame mode / partition** (round 16):
+//!       * `Default_Intra_Frame_Y_Mode_Cdf` (`intra_frame_y_mode`)
+//!       * `Default_Partition_W8/W16/W32/W64/W128_Cdf` (`partition`)
+//!       * `Default_Skip_Cdf` (`skip`)
+//!       * `Default_Segment_Id_Cdf` (`segment_id`)
 //!
-//! The remaining ~100 `Default_*_Cdf` arrays of §9.4 (the y_mode,
-//! uv_mode, angle-delta, tx-size, motion-vector, coefficient, palette,
-//! … groups), the `init_coeff_cdfs` coefficient tables, and the §8.3.2
+//!   * **Motion-vector component** (round 17):
+//!       * `Default_Mv_Joint_Cdf` (`mv_joint`)
+//!       * `Default_Mv_Sign_Cdf` (`mv_sign`)
+//!       * `Default_Mv_Class_Cdf` (`mv_class`)
+//!       * `Default_Mv_Class0_Bit_Cdf` (`mv_class0_bit`)
+//!       * `Default_Mv_Class0_Fr_Cdf` (`mv_class0_fr`)
+//!       * `Default_Mv_Class0_Hp_Cdf` (`mv_class0_hp`)
+//!       * `Default_Mv_Bit_Cdf` (`mv_bit`)
+//!       * `Default_Mv_Fr_Cdf` (`mv_fr`)
+//!       * `Default_Mv_Hp_Cdf` (`mv_hp`)
+//!
+//! The remaining ~90 `Default_*_Cdf` arrays of §9.4 (the y_mode,
+//! uv_mode, angle-delta, tx-size, coefficient, palette, … groups),
+//! the `init_coeff_cdfs` coefficient tables, and the §8.3.2
 //! `split_or_horz` / `split_or_vert` / `tx_depth` / `txfm_split` / …
 //! selections are a clear followup: each is a mechanical transcription
 //! of one §9.4 table plus its §8.3.2 paragraph, slotted into the same
@@ -78,6 +89,40 @@ pub const MAX_SEGMENTS: usize = 8;
 /// block's `YMode` to the above/left context index used to select the
 /// `intra_frame_y_mode` CDF.
 pub const INTRA_MODE_CONTEXT: [usize; INTRA_MODES] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+
+// ---------------------------------------------------------------------
+// §3 motion-vector constants (round 17).
+// ---------------------------------------------------------------------
+
+/// `MV_CONTEXTS` (§3) — number of contexts for decoding motion vectors.
+/// The §5.11.31 `read_mv()` derivation sets `MvCtx = MV_INTRABC_CONTEXT`
+/// for intra-block-copy use and `MvCtx = 0` otherwise, so an MvCtx value
+/// addresses one of `0..MV_CONTEXTS` (with `MV_INTRABC_CONTEXT = 1`
+/// hitting the second slot).
+pub const MV_CONTEXTS: usize = 2;
+
+/// `MV_INTRABC_CONTEXT` (§3) — motion-vector context used by §5.11.31
+/// `read_mv()` when `use_intrabc == 1`.
+pub const MV_INTRABC_CONTEXT: usize = 1;
+
+/// `MV_JOINTS` (§3) — number of values for `mv_joint`
+/// (`MV_JOINT_ZERO`, `MV_JOINT_HNZVZ`, `MV_JOINT_HZVNZ`, `MV_JOINT_HNZVNZ`).
+pub const MV_JOINTS: usize = 4;
+
+/// `MV_CLASSES` (§3) — number of values for `mv_class`.
+pub const MV_CLASSES: usize = 11;
+
+/// `CLASS0_SIZE` (§3) — number of values for `mv_class0_bit`. Also the
+/// inner dimension of `Default_Mv_Class0_Fr_Cdf`.
+pub const CLASS0_SIZE: usize = 2;
+
+/// `MV_OFFSET_BITS` (§3) — maximum number of `mv_bit` slots read by
+/// `read_mv_component()` (one per `i = 0..mv_class-1`).
+pub const MV_OFFSET_BITS: usize = 10;
+
+/// Number of distinct mv components per call: the §5.11.31 motion vector
+/// has a horizontal and vertical component (`comp = 0..1`).
+pub const MV_COMPS: usize = 2;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -284,6 +329,93 @@ pub const DEFAULT_SEGMENT_ID_CDF: [[u16; MAX_SEGMENTS + 1]; SEGMENT_ID_CONTEXTS]
 ];
 
 // ---------------------------------------------------------------------
+// §9.4 motion-vector default CDF tables (round 17).
+//
+// Per §8.3.1 every per-tile `Mv*Cdf[ i ]` array (`i = 0..MV_CONTEXTS-1`)
+// is "set equal to a copy of" the corresponding `Default_Mv_*_Cdf`. The
+// per-component (`comp = 0..1`) decomposition for `MvSign`/`MvBit`/
+// `MvHp`/`MvClass0Bit`/`MvClass0Hp` similarly broadcasts the same flat
+// default row to both components; `MvClassCdf`/`MvClass0FrCdf`/
+// `MvFrCdf` carry distinct per-component rows in the source default
+// (the inner `2` in the spec dimension is the `comp` axis).
+//
+// Each innermost array has length `N + 1`: `N` cumulative frequencies
+// (the last `1 << 15 == 32768`) followed by the §8.3 adaptation
+// counter, which starts at 0.
+// ---------------------------------------------------------------------
+
+/// `Default_Mv_Joint_Cdf[ MV_JOINTS + 1 ]` (§9.4). The spec uses
+/// `MV_JOINTS + 1` as both the symbol count and the cumulative-array
+/// length (the row holds 4 frequencies + 1 counter).
+pub const DEFAULT_MV_JOINT_CDF: [u16; MV_JOINTS + 1] = [4096, 11264, 19328, 32768, 0];
+
+/// `Default_Mv_Sign_Cdf[ 3 ]` (§9.4). Binary symbol; the cumulative
+/// value `128*128 = 16384` is transcribed expanded.
+pub const DEFAULT_MV_SIGN_CDF: [u16; 3] = [128 * 128, 32768, 0];
+
+/// `Default_Mv_Class_Cdf[ 2 ][ MV_CLASSES + 1 ]` (§9.4). The leading `2`
+/// is the `comp = 0..1` axis (both rows are identical per spec).
+pub const DEFAULT_MV_CLASS_CDF: [[u16; MV_CLASSES + 1]; MV_COMPS] = [
+    [
+        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0,
+    ],
+    [
+        28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0,
+    ],
+];
+
+/// `Default_Mv_Class0_Bit_Cdf[ 3 ]` (§9.4). Binary symbol; broadcast to
+/// every `[comp]` slot at §8.3.1 init.
+pub const DEFAULT_MV_CLASS0_BIT_CDF: [u16; 3] = [216 * 128, 32768, 0];
+
+/// `Default_Mv_Class0_Fr_Cdf[ 2 ][ CLASS0_SIZE ][ MV_JOINTS + 1 ]`
+/// (§9.4). The leading `2` is the `comp = 0..1` axis; the middle
+/// dimension is `mv_class0_bit = 0..1` (the literal §5.11.32 dispatch
+/// `[ MvCtx ][ comp ][ mv_class0_bit ]`).
+pub const DEFAULT_MV_CLASS0_FR_CDF: [[[u16; MV_JOINTS + 1]; CLASS0_SIZE]; MV_COMPS] = [
+    [
+        [16384, 24576, 26624, 32768, 0],
+        [12288, 21248, 24128, 32768, 0],
+    ],
+    [
+        [16384, 24576, 26624, 32768, 0],
+        [12288, 21248, 24128, 32768, 0],
+    ],
+];
+
+/// `Default_Mv_Class0_Hp_Cdf[ 3 ]` (§9.4). Binary symbol.
+pub const DEFAULT_MV_CLASS0_HP_CDF: [u16; 3] = [160 * 128, 32768, 0];
+
+/// `Default_Mv_Bit_Cdf[ MV_OFFSET_BITS ][ 3 ]` (§9.4). One binary
+/// distribution per offset-bit position `i = 0..MV_OFFSET_BITS-1`. The
+/// `*128` factor expands the `8.7`-style fixed-point notation used in
+/// the spec.
+pub const DEFAULT_MV_BIT_CDF: [[u16; 3]; MV_OFFSET_BITS] = [
+    [136 * 128, 32768, 0],
+    [140 * 128, 32768, 0],
+    [148 * 128, 32768, 0],
+    [160 * 128, 32768, 0],
+    [176 * 128, 32768, 0],
+    [192 * 128, 32768, 0],
+    [224 * 128, 32768, 0],
+    [234 * 128, 32768, 0],
+    [234 * 128, 32768, 0],
+    [240 * 128, 32768, 0],
+];
+
+/// `Default_Mv_Fr_Cdf[ 2 ][ MV_JOINTS + 1 ]` (§9.4). The leading `2` is
+/// the `comp = 0..1` axis. Both rows are identical per spec; the inner
+/// `MV_JOINTS + 1` matches the 4-value `mv_fr` symbol (4 frequencies +
+/// 1 counter).
+pub const DEFAULT_MV_FR_CDF: [[u16; MV_JOINTS + 1]; MV_COMPS] = [
+    [8192, 17408, 21248, 32768, 0],
+    [8192, 17408, 21248, 32768, 0],
+];
+
+/// `Default_Mv_Hp_Cdf[ 3 ]` (§9.4). Binary symbol.
+pub const DEFAULT_MV_HP_CDF: [u16; 3] = [128 * 128, 32768, 0];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -313,6 +445,34 @@ pub struct TileCdfContext {
     pub skip: [[u16; 3]; SKIP_CONTEXTS],
     /// `TileSegmentIdCdf` (§8.3.1).
     pub segment_id: [[u16; MAX_SEGMENTS + 1]; SEGMENT_ID_CONTEXTS],
+
+    // -----------------------------------------------------------------
+    // Round 17 — motion-vector working CDFs. §8.3.1 enumerates each as
+    // "`Mv*Cdf[ i ]` is set equal to a copy of `Default_Mv_*_Cdf` for
+    // `i = 0..MV_CONTEXTS - 1`" (with the inner `comp = 0..1` axis
+    // either replicated or carried by the source default).
+    // -----------------------------------------------------------------
+    /// `TileMvJointCdf[ MV_CONTEXTS ]` (§8.3.1).
+    pub mv_joint: [[u16; MV_JOINTS + 1]; MV_CONTEXTS],
+    /// `TileMvSignCdf[ MV_CONTEXTS ][ 2 ]` (§8.3.1). The `2` is
+    /// `comp = 0..1`.
+    pub mv_sign: [[[u16; 3]; MV_COMPS]; MV_CONTEXTS],
+    /// `TileMvClassCdf[ MV_CONTEXTS ][ 2 ]` (§8.3.1).
+    pub mv_class: [[[u16; MV_CLASSES + 1]; MV_COMPS]; MV_CONTEXTS],
+    /// `TileMvClass0BitCdf[ MV_CONTEXTS ][ 2 ]` (§8.3.1).
+    pub mv_class0_bit: [[[u16; 3]; MV_COMPS]; MV_CONTEXTS],
+    /// `TileMvClass0FrCdf[ MV_CONTEXTS ][ 2 ][ CLASS0_SIZE ]` (§8.3.1).
+    /// The §5.11.32 selection indexes by `[ MvCtx ][ comp ][ mv_class0_bit ]`.
+    pub mv_class0_fr: [[[[u16; MV_JOINTS + 1]; CLASS0_SIZE]; MV_COMPS]; MV_CONTEXTS],
+    /// `TileMvClass0HpCdf[ MV_CONTEXTS ][ 2 ]` (§8.3.1).
+    pub mv_class0_hp: [[[u16; 3]; MV_COMPS]; MV_CONTEXTS],
+    /// `TileMvBitCdf[ MV_CONTEXTS ][ 2 ][ MV_OFFSET_BITS ]` (§8.3.1).
+    /// Selection: `[ MvCtx ][ comp ][ i ]`.
+    pub mv_bit: [[[[u16; 3]; MV_OFFSET_BITS]; MV_COMPS]; MV_CONTEXTS],
+    /// `TileMvFrCdf[ MV_CONTEXTS ][ 2 ]` (§8.3.1).
+    pub mv_fr: [[[u16; MV_JOINTS + 1]; MV_COMPS]; MV_CONTEXTS],
+    /// `TileMvHpCdf[ MV_CONTEXTS ][ 2 ]` (§8.3.1).
+    pub mv_hp: [[[u16; 3]; MV_COMPS]; MV_CONTEXTS],
 }
 
 impl TileCdfContext {
@@ -324,6 +484,18 @@ impl TileCdfContext {
     /// et al. (it is a value copy), so adapting it leaves the defaults
     /// untouched for the next tile's `new_from_defaults`.
     pub fn new_from_defaults() -> Self {
+        // Per §8.3.1 the flat (per-comp, per-bit) defaults are
+        // broadcast into a [MV_CONTEXTS][..] / [MV_CONTEXTS][2][..]
+        // working set; expand them once here.
+        let mv_sign_row: [[u16; 3]; MV_COMPS] = [DEFAULT_MV_SIGN_CDF, DEFAULT_MV_SIGN_CDF];
+        let mv_class0_bit_row: [[u16; 3]; MV_COMPS] =
+            [DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF];
+        let mv_class0_hp_row: [[u16; 3]; MV_COMPS] =
+            [DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS0_HP_CDF];
+        let mv_hp_row: [[u16; 3]; MV_COMPS] = [DEFAULT_MV_HP_CDF, DEFAULT_MV_HP_CDF];
+        let mv_bit_row: [[[u16; 3]; MV_OFFSET_BITS]; MV_COMPS] =
+            [DEFAULT_MV_BIT_CDF, DEFAULT_MV_BIT_CDF];
+
         Self {
             intra_frame_y_mode: DEFAULT_INTRA_FRAME_Y_MODE_CDF,
             partition_w8: DEFAULT_PARTITION_W8_CDF,
@@ -333,6 +505,16 @@ impl TileCdfContext {
             partition_w128: DEFAULT_PARTITION_W128_CDF,
             skip: DEFAULT_SKIP_CDF,
             segment_id: DEFAULT_SEGMENT_ID_CDF,
+
+            mv_joint: [DEFAULT_MV_JOINT_CDF; MV_CONTEXTS],
+            mv_sign: [mv_sign_row; MV_CONTEXTS],
+            mv_class: [DEFAULT_MV_CLASS_CDF; MV_CONTEXTS],
+            mv_class0_bit: [mv_class0_bit_row; MV_CONTEXTS],
+            mv_class0_fr: [DEFAULT_MV_CLASS0_FR_CDF; MV_CONTEXTS],
+            mv_class0_hp: [mv_class0_hp_row; MV_CONTEXTS],
+            mv_bit: [mv_bit_row; MV_CONTEXTS],
+            mv_fr: [DEFAULT_MV_FR_CDF; MV_CONTEXTS],
+            mv_hp: [mv_hp_row; MV_CONTEXTS],
         }
     }
 
@@ -384,6 +566,79 @@ impl TileCdfContext {
     /// `0..SEGMENT_ID_CONTEXTS`); see [`segment_id_ctx`].
     pub fn segment_id_cdf(&mut self, ctx: usize) -> &mut [u16] {
         &mut self.segment_id[ctx]
+    }
+
+    // -----------------------------------------------------------------
+    // Round 17 — motion-vector §8.3.2 selectors. The shared `MvCtx`
+    // input is derived from §5.11.31 `read_mv()`:
+    //
+    //   MvCtx = use_intrabc ? MV_INTRABC_CONTEXT : 0
+    //
+    // See [`mv_ctx`].
+    // -----------------------------------------------------------------
+
+    /// §8.3.2 `mv_joint`: the cdf is `TileMvJointCdf[ MvCtx ]`.
+    pub fn mv_joint_cdf(&mut self, mv_ctx: usize) -> &mut [u16] {
+        &mut self.mv_joint[mv_ctx]
+    }
+
+    /// §8.3.2 `mv_sign`: the cdf is `TileMvSignCdf[ MvCtx ][ comp ]`,
+    /// with `comp = 0` for the horizontal component and `comp = 1` for
+    /// the vertical.
+    pub fn mv_sign_cdf(&mut self, mv_ctx: usize, comp: usize) -> &mut [u16] {
+        &mut self.mv_sign[mv_ctx][comp]
+    }
+
+    /// §8.3.2 `mv_class`: the cdf is `TileMvClassCdf[ MvCtx ][ comp ]`.
+    pub fn mv_class_cdf(&mut self, mv_ctx: usize, comp: usize) -> &mut [u16] {
+        &mut self.mv_class[mv_ctx][comp]
+    }
+
+    /// §8.3.2 `mv_class0_bit`: the cdf is
+    /// `TileMvClass0BitCdf[ MvCtx ][ comp ]`. Only reached when
+    /// §5.11.32 `read_mv_component()` saw `mv_class == MV_CLASS_0`.
+    pub fn mv_class0_bit_cdf(&mut self, mv_ctx: usize, comp: usize) -> &mut [u16] {
+        &mut self.mv_class0_bit[mv_ctx][comp]
+    }
+
+    /// §8.3.2 `mv_class0_fr`: the cdf is
+    /// `TileMvClass0FrCdf[ MvCtx ][ comp ][ mv_class0_bit ]`. The
+    /// caller supplies the already-decoded `mv_class0_bit` (in
+    /// `0..CLASS0_SIZE`).
+    pub fn mv_class0_fr_cdf(
+        &mut self,
+        mv_ctx: usize,
+        comp: usize,
+        mv_class0_bit: usize,
+    ) -> &mut [u16] {
+        &mut self.mv_class0_fr[mv_ctx][comp][mv_class0_bit]
+    }
+
+    /// §8.3.2 `mv_class0_hp`: the cdf is
+    /// `TileMvClass0HpCdf[ MvCtx ][ comp ]`. Only reached when
+    /// `allow_high_precision_mv == 1`.
+    pub fn mv_class0_hp_cdf(&mut self, mv_ctx: usize, comp: usize) -> &mut [u16] {
+        &mut self.mv_class0_hp[mv_ctx][comp]
+    }
+
+    /// §8.3.2 `mv_bit`: the cdf is `TileMvBitCdf[ MvCtx ][ comp ][ i ]`
+    /// where `i` is the bit position currently being read by §5.11.32
+    /// (`i = 0..mv_class - 1`, bounded above by `MV_OFFSET_BITS`).
+    pub fn mv_bit_cdf(&mut self, mv_ctx: usize, comp: usize, i: usize) -> &mut [u16] {
+        &mut self.mv_bit[mv_ctx][comp][i]
+    }
+
+    /// §8.3.2 `mv_fr`: the cdf is `TileMvFrCdf[ MvCtx ][ comp ]`. Only
+    /// reached when `force_integer_mv == 0` and `mv_class != MV_CLASS_0`.
+    pub fn mv_fr_cdf(&mut self, mv_ctx: usize, comp: usize) -> &mut [u16] {
+        &mut self.mv_fr[mv_ctx][comp]
+    }
+
+    /// §8.3.2 `mv_hp`: the cdf is `TileMvHpCdf[ MvCtx ][ comp ]`. Only
+    /// reached when `allow_high_precision_mv == 1` and
+    /// `mv_class != MV_CLASS_0`.
+    pub fn mv_hp_cdf(&mut self, mv_ctx: usize, comp: usize) -> &mut [u16] {
+        &mut self.mv_hp[mv_ctx][comp]
     }
 }
 
@@ -466,6 +721,17 @@ pub fn segment_id_ctx(prev_ul: Option<i32>, prev_u: Option<i32>, prev_l: Option<
         2
     } else if ul_eq_u || ul_eq_l || u_eq_l {
         1
+    } else {
+        0
+    }
+}
+
+/// §5.11.31 `read_mv()` `MvCtx` derivation. Returns
+/// [`MV_INTRABC_CONTEXT`] when `use_intrabc == 1` and `0` otherwise;
+/// the result is the first index into every `Mv*Cdf` selector above.
+pub fn mv_ctx(use_intrabc: bool) -> usize {
+    if use_intrabc {
+        MV_INTRABC_CONTEXT
     } else {
         0
     }
@@ -648,5 +914,220 @@ mod tests {
         assert!(sym < 10, "partition symbol in 0..10, got {sym}");
         // disable_cdf_update was true ⇒ the row is untouched.
         assert_eq!(ctx.partition_w16[1], DEFAULT_PARTITION_W16_CDF[1]);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 17 — motion-vector default CDF tests.
+    // -----------------------------------------------------------------
+
+    /// §9.4 verbatim values for the small / flat MV defaults: the
+    /// `216*128`-style fixed-point expansions land as the bytes
+    /// `SymbolDecoder::read_symbol` will see.
+    #[test]
+    fn mv_default_byte_exact_values() {
+        // Default_Mv_Joint_Cdf = { 4096, 11264, 19328, 32768, 0 }
+        assert_eq!(DEFAULT_MV_JOINT_CDF, [4096, 11264, 19328, 32768, 0]);
+        // Default_Mv_Sign_Cdf = { 128*128, 32768, 0 } = { 16384, 32768, 0 }
+        assert_eq!(DEFAULT_MV_SIGN_CDF, [16384, 32768, 0]);
+        // Default_Mv_Hp_Cdf = { 128*128, 32768, 0 }
+        assert_eq!(DEFAULT_MV_HP_CDF, [16384, 32768, 0]);
+        // Default_Mv_Class0_Bit_Cdf = { 216*128, 32768, 0 } = { 27648, ... }
+        assert_eq!(DEFAULT_MV_CLASS0_BIT_CDF, [27648, 32768, 0]);
+        // Default_Mv_Class0_Hp_Cdf = { 160*128, 32768, 0 } = { 20480, ... }
+        assert_eq!(DEFAULT_MV_CLASS0_HP_CDF, [20480, 32768, 0]);
+        // Default_Mv_Bit_Cdf[ MV_OFFSET_BITS ][ 3 ] — every multiplier
+        // verbatim from the spec.
+        let expected: [[u16; 3]; MV_OFFSET_BITS] = [
+            [136 * 128, 32768, 0],
+            [140 * 128, 32768, 0],
+            [148 * 128, 32768, 0],
+            [160 * 128, 32768, 0],
+            [176 * 128, 32768, 0],
+            [192 * 128, 32768, 0],
+            [224 * 128, 32768, 0],
+            [234 * 128, 32768, 0],
+            [234 * 128, 32768, 0],
+            [240 * 128, 32768, 0],
+        ];
+        assert_eq!(DEFAULT_MV_BIT_CDF, expected);
+        // Default_Mv_Class_Cdf — first row, by literal §9.4 listing.
+        assert_eq!(
+            DEFAULT_MV_CLASS_CDF[0],
+            [28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0]
+        );
+        // The leading `2` axis carries identical rows per spec.
+        assert_eq!(DEFAULT_MV_CLASS_CDF[0], DEFAULT_MV_CLASS_CDF[1]);
+        // Default_Mv_Class0_Fr_Cdf — both comp rows, both mv_class0_bit
+        // sub-rows.
+        assert_eq!(
+            DEFAULT_MV_CLASS0_FR_CDF[0][0],
+            [16384, 24576, 26624, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_MV_CLASS0_FR_CDF[0][1],
+            [12288, 21248, 24128, 32768, 0]
+        );
+        assert_eq!(DEFAULT_MV_CLASS0_FR_CDF[1], DEFAULT_MV_CLASS0_FR_CDF[0]);
+        // Default_Mv_Fr_Cdf — both comp rows identical.
+        assert_eq!(DEFAULT_MV_FR_CDF[0], [8192, 17408, 21248, 32768, 0]);
+        assert_eq!(DEFAULT_MV_FR_CDF[1], DEFAULT_MV_FR_CDF[0]);
+    }
+
+    /// §8.3.1 init step for the MV group: every working row matches the
+    /// transcribed §9.4 default, broadcast to `MV_CONTEXTS` slots (and
+    /// to `MV_COMPS` slots for the flat per-component defaults). The
+    /// §8.2.6 well-formedness invariants hold on every row.
+    #[test]
+    fn init_from_defaults_copies_mv_tables() {
+        let ctx = TileCdfContext::new_from_defaults();
+
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+
+        for i in 0..MV_CONTEXTS {
+            assert_eq!(ctx.mv_joint[i], DEFAULT_MV_JOINT_CDF);
+            check(&ctx.mv_joint[i]);
+
+            for comp in 0..MV_COMPS {
+                assert_eq!(ctx.mv_sign[i][comp], DEFAULT_MV_SIGN_CDF);
+                check(&ctx.mv_sign[i][comp]);
+                assert_eq!(ctx.mv_class[i][comp], DEFAULT_MV_CLASS_CDF[comp]);
+                check(&ctx.mv_class[i][comp]);
+                assert_eq!(ctx.mv_class0_bit[i][comp], DEFAULT_MV_CLASS0_BIT_CDF);
+                check(&ctx.mv_class0_bit[i][comp]);
+                assert_eq!(ctx.mv_class0_hp[i][comp], DEFAULT_MV_CLASS0_HP_CDF);
+                check(&ctx.mv_class0_hp[i][comp]);
+                assert_eq!(ctx.mv_hp[i][comp], DEFAULT_MV_HP_CDF);
+                check(&ctx.mv_hp[i][comp]);
+                assert_eq!(ctx.mv_fr[i][comp], DEFAULT_MV_FR_CDF[comp]);
+                check(&ctx.mv_fr[i][comp]);
+
+                for (bit, default_row) in DEFAULT_MV_CLASS0_FR_CDF[comp].iter().enumerate() {
+                    assert_eq!(ctx.mv_class0_fr[i][comp][bit], *default_row);
+                    check(&ctx.mv_class0_fr[i][comp][bit]);
+                }
+                for (off, default_row) in DEFAULT_MV_BIT_CDF.iter().enumerate() {
+                    assert_eq!(ctx.mv_bit[i][comp][off], *default_row);
+                    check(&ctx.mv_bit[i][comp][off]);
+                }
+            }
+        }
+    }
+
+    /// §5.11.31 `MvCtx = use_intrabc ? MV_INTRABC_CONTEXT : 0`.
+    #[test]
+    fn mv_ctx_derivation_per_spec() {
+        assert_eq!(mv_ctx(false), 0);
+        assert_eq!(mv_ctx(true), MV_INTRABC_CONTEXT);
+        assert_eq!(MV_INTRABC_CONTEXT, 1);
+        // The §5.11.31 result must always be a valid MvCtx index.
+        assert!(mv_ctx(false) < MV_CONTEXTS);
+        assert!(mv_ctx(true) < MV_CONTEXTS);
+    }
+
+    /// §8.3.2 MV selectors all return the §9.4 default row (and the
+    /// `MvCtx + comp + mv_class0_bit / i` indexing matches the spec's
+    /// `[ MvCtx ][ comp ][ ... ]` literal).
+    #[test]
+    fn mv_selectors_return_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        for i in 0..MV_CONTEXTS {
+            assert_eq!(ctx.mv_joint_cdf(i), &DEFAULT_MV_JOINT_CDF);
+            for comp in 0..MV_COMPS {
+                assert_eq!(ctx.mv_sign_cdf(i, comp), &DEFAULT_MV_SIGN_CDF);
+                assert_eq!(ctx.mv_class_cdf(i, comp), &DEFAULT_MV_CLASS_CDF[comp]);
+                assert_eq!(ctx.mv_class0_bit_cdf(i, comp), &DEFAULT_MV_CLASS0_BIT_CDF);
+                assert_eq!(ctx.mv_class0_hp_cdf(i, comp), &DEFAULT_MV_CLASS0_HP_CDF);
+                assert_eq!(ctx.mv_hp_cdf(i, comp), &DEFAULT_MV_HP_CDF);
+                assert_eq!(ctx.mv_fr_cdf(i, comp), &DEFAULT_MV_FR_CDF[comp]);
+                for (bit, default_row) in DEFAULT_MV_CLASS0_FR_CDF[comp].iter().enumerate() {
+                    assert_eq!(ctx.mv_class0_fr_cdf(i, comp, bit), default_row);
+                }
+                for (off, default_row) in DEFAULT_MV_BIT_CDF.iter().enumerate() {
+                    assert_eq!(ctx.mv_bit_cdf(i, comp, off), default_row);
+                }
+            }
+        }
+    }
+
+    /// §8.3.1 independence for the MV group: adapting the working copy
+    /// must not mutate the §9.4 source.
+    #[test]
+    fn mv_working_copy_is_independent_of_defaults() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        ctx.mv_joint_cdf(0)[0] = 17;
+        ctx.mv_sign_cdf(1, 1)[0] = 33;
+        ctx.mv_class0_fr_cdf(0, 1, 0)[2] = 99;
+        ctx.mv_bit_cdf(1, 0, 3)[0] = 41;
+
+        assert_ne!(ctx.mv_joint[0][0], DEFAULT_MV_JOINT_CDF[0]);
+        assert_ne!(ctx.mv_sign[1][1][0], DEFAULT_MV_SIGN_CDF[0]);
+        assert_ne!(
+            ctx.mv_class0_fr[0][1][0][2],
+            DEFAULT_MV_CLASS0_FR_CDF[1][0][2]
+        );
+        assert_ne!(ctx.mv_bit[1][0][3][0], DEFAULT_MV_BIT_CDF[3][0]);
+
+        // §9.4 sources untouched.
+        assert_eq!(DEFAULT_MV_JOINT_CDF, [4096, 11264, 19328, 32768, 0]);
+        assert_eq!(DEFAULT_MV_SIGN_CDF, [16384, 32768, 0]);
+        assert_eq!(
+            DEFAULT_MV_CLASS0_FR_CDF[1][0],
+            [16384, 24576, 26624, 32768, 0]
+        );
+        assert_eq!(DEFAULT_MV_BIT_CDF[3], [160 * 128, 32768, 0]);
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a
+    /// `mv_joint` (4-value) default CDF selected by §8.3.2, and assert
+    /// the §8.3 update path actually mutated the working row + counter.
+    #[test]
+    fn decode_mv_joint_through_default_cdf() {
+        // sz = 2 ⇒ numBits = 15. bytes = 0xFF 0xFE ⇒ top 15 bits =
+        // 0x7FFF; SymbolValue = 0x7FFF ^ 0x7FFF = 0. SymbolValue 0 is
+        // below every `cur` boundary, so §8.2.6 returns the LAST symbol
+        // (here symbol 3 = MV_JOINT_HNZVNZ).
+        let bytes = [0xFFu8, 0xFEu8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 2, false).unwrap();
+        assert_eq!(dec.symbol_value(), 0);
+
+        let mut ctx = TileCdfContext::new_from_defaults();
+        let before = ctx.mv_joint;
+        let mctx = mv_ctx(false);
+        assert_eq!(mctx, 0);
+        let cdf = ctx.mv_joint_cdf(mctx);
+        let sym = dec.read_symbol(cdf).unwrap();
+        assert_eq!(sym, 3, "SymbolValue 0 selects MV_JOINT_HNZVNZ");
+
+        // §8.3 update ran: counter advanced and the working row changed.
+        assert_ne!(ctx.mv_joint, before);
+        assert_eq!(ctx.mv_joint[0][4], 1, "§8.3 counter incremented to 1");
+        // §9.4 source is immutable.
+        assert_eq!(DEFAULT_MV_JOINT_CDF, [4096, 11264, 19328, 32768, 0]);
+    }
+
+    /// End-to-end through a binary `mv_bit` default CDF with
+    /// `disable_cdf_update == true`, confirming the §8.3.2 selector
+    /// drives a valid §8.2.6 decode in range and the working row stays
+    /// untouched in the non-adaptive path.
+    #[test]
+    fn decode_mv_bit_through_default_cdf_no_update() {
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        // §5.11.32 inputs: MvCtx for a non-intrabc inter MV; comp = 1
+        // (vertical); offset bit position i = 3.
+        let mctx = mv_ctx(false);
+        let cdf = ctx.mv_bit_cdf(mctx, 1, 3);
+        let sym = dec.read_symbol(cdf).unwrap();
+        assert!(sym < 2, "mv_bit is binary; got {sym}");
+
+        // disable_cdf_update was true ⇒ the row is untouched.
+        assert_eq!(ctx.mv_bit[mctx][1][3], DEFAULT_MV_BIT_CDF[3]);
     }
 }

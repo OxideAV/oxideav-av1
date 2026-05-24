@@ -265,6 +265,29 @@
 //!     `tx_depth` / `txfm_split` / the motion-vector + uv-mode groups)
 //!     are a clear followup. See [`cdf`].
 //!
+//!   * **Round 17.** The §9.4 default CDF tables and the §8.3.1 /
+//!     §8.3.2 CDF-selection process for the **motion-vector component**
+//!     syntax group, extending [`cdf`]. Transcribes
+//!     [`DEFAULT_MV_JOINT_CDF`], [`DEFAULT_MV_SIGN_CDF`],
+//!     [`DEFAULT_MV_CLASS_CDF`], [`DEFAULT_MV_CLASS0_BIT_CDF`],
+//!     [`DEFAULT_MV_CLASS0_FR_CDF`], [`DEFAULT_MV_CLASS0_HP_CDF`],
+//!     [`DEFAULT_MV_BIT_CDF`], [`DEFAULT_MV_FR_CDF`], and
+//!     [`DEFAULT_MV_HP_CDF`] verbatim from §9.4 (the `216*128` /
+//!     `136*128` / … fixed-point notation expanded). [`TileCdfContext`]
+//!     grows nine `mv_*` working-set fields broadcast per §8.3.1 to
+//!     `MV_CONTEXTS = 2` slots (and to the `comp = 0..1` axis where the
+//!     source default is per-comp identical), and the §8.3.2 selection
+//!     surfaces `&mut [u16]` rows for every MV element: `mv_joint`
+//!     (`[MvCtx]`), `mv_sign` / `mv_class` / `mv_class0_bit` /
+//!     `mv_class0_hp` / `mv_fr` / `mv_hp` (`[MvCtx][comp]`),
+//!     `mv_class0_fr` (`[MvCtx][comp][mv_class0_bit]`), and `mv_bit`
+//!     (`[MvCtx][comp][i]`). The §5.11.31 `MvCtx` derivation —
+//!     `MvCtx = use_intrabc ? MV_INTRABC_CONTEXT : 0` — is exposed as
+//!     the [`mv_ctx`] helper. The remaining ~90 §9.4 tables (y_mode,
+//!     uv_mode, angle-delta, tx-size, coefficient, palette, …) and the
+//!     other §8.3.2 selections are a mechanical followup against the
+//!     same [`TileCdfContext`] shape.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -286,11 +309,14 @@ pub mod tile_info;
 pub mod uncompressed_header_tail;
 
 pub use cdf::{
-    intra_mode_ctx, partition_ctx, segment_id_ctx, skip_ctx, TileCdfContext,
-    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_PARTITION_W128_CDF, DEFAULT_PARTITION_W16_CDF,
-    DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF, DEFAULT_PARTITION_W8_CDF,
-    DEFAULT_SEGMENT_ID_CDF, DEFAULT_SKIP_CDF, INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS,
-    PARTITION_CONTEXTS, SEGMENT_ID_CONTEXTS, SKIP_CONTEXTS,
+    intra_mode_ctx, mv_ctx, partition_ctx, segment_id_ctx, skip_ctx, TileCdfContext, CLASS0_SIZE,
+    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
+    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
+    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_PARTITION_W128_CDF,
+    DEFAULT_PARTITION_W16_CDF, DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF,
+    DEFAULT_PARTITION_W8_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SKIP_CDF, INTRA_MODES,
+    INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, MV_CLASSES, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT,
+    MV_JOINTS, MV_OFFSET_BITS, PARTITION_CONTEXTS, SEGMENT_ID_CONTEXTS, SKIP_CONTEXTS,
 };
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,

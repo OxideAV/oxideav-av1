@@ -6,6 +6,48 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 17 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (motion-vector component subset).** Extends `cdf` with the nine
+  `Default_Mv_*_Cdf` tables transcribed verbatim from §9.4
+  (`Default_Mv_Joint_Cdf`, `Default_Mv_Sign_Cdf`, `Default_Mv_Class_Cdf`,
+  `Default_Mv_Class0_Bit_Cdf`, `Default_Mv_Class0_Fr_Cdf`,
+  `Default_Mv_Class0_Hp_Cdf`, `Default_Mv_Bit_Cdf`, `Default_Mv_Fr_Cdf`,
+  `Default_Mv_Hp_Cdf` — the `216*128` / `136*128` / … fixed-point
+  notation expanded). `TileCdfContext::new_from_defaults` performs the
+  §8.3.1 init step ("`Mv*Cdf[ i ]` is set equal to a copy of
+  `Default_Mv_*_Cdf` for `i = 0..MV_CONTEXTS-1`"), broadcasting the
+  per-`comp` flat defaults to both `comp = 0..1` slots. The §8.3.2
+  selection surfaces nine new `&mut [u16]` accessors —
+  `mv_joint_cdf(MvCtx)`, `mv_sign_cdf(MvCtx, comp)`,
+  `mv_class_cdf(MvCtx, comp)`, `mv_class0_bit_cdf(MvCtx, comp)`,
+  `mv_class0_fr_cdf(MvCtx, comp, mv_class0_bit)`,
+  `mv_class0_hp_cdf(MvCtx, comp)`, `mv_bit_cdf(MvCtx, comp, i)`,
+  `mv_fr_cdf(MvCtx, comp)`, `mv_hp_cdf(MvCtx, comp)` — each yielding
+  the row `SymbolDecoder::read_symbol` consumes. The §5.11.31
+  `MvCtx = use_intrabc ? MV_INTRABC_CONTEXT : 0` derivation is exposed
+  as the `mv_ctx` helper. New public API: `DEFAULT_MV_*` constants,
+  the nine `mv_*_cdf` selectors, `mv_ctx`, and the constants
+  `MV_CONTEXTS`, `MV_INTRABC_CONTEXT`, `MV_JOINTS`, `MV_CLASSES`,
+  `CLASS0_SIZE`, `MV_OFFSET_BITS`, `MV_COMPS`. The remaining ~90 §9.4
+  tables (y_mode, uv_mode, angle-delta, tx-size, coefficient, palette,
+  …) are a mechanical followup against the same `TileCdfContext` shape.
+
+  7 new unit tests (165 → 172 in src/): every §9.4 transcribed value
+  asserted byte-exact (including the expanded `*128` fixed-point);
+  §8.3.1 init copies every default into every `MV_CONTEXTS × MV_COMPS`
+  slot with the `cdf[N - 1] == 32768` / `cdf[N] == 0` invariant
+  enforced on every row; §5.11.31 `mv_ctx` derivation matches the spec
+  (`false → 0`, `true → MV_INTRABC_CONTEXT == 1`); §8.3.2 selectors
+  return the right default row for every `(MvCtx, comp, *)` indexing
+  variant; working-copy independence — adapting `mv_joint` / `mv_sign`
+  / `mv_class0_fr` / `mv_bit` does not mutate `DEFAULT_MV_*`; and two
+  end-to-end decodes driving the real `SymbolDecoder` through a
+  default CDF — a 4-value `mv_joint` decode that exercises the §8.3
+  update path (asserting the counter advances and the §9.4 source is
+  left untouched) and a binary `mv_bit` decode with
+  `disable_cdf_update == true` (asserting the row stays put in the
+  non-adaptive path).
+
 * **Round 16 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (intra-frame mode / partition subset).** A new `cdf` module
   transcribes the §9.4 `Default_Intra_Frame_Y_Mode_Cdf` (5×5×14), the
