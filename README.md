@@ -571,7 +571,7 @@ Bitstream parsing currently covers:
   group (`Default_Cfl_Sign_Cdf` 8-value,
   `Default_Cfl_Alpha_Cdf[ 6 ][ 17 ]` 16-value) — all transcribed
   verbatim from §9.4 with the §3 constants `BLOCK_SIZES = 22`,
-  `FILTER_INTRA_MODES = 5`, `PALETTE_BLOCK_SIZE_CONTEXTS = 7`,
+  `INTRA_FILTER_MODES = 5`, `PALETTE_BLOCK_SIZE_CONTEXTS = 7`,
   `PALETTE_{Y,UV}_MODE_CONTEXTS = 3/2`, `PALETTE_SIZES = 7`,
   `PALETTE_COLORS = 8`, `PALETTE_COLOR_CONTEXTS = 5`,
   `CFL_JOINT_SIGNS = 8`, `CFL_ALPHABET_SIZE = 16`,

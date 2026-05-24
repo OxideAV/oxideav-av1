@@ -220,9 +220,9 @@ pub const COMPOUND_MODE_CTX_MAP: [[usize; COMP_NEWMV_CTXS]; 3] =
 /// transcribed full-width.
 pub const BLOCK_SIZES: usize = 22;
 
-/// `FILTER_INTRA_MODES` (§3) — number of values for `filter_intra_mode`
+/// `INTRA_FILTER_MODES` (§3) — number of values for `filter_intra_mode`
 /// (the length of `Default_Filter_Intra_Mode_Cdf` is this + 1).
-pub const FILTER_INTRA_MODES: usize = 5;
+pub const INTRA_FILTER_MODES: usize = 5;
 
 /// `PALETTE_BLOCK_SIZE_CONTEXTS` (§3) — number of `bsizeCtx` values for
 /// palette block size. `bsizeCtx = Mi_Width_Log2[ MiSize ] +
@@ -737,9 +737,9 @@ pub const DEFAULT_UNI_COMP_REF_CDF: [[[u16; 3]; UNIDIR_COMP_REFS - 1]; REF_CONTE
 // which starts at 0.
 // ---------------------------------------------------------------------
 
-/// `Default_Filter_Intra_Mode_Cdf[ FILTER_INTRA_MODES + 1 ]` (§9.4).
+/// `Default_Filter_Intra_Mode_Cdf[ INTRA_FILTER_MODES + 1 ]` (§9.4).
 /// Codes the 5-value `filter_intra_mode`.
-pub const DEFAULT_FILTER_INTRA_MODE_CDF: [u16; FILTER_INTRA_MODES + 1] =
+pub const DEFAULT_FILTER_INTRA_MODE_CDF: [u16; INTRA_FILTER_MODES + 1] =
     [8949, 12776, 17211, 29558, 32768, 0];
 
 /// `Default_Filter_Intra_Cdf[ BLOCK_SIZES ][ 3 ]` (§9.4). Binary; codes
@@ -1076,7 +1076,7 @@ pub struct TileCdfContext {
     // (no per-context broadcast for this group).
     // -----------------------------------------------------------------
     /// `TileFilterIntraModeCdf` (§8.3.1).
-    pub filter_intra_mode: [u16; FILTER_INTRA_MODES + 1],
+    pub filter_intra_mode: [u16; INTRA_FILTER_MODES + 1],
     /// `TileFilterIntraCdf[ BLOCK_SIZES ]` (§8.3.1).
     pub filter_intra: [[u16; 3]; BLOCK_SIZES],
     /// `TilePaletteYModeCdf[ PALETTE_BLOCK_SIZE_CONTEXTS ][ PALETTE_Y_MODE_CONTEXTS ]`
@@ -2538,7 +2538,7 @@ mod tests {
         };
 
         // Filter-intra.
-        assert_eq!(DEFAULT_FILTER_INTRA_MODE_CDF.len(), FILTER_INTRA_MODES + 1);
+        assert_eq!(DEFAULT_FILTER_INTRA_MODE_CDF.len(), INTRA_FILTER_MODES + 1);
         check(&DEFAULT_FILTER_INTRA_MODE_CDF);
         assert_eq!(DEFAULT_FILTER_INTRA_CDF.len(), BLOCK_SIZES);
         for r in &DEFAULT_FILTER_INTRA_CDF {

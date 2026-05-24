@@ -15,7 +15,7 @@ All notable changes to `oxideav-av1` are recorded here.
   `Default_Palette_Size_{2..8}_{Y,Uv}_Color_Cdf` colour-index tables),
   and CFL (`Default_Cfl_Sign_Cdf`, `Default_Cfl_Alpha_Cdf`) default
   tables — all transcribed verbatim from §9.4. New §3 constants
-  `BLOCK_SIZES`, `FILTER_INTRA_MODES`, `PALETTE_BLOCK_SIZE_CONTEXTS`,
+  `BLOCK_SIZES`, `INTRA_FILTER_MODES`, `PALETTE_BLOCK_SIZE_CONTEXTS`,
   `PALETTE_Y_MODE_CONTEXTS`, `PALETTE_UV_MODE_CONTEXTS`,
   `PALETTE_SIZES`, `PALETTE_COLORS`, `PALETTE_COLOR_CONTEXTS`,
   `PALETTE_NUM_NEIGHBORS`, `PALETTE_MAX_COLOR_CONTEXT_HASH`,
