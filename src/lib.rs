@@ -154,11 +154,26 @@
 //!     `== 3 ⇒ += 1` adjustment. Also available as a standalone parser
 //!     entry point ([`parse_cdef_params`]).
 //!
-//! Frame decoding past `cdef_params()` (the remaining tail —
-//! `lr_params()` / `read_tx_mode()` /
-//! `frame_reference_mode()` / tile-content decode) is still out of
-//! scope. [`decode_av1`] / [`encode_av1`] continue to return
-//! [`Error::NotImplemented`].
+//!   * **Round 11 — §5.9.20 `lr_params()`** wired into the streaming
+//!     [`parse_frame_header`] walk (intra path). After `cdef_params()`
+//!     the parser consumes `lr_params()` and surfaces a typed
+//!     [`LrParams`] on [`FrameHeader::lr_params`]. The §5.9.20
+//!     `AllLossless || allow_intrabc || !enable_restoration`
+//!     short-circuit consumes no bits and leaves every plane
+//!     `RESTORE_NONE` with `UsesLr = 0`; the full path reads one
+//!     `lr_type` (`f(2)`) per plane (mapped through `Remap_Lr_Type` into
+//!     [`FrameRestorationType`]), then — when any plane uses LR —
+//!     `lr_unit_shift` (post-incremented for 128×128 superblocks,
+//!     otherwise extended by `lr_unit_extra_shift`) and the
+//!     4:2:0-chroma-gated `lr_uv_shift`, deriving the three
+//!     `LoopRestorationSize[]` entries from `RESTORATION_TILESIZE_MAX`.
+//!     Also available as a standalone parser entry point
+//!     ([`parse_lr_params`]).
+//!
+//! Frame decoding past `lr_params()` (the remaining tail —
+//! `read_tx_mode()` / `frame_reference_mode()` / tile-content decode) is
+//! still out of scope. [`decode_av1`] / [`encode_av1`] continue to
+//! return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -185,10 +200,11 @@ pub use tile_info::{
 };
 pub use uncompressed_header_tail::{
     parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_interpolation_filter,
-    parse_loop_filter_params, parse_quantization_params, parse_segmentation_params, CdefParams,
-    DeltaLfParams, DeltaQParams, InterpolationFilter, LoopFilterParams, QuantizationParams,
-    SegmentationParams, CDEF_MAX_STRENGTHS, LOOP_FILTER_MODE_DELTAS_DEFAULT,
-    LOOP_FILTER_REF_DELTAS_DEFAULT, MAX_LOOP_FILTER, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS,
+    parse_loop_filter_params, parse_lr_params, parse_quantization_params,
+    parse_segmentation_params, CdefParams, DeltaLfParams, DeltaQParams, FrameRestorationType,
+    InterpolationFilter, LoopFilterParams, LrParams, QuantizationParams, SegmentationParams,
+    CDEF_MAX_STRENGTHS, LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT,
+    MAX_LOOP_FILTER, MAX_SEGMENTS, RESTORATION_TILESIZE_MAX, SEGMENTATION_FEATURE_BITS,
     SEGMENTATION_FEATURE_MAX, SEGMENTATION_FEATURE_SIGNED, SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V,
     SEG_LVL_ALT_LF_Y_H, SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX,
     SEG_LVL_REF_FRAME, SEG_LVL_SKIP, TOTAL_REFS_PER_FRAME,

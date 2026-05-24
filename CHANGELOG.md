@@ -6,6 +6,64 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 11 — `lr_params()` (§5.9.20) wired into the streaming
+  `parse_frame_header` walk.** For intra (`KEY_FRAME` /
+  `INTRA_ONLY_FRAME`) frames the parser now descends past
+  `cdef_params()` into `lr_params()`. `AllLossless` is derived per the
+  §5.9.2 line `AllLossless = CodedLossless && (FrameWidth ==
+  UpscaledWidth)` (so a super-resolution-downscaled lossless frame is
+  *not* AllLossless and still walks the full LR path). The §5.9.20
+  `AllLossless || allow_intrabc || !enable_restoration` short-circuit
+  consumes no bits and leaves every plane `RESTORE_NONE` with
+  `UsesLr = 0` and zero `LoopRestorationSize[]`. The full path reads
+  one `lr_type` (`f(2)`) per plane (`NumPlanes` of them), mapping each
+  through `Remap_Lr_Type[4] = { RESTORE_NONE, RESTORE_SWITCHABLE,
+  RESTORE_WIENER, RESTORE_SGRPROJ }`; when any plane uses LR, the
+  parser then reads `lr_unit_shift` (`f(1)`, post-incremented for
+  128×128 superblocks, otherwise extended by `lr_unit_extra_shift`
+  `f(1)` when the first bit is set) and — when `subsampling_x &&
+  subsampling_y && usesChromaLr` (4:2:0 chroma LR) — `lr_uv_shift`
+  (`f(1)`). The three `LoopRestorationSize[]` entries derive from
+  `RESTORATION_TILESIZE_MAX = 256` via `>> (2 - lr_unit_shift)` for
+  luma and `>> lr_uv_shift` for chroma.
+
+  New types `LrParams` (`frame_restoration_type[3]`, `uses_lr`,
+  `uses_chroma_lr`, `lr_unit_shift`, `lr_uv_shift`,
+  `loop_restoration_size[3]`, `short_circuited`) and
+  `FrameRestorationType` (a 4-variant enum with §6.10.15 symbol-value
+  discriminants `None = 0, Wiener = 1, SgrProj = 2, Switchable = 3`
+  plus a `remap(lr_type)` constructor that walks `Remap_Lr_Type`). New
+  constant `RESTORATION_TILESIZE_MAX = 256`. New standalone parser
+  entry point `parse_lr_params`. New field on `FrameHeader`:
+  `lr_params: Option<LrParams>` (`Some` for intra frames, `None` for
+  inter / show-existing replays). Wired into both intra paths
+  (reduced-still and non-reduced).
+
+  Validation: 19 new unit tests — short-circuit on each of the three
+  gate conditions (AllLossless / allow_intrabc / !enable_restoration),
+  `Remap_Lr_Type` table coverage, the UsesLr=0 path (only types read,
+  no shift bits), non-128×128 superblock with `lr_unit_shift` in each
+  of {0, 1, 2}, 128×128 superblock post-increment giving shifts {1, 2},
+  4:2:0 chroma LR uv-shift read with 0 and 1 outcomes, the
+  subsampling-gating short-circuits for 4:4:4 and 4:2:2 chroma LR,
+  monochrome (`NumPlanes == 1`) only reading one type, all-three
+  distinct types, and two unexpected-end variants (at the first type
+  and partway through unit-shift reading). The 16-fixture frame-header
+  integration test gains five new asserted trace columns (`y_type`,
+  `u_type`, `v_type`, `unit_shift`, `uv_shift` from each fixture's
+  `LOOP_RESTORATION idx=0` trace line) plus a `UsesLr` cross-check, a
+  short-circuit invariant (only `lossless-i-only` is AllLossless), and
+  a `LoopRestorationSize[0]` derivation cross-check. The trace's
+  `y_type` / `u_type` / `v_type` columns were empirically confirmed to
+  log the **raw bitstream `lr_type`** (`f(2)`, 0..=3) rather than the
+  post-`Remap_Lr_Type` `FrameRestorationType` symbol that the
+  fixture-doc legend "0=NONE, 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE"
+  suggests; the integration test routes the trace value through
+  `Remap_Lr_Type` before comparing. The
+  `parses_tiny_key_frame_prefix` `bits_consumed` assertion rises from
+  64 to 70 (the §5.9.20 full path reads 3 × `f(2)` = 6 bits when all
+  three planes resolve to `RESTORE_NONE`, so no shift bits follow).
+
 * **Round 10 — `cdef_params()` (§5.9.19) wired into the streaming
   `parse_frame_header` walk.** For intra (`KEY_FRAME` /
   `INTRA_ONLY_FRAME`) frames the parser now descends past

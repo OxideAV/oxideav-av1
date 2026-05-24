@@ -29,7 +29,9 @@
 //! post-override value; the raw bit is preserved as documentation
 //! only.
 
-use oxideav_av1::{parse_frame_header, parse_sequence_header, FrameType, SUPERRES_NUM};
+use oxideav_av1::{
+    parse_frame_header, parse_sequence_header, FrameRestorationType, FrameType, SUPERRES_NUM,
+};
 
 #[derive(Debug)]
 struct Expected {
@@ -142,6 +144,29 @@ struct Expected {
     /// `uv_sec[0]` from the `CDEF` trace line — the **raw** signalled
     /// `cdef_uv_sec_strength[0]` before the §5.9.19 adjustment.
     trace_cdef_uv_sec0_raw: u8,
+    /// `y_type` column from the `LOOP_RESTORATION` trace line
+    /// (§5.9.20). Empirically (see the four-fixture decode in
+    /// `lr_debug` round-prep + cross-check against the spec
+    /// `Remap_Lr_Type[]`) the trace logger emits the **raw bitstream
+    /// `lr_type`** (`f(2)`, 0..=3), not the post-`Remap_Lr_Type`
+    /// FrameRestorationType symbol value. The
+    /// `docs/video/av1/av1-fixtures-and-traces.md` legend "0=NONE,
+    /// 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE" misleadingly suggests the
+    /// symbol convention. The assertion below applies
+    /// `Remap_Lr_Type[trace_lr_y_type]` before comparing to the parsed
+    /// [`FrameRestorationType`].
+    trace_lr_y_type: u8,
+    /// `u_type` (raw `lr_type`) from the `LOOP_RESTORATION` trace line.
+    /// `0` for `monochrome-grey-only` (no chroma plane is parsed).
+    trace_lr_u_type: u8,
+    /// `v_type` (raw `lr_type`) from the `LOOP_RESTORATION` trace line.
+    trace_lr_v_type: u8,
+    /// `unit_shift` from the `LOOP_RESTORATION` trace line — `lr_unit_shift`
+    /// (0..=2). `0` whenever `UsesLr == 0` / the short-circuit path.
+    trace_lr_unit_shift: u8,
+    /// `uv_shift` from the `LOOP_RESTORATION` trace line — `lr_uv_shift`
+    /// (0 or 1). `0` for every corpus fixture.
+    trace_lr_uv_shift: u8,
 }
 
 /// Apply the §5.9.19 secondary-strength adjustment: a raw value of `3`
@@ -192,6 +217,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -216,6 +243,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 12,
             trace_cdef_y_sec0_raw: 3, trace_cdef_uv_sec0_raw: 1,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 2,
+            trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -240,6 +269,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 2,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 3,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 2,
+            trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -264,6 +295,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 2, trace_cdef_uv_pri0: 3,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -288,6 +321,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 10, trace_cdef_uv_pri0: 0,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 3,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -312,6 +347,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 6, trace_cdef_uv_pri0: 1,
             trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 3,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -336,6 +373,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 1, trace_cdef_uv_pri0: 1,
             trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 1,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -360,6 +399,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 1, trace_cdef_uv_pri0: 0,
             trace_cdef_y_sec0_raw: 1, trace_cdef_uv_sec0_raw: 0,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -384,6 +425,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 5, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 2, trace_cdef_uv_pri0: 14,
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
+            trace_lr_y_type: 2, trace_lr_u_type: 2, trace_lr_v_type: 2,
+            trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -412,6 +455,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 3, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -436,6 +481,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 8,
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -461,6 +508,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 5, trace_cdef_bits: 1,
             trace_cdef_y_pri0: 6, trace_cdef_uv_pri0: 7,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
+            trace_lr_y_type: 3, trace_lr_u_type: 3, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -486,6 +535,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 1,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -514,6 +565,13 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 3, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 2,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 2,
+            // No standalone trace.txt for this fixture (the synthetic
+            // show-existing IVF frame); the underlying hidden KEY OBU is
+            // not CodedLossless (CDEF uv_pri[0]=2), so lr_params() walks
+            // the full path. All three planes read RESTORE_NONE ⇒
+            // UsesLr = 0 ⇒ no shift bits, all sizes 0.
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -543,6 +601,11 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 3, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 0, trace_cdef_uv_pri0: 0,
             trace_cdef_y_sec0_raw: 0, trace_cdef_uv_sec0_raw: 0,
+            // CodedLossless ⇒ AllLossless (FrameWidth == UpscaledWidth)
+            // ⇒ §5.9.20 short-circuit: all planes RESTORE_NONE,
+            // UsesLr = 0, no bits read.
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
     Fixture {
@@ -567,6 +630,8 @@ const FIXTURES: &[Fixture] = &[
             trace_cdef_damping: 4, trace_cdef_bits: 0,
             trace_cdef_y_pri0: 2, trace_cdef_uv_pri0: 8,
             trace_cdef_y_sec0_raw: 2, trace_cdef_uv_sec0_raw: 2,
+            trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
+            trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
         },
     },
 ];
@@ -925,6 +990,104 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
                 "{}: cdef short_circuited expected {} got {}",
                 fx.name, cdef_is_short, cdef.short_circuited,
             ));
+        }
+
+        // Round 11: §5.9.20 lr_params wired into the streaming walk. The
+        // `LOOP_RESTORATION` trace line (idx=0) carries the per-plane
+        // raw bitstream `lr_type` (the 2-bit `f(2)` value before
+        // `Remap_Lr_Type` is applied) plus `unit_shift` / `uv_shift`.
+        // (The fixture-doc legend "0=NONE, 1=WIENER, 2=SGRPROJ,
+        // 3=SWITCHABLE" describes the trace VALUES as if they were
+        // FrameRestorationType symbols, but the bytes in
+        // `docs/video/av1/fixtures/*/trace.txt` consistently log the
+        // raw `lr_type` — see
+        // `docs/video/av1/av1-fixtures-and-traces.md` §"LOOP_RESTORATION"
+        // and §5.9.20 `Remap_Lr_Type` for the mapping the parser then
+        // applies.)
+        //
+        // We compare the parsed [`FrameRestorationType`] against the
+        // trace's raw `lr_type` by `Remap_Lr_Type[lr_type]`. Only
+        // `lossless-i-only` short-circuits for LR (its AllLossless —
+        // `CodedLossless && FrameWidth == UpscaledWidth` — fires the
+        // §5.9.20 short-circuit). The all-zero-type fixtures walk the
+        // full path and just resolve to `UsesLr = 0`.
+        let lr = fh
+            .lr_params
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture {}: expected lr_params = Some(..)", fx.name));
+        let expected_y_rtype = FrameRestorationType::remap(fx.expected.trace_lr_y_type);
+        let expected_u_rtype = FrameRestorationType::remap(fx.expected.trace_lr_u_type);
+        let expected_v_rtype = FrameRestorationType::remap(fx.expected.trace_lr_v_type);
+        if lr.frame_restoration_type[0] != expected_y_rtype {
+            mismatches.push(format!(
+                "{}: lr y_type expected lr_type={} (= {:?}) got {:?}",
+                fx.name,
+                fx.expected.trace_lr_y_type,
+                expected_y_rtype,
+                lr.frame_restoration_type[0],
+            ));
+        }
+        if lr.frame_restoration_type[1] != expected_u_rtype {
+            mismatches.push(format!(
+                "{}: lr u_type expected lr_type={} (= {:?}) got {:?}",
+                fx.name,
+                fx.expected.trace_lr_u_type,
+                expected_u_rtype,
+                lr.frame_restoration_type[1],
+            ));
+        }
+        if lr.frame_restoration_type[2] != expected_v_rtype {
+            mismatches.push(format!(
+                "{}: lr v_type expected lr_type={} (= {:?}) got {:?}",
+                fx.name,
+                fx.expected.trace_lr_v_type,
+                expected_v_rtype,
+                lr.frame_restoration_type[2],
+            ));
+        }
+        if lr.lr_unit_shift != fx.expected.trace_lr_unit_shift {
+            mismatches.push(format!(
+                "{}: lr_unit_shift expected {} got {}",
+                fx.name, fx.expected.trace_lr_unit_shift, lr.lr_unit_shift,
+            ));
+        }
+        if lr.lr_uv_shift != fx.expected.trace_lr_uv_shift {
+            mismatches.push(format!(
+                "{}: lr_uv_shift expected {} got {}",
+                fx.name, fx.expected.trace_lr_uv_shift, lr.lr_uv_shift,
+            ));
+        }
+        // §5.9.20 UsesLr cross-check: any non-zero raw `lr_type` ⇒
+        // UsesLr (since `Remap_Lr_Type[1..=3]` are all non-NONE and only
+        // `lr_type == 0` maps to RESTORE_NONE).
+        let any_lr = fx.expected.trace_lr_y_type != 0
+            || fx.expected.trace_lr_u_type != 0
+            || fx.expected.trace_lr_v_type != 0;
+        if lr.uses_lr != any_lr {
+            mismatches.push(format!(
+                "{}: lr uses_lr expected {} got {}",
+                fx.name, any_lr, lr.uses_lr,
+            ));
+        }
+        // §5.9.20 short-circuit invariant: only `lossless-i-only`
+        // (AllLossless) takes the no-bits-read short-circuit path.
+        let lr_is_short = fx.name == "lossless-i-only";
+        if lr.short_circuited != lr_is_short {
+            mismatches.push(format!(
+                "{}: lr short_circuited expected {} got {}",
+                fx.name, lr_is_short, lr.short_circuited,
+            ));
+        }
+        // §5.9.20 LoopRestorationSize[0] derivation cross-check when
+        // UsesLr: 256 >> (2 - lr_unit_shift).
+        if lr.uses_lr {
+            let expected_size0 = 256u32 >> (2 - u32::from(lr.lr_unit_shift));
+            if lr.loop_restoration_size[0] != expected_size0 {
+                mismatches.push(format!(
+                    "{}: LoopRestorationSize[0] expected {} got {}",
+                    fx.name, expected_size0, lr.loop_restoration_size[0],
+                ));
+            }
         }
 
         if !mismatches.is_empty() {

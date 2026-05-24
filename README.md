@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-24
 
-**Clean-room rebuild, round 10.** The crate's prior implementation was
+**Clean-room rebuild, round 11.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -300,6 +300,56 @@ Bitstream parsing currently covers:
   the short-circuit; the other 14 take the full path (e.g.
   `super-resolution` `damping=5 / cdef_y_pri=2 / cdef_uv_pri=14`).
 
+* **§5.9.20 `lr_params()` wired into the streaming parser (round
+  11).** After `cdef_params()` the parser now consumes `lr_params()`
+  per §5.9.20. `AllLossless = CodedLossless && (FrameWidth ==
+  UpscaledWidth)` is derived inline (super-resolution downscaling
+  keeps AllLossless 0 even when CodedLossless is 1). The `AllLossless
+  || allow_intrabc || !enable_restoration` short-circuit consumes no
+  bits and leaves every plane `RESTORE_NONE` with `UsesLr = 0` and
+  zero `LoopRestorationSize[]`. The full path reads one `lr_type`
+  (`f(2)`) per plane, mapping each through `Remap_Lr_Type[4] = {
+  RESTORE_NONE, RESTORE_SWITCHABLE, RESTORE_WIENER, RESTORE_SGRPROJ }`;
+  when any plane uses LR, the parser reads `lr_unit_shift` (`f(1)`,
+  post-incremented for 128×128 superblocks, otherwise extended by
+  `lr_unit_extra_shift` `f(1)` when the first bit is set) and — when
+  `subsampling_x && subsampling_y && usesChromaLr` — `lr_uv_shift`
+  (`f(1)`). The three `LoopRestorationSize[]` entries derive from
+  `RESTORATION_TILESIZE_MAX = 256` via `>> (2 - lr_unit_shift)` for
+  luma and `>> lr_uv_shift` for chroma. New types `LrParams`
+  (`frame_restoration_type[3]`, `uses_lr`, `uses_chroma_lr`,
+  `lr_unit_shift`, `lr_uv_shift`, `loop_restoration_size[3]`,
+  `short_circuited`) and `FrameRestorationType` (4-variant enum with
+  §6.10.15 symbol discriminants 0..=3, plus `remap(lr_type)`). New
+  constant `RESTORATION_TILESIZE_MAX = 256`. New standalone parser
+  entry point `parse_lr_params`. New field
+  `FrameHeader::lr_params: Option<LrParams>`. 19 new unit tests
+  (short-circuit on all three gates, the `Remap_Lr_Type` table, UsesLr=0
+  no-shift path, non-128 SB with lr_unit_shift each of {0, 1, 2}, 128 SB
+  post-increment with each of {1, 2}, 4:2:0 chroma uv-shift {0, 1},
+  subsampling-gated uv-shift skip on 4:4:4 and 4:2:2, monochrome
+  one-type-only, distinct types per plane, and two unexpected-end
+  cases). The `parses_tiny_key_frame_prefix` bit-count rises 64 → 70.
+  The 16-fixture frame-header integration test gains five new asserted
+  trace columns (`y_type`, `u_type`, `v_type`, `unit_shift`,
+  `uv_shift` from each fixture's `LOOP_RESTORATION idx=0` trace line)
+  plus a `UsesLr` cross-check, short-circuit invariant (only
+  `lossless-i-only` AllLossless short-circuits), and a
+  `LoopRestorationSize[0]` derivation cross-check. Empirically
+  confirmed: the trace logger writes the **raw bitstream `lr_type`**
+  (not the post-`Remap_Lr_Type` symbol) — the four
+  `bits_consumed`-traceable fixtures (`i-only-64x64-prof0`,
+  `i-frame-then-p-64x64`, `super-resolution`, `superblocks-128`) all
+  decode bit-exactly only when the test routes the trace value through
+  `Remap_Lr_Type` before comparing. `super-resolution` exercises
+  three-plane Wiener LR with unit_shift=2; `superblocks-128`
+  exercises two-plane SgrProj LR with unit_shift=2 from a 128×128
+  superblock; `i-only-64x64-prof0` and `i-frame-then-p-64x64` each
+  exercise V-plane-only Wiener LR (`usesChromaLr=1` and the 4:2:0
+  uv-shift read=0); `lossless-i-only` exercises the AllLossless
+  short-circuit (the only fixture that does); the other 10 walk the
+  full LR path with all three planes RESTORE_NONE / `UsesLr = 0`.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -322,12 +372,11 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `cdef_params()` (the remaining
-uncompressed-header tail — `lr_params()`, `read_tx_mode()`,
-`frame_reference_mode()` — plus tile-content decode —
-motion vectors, transform / quantisation, in-loop filters, film grain)
-is **not yet implemented**. `decode_av1` and `encode_av1` still
-return `Error::NotImplemented`.
+Frame decoding past `lr_params()` (the remaining uncompressed-header
+tail — `read_tx_mode()`, `frame_reference_mode()` — plus tile-content
+decode — motion vectors, transform / quantisation, in-loop filters,
+film grain) is **not yet implemented**. `decode_av1` and `encode_av1`
+still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -407,6 +456,22 @@ return `Error::NotImplemented`.
     adjustment), §5.5.1 (`enable_cdef`), §6.4 (`enable_cdef`
     semantics), §6.10.14 (CDEF params semantics — `cdef_damping_minus_3`
     / `cdef_bits` / `cdef_*_pri_strength` / `cdef_*_sec_strength`).
+  * Round 11: §3 (constant — `RESTORATION_TILESIZE_MAX = 256`),
+    §5.9.2 (the `AllLossless = CodedLossless && (FrameWidth ==
+    UpscaledWidth)` derivation line and the `lr_params()` placement
+    after `cdef_params()` in the `if (FrameIsIntra)` block), §5.9.20
+    (`lr_params` — the `AllLossless || allow_intrabc ||
+    !enable_restoration` short-circuit, the per-plane `lr_type` `f(2)`
+    loop with `Remap_Lr_Type[4] = { RESTORE_NONE, RESTORE_SWITCHABLE,
+    RESTORE_WIENER, RESTORE_SGRPROJ }`, the `UsesLr` / `usesChromaLr`
+    derivation, the 128×128-superblock-gated `lr_unit_shift`
+    post-increment vs the non-128 `lr_unit_extra_shift` extension,
+    the 4:2:0-chroma-gated `lr_uv_shift`, and the
+    `LoopRestorationSize[plane]` derivation —
+    `RESTORATION_TILESIZE_MAX >> (2 - lr_unit_shift)` for luma and
+    `>> lr_uv_shift` for chroma), §5.5.1 (`enable_restoration`,
+    `use_128x128_superblock`), §6.10.15 (Loop restoration params
+    semantics — the `FrameRestorationType` symbol-value table).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

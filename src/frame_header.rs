@@ -118,8 +118,9 @@ use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CO
 use crate::tile_info::{read_tile_info, TileInfo};
 use crate::uncompressed_header_tail::{
     read_cdef_params, read_delta_lf_params, read_delta_q_params, read_loop_filter_params,
-    read_quantization_params, read_segmentation_params, CdefParams, DeltaLfParams, DeltaQParams,
-    LoopFilterParams, QuantizationParams, SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q,
+    read_lr_params, read_quantization_params, read_segmentation_params, CdefParams, DeltaLfParams,
+    DeltaQParams, LoopFilterParams, LrParams, QuantizationParams, SegmentationParams, MAX_SEGMENTS,
+    SEG_LVL_ALT_Q,
 };
 use crate::Error;
 
@@ -415,10 +416,18 @@ pub struct FrameHeader {
     /// allow_intrabc || !enable_cdef` short-circuit consumes no bits and
     /// leaves `cdef_bits = 0` / `CdefDamping = 3` with zero strengths.
     pub cdef_params: Option<CdefParams>,
+    /// `lr_params()` (§5.9.20) result. `Some` whenever `cdef_params` is
+    /// `Some` (intra frames); `None` for inter / show-existing-frame
+    /// paths. The §5.9.20 `AllLossless || allow_intrabc ||
+    /// !enable_restoration` short-circuit consumes no bits and leaves
+    /// every plane `RESTORE_NONE` with `UsesLr = 0`. `AllLossless` is
+    /// derived as `CodedLossless && (FrameWidth == UpscaledWidth)` —
+    /// i.e. `CodedLossless` with no active super-resolution downscale.
+    pub lr_params: Option<LrParams>,
     /// Total bits consumed from `payload` by this parse. The next
     /// round will continue from this position to decode the
-    /// `lr_params()` / `read_tx_mode()` block (intra path) or the
-    /// inter-frame `frame_refs_short_signaling` block (inter path).
+    /// `read_tx_mode()` block (intra path) or the inter-frame
+    /// `frame_refs_short_signaling` block (inter path).
     pub bits_consumed: usize,
 }
 
@@ -571,6 +580,22 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             allow_intrabc,
             seq.enable_cdef,
         )?;
+        // §5.9.2 spec order: AllLossless is derived as
+        // `CodedLossless && (FrameWidth == UpscaledWidth)` before the
+        // loop_filter / cdef / lr block; then lr_params() (§5.9.20). The
+        // §5.9.20 short-circuit fires on `AllLossless || allow_intrabc
+        // || !enable_restoration`.
+        let all_lossless = coded_lossless && frame_size.frame_width == frame_size.upscaled_width;
+        let lr_params = read_lr_params(
+            br,
+            seq.color_config.num_planes,
+            seq.color_config.subsampling_x,
+            seq.color_config.subsampling_y,
+            seq.use_128x128_superblock,
+            all_lossless,
+            allow_intrabc,
+            seq.enable_restoration,
+        )?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -598,6 +623,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             delta_lf_params: Some(delta_lf_params),
             loop_filter_params: Some(loop_filter_params),
             cdef_params: Some(cdef_params),
+            lr_params: Some(lr_params),
             bits_consumed: br.position(),
         });
     }
@@ -655,6 +681,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             delta_lf_params: None,
             loop_filter_params: None,
             cdef_params: None,
+            lr_params: None,
             bits_consumed: br.position(),
         });
     }
@@ -782,6 +809,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         delta_lf_params,
         loop_filter_params,
         cdef_params,
+        lr_params,
     ) = if frame_is_intra {
         let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
         let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
@@ -830,6 +858,25 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             aib,
             seq.enable_cdef,
         )?;
+        // §5.9.2 spec order: AllLossless is derived as
+        // `CodedLossless && (FrameWidth == UpscaledWidth)` before the
+        // loop_filter / cdef / lr block; then lr_params() (§5.9.20). The
+        // §5.9.20 short-circuit fires on `AllLossless || allow_intrabc
+        // || !enable_restoration`. Super-resolution downscaling
+        // (`FrameWidth != UpscaledWidth`) keeps AllLossless 0 even when
+        // CodedLossless is 1, so a downscaled lossless frame still walks
+        // the full LR path.
+        let all_lossless = coded_lossless && fs.frame_width == fs.upscaled_width;
+        let lr = read_lr_params(
+            br,
+            seq.color_config.num_planes,
+            seq.color_config.subsampling_x,
+            seq.color_config.subsampling_y,
+            seq.use_128x128_superblock,
+            all_lossless,
+            aib,
+            seq.enable_restoration,
+        )?;
         (
             Some(fs),
             aib,
@@ -841,9 +888,12 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             Some(dlf),
             Some(lf),
             Some(cdef),
+            Some(lr),
         )
     } else {
-        (None, false, false, None, None, None, None, None, None, None)
+        (
+            None, false, false, None, None, None, None, None, None, None, None,
+        )
     };
 
     Ok(FrameHeader {
@@ -873,6 +923,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         delta_lf_params,
         loop_filter_params,
         cdef_params,
+        lr_params,
         bits_consumed: br.position(),
     })
 }
@@ -1216,8 +1267,14 @@ mod tests {
         //     cdef_y_sec_strength(2)=0  cdef_uv_pri_strength(4)=0
         //     cdef_uv_sec_strength(2)=0
         //   = +16 bits.
-        // = 64 bits total.
-        assert_eq!(fh.bits_consumed, 64);
+        // = 64 bits. Round 11 adds lr_params (§5.9.20):
+        //   [AllLossless=0 (CodedLossless=0), allow_intrabc=0,
+        //    enable_restoration=1 ⇒ full path]
+        //   NumPlanes=3 ⇒ lr_type[0..3] each f(2): 6 bits. Trace shows
+        //   y=0/u=0/v=0 ⇒ UsesLr=0 ⇒ no unit_shift / uv_shift bits.
+        //   = +6 bits.
+        // = 70 bits total.
+        assert_eq!(fh.bits_consumed, 70);
         let qp = fh
             .quantization_params
             .as_ref()
@@ -1519,11 +1576,18 @@ mod tests {
         //   [85x64 use_128sb=1: sbCols=sbRows=1 ⇒ no increment reads;
         //    TileColsLog2==0 && TileRowsLog2==0 ⇒ no trailing reads]
         // = 9 bits. Round 7 appends 13 zero bits for quant + seg.
-        // Total = 22 bits. Bytes: 0101_0110 1000_0000 0000_0000 = 0x56 0x80 0x00.
-        let payload = [0x56u8, 0x80u8, 0x00u8];
+        // = 22 bits. Round 10 adds cdef_params (§5.9.19): base_q_idx=0
+        // and no delta_q offsets ⇒ CodedLossless=1 ⇒ §5.9.19
+        // short-circuit (0 bits). Round 11 adds lr_params (§5.9.20):
+        // AllLossless = CodedLossless && (FrameWidth == UpscaledWidth)
+        // = true && (85 == 128) = false ⇒ NOT short-circuit; full path
+        // reads NumPlanes=3 lr_type f(2) ⇒ +6 zero bits ⇒ all NONE ⇒
+        // UsesLr=0 ⇒ no shift bits. Total = 28 bits. The trailing 4
+        // bits are padding inside the 4-byte buffer.
+        let payload = [0x56u8, 0x80u8, 0x00u8, 0x00u8];
         let seq = super_resolution_seq();
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
-        assert_eq!(fh.bits_consumed, 22);
+        assert_eq!(fh.bits_consumed, 28);
         let fs = fh.frame_size.expect("reduced-still produces frame_size");
         assert!(fs.use_superres);
         assert_eq!(fs.coded_denom, 3);

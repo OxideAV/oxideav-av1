@@ -2,14 +2,16 @@
 //! `uncompressed_header()` (§5.9.2). Rounds 5–8 of the clean-room
 //! rebuild landed `read_interpolation_filter()` (§5.9.10),
 //! `loop_filter_params()` (§5.9.11), `quantization_params()` (§5.9.12),
-//! `segmentation_params()` (§5.9.14), and — added this round —
-//! `delta_q_params()` (§5.9.17) + `delta_lf_params()` (§5.9.18).
+//! `segmentation_params()` (§5.9.14), `delta_q_params()` (§5.9.17),
+//! `delta_lf_params()` (§5.9.18), `cdef_params()` (§5.9.19), and — added
+//! this round — `lr_params()` (§5.9.20).
 //!
 //! `quantization_params()`, `segmentation_params()`,
-//! `delta_q_params()`, and `delta_lf_params()` are also wired into the
-//! streaming [`crate::parse_frame_header`] walk (intra path) since they
-//! sit before the remaining `loop_filter_params()` (streaming wire-in)
-//! / `cdef_params()` / `lr_params()` block. The standalone entry points
+//! `delta_q_params()`, `delta_lf_params()`, `cdef_params()`, and
+//! `lr_params()` are also wired into the streaming
+//! [`crate::parse_frame_header`] walk (intra path) since they sit
+//! before the remaining `read_tx_mode()` / `frame_reference_mode()`
+//! block. The standalone entry points
 //! remain available so callers that want to exercise the parsers on a
 //! raw byte slice can do so without rebuilding a `SequenceHeader` and a
 //! streaming context.
@@ -23,6 +25,10 @@
 //!   * §5.9.14 — `segmentation_params()`
 //!   * §5.9.17 — `delta_q_params()`
 //!   * §5.9.18 — `delta_lf_params()`
+//!   * §5.9.19 — `cdef_params()`
+//!   * §5.9.20 — `lr_params()`
+//!   * §6.10.14 — CDEF params semantics
+//!   * §6.10.15 — Loop restoration params semantics
 //!   * §6.8.9  — Interpolation filter semantics
 //!   * §6.8.10 — Loop filter semantics
 //!   * §6.8.11 — Quantization params semantics
@@ -951,6 +957,255 @@ pub(crate) fn read_cdef_params(
         cdef_y_sec_strength,
         cdef_uv_pri_strength,
         cdef_uv_sec_strength,
+        short_circuited: false,
+    })
+}
+
+// ---------------------------------------------------------------------
+// §5.9.20 lr_params
+// ---------------------------------------------------------------------
+
+/// `RESTORATION_TILESIZE_MAX` per §3 — the maximum size (in luma
+/// samples) of a loop restoration unit. `LoopRestorationSize[0]` is
+/// derived as `RESTORATION_TILESIZE_MAX >> (2 - lr_unit_shift)`.
+pub const RESTORATION_TILESIZE_MAX: u32 = 256;
+
+/// The per-plane restoration type (§6.10.15 `FrameRestorationType`).
+///
+/// The §5.9.20 `lr_type` (`f(2)`) bitstream value is mapped through the
+/// `Remap_Lr_Type[4]` lookup table into one of these. The numeric
+/// discriminants are the §6.10.15 `FrameRestorationType` symbol values
+/// (`RESTORE_NONE = 0`, `RESTORE_WIENER = 1`, `RESTORE_SGRPROJ = 2`,
+/// `RESTORE_SWITCHABLE = 3`), which is also the encoding the
+/// `LOOP_RESTORATION` trace lines log for `y_type` / `u_type` /
+/// `v_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameRestorationType {
+    /// `RESTORE_NONE` (0) — no loop restoration on this plane.
+    None = 0,
+    /// `RESTORE_WIENER` (1) — Wiener filter restoration.
+    Wiener = 1,
+    /// `RESTORE_SGRPROJ` (2) — self-guided projection restoration.
+    SgrProj = 2,
+    /// `RESTORE_SWITCHABLE` (3) — per-unit switchable restoration.
+    Switchable = 3,
+}
+
+impl FrameRestorationType {
+    /// `Remap_Lr_Type[lr_type]` per §5.9.20:
+    ///
+    /// ```text
+    /// Remap_Lr_Type[4] = {
+    ///   RESTORE_NONE, RESTORE_SWITCHABLE, RESTORE_WIENER, RESTORE_SGRPROJ
+    /// }
+    /// ```
+    ///
+    /// `lr_type` is read as `f(2)` so it is always in `0..=3`; the
+    /// `_ => None` arm is unreachable for a conforming bitstream and
+    /// exists only to keep the match total.
+    #[must_use]
+    pub const fn remap(lr_type: u8) -> Self {
+        match lr_type {
+            0 => FrameRestorationType::None,
+            1 => FrameRestorationType::Switchable,
+            2 => FrameRestorationType::Wiener,
+            3 => FrameRestorationType::SgrProj,
+            _ => FrameRestorationType::None,
+        }
+    }
+
+    /// The §6.10.15 `FrameRestorationType` symbol value (0..=3).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Parsed `lr_params()` per §5.9.20 + §6.10.15.
+///
+/// Loop-restoration parameters. When the §5.9.20 short-circuit fires
+/// (`AllLossless || allow_intrabc || !enable_restoration`) the spec sets
+/// `FrameRestorationType[0..3] = RESTORE_NONE`, `UsesLr = 0`, and
+/// returns without reading any bits; [`Self::short_circuited`] records
+/// that no bits were read.
+///
+/// Otherwise the parser reads one `lr_type` (`f(2)`) per plane
+/// (`NumPlanes` of them), mapping each through `Remap_Lr_Type` into
+/// [`FrameRestorationType`]. `UsesLr` is set if any plane uses
+/// restoration; `usesChromaLr` is set if any chroma plane (`i > 0`)
+/// does. When `UsesLr`, the loop-restoration unit size is read:
+/// `lr_unit_shift` (`f(1)`, post-incremented for 128×128 superblocks;
+/// otherwise extended by `lr_unit_extra_shift` `f(1)` when the first bit
+/// is set), then `lr_uv_shift` (`f(1)`, only for 4:2:0 with chroma LR;
+/// 0 otherwise). The three `LoopRestorationSize[]` entries are derived
+/// from `RESTORATION_TILESIZE_MAX` and the two shifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LrParams {
+    /// `FrameRestorationType[0..NumPlanes]` (Y, U, V). Planes beyond
+    /// `NumPlanes` (chroma on monochrome) stay at `RESTORE_NONE` — the
+    /// §5.9.20 short-circuit and the monochrome `NumPlanes == 1` loop
+    /// bound both leave them untouched.
+    pub frame_restoration_type: [FrameRestorationType; 3],
+    /// `UsesLr` — `true` when any plane uses loop restoration.
+    pub uses_lr: bool,
+    /// `usesChromaLr` — `true` when any chroma plane (`i > 0`) uses loop
+    /// restoration. Gates the §5.9.20 `lr_uv_shift` read together with
+    /// `subsampling_x && subsampling_y`.
+    pub uses_chroma_lr: bool,
+    /// `lr_unit_shift`. `0` when `!UsesLr`. For 128×128 superblocks the
+    /// read `f(1)` is post-incremented (so `1..=2`); otherwise it is
+    /// `0` or `1 + lr_unit_extra_shift` (`1..=2`). Feeds
+    /// `LoopRestorationSize[0]`.
+    pub lr_unit_shift: u8,
+    /// `lr_uv_shift`. `0` unless `subsampling_x && subsampling_y &&
+    /// usesChromaLr`, in which case it is the read `f(1)`.
+    pub lr_uv_shift: u8,
+    /// `LoopRestorationSize[0..3]` (Y, U, V) in plane samples.
+    /// `LoopRestorationSize[0] = RESTORATION_TILESIZE_MAX >>
+    /// (2 - lr_unit_shift)`; the two chroma entries are that value
+    /// `>> lr_uv_shift`. All three are `0` on the short-circuit /
+    /// `!UsesLr` path (no size is signalled).
+    pub loop_restoration_size: [u32; 3],
+    /// Whether the §5.9.20 short-circuit (`AllLossless || allow_intrabc
+    /// || !enable_restoration`) fired and the parser returned without
+    /// reading any bits.
+    pub short_circuited: bool,
+}
+
+impl LrParams {
+    /// The §5.9.20 short-circuit-path output (no bits consumed): all
+    /// planes `RESTORE_NONE`, `UsesLr = 0`, shifts and sizes `0`.
+    #[must_use]
+    pub const fn short_circuit() -> Self {
+        Self {
+            frame_restoration_type: [FrameRestorationType::None; 3],
+            uses_lr: false,
+            uses_chroma_lr: false,
+            lr_unit_shift: 0,
+            lr_uv_shift: 0,
+            loop_restoration_size: [0; 3],
+            short_circuited: true,
+        }
+    }
+}
+
+/// Parse `lr_params()` per §5.9.20 from a raw byte slice.
+///
+/// `num_planes` is §5.5.2's `NumPlanes` derived value (1 for
+/// monochrome, otherwise 3). `subsampling_x` / `subsampling_y` are the
+/// §5.5.2 chroma-subsampling flags (both `true` for 4:2:0).
+/// `use_128x128_superblock` is the §5.5.1 sequence-header flag.
+/// `all_lossless`, `allow_intrabc`, and `enable_restoration` are the
+/// §5.9.2 / §5.5.1 flags that select the short-circuit path; standalone
+/// callers that want the full bitstream path can pass
+/// `all_lossless = false, allow_intrabc = false,
+/// enable_restoration = true`.
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+#[allow(clippy::too_many_arguments)]
+pub fn parse_lr_params(
+    payload: &[u8],
+    num_planes: u8,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    use_128x128_superblock: bool,
+    all_lossless: bool,
+    allow_intrabc: bool,
+    enable_restoration: bool,
+) -> Result<(LrParams, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let lr = read_lr_params(
+        &mut br,
+        num_planes,
+        subsampling_x,
+        subsampling_y,
+        use_128x128_superblock,
+        all_lossless,
+        allow_intrabc,
+        enable_restoration,
+    )?;
+    Ok((lr, br.position()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_lr_params(
+    br: &mut BitReader<'_>,
+    num_planes: u8,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    use_128x128_superblock: bool,
+    all_lossless: bool,
+    allow_intrabc: bool,
+    enable_restoration: bool,
+) -> Result<LrParams, Error> {
+    // §5.9.20 short-circuit: no bits read, all planes RESTORE_NONE.
+    if all_lossless || allow_intrabc || !enable_restoration {
+        return Ok(LrParams::short_circuit());
+    }
+
+    let mut frame_restoration_type = [FrameRestorationType::None; 3];
+    let mut uses_lr = false;
+    let mut uses_chroma_lr = false;
+
+    // §5.9.20: for ( i = 0; i < NumPlanes; i++ ).
+    for (i, slot) in frame_restoration_type
+        .iter_mut()
+        .enumerate()
+        .take(usize::from(num_planes))
+    {
+        let lr_type = br.f(2)? as u8;
+        let rtype = FrameRestorationType::remap(lr_type);
+        *slot = rtype;
+        if rtype != FrameRestorationType::None {
+            uses_lr = true;
+            if i > 0 {
+                uses_chroma_lr = true;
+            }
+        }
+    }
+
+    let mut lr_unit_shift = 0u8;
+    let mut lr_uv_shift = 0u8;
+    let mut loop_restoration_size = [0u32; 3];
+
+    if uses_lr {
+        // §5.9.20 lr_unit_shift derivation.
+        if use_128x128_superblock {
+            lr_unit_shift = br.f(1)? as u8;
+            lr_unit_shift += 1;
+        } else {
+            lr_unit_shift = br.f(1)? as u8;
+            if lr_unit_shift != 0 {
+                let lr_unit_extra_shift = br.f(1)? as u8;
+                lr_unit_shift += lr_unit_extra_shift;
+            }
+        }
+
+        // §5.9.20: LoopRestorationSize[0] =
+        //   RESTORATION_TILESIZE_MAX >> (2 - lr_unit_shift).
+        // lr_unit_shift is in 0..=2 here, so the shift amount is 0..=2.
+        loop_restoration_size[0] = RESTORATION_TILESIZE_MAX >> (2 - u32::from(lr_unit_shift));
+
+        // §5.9.20: lr_uv_shift only signalled for 4:2:0 chroma LR.
+        if subsampling_x && subsampling_y && uses_chroma_lr {
+            lr_uv_shift = br.f(1)? as u8;
+        } else {
+            lr_uv_shift = 0;
+        }
+
+        loop_restoration_size[1] = loop_restoration_size[0] >> u32::from(lr_uv_shift);
+        loop_restoration_size[2] = loop_restoration_size[0] >> u32::from(lr_uv_shift);
+    }
+
+    Ok(LrParams {
+        frame_restoration_type,
+        uses_lr,
+        uses_chroma_lr,
+        lr_unit_shift,
+        lr_uv_shift,
+        loop_restoration_size,
         short_circuited: false,
     })
 }
@@ -1888,6 +2143,370 @@ mod tests {
         // errors.
         let payload: [u8; 0] = [];
         let err = parse_cdef_params(&payload, 3, false, false, true).expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.20 lr_params
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn lr_remap_table_matches_spec() {
+        // Remap_Lr_Type[4] = { NONE, SWITCHABLE, WIENER, SGRPROJ }.
+        assert_eq!(FrameRestorationType::remap(0), FrameRestorationType::None);
+        assert_eq!(
+            FrameRestorationType::remap(1),
+            FrameRestorationType::Switchable
+        );
+        assert_eq!(FrameRestorationType::remap(2), FrameRestorationType::Wiener);
+        assert_eq!(
+            FrameRestorationType::remap(3),
+            FrameRestorationType::SgrProj
+        );
+        // §6.10.15 FrameRestorationType symbol values.
+        assert_eq!(FrameRestorationType::None.as_u8(), 0);
+        assert_eq!(FrameRestorationType::Wiener.as_u8(), 1);
+        assert_eq!(FrameRestorationType::SgrProj.as_u8(), 2);
+        assert_eq!(FrameRestorationType::Switchable.as_u8(), 3);
+    }
+
+    #[test]
+    fn lr_short_circuit_all_lossless() {
+        // AllLossless ⇒ short-circuit, no bits read.
+        let payload: [u8; 0] = [];
+        let (lr, n) =
+            parse_lr_params(&payload, 3, true, true, false, true, false, true).expect("decodes");
+        assert!(lr.short_circuited);
+        assert!(!lr.uses_lr);
+        assert!(!lr.uses_chroma_lr);
+        assert_eq!(lr.frame_restoration_type, [FrameRestorationType::None; 3]);
+        assert_eq!(lr.lr_unit_shift, 0);
+        assert_eq!(lr.lr_uv_shift, 0);
+        assert_eq!(lr.loop_restoration_size, [0; 3]);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lr_short_circuit_allow_intrabc() {
+        // allow_intrabc ⇒ short-circuit even when lossless clear.
+        let payload: [u8; 0] = [];
+        let (lr, n) =
+            parse_lr_params(&payload, 3, true, true, false, false, true, true).expect("decodes");
+        assert!(lr.short_circuited);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lr_short_circuit_enable_restoration_off() {
+        // !enable_restoration ⇒ short-circuit even when lossless/intrabc
+        // clear. Matches the `screen-content-tools` / lossless fixtures
+        // whose LR trace is all-zero.
+        let payload: [u8; 0] = [];
+        let (lr, n) =
+            parse_lr_params(&payload, 3, true, true, false, false, false, false).expect("decodes");
+        assert!(lr.short_circuited);
+        assert!(!lr.uses_lr);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lr_uses_lr_zero_reads_only_three_types() {
+        // num_planes=3, all lr_type = 0 (NONE) ⇒ UsesLr = 0, no shift
+        // bits read. Six bits consumed (3 * f(2)).
+        let payload = pack_bits(&[
+            0, 0, // plane 0 lr_type = 0
+            0, 0, // plane 1 lr_type = 0
+            0, 0, // plane 2 lr_type = 0
+        ]);
+        let (lr, n) =
+            parse_lr_params(&payload, 3, true, true, false, false, false, true).expect("decodes");
+        assert!(!lr.short_circuited);
+        assert!(!lr.uses_lr);
+        assert!(!lr.uses_chroma_lr);
+        assert_eq!(lr.frame_restoration_type, [FrameRestorationType::None; 3]);
+        assert_eq!(lr.lr_unit_shift, 0);
+        assert_eq!(lr.loop_restoration_size, [0; 3]);
+        // 3 planes * f(2) = 6 bits read (position is in bits).
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn lr_luma_only_non128_shift_zero() {
+        // num_planes=3, plane0 = WIENER (lr_type=2), planes 1/2 = NONE.
+        // UsesLr=1, usesChromaLr=0 (only luma). Non-128 SB:
+        //   lr_unit_shift bit = 0 ⇒ shift stays 0, no extra bit.
+        // usesChromaLr=0 ⇒ no lr_uv_shift bit.
+        let payload = pack_bits(&[
+            1, 0, // plane 0 lr_type = 2 (WIENER)
+            0, 0, // plane 1 lr_type = 0 (NONE)
+            0, 0, // plane 2 lr_type = 0 (NONE)
+            0, // lr_unit_shift = 0
+        ]);
+        let (lr, n) =
+            parse_lr_params(&payload, 3, true, true, false, false, false, true).expect("decodes");
+        assert!(lr.uses_lr);
+        assert!(!lr.uses_chroma_lr);
+        assert_eq!(lr.frame_restoration_type[0], FrameRestorationType::Wiener);
+        assert_eq!(lr.frame_restoration_type[1], FrameRestorationType::None);
+        assert_eq!(lr.frame_restoration_type[2], FrameRestorationType::None);
+        assert_eq!(lr.lr_unit_shift, 0);
+        assert_eq!(lr.lr_uv_shift, 0);
+        // LoopRestorationSize[0] = 256 >> (2 - 0) = 64.
+        assert_eq!(lr.loop_restoration_size[0], 64);
+        assert_eq!(lr.loop_restoration_size[1], 64);
+        assert_eq!(lr.loop_restoration_size[2], 64);
+        // 6 (types) + 1 (unit_shift) = 7 bits read (position in bits).
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn lr_non128_unit_shift_one_plus_extra() {
+        // Non-128 SB, lr_unit_shift bit = 1 ⇒ read lr_unit_extra_shift.
+        // extra = 1 ⇒ lr_unit_shift = 1 + 1 = 2.
+        // plane0 = SGRPROJ (lr_type=3), rest NONE. usesChromaLr=0.
+        let payload = pack_bits(&[
+            1, 1, // plane 0 lr_type = 3 (SGRPROJ)
+            0, 0, // plane 1 NONE
+            0, 0, // plane 2 NONE
+            1, // lr_unit_shift bit = 1
+            1, // lr_unit_extra_shift = 1
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, true, false, false, false, true).expect("decodes");
+        assert!(lr.uses_lr);
+        assert_eq!(lr.frame_restoration_type[0], FrameRestorationType::SgrProj);
+        assert_eq!(lr.lr_unit_shift, 2);
+        // LoopRestorationSize[0] = 256 >> (2 - 2) = 256.
+        assert_eq!(lr.loop_restoration_size[0], 256);
+        assert_eq!(lr.loop_restoration_size[1], 256);
+    }
+
+    #[test]
+    fn lr_non128_unit_shift_one_extra_zero() {
+        // Non-128 SB, lr_unit_shift bit = 1, extra = 0 ⇒ shift = 1.
+        let payload = pack_bits(&[
+            1, 0, // plane 0 WIENER
+            0, 0, 0, 0, // planes 1/2 NONE
+            1, // lr_unit_shift bit = 1
+            0, // lr_unit_extra_shift = 0
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, true, false, false, false, true).expect("decodes");
+        assert_eq!(lr.lr_unit_shift, 1);
+        // LoopRestorationSize[0] = 256 >> (2 - 1) = 128.
+        assert_eq!(lr.loop_restoration_size[0], 128);
+    }
+
+    #[test]
+    fn lr_128_superblock_post_increment() {
+        // use_128x128_superblock ⇒ lr_unit_shift = read_bit + 1, no
+        // extra bit. bit = 1 ⇒ shift = 2. Mirrors the superblocks-128
+        // fixture (unit_shift=2). plane0 = SWITCHABLE (lr_type=1).
+        let payload = pack_bits(&[
+            0, 1, // plane 0 lr_type = 1 (SWITCHABLE)
+            0, 0, 0, 0, // planes 1/2 NONE
+            1, // lr_unit_shift bit (post-incremented to 2)
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, true, true, false, false, true).expect("decodes");
+        assert_eq!(
+            lr.frame_restoration_type[0],
+            FrameRestorationType::Switchable
+        );
+        assert!(lr.uses_lr);
+        assert!(!lr.uses_chroma_lr);
+        assert_eq!(lr.lr_unit_shift, 2);
+        assert_eq!(lr.loop_restoration_size[0], 256);
+    }
+
+    #[test]
+    fn lr_128_superblock_bit_zero_gives_shift_one() {
+        // use_128x128_superblock, bit = 0 ⇒ shift = 0 + 1 = 1.
+        let payload = pack_bits(&[
+            1, 0, // plane 0 WIENER
+            0, 0, 0, 0, // planes 1/2 NONE
+            0, // lr_unit_shift bit ⇒ +1 = 1
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, true, true, false, false, true).expect("decodes");
+        assert_eq!(lr.lr_unit_shift, 1);
+        assert_eq!(lr.loop_restoration_size[0], 128);
+    }
+
+    #[test]
+    fn lr_chroma_lr_420_reads_uv_shift() {
+        // plane2 (V) = SGRPROJ ⇒ usesChromaLr=1. 4:2:0
+        // (subsampling_x && subsampling_y) ⇒ read lr_uv_shift.
+        // Mirrors i-only-64x64-prof0 (v_type=2, unit_shift=2,
+        // uv_shift=0), 128 SB.
+        let payload = pack_bits(&[
+            0, 0, // plane 0 NONE
+            0, 0, // plane 1 NONE
+            1, 0, // plane 2 lr_type = 2 (WIENER) ⇒ chroma LR
+            1, // 128 SB lr_unit_shift bit ⇒ shift = 2
+            0, // lr_uv_shift = 0
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, true, true, false, false, true).expect("decodes");
+        assert!(lr.uses_lr);
+        assert!(lr.uses_chroma_lr);
+        assert_eq!(lr.frame_restoration_type[2], FrameRestorationType::Wiener);
+        assert_eq!(lr.lr_unit_shift, 2);
+        assert_eq!(lr.lr_uv_shift, 0);
+        assert_eq!(lr.loop_restoration_size[0], 256);
+        assert_eq!(lr.loop_restoration_size[1], 256);
+        assert_eq!(lr.loop_restoration_size[2], 256);
+    }
+
+    #[test]
+    fn lr_chroma_lr_420_uv_shift_one_halves_chroma() {
+        // 4:2:0 chroma LR, lr_uv_shift = 1 ⇒ chroma sizes halved.
+        let payload = pack_bits(&[
+            0, 0, // plane 0 NONE
+            1, 0, // plane 1 lr_type = 2 (WIENER) ⇒ chroma LR
+            0, 0, // plane 2 NONE
+            1, // 128 SB lr_unit_shift bit ⇒ shift = 2
+            1, // lr_uv_shift = 1
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, true, true, false, false, true).expect("decodes");
+        assert!(lr.uses_chroma_lr);
+        assert_eq!(lr.lr_uv_shift, 1);
+        // LoopRestorationSize[0] = 256; chroma = 256 >> 1 = 128.
+        assert_eq!(lr.loop_restoration_size[0], 256);
+        assert_eq!(lr.loop_restoration_size[1], 128);
+        assert_eq!(lr.loop_restoration_size[2], 128);
+    }
+
+    #[test]
+    fn lr_chroma_lr_non420_skips_uv_shift() {
+        // 4:4:4 (subsampling_x=0, subsampling_y=0) with chroma LR ⇒ the
+        // lr_uv_shift read is gated off; lr_uv_shift = 0 and no bit
+        // consumed beyond lr_unit_shift.
+        let payload = pack_bits(&[
+            0, 0, // plane 0 NONE
+            1, 0, // plane 1 WIENER ⇒ chroma LR
+            0, 0, // plane 2 NONE
+            1, // 128 SB lr_unit_shift bit ⇒ shift = 2
+        ]);
+        let (lr, n) =
+            parse_lr_params(&payload, 3, false, false, true, false, false, true).expect("decodes");
+        assert!(lr.uses_chroma_lr);
+        assert_eq!(lr.lr_uv_shift, 0);
+        // 6 (types) + 1 (unit_shift) = 7 bits, no uv_shift bit
+        // (position in bits).
+        assert_eq!(n, 7);
+        assert_eq!(lr.loop_restoration_size[1], lr.loop_restoration_size[0]);
+    }
+
+    #[test]
+    fn lr_chroma_lr_422_skips_uv_shift() {
+        // 4:2:2 (subsampling_x=1, subsampling_y=0): the spec gates
+        // lr_uv_shift on subsampling_x && subsampling_y, so 4:2:2 skips
+        // it even with chroma LR.
+        let payload = pack_bits(&[
+            0, 0, // plane 0 NONE
+            0, 0, // plane 1 NONE
+            1, 0, // plane 2 WIENER ⇒ chroma LR
+            1, // 128 SB lr_unit_shift bit ⇒ shift = 2
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, false, true, false, false, true).expect("decodes");
+        assert!(lr.uses_chroma_lr);
+        assert_eq!(lr.lr_uv_shift, 0);
+    }
+
+    #[test]
+    fn lr_monochrome_reads_one_type_only() {
+        // num_planes=1 (monochrome): only plane 0 lr_type read.
+        // plane0 = WIENER ⇒ UsesLr=1, usesChromaLr=0 (no i>0 planes).
+        // Non-128 SB, lr_unit_shift bit = 0.
+        let payload = pack_bits(&[
+            1, 0, // plane 0 lr_type = 2 (WIENER)
+            0, // lr_unit_shift = 0
+        ]);
+        let (lr, n) =
+            parse_lr_params(&payload, 1, true, true, false, false, false, true).expect("decodes");
+        assert!(lr.uses_lr);
+        assert!(!lr.uses_chroma_lr);
+        assert_eq!(lr.frame_restoration_type[0], FrameRestorationType::Wiener);
+        // Planes 1/2 left at default NONE (never read).
+        assert_eq!(lr.frame_restoration_type[1], FrameRestorationType::None);
+        assert_eq!(lr.frame_restoration_type[2], FrameRestorationType::None);
+        assert_eq!(lr.lr_uv_shift, 0);
+        // 1 (type) * f(2) + 1 (unit_shift) = 3 bits (position in bits).
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn lr_all_planes_distinct_types() {
+        // y=SWITCHABLE(1), u=WIENER(2), v=SGRPROJ(3). UsesLr=1,
+        // usesChromaLr=1. Non-128 SB, shift bit = 0, 4:2:0 ⇒ uv_shift.
+        let payload = pack_bits(&[
+            0, 1, // plane 0 lr_type = 1 (SWITCHABLE)
+            1, 0, // plane 1 lr_type = 2 (WIENER)
+            1, 1, // plane 2 lr_type = 3 (SGRPROJ)
+            0, // lr_unit_shift = 0
+            0, // lr_uv_shift = 0
+        ]);
+        let (lr, _n) =
+            parse_lr_params(&payload, 3, true, true, false, false, false, true).expect("decodes");
+        assert_eq!(
+            lr.frame_restoration_type[0],
+            FrameRestorationType::Switchable
+        );
+        assert_eq!(lr.frame_restoration_type[1], FrameRestorationType::Wiener);
+        assert_eq!(lr.frame_restoration_type[2], FrameRestorationType::SgrProj);
+        assert!(lr.uses_lr);
+        assert!(lr.uses_chroma_lr);
+        assert_eq!(lr.lr_unit_shift, 0);
+        // 256 >> (2 - 0) = 64.
+        assert_eq!(lr.loop_restoration_size[0], 64);
+    }
+
+    #[test]
+    fn lr_full_path_unexpected_end() {
+        // Full path but empty payload ⇒ reading the first lr_type errors.
+        let payload: [u8; 0] = [];
+        let err = parse_lr_params(&payload, 3, true, true, false, false, false, true)
+            .expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    #[test]
+    fn lr_unexpected_end_at_unit_shift() {
+        // num_planes=8 worth of demand isn't valid, but a 12-bit demand
+        // against an 8-bit buffer forces the shift read off the end:
+        // three planes (6 type bits) where plane0 = WIENER (UsesLr=1)
+        // fill bits 0..5, then a non-128-SB lr_unit_shift bit = 1 at
+        // bit 6 triggers lr_unit_extra_shift at bit 7, and finally the
+        // lr_uv_shift read for 4:2:0 chroma LR needs bit 8 — which lies
+        // in a second byte the 1-byte buffer doesn't provide.
+        //
+        // plane0 = WIENER(2), plane1 = NONE, plane2 = WIENER(2)
+        // ⇒ usesChromaLr=1. unit_shift bit=1, extra=1 ⇒ shift fully read
+        // by bit 7; lr_uv_shift then demands bit 8 ⇒ UnexpectedEnd.
+        let payload = pack_bits(&[
+            1, 0, // plane 0 lr_type = 2 (WIENER)
+            0, 0, // plane 1 NONE
+            1, 0, // plane 2 lr_type = 2 (WIENER) ⇒ chroma LR
+            1, // bit 6 lr_unit_shift = 1
+            1, // bit 7 lr_unit_extra_shift = 1
+               // lr_uv_shift would be bit 8 (second byte) — absent.
+        ]);
+        // payload is exactly 8 meaningful bits = 1 byte. The lr_uv_shift
+        // read needs a 9th bit.
+        let err = parse_lr_params(&payload, 3, true, true, false, false, false, true)
+            .expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    #[test]
+    fn lr_unexpected_end_at_first_type() {
+        // Empty payload, full path ⇒ reading the first lr_type errors.
+        let empty: [u8; 0] = [];
+        let err = parse_lr_params(&empty, 1, false, false, false, false, false, true)
+            .expect_err("must err");
         assert_eq!(err, Error::UnexpectedEnd);
     }
 }
