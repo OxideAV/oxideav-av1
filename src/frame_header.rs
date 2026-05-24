@@ -128,10 +128,12 @@ use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CO
 use crate::tile_info::{read_tile_info, TileInfo};
 use crate::uncompressed_header_tail::{
     prev_gm_params_default, read_cdef_params, read_delta_lf_params, read_delta_q_params,
-    read_film_grain_params, read_global_motion_params, read_loop_filter_params, read_lr_params,
-    read_quantization_params, read_segmentation_params, read_tx_mode, CdefParams, DeltaLfParams,
-    DeltaQParams, FilmGrainContext, FilmGrainParams, GlobalMotionParams, LoopFilterParams,
-    LrParams, QuantizationParams, SegmentationParams, TxMode, MAX_SEGMENTS, SEG_LVL_ALT_Q,
+    read_film_grain_params, read_global_motion_params, read_interpolation_filter,
+    read_loop_filter_params, read_lr_params, read_quantization_params, read_segmentation_params,
+    read_tx_mode, CdefParams, DeltaLfParams, DeltaQParams, FilmGrainContext, FilmGrainParams,
+    GlobalMotionParams, InterpolationFilter, LoopFilterParams, LrParams, QuantizationParams,
+    SegmentationParams, TxMode, ALTREF_FRAME, LAST_FRAME, MAX_SEGMENTS, REFS_PER_FRAME,
+    SEG_LVL_ALT_Q,
 };
 use crate::Error;
 
@@ -161,6 +163,17 @@ pub const SUPERRES_DENOM_MIN: u32 = 9;
 /// `SUPERRES_DENOM_BITS` (§3): bit width of the `coded_denom` field
 /// when `use_superres == 1` (§5.9.8).
 pub const SUPERRES_DENOM_BITS: u32 = 3;
+
+// §3 reference-frame index symbols (the values RefFrame[0] takes per the
+// §6.10.X table: LAST_FRAME=1 .. ALTREF_FRAME=7). `ref_frame_idx[]` is
+// indexed by `refFrame - LAST_FRAME`, i.e. 0..=6, so each symbol below
+// maps to slot `<SYMBOL> - LAST_FRAME` in the array. Used by §7.8
+// `set_frame_refs()`.
+const LAST2_FRAME: usize = 2;
+const LAST3_FRAME: usize = 3;
+const GOLDEN_FRAME: usize = 4;
+const BWDREF_FRAME: usize = 5;
+const ALTREF2_FRAME: usize = 6;
 
 // ---------------------------------------------------------------------
 // FrameType (§6.8.2)
@@ -284,6 +297,112 @@ impl FrameSize {
     pub fn is_super_resolved(&self) -> bool {
         self.use_superres && self.frame_width != self.upscaled_width
     }
+}
+
+// ---------------------------------------------------------------------
+// RefInfo (cross-frame reference state)
+// ---------------------------------------------------------------------
+
+/// Minimal cross-frame reference-buffer state the inter-frame path of
+/// `uncompressed_header()` (§5.9.2) reads from.
+///
+/// Each array is indexed by a reference-frame **slot** number
+/// (`0..NUM_REF_FRAMES`), exactly as the spec's `RefValid[]` /
+/// `RefOrderHint[]` / `RefFrameId[]` and the per-frame dimension arrays
+/// (`RefUpscaledWidth[]` / `RefFrameHeight[]` / `RefRenderWidth[]` /
+/// `RefRenderHeight[]`) are. A decoder session maintains these across
+/// frames via the §7.20 reference frame update process — that process
+/// is out of scope here; this round only *consumes* the state so an
+/// inter `uncompressed_header()` can be parsed end-to-end.
+///
+/// The fields the parser actually touches this round:
+///
+///   * `order_hint[]` — used by §7.8 `set_frame_refs()`
+///     (`shiftedOrderHints[]`) and the `OrderHints[refFrame]` /
+///     `RefFrameSignBias[]` derivations that follow the size block.
+///   * `upscaled_width[]` / `frame_height[]` / `render_width[]` /
+///     `render_height[]` — used by §5.9.7 `frame_size_with_refs()` on
+///     the `found_ref == 1` branch.
+///   * `valid[]` / `frame_id[]` — used by the conformance constraints
+///     (`RefValid[ref_frame_idx[i]] == 1`, the `expectedFrameId[]`
+///     match) and the §5.9.2 `ref_order_hint` walk; surfaced so a
+///     session-aware caller can seed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefInfo {
+    /// `RefValid[i]` — `true` when slot `i` holds a decoded frame
+    /// available for reference.
+    pub valid: [bool; NUM_REF_FRAMES as usize],
+    /// `RefOrderHint[i]` — the stored `order_hint` of the frame in
+    /// slot `i` (the least-significant `OrderHintBits` of its expected
+    /// output order).
+    pub order_hint: [u32; NUM_REF_FRAMES as usize],
+    /// `RefFrameId[i]` — the stored `current_frame_id` of the frame in
+    /// slot `i` (only meaningful when `frame_id_numbers_present_flag`).
+    pub frame_id: [u32; NUM_REF_FRAMES as usize],
+    /// `RefUpscaledWidth[i]` — the stored `UpscaledWidth` of slot `i`.
+    pub upscaled_width: [u32; NUM_REF_FRAMES as usize],
+    /// `RefFrameHeight[i]` — the stored `FrameHeight` of slot `i`.
+    pub frame_height: [u32; NUM_REF_FRAMES as usize],
+    /// `RefRenderWidth[i]` — the stored `RenderWidth` of slot `i`.
+    pub render_width: [u32; NUM_REF_FRAMES as usize],
+    /// `RefRenderHeight[i]` — the stored `RenderHeight` of slot `i`.
+    pub render_height: [u32; NUM_REF_FRAMES as usize],
+}
+
+impl Default for RefInfo {
+    /// All slots invalid with zeroed hints / ids / dimensions — the
+    /// state immediately after a `(KEY_FRAME && show_frame)` frame
+    /// resets every slot per the §5.9.2 `RefValid[i] = 0;
+    /// RefOrderHint[i] = 0` loop, *before* the §7.20 update stores the
+    /// just-decoded frame.
+    fn default() -> Self {
+        Self {
+            valid: [false; NUM_REF_FRAMES as usize],
+            order_hint: [0; NUM_REF_FRAMES as usize],
+            frame_id: [0; NUM_REF_FRAMES as usize],
+            upscaled_width: [0; NUM_REF_FRAMES as usize],
+            frame_height: [0; NUM_REF_FRAMES as usize],
+            render_width: [0; NUM_REF_FRAMES as usize],
+            render_height: [0; NUM_REF_FRAMES as usize],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// InterFrameRefs (§5.9.2 inter-frame reference signaling)
+// ---------------------------------------------------------------------
+
+/// Reference-frame signaling read on the **inter** branch of §5.9.2,
+/// surfaced on [`FrameHeader::inter_refs`] for inter frames (and `None`
+/// for intra / show-existing-frame headers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterFrameRefs {
+    /// `frame_refs_short_signaling` (§5.9.2). `false` when
+    /// `enable_order_hint == 0` (no bit read). When `true`,
+    /// `ref_frame_idx[]` is *computed* by §7.8 `set_frame_refs()` from
+    /// `last_frame_idx` / `gold_frame_idx` rather than signaled.
+    pub frame_refs_short_signaling: bool,
+    /// `last_frame_idx` (§5.9.2) — present only when
+    /// `frame_refs_short_signaling == 1`.
+    pub last_frame_idx: Option<u8>,
+    /// `gold_frame_idx` (§5.9.2) — present only when
+    /// `frame_refs_short_signaling == 1`.
+    pub gold_frame_idx: Option<u8>,
+    /// `ref_frame_idx[i]` for `i = 0..REFS_PER_FRAME` — the slot index
+    /// each of the seven inter references (LAST..ALTREF) reads from.
+    /// Either signaled explicitly (`f(3)` each) or computed by §7.8.
+    pub ref_frame_idx: [u8; REFS_PER_FRAME],
+    /// `allow_high_precision_mv` (§5.9.2). `false` (no bit) when
+    /// `force_integer_mv == 1`; otherwise the read `f(1)`.
+    pub allow_high_precision_mv: bool,
+    /// `interpolation_filter` (§5.9.10 `read_interpolation_filter()`).
+    pub interpolation_filter: InterpolationFilter,
+    /// `is_motion_mode_switchable` (§5.9.2 `f(1)`).
+    pub is_motion_mode_switchable: bool,
+    /// `use_ref_frame_mvs` (§5.9.2). `false` (no bit) when
+    /// `error_resilient_mode || !enable_ref_frame_mvs`; otherwise the
+    /// read `f(1)`.
+    pub use_ref_frame_mvs: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -472,6 +591,12 @@ pub struct FrameHeader {
     /// (`!film_grain_params_present`, hidden frame, or `apply_grain ==
     /// 0`) all yield the `reset_grain_params()` defaults.
     pub film_grain_params: Option<FilmGrainParams>,
+    /// Inter-frame reference signaling (§5.9.2 inter branch + §5.9.7 +
+    /// §5.9.10). `Some` for inter / switch frames whose
+    /// `uncompressed_header()` parses end-to-end; `None` for intra /
+    /// show-existing-frame headers (which have no inter reference
+    /// block).
+    pub inter_refs: Option<InterFrameRefs>,
     /// Total bits consumed from `payload` by this parse. For intra
     /// frames this now reaches the end of `uncompressed_header()`
     /// (`film_grain_params()`); inter / show-existing paths stop early
@@ -510,21 +635,45 @@ pub struct FrameHeader {
 ///     hitting this path; bitstreams that enable a decoder model
 ///     plus variable picture interval will be picked up in a future
 ///     round alongside §5.9.31.
-///   * [`Error::RefOrderHintWalkUnsupported`] — the §5.9.2
-///     `if (!FrameIsIntra || refresh_frame_flags != allFrames) {
-///     if (error_resilient_mode && enable_order_hint) { ... } }`
-///     ref_order_hint walk requires a `RefOrderHint[]` /
-///     `RefValid[]` session state that isn't tracked yet.
 ///   * [`Error::InvalidIdLen`] — §6.8.2 conformance:
 ///     `idLen <= 16` (the constraint stated alongside
 ///     `display_frame_id`); we surface the violation here rather than
 ///     silently reading >16 bits.
+///
+/// This entry point seeds the cross-frame reference state with
+/// [`RefInfo::default`] (every slot invalid, hints / dimensions
+/// zeroed). For an inter frame that uses `set_frame_refs()` or
+/// `frame_size_with_refs()` against real reference dimensions, use
+/// [`parse_frame_header_with_refs`] and pass the session's [`RefInfo`].
 pub fn parse_frame_header(payload: &[u8], seq: &SequenceHeader) -> Result<FrameHeader, Error> {
     let mut br = BitReader::new(payload);
-    parse_with(&mut br, seq)
+    parse_with(&mut br, seq, &RefInfo::default())
 }
 
-fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeader, Error> {
+/// Parse `uncompressed_header()` (§5.9.2) against an explicit
+/// cross-frame reference state.
+///
+/// Identical to [`parse_frame_header`] except the inter-frame path
+/// resolves `set_frame_refs()` (§7.8), `frame_size_with_refs()`
+/// (§5.9.7), and the `OrderHints[]` / `RefFrameSignBias[]`
+/// derivations against the supplied `ref_info` (the decoder session's
+/// `RefValid[]` / `RefOrderHint[]` / `RefFrameId[]` plus per-slot
+/// `RefUpscaledWidth[]` / `RefFrameHeight[]` / `RefRenderWidth[]` /
+/// `RefRenderHeight[]` arrays).
+pub fn parse_frame_header_with_refs(
+    payload: &[u8],
+    seq: &SequenceHeader,
+    ref_info: &RefInfo,
+) -> Result<FrameHeader, Error> {
+    let mut br = BitReader::new(payload);
+    parse_with(&mut br, seq, ref_info)
+}
+
+fn parse_with(
+    br: &mut BitReader<'_>,
+    seq: &SequenceHeader,
+    ref_info: &RefInfo,
+) -> Result<FrameHeader, Error> {
     // §5.9.2 idLen derivation (only valid when frame_id_numbers_present_flag).
     let id_len: u32 = if seq.frame_id_numbers_present_flag {
         u32::from(seq.additional_frame_id_length_minus_1)
@@ -695,6 +844,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             reduced_tx_set: Some(reduced_tx_set),
             global_motion_params: Some(global_motion_params),
             film_grain_params: Some(film_grain_params),
+            inter_refs: None,
             bits_consumed: br.position(),
         });
     }
@@ -760,6 +910,7 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             reduced_tx_set: None,
             global_motion_params: None,
             film_grain_params: None,
+            inter_refs: None,
             bits_consumed: br.position(),
         });
     }
@@ -849,33 +1000,39 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
     // — the ref_order_hint block only fires when the frame is inter
     // OR when an intra frame leaves some ref slots intact. For an
     // intra frame the inner gate further requires
-    // `error_resilient_mode && enable_order_hint`. Every fixture's
-    // intra frame in the corpus has `refresh_frame_flags == 0xff`
-    // (which is `allFrames`), so the block is skipped in practice
-    // and we don't have to model the `ref_order_hint[i] !=
-    // RefOrderHint[i] => RefValid[i] = 0` derivation yet. We refuse
-    // to descend into a path we haven't modelled.
+    // `error_resilient_mode && enable_order_hint`. When taken it reads
+    // `NUM_REF_FRAMES` `ref_order_hint[i]` values of `OrderHintBits`
+    // each and invalidates any slot whose stored hint no longer
+    // matches. Every fixture's intra frame has
+    // `refresh_frame_flags == 0xff` (= `allFrames`) and the lone inter
+    // fixture has `error_resilient_mode == 0`, so this block reads zero
+    // bits in the current corpus; it is modelled so error-resilient
+    // inter streams parse correctly. The spec's `RefValid[i] = 0`
+    // invalidation on a hint mismatch is a conformance / session-state
+    // update with no effect on the bit position or on the parses below
+    // (§7.8 `set_frame_refs()` keys off `RefOrderHint[]`, not
+    // `RefValid[]`), so we read the bits and leave the session's
+    // `ref_info` untouched here.
     if (!frame_is_intra || refresh_frame_flags != ALL_FRAMES)
         && error_resilient_mode
         && seq.enable_order_hint
     {
-        // Reading NUM_REF_FRAMES * order_hint_bits bits without
-        // tracking the resulting RefValid[] / RefOrderHint[] updates
-        // would lose information needed by later round's inter-frame
-        // reference resolution. Surface as an unsupported path until
-        // ref-frame state lands.
-        return Err(Error::RefOrderHintWalkUnsupported);
+        for _ in 0..NUM_REF_FRAMES as usize {
+            let _ref_order_hint = br.f(u32::from(seq.order_hint_bits))?;
+        }
     }
 
     // §5.9.2: the size block. For intra frames we always go through
-    // frame_size() + render_size() (and the no-superres / non-ref
-    // path is exactly what `parse_frame_size_block` handles). For
-    // inter frames the spec walks `frame_refs_short_signaling`,
-    // `ref_frame_idx[]`, and then conditionally calls
-    // `frame_size_with_refs()` or `frame_size()`+`render_size()` —
-    // none of which can be modelled without the ref-frame state.
-    // Return early with `frame_size: None` and stop bit accounting
-    // at `refresh_frame_flags`.
+    // frame_size() + render_size() (the no-superres / non-ref path is
+    // exactly what `parse_frame_size_block` handles). For inter frames
+    // the spec walks `frame_refs_short_signaling`, `ref_frame_idx[]`,
+    // and then conditionally calls `frame_size_with_refs()` or
+    // `frame_size()`+`render_size()`, followed by the inter-only
+    // `allow_high_precision_mv` / `read_interpolation_filter()` /
+    // `is_motion_mode_switchable` / `use_ref_frame_mvs` block. Both
+    // paths converge on `disable_frame_end_update_cdf` + the shared
+    // tile/quant/segment/.../film-grain tail.
+    let mut inter_refs: Option<InterFrameRefs> = None;
     let (
         frame_size,
         allow_intrabc,
@@ -994,9 +1151,208 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             Some(fg),
         )
     } else {
+        // -------------------------------------------------------------
+        // Inter / switch frame path (§5.9.2 `else` of `if (FrameIsIntra)`).
+        // -------------------------------------------------------------
+
+        // §5.9.2 frame_refs_short_signaling + ref_frame_idx[].
+        let frame_refs_short_signaling = if seq.enable_order_hint {
+            br.f(1)? == 1
+        } else {
+            false
+        };
+        let (short_last, short_gold, mut ref_frame_idx) = if frame_refs_short_signaling {
+            let last_frame_idx = br.f(3)? as u8;
+            let gold_frame_idx = br.f(3)? as u8;
+            // §7.8 set_frame_refs() computes ref_frame_idx[] from
+            // last_frame_idx / gold_frame_idx + RefOrderHint[].
+            let computed = set_frame_refs(
+                last_frame_idx,
+                gold_frame_idx,
+                order_hint,
+                seq.order_hint_bits,
+                seq.enable_order_hint,
+                &ref_info.order_hint,
+            );
+            (Some(last_frame_idx), Some(gold_frame_idx), computed)
+        } else {
+            (None, None, [0u8; REFS_PER_FRAME])
+        };
+
+        for entry in ref_frame_idx.iter_mut().take(REFS_PER_FRAME) {
+            if !frame_refs_short_signaling {
+                *entry = br.f(3)? as u8;
+            }
+            // §5.9.2: when frame_id_numbers_present_flag the
+            // delta_frame_id_minus_1 / expectedFrameId[] block reads
+            // `delta_frame_id_length_minus_2 + 2` bits per ref. No
+            // fixture in the corpus enables frame ids, but model it so
+            // such streams parse.
+            if seq.frame_id_numbers_present_flag {
+                let n = u32::from(seq.delta_frame_id_length_minus_2) + 2;
+                let _delta_frame_id_minus_1 = br.f(n)?;
+            }
+        }
+
+        // §5.9.2: frame_size_with_refs() when the size is overridden and
+        // the frame isn't error-resilient; otherwise frame_size() +
+        // render_size().
+        let fs = if frame_size_override_flag && !error_resilient_mode {
+            read_frame_size_with_refs(br, seq, frame_size_override_flag, &ref_frame_idx, ref_info)?
+        } else {
+            parse_frame_size_block(br, seq, frame_size_override_flag)?
+        };
+
+        // §5.9.2: allow_high_precision_mv.
+        let allow_high_precision_mv = if force_integer_mv {
+            false
+        } else {
+            br.f(1)? == 1
+        };
+
+        // §5.9.10 read_interpolation_filter().
+        let interpolation_filter = read_interpolation_filter(br)?;
+
+        // §5.9.2: is_motion_mode_switchable.
+        let is_motion_mode_switchable = br.f(1)? == 1;
+
+        // §5.9.2: use_ref_frame_mvs.
+        let use_ref_frame_mvs = if error_resilient_mode || !seq.enable_ref_frame_mvs {
+            false
+        } else {
+            br.f(1)? == 1
+        };
+
+        // §5.9.2 OrderHints[] / RefFrameSignBias[] derivation reads no
+        // bits (it consults RefOrderHint[ ref_frame_idx[i] ]). We don't
+        // surface the per-ref sign-bias array this round; the size-block
+        // and motion-precision fields above are what the inter path
+        // needs to keep parsing.
+
+        // §5.9.2: disable_frame_end_update_cdf — read as `f(1)` unless
+        // `reduced_still_picture_header || disable_cdf_update`. The
+        // reduced-still path returned earlier, so only disable_cdf_update
+        // matters here.
+        let dfeuc = if disable_cdf_update {
+            true
+        } else {
+            br.f(1)? == 1
+        };
+
+        // §5.9.2: tile_info() + quant/segment/delta tail (shared with
+        // the intra path, but `allow_intrabc` is always 0 for inter).
+        let aib = false;
+        let ti = read_tile_info(br, fs.mi_cols, fs.mi_rows, seq.use_128x128_superblock)?;
+        let qp = read_quantization_params(
+            br,
+            seq.color_config.num_planes,
+            seq.color_config.separate_uv_delta_q,
+        )?;
+        let sp = read_segmentation_params(br, primary_ref_frame)?;
+        let dq = read_delta_q_params(br, qp.base_q_idx)?;
+        let dlf = read_delta_lf_params(br, dq.delta_q_present, aib)?;
+        let coded_lossless = compute_coded_lossless(&qp, &sp);
+        let lf = read_loop_filter_params(br, seq.color_config.num_planes, coded_lossless, aib)?;
+        let cdef = read_cdef_params(
+            br,
+            seq.color_config.num_planes,
+            coded_lossless,
+            aib,
+            seq.enable_cdef,
+        )?;
+        let all_lossless = coded_lossless && fs.frame_width == fs.upscaled_width;
+        let lr = read_lr_params(
+            br,
+            seq.color_config.num_planes,
+            seq.color_config.subsampling_x,
+            seq.color_config.subsampling_y,
+            seq.use_128x128_superblock,
+            all_lossless,
+            aib,
+            seq.enable_restoration,
+        )?;
+        let tx = read_tx_mode(br, coded_lossless)?;
+
+        // §5.9.23 frame_reference_mode() — inter frame reads
+        // reference_select `f(1)`.
+        let reference_select = br.f(1)? == 1;
+        // §5.9.22 skip_mode_params(). skipModeAllowed requires
+        // reference_select && enable_order_hint && a valid
+        // forward+backward (or two-forward) reference pair derived from
+        // RefOrderHint[ ref_frame_idx[i] ]. The lone inter fixture has
+        // reference_select == 0 so skipModeAllowed == 0 with no bit
+        // read; the full derivation against arbitrary RefOrderHint[]
+        // values is a followup.
+        let skip_mode_present = read_skip_mode_present(
+            br,
+            reference_select,
+            seq.enable_order_hint,
+            order_hint,
+            seq.order_hint_bits,
+            &ref_frame_idx,
+            ref_info,
+        )?;
+        // §5.9.2 allow_warped_motion guard: read `f(1)` only when
+        // `!error_resilient_mode && enable_warped_motion` (FrameIsIntra
+        // is false on this branch).
+        let allow_warped_motion = if error_resilient_mode || !seq.enable_warped_motion {
+            false
+        } else {
+            br.f(1)? == 1
+        };
+        // §5.9.2 reduced_tx_set f(1).
+        let reduced_tx_set = br.f(1)? == 1;
+        // §5.9.24 global_motion_params() — inter path reads.
+        let gm = read_global_motion_params(
+            br,
+            false,
+            allow_high_precision_mv,
+            &prev_gm_params_default(),
+        )?;
+        // §5.9.30 film_grain_params().
+        let fg = read_film_grain_params(
+            br,
+            FilmGrainContext {
+                film_grain_params_present: seq.film_grain_params_present,
+                show_frame,
+                showable_frame,
+                is_inter_frame: matches!(frame_type, FrameType::Inter),
+                mono_chrome: seq.color_config.mono_chrome,
+                subsampling_x: seq.color_config.subsampling_x,
+                subsampling_y: seq.color_config.subsampling_y,
+            },
+        )?;
+
+        inter_refs = Some(InterFrameRefs {
+            frame_refs_short_signaling,
+            last_frame_idx: short_last,
+            gold_frame_idx: short_gold,
+            ref_frame_idx,
+            allow_high_precision_mv,
+            interpolation_filter,
+            is_motion_mode_switchable,
+            use_ref_frame_mvs,
+        });
+
         (
-            None, false, false, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            Some(fs),
+            aib,
+            dfeuc,
+            Some(ti),
+            Some(qp),
+            Some(sp),
+            Some(dq),
+            Some(dlf),
+            Some(lf),
+            Some(cdef),
+            Some(lr),
+            Some(tx),
+            Some(reference_select),
+            Some(skip_mode_present),
+            Some(allow_warped_motion),
+            Some(reduced_tx_set),
+            Some(gm),
+            Some(fg),
         )
     };
 
@@ -1035,8 +1391,351 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         reduced_tx_set,
         global_motion_params,
         film_grain_params,
+        inter_refs,
         bits_consumed: br.position(),
     })
+}
+
+/// `get_relative_dist( a, b )` per §5.9.3 — the sign-extended distance
+/// between two order hints. Returns `0` when order hints are disabled.
+fn get_relative_dist(a: i64, b: i64, order_hint_bits: u8, enable_order_hint: bool) -> i64 {
+    if !enable_order_hint {
+        return 0;
+    }
+    let mut diff = a - b;
+    let m = 1i64 << (i64::from(order_hint_bits) - 1);
+    diff = (diff & (m - 1)) - (diff & m);
+    diff
+}
+
+/// `set_frame_refs()` per §7.8 — compute the seven `ref_frame_idx[]`
+/// entries from `last_frame_idx` / `gold_frame_idx` and the session's
+/// `RefOrderHint[]` array when `frame_refs_short_signaling == 1`.
+///
+/// `ref_frame_idx[]` is indexed by `refFrame - LAST_FRAME`
+/// (`0..REFS_PER_FRAME`); each entry holds a slot index in
+/// `0..NUM_REF_FRAMES`. The algorithm:
+///
+///   1. Seed LAST_FRAME / GOLDEN_FRAME from the two explicit indices,
+///      mark them used, and prepare `shiftedOrderHints[]`.
+///   2. ALTREF_FRAME = latest backward ref, BWDREF_FRAME / ALTREF2_FRAME
+///      = the two earliest backward refs.
+///   3. The remaining `Ref_Frame_List` slots = forward refs in
+///      anti-chronological order.
+///   4. Any still-unset entry = the ref with the smallest output order.
+fn set_frame_refs(
+    last_frame_idx: u8,
+    gold_frame_idx: u8,
+    order_hint: u32,
+    order_hint_bits: u8,
+    enable_order_hint: bool,
+    ref_order_hint: &[u32; NUM_REF_FRAMES as usize],
+) -> [u8; REFS_PER_FRAME] {
+    const N: usize = NUM_REF_FRAMES as usize;
+    let last = last_frame_idx as usize;
+    let gold = gold_frame_idx as usize;
+
+    // -1 sentinel for "not yet assigned"; resolved to u8 at the end.
+    // ref_frame_idx[] is indexed by `refFrame - LAST_FRAME`, so
+    // LAST_FRAME maps to slot 0 and GOLDEN_FRAME to `GOLDEN_FRAME -
+    // LAST_FRAME`.
+    let mut ref_frame_idx: [i32; REFS_PER_FRAME] = [-1; REFS_PER_FRAME];
+    ref_frame_idx[0] = last as i32; // §7.8: ref_frame_idx[LAST_FRAME - LAST_FRAME].
+    ref_frame_idx[GOLDEN_FRAME - LAST_FRAME] = gold as i32;
+
+    let mut used_frame = [false; N];
+    used_frame[last] = true;
+    used_frame[gold] = true;
+
+    let cur_frame_hint: i64 = 1 << (i64::from(order_hint_bits) - 1);
+    let mut shifted = [0i64; N];
+    for (i, slot) in shifted.iter_mut().enumerate() {
+        *slot = cur_frame_hint
+            + get_relative_dist(
+                i64::from(ref_order_hint[i]),
+                i64::from(order_hint),
+                order_hint_bits,
+                enable_order_hint,
+            );
+    }
+
+    // find_latest_backward(): unused slot with the highest hint at or
+    // beyond curFrameHint.
+    let find_latest_backward = |used: &[bool; N]| -> i32 {
+        let mut r = -1i32;
+        let mut latest = 0i64;
+        for i in 0..N {
+            let h = shifted[i];
+            if !used[i] && h >= cur_frame_hint && (r < 0 || h >= latest) {
+                r = i as i32;
+                latest = h;
+            }
+        }
+        r
+    };
+    // find_earliest_backward(): unused slot with the lowest hint at or
+    // beyond curFrameHint.
+    let find_earliest_backward = |used: &[bool; N]| -> i32 {
+        let mut r = -1i32;
+        let mut earliest = 0i64;
+        for i in 0..N {
+            let h = shifted[i];
+            if !used[i] && h >= cur_frame_hint && (r < 0 || h < earliest) {
+                r = i as i32;
+                earliest = h;
+            }
+        }
+        r
+    };
+    // find_latest_forward(): unused slot with the highest hint below
+    // curFrameHint.
+    let find_latest_forward = |used: &[bool; N]| -> i32 {
+        let mut r = -1i32;
+        let mut latest = 0i64;
+        for i in 0..N {
+            let h = shifted[i];
+            if !used[i] && h < cur_frame_hint && (r < 0 || h >= latest) {
+                r = i as i32;
+                latest = h;
+            }
+        }
+        r
+    };
+
+    // ALTREF_FRAME — latest backward.
+    let r = find_latest_backward(&used_frame);
+    if r >= 0 {
+        ref_frame_idx[ALTREF_FRAME - LAST_FRAME] = r;
+        used_frame[r as usize] = true;
+    }
+    // BWDREF_FRAME — earliest backward.
+    let r = find_earliest_backward(&used_frame);
+    if r >= 0 {
+        ref_frame_idx[BWDREF_FRAME - LAST_FRAME] = r;
+        used_frame[r as usize] = true;
+    }
+    // ALTREF2_FRAME — next earliest backward.
+    let r = find_earliest_backward(&used_frame);
+    if r >= 0 {
+        ref_frame_idx[ALTREF2_FRAME - LAST_FRAME] = r;
+        used_frame[r as usize] = true;
+    }
+
+    // Remaining references = forward refs in anti-chronological order.
+    const REF_FRAME_LIST: [usize; REFS_PER_FRAME - 2] = [
+        LAST2_FRAME,
+        LAST3_FRAME,
+        BWDREF_FRAME,
+        ALTREF2_FRAME,
+        ALTREF_FRAME,
+    ];
+    for &ref_frame in REF_FRAME_LIST.iter() {
+        if ref_frame_idx[ref_frame - LAST_FRAME] < 0 {
+            let r = find_latest_forward(&used_frame);
+            if r >= 0 {
+                ref_frame_idx[ref_frame - LAST_FRAME] = r;
+                used_frame[r as usize] = true;
+            }
+        }
+    }
+
+    // Finally, any remaining entries = the ref with smallest output
+    // order.
+    let mut r = -1i32;
+    let mut earliest = 0i64;
+    for (i, &h) in shifted.iter().enumerate().take(N) {
+        if r < 0 || h < earliest {
+            r = i as i32;
+            earliest = h;
+        }
+    }
+    for entry in ref_frame_idx.iter_mut() {
+        if *entry < 0 {
+            *entry = r;
+        }
+    }
+
+    let mut out = [0u8; REFS_PER_FRAME];
+    for (o, v) in out.iter_mut().zip(ref_frame_idx.iter()) {
+        // Every entry is assigned a non-negative slot by the final
+        // fallback (which always finds a ref when NUM_REF_FRAMES > 0).
+        *o = (*v).max(0) as u8;
+    }
+    out
+}
+
+/// `frame_size_with_refs()` per §5.9.7. Scans the seven references for
+/// the first one whose `found_ref` bit is set, inheriting that ref's
+/// dimensions; if none is found, falls back to `frame_size()` +
+/// `render_size()`. On a found ref it runs `superres_params()` +
+/// `compute_image_size()` against the inherited width.
+fn read_frame_size_with_refs(
+    br: &mut BitReader<'_>,
+    seq: &SequenceHeader,
+    frame_size_override_flag: bool,
+    ref_frame_idx: &[u8; REFS_PER_FRAME],
+    ref_info: &RefInfo,
+) -> Result<FrameSize, Error> {
+    let mut found = false;
+    let mut upscaled_width = 0u32;
+    let mut frame_height = 0u32;
+    let mut render_width = 0u32;
+    let mut render_height = 0u32;
+    for &slot in ref_frame_idx.iter() {
+        let found_ref = br.f(1)? == 1;
+        if found_ref {
+            let s = slot as usize;
+            upscaled_width = ref_info.upscaled_width[s];
+            frame_height = ref_info.frame_height[s];
+            render_width = ref_info.render_width[s];
+            render_height = ref_info.render_height[s];
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        // §5.9.7: frame_size() + render_size().
+        return parse_frame_size_block(br, seq, frame_size_override_flag);
+    }
+
+    // §5.9.8 superres_params() — runs against the inherited
+    // UpscaledWidth (which §5.9.7 assigned to FrameWidth before this
+    // call).
+    let (use_superres, coded_denom, superres_denom) = if seq.enable_superres {
+        let use_superres = br.f(1)? == 1;
+        if use_superres {
+            let coded_denom = br.f(SUPERRES_DENOM_BITS)? as u8;
+            (
+                true,
+                coded_denom,
+                u32::from(coded_denom) + SUPERRES_DENOM_MIN,
+            )
+        } else {
+            (false, 0u8, SUPERRES_NUM)
+        }
+    } else {
+        (false, 0u8, SUPERRES_NUM)
+    };
+    // The inherited width is the pre-superres UpscaledWidth; §5.9.8 then
+    // downscales FrameWidth.
+    let frame_width = (upscaled_width * SUPERRES_NUM + (superres_denom / 2)) / superres_denom;
+
+    // §5.9.9 compute_image_size().
+    let mi_cols = 2 * ((frame_width + 7) >> 3);
+    let mi_rows = 2 * ((frame_height + 7) >> 3);
+
+    Ok(FrameSize {
+        frame_width,
+        frame_height,
+        render_width,
+        render_height,
+        superres_denom,
+        upscaled_width,
+        mi_cols,
+        mi_rows,
+        use_superres,
+        coded_denom,
+        // §5.9.7's found-ref branch does not call render_size(), so no
+        // `render_and_frame_size_different` bit is read; the inherited
+        // render dimensions stand.
+        render_and_frame_size_different: false,
+    })
+}
+
+/// `skip_mode_params()` per §5.9.22. Returns `skip_mode_present`. The
+/// `skipModeAllowed` derivation scans `RefOrderHint[ ref_frame_idx[i] ]`
+/// for a forward + backward reference pair (or two forward refs); when
+/// allowed it reads `skip_mode_present` `f(1)`, otherwise it is `0` with
+/// no bit read.
+#[allow(clippy::too_many_arguments)]
+fn read_skip_mode_present(
+    br: &mut BitReader<'_>,
+    reference_select: bool,
+    enable_order_hint: bool,
+    order_hint: u32,
+    order_hint_bits: u8,
+    ref_frame_idx: &[u8; REFS_PER_FRAME],
+    ref_info: &RefInfo,
+) -> Result<bool, Error> {
+    // §5.9.22: FrameIsIntra is false on this branch (inter path).
+    if !reference_select || !enable_order_hint {
+        return Ok(false);
+    }
+
+    let rel = |a: u32| -> i64 {
+        get_relative_dist(
+            i64::from(a),
+            i64::from(order_hint),
+            order_hint_bits,
+            enable_order_hint,
+        )
+    };
+
+    let mut forward_idx: i32 = -1;
+    let mut backward_idx: i32 = -1;
+    let mut forward_hint: u32 = 0;
+    let mut backward_hint: u32 = 0;
+    for (i, &slot) in ref_frame_idx.iter().enumerate() {
+        let ref_hint = ref_info.order_hint[slot as usize];
+        if rel(ref_hint) < 0 {
+            if forward_idx < 0
+                || rel_pair(ref_hint, forward_hint, order_hint_bits, enable_order_hint) > 0
+            {
+                forward_idx = i as i32;
+                forward_hint = ref_hint;
+            }
+        } else if rel(ref_hint) > 0
+            && (backward_idx < 0
+                || rel_pair(ref_hint, backward_hint, order_hint_bits, enable_order_hint) < 0)
+        {
+            backward_idx = i as i32;
+            backward_hint = ref_hint;
+        }
+    }
+
+    let skip_mode_allowed = if forward_idx < 0 {
+        false
+    } else if backward_idx >= 0 {
+        true
+    } else {
+        // Two-forward-reference fallback.
+        let mut second_forward_idx: i32 = -1;
+        let mut second_forward_hint: u32 = 0;
+        for (i, &slot) in ref_frame_idx.iter().enumerate() {
+            let ref_hint = ref_info.order_hint[slot as usize];
+            if rel_pair(ref_hint, forward_hint, order_hint_bits, enable_order_hint) < 0
+                && (second_forward_idx < 0
+                    || rel_pair(
+                        ref_hint,
+                        second_forward_hint,
+                        order_hint_bits,
+                        enable_order_hint,
+                    ) > 0)
+            {
+                second_forward_idx = i as i32;
+                second_forward_hint = ref_hint;
+            }
+        }
+        second_forward_idx >= 0
+    };
+
+    if skip_mode_allowed {
+        Ok(br.f(1)? == 1)
+    } else {
+        Ok(false)
+    }
+}
+
+/// `get_relative_dist(a, b)` for two stored order hints (helper for
+/// `read_skip_mode_present`).
+fn rel_pair(a: u32, b: u32, order_hint_bits: u8, enable_order_hint: bool) -> i64 {
+    get_relative_dist(
+        i64::from(a),
+        i64::from(b),
+        order_hint_bits,
+        enable_order_hint,
+    )
 }
 
 /// Derive `CodedLossless` per the §5.9.2 lines that follow
@@ -2423,6 +3122,84 @@ mod tests {
                 .as_ref()
                 .expect("intra has film_grain")
                 .apply_grain
+        );
+    }
+
+    // -------------------------------------------------------------
+    // §7.8 set_frame_refs()
+    // -------------------------------------------------------------
+
+    /// `get_relative_dist()` (§5.9.3) sign-extends within the
+    /// `OrderHintBits`-wide window: with 7 bits the window is
+    /// `[-64, 63]`, so a hint of 120 vs OrderHint 1 wraps negative.
+    #[test]
+    fn get_relative_dist_sign_extends() {
+        // 7-bit order hints. dist(2, 1) = +1, dist(1, 2) = -1.
+        assert_eq!(get_relative_dist(2, 1, 7, true), 1);
+        assert_eq!(get_relative_dist(1, 2, 7, true), -1);
+        // Wrap: dist(0, 127) within a 7-bit window = +1 (0 is "after"
+        // 127 modulo 128).
+        assert_eq!(get_relative_dist(0, 127, 7, true), 1);
+        // Disabled order hints => 0.
+        assert_eq!(get_relative_dist(50, 1, 7, false), 0);
+    }
+
+    /// All references in the past (forward refs only). With
+    /// `OrderHint = 8` and four valid backward... er, forward slots at
+    /// hints {7,6,5,4}, every backward search fails and the forward
+    /// loop + final fallback assign slots. LAST/GOLDEN keep their
+    /// explicit indices.
+    #[test]
+    fn set_frame_refs_all_forward() {
+        // Slots 0..3 hold past frames (hints 4,5,6,7); 4..7 unused
+        // (hint 0). OrderHint = 8, 7-bit hints.
+        let ref_order_hint = [4u32, 5, 6, 7, 0, 0, 0, 0];
+        // last_frame_idx = 3 (hint 7, the closest past frame),
+        // gold_frame_idx = 0 (hint 4, the oldest).
+        let idx = set_frame_refs(3, 0, 8, 7, true, &ref_order_hint);
+        // ref_frame_idx[LAST-LAST]=last, [GOLDEN-LAST]=gold per §7.8.
+        assert_eq!(idx[LAST_FRAME - LAST_FRAME], 3, "LAST = last_frame_idx");
+        assert_eq!(idx[GOLDEN_FRAME - LAST_FRAME], 0, "GOLDEN = gold_frame_idx");
+        // No backward refs exist (all hints < curFrameHint), so
+        // ALTREF/BWDREF/ALTREF2 fall to the forward / smallest-order
+        // fallbacks; every entry resolves to a valid slot (0..=7).
+        for (i, &v) in idx.iter().enumerate() {
+            assert!(
+                (v as usize) < NUM_REF_FRAMES as usize,
+                "idx[{i}]={v} in range"
+            );
+        }
+    }
+
+    /// Mixed past + future refs: a forward ref (past) and a backward
+    /// ref (future) are present, so ALTREF picks the latest backward
+    /// and the LAST/GOLDEN explicit indices are preserved.
+    #[test]
+    fn set_frame_refs_backward_ref_picked_for_altref() {
+        // OrderHint = 4 (7-bit). Slot 0 hint 2 (past), slot 1 hint 3
+        // (past), slot 2 hint 6 (future), slot 3 hint 8 (further
+        // future). 4..7 unused.
+        let ref_order_hint = [2u32, 3, 6, 8, 0, 0, 0, 0];
+        let idx = set_frame_refs(1, 0, 4, 7, true, &ref_order_hint);
+        assert_eq!(idx[LAST_FRAME - LAST_FRAME], 1, "LAST = last_frame_idx=1");
+        assert_eq!(
+            idx[GOLDEN_FRAME - LAST_FRAME],
+            0,
+            "GOLDEN = gold_frame_idx=0"
+        );
+        // ALTREF = find_latest_backward(): the unused future slot with
+        // the highest shifted hint = slot 3 (hint 8).
+        assert_eq!(
+            idx[ALTREF_FRAME - LAST_FRAME],
+            3,
+            "ALTREF = latest backward (slot 3)"
+        );
+        // BWDREF = find_earliest_backward(): next earliest future =
+        // slot 2 (hint 6).
+        assert_eq!(
+            idx[BWDREF_FRAME - LAST_FRAME],
+            2,
+            "BWDREF = earliest backward (slot 2)"
         );
     }
 }

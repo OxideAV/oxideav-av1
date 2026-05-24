@@ -533,7 +533,7 @@ fn read_delta_q(br: &mut BitReader<'_>) -> Result<i8, Error> {
 /// When `segmentation_enabled == 1 && segmentation_update_data == 0`
 /// the spec keeps the existing per-segment feature data; this
 /// structural parser also reports zeros in that case, with
-/// [`Self::segmentation_update_data`] left `false` so a session-aware
+/// [`Self::update_data`] left `false` so a session-aware
 /// layer can detect the "use saved state" branch and substitute the
 /// loaded data.
 ///

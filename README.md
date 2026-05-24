@@ -396,6 +396,32 @@ Bitstream parsing currently covers:
   block (14 Y points, 8 Cb + 9 Cr points, `ar_coeff_lag = 2`,
   `seed = 45231`) byte-exact against the fixture trace.
 
+* **The inter-frame `uncompressed_header()` path (round 14).** An
+  `INTER_FRAME` / `SWITCH_FRAME` header now parses end-to-end. The §5.9.2
+  `else` branch reads `frame_refs_short_signaling`, the explicit
+  `ref_frame_idx[]` (or computes them via §7.8 `set_frame_refs()`), the
+  §5.9.7 `frame_size_with_refs()` / `frame_size()` + `render_size()` size
+  selection, `allow_high_precision_mv`, §5.9.10
+  `read_interpolation_filter()`, `is_motion_mode_switchable`,
+  `use_ref_frame_mvs`, then the shared tile / quant / segment / delta /
+  loop-filter / CDEF / LR / tx-mode tail, the inter
+  `frame_reference_mode()` (`reference_select`), §5.9.22
+  `skip_mode_params()`, `allow_warped_motion`, `reduced_tx_set`, inter
+  `global_motion_params()`, and `film_grain_params()`. New §7.8
+  `set_frame_refs()`, §5.9.3 `get_relative_dist()`, §5.9.7
+  `frame_size_with_refs()`, and §5.9.22 `skip_mode_params()` are backed by
+  a new public `RefInfo` cross-frame reference state (`RefValid[]` /
+  `RefOrderHint[]` / `RefFrameId[]` + per-slot `RefUpscaledWidth[]` /
+  `RefFrameHeight[]` / `RefRenderWidth[]` / `RefRenderHeight[]`). New
+  public API: `parse_frame_header_with_refs()`, `RefInfo`,
+  `InterFrameRefs` (surfaced on `FrameHeader::inter_refs`). Verified
+  byte-exact against the `i-frame-then-p-64x64` `idx=1` `FRAME_HEADER` +
+  `REF_MAP` trace lines (134 uncompressed-header bits; `ref_frame_idx =
+  [0; 7]`, `base_q_idx = 120`, `tx_mode = 1`, `reference_select = 0`,
+  `allow_warped_motion = 1`). 5 new tests (a byte-exact inter-header
+  fixture test, a `RefInfo` default contract test, and three
+  `set_frame_refs()` / `get_relative_dist()` unit tests).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -418,14 +444,19 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-The intra `uncompressed_header()` is now parsed end-to-end (through
-`film_grain_params()`). The full inter-frame header path
-(`frame_refs_short_signaling`, `ref_frame_idx[]`,
-`frame_size_with_refs()`, the inter `global_motion_params()` /
-`skip_mode_params()` walks that need cross-frame reference state) and
-tile-content decode (motion vectors, transform / quantisation, in-loop
-filters, film-grain synthesis) are **not yet implemented**. `decode_av1`
-and `encode_av1` still return `Error::NotImplemented`.
+Both the intra and the inter `uncompressed_header()` are now parsed
+end-to-end (through `film_grain_params()`). What remains: the
+`set_frame_refs()` short-signaling ordering is implemented and unit-
+tested but not yet exercised by a corpus fixture (no short-signaling
+bitstream exists in `docs/video/av1/fixtures/`); the
+`frame_size_with_refs()` `found_ref == 1` branch is implemented but
+likewise unexercised by the corpus; the §5.9.2 OrderHints[] /
+RefFrameSignBias[] derivation and the §7.20 reference frame update
+process (which would *store* a decoded frame's dimensions / hints back
+into `RefInfo` across frames) are session-state concerns left to the
+decode pipeline; and tile-content decode (motion vectors, transform /
+quantisation, in-loop filters, film-grain synthesis) is unstarted.
+`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 

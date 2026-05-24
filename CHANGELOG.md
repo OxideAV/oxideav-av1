@@ -6,6 +6,49 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 14 — the inter-frame `uncompressed_header()` path.** An
+  `INTER_FRAME` / `SWITCH_FRAME` header now parses end-to-end. After
+  `refresh_frame_flags` the parser walks the §5.9.2 `else` branch:
+  `frame_refs_short_signaling` (`f(1)`, gated on `enable_order_hint`),
+  the explicit `ref_frame_idx[]` reads (`f(3)` each, plus the
+  `delta_frame_id_minus_1` per-ref reads when frame-id numbering is on),
+  the §5.9.7 `frame_size_with_refs()` / §5.9.5 `frame_size()` +
+  `render_size()` size selection, `allow_high_precision_mv`, §5.9.10
+  `read_interpolation_filter()`, `is_motion_mode_switchable`,
+  `use_ref_frame_mvs`, then the shared `disable_frame_end_update_cdf` +
+  `tile_info()` + quant / segment / delta-q / delta-lf / loop-filter /
+  CDEF / LR / `read_tx_mode()` tail, the inter `frame_reference_mode()`
+  (`reference_select` `f(1)`), `skip_mode_params()`,
+  `allow_warped_motion`, `reduced_tx_set`, inter `global_motion_params()`,
+  and `film_grain_params()`. The §5.9.2 `ref_order_hint` walk
+  (error-resilient inter) consumes its bits.
+
+  New: §7.8 `set_frame_refs()` (full ordering: explicit LAST/GOLDEN,
+  ALTREF latest-backward, BWDREF/ALTREF2 earliest-backward, the
+  `Ref_Frame_List` forward refs, smallest-output-order fallback), §5.9.3
+  `get_relative_dist()`, §5.9.7 `frame_size_with_refs()`, and §5.9.22
+  `skip_mode_params()`. Backed by a public `RefInfo` cross-frame
+  reference state (`RefValid[]` / `RefOrderHint[]` / `RefFrameId[]` +
+  per-slot `RefUpscaledWidth[]` / `RefFrameHeight[]` / `RefRenderWidth[]`
+  / `RefRenderHeight[]`).
+
+  New public API: `parse_frame_header_with_refs(payload, seq, &RefInfo)`
+  (the ref-aware entry point), `RefInfo`, `InterFrameRefs` (surfaced on
+  the new `FrameHeader::inter_refs` field —
+  `frame_refs_short_signaling` / `last_frame_idx` / `gold_frame_idx` /
+  `ref_frame_idx[7]` / `allow_high_precision_mv` / `interpolation_filter`
+  / `is_motion_mode_switchable` / `use_ref_frame_mvs`). The existing
+  `parse_frame_header()` seeds `RefInfo::default()`.
+
+  Verified byte-exact against the `i-frame-then-p-64x64` fixture's
+  `idx=1` `FRAME_HEADER` + `REF_MAP` trace lines (the INTER frame:
+  `frame_refs_short_signaling=0`, `ref_frame_idx = [0;7]`,
+  `frame_size_override_flag=0` ⇒ `frame_size()`+`render_size()`,
+  `order_hint=1`, `base_q_idx=120`, `tx_mode=1`, `reference_select=0`,
+  `allow_warped_motion=1`; 134 uncompressed-header bits). Pixel
+  reconstruction stays out of scope (`decode_av1` remains
+  `Err(NotImplemented)`).
+
 * **Round 13 — the §5.9.2 uncompressed-header tail (`global_motion_params()`
   / `film_grain_params()`) wired into the streaming `parse_frame_header`
   walk.** For intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frames the parser

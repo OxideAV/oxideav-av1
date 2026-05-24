@@ -1408,3 +1408,137 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
         "embedded frame-header corpus shrank below 16 fixtures"
     );
 }
+
+// =====================================================================
+// Inter-frame uncompressed-header path: i-frame-then-p-64x64 idx=1
+// =====================================================================
+
+/// SEQUENCE_HEADER OBU payload from `i-frame-then-p-64x64` (identical to
+/// the clip's KEY-frame entry above).
+const IFTP_SEQ_PAYLOAD: &[u8] = &[0x00, 0x00, 0x00, 0x02, 0xaf, 0xff, 0xbf, 0xff, 0x30, 0x08];
+
+/// FRAME OBU payload of the **second** TU in `i-frame-then-p-64x64`
+/// (the INTER / P-equivalent frame, trace `idx=1`).
+///
+/// Extracted by walking `input.ivf`: frame 1 (size 26) holds a
+/// `TEMPORAL_DELIMITER` OBU (`12 00`) then a `FRAME` OBU
+/// (`32 16` = type 6, size 22); the 22-byte payload below is that
+/// FRAME OBU's body, i.e. the `uncompressed_header()` bits the
+/// `idx=1 FRAME_HEADER` / `REF_MAP` trace lines describe.
+const IFTP_INTER_FRAME_PAYLOAD: &[u8] = &[
+    0x32, 0x01, 0xe0, 0x40, 0x00, 0x00, 0x23, 0x5e, 0x00, 0x00, 0x12, 0x84, 0x12, 0x00, 0x00, 0x04,
+    0x00, 0xd0, 0x0a, 0x2d, 0x16, 0x8b,
+];
+
+/// Parse the inter-frame `uncompressed_header()` end-to-end and assert
+/// against the `idx=1` `FRAME_HEADER` + `REF_MAP` trace lines from
+/// `docs/video/av1/fixtures/i-frame-then-p-64x64/trace.txt`.
+#[test]
+fn parses_iftp_inter_frame_header() {
+    use oxideav_av1::{parse_frame_header_with_refs, InterpolationFilter, RefInfo};
+
+    let seq = parse_sequence_header(IFTP_SEQ_PAYLOAD).expect("i-frame-then-p seq header parses");
+    // The inter frame is keyed off a session ref state, but this
+    // fixture takes neither the `frame_refs_short_signaling`
+    // (`set_frame_refs()`) nor the `frame_size_with_refs()` branch, so a
+    // default (all-invalid) RefInfo parses it bit-exactly. The
+    // ref_frame_idx[] values are signaled explicitly and all read 0.
+    let ref_info = RefInfo::default();
+    let fh = parse_frame_header_with_refs(IFTP_INTER_FRAME_PAYLOAD, &seq, &ref_info)
+        .expect("inter frame header parses end-to-end");
+
+    // --- §5.9.2 leading + per-frame fields (trace idx=1) ---
+    assert!(!fh.show_existing_frame);
+    assert_eq!(fh.frame_type, FrameType::Inter, "frame_type=1 (INTER)");
+    assert!(!fh.frame_is_intra);
+    assert!(fh.show_frame, "show_frame=1");
+    assert!(fh.showable_frame, "showable=1 (INTER + show_frame)");
+    assert!(!fh.error_resilient_mode, "error_resilient=0");
+    assert!(!fh.disable_cdf_update);
+    assert!(fh.allow_screen_content_tools, "allow_screen_content=1");
+    // INTER + raw force_integer_mv bit = 0 (no FrameIsIntra override).
+    assert!(!fh.force_integer_mv, "force_integer_mv=0");
+    assert_eq!(fh.order_hint, 1, "order_hint=1");
+    assert_eq!(
+        fh.primary_ref_frame, 7,
+        "primary_ref_frame=7 (PRIMARY_REF_NONE)"
+    );
+    assert_eq!(fh.refresh_frame_flags, 0x02, "refresh_flags=0x02");
+    assert!(!fh.allow_intrabc, "inter frames never set allow_intrabc");
+    assert!(
+        !fh.disable_frame_end_update_cdf,
+        "disable_frame_end_update_cdf=0"
+    );
+
+    // --- §5.9.5/§5.9.6/§5.9.8/§5.9.9 size block (frame_size + render) ---
+    let fs = fh.frame_size.expect("inter frame produces frame_size");
+    assert_eq!(fs.upscaled_width, 64, "w=64");
+    assert_eq!(fs.frame_height, 64, "h=64");
+    assert_eq!(fs.frame_width, 64);
+    assert!(!fs.use_superres, "use_superres=0");
+    assert_eq!(fs.mi_cols, 16);
+    assert_eq!(fs.mi_rows, 16);
+
+    // --- §5.9.2 inter reference signaling + §5.9.10 + motion ---
+    let ir = fh
+        .inter_refs
+        .as_ref()
+        .expect("inter frame produces inter_refs");
+    assert!(
+        !ir.frame_refs_short_signaling,
+        "frame_refs_short_signaling=0 (explicit ref_frame_idx)"
+    );
+    assert_eq!(ir.last_frame_idx, None);
+    assert_eq!(ir.gold_frame_idx, None);
+    // REF_MAP idx=1: ref0..ref6 all 0.
+    assert_eq!(ir.ref_frame_idx, [0u8; 7], "REF_MAP ref0..ref6 = 0");
+    assert!(ir.allow_high_precision_mv, "allow_high_prec_mv=1");
+    assert_eq!(
+        ir.interpolation_filter,
+        InterpolationFilter::from_raw(0),
+        "interp_filter=0 (EIGHTTAP)"
+    );
+    assert!(ir.is_motion_mode_switchable);
+    assert!(ir.use_ref_frame_mvs, "use_ref_frame_mvs=1");
+
+    // --- shared tail (trace idx=1) ---
+    let qp = fh.quantization_params.expect("quant params");
+    assert_eq!(qp.base_q_idx, 120, "base_q_idx=120");
+    let sp = fh.segmentation_params.expect("seg params");
+    assert!(!sp.enabled, "seg_enabled=0");
+    let dq = fh.delta_q_params.expect("delta_q params");
+    assert!(!dq.delta_q_present, "delta_q_present=0");
+    let lf = fh.loop_filter_params.expect("loop filter params");
+    assert_eq!(lf.loop_filter_level[0], 0, "lf_y=0");
+    assert_eq!(lf.loop_filter_level[2], 10, "lf_uv0=10");
+    assert_eq!(lf.loop_filter_level[3], 4, "lf_uv1=4");
+    assert_eq!(lf.loop_filter_sharpness, 0, "lf_sharp=0");
+    assert!(lf.loop_filter_delta_enabled, "lf_delta_enabled=1");
+    let tx = fh.tx_mode.expect("tx_mode");
+    assert_eq!(tx, TxMode::TxModeLargest, "tx_mode=1 (LARGEST)");
+    // §5.9.23 reference_select=0 ⇒ §5.9.22 skip_mode_present=0 (no bit).
+    assert_eq!(fh.reference_select, Some(false), "reference_select=0");
+    assert_eq!(fh.skip_mode_present, Some(false), "skip_mode_present=0");
+    assert_eq!(fh.allow_warped_motion, Some(true), "allow_warped_motion=1");
+    assert_eq!(fh.reduced_tx_set, Some(false), "reduced_tx_set=0");
+    let fg = fh.film_grain_params.expect("film grain params");
+    assert!(!fg.apply_grain, "apply_grain=0");
+
+    // Total `uncompressed_header()` bits for this inter frame
+    // (hand-verified against the §5.9.2 syntax tree): 134 bits. The
+    // FRAME OBU payload is 22 bytes = 176 bits; the remaining 42 bits
+    // are the tile-group / trailing bits, out of scope here.
+    assert_eq!(fh.bits_consumed, 134, "inter uncompressed_header bit count");
+}
+
+/// Public `RefInfo` default-shape contract: every slot invalid with
+/// zeroed hints / dimensions, mirroring the §5.9.2 post-KEY-frame reset.
+#[test]
+fn ref_info_default_is_all_invalid() {
+    use oxideav_av1::{RefInfo, NUM_REF_FRAMES};
+    let ri = RefInfo::default();
+    assert_eq!(ri.valid.len(), NUM_REF_FRAMES as usize);
+    assert!(ri.valid.iter().all(|&v| !v));
+    assert!(ri.order_hint.iter().all(|&h| h == 0));
+    assert!(ri.upscaled_width.iter().all(|&w| w == 0));
+}

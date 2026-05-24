@@ -206,10 +206,32 @@
 //!     for the intra path — [`FrameHeader::bits_consumed`] now reaches
 //!     the trailing bits / tile-group boundary.
 //!
+//!   * **Round 14 — the inter-frame `uncompressed_header()` path.** An
+//!     `INTER_FRAME` / `SWITCH_FRAME` header now parses end-to-end. The
+//!     §5.9.2 `else` branch reads `frame_refs_short_signaling`, the
+//!     explicit `ref_frame_idx[]` (or computes them via §7.8
+//!     `set_frame_refs()`), the §5.9.7 `frame_size_with_refs()` /
+//!     §5.9.5 `frame_size()` + §5.9.6 `render_size()` size selection,
+//!     `allow_high_precision_mv`, §5.9.10 `read_interpolation_filter()`,
+//!     `is_motion_mode_switchable`, `use_ref_frame_mvs`, then the shared
+//!     `disable_frame_end_update_cdf` + `tile_info()` + quant / segment
+//!     / delta / loop-filter / CDEF / LR / `read_tx_mode()` tail, the
+//!     inter `frame_reference_mode()` (`reference_select`), §5.9.22
+//!     `skip_mode_params()`, `allow_warped_motion`, `reduced_tx_set`,
+//!     inter `global_motion_params()`, and `film_grain_params()`. Backed
+//!     by a new public [`frame_header::RefInfo`] cross-frame reference
+//!     state and surfaced via [`parse_frame_header_with_refs`] /
+//!     [`frame_header::InterFrameRefs`] (on
+//!     [`FrameHeader::inter_refs`]). Verified byte-exact against the
+//!     `i-frame-then-p-64x64` fixture's `idx=1` `FRAME_HEADER` +
+//!     `REF_MAP` trace lines.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
-//! motion-vector, and reconstruction passes) and the full inter-frame
-//! header path remain out of scope. [`decode_av1`] / [`encode_av1`]
-//! continue to return [`Error::NotImplemented`].
+//! motion-vector, and reconstruction passes) remains out of scope, as
+//! does the §7.20 reference frame update process that would store a
+//! decoded frame back into [`frame_header::RefInfo`] across frames.
+//! [`decode_av1`] / [`encode_av1`] continue to return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -223,8 +245,9 @@ pub mod tile_info;
 pub mod uncompressed_header_tail;
 
 pub use frame_header::{
-    parse_frame_header, FrameHeader, FrameSize, FrameType, NUM_REF_FRAMES, PRIMARY_REF_NONE,
-    SUPERRES_DENOM_BITS, SUPERRES_DENOM_MIN, SUPERRES_NUM,
+    parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
+    InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,
+    SUPERRES_DENOM_MIN, SUPERRES_NUM,
 };
 pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
 pub use sequence_header::{
@@ -290,16 +313,13 @@ pub enum Error {
     /// implemented yet; every fixture in this round's corpus parses
     /// without ever triggering this path.
     TemporalPointInfoUnsupported,
-    /// The frame-header parser hit the §5.9.2 `if (!FrameIsIntra ||
-    /// refresh_frame_flags != allFrames) { if (error_resilient_mode
-    /// && enable_order_hint) { ... } }` ref_order_hint walk. The
-    /// reads themselves are simple (`NUM_REF_FRAMES *
-    /// order_hint_bits` bits of `f(...)`), but the spec then
-    /// requires per-slot `RefValid[i] = 0` updates against the
-    /// session's `RefOrderHint[]` array. We don't yet track that
-    /// state across calls, so we refuse to descend rather than
-    /// silently discard the updates. No fixture in the current
-    /// corpus exercises this path.
+    /// Retained for API stability. The §5.9.2 `if (!FrameIsIntra ||
+    /// refresh_frame_flags != allFrames) { if (error_resilient_mode &&
+    /// enable_order_hint) { ... } }` ref_order_hint walk is now parsed
+    /// (the bits are consumed; the conformance-only `RefValid[i] = 0`
+    /// invalidation against the session's `RefOrderHint[]` has no effect
+    /// on the parse), so the inter-frame header path no longer returns
+    /// this variant. It is kept to avoid a breaking enum change.
     RefOrderHintWalkUnsupported,
 }
 
