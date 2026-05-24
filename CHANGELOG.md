@@ -6,6 +6,51 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 15 — the §8.2 symbol (arithmetic / msac) decoder.** A new
+  standalone `symbol_decoder` module implements the AV1 entropy engine
+  end-to-end: §8.2.2 `init_symbol(sz)` (the `numBits = Min(sz*8, 15)`
+  window read, `paddedBuf = buf << (15 - numBits)`,
+  `SymbolValue = ((1<<15)-1) ^ paddedBuf`, `SymbolRange = 1<<15`,
+  `SymbolMaxBits = 8*sz - 15`), §8.2.6 `read_symbol(cdf)` (the
+  CDF-adaptive multisymbol search loop using `EC_PROB_SHIFT = 6` /
+  `EC_MIN_PROB = 4`, the `SymbolRange = prev - cur` /
+  `SymbolValue -= cur` update, and the seven-step renormalisation that
+  pulls new bits — or §8.2.2 padding zeros once `SymbolMaxBits` is
+  exhausted — via `f(numBits)`), the §8.3 CDF update (the
+  `rate = 3 + (cdf[N]>15) + (cdf[N]>31) + Min(FloorLog2(N), 2)`
+  adaptive-rate walk plus the `cdf[N]` count-to-32 counter), §8.2.3
+  `read_bool()` (the fixed `[1<<14, 1<<15, 0]` boolean CDF, fed fresh
+  per call so its adaptation is discarded per the §8.2.3 note), §8.2.5
+  `read_literal(n)` (`L(n)`, §4.10.8), `NS(n)` (§4.10.10), the
+  arithmetic-coded `decode_subexp_bool(numSyms, k)` (§5.9.28 bool
+  variant), and §8.2.4 `exit_symbol()` (the
+  `trailingBitPosition = get_position() - Min(15, SymbolMaxBits+15)`
+  derivation, the `Max(0, SymbolMaxBits)` trailing-bit advance to the
+  byte boundary, returning the `(trailingBitPosition,
+  paddingEndPosition)` pair, and rejecting the `SymbolMaxBits < -14`
+  conformance violation via a new `Error::SymbolExitUnderflow`).
+
+  The decoder shares the existing MSB-first `BitReader` (§8.1 `f(n)`),
+  so its bit-position indicator advances the same `get_position()` the
+  rest of the OBU walk uses. Default CDF tables and the §8.3.2
+  CDF-selection process are deliberately out of scope — they land with
+  the tile-content decode that consumes them. New public API:
+  `SymbolDecoder` (`init_symbol` / `read_symbol` / `read_bool` /
+  `read_literal` / `read_ns` / `decode_subexp_bool` / `exit_symbol` /
+  `position`).
+
+  13 new byte-exact unit tests: §8.2.2 init over a full 15-bit and a
+  partial 8-bit window; a hand-traced single §8.2.6 decode against the
+  boolean CDF (asserting the decoded symbol, post-decode
+  `SymbolValue` / `SymbolRange` / `SymbolMaxBits`, and consumed bit
+  position); `read_bool` / `read_literal` composition; the §8.3 update
+  computed term-by-term against a 3-symbol CDF; the count-to-32 cap;
+  CDF mutation-when-enabled vs untouched-when-`disable_cdf_update`;
+  `NS(1)` zero-bit short-circuit; `decode_subexp_bool` immediate
+  uniform branch; the §8.2.4 byte-boundary advance + the
+  `SymbolMaxBits < -14` underflow rejection; and a past-buffer decode
+  that draws §8.2.2 padding zeros instead of erroring.
+
 * **Round 14 — the inter-frame `uncompressed_header()` path.** An
   `INTER_FRAME` / `SWITCH_FRAME` header now parses end-to-end. After
   `refresh_frame_flags` the parser walks the §5.9.2 `else` branch:

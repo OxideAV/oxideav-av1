@@ -226,6 +226,23 @@
 //!     `i-frame-then-p-64x64` fixture's `idx=1` `FRAME_HEADER` +
 //!     `REF_MAP` trace lines.
 //!
+//!   * **Round 15.** The §8.2 symbol (arithmetic / msac) decoder, as a
+//!     standalone [`symbol_decoder::SymbolDecoder`]. Implements §8.2.2
+//!     `init_symbol` (the `SymbolValue` / `SymbolRange` / `SymbolMaxBits`
+//!     §8.2.4 state), §8.2.6 `read_symbol` (the CDF-adaptive multisymbol
+//!     search with `EC_PROB_SHIFT` / `EC_MIN_PROB`, the `prev - cur`
+//!     range update, and the seven-step renormalisation that draws new
+//!     bits — or §8.2.2 padding zeros once `SymbolMaxBits` is exhausted),
+//!     the §8.3 adaptive-rate CDF update, §8.2.3 `read_bool`, §8.2.5
+//!     `read_literal` (`L(n)`), `NS(n)` (§4.10.10), the arithmetic-coded
+//!     `decode_subexp_bool` (§5.9.28 bool variant), and §8.2.4
+//!     `exit_symbol` (trailing-bit accounting + byte-alignment advance,
+//!     rejecting the `SymbolMaxBits < -14` conformance violation via
+//!     [`Error::SymbolExitUnderflow`]). The default CDF tables (§8.2.2)
+//!     and the §8.3.2 CDF-selection process are out of scope this round —
+//!     they land with the tile-content decode that consumes them. See
+//!     [`symbol_decoder`].
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -241,6 +258,7 @@ mod bitreader;
 pub mod frame_header;
 pub mod obu;
 pub mod sequence_header;
+pub mod symbol_decoder;
 pub mod tile_info;
 pub mod uncompressed_header_tail;
 
@@ -254,6 +272,7 @@ pub use sequence_header::{
     parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
     SequenceHeader, TimingInfo,
 };
+pub use symbol_decoder::SymbolDecoder;
 pub use tile_info::{
     parse_tile_info, TileInfo, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH,
 };
@@ -321,6 +340,10 @@ pub enum Error {
     /// on the parse), so the inter-frame header path no longer returns
     /// this variant. It is kept to avoid a breaking enum change.
     RefOrderHintWalkUnsupported,
+    /// `exit_symbol()` was invoked while `SymbolMaxBits` was strictly
+    /// less than `-14`, violating the §8.2.4 bitstream-conformance
+    /// requirement that `SymbolMaxBits >= -14` at exit.
+    SymbolExitUnderflow,
 }
 
 impl core::fmt::Display for Error {
@@ -367,6 +390,10 @@ impl core::fmt::Display for Error {
             Self::RefOrderHintWalkUnsupported => write!(
                 f,
                 "oxideav-av1: ref_order_hint walk in §5.9.2 needs RefOrderHint[] state (not yet tracked)"
+            ),
+            Self::SymbolExitUnderflow => write!(
+                f,
+                "oxideav-av1: exit_symbol() with SymbolMaxBits < -14 (§8.2.4 conformance)"
             ),
         }
     }

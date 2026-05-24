@@ -422,6 +422,26 @@ Bitstream parsing currently covers:
   fixture test, a `RefInfo` default contract test, and three
   `set_frame_refs()` / `get_relative_dist()` unit tests).
 
+* **§8.2 — the symbol (arithmetic / msac) decoder (round 15).** A new
+  standalone `SymbolDecoder` implements the AV1 entropy engine that
+  every tile-content read will sit on: §8.2.2 `init_symbol(sz)`, §8.2.6
+  `read_symbol(cdf)` (the CDF-adaptive multisymbol search with
+  `EC_PROB_SHIFT`/`EC_MIN_PROB`, the `prev - cur` range update, and the
+  seven-step renormalisation drawing new bits — or §8.2.2 padding zeros
+  once `SymbolMaxBits` is exhausted), the §8.3 adaptive-rate CDF update
+  (`rate = 3 + (cdf[N]>15) + (cdf[N]>31) + Min(FloorLog2(N), 2)` plus the
+  count-to-32 counter), §8.2.3 `read_bool()`, §8.2.5 `read_literal(n)`
+  (`L(n)`), `NS(n)` (§4.10.10), the arithmetic-coded
+  `decode_subexp_bool(numSyms, k)` (§5.9.28 bool variant), and §8.2.4
+  `exit_symbol()` (trailing-bit accounting + byte-alignment advance,
+  rejecting the `SymbolMaxBits < -14` conformance violation). The
+  decoder shares the existing MSB-first `BitReader` (§8.1 `f(n)`) so its
+  position indicator advances the same `get_position()` the OBU walk
+  uses. Default CDF tables and the §8.3.2 CDF-selection process are out
+  of scope — they land with the tile-content decode that consumes them.
+  13 byte-exact unit tests (hand-traced single decodes + term-by-term
+  §8.3 update checks + padding-zero / underflow edge cases).
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -455,8 +475,13 @@ RefFrameSignBias[] derivation and the §7.20 reference frame update
 process (which would *store* a decoded frame's dimensions / hints back
 into `RefInfo` across frames) are session-state concerns left to the
 decode pipeline; and tile-content decode (motion vectors, transform /
-quantisation, in-loop filters, film-grain synthesis) is unstarted.
-`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
+quantisation, in-loop filters, film-grain synthesis) is unstarted. The
+§8.2 symbol (arithmetic) decoder — the engine all tile-content reads run
+on — now exists as a standalone, byte-exact `SymbolDecoder` (round 15);
+what it still needs to drive real tiles is the §8.2.2 default CDF tables
+and the §8.3.2 CDF-selection process that maps each `S`-typed syntax
+element to its context CDF. `decode_av1` and `encode_av1` still return
+`Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -581,6 +606,18 @@ quantisation, in-loop filters, film-grain synthesis) is unstarted.
     chroma-suppression branch, the AR-coefficient loops, and the
     chroma mult/offset triplets), §6.8.18 (global-motion-type symbol
     values), §6.8.20 (film-grain params semantics).
+  * Round 15: §3 (constants — `EC_PROB_SHIFT = 6`, `EC_MIN_PROB = 4`),
+    §4.7 (`FloorLog2`), §4.10.8 (`L(n)` descriptor), §4.10.10 (`NS(n)`
+    descriptor), §5.9.28 (`decode_subexp_bool` — the bool variant of the
+    subexponential code), §8.1 (`f(n)` parsing process — shared bit
+    reader), §8.2.2 (`init_symbol` — `numBits` / `paddedBuf` /
+    `SymbolValue` / `SymbolRange` / `SymbolMaxBits` init), §8.2.3
+    (`read_bool` — the fixed `[1<<14, 1<<15, 0]` CDF), §8.2.4
+    (`exit_symbol` — `trailingBitPosition` / `paddingEndPosition`
+    derivation, the `Max(0, SymbolMaxBits)` advance, the
+    `SymbolMaxBits >= -14` conformance gate), §8.2.5 (`read_literal`),
+    §8.2.6 (`read_symbol` — the CDF-adaptive symbol search loop + the
+    seven-step renormalisation), §8.3 (the adaptive-rate CDF update).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
