@@ -180,10 +180,36 @@
 //!     Also available as a standalone parser entry point
 //!     ([`parse_tx_mode`]).
 //!
-//! Frame decoding past `read_tx_mode()` (the remaining tail —
-//! `frame_reference_mode()` / `skip_mode_params()` / tile-content decode)
-//! is still out of scope. [`decode_av1`] / [`encode_av1`] continue to
-//! return [`Error::NotImplemented`].
+//!   * **Round 13 — the §5.9.2 uncompressed-header tail** completes the
+//!     intra path. After `read_tx_mode()` the parser consumes
+//!     `frame_reference_mode()` (§5.9.23), `skip_mode_params()`
+//!     (§5.9.22), the `allow_warped_motion` slot, `reduced_tx_set`
+//!     (`f(1)`), `global_motion_params()` (§5.9.24), and
+//!     `film_grain_params()` (§5.9.30), surfacing
+//!     [`FrameHeader::reference_select`] / `skip_mode_present` /
+//!     `allow_warped_motion` / `reduced_tx_set` plus typed
+//!     [`GlobalMotionParams`] and [`FilmGrainParams`]. For an intra
+//!     frame the first three blocks and `global_motion_params()` all
+//!     collapse without reading bits (the §5.9.23 `FrameIsIntra ⇒
+//!     reference_select = 0`, the §5.9.22 `skipModeAllowed = 0`, the
+//!     §5.9.2 `allow_warped_motion` guard, and the §5.9.24 `FrameIsIntra`
+//!     identity short-circuit); `reduced_tx_set` is one bit, and
+//!     `film_grain_params()` reads its full §5.9.30 block when the
+//!     sequence enables grain and the frame carries `apply_grain == 1`.
+//!     `global_motion_params()` exposes the complete §5.9.24/§5.9.25
+//!     inter syntax (`read_global_param` + §5.9.26–§5.9.29
+//!     `decode_signed_subexp_with_ref` / `decode_subexp` /
+//!     `inverse_recenter`) via the standalone
+//!     [`parse_global_motion_params`]; `film_grain_params()` is likewise
+//!     available via [`parse_film_grain_params`] (taking a
+//!     [`FilmGrainContext`]). This is the end of `uncompressed_header()`
+//!     for the intra path — [`FrameHeader::bits_consumed`] now reaches
+//!     the trailing bits / tile-group boundary.
+//!
+//! Tile-group / tile-content decode (the per-tile coefficient,
+//! motion-vector, and reconstruction passes) and the full inter-frame
+//! header path remain out of scope. [`decode_av1`] / [`encode_av1`]
+//! continue to return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -209,15 +235,20 @@ pub use tile_info::{
     parse_tile_info, TileInfo, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH,
 };
 pub use uncompressed_header_tail::{
-    parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_interpolation_filter,
-    parse_loop_filter_params, parse_lr_params, parse_quantization_params,
-    parse_segmentation_params, parse_tx_mode, CdefParams, DeltaLfParams, DeltaQParams,
-    FrameRestorationType, InterpolationFilter, LoopFilterParams, LrParams, QuantizationParams,
-    SegmentationParams, TxMode, CDEF_MAX_STRENGTHS, LOOP_FILTER_MODE_DELTAS_DEFAULT,
-    LOOP_FILTER_REF_DELTAS_DEFAULT, MAX_LOOP_FILTER, MAX_SEGMENTS, RESTORATION_TILESIZE_MAX,
-    SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX, SEGMENTATION_FEATURE_SIGNED,
-    SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H, SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q,
-    SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, TOTAL_REFS_PER_FRAME, TX_MODES,
+    parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,
+    parse_global_motion_params, parse_interpolation_filter, parse_loop_filter_params,
+    parse_lr_params, parse_quantization_params, parse_segmentation_params, parse_tx_mode,
+    prev_gm_params_default, CdefParams, DeltaLfParams, DeltaQParams, FilmGrainContext,
+    FilmGrainParams, FrameRestorationType, GlobalMotionParams, InterpolationFilter,
+    LoopFilterParams, LrParams, QuantizationParams, SegmentationParams, TxMode, WarpModelType,
+    ALTREF_FRAME, CDEF_MAX_STRENGTHS, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS, GM_ABS_TRANS_ONLY_BITS,
+    GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS, INTRA_FRAME, LAST_FRAME,
+    LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT, MAX_AR_COEFFS_UV,
+    MAX_AR_COEFFS_Y, MAX_LOOP_FILTER, MAX_NUM_CHROMA_POINTS, MAX_NUM_Y_POINTS, MAX_SEGMENTS,
+    REFS_PER_FRAME, RESTORATION_TILESIZE_MAX, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
+    SEGMENTATION_FEATURE_SIGNED, SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H,
+    SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME,
+    SEG_LVL_SKIP, TOTAL_REFS_PER_FRAME, TX_MODES, WARPEDMODEL_PREC_BITS,
 };
 
 /// Crate-local error type.

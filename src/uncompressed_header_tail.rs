@@ -1291,6 +1291,674 @@ pub(crate) fn read_tx_mode(br: &mut BitReader<'_>, coded_lossless: bool) -> Resu
     })
 }
 
+// ---------------------------------------------------------------------
+// §5.9.24 global_motion_params + §5.9.25 read_global_param +
+// §5.9.26–§5.9.29 decode_signed_subexp_with_ref helpers
+// ---------------------------------------------------------------------
+
+/// `REFS_PER_FRAME` per §3 — the number of inter-prediction reference
+/// frames a frame may use (`LAST_FRAME`..`ALTREF_FRAME`, i.e. 7). This
+/// is the length of the per-ref global-motion arrays.
+pub const REFS_PER_FRAME: usize = 7;
+
+/// `INTRA_FRAME` per §3 — the implicit reference-frame index 0. The
+/// inter references `LAST_FRAME`..`ALTREF_FRAME` are 1..=7.
+pub const INTRA_FRAME: usize = 0;
+
+/// `LAST_FRAME` per §3 — the first inter-prediction reference index.
+pub const LAST_FRAME: usize = 1;
+
+/// `ALTREF_FRAME` per §3 — the last inter-prediction reference index.
+pub const ALTREF_FRAME: usize = 7;
+
+/// `WARPEDMODEL_PREC_BITS` per §3 — internal precision of warped-motion
+/// models. The §5.9.24 identity default sets `gm_params[ref][i]` to
+/// `1 << WARPEDMODEL_PREC_BITS` for the two diagonal slots (`i % 3 == 2`).
+pub const WARPEDMODEL_PREC_BITS: u32 = 16;
+
+/// `GM_ABS_TRANS_BITS` per §3 — number of bits for the translational
+/// components of a ROTZOOM / AFFINE model.
+pub const GM_ABS_TRANS_BITS: u32 = 12;
+
+/// `GM_ABS_TRANS_ONLY_BITS` per §3 — number of bits for the
+/// translational components of a TRANSLATION model.
+pub const GM_ABS_TRANS_ONLY_BITS: u32 = 9;
+
+/// `GM_ABS_ALPHA_BITS` per §3 — number of bits for the
+/// non-translational components of a global-motion model.
+pub const GM_ABS_ALPHA_BITS: u32 = 12;
+
+/// `GM_ALPHA_PREC_BITS` per §3 — fractional bits for non-translational
+/// warp-model coefficients.
+pub const GM_ALPHA_PREC_BITS: u32 = 15;
+
+/// `GM_TRANS_PREC_BITS` per §3 — fractional bits for translational
+/// warp-model coefficients (ROTZOOM / AFFINE).
+pub const GM_TRANS_PREC_BITS: u32 = 6;
+
+/// `GM_TRANS_ONLY_PREC_BITS` per §3 — fractional bits for the
+/// translational components of a pure-TRANSLATION warp.
+pub const GM_TRANS_ONLY_PREC_BITS: u32 = 3;
+
+/// Warp-model type per §6.8.18 (`GmType[ref]`). The numeric
+/// discriminants are the §3 `IDENTITY` / `TRANSLATION` / `ROTZOOM` /
+/// `AFFINE` symbol values; the §5.9.24 `type >= ROTZOOM` /
+/// `type >= TRANSLATION` comparisons depend on this exact ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WarpModelType {
+    /// `IDENTITY` (0) — no warp; the per-ref default and the value used
+    /// for every ref on the §5.9.24 `FrameIsIntra` short-circuit.
+    Identity = 0,
+    /// `TRANSLATION` (1) — a pure translation (only `gm_params[ref][0]`
+    /// / `[1]` are read).
+    Translation = 1,
+    /// `ROTZOOM` (2) — rotation + symmetric zoom + translation
+    /// (`gm_params[ref][2..=3]` plus the derived `[4]` / `[5]`).
+    RotZoom = 2,
+    /// `AFFINE` (3) — a general affine transform (`gm_params[ref][2..=5]`).
+    Affine = 3,
+}
+
+impl WarpModelType {
+    /// The §6.8.18 `GmType` symbol value (0..=3).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Parsed `global_motion_params()` per §5.9.24 + §6.8.18.
+///
+/// `gm_type[i]` / `gm_params[i][..]` are indexed by **reference-frame
+/// index** (0..=7), matching the spec's `GmType[ref]` /
+/// `gm_params[ref][i]` arrays where `ref` ranges over
+/// `LAST_FRAME`..`ALTREF_FRAME`. Index `INTRA_FRAME = 0` is never
+/// written by §5.9.24 and stays at the identity default.
+///
+/// On the §5.9.24 `FrameIsIntra` short-circuit every ref keeps the
+/// identity initialiser (`GmType = IDENTITY`, the diagonal
+/// `gm_params[ref][2] = gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`,
+/// every other slot `0`) and no bits are read;
+/// [`Self::short_circuited`] records this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalMotionParams {
+    /// `GmType[ref]` for `ref` in `0..=ALTREF_FRAME`. Index 0
+    /// (`INTRA_FRAME`) is always `IDENTITY`.
+    pub gm_type: [WarpModelType; TOTAL_REFS_PER_FRAME],
+    /// `gm_params[ref][0..6]` for `ref` in `0..=ALTREF_FRAME`. The six
+    /// warp-model coefficients are stored at `WARPEDMODEL_PREC_BITS`
+    /// internal precision (i.e. the value `read_global_param` writes,
+    /// before any §7.13.1 setup). The identity model is
+    /// `[0, 0, 1<<16, 0, 0, 1<<16]`.
+    pub gm_params: [[i32; 6]; TOTAL_REFS_PER_FRAME],
+    /// Whether the §5.9.24 `FrameIsIntra` short-circuit fired and the
+    /// parser returned the identity defaults without reading any bits.
+    pub short_circuited: bool,
+}
+
+impl GlobalMotionParams {
+    /// The §5.9.24 identity initialiser: every ref `IDENTITY`, with
+    /// `gm_params[ref][i] = (i % 3 == 2) ? 1 << WARPEDMODEL_PREC_BITS :
+    /// 0`. This is also the output on the `FrameIsIntra` short-circuit.
+    #[must_use]
+    pub const fn identity() -> Self {
+        let one = 1i32 << WARPEDMODEL_PREC_BITS;
+        Self {
+            gm_type: [WarpModelType::Identity; TOTAL_REFS_PER_FRAME],
+            gm_params: [[0, 0, one, 0, 0, one]; TOTAL_REFS_PER_FRAME],
+            short_circuited: true,
+        }
+    }
+}
+
+/// The §7.13.1 default `PrevGmParams[ref][idx]` (i.e. the
+/// `setup_past_independence` initialiser): `(idx % 3 == 2) ? 1 <<
+/// WARPEDMODEL_PREC_BITS : 0`. Used as the prediction reference for
+/// `read_global_param` when the frame has no previous-frame state
+/// (the only path the streaming parser exercises — intra frames with
+/// `primary_ref_frame == PRIMARY_REF_NONE`, which short-circuit before
+/// any `read_global_param` call anyway).
+#[must_use]
+pub const fn prev_gm_params_default() -> [[i32; 6]; TOTAL_REFS_PER_FRAME] {
+    let one = 1i32 << WARPEDMODEL_PREC_BITS;
+    [[0, 0, one, 0, 0, one]; TOTAL_REFS_PER_FRAME]
+}
+
+/// `inverse_recenter(r, v)` per §5.9.29.
+fn inverse_recenter(r: i64, v: i64) -> i64 {
+    if v > 2 * r {
+        v
+    } else if v & 1 != 0 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
+}
+
+/// `decode_subexp(numSyms)` per §5.9.28.
+///
+/// `k = 3` is the §5.9.28 fixed sub-exponential parameter. The loop
+/// reads `subexp_more_bits` (`f(1)`) until the remaining range fits,
+/// then either `subexp_final_bits` (`ns(numSyms - mk)`) or
+/// `subexp_bits` (`f(b2)`).
+fn decode_subexp(br: &mut BitReader<'_>, num_syms: u32) -> Result<u32, Error> {
+    let mut i: u32 = 0;
+    let mut mk: u32 = 0;
+    let k: u32 = 3;
+    loop {
+        let b2 = if i != 0 { k + i - 1 } else { k };
+        let a = 1u32 << b2;
+        if num_syms <= mk + 3 * a {
+            let subexp_final_bits = br.ns(num_syms - mk)?;
+            return Ok(subexp_final_bits + mk);
+        }
+        let subexp_more_bits = br.f(1)? == 1;
+        if subexp_more_bits {
+            i += 1;
+            mk += a;
+        } else {
+            let subexp_bits = br.f(b2)? as u32;
+            return Ok(subexp_bits + mk);
+        }
+    }
+}
+
+/// `decode_unsigned_subexp_with_ref(mx, r)` per §5.9.27. Returns a
+/// value in `0..mx`.
+fn decode_unsigned_subexp_with_ref(br: &mut BitReader<'_>, mx: i64, r: i64) -> Result<i64, Error> {
+    // `mx` is bounded by `2 * (1 << absBits) + 1 <= 2 * 4096 + 1`, so it
+    // fits in u32 for the `decode_subexp` call.
+    let v = i64::from(decode_subexp(br, mx as u32)?);
+    if (r << 1) <= mx {
+        Ok(inverse_recenter(r, v))
+    } else {
+        Ok(mx - 1 - inverse_recenter(mx - 1 - r, v))
+    }
+}
+
+/// `decode_signed_subexp_with_ref(low, high, r)` per §5.9.26. Returns a
+/// value in `low..high`.
+fn decode_signed_subexp_with_ref(
+    br: &mut BitReader<'_>,
+    low: i64,
+    high: i64,
+    r: i64,
+) -> Result<i64, Error> {
+    let x = decode_unsigned_subexp_with_ref(br, high - low, r - low)?;
+    Ok(x + low)
+}
+
+/// `read_global_param(type, ref, idx)` per §5.9.25.
+///
+/// Reads one warp-model coefficient into `gm_params[ref][idx]`, using
+/// `prev_gm_params[ref][idx]` (the spec's `PrevGmParams`) as the
+/// sub-exponential prediction reference. `allow_high_precision_mv`
+/// adjusts the translational `idx < 2` precision per §5.9.25.
+#[allow(clippy::too_many_arguments)]
+fn read_global_param(
+    br: &mut BitReader<'_>,
+    gm_type: WarpModelType,
+    gm_params: &mut [[i32; 6]; TOTAL_REFS_PER_FRAME],
+    prev_gm_params: &[[i32; 6]; TOTAL_REFS_PER_FRAME],
+    allow_high_precision_mv: bool,
+    ref_idx: usize,
+    idx: usize,
+) -> Result<(), Error> {
+    let not_high_prec: u32 = u32::from(!allow_high_precision_mv);
+    let (abs_bits, prec_bits) = if idx < 2 {
+        if gm_type == WarpModelType::Translation {
+            (
+                GM_ABS_TRANS_ONLY_BITS - not_high_prec,
+                GM_TRANS_ONLY_PREC_BITS - not_high_prec,
+            )
+        } else {
+            (GM_ABS_TRANS_BITS, GM_TRANS_PREC_BITS)
+        }
+    } else {
+        (GM_ABS_ALPHA_BITS, GM_ALPHA_PREC_BITS)
+    };
+    let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
+    let round: i64 = if idx % 3 == 2 {
+        1i64 << WARPEDMODEL_PREC_BITS
+    } else {
+        0
+    };
+    let sub: i64 = if idx % 3 == 2 { 1i64 << prec_bits } else { 0 };
+    let mx: i64 = 1i64 << abs_bits;
+    let r: i64 = (i64::from(prev_gm_params[ref_idx][idx]) >> prec_diff) - sub;
+    let decoded = decode_signed_subexp_with_ref(br, -mx, mx + 1, r)?;
+    let value = (decoded << prec_diff) + round;
+    gm_params[ref_idx][idx] = value as i32;
+    Ok(())
+}
+
+/// Parse `global_motion_params()` per §5.9.24 from a raw byte slice.
+///
+/// `frame_is_intra` selects the §5.9.24 `FrameIsIntra` short-circuit
+/// (identity defaults, no bits). `allow_high_precision_mv` and
+/// `prev_gm_params` feed `read_global_param` on the full (inter) path;
+/// standalone callers exercising the full syntax should pass the
+/// `PrevGmParams` defaults via [`prev_gm_params_default`].
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+pub fn parse_global_motion_params(
+    payload: &[u8],
+    frame_is_intra: bool,
+    allow_high_precision_mv: bool,
+    prev_gm_params: &[[i32; 6]; TOTAL_REFS_PER_FRAME],
+) -> Result<(GlobalMotionParams, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let gm = read_global_motion_params(
+        &mut br,
+        frame_is_intra,
+        allow_high_precision_mv,
+        prev_gm_params,
+    )?;
+    Ok((gm, br.position()))
+}
+
+pub(crate) fn read_global_motion_params(
+    br: &mut BitReader<'_>,
+    frame_is_intra: bool,
+    allow_high_precision_mv: bool,
+    prev_gm_params: &[[i32; 6]; TOTAL_REFS_PER_FRAME],
+) -> Result<GlobalMotionParams, Error> {
+    // §5.9.24 initialiser: every ref IDENTITY with the diagonal defaults.
+    let mut gm = GlobalMotionParams::identity();
+    if frame_is_intra {
+        // `gm.short_circuited` is already `true` from `identity()`.
+        return Ok(gm);
+    }
+    gm.short_circuited = false;
+
+    for ref_idx in LAST_FRAME..=ALTREF_FRAME {
+        let is_global = br.f(1)? == 1;
+        let gm_type = if is_global {
+            let is_rot_zoom = br.f(1)? == 1;
+            if is_rot_zoom {
+                WarpModelType::RotZoom
+            } else {
+                let is_translation = br.f(1)? == 1;
+                if is_translation {
+                    WarpModelType::Translation
+                } else {
+                    WarpModelType::Affine
+                }
+            }
+        } else {
+            WarpModelType::Identity
+        };
+        gm.gm_type[ref_idx] = gm_type;
+
+        if gm_type as u8 >= WarpModelType::RotZoom as u8 {
+            read_global_param(
+                br,
+                gm_type,
+                &mut gm.gm_params,
+                prev_gm_params,
+                allow_high_precision_mv,
+                ref_idx,
+                2,
+            )?;
+            read_global_param(
+                br,
+                gm_type,
+                &mut gm.gm_params,
+                prev_gm_params,
+                allow_high_precision_mv,
+                ref_idx,
+                3,
+            )?;
+            if gm_type == WarpModelType::Affine {
+                read_global_param(
+                    br,
+                    gm_type,
+                    &mut gm.gm_params,
+                    prev_gm_params,
+                    allow_high_precision_mv,
+                    ref_idx,
+                    4,
+                )?;
+                read_global_param(
+                    br,
+                    gm_type,
+                    &mut gm.gm_params,
+                    prev_gm_params,
+                    allow_high_precision_mv,
+                    ref_idx,
+                    5,
+                )?;
+            } else {
+                // §5.9.24: ROTZOOM derives [4] / [5] from [3] / [2].
+                gm.gm_params[ref_idx][4] = -gm.gm_params[ref_idx][3];
+                gm.gm_params[ref_idx][5] = gm.gm_params[ref_idx][2];
+            }
+        }
+        if gm_type as u8 >= WarpModelType::Translation as u8 {
+            read_global_param(
+                br,
+                gm_type,
+                &mut gm.gm_params,
+                prev_gm_params,
+                allow_high_precision_mv,
+                ref_idx,
+                0,
+            )?;
+            read_global_param(
+                br,
+                gm_type,
+                &mut gm.gm_params,
+                prev_gm_params,
+                allow_high_precision_mv,
+                ref_idx,
+                1,
+            )?;
+        }
+    }
+    Ok(gm)
+}
+
+// ---------------------------------------------------------------------
+// §5.9.30 film_grain_params
+// ---------------------------------------------------------------------
+
+/// Maximum number of luma scaling-function points. `num_y_points` is
+/// `f(4)` (0..=15) but §6.8.20 conformance caps it at 14; the array is
+/// sized at 14.
+pub const MAX_NUM_Y_POINTS: usize = 14;
+
+/// Maximum number of chroma scaling-function points per plane.
+/// `num_cb_points` / `num_cr_points` are `f(4)` and §6.8.20-capped at
+/// 10.
+pub const MAX_NUM_CHROMA_POINTS: usize = 10;
+
+/// Maximum number of luma auto-regressive coefficients:
+/// `numPosLuma = 2 * ar_coeff_lag * (ar_coeff_lag + 1)` with
+/// `ar_coeff_lag` in `0..=3` ⇒ `2 * 3 * 4 = 24`.
+pub const MAX_AR_COEFFS_Y: usize = 24;
+
+/// Maximum number of chroma auto-regressive coefficients:
+/// `numPosChroma = numPosLuma + 1 = 25` when `num_y_points > 0`.
+pub const MAX_AR_COEFFS_UV: usize = 25;
+
+/// Parsed `film_grain_params()` per §5.9.30 + §6.8.20.
+///
+/// The `apply_grain == 0` / `!film_grain_params_present` /
+/// hidden-frame short-circuits all reduce to the
+/// `reset_grain_params()` output, which §6.8.20 defines as every field
+/// set to `0`; [`Self::apply_grain`] then reads `false`. On the
+/// `update_grain == 0` predicted path only `apply_grain`, `grain_seed`,
+/// `update_grain`, and `film_grain_params_ref_idx` are populated from
+/// the bitstream (the remaining fields would be loaded from the
+/// referenced frame via `load_grain_params` — out of scope for a
+/// stateless header parser, so they stay at their defaults and
+/// [`Self::predicted`] records the predicted path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilmGrainParams {
+    /// `apply_grain` (`f(1)`). `false` on every short-circuit path.
+    pub apply_grain: bool,
+    /// `grain_seed` (`f(16)`).
+    pub grain_seed: u16,
+    /// `update_grain` (`f(1)` for `INTER_FRAME`, else derived `1`).
+    pub update_grain: bool,
+    /// `film_grain_params_ref_idx` (`f(3)`) — only meaningful when
+    /// [`Self::predicted`] is `true`.
+    pub film_grain_params_ref_idx: u8,
+    /// `num_y_points` (`f(4)`).
+    pub num_y_points: u8,
+    /// `point_y_value[i]` / `point_y_scaling[i]` (`f(8)` each), the
+    /// first `num_y_points` entries valid.
+    pub point_y_value: [u8; MAX_NUM_Y_POINTS],
+    /// See [`Self::point_y_value`].
+    pub point_y_scaling: [u8; MAX_NUM_Y_POINTS],
+    /// `chroma_scaling_from_luma` (`f(1)`, `0` when `mono_chrome`).
+    pub chroma_scaling_from_luma: bool,
+    /// `num_cb_points` (`f(4)`), `0` on the §5.9.30 chroma-suppression
+    /// branch (`mono_chrome || chroma_scaling_from_luma || (4:2:0 &&
+    /// num_y_points == 0)`).
+    pub num_cb_points: u8,
+    /// `point_cb_value[i]` / `point_cb_scaling[i]` (`f(8)` each).
+    pub point_cb_value: [u8; MAX_NUM_CHROMA_POINTS],
+    /// See [`Self::point_cb_value`].
+    pub point_cb_scaling: [u8; MAX_NUM_CHROMA_POINTS],
+    /// `num_cr_points` (`f(4)`).
+    pub num_cr_points: u8,
+    /// `point_cr_value[i]` / `point_cr_scaling[i]` (`f(8)` each).
+    pub point_cr_value: [u8; MAX_NUM_CHROMA_POINTS],
+    /// See [`Self::point_cr_value`].
+    pub point_cr_scaling: [u8; MAX_NUM_CHROMA_POINTS],
+    /// `GrainScaling = grain_scaling_minus_8 + 8` (`f(2)` ⇒ 8..=11).
+    pub grain_scaling: u8,
+    /// `ar_coeff_lag` (`f(2)` ⇒ 0..=3).
+    pub ar_coeff_lag: u8,
+    /// `ar_coeffs_y_plus_128[i]` (`f(8)`), the first `numPosLuma`
+    /// entries valid (only when `num_y_points > 0`).
+    pub ar_coeffs_y_plus_128: [u8; MAX_AR_COEFFS_Y],
+    /// `ar_coeffs_cb_plus_128[i]` (`f(8)`), the first `numPosChroma`
+    /// entries valid (when `chroma_scaling_from_luma || num_cb_points`).
+    pub ar_coeffs_cb_plus_128: [u8; MAX_AR_COEFFS_UV],
+    /// `ar_coeffs_cr_plus_128[i]` (`f(8)`), the first `numPosChroma`
+    /// entries valid (when `chroma_scaling_from_luma || num_cr_points`).
+    pub ar_coeffs_cr_plus_128: [u8; MAX_AR_COEFFS_UV],
+    /// `ArCoeffShift = ar_coeff_shift_minus_6 + 6` (`f(2)` ⇒ 6..=9).
+    pub ar_coeff_shift: u8,
+    /// `grain_scale_shift` (`f(2)` ⇒ 0..=3).
+    pub grain_scale_shift: u8,
+    /// `cb_mult` (`f(8)`), valid when `num_cb_points > 0`.
+    pub cb_mult: u8,
+    /// `cb_luma_mult` (`f(8)`).
+    pub cb_luma_mult: u8,
+    /// `cb_offset` (`f(9)` ⇒ 0..=511).
+    pub cb_offset: u16,
+    /// `cr_mult` (`f(8)`), valid when `num_cr_points > 0`.
+    pub cr_mult: u8,
+    /// `cr_luma_mult` (`f(8)`).
+    pub cr_luma_mult: u8,
+    /// `cr_offset` (`f(9)` ⇒ 0..=511).
+    pub cr_offset: u16,
+    /// `overlap_flag` (`f(1)`).
+    pub overlap_flag: bool,
+    /// `clip_to_restricted_range` (`f(1)`).
+    pub clip_to_restricted_range: bool,
+    /// Whether the §5.9.30 `update_grain == 0` predicted path fired
+    /// (`film_grain_params_ref_idx` valid; the AR / scaling fields are
+    /// inherited from the referenced frame, not present in this
+    /// header's bitstream).
+    pub predicted: bool,
+}
+
+impl FilmGrainParams {
+    /// The §6.8.20 `reset_grain_params()` output: every field `0` /
+    /// `false`.
+    #[must_use]
+    pub const fn reset() -> Self {
+        Self {
+            apply_grain: false,
+            grain_seed: 0,
+            update_grain: false,
+            film_grain_params_ref_idx: 0,
+            num_y_points: 0,
+            point_y_value: [0; MAX_NUM_Y_POINTS],
+            point_y_scaling: [0; MAX_NUM_Y_POINTS],
+            chroma_scaling_from_luma: false,
+            num_cb_points: 0,
+            point_cb_value: [0; MAX_NUM_CHROMA_POINTS],
+            point_cb_scaling: [0; MAX_NUM_CHROMA_POINTS],
+            num_cr_points: 0,
+            point_cr_value: [0; MAX_NUM_CHROMA_POINTS],
+            point_cr_scaling: [0; MAX_NUM_CHROMA_POINTS],
+            grain_scaling: 0,
+            ar_coeff_lag: 0,
+            ar_coeffs_y_plus_128: [0; MAX_AR_COEFFS_Y],
+            ar_coeffs_cb_plus_128: [0; MAX_AR_COEFFS_UV],
+            ar_coeffs_cr_plus_128: [0; MAX_AR_COEFFS_UV],
+            ar_coeff_shift: 0,
+            grain_scale_shift: 0,
+            cb_mult: 0,
+            cb_luma_mult: 0,
+            cb_offset: 0,
+            cr_mult: 0,
+            cr_luma_mult: 0,
+            cr_offset: 0,
+            overlap_flag: false,
+            clip_to_restricted_range: false,
+            predicted: false,
+        }
+    }
+}
+
+/// Inputs to `film_grain_params()` that come from the §5.9.2 per-frame
+/// state and the §5.5.x sequence header. Bundled so the standalone
+/// parser and the streaming wiring share one shape.
+#[derive(Debug, Clone, Copy)]
+pub struct FilmGrainContext {
+    /// `film_grain_params_present` (§5.5.2 sequence-header flag).
+    pub film_grain_params_present: bool,
+    /// `show_frame` (§5.9.2).
+    pub show_frame: bool,
+    /// `showable_frame` (§5.9.2).
+    pub showable_frame: bool,
+    /// `frame_type == INTER_FRAME` — gates the `update_grain` read.
+    pub is_inter_frame: bool,
+    /// `mono_chrome` (§5.5.2).
+    pub mono_chrome: bool,
+    /// `subsampling_x` (§5.5.2).
+    pub subsampling_x: bool,
+    /// `subsampling_y` (§5.5.2).
+    pub subsampling_y: bool,
+}
+
+/// Parse `film_grain_params()` per §5.9.30 from a raw byte slice.
+///
+/// ## Errors
+///   * [`Error::UnexpectedEnd`]
+pub fn parse_film_grain_params(
+    payload: &[u8],
+    ctx: FilmGrainContext,
+) -> Result<(FilmGrainParams, usize), Error> {
+    let mut br = BitReader::new(payload);
+    let fg = read_film_grain_params(&mut br, ctx)?;
+    Ok((fg, br.position()))
+}
+
+pub(crate) fn read_film_grain_params(
+    br: &mut BitReader<'_>,
+    ctx: FilmGrainContext,
+) -> Result<FilmGrainParams, Error> {
+    // §5.9.30: short-circuit when film grain is disabled at the
+    // sequence level or the frame is neither shown nor showable.
+    if !ctx.film_grain_params_present || (!ctx.show_frame && !ctx.showable_frame) {
+        return Ok(FilmGrainParams::reset());
+    }
+
+    let apply_grain = br.f(1)? == 1;
+    if !apply_grain {
+        return Ok(FilmGrainParams::reset());
+    }
+
+    let mut fg = FilmGrainParams::reset();
+    fg.apply_grain = true;
+
+    fg.grain_seed = br.f(16)? as u16;
+
+    // §5.9.30: update_grain is `f(1)` only for INTER_FRAME; derived 1
+    // otherwise.
+    fg.update_grain = if ctx.is_inter_frame {
+        br.f(1)? == 1
+    } else {
+        true
+    };
+
+    if !fg.update_grain {
+        // Predicted path: read the ref idx, then inherit the rest from
+        // the referenced frame (load_grain_params) — which a stateless
+        // header parser cannot resolve. grain_seed is preserved
+        // (tempGrainSeed dance) — and we already stored it above.
+        fg.film_grain_params_ref_idx = br.f(3)? as u8;
+        fg.predicted = true;
+        return Ok(fg);
+    }
+
+    fg.num_y_points = br.f(4)? as u8;
+    for i in 0..usize::from(fg.num_y_points) {
+        fg.point_y_value[i] = br.f(8)? as u8;
+        fg.point_y_scaling[i] = br.f(8)? as u8;
+    }
+
+    fg.chroma_scaling_from_luma = if ctx.mono_chrome {
+        false
+    } else {
+        br.f(1)? == 1
+    };
+
+    // §5.9.30: the chroma-points suppression branch.
+    let suppress_chroma = ctx.mono_chrome
+        || fg.chroma_scaling_from_luma
+        || (ctx.subsampling_x && ctx.subsampling_y && fg.num_y_points == 0);
+    if suppress_chroma {
+        fg.num_cb_points = 0;
+        fg.num_cr_points = 0;
+    } else {
+        fg.num_cb_points = br.f(4)? as u8;
+        for i in 0..usize::from(fg.num_cb_points) {
+            fg.point_cb_value[i] = br.f(8)? as u8;
+            fg.point_cb_scaling[i] = br.f(8)? as u8;
+        }
+        fg.num_cr_points = br.f(4)? as u8;
+        for i in 0..usize::from(fg.num_cr_points) {
+            fg.point_cr_value[i] = br.f(8)? as u8;
+            fg.point_cr_scaling[i] = br.f(8)? as u8;
+        }
+    }
+
+    let grain_scaling_minus_8 = br.f(2)? as u8;
+    fg.grain_scaling = grain_scaling_minus_8 + 8;
+    fg.ar_coeff_lag = br.f(2)? as u8;
+
+    let num_pos_luma = 2 * usize::from(fg.ar_coeff_lag) * (usize::from(fg.ar_coeff_lag) + 1);
+    let num_pos_chroma = if fg.num_y_points > 0 {
+        for i in 0..num_pos_luma {
+            fg.ar_coeffs_y_plus_128[i] = br.f(8)? as u8;
+        }
+        num_pos_luma + 1
+    } else {
+        num_pos_luma
+    };
+
+    if fg.chroma_scaling_from_luma || fg.num_cb_points > 0 {
+        for i in 0..num_pos_chroma {
+            fg.ar_coeffs_cb_plus_128[i] = br.f(8)? as u8;
+        }
+    }
+    if fg.chroma_scaling_from_luma || fg.num_cr_points > 0 {
+        for i in 0..num_pos_chroma {
+            fg.ar_coeffs_cr_plus_128[i] = br.f(8)? as u8;
+        }
+    }
+
+    let ar_coeff_shift_minus_6 = br.f(2)? as u8;
+    fg.ar_coeff_shift = ar_coeff_shift_minus_6 + 6;
+    fg.grain_scale_shift = br.f(2)? as u8;
+
+    if fg.num_cb_points > 0 {
+        fg.cb_mult = br.f(8)? as u8;
+        fg.cb_luma_mult = br.f(8)? as u8;
+        fg.cb_offset = br.f(9)? as u16;
+    }
+    if fg.num_cr_points > 0 {
+        fg.cr_mult = br.f(8)? as u8;
+        fg.cr_luma_mult = br.f(8)? as u8;
+        fg.cr_offset = br.f(9)? as u16;
+    }
+
+    fg.overlap_flag = br.f(1)? == 1;
+    fg.clip_to_restricted_range = br.f(1)? == 1;
+
+    Ok(fg)
+}
+
 /// `Clip3(a, b, x)` per §"Conventions": clamp `x` to `[a, b]`.
 fn clip3_i32(a: i32, b: i32, x: i32) -> i32 {
     if x < a {
@@ -2648,6 +3316,347 @@ mod tests {
         // errors.
         let empty: [u8; 0] = [];
         let err = parse_tx_mode(&empty, false).expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.24 global_motion_params
+    // -----------------------------------------------------------------
+
+    /// Pack `(value, width)` MSB-first fields into a byte buffer.
+    fn pack_fields(fields: &[(u32, u32)]) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        for &(value, width) in fields {
+            for i in (0..width).rev() {
+                bits.push(((value >> i) & 1) as u8);
+            }
+        }
+        pack_bits(&bits)
+    }
+
+    #[test]
+    fn warp_model_type_symbol_values() {
+        // §3 / §6.8.18 symbol values; the §5.9.24 `>= ROTZOOM` /
+        // `>= TRANSLATION` comparisons rely on this ordering.
+        assert_eq!(WarpModelType::Identity.as_u8(), 0);
+        assert_eq!(WarpModelType::Translation.as_u8(), 1);
+        assert_eq!(WarpModelType::RotZoom.as_u8(), 2);
+        assert_eq!(WarpModelType::Affine.as_u8(), 3);
+    }
+
+    #[test]
+    fn global_motion_identity_default_values() {
+        // §5.9.24 initialiser: IDENTITY with diagonal slots
+        // 1 << WARPEDMODEL_PREC_BITS.
+        let one = 1i32 << WARPEDMODEL_PREC_BITS;
+        let gm = GlobalMotionParams::identity();
+        assert!(gm.short_circuited);
+        for r in 0..TOTAL_REFS_PER_FRAME {
+            assert_eq!(gm.gm_type[r], WarpModelType::Identity);
+            assert_eq!(gm.gm_params[r], [0, 0, one, 0, 0, one]);
+        }
+        assert_eq!(REFS_PER_FRAME, 7);
+        assert_eq!(LAST_FRAME, 1);
+        assert_eq!(ALTREF_FRAME, 7);
+        assert_eq!(INTRA_FRAME, 0);
+    }
+
+    #[test]
+    fn global_motion_intra_short_circuit_no_bits() {
+        // §5.9.24 FrameIsIntra ⇒ identity defaults, no bits read.
+        let payload: [u8; 0] = [];
+        let (gm, n) = parse_global_motion_params(&payload, true, false, &prev_gm_params_default())
+            .expect("decodes");
+        assert_eq!(n, 0);
+        assert_eq!(gm, GlobalMotionParams::identity());
+    }
+
+    #[test]
+    fn global_motion_inter_all_identity_seven_bits() {
+        // Inter frame, every ref `is_global = 0` ⇒ IDENTITY, no further
+        // reads. The §5.9.24 loop runs over LAST_FRAME..=ALTREF_FRAME
+        // (7 refs) ⇒ exactly 7 bits.
+        let payload = pack_bits(&[0, 0, 0, 0, 0, 0, 0]);
+        let (gm, n) = parse_global_motion_params(&payload, false, false, &prev_gm_params_default())
+            .expect("decodes");
+        assert_eq!(n, 7, "7 `is_global` bits");
+        assert!(!gm.short_circuited);
+        let identity_params = prev_gm_params_default();
+        for (r, want) in identity_params
+            .iter()
+            .enumerate()
+            .take(ALTREF_FRAME + 1)
+            .skip(LAST_FRAME)
+        {
+            assert_eq!(gm.gm_type[r], WarpModelType::Identity);
+            assert_eq!(gm.gm_params[r], *want);
+        }
+    }
+
+    #[test]
+    fn global_motion_inter_single_translation_zero_value() {
+        // First ref (LAST_FRAME) carries a TRANSLATION model whose two
+        // translational coefficients decode to 0; the other six refs are
+        // IDENTITY.
+        //
+        // LAST_FRAME bits:
+        //   is_global=1 is_rot_zoom=0 is_translation=1  ⇒ TRANSLATION
+        //   read_global_param(idx=0): with allow_high_precision_mv=0,
+        //     absBits=8, precBits=2, precDiff=14, round=0, sub=0,
+        //     mx=256, r=(PrevGmParams[1][0]=0 >> 14)=0.
+        //     decode_signed_subexp_with_ref(-256, 257, 0):
+        //       decode_unsigned_subexp_with_ref(513, 256):
+        //         v = decode_subexp(513): numSyms=513 > 0 + 3*8=24 ⇒
+        //           subexp_more_bits=0, subexp_bits=f(3)=000 ⇒ v=0.
+        //         (256<<1=512) <= 513 ⇒ inverse_recenter(256, 0)=256.
+        //       x=256 ⇒ signed result = 256 + (-256) = 0.
+        //     value = (0 << 14) + 0 = 0.
+        //     bits consumed: subexp_more_bits(1)=0 + subexp_bits(3)=000.
+        //   read_global_param(idx=1): identical structure ⇒ 4 bits, 0.
+        // Then refs LAST2_FRAME..ALTREF_FRAME: is_global=0 (6 bits).
+        let payload = pack_fields(&[
+            (1, 1), // is_global
+            (0, 1), // is_rot_zoom
+            (1, 1), // is_translation ⇒ TRANSLATION
+            (0, 1), // idx0 subexp_more_bits = 0
+            (0, 3), // idx0 subexp_bits = 0
+            (0, 1), // idx1 subexp_more_bits = 0
+            (0, 3), // idx1 subexp_bits = 0
+            (0, 1), // LAST2 is_global = 0
+            (0, 1), // LAST3 is_global = 0
+            (0, 1), // GOLDEN is_global = 0
+            (0, 1), // BWDREF is_global = 0
+            (0, 1), // ALTREF2 is_global = 0
+            (0, 1), // ALTREF is_global = 0
+        ]);
+        let (gm, n) = parse_global_motion_params(&payload, false, false, &prev_gm_params_default())
+            .expect("decodes");
+        // 3 (type) + 4 (idx0) + 4 (idx1) + 6 (remaining is_global) = 17.
+        assert_eq!(n, 17);
+        assert!(!gm.short_circuited);
+        assert_eq!(gm.gm_type[LAST_FRAME], WarpModelType::Translation);
+        // Translation only writes [0] / [1]; the diagonal defaults from
+        // the identity initialiser persist for [2] / [5].
+        let one = 1i32 << WARPEDMODEL_PREC_BITS;
+        assert_eq!(gm.gm_params[LAST_FRAME], [0, 0, one, 0, 0, one]);
+        for r in (LAST_FRAME + 1)..=ALTREF_FRAME {
+            assert_eq!(gm.gm_type[r], WarpModelType::Identity);
+        }
+    }
+
+    #[test]
+    fn global_motion_inter_unexpected_end() {
+        // Inter frame with no bytes ⇒ the first `is_global` read errors.
+        let empty: [u8; 0] = [];
+        let err = parse_global_motion_params(&empty, false, false, &prev_gm_params_default())
+            .expect_err("must err");
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.9.30 film_grain_params
+    // -----------------------------------------------------------------
+
+    fn fg_ctx_present_shown() -> FilmGrainContext {
+        FilmGrainContext {
+            film_grain_params_present: true,
+            show_frame: true,
+            showable_frame: false,
+            is_inter_frame: false,
+            mono_chrome: false,
+            subsampling_x: true,
+            subsampling_y: true,
+        }
+    }
+
+    #[test]
+    fn film_grain_not_present_resets_no_bits() {
+        // §5.9.30 !film_grain_params_present ⇒ reset, no bits read.
+        let ctx = FilmGrainContext {
+            film_grain_params_present: false,
+            ..fg_ctx_present_shown()
+        };
+        let payload = pack_bits(&[1, 1, 1, 1, 1, 1, 1, 1]);
+        let (fg, n) = parse_film_grain_params(&payload, ctx).expect("decodes");
+        assert_eq!(n, 0);
+        assert_eq!(fg, FilmGrainParams::reset());
+    }
+
+    #[test]
+    fn film_grain_hidden_frame_resets_no_bits() {
+        // §5.9.30 (!show_frame && !showable_frame) ⇒ reset, no bits.
+        let ctx = FilmGrainContext {
+            show_frame: false,
+            showable_frame: false,
+            ..fg_ctx_present_shown()
+        };
+        let payload = pack_bits(&[1, 1, 1, 1]);
+        let (fg, n) = parse_film_grain_params(&payload, ctx).expect("decodes");
+        assert_eq!(n, 0);
+        assert_eq!(fg, FilmGrainParams::reset());
+    }
+
+    #[test]
+    fn film_grain_apply_grain_zero_one_bit() {
+        // §5.9.30 apply_grain = 0 ⇒ reset, one bit read.
+        let ctx = fg_ctx_present_shown();
+        let payload = pack_bits(&[0]);
+        let (fg, n) = parse_film_grain_params(&payload, ctx).expect("decodes");
+        assert_eq!(n, 1);
+        assert!(!fg.apply_grain);
+        assert_eq!(fg, FilmGrainParams::reset());
+    }
+
+    #[test]
+    fn film_grain_predicted_path_inter_frame() {
+        // §5.9.30 INTER_FRAME, apply_grain=1, update_grain=0 ⇒ read
+        // film_grain_params_ref_idx then return (predicted path).
+        let ctx = FilmGrainContext {
+            is_inter_frame: true,
+            ..fg_ctx_present_shown()
+        };
+        let payload = pack_fields(&[
+            (1, 1),       // apply_grain
+            (0xBEEF, 16), // grain_seed
+            (0, 1),       // update_grain (INTER ⇒ read) = 0
+            (5, 3),       // film_grain_params_ref_idx = 5
+        ]);
+        let (fg, n) = parse_film_grain_params(&payload, ctx).expect("decodes");
+        // 1 + 16 + 1 + 3 = 21 bits.
+        assert_eq!(n, 21);
+        assert!(fg.apply_grain);
+        assert!(!fg.update_grain);
+        assert!(fg.predicted);
+        assert_eq!(fg.grain_seed, 0xBEEF);
+        assert_eq!(fg.film_grain_params_ref_idx, 5);
+        // num_y_points etc. stay at reset defaults on the predicted path.
+        assert_eq!(fg.num_y_points, 0);
+    }
+
+    #[test]
+    fn film_grain_chroma_suppressed_420_no_y_points() {
+        // §5.9.30 4:2:0 + num_y_points == 0 ⇒ chroma points suppressed.
+        // KEY frame (update_grain derived 1), chroma_scaling_from_luma=0.
+        let ctx = fg_ctx_present_shown(); // 4:2:0, not mono, not inter.
+        let payload = pack_fields(&[
+            (1, 1),  // apply_grain
+            (0, 16), // grain_seed
+            // update_grain derived 1 (not inter) ⇒ no bit
+            (0, 4), // num_y_points = 0
+            (0, 1), // chroma_scaling_from_luma = 0
+            // suppress_chroma (4:2:0 && num_y_points==0) ⇒ no num_cb/cr
+            (1, 2), // grain_scaling_minus_8 = 1 ⇒ GrainScaling = 9
+            (0, 2), // ar_coeff_lag = 0 ⇒ numPosLuma = 0
+            // num_y_points==0 ⇒ no ar_coeffs_y; cfl=0 && num_cb=0 ⇒ none
+            (2, 2), // ar_coeff_shift_minus_6 = 2 ⇒ ArCoeffShift = 8
+            (0, 2), // grain_scale_shift = 0
+            // num_cb_points==0 && num_cr_points==0 ⇒ no mult/offset
+            (1, 1), // overlap_flag = 1
+            (0, 1), // clip_to_restricted_range = 0
+        ]);
+        let (fg, n) = parse_film_grain_params(&payload, ctx).expect("decodes");
+        // 1 + 16 + 4 + 1 + 2 + 2 + 2 + 2 + 1 + 1 = 32 bits.
+        assert_eq!(n, 32);
+        assert!(fg.apply_grain);
+        assert!(fg.update_grain);
+        assert!(!fg.predicted);
+        assert_eq!(fg.num_y_points, 0);
+        assert!(!fg.chroma_scaling_from_luma);
+        assert_eq!(fg.num_cb_points, 0);
+        assert_eq!(fg.num_cr_points, 0);
+        assert_eq!(fg.grain_scaling, 9);
+        assert_eq!(fg.ar_coeff_lag, 0);
+        assert_eq!(fg.ar_coeff_shift, 8);
+        assert_eq!(fg.grain_scale_shift, 0);
+        assert!(fg.overlap_flag);
+        assert!(!fg.clip_to_restricted_range);
+    }
+
+    #[test]
+    fn film_grain_full_luma_and_chroma_points() {
+        // §5.9.30 full path: 1 Y point + 1 Cb point + 1 Cr point,
+        // ar_coeff_lag = 1 ⇒ numPosLuma = 2*1*2 = 4, numPosChroma = 5.
+        let ctx = fg_ctx_present_shown();
+        let mut fields: Vec<(u32, u32)> = vec![
+            (1, 1),       // apply_grain
+            (0xABCD, 16), // grain_seed
+            // update_grain derived 1
+            (1, 4),  // num_y_points = 1
+            (10, 8), // point_y_value[0]
+            (20, 8), // point_y_scaling[0]
+            (0, 1),  // chroma_scaling_from_luma = 0
+            // not suppressed: num_y_points>0 so 4:2:0 branch doesn't fire
+            (1, 4),  // num_cb_points = 1
+            (30, 8), // point_cb_value[0]
+            (40, 8), // point_cb_scaling[0]
+            (1, 4),  // num_cr_points = 1
+            (50, 8), // point_cr_value[0]
+            (60, 8), // point_cr_scaling[0]
+            (3, 2),  // grain_scaling_minus_8 = 3 ⇒ 11
+            (1, 2),  // ar_coeff_lag = 1 ⇒ numPosLuma = 4
+        ];
+        // ar_coeffs_y_plus_128[0..4] (num_y_points>0).
+        for v in [100u32, 101, 102, 103] {
+            fields.push((v, 8));
+        }
+        // numPosChroma = 5; num_cb_points>0 ⇒ cb coeffs.
+        for v in [110u32, 111, 112, 113, 114] {
+            fields.push((v, 8));
+        }
+        // num_cr_points>0 ⇒ cr coeffs.
+        for v in [120u32, 121, 122, 123, 124] {
+            fields.push((v, 8));
+        }
+        fields.push((1, 2)); // ar_coeff_shift_minus_6 = 1 ⇒ 7
+        fields.push((2, 2)); // grain_scale_shift = 2
+                             // num_cb_points>0 ⇒ cb mult/offset.
+        fields.push((128, 8)); // cb_mult
+        fields.push((192, 8)); // cb_luma_mult
+        fields.push((256, 9)); // cb_offset
+                               // num_cr_points>0 ⇒ cr mult/offset.
+        fields.push((130, 8)); // cr_mult
+        fields.push((190, 8)); // cr_luma_mult
+        fields.push((300, 9)); // cr_offset
+        fields.push((0, 1)); // overlap_flag
+        fields.push((1, 1)); // clip_to_restricted_range
+        let payload = pack_fields(&fields);
+        let (fg, _n) = parse_film_grain_params(&payload, ctx).expect("decodes");
+        assert!(fg.apply_grain);
+        assert!(fg.update_grain);
+        assert_eq!(fg.grain_seed, 0xABCD);
+        assert_eq!(fg.num_y_points, 1);
+        assert_eq!(fg.point_y_value[0], 10);
+        assert_eq!(fg.point_y_scaling[0], 20);
+        assert!(!fg.chroma_scaling_from_luma);
+        assert_eq!(fg.num_cb_points, 1);
+        assert_eq!(fg.point_cb_value[0], 30);
+        assert_eq!(fg.point_cb_scaling[0], 40);
+        assert_eq!(fg.num_cr_points, 1);
+        assert_eq!(fg.point_cr_value[0], 50);
+        assert_eq!(fg.point_cr_scaling[0], 60);
+        assert_eq!(fg.grain_scaling, 11);
+        assert_eq!(fg.ar_coeff_lag, 1);
+        assert_eq!(&fg.ar_coeffs_y_plus_128[0..4], &[100, 101, 102, 103]);
+        assert_eq!(&fg.ar_coeffs_cb_plus_128[0..5], &[110, 111, 112, 113, 114]);
+        assert_eq!(&fg.ar_coeffs_cr_plus_128[0..5], &[120, 121, 122, 123, 124]);
+        assert_eq!(fg.ar_coeff_shift, 7);
+        assert_eq!(fg.grain_scale_shift, 2);
+        assert_eq!(fg.cb_mult, 128);
+        assert_eq!(fg.cb_luma_mult, 192);
+        assert_eq!(fg.cb_offset, 256);
+        assert_eq!(fg.cr_mult, 130);
+        assert_eq!(fg.cr_luma_mult, 190);
+        assert_eq!(fg.cr_offset, 300);
+        assert!(!fg.overlap_flag);
+        assert!(fg.clip_to_restricted_range);
+    }
+
+    #[test]
+    fn film_grain_unexpected_end() {
+        // apply_grain=1 then EOF before grain_seed ⇒ error.
+        let ctx = fg_ctx_present_shown();
+        let payload = pack_bits(&[1]); // only apply_grain available
+        let err = parse_film_grain_params(&payload, ctx).expect_err("must err");
         assert_eq!(err, Error::UnexpectedEnd);
     }
 }

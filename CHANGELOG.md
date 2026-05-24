@@ -6,6 +6,68 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 13 — the §5.9.2 uncompressed-header tail (`global_motion_params()`
+  / `film_grain_params()`) wired into the streaming `parse_frame_header`
+  walk.** For intra (`KEY_FRAME` / `INTRA_ONLY_FRAME`) frames the parser
+  now descends past `read_tx_mode()` to the end of `uncompressed_header()`:
+  `frame_reference_mode()` (§5.9.23), `skip_mode_params()` (§5.9.22), the
+  `allow_warped_motion` slot, `reduced_tx_set` (`f(1)`),
+  `global_motion_params()` (§5.9.24), and `film_grain_params()` (§5.9.30).
+
+  For an intra frame the §5.9.23 `FrameIsIntra ⇒ reference_select = 0`,
+  the §5.9.22 `skipModeAllowed = 0 ⇒ skip_mode_present = 0`, the §5.9.2
+  `allow_warped_motion` guard (`FrameIsIntra || error_resilient_mode ||
+  !enable_warped_motion`), and the §5.9.24 `FrameIsIntra` identity
+  short-circuit all consume no bits; only `reduced_tx_set` (one `f(1)`
+  bit) and the `film_grain_params()` block read from the stream.
+
+  New types: `WarpModelType` (a 4-variant §6.8.18 enum
+  `Identity/Translation/RotZoom/Affine` with `as_u8()`),
+  `GlobalMotionParams` (`gm_type[8]` / `gm_params[8][6]` indexed by
+  reference-frame index, `short_circuited`, with an `identity()`
+  constructor and `prev_gm_params_default()` helper), `FilmGrainParams`
+  (the full §5.9.30 field set — `apply_grain`, `grain_seed`,
+  `update_grain`, `film_grain_params_ref_idx`, the Y / Cb / Cr scaling
+  points, AR coefficients, `grain_scaling`, `ar_coeff_lag`,
+  `ar_coeff_shift`, `grain_scale_shift`, the chroma mult/offset triplets,
+  `overlap_flag`, `clip_to_restricted_range`, plus `predicted`, with a
+  `reset()` constructor), and `FilmGrainContext` (the §5.5.x / §5.9.2
+  inputs). New constants: `REFS_PER_FRAME`, `INTRA_FRAME`, `LAST_FRAME`,
+  `ALTREF_FRAME`, `WARPEDMODEL_PREC_BITS`, the six `GM_*` precision/bit
+  constants, `MAX_NUM_Y_POINTS`, `MAX_NUM_CHROMA_POINTS`,
+  `MAX_AR_COEFFS_Y`, `MAX_AR_COEFFS_UV`.
+
+  The complete §5.9.24/§5.9.25 inter global-motion syntax is implemented
+  (`read_global_param` + the §5.9.26–§5.9.29
+  `decode_signed_subexp_with_ref` / `decode_unsigned_subexp_with_ref` /
+  `decode_subexp` / `inverse_recenter` sub-exponential decoders), exposed
+  via the standalone `parse_global_motion_params(payload, frame_is_intra,
+  allow_high_precision_mv, prev_gm_params)`; `film_grain_params()` is
+  exposed via `parse_film_grain_params(payload, ctx)`. New fields on
+  `FrameHeader`: `reference_select` / `skip_mode_present` /
+  `allow_warped_motion` / `reduced_tx_set` (`Option<bool>`),
+  `global_motion_params: Option<GlobalMotionParams>`,
+  `film_grain_params: Option<FilmGrainParams>` (`Some` for intra frames,
+  `None` for inter / show-existing replays).
+
+  Validation: 14 new unit tests (`WarpModelType` symbol values; the
+  §5.9.24 identity defaults; the intra global-motion no-bits
+  short-circuit; an inter all-IDENTITY 7-bit walk; an inter
+  single-TRANSLATION subexp decode; global-motion unexpected-end; the
+  three §5.9.30 short-circuits — `!present`, hidden frame, `apply_grain =
+  0`; the INTER predicted `update_grain = 0` path; the 4:2:0 chroma
+  suppression branch; a full luma + chroma + AR-coeff path; film-grain
+  unexpected-end). The 16-fixture frame-header integration test now
+  asserts the new tail columns (`reference_select` / `skip_mode_present`
+  / `allow_warped_motion` / `reduced_tx_set` = 0, global-motion identity)
+  on every fixture, and the `film-grain-on` fixture's full 718-byte FRAME
+  OBU payload is embedded so its `apply_grain = 1` `film_grain_params()`
+  (14 Y points, 8 Cb + 9 Cr points, `ar_coeff_lag = 2`, `seed = 45231`,
+  `scaling_minus_8 = 11`, `clip_restricted = 1`) is validated byte-exact
+  against the fixture trace. The `parses_tiny_key_frame_prefix`
+  `bits_consumed` rises from 71 to 72 (one `reduced_tx_set` bit;
+  `film_grain_params_present = 0` ⇒ film grain resets).
+
 * **Round 12 — `read_tx_mode()` (§5.9.21) wired into the streaming
   `parse_frame_header` walk.** For intra (`KEY_FRAME` /
   `INTRA_ONLY_FRAME`) frames the parser now descends past `lr_params()`

@@ -127,10 +127,11 @@ use crate::bitreader::BitReader;
 use crate::sequence_header::{SequenceHeader, SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
 use crate::tile_info::{read_tile_info, TileInfo};
 use crate::uncompressed_header_tail::{
-    read_cdef_params, read_delta_lf_params, read_delta_q_params, read_loop_filter_params,
-    read_lr_params, read_quantization_params, read_segmentation_params, read_tx_mode, CdefParams,
-    DeltaLfParams, DeltaQParams, LoopFilterParams, LrParams, QuantizationParams,
-    SegmentationParams, TxMode, MAX_SEGMENTS, SEG_LVL_ALT_Q,
+    prev_gm_params_default, read_cdef_params, read_delta_lf_params, read_delta_q_params,
+    read_film_grain_params, read_global_motion_params, read_loop_filter_params, read_lr_params,
+    read_quantization_params, read_segmentation_params, read_tx_mode, CdefParams, DeltaLfParams,
+    DeltaQParams, FilmGrainContext, FilmGrainParams, GlobalMotionParams, LoopFilterParams,
+    LrParams, QuantizationParams, SegmentationParams, TxMode, MAX_SEGMENTS, SEG_LVL_ALT_Q,
 };
 use crate::Error;
 
@@ -441,10 +442,40 @@ pub struct FrameHeader {
     /// `tx_mode_select` slot selects [`TxMode::TxModeSelect`] (`1`) or
     /// [`TxMode::TxModeLargest`] (`0`).
     pub tx_mode: Option<TxMode>,
-    /// Total bits consumed from `payload` by this parse. The next
-    /// round will continue from this position to decode the
-    /// `frame_reference_mode()` block (intra path) or the inter-frame
-    /// `frame_refs_short_signaling` block (inter path).
+    /// `reference_select` (§5.9.23 `frame_reference_mode()`). `Some`
+    /// whenever `tx_mode` is `Some` (intra frames); `None` for inter /
+    /// show-existing-frame paths. For an intra frame the §5.9.23
+    /// `FrameIsIntra` branch forces `reference_select = 0` with no bits
+    /// read.
+    pub reference_select: Option<bool>,
+    /// `skip_mode_present` (§5.9.22 `skip_mode_params()`). `Some` for
+    /// intra frames; `None` otherwise. For an intra frame the §5.9.22
+    /// `FrameIsIntra` branch sets `skipModeAllowed = 0` so
+    /// `skip_mode_present = 0` with no bits read.
+    pub skip_mode_present: Option<bool>,
+    /// `allow_warped_motion` (§5.9.2). `Some` for intra frames; `None`
+    /// otherwise. The §5.9.2 `FrameIsIntra || error_resilient_mode ||
+    /// !enable_warped_motion` guard forces it to `0` (no bits read) for
+    /// every intra frame.
+    pub allow_warped_motion: Option<bool>,
+    /// `reduced_tx_set` (§5.9.2 `f(1)`). `Some` for intra frames;
+    /// `None` otherwise. Always read from the bitstream (one bit) on
+    /// the intra path.
+    pub reduced_tx_set: Option<bool>,
+    /// `global_motion_params()` (§5.9.24) result. `Some` for intra
+    /// frames; `None` otherwise. On the intra path the §5.9.24
+    /// `FrameIsIntra` short-circuit leaves every ref `IDENTITY` with no
+    /// bits read.
+    pub global_motion_params: Option<GlobalMotionParams>,
+    /// `film_grain_params()` (§5.9.30) result. `Some` for intra frames;
+    /// `None` otherwise. The §5.9.30 short-circuits
+    /// (`!film_grain_params_present`, hidden frame, or `apply_grain ==
+    /// 0`) all yield the `reset_grain_params()` defaults.
+    pub film_grain_params: Option<FilmGrainParams>,
+    /// Total bits consumed from `payload` by this parse. For intra
+    /// frames this now reaches the end of `uncompressed_header()`
+    /// (`film_grain_params()`); inter / show-existing paths stop early
+    /// as documented on the individual fields.
     pub bits_consumed: usize,
 }
 
@@ -617,6 +648,18 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         // No bits when CodedLossless == 1 (TxMode = ONLY_4X4); otherwise
         // one `tx_mode_select` `f(1)` bit.
         let tx_mode = read_tx_mode(br, coded_lossless)?;
+        // §5.9.2 spec order after read_tx_mode(): frame_reference_mode()
+        // / skip_mode_params() / allow_warped_motion / reduced_tx_set /
+        // global_motion_params() / film_grain_params(). The reduced-still
+        // frame is a shown, non-showable KEY frame.
+        let (
+            reference_select,
+            skip_mode_present,
+            allow_warped_motion,
+            reduced_tx_set,
+            global_motion_params,
+            film_grain_params,
+        ) = read_intra_uncompressed_header_tail(br, seq, true, false, FrameType::Key)?;
         return Ok(FrameHeader {
             show_existing_frame: false,
             frame_to_show_map_idx: None,
@@ -646,6 +689,12 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             cdef_params: Some(cdef_params),
             lr_params: Some(lr_params),
             tx_mode: Some(tx_mode),
+            reference_select: Some(reference_select),
+            skip_mode_present: Some(skip_mode_present),
+            allow_warped_motion: Some(allow_warped_motion),
+            reduced_tx_set: Some(reduced_tx_set),
+            global_motion_params: Some(global_motion_params),
+            film_grain_params: Some(film_grain_params),
             bits_consumed: br.position(),
         });
     }
@@ -705,6 +754,12 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             cdef_params: None,
             lr_params: None,
             tx_mode: None,
+            reference_select: None,
+            skip_mode_present: None,
+            allow_warped_motion: None,
+            reduced_tx_set: None,
+            global_motion_params: None,
+            film_grain_params: None,
             bits_consumed: br.position(),
         });
     }
@@ -834,6 +889,12 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         cdef_params,
         lr_params,
         tx_mode,
+        reference_select,
+        skip_mode_present,
+        allow_warped_motion,
+        reduced_tx_set,
+        global_motion_params,
+        film_grain_params,
     ) = if frame_is_intra {
         let fs = parse_frame_size_block(br, seq, frame_size_override_flag)?;
         let aib = read_allow_intrabc(br, allow_screen_content_tools, &fs)?;
@@ -905,6 +966,13 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         // No bits when CodedLossless == 1 (TxMode = ONLY_4X4); otherwise
         // one `tx_mode_select` `f(1)` bit.
         let tx = read_tx_mode(br, coded_lossless)?;
+        // §5.9.2 spec order after read_tx_mode(): frame_reference_mode()
+        // / skip_mode_params() / allow_warped_motion / reduced_tx_set /
+        // global_motion_params() / film_grain_params(). For an intra
+        // frame everything but `reduced_tx_set` (one `f(1)` bit) and the
+        // `film_grain_params()` reads collapses without consuming bits.
+        let (rs, smp, awm, rts, gm, fg) =
+            read_intra_uncompressed_header_tail(br, seq, show_frame, showable_frame, frame_type)?;
         (
             Some(fs),
             aib,
@@ -918,10 +986,17 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
             Some(cdef),
             Some(lr),
             Some(tx),
+            Some(rs),
+            Some(smp),
+            Some(awm),
+            Some(rts),
+            Some(gm),
+            Some(fg),
         )
     } else {
         (
-            None, false, false, None, None, None, None, None, None, None, None, None,
+            None, false, false, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None,
         )
     };
 
@@ -954,6 +1029,12 @@ fn parse_with(br: &mut BitReader<'_>, seq: &SequenceHeader) -> Result<FrameHeade
         cdef_params,
         lr_params,
         tx_mode,
+        reference_select,
+        skip_mode_present,
+        allow_warped_motion,
+        reduced_tx_set,
+        global_motion_params,
+        film_grain_params,
         bits_consumed: br.position(),
     })
 }
@@ -1008,6 +1089,68 @@ fn compute_coded_lossless(qp: &QuantizationParams, sp: &SegmentationParams) -> b
         }
     }
     true
+}
+
+/// Read the §5.9.2 tail that follows `read_tx_mode()` on the **intra**
+/// path: `frame_reference_mode()` (§5.9.23), `skip_mode_params()`
+/// (§5.9.22), the `allow_warped_motion` slot, `reduced_tx_set` (`f(1)`),
+/// `global_motion_params()` (§5.9.24), and `film_grain_params()`
+/// (§5.9.30).
+///
+/// For an intra frame every gate but `reduced_tx_set` collapses without
+/// reading bits:
+///   * `frame_reference_mode()`: `FrameIsIntra` ⇒ `reference_select = 0`.
+///   * `skip_mode_params()`: `FrameIsIntra` ⇒ `skipModeAllowed = 0` ⇒
+///     `skip_mode_present = 0`.
+///   * `allow_warped_motion`: the §5.9.2 `FrameIsIntra || ...` guard ⇒
+///     `0`.
+///   * `global_motion_params()`: the §5.9.24 `FrameIsIntra` early
+///     return ⇒ identity defaults, no bits.
+///
+/// `reduced_tx_set` is one `f(1)` bit, and `film_grain_params()` reads
+/// per §5.9.30 (which short-circuits unless the sequence enables grain
+/// *and* the frame is shown/showable *and* `apply_grain == 1`).
+#[allow(clippy::type_complexity)]
+fn read_intra_uncompressed_header_tail(
+    br: &mut BitReader<'_>,
+    seq: &SequenceHeader,
+    show_frame: bool,
+    showable_frame: bool,
+    frame_type: FrameType,
+) -> Result<(bool, bool, bool, bool, GlobalMotionParams, FilmGrainParams), Error> {
+    // §5.9.23 frame_reference_mode() — FrameIsIntra ⇒ reference_select = 0.
+    let reference_select = false;
+    // §5.9.22 skip_mode_params() — FrameIsIntra ⇒ skip_mode_present = 0.
+    let skip_mode_present = false;
+    // §5.9.2 allow_warped_motion guard fires for any intra frame.
+    let allow_warped_motion = false;
+    // §5.9.2 reduced_tx_set f(1).
+    let reduced_tx_set = br.f(1)? == 1;
+    // §5.9.24 global_motion_params() — FrameIsIntra short-circuit.
+    // allow_high_precision_mv is 0 for intra frames (no read happens on
+    // this path), and PrevGmParams is irrelevant under the early return.
+    let global_motion = read_global_motion_params(br, true, false, &prev_gm_params_default())?;
+    // §5.9.30 film_grain_params().
+    let film_grain = read_film_grain_params(
+        br,
+        FilmGrainContext {
+            film_grain_params_present: seq.film_grain_params_present,
+            show_frame,
+            showable_frame,
+            is_inter_frame: matches!(frame_type, FrameType::Inter),
+            mono_chrome: seq.color_config.mono_chrome,
+            subsampling_x: seq.color_config.subsampling_x,
+            subsampling_y: seq.color_config.subsampling_y,
+        },
+    )?;
+    Ok((
+        reference_select,
+        skip_mode_present,
+        allow_warped_motion,
+        reduced_tx_set,
+        global_motion,
+        film_grain,
+    ))
 }
 
 /// `allow_intrabc` per §5.9.3 path of §5.9.2: read `f(1)` only when
@@ -1307,8 +1450,17 @@ mod tests {
         //   [CodedLossless=0 ⇒ tx_mode_select(1) read; trace tx_mode=1
         //    ⇒ TX_MODE_LARGEST ⇒ tx_mode_select=0]
         //   = +1 bit.
-        // = 71 bits total.
-        assert_eq!(fh.bits_consumed, 71);
+        // = 71 bits. Round 13 adds the §5.9.2 tail after read_tx_mode():
+        //   frame_reference_mode() [intra ⇒ reference_select=0, no bits]
+        //   skip_mode_params()     [intra ⇒ skip_mode_present=0, no bits]
+        //   allow_warped_motion    [intra guard ⇒ 0, no bits]
+        //   reduced_tx_set(1)=0    [trace reduced_tx_set=0] ⇒ +1 bit
+        //   global_motion_params() [intra ⇒ identity, no bits]
+        //   film_grain_params()    [film_grain_params_present=0 ⇒
+        //                           reset_grain_params, no bits]
+        //   = +1 bit.
+        // = 72 bits total.
+        assert_eq!(fh.bits_consumed, 72);
         let qp = fh
             .quantization_params
             .as_ref()
@@ -1371,6 +1523,26 @@ mod tests {
         // CodedLossless=0 ⇒ §5.9.21 reads tx_mode_select; trace tx_mode=1
         // ⇒ TX_MODE_LARGEST.
         assert_eq!(tx, TxMode::TxModeLargest);
+        // Round 13 §5.9.2 tail: intra ⇒ reference_select / skip_mode /
+        // allow_warped_motion all 0 (no bits); reduced_tx_set is one
+        // bit (trace=0); global_motion identity; film grain reset.
+        assert_eq!(fh.reference_select, Some(false));
+        assert_eq!(fh.skip_mode_present, Some(false));
+        assert_eq!(fh.allow_warped_motion, Some(false));
+        assert_eq!(fh.reduced_tx_set, Some(false));
+        let gm = fh
+            .global_motion_params
+            .as_ref()
+            .expect("intra frame produces global_motion_params");
+        assert!(gm.short_circuited);
+        assert_eq!(gm, &GlobalMotionParams::identity());
+        let fg = fh
+            .film_grain_params
+            .as_ref()
+            .expect("intra frame produces film_grain_params");
+        // tiny-i-only seq has film_grain_params_present=0 ⇒ reset.
+        assert!(!fg.apply_grain);
+        assert_eq!(fg, &FilmGrainParams::reset());
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
         assert!(ti.uniform_tile_spacing_flag);
         assert_eq!(ti.tile_cols, 1);
@@ -1504,7 +1676,10 @@ mod tests {
         // = 7 bits = 0b0100_0100 = 0x44. Round 7 appends:
         //   base_q_idx(8) = 0, three delta_q delta_coded(1) = 0 each,
         //   using_qmatrix(1) = 0, seg_enabled(1) = 0 ⇒ +13 zero bits.
-        // Total = 20 bits = 0b0100_0100 0000_0000 0000_0000 = three
+        // = 20 bits. Round 13 appends the §5.9.2 tail: reduced_tx_set(1)
+        //   = 0 (the only bit read on the intra tail; film_grain is reset
+        //   because this seq has film_grain_params_present=0).
+        // Total = 21 bits = 0b0100_0100 0000_0000 0000_0000 = three
         // zero-padded bytes. 0x44, 0x00, 0x00.
         let payload = [0x44u8, 0x00, 0x00];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
@@ -1521,7 +1696,20 @@ mod tests {
         assert_eq!(fh.refresh_frame_flags, 0xff);
         assert_eq!(fh.primary_ref_frame, PRIMARY_REF_NONE);
         assert!(!fh.allow_intrabc);
-        assert_eq!(fh.bits_consumed, 20);
+        assert!(!fh.reduced_tx_set.expect("intra has reduced_tx_set"));
+        assert!(
+            fh.global_motion_params
+                .as_ref()
+                .expect("intra has global_motion")
+                .short_circuited
+        );
+        assert!(
+            !fh.film_grain_params
+                .as_ref()
+                .expect("intra has film_grain")
+                .apply_grain
+        );
+        assert_eq!(fh.bits_consumed, 21);
         let qp = fh.quantization_params.as_ref().expect("intra has qp");
         assert_eq!(qp.base_q_idx, 0);
         assert!(!qp.using_qmatrix);
@@ -1567,7 +1755,9 @@ mod tests {
         //    increment / context_update_tile_id reads]
         // = 7 bits. Round 7 appends 13 zero bits for quant +
         // segmentation (same as the screen-content reduced-still test
-        // above). Total = 20 bits. 0x42 0x00 0x00.
+        // above). = 20 bits. Round 13 appends reduced_tx_set(1)=0
+        // (film_grain reset: film_grain_params_present=0). Total = 21
+        // bits. 0x42 0x00 0x00.
         let payload = [0x42u8, 0x00, 0x00];
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
         assert!(fh.allow_screen_content_tools);
@@ -1582,7 +1772,8 @@ mod tests {
         assert!(!fs.use_superres);
         assert_eq!(fs.superres_denom, SUPERRES_NUM);
         assert!(!fh.allow_intrabc);
-        assert_eq!(fh.bits_consumed, 20);
+        assert!(!fh.reduced_tx_set.expect("intra has reduced_tx_set"));
+        assert_eq!(fh.bits_consumed, 21);
         let sp = fh.segmentation_params.as_ref().expect("intra has sp");
         assert!(!sp.enabled);
         let ti = fh.tile_info.as_ref().expect("intra frame has tile_info");
@@ -1620,12 +1811,15 @@ mod tests {
         // AllLossless = CodedLossless && (FrameWidth == UpscaledWidth)
         // = true && (85 == 128) = false ⇒ NOT short-circuit; full path
         // reads NumPlanes=3 lr_type f(2) ⇒ +6 zero bits ⇒ all NONE ⇒
-        // UsesLr=0 ⇒ no shift bits. Total = 28 bits. The trailing 4
-        // bits are padding inside the 4-byte buffer.
+        // UsesLr=0 ⇒ no shift bits. = 28 bits. read_tx_mode (§5.9.21):
+        // CodedLossless=1 ⇒ ONLY_4X4, no bits. Round 13 appends
+        // reduced_tx_set(1)=0 (film_grain reset: film_grain_params_present
+        // =0). Total = 29 bits. The trailing 3 bits are padding inside
+        // the 4-byte buffer.
         let payload = [0x56u8, 0x80u8, 0x00u8, 0x00u8];
         let seq = super_resolution_seq();
         let fh = parse_frame_header(&payload, &seq).expect("decodes");
-        assert_eq!(fh.bits_consumed, 28);
+        assert_eq!(fh.bits_consumed, 29);
         let fs = fh.frame_size.expect("reduced-still produces frame_size");
         assert!(fs.use_superres);
         assert_eq!(fs.coded_denom, 3);
@@ -1711,6 +1905,12 @@ mod tests {
             0, 0, 0, // three delta_coded gates
             0, // using_qmatrix
             0, // seg_enabled
+            // base_q_idx=0, no deltas, seg disabled ⇒ CodedLossless=1 ⇒
+            // delta_q (base_q_idx==0, no read), loop_filter / cdef / lr /
+            // read_tx_mode all short-circuit (0 bits). Round 13 reads
+            // reduced_tx_set(1)=0 (film_grain reset:
+            // film_grain_params_present=0 in tiny_seq).
+            0, // reduced_tx_set
         ];
         let mut payload = vec![0u8; bits.len().div_ceil(8)];
         for (i, &b) in bits.iter().enumerate() {
@@ -1725,6 +1925,7 @@ mod tests {
         assert_eq!(fs.render_height, 30);
         assert_eq!(fs.frame_width, 16);
         assert_eq!(fs.frame_height, 16);
+        assert!(!fh.reduced_tx_set.expect("intra has reduced_tx_set"));
         assert_eq!(fh.bits_consumed, bits.len());
     }
 
@@ -2177,7 +2378,14 @@ mod tests {
         }
         //   loop_filter_delta_enabled(1) = 0 (stop; no update walk).
         bits.push(0);
-        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        // After loop_filter_params() the parser walks cdef_params()
+        // (enable_cdef=0 ⇒ short-circuit, 0 bits), lr_params()
+        // (enable_restoration=0 ⇒ short-circuit, 0 bits), read_tx_mode()
+        // (CodedLossless=0 ⇒ tx_mode_select(1)=0 ⇒ TX_MODE_LARGEST), then
+        // the round-13 tail: reduced_tx_set(1)=0 plus film_grain reset
+        // (film_grain_params_present=0). Provide two extra zero bytes of
+        // tail so those reads land on padding rather than the buffer end.
+        let mut payload = vec![0u8; bits.len().div_ceil(8) + 2];
         for (i, &b) in bits.iter().enumerate() {
             if b != 0 {
                 payload[i / 8] |= 1 << (7 - (i % 8));
@@ -2201,5 +2409,20 @@ mod tests {
         // `tx_mode_select` bit from the zero-padded tail (= 0) ⇒
         // TX_MODE_LARGEST.
         assert_eq!(fh.tx_mode, Some(TxMode::TxModeLargest));
+        // Round-13 tail off the zero padding: reduced_tx_set=0,
+        // global motion identity, film grain reset.
+        assert_eq!(fh.reduced_tx_set, Some(false));
+        assert!(
+            fh.global_motion_params
+                .as_ref()
+                .expect("intra has global_motion")
+                .short_circuited
+        );
+        assert!(
+            !fh.film_grain_params
+                .as_ref()
+                .expect("intra has film_grain")
+                .apply_grain
+        );
     }
 }

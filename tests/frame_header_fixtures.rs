@@ -174,6 +174,35 @@ struct Expected {
     /// `2` = TX_MODE_SELECT (`tx_mode_select = 1`). Asserted against
     /// [`oxideav_av1::TxMode`] via its §6.8.21 symbol value.
     trace_tx_mode: u8,
+    /// `reduced_tx_set` column from the `FRAME_HEADER` trace line
+    /// (§5.9.2, one `f(1)` bit on the intra path). The whole corpus
+    /// reports `reduced_tx_set=0`.
+    trace_reduced_tx_set: bool,
+    /// `FILM_GRAIN_PARAMS` trace expectation (§5.9.30). `None` for every
+    /// fixture whose film grain short-circuits (`apply_grain=0` or the
+    /// `(!show_frame && !showable_frame)` / `!film_grain_params_present`
+    /// guards); `Some` only for `film-grain-on` whose `apply_grain=1`
+    /// frame carries a full set of FGS parameters.
+    trace_film_grain: Option<FilmGrainExpected>,
+}
+
+/// The `FILM_GRAIN_PARAMS` trace columns for a full `apply_grain=1`
+/// frame (§5.9.30 / §6.8.20). `ar_coeff_shift` / `grain_scaling` are the
+/// **decoded** values the trace logs (`+6` / `+8` applied).
+#[derive(Debug)]
+struct FilmGrainExpected {
+    seed: u16,
+    update_grain: bool,
+    num_y_points: u8,
+    chroma_from_luma: bool,
+    num_cb_points: u8,
+    num_cr_points: u8,
+    ar_coeff_lag: u8,
+    ar_coeff_shift: u8,
+    grain_scale_shift: u8,
+    grain_scaling: u8,
+    overlap: bool,
+    clip_restricted: bool,
 }
 
 /// Apply the §5.9.19 secondary-strength adjustment: a raw value of `3`
@@ -227,6 +256,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 1,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -254,6 +285,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 2,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -281,6 +314,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 2,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -308,6 +343,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -335,6 +372,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 1,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -362,6 +401,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -389,6 +430,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 1,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -416,6 +459,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 1,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -443,6 +488,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 2, trace_lr_u_type: 2, trace_lr_v_type: 2,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -474,14 +521,71 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
         name: "film-grain-on",
         seq_payload: &[0x00, 0x00, 0x00, 0x02, 0xaf, 0xff, 0x9b, 0x5f, 0x30, 0x18],
+        // Full FRAME OBU payload (718 bytes) — the §5.9.2
+        // uncompressed_header() runs well past the leading 16 bytes
+        // because this fixture's frame carries a full film_grain_params()
+        // (§5.9.30) block (14 Y points, 8 Cb + 9 Cr points, AR coeffs).
+        // Tile-group data follows the header but is ignored by the parser.
         frame_payload: &[
             0x14, 0x00, 0x2f, 0x00, 0x08, 0x21, 0xc5, 0x89, 0x02, 0x88, 0x0b, 0x61, 0x5f, 0xc2,
-            0x00, 0x03,
+            0x00, 0x03, 0x31, 0x04, 0x32, 0x05, 0x34, 0x06, 0x15, 0x07, 0x11, 0x08, 0x70, 0x0a,
+            0x52, 0x0c, 0x33, 0x0e, 0x32, 0x10, 0x16, 0x11, 0xf5, 0x13, 0xd6, 0x16, 0x57, 0x08,
+            0x10, 0x00, 0x14, 0x40, 0x1c, 0x58, 0x3c, 0x68, 0x5a, 0x88, 0x69, 0xa0, 0x86, 0xa8,
+            0xa8, 0xd0, 0x91, 0x00, 0x01, 0xc6, 0x03, 0x85, 0x04, 0x26, 0x05, 0x06, 0x86, 0xc6,
+            0x07, 0xa7, 0x08, 0x97, 0x0a, 0x9b, 0x0e, 0x80, 0x80, 0x46, 0x80, 0x80, 0x80, 0x34,
+            0xe4, 0x55, 0x80, 0x4d, 0xd2, 0x80, 0x80, 0x4f, 0x80, 0x80, 0x80, 0x5c, 0x96, 0x62,
+            0x80, 0x5a, 0x87, 0xa7, 0x80, 0x80, 0x51, 0x80, 0x80, 0x80, 0x61, 0x9f, 0x67, 0x80,
+            0x60, 0x8d, 0x1c, 0x8f, 0x7c, 0x00, 0x97, 0x2e, 0x00, 0xd9, 0xdd, 0xdd, 0xa3, 0x90,
+            0x23, 0xc8, 0x4a, 0x71, 0x55, 0x0b, 0xa8, 0xe1, 0x15, 0xe9, 0x7b, 0x9b, 0xeb, 0xa9,
+            0xa6, 0xfa, 0x40, 0x82, 0xaf, 0x10, 0xb2, 0x21, 0x96, 0xfb, 0x5b, 0xcc, 0x9b, 0x0b,
+            0x64, 0x72, 0x59, 0xd3, 0x9b, 0xa5, 0x0b, 0xee, 0x3e, 0x3f, 0xd5, 0xb2, 0xc7, 0x0e,
+            0xcc, 0x25, 0xf5, 0xca, 0x7a, 0xfa, 0x05, 0xf6, 0x60, 0x41, 0x7d, 0xa9, 0x9b, 0x0c,
+            0x48, 0x4c, 0x9f, 0x13, 0xa0, 0xe4, 0xfd, 0x75, 0xe9, 0x8e, 0xfe, 0x83, 0x93, 0x7c,
+            0xc5, 0x94, 0x45, 0x28, 0x11, 0x19, 0x9f, 0xfa, 0xff, 0x0a, 0xe7, 0x38, 0x34, 0xaa,
+            0xbc, 0x8b, 0xd1, 0xb0, 0x61, 0xef, 0xbe, 0x92, 0x7b, 0x33, 0x51, 0x50, 0xe3, 0x88,
+            0x47, 0xf2, 0x2c, 0x3d, 0x7a, 0xd3, 0x55, 0x6c, 0x58, 0x2c, 0x34, 0x0f, 0xc4, 0x54,
+            0x81, 0x1d, 0xb1, 0xb3, 0x7d, 0x6d, 0x86, 0x86, 0x83, 0xbe, 0xd6, 0xf2, 0x60, 0x1a,
+            0x4f, 0x12, 0x49, 0x29, 0x23, 0xa2, 0xae, 0xa8, 0x94, 0x9f, 0xfb, 0xd5, 0xcd, 0x41,
+            0x40, 0x27, 0x62, 0x24, 0x81, 0xf9, 0xb1, 0xd6, 0x5f, 0x0b, 0xef, 0x0b, 0xd7, 0xf7,
+            0x40, 0x3f, 0xe1, 0xd5, 0xf1, 0x04, 0x79, 0xa7, 0x40, 0x5a, 0x12, 0x82, 0xfc, 0x22,
+            0x63, 0x4e, 0x99, 0xfc, 0xb5, 0x71, 0x77, 0x0f, 0x65, 0x1a, 0xce, 0x23, 0xe4, 0x48,
+            0x9b, 0x9b, 0xb6, 0x88, 0x98, 0x7b, 0xb9, 0xfd, 0x37, 0xff, 0xf1, 0x8b, 0x92, 0xfd,
+            0xa3, 0x07, 0xca, 0xc1, 0x2b, 0xbb, 0x87, 0x44, 0xaa, 0xbb, 0x52, 0x6b, 0xf2, 0x4d,
+            0x87, 0x3f, 0x70, 0x58, 0x8b, 0x6c, 0x0b, 0x0e, 0x66, 0x81, 0x70, 0xd7, 0xa3, 0xd0,
+            0x67, 0x85, 0x4e, 0xab, 0xbe, 0x31, 0x72, 0xfc, 0x15, 0xc5, 0xd5, 0x64, 0xf6, 0x6f,
+            0x86, 0xf6, 0x3c, 0x1f, 0x3c, 0x04, 0xa8, 0x40, 0x0f, 0x05, 0xbb, 0x55, 0x84, 0xd6,
+            0x03, 0x36, 0x7a, 0xef, 0x89, 0x65, 0x7d, 0xf3, 0x5f, 0x5f, 0xc5, 0x21, 0x25, 0x4f,
+            0xaf, 0x62, 0x79, 0xc8, 0x95, 0xcb, 0x8a, 0x26, 0xdc, 0xc5, 0x75, 0xe1, 0xef, 0x3d,
+            0x91, 0x13, 0x77, 0x9a, 0xcc, 0xf3, 0xa1, 0xa7, 0x4d, 0xb1, 0xe9, 0x8f, 0x76, 0xb5,
+            0x8d, 0x20, 0x6f, 0xf5, 0xa3, 0x0e, 0xcb, 0x88, 0x0a, 0x76, 0x1b, 0x58, 0x03, 0xaf,
+            0x65, 0x52, 0x73, 0x94, 0x7e, 0xdf, 0xf2, 0x92, 0x2f, 0xdf, 0x2e, 0x8c, 0x2b, 0xd9,
+            0xb8, 0x98, 0x14, 0xbb, 0xe5, 0x4c, 0xc0, 0x4c, 0xc2, 0xa0, 0x2f, 0xa7, 0xfc, 0xd3,
+            0x32, 0x86, 0x02, 0x13, 0xda, 0x53, 0xee, 0xd7, 0xe2, 0x67, 0xb9, 0x22, 0x9d, 0x20,
+            0x72, 0x0c, 0x86, 0x10, 0xd2, 0xa6, 0x1d, 0xaa, 0xa0, 0xed, 0x83, 0xc6, 0x51, 0x27,
+            0xef, 0xb5, 0xfe, 0x5f, 0x61, 0x50, 0x90, 0xb8, 0xeb, 0x0d, 0xb2, 0xfb, 0x3d, 0xe6,
+            0xa5, 0x7e, 0xeb, 0xa8, 0x1c, 0xd8, 0xf8, 0x29, 0xfa, 0x84, 0x96, 0xa6, 0x89, 0x6c,
+            0xf6, 0xfc, 0xbc, 0xfa, 0xe2, 0x18, 0xdb, 0x3f, 0xe8, 0x31, 0x5f, 0x58, 0x00, 0x7c,
+            0x85, 0xe6, 0x12, 0xda, 0xa0, 0xee, 0x10, 0xc1, 0x10, 0x06, 0x9c, 0x10, 0x5d, 0xcd,
+            0x03, 0x06, 0x11, 0xdd, 0x2e, 0x13, 0x56, 0x86, 0x43, 0x9a, 0xc5, 0xbb, 0x42, 0x87,
+            0x3e, 0x12, 0x9a, 0x77, 0x42, 0x0a, 0xb2, 0xbe, 0x61, 0x3d, 0x4b, 0x1c, 0x40, 0x5b,
+            0xff, 0xa0, 0xd8, 0x67, 0x6d, 0xbb, 0x00, 0x74, 0x00, 0x90, 0x15, 0x38, 0x3f, 0xf3,
+            0x24, 0xac, 0x69, 0x7a, 0xe4, 0xbf, 0x9e, 0xdf, 0x5a, 0x57, 0xda, 0x3c, 0xf9, 0x35,
+            0x43, 0x19, 0x3f, 0x52, 0xa0, 0xc3, 0x67, 0x11, 0x87, 0x27, 0x2c, 0x40, 0x12, 0xa3,
+            0x07, 0x4f, 0xce, 0x45, 0xcf, 0x1c, 0x62, 0x16, 0xbe, 0x09, 0xa6, 0x70, 0x88, 0xb1,
+            0xb5, 0x31, 0x91, 0xe3, 0x7c, 0x87, 0x43, 0x6c, 0x79, 0xfa, 0x92, 0xc0, 0x39, 0x91,
+            0xf2, 0xfc, 0x17, 0xa3, 0x77, 0x64, 0x53, 0x5f, 0x56, 0x28, 0xff, 0xb5, 0xc7, 0xa6,
+            0x22, 0x1f, 0x7a, 0xe8, 0xca, 0x2e, 0x96, 0xce, 0x4a, 0x9b, 0xd1, 0x58, 0x92, 0x2b,
+            0x43, 0x7a, 0xfc, 0xd3, 0xc8, 0xb0, 0x59, 0x07, 0x8f, 0x08, 0xb7, 0xd4, 0x75, 0x1b,
+            0x13, 0x7e, 0x66, 0xf7, 0x3e, 0x84, 0xbf, 0x38, 0x66, 0x74, 0x81, 0x55, 0xe3, 0x0b,
+            0xeb, 0x3e, 0x1f, 0xd9, 0x67, 0x11, 0xae, 0x05, 0x16, 0x24, 0xce, 0x20, 0xb6, 0xb7,
+            0xec, 0xd0, 0xec, 0x55,
         ],
         expected: Expected {
             show_existing_frame: false, frame_to_show_map_idx: None,
@@ -501,6 +605,15 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: Some(FilmGrainExpected {
+                seed: 45231, update_grain: true,
+                num_y_points: 14, chroma_from_luma: false,
+                num_cb_points: 8, num_cr_points: 9,
+                ar_coeff_lag: 2, ar_coeff_shift: 8,
+                grain_scale_shift: 0, grain_scaling: 11,
+                overlap: false, clip_restricted: true,
+            }),
         },
     },
     Fixture {
@@ -529,6 +642,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 3, trace_lr_u_type: 3, trace_lr_v_type: 0,
             trace_lr_unit_shift: 2, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -557,6 +672,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -593,6 +710,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -628,6 +747,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 0,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
     Fixture {
@@ -655,6 +776,8 @@ const FIXTURES: &[Fixture] = &[
             trace_lr_y_type: 0, trace_lr_u_type: 0, trace_lr_v_type: 0,
             trace_lr_unit_shift: 0, trace_lr_uv_shift: 0,
             trace_tx_mode: 2,
+            trace_reduced_tx_set: false,
+            trace_film_grain: None,
         },
     },
 ];
@@ -1138,6 +1261,137 @@ fn all_corpus_fixtures_round_trip_frame_header_prefix() {
                 "{}: tx_mode ONLY_4X4 (CodedLossless) expected {} got {}",
                 fx.name, expect_only_4x4, tx_is_only_4x4,
             ));
+        }
+
+        // Round 13: §5.9.2 tail after read_tx_mode(). Every corpus
+        // fixture's first frame is intra, so frame_reference_mode() /
+        // skip_mode_params() / allow_warped_motion all collapse to 0 with
+        // no bits, and reduced_tx_set is one bit (trace = 0 everywhere).
+        if fh.reference_select != Some(false) {
+            mismatches.push(format!(
+                "{}: reference_select expected Some(false) got {:?}",
+                fx.name, fh.reference_select,
+            ));
+        }
+        if fh.skip_mode_present != Some(false) {
+            mismatches.push(format!(
+                "{}: skip_mode_present expected Some(false) got {:?}",
+                fx.name, fh.skip_mode_present,
+            ));
+        }
+        if fh.allow_warped_motion != Some(false) {
+            mismatches.push(format!(
+                "{}: allow_warped_motion expected Some(false) got {:?}",
+                fx.name, fh.allow_warped_motion,
+            ));
+        }
+        if fh.reduced_tx_set != Some(fx.expected.trace_reduced_tx_set) {
+            mismatches.push(format!(
+                "{}: reduced_tx_set expected Some({}) got {:?}",
+                fx.name, fx.expected.trace_reduced_tx_set, fh.reduced_tx_set,
+            ));
+        }
+        // §5.9.24 global_motion_params(): intra ⇒ identity short-circuit.
+        let gm = fh
+            .global_motion_params
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture {}: expected global_motion = Some(..)", fx.name));
+        if !gm.short_circuited {
+            mismatches.push(format!(
+                "{}: global_motion expected short-circuit (intra)",
+                fx.name,
+            ));
+        }
+        if *gm != oxideav_av1::GlobalMotionParams::identity() {
+            mismatches.push(format!(
+                "{}: global_motion expected identity defaults",
+                fx.name
+            ));
+        }
+
+        // §5.9.30 film_grain_params().
+        let fg = fh
+            .film_grain_params
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture {}: expected film_grain = Some(..)", fx.name));
+        match &fx.expected.trace_film_grain {
+            None => {
+                // Short-circuit fixtures: apply_grain = 0 ⇒ reset.
+                if fg.apply_grain {
+                    mismatches.push(format!(
+                        "{}: film_grain expected apply_grain=0 (reset), got apply_grain=1",
+                        fx.name,
+                    ));
+                }
+            }
+            Some(e) => {
+                if !fg.apply_grain {
+                    mismatches.push(format!("{}: film_grain expected apply_grain=1", fx.name));
+                }
+                let checks: [(&str, u32, u32); 11] = [
+                    ("seed", u32::from(e.seed), u32::from(fg.grain_seed)),
+                    (
+                        "update_grain",
+                        u32::from(e.update_grain),
+                        u32::from(fg.update_grain),
+                    ),
+                    (
+                        "num_y_points",
+                        u32::from(e.num_y_points),
+                        u32::from(fg.num_y_points),
+                    ),
+                    (
+                        "chroma_from_luma",
+                        u32::from(e.chroma_from_luma),
+                        u32::from(fg.chroma_scaling_from_luma),
+                    ),
+                    (
+                        "num_cb_points",
+                        u32::from(e.num_cb_points),
+                        u32::from(fg.num_cb_points),
+                    ),
+                    (
+                        "num_cr_points",
+                        u32::from(e.num_cr_points),
+                        u32::from(fg.num_cr_points),
+                    ),
+                    (
+                        "ar_coeff_lag",
+                        u32::from(e.ar_coeff_lag),
+                        u32::from(fg.ar_coeff_lag),
+                    ),
+                    (
+                        "ar_coeff_shift",
+                        u32::from(e.ar_coeff_shift),
+                        u32::from(fg.ar_coeff_shift),
+                    ),
+                    (
+                        "grain_scale_shift",
+                        u32::from(e.grain_scale_shift),
+                        u32::from(fg.grain_scale_shift),
+                    ),
+                    (
+                        "grain_scaling",
+                        u32::from(e.grain_scaling),
+                        u32::from(fg.grain_scaling),
+                    ),
+                    ("overlap", u32::from(e.overlap), u32::from(fg.overlap_flag)),
+                ];
+                for (label, want, got) in checks {
+                    if want != got {
+                        mismatches.push(format!(
+                            "{}: film_grain {label} expected {want} got {got}",
+                            fx.name,
+                        ));
+                    }
+                }
+                if e.clip_restricted != fg.clip_to_restricted_range {
+                    mismatches.push(format!(
+                        "{}: film_grain clip_restricted expected {} got {}",
+                        fx.name, e.clip_restricted, fg.clip_to_restricted_range,
+                    ));
+                }
+            }
         }
 
         if !mismatches.is_empty() {

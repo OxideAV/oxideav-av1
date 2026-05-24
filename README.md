@@ -374,6 +374,28 @@ Bitstream parsing currently covers:
   `tx_mode_select = 0`); the other 11 are `tx_mode = 2`
   (TX_MODE_SELECT, `tx_mode_select = 1`).
 
+* **The §5.9.2 uncompressed-header tail wired into the streaming parser
+  (round 13).** After `read_tx_mode()` the intra path now walks to the
+  end of `uncompressed_header()`: `frame_reference_mode()` (§5.9.23),
+  `skip_mode_params()` (§5.9.22), the `allow_warped_motion` slot,
+  `reduced_tx_set` (`f(1)`), `global_motion_params()` (§5.9.24), and
+  `film_grain_params()` (§5.9.30). For an intra frame all but
+  `reduced_tx_set` (one bit) and `film_grain_params()` collapse without
+  reading bits. New types `WarpModelType`, `GlobalMotionParams`
+  (`gm_type[8]` / `gm_params[8][6]`, identity short-circuit), and
+  `FilmGrainParams` (full §5.9.30 field set); new `FrameHeader` fields
+  `reference_select` / `skip_mode_present` / `allow_warped_motion` /
+  `reduced_tx_set` / `global_motion_params` / `film_grain_params`. The
+  full §5.9.24/§5.9.25 inter global-motion syntax — `read_global_param`
+  plus the §5.9.26–§5.9.29 `decode_signed_subexp_with_ref` /
+  `decode_subexp` / `inverse_recenter` sub-exponential decoders — is
+  implemented and exposed as standalone `parse_global_motion_params`;
+  `film_grain_params()` is exposed as `parse_film_grain_params`. 14 new
+  unit tests; the integration test embeds the `film-grain-on` fixture's
+  full 718-byte FRAME OBU payload to validate the `apply_grain = 1` FGS
+  block (14 Y points, 8 Cb + 9 Cr points, `ar_coeff_lag = 2`,
+  `seed = 45231`) byte-exact against the fixture trace.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -396,12 +418,14 @@ post-downscale `FrameWidth = (128 * 8 + 6) / 12 = 85`,
 `MiCols = 22`); every other fixture is `use_superres == 0` with
 `FrameWidth == UpscaledWidth`.
 
-Frame decoding past `read_tx_mode()` (the remaining uncompressed-header
-tail — `frame_reference_mode()`, `skip_mode_params()`,
-`global_motion_params()`, `film_grain_params()` — plus tile-content
-decode — motion vectors, transform / quantisation, in-loop filters,
-film grain) is **not yet implemented**. `decode_av1` and `encode_av1`
-still return `Error::NotImplemented`.
+The intra `uncompressed_header()` is now parsed end-to-end (through
+`film_grain_params()`). The full inter-frame header path
+(`frame_refs_short_signaling`, `ref_frame_idx[]`,
+`frame_size_with_refs()`, the inter `global_motion_params()` /
+`skip_mode_params()` walks that need cross-frame reference state) and
+tile-content decode (motion vectors, transform / quantisation, in-loop
+filters, film-grain synthesis) are **not yet implemented**. `decode_av1`
+and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -504,6 +528,28 @@ still return `Error::NotImplemented`.
     `tx_mode_select` `f(1)` ⇒ `TX_MODE_SELECT` / `TX_MODE_LARGEST`
     selection), §6.8.21 (TX mode semantics — the `TxMode` symbol-value
     table `ONLY_4X4 = 0`, `TX_MODE_LARGEST = 1`, `TX_MODE_SELECT = 2`).
+  * Round 13: §3 (constants — `WARPEDMODEL_PREC_BITS = 16`, the `GM_*`
+    bit / precision constants, `IDENTITY`/`TRANSLATION`/`ROTZOOM`/
+    `AFFINE`, `LAST_FRAME`..`ALTREF_FRAME` reference-frame indices),
+    §5.9.2 (the tail ordering after `read_tx_mode()`:
+    `frame_reference_mode()` / `skip_mode_params()` / the
+    `allow_warped_motion` guard / `reduced_tx_set` `f(1)` /
+    `global_motion_params()` / `film_grain_params()`), §5.9.22
+    (`skip_mode_params` — the `FrameIsIntra` ⇒ `skipModeAllowed = 0`
+    branch), §5.9.23 (`frame_reference_mode` — `FrameIsIntra` ⇒
+    `reference_select = 0`), §5.9.24 (`global_motion_params` — the
+    identity initialiser, the `FrameIsIntra` early return, and the
+    per-ref `is_global` / `is_rot_zoom` / `is_translation` type walk),
+    §5.9.25 (`read_global_param` — `absBits` / `precBits` / `precDiff` /
+    `round` / `sub` derivation), §5.9.26–§5.9.29
+    (`decode_signed_subexp_with_ref` / `decode_unsigned_subexp_with_ref`
+    / `decode_subexp` / `inverse_recenter`), §5.9.30 (`film_grain_params`
+    — the `reset_grain_params()` short-circuits, the
+    `apply_grain` / `grain_seed` / `update_grain` reads, the predicted
+    `update_grain == 0` path, the Y / Cb / Cr scaling-point loops, the
+    chroma-suppression branch, the AR-coefficient loops, and the
+    chroma mult/offset triplets), §6.8.18 (global-motion-type symbol
+    values), §6.8.20 (film-grain params semantics).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
