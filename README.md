@@ -773,7 +773,16 @@ derivation stays in the future tile walk) then indexes by `YMode`;
 the §3 constants `BLOCK_SIZE_GROUPS = 4`,
 `UV_INTRA_MODES_CFL_NOT_ALLOWED = 13` and
 `UV_INTRA_MODES_CFL_ALLOWED = 14` are added.
-The remaining §9.4 tables (angle-delta, intra transform-type
+Round 135 lands the **angle-delta** subset — the default table
+`Default_Angle_Delta_Cdf` (8 directional-mode rows × 7 cumulative
+frequencies) — plus its §8.3.2 selection: `angle_delta_cdf(mode)`
+indexes `TileAngleDeltaCdf[ mode - V_PRED ]` (the
+`TileAngleDeltaCdf[ YMode - V_PRED ]` / `[ UVMode - V_PRED ]`
+selection shared by `angle_delta_y` / `angle_delta_uv`), returning
+`None` for non-directional modes; the §3 constants
+`DIRECTIONAL_MODES = 8`, `MAX_ANGLE_DELTA = 3` and the
+directional-mode base `V_PRED = 1` are added.
+The remaining §9.4 tables (intra transform-type
 (`intra_tx_type`, `Default_Intra_Tx_Type_Set{1,2}_Cdf`),
 inter-intra (`Default_Interintra_Cdf`),
 coefficient, …), the `init_coeff_cdfs` coefficient set, and the

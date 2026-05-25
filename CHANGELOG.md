@@ -6,6 +6,29 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 135 — §9.4 default CDF table + §8.3.1 / §8.3.2 selection
+  (angle-delta subset).** Extends `cdf` with the angle-delta default
+  table `Default_Angle_Delta_Cdf`
+  (`[DIRECTIONAL_MODES][(2 * MAX_ANGLE_DELTA + 1) + 1]`, 8 directional-mode
+  rows × 7 cumulative frequencies + adaptation counter; the
+  `angle_delta_y` / `angle_delta_uv` directional-prediction angle offset)
+  — transcribed verbatim from §9.4. New §3 constants
+  `DIRECTIONAL_MODES = 8`, `MAX_ANGLE_DELTA = 3` and the directional-mode
+  base `V_PRED = 1`. New `TileCdfContext` field `angle_delta`, initialised
+  by `TileCdfContext::new_from_defaults` per §8.3.1 ("`AngleDeltaCdf` is
+  set to a copy of `Default_Angle_Delta_Cdf`"). Selection accessor
+  `angle_delta_cdf(mode)` lands, indexing `TileAngleDeltaCdf[ mode - V_PRED ]`
+  — the §8.3.2 `TileAngleDeltaCdf[ YMode - V_PRED ]` /
+  `TileAngleDeltaCdf[ UVMode - V_PRED ]` selection for the luma / chroma
+  elements — returning `None` for non-directional modes (below `V_PRED`
+  or at/above `V_PRED + DIRECTIONAL_MODES`). All new types / constants
+  re-exported at the crate root. Tests grow by 5 (cdf module): table
+  well-formedness + strict-monotonicity against §3 constants,
+  byte-anchor spot-checks of the §9.4 row values, §8.3.1 init-copy
+  independence with mutate-doesn't-touch-source assertions, selector
+  row-equality across every directional mode plus non-directional-mode
+  `None` returns, and an end-to-end §8.2 `SymbolDecoder` decode driving
+  `Default_Angle_Delta_Cdf[2]` selected by `angle_delta_cdf(D45_PRED)`.
 * **Round 134 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (inter-frame intra-mode subset).** Extends `cdf` with the three
   inter-frame intra-mode default tables — `Default_Y_Mode_Cdf`

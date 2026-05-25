@@ -102,7 +102,13 @@
 //!       * `Default_Uv_Mode_Cfl_Allowed_Cdf` (`uv_mode` when
 //!         chroma-from-luma is allowed, keyed by `YMode`).
 //!
-//! The remaining `Default_*_Cdf` arrays of §9.4 (the angle-delta,
+//!   * **Angle-delta** (round 135):
+//!       * `Default_Angle_Delta_Cdf` (`angle_delta_y` / `angle_delta_uv`,
+//!         keyed by the directional intra mode rebased onto
+//!         `0..DIRECTIONAL_MODES` via `YMode - V_PRED` /
+//!         `UVMode - V_PRED`).
+//!
+//! The remaining `Default_*_Cdf` arrays of §9.4 (the
 //! intra transform-type (`intra_tx_type`,
 //! `Default_Intra_Tx_Type_Set{1,2}_Cdf`), coefficient,
 //! inter-intra group), the
@@ -469,6 +475,28 @@ pub const UV_INTRA_MODES_CFL_ALLOWED: usize = 14;
 pub const SIZE_GROUP: [usize; BLOCK_SIZES] = [
     0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2,
 ];
+
+/// `DIRECTIONAL_MODES` (§3) — number of directional intra modes, i.e. the
+/// span of `YMode` / `UVMode` values from `V_PRED` to `D67_PRED`
+/// inclusive. Drives the outer dimension of [`DEFAULT_ANGLE_DELTA_CDF`].
+/// The §8.3.2 `angle_delta_y` / `angle_delta_uv` selections index that
+/// table by `YMode - V_PRED` / `UVMode - V_PRED`, a value in
+/// `0..DIRECTIONAL_MODES`.
+pub const DIRECTIONAL_MODES: usize = 8;
+
+/// `MAX_ANGLE_DELTA` (§3) — maximum magnitude of `AngleDeltaY` and
+/// `AngleDeltaUV`. The coded `angle_delta_y` / `angle_delta_uv` syntax
+/// elements are biased by `MAX_ANGLE_DELTA` so as to encode a positive
+/// value, so they range over `0..(2 * MAX_ANGLE_DELTA + 1)`; that span
+/// (`2 * MAX_ANGLE_DELTA + 1 == 7`) is the cumulative-frequency width of
+/// [`DEFAULT_ANGLE_DELTA_CDF`].
+pub const MAX_ANGLE_DELTA: usize = 3;
+
+/// `V_PRED` (§6.10.x intra-mode enumeration) — the first directional
+/// intra mode (`DC_PRED == 0`, `V_PRED == 1`, …, `D67_PRED == 8`). The
+/// §8.3.2 `angle_delta` selections rebase a directional `YMode` / `UVMode`
+/// onto `0..DIRECTIONAL_MODES` by subtracting this value.
+pub const V_PRED: usize = 1;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -1578,6 +1606,25 @@ pub const DEFAULT_UV_MODE_CFL_ALLOWED_CDF: [[u16; UV_INTRA_MODES_CFL_ALLOWED + 1
     ],
 ];
 
+/// `Default_Angle_Delta_Cdf[ DIRECTIONAL_MODES ][ (2 * MAX_ANGLE_DELTA + 1) + 1 ]`
+/// (§9.4). The CDF for the `angle_delta_y` / `angle_delta_uv` syntax
+/// elements (the directional intra-prediction angle offset, biased by
+/// `MAX_ANGLE_DELTA`). Indexed by the directional mode rebased onto
+/// `0..DIRECTIONAL_MODES` (`YMode - V_PRED` for luma, `UVMode - V_PRED`
+/// for chroma) per the §8.3.2 selection. Each row carries
+/// `2 * MAX_ANGLE_DELTA + 1 = 7` cumulative frequencies (the last being
+/// `1 << 15 == 32768`) plus the §8.3 adaptation counter (starts at 0).
+pub const DEFAULT_ANGLE_DELTA_CDF: [[u16; (2 * MAX_ANGLE_DELTA + 1) + 1]; DIRECTIONAL_MODES] = [
+    [2180, 5032, 7567, 22776, 26989, 30217, 32768, 0],
+    [2301, 5608, 8801, 23487, 26974, 30330, 32768, 0],
+    [3780, 11018, 13699, 19354, 23083, 31286, 32768, 0],
+    [4581, 11226, 15147, 17138, 21834, 28397, 32768, 0],
+    [1737, 10927, 14509, 19588, 22745, 28823, 32768, 0],
+    [2664, 10176, 12485, 17650, 21600, 30495, 32768, 0],
+    [2240, 11096, 15453, 20341, 22561, 28917, 32768, 0],
+    [3605, 10428, 12459, 17676, 21244, 30655, 32768, 0],
+];
+
 // ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
@@ -1812,6 +1859,15 @@ pub struct TileCdfContext {
     /// `TileUVModeCflAllowedCdf[ INTRA_MODES ]` (§8.3.1). Codes `uv_mode`
     /// when chroma-from-luma is allowed, selected by `YMode`.
     pub uv_mode_cfl_allowed: [[u16; UV_INTRA_MODES_CFL_ALLOWED + 1]; INTRA_MODES],
+
+    // -----------------------------------------------------------------
+    // Round 135 — angle-delta group. §8.3.1 enumerates this as
+    // "`AngleDeltaCdf` is set to a copy of `Default_Angle_Delta_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileAngleDeltaCdf[ DIRECTIONAL_MODES ]` (§8.3.1). Codes the
+    /// `angle_delta_y` / `angle_delta_uv` directional-angle offset,
+    /// selected by `YMode - V_PRED` / `UVMode - V_PRED`.
+    pub angle_delta: [[u16; (2 * MAX_ANGLE_DELTA + 1) + 1]; DIRECTIONAL_MODES],
 }
 
 impl TileCdfContext {
@@ -1921,6 +1977,9 @@ impl TileCdfContext {
             y_mode: DEFAULT_Y_MODE_CDF,
             uv_mode_cfl_not_allowed: DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF,
             uv_mode_cfl_allowed: DEFAULT_UV_MODE_CFL_ALLOWED_CDF,
+
+            // Round 135 — angle-delta group.
+            angle_delta: DEFAULT_ANGLE_DELTA_CDF,
         }
     }
 
@@ -2421,6 +2480,31 @@ impl TileCdfContext {
             Some(&mut self.uv_mode_cfl_allowed[y_mode])
         } else {
             Some(&mut self.uv_mode_cfl_not_allowed[y_mode])
+        }
+    }
+
+    /// §8.3.2 `angle_delta_y` / `angle_delta_uv`: the cdf is
+    /// `TileAngleDeltaCdf[ YMode - V_PRED ]` for the luma element and
+    /// `TileAngleDeltaCdf[ UVMode - V_PRED ]` for the chroma element. Both
+    /// rebase the directional intra mode onto `0..DIRECTIONAL_MODES` by
+    /// subtracting `V_PRED`; this selector takes the directional `mode`
+    /// (`YMode` for `angle_delta_y`, `UVMode` for `angle_delta_uv`) and
+    /// performs the subtraction.
+    ///
+    /// `angle_delta_y` / `angle_delta_uv` are only read when the mode is
+    /// directional (`V_PRED <= mode <= D67_PRED`, i.e. the `is_directional_mode`
+    /// gate in the §5.11 mode-info read). Returns `None` if `mode < V_PRED`
+    /// or `mode - V_PRED >= DIRECTIONAL_MODES` (a non-directional mode — a
+    /// caller bug, since the syntax wouldn't have coded an `angle_delta`).
+    pub fn angle_delta_cdf(&mut self, mode: usize) -> Option<&mut [u16]> {
+        if mode < V_PRED {
+            return None;
+        }
+        let idx = mode - V_PRED;
+        if idx < DIRECTIONAL_MODES {
+            Some(&mut self.angle_delta[idx])
+        } else {
+            None
         }
     }
 }
@@ -5055,5 +5139,133 @@ mod tests {
         }
         assert_eq!(DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[0][0], 22631);
         assert_eq!(DEFAULT_UV_MODE_CFL_ALLOWED_CDF[0][0], 10407);
+    }
+
+    // Round 135 — angle-delta group tests.
+
+    /// §8.3.1 / §9.4: the angle-delta default table is well-formed. The
+    /// §3 constants are pinned, the outer dimension matches
+    /// `DIRECTIONAL_MODES`, each row carries `2 * MAX_ANGLE_DELTA + 1 = 7`
+    /// cumulative frequencies + the adaptation counter, the
+    /// second-to-last entry is `1 << 15` and the last is a fresh-0
+    /// counter, and the cumulative frequencies strictly increase to
+    /// `32768`.
+    #[test]
+    fn angle_delta_default_table_well_formed() {
+        // §3 constants pinned.
+        assert_eq!(DIRECTIONAL_MODES, 8);
+        assert_eq!(MAX_ANGLE_DELTA, 3);
+        assert_eq!(V_PRED, 1);
+        assert_eq!(2 * MAX_ANGLE_DELTA + 1, 7);
+
+        // Outer / inner dimensions.
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF.len(), DIRECTIONAL_MODES);
+        assert_eq!(
+            DEFAULT_ANGLE_DELTA_CDF[0].len(),
+            (2 * MAX_ANGLE_DELTA + 1) + 1
+        );
+
+        for row in &DEFAULT_ANGLE_DELTA_CDF {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+            for w in row[..n].windows(2) {
+                assert!(w[0] < w[1], "cdf must be strictly increasing: {row:?}");
+            }
+        }
+    }
+
+    /// Spot-check the §9.4 angle-delta default values byte-for-byte. A
+    /// mis-keyed digit during transcription breaks the equality.
+    #[test]
+    fn angle_delta_default_byte_exact_values() {
+        // First / last directional-mode rows.
+        assert_eq!(
+            DEFAULT_ANGLE_DELTA_CDF[0],
+            [2180, 5032, 7567, 22776, 26989, 30217, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_ANGLE_DELTA_CDF[7],
+            [3605, 10428, 12459, 17676, 21244, 30655, 32768, 0]
+        );
+        // A couple of interior rows + leading-frequency anchors.
+        assert_eq!(
+            DEFAULT_ANGLE_DELTA_CDF[3],
+            [4581, 11226, 15147, 17138, 21834, 28397, 32768, 0]
+        );
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF[1][0], 2301);
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF[2][0], 3780);
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF[4][0], 1737);
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF[5][2], 12485);
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF[6][4], 22561);
+    }
+
+    /// §8.3.1: a fresh context copies the angle-delta default in (the
+    /// §9.4 source is not aliased), and mutating the working copy leaves
+    /// the source untouched.
+    #[test]
+    fn angle_delta_init_from_defaults_copies_table() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.angle_delta, DEFAULT_ANGLE_DELTA_CDF);
+
+        // V_PRED maps to row 0.
+        ctx.angle_delta_cdf(V_PRED).unwrap()[0] = 12345;
+        assert_ne!(ctx.angle_delta[0][0], DEFAULT_ANGLE_DELTA_CDF[0][0]);
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF[0][0], 2180);
+    }
+
+    /// §8.3.2 `angle_delta_y` / `angle_delta_uv` selector: takes the
+    /// directional `YMode` / `UVMode` and rebases by `V_PRED`, returning
+    /// `TileAngleDeltaCdf[ mode - V_PRED ]`. Confirms every directional
+    /// mode maps to the right §9.4 row and that non-directional modes
+    /// (below `V_PRED`, or at/above `V_PRED + DIRECTIONAL_MODES`) return
+    /// `None`.
+    #[test]
+    fn angle_delta_selector_returns_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        // mode = V_PRED .. V_PRED + DIRECTIONAL_MODES - 1 → rows 0..8.
+        for (i, want) in DEFAULT_ANGLE_DELTA_CDF.iter().enumerate() {
+            let mode = V_PRED + i;
+            let row = ctx.angle_delta_cdf(mode).unwrap();
+            assert_eq!(row.len(), (2 * MAX_ANGLE_DELTA + 1) + 1);
+            assert_eq!(row, want);
+        }
+
+        // DC_PRED (0, below V_PRED) is non-directional → None.
+        assert!(ctx.angle_delta_cdf(0).is_none());
+        // SMOOTH_PRED (9 == V_PRED + DIRECTIONAL_MODES) and beyond → None.
+        assert!(ctx.angle_delta_cdf(V_PRED + DIRECTIONAL_MODES).is_none());
+        assert!(ctx
+            .angle_delta_cdf(V_PRED + DIRECTIONAL_MODES + 3)
+            .is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through an
+    /// angle-delta default CDF selected by the §8.3.2 selection (a
+    /// directional `YMode`, here `D45_PRED == V_PRED + 2`), confirming the
+    /// chosen row matches the §9.4 source, the decoded symbol lands in
+    /// `0..(2 * MAX_ANGLE_DELTA + 1)` and the working copy adapts.
+    #[test]
+    fn decode_angle_delta_through_default_cdf() {
+        // D45_PRED = 3 → angle-delta row 3 - V_PRED = 2.
+        let mode = V_PRED + 2;
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.angle_delta;
+
+        let row = tile_ctx.angle_delta_cdf(mode).unwrap();
+        assert_eq!(row, &DEFAULT_ANGLE_DELTA_CDF[2]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            (sym as usize) < (2 * MAX_ANGLE_DELTA + 1),
+            "angle_delta must code a symbol in 0..(2 * MAX_ANGLE_DELTA + 1)"
+        );
+        assert_ne!(
+            tile_ctx.angle_delta, before,
+            "read_symbol must adapt the working CDF"
+        );
+        assert_eq!(DEFAULT_ANGLE_DELTA_CDF[2][0], 3780);
     }
 }
