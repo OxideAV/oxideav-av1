@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-25
 
-**Clean-room rebuild, round 20.** The crate's prior implementation was
+**Clean-room rebuild, round 21.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -635,6 +635,50 @@ Bitstream parsing currently covers:
   binary `TileTxfmSplitCdf[ 2 ]` row selected by
   `txfm_split_ctx(true, true, 4, 4) = 2`.
 
+* **§9.4 default CDF tables + §8.3.2 selection — inter-frame
+  transform-type subset (round 21).** Extends `cdf` with the three
+  inter-frame transform-type default tables
+  (`Default_Inter_Tx_Type_Set1_Cdf[ 2 ][ 17 ]` — the 16-symbol full
+  set for 4x4 / 8x8 inter blocks reaching `TX_SET_INTER_1`;
+  `Default_Inter_Tx_Type_Set2_Cdf[ 13 ]` — the 12-symbol 16x16-only
+  set for `TX_SET_INTER_2`; `Default_Inter_Tx_Type_Set3_Cdf[ 4 ][ 3 ]`
+  — the 2-symbol `{ IDTX, DCT_DCT }` reduced set for
+  `TX_SET_INTER_3`) — all transcribed verbatim from §9.4 with the §3
+  constants `TX_TYPES = 16`, `TX_TYPES_SET2 = 12`, `TX_TYPES_SET3 = 2`,
+  `INTER_TX_TYPE_SET1_SIZES = 2`, `INTER_TX_TYPE_SET3_SIZES = 4` and
+  the §6.10.19 transform-set tag constants `TX_SET_DCTONLY = 0` /
+  `TX_SET_INTER_1 = 1` / `TX_SET_INTER_2 = 2` / `TX_SET_INTER_3 = 3`.
+  `new_from_defaults` performs the §8.3.1 init step for every array.
+  An `&mut [u16]` accessor `inter_tx_type_cdf(set, tx_size_sqr)`
+  surfaces the §8.3.2 selection — the three-way
+  `TileInterTxTypeSet{1,2,3}Cdf` switch keyed by the §5.11.48 `set`
+  return — yielding `None` for `TX_SET_DCTONLY` (where §5.11.47
+  forces `TxType = DCT_DCT` and `inter_tx_type` is not read) and for
+  any unreachable `(set, tx_size_sqr)` combination. The scalar
+  §5.11.48 helper `inter_tx_type_set(tx_sz_sqr, tx_sz_sqr_up,
+  reduced_tx_set)` computes the `set ∈ { TX_SET_DCTONLY,
+  TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3 }` from the
+  `Tx_Size_Sqr[ txSz ]` / `Tx_Size_Sqr_Up[ txSz ]` / `reduced_tx_set`
+  inputs the surrounding §5.11.47 syntax supplies. 6 new unit tests
+  (204 in src/, up from 198): every inter-tx-type table's
+  `cdf[N-1] == 32768` / `cdf[N] == 0` invariant, dimension audit
+  against the §3 constants; byte-anchor spot-checks on every table's
+  first / last entries; §8.3.1 init-copy independence with a
+  mutate-doesn't-touch-source assertion; `inter_tx_type_cdf`
+  three-way selection with row-length assertions and unreachable-set
+  / out-of-range coverage; the `inter_tx_type_set` formula walked
+  across every reachable `(tx_sz_sqr, tx_sz_sqr_up, reduced_tx_set)`
+  triple (including the rectangular `TX_4X8` / `TX_16X32` cases
+  where `tx_sz_sqr != tx_sz_sqr_up`); and one end-to-end §8.2
+  `SymbolDecoder` decode driving the 2-symbol
+  `TileInterTxTypeSet3Cdf[ 1 ]` row selected by
+  `inter_tx_type_set(1, 1, true) = TX_SET_INTER_3`. The intra
+  counterpart (`Default_Intra_Tx_Type_Set{1,2}_Cdf` with their
+  `[INTRA_MODES][..]` second axis and the `intraDir` selection that
+  routes filter-intra modes through
+  `Filter_Intra_Mode_To_Intra_Dir`) is a mechanical follow-up
+  against the same `TileCdfContext` shape.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -688,13 +732,17 @@ round 20 extends the same `TileCdfContext` shape with the
 **transform-size** subset (`tx_depth` over the four
 per-`maxTxDepth` `Default_Tx_{8,16,32,64}x{8,16,32,64}_Cdf` arrays
 and `txfm_split` over `Default_Txfm_Split_Cdf`) plus the §8.3.2
-`tx_depth_ctx` / `txfm_split_ctx` derivations.
-The remaining §9.4 tables (y_mode, uv_mode, angle-delta,
-transform-type (`tx_type` / `inter_tx_type` / `intra_tx_type`),
-coefficient, …), the `init_coeff_cdfs` coefficient set, and the
-other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
-`uv_mode` / …) are a mechanical followup against the same
-`TileCdfContext` shape.
+`tx_depth_ctx` / `txfm_split_ctx` derivations. Round 21 lands the
+**inter-frame transform-type** subset (`inter_tx_type` over
+`Default_Inter_Tx_Type_Set{1,2,3}_Cdf`) plus the §5.11.48
+`inter_tx_type_set` switch driving the §8.3.2 three-way
+`TileInterTxTypeSet{1,2,3}Cdf` selection.
+The remaining §9.4 tables (y_mode, uv_mode, angle-delta, intra
+transform-type (`intra_tx_type`,
+`Default_Intra_Tx_Type_Set{1,2}_Cdf`), coefficient, …), the
+`init_coeff_cdfs` coefficient set, and the other §8.3.2 selections
+(`split_or_horz` / `split_or_vert` / `uv_mode` / …) are a
+mechanical followup against the same `TileCdfContext` shape.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
@@ -923,6 +971,26 @@ other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
     `Default_Tx_8x8_Cdf`, `Default_Tx_16x16_Cdf`,
     `Default_Tx_32x32_Cdf`, `Default_Tx_64x64_Cdf`,
     `Default_Txfm_Split_Cdf`).
+  * Round 21: §3 (constants — `TX_TYPES = 16`, `TX_TYPES_SET2 = 12`,
+    `TX_TYPES_SET3 = 2`), §5.11.47 (`transform_type` — the `set > 0
+    && qindex > 0 && is_inter` gate on the `inter_tx_type` `S()`
+    read + the `Tx_Type_Inter_Inv_Set{1,2,3}` inversion tables),
+    §5.11.48 (`get_tx_set` — the `is_inter == 1` branch:
+    `txSzSqrUp > TX_32X32 ⇒ TX_SET_DCTONLY` /
+    `reduced_tx_set || txSzSqrUp == TX_32X32 ⇒ TX_SET_INTER_3` /
+    `txSzSqr == TX_16X16 ⇒ TX_SET_INTER_2` / else `TX_SET_INTER_1`),
+    §6.10.19 (`set` tag enumeration — `TX_SET_DCTONLY = 0`,
+    `TX_SET_INTRA_1 = 1`, `TX_SET_INTRA_2 = 2`, `TX_SET_INTER_1 = 1`,
+    `TX_SET_INTER_2 = 2`, `TX_SET_INTER_3 = 3`), §8.3.1 (the "set
+    equal to a copy of `Default_Inter_Tx_Type_Set{1,2,3}_Cdf`" init
+    step for `InterTxTypeSet{1,2,3}Cdf`), §8.3.2 (the three-way
+    `inter_tx_type` selection by `set` over
+    `TileInterTxTypeSet1Cdf[ Tx_Size_Sqr[ txSz ] ]` /
+    `TileInterTxTypeSet2Cdf` /
+    `TileInterTxTypeSet3Cdf[ Tx_Size_Sqr[ txSz ] ]`), §9.4 (default
+    CDF table values for `Default_Inter_Tx_Type_Set1_Cdf`,
+    `Default_Inter_Tx_Type_Set2_Cdf`,
+    `Default_Inter_Tx_Type_Set3_Cdf`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

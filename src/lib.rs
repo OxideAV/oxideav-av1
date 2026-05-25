@@ -334,11 +334,34 @@
 //!     [`txfm_split_ctx`] (the
 //!     `(txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 +
 //!     above + left` formula) compute each `ctx` from scalar inputs
-//!     the §5.11.15 / §5.11.16 syntax supplies. The remaining §9.4
-//!     tables (y_mode, uv_mode, angle-delta, transform-type
-//!     (`tx_type` / `inter_tx_type` / `intra_tx_type`), coefficient,
-//!     …) are a mechanical followup against the same
-//!     [`TileCdfContext`] shape.
+//!     the §5.11.15 / §5.11.16 syntax supplies.
+//!
+//!   * **Round 21.** The §9.4 default CDF tables and the §8.3.1 /
+//!     §8.3.2 selection for the **inter-frame transform-type** syntax
+//!     group, extending [`cdf`]. Transcribes the three
+//!     `Default_Inter_Tx_Type_Set{1,2,3}_Cdf` tables
+//!     ([`DEFAULT_INTER_TX_TYPE_SET1_CDF`],
+//!     [`DEFAULT_INTER_TX_TYPE_SET2_CDF`],
+//!     [`DEFAULT_INTER_TX_TYPE_SET3_CDF`]) verbatim from §9.4 —
+//!     `Set1` for the full 16-symbol set (4x4 / 8x8 inter blocks),
+//!     `Set2` for the 16x16 inter set (12 symbols), `Set3` for the
+//!     reduced 2-symbol `{ IDTX, DCT_DCT }` set (4x4..32x32 inter
+//!     blocks). [`TileCdfContext`] grows the `inter_tx_type_set1` /
+//!     `inter_tx_type_set2` / `inter_tx_type_set3` fields, all
+//!     seeded by [`TileCdfContext::new_from_defaults`] per §8.3.1.
+//!     The §8.3.2 selection surfaces an `&mut [u16]` accessor
+//!     `inter_tx_type_cdf(set, tx_size_sqr)` (the §8.3.2 three-way
+//!     `TX_SET_INTER_{1,2,3}` switch; returns `None` for
+//!     `TX_SET_DCTONLY` per §5.11.47 and for any unreachable
+//!     `(set, tx_size_sqr)` combination). The scalar §5.11.48 helper
+//!     [`inter_tx_type_set`] computes the `set ∈ { TX_SET_DCTONLY,
+//!     TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3 }` from the
+//!     `(Tx_Size_Sqr[txSz], Tx_Size_Sqr_Up[txSz], reduced_tx_set)`
+//!     tuple supplied by the surrounding §5.11.47 syntax. The intra
+//!     counterpart (`Default_Intra_Tx_Type_Set{1,2}_Cdf` with their
+//!     extra `intraDir` axis) and the remaining §9.4 tables (y_mode,
+//!     uv_mode, angle-delta, coefficient, …) are mechanical
+//!     followups against the same [`TileCdfContext`] shape.
 //!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
@@ -361,15 +384,16 @@ pub mod tile_info;
 pub mod uncompressed_header_tail;
 
 pub use cdf::{
-    cfl_alpha_u_ctx, cfl_alpha_v_ctx, compound_mode_ctx, intra_mode_ctx, is_inter_ctx, mv_ctx,
-    palette_color_ctx, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx, ref_count_ctx,
-    segment_id_ctx, skip_ctx, skip_mode_ctx, tx_depth_ctx, txfm_split_ctx, TileCdfContext,
-    BLOCK_SIZES, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE,
-    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMP_INTER_CONTEXTS,
-    COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF,
-    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_MODE_CDF,
-    DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DRL_MODE_CDF,
-    DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
+    cfl_alpha_u_ctx, cfl_alpha_v_ctx, compound_mode_ctx, inter_tx_type_set, intra_mode_ctx,
+    is_inter_ctx, mv_ctx, palette_color_ctx, palette_uv_mode_ctx, palette_y_mode_ctx,
+    partition_ctx, ref_count_ctx, segment_id_ctx, skip_ctx, skip_mode_ctx, tx_depth_ctx,
+    txfm_split_ctx, TileCdfContext, BLOCK_SIZES, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS,
+    CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP,
+    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DEFAULT_CFL_ALPHA_CDF,
+    DEFAULT_CFL_SIGN_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMP_BWD_REF_CDF,
+    DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DRL_MODE_CDF,
+    DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF,
+    DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
     DEFAULT_IS_INTER_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
     DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
     DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
@@ -386,14 +410,16 @@ pub use cdf::{
     DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF,
     DEFAULT_SKIP_MODE_CDF, DEFAULT_TXFM_SPLIT_CDF, DEFAULT_TX_16X16_CDF, DEFAULT_TX_32X32_CDF,
     DEFAULT_TX_64X64_CDF, DEFAULT_TX_8X8_CDF, DEFAULT_UNI_COMP_REF_CDF, DEFAULT_ZERO_MV_CDF,
-    DRL_MODE_CONTEXTS, FWD_REFS, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXT,
-    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_TX_DEPTH, MV_CLASSES, MV_COMPS, MV_CONTEXTS,
-    MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS, PALETTE_BLOCK_SIZE_CONTEXTS,
-    PALETTE_COLORS, PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
-    PALETTE_MAX_COLOR_CONTEXT_HASH, PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS,
-    PALETTE_Y_MODE_CONTEXTS, PARTITION_CONTEXTS, REF_CONTEXTS, REF_MV_CONTEXTS,
-    SEGMENT_ID_CONTEXTS, SINGLE_REFS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, TXFM_PARTITION_CONTEXTS,
-    TX_SIZES, TX_SIZE_CONTEXTS, UNIDIR_COMP_REFS, ZERO_MV_CONTEXTS,
+    DRL_MODE_CONTEXTS, FWD_REFS, INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES,
+    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
+    MAX_TX_DEPTH, MV_CLASSES, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS,
+    NEW_MV_CONTEXTS, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, PALETTE_COLOR_CONTEXT,
+    PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS, PALETTE_MAX_COLOR_CONTEXT_HASH,
+    PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS, PALETTE_Y_MODE_CONTEXTS,
+    PARTITION_CONTEXTS, REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SINGLE_REFS,
+    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, TXFM_PARTITION_CONTEXTS, TX_SET_DCTONLY, TX_SET_INTER_1,
+    TX_SET_INTER_2, TX_SET_INTER_3, TX_SIZES, TX_SIZE_CONTEXTS, TX_TYPES, TX_TYPES_SET2,
+    TX_TYPES_SET3, UNIDIR_COMP_REFS, ZERO_MV_CONTEXTS,
 };
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,

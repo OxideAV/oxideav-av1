@@ -6,6 +6,46 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 21 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (inter-frame transform-type subset).** Extends `cdf` with three
+  new default tables (`Default_Inter_Tx_Type_Set1_Cdf` —
+  `[INTER_TX_TYPE_SET1_SIZES][TX_TYPES + 1]` for 4x4 / 8x8 inter
+  blocks reaching `TX_SET_INTER_1`; `Default_Inter_Tx_Type_Set2_Cdf`
+  — flat `[TX_TYPES_SET2 + 1]` for 16x16 inter blocks reaching
+  `TX_SET_INTER_2`; `Default_Inter_Tx_Type_Set3_Cdf` —
+  `[INTER_TX_TYPE_SET3_SIZES][TX_TYPES_SET3 + 1]` for 4x4..32x32
+  inter blocks reaching the reduced `{ IDTX, DCT_DCT }`
+  `TX_SET_INTER_3`) — all transcribed verbatim from §9.4. New §3
+  constants `TX_TYPES = 16`, `TX_TYPES_SET2 = 12`, `TX_TYPES_SET3 = 2`,
+  `INTER_TX_TYPE_SET1_SIZES = 2`, `INTER_TX_TYPE_SET3_SIZES = 4` and
+  the §6.10.19 transform-set tag constants `TX_SET_DCTONLY = 0`,
+  `TX_SET_INTER_1 = 1`, `TX_SET_INTER_2 = 2`, `TX_SET_INTER_3 = 3`.
+  New `TileCdfContext` fields (`inter_tx_type_set1`,
+  `inter_tx_type_set2`, `inter_tx_type_set3`), all initialised by
+  `TileCdfContext::new_from_defaults` per §8.3.1. One §8.3.2
+  selection accessor lands — `inter_tx_type_cdf(set, tx_size_sqr)`
+  (the §8.3.2 three-way `TileInterTxTypeSet{1,2,3}Cdf` switch keyed
+  by the §5.11.48 set; `None` for `TX_SET_DCTONLY` per §5.11.47 and
+  for unreachable `(set, tx_size_sqr)` combinations). New scalar
+  §5.11.48 helper `inter_tx_type_set(tx_sz_sqr, tx_sz_sqr_up,
+  reduced_tx_set)` computes the set ∈ `{ TX_SET_DCTONLY,
+  TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3 }` from the
+  `Tx_Size_Sqr` / `Tx_Size_Sqr_Up` / `reduced_tx_set` tuple supplied
+  by §5.11.47. All new types / constants / fns re-exported at the
+  crate root. Tests grow from 198 to 204 (cdf module): table
+  well-formedness + dimensions against §3 constants, byte-anchor
+  spot-checks on every transcribed table, §8.3.1 init-copy
+  independence with mutate-doesn't-touch-source assertion,
+  `inter_tx_type_cdf` three-way selection with row-length
+  assertions, `inter_tx_type_set` walk across every reachable
+  `(tx_sz_sqr, tx_sz_sqr_up, reduced_tx_set)` triple, and one
+  end-to-end §8.2 `SymbolDecoder` decode driving the 2-value
+  `TileInterTxTypeSet3Cdf[ 1 ]` row selected by the new helpers.
+  The intra counterpart (`Default_Intra_Tx_Type_Set{1,2}_Cdf`,
+  with their `[INTRA_MODES][..]` second axis and `intraDir`
+  selection) is a mechanical follow-up against the same
+  `TileCdfContext` shape.
+
 * **Round 20 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (transform-size subset).** Extends `cdf` with five new default
   tables (`Default_Tx_8x8_Cdf`, `Default_Tx_16x16_Cdf`,

@@ -72,12 +72,20 @@
 //!       * `Default_Tx_64x64_Cdf` (`tx_depth`, `maxTxDepth == 4`)
 //!       * `Default_Txfm_Split_Cdf` (`txfm_split`)
 //!
+//!   * **Inter-frame transform-type** (round 21):
+//!       * `Default_Inter_Tx_Type_Set1_Cdf` (`inter_tx_type`,
+//!         `TX_SET_INTER_1`, 4x4 / 8x8 inter blocks)
+//!       * `Default_Inter_Tx_Type_Set2_Cdf` (`inter_tx_type`,
+//!         `TX_SET_INTER_2`, 16x16 inter blocks)
+//!       * `Default_Inter_Tx_Type_Set3_Cdf` (`inter_tx_type`,
+//!         `TX_SET_INTER_3`, 4x4..32x32 reduced-set inter blocks)
+//!
 //! The remaining `Default_*_Cdf` arrays of §9.4 (the y_mode,
-//! uv_mode, angle-delta, transform-type (`tx_type` /
-//! `inter_tx_type` / `intra_tx_type`), coefficient, interpolation,
-//! motion-mode, … groups), the `init_coeff_cdfs` coefficient tables,
-//! and the §8.3.2 `split_or_horz` / `split_or_vert` /
-//! `inter_tx_type` / `intra_tx_type` / … selections are a clear
+//! uv_mode, angle-delta, intra transform-type (`intra_tx_type`,
+//! `Default_Intra_Tx_Type_Set{1,2}_Cdf`), coefficient,
+//! interpolation, motion-mode, … groups), the `init_coeff_cdfs`
+//! coefficient tables, and the §8.3.2 `split_or_horz` /
+//! `split_or_vert` / `intra_tx_type` / … selections are a clear
 //! followup: each is a mechanical transcription of one §9.4 table
 //! plus its §8.3.2 paragraph, slotted into the same
 //! [`TileCdfContext`] shape used here.
@@ -315,6 +323,61 @@ pub const MAX_TX_DEPTH: usize = 2;
 /// `txfm_split`. Drives the first dimension of
 /// `Default_Txfm_Split_Cdf` (§9.4).
 pub const TXFM_PARTITION_CONTEXTS: usize = 21;
+
+/// `TX_TYPES` (§3) — total number of inverse transform types in the
+/// `Tx_Type_Inter_Inv_Set1` enumeration (the §6.10.19 full set). Drives
+/// the symbol-count of [`DEFAULT_INTER_TX_TYPE_SET1_CDF`] (16 cumulative
+/// frequencies + one trailing adaptation counter).
+pub const TX_TYPES: usize = 16;
+
+/// `TX_TYPES_SET2` — symbol count for §6.10.19 `TX_SET_INTER_2`
+/// (`Tx_Type_Inter_Inv_Set2` has 12 entries). Drives the row width of
+/// [`DEFAULT_INTER_TX_TYPE_SET2_CDF`].
+pub const TX_TYPES_SET2: usize = 12;
+
+/// `TX_TYPES_SET3` — symbol count for §6.10.19 `TX_SET_INTER_3`
+/// (`Tx_Type_Inter_Inv_Set3 = { IDTX, DCT_DCT }`, two entries). Drives
+/// the row width of [`DEFAULT_INTER_TX_TYPE_SET3_CDF`].
+pub const TX_TYPES_SET3: usize = 2;
+
+/// `TX_SET_DCTONLY` (§6.10.19) — the trivial transform-set returned by
+/// §5.11.48 `get_tx_set()` when the block is too large or
+/// `reduced_tx_set` collapses everything to DCT_DCT. Listed for
+/// completeness alongside the inter-tx-type sets; no CDF row is read in
+/// this case (§5.11.47 forces `TxType = DCT_DCT`).
+pub const TX_SET_DCTONLY: u32 = 0;
+
+/// `TX_SET_INTER_1` (§6.10.19) — the full-inter transform set
+/// (`Tx_Type_Inter_Inv_Set1`, 16 symbols), selected when neither
+/// `reduced_tx_set` nor `txSzSqrUp == TX_32X32` apply and
+/// `txSzSqr != TX_16X16`. Returned by [`inter_tx_type_set`].
+pub const TX_SET_INTER_1: u32 = 1;
+
+/// `TX_SET_INTER_2` (§6.10.19) — the 16x16 inter transform set
+/// (`Tx_Type_Inter_Inv_Set2`, 12 symbols), selected when
+/// `txSzSqr == TX_16X16` and `reduced_tx_set == 0`. Returned by
+/// [`inter_tx_type_set`].
+pub const TX_SET_INTER_2: u32 = 2;
+
+/// `TX_SET_INTER_3` (§6.10.19) — the reduced inter transform set
+/// (`Tx_Type_Inter_Inv_Set3 = { IDTX, DCT_DCT }`), selected when
+/// `reduced_tx_set == 1` or `txSzSqrUp == TX_32X32`. Returned by
+/// [`inter_tx_type_set`].
+pub const TX_SET_INTER_3: u32 = 3;
+
+/// First-axis length of [`DEFAULT_INTER_TX_TYPE_SET1_CDF`] — two entries
+/// for `Tx_Size_Sqr[ txSz ] ∈ { TX_4X4, TX_8X8 }`, the only sizes that
+/// reach `TX_SET_INTER_1` (per §5.11.48 `get_tx_set()`: the function
+/// already returns `TX_SET_INTER_2` for `txSzSqr == TX_16X16` and
+/// `TX_SET_INTER_3` for `txSzSqrUp == TX_32X32`).
+pub const INTER_TX_TYPE_SET1_SIZES: usize = 2;
+
+/// First-axis length of [`DEFAULT_INTER_TX_TYPE_SET3_CDF`] — four
+/// entries for `Tx_Size_Sqr[ txSz ] ∈ { TX_4X4, TX_8X8, TX_16X16,
+/// TX_32X32 }`, the reachable sizes for the reduced inter-tx-type set
+/// (per §5.11.48: `txSzSqrUp > TX_32X32` already returns
+/// `TX_SET_DCTONLY`).
+pub const INTER_TX_TYPE_SET3_SIZES: usize = 4;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -1075,6 +1138,57 @@ pub const DEFAULT_TXFM_SPLIT_CDF: [[u16; 3]; TXFM_PARTITION_CONTEXTS] = [
 ];
 
 // ---------------------------------------------------------------------
+// Round 21 — inter-frame transform-type group (§9.4):
+// `Default_Inter_Tx_Type_Set{1,2,3}_Cdf`. Codes `inter_tx_type` per
+// §5.11.47 / §8.3.2 against the §6.10.19 transform-set returned by
+// §5.11.48 `get_tx_set()`. The intra counterparts
+// (`Default_Intra_Tx_Type_Set{1,2}_Cdf`) are a follow-up — they carry
+// an extra `intraDir` axis and are handled in a separate round.
+// ---------------------------------------------------------------------
+
+/// `Default_Inter_Tx_Type_Set1_Cdf[ 2 ][ TX_TYPES + 1 ]` (§9.4).
+///
+/// Selected by §8.3.2 when `set == TX_SET_INTER_1` (the full inter
+/// transform set, `Tx_Type_Inter_Inv_Set1` with 16 entries). The first
+/// axis is `Tx_Size_Sqr[ txSz ] ∈ { TX_4X4, TX_8X8 }` — the only sizes
+/// that reach `TX_SET_INTER_1` per §5.11.48 (`txSzSqr == TX_16X16`
+/// would already have been routed to `TX_SET_INTER_2`).
+pub const DEFAULT_INTER_TX_TYPE_SET1_CDF: [[u16; TX_TYPES + 1]; INTER_TX_TYPE_SET1_SIZES] = [
+    [
+        4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727,
+        28915, 30631, 32768, 0,
+    ],
+    [
+        1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517, 25010, 27116, 28856,
+        30749, 32768, 0,
+    ],
+];
+
+/// `Default_Inter_Tx_Type_Set2_Cdf[ TX_TYPES_SET2 + 1 ]` (§9.4).
+///
+/// Selected by §8.3.2 when `set == TX_SET_INTER_2` (the 16x16-only
+/// inter transform set, `Tx_Type_Inter_Inv_Set2` with 12 entries).
+/// `TX_SET_INTER_2` is reached only when `txSzSqr == TX_16X16` and
+/// `reduced_tx_set == 0`, so there is no per-`Tx_Size_Sqr` first axis.
+pub const DEFAULT_INTER_TX_TYPE_SET2_CDF: [u16; TX_TYPES_SET2 + 1] = [
+    770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768, 0,
+];
+
+/// `Default_Inter_Tx_Type_Set3_Cdf[ 4 ][ TX_TYPES_SET3 + 1 ]` (§9.4).
+///
+/// Selected by §8.3.2 when `set == TX_SET_INTER_3` (the reduced inter
+/// transform set, `Tx_Type_Inter_Inv_Set3 = { IDTX, DCT_DCT }`, two
+/// entries). The first axis is `Tx_Size_Sqr[ txSz ] ∈ { TX_4X4, TX_8X8,
+/// TX_16X16, TX_32X32 }` — `txSzSqrUp > TX_32X32` would already have
+/// been routed to `TX_SET_DCTONLY` per §5.11.48.
+pub const DEFAULT_INTER_TX_TYPE_SET3_CDF: [[u16; TX_TYPES_SET3 + 1]; INTER_TX_TYPE_SET3_SIZES] = [
+    [16384, 32768, 0],
+    [4167, 32768, 0],
+    [1998, 32768, 0],
+    [748, 32768, 0],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -1237,6 +1351,22 @@ pub struct TileCdfContext {
     /// `TileTxfmSplitCdf[ TXFM_PARTITION_CONTEXTS ]` (§8.3.1). Codes
     /// `txfm_split`.
     pub txfm_split: [[u16; 3]; TXFM_PARTITION_CONTEXTS],
+
+    // -----------------------------------------------------------------
+    // Round 21 — inter-frame transform-type group. §8.3.1 enumerates
+    // each as "`InterTxTypeSet{n}Cdf` is set equal to a copy of
+    // `Default_Inter_Tx_Type_Set{n}_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileInterTxTypeSet1Cdf[ INTER_TX_TYPE_SET1_SIZES ]` (§8.3.1).
+    /// Selected for `inter_tx_type` when `set == TX_SET_INTER_1`.
+    pub inter_tx_type_set1: [[u16; TX_TYPES + 1]; INTER_TX_TYPE_SET1_SIZES],
+    /// `TileInterTxTypeSet2Cdf` (§8.3.1). Selected for `inter_tx_type`
+    /// when `set == TX_SET_INTER_2`. Single row — no per-`Tx_Size_Sqr`
+    /// axis (only `TX_16X16` reaches this set).
+    pub inter_tx_type_set2: [u16; TX_TYPES_SET2 + 1],
+    /// `TileInterTxTypeSet3Cdf[ INTER_TX_TYPE_SET3_SIZES ]` (§8.3.1).
+    /// Selected for `inter_tx_type` when `set == TX_SET_INTER_3`.
+    pub inter_tx_type_set3: [[u16; TX_TYPES_SET3 + 1]; INTER_TX_TYPE_SET3_SIZES],
 }
 
 impl TileCdfContext {
@@ -1325,6 +1455,11 @@ impl TileCdfContext {
             tx_32x32: DEFAULT_TX_32X32_CDF,
             tx_64x64: DEFAULT_TX_64X64_CDF,
             txfm_split: DEFAULT_TXFM_SPLIT_CDF,
+
+            // Round 21 — inter-frame transform-type group.
+            inter_tx_type_set1: DEFAULT_INTER_TX_TYPE_SET1_CDF,
+            inter_tx_type_set2: DEFAULT_INTER_TX_TYPE_SET2_CDF,
+            inter_tx_type_set3: DEFAULT_INTER_TX_TYPE_SET3_CDF,
         }
     }
 
@@ -1685,6 +1820,35 @@ impl TileCdfContext {
     pub fn txfm_split_cdf(&mut self, ctx: usize) -> &mut [u16] {
         &mut self.txfm_split[ctx]
     }
+
+    /// §8.3.2 `inter_tx_type`: the cdf depends on the §5.11.48
+    /// `get_tx_set()` value as follows (spec §8.3.2, "inter_tx_type"):
+    ///
+    /// * `TX_SET_INTER_1` ⇒ `TileInterTxTypeSet1Cdf[ Tx_Size_Sqr[ txSz ] ]`
+    /// * `TX_SET_INTER_2` ⇒ `TileInterTxTypeSet2Cdf` (no `txSz` axis)
+    /// * `TX_SET_INTER_3` ⇒ `TileInterTxTypeSet3Cdf[ Tx_Size_Sqr[ txSz ] ]`
+    ///
+    /// `set` is the [`inter_tx_type_set`] result; `tx_size_sqr` is the
+    /// `Tx_Size_Sqr[ txSz ]` value supplied by §5.11.47 (in
+    /// `0..TX_SIZES`, but only the first 2 / 4 entries of Set1 / Set3
+    /// are addressable per the §5.11.48 routing). Returns `None` for
+    /// the §5.11.47 `set == TX_SET_DCTONLY` path (where `inter_tx_type`
+    /// is not read — `TxType = DCT_DCT` is forced), and for any
+    /// out-of-range `set` / `tx_size_sqr` combination that §5.11.48
+    /// would not actually produce.
+    pub fn inter_tx_type_cdf(&mut self, set: u32, tx_size_sqr: u32) -> Option<&mut [u16]> {
+        let sqr = tx_size_sqr as usize;
+        match set {
+            TX_SET_INTER_1 if sqr < INTER_TX_TYPE_SET1_SIZES => {
+                Some(&mut self.inter_tx_type_set1[sqr])
+            }
+            TX_SET_INTER_2 => Some(&mut self.inter_tx_type_set2),
+            TX_SET_INTER_3 if sqr < INTER_TX_TYPE_SET3_SIZES => {
+                Some(&mut self.inter_tx_type_set3[sqr])
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for TileCdfContext {
@@ -1993,6 +2157,42 @@ pub fn txfm_split_ctx(above: bool, left: bool, tx_sz_sqr_up: u32, max_tx_sz: u32
         Some(ctx)
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------
+// Round 21 — inter-frame transform-type §8.3.2 helpers. Mirrors the
+// `is_inter == 1` branch of §5.11.48 `get_tx_set()`.
+// ---------------------------------------------------------------------
+
+/// §5.11.48 `get_tx_set()` (the `is_inter == 1` branch). Maps the
+/// `txSzSqr` / `txSzSqrUp` pair (and the frame's `reduced_tx_set`) to
+/// the inter transform-set index `set ∈ { TX_SET_DCTONLY,
+/// TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3 }`.
+///
+/// ```text
+///   if ( txSzSqrUp > TX_32X32 )                              return TX_SET_DCTONLY
+///   if ( reduced_tx_set || txSzSqrUp == TX_32X32 )           return TX_SET_INTER_3
+///   else if ( txSzSqr == TX_16X16 )                          return TX_SET_INTER_2
+///   return TX_SET_INTER_1
+/// ```
+///
+/// `tx_sz_sqr` and `tx_sz_sqr_up` are `Tx_Size_Sqr[ txSz ]` and
+/// `Tx_Size_Sqr_Up[ txSz ]` (`TX_4X4 = 0..TX_64X64 = 4`). The intra
+/// branch is left for a follow-up round (it carries an `intraDir`
+/// axis and selects a different default-cdf family).
+pub fn inter_tx_type_set(tx_sz_sqr: u32, tx_sz_sqr_up: u32, reduced_tx_set: bool) -> u32 {
+    // §3 `TX_32X32 = 3` per the spec's per-`TX_*` constant table.
+    const TX_16X16: u32 = 2;
+    const TX_32X32: u32 = 3;
+    if tx_sz_sqr_up > TX_32X32 {
+        TX_SET_DCTONLY
+    } else if reduced_tx_set || tx_sz_sqr_up == TX_32X32 {
+        TX_SET_INTER_3
+    } else if tx_sz_sqr == TX_16X16 {
+        TX_SET_INTER_2
+    } else {
+        TX_SET_INTER_1
     }
 }
 
@@ -3273,5 +3473,195 @@ mod tests {
 
         assert_ne!(ctx.txfm_split, before, "read_symbol must adapt the CDF");
         assert_eq!(DEFAULT_TXFM_SPLIT_CDF[2][0], 20847);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 21 — inter-frame transform-type group tests.
+    // -----------------------------------------------------------------
+
+    /// §9.4 default tables: every row terminates with `1 << 15` and a
+    /// zero adaptation counter (§8.2.6 contract). Locks each
+    /// transcribed inter-tx-type default.
+    #[test]
+    fn inter_tx_type_default_tables_well_formed() {
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+        for r in &DEFAULT_INTER_TX_TYPE_SET1_CDF {
+            check(r);
+        }
+        check(&DEFAULT_INTER_TX_TYPE_SET2_CDF);
+        for r in &DEFAULT_INTER_TX_TYPE_SET3_CDF {
+            check(r);
+        }
+
+        // §3 dimensions.
+        assert_eq!(
+            DEFAULT_INTER_TX_TYPE_SET1_CDF.len(),
+            INTER_TX_TYPE_SET1_SIZES
+        );
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET1_CDF[0].len(), TX_TYPES + 1);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET2_CDF.len(), TX_TYPES_SET2 + 1);
+        assert_eq!(
+            DEFAULT_INTER_TX_TYPE_SET3_CDF.len(),
+            INTER_TX_TYPE_SET3_SIZES
+        );
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[0].len(), TX_TYPES_SET3 + 1);
+    }
+
+    /// Spot-check the first / last cumulative frequency in each §9.4
+    /// inter-tx-type transcribed table. A mis-keyed digit during
+    /// transcription breaks the equality.
+    #[test]
+    fn inter_tx_type_table_byte_anchors() {
+        // Default_Inter_Tx_Type_Set1_Cdf.
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET1_CDF[0][0], 4458);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET1_CDF[0][14], 30631);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET1_CDF[1][0], 1645);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET1_CDF[1][14], 30749);
+
+        // Default_Inter_Tx_Type_Set2_Cdf.
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET2_CDF[0], 770);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET2_CDF[10], 30529);
+
+        // Default_Inter_Tx_Type_Set3_Cdf.
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[0][0], 16384);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[1][0], 4167);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[2][0], 1998);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[3][0], 748);
+    }
+
+    /// §8.3.1: a fresh context copies every inter-tx-type default in
+    /// (independent of the source — the §9.4 array is not aliased).
+    #[test]
+    fn inter_tx_type_init_from_defaults_copies_tables() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.inter_tx_type_set1, DEFAULT_INTER_TX_TYPE_SET1_CDF);
+        assert_eq!(ctx.inter_tx_type_set2, DEFAULT_INTER_TX_TYPE_SET2_CDF);
+        assert_eq!(ctx.inter_tx_type_set3, DEFAULT_INTER_TX_TYPE_SET3_CDF);
+
+        // Working-copy independence: mutating the context must not
+        // touch the §9.4 source.
+        ctx.inter_tx_type_cdf(TX_SET_INTER_2, 0).unwrap()[0] = 12345;
+        assert_ne!(ctx.inter_tx_type_set2[0], DEFAULT_INTER_TX_TYPE_SET2_CDF[0]);
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET2_CDF[0], 770);
+    }
+
+    /// §8.3.2 `inter_tx_type` selection: each `(set, tx_size_sqr)`
+    /// picks the expected `Default_Inter_Tx_Type_Set*_Cdf` row, the
+    /// row length matches the spec's per-set symbol count, and the
+    /// unreachable / `TX_SET_DCTONLY` paths return `None`.
+    #[test]
+    fn inter_tx_type_cdf_selected_by_set() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        // TX_SET_INTER_1, Tx_Size_Sqr = TX_4X4 = 0.
+        let row1 = ctx.inter_tx_type_cdf(TX_SET_INTER_1, 0).unwrap();
+        assert_eq!(row1.len(), TX_TYPES + 1);
+        assert_eq!(row1, &DEFAULT_INTER_TX_TYPE_SET1_CDF[0]);
+        // TX_SET_INTER_1, Tx_Size_Sqr = TX_8X8 = 1.
+        let row1b = ctx.inter_tx_type_cdf(TX_SET_INTER_1, 1).unwrap();
+        assert_eq!(row1b, &DEFAULT_INTER_TX_TYPE_SET1_CDF[1]);
+
+        // TX_SET_INTER_2: tx_size_sqr is ignored (single row).
+        let row2 = ctx.inter_tx_type_cdf(TX_SET_INTER_2, 0).unwrap();
+        assert_eq!(row2.len(), TX_TYPES_SET2 + 1);
+        assert_eq!(row2, &DEFAULT_INTER_TX_TYPE_SET2_CDF);
+        // Same row regardless of tx_size_sqr.
+        let row2b = ctx.inter_tx_type_cdf(TX_SET_INTER_2, 4).unwrap();
+        assert_eq!(row2b, &DEFAULT_INTER_TX_TYPE_SET2_CDF);
+
+        // TX_SET_INTER_3, all four reachable Tx_Size_Sqr values.
+        for sqr in 0..INTER_TX_TYPE_SET3_SIZES as u32 {
+            let row = ctx.inter_tx_type_cdf(TX_SET_INTER_3, sqr).unwrap();
+            assert_eq!(row.len(), TX_TYPES_SET3 + 1);
+            assert_eq!(row, &DEFAULT_INTER_TX_TYPE_SET3_CDF[sqr as usize]);
+        }
+
+        // TX_SET_DCTONLY: §5.11.47 forces TxType = DCT_DCT and skips
+        // the inter_tx_type read; the selector returns None.
+        assert!(ctx.inter_tx_type_cdf(TX_SET_DCTONLY, 0).is_none());
+
+        // Out-of-range tx_size_sqr for Set1 / Set3.
+        assert!(ctx
+            .inter_tx_type_cdf(TX_SET_INTER_1, INTER_TX_TYPE_SET1_SIZES as u32)
+            .is_none());
+        assert!(ctx
+            .inter_tx_type_cdf(TX_SET_INTER_3, INTER_TX_TYPE_SET3_SIZES as u32)
+            .is_none());
+
+        // Out-of-range set.
+        assert!(ctx.inter_tx_type_cdf(99, 0).is_none());
+    }
+
+    /// §5.11.48 `get_tx_set()` (inter branch). Walk every reachable
+    /// `(tx_sz_sqr, tx_sz_sqr_up, reduced_tx_set)` and confirm the
+    /// helper returns the spec-prescribed set.
+    #[test]
+    fn inter_tx_type_set_get_tx_set_inter_branch() {
+        // TX_4X4 / TX_8X8 with txSzSqrUp == txSzSqr, !reduced ⇒
+        // TX_SET_INTER_1.
+        assert_eq!(inter_tx_type_set(0, 0, false), TX_SET_INTER_1);
+        assert_eq!(inter_tx_type_set(1, 1, false), TX_SET_INTER_1);
+
+        // TX_16X16 (txSzSqr == 2), !reduced ⇒ TX_SET_INTER_2.
+        assert_eq!(inter_tx_type_set(2, 2, false), TX_SET_INTER_2);
+
+        // TX_32X32 (txSzSqrUp == 3), !reduced ⇒ TX_SET_INTER_3 (the
+        // `txSzSqrUp == TX_32X32` branch fires before the
+        // `txSzSqr == TX_16X16` branch).
+        assert_eq!(inter_tx_type_set(3, 3, false), TX_SET_INTER_3);
+
+        // Reduced-tx-set forces TX_SET_INTER_3 for any sqrUp <= 32x32.
+        assert_eq!(inter_tx_type_set(0, 0, true), TX_SET_INTER_3);
+        assert_eq!(inter_tx_type_set(2, 2, true), TX_SET_INTER_3);
+        assert_eq!(inter_tx_type_set(3, 3, true), TX_SET_INTER_3);
+
+        // txSzSqrUp > TX_32X32 ⇒ TX_SET_DCTONLY regardless of
+        // reduced_tx_set / txSzSqr.
+        assert_eq!(inter_tx_type_set(0, 4, false), TX_SET_DCTONLY);
+        assert_eq!(inter_tx_type_set(3, 4, true), TX_SET_DCTONLY);
+
+        // The rectangular-tx case (txSzSqr != txSzSqrUp): e.g.
+        // a TX_4X8 block has txSzSqr = TX_4X4 (0), txSzSqrUp = TX_8X8 (1).
+        // No reduced_tx_set ⇒ TX_SET_INTER_1.
+        assert_eq!(inter_tx_type_set(0, 1, false), TX_SET_INTER_1);
+        // A TX_16X32 / TX_32X16: txSzSqr = TX_16X16 (2),
+        // txSzSqrUp = TX_32X32 (3) ⇒ TX_SET_INTER_3 (sqrUp == 32x32
+        // wins over sqr == 16x16).
+        assert_eq!(inter_tx_type_set(2, 3, false), TX_SET_INTER_3);
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through an
+    /// `inter_tx_type` default CDF selected by the §8.3.2 selection,
+    /// confirming the chosen row matches the §9.4 source, the decode
+    /// lands in range and the working copy adapts.
+    #[test]
+    fn decode_inter_tx_type_through_default_cdf() {
+        // Pick TX_SET_INTER_3 (2-symbol row, easiest to bound the
+        // decoded symbol). Use a TX_8X8 block (Tx_Size_Sqr = 1).
+        let set = inter_tx_type_set(1, 1, true);
+        assert_eq!(set, TX_SET_INTER_3);
+
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+        let before = ctx.inter_tx_type_set3;
+
+        let row = ctx.inter_tx_type_cdf(set, 1).unwrap();
+        assert_eq!(row, &DEFAULT_INTER_TX_TYPE_SET3_CDF[1]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            sym <= 1,
+            "inter_tx_type via Set3 codes one of {{ IDTX, DCT_DCT }}"
+        );
+
+        assert_ne!(
+            ctx.inter_tx_type_set3, before,
+            "read_symbol must adapt the CDF"
+        );
+        assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[1][0], 4167);
     }
 }
