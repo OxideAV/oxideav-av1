@@ -6,6 +6,40 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 138 — §9.4 default CDF table + §8.3.1 `init_coeff_cdfs` /
+  §8.3.2 selection (`coeff_base_eob` sub-group).** Lands the first
+  member of the `coeff_base` / `coeff_base_eob` / `coeff_br` braid,
+  the next gateway to tile-content decode following the round-136
+  coefficient-token entry sub-group. Extends `cdf` with
+  `Default_Coeff_Base_Eob_Cdf`
+  (`[COEFF_CDF_Q_CTXS][TX_SIZES][PLANE_TYPES][SIG_COEF_CONTEXTS_EOB][4]`)
+  transcribed verbatim from §9.4: `coeff_base_eob` codes the base
+  level of the last non-zero coefficient (the base level is
+  `coeff_base_eob + 1`, restricted to 1, 2, or 3, so only three
+  symbols are coded — a 4-entry row of 3 cumulative frequencies plus
+  the §8.3 adaptation counter). New §3 constant
+  `SIG_COEF_CONTEXTS_EOB = 4`. The §8.3.1 `init_coeff_cdfs` grows a
+  `self.coeff_base_eob = DEFAULT_COEFF_BASE_EOB_CDF[idx]` copy on the
+  `base_q_idx`-derived `idx`; `TileCdfContext::new_from_defaults`
+  seeds the field from `idx == 0` so the value is always well-formed.
+  The §8.3.2 selection surfaces `coeff_base_eob_cdf(tx_sz_ctx, ptype,
+  ctx)`, the three-way `TileCoeffBaseEobCdf[ txSzCtx ][ ptype ][ ctx ]`
+  lookup (the `get_coeff_base_ctx() - SIG_COEF_CONTEXTS +
+  SIG_COEF_CONTEXTS_EOB` reduction belongs to the not-yet-implemented
+  tile-content walk and is deferred). The two remaining tables of the
+  braid (`Default_Coeff_Base_Cdf` and `Default_Coeff_Br_Cdf`) are
+  deferred to later rounds. New type / constant re-exported at the
+  crate root. Tests grow by 6 (cdf module): `SIG_COEF_CONTEXTS_EOB`
+  pin; table dimension audit + strict-monotonicity / cdf-shape
+  well-formedness across all q-contexts; byte-anchor spot-checks of
+  the §9.4 values (luma + chroma first-context rows, the flat
+  `{10923, 21845, 32768, 0}` placeholder padding the largest TX
+  size's chroma slice across all q-contexts and ctx values, and a
+  high-q interior anchor); `init_coeff_cdfs` q-context re-selection
+  for the new field with mutate-doesn't-touch-source independence;
+  selector in-range coverage with per-axis out-of-range `None`
+  returns; one end-to-end §8.2 `SymbolDecoder` decode driving the
+  3-symbol `TileCoeffBaseEobCdf[ 0 ][ 0 ][ 0 ]` row.
 * **Round 137 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (intra-frame transform-type subset).** Completes the §6.10.19
   transform-set coverage started in round 21 by extending `cdf` with the

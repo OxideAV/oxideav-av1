@@ -858,13 +858,30 @@ Round 137 completes §9.4's transform-type coverage by adding the
 helper that derives the `intraDir` axis from `use_filter_intra` +
 `YMode` / `filter_intra_mode` via the
 `Filter_Intra_Mode_To_Intra_Dir` table.
+Round 138 lands the first member of the `coeff_base` /
+`coeff_base_eob` / `coeff_br` braid — the **`coeff_base_eob`
+sub-group** — by adding `Default_Coeff_Base_Eob_Cdf`
+(`[COEFF_CDF_Q_CTXS=4][TX_SIZES=5][PLANE_TYPES=2][SIG_COEF_CONTEXTS_EOB=4][4]`)
+transcribed verbatim from §9.4. `coeff_base_eob` codes the base
+level of the last non-zero coefficient (the base level is
+`coeff_base_eob + 1`, restricted to 1, 2, or 3, so only three
+symbols are coded). `init_coeff_cdfs` grows the new
+`self.coeff_base_eob = DEFAULT_COEFF_BASE_EOB_CDF[ idx ]` copy on
+the `base_q_idx`-derived `idx`, and the §8.3.2 selector
+`coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx)` surfaces the
+`TileCoeffBaseEobCdf[ txSzCtx ][ ptype ][ ctx ]` lookup. The §8.3.2
+ctx derivation
+(`get_coeff_base_ctx() - SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB`)
+belongs to the not-yet-implemented tile-content walk and is
+deferred along with `Default_Coeff_Base_Cdf` and
+`Default_Coeff_Br_Cdf`; the §3 constant `SIG_COEF_CONTEXTS_EOB = 4`
+is added.
 The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
 the rest of the `init_coeff_cdfs` coefficient set
-(`Default_Coeff_Base_Eob_Cdf` / `Default_Coeff_Base_Cdf` /
-`Default_Coeff_Br_Cdf`), and the other §8.3.2 selections
-(`split_or_horz` / `split_or_vert` / …) are a mechanical followup
-against the same `TileCdfContext` shape. `decode_av1` and
-`encode_av1` still return `Error::NotImplemented`.
+(`Default_Coeff_Base_Cdf` / `Default_Coeff_Br_Cdf`), and the other
+§8.3.2 selections (`split_or_horz` / `split_or_vert` / …) are a
+mechanical followup against the same `TileCdfContext` shape.
+`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -1195,6 +1212,17 @@ against the same `TileCdfContext` shape. `decode_av1` and
     `use_filter_intra == 1`, else `YMode`), §8.3.2
     `Filter_Intra_Mode_To_Intra_Dir[ INTRA_FILTER_MODES ]` table,
     §9.4 (default CDF table values for the two tables).
+  * **`coeff_base_eob` CDF** (round 138): §3 (`SIG_COEF_CONTEXTS_EOB = 4`
+    constant definition), §5.11 `coeff_base_eob` semantics (the
+    "base level is `coeff_base_eob + 1`; only base levels 1, 2, or 3
+    can be coded" note constraining the symbol set to three values),
+    §8.3.1 `init_coeff_cdfs` (the "`CoeffBaseEobCdf` is set to a
+    copy of `Default_Coeff_Base_Eob_Cdf[ idx ]`" reset step), §8.3.2
+    (the `coeff_base_eob: TileCoeffBaseEobCdf[ txSzCtx ][ ptype ][
+    ctx ]` selection plus the deferred-to-tile-walk
+    `ctx = get_coeff_base_ctx(...) - SIG_COEF_CONTEXTS +
+    SIG_COEF_CONTEXTS_EOB` derivation), §9.4 (default CDF table
+    values for `Default_Coeff_Base_Eob_Cdf`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

@@ -128,9 +128,14 @@
 //!       * `Default_Intra_Tx_Type_Set2_Cdf` (`intra_tx_type`,
 //!         `TX_SET_INTRA_2`, 4x4 / 8x8 / 16x16 intra blocks; 5 symbols).
 //!
+//!   * **Coefficient `coeff_base_eob` sub-group** (round 138) — the
+//!     first of the `init_coeff_cdfs` `coeff_base` / `coeff_base_eob` /
+//!     `coeff_br` braid:
+//!       * `Default_Coeff_Base_Eob_Cdf` (`coeff_base_eob`, the base
+//!         level of the last non-zero coefficient).
+//!
 //! The remaining `Default_*_Cdf` arrays of §9.4 (the rest of the
-//! `init_coeff_cdfs` coefficient set
-//! (`Default_Coeff_Base_Eob_Cdf` / `Default_Coeff_Base_Cdf` /
+//! `init_coeff_cdfs` coefficient set (`Default_Coeff_Base_Cdf` and
 //! `Default_Coeff_Br_Cdf`), the inter-intra group), and the §8.3.2
 //! `split_or_horz` / `split_or_vert` / … selections are a clear
 //! followup: each is a mechanical transcription of one §9.4 table
@@ -601,6 +606,13 @@ pub const EOB_COEF_CONTEXTS: usize = 9;
 /// `DC_SIGN_CONTEXTS` (§3) — number of contexts for `dc_sign`. Indexes the
 /// inner axis of [`DEFAULT_DC_SIGN_CDF`].
 pub const DC_SIGN_CONTEXTS: usize = 3;
+
+/// `SIG_COEF_CONTEXTS_EOB` (§3) — number of contexts for `coeff_base_eob`.
+/// Indexes the innermost context axis of [`DEFAULT_COEFF_BASE_EOB_CDF`].
+/// The §8.3.2 derivation reduces the full `get_coeff_base_ctx()` result
+/// onto `0..SIG_COEF_CONTEXTS_EOB` via
+/// `ctx = get_coeff_base_ctx(...) - SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB`.
+pub const SIG_COEF_CONTEXTS_EOB: usize = 4;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -3043,6 +3055,319 @@ pub const DEFAULT_DC_SIGN_CDF: [[[[u16; 3]; DC_SIGN_CONTEXTS]; PLANE_TYPES]; COE
 ];
 
 // ---------------------------------------------------------------------
+// Round 138 — coefficient `coeff_base_eob` sub-group default CDF (§9.4),
+// the first of the `coeff_base` / `coeff_base_eob` / `coeff_br` braid
+// reset by the §8.3.1 `init_coeff_cdfs` function. `coeff_base_eob`
+// codes the base level of the last non-zero coefficient: the base level
+// is `coeff_base_eob + 1`, and since this coefficient is known to be
+// non-zero only base levels 1, 2, or 3 are coded — i.e. the cdf has
+// three symbols (a 4-entry row: 3 cumulative frequencies + the §8.3
+// adaptation counter). The remaining two tables of the braid
+// (`Default_Coeff_Base_Cdf` and `Default_Coeff_Br_Cdf`) are deferred
+// to later rounds. Transcribed verbatim from the §9.4 source; the
+// outer `COEFF_CDF_Q_CTXS` axis is selected by `base_q_idx` at
+// `init_coeff_cdfs`.
+// ---------------------------------------------------------------------
+
+/// `Default_Coeff_Base_Eob_Cdf[ COEFF_CDF_Q_CTXS ][ TX_SIZES ][ PLANE_TYPES ][ SIG_COEF_CONTEXTS_EOB ][ 4 ]`
+/// (§9.4). Codes `coeff_base_eob`. Selected at `init_coeff_cdfs` by
+/// `idx` (the [`coeff_cdf_q_ctx`] value), then by `txSzCtx`, `ptype`,
+/// and the `coeff_base_eob` context (the latter is the
+/// `get_coeff_base_ctx() - SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB`
+/// reduction per §8.3.2).
+pub const DEFAULT_COEFF_BASE_EOB_CDF: [[[[[u16; 4]; SIG_COEF_CONTEXTS_EOB]; PLANE_TYPES];
+    TX_SIZES]; COEFF_CDF_Q_CTXS] = [
+    [
+        [
+            [
+                [17837, 29055, 32768, 0],
+                [29600, 31446, 32768, 0],
+                [30844, 31878, 32768, 0],
+                [24926, 28948, 32768, 0],
+            ],
+            [
+                [21365, 30026, 32768, 0],
+                [30512, 32423, 32768, 0],
+                [31658, 32621, 32768, 0],
+                [29630, 31881, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [5717, 26477, 32768, 0],
+                [30491, 31703, 32768, 0],
+                [31550, 32158, 32768, 0],
+                [29648, 31491, 32768, 0],
+            ],
+            [
+                [12608, 27820, 32768, 0],
+                [30680, 32225, 32768, 0],
+                [30809, 32335, 32768, 0],
+                [31299, 32423, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [1786, 12612, 32768, 0],
+                [30663, 31625, 32768, 0],
+                [32339, 32468, 32768, 0],
+                [31148, 31833, 32768, 0],
+            ],
+            [
+                [18857, 23865, 32768, 0],
+                [31428, 32428, 32768, 0],
+                [31744, 32373, 32768, 0],
+                [31775, 32526, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [1787, 2532, 32768, 0],
+                [30832, 31662, 32768, 0],
+                [31824, 32682, 32768, 0],
+                [32133, 32569, 32768, 0],
+            ],
+            [
+                [13751, 22235, 32768, 0],
+                [32089, 32409, 32768, 0],
+                [27084, 27920, 32768, 0],
+                [29291, 32594, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [1725, 3449, 32768, 0],
+                [31102, 31935, 32768, 0],
+                [32457, 32613, 32768, 0],
+                [32412, 32649, 32768, 0],
+            ],
+            [
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+            ],
+        ],
+    ],
+    [
+        [
+            [
+                [17560, 29888, 32768, 0],
+                [29671, 31549, 32768, 0],
+                [31007, 32056, 32768, 0],
+                [27286, 30006, 32768, 0],
+            ],
+            [
+                [26594, 31212, 32768, 0],
+                [31208, 32582, 32768, 0],
+                [31835, 32637, 32768, 0],
+                [30595, 32206, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [15239, 29932, 32768, 0],
+                [31315, 32095, 32768, 0],
+                [32130, 32434, 32768, 0],
+                [30864, 31996, 32768, 0],
+            ],
+            [
+                [26279, 30968, 32768, 0],
+                [31142, 32495, 32768, 0],
+                [31713, 32540, 32768, 0],
+                [31929, 32594, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [2644, 25198, 32768, 0],
+                [32038, 32451, 32768, 0],
+                [32639, 32695, 32768, 0],
+                [32166, 32518, 32768, 0],
+            ],
+            [
+                [17187, 27668, 32768, 0],
+                [31714, 32550, 32768, 0],
+                [32283, 32678, 32768, 0],
+                [31930, 32563, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [1044, 2257, 32768, 0],
+                [30755, 31923, 32768, 0],
+                [32208, 32693, 32768, 0],
+                [32244, 32615, 32768, 0],
+            ],
+            [
+                [21317, 26207, 32768, 0],
+                [29133, 30868, 32768, 0],
+                [29311, 31231, 32768, 0],
+                [29657, 31087, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [478, 1834, 32768, 0],
+                [31005, 31987, 32768, 0],
+                [32317, 32724, 32768, 0],
+                [30865, 32648, 32768, 0],
+            ],
+            [
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+            ],
+        ],
+    ],
+    [
+        [
+            [
+                [20092, 30774, 32768, 0],
+                [30695, 32020, 32768, 0],
+                [31131, 32103, 32768, 0],
+                [28666, 30870, 32768, 0],
+            ],
+            [
+                [27258, 31095, 32768, 0],
+                [31804, 32623, 32768, 0],
+                [31763, 32528, 32768, 0],
+                [31438, 32506, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [18049, 30489, 32768, 0],
+                [31706, 32286, 32768, 0],
+                [32163, 32473, 32768, 0],
+                [31550, 32184, 32768, 0],
+            ],
+            [
+                [27116, 30842, 32768, 0],
+                [31971, 32598, 32768, 0],
+                [32088, 32576, 32768, 0],
+                [32067, 32664, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [12854, 29093, 32768, 0],
+                [32272, 32558, 32768, 0],
+                [32667, 32729, 32768, 0],
+                [32306, 32585, 32768, 0],
+            ],
+            [
+                [25476, 30366, 32768, 0],
+                [32169, 32687, 32768, 0],
+                [32479, 32689, 32768, 0],
+                [31673, 32634, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [2809, 19301, 32768, 0],
+                [32205, 32622, 32768, 0],
+                [32338, 32730, 32768, 0],
+                [31786, 32616, 32768, 0],
+            ],
+            [
+                [22737, 29105, 32768, 0],
+                [30810, 32362, 32768, 0],
+                [30014, 32627, 32768, 0],
+                [30528, 32574, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [935, 3382, 32768, 0],
+                [30789, 31909, 32768, 0],
+                [32466, 32756, 32768, 0],
+                [30860, 32513, 32768, 0],
+            ],
+            [
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+            ],
+        ],
+    ],
+    [
+        [
+            [
+                [22497, 31198, 32768, 0],
+                [31715, 32495, 32768, 0],
+                [31606, 32337, 32768, 0],
+                [30388, 31990, 32768, 0],
+            ],
+            [
+                [27877, 31584, 32768, 0],
+                [32170, 32728, 32768, 0],
+                [32155, 32688, 32768, 0],
+                [32219, 32702, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [21457, 31043, 32768, 0],
+                [31951, 32483, 32768, 0],
+                [32153, 32562, 32768, 0],
+                [31473, 32215, 32768, 0],
+            ],
+            [
+                [27558, 31151, 32768, 0],
+                [32020, 32640, 32768, 0],
+                [32097, 32575, 32768, 0],
+                [32242, 32719, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [19980, 30591, 32768, 0],
+                [32219, 32597, 32768, 0],
+                [32581, 32706, 32768, 0],
+                [31803, 32287, 32768, 0],
+            ],
+            [
+                [26473, 30507, 32768, 0],
+                [32431, 32723, 32768, 0],
+                [32196, 32611, 32768, 0],
+                [31588, 32528, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [24647, 30463, 32768, 0],
+                [32412, 32695, 32768, 0],
+                [32468, 32720, 32768, 0],
+                [31269, 32523, 32768, 0],
+            ],
+            [
+                [28482, 31505, 32768, 0],
+                [32152, 32701, 32768, 0],
+                [31732, 32598, 32768, 0],
+                [31767, 32712, 32768, 0],
+            ],
+        ],
+        [
+            [
+                [12358, 24977, 32768, 0],
+                [31331, 32385, 32768, 0],
+                [32634, 32756, 32768, 0],
+                [30411, 32548, 32768, 0],
+            ],
+            [
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+                [10923, 21845, 32768, 0],
+            ],
+        ],
+    ],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -3334,6 +3659,16 @@ pub struct TileCdfContext {
     /// `TileDcSignCdf[ PLANE_TYPES ][ DC_SIGN_CONTEXTS ]` (§8.3.1). Codes
     /// the binary `dc_sign`.
     pub dc_sign: [[[u16; 3]; DC_SIGN_CONTEXTS]; PLANE_TYPES],
+
+    // -----------------------------------------------------------------
+    // Round 138 — `coeff_base_eob` sub-group. §8.3.1 enumerates this as
+    // "`CoeffBaseEobCdf` is set to a copy of `Default_Coeff_Base_Eob_Cdf
+    // [ idx ]`". The working copy drops the `COEFF_CDF_Q_CTXS` axis;
+    // [`TileCdfContext::init_coeff_cdfs`] performs the per-`idx` copy.
+    // -----------------------------------------------------------------
+    /// `TileCoeffBaseEobCdf[ TX_SIZES ][ PLANE_TYPES ][ SIG_COEF_CONTEXTS_EOB ]`
+    /// (§8.3.1). Codes `coeff_base_eob`.
+    pub coeff_base_eob: [[[[u16; 4]; SIG_COEF_CONTEXTS_EOB]; PLANE_TYPES]; TX_SIZES],
 }
 
 impl TileCdfContext {
@@ -3464,6 +3799,11 @@ impl TileCdfContext {
             eob_pt_1024: DEFAULT_EOB_PT_1024_CDF[0],
             eob_extra: DEFAULT_EOB_EXTRA_CDF[0],
             dc_sign: DEFAULT_DC_SIGN_CDF[0],
+
+            // Round 138 — `coeff_base_eob` sub-group. Seeded from the
+            // `idx == 0` q-context slice; `init_coeff_cdfs` re-selects
+            // the slice for the actual `base_q_idx` before tile content.
+            coeff_base_eob: DEFAULT_COEFF_BASE_EOB_CDF[0],
         }
     }
 
@@ -4061,6 +4401,7 @@ impl TileCdfContext {
         self.eob_pt_1024 = DEFAULT_EOB_PT_1024_CDF[idx];
         self.eob_extra = DEFAULT_EOB_EXTRA_CDF[idx];
         self.dc_sign = DEFAULT_DC_SIGN_CDF[idx];
+        self.coeff_base_eob = DEFAULT_COEFF_BASE_EOB_CDF[idx];
     }
 
     /// §8.3.2 `all_zero`: the cdf is `TileTxbSkipCdf[ txSzCtx ][ ctx ]`,
@@ -4167,6 +4508,26 @@ impl TileCdfContext {
     pub fn dc_sign_cdf(&mut self, ptype: usize, ctx: usize) -> Option<&mut [u16]> {
         if ptype < PLANE_TYPES && ctx < DC_SIGN_CONTEXTS {
             Some(&mut self.dc_sign[ptype][ctx])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `coeff_base_eob`: the cdf is
+    /// `TileCoeffBaseEobCdf[ txSzCtx ][ ptype ][ ctx ]`, where `ctx` is
+    /// the `coeff_base_eob` context derived per §8.3.2 from
+    /// `get_coeff_base_ctx(...) - SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB`
+    /// (the `get_coeff_base_ctx()` lookup itself belongs to the
+    /// not-yet-implemented tile-content walk). Returns `None` for an
+    /// out-of-range index.
+    pub fn coeff_base_eob_cdf(
+        &mut self,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> Option<&mut [u16]> {
+        if tx_sz_ctx < TX_SIZES && ptype < PLANE_TYPES && ctx < SIG_COEF_CONTEXTS_EOB {
+            Some(&mut self.coeff_base_eob[tx_sz_ctx][ptype][ctx])
         } else {
             None
         }
@@ -7590,5 +7951,177 @@ mod tests {
             assert!((sym as usize) < 2, "dc_sign must code 0 or 1");
             assert_ne!(ctx.dc_sign, before, "read_symbol must adapt the CDF");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 138 — `coeff_base_eob` sub-group tests.
+    // -----------------------------------------------------------------
+
+    /// §3 `SIG_COEF_CONTEXTS_EOB` pins to its spec value.
+    #[test]
+    fn coeff_base_eob_constants_pinned() {
+        assert_eq!(SIG_COEF_CONTEXTS_EOB, 4);
+    }
+
+    /// `Default_Coeff_Base_Eob_Cdf` carries the declared §9.4 dimensions
+    /// and every cumulative-frequency row is well-formed: the last data
+    /// entry is `1 << 15 == 32768`, the trailing adaptation counter is
+    /// `0`, and the cumulative frequencies strictly increase.
+    #[test]
+    fn coeff_base_eob_default_table_well_formed() {
+        fn check_row(row: &[u16]) {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768: {row:?}");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0: {row:?}");
+            for w in row[..n].windows(2) {
+                assert!(w[0] < w[1], "cdf must strictly increase: {row:?}");
+            }
+        }
+
+        assert_eq!(DEFAULT_COEFF_BASE_EOB_CDF.len(), COEFF_CDF_Q_CTXS);
+        for q in &DEFAULT_COEFF_BASE_EOB_CDF {
+            assert_eq!(q.len(), TX_SIZES);
+            for tx in q {
+                assert_eq!(tx.len(), PLANE_TYPES);
+                for pt in tx {
+                    assert_eq!(pt.len(), SIG_COEF_CONTEXTS_EOB);
+                    for row in pt {
+                        assert_eq!(row.len(), 4);
+                        check_row(row);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spot-check the §9.4 `Default_Coeff_Base_Eob_Cdf` initial values
+    /// byte-for-byte. A mis-keyed digit during transcription breaks the
+    /// equality. Anchors include the (q0, tx0) first / last context and
+    /// the flat-distribution placeholder row that pads every q-context's
+    /// last `(txSz, chroma)` slice.
+    #[test]
+    fn coeff_base_eob_default_byte_exact_values() {
+        // (q0, tx0, pt0): first context and last context of the row.
+        assert_eq!(
+            DEFAULT_COEFF_BASE_EOB_CDF[0][0][0][0],
+            [17837, 29055, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_COEFF_BASE_EOB_CDF[0][0][0][3],
+            [24926, 28948, 32768, 0]
+        );
+
+        // (q0, tx0, pt1): chroma plane.
+        assert_eq!(
+            DEFAULT_COEFF_BASE_EOB_CDF[0][0][1][0],
+            [21365, 30026, 32768, 0]
+        );
+
+        // Every q-context's (tx4, pt1) slice is the same flat
+        // {10923, 21845, 32768, 0} placeholder for all four ctx values
+        // (the §9.4 sentinel for an unreachable chroma row at the
+        // largest TX size).
+        let flat = [10923u16, 21845, 32768, 0];
+        for (q, q_slice) in DEFAULT_COEFF_BASE_EOB_CDF.iter().enumerate() {
+            for (ctx, row) in q_slice[4][1].iter().enumerate() {
+                assert_eq!(
+                    *row, flat,
+                    "(q={q}, tx=4, pt=1, ctx={ctx}) must be the flat placeholder"
+                );
+            }
+        }
+
+        // (q3, tx3, pt1, ctx3): a non-trivial interior anchor — the
+        // last (luma, ctx) row of the second-largest TX size at the
+        // highest q-context.
+        assert_eq!(
+            DEFAULT_COEFF_BASE_EOB_CDF[3][3][1][3],
+            [31767, 32712, 32768, 0]
+        );
+
+        // (q3, tx4, pt0, ctx0): the largest TX size, luma, first ctx.
+        assert_eq!(
+            DEFAULT_COEFF_BASE_EOB_CDF[3][4][0][0],
+            [12358, 24977, 32768, 0]
+        );
+    }
+
+    /// §8.3.1 `init_coeff_cdfs`: the working `coeff_base_eob` array is
+    /// set to a copy of `Default_Coeff_Base_Eob_Cdf[ idx ]` for the
+    /// derived `idx`, and mutating the working copy leaves the §9.4
+    /// source intact.
+    #[test]
+    fn coeff_base_eob_init_coeff_cdfs_selects_q_ctx() {
+        // A fresh context is seeded from idx 0.
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.coeff_base_eob, DEFAULT_COEFF_BASE_EOB_CDF[0]);
+
+        // init_coeff_cdfs re-selects the slice for a high base_q_idx.
+        ctx.init_coeff_cdfs(200); // -> idx 3
+        assert_eq!(ctx.coeff_base_eob, DEFAULT_COEFF_BASE_EOB_CDF[3]);
+
+        // And for a mid base_q_idx.
+        ctx.init_coeff_cdfs(50); // -> idx 1
+        assert_eq!(ctx.coeff_base_eob, DEFAULT_COEFF_BASE_EOB_CDF[1]);
+
+        // Mutating the working copy leaves the §9.4 source untouched.
+        ctx.coeff_base_eob_cdf(0, 0, 0).unwrap()[0] = 12345;
+        assert_ne!(
+            ctx.coeff_base_eob[0][0][0],
+            DEFAULT_COEFF_BASE_EOB_CDF[1][0][0][0]
+        );
+        assert_eq!(
+            DEFAULT_COEFF_BASE_EOB_CDF[1][0][0][0],
+            [17560, 29888, 32768, 0]
+        );
+    }
+
+    /// §8.3.2 `coeff_base_eob` selector returns the correct §9.4 row
+    /// for the in-range `(txSzCtx, ptype, ctx)` triple and rejects each
+    /// out-of-range axis.
+    #[test]
+    fn coeff_base_eob_selector_returns_default_row() {
+        let mut ctx = TileCdfContext::new_from_defaults(); // idx 0
+
+        // In-range: (tx=2, pt=1, ctx=2).
+        assert_eq!(
+            ctx.coeff_base_eob_cdf(2, 1, 2).unwrap(),
+            &DEFAULT_COEFF_BASE_EOB_CDF[0][2][1][2]
+        );
+        // In-range: (tx=4, pt=0, ctx=0).
+        assert_eq!(
+            ctx.coeff_base_eob_cdf(4, 0, 0).unwrap(),
+            &DEFAULT_COEFF_BASE_EOB_CDF[0][4][0][0]
+        );
+
+        // Out-of-range on each axis.
+        assert!(ctx.coeff_base_eob_cdf(TX_SIZES, 0, 0).is_none());
+        assert!(ctx.coeff_base_eob_cdf(0, PLANE_TYPES, 0).is_none());
+        assert!(ctx
+            .coeff_base_eob_cdf(0, 0, SIG_COEF_CONTEXTS_EOB)
+            .is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through the
+    /// `coeff_base_eob` default CDF selected by the §8.3.2 selection,
+    /// confirming the chosen row matches the §9.4 source, the decoded
+    /// symbol is in range (`0..3`, since the base level is
+    /// `coeff_base_eob + 1` and the spec restricts it to 1, 2, or 3),
+    /// and the working copy adapts.
+    #[test]
+    fn decode_coeff_base_eob_through_default_cdf() {
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+        let before = ctx.coeff_base_eob;
+        let row = ctx.coeff_base_eob_cdf(0, 0, 0).unwrap();
+        assert_eq!(row, &DEFAULT_COEFF_BASE_EOB_CDF[0][0][0][0]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!((sym as usize) < 3, "coeff_base_eob codes 0..3");
+        assert_ne!(
+            ctx.coeff_base_eob, before,
+            "read_symbol must adapt the working CDF"
+        );
     }
 }
