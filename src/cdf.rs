@@ -122,16 +122,20 @@
 //! `idx` via [`coeff_cdf_q_ctx`]); the working copy drops the
 //! `COEFF_CDF_Q_CTXS` axis, selecting `Default_*_Cdf[ idx ]`.
 //!
-//! The remaining `Default_*_Cdf` arrays of §9.4 (the
-//! intra transform-type (`intra_tx_type`,
-//! `Default_Intra_Tx_Type_Set{1,2}_Cdf`), the rest of the
+//!   * **Intra-frame transform-type** (round 137):
+//!       * `Default_Intra_Tx_Type_Set1_Cdf` (`intra_tx_type`,
+//!         `TX_SET_INTRA_1`, 4x4 / 8x8 intra blocks; 7 symbols).
+//!       * `Default_Intra_Tx_Type_Set2_Cdf` (`intra_tx_type`,
+//!         `TX_SET_INTRA_2`, 4x4 / 8x8 / 16x16 intra blocks; 5 symbols).
+//!
+//! The remaining `Default_*_Cdf` arrays of §9.4 (the rest of the
 //! `init_coeff_cdfs` coefficient set
 //! (`Default_Coeff_Base_Eob_Cdf` / `Default_Coeff_Base_Cdf` /
 //! `Default_Coeff_Br_Cdf`), the inter-intra group), and the §8.3.2
-//! `split_or_horz` / `split_or_vert` / `intra_tx_type` / …
-//! selections are a clear followup: each is a mechanical
-//! transcription of one §9.4 table plus its §8.3.2 paragraph,
-//! slotted into the same [`TileCdfContext`] shape used here.
+//! `split_or_horz` / `split_or_vert` / … selections are a clear
+//! followup: each is a mechanical transcription of one §9.4 table
+//! plus its §8.3.2 paragraph, slotted into the same
+//! [`TileCdfContext`] shape used here.
 //!
 //! All values are transcribed directly from `docs/video/av1/av1-spec`
 //! §8.3 and §9.4 — no external source consulted.
@@ -421,6 +425,57 @@ pub const INTER_TX_TYPE_SET1_SIZES: usize = 2;
 /// (per §5.11.48: `txSzSqrUp > TX_32X32` already returns
 /// `TX_SET_DCTONLY`).
 pub const INTER_TX_TYPE_SET3_SIZES: usize = 4;
+
+/// `TX_SET_INTRA_1` (§6.10.19) — the full-intra transform set
+/// (`Tx_Type_Intra_Inv_Set1`, 7 symbols including `IDTX`, `DCT_DCT`,
+/// `V_DCT`, `H_DCT`, `ADST_ADST`, `ADST_DCT`, `DCT_ADST`). Returned by
+/// §5.11.48 `get_tx_set()` on the `is_inter == 0` branch when neither
+/// `reduced_tx_set` nor `txSzSqr == TX_16X16` apply.
+pub const TX_SET_INTRA_1: u32 = 1;
+
+/// `TX_SET_INTRA_2` (§6.10.19) — the reduced-intra transform set
+/// (`Tx_Type_Intra_Inv_Set2`, 5 symbols: `IDTX`, `DCT_DCT`, `ADST_ADST`,
+/// `ADST_DCT`, `DCT_ADST`). Returned by §5.11.48 `get_tx_set()` on the
+/// `is_inter == 0` branch when `reduced_tx_set == 1` or
+/// `txSzSqr == TX_16X16`.
+pub const TX_SET_INTRA_2: u32 = 2;
+
+/// Symbol count for §6.10.19 `TX_SET_INTRA_1` (`Tx_Type_Intra_Inv_Set1`
+/// has 7 entries). Drives the row width of
+/// [`DEFAULT_INTRA_TX_TYPE_SET1_CDF`] (`TX_TYPES_INTRA_SET1 + 1`
+/// cumulative frequencies + the §8.3 adaptation counter, matching the
+/// `[8]` row width in the spec's §9.4 listing).
+pub const TX_TYPES_INTRA_SET1: usize = 7;
+
+/// Symbol count for §6.10.19 `TX_SET_INTRA_2` (`Tx_Type_Intra_Inv_Set2`
+/// has 5 entries). Drives the row width of
+/// [`DEFAULT_INTRA_TX_TYPE_SET2_CDF`] (`TX_TYPES_INTRA_SET2 + 1`
+/// cumulative frequencies + the §8.3 adaptation counter, matching the
+/// `[6]` row width in the spec's §9.4 listing).
+pub const TX_TYPES_INTRA_SET2: usize = 5;
+
+/// First-axis length of [`DEFAULT_INTRA_TX_TYPE_SET1_CDF`] — two entries
+/// for `Tx_Size_Sqr[ txSz ] ∈ { TX_4X4, TX_8X8 }`, the only sizes that
+/// reach `TX_SET_INTRA_1` per §5.11.48 (`txSzSqr == TX_16X16` is routed
+/// to `TX_SET_INTRA_2`, `txSzSqrUp == TX_32X32` to `TX_SET_DCTONLY`).
+pub const INTRA_TX_TYPE_SET1_SIZES: usize = 2;
+
+/// First-axis length of [`DEFAULT_INTRA_TX_TYPE_SET2_CDF`] — three
+/// entries for `Tx_Size_Sqr[ txSz ] ∈ { TX_4X4, TX_8X8, TX_16X16 }`, the
+/// reachable sizes for the reduced intra-tx-type set (per §5.11.48:
+/// `txSzSqrUp > TX_32X32` already returns `TX_SET_DCTONLY`, and only
+/// `txSzSqr == TX_16X16` or `reduced_tx_set == 1` routes to
+/// `TX_SET_INTRA_2`).
+pub const INTRA_TX_TYPE_SET2_SIZES: usize = 3;
+
+/// `Filter_Intra_Mode_To_Intra_Dir[ INTRA_FILTER_MODES ]` (§8.3.2
+/// `intra_tx_type`) — when `use_filter_intra == 1`, the §8.3.2 `intraDir`
+/// axis is `Filter_Intra_Mode_To_Intra_Dir[ filter_intra_mode ]` rather
+/// than `YMode`. The spec lists the entries as
+/// `{ DC_PRED, V_PRED, H_PRED, D157_PRED, DC_PRED }`; their numeric
+/// values follow the §6.10.x intra-mode enumeration (`DC_PRED = 0`,
+/// `V_PRED = 1`, `H_PRED = 2`, `D157_PRED = 6`).
+pub const FILTER_INTRA_MODE_TO_INTRA_DIR: [usize; INTRA_FILTER_MODES] = [0, 1, 2, 6, 0];
 
 /// `INTERP_FILTERS` per §3. Number of values for `interp_filter` (the
 /// three switchable filters: `EIGHTTAP`, `EIGHTTAP_SMOOTH`,
@@ -1354,6 +1409,128 @@ pub const DEFAULT_INTER_TX_TYPE_SET3_CDF: [[u16; TX_TYPES_SET3 + 1]; INTER_TX_TY
     [4167, 32768, 0],
     [1998, 32768, 0],
     [748, 32768, 0],
+];
+
+// ---------------------------------------------------------------------
+// Round 137 — intra-frame transform-type group (§9.4):
+// `Default_Intra_Tx_Type_Set{1,2}_Cdf`. Codes `intra_tx_type` per
+// §5.11.47 / §8.3.2 against the §6.10.19 intra transform set returned
+// by §5.11.48 `get_tx_set()` on the `is_inter == 0` branch. Both
+// tables carry an extra `intraDir` axis (`INTRA_MODES = 13`) on top of
+// the `Tx_Size_Sqr` axis seen in the inter counterparts; `intraDir` is
+// `YMode` when `use_filter_intra == 0` and
+// `Filter_Intra_Mode_To_Intra_Dir[ filter_intra_mode ]` otherwise (see
+// [`FILTER_INTRA_MODE_TO_INTRA_DIR`]).
+// ---------------------------------------------------------------------
+
+/// `Default_Intra_Tx_Type_Set1_Cdf[ 2 ][ INTRA_MODES ][ 8 ]` (§9.4).
+///
+/// Selected by §8.3.2 when `set == TX_SET_INTRA_1` (the full intra
+/// transform set, `Tx_Type_Intra_Inv_Set1` with 7 entries; the row
+/// width is `TX_TYPES_INTRA_SET1 + 1 == 8` per the §8.3 adaptation-
+/// counter convention). The first axis is `Tx_Size_Sqr[ txSz ] ∈
+/// { TX_4X4, TX_8X8 }` — `txSzSqr == TX_16X16` is routed to
+/// `TX_SET_INTRA_2` by §5.11.48 and never reaches this table. The
+/// second axis is `intraDir ∈ 0..INTRA_MODES` (`YMode` or
+/// `Filter_Intra_Mode_To_Intra_Dir[ filter_intra_mode ]`).
+pub const DEFAULT_INTRA_TX_TYPE_SET1_CDF: [[[u16; TX_TYPES_INTRA_SET1 + 1]; INTRA_MODES];
+    INTRA_TX_TYPE_SET1_SIZES] = [
+    [
+        [1535, 8035, 9461, 12751, 23467, 27825, 32768, 0],
+        [564, 3335, 9709, 10870, 18143, 28094, 32768, 0],
+        [672, 3247, 3676, 11982, 19415, 23127, 32768, 0],
+        [5279, 13885, 15487, 18044, 23527, 30252, 32768, 0],
+        [4423, 6074, 7985, 10416, 25693, 29298, 32768, 0],
+        [1486, 4241, 9460, 10662, 16456, 27694, 32768, 0],
+        [439, 2838, 3522, 6737, 18058, 23754, 32768, 0],
+        [1190, 4233, 4855, 11670, 20281, 24377, 32768, 0],
+        [1045, 4312, 8647, 10159, 18644, 29335, 32768, 0],
+        [202, 3734, 4747, 7298, 17127, 24016, 32768, 0],
+        [447, 4312, 6819, 8884, 16010, 23858, 32768, 0],
+        [277, 4369, 5255, 8905, 16465, 22271, 32768, 0],
+        [3409, 5436, 10599, 15599, 19687, 24040, 32768, 0],
+    ],
+    [
+        [1870, 13742, 14530, 16498, 23770, 27698, 32768, 0],
+        [326, 8796, 14632, 15079, 19272, 27486, 32768, 0],
+        [484, 7576, 7712, 14443, 19159, 22591, 32768, 0],
+        [1126, 15340, 15895, 17023, 20896, 30279, 32768, 0],
+        [655, 4854, 5249, 5913, 22099, 27138, 32768, 0],
+        [1299, 6458, 8885, 9290, 14851, 25497, 32768, 0],
+        [311, 5295, 5552, 6885, 16107, 22672, 32768, 0],
+        [883, 8059, 8270, 11258, 17289, 21549, 32768, 0],
+        [741, 7580, 9318, 10345, 16688, 29046, 32768, 0],
+        [110, 7406, 7915, 9195, 16041, 23329, 32768, 0],
+        [363, 7974, 9357, 10673, 15629, 24474, 32768, 0],
+        [153, 7647, 8112, 9936, 15307, 19996, 32768, 0],
+        [3511, 6332, 11165, 15335, 19323, 23594, 32768, 0],
+    ],
+];
+
+/// `Default_Intra_Tx_Type_Set2_Cdf[ 3 ][ INTRA_MODES ][ 6 ]` (§9.4).
+///
+/// Selected by §8.3.2 when `set == TX_SET_INTRA_2` (the reduced intra
+/// transform set, `Tx_Type_Intra_Inv_Set2` with 5 entries; the row
+/// width is `TX_TYPES_INTRA_SET2 + 1 == 6` per the §8.3 adaptation-
+/// counter convention). The first axis is `Tx_Size_Sqr[ txSz ] ∈
+/// { TX_4X4, TX_8X8, TX_16X16 }` — `txSzSqrUp > TX_32X32` would
+/// already have been routed to `TX_SET_DCTONLY` per §5.11.48. The
+/// second axis is `intraDir ∈ 0..INTRA_MODES`.
+///
+/// Note: the §9.4 source lists the first two `Tx_Size_Sqr` rows
+/// (`TX_4X4`, `TX_8X8`) as the uniform `{ 6554, 13107, 19661, 26214,
+/// 32768, 0 }` distribution (i.e. a flat 5-way prior, since `32768 / 5
+/// ≈ 6554`). Only the `TX_16X16` row carries adapted seeds. This
+/// matches the §5.11.48 routing where `txSzSqr == TX_16X16` always
+/// reaches `TX_SET_INTRA_2`, while the smaller sizes can only reach it
+/// via `reduced_tx_set == 1`.
+pub const DEFAULT_INTRA_TX_TYPE_SET2_CDF: [[[u16; TX_TYPES_INTRA_SET2 + 1]; INTRA_MODES];
+    INTRA_TX_TYPE_SET2_SIZES] = [
+    [
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+    ],
+    [
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+        [6554, 13107, 19661, 26214, 32768, 0],
+    ],
+    [
+        [1127, 12814, 22772, 27483, 32768, 0],
+        [145, 6761, 11980, 26667, 32768, 0],
+        [362, 5887, 11678, 16725, 32768, 0],
+        [385, 15213, 18587, 30693, 32768, 0],
+        [25, 2914, 23134, 27903, 32768, 0],
+        [60, 4470, 11749, 23991, 32768, 0],
+        [37, 3332, 14511, 21448, 32768, 0],
+        [157, 6320, 13036, 17439, 32768, 0],
+        [119, 6719, 12906, 29396, 32768, 0],
+        [47, 5537, 12576, 21499, 32768, 0],
+        [269, 6076, 11258, 23115, 32768, 0],
+        [83, 5615, 12001, 17228, 32768, 0],
+        [1968, 5556, 12023, 18547, 32768, 0],
+    ],
 ];
 
 // ---------------------------------------------------------------------
@@ -3046,6 +3223,22 @@ pub struct TileCdfContext {
     pub inter_tx_type_set3: [[u16; TX_TYPES_SET3 + 1]; INTER_TX_TYPE_SET3_SIZES],
 
     // -----------------------------------------------------------------
+    // Round 137 — intra-frame transform-type group. §8.3.1 enumerates
+    // each as "`IntraTxTypeSet{n}Cdf` is set equal to a copy of
+    // `Default_Intra_Tx_Type_Set{n}_Cdf`". Both tables carry an extra
+    // `intraDir` axis (`INTRA_MODES`) on top of the `Tx_Size_Sqr` axis
+    // already seen in the inter counterparts.
+    // -----------------------------------------------------------------
+    /// `TileIntraTxTypeSet1Cdf[ INTRA_TX_TYPE_SET1_SIZES ][ INTRA_MODES ]`
+    /// (§8.3.1). Selected for `intra_tx_type` when `set == TX_SET_INTRA_1`.
+    pub intra_tx_type_set1:
+        [[[u16; TX_TYPES_INTRA_SET1 + 1]; INTRA_MODES]; INTRA_TX_TYPE_SET1_SIZES],
+    /// `TileIntraTxTypeSet2Cdf[ INTRA_TX_TYPE_SET2_SIZES ][ INTRA_MODES ]`
+    /// (§8.3.1). Selected for `intra_tx_type` when `set == TX_SET_INTRA_2`.
+    pub intra_tx_type_set2:
+        [[[u16; TX_TYPES_INTRA_SET2 + 1]; INTRA_MODES]; INTRA_TX_TYPE_SET2_SIZES],
+
+    // -----------------------------------------------------------------
     // Round 22 — inter-frame interpolation-filter group. §8.3.1
     // enumerates as "`InterpFilterCdf` is set equal to a copy of
     // `Default_Interp_Filter_Cdf`".
@@ -3234,6 +3427,10 @@ impl TileCdfContext {
             inter_tx_type_set1: DEFAULT_INTER_TX_TYPE_SET1_CDF,
             inter_tx_type_set2: DEFAULT_INTER_TX_TYPE_SET2_CDF,
             inter_tx_type_set3: DEFAULT_INTER_TX_TYPE_SET3_CDF,
+
+            // Round 137 — intra-frame transform-type group.
+            intra_tx_type_set1: DEFAULT_INTRA_TX_TYPE_SET1_CDF,
+            intra_tx_type_set2: DEFAULT_INTRA_TX_TYPE_SET2_CDF,
 
             // Round 22 — inter-frame interpolation-filter group.
             interp_filter: DEFAULT_INTERP_FILTER_CDF,
@@ -3652,6 +3849,51 @@ impl TileCdfContext {
             TX_SET_INTER_2 => Some(&mut self.inter_tx_type_set2),
             TX_SET_INTER_3 if sqr < INTER_TX_TYPE_SET3_SIZES => {
                 Some(&mut self.inter_tx_type_set3[sqr])
+            }
+            _ => None,
+        }
+    }
+
+    /// §8.3.2 `intra_tx_type`: the cdf depends on the §5.11.48
+    /// `get_tx_set()` value as follows (spec §8.3.2, "intra_tx_type"):
+    ///
+    /// * `TX_SET_INTRA_1` ⇒
+    ///   `TileIntraTxTypeSet1Cdf[ Tx_Size_Sqr[ txSz ] ][ intraDir ]`
+    /// * `TX_SET_INTRA_2` ⇒
+    ///   `TileIntraTxTypeSet2Cdf[ Tx_Size_Sqr[ txSz ] ][ intraDir ]`
+    ///
+    /// `set` is the §5.11.48 `get_tx_set()` result on the
+    /// `is_inter == 0` branch (one of `TX_SET_DCTONLY`, `TX_SET_INTRA_1`,
+    /// `TX_SET_INTRA_2`); `tx_size_sqr` is `Tx_Size_Sqr[ txSz ]`
+    /// (`0..TX_SIZES`, but only the first 2 entries of Set1 / 3 entries
+    /// of Set2 are addressable per the §5.11.48 routing); `intra_dir` is
+    /// the §8.3.2 `intraDir` axis — `YMode` when `use_filter_intra == 0`
+    /// and `Filter_Intra_Mode_To_Intra_Dir[ filter_intra_mode ]`
+    /// otherwise (see [`FILTER_INTRA_MODE_TO_INTRA_DIR`]).
+    ///
+    /// Returns `None` for:
+    /// * the §5.11.47 `set == TX_SET_DCTONLY` path (where `intra_tx_type`
+    ///   is not read — `TxType = DCT_DCT` is forced),
+    /// * any out-of-range `set` / `tx_size_sqr` combination that
+    ///   §5.11.48 would not actually produce, and
+    /// * `intra_dir >= INTRA_MODES` (a caller bug — the §3 enumeration
+    ///   bounds `YMode` to `0..INTRA_MODES`).
+    pub fn intra_tx_type_cdf(
+        &mut self,
+        set: u32,
+        tx_size_sqr: u32,
+        intra_dir: usize,
+    ) -> Option<&mut [u16]> {
+        if intra_dir >= INTRA_MODES {
+            return None;
+        }
+        let sqr = tx_size_sqr as usize;
+        match set {
+            TX_SET_INTRA_1 if sqr < INTRA_TX_TYPE_SET1_SIZES => {
+                Some(&mut self.intra_tx_type_set1[sqr][intra_dir])
+            }
+            TX_SET_INTRA_2 if sqr < INTRA_TX_TYPE_SET2_SIZES => {
+                Some(&mut self.intra_tx_type_set2[sqr][intra_dir])
             }
             _ => None,
         }
@@ -4291,8 +4533,7 @@ pub fn txfm_split_ctx(above: bool, left: bool, tx_sz_sqr_up: u32, max_tx_sz: u32
 ///
 /// `tx_sz_sqr` and `tx_sz_sqr_up` are `Tx_Size_Sqr[ txSz ]` and
 /// `Tx_Size_Sqr_Up[ txSz ]` (`TX_4X4 = 0..TX_64X64 = 4`). The intra
-/// branch is left for a follow-up round (it carries an `intraDir`
-/// axis and selects a different default-cdf family).
+/// branch is covered by the companion [`intra_tx_type_set`].
 pub fn inter_tx_type_set(tx_sz_sqr: u32, tx_sz_sqr_up: u32, reduced_tx_set: bool) -> u32 {
     // §3 `TX_32X32 = 3` per the spec's per-`TX_*` constant table.
     const TX_16X16: u32 = 2;
@@ -4305,6 +4546,73 @@ pub fn inter_tx_type_set(tx_sz_sqr: u32, tx_sz_sqr_up: u32, reduced_tx_set: bool
         TX_SET_INTER_2
     } else {
         TX_SET_INTER_1
+    }
+}
+
+// ---------------------------------------------------------------------
+// Round 137 — intra-frame transform-type §8.3.2 helpers. Mirrors the
+// `is_inter == 0` branch of §5.11.48 `get_tx_set()` and the §8.3.2
+// `intraDir` derivation (`YMode` or
+// `Filter_Intra_Mode_To_Intra_Dir[ filter_intra_mode ]`).
+// ---------------------------------------------------------------------
+
+/// §5.11.48 `get_tx_set()` (the `is_inter == 0` branch). Maps the
+/// `txSzSqr` / `txSzSqrUp` pair (and the frame's `reduced_tx_set`) to
+/// the intra transform-set index `set ∈ { TX_SET_DCTONLY,
+/// TX_SET_INTRA_1, TX_SET_INTRA_2 }`.
+///
+/// ```text
+///   if ( txSzSqrUp > TX_32X32 )                  return TX_SET_DCTONLY
+///   if ( txSzSqrUp == TX_32X32 )                 return TX_SET_DCTONLY
+///   else if ( reduced_tx_set )                   return TX_SET_INTRA_2
+///   else if ( txSzSqr == TX_16X16 )              return TX_SET_INTRA_2
+///   return TX_SET_INTRA_1
+/// ```
+///
+/// `tx_sz_sqr` and `tx_sz_sqr_up` are `Tx_Size_Sqr[ txSz ]` and
+/// `Tx_Size_Sqr_Up[ txSz ]` (`TX_4X4 = 0..TX_64X64 = 4`).
+pub fn intra_tx_type_set(tx_sz_sqr: u32, tx_sz_sqr_up: u32, reduced_tx_set: bool) -> u32 {
+    // §3 `TX_32X32 = 3` per the spec's per-`TX_*` constant table.
+    const TX_16X16: u32 = 2;
+    const TX_32X32: u32 = 3;
+    // The two §5.11.48 `return TX_SET_DCTONLY` gates merge: the outer
+    // pre-`is_inter` guard fires for `txSzSqrUp > TX_32X32`, and the
+    // first intra-branch line fires for `txSzSqrUp == TX_32X32`.
+    if tx_sz_sqr_up >= TX_32X32 {
+        TX_SET_DCTONLY
+    } else if reduced_tx_set || tx_sz_sqr == TX_16X16 {
+        TX_SET_INTRA_2
+    } else {
+        TX_SET_INTRA_1
+    }
+}
+
+/// §8.3.2 `intra_tx_type` — `intraDir` derivation. Mirrors the spec:
+///
+/// ```text
+///   if ( use_filter_intra == 1 )
+///       intraDir = Filter_Intra_Mode_To_Intra_Dir[ filter_intra_mode ]
+///   else
+///       intraDir = YMode
+/// ```
+///
+/// `y_mode` is the current block's `YMode` (`0..INTRA_MODES`);
+/// `filter_intra_mode` is the §5.11.x `filter_intra_mode` syntax value
+/// (`0..INTRA_FILTER_MODES`) — supply `0` and `use_filter_intra = false`
+/// for blocks that didn't read a filter-intra mode.
+///
+/// Returns `None` if any input is out of the spec-bounded range (a
+/// caller bug — `y_mode < INTRA_MODES` and
+/// `filter_intra_mode < INTRA_FILTER_MODES` per the §3 enumerations).
+pub fn intra_dir(use_filter_intra: bool, y_mode: usize, filter_intra_mode: usize) -> Option<usize> {
+    if use_filter_intra {
+        FILTER_INTRA_MODE_TO_INTRA_DIR
+            .get(filter_intra_mode)
+            .copied()
+    } else if y_mode < INTRA_MODES {
+        Some(y_mode)
+    } else {
+        None
     }
 }
 
@@ -5855,6 +6163,272 @@ mod tests {
             "read_symbol must adapt the CDF"
         );
         assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[1][0], 4167);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 137 — intra-frame transform-type group tests.
+    // -----------------------------------------------------------------
+
+    /// §9.4 default tables: every row terminates with `1 << 15` and a
+    /// zero adaptation counter (§8.2.6 contract). Locks each
+    /// transcribed intra-tx-type default and confirms its §3 dimensions.
+    #[test]
+    fn intra_tx_type_default_tables_well_formed() {
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+        for plane in &DEFAULT_INTRA_TX_TYPE_SET1_CDF {
+            for row in plane {
+                check(row);
+            }
+        }
+        for plane in &DEFAULT_INTRA_TX_TYPE_SET2_CDF {
+            for row in plane {
+                check(row);
+            }
+        }
+
+        // §3 dimensions.
+        assert_eq!(
+            DEFAULT_INTRA_TX_TYPE_SET1_CDF.len(),
+            INTRA_TX_TYPE_SET1_SIZES
+        );
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[0].len(), INTRA_MODES);
+        assert_eq!(
+            DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][0].len(),
+            TX_TYPES_INTRA_SET1 + 1
+        );
+
+        assert_eq!(
+            DEFAULT_INTRA_TX_TYPE_SET2_CDF.len(),
+            INTRA_TX_TYPE_SET2_SIZES
+        );
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET2_CDF[0].len(), INTRA_MODES);
+        assert_eq!(
+            DEFAULT_INTRA_TX_TYPE_SET2_CDF[0][0].len(),
+            TX_TYPES_INTRA_SET2 + 1
+        );
+    }
+
+    /// Spot-check the first / last cumulative frequency in each §9.4
+    /// intra-tx-type transcribed table. A mis-keyed digit during
+    /// transcription breaks the equality.
+    #[test]
+    fn intra_tx_type_table_byte_anchors() {
+        // Default_Intra_Tx_Type_Set1_Cdf — TX_4X4 (size 0).
+        // Row 0 (DC_PRED): { 1535, 8035, 9461, 12751, 23467, 27825, 32768, 0 }
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][0][0], 1535);
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][0][5], 27825);
+        // Row 12 (PAETH_PRED, last): { 3409, 5436, 10599, 15599, 19687, 24040, 32768, 0 }
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][12][0], 3409);
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][12][5], 24040);
+
+        // Default_Intra_Tx_Type_Set1_Cdf — TX_8X8 (size 1).
+        // Row 0 (DC_PRED): { 1870, 13742, 14530, 16498, 23770, 27698, 32768, 0 }
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[1][0][0], 1870);
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[1][0][5], 27698);
+        // Row 12 (PAETH_PRED): { 3511, 6332, 11165, 15335, 19323, 23594, 32768, 0 }
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[1][12][0], 3511);
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[1][12][5], 23594);
+
+        // Default_Intra_Tx_Type_Set2_Cdf — TX_4X4 (size 0) and TX_8X8
+        // (size 1) are the §9.4 flat 5-way distribution.
+        for (size_idx, plane) in DEFAULT_INTRA_TX_TYPE_SET2_CDF.iter().enumerate().take(2) {
+            for (y, row) in plane.iter().enumerate() {
+                assert_eq!(
+                    row,
+                    &[6554, 13107, 19661, 26214, 32768, 0],
+                    "Set2 size {size_idx} row {y} must be the §9.4 flat distribution"
+                );
+            }
+        }
+        // Default_Intra_Tx_Type_Set2_Cdf — TX_16X16 (size 2).
+        // Row 0 (DC_PRED): { 1127, 12814, 22772, 27483, 32768, 0 }
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET2_CDF[2][0][0], 1127);
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET2_CDF[2][0][3], 27483);
+        // Row 12 (PAETH_PRED): { 1968, 5556, 12023, 18547, 32768, 0 }
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET2_CDF[2][12][0], 1968);
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET2_CDF[2][12][3], 18547);
+    }
+
+    /// §8.3.1: a fresh context copies every intra-tx-type default in
+    /// (independent of the source — the §9.4 array is not aliased).
+    #[test]
+    fn intra_tx_type_init_from_defaults_copies_tables() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.intra_tx_type_set1, DEFAULT_INTRA_TX_TYPE_SET1_CDF);
+        assert_eq!(ctx.intra_tx_type_set2, DEFAULT_INTRA_TX_TYPE_SET2_CDF);
+
+        // Working-copy independence: mutating the context must not
+        // touch the §9.4 source.
+        ctx.intra_tx_type_cdf(TX_SET_INTRA_1, 0, 0).unwrap()[0] = 12345;
+        assert_ne!(
+            ctx.intra_tx_type_set1[0][0],
+            DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][0]
+        );
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][0][0], 1535);
+    }
+
+    /// §8.3.2 `intra_tx_type` selection: each `(set, tx_size_sqr,
+    /// intra_dir)` triple picks the expected
+    /// `Default_Intra_Tx_Type_Set*_Cdf` row, the row length matches the
+    /// spec's per-set symbol count, and the unreachable /
+    /// `TX_SET_DCTONLY` paths return `None`.
+    #[test]
+    fn intra_tx_type_cdf_selected_by_set() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        // TX_SET_INTRA_1, Tx_Size_Sqr = TX_4X4 (=0), intraDir = DC_PRED (=0).
+        let row1 = ctx.intra_tx_type_cdf(TX_SET_INTRA_1, 0, 0).unwrap();
+        assert_eq!(row1.len(), TX_TYPES_INTRA_SET1 + 1);
+        assert_eq!(row1, &DEFAULT_INTRA_TX_TYPE_SET1_CDF[0][0]);
+        // TX_SET_INTRA_1, Tx_Size_Sqr = TX_8X8 (=1), intraDir = PAETH_PRED (=12).
+        let row1b = ctx.intra_tx_type_cdf(TX_SET_INTRA_1, 1, 12).unwrap();
+        assert_eq!(row1b, &DEFAULT_INTRA_TX_TYPE_SET1_CDF[1][12]);
+
+        // TX_SET_INTRA_2 across its three reachable sizes.
+        for sqr in 0..INTRA_TX_TYPE_SET2_SIZES as u32 {
+            for (dir, expected_row) in DEFAULT_INTRA_TX_TYPE_SET2_CDF[sqr as usize]
+                .iter()
+                .enumerate()
+            {
+                let row = ctx.intra_tx_type_cdf(TX_SET_INTRA_2, sqr, dir).unwrap();
+                assert_eq!(row.len(), TX_TYPES_INTRA_SET2 + 1);
+                assert_eq!(row, expected_row);
+            }
+        }
+
+        // TX_SET_DCTONLY: §5.11.47 forces TxType = DCT_DCT and skips
+        // the intra_tx_type read; the selector returns None.
+        assert!(ctx.intra_tx_type_cdf(TX_SET_DCTONLY, 0, 0).is_none());
+
+        // Out-of-range tx_size_sqr for Set1 (only TX_4X4 / TX_8X8) /
+        // Set2 (only TX_4X4 / TX_8X8 / TX_16X16).
+        assert!(ctx
+            .intra_tx_type_cdf(TX_SET_INTRA_1, INTRA_TX_TYPE_SET1_SIZES as u32, 0)
+            .is_none());
+        assert!(ctx
+            .intra_tx_type_cdf(TX_SET_INTRA_2, INTRA_TX_TYPE_SET2_SIZES as u32, 0)
+            .is_none());
+
+        // Out-of-range intra_dir.
+        assert!(ctx
+            .intra_tx_type_cdf(TX_SET_INTRA_1, 0, INTRA_MODES)
+            .is_none());
+        assert!(ctx
+            .intra_tx_type_cdf(TX_SET_INTRA_2, 2, INTRA_MODES)
+            .is_none());
+
+        // Out-of-range set (the inter set IDs share the same numeric
+        // space — but the intra selector should not return a row for an
+        // unreachable set ⇒ Set3 isn't an intra set; the inter values
+        // are themselves intra `1` / `2`, so a stray `set == 3` is
+        // invalid for the intra branch).
+        assert!(ctx.intra_tx_type_cdf(99, 0, 0).is_none());
+    }
+
+    /// §5.11.48 `get_tx_set()` (intra branch). Walk every reachable
+    /// `(tx_sz_sqr, tx_sz_sqr_up, reduced_tx_set)` and confirm the
+    /// helper returns the spec-prescribed set.
+    #[test]
+    fn intra_tx_type_set_get_tx_set_intra_branch() {
+        // TX_4X4 / TX_8X8 with txSzSqrUp == txSzSqr, !reduced ⇒
+        // TX_SET_INTRA_1.
+        assert_eq!(intra_tx_type_set(0, 0, false), TX_SET_INTRA_1);
+        assert_eq!(intra_tx_type_set(1, 1, false), TX_SET_INTRA_1);
+
+        // TX_16X16 (txSzSqr == 2), !reduced ⇒ TX_SET_INTRA_2.
+        assert_eq!(intra_tx_type_set(2, 2, false), TX_SET_INTRA_2);
+
+        // TX_32X32 (txSzSqrUp == 3), !reduced ⇒ TX_SET_DCTONLY (the
+        // §5.11.48 intra branch is stricter than the inter one — any
+        // `txSzSqrUp == TX_32X32` returns `TX_SET_DCTONLY`).
+        assert_eq!(intra_tx_type_set(3, 3, false), TX_SET_DCTONLY);
+
+        // Reduced-tx-set forces TX_SET_INTRA_2 for sqrUp < 32x32.
+        assert_eq!(intra_tx_type_set(0, 0, true), TX_SET_INTRA_2);
+        assert_eq!(intra_tx_type_set(1, 1, true), TX_SET_INTRA_2);
+        assert_eq!(intra_tx_type_set(2, 2, true), TX_SET_INTRA_2);
+
+        // txSzSqrUp >= TX_32X32 ⇒ TX_SET_DCTONLY regardless of
+        // reduced_tx_set / txSzSqr.
+        assert_eq!(intra_tx_type_set(3, 3, true), TX_SET_DCTONLY);
+        assert_eq!(intra_tx_type_set(0, 4, false), TX_SET_DCTONLY);
+        assert_eq!(intra_tx_type_set(3, 4, true), TX_SET_DCTONLY);
+
+        // The rectangular-tx case: a TX_4X8 block has txSzSqr = TX_4X4
+        // (0), txSzSqrUp = TX_8X8 (1). No reduced_tx_set ⇒
+        // TX_SET_INTRA_1.
+        assert_eq!(intra_tx_type_set(0, 1, false), TX_SET_INTRA_1);
+        // A TX_16X32 / TX_32X16: txSzSqr = TX_16X16 (2),
+        // txSzSqrUp = TX_32X32 (3) ⇒ TX_SET_DCTONLY (the `txSzSqrUp ==
+        // TX_32X32` gate fires before the `txSzSqr == TX_16X16` branch
+        // on the intra branch).
+        assert_eq!(intra_tx_type_set(2, 3, false), TX_SET_DCTONLY);
+    }
+
+    /// §8.3.2 `intraDir` derivation: with `use_filter_intra == 0` the
+    /// caller's `YMode` is passed through; with `use_filter_intra == 1`
+    /// the `Filter_Intra_Mode_To_Intra_Dir` table maps each filter mode
+    /// to a directional anchor (DC_PRED / V_PRED / H_PRED / D157_PRED /
+    /// DC_PRED).
+    #[test]
+    fn intra_dir_derivation() {
+        // Non-filter-intra: pass-through YMode.
+        for y in 0..INTRA_MODES {
+            assert_eq!(intra_dir(false, y, 0), Some(y));
+        }
+        // Out-of-range YMode (pass-through bound) returns None.
+        assert!(intra_dir(false, INTRA_MODES, 0).is_none());
+
+        // Filter-intra: Filter_Intra_Mode_To_Intra_Dir lookup.
+        // The spec listing reads { DC_PRED, V_PRED, H_PRED, D157_PRED,
+        // DC_PRED }, i.e. { 0, 1, 2, 6, 0 }.
+        assert_eq!(intra_dir(true, 99, 0), Some(0)); // FILTER_DC_PRED → DC_PRED
+        assert_eq!(intra_dir(true, 99, 1), Some(1)); // FILTER_V_PRED → V_PRED
+        assert_eq!(intra_dir(true, 99, 2), Some(2)); // FILTER_H_PRED → H_PRED
+        assert_eq!(intra_dir(true, 99, 3), Some(6)); // FILTER_D157_PRED → D157_PRED
+        assert_eq!(intra_dir(true, 99, 4), Some(0)); // FILTER_PAETH_PRED → DC_PRED
+
+        // Out-of-range filter_intra_mode returns None.
+        assert!(intra_dir(true, 0, INTRA_FILTER_MODES).is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through an
+    /// `intra_tx_type` default CDF selected by the §8.3.2 selection,
+    /// confirming the chosen row matches the §9.4 source, the decode
+    /// lands in range and the working copy adapts.
+    #[test]
+    fn decode_intra_tx_type_through_default_cdf() {
+        // Pick TX_SET_INTRA_2 (5-symbol row), TX_16X16 (Tx_Size_Sqr =
+        // 2). intraDir = DC_PRED (the §9.4 row { 1127, 12814, 22772,
+        // 27483, 32768, 0 }).
+        let set = intra_tx_type_set(2, 2, false);
+        assert_eq!(set, TX_SET_INTRA_2);
+        let dir = intra_dir(false, 0, 0).unwrap();
+        assert_eq!(dir, 0);
+
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+        let before = ctx.intra_tx_type_set2;
+
+        let row = ctx.intra_tx_type_cdf(set, 2, dir).unwrap();
+        assert_eq!(row, &DEFAULT_INTRA_TX_TYPE_SET2_CDF[2][0]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            (sym as usize) < TX_TYPES_INTRA_SET2,
+            "intra_tx_type via Set2 codes one of \
+             {{ IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST }}"
+        );
+
+        assert_ne!(
+            ctx.intra_tx_type_set2, before,
+            "read_symbol must adapt the CDF"
+        );
+        assert_eq!(DEFAULT_INTRA_TX_TYPE_SET2_CDF[2][0][0], 1127);
     }
 
     // Round 22 — inter-frame interpolation-filter group tests.

@@ -6,6 +6,49 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 137 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (intra-frame transform-type subset).** Completes the §6.10.19
+  transform-set coverage started in round 21 by extending `cdf` with the
+  two intra-frame transform-type default tables transcribed verbatim
+  from §9.4: `Default_Intra_Tx_Type_Set1_Cdf[ 2 ][ INTRA_MODES ][ 8 ]`
+  — the 7-symbol full intra set for 4x4 / 8x8 intra blocks reaching
+  `TX_SET_INTRA_1` (`Tx_Type_Intra_Inv_Set1 = { IDTX, DCT_DCT, V_DCT,
+  H_DCT, ADST_ADST, ADST_DCT, DCT_ADST }`); and
+  `Default_Intra_Tx_Type_Set2_Cdf[ 3 ][ INTRA_MODES ][ 6 ]` — the
+  5-symbol reduced intra set for 4x4 / 8x8 / 16x16 intra blocks
+  reaching `TX_SET_INTRA_2` (`Tx_Type_Intra_Inv_Set2 = { IDTX, DCT_DCT,
+  ADST_ADST, ADST_DCT, DCT_ADST }`). New §3 constants
+  `TX_SET_INTRA_1 = 1`, `TX_SET_INTRA_2 = 2`, `TX_TYPES_INTRA_SET1 = 7`,
+  `TX_TYPES_INTRA_SET2 = 5`, `INTRA_TX_TYPE_SET1_SIZES = 2`,
+  `INTRA_TX_TYPE_SET2_SIZES = 3`, and the §8.3.2
+  `Filter_Intra_Mode_To_Intra_Dir[ INTRA_FILTER_MODES ]` table
+  (`{ DC_PRED, V_PRED, H_PRED, D157_PRED, DC_PRED }`). New
+  `TileCdfContext` fields `intra_tx_type_set1` / `intra_tx_type_set2`,
+  initialised by `TileCdfContext::new_from_defaults` per §8.3.1
+  ("`IntraTxTypeSet1Cdf` is set equal to a copy of
+  `Default_Intra_Tx_Type_Set1_Cdf`" and likewise for Set2). The §8.3.2
+  selection surfaces `intra_tx_type_cdf(set, tx_size_sqr, intra_dir)`,
+  the two-way `TileIntraTxTypeSet{1,2}Cdf` switch indexed on the
+  `intraDir` axis (returning `None` for `TX_SET_DCTONLY` per §5.11.47
+  and for unreachable `(set, tx_size_sqr, intra_dir)` combinations).
+  Two scalar helpers complete the path: `intra_tx_type_set(tx_sz_sqr,
+  tx_sz_sqr_up, reduced_tx_set)` mirrors §5.11.48 `get_tx_set()` on the
+  `is_inter == 0` branch (differing from the inter counterpart in
+  routing `txSzSqrUp == TX_32X32` to `TX_SET_DCTONLY` and
+  `txSzSqr == TX_16X16` to `TX_SET_INTRA_2`), and
+  `intra_dir(use_filter_intra, y_mode, filter_intra_mode)` derives the
+  §8.3.2 `intraDir` axis. All new types / constants / helpers
+  re-exported at the crate root. Tests grow by 7 (cdf module): table
+  well-formedness + dimension audit against the §3 constants;
+  byte-anchor spot-checks plus the explicit `Set2` flat-distribution
+  check for sizes 0..=1; §8.3.1 init-copy independence with a
+  mutate-doesn't-touch-source assertion; selector two-way coverage
+  with row-length assertions and unreachable / out-of-range `None`
+  returns; the `intra_tx_type_set` formula walked across every
+  reachable `(tx_sz_sqr, tx_sz_sqr_up, reduced_tx_set)` triple; the
+  `intra_dir` derivation for the pass-through and filter-intra
+  branches; and one end-to-end §8.2 `SymbolDecoder` decode driving
+  the 5-symbol `TileIntraTxTypeSet2Cdf[ 2 ][ DC_PRED ]` row.
 * **Round 136 — §9.4 default CDF tables + §8.3.1 `init_coeff_cdfs` /
   §8.3.2 selection (coefficient-token entry sub-group).** Extends `cdf`
   with the entry sub-group of the coefficient-token CDFs — the gateway

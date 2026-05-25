@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-25
+## Status — 2026-05-26
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -672,12 +672,61 @@ Bitstream parsing currently covers:
   where `tx_sz_sqr != tx_sz_sqr_up`); and one end-to-end §8.2
   `SymbolDecoder` decode driving the 2-symbol
   `TileInterTxTypeSet3Cdf[ 1 ]` row selected by
-  `inter_tx_type_set(1, 1, true) = TX_SET_INTER_3`. The intra
-  counterpart (`Default_Intra_Tx_Type_Set{1,2}_Cdf` with their
-  `[INTRA_MODES][..]` second axis and the `intraDir` selection that
-  routes filter-intra modes through
-  `Filter_Intra_Mode_To_Intra_Dir`) is a mechanical follow-up
-  against the same `TileCdfContext` shape.
+  `inter_tx_type_set(1, 1, true) = TX_SET_INTER_3`.
+
+* **§9.4 default CDF tables + §8.3.2 selection — intra-frame
+  transform-type subset (round 137).** Completes the §6.10.19
+  transform-set coverage started in round 21 with the two intra-frame
+  default tables (`Default_Intra_Tx_Type_Set1_Cdf[ 2 ][ INTRA_MODES ][ 8 ]`
+  — the 7-symbol full intra set for 4x4 / 8x8 intra blocks reaching
+  `TX_SET_INTRA_1`; `Default_Intra_Tx_Type_Set2_Cdf[ 3 ][ INTRA_MODES ][ 6 ]`
+  — the 5-symbol reduced intra set for 4x4 / 8x8 / 16x16 intra blocks
+  reaching `TX_SET_INTRA_2`) — both transcribed verbatim from §9.4 with
+  the §3 constants `TX_SET_INTRA_1 = 1`, `TX_SET_INTRA_2 = 2`,
+  `TX_TYPES_INTRA_SET1 = 7`, `TX_TYPES_INTRA_SET2 = 5`,
+  `INTRA_TX_TYPE_SET1_SIZES = 2`, `INTRA_TX_TYPE_SET2_SIZES = 3`, and
+  the §8.3.2 `Filter_Intra_Mode_To_Intra_Dir[ INTRA_FILTER_MODES ]`
+  table mapping each filter mode to a directional anchor
+  (`{ DC_PRED, V_PRED, H_PRED, D157_PRED, DC_PRED }`).
+  `new_from_defaults` performs the §8.3.1 init step for both arrays.
+  An `&mut [u16]` accessor `intra_tx_type_cdf(set, tx_size_sqr, intra_dir)`
+  surfaces the §8.3.2 selection — the two-way
+  `TileIntraTxTypeSet{1,2}Cdf` switch keyed by the §5.11.48 `set`
+  return and indexed on the `intraDir` axis — yielding `None` for
+  `TX_SET_DCTONLY` and for any unreachable `(set, tx_size_sqr,
+  intra_dir)` combination. Two scalar §5.11.48 / §8.3.2 helpers
+  complete the path: `intra_tx_type_set(tx_sz_sqr, tx_sz_sqr_up,
+  reduced_tx_set)` computes the `set ∈ { TX_SET_DCTONLY,
+  TX_SET_INTRA_1, TX_SET_INTRA_2 }` from the surrounding §5.11.47
+  syntax (differing from the inter branch in two places:
+  `txSzSqrUp == TX_32X32` itself routes to `TX_SET_DCTONLY` rather
+  than `TX_SET_INTER_3`, and `txSzSqr == TX_16X16` routes to
+  `TX_SET_INTRA_2` rather than `TX_SET_INTER_2`), and
+  `intra_dir(use_filter_intra, y_mode, filter_intra_mode)` derives
+  the `intraDir` axis from the `use_filter_intra` flag plus
+  the `YMode` / `filter_intra_mode` pair. 7 new unit tests:
+  every intra-tx-type table's `cdf[N-1] == 32768` / `cdf[N] == 0`
+  invariant + dimension audit against the §3 constants; byte-anchor
+  spot-checks on every table's first / last entries plus the explicit
+  flat-distribution check for `Set2` sizes 0..=1; §8.3.1 init-copy
+  independence with a mutate-doesn't-touch-source assertion;
+  `intra_tx_type_cdf` two-way selection over every reachable
+  `(set, tx_size_sqr, intra_dir)` triple with row-length assertions
+  and unreachable-set / out-of-range coverage; the
+  `intra_tx_type_set` formula walked across every reachable
+  `(tx_sz_sqr, tx_sz_sqr_up, reduced_tx_set)` triple (including the
+  rectangular `TX_4X8` / `TX_16X32` cases and the `txSzSqrUp == TX_32X32`
+  short-circuit specific to the intra branch); the `intra_dir`
+  derivation tested for the pass-through (`use_filter_intra == 0`)
+  and the `Filter_Intra_Mode_To_Intra_Dir` lookup branches; and one
+  end-to-end §8.2 `SymbolDecoder` decode driving the 5-symbol
+  `TileIntraTxTypeSet2Cdf[ 2 ][ 0 ]` row selected by
+  `intra_tx_type_set(2, 2, false) = TX_SET_INTRA_2` +
+  `intra_dir(false, DC_PRED, _) = DC_PRED`. This completes §9.4's
+  transform-type coverage (intra + inter); remaining §9.4 work is
+  the `init_coeff_cdfs` coefficient set (`Default_Coeff_Base_Eob_Cdf`
+  / `Default_Coeff_Base_Cdf` / `Default_Coeff_Br_Cdf`) and the
+  inter-intra group.
 
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
@@ -801,15 +850,21 @@ working arrays; the §8.3.2 selectors `txb_skip_cdf` /
 and the §3 constants `PLANE_TYPES = 2`, `COEFF_CDF_Q_CTXS = 4`,
 `TXB_SKIP_CONTEXTS = 13`, `EOB_COEF_CONTEXTS = 9`,
 `DC_SIGN_CONTEXTS = 3` are added.
-The remaining §9.4 tables (intra transform-type
-(`intra_tx_type`, `Default_Intra_Tx_Type_Set{1,2}_Cdf`),
-inter-intra (`Default_Interintra_Cdf`)), the rest of the
-`init_coeff_cdfs` coefficient set (`Default_Coeff_Base_Eob_Cdf` /
-`Default_Coeff_Base_Cdf` / `Default_Coeff_Br_Cdf`), and the
-other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
-…) are a mechanical followup against the same
-`TileCdfContext` shape. `decode_av1` and `encode_av1` still return
-`Error::NotImplemented`.
+Round 137 completes §9.4's transform-type coverage by adding the
+**intra-frame transform-type** subset (`intra_tx_type` over
+`Default_Intra_Tx_Type_Set{1,2}_Cdf`) plus the §5.11.48
+`intra_tx_type_set` switch driving the §8.3.2 two-way
+`TileIntraTxTypeSet{1,2}Cdf` selection and the §8.3.2 `intra_dir`
+helper that derives the `intraDir` axis from `use_filter_intra` +
+`YMode` / `filter_intra_mode` via the
+`Filter_Intra_Mode_To_Intra_Dir` table.
+The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
+the rest of the `init_coeff_cdfs` coefficient set
+(`Default_Coeff_Base_Eob_Cdf` / `Default_Coeff_Base_Cdf` /
+`Default_Coeff_Br_Cdf`), and the other §8.3.2 selections
+(`split_or_horz` / `split_or_vert` / …) are a mechanical followup
+against the same `TileCdfContext` shape. `decode_av1` and
+`encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -1123,6 +1178,23 @@ other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
     `Default_Txb_Skip_Cdf`, `Default_Eob_Pt_{16,32,64,128,256,512,
     1024}_Cdf`, `Default_Eob_Extra_Cdf` and `Default_Dc_Sign_Cdf`,
     the last in the `128 * N` fixed-point form).
+  * **Intra-frame transform-type CDFs** (round 137): §3 (constants —
+    `TX_SET_INTRA_1 = 1`, `TX_SET_INTRA_2 = 2`,
+    `TX_TYPES_INTRA_SET1 = 7`, `TX_TYPES_INTRA_SET2 = 5`,
+    `INTRA_TX_TYPE_SET1_SIZES = 2`, `INTRA_TX_TYPE_SET2_SIZES = 3`),
+    §5.11.48 `get_tx_set()` (the `is_inter == 0` branch routing
+    `txSzSqrUp >= TX_32X32` → `TX_SET_DCTONLY`, `reduced_tx_set ||
+    txSzSqr == TX_16X16` → `TX_SET_INTRA_2`, else → `TX_SET_INTRA_1`),
+    §6.10.19 (the `Tx_Type_Intra_Inv_Set1` 7-entry / `Tx_Type_Intra_Inv_Set2`
+    5-entry transform-type enumeration), §8.3.1 (the "set equal to a
+    copy of `Default_Intra_Tx_Type_Set1_Cdf` / `Default_Intra_Tx_Type_Set2_Cdf`"
+    init steps for `IntraTxTypeSet1Cdf` / `IntraTxTypeSet2Cdf`), §8.3.2
+    (the `intra_tx_type: TileIntraTxTypeSet{1,2}Cdf[ Tx_Size_Sqr[ txSz ]
+    ][ intraDir ]` two-way switch and the `intraDir` derivation —
+    `Filter_Intra_Mode_To_Intra_Dir[ filter_intra_mode ]` when
+    `use_filter_intra == 1`, else `YMode`), §8.3.2
+    `Filter_Intra_Mode_To_Intra_Dir[ INTRA_FILTER_MODES ]` table,
+    §9.4 (default CDF table values for the two tables).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
