@@ -547,6 +547,38 @@
 //!     remaining table of the braid (`Default_Coeff_Br_Cdf`) is
 //!     deferred to a later round.
 //!
+//!   * **Round 140.** The §9.4 default CDF table and the §8.3.1
+//!     `init_coeff_cdfs` / §8.3.2 selection for the LAST member of
+//!     the `coeff_base` / `coeff_base_eob` / `coeff_br` braid:
+//!     [`DEFAULT_COEFF_BR_CDF`]
+//!     (`[COEFF_CDF_Q_CTXS][TX_SIZES][PLANE_TYPES][LEVEL_CONTEXTS][BR_CDF_SIZE + 1]`,
+//!     840 5-entry rows; declared `static` so `clippy::large_const_arrays`
+//!     does not flag the per-use copy hazard), transcribed verbatim
+//!     from §9.4. With this table all three coefficient-CDF braid
+//!     members are landed. `coeff_br` codes the per-coefficient
+//!     base-range increment used to push a level above
+//!     `NUM_BASE_LEVELS`: each read codes a value in
+//!     `0..BR_CDF_SIZE = 4`, and §5.11.39 stacks
+//!     `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)` such reads per
+//!     coefficient. New §3 constants `LEVEL_CONTEXTS = 21` and
+//!     `BR_CDF_SIZE = 4`. [`TileCdfContext`] grows the `coeff_br`
+//!     field, seeded by [`TileCdfContext::new_from_defaults`] from
+//!     the `idx == 0` slice and re-selected per `base_q_idx` by
+//!     [`TileCdfContext::init_coeff_cdfs`]. The §8.3.2 selection
+//!     surfaces `coeff_br_cdf(tx_sz_ctx, ptype, ctx)`, implementing
+//!     the spec selector
+//!     `TileCoeffBrCdf[ Min(txSzCtx, TX_32X32) ][ ptype ][ ctx ]`
+//!     with the `TX_32X32 = 3` clamp built in (so any `txSzCtx` is
+//!     accepted; only `ptype` / `ctx` are bounds-checked); the
+//!     `get_br_ctx()` derivation itself belongs to the
+//!     not-yet-implemented tile-content walk and is deferred. The
+//!     largest `(TX_SIZE = TX_64X64, ptype = chroma)` slice is again
+//!     a flat `{8192, 16384, 24576, 32768, 0}` placeholder, mirroring
+//!     the r138 / r139 pattern. The next gate is the §8.3.2
+//!     `get_coeff_base_ctx()` / `get_br_ctx()` neighbour-derivation
+//!     helpers (deferred to a different round — they need
+//!     tile-content walker state).
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -572,21 +604,21 @@ pub use cdf::{
     interp_filter_ctx, intra_dir, intra_mode_ctx, intra_tx_type_set, is_inter_ctx, mv_ctx,
     palette_color_ctx, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx, ref_count_ctx,
     segment_id_ctx, size_group, skip_ctx, skip_mode_ctx, tx_depth_ctx, txfm_split_ctx,
-    TileCdfContext, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BWD_REFS, CFL_ALPHABET_SIZE,
+    TileCdfContext, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE,
     CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
     COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
     COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
     DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF,
-    DEFAULT_COEFF_BASE_CDF, DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COMPOUND_IDX_CDF,
-    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF,
-    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
-    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF,
-    DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF,
-    DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF,
-    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF,
-    DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
-    DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF,
-    DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
+    DEFAULT_COEFF_BASE_CDF, DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF,
+    DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF,
+    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF,
+    DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DRL_MODE_CDF,
+    DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF,
+    DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF,
+    DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF,
+    DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF,
+    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF,
+    DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
     DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
     DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
     DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
@@ -607,8 +639,8 @@ pub use cdf::{
     FILTER_INTRA_MODE_TO_INTRA_DIR, FWD_REFS, INTERP_FILTERS, INTERP_FILTER_CONTEXTS,
     INTERP_FILTER_NONE, INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES, INTRA_FILTER_MODES,
     INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, INTRA_TX_TYPE_SET1_SIZES,
-    INTRA_TX_TYPE_SET2_SIZES, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_TX_DEPTH, MOTION_MODES,
-    MV_CLASSES, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS,
+    INTRA_TX_TYPE_SET2_SIZES, IS_INTER_CONTEXTS, LEVEL_CONTEXTS, MAX_ANGLE_DELTA, MAX_TX_DEPTH,
+    MOTION_MODES, MV_CLASSES, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS,
     NEW_MV_CONTEXTS, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, PALETTE_COLOR_CONTEXT,
     PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS, PALETTE_MAX_COLOR_CONTEXT_HASH,
     PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS, PALETTE_Y_MODE_CONTEXTS,

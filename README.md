@@ -896,12 +896,36 @@ chroma)` slice is the flat `{8192, 16384, 24576, 32768, 0}`
 placeholder for every q-context and ctx value — a sentinel for an
 unreachable chroma row at the largest TX size — and is locked down
 by an exhaustive byte-equality test.
+Round 140 lands the LAST member of the braid — the **`coeff_br`
+sub-group** — by adding `Default_Coeff_Br_Cdf`
+(`[COEFF_CDF_Q_CTXS=4][TX_SIZES=5][PLANE_TYPES=2][LEVEL_CONTEXTS=21][BR_CDF_SIZE + 1 = 5]`,
+840 5-entry rows = 8400 bytes; declared `static` to satisfy
+`clippy::large_const_arrays`) transcribed verbatim from §9.4. With
+this table all three coefficient-CDF braid members are landed.
+`coeff_br` codes the per-coefficient base-range increment used to
+push a level above `NUM_BASE_LEVELS`: each read codes a value in
+`0..BR_CDF_SIZE = 4`, and §5.11.39 stacks
+`COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)` such reads per coefficient.
+`init_coeff_cdfs` grows the new
+`self.coeff_br = DEFAULT_COEFF_BR_CDF[ idx ]` copy on the
+`base_q_idx`-derived `idx`, and the §8.3.2 selector
+`coeff_br_cdf(tx_sz_ctx, ptype, ctx)` surfaces the
+`TileCoeffBrCdf[ Min(txSzCtx, TX_32X32) ][ ptype ][ ctx ]` lookup
+with the `TX_32X32 = 3` clamp built in (so any `txSzCtx` is
+accepted; only `ptype` / `ctx` are bounds-checked). New §3
+constants `LEVEL_CONTEXTS = 21` and `BR_CDF_SIZE = 4`. Mirroring
+r138 / r139, the largest `(TX_SIZE = TX_64X64, ptype = chroma)`
+slice is the flat `{8192, 16384, 24576, 32768, 0}` placeholder for
+every q-context and ctx value, locked down by an exhaustive
+byte-equality test. The next gate is the §8.3.2
+`get_coeff_base_ctx()` / `get_br_ctx()` neighbour-derivation helpers,
+deferred to a different round because they need tile-content walker
+state.
 The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
-the last member of the `init_coeff_cdfs` coefficient set
-(`Default_Coeff_Br_Cdf`), and the other §8.3.2 selections
-(`split_or_horz` / `split_or_vert` / …) are a mechanical followup
-against the same `TileCdfContext` shape. `decode_av1` and
-`encode_av1` still return `Error::NotImplemented`.
+and the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
+…) are a mechanical followup against the same `TileCdfContext`
+shape. `decode_av1` and `encode_av1` still return
+`Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -1243,6 +1267,28 @@ against the same `TileCdfContext` shape. `decode_av1` and
     `ctx = get_coeff_base_ctx(...) - SIG_COEF_CONTEXTS +
     SIG_COEF_CONTEXTS_EOB` derivation), §9.4 (default CDF table
     values for `Default_Coeff_Base_Eob_Cdf`).
+  * **`coeff_base` CDF** (round 139): §3 (`SIG_COEF_CONTEXTS = 42`
+    constant definition; the `SIG_COEF_CONTEXTS_2D = 26` partition
+    tag that splits the 2D-scan prefix from the 1D horizontal- /
+    vertical-only tails), §5.11 `coeff_base` semantics (the "level
+    is `coeff_base`" assignment for non-EOB coefficients),
+    §8.3.1 `init_coeff_cdfs` (the "`CoeffBaseCdf` is set to a copy
+    of `Default_Coeff_Base_Cdf[ idx ]`" reset step), §8.3.2 (the
+    `coeff_base: TileCoeffBaseCdf[ txSzCtx ][ ptype ][ ctx ]`
+    selection plus the deferred-to-tile-walk
+    `ctx = get_coeff_base_ctx(...)` derivation), §9.4 (default CDF
+    table values for `Default_Coeff_Base_Cdf`).
+  * **`coeff_br` CDF** (round 140): §3 (`LEVEL_CONTEXTS = 21` and
+    `BR_CDF_SIZE = 4` constant definitions), §5.11.39 `coeff_br`
+    semantics (the `for idx = 0; idx < COEFF_BASE_RANGE /
+    (BR_CDF_SIZE - 1); idx++` per-coefficient stacking loop with
+    the `coeff_br < (BR_CDF_SIZE - 1)` early-break),
+    §8.3.1 `init_coeff_cdfs` (the "`CoeffBrCdf` is set to a copy of
+    `Default_Coeff_Br_Cdf[ idx ]`" reset step), §8.3.2 (the
+    `coeff_br: TileCoeffBrCdf[ Min(txSzCtx, TX_32X32) ][ ptype ][
+    ctx ]` selection with the `TX_32X32 = 3` clamp, plus the
+    deferred-to-tile-walk `ctx = get_br_ctx(...)` derivation),
+    §9.4 (default CDF table values for `Default_Coeff_Br_Cdf`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
