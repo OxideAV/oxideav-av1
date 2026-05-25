@@ -6,6 +6,40 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 22 — §9.4 default CDF table + §8.3.1 / §8.3.2 selection
+  (inter-frame interpolation-filter subset).** Extends `cdf` with the
+  `Default_Interp_Filter_Cdf` default table —
+  `[INTERP_FILTER_CONTEXTS][INTERP_FILTERS + 1]` (16 contexts × 3
+  cumulative frequencies + adaptation counter), transcribed verbatim
+  from §9.4. New §3 constants `INTERP_FILTERS = 3` and
+  `INTERP_FILTER_CONTEXTS = 16`, plus the sentinel
+  `INTERP_FILTER_NONE = INTERP_FILTERS` (mirrors the spec's literal `3`
+  marker for unavailable / mismatched neighbours). New
+  `TileCdfContext::interp_filter` field, initialised by
+  `TileCdfContext::new_from_defaults` per §8.3.1. One §8.3.2 selection
+  accessor lands — `interp_filter_cdf(ctx)` (with bounds-check return
+  of `None` for `ctx >= INTERP_FILTER_CONTEXTS`). The scalar §8.3.2
+  helper `interp_filter_ctx(above_type, left_type, dir, is_compound)`
+  folds the §8.3.2 four-branch formula
+  (`((dir & 1) * 2 + (RefFrame[1] > INTRA_FRAME)) * 4` base, then
+  `+ leftType` / `+ aboveType` / `+ INTERP_FILTERS` per the
+  match-vs-NONE branches) into a single
+  `0..INTERP_FILTER_CONTEXTS` index — the caller supplies the
+  already-resolved neighbour-filter values per the spec's
+  `RefFrames[..][0|1] == RefFrame[0]` matching predicate (the
+  neighbour walk itself lives in the future tile-walk crate). All new
+  types / constants / fns re-exported at the crate root. Tests grow
+  from 204 to 211 (cdf module): table well-formedness against §3
+  constants, byte-anchor spot-checks of the §9.4 row values
+  (rows 0/2/7/8/14/15), §8.3.1 init-copy independence with
+  mutate-doesn't-touch-source assertion, `interp_filter_ctx` walk
+  across all four §8.3.2 branches (match, left-NONE, above-NONE,
+  distinct) and across all four `(dir, is_compound)` quadrants, an
+  exhaustive coverage walk that hits every reachable
+  `0..INTERP_FILTER_CONTEXTS` ctx, selector row-equality for every
+  ctx, and one end-to-end §8.2 `SymbolDecoder` decode driving the
+  `Default_Interp_Filter_Cdf[2]` row selected by the new helpers.
+
 * **Round 21 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (inter-frame transform-type subset).** Extends `cdf` with three
   new default tables (`Default_Inter_Tx_Type_Set1_Cdf` —

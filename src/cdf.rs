@@ -379,6 +379,19 @@ pub const INTER_TX_TYPE_SET1_SIZES: usize = 2;
 /// `TX_SET_DCTONLY`).
 pub const INTER_TX_TYPE_SET3_SIZES: usize = 4;
 
+/// `INTERP_FILTERS` per §3. Number of values for `interp_filter` (the
+/// three switchable filters: `EIGHTTAP`, `EIGHTTAP_SMOOTH`,
+/// `EIGHTTAP_SHARP` — `BILINEAR` is reachable only when the frame
+/// header's `interpolation_filter` is `BILINEAR` and the §5.11.x
+/// switchable-filter path is not entered).
+pub const INTERP_FILTERS: usize = 3;
+
+/// `INTERP_FILTER_CONTEXTS` per §3. Number of contexts for
+/// `interp_filter`. The §8.3.2 ctx formula (`((dir & 1) * 2 +
+/// (RefFrame[1] > INTRA_FRAME)) * 4 + ...`) ranges across
+/// `0..INTERP_FILTER_CONTEXTS`.
+pub const INTERP_FILTER_CONTEXTS: usize = 16;
+
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
 //
@@ -1189,6 +1202,40 @@ pub const DEFAULT_INTER_TX_TYPE_SET3_CDF: [[u16; TX_TYPES_SET3 + 1]; INTER_TX_TY
 ];
 
 // ---------------------------------------------------------------------
+// Round 22 — inter-frame interpolation-filter group (§9.4):
+// `Default_Interp_Filter_Cdf`. Codes `interp_filter` per §5.11.x and
+// the §8.3.2 selection. The §8.3.2 `ctx` formula folds two scalar
+// neighbour inputs (`aboveType` / `leftType`) plus the §5.11.x scope
+// `dir` / `RefFrame[1]` into a single `0..INTERP_FILTER_CONTEXTS`
+// index — see [`interp_filter_ctx`].
+// ---------------------------------------------------------------------
+
+/// `Default_Interp_Filter_Cdf[ INTERP_FILTER_CONTEXTS ][ INTERP_FILTERS + 1 ]`
+/// (§9.4). Indexed by the §8.3.2 `interp_filter` ctx (in
+/// `0..INTERP_FILTER_CONTEXTS`); the innermost row codes the
+/// `interp_filter ∈ { EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP }`
+/// symbol (`INTERP_FILTERS = 3` cumulative frequencies plus the
+/// §8.3 adaptation counter that starts at 0).
+pub const DEFAULT_INTERP_FILTER_CDF: [[u16; INTERP_FILTERS + 1]; INTERP_FILTER_CONTEXTS] = [
+    [31935, 32720, 32768, 0],
+    [5568, 32719, 32768, 0],
+    [422, 2938, 32768, 0],
+    [28244, 32608, 32768, 0],
+    [31206, 31953, 32768, 0],
+    [4862, 32121, 32768, 0],
+    [770, 1152, 32768, 0],
+    [20889, 25637, 32768, 0],
+    [31910, 32724, 32768, 0],
+    [4120, 32712, 32768, 0],
+    [305, 2247, 32768, 0],
+    [27403, 32636, 32768, 0],
+    [31022, 32009, 32768, 0],
+    [2963, 32093, 32768, 0],
+    [601, 943, 32768, 0],
+    [14969, 21398, 32768, 0],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -1367,6 +1414,15 @@ pub struct TileCdfContext {
     /// `TileInterTxTypeSet3Cdf[ INTER_TX_TYPE_SET3_SIZES ]` (§8.3.1).
     /// Selected for `inter_tx_type` when `set == TX_SET_INTER_3`.
     pub inter_tx_type_set3: [[u16; TX_TYPES_SET3 + 1]; INTER_TX_TYPE_SET3_SIZES],
+
+    // -----------------------------------------------------------------
+    // Round 22 — inter-frame interpolation-filter group. §8.3.1
+    // enumerates as "`InterpFilterCdf` is set equal to a copy of
+    // `Default_Interp_Filter_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileInterpFilterCdf[ INTERP_FILTER_CONTEXTS ]` (§8.3.1). Codes
+    /// `interp_filter` (the switchable-filter selection).
+    pub interp_filter: [[u16; INTERP_FILTERS + 1]; INTERP_FILTER_CONTEXTS],
 }
 
 impl TileCdfContext {
@@ -1460,6 +1516,9 @@ impl TileCdfContext {
             inter_tx_type_set1: DEFAULT_INTER_TX_TYPE_SET1_CDF,
             inter_tx_type_set2: DEFAULT_INTER_TX_TYPE_SET2_CDF,
             inter_tx_type_set3: DEFAULT_INTER_TX_TYPE_SET3_CDF,
+
+            // Round 22 — inter-frame interpolation-filter group.
+            interp_filter: DEFAULT_INTERP_FILTER_CDF,
         }
     }
 
@@ -1849,6 +1908,18 @@ impl TileCdfContext {
             _ => None,
         }
     }
+
+    /// §8.3.2 `interp_filter`: the cdf is `TileInterpFilterCdf[ ctx ]`,
+    /// with `ctx` in `0..INTERP_FILTER_CONTEXTS` (see
+    /// [`interp_filter_ctx`]). Returns `None` if `ctx` is out of range
+    /// (a caller bug — the §8.3.2 formula bounds the result).
+    pub fn interp_filter_cdf(&mut self, ctx: usize) -> Option<&mut [u16]> {
+        if ctx < INTERP_FILTER_CONTEXTS {
+            Some(&mut self.interp_filter[ctx])
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for TileCdfContext {
@@ -2193,6 +2264,86 @@ pub fn inter_tx_type_set(tx_sz_sqr: u32, tx_sz_sqr_up: u32, reduced_tx_set: bool
         TX_SET_INTER_2
     } else {
         TX_SET_INTER_1
+    }
+}
+
+// ---------------------------------------------------------------------
+// Round 22 — inter-frame interpolation-filter §8.3.2 helper. The
+// §8.3.2 ctx formula folds the §5.11.x `dir` / `RefFrame[1]` scope
+// inputs with the two `(above|left)Type` neighbour-filter inputs into
+// a single `0..INTERP_FILTER_CONTEXTS` index.
+// ---------------------------------------------------------------------
+
+/// Sentinel returned by the §8.3.2 `aboveType` / `leftType` neighbour
+/// reads when the neighbour is unavailable or carries a different
+/// reference frame (so its `InterpFilters` entry doesn't count as a
+/// matching neighbour). Per §8.3.2 the spec's literal initialiser
+/// `aboveType = 3; leftType = 3` matches `INTERP_FILTERS`, i.e. one
+/// past the highest reachable filter index.
+pub const INTERP_FILTER_NONE: usize = INTERP_FILTERS;
+
+/// §8.3.2 `interp_filter` context. Mirrors the spec block:
+///
+/// ```text
+///   ctx = ((dir & 1) * 2 + (RefFrame[1] > INTRA_FRAME)) * 4
+///   leftType = 3
+///   aboveType = 3
+///
+///   if (AvailL) {
+///       if (RefFrames[ MiRow ][ MiCol - 1 ][ 0 ] == RefFrame[ 0 ] ||
+///           RefFrames[ MiRow ][ MiCol - 1 ][ 1 ] == RefFrame[ 0 ])
+///           leftType = InterpFilters[ MiRow ][ MiCol - 1 ][ dir ]
+///   }
+///   if (AvailU) {
+///       if (RefFrames[ MiRow - 1 ][ MiCol ][ 0 ] == RefFrame[ 0 ] ||
+///           RefFrames[ MiRow - 1 ][ MiCol ][ 1 ] == RefFrame[ 0 ])
+///           aboveType = InterpFilters[ MiRow - 1 ][ MiCol ][ dir ]
+///   }
+///
+///   if (leftType == aboveType)        ctx += leftType
+///   else if (leftType == 3)           ctx += aboveType
+///   else if (aboveType == 3)          ctx += leftType
+///   else                              ctx += 3
+/// ```
+///
+/// The caller supplies the already-resolved `above_type` / `left_type`
+/// in `0..INTERP_FILTERS` for a matching neighbour, or
+/// [`INTERP_FILTER_NONE`] (== `INTERP_FILTERS`, the spec's literal `3`)
+/// for an unavailable / mismatched neighbour — the §5.11.x neighbour
+/// walk owns that resolution. `dir` is 0 (horizontal) or 1 (vertical),
+/// and `is_compound` is the §5.11.27 `isCompound = RefFrame[1] >
+/// INTRA_FRAME` derivation.
+///
+/// Returns `Some(ctx)` in `0..INTERP_FILTER_CONTEXTS`, or `None` if
+/// any input is out of the spec-bounded range (a caller bug —
+/// `above_type` / `left_type` strictly bounded to `0..=INTERP_FILTERS`,
+/// `dir <= 1`).
+pub fn interp_filter_ctx(
+    above_type: usize,
+    left_type: usize,
+    dir: u32,
+    is_compound: bool,
+) -> Option<usize> {
+    if dir > 1 {
+        return None;
+    }
+    if above_type > INTERP_FILTERS || left_type > INTERP_FILTERS {
+        return None;
+    }
+    let mut ctx = (((dir & 1) as usize) * 2 + (is_compound as usize)) * 4;
+    if left_type == above_type {
+        ctx += left_type;
+    } else if left_type == INTERP_FILTER_NONE {
+        ctx += above_type;
+    } else if above_type == INTERP_FILTER_NONE {
+        ctx += left_type;
+    } else {
+        ctx += INTERP_FILTERS;
+    }
+    if ctx < INTERP_FILTER_CONTEXTS {
+        Some(ctx)
+    } else {
+        None
     }
 }
 
@@ -3663,5 +3814,187 @@ mod tests {
             "read_symbol must adapt the CDF"
         );
         assert_eq!(DEFAULT_INTER_TX_TYPE_SET3_CDF[1][0], 4167);
+    }
+
+    // Round 22 — inter-frame interpolation-filter group tests.
+
+    /// §8.3.1 / §9.4: the `Default_Interp_Filter_Cdf` table well-formed.
+    /// Each row is `[INTERP_FILTERS + 1]` (3 cumulative frequencies +
+    /// adaptation counter), the second-to-last entry is `1 << 15`, and
+    /// the last entry is 0. Outer dim matches `INTERP_FILTER_CONTEXTS`.
+    #[test]
+    fn interp_filter_default_table_well_formed() {
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF.len(), INTERP_FILTER_CONTEXTS);
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[0].len(), INTERP_FILTERS + 1);
+
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+        for r in &DEFAULT_INTERP_FILTER_CDF {
+            check(r);
+        }
+    }
+
+    /// Spot-check the §9.4 `Default_Interp_Filter_Cdf` values byte-for-byte.
+    /// A mis-keyed digit during transcription breaks the equality.
+    #[test]
+    fn interp_filter_default_byte_exact_values() {
+        // Row 0: { 31935, 32720, 32768, 0 } — strongest bias to filter 0.
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[0][0], 31935);
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[0][1], 32720);
+        // Row 2: { 422, 2938, 32768, 0 } — strong bias to filter 2.
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[2][0], 422);
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[2][1], 2938);
+        // Row 7: { 20889, 25637, 32768, 0 } — mixed-neighbour anchor.
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[7][0], 20889);
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[7][1], 25637);
+        // Row 8: { 31910, 32724, 32768, 0 } — vertical-dir row 0.
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[8][0], 31910);
+        // Row 14: { 601, 943, 32768, 0 } — anchor near the end.
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[14][0], 601);
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[14][1], 943);
+        // Row 15: { 14969, 21398, 32768, 0 } — last row.
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[15][0], 14969);
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[15][1], 21398);
+    }
+
+    /// §8.3.1: a fresh context copies the interp-filter default in
+    /// (the §9.4 source is not aliased).
+    #[test]
+    fn interp_filter_init_from_defaults_copies_table() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.interp_filter, DEFAULT_INTERP_FILTER_CDF);
+
+        // Working-copy independence: mutating the context must not
+        // touch the §9.4 source.
+        ctx.interp_filter_cdf(0).unwrap()[0] = 12345;
+        assert_ne!(ctx.interp_filter[0][0], DEFAULT_INTERP_FILTER_CDF[0][0]);
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[0][0], 31935);
+    }
+
+    /// §8.3.2 `interp_filter` ctx formula: walk the four §8.3.2
+    /// branches against §5.11.x scope inputs and assert the returned
+    /// `ctx` matches the spec literal exactly.
+    #[test]
+    fn interp_filter_context_formula() {
+        // Base (dir=0, single-ref): ((0 & 1) * 2 + 0) * 4 = 0.
+        // leftType == aboveType branch: ctx += leftType.
+        assert_eq!(interp_filter_ctx(0, 0, 0, false).unwrap(), 0);
+        assert_eq!(interp_filter_ctx(1, 1, 0, false).unwrap(), 1);
+        assert_eq!(interp_filter_ctx(2, 2, 0, false).unwrap(), 2);
+
+        // leftType == 3 (NONE) branch: ctx += aboveType.
+        assert_eq!(
+            interp_filter_ctx(0, INTERP_FILTER_NONE, 0, false).unwrap(),
+            0,
+        );
+        assert_eq!(
+            interp_filter_ctx(2, INTERP_FILTER_NONE, 0, false).unwrap(),
+            2,
+        );
+
+        // aboveType == 3 (NONE) branch: ctx += leftType.
+        assert_eq!(
+            interp_filter_ctx(INTERP_FILTER_NONE, 1, 0, false).unwrap(),
+            1,
+        );
+
+        // Distinct, both available: ctx += 3.
+        assert_eq!(interp_filter_ctx(0, 1, 0, false).unwrap(), 3);
+        assert_eq!(interp_filter_ctx(2, 0, 0, false).unwrap(), 3);
+
+        // dir=1, single-ref: ((1 & 1) * 2 + 0) * 4 = 8.
+        assert_eq!(interp_filter_ctx(0, 0, 1, false).unwrap(), 8);
+        assert_eq!(interp_filter_ctx(1, 1, 1, false).unwrap(), 9);
+        assert_eq!(interp_filter_ctx(0, 1, 1, false).unwrap(), 11); // ctx += 3
+        assert_eq!(
+            interp_filter_ctx(INTERP_FILTER_NONE, INTERP_FILTER_NONE, 1, false).unwrap(),
+            11,
+        );
+
+        // dir=0, compound (RefFrame[1] > INTRA_FRAME):
+        // ((0 & 1) * 2 + 1) * 4 = 4.
+        assert_eq!(interp_filter_ctx(0, 0, 0, true).unwrap(), 4);
+        assert_eq!(interp_filter_ctx(0, 1, 0, true).unwrap(), 7);
+
+        // dir=1, compound: ((1 & 1) * 2 + 1) * 4 = 12. Max bucket.
+        assert_eq!(interp_filter_ctx(0, 0, 1, true).unwrap(), 12);
+        assert_eq!(interp_filter_ctx(2, 2, 1, true).unwrap(), 14);
+        assert_eq!(interp_filter_ctx(0, 1, 1, true).unwrap(), 15);
+
+        // Out-of-range: dir > 1, type > INTERP_FILTERS.
+        assert_eq!(interp_filter_ctx(0, 0, 2, false), None);
+        assert_eq!(interp_filter_ctx(INTERP_FILTERS + 1, 0, 0, false), None);
+        assert_eq!(interp_filter_ctx(0, INTERP_FILTERS + 1, 0, false), None);
+    }
+
+    /// §8.3.2 `interp_filter` ctx coverage: every reachable ctx in
+    /// `0..INTERP_FILTER_CONTEXTS` is hit by some valid input.
+    #[test]
+    fn interp_filter_context_full_coverage() {
+        let mut hit = [false; INTERP_FILTER_CONTEXTS];
+        for dir in 0..=1 {
+            for is_comp in [false, true] {
+                for above in 0..=INTERP_FILTERS {
+                    for left in 0..=INTERP_FILTERS {
+                        if let Some(ctx) = interp_filter_ctx(above, left, dir, is_comp) {
+                            hit[ctx] = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (i, h) in hit.iter().enumerate() {
+            assert!(h, "ctx {i} unreachable");
+        }
+    }
+
+    /// §8.3.2 `interp_filter` selector returns the right §9.4 row for
+    /// each `ctx`, with the row length matching the spec
+    /// (`INTERP_FILTERS + 1`).
+    #[test]
+    fn interp_filter_selector_returns_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        for (i, want) in DEFAULT_INTERP_FILTER_CDF.iter().enumerate() {
+            let row = ctx.interp_filter_cdf(i).unwrap();
+            assert_eq!(row.len(), INTERP_FILTERS + 1);
+            assert_eq!(row, want);
+        }
+        // Out-of-range ctx returns None.
+        assert!(ctx.interp_filter_cdf(INTERP_FILTER_CONTEXTS).is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through an
+    /// `interp_filter` default CDF selected by the §8.3.2 selection,
+    /// confirming the chosen row matches the §9.4 source, the decode
+    /// lands in range and the working copy adapts.
+    #[test]
+    fn decode_interp_filter_through_default_cdf() {
+        // ctx=2 (Default_Interp_Filter_Cdf[2] = {422, 2938, 32768, 0}):
+        // a strongly-toward-filter-2 row. Drive the decoder with a
+        // window that lands in the high-symbol region, then assert
+        // the working copy mutated and the §9.4 source stayed put.
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.interp_filter;
+
+        let chosen = interp_filter_ctx(2, 2, 0, false).unwrap();
+        assert_eq!(chosen, 2, "leftType==aboveType, base=0");
+        let row = tile_ctx.interp_filter_cdf(chosen).unwrap();
+        assert_eq!(row, &DEFAULT_INTERP_FILTER_CDF[2]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            (sym as usize) < INTERP_FILTERS,
+            "interp_filter must code a symbol in 0..INTERP_FILTERS"
+        );
+
+        assert_ne!(
+            tile_ctx.interp_filter, before,
+            "read_symbol must adapt the working CDF"
+        );
+        assert_eq!(DEFAULT_INTERP_FILTER_CDF[2], [422, 2938, 32768, 0]);
     }
 }

@@ -363,6 +363,24 @@
 //!     uv_mode, angle-delta, coefficient, …) are mechanical
 //!     followups against the same [`TileCdfContext`] shape.
 //!
+//!   * **Round 22.** The §9.4 default CDF table and the §8.3.1 /
+//!     §8.3.2 selection for the **inter-frame interpolation-filter**
+//!     syntax element, extending [`cdf`]. Transcribes
+//!     [`DEFAULT_INTERP_FILTER_CDF`] — `[INTERP_FILTER_CONTEXTS][INTERP_FILTERS + 1]`,
+//!     i.e. 16 contexts × 3 cumulative frequencies + adaptation counter
+//!     — verbatim from §9.4. New §3 constants `INTERP_FILTERS = 3`
+//!     and `INTERP_FILTER_CONTEXTS = 16`. [`TileCdfContext`] grows the
+//!     `interp_filter` field, seeded by [`TileCdfContext::new_from_defaults`]
+//!     per §8.3.1. The §8.3.2 selection surfaces
+//!     `interp_filter_cdf(ctx)`; the scalar [`interp_filter_ctx`]
+//!     helper folds the §8.3.2 four-branch
+//!     `(above_type, left_type, dir, is_compound)` formula into a
+//!     single `0..INTERP_FILTER_CONTEXTS` index (the caller supplies
+//!     the already-resolved neighbour-type values per the spec's
+//!     `RefFrame[0]` matching predicate). Sentinel
+//!     [`INTERP_FILTER_NONE`] (== `INTERP_FILTERS`, mirroring the
+//!     spec's literal `3`) marks an unavailable / mismatched neighbour.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -384,15 +402,16 @@ pub mod tile_info;
 pub mod uncompressed_header_tail;
 
 pub use cdf::{
-    cfl_alpha_u_ctx, cfl_alpha_v_ctx, compound_mode_ctx, inter_tx_type_set, intra_mode_ctx,
-    is_inter_ctx, mv_ctx, palette_color_ctx, palette_uv_mode_ctx, palette_y_mode_ctx,
-    partition_ctx, ref_count_ctx, segment_id_ctx, skip_ctx, skip_mode_ctx, tx_depth_ctx,
-    txfm_split_ctx, TileCdfContext, BLOCK_SIZES, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS,
-    CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP,
-    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DEFAULT_CFL_ALPHA_CDF,
-    DEFAULT_CFL_SIGN_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMP_BWD_REF_CDF,
-    DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DRL_MODE_CDF,
-    DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF,
+    cfl_alpha_u_ctx, cfl_alpha_v_ctx, compound_mode_ctx, inter_tx_type_set, interp_filter_ctx,
+    intra_mode_ctx, is_inter_ctx, mv_ctx, palette_color_ctx, palette_uv_mode_ctx,
+    palette_y_mode_ctx, partition_ctx, ref_count_ctx, segment_id_ctx, skip_ctx, skip_mode_ctx,
+    tx_depth_ctx, txfm_split_ctx, TileCdfContext, BLOCK_SIZES, BWD_REFS, CFL_ALPHABET_SIZE,
+    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS,
+    COMPOUND_MODE_CTX_MAP, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
+    DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COMPOUND_MODE_CDF,
+    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
+    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_FILTER_INTRA_CDF,
+    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF,
     DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
     DEFAULT_IS_INTER_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
     DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
@@ -410,16 +429,17 @@ pub use cdf::{
     DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF,
     DEFAULT_SKIP_MODE_CDF, DEFAULT_TXFM_SPLIT_CDF, DEFAULT_TX_16X16_CDF, DEFAULT_TX_32X32_CDF,
     DEFAULT_TX_64X64_CDF, DEFAULT_TX_8X8_CDF, DEFAULT_UNI_COMP_REF_CDF, DEFAULT_ZERO_MV_CDF,
-    DRL_MODE_CONTEXTS, FWD_REFS, INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES,
-    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
-    MAX_TX_DEPTH, MV_CLASSES, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS,
-    NEW_MV_CONTEXTS, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, PALETTE_COLOR_CONTEXT,
-    PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS, PALETTE_MAX_COLOR_CONTEXT_HASH,
-    PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS, PALETTE_Y_MODE_CONTEXTS,
-    PARTITION_CONTEXTS, REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SINGLE_REFS,
-    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, TXFM_PARTITION_CONTEXTS, TX_SET_DCTONLY, TX_SET_INTER_1,
-    TX_SET_INTER_2, TX_SET_INTER_3, TX_SIZES, TX_SIZE_CONTEXTS, TX_TYPES, TX_TYPES_SET2,
-    TX_TYPES_SET3, UNIDIR_COMP_REFS, ZERO_MV_CONTEXTS,
+    DRL_MODE_CONTEXTS, FWD_REFS, INTERP_FILTERS, INTERP_FILTER_CONTEXTS, INTERP_FILTER_NONE,
+    INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES, INTRA_FILTER_MODES, INTRA_MODES,
+    INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_TX_DEPTH, MV_CLASSES, MV_COMPS,
+    MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS,
+    PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS,
+    PALETTE_COLOR_HASH_MULTIPLIERS, PALETTE_MAX_COLOR_CONTEXT_HASH, PALETTE_NUM_NEIGHBORS,
+    PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS, PALETTE_Y_MODE_CONTEXTS, PARTITION_CONTEXTS,
+    REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SINGLE_REFS, SKIP_CONTEXTS,
+    SKIP_MODE_CONTEXTS, TXFM_PARTITION_CONTEXTS, TX_SET_DCTONLY, TX_SET_INTER_1, TX_SET_INTER_2,
+    TX_SET_INTER_3, TX_SIZES, TX_SIZE_CONTEXTS, TX_TYPES, TX_TYPES_SET2, TX_TYPES_SET3,
+    UNIDIR_COMP_REFS, ZERO_MV_CONTEXTS,
 };
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,

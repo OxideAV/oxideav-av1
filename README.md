@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-25
 
-**Clean-room rebuild, round 21.** The crate's prior implementation was
+**Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -736,14 +736,24 @@ and `txfm_split` over `Default_Txfm_Split_Cdf`) plus the §8.3.2
 **inter-frame transform-type** subset (`inter_tx_type` over
 `Default_Inter_Tx_Type_Set{1,2,3}_Cdf`) plus the §5.11.48
 `inter_tx_type_set` switch driving the §8.3.2 three-way
-`TileInterTxTypeSet{1,2,3}Cdf` selection.
+`TileInterTxTypeSet{1,2,3}Cdf` selection. Round 22 lands the
+**inter-frame interpolation-filter** subset (`interp_filter` over
+`Default_Interp_Filter_Cdf` — 16 contexts × 3 cumulative
+frequencies) plus the §8.3.2 four-branch `interp_filter_ctx`
+formula (the `((dir & 1) * 2 + (RefFrame[1] > INTRA_FRAME)) * 4`
+base plus the leftType / aboveType / NONE-match folding).
 The remaining §9.4 tables (y_mode, uv_mode, angle-delta, intra
 transform-type (`intra_tx_type`,
-`Default_Intra_Tx_Type_Set{1,2}_Cdf`), coefficient, …), the
-`init_coeff_cdfs` coefficient set, and the other §8.3.2 selections
-(`split_or_horz` / `split_or_vert` / `uv_mode` / …) are a
-mechanical followup against the same `TileCdfContext` shape.
-`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
+`Default_Intra_Tx_Type_Set{1,2}_Cdf`), motion-mode
+(`Default_Motion_Mode_Cdf` keyed by `BLOCK_SIZES`),
+inter-intra / compound-index / compound-type
+(`Default_Interintra_Cdf`, `Default_Compound_Idx_Cdf`,
+`Default_Comp_Group_Idx_Cdf`, `Default_Compound_Type_Cdf`),
+coefficient, …), the `init_coeff_cdfs` coefficient set, and the
+other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
+`uv_mode` / …) are a mechanical followup against the same
+`TileCdfContext` shape. `decode_av1` and `encode_av1` still return
+`Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -991,6 +1001,18 @@ mechanical followup against the same `TileCdfContext` shape.
     CDF table values for `Default_Inter_Tx_Type_Set1_Cdf`,
     `Default_Inter_Tx_Type_Set2_Cdf`,
     `Default_Inter_Tx_Type_Set3_Cdf`).
+  * Round 22: §3 (constants — `INTERP_FILTERS = 3`,
+    `INTERP_FILTER_CONTEXTS = 16`), §8.3.1 (the "set equal to a copy
+    of `Default_Interp_Filter_Cdf`" init step for `InterpFilterCdf`),
+    §8.3.2 (the four-branch `interp_filter` ctx formula —
+    `ctx = ((dir & 1) * 2 + (RefFrame[1] > INTRA_FRAME)) * 4` base,
+    `leftType = aboveType = 3` initialisers, the
+    `RefFrames[..][0|1] == RefFrame[0]` neighbour-matching gate that
+    promotes the `InterpFilters[..][dir]` entry, and the
+    match / left-NONE / above-NONE / distinct branches that fold
+    `leftType` / `aboveType` / `3` into the ctx total; the
+    `interp_filter: TileInterpFilterCdf[ ctx ]` selection), §9.4
+    (default CDF table values for `Default_Interp_Filter_Cdf`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
