@@ -395,6 +395,23 @@
 //!     "`TileMotionModeCdf[ MiSize ]`"; no neighbour-context
 //!     arithmetic).
 //!
+//!   * **Round 24.** The §9.4 default CDF tables and the §8.3.1 /
+//!     §8.3.2 selection for the **compound-prediction** syntax
+//!     elements, extending [`cdf`]. Transcribes
+//!     [`DEFAULT_COMP_GROUP_IDX_CDF`] (`[COMP_GROUP_IDX_CONTEXTS][3]`),
+//!     [`DEFAULT_COMPOUND_IDX_CDF`] (`[COMPOUND_IDX_CONTEXTS][3]`) and
+//!     [`DEFAULT_COMPOUND_TYPE_CDF`]
+//!     (`[BLOCK_SIZES][COMPOUND_TYPES + 1]`) verbatim from §9.4. New §3
+//!     constants `COMPOUND_TYPES = 2`, `COMP_GROUP_IDX_CONTEXTS = 6`,
+//!     `COMPOUND_IDX_CONTEXTS = 6`. [`TileCdfContext`] grows the
+//!     `comp_group_idx` / `compound_idx` / `compound_type` fields,
+//!     seeded by [`TileCdfContext::new_from_defaults`] per §8.3.1. The
+//!     §8.3.2 selection surfaces `comp_group_idx_cdf(ctx)` /
+//!     `compound_idx_cdf(ctx)` (binary, precomputed-`ctx` index) and
+//!     `compound_type_cdf(mi_size)` (a straight `0..BLOCK_SIZES` index;
+//!     the spec's selection text reads "`TileCompoundTypeCdf[ MiSize
+//!     ]`").
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -420,16 +437,18 @@ pub use cdf::{
     intra_mode_ctx, is_inter_ctx, mv_ctx, palette_color_ctx, palette_uv_mode_ctx,
     palette_y_mode_ctx, partition_ctx, ref_count_ctx, segment_id_ctx, skip_ctx, skip_mode_ctx,
     tx_depth_ctx, txfm_split_ctx, TileCdfContext, BLOCK_SIZES, BWD_REFS, CFL_ALPHABET_SIZE,
-    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS,
-    COMPOUND_MODE_CTX_MAP, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
-    DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COMPOUND_MODE_CDF,
-    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
-    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_FILTER_INTRA_CDF,
-    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF,
-    DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
-    DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
-    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
-    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
+    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_IDX_CONTEXTS, COMPOUND_MODES,
+    COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES, COMP_GROUP_IDX_CONTEXTS,
+    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DEFAULT_CFL_ALPHA_CDF,
+    DEFAULT_CFL_SIGN_CDF, DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF,
+    DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_GROUP_IDX_CDF,
+    DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DRL_MODE_CDF,
+    DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF,
+    DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF,
+    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF,
+    DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
+    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
+    DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
     DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,

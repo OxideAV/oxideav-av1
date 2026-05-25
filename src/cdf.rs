@@ -85,10 +85,19 @@
 //!         `MiSize` — a straight `BLOCK_SIZES` index, no
 //!         neighbour-context arithmetic).
 //!
+//!   * **Compound prediction** (round 24):
+//!       * `Default_Comp_Group_Idx_Cdf` (`comp_group_idx`, binary,
+//!         keyed by a precomputed `ctx ∈ 0..COMP_GROUP_IDX_CONTEXTS`).
+//!       * `Default_Compound_Idx_Cdf` (`compound_idx`, binary, keyed
+//!         by a precomputed `ctx ∈ 0..COMPOUND_IDX_CONTEXTS`).
+//!       * `Default_Compound_Type_Cdf` (`compound_type`, keyed by
+//!         `MiSize` — a straight `BLOCK_SIZES` index, no
+//!         neighbour-context arithmetic).
+//!
 //! The remaining `Default_*_Cdf` arrays of §9.4 (the y_mode,
 //! uv_mode, angle-delta, intra transform-type (`intra_tx_type`,
 //! `Default_Intra_Tx_Type_Set{1,2}_Cdf`), coefficient,
-//! inter-intra / compound-index / compound-type groups), the
+//! inter-intra group), the
 //! `init_coeff_cdfs` coefficient tables, and the §8.3.2
 //! `split_or_horz` / `split_or_vert` / `intra_tx_type` / …
 //! selections are a clear followup: each is a mechanical
@@ -403,6 +412,26 @@ pub const INTERP_FILTER_CONTEXTS: usize = 16;
 /// (`MOTION_MODES + 1` = three cumulative frequencies + the §8.3
 /// adaptation counter).
 pub const MOTION_MODES: usize = 3;
+
+/// `COMPOUND_TYPES` per §3 — number of values for `compound_type`
+/// (the §8.3.2 binary symbol selecting `COMPOUND_WEDGE` vs
+/// `COMPOUND_DIFFWTD`; see §6.10.24 semantics). Drives the row width
+/// of [`DEFAULT_COMPOUND_TYPE_CDF`] (`COMPOUND_TYPES + 1` = two
+/// cumulative frequencies + the §8.3 adaptation counter).
+pub const COMPOUND_TYPES: usize = 2;
+
+/// `COMP_GROUP_IDX_CONTEXTS` per §3 — number of contexts for
+/// `comp_group_idx`. Drives the outer dimension of
+/// [`DEFAULT_COMP_GROUP_IDX_CDF`]. The §8.3.2 selection clamps the
+/// computed context with `ctx = Min(5, ctx)`, so the valid range is
+/// `0..COMP_GROUP_IDX_CONTEXTS`.
+pub const COMP_GROUP_IDX_CONTEXTS: usize = 6;
+
+/// `COMPOUND_IDX_CONTEXTS` per §3 — number of contexts for
+/// `compound_idx`. Drives the outer dimension of
+/// [`DEFAULT_COMPOUND_IDX_CDF`]; valid range is
+/// `0..COMPOUND_IDX_CONTEXTS`.
+pub const COMPOUND_IDX_CONTEXTS: usize = 6;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -1291,6 +1320,84 @@ pub const DEFAULT_MOTION_MODE_CDF: [[u16; MOTION_MODES + 1]; BLOCK_SIZES] = [
 ];
 
 // ---------------------------------------------------------------------
+// Round 24 — compound-prediction group (§9.4):
+// `Default_Comp_Group_Idx_Cdf`, `Default_Compound_Idx_Cdf`,
+// `Default_Compound_Type_Cdf`. The first two are binary, keyed by a
+// precomputed `ctx` (the §8.3.2 paragraphs derive `ctx` from
+// neighbour state — `CompGroupIdxs` / `CompoundIdxs`, `AvailU` /
+// `AvailL`, `AboveSingle` / `LeftSingle`, `AltRef` reference frames —
+// which belongs in the future tile-walk; the selectors here take the
+// already-computed index). `Default_Compound_Type_Cdf` is keyed by a
+// straight `MiSize` index (the §8.3.2 selection text reads
+// "`TileCompoundTypeCdf[ MiSize ]`"). Per the §9.4 note, first-
+// dimension indices 0..=2, 10..=17 and 20..=21 of
+// `Default_Compound_Type_Cdf` are never used (those block sizes don't
+// satisfy the §5.11.x masked-compound gate); the table is still
+// transcribed full-width.
+// ---------------------------------------------------------------------
+
+/// `Default_Compound_Idx_Cdf[ COMPOUND_IDX_CONTEXTS ][ 3 ]` (§9.4).
+/// Binary symbol `compound_idx` (distance-weighted vs averaging blend;
+/// see §6.10.24). Indexed by the precomputed `ctx` from the §8.3.2
+/// `compound_idx` paragraph (`0..COMPOUND_IDX_CONTEXTS`). Each row is
+/// two cumulative frequencies plus the §8.3 adaptation counter (0).
+pub const DEFAULT_COMPOUND_IDX_CDF: [[u16; 3]; COMPOUND_IDX_CONTEXTS] = [
+    [18244, 32768, 0],
+    [12865, 32768, 0],
+    [7053, 32768, 0],
+    [13259, 32768, 0],
+    [9334, 32768, 0],
+    [4644, 32768, 0],
+];
+
+/// `Default_Comp_Group_Idx_Cdf[ COMP_GROUP_IDX_CONTEXTS ][ 3 ]` (§9.4).
+/// Binary symbol `comp_group_idx` (whether `compound_idx` is present;
+/// see §6.10.24). Indexed by the precomputed `ctx` from the §8.3.2
+/// `comp_group_idx` paragraph (`ctx = Min(5, ctx)`, hence
+/// `0..COMP_GROUP_IDX_CONTEXTS`). Each row is two cumulative
+/// frequencies plus the §8.3 adaptation counter (0).
+pub const DEFAULT_COMP_GROUP_IDX_CDF: [[u16; 3]; COMP_GROUP_IDX_CONTEXTS] = [
+    [26607, 32768, 0],
+    [22891, 32768, 0],
+    [18840, 32768, 0],
+    [24594, 32768, 0],
+    [19934, 32768, 0],
+    [22674, 32768, 0],
+];
+
+/// `Default_Compound_Type_Cdf[ BLOCK_SIZES ][ COMPOUND_TYPES + 1 ]`
+/// (§9.4). Indexed by `MiSize` per the §8.3.2 selection; the innermost
+/// row codes the binary `compound_type ∈ { COMPOUND_WEDGE,
+/// COMPOUND_DIFFWTD }` symbol (`COMPOUND_TYPES = 2` cumulative
+/// frequencies plus the §8.3 adaptation counter, which starts at 0).
+/// Per the §9.4 note, rows 0..=2, 10..=17 and 20..=21 are never used in
+/// the first dimension — see the group banner above.
+pub const DEFAULT_COMPOUND_TYPE_CDF: [[u16; COMPOUND_TYPES + 1]; BLOCK_SIZES] = [
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [23431, 32768, 0],
+    [13171, 32768, 0],
+    [11470, 32768, 0],
+    [9770, 32768, 0],
+    [9100, 32768, 0],
+    [8233, 32768, 0],
+    [6172, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [11820, 32768, 0],
+    [7701, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -1486,6 +1593,26 @@ pub struct TileCdfContext {
     /// `TileMotionModeCdf[ BLOCK_SIZES ]` (§8.3.1). Codes `motion_mode`
     /// (§5.11.x `read_motion_mode`), selected by `MiSize`.
     pub motion_mode: [[u16; MOTION_MODES + 1]; BLOCK_SIZES],
+
+    // -----------------------------------------------------------------
+    // Round 24 — compound-prediction group. §8.3.1 enumerates these as
+    // "`CompGroupIdxCdf` is set to a copy of `Default_Comp_Group_Idx_Cdf`",
+    // "`CompoundIdxCdf` is set to a copy of `Default_Compound_Idx_Cdf`",
+    // and "`CompoundTypeCdf` is set to a copy of
+    // `Default_Compound_Type_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileCompGroupIdxCdf[ COMP_GROUP_IDX_CONTEXTS ]` (§8.3.1). Codes
+    /// the binary `comp_group_idx` (§5.11.x `read_compound_type`),
+    /// selected by a precomputed `ctx`.
+    pub comp_group_idx: [[u16; 3]; COMP_GROUP_IDX_CONTEXTS],
+    /// `TileCompoundIdxCdf[ COMPOUND_IDX_CONTEXTS ]` (§8.3.1). Codes the
+    /// binary `compound_idx` (§5.11.x `read_compound_type`), selected by
+    /// a precomputed `ctx`.
+    pub compound_idx: [[u16; 3]; COMPOUND_IDX_CONTEXTS],
+    /// `TileCompoundTypeCdf[ BLOCK_SIZES ]` (§8.3.1). Codes the binary
+    /// `compound_type` (§5.11.x `read_compound_type`), selected by
+    /// `MiSize`.
+    pub compound_type: [[u16; COMPOUND_TYPES + 1]; BLOCK_SIZES],
 }
 
 impl TileCdfContext {
@@ -1585,6 +1712,11 @@ impl TileCdfContext {
 
             // Round 23 — motion-mode group.
             motion_mode: DEFAULT_MOTION_MODE_CDF,
+
+            // Round 24 — compound-prediction group.
+            comp_group_idx: DEFAULT_COMP_GROUP_IDX_CDF,
+            compound_idx: DEFAULT_COMPOUND_IDX_CDF,
+            compound_type: DEFAULT_COMPOUND_TYPE_CDF,
         }
     }
 
@@ -2001,6 +2133,48 @@ impl TileCdfContext {
     pub fn motion_mode_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
         if mi_size < BLOCK_SIZES {
             Some(&mut self.motion_mode[mi_size])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `comp_group_idx`: the cdf is `TileCompGroupIdxCdf[ ctx ]`,
+    /// with `ctx` computed by the §8.3.2 `comp_group_idx` paragraph
+    /// (which combines `CompGroupIdxs` neighbour values, `AvailU` /
+    /// `AvailL`, `AboveSingle` / `LeftSingle` and the `ALTREF_FRAME`
+    /// reference test, ending with `ctx = Min(5, ctx)` — in
+    /// `0..COMP_GROUP_IDX_CONTEXTS`). The neighbour arithmetic belongs
+    /// in the (future) tile walk; this selector takes the already-
+    /// computed index.
+    pub fn comp_group_idx_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.comp_group_idx[ctx]
+    }
+
+    /// §8.3.2 `compound_idx`: the cdf is `TileCompoundIdxCdf[ ctx ]`,
+    /// with `ctx` computed by the §8.3.2 `compound_idx` paragraph
+    /// (which seeds `ctx` from the `get_relative_dist` forward/backward
+    /// equality test, then adds the `CompoundIdxs` neighbour values /
+    /// `ALTREF_FRAME` test — in `0..COMPOUND_IDX_CONTEXTS`). The
+    /// neighbour arithmetic belongs in the (future) tile walk; this
+    /// selector takes the already-computed index.
+    pub fn compound_idx_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.compound_idx[ctx]
+    }
+
+    /// §8.3.2 `compound_type`: the cdf is
+    /// `TileCompoundTypeCdf[ MiSize ]`, a straight `0..BLOCK_SIZES`
+    /// index — no neighbour-context arithmetic. Returns `None` if
+    /// `mi_size >= BLOCK_SIZES` (a caller bug — the §3 enumeration
+    /// bounds `MiSize`).
+    ///
+    /// Per the §9.4 note on `Default_Compound_Type_Cdf`, `MiSize`
+    /// indices `0..=2`, `10..=17` and `20..=21` are never reached by the
+    /// §5.11.x `read_compound_type` selection (those block sizes do not
+    /// satisfy the masked-compound gate), but the selector still returns
+    /// the in-table row so the behaviour is purely indexical.
+    pub fn compound_type_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
+        if mi_size < BLOCK_SIZES {
+            Some(&mut self.compound_type[mi_size])
         } else {
             None
         }
@@ -4192,5 +4366,176 @@ mod tests {
             "read_symbol must adapt the working CDF"
         );
         assert_eq!(DEFAULT_MOTION_MODE_CDF[15], [32507, 32558, 32768, 0]);
+    }
+
+    // Round 24 — compound-prediction group tests.
+
+    /// §8.3.1 / §9.4: the three compound-prediction default tables are
+    /// well-formed. Outer dims match the §3 constants; each binary row
+    /// is `[3]` (`comp_group_idx` / `compound_idx`) or
+    /// `[COMPOUND_TYPES + 1]` (`compound_type`); the second-to-last
+    /// entry is `1 << 15` and the last is a fresh-0 adaptation counter.
+    #[test]
+    fn compound_default_tables_well_formed() {
+        // §3 constants pinned.
+        assert_eq!(COMPOUND_TYPES, 2);
+        assert_eq!(COMP_GROUP_IDX_CONTEXTS, 6);
+        assert_eq!(COMPOUND_IDX_CONTEXTS, 6);
+
+        assert_eq!(DEFAULT_COMP_GROUP_IDX_CDF.len(), COMP_GROUP_IDX_CONTEXTS);
+        assert_eq!(DEFAULT_COMPOUND_IDX_CDF.len(), COMPOUND_IDX_CONTEXTS);
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF.len(), BLOCK_SIZES);
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[0].len(), COMPOUND_TYPES + 1);
+
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+        for r in &DEFAULT_COMP_GROUP_IDX_CDF {
+            assert_eq!(r.len(), 3);
+            check(r);
+        }
+        for r in &DEFAULT_COMPOUND_IDX_CDF {
+            assert_eq!(r.len(), 3);
+            check(r);
+        }
+        for r in &DEFAULT_COMPOUND_TYPE_CDF {
+            check(r);
+        }
+    }
+
+    /// Spot-check the §9.4 compound default values byte-for-byte. A
+    /// mis-keyed digit during transcription breaks the equality.
+    #[test]
+    fn compound_default_byte_exact_values() {
+        // Default_Compound_Idx_Cdf — 6 binary context rows.
+        assert_eq!(DEFAULT_COMPOUND_IDX_CDF[0], [18244, 32768, 0]);
+        assert_eq!(DEFAULT_COMPOUND_IDX_CDF[2], [7053, 32768, 0]);
+        assert_eq!(DEFAULT_COMPOUND_IDX_CDF[5], [4644, 32768, 0]);
+
+        // Default_Comp_Group_Idx_Cdf — 6 binary context rows.
+        assert_eq!(DEFAULT_COMP_GROUP_IDX_CDF[0], [26607, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_GROUP_IDX_CDF[2], [18840, 32768, 0]);
+        assert_eq!(DEFAULT_COMP_GROUP_IDX_CDF[5], [22674, 32768, 0]);
+
+        // Default_Compound_Type_Cdf — the §9.4 note marks rows 0..=2,
+        // 10..=17 and 20..=21 unreachable; those carry the flat
+        // { 16384, 32768, 0 } placeholder.
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[0], [16384, 32768, 0]);
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[2], [16384, 32768, 0]);
+        // Row 3: { 23431, 32768, 0 } — first reachable row.
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[3], [23431, 32768, 0]);
+        // Row 9: { 6172, 32768, 0 } — last of the 3..=9 reachable run.
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[9], [6172, 32768, 0]);
+        // Rows 10..=17: spec-unreachable, flat-init.
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[10], [16384, 32768, 0]);
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[17], [16384, 32768, 0]);
+        // Rows 18 / 19: { 11820, .. } / { 7701, .. } — second reachable run.
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[18], [11820, 32768, 0]);
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[19], [7701, 32768, 0]);
+        // Rows 20..=21: spec-unreachable, flat-init.
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[20], [16384, 32768, 0]);
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[21], [16384, 32768, 0]);
+    }
+
+    /// §8.3.1: a fresh context copies the three compound-prediction
+    /// defaults in (the §9.4 sources are not aliased).
+    #[test]
+    fn compound_init_from_defaults_copies_tables() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.comp_group_idx, DEFAULT_COMP_GROUP_IDX_CDF);
+        assert_eq!(ctx.compound_idx, DEFAULT_COMPOUND_IDX_CDF);
+        assert_eq!(ctx.compound_type, DEFAULT_COMPOUND_TYPE_CDF);
+
+        // Working-copy independence: mutating the context must not touch
+        // the §9.4 sources.
+        ctx.comp_group_idx_cdf(0)[0] = 12345;
+        ctx.compound_idx_cdf(0)[0] = 23456;
+        ctx.compound_type_cdf(3).unwrap()[0] = 34567;
+        assert_ne!(ctx.comp_group_idx[0][0], DEFAULT_COMP_GROUP_IDX_CDF[0][0]);
+        assert_ne!(ctx.compound_idx[0][0], DEFAULT_COMPOUND_IDX_CDF[0][0]);
+        assert_ne!(ctx.compound_type[3][0], DEFAULT_COMPOUND_TYPE_CDF[3][0]);
+        assert_eq!(DEFAULT_COMP_GROUP_IDX_CDF[0][0], 26607);
+        assert_eq!(DEFAULT_COMPOUND_IDX_CDF[0][0], 18244);
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[3][0], 23431);
+    }
+
+    /// §8.3.2 compound selectors return the right §9.4 rows. The two
+    /// binary selectors take a precomputed `ctx`; the `compound_type`
+    /// selector takes `MiSize` and returns `None` out of range.
+    #[test]
+    fn compound_selectors_return_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        for (i, want) in DEFAULT_COMP_GROUP_IDX_CDF.iter().enumerate() {
+            let row = ctx.comp_group_idx_cdf(i);
+            assert_eq!(row.len(), 3);
+            assert_eq!(row, want);
+        }
+        for (i, want) in DEFAULT_COMPOUND_IDX_CDF.iter().enumerate() {
+            let row = ctx.compound_idx_cdf(i);
+            assert_eq!(row.len(), 3);
+            assert_eq!(row, want);
+        }
+        for (i, want) in DEFAULT_COMPOUND_TYPE_CDF.iter().enumerate() {
+            let row = ctx.compound_type_cdf(i).unwrap();
+            assert_eq!(row.len(), COMPOUND_TYPES + 1);
+            assert_eq!(row, want);
+        }
+        // Out-of-range `MiSize` returns None.
+        assert!(ctx.compound_type_cdf(BLOCK_SIZES).is_none());
+        assert!(ctx.compound_type_cdf(BLOCK_SIZES + 7).is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a
+    /// `compound_type` default CDF selected by the §8.3.2 selection
+    /// (`MiSize = 9`, the strongest-bias reachable row), confirming the
+    /// chosen row matches the §9.4 source, the decode lands in range and
+    /// the working copy adapts.
+    #[test]
+    fn decode_compound_type_through_default_cdf() {
+        // Default_Compound_Type_Cdf[9] = { 6172, 32768, 0 }.
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.compound_type;
+
+        let row = tile_ctx.compound_type_cdf(9).unwrap();
+        assert_eq!(row, &DEFAULT_COMPOUND_TYPE_CDF[9]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            (sym as usize) < COMPOUND_TYPES,
+            "compound_type must code a symbol in 0..COMPOUND_TYPES"
+        );
+
+        assert_ne!(
+            tile_ctx.compound_type, before,
+            "read_symbol must adapt the working CDF"
+        );
+        assert_eq!(DEFAULT_COMPOUND_TYPE_CDF[9], [6172, 32768, 0]);
+    }
+
+    /// End-to-end: drive the §8.2 `SymbolDecoder` through a binary
+    /// `comp_group_idx` default CDF (ctx = 2, the lowest-bias context),
+    /// confirming the row matches §9.4, the decode is in range and the
+    /// working copy adapts.
+    #[test]
+    fn decode_comp_group_idx_through_default_cdf() {
+        // Default_Comp_Group_Idx_Cdf[2] = { 18840, 32768, 0 }.
+        let bytes = [0x40u8, 0x00u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.comp_group_idx;
+
+        let row = tile_ctx.comp_group_idx_cdf(2);
+        assert_eq!(row, &DEFAULT_COMP_GROUP_IDX_CDF[2]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!((sym as usize) < 2, "comp_group_idx is a binary symbol");
+
+        assert_ne!(
+            tile_ctx.comp_group_idx, before,
+            "read_symbol must adapt the working CDF"
+        );
+        assert_eq!(DEFAULT_COMP_GROUP_IDX_CDF[2], [18840, 32768, 0]);
     }
 }

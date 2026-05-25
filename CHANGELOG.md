@@ -6,6 +6,38 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 24 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (compound-prediction subset).** Extends `cdf` with the three
+  compound-prediction default tables — `Default_Comp_Group_Idx_Cdf`
+  (`[COMP_GROUP_IDX_CONTEXTS][3]`), `Default_Compound_Idx_Cdf`
+  (`[COMPOUND_IDX_CONTEXTS][3]`) and `Default_Compound_Type_Cdf`
+  (`[BLOCK_SIZES][COMPOUND_TYPES + 1]`, 22 block-size rows × 2
+  cumulative frequencies + adaptation counter) — transcribed verbatim
+  from §9.4 (including the spec-flagged-unreachable
+  `Default_Compound_Type_Cdf` rows 0..=2, 10..=17 and 20..=21 which
+  carry the flat `{ 16384, 32768, 0 }` placeholder per the §9.4 note).
+  New §3 constants `COMPOUND_TYPES = 2`, `COMP_GROUP_IDX_CONTEXTS = 6`,
+  `COMPOUND_IDX_CONTEXTS = 6`. New `TileCdfContext` fields
+  `comp_group_idx` / `compound_idx` / `compound_type`, initialised by
+  `TileCdfContext::new_from_defaults` per §8.3.1 ("`CompGroupIdxCdf` /
+  `CompoundIdxCdf` / `CompoundTypeCdf` is set to a copy of
+  `Default_*`"). Three §8.3.2 selection accessors land —
+  `comp_group_idx_cdf(ctx)` and `compound_idx_cdf(ctx)` (binary,
+  taking the precomputed §8.3.2 neighbour-derived context whose
+  arithmetic belongs in the future tile walk) plus
+  `compound_type_cdf(mi_size)` (a straight `0..BLOCK_SIZES` index per
+  the §8.3.2 text "`TileCompoundTypeCdf[ MiSize ]`", returning `None`
+  for `mi_size >= BLOCK_SIZES`). All new types / constants re-exported
+  at the crate root. Tests grow by 6 (cdf module): table
+  well-formedness against §3 constants, byte-anchor spot-checks of the
+  §9.4 row values (covering both the spec-flagged-unreachable
+  placeholders and the reachable runs), §8.3.1 init-copy independence
+  with mutate-doesn't-touch-source assertions, selector row-equality
+  across every context / `MiSize` plus out-of-range `None` returns,
+  and two end-to-end §8.2 `SymbolDecoder` decodes driving the
+  `Default_Compound_Type_Cdf[9]` and `Default_Comp_Group_Idx_Cdf[2]`
+  rows selected by the new helpers.
+
 * **Round 23 — §9.4 default CDF table + §8.3.1 / §8.3.2 selection
   (motion-mode subset).** Extends `cdf` with the
   `Default_Motion_Mode_Cdf` default table —

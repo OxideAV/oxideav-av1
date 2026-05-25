@@ -748,12 +748,21 @@ frequencies) plus its §8.3.2 selection — a straight
 `TileMotionModeCdf[ MiSize ]` index with no neighbour-context
 arithmetic; the §6.10.26 enumeration `MOTION_MODES = 3`
 (`SIMPLE` / `OBMC` / `LOCALWARP`) is added as a new §3 constant.
+Round 24 lands the **compound-prediction** subset — the three
+default tables `Default_Comp_Group_Idx_Cdf` /
+`Default_Compound_Idx_Cdf` (binary, 6 contexts each) and
+`Default_Compound_Type_Cdf` (22 block-size rows × 2 cumulative
+frequencies) — plus their §8.3.2 selections:
+`comp_group_idx_cdf(ctx)` / `compound_idx_cdf(ctx)` take the
+precomputed neighbour-derived context (whose arithmetic stays in
+the future tile walk) and `compound_type_cdf(mi_size)` is a
+straight `TileCompoundTypeCdf[ MiSize ]` index; the §3 constants
+`COMPOUND_TYPES = 2`, `COMP_GROUP_IDX_CONTEXTS = 6` and
+`COMPOUND_IDX_CONTEXTS = 6` are added.
 The remaining §9.4 tables (y_mode, uv_mode, angle-delta, intra
 transform-type (`intra_tx_type`,
 `Default_Intra_Tx_Type_Set{1,2}_Cdf`),
-inter-intra / compound-index / compound-type
-(`Default_Interintra_Cdf`, `Default_Compound_Idx_Cdf`,
-`Default_Comp_Group_Idx_Cdf`, `Default_Compound_Type_Cdf`),
+inter-intra (`Default_Interintra_Cdf`),
 coefficient, …), the `init_coeff_cdfs` coefficient set, and the
 other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
 `uv_mode` / …) are a mechanical followup against the same
@@ -1028,6 +1037,21 @@ other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
     `Default_Motion_Mode_Cdf` including the §9.4 note that
     first-dimension indices `0..=2` and `16..=17` are never reached
     by the §5.11.x `read_motion_mode` selection but are still
+    transcribed full-width).
+  * Round 24: §3 (constants — `COMPOUND_TYPES = 2`,
+    `COMP_GROUP_IDX_CONTEXTS = 6`, `COMPOUND_IDX_CONTEXTS = 6`),
+    §6.10.24 (`comp_group_idx` / `compound_idx` / `compound_type`
+    semantics), §8.3.1 (the "set equal to a copy of
+    `Default_Comp_Group_Idx_Cdf` / `Default_Compound_Idx_Cdf` /
+    `Default_Compound_Type_Cdf`" init steps), §8.3.2 (the
+    `comp_group_idx: TileCompGroupIdxCdf[ ctx ]` paragraph with its
+    `ctx = Min(5, ctx)` neighbour clamp, the
+    `compound_idx: TileCompoundIdxCdf[ ctx ]` paragraph with its
+    `get_relative_dist` fwd/bck seed, and the
+    `compound_type: TileCompoundTypeCdf[ MiSize ]` straight index),
+    §9.4 (default CDF table values for the three tables including the
+    §9.4 note that `Default_Compound_Type_Cdf` first-dimension indices
+    `0..=2`, `10..=17` and `20..=21` are never used but are still
     transcribed full-width).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
