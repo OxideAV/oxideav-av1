@@ -65,14 +65,22 @@
 //!       * `Default_Cfl_Sign_Cdf` (`cfl_alpha_signs`)
 //!       * `Default_Cfl_Alpha_Cdf` (`cfl_alpha_u` / `cfl_alpha_v`)
 //!
+//!   * **Transform-size** (round 20):
+//!       * `Default_Tx_8x8_Cdf` (`tx_depth`, `maxTxDepth == 1`)
+//!       * `Default_Tx_16x16_Cdf` (`tx_depth`, `maxTxDepth == 2`)
+//!       * `Default_Tx_32x32_Cdf` (`tx_depth`, `maxTxDepth == 3`)
+//!       * `Default_Tx_64x64_Cdf` (`tx_depth`, `maxTxDepth == 4`)
+//!       * `Default_Txfm_Split_Cdf` (`txfm_split`)
+//!
 //! The remaining `Default_*_Cdf` arrays of §9.4 (the y_mode,
-//! uv_mode, angle-delta, transform (`tx_size` / `tx_type` /
+//! uv_mode, angle-delta, transform-type (`tx_type` /
 //! `inter_tx_type` / `intra_tx_type`), coefficient, interpolation,
 //! motion-mode, … groups), the `init_coeff_cdfs` coefficient tables,
-//! and the §8.3.2 `split_or_horz` / `split_or_vert` / `tx_depth` /
-//! `txfm_split` / … selections are a clear followup: each is a
-//! mechanical transcription of one §9.4 table plus its §8.3.2
-//! paragraph, slotted into the same [`TileCdfContext`] shape used here.
+//! and the §8.3.2 `split_or_horz` / `split_or_vert` /
+//! `inter_tx_type` / `intra_tx_type` / … selections are a clear
+//! followup: each is a mechanical transcription of one §9.4 table
+//! plus its §8.3.2 paragraph, slotted into the same
+//! [`TileCdfContext`] shape used here.
 //!
 //! All values are transcribed directly from `docs/video/av1/av1-spec`
 //! §8.3 and §9.4 — no external source consulted.
@@ -282,6 +290,31 @@ pub const CFL_ALPHABET_SIZE: usize = 16;
 /// `CFL_ALPHA_CONTEXTS` (§3) — number of `ctx` values for `cfl_alpha_u` /
 /// `cfl_alpha_v` (the `Default_Cfl_Alpha_Cdf` first dimension).
 pub const CFL_ALPHA_CONTEXTS: usize = 6;
+
+/// `TX_SIZE_CONTEXTS` (§3) — number of contexts when decoding
+/// `tx_depth`. Drives the first dimension of every
+/// `Default_Tx_{8,16,32,64}x{8,16,32,64}_Cdf` table (§9.4) and is the
+/// number of values returned by the §8.3.2 `tx_depth` context formula.
+pub const TX_SIZE_CONTEXTS: usize = 3;
+
+/// `TX_SIZES` (§3) — number of square transform sizes (`TX_4X4`,
+/// `TX_8X8`, `TX_16X16`, `TX_32X32`, `TX_64X64`).
+pub const TX_SIZES: usize = 5;
+
+/// `MAX_TX_DEPTH` (§3) — maximum number of times the transform can
+/// be split. Drives the §9.4 row widths for the per-`maxRectTxSize`
+/// `tx_depth` CDFs: `Default_Tx_8x8_Cdf` rows are length
+/// `MAX_TX_DEPTH + 1` (one symbol of 2 values, since the spec
+/// constraint `tx_depth in 0..=2` collapses to two choices for the
+/// `maxTxDepth == 1` block-size group), while every other
+/// `Default_Tx_*Cdf` row is `MAX_TX_DEPTH + 2` (three choices) per
+/// the §9.4 source.
+pub const MAX_TX_DEPTH: usize = 2;
+
+/// `TXFM_PARTITION_CONTEXTS` (§3) — number of contexts when decoding
+/// `txfm_split`. Drives the first dimension of
+/// `Default_Txfm_Split_Cdf` (§9.4).
+pub const TXFM_PARTITION_CONTEXTS: usize = 21;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -980,6 +1013,68 @@ pub const DEFAULT_CFL_ALPHA_CDF: [[u16; CFL_ALPHABET_SIZE + 1]; CFL_ALPHA_CONTEX
 ];
 
 // ---------------------------------------------------------------------
+// Round 20 — transform-size group (§9.4): `Default_Tx_*_Cdf` (four
+// per-`maxRectTxSize` arrays codes `tx_depth`) + `Default_Txfm_Split_Cdf`
+// (codes the binary `txfm_split`).
+// ---------------------------------------------------------------------
+
+/// `Default_Tx_8x8_Cdf[ TX_SIZE_CONTEXTS ][ MAX_TX_DEPTH + 1 ]` (§9.4).
+/// Selected by §8.3.2 when `maxTxDepth == 1` (the small block-size
+/// `tx_depth` group, two symbol values).
+pub const DEFAULT_TX_8X8_CDF: [[u16; MAX_TX_DEPTH + 1]; TX_SIZE_CONTEXTS] =
+    [[19968, 32768, 0], [19968, 32768, 0], [24320, 32768, 0]];
+
+/// `Default_Tx_16x16_Cdf[ TX_SIZE_CONTEXTS ][ MAX_TX_DEPTH + 2 ]` (§9.4).
+/// Selected by §8.3.2 when `maxTxDepth == 2` (three symbol values).
+pub const DEFAULT_TX_16X16_CDF: [[u16; MAX_TX_DEPTH + 2]; TX_SIZE_CONTEXTS] = [
+    [12272, 30172, 32768, 0],
+    [12272, 30172, 32768, 0],
+    [18677, 30848, 32768, 0],
+];
+
+/// `Default_Tx_32x32_Cdf[ TX_SIZE_CONTEXTS ][ MAX_TX_DEPTH + 2 ]` (§9.4).
+/// Selected by §8.3.2 when `maxTxDepth == 3`.
+pub const DEFAULT_TX_32X32_CDF: [[u16; MAX_TX_DEPTH + 2]; TX_SIZE_CONTEXTS] = [
+    [12986, 15180, 32768, 0],
+    [12986, 15180, 32768, 0],
+    [24302, 25602, 32768, 0],
+];
+
+/// `Default_Tx_64x64_Cdf[ TX_SIZE_CONTEXTS ][ MAX_TX_DEPTH + 2 ]` (§9.4).
+/// Selected by §8.3.2 when `maxTxDepth == 4`.
+pub const DEFAULT_TX_64X64_CDF: [[u16; MAX_TX_DEPTH + 2]; TX_SIZE_CONTEXTS] = [
+    [5782, 11475, 32768, 0],
+    [5782, 11475, 32768, 0],
+    [16803, 22759, 32768, 0],
+];
+
+/// `Default_Txfm_Split_Cdf[ TXFM_PARTITION_CONTEXTS ][ 3 ]` (§9.4).
+/// Codes the binary `txfm_split` syntax element per §8.3.2.
+pub const DEFAULT_TXFM_SPLIT_CDF: [[u16; 3]; TXFM_PARTITION_CONTEXTS] = [
+    [28581, 32768, 0],
+    [23846, 32768, 0],
+    [20847, 32768, 0],
+    [24315, 32768, 0],
+    [18196, 32768, 0],
+    [12133, 32768, 0],
+    [18791, 32768, 0],
+    [10887, 32768, 0],
+    [11005, 32768, 0],
+    [27179, 32768, 0],
+    [20004, 32768, 0],
+    [11281, 32768, 0],
+    [26549, 32768, 0],
+    [19308, 32768, 0],
+    [14224, 32768, 0],
+    [28015, 32768, 0],
+    [21546, 32768, 0],
+    [14400, 32768, 0],
+    [28165, 32768, 0],
+    [22401, 32768, 0],
+    [16088, 32768, 0],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -1120,6 +1215,28 @@ pub struct TileCdfContext {
     pub cfl_sign: [u16; CFL_JOINT_SIGNS + 1],
     /// `TileCflAlphaCdf[ CFL_ALPHA_CONTEXTS ]` (§8.3.1).
     pub cfl_alpha: [[u16; CFL_ALPHABET_SIZE + 1]; CFL_ALPHA_CONTEXTS],
+
+    // -----------------------------------------------------------------
+    // Round 20 — transform-size working CDFs. §8.3.1 lists each as
+    // "`Tx*Cdf` is set equal to a copy of `Default_Tx_*_Cdf`" and
+    // "`TxfmSplitCdf` is set equal to a copy of
+    // `Default_Txfm_Split_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileTx8x8Cdf[ TX_SIZE_CONTEXTS ]` (§8.3.1). Selected for
+    /// `tx_depth` when `maxTxDepth == 1`.
+    pub tx_8x8: [[u16; MAX_TX_DEPTH + 1]; TX_SIZE_CONTEXTS],
+    /// `TileTx16x16Cdf[ TX_SIZE_CONTEXTS ]` (§8.3.1). Selected for
+    /// `tx_depth` when `maxTxDepth == 2`.
+    pub tx_16x16: [[u16; MAX_TX_DEPTH + 2]; TX_SIZE_CONTEXTS],
+    /// `TileTx32x32Cdf[ TX_SIZE_CONTEXTS ]` (§8.3.1). Selected for
+    /// `tx_depth` when `maxTxDepth == 3`.
+    pub tx_32x32: [[u16; MAX_TX_DEPTH + 2]; TX_SIZE_CONTEXTS],
+    /// `TileTx64x64Cdf[ TX_SIZE_CONTEXTS ]` (§8.3.1). Selected for
+    /// `tx_depth` when `maxTxDepth == 4`.
+    pub tx_64x64: [[u16; MAX_TX_DEPTH + 2]; TX_SIZE_CONTEXTS],
+    /// `TileTxfmSplitCdf[ TXFM_PARTITION_CONTEXTS ]` (§8.3.1). Codes
+    /// `txfm_split`.
+    pub txfm_split: [[u16; 3]; TXFM_PARTITION_CONTEXTS],
 }
 
 impl TileCdfContext {
@@ -1201,6 +1318,13 @@ impl TileCdfContext {
             palette_size_8_uv_color: DEFAULT_PALETTE_SIZE_8_UV_COLOR_CDF,
             cfl_sign: DEFAULT_CFL_SIGN_CDF,
             cfl_alpha: DEFAULT_CFL_ALPHA_CDF,
+
+            // Round 20 — transform-size group.
+            tx_8x8: DEFAULT_TX_8X8_CDF,
+            tx_16x16: DEFAULT_TX_16X16_CDF,
+            tx_32x32: DEFAULT_TX_32X32_CDF,
+            tx_64x64: DEFAULT_TX_64X64_CDF,
+            txfm_split: DEFAULT_TXFM_SPLIT_CDF,
         }
     }
 
@@ -1532,6 +1656,35 @@ impl TileCdfContext {
     pub fn cfl_alpha_cdf(&mut self, ctx: usize) -> &mut [u16] {
         &mut self.cfl_alpha[ctx]
     }
+
+    /// §8.3.2 `tx_depth`: the cdf depends on the value of `maxTxDepth`
+    /// and `ctx`. Per the §8.3.2 paragraph:
+    ///
+    /// * `TileTx64x64Cdf[ ctx ]` if `maxTxDepth == 4`
+    /// * `TileTx32x32Cdf[ ctx ]` if `maxTxDepth == 3`
+    /// * `TileTx16x16Cdf[ ctx ]` if `maxTxDepth == 2`
+    /// * `TileTx8x8Cdf[ ctx ]` otherwise (`maxTxDepth == 1`)
+    ///
+    /// `ctx` is the [`tx_depth_ctx`] result (in `0..TX_SIZE_CONTEXTS`);
+    /// `max_tx_depth` is the `Max_Tx_Depth[ MiSize ]` value from §5.11.15.
+    /// Returns `None` when `max_tx_depth == 0` (no `tx_depth` is read in
+    /// that case — §5.11.15 forces `TxSize = maxRectTxSize`).
+    pub fn tx_depth_cdf(&mut self, max_tx_depth: u32, ctx: usize) -> Option<&mut [u16]> {
+        match max_tx_depth {
+            1 => Some(&mut self.tx_8x8[ctx]),
+            2 => Some(&mut self.tx_16x16[ctx]),
+            3 => Some(&mut self.tx_32x32[ctx]),
+            4 => Some(&mut self.tx_64x64[ctx]),
+            _ => None,
+        }
+    }
+
+    /// §8.3.2 `txfm_split`: the cdf is `TileTxfmSplitCdf[ ctx ]`, where
+    /// `ctx` is the [`txfm_split_ctx`] result (in
+    /// `0..TXFM_PARTITION_CONTEXTS`).
+    pub fn txfm_split_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.txfm_split[ctx]
+    }
 }
 
 impl Default for TileCdfContext {
@@ -1776,6 +1929,71 @@ pub fn cfl_alpha_u_ctx(sign_u: usize, sign_v: usize) -> usize {
 /// `0..CFL_ALPHA_CONTEXTS`.
 pub fn cfl_alpha_v_ctx(sign_u: usize, sign_v: usize) -> usize {
     (sign_v - 1) * 3 + sign_u
+}
+
+// ---------------------------------------------------------------------
+// Round 20 — transform-size §8.3.2 context helpers. Each computes a
+// `ctx` from scalar inputs the caller derives from the §5.11.15 /
+// §5.11.16 syntax + the local neighbour state. The full neighbour
+// `get_above_tx_width` / `get_left_tx_height` walks live in the tile
+// walk (none of those tables are yet tracked here); the helpers below
+// take the already-computed `aboveW` / `leftH` width-and-height
+// neighbours and the `maxTxWidth` / `maxTxHeight` from the spec's
+// `Tx_Width` / `Tx_Height` tables.
+// ---------------------------------------------------------------------
+
+/// §8.3.2 `tx_depth` context formula:
+///
+/// ```text
+///   ctx = (aboveW >= maxTxWidth) + (leftH >= maxTxHeight)
+/// ```
+///
+/// `above_w` and `left_h` are the §8.3.2-defined neighbour widths /
+/// heights (`0` when the neighbour is unavailable; the
+/// `Block_Width[ MiSizes[..] ]` / `get_above_tx_width(..)` /
+/// `get_left_tx_height(..)` ladders for the present-neighbour case
+/// happen in the tile walk). `max_tx_width` / `max_tx_height` are the
+/// `Tx_Width[ maxRectTxSize ]` / `Tx_Height[ maxRectTxSize ]` values.
+/// Result is in `0..TX_SIZE_CONTEXTS`.
+pub fn tx_depth_ctx(above_w: u32, left_h: u32, max_tx_width: u32, max_tx_height: u32) -> usize {
+    (above_w >= max_tx_width) as usize + (left_h >= max_tx_height) as usize
+}
+
+/// §8.3.2 `txfm_split` context formula:
+///
+/// ```text
+///   above = get_above_tx_width( row, col ) < Tx_Width[ txSz ]
+///   left  = get_left_tx_height( row, col ) < Tx_Height[ txSz ]
+///   size  = Min( 64, Max( Block_Width[ MiSize ], Block_Height[ MiSize ] ) )
+///   maxTxSz = find_tx_size( size, size )
+///   txSzSqrUp = Tx_Size_Sqr_Up[ txSz ]
+///   ctx = (txSzSqrUp != maxTxSz) * 3
+///       + (TX_SIZES - 1 - maxTxSz) * 6
+///       + above + left
+/// ```
+///
+/// `above` / `left` are the two booleans the spec computes from
+/// `get_above_tx_width` / `get_left_tx_height` against `Tx_Width[ txSz ]`
+/// / `Tx_Height[ txSz ]`; `tx_sz_sqr_up` is `Tx_Size_Sqr_Up[ txSz ]` and
+/// `max_tx_sz` is `find_tx_size( size, size )` for `size = Min( 64,
+/// Max( Block_Width, Block_Height ) )` — both `TX_4X4..TX_64X64`
+/// indices.
+///
+/// Returns `None` if the computed ctx would land outside
+/// `0..TXFM_PARTITION_CONTEXTS` (a caller-input bug; the spec's
+/// reachable combinations stay in range).
+pub fn txfm_split_ctx(above: bool, left: bool, tx_sz_sqr_up: u32, max_tx_sz: u32) -> Option<usize> {
+    if max_tx_sz as usize >= TX_SIZES {
+        return None;
+    }
+    let split = (tx_sz_sqr_up != max_tx_sz) as usize;
+    let size_term = (TX_SIZES - 1 - max_tx_sz as usize).checked_mul(6)?;
+    let ctx = split * 3 + size_term + (above as usize) + (left as usize);
+    if ctx < TXFM_PARTITION_CONTEXTS {
+        Some(ctx)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -2808,5 +3026,252 @@ mod tests {
         // but the §9.4 source is immutable.
         assert_ne!(ctx.cfl_alpha, before, "read_symbol must adapt the CDF");
         assert_eq!(DEFAULT_CFL_ALPHA_CDF[0][0], 7637);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 20 — transform-size group tests.
+    // -----------------------------------------------------------------
+
+    /// §9.4 default tables: every row terminates with `1 << 15` and a
+    /// zero adaptation counter (the §8.2.6 contract). Locks all five
+    /// transcribed transform-size tables row-by-row.
+    #[test]
+    fn tx_size_default_tables_well_formed() {
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+        for r in &DEFAULT_TX_8X8_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_TX_16X16_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_TX_32X32_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_TX_64X64_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_TXFM_SPLIT_CDF {
+            check(r);
+        }
+
+        // §3 dimensions held by every default table.
+        assert_eq!(DEFAULT_TX_8X8_CDF.len(), TX_SIZE_CONTEXTS);
+        assert_eq!(DEFAULT_TX_16X16_CDF.len(), TX_SIZE_CONTEXTS);
+        assert_eq!(DEFAULT_TX_32X32_CDF.len(), TX_SIZE_CONTEXTS);
+        assert_eq!(DEFAULT_TX_64X64_CDF.len(), TX_SIZE_CONTEXTS);
+        assert_eq!(DEFAULT_TXFM_SPLIT_CDF.len(), TXFM_PARTITION_CONTEXTS);
+        assert_eq!(DEFAULT_TX_8X8_CDF[0].len(), MAX_TX_DEPTH + 1);
+        assert_eq!(DEFAULT_TX_16X16_CDF[0].len(), MAX_TX_DEPTH + 2);
+        assert_eq!(DEFAULT_TX_32X32_CDF[0].len(), MAX_TX_DEPTH + 2);
+        assert_eq!(DEFAULT_TX_64X64_CDF[0].len(), MAX_TX_DEPTH + 2);
+        assert_eq!(DEFAULT_TXFM_SPLIT_CDF[0].len(), 3);
+    }
+
+    /// Spot-check the first / last byte of each §9.4 transcribed
+    /// transform-size table. If a digit was mis-keyed during the
+    /// transcription, the equality breaks.
+    #[test]
+    fn tx_size_table_byte_anchors() {
+        // First / last cumulative-frequency in each table.
+        assert_eq!(DEFAULT_TX_8X8_CDF[0][0], 19968);
+        assert_eq!(DEFAULT_TX_8X8_CDF[2][0], 24320);
+        assert_eq!(DEFAULT_TX_16X16_CDF[0][0], 12272);
+        assert_eq!(DEFAULT_TX_16X16_CDF[0][1], 30172);
+        assert_eq!(DEFAULT_TX_16X16_CDF[2][1], 30848);
+        assert_eq!(DEFAULT_TX_32X32_CDF[0][0], 12986);
+        assert_eq!(DEFAULT_TX_32X32_CDF[2][1], 25602);
+        assert_eq!(DEFAULT_TX_64X64_CDF[0][0], 5782);
+        assert_eq!(DEFAULT_TX_64X64_CDF[2][1], 22759);
+
+        // First / last row of Default_Txfm_Split_Cdf.
+        assert_eq!(DEFAULT_TXFM_SPLIT_CDF[0][0], 28581);
+        assert_eq!(
+            DEFAULT_TXFM_SPLIT_CDF[TXFM_PARTITION_CONTEXTS - 1][0],
+            16088
+        );
+    }
+
+    /// §8.3.1: a fresh context copies every transform-size default
+    /// in (independent of the source — the §9.4 array is not aliased).
+    #[test]
+    fn tx_size_init_from_defaults_copies_tables() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.tx_8x8, DEFAULT_TX_8X8_CDF);
+        assert_eq!(ctx.tx_16x16, DEFAULT_TX_16X16_CDF);
+        assert_eq!(ctx.tx_32x32, DEFAULT_TX_32X32_CDF);
+        assert_eq!(ctx.tx_64x64, DEFAULT_TX_64X64_CDF);
+        assert_eq!(ctx.txfm_split, DEFAULT_TXFM_SPLIT_CDF);
+
+        // Working-copy independence: mutating the context must not
+        // touch the §9.4 source.
+        ctx.txfm_split_cdf(0)[0] = 12345;
+        assert_ne!(ctx.txfm_split[0][0], DEFAULT_TXFM_SPLIT_CDF[0][0]);
+        assert_eq!(DEFAULT_TXFM_SPLIT_CDF[0][0], 28581);
+    }
+
+    /// §8.3.2 `tx_depth` selection: each `max_tx_depth` value picks the
+    /// expected `Default_Tx_*_Cdf` row and the row length matches the
+    /// spec's per-table symbol count (`MAX_TX_DEPTH + 1` for the
+    /// `maxTxDepth == 1` group, `MAX_TX_DEPTH + 2` for every other).
+    #[test]
+    fn tx_depth_cdf_selected_by_max_tx_depth() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        // maxTxDepth == 1 ⇒ TileTx8x8Cdf, row width MAX_TX_DEPTH + 1.
+        let row1 = ctx.tx_depth_cdf(1, 1).unwrap();
+        assert_eq!(row1.len(), MAX_TX_DEPTH + 1);
+        assert_eq!(row1, &DEFAULT_TX_8X8_CDF[1]);
+
+        // maxTxDepth == 2 ⇒ TileTx16x16Cdf.
+        let row2 = ctx.tx_depth_cdf(2, 2).unwrap();
+        assert_eq!(row2.len(), MAX_TX_DEPTH + 2);
+        assert_eq!(row2, &DEFAULT_TX_16X16_CDF[2]);
+
+        // maxTxDepth == 3 ⇒ TileTx32x32Cdf.
+        let row3 = ctx.tx_depth_cdf(3, 0).unwrap();
+        assert_eq!(row3, &DEFAULT_TX_32X32_CDF[0]);
+
+        // maxTxDepth == 4 ⇒ TileTx64x64Cdf.
+        let row4 = ctx.tx_depth_cdf(4, 2).unwrap();
+        assert_eq!(row4, &DEFAULT_TX_64X64_CDF[2]);
+
+        // maxTxDepth == 0 ⇒ tx_depth is not read; selection returns None.
+        assert!(ctx.tx_depth_cdf(0, 0).is_none());
+        // out-of-range max_tx_depth ⇒ None.
+        assert!(ctx.tx_depth_cdf(5, 0).is_none());
+    }
+
+    /// §8.3.2 `tx_depth` context formula:
+    /// `ctx = (above_w >= max_tx_width) + (left_h >= max_tx_height)`.
+    /// Cover all four neighbour-vs-max combinations and check the
+    /// strict-less-than semantics ("strictly less" doesn't count).
+    #[test]
+    fn tx_depth_context_formula() {
+        // both neighbours strictly smaller ⇒ 0.
+        assert_eq!(tx_depth_ctx(0, 0, 16, 16), 0);
+        // above hits the threshold ⇒ 1 (>= is the spec's relation).
+        assert_eq!(tx_depth_ctx(16, 0, 16, 16), 1);
+        // left hits ⇒ 1.
+        assert_eq!(tx_depth_ctx(0, 16, 16, 16), 1);
+        // both hit ⇒ 2.
+        assert_eq!(tx_depth_ctx(16, 16, 16, 16), 2);
+        // both strictly greater ⇒ also 2 (the >= still holds).
+        assert_eq!(tx_depth_ctx(32, 64, 16, 16), 2);
+        // Result is bounded by TX_SIZE_CONTEXTS.
+        for aw in [0u32, 8, 16, 32, 64] {
+            for lh in [0u32, 8, 16, 32, 64] {
+                assert!(tx_depth_ctx(aw, lh, 16, 16) < TX_SIZE_CONTEXTS);
+            }
+        }
+    }
+
+    /// §8.3.2 `txfm_split` context:
+    /// `ctx = (txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 + above + left`.
+    /// Walk the spec formula term-by-term for several reachable
+    /// `(above, left, txSzSqrUp, maxTxSz)` tuples, then check the
+    /// out-of-range and overflow guards.
+    #[test]
+    fn txfm_split_context_formula() {
+        // maxTxSz == TX_4X4 (= 0), tx_sz_sqr_up == 0, no neighbours ⇒
+        // ctx = 0 + (5 - 1 - 0) * 6 + 0 + 0 = 24.
+        assert_eq!(txfm_split_ctx(false, false, 0, 0), None);
+        // ^ 24 >= TXFM_PARTITION_CONTEXTS (21), so the helper returns
+        // None — only reachable tuples should land in-range.
+
+        // A reachable in-range tuple: maxTxSz == TX_64X64 (= 4),
+        // txSzSqrUp == 0 (split), no neighbours ⇒
+        // ctx = 1 * 3 + (5 - 1 - 4) * 6 + 0 + 0 = 3.
+        assert_eq!(txfm_split_ctx(false, false, 0, 4), Some(3));
+        // Same shape but both neighbours present ⇒ ctx = 3 + 2 = 5.
+        assert_eq!(txfm_split_ctx(true, true, 0, 4), Some(5));
+        // maxTxSz == TX_64X64, tx_sz_sqr_up == 4 (no split) ⇒ ctx = 0.
+        assert_eq!(txfm_split_ctx(false, false, 4, 4), Some(0));
+        // maxTxSz == TX_64X64, tx_sz_sqr_up == 4 (no split), both nbrs ⇒
+        // ctx = 0 + 0 + 1 + 1 = 2.
+        assert_eq!(txfm_split_ctx(true, true, 4, 4), Some(2));
+
+        // maxTxSz == TX_32X32 (= 3), split ⇒
+        // ctx = 3 + (5 - 1 - 3) * 6 + 0 + 0 = 9.
+        assert_eq!(txfm_split_ctx(false, false, 0, 3), Some(9));
+        // maxTxSz == TX_32X32, no split, both nbrs ⇒
+        // ctx = 0 + 6 + 1 + 1 = 8.
+        assert_eq!(txfm_split_ctx(true, true, 3, 3), Some(8));
+
+        // Out-of-range max_tx_sz.
+        assert_eq!(txfm_split_ctx(false, false, 0, TX_SIZES as u32), None);
+
+        // Every reachable in-range result is < TXFM_PARTITION_CONTEXTS.
+        for &max_tx_sz in &[0u32, 1, 2, 3, 4] {
+            for &split in &[0u32, 1] {
+                let sqr_up = if split == 1 { 0 } else { max_tx_sz };
+                for above in [false, true] {
+                    for left in [false, true] {
+                        if let Some(ctx) = txfm_split_ctx(above, left, sqr_up, max_tx_sz) {
+                            assert!(
+                                ctx < TXFM_PARTITION_CONTEXTS,
+                                "ctx {ctx} out of range for max={max_tx_sz} split={split}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a
+    /// `tx_depth` 3-value default CDF selected by §8.3.2 `tx_depth_ctx`,
+    /// confirming the selected row matches the §9.4 default and a valid
+    /// §8.2.6 decode lands in range and adapts.
+    #[test]
+    fn decode_tx_depth_through_default_cdf() {
+        // aboveW == 16, leftH == 16, both equal maxTxWidth/Height = 16
+        // ⇒ ctx = 2 (both >= threshold).
+        let ctx_idx = tx_depth_ctx(16, 16, 16, 16);
+        assert_eq!(ctx_idx, 2);
+
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+        let before = ctx.tx_16x16;
+
+        // maxTxDepth == 2 ⇒ TileTx16x16Cdf[ ctx_idx ].
+        let row = ctx.tx_depth_cdf(2, ctx_idx).unwrap();
+        assert_eq!(row, &DEFAULT_TX_16X16_CDF[2]);
+        let sym = dec.read_symbol(row).unwrap();
+        // tx_depth in 0..MAX_TX_DEPTH + 1 (the row carries 3 symbols).
+        assert!(sym <= MAX_TX_DEPTH as u32, "tx_depth in 0..=MAX_TX_DEPTH");
+
+        // §8.3 update ran (the working copy mutated) but the §9.4
+        // source is immutable.
+        assert_ne!(ctx.tx_16x16, before, "read_symbol must adapt the CDF");
+        assert_eq!(DEFAULT_TX_16X16_CDF[2][0], 18677);
+    }
+
+    /// End-to-end: drive the §8.2 `SymbolDecoder` through a `txfm_split`
+    /// (binary, 3 entries with the trailing counter) default CDF row
+    /// selected by §8.3.2 `txfm_split_ctx`, confirming the row matches
+    /// the §9.4 default and the symbol is 0 or 1.
+    #[test]
+    fn decode_txfm_split_through_default_cdf() {
+        // maxTxSz = TX_64X64, no-split, both neighbours present ⇒ ctx = 2.
+        let ctx_idx = txfm_split_ctx(true, true, 4, 4).unwrap();
+        assert_eq!(ctx_idx, 2);
+
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut ctx = TileCdfContext::new_from_defaults();
+        let before = ctx.txfm_split;
+
+        let row = ctx.txfm_split_cdf(ctx_idx);
+        assert_eq!(row, &DEFAULT_TXFM_SPLIT_CDF[2]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(sym <= 1, "txfm_split is binary");
+
+        assert_ne!(ctx.txfm_split, before, "read_symbol must adapt the CDF");
+        assert_eq!(DEFAULT_TXFM_SPLIT_CDF[2][0], 20847);
     }
 }

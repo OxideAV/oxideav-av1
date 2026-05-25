@@ -4,7 +4,7 @@ Pure-Rust AV1 (AOMedia Video 1) codec.
 
 ## Status — 2026-05-25
 
-**Clean-room rebuild, round 18.** The crate's prior implementation was
+**Clean-room rebuild, round 20.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -601,6 +601,40 @@ Bitstream parsing currently covers:
   `SymbolDecoder` decode driving the 16-value `cfl_alpha_u` default
   CDF row selected by `cfl_alpha_u_ctx(1, 0) = 0`.
 
+* **§9.4 default CDF tables + §8.3.2 selection — transform-size
+  subset (round 20).** Extends `cdf` with the five transform-size
+  default tables (`Default_Tx_8x8_Cdf[ 3 ][ 3 ]`,
+  `Default_Tx_16x16_Cdf[ 3 ][ 4 ]`, `Default_Tx_32x32_Cdf[ 3 ][ 4 ]`,
+  `Default_Tx_64x64_Cdf[ 3 ][ 4 ]`, `Default_Txfm_Split_Cdf[ 21 ][ 3 ]`)
+  — all transcribed verbatim from §9.4 with the §3 constants
+  `TX_SIZE_CONTEXTS = 3`, `TX_SIZES = 5`, `MAX_TX_DEPTH = 2`,
+  `TXFM_PARTITION_CONTEXTS = 21`. `new_from_defaults` performs the
+  §8.3.1 init step for every array. Two `&mut [u16]` accessors
+  surface the §8.3.2 selection: `tx_depth_cdf(maxTxDepth, ctx)` picks
+  `TileTx{8x8,16x16,32x32,64x64}Cdf[ ctx ]` per the §8.3.2 paragraph's
+  four-way `maxTxDepth ∈ {1, 2, 3, 4}` switch (returning `None` when
+  `maxTxDepth == 0`, the syntax-not-read case), and
+  `txfm_split_cdf(ctx)` picks `TileTxfmSplitCdf[ ctx ]`. Scalar
+  context helpers `tx_depth_ctx(aboveW, leftH, maxTxWidth, maxTxHeight)`
+  (the `(aboveW >= maxTxWidth) + (leftH >= maxTxHeight)` formula) and
+  `txfm_split_ctx(above, left, txSzSqrUp, maxTxSz)` (the
+  `(txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 + above + left`
+  formula) compute the `ctx` from scalar inputs the §5.11.15 /
+  §5.11.16 syntax supplies. 8 new unit tests (198 in src/, up from
+  190): every transform-size table's `cdf[N-1] == 32768` /
+  `cdf[N] == 0` invariant, dimension audit against the §3 constants;
+  byte-anchor spot-checks on every table's first/last entries;
+  §8.3.1 init-copy independence; `tx_depth_cdf` four-way selection
+  with row-length assertions; the `tx_depth_ctx` formula across all
+  four neighbour combinations; the `txfm_split_ctx` formula
+  walked term-by-term plus an exhaustive bounds sweep over the
+  reachable `(above, left, maxTxSz, txSzSqrUp)` tuples; and two
+  end-to-end §8.2 `SymbolDecoder` decodes — one driving the
+  3-symbol `TileTx16x16Cdf[ 2 ]` row selected by
+  `tx_depth_ctx(16, 16, 16, 16) = 2`, the other driving the
+  binary `TileTxfmSplitCdf[ 2 ]` row selected by
+  `txfm_split_ctx(true, true, 4, 4) = 2`.
+
 Validation: all 16 IVF fixtures under
 `docs/video/av1/fixtures/` (`tiny-i-only-16x16-prof0`,
 `i-only-64x64-prof0`, `profile-1-yuv444-8bit`,
@@ -650,11 +684,17 @@ again with the **inter-mode / reference-frame** subset (`new_mv` /
 `single_ref_p{1..6}` / `compound_mode` / `comp_ref_type` /
 `uni_comp_ref{,_p1,_p2}`) plus the §8.3.2 context helpers
 `is_inter_ctx` / `skip_mode_ctx` / `ref_count_ctx` / `compound_mode_ctx`.
-The remaining ~80 §9.4 tables (y_mode, uv_mode, angle-delta, tx-size,
-coefficient, palette, …), the `init_coeff_cdfs` coefficient set, and
-the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
-`tx_depth` / `txfm_split` / `uv_mode` / …) are a mechanical followup
-against the same `TileCdfContext` shape.
+round 20 extends the same `TileCdfContext` shape with the
+**transform-size** subset (`tx_depth` over the four
+per-`maxTxDepth` `Default_Tx_{8,16,32,64}x{8,16,32,64}_Cdf` arrays
+and `txfm_split` over `Default_Txfm_Split_Cdf`) plus the §8.3.2
+`tx_depth_ctx` / `txfm_split_ctx` derivations.
+The remaining §9.4 tables (y_mode, uv_mode, angle-delta,
+transform-type (`tx_type` / `inter_tx_type` / `intra_tx_type`),
+coefficient, …), the `init_coeff_cdfs` coefficient set, and the
+other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
+`uv_mode` / …) are a mechanical followup against the same
+`TileCdfContext` shape.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
@@ -866,6 +906,23 @@ against the same `TileCdfContext` shape.
     `Default_Single_Ref_Cdf`, `Default_Compound_Mode_Cdf`,
     `Default_Comp_Ref_Type_Cdf`, `Default_Uni_Comp_Ref_Cdf`, plus the
     `Compound_Mode_Ctx_Map[ 3 ][ COMP_NEWMV_CTXS ]` table).
+  * Round 20: §3 (constants — `TX_SIZE_CONTEXTS = 3`, `TX_SIZES = 5`,
+    `MAX_TX_DEPTH = 2`, `TXFM_PARTITION_CONTEXTS = 21`), §5.11.15
+    (`read_tx_size` — the `MiSize > BLOCK_4X4 && allowSelect &&
+    TxMode == TX_MODE_SELECT` gate on the `tx_depth` `S()` read +
+    the `Max_Tx_Depth[ MiSize ]` driver), §5.11.16 (`read_block_tx_size`
+    — the `read_var_tx_size` call site that drives `txfm_split`),
+    §8.3.1 (the "set equal to a copy of `Default_*_Cdf`" init step
+    for `Tx8x8Cdf`, `Tx16x16Cdf`, `Tx32x32Cdf`, `Tx64x64Cdf`,
+    `TxfmSplitCdf`), §8.3.2 (the four-way `tx_depth` selection by
+    `maxTxDepth` over `TileTx{8x8,16x16,32x32,64x64}Cdf[ ctx ]`, the
+    `ctx = (aboveW >= maxTxWidth) + (leftH >= maxTxHeight)` formula,
+    the `txfm_split: TileTxfmSplitCdf[ ctx ]` selection with
+    `ctx = (txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6
+    + above + left`), §9.4 (default CDF table values for
+    `Default_Tx_8x8_Cdf`, `Default_Tx_16x16_Cdf`,
+    `Default_Tx_32x32_Cdf`, `Default_Tx_64x64_Cdf`,
+    `Default_Txfm_Split_Cdf`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

@@ -6,6 +6,37 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 20 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (transform-size subset).** Extends `cdf` with five new default
+  tables (`Default_Tx_8x8_Cdf`, `Default_Tx_16x16_Cdf`,
+  `Default_Tx_32x32_Cdf`, `Default_Tx_64x64_Cdf`,
+  `Default_Txfm_Split_Cdf`) — all transcribed verbatim from §9.4.
+  New §3 constants `TX_SIZE_CONTEXTS = 3`, `TX_SIZES = 5`,
+  `MAX_TX_DEPTH = 2`, `TXFM_PARTITION_CONTEXTS = 21`. New
+  `TileCdfContext` fields (`tx_8x8`, `tx_16x16`, `tx_32x32`,
+  `tx_64x64`, `txfm_split`), all initialised by
+  `TileCdfContext::new_from_defaults` per §8.3.1. Two §8.3.2
+  selection accessors land: `tx_depth_cdf(max_tx_depth, ctx)`
+  (returns the right `TileTx*Cdf` row per the §8.3.2 four-way
+  `maxTxDepth` switch, `None` when `max_tx_depth == 0`) and
+  `txfm_split_cdf(ctx)`. Two new scalar §8.3.2 helpers
+  `tx_depth_ctx(above_w, left_h, max_tx_width, max_tx_height)`
+  (the `(aboveW >= maxTxWidth) + (leftH >= maxTxHeight)` formula)
+  and `txfm_split_ctx(above, left, tx_sz_sqr_up, max_tx_sz)`
+  (the `(txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 +
+  above + left` formula, returns `None` for unreachable
+  combinations that would land outside `0..TXFM_PARTITION_CONTEXTS`).
+  All new types / constants / fns re-exported at the crate root.
+  Tests grow from 190 to 198 (cdf module): table well-formedness +
+  dimensions against §3 constants, byte-anchor spot-checks on
+  every transcribed table, §8.3.1 init-copy independence,
+  `tx_depth_cdf` four-way selection with row-length assertions,
+  `tx_depth_ctx` formula across all neighbour combinations,
+  `txfm_split_ctx` formula walked term-by-term + an exhaustive
+  in-range sweep, and two end-to-end §8.2 `SymbolDecoder` decodes
+  driving the 3-value `TileTx16x16Cdf[ 2 ]` row and the binary
+  `TileTxfmSplitCdf[ 2 ]` row selected by the new context helpers.
+
 * **Round 19 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (palette / filter-intra / CFL subset).** Extends `cdf` with the
   filter-intra (`Default_Filter_Intra_Mode_Cdf`,
