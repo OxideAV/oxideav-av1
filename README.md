@@ -759,13 +759,26 @@ the future tile walk) and `compound_type_cdf(mi_size)` is a
 straight `TileCompoundTypeCdf[ MiSize ]` index; the §3 constants
 `COMPOUND_TYPES = 2`, `COMP_GROUP_IDX_CONTEXTS = 6` and
 `COMPOUND_IDX_CONTEXTS = 6` are added.
-The remaining §9.4 tables (y_mode, uv_mode, angle-delta, intra
-transform-type (`intra_tx_type`,
-`Default_Intra_Tx_Type_Set{1,2}_Cdf`),
+Round 134 lands the **inter-frame intra-mode** subset — the three
+default tables `Default_Y_Mode_Cdf` (4 block-size-group contexts ×
+13 cumulative frequencies), `Default_Uv_Mode_Cfl_Not_Allowed_Cdf`
+(13 `YMode` rows × 13) and `Default_Uv_Mode_Cfl_Allowed_Cdf`
+(13 `YMode` rows × 14) — plus their §8.3.2 selections:
+`y_mode_cdf(ctx)` indexes `TileYModeCdf[ Size_Group[ MiSize ] ]`
+(the `Size_Group` table + `size_group()` helper land alongside),
+and `uv_mode_cdf(cfl_allowed, y_mode)` picks the cfl-allowed /
+cfl-not-allowed variant by the resolved flag (the `Lossless` /
+`get_plane_residual_size` / `Max(Block_Width, Block_Height) <= 32`
+derivation stays in the future tile walk) then indexes by `YMode`;
+the §3 constants `BLOCK_SIZE_GROUPS = 4`,
+`UV_INTRA_MODES_CFL_NOT_ALLOWED = 13` and
+`UV_INTRA_MODES_CFL_ALLOWED = 14` are added.
+The remaining §9.4 tables (angle-delta, intra transform-type
+(`intra_tx_type`, `Default_Intra_Tx_Type_Set{1,2}_Cdf`),
 inter-intra (`Default_Interintra_Cdf`),
 coefficient, …), the `init_coeff_cdfs` coefficient set, and the
 other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
-`uv_mode` / …) are a mechanical followup against the same
+…) are a mechanical followup against the same
 `TileCdfContext` shape. `decode_av1` and `encode_av1` still return
 `Error::NotImplemented`.
 
@@ -1053,6 +1066,18 @@ other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
     §9.4 note that `Default_Compound_Type_Cdf` first-dimension indices
     `0..=2`, `10..=17` and `20..=21` are never used but are still
     transcribed full-width).
+  * **Inter-frame intra-mode CDFs** (round 134): §3 (`BLOCK_SIZE_GROUPS`,
+    `UV_INTRA_MODES_CFL_NOT_ALLOWED`, `UV_INTRA_MODES_CFL_ALLOWED`
+    constant definitions), §8.3.1 (the "set equal to a copy of
+    `Default_Y_Mode_Cdf` / `Default_Uv_Mode_Cfl_Not_Allowed_Cdf` /
+    `Default_Uv_Mode_Cfl_Allowed_Cdf`" init steps for `YModeCdf` /
+    `UVModeCflNotAllowedCdf` / `UVModeCflAllowedCdf`), §8.3.2 (the
+    `y_mode: TileYModeCdf[ Size_Group[ MiSize ] ]` paragraph and the
+    `uv_mode` paragraph selecting the cfl-allowed / cfl-not-allowed
+    variant by the `Lossless` / `get_plane_residual_size` /
+    `Max(Block_Width, Block_Height) <= 32` tests, then indexing by
+    `YMode`), §8.3.2 `Size_Group[ BLOCK_SIZES ]` table, §9.4 (default
+    CDF table values for the three tables).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

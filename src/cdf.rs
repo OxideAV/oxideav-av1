@@ -94,8 +94,16 @@
 //!         `MiSize` — a straight `BLOCK_SIZES` index, no
 //!         neighbour-context arithmetic).
 //!
-//! The remaining `Default_*_Cdf` arrays of §9.4 (the y_mode,
-//! uv_mode, angle-delta, intra transform-type (`intra_tx_type`,
+//!   * **Inter-frame intra mode** (round 134):
+//!       * `Default_Y_Mode_Cdf` (`y_mode`, keyed by
+//!         `ctx = Size_Group[ MiSize ] ∈ 0..BLOCK_SIZE_GROUPS`).
+//!       * `Default_Uv_Mode_Cfl_Not_Allowed_Cdf` (`uv_mode` when
+//!         chroma-from-luma is not allowed, keyed by `YMode`).
+//!       * `Default_Uv_Mode_Cfl_Allowed_Cdf` (`uv_mode` when
+//!         chroma-from-luma is allowed, keyed by `YMode`).
+//!
+//! The remaining `Default_*_Cdf` arrays of §9.4 (the angle-delta,
+//! intra transform-type (`intra_tx_type`,
 //! `Default_Intra_Tx_Type_Set{1,2}_Cdf`), coefficient,
 //! inter-intra group), the
 //! `init_coeff_cdfs` coefficient tables, and the §8.3.2
@@ -432,6 +440,35 @@ pub const COMP_GROUP_IDX_CONTEXTS: usize = 6;
 /// [`DEFAULT_COMPOUND_IDX_CDF`]; valid range is
 /// `0..COMPOUND_IDX_CONTEXTS`.
 pub const COMPOUND_IDX_CONTEXTS: usize = 6;
+
+/// `BLOCK_SIZE_GROUPS` (§3) — number of contexts when decoding `y_mode`
+/// (the inter-frame, non-keyframe luma intra-mode element). Drives the
+/// outer dimension of [`DEFAULT_Y_MODE_CDF`]. The §8.3.2 selection
+/// computes `ctx = Size_Group[ MiSize ]`, in `0..BLOCK_SIZE_GROUPS`.
+pub const BLOCK_SIZE_GROUPS: usize = 4;
+
+/// `UV_INTRA_MODES_CFL_NOT_ALLOWED` (§3) — number of values for `uv_mode`
+/// when chroma-from-luma is not allowed (i.e. `UV_CFL_PRED` is excluded).
+/// Drives the row width of [`DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF`]
+/// (`UV_INTRA_MODES_CFL_NOT_ALLOWED + 1` cumulative frequencies + the
+/// §8.3 adaptation counter).
+pub const UV_INTRA_MODES_CFL_NOT_ALLOWED: usize = 13;
+
+/// `UV_INTRA_MODES_CFL_ALLOWED` (§3) — number of values for `uv_mode`
+/// when chroma-from-luma is allowed (i.e. `UV_CFL_PRED` is included).
+/// Drives the row width of [`DEFAULT_UV_MODE_CFL_ALLOWED_CDF`]
+/// (`UV_INTRA_MODES_CFL_ALLOWED + 1` cumulative frequencies + the §8.3
+/// adaptation counter).
+pub const UV_INTRA_MODES_CFL_ALLOWED: usize = 14;
+
+/// `Size_Group[ BLOCK_SIZES ]` (§8.3.2) — maps a luma block size
+/// (`MiSize`) into the `y_mode` context (and, after `- 1`, several other
+/// intra-syntax contexts). Used by the §8.3.2 `y_mode` selection as
+/// `ctx = Size_Group[ MiSize ]`, yielding a value in
+/// `0..BLOCK_SIZE_GROUPS`.
+pub const SIZE_GROUP: [usize; BLOCK_SIZES] = [
+    0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2,
+];
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -1397,6 +1434,150 @@ pub const DEFAULT_COMPOUND_TYPE_CDF: [[u16; COMPOUND_TYPES + 1]; BLOCK_SIZES] = 
     [16384, 32768, 0],
 ];
 
+/// `Default_Y_Mode_Cdf[ BLOCK_SIZE_GROUPS ][ INTRA_MODES + 1 ]` (§9.4).
+/// The inter-frame (non-keyframe) luma intra-mode CDF, indexed by
+/// `ctx = Size_Group[ MiSize ]` per the §8.3.2 `y_mode` selection. Each
+/// row carries `INTRA_MODES = 13` cumulative frequencies (the last being
+/// `1 << 15 == 32768`) plus the §8.3 adaptation counter (starts at 0).
+/// Distinct from [`DEFAULT_INTRA_FRAME_Y_MODE_CDF`], which is the
+/// keyframe / intra-frame variant keyed by `[abovemode][leftmode]`.
+pub const DEFAULT_Y_MODE_CDF: [[u16; INTRA_MODES + 1]; BLOCK_SIZE_GROUPS] = [
+    [
+        22801, 23489, 24293, 24756, 25601, 26123, 26606, 27418, 27945, 29228, 29685, 30349, 32768,
+        0,
+    ],
+    [
+        18673, 19845, 22631, 23318, 23950, 24649, 25527, 27364, 28152, 29701, 29984, 30852, 32768,
+        0,
+    ],
+    [
+        19770, 20979, 23396, 23939, 24241, 24654, 25136, 27073, 27830, 29360, 29730, 30659, 32768,
+        0,
+    ],
+    [
+        20155, 21301, 22838, 23178, 23261, 23533, 23703, 24804, 25352, 26575, 27016, 28049, 32768,
+        0,
+    ],
+];
+
+/// `Default_Uv_Mode_Cfl_Not_Allowed_Cdf[ INTRA_MODES ][ UV_INTRA_MODES_CFL_NOT_ALLOWED + 1 ]`
+/// (§9.4). The chroma intra-mode CDF used when chroma-from-luma is **not**
+/// allowed; indexed by `YMode` per the §8.3.2 `uv_mode` selection. Each
+/// row carries `UV_INTRA_MODES_CFL_NOT_ALLOWED = 13` cumulative
+/// frequencies plus the §8.3 adaptation counter (starts at 0).
+pub const DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF: [[u16; UV_INTRA_MODES_CFL_NOT_ALLOWED + 1];
+    INTRA_MODES] = [
+    [
+        22631, 24152, 25378, 25661, 25986, 26520, 27055, 27923, 28244, 30059, 30941, 31961, 32768,
+        0,
+    ],
+    [
+        9513, 26881, 26973, 27046, 27118, 27664, 27739, 27824, 28359, 29505, 29800, 31796, 32768, 0,
+    ],
+    [
+        9845, 9915, 28663, 28704, 28757, 28780, 29198, 29822, 29854, 30764, 31777, 32029, 32768, 0,
+    ],
+    [
+        13639, 13897, 14171, 25331, 25606, 25727, 25953, 27148, 28577, 30612, 31355, 32493, 32768,
+        0,
+    ],
+    [
+        9764, 9835, 9930, 9954, 25386, 27053, 27958, 28148, 28243, 31101, 31744, 32363, 32768, 0,
+    ],
+    [
+        11825, 13589, 13677, 13720, 15048, 29213, 29301, 29458, 29711, 31161, 31441, 32550, 32768,
+        0,
+    ],
+    [
+        14175, 14399, 16608, 16821, 17718, 17775, 28551, 30200, 30245, 31837, 32342, 32667, 32768,
+        0,
+    ],
+    [
+        12885, 13038, 14978, 15590, 15673, 15748, 16176, 29128, 29267, 30643, 31961, 32461, 32768,
+        0,
+    ],
+    [
+        12026, 13661, 13874, 15305, 15490, 15726, 15995, 16273, 28443, 30388, 30767, 32416, 32768,
+        0,
+    ],
+    [
+        19052, 19840, 20579, 20916, 21150, 21467, 21885, 22719, 23174, 28861, 30379, 32175, 32768,
+        0,
+    ],
+    [
+        18627, 19649, 20974, 21219, 21492, 21816, 22199, 23119, 23527, 27053, 31397, 32148, 32768,
+        0,
+    ],
+    [
+        17026, 19004, 19997, 20339, 20586, 21103, 21349, 21907, 22482, 25896, 26541, 31819, 32768,
+        0,
+    ],
+    [
+        12124, 13759, 14959, 14992, 15007, 15051, 15078, 15166, 15255, 15753, 16039, 16606, 32768,
+        0,
+    ],
+];
+
+/// `Default_Uv_Mode_Cfl_Allowed_Cdf[ INTRA_MODES ][ UV_INTRA_MODES_CFL_ALLOWED + 1 ]`
+/// (§9.4). The chroma intra-mode CDF used when chroma-from-luma **is**
+/// allowed (so `UV_CFL_PRED` is a coded value); indexed by `YMode` per
+/// the §8.3.2 `uv_mode` selection. Each row carries
+/// `UV_INTRA_MODES_CFL_ALLOWED = 14` cumulative frequencies plus the §8.3
+/// adaptation counter (starts at 0).
+pub const DEFAULT_UV_MODE_CFL_ALLOWED_CDF: [[u16; UV_INTRA_MODES_CFL_ALLOWED + 1]; INTRA_MODES] = [
+    [
+        10407, 11208, 12900, 13181, 13823, 14175, 14899, 15656, 15986, 20086, 20995, 22455, 24212,
+        32768, 0,
+    ],
+    [
+        4532, 19780, 20057, 20215, 20428, 21071, 21199, 21451, 22099, 24228, 24693, 27032, 29472,
+        32768, 0,
+    ],
+    [
+        5273, 5379, 20177, 20270, 20385, 20439, 20949, 21695, 21774, 23138, 24256, 24703, 26679,
+        32768, 0,
+    ],
+    [
+        6740, 7167, 7662, 14152, 14536, 14785, 15034, 16741, 18371, 21520, 22206, 23389, 24182,
+        32768, 0,
+    ],
+    [
+        4987, 5368, 5928, 6068, 19114, 20315, 21857, 22253, 22411, 24911, 25380, 26027, 26376,
+        32768, 0,
+    ],
+    [
+        5370, 6889, 7247, 7393, 9498, 21114, 21402, 21753, 21981, 24780, 25386, 26517, 27176,
+        32768, 0,
+    ],
+    [
+        4816, 4961, 7204, 7326, 8765, 8930, 20169, 20682, 20803, 23188, 23763, 24455, 24940, 32768,
+        0,
+    ],
+    [
+        6608, 6740, 8529, 9049, 9257, 9356, 9735, 18827, 19059, 22336, 23204, 23964, 24793, 32768,
+        0,
+    ],
+    [
+        5998, 7419, 7781, 8933, 9255, 9549, 9753, 10417, 18898, 22494, 23139, 24764, 25989, 32768,
+        0,
+    ],
+    [
+        10660, 11298, 12550, 12957, 13322, 13624, 14040, 15004, 15534, 20714, 21789, 23443, 24861,
+        32768, 0,
+    ],
+    [
+        10522, 11530, 12552, 12963, 13378, 13779, 14245, 15235, 15902, 20102, 22696, 23774, 25838,
+        32768, 0,
+    ],
+    [
+        10099, 10691, 12639, 13049, 13386, 13665, 14125, 15163, 15636, 19676, 20474, 23519, 25208,
+        32768, 0,
+    ],
+    [
+        3144, 5087, 7382, 7504, 7593, 7690, 7801, 8064, 8232, 9248, 9875, 10521, 29048, 32768, 0,
+    ],
+];
+
 // ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
@@ -1613,6 +1794,24 @@ pub struct TileCdfContext {
     /// `compound_type` (§5.11.x `read_compound_type`), selected by
     /// `MiSize`.
     pub compound_type: [[u16; COMPOUND_TYPES + 1]; BLOCK_SIZES],
+
+    // -----------------------------------------------------------------
+    // Round 134 — inter-frame intra-mode group. §8.3.1 enumerates these
+    // as "`YModeCdf` is set to a copy of `Default_Y_Mode_Cdf`",
+    // "`UVModeCflNotAllowedCdf` is set to a copy of
+    // `Default_Uv_Mode_Cfl_Not_Allowed_Cdf`", and
+    // "`UVModeCflAllowedCdf` is set to a copy of
+    // `Default_Uv_Mode_Cfl_Allowed_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileYModeCdf[ BLOCK_SIZE_GROUPS ]` (§8.3.1). Codes the inter-frame
+    /// `y_mode`, selected by `ctx = Size_Group[ MiSize ]`.
+    pub y_mode: [[u16; INTRA_MODES + 1]; BLOCK_SIZE_GROUPS],
+    /// `TileUVModeCflNotAllowedCdf[ INTRA_MODES ]` (§8.3.1). Codes
+    /// `uv_mode` when chroma-from-luma is not allowed, selected by `YMode`.
+    pub uv_mode_cfl_not_allowed: [[u16; UV_INTRA_MODES_CFL_NOT_ALLOWED + 1]; INTRA_MODES],
+    /// `TileUVModeCflAllowedCdf[ INTRA_MODES ]` (§8.3.1). Codes `uv_mode`
+    /// when chroma-from-luma is allowed, selected by `YMode`.
+    pub uv_mode_cfl_allowed: [[u16; UV_INTRA_MODES_CFL_ALLOWED + 1]; INTRA_MODES],
 }
 
 impl TileCdfContext {
@@ -1717,6 +1916,11 @@ impl TileCdfContext {
             comp_group_idx: DEFAULT_COMP_GROUP_IDX_CDF,
             compound_idx: DEFAULT_COMPOUND_IDX_CDF,
             compound_type: DEFAULT_COMPOUND_TYPE_CDF,
+
+            // Round 134 — inter-frame intra-mode group.
+            y_mode: DEFAULT_Y_MODE_CDF,
+            uv_mode_cfl_not_allowed: DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF,
+            uv_mode_cfl_allowed: DEFAULT_UV_MODE_CFL_ALLOWED_CDF,
         }
     }
 
@@ -2179,6 +2383,46 @@ impl TileCdfContext {
             None
         }
     }
+
+    /// §8.3.2 `y_mode`: the cdf is `TileYModeCdf[ ctx ]`, where the §8.3.2
+    /// `y_mode` paragraph computes `ctx = Size_Group[ MiSize ]` (a value
+    /// in `0..BLOCK_SIZE_GROUPS`). [`size_group`] performs that mapping;
+    /// this selector takes the already-computed context. Returns `None`
+    /// if `ctx >= BLOCK_SIZE_GROUPS` (a caller bug).
+    ///
+    /// Distinct from [`Self::intra_frame_y_mode_cdf`], which is the
+    /// keyframe / intra-frame variant keyed by `[abovemode][leftmode]`.
+    pub fn y_mode_cdf(&mut self, ctx: usize) -> Option<&mut [u16]> {
+        if ctx < BLOCK_SIZE_GROUPS {
+            Some(&mut self.y_mode[ctx])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `uv_mode`: selects between the two chroma intra-mode CDFs by
+    /// the `cfl_allowed` flag derived in the §8.3.2 `uv_mode` paragraph,
+    /// then indexes the chosen array by `YMode`:
+    ///
+    /// * `cfl_allowed == true` → `TileUVModeCflAllowedCdf[ YMode ]`
+    ///   (so `UV_CFL_PRED` is a coded value);
+    /// * `cfl_allowed == false` → `TileUVModeCflNotAllowedCdf[ YMode ]`.
+    ///
+    /// The §8.3.2 derivation of `cfl_allowed` (the `Lossless` /
+    /// `get_plane_residual_size` / `Max(Block_Width, Block_Height) <= 32`
+    /// tests) belongs in the tile walk; this selector takes the resolved
+    /// flag plus `YMode`. Returns `None` if `y_mode >= INTRA_MODES`
+    /// (a caller bug — the §3 enumeration bounds `YMode`).
+    pub fn uv_mode_cdf(&mut self, cfl_allowed: bool, y_mode: usize) -> Option<&mut [u16]> {
+        if y_mode >= INTRA_MODES {
+            return None;
+        }
+        if cfl_allowed {
+            Some(&mut self.uv_mode_cfl_allowed[y_mode])
+        } else {
+            Some(&mut self.uv_mode_cfl_not_allowed[y_mode])
+        }
+    }
 }
 
 impl Default for TileCdfContext {
@@ -2197,6 +2441,14 @@ impl Default for TileCdfContext {
 /// `DC_PRED == 0` when that neighbour is unavailable).
 pub fn intra_mode_ctx(mode: usize) -> usize {
     INTRA_MODE_CONTEXT[mode]
+}
+
+/// §8.3.2 `y_mode` context mapping: `ctx = Size_Group[ MiSize ]`. The
+/// result selects a [`TileCdfContext::y_mode_cdf`] row and is in
+/// `0..BLOCK_SIZE_GROUPS`. `mi_size` is the current block's `MiSize`
+/// (`0..BLOCK_SIZES`).
+pub fn size_group(mi_size: usize) -> usize {
+    SIZE_GROUP[mi_size]
 }
 
 /// §8.3.2 `partition` context:
@@ -4537,5 +4789,271 @@ mod tests {
             "read_symbol must adapt the working CDF"
         );
         assert_eq!(DEFAULT_COMP_GROUP_IDX_CDF[2], [18840, 32768, 0]);
+    }
+
+    // Round 134 — inter-frame intra-mode group tests.
+
+    /// §8.3.1 / §9.4: the three inter-frame intra-mode default tables are
+    /// well-formed. Outer dims match the §3 constants; each row carries
+    /// the right number of cumulative frequencies + the adaptation
+    /// counter; the second-to-last entry is `1 << 15` and the last is a
+    /// fresh-0 adaptation counter; the cumulative frequencies are
+    /// strictly increasing up to `32768`.
+    #[test]
+    fn inter_intra_mode_default_tables_well_formed() {
+        // §3 constants pinned.
+        assert_eq!(BLOCK_SIZE_GROUPS, 4);
+        assert_eq!(UV_INTRA_MODES_CFL_NOT_ALLOWED, 13);
+        assert_eq!(UV_INTRA_MODES_CFL_ALLOWED, 14);
+        assert_eq!(INTRA_MODES, 13);
+
+        // Outer dimensions.
+        assert_eq!(DEFAULT_Y_MODE_CDF.len(), BLOCK_SIZE_GROUPS);
+        assert_eq!(DEFAULT_Y_MODE_CDF[0].len(), INTRA_MODES + 1);
+        assert_eq!(DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF.len(), INTRA_MODES);
+        assert_eq!(
+            DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[0].len(),
+            UV_INTRA_MODES_CFL_NOT_ALLOWED + 1
+        );
+        assert_eq!(DEFAULT_UV_MODE_CFL_ALLOWED_CDF.len(), INTRA_MODES);
+        assert_eq!(
+            DEFAULT_UV_MODE_CFL_ALLOWED_CDF[0].len(),
+            UV_INTRA_MODES_CFL_ALLOWED + 1
+        );
+
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+            // Cumulative frequencies strictly increase to 32768.
+            for w in row[..n].windows(2) {
+                assert!(w[0] < w[1], "cdf must be strictly increasing: {row:?}");
+            }
+        };
+        for r in &DEFAULT_Y_MODE_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF {
+            check(r);
+        }
+        for r in &DEFAULT_UV_MODE_CFL_ALLOWED_CDF {
+            check(r);
+        }
+    }
+
+    /// Spot-check the §9.4 inter-frame intra-mode default values
+    /// byte-for-byte. A mis-keyed digit during transcription breaks the
+    /// equality.
+    #[test]
+    fn inter_intra_mode_default_byte_exact_values() {
+        // Default_Y_Mode_Cdf — first / last context rows.
+        assert_eq!(
+            DEFAULT_Y_MODE_CDF[0],
+            [
+                22801, 23489, 24293, 24756, 25601, 26123, 26606, 27418, 27945, 29228, 29685, 30349,
+                32768, 0
+            ]
+        );
+        assert_eq!(
+            DEFAULT_Y_MODE_CDF[3],
+            [
+                20155, 21301, 22838, 23178, 23261, 23533, 23703, 24804, 25352, 26575, 27016, 28049,
+                32768, 0
+            ]
+        );
+        // Leading-frequency anchors across the four contexts.
+        assert_eq!(DEFAULT_Y_MODE_CDF[1][0], 18673);
+        assert_eq!(DEFAULT_Y_MODE_CDF[2][0], 19770);
+
+        // Default_Uv_Mode_Cfl_Not_Allowed_Cdf — first / last YMode rows.
+        assert_eq!(
+            DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[0],
+            [
+                22631, 24152, 25378, 25661, 25986, 26520, 27055, 27923, 28244, 30059, 30941, 31961,
+                32768, 0
+            ]
+        );
+        assert_eq!(
+            DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[12],
+            [
+                12124, 13759, 14959, 14992, 15007, 15051, 15078, 15166, 15255, 15753, 16039, 16606,
+                32768, 0
+            ]
+        );
+        assert_eq!(DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[1][0], 9513);
+        assert_eq!(DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[6][6], 28551);
+
+        // Default_Uv_Mode_Cfl_Allowed_Cdf — first / last YMode rows.
+        assert_eq!(
+            DEFAULT_UV_MODE_CFL_ALLOWED_CDF[0],
+            [
+                10407, 11208, 12900, 13181, 13823, 14175, 14899, 15656, 15986, 20086, 20995, 22455,
+                24212, 32768, 0
+            ]
+        );
+        assert_eq!(
+            DEFAULT_UV_MODE_CFL_ALLOWED_CDF[12],
+            [
+                3144, 5087, 7382, 7504, 7593, 7690, 7801, 8064, 8232, 9248, 9875, 10521, 29048,
+                32768, 0
+            ]
+        );
+        assert_eq!(DEFAULT_UV_MODE_CFL_ALLOWED_CDF[1][0], 4532);
+        assert_eq!(DEFAULT_UV_MODE_CFL_ALLOWED_CDF[8][8], 18898);
+    }
+
+    /// §8.3.2 `Size_Group[ BLOCK_SIZES ]` table + [`size_group`] helper:
+    /// pinned byte-for-byte and confirmed to map into `0..BLOCK_SIZE_GROUPS`.
+    #[test]
+    fn size_group_table_pinned() {
+        assert_eq!(SIZE_GROUP.len(), BLOCK_SIZES);
+        assert_eq!(
+            SIZE_GROUP,
+            [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2]
+        );
+        for (mi_size, &want) in SIZE_GROUP.iter().enumerate() {
+            let g = size_group(mi_size);
+            assert!(g < BLOCK_SIZE_GROUPS, "Size_Group must index a y_mode ctx");
+            assert_eq!(g, want);
+        }
+    }
+
+    /// §8.3.1: a fresh context copies the three inter-frame intra-mode
+    /// defaults in (the §9.4 sources are not aliased).
+    #[test]
+    fn inter_intra_mode_init_from_defaults_copies_tables() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.y_mode, DEFAULT_Y_MODE_CDF);
+        assert_eq!(
+            ctx.uv_mode_cfl_not_allowed,
+            DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF
+        );
+        assert_eq!(ctx.uv_mode_cfl_allowed, DEFAULT_UV_MODE_CFL_ALLOWED_CDF);
+
+        // Working-copy independence: mutating the context must not touch
+        // the §9.4 sources.
+        ctx.y_mode_cdf(0).unwrap()[0] = 12345;
+        ctx.uv_mode_cdf(false, 0).unwrap()[0] = 23456;
+        ctx.uv_mode_cdf(true, 0).unwrap()[0] = 34567;
+        assert_ne!(ctx.y_mode[0][0], DEFAULT_Y_MODE_CDF[0][0]);
+        assert_ne!(
+            ctx.uv_mode_cfl_not_allowed[0][0],
+            DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[0][0]
+        );
+        assert_ne!(
+            ctx.uv_mode_cfl_allowed[0][0],
+            DEFAULT_UV_MODE_CFL_ALLOWED_CDF[0][0]
+        );
+        assert_eq!(DEFAULT_Y_MODE_CDF[0][0], 22801);
+        assert_eq!(DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[0][0], 22631);
+        assert_eq!(DEFAULT_UV_MODE_CFL_ALLOWED_CDF[0][0], 10407);
+    }
+
+    /// §8.3.2 inter-frame intra-mode selectors return the right §9.4 rows.
+    /// `y_mode_cdf` takes `ctx = Size_Group[MiSize]`; `uv_mode_cdf` picks
+    /// the cfl-allowed / cfl-not-allowed variant by the resolved flag and
+    /// indexes by `YMode`. Both reject out-of-range indices with `None`.
+    #[test]
+    fn inter_intra_mode_selectors_return_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        for (i, want) in DEFAULT_Y_MODE_CDF.iter().enumerate() {
+            let row = ctx.y_mode_cdf(i).unwrap();
+            assert_eq!(row.len(), INTRA_MODES + 1);
+            assert_eq!(row, want);
+        }
+        assert!(ctx.y_mode_cdf(BLOCK_SIZE_GROUPS).is_none());
+        assert!(ctx.y_mode_cdf(BLOCK_SIZE_GROUPS + 3).is_none());
+
+        for (i, want) in DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF.iter().enumerate() {
+            let row = ctx.uv_mode_cdf(false, i).unwrap();
+            assert_eq!(row.len(), UV_INTRA_MODES_CFL_NOT_ALLOWED + 1);
+            assert_eq!(row, want);
+        }
+        for (i, want) in DEFAULT_UV_MODE_CFL_ALLOWED_CDF.iter().enumerate() {
+            let row = ctx.uv_mode_cdf(true, i).unwrap();
+            assert_eq!(row.len(), UV_INTRA_MODES_CFL_ALLOWED + 1);
+            assert_eq!(row, want);
+        }
+        // Out-of-range `YMode` returns None for both variants.
+        assert!(ctx.uv_mode_cdf(false, INTRA_MODES).is_none());
+        assert!(ctx.uv_mode_cdf(true, INTRA_MODES + 5).is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a `y_mode`
+    /// default CDF selected by the §8.3.2 selection
+    /// (`ctx = Size_Group[ MiSize ]` for a 64×64 `MiSize`, the
+    /// largest-block context 3), confirming the chosen row matches the
+    /// §9.4 source, the decode lands in range and the working copy adapts.
+    #[test]
+    fn decode_y_mode_through_default_cdf() {
+        // MiSize = 12 (BLOCK_64X64) → Size_Group[12] = 3.
+        assert_eq!(size_group(12), 3);
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.y_mode;
+
+        let ctx = size_group(12);
+        let row = tile_ctx.y_mode_cdf(ctx).unwrap();
+        assert_eq!(row, &DEFAULT_Y_MODE_CDF[3]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            (sym as usize) < INTRA_MODES,
+            "y_mode must code a symbol in 0..INTRA_MODES"
+        );
+
+        assert_ne!(
+            tile_ctx.y_mode, before,
+            "read_symbol must adapt the working CDF"
+        );
+        assert_eq!(DEFAULT_Y_MODE_CDF[3][0], 20155);
+    }
+
+    /// End-to-end: drive the §8.2 `SymbolDecoder` through both `uv_mode`
+    /// variants (`cfl_allowed` true / false) for the same `YMode`,
+    /// confirming each selector picks the correct §9.4 table, the decode
+    /// lands in the matching value range and the working copy adapts.
+    #[test]
+    fn decode_uv_mode_through_default_cdf() {
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+
+        // cfl-not-allowed: 13 coded values, YMode = 0.
+        {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+            let mut tile_ctx = TileCdfContext::new_from_defaults();
+            let before = tile_ctx.uv_mode_cfl_not_allowed;
+            let row = tile_ctx.uv_mode_cdf(false, 0).unwrap();
+            assert_eq!(row, &DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[0]);
+            let sym = dec.read_symbol(row).unwrap();
+            assert!(
+                (sym as usize) < UV_INTRA_MODES_CFL_NOT_ALLOWED,
+                "uv_mode (cfl-not-allowed) must code 0..UV_INTRA_MODES_CFL_NOT_ALLOWED"
+            );
+            assert_ne!(
+                tile_ctx.uv_mode_cfl_not_allowed, before,
+                "read_symbol must adapt the working CDF"
+            );
+        }
+
+        // cfl-allowed: 14 coded values (UV_CFL_PRED included), YMode = 0.
+        {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+            let mut tile_ctx = TileCdfContext::new_from_defaults();
+            let before = tile_ctx.uv_mode_cfl_allowed;
+            let row = tile_ctx.uv_mode_cdf(true, 0).unwrap();
+            assert_eq!(row, &DEFAULT_UV_MODE_CFL_ALLOWED_CDF[0]);
+            let sym = dec.read_symbol(row).unwrap();
+            assert!(
+                (sym as usize) < UV_INTRA_MODES_CFL_ALLOWED,
+                "uv_mode (cfl-allowed) must code 0..UV_INTRA_MODES_CFL_ALLOWED"
+            );
+            assert_ne!(
+                tile_ctx.uv_mode_cfl_allowed, before,
+                "read_symbol must adapt the working CDF"
+            );
+        }
+        assert_eq!(DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF[0][0], 22631);
+        assert_eq!(DEFAULT_UV_MODE_CFL_ALLOWED_CDF[0][0], 10407);
     }
 }

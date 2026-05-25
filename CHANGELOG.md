@@ -6,6 +6,38 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 134 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
+  (inter-frame intra-mode subset).** Extends `cdf` with the three
+  inter-frame intra-mode default tables — `Default_Y_Mode_Cdf`
+  (`[BLOCK_SIZE_GROUPS][INTRA_MODES + 1]`, 4 block-size-group contexts ×
+  13 cumulative frequencies + adaptation counter; the non-keyframe luma
+  `y_mode` element, distinct from the keyframe
+  `Default_Intra_Frame_Y_Mode_Cdf`), `Default_Uv_Mode_Cfl_Not_Allowed_Cdf`
+  (`[INTRA_MODES][UV_INTRA_MODES_CFL_NOT_ALLOWED + 1]`) and
+  `Default_Uv_Mode_Cfl_Allowed_Cdf`
+  (`[INTRA_MODES][UV_INTRA_MODES_CFL_ALLOWED + 1]`) — transcribed
+  verbatim from §9.4. New §3 constants `BLOCK_SIZE_GROUPS = 4`,
+  `UV_INTRA_MODES_CFL_NOT_ALLOWED = 13`, `UV_INTRA_MODES_CFL_ALLOWED = 14`
+  plus the §8.3.2 `Size_Group[ BLOCK_SIZES ]` table. New `TileCdfContext`
+  fields `y_mode` / `uv_mode_cfl_not_allowed` / `uv_mode_cfl_allowed`,
+  initialised by `TileCdfContext::new_from_defaults` per §8.3.1
+  ("`YModeCdf` / `UVModeCflNotAllowedCdf` / `UVModeCflAllowedCdf` is set
+  to a copy of `Default_*`"). Selection accessors land —
+  `y_mode_cdf(ctx)` indexing `TileYModeCdf[ Size_Group[ MiSize ] ]`
+  (with `size_group()` performing the §8.3.2 mapping), and
+  `uv_mode_cdf(cfl_allowed, y_mode)` picking the cfl-allowed /
+  cfl-not-allowed variant by the resolved flag (the `Lossless` /
+  `get_plane_residual_size` / `Max(Block_Width, Block_Height) <= 32`
+  derivation belongs in the future tile walk) then indexing by `YMode`,
+  returning `None` out of range. All new types / constants re-exported at
+  the crate root. Tests grow by 7 (cdf module): table well-formedness +
+  strict-monotonicity against §3 constants, byte-anchor spot-checks of
+  the §9.4 row values, the `Size_Group` table pinned byte-for-byte,
+  §8.3.1 init-copy independence with mutate-doesn't-touch-source
+  assertions, selector row-equality across every context / `YMode` /
+  variant plus out-of-range `None` returns, and two end-to-end §8.2
+  `SymbolDecoder` decodes driving `Default_Y_Mode_Cdf[3]` and both
+  `uv_mode` variants selected by the new helpers.
 * **Round 24 — §9.4 default CDF tables + §8.3.1 / §8.3.2 selection
   (compound-prediction subset).** Extends `cdf` with the three
   compound-prediction default tables — `Default_Comp_Group_Idx_Cdf`
