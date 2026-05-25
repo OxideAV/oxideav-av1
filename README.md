@@ -782,10 +782,30 @@ selection shared by `angle_delta_y` / `angle_delta_uv`), returning
 `None` for non-directional modes; the §3 constants
 `DIRECTIONAL_MODES = 8`, `MAX_ANGLE_DELTA = 3` and the
 directional-mode base `V_PRED = 1` are added.
+Round 136 lands the **coefficient-token entry sub-group** — the
+`init_coeff_cdfs` gateway to tile-content decode: the
+transform-block skip flag `Default_Txb_Skip_Cdf` (4 q-contexts ×
+5 transform sizes × 13 skip contexts), the end-of-block position
+classes `Default_Eob_Pt_{16,32,64,128,256}_Cdf` (per-plane,
+per-`isInter`) plus the no-`isInter`-axis
+`Default_Eob_Pt_{512,1024}_Cdf`, the binary `Default_Eob_Extra_Cdf`
+(per transform size / plane / 9 EOB contexts) and the binary
+`Default_Dc_Sign_Cdf` (per plane / 3 contexts, in the §9.4
+`128 * N` fixed-point form), all transcribed verbatim from §9.4.
+Unlike the non-coeff CDFs these are reset by the separate
+`TileCdfContext::init_coeff_cdfs`, which derives the q-context
+`idx` from `base_q_idx` (`coeff_cdf_q_ctx`: `<=20→0`, `<=60→1`,
+`<=120→2`, else `3`) and copies `Default_*_Cdf[ idx ]` into the
+working arrays; the §8.3.2 selectors `txb_skip_cdf` /
+`eob_pt_*_cdf` / `eob_extra_cdf` / `dc_sign_cdf` land alongside,
+and the §3 constants `PLANE_TYPES = 2`, `COEFF_CDF_Q_CTXS = 4`,
+`TXB_SKIP_CONTEXTS = 13`, `EOB_COEF_CONTEXTS = 9`,
+`DC_SIGN_CONTEXTS = 3` are added.
 The remaining §9.4 tables (intra transform-type
 (`intra_tx_type`, `Default_Intra_Tx_Type_Set{1,2}_Cdf`),
-inter-intra (`Default_Interintra_Cdf`),
-coefficient, …), the `init_coeff_cdfs` coefficient set, and the
+inter-intra (`Default_Interintra_Cdf`)), the rest of the
+`init_coeff_cdfs` coefficient set (`Default_Coeff_Base_Eob_Cdf` /
+`Default_Coeff_Base_Cdf` / `Default_Coeff_Br_Cdf`), and the
 other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
 …) are a mechanical followup against the same
 `TileCdfContext` shape. `decode_av1` and `encode_av1` still return
@@ -1087,6 +1107,22 @@ other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
     `Max(Block_Width, Block_Height) <= 32` tests, then indexing by
     `YMode`), §8.3.2 `Size_Group[ BLOCK_SIZES ]` table, §9.4 (default
     CDF table values for the three tables).
+  * **Angle-delta CDF** (round 135): §3 (`DIRECTIONAL_MODES`,
+    `MAX_ANGLE_DELTA`, `V_PRED`), §8.3.1 (the "`AngleDeltaCdf` is set
+    to a copy of `Default_Angle_Delta_Cdf`" init step), §8.3.2 (the
+    `TileAngleDeltaCdf[ YMode - V_PRED ]` / `[ UVMode - V_PRED ]`
+    selections for `angle_delta_y` / `angle_delta_uv`), §9.4 (default
+    CDF table values for `Default_Angle_Delta_Cdf`).
+  * **Coefficient-token entry CDFs** (round 136): §3 (`PLANE_TYPES`,
+    `COEFF_CDF_Q_CTXS`, `TXB_SKIP_CONTEXTS`, `EOB_COEF_CONTEXTS`,
+    `DC_SIGN_CONTEXTS` constant definitions), §8.3.1 `init_coeff_cdfs`
+    (the `base_q_idx` → `idx` derivation and the "set to a copy of
+    `Default_Txb_Skip_Cdf[ idx ]` / `Default_Eob_Pt_*_Cdf[ idx ]` /
+    `Default_Eob_Extra_Cdf[ idx ]` / `Default_Dc_Sign_Cdf[ idx ]`"
+    reset steps), §9.4 (default CDF table values for
+    `Default_Txb_Skip_Cdf`, `Default_Eob_Pt_{16,32,64,128,256,512,
+    1024}_Cdf`, `Default_Eob_Extra_Cdf` and `Default_Dc_Sign_Cdf`,
+    the last in the `128 * N` fixed-point form).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

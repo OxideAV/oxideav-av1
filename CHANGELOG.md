@@ -6,6 +6,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 136 — §9.4 default CDF tables + §8.3.1 `init_coeff_cdfs` /
+  §8.3.2 selection (coefficient-token entry sub-group).** Extends `cdf`
+  with the entry sub-group of the coefficient-token CDFs — the gateway
+  to tile-content decode — transcribed verbatim from §9.4: the
+  transform-block skip flag `Default_Txb_Skip_Cdf`
+  (`[COEFF_CDF_Q_CTXS][TX_SIZES][TXB_SKIP_CONTEXTS][3]`), the
+  end-of-block position classes `Default_Eob_Pt_16/32/64/128/256_Cdf`
+  (`[COEFF_CDF_Q_CTXS][PLANE_TYPES][2][N]`) plus the no-`isInter`-axis
+  `Default_Eob_Pt_512/1024_Cdf` (`[COEFF_CDF_Q_CTXS][PLANE_TYPES][N]`),
+  the binary `Default_Eob_Extra_Cdf`
+  (`[COEFF_CDF_Q_CTXS][TX_SIZES][PLANE_TYPES][EOB_COEF_CONTEXTS][3]`),
+  and the binary `Default_Dc_Sign_Cdf`
+  (`[COEFF_CDF_Q_CTXS][PLANE_TYPES][DC_SIGN_CONTEXTS][3]`, in the §9.4
+  `128 * N` fixed-point form). New §3 constants `PLANE_TYPES = 2`,
+  `COEFF_CDF_Q_CTXS = 4`, `TXB_SKIP_CONTEXTS = 13`,
+  `EOB_COEF_CONTEXTS = 9`, `DC_SIGN_CONTEXTS = 3`. Unlike the non-coeff
+  CDFs, these are reset by the separate `TileCdfContext::init_coeff_cdfs`,
+  which derives the q-context `idx` from `base_q_idx` (via the new
+  `coeff_cdf_q_ctx` helper: `<=20→0`, `<=60→1`, `<=120→2`, else `3`) and
+  copies `Default_*_Cdf[ idx ]` into the working arrays (so the working
+  copy drops the `COEFF_CDF_Q_CTXS` axis). `new_from_defaults` seeds the
+  fields from `idx 0` so the value is always well-formed. The §8.3.2
+  selection surfaces `txb_skip_cdf` / `eob_pt_{16,32,64,128,256}_cdf` /
+  `eob_pt_{512,1024}_cdf` / `eob_extra_cdf` / `dc_sign_cdf`. All new
+  types / constants re-exported at the crate root. Tests grow by 7 (cdf
+  module): §3-constant pins, table well-formedness + strict-monotonicity
+  across all q-contexts, byte-anchor spot-checks of the §9.4 values,
+  `coeff_cdf_q_ctx` boundary mapping, `init_coeff_cdfs` q-context
+  re-selection with mutate-doesn't-touch-source independence, selector
+  row-equality + out-of-range `None` returns, and end-to-end §8.2
+  `SymbolDecoder` decodes driving the `all_zero` / `eob_pt_16` /
+  `dc_sign` default CDFs. The coeff_base / coeff_base_eob / coeff_br
+  braid is deferred to a later round.
 * **Round 135 — §9.4 default CDF table + §8.3.1 / §8.3.2 selection
   (angle-delta subset).** Extends `cdf` with the angle-delta default
   table `Default_Angle_Delta_Cdf`
