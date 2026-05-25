@@ -80,15 +80,20 @@
 //!       * `Default_Inter_Tx_Type_Set3_Cdf` (`inter_tx_type`,
 //!         `TX_SET_INTER_3`, 4x4..32x32 reduced-set inter blocks)
 //!
+//!   * **Motion-mode** (round 23):
+//!       * `Default_Motion_Mode_Cdf` (`motion_mode`, keyed by
+//!         `MiSize` — a straight `BLOCK_SIZES` index, no
+//!         neighbour-context arithmetic).
+//!
 //! The remaining `Default_*_Cdf` arrays of §9.4 (the y_mode,
 //! uv_mode, angle-delta, intra transform-type (`intra_tx_type`,
 //! `Default_Intra_Tx_Type_Set{1,2}_Cdf`), coefficient,
-//! interpolation, motion-mode, … groups), the `init_coeff_cdfs`
-//! coefficient tables, and the §8.3.2 `split_or_horz` /
-//! `split_or_vert` / `intra_tx_type` / … selections are a clear
-//! followup: each is a mechanical transcription of one §9.4 table
-//! plus its §8.3.2 paragraph, slotted into the same
-//! [`TileCdfContext`] shape used here.
+//! inter-intra / compound-index / compound-type groups), the
+//! `init_coeff_cdfs` coefficient tables, and the §8.3.2
+//! `split_or_horz` / `split_or_vert` / `intra_tx_type` / …
+//! selections are a clear followup: each is a mechanical
+//! transcription of one §9.4 table plus its §8.3.2 paragraph,
+//! slotted into the same [`TileCdfContext`] shape used here.
 //!
 //! All values are transcribed directly from `docs/video/av1/av1-spec`
 //! §8.3 and §9.4 — no external source consulted.
@@ -391,6 +396,13 @@ pub const INTERP_FILTERS: usize = 3;
 /// (RefFrame[1] > INTRA_FRAME)) * 4 + ...`) ranges across
 /// `0..INTERP_FILTER_CONTEXTS`.
 pub const INTERP_FILTER_CONTEXTS: usize = 16;
+
+/// `MOTION_MODES` per §3 — number of values for `motion_mode`
+/// (`SIMPLE = 0`, `OBMC = 1`, `LOCALWARP = 2`; see §6.10.26 semantics).
+/// Drives the row width of [`DEFAULT_MOTION_MODE_CDF`]
+/// (`MOTION_MODES + 1` = three cumulative frequencies + the §8.3
+/// adaptation counter).
+pub const MOTION_MODES: usize = 3;
 
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
@@ -1236,6 +1248,49 @@ pub const DEFAULT_INTERP_FILTER_CDF: [[u16; INTERP_FILTERS + 1]; INTERP_FILTER_C
 ];
 
 // ---------------------------------------------------------------------
+// Round 23 — motion-mode group (§9.4): `Default_Motion_Mode_Cdf`. The
+// §8.3.2 selection (§7.4.x "motion_mode: the cdf is given by
+// `TileMotionModeCdf[ MiSize ]`") is a straight `BLOCK_SIZES` index —
+// no neighbour-context arithmetic. Per the §9.4 note, first-dimension
+// indices 0..=2 and 16..=17 are never reached by the §5.11.x
+// `read_motion_mode` selection (those `MiSize` values do not satisfy
+// the §5.11.x `Block_Width >= 8 && Block_Height >= 8` gate that lets
+// the syntax element appear), but the table is still transcribed
+// full-width.
+// ---------------------------------------------------------------------
+
+/// `Default_Motion_Mode_Cdf[ BLOCK_SIZES ][ MOTION_MODES + 1 ]` (§9.4).
+/// Indexed by `MiSize` per the §8.3.2 selection; the innermost row codes
+/// the `motion_mode ∈ { SIMPLE, OBMC, LOCALWARP }` symbol (`MOTION_MODES
+/// = 3` cumulative frequencies plus the §8.3 adaptation counter that
+/// starts at 0). Rows 0..=2 and 16..=17 are spec-flagged as unreachable
+/// — see the §9.4 note quoted in the group banner above.
+pub const DEFAULT_MOTION_MODE_CDF: [[u16; MOTION_MODES + 1]; BLOCK_SIZES] = [
+    [10923, 21845, 32768, 0],
+    [10923, 21845, 32768, 0],
+    [10923, 21845, 32768, 0],
+    [7651, 24760, 32768, 0],
+    [4738, 24765, 32768, 0],
+    [5391, 25528, 32768, 0],
+    [19419, 26810, 32768, 0],
+    [5123, 23606, 32768, 0],
+    [11606, 24308, 32768, 0],
+    [26260, 29116, 32768, 0],
+    [20360, 28062, 32768, 0],
+    [21679, 26830, 32768, 0],
+    [29516, 30701, 32768, 0],
+    [28898, 30397, 32768, 0],
+    [30878, 31335, 32768, 0],
+    [32507, 32558, 32768, 0],
+    [10923, 21845, 32768, 0],
+    [10923, 21845, 32768, 0],
+    [28799, 31390, 32768, 0],
+    [26431, 30774, 32768, 0],
+    [28973, 31594, 32768, 0],
+    [29742, 31203, 32768, 0],
+];
+
+// ---------------------------------------------------------------------
 // §8.3.1 init-from-defaults: the per-tile working CDF set.
 // ---------------------------------------------------------------------
 
@@ -1423,6 +1478,14 @@ pub struct TileCdfContext {
     /// `TileInterpFilterCdf[ INTERP_FILTER_CONTEXTS ]` (§8.3.1). Codes
     /// `interp_filter` (the switchable-filter selection).
     pub interp_filter: [[u16; INTERP_FILTERS + 1]; INTERP_FILTER_CONTEXTS],
+
+    // -----------------------------------------------------------------
+    // Round 23 — motion-mode group. §8.3.1 enumerates as
+    // "`MotionModeCdf` is set to a copy of `Default_Motion_Mode_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileMotionModeCdf[ BLOCK_SIZES ]` (§8.3.1). Codes `motion_mode`
+    /// (§5.11.x `read_motion_mode`), selected by `MiSize`.
+    pub motion_mode: [[u16; MOTION_MODES + 1]; BLOCK_SIZES],
 }
 
 impl TileCdfContext {
@@ -1519,6 +1582,9 @@ impl TileCdfContext {
 
             // Round 22 — inter-frame interpolation-filter group.
             interp_filter: DEFAULT_INTERP_FILTER_CDF,
+
+            // Round 23 — motion-mode group.
+            motion_mode: DEFAULT_MOTION_MODE_CDF,
         }
     }
 
@@ -1916,6 +1982,25 @@ impl TileCdfContext {
     pub fn interp_filter_cdf(&mut self, ctx: usize) -> Option<&mut [u16]> {
         if ctx < INTERP_FILTER_CONTEXTS {
             Some(&mut self.interp_filter[ctx])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `motion_mode`: the cdf is `TileMotionModeCdf[ MiSize ]`,
+    /// a straight `0..BLOCK_SIZES` index — no neighbour-context
+    /// arithmetic. Returns `None` if `mi_size >= BLOCK_SIZES` (a caller
+    /// bug — the §3 enumeration bounds `MiSize`).
+    ///
+    /// Per the §9.4 note on `Default_Motion_Mode_Cdf`, `MiSize` indices
+    /// `0..=2` and `16..=17` are never reached by the §5.11.x
+    /// `read_motion_mode` selection (the §5.11.x gate
+    /// `Block_Width >= 8 && Block_Height >= 8` excludes those block
+    /// sizes), but the selector still returns the in-table row so the
+    /// behaviour is purely indexical.
+    pub fn motion_mode_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
+        if mi_size < BLOCK_SIZES {
+            Some(&mut self.motion_mode[mi_size])
         } else {
             None
         }
@@ -3996,5 +4081,116 @@ mod tests {
             "read_symbol must adapt the working CDF"
         );
         assert_eq!(DEFAULT_INTERP_FILTER_CDF[2], [422, 2938, 32768, 0]);
+    }
+
+    // Round 23 — motion-mode group tests.
+
+    /// §8.3.1 / §9.4: the `Default_Motion_Mode_Cdf` table is
+    /// well-formed. Outer dim matches `BLOCK_SIZES`; each row is
+    /// `[MOTION_MODES + 1]` (3 cumulative frequencies + adaptation
+    /// counter); the second-to-last entry is `1 << 15` and the last is
+    /// 0.
+    #[test]
+    fn motion_mode_default_table_well_formed() {
+        assert_eq!(DEFAULT_MOTION_MODE_CDF.len(), BLOCK_SIZES);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[0].len(), MOTION_MODES + 1);
+        // §3 constant pinned: SIMPLE/OBMC/LOCALWARP ⇒ 3 motion modes.
+        assert_eq!(MOTION_MODES, 3);
+        let check = |row: &[u16]| {
+            let n = row.len() - 1;
+            assert_eq!(row[n - 1], 1 << 15, "cdf[N-1] must be 32768");
+            assert_eq!(row[n], 0, "fresh adaptation counter must be 0");
+        };
+        for r in &DEFAULT_MOTION_MODE_CDF {
+            check(r);
+        }
+    }
+
+    /// Spot-check the §9.4 `Default_Motion_Mode_Cdf` values byte-for-byte.
+    /// A mis-keyed digit during transcription breaks the equality.
+    #[test]
+    fn motion_mode_default_byte_exact_values() {
+        // Rows 0..=2: the spec-flagged-unreachable rows initialise to
+        // the flat `{ 10923, 21845, 32768, 0 }` — three roughly equal
+        // buckets (≈ 10923 = 32768/3).
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[0], [10923, 21845, 32768, 0]);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[1], [10923, 21845, 32768, 0]);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[2], [10923, 21845, 32768, 0]);
+        // Row 3: { 7651, 24760, 32768, 0 } — first reachable row.
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[3][0], 7651);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[3][1], 24760);
+        // Row 9: { 26260, 29116, 32768, 0 } — strong-SIMPLE bias anchor.
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[9][0], 26260);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[9][1], 29116);
+        // Row 15: { 32507, 32558, 32768, 0 } — heaviest SIMPLE bias.
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[15][0], 32507);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[15][1], 32558);
+        // Rows 16..=17: spec-unreachable, flat-init.
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[16], [10923, 21845, 32768, 0]);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[17], [10923, 21845, 32768, 0]);
+        // Row 21: { 29742, 31203, 32768, 0 } — last row anchor.
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[21][0], 29742);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[21][1], 31203);
+    }
+
+    /// §8.3.1: a fresh context copies the motion-mode default in (the
+    /// §9.4 source is not aliased).
+    #[test]
+    fn motion_mode_init_from_defaults_copies_table() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.motion_mode, DEFAULT_MOTION_MODE_CDF);
+
+        // Working-copy independence: mutating the context must not
+        // touch the §9.4 source.
+        ctx.motion_mode_cdf(3).unwrap()[0] = 12345;
+        assert_ne!(ctx.motion_mode[3][0], DEFAULT_MOTION_MODE_CDF[3][0]);
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[3][0], 7651);
+    }
+
+    /// §8.3.2 `motion_mode` selector returns the right §9.4 row for
+    /// every `MiSize`, with row length matching the spec
+    /// (`MOTION_MODES + 1`).
+    #[test]
+    fn motion_mode_selector_returns_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        for (i, want) in DEFAULT_MOTION_MODE_CDF.iter().enumerate() {
+            let row = ctx.motion_mode_cdf(i).unwrap();
+            assert_eq!(row.len(), MOTION_MODES + 1);
+            assert_eq!(row, want);
+        }
+        // Out-of-range `MiSize` returns None.
+        assert!(ctx.motion_mode_cdf(BLOCK_SIZES).is_none());
+        assert!(ctx.motion_mode_cdf(BLOCK_SIZES + 7).is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a
+    /// `motion_mode` default CDF selected by the §8.3.2 selection
+    /// (`MiSize = 15`, the heaviest-SIMPLE-bias row), confirming the
+    /// chosen row matches the §9.4 source, the decode lands in range
+    /// and the working copy adapts.
+    #[test]
+    fn decode_motion_mode_through_default_cdf() {
+        // Default_Motion_Mode_Cdf[15] = { 32507, 32558, 32768, 0 } —
+        // very strong SIMPLE bias. Drive the decoder with a typical
+        // start-of-tile window and assert the working copy mutates and
+        // the §9.4 source stays put.
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.motion_mode;
+
+        let row = tile_ctx.motion_mode_cdf(15).unwrap();
+        assert_eq!(row, &DEFAULT_MOTION_MODE_CDF[15]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            (sym as usize) < MOTION_MODES,
+            "motion_mode must code a symbol in 0..MOTION_MODES"
+        );
+
+        assert_ne!(
+            tile_ctx.motion_mode, before,
+            "read_symbol must adapt the working CDF"
+        );
+        assert_eq!(DEFAULT_MOTION_MODE_CDF[15], [32507, 32558, 32768, 0]);
     }
 }

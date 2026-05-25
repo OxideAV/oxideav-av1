@@ -6,6 +6,32 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 23 — §9.4 default CDF table + §8.3.1 / §8.3.2 selection
+  (motion-mode subset).** Extends `cdf` with the
+  `Default_Motion_Mode_Cdf` default table —
+  `[BLOCK_SIZES][MOTION_MODES + 1]` (22 block-size rows × 3 cumulative
+  frequencies + adaptation counter), transcribed verbatim from §9.4
+  (including the spec-flagged-unreachable rows 0..=2 and 16..=17 which
+  initialise to the flat `{ 10923, 21845, 32768, 0 }` placeholder).
+  New §3 constant `MOTION_MODES = 3` (per §6.10.26 semantics:
+  `SIMPLE = 0`, `OBMC = 1`, `LOCALWARP = 2`). New `TileCdfContext`
+  field `motion_mode`, initialised by `TileCdfContext::new_from_defaults`
+  per §8.3.1 ("`MotionModeCdf` is set to a copy of
+  `Default_Motion_Mode_Cdf`"). One §8.3.2 selection accessor lands —
+  `motion_mode_cdf(mi_size)` — a straight `0..BLOCK_SIZES` index (the
+  spec's §8.3.2 selection text reads "`TileMotionModeCdf[ MiSize ]`";
+  no neighbour-context arithmetic). Bounds-check returns `None` for
+  `mi_size >= BLOCK_SIZES`. All new types / constants re-exported at
+  the crate root. Tests grow from 211 to 216 (cdf module): table
+  well-formedness against §3 constants, byte-anchor spot-checks of the
+  §9.4 row values (rows 0/1/2/3/9/15/16/17/21 covering both the
+  spec-flagged-unreachable placeholders and the heaviest-bias rows),
+  §8.3.1 init-copy independence with mutate-doesn't-touch-source
+  assertion, selector row-equality for every `MiSize` plus
+  out-of-range `None` returns, and one end-to-end §8.2 `SymbolDecoder`
+  decode driving the `Default_Motion_Mode_Cdf[15]` row selected by
+  the new helper.
+
 * **Round 22 — §9.4 default CDF table + §8.3.1 / §8.3.2 selection
   (inter-frame interpolation-filter subset).** Extends `cdf` with the
   `Default_Interp_Filter_Cdf` default table —

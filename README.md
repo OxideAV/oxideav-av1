@@ -741,11 +741,16 @@ and `txfm_split` over `Default_Txfm_Split_Cdf`) plus the §8.3.2
 `Default_Interp_Filter_Cdf` — 16 contexts × 3 cumulative
 frequencies) plus the §8.3.2 four-branch `interp_filter_ctx`
 formula (the `((dir & 1) * 2 + (RefFrame[1] > INTRA_FRAME)) * 4`
-base plus the leftType / aboveType / NONE-match folding).
+base plus the leftType / aboveType / NONE-match folding). Round 23
+lands the **motion-mode** subset (`motion_mode` over
+`Default_Motion_Mode_Cdf` — 22 block-size rows × 3 cumulative
+frequencies) plus its §8.3.2 selection — a straight
+`TileMotionModeCdf[ MiSize ]` index with no neighbour-context
+arithmetic; the §6.10.26 enumeration `MOTION_MODES = 3`
+(`SIMPLE` / `OBMC` / `LOCALWARP`) is added as a new §3 constant.
 The remaining §9.4 tables (y_mode, uv_mode, angle-delta, intra
 transform-type (`intra_tx_type`,
-`Default_Intra_Tx_Type_Set{1,2}_Cdf`), motion-mode
-(`Default_Motion_Mode_Cdf` keyed by `BLOCK_SIZES`),
+`Default_Intra_Tx_Type_Set{1,2}_Cdf`),
 inter-intra / compound-index / compound-type
 (`Default_Interintra_Cdf`, `Default_Compound_Idx_Cdf`,
 `Default_Comp_Group_Idx_Cdf`, `Default_Compound_Type_Cdf`),
@@ -1013,6 +1018,17 @@ other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
     `leftType` / `aboveType` / `3` into the ctx total; the
     `interp_filter: TileInterpFilterCdf[ ctx ]` selection), §9.4
     (default CDF table values for `Default_Interp_Filter_Cdf`).
+  * Round 23: §3 (constants — `MOTION_MODES = 3`), §6.10.26
+    (`motion_mode` semantics — `SIMPLE = 0`, `OBMC = 1`,
+    `LOCALWARP = 2`), §8.3.1 (the "set equal to a copy of
+    `Default_Motion_Mode_Cdf`" init step for `MotionModeCdf`),
+    §8.3.2 (the `motion_mode: TileMotionModeCdf[ MiSize ]` selection
+    — a straight `0..BLOCK_SIZES` index with no neighbour-context
+    arithmetic), §9.4 (default CDF table values for
+    `Default_Motion_Mode_Cdf` including the §9.4 note that
+    first-dimension indices `0..=2` and `16..=17` are never reached
+    by the §5.11.x `read_motion_mode` selection but are still
+    transcribed full-width).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
