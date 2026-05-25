@@ -6,6 +6,47 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 139 — §9.4 default CDF table + §8.3.1 `init_coeff_cdfs` /
+  §8.3.2 selection (`coeff_base` sub-group).** Lands the second
+  member of the `coeff_base` / `coeff_base_eob` / `coeff_br` braid,
+  the larger sibling of r138's `coeff_base_eob` table. Extends
+  `cdf` with `Default_Coeff_Base_Cdf`
+  (`[COEFF_CDF_Q_CTXS][TX_SIZES][PLANE_TYPES][SIG_COEF_CONTEXTS][5]`,
+  1680 5-entry rows = 16800 bytes; declared `static` rather than
+  `const` so `clippy::large_const_arrays` does not flag the per-use
+  copy hazard) transcribed verbatim from §9.4. `coeff_base` codes
+  the base level of each non-EOB coefficient — a 4-symbol alphabet
+  (`0..3`), so each row carries 4 cumulative frequencies plus the
+  §8.3 adaptation counter. New §3 constant `SIG_COEF_CONTEXTS = 42`
+  (the §3 partition tag `SIG_COEF_CONTEXTS_2D = 26` splits this
+  range between the two-dimensional scan prefix and the 1D
+  horizontal- / vertical-only tails, used by the not-yet-implemented
+  `get_coeff_base_ctx()` lookup). The §8.3.1 `init_coeff_cdfs`
+  grows a `self.coeff_base = DEFAULT_COEFF_BASE_CDF[idx]` copy on
+  the `base_q_idx`-derived `idx`; `TileCdfContext::new_from_defaults`
+  seeds the field from `idx == 0` so the value is always well-formed.
+  The §8.3.2 selection surfaces `coeff_base_cdf(tx_sz_ctx, ptype,
+  ctx)`, the three-way `TileCoeffBaseCdf[ txSzCtx ][ ptype ][ ctx ]`
+  lookup (the `get_coeff_base_ctx()` derivation itself belongs to
+  the not-yet-implemented tile-content walk and is deferred). Just
+  as in r138, the largest `(TX_SIZE = TX_64X64, ptype = chroma)`
+  slice is the flat `{8192, 16384, 24576, 32768, 0}` placeholder
+  for every q-context and ctx value — an unreachable-chroma
+  sentinel — locked down by an exhaustive byte-equality test. The
+  last remaining table of the braid (`Default_Coeff_Br_Cdf`) is
+  deferred to a later round. New type / constant re-exported at the
+  crate root. Tests grow by 6 (cdf module): `SIG_COEF_CONTEXTS`
+  pin; table dimension audit + strict-monotonicity / cdf-shape
+  well-formedness across all q-contexts; byte-anchor spot-checks of
+  the §9.4 values (luma + chroma first-context rows at q0 and the
+  highest TX size, a high-q-context anchor, and the exhaustive
+  `(tx=4, pt=1)` flat-placeholder lock-down across every q-context
+  and ctx value); `init_coeff_cdfs` q-context re-selection for the
+  new field with mutate-doesn't-touch-source independence; selector
+  in-range coverage at the §3 `SIG_COEF_CONTEXTS_2D` split point
+  and at the highest in-range context, with per-axis out-of-range
+  `None` returns; one end-to-end §8.2 `SymbolDecoder` decode
+  driving the 4-symbol `TileCoeffBaseCdf[ 0 ][ 0 ][ 0 ]` row.
 * **Round 138 — §9.4 default CDF table + §8.3.1 `init_coeff_cdfs` /
   §8.3.2 selection (`coeff_base_eob` sub-group).** Lands the first
   member of the `coeff_base` / `coeff_base_eob` / `coeff_br` braid,

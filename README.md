@@ -876,12 +876,32 @@ belongs to the not-yet-implemented tile-content walk and is
 deferred along with `Default_Coeff_Base_Cdf` and
 `Default_Coeff_Br_Cdf`; the §3 constant `SIG_COEF_CONTEXTS_EOB = 4`
 is added.
+Round 139 lands the second member of the braid — the **`coeff_base`
+sub-group** — by adding `Default_Coeff_Base_Cdf`
+(`[COEFF_CDF_Q_CTXS=4][TX_SIZES=5][PLANE_TYPES=2][SIG_COEF_CONTEXTS=42][5]`,
+1680 5-entry rows = 16800 bytes; declared `static` to satisfy
+`clippy::large_const_arrays`) transcribed verbatim from §9.4.
+`coeff_base` codes the base level of every non-EOB coefficient — the
+4-symbol alphabet `0..3`, so each row carries 4 cumulative
+frequencies plus the §8.3 adaptation counter. `init_coeff_cdfs`
+grows the new `self.coeff_base = DEFAULT_COEFF_BASE_CDF[ idx ]`
+copy on the `base_q_idx`-derived `idx`, and the §8.3.2 selector
+`coeff_base_cdf(tx_sz_ctx, ptype, ctx)` surfaces the
+`TileCoeffBaseCdf[ txSzCtx ][ ptype ][ ctx ]` lookup. The §3
+constant `SIG_COEF_CONTEXTS = 42` is added (the §3 partition tag
+`SIG_COEF_CONTEXTS_2D = 26` splits this range between the
+two-dimensional scan prefix and the 1D horizontal- / vertical-only
+tails). Just as in r138, the largest `(TX_SIZE = TX_64X64, ptype =
+chroma)` slice is the flat `{8192, 16384, 24576, 32768, 0}`
+placeholder for every q-context and ctx value — a sentinel for an
+unreachable chroma row at the largest TX size — and is locked down
+by an exhaustive byte-equality test.
 The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
-the rest of the `init_coeff_cdfs` coefficient set
-(`Default_Coeff_Base_Cdf` / `Default_Coeff_Br_Cdf`), and the other
-§8.3.2 selections (`split_or_horz` / `split_or_vert` / …) are a
-mechanical followup against the same `TileCdfContext` shape.
-`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
+the last member of the `init_coeff_cdfs` coefficient set
+(`Default_Coeff_Br_Cdf`), and the other §8.3.2 selections
+(`split_or_horz` / `split_or_vert` / …) are a mechanical followup
+against the same `TileCdfContext` shape. `decode_av1` and
+`encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
