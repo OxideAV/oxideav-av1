@@ -6,6 +6,45 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 148 — §9.3 block-size conversion tables.** Stages the four
+  `BLOCK_SIZES`-indexed lookup tables that convert a `MiSize` into
+  block dimensions (av1-spec p.400–401): [`MI_WIDTH_LOG2`],
+  [`MI_HEIGHT_LOG2`], [`NUM_4X4_BLOCKS_WIDE`], [`NUM_4X4_BLOCKS_HIGH`],
+  each transcribed verbatim with the spec ordering — the 16 entries
+  for `BLOCK_4X4`..`BLOCK_128X128` followed by the seven `1:4` / `4:1`
+  aspect-ratio entries (`BLOCK_4X16` .. `BLOCK_64X16`). Also adds the
+  §3 constants [`MI_SIZE`] (`4`) and [`MI_SIZE_LOG2`] (`2`) that the
+  §9.3 spec definitions reference (`Block_Width[ x ] = 4 *
+  Num_4x4_Blocks_Wide[ x ]` is encoded as `NUM_4X4_BLOCKS_WIDE[ x ] <<
+  MI_SIZE_LOG2` so the spec identity is not duplicated as a numeric
+  table). Six new `MiSize`-keyed accessors round-out the surface:
+  [`block_width`], [`block_height`], [`num_4x4_blocks_wide`],
+  [`num_4x4_blocks_high`], [`mi_width_log2`], [`mi_height_log2`]; each
+  is `const fn` with a `debug_assert!(mi_size < BLOCK_SIZES)` bound.
+  These feed the §5.11.49 [`palette_tokens_plane`] caller (block_w /
+  block_h derivation) staged in r147, and unblock the wider §5.x
+  reconstruction call sites (`bw4 = Num_4x4_Blocks_Wide[ MiSize ]`)
+  that the parser will surface once `read_block` is wired. Tests grow
+  by 10 (cdf module): the four §9.3 tables pinned byte-for-byte at
+  the expected `BLOCK_SIZES = 22` length; the §3 `MI_SIZE == 1 <<
+  MI_SIZE_LOG2` identity; the `Num_4x4_Blocks_{Wide,High} == 1 <<
+  Mi_{Width,Height}_Log2` identity per the §9.3 derivation; the
+  `Block_{Width,Height} = 4 * Num_4x4_Blocks_{Wide,High}` identity
+  for every `MiSize` with the canonical 22-entry expected vectors
+  (4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 4,
+  16, 8, 32, 16, 64 for widths; 4, 8, 4, 8, 16, 8, 16, 32, 16, 32,
+  64, 32, 64, 128, 64, 128, 16, 4, 32, 8, 64, 16 for heights); the
+  square diagonal `BLOCK_4X4` .. `BLOCK_128X128` resolving to the
+  expected `n×n` luma sizes; the §5.11.46 `bsizeCtx =
+  Mi_Width_Log2[ MiSize ] + Mi_Height_Log2[ MiSize ] - 2` derivation
+  staying inside `0..PALETTE_BLOCK_SIZE_CONTEXTS` for every `MiSize`
+  inside the §5.11.46 palette syntax gate (`MiSize >= BLOCK_8X8 &&
+  Block_Width <= 64 && Block_Height <= 64`); and a §5.11.49 caller
+  data-flow pin confirming `block_width(mi_size)` /
+  `block_height(mi_size)` are inside `8..=64` at the palette-minimum
+  (`BLOCK_8X8`) and palette-maximum (`BLOCK_64X64`) `MiSize` values
+  the §5.11.46 gate admits. Tests: 334 -> 344, zero `#[ignore]`.
+
 * **Round 147 — §5.11.49 `palette_tokens` per-plane diagonal walker.**
   Lands the §5.11.49 palette-tokens walker (p.101–102) that drives the
   decoded `ColorMap{Y,UV}` from the `SymbolDecoder`-emitted

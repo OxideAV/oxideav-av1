@@ -739,6 +739,24 @@
 //!     unreachable hash slots ([`Error::PaletteColorContextUnmapped`]).
 //!     323 -> 334 tests, zero `#[ignore]`.
 //!
+//!   * **Round 148.** The §9.3 block-size conversion tables
+//!     (av1-spec p.400–401) — four `BLOCK_SIZES`-indexed lookup
+//!     tables that turn a `MiSize` into block dimensions:
+//!     [`MI_WIDTH_LOG2`], [`MI_HEIGHT_LOG2`], [`NUM_4X4_BLOCKS_WIDE`],
+//!     [`NUM_4X4_BLOCKS_HIGH`], plus the §3 constants
+//!     [`MI_SIZE`] (`4`) and [`MI_SIZE_LOG2`] (`2`). Surface: the
+//!     four tables plus the six `MiSize`-keyed `const fn` accessors
+//!     [`block_width`], [`block_height`], [`num_4x4_blocks_wide`],
+//!     [`num_4x4_blocks_high`], [`mi_width_log2`],
+//!     [`mi_height_log2`]. The `Block_Width[ x ] = 4 *
+//!     Num_4x4_Blocks_Wide[ x ]` spec identity is encoded as the
+//!     `NUM_4X4_BLOCKS_WIDE[ x ] << MI_SIZE_LOG2` shift so the
+//!     identity is not duplicated as a numeric table. These feed the
+//!     §5.11.49 [`palette_tokens_plane`] caller staged in r147 and
+//!     unblock the wider §5.x reconstruction call sites that the
+//!     parser will surface once `read_block` is wired. 334 -> 344
+//!     tests, zero `#[ignore]`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -760,10 +778,11 @@ pub mod tile_info;
 pub mod uncompressed_header_tail;
 
 pub use cdf::{
-    cfl_alpha_u_ctx, cfl_alpha_v_ctx, coeff_cdf_q_ctx, compound_mode_ctx, compute_tx_type,
-    get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, get_palette_color_context,
-    get_tx_class, inter_tx_type_set, interintra_ctx, interp_filter_ctx, intra_dir, intra_mode_ctx,
-    intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mv_ctx,
+    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, coeff_cdf_q_ctx,
+    compound_mode_ctx, compute_tx_type, get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx,
+    get_palette_color_context, get_tx_class, inter_tx_type_set, interintra_ctx, interp_filter_ctx,
+    intra_dir, intra_mode_ctx, intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mi_height_log2,
+    mi_width_log2, mv_ctx, num_4x4_blocks_high, num_4x4_blocks_wide,
     palette_color_context_from_neighbors, palette_color_ctx, palette_tokens_plane,
     palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx, ref_count_ctx, segment_id_ctx,
     size_group, skip_ctx, skip_mode_ctx, split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx,
@@ -809,9 +828,10 @@ pub use cdf::{
     INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES, INTRA_FILTER_MODES, INTRA_MODES,
     INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, INTRA_TX_TYPE_SET1_SIZES, INTRA_TX_TYPE_SET2_SIZES,
     IS_INTER_CONTEXTS, LEVEL_CONTEXTS, MAG_REF_OFFSET_WITH_TX_CLASS, MAX_ANGLE_DELTA, MAX_TX_DEPTH,
-    MODE_TO_TXFM, MOTION_MODES, MV_CLASSES, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS,
-    MV_OFFSET_BITS, NEW_MV_CONTEXTS, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS,
-    PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
+    MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_TO_TXFM, MOTION_MODES, MV_CLASSES,
+    MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS,
+    PALETTE_COLORS, PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
     PALETTE_MAX_COLOR_CONTEXT_HASH, PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS,
     PALETTE_Y_MODE_CONTEXTS, PARTITION_CONTEXTS, PARTITION_HORZ, PARTITION_HORZ_4,
     PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT,

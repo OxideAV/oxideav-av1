@@ -1110,6 +1110,37 @@ chroma-subsampled UV / Y shape parity, the `ColorOrder[idx]` remap on
 the 2x2 edge positions, the degenerate 1-wide-block shape, and
 `read_symbol` underflow propagating as `UnexpectedEnd` (not as a
 walker-side caller-bug variant).
+Round 148 stages the §9.3 **block-size conversion tables** (av1-spec
+p.400–401) that the §5.11.49 caller needs to derive `block_w` / `block_h`
+from a `MiSize`. The four `BLOCK_SIZES`-indexed lookup tables
+(`MI_WIDTH_LOG2`, `MI_HEIGHT_LOG2`, `NUM_4X4_BLOCKS_WIDE`,
+`NUM_4X4_BLOCKS_HIGH`) are transcribed verbatim with the spec
+ordering (16 square/rectangular entries `BLOCK_4X4` ..
+`BLOCK_128X128` followed by the seven `1:4` / `4:1` aspect-ratio
+entries `BLOCK_4X16` .. `BLOCK_64X16`). The §3 constants `MI_SIZE = 4`
+and `MI_SIZE_LOG2 = 2` land alongside them so the §9.3
+`Block_Width[ x ] = 4 * Num_4x4_Blocks_Wide[ x ]` identity is encoded
+as `NUM_4X4_BLOCKS_WIDE[ x ] << MI_SIZE_LOG2` rather than duplicated
+as a numeric table. Six new `MiSize`-keyed accessors round-out the
+surface: `block_width`, `block_height`, `num_4x4_blocks_wide`,
+`num_4x4_blocks_high`, `mi_width_log2`, `mi_height_log2` — each a
+`const fn` with a `debug_assert!(mi_size < BLOCK_SIZES)` bound. These
+feed the §5.11.49 `palette_tokens_plane` caller staged in r147 and
+unblock the wider §5.x reconstruction call sites (`bw4 =
+Num_4x4_Blocks_Wide[ MiSize ]`) the parser will surface once
+`read_block` is wired. 10 new unit tests (334 -> 344) cover the four
+§9.3 tables pinned byte-for-byte at `BLOCK_SIZES = 22`, the §3
+`MI_SIZE == 1 << MI_SIZE_LOG2` identity, the `Num_4x4_Blocks_* == 1
+<< Mi_*_Log2` identity per §9.3, the canonical 22-entry expected
+width/height vectors, the square diagonal `BLOCK_4X4` ..
+`BLOCK_128X128` resolving to `n×n` luma sizes, the §5.11.46
+`bsizeCtx` derivation staying inside `0..PALETTE_BLOCK_SIZE_CONTEXTS`
+for every `MiSize` inside the §5.11.46 palette syntax gate
+(`MiSize >= BLOCK_8X8 && Block_Width <= 64 && Block_Height <= 64`),
+and a §5.11.49 caller data-flow pin confirming `block_width(mi_size)`
+/ `block_height(mi_size)` are inside `8..=64` at the palette-minimum
+(`BLOCK_8X8`) and palette-maximum (`BLOCK_64X64`) `MiSize` values
+the gate admits.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)

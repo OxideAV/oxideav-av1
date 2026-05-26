@@ -625,6 +625,143 @@ pub const SIZE_GROUP: [usize; BLOCK_SIZES] = [
     0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2,
 ];
 
+// ---------------------------------------------------------------------
+// Round 148 — §9.3 block-size conversion tables (av1-spec p.400-401).
+// Stages the four `BLOCK_SIZES`-indexed lookup tables that convert a
+// `MiSize` into block dimensions, plus the related §3 `MI_SIZE` /
+// `MI_SIZE_LOG2` constants (p.20 enumeration). These feed the §5.11.49
+// `palette_tokens` caller (block_w / block_h derivation) landed in r147
+// and the wider §5.x reconstruction code that the parser eventually
+// surfaces (§5.11.15 `read_block` and onward).
+//
+// All four §9.3 tables are listed in the spec as a 22-entry `BLOCK_SIZES`
+// array; this round transcribes the published values verbatim and adds
+// the matching `MiSize`-keyed accessor helpers. The
+// `Block_Width[ x ] = 4 * Num_4x4_Blocks_Wide[ x ]` /
+// `Block_Height[ x ] = 4 * Num_4x4_Blocks_High[ x ]` derivations
+// (av1-spec p.401) are encoded as `block_width` / `block_height` helpers
+// that reuse the `NUM_4X4_BLOCKS_*` tables, matching the spec's
+// definition without duplicating numeric values.
+// ---------------------------------------------------------------------
+
+/// `MI_SIZE` (§3 constant table, av1-spec p.20) — smallest size of a
+/// mode-info block in luma samples. Equal to `4`. Used in the §5.x
+/// `MiCols = (FrameWidth + MI_SIZE - 1) >> MI_SIZE_LOG2` derivation
+/// (the per-frame mode-info grid) and as the unit-conversion factor
+/// from "4-sample units" (`Num_4x4_Blocks_Wide`, `Mi_Width_Log2`) to
+/// luma samples (`Block_Width`).
+pub const MI_SIZE: usize = 4;
+
+/// `MI_SIZE_LOG2` (§3 constant table, av1-spec p.20) — base-2 logarithm
+/// of [`MI_SIZE`], i.e. `2`. Used by every `>> MI_SIZE_LOG2` /
+/// `<< MI_SIZE_LOG2` conversion between luma samples and mode-info
+/// grid units (e.g. §7.11.3.3 `row = startY >> MI_SIZE_LOG2`).
+pub const MI_SIZE_LOG2: usize = 2;
+
+/// `Mi_Width_Log2[ BLOCK_SIZES ]` (§9.3, av1-spec p.400) — base-2
+/// logarithm of the block width in units of `4` luma samples. Indexed
+/// by `MiSize`, returning a value in `0..=5`. Used by §5.11.46
+/// `bsizeCtx = Mi_Width_Log2[ MiSize ] + Mi_Height_Log2[ MiSize ] - 2`
+/// (the palette block-size context).
+pub const MI_WIDTH_LOG2: [usize; BLOCK_SIZES] = [
+    0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 0, 2, 1, 3, 2, 4,
+];
+
+/// `Mi_Height_Log2[ BLOCK_SIZES ]` (§9.3, av1-spec p.400) — base-2
+/// logarithm of the block height in units of `4` luma samples. Indexed
+/// by `MiSize`, returning a value in `0..=5`. Companion to
+/// [`MI_WIDTH_LOG2`].
+pub const MI_HEIGHT_LOG2: [usize; BLOCK_SIZES] = [
+    0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 2, 0, 3, 1, 4, 2,
+];
+
+/// `Num_4x4_Blocks_Wide[ BLOCK_SIZES ]` (§9.3, av1-spec p.400) — width
+/// of the block in units of `4` luma samples. Equal to
+/// `1 << MI_WIDTH_LOG2[ x ]` for every entry. Indexed by `MiSize`,
+/// returning a value in `1..=32`. Used by §7.5 / §7.11 reconstruction
+/// loops (`bw4 = Num_4x4_Blocks_Wide[ MiSize ]`).
+pub const NUM_4X4_BLOCKS_WIDE: [usize; BLOCK_SIZES] = [
+    1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16,
+];
+
+/// `Num_4x4_Blocks_High[ BLOCK_SIZES ]` (§9.3, av1-spec p.400) — height
+/// of the block in units of `4` luma samples. Equal to
+/// `1 << MI_HEIGHT_LOG2[ x ]` for every entry. Indexed by `MiSize`,
+/// returning a value in `1..=32`. Companion to [`NUM_4X4_BLOCKS_WIDE`].
+pub const NUM_4X4_BLOCKS_HIGH: [usize; BLOCK_SIZES] = [
+    1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4,
+];
+
+/// `Block_Width[ MiSize ]` (§9.3, av1-spec p.401) — width of a block in
+/// luma samples. Defined by the spec as
+/// `Block_Width[ x ] = 4 * Num_4x4_Blocks_Wide[ x ]`, i.e.
+/// `NUM_4X4_BLOCKS_WIDE[ mi_size ] << MI_SIZE_LOG2`. Returns a value
+/// in `4..=128`. Panics in debug builds if `mi_size >= BLOCK_SIZES`.
+///
+/// This is the per-`MiSize` driver used to seed
+/// [`palette_tokens_plane`]'s `block_w` / `onscreen_w` once the parser
+/// is wired into the §5.11.x reconstruction pass.
+#[inline]
+#[must_use]
+pub const fn block_width(mi_size: usize) -> usize {
+    debug_assert!(mi_size < BLOCK_SIZES);
+    NUM_4X4_BLOCKS_WIDE[mi_size] << MI_SIZE_LOG2
+}
+
+/// `Block_Height[ MiSize ]` (§9.3, av1-spec p.401) — height of a block
+/// in luma samples. Defined by the spec as
+/// `Block_Height[ x ] = 4 * Num_4x4_Blocks_High[ x ]`, i.e.
+/// `NUM_4X4_BLOCKS_HIGH[ mi_size ] << MI_SIZE_LOG2`. Returns a value
+/// in `4..=128`. Panics in debug builds if `mi_size >= BLOCK_SIZES`.
+///
+/// Companion to [`block_width`].
+#[inline]
+#[must_use]
+pub const fn block_height(mi_size: usize) -> usize {
+    debug_assert!(mi_size < BLOCK_SIZES);
+    NUM_4X4_BLOCKS_HIGH[mi_size] << MI_SIZE_LOG2
+}
+
+/// `Num_4x4_Blocks_Wide[ MiSize ]` (§9.3) — convenience accessor for
+/// [`NUM_4X4_BLOCKS_WIDE`]. Returns the block width in units of `4`
+/// luma samples. Panics in debug builds if `mi_size >= BLOCK_SIZES`.
+#[inline]
+#[must_use]
+pub const fn num_4x4_blocks_wide(mi_size: usize) -> usize {
+    debug_assert!(mi_size < BLOCK_SIZES);
+    NUM_4X4_BLOCKS_WIDE[mi_size]
+}
+
+/// `Num_4x4_Blocks_High[ MiSize ]` (§9.3) — convenience accessor for
+/// [`NUM_4X4_BLOCKS_HIGH`]. Returns the block height in units of `4`
+/// luma samples. Panics in debug builds if `mi_size >= BLOCK_SIZES`.
+#[inline]
+#[must_use]
+pub const fn num_4x4_blocks_high(mi_size: usize) -> usize {
+    debug_assert!(mi_size < BLOCK_SIZES);
+    NUM_4X4_BLOCKS_HIGH[mi_size]
+}
+
+/// `Mi_Width_Log2[ MiSize ]` (§9.3) — convenience accessor for
+/// [`MI_WIDTH_LOG2`]. Panics in debug builds if
+/// `mi_size >= BLOCK_SIZES`.
+#[inline]
+#[must_use]
+pub const fn mi_width_log2(mi_size: usize) -> usize {
+    debug_assert!(mi_size < BLOCK_SIZES);
+    MI_WIDTH_LOG2[mi_size]
+}
+
+/// `Mi_Height_Log2[ MiSize ]` (§9.3) — convenience accessor for
+/// [`MI_HEIGHT_LOG2`]. Panics in debug builds if
+/// `mi_size >= BLOCK_SIZES`.
+#[inline]
+#[must_use]
+pub const fn mi_height_log2(mi_size: usize) -> usize {
+    debug_assert!(mi_size < BLOCK_SIZES);
+    MI_HEIGHT_LOG2[mi_size]
+}
+
 /// `DIRECTIONAL_MODES` (§3) — number of directional intra modes, i.e. the
 /// span of `YMode` / `UVMode` values from `V_PRED` to `D67_PRED`
 /// inclusive. Drives the outer dimension of [`DEFAULT_ANGLE_DELTA_CDF`].
@@ -12285,6 +12422,196 @@ mod tests {
             let g = size_group(mi_size);
             assert!(g < BLOCK_SIZE_GROUPS, "Size_Group must index a y_mode ctx");
             assert_eq!(g, want);
+        }
+    }
+
+    /// §3 constants `MI_SIZE` / `MI_SIZE_LOG2` (av1-spec p.20) and the
+    /// `MI_SIZE == 1 << MI_SIZE_LOG2` identity that the §5.x decoder
+    /// relies on for `>> MI_SIZE_LOG2` ⇄ `* MI_SIZE` interchange.
+    #[test]
+    fn mi_size_constants_match_spec() {
+        assert_eq!(MI_SIZE, 4);
+        assert_eq!(MI_SIZE_LOG2, 2);
+        assert_eq!(MI_SIZE, 1usize << MI_SIZE_LOG2);
+    }
+
+    /// §9.3 `Mi_Width_Log2[ BLOCK_SIZES ]` (av1-spec p.400) — pinned
+    /// verbatim and confirmed full-width.
+    #[test]
+    fn mi_width_log2_table_pinned() {
+        assert_eq!(MI_WIDTH_LOG2.len(), BLOCK_SIZES);
+        assert_eq!(
+            MI_WIDTH_LOG2,
+            [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 0, 2, 1, 3, 2, 4]
+        );
+        for (mi_size, &want) in MI_WIDTH_LOG2.iter().enumerate() {
+            assert_eq!(mi_width_log2(mi_size), want);
+            // Range bound — a `0..=5` log2 is the §3 ceiling for
+            // `Block_Width <= 128` (`MI_SIZE << 5 == 128`).
+            assert!(want <= 5);
+        }
+    }
+
+    /// §9.3 `Mi_Height_Log2[ BLOCK_SIZES ]` (av1-spec p.400) — pinned
+    /// verbatim and confirmed full-width.
+    #[test]
+    fn mi_height_log2_table_pinned() {
+        assert_eq!(MI_HEIGHT_LOG2.len(), BLOCK_SIZES);
+        assert_eq!(
+            MI_HEIGHT_LOG2,
+            [0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 2, 0, 3, 1, 4, 2]
+        );
+        for (mi_size, &want) in MI_HEIGHT_LOG2.iter().enumerate() {
+            assert_eq!(mi_height_log2(mi_size), want);
+            assert!(want <= 5);
+        }
+    }
+
+    /// §9.3 `Num_4x4_Blocks_Wide[ BLOCK_SIZES ]` (av1-spec p.400) —
+    /// pinned verbatim and confirmed equal to `1 << MI_WIDTH_LOG2[ x ]`
+    /// per the §9.3 derivation.
+    #[test]
+    fn num_4x4_blocks_wide_table_pinned() {
+        assert_eq!(NUM_4X4_BLOCKS_WIDE.len(), BLOCK_SIZES);
+        assert_eq!(
+            NUM_4X4_BLOCKS_WIDE,
+            [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16]
+        );
+        for (mi_size, &want) in NUM_4X4_BLOCKS_WIDE.iter().enumerate() {
+            assert_eq!(num_4x4_blocks_wide(mi_size), want);
+            assert_eq!(
+                want,
+                1usize << MI_WIDTH_LOG2[mi_size],
+                "Num_4x4_Blocks_Wide[ x ] must equal 1 << Mi_Width_Log2[ x ] (§9.3)",
+            );
+        }
+    }
+
+    /// §9.3 `Num_4x4_Blocks_High[ BLOCK_SIZES ]` (av1-spec p.400) —
+    /// pinned verbatim and confirmed equal to `1 << MI_HEIGHT_LOG2[ x ]`
+    /// per the §9.3 derivation.
+    #[test]
+    fn num_4x4_blocks_high_table_pinned() {
+        assert_eq!(NUM_4X4_BLOCKS_HIGH.len(), BLOCK_SIZES);
+        assert_eq!(
+            NUM_4X4_BLOCKS_HIGH,
+            [1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4]
+        );
+        for (mi_size, &want) in NUM_4X4_BLOCKS_HIGH.iter().enumerate() {
+            assert_eq!(num_4x4_blocks_high(mi_size), want);
+            assert_eq!(
+                want,
+                1usize << MI_HEIGHT_LOG2[mi_size],
+                "Num_4x4_Blocks_High[ x ] must equal 1 << Mi_Height_Log2[ x ] (§9.3)",
+            );
+        }
+    }
+
+    /// §9.3 `Block_Width[ x ] = 4 * Num_4x4_Blocks_Wide[ x ]` (av1-spec
+    /// p.401). Confirms the [`block_width`] helper matches the spec
+    /// identity for every `MiSize`, and that the §3 enum's first 16
+    /// square/rectangular block sizes resolve to the canonical luma
+    /// widths (4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64,
+    /// 128, 128) plus the seven 1:4 / 4:1 aspect entries.
+    #[test]
+    fn block_width_matches_spec_identity() {
+        let expect = [
+            4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 4, 16, 8, 32, 16, 64,
+        ];
+        for mi_size in 0..BLOCK_SIZES {
+            let w = block_width(mi_size);
+            assert_eq!(w, expect[mi_size]);
+            assert_eq!(w, 4 * NUM_4X4_BLOCKS_WIDE[mi_size]);
+            assert_eq!(w, NUM_4X4_BLOCKS_WIDE[mi_size] << MI_SIZE_LOG2);
+            // §3 ceiling: `Block_Width <= 128`.
+            assert!(w <= 128);
+            assert!(w >= 4);
+        }
+    }
+
+    /// §9.3 `Block_Height[ x ] = 4 * Num_4x4_Blocks_High[ x ]` (av1-spec
+    /// p.401). Companion to [`block_width_matches_spec_identity`].
+    #[test]
+    fn block_height_matches_spec_identity() {
+        let expect = [
+            4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 64, 32, 64, 128, 64, 128, 16, 4, 32, 8, 64, 16,
+        ];
+        for mi_size in 0..BLOCK_SIZES {
+            let h = block_height(mi_size);
+            assert_eq!(h, expect[mi_size]);
+            assert_eq!(h, 4 * NUM_4X4_BLOCKS_HIGH[mi_size]);
+            assert_eq!(h, NUM_4X4_BLOCKS_HIGH[mi_size] << MI_SIZE_LOG2);
+            assert!(h <= 128);
+            assert!(h >= 4);
+        }
+    }
+
+    /// §3 `BLOCK_4X4 = 0`, `BLOCK_8X8 = 3`, `BLOCK_16X16 = 6`,
+    /// `BLOCK_32X32 = 9`, `BLOCK_64X64 = 12`, `BLOCK_128X128 = 15` —
+    /// spot-check the square diagonal of the §9.3 tables resolves to the
+    /// expected `n×n` luma dimensions. (The full enum ordering is
+    /// transcribed in `block_{width,height}_matches_spec_identity`.)
+    #[test]
+    fn square_diagonal_resolves_n_times_n() {
+        for (mi_size, n) in [(0, 4), (3, 8), (6, 16), (9, 32), (12, 64), (15, 128)] {
+            assert_eq!(block_width(mi_size), n);
+            assert_eq!(block_height(mi_size), n);
+            assert_eq!(num_4x4_blocks_wide(mi_size), n / MI_SIZE);
+            assert_eq!(num_4x4_blocks_high(mi_size), n / MI_SIZE);
+        }
+    }
+
+    /// §5.11.46 `bsizeCtx = Mi_Width_Log2[ MiSize ] +
+    /// Mi_Height_Log2[ MiSize ] - 2` — confirm the new §9.3 tables
+    /// reproduce the palette block-size context for every `MiSize`
+    /// inside the palette syntax gate. The §5.11.46 gate restricts
+    /// palette blocks to `MiSize >= BLOCK_8X8` and `Block_Width <= 64
+    /// && Block_Height <= 64` (av1-spec lines around the
+    /// `Block_Width[ MiSize ] <= 64` checks at p.93). Within that
+    /// window `bsizeCtx` is in `0..PALETTE_BLOCK_SIZE_CONTEXTS`.
+    #[test]
+    fn bsize_ctx_derivation_matches_palette_helper() {
+        for mi_size in 0..BLOCK_SIZES {
+            let bw = block_width(mi_size);
+            let bh = block_height(mi_size);
+            // §5.11.46 gate: square/rectangular blocks 8..=64 only.
+            if bw < 8 || bh < 8 || bw > 64 || bh > 64 {
+                continue;
+            }
+            let lw = mi_width_log2(mi_size);
+            let lh = mi_height_log2(mi_size);
+            assert!(lw + lh >= 2);
+            let bsize_ctx = lw + lh - 2;
+            assert!(
+                bsize_ctx < PALETTE_BLOCK_SIZE_CONTEXTS,
+                "MiSize {mi_size} ({bw}x{bh}) bsize_ctx {bsize_ctx} out of range",
+            );
+        }
+    }
+
+    /// §5.11.49 caller-side derivation: a `MiSize` directly drives the
+    /// `blockWidth` / `blockHeight` arguments that
+    /// [`palette_tokens_plane`] consumes. This pins the §9.3-table →
+    /// `palette_tokens_plane` data flow for the §5.11.49 caller wiring
+    /// targeted by the next implementer round.
+    #[test]
+    fn palette_tokens_args_from_mi_size_pins_data_flow() {
+        // BLOCK_8X8 (palette minimum, §5.11.46) and BLOCK_64X64
+        // (palette maximum, §5.11.46 — block_w/h <= 64).
+        for mi_size in [3usize, 12] {
+            let block_w = block_width(mi_size);
+            let block_h = block_height(mi_size);
+            assert!((8..=64).contains(&block_w));
+            assert!((8..=64).contains(&block_h));
+            // Stride at least matches block_w (caller-bug precondition in
+            // §5.11.49 `palette_tokens_plane` is `stride >= block_w`).
+            let stride = block_w;
+            let mut color_map = vec![0u8; stride * block_h];
+            // Seed (0,0) only — the rest is filled by the walker once the
+            // SymbolDecoder is wired. We're testing data-flow only, not
+            // decoding.
+            color_map[0] = 0;
+            assert_eq!(color_map.len(), stride * block_h);
         }
     }
 
