@@ -955,7 +955,7 @@ the `TX_CLASS_{2D,HORIZ,VERT}` tags, the `Adjusted_Tx_Size` /
 `Coeff_Base_Ctx_Offset` / `Coeff_Base_Pos_Ctx_Offset` tables, all
 transcribed verbatim from the spec; a pure `get_tx_class()` helper
 reduces the directional transform-type flags to a class. 12 new unit
-tests (270 -> 282) pin each branch with hand-computed `ctx` values.
+tests (266 -> 278) pin each branch with hand-computed `ctx` values.
 The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
 and the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
 …) are a mechanical followup against the same `TileCdfContext`
@@ -1324,6 +1324,35 @@ shape. `decode_av1` and `encode_av1` still return
     ctx ]` selection with the `TX_32X32 = 3` clamp, plus the
     deferred-to-tile-walk `ctx = get_br_ctx(...)` derivation),
     §9.4 (default CDF table values for `Default_Coeff_Br_Cdf`).
+  * **`get_coeff_base_ctx` / `get_br_ctx` helpers** (round 141):
+    §3 (`TX_SIZES_ALL = 19`, `SIG_COEF_CONTEXTS_2D = 26`,
+    `SIG_REF_DIFF_OFFSET_NUM = 5`, `NUM_BASE_LEVELS = 2`,
+    `COEFF_BASE_RANGE = 12`, `TX_CLASS_{2D, HORIZ, VERT}` tag
+    enumeration with values `{ 0, 1, 2 }`, and the `V_DCT = 10`,
+    `H_DCT = 11`, `V_ADST = 12`, `H_ADST = 13`, `V_FLIPADST = 14`,
+    `H_FLIPADST = 15` transform-type enumeration used by
+    `get_tx_class`), §8.3.2 (the `get_coeff_base_ctx()` and
+    `get_br_ctx()` function bodies — `isEob` branch with the
+    `(height << bwl) / 8` / `/ 4` boundaries, the
+    `Sig_Ref_Diff_Offset` neighbour scan with the
+    `Min(Abs(Quant[..]), 3)` per-neighbour clamp, the 2D
+    `row == 0 && col == 0 -> 0` short-circuit, the
+    `Coeff_Base_Ctx_Offset[txSz][Min(row, 4)][Min(col, 4)]` 2D
+    offset, the `Coeff_Base_Pos_Ctx_Offset[Min(idx, 2)]` 1D
+    branch, the `Mag_Ref_Offset_With_Tx_Class` three-neighbour
+    scan with the `Min(Quant[..], COEFF_BASE_RANGE + NUM_BASE_LEVELS
+    + 1)` clamp, the `Min((mag + 1) >> 1, 6)` magnitude bucket,
+    the `pos == 0` short-circuit, and the per-class `+7` /
+    `+14` offsets — plus the `get_tx_class()` function body and
+    the `coeff_base_eob` `ctx = get_coeff_base_ctx(.., 1) -
+    SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB` reduction),
+    §"Additional tables" (`Tx_Width[TX_SIZES_ALL]`,
+    `Tx_Height[TX_SIZES_ALL]`, `Tx_Width_Log2[TX_SIZES_ALL]`,
+    `Adjusted_Tx_Size[TX_SIZES_ALL]`,
+    `Sig_Ref_Diff_Offset[3][SIG_REF_DIFF_OFFSET_NUM][2]`,
+    `Coeff_Base_Ctx_Offset[TX_SIZES_ALL][5][5]`,
+    `Coeff_Base_Pos_Ctx_Offset[3]`,
+    `Mag_Ref_Offset_With_Tx_Class[3][3][2]`).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

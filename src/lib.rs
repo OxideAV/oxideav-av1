@@ -579,6 +579,33 @@
 //!     helpers (deferred to a different round — they need
 //!     tile-content walker state).
 //!
+//!   * **Round 141.** The §8.3.2 neighbour-derivation helpers that
+//!     close out the coefficient-CDF braid: [`get_coeff_base_ctx`]
+//!     and [`get_br_ctx`] (plus the [`get_coeff_base_eob_ctx`]
+//!     wrapper that subtracts `SIG_COEF_CONTEXTS` and adds
+//!     `SIG_COEF_CONTEXTS_EOB` to land on the EOB-CDF context
+//!     range). Each consumes a coefficient-magnitude array `Quant[]`
+//!     (laid out row-major with stride `Tx_Width[ adjTxSz ]`) plus
+//!     the position-in-scan + tx-class + tx-size and returns the
+//!     `ctx` index consumed by the matching `coeff_base_eob_cdf` /
+//!     `coeff_base_cdf` / `coeff_br_cdf` selector. [`get_tx_class`]
+//!     performs the §8.3.2 `TxType -> TxClass` reduction
+//!     (`V_DCT` / `V_ADST` / `V_FLIPADST` -> [`TX_CLASS_VERT`],
+//!     `H_DCT` / `H_ADST` / `H_FLIPADST` -> [`TX_CLASS_HORIZ`],
+//!     everything else -> [`TX_CLASS_2D`]). New §3 constants
+//!     [`TX_SIZES_ALL`] (`= 19`), [`SIG_COEF_CONTEXTS_2D`] (`= 26`),
+//!     [`SIG_REF_DIFF_OFFSET_NUM`] (`= 5`), [`NUM_BASE_LEVELS`]
+//!     (`= 2`), [`COEFF_BASE_RANGE`] (`= 12`), [`TX_CLASS_2D`],
+//!     [`TX_CLASS_HORIZ`], [`TX_CLASS_VERT`]. New §-Additional-
+//!     tables transcriptions [`TX_WIDTH`], [`TX_HEIGHT`],
+//!     [`TX_WIDTH_LOG2`], [`ADJUSTED_TX_SIZE`],
+//!     [`SIG_REF_DIFF_OFFSET`], [`MAG_REF_OFFSET_WITH_TX_CLASS`],
+//!     [`COEFF_BASE_CTX_OFFSET`], [`COEFF_BASE_POS_CTX_OFFSET`].
+//!     Caller still owns the tile-content walk that supplies
+//!     `Quant[]` itself plus the `compute_tx_type()` derivation that
+//!     feeds [`get_tx_class`]; this round delivers the per-coefficient
+//!     `ctx` plumbing those callers will consume.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a

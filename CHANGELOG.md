@@ -52,7 +52,7 @@ All notable changes to `oxideav-av1` are recorded here.
   saturated magnitude clamp to 6, and each tx-class branch
   (2D inner/outer, horizontal col==0/else, vertical row==0/else), with
   in-range assertions against the matching `coeff_base` / `coeff_br`
-  selector. 270 -> 282 tests, zero `#[ignore]`.
+  selector. 266 -> 278 tests, zero `#[ignore]`.
 
 * **Round 140 — §9.4 default CDF table + §8.3.1 `init_coeff_cdfs` /
   §8.3.2 selection (`coeff_br` sub-group).** Lands the LAST member of
