@@ -179,6 +179,62 @@ pub const INTRA_MODE_CONTEXTS: usize = 5;
 /// `partition`.
 pub const PARTITION_CONTEXTS: usize = 4;
 
+/// `EXT_PARTITION_TYPES` (§3 / §6.10.4) — number of partition kinds the
+/// `partition` syntax element can code at `bsl >= 2`
+/// (`BLOCK_8X8`..`BLOCK_64X64`). The W8 context uses only the first 4
+/// values; the W128 context omits the trailing `PARTITION_*_4` pair.
+pub const EXT_PARTITION_TYPES: usize = 10;
+
+/// `PARTITION_NONE` (§6.10.4) — partition ordinal `0`; the block is left
+/// unsplit.
+pub const PARTITION_NONE: usize = 0;
+
+/// `PARTITION_HORZ` (§6.10.4) — partition ordinal `1`; the block splits
+/// into a top/bottom pair.
+pub const PARTITION_HORZ: usize = 1;
+
+/// `PARTITION_VERT` (§6.10.4) — partition ordinal `2`; the block splits
+/// into a left/right pair.
+pub const PARTITION_VERT: usize = 2;
+
+/// `PARTITION_SPLIT` (§6.10.4) — partition ordinal `3`; the block
+/// recursively splits into four quadrants.
+pub const PARTITION_SPLIT: usize = 3;
+
+/// `PARTITION_HORZ_A` (§6.10.4) — partition ordinal `4`; the top half of
+/// a `PARTITION_HORZ` split is itself further split vertically (top-left
+/// + top-right + bottom).
+pub const PARTITION_HORZ_A: usize = 4;
+
+/// `PARTITION_HORZ_B` (§6.10.4) — partition ordinal `5`; the bottom half
+/// of a `PARTITION_HORZ` split is itself further split vertically (top +
+/// bottom-left + bottom-right).
+pub const PARTITION_HORZ_B: usize = 5;
+
+/// `PARTITION_VERT_A` (§6.10.4) — partition ordinal `6`; the left half
+/// of a `PARTITION_VERT` split is itself further split horizontally
+/// (top-left + bottom-left + right).
+pub const PARTITION_VERT_A: usize = 6;
+
+/// `PARTITION_VERT_B` (§6.10.4) — partition ordinal `7`; the right half
+/// of a `PARTITION_VERT` split is itself further split horizontally
+/// (left + top-right + bottom-right).
+pub const PARTITION_VERT_B: usize = 7;
+
+/// `PARTITION_HORZ_4` (§6.10.4) — partition ordinal `8`; the block
+/// splits into four horizontal stripes. Disallowed for `BLOCK_128X128`.
+pub const PARTITION_HORZ_4: usize = 8;
+
+/// `PARTITION_VERT_4` (§6.10.4) — partition ordinal `9`; the block
+/// splits into four vertical stripes. Disallowed for `BLOCK_128X128`.
+pub const PARTITION_VERT_4: usize = 9;
+
+/// `BLOCK_128X128` (§6.10.4) — block-size ordinal `15`; the largest
+/// superblock. The §8.3.2 `split_or_horz` / `split_or_vert` cdf
+/// derivations drop the `PARTITION_*_4` term when `bSize` equals this
+/// value (the W128 `partition` cdf has no entry at indices 8/9).
+pub const BLOCK_128X128: usize = 15;
+
 /// `SKIP_CONTEXTS` (§9.3) — number of contexts for decoding `skip`.
 pub const SKIP_CONTEXTS: usize = 3;
 
@@ -7721,6 +7777,97 @@ pub fn partition_ctx(above: bool, left: bool) -> usize {
     (left as usize) * 2 + (above as usize)
 }
 
+/// §8.3.2 `split_or_horz`: derive the 2-symbol binary cdf from the
+/// already-selected `partition` cdf (the spec's `partitionCdf`). Folds
+/// the §9.4 partition probabilities of `PARTITION_VERT` /
+/// `PARTITION_SPLIT` / `PARTITION_HORZ_A` / `PARTITION_VERT_A` /
+/// `PARTITION_VERT_B` (plus `PARTITION_VERT_4` when `b_size` is not
+/// [`BLOCK_128X128`]) into a single "split" probability per the §8.3.2
+/// note ("the probability for a vertical partition is assigned to the
+/// probability for the split partition"), and emits the binary
+/// `cdf[0] = (1 << 15) - psum`, `cdf[1] = 1 << 15`, `cdf[2] = 0` per
+/// p.362.
+///
+/// The §8.3.2 selection guarantees `partition_cdf` is one of the
+/// `bsl >= 2` rows (W16 / W32 / W64 / W128), so the read range is well
+/// within bounds: `EXT_PARTITION_TYPES` for W16 / W32 / W64, and the
+/// `b_size == BLOCK_128X128` branch's read of `PARTITION_VERT_B` =
+/// index 7 fits inside the 9-entry W128 row.
+///
+/// Returns `None` if `partition_cdf` is too short for the indexing
+/// (a caller bug — `bsl == 1` (W8) is never reached for `split_or_horz`
+/// per the §8.3.2 note "bsl is never equal to 1 when decoding
+/// split_or_horz").
+pub fn split_or_horz_cdf(partition_cdf: &[u16], b_size: usize) -> Option<[u16; 3]> {
+    // Always-present terms: VERT / SPLIT / HORZ_A / VERT_A / VERT_B.
+    // The largest index read in this group is PARTITION_VERT_B (= 7), so
+    // the row must have at least 8 entries (PARTITION_VERT_B - 1 == 6
+    // plus the partitionCdf[VERT_B] read at index 7).
+    let need = PARTITION_VERT_B + 1;
+    if partition_cdf.len() < need {
+        return None;
+    }
+    let mut psum: i32 = 0;
+    psum += partition_cdf[PARTITION_VERT] as i32 - partition_cdf[PARTITION_VERT - 1] as i32;
+    psum += partition_cdf[PARTITION_SPLIT] as i32 - partition_cdf[PARTITION_SPLIT - 1] as i32;
+    psum += partition_cdf[PARTITION_HORZ_A] as i32 - partition_cdf[PARTITION_HORZ_A - 1] as i32;
+    psum += partition_cdf[PARTITION_VERT_A] as i32 - partition_cdf[PARTITION_VERT_A - 1] as i32;
+    psum += partition_cdf[PARTITION_VERT_B] as i32 - partition_cdf[PARTITION_VERT_B - 1] as i32;
+    if b_size != BLOCK_128X128 {
+        // Index PARTITION_VERT_4 (= 9) is only present in the W16/W32/W64
+        // rows; the §8.3.2 selection's `b_size != BLOCK_128X128` guard
+        // ensures the row is long enough.
+        if partition_cdf.len() <= PARTITION_VERT_4 {
+            return None;
+        }
+        psum += partition_cdf[PARTITION_VERT_4] as i32 - partition_cdf[PARTITION_VERT_4 - 1] as i32;
+    }
+    // Per §8.2.6 well-formedness, every partitionCdf is monotonically
+    // increasing in [0, 1 << 15], so each (cdf[i] - cdf[i-1]) is in
+    // [0, 1 << 15] and the sum is also in [0, 1 << 15] (the §8.2.6
+    // probability mass is bounded by 1).
+    let psum_u16 = psum.clamp(0, 1 << 15) as u16;
+    Some([(1 << 15) - psum_u16, 1 << 15, 0])
+}
+
+/// §8.3.2 `split_or_vert`: derive the 2-symbol binary cdf from the
+/// already-selected `partition` cdf. Folds the §9.4 partition
+/// probabilities of `PARTITION_HORZ` / `PARTITION_SPLIT` /
+/// `PARTITION_HORZ_A` / `PARTITION_HORZ_B` / `PARTITION_VERT_A` (plus
+/// `PARTITION_HORZ_4` when `b_size` is not [`BLOCK_128X128`]) into a
+/// single "split" probability, and emits the binary
+/// `cdf[0] = (1 << 15) - psum`, `cdf[1] = 1 << 15`, `cdf[2] = 0` per
+/// p.362.
+///
+/// As with [`split_or_horz_cdf`], the §8.3.2 selection guarantees
+/// `bsl >= 2` so the read range never reaches the W8 row, and
+/// `PARTITION_VERT_A` (= 6) fits inside the W128 row.
+///
+/// Returns `None` if `partition_cdf` is too short for the indexing
+/// (a caller bug — `bsl == 1` is never reached for `split_or_vert`).
+pub fn split_or_vert_cdf(partition_cdf: &[u16], b_size: usize) -> Option<[u16; 3]> {
+    // Always-present terms: HORZ / SPLIT / HORZ_A / HORZ_B / VERT_A.
+    // Largest index here is PARTITION_VERT_A (= 6).
+    let need = PARTITION_VERT_A + 1;
+    if partition_cdf.len() < need {
+        return None;
+    }
+    let mut psum: i32 = 0;
+    psum += partition_cdf[PARTITION_HORZ] as i32 - partition_cdf[PARTITION_HORZ - 1] as i32;
+    psum += partition_cdf[PARTITION_SPLIT] as i32 - partition_cdf[PARTITION_SPLIT - 1] as i32;
+    psum += partition_cdf[PARTITION_HORZ_A] as i32 - partition_cdf[PARTITION_HORZ_A - 1] as i32;
+    psum += partition_cdf[PARTITION_HORZ_B] as i32 - partition_cdf[PARTITION_HORZ_B - 1] as i32;
+    psum += partition_cdf[PARTITION_VERT_A] as i32 - partition_cdf[PARTITION_VERT_A - 1] as i32;
+    if b_size != BLOCK_128X128 {
+        if partition_cdf.len() <= PARTITION_HORZ_4 {
+            return None;
+        }
+        psum += partition_cdf[PARTITION_HORZ_4] as i32 - partition_cdf[PARTITION_HORZ_4 - 1] as i32;
+    }
+    let psum_u16 = psum.clamp(0, 1 << 15) as u16;
+    Some([(1 << 15) - psum_u16, 1 << 15, 0])
+}
+
 /// §8.3.2 `skip` context:
 ///
 /// ```text
@@ -13687,5 +13834,230 @@ mod tests {
             tile_ctx.wedge_index, before,
             "read_symbol must adapt the working CDF"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Round 145 — §8.3.2 split_or_horz / split_or_vert derivations.
+    // -----------------------------------------------------------------
+
+    /// §6.10.4 partition ordinals: the §8.3.2 `psum` formulas index
+    /// `partitionCdf[ PARTITION_X ]` and `partitionCdf[ PARTITION_X - 1 ]`,
+    /// so the exact ordinal values are load-bearing.
+    #[test]
+    fn partition_ordinals_match_spec_table_p172() {
+        assert_eq!(PARTITION_NONE, 0);
+        assert_eq!(PARTITION_HORZ, 1);
+        assert_eq!(PARTITION_VERT, 2);
+        assert_eq!(PARTITION_SPLIT, 3);
+        assert_eq!(PARTITION_HORZ_A, 4);
+        assert_eq!(PARTITION_HORZ_B, 5);
+        assert_eq!(PARTITION_VERT_A, 6);
+        assert_eq!(PARTITION_VERT_B, 7);
+        assert_eq!(PARTITION_HORZ_4, 8);
+        assert_eq!(PARTITION_VERT_4, 9);
+        assert_eq!(EXT_PARTITION_TYPES, 10);
+        assert_eq!(BLOCK_128X128, 15);
+    }
+
+    /// §9.4 partition cdf row shapes match the §8.3.2 split_or_*
+    /// indexing budget: W16/W32/W64 carry the full 10-symbol cdf (+1
+    /// trailing count) so all `PARTITION_*_4` reads are in range, and
+    /// W128 carries the 8-symbol cdf (+1) so the largest index used
+    /// (`PARTITION_VERT_B = 7`) fits.
+    #[test]
+    fn partition_cdf_row_lengths_match_spec_p362_indexing_budget() {
+        assert_eq!(DEFAULT_PARTITION_W16_CDF[0].len(), EXT_PARTITION_TYPES + 1);
+        assert_eq!(DEFAULT_PARTITION_W32_CDF[0].len(), EXT_PARTITION_TYPES + 1);
+        assert_eq!(DEFAULT_PARTITION_W64_CDF[0].len(), EXT_PARTITION_TYPES + 1);
+        // W128 drops the two *_4 ordinals (no HORZ_4 / VERT_4 entry).
+        assert_eq!(
+            DEFAULT_PARTITION_W128_CDF[0].len(),
+            EXT_PARTITION_TYPES - 2 + 1
+        );
+        // PARTITION_VERT_B (= 7) must fit inside the W128 cdf row.
+        assert!(DEFAULT_PARTITION_W128_CDF[0].len() > PARTITION_VERT_B);
+    }
+
+    /// §8.3.2 `split_or_horz` cdf derivation: starting from a known
+    /// `partitionCdf` (the `Default_Partition_W16_Cdf[ ctx = 0 ]` row),
+    /// the helper must reproduce the spec's algebra exactly. Cross-checks
+    /// against an independent re-derivation that walks the partitionCdf
+    /// without using the helper.
+    #[test]
+    fn split_or_horz_cdf_matches_spec_psum_for_w16_ctx0() {
+        let partition_cdf = &DEFAULT_PARTITION_W16_CDF[0];
+        // Non-128 size: bSize = BLOCK_16X16 = 6 (Mi_Width_Log2 = 2 ⇒
+        // bsl = 2 ⇒ W16). Includes the PARTITION_VERT_4 term.
+        let cdf = split_or_horz_cdf(partition_cdf, 6).expect("non-empty");
+        let psum_re: i32 = (partition_cdf[PARTITION_VERT] as i32
+            - partition_cdf[PARTITION_VERT - 1] as i32)
+            + (partition_cdf[PARTITION_SPLIT] as i32 - partition_cdf[PARTITION_SPLIT - 1] as i32)
+            + (partition_cdf[PARTITION_HORZ_A] as i32 - partition_cdf[PARTITION_HORZ_A - 1] as i32)
+            + (partition_cdf[PARTITION_VERT_A] as i32 - partition_cdf[PARTITION_VERT_A - 1] as i32)
+            + (partition_cdf[PARTITION_VERT_B] as i32 - partition_cdf[PARTITION_VERT_B - 1] as i32)
+            + (partition_cdf[PARTITION_VERT_4] as i32 - partition_cdf[PARTITION_VERT_4 - 1] as i32);
+        assert_eq!(cdf[0] as i32, (1 << 15) - psum_re);
+        assert_eq!(cdf[1], 1 << 15);
+        assert_eq!(cdf[2], 0);
+    }
+
+    /// §8.3.2 `split_or_vert` cdf derivation: same shape, different
+    /// symbol set (HORZ / SPLIT / HORZ_A / HORZ_B / VERT_A [+ HORZ_4
+    /// when not BLOCK_128X128]). Cross-checks against an independent
+    /// re-derivation.
+    #[test]
+    fn split_or_vert_cdf_matches_spec_psum_for_w32_ctx3() {
+        let partition_cdf = &DEFAULT_PARTITION_W32_CDF[3];
+        let cdf = split_or_vert_cdf(partition_cdf, 9).expect("non-empty");
+        let psum_re: i32 = (partition_cdf[PARTITION_HORZ] as i32
+            - partition_cdf[PARTITION_HORZ - 1] as i32)
+            + (partition_cdf[PARTITION_SPLIT] as i32 - partition_cdf[PARTITION_SPLIT - 1] as i32)
+            + (partition_cdf[PARTITION_HORZ_A] as i32 - partition_cdf[PARTITION_HORZ_A - 1] as i32)
+            + (partition_cdf[PARTITION_HORZ_B] as i32 - partition_cdf[PARTITION_HORZ_B - 1] as i32)
+            + (partition_cdf[PARTITION_VERT_A] as i32 - partition_cdf[PARTITION_VERT_A - 1] as i32)
+            + (partition_cdf[PARTITION_HORZ_4] as i32 - partition_cdf[PARTITION_HORZ_4 - 1] as i32);
+        assert_eq!(cdf[0] as i32, (1 << 15) - psum_re);
+        assert_eq!(cdf[1], 1 << 15);
+        assert_eq!(cdf[2], 0);
+    }
+
+    /// `b_size == BLOCK_128X128`: the `PARTITION_*_4` term is dropped
+    /// from `psum`. The W128 cdf row has no `PARTITION_HORZ_4` /
+    /// `PARTITION_VERT_4` entry (the 8-symbol row's last cdf index is
+    /// `PARTITION_VERT_B = 7`; index 8 is the §8.3 trailing count slot),
+    /// and the helper must not read past the §6.10.4 cdf range. Verifies
+    /// the omitted-term case and confirms the resulting binary cdf is
+    /// well-formed.
+    #[test]
+    fn split_or_horz_cdf_drops_partition_4_term_for_block_128x128() {
+        let partition_cdf = &DEFAULT_PARTITION_W128_CDF[1];
+        // §9.4 W128 cdf row: 8 partition symbols (indices 0..=7) + 1
+        // trailing count slot at index 8.
+        assert_eq!(partition_cdf.len(), EXT_PARTITION_TYPES - 2 + 1);
+        // PARTITION_VERT_B (= 7) is the last partition-cdf entry.
+        assert!(partition_cdf.len() > PARTITION_VERT_B);
+
+        let cdf = split_or_horz_cdf(partition_cdf, BLOCK_128X128).expect("non-empty");
+        // Re-derive without the VERT_4 term.
+        let psum_re: i32 = (partition_cdf[PARTITION_VERT] as i32
+            - partition_cdf[PARTITION_VERT - 1] as i32)
+            + (partition_cdf[PARTITION_SPLIT] as i32 - partition_cdf[PARTITION_SPLIT - 1] as i32)
+            + (partition_cdf[PARTITION_HORZ_A] as i32 - partition_cdf[PARTITION_HORZ_A - 1] as i32)
+            + (partition_cdf[PARTITION_VERT_A] as i32 - partition_cdf[PARTITION_VERT_A - 1] as i32)
+            + (partition_cdf[PARTITION_VERT_B] as i32 - partition_cdf[PARTITION_VERT_B - 1] as i32);
+        assert_eq!(cdf[0] as i32, (1 << 15) - psum_re);
+        assert_eq!(cdf[1], 1 << 15);
+        assert_eq!(cdf[2], 0);
+        // §8.2.6 well-formedness: monotonically increasing in `[0, 1<<15]`.
+        assert!(cdf[0] <= cdf[1]);
+        assert_eq!(cdf[1] as u32, 1 << 15);
+    }
+
+    /// `b_size == BLOCK_128X128`: the same drop applies to
+    /// `split_or_vert` for the `PARTITION_HORZ_4` term.
+    #[test]
+    fn split_or_vert_cdf_drops_partition_4_term_for_block_128x128() {
+        let partition_cdf = &DEFAULT_PARTITION_W128_CDF[2];
+        assert_eq!(partition_cdf.len(), EXT_PARTITION_TYPES - 2 + 1);
+
+        let cdf = split_or_vert_cdf(partition_cdf, BLOCK_128X128).expect("non-empty");
+        let psum_re: i32 = (partition_cdf[PARTITION_HORZ] as i32
+            - partition_cdf[PARTITION_HORZ - 1] as i32)
+            + (partition_cdf[PARTITION_SPLIT] as i32 - partition_cdf[PARTITION_SPLIT - 1] as i32)
+            + (partition_cdf[PARTITION_HORZ_A] as i32 - partition_cdf[PARTITION_HORZ_A - 1] as i32)
+            + (partition_cdf[PARTITION_HORZ_B] as i32 - partition_cdf[PARTITION_HORZ_B - 1] as i32)
+            + (partition_cdf[PARTITION_VERT_A] as i32 - partition_cdf[PARTITION_VERT_A - 1] as i32);
+        assert_eq!(cdf[0] as i32, (1 << 15) - psum_re);
+        assert_eq!(cdf[1], 1 << 15);
+        assert_eq!(cdf[2], 0);
+        assert!(cdf[0] <= cdf[1]);
+    }
+
+    /// `split_or_horz` / `split_or_vert` over every reachable §8.3.2
+    /// `(bsl, ctx, b_size)` triple: the §8.2.6 well-formedness invariants
+    /// hold for every default `partition` cdf row in the workspace
+    /// (`cdf[1] == 32768`, `cdf[0] <= cdf[1]`, `cdf[2] == 0`). bsl == 1
+    /// is excluded per the §8.3.2 note "bsl is never equal to 1 when
+    /// decoding split_or_horz / split_or_vert".
+    #[test]
+    fn split_or_helpers_well_formed_for_every_partition_cdf_row() {
+        // (rows, b_size used to gate the *_4 term)
+        let suites: [(&[[u16; 11]], usize); 3] = [
+            (&DEFAULT_PARTITION_W16_CDF, 6),
+            (&DEFAULT_PARTITION_W32_CDF, 9),
+            (&DEFAULT_PARTITION_W64_CDF, 12),
+        ];
+        for (rows, b_size) in suites {
+            for row in rows {
+                for helper in [split_or_horz_cdf, split_or_vert_cdf] {
+                    let cdf = helper(row, b_size).expect("must succeed for W16/W32/W64");
+                    assert_eq!(cdf[1] as u32, 1 << 15);
+                    assert_eq!(cdf[2], 0);
+                    assert!(cdf[0] <= cdf[1], "binary cdf must satisfy cdf[0] <= cdf[1]");
+                }
+            }
+        }
+        // W128 (8-symbol rows, b_size = BLOCK_128X128).
+        for row in &DEFAULT_PARTITION_W128_CDF {
+            for helper in [split_or_horz_cdf, split_or_vert_cdf] {
+                let cdf = helper(row, BLOCK_128X128).expect("must succeed for W128");
+                assert_eq!(cdf[1] as u32, 1 << 15);
+                assert_eq!(cdf[2], 0);
+                assert!(cdf[0] <= cdf[1]);
+            }
+        }
+    }
+
+    /// The §8.3.2 note explicitly says `split_or_horz` is never allowed
+    /// to return a `PARTITION_VERT` outcome — its 2-symbol cdf folds the
+    /// `PARTITION_VERT` probability into the split branch. End-to-end:
+    /// drive the §8.2 `SymbolDecoder` through the derived 2-symbol
+    /// `split_or_horz` cdf for `BLOCK_64X64` and confirm the symbol
+    /// lands in `0..2`.
+    #[test]
+    fn decode_split_or_horz_through_derived_cdf() {
+        let bytes = [0x00u8, 0x40u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+
+        // bSize = BLOCK_64X64 (= 12); bsl = 4 ⇒ W64 row; ctx = 0.
+        let partition_cdf = tile_ctx.partition_cdf(4, 0).unwrap();
+        let mut split_or_horz = split_or_horz_cdf(partition_cdf, 12).unwrap();
+        let sym = dec.read_symbol(&mut split_or_horz).unwrap();
+        assert!(
+            (sym as usize) < 2,
+            "split_or_horz must code a binary symbol in 0..2"
+        );
+        // The 0/1 outcome maps to {PARTITION_HORZ, PARTITION_SPLIT};
+        // never to PARTITION_VERT — covered structurally by the helper
+        // (the derived cdf has only two outcomes), not the decoded value.
+    }
+
+    /// Symmetric end-to-end test for `split_or_vert`.
+    #[test]
+    fn decode_split_or_vert_through_derived_cdf() {
+        let bytes = [0xc0u8, 0x00u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+
+        // bSize = BLOCK_128X128 — exercise the *_4-omission branch
+        // alongside the end-to-end symbol decode.
+        let partition_cdf = tile_ctx.partition_cdf(5, 1).unwrap();
+        let mut split_or_vert = split_or_vert_cdf(partition_cdf, BLOCK_128X128).unwrap();
+        let sym = dec.read_symbol(&mut split_or_vert).unwrap();
+        assert!(
+            (sym as usize) < 2,
+            "split_or_vert must code a binary symbol in 0..2"
+        );
+    }
+
+    /// Out-of-range guard: a short `partition_cdf` (the W8 row, which
+    /// the §8.3.2 note forbids for split_or_horz / split_or_vert) is
+    /// rejected with `None` rather than panicking.
+    #[test]
+    fn split_or_helpers_reject_w8_row() {
+        let w8_row = &DEFAULT_PARTITION_W8_CDF[0];
+        assert!(split_or_horz_cdf(w8_row, 3).is_none());
+        assert!(split_or_vert_cdf(w8_row, 3).is_none());
     }
 }

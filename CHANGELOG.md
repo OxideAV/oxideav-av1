@@ -6,6 +6,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 145 — §8.3.2 `split_or_horz` / `split_or_vert` derivations.**
+  Lands the two §8.3.2 cdf-derivation helpers that build a 2-symbol
+  binary cdf out of the already-selected `partition` cdf (the spec's
+  `partitionCdf`) per p.362. Each helper folds the §9.4 partition
+  probabilities of the "splittable plus orthogonal-axis" symbols into a
+  single `psum`, then emits the §8.2.6 binary cdf `cdf[0] = (1 << 15) -
+  psum`, `cdf[1] = 1 << 15`, `cdf[2] = 0`. Per the §8.3.2 note the
+  disallowed orthogonal partition's probability is folded into the
+  split branch — `split_or_horz` cannot return `PARTITION_VERT` and
+  `split_or_vert` cannot return `PARTITION_HORZ`. The
+  `b_size != BLOCK_128X128` guard drops the `PARTITION_*_4` term that
+  the §9.4 `Default_Partition_W128_Cdf` row has no entry for. The §3 /
+  §6.10.4 partition ordinals `PARTITION_NONE` (`= 0`), `PARTITION_HORZ`
+  (`= 1`), `PARTITION_VERT` (`= 2`), `PARTITION_SPLIT` (`= 3`),
+  `PARTITION_HORZ_A` (`= 4`), `PARTITION_HORZ_B` (`= 5`),
+  `PARTITION_VERT_A` (`= 6`), `PARTITION_VERT_B` (`= 7`),
+  `PARTITION_HORZ_4` (`= 8`), `PARTITION_VERT_4` (`= 9`) plus
+  `EXT_PARTITION_TYPES` (`= 10`) and `BLOCK_128X128` (`= 15`) replace
+  the literal indices the §8.3.2 formulas use. Tests grow by 10
+  (cdf module): partition ordinal pin against the §6.10.4 p.172 table;
+  W{16,32,64,128} partition cdf row-length budget vs the §8.3.2
+  indexing reach (`PARTITION_VERT_4` for non-128, `PARTITION_VERT_B`
+  for W128); spec-`psum` cross-check for `split_or_horz` (W16, ctx 0)
+  and `split_or_vert` (W32, ctx 3) re-derived inline; `PARTITION_*_4`
+  omission verified for both helpers under `b_size == BLOCK_128X128`;
+  full `b_size`-stratified §8.2.6 well-formedness sweep across every
+  `DEFAULT_PARTITION_W{16,32,64,128}_CDF` row; end-to-end `SymbolDecoder`
+  reads through both derived cdfs (`BLOCK_64X64` for `split_or_horz`,
+  `BLOCK_128X128` for `split_or_vert`) confirming the 2-symbol decode
+  lands in `0..2`; out-of-range guard rejecting the `bsl == 1` W8 row
+  (which the §8.3.2 note forbids for both helpers) with `None`. Tests:
+  302 -> 312, zero `#[ignore]`.
+
 * **Round 144 — §9.4 wedge-index default-CDF.** Lands the §9.4
   `Default_Wedge_Index_Cdf[ BLOCK_SIZES ][ WEDGE_TYPES + 1 ]` table —
   the 16-symbol `wedge_index` element read by §5.11.28

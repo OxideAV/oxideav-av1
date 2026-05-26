@@ -1031,11 +1031,32 @@ constant / table shape and values (cross-checked against the §3
 selector return value with out-of-range rejection / working-copy
 independence, plus an end-to-end `SymbolDecoder` read through a
 `wedge_index` row from the reachable band.
-The other §8.3.2 selections (`split_or_horz` / `split_or_vert`,
-`get_above_palette_color_context` /
-`get_left_palette_color_context` derivations …) are a mechanical
-followup against the same `TileCdfContext` shape. `decode_av1` and
-`encode_av1` still return `Error::NotImplemented`.
+Round 145 lands the §8.3.2 **`split_or_horz` / `split_or_vert`
+cdf-derivation helpers** (p.362–363) — two pure functions that turn an
+already-selected `partition` cdf into a 2-symbol binary cdf by folding
+the §9.4 partition probabilities of the splittable plus orthogonal-axis
+symbols into a single `psum`. Per the §8.3.2 note the disallowed
+orthogonal partition's probability is folded into the split branch
+(`split_or_horz` cannot return `PARTITION_VERT`; `split_or_vert` cannot
+return `PARTITION_HORZ`). The `b_size != BLOCK_128X128` guard drops the
+`PARTITION_*_4` term that the §9.4 `Default_Partition_W128_Cdf` row has
+no entry for. Adds the §3 / §6.10.4 partition ordinal constants
+(`PARTITION_NONE` through `PARTITION_VERT_4` plus `EXT_PARTITION_TYPES =
+10`) and the block-size ordinal `BLOCK_128X128 = 15` that the §8.3.2
+formulas reference by name. 10 new unit tests (302 -> 312) pin the
+§6.10.4 ordinals against the spec table (p.172), validate the
+W{16,32,64,128} row-length budget against the §8.3.2 indexing reach,
+re-derive both helpers' `psum` inline against a known
+`Default_Partition_W{16,32}_Cdf` row, exercise the `PARTITION_*_4`
+omission for both helpers under `b_size == BLOCK_128X128`, sweep §8.2.6
+well-formedness across every default partition cdf row, drive the §8.2
+`SymbolDecoder` through both derived binary cdfs (`BLOCK_64X64` for
+`split_or_horz`, `BLOCK_128X128` for `split_or_vert`), and reject the
+disallowed `bsl == 1` W8 row with `None`.
+The remaining §8.3.2 selections (`get_above_palette_color_context` /
+`get_left_palette_color_context` tile-content walker derivations …) are
+a mechanical followup against the same `TileCdfContext` shape.
+`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
