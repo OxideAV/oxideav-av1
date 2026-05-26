@@ -6,6 +6,54 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 141 — §8.3.2 `get_coeff_base_ctx()` / `get_br_ctx()`
+  neighbour-derivation helpers.** Lands the per-coefficient `ctx`
+  computation that feeds the existing `coeff_base` /
+  `coeff_base_eob` / `coeff_br` selectors (the r138–r140 braid). Both
+  helpers take the coefficient-magnitude array `Quant` plus scalar
+  transform / position state and return the `ctx` index; they own the
+  §8.3.2 neighbour scan only — the tile-content walker that produces
+  `Quant`, `pos`, `c`, and the `compute_tx_type()` derivation is a
+  separate gate. `get_coeff_base_ctx(quant, tx_size, tx_class, pos, c,
+  is_eob)` scans `Sig_Ref_Diff_Offset` (5 offsets) accumulating
+  `Min(Abs(Quant[(refRow<<bwl)+refCol]), 3)` over in-bounds
+  neighbours (`refRow < height && refCol < width`, `width = 1<<bwl`,
+  `bwl = Tx_Width_Log2[Adjusted_Tx_Size[txSz]]`), forms
+  `ctx = Min((mag+1)>>1, 4)`, then routes through the 2D
+  `Coeff_Base_Ctx_Offset[txSz][Min(row,4)][Min(col,4)]` branch (with
+  the `row==0 && col==0 -> 0` early return) or the 1D
+  `Coeff_Base_Pos_Ctx_Offset[Min(idx,2)]` branch (vertical / horizontal);
+  the `isEob` path returns the `SIG_COEF_CONTEXTS-{4,3,2,1}` buckets per
+  `c` thresholds. `get_coeff_base_eob_ctx(...)` wraps it with the
+  §8.3.2 `- SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB` reduction onto
+  `0..SIG_COEF_CONTEXTS_EOB`. `get_br_ctx(quant, tx_size, tx_class,
+  pos)` scans `Mag_Ref_Offset_With_Tx_Class` (3 offsets) accumulating
+  `Min(Quant[refRow*txw+refCol], COEFF_BASE_RANGE+NUM_BASE_LEVELS+1)`
+  (no abs; distinct clamp; bound `refRow < txh && refCol < (1<<bwl)`),
+  forms `mag = Min((mag+1)>>1, 6)`, then `pos==0 -> mag`; 2D `+7` if
+  `row<2 && col<2` else `+14`; horizontal `+7` if `col==0` else `+14`;
+  vertical `+7` if `row==0` else `+14` (result in `0..LEVEL_CONTEXTS`).
+  Adds the §3 constants `SIG_COEF_CONTEXTS_2D = 26`,
+  `SIG_REF_DIFF_OFFSET_NUM = 5`, `NUM_BASE_LEVELS = 2`,
+  `COEFF_BASE_RANGE = 12`, `TX_SIZES_ALL = 19`, the `TX_CLASS_{2D,
+  HORIZ, VERT}` tags, the `Adjusted_Tx_Size` / `Tx_Width` / `Tx_Height`
+  / `Tx_Width_Log2` size tables, the `Sig_Ref_Diff_Offset` /
+  `Mag_Ref_Offset_With_Tx_Class` neighbour-offset tables, and the
+  `Coeff_Base_Ctx_Offset` / `Coeff_Base_Pos_Ctx_Offset` offset tables,
+  all transcribed verbatim from the spec. A pure `get_tx_class()`
+  helper reduces the directional transform-type flags to a class.
+  Tests grow by 12 (cdf module): constant + table-shape pin
+  (including `Tx_Width == 1 << Tx_Width_Log2` self-consistency);
+  `get_tx_class` reduction; the four `is_eob` buckets plus the
+  `get_coeff_base_eob_ctx` reduction; the `row==0 && col==0 -> 0` 2D
+  early return; a 2D case with a non-trivial offset entry and a
+  saturated-neighbourhood `ctx` clamp to 4; vertical and horizontal
+  branches with `Min(idx,2)` clamping; `get_br_ctx` `pos==0`, the
+  saturated magnitude clamp to 6, and each tx-class branch
+  (2D inner/outer, horizontal col==0/else, vertical row==0/else), with
+  in-range assertions against the matching `coeff_base` / `coeff_br`
+  selector. 270 -> 282 tests, zero `#[ignore]`.
+
 * **Round 140 — §9.4 default CDF table + §8.3.1 `init_coeff_cdfs` /
   §8.3.2 selection (`coeff_br` sub-group).** Lands the LAST member of
   the `coeff_base` / `coeff_base_eob` / `coeff_br` braid; with this

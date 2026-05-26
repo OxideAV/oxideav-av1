@@ -657,6 +657,30 @@ pub const LEVEL_CONTEXTS: usize = 21;
 /// the §8.3 adaptation counter).
 pub const BR_CDF_SIZE: usize = 4;
 
+/// `SIG_COEF_CONTEXTS_2D` (§3) — the split point inside the
+/// `0..SIG_COEF_CONTEXTS` `coeff_base` context range. The §8.3.2
+/// `get_coeff_base_ctx()` two-dimensional branch returns values in
+/// `0..SIG_COEF_CONTEXTS_2D`; the one-dimensional vertical- /
+/// horizontal-only branch returns `SIG_COEF_CONTEXTS_2D` and above via
+/// [`COEFF_BASE_POS_CTX_OFFSET`].
+pub const SIG_COEF_CONTEXTS_2D: usize = 26;
+
+/// `SIG_REF_DIFF_OFFSET_NUM` (§3) — the number of neighbour offsets
+/// scanned by the §8.3.2 `get_coeff_base_ctx()` magnitude accumulation
+/// (the row count of each [`SIG_REF_DIFF_OFFSET`] sub-table).
+pub const SIG_REF_DIFF_OFFSET_NUM: usize = 5;
+
+/// `NUM_BASE_LEVELS` (§3) — the number of base levels coded by
+/// `coeff_base` before `coeff_br` increments take over. Used by the
+/// §8.3.2 `get_br_ctx()` magnitude clamp
+/// `Min(Quant[..], COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1)`.
+pub const NUM_BASE_LEVELS: usize = 2;
+
+/// `COEFF_BASE_RANGE` (§3) — the maximum cumulative base-range increment
+/// a coefficient can accrue from `coeff_br` reads. Used by the §8.3.2
+/// `get_br_ctx()` magnitude clamp (see [`NUM_BASE_LEVELS`]).
+pub const COEFF_BASE_RANGE: usize = 12;
+
 // ---------------------------------------------------------------------
 // §9.4 default CDF tables (the intra-frame mode / partition subset).
 //
@@ -8025,6 +8049,485 @@ pub fn interp_filter_ctx(
     }
 }
 
+// ---------------------------------------------------------------------
+// §8.3.2 coefficient context derivation (`get_coeff_base_ctx` /
+// `get_br_ctx`). These compute the per-coefficient `ctx` index that the
+// `coeff_base` / `coeff_base_eob` / `coeff_br` selectors above consume.
+// They read a coefficient-magnitude array (`Quant`) plus scalar
+// transform / position state supplied by the tile-content walk (which
+// is implemented separately); they own the §8.3.2 neighbour scan only.
+// ---------------------------------------------------------------------
+
+/// §3 `TX_CLASS_2D` — the two-dimensional transform class returned by
+/// `get_tx_class()` for transforms with non-identity behaviour on both
+/// axes (the default class for `DCT_DCT` and friends).
+pub const TX_CLASS_2D: usize = 0;
+
+/// §3 `TX_CLASS_HORIZ` — the transform class for horizontal-only
+/// transforms (`H_DCT` / `H_ADST` / `H_FLIPADST`).
+pub const TX_CLASS_HORIZ: usize = 1;
+
+/// §3 `TX_CLASS_VERT` — the transform class for vertical-only
+/// transforms (`V_DCT` / `V_ADST` / `V_FLIPADST`).
+pub const TX_CLASS_VERT: usize = 2;
+
+/// `TX_SIZES_ALL` (§3) — the number of transform sizes including the
+/// rectangular variants; the first axis of [`COEFF_BASE_CTX_OFFSET`]
+/// and the index space for [`ADJUSTED_TX_SIZE`] / [`TX_WIDTH`] /
+/// [`TX_HEIGHT`] / [`TX_WIDTH_LOG2`].
+pub const TX_SIZES_ALL: usize = 19;
+
+/// `Adjusted_Tx_Size[ TX_SIZES_ALL ]` (§ Additional tables). Maps each
+/// transform size to the size whose dimensions cap the coefficient
+/// context scan at 32×32 — `get_coeff_base_ctx()` / `get_br_ctx()` use
+/// `bwl`, `width`, `height` derived from this adjusted size while
+/// `Coeff_Base_Ctx_Offset` is still indexed by the *original* size.
+/// Entries are themselves `TX_SIZES_ALL` indices.
+pub const ADJUSTED_TX_SIZE: [usize; TX_SIZES_ALL] = [
+    0,  // TX_4X4   -> TX_4X4
+    1,  // TX_8X8   -> TX_8X8
+    2,  // TX_16X16 -> TX_16X16
+    3,  // TX_32X32 -> TX_32X32
+    3,  // TX_64X64 -> TX_32X32
+    5,  // TX_4X8   -> TX_4X8
+    6,  // TX_8X4   -> TX_8X4
+    7,  // TX_8X16  -> TX_8X16
+    8,  // TX_16X8  -> TX_16X8
+    9,  // TX_16X32 -> TX_16X32
+    10, // TX_32X16 -> TX_32X16
+    3,  // TX_32X64 -> TX_32X32
+    3,  // TX_64X32 -> TX_32X32
+    13, // TX_4X16  -> TX_4X16
+    14, // TX_16X4  -> TX_16X4
+    15, // TX_8X32  -> TX_8X32
+    16, // TX_32X8  -> TX_32X8
+    9,  // TX_16X64 -> TX_16X32
+    10, // TX_64X16 -> TX_32X16
+];
+
+/// `Tx_Width[ TX_SIZES_ALL ]` (§ Additional tables) — the width in
+/// pixels of each transform size.
+pub const TX_WIDTH: [usize; TX_SIZES_ALL] = [
+    4, 8, 16, 32, 64, 4, 8, 8, 16, 16, 32, 32, 64, 4, 16, 8, 32, 16, 64,
+];
+
+/// `Tx_Height[ TX_SIZES_ALL ]` (§ Additional tables) — the height in
+/// pixels of each transform size.
+pub const TX_HEIGHT: [usize; TX_SIZES_ALL] = [
+    4, 8, 16, 32, 64, 8, 4, 16, 8, 32, 16, 64, 32, 16, 4, 32, 8, 64, 16,
+];
+
+/// `Tx_Width_Log2[ TX_SIZES_ALL ]` (§ Additional tables) — the base-2
+/// logarithm of each transform width (the `bwl` shift used to convert a
+/// scan position into `(row, col)` within the coefficient array).
+pub const TX_WIDTH_LOG2: [usize; TX_SIZES_ALL] =
+    [2, 3, 4, 5, 6, 2, 3, 3, 4, 4, 5, 5, 6, 2, 4, 3, 5, 4, 6];
+
+/// `Sig_Ref_Diff_Offset[ 3 ][ SIG_REF_DIFF_OFFSET_NUM ][ 2 ]`
+/// (§ Additional tables). Per transform class, the
+/// `(rowDelta, colDelta)` offsets scanned by `get_coeff_base_ctx()` to
+/// accumulate the neighbour magnitude. Indexed `[txClass][idx][0|1]`.
+pub const SIG_REF_DIFF_OFFSET: [[[usize; 2]; SIG_REF_DIFF_OFFSET_NUM]; 3] = [
+    // TX_CLASS_2D
+    [[0, 1], [1, 0], [1, 1], [0, 2], [2, 0]],
+    // TX_CLASS_HORIZ
+    [[0, 1], [1, 0], [0, 2], [0, 3], [0, 4]],
+    // TX_CLASS_VERT
+    [[0, 1], [1, 0], [2, 0], [3, 0], [4, 0]],
+];
+
+/// `Mag_Ref_Offset_With_Tx_Class[ 3 ][ 3 ][ 2 ]` (§ Additional tables).
+/// Per transform class, the three `(rowDelta, colDelta)` offsets scanned
+/// by `get_br_ctx()` to accumulate the neighbour base-range magnitude.
+/// Indexed `[txClass][idx][0|1]`.
+pub const MAG_REF_OFFSET_WITH_TX_CLASS: [[[usize; 2]; 3]; 3] = [
+    // TX_CLASS_2D
+    [[0, 1], [1, 0], [1, 1]],
+    // TX_CLASS_HORIZ
+    [[0, 1], [1, 0], [0, 2]],
+    // TX_CLASS_VERT
+    [[0, 1], [1, 0], [2, 0]],
+];
+
+/// `Coeff_Base_Pos_Ctx_Offset[ 3 ]` (§8.3.2) — the offsets added to the
+/// magnitude bucket in the one-dimensional (vertical / horizontal)
+/// branch of `get_coeff_base_ctx()`. Indexed by `Min(idx, 2)` where
+/// `idx` is the row (vertical) or column (horizontal) of the position.
+pub const COEFF_BASE_POS_CTX_OFFSET: [usize; 3] = [
+    SIG_COEF_CONTEXTS_2D,
+    SIG_COEF_CONTEXTS_2D + 5,
+    SIG_COEF_CONTEXTS_2D + 10,
+];
+
+/// `Coeff_Base_Ctx_Offset[ TX_SIZES_ALL ][ 5 ][ 5 ]` (§8.3.2) — the
+/// per-position context offset added in the two-dimensional branch of
+/// `get_coeff_base_ctx()`. Indexed `[txSz][Min(row,4)][Min(col,4)]`
+/// using the *original* (non-adjusted) transform size.
+pub const COEFF_BASE_CTX_OFFSET: [[[usize; 5]; 5]; TX_SIZES_ALL] = [
+    // TX_4X4
+    [
+        [0, 1, 6, 6, 0],
+        [1, 6, 6, 21, 0],
+        [6, 6, 21, 21, 0],
+        [6, 21, 21, 21, 0],
+        [0, 0, 0, 0, 0],
+    ],
+    // TX_8X8
+    [
+        [0, 1, 6, 6, 21],
+        [1, 6, 6, 21, 21],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_16X16
+    [
+        [0, 1, 6, 6, 21],
+        [1, 6, 6, 21, 21],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_32X32
+    [
+        [0, 1, 6, 6, 21],
+        [1, 6, 6, 21, 21],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_64X64
+    [
+        [0, 1, 6, 6, 21],
+        [1, 6, 6, 21, 21],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_4X8
+    [
+        [0, 11, 11, 11, 0],
+        [11, 11, 11, 11, 0],
+        [6, 6, 21, 21, 0],
+        [6, 21, 21, 21, 0],
+        [21, 21, 21, 21, 0],
+    ],
+    // TX_8X4
+    [
+        [0, 16, 6, 6, 21],
+        [16, 16, 6, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+        [0, 0, 0, 0, 0],
+    ],
+    // TX_8X16
+    [
+        [0, 11, 11, 11, 11],
+        [11, 11, 11, 11, 11],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_16X8
+    [
+        [0, 16, 6, 6, 21],
+        [16, 16, 6, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+    ],
+    // TX_16X32
+    [
+        [0, 11, 11, 11, 11],
+        [11, 11, 11, 11, 11],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_32X16
+    [
+        [0, 16, 6, 6, 21],
+        [16, 16, 6, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+    ],
+    // TX_32X64
+    [
+        [0, 11, 11, 11, 11],
+        [11, 11, 11, 11, 11],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_64X32
+    [
+        [0, 16, 6, 6, 21],
+        [16, 16, 6, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+    ],
+    // TX_4X16
+    [
+        [0, 11, 11, 11, 0],
+        [11, 11, 11, 11, 0],
+        [6, 6, 21, 21, 0],
+        [6, 21, 21, 21, 0],
+        [21, 21, 21, 21, 0],
+    ],
+    // TX_16X4
+    [
+        [0, 16, 6, 6, 21],
+        [16, 16, 6, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+        [0, 0, 0, 0, 0],
+    ],
+    // TX_8X32
+    [
+        [0, 11, 11, 11, 11],
+        [11, 11, 11, 11, 11],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_32X8
+    [
+        [0, 16, 6, 6, 21],
+        [16, 16, 6, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+    ],
+    // TX_16X64
+    [
+        [0, 11, 11, 11, 11],
+        [11, 11, 11, 11, 11],
+        [6, 6, 21, 21, 21],
+        [6, 21, 21, 21, 21],
+        [21, 21, 21, 21, 21],
+    ],
+    // TX_64X16
+    [
+        [0, 16, 6, 6, 21],
+        [16, 16, 6, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+        [16, 16, 21, 21, 21],
+    ],
+];
+
+/// §8.3.2 `get_tx_class( txType )` — maps a transform type to its
+/// transform class. The vertical-only types (`V_DCT` / `V_ADST` /
+/// `V_FLIPADST`) return [`TX_CLASS_VERT`]; the horizontal-only types
+/// (`H_DCT` / `H_ADST` / `H_FLIPADST`) return [`TX_CLASS_HORIZ`]; every
+/// other transform type returns [`TX_CLASS_2D`].
+///
+/// The transform-type enumeration values are the §3 `*_DCT` / `*_ADST`
+/// / `*_FLIPADST` constants; `v_dct` / `v_adst` / `v_flipadst` and
+/// `h_dct` / `h_adst` / `h_flipadst` flag the directional types. The
+/// full §8.3.2 `compute_tx_type()` derivation that produces `txType`
+/// from the bitstream belongs to the tile-content walk; this helper
+/// performs only the class reduction.
+pub fn get_tx_class(
+    v_dct: bool,
+    v_adst: bool,
+    v_flipadst: bool,
+    h_dct: bool,
+    h_adst: bool,
+    h_flipadst: bool,
+) -> usize {
+    if v_dct || v_adst || v_flipadst {
+        TX_CLASS_VERT
+    } else if h_dct || h_adst || h_flipadst {
+        TX_CLASS_HORIZ
+    } else {
+        TX_CLASS_2D
+    }
+}
+
+/// §8.3.2 `get_coeff_base_ctx( txSz, plane, blockX, blockY, pos, c,
+/// isEob )` — the `coeff_base` / `coeff_base_eob` neighbour-derivation.
+///
+/// ```text
+///   adjTxSz = Adjusted_Tx_Size[ txSz ]
+///   bwl     = Tx_Width_Log2[ adjTxSz ]
+///   width   = 1 << bwl
+///   height  = Tx_Height[ adjTxSz ]
+///   if ( isEob ) {                       // EOB-position buckets
+///       if ( c == 0 )                  return SIG_COEF_CONTEXTS - 4
+///       if ( c <= (height<<bwl)/8 )    return SIG_COEF_CONTEXTS - 3
+///       if ( c <= (height<<bwl)/4 )    return SIG_COEF_CONTEXTS - 2
+///                                      return SIG_COEF_CONTEXTS - 1
+///   }
+///   row = pos >> bwl ;  col = pos - (row << bwl)
+///   mag = sum over SIG_REF_DIFF_OFFSET_NUM neighbours of
+///         Min( Abs( Quant[(refRow<<bwl)+refCol] ), 3 )      // in-bounds only
+///   ctx = Min( (mag + 1) >> 1, 4 )
+///   if ( txClass == TX_CLASS_2D ) {
+///       if ( row == 0 && col == 0 )  return 0
+///       return ctx + Coeff_Base_Ctx_Offset[ txSz ][ Min(row,4) ][ Min(col,4) ]
+///   }
+///   idx = (txClass == TX_CLASS_VERT) ? row : col
+///   return ctx + Coeff_Base_Pos_Ctx_Offset[ Min(idx, 2) ]
+/// ```
+///
+/// The neighbour scan uses [`SIG_REF_DIFF_OFFSET`] with the bound check
+/// `refRow < height && refCol < width` (`width = 1 << bwl`); the
+/// `Coeff_Base_Ctx_Offset` lookup uses the *original* `tx_size`, not the
+/// adjusted size. `quant` is the coefficient-magnitude array (`Quant`)
+/// indexed `(refRow << bwl) + refCol`; `tx_class` is the
+/// [`get_tx_class`] result supplied by the caller (the
+/// `compute_tx_type()` derivation belongs to the tile walk); `pos` is
+/// the scan position `scan[c]`; `c` is the scan index; `is_eob` selects
+/// the EOB-position buckets.
+///
+/// Returns a value in `0..SIG_COEF_CONTEXTS` (the EOB buckets occupy the
+/// top four). The `coeff_base_eob` selector applies
+/// `- SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB` to map onto
+/// `0..SIG_COEF_CONTEXTS_EOB` — see [`get_coeff_base_eob_ctx`].
+pub fn get_coeff_base_ctx(
+    quant: &[i32],
+    tx_size: usize,
+    tx_class: usize,
+    pos: usize,
+    c: usize,
+    is_eob: bool,
+) -> usize {
+    let adj_tx_sz = ADJUSTED_TX_SIZE[tx_size];
+    let bwl = TX_WIDTH_LOG2[adj_tx_sz];
+    let width = 1usize << bwl;
+    let height = TX_HEIGHT[adj_tx_sz];
+
+    if is_eob {
+        if c == 0 {
+            return SIG_COEF_CONTEXTS - 4;
+        }
+        if c <= (height << bwl) / 8 {
+            return SIG_COEF_CONTEXTS - 3;
+        }
+        if c <= (height << bwl) / 4 {
+            return SIG_COEF_CONTEXTS - 2;
+        }
+        return SIG_COEF_CONTEXTS - 1;
+    }
+
+    let row = pos >> bwl;
+    let col = pos - (row << bwl);
+
+    // Accumulate the neighbour magnitude over the SIG_REF_DIFF_OFFSET_NUM
+    // offsets, clamping each in-bounds neighbour magnitude to 3.
+    let mut mag: i32 = 0;
+    for offset in &SIG_REF_DIFF_OFFSET[tx_class] {
+        let ref_row = row + offset[0];
+        let ref_col = col + offset[1];
+        // The offsets are non-negative, so refRow / refCol >= 0 holds by
+        // construction; only the upper bound needs checking.
+        if ref_row < height && ref_col < width {
+            let q = quant[(ref_row << bwl) + ref_col].unsigned_abs() as i32;
+            mag += q.min(3);
+        }
+    }
+
+    let ctx = (((mag + 1) >> 1).min(4)) as usize;
+
+    if tx_class == TX_CLASS_2D {
+        if row == 0 && col == 0 {
+            return 0;
+        }
+        return ctx + COEFF_BASE_CTX_OFFSET[tx_size][row.min(4)][col.min(4)];
+    }
+    let idx = if tx_class == TX_CLASS_VERT { row } else { col };
+    ctx + COEFF_BASE_POS_CTX_OFFSET[idx.min(2)]
+}
+
+/// §8.3.2 `coeff_base_eob` context: the [`get_coeff_base_ctx`] result
+/// with `is_eob = true`, reduced onto `0..SIG_COEF_CONTEXTS_EOB` via
+/// `ctx - SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB`. The result is the
+/// `ctx` index consumed by [`TileCdfContext::coeff_base_eob_cdf`].
+pub fn get_coeff_base_eob_ctx(
+    quant: &[i32],
+    tx_size: usize,
+    tx_class: usize,
+    pos: usize,
+    c: usize,
+) -> usize {
+    // The §8.3.2 reduction is `ctx - SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB`
+    // in signed arithmetic. The isEob path returns a value in
+    // `SIG_COEF_CONTEXTS-4 ..= SIG_COEF_CONTEXTS-1`, so adding the EOB
+    // context count first keeps the intermediate non-negative for usize.
+    (get_coeff_base_ctx(quant, tx_size, tx_class, pos, c, true) + SIG_COEF_CONTEXTS_EOB)
+        - SIG_COEF_CONTEXTS
+}
+
+/// §8.3.2 `get_br_ctx` — the `coeff_br` neighbour-derivation.
+///
+/// ```text
+///   adjTxSz = Adjusted_Tx_Size[ txSz ]
+///   bwl = Tx_Width_Log2[ adjTxSz ] ; txw = Tx_Width[ adjTxSz ]
+///   txh = Tx_Height[ adjTxSz ]
+///   row = pos >> bwl ; col = pos - (row << bwl)
+///   mag = sum over 3 neighbours of
+///         Min( Quant[refRow*txw+refCol], COEFF_BASE_RANGE+NUM_BASE_LEVELS+1 )
+///   mag = Min( (mag + 1) >> 1, 6 )
+///   if ( pos == 0 )                       ctx = mag
+///   else if ( txClass == 0 )              ctx = mag + (row<2 && col<2 ? 7 : 14)
+///   else if ( txClass == 1 )              ctx = mag + (col==0 ? 7 : 14)
+///   else                                  ctx = mag + (row==0 ? 7 : 14)
+/// ```
+///
+/// The neighbour scan uses [`MAG_REF_OFFSET_WITH_TX_CLASS`] (three
+/// offsets) with the bound check `refRow < txh && refCol < (1 << bwl)`.
+/// Note the magnitude is `Quant[..]` directly (not its absolute value)
+/// and the clamp is `COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1`, distinct
+/// from the `get_coeff_base_ctx()` scan. `quant` is the
+/// coefficient-magnitude array indexed `refRow * txw + refCol`;
+/// `tx_class` is the [`get_tx_class`] result supplied by the caller;
+/// `pos` is the scan position.
+///
+/// Returns a value in `0..LEVEL_CONTEXTS`, the `ctx` index consumed by
+/// [`TileCdfContext::coeff_br_cdf`].
+pub fn get_br_ctx(quant: &[i32], tx_size: usize, tx_class: usize, pos: usize) -> usize {
+    let adj_tx_sz = ADJUSTED_TX_SIZE[tx_size];
+    let bwl = TX_WIDTH_LOG2[adj_tx_sz];
+    let txw = TX_WIDTH[adj_tx_sz];
+    let txh = TX_HEIGHT[adj_tx_sz];
+    let row = pos >> bwl;
+    let col = pos - (row << bwl);
+
+    let clamp = (COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1) as i32;
+    let mut mag: i32 = 0;
+    for offset in &MAG_REF_OFFSET_WITH_TX_CLASS[tx_class] {
+        let ref_row = row + offset[0];
+        let ref_col = col + offset[1];
+        if ref_row < txh && ref_col < (1usize << bwl) {
+            mag += quant[ref_row * txw + ref_col].min(clamp);
+        }
+    }
+
+    let mag = (((mag + 1) >> 1).min(6)) as usize;
+    if pos == 0 {
+        mag
+    } else if tx_class == TX_CLASS_2D {
+        if row < 2 && col < 2 {
+            mag + 7
+        } else {
+            mag + 14
+        }
+    } else if tx_class == TX_CLASS_HORIZ {
+        if col == 0 {
+            mag + 7
+        } else {
+            mag + 14
+        }
+    } else if row == 0 {
+        mag + 7
+    } else {
+        mag + 14
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11419,5 +11922,259 @@ mod tests {
             ctx.coeff_br, before,
             "read_symbol must adapt the working CDF"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §8.3.2 get_coeff_base_ctx / get_br_ctx neighbour derivation.
+    // Expected ctx values are hand-computed from the §8.3.2 pseudocode.
+    // -----------------------------------------------------------------
+
+    /// §3 constants the §8.3.2 helpers depend on pin to their spec values.
+    #[test]
+    fn coeff_ctx_constants_pin() {
+        assert_eq!(SIG_COEF_CONTEXTS_2D, 26);
+        assert_eq!(SIG_REF_DIFF_OFFSET_NUM, 5);
+        assert_eq!(NUM_BASE_LEVELS, 2);
+        assert_eq!(COEFF_BASE_RANGE, 12);
+        assert_eq!(TX_SIZES_ALL, 19);
+        assert_eq!(TX_CLASS_2D, 0);
+        assert_eq!(TX_CLASS_HORIZ, 1);
+        assert_eq!(TX_CLASS_VERT, 2);
+        // Each TX_SIZES_ALL-indexed table has the right shape.
+        assert_eq!(ADJUSTED_TX_SIZE.len(), TX_SIZES_ALL);
+        assert_eq!(TX_WIDTH.len(), TX_SIZES_ALL);
+        assert_eq!(TX_HEIGHT.len(), TX_SIZES_ALL);
+        assert_eq!(TX_WIDTH_LOG2.len(), TX_SIZES_ALL);
+        assert_eq!(COEFF_BASE_CTX_OFFSET.len(), TX_SIZES_ALL);
+        // Coeff_Base_Pos_Ctx_Offset[ idx ] = SIG_COEF_CONTEXTS_2D + 5*idx.
+        assert_eq!(COEFF_BASE_POS_CTX_OFFSET, [26, 31, 36]);
+        // Width / log2 self-consistency: Tx_Width == 1 << Tx_Width_Log2.
+        for t in 0..TX_SIZES_ALL {
+            assert_eq!(TX_WIDTH[t], 1 << TX_WIDTH_LOG2[t]);
+        }
+    }
+
+    /// §8.3.2 `get_tx_class()` reduces the directional flags to the three
+    /// transform classes.
+    #[test]
+    fn tx_class_reduction() {
+        // No directional flag -> 2D.
+        assert_eq!(
+            get_tx_class(false, false, false, false, false, false),
+            TX_CLASS_2D
+        );
+        // Any vertical flag -> VERT (vertical takes precedence in spec).
+        assert_eq!(
+            get_tx_class(true, false, false, false, false, false),
+            TX_CLASS_VERT
+        );
+        assert_eq!(
+            get_tx_class(false, true, false, false, false, false),
+            TX_CLASS_VERT
+        );
+        assert_eq!(
+            get_tx_class(false, false, true, false, false, false),
+            TX_CLASS_VERT
+        );
+        // Horizontal flags (no vertical) -> HORIZ.
+        assert_eq!(
+            get_tx_class(false, false, false, true, false, false),
+            TX_CLASS_HORIZ
+        );
+        assert_eq!(
+            get_tx_class(false, false, false, false, true, false),
+            TX_CLASS_HORIZ
+        );
+        assert_eq!(
+            get_tx_class(false, false, false, false, false, true),
+            TX_CLASS_HORIZ
+        );
+    }
+
+    /// §8.3.2 `get_coeff_base_ctx(..., isEob=1)` buckets for TX_4X4
+    /// (bwl=2, height=4 -> (height<<bwl)=16, /8=2, /4=4).
+    #[test]
+    fn coeff_base_eob_buckets() {
+        let quant = [0i32; 16];
+        // c == 0 -> SIG_COEF_CONTEXTS - 4.
+        assert_eq!(
+            get_coeff_base_ctx(&quant, 0, TX_CLASS_2D, 0, 0, true),
+            SIG_COEF_CONTEXTS - 4
+        );
+        // c <= 2 -> SIG_COEF_CONTEXTS - 3.
+        assert_eq!(
+            get_coeff_base_ctx(&quant, 0, TX_CLASS_2D, 0, 1, true),
+            SIG_COEF_CONTEXTS - 3
+        );
+        assert_eq!(
+            get_coeff_base_ctx(&quant, 0, TX_CLASS_2D, 0, 2, true),
+            SIG_COEF_CONTEXTS - 3
+        );
+        // 2 < c <= 4 -> SIG_COEF_CONTEXTS - 2.
+        assert_eq!(
+            get_coeff_base_ctx(&quant, 0, TX_CLASS_2D, 0, 3, true),
+            SIG_COEF_CONTEXTS - 2
+        );
+        assert_eq!(
+            get_coeff_base_ctx(&quant, 0, TX_CLASS_2D, 0, 4, true),
+            SIG_COEF_CONTEXTS - 2
+        );
+        // c > 4 -> SIG_COEF_CONTEXTS - 1.
+        assert_eq!(
+            get_coeff_base_ctx(&quant, 0, TX_CLASS_2D, 0, 5, true),
+            SIG_COEF_CONTEXTS - 1
+        );
+
+        // The coeff_base_eob ctx wrapper reduces onto 0..SIG_COEF_CONTEXTS_EOB.
+        assert_eq!(get_coeff_base_eob_ctx(&quant, 0, TX_CLASS_2D, 0, 0), 0);
+        assert_eq!(get_coeff_base_eob_ctx(&quant, 0, TX_CLASS_2D, 0, 1), 1);
+        assert_eq!(get_coeff_base_eob_ctx(&quant, 0, TX_CLASS_2D, 0, 3), 2);
+        assert_eq!(get_coeff_base_eob_ctx(&quant, 0, TX_CLASS_2D, 0, 5), 3);
+        // The reduced ctx must address a coeff_base_eob CDF row.
+        let mut tile = TileCdfContext::new_from_defaults();
+        let eob_ctx = get_coeff_base_eob_ctx(&quant, 0, TX_CLASS_2D, 0, 5);
+        assert!(tile.coeff_base_eob_cdf(0, 0, eob_ctx).is_some());
+    }
+
+    /// §8.3.2 2D branch early return: `row == 0 && col == 0` -> ctx 0.
+    #[test]
+    fn coeff_base_2d_dc_returns_zero() {
+        let quant = [9i32; 64]; // neighbours irrelevant for the DC return.
+        assert_eq!(get_coeff_base_ctx(&quant, 1, TX_CLASS_2D, 0, 0, false), 0);
+    }
+
+    /// §8.3.2 2D branch with a non-trivial Coeff_Base_Ctx_Offset entry.
+    /// TX_8X8 (bwl=3), pos=9 -> row=1, col=1, offset[1][1][1]=6. A single
+    /// neighbour magnitude 2 gives mag=2, ctx=Min((2+1)>>1,4)=1 -> 1+6=7.
+    #[test]
+    fn coeff_base_2d_with_neighbour_mag() {
+        let mut quant = [0i32; 64];
+        // Sig_Ref_Diff_Offset[2D][0] = (0,1): refRow=1, refCol=2 ->
+        // Quant[(1<<3)+2] = Quant[10].
+        quant[10] = 2;
+        let ctx = get_coeff_base_ctx(&quant, 1, TX_CLASS_2D, 9, 0, false);
+        assert_eq!(ctx, 7);
+        assert!(ctx < SIG_COEF_CONTEXTS);
+
+        // Saturated 2D neighbourhood: all five offsets carry magnitude 3
+        // -> mag=15, ctx=Min((15+1)>>1,4)=Min(8,4)=4. 4 + offset[1][1][1]=6
+        // -> 10.
+        let mut sat = [0i32; 64];
+        for &(r, c) in &[(1usize, 2usize), (2, 1), (2, 2), (1, 3), (3, 1)] {
+            sat[(r << 3) + c] = 3;
+        }
+        let ctx_sat = get_coeff_base_ctx(&sat, 1, TX_CLASS_2D, 9, 0, false);
+        assert_eq!(ctx_sat, 10);
+        assert!(ctx_sat < SIG_COEF_CONTEXTS);
+    }
+
+    /// §8.3.2 vertical branch: idx=row, Coeff_Base_Pos_Ctx_Offset[Min(row,2)].
+    /// TX_8X8 (bwl=3), pos=24 -> row=3, col=0; Min(3,2)=2 -> offset 36.
+    /// Two saturated neighbours give mag=6, ctx=Min((6+1)>>1,4)=3 -> 39.
+    #[test]
+    fn coeff_base_vert_branch() {
+        let mut quant = [0i32; 64];
+        // Sig_Ref_Diff_Offset[VERT][0]=(0,1): refRow=3,refCol=1 -> Quant[25].
+        // Sig_Ref_Diff_Offset[VERT][1]=(1,0): refRow=4,refCol=0 -> Quant[32].
+        quant[25] = 3;
+        quant[32] = 3;
+        let ctx = get_coeff_base_ctx(&quant, 1, TX_CLASS_VERT, 24, 0, false);
+        assert_eq!(ctx, 39);
+        assert!(ctx < SIG_COEF_CONTEXTS);
+        assert!(ctx >= SIG_COEF_CONTEXTS_2D, "1D tail uses the >=26 range");
+    }
+
+    /// §8.3.2 horizontal branch with Min(col,2) clamping.
+    /// TX_8X8 (bwl=3). pos=3 -> row=0,col=3; Min(3,2)=2 -> offset 36.
+    /// Quant[4]=1 -> mag=1, ctx=Min((1+1)>>1,4)=1 -> 37.
+    #[test]
+    fn coeff_base_horiz_branch_clamped() {
+        let mut quant = [0i32; 64];
+        // Sig_Ref_Diff_Offset[HORIZ][0]=(0,1): refRow=0,refCol=4 -> Quant[4].
+        quant[4] = 1;
+        let ctx = get_coeff_base_ctx(&quant, 1, TX_CLASS_HORIZ, 3, 0, false);
+        assert_eq!(ctx, 37);
+        assert!(ctx < SIG_COEF_CONTEXTS);
+
+        // col=1 -> idx not clamped: Coeff_Base_Pos_Ctx_Offset[1] = 31.
+        // pos=1 -> row=0,col=1. Empty neighbourhood -> mag=0, ctx=0 -> 31.
+        let empty = [0i32; 64];
+        let ctx2 = get_coeff_base_ctx(&empty, 1, TX_CLASS_HORIZ, 1, 0, false);
+        assert_eq!(ctx2, 31);
+    }
+
+    /// §8.3.2 `get_br_ctx`: pos==0 path returns the magnitude bucket alone.
+    /// TX_4X4 (bwl=2,txw=4,txh=4). Quant[1]=5 -> mag=Min(5,15)=5,
+    /// mag=Min((5+1)>>1,6)=3. pos==0 -> ctx=3.
+    #[test]
+    fn br_ctx_pos_zero() {
+        let mut quant = [0i32; 16];
+        // Mag_Ref_Offset[2D][0]=(0,1): refRow=0,refCol=1 -> Quant[0*4+1]=Quant[1].
+        quant[1] = 5;
+        let ctx = get_br_ctx(&quant, 0, TX_CLASS_2D, 0);
+        assert_eq!(ctx, 3);
+        assert!(ctx < LEVEL_CONTEXTS);
+    }
+
+    /// §8.3.2 `get_br_ctx` magnitude clamp: each neighbour saturates at
+    /// COEFF_BASE_RANGE+NUM_BASE_LEVELS+1 = 15; three at 100 -> mag=45,
+    /// Min((45+1)>>1,6)=6. TX_4X4 pos==0 -> ctx=6 (the max bucket).
+    #[test]
+    fn br_ctx_saturated_clamp() {
+        let mut quant = [0i32; 16];
+        // 2D offsets from (0,0): (0,1)->Q[1], (1,0)->Q[4], (1,1)->Q[5].
+        quant[1] = 100;
+        quant[4] = 100;
+        quant[5] = 100;
+        let ctx = get_br_ctx(&quant, 0, TX_CLASS_2D, 0);
+        assert_eq!(ctx, 6);
+        assert!(ctx < LEVEL_CONTEXTS);
+    }
+
+    /// §8.3.2 `get_br_ctx` 2D branch: inner (row<2 && col<2) -> +7,
+    /// outer -> +14. TX_8X8 (bwl=3).
+    #[test]
+    fn br_ctx_2d_inner_outer() {
+        // Inner: pos=9 -> row=1,col=1. Quant[10]=1 (offset (0,1) -> col 2)
+        // -> mag=1, Min((1+1)>>1,6)=1, +7 -> 8.
+        let mut inner = [0i32; 64];
+        inner[10] = 1; // refRow=1,refCol=2 -> 1*8+2 = 10.
+        let c_inner = get_br_ctx(&inner, 1, TX_CLASS_2D, 9);
+        assert_eq!(c_inner, 8);
+        assert!(c_inner < LEVEL_CONTEXTS);
+
+        // Outer: pos=18 -> row=2,col=2. Empty neighbourhood -> mag=0,
+        // Min((0+1)>>1,6)=0, +14 -> 14.
+        let empty = [0i32; 64];
+        let c_outer = get_br_ctx(&empty, 1, TX_CLASS_2D, 18);
+        assert_eq!(c_outer, 14);
+        assert!(c_outer < LEVEL_CONTEXTS);
+    }
+
+    /// §8.3.2 `get_br_ctx` horizontal branch (txClass==1): col==0 -> +7,
+    /// else +14. TX_8X8 (bwl=3), empty neighbourhood -> mag bucket 0.
+    #[test]
+    fn br_ctx_horiz_branch() {
+        let empty = [0i32; 64];
+        // col==0: pos=8 -> row=1,col=0 -> mag bucket 0, +7 -> 7.
+        assert_eq!(get_br_ctx(&empty, 1, TX_CLASS_HORIZ, 8), 7);
+        // col!=0: pos=1 -> row=0,col=1 -> +14 -> 14.
+        assert_eq!(get_br_ctx(&empty, 1, TX_CLASS_HORIZ, 1), 14);
+    }
+
+    /// §8.3.2 `get_br_ctx` vertical branch (txClass==2 / else): row==0 ->
+    /// +7, else +14. TX_8X8 (bwl=3), empty neighbourhood -> mag bucket 0.
+    #[test]
+    fn br_ctx_vert_branch() {
+        let empty = [0i32; 64];
+        // row==0: pos=1 -> row=0,col=1 -> +7 -> 7.
+        assert_eq!(get_br_ctx(&empty, 1, TX_CLASS_VERT, 1), 7);
+        // row!=0: pos=8 -> row=1,col=0 -> +14 -> 14.
+        assert_eq!(get_br_ctx(&empty, 1, TX_CLASS_VERT, 8), 14);
+
+        // The derived ctx must address a coeff_br CDF row.
+        let mut tile = TileCdfContext::new_from_defaults();
+        let ctx = get_br_ctx(&empty, 1, TX_CLASS_VERT, 1);
+        assert!(tile.coeff_br_cdf(1, 0, ctx).is_some());
     }
 }

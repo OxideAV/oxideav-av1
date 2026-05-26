@@ -921,6 +921,41 @@ byte-equality test. The next gate is the §8.3.2
 `get_coeff_base_ctx()` / `get_br_ctx()` neighbour-derivation helpers,
 deferred to a different round because they need tile-content walker
 state.
+Round 141 lands those **§8.3.2 `get_coeff_base_ctx()` /
+`get_br_ctx()` neighbour-derivation helpers** — the per-coefficient
+`ctx` computation that feeds the r138–r140 selectors. Both are free
+functions that take the coefficient-magnitude array `Quant` plus
+scalar transform / position state (`tx_size`, `tx_class`, `pos`,
+`c`, `is_eob`) and return the `ctx` index; they own the §8.3.2
+neighbour scan only — the tile-content walker that produces `Quant`
+and the `compute_tx_type()` derivation is the next gate.
+`get_coeff_base_ctx()` scans `Sig_Ref_Diff_Offset`
+(`SIG_REF_DIFF_OFFSET_NUM = 5` offsets) accumulating
+`Min(Abs(Quant[(refRow<<bwl)+refCol]), 3)` over in-bounds neighbours
+(`refRow < height && refCol < width`, `bwl =
+Tx_Width_Log2[Adjusted_Tx_Size[txSz]]`), forms `ctx = Min((mag+1)>>1,
+4)`, then routes through the 2D `Coeff_Base_Ctx_Offset[txSz][Min(row,
+4)][Min(col,4)]` branch (with the `row==0 && col==0 -> 0` early
+return) or the 1D `Coeff_Base_Pos_Ctx_Offset[Min(idx,2)]` branch;
+the `isEob` path returns the `SIG_COEF_CONTEXTS-{4,3,2,1}` buckets per
+`c` thresholds. A `get_coeff_base_eob_ctx()` wrapper applies the
+§8.3.2 `- SIG_COEF_CONTEXTS + SIG_COEF_CONTEXTS_EOB` reduction.
+`get_br_ctx()` scans `Mag_Ref_Offset_With_Tx_Class` (3 offsets)
+accumulating `Min(Quant[refRow*txw+refCol],
+COEFF_BASE_RANGE+NUM_BASE_LEVELS+1)` (no abs, distinct clamp, bound
+`refRow < txh && refCol < (1<<bwl)`), forms `mag = Min((mag+1)>>1,
+6)`, then `pos==0 -> mag`; 2D `+7/+14` on `(row<2 && col<2)`;
+horizontal `+7/+14` on `col==0`; vertical `+7/+14` on `row==0`
+(result in `0..LEVEL_CONTEXTS`). Adds the §3 constants
+`SIG_COEF_CONTEXTS_2D = 26`, `SIG_REF_DIFF_OFFSET_NUM = 5`,
+`NUM_BASE_LEVELS = 2`, `COEFF_BASE_RANGE = 12`, `TX_SIZES_ALL = 19`,
+the `TX_CLASS_{2D,HORIZ,VERT}` tags, the `Adjusted_Tx_Size` /
+`Tx_Width` / `Tx_Height` / `Tx_Width_Log2` size tables, and the
+`Sig_Ref_Diff_Offset` / `Mag_Ref_Offset_With_Tx_Class` /
+`Coeff_Base_Ctx_Offset` / `Coeff_Base_Pos_Ctx_Offset` tables, all
+transcribed verbatim from the spec; a pure `get_tx_class()` helper
+reduces the directional transform-type flags to a class. 12 new unit
+tests (270 -> 282) pin each branch with hand-computed `ctx` values.
 The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
 and the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
 …) are a mechanical followup against the same `TileCdfContext`
