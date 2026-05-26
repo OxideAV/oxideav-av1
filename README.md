@@ -988,11 +988,34 @@ branch (lossless / `txSzSqrUp > TX_32X32` fallback, luma cache
 read, inter-chroma `Max` lift + admission pass/fail, intra-chroma
 `Mode_To_Txfm` + admission pass/fail + out-of-range, plus a
 selector/admission closed-loop check).
-The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
-and the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
-…) are a mechanical followup against the same `TileCdfContext`
-shape. `decode_av1` and `encode_av1` still return
-`Error::NotImplemented`.
+Round 143 lands the **inter-intra group** — the three §9.4 default
+CDFs read by the §5.11.28 `read_interintra_mode` syntax:
+`Default_Inter_Intra_Cdf[ BLOCK_SIZE_GROUPS - 1 ][ 3 ]`,
+`Default_Inter_Intra_Mode_Cdf[ BLOCK_SIZE_GROUPS - 1 ][ INTERINTRA_MODES + 1 ]`,
+and `Default_Wedge_Inter_Intra_Cdf[ BLOCK_SIZES ][ 3 ]`. Adds the
+`INTERINTRA_MODES = 4` §3 constant (per §6.10.27 — `II_DC_PRED` /
+`II_V_PRED` / `II_H_PRED` / `II_SMOOTH_PRED`) and the §8.3.2
+`interintra_ctx(mi_size) = Size_Group[ MiSize ] - 1` mapping
+(returning `None` for the `Size_Group[ MiSize ] == 0` rows that the
+§5.11.28 syntax gate excludes — `MiSize < BLOCK_8X8`). The
+`TileCdfContext` grows the `inter_intra` / `inter_intra_mode` /
+`wedge_inter_intra` fields and gains the
+`inter_intra_cdf(ctx)` / `inter_intra_mode_cdf(ctx)` /
+`wedge_inter_intra_cdf(mi_size)` selectors. The wedge table's outer
+dimension is transcribed full-width per the §9.4 listing; per its
+note only indices `3..=9` (the `BLOCK_8X8`..`BLOCK_32X32` band) are
+reachable and the other rows hold the placeholder
+`{16384, 32768, 0}` row. 8 new unit tests (288 -> 296) pin the table
+shapes / well-formedness / `Size_Group - 1` mapping / per-row
+selector return value / working-copy independence, plus end-to-end
+`SymbolDecoder` reads through `interintra`, `interintra_mode`, and
+`wedge_interintra` rows.
+The remaining §9.4 tables (the `Default_Wedge_Index_Cdf` family) and
+the other §8.3.2 selections (`split_or_horz` / `split_or_vert`,
+`get_above_palette_color_context` /
+`get_left_palette_color_context` derivations …) are a mechanical
+followup against the same `TileCdfContext` shape. `decode_av1` and
+`encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
 
@@ -1385,6 +1408,23 @@ shape. `decode_av1` and `encode_av1` still return
     `Coeff_Base_Ctx_Offset[TX_SIZES_ALL][5][5]`,
     `Coeff_Base_Pos_Ctx_Offset[3]`,
     `Mag_Ref_Offset_With_Tx_Class[3][3][2]`).
+  * **Inter-intra CDFs** (round 143): §3 (`INTERINTRA_MODES = 4`),
+    §5.11.28 (`read_interintra_mode` — the `interintra` /
+    `interintra_mode` / `wedge_interintra` reads, including the
+    `BLOCK_8X8 <= MiSize <= BLOCK_32X32` syntax gate),
+    §6.10.27 (`II_DC_PRED` / `II_V_PRED` / `II_H_PRED` /
+    `II_SMOOTH_PRED` enumeration; `wedge_interintra` semantics),
+    §8.3.1 (`init_non_coeff_cdfs` — `InterIntraCdf` /
+    `InterIntraModeCdf` / `WedgeInterIntraCdf` "is set equal to a copy
+    of `Default_*`"), §8.3.2 (`interintra` /
+    `interintra_mode` / `wedge_interintra` paragraphs — the
+    `ctx = Size_Group[ MiSize ] - 1` mapping for the first two and
+    the `TileWedgeInterIntraCdf[ MiSize ]` straight index for the
+    third), §8.3.2 `Size_Group[ BLOCK_SIZES ]` table (from round
+    134), §9.4 listings (`Default_Inter_Intra_Cdf`,
+    `Default_Inter_Intra_Mode_Cdf`, `Default_Wedge_Inter_Intra_Cdf`
+    on pp.434–436 of the spec PDF — including the latter's note that
+    only first-dimension indices 3..=9 are used).
   * **`compute_tx_type` derivation** (round 142): §3 / §6.10.16 (the
     `TX_4X4 = 0`, `TX_8X8 = 1`, `TX_16X16 = 2`, `TX_32X32 = 3`,
     `TX_64X64 = 4` `TxSize` ordinals — previously used only as

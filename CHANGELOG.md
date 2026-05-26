@@ -6,6 +6,43 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 143 — §9.4 inter-intra default-CDF group.** Lands the three
+  §9.4 default CDFs read by the §5.11.28 `read_interintra_mode`
+  syntax — `Default_Inter_Intra_Cdf[ BLOCK_SIZE_GROUPS - 1 ][ 3 ]`
+  (binary `interintra`),
+  `Default_Inter_Intra_Mode_Cdf[ BLOCK_SIZE_GROUPS - 1 ][ INTERINTRA_MODES + 1 ]`
+  (4-symbol `interintra_mode`), and
+  `Default_Wedge_Inter_Intra_Cdf[ BLOCK_SIZES ][ 3 ]` (binary
+  `wedge_interintra`) — all transcribed verbatim from the §9.4
+  listing. Adds the §3 / §6.10.27 constant `INTERINTRA_MODES = 4`
+  (`II_DC_PRED` / `II_V_PRED` / `II_H_PRED` / `II_SMOOTH_PRED`) and
+  the `interintra_ctx(mi_size) -> Option<usize>` helper that folds
+  the §8.3.2 `ctx = Size_Group[ MiSize ] - 1` mapping into a single
+  scalar (returning `None` when `Size_Group[ MiSize ] == 0`, i.e.
+  for `MiSize < BLOCK_8X8` — the rows that the §5.11.28 syntax gate
+  excludes). The `TileCdfContext` grows the `inter_intra` /
+  `inter_intra_mode` / `wedge_inter_intra` fields, seeded by
+  `new_from_defaults` per §8.3.1. The §8.3.2 selection surfaces the
+  `inter_intra_cdf(ctx)` / `inter_intra_mode_cdf(ctx)` /
+  `wedge_inter_intra_cdf(mi_size)` selectors. The wedge table's
+  outer dimension is transcribed full-width per the §9.4 listing;
+  per its note only first-dimension indices 3..=9 (the
+  `BLOCK_8X8`..`BLOCK_32X32` band — the same band the §5.11.28
+  syntax gate confines coded blocks to) are reachable, with the
+  other rows holding the placeholder `{16384, 32768, 0}` row. Tests
+  grow by 8 (cdf module): `INTERINTRA_MODES` constant pin; default
+  table values and §8.2.6 well-formedness (every row trails with
+  `0` after `1 << 15 == 32768`); `init_non_coeff_cdfs` working-copy
+  seeding; `interintra_ctx` matches `Size_Group[ MiSize ] - 1`
+  across the entire `BLOCK_SIZES` axis (including `None`-rejection
+  on the `Size_Group == 0` rows and on `mi_size >= BLOCK_SIZES`);
+  per-row selector return value with out-of-range rejection;
+  working-copy independence from the §9.4 sources; end-to-end
+  `SymbolDecoder` reads through `interintra` + `interintra_mode`
+  default CDFs (`BLOCK_16X16` -> `ctx = 1`) and a separate read
+  through a `wedge_interintra` row from the reachable band.
+  Tests: 288 -> 296, zero `#[ignore]`.
+
 * **Round 142 — §5.11.40 `compute_tx_type()` derivation.** Lands the
   per-plane / per-block transform-type lookup the tile-content walker
   reads before kicking off coefficient decoding and inverse transform.

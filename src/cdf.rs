@@ -591,6 +591,18 @@ pub const MAX_ANGLE_DELTA: usize = 3;
 /// onto `0..DIRECTIONAL_MODES` by subtracting this value.
 pub const V_PRED: usize = 1;
 
+/// `INTERINTRA_MODES` (§3 / §6.10.27) — number of values for
+/// `interintra_mode` (`II_DC_PRED = 0`, `II_V_PRED = 1`, `II_H_PRED = 2`,
+/// `II_SMOOTH_PRED = 3`). Drives the row width of
+/// [`DEFAULT_INTER_INTRA_MODE_CDF`] (`INTERINTRA_MODES + 1` cumulative
+/// frequencies + the §8.3 adaptation counter). The §5.11.28
+/// `read_interintra_mode` syntax gate restricts coded blocks to the
+/// `BLOCK_8X8`..`BLOCK_32X32` band (per §6.10.27), where `Size_Group[
+/// MiSize ]` evaluates to `1`, `2`, or `3` — hence the `[
+/// BLOCK_SIZE_GROUPS - 1 ]` outer dimension on the matching default
+/// CDFs.
+pub const INTERINTRA_MODES: usize = 4;
+
 // ---------------------------------------------------------------------
 // Round 136 — coefficient-token entry constants (§3). These drive the
 // outer/inner dimensions of the `init_coeff_cdfs` entry sub-group:
@@ -6597,6 +6609,26 @@ pub struct TileCdfContext {
     /// (§8.3.1). Codes `coeff_br` (the per-coefficient base-range
     /// increment used to push a level above `NUM_BASE_LEVELS`).
     pub coeff_br: [[[[u16; BR_CDF_SIZE + 1]; LEVEL_CONTEXTS]; PLANE_TYPES]; TX_SIZES],
+
+    // -----------------------------------------------------------------
+    // Round 143 — inter-intra group. §8.3.1 enumerates these as
+    // "`InterIntraCdf` is set to a copy of `Default_Inter_Intra_Cdf`",
+    // "`InterIntraModeCdf` is set to a copy of
+    // `Default_Inter_Intra_Mode_Cdf`", and "`WedgeInterIntraCdf` is set
+    // to a copy of `Default_Wedge_Inter_Intra_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileInterIntraCdf[ BLOCK_SIZE_GROUPS - 1 ]` (§8.3.1). Codes the
+    /// binary `interintra` flag (§5.11.28 `read_interintra_mode`),
+    /// selected by `ctx = Size_Group[ MiSize ] - 1`.
+    pub inter_intra: [[u16; 3]; BLOCK_SIZE_GROUPS - 1],
+    /// `TileInterIntraModeCdf[ BLOCK_SIZE_GROUPS - 1 ]` (§8.3.1). Codes
+    /// `interintra_mode` (§5.11.28 `read_interintra_mode`), selected by
+    /// `ctx = Size_Group[ MiSize ] - 1`.
+    pub inter_intra_mode: [[u16; INTERINTRA_MODES + 1]; BLOCK_SIZE_GROUPS - 1],
+    /// `TileWedgeInterIntraCdf[ BLOCK_SIZES ]` (§8.3.1). Codes the binary
+    /// `wedge_interintra` flag (§5.11.28 `read_interintra_mode`),
+    /// selected by `MiSize` per the §8.3.2 selection.
+    pub wedge_inter_intra: [[u16; 3]; BLOCK_SIZES],
 }
 
 impl TileCdfContext {
@@ -6742,6 +6774,11 @@ impl TileCdfContext {
             // `idx == 0` q-context slice; `init_coeff_cdfs` re-selects
             // the slice for the actual `base_q_idx` before tile content.
             coeff_br: DEFAULT_COEFF_BR_CDF[0],
+
+            // Round 143 — inter-intra group.
+            inter_intra: DEFAULT_INTER_INTRA_CDF,
+            inter_intra_mode: DEFAULT_INTER_INTRA_MODE_CDF,
+            wedge_inter_intra: DEFAULT_WEDGE_INTER_INTRA_CDF,
         }
     }
 
@@ -7520,6 +7557,54 @@ impl TileCdfContext {
         };
         if ptype < PLANE_TYPES && ctx < LEVEL_CONTEXTS {
             Some(&mut self.coeff_br[clamped][ptype][ctx])
+        } else {
+            None
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 143 — §8.3.2 inter-intra selectors.
+    // -----------------------------------------------------------------
+
+    /// §8.3.2 `interintra`: the cdf is `TileInterIntraCdf[ ctx ]`, where
+    /// the §8.3.2 `interintra` paragraph computes
+    /// `ctx = Size_Group[ MiSize ] - 1` (a value in
+    /// `0..(BLOCK_SIZE_GROUPS - 1)`). [`interintra_ctx`] performs that
+    /// mapping; this selector takes the already-computed context. Returns
+    /// `None` if `ctx >= BLOCK_SIZE_GROUPS - 1` (a caller bug).
+    pub fn inter_intra_cdf(&mut self, ctx: usize) -> Option<&mut [u16]> {
+        if ctx < BLOCK_SIZE_GROUPS - 1 {
+            Some(&mut self.inter_intra[ctx])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `interintra_mode`: the cdf is
+    /// `TileInterIntraModeCdf[ ctx ]`, where the §8.3.2 `interintra_mode`
+    /// paragraph computes `ctx = Size_Group[ MiSize ] - 1` (a value in
+    /// `0..(BLOCK_SIZE_GROUPS - 1)`). [`interintra_ctx`] performs that
+    /// mapping; this selector takes the already-computed context. Returns
+    /// `None` if `ctx >= BLOCK_SIZE_GROUPS - 1` (a caller bug).
+    pub fn inter_intra_mode_cdf(&mut self, ctx: usize) -> Option<&mut [u16]> {
+        if ctx < BLOCK_SIZE_GROUPS - 1 {
+            Some(&mut self.inter_intra_mode[ctx])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `wedge_interintra`: the cdf is
+    /// `TileWedgeInterIntraCdf[ MiSize ]`, a straight `0..BLOCK_SIZES`
+    /// index. Returns `None` if `mi_size >= BLOCK_SIZES` (a caller bug).
+    ///
+    /// Per the §9.4 note (and the §5.11.28 syntax gate), only
+    /// `BLOCK_8X8..=BLOCK_32X32` (indices 3..=9) are reachable in
+    /// practice; the other rows are placeholder values and are surfaced
+    /// to keep `MiSize`-indexing uniform.
+    pub fn wedge_inter_intra_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
+        if mi_size < BLOCK_SIZES {
+            Some(&mut self.wedge_inter_intra[mi_size])
         } else {
             None
         }
@@ -8822,6 +8907,108 @@ pub fn get_br_ctx(quant: &[i32], tx_size: usize, tx_class: usize, pos: usize) ->
         mag + 7
     } else {
         mag + 14
+    }
+}
+
+// ---------------------------------------------------------------------
+// Round 143 — inter-intra group (§9.4): `Default_Inter_Intra_Cdf`,
+// `Default_Inter_Intra_Mode_Cdf`, `Default_Wedge_Inter_Intra_Cdf`. All
+// three CDFs are read by the §5.11.28 `read_interintra_mode` syntax
+// inside the inter-block mode-info parse (the `interintra`,
+// `interintra_mode`, and `wedge_interintra` elements). §6.10.27 enumerates
+// `INTERINTRA_MODES = 4` values for `interintra_mode` (`II_DC_PRED`,
+// `II_V_PRED`, `II_H_PRED`, `II_SMOOTH_PRED`).
+//
+// §8.3.2 selection for `interintra` / `interintra_mode` is
+// `ctx = Size_Group[ MiSize ] - 1`; the §5.11.28 gate confines coded
+// blocks to the `BLOCK_8X8`..`BLOCK_32X32` band, so the resulting `ctx`
+// is one of `{0, 1, 2}` — matching the `[ BLOCK_SIZE_GROUPS - 1 ]` outer
+// dimension. The §8.3.2 `wedge_interintra` selection is a straight
+// `TileWedgeInterIntraCdf[ MiSize ]` index; per the §9.4 note only block
+// sizes 3..=9 (the BLOCK_8X8..BLOCK_32X32 band) are reachable, but the
+// table is transcribed full-width to keep the indexing uniform with
+// every other `[ BLOCK_SIZES ]` table.
+// ---------------------------------------------------------------------
+
+/// `Default_Inter_Intra_Cdf[ BLOCK_SIZE_GROUPS - 1 ][ 3 ]` (§9.4). Binary
+/// symbol `interintra` (§5.11.28 `read_interintra_mode` gate; selects
+/// whether an inter prediction should be blended with an intra prediction,
+/// per §6.10.27 semantics). The §8.3.2 selection computes
+/// `ctx = Size_Group[ MiSize ] - 1` (the spec's literal text), valid in
+/// `0..(BLOCK_SIZE_GROUPS - 1)`. Each row carries two cumulative
+/// frequencies plus the §8.3 adaptation counter (starts at 0).
+pub const DEFAULT_INTER_INTRA_CDF: [[u16; 3]; BLOCK_SIZE_GROUPS - 1] =
+    [[26887, 32768, 0], [27597, 32768, 0], [30237, 32768, 0]];
+
+/// `Default_Inter_Intra_Mode_Cdf[ BLOCK_SIZE_GROUPS - 1 ][ INTERINTRA_MODES + 1 ]`
+/// (§9.4). Codes `interintra_mode ∈ { II_DC_PRED, II_V_PRED, II_H_PRED,
+/// II_SMOOTH_PRED }` (§6.10.27 enumeration). The §8.3.2 selection
+/// computes `ctx = Size_Group[ MiSize ] - 1`, valid in
+/// `0..(BLOCK_SIZE_GROUPS - 1)`. Each row carries
+/// `INTERINTRA_MODES = 4` cumulative frequencies plus the §8.3 adaptation
+/// counter (starts at 0).
+pub const DEFAULT_INTER_INTRA_MODE_CDF: [[u16; INTERINTRA_MODES + 1]; BLOCK_SIZE_GROUPS - 1] = [
+    [1875, 11082, 27332, 32768, 0],
+    [2473, 9996, 26388, 32768, 0],
+    [4238, 11537, 25926, 32768, 0],
+];
+
+/// `Default_Wedge_Inter_Intra_Cdf[ BLOCK_SIZES ][ 3 ]` (§9.4). Binary
+/// symbol `wedge_interintra` (§5.11.28; §6.10.27 selects whether wedge
+/// blending should be used). The §8.3.2 selection is a straight
+/// `TileWedgeInterIntraCdf[ MiSize ]` index. Per the §9.4 note only
+/// indices 3..=9 (the `BLOCK_8X8`..`BLOCK_32X32` band — the same band
+/// the §5.11.28 syntax gate confines coded blocks to) are ever used in
+/// the first dimension; the rows outside that band are placeholder
+/// `{16384, 32768, 0}` entries and are transcribed full-width to keep
+/// `MiSize`-indexing uniform with every other `[ BLOCK_SIZES ]` table.
+pub const DEFAULT_WEDGE_INTER_INTRA_CDF: [[u16; 3]; BLOCK_SIZES] = [
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [20036, 32768, 0],
+    [24957, 32768, 0],
+    [26704, 32768, 0],
+    [27530, 32768, 0],
+    [29564, 32768, 0],
+    [29444, 32768, 0],
+    [26872, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+];
+
+/// §8.3.2 `interintra` / `interintra_mode` context mapping:
+/// `ctx = Size_Group[ MiSize ] - 1`. The result selects a
+/// [`TileCdfContext::inter_intra_cdf`] /
+/// [`TileCdfContext::inter_intra_mode_cdf`] row and is in
+/// `0..(BLOCK_SIZE_GROUPS - 1)`. `mi_size` is the current block's `MiSize`
+/// (`0..BLOCK_SIZES`).
+///
+/// The §5.11.28 syntax gate restricts coded blocks to
+/// `BLOCK_8X8 <= MiSize <= BLOCK_32X32` (per §6.10.27), where
+/// `Size_Group[ MiSize ]` is one of `{1, 2, 3}` and the subtraction is
+/// well-defined. Returns `None` if `Size_Group[ MiSize ] == 0` (a caller
+/// bug: the §5.11.28 gate would not have coded `interintra` /
+/// `interintra_mode` in that case) or if `mi_size >= BLOCK_SIZES`.
+pub fn interintra_ctx(mi_size: usize) -> Option<usize> {
+    if mi_size >= BLOCK_SIZES {
+        return None;
+    }
+    let g = SIZE_GROUP[mi_size];
+    if g == 0 {
+        None
+    } else {
+        Some(g - 1)
     }
 }
 
@@ -12910,5 +13097,253 @@ mod tests {
         // Silence "unused" warning on the local — it documents the
         // bwl ordinal the closure-free path computes.
         let _ = tx_sz_sqr;
+    }
+
+    // -----------------------------------------------------------------
+    // Round 143 — inter-intra group tests.
+    // -----------------------------------------------------------------
+
+    /// §3 / §6.10.27: `INTERINTRA_MODES = 4`, matching the spec's
+    /// enumeration count.
+    #[test]
+    fn interintra_modes_constant_matches_spec() {
+        assert_eq!(INTERINTRA_MODES, 4);
+    }
+
+    /// `Default_Inter_Intra_Cdf` / `Default_Inter_Intra_Mode_Cdf` /
+    /// `Default_Wedge_Inter_Intra_Cdf` are pinned verbatim from §9.4 and
+    /// satisfy the §8.2.6 well-formedness invariants every other §9.4
+    /// table satisfies: the trailing entry of each row is `0` (the §8.3
+    /// adaptation counter) and the next-to-last is `1 << 15 == 32768`.
+    #[test]
+    fn inter_intra_default_tables_pinned() {
+        // Shape pins straight off the §9.4 listing.
+        assert_eq!(DEFAULT_INTER_INTRA_CDF.len(), BLOCK_SIZE_GROUPS - 1);
+        assert_eq!(DEFAULT_INTER_INTRA_MODE_CDF.len(), BLOCK_SIZE_GROUPS - 1);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF.len(), BLOCK_SIZES);
+
+        // Spec-pinned values: `Default_Inter_Intra_Cdf` (verbatim from
+        // §9.4 listing, p.434).
+        assert_eq!(DEFAULT_INTER_INTRA_CDF[0], [26887, 32768, 0]);
+        assert_eq!(DEFAULT_INTER_INTRA_CDF[1], [27597, 32768, 0]);
+        assert_eq!(DEFAULT_INTER_INTRA_CDF[2], [30237, 32768, 0]);
+
+        // `Default_Inter_Intra_Mode_Cdf` (verbatim from §9.4, p.434).
+        assert_eq!(
+            DEFAULT_INTER_INTRA_MODE_CDF[0],
+            [1875, 11082, 27332, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_INTER_INTRA_MODE_CDF[1],
+            [2473, 9996, 26388, 32768, 0]
+        );
+        assert_eq!(
+            DEFAULT_INTER_INTRA_MODE_CDF[2],
+            [4238, 11537, 25926, 32768, 0]
+        );
+
+        // `Default_Wedge_Inter_Intra_Cdf` (verbatim from §9.4, p.436):
+        // per the spec note, only indices 3..=9 are reachable; rows 0..2
+        // and 10..21 are placeholder `{16384, 32768, 0}`.
+        for row in &DEFAULT_WEDGE_INTER_INTRA_CDF[0..3] {
+            assert_eq!(row, &[16384, 32768, 0]);
+        }
+        for row in &DEFAULT_WEDGE_INTER_INTRA_CDF[10..BLOCK_SIZES] {
+            assert_eq!(row, &[16384, 32768, 0]);
+        }
+        // Reachable band (BLOCK_8X8..=BLOCK_32X32 -> indices 3..=9).
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[3], [20036, 32768, 0]);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[4], [24957, 32768, 0]);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[5], [26704, 32768, 0]);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[6], [27530, 32768, 0]);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[7], [29564, 32768, 0]);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[8], [29444, 32768, 0]);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[9], [26872, 32768, 0]);
+
+        // §8.2.6 well-formedness invariants on every row of every CDF.
+        for row in &DEFAULT_INTER_INTRA_CDF {
+            assert_eq!(row[row.len() - 1], 0);
+            assert_eq!(row[row.len() - 2], 1 << 15);
+        }
+        for row in &DEFAULT_INTER_INTRA_MODE_CDF {
+            assert_eq!(row[row.len() - 1], 0);
+            assert_eq!(row[row.len() - 2], 1 << 15);
+        }
+        for row in &DEFAULT_WEDGE_INTER_INTRA_CDF {
+            assert_eq!(row[row.len() - 1], 0);
+            assert_eq!(row[row.len() - 2], 1 << 15);
+        }
+    }
+
+    /// §8.3.1 `init_non_coeff_cdfs`: the working-copy fields are seeded
+    /// verbatim from the §9.4 defaults.
+    #[test]
+    fn inter_intra_init_from_defaults() {
+        let ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.inter_intra, DEFAULT_INTER_INTRA_CDF);
+        assert_eq!(ctx.inter_intra_mode, DEFAULT_INTER_INTRA_MODE_CDF);
+        assert_eq!(ctx.wedge_inter_intra, DEFAULT_WEDGE_INTER_INTRA_CDF);
+    }
+
+    /// `interintra_ctx` implements the §8.3.2
+    /// `ctx = Size_Group[ MiSize ] - 1` mapping across the entire
+    /// `BLOCK_SIZES` axis: rows where `Size_Group[ MiSize ] == 0` (i.e.
+    /// outside the §5.11.28 syntax gate) return `None`, the rest return
+    /// `Size_Group[ MiSize ] - 1` in `0..(BLOCK_SIZE_GROUPS - 1)`.
+    #[test]
+    fn interintra_ctx_matches_size_group_minus_one() {
+        for (mi_size, &g) in SIZE_GROUP.iter().enumerate() {
+            match interintra_ctx(mi_size) {
+                None => assert_eq!(g, 0),
+                Some(ctx) => {
+                    assert!(g > 0);
+                    assert_eq!(ctx, g - 1);
+                    assert!(ctx < BLOCK_SIZE_GROUPS - 1);
+                }
+            }
+        }
+        // Out-of-range MiSize is rejected.
+        assert!(interintra_ctx(BLOCK_SIZES).is_none());
+        assert!(interintra_ctx(BLOCK_SIZES + 7).is_none());
+
+        // §5.11.28 syntax gate band: BLOCK_8X8 (3) .. BLOCK_32X32 (9)
+        // inclusive must all return Some. Spot-check each.
+        for mi_size in 3..=9 {
+            assert!(
+                interintra_ctx(mi_size).is_some(),
+                "MiSize {mi_size} (in BLOCK_8X8..=BLOCK_32X32) must yield Some(ctx)"
+            );
+        }
+    }
+
+    /// §8.3.2 inter-intra selectors return the right §9.4 rows for every
+    /// valid context, and reject out-of-range indices with `None`.
+    #[test]
+    fn inter_intra_selectors_return_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+
+        for (i, want) in DEFAULT_INTER_INTRA_CDF.iter().enumerate() {
+            let row = ctx.inter_intra_cdf(i).unwrap();
+            assert_eq!(row.len(), 3);
+            assert_eq!(row, want);
+        }
+        assert!(ctx.inter_intra_cdf(BLOCK_SIZE_GROUPS - 1).is_none());
+        assert!(ctx.inter_intra_cdf(BLOCK_SIZE_GROUPS).is_none());
+
+        for (i, want) in DEFAULT_INTER_INTRA_MODE_CDF.iter().enumerate() {
+            let row = ctx.inter_intra_mode_cdf(i).unwrap();
+            assert_eq!(row.len(), INTERINTRA_MODES + 1);
+            assert_eq!(row, want);
+        }
+        assert!(ctx.inter_intra_mode_cdf(BLOCK_SIZE_GROUPS - 1).is_none());
+
+        for (i, want) in DEFAULT_WEDGE_INTER_INTRA_CDF.iter().enumerate() {
+            let row = ctx.wedge_inter_intra_cdf(i).unwrap();
+            assert_eq!(row.len(), 3);
+            assert_eq!(row, want);
+        }
+        assert!(ctx.wedge_inter_intra_cdf(BLOCK_SIZES).is_none());
+        assert!(ctx.wedge_inter_intra_cdf(BLOCK_SIZES + 5).is_none());
+    }
+
+    /// Working-copy independence: mutating the context via the selectors
+    /// must not touch the §9.4 source tables.
+    #[test]
+    fn inter_intra_working_copy_is_independent() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        ctx.inter_intra_cdf(0).unwrap()[0] = 12345;
+        ctx.inter_intra_mode_cdf(1).unwrap()[0] = 23456;
+        ctx.wedge_inter_intra_cdf(3).unwrap()[0] = 34567;
+        assert_ne!(ctx.inter_intra[0][0], DEFAULT_INTER_INTRA_CDF[0][0]);
+        assert_ne!(
+            ctx.inter_intra_mode[1][0],
+            DEFAULT_INTER_INTRA_MODE_CDF[1][0]
+        );
+        assert_ne!(
+            ctx.wedge_inter_intra[3][0],
+            DEFAULT_WEDGE_INTER_INTRA_CDF[3][0]
+        );
+        // Spec sources unchanged.
+        assert_eq!(DEFAULT_INTER_INTRA_CDF[0][0], 26887);
+        assert_eq!(DEFAULT_INTER_INTRA_MODE_CDF[1][0], 2473);
+        assert_eq!(DEFAULT_WEDGE_INTER_INTRA_CDF[3][0], 20036);
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through both an
+    /// `interintra` (binary) and an `interintra_mode` default CDF
+    /// selected via the §8.3.2 `ctx = Size_Group[ MiSize ] - 1` mapping
+    /// for a `BLOCK_16X16` (`MiSize = 6`, `Size_Group = 2`, `ctx = 1`),
+    /// confirming the row matches the §9.4 source, the decode lands in
+    /// range, and the working copy adapts.
+    #[test]
+    fn decode_inter_intra_through_default_cdf() {
+        // BLOCK_16X16 (MiSize = 6) -> Size_Group[6] = 2 -> ctx = 1.
+        assert_eq!(SIZE_GROUP[6], 2);
+        let ctx_val = interintra_ctx(6).unwrap();
+        assert_eq!(ctx_val, 1);
+
+        // Binary `interintra` decode.
+        {
+            let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+            let mut tile_ctx = TileCdfContext::new_from_defaults();
+            let before = tile_ctx.inter_intra;
+
+            let row = tile_ctx.inter_intra_cdf(ctx_val).unwrap();
+            assert_eq!(row, &DEFAULT_INTER_INTRA_CDF[1]);
+            let sym = dec.read_symbol(row).unwrap();
+            assert!(sym < 2, "interintra must code a binary symbol");
+
+            assert_ne!(
+                tile_ctx.inter_intra, before,
+                "read_symbol must adapt the working CDF"
+            );
+        }
+
+        // 4-symbol `interintra_mode` decode.
+        {
+            let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+            let mut tile_ctx = TileCdfContext::new_from_defaults();
+            let before = tile_ctx.inter_intra_mode;
+
+            let row = tile_ctx.inter_intra_mode_cdf(ctx_val).unwrap();
+            assert_eq!(row, &DEFAULT_INTER_INTRA_MODE_CDF[1]);
+            let sym = dec.read_symbol(row).unwrap();
+            assert!(
+                (sym as usize) < INTERINTRA_MODES,
+                "interintra_mode must code a symbol in 0..INTERINTRA_MODES"
+            );
+
+            assert_ne!(
+                tile_ctx.inter_intra_mode, before,
+                "read_symbol must adapt the working CDF"
+            );
+        }
+    }
+
+    /// End-to-end: drive the §8.2 `SymbolDecoder` through a
+    /// `wedge_interintra` default CDF for a `BLOCK_16X16` (`MiSize = 6`,
+    /// inside the §5.11.28 reachable band), confirming the row matches
+    /// the §9.4 source, the binary decode lands in range, and the working
+    /// copy adapts.
+    #[test]
+    fn decode_wedge_inter_intra_through_default_cdf() {
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.wedge_inter_intra;
+
+        // MiSize = 6 (BLOCK_16X16) is inside the §5.11.28 reachable band
+        // (rows 3..=9) where the §9.4 table holds non-placeholder values.
+        let row = tile_ctx.wedge_inter_intra_cdf(6).unwrap();
+        assert_eq!(row, &DEFAULT_WEDGE_INTER_INTRA_CDF[6]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(sym < 2, "wedge_interintra must code a binary symbol");
+
+        assert_ne!(
+            tile_ctx.wedge_inter_intra, before,
+            "read_symbol must adapt the working CDF"
+        );
     }
 }
