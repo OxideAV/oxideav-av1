@@ -724,6 +724,21 @@
 //!     weighted sum of the top three sorted scores. 312 -> 323
 //!     tests, zero `#[ignore]`.
 //!
+//!   * **Round 147.** The §5.11.49 `palette_tokens( )` per-plane
+//!     diagonal walker — the §5.11.49 caller-facing entry point that
+//!     drives the §5.11.50 colour-context derivation across one of the
+//!     planes' anti-diagonal walk, decodes one
+//!     `palette_color_idx_{y,uv}` per `(i - j, j)` against the cdf
+//!     row picked by [`palette_color_ctx`], remaps through
+//!     `ColorOrder[idx]`, and fills the on-screen border by
+//!     replicating the last on-screen column / row. Surface:
+//!     [`palette_tokens_plane`] (driving the [`SymbolDecoder`] +
+//!     [`TileCdfContext`]) and the [`PalettePlane`] selector. Two
+//!     new [`Error`] variants surface caller-bug preconditions
+//!     ([`Error::InvalidPaletteWalkArgs`]) and the §5.11.50
+//!     unreachable hash slots ([`Error::PaletteColorContextUnmapped`]).
+//!     323 -> 334 tests, zero `#[ignore]`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -749,12 +764,12 @@ pub use cdf::{
     get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, get_palette_color_context,
     get_tx_class, inter_tx_type_set, interintra_ctx, interp_filter_ctx, intra_dir, intra_mode_ctx,
     intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mv_ctx,
-    palette_color_context_from_neighbors, palette_color_ctx, palette_uv_mode_ctx,
-    palette_y_mode_ctx, partition_ctx, ref_count_ctx, segment_id_ctx, size_group, skip_ctx,
-    skip_mode_ctx, split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx,
-    PaletteColorContext, TileCdfContext, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST,
-    BLOCK_128X128, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE,
-    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
+    palette_color_context_from_neighbors, palette_color_ctx, palette_tokens_plane,
+    palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx, ref_count_ctx, segment_id_ctx,
+    size_group, skip_ctx, skip_mode_ctx, split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx,
+    txfm_split_ctx, PaletteColorContext, PalettePlane, TileCdfContext, ADJUSTED_TX_SIZE, ADST_ADST,
+    ADST_DCT, ADST_FLIPADST, BLOCK_128X128, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS,
+    CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
     COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
     COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
     COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
@@ -894,6 +909,26 @@ pub enum Error {
     /// less than `-14`, violating the §8.2.4 bitstream-conformance
     /// requirement that `SymbolMaxBits >= -14` at exit.
     SymbolExitUnderflow,
+    /// The §5.11.49 `palette_tokens` walker
+    /// ([`crate::palette_tokens_plane`]) was called with caller-supplied
+    /// dimensions / palette size / buffer that violate the spec's
+    /// implicit preconditions (palette size outside `2..=PALETTE_COLORS`,
+    /// `onscreen_{w,h}` zero or greater than `block_{w,h}`,
+    /// `color_index_map >= palette_size`, stride below `block_width`,
+    /// or output buffer smaller than `block_height * stride`). The
+    /// spec gates the walker behind §5.11.49's `if (PaletteSize{Y,UV})`
+    /// guard plus §5.11.x block-size discipline, so a conformant call
+    /// site never produces this.
+    InvalidPaletteWalkArgs,
+    /// During the §5.11.49 palette diagonal walk, the §5.11.50
+    /// `ColorContextHash` landed on an unmapped entry of
+    /// `Palette_Color_Context[]` (the slots that hold `-1`: hashes
+    /// `0`, `1`, `3`, `4`). The spec sweep over every realisable
+    /// neighbour combination at every palette size shows these hashes
+    /// are unreachable from a conformant decode state, so producing
+    /// one is a bitstream-conformance violation (or a buffer-aliasing
+    /// bug in the caller's `color_map`).
+    PaletteColorContextUnmapped,
 }
 
 impl core::fmt::Display for Error {
@@ -944,6 +979,14 @@ impl core::fmt::Display for Error {
             Self::SymbolExitUnderflow => write!(
                 f,
                 "oxideav-av1: exit_symbol() with SymbolMaxBits < -14 (§8.2.4 conformance)"
+            ),
+            Self::InvalidPaletteWalkArgs => write!(
+                f,
+                "oxideav-av1: §5.11.49 palette_tokens_plane caller-side preconditions violated"
+            ),
+            Self::PaletteColorContextUnmapped => write!(
+                f,
+                "oxideav-av1: §5.11.49 palette ColorContextHash maps to an unreachable -1 slot of Palette_Color_Context[]"
             ),
         }
     }

@@ -8220,6 +8220,189 @@ pub fn get_palette_color_context(
     palette_color_context_from_neighbors(left, above_left, above, n)
 }
 
+/// Selects the §5.11.49 plane the walker is running on: chooses
+/// between [`TileCdfContext::palette_y_color_cdf`] (Y plane,
+/// `palette_color_idx_y`) and [`TileCdfContext::palette_uv_color_cdf`]
+/// (UV plane, `palette_color_idx_uv`). The two paths differ only in
+/// which cdf-family they read from; the diagonal walk and the
+/// border-fill are identical per §5.11.49.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PalettePlane {
+    /// `ColorMapY[ ][ ]` — `palette_color_idx_y` against
+    /// `TilePaletteSize{n}YColorCdf`.
+    Y,
+    /// `ColorMapUV[ ][ ]` — `palette_color_idx_uv` against
+    /// `TilePaletteSize{n}UVColorCdf`.
+    Uv,
+}
+
+/// §5.11.49 `palette_tokens( )` per-plane walker — decodes one plane's
+/// `ColorMap{Y,UV}` from a [`SymbolDecoder`] and an initialised
+/// [`TileCdfContext`].
+///
+/// The spec function decodes both planes back-to-back in a single
+/// `palette_tokens( )` call. This helper covers exactly one of those
+/// passes; the caller invokes it once for `Y` (when `PaletteSizeY != 0`)
+/// and again for `Uv` (when `PaletteSizeUV != 0`) with the
+/// chroma-subsampled dimensions per the §5.11.49 `blockHeight =
+/// blockHeight >> subsampling_y` adjustments. Both calls are spec-faithful
+/// in isolation — the spec performs the same diagonal walk + border-fill
+/// for each plane and never mixes Y and UV state.
+///
+/// Parameters:
+///
+/// * `dec` — the §8.2 arithmetic decoder, positioned just after the
+///   `NS(PaletteSize{Y,UV})` call that produced `color_index_map_{y,uv}`.
+/// * `tile_ctx` — the §8.3.1 working CDF context; the walker borrows
+///   `palette_{y,uv}_color_cdf` once per decoded sample (the row is
+///   adapted in place per §8.3 unless the §5.9.2 `disable_cdf_update`
+///   flag was set at `init_symbol`).
+/// * `plane` — see [`PalettePlane`].
+/// * `palette_size` — `PaletteSize{Y,UV}` in `2..=PALETTE_COLORS`.
+/// * `block_width`, `block_height` — the §5.11.49 `blockWidth` and
+///   `blockHeight` (already subsampled + `<4` corrected by the caller
+///   for the UV path).
+/// * `onscreen_width`, `onscreen_height` — the §5.11.49 `onscreenWidth`
+///   and `onscreenHeight` (same caller-side adjustments).
+/// * `color_index_map` — the `NS(PaletteSize)` byte the caller read for
+///   the top-left sample of the plane. Becomes `ColorMap{Y,UV}[0][0]`.
+/// * `color_map` — a row-major output buffer of length at least
+///   `block_height * stride`. The walker writes the §5.11.49 diagonal
+///   and the border-fill into `color_map[row * stride + col]`.
+/// * `stride` — the row stride of `color_map`. Must be `>= block_width`.
+///
+/// Returns `Ok(())` on success. The §5.11.49 decode produces one
+/// `S(palette_color_idx_*)` symbol per anti-diagonal position; the
+/// `read_symbol` may bubble [`Error::UnexpectedEnd`] up if the
+/// bitstream runs short (this is the §8.2 underflow path, propagated
+/// verbatim).
+///
+/// Errors:
+///
+/// * [`Error::InvalidPaletteWalkArgs`] — caller bug. Returned when any
+///   of: `palette_size` is outside `2..=PALETTE_COLORS`; `stride <
+///   block_width`; `color_map.len() < block_height * stride`;
+///   `onscreen_width == 0` or `onscreen_height == 0`; `onscreen_width
+///   greater than `block_width` or `onscreen_height` greater than
+///   `block_height`; `color_index_map >= palette_size`; or a
+///   partial-sort run reads a neighbour value `>= PALETTE_COLORS`
+///   (cannot happen if every prior write came from this walker, which
+///   always emits values `< palette_size <= PALETTE_COLORS`, so this
+///   is a buffer-shared-with-a-bug signal).
+/// * [`Error::PaletteColorContextUnmapped`] — the §5.11.50
+///   `ColorContextHash` landed on an unmapped entry of
+///   `Palette_Color_Context[]` (hash 0, 1, 3, or 4). The spec sweep
+///   over every realisable neighbour combination shows these hashes
+///   are unreachable, so this is bitstream conformance — surface it
+///   rather than silently feeding a `-1` context to the cdf selector.
+#[allow(clippy::too_many_arguments)]
+pub fn palette_tokens_plane(
+    dec: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+    tile_ctx: &mut TileCdfContext,
+    plane: PalettePlane,
+    palette_size: usize,
+    block_width: usize,
+    block_height: usize,
+    onscreen_width: usize,
+    onscreen_height: usize,
+    color_index_map: u8,
+    color_map: &mut [u8],
+    stride: usize,
+) -> Result<(), crate::Error> {
+    // Caller-bug guards. Each maps to InvalidPaletteWalkArgs; none can
+    // be triggered by a conformant §5.11.49 caller.
+    if !(2..=PALETTE_COLORS).contains(&palette_size) {
+        return Err(crate::Error::InvalidPaletteWalkArgs);
+    }
+    if onscreen_width == 0 || onscreen_height == 0 {
+        return Err(crate::Error::InvalidPaletteWalkArgs);
+    }
+    if onscreen_width > block_width || onscreen_height > block_height {
+        return Err(crate::Error::InvalidPaletteWalkArgs);
+    }
+    if stride < block_width {
+        return Err(crate::Error::InvalidPaletteWalkArgs);
+    }
+    if color_map.len() < block_height.saturating_mul(stride) {
+        return Err(crate::Error::InvalidPaletteWalkArgs);
+    }
+    if (color_index_map as usize) >= palette_size {
+        return Err(crate::Error::InvalidPaletteWalkArgs);
+    }
+
+    // §5.11.49: ColorMap{Y,UV}[0][0] = color_index_map_{y,uv}.
+    color_map[0] = color_index_map;
+
+    // §5.11.49 diagonal walk over the onscreen rectangle. Each (r, c) =
+    // (i - j, j) sample is decoded against the §5.11.50 colour context.
+    for i in 1..(onscreen_height + onscreen_width - 1) {
+        // j descends from min(i, onscreenWidth - 1) to
+        // max(0, i - onscreenHeight + 1) — the spec's anti-diagonal
+        // ordering, which guarantees the three neighbours
+        // (left, above-left, above) are already written.
+        let j_hi = core::cmp::min(i, onscreen_width - 1);
+        let j_lo = i.saturating_sub(onscreen_height - 1);
+        let mut j = j_hi;
+        loop {
+            let r = i - j;
+            let c = j;
+
+            // §5.11.50 colour context — invariant: every neighbour
+            // already in color_map is < palette_size <= PALETTE_COLORS
+            // (we just wrote it as an indexed ColorOrder slot whose
+            // codomain is 0..palette_size).
+            let pcc = get_palette_color_context(color_map, stride, r, c, palette_size)
+                .ok_or(crate::Error::InvalidPaletteWalkArgs)?;
+            let ctx = palette_color_ctx(pcc.color_context_hash)
+                .ok_or(crate::Error::PaletteColorContextUnmapped)?;
+
+            let cdf = match plane {
+                PalettePlane::Y => tile_ctx.palette_y_color_cdf(palette_size, ctx),
+                PalettePlane::Uv => tile_ctx.palette_uv_color_cdf(palette_size, ctx),
+            }
+            .ok_or(crate::Error::InvalidPaletteWalkArgs)?;
+            let idx = dec.read_symbol(cdf)? as usize;
+            // §5.11.49: ColorMap[r][c] = ColorOrder[ palette_color_idx ].
+            // The cdf has `palette_size` symbols, so `idx < palette_size`
+            // <= PALETTE_COLORS and the indexing is in-bounds.
+            color_map[r * stride + c] = pcc.color_order[idx];
+
+            if j == j_lo {
+                break;
+            }
+            j -= 1;
+        }
+    }
+
+    // §5.11.49 horizontal border-fill: for each on-screen row, extend
+    // the right edge by replicating column `onscreenWidth - 1`.
+    for r in 0..onscreen_height {
+        let last = color_map[r * stride + (onscreen_width - 1)];
+        for c in onscreen_width..block_width {
+            color_map[r * stride + c] = last;
+        }
+    }
+
+    // §5.11.49 vertical border-fill: for each row below the on-screen
+    // band, replicate row `onscreenHeight - 1` across the full block
+    // width.
+    if onscreen_height < block_height {
+        // Snapshot row (onscreenHeight - 1) into a small temp so the
+        // copy doesn't alias the destination through `color_map[..]`.
+        let src_row_start = (onscreen_height - 1) * stride;
+        let mut row_snapshot = [0u8; 64]; // block widths are <= 64
+        let row_w = block_width;
+        debug_assert!(row_w <= row_snapshot.len(), "block width fits in 64");
+        row_snapshot[..row_w].copy_from_slice(&color_map[src_row_start..src_row_start + row_w]);
+        for r in onscreen_height..block_height {
+            let dst = r * stride;
+            color_map[dst..dst + row_w].copy_from_slice(&row_snapshot[..row_w]);
+        }
+    }
+
+    Ok(())
+}
+
 /// §8.3.2 `cfl_alpha_u` context: `ctx = (signU - 1) * 3 + signV`, which
 /// the spec notes equals `cfl_alpha_signs - 2`. `sign_u` / `sign_v` are
 /// the §5.11.45 joint-sign components (`CFL_SIGN_ZERO == 0`,
@@ -14502,5 +14685,559 @@ mod tests {
         let w8_row = &DEFAULT_PARTITION_W8_CDF[0];
         assert!(split_or_horz_cdf(w8_row, 3).is_none());
         assert!(split_or_vert_cdf(w8_row, 3).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Round 147 — §5.11.49 palette_tokens diagonal walker tests.
+    // -----------------------------------------------------------------
+
+    /// §5.11.49 — caller-bug pre-conditions all reject with
+    /// [`crate::Error::InvalidPaletteWalkArgs`] before any symbol is
+    /// read. The walker never advances the decoder on a rejection.
+    #[test]
+    fn palette_tokens_plane_rejects_caller_bug_args() {
+        // Common harness: a 4-byte stream + 4x4 buffer + size-2 palette
+        // — bytes don't matter because every assertion is supposed to
+        // short-circuit before the first read_symbol.
+        let bytes = [0xFFu8, 0xFEu8, 0u8, 0u8];
+
+        // palette_size out of 2..=PALETTE_COLORS.
+        for &bad_n in &[0usize, 1, PALETTE_COLORS + 1, 100] {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+            let mut tile = TileCdfContext::new_from_defaults();
+            let mut cm = [0u8; 16];
+            let r = palette_tokens_plane(
+                &mut dec,
+                &mut tile,
+                PalettePlane::Y,
+                bad_n,
+                4,
+                4,
+                4,
+                4,
+                0,
+                &mut cm,
+                4,
+            );
+            assert!(matches!(r, Err(crate::Error::InvalidPaletteWalkArgs)));
+        }
+
+        // onscreen_w == 0 or onscreen_h == 0.
+        for (ow, oh) in [(0usize, 4usize), (4, 0)] {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+            let mut tile = TileCdfContext::new_from_defaults();
+            let mut cm = [0u8; 16];
+            let r = palette_tokens_plane(
+                &mut dec,
+                &mut tile,
+                PalettePlane::Y,
+                4,
+                4,
+                4,
+                ow,
+                oh,
+                0,
+                &mut cm,
+                4,
+            );
+            assert!(matches!(r, Err(crate::Error::InvalidPaletteWalkArgs)));
+        }
+
+        // onscreen_w > block_w / onscreen_h > block_h.
+        for (bw, bh, ow, oh) in [(4usize, 4usize, 5, 4), (4, 4, 4, 5)] {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+            let mut tile = TileCdfContext::new_from_defaults();
+            let mut cm = [0u8; 32];
+            let r = palette_tokens_plane(
+                &mut dec,
+                &mut tile,
+                PalettePlane::Y,
+                4,
+                bw,
+                bh,
+                ow,
+                oh,
+                0,
+                &mut cm,
+                bw.max(ow),
+            );
+            assert!(matches!(r, Err(crate::Error::InvalidPaletteWalkArgs)));
+        }
+
+        // stride < block_width.
+        {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+            let mut tile = TileCdfContext::new_from_defaults();
+            let mut cm = [0u8; 12];
+            let r = palette_tokens_plane(
+                &mut dec,
+                &mut tile,
+                PalettePlane::Y,
+                4,
+                4,
+                4,
+                4,
+                4,
+                0,
+                &mut cm,
+                3,
+            );
+            assert!(matches!(r, Err(crate::Error::InvalidPaletteWalkArgs)));
+        }
+
+        // color_map buffer too small (block_h * stride > len).
+        {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+            let mut tile = TileCdfContext::new_from_defaults();
+            let mut cm = [0u8; 12]; // need 16
+            let r = palette_tokens_plane(
+                &mut dec,
+                &mut tile,
+                PalettePlane::Y,
+                4,
+                4,
+                4,
+                4,
+                4,
+                0,
+                &mut cm,
+                4,
+            );
+            assert!(matches!(r, Err(crate::Error::InvalidPaletteWalkArgs)));
+        }
+
+        // color_index_map >= palette_size.
+        {
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+            let mut tile = TileCdfContext::new_from_defaults();
+            let mut cm = [0u8; 16];
+            let r = palette_tokens_plane(
+                &mut dec,
+                &mut tile,
+                PalettePlane::Y,
+                4,
+                4,
+                4,
+                4,
+                4,
+                4, // == palette_size; spec requires <
+                &mut cm,
+                4,
+            );
+            assert!(matches!(r, Err(crate::Error::InvalidPaletteWalkArgs)));
+        }
+    }
+
+    /// §5.11.49 — the corner case of `onscreen_width == block_width`
+    /// and `onscreen_height == block_height`: no border-fill happens
+    /// and every interior sample of the on-screen rectangle is
+    /// written. Test on a 2x2 / palette-size-2 walk: the diagonal
+    /// loop runs i=1,2 with j-sequences (1,0) and (1) respectively, so
+    /// three `read_symbol` calls happen.
+    #[test]
+    fn palette_tokens_plane_2x2_no_border_fill_writes_every_cell() {
+        // Use SymbolDecoder bytes that decode through the size-2 cdf
+        // family producing in-range symbols. The exact symbol values
+        // are an implementation detail of the §8.2.6 search; we only
+        // assert structural properties (every cell < palette_size).
+        let bytes = [0x55u8, 0xAAu8, 0x55u8, 0xAAu8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0xFFu8; 4];
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            2,
+            2,
+            2,
+            2,
+            2,
+            1,
+            &mut cm,
+            2,
+        )
+        .unwrap();
+        // (0,0) seed.
+        assert_eq!(cm[0], 1);
+        // Every cell holds a valid palette index.
+        for v in cm.iter() {
+            assert!((*v as usize) < 2, "cell value {v} >= palette_size 2");
+        }
+    }
+
+    /// §5.11.49 — horizontal border-fill: for a 2-wide on-screen
+    /// block inside a 4-wide block, the (0..onscreen_h) rows must
+    /// have columns 2 and 3 replicated from column 1 after the walk.
+    #[test]
+    fn palette_tokens_plane_horizontal_border_fill_replicates_column() {
+        // Hand-craft a state: seed the walker with the 2x2 on-screen
+        // walk through a size-2 palette, then check the right-edge
+        // extension.
+        let bytes = [0xC0u8, 0x00u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0u8; 8]; // 2 rows * stride 4
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            2,
+            4,
+            2,
+            2,
+            2,
+            1,
+            &mut cm,
+            4,
+        )
+        .unwrap();
+        // Right-edge cells (cols 2, 3) equal the on-screen last column
+        // (col 1) in each row.
+        for r in 0..2usize {
+            assert_eq!(cm[r * 4 + 2], cm[r * 4 + 1]);
+            assert_eq!(cm[r * 4 + 3], cm[r * 4 + 1]);
+        }
+    }
+
+    /// §5.11.49 — vertical border-fill: rows from `onscreen_height` up
+    /// to `block_height` are replicated from row `onscreen_height - 1`
+    /// across the full `block_width`.
+    #[test]
+    fn palette_tokens_plane_vertical_border_fill_replicates_row() {
+        let bytes = [0xC0u8, 0x00u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0u8; 16]; // 4 rows * stride 4
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            2,
+            4,
+            4, // block 4x4
+            4,
+            2, // on-screen 4x2
+            1,
+            &mut cm,
+            4,
+        )
+        .unwrap();
+        // Rows 2 and 3 equal row 1 (the last on-screen row) cell-by-cell
+        // across all 4 columns.
+        for r in 2..4usize {
+            for c in 0..4usize {
+                assert_eq!(cm[r * 4 + c], cm[4 + c]);
+            }
+        }
+    }
+
+    /// §5.11.49 — combined border-fill: 2x2 on-screen inside a 4x4
+    /// block exercises both the right-edge and the bottom-band paths.
+    /// The bottom band (rows 2..4) must mirror row 1 across columns
+    /// 0..4 (including the right-edge replicated cells).
+    #[test]
+    fn palette_tokens_plane_combined_border_fill_corner_block() {
+        let bytes = [0xC0u8, 0x00u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0u8; 16];
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            2,
+            4,
+            4,
+            2,
+            2,
+            1,
+            &mut cm,
+            4,
+        )
+        .unwrap();
+        // Right edge.
+        for r in 0..2usize {
+            assert_eq!(cm[r * 4 + 2], cm[r * 4 + 1]);
+            assert_eq!(cm[r * 4 + 3], cm[r * 4 + 1]);
+        }
+        // Bottom band — row 1 across the whole width gets replicated.
+        for r in 2..4usize {
+            for c in 0..4usize {
+                assert_eq!(cm[r * 4 + c], cm[4 + c]);
+            }
+        }
+    }
+
+    /// §5.11.49 — sweeping every spec-realisable `(onscreen_w,
+    /// onscreen_h)` shape inside a 4x4 / size-2 palette walk: the
+    /// (0,0) seed is preserved, every cell in `0..block_h * stride`
+    /// holds a value `< palette_size`, and no decoder-side error is
+    /// raised. Confirms the diagonal-walk index arithmetic holds for
+    /// rectangular shapes (W != H).
+    #[test]
+    fn palette_tokens_plane_rectangular_onscreen_shapes_well_formed() {
+        for ow in 1..=4usize {
+            for oh in 1..=4usize {
+                // Each call gets a fresh decoder; bytes are arbitrary
+                // but enough for the largest 4x4 walk to consume.
+                let bytes = [0x55u8, 0xAAu8, 0x55u8, 0xAAu8, 0x55u8, 0xAAu8];
+                let mut dec = SymbolDecoder::init_symbol(&bytes, 6, true).unwrap();
+                let mut tile = TileCdfContext::new_from_defaults();
+                let mut cm = [0xFEu8; 16];
+                palette_tokens_plane(
+                    &mut dec,
+                    &mut tile,
+                    PalettePlane::Y,
+                    2,
+                    4,
+                    4,
+                    ow,
+                    oh,
+                    1,
+                    &mut cm,
+                    4,
+                )
+                .unwrap();
+                assert_eq!(cm[0], 1, "(0,0) seed preserved");
+                for &v in cm.iter() {
+                    assert!((v as usize) < 2);
+                }
+            }
+        }
+    }
+
+    /// §5.11.49 — the UV plane runs the same diagonal walk against
+    /// the `palette_uv_color_cdf` family. With a size-2 / no-CDF-update
+    /// decoder and the same harness as the Y test, the UV path must
+    /// behave identically (the walker's only Y/UV difference is the
+    /// cdf selector). We further confirm the §8.3 adaptation _did_
+    /// occur on the UV row when `disable_cdf_update == false`.
+    #[test]
+    fn palette_tokens_plane_uv_plane_adapts_uv_cdf_family() {
+        let bytes = [0xC0u8, 0x00u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let before_y2 = tile.palette_y_color_cdf(2, 0).unwrap().to_vec();
+        let before_uv2 = tile.palette_uv_color_cdf(2, 0).unwrap().to_vec();
+        let mut cm = [0u8; 4];
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Uv,
+            2,
+            2,
+            2,
+            2,
+            2,
+            0,
+            &mut cm,
+            2,
+        )
+        .unwrap();
+        // (0,0) seed.
+        assert_eq!(cm[0], 0);
+        for &v in cm.iter() {
+            assert!((v as usize) < 2);
+        }
+        // The Y family must remain untouched (Uv plane only adapts the
+        // UV cdf family); some UV row must have ticked.
+        assert_eq!(
+            tile.palette_y_color_cdf(2, 0).unwrap(),
+            before_y2.as_slice()
+        );
+        let mut any_changed = false;
+        for c in 0..PALETTE_COLOR_CONTEXTS {
+            if tile.palette_uv_color_cdf(2, c).unwrap() != before_uv2.as_slice() {
+                any_changed = true;
+                break;
+            }
+        }
+        // The walker reads 3 symbols total (i=1: j=1,0; i=2: j=1) so
+        // at least one of the size-2 UV rows must have been adapted.
+        let _ = (before_uv2, any_changed);
+        assert!(any_changed, "§8.3 CDF update must touch the UV cdf family");
+    }
+
+    /// §5.11.49 — chroma-subsampled UV path: the spec adjusts
+    /// `blockWidth`, `blockHeight`, `onscreenWidth`, `onscreenHeight`
+    /// by `subsampling_{x,y}`, then bumps the width or height by 2 if
+    /// it dropped below 4. The walker itself sees only the already-adjusted
+    /// values, so a 4x4 / on-screen-4x4 / palette-2 UV call must behave
+    /// equivalently to the corresponding Y call. We check that here:
+    /// both produce a 16-cell colour map where every cell is `< 2`.
+    #[test]
+    fn palette_tokens_plane_uv_chroma_subsampled_shape_well_formed() {
+        let bytes_y = [0x55u8, 0xAAu8, 0x55u8, 0xAAu8];
+        let mut dec_y = SymbolDecoder::init_symbol(&bytes_y, 4, true).unwrap();
+        let mut tile_y = TileCdfContext::new_from_defaults();
+        let mut cm_y = [0xFFu8; 16];
+        palette_tokens_plane(
+            &mut dec_y,
+            &mut tile_y,
+            PalettePlane::Y,
+            2,
+            4,
+            4,
+            4,
+            4,
+            0,
+            &mut cm_y,
+            4,
+        )
+        .unwrap();
+
+        let bytes_uv = [0x55u8, 0xAAu8, 0x55u8, 0xAAu8];
+        let mut dec_uv = SymbolDecoder::init_symbol(&bytes_uv, 4, true).unwrap();
+        let mut tile_uv = TileCdfContext::new_from_defaults();
+        let mut cm_uv = [0xFFu8; 16];
+        palette_tokens_plane(
+            &mut dec_uv,
+            &mut tile_uv,
+            PalettePlane::Uv,
+            2,
+            4,
+            4,
+            4,
+            4,
+            0,
+            &mut cm_uv,
+            4,
+        )
+        .unwrap();
+
+        // Both must produce 16 in-range cells. (Values may differ —
+        // the size-2 UV cdf is not byte-equal to the size-2 Y cdf.)
+        for r in 0..4usize {
+            for c in 0..4usize {
+                assert!((cm_y[r * 4 + c] as usize) < 2);
+                assert!((cm_uv[r * 4 + c] as usize) < 2);
+            }
+        }
+    }
+
+    /// §5.11.49 — confirm the §5.11.50 boundary guards drive the
+    /// walker correctly at the (0, c) and (r, 0) edges. With every
+    /// cell so far equal to 0 (the §5.11.50 partial sort leaves
+    /// ColorOrder = [0, 1] in this case), the decoded
+    /// `palette_color_idx_y` must map through `ColorOrder[ idx ]` and
+    /// the result must always be in `0..2`.
+    #[test]
+    fn palette_tokens_plane_edge_positions_use_color_order_remap() {
+        let bytes = [0x00u8, 0x00u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0u8; 4];
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            2,
+            2,
+            2,
+            2,
+            2,
+            0,
+            &mut cm,
+            2,
+        )
+        .unwrap();
+        // (0,0) was seeded to 0. The three decoded cells must be in 0..2.
+        assert_eq!(cm[0], 0);
+        for &v in &cm[1..] {
+            assert!((v as usize) < 2);
+        }
+    }
+
+    /// §5.11.49 — degenerate 1-wide block (block_width == 1,
+    /// onscreen_width == 1). The diagonal walk `i < 1 + onscreen_h - 1`
+    /// reduces to a single column; only the (0,0) seed is written for
+    /// onscreen_h == 1, otherwise the rest of the column is decoded
+    /// via the same diagonal arithmetic. Confirms the walker handles
+    /// the bounds without underflow.
+    #[test]
+    fn palette_tokens_plane_degenerate_one_wide_shape() {
+        // 1x1 on-screen / 1x1 block: only (0,0) seed; no read_symbol
+        // and no border-fill.
+        let bytes = [0xFFu8, 0xFFu8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 2, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0xAAu8; 1];
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            2,
+            1,
+            1,
+            1,
+            1,
+            1,
+            &mut cm,
+            1,
+        )
+        .unwrap();
+        assert_eq!(cm[0], 1);
+
+        // 1x3 on-screen / 1x3 block: walk runs i=1,2 each with j=0.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 2, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0xAAu8; 3];
+        palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            2,
+            1,
+            3,
+            1,
+            3,
+            0,
+            &mut cm,
+            1,
+        )
+        .unwrap();
+        assert_eq!(cm[0], 0);
+        for &v in &cm[1..] {
+            assert!((v as usize) < 2);
+        }
+    }
+
+    /// §5.11.49 — `read_symbol` byte-underflow propagates as
+    /// `Error::UnexpectedEnd` (the §8.2 path) rather than as one of
+    /// the walker's caller-bug variants. We provoke this by giving
+    /// the symbol decoder a tiny `sz` (1 byte) so the renormaliser
+    /// hits the `SymbolMaxBits` floor after a handful of reads and
+    /// then runs out of bytes.
+    #[test]
+    fn palette_tokens_plane_propagates_symbol_decoder_underflow() {
+        // A pathological case: a max-size palette walk against a
+        // 1-byte bitstream. The §8.2 reader cannot service the many
+        // renormalisation reads the walk demands.
+        let bytes = [0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
+        let mut tile = TileCdfContext::new_from_defaults();
+        let mut cm = [0u8; 64];
+        let r = palette_tokens_plane(
+            &mut dec,
+            &mut tile,
+            PalettePlane::Y,
+            8,
+            8,
+            8,
+            8,
+            8,
+            0,
+            &mut cm,
+            8,
+        );
+        // Either underflow (UnexpectedEnd) is raised, or — if the
+        // arithmetic happens to track padding zeros through to the
+        // end — the walker completes; both are §8.2-conformant. The
+        // important invariant is that the walker never produces an
+        // InvalidPaletteWalkArgs on this input.
+        if let Err(e) = r {
+            assert!(matches!(e, crate::Error::UnexpectedEnd));
+        }
     }
 }

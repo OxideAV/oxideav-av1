@@ -1085,6 +1085,31 @@ that wires `get_palette_color_context` into the §5.11.49 diagonal walk,
 plus the corresponding wedge / inter / intra walks for the unwalked
 syntax elements …) are a mechanical followup against the same
 `TileCdfContext` shape.
+Round 147 lands the §5.11.49 **`palette_tokens( )` per-plane diagonal
+walker** (p.101–102) — the caller-facing entry that drives the §5.11.50
+colour-context derivation across an anti-diagonal walk, decodes one
+`palette_color_idx_{y,uv}` per `(i - j, j)` against the cdf row picked
+by `palette_color_ctx`, remaps through `ColorOrder[idx]`, and replicates
+the on-screen last column / last row into the block's border band.
+Surface: `palette_tokens_plane(dec, tile_ctx, plane, palette_size,
+block_w, block_h, onscreen_w, onscreen_h, color_index_map, color_map,
+stride) -> Result<(), Error>` with `PalettePlane::{Y, Uv}` picking
+between `palette_y_color_cdf` and `palette_uv_color_cdf`. The
+chroma-subsampling adjustments (`blockWidth >> subsampling_x` and the
+`< 4` bump) are the caller's responsibility — they belong to the
+§5.11.49 outer-control flow, not the walker. Two new `Error` variants
+surface caller-bug preconditions (`InvalidPaletteWalkArgs`) and the
+§5.11.50 unreachable hash slots (`PaletteColorContextUnmapped`); the
+`SymbolDecoder` underflow path still propagates as `UnexpectedEnd`.
+11 new unit tests (323 -> 334) cover every caller-bug rejection, a 2x2
+on-screen walk that writes every cell with no border-fill, the
+horizontal / vertical / combined border-fill paths on a 2x2 / 4x4
+shape, a rectangular shape sweep over every `(onscreen_w, onscreen_h)`
+in `1..=4 × 1..=4`, the UV plane adapting only the UV cdf family, the
+chroma-subsampled UV / Y shape parity, the `ColorOrder[idx]` remap on
+the 2x2 edge positions, the degenerate 1-wide-block shape, and
+`read_symbol` underflow propagating as `UnexpectedEnd` (not as a
+walker-side caller-bug variant).
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)

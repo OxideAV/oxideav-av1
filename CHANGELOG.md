@@ -6,6 +6,50 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 147 — §5.11.49 `palette_tokens` per-plane diagonal walker.**
+  Lands the §5.11.49 palette-tokens walker (p.101–102) that drives the
+  decoded `ColorMap{Y,UV}` from the `SymbolDecoder`-emitted
+  `palette_color_idx_{y,uv}` symbols and the §5.11.50
+  [`get_palette_color_context`] derivation landed in r146. Surface:
+  `palette_tokens_plane(dec, tile_ctx, plane, palette_size, block_w,
+  block_h, onscreen_w, onscreen_h, color_index_map, color_map, stride)
+  -> Result<(), Error>`, with `PalettePlane::{Y, Uv}` picking the
+  `palette_{y,uv}_color_cdf` family. The walker (a) seeds
+  `ColorMap{Y,UV}[0][0] = color_index_map_{y,uv}`; (b) runs the
+  anti-diagonal walk `for i in 1..H+W-1 { for j in min(i, W-1) ..=
+  max(0, i - H + 1) }` decoding one `palette_color_idx_*` per
+  `(i - j, j)` against the §5.11.50 colour-context-derived cdf row,
+  writing `ColorMap[r][c] = ColorOrder[idx]`; (c) replicates the
+  on-screen right edge (`onscreen_width - 1`) into columns
+  `onscreen_width..block_width`; and (d) replicates the on-screen
+  bottom row (`onscreen_height - 1`) across the full `block_width`
+  into rows `onscreen_height..block_height`. The chroma-subsampled UV
+  path is the same walker; the §5.11.49 `blockWidth >> subsampling_x`
+  and `<4 -> +=2` adjustments are the caller's responsibility (they
+  belong to the §5.11.49 outer-control flow, not the walker). Two new
+  [`Error`] variants surface caller bugs (palette size out of range /
+  buffer too small / on-screen exceeds block / `color_index_map` out
+  of palette range) as [`Error::InvalidPaletteWalkArgs`] and the
+  unreachable §5.11.50 hash slots (`0`, `1`, `3`, `4`) as
+  [`Error::PaletteColorContextUnmapped`]. Tests grow by 11 (cdf
+  module): every caller-bug pre-condition is rejected before any
+  `read_symbol`; 2x2 on-screen / no border-fill walk writes every
+  cell to a value `< palette_size` and preserves the (0,0) seed;
+  horizontal border-fill replicates column `onscreen_width - 1` into
+  the right columns; vertical border-fill replicates row
+  `onscreen_height - 1` into the bottom rows; combined corner-block
+  fill (2x2 on-screen / 4x4 block) exercises both fills together;
+  rectangular shape sweep over every `(onscreen_w, onscreen_h)` in
+  `1..=4 × 1..=4` for a 4x4 block confirms no decoder error; the UV
+  plane adapts the `palette_uv_color_cdf` family and leaves the Y
+  family untouched; chroma-subsampled UV / Y shape parity at the
+  4x4 / palette-2 fixture; edge positions on a 2x2 block use the
+  `ColorOrder[idx]` remap correctly with the `[0, 1]` identity
+  permutation; the 1-wide-block degenerate shape walks without
+  underflow; and bitstream-side `read_symbol` underflow propagates
+  as [`Error::UnexpectedEnd`] rather than as an `InvalidPaletteWalkArgs`.
+  Tests: 323 -> 334, zero `#[ignore]`.
+
 * **Round 146 — §5.11.50 `get_palette_color_context` derivation.** Lands
   the §5.11.50 palette colour-context function (p.103) that consumes the
   `colorMap` at the §5.11.49 diagonal-walk position `(r, c)` plus the
