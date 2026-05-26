@@ -6,6 +6,62 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 156 — §5.11.13 `read_delta_lf()` syntax element.**
+  Lands the per-superblock loop-filter delta read (av1-spec p.68)
+  as a new [`PartitionWalker::decode_delta_lf`] method, structurally
+  parallel to the §5.11.12 `decode_delta_qindex` walker landed in
+  r155 but iterating `frameLfCount` times over a four-slot
+  `DeltaLF[ i ]` accumulator and selecting between the §8.3.2
+  single-LF (`TileDeltaLFCdf`) and per-edge multi-LF
+  (`TileDeltaLFMultiCdf[ i ]`) CDF rows via the `delta_lf_multi`
+  argument. Adds a `current_delta_lf: [i32; FRAME_LF_COUNT]`
+  accumulator on `PartitionWalker` with
+  [`PartitionWalker::current_delta_lf`] read accessor and
+  [`PartitionWalker::reset_current_delta_lf`] for the §5.11.2
+  tile-entry reset.
+
+  Honours the §5.11.13 superblock-skip short-circuit (identical
+  shape to §5.11.12) and the outer `ReadDeltas && delta_lf_present`
+  gate (two AND-ed flags — `delta_lf_present` is the §5.9.18
+  frame-header bit, accepted as an argument). When the gate
+  passes, `frameLfCount` is derived locally:
+  `delta_lf_multi == 0 ⇒ 1`;
+  `delta_lf_multi == 1 && mono_chrome ⇒ FRAME_LF_COUNT - 2 = 2`;
+  otherwise `FRAME_LF_COUNT = 4`. Each iteration reads
+  `delta_lf_abs` `S()` against the branch-selected CDF, then either
+  the literal value or the §5.11.13 escape ladder
+  (`delta_lf_rem_bits` `L(3)` + post-increment + `delta_lf_abs_bits`
+  `L(rem_bits + 1)` ⇒ `deltaLfAbs = abs_bits + (1 << n) + 1`); for
+  non-zero magnitudes reads `delta_lf_sign_bit` `L(1)` and applies
+  `DeltaLF[ i ] = Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+  DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res))`.
+
+  New constants [`DELTA_LF_SMALL = 3`], [`FRAME_LF_COUNT = 4`],
+  and `cdf::MAX_LOOP_FILTER = 63i32` (distinct from the pre-existing
+  `uncompressed_header_tail::MAX_LOOP_FILTER` `i16` twin from §5.9.11).
+  New table [`DEFAULT_DELTA_LF_CDF`] transcribed verbatim from §9.4
+  p.431 (`[28160, 32120, 32677, 32768, 0]`, identical row to
+  `DEFAULT_DELTA_Q_CDF` per the spec listing — preserved as two
+  independent constants so adaptation drift on one does not leak
+  through the other). New fields [`TileCdfContext::delta_lf`] +
+  [`TileCdfContext::delta_lf_multi`] with accessors
+  [`TileCdfContext::delta_lf_cdf`] /
+  [`TileCdfContext::delta_lf_multi_cdf`]. Tests grow by 17 (cdf
+  module): default-CDF literal match (incl. §9.4 equality with
+  `DEFAULT_DELTA_Q_CDF`); init-from-defaults invariant for both
+  single-LF and all four multi-LF rows; sb-skip short-circuit at
+  both `use_128x128_superblock` settings; `ReadDeltas` false
+  short-circuit; `delta_lf_present` false short-circuit; single-LF
+  branch writes only `DeltaLF[ 0 ]`; multi-LF colour branch writes
+  all four slots; multi-LF monochrome branch writes only the two
+  Y slots; zero-`delta_lf_abs` no-update; literal-positive with
+  shift; Clip3 upper-bound at `MAX_LOOP_FILTER = 63`; Clip3
+  lower-bound via hostile seed at `i32::MIN + 1`;
+  `DELTA_LF_SMALL` escape ladder minimum value; cross-call
+  accumulation; fresh-walker initial accumulator all-zero +
+  `reset_current_delta_lf` round-trip; out-of-range guard. 433 ->
+  450 tests, zero `#[ignore]`.
+
 * **Round 155 — §5.11.12 `read_delta_qindex()` syntax element.**
   Lands the per-superblock quantiser-index delta read (av1-spec
   p.67) as a new [`PartitionWalker::decode_delta_qindex`] method

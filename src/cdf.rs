@@ -319,6 +319,39 @@ pub const SKIP_MODE_CONTEXTS: usize = 3;
 /// length `DELTA_Q_SMALL + 2 = 5`.
 pub const DELTA_Q_SMALL: usize = 3;
 
+/// `DELTA_LF_SMALL` (§3, av1-spec p.16) — the escape value for the
+/// §5.11.13 `delta_lf_abs` symbol. Mirrors the role of
+/// [`DELTA_Q_SMALL`] for the loop-filter delta read: when the decoded
+/// `delta_lf_abs` equals this constant the absolute delta is encoded
+/// via the `delta_lf_rem_bits` (`L(3)`) + `delta_lf_abs_bits` (`L(n)`)
+/// ladder. The §8.3.2 `TileDeltaLFCdf` / `TileDeltaLFMultiCdf[ i ]`
+/// rows therefore cover `DELTA_LF_SMALL + 1` literal values
+/// (`0..=DELTA_LF_SMALL`) plus the §8.2.6 counter slot — i.e. length
+/// `DELTA_LF_SMALL + 2 = 5`.
+pub const DELTA_LF_SMALL: usize = 3;
+
+/// `FRAME_LF_COUNT` (§3, av1-spec p.16) — number of loop filter
+/// strength values per frame. Used as the upper bound on the §5.11.13
+/// `for ( i = 0; i < frameLfCount; i++ )` loop and the size of the
+/// `DeltaLFMultiCdf[ FRAME_LF_COUNT ]` array and the §5.11.2
+/// `DeltaLF[ FRAME_LF_COUNT ]` accumulator. When `delta_lf_multi == 1`
+/// and `NumPlanes > 1`, `frameLfCount = FRAME_LF_COUNT = 4` (the four
+/// edge categories: horizontal-Y, vertical-Y, U, V); when
+/// `NumPlanes == 1` it is `FRAME_LF_COUNT - 2 = 2`; when
+/// `delta_lf_multi == 0`, `frameLfCount = 1`.
+pub const FRAME_LF_COUNT: usize = 4;
+
+/// `MAX_LOOP_FILTER` (§3, av1-spec p.16) — the §5.11.13 `Clip3(
+/// -MAX_LOOP_FILTER, MAX_LOOP_FILTER, ...)` bound on the running
+/// `DeltaLF[ i ]` accumulator. The §6.10.2 `Clip3(0, MAX_LOOP_FILTER,
+/// deltaLF + loop_filter_level[ i ])` derivation downstream uses the
+/// same constant; the loop-filter-level-parser module
+/// (`uncompressed_header_tail::MAX_LOOP_FILTER`) holds an `i16`-typed
+/// twin for the §5.9.11 ref-/mode-delta clip bounds. Held as `i32`
+/// here because the pre-clip §5.11.13 sum
+/// `DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res)` is signed.
+pub const MAX_LOOP_FILTER: i32 = 63;
+
 /// `REF_CONTEXTS` (§3) — number of contexts for `single_ref`, `comp_ref`,
 /// `comp_bwdref`, and `uni_comp_ref`.
 pub const REF_CONTEXTS: usize = 3;
@@ -1467,6 +1500,21 @@ pub const DEFAULT_SKIP_MODE_CDF: [[u16; 3]; SKIP_MODE_CONTEXTS] =
 /// working `TileDeltaQCdf` is a single row instead of a per-context
 /// `[CONTEXTS][..]` array.
 pub const DEFAULT_DELTA_Q_CDF: [u16; DELTA_Q_SMALL + 2] = [28160, 32120, 32677, 32768, 0];
+
+/// `Default_Delta_Lf_Cdf[ DELTA_LF_SMALL + 2 ]` (§9.4, av1-spec p.431).
+/// Codes `delta_lf_abs` per §8.3.2 `TileDeltaLFCdf` (when
+/// `delta_lf_multi == 0`) and is also the per-plane initialiser for
+/// every row of `TileDeltaLFMultiCdf[ FRAME_LF_COUNT ]` (when
+/// `delta_lf_multi == 1`) — the §8.3.1 init step reads "`DeltaLFCdf`
+/// is set to a copy of `Default_Delta_Lf_Cdf`" and "`DeltaLFMultiCdf[
+/// i ]` is set to a copy of `Default_Delta_Lf_Cdf` for
+/// `i = 0..FRAME_LF_COUNT-1`". The §9.4 spec listing shows a value
+/// row literally equal to `Default_Delta_Q_Cdf`; this is the spec's
+/// intent — the two §5.11.x delta syntax elements share their
+/// fresh-context distribution. Both rows are transcribed
+/// independently so that any future adaptation drift (via §8.4.4) on
+/// one does not leak through a shared reference.
+pub const DEFAULT_DELTA_LF_CDF: [u16; DELTA_LF_SMALL + 2] = [28160, 32120, 32677, 32768, 0];
 
 /// `Default_Comp_Ref_Cdf[ REF_CONTEXTS ][ FWD_REFS - 1 ][ 3 ]` (§9.4).
 /// Binary; codes `comp_ref` / `comp_ref_p1` / `comp_ref_p2` per §8.3.2
@@ -6776,6 +6824,17 @@ pub struct TileCdfContext {
     /// `TileDeltaQCdf` (§8.3.1, av1-spec p.382). Codes `delta_q_abs`
     /// per §5.11.12 / §8.3.2; single CDF row (no context index).
     pub delta_q: [u16; DELTA_Q_SMALL + 2],
+    /// `TileDeltaLFCdf` (§8.3.1, av1-spec p.382). Codes
+    /// `delta_lf_abs` per §5.11.13 / §8.3.2 in the
+    /// `delta_lf_multi == 0` branch; single CDF row (no context
+    /// index).
+    pub delta_lf: [u16; DELTA_LF_SMALL + 2],
+    /// `TileDeltaLFMultiCdf[ FRAME_LF_COUNT ]` (§8.3.1, av1-spec
+    /// p.382). Codes `delta_lf_abs` per §5.11.13 / §8.3.2 in the
+    /// `delta_lf_multi == 1` branch — one CDF row per loop-filter
+    /// strength index `i ∈ 0..FRAME_LF_COUNT`. The §8.3.1 init step
+    /// initialises every row from [`DEFAULT_DELTA_LF_CDF`].
+    pub delta_lf_multi: [[u16; DELTA_LF_SMALL + 2]; FRAME_LF_COUNT],
     /// `TileCompRefCdf[ REF_CONTEXTS ][ FWD_REFS - 1 ]` (§8.3.1).
     pub comp_ref: [[[u16; 3]; FWD_REFS - 1]; REF_CONTEXTS],
     /// `TileCompBwdRefCdf[ REF_CONTEXTS ][ BWD_REFS - 1 ]` (§8.3.1).
@@ -7111,6 +7170,8 @@ impl TileCdfContext {
             comp_mode: DEFAULT_COMP_MODE_CDF,
             skip_mode: DEFAULT_SKIP_MODE_CDF,
             delta_q: DEFAULT_DELTA_Q_CDF,
+            delta_lf: DEFAULT_DELTA_LF_CDF,
+            delta_lf_multi: [DEFAULT_DELTA_LF_CDF; FRAME_LF_COUNT],
             comp_ref: DEFAULT_COMP_REF_CDF,
             comp_bwd_ref: DEFAULT_COMP_BWD_REF_CDF,
             single_ref: DEFAULT_SINGLE_REF_CDF,
@@ -7404,6 +7465,25 @@ impl TileCdfContext {
     /// the §5.11.12 `delta_q_rem_bits` / `delta_q_abs_bits` ladder.
     pub fn delta_q_cdf(&mut self) -> &mut [u16] {
         &mut self.delta_q
+    }
+
+    /// §8.3.2 `delta_lf_abs` (single-LF branch, `delta_lf_multi ==
+    /// 0`): the cdf is `TileDeltaLFCdf` (no context index). Length is
+    /// `DELTA_LF_SMALL + 2 = 5`, encoding the four literal values
+    /// `0..=DELTA_LF_SMALL` plus the §8.2.6 counter slot. A decoded
+    /// value of `DELTA_LF_SMALL` is the escape into the §5.11.13
+    /// `delta_lf_rem_bits` / `delta_lf_abs_bits` ladder.
+    pub fn delta_lf_cdf(&mut self) -> &mut [u16] {
+        &mut self.delta_lf
+    }
+
+    /// §8.3.2 `delta_lf_abs` (multi-LF branch, `delta_lf_multi ==
+    /// 1`): the cdf is `TileDeltaLFMultiCdf[ i ]`, with the index
+    /// `i` selecting the loop-filter-strength row in
+    /// `0..FRAME_LF_COUNT`. Same length / encoding as
+    /// [`Self::delta_lf_cdf`].
+    pub fn delta_lf_multi_cdf(&mut self, i: usize) -> &mut [u16] {
+        &mut self.delta_lf_multi[i]
     }
 
     /// §8.3.2 `comp_ref`: the cdf is `TileCompRefCdf[ ctx ][ p ]`, with
@@ -10559,6 +10639,18 @@ pub struct PartitionWalker {
     /// pre-Clip3 sum is a signed quantity (the spec writes
     /// `CurrentQIndex + (reducedDeltaQIndex << delta_q_res)`).
     current_q_index: i32,
+    /// `DeltaLF[ i ]` (§5.11.2 / §5.11.13) — the four running
+    /// loop-filter-strength deltas. §5.11.2 `decode_tile()` resets
+    /// every slot to `0` at tile entry; §5.11.13 updates one (when
+    /// `delta_lf_multi == 0`, only `DeltaLF[0]`) or all
+    /// `frameLfCount` slots per superblock with the spec's
+    /// `Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER, DeltaLF[i] +
+    /// (reducedDeltaLfLevel << delta_lf_res))` update. Held as `i32`
+    /// because the pre-Clip3 sum is signed; the post-clip range is
+    /// `-MAX_LOOP_FILTER ..= MAX_LOOP_FILTER` (i.e. `-63..=63`).
+    /// Stored as a fixed-length array because `FRAME_LF_COUNT` is a
+    /// §3 spec constant.
+    current_delta_lf: [i32; FRAME_LF_COUNT],
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -10598,6 +10690,7 @@ impl PartitionWalker {
             skips,
             skip_modes,
             current_q_index: 0,
+            current_delta_lf: [0; FRAME_LF_COUNT],
             blocks: Vec::new(),
         })
     }
@@ -10686,6 +10779,28 @@ impl PartitionWalker {
     /// `decode_delta_qindex` (`delta_q_present == 0`).
     pub fn set_current_q_index(&mut self, q_index: i32) {
         self.current_q_index = q_index;
+    }
+
+    /// Current `DeltaLF[ i ]` row (§5.11.2 / §5.11.13) — the four
+    /// running loop-filter-strength deltas. Every entry is in
+    /// `-MAX_LOOP_FILTER ..= MAX_LOOP_FILTER` after at least one
+    /// §5.11.13 update (the spec's `Clip3` bound). Fresh walkers
+    /// start with all-zero entries, matching the §5.11.2
+    /// `decode_tile()` line `for ( i = 0; i < FRAME_LF_COUNT; i++ )
+    /// DeltaLF[ i ] = 0`.
+    #[must_use]
+    pub fn current_delta_lf(&self) -> &[i32; FRAME_LF_COUNT] {
+        &self.current_delta_lf
+    }
+
+    /// Reset the `DeltaLF[ i ]` accumulator to all-zero. Callers
+    /// should invoke this at tile entry per §5.11.2 (which mandates
+    /// `DeltaLF[ i ] = 0` for `i = 0..FRAME_LF_COUNT-1` before the
+    /// per-superblock partition walk). The constructor already
+    /// zero-initialises the row; this method exists for tile-loop
+    /// re-entry when one walker decodes multiple tiles.
+    pub fn reset_current_delta_lf(&mut self) {
+        self.current_delta_lf = [0; FRAME_LF_COUNT];
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for
@@ -11378,6 +11493,187 @@ impl PartitionWalker {
         }
 
         Ok(self.current_q_index)
+    }
+
+    /// `read_delta_lf()` per §5.11.13 (av1-spec p.68) — reads the
+    /// per-superblock loop-filter delta values and applies them to
+    /// the running `DeltaLF[ i ]` row. Updates
+    /// [`Self::current_delta_lf`] in place and returns the post-call
+    /// row as a fixed-length array.
+    ///
+    /// The spec body (av1-spec p.68) reads:
+    ///
+    /// ```text
+    ///   read_delta_lf( ) {
+    ///       sbSize = use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64
+    ///       if ( MiSize == sbSize && skip )
+    ///           return
+    ///       if ( ReadDeltas && delta_lf_present ) {
+    ///           frameLfCount = 1
+    ///           if ( delta_lf_multi )
+    ///               frameLfCount = ( NumPlanes > 1 ) ? FRAME_LF_COUNT
+    ///                                                : ( FRAME_LF_COUNT - 2 )
+    ///           for ( i = 0; i < frameLfCount; i++ ) {
+    ///               delta_lf_abs                                        S()
+    ///               if ( delta_lf_abs == DELTA_LF_SMALL ) {
+    ///                   delta_lf_rem_bits                              L(3)
+    ///                   n = delta_lf_rem_bits + 1
+    ///                   delta_lf_abs_bits                              L(n)
+    ///                   deltaLfAbs = delta_lf_abs_bits + (1 << n) + 1
+    ///               } else {
+    ///                   deltaLfAbs = delta_lf_abs
+    ///               }
+    ///               if ( deltaLfAbs ) {
+    ///                   delta_lf_sign_bit                              L(1)
+    ///                   reducedDeltaLfLevel = delta_lf_sign_bit ?
+    ///                                            -deltaLfAbs : deltaLfAbs
+    ///                   DeltaLF[ i ] = Clip3( -MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+    ///                       DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res) )
+    ///               }
+    ///           }
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// Note that §5.11.13 differs structurally from §5.11.12
+    /// `read_delta_qindex` in three places: (1) the outer guard is
+    /// `ReadDeltas && delta_lf_present` (two AND-ed flags, not just
+    /// `ReadDeltas`), (2) the body iterates `frameLfCount` times
+    /// instead of running once, and (3) the per-iteration `S()`
+    /// uses a *different* CDF depending on the `delta_lf_multi`
+    /// flag (`TileDeltaLFCdf` for the single-LF branch,
+    /// `TileDeltaLFMultiCdf[ i ]` for the multi-LF branch). The
+    /// `MiSize == sbSize && skip` short-circuit at the top is
+    /// identical to §5.11.12, as are the `DELTA_LF_SMALL` escape
+    /// ladder and the `delta_lf_sign_bit` + `Clip3` update step.
+    ///
+    /// The `frameLfCount` derivation honours `NumPlanes`: when
+    /// `delta_lf_multi == 1` and `NumPlanes > 1` the loop covers
+    /// all four edge categories (horizontal-Y, vertical-Y, U, V);
+    /// when `NumPlanes == 1` (monochrome) the U/V categories are
+    /// skipped and the loop covers just the two Y categories
+    /// (`FRAME_LF_COUNT - 2 = 2`). When `delta_lf_multi == 0` the
+    /// loop runs once and writes only `DeltaLF[ 0 ]` regardless of
+    /// `NumPlanes`.
+    ///
+    /// `delta_lf_res` is the §5.9.18 frame-header field clamped to
+    /// `0..=3` by `f(2)`. `mono_chrome` is `NumPlanes == 1` per
+    /// §5.5.2. `delta_lf_present` is the §5.9.18 frame-header bit;
+    /// when set, `delta_lf_multi` is read by the frame header and
+    /// passed through as the same-named argument. `read_deltas` is
+    /// the §6.10.4 `ReadDeltas` derivation (`delta_q_present` AND
+    /// first-block-of-superblock) — accepted from the caller per
+    /// the §5.11.12 convention.
+    ///
+    /// Returns the post-call `DeltaLF[ .. ]` row on success, or
+    /// [`Error::PartitionWalkOutOfRange`] for caller-bug arguments
+    /// (`sub_size >= BLOCK_SIZES`, `mi_row >= MiRows`, `mi_col >=
+    /// MiCols`). [`Error::UnexpectedEnd`] /
+    /// [`Error::SymbolExitUnderflow`] surface bitstream errors.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_delta_lf(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip: u8,
+        read_deltas: bool,
+        delta_lf_present: bool,
+        delta_lf_multi: bool,
+        mono_chrome: bool,
+        use_128x128_superblock: bool,
+        delta_lf_res: u8,
+    ) -> Result<[i32; FRAME_LF_COUNT], crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.13 superblock-skip short-circuit (identical to
+        // §5.11.12): a skipped whole-superblock does not signal
+        // a delta.
+        let sb_size = if use_128x128_superblock {
+            BLOCK_128X128
+        } else {
+            BLOCK_64X64
+        };
+        if sub_size == sb_size && skip != 0 {
+            return Ok(self.current_delta_lf);
+        }
+
+        // §5.11.13 outer gate: `ReadDeltas && delta_lf_present` —
+        // both must be true. Either off ⇒ no read, accumulator
+        // unchanged.
+        if !(read_deltas && delta_lf_present) {
+            return Ok(self.current_delta_lf);
+        }
+
+        // §5.11.13 `frameLfCount` derivation.
+        let frame_lf_count: usize = if delta_lf_multi {
+            if mono_chrome {
+                FRAME_LF_COUNT - 2
+            } else {
+                FRAME_LF_COUNT
+            }
+        } else {
+            1
+        };
+        debug_assert!(
+            frame_lf_count <= FRAME_LF_COUNT,
+            "frameLfCount cannot exceed FRAME_LF_COUNT = 4"
+        );
+
+        for i in 0..frame_lf_count {
+            // delta_lf_abs                                          S()
+            // §8.3.2: the cdf is given by TileDeltaLFCdf (single-LF)
+            // or TileDeltaLFMultiCdf[ i ] (multi-LF).
+            let cdf: &mut [u16] = if delta_lf_multi {
+                cdfs.delta_lf_multi_cdf(i)
+            } else {
+                cdfs.delta_lf_cdf()
+            };
+            let mut delta_lf_abs: u32 = decoder.read_symbol(cdf)?;
+            debug_assert!(
+                (delta_lf_abs as usize) < DELTA_LF_SMALL + 1,
+                "S() over Default_Delta_Lf_Cdf yields 0..=DELTA_LF_SMALL"
+            );
+
+            if delta_lf_abs as usize == DELTA_LF_SMALL {
+                // Escape ladder: identical shape to §5.11.12. n is
+                // the post-increment `delta_lf_rem_bits + 1`; the
+                // second L() read uses the incremented count.
+                let rem_bits = decoder.read_literal(3)?;
+                let n = rem_bits + 1;
+                let abs_bits = decoder.read_literal(n)?;
+                delta_lf_abs = abs_bits + (1 << n) + 1;
+            }
+
+            if delta_lf_abs != 0 {
+                let sign = decoder.read_literal(1)?;
+                let reduced: i32 = if sign == 1 {
+                    -(delta_lf_abs as i32)
+                } else {
+                    delta_lf_abs as i32
+                };
+                // DeltaLF[ i ] = Clip3(-MAX_LOOP_FILTER,
+                //   MAX_LOOP_FILTER,
+                //   DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res))
+                let shift = delta_lf_res as u32;
+                let scaled = reduced.wrapping_shl(shift);
+                let pre_clip = self.current_delta_lf[i].wrapping_add(scaled);
+                self.current_delta_lf[i] = pre_clip.clamp(-MAX_LOOP_FILTER, MAX_LOOP_FILTER);
+            }
+        }
+
+        Ok(self.current_delta_lf)
     }
 }
 
@@ -19585,6 +19881,654 @@ mod tests {
         );
         assert_eq!(
             walker.decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_SIZES, 0, false, false, 0),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    // Round 156 — §5.11.13 read_delta_lf walker tests.
+
+    /// Helper: force a length-5 CDF row to select `symbol` on the next
+    /// `read_symbol`. Mirrors `force_delta_q_cdf` for the §5.11.13
+    /// `delta_lf_abs` literal-branch CDFs.
+    fn force_delta_lf_cdf(symbol: u8) -> [u16; DELTA_LF_SMALL + 2] {
+        assert!(
+            (symbol as usize) <= DELTA_LF_SMALL,
+            "Default_Delta_Lf_Cdf admits 0..=DELTA_LF_SMALL"
+        );
+        let mut row = [1u16 << 15; DELTA_LF_SMALL + 2];
+        for s in row.iter_mut().take(symbol as usize) {
+            *s = 0;
+        }
+        row[DELTA_LF_SMALL + 1] = 0;
+        row
+    }
+
+    /// §9.4: `Default_Delta_Lf_Cdf` matches the spec listing verbatim
+    /// (av1-spec p.431) and the §8.2.6 well-formedness invariant
+    /// holds. Equality with `DEFAULT_DELTA_Q_CDF` is deliberate per
+    /// the spec.
+    #[test]
+    fn default_delta_lf_cdf_matches_spec_literal() {
+        assert_eq!(DEFAULT_DELTA_LF_CDF, [28160, 32120, 32677, 32768, 0]);
+        let n = DEFAULT_DELTA_LF_CDF.len() - 1;
+        assert_eq!(DEFAULT_DELTA_LF_CDF[n - 1], 1 << 15);
+        assert_eq!(DEFAULT_DELTA_LF_CDF[n], 0);
+        // §9.4 listing: the two §5.11.x delta tables carry the same
+        // distribution at fresh-context init.
+        assert_eq!(DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF);
+    }
+
+    /// §8.3.1 init: a fresh `TileCdfContext` carries
+    /// `DEFAULT_DELTA_LF_CDF` verbatim in both the single-LF row and
+    /// every multi-LF row.
+    #[test]
+    fn tile_cdf_context_delta_lf_initialised_to_default() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.delta_lf_cdf(), &DEFAULT_DELTA_LF_CDF);
+        for i in 0..FRAME_LF_COUNT {
+            assert_eq!(ctx.delta_lf_multi_cdf(i), &DEFAULT_DELTA_LF_CDF);
+        }
+    }
+
+    /// §5.11.13 short-circuit: `MiSize == sbSize && skip` ⇒ no
+    /// symbol read, `DeltaLF[]` unchanged. With
+    /// `use_128x128_superblock == false`, `sbSize == BLOCK_64X64`.
+    #[test]
+    fn decode_delta_lf_sb_skip_short_circuit_64x64() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_64X64,
+                /*skip=*/ 1,
+                /*read_deltas=*/ true,
+                /*delta_lf_present=*/ true,
+                /*delta_lf_multi=*/ false,
+                /*mono_chrome=*/ false,
+                /*use_128x128_superblock=*/ false,
+                /*delta_lf_res=*/ 0,
+            )
+            .unwrap();
+        assert_eq!(row, [0; FRAME_LF_COUNT]);
+        assert_eq!(dec.position(), pos_before, "no bit consumed");
+    }
+
+    /// §5.11.13 short-circuit (128x128 variant): when
+    /// `use_128x128_superblock == true`, `sbSize == BLOCK_128X128`.
+    #[test]
+    fn decode_delta_lf_sb_skip_short_circuit_128x128() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 64,
+            mi_col_start: 0,
+            mi_col_end: 64,
+        };
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_128X128,
+                1,
+                true,
+                true,
+                false,
+                false,
+                true,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row, [0; FRAME_LF_COUNT]);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.13 outer gate: `!ReadDeltas` ⇒ no symbol read,
+    /// accumulator unchanged regardless of `delta_lf_present`.
+    #[test]
+    fn decode_delta_lf_read_deltas_false_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /*skip=*/ 0,
+                /*read_deltas=*/ false,
+                /*delta_lf_present=*/ true,
+                false,
+                false,
+                false,
+                3,
+            )
+            .unwrap();
+        assert_eq!(row, [0; FRAME_LF_COUNT]);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.13 outer gate: `!delta_lf_present` ⇒ no symbol read
+    /// even when `ReadDeltas` is on (the `&&` second clause).
+    #[test]
+    fn decode_delta_lf_present_false_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                /*read_deltas=*/ true,
+                /*delta_lf_present=*/ false,
+                false,
+                false,
+                false,
+                3,
+            )
+            .unwrap();
+        assert_eq!(row, [0; FRAME_LF_COUNT]);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.13 single-LF branch: `delta_lf_multi == 0` ⇒
+    /// `frameLfCount = 1`, only `DeltaLF[ 0 ]` updated, and the
+    /// `TileDeltaLFCdf` row is consulted.
+    #[test]
+    fn decode_delta_lf_single_branch_writes_only_slot_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                /*delta_lf_multi=*/ false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row[0], 1, "DeltaLF[0] += 1");
+        assert_eq!(row[1], 0, "DeltaLF[1] untouched");
+        assert_eq!(row[2], 0);
+        assert_eq!(row[3], 0);
+    }
+
+    /// §5.11.13 multi-LF colour branch: `delta_lf_multi == 1` and
+    /// `mono_chrome == false` ⇒ `frameLfCount == FRAME_LF_COUNT = 4`,
+    /// all four slots updated. With every multi-row forced to land
+    /// on `delta_lf_abs = 1` and all-zero bytes (positive sign),
+    /// each slot gains +1 with `delta_lf_res = 0`.
+    #[test]
+    fn decode_delta_lf_multi_branch_colour_writes_all_four_slots() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        for i in 0..FRAME_LF_COUNT {
+            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                /*delta_lf_multi=*/ true,
+                /*mono_chrome=*/ false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row, [1, 1, 1, 1], "all four edge categories incremented");
+    }
+
+    /// §5.11.13 multi-LF monochrome branch: `delta_lf_multi == 1`
+    /// and `mono_chrome == true` ⇒ `frameLfCount == FRAME_LF_COUNT -
+    /// 2 = 2`. Only the two Y slots (`DeltaLF[0]`, `DeltaLF[1]`) are
+    /// updated; the U/V slots stay zero.
+    #[test]
+    fn decode_delta_lf_multi_branch_monochrome_writes_only_y_slots() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        for i in 0..FRAME_LF_COUNT {
+            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                /*delta_lf_multi=*/ true,
+                /*mono_chrome=*/ true,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row, [1, 1, 0, 0], "only Y-horiz / Y-vert touched");
+    }
+
+    /// §5.11.13 zero-`delta_lf_abs` no-update: a forced CDF returning
+    /// 0 ⇒ the `if (deltaLfAbs)` body is skipped, no sign-bit read,
+    /// `DeltaLF[]` row unchanged.
+    #[test]
+    fn decode_delta_lf_zero_abs_no_update() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(0);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row, [0; FRAME_LF_COUNT]);
+    }
+
+    /// §5.11.13 literal-positive path with `delta_lf_res = 2`:
+    /// `delta_lf_abs = 1`, sign = 0 ⇒ `DeltaLF[0] += (1 << 2) = 4`.
+    #[test]
+    fn decode_delta_lf_literal_positive_with_shift() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                2,
+            )
+            .unwrap();
+        assert_eq!(row[0], 4, "0 + (1 << 2) = 4");
+    }
+
+    /// §5.11.13 `Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER)` upper
+    /// bound: a large positive delta from a near-max seed clips at
+    /// `MAX_LOOP_FILTER = 63`.
+    #[test]
+    fn decode_delta_lf_clip3_upper_bound() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        // Seed the accumulator near the upper bound. Single-LF only
+        // writes slot 0 so we can pre-fill it.
+        walker.current_delta_lf[0] = 60;
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(2);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // delta_lf_abs = 2, sign = 0 (zero bytes), shift = 3 ⇒
+        // delta = +16 ⇒ 60 + 16 = 76 ⇒ clip to 63.
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                3,
+            )
+            .unwrap();
+        assert_eq!(row[0], MAX_LOOP_FILTER);
+    }
+
+    /// §5.11.13 `Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER)` lower
+    /// bound via hostile seed: like the §5.11.12 lower-bound test,
+    /// the all-zero-bytes sign read flips positive, but a sufficiently
+    /// negative seed plus a small positive delta still stays below
+    /// `-MAX_LOOP_FILTER` so the lower clip activates. Seed at
+    /// `i32::MIN + 1` to verify the saturating clamp.
+    #[test]
+    fn decode_delta_lf_clip3_lower_bound_via_hostile_seed() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.current_delta_lf[0] = i32::MIN + 1;
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            row[0], -MAX_LOOP_FILTER,
+            "hostile seed + tiny +ve delta still clamps at -MAX_LOOP_FILTER"
+        );
+    }
+
+    /// §5.11.13 DELTA_LF_SMALL escape ladder minimum value: a forced
+    /// `delta_lf_abs = DELTA_LF_SMALL = 3` with all-zero bytes ⇒
+    /// `L(3) = 0 ⇒ n = 1`, `L(1) = 0 ⇒ abs_bits = 0` ⇒ `deltaLfAbs
+    /// = 0 + (1 << 1) + 1 = 3`. Sign bit `L(1) = 0` (positive) ⇒
+    /// `DeltaLF[0] += 3`.
+    #[test]
+    fn decode_delta_lf_small_escape_minimum() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(DELTA_LF_SMALL as u8);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row[0], 3);
+    }
+
+    /// §5.11.13 cross-call accumulation in the single-LF branch:
+    /// two consecutive `+1` calls ⇒ `DeltaLF[0]` reaches 2.
+    #[test]
+    fn decode_delta_lf_accumulates_across_calls() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(1);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r1 = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r1[0], 1);
+        let r2 = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                4,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(r2[0], 2);
+    }
+
+    /// §5.11.2: a fresh `PartitionWalker::current_delta_lf` is all
+    /// zero (matches the `for ( i = 0; i < FRAME_LF_COUNT; i++ )
+    /// DeltaLF[ i ] = 0` line). `reset_current_delta_lf` returns it
+    /// to that state after a non-zero update.
+    #[test]
+    fn fresh_walker_current_delta_lf_is_zero_and_reset_works() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        assert_eq!(walker.current_delta_lf(), &[0; FRAME_LF_COUNT]);
+        // Apply a small +1 single-LF update.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_lf = force_delta_lf_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(walker.current_delta_lf()[0], 1);
+        walker.reset_current_delta_lf();
+        assert_eq!(walker.current_delta_lf(), &[0; FRAME_LF_COUNT]);
+    }
+
+    /// Out-of-range guards: `mi_row >= MiRows`, `mi_col >= MiCols`,
+    /// `sub_size >= BLOCK_SIZES` all surface
+    /// `Error::PartitionWalkOutOfRange`.
+    #[test]
+    fn decode_delta_lf_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        assert_eq!(
+            walker.decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                8,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+                false,
+                false,
+                0
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                8,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+                false,
+                false,
+                0
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_SIZES,
+                0,
+                false,
+                false,
+                false,
+                false,
+                false,
+                0
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
     }

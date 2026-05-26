@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-26
+## Status — 2026-05-27
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1307,6 +1307,57 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
 
+Round 156 lands the §5.11.13 **`read_delta_lf()` syntax element**
+(av1-spec p.68) as a new `PartitionWalker::decode_delta_lf` method,
+structurally parallel to r155's §5.11.12 walker but iterating
+`frameLfCount` times over a four-slot `DeltaLF[ i ]` accumulator
+and selecting between the §8.3.2 single-LF (`TileDeltaLFCdf`) and
+per-edge multi-LF (`TileDeltaLFMultiCdf[ i ]`) CDF rows via the
+`delta_lf_multi` argument. Adds a
+`current_delta_lf: [i32; FRAME_LF_COUNT]` accumulator on
+`PartitionWalker` with `current_delta_lf()` read accessor and
+`reset_current_delta_lf()` for the §5.11.2 tile-entry reset.
+Honours the §5.11.13 superblock-skip short-circuit (identical to
+§5.11.12) and the outer `ReadDeltas && delta_lf_present` gate
+(two AND-ed flags — `delta_lf_present` is the §5.9.18 frame-header
+bit, accepted as an argument). When the gate passes, `frameLfCount`
+is derived locally: `delta_lf_multi == 0 ⇒ 1`;
+`delta_lf_multi == 1 && mono_chrome ⇒ FRAME_LF_COUNT - 2 = 2`;
+otherwise `FRAME_LF_COUNT = 4`. Each iteration reads
+`delta_lf_abs` `S()` against the branch-selected CDF, then either
+the literal value or the §5.11.13 escape ladder
+(`delta_lf_rem_bits` `L(3)` + post-increment + `delta_lf_abs_bits`
+`L(rem_bits + 1)` ⇒ `deltaLfAbs = abs_bits + (1 << n) + 1`); for
+non-zero magnitudes reads `delta_lf_sign_bit` `L(1)` and applies
+`DeltaLF[ i ] = Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res))`. New
+constants `DELTA_LF_SMALL = 3`, `FRAME_LF_COUNT = 4`,
+`cdf::MAX_LOOP_FILTER = 63i32` (distinct from the §5.9.11
+`uncompressed_header_tail::MAX_LOOP_FILTER` `i16` twin); new table
+`DEFAULT_DELTA_LF_CDF` transcribed verbatim from §9.4 p.431
+(`[28160, 32120, 32677, 32768, 0]`, identical row to
+`DEFAULT_DELTA_Q_CDF` per the spec — preserved as two independent
+constants so adaptation drift on one does not leak through the
+other); new fields `TileCdfContext::delta_lf` +
+`TileCdfContext::delta_lf_multi` with `delta_lf_cdf()` /
+`delta_lf_multi_cdf(i)` accessors. 17 new cdf-module tests (433 ->
+450): default-CDF literal match (incl. §9.4 equality with
+`DEFAULT_DELTA_Q_CDF`); init-from-defaults invariant for the
+single-LF row and all four multi-LF rows; sb-skip short-circuit
+at both `use_128x128_superblock` settings; `ReadDeltas` false
+short-circuit; `delta_lf_present` false short-circuit; single-LF
+branch writes only `DeltaLF[ 0 ]`; multi-LF colour branch writes
+all four slots; multi-LF monochrome branch writes only the two Y
+slots; zero-`delta_lf_abs` no-update; literal-positive with
+shift; Clip3 upper-bound at `MAX_LOOP_FILTER = 63`; Clip3
+lower-bound via hostile seed at `i32::MIN + 1`; `DELTA_LF_SMALL`
+escape ladder minimum value; cross-call accumulation;
+fresh-walker initial accumulator all-zero + `reset_current_delta_lf`
+round-trip; out-of-range guards ⇒ `PartitionWalkOutOfRange`. The
+§5.11.5 `decode_block()` body itself (coefficient / motion-vector
+/ reconstruction) remains the next round's target. `decode_av1`
+/ `encode_av1` continue to return `Error::NotImplemented`.
+
 Round 155 lands the §5.11.12 **`read_delta_qindex()` syntax
 element** (av1-spec p.67) as a new
 `PartitionWalker::decode_delta_qindex` method on the r154 walker,
@@ -1774,6 +1825,39 @@ observation. `decode_av1` / `encode_av1` continue to return
     tables" (`Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` — `t -> Max(w, h)`-
     sided square — and `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
     — chroma-mode default-tx-type table).
+  * **`read_delta_lf` syntax element** (round 156): §3 (the
+    `DELTA_LF_SMALL = 3` escape sentinel against which `delta_lf_abs`
+    is compared to trigger the `delta_lf_rem_bits` /
+    `delta_lf_abs_bits` ladder; the `FRAME_LF_COUNT = 4` upper bound
+    on the per-superblock iteration loop and on the size of the
+    `DeltaLF[ ]` accumulator; the `MAX_LOOP_FILTER = 63` Clip3
+    bound — `cdf::MAX_LOOP_FILTER` is an `i32` twin of the
+    pre-existing §5.9.11 `uncompressed_header_tail::MAX_LOOP_FILTER`
+    `i16` so the signed `DeltaLF[ i ] + (reducedDeltaLfLevel <<
+    delta_lf_res)` arithmetic stays in a single integer type), §5.11.2
+    (`for ( i = 0; i < FRAME_LF_COUNT; i++ ) DeltaLF[ i ] = 0` — the
+    tile-entry reset honoured by `reset_current_delta_lf`), §5.11.13
+    (`read_delta_lf()` function body — the `sbSize`-derived skip
+    short-circuit identical to §5.11.12, the
+    `ReadDeltas && delta_lf_present` outer gate, the
+    `frameLfCount = delta_lf_multi ?
+        ((NumPlanes > 1) ? FRAME_LF_COUNT : FRAME_LF_COUNT - 2) : 1`
+    derivation, the per-iteration `S()` against `TileDeltaLFCdf` or
+    `TileDeltaLFMultiCdf[ i ]`, the `DELTA_LF_SMALL` escape ladder,
+    the `delta_lf_sign_bit` sign read, and the `Clip3(-MAX_LOOP_FILTER,
+    MAX_LOOP_FILTER, ...)` update), §6.10.4 (the `ReadDeltas`
+    derivation as `delta_q_present` AND first-block-of-superblock,
+    re-used identically for the §5.11.13 outer gate — accepted from
+    the caller per the §5.11.12 convention), §8.3.1 (the
+    `init_non_coeff_cdfs` steps "`DeltaLFCdf` is set to a copy of
+    `Default_Delta_Lf_Cdf`" and "`DeltaLFMultiCdf[ i ]` is set to a
+    copy of `Default_Delta_Lf_Cdf` for `i = 0..FRAME_LF_COUNT-1`"),
+    §8.3.2 (the `delta_lf_abs` cdf-selection paragraph — `cdf` is
+    `TileDeltaLFCdf` when `delta_lf_multi == 0` and
+    `TileDeltaLFMultiCdf[ i ]` when `delta_lf_multi == 1`; no
+    context index in either case), §9.4 (default CDF table values
+    for `Default_Delta_Lf_Cdf[ DELTA_LF_SMALL + 2 ]` on av1-spec
+    p.431).
   * **`read_delta_qindex` syntax element** (round 155): §3 (the
     `DELTA_Q_SMALL = 3` constant — the §5.11.12 escape sentinel
     against which `delta_q_abs` is compared to trigger the
