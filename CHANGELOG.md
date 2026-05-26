@@ -6,6 +6,83 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 159 — §5.11.9 `read_segment_id()` syntax element.** Lands
+  the per-block segment-id reader (av1-spec p.66) as a new
+  [`PartitionWalker::decode_segment_id`] method on the r158 walker,
+  plus a `segment_ids: Vec<i32>` row-major grid sized `MiRows ×
+  MiCols` (pre-filled with the §5.11.9 `-1` sentinel; cells inside a
+  decoded block's `bh4 * bw4` footprint then carry the block's
+  `segment_id ∈ 0..MAX_SEGMENTS = 0..8`) with a
+  [`PartitionWalker::segment_ids`] read accessor. Adds the public
+  module-level [`neg_deinterleave`] helper transcribing the §5.11.9
+  bijection (`diff ∈ 0..max ↔ segment_id ∈ 0..max` biased toward
+  values near `ref`).
+
+  The §5.11.9 neighbour cascade is honoured exactly as spelled out:
+  `prevUL` requires both [`TileGeometry::is_inside`]-derived `AvailU`
+  AND `AvailL`, `prevU` and `prevL` each gate on their own edge, and
+  out-of-grid neighbours fall through to the spec's `-1` sentinel.
+  The four-arm `pred` derivation (`prevU == -1 ⇒ prevL/0`; `prevL ==
+  -1 ⇒ prevU`; `prevUL == prevU ⇒ prevU`; else `prevL`) is preserved
+  verbatim with a `#[allow(clippy::if_same_then_else)]` annotation —
+  two arms happen to return `prev_u` but the predicates are
+  semantically distinct ("left neighbour unavailable" vs. "above-left
+  agrees with above"), and collapsing them would obscure the spec
+  correspondence. The §5.11.9 dispatch distinguishes the two paths:
+
+  * `skip != 0` ⇒ `segment_id = pred` (zero bits read; the
+    spatially-predicted-on-skip semantics the spec relies on for
+    skip-block segment-map continuity).
+  * Else: `diff S()` against `TileSegmentIdCdf[ctx]` (ctx from the
+    existing [`segment_id_ctx`] helper, which already honours the
+    `-1` sentinels), then
+    `segment_id = neg_deinterleave(diff, pred, last_active_seg_id +
+    1)`.
+
+  The §5.11.5 grid-fill stamps the result over the block's `bw4 *
+  bh4` footprint, clipped at the frame's `MiRows` / `MiCols` extent
+  so a leaf straddling the bottom or right edge fills only the
+  in-grid portion. The walker stays segmentation-state-free: the
+  caller-passes `last_active_seg_id` (the §5.9.14 trailing
+  derivation `[`SegmentationParams::last_active_seg_id`]`) and the
+  `skip` value the §5.11.11 [`PartitionWalker::decode_skip`] just
+  returned.
+
+  `decode_segment_id` is read inside both §5.11.8 `intra_segment_id`
+  and §5.11.19 `inter_segment_id` (the segmentation-enabled inner
+  branch in each); the latter's `preSkip` machinery is the caller's
+  job. The eventual §5.11.20 [`PartitionWalker::decode_is_inter`]
+  Arm 2 (`FeatureData[segment_id][SEG_LVL_REF_FRAME]`) becomes
+  segment-aware once a §5.11.18 caller wires
+  `decode_segment_id`'s result into the `seg_ref_frame_is_inter`
+  argument the r158 method already accepts.
+
+  Tests grow by 11 (cdf module, 483 → 494): fresh-walker grid all
+  `-1`; skip short-circuit at frame origin with empty neighbours
+  writes `segment_id = pred = 0` (footprint-stamped, no S() bit
+  consumed on a hostile `0xFF` byte buffer); skip short-circuit
+  inherits `prev_u` when `prev_l` is unavailable (a non-skip seed at
+  origin stamps sid=5 over rows 0..4 cols 0..4 via `diff = 5`,
+  `pred = 0`, then a skip at `(4, 0)` reads `pred = prev_u = 5`);
+  non-skip path with `pred = 0` returns `diff` unchanged (the
+  `if (!ref) return diff` branch); direct `neg_deinterleave` table
+  exercises for the `2 * ref < max` upward branch (`pred = 2`, all
+  eight `diff` values) and the `2 * ref >= max` downward branch
+  (`pred = 5`, all eight `diff` values); edge cases (`ref == 0` ⇒
+  identity; `ref == max - 1` ⇒ `max - diff - 1`; smallest
+  non-trivial alphabet `max = 2`); ctx-0 origin selection via rigged
+  rows; ctx-2 all-neighbours-match selection through three
+  walker-stamped seeds; bottom-right edge clip on `BLOCK_16X16 @
+  (2, 2)` in a 4×4 frame stamps only the in-grid 2×2 quadrant;
+  four-way out-of-range guard (`mi_row` past extent / `mi_col` past
+  extent / `sub_size == BLOCK_SIZES` / `last_active_seg_id >=
+  MAX_SEGMENTS`) ⇒ `PartitionWalkOutOfRange`.
+
+  The §5.11.5 `decode_block()` body itself (coefficient /
+  motion-vector / reconstruction) remains the next round's target.
+  [`decode_av1`] / [`encode_av1`] continue to return
+  [`Error::NotImplemented`].
+
 * **Round 158 — §5.11.20 `read_is_inter()` syntax element.** Lands
   the per-block intra/inter classifier (av1-spec p.71-72) as a new
   [`PartitionWalker::decode_is_inter`] method on the r157 walker,

@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27
+## Status — 2026-05-27 (round 159)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1307,6 +1307,63 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
 
+Round 159 lands the §5.11.9 **`read_segment_id()` syntax element**
+(av1-spec p.66) as a new `PartitionWalker::decode_segment_id`
+method on the r158 walker, plus a `SegmentIds[r][c]` grid carried
+alongside the r158 `IsInters[]`, r156 `cdef_idx[]`, r154
+`SkipModes[]`, r152 `Skips[]`, and the existing §6.10.4 `MiSizes[]`
+grids. The grid is pre-filled with the §5.11.9 `-1` sentinel (the
+spec's `prevUL = -1` / `prevU = -1` / `prevL = -1` "neighbour
+unavailable" marker); cells inside a decoded block's `bh4 * bw4`
+footprint then carry the block's `segment_id ∈ 0..MAX_SEGMENTS = 0..8`.
+The walker stays segmentation-state-free: the caller passes
+`last_active_seg_id` (the §5.9.14 trailing derivation) and the
+`skip` value the §5.11.11 `decode_skip` just returned. The §5.11.9
+neighbour cascade is honoured exactly as the spec spells it out:
+`prevUL` requires both `AvailU` AND `AvailL`; `prevU` and `prevL`
+each gate on their own edge; out-of-grid neighbours fall through to
+`-1`. The four-arm `pred` derivation (`prevU == -1 ⇒ prevL/0`;
+`prevL == -1 ⇒ prevU`; `prevUL == prevU ⇒ prevU`; else `prevL`) is
+preserved verbatim — two arms happen to return `prev_u` but the
+predicates are semantically distinct ("left neighbour unavailable"
+vs. "above-left agrees with above"), and collapsing them would
+obscure the spec correspondence. The §5.11.9 dispatch distinguishes
+two paths: `skip != 0` ⇒ `segment_id = pred` (zero bits read; the
+spatially-predicted-on-skip semantics the spec relies on for
+skip-block segment-map continuity); else `diff S()` against
+`TileSegmentIdCdf[ctx]` (ctx from the existing `segment_id_ctx`
+helper, which already honours the `-1` sentinels), then `segment_id
+= neg_deinterleave(diff, pred, last_active_seg_id + 1)`. The
+§5.11.5 grid-fill stamps the result over the block's `bw4 * bh4`
+footprint, clipped at the frame's extent. A new public module-level
+`neg_deinterleave(diff, ref, max)` helper transcribes the §5.11.9
+bijection (`diff ∈ 0..max ↔ segment_id ∈ 0..max` biased toward
+values near `ref`). `decode_segment_id` is the read inside both
+§5.11.8 `intra_segment_id` and §5.11.19 `inter_segment_id` (the
+segmentation-enabled inner branch in each); the latter's `preSkip`
+machinery and the `segment_id`-aware Arm 2 of §5.11.20 (which
+consumes `FeatureData[segment_id][SEG_LVL_REF_FRAME]`) are now both
+unblocked at the leaf-walk level. 11 new cdf-module tests (483 →
+494): fresh-walker grid all `-1`; skip short-circuit at frame
+origin writes `segment_id = pred = 0` (no S() bit consumed on a
+hostile `0xFF` byte buffer); skip inherits `prev_u` when `prev_l`
+is unavailable; non-skip path with `pred = 0` returns `diff`
+unchanged; direct `neg_deinterleave` table exercises for both the
+`2 * ref < max` upward branch (`pred = 2`, all eight `diff` values)
+and the `2 * ref >= max` downward branch (`pred = 5`, all eight
+`diff` values); edge cases (`ref == 0` identity, `ref == max - 1`
+inverted, smallest non-trivial alphabet `max = 2`); ctx-0 origin
+selection via rigged rows; ctx-2 all-neighbours-match selection
+through three walker-stamped seeds; bottom-right edge clip on
+`BLOCK_16X16 @ (2, 2)` in a 4×4 frame stamps only the in-grid 2×2
+quadrant; four-way out-of-range guard (`mi_row` past extent /
+`mi_col` past extent / `sub_size == BLOCK_SIZES` /
+`last_active_seg_id >= MAX_SEGMENTS`) ⇒ `PartitionWalkOutOfRange`.
+The §5.11.5 `decode_block()` body itself (coefficient /
+motion-vector / reconstruction) remains the next round's target.
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
+
 Round 158 lands the §5.11.20 **`read_is_inter()` syntax element**
 (av1-spec p.71-72) as a new `PartitionWalker::decode_is_inter`
 method on the r157 walker, plus an `IsInters[r][c]` flag grid
@@ -1930,6 +1987,28 @@ observation. `decode_av1` / `encode_av1` continue to return
     tables" (`Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` — `t -> Max(w, h)`-
     sided square — and `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
     — chroma-mode default-tx-type table).
+  * **`read_segment_id` syntax element** (round 159): §3 (the
+    `MAX_SEGMENTS = 8` upper bound capping the §5.11.9 alphabet
+    and the `SEGMENT_ID_CONTEXTS = 3` constant bounding the §8.3.2
+    ctx derivation), §5.9.14 (the `LastActiveSegId` trailing
+    derivation that supplies `max = LastActiveSegId + 1` to the
+    §5.11.9 `neg_deinterleave` call — accepted as a `u8` parameter
+    so the walker stays segmentation-state-free), §5.11.5 (the
+    per-block grid-fill footer line `SegmentIds[ r + y ][ c + x ] =
+    segment_id` the walker stamps over the `bw4 * bh4` footprint),
+    §5.11.8 / §5.11.19 (the two caller contexts: intra-frame /
+    inter-frame `*_segment_id` syntax, both of which route through
+    `read_segment_id` when `segmentation_enabled`), §5.11.9 (the
+    function body itself — the three neighbour reads `prevUL` /
+    `prevU` / `prevL`, the four-arm `pred` cascade `prevU == -1 ⇒
+    prevL / 0`; `prevL == -1 ⇒ prevU`; `prevUL == prevU ⇒ prevU`;
+    else `prevL`, the `skip ⇒ segment_id = pred` short-circuit, the
+    `S()` read against `TileSegmentIdCdf[ ctx ]` plus
+    `neg_deinterleave( diff, pred, max )` reconstruction), and
+    §8.3.2 (the `segment_id` ctx formula `prevUL < 0 ⇒ 0; (prevUL
+    == prevU && prevUL == prevL) ⇒ 2; (prevUL == prevU || prevUL
+    == prevL || prevU == prevL) ⇒ 1; else 0` — already lifted as
+    `segment_id_ctx`).
   * **`read_is_inter` syntax element** (round 158): §3 (the
     `IS_INTER_CONTEXTS = 4` constant bounding the §8.3.2 ctx
     derivation, the implicit `INTRA_FRAME = 0` ordinal under which

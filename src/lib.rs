@@ -1099,6 +1099,50 @@
 //!     `PartitionWalkOutOfRange`. `decode_av1` / `encode_av1`
 //!     continue to return `Error::NotImplemented`.
 //!
+//!   * **Round 159.** The §5.11.9 `read_segment_id()` syntax element
+//!     (av1-spec p.66) — the per-block segment-id reader called
+//!     inside §5.11.8 `intra_segment_id` and §5.11.19
+//!     `inter_segment_id` whenever `segmentation_enabled`. Lands as
+//!     a new [`PartitionWalker::decode_segment_id`] method on the
+//!     r158 walker, plus a `SegmentIds[r][c]` grid carried alongside
+//!     the r158 `IsInters[]`, r156 `cdef_idx[]`, r154 `SkipModes[]`,
+//!     r152 `Skips[]`, and the existing §6.10.4 `MiSizes[]` grids
+//!     (`SegmentIds[ r + y ][ c + x ] = segment_id` per the §5.11.5
+//!     grid-fill footer). The grid is pre-filled with the §5.11.9
+//!     `-1` sentinel; cells inside a decoded block's `bh4 * bw4`
+//!     footprint then carry `segment_id` in `0..MAX_SEGMENTS = 0..8`.
+//!     The §5.11.9 neighbour cascade is honoured exactly as
+//!     spelled out: `prevUL` requires both `AvailU` AND `AvailL`;
+//!     `prevU` and `prevL` each gate on their own edge; out-of-grid
+//!     neighbours fall through to `-1`. The four-arm `pred`
+//!     derivation (`prevU == -1` ⇒ `prevL / 0`; `prevL == -1` ⇒
+//!     `prevU`; `prevUL == prevU` ⇒ `prevU`; else `prevL`) is
+//!     preserved verbatim. The §5.11.9 dispatch distinguishes two
+//!     paths: `skip != 0` ⇒ `segment_id = pred` (zero bits read);
+//!     else `diff S()` against `TileSegmentIdCdf[ctx]` (ctx from
+//!     the existing [`segment_id_ctx`] helper) then
+//!     `segment_id = neg_deinterleave(diff, pred, last_active_seg_id + 1)`.
+//!     The walker stays segmentation-state-free: the caller passes
+//!     `last_active_seg_id` (the §5.9.14 trailing derivation) and
+//!     the `skip` value the §5.11.11 `decode_skip` just returned.
+//!     New public module-level [`neg_deinterleave`] helper
+//!     transcribes the §5.11.9 bijection. New
+//!     [`PartitionWalker::segment_ids`] accessor returns a row-major
+//!     view. 11 new cdf-module tests (483 → 494): fresh-walker grid
+//!     all `-1`; skip short-circuit at frame origin writes
+//!     `segment_id = pred = 0` (no `S()` bit consumed on a hostile
+//!     `0xFF` byte buffer); skip inherits `prev_u` when `prev_l` is
+//!     unavailable; non-skip path with `pred = 0` returns `diff`
+//!     unchanged; direct `neg_deinterleave` table exercises for both
+//!     `2 * ref < max` and `2 * ref >= max` branches plus edge cases
+//!     (`ref == 0` identity, `ref == max - 1` inverted, smallest
+//!     non-trivial alphabet `max = 2`); ctx-0 origin selection;
+//!     ctx-2 all-neighbours-match selection through three
+//!     walker-stamped seeds; bottom-right edge clip on
+//!     `BLOCK_16X16 @ (2, 2)` in a 4×4 frame; four-way out-of-range
+//!     guard. `decode_av1` / `encode_av1` continue to return
+//!     `Error::NotImplemented`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -1124,7 +1168,7 @@ pub use cdf::{
     compound_mode_ctx, compute_tx_type, get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx,
     get_palette_color_context, get_tx_class, inter_tx_type_set, interintra_ctx, interp_filter_ctx,
     intra_dir, intra_mode_ctx, intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mi_height_log2,
-    mi_width_log2, mv_ctx, num_4x4_blocks_high, num_4x4_blocks_wide,
+    mi_width_log2, mv_ctx, neg_deinterleave, num_4x4_blocks_high, num_4x4_blocks_wide,
     palette_color_context_from_neighbors, palette_color_ctx, palette_tokens_args,
     palette_tokens_plane, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx,
     partition_subsize, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,

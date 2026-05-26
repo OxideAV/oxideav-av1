@@ -8360,6 +8360,77 @@ pub fn segment_id_ctx(prev_ul: Option<i32>, prev_u: Option<i32>, prev_l: Option<
     }
 }
 
+/// §5.11.9 `neg_deinterleave` — the spec helper that reconstructs a
+/// `segment_id` from the on-wire `diff` (the §5.11.9 `S()` symbol) the
+/// caller-known `ref` value (the §5.11.9 `pred` derivation), and the
+/// `max = LastActiveSegId + 1` upper bound. Spec body (av1-spec p.66):
+///
+/// ```text
+///   neg_deinterleave( diff, ref, max ) {
+///       if ( !ref ) return diff
+///       if ( ref >= (max - 1) ) return max - diff - 1
+///       if ( 2 * ref < max ) {
+///           if ( diff <= 2 * ref ) {
+///               if ( diff & 1 ) return ref + ((diff + 1) >> 1)
+///               else            return ref - (diff >> 1)
+///           }
+///           return diff
+///       } else {
+///           if ( diff <= 2 * (max - ref - 1) ) {
+///               if ( diff & 1 ) return ref + ((diff + 1) >> 1)
+///               else            return ref - (diff >> 1)
+///           }
+///           return max - (diff + 1)
+///       }
+///   }
+/// ```
+///
+/// The function is a bijection between `diff ∈ 0..max` and
+/// `segment_id ∈ 0..max` for a fixed `ref ∈ 0..max`, biasing the
+/// small-`diff` end of the alphabet toward values close to `ref` (the
+/// `pred`-based context) so the entropy coder spends fewer bits on
+/// the common "small neighbour delta" case. The two `if ( diff & 1
+/// )` branches alternate the sign of the offset away from `ref`
+/// (odd `diff` walks upward from `ref`; even `diff` walks downward),
+/// and the `2 * ref < max` test selects whether the upward or the
+/// downward side runs out first.
+///
+/// All arguments are `u32`. Inputs are spec-bounded: `ref < max` and
+/// `diff < max` per the §5.11.9 surrounds (`ref` is `pred ∈
+/// 0..LastActiveSegId+1`; `diff` is the §8.2.6 `S()` value capped at
+/// `LastActiveSegId+1` by the alphabet size). The function panics on
+/// `max == 0` (a caller bug: `max = LastActiveSegId + 1 >= 1` always).
+#[must_use]
+pub fn neg_deinterleave(diff: u32, r: u32, max: u32) -> u32 {
+    debug_assert!(max >= 1, "max = LastActiveSegId + 1 >= 1");
+    debug_assert!(r < max, "ref < max per the §5.11.9 surrounds");
+    if r == 0 {
+        return diff;
+    }
+    if r >= max - 1 {
+        return max - diff - 1;
+    }
+    if 2 * r < max {
+        if diff <= 2 * r {
+            if diff & 1 != 0 {
+                r + ((diff + 1) >> 1)
+            } else {
+                r - (diff >> 1)
+            }
+        } else {
+            diff
+        }
+    } else if diff <= 2 * (max - r - 1) {
+        if diff & 1 != 0 {
+            r + ((diff + 1) >> 1)
+        } else {
+            r - (diff >> 1)
+        }
+    } else {
+        max - (diff + 1)
+    }
+}
+
 /// §5.11.31 `read_mv()` `MvCtx` derivation. Returns
 /// [`MV_INTRABC_CONTEXT`] when `use_intrabc == 1` and `0` otherwise;
 /// the result is the first index into every `Mv*Cdf` selector above.
@@ -10675,6 +10746,20 @@ pub struct PartitionWalker {
     /// AboveIntra = true` weight as an unavailable neighbour gated
     /// out by `AvailU` / `AvailL`.
     is_inters: Vec<u8>,
+    /// `SegmentIds[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec §5.11.9 / §6.10.4 — the segment
+    /// map the §5.11.9 `read_segment_id()` populates as each block
+    /// fires). Entries are `-1` for cells that no §5.11.9
+    /// [`Self::decode_segment_id`] call has touched yet (the §5.11.9
+    /// neighbour-lookup `prevUL` / `prevU` / `prevL` sentinel — the
+    /// spec writes `prevUL = -1` when the above-left neighbour is
+    /// unavailable, and §5.11.9's `pred` derivation treats that
+    /// sentinel as "no information"). Cells in the `bh4 * bw4`
+    /// footprint of a decoded block carry the block's `segment_id`
+    /// (a value in `0..MAX_SEGMENTS = 0..8`). Stored as `i32` so the
+    /// `-1` sentinel is the literal spec value rather than a
+    /// shoehorned encoding.
+    segment_ids: Vec<i32>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -10717,6 +10802,13 @@ impl PartitionWalker {
         let mut is_inters: Vec<u8> = Vec::new();
         is_inters.try_reserve_exact(area).ok()?;
         is_inters.resize(area, 0);
+        let mut segment_ids: Vec<i32> = Vec::new();
+        segment_ids.try_reserve_exact(area).ok()?;
+        // §5.11.9 sentinel: every cell starts at -1 ("no neighbour
+        // information"). The first §5.11.9 [`Self::decode_segment_id`]
+        // call on a cell replaces the sentinel with a value in
+        // `0..MAX_SEGMENTS`.
+        segment_ids.resize(area, -1);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -10728,6 +10820,7 @@ impl PartitionWalker {
             current_delta_lf: [0; FRAME_LF_COUNT],
             cdef_idx,
             is_inters,
+            segment_ids,
             blocks: Vec::new(),
         })
     }
@@ -11103,6 +11196,39 @@ impl PartitionWalker {
             return 0;
         }
         self.is_inters[(r * self.mi_cols + c) as usize]
+    }
+
+    /// View of the §6.10.4 `SegmentIds[]` grid after the walk. Indexed
+    /// row-major: `segment_ids()[ r * MiCols + c ]`. Cells that no
+    /// §5.11.9 [`Self::decode_segment_id`] call has touched yet carry
+    /// the `-1` sentinel (the spec's `prevUL = -1` / `prevU = -1` /
+    /// `prevL = -1` "neighbour unavailable" marker). Cells inside a
+    /// decoded block's `bh4 * bw4` footprint carry the block's
+    /// `segment_id` (a value in `0..MAX_SEGMENTS = 0..8`).
+    #[must_use]
+    pub fn segment_ids(&self) -> &[i32] {
+        &self.segment_ids
+    }
+
+    /// Helper to read `SegmentIds[ r ][ c ]` for the §5.11.9
+    /// neighbour-lookup. Returns the `-1` sentinel for out-of-grid
+    /// coordinates (matching the spec's `AvailU ? ... : -1` /
+    /// `AvailL ? ... : -1` / `AvailU && AvailL ? ... : -1`
+    /// gating). Returns the stored value for in-grid coordinates;
+    /// if no §5.11.9 call has touched the cell yet, the stored
+    /// value is also `-1` (the constructor's pre-fill sentinel),
+    /// which is the same "no information" value §5.11.9's `pred`
+    /// derivation already understands.
+    #[inline]
+    fn segment_id_at(&self, r: i32, c: i32) -> i32 {
+        if r < 0 || c < 0 {
+            return -1;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return -1;
+        }
+        self.segment_ids[(r * self.mi_cols + c) as usize]
     }
 
     /// Helper to read `MiSizes[ r ][ c ]`. Returns [`BLOCK_INVALID`]
@@ -11808,6 +11934,211 @@ impl PartitionWalker {
         }
 
         Ok(is_inter)
+    }
+
+    /// `read_segment_id()` per §5.11.9 (av1-spec p.66) — reads the
+    /// per-block `segment_id` syntax element at the leaf
+    /// `(mi_row, mi_col)` of a block whose §5.11.5 `MiSize` is
+    /// `sub_size`. `segment_id` is the §6.10.4 per-block index into the
+    /// frame's eight segment slots; it controls the §5.11.18
+    /// `Lossless = LosslessArray[ segment_id ]` lookup and feeds the
+    /// `FeatureData[ segment_id ][ * ]` indexing the §5.11.20
+    /// [`Self::decode_is_inter`] dispatch already consumes via its
+    /// caller-pre-computed `seg_ref_frame_is_inter` boolean.
+    ///
+    /// The spec body (av1-spec p.66) reads:
+    ///
+    /// ```text
+    ///   read_segment_id( ) {
+    ///       if ( AvailU && AvailL )
+    ///           prevUL = SegmentIds[ MiRow - 1 ][ MiCol - 1 ]
+    ///       else
+    ///           prevUL = -1
+    ///       if ( AvailU )
+    ///           prevU = SegmentIds[ MiRow - 1 ][ MiCol ]
+    ///       else
+    ///           prevU = -1
+    ///       if ( AvailL )
+    ///           prevL = SegmentIds[ MiRow ][ MiCol - 1 ]
+    ///       else
+    ///           prevL = -1
+    ///       if ( prevU == -1 )
+    ///           pred = (prevL == -1) ? 0 : prevL
+    ///       else if ( prevL == -1 )
+    ///           pred = prevU
+    ///       else
+    ///           pred = (prevUL == prevU) ? prevU : prevL
+    ///       if ( skip ) {
+    ///           segment_id = pred
+    ///       } else {
+    ///           segment_id                                          S()
+    ///           segment_id = neg_deinterleave( segment_id, pred,
+    ///                                          LastActiveSegId + 1 )
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// `last_active_seg_id` is the §5.9.14 trailing derivation
+    /// (`FeatureEnabled[i][.]` reduction the
+    /// [`uncompressed_header_tail`] parse already lifts into
+    /// [`SegmentationParams::last_active_seg_id`]) — the caller passes
+    /// it as a `u8 ∈ 0..MAX_SEGMENTS = 0..8`. `skip` is the
+    /// `Skips[r][c]` value the §5.11.11 [`Self::decode_skip`] just
+    /// stamped (the caller has it in scope from that call's return);
+    /// the §5.11.9 `skip ⇒ segment_id = pred` short-circuit reads zero
+    /// bits, matching the spec's "spatially predicted on a skipped
+    /// block" semantics. The §8.3.2 ctx for the non-skip `S()` is
+    /// `segment_id_ctx(prev_ul, prev_u, prev_l)`; the helper already
+    /// honours the `-1` sentinels.
+    ///
+    /// The §5.11.5 grid-fill stamps the decoded `segment_id` over the
+    /// block's `bw4 * bh4` footprint, clipped at the frame's `MiRows`
+    /// / `MiCols` extent so a leaf straddling the bottom or right
+    /// edge fills only the in-grid portion of its footprint. The
+    /// neighbour-lookup reads happen *before* the grid-fill, so a
+    /// non-square block with `(mi_row, mi_col)` past the block's own
+    /// top-left corner still sees only previously-decoded neighbours.
+    ///
+    /// Returns the decoded `segment_id ∈ 0..=last_active_seg_id` on
+    /// success, or [`Error::PartitionWalkOutOfRange`] for caller-bug
+    /// arguments (out-of-range `sub_size`, `mi_row` / `mi_col`
+    /// outside the frame's mi extent, or `last_active_seg_id >=
+    /// MAX_SEGMENTS`). [`Error::UnexpectedEnd`] /
+    /// [`Error::SymbolExitUnderflow`] surface bitstream errors.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
+    /// [`SegmentationParams::last_active_seg_id`]: crate::uncompressed_header_tail::SegmentationParams::last_active_seg_id
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_segment_id(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip: u8,
+        last_active_seg_id: u8,
+    ) -> Result<u8, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.9 neighbour lookup. `prev_ul` requires *both* AvailU
+        // and AvailL (the diagonal neighbour is only meaningful when
+        // both edges are inside the tile per the spec's `AvailU &&
+        // AvailL` gate); `prev_u` and `prev_l` are each gated by their
+        // own edge.
+        let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+        let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+        let prev_ul: i32 = if avail_u && avail_l {
+            self.segment_id_at(mi_row as i32 - 1, mi_col as i32 - 1)
+        } else {
+            -1
+        };
+        let prev_u: i32 = if avail_u {
+            self.segment_id_at(mi_row as i32 - 1, mi_col as i32)
+        } else {
+            -1
+        };
+        let prev_l: i32 = if avail_l {
+            self.segment_id_at(mi_row as i32, mi_col as i32 - 1)
+        } else {
+            -1
+        };
+
+        // §5.11.9 `pred` derivation. Transcribes the four-arm cascade
+        // literally. Two arms happen to return `prev_u` (the
+        // `prev_l == -1` arm and the `prev_ul == prev_u` arm) — the
+        // spec spells them out as separate branches because the
+        // predicates are semantically distinct (the former is
+        // "left neighbour unavailable", the latter is "above-left
+        // agrees with above"). Collapsing them would obscure the
+        // spec correspondence, so the clippy `if_same_then_else`
+        // lint is allowed on this block.
+        #[allow(clippy::if_same_then_else)]
+        let pred: i32 = if prev_u == -1 {
+            if prev_l == -1 {
+                0
+            } else {
+                prev_l
+            }
+        } else if prev_l == -1 {
+            prev_u
+        } else if prev_ul == prev_u {
+            prev_u
+        } else {
+            prev_l
+        };
+        // `pred` is in `0..=last_active_seg_id`: either it comes from
+        // a neighbour cell (whose stored value was in
+        // `0..=last_active_seg_id` from a prior call) or it falls
+        // through to `0` (the empty-neighbour seed). The
+        // [`neg_deinterleave`] `ref < max` precondition therefore
+        // holds for `max = last_active_seg_id + 1`.
+        debug_assert!(
+            pred >= 0 && (pred as u32) <= last_active_seg_id as u32,
+            "§5.11.9 pred is in 0..=last_active_seg_id"
+        );
+
+        // §5.11.9 dispatch — skip-block short-circuit vs. S() with
+        // neg_deinterleave decoding.
+        let segment_id: u8 = if skip != 0 {
+            // §5.11.9 `if ( skip ) segment_id = pred`. The neighbour
+            // cascade has already produced `pred`; no symbol read.
+            pred as u8
+        } else {
+            // §8.3.2 ctx derivation: feeds the three neighbour values
+            // (each `Some(v)` for an in-grid cell with v >= 0, `None`
+            // for the spec's `-1` sentinel) into [`segment_id_ctx`].
+            // The helper returns 0..=2 < SEGMENT_ID_CONTEXTS (3); the
+            // `segment_id_cdf` accessor is total over that range.
+            let to_opt = |v: i32| if v < 0 { None } else { Some(v) };
+            let ctx = segment_id_ctx(to_opt(prev_ul), to_opt(prev_u), to_opt(prev_l));
+            let cdf = cdfs.segment_id_cdf(ctx);
+            // §8.2.6 S(): the read against `Default_Segment_Id_Cdf`
+            // (length MAX_SEGMENTS + 1 = 9 including the counter slot)
+            // returns 0..=last_active_seg_id (the §5.11.9 spec relies
+            // on `max = LastActiveSegId + 1` as the upper bound; for
+            // the default 8-symbol CDF, the §5.9.14 derivation caps
+            // `last_active_seg_id` at 7).
+            let diff = decoder.read_symbol(cdf)?;
+            debug_assert!(
+                diff <= last_active_seg_id as u32,
+                "§5.11.9 diff is in 0..=last_active_seg_id"
+            );
+            let max = last_active_seg_id as u32 + 1;
+            let sid = neg_deinterleave(diff, pred as u32, max);
+            debug_assert!(sid < max, "§5.11.9 neg_deinterleave bijects onto 0..max");
+            sid as u8
+        };
+
+        // §5.11.5 grid-fill: stamp `segment_id` over the block's bh4 *
+        // bw4 footprint, clipped at the frame's MiRows / MiCols extent.
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.segment_ids[(rr * self.mi_cols + cc) as usize] = segment_id as i32;
+            }
+        }
+
+        Ok(segment_id)
     }
 
     /// `read_delta_qindex()` per §5.11.12 (av1-spec p.67) — reads the
@@ -22149,6 +22480,386 @@ mod tests {
                 false,
                 false
             ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Round 159 — §5.11.9 `read_segment_id()` (av1-spec p.66).
+    // Exercises [`PartitionWalker::decode_segment_id`].
+    // ---------------------------------------------------------------
+
+    /// Builds a rigged `Default_Segment_Id_Cdf`-shaped row (length
+    /// `MAX_SEGMENTS + 1 = 9`) that, against a freshly-initialised
+    /// `SymbolDecoder` over zero bytes (so `SymbolValue = 32767`),
+    /// forces a specific symbol to fire. `cdf[..symbol]` is `0` (so
+    /// the binary search advances past every smaller symbol) and
+    /// `cdf[symbol..MAX_SEGMENTS]` is `1 << 15` (cumulative count
+    /// `≈ 32768 > SymbolValue` ⇒ first match at `symbol`). The
+    /// trailing `cdf[MAX_SEGMENTS]` counter slot stays `0`.
+    fn force_segment_id_cdf(symbol: u8) -> [u16; MAX_SEGMENTS + 1] {
+        assert!(
+            (symbol as usize) < MAX_SEGMENTS,
+            "force_segment_id_cdf supports 0..MAX_SEGMENTS",
+        );
+        let mut row = [0u16; MAX_SEGMENTS + 1];
+        for slot in row.iter_mut().take(MAX_SEGMENTS).skip(symbol as usize) {
+            *slot = 1 << 15;
+        }
+        row
+    }
+
+    /// Fresh walker: every `SegmentIds[]` cell starts at the §5.11.9
+    /// `-1` sentinel.
+    #[test]
+    fn decode_segment_id_fresh_walker_grid_is_sentinel() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        for &cell in walker.segment_ids() {
+            assert_eq!(cell, -1, "fresh-walker segment_ids[] = -1 sentinel");
+        }
+    }
+
+    /// §5.11.9 `if ( skip ) segment_id = pred` short-circuit: no
+    /// symbol is read against the bitstream, and the empty-neighbour
+    /// case (frame origin, no prior calls ⇒ all three neighbours -1
+    /// ⇒ `pred = 0`) writes `segment_id = 0` over the footprint.
+    #[test]
+    fn decode_segment_id_skip_short_circuit_empty_neighbours_writes_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let sid = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_8X8, 1, 7)
+            .unwrap();
+        assert_eq!(sid, 0, "skip ⇒ segment_id = pred = 0 at frame origin");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no S() read on the §5.11.9 skip short-circuit",
+        );
+        // Footprint stamped to 0.
+        for r in 0..2 {
+            for c in 0..2 {
+                assert_eq!(walker.segment_ids()[r * 16 + c], 0);
+            }
+        }
+        // Adjacent cells stay at the -1 sentinel.
+        assert_eq!(walker.segment_ids()[2 * 16], -1);
+        assert_eq!(walker.segment_ids()[2], -1);
+    }
+
+    /// §5.11.9 skip short-circuit propagates the neighbour `pred`
+    /// (matching `prevU == prevL` ⇒ pred = prevU). Two prior calls
+    /// at (0, 0) and (0, 2) stamp `segment_id = 5` into row 0 cols
+    /// 0..4; a third skip-block at (2, 0) reads pred from `prev_l =
+    /// -1` (col -1 unavailable) and `prev_u = 5` (row 1 col 0 — but
+    /// row 1 was never written, so it's -1!). Use a 4×4 footprint
+    /// block to make the prior call stamp row 1 too.
+    #[test]
+    fn decode_segment_id_skip_pred_inherits_neighbour() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig every ctx row to force symbol 5; the prior call is the
+        // non-skip path so we need a CDF that delivers diff = 5.
+        let rigged = force_segment_id_cdf(5);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // First call: non-skip BLOCK_16X16 (bw4 = bh4 = 4) at origin.
+        // `pred = 0` (empty neighbours); `diff = 5` reads through
+        // `neg_deinterleave(5, 0, 8) = 5`. Stamps rows 0..4 cols 0..4
+        // to 5.
+        let sid0 = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, 7)
+            .unwrap();
+        assert_eq!(sid0, 5);
+        // Second call: skip BLOCK_4X4 at (4, 0). prev_u = SegmentIds[3][0]
+        // = 5, prev_l = SegmentIds[4][-1] = -1 (col -1 unavailable),
+        // prev_ul = -1. §5.11.9 pred cascade: prev_u != -1, prev_l ==
+        // -1 ⇒ pred = prev_u = 5. Skip ⇒ segment_id = pred = 5.
+        let pos_before = dec.position();
+        let sid1 = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 4, 0, BLOCK_4X4, 1, 7)
+            .unwrap();
+        assert_eq!(sid1, 5, "pred inherits prev_u when prev_l is unavailable");
+        assert_eq!(dec.position(), pos_before, "no S() read on skip path");
+        assert_eq!(walker.segment_ids()[4 * 16], 5);
+    }
+
+    /// §5.11.9 non-skip path: `S()` returns `diff = 0` ⇒
+    /// `neg_deinterleave(0, pred, max)`. For `pred = 0`, the
+    /// `if (!ref) return diff` branch fires ⇒ `segment_id = 0`.
+    #[test]
+    fn decode_segment_id_non_skip_pred_zero_returns_diff() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig every ctx row to force symbol 3.
+        let rigged = force_segment_id_cdf(3);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // Origin, empty neighbours ⇒ pred = 0; diff = 3 ⇒
+        // neg_deinterleave(3, 0, 8) = 3.
+        let sid = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_8X8, 0, 7)
+            .unwrap();
+        assert_eq!(sid, 3);
+        // Footprint stamped to 3.
+        for r in 0..2 {
+            for c in 0..2 {
+                assert_eq!(walker.segment_ids()[r * 16 + c], 3);
+            }
+        }
+        // Adjacent cells stay at -1.
+        assert_eq!(walker.segment_ids()[2 * 16], -1);
+    }
+
+    /// §5.11.9 non-skip path with a non-zero `pred`: drives the
+    /// upward/downward `neg_deinterleave` arm. For `pred = 2`,
+    /// `max = 8`, `2 * ref = 4 < max ⇒ upper branch`. `diff = 0`
+    /// is even and `<= 2 * ref = 4` ⇒ `pred - (diff >> 1) = 2`.
+    /// `diff = 1` is odd and `<= 4` ⇒ `pred + ((diff + 1) >> 1) = 3`.
+    /// `diff = 2` is even ⇒ `pred - 1 = 1`. `diff = 3` is odd ⇒
+    /// `pred + 2 = 4`. `diff = 4` is even ⇒ `pred - 2 = 0`.
+    /// `diff = 5` is > `2 * ref` ⇒ returns `diff = 5`.
+    #[test]
+    fn decode_segment_id_neg_deinterleave_upward_branch() {
+        // Direct exercise of the helper (the §5.11.9 spec table).
+        assert_eq!(neg_deinterleave(0, 2, 8), 2);
+        assert_eq!(neg_deinterleave(1, 2, 8), 3);
+        assert_eq!(neg_deinterleave(2, 2, 8), 1);
+        assert_eq!(neg_deinterleave(3, 2, 8), 4);
+        assert_eq!(neg_deinterleave(4, 2, 8), 0);
+        assert_eq!(neg_deinterleave(5, 2, 8), 5);
+        assert_eq!(neg_deinterleave(6, 2, 8), 6);
+        assert_eq!(neg_deinterleave(7, 2, 8), 7);
+    }
+
+    /// §5.11.9 `neg_deinterleave` `2 * ref >= max` branch. For
+    /// `pred = 5`, `max = 8`, `2 * ref = 10 >= max ⇒ lower branch`,
+    /// `2 * (max - ref - 1) = 4`. `diff = 0` is even ⇒ `pred - 0 =
+    /// 5`. `diff = 1` is odd ⇒ `pred + 1 = 6`. `diff = 2` is even ⇒
+    /// `pred - 1 = 4`. `diff = 3` is odd ⇒ `pred + 2 = 7`. `diff =
+    /// 4` is even ⇒ `pred - 2 = 3`. `diff = 5` is > `2 * (max -
+    /// ref - 1) = 4` ⇒ `max - (diff + 1) = 8 - 6 = 2`.
+    #[test]
+    fn decode_segment_id_neg_deinterleave_downward_branch() {
+        assert_eq!(neg_deinterleave(0, 5, 8), 5);
+        assert_eq!(neg_deinterleave(1, 5, 8), 6);
+        assert_eq!(neg_deinterleave(2, 5, 8), 4);
+        assert_eq!(neg_deinterleave(3, 5, 8), 7);
+        assert_eq!(neg_deinterleave(4, 5, 8), 3);
+        assert_eq!(neg_deinterleave(5, 5, 8), 2);
+        assert_eq!(neg_deinterleave(6, 5, 8), 1);
+        assert_eq!(neg_deinterleave(7, 5, 8), 0);
+    }
+
+    /// §5.11.9 `neg_deinterleave` edge cases: `ref == 0` ⇒ identity
+    /// (returns `diff` unchanged); `ref == max - 1` ⇒ `max - diff -
+    /// 1` (the full alphabet inverted).
+    #[test]
+    fn decode_segment_id_neg_deinterleave_edge_cases() {
+        // ref = 0: identity over the full alphabet.
+        for d in 0..8u32 {
+            assert_eq!(neg_deinterleave(d, 0, 8), d);
+        }
+        // ref = max - 1: inverted.
+        for d in 0..8u32 {
+            assert_eq!(neg_deinterleave(d, 7, 8), 7 - d);
+        }
+        // Smallest non-trivial alphabet: max = 2, ref ∈ {0, 1},
+        // diff ∈ {0, 1}. ref = 0 ⇒ identity. ref = 1 ⇒ inverted.
+        assert_eq!(neg_deinterleave(0, 0, 2), 0);
+        assert_eq!(neg_deinterleave(1, 0, 2), 1);
+        assert_eq!(neg_deinterleave(0, 1, 2), 1);
+        assert_eq!(neg_deinterleave(1, 1, 2), 0);
+    }
+
+    /// §5.11.9 ctx-0 selection at the frame origin (`AvailU =
+    /// AvailL = false`). Verify by rigging `segment_id_cdf[0]` to
+    /// fire symbol 1 and the other two ctx rows to fire symbol 0;
+    /// the origin call should land on ctx 0 ⇒ diff = 1 ⇒
+    /// `neg_deinterleave(1, 0, 8) = 1`.
+    #[test]
+    fn decode_segment_id_origin_ctx_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.segment_id[0] = force_segment_id_cdf(1);
+        cdfs.segment_id[1] = force_segment_id_cdf(0);
+        cdfs.segment_id[2] = force_segment_id_cdf(0);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let sid = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_8X8, 0, 7)
+            .unwrap();
+        // ctx-0 ⇒ diff = 1; pred = 0 ⇒ segment_id = 1.
+        assert_eq!(sid, 1);
+    }
+
+    /// §5.11.9 ctx-2 selection: three matching neighbours `prevUL ==
+    /// prevU == prevL`. Stamp two prior BLOCK_8X8 leaves at (0, 0)
+    /// and (0, 2) with sid = 4; then a third BLOCK_8X8 leaf at
+    /// (2, 2) — `prev_u = SegmentIds[1][2] = 4`, `prev_l =
+    /// SegmentIds[2][1] = 4`, `prev_ul = SegmentIds[1][1] = 4` ⇒
+    /// `segment_id_ctx` returns 2. The §5.11.9 `pred` derivation: U
+    /// != -1, L != -1, UL == U ⇒ pred = U = 4.
+    #[test]
+    fn decode_segment_id_ctx_2_all_neighbours_match() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Two BLOCK_8X8 skip stamps to seed sid = 4 into the
+        // top-left 4x4 cells without touching the bitstream.
+        // First seed at (0, 0): pred = 0, but skip + pred = 0 so
+        // sid = 0 — that doesn't work for our "all neighbours = 4"
+        // setup. Use the non-skip path with rigged CDF.
+        let rigged4 = force_segment_id_cdf(4);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged4;
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_8X8, 0, 7)
+            .unwrap();
+        // Skip stamp at (0, 2): pred from prev_u (-1), prev_l (=4),
+        // prev_ul (-1) ⇒ pred = prev_l = 4 (else-if branch: prev_u
+        // == -1, prev_l == 4). Skip ⇒ sid = 4.
+        walker
+            .decode_segment_id(&mut dec, &mut cdfs, 0, 2, BLOCK_8X8, 1, 7)
+            .unwrap();
+        // Skip stamp at (2, 0): pred from prev_u (= 4), prev_l
+        // (-1), prev_ul (-1) ⇒ prev_u != -1, prev_l == -1 ⇒ pred =
+        // prev_u = 4. Skip ⇒ sid = 4.
+        walker
+            .decode_segment_id(&mut dec, &mut cdfs, 2, 0, BLOCK_8X8, 1, 7)
+            .unwrap();
+        // Now: SegmentIds[1][1] = 4, [1][2] = 4, [2][1] = 4. The
+        // call at (2, 2) lands ctx = 2 (UL == U && UL == L). Rig
+        // ctx-2's row to force diff = 0 (so segment_id = pred = 4
+        // unchanged by the upward branch when diff is even and 0).
+        // ctx-0 / ctx-1 forced to diff = 7 (would yield a different
+        // sid) so ctx-2 selection is unambiguous.
+        cdfs.segment_id[0] = force_segment_id_cdf(7);
+        cdfs.segment_id[1] = force_segment_id_cdf(7);
+        cdfs.segment_id[2] = force_segment_id_cdf(0);
+        let sid = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 2, 2, BLOCK_8X8, 0, 7)
+            .unwrap();
+        // pred = 4, diff = 0, neg_deinterleave(0, 4, 8): ref = 4,
+        // max = 8, 2 * ref = 8 == max ⇒ lower branch; 2 * (max -
+        // ref - 1) = 6; diff = 0 <= 6 and even ⇒ pred - 0 = 4.
+        assert_eq!(sid, 4, "ctx-2 selected and pred = 4 ⇒ sid = 4");
+    }
+
+    /// §5.11.5 grid-fill clips at the frame's bottom-right edge.
+    /// Place a BLOCK_16X16 leaf (`bw4 = bh4 = 4`) at `(2, 2)` of a
+    /// 4×4 frame: only the in-grid 2×2 quadrant should be stamped.
+    #[test]
+    fn decode_segment_id_grid_fill_clips_bottom_right_edge() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_segment_id_cdf(2);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let sid = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 2, 2, BLOCK_16X16, 0, 7)
+            .unwrap();
+        assert_eq!(sid, 2, "diff = 2, pred = 0 ⇒ sid = 2");
+        // In-grid 2×2 quadrant (rows 2..4, cols 2..4) stamped.
+        for r in 2..4 {
+            for c in 2..4 {
+                assert_eq!(walker.segment_ids()[r * 4 + c], 2);
+            }
+        }
+        // Out-of-quadrant in-grid cells stay at -1.
+        assert_eq!(walker.segment_ids()[0], -1);
+        assert_eq!(walker.segment_ids()[3], -1);
+        assert_eq!(walker.segment_ids()[3 * 4], -1);
+    }
+
+    /// Three-way out-of-range guard: `mi_row` past extent, `mi_col`
+    /// past extent, `sub_size == BLOCK_SIZES`, plus the new
+    /// `last_active_seg_id >= MAX_SEGMENTS` precondition.
+    #[test]
+    fn decode_segment_id_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        assert_eq!(
+            walker.decode_segment_id(&mut dec, &mut cdfs, 8, 0, BLOCK_4X4, 0, 7),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_segment_id(&mut dec, &mut cdfs, 0, 8, BLOCK_4X4, 0, 7),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_SIZES, 0, 7),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // last_active_seg_id must be in 0..MAX_SEGMENTS = 0..8.
+        // The §5.9.14 derivation enforces this upstream; the walker
+        // surfaces a caller-bug for out-of-range values.
+        assert_eq!(
+            walker.decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_4X4, 0, 8),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
     }
