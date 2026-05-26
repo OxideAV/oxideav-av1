@@ -1307,6 +1307,42 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
 
+Round 155 lands the §5.11.12 **`read_delta_qindex()` syntax
+element** (av1-spec p.67) as a new
+`PartitionWalker::decode_delta_qindex` method on the r154 walker,
+plus a `CurrentQIndex` scalar tracked across calls via
+`PartitionWalker::current_q_index()` /
+`PartitionWalker::set_current_q_index()` accessors. Honours the
+§5.11.12 superblock-skip short-circuit (`MiSize == sbSize && skip`
+⇒ no symbol read; `sbSize = use_128x128_superblock ?
+BLOCK_128X128 : BLOCK_64X64`, the latter via the §5.5.1
+sequence-header flag) and the outer `ReadDeltas` (§6.10.4) gate.
+Otherwise an `S()` symbol is decoded against `TileDeltaQCdf` —
+length `DELTA_Q_SMALL + 2 = 5`, no context index per §8.3.2; the
+working CDF is a single row. A decoded value of `DELTA_Q_SMALL`
+(`= 3`) triggers the §5.11.12 escape ladder
+(`delta_q_rem_bits` `L(3)` + post-increment + `delta_q_abs_bits`
+`L(rem_bits + 1)`), reconstructing
+`delta_q_abs = delta_q_abs_bits + (1 << n) + 1` over the extended
+range `0..=2 ∪ 3..=511`. Non-zero `delta_q_abs` reads
+`delta_q_sign_bit` `L(1)` and applies the spec's
+`CurrentQIndex = Clip3(1, 255, CurrentQIndex +
+(reducedDeltaQIndex << delta_q_res))` update. New constant
+`DELTA_Q_SMALL = 3`, new table `DEFAULT_DELTA_Q_CDF` transcribed
+verbatim from §9.4 p.431 (`[28160, 32120, 32677, 32768, 0]`), new
+field `TileCdfContext::delta_q` + `delta_q_cdf()` accessor. 16
+new cdf-module tests (417 -> 433): default-CDF literal match;
+init-from-defaults invariant; sb-skip short-circuit for both
+`use_128x128_superblock` values; `ReadDeltas` false short-circuit;
+zero-`delta_q_abs` no-update; literal-positive no-shift; literal
+positive with shift; Clip3 lower-bound via hostile seed; Clip3
+upper-bound; DELTA_Q_SMALL escape ladder minimum value; escape
+ladder stays in `Clip3(1, 255)` range; cross-call accumulation;
+fresh-walker initial `CurrentQIndex = 0`; out-of-range guards ⇒
+`PartitionWalkOutOfRange`; arithmetic-decoder zero-byte sign-bit
+observation. `decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
+
 ## Sources consulted (clean-room wall)
 
 * AV1 Bitstream & Decoding Process Specification — AOMedia, copy at
@@ -1738,6 +1774,31 @@ and `encode_av1` still return `Error::NotImplemented`.
     tables" (`Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` — `t -> Max(w, h)`-
     sided square — and `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
     — chroma-mode default-tx-type table).
+  * **`read_delta_qindex` syntax element** (round 155): §3 (the
+    `DELTA_Q_SMALL = 3` constant — the §5.11.12 escape sentinel
+    against which `delta_q_abs` is compared to trigger the
+    `delta_q_rem_bits` / `delta_q_abs_bits` ladder), §5.11.12
+    (`read_delta_qindex()` function body — the `sbSize =
+    use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64` derivation,
+    the `MiSize == sbSize && skip` superblock-skip short-circuit,
+    the `ReadDeltas` outer gate, the `delta_q_abs` `S()` read with
+    the `DELTA_Q_SMALL` escape ladder
+    `delta_q_rem_bits = L(3); delta_q_rem_bits++;
+    delta_q_abs_bits = L(delta_q_rem_bits); delta_q_abs =
+    delta_q_abs_bits + (1 << delta_q_rem_bits) + 1`, the
+    `delta_q_sign_bit = L(1)` sign read, the
+    `reducedDeltaQIndex = delta_q_sign_bit ? -delta_q_abs :
+    delta_q_abs` derivation, and the
+    `CurrentQIndex = Clip3(1, 255, CurrentQIndex +
+    (reducedDeltaQIndex << delta_q_res))` update), §6.10.4 (the
+    `ReadDeltas` derivation as `delta_q_present` AND
+    first-block-of-superblock — accepted from the caller as a
+    pre-computed boolean rather than re-derived inside the walker),
+    §8.3.1 (the `init_non_coeff_cdfs` step "`DeltaQCdf` is set to
+    a copy of `Default_Delta_Q_Cdf`"), §8.3.2 (the `delta_q_abs:
+    the cdf is given by TileDeltaQCdf` paragraph — single CDF row
+    with no context index), §9.4 (default CDF table values for
+    `Default_Delta_Q_Cdf[ DELTA_Q_SMALL + 2 ]` on av1-spec p.431).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

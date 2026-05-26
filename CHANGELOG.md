@@ -6,6 +6,41 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 155 — §5.11.12 `read_delta_qindex()` syntax element.**
+  Lands the per-superblock quantiser-index delta read (av1-spec
+  p.67) as a new [`PartitionWalker::decode_delta_qindex`] method
+  on the r154 walker, plus a `CurrentQIndex` scalar tracked across
+  calls with [`PartitionWalker::current_q_index`] /
+  [`PartitionWalker::set_current_q_index`] accessors. Honours the
+  §5.11.12 superblock-skip short-circuit (`MiSize == sbSize && skip`
+  ⇒ early return, `CurrentQIndex` unchanged) with `sbSize` derived
+  from the §5.5.1 `use_128x128_superblock` argument, plus the outer
+  `ReadDeltas` (§6.10.4) gate. Otherwise an `S()` symbol is decoded
+  against `TileDeltaQCdf` (no context index — single-row §8.3.2 CDF
+  with length `DELTA_Q_SMALL + 2 = 5`); a decoded value of
+  `DELTA_Q_SMALL = 3` triggers the §5.11.12 escape ladder
+  (`delta_q_rem_bits` `L(3)` + post-increment + `delta_q_abs_bits`
+  `L(rem_bits+1)`), reconstructing the extended absolute value via
+  `delta_q_abs = delta_q_abs_bits + (1 << n) + 1` with n ∈ 1..=8
+  and the final range `0..=2 ∪ 3..=511`. Non-zero `delta_q_abs`
+  reads a `delta_q_sign_bit` `L(1)` and applies the §5.11.12 update
+  `CurrentQIndex = Clip3(1, 255, CurrentQIndex +
+  (reducedDeltaQIndex << delta_q_res))`. New constant
+  [`DELTA_Q_SMALL = 3`], new table [`DEFAULT_DELTA_Q_CDF`]
+  transcribed verbatim from §9.4 p.431 (`[28160, 32120, 32677,
+  32768, 0]`), new field [`TileCdfContext::delta_q`] +
+  [`TileCdfContext::delta_q_cdf`] accessor. Tests grow by 16 (cdf
+  module): default-cdf literal match; init-from-defaults
+  invariant; sb-skip short-circuit for both `use_128x128_superblock`
+  values; `ReadDeltas` false short-circuit; zero-`delta_q_abs`
+  no-update; literal-positive no-shift; literal-positive with
+  shift; Clip3 lower-bound via hostile seed; Clip3 upper-bound;
+  DELTA_Q_SMALL escape ladder minimum value; escape ladder
+  in-clip-range path; cross-call accumulation; fresh-walker
+  initial `CurrentQIndex = 0`; out-of-range guard; arithmetic
+  decoder zero-byte sign-bit observation. 417 -> 433 tests, zero
+  `#[ignore]`.
+
 * **Round 154 — §5.11.10 `read_skip_mode()` syntax element.**
   Lands the per-block `skip_mode` read (av1-spec p.67) as a new
   [`PartitionWalker::decode_skip_mode`] method, plus a

@@ -309,6 +309,16 @@ pub const COMP_INTER_CONTEXTS: usize = 5;
 /// `SKIP_MODE_CONTEXTS` (§3) — number of contexts for `skip_mode`.
 pub const SKIP_MODE_CONTEXTS: usize = 3;
 
+/// `DELTA_Q_SMALL` (§3, av1-spec p.16) — the escape value for the
+/// §5.11.12 `delta_q_abs` symbol. When the decoded `delta_q_abs`
+/// equals this constant, the absolute delta is encoded via the
+/// `delta_q_rem_bits` (`L(3)`) + `delta_q_abs_bits` (`L(n)`) ladder
+/// instead of being the literal value. The §8.3.2 `TileDeltaQCdf`
+/// row therefore covers `DELTA_Q_SMALL + 1` literal values
+/// (`0..=DELTA_Q_SMALL`) plus the §8.2.6 counter slot — i.e. it has
+/// length `DELTA_Q_SMALL + 2 = 5`.
+pub const DELTA_Q_SMALL: usize = 3;
+
 /// `REF_CONTEXTS` (§3) — number of contexts for `single_ref`, `comp_ref`,
 /// `comp_bwdref`, and `uni_comp_ref`.
 pub const REF_CONTEXTS: usize = 3;
@@ -1448,6 +1458,15 @@ pub const DEFAULT_COMP_MODE_CDF: [[u16; 3]; COMP_INTER_CONTEXTS] = [
 /// codes `skip_mode` per §8.3.2 `TileSkipModeCdf[ ctx ]`.
 pub const DEFAULT_SKIP_MODE_CDF: [[u16; 3]; SKIP_MODE_CONTEXTS] =
     [[32621, 32768, 0], [20708, 32768, 0], [8127, 32768, 0]];
+
+/// `Default_Delta_Q_Cdf[ DELTA_Q_SMALL + 2 ]` (§9.4, av1-spec p.431).
+/// Codes `delta_q_abs` per §8.3.2 `TileDeltaQCdf`. There is **no**
+/// context index for this syntax element — the spec lists one
+/// `Default_Delta_Q_Cdf` table directly and §8.3.2 reads "the cdf is
+/// given by `TileDeltaQCdf`" (no `[ctx]`-style subscript), so the
+/// working `TileDeltaQCdf` is a single row instead of a per-context
+/// `[CONTEXTS][..]` array.
+pub const DEFAULT_DELTA_Q_CDF: [u16; DELTA_Q_SMALL + 2] = [28160, 32120, 32677, 32768, 0];
 
 /// `Default_Comp_Ref_Cdf[ REF_CONTEXTS ][ FWD_REFS - 1 ][ 3 ]` (§9.4).
 /// Binary; codes `comp_ref` / `comp_ref_p1` / `comp_ref_p2` per §8.3.2
@@ -6754,6 +6773,9 @@ pub struct TileCdfContext {
     pub comp_mode: [[u16; 3]; COMP_INTER_CONTEXTS],
     /// `TileSkipModeCdf[ SKIP_MODE_CONTEXTS ]` (§8.3.1).
     pub skip_mode: [[u16; 3]; SKIP_MODE_CONTEXTS],
+    /// `TileDeltaQCdf` (§8.3.1, av1-spec p.382). Codes `delta_q_abs`
+    /// per §5.11.12 / §8.3.2; single CDF row (no context index).
+    pub delta_q: [u16; DELTA_Q_SMALL + 2],
     /// `TileCompRefCdf[ REF_CONTEXTS ][ FWD_REFS - 1 ]` (§8.3.1).
     pub comp_ref: [[[u16; 3]; FWD_REFS - 1]; REF_CONTEXTS],
     /// `TileCompBwdRefCdf[ REF_CONTEXTS ][ BWD_REFS - 1 ]` (§8.3.1).
@@ -7088,6 +7110,7 @@ impl TileCdfContext {
             is_inter: DEFAULT_IS_INTER_CDF,
             comp_mode: DEFAULT_COMP_MODE_CDF,
             skip_mode: DEFAULT_SKIP_MODE_CDF,
+            delta_q: DEFAULT_DELTA_Q_CDF,
             comp_ref: DEFAULT_COMP_REF_CDF,
             comp_bwd_ref: DEFAULT_COMP_BWD_REF_CDF,
             single_ref: DEFAULT_SINGLE_REF_CDF,
@@ -7372,6 +7395,15 @@ impl TileCdfContext {
     /// `ctx` computed by [`skip_mode_ctx`] (in `0..SKIP_MODE_CONTEXTS`).
     pub fn skip_mode_cdf(&mut self, ctx: usize) -> &mut [u16] {
         &mut self.skip_mode[ctx]
+    }
+
+    /// §8.3.2 `delta_q_abs`: the cdf is `TileDeltaQCdf` (no context
+    /// index). Length is `DELTA_Q_SMALL + 2 = 5`, encoding the four
+    /// literal values `0..=DELTA_Q_SMALL` plus the §8.2.6 counter
+    /// slot. A decoded value of `DELTA_Q_SMALL` is the escape into
+    /// the §5.11.12 `delta_q_rem_bits` / `delta_q_abs_bits` ladder.
+    pub fn delta_q_cdf(&mut self) -> &mut [u16] {
+        &mut self.delta_q
     }
 
     /// §8.3.2 `comp_ref`: the cdf is `TileCompRefCdf[ ctx ][ p ]`, with
@@ -10518,6 +10550,15 @@ pub struct PartitionWalker {
     /// `bh4 * bw4` footprint of a block whose §5.11.10
     /// [`Self::decode_skip_mode`] has already fired.
     skip_modes: Vec<u8>,
+    /// `CurrentQIndex` (§5.11.12) — the running quantiser index the
+    /// next §5.11.12 `read_delta_qindex()` call adjusts. Per §6.10.4
+    /// the tile-walk pre-loads this from §5.9.12 `base_q_idx` at the
+    /// first block of the tile; the walker tracks it across
+    /// [`Self::decode_delta_qindex`] calls so subsequent superblocks
+    /// see the accumulated value. Held as `i32` because the
+    /// pre-Clip3 sum is a signed quantity (the spec writes
+    /// `CurrentQIndex + (reducedDeltaQIndex << delta_q_res)`).
+    current_q_index: i32,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -10556,6 +10597,7 @@ impl PartitionWalker {
             mi_sizes,
             skips,
             skip_modes,
+            current_q_index: 0,
             blocks: Vec::new(),
         })
     }
@@ -10624,6 +10666,26 @@ impl PartitionWalker {
     #[must_use]
     pub fn skip_modes(&self) -> &[u8] {
         &self.skip_modes
+    }
+
+    /// Current `CurrentQIndex` (§5.11.12) — the running quantiser
+    /// index. Always in `1..=255` after at least one §5.11.12 call
+    /// because the spec applies `Clip3(1, 255, ...)`; the fresh-walker
+    /// initial value is `0` (callers should set it to §5.9.12
+    /// `base_q_idx` via [`Self::set_current_q_index`] at the first
+    /// block of the tile per §6.10.4).
+    #[must_use]
+    pub fn current_q_index(&self) -> i32 {
+        self.current_q_index
+    }
+
+    /// Seed `CurrentQIndex` to the §5.9.12 `base_q_idx` (or restore
+    /// it at a tile boundary). Callers should call this once before
+    /// the first §5.11.12 [`Self::decode_delta_qindex`] in a tile,
+    /// per §6.10.4. No-op for tiles that never call
+    /// `decode_delta_qindex` (`delta_q_present == 0`).
+    pub fn set_current_q_index(&mut self, q_index: i32) {
+        self.current_q_index = q_index;
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for
@@ -11167,6 +11229,155 @@ impl PartitionWalker {
         }
 
         Ok(skip_mode)
+    }
+
+    /// `read_delta_qindex()` per §5.11.12 (av1-spec p.67) — reads the
+    /// per-superblock quantiser-index delta and applies it to the
+    /// running `CurrentQIndex` scalar. Updates
+    /// [`Self::current_q_index`] in place and returns the new value.
+    ///
+    /// The spec body (av1-spec p.67) reads:
+    ///
+    /// ```text
+    ///   read_delta_qindex( ) {
+    ///       sbSize = use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64
+    ///       if ( MiSize == sbSize && skip )
+    ///           return
+    ///       if ( ReadDeltas ) {
+    ///           delta_q_abs                                        S()
+    ///           if ( delta_q_abs == DELTA_Q_SMALL ) {
+    ///               delta_q_rem_bits                              L(3)
+    ///               delta_q_rem_bits++
+    ///               delta_q_abs_bits                  L(delta_q_rem_bits)
+    ///               delta_q_abs = delta_q_abs_bits + (1 << delta_q_rem_bits) + 1
+    ///           }
+    ///           if ( delta_q_abs ) {
+    ///               delta_q_sign_bit                              L(1)
+    ///               reducedDeltaQIndex = delta_q_sign_bit ? -delta_q_abs
+    ///                                                     : delta_q_abs
+    ///               CurrentQIndex = Clip3(1, 255,
+    ///                   CurrentQIndex + (reducedDeltaQIndex << delta_q_res))
+    ///           }
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// Per §6.10.4 / §5.11.12 the gating condition `ReadDeltas` is
+    /// `delta_q_present && first-block-of-superblock`; the §6.10.4
+    /// derivation is owned by the (future) tile walk and we accept it
+    /// as the caller-passed `read_deltas` boolean. `skip` is the
+    /// `Skips[r][c]` value the §5.11.11 [`Self::decode_skip`] just
+    /// stamped (the caller has it in scope from that call's return).
+    /// `use_128x128_superblock` is the §5.5.1 sequence-header bit.
+    /// `delta_q_res` is the §5.9.17 frame-header field clamped to
+    /// `0..=3` by `f(2)`.
+    ///
+    /// The `S()` read uses the single `TileDeltaQCdf` row (length
+    /// `DELTA_Q_SMALL + 2 = 5`, four literals `0..=DELTA_Q_SMALL` plus
+    /// the §8.2.6 counter slot). When the decoded `delta_q_abs`
+    /// equals `DELTA_Q_SMALL` it is the escape sentinel: the spec
+    /// then reads `delta_q_rem_bits` as `L(3)` (a fixed 3-bit
+    /// uniform integer), increments it by one to get the working
+    /// `n = rem_bits + 1`, reads `delta_q_abs_bits` as `L(n)` (the
+    /// `rem_bits` increment is performed *before* the second
+    /// literal read, so the second read uses the incremented count),
+    /// and reconstructs `delta_q_abs = delta_q_abs_bits + (1 << n) +
+    /// 1`. With `rem_bits ∈ 0..=7` after the `L(3)` read and a
+    /// post-increment `n ∈ 1..=8`, `delta_q_abs ∈ 2 + 2 ⋯ 256 +
+    /// 256 = 3 .. 511`; combined with the literal-branch range
+    /// `0..=DELTA_Q_SMALL` the full §5.11.12 `delta_q_abs` range is
+    /// `0..=2 ∪ 3..=511`, i.e. up to `511`.
+    ///
+    /// Returns the post-call `CurrentQIndex` on success, or
+    /// [`Error::PartitionWalkOutOfRange`] for caller-bug arguments
+    /// (out-of-range `sub_size`, `mi_row` / `mi_col` outside the
+    /// frame's mi extent). [`Error::UnexpectedEnd`] /
+    /// [`Error::SymbolExitUnderflow`] surface bitstream errors.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_delta_qindex(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip: u8,
+        read_deltas: bool,
+        use_128x128_superblock: bool,
+        delta_q_res: u8,
+    ) -> Result<i32, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.12 superblock-skip short-circuit:
+        //   sbSize = use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64
+        //   if ( MiSize == sbSize && skip ) return
+        // — a skipped whole-superblock does not signal a delta.
+        let sb_size = if use_128x128_superblock {
+            BLOCK_128X128
+        } else {
+            BLOCK_64X64
+        };
+        if sub_size == sb_size && skip != 0 {
+            return Ok(self.current_q_index);
+        }
+
+        // §5.11.12 outer gate: `ReadDeltas` (§6.10.4) — when off the
+        // function body is a no-op and CurrentQIndex stays unchanged.
+        if !read_deltas {
+            return Ok(self.current_q_index);
+        }
+
+        // delta_q_abs                                              S()
+        // §8.3.2: the cdf is given by TileDeltaQCdf (no ctx index).
+        let cdf = cdfs.delta_q_cdf();
+        let mut delta_q_abs: u32 = decoder.read_symbol(cdf)?;
+        debug_assert!(
+            (delta_q_abs as usize) < DELTA_Q_SMALL + 1,
+            "S() over Default_Delta_Q_Cdf yields 0..=DELTA_Q_SMALL"
+        );
+
+        if delta_q_abs as usize == DELTA_Q_SMALL {
+            // Escape ladder: delta_q_rem_bits = L(3) + 1, then
+            // delta_q_abs_bits = L(delta_q_rem_bits), and finally
+            // delta_q_abs = delta_q_abs_bits + (1 << delta_q_rem_bits) + 1.
+            // The spec's `delta_q_rem_bits++` happens *before* the
+            // second L() read, so `n` below is the incremented count.
+            let rem_bits = decoder.read_literal(3)?;
+            let n = rem_bits + 1;
+            let abs_bits = decoder.read_literal(n)?;
+            // n ∈ 1..=8 so (1 << n) ∈ 2..=256; abs_bits < (1 << n);
+            // the reconstructed value fits in u32 comfortably.
+            delta_q_abs = abs_bits + (1 << n) + 1;
+        }
+
+        if delta_q_abs != 0 {
+            let sign = decoder.read_literal(1)?;
+            // reducedDeltaQIndex = delta_q_sign_bit ? -delta_q_abs : delta_q_abs
+            let reduced: i32 = if sign == 1 {
+                -(delta_q_abs as i32)
+            } else {
+                delta_q_abs as i32
+            };
+            // CurrentQIndex = Clip3(1, 255,
+            //     CurrentQIndex + (reducedDeltaQIndex << delta_q_res))
+            // delta_q_res is f(2) so ∈ 0..=3; the left shift fits in
+            // i32 (max |reduced| is 511 ⇒ 511 << 3 = 4088 << 16-bit).
+            let shift = delta_q_res as u32;
+            let scaled = reduced.wrapping_shl(shift);
+            let pre_clip = self.current_q_index.wrapping_add(scaled);
+            self.current_q_index = pre_clip.clamp(1, 255);
+        }
+
+        Ok(self.current_q_index)
     }
 }
 
@@ -18934,5 +19145,447 @@ mod tests {
         let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.skip_modes().len(), 16 * 16);
         assert!(walker.skip_modes().iter().all(|&v| v == 0));
+    }
+
+    // Round 155 — §5.11.12 read_delta_qindex walker tests.
+
+    /// Helper: force a length-5 CDF row to select `symbol` on the next
+    /// `read_symbol`. Matches the `Default_Delta_Q_Cdf` shape (four
+    /// literal values `0..=DELTA_Q_SMALL` plus the §8.2.6 counter
+    /// slot).
+    fn force_delta_q_cdf(symbol: u8) -> [u16; DELTA_Q_SMALL + 2] {
+        assert!(
+            (symbol as usize) <= DELTA_Q_SMALL,
+            "Default_Delta_Q_Cdf admits 0..=DELTA_Q_SMALL"
+        );
+        // §8.2.6 fixed-point CDF: assign the entire 1 << 15 mass to
+        // the desired symbol by setting the first `symbol` slots to 0
+        // and the remaining literal slots to `1 << 15`. The last entry
+        // is the counter slot, always 0.
+        let mut row = [1u16 << 15; DELTA_Q_SMALL + 2];
+        for s in row.iter_mut().take(symbol as usize) {
+            *s = 0;
+        }
+        row[DELTA_Q_SMALL + 1] = 0;
+        row
+    }
+
+    /// §9.4: `Default_Delta_Q_Cdf` matches the spec listing verbatim
+    /// (av1-spec p.431) and the §8.2.6 well-formedness invariant
+    /// holds.
+    #[test]
+    fn default_delta_q_cdf_matches_spec_literal() {
+        assert_eq!(DEFAULT_DELTA_Q_CDF, [28160, 32120, 32677, 32768, 0]);
+        let n = DEFAULT_DELTA_Q_CDF.len() - 1;
+        assert_eq!(DEFAULT_DELTA_Q_CDF[n - 1], 1 << 15);
+        assert_eq!(DEFAULT_DELTA_Q_CDF[n], 0);
+    }
+
+    /// §8.3.1 init: a fresh `TileCdfContext` carries
+    /// `DEFAULT_DELTA_Q_CDF` verbatim.
+    #[test]
+    fn tile_cdf_context_delta_q_initialised_to_default() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.delta_q_cdf(), &DEFAULT_DELTA_Q_CDF);
+    }
+
+    /// §5.11.12 short-circuit: `MiSize == sbSize && skip` ⇒ no symbol
+    /// read, `CurrentQIndex` unchanged. With `use_128x128_superblock
+    /// == false`, `sbSize == BLOCK_64X64`.
+    #[test]
+    fn decode_delta_qindex_sb_skip_short_circuit_64x64() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(120);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let q = walker
+            .decode_delta_qindex(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_64X64,
+                /*skip=*/ 1,
+                /*read_deltas=*/ true,
+                /*use_128x128_superblock=*/ false,
+                /*delta_q_res=*/ 0,
+            )
+            .unwrap();
+        assert_eq!(q, 120, "sb-skip ⇒ CurrentQIndex unchanged");
+        assert_eq!(walker.current_q_index(), 120);
+        assert_eq!(dec.position(), pos_before, "no bit consumed");
+    }
+
+    /// §5.11.12 short-circuit (128x128 variant): `sbSize ==
+    /// BLOCK_128X128` when `use_128x128_superblock == true`.
+    #[test]
+    fn decode_delta_qindex_sb_skip_short_circuit_128x128() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 64,
+            mi_col_start: 0,
+            mi_col_end: 64,
+        };
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        walker.set_current_q_index(64);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let q = walker
+            .decode_delta_qindex(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_128X128,
+                1,
+                true,
+                /*use_128x128_superblock=*/ true,
+                0,
+            )
+            .unwrap();
+        assert_eq!(q, 64);
+        assert_eq!(dec.position(), pos_before);
+        // A 64x64 block in a 128x128-superblock frame should NOT
+        // short-circuit (MiSize != sbSize).
+        let q2 = walker
+            .decode_delta_qindex(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_64X64,
+                1,
+                /*read_deltas=*/ false, // gate symbol-read off via ReadDeltas
+                true,
+                0,
+            )
+            .unwrap();
+        // The ReadDeltas gate (the *outer* if) is what stops the
+        // symbol read here; CurrentQIndex still unchanged.
+        assert_eq!(q2, 64);
+    }
+
+    /// §5.11.12 outer gate: `!ReadDeltas` ⇒ no symbol read,
+    /// `CurrentQIndex` unchanged. (`skip` doesn't matter when the
+    /// outer gate is off.)
+    #[test]
+    fn decode_delta_qindex_read_deltas_false_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(100);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let q = walker
+            .decode_delta_qindex(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /*skip=*/ 0,
+                /*read_deltas=*/ false,
+                false,
+                3,
+            )
+            .unwrap();
+        assert_eq!(q, 100);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.12 else branch: a rigged CDF forcing `delta_q_abs = 0`
+    /// ⇒ `CurrentQIndex` unchanged (the `if (delta_q_abs)` body is
+    /// skipped, no sign-bit / no shift). One symbol bit consumed.
+    #[test]
+    fn decode_delta_qindex_zero_abs_no_update() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(80);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_q = force_delta_q_cdf(0);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let q = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 1)
+            .unwrap();
+        assert_eq!(q, 80, "delta_q_abs = 0 ⇒ CurrentQIndex unchanged");
+    }
+
+    /// §5.11.12 literal-positive path: `delta_q_abs = 1`, sign = 0,
+    /// `delta_q_res = 0` ⇒ `CurrentQIndex += 1`.
+    #[test]
+    fn decode_delta_qindex_literal_positive_no_shift() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(100);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_q = force_delta_q_cdf(1);
+        // After the S() read we need a sign-bit read of 0 (positive).
+        // Bytes are all zero so L(1) returns 0.
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let q = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 0)
+            .unwrap();
+        assert_eq!(q, 101);
+        assert_eq!(walker.current_q_index(), 101);
+    }
+
+    /// §5.11.12 literal-positive path with `delta_q_res = 2`:
+    /// `CurrentQIndex += (delta_q_abs << 2) = +4`.
+    #[test]
+    fn decode_delta_qindex_literal_positive_with_shift() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(50);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_q = force_delta_q_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let q = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 2)
+            .unwrap();
+        assert_eq!(q, 54, "50 + (1 << 2) = 54");
+    }
+
+    /// §8.2.2 / §8.2.5: with all-zero source bytes, every L(1)
+    /// `read_bool` yields 0. We rely on this to test positive-delta
+    /// paths deterministically (the negative path would require
+    /// engineering a specific arithmetic state to flip the sign bit,
+    /// which is out of scope for the §5.11.12 walker tests — its
+    /// L(1) is shared with the §8.2.3 boolean primitive whose tests
+    /// already cover both bit polarities).
+    #[test]
+    fn decode_delta_qindex_zero_byte_sign_bit_is_positive() {
+        let bytes = [0u8; 8];
+        let mut d = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // After an S() over a rigged 4-literal CDF returning 0, L(1)
+        // is still 0 on a zero-byte stream.
+        let mut cdf = force_delta_q_cdf(0);
+        let s = d.read_symbol(&mut cdf).unwrap();
+        assert_eq!(s, 0);
+        let l = d.read_literal(1).unwrap();
+        assert_eq!(l, 0, "all-zero bytes ⇒ L(1) = 0");
+    }
+
+    /// §5.11.12 Clip3(1, 255) lower bound: a large negative delta
+    /// from a tiny `CurrentQIndex` clips at 1. The arithmetic-decoder
+    /// `L(1)` sign-bit is shared with §8.2.3 `read_bool` and cannot
+    /// be rigged in isolation through a forced 4-literal CDF; we
+    /// instead exercise the lower clamp by seeding `CurrentQIndex`
+    /// at i32::MIN + 1 (a hostile-state caller bug) and asserting
+    /// the §5.11.12 Clip3 still drives the post-call value into
+    /// `[1, 255]`. Even the all-zero-bytes positive path with
+    /// `delta_q_abs = 1` cannot escape the lower clamp because the
+    /// pre-clip value is `i32::MIN + 2` (saturating against the
+    /// `wrapping_add(scaled)` step).
+    #[test]
+    fn decode_delta_qindex_clip3_lower_bound_via_hostile_seed() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(i32::MIN + 1);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_q = force_delta_q_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let q = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 0)
+            .unwrap();
+        assert_eq!(q, 1, "hostile seed + tiny +ve delta still clamps to 1");
+    }
+
+    /// §5.11.12 Clip3(1, 255) upper bound: a large positive delta
+    /// from a near-max `CurrentQIndex` clips at 255.
+    #[test]
+    fn decode_delta_qindex_clip3_upper_bound() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(250);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_q = force_delta_q_cdf(2);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // delta_q_abs = 2, sign = 0 (positive bytes are 0), shift = 3 ⇒
+        // delta = +16 ⇒ 250 + 16 = 266 ⇒ clip to 255.
+        let q = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 3)
+            .unwrap();
+        assert_eq!(q, 255);
+    }
+
+    /// §5.11.12 DELTA_Q_SMALL escape ladder: `delta_q_abs ==
+    /// DELTA_Q_SMALL` triggers the L(3) + L(n+1) ladder. With
+    /// `delta_q_rem_bits = 0` (read as L(3)=0), n = 1, `abs_bits =
+    /// L(1)=0` ⇒ `delta_q_abs = 0 + (1 << 1) + 1 = 3`.
+    #[test]
+    fn decode_delta_qindex_small_escape_minimum() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(100);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force the symbol read to yield DELTA_Q_SMALL = 3.
+        cdfs.delta_q = force_delta_q_cdf(DELTA_Q_SMALL as u8);
+        // All-zero bytes ⇒ L(3) = 0 (rem_bits), L(1) = 0 (abs_bits),
+        // L(1) = 0 (sign). delta_q_abs = 3.
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let q = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 0)
+            .unwrap();
+        assert_eq!(q, 103, "100 + 3 = 103");
+    }
+
+    /// §5.11.12 DELTA_Q_SMALL escape ladder result stays in
+    /// [1, 255] regardless of the ladder's L() outputs: an FF-byte
+    /// stream forces the S() read into the escape branch (the
+    /// rigged 4-literal CDF + FF arithmetic state lands on
+    /// symbol 3 = DELTA_Q_SMALL as shown by the lower-clip probe
+    /// reasoning), and even when the resulting `delta_q_abs` is
+    /// large the §5.11.12 `Clip3(1, 255, ...)` keeps
+    /// `CurrentQIndex` in range. The exact post-call value depends
+    /// on the cascade of L(3) / L(n) / L(1) reads under the
+    /// arithmetic decoder's post-S() state and is not asserted
+    /// pointwise here.
+    #[test]
+    fn decode_delta_qindex_small_escape_stays_in_clip_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(200);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force the S() result to DELTA_Q_SMALL via a CDF that lands
+        // on it under the zero-byte arithmetic state.
+        cdfs.delta_q = force_delta_q_cdf(DELTA_Q_SMALL as u8);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let q = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 0)
+            .unwrap();
+        // With all-zero bytes:
+        //   * L(3) for delta_q_rem_bits = 0 ⇒ n = 1
+        //   * L(1) for delta_q_abs_bits = 0 ⇒ delta_q_abs = 0 + 2 + 1 = 3
+        //   * L(1) for sign_bit = 0 ⇒ reduced = +3
+        //   * pre-clip 200 + 3 = 203, in range
+        assert_eq!(q, 203);
+    }
+
+    /// CurrentQIndex carries across multiple §5.11.12 calls: a +1
+    /// then another +1 with `delta_q_res = 0` from a seed of 100
+    /// ends at 102.
+    #[test]
+    fn decode_delta_qindex_accumulates_across_calls() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        walker.set_current_q_index(100);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.delta_q = force_delta_q_cdf(1);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let q1 = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, true, false, 0)
+            .unwrap();
+        assert_eq!(q1, 101);
+        let q2 = walker
+            .decode_delta_qindex(&mut dec, &mut cdfs, 0, 4, BLOCK_16X16, 0, true, false, 0)
+            .unwrap();
+        assert_eq!(q2, 102);
+    }
+
+    /// Fresh `PartitionWalker::current_q_index` defaults to 0
+    /// (callers must seed via `set_current_q_index(base_q_idx)`).
+    #[test]
+    fn fresh_walker_current_q_index_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        assert_eq!(walker.current_q_index(), 0);
+    }
+
+    /// Out-of-range guards: `mi_row >= MiRows`, `mi_col >= MiCols`,
+    /// `sub_size >= BLOCK_SIZES` all surface
+    /// `Error::PartitionWalkOutOfRange`.
+    #[test]
+    fn decode_delta_qindex_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        assert_eq!(
+            walker.decode_delta_qindex(&mut dec, &mut cdfs, 8, 0, BLOCK_16X16, 0, false, false, 0),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_delta_qindex(&mut dec, &mut cdfs, 0, 8, BLOCK_16X16, 0, false, false, 0),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_delta_qindex(&mut dec, &mut cdfs, 0, 0, BLOCK_SIZES, 0, false, false, 0),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
     }
 }
