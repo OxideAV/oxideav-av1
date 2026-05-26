@@ -1307,6 +1307,54 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
 
+Round 157 lands the §5.11.56 **`read_cdef()` syntax element** plus
+the §5.11.55 **`clear_cdef()` reset** (av1-spec p.104) as new
+`PartitionWalker::decode_cdef` + `PartitionWalker::clear_cdef`
+methods on the r156 walker, alongside a `cdef_idx: Vec<i8>`
+row-major grid sized `MiRows × MiCols` (pre-filled with the `-1`
+sentinel per §5.11.55, interpreted as "CDEF disabled for that
+block" per §6.10.40) with a `cdef_idx()` read accessor. CDEF
+operates on 64×64 anchor cells, so `decode_cdef` masks the leaf's
+`(MiRow, MiCol)` to the anchor at `(MiRow & cdefMask4, MiCol &
+cdefMask4)` (`cdefMask4 = ~(cdefSize4 - 1)`, `cdefSize4 =
+Num_4x4_Blocks_Wide[ BLOCK_64X64 ] = 16` so the low four bits are
+zeroed). If the anchor still holds the `-1` sentinel, an
+`L(cdef_bits)` literal is read (`cdef_bits ∈ 0..=3` per §5.9.19
+`f(2)` ⇒ decoded value in `0..=7`) and the grid-fill loop stamps
+the value across the leaf's `(w4, h4)` footprint at the `cdefSize4
+= 16` stride so super-64 blocks (`BLOCK_128X128`) reach all four
+anchor cells while sub-64 blocks touch only their containing
+anchor. Subsequent leaves whose `cdefMask4` lands on the same
+anchor short-circuit (no read; the anchor already holds the
+value). The §5.11.56 short-circuit set is honoured: `skip ||
+CodedLossless || !enable_cdef || allow_intrabc` ⇒ no read; the
+anchor's current value (sentinel or prior stamp) is returned
+unchanged. `clear_cdef( r, c, use_128x128_superblock )` — called
+by the §5.11.2 tile walk at each superblock — stamps `-1` at the
+one (64×64 superblock) or four (128×128 superblock) anchor cells;
+out-of-grid anchors are silently skipped so the bottom/right
+superblock can straddle the frame edge without panic. `cdef_bits
+== 0` yields `L(0) = 0` (no bit read) and still transitions the
+anchor from `-1` to `0`, matching the §5.9.19 single-strength
+case. 18 new cdf-module tests (450 → 468): fresh-walker all-`-1`
+invariant; `clear_cdef` 64×64 single-anchor stamp; `clear_cdef`
+128×128 four-anchor stamp; `clear_cdef` out-of-grid silent skip;
+each of the four `skip` / `CodedLossless` / `!enable_cdef` /
+`allow_intrabc` short-circuit gates (separately, with `0xFF` byte
+buffers proving no bit consumed); first-leaf-reads-literal-
+and-stamps-anchor with off-anchor cell stays at sentinel;
+second-leaf-in-anchor-no-read; `cdef_bits == 0` zero-bit stamp;
+`cdef_bits == 3` upper-bound; anchor-mask routes (10, 13) ⇒ (0,
+0); `BLOCK_128X128` stamps all four anchors with off-anchor cells
+at sentinel; grid-fill clips at frame edge; short-circuit returns
+prior stamp; `clear_cdef` after stamp resets anchor; four-way
+out-of-range guard (`mi_row` past extent / `mi_col` past extent /
+`sub_size == BLOCK_SIZES` / `cdef_bits > 3`) ⇒
+`PartitionWalkOutOfRange`. The §5.11.5 `decode_block()` body
+itself (coefficient / motion-vector / reconstruction) remains the
+next round's target. `decode_av1` / `encode_av1` continue to
+return `Error::NotImplemented`.
+
 Round 156 lands the §5.11.13 **`read_delta_lf()` syntax element**
 (av1-spec p.68) as a new `PartitionWalker::decode_delta_lf` method,
 structurally parallel to r155's §5.11.12 walker but iterating
@@ -1825,6 +1873,28 @@ observation. `decode_av1` / `encode_av1` continue to return
     tables" (`Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` — `t -> Max(w, h)`-
     sided square — and `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
     — chroma-mode default-tx-type table).
+  * **`read_cdef` syntax element + `clear_cdef` reset** (round 157):
+    §3 (the `BLOCK_64X64 = 12` ordinal that anchors the §5.11.55
+    `cdefSize4 = Num_4x4_Blocks_Wide[ BLOCK_64X64 ] = 16` stride; the
+    `Num_4x4_Blocks_Wide[ ]` / `Num_4x4_Blocks_High[ ]` tables used
+    by the §5.11.56 grid-fill loop, transcribed in round 148 from
+    §9.3 p.400), §5.9.19 (the `cdef_bits` `f(2)` upper bound — so
+    `cdef_bits ∈ 0..=3` and the decoded `L(cdef_bits)` value fits in
+    `i8`; the `CodedLossless || allow_intrabc || !enable_cdef ⇒
+    cdef_bits = 0` short-circuit that pairs with §5.11.56's
+    short-circuit set), §5.11.2 (the per-superblock `clear_cdef( r,
+    c )` call site at the top of the tile-walk inner loop —
+    immediately before `decode_partition`), §5.11.55 (the
+    `clear_cdef()` function body — the unconditional `cdef_idx[ r ][
+    c ] = -1` stamp plus the `use_128x128_superblock` three-extra-
+    anchor stamps), §5.11.56 (the `read_cdef()` function body — the
+    four-way short-circuit `skip || CodedLossless || !enable_cdef ||
+    allow_intrabc`, the `cdefMask4 = ~(cdefSize4 - 1)` anchor mask,
+    the `cdef_idx[ r ][ c ] == -1` first-leaf gate that gates the
+    `L(cdef_bits)` literal read, and the `cdefSize4`-strided
+    grid-fill loop over the leaf's `(w4, h4)` footprint), §6.10.40
+    (the `cdef_idx` semantics — "A value of -1 means that CDEF is
+    disabled for that block").
   * **`read_delta_lf` syntax element** (round 156): §3 (the
     `DELTA_LF_SMALL = 3` escape sentinel against which `delta_lf_abs`
     is compared to trigger the `delta_lf_rem_bits` /

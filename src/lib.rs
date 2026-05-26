@@ -1011,6 +1011,48 @@
 //!     out-of-range guard. `decode_av1` / `encode_av1` continue to
 //!     return `Error::NotImplemented`.
 //!
+//!   * **Round 157.** The §5.11.56 `read_cdef()` syntax element
+//!     (av1-spec p.104) — the per-leaf CDEF-index read, plus the
+//!     §5.11.55 `clear_cdef()` per-superblock sentinel reset. Lands
+//!     as new [`PartitionWalker::decode_cdef`] +
+//!     [`PartitionWalker::clear_cdef`] methods on the r156 walker,
+//!     plus a `cdef_idx: Vec<i8>` row-major grid sized `MiRows ×
+//!     MiCols` with [`PartitionWalker::cdef_idx`] read accessor. CDEF
+//!     operates on 64×64 anchor cells, so the walker masks the leaf
+//!     `(MiRow, MiCol)` to the anchor at `(MiRow & cdefMask4, MiCol &
+//!     cdefMask4)` (`cdefMask4 = ~(cdefSize4 - 1)`, `cdefSize4 =
+//!     Num_4x4_Blocks_Wide[ BLOCK_64X64 ] = 16`) and uses the
+//!     anchor's `-1` sentinel to decide whether the first leaf in
+//!     this anchor should read an `L(cdef_bits)` literal (`cdef_bits`
+//!     in `0..=3` per §5.9.19 `f(2)`). When the literal is read, the
+//!     grid-fill loop stamps the value across the leaf's
+//!     `(w4, h4)` footprint at the `cdefSize4 = 16` stride so super-64
+//!     blocks (`BLOCK_128X128`) reach all four anchor cells while
+//!     sub-64 blocks touch only their containing anchor. Subsequent
+//!     leaves in the same 64×64 anchor short-circuit (no read; the
+//!     anchor already holds the value). The §5.11.56 short-circuit
+//!     set is honoured: `skip || CodedLossless || !enable_cdef ||
+//!     allow_intrabc` ⇒ no read, anchor sentinel/value returned
+//!     unchanged. `clear_cdef( r, c, use_128x128_superblock )` —
+//!     called by the §5.11.2 tile walk before each superblock —
+//!     stamps `-1` at the one (64×64 superblocks) or four (128×128
+//!     superblocks) anchor cells; out-of-grid anchors are silently
+//!     skipped (the bottom/right superblock can straddle the frame
+//!     edge). 18 new cdf-module tests (450 → 468): fresh-walker
+//!     all-`-1` invariant; `clear_cdef` 64x64 single-anchor stamp;
+//!     `clear_cdef` 128x128 four-anchor stamp; `clear_cdef`
+//!     out-of-grid skip; each of the four `skip` / `CodedLossless`
+//!     / `!enable_cdef` / `allow_intrabc` short-circuit gates;
+//!     first-leaf-reads-literal-and-stamps-anchor; second-leaf-in-
+//!     anchor-no-read; `cdef_bits == 0` zero-bit stamp; `cdef_bits ==
+//!     3` upper-bound; anchor-mask routes (10, 13) ⇒ (0, 0);
+//!     BLOCK_128X128 stamps all four anchors; grid-fill clips at
+//!     frame edge; short-circuit returns prior stamp; `clear_cdef`
+//!     after stamp resets anchor; out-of-range guard (4-way:
+//!     `mi_row` / `mi_col` / `sub_size` / `cdef_bits > 3`).
+//!     `decode_av1` / `encode_av1` continue to return
+//!     `Error::NotImplemented`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a

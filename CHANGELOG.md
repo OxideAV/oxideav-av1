@@ -6,6 +6,67 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 157 — §5.11.56 `read_cdef()` syntax element + §5.11.55
+  `clear_cdef()` reset.** Lands the per-leaf CDEF-index read
+  (av1-spec p.104) as a new [`PartitionWalker::decode_cdef`] method
+  on the r156 walker, plus the per-superblock
+  [`PartitionWalker::clear_cdef`] reset called by §5.11.2 at each
+  superblock entry. Adds a `cdef_idx: Vec<i8>` row-major grid sized
+  `MiRows × MiCols` to `PartitionWalker` (pre-filled with the `-1`
+  sentinel from §5.11.55, interpreted as "CDEF disabled for that
+  block" per §6.10.40) with a [`PartitionWalker::cdef_idx`] read
+  accessor.
+
+  CDEF operates on 64×64 anchor cells: `decode_cdef` masks the
+  leaf's `(MiRow, MiCol)` to the anchor at `(MiRow & cdefMask4,
+  MiCol & cdefMask4)`, where `cdefMask4 = ~(cdefSize4 - 1)` and
+  `cdefSize4 = Num_4x4_Blocks_Wide[ BLOCK_64X64 ] = 16` so the
+  low four bits are zeroed. If the anchor still holds the `-1`
+  sentinel, an `L(cdef_bits)` literal is read (`cdef_bits ∈ 0..=3`
+  per §5.9.19 `f(2)`, so the decoded value is in `0..=7`). The
+  literal then stamps across the leaf's `(w4, h4)` footprint at the
+  `cdefSize4 = 16` stride so super-64 blocks (`BLOCK_128X128`) reach
+  all four anchor cells while sub-64 blocks touch only their
+  containing anchor. Subsequent leaves whose `cdefMask4` lands on
+  the same anchor short-circuit (no read; the anchor already holds
+  the value — `cdef_idx[r][c] != -1` ⇒ outer `if` false).
+
+  The §5.11.56 short-circuit set is honoured: `skip ||
+  CodedLossless || !enable_cdef || allow_intrabc` ⇒ no read, the
+  anchor's current value (sentinel or prior stamp) returned
+  unchanged. `clear_cdef( r, c, use_128x128_superblock )` stamps
+  `-1` at the one (64×64 superblock) or four (128×128 superblock)
+  anchor cells per §5.11.55; out-of-grid anchors are silently
+  skipped so the bottom/right superblock can straddle the frame
+  edge without panic. `cdef_bits == 0` yields `L(0) = 0` (no bit
+  read) and still transitions the anchor from `-1` to `0`, matching
+  the §5.9.19 single-strength case.
+
+  Tests grow by 18 (cdf module): fresh-walker all-`-1` invariant;
+  `clear_cdef` 64×64 single-anchor stamp; `clear_cdef` 128×128
+  four-anchor stamp; `clear_cdef` out-of-grid silent skip; each of
+  the four `skip` / `CodedLossless` / `!enable_cdef` /
+  `allow_intrabc` short-circuit gates (separately, with `0xFF`
+  byte buffers proving no bit consumed); first-leaf-reads-literal-
+  and-stamps-anchor with off-anchor cell stays at sentinel;
+  second-leaf-in-anchor-no-read (cross-call position invariant);
+  `cdef_bits == 0` zero-bit stamp; `cdef_bits == 3` upper-bound;
+  anchor-mask routes `(10, 13)` ⇒ `(0, 0)` (leaf coords are not
+  stamp coords); `BLOCK_128X128` stamps all four 64×64 anchor
+  cells while off-anchor cells stay at sentinel; grid-fill clips
+  at the frame edge (24×24 grid + 128×128 leaf at `(16, 16)`); the
+  short-circuit returns the anchor's prior stamp (not `-1`) once a
+  prior leaf has written it; `clear_cdef` after a stamp resets the
+  anchor; four-way out-of-range guard (`mi_row` past extent /
+  `mi_col` past extent / `sub_size == BLOCK_SIZES` / `cdef_bits >
+  3`) ⇒ `Error::PartitionWalkOutOfRange`. 450 → 468 tests, zero
+  `#[ignore]`.
+
+  `decode_av1` / `encode_av1` continue to return
+  `Error::NotImplemented`; the §5.11.5 `decode_block()` body itself
+  (coefficient / motion-vector / reconstruction) remains the next
+  round's target.
+
 * **Round 156 — §5.11.13 `read_delta_lf()` syntax element.**
   Lands the per-superblock loop-filter delta read (av1-spec p.68)
   as a new [`PartitionWalker::decode_delta_lf`] method, structurally

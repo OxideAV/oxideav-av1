@@ -10651,6 +10651,17 @@ pub struct PartitionWalker {
     /// Stored as a fixed-length array because `FRAME_LF_COUNT` is a
     /// §3 spec constant.
     current_delta_lf: [i32; FRAME_LF_COUNT],
+    /// `cdef_idx[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec §5.11.55 / §5.11.56 / §6.10.40
+    /// p.179, av1-spec p.104). Entries are `-1` for cells that no
+    /// §5.11.56 [`Self::decode_cdef`] call has touched yet (matching
+    /// the §5.11.55 `clear_cdef()` initialisation sentinel; -1 means
+    /// "CDEF disabled for that block") and a value in `0..(1 <<
+    /// cdef_bits) <= 8` for cells in the `64x64` footprint of a block
+    /// whose §5.11.56 has fired. Stored as `i8` because the spec's
+    /// sentinel is the literal value `-1` and the `cdef_bits` literal
+    /// read is bounded by `f(2)` (so `1 << cdef_bits <= 8`).
+    cdef_idx: Vec<i8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -10682,6 +10693,14 @@ impl PartitionWalker {
         let mut skip_modes: Vec<u8> = Vec::new();
         skip_modes.try_reserve_exact(area).ok()?;
         skip_modes.resize(area, 0);
+        let mut cdef_idx: Vec<i8> = Vec::new();
+        cdef_idx.try_reserve_exact(area).ok()?;
+        // §5.11.55: every cell starts at -1, the "CDEF disabled for
+        // this block" sentinel. The per-superblock §5.11.55
+        // `clear_cdef(r, c)` call site below re-stamps the four (or
+        // one) 64x64 anchor cells; the fresh-walker pre-fill matches
+        // the spec's `cdef_idx[ r ][ c ] = -1` initialisation.
+        cdef_idx.resize(area, -1);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -10691,6 +10710,7 @@ impl PartitionWalker {
             skip_modes,
             current_q_index: 0,
             current_delta_lf: [0; FRAME_LF_COUNT],
+            cdef_idx,
             blocks: Vec::new(),
         })
     }
@@ -10801,6 +10821,228 @@ impl PartitionWalker {
     /// re-entry when one walker decodes multiple tiles.
     pub fn reset_current_delta_lf(&mut self) {
         self.current_delta_lf = [0; FRAME_LF_COUNT];
+    }
+
+    /// View of the §6.10.40 `cdef_idx[]` grid after the walk. Indexed
+    /// row-major: `cdef_idx()[ r * MiCols + c ]`. Cells that no
+    /// §5.11.56 [`Self::decode_cdef`] call has touched carry `-1` per
+    /// the §5.11.55 `clear_cdef()` initialisation (interpreted as
+    /// "CDEF disabled for that block").
+    #[must_use]
+    pub fn cdef_idx(&self) -> &[i8] {
+        &self.cdef_idx
+    }
+
+    /// `clear_cdef( r, c )` per §5.11.55 (av1-spec p.104) — re-stamps
+    /// the `-1` sentinel at the four (when `use_128x128_superblock`)
+    /// or one 64×64 anchor cell(s) at the top of each superblock. The
+    /// §5.11.2 tile walk calls this immediately before
+    /// [`Self::decode_partition`].
+    ///
+    /// ```text
+    ///   clear_cdef( r, c ) {
+    ///       cdef_idx[ r ][ c ] = -1
+    ///       if ( use_128x128_superblock ) {
+    ///           cdefSize4 = Num_4x4_Blocks_Wide[ BLOCK_64X64 ]
+    ///           cdef_idx[ r ][ c + cdefSize4 ] = -1
+    ///           cdef_idx[ r + cdefSize4][ c ] = -1
+    ///           cdef_idx[ r + cdefSize4][ c + cdefSize4 ] = -1
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// The fresh-walker constructor already initialises every cell to
+    /// `-1`; this method exists for tile-loop re-entry / superblock
+    /// boundaries where the same walker decodes contiguous
+    /// superblocks. Coordinates outside the frame's `MiRows` /
+    /// `MiCols` extent are silently skipped (the bottom/right
+    /// superblock can straddle the frame edge).
+    pub fn clear_cdef(&mut self, r: u32, c: u32, use_128x128_superblock: bool) {
+        // §5.11.55 first stamp: cdef_idx[ r ][ c ] = -1.
+        if r < self.mi_rows && c < self.mi_cols {
+            self.cdef_idx[(r * self.mi_cols + c) as usize] = -1;
+        }
+        if !use_128x128_superblock {
+            return;
+        }
+        // §5.11.55 `cdefSize4 = Num_4x4_Blocks_Wide[ BLOCK_64X64 ]`
+        // — the 64x64 anchor stride in 4x4-block units (= 16).
+        let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
+        // §5.11.55 three additional stamps for the 128x128 case.
+        let stamps: [(u32, u32); 3] = [
+            (r, c + cdef_size4),
+            (r + cdef_size4, c),
+            (r + cdef_size4, c + cdef_size4),
+        ];
+        for (rr, cc) in stamps {
+            if rr < self.mi_rows && cc < self.mi_cols {
+                self.cdef_idx[(rr * self.mi_cols + cc) as usize] = -1;
+            }
+        }
+    }
+
+    /// `read_cdef()` per §5.11.56 (av1-spec p.104) — the per-leaf
+    /// CDEF-index read. CDEF (Constrained Directional Enhancement
+    /// Filter) operates on 64×64 anchor cells; multiple decode-block
+    /// leaves inside one 64×64 anchor share the same `cdef_idx`
+    /// value. The first leaf inside an anchor reads the
+    /// `L(cdef_bits)` literal and stamps it across the anchor cells
+    /// the leaf's footprint covers; subsequent leaves inside the same
+    /// anchor observe the stamped value (no symbol read, identity
+    /// stamp).
+    ///
+    /// The spec body (av1-spec p.104) reads:
+    ///
+    /// ```text
+    ///   read_cdef( ) {
+    ///       if ( skip || CodedLossless || !enable_cdef || allow_intrabc) {
+    ///           return
+    ///       }
+    ///       cdefSize4 = Num_4x4_Blocks_Wide[ BLOCK_64X64 ]
+    ///       cdefMask4 = ~(cdefSize4 - 1)
+    ///       r = MiRow & cdefMask4
+    ///       c = MiCol & cdefMask4
+    ///       if ( cdef_idx[ r ][ c ] == -1 ) {
+    ///           cdef_idx[ r ][ c ]                        L(cdef_bits)
+    ///           w4 = Num_4x4_Blocks_Wide[ MiSize ]
+    ///           h4 = Num_4x4_Blocks_High[ MiSize ]
+    ///           for ( i = r; i < r + h4 ; i += cdefSize4 ) {
+    ///               for ( j = c; j < c + w4 ; j += cdefSize4 ) {
+    ///                   cdef_idx[ i ][ j ] = cdef_idx[ r ][ c ]
+    ///               }
+    ///           }
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// The §5.11.56 short-circuit set (any-true ⇒ no symbol read,
+    /// `cdef_idx` unchanged) maps directly to caller-side arguments:
+    ///
+    /// * `skip` — the §5.11.11 [`Self::decode_skip`] result for the
+    ///   current leaf (0 or 1).
+    /// * `coded_lossless` — the §6.8.2 frame-level `CodedLossless`
+    ///   flag (the §5.9.13 `delta_q_*` chain plus `seg_qm_active`
+    ///   logic that the frame parser already derives).
+    /// * `enable_cdef` — the §5.5.1 sequence-header bit. When
+    ///   `enable_cdef == 0`, §5.9.19 also forces `cdef_bits = 0`, so
+    ///   the short-circuit catches the case before any literal read.
+    /// * `allow_intrabc` — the §5.9.20 frame-header bit. When
+    ///   intra-block-copy is enabled, CDEF is disabled per §5.9.20.
+    ///
+    /// When the short-circuit set is all-false, the §5.11.56
+    /// `cdefMask4 = ~(cdefSize4 - 1)` masks the leaf's `(MiRow,
+    /// MiCol)` to the 64×64 anchor at `(r, c) = (MiRow &
+    /// cdefMask4, MiCol & cdefMask4)`. `cdefSize4 = 16` per
+    /// `Num_4x4_Blocks_Wide[ BLOCK_64X64 ]`, so `cdefMask4` zeroes
+    /// the low four bits.
+    ///
+    /// If `cdef_idx[ r ][ c ] == -1` (first leaf in this anchor),
+    /// `L(cdef_bits)` reads the literal (0..=7, since `cdef_bits` is
+    /// `f(2)` so `1 << cdef_bits <= 8`), then the per-leaf grid-fill
+    /// loop stamps the value over the `w4 x h4` footprint, advancing
+    /// by `cdefSize4` so only the 64×64 anchor cells inside the
+    /// footprint receive the stamp. Otherwise no read happens (the
+    /// stamp is implicit — earlier leaves in this anchor already wrote
+    /// it).
+    ///
+    /// Returns the `cdef_idx` value stamped at the anchor `(r, c)`
+    /// (the same value the spec writes into the grid), or
+    /// [`Error::PartitionWalkOutOfRange`] for caller-bug arguments
+    /// (`sub_size >= BLOCK_SIZES`, `mi_row >= MiRows`, `mi_col >=
+    /// MiCols`, `cdef_bits > 3`). [`Error::UnexpectedEnd`] surfaces
+    /// bitstream errors from the underlying `L(cdef_bits)` read.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_cdef(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip: u8,
+        coded_lossless: bool,
+        enable_cdef: bool,
+        allow_intrabc: bool,
+        cdef_bits: u32,
+    ) -> Result<i8, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.9.19 caps `cdef_bits` at `f(2) ⇒ 0..=3`. A larger value
+        // is a caller bug.
+        if cdef_bits > 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.56 short-circuit set: any-true ⇒ no symbol read,
+        // `cdef_idx` unchanged (the §5.11.55 `-1` sentinel survives).
+        if skip != 0 || coded_lossless || !enable_cdef || allow_intrabc {
+            // Return whatever sentinel/value sits at the leaf's anchor
+            // (typically `-1` from §5.11.55, but could be a prior
+            // leaf's stamp if the short-circuit fires mid-anchor).
+            let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
+            let mask: u32 = !(cdef_size4 - 1);
+            let r = mi_row & mask;
+            let c = mi_col & mask;
+            // r/c clipped to the anchor — already in-grid because
+            // `(mi_row, mi_col)` was.
+            return Ok(self.cdef_idx[(r * self.mi_cols + c) as usize]);
+        }
+
+        // §5.11.56 anchor derivation: cdefSize4 = 16, cdefMask4
+        // zeroes the low four bits of the leaf coordinate.
+        let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
+        let mask: u32 = !(cdef_size4 - 1);
+        let r = mi_row & mask;
+        let c = mi_col & mask;
+
+        let anchor_value = self.cdef_idx[(r * self.mi_cols + c) as usize];
+        if anchor_value != -1 {
+            // Anchor already stamped by an earlier leaf in the same
+            // 64×64 cell — §5.11.56 outer `if` is false, so no read.
+            return Ok(anchor_value);
+        }
+
+        // §5.11.56 inner branch: anchor still -1. Read `L(cdef_bits)`.
+        // `cdef_bits == 0` returns 0 with no bit consumed.
+        let raw = decoder.read_literal(cdef_bits)?;
+        debug_assert!(
+            raw < (1u32 << cdef_bits),
+            "L(cdef_bits) yields 0..(1<<cdef_bits)"
+        );
+        // `cdef_bits <= 3` ⇒ `raw <= 7` ⇒ fits in i8.
+        let value = raw as i8;
+
+        // §5.11.56 grid-fill: stamp `value` over the 64×64 anchor
+        // cells inside the leaf's `(w4, h4)` footprint, advancing by
+        // `cdefSize4 = 16` so only one cell per 64×64 anchor receives
+        // the stamp. Sub-64 blocks visit only their containing
+        // anchor; super-64 blocks (BLOCK_128X128 with
+        // `use_128x128_superblock`) cover four anchors.
+        let w4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let h4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        let mut i = r;
+        while i < r + h4 {
+            if i >= self.mi_rows {
+                break;
+            }
+            let mut j = c;
+            while j < c + w4 {
+                if j >= self.mi_cols {
+                    break;
+                }
+                self.cdef_idx[(i * self.mi_cols + j) as usize] = value;
+                j += cdef_size4;
+            }
+            i += cdef_size4;
+        }
+
+        Ok(value)
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for
@@ -20467,6 +20709,476 @@ mod tests {
 
     /// Out-of-range guards: `mi_row >= MiRows`, `mi_col >= MiCols`,
     /// `sub_size >= BLOCK_SIZES` all surface
+    /// §5.11.55 fresh-walker init: every `cdef_idx[]` cell starts at
+    /// `-1` (the "CDEF disabled" sentinel that matches the
+    /// `clear_cdef()` initialisation).
+    #[test]
+    fn cdef_idx_fresh_walker_all_minus_one() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        assert!(walker.cdef_idx().iter().all(|&v| v == -1));
+    }
+
+    /// §5.11.55: `clear_cdef( r, c )` with `use_128x128_superblock ==
+    /// false` stamps `-1` at exactly one anchor cell.
+    #[test]
+    fn clear_cdef_64x64_stamps_only_anchor() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        // Pre-stamp a non-sentinel so clear is observable.
+        walker.cdef_idx[5 * 32 + 7] = 4;
+        walker.clear_cdef(5, 7, false);
+        assert_eq!(walker.cdef_idx()[5 * 32 + 7], -1);
+    }
+
+    /// §5.11.55: `clear_cdef( r, c )` with `use_128x128_superblock ==
+    /// true` stamps `-1` at four 64×64 anchor cells (`cdefSize4 = 16`
+    /// stride).
+    #[test]
+    fn clear_cdef_128x128_stamps_four_anchors() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 64,
+            mi_col_start: 0,
+            mi_col_end: 64,
+        };
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        // Pre-stamp all four anchors so clear is observable.
+        let stamps: [(u32, u32); 4] = [(0, 0), (0, 16), (16, 0), (16, 16)];
+        for &(r, c) in &stamps {
+            walker.cdef_idx[(r * 64 + c) as usize] = 3;
+        }
+        walker.clear_cdef(0, 0, true);
+        for &(r, c) in &stamps {
+            assert_eq!(walker.cdef_idx()[(r * 64 + c) as usize], -1);
+        }
+        // No off-anchor cell touched.
+        assert_eq!(walker.cdef_idx()[1], -1);
+    }
+
+    /// §5.11.55: `clear_cdef( r, c )` silently skips out-of-grid
+    /// anchor cells (the bottom/right superblock can straddle the
+    /// frame edge).
+    #[test]
+    fn clear_cdef_skips_out_of_grid() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 24,
+            mi_col_start: 0,
+            mi_col_end: 24,
+        };
+        let mut walker = PartitionWalker::new(24, 24, geom).unwrap();
+        // Anchor at (16, 16) is in-grid; the (16, 32) / (32, 16) /
+        // (32, 32) anchors are out-of-grid (24 < 32) and must be
+        // silently skipped without panic.
+        walker.clear_cdef(16, 16, true);
+        assert_eq!(walker.cdef_idx()[16 * 24 + 16], -1);
+    }
+
+    /// §5.11.56 short-circuit: `skip != 0` ⇒ no symbol read, anchor
+    /// sentinel unchanged.
+    #[test]
+    fn decode_cdef_skip_short_circuit_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let v = walker
+            .decode_cdef(
+                &mut dec,
+                0,
+                0,
+                BLOCK_16X16,
+                /*skip=*/ 1,
+                /*coded_lossless=*/ false,
+                /*enable_cdef=*/ true,
+                /*allow_intrabc=*/ false,
+                /*cdef_bits=*/ 2,
+            )
+            .unwrap();
+        assert_eq!(v, -1, "anchor sentinel survives the short-circuit");
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.56 short-circuit: `CodedLossless == true` ⇒ no read.
+    #[test]
+    fn decode_cdef_coded_lossless_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let v = walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, true, true, false, 2)
+            .unwrap();
+        assert_eq!(v, -1);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.56 short-circuit: `!enable_cdef` ⇒ no read. This is the
+    /// common case for sequences that opted out of CDEF in the §5.5.1
+    /// sequence header.
+    #[test]
+    fn decode_cdef_disabled_in_seq_header_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let v = walker
+            .decode_cdef(
+                &mut dec,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                /*enable_cdef=*/ false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(v, -1);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.56 short-circuit: `allow_intrabc == true` ⇒ no read.
+    #[test]
+    fn decode_cdef_allow_intrabc_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let v = walker
+            .decode_cdef(
+                &mut dec,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                true,
+                /*allow_intrabc=*/ true,
+                2,
+            )
+            .unwrap();
+        assert_eq!(v, -1);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.56 first-leaf-in-anchor path with `cdef_bits = 2`:
+    /// `L(2)` reads two bits MSB-first. Bytes `0b11_000000…` ⇒
+    /// `cdef_idx = 0b11 = 3`. The anchor and the leaf's `w4 = h4 = 4`
+    /// footprint inside the anchor receives the stamp; advancing by
+    /// `cdefSize4 = 16` per row/col means only the anchor cell is
+    /// touched for a sub-64 block.
+    #[test]
+    fn decode_cdef_first_leaf_reads_literal_and_stamps_anchor() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0b1100_0000;
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 2)
+            .unwrap();
+        assert_eq!(v, 3, "two-bit MSB-first read yields 3");
+        // Anchor at (0, 0) stamped; off-anchor cells inside the same
+        // 64×64 cell are untouched (the spec only fills 64-aligned
+        // cells via the cdefSize4 stride).
+        assert_eq!(walker.cdef_idx()[0], 3);
+        assert_eq!(
+            walker.cdef_idx()[4],
+            -1,
+            "off-anchor cell inside the same 64×64 anchor stays at sentinel"
+        );
+    }
+
+    /// §5.11.56 second leaf in the same 64×64 anchor: `cdef_idx[ r
+    /// ][ c ] != -1` ⇒ no read, anchor value returned unchanged.
+    #[test]
+    fn decode_cdef_second_leaf_in_anchor_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0b1100_0000;
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // First leaf at (0, 0): consumes two bits, anchor ⇐ 3.
+        walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 2)
+            .unwrap();
+        let pos_after_first = dec.position();
+        // Second leaf at (0, 4): same 64×64 anchor at (0, 0). Must
+        // not read, must return the stamped value 3.
+        let v = walker
+            .decode_cdef(&mut dec, 0, 4, BLOCK_16X16, 0, false, true, false, 2)
+            .unwrap();
+        assert_eq!(v, 3, "subsequent leaf in same anchor returns stamped value");
+        assert_eq!(
+            dec.position(),
+            pos_after_first,
+            "second leaf consumes no extra bits"
+        );
+    }
+
+    /// §5.11.56 `cdef_bits == 0` edge case: `L(0)` reads zero bits
+    /// and returns 0; the anchor still transitions from `-1` to `0`.
+    /// This matches the spec's `1 << cdef_bits == 1` single-strength
+    /// case from §5.9.19.
+    #[test]
+    fn decode_cdef_cdef_bits_zero_stamps_zero_without_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let v = walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 0)
+            .unwrap();
+        assert_eq!(v, 0);
+        assert_eq!(dec.position(), pos_before, "L(0) consumes no bits");
+        assert_eq!(walker.cdef_idx()[0], 0);
+    }
+
+    /// §5.11.56 `cdef_bits == 3` upper bound: three literal bits can
+    /// encode values 0..=7. Bytes `0b1110_0000…` ⇒ `0b111 = 7`.
+    #[test]
+    fn decode_cdef_cdef_bits_three_reads_three_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0b1110_0000;
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 3)
+            .unwrap();
+        assert_eq!(v, 7);
+    }
+
+    /// §5.11.56 mask logic: a leaf at (MiRow = 10, MiCol = 13) inside
+    /// a 64×64 anchor (`cdefMask4 = ~15`, so `cdefMask4 & x` zeroes
+    /// the low 4 bits) anchors at (0, 0). The stamp lands at the
+    /// anchor cell, not at (10, 13).
+    #[test]
+    fn decode_cdef_anchor_mask_routes_to_64x64_origin() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0b1000_0000;
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_cdef(&mut dec, 10, 13, BLOCK_4X4, 0, false, true, false, 2)
+            .unwrap();
+        assert_eq!(v, 2);
+        assert_eq!(walker.cdef_idx()[0], 2, "anchor at (0, 0)");
+        assert_eq!(
+            walker.cdef_idx()[10 * 32 + 13],
+            -1,
+            "leaf coords are not the stamp coords"
+        );
+    }
+
+    /// §5.11.56 BLOCK_128X128 spans four 64×64 anchors: a single
+    /// 128×128 leaf at (0, 0) should stamp all four. `w4 = h4 = 32`,
+    /// stride `cdefSize4 = 16`, so the inner loop visits (0, 0),
+    /// (0, 16), (16, 0), (16, 16). The decoded literal value is
+    /// whatever the §8.2.5 `L(2)` returns against the test buffer;
+    /// the structural invariant is that all four anchor cells receive
+    /// the same stamp (the spec's grid-fill rule).
+    #[test]
+    fn decode_cdef_block_128x128_stamps_four_anchors() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0xA5u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_128X128, 0, false, true, false, 2)
+            .unwrap();
+        assert!((0..4).contains(&v), "L(2) ⇒ 0..=3, got {v}");
+        let anchors: [(u32, u32); 4] = [(0, 0), (0, 16), (16, 0), (16, 16)];
+        for &(r, c) in &anchors {
+            assert_eq!(
+                walker.cdef_idx()[(r * 32 + c) as usize],
+                v,
+                "anchor ({r}, {c}) stamped"
+            );
+        }
+        // Off-anchor cells inside any of the four 64×64 cells stay at
+        // the sentinel (no fill, the stride is 16).
+        assert_eq!(walker.cdef_idx()[4], -1);
+        assert_eq!(walker.cdef_idx()[4 * 32], -1);
+        assert_eq!(walker.cdef_idx()[16 * 32 + 20], -1);
+    }
+
+    /// §5.11.56 grid-fill clips at the frame's right/bottom edge: a
+    /// 64×64 anchor at (16, 16) in a 24×24 mi-grid leaves the
+    /// out-of-grid 32-aligned anchors untouched (no panic).
+    #[test]
+    fn decode_cdef_grid_fill_clips_frame_edge() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 24,
+            mi_col_start: 0,
+            mi_col_end: 24,
+        };
+        let mut walker = PartitionWalker::new(24, 24, geom).unwrap();
+        let bytes = [0xA5u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_cdef(&mut dec, 16, 16, BLOCK_128X128, 0, false, true, false, 2)
+            .unwrap();
+        assert!((0..4).contains(&v));
+        // The (16, 16) anchor is in-grid and stamped; the other three
+        // 128×128 anchors would be off-grid (32 >= 24) so they aren't
+        // touched (no panic on out-of-grid clip).
+        assert_eq!(walker.cdef_idx()[16 * 24 + 16], v);
+    }
+
+    /// §5.11.56 short-circuit when anchor already non-sentinel: even
+    /// with `skip=1`, the returned value is the anchor's current
+    /// stamp (a prior leaf's `decode_cdef` write), not `-1`. Verifies
+    /// the spec's "return value is the current `cdef_idx[r][c]`"
+    /// interpretation.
+    #[test]
+    fn decode_cdef_short_circuit_returns_prior_stamp() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0b1100_0000;
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // First leaf at (0, 0) stamps anchor ⇐ 3.
+        walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 2)
+            .unwrap();
+        // Second leaf at (0, 4) with `skip = 1` — short-circuit. The
+        // anchor at (0, 0) still holds 3.
+        let v = walker
+            .decode_cdef(&mut dec, 0, 4, BLOCK_16X16, 1, false, true, false, 2)
+            .unwrap();
+        assert_eq!(v, 3, "short-circuit returns anchor's existing stamp");
+    }
+
+    /// §5.11.55 `clear_cdef` after a stamp restores `-1` so a fresh
+    /// superblock at the same coordinates can re-read.
+    #[test]
+    fn clear_cdef_after_stamp_resets_anchor() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut bytes = [0u8; 8];
+        bytes[0] = 0b1100_0000;
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 2)
+            .unwrap();
+        assert_eq!(walker.cdef_idx()[0], 3);
+        walker.clear_cdef(0, 0, false);
+        assert_eq!(walker.cdef_idx()[0], -1);
+    }
+
+    /// §5.11.56 caller-bug guards: `mi_row` past frame extent,
+    /// `mi_col` past frame extent, `sub_size == BLOCK_SIZES`, and
+    /// `cdef_bits > 3` all ⇒ `Error::PartitionWalkOutOfRange`.
+    #[test]
+    fn decode_cdef_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        assert_eq!(
+            walker.decode_cdef(&mut dec, 8, 0, BLOCK_16X16, 0, false, true, false, 2),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_cdef(&mut dec, 0, 8, BLOCK_16X16, 0, false, true, false, 2),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_cdef(&mut dec, 0, 0, BLOCK_SIZES, 0, false, true, false, 2),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 4),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
     /// `Error::PartitionWalkOutOfRange`.
     #[test]
     fn decode_delta_lf_rejects_out_of_range() {
