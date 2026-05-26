@@ -664,6 +664,26 @@
 //!     indices `3..=9` (the `BLOCK_8X8`..`BLOCK_32X32` band) are
 //!     reachable. 288 -> 296 tests, zero `#[ignore]`.
 //!
+//!   * **Round 144.** The §9.4 default CDF table and the §8.3.1 /
+//!     §8.3.2 selection for the **wedge-index** syntax element —
+//!     `wedge_index`, read by both §5.11.28 `read_interintra_mode` (the
+//!     inter-intra wedge sub-branch, when `wedge_interintra == 1`) and
+//!     §5.11.29 `read_compound_type` (the inter-inter `COMPOUND_WEDGE`
+//!     branch). Transcribes [`DEFAULT_WEDGE_INDEX_CDF`]
+//!     (`[BLOCK_SIZES][WEDGE_TYPES + 1]`) verbatim from §9.4 (p.435).
+//!     New §3 constant [`WEDGE_TYPES`] (`= 16`, the spec text reads
+//!     *"Number of directions for the wedge mask process"*).
+//!     [`TileCdfContext`] grows the `wedge_index` field, seeded by
+//!     [`TileCdfContext::new_from_defaults`] per §8.3.1. The §8.3.2
+//!     selection `wedge_index_cdf(mi_size)` is a straight
+//!     `TileWedgeIndexCdf[ MiSize ]` index. The table's outer dimension
+//!     is transcribed full-width per the §9.4 listing; per its note
+//!     (p.436) indices 0..2, 10..17, and 20..21 are never used in the
+//!     first dimension (matching the §3 `Wedge_Bits[ MiSize ] == 0`
+//!     rows) and carry the placeholder uniform CDF `{ 2048, 4096, …,
+//!     30720, 32768, 0 }` (step `32768 / WEDGE_TYPES`). 296 -> 302
+//!     tests, zero `#[ignore]`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -724,7 +744,7 @@ pub use cdf::{
     DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF,
     DEFAULT_SKIP_MODE_CDF, DEFAULT_TXB_SKIP_CDF, DEFAULT_TXFM_SPLIT_CDF, DEFAULT_TX_16X16_CDF,
     DEFAULT_TX_32X32_CDF, DEFAULT_TX_64X64_CDF, DEFAULT_TX_8X8_CDF, DEFAULT_UNI_COMP_REF_CDF,
-    DEFAULT_UV_MODE_CFL_ALLOWED_CDF, DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF,
+    DEFAULT_UV_MODE_CFL_ALLOWED_CDF, DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF, DEFAULT_WEDGE_INDEX_CDF,
     DEFAULT_WEDGE_INTER_INTRA_CDF, DEFAULT_Y_MODE_CDF, DEFAULT_ZERO_MV_CDF, DIRECTIONAL_MODES,
     DRL_MODE_CONTEXTS, EOB_COEF_CONTEXTS, FILTER_INTRA_MODE_TO_INTRA_DIR, FLIPADST_ADST,
     FLIPADST_DCT, FLIPADST_FLIPADST, FWD_REFS, H_ADST, H_DCT, H_FLIPADST, IDTX, INTERINTRA_MODES,
@@ -746,7 +766,7 @@ pub use cdf::{
     TX_SIZE_SQR_UP, TX_TYPES, TX_TYPES_INTRA_SET1, TX_TYPES_INTRA_SET2, TX_TYPES_SET2,
     TX_TYPES_SET3, TX_TYPE_IN_SET_INTER, TX_TYPE_IN_SET_INTRA, TX_WIDTH, TX_WIDTH_LOG2,
     UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED, V_ADST, V_DCT,
-    V_FLIPADST, V_PRED, ZERO_MV_CONTEXTS,
+    V_FLIPADST, V_PRED, WEDGE_TYPES, ZERO_MV_CONTEXTS,
 };
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,

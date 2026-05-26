@@ -6,6 +6,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 144 — §9.4 wedge-index default-CDF.** Lands the §9.4
+  `Default_Wedge_Index_Cdf[ BLOCK_SIZES ][ WEDGE_TYPES + 1 ]` table —
+  the 16-symbol `wedge_index` element read by §5.11.28
+  `read_interintra_mode` (the inter-intra wedge sub-branch, when
+  `wedge_interintra == 1`) and §5.11.29 `read_compound_type` (the
+  inter-inter `COMPOUND_WEDGE` branch). Transcribed verbatim from the
+  §9.4 listing (p.435). Adds the §3 constant `WEDGE_TYPES = 16` (the
+  spec text reads *"Number of directions for the wedge mask process"*).
+  The `TileCdfContext` grows a `wedge_index` field seeded by
+  `new_from_defaults` per §8.3.1 ("`WedgeIndexCdf` is set to a copy of
+  `Default_Wedge_Index_Cdf`"). The §8.3.2 selection surfaces a
+  `wedge_index_cdf(mi_size) -> Option<&mut [u16]>` selector that
+  implements the straight `TileWedgeIndexCdf[ MiSize ]` indexing. The
+  table's outer dimension is transcribed full-width per the §9.4
+  listing; per its note (p.436) indices 0..2, 10..17, and 20..21 are
+  never used in the first dimension (matching the §3
+  `Wedge_Bits[ MiSize ] == 0` rows) and carry the placeholder uniform
+  CDF `{ 2048, 4096, …, 30720, 32768, 0 }` (step `32768 / WEDGE_TYPES`).
+  Tests grow by 6 (cdf module): `WEDGE_TYPES` constant pin; default
+  table values (cross-checked against the §3 `Wedge_Bits` table — every
+  `Wedge_Bits == 0` row must equal the placeholder uniform CDF, every
+  `Wedge_Bits > 0` row must not) and §8.2.6 well-formedness (every row
+  trails with `0` after `1 << 15 == 32768`, with strictly increasing
+  cumulative frequencies); `init_non_coeff_cdfs` working-copy seeding;
+  per-row selector return value with out-of-range rejection;
+  working-copy independence from the §9.4 source; end-to-end
+  `SymbolDecoder` read through a `wedge_index` row from the reachable
+  band (`BLOCK_16X16`, `Wedge_Bits[6] = 4`) confirming the 16-symbol
+  decode lands in `0..WEDGE_TYPES`. Tests: 296 -> 302, zero `#[ignore]`.
+
 * **Round 143 — §9.4 inter-intra default-CDF group.** Lands the three
   §9.4 default CDFs read by the §5.11.28 `read_interintra_mode`
   syntax — `Default_Inter_Intra_Cdf[ BLOCK_SIZE_GROUPS - 1 ][ 3 ]`

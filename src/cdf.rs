@@ -603,6 +603,19 @@ pub const V_PRED: usize = 1;
 /// CDFs.
 pub const INTERINTRA_MODES: usize = 4;
 
+/// `WEDGE_TYPES` (§3) — number of directions for the wedge mask process
+/// (the spec text reads: *"Number of directions for the wedge mask
+/// process"*). Drives the symbol axis of [`DEFAULT_WEDGE_INDEX_CDF`]
+/// (`WEDGE_TYPES + 1` cumulative frequencies + the §8.3 adaptation
+/// counter). `wedge_index` is read by the §5.11.28
+/// `read_interintra_mode` (the inter-intra wedge sub-branch, when
+/// `wedge_interintra == 1`) and by the §5.11.29 `read_compound_type`
+/// (the inter-inter `COMPOUND_WEDGE` branch, when
+/// `compound_type == COMPOUND_WEDGE`) syntax elements; the same default
+/// CDF is selected by both call sites per §8.3.2 (the cdf is
+/// `TileWedgeIndexCdf[ MiSize ]`).
+pub const WEDGE_TYPES: usize = 16;
+
 // ---------------------------------------------------------------------
 // Round 136 — coefficient-token entry constants (§3). These drive the
 // outer/inner dimensions of the `init_coeff_cdfs` entry sub-group:
@@ -6629,6 +6642,18 @@ pub struct TileCdfContext {
     /// `wedge_interintra` flag (§5.11.28 `read_interintra_mode`),
     /// selected by `MiSize` per the §8.3.2 selection.
     pub wedge_inter_intra: [[u16; 3]; BLOCK_SIZES],
+
+    // -----------------------------------------------------------------
+    // Round 144 — wedge-index CDF. §8.3.1 enumerates this as
+    // "`WedgeIndexCdf` is set to a copy of `Default_Wedge_Index_Cdf`".
+    // -----------------------------------------------------------------
+    /// `TileWedgeIndexCdf[ BLOCK_SIZES ]` (§8.3.1). Codes the
+    /// `wedge_index ∈ 0..WEDGE_TYPES` element read by §5.11.28
+    /// `read_interintra_mode` (the inter-intra wedge sub-branch, when
+    /// `wedge_interintra == 1`) and §5.11.29 `read_compound_type` (the
+    /// inter-inter `COMPOUND_WEDGE` branch). Selected by `MiSize` per
+    /// the §8.3.2 selection (`TileWedgeIndexCdf[ MiSize ]`).
+    pub wedge_index: [[u16; WEDGE_TYPES + 1]; BLOCK_SIZES],
 }
 
 impl TileCdfContext {
@@ -6779,6 +6804,9 @@ impl TileCdfContext {
             inter_intra: DEFAULT_INTER_INTRA_CDF,
             inter_intra_mode: DEFAULT_INTER_INTRA_MODE_CDF,
             wedge_inter_intra: DEFAULT_WEDGE_INTER_INTRA_CDF,
+
+            // Round 144 — wedge-index CDF.
+            wedge_index: DEFAULT_WEDGE_INDEX_CDF,
         }
     }
 
@@ -7605,6 +7633,25 @@ impl TileCdfContext {
     pub fn wedge_inter_intra_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
         if mi_size < BLOCK_SIZES {
             Some(&mut self.wedge_inter_intra[mi_size])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `wedge_index`: the cdf is `TileWedgeIndexCdf[ MiSize ]`,
+    /// a straight `0..BLOCK_SIZES` index. Returns `None` if
+    /// `mi_size >= BLOCK_SIZES` (a caller bug).
+    ///
+    /// Per the §9.4 `Default_Wedge_Index_Cdf` note ("Indices 0 to 2, 10
+    /// to 17, and 20 to 21 inclusive are never used in the first
+    /// dimension"), `wedge_index` is only ever coded for block sizes
+    /// where `Wedge_Bits[ MiSize ] > 0` (§3 table — indices 3..=9 plus
+    /// 18..=19); the other rows are placeholder uniform CDFs and are
+    /// surfaced to keep `MiSize`-indexing uniform with every other
+    /// `[ BLOCK_SIZES ]` table.
+    pub fn wedge_index_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
+        if mi_size < BLOCK_SIZES {
+            Some(&mut self.wedge_index[mi_size])
         } else {
             None
         }
@@ -9011,6 +9058,136 @@ pub fn interintra_ctx(mi_size: usize) -> Option<usize> {
         Some(g - 1)
     }
 }
+
+// ---------------------------------------------------------------------
+// Round 144 — wedge-index CDF (§9.4): `Default_Wedge_Index_Cdf`. The
+// table codes the `wedge_index ∈ 0..WEDGE_TYPES` element read by two
+// §5.11 syntax call sites:
+//   * §5.11.28 `read_interintra_mode` — the inter-intra wedge branch,
+//     reached when `wedge_interintra == 1`.
+//   * §5.11.29 `read_compound_type` — the inter-inter `COMPOUND_WEDGE`
+//     branch, reached when `compound_type == COMPOUND_WEDGE` (gated on
+//     `Wedge_Bits[ MiSize ] > 0`).
+// Both call sites read the same default CDF; the §8.3.2 selection text
+// is "wedge_index: The cdf is given by TileWedgeIndexCdf[ MiSize ]".
+//
+// Per the §9.4 note (p.436), only first-dimension indices 3..=9 (the
+// `BLOCK_8X8`..`BLOCK_32X32` band) and 18..=19 (`BLOCK_8X16` /
+// `BLOCK_16X8` 2:1 rectangles) are reachable — matching the rows where
+// the §3 `Wedge_Bits[ BLOCK_SIZES ]` table is non-zero. The remaining
+// rows hold a placeholder uniform CDF (step 2048 = 32768 / 16) and are
+// transcribed full-width to keep the indexing uniform with every other
+// `[ BLOCK_SIZES ]` table.
+// ---------------------------------------------------------------------
+
+/// `Default_Wedge_Index_Cdf[ BLOCK_SIZES ][ WEDGE_TYPES + 1 ]` (§9.4,
+/// p.435). Symbol `wedge_index` (§5.11.28 wedge sub-branch and §5.11.29
+/// `COMPOUND_WEDGE` branch; selects the direction and offset of the
+/// wedge mask used during blending). The §8.3.2 selection is a straight
+/// `TileWedgeIndexCdf[ MiSize ]` index. Per the §9.4 note only indices
+/// `3..=9` and `18..=19` (the rows where `Wedge_Bits[ MiSize ] > 0`) are
+/// ever used in the first dimension; the rows outside that set are the
+/// placeholder uniform CDF `{ 2048, 4096, …, 30720, 32768, 0 }` and are
+/// transcribed full-width to keep `MiSize`-indexing uniform with every
+/// other `[ BLOCK_SIZES ]` table. Each row carries `WEDGE_TYPES = 16`
+/// cumulative frequencies plus the §8.3 adaptation counter (starts at
+/// 0).
+pub const DEFAULT_WEDGE_INDEX_CDF: [[u16; WEDGE_TYPES + 1]; BLOCK_SIZES] = [
+    // Rows 0..=2 (BLOCK_4X4 / BLOCK_4X8 / BLOCK_8X4) — placeholder
+    // uniform, never reached (Wedge_Bits = 0).
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    // Rows 3..=9 (BLOCK_8X8..BLOCK_32X32) — reachable.
+    [
+        2438, 4440, 6599, 8663, 11005, 12874, 15751, 18094, 20359, 22362, 24127, 25702, 27752,
+        29450, 31171, 32768, 0,
+    ],
+    [
+        806, 3266, 6005, 6738, 7218, 7367, 7771, 14588, 16323, 17367, 18452, 19422, 22839, 26127,
+        29629, 32768, 0,
+    ],
+    [
+        2779, 3738, 4683, 7213, 7775, 8017, 8655, 14357, 17939, 21332, 24520, 27470, 29456, 30529,
+        31656, 32768, 0,
+    ],
+    [
+        1684, 3625, 5675, 7108, 9302, 11274, 14429, 17144, 19163, 20961, 22884, 24471, 26719,
+        28714, 30877, 32768, 0,
+    ],
+    [
+        1142, 3491, 6277, 7314, 8089, 8355, 9023, 13624, 15369, 16730, 18114, 19313, 22521, 26012,
+        29550, 32768, 0,
+    ],
+    [
+        2742, 4195, 5727, 8035, 8980, 9336, 10146, 14124, 17270, 20533, 23434, 25972, 27944, 29570,
+        31416, 32768, 0,
+    ],
+    [
+        1727, 3948, 6101, 7796, 9841, 12344, 15766, 18944, 20638, 22038, 23963, 25311, 26988,
+        28766, 31012, 32768, 0,
+    ],
+    // Rows 10..=17 — placeholder uniform.
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    // Rows 18..=19 (BLOCK_8X16 / BLOCK_16X8) — reachable.
+    [
+        154, 987, 1925, 2051, 2088, 2111, 2151, 23033, 23703, 24284, 24985, 25684, 27259, 28883,
+        30911, 32768, 0,
+    ],
+    [
+        1135, 1322, 1493, 2635, 2696, 2737, 2770, 21016, 22935, 25057, 27251, 29173, 30089, 30960,
+        31933, 32768, 0,
+    ],
+    // Rows 20..=21 — placeholder uniform.
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+    [
+        2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+        28672, 30720, 32768, 0,
+    ],
+];
 
 #[cfg(test)]
 mod tests {
@@ -13343,6 +13520,171 @@ mod tests {
 
         assert_ne!(
             tile_ctx.wedge_inter_intra, before,
+            "read_symbol must adapt the working CDF"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Round 144 — wedge-index CDF tests.
+    // -----------------------------------------------------------------
+
+    /// §3: `WEDGE_TYPES = 16`, matching the spec's *"Number of directions
+    /// for the wedge mask process"* row in the constants table.
+    #[test]
+    fn wedge_types_constant_matches_spec() {
+        assert_eq!(WEDGE_TYPES, 16);
+    }
+
+    /// `Default_Wedge_Index_Cdf` is pinned verbatim from §9.4 (p.435) and
+    /// satisfies the §8.2.6 well-formedness invariants every other §9.4
+    /// table satisfies: the trailing entry of each row is `0` (the §8.3
+    /// adaptation counter) and the next-to-last is `1 << 15 == 32768`.
+    /// Per the §9.4 note (p.436), indices 0..2, 10..17, and 20..21 in the
+    /// first dimension are never used and carry the placeholder uniform
+    /// CDF (step 2048 = 32768 / 16).
+    #[test]
+    fn wedge_index_default_table_pinned() {
+        // Shape pins straight off the §9.4 listing.
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF.len(), BLOCK_SIZES);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[0].len(), WEDGE_TYPES + 1);
+
+        // §8.2.6 well-formedness invariants on every row.
+        for row in &DEFAULT_WEDGE_INDEX_CDF {
+            assert_eq!(row[row.len() - 1], 0);
+            assert_eq!(row[row.len() - 2], 1 << 15);
+            // Cumulative frequencies strictly increase to 32768.
+            for w in row[..row.len() - 1].windows(2) {
+                assert!(w[0] < w[1], "cdf must be strictly increasing: {row:?}");
+            }
+        }
+
+        // §9.4 note: placeholder rows (uniform 16-symbol CDF, step 2048).
+        let placeholder: [u16; WEDGE_TYPES + 1] = [
+            2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+            28672, 30720, 32768, 0,
+        ];
+        // Indices where the §9.4 note says the row is never used.
+        let placeholder_ix: &[usize] = &[0, 1, 2, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21];
+        for &i in placeholder_ix {
+            assert_eq!(DEFAULT_WEDGE_INDEX_CDF[i], placeholder, "row {i}");
+        }
+
+        // Reachable band 3..=9 (BLOCK_8X8..BLOCK_32X32): spec-pinned
+        // leading-frequency anchors and last-frequency anchors.
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[3][0], 2438);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[3][14], 31171);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[4][0], 806);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[4][14], 29629);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[5][0], 2779);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[5][14], 31656);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[6][0], 1684);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[6][14], 30877);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[7][0], 1142);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[7][14], 29550);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[8][0], 2742);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[8][14], 31416);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[9][0], 1727);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[9][14], 31012);
+
+        // Reachable band 18..=19 (BLOCK_8X16 / BLOCK_16X8): pin both
+        // leading values and one mid-row value each (a transcription
+        // typo here would not be caught by either uniform-row or
+        // adjacency checks elsewhere).
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[18][0], 154);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[18][7], 23033);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[18][14], 30911);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[19][0], 1135);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[19][7], 21016);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[19][14], 31933);
+    }
+
+    /// §8.3.1 `init_non_coeff_cdfs`: the working-copy `wedge_index` field
+    /// is seeded verbatim from the §9.4 default.
+    #[test]
+    fn wedge_index_init_from_defaults() {
+        let ctx = TileCdfContext::new_from_defaults();
+        assert_eq!(ctx.wedge_index, DEFAULT_WEDGE_INDEX_CDF);
+    }
+
+    /// §8.3.2 `wedge_index_cdf` selector returns the right §9.4 row for
+    /// every valid `MiSize`, and rejects out-of-range indices with
+    /// `None`. Cross-checks the §3 `Wedge_Bits[ MiSize ] > 0` rule: the
+    /// placeholder rows match exactly the `Wedge_Bits == 0` positions in
+    /// the spec's table (indices 0..2, 10..17, 20..21).
+    #[test]
+    fn wedge_index_selector_returns_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        for (i, want) in DEFAULT_WEDGE_INDEX_CDF.iter().enumerate() {
+            let row = ctx.wedge_index_cdf(i).unwrap();
+            assert_eq!(row.len(), WEDGE_TYPES + 1);
+            assert_eq!(row, want);
+        }
+        assert!(ctx.wedge_index_cdf(BLOCK_SIZES).is_none());
+        assert!(ctx.wedge_index_cdf(BLOCK_SIZES + 7).is_none());
+
+        // §3 `Wedge_Bits[ BLOCK_SIZES ]` table — non-zero only for the
+        // reachable rows enumerated above.
+        let wedge_bits: [u8; BLOCK_SIZES] = [
+            0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0,
+        ];
+        let placeholder: [u16; WEDGE_TYPES + 1] = [
+            2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624,
+            28672, 30720, 32768, 0,
+        ];
+        for (i, &bits) in wedge_bits.iter().enumerate() {
+            if bits == 0 {
+                assert_eq!(
+                    DEFAULT_WEDGE_INDEX_CDF[i], placeholder,
+                    "row {i} (Wedge_Bits == 0) must be the placeholder uniform CDF"
+                );
+            } else {
+                assert_ne!(
+                    DEFAULT_WEDGE_INDEX_CDF[i], placeholder,
+                    "row {i} (Wedge_Bits > 0) must hold a non-placeholder CDF"
+                );
+            }
+        }
+    }
+
+    /// Working-copy independence: mutating the context via the selector
+    /// must not touch the §9.4 source table.
+    #[test]
+    fn wedge_index_working_copy_is_independent() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        ctx.wedge_index_cdf(3).unwrap()[0] = 12345;
+        ctx.wedge_index_cdf(18).unwrap()[1] = 23456;
+        assert_ne!(ctx.wedge_index[3][0], DEFAULT_WEDGE_INDEX_CDF[3][0]);
+        assert_ne!(ctx.wedge_index[18][1], DEFAULT_WEDGE_INDEX_CDF[18][1]);
+        // Spec source unchanged.
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[3][0], 2438);
+        assert_eq!(DEFAULT_WEDGE_INDEX_CDF[18][1], 987);
+    }
+
+    /// End-to-end: drive the §8.2 `SymbolDecoder` through a `wedge_index`
+    /// default CDF for a `BLOCK_16X16` (`MiSize = 6`, inside the §5.11.28
+    /// / §5.11.29 reachable band), confirming the row matches the §9.4
+    /// source, the 16-symbol decode lands in `0..WEDGE_TYPES`, and the
+    /// working copy adapts.
+    #[test]
+    fn decode_wedge_index_through_default_cdf() {
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let before = tile_ctx.wedge_index;
+
+        // MiSize = 6 (BLOCK_16X16): Wedge_Bits[6] = 4, so wedge_index is
+        // coded here per the §5.11.29 `COMPOUND_WEDGE` branch and the
+        // §5.11.28 wedge sub-branch.
+        let row = tile_ctx.wedge_index_cdf(6).unwrap();
+        assert_eq!(row, &DEFAULT_WEDGE_INDEX_CDF[6]);
+        let sym = dec.read_symbol(row).unwrap();
+        assert!(
+            (sym as usize) < WEDGE_TYPES,
+            "wedge_index must code a symbol in 0..WEDGE_TYPES"
+        );
+
+        assert_ne!(
+            tile_ctx.wedge_index, before,
             "read_symbol must adapt the working CDF"
         );
     }

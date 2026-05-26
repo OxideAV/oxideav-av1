@@ -1010,8 +1010,28 @@ shapes / well-formedness / `Size_Group - 1` mapping / per-row
 selector return value / working-copy independence, plus end-to-end
 `SymbolDecoder` reads through `interintra`, `interintra_mode`, and
 `wedge_interintra` rows.
-The remaining §9.4 tables (the `Default_Wedge_Index_Cdf` family) and
-the other §8.3.2 selections (`split_or_horz` / `split_or_vert`,
+Round 144 lands the **wedge-index CDF** — the §9.4
+`Default_Wedge_Index_Cdf[ BLOCK_SIZES ][ WEDGE_TYPES + 1 ]` table
+(p.435) and the matching §8.3.2 selection. `wedge_index` is the
+16-symbol element read by both §5.11.28 `read_interintra_mode` (the
+inter-intra wedge sub-branch, when `wedge_interintra == 1`) and
+§5.11.29 `read_compound_type` (the inter-inter `COMPOUND_WEDGE`
+branch). Adds the §3 constant `WEDGE_TYPES = 16` (the spec text reads
+*"Number of directions for the wedge mask process"*). `TileCdfContext`
+grows a `wedge_index` field and gains a
+`wedge_index_cdf(mi_size) -> Option<&mut [u16]>` selector (straight
+`TileWedgeIndexCdf[ MiSize ]` indexing). The table's outer dimension is
+transcribed full-width per the §9.4 listing; per its note (p.436)
+indices `0..2`, `10..17`, and `20..21` are never used in the first
+dimension (matching the §3 `Wedge_Bits[ MiSize ] == 0` rows) and carry
+the placeholder uniform CDF `{ 2048, 4096, …, 30720, 32768, 0 }` (step
+`32768 / WEDGE_TYPES`). 6 new unit tests (296 -> 302) pin the §3
+constant / table shape and values (cross-checked against the §3
+`Wedge_Bits` table) / well-formedness / `init_non_coeff_cdfs` seeding /
+selector return value with out-of-range rejection / working-copy
+independence, plus an end-to-end `SymbolDecoder` read through a
+`wedge_index` row from the reachable band.
+The other §8.3.2 selections (`split_or_horz` / `split_or_vert`,
 `get_above_palette_color_context` /
 `get_left_palette_color_context` derivations …) are a mechanical
 followup against the same `TileCdfContext` shape. `decode_av1` and
