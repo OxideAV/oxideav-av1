@@ -6,6 +6,43 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 150 — §9.3 `Partition_Subsize` table + §3 `BLOCK_*`
+  enum staging.** Lands [`PARTITION_SUBSIZE`] (`[10][BLOCK_SIZES]`,
+  av1-spec p.402–403) plus the typed accessor
+  [`partition_subsize(partition, b_size) -> Option<usize>`] that
+  folds the [`BLOCK_INVALID`] (`22`) sentinel into `None`.
+  Transcription is byte-for-byte against av1-spec p.402–403; the
+  spec note at p.401 ("The table will never get accessed for
+  rectangular block sizes") is reflected by `BLOCK_INVALID` filling
+  every rectangular `bSize` column across all 10 partition rows.
+  Alongside the table, 19 named `BLOCK_*` constants land (the
+  remaining members of the §3 enumeration at av1-spec p.171–172
+  beyond the existing `BLOCK_8X8` (r149) and `BLOCK_128X128`
+  (r112)) and the [`BLOCK_INVALID`] sentinel from the §3 constant
+  table (p.7) so the table can read as the spec spells it, with no
+  bare numeric literals. The [`PARTITION_TYPES_TOTAL`] constant
+  (`10`) is added for the table's first dimension. Unblocks the
+  §5.11.4 `decode_partition()` body (av1-spec p.61–62), which
+  reads both `subSize = Partition_Subsize[ partition ][ bSize ]`
+  and `splitSize = Partition_Subsize[ PARTITION_SPLIT ][ bSize ]`
+  side by side; the typed accessor's `None` return means the
+  recursive descent never silently propagates a sentinel. Tests
+  grow by 16 (cdf module): BLOCK_* ordinal pinning (`BLOCK_4X4 =
+  0` through `BLOCK_INVALID = 22`); `PARTITION_TYPES_TOTAL` pin;
+  table-shape pin; row 0 (PARTITION_NONE) identity on every
+  square; row 1 (HORZ) height-halving; row 2 (VERT) width-halving;
+  row 3 (SPLIT) both-dimensions halving; rows 4/5 (HORZ_A/B) row
+  equality with row 1; rows 6/7 (VERT_A/B) row equality with row
+  2; rows 8/9 (HORZ_4/VERT_4) quarter-splits + BLOCK_128X128 drop;
+  `BLOCK_4X4` only-resolves-for-`PARTITION_NONE` invariant;
+  exhaustive rectangular-`bSize`-is-invalid coverage; every
+  resolved subSize in `0..BLOCK_SIZES`; out-of-range guard
+  (`partition >= 10`, `b_size >= BLOCK_SIZES`); §5.11.4
+  subdivision-shrinks-area invariant (halving / quartering
+  partitions strictly shrink the child area); §5.11.4 subSize +
+  splitSize pair well-formedness for every reachable HORZ_A /
+  HORZ_B parent block. 359 -> 375 tests, zero `#[ignore]`.
+
 * **Round 149 — §5.11.49 caller-side argument derivation.** Lands the
   `palette_tokens_args(mi_size, mi_row, mi_col, mi_rows, mi_cols,
   plane, subsampling_x, subsampling_y) -> Option<PaletteTokensArgs>`

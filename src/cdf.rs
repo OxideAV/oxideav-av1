@@ -10001,6 +10001,406 @@ pub const DEFAULT_WEDGE_INDEX_CDF: [[u16; WEDGE_TYPES + 1]; BLOCK_SIZES] = [
     ],
 ];
 
+// ---------------------------------------------------------------------
+// Round 150 — §9.3 `Partition_Subsize` table + §3 BLOCK_* enum staging
+// (av1-spec p.402-403). Stages the `[10][BLOCK_SIZES]` lookup that the
+// §5.11.4 `decode_partition()` body (av1-spec p.61-62) consumes:
+//
+//     subSize   = Partition_Subsize[ partition       ][ bSize ]
+//     splitSize = Partition_Subsize[ PARTITION_SPLIT ][ bSize ]
+//
+// followed by per-partition `decode_block` / `decode_partition` calls
+// against the resolved subSize / splitSize. The spec note at p.401 —
+// "The table will never get accessed for rectangular block sizes" —
+// is reflected by every rectangular bSize column carrying BLOCK_INVALID
+// across the entire table; the [`partition_subsize`] helper surfaces
+// that as `None` so a future `decode_partition` body never silently
+// hands a sentinel to the next level of recursion.
+//
+// The §3 enumeration (av1-spec p.171-172, the `Name of subSize` table)
+// is staged alongside as named [`BLOCK_*`] / [`BLOCK_INVALID`] constants
+// so the [`PARTITION_SUBSIZE`] entries read as the spec spells them.
+// Pre-existing [`BLOCK_8X8`] (idx 3, r149) and [`BLOCK_128X128`]
+// (idx 15, r112) are kept verbatim; r150 adds the remaining 19 names so
+// the full table can be transcribed without bare numeric literals.
+// ---------------------------------------------------------------------
+
+/// `BLOCK_4X4` (§3 enumeration, av1-spec p.171) — block-size ordinal `0`.
+pub const BLOCK_4X4: usize = 0;
+/// `BLOCK_4X8` (§3 enumeration, av1-spec p.171) — block-size ordinal `1`.
+pub const BLOCK_4X8: usize = 1;
+/// `BLOCK_8X4` (§3 enumeration, av1-spec p.171) — block-size ordinal `2`.
+pub const BLOCK_8X4: usize = 2;
+/// `BLOCK_8X16` (§3 enumeration, av1-spec p.171) — block-size ordinal `4`.
+pub const BLOCK_8X16: usize = 4;
+/// `BLOCK_16X8` (§3 enumeration, av1-spec p.171) — block-size ordinal `5`.
+pub const BLOCK_16X8: usize = 5;
+/// `BLOCK_16X16` (§3 enumeration, av1-spec p.171) — block-size ordinal `6`.
+pub const BLOCK_16X16: usize = 6;
+/// `BLOCK_16X32` (§3 enumeration, av1-spec p.171) — block-size ordinal `7`.
+pub const BLOCK_16X32: usize = 7;
+/// `BLOCK_32X16` (§3 enumeration, av1-spec p.171) — block-size ordinal `8`.
+pub const BLOCK_32X16: usize = 8;
+/// `BLOCK_32X32` (§3 enumeration, av1-spec p.171) — block-size ordinal `9`.
+pub const BLOCK_32X32: usize = 9;
+/// `BLOCK_32X64` (§3 enumeration, av1-spec p.172) — block-size ordinal `10`.
+pub const BLOCK_32X64: usize = 10;
+/// `BLOCK_64X32` (§3 enumeration, av1-spec p.172) — block-size ordinal `11`.
+pub const BLOCK_64X32: usize = 11;
+/// `BLOCK_64X64` (§3 enumeration, av1-spec p.172) — block-size ordinal `12`.
+pub const BLOCK_64X64: usize = 12;
+/// `BLOCK_64X128` (§3 enumeration, av1-spec p.172) — block-size ordinal `13`.
+pub const BLOCK_64X128: usize = 13;
+/// `BLOCK_128X64` (§3 enumeration, av1-spec p.172) — block-size ordinal `14`.
+pub const BLOCK_128X64: usize = 14;
+/// `BLOCK_4X16` (§3 enumeration, av1-spec p.172) — block-size ordinal `16`.
+pub const BLOCK_4X16: usize = 16;
+/// `BLOCK_16X4` (§3 enumeration, av1-spec p.172) — block-size ordinal `17`.
+pub const BLOCK_16X4: usize = 17;
+/// `BLOCK_8X32` (§3 enumeration, av1-spec p.172) — block-size ordinal `18`.
+pub const BLOCK_8X32: usize = 18;
+/// `BLOCK_32X8` (§3 enumeration, av1-spec p.172) — block-size ordinal `19`.
+pub const BLOCK_32X8: usize = 19;
+/// `BLOCK_16X64` (§3 enumeration, av1-spec p.172) — block-size ordinal `20`.
+pub const BLOCK_16X64: usize = 20;
+/// `BLOCK_64X16` (§3 enumeration, av1-spec p.172) — block-size ordinal `21`.
+pub const BLOCK_64X16: usize = 21;
+
+/// `BLOCK_INVALID` (§3 constant table, av1-spec p.7) — sentinel value
+/// (`22`, one past the last `BLOCK_SIZES` entry) marking partition
+/// choices that are not allowed. Every rectangular-`bSize` column of
+/// [`PARTITION_SUBSIZE`] holds this sentinel, as does every entry of a
+/// non-`PARTITION_NONE` row whose split would produce an invalid
+/// child block. The [`partition_subsize`] helper translates the
+/// sentinel into `Option::None` so callers never see the raw `22`.
+pub const BLOCK_INVALID: usize = 22;
+
+/// `PARTITION_TYPES_TOTAL` — the first dimension of
+/// [`PARTITION_SUBSIZE`] (`10`); covers every named `PARTITION_*`
+/// ordinal `0..=9` (§6.10.4 enumeration: `PARTITION_NONE`,
+/// `PARTITION_HORZ`, `PARTITION_VERT`, `PARTITION_SPLIT`,
+/// `PARTITION_HORZ_A`, `PARTITION_HORZ_B`, `PARTITION_VERT_A`,
+/// `PARTITION_VERT_B`, `PARTITION_HORZ_4`, `PARTITION_VERT_4`).
+pub const PARTITION_TYPES_TOTAL: usize = 10;
+
+/// `Partition_Subsize[ 10 ][ BLOCK_SIZES ]` (§9.3 additional tables,
+/// av1-spec p.402-403) — for a partition type `p` and a (square)
+/// `bSize`, returns the size of the sub-blocks produced by the
+/// split. If the split produces blocks of different sizes the table
+/// holds the largest sub-block size; the splitting code in §5.11.4
+/// reads both `Partition_Subsize[ partition ][ bSize ]` (the main
+/// sub-block size) and `Partition_Subsize[ PARTITION_SPLIT ][ bSize ]`
+/// (the secondary sub-block size used by the `_A` / `_B` cases).
+///
+/// The first dimension is the [`PARTITION_TYPES_TOTAL`] partition
+/// ordinal; the second dimension is the `BLOCK_SIZES` (`22`) `bSize`
+/// ordinal. Rectangular `bSize` columns are filled with
+/// [`BLOCK_INVALID`] per the spec note "The table will never get
+/// accessed for rectangular block sizes" — accessing such a column
+/// in a conformant decode path is impossible, but the table is
+/// transcribed full-width to match the spec.
+pub const PARTITION_SUBSIZE: [[usize; BLOCK_SIZES]; PARTITION_TYPES_TOTAL] = [
+    // PARTITION_NONE (0): the block is left intact; subSize == bSize
+    // for every square bSize.
+    [
+        BLOCK_4X4,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_128X128,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_HORZ (1): top+bottom split — square bSize halves
+    // vertically (e.g. BLOCK_16X16 -> BLOCK_16X8). BLOCK_4X4 is
+    // BLOCK_INVALID because it cannot be split further.
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X4,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_128X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_VERT (2): left+right split — square bSize halves
+    // horizontally (e.g. BLOCK_16X16 -> BLOCK_8X16).
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_4X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X128,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_SPLIT (3): quarter-split — square bSize halves on
+    // both axes (e.g. BLOCK_16X16 -> BLOCK_8X8).
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_4X4,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_HORZ_A (4): top is split horizontally, bottom is one
+    // block — the spec records the larger (bottom) sub-block size,
+    // which is BLOCK_HORZ's subSize (top-bottom half). splitSize
+    // (read from row 3) carries the smaller HORZ_A children.
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X4,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_128X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_HORZ_B (5): same subSize as PARTITION_HORZ_A; the
+    // §5.11.4 walk distinguishes which child gets the splitSize by
+    // ordering decode_block calls.
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X4,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_128X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_VERT_A (6): left is split vertically, right is one
+    // block — subSize is BLOCK_VERT's subSize.
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_4X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X128,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_VERT_B (7): mirror of PARTITION_VERT_A.
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_4X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X128,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_HORZ_4 (8): four horizontal stripes; subSize is the
+    // quarter-height extended block (e.g. BLOCK_16X16 -> BLOCK_16X4).
+    // First three columns and the larger BLOCK_64X64 column onward
+    // are BLOCK_INVALID because the quarter would fall under the
+    // §5.x minimum or above the largest extended rectangle.
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X4,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_32X8,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_64X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+    // PARTITION_VERT_4 (9): four vertical stripes — quarter-width
+    // extended block (e.g. BLOCK_16X16 -> BLOCK_4X16).
+    [
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_4X16,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_8X32,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_16X64,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+        BLOCK_INVALID,
+    ],
+];
+
+/// `Partition_Subsize[ partition ][ b_size ]` (§9.3, av1-spec p.402)
+/// — typed accessor returning the resolved sub-block size or `None`
+/// when the table holds [`BLOCK_INVALID`].
+///
+/// The `None` branch covers three §5.11.4 / §6.10.4 cases:
+///
+/// 1. `b_size` is rectangular. The spec note at p.401 — "The table
+///    will never get accessed for rectangular block sizes" — means a
+///    conformant decoder never reaches this case; surfacing `None`
+///    catches caller bugs instead of silently propagating `22`.
+/// 2. `b_size == BLOCK_4X4` and the partition is anything other than
+///    [`PARTITION_NONE`]. A 4×4 block has no further split.
+/// 3. The partition cannot apply to `b_size` (e.g. `PARTITION_HORZ_4`
+///    on `BLOCK_128X128` — there is no `BLOCK_128X1` extended block).
+///
+/// Out-of-range `partition` (>= [`PARTITION_TYPES_TOTAL`]) or `b_size`
+/// (>= [`BLOCK_SIZES`]) also returns `None`; the §5.11.4 walk feeds
+/// in-range values by construction so a `Some(_)` return is the
+/// expected path.
+#[inline]
+#[must_use]
+pub const fn partition_subsize(partition: usize, b_size: usize) -> Option<usize> {
+    if partition >= PARTITION_TYPES_TOTAL || b_size >= BLOCK_SIZES {
+        return None;
+    }
+    let v = PARTITION_SUBSIZE[partition][b_size];
+    if v == BLOCK_INVALID {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16014,6 +16414,373 @@ mod tests {
         // InvalidPaletteWalkArgs on this input.
         if let Err(e) = r {
             assert!(matches!(e, crate::Error::UnexpectedEnd));
+        }
+    }
+
+    // ---- Round 150 — Partition_Subsize table tests ---------------
+
+    /// §3 enumeration pin: every staged `BLOCK_*` constant matches
+    /// its av1-spec p.171-172 ordinal exactly. Catches a typo in any
+    /// of the 19 new constants r150 added alongside the table.
+    #[test]
+    fn block_size_constants_match_spec_ordinals() {
+        assert_eq!(BLOCK_4X4, 0);
+        assert_eq!(BLOCK_4X8, 1);
+        assert_eq!(BLOCK_8X4, 2);
+        assert_eq!(BLOCK_8X8, 3);
+        assert_eq!(BLOCK_8X16, 4);
+        assert_eq!(BLOCK_16X8, 5);
+        assert_eq!(BLOCK_16X16, 6);
+        assert_eq!(BLOCK_16X32, 7);
+        assert_eq!(BLOCK_32X16, 8);
+        assert_eq!(BLOCK_32X32, 9);
+        assert_eq!(BLOCK_32X64, 10);
+        assert_eq!(BLOCK_64X32, 11);
+        assert_eq!(BLOCK_64X64, 12);
+        assert_eq!(BLOCK_64X128, 13);
+        assert_eq!(BLOCK_128X64, 14);
+        assert_eq!(BLOCK_128X128, 15);
+        assert_eq!(BLOCK_4X16, 16);
+        assert_eq!(BLOCK_16X4, 17);
+        assert_eq!(BLOCK_8X32, 18);
+        assert_eq!(BLOCK_32X8, 19);
+        assert_eq!(BLOCK_16X64, 20);
+        assert_eq!(BLOCK_64X16, 21);
+        assert_eq!(BLOCK_INVALID, 22);
+        // BLOCK_INVALID sits one past the last valid BLOCK_SIZES
+        // ordinal, matching the §3 constant-table note (p.7).
+        assert_eq!(BLOCK_INVALID, BLOCK_SIZES);
+    }
+
+    /// `PARTITION_TYPES_TOTAL` equals `PARTITION_VERT_4 + 1` (the
+    /// highest §6.10.4 partition ordinal). Catches a future addition
+    /// to the partition enumeration that forgets to lift the table's
+    /// first dimension.
+    #[test]
+    fn partition_types_total_matches_highest_partition() {
+        assert_eq!(PARTITION_TYPES_TOTAL, PARTITION_VERT_4 + 1);
+        assert_eq!(PARTITION_TYPES_TOTAL, 10);
+    }
+
+    /// Table shape: `[10][BLOCK_SIZES]`. Pins the literal dimensions
+    /// against the spec p.402 declaration
+    /// `Partition_Subsize[ 10 ][ BLOCK_SIZES ]`.
+    #[test]
+    fn partition_subsize_table_shape() {
+        assert_eq!(PARTITION_SUBSIZE.len(), 10);
+        for (i, row) in PARTITION_SUBSIZE.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                BLOCK_SIZES,
+                "PARTITION_SUBSIZE row {i} has wrong length",
+            );
+        }
+    }
+
+    /// `PARTITION_NONE` is the identity on every square `bSize`: the
+    /// block is left intact. Pins the row-0 diagonal entries spec
+    /// p.402.
+    #[test]
+    fn partition_none_is_identity_on_squares() {
+        for &b in &[
+            BLOCK_4X4,
+            BLOCK_8X8,
+            BLOCK_16X16,
+            BLOCK_32X32,
+            BLOCK_64X64,
+            BLOCK_128X128,
+        ] {
+            assert_eq!(partition_subsize(PARTITION_NONE, b), Some(b));
+        }
+    }
+
+    /// `PARTITION_HORZ` halves a square `bSize` vertically; pins
+    /// every reachable entry on row 1 of spec p.402.
+    #[test]
+    fn partition_horz_halves_height_for_squares() {
+        let pairs = [
+            (BLOCK_8X8, BLOCK_8X4),
+            (BLOCK_16X16, BLOCK_16X8),
+            (BLOCK_32X32, BLOCK_32X16),
+            (BLOCK_64X64, BLOCK_64X32),
+            (BLOCK_128X128, BLOCK_128X64),
+        ];
+        for (b, expect) in pairs {
+            assert_eq!(partition_subsize(PARTITION_HORZ, b), Some(expect));
+        }
+        // BLOCK_4X4 cannot split — the row-1 entry is BLOCK_INVALID.
+        assert_eq!(partition_subsize(PARTITION_HORZ, BLOCK_4X4), None);
+    }
+
+    /// `PARTITION_VERT` halves a square `bSize` horizontally;
+    /// mirror of the HORZ test against row 2 of spec p.402.
+    #[test]
+    fn partition_vert_halves_width_for_squares() {
+        let pairs = [
+            (BLOCK_8X8, BLOCK_4X8),
+            (BLOCK_16X16, BLOCK_8X16),
+            (BLOCK_32X32, BLOCK_16X32),
+            (BLOCK_64X64, BLOCK_32X64),
+            (BLOCK_128X128, BLOCK_64X128),
+        ];
+        for (b, expect) in pairs {
+            assert_eq!(partition_subsize(PARTITION_VERT, b), Some(expect));
+        }
+        assert_eq!(partition_subsize(PARTITION_VERT, BLOCK_4X4), None);
+    }
+
+    /// `PARTITION_SPLIT` halves both dimensions, yielding a smaller
+    /// square block (row 3 of spec p.402). The §5.11.4 walk reads
+    /// this row both as `subSize` (for the `_SPLIT` partition) and
+    /// as `splitSize` (for the `_HORZ_A` / `_HORZ_B` / `_VERT_A` /
+    /// `_VERT_B` partitions).
+    #[test]
+    fn partition_split_halves_both_dimensions() {
+        let pairs = [
+            (BLOCK_8X8, BLOCK_4X4),
+            (BLOCK_16X16, BLOCK_8X8),
+            (BLOCK_32X32, BLOCK_16X16),
+            (BLOCK_64X64, BLOCK_32X32),
+            (BLOCK_128X128, BLOCK_64X64),
+        ];
+        for (b, expect) in pairs {
+            assert_eq!(partition_subsize(PARTITION_SPLIT, b), Some(expect));
+        }
+        assert_eq!(partition_subsize(PARTITION_SPLIT, BLOCK_4X4), None);
+    }
+
+    /// `PARTITION_HORZ_A` and `PARTITION_HORZ_B` share the row-1
+    /// (HORZ) subSize values: the §5.11.4 walk distinguishes
+    /// `_A` from `_B` by the order it issues `decode_block` calls
+    /// (top is the small split for `_A`, bottom for `_B`). Pinning
+    /// the row equality enforces the av1-spec p.402-403 invariant
+    /// the rest of the decode path will rely on.
+    #[test]
+    fn partition_horz_a_and_b_share_horz_subsize() {
+        let horz = &PARTITION_SUBSIZE[PARTITION_HORZ];
+        let horz_a = &PARTITION_SUBSIZE[PARTITION_HORZ_A];
+        let horz_b = &PARTITION_SUBSIZE[PARTITION_HORZ_B];
+        for (b, ((&a, &h), &bb)) in horz_a
+            .iter()
+            .zip(horz.iter())
+            .zip(horz_b.iter())
+            .enumerate()
+        {
+            assert_eq!(a, h, "row HORZ_A/HORZ differ at bSize {b}");
+            assert_eq!(bb, h, "row HORZ_B/HORZ differ at bSize {b}");
+        }
+    }
+
+    /// Symmetric to `partition_horz_a_and_b_share_horz_subsize`:
+    /// row 2 (VERT) equals rows 6 (VERT_A) and 7 (VERT_B).
+    #[test]
+    fn partition_vert_a_and_b_share_vert_subsize() {
+        let vert = &PARTITION_SUBSIZE[PARTITION_VERT];
+        let vert_a = &PARTITION_SUBSIZE[PARTITION_VERT_A];
+        let vert_b = &PARTITION_SUBSIZE[PARTITION_VERT_B];
+        for (b, ((&a, &v), &bb)) in vert_a
+            .iter()
+            .zip(vert.iter())
+            .zip(vert_b.iter())
+            .enumerate()
+        {
+            assert_eq!(a, v, "row VERT_A/VERT differ at bSize {b}");
+            assert_eq!(bb, v, "row VERT_B/VERT differ at bSize {b}");
+        }
+    }
+
+    /// `PARTITION_HORZ_4` and `PARTITION_VERT_4` only resolve for the
+    /// middle square sizes (BLOCK_16X16 / 32X32 / 64X64). Pin the
+    /// quarter-split entries and confirm the BLOCK_128X128 column is
+    /// `BLOCK_INVALID` for both (the partition_w128 cdf has no `_4`
+    /// slot — round-145 `split_or_horz` derivation already drops
+    /// the `_4` term at BLOCK_128X128, so a `None` at this lookup
+    /// matches that gate).
+    #[test]
+    fn partition_horz4_and_vert4_quarter_splits() {
+        let horz4 = [
+            (BLOCK_16X16, BLOCK_16X4),
+            (BLOCK_32X32, BLOCK_32X8),
+            (BLOCK_64X64, BLOCK_64X16),
+        ];
+        for (b, expect) in horz4 {
+            assert_eq!(partition_subsize(PARTITION_HORZ_4, b), Some(expect));
+        }
+        let vert4 = [
+            (BLOCK_16X16, BLOCK_4X16),
+            (BLOCK_32X32, BLOCK_8X32),
+            (BLOCK_64X64, BLOCK_16X64),
+        ];
+        for (b, expect) in vert4 {
+            assert_eq!(partition_subsize(PARTITION_VERT_4, b), Some(expect));
+        }
+        // Quarter-splits drop at BLOCK_128X128 (no BLOCK_128X1 or
+        // BLOCK_1X128 extended block exists).
+        assert_eq!(partition_subsize(PARTITION_HORZ_4, BLOCK_128X128), None);
+        assert_eq!(partition_subsize(PARTITION_VERT_4, BLOCK_128X128), None);
+        // And at the smallest square BLOCK_8X8 (no extended 8x2).
+        assert_eq!(partition_subsize(PARTITION_HORZ_4, BLOCK_8X8), None);
+        assert_eq!(partition_subsize(PARTITION_VERT_4, BLOCK_8X8), None);
+    }
+
+    /// `BLOCK_4X4` is splittable only by `PARTITION_NONE`. Every
+    /// other partition ordinal must return `None`. Pins the
+    /// av1-spec p.402 column-0 BLOCK_INVALID-except-row-0 layout.
+    #[test]
+    fn block_4x4_only_partition_none_resolves() {
+        assert_eq!(
+            partition_subsize(PARTITION_NONE, BLOCK_4X4),
+            Some(BLOCK_4X4)
+        );
+        for p in 1..PARTITION_TYPES_TOTAL {
+            assert_eq!(
+                partition_subsize(p, BLOCK_4X4),
+                None,
+                "partition {p} should not resolve for BLOCK_4X4",
+            );
+        }
+    }
+
+    /// Rectangular `bSize` columns are entirely `BLOCK_INVALID`
+    /// across every partition row. Pins the av1-spec p.401 note
+    /// "The table will never get accessed for rectangular block
+    /// sizes": [`partition_subsize`] must return `None` for every
+    /// rectangular `bSize` regardless of `partition`.
+    #[test]
+    fn rectangular_bsize_columns_are_invalid() {
+        let rectangular = [
+            BLOCK_4X8,
+            BLOCK_8X4,
+            BLOCK_8X16,
+            BLOCK_16X8,
+            BLOCK_16X32,
+            BLOCK_32X16,
+            BLOCK_32X64,
+            BLOCK_64X32,
+            BLOCK_64X128,
+            BLOCK_128X64,
+            BLOCK_4X16,
+            BLOCK_16X4,
+            BLOCK_8X32,
+            BLOCK_32X8,
+            BLOCK_16X64,
+            BLOCK_64X16,
+        ];
+        for &b in &rectangular {
+            for p in 0..PARTITION_TYPES_TOTAL {
+                assert_eq!(
+                    partition_subsize(p, b),
+                    None,
+                    "partition {p} on rectangular bSize {b} should be invalid",
+                );
+            }
+        }
+    }
+
+    /// Whenever [`partition_subsize`] returns `Some(child)`, the
+    /// child must be a valid `BLOCK_SIZES` ordinal (`< 22`) — never
+    /// the sentinel and never out of range. Exhaustive check across
+    /// every `(partition, b_size)` pair.
+    #[test]
+    fn every_resolved_subsize_is_in_range() {
+        for p in 0..PARTITION_TYPES_TOTAL {
+            for b in 0..BLOCK_SIZES {
+                if let Some(child) = partition_subsize(p, b) {
+                    assert!(
+                        child < BLOCK_SIZES,
+                        "partition {p} bSize {b} resolved to out-of-range {child}",
+                    );
+                    assert_ne!(
+                        child, BLOCK_INVALID,
+                        "partition {p} bSize {b} resolved to BLOCK_INVALID",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Out-of-range `partition` or `b_size` returns `None` (the
+    /// caller-bug guard), not a panic. Catches a future regression
+    /// that swaps the guard with a `[]` index on an attacker-shaped
+    /// (partition, b_size) tuple from the bitstream.
+    #[test]
+    fn out_of_range_indices_return_none() {
+        assert_eq!(partition_subsize(PARTITION_TYPES_TOTAL, BLOCK_8X8), None);
+        assert_eq!(partition_subsize(99, BLOCK_8X8), None);
+        assert_eq!(partition_subsize(PARTITION_NONE, BLOCK_SIZES), None);
+        assert_eq!(partition_subsize(PARTITION_NONE, BLOCK_INVALID), None);
+        assert_eq!(partition_subsize(PARTITION_NONE, 99), None);
+        // Both out-of-range together — still None.
+        assert_eq!(partition_subsize(99, 99), None);
+    }
+
+    /// §5.11.4 invariant: the resolved sub-block area is at most
+    /// half the parent block's area for splitting partitions
+    /// (HORZ / VERT / HORZ_A / HORZ_B / VERT_A / VERT_B) and at
+    /// most a quarter for SPLIT / HORZ_4 / VERT_4. Encodes the
+    /// "subdivision shrinks the block" invariant the decode walk
+    /// relies on to terminate.
+    #[test]
+    fn subdivision_strictly_shrinks_block_area() {
+        let halving = [
+            PARTITION_HORZ,
+            PARTITION_VERT,
+            PARTITION_HORZ_A,
+            PARTITION_HORZ_B,
+            PARTITION_VERT_A,
+            PARTITION_VERT_B,
+        ];
+        let quartering = [PARTITION_SPLIT, PARTITION_HORZ_4, PARTITION_VERT_4];
+        for b in 0..BLOCK_SIZES {
+            let parent_area = block_width(b) * block_height(b);
+            for &p in &halving {
+                if let Some(child) = partition_subsize(p, b) {
+                    let child_area = block_width(child) * block_height(child);
+                    assert!(
+                        child_area * 2 <= parent_area,
+                        "partition {p} bSize {b}: child area {child_area} > parent/2 {}",
+                        parent_area / 2,
+                    );
+                }
+            }
+            for &p in &quartering {
+                if let Some(child) = partition_subsize(p, b) {
+                    let child_area = block_width(child) * block_height(child);
+                    assert!(
+                        child_area * 4 <= parent_area,
+                        "partition {p} bSize {b}: child area {child_area} > parent/4 {}",
+                        parent_area / 4,
+                    );
+                }
+            }
+        }
+    }
+
+    /// §5.11.4 data-flow pin: the `subSize` / `splitSize` pair the
+    /// `decode_partition` body reads side by side for every
+    /// `_HORZ_A` / `_HORZ_B` partition is well-formed — both rows
+    /// resolve for the same `bSize` window (the larger `subSize`
+    /// from row HORZ matches the smaller `splitSize` from row
+    /// SPLIT halved one further axis).
+    #[test]
+    fn horz_a_b_subsize_and_splitsize_pair_resolves() {
+        for b in [
+            BLOCK_8X8,
+            BLOCK_16X16,
+            BLOCK_32X32,
+            BLOCK_64X64,
+            BLOCK_128X128,
+        ] {
+            let sub = partition_subsize(PARTITION_HORZ_A, b).unwrap();
+            let split = partition_subsize(PARTITION_SPLIT, b).unwrap();
+            // subSize is the BLOCK_HORZ child (e.g. BLOCK_16X8 for
+            // BLOCK_16X16); splitSize is the BLOCK_SPLIT child
+            // (e.g. BLOCK_8X8). Sub-block width == parent width,
+            // splitSize width == parent width / 2.
+            assert_eq!(block_width(sub), block_width(b));
+            assert_eq!(block_height(sub), block_height(b) / 2);
+            assert_eq!(block_width(split), block_width(b) / 2);
+            assert_eq!(block_height(split), block_height(b) / 2);
         }
     }
 }

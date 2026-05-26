@@ -1175,6 +1175,36 @@ r147 follow-up test and leaves `read_block` clear to call
 `palette_tokens` once the parser surfaces the variables.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
+Round 150 stages the §9.3 **`Partition_Subsize[ 10 ][ BLOCK_SIZES ]`**
+lookup (av1-spec p.402–403) plus the §3 enumeration of all 22 named
+`BLOCK_*` ordinals and the `BLOCK_INVALID = 22` sentinel from the
+§3 constant table (p.7). `PARTITION_SUBSIZE` is transcribed verbatim;
+every rectangular `bSize` column carries `BLOCK_INVALID` per the
+spec p.401 note "The table will never get accessed for rectangular
+block sizes". The typed accessor
+`partition_subsize(partition, b_size) -> Option<usize>` folds the
+sentinel into `None` so the upcoming §5.11.4 `decode_partition()`
+body — which reads
+`subSize = Partition_Subsize[ partition ][ bSize ]` and
+`splitSize = Partition_Subsize[ PARTITION_SPLIT ][ bSize ]` side
+by side, then dispatches `decode_block` / `decode_partition` per
+the resolved size — never silently hands the `22` sentinel to its
+recursive children. 16 new unit tests (359 -> 375) cover BLOCK_*
+ordinal pinning (`BLOCK_4X4 = 0` through `BLOCK_INVALID = 22`);
+`PARTITION_TYPES_TOTAL` (`10`) pin; table-shape pin; row-0
+(PARTITION_NONE) identity on every square; row-1 / row-2 / row-3
+halving / quartering identities; row-4..7 (`_A` / `_B`) row equality
+with rows 1 / 2; row-8..9 (`_4`) quarter-splits + `BLOCK_128X128`
+drop; `BLOCK_4X4`-only-resolves-for-`PARTITION_NONE` column-0
+invariant; exhaustive rectangular-`bSize`-is-invalid coverage; every
+resolved subSize in `0..BLOCK_SIZES`; out-of-range
+(`partition >= 10`, `b_size >= BLOCK_SIZES`) guard; the §5.11.4
+subdivision-shrinks-area invariant; and the §5.11.4 `subSize` +
+`splitSize` pair well-formedness for every reachable HORZ_A /
+HORZ_B parent block. The full `decode_partition` body remains the
+next round's target; this round drops the last lookup it needs.
+`decode_av1` and `encode_av1` still return `Error::NotImplemented`.
+
 ## Sources consulted (clean-room wall)
 
 * AV1 Bitstream & Decoding Process Specification — AOMedia, copy at
