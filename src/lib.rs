@@ -1053,6 +1053,52 @@
 //!     `decode_av1` / `encode_av1` continue to return
 //!     `Error::NotImplemented`.
 //!
+//!   * **Round 158.** The §5.11.20 `read_is_inter()` syntax element
+//!     (av1-spec p.71-72) — the per-block intra/inter classifier read
+//!     inside §5.11.18 `inter_frame_mode_info` (after
+//!     `inter_segment_id` / `read_skip` / `read_cdef` /
+//!     `read_delta_qindex` / `read_delta_lf`) that dispatches
+//!     between §5.11.22 `intra_block_mode_info` and §5.11.23
+//!     `inter_block_mode_info`. Lands as a new
+//!     [`PartitionWalker::decode_is_inter`] method on the r157
+//!     walker, plus an `IsInters[r][c]` flag grid carried alongside
+//!     the r157 `cdef_idx[]`, r154 `SkipModes[]`, r152 `Skips[]`,
+//!     and the existing §6.10.4 `MiSizes[]` grids
+//!     (`IsInters[ r + y ][ c + x ] = is_inter` per the §5.11.5
+//!     footer at av1-spec p.65). All four arms of the §5.11.20
+//!     dispatch are honoured in spec order (first match fires, no
+//!     read on the short-circuit arms): Arm 1 — `skip_mode == 1`
+//!     forces `is_inter = 1`; Arm 2 —
+//!     `seg_feature_active(SEG_LVL_REF_FRAME)` routes through the
+//!     caller-pre-computed `FeatureData[segment_id][SEG_LVL_REF_FRAME]
+//!     != INTRA_FRAME` boolean (the walker stays
+//!     segmentation-state-free, identical to r154's
+//!     `seg_skip_mode_off` pattern); Arm 3 —
+//!     `seg_feature_active(SEG_LVL_GLOBALMV)` forces `is_inter = 1`;
+//!     Arm 4 — `S()` symbol read against `TileIsInterCdf[ctx]` with
+//!     `ctx` from the existing [`is_inter_ctx`] helper. The §8.3.2
+//!     ctx samples neighbour intra-ness from the complement of the
+//!     walker's `IsInters[]` grid (`intra = !is_inter`), with an
+//!     unavailable neighbour treated as intra per §5.11.18
+//!     (`LeftRefFrame[0] = AvailL ? RefFrames[..][0] : INTRA_FRAME`
+//!     ⇒ `None` to [`is_inter_ctx`]). The §5.11.5 grid-fill stamps
+//!     the value over the block's `bw4 * bh4` footprint, clipped at
+//!     the frame's `MiRows` / `MiCols` extent. New
+//!     [`PartitionWalker::is_inters`] accessor returns a row-major
+//!     view. 15 new cdf-module tests (468 → 483): fresh-walker grid
+//!     all-zero; Arm 1 skip_mode short-circuit (position-invariant
+//!     on a hostile `0xFF` buffer); Arm 2 routing to intra and to
+//!     inter (both position-invariant); Arm 3 globalmv short-circuit;
+//!     Arm 1 takes precedence over Arm 2 / Arm 3; Arm 2 takes
+//!     precedence over Arm 3; else-branch S() returning symbol 0 / 1
+//!     on rigged binary CDF rows (symbol-1 verifies the footprint
+//!     grid-stamp); ctx-0 / ctx-1 / ctx-2 / ctx-3 selection through
+//!     intra/inter seed combinations and a `mi_col_start = 4` tile
+//!     origin; bottom-right edge clip on `BLOCK_16X16 @ (2, 2)` in
+//!     a 4×4 frame; three-way out-of-range guard ⇒
+//!     `PartitionWalkOutOfRange`. `decode_av1` / `encode_av1`
+//!     continue to return `Error::NotImplemented`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a

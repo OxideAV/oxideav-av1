@@ -1307,6 +1307,63 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
 
+Round 158 lands the §5.11.20 **`read_is_inter()` syntax element**
+(av1-spec p.71-72) as a new `PartitionWalker::decode_is_inter`
+method on the r157 walker, plus an `IsInters[r][c]` flag grid
+carried alongside the r156 `cdef_idx[]`, r154 `SkipModes[]`,
+r152 `Skips[]`, and the existing §6.10.4 `MiSizes[]` grids
+(`IsInters[ r + y ][ c + x ] = is_inter` per the §5.11.5
+footer at av1-spec p.65). All four arms of the §5.11.20 dispatch
+are honoured in spec order (first match fires, no read on the
+short-circuit arms): Arm 1 — `skip_mode == 1` forces
+`is_inter = 1` (a compound-reference skip block is by definition
+inter); Arm 2 — `seg_feature_active(SEG_LVL_REF_FRAME) == true`
+routes through the caller-pre-computed
+`FeatureData[segment_id][SEG_LVL_REF_FRAME] != INTRA_FRAME`
+boolean (the walker stays segmentation-state-free, identical to
+r154's `seg_skip_mode_off` pattern); Arm 3 —
+`seg_feature_active(SEG_LVL_GLOBALMV) == true` forces
+`is_inter = 1` (global-MV is intrinsically inter); Arm 4 — `S()`
+symbol read against `TileIsInterCdf[ctx]` with `ctx` from the
+existing `is_inter_ctx(above_intra, left_intra)` helper. Per
+§5.11.18 the §8.3.2 neighbour intra-ness is sampled from
+`LeftRefFrame[0] / AboveRefFrame[0]` (`LeftIntra = LeftRefFrame[0]
+<= INTRA_FRAME`); the walker derives this from the complement of
+its `IsInters[]` grid (`intra = !is_inter`), with an unavailable
+neighbour treated as intra per §5.11.18 (`LeftRefFrame[0] = AvailL
+? RefFrames[..][0] : INTRA_FRAME` ⇒ `None` to `is_inter_ctx`).
+The §5.11.5 grid-fill stamps the decoded value over the block's
+`bw4 * bh4` footprint, clipped at the frame's `MiRows` / `MiCols`
+extent so a leaf straddling the bottom or right edge fills only
+the in-grid portion. New `PartitionWalker::is_inters()` accessor
+returns a row-major view; the fresh-walker initial state is
+all-zero (a pre-write neighbour weights as intra in the §8.3.2
+ctx walk, which is the natural identity for the spec's `LeftIntra
+= LeftRefFrame[0] <= INTRA_FRAME` reading and matches an
+unavailable neighbour gated by `AvailU` / `AvailL`). `is_inter`
+is the per-block intra/inter classifier read inside §5.11.18
+`inter_frame_mode_info` (after `inter_segment_id` / `read_skip` /
+`read_cdef` / `read_delta_qindex` / `read_delta_lf`) that
+dispatches between §5.11.22 `intra_block_mode_info` and §5.11.23
+`inter_block_mode_info`; intra-only frames never call it. 15 new
+cdf-module tests (468 → 483): fresh-walker grid all-zero; Arm 1
+skip_mode short-circuit (position-invariant); Arm 2 routing to
+intra (`seg_ref_frame_is_inter = false`) and to inter
+(`seg_ref_frame_is_inter = true`), both position-invariant;
+Arm 3 globalmv short-circuit; Arm 1 takes precedence over both
+Arm 2 and Arm 3; Arm 2 takes precedence over Arm 3; else-branch
+S() returning 0 / 1 on a forced binary CDF (the
+`is_inter = 1` arm verifies the footprint grid-stamp); ctx-0
+selection at the frame origin; ctx-3 selection through two prior
+intra-stamping seeds; ctx-1 through one intra + one inter
+neighbour with both available; ctx-2 through a non-zero-tile-col
+origin clearing AvailL with an above-intra seed; bottom-right
+edge clip on `BLOCK_16X16 @ (2, 2)` in a 4×4 frame; three-way
+out-of-range guard ⇒ `PartitionWalkOutOfRange`. The §5.11.5
+`decode_block()` body itself (coefficient / motion-vector /
+reconstruction) remains the next round's target. `decode_av1` /
+`encode_av1` continue to return `Error::NotImplemented`.
+
 Round 157 lands the §5.11.56 **`read_cdef()` syntax element** plus
 the §5.11.55 **`clear_cdef()` reset** (av1-spec p.104) as new
 `PartitionWalker::decode_cdef` + `PartitionWalker::clear_cdef`
@@ -1873,6 +1930,29 @@ observation. `decode_av1` / `encode_av1` continue to return
     tables" (`Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` — `t -> Max(w, h)`-
     sided square — and `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
     — chroma-mode default-tx-type table).
+  * **`read_is_inter` syntax element** (round 158): §3 (the
+    `IS_INTER_CONTEXTS = 4` constant bounding the §8.3.2 ctx
+    derivation, the implicit `INTRA_FRAME = 0` ordinal under which
+    the §5.11.20 Arm 2 comparison `FeatureData[..] != INTRA_FRAME`
+    encodes "the segmentation override selected an inter reference",
+    the `SEG_LVL_REF_FRAME = 5` / `SEG_LVL_GLOBALMV = 7` segment-
+    feature indices that gate Arms 2 and 3), §5.11.5 (the per-block
+    grid-fill footer line `IsInters[ r + y ][ c + x ] = is_inter`
+    that the walker stamps over the `bw4 * bh4` footprint after the
+    arm dispatch), §5.11.18 (the §5.11.20 caller context: the
+    `LeftRefFrame[0] = AvailL ? RefFrames[..][0] : INTRA_FRAME` /
+    `LeftIntra = LeftRefFrame[0] <= INTRA_FRAME` neighbour-
+    derivation that maps onto an `Option<bool>` to `is_inter_ctx`,
+    and the `read_is_inter()` call-site placement immediately after
+    `read_delta_lf()` and before the `is_inter ?
+    inter_block_mode_info() : intra_block_mode_info()` dispatch),
+    §5.11.20 (the four-arm dispatch body itself —
+    `skip_mode` ⇒ 1; `seg_feature_active(SEG_LVL_REF_FRAME)` ⇒
+    `FeatureData != INTRA_FRAME`; `seg_feature_active(SEG_LVL_GLOBALMV)`
+    ⇒ 1; else `S()` — and the §8.3.2 ctx formula at av1-spec p.365:
+    `AvailU && AvailL ⇒ (LeftIntra && AboveIntra) ? 3 : LeftIntra
+    || AboveIntra`; `AvailU ^ AvailL ⇒ 2 * (AvailU ? AboveIntra :
+    LeftIntra)`; else 0).
   * **`read_cdef` syntax element + `clear_cdef` reset** (round 157):
     §3 (the `BLOCK_64X64 = 12` ordinal that anchors the §5.11.55
     `cdefSize4 = Num_4x4_Blocks_Wide[ BLOCK_64X64 ] = 16` stride; the

@@ -6,6 +6,59 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 158 — §5.11.20 `read_is_inter()` syntax element.** Lands
+  the per-block intra/inter classifier (av1-spec p.71-72) as a new
+  [`PartitionWalker::decode_is_inter`] method on the r157 walker,
+  plus an `is_inters: Vec<u8>` row-major grid sized `MiRows ×
+  MiCols` (all-zero before any leaf fires) with a
+  [`PartitionWalker::is_inters`] read accessor. The four spec arms
+  are dispatched in order (first match fires, three short-circuit
+  arms read zero bits): (1) `skip_mode == 1` ⇒ `is_inter = 1`; (2)
+  `seg_feature_active(SEG_LVL_REF_FRAME)` ⇒
+  `FeatureData[segment_id][SEG_LVL_REF_FRAME] != INTRA_FRAME` (the
+  caller pre-computes this into `seg_ref_frame_is_inter` so the
+  walker stays segmentation-state-free, identical to r154's
+  `seg_skip_mode_off` pattern); (3) `seg_feature_active(SEG_LVL_GLOBALMV)`
+  ⇒ `is_inter = 1`; (4) fall-through `S()` symbol read against
+  `TileIsInterCdf[ctx]` with `ctx` from the existing
+  [`is_inter_ctx`] helper.
+
+  The §8.3.2 ctx derivation samples neighbour intra-ness from the
+  complement of the walker's `IsInters[]` grid (`intra =
+  !is_inter`); an unavailable neighbour (gated by
+  [`TileGeometry::is_inside`]) is treated as intra per §5.11.18
+  (`LeftRefFrame[0] = AvailL ? RefFrames[..][0] : INTRA_FRAME`).
+  The §5.11.5 grid-fill stamps the decoded value over the block's
+  `bw4 * bh4` footprint, clipped at the frame's `MiRows` /
+  `MiCols` extent so a leaf straddling the bottom or right edge
+  fills only the in-grid portion.
+
+  Tests grow by 15 (cdf module, 468 → 483): fresh-walker grid
+  all-zero; Arm 1 skip_mode short-circuit (position-invariant on a
+  hostile `0xFF` byte buffer); Arm 2 routing to intra
+  (`seg_ref_frame_is_inter = false`) and to inter
+  (`seg_ref_frame_is_inter = true`), both position-invariant;
+  Arm 3 globalmv short-circuit (position-invariant); Arm 1 takes
+  precedence over both Arm 2 and Arm 3; Arm 2 takes precedence
+  over Arm 3; else-branch `S()` returning symbol 0 and symbol 1
+  on rigged binary CDF rows (the `is_inter = 1` arm verifies the
+  footprint grid-stamp on BLOCK_16X16 plus the four cells outside
+  the footprint staying at the initial 0); ctx-0 selection at the
+  frame origin (`AvailU = AvailL = false`); ctx-3 selection through
+  two intra-stamping seeds at `(0, 0)` and `(0, 4)` driving the
+  block at `(3, 5)`; ctx-1 through one intra + one inter neighbour
+  with both available; ctx-2 through a `mi_col_start = 4` tile
+  origin clearing `AvailL` plus an above-intra seed; bottom-right
+  edge clip on `BLOCK_16X16 @ (2, 2)` in a 4×4 frame stamps only
+  the in-grid quadrant; three-way out-of-range guard (`mi_row`
+  past extent / `mi_col` past extent / `sub_size == BLOCK_SIZES`)
+  ⇒ `PartitionWalkOutOfRange`.
+
+  The §5.11.5 `decode_block()` body itself (coefficient /
+  motion-vector / reconstruction) remains the next round's target.
+  [`decode_av1`] / [`encode_av1`] continue to return
+  [`Error::NotImplemented`].
+
 * **Round 157 — §5.11.56 `read_cdef()` syntax element + §5.11.55
   `clear_cdef()` reset.** Lands the per-leaf CDEF-index read
   (av1-spec p.104) as a new [`PartitionWalker::decode_cdef`] method

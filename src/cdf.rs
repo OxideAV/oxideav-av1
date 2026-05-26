@@ -10662,6 +10662,19 @@ pub struct PartitionWalker {
     /// sentinel is the literal value `-1` and the `cdef_bits` literal
     /// read is bounded by `f(2)` (so `1 << cdef_bits <= 8`).
     cdef_idx: Vec<i8>,
+    /// `IsInters[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec p.378 / §5.11.5 line
+    /// `IsInters[ r + y ][ c + x ] = is_inter`). Entries are `0` for
+    /// not-yet-decoded cells and `0` (intra block) or `1` (inter
+    /// block) for cells in the `bh4 * bw4` footprint of a block whose
+    /// §5.11.20 [`Self::decode_is_inter`] has already fired. The
+    /// initial-zero state matches the spec's pre-write "intra block"
+    /// reading (an unwritten cell's `is_inter` is 0), which is the
+    /// natural identity for the §8.3.2 neighbour-intra ctx walk: a
+    /// pre-write neighbour contributes the same `LeftIntra =
+    /// AboveIntra = true` weight as an unavailable neighbour gated
+    /// out by `AvailU` / `AvailL`.
+    is_inters: Vec<u8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -10701,6 +10714,9 @@ impl PartitionWalker {
         // one) 64x64 anchor cells; the fresh-walker pre-fill matches
         // the spec's `cdef_idx[ r ][ c ] = -1` initialisation.
         cdef_idx.resize(area, -1);
+        let mut is_inters: Vec<u8> = Vec::new();
+        is_inters.try_reserve_exact(area).ok()?;
+        is_inters.resize(area, 0);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -10711,6 +10727,7 @@ impl PartitionWalker {
             current_q_index: 0,
             current_delta_lf: [0; FRAME_LF_COUNT],
             cdef_idx,
+            is_inters,
             blocks: Vec::new(),
         })
     }
@@ -11059,6 +11076,33 @@ impl PartitionWalker {
             return 0;
         }
         self.skip_modes[(r * self.mi_cols + c) as usize]
+    }
+
+    /// View of the §6.10.4 `IsInters[]` grid after the walk. Indexed
+    /// row-major: `is_inters()[ r * MiCols + c ]`. Cells that no leaf
+    /// covered carry `0` (the §5.11.20 [`Self::decode_is_inter`]
+    /// writer only fills the `bh4 * bw4` footprint of decoded blocks).
+    #[must_use]
+    pub fn is_inters(&self) -> &[u8] {
+        &self.is_inters
+    }
+
+    /// Helper to read `IsInters[ r ][ c ]`. Returns `0` for out-of-grid
+    /// coordinates; callers must therefore use [`TileGeometry::is_inside`]
+    /// to derive `AvailU` / `AvailL` before consulting the grid for the
+    /// §8.3.2 `is_inter` ctx walk (an unavailable neighbour is treated
+    /// as `LeftIntra = AboveIntra = true` per §5.11.18:
+    /// `LeftRefFrame[0] = AvailL ? RefFrames[..][0] : INTRA_FRAME`).
+    #[inline]
+    fn is_inter_at(&self, r: i32, c: i32) -> u8 {
+        if r < 0 || c < 0 {
+            return 0;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        self.is_inters[(r * self.mi_cols + c) as usize]
     }
 
     /// Helper to read `MiSizes[ r ][ c ]`. Returns [`BLOCK_INVALID`]
@@ -11586,6 +11630,184 @@ impl PartitionWalker {
         }
 
         Ok(skip_mode)
+    }
+
+    /// `read_is_inter()` per §5.11.20 (av1-spec p.71-72) — reads the
+    /// per-block `is_inter` syntax element at the leaf
+    /// `(mi_row, mi_col)` of a block whose §5.11.5 `MiSize` is
+    /// `sub_size`. `is_inter` selects between
+    /// [§5.11.22 `intra_block_mode_info`] and
+    /// [§5.11.23 `inter_block_mode_info`] inside the §5.11.18
+    /// `inter_frame_mode_info` outer dispatch; it is never read for
+    /// intra-only frames (those go through §5.11.7 directly).
+    ///
+    /// The spec body (av1-spec p.71-72) reads:
+    ///
+    /// ```text
+    ///   read_is_inter() {
+    ///       if ( skip_mode ) {
+    ///           is_inter = 1
+    ///       } else if ( seg_feature_active( SEG_LVL_REF_FRAME ) ) {
+    ///           is_inter = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME
+    ///       } else if ( seg_feature_active( SEG_LVL_GLOBALMV ) ) {
+    ///           is_inter = 1
+    ///       } else {
+    ///           is_inter                                        S()
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// The four arms are ordered (only the first matching arm fires):
+    ///
+    /// 1. `skip_mode` (the §5.11.10 result the caller has already
+    ///    decoded for this block) forces `is_inter = 1` — a
+    ///    compound-reference skip block is by definition inter.
+    /// 2. `seg_ref_frame_active` (the §5.9.14 segmentation override
+    ///    `seg_feature_active( SEG_LVL_REF_FRAME )` evaluated against
+    ///    the block's `segment_id`) routes through the per-segment
+    ///    `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]` value:
+    ///    `INTRA_FRAME` (value `0` per §3) ⇒ intra, anything else ⇒
+    ///    inter. The caller pre-computes this comparison into the
+    ///    `seg_ref_frame_is_inter` boolean so the walker stays
+    ///    segmentation-state free.
+    /// 3. `seg_globalmv_active` (the §5.9.14 segmentation override
+    ///    `seg_feature_active( SEG_LVL_GLOBALMV )` — a boolean
+    ///    feature with no data, just an enabled bit) forces
+    ///    `is_inter = 1` (global-MV is intrinsically an inter mode).
+    /// 4. Fall-through `S()` symbol read against
+    ///    `TileIsInterCdf[ ctx ]` per §8.3.2 (av1-spec p.365) with
+    ///    `ctx` derived from neighbour intra-ness via the existing
+    ///    [`is_inter_ctx`] helper.
+    ///
+    /// The §8.3.2 ctx derivation is:
+    ///
+    /// ```text
+    ///   if ( AvailU && AvailL )
+    ///        ctx = (LeftIntra && AboveIntra) ? 3 : LeftIntra || AboveIntra
+    ///   else if ( AvailU || AvailL )
+    ///        ctx = 2 * (AvailU ? AboveIntra : LeftIntra)
+    ///   else
+    ///        ctx = 0
+    /// ```
+    ///
+    /// Per §5.11.18 the neighbour intra-ness is sampled from
+    /// `LeftRefFrame[0] / AboveRefFrame[0]`:
+    /// `LeftIntra = LeftRefFrame[0] <= INTRA_FRAME`. The walker's
+    /// `IsInters[]` grid stores `is_inter` (0 / 1), so `LeftIntra`
+    /// is the complement: `!is_inter_at(...)`. Per §5.11.18
+    /// `LeftRefFrame[0] = AvailL ? RefFrames[..][0] : INTRA_FRAME`,
+    /// so an unavailable neighbour is treated as intra — exactly
+    /// the `None` arm of [`is_inter_ctx`].
+    ///
+    /// The decoded `is_inter` value is then stamped over the block's
+    /// `bw4 * bh4` footprint of [`Self::is_inters`] per the §5.11.5
+    /// per-block invariant
+    ///
+    /// ```text
+    ///   for ( y = 0; y < bh4; y++ )
+    ///     for ( x = 0; x < bw4; x++ )
+    ///         IsInters[ r + y ][ c + x ] = is_inter
+    /// ```
+    ///
+    /// (av1-spec p.65, the §5.11.5 footer covering `IsInters[]` /
+    /// `SkipModes[]` / `Skips[]` / `MiSizes[]` / etc.) so the next
+    /// block's §8.3.2 is-inter-ctx walk observes the value.
+    ///
+    /// Returns the decoded `is_inter` value (0 = intra block, 1 =
+    /// inter block) on success, or [`Error::PartitionWalkOutOfRange`]
+    /// for caller bugs (out-of-range `sub_size`, `mi_row` / `mi_col`
+    /// outside the frame's mi extent).
+    ///
+    /// [§5.11.22 `intra_block_mode_info`]: https://aomediacodec.github.io/av1-spec/av1-spec.pdf
+    /// [§5.11.23 `inter_block_mode_info`]: https://aomediacodec.github.io/av1-spec/av1-spec.pdf
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_is_inter(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip_mode: u8,
+        seg_ref_frame_active: bool,
+        seg_ref_frame_is_inter: bool,
+        seg_globalmv_active: bool,
+    ) -> Result<u8, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.20 four-arm dispatch — first match fires. The three
+        // short-circuit arms read zero bits; only the fall-through
+        // `else` reads an `S()` symbol against `TileIsInterCdf[ctx]`.
+        let is_inter: u8 = if skip_mode != 0 {
+            // Arm 1: `if ( skip_mode ) is_inter = 1`.
+            1
+        } else if seg_ref_frame_active {
+            // Arm 2: `is_inter = FeatureData[segment_id][SEG_LVL_REF_FRAME] != INTRA_FRAME`.
+            // Caller pre-computed the !=INTRA_FRAME comparison.
+            seg_ref_frame_is_inter as u8
+        } else if seg_globalmv_active {
+            // Arm 3: `if ( seg_feature_active( SEG_LVL_GLOBALMV ) ) is_inter = 1`.
+            1
+        } else {
+            // Arm 4: `is_inter S()` — fall-through symbol read.
+            //
+            // §8.3.2 is_inter ctx derivation: the neighbour
+            // `LeftIntra` / `AboveIntra` predicates per §5.11.18 are
+            // the complement of `IsInters[]` (intra ≡ !is_inter), and
+            // an unavailable neighbour is treated as intra per
+            // §5.11.18 (`LeftRefFrame[0] = AvailL ? ... :
+            // INTRA_FRAME`) — i.e. `None` to [`is_inter_ctx`].
+            let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+            let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+            let above_intra: Option<bool> = if avail_u {
+                Some(self.is_inter_at(mi_row as i32 - 1, mi_col as i32) == 0)
+            } else {
+                None
+            };
+            let left_intra: Option<bool> = if avail_l {
+                Some(self.is_inter_at(mi_row as i32, mi_col as i32 - 1) == 0)
+            } else {
+                None
+            };
+            let ctx = is_inter_ctx(above_intra, left_intra);
+            // is_inter_ctx returns 0..=3 < IS_INTER_CONTEXTS (4); the
+            // `is_inter_cdf` accessor is total over that range.
+            let cdf = cdfs.is_inter_cdf(ctx);
+            // §8.2.6 S(): a 2-symbol read against
+            // `Default_Is_Inter_Cdf` (length 3 including the counter
+            // slot) returns 0 or 1.
+            let sym = decoder.read_symbol(cdf)? as u8;
+            debug_assert!(sym <= 1, "S() over Default_Is_Inter_Cdf yields 0 or 1");
+            sym
+        };
+
+        // §5.11.5 grid-fill: stamp `is_inter` over the block's bh4 *
+        // bw4 footprint, clipped at the frame's MiRows / MiCols
+        // extent so a leaf straddling the bottom or right edge fills
+        // only the in-grid portion.
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.is_inters[(rr * self.mi_cols + cc) as usize] = is_inter;
+            }
+        }
+
+        Ok(is_inter)
     }
 
     /// `read_delta_qindex()` per §5.11.12 (av1-spec p.67) — reads the
@@ -21240,6 +21462,692 @@ mod tests {
                 false,
                 false,
                 0
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Round 158 — §5.11.20 read_is_inter walker tests.
+    // ---------------------------------------------------------------------
+
+    /// Helper: force a 2-symbol is_inter CDF row (length 3) to select
+    /// `symbol` on the next `read_symbol`. Mirrors `force_skip_mode_cdf`
+    /// (the §9.4 `DEFAULT_IS_INTER_CDF` rows are also `[a, 1 << 15,
+    /// 0]`-shaped 2-symbol CDFs).
+    fn force_is_inter_cdf(symbol: u8) -> [u16; 3] {
+        match symbol {
+            0 => [1 << 15, 1 << 15, 0],
+            1 => [0, 1 << 15, 0],
+            _ => panic!("force_is_inter_cdf supports 0 or 1 only"),
+        }
+    }
+
+    /// §5.11.5 grid-fill initial state: a fresh PartitionWalker has
+    /// every `IsInters[]` cell at 0 (the §9.4 default before any block
+    /// is decoded).
+    #[test]
+    fn fresh_walker_is_inters_grid_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        assert_eq!(walker.is_inters().len(), 16 * 16);
+        assert!(walker.is_inters().iter().all(|&v| v == 0));
+    }
+
+    /// §5.11.20 Arm 1: `skip_mode == 1` ⇒ `is_inter = 1`, no symbol
+    /// read. The decoder position must not advance. A buffer of
+    /// `0xFF` bytes would steer any spurious `S()` away from 0, so
+    /// the position-invariant check is the load-bearing assertion.
+    #[test]
+    fn decode_is_inter_skip_mode_short_circuit_no_symbol_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 1,
+                /* seg_ref_frame_active = */ false,
+                /* seg_ref_frame_is_inter = */ false,
+                /* seg_globalmv_active = */ false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1, "skip_mode = 1 ⇒ is_inter = 1");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no symbol bit read on the skip_mode arm"
+        );
+    }
+
+    /// §5.11.20 Arm 2 (intra-routing branch):
+    /// `seg_feature_active(SEG_LVL_REF_FRAME) == true` +
+    /// `FeatureData[..][SEG_LVL_REF_FRAME] == INTRA_FRAME` (encoded by
+    /// the caller as `seg_ref_frame_is_inter = false`) ⇒
+    /// `is_inter = 0`, no symbol read.
+    #[test]
+    fn decode_is_inter_seg_ref_frame_routes_to_intra_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 0,
+                /* seg_ref_frame_active = */ true,
+                /* seg_ref_frame_is_inter = */ false,
+                /* seg_globalmv_active = */ false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 0, "FeatureData == INTRA_FRAME ⇒ is_inter = 0");
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.20 Arm 2 (inter-routing branch):
+    /// `seg_feature_active(SEG_LVL_REF_FRAME) == true` +
+    /// `FeatureData[..][SEG_LVL_REF_FRAME] != INTRA_FRAME` (encoded
+    /// as `seg_ref_frame_is_inter = true`) ⇒ `is_inter = 1`, no
+    /// symbol read.
+    #[test]
+    fn decode_is_inter_seg_ref_frame_routes_to_inter_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 0,
+                /* seg_ref_frame_active = */ true,
+                /* seg_ref_frame_is_inter = */ true,
+                /* seg_globalmv_active = */ false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1, "FeatureData != INTRA_FRAME ⇒ is_inter = 1");
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.20 Arm 3: `seg_feature_active(SEG_LVL_GLOBALMV) == true`
+    /// ⇒ `is_inter = 1`, no symbol read.
+    #[test]
+    fn decode_is_inter_seg_globalmv_short_circuit_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 0,
+                /* seg_ref_frame_active = */ false,
+                /* seg_ref_frame_is_inter = */ false,
+                /* seg_globalmv_active = */ true,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1, "seg GLOBALMV ⇒ is_inter = 1");
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.20 arm-ordering invariant: when both `skip_mode == 1`
+    /// AND `seg_ref_frame_active == true` AND
+    /// `seg_ref_frame_is_inter == false`, Arm 1 fires first ⇒
+    /// `is_inter = 1` (not the `0` Arm 2 would produce). The spec's
+    /// `if / else if / else if / else` chain is short-circuit on the
+    /// first match.
+    #[test]
+    fn decode_is_inter_skip_mode_takes_precedence_over_seg_ref_frame() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 1,
+                /* seg_ref_frame_active = */ true,
+                /* seg_ref_frame_is_inter = */ false,
+                /* seg_globalmv_active = */ true,
+            )
+            .unwrap();
+        assert_eq!(
+            is_inter, 1,
+            "Arm 1 (skip_mode) takes precedence over Arm 2 / 3"
+        );
+    }
+
+    /// §5.11.20 arm-ordering invariant: when Arm 2 is active
+    /// (`seg_ref_frame_active == true`), the `seg_globalmv_active`
+    /// flag must NOT be checked — even if it would have produced
+    /// `is_inter = 1`, Arm 2's `seg_ref_frame_is_inter = false`
+    /// result wins.
+    #[test]
+    fn decode_is_inter_seg_ref_frame_takes_precedence_over_globalmv() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 0,
+                /* seg_ref_frame_active = */ true,
+                /* seg_ref_frame_is_inter = */ false,
+                /* seg_globalmv_active = */ true,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 0, "Arm 2 (seg_ref_frame=intra) wins over Arm 3");
+    }
+
+    /// §5.11.20 else branch with a rigged CDF forcing symbol 0
+    /// (`is_inter = 0`): the returned value matches.
+    #[test]
+    fn decode_is_inter_else_branch_returns_symbol_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_is_inter_cdf(0);
+        for ctx_idx in 0..IS_INTER_CONTEXTS {
+            cdfs.is_inter[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 0);
+    }
+
+    /// §5.11.20 else branch with a rigged CDF forcing symbol 1
+    /// (`is_inter = 1`): the returned value matches and the value is
+    /// stamped into the `IsInters[]` grid over the block's
+    /// `bh4 * bw4` footprint.
+    #[test]
+    fn decode_is_inter_else_branch_returns_symbol_one_and_stamps_grid() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_is_inter_cdf(1);
+        for ctx_idx in 0..IS_INTER_CONTEXTS {
+            cdfs.is_inter[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1);
+
+        // §5.11.5 grid-fill: BLOCK_16X16 has bw4 = bh4 = 4, so the
+        // footprint IsInters[0..4][0..4] all carry 1.
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(
+                    walker.is_inters()[r * 32 + c],
+                    1,
+                    "footprint cell ({r},{c}) should be is_inter = 1",
+                );
+            }
+        }
+        // Cells outside the footprint stay at the initial 0.
+        assert_eq!(walker.is_inters()[4], 0, "col 4 outside footprint");
+        assert_eq!(walker.is_inters()[4 * 32], 0, "row 4 outside footprint");
+    }
+
+    /// §8.3.2 origin ctx = 0: at the frame origin both `AvailU` and
+    /// `AvailL` are false, so the ctx-0 row's rigged CDF drives the
+    /// read. Other rows are zeroed (in a way that would not yield
+    /// symbol 1 if accidentally consulted).
+    #[test]
+    fn decode_is_inter_origin_ctx_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // ctx 0 drives symbol 1. ctx 1, 2, 3 would drive symbol 0.
+        cdfs.is_inter[0] = force_is_inter_cdf(1);
+        for ctx_idx in 1..IS_INTER_CONTEXTS {
+            cdfs.is_inter[ctx_idx] = force_is_inter_cdf(0);
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            is_inter, 1,
+            "origin ctx must be 0; ctx-0 row drove the read"
+        );
+    }
+
+    /// §8.3.2 ctx = 3 (both neighbours intra): two prior decode_is_inter
+    /// calls write `is_inter = 0` at (0, 0) and (0, 4) so the block at
+    /// (4, 4) sees both an above neighbour (intra) and a left
+    /// neighbour (intra) ⇒ ctx = 3. The ctx-3 row's rigged CDF drives
+    /// the read.
+    #[test]
+    fn decode_is_inter_ctx_3_both_neighbours_intra() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force is_inter = 0 (intra) for the seed blocks via Arm 2.
+        let seed_bytes = [0xFFu8; 8];
+        let mut seed_dec = SymbolDecoder::init_symbol(&seed_bytes, 8, true).unwrap();
+        walker
+            .decode_is_inter(
+                &mut seed_dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        walker
+            .decode_is_inter(
+                &mut seed_dec,
+                &mut cdfs,
+                0,
+                4,
+                BLOCK_16X16,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        // Now (4, 4) sees above (0, 4) at intra and left (4, 0) at
+        // intra — both available, both intra ⇒ ctx = 3.
+        // Wait: above at (4, 4) is (3, 4); left is (4, 3).
+        // The (0, 0) block stamped IsInters[0..4][0..4] = 0 (intra)
+        // and (0, 4) stamped IsInters[0..4][4..8] = 0. So (3, 4) and
+        // (4, 3) are both 0 (intra), but (4, 3) is at row 4 column 3
+        // — that's outside both stamps. Let me use (3, 5) instead so
+        // both neighbours fall inside the stamped intra footprint.
+        //
+        // Above neighbour: (2, 5). The (0, 4) stamp covers rows 0-3
+        // cols 4-7. (2, 5) is inside ⇒ intra (is_inter = 0).
+        // Left neighbour: (3, 4). The (0, 4) stamp covers (3, 4) too
+        // ⇒ intra (is_inter = 0).
+        // Therefore ctx at (3, 5) = 3.
+        let rigged_3 = force_is_inter_cdf(1);
+        let rigged_others = force_is_inter_cdf(0);
+        for ctx_idx in 0..IS_INTER_CONTEXTS {
+            cdfs.is_inter[ctx_idx] = if ctx_idx == 3 {
+                rigged_3
+            } else {
+                rigged_others
+            };
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(&mut dec, &mut cdfs, 3, 5, BLOCK_8X8, 0, false, false, false)
+            .unwrap();
+        assert_eq!(
+            is_inter, 1,
+            "both-intra-neighbours ⇒ ctx = 3 drove the read"
+        );
+    }
+
+    /// §8.3.2 ctx = 1 (exactly one neighbour intra, both available):
+    /// the seed block at (0, 4) stamps intra; an inter seed block at
+    /// (4, 0) stamps inter. The (4, 4) block sees above intra
+    /// (`IsInters[3][4] = 0`) + left inter (`IsInters[4][3] = 1`) ⇒
+    /// `ctx = LeftIntra || AboveIntra = false || true = 1`.
+    #[test]
+    fn decode_is_inter_ctx_1_mixed_neighbours_both_avail() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let seed_bytes = [0u8; 8];
+        let mut seed_dec = SymbolDecoder::init_symbol(&seed_bytes, 8, true).unwrap();
+        // Above seed: intra at (0, 4) covering rows 0-3 cols 4-7.
+        walker
+            .decode_is_inter(
+                &mut seed_dec,
+                &mut cdfs,
+                0,
+                4,
+                BLOCK_16X16,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        // Left seed: inter at (4, 0) covering rows 4-7 cols 0-3 via
+        // Arm 3 (globalmv).
+        walker
+            .decode_is_inter(
+                &mut seed_dec,
+                &mut cdfs,
+                4,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+        // (4, 4) sees above (3, 4) ⇒ IsInters[3][4] = 0 (intra) AND
+        // left (4, 3) ⇒ IsInters[4][3] = 1 (inter).
+        // ctx = (LeftIntra && AboveIntra) ? 3 : LeftIntra || AboveIntra
+        //     = (false && true) ? 3 : false || true
+        //     = false ? 3 : true
+        //     = 1
+        let rigged_1 = force_is_inter_cdf(1);
+        let rigged_others = force_is_inter_cdf(0);
+        for ctx_idx in 0..IS_INTER_CONTEXTS {
+            cdfs.is_inter[ctx_idx] = if ctx_idx == 1 {
+                rigged_1
+            } else {
+                rigged_others
+            };
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                4,
+                4,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            is_inter, 1,
+            "mixed neighbours (above intra, left inter) ⇒ ctx = 1 drove the read"
+        );
+    }
+
+    /// §8.3.2 ctx = 2 (only one neighbour available, that neighbour
+    /// is intra). A tile origin shifted away from the frame origin
+    /// makes `AvailL` false at the tile-column origin; an above
+    /// neighbour stamped intra ⇒ `ctx = 2 * AboveIntra = 2 * 1 = 2`.
+    #[test]
+    fn decode_is_inter_ctx_2_only_above_intra() {
+        // Tile spans rows 0..32, cols 4..32 (so col 4 is the tile
+        // origin column — `AvailL` at col 4 is false for the first
+        // block in row 0). But to also get `AvailU` true at the
+        // tested block, we need a non-zero row.
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 4,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let seed_bytes = [0u8; 8];
+        let mut seed_dec = SymbolDecoder::init_symbol(&seed_bytes, 8, true).unwrap();
+        // Above seed: intra at (0, 4) covering rows 0-3 cols 4-7.
+        walker
+            .decode_is_inter(
+                &mut seed_dec,
+                &mut cdfs,
+                0,
+                4,
+                BLOCK_16X16,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        // Block under test at (4, 4):
+        // - AvailU = is_inside(3, 4) = true (3 is in row range, 4 is
+        //   in col range [4..32]).
+        // - AvailL = is_inside(4, 3) = false (col 3 < mi_col_start = 4).
+        // - AboveIntra: IsInters[3][4] = 0 ⇒ above_intra = Some(true).
+        // - LeftIntra: None (unavailable).
+        // is_inter_ctx(Some(true), None) returns 2 * (true as usize)
+        // = 2.
+        let rigged_2 = force_is_inter_cdf(1);
+        let rigged_others = force_is_inter_cdf(0);
+        for ctx_idx in 0..IS_INTER_CONTEXTS {
+            cdfs.is_inter[ctx_idx] = if ctx_idx == 2 {
+                rigged_2
+            } else {
+                rigged_others
+            };
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                4,
+                4,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            is_inter, 1,
+            "AvailL=false + above-intra ⇒ ctx = 2 drove the read"
+        );
+    }
+
+    /// §5.11.5 grid-fill clip: a `BLOCK_16X16` leaf at
+    /// `(MiRows - 2, MiCols - 2)` straddles both bottom and right
+    /// edges. Only the 4 cells inside the frame should get stamped;
+    /// the other 12 cells of the 4×4 footprint must not overflow the
+    /// `IsInters[]` buffer.
+    #[test]
+    fn decode_is_inter_grid_fill_clips_bottom_right_edge() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_is_inter_cdf(1);
+        for ctx_idx in 0..IS_INTER_CONTEXTS {
+            cdfs.is_inter[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                2,
+                2,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1);
+        // Only the in-grid quadrant (2..4) × (2..4) should be 1.
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected: u8 = if r >= 2 && c >= 2 { 1 } else { 0 };
+                assert_eq!(
+                    walker.is_inters()[r * 4 + c],
+                    expected,
+                    "cell ({r},{c}) should be {expected}",
+                );
+            }
+        }
+    }
+
+    /// Out-of-range guard: `mi_row >= MiRows`, `mi_col >= MiCols`, or
+    /// `sub_size >= BLOCK_SIZES` all yield
+    /// `Error::PartitionWalkOutOfRange` without any state mutation.
+    #[test]
+    fn decode_is_inter_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        assert_eq!(
+            walker.decode_is_inter(&mut dec, &mut cdfs, 8, 0, BLOCK_4X4, 0, false, false, false),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_is_inter(&mut dec, &mut cdfs, 0, 8, BLOCK_4X4, 0, false, false, false),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_is_inter(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_SIZES,
+                0,
+                false,
+                false,
+                false
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
