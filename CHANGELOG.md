@@ -6,6 +6,83 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 160 — §5.11.8 `intra_segment_id()` syntax element.** Lands
+  the intra-frame variant of the per-block segment-id read (av1-spec
+  p.66) as a new [`PartitionWalker::decode_intra_segment_id`] method
+  built on top of r159's [`PartitionWalker::decode_segment_id`].
+  `intra_segment_id` is called from §5.11.7 `intra_frame_mode_info`
+  on both the `SegIdPreSkip` pre-skip arm and the `!SegIdPreSkip`
+  post-skip arm. The §5.11.8 spec body is short — `if
+  (segmentation_enabled) read_segment_id(); else segment_id = 0;
+  Lossless = LosslessArray[segment_id]` — but the Lossless lookup
+  is the first place the per-segment §6.8.2 `LosslessArray[]` table
+  reaches the leaf walk.
+
+  The dispatch is exact:
+
+  * `segmentation_enabled = true` ⇒ descends into the r159
+    implementation (which performs the §5.11.9 neighbour cascade,
+    the skip / non-skip dispatch, the `S()` read against
+    `TileSegmentIdCdf[ctx]`, the `neg_deinterleave` mapping, and
+    the §5.11.5 grid-fill).
+  * `segmentation_enabled = false` ⇒ forces `segment_id = 0`
+    without reading any bits and stamps the `bh4 * bw4` footprint
+    to `0` so subsequent §5.11.9 neighbour lookups see a real zero
+    rather than the §5.11.9 `-1` sentinel.
+
+  Both arms then resolve `Lossless = lossless_array[segment_id as
+  usize]` from the caller-supplied `&[bool; MAX_SEGMENTS]` table
+  (the §6.8.2 derivation the frame-header walk computes from
+  `qindex = get_qindex(1, segmentId)` plus the five `DeltaQ?Dc` /
+  `DeltaQ?Ac` offsets; `compute_coded_lossless` in `frame_header.rs`
+  is the frame-wide conjunction, this round's table is the
+  per-segment data the walker indexes by `segment_id`). The walker
+  stays segmentation-state-free: callers pass
+  `segmentation_enabled`, `last_active_seg_id`, and `lossless_array`
+  per-call, mirroring the r159 pattern.
+
+  Range guards (out-of-range `sub_size`, `mi_row` / `mi_col` past
+  extent, `last_active_seg_id >= MAX_SEGMENTS`) fire on both arms
+  so the no-symbol path is total over the same input space as the
+  bitstream-reading path.
+
+  Returns `(segment_id, lossless)`. The §5.11.18
+  `inter_frame_mode_info` top-level dispatcher (the §5.11.19
+  `inter_segment_id(preSkip)` two-call protocol) remains the next
+  round's target.
+
+  7 new cdf-module tests (494 → 501):
+
+  * `decode_intra_segment_id_segmentation_disabled_no_read` —
+    `!segmentation_enabled` ⇒ no `S()` consumed on a hostile `0xFF`
+    buffer; grid stamped to `0`; `Lossless` from
+    `lossless_array[0] = true`.
+  * `decode_intra_segment_id_segmentation_disabled_lossless_false`
+    — same arm with `lossless_array[0] = false` reports `Lossless
+    = false`.
+  * `decode_intra_segment_id_segmentation_enabled_skip_origin` —
+    `skip = 1` at frame origin ⇒ pred = 0, no `S()` consumed, grid
+    stamped to `0`, Lossless from slot 0.
+  * `decode_intra_segment_id_segmentation_enabled_non_skip_reads_symbol`
+    — `skip = 0` with rigged CDF reading `diff = 3` ⇒ `segment_id
+    = 3`; Lossless from slot 3 = true; grid-fill verified at the
+    BLOCK_8X8 footprint.
+  * `decode_intra_segment_id_lossless_indexed_by_segment_id` —
+    rig `diff = 5`, set `lossless_array[5] = false` while every
+    other slot is `true`; expect `Lossless = false` (proves the
+    lookup is per-segment, not frame-wide).
+  * `decode_intra_segment_id_segmentation_disabled_grid_fill_clips`
+    — `BLOCK_16X16 @ (2, 2)` in a 4×4 frame stamps only the
+    in-grid 2×2 quadrant and leaves the rest at `-1`.
+  * `decode_intra_segment_id_rejects_out_of_range` — five-way
+    out-of-range guard (`mi_row >= mi_rows`, `mi_col >= mi_cols`,
+    `sub_size == BLOCK_SIZES`, `last_active_seg_id ==
+    MAX_SEGMENTS`, plus a `mi_row` guard on the
+    `segmentation_enabled = true` path).
+
+  `decode_av1` / `encode_av1` still return
+  [`Error::NotImplemented`].
+
 * **Round 159 — §5.11.9 `read_segment_id()` syntax element.** Lands
   the per-block segment-id reader (av1-spec p.66) as a new
   [`PartitionWalker::decode_segment_id`] method on the r158 walker,

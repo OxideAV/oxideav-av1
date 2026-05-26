@@ -12141,6 +12141,158 @@ impl PartitionWalker {
         Ok(segment_id)
     }
 
+    /// `intra_segment_id()` per §5.11.8 (av1-spec p.66) — the
+    /// intra-frame variant of the per-block segment-id read, called
+    /// from §5.11.7 `intra_frame_mode_info` (both the `SegIdPreSkip`
+    /// pre-skip arm and the `!SegIdPreSkip` post-skip arm route here).
+    /// Wraps the r159 [`Self::decode_segment_id`] under a
+    /// `segmentation_enabled` gate and resolves the `Lossless`
+    /// per-block boolean via the §6.8.2 `LosslessArray[ segment_id ]`
+    /// table.
+    ///
+    /// The spec body (av1-spec p.66) reads:
+    ///
+    /// ```text
+    ///   intra_segment_id( ) {
+    ///       if ( segmentation_enabled )
+    ///           read_segment_id( )
+    ///       else
+    ///           segment_id = 0
+    ///       Lossless = LosslessArray[ segment_id ]
+    ///   }
+    /// ```
+    ///
+    /// `segmentation_enabled` is the §5.9.14 frame-header bit (the
+    /// [`SegmentationParams::enabled`] field on the parsed segmentation
+    /// state). When clear, every block forces `segment_id = 0` and no
+    /// `S()` is read; when set, the call descends into r159
+    /// `decode_segment_id` with the caller-supplied `skip` (the
+    /// §5.11.11 `decode_skip` return) and `last_active_seg_id` (the
+    /// §5.9.14 trailing derivation) — that path stamps the grid and
+    /// reads at most one symbol per the §5.11.9 dispatch.
+    ///
+    /// `lossless_array` is the §6.8.2 per-segment `LosslessArray[]`
+    /// table the uncompressed-header walk derives once per frame
+    /// (`LosslessArray[ segmentId ] = qindex == 0 && DeltaQYDc == 0 &&
+    /// DeltaQUAc == 0 && DeltaQUDc == 0 && DeltaQVAc == 0 && DeltaQVDc
+    /// == 0` per av1-spec p.42; `qindex = get_qindex(1, segmentId)`).
+    /// The full conjunction (`AllLossless = CodedLossless && (FrameWidth
+    /// == UpscaledWidth)`) is owned by the frame-header parse; this
+    /// method only consumes the eight-entry per-segment slice. The
+    /// caller-side derivation matches the pattern of r159's
+    /// `last_active_seg_id` argument (the walker stays
+    /// segmentation-state-free).
+    ///
+    /// When `segmentation_enabled == false`, the §5.11.5 grid-fill
+    /// over the leaf's `bh4 * bw4` footprint stamps `segment_id = 0`
+    /// (matching the spec's `segment_id = 0` assignment) so subsequent
+    /// `decode_segment_id` neighbour lookups see a real zero rather
+    /// than the §5.11.9 `-1` sentinel. The `lossless_array[0]` slot is
+    /// the universal `Lossless` for the whole frame in that case (a
+    /// segmentation-disabled frame has only segment 0 in use).
+    ///
+    /// Returns `(segment_id, lossless)` on success, where `segment_id ∈
+    /// 0..=last_active_seg_id` (or `0` when segmentation is disabled)
+    /// and `lossless == lossless_array[ segment_id as usize ]`. Returns
+    /// [`Error::PartitionWalkOutOfRange`] for caller-bug arguments
+    /// (out-of-range `sub_size`, `mi_row` / `mi_col` outside the
+    /// frame's mi extent, or `last_active_seg_id >= MAX_SEGMENTS`).
+    /// [`Error::UnexpectedEnd`] / [`Error::SymbolExitUnderflow`]
+    /// surface bitstream errors from the inner `decode_segment_id`
+    /// call.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
+    /// [`SegmentationParams::enabled`]: crate::uncompressed_header_tail::SegmentationParams::enabled
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_intra_segment_id(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip: u8,
+        segmentation_enabled: bool,
+        last_active_seg_id: u8,
+        lossless_array: &[bool; MAX_SEGMENTS],
+    ) -> Result<(u8, bool), crate::Error> {
+        // §5.11.8 range guards happen here even on the
+        // `!segmentation_enabled` branch (the spec still stamps the
+        // grid in that branch, so a bogus `mi_row` / `mi_col` /
+        // `sub_size` should fail symmetrically with the
+        // `segmentation_enabled == true` path). The `decode_segment_id`
+        // path re-checks them but performs the bitstream read first;
+        // checking up front keeps the no-symbol path total over the
+        // same input space.
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        let segment_id: u8 = if segmentation_enabled {
+            // §5.11.8 `if ( segmentation_enabled ) read_segment_id( )`
+            // — descend into the r159 implementation, which performs
+            // the §5.11.9 neighbour cascade, the skip / non-skip
+            // dispatch (with the `S()` read against
+            // `TileSegmentIdCdf[ctx]` and the `neg_deinterleave`
+            // mapping), and the §5.11.5 grid-fill of the result.
+            self.decode_segment_id(
+                decoder,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                skip,
+                last_active_seg_id,
+            )?
+        } else {
+            // §5.11.8 else-branch: `segment_id = 0` (no bits read,
+            // every block on the frame shares the single segment
+            // slot). The §5.11.5 grid-fill still stamps the
+            // footprint so downstream §5.11.9 neighbour lookups see
+            // a real `0` rather than the `-1` sentinel — matching
+            // the spec's reading of `SegmentIds[ r + y ][ c + x ] =
+            // segment_id` regardless of how `segment_id` was
+            // derived. Without this, a later frame with
+            // `segmentation_enabled == true` (rare across
+            // intra-only streams but legal) would see stale `-1`
+            // sentinels in the same `PartitionWalker`'s neighbour
+            // history; in practice each frame instantiates a fresh
+            // walker, but the spec's grid-fill semantics are
+            // upheld either way.
+            let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+            let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+            for dr in 0..bh4 {
+                let rr = mi_row + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    self.segment_ids[(rr * self.mi_cols + cc) as usize] = 0;
+                }
+            }
+            0
+        };
+
+        // §5.11.8 `Lossless = LosslessArray[ segment_id ]`. With
+        // `segment_id ∈ 0..MAX_SEGMENTS = 0..8` by construction
+        // (the §5.11.9 / spec range), the eight-entry table indexes
+        // total.
+        let lossless = lossless_array[segment_id as usize];
+        Ok((segment_id, lossless))
+    }
+
     /// `read_delta_qindex()` per §5.11.12 (av1-spec p.67) — reads the
     /// per-superblock quantiser-index delta and applies it to the
     /// running `CurrentQIndex` scalar. Updates
@@ -22860,6 +23012,368 @@ mod tests {
         // surfaces a caller-bug for out-of-range values.
         assert_eq!(
             walker.decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_4X4, 0, 8),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    // §5.11.8 intra_segment_id — round-160 dispatcher around r159
+    // decode_segment_id + §6.8.2 Lossless lookup.
+
+    /// §5.11.8 `!segmentation_enabled` branch: no `S()` read, the
+    /// grid is stamped to `0`, and `Lossless` comes from
+    /// `lossless_array[0]`. The bitstream is `0xFF` to make any
+    /// accidental read trivially observable as a non-zero position
+    /// delta.
+    #[test]
+    fn decode_intra_segment_id_segmentation_disabled_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        // lossless_array seeded so segment 0 is lossless.
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[0] = true;
+        let (sid, lossless) = walker
+            .decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* skip = */ 0,
+                /* segmentation_enabled = */ false,
+                /* last_active_seg_id = */ 0,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 0, "!segmentation_enabled ⇒ segment_id = 0");
+        assert!(lossless, "Lossless = LosslessArray[0] = true");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "!segmentation_enabled ⇒ no bits consumed",
+        );
+        // Grid-fill: the bh4*bw4 footprint of BLOCK_8X8 (2x2) at
+        // (0, 0) is stamped to 0; adjacent cells stay at -1.
+        for r in 0..2 {
+            for c in 0..2 {
+                assert_eq!(walker.segment_ids()[r * 16 + c], 0);
+            }
+        }
+        assert_eq!(walker.segment_ids()[2 * 16], -1);
+        assert_eq!(walker.segment_ids()[2], -1);
+    }
+
+    /// §5.11.8 `!segmentation_enabled` branch reports `Lossless =
+    /// false` when the segment-0 slot of the lossless table is false
+    /// (e.g. a frame with `base_q_idx != 0` or a non-zero `DeltaQ?Dc`
+    /// / `DeltaQ?Ac`). Same no-read invariant as the previous test.
+    #[test]
+    fn decode_intra_segment_id_segmentation_disabled_lossless_false() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let lossless_array = [false; MAX_SEGMENTS]; // segment 0 = false
+        let (sid, lossless) = walker
+            .decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                0,
+                false,
+                0,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 0);
+        assert!(!lossless, "LosslessArray[0] = false ⇒ Lossless = false");
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.8 `segmentation_enabled = true, skip = 1` arm — pred =
+    /// 0 at the frame origin (all neighbours unavailable) ⇒
+    /// segment_id = pred = 0; the §5.11.9 skip-short-circuit fires
+    /// inside `decode_segment_id` and no `S()` is read. The Lossless
+    /// lookup reads `lossless_array[0]`.
+    #[test]
+    fn decode_intra_segment_id_segmentation_enabled_skip_origin() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[0] = true;
+        let (sid, lossless) = walker
+            .decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* skip = */ 1,
+                /* segmentation_enabled = */ true,
+                /* last_active_seg_id = */ 7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 0, "skip ⇒ segment_id = pred = 0 at frame origin");
+        assert!(lossless, "Lossless = LosslessArray[0] = true");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "skip ⇒ decode_segment_id consumes no S() bit",
+        );
+        // Grid stamped to 0 over the BLOCK_8X8 footprint.
+        for r in 0..2 {
+            for c in 0..2 {
+                assert_eq!(walker.segment_ids()[r * 16 + c], 0);
+            }
+        }
+    }
+
+    /// §5.11.8 `segmentation_enabled = true, skip = 0` arm — descends
+    /// into `decode_segment_id`'s non-skip branch, which reads `diff
+    /// S()` and resolves `segment_id = neg_deinterleave(diff, pred,
+    /// max)`. Rig every ctx row to force `diff = 3`; `pred = 0` at
+    /// frame origin ⇒ `neg_deinterleave(3, 0, 8) = 3` (the `ref == 0`
+    /// identity branch). `lossless_array[3] = true` ⇒ `Lossless =
+    /// true`.
+    #[test]
+    fn decode_intra_segment_id_segmentation_enabled_non_skip_reads_symbol() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_segment_id_cdf(3);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[3] = true;
+        let (sid, lossless) = walker
+            .decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* skip = */ 0,
+                true,
+                7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 3, "diff = 3 with pred = 0 ⇒ segment_id = 3");
+        assert!(lossless, "LosslessArray[3] = true ⇒ Lossless = true");
+        // Grid-fill at (0, 0) BLOCK_8X8 ⇒ rows 0..2 cols 0..2 = 3.
+        for r in 0..2 {
+            for c in 0..2 {
+                assert_eq!(walker.segment_ids()[r * 16 + c], 3);
+            }
+        }
+    }
+
+    /// §5.11.8 segmentation-enabled non-skip arm Lossless lookup is
+    /// per-segment, not frame-wide. Rig `diff = 5` on every ctx ⇒
+    /// `segment_id = 5`; `lossless_array[5] = false` ⇒ `Lossless =
+    /// false` even though `lossless_array[0] = true`.
+    #[test]
+    fn decode_intra_segment_id_lossless_indexed_by_segment_id() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_segment_id_cdf(5);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mut lossless_array = [true; MAX_SEGMENTS]; // every other slot lossless
+        lossless_array[5] = false; // segment 5 specifically not lossless
+        let (sid, lossless) = walker
+            .decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                0,
+                true,
+                7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 5);
+        assert!(!lossless, "LosslessArray indexes by segment_id, not by 0",);
+    }
+
+    /// §5.11.8 grid-fill on the `!segmentation_enabled` branch clips
+    /// at the frame's bottom-right edge. A BLOCK_16X16 at (2, 2) in a
+    /// 4×4 frame has bh4 = bw4 = 4; only the in-grid 2×2 quadrant
+    /// (rows 2..4, cols 2..4) should be stamped to 0.
+    #[test]
+    fn decode_intra_segment_id_segmentation_disabled_grid_fill_clips() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+        let (sid, _) = walker
+            .decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                2,
+                2,
+                BLOCK_16X16,
+                0,
+                false,
+                0,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 0);
+        // Only rows 2..4 cols 2..4 were stamped (the bottom-right 2x2
+        // quadrant). The rest stay at the §5.11.9 -1 sentinel.
+        for r in 0..4 {
+            for c in 0..4 {
+                let cell = walker.segment_ids()[r * 4 + c];
+                if (2..4).contains(&r) && (2..4).contains(&c) {
+                    assert_eq!(cell, 0, "({r}, {c}) stamped");
+                } else {
+                    assert_eq!(cell, -1, "({r}, {c}) untouched");
+                }
+            }
+        }
+    }
+
+    /// §5.11.8 range guards fire on the `!segmentation_enabled`
+    /// branch too: out-of-range `sub_size`, `mi_row` / `mi_col` past
+    /// the frame's mi extent, and `last_active_seg_id >=
+    /// MAX_SEGMENTS` all surface `PartitionWalkOutOfRange` without
+    /// reading the bitstream.
+    #[test]
+    fn decode_intra_segment_id_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+        assert_eq!(
+            walker.decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                8,
+                0,
+                BLOCK_4X4,
+                0,
+                false,
+                0,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                8,
+                BLOCK_4X4,
+                0,
+                false,
+                0,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_SIZES,
+                0,
+                false,
+                0,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                0,
+                false,
+                /* last_active_seg_id = */ 8,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // Same guards on the segmentation_enabled = true path.
+        assert_eq!(
+            walker.decode_intra_segment_id(
+                &mut dec,
+                &mut cdfs,
+                8,
+                0,
+                BLOCK_4X4,
+                0,
+                true,
+                7,
+                &lossless_array,
+            ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
     }

@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 159)
+## Status — 2026-05-27 (round 160)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1307,6 +1307,57 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
 
+Round 160 lands the §5.11.8 **`intra_segment_id()` syntax element**
+(av1-spec p.66) as a new `PartitionWalker::decode_intra_segment_id`
+method built on top of r159's `decode_segment_id`. `intra_segment_id`
+is the intra-frame variant of the per-block segment-id read, called
+from §5.11.7 `intra_frame_mode_info` on both the `SegIdPreSkip`
+pre-skip arm and the `!SegIdPreSkip` post-skip arm. The §5.11.8 spec
+body is short — `if (segmentation_enabled) read_segment_id(); else
+segment_id = 0; Lossless = LosslessArray[segment_id]` — but the
+Lossless lookup is the first place the per-segment §6.8.2
+`LosslessArray[]` table reaches the leaf walk. The dispatch is exact:
+the `segmentation_enabled = true` arm descends into the r159
+implementation (which performs the §5.11.9 neighbour cascade, the
+skip / non-skip dispatch, the `S()` read against
+`TileSegmentIdCdf[ctx]`, the `neg_deinterleave` mapping, and the
+§5.11.5 grid-fill); the `segmentation_enabled = false` arm forces
+`segment_id = 0` without reading any bits and stamps the `bh4 * bw4`
+footprint to `0` so subsequent §5.11.9 neighbour lookups see a real
+zero rather than the `-1` sentinel. Both arms then resolve
+`Lossless = lossless_array[segment_id as usize]` from the
+caller-supplied `&[bool; MAX_SEGMENTS]` table (the §6.8.2 derivation
+the frame-header walk computes from `qindex = get_qindex(1,
+segmentId)` plus the five `DeltaQ?Dc` / `DeltaQ?Ac` offsets;
+`compute_coded_lossless` in `frame_header.rs` is the frame-wide
+conjunction, this round's table is the per-segment data the walker
+indexes by `segment_id`). The walker stays segmentation-state-free:
+callers pass `segmentation_enabled`, `last_active_seg_id`, and
+`lossless_array` per-call, mirroring the r159 pattern. Range guards
+(out-of-range `sub_size`, `mi_row` / `mi_col` past extent,
+`last_active_seg_id >= MAX_SEGMENTS`) fire on both arms so the
+no-symbol path is total over the same input space as the
+bitstream-reading path. The §5.11.18 `inter_frame_mode_info`
+top-level dispatcher (the §5.11.19 `inter_segment_id(preSkip)`
+two-call protocol) remains the next round's target. 7 new cdf-module
+tests (494 → 501): `!segmentation_enabled` no-read on a hostile
+`0xFF` buffer with `lossless_array[0] = true` and `= false` arms
+each; `segmentation_enabled = true, skip = 1` at frame origin
+(pred = 0, no `S()` consumed, grid stamped to 0, Lossless from slot
+0); `segmentation_enabled = true, skip = 0` reading `diff = 3` on a
+rigged CDF (Lossless from slot 3 = true); per-segment Lossless
+indexing (rig `diff = 5`, set `lossless_array[5] = false` while
+every other slot is `true`, expect `Lossless = false`); bottom-right
+edge clip on `BLOCK_16X16 @ (2, 2)` in a 4×4 frame on the
+`!segmentation_enabled` arm stamps only the in-grid 2×2 quadrant
+and leaves the rest at `-1`; five-way out-of-range guard
+(`mi_row >= mi_rows`, `mi_col >= mi_cols`, `sub_size ==
+BLOCK_SIZES`, `last_active_seg_id == MAX_SEGMENTS`, and the
+`segmentation_enabled = true` path also rejects bad mi-row). The
+§5.11.5 `decode_block()` body itself (coefficient / motion-vector /
+reconstruction) remains the next round's target. `decode_av1` /
+`encode_av1` continue to return `Error::NotImplemented`.
+
 Round 159 lands the §5.11.9 **`read_segment_id()` syntax element**
 (av1-spec p.66) as a new `PartitionWalker::decode_segment_id`
 method on the r158 walker, plus a `SegmentIds[r][c]` grid carried
@@ -1987,6 +2038,24 @@ observation. `decode_av1` / `encode_av1` continue to return
     tables" (`Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` — `t -> Max(w, h)`-
     sided square — and `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
     — chroma-mode default-tx-type table).
+  * **`intra_segment_id` syntax element** (round 160): §3 (the
+    `MAX_SEGMENTS = 8` upper bound that sizes the §6.8.2
+    `LosslessArray[]` table the §5.11.8 footer indexes), §5.11.7
+    (the §5.11.7 `intra_frame_mode_info` caller context — the two
+    `SegIdPreSkip` arms that each call `intra_segment_id()`),
+    §5.11.8 (the function body itself — the
+    `segmentation_enabled ⇒ read_segment_id() : segment_id = 0`
+    dispatch and the `Lossless = LosslessArray[ segment_id ]`
+    footer), §5.11.9 (the §5.11.9 `read_segment_id` body the
+    `segmentation_enabled = true` arm delegates to, including the
+    §5.11.5 grid-fill footer line `SegmentIds[ r + y ][ c + x ] =
+    segment_id` — accepted as the r159 implementation), and §6.8.2
+    (the `LosslessArray[ segmentId ] = qindex == 0 && DeltaQYDc ==
+    0 && DeltaQUAc == 0 && DeltaQUDc == 0 && DeltaQVAc == 0 &&
+    DeltaQVDc == 0` per-segment derivation that produces the
+    eight-entry table the walker indexes by `segment_id` — accepted
+    as a `&[bool; MAX_SEGMENTS]` parameter so the walker stays
+    segmentation-state-free).
   * **`read_segment_id` syntax element** (round 159): §3 (the
     `MAX_SEGMENTS = 8` upper bound capping the §5.11.9 alphabet
     and the `SEGMENT_ID_CONTEXTS = 3` constant bounding the §8.3.2

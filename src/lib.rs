@@ -1143,6 +1143,44 @@
 //!     guard. `decode_av1` / `encode_av1` continue to return
 //!     `Error::NotImplemented`.
 //!
+//!   * **Round 160.** The §5.11.8 `intra_segment_id()` syntax
+//!     element (av1-spec p.66) — the intra-frame variant of the
+//!     per-block segment-id read, called from §5.11.7
+//!     `intra_frame_mode_info` on both the `SegIdPreSkip` and
+//!     `!SegIdPreSkip` arms. Lands as a new
+//!     [`PartitionWalker::decode_intra_segment_id`] method that
+//!     dispatches on the caller-passed `segmentation_enabled` bit:
+//!     when set, descends into r159
+//!     [`PartitionWalker::decode_segment_id`] (which does the
+//!     §5.11.9 neighbour cascade + skip / non-skip dispatch + grid
+//!     fill); when clear, stamps `segment_id = 0` over the leaf's
+//!     `bh4 * bw4` footprint without reading any bits. Both arms
+//!     then resolve the §5.11.8 `Lossless = LosslessArray[
+//!     segment_id ]` lookup via a caller-supplied
+//!     `lossless_array: &[bool; MAX_SEGMENTS]` (the §6.8.2
+//!     per-segment table the frame-header walk computes from
+//!     `qindex` + `DeltaQ?Dc` + `DeltaQ?Ac`). Returns
+//!     `(segment_id, lossless)`. The walker stays
+//!     segmentation-state-free: callers pass `segmentation_enabled`,
+//!     `last_active_seg_id`, and `lossless_array` per-call (matching
+//!     the r159 pattern). Range guards (out-of-range `sub_size`,
+//!     `mi_row` / `mi_col` past the frame's mi extent,
+//!     `last_active_seg_id >= MAX_SEGMENTS`) fire on both arms so
+//!     the no-symbol path is total over the same input space as the
+//!     bitstream-reading path. 7 new cdf-module tests (494 → 501):
+//!     `segmentation_enabled = false` no-read on a hostile `0xFF`
+//!     buffer with `lossless_array[0] = true` and `= false` arms;
+//!     `segmentation_enabled = true, skip = 1` at frame origin
+//!     (pred = 0, no `S()` consumed); `segmentation_enabled = true,
+//!     skip = 0` reading `diff = 3` on a rigged CDF and looking up
+//!     `lossless_array[3]`; per-segment Lossless indexing (rig
+//!     `diff = 5`, set `lossless_array[5] = false` while every
+//!     other slot is `true`, expect `Lossless = false`);
+//!     bottom-right edge-clip on `BLOCK_16X16 @ (2, 2)` in a 4×4
+//!     frame on the `!segmentation_enabled` arm; five-way
+//!     out-of-range guard covering both arms. `decode_av1` /
+//!     `encode_av1` continue to return `Error::NotImplemented`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
