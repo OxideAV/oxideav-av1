@@ -1181,6 +1181,52 @@
 //!     out-of-range guard covering both arms. `decode_av1` /
 //!     `encode_av1` continue to return `Error::NotImplemented`.
 //!
+//!   * **Round 161.** The §5.11.7 `intra_frame_mode_info()`
+//!     **prefix dispatcher** (av1-spec p.64) — the per-block top-level
+//!     entry-point that composes the §5.11.7 first 11 lines:
+//!     `skip = 0`; conditional pre-skip `intra_segment_id()`;
+//!     `skip_mode = 0`; `read_skip()`; conditional post-skip
+//!     `intra_segment_id()`; `read_cdef()`; `read_delta_qindex()`;
+//!     `read_delta_lf()`; the fixed `ReadDeltas = 0` / `RefFrame[0]
+//!     = INTRA_FRAME` / `RefFrame[1] = NONE` assignments. Lands as
+//!     a new [`PartitionWalker::decode_intra_frame_mode_info_prefix`]
+//!     method on the r160 walker, returning the new public
+//!     [`cdf::IntraFrameModeInfoPrefix`] struct carrying every
+//!     post-call observable (`skip`, `skip_mode`, `segment_id`,
+//!     `lossless`, `cdef_idx`, `current_q_index`,
+//!     `current_delta_lf`, `ref_frame`). The §5.11.7 `SegIdPreSkip`
+//!     conditional routes the §5.11.8 call before or after the
+//!     §5.11.11 `read_skip()` per the caller-passed
+//!     `seg_id_pre_skip` boolean (the §5.9.14 trailing
+//!     derivation). `skip_mode` is fixed at `0` because the
+//!     intra-frame walk never calls `decode_skip_mode` (§5.11.10
+//!     short-circuits on `!skip_mode_present` for intra-only frames
+//!     per §5.9.21). The §6.10.4 `ReadDeltas = 0` assignment is
+//!     left to the caller (the walker remains stateless about
+//!     per-superblock first-block detection), matching the
+//!     §6.10.4 pattern existing
+//!     [`PartitionWalker::decode_delta_qindex`] /
+//!     [`PartitionWalker::decode_delta_lf`] call sites already
+//!     use. Range guards (out-of-range `sub_size`, `mi_row` /
+//!     `mi_col`, `last_active_seg_id >= MAX_SEGMENTS`, `cdef_bits >
+//!     3`) fire on the dispatcher level before any inner read so a
+//!     caller bug never produces a partial-read. 8 new cdf-module
+//!     tests (501 → 509): minimum-bit path (one `S()` consumed for
+//!     `read_skip`); `SegIdPreSkip = true` arm reading
+//!     `segment_id` first then `skip`; `SegIdPreSkip = false` arm
+//!     post-skip with `skip = 1` triggering the §5.11.9
+//!     short-circuit; seg-skip-active forcing `skip = 1` with zero
+//!     bits consumed on a hostile `0xFF` buffer; fixed
+//!     `ref_frame = [INTRA_FRAME, NONE]`; `read_deltas` true
+//!     wiring through to both `delta_q` and `delta_lf` reads;
+//!     five-way out-of-range guard; `skip_mode` always `0` on both
+//!     pre-skip arms (verifies `SkipModes[]` grid untouched). The
+//!     §5.11.7 follow-on body (`use_intrabc` arm + `intra_block_mode_info`
+//!     composite) and the §5.11.18 `inter_frame_mode_info` /
+//!     §5.11.19 `inter_segment_id` two-call protocol remain the
+//!     next round's targets. `decode_av1` / `encode_av1` continue
+//!     to return `Error::NotImplemented`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -1211,13 +1257,13 @@ pub use cdf::{
     palette_tokens_plane, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx,
     partition_subsize, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,
     split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, DecodedBlockRecord,
-    PaletteColorContext, PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext,
-    TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128,
-    BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16,
-    BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128,
-    BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8,
-    BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE,
-    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
+    IntraFrameModeInfoPrefix, PaletteColorContext, PalettePlane, PaletteTokensArgs,
+    PartitionWalker, TileCdfContext, TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT,
+    ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64,
+    BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4,
+    BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32,
+    BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS,
+    CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
     COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
     COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
     COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,

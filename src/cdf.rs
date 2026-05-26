@@ -12622,6 +12622,357 @@ impl PartitionWalker {
 
         Ok(self.current_delta_lf)
     }
+
+    /// `intra_frame_mode_info()` per §5.11.7 (av1-spec p.64–65), prefix
+    /// only — composes the per-block syntax elements
+    ///
+    /// ```text
+    ///   skip = 0
+    ///   if ( SegIdPreSkip )
+    ///       intra_segment_id( )
+    ///   skip_mode = 0
+    ///   read_skip( )
+    ///   if ( !SegIdPreSkip )
+    ///       intra_segment_id( )
+    ///   read_cdef( )
+    ///   read_delta_qindex( )
+    ///   read_delta_lf( )
+    ///   ReadDeltas = 0
+    ///   RefFrame[ 0 ] = INTRA_FRAME
+    ///   RefFrame[ 1 ] = NONE
+    /// ```
+    ///
+    /// (av1-spec p.64, the first 11 lines of `intra_frame_mode_info`)
+    /// into a single walker entry-point. The dispatcher composes
+    /// existing leaf methods in spec order: r160
+    /// [`Self::decode_intra_segment_id`] for the §5.11.8 segment-id
+    /// read (called on either the pre-skip or post-skip arm per the
+    /// §5.9.14 `SegIdPreSkip` derivation); r152 [`Self::decode_skip`]
+    /// for the §5.11.11 read; r156 [`Self::decode_cdef`] for the
+    /// §5.11.56 CDEF-index read; r154 [`Self::decode_delta_qindex`]
+    /// for the §5.11.12 quantiser delta; r155 [`Self::decode_delta_lf`]
+    /// for the §5.11.13 loop-filter deltas.
+    ///
+    /// The §5.11.7 `read_skip()` call routes through r152's
+    /// `decode_skip` with the caller-supplied `seg_skip_active` flag
+    /// (the §5.9.14 `SegIdPreSkip && seg_feature_active(SEG_LVL_SKIP)`
+    /// short-circuit that forces `skip = 1` without consuming a bit).
+    /// `skip_mode = 0` is implicit — `read_skip_mode` is never called
+    /// from the intra-frame walk (skip-mode is an inter-only
+    /// compound-reference shortcut per §5.11.10 — the
+    /// `seg_feature_active(SEG_LVL_REF_FRAME) || ... || !skip_mode_present`
+    /// guard in `read_skip_mode` always trips for an intra-only frame
+    /// because intra-only frames have `skip_mode_present == 0` per
+    /// §5.9.21). The returned [`IntraFrameModeInfoPrefix::skip_mode`]
+    /// field is therefore always `0`.
+    ///
+    /// The dispatcher returns at the `RefFrame[0] = INTRA_FRAME` /
+    /// `RefFrame[1] = NONE` assignment, which is the point where the
+    /// §5.11.7 body diverges into the `use_intrabc` arm vs. the
+    /// regular intra-mode arm (`intra_frame_y_mode S()`,
+    /// `intra_angle_info_y()`, `uv_mode S()`, …). Those follow-on
+    /// elements need symbols not yet wired through the walker
+    /// (`use_intrabc`, `intra_frame_y_mode`, `uv_mode`, etc.) and are
+    /// the topic of a later sub-round; the §5.11.22
+    /// `intra_block_mode_info` composite (3–4 sub-rounds per the
+    /// round-161 plan) covers the regular-intra arm directly.
+    ///
+    /// The §6.10.4 `ReadDeltas = 0` assignment is **not** performed
+    /// inside the dispatcher: `ReadDeltas` is the §6.10.4 tile-walk
+    /// scalar gating the delta reads, owned by the tile walk, not the
+    /// per-block walker. The dispatcher consumes the caller-passed
+    /// `read_deltas` boolean exactly once (both `decode_delta_qindex`
+    /// and `decode_delta_lf` route through it), so the spec's "reset
+    /// to 0 after the first block of the superblock" semantics are
+    /// implemented by the *caller* clearing its own `ReadDeltas`
+    /// variable to `false` on every call after the first per
+    /// superblock. This keeps the walker stateless about
+    /// per-superblock first-block detection and matches the §6.10.4
+    /// pattern already used by the existing
+    /// [`Self::decode_delta_qindex`] / [`Self::decode_delta_lf`]
+    /// call sites.
+    ///
+    /// Caller-passed arguments split into three groups:
+    ///
+    /// 1. **Per-block location**: `mi_row`, `mi_col`, `sub_size` (the
+    ///    §5.11.5 `MiSize` ordinal). Range-checked once on entry
+    ///    (`sub_size < BLOCK_SIZES`, `mi_row < MiRows`, `mi_col <
+    ///    MiCols`); each inner method re-checks for paranoia but the
+    ///    dispatcher short-circuits before any of them on a caller
+    ///    bug.
+    /// 2. **Segmentation state** (§5.9.14, walker stays state-free):
+    ///    `seg_id_pre_skip` (the `SegIdPreSkip` trailing derivation,
+    ///    boolean), `segmentation_enabled` (§5.9.14 toggle),
+    ///    `seg_skip_active` (the `seg_feature_active(SEG_LVL_SKIP)`
+    ///    short-circuit the §5.11.11 read consumes),
+    ///    `last_active_seg_id` (§5.9.14 trailing derivation),
+    ///    `lossless_array` (§6.8.2 per-segment `LosslessArray[]`).
+    /// 3. **Frame-header scalars** (§5.5.1 / §5.9.x / §6.10.4):
+    ///    `coded_lossless` (§6.8.2 frame-wide AND), `enable_cdef`
+    ///    (§5.5.2 sequence-header bit), `allow_intrabc` (§5.9.5
+    ///    frame-header bit), `cdef_bits` (§5.9.19 `f(2)`),
+    ///    `read_deltas` (§6.10.4 derivation),
+    ///    `use_128x128_superblock` (§5.5.1 sequence-header bit),
+    ///    `delta_q_res` (§5.9.17 `f(2)`), `delta_lf_present`
+    ///    (§5.9.18 frame-header bit), `delta_lf_multi` (§5.9.18
+    ///    frame-header bit), `mono_chrome` (§5.5.2 sequence-header
+    ///    `NumPlanes == 1`), `delta_lf_res` (§5.9.18 `f(2)`).
+    ///
+    /// The return [`IntraFrameModeInfoPrefix`] mirrors the §5.11.7
+    /// state the dispatcher produced. `skip` and `segment_id` carry
+    /// the §5.11.11 / §5.11.8 outputs; `lossless` carries the
+    /// §5.11.8 `Lossless = LosslessArray[segment_id]` lookup;
+    /// `cdef_idx` carries the §5.11.56 `cdef_idx` value (`-1` when
+    /// the §5.11.56 short-circuit fired and no anchor was written);
+    /// `current_q_index` and `current_delta_lf` carry the post-call
+    /// running accumulators (the walker's own state, returned for
+    /// caller observability without forcing a separate accessor
+    /// call). `ref_frame[0] = INTRA_FRAME = 0` and `ref_frame[1] =
+    /// NONE = -1` are the §5.11.7 fixed assignments.
+    ///
+    /// Returns [`Error::PartitionWalkOutOfRange`] for caller-bug
+    /// arguments (out-of-range `sub_size`, `mi_row` / `mi_col` past
+    /// the frame's mi extent, `last_active_seg_id >= MAX_SEGMENTS`,
+    /// `cdef_bits > 3`). [`Error::UnexpectedEnd`] /
+    /// [`Error::SymbolExitUnderflow`] surface bitstream errors from
+    /// any of the inner reads.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_intra_frame_mode_info_prefix(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        // Segmentation state (§5.9.14):
+        seg_id_pre_skip: bool,
+        segmentation_enabled: bool,
+        seg_skip_active: bool,
+        last_active_seg_id: u8,
+        lossless_array: &[bool; MAX_SEGMENTS],
+        // Frame-header / sequence-header scalars:
+        coded_lossless: bool,
+        enable_cdef: bool,
+        allow_intrabc: bool,
+        cdef_bits: u32,
+        read_deltas: bool,
+        use_128x128_superblock: bool,
+        delta_q_res: u8,
+        delta_lf_present: bool,
+        delta_lf_multi: bool,
+        mono_chrome: bool,
+        delta_lf_res: u8,
+    ) -> Result<IntraFrameModeInfoPrefix, crate::Error> {
+        // §5.11.7 range guards on the dispatcher level — every inner
+        // method re-checks these, but a fail-fast here keeps the
+        // dispatcher's behaviour consistent on caller bugs (no
+        // partial reads).
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if cdef_bits > 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.7 line 1: `skip = 0`. The §5.11.11 `decode_skip` call
+        // below overwrites this; the local initial value is the spec's
+        // fall-through if `decode_skip`'s seg_skip_active arm fires
+        // with a `0` (it can't — that arm always returns `1` — but the
+        // assignment matches the spec text).
+        //
+        // §5.11.7 lines 2-3: `if ( SegIdPreSkip ) intra_segment_id( )`.
+        // The pre-skip arm calls intra_segment_id BEFORE read_skip;
+        // the post-skip arm calls it AFTER. Pre-skip is the §5.9.14
+        // SegIdPreSkip derivation: any active feature j >=
+        // SEG_LVL_REF_FRAME forces it to 1.
+        //
+        // On the pre-skip arm the §5.11.9 read_segment_id is called
+        // with `skip = 0` (the §5.11.7 init); the skip short-circuit
+        // there does not fire. On the post-skip arm `skip` carries
+        // the just-decoded value.
+        let (mut segment_id, mut lossless) = (0u8, lossless_array[0]);
+        if seg_id_pre_skip {
+            let (sid, ll) = self.decode_intra_segment_id(
+                decoder,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                /* skip = */ 0,
+                segmentation_enabled,
+                last_active_seg_id,
+                lossless_array,
+            )?;
+            segment_id = sid;
+            lossless = ll;
+        }
+
+        // §5.11.7 line 4: `skip_mode = 0`. The intra-frame walk never
+        // reads `skip_mode` — §5.11.10 short-circuits to `0` for
+        // intra-only frames via the `!skip_mode_present` guard
+        // (intra-only ⇒ `skip_mode_present == 0` per §5.9.21). The
+        // walker's `SkipModes[]` grid is unchanged (the §5.11.10
+        // `decode_skip_mode` is the only writer and we don't call
+        // it from this dispatcher).
+        let skip_mode = 0u8;
+
+        // §5.11.7 line 5: `read_skip( )`. Routes through r152
+        // `decode_skip` with `seg_skip_active = SegIdPreSkip &&
+        // seg_feature_active( SEG_LVL_SKIP )`.
+        let skip = self.decode_skip(decoder, cdfs, mi_row, mi_col, sub_size, seg_skip_active)?;
+
+        // §5.11.7 lines 6-7: `if ( !SegIdPreSkip ) intra_segment_id( )`.
+        // Post-skip arm — the §5.11.9 path now sees the just-decoded
+        // `skip` value, which gates whether `S()` is consumed
+        // (skip ⇒ segment_id = pred = neighbour-derived, no bit
+        // read; !skip ⇒ `diff S()` against `TileSegmentIdCdf[ctx]`).
+        if !seg_id_pre_skip {
+            let (sid, ll) = self.decode_intra_segment_id(
+                decoder,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                skip,
+                segmentation_enabled,
+                last_active_seg_id,
+                lossless_array,
+            )?;
+            segment_id = sid;
+            lossless = ll;
+        }
+
+        // §5.11.7 line 8: `read_cdef( )`. Routes through r156
+        // `decode_cdef`; the `coded_lossless || !enable_cdef ||
+        // allow_intrabc || skip` short-circuit fires inside.
+        let cdef_idx = self.decode_cdef(
+            decoder,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip,
+            coded_lossless,
+            enable_cdef,
+            allow_intrabc,
+            cdef_bits,
+        )?;
+
+        // §5.11.7 line 9: `read_delta_qindex( )`. Routes through r154
+        // `decode_delta_qindex` with the caller-passed `ReadDeltas`
+        // flag. Updates `Self::current_q_index` in place.
+        let current_q_index = self.decode_delta_qindex(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip,
+            read_deltas,
+            use_128x128_superblock,
+            delta_q_res,
+        )?;
+
+        // §5.11.7 line 10: `read_delta_lf( )`. Routes through r155
+        // `decode_delta_lf` with the caller-passed `read_deltas` AND
+        // `delta_lf_present` gating (the spec body of
+        // `read_delta_lf` re-checks both, mirroring the §5.11.13
+        // outer condition). Updates `Self::current_delta_lf` in
+        // place.
+        let current_delta_lf = self.decode_delta_lf(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip,
+            read_deltas,
+            delta_lf_present,
+            delta_lf_multi,
+            mono_chrome,
+            use_128x128_superblock,
+            delta_lf_res,
+        )?;
+
+        // §5.11.7 lines 11-13: `ReadDeltas = 0`, `RefFrame[ 0 ] =
+        // INTRA_FRAME`, `RefFrame[ 1 ] = NONE`. `ReadDeltas` is
+        // caller-owned (see method doc) and not reset inside the
+        // walker. The two `RefFrame[*]` assignments are returned in
+        // the struct's `ref_frame` field — `INTRA_FRAME = 0` /
+        // `NONE = -1` per §6.10.1 / §3 of the spec.
+        Ok(IntraFrameModeInfoPrefix {
+            skip,
+            skip_mode,
+            segment_id,
+            lossless,
+            cdef_idx,
+            current_q_index,
+            current_delta_lf,
+            ref_frame: [0, -1],
+        })
+    }
+}
+
+/// Result of [`PartitionWalker::decode_intra_frame_mode_info_prefix`]
+/// — the per-block state §5.11.7 produces through the
+/// `read_delta_lf( )` line. Carries the outputs of the composed leaf
+/// methods (`skip`, `skip_mode`, `segment_id`, `Lossless`, `cdef_idx`)
+/// plus the running quantiser-index / loop-filter-delta accumulators
+/// the walker updated in place. The §5.11.7 trailing assignments
+/// (`RefFrame[ 0 ] = INTRA_FRAME`, `RefFrame[ 1 ] = NONE`) are
+/// surfaced as the `ref_frame` field.
+///
+/// Field semantics align one-to-one with §5.11.7 / §5.11.8 / §5.11.11
+/// / §5.11.56 / §5.11.12 / §5.11.13:
+///
+/// * `skip` — §5.11.11 / §5.11.5 `Skips[r][c]`. `0` or `1`.
+/// * `skip_mode` — §5.11.7 line 4 fixed at `0` for the intra-frame
+///   walk (§5.11.10 short-circuits on `!skip_mode_present`).
+/// * `segment_id` — §5.11.8 / §5.11.9 `SegmentIds[r][c]`. In
+///   `0..MAX_SEGMENTS = 0..8`.
+/// * `lossless` — §5.11.8 `Lossless = LosslessArray[ segment_id ]`.
+/// * `cdef_idx` — §5.11.56 / §5.11.55 `cdef_idx[r][c]`. `-1` when the
+///   §5.11.56 short-circuit fires (skip / coded-lossless /
+///   !enable_cdef / allow_intrabc) and the 64×64 anchor has not been
+///   stamped yet by an earlier leaf.
+/// * `current_q_index` — §5.11.12 `CurrentQIndex` after the call.
+/// * `current_delta_lf` — §5.11.13 `DeltaLF[ .. ]` row after the call.
+/// * `ref_frame` — §5.11.7 `RefFrame[ 0..2 ]` = `[INTRA_FRAME, NONE]`
+///   = `[0, -1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntraFrameModeInfoPrefix {
+    /// `Skips[r][c]` post-§5.11.11. `0` or `1`.
+    pub skip: u8,
+    /// `SkipModes[r][c]` post-§5.11.10. Always `0` for the
+    /// intra-frame walk (no `decode_skip_mode` call from this
+    /// dispatcher).
+    pub skip_mode: u8,
+    /// `SegmentIds[r][c]` post-§5.11.9 (whichever §5.11.7 arm fired).
+    /// In `0..MAX_SEGMENTS = 0..8`.
+    pub segment_id: u8,
+    /// `Lossless = LosslessArray[ segment_id ]` per §5.11.8.
+    pub lossless: bool,
+    /// `cdef_idx[r][c]` post-§5.11.56. `-1` when the §5.11.56
+    /// short-circuit fired and no anchor was written.
+    pub cdef_idx: i8,
+    /// `CurrentQIndex` post-§5.11.12 (running accumulator).
+    pub current_q_index: i32,
+    /// `DeltaLF[ .. ]` row post-§5.11.13 (running accumulator).
+    pub current_delta_lf: [i32; FRAME_LF_COUNT],
+    /// §5.11.7 `RefFrame[ 0..2 ]` = `[INTRA_FRAME, NONE]` = `[0, -1]`.
+    /// Fixed by spec — intra-frame mode info always sets these to
+    /// `INTRA_FRAME` / `NONE` regardless of the `use_intrabc`
+    /// follow-on element.
+    pub ref_frame: [i8; 2],
 }
 
 #[cfg(test)]
@@ -23376,5 +23727,557 @@ mod tests {
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
+    }
+
+    // ------------------------------------------------------------
+    // §5.11.7 `decode_intra_frame_mode_info_prefix` dispatcher tests
+    // ------------------------------------------------------------
+
+    /// §5.11.7 baseline: segmentation disabled + CDEF allowed but
+    /// `cdef_bits = 0` + `read_deltas = false` + `delta_lf_present =
+    /// false`. None of the composed reads consumes a bit (skip uses
+    /// a normal `S()` but its ctx-0 cdf forces it through a real
+    /// read — we instead suppress it via the seg-skip short-circuit
+    /// in a sibling test). For this test we rig the §5.11.11 skip
+    /// cdf to force `skip = 0`, then verify every other field
+    /// short-circuits in the expected place.
+    ///
+    /// This is the minimum-bit path: only the §5.11.11 `S()` is
+    /// consumed (a single 2-symbol read).
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_minimum_path() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        // Rig only the §5.11.11 skip cdf — every other inner method
+        // short-circuits via its caller-passed gates and reads zero
+        // bits. Forcing symbol 0 means `skip = 0`.
+        let rigged_skip = force_binary_cdf(0);
+        for ctx_idx in 0..SKIP_CONTEXTS {
+            cdfs.skip[ctx_idx] = rigged_skip;
+        }
+
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+
+        let prefix = walker
+            .decode_intra_frame_mode_info_prefix(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                BLOCK_8X8,
+                /* seg_id_pre_skip = */ false,
+                /* segmentation_enabled = */ false,
+                /* seg_skip_active = */ false,
+                /* last_active_seg_id = */ 0,
+                &lossless_array,
+                /* coded_lossless = */ false,
+                /* enable_cdef = */ true,
+                /* allow_intrabc = */ false,
+                /* cdef_bits = */ 0,
+                /* read_deltas = */ false,
+                /* use_128x128_superblock = */ false,
+                /* delta_q_res = */ 0,
+                /* delta_lf_present = */ false,
+                /* delta_lf_multi = */ false,
+                /* mono_chrome = */ false,
+                /* delta_lf_res = */ 0,
+            )
+            .unwrap();
+
+        // §5.11.11 fired; rigged cdf returned 0.
+        assert_eq!(prefix.skip, 0);
+        // §5.11.7 line 4: intra-frame walk never sets skip_mode.
+        assert_eq!(prefix.skip_mode, 0);
+        // !segmentation_enabled ⇒ segment_id forced to 0.
+        assert_eq!(prefix.segment_id, 0);
+        // lossless_array[0] = false ⇒ Lossless = false.
+        assert!(!prefix.lossless);
+        // §5.11.56: skip=0 short-circuit doesn't fire, but
+        // cdef_bits=0 ⇒ L(0) returns 0 and the anchor is stamped
+        // with 0.
+        assert_eq!(prefix.cdef_idx, 0);
+        // read_deltas = false ⇒ no delta_qindex / delta_lf read;
+        // accumulators stay at their construction defaults (0 / [0;4]).
+        assert_eq!(prefix.current_q_index, 0);
+        assert_eq!(prefix.current_delta_lf, [0; FRAME_LF_COUNT]);
+        // §5.11.7 fixed RefFrame assignments.
+        assert_eq!(prefix.ref_frame, [0, -1]);
+
+        // Grids stamped over the BLOCK_8X8 footprint (2×2 at (0,0)).
+        for r in 0..2 {
+            for c in 0..2 {
+                assert_eq!(walker.skips()[r * 16 + c], 0);
+                assert_eq!(walker.segment_ids()[r * 16 + c], 0);
+            }
+        }
+    }
+
+    /// §5.11.7 `SegIdPreSkip = true` arm: `intra_segment_id` is
+    /// called BEFORE `read_skip` with `skip = 0` (the §5.11.7 line-1
+    /// init). With segmentation enabled the §5.11.9 non-skip path
+    /// fires, reading a `diff` symbol against
+    /// `TileSegmentIdCdf[ctx]`. Then `read_skip` reads its own bit.
+    /// Verifies the ordering by checking the bitstream position after
+    /// both reads — the pre-skip arm reads `segment_id` first, then
+    /// `skip`.
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_pre_skip_arm_reads_segment_first() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        // Rig the §5.11.9 segment_id cdf to force diff = 2 on every
+        // ctx; pred = 0 at frame origin ⇒ segment_id = 2.
+        let rigged_seg = force_segment_id_cdf(2);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged_seg;
+        }
+        // Rig §5.11.11 skip cdf to force symbol 1 (skip = 1).
+        let rigged_skip = force_binary_cdf(1);
+        for ctx_idx in 0..SKIP_CONTEXTS {
+            cdfs.skip[ctx_idx] = rigged_skip;
+        }
+
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[2] = true;
+
+        let prefix = walker
+            .decode_intra_frame_mode_info_prefix(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* seg_id_pre_skip = */ true,
+                /* segmentation_enabled = */ true,
+                /* seg_skip_active = */ false,
+                /* last_active_seg_id = */ 7,
+                &lossless_array,
+                /* coded_lossless = */ false,
+                /* enable_cdef = */ true,
+                /* allow_intrabc = */ false,
+                /* cdef_bits = */ 0,
+                /* read_deltas = */ false,
+                /* use_128x128_superblock = */ false,
+                /* delta_q_res = */ 0,
+                /* delta_lf_present = */ false,
+                /* delta_lf_multi = */ false,
+                /* mono_chrome = */ false,
+                /* delta_lf_res = */ 0,
+            )
+            .unwrap();
+
+        // segment_id read first (in the pre-skip arm), then skip.
+        assert_eq!(prefix.segment_id, 2, "diff=2, pred=0 ⇒ segment_id=2");
+        assert!(prefix.lossless, "lossless_array[2] = true");
+        assert_eq!(prefix.skip, 1, "rigged skip cdf forces symbol 1");
+        // skip didn't trigger the cdef short-circuit because
+        // enable_cdef=true and cdef_bits=0, so the anchor was
+        // stamped with the L(0)=0 read. But the §5.11.56 spec also
+        // short-circuits on skip != 0 — verify cdef_idx is the
+        // pre-existing -1 sentinel from §5.11.55.
+        assert_eq!(
+            prefix.cdef_idx, -1,
+            "skip != 0 ⇒ §5.11.56 short-circuit returns the -1 sentinel"
+        );
+    }
+
+    /// §5.11.7 `SegIdPreSkip = false` arm: `read_skip` fires first,
+    /// then `intra_segment_id` with the just-decoded `skip`. When
+    /// `skip = 1` the §5.11.9 skip-short-circuit fires
+    /// (`segment_id = pred` with no `S()` consumed).
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_post_skip_arm_segment_after_skip() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        // Rig §5.11.11 skip cdf to force symbol 1.
+        let rigged_skip = force_binary_cdf(1);
+        for ctx_idx in 0..SKIP_CONTEXTS {
+            cdfs.skip[ctx_idx] = rigged_skip;
+        }
+
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[0] = true; // pred = 0 at origin ⇒ segment 0
+
+        let prefix = walker
+            .decode_intra_frame_mode_info_prefix(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* seg_id_pre_skip = */ false,
+                /* segmentation_enabled = */ true,
+                /* seg_skip_active = */ false,
+                /* last_active_seg_id = */ 7,
+                &lossless_array,
+                /* coded_lossless = */ false,
+                /* enable_cdef = */ true,
+                /* allow_intrabc = */ false,
+                /* cdef_bits = */ 0,
+                /* read_deltas = */ false,
+                /* use_128x128_superblock = */ false,
+                /* delta_q_res = */ 0,
+                /* delta_lf_present = */ false,
+                /* delta_lf_multi = */ false,
+                /* mono_chrome = */ false,
+                /* delta_lf_res = */ 0,
+            )
+            .unwrap();
+
+        assert_eq!(prefix.skip, 1);
+        // skip = 1 ⇒ §5.11.9 short-circuit: segment_id = pred = 0
+        // at frame origin (no neighbours).
+        assert_eq!(prefix.segment_id, 0);
+        assert!(prefix.lossless, "lossless_array[0] = true");
+    }
+
+    /// §5.11.7 with seg-skip-active: `read_skip` short-circuits to
+    /// `skip = 1` without reading any bit (the §5.11.11 outer arm).
+    /// On the pre-skip arm the §5.11.9 `S()` still fires because the
+    /// pre-skip arm passes `skip = 0` to `decode_intra_segment_id`.
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_seg_skip_active_no_skip_bit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let lossless_array = [false; MAX_SEGMENTS];
+
+        let prefix = walker
+            .decode_intra_frame_mode_info_prefix(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* seg_id_pre_skip = */ false, // post-skip, but irrelevant
+                /* segmentation_enabled = */ false,
+                /* seg_skip_active = */ true,
+                /* last_active_seg_id = */ 0,
+                &lossless_array,
+                /* coded_lossless = */ false,
+                /* enable_cdef = */ false, // short-circuit cdef
+                /* allow_intrabc = */ false,
+                /* cdef_bits = */ 0,
+                /* read_deltas = */ false,
+                /* use_128x128_superblock = */ false,
+                /* delta_q_res = */ 0,
+                /* delta_lf_present = */ false,
+                /* delta_lf_multi = */ false,
+                /* mono_chrome = */ false,
+                /* delta_lf_res = */ 0,
+            )
+            .unwrap();
+
+        assert_eq!(prefix.skip, 1, "seg_skip_active ⇒ skip = 1");
+        assert_eq!(prefix.segment_id, 0);
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no bits consumed on the seg-skip + no-cdef path",
+        );
+        // §5.11.56 short-circuit returned the pre-existing -1
+        // sentinel (skip=1 and !enable_cdef both fire).
+        assert_eq!(prefix.cdef_idx, -1);
+    }
+
+    /// §5.11.7 prefix returns the §5.11.7 `RefFrame[0..2]` =
+    /// `[INTRA_FRAME, NONE]` = `[0, -1]` regardless of path taken.
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_ref_frame_fixed() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let lossless_array = [true; MAX_SEGMENTS];
+
+        let prefix = walker
+            .decode_intra_frame_mode_info_prefix(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                false,
+                false,
+                /* seg_skip_active = */ true,
+                0,
+                &lossless_array,
+                false,
+                false,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(prefix.ref_frame, [0, -1]);
+    }
+
+    /// §5.11.7 with `read_deltas = true` + `delta_lf_present = true`
+    /// drives the delta_qindex and delta_lf reads. Rig the
+    /// `delta_q_abs` cdf to force `0` (one `S()` read, no escape, no
+    /// sign bit ⇒ `CurrentQIndex` unchanged). Rig `delta_lf_abs` cdf
+    /// likewise. With base accumulators at `0`, the post-call values
+    /// stay at `0`.
+    ///
+    /// Verifies that read_deltas-true wires through to BOTH reads.
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_read_deltas_routes_through() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        // Rig skip cdf to force 0 (so delta_q / delta_lf paths fire;
+        // sub_size != sbSize anyway so they would too, but this
+        // keeps the path explicit).
+        let rigged_skip = force_binary_cdf(0);
+        for ctx_idx in 0..SKIP_CONTEXTS {
+            cdfs.skip[ctx_idx] = rigged_skip;
+        }
+        // Rig delta_q cdf to force symbol 0 (no escape, no sign bit
+        // ⇒ delta_q_abs = 0 ⇒ CurrentQIndex unchanged).
+        let mut rigged_delta_q = [0u16; DELTA_Q_SMALL + 2];
+        for slot in rigged_delta_q.iter_mut().take(DELTA_Q_SMALL + 1) {
+            *slot = 1 << 15;
+        }
+        cdfs.delta_q = rigged_delta_q;
+        // Same for delta_lf.
+        let mut rigged_delta_lf = [0u16; DELTA_LF_SMALL + 2];
+        for slot in rigged_delta_lf.iter_mut().take(DELTA_LF_SMALL + 1) {
+            *slot = 1 << 15;
+        }
+        cdfs.delta_lf = rigged_delta_lf;
+
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+
+        let pos_before = dec.position();
+        let prefix = walker
+            .decode_intra_frame_mode_info_prefix(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                false,
+                false,
+                false,
+                0,
+                &lossless_array,
+                false,
+                false,
+                false,
+                0,
+                /* read_deltas = */ true,
+                false,
+                /* delta_q_res = */ 0,
+                /* delta_lf_present = */ true,
+                /* delta_lf_multi = */ false,
+                false,
+                /* delta_lf_res = */ 0,
+            )
+            .unwrap();
+
+        assert_eq!(prefix.current_q_index, 0, "delta_q_abs = 0 ⇒ no change");
+        assert_eq!(
+            prefix.current_delta_lf, [0; FRAME_LF_COUNT],
+            "delta_lf_abs = 0 ⇒ no change",
+        );
+        // Three S() reads happened (skip + delta_q + delta_lf); the
+        // exact bit count depends on the decoder geometry but the
+        // position must have advanced at least 1.
+        assert!(dec.position() > pos_before, "S() reads advanced position");
+    }
+
+    /// §5.11.7 range guards on the dispatcher level fire before any
+    /// inner method is called. Checks out-of-range mi_row, mi_col,
+    /// sub_size, last_active_seg_id, and cdef_bits.
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+
+        let call_with = |walker: &mut PartitionWalker,
+                         dec: &mut SymbolDecoder<'_>,
+                         cdfs: &mut TileCdfContext,
+                         mi_row: u32,
+                         mi_col: u32,
+                         sub_size: usize,
+                         last_active_seg_id: u8,
+                         cdef_bits: u32|
+         -> Result<IntraFrameModeInfoPrefix, crate::Error> {
+            walker.decode_intra_frame_mode_info_prefix(
+                dec,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                false,
+                false,
+                false,
+                last_active_seg_id,
+                &lossless_array,
+                false,
+                false,
+                false,
+                cdef_bits,
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                0,
+            )
+        };
+
+        assert_eq!(
+            call_with(&mut walker, &mut dec, &mut cdfs, 8, 0, BLOCK_4X4, 0, 0),
+            Err(crate::Error::PartitionWalkOutOfRange),
+            "mi_row >= MiRows",
+        );
+        assert_eq!(
+            call_with(&mut walker, &mut dec, &mut cdfs, 0, 8, BLOCK_4X4, 0, 0),
+            Err(crate::Error::PartitionWalkOutOfRange),
+            "mi_col >= MiCols",
+        );
+        assert_eq!(
+            call_with(&mut walker, &mut dec, &mut cdfs, 0, 0, BLOCK_SIZES, 0, 0),
+            Err(crate::Error::PartitionWalkOutOfRange),
+            "sub_size >= BLOCK_SIZES",
+        );
+        assert_eq!(
+            call_with(&mut walker, &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, 8, 0),
+            Err(crate::Error::PartitionWalkOutOfRange),
+            "last_active_seg_id >= MAX_SEGMENTS",
+        );
+        assert_eq!(
+            call_with(&mut walker, &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, 0, 4),
+            Err(crate::Error::PartitionWalkOutOfRange),
+            "cdef_bits > 3",
+        );
+    }
+
+    /// §5.11.7 verifies that on the pre-skip arm with
+    /// `segmentation_enabled = false` and `seg_skip_active = false`,
+    /// the §5.11.8 no-bit path is taken for segment_id, then
+    /// `read_skip` reads its `S()` bit. Validates ordering by
+    /// confirming the skip cdf adapted (was read) but the segment_id
+    /// cdf did not.
+    #[test]
+    fn decode_intra_frame_mode_info_prefix_skip_mode_field_always_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        let rigged_skip = force_binary_cdf(0);
+        for ctx_idx in 0..SKIP_CONTEXTS {
+            cdfs.skip[ctx_idx] = rigged_skip;
+        }
+        let bytes = [0u8; 8];
+        let lossless_array = [false; MAX_SEGMENTS];
+
+        // Both arms (pre-skip and post-skip) — skip_mode is always 0
+        // in either path because the dispatcher never calls
+        // `decode_skip_mode`. SkipModes[] grid stays at its
+        // construction default.
+        for &pre_skip in &[true, false] {
+            let mut walker_local = PartitionWalker::new(16, 16, geom).unwrap();
+            let mut dec_local = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+            let prefix = walker_local
+                .decode_intra_frame_mode_info_prefix(
+                    &mut dec_local,
+                    &mut cdfs,
+                    0,
+                    0,
+                    BLOCK_8X8,
+                    pre_skip,
+                    /* segmentation_enabled = */ false,
+                    /* seg_skip_active = */ false,
+                    0,
+                    &lossless_array,
+                    false,
+                    true,
+                    false,
+                    0,
+                    false,
+                    false,
+                    0,
+                    false,
+                    false,
+                    false,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(prefix.skip_mode, 0);
+            // §5.11.7 line 4 left SkipModes[] untouched.
+            assert_eq!(walker_local.skip_modes()[0], 0, "SkipModes[0][0] = 0");
+        }
     }
 }

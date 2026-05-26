@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 160)
+## Status — 2026-05-27 (round 161)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,58 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 161 lands the §5.11.7 **`intra_frame_mode_info()` prefix
+dispatcher** (av1-spec p.64) as a new
+`PartitionWalker::decode_intra_frame_mode_info_prefix` method
+composing the first 11 lines of the §5.11.7 spec body into a single
+walker entry-point. The dispatcher fires the §5.11.7 sequence in
+exact spec order: `skip = 0`; conditional pre-skip
+`intra_segment_id()` (r160); `skip_mode = 0`; `read_skip()` (r152);
+conditional post-skip `intra_segment_id()`; `read_cdef()` (r156);
+`read_delta_qindex()` (r154); `read_delta_lf()` (r155); the fixed
+`RefFrame[0] = INTRA_FRAME` / `RefFrame[1] = NONE` trailing
+assignments. Returns a new public `IntraFrameModeInfoPrefix` struct
+carrying every post-call observable: `skip`, `skip_mode`,
+`segment_id`, `lossless`, `cdef_idx`, `current_q_index`,
+`current_delta_lf`, `ref_frame`. The §5.11.7 `SegIdPreSkip`
+conditional routes the §5.11.8 call before or after the §5.11.11
+`read_skip()` per the caller-passed `seg_id_pre_skip` boolean (the
+§5.9.14 trailing derivation surfaced as
+`SegmentationParams::seg_id_pre_skip`). `skip_mode` is fixed at `0`
+because the intra-frame walk never calls `decode_skip_mode` —
+§5.11.10 short-circuits on `!skip_mode_present` (intra-only frames
+have `skip_mode_present == 0` per §5.9.21). The §6.10.4 `ReadDeltas
+= 0` assignment on the spec's line 11 is left to the caller (the
+walker stays stateless about per-superblock first-block detection),
+matching the §6.10.4 pattern existing `decode_delta_qindex` /
+`decode_delta_lf` call sites already use. Range guards (`sub_size >=
+BLOCK_SIZES`, `mi_row >= MiRows`, `mi_col >= MiCols`,
+`last_active_seg_id >= MAX_SEGMENTS`, `cdef_bits > 3`) fire on the
+dispatcher level before any inner read so a caller bug never
+produces a partial-read. 8 new cdf-module tests (501 → 509):
+minimum-bit path (only the §5.11.11 `S()` consumed, every other
+field short-circuits); `SegIdPreSkip = true` arm reads `segment_id`
+(diff = 2 against rigged cdf) before `skip` (forced 1) and the
+§5.11.56 `cdef_idx = -1` sentinel survives the skip short-circuit;
+`SegIdPreSkip = false` arm post-skip with `skip = 1` triggers the
+§5.11.9 short-circuit (`segment_id = pred = 0`, no bit consumed);
+seg-skip-active path forces `skip = 1` with zero bits consumed on a
+hostile `0xFF` buffer; `ref_frame = [INTRA_FRAME, NONE] = [0, -1]`
+regardless of path taken; `read_deltas = true` + `delta_lf_present
+= true` wires through to both delta reads (rigged `delta_q_abs = 0`
+/ `delta_lf_abs = 0` ⇒ accumulators unchanged but the `S()` reads
+advance the decoder); five-way out-of-range guard on `mi_row`,
+`mi_col`, `sub_size`, `last_active_seg_id`, `cdef_bits`;
+`skip_mode = 0` on both pre-skip arms (verifies the dispatcher
+never calls `decode_skip_mode` and `SkipModes[]` stays untouched).
+The §5.11.7 follow-on body (`use_intrabc` arm + the §5.11.22
+`intra_block_mode_info` composite — `intra_frame_y_mode`,
+`intra_angle_info_y`, `uv_mode`, `intra_angle_info_uv`,
+`palette_mode_info`, `filter_intra_mode_info`) and the §5.11.18
+`inter_frame_mode_info` / §5.11.19 `inter_segment_id` two-call
+protocol remain the next round's targets. `decode_av1` /
+`encode_av1` continue to return `Error::NotImplemented`.
 
 Round 160 lands the §5.11.8 **`intra_segment_id()` syntax element**
 (av1-spec p.66) as a new `PartitionWalker::decode_intra_segment_id`
