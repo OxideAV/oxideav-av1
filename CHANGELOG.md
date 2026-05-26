@@ -6,6 +6,41 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 149 — §5.11.49 caller-side argument derivation.** Lands the
+  `palette_tokens_args(mi_size, mi_row, mi_col, mi_rows, mi_cols,
+  plane, subsampling_x, subsampling_y) -> Option<PaletteTokensArgs>`
+  helper (av1-spec p.101–102) that computes the four
+  [`palette_tokens_plane`] size arguments straight from the §5.11.49
+  parser-scope variables. Y branch returns the §9.3-driven
+  `block_{w,h}` clipped by `Min(.., (MiRows - MiRow) * MI_SIZE)` /
+  `Min(.., (MiCols - MiCol) * MI_SIZE)`; UV branch then applies the
+  `>> subsampling_{x,y}` shift followed by the §5.11.49 `<4`-bump
+  (`block_w += 2; onscreen_w += 2` when post-shift `block_w < 4`,
+  ditto height). The new [`PaletteTokensArgs`] struct holds the four
+  resolved dimensions and the §5.11.46 palette-gate constant
+  [`BLOCK_8X8`] (`3`) is exposed for caller-side gating. The helper
+  returns `None` for any §5.11.46 palette-gate violation (`mi_size <
+  BLOCK_8X8`, `block_w > 64`, `block_h > 64`, `mi_size >=
+  BLOCK_SIZES`), out-of-bounds `mi_row` / `mi_col`, zero mi-grid, or
+  out-of-range subsampling flag, so the helper is safe to call
+  defensively from a not-yet-gated caller. Walker invariants (`1 <=
+  onscreen_* <= block_*`, `block_* <= 64`) proven over every
+  palette-eligible `(MiSize, sub_x, sub_y, plane)` combination via
+  an exhaustive sweep test. End-to-end shape test feeds the helper's
+  output straight into [`palette_tokens_plane`] against the §9.4
+  default palette CDFs and confirms `InvalidPaletteWalkArgs` never
+  fires, sealing the data-flow gap pinned by the r147 follow-up
+  test `palette_tokens_args_from_mi_size_pins_data_flow`.
+  `read_block` can now call `palette_tokens` directly once the
+  parser surfaces the variables. Tests grow by 15 (cdf module):
+  `BLOCK_8X8`-row pinning; Y-plane fully-on-screen / right-edge /
+  bottom-edge clipping; UV 4:2:0 minimum block, large block, width-
+  `<4`-bump, height-`<4`-bump; UV 4:2:2 shape; UV 4:4:4 = Y
+  identity; UV right-edge clip carry-through; the exhaustive
+  invariant sweep; palette-gate rejections; caller-bug rejections;
+  and the walker-fed end-to-end shape. Tests: 344 -> 359, zero
+  `#[ignore]`.
+
 * **Round 148 — §9.3 block-size conversion tables.** Stages the four
   `BLOCK_SIZES`-indexed lookup tables that convert a `MiSize` into
   block dimensions (av1-spec p.400–401): [`MI_WIDTH_LOG2`],

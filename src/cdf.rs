@@ -762,6 +762,196 @@ pub const fn mi_height_log2(mi_size: usize) -> usize {
     MI_HEIGHT_LOG2[mi_size]
 }
 
+// ---------------------------------------------------------------------
+// Round 149 — §5.11.49 caller-side argument derivation.
+// Computes the four `palette_tokens_plane` size arguments
+// (`block_w`, `block_h`, `onscreen_w`, `onscreen_h`) from the parser-
+// scope variables (`MiSize`, `MiRow`, `MiCol`, `MiRows`, `MiCols`,
+// `subsampling_{x,y}`) using only the §9.3 block-size tables staged
+// in r148 and the §5.11.49 spec text (av1-spec p.101-102). Bridges the
+// data-flow gap pinned by the r147 follow-up test
+// `palette_tokens_args_from_mi_size_pins_data_flow`: the r147 walker
+// took fully-derived sizes; this round stages the derivation itself so
+// `read_block` can call `palette_tokens` directly once the parser
+// surfaces the variables.
+// ---------------------------------------------------------------------
+
+/// `BLOCK_8X8` (§3 / §9.3 enumeration) — the smallest `MiSize` whose
+/// block is `8` luma samples on a side. Numerically `3` in the spec's
+/// `BLOCK_SIZES` enumeration (`BLOCK_4X4 = 0`, `BLOCK_4X8 = 1`,
+/// `BLOCK_8X4 = 2`, `BLOCK_8X8 = 3`); this matches the entry-`3` row
+/// of every §9.3 table (`MI_WIDTH_LOG2[3] = MI_HEIGHT_LOG2[3] = 1`,
+/// `NUM_4X4_BLOCKS_WIDE[3] = NUM_4X4_BLOCKS_HIGH[3] = 2`,
+/// `block_width(3) = block_height(3) = 8`).
+///
+/// Used as the §5.11.46 palette gate (`MiSize >= BLOCK_8X8 &&
+/// Block_Width[MiSize] <= 64 && Block_Height[MiSize] <= 64`) — both
+/// `palette_mode_info` call sites (av1-spec p.4171 / p.4605) read it.
+/// The `>=` comparison is on the spec enum's numeric ordering, so the
+/// gate also admits the extended block sizes (`BLOCK_4X16` through
+/// `BLOCK_64X16`, indices 16..=21); the per-plane `<4`-bump branch in
+/// §5.11.49 catches the post-subsampling dimensions that the extended
+/// sizes can drop below `4`.
+pub const BLOCK_8X8: usize = 3;
+
+/// §5.11.49 palette-tokens size arguments — the four dimensions a
+/// conformant `palette_tokens( )` caller passes to
+/// [`palette_tokens_plane`] for one plane.
+///
+/// Derived by [`palette_tokens_args`] from the parser-scope variables
+/// per §5.11.49:
+///
+/// ```text
+///   blockHeight     = Block_Height[ MiSize ]
+///   blockWidth      = Block_Width[ MiSize ]
+///   onscreenHeight  = Min( blockHeight, (MiRows - MiRow) * MI_SIZE )
+///   onscreenWidth   = Min( blockWidth,  (MiCols - MiCol) * MI_SIZE )
+/// ```
+///
+/// For the UV plane the spec then applies the §5.11.49 subsampling +
+/// `<4`-bump adjustment:
+///
+/// ```text
+///   blockHeight    >>= subsampling_y
+///   blockWidth     >>= subsampling_x
+///   onscreenHeight >>= subsampling_y
+///   onscreenWidth  >>= subsampling_x
+///   if ( blockWidth  < 4 ) { blockWidth  += 2; onscreenWidth  += 2 }
+///   if ( blockHeight < 4 ) { blockHeight += 2; onscreenHeight += 2 }
+/// ```
+///
+/// The fields satisfy `1 <= onscreen_w <= block_w` and
+/// `1 <= onscreen_h <= block_h` (both equal-bound when the block sits
+/// entirely on-screen; strict-less when the block straddles the
+/// frame's right / bottom edge). The bump preserves these invariants
+/// because it adds the same `2` to both `block_*` and `onscreen_*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaletteTokensArgs {
+    /// `blockWidth` (post-subsampling, post-bump if applicable).
+    pub block_w: usize,
+    /// `blockHeight` (post-subsampling, post-bump if applicable).
+    pub block_h: usize,
+    /// `onscreenWidth` (post-subsampling, post-bump if applicable).
+    pub onscreen_w: usize,
+    /// `onscreenHeight` (post-subsampling, post-bump if applicable).
+    pub onscreen_h: usize,
+}
+
+/// §5.11.49 caller-side derivation: computes the four
+/// [`PaletteTokensArgs`] dimensions from the parser-scope variables.
+///
+/// Parameters:
+///
+/// * `mi_size` — the §5.11.x `MiSize` (a `BLOCK_SIZES` index). The
+///   helper returns `None` if the §5.11.46 palette gate would have
+///   rejected this block — specifically when `mi_size < BLOCK_8X8` or
+///   when `Block_Width[mi_size] > 64` or `Block_Height[mi_size] > 64`.
+///   A conformant caller has already evaluated the gate, but returning
+///   `None` keeps the helper safe to call defensively.
+/// * `mi_row` / `mi_col` — the block's top-left position in the
+///   mode-info grid (`0..MiRows`, `0..MiCols`).
+/// * `mi_rows` / `mi_cols` — the frame's mode-info grid size per
+///   §5.9.9 (`MiRows = 2 * ((FrameHeight + 7) >> 3)`, similarly for
+///   `MiCols`). Both are positive for a frame with any decode work.
+/// * `plane` — see [`PalettePlane`]. The Y branch returns the four
+///   `Block_*` / `onscreen*` values as-is; the UV branch applies the
+///   §5.11.49 `>> subsampling_{x,y}` + `<4`-bump adjustment.
+/// * `subsampling_x` / `subsampling_y` — the §5.7.2 `subsampling_*`
+///   flags (each `0` or `1`). Ignored on the Y path.
+///
+/// Returns `None` when:
+///
+/// * `mi_size >= BLOCK_SIZES` (caller bug, would index out of the
+///   §9.3 tables).
+/// * `mi_size < BLOCK_8X8` or `Block_Width[mi_size] > 64` or
+///   `Block_Height[mi_size] > 64` (palette gate violation).
+/// * `mi_row >= mi_rows` or `mi_col >= mi_cols` or `mi_rows == 0`
+///   or `mi_cols == 0` (caller bug, would produce a zero on-screen
+///   dimension).
+/// * `subsampling_x > 1` or `subsampling_y > 1` (only the values `0`
+///   and `1` are defined by §5.7.2).
+///
+/// On success the returned [`PaletteTokensArgs`] feeds the
+/// [`palette_tokens_plane`] caller for the matching plane verbatim.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn palette_tokens_args(
+    mi_size: usize,
+    mi_row: usize,
+    mi_col: usize,
+    mi_rows: usize,
+    mi_cols: usize,
+    plane: PalettePlane,
+    subsampling_x: usize,
+    subsampling_y: usize,
+) -> Option<PaletteTokensArgs> {
+    if mi_size >= BLOCK_SIZES {
+        return None;
+    }
+    if mi_size < BLOCK_8X8 {
+        return None;
+    }
+    if mi_rows == 0 || mi_cols == 0 {
+        return None;
+    }
+    if mi_row >= mi_rows || mi_col >= mi_cols {
+        return None;
+    }
+    if subsampling_x > 1 || subsampling_y > 1 {
+        return None;
+    }
+
+    // §5.11.49 base derivation, identical for both planes.
+    let block_w_luma = block_width(mi_size);
+    let block_h_luma = block_height(mi_size);
+    // §5.11.46 palette gate: both block dimensions in luma samples must
+    // be <= 64. Belt-and-braces with `mi_size < BLOCK_SIZES`.
+    if block_w_luma > 64 || block_h_luma > 64 {
+        return None;
+    }
+
+    // (MiRows - MiRow) * MI_SIZE and (MiCols - MiCol) * MI_SIZE are
+    // both >= MI_SIZE = 4 here, since the bounds-check above guarantees
+    // mi_row < mi_rows and mi_col < mi_cols.
+    let rem_rows_samples = (mi_rows - mi_row) * MI_SIZE;
+    let rem_cols_samples = (mi_cols - mi_col) * MI_SIZE;
+    let onscreen_h_luma = core::cmp::min(block_h_luma, rem_rows_samples);
+    let onscreen_w_luma = core::cmp::min(block_w_luma, rem_cols_samples);
+
+    let args = match plane {
+        PalettePlane::Y => PaletteTokensArgs {
+            block_w: block_w_luma,
+            block_h: block_h_luma,
+            onscreen_w: onscreen_w_luma,
+            onscreen_h: onscreen_h_luma,
+        },
+        PalettePlane::Uv => {
+            // §5.11.49 UV branch: shift both block_* and onscreen_*
+            // by the subsampling factor, then apply the `<4`-bump.
+            let mut block_w = block_w_luma >> subsampling_x;
+            let mut block_h = block_h_luma >> subsampling_y;
+            let mut onscreen_w = onscreen_w_luma >> subsampling_x;
+            let mut onscreen_h = onscreen_h_luma >> subsampling_y;
+            if block_w < 4 {
+                block_w += 2;
+                onscreen_w += 2;
+            }
+            if block_h < 4 {
+                block_h += 2;
+                onscreen_h += 2;
+            }
+            PaletteTokensArgs {
+                block_w,
+                block_h,
+                onscreen_w,
+                onscreen_h,
+            }
+        }
+    };
+
+    Some(args)
+}
+
 /// `DIRECTIONAL_MODES` (§3) — number of directional intra modes, i.e. the
 /// span of `YMode` / `UVMode` values from `V_PRED` to `D67_PRED`
 /// inclusive. Drives the outer dimension of [`DEFAULT_ANGLE_DELTA_CDF`].
@@ -12612,6 +12802,265 @@ mod tests {
             // decoding.
             color_map[0] = 0;
             assert_eq!(color_map.len(), stride * block_h);
+        }
+    }
+
+    /// §3 enum value: `BLOCK_8X8 == 3` and the §9.3 entry-3 row matches
+    /// an 8×8 block (`block_width == block_height == 8`).
+    #[test]
+    fn block_8x8_const_matches_size_3_row() {
+        assert_eq!(BLOCK_8X8, 3);
+        assert_eq!(block_width(BLOCK_8X8), 8);
+        assert_eq!(block_height(BLOCK_8X8), 8);
+        assert_eq!(num_4x4_blocks_wide(BLOCK_8X8), 2);
+        assert_eq!(num_4x4_blocks_high(BLOCK_8X8), 2);
+        assert_eq!(mi_width_log2(BLOCK_8X8), 1);
+        assert_eq!(mi_height_log2(BLOCK_8X8), 1);
+    }
+
+    /// §5.11.49 Y-plane caller derivation, block sitting entirely
+    /// on-screen: `onscreenWidth == blockWidth`, same for height.
+    #[test]
+    fn palette_tokens_args_y_block_fully_on_screen() {
+        // BLOCK_16X16 (idx 6), top-left of a 64×64 mi-grid (256×256
+        // luma samples). The block is well-inside the frame so the
+        // Min() clips to blockWidth/blockHeight.
+        let args = palette_tokens_args(6, 0, 0, 64, 64, PalettePlane::Y, 0, 0).unwrap();
+        assert_eq!(args.block_w, 16);
+        assert_eq!(args.block_h, 16);
+        assert_eq!(args.onscreen_w, 16);
+        assert_eq!(args.onscreen_h, 16);
+    }
+
+    /// §5.11.49 Y-plane caller derivation, block straddling the
+    /// frame's right edge: `onscreenWidth = (MiCols - MiCol) * MI_SIZE
+    /// < blockWidth`, but height is unaffected.
+    #[test]
+    fn palette_tokens_args_y_right_edge_clips_onscreen_w() {
+        // BLOCK_16X16 (16×16 luma). Frame is 6 mi-cols wide (24 luma).
+        // Block placed at mi_col=4 → block runs from luma col 16..32
+        // but the frame ends at col 24, so onscreen_w = 24 - 16 = 8.
+        let args = palette_tokens_args(6, 0, 4, 16, 6, PalettePlane::Y, 0, 0).unwrap();
+        assert_eq!(args.block_w, 16);
+        assert_eq!(args.block_h, 16);
+        assert_eq!(args.onscreen_w, 8);
+        assert_eq!(args.onscreen_h, 16);
+        // §5.11.49 invariant: 1 <= onscreen <= block on both axes.
+        assert!(args.onscreen_w >= 1 && args.onscreen_w <= args.block_w);
+        assert!(args.onscreen_h >= 1 && args.onscreen_h <= args.block_h);
+    }
+
+    /// §5.11.49 Y-plane caller derivation, block straddling the
+    /// frame's bottom edge: symmetric to the right-edge case.
+    #[test]
+    fn palette_tokens_args_y_bottom_edge_clips_onscreen_h() {
+        // BLOCK_16X16, frame is 5 mi-rows tall (20 luma) × 16 wide.
+        // Block at mi_row=2 → row 8..24, frame ends at 20 → onscreen_h = 12.
+        let args = palette_tokens_args(6, 2, 0, 5, 16, PalettePlane::Y, 0, 0).unwrap();
+        assert_eq!(args.block_w, 16);
+        assert_eq!(args.block_h, 16);
+        assert_eq!(args.onscreen_w, 16);
+        assert_eq!(args.onscreen_h, 12);
+    }
+
+    /// §5.11.49 UV branch (4:2:0): blockWidth >>= 1, blockHeight >>= 1,
+    /// no `<4`-bump because BLOCK_8X8 → 4×4 after shift (`< 4` test is
+    /// strict).
+    #[test]
+    fn palette_tokens_args_uv_420_min_block_no_bump() {
+        let args = palette_tokens_args(BLOCK_8X8, 0, 0, 8, 8, PalettePlane::Uv, 1, 1).unwrap();
+        assert_eq!(args.block_w, 4);
+        assert_eq!(args.block_h, 4);
+        assert_eq!(args.onscreen_w, 4);
+        assert_eq!(args.onscreen_h, 4);
+    }
+
+    /// §5.11.49 UV branch (4:2:0), bigger block: a 64×64 luma block
+    /// becomes 32×32 in chroma with no bump.
+    #[test]
+    fn palette_tokens_args_uv_420_large_no_bump() {
+        // BLOCK_64X64 = index 12 (4 * 2^4 = 64 on both axes).
+        let args = palette_tokens_args(12, 0, 0, 32, 32, PalettePlane::Uv, 1, 1).unwrap();
+        assert_eq!(args.block_w, 32);
+        assert_eq!(args.block_h, 32);
+        assert_eq!(args.onscreen_w, 32);
+        assert_eq!(args.onscreen_h, 32);
+    }
+
+    /// §5.11.49 UV branch `<4`-bump: BLOCK_4X16 (idx 16, luma 4×16) is
+    /// accepted by `MiSize >= BLOCK_8X8` (numerical enum, 16 >= 3) but
+    /// 4 >> 1 = 2 chroma samples wide. The spec then bumps:
+    /// `blockWidth += 2; onscreenWidth += 2` to 4, preserving the
+    /// `>= 4`-on-each-side invariant the walker relies on.
+    #[test]
+    fn palette_tokens_args_uv_420_width_lt_4_bump() {
+        // BLOCK_4X16 = index 16 (luma 4×16). UV 4:2:0 → 2×8 pre-bump,
+        // 4×8 post-bump (width bumped, height not).
+        let args = palette_tokens_args(16, 0, 0, 16, 16, PalettePlane::Uv, 1, 1).unwrap();
+        assert_eq!(args.block_w, 4);
+        assert_eq!(args.block_h, 8);
+        assert_eq!(args.onscreen_w, 4);
+        assert_eq!(args.onscreen_h, 8);
+    }
+
+    /// §5.11.49 UV branch `<4`-bump on the height axis: BLOCK_16X4
+    /// (idx 17, luma 16×4) → 8×2 pre-bump, 8×4 post-bump.
+    #[test]
+    fn palette_tokens_args_uv_420_height_lt_4_bump() {
+        let args = palette_tokens_args(17, 0, 0, 16, 16, PalettePlane::Uv, 1, 1).unwrap();
+        assert_eq!(args.block_w, 8);
+        assert_eq!(args.block_h, 4);
+        assert_eq!(args.onscreen_w, 8);
+        assert_eq!(args.onscreen_h, 4);
+    }
+
+    /// §5.11.49 UV branch (4:2:2): subsampling_x=1, subsampling_y=0.
+    /// BLOCK_8X8 luma → 4×8 chroma, no bump.
+    #[test]
+    fn palette_tokens_args_uv_422() {
+        let args = palette_tokens_args(BLOCK_8X8, 0, 0, 8, 8, PalettePlane::Uv, 1, 0).unwrap();
+        assert_eq!(args.block_w, 4);
+        assert_eq!(args.block_h, 8);
+        assert_eq!(args.onscreen_w, 4);
+        assert_eq!(args.onscreen_h, 8);
+    }
+
+    /// §5.11.49 UV branch (4:4:4): subsampling_x=0, subsampling_y=0.
+    /// UV dimensions equal Y dimensions.
+    #[test]
+    fn palette_tokens_args_uv_444_matches_y() {
+        let y = palette_tokens_args(6, 0, 0, 16, 16, PalettePlane::Y, 0, 0).unwrap();
+        let uv = palette_tokens_args(6, 0, 0, 16, 16, PalettePlane::Uv, 0, 0).unwrap();
+        assert_eq!(y, uv);
+    }
+
+    /// §5.11.49 UV branch: the right-edge `onscreen_w` clip carries
+    /// through the subsampling shift. BLOCK_16X16 at the right edge
+    /// (luma onscreen_w = 8) → chroma onscreen_w = 4 (no bump).
+    #[test]
+    fn palette_tokens_args_uv_420_right_edge_clip() {
+        let args = palette_tokens_args(6, 0, 4, 16, 6, PalettePlane::Uv, 1, 1).unwrap();
+        assert_eq!(args.block_w, 8);
+        assert_eq!(args.block_h, 8);
+        assert_eq!(args.onscreen_w, 4);
+        assert_eq!(args.onscreen_h, 8);
+    }
+
+    /// §5.11.49 invariant on the on-screen rectangle: the walker
+    /// requires `1 <= onscreen <= block` on each axis, post-bump. The
+    /// helper must preserve this across every legal `(MiSize, plane,
+    /// subsampling_*)` combination so the walker's caller-bug guards
+    /// never trigger on a conformant caller.
+    #[test]
+    fn palette_tokens_args_invariants_hold_for_every_palette_eligible_size() {
+        // Iterate every MiSize >= BLOCK_8X8 with both block dims <= 64
+        // (the §5.11.46 palette gate). Frame is 32×32 mi-grid so even
+        // the largest 64×64 block fits.
+        for mi_size in BLOCK_8X8..BLOCK_SIZES {
+            if block_width(mi_size) > 64 || block_height(mi_size) > 64 {
+                continue;
+            }
+            for sub_x in 0..=1 {
+                for sub_y in 0..=1 {
+                    for plane in [PalettePlane::Y, PalettePlane::Uv] {
+                        let args = palette_tokens_args(mi_size, 0, 0, 32, 32, plane, sub_x, sub_y)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "palette_tokens_args returned None for \
+                                 mi_size={mi_size} sub_x={sub_x} \
+                                 sub_y={sub_y} plane={plane:?}"
+                                )
+                            });
+                        assert!(args.onscreen_w >= 1);
+                        assert!(args.onscreen_h >= 1);
+                        assert!(args.onscreen_w <= args.block_w);
+                        assert!(args.onscreen_h <= args.block_h);
+                        // Walker stride assumption (block_w <= 64
+                        // post-bump): the §5.11.49 vertical border-fill
+                        // uses a `[u8; 64]` snapshot.
+                        assert!(args.block_w <= 64);
+                        assert!(args.block_h <= 64);
+                    }
+                }
+            }
+        }
+    }
+
+    /// §5.11.49 caller-side derivation: rejects sub-`BLOCK_8X8` sizes
+    /// (the §5.11.46 palette gate) and out-of-table indices.
+    #[test]
+    fn palette_tokens_args_rejects_palette_gate_violations() {
+        // BLOCK_4X4 (idx 0) < BLOCK_8X8 → None.
+        assert!(palette_tokens_args(0, 0, 0, 16, 16, PalettePlane::Y, 0, 0).is_none());
+        // BLOCK_4X8 (idx 1) < BLOCK_8X8 → None.
+        assert!(palette_tokens_args(1, 0, 0, 16, 16, PalettePlane::Y, 0, 0).is_none());
+        // BLOCK_8X4 (idx 2) < BLOCK_8X8 → None.
+        assert!(palette_tokens_args(2, 0, 0, 16, 16, PalettePlane::Y, 0, 0).is_none());
+        // mi_size >= BLOCK_SIZES → None.
+        assert!(palette_tokens_args(BLOCK_SIZES, 0, 0, 16, 16, PalettePlane::Y, 0, 0).is_none());
+        assert!(
+            palette_tokens_args(BLOCK_SIZES + 5, 0, 0, 16, 16, PalettePlane::Y, 0, 0).is_none()
+        );
+        // BLOCK_128X128 (idx 15, 128×128) exceeds the <=64 palette
+        // cap → None.
+        assert!(palette_tokens_args(15, 0, 0, 64, 64, PalettePlane::Y, 0, 0).is_none());
+        // BLOCK_64X128 (idx 13, 64×128) exceeds the height cap → None.
+        assert!(palette_tokens_args(13, 0, 0, 64, 64, PalettePlane::Y, 0, 0).is_none());
+    }
+
+    /// §5.11.49 caller-side derivation: rejects caller bugs that would
+    /// otherwise produce a zero-size on-screen rectangle.
+    #[test]
+    fn palette_tokens_args_rejects_caller_bugs() {
+        // mi_row out of bounds.
+        assert!(palette_tokens_args(BLOCK_8X8, 8, 0, 8, 8, PalettePlane::Y, 0, 0).is_none());
+        // mi_col out of bounds.
+        assert!(palette_tokens_args(BLOCK_8X8, 0, 8, 8, 8, PalettePlane::Y, 0, 0).is_none());
+        // Zero mi-grid.
+        assert!(palette_tokens_args(BLOCK_8X8, 0, 0, 0, 8, PalettePlane::Y, 0, 0).is_none());
+        assert!(palette_tokens_args(BLOCK_8X8, 0, 0, 8, 0, PalettePlane::Y, 0, 0).is_none());
+        // Out-of-range subsampling flags.
+        assert!(palette_tokens_args(BLOCK_8X8, 0, 0, 8, 8, PalettePlane::Uv, 2, 0).is_none());
+        assert!(palette_tokens_args(BLOCK_8X8, 0, 0, 8, 8, PalettePlane::Uv, 0, 2).is_none());
+    }
+
+    /// End-to-end shape: `palette_tokens_args` output drops straight
+    /// into `palette_tokens_plane`'s argument list without any
+    /// `InvalidPaletteWalkArgs` failure when the inputs are conformant.
+    /// Uses the §8.2 SymbolDecoder + the §9.4 default palette CDFs so
+    /// the end-to-end data-flow is exercised on a real walker call.
+    #[test]
+    fn palette_tokens_args_feeds_walker_without_caller_bug() {
+        // BLOCK_8X8 Y plane, fully on-screen at frame origin.
+        let args = palette_tokens_args(BLOCK_8X8, 0, 0, 8, 8, PalettePlane::Y, 0, 0).unwrap();
+        // Compose a tiny byte buffer that init_symbol accepts; we only
+        // care that the walker's argument-validation passes (the
+        // decode itself can produce any indices).
+        let bytes = [0x80u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let mut tile_ctx = TileCdfContext::new_from_defaults();
+        let stride = args.block_w;
+        let mut color_map = vec![0u8; stride * args.block_h];
+        // PaletteSizeY = 2 (smallest legal palette per §5.11.46).
+        let r = palette_tokens_plane(
+            &mut dec,
+            &mut tile_ctx,
+            PalettePlane::Y,
+            2,
+            args.block_w,
+            args.block_h,
+            args.onscreen_w,
+            args.onscreen_h,
+            0,
+            &mut color_map,
+            stride,
+        );
+        // The walker must not reject our args. The decode itself may
+        // bubble UnexpectedEnd or PaletteColorContextUnmapped depending
+        // on the random byte stream; we only assert the caller-bug
+        // path did not fire.
+        if let Err(crate::Error::InvalidPaletteWalkArgs) = r {
+            panic!("palette_tokens_args produced caller-bug-rejecting args");
         }
     }
 

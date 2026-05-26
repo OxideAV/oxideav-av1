@@ -1141,6 +1141,38 @@ and a §5.11.49 caller data-flow pin confirming `block_width(mi_size)`
 / `block_height(mi_size)` are inside `8..=64` at the palette-minimum
 (`BLOCK_8X8`) and palette-maximum (`BLOCK_64X64`) `MiSize` values
 the gate admits.
+
+Round 149 wires the §5.11.49 **caller-side argument derivation**
+(av1-spec p.101–102) on top of the r148 tables. The new
+`palette_tokens_args(mi_size, mi_row, mi_col, mi_rows, mi_cols, plane,
+subsampling_x, subsampling_y) -> Option<PaletteTokensArgs>` helper
+returns the four `palette_tokens_plane` size arguments
+(`block_w`, `block_h`, `onscreen_w`, `onscreen_h`) for one plane, and
+a new `BLOCK_8X8` constant (`3`, the §5.11.46 palette gate) sits
+alongside it. Y branch returns the §9.3 dimensions clipped by
+`Min(.., (MiRows - MiRow) * MI_SIZE)` / `Min(.., (MiCols - MiCol)
+* MI_SIZE)`. UV branch applies the §5.11.49 `>> subsampling_{x,y}`
+shift and the `<4`-bump (`block_w += 2; onscreen_w += 2` when post-
+shift `block_w < 4`, ditto height); the bump preserves the walker's
+`onscreen_* <= block_*` invariant because it adds the same `2` to
+both. The helper returns `None` for any §5.11.46 palette-gate
+violation (sub-`BLOCK_8X8` size, `block_w > 64`, `block_h > 64`,
+out-of-table index), out-of-bounds `mi_row` / `mi_col`, zero mi-grid,
+or out-of-range subsampling flag — safe to call defensively from a
+not-yet-gated caller. 15 new unit tests (344 -> 359) cover
+`BLOCK_8X8`-row pinning; Y-plane fully-on-screen / right-edge /
+bottom-edge clipping; UV 4:2:0 minimum block + large block;
+UV 4:2:0 width-`<4`-bump (`BLOCK_4X16`) and height-`<4`-bump
+(`BLOCK_16X4`); UV 4:2:2 + UV 4:4:4 shape; UV right-edge clip carry-
+through; an exhaustive sweep proving `1 <= onscreen_* <= block_* <=
+64` over every palette-eligible `(MiSize, sub_x, sub_y, plane)`
+combination; palette-gate + caller-bug rejection paths; and an end-
+to-end shape test that feeds the helper's output straight into
+`palette_tokens_plane` against the §9.4 default palette CDFs,
+confirming the walker's `InvalidPaletteWalkArgs` guard never fires
+on conformant arguments. This closes the data-flow gap pinned by the
+r147 follow-up test and leaves `read_block` clear to call
+`palette_tokens` once the parser surfaces the variables.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)
