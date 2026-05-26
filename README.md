@@ -956,6 +956,38 @@ the `TX_CLASS_{2D,HORIZ,VERT}` tags, the `Adjusted_Tx_Size` /
 transcribed verbatim from the spec; a pure `get_tx_class()` helper
 reduces the directional transform-type flags to a class. 12 new unit
 tests (266 -> 278) pin each branch with hand-computed `ctx` values.
+Round 142 follows up with the **§5.11.40 `compute_tx_type()`
+derivation** — `compute_tx_type(plane, tx_sz, lossless, is_inter,
+tx_set, mi_row, mi_col, block_x, block_y, subsampling_x,
+subsampling_y, uv_mode, tx_types)` implements the full spec function
+the tile-content walker reads before kicking off coefficient
+decoding. `Lossless || Tx_Size_Sqr_Up[ txSz ] > TX_32X32`
+short-circuits to `DCT_DCT`; `plane == 0` returns the
+`TxTypes[ blockY ][ blockX ]` luma cache entry; `is_inter` chroma
+reads the cache at
+`(Max(MiRow, blockY << subsampling_y), Max(MiCol, blockX <<
+subsampling_x))` then runs the §5.11.40 `is_tx_type_in_set`
+admission filter; intra chroma reads `Mode_To_Txfm[UVMode]` then
+runs the same filter. The caller supplies the §5.11.40 `txSet`
+(i.e. the already-resolved `inter_tx_type_set` /
+`intra_tx_type_set` result) and a closure over `TxTypes[y][x]` so
+the helper does not bake in a particular storage shape — a dense 2D
+array, a sparse map, or a `MiRow/MiCol`-relative tile-local view
+all work. Adds the §6.10.16 size ordinals
+`TX_4X4` / `TX_8X8` / `TX_16X16` / `TX_32X32` / `TX_64X64`
+(replacing the previously locally-scoped `const TX_*` shadows
+inside `inter_tx_type_set` / `intra_tx_type_set`), the §6.10.19
+transform-type ordinals `DCT_DCT` through `H_FLIPADST` (16
+entries), the `TX_SET_TYPES_INTRA = 3` / `TX_SET_TYPES_INTER = 4`
+row-count constants, the `Tx_Size_Sqr_Up[ TX_SIZES_ALL ]`,
+`Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`,
+`Tx_Type_In_Set_Intra[ 3 ][ TX_TYPES ]`, and
+`Tx_Type_In_Set_Inter[ 4 ][ TX_TYPES ]` tables, all transcribed
+verbatim from the spec. 10 new unit tests (278 -> 288) pin each
+branch (lossless / `txSzSqrUp > TX_32X32` fallback, luma cache
+read, inter-chroma `Max` lift + admission pass/fail, intra-chroma
+`Mode_To_Txfm` + admission pass/fail + out-of-range, plus a
+selector/admission closed-loop check).
 The remaining §9.4 tables (inter-intra (`Default_Interintra_Cdf`),
 and the other §8.3.2 selections (`split_or_horz` / `split_or_vert` /
 …) are a mechanical followup against the same `TileCdfContext`
@@ -1353,6 +1385,29 @@ shape. `decode_av1` and `encode_av1` still return
     `Coeff_Base_Ctx_Offset[TX_SIZES_ALL][5][5]`,
     `Coeff_Base_Pos_Ctx_Offset[3]`,
     `Mag_Ref_Offset_With_Tx_Class[3][3][2]`).
+  * **`compute_tx_type` derivation** (round 142): §3 / §6.10.16 (the
+    `TX_4X4 = 0`, `TX_8X8 = 1`, `TX_16X16 = 2`, `TX_32X32 = 3`,
+    `TX_64X64 = 4` `TxSize` ordinals — previously used only as
+    locally-scoped `const TX_*` shadows inside the §5.11.48
+    helpers — and the `TX_SET_TYPES_INTRA = 3` /
+    `TX_SET_TYPES_INTER = 4` row-count constants for the
+    `Tx_Type_In_Set_*` tables), §6.10.19 (the `DCT_DCT = 0` through
+    `H_FLIPADST = 15` 16-entry transform-type enumeration —
+    previously the `V_DCT..H_FLIPADST` tail only), §5.11.40
+    (`compute_tx_type()` function body — the `Lossless ||
+    Tx_Size_Sqr_Up[ txSz ] > TX_32X32 -> DCT_DCT` short-circuit, the
+    `plane == 0 -> TxTypes[ blockY ][ blockX ]` luma branch, the
+    `is_inter` chroma `Max(MiRow, blockY << subsampling_y)` /
+    `Max(MiCol, blockX << subsampling_x)` lift into the
+    `TxTypes[..]` cache, the `is_tx_type_in_set` admission filter
+    with the `!is_tx_type_in_set -> DCT_DCT` fallback, the intra
+    chroma `Mode_To_Txfm[ UVMode ]` path with the same filter — and
+    the `Tx_Type_In_Set_Intra[ 3 ][ TX_TYPES ]` /
+    `Tx_Type_In_Set_Inter[ 4 ][ TX_TYPES ]` admission-flag tables
+    transcribed verbatim from the spec listing), §"Additional
+    tables" (`Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` — `t -> Max(w, h)`-
+    sided square — and `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
+    — chroma-mode default-tx-type table).
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).

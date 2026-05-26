@@ -6,6 +6,59 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 142 — §5.11.40 `compute_tx_type()` derivation.** Lands the
+  per-plane / per-block transform-type lookup the tile-content walker
+  reads before kicking off coefficient decoding and inverse transform.
+  `compute_tx_type(plane, tx_sz, lossless, is_inter, tx_set, mi_row,
+  mi_col, block_x, block_y, subsampling_x, subsampling_y, uv_mode,
+  tx_types)` implements the full spec function:
+  `Lossless || Tx_Size_Sqr_Up[ txSz ] > TX_32X32` short-circuits to
+  `DCT_DCT`; `plane == 0` returns the `TxTypes[ blockY ][ blockX ]`
+  luma cache entry; `is_inter` chroma reads the cache at
+  `(Max(MiRow, blockY << subsampling_y), Max(MiCol, blockX <<
+  subsampling_x))` then runs the §5.11.40 `is_tx_type_in_set`
+  admission filter; intra chroma reads `Mode_To_Txfm[UVMode]` then
+  runs the same filter. The caller supplies the §5.11.40 `txSet`
+  (i.e. the already-resolved `inter_tx_type_set` / `intra_tx_type_set`
+  result) and a closure over `TxTypes[y][x]` so the helper does not
+  bake in a particular storage shape — a dense 2D array, a sparse
+  map, or a `MiRow/MiCol`-relative tile-local view all work. The
+  closure is only invoked on the luma / inter-chroma branches, never
+  on the intra-chroma branch. `is_tx_type_in_set(is_inter, tx_set,
+  tx_type)` is a direct read of `Tx_Type_In_Set_Inter` /
+  `Tx_Type_In_Set_Intra`; out-of-range `tx_set` / `tx_type` returns
+  `false` (the spec's reachable values stay in range, so `false`
+  flags a bookkeeping bug). Adds the §6.10.16 size ordinal constants
+  `TX_4X4` / `TX_8X8` / `TX_16X16` / `TX_32X32` / `TX_64X64`
+  (replacing the previously locally-scoped `const TX_16X16 = 2;` /
+  `const TX_32X32 = 3;` shadows inside `inter_tx_type_set` /
+  `intra_tx_type_set`), the §6.10.19 transform-type ordinals
+  `DCT_DCT` through `H_FLIPADST` (16 entries), the
+  `TX_SET_TYPES_INTRA = 3` / `TX_SET_TYPES_INTER = 4` row-count
+  constants, the `Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` table (`t -> Max(w,
+  h)-sided square`), the `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]`
+  chroma-mode -> default-tx-type table, and the
+  `Tx_Type_In_Set_Intra[ 3 ][ TX_TYPES ]` /
+  `Tx_Type_In_Set_Inter[ 4 ][ TX_TYPES ]` admission tables, all
+  transcribed verbatim from the spec. Tests grow by 10 (cdf module):
+  `Tx_Size_Sqr_Up` well-formedness (every entry is a square ordinal,
+  spot-checks against the spec rows); §6.10.16 / §6.10.19 ordinal
+  values match the spec; `Mode_To_Txfm` per-row spot-check + bounds;
+  `is_tx_type_in_set` per-row admission flags for all 4 inter sets +
+  3 intra sets (with out-of-range fallback); `compute_tx_type`
+  lossless / `txSzSqrUp > TX_32X32` short-circuits (covering
+  `TX_64X64`, `TX_32X64`, and an out-of-range tx_sz); luma branch
+  verbatim cache read (with admission filter intentionally inert);
+  inter-chroma `Max(MiCol, blockX << subsampling_x)` lift firing
+  through a cache that disambiguates lifted vs unlifted columns,
+  admission pass for `IDTX` under `TX_SET_INTER_3`, and admission
+  fail for `ADST_DCT` falling back to `DCT_DCT`; intra-chroma
+  `Mode_To_Txfm` path with admission pass, admission fail, and
+  out-of-range `uv_mode` fallback (with a panic-on-call closure
+  proving the luma cache is not read); selector / admission filter
+  closed-loop check for a 16×16 inter chroma block. 278 -> 288
+  tests, zero `#[ignore]`.
+
 * **Round 141 — §8.3.2 `get_coeff_base_ctx()` / `get_br_ctx()`
   neighbour-derivation helpers.** Lands the per-coefficient `ctx`
   computation that feeds the existing `coeff_base` /

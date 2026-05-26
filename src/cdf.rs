@@ -8123,6 +8123,38 @@ pub const TX_HEIGHT: [usize; TX_SIZES_ALL] = [
 pub const TX_WIDTH_LOG2: [usize; TX_SIZES_ALL] =
     [2, 3, 4, 5, 6, 2, 3, 3, 4, 4, 5, 5, 6, 2, 4, 3, 5, 4, 6];
 
+/// `Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` (§ Additional tables). For a
+/// transform size `t` (of width `w` and height `h`), returns the square
+/// tx size whose side length is `Max(w, h)`. Entries are themselves
+/// `TX_SIZES_ALL` indices in the `TX_4X4..TX_64X64` range.
+///
+/// Used by §5.11.40 `compute_tx_type()` (the `txSzSqrUp > TX_32X32`
+/// fallback to `DCT_DCT`), by §5.11.48 `get_tx_set()`, and by the
+/// `txfm_split` context formula. Replaces the locally-scoped
+/// `TX_32X32 = 3` numeric constants the existing
+/// [`inter_tx_type_set`] / [`intra_tx_type_set`] helpers used.
+pub const TX_SIZE_SQR_UP: [usize; TX_SIZES_ALL] = [
+    0, // TX_4X4   -> TX_4X4
+    1, // TX_8X8   -> TX_8X8
+    2, // TX_16X16 -> TX_16X16
+    3, // TX_32X32 -> TX_32X32
+    4, // TX_64X64 -> TX_64X64
+    1, // TX_4X8   -> TX_8X8
+    1, // TX_8X4   -> TX_8X8
+    2, // TX_8X16  -> TX_16X16
+    2, // TX_16X8  -> TX_16X16
+    3, // TX_16X32 -> TX_32X32
+    3, // TX_32X16 -> TX_32X32
+    4, // TX_32X64 -> TX_64X64
+    4, // TX_64X32 -> TX_64X64
+    2, // TX_4X16  -> TX_16X16
+    2, // TX_16X4  -> TX_16X16
+    3, // TX_8X32  -> TX_32X32
+    3, // TX_32X8  -> TX_32X32
+    4, // TX_16X64 -> TX_64X64
+    4, // TX_64X16 -> TX_64X64
+];
+
 /// `Sig_Ref_Diff_Offset[ 3 ][ SIG_REF_DIFF_OFFSET_NUM ][ 2 ]`
 /// (§ Additional tables). Per transform class, the
 /// `(rowDelta, colDelta)` offsets scanned by `get_coeff_base_ctx()` to
@@ -8317,6 +8349,271 @@ pub const COEFF_BASE_CTX_OFFSET: [[[usize; 5]; 5]; TX_SIZES_ALL] = [
         [16, 16, 21, 21, 21],
     ],
 ];
+
+// ---------------------------------------------------------------------
+// Round 142 — §5.11.40 `compute_tx_type()` derivation. Pure plumbing
+// the tile-content walker will consume to map a 4×4 (blockX, blockY)
+// position into the per-plane transform type. The arithmetic itself is
+// independent of the msac decoder — it is a table lookup chain over the
+// tx-set / tx-type tables, plus the `TxTypes[y][x]` luma cache the
+// walker has already filled in.
+// ---------------------------------------------------------------------
+
+/// §6.10.16 `TxSize` ordinals (`TxSize` semantics table). Indices into
+/// the `Tx_Size_Sqr_Up` / `Tx_Width` / `Tx_Height` / `Tx_Width_Log2`
+/// tables. Previously local `const TX_16X16: u32 = 2;` / `const
+/// TX_32X32: u32 = 3;` shadows inside the [`inter_tx_type_set`] /
+/// [`intra_tx_type_set`] helpers used these same values; the public
+/// constants below let new callers (e.g. [`compute_tx_type`]) reference
+/// the same ordinals without re-typing them.
+pub const TX_4X4: usize = 0;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source.
+pub const TX_8X8: usize = 1;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source.
+pub const TX_16X16: usize = 2;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source.
+pub const TX_32X32: usize = 3;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source.
+pub const TX_64X64: usize = 4;
+
+/// §6.10.19 / §3 transform-type ordinals. The spec lists `DCT_DCT = 0`
+/// through `H_FLIPADST = 15` in a single enumeration; these are the
+/// indices used by the [`MODE_TO_TXFM`] / [`TX_TYPE_IN_SET_INTRA`] /
+/// [`TX_TYPE_IN_SET_INTER`] / [`get_tx_class`] tables, and the §5.11.40
+/// `DCT_DCT` fallback returned by [`compute_tx_type`] when the
+/// transform is too large or the per-plane derivation falls back.
+pub const DCT_DCT: usize = 0;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const ADST_DCT: usize = 1;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const DCT_ADST: usize = 2;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const ADST_ADST: usize = 3;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const FLIPADST_DCT: usize = 4;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const DCT_FLIPADST: usize = 5;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const FLIPADST_FLIPADST: usize = 6;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const ADST_FLIPADST: usize = 7;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const FLIPADST_ADST: usize = 8;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const IDTX: usize = 9;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const V_DCT: usize = 10;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const H_DCT: usize = 11;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const V_ADST: usize = 12;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const H_ADST: usize = 13;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const V_FLIPADST: usize = 14;
+/// See [`DCT_DCT`] for the §6.10.19 ordinal source.
+pub const H_FLIPADST: usize = 15;
+
+/// `TX_SET_TYPES_INTRA` (§3) — the number of `is_inter == 0` rows in
+/// [`TX_TYPE_IN_SET_INTRA`] (`TX_SET_DCTONLY`, `TX_SET_INTRA_1`,
+/// `TX_SET_INTRA_2`).
+pub const TX_SET_TYPES_INTRA: usize = 3;
+
+/// `TX_SET_TYPES_INTER` (§3) — the number of `is_inter == 1` rows in
+/// [`TX_TYPE_IN_SET_INTER`] (`TX_SET_DCTONLY`, `TX_SET_INTER_1`,
+/// `TX_SET_INTER_2`, `TX_SET_INTER_3`).
+pub const TX_SET_TYPES_INTER: usize = 4;
+
+/// `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]` (§ Additional tables).
+/// Maps each chroma intra prediction mode to the transform type the
+/// §5.11.40 `compute_tx_type()` derivation uses as the per-plane default
+/// before the `is_tx_type_in_set` admission filter. Indexed by
+/// `UVMode` in `0..UV_INTRA_MODES_CFL_ALLOWED`.
+pub const MODE_TO_TXFM: [usize; UV_INTRA_MODES_CFL_ALLOWED] = [
+    DCT_DCT,   // DC_PRED
+    ADST_DCT,  // V_PRED
+    DCT_ADST,  // H_PRED
+    DCT_DCT,   // D45_PRED
+    ADST_ADST, // D135_PRED
+    ADST_DCT,  // D113_PRED
+    DCT_ADST,  // D157_PRED
+    DCT_ADST,  // D203_PRED
+    ADST_DCT,  // D67_PRED
+    ADST_ADST, // SMOOTH_PRED
+    ADST_DCT,  // SMOOTH_V_PRED
+    DCT_ADST,  // SMOOTH_H_PRED
+    ADST_ADST, // PAETH_PRED
+    DCT_DCT,   // UV_CFL_PRED
+];
+
+/// `Tx_Type_In_Set_Intra[ TX_SET_TYPES_INTRA ][ TX_TYPES ]` (§5.11.40).
+/// One row per intra `txSet` index (`TX_SET_DCTONLY`, `TX_SET_INTRA_1`,
+/// `TX_SET_INTRA_2`). Row `txSet`'s column `txType` is `1` iff the spec
+/// considers `txType` admissible for that set; the §5.11.40
+/// `is_tx_type_in_set(txSet, txType)` predicate is a direct table read.
+pub const TX_TYPE_IN_SET_INTRA: [[u8; TX_TYPES]; TX_SET_TYPES_INTRA] = [
+    // TX_SET_DCTONLY: only DCT_DCT.
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // TX_SET_INTRA_1: DCT/ADST cross-set plus IDTX/V_DCT/H_DCT.
+    [1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+    // TX_SET_INTRA_2: DCT/ADST cross-set plus IDTX.
+    [1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+];
+
+/// `Tx_Type_In_Set_Inter[ TX_SET_TYPES_INTER ][ TX_TYPES ]` (§5.11.40).
+/// One row per inter `txSet` index (`TX_SET_DCTONLY`, `TX_SET_INTER_1`,
+/// `TX_SET_INTER_2`, `TX_SET_INTER_3`). Row `txSet`'s column `txType`
+/// is `1` iff the spec considers `txType` admissible for that set; the
+/// §5.11.40 `is_tx_type_in_set(txSet, txType)` predicate on the
+/// `is_inter == 1` branch is a direct table read.
+pub const TX_TYPE_IN_SET_INTER: [[u8; TX_TYPES]; TX_SET_TYPES_INTER] = [
+    // TX_SET_DCTONLY: only DCT_DCT.
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    // TX_SET_INTER_1: every transform type.
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    // TX_SET_INTER_2: full set minus the four V_/H_FLIPADST tail.
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+    // TX_SET_INTER_3: { IDTX, DCT_DCT }.
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+];
+
+/// §5.11.40 `is_tx_type_in_set( txSet, txType )` — the admission filter
+/// the [`compute_tx_type`] derivation runs after looking up the
+/// per-plane default `txType`. Reads the [`TX_TYPE_IN_SET_INTER`] /
+/// [`TX_TYPE_IN_SET_INTRA`] table per the `is_inter` flag and returns
+/// `true` when the entry is non-zero.
+///
+/// Returns `false` for any out-of-range `tx_set` / `tx_type` index
+/// rather than panicking; the spec's reachable values always stay in
+/// range, so a `false` return tells the caller a bookkeeping bug has
+/// presented an unreachable combination.
+pub fn is_tx_type_in_set(is_inter: bool, tx_set: u32, tx_type: usize) -> bool {
+    let set = tx_set as usize;
+    if tx_type >= TX_TYPES {
+        return false;
+    }
+    if is_inter {
+        TX_TYPE_IN_SET_INTER
+            .get(set)
+            .map(|row| row[tx_type] != 0)
+            .unwrap_or(false)
+    } else {
+        TX_TYPE_IN_SET_INTRA
+            .get(set)
+            .map(|row| row[tx_type] != 0)
+            .unwrap_or(false)
+    }
+}
+
+/// §5.11.40 `compute_tx_type( plane, txSz, blockX, blockY )` — the
+/// per-plane transform-type derivation the tile-content walker reads
+/// before kicking off coefficient decoding and inverse transform.
+///
+/// ```text
+///   txSzSqrUp = Tx_Size_Sqr_Up[ txSz ]
+///   if ( Lossless || txSzSqrUp > TX_32X32 )  return DCT_DCT
+///   txSet = get_tx_set( txSz )
+///   if ( plane == 0 )                       return TxTypes[ blockY ][ blockX ]
+///   if ( is_inter ) {
+///       x4 = Max( MiCol, blockX << subsampling_x )
+///       y4 = Max( MiRow, blockY << subsampling_y )
+///       txType = TxTypes[ y4 ][ x4 ]
+///       if ( !is_tx_type_in_set( txSet, txType ) )  return DCT_DCT
+///       return txType
+///   }
+///   txType = Mode_To_Txfm[ UVMode ]
+///   if ( !is_tx_type_in_set( txSet, txType ) )      return DCT_DCT
+///   return txType
+/// ```
+///
+/// All bitstream-derived state the spec function reads from globals is
+/// passed in explicitly:
+///
+/// * `plane` — `0` for luma (Y), nonzero for chroma (U / V). Only the
+///   `plane == 0` branch is special-cased; the §5.11.40 lookup returns
+///   the same value for plane 1 and plane 2 with chroma inputs.
+/// * `tx_sz` — `TxSize` index in `TX_4X4..TX_64X64..TX_64X16`
+///   (§6.10.16 ordinal). Out-of-range inputs return `DCT_DCT` (the
+///   §5.11.40 `txSzSqrUp > TX_32X32` fallback's safest extension to a
+///   bookkeeping bug).
+/// * `lossless`, `is_inter`, `mi_row`, `mi_col`, `subsampling_x` /
+///   `subsampling_y`, `uv_mode` — the spec globals of the same names.
+/// * `block_x`, `block_y` — the §5.11.40 4×4-granularity block
+///   coordinates (in 4×4 luma units; the spec's `blockX << subsampling_x`
+///   product yields the same units as `MiCol`).
+/// * `tx_types(y, x)` — the §5.11.40 `TxTypes[y][x]` luma cache the
+///   walker maintains. Passed as a closure so the helper does not bake
+///   in a particular storage shape — the walker may back it by a dense
+///   2D array, a sparse map, or a `MiRow / MiCol`-relative tile-local
+///   view. The closure is only invoked on the luma / inter chroma
+///   branches.
+///
+/// Returns a transform-type ordinal in `0..TX_TYPES` (see [`DCT_DCT`]
+/// through [`H_FLIPADST`]).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_tx_type<F>(
+    plane: usize,
+    tx_sz: usize,
+    lossless: bool,
+    is_inter: bool,
+    tx_set: u32,
+    mi_row: u32,
+    mi_col: u32,
+    block_x: u32,
+    block_y: u32,
+    subsampling_x: u32,
+    subsampling_y: u32,
+    uv_mode: usize,
+    tx_types: F,
+) -> usize
+where
+    F: Fn(u32, u32) -> usize,
+{
+    // `Lossless || txSzSqrUp > TX_32X32` short-circuit. Treat
+    // out-of-range tx_sz as DCT_DCT for the same reason: the spec's
+    // reachable inputs all land in `TX_SIZES_ALL`, so an out-of-range
+    // index is a caller bug whose safest behaviour matches the
+    // §5.11.40 too-large fallback.
+    if lossless {
+        return DCT_DCT;
+    }
+    let tx_sz_sqr_up = match TX_SIZE_SQR_UP.get(tx_sz) {
+        Some(v) => *v,
+        None => return DCT_DCT,
+    };
+    if tx_sz_sqr_up > TX_32X32 {
+        return DCT_DCT;
+    }
+
+    if plane == 0 {
+        return tx_types(block_y, block_x);
+    }
+
+    if is_inter {
+        // `x4 = Max( MiCol, blockX << subsampling_x )` —
+        // `block_x << subsampling_x` lifts the chroma 4×4 coordinate
+        // back into luma units; the `Max` against `MiCol` clips the
+        // first row/col of a chroma block to the top-left of its
+        // luma siblings (this matters when the chroma block straddles
+        // the MI grid origin).
+        let x4 = (block_x << subsampling_x).max(mi_col);
+        let y4 = (block_y << subsampling_y).max(mi_row);
+        let tx_type = tx_types(y4, x4);
+        if !is_tx_type_in_set(true, tx_set, tx_type) {
+            return DCT_DCT;
+        }
+        return tx_type;
+    }
+
+    let tx_type = match MODE_TO_TXFM.get(uv_mode) {
+        Some(v) => *v,
+        None => return DCT_DCT,
+    };
+    if !is_tx_type_in_set(false, tx_set, tx_type) {
+        return DCT_DCT;
+    }
+    tx_type
+}
 
 /// §8.3.2 `get_tx_class( txType )` — maps a transform type to its
 /// transform class. The vertical-only types (`V_DCT` / `V_ADST` /
@@ -12176,5 +12473,442 @@ mod tests {
         let mut tile = TileCdfContext::new_from_defaults();
         let ctx = get_br_ctx(&empty, 1, TX_CLASS_VERT, 1);
         assert!(tile.coeff_br_cdf(1, 0, ctx).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Round 142 — §5.11.40 `compute_tx_type()` derivation.
+    // -----------------------------------------------------------------
+
+    /// `Tx_Size_Sqr_Up[ TX_SIZES_ALL ]` (§ Additional tables): each row
+    /// entry is a valid `TX_4X4..TX_64X64` ordinal, and the equality
+    /// `Tx_Width[ Tx_Size_Sqr_Up[ t ] ] == Tx_Height[ Tx_Size_Sqr_Up[ t ] ]`
+    /// holds because the destination is always a square size. Spot-checks
+    /// the rectangular entries lift to `Max(w, h)`-sided squares.
+    #[test]
+    fn tx_size_sqr_up_table_is_well_formed() {
+        assert_eq!(TX_SIZE_SQR_UP.len(), TX_SIZES_ALL);
+        for &t in &TX_SIZE_SQR_UP {
+            assert!(
+                t <= TX_64X64,
+                "Tx_Size_Sqr_Up entry must be a square tx-size ordinal"
+            );
+            assert_eq!(
+                TX_WIDTH[t], TX_HEIGHT[t],
+                "Tx_Size_Sqr_Up destination must be square"
+            );
+        }
+        // §6.10.16 ordinals: 5 = TX_4X8, 7 = TX_8X16, 13 = TX_4X16 —
+        // each lifts to the Max(w,h)-sided square per the spec.
+        assert_eq!(TX_SIZE_SQR_UP[5], TX_8X8); // 4x8 -> 8x8
+        assert_eq!(TX_SIZE_SQR_UP[7], TX_16X16); // 8x16 -> 16x16
+        assert_eq!(TX_SIZE_SQR_UP[13], TX_16X16); // 4x16 -> 16x16
+        assert_eq!(TX_SIZE_SQR_UP[11], TX_64X64); // 32x64 -> 64x64
+    }
+
+    /// §6.10.16 / §3 transform-size and transform-type ordinals match
+    /// the spec-listed values; the ordinal constants are the same
+    /// values previously used as locally-scoped `const TX_*` shadows.
+    #[test]
+    fn tx_size_and_tx_type_ordinals_match_spec() {
+        // §6.10.16 TxSize semantics table rows 0..4.
+        assert_eq!(TX_4X4, 0);
+        assert_eq!(TX_8X8, 1);
+        assert_eq!(TX_16X16, 2);
+        assert_eq!(TX_32X32, 3);
+        assert_eq!(TX_64X64, 4);
+        // §6.10.19 TxType enumeration rows 0..15.
+        assert_eq!(DCT_DCT, 0);
+        assert_eq!(ADST_DCT, 1);
+        assert_eq!(DCT_ADST, 2);
+        assert_eq!(ADST_ADST, 3);
+        assert_eq!(FLIPADST_DCT, 4);
+        assert_eq!(DCT_FLIPADST, 5);
+        assert_eq!(FLIPADST_FLIPADST, 6);
+        assert_eq!(ADST_FLIPADST, 7);
+        assert_eq!(FLIPADST_ADST, 8);
+        assert_eq!(IDTX, 9);
+        assert_eq!(V_DCT, 10);
+        assert_eq!(H_DCT, 11);
+        assert_eq!(V_ADST, 12);
+        assert_eq!(H_ADST, 13);
+        assert_eq!(V_FLIPADST, 14);
+        assert_eq!(H_FLIPADST, 15);
+        // §3 TX_SET_TYPES_* counts match the table-row counts.
+        assert_eq!(TX_SET_TYPES_INTRA, TX_TYPE_IN_SET_INTRA.len());
+        assert_eq!(TX_SET_TYPES_INTER, TX_TYPE_IN_SET_INTER.len());
+    }
+
+    /// `Mode_To_Txfm[ UV_INTRA_MODES_CFL_ALLOWED ]` (§ Additional tables):
+    /// per-row spot-check + length pin. Each entry lies in `0..TX_TYPES`
+    /// (so [`is_tx_type_in_set`] never returns the out-of-range `false`).
+    #[test]
+    fn mode_to_txfm_table_matches_spec() {
+        assert_eq!(MODE_TO_TXFM.len(), UV_INTRA_MODES_CFL_ALLOWED);
+        for &t in &MODE_TO_TXFM {
+            assert!(t < TX_TYPES);
+        }
+        // Spec § Additional tables (Mode_To_Txfm), per-row:
+        assert_eq!(MODE_TO_TXFM[0], DCT_DCT); // DC_PRED
+        assert_eq!(MODE_TO_TXFM[1], ADST_DCT); // V_PRED
+        assert_eq!(MODE_TO_TXFM[2], DCT_ADST); // H_PRED
+        assert_eq!(MODE_TO_TXFM[4], ADST_ADST); // D135_PRED
+        assert_eq!(MODE_TO_TXFM[9], ADST_ADST); // SMOOTH_PRED
+        assert_eq!(MODE_TO_TXFM[12], ADST_ADST); // PAETH_PRED
+        assert_eq!(MODE_TO_TXFM[13], DCT_DCT); // UV_CFL_PRED
+    }
+
+    /// §5.11.40 `is_tx_type_in_set` over the four inter `txSet` rows.
+    /// `TX_SET_DCTONLY` admits only `DCT_DCT`; `TX_SET_INTER_1` admits
+    /// all 16; `TX_SET_INTER_2` admits 0..=11 only; `TX_SET_INTER_3`
+    /// admits `{ IDTX, DCT_DCT }`.
+    #[test]
+    fn is_tx_type_in_set_inter_per_row() {
+        // TX_SET_DCTONLY (0): DCT_DCT only.
+        assert!(is_tx_type_in_set(true, TX_SET_DCTONLY, DCT_DCT));
+        assert!(!is_tx_type_in_set(true, TX_SET_DCTONLY, ADST_DCT));
+        assert!(!is_tx_type_in_set(true, TX_SET_DCTONLY, IDTX));
+        // TX_SET_INTER_1 (1): every type admitted.
+        for t in 0..TX_TYPES {
+            assert!(
+                is_tx_type_in_set(true, TX_SET_INTER_1, t),
+                "INTER_1 admits {t}"
+            );
+        }
+        // TX_SET_INTER_2 (2): 0..=11 yes, 12..=15 no.
+        for t in 0..12 {
+            assert!(
+                is_tx_type_in_set(true, TX_SET_INTER_2, t),
+                "INTER_2 admits {t}"
+            );
+        }
+        for t in 12..16 {
+            assert!(
+                !is_tx_type_in_set(true, TX_SET_INTER_2, t),
+                "INTER_2 rejects {t}"
+            );
+        }
+        // TX_SET_INTER_3 (3): IDTX + DCT_DCT only.
+        assert!(is_tx_type_in_set(true, TX_SET_INTER_3, DCT_DCT));
+        assert!(is_tx_type_in_set(true, TX_SET_INTER_3, IDTX));
+        assert!(!is_tx_type_in_set(true, TX_SET_INTER_3, ADST_DCT));
+        assert!(!is_tx_type_in_set(true, TX_SET_INTER_3, H_FLIPADST));
+    }
+
+    /// §5.11.40 `is_tx_type_in_set` over the three intra `txSet` rows.
+    /// `TX_SET_INTRA_1` admits 4 cross-DCT/ADST types + IDTX + V_DCT +
+    /// H_DCT (i.e. 7 entries); `TX_SET_INTRA_2` drops V_DCT + H_DCT (5
+    /// entries). Out-of-range tx_set / tx_type returns `false`.
+    #[test]
+    fn is_tx_type_in_set_intra_per_row() {
+        // TX_SET_DCTONLY: DCT_DCT only.
+        assert!(is_tx_type_in_set(false, TX_SET_DCTONLY, DCT_DCT));
+        assert!(!is_tx_type_in_set(false, TX_SET_DCTONLY, IDTX));
+        // TX_SET_INTRA_1: 4 cross-set + { IDTX, V_DCT, H_DCT }.
+        for t in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST, IDTX, V_DCT, H_DCT] {
+            assert!(
+                is_tx_type_in_set(false, TX_SET_INTRA_1, t),
+                "INTRA_1 admits {t}"
+            );
+        }
+        for t in [FLIPADST_DCT, DCT_FLIPADST, V_ADST, H_FLIPADST] {
+            assert!(
+                !is_tx_type_in_set(false, TX_SET_INTRA_1, t),
+                "INTRA_1 rejects {t}"
+            );
+        }
+        // TX_SET_INTRA_2: drops V_DCT / H_DCT vs INTRA_1.
+        assert!(is_tx_type_in_set(false, TX_SET_INTRA_2, IDTX));
+        assert!(!is_tx_type_in_set(false, TX_SET_INTRA_2, V_DCT));
+        assert!(!is_tx_type_in_set(false, TX_SET_INTRA_2, H_DCT));
+        // Out-of-range inputs return false rather than panicking.
+        assert!(!is_tx_type_in_set(false, 99, DCT_DCT));
+        assert!(!is_tx_type_in_set(true, 99, DCT_DCT));
+        assert!(!is_tx_type_in_set(false, TX_SET_INTRA_1, TX_TYPES));
+    }
+
+    /// §5.11.40 `compute_tx_type` short-circuits: `Lossless` returns
+    /// `DCT_DCT` ignoring everything; `txSzSqrUp > TX_32X32` (e.g.
+    /// `TX_64X64`, ordinal 4) returns `DCT_DCT` regardless of plane /
+    /// is_inter / tx_set.
+    #[test]
+    fn compute_tx_type_lossless_and_large_fallback() {
+        let tx_types = |_: u32, _: u32| ADST_ADST; // would-be luma result
+                                                   // Lossless: must collapse to DCT_DCT even for plane 0.
+        assert_eq!(
+            compute_tx_type(
+                0,
+                TX_8X8,
+                true,
+                false,
+                TX_SET_INTRA_1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                tx_types
+            ),
+            DCT_DCT
+        );
+        // TX_64X64 -> txSzSqrUp == TX_64X64 > TX_32X32 -> DCT_DCT.
+        assert_eq!(
+            compute_tx_type(
+                0,
+                TX_64X64,
+                false,
+                true,
+                TX_SET_INTER_1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                tx_types
+            ),
+            DCT_DCT
+        );
+        // TX_32X64 (ordinal 11) also lifts to TX_64X64.
+        assert_eq!(
+            compute_tx_type(
+                0,
+                11,
+                false,
+                true,
+                TX_SET_INTER_1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                tx_types
+            ),
+            DCT_DCT
+        );
+        // Out-of-range tx_sz: treat as fallback (no panic).
+        assert_eq!(
+            compute_tx_type(
+                0,
+                99,
+                false,
+                true,
+                TX_SET_INTER_1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                tx_types
+            ),
+            DCT_DCT
+        );
+    }
+
+    /// §5.11.40 `compute_tx_type` luma branch (`plane == 0`): returns
+    /// the `TxTypes[blockY][blockX]` cache entry verbatim (no
+    /// admission filter, no `Max(MiRow, ...)` lift). The chroma
+    /// `is_tx_type_in_set` admission filter does not apply.
+    #[test]
+    fn compute_tx_type_plane_zero_returns_cache_entry() {
+        // The closure encodes a 2D cache; the function must read
+        // exactly (block_y, block_x) without applying subsampling /
+        // MI-grid lift.
+        let cache = |y: u32, x: u32| ((y * 4 + x) as usize) % TX_TYPES;
+        let result = compute_tx_type(
+            0,
+            TX_8X8,
+            false,
+            true,
+            TX_SET_INTER_1,
+            10,
+            20, // MiRow / MiCol (ignored on luma)
+            3,
+            2,
+            1,
+            1, // subsampling (ignored on luma)
+            5, // uv_mode (ignored on luma)
+            cache,
+        );
+        assert_eq!(result, (2 * 4 + 3) % TX_TYPES);
+    }
+
+    /// §5.11.40 `compute_tx_type` inter chroma branch: reads
+    /// `TxTypes[Max(MiRow, blockY<<ssY)][Max(MiCol, blockX<<ssX)]`
+    /// then admits per `is_tx_type_in_set(true, txSet, txType)` else
+    /// returns `DCT_DCT`. Covers (a) the `Max` lift firing when
+    /// `MiCol > blockX<<ssX`, (b) the admission filter passing, and
+    /// (c) the admission filter falling back.
+    #[test]
+    fn compute_tx_type_inter_chroma_max_lift_and_admission() {
+        // (a) Max lift: subsampling_x = 1, block_x = 1, MiCol = 4. The
+        // spec computes `Max(MiCol, 1 << 1) = Max(4, 2) = 4`, so the
+        // cache lookup must be at column 4 (not 2). Encode the cache
+        // so column-4 reads return ADST_DCT but column-2 reads return
+        // a clearly-disadmitted ADST_FLIPADST.
+        let cache = |y: u32, x: u32| {
+            if y == 4 && x == 4 {
+                ADST_DCT // admitted under TX_SET_INTER_1 / INTER_2
+            } else if y == 4 && x == 2 {
+                ADST_FLIPADST // not selected if Max lift works
+            } else {
+                FLIPADST_FLIPADST
+            }
+        };
+        let r = compute_tx_type(
+            1,
+            TX_8X8,
+            false,
+            true,
+            TX_SET_INTER_1,
+            4,
+            4, // MiRow = MiCol = 4
+            1,
+            1,
+            1,
+            1, // block_x = block_y = 1; subsampling = 1
+            0,
+            cache,
+        );
+        assert_eq!(r, ADST_DCT);
+
+        // (b) Admission pass: TX_SET_INTER_3 admits { IDTX, DCT_DCT }.
+        // Cache returns IDTX; result must be IDTX (not DCT_DCT).
+        let idtx_cache = |_: u32, _: u32| IDTX;
+        let r2 = compute_tx_type(
+            2,
+            TX_8X8,
+            false,
+            true,
+            TX_SET_INTER_3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            idtx_cache,
+        );
+        assert_eq!(r2, IDTX);
+
+        // (c) Admission fail: TX_SET_INTER_3 rejects ADST_DCT, so the
+        // §5.11.40 `!is_tx_type_in_set` fallback returns DCT_DCT.
+        let adst_cache = |_: u32, _: u32| ADST_DCT;
+        let r3 = compute_tx_type(
+            2,
+            TX_8X8,
+            false,
+            true,
+            TX_SET_INTER_3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            adst_cache,
+        );
+        assert_eq!(r3, DCT_DCT);
+    }
+
+    /// §5.11.40 `compute_tx_type` intra chroma branch:
+    /// `Mode_To_Txfm[UVMode]` then `is_tx_type_in_set(false, txSet,
+    /// txType)`. The `TxTypes` closure is *not* invoked. Covers a
+    /// successful admission path, a fallback path, and an
+    /// out-of-range `uv_mode` (returns DCT_DCT).
+    #[test]
+    fn compute_tx_type_intra_chroma_uv_mode_path() {
+        // The closure must NOT be invoked on the intra chroma branch
+        // — drive it through a panic-on-call closure to prove it.
+        let never_call = |_: u32, _: u32| -> usize {
+            panic!("luma TxTypes cache must not be read on intra-chroma branch")
+        };
+
+        // (a) UVMode = D135_PRED (4) -> ADST_ADST. INTRA_1 admits it.
+        let r1 = compute_tx_type(
+            1,
+            TX_8X8,
+            false,
+            false,
+            TX_SET_INTRA_1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4,
+            never_call,
+        );
+        assert_eq!(r1, ADST_ADST);
+
+        // (b) UVMode = V_PRED (1) -> ADST_DCT. Under TX_SET_DCTONLY
+        // the admission filter rejects -> DCT_DCT fallback.
+        let r2 = compute_tx_type(
+            1,
+            TX_8X8,
+            false,
+            false,
+            TX_SET_DCTONLY,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            never_call,
+        );
+        assert_eq!(r2, DCT_DCT);
+
+        // (c) Out-of-range uv_mode -> DCT_DCT.
+        let r3 = compute_tx_type(
+            2,
+            TX_8X8,
+            false,
+            false,
+            TX_SET_INTRA_1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            99,
+            never_call,
+        );
+        assert_eq!(r3, DCT_DCT);
+    }
+
+    /// §5.11.40 `compute_tx_type` and the existing
+    /// [`inter_tx_type_set`] / [`intra_tx_type_set`] selectors form a
+    /// closed loop: the txSet that selector returns for a given
+    /// (tx_sz_sqr, tx_sz_sqr_up, reduced_tx_set) triple is the txSet
+    /// the admission filter must use. Spot-check the loop for a
+    /// 16×16 inter chroma block.
+    #[test]
+    fn compute_tx_type_uses_selector_consistent_tx_set() {
+        // tx_sz = TX_16X16 -> sqr = sqr_up = TX_16X16.
+        let tx_sz_sqr = TX_WIDTH[TX_16X16].trailing_zeros() - 2; // 16 -> log2=4, bwl_index 2
+                                                                 // Just use the spec's explicit ordinal: TX_16X16.
+        let tx_set = inter_tx_type_set(TX_16X16 as u32, TX_16X16 as u32, false);
+        assert_eq!(tx_set, TX_SET_INTER_2);
+
+        // Cache returns DCT_DCT (admitted under INTER_2). Result is
+        // DCT_DCT.
+        let cache = |_: u32, _: u32| DCT_DCT;
+        let r = compute_tx_type(1, TX_16X16, false, true, tx_set, 0, 0, 0, 0, 0, 0, 0, cache);
+        assert_eq!(r, DCT_DCT);
+        // Silence "unused" warning on the local — it documents the
+        // bwl ordinal the closure-free path computes.
+        let _ = tx_sz_sqr;
     }
 }
