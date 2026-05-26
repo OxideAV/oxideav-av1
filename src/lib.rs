@@ -850,6 +850,38 @@
 //!     `decode_block` coefficient / motion-vector / reconstruction
 //!     path entirely to the next round.
 //!
+//!   * **Round 152.** The §5.11.11 `read_skip()` syntax element
+//!     (av1-spec p.65) — the per-block `skip` syntax read. Lands as
+//!     a new [`PartitionWalker::decode_skip`] method on the r151
+//!     walker, plus a `Skips[r][c]` flag grid carried alongside the
+//!     existing §6.10.4 `MiSizes[]` grid. Both spec branches are
+//!     honoured: when the caller passes `seg_skip_active = true`
+//!     (the combined precondition `SegIdPreSkip &&
+//!     seg_feature_active( SEG_LVL_SKIP )` from §5.9.14
+//!     segmentation state, computed upstream by the frame parser),
+//!     the spec short-circuits to `skip = 1` with no symbol read;
+//!     otherwise an `S()` symbol is decoded against
+//!     `TileSkipCdf[ctx]` where `ctx = AvailU *
+//!     Skips[MiRow-1][MiCol] + AvailL * Skips[MiRow][MiCol-1]` per
+//!     av1-spec p.378, driven through the walker's `Skips[]` grid
+//!     and [`TileGeometry::is_inside`] for `AvailU` / `AvailL`. The
+//!     §5.11.5 grid-fill (av1-spec p.65 footer) stamps the decoded
+//!     value over the block's `bw4 * bh4` footprint, clipped at the
+//!     frame's `MiRows` / `MiCols` extent. New
+//!     [`PartitionWalker::skips`] accessor returns a row-major view
+//!     of the grid for downstream §5.11.x consumers. Out-of-range
+//!     `mi_row` / `mi_col` / `sub_size` surface as
+//!     [`Error::PartitionWalkOutOfRange`]. Tests cover: seg
+//!     short-circuit no-symbol-read invariant; else-branch S()
+//!     against rigged 2-symbol CDFs (forced 0 and 1); footprint
+//!     grid-stamp on both branches; ctx-0 selection at the frame
+//!     origin (`AvailU = AvailL = false`); ctx-2 selection through
+//!     two prior `Skips=1` neighbours; AvailL-false at the
+//!     left-tile-column boundary; non-zero tile origin clearing
+//!     both `AvailU` / `AvailL`; right-edge `bw4` clip; out-of-range
+//!     guard returns; and the initial all-zero `Skips[]` invariant.
+//!     394 -> 405 tests, zero `#[ignore]`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a

@@ -1246,6 +1246,34 @@ leaf; construction overflow; `take_blocks` drain semantics.
 coefficient decode + motion-vector decode + reconstruction)
 behind the now-complete partition walker.
 
+Round 152 lands the §5.11.11 **`read_skip()` syntax element**
+(av1-spec p.65) as a new `PartitionWalker::decode_skip` method
+plus a `Skips[r][c]` flag grid on the walker (parallel to the
+§6.10.4 `MiSizes[]` grid landed in r151). Both spec branches are
+honoured: the `SegIdPreSkip && seg_feature_active(SEG_LVL_SKIP)`
+short-circuit (no symbol read, `skip = 1`) is taken when the
+caller passes `seg_skip_active = true`; otherwise an `S()` symbol
+is decoded against `TileSkipCdf[ctx]` with the §8.3.2 ctx `ctx =
+AvailU * Skips[MiRow-1][MiCol] + AvailL * Skips[MiRow][MiCol-1]`
+(av1-spec p.378). The decoded value is stamped over the block's
+`bw4 * bh4` footprint of `Skips[]` per the §5.11.5 footer (clipped
+at the frame's `MiRows` / `MiCols` extent). New
+`PartitionWalker::skips()` accessor surfaces a row-major view of
+the grid for downstream consumers. The combined precondition
+`SegIdPreSkip && seg_feature_active(SEG_LVL_SKIP)` is computed
+upstream by the frame parser — the walker stays segmentation-state
+free. 11 new cdf-module tests (394 -> 405): seg short-circuit
+returns 1 with no symbol read; else branch returns the rigged
+symbol on a forced binary CDF; seg- + else-branch grid-stamp
+invariant; origin ctx = 0; ctx-2 path through two prior
+`Skips=1` neighbours; AvailL-false drops the left contribution;
+non-zero tile origin clears AvailU / AvailL; right-edge `bw4`
+clip; out-of-range `mi_row` / `mi_col` / `sub_size` ⇒
+`PartitionWalkOutOfRange`; fresh-walker grid all-zero. The §5.11.5
+`decode_block()` body itself (coefficient / motion-vector /
+reconstruction) remains the next round's target. `decode_av1` and
+`encode_av1` still return `Error::NotImplemented`.
+
 ## Sources consulted (clean-room wall)
 
 * AV1 Bitstream & Decoding Process Specification — AOMedia, copy at

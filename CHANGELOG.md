@@ -6,6 +6,41 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 152 — §5.11.11 `read_skip()` syntax element.** Lands
+  the per-block `skip` read (av1-spec p.65) as a new
+  [`PartitionWalker::decode_skip`] method, plus a `Skips[r][c]`
+  flag grid on the walker (parallel to the existing §6.10.4
+  `MiSizes[]` grid). Honours both spec branches: the
+  `SegIdPreSkip && seg_feature_active( SEG_LVL_SKIP )`
+  short-circuit (no symbol read, `skip = 1`) is taken when the
+  caller passes `seg_skip_active = true`; otherwise an `S()`
+  symbol is decoded against `TileSkipCdf[ ctx ]` with the §8.3.2
+  ctx `ctx = AvailU * Skips[MiRow-1][MiCol] + AvailL *
+  Skips[MiRow][MiCol-1]` (av1-spec p.378). The §5.11.5 footer's
+  `Skips[r+y][c+x] = skip` line is applied literally over the
+  block's `bw4 * bh4` footprint (clipped at the frame's MiRows /
+  MiCols extent). New [`PartitionWalker::skips`] accessor returns
+  a row-major view of the grid for downstream §5.11.x consumers.
+  The walker itself does not track segmentation state (the
+  segment id is per-block and is read by a separate §5.11.9
+  `intra_segment_id()` call site that lives in the frame parser);
+  the combined `SegIdPreSkip && seg_feature_active(SEG_LVL_SKIP)`
+  precondition is computed upstream and passed in. Tests grow by
+  11 (cdf module): seg short-circuit returns 1 with no symbol
+  read; else branch returns the rigged symbol (0 / 1) on a
+  forced binary CDF; seg-branch + else-branch both stamp the
+  `Skips[]` footprint; origin ctx = 0; ctx-2 path through two
+  prior `Skips=1` neighbours; AvailL-false drops the
+  left-neighbour contribution; non-zero tile origin clears both
+  AvailU / AvailL; right-edge `bw4` clip; out-of-range
+  (`mi_row`, `mi_col`, `sub_size`) ⇒
+  `Error::PartitionWalkOutOfRange`; fresh-walker grid is all
+  zero. The §5.11.5 `decode_block()` body itself (coefficient /
+  motion-vector / reconstruction) remains the next round's
+  target; this round drops the `Skips[]` grid + the `read_skip()`
+  read that everything in §5.11.12 onwards reads against. 394 ->
+  405 tests, zero `#[ignore]`.
+
 * **Round 151 — §5.11.4 `decode_partition()` body.** Lands the
   recursive partition-tree walker (av1-spec p.61–62) as a new
   [`PartitionWalker`] type. The walker stitches together every
