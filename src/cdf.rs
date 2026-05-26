@@ -8065,6 +8065,161 @@ pub fn palette_color_ctx(color_context_hash: usize) -> Option<usize> {
     }
 }
 
+/// §5.11.50 `get_palette_color_context` output: the two pieces of state
+/// the spec derivation writes — the partial-selection-sort permutation
+/// of the palette indices (`ColorOrder[ PALETTE_COLORS ]`, used by the
+/// caller to remap `palette_color_idx_*` after the cdf decode) and the
+/// `ColorContextHash` (input to [`palette_color_ctx`]).
+///
+/// `color_order` is `0..PALETTE_COLORS` with the top
+/// [`PALETTE_NUM_NEIGHBORS`] slots in descending-score order followed by
+/// the remaining indices in their original ascending order. Only the
+/// first `n` slots are addressable from the cdf decode (the
+/// `palette_size_*` cdf rows have width `n`); the trailing slots are
+/// preserved as the spec leaves them.
+///
+/// `color_context_hash` is in `0..=PALETTE_MAX_COLOR_CONTEXT_HASH` and
+/// always indexes a `Some(_)` entry of [`PALETTE_COLOR_CONTEXT`] when
+/// fed back through [`palette_color_ctx`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaletteColorContext {
+    /// `ColorOrder[ PALETTE_COLORS ]` — the permutation of palette
+    /// indices the §5.11.50 partial sort produces.
+    pub color_order: [u8; PALETTE_COLORS],
+    /// `ColorContextHash` — the §5.11.50 weighted-score sum. Indexes
+    /// [`PALETTE_COLOR_CONTEXT`] via [`palette_color_ctx`].
+    pub color_context_hash: usize,
+}
+
+/// §5.11.50 `get_palette_color_context` core — derives the
+/// [`PaletteColorContext`] from the three palette-neighbour indices that
+/// the spec function reads out of `colorMap` (left = `colorMap[r][c-1]`,
+/// above-left = `colorMap[r-1][c-1]`, above = `colorMap[r-1][c]`). Pass
+/// `None` for any neighbour that the §5.11.50 `c > 0` / `r > 0` guards
+/// reject as out-of-block.
+///
+/// `n` is the palette size (the `palette_size_y` / `palette_size_uv`
+/// the caller decoded via the size cdf, in `2..=PALETTE_COLORS`). Out
+/// of range yields `None`; the §5.11.50 partial selection sort uses
+/// `j < n` for its inner-loop upper bound, so the size must be in
+/// range for the derivation to be well-defined.
+///
+/// The neighbour indices must themselves be `< PALETTE_COLORS` (palette
+/// indices are coded by the §5.11.49 `palette_color_idx_*` cdfs whose
+/// widths are at most `PALETTE_COLORS`); a higher value would address
+/// `scores[]` out of range so this helper rejects it with `None`.
+pub fn palette_color_context_from_neighbors(
+    left: Option<u8>,
+    above_left: Option<u8>,
+    above: Option<u8>,
+    n: usize,
+) -> Option<PaletteColorContext> {
+    if !(2..=PALETTE_COLORS).contains(&n) {
+        return None;
+    }
+
+    // §5.11.50: scores[i] = 0; ColorOrder[i] = i  for i in 0..PALETTE_COLORS.
+    let mut scores = [0u32; PALETTE_COLORS];
+    let mut color_order = [0u8; PALETTE_COLORS];
+    for (i, slot) in color_order.iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+
+    // §5.11.50 neighbour accumulations: the left and above neighbours
+    // contribute +2, the above-left neighbour contributes +1.
+    let mut add = |neighbor: Option<u8>, weight: u32| -> Option<()> {
+        if let Some(idx) = neighbor {
+            let idx = idx as usize;
+            if idx >= PALETTE_COLORS {
+                return None;
+            }
+            scores[idx] += weight;
+        }
+        Some(())
+    };
+    add(left, 2)?;
+    add(above_left, 1)?;
+    add(above, 2)?;
+
+    // §5.11.50 partial selection sort: for the first PALETTE_NUM_NEIGHBORS
+    // slots, find the maximum-scoring entry in scores[i + 1 .. n] and
+    // swap it to the front, shifting the intervening entries right (so
+    // the relative order of the runners-up is preserved).
+    for i in 0..PALETTE_NUM_NEIGHBORS {
+        let mut max_score = scores[i];
+        let mut max_idx = i;
+        for (j, &score) in scores.iter().enumerate().take(n).skip(i + 1) {
+            if score > max_score {
+                max_score = score;
+                max_idx = j;
+            }
+        }
+        if max_idx != i {
+            let max_color_order = color_order[max_idx];
+            for k in (i + 1..=max_idx).rev() {
+                scores[k] = scores[k - 1];
+                color_order[k] = color_order[k - 1];
+            }
+            scores[i] = max_score;
+            color_order[i] = max_color_order;
+        }
+    }
+
+    // §5.11.50: ColorContextHash = sum_{i=0..PALETTE_NUM_NEIGHBORS}
+    //   scores[i] * Palette_Color_Hash_Multipliers[i].
+    let mut color_context_hash: u32 = 0;
+    for i in 0..PALETTE_NUM_NEIGHBORS {
+        color_context_hash += scores[i] * PALETTE_COLOR_HASH_MULTIPLIERS[i];
+    }
+
+    Some(PaletteColorContext {
+        color_order,
+        color_context_hash: color_context_hash as usize,
+    })
+}
+
+/// §5.11.50 `get_palette_color_context( colorMap, r, c, n )` — the
+/// spec-faithful 2-D entry point. `color_map` is a row-major slice of
+/// palette indices with `stride` entries per row; `(r, c)` is the
+/// current position in the diagonal walk (§5.11.49 reads
+/// `palette_color_idx_*` once per `(r, c)` along the anti-diagonal).
+///
+/// The §5.11.50 boundary guards (`r > 0`, `c > 0`) decide which
+/// neighbours are read; this helper applies them and then defers to
+/// [`palette_color_context_from_neighbors`] for the scoring.
+///
+/// Returns `None` if `n` is out of `2..=PALETTE_COLORS`, if `(r, c)`
+/// (or any read neighbour) falls outside `stride` × ⌈len/stride⌉, or
+/// if any read neighbour holds a value `>= PALETTE_COLORS`.
+pub fn get_palette_color_context(
+    color_map: &[u8],
+    stride: usize,
+    r: usize,
+    c: usize,
+    n: usize,
+) -> Option<PaletteColorContext> {
+    if stride == 0 {
+        return None;
+    }
+    let at = |row: usize, col: usize| -> Option<u8> {
+        if col >= stride {
+            return None;
+        }
+        color_map.get(row * stride + col).copied()
+    };
+    // The center position must itself be in-bounds — the §5.11.49 walk
+    // would not have called this helper otherwise.
+    at(r, c)?;
+    let left = if c > 0 { Some(at(r, c - 1)?) } else { None };
+    let above_left = if r > 0 && c > 0 {
+        Some(at(r - 1, c - 1)?)
+    } else {
+        None
+    };
+    let above = if r > 0 { Some(at(r - 1, c)?) } else { None };
+    palette_color_context_from_neighbors(left, above_left, above, n)
+}
+
 /// §8.3.2 `cfl_alpha_u` context: `ctx = (signU - 1) * 3 + signV`, which
 /// the spec notes equals `cfl_alpha_signs - 2`. `sign_u` / `sign_v` are
 /// the §5.11.45 joint-sign components (`CFL_SIGN_ZERO == 0`,
@@ -10310,6 +10465,294 @@ mod tests {
             }
         }
         assert_eq!(PALETTE_COLOR_HASH_MULTIPLIERS, [1, 2, 2]);
+    }
+
+    /// §5.11.50 `get_palette_color_context` — spec example: every
+    /// neighbour holds palette index 0. `scores[0] = 2 + 1 + 2 = 5`;
+    /// after the partial selection sort `scores = [5, 0, 0, ...]`. Hash
+    /// = `5 * 1 + 0 * 2 + 0 * 2 = 5` which maps to `palette_color_ctx`
+    /// 4. `ColorOrder` keeps the natural ascending identity since `0`
+    /// is already at slot 0.
+    #[test]
+    fn palette_color_context_all_same_neighbor() {
+        let pcc = palette_color_context_from_neighbors(Some(0), Some(0), Some(0), 4).unwrap();
+        assert_eq!(pcc.color_context_hash, 5);
+        assert_eq!(palette_color_ctx(pcc.color_context_hash), Some(4));
+        assert_eq!(pcc.color_order, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// §5.11.50 — left = 0, above = 1, no above-left: `scores =
+    /// [2, 2, 0, ...]`. The partial selection sort picks the tying
+    /// `scores[1]` as the max at i = 1 (already in place) so the
+    /// sorted-scores layout is `[2, 2, 0, ...]` and `ColorOrder[0..3]
+    /// = [0, 1, 2]`. Hash = `2 * 1 + 2 * 2 + 0 * 2 = 6` -> ctx 3.
+    #[test]
+    fn palette_color_context_left_and_above_distinct() {
+        let pcc = palette_color_context_from_neighbors(Some(0), None, Some(1), 4).unwrap();
+        assert_eq!(pcc.color_context_hash, 6);
+        assert_eq!(palette_color_ctx(pcc.color_context_hash), Some(3));
+        assert_eq!(&pcc.color_order[..3], &[0, 1, 2]);
+    }
+
+    /// §5.11.50 — left = above = 1 (different from above-left = 0):
+    /// `scores[1] = 4`, `scores[0] = 1`. After the partial sort the
+    /// index `1` is promoted to slot 0; the remaining indices fall in
+    /// their original ascending order so the runner-up at slot 1 is
+    /// the original index `0`. Hash = `4 * 1 + 1 * 2 + 0 * 2 = 6` ->
+    /// ctx 3.
+    #[test]
+    fn palette_color_context_partial_sort_swap() {
+        let pcc = palette_color_context_from_neighbors(Some(1), Some(0), Some(1), 4).unwrap();
+        assert_eq!(pcc.color_context_hash, 6);
+        assert_eq!(palette_color_ctx(pcc.color_context_hash), Some(3));
+        // The §5.11.50 shift moves the winner from slot 1 to slot 0
+        // and pushes the original slot-0 entry down to slot 1.
+        assert_eq!(&pcc.color_order[..4], &[1, 0, 2, 3]);
+    }
+
+    /// §5.11.50 — three distinct neighbours: left = 2, above-left = 1,
+    /// above = 3. `scores[1] = 1`, `scores[2] = 2`, `scores[3] = 2`.
+    /// The partial sort promotes the first-encountered tied max
+    /// (index 2) to slot 0, then the second tied max (now at slot 3
+    /// after the shift) to slot 1; index 1 (the +1 above-left) stays
+    /// in its ascending position. Hash = `2 * 1 + 2 * 2 + 1 * 2 = 8`
+    /// -> ctx 1.
+    #[test]
+    fn palette_color_context_three_distinct_neighbors() {
+        let pcc = palette_color_context_from_neighbors(Some(2), Some(1), Some(3), 5).unwrap();
+        assert_eq!(pcc.color_context_hash, 8);
+        assert_eq!(palette_color_ctx(pcc.color_context_hash), Some(1));
+        assert_eq!(&pcc.color_order[..5], &[2, 3, 1, 0, 4]);
+    }
+
+    /// §5.11.50 — the no-neighbour case (the top-left corner of the
+    /// palette block, `r == 0` and `c == 0`): every `scores[i] = 0`,
+    /// the partial sort is a no-op, `ColorOrder` stays the identity,
+    /// and `ColorContextHash = 0` (which is one of the `-1` slots of
+    /// `Palette_Color_Context` and therefore unreachable from the
+    /// §5.11.49 walk — the spec guarantees the function isn't called
+    /// at the top-left position).
+    #[test]
+    fn palette_color_context_no_neighbors() {
+        let pcc = palette_color_context_from_neighbors(None, None, None, 2).unwrap();
+        assert_eq!(pcc.color_context_hash, 0);
+        assert_eq!(palette_color_ctx(pcc.color_context_hash), None);
+        assert_eq!(pcc.color_order, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// §5.11.50 — the `n` argument out of `2..=PALETTE_COLORS` is a
+    /// caller bug (the size cdf only emits values in that range). The
+    /// helper rejects both `n == 0` / `n == 1` (below the minimum
+    /// palette size of 2) and `n > PALETTE_COLORS` with `None`.
+    #[test]
+    fn palette_color_context_palette_size_out_of_range() {
+        assert!(palette_color_context_from_neighbors(Some(0), None, None, 0).is_none());
+        assert!(palette_color_context_from_neighbors(Some(0), None, None, 1).is_none());
+        assert!(
+            palette_color_context_from_neighbors(Some(0), None, None, PALETTE_COLORS + 1).is_none()
+        );
+        for n in 2..=PALETTE_COLORS {
+            assert!(palette_color_context_from_neighbors(Some(0), None, None, n).is_some());
+        }
+    }
+
+    /// §5.11.50 — every neighbour value must itself be a valid
+    /// palette index (`< PALETTE_COLORS`). The §5.11.49 walk decodes
+    /// `palette_color_idx_*` against a cdf row of width at most
+    /// `PALETTE_COLORS`, so a higher value would be a caller bug; the
+    /// helper rejects it rather than indexing `scores[]` out of range.
+    #[test]
+    fn palette_color_context_out_of_range_neighbor_rejected() {
+        assert!(
+            palette_color_context_from_neighbors(Some(PALETTE_COLORS as u8), None, None, 4)
+                .is_none()
+        );
+        assert!(
+            palette_color_context_from_neighbors(None, Some(PALETTE_COLORS as u8), None, 4)
+                .is_none()
+        );
+        assert!(
+            palette_color_context_from_neighbors(None, None, Some(PALETTE_COLORS as u8), 4)
+                .is_none()
+        );
+    }
+
+    /// §5.11.50 — every spec-realisable `(left, above_left, above)`
+    /// combination at every palette size produces a `ColorContextHash`
+    /// in `0..=PALETTE_MAX_COLOR_CONTEXT_HASH` and a `ColorOrder` that
+    /// is a permutation of `0..PALETTE_COLORS`. The §5.11.50 guards
+    /// constrain which combinations the §5.11.49 walk reaches:
+    ///
+    /// * the spec function is never called at the top-left position
+    ///   (`r == 0 && c == 0`); the §5.11.49 caller sets
+    ///   `ColorMap[0][0]` directly via `color_index_map_*`, so the
+    ///   all-`None` case is forbidden;
+    /// * `above_left` requires `r > 0 && c > 0` — it cannot be
+    ///   present without `left` (which only requires `c > 0`) and
+    ///   `above` (which only requires `r > 0`) also being present.
+    ///
+    /// Every reachable hash must therefore map to a `Some(_)` ctx
+    /// through [`palette_color_ctx`], which cross-checks the spec
+    /// note that the `-1` entries of [`PALETTE_COLOR_CONTEXT`] are
+    /// unreachable from the §5.11.50 derivation.
+    #[test]
+    fn palette_color_context_hash_in_range_and_reachable_ctxs_resolve() {
+        let mut reachable: [bool; PALETTE_MAX_COLOR_CONTEXT_HASH + 1] =
+            [false; PALETTE_MAX_COLOR_CONTEXT_HASH + 1];
+        // (left_present, above_present, above_left_present) — the
+        // spec-realisable subset. Above-left requires both row and
+        // column > 0; the all-`None` combo is excluded.
+        let presence = [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ];
+        for n in 2..=PALETTE_COLORS {
+            let palette: Vec<u8> = (0..n as u8).collect();
+            for &(has_l, has_a, has_al) in &presence {
+                let l_opts: Vec<Option<u8>> = if has_l {
+                    palette.iter().map(|&v| Some(v)).collect()
+                } else {
+                    vec![None]
+                };
+                let a_opts: Vec<Option<u8>> = if has_a {
+                    palette.iter().map(|&v| Some(v)).collect()
+                } else {
+                    vec![None]
+                };
+                let al_opts: Vec<Option<u8>> = if has_al {
+                    palette.iter().map(|&v| Some(v)).collect()
+                } else {
+                    vec![None]
+                };
+                for &l in &l_opts {
+                    for &al in &al_opts {
+                        for &a in &a_opts {
+                            let pcc = palette_color_context_from_neighbors(l, al, a, n).unwrap();
+                            assert!(
+                                pcc.color_context_hash <= PALETTE_MAX_COLOR_CONTEXT_HASH,
+                                "hash {} out of range for n={} neighbours=({:?},{:?},{:?})",
+                                pcc.color_context_hash,
+                                n,
+                                l,
+                                al,
+                                a
+                            );
+                            reachable[pcc.color_context_hash] = true;
+                            // `ColorOrder` is a permutation of 0..PALETTE_COLORS.
+                            let mut seen = [false; PALETTE_COLORS];
+                            for &v in &pcc.color_order {
+                                assert!((v as usize) < PALETTE_COLORS);
+                                assert!(!seen[v as usize]);
+                                seen[v as usize] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Every reachable hash maps to a `Some(_)` ctx.
+        for (h, &is_reachable) in reachable.iter().enumerate() {
+            if is_reachable {
+                assert!(
+                    palette_color_ctx(h).is_some(),
+                    "reachable hash {} mapped to None",
+                    h
+                );
+            }
+        }
+        // The `-1` entries of `PALETTE_COLOR_CONTEXT` (hashes 0, 1,
+        // 3, 4) must all be unreachable from the spec-realisable
+        // subset.
+        for &h in &[0usize, 1, 3, 4] {
+            assert!(!reachable[h], "hash {} should be unreachable", h);
+        }
+    }
+
+    /// §5.11.50 `get_palette_color_context( colorMap, r, c, n )` — the
+    /// 2-D entry point. Build a 4×4 `colorMap` and read at an interior
+    /// position; the helper should produce the same result as feeding
+    /// the three neighbours to
+    /// [`palette_color_context_from_neighbors`].
+    #[test]
+    fn palette_color_context_2d_entry_point() {
+        // colorMap:
+        //   row 0: [0, 1, 2, 3]
+        //   row 1: [1, 0, 1, 0]
+        //   row 2: [2, 1, 0, 1]
+        //   row 3: [3, 2, 1, 0]
+        let color_map: [u8; 16] = [0, 1, 2, 3, 1, 0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 0];
+        // Position (2, 2): above = colorMap[1][2] = 1, above-left =
+        // colorMap[1][1] = 0, left = colorMap[2][1] = 1.
+        let pcc_2d = get_palette_color_context(&color_map, 4, 2, 2, 4).unwrap();
+        let pcc_ref = palette_color_context_from_neighbors(Some(1), Some(0), Some(1), 4).unwrap();
+        assert_eq!(pcc_2d, pcc_ref);
+
+        // Position (0, 0): no neighbours at all.
+        let pcc_origin = get_palette_color_context(&color_map, 4, 0, 0, 4).unwrap();
+        assert_eq!(pcc_origin.color_context_hash, 0);
+        assert_eq!(pcc_origin.color_order, [0, 1, 2, 3, 4, 5, 6, 7]);
+
+        // Position (0, 1): only the left neighbour (colorMap[0][0] = 0)
+        // is read; `r > 0` is false so above / above-left are skipped.
+        let pcc_top = get_palette_color_context(&color_map, 4, 0, 1, 4).unwrap();
+        let pcc_top_ref = palette_color_context_from_neighbors(Some(0), None, None, 4).unwrap();
+        assert_eq!(pcc_top, pcc_top_ref);
+
+        // Position (1, 0): only the above neighbour (colorMap[0][0] =
+        // 0) is read; `c > 0` is false so left / above-left are skipped.
+        let pcc_lhs = get_palette_color_context(&color_map, 4, 1, 0, 4).unwrap();
+        let pcc_lhs_ref = palette_color_context_from_neighbors(None, None, Some(0), 4).unwrap();
+        assert_eq!(pcc_lhs, pcc_lhs_ref);
+    }
+
+    /// §5.11.50 — `get_palette_color_context` boundary-rejection
+    /// cases: zero stride, out-of-range `n`, out-of-range column.
+    #[test]
+    fn palette_color_context_2d_out_of_range() {
+        let color_map: [u8; 4] = [0, 1, 2, 3];
+        assert!(get_palette_color_context(&color_map, 0, 0, 0, 4).is_none());
+        assert!(get_palette_color_context(&color_map, 4, 0, 4, 4).is_none());
+        assert!(get_palette_color_context(&color_map, 4, 0, 0, 1).is_none());
+        // Out-of-buffer (1, 0) at stride 4 needs at least 8 entries.
+        assert!(get_palette_color_context(&color_map, 4, 1, 0, 4).is_none());
+    }
+
+    /// End-to-end: drive the real §8.2 `SymbolDecoder` through a
+    /// `palette_color_idx_y` default cdf selected via
+    /// [`palette_color_ctx`] applied to the
+    /// [`get_palette_color_context`] output. Confirms the helper +
+    /// cdf-selector + symbol-decoder chain produces an in-range
+    /// `palette_color_idx_y` and that the §8.2 adaptation runs.
+    #[test]
+    fn palette_color_idx_y_end_to_end_via_get_palette_color_context() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        // Build a small color map and pick an interior position where
+        // the derivation yields a hash that maps to a real ctx
+        // (left=0, above-left=0, above=0 -> hash 5 -> ctx 4).
+        let color_map: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let pcc = get_palette_color_context(&color_map, 3, 1, 1, 4).unwrap();
+        let palette_color_ctx_v = palette_color_ctx(pcc.color_context_hash).unwrap();
+        assert_eq!(palette_color_ctx_v, 4);
+
+        let cdf = ctx
+            .palette_y_color_cdf(4, palette_color_ctx_v)
+            .unwrap()
+            .to_vec();
+        assert_eq!(cdf, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF[4]);
+
+        // Decode a single symbol: feed the cdf's range a deterministic
+        // stream and confirm the symbol lands in `0..4`.
+        let bytes = [0x10u8, 0x80u8, 0x00u8, 0x00u8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let row = ctx.palette_y_color_cdf(4, palette_color_ctx_v).unwrap();
+        let sym = dec.read_symbol(row).unwrap();
+        assert!((sym as usize) < 4, "palette_color_idx_y is in 0..4");
+        // disable_cdf_update was true ⇒ row untouched.
+        assert_eq!(
+            ctx.palette_y_color_cdf(4, palette_color_ctx_v).unwrap(),
+            &DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF[4]
+        );
     }
 
     /// §8.3.2 `cfl_alpha_u` / `cfl_alpha_v` context formulas. The spec

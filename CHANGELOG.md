@@ -6,6 +6,44 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 146 — §5.11.50 `get_palette_color_context` derivation.** Lands
+  the §5.11.50 palette colour-context function (p.103) that consumes the
+  `colorMap` at the §5.11.49 diagonal-walk position `(r, c)` plus the
+  decoded `palette_size_y` / `palette_size_uv` and produces the
+  `ColorOrder[ PALETTE_COLORS ]` permutation + `ColorContextHash` that
+  the §5.11.49 syntax feeds back through [`palette_color_ctx`] to the
+  §8.3.2 `palette_color_idx_*` cdf selector. Surface:
+  `palette_color_context_from_neighbors(left, above_left, above, n) ->
+  Option<PaletteColorContext>` (pure-scoring core taking the three
+  optional neighbour palette indices) and
+  `get_palette_color_context(color_map, stride, r, c, n) ->
+  Option<PaletteColorContext>` (spec-faithful 2-D entry that applies
+  the §5.11.50 `r > 0` / `c > 0` boundary guards). The
+  `PaletteColorContext { color_order, color_context_hash }` struct
+  packages both outputs; the partial selection sort is the §5.11.50
+  three-iteration loop that promotes the top-scoring neighbours to the
+  head of `ColorOrder` while preserving the runners-up's ascending
+  order. Tests grow by 11 (cdf module): spec example with every
+  neighbour holding the same palette index (`scores = [5, 0, 0]`, hash
+  5, ctx 4); distinct left/above with no above-left (hash 6, ctx 3);
+  partial-sort swap with two-of-three neighbours sharing an index
+  (hash 6, ctx 3); three distinct neighbours covering the +1 / +2
+  weight split (hash 8, ctx 1); the no-neighbour identity case (the
+  (0,0) corner the §5.11.49 walk never asks for); palette-size
+  rejection at `n ∉ 2..=PALETTE_COLORS`; out-of-range neighbour
+  rejection (any value `>= PALETTE_COLORS`); full spec-realisable
+  combinatorial sweep across every `(left, above_left, above)` at
+  every palette size confirming every reachable hash maps to a
+  `Some(_)` ctx and the `-1` entries of `PALETTE_COLOR_CONTEXT`
+  (hashes 0, 1, 3, 4) are unreachable; 2-D entry-point equivalence
+  with `palette_color_context_from_neighbors` across an interior
+  position, the top-left corner, top-row-only, and left-column-only
+  positions; 2-D boundary rejection (zero stride / OOB column / OOB
+  palette size / OOB row); end-to-end `SymbolDecoder` read through
+  the `palette_color_idx_y` default cdf selected by the
+  derivation -> `palette_color_ctx` -> `palette_y_color_cdf` chain.
+  Tests: 312 -> 323, zero `#[ignore]`.
+
 * **Round 145 — §8.3.2 `split_or_horz` / `split_or_vert` derivations.**
   Lands the two §8.3.2 cdf-derivation helpers that build a 2-symbol
   binary cdf out of the already-selected `partition` cdf (the spec's

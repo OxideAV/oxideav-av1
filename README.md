@@ -1053,9 +1053,38 @@ well-formedness across every default partition cdf row, drive the §8.2
 `SymbolDecoder` through both derived binary cdfs (`BLOCK_64X64` for
 `split_or_horz`, `BLOCK_128X128` for `split_or_vert`), and reject the
 disallowed `bsl == 1` W8 row with `None`.
-The remaining §8.3.2 selections (`get_above_palette_color_context` /
-`get_left_palette_color_context` tile-content walker derivations …) are
-a mechanical followup against the same `TileCdfContext` shape.
+Round 146 lands the §5.11.50 **`get_palette_color_context` derivation**
+(p.103) — the function the §5.11.49 diagonal-walk reads at each
+`palette_color_idx_*` position to derive the `ColorOrder[ PALETTE_COLORS ]`
+permutation + `ColorContextHash` that flow back through
+[`palette_color_ctx`] into the §8.3.2 cdf selector. Surface:
+`palette_color_context_from_neighbors(left, above_left, above, n) ->
+Option<PaletteColorContext>` (pure-scoring core taking the three optional
+neighbour palette indices) and `get_palette_color_context(color_map,
+stride, r, c, n) -> Option<PaletteColorContext>` (spec-faithful 2-D
+entry that applies the §5.11.50 `r > 0` / `c > 0` boundary guards). The
+partial selection sort is the §5.11.50 three-iteration loop that
+promotes the top-scoring neighbours to the head of `ColorOrder` while
+preserving the runners-up's ascending order; the hash is the
+`Palette_Color_Hash_Multipliers`-weighted sum of the top three sorted
+scores. 11 new unit tests (312 -> 323) cover the spec example (all-same
+neighbour, hash 5, ctx 4), distinct left/above (hash 6, ctx 3), the
+partial-sort swap (two-of-three neighbours sharing an index, hash 6,
+ctx 3), three distinct neighbours (hash 8, ctx 1), the no-neighbour
+identity, palette-size / neighbour-value rejection, the full
+spec-realisable combinatorial sweep across every `(left, above_left,
+above)` at every palette size (every reachable hash maps to a
+`Some(_)` ctx; the `-1` entries 0/1/3/4 are unreachable), 2-D
+entry-point equivalence (interior + top-left corner + top-row-only +
+left-column-only positions), 2-D boundary rejection (zero stride / OOB
+column / OOB palette size / OOB row), and an end-to-end `SymbolDecoder`
+read through the `palette_color_idx_y` default cdf selected by the
+derivation -> `palette_color_ctx` -> `palette_y_color_cdf` chain.
+The remaining §8.3.2 selections (the tile-content walker plumbing
+that wires `get_palette_color_context` into the §5.11.49 diagonal walk,
+plus the corresponding wedge / inter / intra walks for the unwalked
+syntax elements …) are a mechanical followup against the same
+`TileCdfContext` shape.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
 ## Sources consulted (clean-room wall)

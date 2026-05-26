@@ -706,6 +706,24 @@
 //!     [`BLOCK_128X128`] (`= 15`) replace the literal indices the §8.3.2
 //!     formulas use. 302 -> 312 tests, zero `#[ignore]`.
 //!
+//!   * **Round 146.** The §5.11.50 `get_palette_color_context`
+//!     derivation — the function the §5.11.49 diagonal walk reads at
+//!     each `palette_color_idx_*` position to produce the
+//!     `ColorOrder[ PALETTE_COLORS ]` permutation +
+//!     `ColorContextHash` that flow back through [`palette_color_ctx`]
+//!     into the §8.3.2 cdf selector. Surface:
+//!     [`palette_color_context_from_neighbors`] (pure-scoring core
+//!     taking the three optional neighbour palette indices) and
+//!     [`get_palette_color_context`] (spec-faithful 2-D entry that
+//!     applies the §5.11.50 `r > 0` / `c > 0` boundary guards). The
+//!     [`PaletteColorContext`] struct packages both outputs. The
+//!     partial selection sort is the §5.11.50 three-iteration loop
+//!     that promotes the top-scoring neighbours to the head of
+//!     `ColorOrder` while preserving the runners-up's ascending
+//!     order; the hash is the `Palette_Color_Hash_Multipliers`-
+//!     weighted sum of the top three sorted scores. 312 -> 323
+//!     tests, zero `#[ignore]`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -728,31 +746,33 @@ pub mod uncompressed_header_tail;
 
 pub use cdf::{
     cfl_alpha_u_ctx, cfl_alpha_v_ctx, coeff_cdf_q_ctx, compound_mode_ctx, compute_tx_type,
-    get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, get_tx_class, inter_tx_type_set,
-    interintra_ctx, interp_filter_ctx, intra_dir, intra_mode_ctx, intra_tx_type_set, is_inter_ctx,
-    is_tx_type_in_set, mv_ctx, palette_color_ctx, palette_uv_mode_ctx, palette_y_mode_ctx,
-    partition_ctx, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,
-    split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, TileCdfContext,
-    ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS,
-    CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET,
-    COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS, COMPOUND_MODES,
-    COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES, COMP_GROUP_IDX_CONTEXTS,
-    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DCT_ADST, DCT_DCT, DCT_FLIPADST,
-    DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF,
-    DEFAULT_COEFF_BASE_CDF, DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF,
-    DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF,
-    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF,
-    DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DRL_MODE_CDF,
-    DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF,
-    DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF,
-    DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF,
-    DEFAULT_INTER_INTRA_CDF, DEFAULT_INTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF,
-    DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
-    DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF,
-    DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
-    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
-    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
+    get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, get_palette_color_context,
+    get_tx_class, inter_tx_type_set, interintra_ctx, interp_filter_ctx, intra_dir, intra_mode_ctx,
+    intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mv_ctx,
+    palette_color_context_from_neighbors, palette_color_ctx, palette_uv_mode_ctx,
+    palette_y_mode_ctx, partition_ctx, ref_count_ctx, segment_id_ctx, size_group, skip_ctx,
+    skip_mode_ctx, split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx,
+    PaletteColorContext, TileCdfContext, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST,
+    BLOCK_128X128, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE,
+    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
+    COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
+    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
+    COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
+    DCT_ADST, DCT_DCT, DCT_FLIPADST, DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF,
+    DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COEFF_BASE_CDF,
+    DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF, DEFAULT_COMPOUND_IDX_CDF,
+    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF,
+    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
+    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF,
+    DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF,
+    DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF,
+    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF,
+    DEFAULT_INTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF,
+    DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF,
+    DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF,
+    DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
+    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
+    DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
     DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,
