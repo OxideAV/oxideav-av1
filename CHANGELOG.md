@@ -6,6 +6,48 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 154 — §5.11.10 `read_skip_mode()` syntax element.**
+  Lands the per-block `skip_mode` read (av1-spec p.67) as a new
+  [`PartitionWalker::decode_skip_mode`] method, plus a
+  `SkipModes[r][c]` flag grid on the walker (parallel to the
+  r152 `Skips[]` and the existing §6.10.4 `MiSizes[]` grids).
+  Honours the §5.11.10 short-circuit set (any-true ⇒
+  `skip_mode = 0`, no symbol read): `seg_feature_active(
+  SEG_LVL_SKIP / REF_FRAME / GLOBALMV )` collapsed into the
+  caller-provided `seg_skip_mode_off`; `!skip_mode_present` via
+  the §5.9.21 frame-header scalar; and `Block_Width[MiSize] < 8
+  || Block_Height[MiSize] < 8` derived locally from `sub_size`
+  via the §9.3 [`block_width`] / [`block_height`] tables.
+  Otherwise an `S()` symbol is decoded against
+  `TileSkipModeCdf[ ctx ]` with the §8.3.2 ctx `ctx = AvailU *
+  SkipModes[MiRow-1][MiCol] + AvailL *
+  SkipModes[MiRow][MiCol-1]` (av1-spec p.378), routed through
+  the existing [`skip_mode_ctx`] helper. The §5.11.5 footer's
+  `SkipModes[r+y][c+x] = skip_mode` line is applied literally
+  over the block's `bw4 * bh4` footprint (clipped at the frame's
+  MiRows / MiCols extent). New
+  [`PartitionWalker::skip_modes`] accessor returns a row-major
+  view of the grid for downstream §5.11.x consumers.
+  `skip_mode` is the inter-frame compound-reference shortcut
+  read in [`inter_frame_mode_info`] before the rest of the inter
+  mode decode; intra-only frames never call this. Tests grow by
+  12 (cdf module): seg short-circuit; `skip_mode_present` false
+  short-circuit; `Block_Width < 8` short-circuit (BLOCK_4X8);
+  `Block_Height < 8` short-circuit (BLOCK_8X4); else branch
+  returns the rigged symbol (0 / 1) on a forced binary CDF;
+  else-branch stamps the `SkipModes[]` footprint; origin ctx =
+  0; ctx-2 path through two prior `SkipModes=1` neighbours plus
+  ctx-1 single-neighbour variants; non-zero tile origin clears
+  both AvailU / AvailL; right-edge `bw4` clip; out-of-range
+  (`mi_row`, `mi_col`, `sub_size`) ⇒
+  `Error::PartitionWalkOutOfRange`; fresh-walker grid is all
+  zero. The §5.11.5 `decode_block()` body itself (coefficient /
+  motion-vector / reconstruction) remains the next round's
+  target; this round adds the `SkipModes[]` grid + the
+  `read_skip_mode()` read that §5.11.18 `inter_frame_mode_info`
+  consults before the rest of the inter-block decode. 405 ->
+  417 tests, zero `#[ignore]`.
+
 * **Round 152 — §5.11.11 `read_skip()` syntax element.** Lands
   the per-block `skip` read (av1-spec p.65) as a new
   [`PartitionWalker::decode_skip`] method, plus a `Skips[r][c]`

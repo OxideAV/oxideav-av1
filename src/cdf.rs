@@ -10511,6 +10511,13 @@ pub struct PartitionWalker {
     /// `bh4 * bw4` footprint of a block whose §5.11.11
     /// [`Self::decode_skip`] has already fired.
     skips: Vec<u8>,
+    /// `SkipModes[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec p.378 / §5.11.5 line
+    /// `SkipModes[ r + y ][ c + x ] = skip_mode`). Entries are `0` for
+    /// not-yet-decoded cells and `0` or `1` for cells in the
+    /// `bh4 * bw4` footprint of a block whose §5.11.10
+    /// [`Self::decode_skip_mode`] has already fired.
+    skip_modes: Vec<u8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -10539,12 +10546,16 @@ impl PartitionWalker {
         let mut skips: Vec<u8> = Vec::new();
         skips.try_reserve_exact(area).ok()?;
         skips.resize(area, 0);
+        let mut skip_modes: Vec<u8> = Vec::new();
+        skip_modes.try_reserve_exact(area).ok()?;
+        skip_modes.resize(area, 0);
         Some(Self {
             mi_rows,
             mi_cols,
             geometry,
             mi_sizes,
             skips,
+            skip_modes,
             blocks: Vec::new(),
         })
     }
@@ -10601,6 +10612,34 @@ impl PartitionWalker {
             return 0;
         }
         self.skips[(r * self.mi_cols + c) as usize]
+    }
+
+    /// View of the §6.10.4 `SkipModes[]` grid after the walk. Indexed
+    /// row-major: `skip_modes()[ r * MiCols + c ]`. Cells that no leaf
+    /// covered carry `0` (the §5.11.10 [`Self::decode_skip_mode`]
+    /// writer only fills the `bh4 * bw4` footprint of decoded blocks;
+    /// the initial-zero state matches the §5.11.5 `SkipModes[r+y][c+x]
+    /// = skip_mode` line for a decoder whose §5.11.10 hasn't fired
+    /// yet on the block).
+    #[must_use]
+    pub fn skip_modes(&self) -> &[u8] {
+        &self.skip_modes
+    }
+
+    /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for
+    /// out-of-grid coordinates (the §8.3.2 skip-mode ctx walk already
+    /// gates on `AvailU` / `AvailL`, so an unavailable neighbour's
+    /// contribution is zero either way).
+    #[inline]
+    fn skip_mode_at(&self, r: i32, c: i32) -> u8 {
+        if r < 0 || c < 0 {
+            return 0;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        self.skip_modes[(r * self.mi_cols + c) as usize]
     }
 
     /// Helper to read `MiSizes[ r ][ c ]`. Returns [`BLOCK_INVALID`]
@@ -10980,6 +11019,154 @@ impl PartitionWalker {
         }
 
         Ok(skip)
+    }
+
+    /// `read_skip_mode()` per §5.11.10 (av1-spec p.67) — reads the
+    /// per-block `skip_mode` syntax element at the leaf
+    /// `(mi_row, mi_col)` of a block whose §5.11.5 `MiSize` is
+    /// `sub_size`. `skip_mode` is the inter-frame "compound-reference
+    /// shortcut" flag read in [`inter_frame_mode_info`] (§5.11.18)
+    /// before the rest of the inter mode decode; it is never read for
+    /// intra-only frames.
+    ///
+    /// The spec body (av1-spec p.67) reads:
+    ///
+    /// ```text
+    ///   read_skip_mode() {
+    ///       if ( seg_feature_active( SEG_LVL_SKIP ) ||
+    ///            seg_feature_active( SEG_LVL_REF_FRAME ) ||
+    ///            seg_feature_active( SEG_LVL_GLOBALMV ) ||
+    ///            !skip_mode_present ||
+    ///            Block_Width[ MiSize ] < 8 ||
+    ///            Block_Height[ MiSize ] < 8 ) {
+    ///           skip_mode = 0
+    ///       } else {
+    ///           skip_mode                                       S()
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// The caller passes the combined precondition
+    /// `seg_skip_mode_off = seg_feature_active(SEG_LVL_SKIP) ||
+    /// seg_feature_active(SEG_LVL_REF_FRAME) ||
+    /// seg_feature_active(SEG_LVL_GLOBALMV)` (computed from the
+    /// §5.9.14 segmentation state owned by the frame parser — the
+    /// walker stays segmentation-state free) and the frame-header
+    /// scalar `skip_mode_present` (§5.9.21, av1-spec p.41). The
+    /// `Block_Width[MiSize] < 8 || Block_Height[MiSize] < 8`
+    /// short-circuit is derived locally from the `sub_size` argument
+    /// via the §9.3 [`block_width`] / [`block_height`] tables.
+    ///
+    /// Otherwise the §8.3.2 `skip_mode` context is computed as
+    /// `ctx = AvailU * SkipModes[MiRow-1][MiCol] + AvailL *
+    /// SkipModes[MiRow][MiCol-1]` (av1-spec p.378) — driven through
+    /// the walker's [`Self::skip_modes`] grid and the
+    /// [`TileGeometry`]'s `AvailU` / `AvailL` predicates via
+    /// [`skip_mode_ctx`] — and a `S()` symbol is decoded against
+    /// `TileSkipModeCdf[ctx]` (the `skip_mode_cdf(ctx)` accessor).
+    ///
+    /// The decoded `skip_mode` value is then stamped over the block's
+    /// `bw4 * bh4` footprint of [`Self::skip_modes`] per the §5.11.5
+    /// per-block invariant
+    ///
+    /// ```text
+    ///   for ( y = 0; y < bh4; y++ )
+    ///     for ( x = 0; x < bw4; x++ )
+    ///         SkipModes[ r + y ][ c + x ] = skip_mode
+    /// ```
+    ///
+    /// (av1-spec p.65, the §5.11.5 footer covering `SkipModes[]` /
+    /// `Skips[]` / `MiSizes[]` / etc.) so the next block's §8.3.2
+    /// skip-mode-ctx walk observes the value.
+    ///
+    /// Returns the decoded `skip_mode` value (0 or 1) on success, or
+    /// [`Error::PartitionWalkOutOfRange`] for caller bugs
+    /// (out-of-range `sub_size`, `mi_row` / `mi_col` outside the
+    /// frame's mi extent).
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_skip_mode(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        seg_skip_mode_off: bool,
+        skip_mode_present: bool,
+    ) -> Result<u8, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.10 short-circuit set (any-true ⇒ skip_mode = 0, no
+        // symbol read):
+        //   * seg_feature_active( SEG_LVL_SKIP / REF_FRAME / GLOBALMV )
+        //     — collapsed into the caller-provided `seg_skip_mode_off`.
+        //   * !skip_mode_present — the §5.9.21 frame-header scalar
+        //     gating skip-mode for the whole frame.
+        //   * Block_Width[ MiSize ] < 8 || Block_Height[ MiSize ] < 8 —
+        //     derived locally from `sub_size` via the §9.3 tables.
+        let bw = block_width(sub_size);
+        let bh = block_height(sub_size);
+        let small_block = bw < 8 || bh < 8;
+        let skip_mode = if seg_skip_mode_off || !skip_mode_present || small_block {
+            0u8
+        } else {
+            // §8.3.2 skip_mode ctx derivation (av1-spec p.378):
+            //   ctx = 0
+            //   if ( AvailU ) ctx += SkipModes[ MiRow - 1 ][ MiCol ]
+            //   if ( AvailL ) ctx += SkipModes[ MiRow ][ MiCol - 1 ]
+            let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+            let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+            let above_sm = if avail_u {
+                self.skip_mode_at(mi_row as i32 - 1, mi_col as i32)
+            } else {
+                0
+            };
+            let left_sm = if avail_l {
+                self.skip_mode_at(mi_row as i32, mi_col as i32 - 1)
+            } else {
+                0
+            };
+            let ctx = skip_mode_ctx(above_sm, left_sm);
+            // skip_mode_ctx is bounded by 0..=2 < SKIP_MODE_CONTEXTS
+            // (3); the `skip_mode_cdf` accessor is total over that
+            // range.
+            let cdf = cdfs.skip_mode_cdf(ctx);
+            // §8.2.6 S(): a 2-symbol read against
+            // `Default_Skip_Mode_Cdf` (length 3 including the counter
+            // slot) returns 0 or 1.
+            let sym = decoder.read_symbol(cdf)? as u8;
+            debug_assert!(sym <= 1, "S() over Default_Skip_Mode_Cdf yields 0 or 1");
+            sym
+        };
+
+        // §5.11.5 grid-fill: stamp `skip_mode` over the block's bh4 *
+        // bw4 footprint, clipped at the frame's MiRows / MiCols
+        // extent so a leaf straddling the bottom or right edge fills
+        // only the in-grid portion.
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.skip_modes[(rr * self.mi_cols + cc) as usize] = skip_mode;
+            }
+        }
+
+        Ok(skip_mode)
     }
 }
 
@@ -18393,5 +18580,359 @@ mod tests {
         let walker = PartitionWalker::new(16, 16, geom).unwrap();
         assert_eq!(walker.skips().len(), 16 * 16);
         assert!(walker.skips().iter().all(|&v| v == 0));
+    }
+
+    // Round 154 — §5.11.10 read_skip_mode walker tests.
+
+    /// Helper: force a 2-symbol skip_mode CDF row (length 3) to select
+    /// `symbol` on the next `read_symbol`. Mirrors `force_binary_cdf`
+    /// (the §9.4 `DEFAULT_SKIP_MODE_CDF` rows are also `[a, 1 << 15,
+    /// 0]`-shaped 2-symbol CDFs).
+    fn force_skip_mode_cdf(symbol: u8) -> [u16; 3] {
+        match symbol {
+            0 => [1 << 15, 1 << 15, 0],
+            1 => [0, 1 << 15, 0],
+            _ => panic!("force_skip_mode_cdf supports 0 or 1 only"),
+        }
+    }
+
+    /// §5.11.10 short-circuit set (case 1: seg short-circuit):
+    /// `seg_feature_active(SEG_LVL_SKIP / REF_FRAME / GLOBALMV)` any
+    /// true ⇒ `skip_mode = 0`, no symbol read. The decoder position
+    /// must not advance.
+    #[test]
+    fn decode_skip_mode_seg_short_circuit_no_symbol_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, true, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0, "seg_skip_mode_off ⇒ skip_mode = 0");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no symbol bit read on the seg short-circuit"
+        );
+    }
+
+    /// §5.11.10 short-circuit set (case 2: !skip_mode_present): the
+    /// frame-header scalar from §5.9.21 is off ⇒ `skip_mode = 0`, no
+    /// symbol read.
+    #[test]
+    fn decode_skip_mode_present_false_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, false, false)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.10 short-circuit set (case 3a: Block_Width < 8): a
+    /// BLOCK_4X8 block (Block_Width = 4) ⇒ `skip_mode = 0`, no symbol
+    /// read.
+    #[test]
+    fn decode_skip_mode_small_width_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_4X8, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.10 short-circuit set (case 3b: Block_Height < 8): a
+    /// BLOCK_8X4 block (Block_Height = 4) ⇒ `skip_mode = 0`, no
+    /// symbol read.
+    #[test]
+    fn decode_skip_mode_small_height_short_circuit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_8X4, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.10 else branch with a rigged CDF forcing symbol 0
+    /// (skip_mode = 0): the returned value matches.
+    #[test]
+    fn decode_skip_mode_else_branch_returns_symbol_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_skip_mode_cdf(0);
+        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
+            cdfs.skip_mode[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+    }
+
+    /// §5.11.10 else branch with a rigged CDF forcing symbol 1
+    /// (skip_mode = 1): the returned value matches and the value is
+    /// stamped into the `SkipModes[]` grid over the block's
+    /// `bh4 * bw4` footprint.
+    #[test]
+    fn decode_skip_mode_else_branch_returns_symbol_one_and_stamps_grid() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_skip_mode_cdf(1);
+        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
+            cdfs.skip_mode[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 1);
+
+        // §5.11.5 grid-fill: BLOCK_16X16 has bw4 = bh4 = 4, so the
+        // footprint SkipModes[0..4][0..4] all carry 1.
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(
+                    walker.skip_modes()[r * 32 + c],
+                    1,
+                    "footprint cell ({r},{c}) should be skip_mode = 1",
+                );
+            }
+        }
+        // Cells outside the footprint stay at the initial 0.
+        assert_eq!(walker.skip_modes()[4], 0, "col 4 outside footprint");
+        assert_eq!(walker.skip_modes()[4 * 32], 0, "row 4 outside footprint");
+    }
+
+    /// §8.3.2 origin ctx = 0: at the frame origin both `AvailU` and
+    /// `AvailL` are false, so the ctx-0 row's rigged CDF drives the
+    /// read.
+    #[test]
+    fn decode_skip_mode_origin_ctx_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Only ctx 0 forces symbol 1; ctxs 1 and 2 force symbol 0.
+        cdfs.skip_mode[0] = force_skip_mode_cdf(1);
+        cdfs.skip_mode[1] = force_skip_mode_cdf(0);
+        cdfs.skip_mode[2] = force_skip_mode_cdf(0);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 1, "ctx-0 row should drive the read");
+    }
+
+    /// §8.3.2 ctx-2 path: two prior `SkipModes = 1` neighbours
+    /// (above and left) ⇒ ctx = 2; pick the ctx-2 row to drive the
+    /// read.
+    #[test]
+    fn decode_skip_mode_ctx_sums_neighbour_skip_modes() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force a BLOCK_8X8 (bw4 = bh4 = 2) above-left at (0,0) to
+        // stamp SkipModes[0..2][0..2] = 1.
+        cdfs.skip_mode[0] = force_skip_mode_cdf(1);
+        cdfs.skip_mode[1] = force_skip_mode_cdf(0);
+        cdfs.skip_mode[2] = force_skip_mode_cdf(0);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let v00 = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, true)
+            .unwrap();
+        assert_eq!(v00, 1);
+        // Block at (0, 2): AvailL true, AvailU false ⇒ ctx = 1 (only
+        // left neighbour contributes).
+        cdfs.skip_mode[0] = force_skip_mode_cdf(0);
+        cdfs.skip_mode[1] = force_skip_mode_cdf(1);
+        cdfs.skip_mode[2] = force_skip_mode_cdf(0);
+        let v01 = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 2, BLOCK_8X8, false, true)
+            .unwrap();
+        assert_eq!(v01, 1, "ctx-1 (left = 1, above unavail) row drives");
+        // Now block at (2, 0): AvailU true (SkipModes[0][0] = 1),
+        // AvailL false ⇒ ctx = 1 again.
+        let v10 = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 2, 0, BLOCK_8X8, false, true)
+            .unwrap();
+        assert_eq!(v10, 1, "ctx-1 (above = 1, left unavail) row drives");
+        // Block at (2, 2): AvailU true (SkipModes[1][2] = 1) and
+        // AvailL true (SkipModes[2][1] = 1) ⇒ ctx = 2.
+        cdfs.skip_mode[0] = force_skip_mode_cdf(0);
+        cdfs.skip_mode[1] = force_skip_mode_cdf(0);
+        cdfs.skip_mode[2] = force_skip_mode_cdf(1);
+        let v11 = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 2, 2, BLOCK_8X8, false, true)
+            .unwrap();
+        assert_eq!(v11, 1, "ctx-2 (above = left = 1) row drives");
+    }
+
+    /// §8.3.2 ctx with non-zero tile origin: a tile starting at
+    /// (mi_row_start = 4, mi_col_start = 4) clears both `AvailU` and
+    /// `AvailL` at the tile-origin block (4, 4); ctx = 0.
+    #[test]
+    fn decode_skip_mode_tile_origin_clears_avail() {
+        let geom = TileGeometry {
+            mi_row_start: 4,
+            mi_row_end: 32,
+            mi_col_start: 4,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Pre-stamp SkipModes[3][4] = SkipModes[4][3] = 1 to prove
+        // the tile origin ignores them.
+        walker.skip_modes[3 * 32 + 4] = 1;
+        walker.skip_modes[4 * 32 + 3] = 1;
+        cdfs.skip_mode[0] = force_skip_mode_cdf(1);
+        cdfs.skip_mode[1] = force_skip_mode_cdf(0);
+        cdfs.skip_mode[2] = force_skip_mode_cdf(0);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 4, 4, BLOCK_16X16, false, true)
+            .unwrap();
+        assert_eq!(v, 1, "tile origin ⇒ ctx = 0 regardless of grid");
+    }
+
+    /// §5.11.5 grid-fill right-edge clip: a BLOCK_16X16 at
+    /// (0, mi_cols - 2) stamps only the in-grid columns (2 out of the
+    /// 4 `bw4` cells).
+    #[test]
+    fn decode_skip_mode_grid_fill_clips_right_edge() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_skip_mode_cdf(1);
+        for ctx_idx in 0..SKIP_MODE_CONTEXTS {
+            cdfs.skip_mode[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_skip_mode(&mut dec, &mut cdfs, 0, 30, BLOCK_16X16, false, true)
+            .unwrap();
+        assert_eq!(v, 1);
+        // Columns 30, 31 are stamped over rows 0..4; columns 32, 33
+        // are outside MiCols and not written.
+        for r in 0..4 {
+            assert_eq!(walker.skip_modes()[r * 32 + 30], 1);
+            assert_eq!(walker.skip_modes()[r * 32 + 31], 1);
+        }
+    }
+
+    /// Out-of-range guards: `mi_row >= MiRows`, `mi_col >= MiCols`,
+    /// `sub_size >= BLOCK_SIZES` all surface
+    /// `Error::PartitionWalkOutOfRange`.
+    #[test]
+    fn decode_skip_mode_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        assert_eq!(
+            walker.decode_skip_mode(&mut dec, &mut cdfs, 8, 0, BLOCK_4X4, true, true),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_skip_mode(&mut dec, &mut cdfs, 0, 8, BLOCK_4X4, true, true),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            walker.decode_skip_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_SIZES, true, true),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    /// §5.11.5 grid-fill initial state: a fresh PartitionWalker has
+    /// every `SkipModes[]` cell at 0.
+    #[test]
+    fn fresh_walker_skip_modes_grid_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        assert_eq!(walker.skip_modes().len(), 16 * 16);
+        assert!(walker.skip_modes().iter().all(|&v| v == 0));
     }
 }

@@ -1274,6 +1274,39 @@ clip; out-of-range `mi_row` / `mi_col` / `sub_size` ⇒
 reconstruction) remains the next round's target. `decode_av1` and
 `encode_av1` still return `Error::NotImplemented`.
 
+Round 154 lands the §5.11.10 **`read_skip_mode()` syntax element**
+(av1-spec p.67) as a new `PartitionWalker::decode_skip_mode` method
+plus a `SkipModes[r][c]` flag grid on the walker (parallel to the
+r152 `Skips[]` and the r151 `MiSizes[]` grids). The §5.11.10
+short-circuit set (any-true ⇒ `skip_mode = 0`, no symbol read) is
+honoured: `seg_feature_active( SEG_LVL_SKIP / REF_FRAME / GLOBALMV )`
+collapsed into the caller-provided `seg_skip_mode_off`;
+`!skip_mode_present` via the §5.9.21 frame-header scalar; and
+`Block_Width[MiSize] < 8 || Block_Height[MiSize] < 8` derived
+locally from `sub_size` via the §9.3 `block_width` / `block_height`
+tables. Otherwise an `S()` symbol is decoded against
+`TileSkipModeCdf[ctx]` with `ctx = AvailU *
+SkipModes[MiRow-1][MiCol] + AvailL * SkipModes[MiRow][MiCol-1]`
+(av1-spec p.378), routed through the existing `skip_mode_ctx`
+helper. The §5.11.5 footer stamps the value over the block's
+`bw4 * bh4` footprint of `SkipModes[]` (clipped at the frame's
+`MiRows` / `MiCols` extent). New `PartitionWalker::skip_modes()`
+accessor surfaces a row-major view. `skip_mode` is the
+inter-frame compound-reference shortcut read in §5.11.18
+`inter_frame_mode_info` before the rest of the inter mode decode
+(intra-only frames never call this). 12 new cdf-module tests
+(405 -> 417): seg short-circuit; `skip_mode_present` false
+short-circuit; `Block_Width < 8` short-circuit (BLOCK_4X8);
+`Block_Height < 8` short-circuit (BLOCK_8X4); else-branch S()
+returning 0 / 1 on a forced binary CDF; footprint grid-stamp;
+ctx-0 selection at the frame origin; ctx-1 single-neighbour and
+ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
+/ AvailL; right-edge `bw4` clip; out-of-range guards ⇒
+`PartitionWalkOutOfRange`; fresh-walker grid all-zero. The
+§5.11.5 `decode_block()` body itself (coefficient / motion-vector
+/ reconstruction) remains the next round's target. `decode_av1`
+and `encode_av1` still return `Error::NotImplemented`.
+
 ## Sources consulted (clean-room wall)
 
 * AV1 Bitstream & Decoding Process Specification — AOMedia, copy at

@@ -882,6 +882,42 @@
 //!     guard returns; and the initial all-zero `Skips[]` invariant.
 //!     394 -> 405 tests, zero `#[ignore]`.
 //!
+//!   * **Round 154.** The §5.11.10 `read_skip_mode()` syntax element
+//!     (av1-spec p.67) — the per-block `skip_mode` syntax read.
+//!     Lands as a new [`PartitionWalker::decode_skip_mode`] method
+//!     on the r152 walker, plus a `SkipModes[r][c]` flag grid
+//!     carried alongside the r152 `Skips[]` and the existing
+//!     §6.10.4 `MiSizes[]` grids. The §5.11.10 short-circuit set
+//!     (any-true ⇒ `skip_mode = 0`, no symbol read) is honoured:
+//!     `seg_feature_active(SEG_LVL_SKIP / REF_FRAME / GLOBALMV)`
+//!     collapsed into the caller-provided `seg_skip_mode_off`;
+//!     `!skip_mode_present` via the §5.9.21 frame-header scalar;
+//!     and `Block_Width[MiSize] < 8 || Block_Height[MiSize] < 8`
+//!     derived locally from `sub_size` via the §9.3
+//!     [`cdf::block_width`] / [`cdf::block_height`] tables.
+//!     Otherwise an `S()` symbol is decoded against
+//!     `TileSkipModeCdf[ctx]` with `ctx = AvailU *
+//!     SkipModes[MiRow-1][MiCol] + AvailL *
+//!     SkipModes[MiRow][MiCol-1]` per av1-spec p.378, routed
+//!     through the existing [`skip_mode_ctx`] helper. The §5.11.5
+//!     grid-fill stamps the value over the block's `bw4 * bh4`
+//!     footprint, clipped at the frame's `MiRows` / `MiCols`
+//!     extent. New [`PartitionWalker::skip_modes`] accessor
+//!     returns a row-major view. `skip_mode` is the inter-frame
+//!     compound-reference shortcut read in §5.11.18
+//!     `inter_frame_mode_info` before the rest of the inter
+//!     mode decode (intra-only frames never call this). Tests
+//!     cover: seg short-circuit; `skip_mode_present` false
+//!     short-circuit; both Block_Width-and-Block_Height < 8
+//!     short-circuits via BLOCK_4X8 and BLOCK_8X4; else-branch
+//!     S() against rigged 2-symbol CDFs (forced 0 and 1);
+//!     footprint grid-stamp; ctx-0 selection at the frame
+//!     origin; ctx-1 single-neighbour and ctx-2 both-neighbour
+//!     selection; non-zero tile origin clearing AvailU / AvailL;
+//!     right-edge `bw4` clip; out-of-range guard returns; and
+//!     the initial all-zero `SkipModes[]` invariant. 405 -> 417
+//!     tests, zero `#[ignore]`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
