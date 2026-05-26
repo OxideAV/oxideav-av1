@@ -6,6 +6,66 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 151 — §5.11.4 `decode_partition()` body.** Lands the
+  recursive partition-tree walker (av1-spec p.61–62) as a new
+  [`PartitionWalker`] type. The walker stitches together every
+  partition prerequisite landed in rounds 137–150: the §9.4
+  partition-default CDFs (r137–r144), the §8.3.2
+  [`split_or_horz_cdf`] / [`split_or_vert_cdf`] binary-CDF
+  derivation (r145), the §9.3 [`PARTITION_SUBSIZE`] table +
+  [`partition_subsize`] accessor (r150), and the §9.3
+  [`MI_WIDTH_LOG2`] / [`MI_HEIGHT_LOG2`] /
+  [`NUM_4X4_BLOCKS_WIDE`] / [`NUM_4X4_BLOCKS_HIGH`] tables. The
+  walker carries the §6.10.4 `MiSizes[r][c]` grid (filled at every
+  leaf via the block's `bh4 * bw4` footprint), and consults it for
+  the §8.3.2 [`partition_ctx`] derivation `above = AvailU &&
+  (Mi_Width_Log2[ MiSizes[r-1][c] ] < bsl)` / `left = AvailL &&
+  (Mi_Height_Log2[ MiSizes[r][c-1] ] < bsl)` on every recursive
+  child (av1-spec p.362). The walker emits a
+  `Vec<DecodedBlockRecord>` of `(MiRow, MiCol, MiSize)` leaves in
+  §5.11.4 syntax order; the actual §5.11.5 `decode_block()` body
+  (coefficient / motion-vector / reconstruction) stays out of
+  scope. All four §5.11.4 edge-of-frame branches are honoured: the
+  `r >= MiRows || c >= MiCols` early return; the `bSize <
+  BLOCK_8X8` short-circuit to `PARTITION_NONE` with no symbol
+  read; the `hasCols`-alone `split_or_horz` branch; the
+  `hasRows`-alone `split_or_vert` branch; the `!hasRows &&
+  !hasCols` fall-through to `PARTITION_SPLIT`. All ten partition
+  arms (`NONE` / `HORZ` / `VERT` / `SPLIT` / `HORZ_A` / `HORZ_B`
+  / `VERT_A` / `VERT_B` / `HORZ_4` / `VERT_4`) dispatch the spec's
+  literal `decode_block` / recursive `decode_partition` calls with
+  the appropriate `subSize` (`Partition_Subsize[ partition ][
+  bSize ]`) or `splitSize` (`Partition_Subsize[ PARTITION_SPLIT
+  ][ bSize ]`). The §5.11.4 bottom-right edge clip on the optional
+  `HORZ_4` / `VERT_4` fourth leaf is applied literally. New
+  [`TileGeometry`] type carries the four §5.11.1 mi-unit tile
+  bounds for the §5.11.51 [`TileGeometry::is_inside`] test. New
+  [`Error::PartitionWalkOutOfRange`] surfaces caller-bug
+  preconditions (bSize out of range, partition out of range,
+  unsupported bsl, BLOCK_INVALID lookup). Tests grow by 19 (cdf
+  module): TileGeometry boundary cases (zero-origin + non-zero
+  origin); §5.11.4 `r >= MiRows || c >= MiCols` early return; the
+  `bSize < BLOCK_8X8` PARTITION_NONE short-circuit at BLOCK_4X4
+  (no symbol read); §6.10.4 grid-fill at a single BLOCK_4X4 leaf;
+  the `!hasRows && !hasCols` PARTITION_SPLIT fallback at a
+  2×2-mi-unit frame (no symbol read at the parent); forced
+  PARTITION_NONE / HORZ / VERT / HORZ_4 / VERT_4 / HORZ_A / VERT_B
+  / SPLIT at BLOCK_16X16 via rigged CDFs (one leaf for NONE; two
+  leaves for HORZ / VERT; four leaves for HORZ_4 / VERT_4; three
+  leaves for HORZ_A / VERT_B with the documented splitSize /
+  subSize pairing; four BLOCK_8X8 leaves for SPLIT in the spec's
+  quadrant order); §6.10.4 grid-fill at BLOCK_16X16 with forced
+  PARTITION_HORZ (both BLOCK_16X8 leaves' `bh4 * bw4` footprints
+  carry `BLOCK_16X8`, surrounding cells stay `BLOCK_INVALID`);
+  default-CDF W128 smoke test (non-empty leaves, all in-frame,
+  all valid sub_size, total mi area bounded by frame area);
+  [`partition_ctx`] derivation at the origin (`above = left =
+  false ⇒ ctx = 0`) and after a leaf decode (wide neighbour
+  drops the bit per `Mi_Width_Log2[ ... ] < bsl`); construction
+  overflow rejection at u32::MAX × u32::MAX dimensions;
+  [`PartitionWalker::take_blocks`] drain semantics. 375 -> 394
+  tests, zero `#[ignore]`.
+
 * **Round 150 — §9.3 `Partition_Subsize` table + §3 `BLOCK_*`
   enum staging.** Lands [`PARTITION_SUBSIZE`] (`[10][BLOCK_SIZES]`,
   av1-spec p.402–403) plus the typed accessor

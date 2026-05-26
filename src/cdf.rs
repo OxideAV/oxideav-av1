@@ -10401,6 +10401,428 @@ pub const fn partition_subsize(partition: usize, b_size: usize) -> Option<usize>
     }
 }
 
+// ===================================================================
+// Round 151 — §5.11.4 `decode_partition()` body (av1-spec p.61-62).
+//
+// Stitches together the §9.4 partition-default CDFs (r137-r145), the
+// §8.3.2 [`partition_ctx`] / [`split_or_horz_cdf`] / [`split_or_vert_cdf`]
+// helpers, the §9.3 [`PARTITION_SUBSIZE`] table + [`partition_subsize`]
+// accessor (r150), and the §9.3 [`MI_WIDTH_LOG2`] / [`NUM_4X4_BLOCKS_WIDE`]
+// tables into the recursive partition-tree walker.
+//
+// The walker emits a [`Vec<DecodedBlockRecord>`] of `(mi_row, mi_col,
+// sub_size)` leaves in spec syntax order; the actual `decode_block()`
+// body (§5.11.5) — which decodes coefficients, motion vectors, and
+// reconstruction state — remains out of scope. The §6.10.4 `MiSizes[]`
+// neighbour grid is filled at every leaf so the recursive children
+// observe the correct `AvailU` / `AvailL` against the
+// `Mi_Width_Log2[ MiSizes[r-1][c] ] < bsl` /
+// `Mi_Height_Log2[ MiSizes[r][c-1] ] < bsl` derivation the spec gives
+// for the §8.3.2 partition context (av1-spec p.362).
+// ===================================================================
+
+/// `TileGeometry` — the four §5.11.1 tile-extent bounds the §5.11.4
+/// walker consults for the [`is_inside`](https://example.invalid)-style
+/// `AvailU` / `AvailL` test (av1-spec §5.11.51), and for the top-level
+/// `r >= MiRows || c >= MiCols` early return.
+///
+/// All four values are in §6.10 mi (4-sample) units. For a frame that
+/// is a single tile the natural fill is
+/// `{ mi_row_start: 0, mi_row_end: MiRows, mi_col_start: 0,
+/// mi_col_end: MiCols }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileGeometry {
+    /// `MiRowStart` per §5.11.1 / §5.11.51.
+    pub mi_row_start: u32,
+    /// `MiRowEnd` per §5.11.1 / §5.11.51 (one past the last mi row).
+    pub mi_row_end: u32,
+    /// `MiColStart` per §5.11.1 / §5.11.51.
+    pub mi_col_start: u32,
+    /// `MiColEnd` per §5.11.1 / §5.11.51 (one past the last mi col).
+    pub mi_col_end: u32,
+}
+
+impl TileGeometry {
+    /// `is_inside( r, c )` per §5.11.51, returning whether the
+    /// candidate mi position is inside the tile bounds.
+    #[inline]
+    #[must_use]
+    pub const fn is_inside(&self, r: i32, c: i32) -> bool {
+        r >= self.mi_row_start as i32
+            && r < self.mi_row_end as i32
+            && c >= self.mi_col_start as i32
+            && c < self.mi_col_end as i32
+    }
+}
+
+/// `DecodedBlockRecord` — one `decode_block( r, c, subSize )` invocation
+/// emitted by [`PartitionWalker::decode_partition`], in §5.11.4 syntax
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedBlockRecord {
+    /// `MiRow` per §5.11.5 — the mi-unit row of the block's top-left
+    /// corner.
+    pub mi_row: u32,
+    /// `MiCol` per §5.11.5 — the mi-unit column of the block's
+    /// top-left corner.
+    pub mi_col: u32,
+    /// `MiSize` per §5.11.5 — the BLOCK_* ordinal selected by the
+    /// partition tree for this leaf, in `0..BLOCK_SIZES`. Never
+    /// [`BLOCK_INVALID`] (the [`partition_subsize`] accessor is gated
+    /// on `Some(_)`).
+    pub sub_size: usize,
+}
+
+/// `PartitionWalker` — the §5.11.4 decoder-side scaffold that walks
+/// the partition tree for one superblock.
+///
+/// State carried across recursive [`Self::decode_partition`] calls:
+///
+/// * The §6.10.4 `MiSizes[ r ][ c ]` grid (filled at every leaf via
+///   the block's [`NUM_4X4_BLOCKS_WIDE`] / [`NUM_4X4_BLOCKS_HIGH`]
+///   footprint), so the recursive children's §8.3.2 [`partition_ctx`]
+///   query observes the correct neighbour widths.
+/// * The list of [`DecodedBlockRecord`] leaves the walker emitted, in
+///   §5.11.4 syntax order.
+///
+/// The walker is constructed against a frame's full mi grid (the
+/// `MiRows` × `MiCols` extent) and tile geometry, then driven by
+/// [`Self::decode_partition`] on the superblock at the top of the
+/// recursion. The §5.11.5 `decode_block()` body itself stays out of
+/// scope — the walker only emits leaves; an upcoming round wires up
+/// the per-block coefficient / motion-vector decode.
+///
+/// Out-of-tile children (`r >= MiRows || c >= MiCols`) short-circuit
+/// per the §5.11.4 `return 0` line.
+#[derive(Debug)]
+pub struct PartitionWalker {
+    mi_rows: u32,
+    mi_cols: u32,
+    geometry: TileGeometry,
+    /// `MiSizes[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer. Entries are `BLOCK_INVALID` for
+    /// not-yet-decoded cells and a `BLOCK_*` ordinal for decoded
+    /// leaves (every cell of the leaf's `bh4 * bw4` footprint).
+    mi_sizes: Vec<usize>,
+    /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
+    /// in §5.11.4 syntax order.
+    blocks: Vec<DecodedBlockRecord>,
+}
+
+impl PartitionWalker {
+    /// Construct a fresh walker for a frame with the given mi-unit
+    /// extent and tile bounds. Every `MiSizes[]` cell starts at
+    /// [`BLOCK_INVALID`] (the §5.11.4 unfilled-cell sentinel).
+    ///
+    /// Returns `None` if `mi_rows * mi_cols` overflows `usize` or
+    /// would exceed an arbitrary per-frame cap (the §5.9.5 parser
+    /// rejects such frame sizes earlier in a real decode anyway).
+    #[must_use]
+    pub fn new(mi_rows: u32, mi_cols: u32, geometry: TileGeometry) -> Option<Self> {
+        let area = (mi_rows as usize).checked_mul(mi_cols as usize)?;
+        // Cap at a large but not-overflowing value — the §6.10
+        // bitstream-conformance bounds keep a real frame's mi-grid
+        // well under this.
+        if area > (1 << 30) {
+            return None;
+        }
+        let mut mi_sizes: Vec<usize> = Vec::new();
+        mi_sizes.try_reserve_exact(area).ok()?;
+        mi_sizes.resize(area, BLOCK_INVALID);
+        Some(Self {
+            mi_rows,
+            mi_cols,
+            geometry,
+            mi_sizes,
+            blocks: Vec::new(),
+        })
+    }
+
+    /// `MiRows` accessor for tests / debugging.
+    #[must_use]
+    pub fn mi_rows(&self) -> u32 {
+        self.mi_rows
+    }
+
+    /// `MiCols` accessor for tests / debugging.
+    #[must_use]
+    pub fn mi_cols(&self) -> u32 {
+        self.mi_cols
+    }
+
+    /// Tile-geometry accessor.
+    #[must_use]
+    pub fn geometry(&self) -> TileGeometry {
+        self.geometry
+    }
+
+    /// View of the §6.10.4 `MiSizes[]` grid after the walk. Indexed
+    /// row-major: `mi_sizes()[ r * MiCols + c ]`. Cells that no leaf
+    /// covered carry [`BLOCK_INVALID`].
+    #[must_use]
+    pub fn mi_sizes(&self) -> &[usize] {
+        &self.mi_sizes
+    }
+
+    /// Helper to read `MiSizes[ r ][ c ]`. Returns [`BLOCK_INVALID`]
+    /// for out-of-grid coordinates (the §5.11.4 walker treats those
+    /// as not-yet-decoded).
+    #[inline]
+    fn mi_size_at(&self, r: i32, c: i32) -> usize {
+        if r < 0 || c < 0 {
+            return BLOCK_INVALID;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return BLOCK_INVALID;
+        }
+        self.mi_sizes[(r * self.mi_cols + c) as usize]
+    }
+
+    /// View of the [`DecodedBlockRecord`] leaves the walker has
+    /// emitted, in §5.11.4 syntax order.
+    #[must_use]
+    pub fn blocks(&self) -> &[DecodedBlockRecord] {
+        &self.blocks
+    }
+
+    /// Take ownership of the emitted leaves, draining the internal
+    /// buffer.
+    pub fn take_blocks(&mut self) -> Vec<DecodedBlockRecord> {
+        core::mem::take(&mut self.blocks)
+    }
+
+    /// `decode_block( r, c, subSize )` per §5.11.5 — for the §5.11.4
+    /// walker, this is the leaf emission point. The walker:
+    ///
+    /// 1. Pushes a [`DecodedBlockRecord`] onto [`Self::blocks`].
+    /// 2. Fills the `MiSizes[ r..r+bh4 ][ c..c+bw4 ]` footprint with
+    ///    `sub_size` per the §6.10.4 grid-fill rule.
+    ///
+    /// Clipped at the frame's `MiRows` / `MiCols` extent so leaves
+    /// straddling the bottom or right edge fill only the in-grid
+    /// portion of their footprint.
+    fn decode_block(&mut self, r: u32, c: u32, sub_size: usize) {
+        debug_assert!(sub_size < BLOCK_SIZES, "leaf sub_size must be valid");
+        self.blocks.push(DecodedBlockRecord {
+            mi_row: r,
+            mi_col: c,
+            sub_size,
+        });
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = r + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = c + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.mi_sizes[(rr * self.mi_cols + cc) as usize] = sub_size;
+            }
+        }
+    }
+
+    /// §8.3.2 `partition` context derivation: the `above` / `left`
+    /// booleans for [`partition_ctx`] are
+    /// `AvailU && (Mi_Width_Log2[ MiSizes[r-1][c] ] < bsl)` /
+    /// `AvailL && (Mi_Height_Log2[ MiSizes[r][c-1] ] < bsl)` per
+    /// av1-spec p.362. An out-of-grid or unfilled neighbour contributes
+    /// `false` to either term.
+    fn partition_ctx_for(&self, r: u32, c: u32, bsl: u32) -> usize {
+        let avail_u = self.geometry.is_inside(r as i32 - 1, c as i32);
+        let avail_l = self.geometry.is_inside(r as i32, c as i32 - 1);
+        let above = if avail_u {
+            let nb = self.mi_size_at(r as i32 - 1, c as i32);
+            nb < BLOCK_SIZES && (MI_WIDTH_LOG2[nb] as u32) < bsl
+        } else {
+            false
+        };
+        let left = if avail_l {
+            let nb = self.mi_size_at(r as i32, c as i32 - 1);
+            nb < BLOCK_SIZES && (MI_HEIGHT_LOG2[nb] as u32) < bsl
+        } else {
+            false
+        };
+        partition_ctx(above, left)
+    }
+
+    /// `decode_partition( r, c, bSize )` — §5.11.4 (av1-spec p.61-62)
+    /// recursive partition-tree walker.
+    ///
+    /// Reads the §8.3.2 `partition` / `split_or_horz` / `split_or_vert`
+    /// symbols from `decoder` against the per-block-size [`TileCdfContext`]
+    /// partition CDFs, derives `subSize` and `splitSize` via
+    /// [`partition_subsize`], and either emits a [`DecodedBlockRecord`]
+    /// leaf (for `PARTITION_NONE`, the orthogonal-block partitions
+    /// `HORZ` / `VERT`, the asymmetric `HORZ_A` / `HORZ_B` / `VERT_A`
+    /// / `VERT_B`, and the `HORZ_4` / `VERT_4` quarter-splits) or
+    /// recurses into four `subSize` quadrants (for `PARTITION_SPLIT`).
+    ///
+    /// `bSize < BLOCK_8X8` short-circuits to `PARTITION_NONE` with no
+    /// symbol read per the §5.11.4 first conditional. The
+    /// edge-of-frame fall-through paths (`!hasRows && !hasCols`
+    /// implies `PARTITION_SPLIT`, `hasCols` alone reads
+    /// `split_or_horz`, `hasRows` alone reads `split_or_vert`) match
+    /// the spec literally. The §5.11.4 `r >= MiRows || c >= MiCols`
+    /// early return is honoured.
+    ///
+    /// Returns [`Error::PartitionWalkOutOfRange`] if a recursive call
+    /// is invoked with `bSize >= BLOCK_SIZES` (a caller bug — the
+    /// public entry is gated on a valid `b_size`).
+    pub fn decode_partition(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        r: u32,
+        c: u32,
+        b_size: usize,
+    ) -> Result<(), crate::Error> {
+        // §5.11.4 line 1: `if (r >= MiRows || c >= MiCols) return 0`.
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return Ok(());
+        }
+        if b_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let num4x4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+        let half_block4x4 = num4x4 >> 1;
+        let quarter_block4x4 = half_block4x4 >> 1;
+        let has_rows = (r + half_block4x4) < self.mi_rows;
+        let has_cols = (c + half_block4x4) < self.mi_cols;
+
+        // §5.11.4 partition decode.
+        let partition = if b_size < BLOCK_8X8 {
+            PARTITION_NONE
+        } else {
+            let bsl = MI_WIDTH_LOG2[b_size] as u32;
+            let pctx = self.partition_ctx_for(r, c, bsl);
+            if has_rows && has_cols {
+                let cdf = cdfs
+                    .partition_cdf(bsl, pctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? as usize
+            } else if has_cols {
+                // §8.3.2 split_or_horz: derive the binary CDF from the
+                // already-selected partition row.
+                let cdf_row = cdfs
+                    .partition_cdf(bsl, pctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let mut bin = split_or_horz_cdf(cdf_row, b_size)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let s = decoder.read_symbol(&mut bin)?;
+                if s == 0 {
+                    PARTITION_HORZ
+                } else {
+                    PARTITION_SPLIT
+                }
+            } else if has_rows {
+                let cdf_row = cdfs
+                    .partition_cdf(bsl, pctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let mut bin = split_or_vert_cdf(cdf_row, b_size)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let s = decoder.read_symbol(&mut bin)?;
+                if s == 0 {
+                    PARTITION_VERT
+                } else {
+                    PARTITION_SPLIT
+                }
+            } else {
+                PARTITION_SPLIT
+            }
+        };
+
+        // §5.11.4 subSize / splitSize lookup via the r150 accessor.
+        let sub_size =
+            partition_subsize(partition, b_size).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let split_size = partition_subsize(PARTITION_SPLIT, b_size);
+
+        // §5.11.4 per-partition dispatch.
+        match partition {
+            PARTITION_NONE => {
+                self.decode_block(r, c, sub_size);
+            }
+            PARTITION_HORZ => {
+                self.decode_block(r, c, sub_size);
+                if has_rows {
+                    self.decode_block(r + half_block4x4, c, sub_size);
+                }
+            }
+            PARTITION_VERT => {
+                self.decode_block(r, c, sub_size);
+                if has_cols {
+                    self.decode_block(r, c + half_block4x4, sub_size);
+                }
+            }
+            PARTITION_SPLIT => {
+                self.decode_partition(decoder, cdfs, r, c, sub_size)?;
+                self.decode_partition(decoder, cdfs, r, c + half_block4x4, sub_size)?;
+                self.decode_partition(decoder, cdfs, r + half_block4x4, c, sub_size)?;
+                self.decode_partition(
+                    decoder,
+                    cdfs,
+                    r + half_block4x4,
+                    c + half_block4x4,
+                    sub_size,
+                )?;
+            }
+            PARTITION_HORZ_A => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                self.decode_block(r, c, split);
+                self.decode_block(r, c + half_block4x4, split);
+                self.decode_block(r + half_block4x4, c, sub_size);
+            }
+            PARTITION_HORZ_B => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                self.decode_block(r, c, sub_size);
+                self.decode_block(r + half_block4x4, c, split);
+                self.decode_block(r + half_block4x4, c + half_block4x4, split);
+            }
+            PARTITION_VERT_A => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                self.decode_block(r, c, split);
+                self.decode_block(r + half_block4x4, c, split);
+                self.decode_block(r, c + half_block4x4, sub_size);
+            }
+            PARTITION_VERT_B => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                self.decode_block(r, c, sub_size);
+                self.decode_block(r, c + half_block4x4, split);
+                self.decode_block(r + half_block4x4, c + half_block4x4, split);
+            }
+            // PARTITION_HORZ_4: the spec writes `r +
+            // quarterBlock4x4 * { 0, 1, 2, 3 }`; clippy folds the
+            // `* 0` and `* 1` cases, so the body is shown with the
+            // folded forms.
+            PARTITION_HORZ_4 => {
+                self.decode_block(r, c, sub_size);
+                self.decode_block(r + quarter_block4x4, c, sub_size);
+                self.decode_block(r + quarter_block4x4 * 2, c, sub_size);
+                if r + quarter_block4x4 * 3 < self.mi_rows {
+                    self.decode_block(r + quarter_block4x4 * 3, c, sub_size);
+                }
+            }
+            // The spec's `else { ... }` arm (PARTITION_VERT_4 — the
+            // tenth and final partition value). Same clippy-folded
+            // pattern as PARTITION_HORZ_4.
+            PARTITION_VERT_4 => {
+                self.decode_block(r, c, sub_size);
+                self.decode_block(r, c + quarter_block4x4, sub_size);
+                self.decode_block(r, c + quarter_block4x4 * 2, sub_size);
+                if c + quarter_block4x4 * 3 < self.mi_cols {
+                    self.decode_block(r, c + quarter_block4x4 * 3, sub_size);
+                }
+            }
+            _ => return Err(crate::Error::PartitionWalkOutOfRange),
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16782,5 +17204,672 @@ mod tests {
             assert_eq!(block_width(split), block_width(b) / 2);
             assert_eq!(block_height(split), block_height(b) / 2);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 151 — §5.11.4 decode_partition walker tests.
+    // -----------------------------------------------------------------
+
+    /// Helper: force one of the §8.3.2 partition CDFs (an 11-entry
+    /// W16/W32/W64 or 10-entry W128 row) to select `symbol` on the
+    /// next [`SymbolDecoder::read_symbol`] against a fresh decoder
+    /// initialised with all-zero bytes (which seeds `SymbolValue =
+    /// 32767`). The rigging puts `1 << 15` cumulative probability on
+    /// every index `>= symbol` and `0` on every index `< symbol`,
+    /// so the §8.2.6 loop breaks at iteration `symbol` (`f = 0`,
+    /// `cur = 4 * (N - symbol - 1) <= 36 << SymbolValue = 32767`).
+    fn force_partition_cdf_w(symbol: usize, n: usize) -> Vec<u16> {
+        let mut row = vec![0u16; n + 1];
+        for entry in row.iter_mut().take(n).skip(symbol) {
+            *entry = 1 << 15;
+        }
+        // Counter slot stays 0.
+        row
+    }
+
+    /// `TileGeometry::is_inside` boundary checks against the §5.11.51
+    /// `MiColStart <= candidateC < MiColEnd && MiRowStart <=
+    /// candidateR < MiRowEnd` rule.
+    #[test]
+    fn tile_geometry_is_inside_boundaries() {
+        let g = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        assert!(g.is_inside(0, 0));
+        assert!(g.is_inside(31, 31));
+        assert!(!g.is_inside(-1, 0));
+        assert!(!g.is_inside(0, -1));
+        assert!(!g.is_inside(32, 0));
+        assert!(!g.is_inside(0, 32));
+
+        // Non-zero start (subsequent tile).
+        let g2 = TileGeometry {
+            mi_row_start: 8,
+            mi_row_end: 24,
+            mi_col_start: 16,
+            mi_col_end: 48,
+        };
+        assert!(!g2.is_inside(7, 16));
+        assert!(g2.is_inside(8, 16));
+        assert!(g2.is_inside(23, 47));
+        assert!(!g2.is_inside(24, 47));
+        assert!(!g2.is_inside(8, 48));
+    }
+
+    /// §5.11.4 first conditional: `r >= MiRows || c >= MiCols`
+    /// returns 0 — the walker emits no leaves and reads no symbol.
+    #[test]
+    fn decode_partition_early_return_at_frame_edge() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+
+        // r >= MiRows
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 16, 0, BLOCK_16X16)
+            .unwrap();
+        assert!(walker.blocks().is_empty());
+
+        // c >= MiCols
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 16, BLOCK_16X16)
+            .unwrap();
+        assert!(walker.blocks().is_empty());
+
+        // Far past the bounds.
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 64, 64, BLOCK_64X64)
+            .unwrap();
+        assert!(walker.blocks().is_empty());
+    }
+
+    /// `bSize < BLOCK_8X8` short-circuit at BLOCK_4X4: `partition =
+    /// PARTITION_NONE`, single BLOCK_4X4 leaf emitted, no symbol read.
+    /// (BLOCK_4X8 / BLOCK_8X4 are rectangular and therefore
+    /// unreachable as `bSize` arguments — the §5.11.4 recursion only
+    /// emits square `subSize` values per the PARTITION_SPLIT row of
+    /// [`PARTITION_SUBSIZE`], so the walker never starts a recursion
+    /// with a rectangular `bSize`.)
+    #[test]
+    fn decode_partition_small_block_emits_single_leaf() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Empty byte slice — any read would panic / underflow, so a
+        // successful walk here proves no symbol was consumed.
+        let bytes = [0u8; 1];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
+        let pos_before = dec.position();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_4X4)
+            .unwrap();
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no symbol bit read for bSize < BLOCK_8X8"
+        );
+        assert_eq!(walker.blocks().len(), 1);
+        assert_eq!(walker.blocks()[0].sub_size, BLOCK_4X4);
+        assert_eq!(walker.blocks()[0].mi_row, 0);
+        assert_eq!(walker.blocks()[0].mi_col, 0);
+    }
+
+    /// §6.10.4 `MiSizes[]` grid-fill invariant: every cell of the
+    /// leaf's `bh4 * bw4` footprint carries `sub_size`. Drives a
+    /// single BLOCK_4X4 leaf at `(4, 8)` via the `bSize < BLOCK_8X8`
+    /// short-circuit (no symbol read), then checks that exactly the
+    /// one-cell footprint `MiSizes[4][8]` carries `BLOCK_4X4` and
+    /// surrounding cells stay `BLOCK_INVALID`.
+    #[test]
+    fn decode_block_fills_mi_sizes_footprint() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 1];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 4, 8, BLOCK_4X4)
+            .unwrap();
+
+        // BLOCK_4X4: bw4=1, bh4=1. So MiSizes[4][8] = BLOCK_4X4.
+        assert_eq!(walker.mi_sizes()[4 * 32 + 8], BLOCK_4X4);
+        // Outside footprint is still BLOCK_INVALID.
+        assert_eq!(walker.mi_sizes()[3 * 32 + 8], BLOCK_INVALID);
+        assert_eq!(walker.mi_sizes()[5 * 32 + 8], BLOCK_INVALID);
+        assert_eq!(walker.mi_sizes()[4 * 32 + 7], BLOCK_INVALID);
+        assert_eq!(walker.mi_sizes()[4 * 32 + 9], BLOCK_INVALID);
+    }
+
+    /// §5.11.4 `!hasRows && !hasCols` fall-through: PARTITION_SPLIT
+    /// is selected without reading a symbol, then the four quadrants
+    /// are all out-of-bounds (the early-return path). Net result:
+    /// 0 leaves emitted, 0 bits consumed.
+    ///
+    /// Constructed with a frame whose MiRows / MiCols are exactly the
+    /// block's `halfBlock4x4` (so `r + halfBlock4x4 == MiRows`,
+    /// `c + halfBlock4x4 == MiCols` ⇒ `hasRows == hasCols == false`),
+    /// driven from `(0, 0)` so the four split children land at
+    /// `(0, half)`, `(half, 0)`, `(half, half)` — all hit the
+    /// `r >= MiRows || c >= MiCols` early return.
+    #[test]
+    fn decode_partition_corner_split_fallback_no_symbol() {
+        // BLOCK_16X16: halfBlock4x4 = 2. Frame is 2 mi units.
+        let mi_rows = NUM_4X4_BLOCKS_HIGH[BLOCK_16X16] as u32 / 2;
+        let mi_cols = NUM_4X4_BLOCKS_WIDE[BLOCK_16X16] as u32 / 2;
+        assert_eq!(mi_rows, 2);
+        assert_eq!(mi_cols, 2);
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        };
+        let mut walker = PartitionWalker::new(mi_rows, mi_cols, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 1];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
+        let pos_before = dec.position();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "neither partition nor split_or_* symbol should be read"
+        );
+        // SPLIT recurses on BLOCK_8X8 — the 4 children at (0,0),
+        // (0,1), (1,0), (1,1). Each one has bSize=BLOCK_8X8,
+        // halfBlock4x4=1, hasRows = (r+1 < 2), hasCols = (c+1 < 2).
+        // (0,0): hasRows=true, hasCols=true → reads a partition
+        //  symbol against the default CDF.
+        // The walk would consume some bytes for the inner recursion,
+        // so we can't assert pos_before == pos_after for the full
+        // walk. Re-issue with a fresh decoder and assert no PANIC, and
+        // the walker emits a non-empty leaf list (the inner reads
+        // against defaults will resolve to *some* partition).
+        let mut walker2 = PartitionWalker::new(mi_rows, mi_cols, geom).unwrap();
+        let mut cdfs2 = TileCdfContext::new_from_defaults();
+        let mut dec2 = SymbolDecoder::init_symbol(&[0u8; 16], 16, true).unwrap();
+        walker2
+            .decode_partition(&mut dec2, &mut cdfs2, 0, 0, BLOCK_16X16)
+            .unwrap();
+        // Some leaves should have been emitted by the 4 inner BLOCK_8X8
+        // recursions.
+        assert!(
+            !walker2.blocks().is_empty(),
+            "inner BLOCK_8X8 children should emit leaves"
+        );
+    }
+
+    /// Forced PARTITION_NONE at BLOCK_16X16: single leaf, sub_size ==
+    /// BLOCK_16X16.
+    #[test]
+    fn decode_partition_forced_none_emits_single_leaf() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Override partition_w16[ctx=0] to force PARTITION_NONE (idx 0).
+        let rigged = force_partition_cdf_w(PARTITION_NONE, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 1);
+        assert_eq!(walker.blocks()[0].sub_size, BLOCK_16X16);
+        assert_eq!(walker.blocks()[0].mi_row, 0);
+        assert_eq!(walker.blocks()[0].mi_col, 0);
+    }
+
+    /// Forced PARTITION_HORZ at BLOCK_16X16: 2 leaves of BLOCK_16X8
+    /// stacked vertically.
+    #[test]
+    fn decode_partition_forced_horz_emits_two_leaves() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 2);
+        assert_eq!(
+            walker.blocks()[0],
+            DecodedBlockRecord {
+                mi_row: 0,
+                mi_col: 0,
+                sub_size: BLOCK_16X8
+            }
+        );
+        // halfBlock4x4 for BLOCK_16X16 = 4 / 2 = 2.
+        assert_eq!(
+            walker.blocks()[1],
+            DecodedBlockRecord {
+                mi_row: 2,
+                mi_col: 0,
+                sub_size: BLOCK_16X8
+            }
+        );
+    }
+
+    /// Forced PARTITION_VERT at BLOCK_16X16: 2 leaves of BLOCK_8X16.
+    #[test]
+    fn decode_partition_forced_vert_emits_two_leaves() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_partition_cdf_w(PARTITION_VERT, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 2);
+        assert_eq!(walker.blocks()[0].sub_size, BLOCK_8X16);
+        assert_eq!(walker.blocks()[1].sub_size, BLOCK_8X16);
+        assert_eq!(walker.blocks()[0].mi_col, 0);
+        assert_eq!(walker.blocks()[1].mi_col, 2);
+    }
+
+    /// Forced PARTITION_HORZ_4 at BLOCK_16X16: 4 leaves of BLOCK_16X4.
+    #[test]
+    fn decode_partition_forced_horz_4_emits_four_leaves() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_partition_cdf_w(PARTITION_HORZ_4, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 4);
+        // quarterBlock4x4 for BLOCK_16X16 = 4 / 2 / 2 = 1.
+        for (i, blk) in walker.blocks().iter().enumerate() {
+            assert_eq!(blk.sub_size, BLOCK_16X4);
+            assert_eq!(blk.mi_row, i as u32);
+            assert_eq!(blk.mi_col, 0);
+        }
+    }
+
+    /// Forced PARTITION_VERT_4 at BLOCK_16X16: 4 leaves of BLOCK_4X16.
+    #[test]
+    fn decode_partition_forced_vert_4_emits_four_leaves() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_partition_cdf_w(PARTITION_VERT_4, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 4);
+        for (i, blk) in walker.blocks().iter().enumerate() {
+            assert_eq!(blk.sub_size, BLOCK_4X16);
+            assert_eq!(blk.mi_row, 0);
+            assert_eq!(blk.mi_col, i as u32);
+        }
+    }
+
+    /// Forced PARTITION_HORZ_A at BLOCK_16X16: 3 leaves: 2 splitSize
+    /// (BLOCK_8X8) + 1 subSize (BLOCK_16X8).
+    #[test]
+    fn decode_partition_forced_horz_a_emits_three_leaves() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_partition_cdf_w(PARTITION_HORZ_A, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 3);
+        // HORZ_A: subSize = BLOCK_16X8, splitSize = BLOCK_8X8.
+        // Decode order: (r,c) splitSize, (r,c+half) splitSize,
+        //               (r+half,c) subSize.
+        assert_eq!(walker.blocks()[0].sub_size, BLOCK_8X8);
+        assert_eq!(walker.blocks()[1].sub_size, BLOCK_8X8);
+        assert_eq!(walker.blocks()[2].sub_size, BLOCK_16X8);
+        assert_eq!(walker.blocks()[0].mi_col, 0);
+        assert_eq!(walker.blocks()[1].mi_col, 2);
+        assert_eq!(walker.blocks()[2].mi_row, 2);
+    }
+
+    /// Forced PARTITION_VERT_B at BLOCK_16X16: 3 leaves: 1 subSize
+    /// (BLOCK_8X16) + 2 splitSize (BLOCK_8X8).
+    #[test]
+    fn decode_partition_forced_vert_b_emits_three_leaves() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_partition_cdf_w(PARTITION_VERT_B, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 3);
+        // VERT_B: subSize = BLOCK_8X16, splitSize = BLOCK_8X8.
+        // Decode order: (r,c) subSize, (r,c+half) splitSize,
+        //               (r+half,c+half) splitSize.
+        assert_eq!(walker.blocks()[0].sub_size, BLOCK_8X16);
+        assert_eq!(walker.blocks()[1].sub_size, BLOCK_8X8);
+        assert_eq!(walker.blocks()[2].sub_size, BLOCK_8X8);
+        assert_eq!(walker.blocks()[1].mi_col, 2);
+        assert_eq!(walker.blocks()[2].mi_row, 2);
+        assert_eq!(walker.blocks()[2].mi_col, 2);
+    }
+
+    /// Forced PARTITION_SPLIT at BLOCK_16X16 with all sub-BLOCK_8X8
+    /// children forced to PARTITION_NONE: 4 leaves of BLOCK_8X8 in
+    /// the spec's documented quadrant order.
+    #[test]
+    fn decode_partition_forced_split_recurses_to_4_leaves() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Top-level BLOCK_16X16 → PARTITION_SPLIT.
+        let rigged_w16 = force_partition_cdf_w(PARTITION_SPLIT, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged_w16);
+        }
+        // Each BLOCK_8X8 child → PARTITION_NONE (W8 row has 5 symbols).
+        let rigged_w8 = force_partition_cdf_w(PARTITION_NONE, 4);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w8[ctx_idx].copy_from_slice(&rigged_w8);
+        }
+        let bytes = [0u8; 64];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 4);
+        for blk in walker.blocks() {
+            assert_eq!(blk.sub_size, BLOCK_8X8);
+        }
+        // §5.11.4 quadrant order: (r,c), (r,c+half), (r+half,c),
+        // (r+half,c+half).
+        assert_eq!(walker.blocks()[0].mi_row, 0);
+        assert_eq!(walker.blocks()[0].mi_col, 0);
+        assert_eq!(walker.blocks()[1].mi_row, 0);
+        assert_eq!(walker.blocks()[1].mi_col, 2);
+        assert_eq!(walker.blocks()[2].mi_row, 2);
+        assert_eq!(walker.blocks()[2].mi_col, 0);
+        assert_eq!(walker.blocks()[3].mi_row, 2);
+        assert_eq!(walker.blocks()[3].mi_col, 2);
+    }
+
+    /// §6.10.4 grid-fill: after a forced PARTITION_HORZ at
+    /// BLOCK_16X16, every cell of the two BLOCK_16X8 leaves' `bh4 *
+    /// bw4` footprints carries `BLOCK_16X8`, and adjacent cells stay
+    /// `BLOCK_INVALID`.
+    #[test]
+    fn decode_partition_grid_fill_after_horz() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_partition_cdf_w(PARTITION_HORZ, 10);
+        for ctx_idx in 0..PARTITION_CONTEXTS {
+            cdfs.partition_w16[ctx_idx].copy_from_slice(&rigged);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+
+        // BLOCK_16X8 footprint: bw4 = 4, bh4 = 2.
+        // Top leaf at (0,0): MiSizes[0..2][0..4] = BLOCK_16X8.
+        for r in 0..2 {
+            for c in 0..4 {
+                assert_eq!(
+                    walker.mi_sizes()[r * 32 + c],
+                    BLOCK_16X8,
+                    "top leaf cell ({r},{c}) should be BLOCK_16X8"
+                );
+            }
+        }
+        // Bottom leaf at (2,0): MiSizes[2..4][0..4] = BLOCK_16X8.
+        for r in 2..4 {
+            for c in 0..4 {
+                assert_eq!(walker.mi_sizes()[r * 32 + c], BLOCK_16X8);
+            }
+        }
+        // Outside footprint stays BLOCK_INVALID.
+        assert_eq!(walker.mi_sizes()[4], BLOCK_INVALID);
+        assert_eq!(walker.mi_sizes()[4 * 32], BLOCK_INVALID);
+    }
+
+    /// Smoke test: a full walk against the §9.4 default CDFs at the
+    /// W128 superblock size completes without error and emits
+    /// well-formed leaves entirely inside the frame extent. The
+    /// partition tree picked depends on the byte stream, but the
+    /// invariants are independent.
+    #[test]
+    fn decode_partition_default_cdf_w128_smoke() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // 128 bytes of bitstream — plenty for the partition tree's
+        // worst-case depth.
+        let bytes = [0x55u8; 128];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 128, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_128X128)
+            .unwrap();
+        // At least one leaf must be emitted.
+        assert!(!walker.blocks().is_empty());
+        // Every leaf is in-frame and has a valid sub_size.
+        for blk in walker.blocks() {
+            assert!(blk.sub_size < BLOCK_SIZES);
+            assert!(blk.mi_row < 32);
+            assert!(blk.mi_col < 32);
+        }
+        // Total mi area of leaves <= frame mi area (no double-counting).
+        let total: u64 = walker
+            .blocks()
+            .iter()
+            .map(|b| {
+                (NUM_4X4_BLOCKS_WIDE[b.sub_size] as u64) * (NUM_4X4_BLOCKS_HIGH[b.sub_size] as u64)
+            })
+            .sum();
+        assert!(total <= (32 * 32) as u64);
+    }
+
+    /// §8.3.2 partition_ctx derivation: the walker computes `above`
+    /// and `left` against the §6.10.4 MiSizes grid populated by
+    /// previously-decoded leaves. At the (0, 0) superblock, both
+    /// AvailU and AvailL are false (the neighbour positions are
+    /// outside the tile), so partition_ctx returns 0 regardless of
+    /// neighbour state.
+    #[test]
+    fn partition_ctx_for_origin_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        // For any bsl, (r=0, c=0) -> AvailU=false, AvailL=false -> ctx=0.
+        for bsl in 1..=5 {
+            assert_eq!(walker.partition_ctx_for(0, 0, bsl), 0);
+        }
+    }
+
+    /// `partition_ctx_for` after a leaf decode: if a wider neighbour
+    /// is present, the §8.3.2 `Mi_Width_Log2[ ... ] < bsl` test fails
+    /// (neighbour width >= bsl) and the corresponding bit stays
+    /// `false`.
+    #[test]
+    fn partition_ctx_for_wide_neighbour_drops_bit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        // Fill row 0 with BLOCK_16X16 (mi_width_log2 = 2) so the
+        // above-neighbour at (1, 0) is BLOCK_16X16.
+        walker.decode_block(0, 0, BLOCK_16X16);
+        // At (4, 0) with bsl = 2 (W16): AvailU=true (4-1=3 inside),
+        // above_neighbour at (3, 0) is BLOCK_INVALID (BLOCK_16X16
+        // footprint is only rows 0..4, cols 0..4 — (3,0) IS in the
+        // footprint, so MiSizes[3][0] = BLOCK_16X16). With
+        // mi_width_log2[BLOCK_16X16] = 2 and bsl = 2, the test
+        // (2 < 2) is false ⇒ above bit = false.
+        // AvailL=true at (4, 0) ⇒ left col is -1 ⇒ is_inside false ⇒
+        // left = false.
+        // Actually with mi_col -1, is_inside is false ⇒ AvailL=false ⇒
+        // left=false.
+        // ctx should be 0.
+        assert_eq!(walker.partition_ctx_for(4, 0, 2), 0);
+
+        // At (4, 4) with bsl = 1 (W8): AvailU=true (3 inside),
+        // above_neighbour at (3, 4) is BLOCK_INVALID (outside the
+        // 16x16 footprint at col 4). BLOCK_INVALID > BLOCK_SIZES, so
+        // the check `nb < BLOCK_SIZES` is false ⇒ above = false.
+        // AvailL=true (3 inside), left_neighbour at (4, 3) is also
+        // outside the BLOCK_16X16 footprint (rows 0..4) ⇒
+        // BLOCK_INVALID ⇒ left = false.
+        // ctx = 0.
+        assert_eq!(walker.partition_ctx_for(4, 4, 1), 0);
+
+        // At (4, 0) with bsl = 3 (W32): above_neighbour at (3, 0) is
+        // BLOCK_16X16 with mi_width_log2 = 2. 2 < 3 ⇒ above = true.
+        // left = false. ctx = (false as 2) + (true as 1) = 1.
+        assert_eq!(walker.partition_ctx_for(4, 0, 3), 1);
+    }
+
+    /// Construction sanity: PartitionWalker::new with absurd
+    /// dimensions returns None.
+    #[test]
+    fn partition_walker_construction_overflow() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: u32::MAX,
+            mi_col_start: 0,
+            mi_col_end: u32::MAX,
+        };
+        // mi_rows * mi_cols overflows usize on this platform.
+        assert!(PartitionWalker::new(u32::MAX, u32::MAX, geom).is_none());
+    }
+
+    /// `take_blocks` drains and resets the internal buffer.
+    #[test]
+    fn take_blocks_drains_buffer() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 1];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 1, true).unwrap();
+        walker
+            .decode_partition(&mut dec, &mut cdfs, 0, 0, BLOCK_4X4)
+            .unwrap();
+        assert_eq!(walker.blocks().len(), 1);
+        let drained = walker.take_blocks();
+        assert_eq!(drained.len(), 1);
+        assert!(walker.blocks().is_empty());
     }
 }

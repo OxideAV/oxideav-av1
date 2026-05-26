@@ -1205,6 +1205,47 @@ HORZ_B parent block. The full `decode_partition` body remains the
 next round's target; this round drops the last lookup it needs.
 `decode_av1` and `encode_av1` still return `Error::NotImplemented`.
 
+Round 151 lands the §5.11.4 **`decode_partition()` body** (av1-spec
+p.61–62) — the recursive partition-tree walker that stitches every
+partition prerequisite landed in rounds 137–150 into one
+`PartitionWalker` type. The walker carries the §6.10.4
+`MiSizes[r][c]` grid (filled at every leaf via the block's `bh4 *
+bw4` footprint) and consults it for the §8.3.2 `partition_ctx`
+derivation `above = AvailU && (Mi_Width_Log2[ MiSizes[r-1][c] ] <
+bsl)` / `left = AvailL && (Mi_Height_Log2[ MiSizes[r][c-1] ] <
+bsl)` on every recursive child (av1-spec p.362). It emits a
+`Vec<DecodedBlockRecord>` of `(MiRow, MiCol, MiSize)` leaves in
+§5.11.4 syntax order; the actual §5.11.5 `decode_block()` body
+(coefficient / motion-vector / reconstruction) is the next round's
+target. All four §5.11.4 edge-of-frame branches are honoured —
+`r >= MiRows || c >= MiCols` early return, `bSize < BLOCK_8X8`
+short-circuit to `PARTITION_NONE` with no symbol read,
+`hasCols`-alone `split_or_horz`, `hasRows`-alone `split_or_vert`,
+`!hasRows && !hasCols` fall-through to `PARTITION_SPLIT`. All ten
+partition arms (`NONE` / `HORZ` / `VERT` / `SPLIT` / `HORZ_A` /
+`HORZ_B` / `VERT_A` / `VERT_B` / `HORZ_4` / `VERT_4`) dispatch
+the spec's literal `decode_block` / recursive `decode_partition`
+calls with the appropriate `subSize` (`Partition_Subsize[
+partition ][ bSize ]`) or `splitSize` (`Partition_Subsize[
+PARTITION_SPLIT ][ bSize ]`). The §5.11.4 bottom-right edge clip
+on the optional `HORZ_4` / `VERT_4` fourth leaf is applied
+literally. New `TileGeometry` type carries the four §5.11.1
+mi-unit tile bounds for the §5.11.51 `is_inside()` test. New
+`Error::PartitionWalkOutOfRange` surfaces caller-bug preconditions
+(`bSize` / `partition` / `bsl` / `Partition_Subsize` lookup out of
+range). 19 new cdf-module tests (375 -> 394): TileGeometry
+boundary cases; §5.11.4 early-return; the `bSize < BLOCK_8X8`
+no-symbol-read short-circuit; §6.10.4 grid-fill; the `!hasRows &&
+!hasCols` corner-case fallback; forced PARTITION_NONE / HORZ /
+VERT / HORZ_4 / VERT_4 / HORZ_A / VERT_B / SPLIT at BLOCK_16X16
+via rigged CDFs; forced-HORZ grid-fill; default-CDF W128 smoke
+test; partition_ctx derivation at origin + after a wide-neighbour
+leaf; construction overflow; `take_blocks` drain semantics.
+`decode_av1` and `encode_av1` still return `Error::NotImplemented`
+— the next round wires the §5.11.5 `decode_block()` body (block
+coefficient decode + motion-vector decode + reconstruction)
+behind the now-complete partition walker.
+
 ## Sources consulted (clean-room wall)
 
 * AV1 Bitstream & Decoding Process Specification — AOMedia, copy at

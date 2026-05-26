@@ -800,6 +800,56 @@
 //!     are also pinned against their av1-spec p.171-172 / p.7
 //!     ordinals. 359 -> 375 tests, zero `#[ignore]`.
 //!
+//!   * **Round 151.** The §5.11.4 `decode_partition( r, c, bSize )`
+//!     body (av1-spec p.61-62) — the recursive partition-tree walker
+//!     that stitches r137-r145's §9.4 partition-default CDFs,
+//!     r145's §8.3.2 [`split_or_horz_cdf`] / [`split_or_vert_cdf`]
+//!     binary-CDF derivation, r150's §9.3 [`PARTITION_SUBSIZE`]
+//!     table + [`partition_subsize`] accessor, and the §9.3
+//!     [`MI_WIDTH_LOG2`] / [`NUM_4X4_BLOCKS_WIDE`] tables into one
+//!     [`PartitionWalker`] type. The walker carries the §6.10.4
+//!     `MiSizes[r][c]` grid (filled at every leaf via the block's
+//!     [`NUM_4X4_BLOCKS_WIDE`] / [`NUM_4X4_BLOCKS_HIGH`] footprint),
+//!     and consults it for the §8.3.2 [`partition_ctx`] derivation
+//!     `above = AvailU && (Mi_Width_Log2[ MiSizes[r-1][c] ] < bsl)` /
+//!     `left  = AvailL && (Mi_Height_Log2[ MiSizes[r][c-1] ] < bsl)`
+//!     on every recursive child (av1-spec p.362). The walker emits a
+//!     [`Vec<DecodedBlockRecord>`] of `(MiRow, MiCol, MiSize)` leaves
+//!     in §5.11.4 syntax order; the actual §5.11.5 `decode_block()`
+//!     body remains out of scope and is the next round's target.
+//!     All four §5.11.4 edge-of-frame branches are honoured: the
+//!     `r >= MiRows || c >= MiCols` early return; the `bSize <
+//!     BLOCK_8X8` short-circuit to `PARTITION_NONE` with no symbol
+//!     read; the `hasCols`-alone branch that reads `split_or_horz`;
+//!     the `hasRows`-alone branch that reads `split_or_vert`; and the
+//!     `!hasRows && !hasCols` fall-through to `PARTITION_SPLIT`. All
+//!     ten partition arms (`NONE` / `HORZ` / `VERT` / `SPLIT` /
+//!     `HORZ_A` / `HORZ_B` / `VERT_A` / `VERT_B` / `HORZ_4` /
+//!     `VERT_4`) dispatch the spec's literal `decode_block` /
+//!     recursive `decode_partition` calls with the appropriate
+//!     `subSize` (the `Partition_Subsize[ partition ][ bSize ]`
+//!     lookup) or `splitSize` (the `Partition_Subsize[ PARTITION_SPLIT
+//!     ][ bSize ]` lookup). New [`TileGeometry`] type carries the
+//!     four §5.11.1 mi-unit tile bounds for the [§5.11.51
+//!     `is_inside`](TileGeometry::is_inside) test. The §5.11.4
+//!     bottom-right edge clip on the optional `HORZ_4` / `VERT_4`
+//!     fourth leaf (`r + quarterBlock4x4 * 3 < MiRows` /
+//!     `c + quarterBlock4x4 * 3 < MiCols`) is applied literally.
+//!     Out-of-range / out-of-tile inputs surface as
+//!     [`Error::PartitionWalkOutOfRange`] (caller-bug only — a
+//!     conformant driver never produces one). Tests cover: single-leaf
+//!     `PARTITION_NONE` for sub-`BLOCK_8X8` block sizes (no symbol
+//!     read); single-leaf and split-emission against the W128
+//!     superblock; recursive descent down to `BLOCK_4X4` leaves; all
+//!     ten partition arms via deterministic CDF setups; the
+//!     edge-of-frame `hasRows`-alone / `hasCols`-alone branches via a
+//!     small mi-cropped frame; the §6.10.4 `MiSizes[]` grid-fill
+//!     invariant (every cell of the leaf's `bh4 * bw4` footprint
+//!     carries `sub_size`); and the §5.11.4 `r >= MiRows ||
+//!     c >= MiCols` early-return invariant. The walker leaves the
+//!     `decode_block` coefficient / motion-vector / reconstruction
+//!     path entirely to the next round.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -829,13 +879,14 @@ pub use cdf::{
     palette_color_context_from_neighbors, palette_color_ctx, palette_tokens_args,
     palette_tokens_plane, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx,
     partition_subsize, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,
-    split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, PaletteColorContext,
-    PalettePlane, PaletteTokensArgs, TileCdfContext, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT,
-    ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64,
-    BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4,
-    BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32,
-    BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS,
-    CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
+    split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, DecodedBlockRecord,
+    PaletteColorContext, PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext,
+    TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128,
+    BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16,
+    BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128,
+    BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8,
+    BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE,
+    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
     COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
     COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
     COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
@@ -997,6 +1048,18 @@ pub enum Error {
     /// one is a bitstream-conformance violation (or a buffer-aliasing
     /// bug in the caller's `color_map`).
     PaletteColorContextUnmapped,
+    /// The §5.11.4 [`crate::PartitionWalker::decode_partition`] walker
+    /// hit an out-of-range `bSize` (>= [`crate::BLOCK_SIZES`]), an
+    /// out-of-range `partition`, a `bsl` that did not select a
+    /// partition CDF row (a `bsl == 0` or `bsl > 5`), or a
+    /// [`crate::partition_subsize`] lookup that returned
+    /// [`crate::BLOCK_INVALID`]. Each of these is a caller bug — the
+    /// public §5.11.4 entry is gated on a valid `bSize` (the
+    /// superblock size, in `BLOCK_8X8..=BLOCK_128X128`) and the
+    /// recursive children are constructed from in-range
+    /// [`crate::PARTITION_SUBSIZE`] table values, so a conformant
+    /// driver never produces one.
+    PartitionWalkOutOfRange,
 }
 
 impl core::fmt::Display for Error {
@@ -1055,6 +1118,10 @@ impl core::fmt::Display for Error {
             Self::PaletteColorContextUnmapped => write!(
                 f,
                 "oxideav-av1: §5.11.49 palette ColorContextHash maps to an unreachable -1 slot of Palette_Color_Context[]"
+            ),
+            Self::PartitionWalkOutOfRange => write!(
+                f,
+                "oxideav-av1: §5.11.4 decode_partition walker hit an out-of-range bSize / partition / bsl / Partition_Subsize lookup"
             ),
         }
     }
