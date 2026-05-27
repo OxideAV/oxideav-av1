@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 163)
+## Status — 2026-05-27 (round 164)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,39 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 164 lands the §5.11.7 **`use_intrabc` syntax element** (av1-spec
+p.65) as a new `PartitionWalker::decode_use_intrabc` method —
+the per-block intra-block-copy enable bit read on the §5.11.7
+`intra_frame_mode_info()` body immediately after the
+`RefFrame[ 0..2 ]` assignments r161
+`decode_intra_frame_mode_info_prefix` produced. The spec body is the
+two-arm `if ( allow_intrabc ) { use_intrabc S() } else { use_intrabc
+= 0 }`; the dispatcher routes both arms exactly, with no bit consumed
+on the fall-through. New `DEFAULT_INTRABC_CDF: [u16; 3] = [30531,
+32768, 0]` verbatim from §9.4 (av1-spec p.430), a single-row binary
+CDF with no context index (the §8.3.2 selection text is contextless,
+mirroring `Default_Delta_Q_Cdf` / `Default_Delta_Lf_Cdf`). New
+`TileCdfContext::intrabc` field + `intrabc_cdf()` selector; constant
+re-exported at the crate root. Unlike the §5.11.5
+`decode_skip` / `decode_skip_mode` / `decode_is_inter` siblings,
+`decode_use_intrabc` writes nothing to the walker's §5.11.5 grids
+(`Skips[]` / `SkipModes[]` / `IsInters[]` / `SegmentIds[]`) — AV1
+has no per-block `UseIntrabc[][]` map; the value is consumed locally
+by the §5.11.7 follow-on arm. 7 new cdf-module tests (532 → 539):
+`allow = false` zero-bit fall-through on a hostile `0xFF` buffer;
+rigged S() arm forcing symbols 0 / 1; three-way out-of-range guard
+(`sub_size`, `mi_row`, `mi_col`); contextless-selection check
+across three `(mi_row, mi_col, sub_size)` triples; `DEFAULT_INTRABC_CDF
+== [30531, 32768, 0]` layout assertion plus accessor round-trip; and
+a no-grid-stamp invariant covering `Skips[]` / `SkipModes[]` /
+`IsInters[]` after a `use_intrabc = 1` call. The §5.11.7 follow-on
+body now divides into two remaining unblocked arms: (i) the
+`use_intrabc == 1` short-circuit (needs the motion-vector
+stack walker) and (ii) the `intra_block_mode_info` composite
+(`intra_frame_y_mode`, `intra_angle_info_y`, `uv_mode`, etc., each a
+bounded leaf, queued for r165+). `decode_av1` / `encode_av1`
+continue to return `Error::NotImplemented`.
 
 Round 163 lands the §5.11.21 **`get_segment_id()` predicted-segment-id
 helper** (av1-spec p.72) as a new free function

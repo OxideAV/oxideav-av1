@@ -6,6 +6,73 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 164 — §5.11.7 `use_intrabc` syntax element (`decode_use_intrabc`).**
+  Lands a new [`PartitionWalker::decode_use_intrabc`] method
+  implementing the §5.11.7 `use_intrabc` syntax element (av1-spec
+  p.65): the per-block intra-block-copy enable bit read on the
+  §5.11.7 `intra_frame_mode_info()` body immediately after the
+  `RefFrame[ 0..2 ]` assignments that r161
+  [`PartitionWalker::decode_intra_frame_mode_info_prefix`] produced.
+  The spec body is the two-arm `if ( allow_intrabc ) { use_intrabc
+  S() } else { use_intrabc = 0 }`; the dispatcher routes both
+  arms exactly, with no bit consumed on the fall-through.
+
+  New `DEFAULT_INTRABC_CDF: [u16; 3] = [30531, 32768, 0]` table
+  verbatim from §9.4 (av1-spec p.430) — a single-row binary CDF
+  with no context index (the §8.3.2 selection text is "use_intrabc:
+  The cdf for use_intrabc is given by TileIntrabcCdf" with no
+  `[ctx]` subscript, mirroring the `Default_Delta_Q_Cdf` /
+  `Default_Delta_Lf_Cdf` shape). New `TileCdfContext::intrabc`
+  field initialised in `new_from_defaults` from
+  `DEFAULT_INTRABC_CDF`, plus the `TileCdfContext::intrabc_cdf()`
+  selector implementing the §8.3.2 contextless lookup.
+  `DEFAULT_INTRABC_CDF` re-exported at the crate root.
+
+  Unlike the §5.11.5 `decode_skip` / `decode_skip_mode` /
+  `decode_is_inter` siblings, `decode_use_intrabc` writes nothing
+  to the walker's §5.11.5 grids (`Skips[]` / `SkipModes[]` /
+  `IsInters[]` / `SegmentIds[]`) — AV1 has no per-block
+  `UseIntrabc[][]` map. The value is consumed locally by the
+  §5.11.7 follow-on arm (the `is_inter = 1` / `YMode = DC_PRED` /
+  `find_mv_stack(0)` / `assign_mv(0)` short-circuit when
+  `use_intrabc == 1`, vs. the `intra_block_mode_info` composite
+  when `use_intrabc == 0`); both follow-on arms remain the next
+  round's targets.
+
+  7 new cdf-module tests (532 → 539):
+    * `decode_use_intrabc_allow_false_no_read` — fall-through arm
+      consumes zero bits on a hostile `0xFF` buffer.
+    * `decode_use_intrabc_allow_true_returns_symbol_zero` /
+      `_returns_symbol_one` — rigged S() arm against
+      `force_binary_cdf(0)` / `(1)` returns the forced symbol.
+    * `decode_use_intrabc_rejects_out_of_range` — `sub_size >=
+      BLOCK_SIZES` / `mi_row >= MiRows` / `mi_col >= MiCols` all
+      surface `PartitionWalkOutOfRange`.
+    * `decode_use_intrabc_contextless_cdf_selection` — three
+      distinct `(mi_row, mi_col, sub_size)` triples all select the
+      same `TileIntrabcCdf` row (confirming the §8.3.2 selection
+      is contextless).
+    * `default_intrabc_cdf_layout_and_accessor` —
+      `DEFAULT_INTRABC_CDF == [30531, 32768, 0]` verbatim from
+      §9.4, fresh `TileCdfContext::intrabc` matches, and the
+      `intrabc_cdf` accessor returns the same row.
+    * `decode_use_intrabc_does_not_stamp_grids` — after a
+      `decode_use_intrabc` call, all of `Skips[]` / `SkipModes[]` /
+      `IsInters[]` stay zeroed (no §5.11.5-style footprint stamp).
+
+  The §5.11.7 follow-on body now divides cleanly into two
+  remaining unblocked arms: (i) the `use_intrabc == 1`
+  short-circuit (`is_inter = 1`, `YMode = DC_PRED`, `UVMode =
+  DC_PRED`, `motion_mode = SIMPLE`, `compound_type =
+  COMPOUND_AVERAGE`, palette sizes = 0, `interp_filter[0..2] =
+  BILINEAR`, `find_mv_stack(0)`, `assign_mv(0)`) — needing the
+  motion-vector stack walker; and (ii) the `intra_block_mode_info`
+  composite (`intra_frame_y_mode`, `intra_angle_info_y`, `uv_mode`,
+  `read_cfl_alphas`, `intra_angle_info_uv`, `palette_mode_info`,
+  `filter_intra_mode_info`) — each a bounded leaf, queued for
+  r165+. `decode_av1` / `encode_av1` continue to return
+  `Error::NotImplemented`.
+
 * **Round 163 — §5.11.21 `get_segment_id()` predicted-segment-id helper.**
   Lands a new free function [`cdf::get_segment_id`] (re-exported at the
   crate root) implementing the §5.11.21 spec body (av1-spec p.72): the

@@ -1516,6 +1516,20 @@ pub const DEFAULT_COMP_MODE_CDF: [[u16; 3]; COMP_INTER_CONTEXTS] = [
 pub const DEFAULT_SKIP_MODE_CDF: [[u16; 3]; SKIP_MODE_CONTEXTS] =
     [[32621, 32768, 0], [20708, 32768, 0], [8127, 32768, 0]];
 
+/// `Default_Intrabc_Cdf[ 2 + 1 ]` (§9.4, av1-spec p.430). Binary; codes
+/// `use_intrabc` per §8.3.2 `TileIntrabcCdf` (no context index — the
+/// §8.3.2 selection text is "use_intrabc: The cdf for use_intrabc is
+/// given by TileIntrabcCdf", with no `[ctx]`-style subscript, so the
+/// working `TileIntrabcCdf` is a single row instead of a per-context
+/// `[CONTEXTS][..]` array — the same shape as
+/// [`DEFAULT_DELTA_Q_CDF`] / [`DEFAULT_DELTA_LF_CDF`]). The spec
+/// listing is `{ 30531, 32768, 0 }` (av1-spec p.430): two cumulative
+/// frequencies (`use_intrabc = 0` ⇒ `30531`, `use_intrabc = 1` ⇒
+/// `32768`) plus the §8.3 adaptation counter (starts at 0). The skew
+/// matches the §5.11.7 control-flow expectation that `use_intrabc`
+/// stays off most of the time even on `allow_intrabc == 1` frames.
+pub const DEFAULT_INTRABC_CDF: [u16; 3] = [30531, 32768, 0];
+
 /// `Default_Delta_Q_Cdf[ DELTA_Q_SMALL + 2 ]` (§9.4, av1-spec p.431).
 /// Codes `delta_q_abs` per §8.3.2 `TileDeltaQCdf`. There is **no**
 /// context index for this syntax element — the spec lists one
@@ -6849,6 +6863,10 @@ pub struct TileCdfContext {
     pub comp_mode: [[u16; 3]; COMP_INTER_CONTEXTS],
     /// `TileSkipModeCdf[ SKIP_MODE_CONTEXTS ]` (§8.3.1).
     pub skip_mode: [[u16; 3]; SKIP_MODE_CONTEXTS],
+    /// `TileIntrabcCdf` (§8.3.1, av1-spec p.354). Codes `use_intrabc`
+    /// per §5.11.7 / §8.3.2; single CDF row (no context index — see
+    /// [`DEFAULT_INTRABC_CDF`]).
+    pub intrabc: [u16; 3],
     /// `TileDeltaQCdf` (§8.3.1, av1-spec p.382). Codes `delta_q_abs`
     /// per §5.11.12 / §8.3.2; single CDF row (no context index).
     pub delta_q: [u16; DELTA_Q_SMALL + 2],
@@ -7198,6 +7216,7 @@ impl TileCdfContext {
             is_inter: DEFAULT_IS_INTER_CDF,
             comp_mode: DEFAULT_COMP_MODE_CDF,
             skip_mode: DEFAULT_SKIP_MODE_CDF,
+            intrabc: DEFAULT_INTRABC_CDF,
             delta_q: DEFAULT_DELTA_Q_CDF,
             delta_lf: DEFAULT_DELTA_LF_CDF,
             delta_lf_multi: [DEFAULT_DELTA_LF_CDF; FRAME_LF_COUNT],
@@ -7496,6 +7515,18 @@ impl TileCdfContext {
     /// `ctx` computed by [`skip_mode_ctx`] (in `0..SKIP_MODE_CONTEXTS`).
     pub fn skip_mode_cdf(&mut self, ctx: usize) -> &mut [u16] {
         &mut self.skip_mode[ctx]
+    }
+
+    /// §8.3.2 `use_intrabc`: the cdf is `TileIntrabcCdf` (no context
+    /// index — the §8.3.2 selection text reads "use_intrabc: The cdf
+    /// for use_intrabc is given by TileIntrabcCdf" with no `[ctx]`
+    /// subscript). Length is 3 (`use_intrabc ∈ { 0, 1 }` plus the
+    /// §8.2.6 counter slot). Used only by the §5.11.7 `if
+    /// ( allow_intrabc ) { use_intrabc S() }` arm — frames with
+    /// `allow_intrabc == 0` never reach the selector (the §5.11.7
+    /// fall-through `use_intrabc = 0` consumes no bit).
+    pub fn intrabc_cdf(&mut self) -> &mut [u16] {
+        &mut self.intrabc
     }
 
     /// §8.3.2 `delta_q_abs`: the cdf is `TileDeltaQCdf` (no context
@@ -13443,6 +13474,88 @@ impl PartitionWalker {
             current_delta_lf,
             ref_frame: [0, -1],
         })
+    }
+
+    /// `use_intrabc` syntax element per §5.11.7 (av1-spec p.65) — the
+    /// per-block intra-block-copy enable bit read on the §5.11.7
+    /// `intra_frame_mode_info()` body immediately after the `RefFrame[
+    /// 0..2 ]` assignments the
+    /// [`Self::decode_intra_frame_mode_info_prefix`] dispatcher produced.
+    ///
+    /// The spec body (av1-spec p.65) reads:
+    ///
+    /// ```text
+    ///   if ( allow_intrabc ) {
+    ///       use_intrabc                                          S()
+    ///   } else {
+    ///       use_intrabc = 0
+    ///   }
+    /// ```
+    ///
+    /// `allow_intrabc` is the §5.9.20 frame-header bit (also routed
+    /// through the §5.9.5 / §5.5.2 `screen_content_tools` gates — see
+    /// [`crate::uncompressed_header_tail::parse_segmentation_params`]
+    /// adjacent fields). When `allow_intrabc == 0`, the spec
+    /// fall-through assigns `use_intrabc = 0` with no bit consumed;
+    /// when `allow_intrabc == 1`, a single `S()` symbol is read against
+    /// `TileIntrabcCdf` (the §8.3.2 selection is contextless — see
+    /// [`TileCdfContext::intrabc_cdf`]).
+    ///
+    /// `use_intrabc` itself is **not** stamped onto any §5.11.5 grid
+    /// (the walker tracks `Skips[]`, `SkipModes[]`, `IsInters[]`,
+    /// `MiSizes[]`, `SegmentIds[]`, but not a per-block
+    /// `UseIntrabc[][]` map — the value is consumed locally by the
+    /// §5.11.7 follow-on `if ( use_intrabc ) { is_inter = 1; YMode =
+    /// DC_PRED; ... find_mv_stack(0); assign_mv(0) }` arm and never
+    /// referenced by a future block's CDF-context derivation). The
+    /// caller threads the returned `u8` into the §5.11.7 arm
+    /// dispatcher (the `intra_block_mode_info` composite vs. the
+    /// `is_inter = 1` / `YMode = DC_PRED` short-circuit followed by
+    /// `find_mv_stack(0)` / `assign_mv(0)` — both of which need
+    /// symbols not yet wired through the walker).
+    ///
+    /// Returns the decoded `use_intrabc` value (0 or 1) on success.
+    /// Returns [`Error::PartitionWalkOutOfRange`] for caller bugs
+    /// (out-of-range `sub_size`, `mi_row` / `mi_col` outside the
+    /// frame's mi extent). [`Error::UnexpectedEnd`] /
+    /// [`Error::SymbolExitUnderflow`] surface bitstream errors from
+    /// the §8.2.6 `S()` read.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
+    pub fn decode_use_intrabc(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        allow_intrabc: bool,
+    ) -> Result<u8, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.7: `if ( allow_intrabc ) { use_intrabc S() } else {
+        // use_intrabc = 0 }`. The fall-through reads zero bits; the
+        // S() arm reads one symbol against `TileIntrabcCdf` (the §8.3.2
+        // selection is contextless — see [`TileCdfContext::intrabc_cdf`]).
+        let use_intrabc: u8 = if allow_intrabc {
+            let cdf = cdfs.intrabc_cdf();
+            // §8.2.6 S(): a 2-symbol read against `Default_Intrabc_Cdf`
+            // (length 3 including the counter slot) returns 0 or 1.
+            let sym = decoder.read_symbol(cdf)? as u8;
+            debug_assert!(sym <= 1, "S() over Default_Intrabc_Cdf yields 0 or 1");
+            sym
+        } else {
+            0
+        };
+
+        Ok(use_intrabc)
     }
 }
 
@@ -24802,6 +24915,221 @@ mod tests {
             assert_eq!(prefix.skip_mode, 0);
             // §5.11.7 line 4 left SkipModes[] untouched.
             assert_eq!(walker_local.skip_modes()[0], 0, "SkipModes[0][0] = 0");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 164 — §5.11.7 `decode_use_intrabc` syntax-element tests.
+    // -----------------------------------------------------------------
+
+    /// §5.11.7 fall-through arm: `allow_intrabc = false` ⇒
+    /// `use_intrabc = 0` with zero bits consumed. The hostile `0xFF`
+    /// buffer must not be touched.
+    #[test]
+    fn decode_use_intrabc_allow_false_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let v = walker
+            .decode_use_intrabc(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* allow_intrabc = */ false,
+            )
+            .unwrap();
+        assert_eq!(v, 0, "allow_intrabc = false ⇒ use_intrabc = 0");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no symbol bit read on the fall-through arm",
+        );
+    }
+
+    /// §5.11.7 `S()` arm with a rigged CDF forcing symbol 0
+    /// (`use_intrabc = 0`): the decoder advances past the S() symbol
+    /// and the returned value matches.
+    #[test]
+    fn decode_use_intrabc_allow_true_returns_symbol_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.intrabc = force_binary_cdf(0);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_use_intrabc(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* allow_intrabc = */ true,
+            )
+            .unwrap();
+        assert_eq!(v, 0, "rigged S() returns 0");
+    }
+
+    /// §5.11.7 `S()` arm with a rigged CDF forcing symbol 1
+    /// (`use_intrabc = 1`): the returned value matches.
+    #[test]
+    fn decode_use_intrabc_allow_true_returns_symbol_one() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.intrabc = force_binary_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let v = walker
+            .decode_use_intrabc(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* allow_intrabc = */ true,
+            )
+            .unwrap();
+        assert_eq!(v, 1, "rigged S() returns 1");
+    }
+
+    /// §5.11.7 caller-bug guards fire before any read: an out-of-range
+    /// `sub_size` or anchor past the frame's mi extent yields
+    /// `PartitionWalkOutOfRange` without consuming any bit of the
+    /// hostile `0xFF` buffer.
+    #[test]
+    fn decode_use_intrabc_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+
+        // Out-of-range sub_size (== BLOCK_SIZES).
+        assert_eq!(
+            walker.decode_use_intrabc(&mut dec, &mut cdfs, 0, 0, BLOCK_SIZES, true),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+        // mi_row past the frame extent.
+        assert_eq!(
+            walker.decode_use_intrabc(&mut dec, &mut cdfs, 16, 0, BLOCK_4X4, true),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+        // mi_col past the frame extent.
+        assert_eq!(
+            walker.decode_use_intrabc(&mut dec, &mut cdfs, 0, 16, BLOCK_4X4, true),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+    }
+
+    /// §5.11.7 `S()` arm uses the contextless `TileIntrabcCdf` — the
+    /// same CDF row is selected regardless of `(mi_row, mi_col)` or
+    /// `sub_size`. We verify by rigging `intrabc` to force symbol 1
+    /// and confirming the symbol fires from three distinct anchor /
+    /// size combinations.
+    #[test]
+    fn decode_use_intrabc_contextless_cdf_selection() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.intrabc = force_binary_cdf(1);
+
+        for &(r, c, sz) in &[
+            (0u32, 0u32, BLOCK_16X16),
+            (8, 12, BLOCK_8X8),
+            (20, 4, BLOCK_4X8),
+        ] {
+            let bytes = [0u8; 8];
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+            let v = walker
+                .decode_use_intrabc(&mut dec, &mut cdfs, r, c, sz, true)
+                .unwrap();
+            assert_eq!(v, 1, "contextless selection at ({r}, {c}) sub_size={sz}",);
+        }
+    }
+
+    /// §8.3.1 init: `TileIntrabcCdf` is set to a copy of
+    /// `Default_Intrabc_Cdf`. The fresh-walker `intrabc` field must
+    /// equal the spec's `{ 30531, 32768, 0 }` listing, and the
+    /// `intrabc_cdf` accessor must return that same row.
+    #[test]
+    fn default_intrabc_cdf_layout_and_accessor() {
+        // §9.4 listing (av1-spec p.430).
+        assert_eq!(DEFAULT_INTRABC_CDF, [30531, 32768, 0]);
+
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        assert_eq!(cdfs.intrabc, DEFAULT_INTRABC_CDF);
+        let accessor_view = cdfs.intrabc_cdf();
+        assert_eq!(accessor_view.len(), 3, "binary CDF row width");
+        assert_eq!(accessor_view[0], 30531);
+        assert_eq!(accessor_view[1], 32768);
+        assert_eq!(accessor_view[2], 0);
+    }
+
+    /// §5.11.7 `decode_use_intrabc` is **stateless** in the §5.11.5
+    /// grid sense: unlike `decode_skip` / `decode_skip_mode` /
+    /// `decode_is_inter`, the function writes nothing to
+    /// `Skips[]` / `SkipModes[]` / `IsInters[]` / `SegmentIds[]`.
+    /// AV1 has no per-block `UseIntrabc[][]` map — the value is
+    /// consumed locally by the §5.11.7 follow-on arm. We verify the
+    /// walker grids are unchanged after the call.
+    #[test]
+    fn decode_use_intrabc_does_not_stamp_grids() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.intrabc = force_binary_cdf(1);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let _ = walker
+            .decode_use_intrabc(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, true)
+            .unwrap();
+        // The walker exposes its §5.11.5 grids via the existing
+        // accessors; none of them should carry a non-zero value after
+        // a use_intrabc call.
+        for &v in walker.skips() {
+            assert_eq!(v, 0, "decode_use_intrabc must not write Skips[]");
+        }
+        for &v in walker.skip_modes() {
+            assert_eq!(v, 0, "decode_use_intrabc must not write SkipModes[]");
+        }
+        for &v in walker.is_inters() {
+            assert_eq!(v, 0, "decode_use_intrabc must not write IsInters[]");
         }
     }
 
