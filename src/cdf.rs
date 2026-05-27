@@ -1024,6 +1024,305 @@ pub const fn mi_height_log2(mi_size: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------
+// Round 180 — §5.11.38 `get_plane_residual_size` + §5.11.33
+// `compute_prediction` per-plane block-size derivation.
+//
+// `Subsampled_Size[ subsize ][ subX ][ subY ]` (av1-spec p.88) is the
+// §5.11.38 lookup the §5.11.30 / §5.11.33 / §5.11.34 callers consume
+// to translate a luma `MiSize` into a per-plane residual block size
+// (chroma residual blocks are width/height-halved by `subsampling_x` /
+// `subsampling_y`, with the §3 enumeration's `BLOCK_INVALID` slots
+// marking the configurations forbidden by the §6.4.1
+// `monochrome` / `subsampling_{x,y}` gates).
+// ---------------------------------------------------------------------
+
+/// `Subsampled_Size[ BLOCK_SIZES ][ 2 ][ 2 ]` (av1-spec p.88,
+/// §5.11.38 `get_plane_residual_size`) — for a luma `subsize` plus a
+/// per-plane `(subsampling_x, subsampling_y)` pair, returns the
+/// `BLOCK_*` ordinal of the per-plane residual block. The
+/// `(0, 0)` cell is always equal to `subsize` (luma needs no
+/// down-shift); the other three cells fold the `subsampling_x` /
+/// `subsampling_y` chroma halving into a §3-enumeration ordinal,
+/// promoting any post-shift `2` dimension back to `4` (the §3
+/// enumeration's smallest tile dimension). The §3 enumeration's
+/// `BLOCK_INVALID` sentinel marks configurations the §6.4.1
+/// `subsampling_{x,y}` / `monochrome` gates forbid (e.g.
+/// `BLOCK_4X8` with `subsampling_x == 1`, `subsampling_y == 0` —
+/// chroma would need a `2`-wide x `8`-tall residual the §3 ordinal
+/// space cannot express).
+///
+/// Indexed as `SUBSAMPLED_SIZE[subsize][subx][suby]`. Caller-bug if
+/// `subsize >= BLOCK_SIZES`.
+pub const SUBSAMPLED_SIZE: [[[usize; 2]; 2]; BLOCK_SIZES] = [
+    // BLOCK_4X4 — already 4x4 chroma cell.
+    [[BLOCK_4X4, BLOCK_4X4], [BLOCK_4X4, BLOCK_4X4]],
+    // BLOCK_4X8
+    [[BLOCK_4X8, BLOCK_4X4], [BLOCK_INVALID, BLOCK_4X4]],
+    // BLOCK_8X4
+    [[BLOCK_8X4, BLOCK_INVALID], [BLOCK_4X4, BLOCK_4X4]],
+    // BLOCK_8X8
+    [[BLOCK_8X8, BLOCK_8X4], [BLOCK_4X8, BLOCK_4X4]],
+    // BLOCK_8X16
+    [[BLOCK_8X16, BLOCK_8X8], [BLOCK_INVALID, BLOCK_4X8]],
+    // BLOCK_16X8
+    [[BLOCK_16X8, BLOCK_INVALID], [BLOCK_8X8, BLOCK_8X4]],
+    // BLOCK_16X16
+    [[BLOCK_16X16, BLOCK_16X8], [BLOCK_8X16, BLOCK_8X8]],
+    // BLOCK_16X32
+    [[BLOCK_16X32, BLOCK_16X16], [BLOCK_INVALID, BLOCK_8X16]],
+    // BLOCK_32X16
+    [[BLOCK_32X16, BLOCK_INVALID], [BLOCK_16X16, BLOCK_16X8]],
+    // BLOCK_32X32
+    [[BLOCK_32X32, BLOCK_32X16], [BLOCK_16X32, BLOCK_16X16]],
+    // BLOCK_32X64
+    [[BLOCK_32X64, BLOCK_32X32], [BLOCK_INVALID, BLOCK_16X32]],
+    // BLOCK_64X32
+    [[BLOCK_64X32, BLOCK_INVALID], [BLOCK_32X32, BLOCK_32X16]],
+    // BLOCK_64X64
+    [[BLOCK_64X64, BLOCK_64X32], [BLOCK_32X64, BLOCK_32X32]],
+    // BLOCK_64X128
+    [[BLOCK_64X128, BLOCK_64X64], [BLOCK_INVALID, BLOCK_32X64]],
+    // BLOCK_128X64
+    [[BLOCK_128X64, BLOCK_INVALID], [BLOCK_64X64, BLOCK_64X32]],
+    // BLOCK_128X128
+    [[BLOCK_128X128, BLOCK_128X64], [BLOCK_64X128, BLOCK_64X64]],
+    // BLOCK_4X16
+    [[BLOCK_4X16, BLOCK_4X8], [BLOCK_INVALID, BLOCK_4X8]],
+    // BLOCK_16X4
+    [[BLOCK_16X4, BLOCK_INVALID], [BLOCK_8X4, BLOCK_8X4]],
+    // BLOCK_8X32
+    [[BLOCK_8X32, BLOCK_8X16], [BLOCK_INVALID, BLOCK_4X16]],
+    // BLOCK_32X8
+    [[BLOCK_32X8, BLOCK_INVALID], [BLOCK_16X8, BLOCK_16X4]],
+    // BLOCK_16X64
+    [[BLOCK_16X64, BLOCK_16X32], [BLOCK_INVALID, BLOCK_8X32]],
+    // BLOCK_64X16
+    [[BLOCK_64X16, BLOCK_INVALID], [BLOCK_32X16, BLOCK_32X8]],
+];
+
+/// `get_plane_residual_size( subsize, plane )` per §5.11.38 (av1-spec
+/// p.88) — returns the `BLOCK_*` ordinal of the per-plane residual
+/// block.
+///
+/// The spec body reads:
+///
+/// ```text
+///   get_plane_residual_size( subsize, plane ) {
+///     subx = plane > 0 ? subsampling_x : 0
+///     suby = plane > 0 ? subsampling_y : 0
+///     return Subsampled_Size[ subsize ][ subx ][ suby ]
+///   }
+/// ```
+///
+/// `plane == 0` (luma) returns `subsize` unchanged (the `(0, 0)` cell
+/// of [`SUBSAMPLED_SIZE`]). `plane > 0` (chroma) applies the
+/// per-plane subsampling pair from the §5.5.2 sequence-header
+/// `color_config()`. The §6.4.1 conformance requirement that
+/// `get_plane_residual_size( subsize, 1 ) != BLOCK_INVALID` holds on
+/// every reachable code path; this helper returns `Some(BLOCK_*)`
+/// for that case and `None` for the §3-enumeration sentinel (i.e.
+/// the §6.4.1-forbidden combinations).
+///
+/// Returns `None` if `subsize >= BLOCK_SIZES` (a caller bug — every
+/// dispatcher upstream gates on the `BLOCK_SIZES` bound first).
+#[inline]
+#[must_use]
+pub fn get_plane_residual_size(
+    subsize: usize,
+    plane: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+) -> Option<usize> {
+    if subsize >= BLOCK_SIZES {
+        return None;
+    }
+    let subx = if plane > 0 {
+        (subsampling_x != 0) as usize
+    } else {
+        0
+    };
+    let suby = if plane > 0 {
+        (subsampling_y != 0) as usize
+    } else {
+        0
+    };
+    let raw = SUBSAMPLED_SIZE[subsize][subx][suby];
+    if raw == BLOCK_INVALID {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Round 180 — §7.11.2.5 DC intra prediction process.
+//
+// `predict_intra_dc_pred` is the §7.11.2.5 sample-generation routine
+// the §7.11.2.1 dispatcher calls when `mode == DC_PRED` (av1-spec
+// p.248-249). Operates on caller-supplied `AboveRow[ 0..w-1 ]` /
+// `LeftCol[ 0..h-1 ]` slices (the §7.11.2.1 prologue's derived
+// neighbour arrays) plus a flat `pred` output buffer of size
+// `h * w` (row-major), writing the per-cell prediction sample.
+//
+// `BitDepth` enters only through the no-neighbour fallback
+// (`pred = 1 << (BitDepth - 1)`); a caller with `BitDepth == 8`
+// passes `bit_depth = 8` and the helper writes `128` into every
+// `pred[i][j]` cell.
+//
+// This is the §7.11.2 sample-generation leaf — separate from the
+// §5.11.30 / §5.11.33 dispatcher (which only walks the per-plane
+// block enumeration). The dispatcher's `predict_intra` call site
+// passes `AboveRow` / `LeftCol` derived from `CurrFrame`, which
+// the §5.11.5 syntax walker does not yet track; the leaf is
+// therefore exposed for direct caller use (e.g. a future
+// `transform_block`-driving reconstruction pass).
+// ---------------------------------------------------------------------
+
+/// §7.11.2.5 DC intra prediction process (av1-spec p.248-249) — fills
+/// `pred[ 0..h*w ]` with the DC prediction for the given neighbour
+/// configuration.
+///
+/// The spec body reads as a four-arm dispatch on `(haveLeft,
+/// haveAbove)`:
+///
+/// * `(1, 1)` ⇒ `pred[i][j] = avg`, where `avg = (sum + (w+h)/2) /
+///   (w+h)` with `sum = Σ LeftCol[k] + Σ AboveRow[k]`.
+/// * `(1, 0)` ⇒ `pred[i][j] = Clip1( ( sum + (h>>1) ) >> log2H )`,
+///   `sum = Σ LeftCol[k]`.
+/// * `(0, 1)` ⇒ `pred[i][j] = Clip1( ( sum + (w>>1) ) >> log2W )`,
+///   `sum = Σ AboveRow[k]`.
+/// * `(0, 0)` ⇒ `pred[i][j] = 1 << (BitDepth - 1)` (e.g. `128` for
+///   8-bit content).
+///
+/// `Clip1(x) = Clip3(0, (1 << BitDepth) - 1, x)` per §3 `Clip1`.
+///
+/// ## Arguments
+///
+/// * `have_left` — `1` if `LeftCol` carries valid samples (`haveLeft`
+///   from §7.11.2.1).
+/// * `have_above` — `1` if `AboveRow` carries valid samples.
+/// * `log2_w` / `log2_h` — base-2 logarithms of the prediction
+///   region's width / height (passed through from §7.11.2.1's
+///   `log2W` / `log2H` inputs). Must satisfy `(1 << log2_w) == w` /
+///   `(1 << log2_h) == h`.
+/// * `w` / `h` — the prediction region's width / height in luma
+///   samples. Both in `4..=64` per the §3 transform-size table.
+/// * `bit_depth` — the §5.5.2 frame bit depth (`8`, `10`, or `12`).
+/// * `above_row` — `AboveRow[ 0..w-1 ]`. Length must be `>= w`. Ignored
+///   when `have_above == 0`.
+/// * `left_col` — `LeftCol[ 0..h-1 ]`. Length must be `>= h`. Ignored
+///   when `have_left == 0`.
+/// * `pred` — output buffer, row-major; length must be `>= h * w`. The
+///   helper writes `pred[i * w + j]` for `i in 0..h`, `j in 0..w`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments: `bit_depth` not in `{8, 10, 12}`; `w != (1 << log2_w)`
+/// or `h != (1 << log2_h)`; `log2_w > 6` or `log2_h > 6`;
+/// `above_row.len() < w` (when `have_above != 0`);
+/// `left_col.len() < h` (when `have_left != 0`); `pred.len() < h * w`.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_intra_dc_pred(
+    have_left: u8,
+    have_above: u8,
+    log2_w: u32,
+    log2_h: u32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    // ---------- caller-bug guards ----------
+    if !matches!(bit_depth, 8 | 10 | 12) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if log2_w > 6 || log2_h > 6 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if w != (1usize << log2_w) || h != (1usize << log2_h) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h * w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if have_above != 0 && above_row.len() < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if have_left != 0 && left_col.len() < h {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.2.5 four-arm dispatch on (haveLeft, haveAbove).
+    let avg: u32 = if have_left != 0 && have_above != 0 {
+        // §7.11.2.5 arm 1: union average.
+        //
+        //   sum = Σ LeftCol[k] for k in 0..h
+        //       + Σ AboveRow[k] for k in 0..w
+        //   sum += (w + h) >> 1
+        //   avg = sum / (w + h)
+        //
+        // The spec's reference-note observes the division by `w + h`
+        // can be implemented with a multiply-shift; we use the spec's
+        // direct division — the result is identical for the `w + h ∈
+        // {8, 12, 16, 20, 24, 32, 40, 48, 64, 96, 128}` set the §3
+        // transform-size table admits, and it keeps the
+        // implementation provably equivalent to the spec text.
+        let mut sum: u32 = 0;
+        for v in left_col.iter().take(h) {
+            sum += *v as u32;
+        }
+        for v in above_row.iter().take(w) {
+            sum += *v as u32;
+        }
+        sum += ((w + h) as u32) >> 1;
+        sum / ((w + h) as u32)
+    } else if have_left != 0 {
+        // §7.11.2.5 arm 2: left-only average with `Clip1`.
+        let mut sum: u32 = 0;
+        for v in left_col.iter().take(h) {
+            sum += *v as u32;
+        }
+        let v = (sum + ((h as u32) >> 1)) >> log2_h;
+        clip1_bit_depth(v, bit_depth)
+    } else if have_above != 0 {
+        // §7.11.2.5 arm 3: above-only average with `Clip1`.
+        let mut sum: u32 = 0;
+        for v in above_row.iter().take(w) {
+            sum += *v as u32;
+        }
+        let v = (sum + ((w as u32) >> 1)) >> log2_w;
+        clip1_bit_depth(v, bit_depth)
+    } else {
+        // §7.11.2.5 arm 4: no-neighbour fallback (the
+        // `1 << (BitDepth - 1)` mid-grey value).
+        1u32 << (bit_depth - 1)
+    };
+
+    let avg = avg as u16;
+    for cell in pred.iter_mut().take(h * w) {
+        *cell = avg;
+    }
+    Ok(())
+}
+
+/// §3 `Clip1(x) = Clip3(0, (1 << BitDepth) - 1, x)`. The clip
+/// upper bound depends on `bit_depth` (`255`, `1023`, or `4095`).
+#[inline]
+fn clip1_bit_depth(x: u32, bit_depth: u8) -> u32 {
+    let max = (1u32 << bit_depth) - 1;
+    if x > max {
+        max
+    } else {
+        x
+    }
+}
+
+// ---------------------------------------------------------------------
 // Round 149 — §5.11.49 caller-side argument derivation.
 // Computes the four `palette_tokens_plane` size arguments
 // (`block_w`, `block_h`, `onscreen_w`, `onscreen_h`) from the parser-
@@ -20404,13 +20703,314 @@ impl PartitionWalker {
             tx_size,
         };
 
-        // §5.11.5 line `compute_prediction( )` — §5.11.30 STUB. The
-        // walker has completed the §5.11.5 prologue + §5.11.6
-        // `mode_info()` (intra arm) + §5.11.49 `palette_tokens()`
-        // (no-op) + §5.11.16 `read_block_tx_size()` and now reaches
-        // the next §5.11.5 call. `compute_prediction()` (intra / inter
-        // prediction sample generation) is the next round's target.
-        Err(crate::Error::DecodeBlockComputePredictionUnsupported)
+        // §5.11.5 line `compute_prediction( )` — §5.11.33 dispatcher.
+        // The §5.11.33 body walks `for plane = 0..1 + HasChroma * 2`,
+        // computes the per-plane residual size + neighbour-availability
+        // flags, and on the reachable path (intra-only block with
+        // `YMode == DC_PRED`, no interintra) emits one DC_PRED
+        // `predict_intra` task per plane. We invoke
+        // [`Self::compute_prediction`] with the running per-block state
+        // and discard the readout — the per-plane sample buffers the
+        // tasks operate against live in `CurrFrame[plane][y][x]`,
+        // which the §5.11.5 syntax walker does not yet track.
+        //
+        // On the `is_inter == 0` walker path the dispatcher returns
+        // `Ok(_)` (one DC_PRED intra task per visited plane), and the
+        // walker advances to the §5.11.34 `residual()` stub.
+        //
+        // On the `is_inter == 1` path (unreachable from `decode_block_
+        // syntax` today — the intra arm forces `is_inter = 0` except
+        // on the `use_intrabc == 1` arm which lands a separate next-arc
+        // §7.11.5 inter+intra sub-arc) the dispatcher would surface
+        // [`crate::Error::ComputePredictionInterUnsupported`]; the
+        // §5.11.5 walker propagates that error directly. (The §5.11.18
+        // inter-frame dispatcher is itself still stubbed at
+        // [`crate::Error::DecodeBlockInterFrameUnsupported`] upstream,
+        // so the `is_inter == 1` arm of compute_prediction isn't yet
+        // reachable from `decode_block_syntax`.)
+        //
+        // For the §5.11.30 / §5.11.33 dispatcher arguments we use:
+        //   `y_mode_uv` — we do NOT yet have a decoded UVMode (§5.11.7
+        //                 follow-on is next-arc); the §5.11.33 chroma
+        //                 plane currently uses the §5.11.7 default
+        //                 `UVMode = DC_PRED` (the read_intra_frame_y_mode
+        //                 reader's intra-mode-info `else` arm sets the
+        //                 grid default to 0 = DC_PRED).
+        let _readout = self.compute_prediction(
+            mi_row_b,
+            mi_col_b,
+            sub_size,
+            has_chroma,
+            avail_u,
+            avail_l,
+            avail_u_chroma,
+            avail_l_chroma,
+            subsampling_x,
+            subsampling_y,
+            is_inter != 0,
+            /* y_mode = */ y_mode,
+            /* uv_mode = */ 0u8, /* DC_PRED — §5.11.7 default until UVMode lands */
+            /* ref_frame_1_is_intra = */ false,
+        )?;
+
+        // §5.11.5 line `residual( )` — §5.11.34 STUB. The walker has
+        // completed the §5.11.5 prologue + §5.11.6 `mode_info()`
+        // (intra arm) + §5.11.49 `palette_tokens()` (no-op) +
+        // §5.11.16 `read_block_tx_size()` + §5.11.33
+        // `compute_prediction()` (intra-DC enumeration) and now
+        // reaches the next §5.11.5 call. `residual()` (transform-
+        // coefficient read + reconstruction) is the next-arc target.
+        Err(crate::Error::DecodeBlockResidualUnsupported)
+    }
+
+    /// `compute_prediction()` per §5.11.33 (av1-spec p.82-83) — the
+    /// per-block prediction-task enumeration the §5.11.5
+    /// [`Self::decode_block_syntax`] driver invokes between the
+    /// §5.11.16 `read_block_tx_size()` call and the §5.11.34
+    /// `residual()` call.
+    ///
+    /// The spec body reads:
+    ///
+    /// ```text
+    ///   compute_prediction() {
+    ///     sbMask = use_128x128_superblock ? 31 : 15
+    ///     subBlockMiRow = MiRow & sbMask
+    ///     subBlockMiCol = MiCol & sbMask
+    ///     for ( plane = 0; plane < 1 + HasChroma * 2; plane++ ) {
+    ///       planeSz = get_plane_residual_size( MiSize, plane )
+    ///       num4x4W = Num_4x4_Blocks_Wide[ planeSz ]
+    ///       num4x4H = Num_4x4_Blocks_High[ planeSz ]
+    ///       log2W = MI_SIZE_LOG2 + Mi_Width_Log2[ planeSz ]
+    ///       log2H = MI_SIZE_LOG2 + Mi_Height_Log2[ planeSz ]
+    ///       subX = (plane > 0) ? subsampling_x : 0
+    ///       subY = (plane > 0) ? subsampling_y : 0
+    ///       baseX = (MiCol >> subX) * MI_SIZE
+    ///       baseY = (MiRow >> subY) * MI_SIZE
+    ///       candRow = (MiRow >> subY) << subY
+    ///       candCol = (MiCol >> subX) << subX
+    ///       IsInterIntra = ( is_inter && RefFrame[ 1 ] == INTRA_FRAME )
+    ///       if ( IsInterIntra ) {
+    ///         // §5.11.33 interintra_mode → mode translation
+    ///         predict_intra( ... )
+    ///       }
+    ///       if ( is_inter ) {
+    ///         predW = Block_Width[ MiSize ] >> subX
+    ///         predH = Block_Height[ MiSize ] >> subY
+    ///         someUseIntra = 0
+    ///         for ( r = 0; r < (num4x4H << subY); r++ )
+    ///           for ( c = 0; c < (num4x4W << subX); c++ )
+    ///             if ( RefFrames[ candRow + r ][ candCol + c ][ 0 ]
+    ///                  == INTRA_FRAME ) someUseIntra = 1
+    ///         if ( someUseIntra ) {
+    ///           predW = num4x4W * 4 ; predH = num4x4H * 4
+    ///           candRow = MiRow ; candCol = MiCol
+    ///         }
+    ///         r = 0
+    ///         for ( y = 0; y < num4x4H * 4; y += predH ) {
+    ///           c = 0
+    ///           for ( x = 0; x < num4x4W * 4; x += predW ) {
+    ///             predict_inter( plane, baseX + x, baseY + y,
+    ///                            predW, predH, candRow + r, candCol + c )
+    ///             c++
+    ///           }
+    ///           r++
+    ///         }
+    ///       }
+    ///     }
+    ///   }
+    /// ```
+    ///
+    /// ## Implemented in this round
+    ///
+    /// * §5.11.33 prologue — `sbMask` derivation deferred to the
+    ///   caller (it is unused for the §5.11.33 task list itself;
+    ///   the `subBlockMiRow` / `subBlockMiCol` outputs feed the
+    ///   §5.11.33 inner `predict_intra` argument list).
+    /// * §5.11.33 outer `for plane = 0..1 + HasChroma * 2` loop —
+    ///   one [`PlanePredictionTask`] entry per visited plane on
+    ///   the intra path.
+    /// * §5.11.38 `get_plane_residual_size` — derived per-plane
+    ///   `planeSz`, then `num4x4W` / `num4x4H` / `log2W` / `log2H` /
+    ///   `subX` / `subY` / `baseX` / `baseY`.
+    /// * §5.11.33 `IsInterIntra` arm — gated; surfaces
+    ///   [`crate::Error::ComputePredictionInterIntraUnsupported`].
+    /// * §5.11.33 `is_inter` arm — gated; surfaces
+    ///   [`crate::Error::ComputePredictionInterUnsupported`] (the §7.9
+    ///   `predict_inter` body is the next-arc target).
+    /// * §5.11.33 `!is_inter` (intra) arm — emits one
+    ///   [`PlanePredictionTask`] per plane carrying the §5.11.33
+    ///   `predict_intra` arguments (`mode`, `baseX`, `baseY`,
+    ///   `log2W`, `log2H`, `haveAbove` / `haveLeft` from the
+    ///   §5.11.5 `AvailU` / `AvailL` / `AvailUChroma` / `AvailLChroma`
+    ///   flags). Plane 0 carries `y_mode`; planes 1/2 carry `uv_mode`.
+    /// * §5.11.33 reachable-mode gate — currently `DC_PRED` only
+    ///   (the §7.11.2.5 sample-generation leaf is
+    ///   [`crate::predict_intra_dc_pred`]). Non-`DC_PRED` modes
+    ///   surface [`crate::Error::ComputePredictionIntraModeUnsupported`].
+    ///
+    /// ## Argument contract
+    ///
+    /// * `mi_row` / `mi_col` / `mi_size` — the §5.11.5 prologue's
+    ///   `MiRow` / `MiCol` / `MiSize`.
+    /// * `has_chroma` — §5.11.5 prologue derivation.
+    /// * `avail_u` / `avail_l` — §5.11.5 prologue `AvailU` / `AvailL`.
+    /// * `avail_u_chroma` / `avail_l_chroma` — §5.11.5 prologue's
+    ///   chroma-edge-case-corrected `AvailUChroma` / `AvailLChroma`.
+    /// * `subsampling_x` / `subsampling_y` — §5.5.2 sequence-header
+    ///   chroma derivation.
+    /// * `is_inter` — §5.11.20 / §5.11.7 derived flag (per-block).
+    /// * `y_mode` — luma intra mode (one of `0..INTRA_MODES`); used
+    ///   for plane 0's task.
+    /// * `uv_mode` — chroma intra mode (one of `0..INTRA_MODES + 1`,
+    ///   the `+1` covering `UV_CFL_PRED`); used for planes 1 and 2.
+    /// * `ref_frame_1_is_intra` — caller-supplied flag for the
+    ///   §5.11.33 `IsInterIntra = is_inter && RefFrame[1] ==
+    ///   INTRA_FRAME` gate. `false` on the intra arm.
+    ///
+    /// ## Returns
+    ///
+    /// A [`ComputePredictionReadout`] with one task per visited plane
+    /// on the supported intra-DC_PRED path. Returns
+    /// [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+    /// arguments (`mi_size >= BLOCK_SIZES`, `mi_row >= mi_rows`,
+    /// `mi_col >= mi_cols`, `subsampling_{x,y} > 1`,
+    /// [`get_plane_residual_size`] returning `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_prediction(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        mi_size: usize,
+        has_chroma: bool,
+        avail_u: bool,
+        avail_l: bool,
+        avail_u_chroma: bool,
+        avail_l_chroma: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        is_inter: bool,
+        y_mode: u8,
+        uv_mode: u8,
+        ref_frame_1_is_intra: bool,
+    ) -> Result<ComputePredictionReadout, crate::Error> {
+        // ---------- caller-bug guards ----------
+        if mi_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if subsampling_x > 1 || subsampling_y > 1 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.33 `IsInterIntra = is_inter && RefFrame[ 1 ] ==
+        // INTRA_FRAME`. Today the §5.11.5 walker emits intra-only
+        // blocks (`is_inter == 0`), so this evaluates to `false`. The
+        // §5.11.28 `read_interintra_mode == 1` block class would
+        // produce `is_inter == 1 && RefFrame[1] == INTRA_FRAME` (the
+        // §5.11.28 inner arm imperatively sets `RefFrame[1] =
+        // INTRA_FRAME`); when that path is wired through `decode_block
+        // _syntax` the caller passes `ref_frame_1_is_intra = true` and
+        // the gate fires.
+        let is_inter_intra = is_inter && ref_frame_1_is_intra;
+        if is_inter_intra {
+            return Err(crate::Error::ComputePredictionInterIntraUnsupported);
+        }
+
+        // §5.11.33 outer loop bound: `1 + HasChroma * 2`. `HasChroma`
+        // is `1` (3 planes) or `0` (1 plane / luma-only). The
+        // [`Self::compute_prediction`] dispatcher visits each plane
+        // and emits one [`PlanePredictionTask`] per visit on the
+        // intra-DC arm.
+        let num_planes = 1u8 + if has_chroma { 2 } else { 0 };
+
+        let mut tasks: Vec<PlanePredictionTask> = Vec::with_capacity(num_planes as usize);
+
+        // §5.11.33 per-plane body.
+        for plane in 0..num_planes {
+            // §5.11.33 plane-loop scalars.
+            let (sub_x, sub_y) = if plane > 0 {
+                (subsampling_x, subsampling_y)
+            } else {
+                (0u8, 0u8)
+            };
+            let plane_sz = match get_plane_residual_size(mi_size, plane, sub_x, sub_y) {
+                Some(s) => s,
+                None => {
+                    // §6.4.1 conformance: `get_plane_residual_size(
+                    // MiSize, 1 ) != BLOCK_INVALID`. A `None` here is
+                    // a caller-bug — a non-conformant `(MiSize,
+                    // subsampling_x, subsampling_y)` triple.
+                    return Err(crate::Error::PartitionWalkOutOfRange);
+                }
+            };
+            // §5.11.33 lines 4-7: per-plane sizes from the §3 tables.
+            let log2_w = (MI_SIZE_LOG2 + MI_WIDTH_LOG2[plane_sz]) as u32;
+            let log2_h = (MI_SIZE_LOG2 + MI_HEIGHT_LOG2[plane_sz]) as u32;
+            // §5.11.33 lines 9-10: `baseX = (MiCol >> subX) * MI_SIZE`,
+            // `baseY = (MiRow >> subY) * MI_SIZE`.
+            let base_x = (mi_col >> sub_x) * (MI_SIZE as u32);
+            let base_y = (mi_row >> sub_y) * (MI_SIZE as u32);
+
+            // §5.11.33 per-plane `is_inter` branch.
+            if is_inter {
+                // §5.11.33 `predict_inter` body — §7.9 sub-pixel
+                // motion-compensated prediction. The dispatcher
+                // returns the §7.9 stub on the first task. (The
+                // dispatcher does NOT emit the per-(y, x)
+                // `predict_inter` tasks because the §7.9 body itself
+                // is the missing implementation — the task list would
+                // be a `predict_inter`-task stream against an
+                // unimplemented kernel.)
+                return Err(crate::Error::ComputePredictionInterUnsupported);
+            }
+
+            // §5.11.33 `!is_inter` (intra) arm. The §7.11.2.1 dispatch
+            // routes to one of §7.11.2.5 (DC_PRED) / §7.11.2.6
+            // (SMOOTH_*) / §7.11.2.4 (directional) / §7.11.2.2
+            // (PAETH_PRED) per `mode`. Today only §7.11.2.5
+            // (DC_PRED) lands as a standalone leaf
+            // ([`crate::predict_intra_dc_pred`]); the other §7.11.2.x
+            // bodies are next-arc.
+            let plane_mode = if plane == 0 { y_mode } else { uv_mode };
+
+            // §5.11.33 reachable-mode gate (intra-DC only today).
+            if plane_mode as usize >= INTRA_MODES && plane_mode != UV_CFL_PRED as u8 {
+                // Out-of-range mode (caller bug — the §5.11.7 /
+                // §5.11.22 readers cap at `INTRA_MODES`).
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            if plane_mode != 0
+            /* DC_PRED */
+            {
+                return Err(crate::Error::ComputePredictionIntraModeUnsupported);
+            }
+
+            let (have_above, have_left) = if plane == 0 {
+                (avail_u, avail_l)
+            } else {
+                (avail_u_chroma, avail_l_chroma)
+            };
+
+            tasks.push(PlanePredictionTask {
+                plane,
+                start_x: base_x,
+                start_y: base_y,
+                log2_w,
+                log2_h,
+                mode: plane_mode,
+                have_left,
+                have_above,
+            });
+        }
+
+        Ok(ComputePredictionReadout {
+            is_inter_intra,
+            is_inter,
+            num_planes_visited: num_planes,
+            tasks,
+        })
     }
 
     /// `decode_partition_syntax( r, c, bSize )` — §5.11.4 partition
@@ -23050,6 +23650,104 @@ pub struct CoefficientsReadout {
     pub dc_category: u8,
 }
 
+/// §5.11.33 `compute_prediction()` per-plane enumeration — one entry
+/// per `(plane, y, x)` prediction-region the §5.11.33 body visits
+/// inside its `for ( plane ) { ... }` outer loop (with the `is_inter`
+/// inner `for y for x` tiling expanded into discrete tasks).
+///
+/// On the §5.11.33 intra path (`is_inter == 0`) every plane produces
+/// a single task covering the full per-plane residual block
+/// (`baseX`, `baseY`, `log2W`, `log2H` from §5.11.33 prologue
+/// lines). On the inter path the §5.11.33 `predict_inter` body emits
+/// one task per `(y, x)` step of the `(predW, predH)` tiling.
+///
+/// `mode` carries the §5.11.33 `predict_intra` `mode` argument (intra
+/// path) or the §5.11.33 `predict_inter` placeholder
+/// [`COMPUTE_PRED_MODE_INTER`] sentinel (inter path — the
+/// `predict_inter` body needs MV / ref-frame state, not a mode).
+///
+/// `have_above_chroma` / `have_left_chroma` are the §5.11.33
+/// `AvailUChroma` / `AvailLChroma` flags routed through the
+/// §5.11.5 prologue for the chroma planes; for plane `0` they
+/// collapse to `AvailU` / `AvailL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanePredictionTask {
+    /// `plane` — `0` (luma), `1` (Cb), `2` (Cr).
+    pub plane: u8,
+    /// `baseX + x` per §5.11.33 `predict_intra` / `predict_inter`
+    /// arguments — the top-left luma-sample x offset of the
+    /// prediction region (post-subsampling for `plane > 0`).
+    pub start_x: u32,
+    /// `baseY + y` per §5.11.33 — the top-left y offset.
+    pub start_y: u32,
+    /// `log2W` for the §5.11.33 `predict_intra` call (intra path).
+    /// On the inter path this carries `log2(predW)` (derived from
+    /// `Block_Width[ MiSize ] >> subX` or `num4x4W * 4` per the
+    /// `someUseIntra` arm).
+    pub log2_w: u32,
+    /// `log2H` companion to [`Self::log2_w`].
+    pub log2_h: u32,
+    /// `mode` — for the intra path, the §5.11.33 `predict_intra`
+    /// mode argument (`DC_PRED` / `V_PRED` / `H_PRED` / etc., one of
+    /// the §6.10.x intra-mode ordinals `0..INTRA_MODES`). For the
+    /// inter path, [`COMPUTE_PRED_MODE_INTER`] (= 255).
+    pub mode: u8,
+    /// `haveLeft` argument routed into `predict_intra` (intra) or the
+    /// §5.11.33 `predict_inter` `candCol` neighbour gate. For
+    /// `plane == 0` this is `AvailL`; for `plane > 0` this is
+    /// `AvailLChroma`.
+    pub have_left: bool,
+    /// `haveAbove` companion to [`Self::have_left`].
+    pub have_above: bool,
+}
+
+/// §5.11.33 `compute_prediction()` post-walk outcome — the
+/// per-plane prediction-task list plus the §5.11.33 derived flags
+/// (`is_inter_intra`, `is_inter`, `num_planes_visited`).
+///
+/// The §5.11.33 body itself is a `for plane = 0..1 + HasChroma * 2`
+/// loop with two inner gates: `IsInterIntra` (one `predict_intra`
+/// per plane on `RefFrame[1] == INTRA_FRAME` blocks) and `is_inter`
+/// (one or more `predict_inter` calls per plane). On the reachable
+/// path (the §5.11.5 walker emits `is_inter == 0` blocks — the only
+/// arm where `YMode != DC_PRED` is still next-arc; today luma always
+/// uses the `intra_frame_y_mode` reader's default DC_PRED), the
+/// outer plane loop fires `predict_intra` once per plane.
+///
+/// `tasks` carries one [`PlanePredictionTask`] per `(plane, y, x)`
+/// task the §5.11.33 body emits. The length is bounded by `num_planes
+/// * (num4x4H * num4x4W)` (the inter path's worst-case), or by
+/// `num_planes` on the pure-intra path (one task per plane).
+///
+/// On the §5.11.33 reachable path with no chroma (e.g. monochrome
+/// streams or sub-8 luma edge cases), `tasks.len() == 1`. On the
+/// 3-plane intra path with `has_chroma == true`, `tasks.len() == 3`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputePredictionReadout {
+    /// §5.11.33 inner `IsInterIntra = is_inter && RefFrame[1] ==
+    /// INTRA_FRAME`. `false` for every intra-only block (the only
+    /// reachable path today).
+    pub is_inter_intra: bool,
+    /// §5.11.33 `is_inter` flag (routed through from the §5.11.5
+    /// walker's `is_inter` derivation).
+    pub is_inter: bool,
+    /// §5.11.33 outer loop bound `1 + HasChroma * 2` — the number of
+    /// planes the §5.11.33 body visited. `1` (luma only) when
+    /// `has_chroma == false`; `3` (luma + Cb + Cr) when
+    /// `has_chroma == true`.
+    pub num_planes_visited: u8,
+    /// Per-plane prediction tasks in §5.11.33 spec order (plane 0
+    /// first, then 1, then 2; within a plane: `y` outer, `x` inner
+    /// for the inter path). One entry on the intra path.
+    pub tasks: Vec<PlanePredictionTask>,
+}
+
+/// Sentinel mode value carried by [`PlanePredictionTask::mode`] on
+/// the §5.11.33 `is_inter == 1` arm (the §5.11.33 `predict_inter`
+/// body needs MV / ref-frame state, not a mode ordinal). Distinct
+/// from every §6.10.x `INTRA_MODES = 13` ordinal value.
+pub const COMPUTE_PRED_MODE_INTER: u8 = 255;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -23068,6 +23766,49 @@ mod tests {
             p[5] = 1 << WARPEDMODEL_PREC_BITS;
         }
         params
+    }
+
+    /// r180: `SUBSAMPLED_SIZE` table-shape sanity. Every plane-0
+    /// `(subx=0, suby=0)` cell is a pass-through (equals the
+    /// `subsize` index), and every cell is either a `BLOCK_*`
+    /// ordinal in `0..BLOCK_SIZES` or the `BLOCK_INVALID` sentinel.
+    #[test]
+    fn subsampled_size_shape_holds() {
+        assert_eq!(SUBSAMPLED_SIZE.len(), BLOCK_SIZES);
+        for (i, row) in SUBSAMPLED_SIZE.iter().enumerate() {
+            assert_eq!(row[0][0], i, "plane 0 (subx=0,suby=0) is pass-through");
+            for (sx, sx_row) in row.iter().enumerate() {
+                for (sy, &v) in sx_row.iter().enumerate() {
+                    assert!(
+                        v < BLOCK_SIZES || v == BLOCK_INVALID,
+                        "row {i} ({sx},{sy}) = {v} must be a BLOCK_* or BLOCK_INVALID",
+                    );
+                }
+            }
+        }
+    }
+
+    /// r180: §7.11.2.5 DC_PRED no-neighbour fallback writes
+    /// `1 << (BitDepth - 1)`.
+    #[test]
+    fn dc_pred_no_neighbour_fallback_bit_depths() {
+        let none: [u16; 0] = [];
+        let mut pred = [0u16; 16];
+        predict_intra_dc_pred(0, 0, 2, 2, 4, 4, 8, &none, &none, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 128));
+        predict_intra_dc_pred(0, 0, 2, 2, 4, 4, 10, &none, &none, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 512));
+        predict_intra_dc_pred(0, 0, 2, 2, 4, 4, 12, &none, &none, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 2048));
+    }
+
+    /// r180: `clip1_bit_depth` saturates to `(1 << BitDepth) - 1`.
+    #[test]
+    fn clip1_bit_depth_saturates() {
+        assert_eq!(clip1_bit_depth(10, 8), 10);
+        assert_eq!(clip1_bit_depth(300, 8), 255);
+        assert_eq!(clip1_bit_depth(2000, 10), 1023);
+        assert_eq!(clip1_bit_depth(8000, 12), 4095);
     }
 
     /// §8.3.1: a fresh context is a verbatim copy of the §9.4 defaults,

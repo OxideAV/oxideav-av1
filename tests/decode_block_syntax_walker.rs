@@ -18,9 +18,15 @@
 //!    when `TxMode == TX_MODE_SELECT`. The resulting `TxSize` is
 //!    stamped into `TxSizes[]` / `InterTxSizes[]` across the block
 //!    footprint.
-//! 5. §5.11.30 `compute_prediction()` — STUBBED. The walker
-//!    short-circuits with
-//!    [`oxideav_av1::Error::DecodeBlockComputePredictionUnsupported`].
+//! 5. §5.11.30 / §5.11.33 `compute_prediction()` — LANDED in r180.
+//!    The walker runs the §5.11.33 per-plane dispatcher (one
+//!    DC_PRED [`oxideav_av1::PlanePredictionTask`] per visited plane)
+//!    and advances past §5.11.30; the §7.11.2.5 DC-PRED sample-
+//!    generation leaf is exposed standalone as
+//!    [`oxideav_av1::predict_intra_dc_pred`].
+//! 6. §5.11.34 `residual()` — STUBBED. The walker now short-circuits
+//!    here with
+//!    [`oxideav_av1::Error::DecodeBlockResidualUnsupported`].
 //!
 //! These tests drive the walker with synthesised in-memory state
 //! (no real bitstream decode required) on a minimal mi grid and
@@ -106,7 +112,10 @@ fn walker_n(n: u32) -> PartitionWalker {
 ///   3. No-op `palette_tokens()`.
 ///   4. Run `read_block_tx_size` (no S() since TX_MODE_SELECT is off),
 ///      stamping `TxSizes[]` / `InterTxSizes[]` with TX_8X8.
-///   5. Short-circuit at §5.11.30 `compute_prediction()`.
+///   5. Run §5.11.33 `compute_prediction()` (intra-DC dispatcher;
+///      emits one [`oxideav_av1::PlanePredictionTask`] per visited
+///      plane). Post-r180 advances past §5.11.30.
+///   6. Short-circuit at §5.11.34 `residual()`.
 #[test]
 fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
     let mut walker = walker_n(16);
@@ -134,12 +143,12 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
     );
     let pos_after = dec.position();
 
-    // §5.11.30 stub fired — the walker reached but did not enter
-    // `compute_prediction()`.
+    // §5.11.34 stub fired — the walker now advances past §5.11.30
+    // `compute_prediction()` via the r180 §5.11.33 dispatcher.
     assert_eq!(
         result,
-        Err(Error::DecodeBlockComputePredictionUnsupported),
-        "the §5.11.5 walker must short-circuit at §5.11.30 compute_prediction after the intra mode-info + read_block_tx_size pass"
+        Err(Error::DecodeBlockResidualUnsupported),
+        "post-r180 the §5.11.5 walker must short-circuit at §5.11.34 residual() after the intra mode-info + read_block_tx_size + §5.11.33 compute_prediction pass"
     );
 
     // The §5.11.5 prologue + §5.11.7 prefix consumed at least the
@@ -225,7 +234,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             /* subsampling_y = */ 1, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
         );
-        assert_eq!(result, Err(Error::DecodeBlockComputePredictionUnsupported));
+        assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
     }
 
     // Arm 2: bw4 == 1 && subsampling_x && MiCol & 1 == 0 ⇒ HasChroma = false.
@@ -240,7 +249,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             /* subsampling_y = */ 0, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
         );
-        assert_eq!(result, Err(Error::DecodeBlockComputePredictionUnsupported));
+        assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
     }
 
     // Arm 3 fall-through: no sub-sampling ⇒ HasChroma = num_planes > 1.
@@ -255,7 +264,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, true,
             0, false,
         );
-        assert_eq!(result, Err(Error::DecodeBlockComputePredictionUnsupported));
+        assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
     }
 }
 
@@ -317,7 +326,7 @@ fn decode_block_syntax_intra_pre_skip_arm_reaches_stub() {
         &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
     );
 
-    assert_eq!(result, Err(Error::DecodeBlockComputePredictionUnsupported));
+    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
     // The §5.11.5 mode-info pass succeeded — the per-block stamp
     // landed on the BLOCK_8X8 (2×2) footprint.
     let mi_cols = walker.mi_cols() as usize;
@@ -389,7 +398,7 @@ fn decode_partition_syntax_routes_leaf_through_decode_block_syntax() {
 
     assert_eq!(
         result,
-        Err(Error::DecodeBlockComputePredictionUnsupported),
+        Err(Error::DecodeBlockResidualUnsupported),
         "the partition driver must propagate the §5.11.30 stub from its leaf call"
     );
 
@@ -486,7 +495,7 @@ fn decode_block_syntax_block_8x16_grid_fill_footprint() {
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X16, true, 0, 0, 3, false, false, false, 0, &lossless,
         false, true, false, 0, false, false, 0, false, false, false, 0, false,
     );
-    assert_eq!(result, Err(Error::DecodeBlockComputePredictionUnsupported));
+    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
 
     // BLOCK_8X16: bw4 = 2, bh4 = 4 ⇒ the §5.11.5 grid-fill stamps a
     // 2×4 footprint (2 cols × 4 rows) at (0, 0).
@@ -550,7 +559,7 @@ fn decode_block_syntax_cdef_bits_two_reaches_stub() {
         /* tx_mode_select = */ false,
     );
     let pos_after = dec.position();
-    assert_eq!(result, Err(Error::DecodeBlockComputePredictionUnsupported));
+    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
     assert!(
         pos_after > pos_before,
         "literal cdef-bits read must advance the bit cursor"
@@ -978,7 +987,7 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
         0,
         /* tx_mode_select = */ true,
     );
-    assert_eq!(result, Err(Error::DecodeBlockComputePredictionUnsupported));
+    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
 
     let mi_cols = walker.mi_cols() as usize;
     for r in 0..4 {
@@ -1811,4 +1820,312 @@ fn decoded_inter_frame_mode_info_struct_public_api_smoke() {
     let copy = info;
     assert_eq!(info, copy);
     let _ = format!("{info:?}");
+}
+
+// ----------------------------------------------------------------
+// Round 180 — §5.11.33 `compute_prediction()` dispatcher tests +
+// §7.11.2.5 DC_PRED standalone leaf tests.
+// ----------------------------------------------------------------
+
+use oxideav_av1::{
+    get_plane_residual_size, predict_intra_dc_pred, ComputePredictionReadout, PlanePredictionTask,
+    BLOCK_16X8, BLOCK_4X8,
+};
+
+/// §5.11.38 `get_plane_residual_size` table sanity — plane 0 is a
+/// pass-through (luma never sub-samples), and a few §3 spot-checks for
+/// the (subsampling=1,1) chroma down-shift on common sub-blocks.
+#[test]
+fn get_plane_residual_size_table_spot_checks() {
+    // Plane 0 (luma) is a pass-through for every subsampling.
+    for bs in 0..22 {
+        for sx in 0..=1 {
+            for sy in 0..=1 {
+                assert_eq!(
+                    get_plane_residual_size(bs, 0, sx, sy),
+                    Some(bs),
+                    "plane 0 must pass through bs={bs}",
+                );
+            }
+        }
+    }
+    // BLOCK_8X8 with full 420 subsampling → BLOCK_4X4 chroma residual.
+    assert_eq!(get_plane_residual_size(BLOCK_8X8, 1, 1, 1), Some(BLOCK_4X4));
+    // BLOCK_16X16 with 420 → BLOCK_8X8 chroma residual.
+    assert_eq!(
+        get_plane_residual_size(BLOCK_16X16, 1, 1, 1),
+        Some(BLOCK_8X8)
+    );
+    // BLOCK_8X16 with 422 (subx=1, suby=0) → §3 forbids the chroma
+    // residual (returns None / BLOCK_INVALID).
+    assert_eq!(get_plane_residual_size(BLOCK_8X16, 1, 1, 0), None);
+    // BLOCK_8X16 with 420 (1,1) → BLOCK_4X8 chroma residual.
+    assert_eq!(
+        get_plane_residual_size(BLOCK_8X16, 1, 1, 1),
+        Some(BLOCK_4X8)
+    );
+    // BLOCK_16X8 with 422 (subx=1, suby=0) → BLOCK_8X8 chroma.
+    assert_eq!(
+        get_plane_residual_size(BLOCK_16X8, 1, 1, 0),
+        Some(BLOCK_8X8)
+    );
+}
+
+/// Out-of-range guards on `get_plane_residual_size`.
+#[test]
+fn get_plane_residual_size_guards() {
+    assert_eq!(get_plane_residual_size(22, 0, 0, 0), None);
+    assert_eq!(get_plane_residual_size(100, 1, 1, 1), None);
+}
+
+/// §5.11.33 `compute_prediction` on the §5.11.5-reachable intra path:
+/// `is_inter == 0`, `y_mode == DC_PRED`, `has_chroma == true`. Emits
+/// one DC_PRED task per plane (plane 0/1/2) on a `BLOCK_8X8` block
+/// with 420 subsampling (chroma plane residual is `BLOCK_4X4`).
+#[test]
+fn compute_prediction_intra_dc_pred_3_plane_path() {
+    let mut walker = walker_n(16);
+    let result = walker.compute_prediction(
+        /* mi_row = */ 0, /* mi_col = */ 0, /* mi_size = */ BLOCK_8X8,
+        /* has_chroma = */ true, /* avail_u = */ false, /* avail_l = */ false,
+        /* avail_u_chroma = */ false, /* avail_l_chroma = */ false,
+        /* subsampling_x = */ 1, /* subsampling_y = */ 1, /* is_inter = */ false,
+        /* y_mode = */ 0, // DC_PRED
+        /* uv_mode = */ 0, // DC_PRED
+        /* ref_frame_1_is_intra = */ false,
+    );
+    let r = result.expect("3-plane intra DC dispatch must succeed");
+    assert!(!r.is_inter);
+    assert!(!r.is_inter_intra);
+    assert_eq!(r.num_planes_visited, 3);
+    assert_eq!(r.tasks.len(), 3);
+
+    // Plane 0 (luma) — BLOCK_8X8, log2W=3, log2H=3, baseX=baseY=0.
+    let t0 = &r.tasks[0];
+    assert_eq!(t0.plane, 0);
+    assert_eq!(t0.start_x, 0);
+    assert_eq!(t0.start_y, 0);
+    assert_eq!(t0.log2_w, 3);
+    assert_eq!(t0.log2_h, 3);
+    assert_eq!(t0.mode, 0);
+    assert!(!t0.have_above);
+    assert!(!t0.have_left);
+
+    // Plane 1 (Cb) — chroma residual is BLOCK_4X4, log2W=log2H=2.
+    let t1 = &r.tasks[1];
+    assert_eq!(t1.plane, 1);
+    assert_eq!(t1.log2_w, 2);
+    assert_eq!(t1.log2_h, 2);
+    // baseX = (0 >> 1) * 4 = 0; baseY same.
+    assert_eq!(t1.start_x, 0);
+    assert_eq!(t1.start_y, 0);
+
+    // Plane 2 (Cr) — mirror of plane 1's per-plane derivation.
+    let t2 = &r.tasks[2];
+    assert_eq!(t2.plane, 2);
+    assert_eq!(t2.log2_w, 2);
+    assert_eq!(t2.log2_h, 2);
+}
+
+/// §5.11.33 luma-only path: `has_chroma == false` → only plane 0
+/// visited.
+#[test]
+fn compute_prediction_luma_only_one_task() {
+    let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, 0, 0, false,
+        )
+        .unwrap();
+    assert_eq!(r.num_planes_visited, 1);
+    assert_eq!(r.tasks.len(), 1);
+    assert_eq!(r.tasks[0].plane, 0);
+    assert!(r.tasks[0].have_above);
+    assert!(r.tasks[0].have_left);
+}
+
+/// §5.11.33 `is_inter == true` arm currently surfaces the next-arc
+/// stub.
+#[test]
+fn compute_prediction_inter_arm_surfaces_stub() {
+    let mut walker = walker_n(16);
+    let result = walker.compute_prediction(
+        0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ true, 0, 0,
+        false,
+    );
+    assert_eq!(result, Err(Error::ComputePredictionInterUnsupported));
+}
+
+/// §5.11.33 inter-intra arm currently surfaces the next-arc stub.
+#[test]
+fn compute_prediction_inter_intra_arm_surfaces_stub() {
+    let mut walker = walker_n(16);
+    let result = walker.compute_prediction(
+        0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ true, 0, 0,
+        /* ref_frame_1_is_intra = */ true,
+    );
+    assert_eq!(result, Err(Error::ComputePredictionInterIntraUnsupported));
+}
+
+/// §5.11.33 non-DC_PRED intra mode (e.g. V_PRED = 1) currently
+/// surfaces the next-arc stub.
+#[test]
+fn compute_prediction_non_dc_pred_surfaces_stub() {
+    let mut walker = walker_n(16);
+    let result = walker.compute_prediction(
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 1, 0,
+        false,
+    );
+    assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
+}
+
+/// §5.11.33 caller-bug guards.
+#[test]
+fn compute_prediction_caller_bug_guards() {
+    let mut walker = walker_n(16);
+    // mi_row out of range.
+    assert_eq!(
+        walker.compute_prediction(
+            999, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, false, 0, 0, false,
+        ),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+    // mi_col out of range.
+    assert_eq!(
+        walker.compute_prediction(
+            0, 999, BLOCK_8X8, false, false, false, false, false, 0, 0, false, 0, 0, false,
+        ),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+    // mi_size out of range.
+    assert_eq!(
+        walker.compute_prediction(
+            0, 0, 99, false, false, false, false, false, 0, 0, false, 0, 0, false,
+        ),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+    // subsampling out of range.
+    assert_eq!(
+        walker.compute_prediction(
+            0, 0, BLOCK_8X8, false, false, false, false, false, 2, 0, false, 0, 0, false,
+        ),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+}
+
+/// §7.11.2.5 DC_PRED leaf — `(haveLeft, haveAbove) = (0, 0)` four-arm
+/// fallback writes `1 << (BitDepth - 1)` (= 128 for 8-bit) into every
+/// cell of an 8×8 prediction region.
+#[test]
+fn predict_intra_dc_pred_no_neighbours_fills_mid_grey() {
+    let mut pred = [0u16; 8 * 8];
+    let above = [0u16; 0];
+    let left = [0u16; 0];
+    predict_intra_dc_pred(0, 0, 3, 3, 8, 8, 8, &above, &left, &mut pred).unwrap();
+    for cell in &pred {
+        assert_eq!(*cell, 128);
+    }
+}
+
+/// §7.11.2.5 DC_PRED — 10-bit fallback writes `512` (= `1 << 9`).
+#[test]
+fn predict_intra_dc_pred_no_neighbours_10bit() {
+    let mut pred = [0u16; 4 * 4];
+    let none: [u16; 0] = [];
+    predict_intra_dc_pred(0, 0, 2, 2, 4, 4, 10, &none, &none, &mut pred).unwrap();
+    assert!(pred.iter().all(|&v| v == 512));
+}
+
+/// §7.11.2.5 DC_PRED — `(haveLeft=1, haveAbove=0)` left-only average
+/// with `Clip1`.
+#[test]
+fn predict_intra_dc_pred_left_only_average() {
+    let mut pred = [0u16; 4 * 4];
+    // 4 left samples summing to 100: 25 each. (h>>1)=2. (100+2)>>2=25.
+    let left = [25u16, 25, 25, 25];
+    let above: [u16; 0] = [];
+    predict_intra_dc_pred(1, 0, 2, 2, 4, 4, 8, &above, &left, &mut pred).unwrap();
+    assert!(pred.iter().all(|&v| v == 25));
+}
+
+/// §7.11.2.5 DC_PRED — `(haveLeft=0, haveAbove=1)` above-only average.
+#[test]
+fn predict_intra_dc_pred_above_only_average() {
+    let mut pred = [0u16; 4 * 4];
+    let above = [40u16, 40, 40, 40];
+    let left: [u16; 0] = [];
+    predict_intra_dc_pred(0, 1, 2, 2, 4, 4, 8, &above, &left, &mut pred).unwrap();
+    assert!(pred.iter().all(|&v| v == 40));
+}
+
+/// §7.11.2.5 DC_PRED — union arm averages left + above. Both filled
+/// with 50 → output is 50. `(w+h)/2 = 4` rounding term added before
+/// integer division by `w + h = 8`: (50*4 + 50*4 + 4)/8 = (400 + 4)/8
+/// = 404/8 = 50 (truncating division).
+#[test]
+fn predict_intra_dc_pred_union_average() {
+    let mut pred = [0u16; 4 * 4];
+    let above = [50u16, 50, 50, 50];
+    let left = [50u16, 50, 50, 50];
+    predict_intra_dc_pred(1, 1, 2, 2, 4, 4, 8, &above, &left, &mut pred).unwrap();
+    assert!(pred.iter().all(|&v| v == 50));
+}
+
+/// §7.11.2.5 DC_PRED — caller-bug guards.
+#[test]
+fn predict_intra_dc_pred_caller_bug_guards() {
+    let mut pred = [0u16; 16];
+    let row: [u16; 8] = [0; 8];
+    // Bad bit_depth.
+    assert_eq!(
+        predict_intra_dc_pred(0, 0, 2, 2, 4, 4, 9, &row, &row, &mut pred),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+    // Mismatched log2/dim.
+    assert_eq!(
+        predict_intra_dc_pred(0, 0, 2, 2, 5, 4, 8, &row, &row, &mut pred),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+    // Output buffer too short.
+    let mut short = [0u16; 8];
+    assert_eq!(
+        predict_intra_dc_pred(0, 0, 2, 2, 4, 4, 8, &row, &row, &mut short),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+    // above_row too short when have_above=1.
+    let too_short = [0u16; 2];
+    assert_eq!(
+        predict_intra_dc_pred(0, 1, 2, 2, 4, 4, 8, &too_short, &row, &mut pred),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+    // log2 out of range.
+    assert_eq!(
+        predict_intra_dc_pred(0, 0, 7, 2, 128, 4, 8, &row, &row, &mut pred),
+        Err(Error::PartitionWalkOutOfRange)
+    );
+}
+
+/// `PlanePredictionTask` / `ComputePredictionReadout` `Clone` +
+/// `Debug` smoke — keeps the public API constructable.
+#[test]
+fn compute_prediction_readout_clone_debug_smoke() {
+    let task = PlanePredictionTask {
+        plane: 0,
+        start_x: 0,
+        start_y: 0,
+        log2_w: 3,
+        log2_h: 3,
+        mode: 0,
+        have_left: false,
+        have_above: false,
+    };
+    let readout = ComputePredictionReadout {
+        is_inter_intra: false,
+        is_inter: false,
+        num_planes_visited: 1,
+        tasks: vec![task],
+    };
+    let cloned = readout.clone();
+    assert_eq!(readout, cloned);
+    let _ = format!("{readout:?}");
 }

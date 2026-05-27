@@ -6,6 +6,57 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 180 — §5.11.30 / §5.11.33 `compute_prediction()` dispatcher
+  + §7.11.2.5 DC intra prediction leaf.** Lifts the §5.11.5 walker's
+  long-standing `DecodeBlockComputePredictionUnsupported` stub by
+  landing the §5.11.33 per-plane prediction-task dispatcher. Exposed
+  as `PartitionWalker::compute_prediction(mi_row, mi_col, mi_size,
+  has_chroma, avail_u, avail_l, avail_u_chroma, avail_l_chroma,
+  subsampling_x, subsampling_y, is_inter, y_mode, uv_mode,
+  ref_frame_1_is_intra)` returning a new `ComputePredictionReadout {
+  is_inter_intra, is_inter, num_planes_visited, tasks }` aggregate;
+  per-plane tasks are surfaced through `Vec<PlanePredictionTask {
+  plane, start_x, start_y, log2_w, log2_h, mode, have_left,
+  have_above }>` in §5.11.33 spec order. Wired into
+  `decode_block_syntax`, so the §5.11.5 walker now advances past
+  §5.11.30 and reaches `Error::DecodeBlockResidualUnsupported`
+  (§5.11.34 outer dispatch around r179's §5.11.39 inner body).
+
+  Standalone leaf landed alongside: `predict_intra_dc_pred(have_left,
+  have_above, log2_w, log2_h, w, h, bit_depth, above_row, left_col,
+  pred)` per §7.11.2.5 (av1-spec p.248-249) — the four-arm dispatch
+  on `(haveLeft, haveAbove)` for DC intra prediction with `Clip1`
+  bit-depth saturation and the `1 << (BitDepth - 1)` mid-grey
+  fallback. Operates on caller-supplied `u16` neighbour slices and
+  flat row-major output buffer.
+
+  Supporting infra: `SUBSAMPLED_SIZE[ BLOCK_SIZES ][ 2 ][ 2 ]`
+  (av1-spec p.88 `Subsampled_Size` table) + `get_plane_residual_size(
+  subsize, plane, subsampling_x, subsampling_y) -> Option<usize>`
+  (§5.11.38). New error variants:
+  `ComputePredictionInterUnsupported` (§7.9 motion-compensated inter
+  prediction next-arc); `ComputePredictionInterIntraUnsupported`
+  (§7.11.5 inter+intra blend); `ComputePredictionIntraModeUnsupported`
+  (§7.11.2.2 / .3 / .4 / .6 / .7+ non-DC intra modes).
+
+  `DecodeBlockComputePredictionUnsupported` is retained as a
+  defensive caller-bug fallback (the dispatcher path no longer
+  constructs it on the conformant `is_inter == 0`, `y_mode ==
+  DC_PRED` arm). 18 new tests (737 → 755): 7 on
+  `compute_prediction`, 6 on `predict_intra_dc_pred`, 3 on
+  table / helper sanity (`SUBSAMPLED_SIZE` shape, plane-0
+  pass-through, `Clip1`-bit-depth saturation at 8 / 10 / 12 bit),
+  2 on `get_plane_residual_size` (spot-checks + out-of-range
+  guards). Existing `decode_block_syntax` integration tests
+  updated to expect `Error::DecodeBlockResidualUnsupported`.
+  `decode_av1` / `encode_av1` still return `Error::NotImplemented`.
+
+  **Split off explicitly for the next arc**: §7.9 `predict_inter`
+  body; remaining 12 §7.11.2.x intra modes; §7.11.5 inter+intra
+  blend; §5.11.34 outer dispatch (`widthChunks` / `heightChunks` /
+  `transform_tree` / `transform_block` recursion against a real
+  per-plane `CurrFrame` sample buffer).
+
 * **Round 179 — §5.11.39 `coeffs( )` per-TU coefficient reader.** Lands
   the first body of the §5.11.34 `residual()` cascade — the gate to
   the entire transform-coefficient pipeline. Exposed as

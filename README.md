@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 179)
+## Status — 2026-05-28 (round 180)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,84 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 180 lifts **§5.11.30 / §5.11.33 `compute_prediction()`** — the
+other major §5.11.5 walker stub (alongside r179's §5.11.39 inside
+§5.11.34 `residual()`). The §5.11.33 per-plane prediction-task
+dispatcher now runs to completion, threading through `for plane = 0..1
++ HasChroma * 2` with the spec's §5.11.38 `get_plane_residual_size` +
+§5.11.33 `IsInterIntra` / `is_inter` / `someUseIntra` gates honoured
+verbatim. Exposed as `PartitionWalker::compute_prediction(...)` and
+surfaced through a new `ComputePredictionReadout { is_inter_intra,
+is_inter, num_planes_visited, tasks }` aggregate carrying one
+`PlanePredictionTask { plane, start_x, start_y, log2_w, log2_h, mode,
+have_left, have_above }` per visited plane. Wired into
+`decode_block_syntax`, lifting `Error::DecodeBlockComputePredictionUnsupported`
+past the §5.11.30 site; the walker now reaches
+`Error::DecodeBlockResidualUnsupported` (§5.11.34, the outer dispatch
+around r179's already-landed §5.11.39 inner body).
+
+Standalone leaf landed alongside: `predict_intra_dc_pred(have_left,
+have_above, log2_w, log2_h, w, h, bit_depth, above_row, left_col,
+pred)` per **§7.11.2.5 DC intra prediction process** (av1-spec
+p.248-249). The §7.11.2.5 four-arm dispatch on `(haveLeft, haveAbove)`
+is transcribed verbatim: union average with `(w+h)/2` rounding term
+(arm 1); left-only `Clip1((sum + h/2) >> log2H)` (arm 2); above-only
+`Clip1((sum + w/2) >> log2W)` (arm 3); `1 << (BitDepth - 1)` mid-grey
+fallback (arm 4). Operates on caller-supplied `u16` neighbour slices +
+flat row-major output buffer — no `CurrFrame` allocation by the
+walker (the §5.11.5 syntax walker doesn't yet track sample buffers).
+This is the first §7.11.2.x sample-generation leaf to land; the
+remaining 12 intra modes (V_PRED / H_PRED / SMOOTH variants /
+PAETH_PRED / D45..D203_PRED directional, plus CFL chroma) are
+next-arc targets.
+
+Supporting infra: `SUBSAMPLED_SIZE[ BLOCK_SIZES ][ 2 ][ 2 ]`
+transcribed from av1-spec p.88 (`Subsampled_Size` table — the
+§5.11.38 per-plane chroma-down-shift lookup, with the spec's
+`BLOCK_INVALID` sentinel for `(MiSize, subsampling_{x,y})` combos
+the §6.4.1 conformance gates forbid). `get_plane_residual_size(
+subsize, plane, subsampling_x, subsampling_y) -> Option<usize>`
+returns `Some(BLOCK_*)` for valid configurations, `None` for the
+§3-enumeration sentinel. Three new `Error` variants
+(`ComputePredictionInterUnsupported` / `ComputePredictionInterIntraUnsupported`
+/ `ComputePredictionIntraModeUnsupported`) surface the §5.11.33
+inner-arm next-arc boundaries one-to-one — the §7.9 inter sample
+generation (sub-pel interpolation + reference frame sampling), the
+§7.11.5 interintra blend, and the §7.11.2.2 / .3 / .4 / .6 / .7+
+non-DC intra modes respectively. Each is reachable only when a
+caller drives `compute_prediction` directly with the matching
+input; the §5.11.5-walker path always lands on the
+`is_inter == 0`, `y_mode == DC_PRED`, no-interintra arm and
+succeeds.
+
+18 new tests (737 → 755): seven on `compute_prediction` (3-plane
+intra DC, luma-only one-task, `is_inter` stub, inter-intra stub,
+non-DC_PRED stub, four caller-bug guards, readout Clone/Debug
+smoke); eight on `predict_intra_dc_pred` (4-bit / 10-bit / 12-bit
+no-neighbour fallback, left-only average, above-only average,
+union average, six caller-bug guards combined into one test);
+three table / helper sanity tests (`SUBSAMPLED_SIZE` shape
+invariant, plane-0 pass-through across all 22 sizes,
+`Clip1`-bit-depth saturation at 8 / 10 / 12 bit). The
+`decode_block_syntax` integration tests are updated to expect
+`Error::DecodeBlockResidualUnsupported` (the walker now advances
+past §5.11.30). `decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
+
+**Split off explicitly for the next arc:** (a) the §7.9
+`predict_inter` body (motion compensation, sub-pixel interpolation,
+reference-frame sampling, warping); (b) the remaining 12 §7.11.2.x
+intra sample-generation modes (V_PRED, H_PRED, SMOOTH_PRED /
+SMOOTH_V_PRED / SMOOTH_H_PRED, PAETH_PRED, the eight directional
+D45..D203_PRED modes); (c) the §7.11.5 inter+intra blend; (d) the
+§5.11.34 outer dispatch (the `widthChunks` / `heightChunks` /
+`transform_tree` / `transform_block` recursion that drives the
+already-landed r179 §5.11.39 inner coefficient reader and r180's
+§7.11.2.5 leaf against a real `CurrFrame` buffer). The walker
+needs a per-plane sample buffer to feed `predict_intra` /
+`predict_inter` / `reconstruct` with actual `CurrFrame[plane][y][x]`
+data — landing one is the natural next arc.
 
 Round 179 lands the **§5.11.39 `coeffs( plane, startX, startY, txSz )`
 per-TU coefficient reader** — the first body of the §5.11.34

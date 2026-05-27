@@ -1625,6 +1625,16 @@ pub use cdf::{
 // r179: §5.11.39 `coeffs` per-TU readout aggregate ([`cdf::CoefficientsReadout`])
 // surfaced through [`cdf::PartitionWalker::coefficients`].
 pub use cdf::CoefficientsReadout;
+// r180: §5.11.33 `compute_prediction()` per-plane dispatcher readout
+// ([`cdf::ComputePredictionReadout`] + [`cdf::PlanePredictionTask`])
+// surfaced through [`cdf::PartitionWalker::compute_prediction`], plus
+// the §7.11.2.5 DC-PRED sample-generation leaf
+// ([`cdf::predict_intra_dc_pred`]) and the §5.11.38
+// `get_plane_residual_size` / `SUBSAMPLED_SIZE` helpers.
+pub use cdf::{
+    get_plane_residual_size, predict_intra_dc_pred, ComputePredictionReadout, PlanePredictionTask,
+    COMPUTE_PRED_MODE_INTER, SUBSAMPLED_SIZE,
+};
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
     InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,
@@ -1778,15 +1788,66 @@ pub enum Error {
     /// `tx_mode_select = true`.
     ReadVarTxSizeUnsupported,
     /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
-    /// walker reached the §5.11.30 `compute_prediction()` call — the
-    /// per-block intra / inter prediction sample-generation pass.
-    /// `compute_prediction()` and its §7.11 sub-routines are the next
-    /// round's target and currently STUBBED. Currently unreachable
-    /// from `decode_block_syntax` because the walker short-circuits
-    /// at [`Error::DecodeBlockReadBlockTxSizeUnsupported`] first; reserved
-    /// for the round that lands `read_block_tx_size()` and exposes
-    /// this stub.
+    /// walker reached the §5.11.30 / §5.11.33 `compute_prediction()`
+    /// call — the per-block intra / inter prediction sample-
+    /// generation pass.
+    ///
+    /// **r180 LIFTED**: the §5.11.33 `compute_prediction()` dispatcher
+    /// (the per-plane `for plane = 0..1 + HasChroma * 2` block walk
+    /// with `is_inter` / `IsInterIntra` gating and §5.11.33 task
+    /// enumeration) now runs to completion via
+    /// [`crate::PartitionWalker::compute_prediction`] and surfaces the
+    /// per-plane task list through
+    /// [`crate::ComputePredictionReadout`]. The §7.11.2.5 DC-PRED
+    /// intra-sample-generation leaf
+    /// ([`crate::predict_intra_dc_pred`]) also lands standalone for
+    /// caller use against a real `CurrFrame` buffer. The walker now
+    /// reaches [`Self::DecodeBlockResidualUnsupported`] (§5.11.34)
+    /// after `compute_prediction()`.
+    ///
+    /// This variant is retained as a defensive caller-bug fallback —
+    /// the dispatcher constructs it only when
+    /// [`crate::PartitionWalker::compute_prediction`] reports an
+    /// inter / inter-intra / non-DC intra mode (none reachable on the
+    /// current intra-only walker path), at which point it surfaces
+    /// [`Self::ComputePredictionInterUnsupported`] /
+    /// [`Self::ComputePredictionInterIntraUnsupported`] /
+    /// [`Self::ComputePredictionIntraModeUnsupported`] instead.
     DecodeBlockComputePredictionUnsupported,
+    /// The §5.11.33 [`crate::PartitionWalker::compute_prediction`]
+    /// dispatcher visited a plane whose task body would invoke
+    /// §5.11.33 `predict_inter` (the §7.9 motion-compensated inter
+    /// prediction sample generation). The §7.9 body — sub-pixel
+    /// interpolation, reference-frame sampling, warping — is a
+    /// next-arc target. The §5.11.33 dispatcher itself runs to
+    /// completion and surfaces the per-plane prediction tasks in
+    /// [`crate::ComputePredictionReadout::tasks`]; only the per-task
+    /// `predict_inter` body remains stubbed.
+    ComputePredictionInterUnsupported,
+    /// The §5.11.33 dispatcher visited a plane whose `IsInterIntra ==
+    /// 1` arm fires (`is_inter && RefFrame[1] == INTRA_FRAME` —
+    /// the inter+intra blend). The §5.11.33 inner `predict_intra`
+    /// arm here calls §7.11.2.x sample-generation against the
+    /// `CurrFrame` neighbour samples, then the outer `is_inter`
+    /// `predict_inter` body blends the inter prediction in via
+    /// §7.11.5 — both bodies are next-arc targets. Reachable only on
+    /// the §5.11.28 `interintra == 1` block class (the §5.11.5
+    /// walker doesn't yet emit those — they need the §5.11.18 inter
+    /// dispatcher to be wired through `decode_block_syntax`, which
+    /// itself remains stubbed at [`Self::DecodeBlockInterFrameUnsupported`]).
+    ComputePredictionInterIntraUnsupported,
+    /// The §5.11.33 dispatcher visited an intra-mode plane whose
+    /// `mode` (the §5.11.33 `predict_intra` `mode` argument) is not
+    /// in the §7.11.2 set the walker currently supports. As of r180
+    /// the standalone [`crate::predict_intra_dc_pred`] (§7.11.2.5
+    /// DC-PRED) lands; the remaining 12 intra modes (V_PRED /
+    /// H_PRED / SMOOTH_PRED variants / PAETH_PRED / D45..D203_PRED
+    /// directional) are next-arc targets. Reachable only when the
+    /// caller drives the dispatcher with a non-`DC_PRED` block; the
+    /// §5.11.5 walker's current intra-arm path always emits
+    /// `YMode == DC_PRED` (the `intra_frame_y_mode` reader's
+    /// reachable cell), so the §5.11.5-driven path never fires this.
+    ComputePredictionIntraModeUnsupported,
     /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
     /// walker reached the §5.11.34 `residual()` call — the per-block
     /// transform-coefficient read + inverse-transform + reconstruction
@@ -2012,7 +2073,19 @@ impl core::fmt::Display for Error {
             ),
             Self::DecodeBlockComputePredictionUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.5 decode_block reached §5.11.30 compute_prediction() — intra / inter prediction sample generation pending next round"
+                "oxideav-av1: §5.11.5 decode_block reached §5.11.30 compute_prediction() — defensive fallback retained post-r180 (the §5.11.33 dispatcher is now wired into the walker; see ComputePredictionIntraModeUnsupported / ComputePredictionInterUnsupported / ComputePredictionInterIntraUnsupported for the live gaps)"
+            ),
+            Self::ComputePredictionInterUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.33 compute_prediction reached §5.11.33 predict_inter — §7.9 motion-compensated inter prediction pending next-arc"
+            ),
+            Self::ComputePredictionInterIntraUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.33 compute_prediction reached IsInterIntra arm — §7.11.5 inter+intra blend pending next-arc"
+            ),
+            Self::ComputePredictionIntraModeUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.33 compute_prediction visited a non-DC_PRED intra mode — §7.11.2.{{2,3,4,6}} (V_PRED / H_PRED / SMOOTH / PAETH / directional) pending next-arc"
             ),
             Self::DecodeBlockResidualUnsupported => write!(
                 f,
