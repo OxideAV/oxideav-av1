@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 193)
+## Status — 2026-05-28 (round 194)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,98 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 194 lands the **§7.11.3.1 [`predict_inter`] driver skeleton** —
+the entry point the §5.11.33 dispatcher invokes per inter task. The
+driver composes the four r189-r193 leaves into one `w × h` prediction
+per the av1-spec p.257-258 process; on this round only the
+**single-reference translational SIMPLE arm** is wired end-to-end.
+Compound (`is_compound == true`), WARP (`motion_mode ==
+MOTION_MODE_WARPED_CAUSAL`), and OBMC (`motion_mode ==
+MOTION_MODE_OBMC`) each short-circuit to a dedicated
+[`Error::PredictInterCompoundUnsupported`] /
+[`Error::PredictInterWarpUnsupported`] /
+[`Error::PredictInterObmcUnsupported`], so callers can narrow against
+the exact unsupported arm.
+
+The driver body (single-ref translational arm):
+
+1. **Step 1** — [`rounding_variables(bit_depth, is_compound)`] →
+   `(InterRound0, InterRound1, InterPostRound)`.
+2. **Step 4** — `refList = 0` (single-ref).
+3. **Steps 5,8,9** — caller-supplied [`PredictInterRef`] bundles
+   (`ref_plane`, `ref_stride`, `ref_upscaled_width`, `ref_width`,
+   `ref_height`, `mv`); the §7.11.3.1 step-5/step-8 spec lookups are
+   external to the driver since the walker owns the `RefFrames[..]` /
+   `Mvs[..]` grids.
+4. **Step 10** — [`motion_vector_scaling`] →
+   `(startX, startY, stepX, stepY)`.
+5. **Step 13** — [`block_inter_prediction`] runs the §7.11.3.4 8-tap
+   translational kernel against `(startX, startY, stepX, stepY)`.
+6. **Final-clip (single-ref)** — `CurrFrame[plane][y + i][x + j] =
+   Clip1(preds[0][i][j])` via [`clip1_single_ref`], written to the
+   caller-supplied `pred_out: &mut [u16]` per-block buffer (the merge
+   into [`PartitionWalker::curr_frame`] remains the walker's
+   responsibility — it owns the `(x, y)` offsetting and the per-plane
+   buffer).
+
+The driver's per-task `predict_inter` is the kernel the §5.11.33
+inter task list ([`PlanePredictionTask`] entries with
+`mode == COMPUTE_PRED_MODE_INTER`) was always going to invoke — r190
+emitted the tasks; r194 makes them executable end-to-end on the
+SIMPLE single-ref path. With this round, a single-reference P-frame
+whose every inter block is `motion_mode == SIMPLE && is_compound ==
+false` would produce sample-accurate prediction across the §5.11.5
+walker (modulo the still-pending `RefFrames[..]` / `Mvs[..]` /
+`InterpFilters[..]` plumbing the dispatcher passes through to its
+caller).
+
+Three new [`Error`] variants surface the still-stubbed arms:
+
+* **`Error::PredictInterCompoundUnsupported`** — `is_compound ==
+  true` (step 14 `refList = 1` repeat + COMPOUND_{AVERAGE, DISTANCE,
+  WEDGE, DIFFWTD, INTRA} combine). The five §7.11.3.11-15
+  sample-generation leaves landed in r191 (wedge_mask /
+  difference_weight_mask / intra_mode_variant_mask / mask_blend /
+  distance_weights); driver-side wiring is a next-arc target.
+* **`Error::PredictInterWarpUnsupported`** — `motion_mode ==
+  MOTION_MODE_WARPED_CAUSAL`. The §7.11.3.5-8 [`block_warp`] /
+  [`setup_shear`] / [`resolve_divisor`] / [`warp_estimation`]
+  kernels landed in r192; step-2/3/6/7 `useWarp` derivation +
+  step-12 `(i8, j8)` 8×8 sub-block loop wiring is a next-arc target.
+* **`Error::PredictInterObmcUnsupported`** — `motion_mode ==
+  MOTION_MODE_OBMC`. The §7.11.3.9-10 [`overlap_blending`] /
+  [`overlap_neighbour_predict_blend`] / [`get_obmc_mask`] leaves
+  landed in r193; the post-step "overlapped_motion_compensation"
+  mi-grid neighbour walk wiring is a next-arc target. Note: this
+  arm fires *after* the translational prediction has been written
+  to `pred_out` — matching the spec's "post-step" ordering, where
+  the overlap blend runs on top of the existing prediction.
+
+Test count: 1011 → 1014 (+3 in lib). New tests:
+
+* **`r194_predict_inter_simple_runs_to_completion_on_translational_path`** —
+  the driver output equals the direct composition
+  `motion_vector_scaling` → `block_inter_prediction` →
+  `clip1_single_ref` against the same inputs on a 4×4 `mv = [0, 0]`
+  region.
+* **`r194_predict_inter_stub_arms_each_surface_dedicated_error`** —
+  each of `is_compound == true` / `WARPED_CAUSAL` / `OBMC` returns
+  its dedicated [`Error`] variant, letting the dispatcher narrow
+  against the live remaining gap.
+* **`r194_predict_inter_rejects_caller_bugs`** — empty `refs`,
+  undersized `pred_out`, and `bit_depth ∉ {8, 10, 12}` each return
+  `PartitionWalkOutOfRange` without entering the leaves.
+
+The §5.11.33 [`PartitionWalker::compute_prediction`] dispatcher's
+`is_inter` task-list output is unchanged from r190 — the walker
+continues to emit one [`PlanePredictionTask`] per `(plane, 4x4
+sub-block)`; the per-task `predict_inter` body is now an executable
+leaf instead of an `Error::ComputePredictionInterUnsupported` stub
+on the SIMPLE single-ref path. The variant is retained as a
+defensive fallback and still fires when the dispatcher itself would
+need to drive compound / WARP / OBMC arms before the per-task
+driver is invoked.
 
 Round 193 lifts the **§7.11.3.9-10 OBMC (Overlapped Block Motion
 Compensation) overlap-blend leaves** — the last §7.11.3 inter-prediction

@@ -6,6 +6,29 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 194 — §7.11.3.1 `predict_inter` driver skeleton
+  (translational single-ref SIMPLE arm).**
+  New free function `inter_pred::predict_inter(plane, x, y, w, h,
+  motion_mode, is_compound, is_inter_intra, bit_depth,
+  subsampling_x, subsampling_y, frame_width, frame_height,
+  interp_filter_x, interp_filter_y, refs: &[PredictInterRef],
+  pred_out: &mut [u16]) -> Result<(), Error>` plus the
+  `PredictInterRef<'a>` per-list bundle (carries `ref_plane` +
+  `ref_stride` + `ref_upscaled_width` + `ref_width` + `ref_height` +
+  `mv`). The single-reference translational path
+  (`is_compound == false && motion_mode == MOTION_MODE_SIMPLE &&
+  is_inter_intra == false`) is wired end-to-end: §7.11.3.2
+  `rounding_variables` → §7.11.3.3 `motion_vector_scaling` → §7.11.3.4
+  `block_inter_prediction` → §7.11.3.1 single-ref final-clip
+  `Clip1(preds[0][i][j])` via `clip1_single_ref`. Three new dedicated
+  [`Error`] variants narrow the live remaining gaps:
+  `PredictInterCompoundUnsupported` (step-14 compound combine; the
+  §7.11.3.11-15 leaves landed in r191), `PredictInterWarpUnsupported`
+  (`motion_mode == MOTION_MODE_WARPED_CAUSAL`; the §7.11.3.5-8 kernels
+  landed in r192), `PredictInterObmcUnsupported` (`motion_mode ==
+  MOTION_MODE_OBMC`; the §7.11.3.9-10 leaves landed in r193). Test
+  count: 1011 → 1014 (+3 in lib).
+
 * **Round 193 — §7.11.3.9-10 OBMC (Overlapped Block Motion
   Compensation) overlap-blend leaves.**
   Three new public bodies in `inter_pred` lift the last §7.11.3

@@ -828,6 +828,342 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
 }
 
 // =====================================================================
+// §7.11.3.1 — Motion compensation driver (av1-spec p.257-258).
+// =====================================================================
+//
+// The §7.11.3.1 process composes the §7.11.3.2 rounding-variables
+// derivation, the §7.11.3.3 motion-vector scaling, and (per `useWarp`)
+// either the §7.11.3.4 8-tap translational kernel or the §7.11.3.5-8
+// warp kernel into one prediction for a `w × h` region of one plane,
+// then applies the §7.11.3.1 final-clip / compound-blend step and
+// (when `motion_mode == OBMC`) hands off to §7.11.3.9-10 for the
+// overlap blend.
+//
+// r194 implements the minimum end-to-end path: single-reference
+// translational MC (`is_compound == false`, `motion_mode ==
+// MOTION_MODE_SIMPLE`, `IsInterIntra == false`) — i.e. the §7.11.3.1
+// steps 1, 4, 5 (refList=0), 8, 9, 10, 13, then the
+// `isCompound == 0 && IsInterIntra == 0` final-clip arm of the
+// "inter predicted samples are then derived" step (av1-spec p.258
+// line 14402). The three remaining motion modes / compound /
+// interintra arms surface dedicated [`crate::Error`] variants — the
+// caller can therefore narrow the call site once each arm lands.
+//
+// Steps mapped to this driver:
+//
+// * Step 1  → [`rounding_variables`]
+// * Steps 2,3,6,7 → WARP / global-warp arm — `motion_mode ==
+//   MOTION_MODE_WARPED_CAUSAL` short-circuits at
+//   `Error::PredictInterWarpUnsupported`.
+// * Step 4  → `refList = 0` (the compound path also runs refList=1).
+// * Step 5  → caller supplies `ref_frame[refList]` through the
+//   `RefPlane` argument array.
+// * Step 8  → caller-supplied `mv[refList]`.
+// * Step 9  → caller-supplied `ref_idx[refList]`. We do not validate
+//   the `use_intrabc` arm here — its `RefFrameWidth[-1] = FrameWidth`
+//   etc. is the caller's responsibility (the kernel only consumes
+//   already-resolved `ref_width` / `ref_height` / `ref_upscaled_width`).
+// * Step 10 → [`motion_vector_scaling`]
+// * Step 11 → not driver-side (`use_intrabc` ref-dim override is
+//   caller responsibility, same rationale as step 9).
+// * Step 12 → WARP arm — short-circuits as above.
+// * Step 13 → [`block_inter_prediction`] (the §7.11.3.4 leaf).
+// * Step 14 → `is_compound == 1` short-circuits at
+//   `Error::PredictInterCompoundUnsupported`.
+// * "Mask" prep / "inter predicted samples are then derived" —
+//   `isCompound == 0 && IsInterIntra == 0` arm:
+//   `CurrFrame[plane][y+i][x+j] = Clip1( preds[0][i][j] )`. We write
+//   into a caller-supplied flat `pred_out: &mut [u16]` per-block
+//   buffer; integrating the per-`CurrFrame[plane]` merge is the
+//   walker's responsibility (it owns the per-plane buffer; see
+//   [`crate::PartitionWalker::curr_frame`]).
+// * §7.11.3.1 post-step `motion_mode == OBMC` — short-circuits at
+//   `Error::PredictInterObmcUnsupported`.
+
+/// §7.11.3.1 per-`refList` MV / ref descriptor (av1-spec p.257
+/// step 5-10): the per-list inputs the driver consumes once for
+/// `refList == 0` on the single-ref path, twice on the compound
+/// path.
+///
+/// Lives in one place rather than fanned out across
+/// [`predict_inter`]'s argument list so adding the compound arm in a
+/// future arc is a one-call-site change.
+#[derive(Debug, Clone, Copy)]
+pub struct PredictInterRef<'a> {
+    /// §7.11.3.1 step 5 — `RefFrames[candRow][candCol][refList]`
+    /// resolved to a per-plane sample buffer. Row-major flat layout
+    /// with `ref_stride` column stride. Per-plane sample values are
+    /// the spec's `RefFrames[][][..]` values clipped to `BitDepth`
+    /// (i.e. `0..=(1 << bit_depth) - 1`).
+    pub ref_plane: &'a [u16],
+    /// Column stride of `ref_plane` (`>= ref_width`).
+    pub ref_stride: usize,
+    /// §7.11.3.3 `RefUpscaledWidth[refIdx]` — pre-superres ref
+    /// width in *per-plane* samples (caller has already applied the
+    /// chroma `>> subX`). Equal to `ref_width` when superres /
+    /// resize is not in effect.
+    pub ref_upscaled_width: u32,
+    /// §7.11.3.3 `RefFrameWidth[refIdx]` post-superres per-plane
+    /// width. The §7.11.3.4 boundary clamp uses this as `lastX +
+    /// 1`. Equal to `ref_upscaled_width` when superres is not in
+    /// effect.
+    pub ref_width: u32,
+    /// §7.11.3.3 `RefFrameHeight[refIdx]` per-plane height.
+    pub ref_height: u32,
+    /// §7.11.3.1 step 8 — `Mvs[candRow][candCol][refList]` in
+    /// 1/8-luma-sample precision per §5.11 (the [`motion_vector_scaling`]
+    /// body multiplies by 2 before the chroma `>> subX` shift).
+    /// Layout: `[mv_row, mv_col]` per av1-spec.
+    pub mv: [i16; 2],
+}
+
+/// §7.11.3.1 driver — translational single-reference MC arm.
+///
+/// Composes [`rounding_variables`] (§7.11.3.2),
+/// [`motion_vector_scaling`] (§7.11.3.3), and
+/// [`block_inter_prediction`] (§7.11.3.4) into one `w × h`
+/// prediction per the av1-spec p.257-258 process, then applies the
+/// §7.11.3.1 single-ref final-clip (`CurrFrame[plane][y+i][x+j] =
+/// Clip1( preds[0][i][j] )`, av1-spec p.258 line 14402).
+///
+/// ## Implemented in this round (r194)
+///
+/// * Step 1 — `rounding_variables(bit_depth, is_compound)` (caller
+///   passes `is_compound == false` on this driver — see the
+///   `PredictInterCompoundUnsupported` short-circuit).
+/// * Step 4 — `refList = 0` only (the step-14 compound `refList = 1`
+///   repeat is next-arc).
+/// * Steps 8-10 — `motion_vector_scaling(plane, subsampling_*,
+///   frame_*, ref_upscaled_width, ref_frame_height, x, y, mv)`.
+/// * Step 13 — `block_inter_prediction(plane, subsampling_*,
+///   ref_plane, ref_stride, ref_width, ref_height, startX, startY,
+///   stepX, stepY, w, h, interp_filter_x, interp_filter_y,
+///   InterRound0, InterRound1, pred)`.
+/// * "inter predicted samples are then derived" final-clip arm —
+///   `isCompound == 0 && IsInterIntra == 0`: writes
+///   `Clip1(pred[i*w+j])` into `pred_out[i*w+j]` via
+///   [`clip1_single_ref`].
+///
+/// ## Stubbed arms (each surfaces a dedicated [`crate::Error`])
+///
+/// * Step 14 `is_compound == 1`  →
+///   [`crate::Error::PredictInterCompoundUnsupported`].
+/// * Steps 2,3,6,7,12 `motion_mode == MOTION_MODE_WARPED_CAUSAL` /
+///   `useWarp != 0`  → [`crate::Error::PredictInterWarpUnsupported`].
+/// * Post-step `motion_mode == MOTION_MODE_OBMC`  →
+///   [`crate::Error::PredictInterObmcUnsupported`].
+///
+/// ## Arguments
+///
+/// * `plane` — 0 (Y) / 1 (Cb) / 2 (Cr).
+/// * `x` / `y` — top-left sample coordinate of the prediction region
+///   in the per-plane current-frame space.
+/// * `w` / `h` — prediction region extent in per-plane samples.
+/// * `motion_mode` — §5.11.27 `motion_mode` ordinal
+///   ([`crate::MOTION_MODE_SIMPLE`] / `MOTION_MODE_OBMC` /
+///   `MOTION_MODE_WARPED_CAUSAL`). r194 supports `SIMPLE` only.
+/// * `is_compound` — §7.11.3.1 `isCompound`. r194 requires `false`.
+/// * `is_inter_intra` — §5.11.33 `IsInterIntra`. r194 requires
+///   `false` (the interintra final-blend body is wired through
+///   [`mask_blend_interintra`] but its driver invocation site is
+///   next-arc).
+/// * `bit_depth` — §5.5.2 frame `BitDepth` (8 / 10 / 12).
+/// * `subsampling_x` / `subsampling_y` — §5.5.2 chroma subsampling.
+/// * `frame_width` / `frame_height` — §5.9.5 current-frame
+///   dimensions in luma samples (the `motion_vector_scaling` body
+///   reduces to per-plane internally).
+/// * `interp_filter_x` / `interp_filter_y` — §5.11.x
+///   `InterpFilters[plane][0..1]` ordinals (`EIGHTTAP` /
+///   `EIGHTTAP_SMOOTH` / `EIGHTTAP_SHARP` / `BILINEAR`). The
+///   §7.11.3.4 small-block remap is applied inside the leaf.
+/// * `refs` — per-list `(ref_plane, ref_stride, mv, ref_dims)`
+///   bundles. On the single-ref path `refs.len() == 1` (only
+///   `refs[0]` is consulted); on the compound path the caller would
+///   pass 2 entries — but the compound arm short-circuits before
+///   the second list is read.
+/// * `pred_out` — flat `w * h` row-major output buffer
+///   (`pred_out[i*w + j]`). Receives the §7.11.3.1 single-ref
+///   `Clip1(preds[0][i][j])`.
+///
+/// ## Returns
+///
+/// `Ok(())` on the single-ref translational path. Returns
+/// `Error::PredictInterCompoundUnsupported` /
+/// `Error::PredictInterWarpUnsupported` /
+/// `Error::PredictInterObmcUnsupported` per the stub-arm table
+/// above. Returns `Error::PartitionWalkOutOfRange` for caller-bug
+/// arguments: `plane > 2`, `subsampling_{x,y} > 1`, `bit_depth ∉
+/// {8, 10, 12}`, `frame_{width,height} == 0`, `w == 0 || h == 0 ||
+/// w > 256 || h > 256`, `refs.is_empty()` on the single-ref path,
+/// `pred_out.len() < w * h`, or any sub-condition the
+/// `motion_vector_scaling` / `block_inter_prediction` /
+/// `clip1_single_ref` leaves reject.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_inter(
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    motion_mode: u8,
+    is_compound: bool,
+    is_inter_intra: bool,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    refs: &[PredictInterRef<'_>],
+    pred_out: &mut [u16],
+) -> Result<(), crate::Error> {
+    // ---------- caller-bug guards ----------
+    if plane > 2 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if subsampling_x > 1 || subsampling_y > 1 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if !matches!(bit_depth, 8 | 10 | 12) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if frame_width == 0 || frame_height == 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if w == 0 || h == 0 || w > 256 || h > 256 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred_out.len() < w * h {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if refs.is_empty() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.1 step 14 — compound short-circuit ----------
+    //
+    // Step 14 repeats steps 5-13 for `refList = 1`, then applies one
+    // of the COMPOUND_{AVERAGE,DISTANCE,WEDGE,DIFFWTD,INTRA} combine
+    // arms (av1-spec p.258 lines 14381-14412). The §7.11.3.11-15
+    // sample-generation leaves are landed (r191) but the per-block
+    // driver wiring is a next-arc target.
+    if is_compound {
+        return Err(crate::Error::PredictInterCompoundUnsupported);
+    }
+
+    // ---------- §7.11.3.1 step 2,3,6,7,12 — WARP short-circuit ----
+    //
+    // The §7.11.3.1 driver routes through the §7.11.3.5-8
+    // `block_warp` kernel when `useWarp != 0`. r194 implements only
+    // the translational SIMPLE arm; the LOCALWARP / global-warp arms
+    // are a next-arc target (the kernels themselves landed in r192).
+    //
+    // We short-circuit on `motion_mode == MOTION_MODE_WARPED_CAUSAL`
+    // without trying to derive `useWarp` itself — the §7.11.3.1
+    // step-7 `useWarp = 2` global-warp arm fires only on
+    // `YMode == GLOBAL{,_GLOBAL}MV && GmType[refFrame] > TRANSLATION
+    // && ...`, none of which the driver's r194 caller can
+    // distinguish from a translational SIMPLE block without
+    // plumbing GmType + YMode through.
+    if motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL {
+        return Err(crate::Error::PredictInterWarpUnsupported);
+    }
+
+    // ---------- §7.11.3.1 IsInterIntra short-circuit ----------
+    //
+    // The §5.11.33 dispatcher's IsInterIntra arm currently surfaces
+    // `Error::ComputePredictionInterIntraUnsupported` at the
+    // dispatcher gate, so a conformant caller never reaches this
+    // driver with `is_inter_intra == true`. Defensive guard.
+    if is_inter_intra {
+        return Err(crate::Error::ComputePredictionInterIntraUnsupported);
+    }
+
+    // ---------- §7.11.3.1 step 1 — rounding variables -----------
+    let rv = rounding_variables(bit_depth, is_compound)?;
+
+    // ---------- §7.11.3.1 step 4-13 — refList = 0 ----------
+    //
+    // Steps 5,8,9 are subsumed into the caller-supplied `refs[0]`
+    // bundle. Step 10 = `motion_vector_scaling`. Step 13 =
+    // `block_inter_prediction` against the
+    // `(startX, startY, stepX, stepY)` quadruple.
+    let r0 = &refs[0];
+
+    let mvs = motion_vector_scaling(
+        plane,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        r0.ref_upscaled_width,
+        r0.ref_height,
+        x,
+        y,
+        r0.mv,
+    )?;
+
+    let mut pred0: Vec<i32> = Vec::new();
+    if pred0.try_reserve_exact(w * h).is_err() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    pred0.resize(w * h, 0);
+
+    block_inter_prediction(
+        plane,
+        subsampling_x,
+        subsampling_y,
+        r0.ref_plane,
+        r0.ref_stride,
+        r0.ref_width,
+        r0.ref_height,
+        mvs.start_x,
+        mvs.start_y,
+        mvs.step_x,
+        mvs.step_y,
+        w,
+        h,
+        interp_filter_x,
+        interp_filter_y,
+        rv.inter_round0,
+        rv.inter_round1,
+        &mut pred0,
+    )?;
+
+    // ---------- §7.11.3.1 final-clip (single-ref arm) ----------
+    //
+    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
+    // Clip1( preds[0][i][j] )` for `(i, j) ∈ [0, h) × [0, w)`. We
+    // write into the caller-supplied per-block buffer; the merge
+    // into [`crate::PartitionWalker::curr_frame`] is the walker's
+    // responsibility (it owns the per-plane buffer and the (x, y)
+    // offsetting).
+    clip1_single_ref(bit_depth, &pred0, pred_out)?;
+
+    // ---------- §7.11.3.1 post-step — OBMC short-circuit --------
+    //
+    // av1-spec p.258 line 14414: "If motion_mode is equal to OBMC,
+    // the overlapped motion compensation in section 7.11.3.9 is
+    // invoked with plane, w, h as inputs." The §7.11.3.9-10 per-pair
+    // overlap-blend leaves landed in r193 but the mi-grid neighbour
+    // walk is a next-arc target.
+    //
+    // Surfacing this *after* the translational prediction has been
+    // written into `pred_out` matches the spec ordering — the
+    // overlap blend runs on top of the already-written current
+    // prediction. A caller that wants the un-blended translational
+    // prediction can ignore the error and consume `pred_out` as-is;
+    // however, conformance requires the blend, so reporting the
+    // stub here is what walker integration will key on.
+    if motion_mode == crate::cdf::MOTION_MODE_OBMC {
+        return Err(crate::Error::PredictInterObmcUnsupported);
+    }
+
+    Ok(())
+}
+
+// =====================================================================
 // §7.11.3.11-15 — Compound mask / blend bodies (av1-spec p.278-285).
 // =====================================================================
 //
@@ -4859,5 +5195,294 @@ mod tests {
         for (j, v) in curr.iter().enumerate().take(8) {
             assert_eq!(*v, 64 - 33, "row 0 col {j}");
         }
+    }
+
+    // ---------- r194 §7.11.3.1 predict_inter driver ----------
+
+    /// §7.11.3.1 SIMPLE single-ref translational path — driver
+    /// composes `rounding_variables` + `motion_vector_scaling` +
+    /// `block_inter_prediction` + `clip1_single_ref`. Reuses the
+    /// `block_inter_prediction_zero_mv_copies_reference`
+    /// integer-aligned phase-0 trick: with `mv = [0, 0]` and the
+    /// §7.11.3.3 `off = 32` bias, the `motion_vector_scaling`
+    /// output's phase is 1 — but the driver itself is wired
+    /// correctly when we observe the prediction reproduces what
+    /// the leaf would have produced standalone for those args.
+    #[test]
+    fn r194_predict_inter_simple_runs_to_completion_on_translational_path() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (r * 16 + c) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let w = 4;
+        let h = 4;
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            /* plane */ 0,
+            /* x */ 2,
+            /* y */ 2,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            /* is_compound */ false,
+            /* is_inter_intra */ false,
+            /* bit_depth */ 8,
+            /* subsampling_x */ 0,
+            /* subsampling_y */ 0,
+            /* frame_width */ ref_w as u32,
+            /* frame_height */ ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            &mut pred_out,
+        )
+        .expect("predict_inter SIMPLE single-ref translational path");
+
+        // Drive the same `block_inter_prediction` leaf the driver
+        // dispatched to with the same `motion_vector_scaling`
+        // output, then apply `clip1_single_ref`, and verify the
+        // driver's `pred_out` matches.
+        let mvs = motion_vector_scaling(
+            0,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            ref_w as u32,
+            ref_h as u32,
+            2,
+            2,
+            [0, 0],
+        )
+        .unwrap();
+        let rv = rounding_variables(8, false).unwrap();
+        let mut leaf_pred = vec![0i32; w * h];
+        block_inter_prediction(
+            0,
+            0,
+            0,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            mvs.start_x,
+            mvs.start_y,
+            mvs.step_x,
+            mvs.step_y,
+            w,
+            h,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            &mut leaf_pred,
+        )
+        .unwrap();
+        let mut leaf_out = vec![0u16; w * h];
+        clip1_single_ref(8, &leaf_pred, &mut leaf_out).unwrap();
+        assert_eq!(
+            pred_out, leaf_out,
+            "driver output must equal direct leaf composition"
+        );
+    }
+
+    /// §7.11.3.1 stub-arm matrix — each unsupported arm short-
+    /// circuits to its dedicated [`crate::Error`] variant. Verifies
+    /// the dispatcher can be narrowed at the call site by checking
+    /// for `PredictInterCompoundUnsupported` /
+    /// `PredictInterWarpUnsupported` / `PredictInterObmcUnsupported`
+    /// independently.
+    #[test]
+    fn r194_predict_inter_stub_arms_each_surface_dedicated_error() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let refp = vec![0u16; ref_w * ref_h];
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let mut pred_out = vec![0u16; 16];
+
+        // is_compound == true ⇒ PredictInterCompoundUnsupported.
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            /* is_compound */ true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            &mut pred_out,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PredictInterCompoundUnsupported);
+
+        // motion_mode == WARPED_CAUSAL ⇒ PredictInterWarpUnsupported.
+        let mut pred_out_8x8 = vec![0u16; 64];
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            8,
+            8,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            &mut pred_out_8x8,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PredictInterWarpUnsupported);
+
+        // motion_mode == OBMC ⇒ PredictInterObmcUnsupported.
+        // The translational prediction runs to completion first
+        // (per av1-spec p.258 line 14414's "post-step" ordering);
+        // the OBMC stub fires after the prediction has been
+        // written to `pred_out`.
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            &mut pred_out,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PredictInterObmcUnsupported);
+    }
+
+    /// §7.11.3.1 caller-bug guards: `refs.is_empty()`,
+    /// `pred_out` undersized, and an out-of-range `bit_depth` each
+    /// return `PartitionWalkOutOfRange` without entering the
+    /// rounding-variables / scaling / convolution pipeline.
+    #[test]
+    fn r194_predict_inter_rejects_caller_bugs() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let refp = vec![0u16; ref_w * ref_h];
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let mut pred_out = vec![0u16; 16];
+
+        // Empty refs.
+        let empty_refs: [PredictInterRef<'_>; 0] = [];
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &empty_refs,
+            &mut pred_out,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
+
+        // Undersized pred_out (w*h = 16, slice = 8).
+        let mut small = vec![0u16; 8];
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            &mut small,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
+
+        // Out-of-range bit_depth.
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            9,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            &mut pred_out,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
     }
 }

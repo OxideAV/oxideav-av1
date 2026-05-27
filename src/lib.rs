@@ -1756,28 +1756,30 @@ pub use transform::{
 // surfaced. The §5.11.33 `compute_prediction` dispatcher now also
 // admits the `is_inter == 1` arm — it emits one
 // [`PlanePredictionTask`] per `(plane, i8, j8)` `8 × 8` sub-block per
-// the §7.11.3.1 driver outer loop with `mode = COMPUTE_PRED_MODE_INTER`;
-// the per-task `predict_inter` body itself remains a separate leaf
-// the caller invokes against a real `RefFrames[refList]` plane buffer
-// + per-block `(InterpFilters, Mvs, RefFrames)` triple. The
-// next-arc targets are §7.11.3.9-10 `overlapped_motion_compensation`
-// (OBMC) and the §7.11.3.1 predict_inter driver wiring. The §7.11.3.5
-// `block_warp` / §7.11.3.6 `setup_shear` / §7.11.3.7 `resolve_divisor`
-// / §7.11.3.8 `warp_estimation` warp MC arm landed in r192. The
-// §7.11.3.11-15 compound-mask / blend arms landed in r191.
+// the §7.11.3.1 driver outer loop with `mode = COMPUTE_PRED_MODE_INTER`.
+// As of r194 the per-task `predict_inter` body lands as
+// [`inter_pred::predict_inter`] (single-reference translational SIMPLE
+// arm only); compound / WARP / OBMC arms each short-circuit to a
+// dedicated [`Error`] variant (`PredictInterCompoundUnsupported` /
+// `PredictInterWarpUnsupported` / `PredictInterObmcUnsupported`)
+// pending driver-side wiring of the §7.11.3.11-15 / §7.11.3.5-8 /
+// §7.11.3.9-10 sample-generation leaves (themselves landed in r191 /
+// r192 / r193). The next-arc targets are wiring the compound / WARP /
+// OBMC arms into the driver, and §7.14 loop filter.
 pub use inter_pred::{
     block_inter_prediction, block_shape, block_warp, clip1_single_ref, compound_distance_blend,
     difference_weight_mask, distance_weights, get_relative_dist, intra_mode_variant_mask,
-    mask_blend, mask_blend_interintra, master_mask_table, motion_vector_scaling, resolve_divisor,
-    rounding_variables, select_interp_filter_small_block, setup_shear, warp_estimation, wedge_mask,
-    DistanceWeights, Divisor, LocalWarp, MvScale, RoundingVars, ShearParams, WarpSampleCand,
-    COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_WEDGE, DIV_LUT,
-    DIV_LUT_BITS, DIV_LUT_NUM, DIV_LUT_PREC_BITS, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP,
-    FILTER_BITS as INTER_FILTER_BITS, II_DC_PRED, II_H_PRED, II_SMOOTH_PRED, II_V_PRED,
-    II_WEIGHTS_1D, LEAST_SQUARES_SAMPLES_MAX as INTER_LEAST_SQUARES_SAMPLES_MAX, LS_MV_MAX,
-    MASK_MASTER_SIZE, MAX_FRAME_DISTANCE, MAX_SB_SIZE, QUANT_DIST_LOOKUP, QUANT_DIST_WEIGHT,
-    REF_SCALE_SHIFT, SCALE_SUBPEL_BITS, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, USE_WARP_GLOBAL,
-    USE_WARP_LOCAL, WARPEDDIFF_PREC_BITS, WARPEDMODEL_NONDIAGAFFINE_CLAMP, WARPEDMODEL_TRANS_CLAMP,
+    mask_blend, mask_blend_interintra, master_mask_table, motion_vector_scaling, predict_inter,
+    resolve_divisor, rounding_variables, select_interp_filter_small_block, setup_shear,
+    warp_estimation, wedge_mask, DistanceWeights, Divisor, LocalWarp, MvScale, PredictInterRef,
+    RoundingVars, ShearParams, WarpSampleCand, COMPOUND_AVERAGE, COMPOUND_DIFFWTD,
+    COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_WEDGE, DIV_LUT, DIV_LUT_BITS, DIV_LUT_NUM,
+    DIV_LUT_PREC_BITS, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP, FILTER_BITS as INTER_FILTER_BITS,
+    II_DC_PRED, II_H_PRED, II_SMOOTH_PRED, II_V_PRED, II_WEIGHTS_1D,
+    LEAST_SQUARES_SAMPLES_MAX as INTER_LEAST_SQUARES_SAMPLES_MAX, LS_MV_MAX, MASK_MASTER_SIZE,
+    MAX_FRAME_DISTANCE, MAX_SB_SIZE, QUANT_DIST_LOOKUP, QUANT_DIST_WEIGHT, REF_SCALE_SHIFT,
+    SCALE_SUBPEL_BITS, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, USE_WARP_GLOBAL, USE_WARP_LOCAL,
+    WARPEDDIFF_PREC_BITS, WARPEDMODEL_NONDIAGAFFINE_CLAMP, WARPEDMODEL_TRANS_CLAMP,
     WARPEDPIXEL_PREC_SHIFTS, WARPED_FILTERS, WARP_PARAM_REDUCE_BITS, WARP_WARPEDMODEL_PREC_BITS,
     WEDGE_BITS, WEDGE_CODEBOOK, WEDGE_DIRECTIONS, WEDGE_HORIZONTAL, WEDGE_MASTER_OBLIQUE_EVEN,
     WEDGE_MASTER_OBLIQUE_ODD, WEDGE_MASTER_VERTICAL, WEDGE_OBLIQUE117, WEDGE_OBLIQUE153,
@@ -2227,6 +2229,36 @@ pub enum Error {
     /// `ZeroMvContext` based on whether the temporal MV diverges
     /// from `GlobalMvs[..]` by more than 16 1/8-luma-sample units.
     TemporalMvScanUnsupported,
+    /// The §7.11.3.1 [`crate::inter_pred::predict_inter`] driver was
+    /// invoked on a compound-prediction block (`is_compound == true`).
+    /// The §7.11.3.1 step-14 outer loop repeats steps 5-13 for
+    /// `refList = 1`, then applies one of the COMPOUND_AVERAGE /
+    /// COMPOUND_DISTANCE / COMPOUND_WEDGE / COMPOUND_DIFFWTD /
+    /// COMPOUND_INTRA combine arms; the §7.11.3.11-15 sample-generation
+    /// leaves are landed (r191) but the per-block driver wiring is a
+    /// next-arc target. Single-reference (`is_compound == false`)
+    /// blocks land in r194.
+    PredictInterCompoundUnsupported,
+    /// The §7.11.3.1 [`crate::inter_pred::predict_inter`] driver was
+    /// invoked with `motion_mode == MOTION_MODE_WARPED_CAUSAL` (or
+    /// step-7 derived `useWarp != 0`). The §7.11.3.5-8 warp MC kernel
+    /// is landed (r192) via [`crate::block_warp`] /
+    /// [`crate::setup_shear`] / [`crate::resolve_divisor`] /
+    /// [`crate::warp_estimation`], but the per-block driver step-12
+    /// `for i8 = 0..((h-1) >> 3) for j8 = 0..((w-1) >> 3)` loop and
+    /// the step-2/3/7 `LocalValid` / `globalValid` derivation are a
+    /// next-arc target. Translational (`motion_mode ==
+    /// MOTION_MODE_SIMPLE`) blocks land in r194.
+    PredictInterWarpUnsupported,
+    /// The §7.11.3.1 [`crate::inter_pred::predict_inter`] driver was
+    /// invoked with `motion_mode == MOTION_MODE_OBMC`. The §7.11.3.9
+    /// / §7.11.3.10 OBMC overlap-blending leaves are landed (r193) via
+    /// [`crate::inter_pred::overlap_blending`] /
+    /// [`crate::inter_pred::overlap_neighbour_predict_blend`] /
+    /// [`crate::inter_pred::get_obmc_mask`], but the per-block
+    /// `overlapped_motion_compensation` mi-grid neighbour walk is a
+    /// next-arc target. Translational SIMPLE blocks land in r194.
+    PredictInterObmcUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -2361,6 +2393,18 @@ impl core::fmt::Display for Error {
             Self::TemporalMvScanUnsupported => write!(
                 f,
                 "oxideav-av1: §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample reached — MotionFieldMvs[ref][y8][x8] grid + §7.9 motion_field_estimation pending next arc; only use_ref_frame_mvs == false is currently supported"
+            ),
+            Self::PredictInterCompoundUnsupported => write!(
+                f,
+                "oxideav-av1: §7.11.3.1 predict_inter driver reached step-14 is_compound == 1 — the §7.11.3.11-15 compound combine wiring is a next-arc target (the sample-generation leaves landed in r191)"
+            ),
+            Self::PredictInterWarpUnsupported => write!(
+                f,
+                "oxideav-av1: §7.11.3.1 predict_inter driver reached motion_mode == WARPED_CAUSAL — the §7.11.3.5-8 block_warp driver wiring is a next-arc target (the kernel itself landed in r192)"
+            ),
+            Self::PredictInterObmcUnsupported => write!(
+                f,
+                "oxideav-av1: §7.11.3.1 predict_inter driver reached motion_mode == OBMC — the §7.11.3.9-10 overlapped_motion_compensation mi-grid neighbour walk is a next-arc target (the per-pair overlap-blend leaves landed in r193)"
             ),
         }
     }
