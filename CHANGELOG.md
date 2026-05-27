@@ -6,6 +6,100 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 171 — §5.11.46 palette-entries reader
+  (`palette_colors_y[]` / `palette_colors_u[]` / `palette_colors_v[]`)
+  + §5.11.49 `get_palette_cache(plane)`.** Lifts the
+  `Error::PaletteEntriesUnsupported` stub the r169 §5.11.22 reader
+  surfaced after `palette_size_y_minus_2` /
+  `palette_size_uv_minus_2`. The §5.11.22
+  `decode_intra_block_mode_info` reader now threads a new
+  `bit_depth: u8` argument (in {8, 10, 12} per §5.5.2; caller-bug
+  inputs surface `PartitionWalkOutOfRange` before any bit is
+  consumed) and runs the §5.11.46 entry reads to completion on the
+  conformant path:
+
+  * The Y luma arm — §5.11.49 `cacheN = get_palette_cache(0)` merge
+    of above + left palettes, the cache-coded indices loop reading
+    `use_palette_color_cache_y L(1)` per cache slot, the first new
+    entry as `L(BitDepth)`, the optional `L(2)
+    palette_num_extra_bits_y` and the delta loop with `palette_delta_y
+    L(paletteBits)` + the spec's `++` increment + `Clip1` + `range =
+    (1 << BitDepth) - palette_colors_y[idx] - 1` paletteBits
+    refinement, terminating in the trailing ascending sort.
+  * The U chroma arm — mirrors the Y reader minus the `++` step and
+    with `range = (1 << BitDepth) - palette_colors_u[idx]` (no
+    `- 1`), terminating in the same trailing sort.
+  * The V chroma arm — two-arm dispatch on
+    `delta_encode_palette_colors_v L(1)`: on 1, signed-delta path
+    with `minBits = BitDepth - 4`, `L(2)
+    palette_num_extra_bits_v`, `L(BitDepth) palette_colors_v[0]`,
+    then per-entry `L(paletteBits) palette_delta_v` + optional
+    `L(1) palette_delta_sign_bit_v` sign-flip + modular wrap into
+    `[0, maxVal)` + `Clip1`; on 0, direct `PaletteSizeUV`-many
+    `L(BitDepth)` literals (no sort either way).
+
+  The walker grows two new grids — `PaletteSizes[plane][r][c]` (a
+  `3 * mi_rows * mi_cols` flat `Vec<u8>`) and
+  `PaletteColors[plane][r][c][idx]` (a `3 * mi_rows * mi_cols *
+  PALETTE_COLORS = 24 * area` flat `Vec<u16>`) — pre-filled at
+  walker-construction time to the spec's "no palette here"
+  identity. Decoded palette entries are stamped over the block's
+  `bh4 * bw4` footprint per plane so the next §5.11.46 call's
+  `get_palette_cache(plane)` two-pointer neighbour merge observes
+  the propagated values. The §5.11.49 `(MiRow * MI_SIZE) % 64`
+  superblock-top gate suppresses the above-neighbour read at 64×64
+  superblock boundaries; `AvailL` collapses to `mi_col > 0` for the
+  tile-start tests (out-of-grid reads return 0, the spec-correct
+  identity).
+
+  Two new public-by-grids accessors land on `PartitionWalker`:
+  `palette_sizes()` and `palette_colors()` (each returns a flat
+  slice with plane-outermost row-major layout). The
+  `get_palette_cache(plane, mi_row, mi_col, &mut [u16; 16])`
+  method runs the §5.11.49 merge + dedupe and writes the cache
+  into the caller-supplied buffer (max `2 * PALETTE_COLORS = 16`
+  entries), returning the count. Two new free helpers cover the
+  spec's §4.7 mathematical primitives the §5.11.46 reader needs:
+  `clip1_to_bit_depth(x, bd)` (the §4.7 `Clip1` clamp to `[0, (1 <<
+  BitDepth) - 1]`) and `ceil_log2_av1(x)` (the §4.7 `CeilLog2`
+  defined to return 0 on `x < 2`).
+
+  Three new fields land on `DecodedIntraBlockModeInfo` carrying
+  the decoded palette entries per plane: `palette_colors_y:
+  Option<[u16; PALETTE_COLORS]>` (sorted ascending),
+  `palette_colors_u: Option<[u16; PALETTE_COLORS]>` (sorted
+  ascending), and `palette_colors_v: Option<[u16; PALETTE_COLORS]>`
+  (source order — the V plane's §5.11.46 body skips the trailing
+  sort). The `palette_size_y` / `palette_size_uv` fields now carry
+  `Some(decoded_size)` on the conformant path (previously stayed
+  `None` because the reader short-circuited before committing the
+  size). `Error::PaletteEntriesUnsupported` is retained for ABI
+  stability but is no longer constructed by the conformant code
+  path (documented as a defensive fallback).
+
+  12 new unit tests cover: the `bit_depth ∈ {8, 10, 12}` caller-bug
+  guard; `get_palette_cache` returning empty on a fresh walker; the
+  `clip1_to_bit_depth` truth table at 8 / 10 / 12 bits; the
+  `ceil_log2_av1` truth table around the `x < 2` boundary;
+  `decode_intra_block_mode_info` with rigged CDFs on the
+  `has_palette_y == 0` path returning `Ok` with empty palette state;
+  `read_palette_entries_y` direct-call with `PaletteSizeY = 2` and a
+  zero bitstream yielding `[0, 1]` (the Y `delta + 1` step);
+  `read_palette_entries_uv` direct-call with `PaletteSizeUV = 2` and
+  a zero bitstream yielding `[0, 0]` on U (no `++` step) and the V
+  direct-literal arm; hand-stamped palette grids visible through
+  `get_palette_cache` (left-neighbour-only); the §5.11.49 above +
+  left merge with a duplicate entry; the §5.11.49 superblock-top
+  boundary gate; and the `read_palette_entries_y` cache-coded
+  no-bit-read path via the `get_palette_cache` accessor. Total
+  lib-test count: 580 → 592 (+12). All four §5.11.22 test setups
+  thread the new `bit_depth = 8` argument; no behavioural change on
+  any pre-r171 test.
+
+  Followup arcs: §7.10 `find_mv_stack` MV-stack derivation (the
+  `Error::FindMvStackUnsupported` gap r170 surfaced); §5.11.30
+  `compute_prediction`; §5.11.34 `residual` walker.
+
 * **Round 170 — §5.11.23 `inter_block_mode_info()` prologue +
   §5.11.25 `read_ref_frames()`
   (`PartitionWalker::decode_inter_block_mode_info`).** Lands the

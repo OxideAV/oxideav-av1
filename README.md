@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 170)
+## Status — 2026-05-27 (round 171)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,75 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 171 lands the **§5.11.46 palette-entries reader**
+(`palette_colors_y[]` / `palette_colors_u[]` /
+`palette_colors_v[]`) and the **§5.11.49 `get_palette_cache(plane)`**
+two-pointer merge of the above + left neighbour palettes —
+lifting the `Error::PaletteEntriesUnsupported` stub the r169
+§5.11.22 reader surfaced after `palette_size_*_minus_2`. The
+§5.11.22 `PartitionWalker::decode_intra_block_mode_info` reader
+now threads a `bit_depth: u8` argument (in {8, 10, 12} per
+§5.5.2) and runs every leaf to completion on the conformant path.
+The Y plane walks the cache-coded indices loop
+(`use_palette_color_cache_y L(1)` per cache slot, copying
+`PaletteCache[i]`), the first new entry as `L(BitDepth)`, the
+optional `L(2) palette_num_extra_bits_y`, and the delta loop with
+`palette_delta_y L(paletteBits)` + the spec's `++` increment +
+`Clip1(prev + delta)` + `range = (1 << BitDepth) -
+palette_colors_y[idx] - 1` paletteBits refinement, terminating in
+the trailing ascending sort. The U plane mirrors Y minus the `++`
+step and with `range = (1 << BitDepth) - palette_colors_u[idx]`
+(no `- 1`). The V plane dispatches on
+`delta_encode_palette_colors_v L(1)`: on 1, a signed-delta path
+with `minBits = BitDepth - 4`, per-entry `L(paletteBits)
+palette_delta_v` + optional `L(1) palette_delta_sign_bit_v` sign
+flip + modular wrap into `[0, maxVal)` + `Clip1`; on 0, direct
+`PaletteSizeUV`-many `L(BitDepth)` literals. The V plane is not
+sorted either way per §5.11.46.
+
+The walker grows two new grids — `PaletteSizes[plane][r][c]` and
+`PaletteColors[plane][r][c][idx]`, packed flat with the plane
+outermost — pre-filled at construction time to the spec's "no
+palette" identity. Decoded entries are stamped over the block's
+`bh4 * bw4` footprint per plane so the next §5.11.46 call's
+§5.11.49 neighbour merge observes the propagated values. The
+§5.11.49 `(MiRow * MI_SIZE) % 64` superblock-top gate suppresses
+the above-neighbour read at 64×64 boundaries; out-of-grid reads
+return 0, the spec-correct identity. New public accessors:
+`palette_sizes()` and `palette_colors()` (flat slice views) plus
+`get_palette_cache(plane, mi_row, mi_col, &mut [u16; 16])` (runs
+the merge + dedupe and returns the entry count). Two new free
+helpers cover the §4.7 mathematical primitives the §5.11.46
+reader needs: `clip1_to_bit_depth(x, bd)` (§4.7 `Clip1`) and
+`ceil_log2_av1(x)` (§4.7 `CeilLog2`, defined to return 0 on
+`x < 2`).
+
+New on `DecodedIntraBlockModeInfo`: three optional palette-entry
+arrays — `palette_colors_y / _u / _v: Option<[u16; PALETTE_COLORS]>`
+— carrying the decoded entries (Y and U sorted; V in source order
+per spec). `palette_size_y` / `palette_size_uv` now report
+`Some(decoded_size)` on the conformant path (previously stayed
+`None` because the reader short-circuited before committing).
+`Error::PaletteEntriesUnsupported` is retained for ABI stability
+but is no longer constructed on the conformant code path.
+
+12 new unit tests cover: the `bit_depth ∈ {8, 10, 12}`
+caller-bug guard; an empty-cache fresh-walker read;
+`clip1_to_bit_depth` / `ceil_log2_av1` truth tables at the
+spec-defined boundaries; `decode_intra_block_mode_info` with a
+rigged `has_palette_y == 0` path returning `Ok` with empty
+palette state; `read_palette_entries_y` direct-call with
+`PaletteSizeY = 2` and a zero bitstream yielding `[0, 1]` (the Y
+`delta + 1` step); the U reader yielding `[0, 0]` (no `++`); the
+V direct-literal arm yielding `[0, 0]`; hand-stamped palette
+grids visible through `get_palette_cache` (left-neighbour-only);
+the §5.11.49 above + left merge with a duplicate entry; the
+§5.11.49 superblock-top boundary gate; and the
+`read_palette_entries_y` cache-coded no-bit-read path via the
+`get_palette_cache` accessor. Test count: 615 → 627 (+12).
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 169 lands **§5.11.22 `intra_block_mode_info()`** (av1-spec
 p.73) — the per-block intra-mode syntax composite reached from the

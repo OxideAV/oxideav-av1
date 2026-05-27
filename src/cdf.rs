@@ -11504,6 +11504,34 @@ pub struct PartitionWalker {
     /// gated through `AvailU` / `AvailL` still produces the spec-
     /// correct fallback for the §5.11.23 / §5.11.18 ctx walks.
     ref_frames: Vec<i8>,
+    /// `PaletteSizes[ plane ][ row ][ col ]` packed into a row-major
+    /// `3 * mi_rows * mi_cols` flat buffer (av1-spec §5.11.46 /
+    /// §5.11.49). Slot `plane * area + r * mi_cols + c` holds the
+    /// `PaletteSize{Y,UV}` for `plane = 0` (luma), `plane = 1` (U
+    /// chroma), and `plane = 2` (V chroma). Entries are `0` for cells
+    /// that no §5.11.46 palette read has populated (matching the
+    /// §5.11.22 line `PaletteSizeY = 0` / `PaletteSizeUV = 0`
+    /// initialisation and the §5.11.49 `aboveN = 0` / `leftN = 0`
+    /// fallback when no neighbour palette has been read). Cells in the
+    /// `bh4 * bw4` footprint of a block whose §5.11.46 luma arm decoded
+    /// `has_palette_y == 1` carry the decoded `PaletteSizeY` (in
+    /// `2..=PALETTE_COLORS = 8`); same for the U / V planes against
+    /// `PaletteSizeUV`. Stored as `u8` because the maximum value is 8.
+    ///
+    /// Per the §5.11.46 syntax the U and V planes always share the same
+    /// `PaletteSizeUV`; both `plane = 1` and `plane = 2` slots carry
+    /// the same value on the chroma palette path (the spec treats them
+    /// as a paired pair).
+    palette_sizes: Vec<u8>,
+    /// `PaletteColors[ plane ][ row ][ col ][ idx ]` packed into a
+    /// row-major `3 * mi_rows * mi_cols * PALETTE_COLORS` flat buffer
+    /// (av1-spec §5.11.46 / §5.11.49). Slot `((plane * area) + r *
+    /// mi_cols + c) * PALETTE_COLORS + idx` holds `palette_colors_{y,
+    /// u, v}[ idx ]` for the block anchored at `(r, c)` whose §5.11.46
+    /// arm decoded the entries. Unused slots (`idx >= palette_sizes[
+    /// plane ][ r ][ c ]`) are left at `0`. Stored as `u16` so 10-bit
+    /// (and 12-bit) `BitDepth` palette entries fit without truncation.
+    palette_colors: Vec<u16>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -11599,6 +11627,23 @@ impl PartitionWalker {
         for cell in 0..area {
             ref_frames[cell * 2 + 1] = -1;
         }
+        // §5.11.46 / §5.11.49: pre-fill `PaletteSizes[plane][r][c]` with
+        // 0 (the §5.11.22 line 11-12 / §5.11.49 `aboveN = 0` / `leftN = 0`
+        // initialisation — a not-yet-decoded cell contributes the same
+        // "no palette" weight as an unavailable neighbour). Three planes
+        // per cell (Y / U / V).
+        let area3 = area.checked_mul(3)?;
+        let mut palette_sizes: Vec<u8> = Vec::new();
+        palette_sizes.try_reserve_exact(area3).ok()?;
+        palette_sizes.resize(area3, 0);
+        // §5.11.46 / §5.11.49: pre-fill `PaletteColors[plane][r][c][..]`
+        // with 0. Unused slots stay at 0; the §5.11.49 cache walk reads
+        // only the first `PaletteSizes[plane][..][..]` entries per cell
+        // so the pre-fill value is unobserved on the conformant path.
+        let area3_colors = area3.checked_mul(PALETTE_COLORS)?;
+        let mut palette_colors: Vec<u16> = Vec::new();
+        palette_colors.try_reserve_exact(area3_colors).ok()?;
+        palette_colors.resize(area3_colors, 0);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -11617,6 +11662,8 @@ impl PartitionWalker {
             tx_sizes,
             inter_tx_sizes,
             ref_frames,
+            palette_sizes,
+            palette_colors,
             blocks: Vec::new(),
         })
     }
@@ -12094,6 +12141,190 @@ impl PartitionWalker {
             return if slot == 0 { 0 } else { -1 };
         }
         self.ref_frames[((r * self.mi_cols + c) as usize) * 2 + slot]
+    }
+
+    /// View of the §5.11.46 / §5.11.49 `PaletteSizes[ plane ][ row ][ col ]`
+    /// grid after the walk. Indexed row-major with the plane outermost:
+    /// `palette_sizes()[ plane * MiRows * MiCols + r * MiCols + c ]`
+    /// where `plane = 0` is luma, `plane = 1` is U chroma, and `plane =
+    /// 2` is V chroma. Pre-fill is `0` (the §5.11.22 line 11-12
+    /// initialiser / §5.11.49 `aboveN = 0` / `leftN = 0` fallback);
+    /// cells inside the `bh4 * bw4` footprint of a §5.11.46 decoded
+    /// block carry the `PaletteSize{Y,UV}` value in `2..=PALETTE_COLORS
+    /// = 8`. The U and V planes always share the same `PaletteSizeUV`
+    /// per the §5.11.46 syntax (both `plane = 1` and `plane = 2` slots
+    /// carry the same value when the chroma arm fires).
+    #[must_use]
+    pub fn palette_sizes(&self) -> &[u8] {
+        &self.palette_sizes
+    }
+
+    /// View of the §5.11.46 / §5.11.49 `PaletteColors[ plane ][ row ][
+    /// col ][ idx ]` grid after the walk. Indexed row-major with the
+    /// plane outermost and palette-entry-index innermost: `palette_colors()[
+    /// ((plane * MiRows + r) * MiCols + c) * PALETTE_COLORS + idx ]`.
+    /// Pre-fill is `0` for every slot; cells inside the `bh4 * bw4`
+    /// footprint of a §5.11.46 decoded block carry the sorted palette
+    /// entries (range `0..(1 << BitDepth)`); slots `idx >=
+    /// palette_sizes()[ … ]` stay at `0`.
+    #[must_use]
+    pub fn palette_colors(&self) -> &[u16] {
+        &self.palette_colors
+    }
+
+    /// Helper to read `PaletteSizes[ plane ][ r ][ c ]` for the
+    /// §5.11.49 `get_palette_cache` neighbour-walk. Returns `0` for
+    /// out-of-grid coordinates (the §5.11.49 `aboveN = 0` / `leftN = 0`
+    /// "no palette available" fallback).
+    #[inline]
+    fn palette_size_at(&self, plane: usize, r: i32, c: i32) -> u8 {
+        debug_assert!(plane < 3, "PaletteSizes plane must be 0, 1 or 2");
+        if r < 0 || c < 0 {
+            return 0;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        self.palette_sizes[plane * area + (r as usize) * (self.mi_cols as usize) + (c as usize)]
+    }
+
+    /// Helper to read `PaletteColors[ plane ][ r ][ c ][ idx ]` for the
+    /// §5.11.49 `get_palette_cache` neighbour-walk. Returns `0` for
+    /// out-of-grid coordinates / out-of-range `idx` (the spec gates
+    /// these reads behind `aboveIdx < aboveN` / `leftIdx < leftN`, so
+    /// the fallback value is unobservable on the conformant path).
+    #[inline]
+    fn palette_color_at(&self, plane: usize, r: i32, c: i32, idx: usize) -> u16 {
+        debug_assert!(plane < 3, "PaletteColors plane must be 0, 1 or 2");
+        debug_assert!(
+            idx < PALETTE_COLORS,
+            "palette idx must be in 0..PALETTE_COLORS"
+        );
+        if r < 0 || c < 0 {
+            return 0;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        let cell = plane * area + (r as usize) * (self.mi_cols as usize) + (c as usize);
+        self.palette_colors[cell * PALETTE_COLORS + idx]
+    }
+
+    /// `get_palette_cache( plane )` per §5.11.49 (av1-spec p.99) — the
+    /// merged-and-deduplicated cache of the above + left neighbour
+    /// palettes for the block anchored at `(mi_row, mi_col)`. Returns
+    /// the number `n` of cache entries written (`0..=2 * PALETTE_COLORS
+    /// = 16`); the entries themselves are written into the first `n`
+    /// slots of the caller-supplied `cache` buffer in ascending order
+    /// (the spec's `PaletteCache[ n ]` writes).
+    ///
+    /// ```text
+    ///   get_palette_cache( plane ) {
+    ///       aboveN = 0
+    ///       if ( ( MiRow * MI_SIZE ) % 64 ) {
+    ///           aboveN = PaletteSizes[ plane ][ MiRow - 1 ][ MiCol ]
+    ///       }
+    ///       leftN = 0
+    ///       if ( AvailL ) {
+    ///           leftN = PaletteSizes[ plane ][ MiRow ][ MiCol - 1 ]
+    ///       }
+    ///       … walk above + left palettes in ascending order …
+    ///       return n
+    ///   }
+    /// ```
+    ///
+    /// The `(MiRow * MI_SIZE) % 64` gate suppresses the above-neighbour
+    /// read at superblock-top boundaries (the §5.11.49 spec body's
+    /// "above is unavailable at the top of a 64×64-aligned superblock"
+    /// derivation). `AvailL` is the standard left-availability gate
+    /// (`mi_col > 0` for an mi-aligned tile-start fixture; this method
+    /// gates on `mi_col > 0` only — callers operating inside a tile
+    /// with `mi_col_start > 0` should consult the tile geometry for the
+    /// full availability check, but the cache read still returns
+    /// correct entries because `palette_size_at` returns 0 for any
+    /// unwritten cell).
+    ///
+    /// The neighbour palettes are already in ascending order (the
+    /// §5.11.46 `sort()` invariant); the merge walks them with a
+    /// classic two-pointer sort and de-dupe against the most-recently-
+    /// written cache entry (`n == 0 || val != PaletteCache[ n - 1 ]`).
+    ///
+    /// The `cache` buffer must hold at least `2 * PALETTE_COLORS = 16`
+    /// entries — callers should pass a fixed-size buffer.
+    #[must_use]
+    pub fn get_palette_cache(
+        &self,
+        plane: usize,
+        mi_row: u32,
+        mi_col: u32,
+        cache: &mut [u16; 2 * PALETTE_COLORS],
+    ) -> usize {
+        debug_assert!(plane < 3, "plane must be 0, 1 or 2");
+        // §5.11.49 `aboveN = 0; if ((MiRow * MI_SIZE) % 64) aboveN =
+        // PaletteSizes[plane][MiRow - 1][MiCol]`. MI_SIZE = 4 so
+        // `MiRow * 4 % 64` simplifies to `MiRow % 16`.
+        let above_n: usize = if mi_row > 0 && ((mi_row as usize) * MI_SIZE) % 64 != 0 {
+            self.palette_size_at(plane, mi_row as i32 - 1, mi_col as i32) as usize
+        } else {
+            0
+        };
+        // §5.11.49 `leftN = 0; if (AvailL) leftN = PaletteSizes[plane][MiRow][MiCol - 1]`.
+        // `AvailL` ⇔ `mi_col > 0` for a tile-start block; callers in
+        // mid-tile read 0 from out-of-grid coordinates here so the
+        // fallback is the spec-correct identity.
+        let left_n: usize = if mi_col > 0 {
+            self.palette_size_at(plane, mi_row as i32, mi_col as i32 - 1) as usize
+        } else {
+            0
+        };
+        let mut above_idx: usize = 0;
+        let mut left_idx: usize = 0;
+        let mut n: usize = 0;
+        // §5.11.49 two-pointer merge with de-dupe against the previous
+        // cache entry.
+        while above_idx < above_n && left_idx < left_n {
+            let above_c = self.palette_color_at(plane, mi_row as i32 - 1, mi_col as i32, above_idx);
+            let left_c = self.palette_color_at(plane, mi_row as i32, mi_col as i32 - 1, left_idx);
+            if left_c < above_c {
+                if n == 0 || left_c != cache[n - 1] {
+                    cache[n] = left_c;
+                    n += 1;
+                }
+                left_idx += 1;
+            } else {
+                if n == 0 || above_c != cache[n - 1] {
+                    cache[n] = above_c;
+                    n += 1;
+                }
+                above_idx += 1;
+                if left_c == above_c {
+                    left_idx += 1;
+                }
+            }
+        }
+        // §5.11.49 above-tail: drain any remaining above entries.
+        while above_idx < above_n {
+            let val = self.palette_color_at(plane, mi_row as i32 - 1, mi_col as i32, above_idx);
+            above_idx += 1;
+            if n == 0 || val != cache[n - 1] {
+                cache[n] = val;
+                n += 1;
+            }
+        }
+        // §5.11.49 left-tail: drain any remaining left entries.
+        while left_idx < left_n {
+            let val = self.palette_color_at(plane, mi_row as i32, mi_col as i32 - 1, left_idx);
+            left_idx += 1;
+            if n == 0 || val != cache[n - 1] {
+                cache[n] = val;
+                n += 1;
+            }
+        }
+        n
     }
 
     /// View of the §6.10.4 `SegmentIds[]` grid after the walk. Indexed
@@ -15054,11 +15285,22 @@ impl PartitionWalker {
         subsampling_x: bool,
         subsampling_y: bool,
         // §8.3.2 `has_palette_y` neighbour ctx booleans (`true` iff
-        // the corresponding neighbour block has a non-empty Y palette;
-        // the walker doesn't yet track `PaletteSizes[][]`, so pass
-        // `false / false` for a fresh-state run):
+        // the corresponding neighbour block has a non-empty Y palette).
+        // Callers operating at a tile-start mi-aligned block with no
+        // pre-existing palette state pass `false / false` (the spec
+        // identity for unavailable neighbours).
         above_palette_y: bool,
         left_palette_y: bool,
+        // §5.11.46 / §6.7.2 `BitDepth` — the sequence-header bit-depth
+        // (8 / 10 / 12) the `L(BitDepth)` palette-entry literals + the
+        // §5.11.46 `minBits = BitDepth - 3` / `minBits = BitDepth - 4`
+        // derivations consume. Must be one of 8 / 10 / 12 per §5.5.2
+        // `color_config()` (`bit_depth = 8 + bitDepthBoolean ? 2 : 0`
+        // with the 12-bit conditional). The §5.11.46 palette gate
+        // is reached only on `allow_screen_content_tools == true`
+        // blocks, so callers without a real bit-depth still pass 8 on
+        // gate-off blocks (the value is unobserved).
+        bit_depth: u8,
     ) -> Result<DecodedIntraBlockModeInfo, crate::Error> {
         // §5.11.22 caller-bug guards: every inner method re-checks
         // its own bounds, but failing fast at the dispatcher keeps
@@ -15067,6 +15309,15 @@ impl PartitionWalker {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
         if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.46 caller-bug guard on `bit_depth`. The §5.5.2
+        // `color_config()` constrains `bit_depth` to one of 8 / 10 / 12.
+        // The §5.11.46 palette gate (`allow_screen_content_tools`) is
+        // checked first below; on the gate-off path `bit_depth` is not
+        // consulted, so reject invalid values here as a caller-bug
+        // signal regardless of the gate.
+        if !matches!(bit_depth, 8 | 10 | 12) {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
@@ -15248,23 +15499,19 @@ impl PartitionWalker {
         }
 
         // §5.11.22 lines 11-12: `PaletteSizeY = 0, PaletteSizeUV = 0`.
-        // The §5.11.46 inner arms overwrite `palette_size_y` to a
-        // non-zero value when `has_palette_y == 1` — but in that case
-        // the function returns `Err(PaletteEntriesUnsupported)`
-        // immediately (the §5.11.46 palette-entries reads are a
-        // subsequent arc). On the conformant success path
-        // `palette_size_y == 0` always, so the §5.11.24 outer-gate
+        // The §5.11.46 inner arms overwrite the locals when the
+        // luma / chroma `has_palette_*` arm fires; on every other
+        // success-path branch they stay at 0 so the §5.11.24 outer-gate
         // `PaletteSizeY == 0` check below trivially passes.
-        // `palette_size_*_out` therefore stays `None` on every
-        // success-path return (matching the surfaced "value not
-        // observed by §5.11.22 lines 11-12 fall-through" semantics
-        // documented on [`DecodedIntraBlockModeInfo::palette_size_y`]
-        // / `palette_size_uv`).
         let mut palette_size_y: u32 = 0;
+        let mut palette_size_uv: u32 = 0;
         let mut has_palette_y_out: Option<u8> = None;
-        let palette_size_y_out: Option<u8> = None;
+        let mut palette_size_y_out: Option<u8> = None;
+        let mut palette_colors_y_out: Option<[u16; PALETTE_COLORS]> = None;
         let mut has_palette_uv_out: Option<u8> = None;
-        let palette_size_uv_out: Option<u8> = None;
+        let mut palette_size_uv_out: Option<u8> = None;
+        let mut palette_colors_u_out: Option<[u16; PALETTE_COLORS]> = None;
+        let mut palette_colors_v_out: Option<[u16; PALETTE_COLORS]> = None;
 
         // §5.11.22 line 13-15: `palette_mode_info( )` outer gate.
         // `MiSize >= BLOCK_8X8 && Block_Width <= 64 && Block_Height
@@ -15317,27 +15564,30 @@ impl PartitionWalker {
                         "S() over Default_Palette_Y_Size_Cdf yields 0..PALETTE_SIZES"
                     );
                     palette_size_y = minus_2 + 2;
-                    // §5.11.46 follows with the palette-entries reads
-                    // (`palette_colors_y[]` via L(1) / L(BitDepth) /
-                    // L(2) literals + L(paletteBits) deltas). Those
-                    // need parser-scope BitDepth + PaletteCache[]
-                    // plumbing the walker doesn't yet track — surface
-                    // the gap to the caller. The decoded
-                    // `palette_size_y` value is consumed by the §8.3
-                    // adaptation update inside `read_symbol`; we
-                    // surface neither it nor the partial aggregate
-                    // since the §5.11.46 spec body is contractually
-                    // mid-update at the point of the missing reads.
-                    let _ = palette_size_y;
-                    return Err(crate::Error::PaletteEntriesUnsupported);
+                    palette_size_y_out = Some(palette_size_y as u8);
+                    // §5.11.46 palette_colors_y[] reads — §5.11.49
+                    // cache merge + cache-coded indices + new-color
+                    // literal + delta loop. Decoded entries are sorted
+                    // in ascending order and committed to
+                    // `palette_colors_y_out` + the walker grid.
+                    let entries = read_palette_entries_y(
+                        decoder,
+                        bit_depth,
+                        palette_size_y as usize,
+                        self,
+                        mi_row,
+                        mi_col,
+                    )?;
+                    palette_colors_y_out = Some(entries);
                 }
             }
 
             // §5.11.46 chroma arm: `if ( HasChroma && UVMode ==
             // DC_PRED )`. DC_PRED = 0. The chroma arm reads
-            // `palette_size_y_minus_2` against a `bsizeCtx`-keyed row
+            // `palette_size_uv_minus_2` against a `bsizeCtx`-keyed row
             // — the §8.3.2 chroma `bsizeCtx` is the SAME `bsizeCtx`
-            // derived from `MiSize` above.
+            // derived from `MiSize` above. The chroma `has_palette_uv`
+            // ctx is `(PaletteSizeY > 0) ? 1 : 0` per [`palette_uv_mode_ctx`].
             if has_chroma && uv_mode_out == Some(0) {
                 let ctx_uv = palette_uv_mode_ctx(palette_size_y as usize);
                 let row = cdfs.palette_uv_mode_cdf(ctx_uv);
@@ -15354,8 +15604,82 @@ impl PartitionWalker {
                         (minus_2 as usize) < PALETTE_SIZES,
                         "S() over Default_Palette_Uv_Size_Cdf yields 0..PALETTE_SIZES"
                     );
-                    let _palette_size_uv = minus_2 + 2;
-                    return Err(crate::Error::PaletteEntriesUnsupported);
+                    palette_size_uv = minus_2 + 2;
+                    palette_size_uv_out = Some(palette_size_uv as u8);
+                    // §5.11.46 palette_colors_u[] + palette_colors_v[]
+                    // reads — both planes share the same PaletteSizeUV.
+                    // U uses the same cache + literal + delta path as Y
+                    // (Y plane minus the `delta++` step per spec). V
+                    // uses either `delta_encode_palette_colors_v == 1`
+                    // (signed delta with sign bit + modular wrap +
+                    // Clip1, NO trailing sort) or `== 0` (PaletteSizeUV
+                    // direct L(BitDepth) literals).
+                    let (entries_u, entries_v) = read_palette_entries_uv(
+                        decoder,
+                        bit_depth,
+                        palette_size_uv as usize,
+                        self,
+                        mi_row,
+                        mi_col,
+                    )?;
+                    palette_colors_u_out = Some(entries_u);
+                    palette_colors_v_out = Some(entries_v);
+                }
+            }
+        }
+
+        // §5.11.46 / §5.11.49 grid-fill: stamp `PaletteSizes[plane][r +
+        // y][c + x] = PaletteSize{Y,UV}` and `PaletteColors[plane][r +
+        // y][c + x][..] = palette_colors_{y,u,v}[..]` over the
+        // `bh4 * bw4` footprint so subsequent §5.11.49
+        // `get_palette_cache(plane)` neighbour reads observe the
+        // decoded palette state. Stamping happens regardless of the
+        // luma / chroma arm firing because the §5.11.22 lines 11-12
+        // initialisers say `PaletteSizeY = 0` / `PaletteSizeUV = 0`
+        // when no arm fires — and the constructor already zero-filled
+        // every cell, so stamping zeroes back is a no-op on those
+        // cases (we only stamp non-zero entries).
+        if palette_size_y > 0 || palette_size_uv > 0 {
+            let bw4_pal = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+            let bh4_pal = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+            let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+            for dr in 0..bh4_pal {
+                let rr = mi_row + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4_pal {
+                    let cc = mi_col + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    let cell = (rr as usize) * (self.mi_cols as usize) + (cc as usize);
+                    // Luma plane.
+                    if let Some(entries) = palette_colors_y_out {
+                        self.palette_sizes[cell] = palette_size_y as u8;
+                        let base = cell * PALETTE_COLORS;
+                        for (i, &v) in entries.iter().enumerate().take(PALETTE_COLORS) {
+                            self.palette_colors[base + i] = v;
+                        }
+                    }
+                    // U plane.
+                    if let Some(entries) = palette_colors_u_out {
+                        let plane_cell = area + cell;
+                        self.palette_sizes[plane_cell] = palette_size_uv as u8;
+                        let base = plane_cell * PALETTE_COLORS;
+                        for (i, &v) in entries.iter().enumerate().take(PALETTE_COLORS) {
+                            self.palette_colors[base + i] = v;
+                        }
+                    }
+                    // V plane.
+                    if let Some(entries) = palette_colors_v_out {
+                        let plane_cell = 2 * area + cell;
+                        self.palette_sizes[plane_cell] = palette_size_uv as u8;
+                        let base = plane_cell * PALETTE_COLORS;
+                        for (i, &v) in entries.iter().enumerate().take(PALETTE_COLORS) {
+                            self.palette_colors[base + i] = v;
+                        }
+                    }
                 }
             }
         }
@@ -15402,8 +15726,11 @@ impl PartitionWalker {
             angle_delta_uv: angle_delta_uv_out,
             has_palette_y: has_palette_y_out,
             palette_size_y: palette_size_y_out,
+            palette_colors_y: palette_colors_y_out,
             has_palette_uv: has_palette_uv_out,
             palette_size_uv: palette_size_uv_out,
+            palette_colors_u: palette_colors_u_out,
+            palette_colors_v: palette_colors_v_out,
             use_filter_intra: use_filter_intra_out,
             filter_intra_mode: filter_intra_mode_out,
         })
@@ -17356,6 +17683,284 @@ impl PartitionWalker {
     }
 }
 
+/// `palette_colors_y[]` reader per §5.11.46 (av1-spec p.97) — the Y
+/// plane palette-entries syntax sub-block. Reached from the §5.11.46
+/// luma arm when `YMode == DC_PRED && has_palette_y == 1`. The reader
+/// composes:
+///
+/// 1. `cacheN = get_palette_cache( 0 )` (§5.11.49) — the merged +
+///    deduplicated above + left luma palette in ascending order.
+/// 2. The cache-coded indices loop:
+///    `for ( i = 0; i < cacheN && idx < PaletteSizeY; i++ ) { ` …
+///    `use_palette_color_cache_y L(1)`; if set, copy `PaletteCache[i]`
+///    into `palette_colors_y[idx++]`.
+/// 3. The first "new" entry (if `idx < PaletteSizeY`) is an
+///    `L(BitDepth)` literal.
+/// 4. The optional `L(2) palette_num_extra_bits_y` (when at least one
+///    more entry remains).
+/// 5. The delta loop — `L(paletteBits) palette_delta_y`, incremented
+///    by 1, then setting `palette_colors_y[idx]` to
+///    `Clip1(palette_colors_y[idx - 1] + palette_delta_y)` and
+///    refining `paletteBits` via the spec's `CeilLog2` of the residual
+///    range.
+/// 6. `sort( palette_colors_y, 0, PaletteSizeY - 1 )` (ascending) — the
+///    Y plane always sorts the final array per §5.11.46 (cache-coded
+///    entries are extracted from an already-sorted cache, but the new
+///    entries can interleave with them — the merge requires a sort).
+///
+/// Returns a fixed-size `[u16; PALETTE_COLORS]` with the first
+/// `palette_size_y` slots carrying the sorted palette entries; the
+/// remaining slots are 0.
+///
+/// Reads neighbour state via `walker.get_palette_cache(0, mi_row,
+/// mi_col, …)` — the caller's walker must have the §5.11.46 luma arm
+/// of any preceding decoded blocks committed into its `PaletteSizes` /
+/// `PaletteColors` grids.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_palette_entries_y(
+    decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+    bit_depth: u8,
+    palette_size_y: usize,
+    walker: &PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<[u16; PALETTE_COLORS], crate::Error> {
+    debug_assert!(
+        matches!(bit_depth, 8 | 10 | 12),
+        "§5.5.2 bit_depth must be 8 / 10 / 12"
+    );
+    debug_assert!(
+        (2..=PALETTE_COLORS).contains(&palette_size_y),
+        "§5.11.46 PaletteSizeY must be in 2..=PALETTE_COLORS"
+    );
+    let bd = bit_depth as u32;
+    let max_val: u32 = 1u32 << bd;
+    let mut palette_colors_y = [0u16; PALETTE_COLORS];
+    // §5.11.49 cache.
+    let mut cache_buf = [0u16; 2 * PALETTE_COLORS];
+    let cache_n = walker.get_palette_cache(0, mi_row, mi_col, &mut cache_buf);
+    // §5.11.46 cache-coded indices loop.
+    let mut idx: usize = 0;
+    {
+        let mut i = 0usize;
+        while i < cache_n && idx < palette_size_y {
+            let use_cache = decoder.read_literal(1)?;
+            if use_cache != 0 {
+                palette_colors_y[idx] = cache_buf[i];
+                idx += 1;
+            }
+            i += 1;
+        }
+    }
+    // §5.11.46 first "new" entry as L(BitDepth) literal.
+    if idx < palette_size_y {
+        let v = decoder.read_literal(bd)?;
+        palette_colors_y[idx] = v as u16;
+        idx += 1;
+    }
+    // §5.11.46 paletteBits derivation (only when entries remain).
+    let mut palette_bits: u32 = 0;
+    if idx < palette_size_y {
+        // §5.11.46: `minBits = BitDepth - 3`. The §3 bit-depth
+        // enumeration starts at 8, so `minBits >= 5 > 0`.
+        let min_bits = bd - 3;
+        let extra = decoder.read_literal(2)?;
+        palette_bits = min_bits + extra;
+    }
+    // §5.11.46 delta loop — `palette_delta_y++` then Clip1(prev +
+    // delta), `range = (1 << BitDepth) - palette_colors_y[idx] - 1`,
+    // `paletteBits = Min(paletteBits, CeilLog2(range))`.
+    while idx < palette_size_y {
+        let delta_raw = decoder.read_literal(palette_bits)?;
+        let delta = delta_raw + 1;
+        let prev = palette_colors_y[idx - 1] as u32;
+        let v = clip1_to_bit_depth(prev + delta, bd);
+        palette_colors_y[idx] = v as u16;
+        // §5.11.46 paletteBits refinement: `range = (1 << BitDepth) -
+        // palette_colors_y[idx] - 1`. If range becomes 0 the next
+        // iteration's L(paletteBits) read becomes L(0) (zero bits), at
+        // which point any remaining `delta_raw == 0` plus the `+ 1`
+        // brings the next color to `v + 1` after Clip1 — but the spec
+        // gates this through CeilLog2 (defined to return 0 on 0).
+        let v_u32 = v;
+        let range = max_val.saturating_sub(v_u32).saturating_sub(1);
+        palette_bits = palette_bits.min(ceil_log2_av1(range));
+        idx += 1;
+    }
+    // §5.11.46 trailing sort over the populated entries (ascending).
+    palette_colors_y[..palette_size_y].sort_unstable();
+    Ok(palette_colors_y)
+}
+
+/// `palette_colors_u[]` + `palette_colors_v[]` reader per §5.11.46
+/// (av1-spec p.97-98) — the UV-plane palette-entries syntax sub-block.
+/// Reached from the §5.11.46 chroma arm when `HasChroma && UVMode ==
+/// DC_PRED && has_palette_uv == 1`. Both U and V planes share the same
+/// `PaletteSizeUV` (the §5.11.46 spec body reads it once).
+///
+/// The U plane mirrors the §5.11.46 Y reader minus the
+/// `palette_delta_y++` step (the spec literally writes
+/// `palette_colors_u[idx] = Clip1(palette_colors_u[idx - 1] +
+/// palette_delta_u)` without the `++`) and minus the `- 1` on the
+/// range derivation (`range = (1 << BitDepth) - palette_colors_u[idx]`
+/// vs Y's `… - 1`).
+///
+/// The V plane has a distinct two-arm structure gated on
+/// `delta_encode_palette_colors_v L(1)`:
+///
+/// * On `delta_encode_palette_colors_v == 1`:
+///   - `minBits = BitDepth - 4`
+///   - `maxVal = 1 << BitDepth`
+///   - `L(2) palette_num_extra_bits_v`; `paletteBits = minBits + extra`
+///   - `L(BitDepth) palette_colors_v[ 0 ]`
+///   - For `idx = 1..PaletteSizeUV`: `L(paletteBits) palette_delta_v`;
+///     on non-zero, read `L(1) palette_delta_sign_bit_v` and negate;
+///     `val = palette_colors_v[idx - 1] + palette_delta_v`; modular
+///     wrap to `[0, maxVal)`; `palette_colors_v[idx] = Clip1(val)`.
+/// * On `delta_encode_palette_colors_v == 0`:
+///   - `for idx = 0..PaletteSizeUV: palette_colors_v[idx] L(BitDepth)`
+///
+/// The V plane is **not** sorted after decode — the §5.11.46 spec body
+/// omits the trailing `sort()` call that Y and U apply.
+///
+/// Returns a `(u, v)` tuple, each a `[u16; PALETTE_COLORS]` with the
+/// first `palette_size_uv` slots carrying the decoded entries.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_palette_entries_uv(
+    decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+    bit_depth: u8,
+    palette_size_uv: usize,
+    walker: &PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<([u16; PALETTE_COLORS], [u16; PALETTE_COLORS]), crate::Error> {
+    debug_assert!(
+        matches!(bit_depth, 8 | 10 | 12),
+        "§5.5.2 bit_depth must be 8 / 10 / 12"
+    );
+    debug_assert!(
+        (2..=PALETTE_COLORS).contains(&palette_size_uv),
+        "§5.11.46 PaletteSizeUV must be in 2..=PALETTE_COLORS"
+    );
+    let bd = bit_depth as u32;
+    let max_val: u32 = 1u32 << bd;
+    // -------- U plane --------
+    let mut palette_colors_u = [0u16; PALETTE_COLORS];
+    let mut cache_buf = [0u16; 2 * PALETTE_COLORS];
+    let cache_n = walker.get_palette_cache(1, mi_row, mi_col, &mut cache_buf);
+    let mut idx: usize = 0;
+    {
+        let mut i = 0usize;
+        while i < cache_n && idx < palette_size_uv {
+            let use_cache = decoder.read_literal(1)?;
+            if use_cache != 0 {
+                palette_colors_u[idx] = cache_buf[i];
+                idx += 1;
+            }
+            i += 1;
+        }
+    }
+    if idx < palette_size_uv {
+        let v = decoder.read_literal(bd)?;
+        palette_colors_u[idx] = v as u16;
+        idx += 1;
+    }
+    let mut palette_bits: u32 = 0;
+    if idx < palette_size_uv {
+        let min_bits = bd - 3;
+        let extra = decoder.read_literal(2)?;
+        palette_bits = min_bits + extra;
+    }
+    // §5.11.46 U-plane delta loop. Note the spec differences vs Y:
+    //   - NO `palette_delta_u++` (Y has `palette_delta_y++` before
+    //     adding to the previous entry).
+    //   - `range = (1 << BitDepth) - palette_colors_u[idx]` (Y has
+    //     `… - 1` at the end).
+    while idx < palette_size_uv {
+        let delta = decoder.read_literal(palette_bits)?;
+        let prev = palette_colors_u[idx - 1] as u32;
+        let v = clip1_to_bit_depth(prev + delta, bd);
+        palette_colors_u[idx] = v as u16;
+        let range = max_val.saturating_sub(v);
+        palette_bits = palette_bits.min(ceil_log2_av1(range));
+        idx += 1;
+    }
+    palette_colors_u[..palette_size_uv].sort_unstable();
+    // -------- V plane --------
+    let mut palette_colors_v = [0u16; PALETTE_COLORS];
+    let delta_encode_v = decoder.read_literal(1)?;
+    if delta_encode_v != 0 {
+        // §5.11.46 V-plane delta-encoded arm.
+        let min_bits_v = bd - 4;
+        let extra_v = decoder.read_literal(2)?;
+        let palette_bits_v = min_bits_v + extra_v;
+        let first = decoder.read_literal(bd)?;
+        palette_colors_v[0] = first as u16;
+        for i in 1..palette_size_uv {
+            let raw = decoder.read_literal(palette_bits_v)?;
+            let signed_delta: i32 = if raw != 0 {
+                let sign_bit = decoder.read_literal(1)?;
+                if sign_bit != 0 {
+                    -(raw as i32)
+                } else {
+                    raw as i32
+                }
+            } else {
+                0
+            };
+            let prev_v = palette_colors_v[i - 1] as i32;
+            let mut val = prev_v + signed_delta;
+            // §5.11.46 V-plane modular wrap into [0, maxVal).
+            if val < 0 {
+                val += max_val as i32;
+            }
+            if val >= max_val as i32 {
+                val -= max_val as i32;
+            }
+            // §5.11.46: `palette_colors_v[idx] = Clip1(val)`. After the
+            // wrap `val` is in `[0, maxVal)` so Clip1 is the identity;
+            // we apply it anyway to match the spec literal form.
+            let clipped = clip1_to_bit_depth(val as u32, bd);
+            palette_colors_v[i] = clipped as u16;
+        }
+        // The §5.11.46 spec body does NOT sort the V plane after the
+        // delta-encoded read — preserve source order.
+    } else {
+        // §5.11.46 V-plane direct-literal arm.
+        for slot in palette_colors_v.iter_mut().take(palette_size_uv) {
+            let v = decoder.read_literal(bd)?;
+            *slot = v as u16;
+        }
+    }
+    Ok((palette_colors_u, palette_colors_v))
+}
+
+/// `Clip1( x )` per §4.7 — clamp `x` to `[0, (1 << BitDepth) - 1]`.
+#[inline]
+fn clip1_to_bit_depth(x: u32, bit_depth: u32) -> u32 {
+    let max_val: u32 = (1u32 << bit_depth) - 1;
+    if x > max_val {
+        max_val
+    } else {
+        x
+    }
+}
+
+/// `CeilLog2( x )` per §4.7.
+///
+/// Defined to return 0 when `x == 0` or `x == 1`. Otherwise the
+/// smallest integer `i` such that `2.pow(i) >= x` (i.e. the number of
+/// bits needed to code a value in `0..x`).
+#[inline]
+fn ceil_log2_av1(x: u32) -> u32 {
+    if x < 2 {
+        return 0;
+    }
+    // x.next_power_of_two() returns the smallest 2^i >= x; trailing_zeros
+    // of that is i.
+    x.next_power_of_two().trailing_zeros()
+}
+
 /// Result of [`PartitionWalker::decode_intra_frame_mode_info_prefix`]
 /// — the per-block state §5.11.7 produces through the
 /// `read_delta_lf( )` line. Carries the outputs of the composed leaf
@@ -17625,6 +18230,14 @@ pub struct DecodedIntraBlockModeInfo {
     /// then leaves `PaletteSizeY = 0` from §5.11.22 line 11). When
     /// present, in `2..=PALETTE_COLORS = 8`.
     pub palette_size_y: Option<u8>,
+    /// §5.11.46 `palette_colors_y[]` — the sorted ascending palette
+    /// entries for the Y plane. `None` when `has_palette_y` was not
+    /// read or was `0`. When present, the first `palette_size_y.unwrap()`
+    /// slots carry the decoded entries (each in `0..(1 << BitDepth)`);
+    /// remaining slots are zeroed. The §5.11.46 spec body sorts the
+    /// final array in ascending order; this field carries the sorted
+    /// result.
+    pub palette_colors_y: Option<[u16; PALETTE_COLORS]>,
     /// §5.11.46 `has_palette_uv`. `None` when the §5.11.46 spec body's
     /// `HasChroma && UVMode == DC_PRED` gate is false; otherwise
     /// `Some(0)` / `Some(1)`.
@@ -17633,6 +18246,25 @@ pub struct DecodedIntraBlockModeInfo {
     /// when `has_palette_uv` was not read or was `0`. When present, in
     /// `2..=PALETTE_COLORS = 8`.
     pub palette_size_uv: Option<u8>,
+    /// §5.11.46 `palette_colors_u[]` — the sorted ascending palette
+    /// entries for the U chroma plane. `None` when `has_palette_uv`
+    /// was not read or was `0`. When present, the first
+    /// `palette_size_uv.unwrap()` slots carry the decoded entries
+    /// (each in `0..(1 << BitDepth)`); remaining slots are zeroed. The
+    /// §5.11.46 U-plane spec body sorts the array in ascending order;
+    /// this field carries the sorted result.
+    pub palette_colors_u: Option<[u16; PALETTE_COLORS]>,
+    /// §5.11.46 `palette_colors_v[]` — the palette entries for the V
+    /// chroma plane. `None` when `has_palette_uv` was not read or was
+    /// `0`. When present, the first `palette_size_uv.unwrap()` slots
+    /// carry the decoded entries (each in `0..(1 << BitDepth)`);
+    /// remaining slots are zeroed. **Not sorted.** The §5.11.46 V-plane
+    /// spec body omits the final `sort()` step the Y and U planes
+    /// apply; the V plane carries either the `delta_encode_palette_colors_v
+    /// == 1` signed-delta result (with `Clip1` + modular wrap on
+    /// `(prev + signed_delta) % maxVal`) or the `== 0` direct
+    /// L(BitDepth) literals (in source order).
+    pub palette_colors_v: Option<[u16; PALETTE_COLORS]>,
     /// §5.11.24 `use_filter_intra` flag. `None` when the §5.11.24
     /// outer gate (`enable_filter_intra && YMode == DC_PRED &&
     /// PaletteSizeY == 0 && Max(Block_Width, Block_Height) <= 32`) is
@@ -30454,21 +31086,22 @@ mod tests {
                 false,
                 false,
                 false,
-                false
+                false,
+                8,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         assert!(matches!(
             walker.decode_intra_block_mode_info(
                 &mut dec, &mut cdfs, 32, 0, BLOCK_4X4, false, true, false, false, false, false,
-                false, false
+                false, false, 8,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
         assert!(matches!(
             walker.decode_intra_block_mode_info(
                 &mut dec, &mut cdfs, 0, 32, BLOCK_4X4, false, true, false, false, false, false,
-                false, false
+                false, false, 8,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
@@ -30516,6 +31149,7 @@ mod tests {
                 /* subsampling_y = */ false,
                 /* above_palette_y = */ false,
                 /* left_palette_y = */ false,
+                /* bit_depth = */ 8,
             )
             .unwrap();
         assert_eq!(info.y_mode, 0, "rigged y_mode = DC_PRED");
@@ -30578,6 +31212,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         let pos_after = dec.position();
@@ -30624,6 +31259,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         assert_eq!(info.angle_delta_y, 0, "DC_PRED → §5.11.42 short-circuit");
@@ -30645,7 +31281,7 @@ mod tests {
         let info = walker
             .decode_intra_block_mode_info(
                 &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, false, false, false, false, false, false,
-                false, false,
+                false, false, 8,
             )
             .unwrap();
         assert_eq!(info.y_mode, V_PRED as u8);
@@ -30682,6 +31318,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         assert_eq!(info.has_palette_y, None);
@@ -30718,6 +31355,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         // Luma palette arm short-circuited (YMode != DC_PRED).
@@ -30748,6 +31386,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         assert_eq!(info.use_filter_intra, None);
@@ -30780,6 +31419,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         assert_eq!(info.use_filter_intra, None);
@@ -30811,6 +31451,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         assert_eq!(info.use_filter_intra, None);
@@ -30828,7 +31469,7 @@ mod tests {
         let info = walker
             .decode_intra_block_mode_info(
                 &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, false, false, false, false, false,
-                false, false,
+                false, false, 8,
             )
             .unwrap();
         assert_eq!(info.ref_frame, [0, -1]);
@@ -30847,7 +31488,7 @@ mod tests {
             .decode_intra_block_mode_info(
                 &mut dec, &mut cdfs, /* mi_row = */ 2, /* mi_col = */ 2,
                 /* sub_size = */ BLOCK_8X8, false, false, false, false, false, false, false,
-                false,
+                false, 8,
             )
             .unwrap();
         // BLOCK_8X8 footprint is 2x2 mi cells anchored at (2,2);
@@ -30888,6 +31529,7 @@ mod tests {
                 false,
                 false,
                 false,
+                8,
             )
             .unwrap();
         let bw4 = NUM_4X4_BLOCKS_WIDE[BLOCK_16X16] as u32;
@@ -30944,9 +31586,343 @@ mod tests {
     }
 
     // ===================================================================
-    // r170 — §5.11.23 `decode_inter_block_mode_info` + §5.11.25
-    // `read_ref_frames` + §8.3.2 ref-frame ctx helpers.
+    // r171 — §5.11.46 palette_colors_y[] / _u[] / _v[] readers +
+    // §5.11.49 get_palette_cache() merge. The §5.11.22 wrapper now
+    // accepts `bit_depth` and stamps `PaletteSizes` / `PaletteColors`
+    // grids on the success path; `PaletteEntriesUnsupported` is no
+    // longer returned by the conformant code path.
     // ===================================================================
+
+    /// Sanity test for the `rigged_row(1)` convention against a 3-wide
+    /// (binary) CDF: forcing symbol=1 should decode the first read of
+    /// the row to 1.
+    #[test]
+    fn rigged_row_binary_one_decodes_one() {
+        let bytes = [0u8; 32];
+        let mut row = rigged_row::<3>(1);
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let s = dec.read_symbol(&mut row).unwrap();
+        assert_eq!(s, 1, "rigged_row(1) on a binary CDF must decode to 1");
+    }
+
+    /// §5.5.2 `bit_depth` caller-bug guard: anything outside {8, 10,
+    /// 12} surfaces `PartitionWalkOutOfRange` before any bit is read.
+    #[test]
+    fn decode_intra_block_mode_info_rejects_bad_bit_depth() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        for bad in [0u8, 7, 9, 11, 13, 16, 255] {
+            assert!(matches!(
+                walker.decode_intra_block_mode_info(
+                    &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, false, false, false, false, false,
+                    false, false, bad,
+                ),
+                Err(crate::Error::PartitionWalkOutOfRange)
+            ));
+        }
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no bit read on the bit_depth-rejection path"
+        );
+    }
+
+    /// §5.11.49 `get_palette_cache(plane)` on a fresh walker: no
+    /// neighbour palettes have been written, so both `aboveN` and
+    /// `leftN` collapse to 0 and the merged cache is empty.
+    #[test]
+    fn get_palette_cache_fresh_walker_returns_empty() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cache = [0u16; 2 * PALETTE_COLORS];
+        for plane in 0..3 {
+            // Even at non-superblock-top mi_row, an unwritten neighbour
+            // returns 0.
+            for mi_row in [0, 1, 4, 8, 16] {
+                for mi_col in [0, 1, 4, 8] {
+                    let n = walker.get_palette_cache(plane, mi_row, mi_col, &mut cache);
+                    assert_eq!(n, 0, "fresh walker has no neighbour palette state");
+                }
+            }
+        }
+    }
+
+    /// §4.7 `Clip1( x )` truth table at 8 / 10 / 12 bits — the helper
+    /// the §5.11.46 delta loop calls. Cumulatively-overflowed inputs
+    /// clamp to `(1 << BitDepth) - 1`.
+    #[test]
+    fn clip1_to_bit_depth_truth_table() {
+        // 8-bit
+        assert_eq!(clip1_to_bit_depth(0, 8), 0);
+        assert_eq!(clip1_to_bit_depth(127, 8), 127);
+        assert_eq!(clip1_to_bit_depth(255, 8), 255);
+        assert_eq!(clip1_to_bit_depth(256, 8), 255);
+        assert_eq!(clip1_to_bit_depth(1 << 20, 8), 255);
+        // 10-bit
+        assert_eq!(clip1_to_bit_depth(0, 10), 0);
+        assert_eq!(clip1_to_bit_depth(512, 10), 512);
+        assert_eq!(clip1_to_bit_depth(1023, 10), 1023);
+        assert_eq!(clip1_to_bit_depth(1024, 10), 1023);
+        // 12-bit
+        assert_eq!(clip1_to_bit_depth(4095, 12), 4095);
+        assert_eq!(clip1_to_bit_depth(4096, 12), 4095);
+    }
+
+    /// §4.7 `CeilLog2( x )` truth table — the helper the §5.11.46
+    /// paletteBits refinement consults. Defined to return 0 on 0 / 1.
+    #[test]
+    fn ceil_log2_av1_truth_table() {
+        assert_eq!(ceil_log2_av1(0), 0);
+        assert_eq!(ceil_log2_av1(1), 0);
+        assert_eq!(ceil_log2_av1(2), 1);
+        assert_eq!(ceil_log2_av1(3), 2);
+        assert_eq!(ceil_log2_av1(4), 2);
+        assert_eq!(ceil_log2_av1(5), 3);
+        assert_eq!(ceil_log2_av1(8), 3);
+        assert_eq!(ceil_log2_av1(9), 4);
+        assert_eq!(ceil_log2_av1(256), 8);
+        assert_eq!(ceil_log2_av1(257), 9);
+        assert_eq!(ceil_log2_av1(1024), 10);
+    }
+
+    /// §5.11.46 happy-path with `has_palette_y == 0` does not enter
+    /// the entry-reads loop; on the conformant path the reader returns
+    /// `Ok` with `has_palette_y = Some(0)` and the entry / size fields
+    /// stay `None`.
+    #[test]
+    fn decode_intra_block_mode_info_has_palette_y_zero_skips_entries() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        // y_mode → DC_PRED.
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0);
+        }
+        // palette_y_mode_cdf is `[3]` per ctx → rig to symbol 0
+        // (`has_palette_y = 0`) for every (bsize, ctx).
+        for bs in cdfs.palette_y_mode.iter_mut() {
+            for row in bs.iter_mut() {
+                *row = rigged_row::<3>(0);
+            }
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                /* has_chroma = */ false,
+                /* allow_screen_content_tools = */ true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.has_palette_y, Some(0));
+        assert_eq!(info.palette_size_y, None);
+        assert_eq!(info.palette_colors_y, None);
+        assert_eq!(walker.palette_sizes()[0], 0, "PaletteSizes[0][0][0] = 0");
+    }
+
+    /// §5.11.46 Y-plane direct-call: with an empty cache (fresh
+    /// walker) and a zero bitstream, `PaletteSizeY = 2` produces
+    /// `palette_colors_y[0] = L(BitDepth) = 0` and `palette_colors_y[1]
+    /// = Clip1(prev=0 + (delta_raw + 1)) = 1` after the Y-specific
+    /// `++` step. After the trailing sort the array stays `[0, 1, …]`.
+    #[test]
+    fn read_palette_entries_y_size_2_zero_bitstream() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let entries = read_palette_entries_y(&mut dec, 8, 2, &walker, 0, 0).unwrap();
+        // entries[0] = L(8) = 0 (zero bitstream); entries[1] = Clip1(0
+        // + (0 + 1)) = 1 with the Y-specific delta++ step. After the
+        // trailing sort the result is [0, 1, 0, …].
+        assert_eq!(entries[0], 0);
+        assert_eq!(entries[1], 1);
+        for &slot in entries.iter().skip(2) {
+            assert_eq!(slot, 0, "unused entry stays 0");
+        }
+    }
+
+    /// §5.11.46 U-plane direct-call: differs from Y by NOT applying
+    /// the `++` to the delta and using `range = (1<<BitDepth) -
+    /// palette_colors_u[idx]` (no `- 1`). With a fresh walker plus
+    /// zero bitstream plus PaletteSizeUV = 2: `u[0] = L(8) = 0`,
+    /// `u[1] = Clip1(0 + 0) = 0` (no ++); sort leaves `[0, 0, …]`.
+    /// Then the V plane reads `delta_encode_palette_colors_v L(1) = 0`
+    /// and takes the direct-literal arm with PaletteSizeUV
+    /// `L(BitDepth)` reads producing zero entries.
+    #[test]
+    fn read_palette_entries_uv_size_2_zero_bitstream_direct_literal_arm() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let (u, v) = read_palette_entries_uv(&mut dec, 8, 2, &walker, 0, 0).unwrap();
+        // U: same shape as Y but no delta++ ⇒ u[0]=0, u[1]=0.
+        assert_eq!(u[0], 0);
+        assert_eq!(u[1], 0);
+        // V: delta_encode_bit = 0 ⇒ direct-literal arm; both L(8) = 0.
+        assert_eq!(v[0], 0);
+        assert_eq!(v[1], 0);
+    }
+
+    /// §5.11.46 grid stamping via direct-call: stamp a luma palette
+    /// into (0, 0) by inserting it directly into the walker's grids,
+    /// then verify `get_palette_cache(0, 0, bw4)` returns the entries
+    /// via the §5.11.49 left-neighbour read.
+    #[test]
+    fn get_palette_cache_left_neighbour_only_via_stamped_grid() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        // Hand-stamp a luma palette into (0, 0): size 3, entries [10,
+        // 50, 200]. We use the public read-only accessors to verify
+        // and the private fields via tests-internal access.
+        let mi_cols = walker.mi_cols() as usize;
+        let area = (walker.mi_rows() as usize) * mi_cols;
+        // (mi_row=0, mi_col=0) ⇒ flat index 0.
+        let cell: usize = 0;
+        let _ = mi_cols;
+        walker.palette_sizes[cell] = 3;
+        walker.palette_colors[cell * PALETTE_COLORS] = 10;
+        walker.palette_colors[cell * PALETTE_COLORS + 1] = 50;
+        walker.palette_colors[cell * PALETTE_COLORS + 2] = 200;
+        // U plane also gets a 2-entry palette so we can verify plane
+        // separation.
+        walker.palette_sizes[area + cell] = 2;
+        walker.palette_colors[(area + cell) * PALETTE_COLORS] = 30;
+        walker.palette_colors[(area + cell) * PALETTE_COLORS + 1] = 70;
+        // Reading from neighbour (0, 1): mi_row=0 ⇒ above gated out
+        // (0 * 4 % 64 = 0); left = (0, 0) palette.
+        let mut cache = [0u16; 2 * PALETTE_COLORS];
+        let n_y = walker.get_palette_cache(0, 0, 1, &mut cache);
+        assert_eq!(n_y, 3);
+        assert_eq!(cache[0], 10);
+        assert_eq!(cache[1], 50);
+        assert_eq!(cache[2], 200);
+        // U plane: 2 entries.
+        let n_u = walker.get_palette_cache(1, 0, 1, &mut cache);
+        assert_eq!(n_u, 2);
+        assert_eq!(cache[0], 30);
+        assert_eq!(cache[1], 70);
+        // V plane: nothing stamped → 0.
+        let n_v = walker.get_palette_cache(2, 0, 1, &mut cache);
+        assert_eq!(n_v, 0);
+    }
+
+    /// §5.11.49 above + left merge with no duplicates: above palette
+    /// `[5, 30]` + left palette `[10, 30, 50]` → merged-deduplicated
+    /// cache `[5, 10, 30, 50]` (the 30 in both lists appears once).
+    #[test]
+    fn get_palette_cache_merge_above_and_left_with_duplicate() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mi_cols = walker.mi_cols() as usize;
+        // Stamp above palette at (mi_row=0, mi_col=1) so that when we
+        // read at (mi_row=1, mi_col=1), the above neighbour is (0, 1)
+        // and mi_row=1 ⇒ 1*4 % 64 = 4 ≠ 0 (above gate open).
+        let above_cell: usize = 1; // (0, 1) ⇒ 0 * mi_cols + 1
+        walker.palette_sizes[above_cell] = 2;
+        walker.palette_colors[above_cell * PALETTE_COLORS] = 5;
+        walker.palette_colors[above_cell * PALETTE_COLORS + 1] = 30;
+        // Stamp left palette at (mi_row=1, mi_col=0).
+        let left_cell: usize = mi_cols;
+        walker.palette_sizes[left_cell] = 3;
+        walker.palette_colors[left_cell * PALETTE_COLORS] = 10;
+        walker.palette_colors[left_cell * PALETTE_COLORS + 1] = 30;
+        walker.palette_colors[left_cell * PALETTE_COLORS + 2] = 50;
+        // Read cache at (1, 1).
+        let mut cache = [0u16; 2 * PALETTE_COLORS];
+        let n = walker.get_palette_cache(0, 1, 1, &mut cache);
+        assert_eq!(n, 4, "deduplicated merge of {{5, 30}} + {{10, 30, 50}}");
+        assert_eq!(cache[0], 5);
+        assert_eq!(cache[1], 10);
+        assert_eq!(cache[2], 30);
+        assert_eq!(cache[3], 50);
+    }
+
+    /// §5.11.49 cache visibility: a hand-stamped left-neighbour
+    /// palette is surfaced by `get_palette_cache`. This isolates the
+    /// §5.11.49 cache-merge path from the §5.11.46 bitstream-driven
+    /// entry reader, which is covered separately by the
+    /// `read_palette_entries_y_size_2_zero_bitstream` test.
+    #[test]
+    fn read_palette_entries_y_cache_visible_via_get_palette_cache() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        // (mi_row=0, mi_col=0) ⇒ flat index 0.
+        let cell: usize = 0;
+        walker.palette_sizes[cell] = 2;
+        walker.palette_colors[cell * PALETTE_COLORS] = 11;
+        walker.palette_colors[cell * PALETTE_COLORS + 1] = 22;
+        // A subsequent block at (0, 1) sees this as the left neighbour
+        // via get_palette_cache.
+        let mut cache = [0u16; 2 * PALETTE_COLORS];
+        let n = walker.get_palette_cache(0, 0, 1, &mut cache);
+        assert_eq!(n, 2);
+        assert_eq!(cache[0], 11);
+        assert_eq!(cache[1], 22);
+    }
+
+    /// §5.11.49 superblock-top boundary suppresses the above-neighbour
+    /// read at `MiRow * MI_SIZE % 64 == 0`. We don't need a populated
+    /// above neighbour to verify the gate — a fresh walker at mi_row =
+    /// 16 (the next superblock top) reads 0 from the gated-out above
+    /// regardless of state.
+    #[test]
+    fn get_palette_cache_superblock_top_suppresses_above() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 64,
+            mi_col_start: 0,
+            mi_col_end: 64,
+        };
+        let walker = PartitionWalker::new(64, 64, geom).unwrap();
+        let mut cache = [0u16; 2 * PALETTE_COLORS];
+        // mi_row = 16: 16 * MI_SIZE (= 4) = 64 → 64 % 64 = 0 → gated.
+        let n_gated = walker.get_palette_cache(0, 16, 8, &mut cache);
+        assert_eq!(n_gated, 0);
+        // mi_row = 17: 17 * 4 = 68 → 68 % 64 = 4 → not gated.
+        let n_open = walker.get_palette_cache(0, 17, 8, &mut cache);
+        assert_eq!(n_open, 0, "fresh walker has no above palette state");
+    }
 
     /// §8.3.2 `check_backward`: BWDREF (5), ALTREF2 (6), ALTREF (7) are
     /// backward; INTRA (0), LAST (1)..GOLDEN (4) are forward; NONE

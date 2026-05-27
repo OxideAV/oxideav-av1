@@ -1813,17 +1813,17 @@ pub enum Error {
     /// before the prologue's bounds check). The §5.11.18 dispatcher no
     /// longer fires it on the conformant path.
     InterBlockModeInfoUnsupported,
-    /// The §5.11.22 [`crate::PartitionWalker::decode_intra_block_mode_info`]
-    /// reader decoded `has_palette_y == 1` or `has_palette_uv == 1` and
-    /// then needed to read the §5.11.46 palette entries themselves
-    /// (`palette_colors_y[]` / `palette_colors_uv[]` via the
-    /// `L(BitDepth)` / `L(2)` / `L(paletteBits)` literal + delta loop).
-    /// Those reads need parser-scope `BitDepth` + `PaletteCache[]`
-    /// plumbing that the §5.11.22 reader does not yet thread through —
-    /// the palette-entries arc will land alongside the §5.11.49
-    /// palette-tokens caller wiring. This stub fires after the
-    /// `palette_size_*_minus_2` `S()` read commits to the §8.3
-    /// adaptation state.
+    /// Historical stub for the §5.11.22 palette-entries gap that
+    /// landed in r169 and was lifted in r171 with the §5.11.46
+    /// `palette_colors_{y,u,v}[]` reader. The §5.11.46 reader — the
+    /// `L(BitDepth)` / `L(2)` / `L(paletteBits)` cache-coded indices
+    /// plus literal plus delta loop, merged with the §5.11.49
+    /// `get_palette_cache(plane)` two-pointer neighbour merge — is now
+    /// inlined into [`crate::PartitionWalker::decode_intra_block_mode_info`],
+    /// which threads `bit_depth: u8` and stamps decoded palette state
+    /// into the walker's `PaletteSizes[]` / `PaletteColors[]` grids.
+    /// This variant is retained only as a defensive fallback (it is
+    /// not constructed on the conformant path).
     PaletteEntriesUnsupported,
     /// The §5.11.23 [`crate::PartitionWalker::decode_inter_block_mode_info`]
     /// reader completed the §5.11.25 `read_ref_frames()` syntax tree
@@ -1936,7 +1936,7 @@ impl core::fmt::Display for Error {
             ),
             Self::PaletteEntriesUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.22 intra_block_mode_info reached §5.11.46 palette-entries L(BitDepth) / L(paletteBits) reads — palette-entries arc pending"
+                "oxideav-av1: §5.11.46 palette-entries reader — historical stub retained post-r171 (the entries reader is now inlined into decode_intra_block_mode_info; this variant is a defensive fallback only)"
             ),
             Self::FindMvStackUnsupported => write!(
                 f,
