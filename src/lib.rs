@@ -1622,6 +1622,9 @@ pub use cdf::{
     CompoundTypeReadout, InterIntraReadout, InterpolationFilterReadout, BILINEAR, EIGHTTAP,
     EIGHTTAP_SHARP, EIGHTTAP_SMOOTH, SWITCHABLE,
 };
+// r179: §5.11.39 `coeffs` per-TU readout aggregate ([`cdf::CoefficientsReadout`])
+// surfaced through [`cdf::PartitionWalker::coefficients`].
+pub use cdf::CoefficientsReadout;
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
     InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,

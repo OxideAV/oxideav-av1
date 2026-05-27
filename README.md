@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 178)
+## Status — 2026-05-28 (round 179)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,119 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 179 lands the **§5.11.39 `coeffs( plane, startX, startY, txSz )`
+per-TU coefficient reader** — the first body of the §5.11.34
+`residual()` cascade, the gate to the entire transform / inverse-
+transform / reconstruction pipeline. Exposed as
+`PartitionWalker::coefficients(decoder, cdfs, plane, is_inter,
+tx_size, tx_class, txb_skip_ctx, dc_sign_ctx, scan, quant)` and
+surfaced through the new `CoefficientsReadout { all_zero, eob,
+cul_level, dc_category }` aggregate. This reader is callable directly
+today; the §5.11.34 outer dispatch (the `widthChunks` / `heightChunks`
+/ `transform_tree` / `transform_block` recursion) and the §5.11.30
+`compute_prediction()` walker-site that gates it remain
+subsequent-arc targets — the §5.11.5 walker
+([`PartitionWalker::decode_block_syntax`]) still short-circuits at
+`Error::DecodeBlockComputePredictionUnsupported` upstream of the new
+reader.
+
+The §5.11.39 body composes seven pieces, all wired:
+
+* **Line 3-7 derived sizes.** `txSzCtx` from `Tx_Size_Sqr` (derived
+  inline from `Min(Tx_Width, Tx_Height)`'s `trailing_zeros`) +
+  `Tx_Size_Sqr_Up` (the existing `TX_SIZE_SQR_UP` table); `ptype =
+  plane > 0`; `segEob` honouring the `TX_16X64 || TX_64X16 ⇒ 512`
+  special case and the `Min(1024, tx_w * tx_h)` cap.
+* **Line 8-9 Quant pre-loop.** Zero-fills `Quant[ 0..segEob ]` in the
+  caller's output buffer.
+* **Line 13 `all_zero` S().** Against `TileTxbSkipCdf[ txSzCtx ][
+  ctx ]` (caller-supplied ctx). On the `all_zero == 1` short-circuit
+  returns `CoefficientsReadout { all_zero: true, eob: 0, cul_level:
+  0, dc_category: 0 }`. The §5.11.40 luma `TxTypes[ y4 + j ][ x4 + i
+  ] = DCT_DCT` stamp on the short-circuit arm is deferred to the
+  §5.11.34 caller (the walker's `TxTypes` grid is not yet tracked).
+* **Lines 19-37 EOB position read.** `eobMultisize = Min(
+  Tx_Width_Log2, 5 ) + Min( Tx_Height_Log2, 5 ) - 4` selects one of
+  the seven `eob_pt_{16, 32, 64, 128, 256, 512, 1024}` S() reads
+  against `TileEobPt*Cdf[ ptype ][ ctx ]` (with `ctx = 0` for
+  `TX_CLASS_2D`, `ctx = 1` for HORIZ / VERT; the 512 / 1024 tables
+  have no ctx axis per §8.3.2). `eobPt = sym + 1`.
+* **Lines 39-55 `eob` derivation.** `eob = (eobPt < 2) ? eobPt : ((1
+  << (eobPt - 2)) + 1)`; `eobShift = Max(-1, eobPt - 3)`. When
+  `eobShift >= 0` reads `eob_extra` S() against `TileEobExtraCdf[
+  txSzCtx ][ ptype ][ eobPt - 3 ]` plus the `eob_extra_bit` L(1)
+  loop adding `1 << eobShift` per set bit.
+* **Lines 56-71 reverse-scan base levels.** Walks `c = eob-1 → 0`:
+  at `c == eob-1` reads `coeff_base_eob` S() against
+  `TileCoeffBaseEobCdf[ txSzCtx ][ ptype ][ ctx ]` with ctx from the
+  existing `get_coeff_base_eob_ctx(quant, tx_size, tx_class, pos,
+  c)` helper; otherwise reads `coeff_base` S() against
+  `TileCoeffBaseCdf[ txSzCtx ][ ptype ][ ctx ]` with ctx from the
+  existing `get_coeff_base_ctx(quant, tx_size, tx_class, pos, c,
+  false)` helper. `level > NUM_BASE_LEVELS = 2` triggers the
+  `coeff_br` chain — up to `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) =
+  4` S() reads against `TileCoeffBrCdf[ Min(txSzCtx, TX_32X32) ][
+  ptype ][ ctx ]` with ctx from `get_br_ctx`; chain terminates on the
+  first symbol `< BR_CDF_SIZE - 1 = 3`. Writes `Quant[ pos ] =
+  level` (positive magnitude only at this stage).
+* **Lines 73-100 forward-scan signs + golomb.** Walks `c = 0..eob`:
+  reads `dc_sign` S() at `c == 0` (against `TileDcSignCdf[ ptype ][
+  ctx ]` with caller-supplied ctx), otherwise `sign_bit` L(1).
+  `Quant[ pos ] > NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14` triggers
+  the §5.11.39 golomb chain — `golomb_length_bit` L(1) do-while loop
+  for the magnitude exponent, then `golomb_data_bit` L(1) loop for
+  the data bits; `Quant[ pos ] = x + COEFF_BASE_RANGE +
+  NUM_BASE_LEVELS`. Updates `dc_category` on the `pos == 0 &&
+  Quant[ pos ] > 0` arm (`1` for negative DC, `2` for positive),
+  applies the `& 0xFFFFF` 20-bit clip and the `culLevel +=
+  Quant[ pos ]` accumulation, then sign-applies `Quant[ pos ] =
+  -Quant[ pos ]` when needed. Closes with the `culLevel = Min(63,
+  culLevel)` clamp.
+
+Caller-supplied state surfaced through the function signature:
+`tx_size` (TX_SIZES_ALL ordinal), `tx_class` (the §8.3.2
+`get_tx_class(txType)` result, one of TX_CLASS_2D / TX_CLASS_HORIZ /
+TX_CLASS_VERT — the §5.11.40 `compute_tx_type` derivation belongs to
+the caller), `plane` / `is_inter`, `txb_skip_ctx` (`all_zero` ctx;
+the §8.3.2 derivation needs `AboveLevelContext` / `LeftLevelContext`
+/ `AboveDcContext` / `LeftDcContext` neighbour state that the
+walker does not yet track), `dc_sign_ctx` (same neighbour-state
+dependency), `scan` (caller-derived from `txSz` + `txType` per §7.5
+`get_scan` — also deferred), and a `quant: &mut [i32]` output buffer
+sized `>= tx_w * tx_h`. Caller-bug guards return
+`PartitionWalkOutOfRange` for each out-of-range argument
+(`tx_size >= TX_SIZES_ALL`, `tx_class > TX_CLASS_VERT`, `plane > 2`,
+`is_inter > 1`, `txb_skip_ctx >= TXB_SKIP_CONTEXTS`,
+`dc_sign_ctx >= DC_SIGN_CONTEXTS`, undersized `scan` / `quant`).
+
+The §5.11.39 `Dequant[][]` step (true §7.13 dequantization through
+the per-plane qmatrix) is **out of scope for this round**; the
+reader produces the §5.11.39 raw signed `Quant[]` array — the same
+quantity that feeds the §7.13 dequant — and leaves the
+dequantization itself for a subsequent arc. The §5.11.34
+`AboveLevelContext` / `LeftLevelContext` / `AboveDcContext` /
+`LeftDcContext` stamping at the post-§5.11.39 line 104-115 site is
+also deferred to the round that adds those context arrays to the
+walker (the readout already carries `cul_level` and `dc_category`
+for the caller to apply).
+
+6 new unit tests cover: the gate-closed `all_zero == 1`
+short-circuit (no symbol / literal bits past `txb_skip`, returned
+readout zeroed, output buffer zero-filled); a gate-open smoke test
+confirming the cascade produces a non-`all_zero` readout with
+`eob ∈ 1..=segEob`, `cul_level ≤ 63`, `dc_category ∈ {0, 1, 2}`,
+and decoder position advanced past at least one symbol bit; a CDF
+adaptation cross-check confirming the §8.3 `txb_skip` counter slot
+increments on a non-`disable_cdf_update` run (proves the reader is
+indexing the right CDF row); the seven caller-bug guards all
+returning `PartitionWalkOutOfRange`; a `TX_16X64` `segEob = 512`
+boundary check (511-element scan rejected, 512-element accepted);
+and a square-tx-size sweep across all five `TX_NxN` ordinals
+confirming the internal `txSzCtx = (Tx_Size_Sqr + Tx_Size_Sqr_Up +
+1) >> 1` derivation stays within `0..TX_SIZES` for every square
+size. Test count: 731 → 737 (+6). `decode_av1` / `encode_av1` still
+return `Error::NotImplemented`.
 
 Round 177 lands the **§5.11.29 `read_compound_type` reader** —
 wiring the inter-inter compound-blending controls into the §5.11.23

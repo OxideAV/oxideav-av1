@@ -19467,6 +19467,508 @@ impl PartitionWalker {
         TX_HEIGHT[nb_tx as usize] as u32
     }
 
+    /// `coeffs( plane, startX, startY, txSz )` per §5.11.39 (av1-spec
+    /// p.89-91) — the per-TU coefficient reader the §5.11.34 `residual()`
+    /// driver invokes via §5.11.35 `transform_block`'s
+    /// `eob = coeffs( plane, startX, startY, txSz )` line.
+    ///
+    /// The spec body (av1-spec p.89-91) reads:
+    ///
+    /// ```text
+    ///   coeffs( plane, startX, startY, txSz ) {
+    ///       x4 = startX >> 2
+    ///       y4 = startY >> 2
+    ///       w4 = Tx_Width[ txSz ] >> 2 ;  h4 = Tx_Height[ txSz ] >> 2
+    ///       txSzCtx = ( Tx_Size_Sqr[txSz] + Tx_Size_Sqr_Up[txSz] + 1 ) >> 1
+    ///       ptype = plane > 0
+    ///       segEob = ( txSz == TX_16X64 || txSz == TX_64X16 ) ? 512 :
+    ///                 Min( 1024, Tx_Width[ txSz ] * Tx_Height[ txSz ] )
+    ///       for ( c = 0; c < segEob; c++ ) Quant[c] = 0
+    ///       eob = 0 ;  culLevel = 0 ;  dcCategory = 0
+    ///       all_zero  S()
+    ///       if ( all_zero ) {
+    ///           // §5.11.39 line-5 short-circuit; the §5.11.40
+    ///           // transform_type call site sets TxTypes[..] = DCT_DCT
+    ///           // on the luma plane (deferred to caller).
+    ///       } else {
+    ///           // §5.11.40 `transform_type( x4, y4, txSz )` for luma
+    ///           //   (deferred to caller — txType / txClass passed in)
+    ///           // eob_pt_* S() per eobMultisize  → eobPt
+    ///           // eob = ( eobPt < 2 ) ? eobPt : ( ( 1 << ( eobPt - 2 ) ) + 1 )
+    ///           // eob_extra S() (only when eobShift >= 0)
+    ///           // eob_extra_bit L(1) loop (eobPt - 3 raw bits)
+    ///           // reverse-scan: coeff_base_eob S() at c==eob-1,
+    ///           //                coeff_base S() for c < eob-1
+    ///           //                followed by coeff_br S() chain for
+    ///           //                level > NUM_BASE_LEVELS
+    ///           // forward-scan: dc_sign S() at c==0, sign_bit L(1)
+    ///           //                otherwise; golomb chain for
+    ///           //                Quant[pos] > NUM_BASE_LEVELS +
+    ///           //                COEFF_BASE_RANGE; dcCategory derive
+    ///           //                from pos == 0 sign; culLevel +=
+    ///           //                Quant[pos]; sign-apply
+    ///           //   culLevel = Min( 63, culLevel )
+    ///       }
+    ///       // AboveLevelContext / LeftLevelContext / AboveDcContext /
+    ///       // LeftDcContext stamps (deferred to caller — the per-plane
+    ///       // context arrays are out-of-scope until a follow-on arc).
+    ///       return eob
+    ///   }
+    /// ```
+    ///
+    /// ## Caller-supplied state
+    ///
+    /// The §8.3.2 selectors for `all_zero` / `eob_pt_*` / `eob_extra` /
+    /// `coeff_base{_eob}` / `coeff_br` / `dc_sign` require neighbour-side
+    /// context state (`AboveLevelContext` / `LeftLevelContext` /
+    /// `AboveDcContext` / `LeftDcContext`) the walker does not yet track
+    /// across TUs. This reader therefore takes the §8.3.2 ctx values as
+    /// pre-computed arguments rather than deriving them on the fly. The
+    /// caller (today: a §5.11.34 driver; tomorrow: the
+    /// [`Self::decode_block_syntax`] post-§5.11.30 site) is responsible
+    /// for:
+    ///
+    /// * `tx_size` — the per-TU size, a [`TX_SIZES_ALL`] index
+    ///   (`0..TX_SIZES_ALL`).
+    /// * `tx_class` — the §8.3.2 `get_tx_class( txType )` result, one of
+    ///   [`TX_CLASS_2D`] / [`TX_CLASS_HORIZ`] / [`TX_CLASS_VERT`]. The
+    ///   §5.11.40 `compute_tx_type()` derivation belongs to the caller
+    ///   (the §5.11.40 luma `TxTypes[ y4 + j ][ x4 + i ] = DCT_DCT`
+    ///   write on the `all_zero` arm also belongs to the caller — it
+    ///   needs the walker's `TxTypes` grid, which is out-of-scope for
+    ///   this reader).
+    /// * `plane` — `0` (Y) or `1`/`2` (U/V). `ptype = plane > 0` is
+    ///   derived internally.
+    /// * `is_inter` — `0` or `1`. Drives the `eob_pt_*` `[ is_inter ]`
+    ///   axis (only for the `eob_pt_16..256` tables; `eob_pt_512` /
+    ///   `eob_pt_1024` have no `isInter` axis per §8.3.2).
+    /// * `txb_skip_ctx` — the §8.3.2 `all_zero` context in
+    ///   `0..TXB_SKIP_CONTEXTS`. The §8.3.2 derivation (p.370-371)
+    ///   reads `AboveLevelContext` / `LeftLevelContext` /
+    ///   `AboveDcContext` / `LeftDcContext` to build it.
+    /// * `dc_sign_ctx` — the §8.3.2 `dc_sign` context in
+    ///   `0..DC_SIGN_CONTEXTS` (p.377). Same neighbour-context source.
+    /// * `scan` — `scan[c]` for `c in 0..segEob` (the §5.11.39 scan
+    ///   table — caller derived from `txSz` + `txType` per §7.5
+    ///   `get_scan`). Length must be `>= segEob`.
+    /// * `quant` — the output `Quant[ pos ]` buffer, indexed `0..(tx_w *
+    ///   tx_h)` where `tx_w * tx_h = Tx_Width[ txSz ] *
+    ///   Tx_Height[ txSz ]`. The reader zero-fills `Quant[ 0..segEob ]`
+    ///   at entry per the §5.11.39 line-3 pre-loop, then writes the
+    ///   decoded signed levels at the scan positions. The caller's
+    ///   buffer must therefore be `>= max(segEob, max_scan_pos + 1)`
+    ///   cells — passing a slice of length `tx_w * tx_h` always
+    ///   satisfies both bounds.
+    ///
+    /// ## §5.11.34 deferred bodies
+    ///
+    /// This reader implements §5.11.39 only. The wider §5.11.34
+    /// `residual()` body (the `widthChunks` / `heightChunks` /
+    /// `transform_tree` / `transform_block` dispatch) and §5.11.35's
+    /// per-TU surrounds (intra `predict_intra` / `predict_palette` /
+    /// `predict_chroma_from_luma`, `reconstruct`,
+    /// `LoopfilterTxSizes[]` / `BlockDecoded[]` stamps) are subsequent-
+    /// arc targets. Likewise §5.11.40 `transform_type` (the luma `S()`
+    /// over `TileTxTypeSet{1,2}Cdf`) and §5.11.41 `compute_tx_type`
+    /// belong to the §5.11.34 caller. The §7.13 `Dequant[][]` step
+    /// (true quantizer-matrix dequantization) is a later arc still.
+    ///
+    /// ## Returns
+    ///
+    /// A [`CoefficientsReadout`] with `all_zero` / `eob` / `cul_level` /
+    /// `dc_category`. The `Quant[ pos ]` levels (signed, in
+    /// `i32::MIN..=i32::MAX` per the spec's `& 0xFFFFF` clip and sign
+    /// apply) are written into the caller's buffer.
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+    /// indices (`tx_size >= TX_SIZES_ALL`, `tx_class > TX_CLASS_VERT`,
+    /// `plane > 2`, `is_inter > 1`, `txb_skip_ctx >= TXB_SKIP_CONTEXTS`,
+    /// `dc_sign_ctx >= DC_SIGN_CONTEXTS`, `scan.len() < seg_eob`,
+    /// `quant.len() < tx_w * tx_h`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn coefficients(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        plane: u8,
+        is_inter: u8,
+        tx_size: usize,
+        tx_class: usize,
+        txb_skip_ctx: usize,
+        dc_sign_ctx: usize,
+        scan: &[u16],
+        quant: &mut [i32],
+    ) -> Result<CoefficientsReadout, crate::Error> {
+        // ---------------- caller-bug guards ----------------
+        if tx_size >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if tx_class > TX_CLASS_VERT {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if plane > 2 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if is_inter > 1 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if txb_skip_ctx >= TXB_SKIP_CONTEXTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if dc_sign_ctx >= DC_SIGN_CONTEXTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.39 lines 1-7: derived sizes.
+        let tx_w = TX_WIDTH[tx_size];
+        let tx_h = TX_HEIGHT[tx_size];
+        // §5.11.39 line 4: `txSzCtx = ( Tx_Size_Sqr[txSz] +
+        // Tx_Size_Sqr_Up[txSz] + 1 ) >> 1`. The §3 `Tx_Size_Sqr[ txSz ]`
+        // returns the square `TX_NxN` whose side length matches
+        // `Min( Tx_Width, Tx_Height )` for the rectangular `txSz`; we
+        // derive it from `Min( TX_WIDTH[txSz], TX_HEIGHT[txSz] )` via
+        // the `log2(side) - 2` rule (the square `TX_NxN` ordinal is
+        // `log2(side) - 2` because `TX_4X4 = 0`, `TX_8X8 = 1`, etc.).
+        // `Tx_Size_Sqr_Up[ txSz ]` is the existing [`TX_SIZE_SQR_UP`]
+        // table.
+        let tx_sz_sqr = {
+            let side = core::cmp::min(tx_w, tx_h);
+            // side ∈ {4, 8, 16, 32, 64}; log2 - 2 ∈ {0, 1, 2, 3, 4}.
+            (side.trailing_zeros() as usize) - 2
+        };
+        let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_size];
+        let tx_sz_ctx = (tx_sz_sqr + tx_sz_sqr_up + 1) >> 1;
+        // §5.11.39 line 5: `ptype = plane > 0`.
+        let ptype = (plane > 0) as usize;
+        // §5.11.39 line 6: `segEob = ( txSz == TX_16X64 || txSz ==
+        // TX_64X16 ) ? 512 : Min( 1024, Tx_Width[ txSz ] *
+        // Tx_Height[ txSz ] )`.
+        let seg_eob = if tx_size == TX_16X64 || tx_size == TX_64X16 {
+            512usize
+        } else {
+            core::cmp::min(1024, tx_w * tx_h)
+        };
+
+        // ---------------- caller-bug guards (continued) ----------------
+        if scan.len() < seg_eob {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // The Quant[] buffer is indexed by `pos = scan[c]`, which is
+        // bounded by `tx_w * tx_h - 1` per the §7.5 scan-table
+        // construction. The caller's buffer must accommodate every
+        // possible `pos`.
+        if quant.len() < tx_w * tx_h {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.39 lines 8-9: `for ( c = 0; c < segEob; c++ ) Quant[c] =
+        // 0`. The spec only zeros `0..segEob` (not the wider
+        // `tx_w * tx_h` extent); we honour that, since the §5.11.39
+        // forward scan only ever touches positions in `scan[ 0..eob ]`,
+        // and `eob <= segEob` for all reachable code paths.
+        for cell in quant.iter_mut().take(seg_eob) {
+            *cell = 0;
+        }
+        // The §5.11.39 line-10/11 `Dequant[ 0..64 ][ 0..64 ] = 0` reset
+        // is the post-§5.11.39 dequantization step's input (filled by
+        // §7.13). It is out-of-scope for this reader — the caller (and
+        // the §7.13 reader) owns the `Dequant[][]` array.
+
+        // §5.11.39 line 13: `all_zero S()`.
+        let all_zero_cdf = cdfs
+            .txb_skip_cdf(tx_sz_ctx, txb_skip_ctx)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let all_zero = decoder.read_symbol(all_zero_cdf)?;
+        debug_assert!(all_zero <= 1, "S() over Default_Txb_Skip_Cdf yields 0 or 1");
+
+        // §5.11.39 line 14: `if ( all_zero ) { c = 0; ... }` — the
+        // short-circuit. The §5.11.40 `transform_type` line "if ( plane
+        // == 0 ) { for i,j: TxTypes[ y4 + j ][ x4 + i ] = DCT_DCT }"
+        // sits inside the if-arm; we surface that as a deferred
+        // caller-side stamp because TxTypes[] is not yet a walker grid.
+        if all_zero != 0 {
+            return Ok(CoefficientsReadout {
+                all_zero: true,
+                eob: 0,
+                cul_level: 0,
+                dc_category: 0,
+            });
+        }
+
+        // ---------------- §5.11.39 EOB read ----------------
+        // §5.11.39 line 19: `eobMultisize = Min( Tx_Width_Log2[ txSz ],
+        // 5) + Min( Tx_Height_Log2[ txSz ], 5) - 4`. The constant `5` is
+        // the §3 `TX_64X64`-class log2 cap. `Tx_Height_Log2[ txSz ]` is
+        // not yet tabulated as a public constant; we derive it inline
+        // from `TX_HEIGHT[ txSz ] ∈ {4, 8, 16, 32, 64}`'s
+        // `trailing_zeros`.
+        let tx_height_log2_local = (tx_h.trailing_zeros() as usize) & 0xFF;
+        let eob_multisize: i32 = (core::cmp::min(TX_WIDTH_LOG2[tx_size], 5)
+            + core::cmp::min(tx_height_log2_local, 5)) as i32
+            - 4;
+        debug_assert!(
+            (0..=6).contains(&eob_multisize),
+            "eobMultisize ∈ 0..=6 over every TX_SIZES_ALL ordinal"
+        );
+
+        // §5.11.39 lines 20-37: `eob_pt_*` S() per `eobMultisize`. The
+        // §8.3.2 ctx for the `eob_pt_16..eob_pt_256` family is `( get_tx_class
+        // == TX_CLASS_2D ) ? 0 : 1`; `eob_pt_512` / `eob_pt_1024` have
+        // no `[ is_inter ]` / `[ ctx ]` axis.
+        let eob_pt_ctx = if tx_class == TX_CLASS_2D { 0 } else { 1 };
+        let eob_pt: u32 = match eob_multisize {
+            0 => {
+                let cdf = cdfs
+                    .eob_pt_16_cdf(ptype, eob_pt_ctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? + 1
+            }
+            1 => {
+                let cdf = cdfs
+                    .eob_pt_32_cdf(ptype, eob_pt_ctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? + 1
+            }
+            2 => {
+                let cdf = cdfs
+                    .eob_pt_64_cdf(ptype, eob_pt_ctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? + 1
+            }
+            3 => {
+                let cdf = cdfs
+                    .eob_pt_128_cdf(ptype, eob_pt_ctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? + 1
+            }
+            4 => {
+                let cdf = cdfs
+                    .eob_pt_256_cdf(ptype, eob_pt_ctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? + 1
+            }
+            5 => {
+                let cdf = cdfs
+                    .eob_pt_512_cdf(ptype)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? + 1
+            }
+            _ => {
+                let cdf = cdfs
+                    .eob_pt_1024_cdf(ptype)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? + 1
+            }
+        };
+
+        // §5.11.39 line 39: `eob = ( eobPt < 2 ) ? eobPt : ( ( 1 << (
+        // eobPt - 2 ) ) + 1 )`.
+        let mut eob: u32 = if eob_pt < 2 {
+            eob_pt
+        } else {
+            (1u32 << (eob_pt - 2)) + 1
+        };
+        // §5.11.39 line 40: `eobShift = Max( -1, eobPt - 3 )`. Signed
+        // because `eobPt` may be 1 or 2 (giving -2 / -1 before the Max).
+        let mut eob_shift: i32 = core::cmp::max(-1, eob_pt as i32 - 3);
+
+        // §5.11.39 lines 41-55: `eob_extra` S() then `eob_extra_bit`
+        // L(1) loop. Both contribute powers of two to `eob`.
+        if eob_shift >= 0 {
+            // §8.3.2 `eob_extra`: ctx = `eobPt - 3`.
+            let extra_ctx = (eob_pt - 3) as usize;
+            let cdf = cdfs
+                .eob_extra_cdf(tx_sz_ctx, ptype, extra_ctx)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let eob_extra = decoder.read_symbol(cdf)?;
+            debug_assert!(
+                eob_extra <= 1,
+                "S() over Default_Eob_Extra_Cdf yields 0 or 1"
+            );
+            if eob_extra != 0 {
+                eob += 1u32 << eob_shift;
+            }
+
+            // §5.11.39 lines 47-53: per-bit raw L(1) loop. `i` runs from
+            // 1 to Max( 0, eobPt - 2 ); inside, `eobShift = Max( 0,
+            // eobPt - 2 ) - 1 - i`.
+            let upper = core::cmp::max(0, eob_pt as i32 - 2);
+            let mut i: i32 = 1;
+            while i < upper {
+                eob_shift = upper - 1 - i;
+                let eob_extra_bit = decoder.read_literal(1)?;
+                if eob_extra_bit != 0 {
+                    eob += 1u32 << eob_shift;
+                }
+                i += 1;
+            }
+        }
+
+        // ---------------- §5.11.39 reverse-scan: base levels ----------
+        // §5.11.39 lines 56-71. `c` runs eob-1 → 0. The first iteration
+        // reads `coeff_base_eob` against the EOB-specific ctx; subsequent
+        // iterations read `coeff_base` against the position-aware ctx.
+        // Both can extend via `coeff_br` S() chain.
+        //
+        // The §8.3.2 ctx derivations consume the running `Quant[]`
+        // array — every iteration of this loop writes one cell of
+        // `Quant[]`, and every subsequent iteration's ctx scan reads
+        // the already-written cells. The `Quant[]` array is the
+        // §5.11.39 line-9 zero-initialised buffer; the buffer must be
+        // wide enough to be indexed at every `pos = scan[c]`.
+        if eob > 0 {
+            let mut c: i32 = eob as i32 - 1;
+            while c >= 0 {
+                let pos = scan[c as usize] as usize;
+                // §8.3.2 ctx derivations — see [`get_coeff_base_ctx`] /
+                // [`get_coeff_base_eob_ctx`].
+                let is_eob = c == (eob as i32 - 1);
+                let mut level: u32;
+                if is_eob {
+                    // §8.3.2 `coeff_base_eob`: ctx via
+                    // [`get_coeff_base_eob_ctx`] (which folds in
+                    // SIG_COEF_CONTEXTS_EOB - SIG_COEF_CONTEXTS).
+                    let ctx = get_coeff_base_eob_ctx(quant, tx_size, tx_class, pos, c as usize);
+                    let cdf = cdfs
+                        .coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx)
+                        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                    // §5.11.39 line 60: `level = coeff_base_eob + 1`
+                    // (the §9.4 alphabet is 3 values: 0, 1, 2 → levels
+                    // 1, 2, 3).
+                    let sym = decoder.read_symbol(cdf)?;
+                    debug_assert!(sym <= 2, "S() over Default_Coeff_Base_Eob_Cdf yields 0..=2");
+                    level = sym + 1;
+                } else {
+                    // §8.3.2 `coeff_base`: ctx via
+                    // [`get_coeff_base_ctx`] with `is_eob = false`.
+                    let ctx = get_coeff_base_ctx(quant, tx_size, tx_class, pos, c as usize, false);
+                    let cdf = cdfs
+                        .coeff_base_cdf(tx_sz_ctx, ptype, ctx)
+                        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                    // §5.11.39 line 63: `level = coeff_base` (the §9.4
+                    // alphabet is 4 values: 0, 1, 2, 3 → levels 0, 1, 2, 3).
+                    let sym = decoder.read_symbol(cdf)?;
+                    debug_assert!(sym <= 3, "S() over Default_Coeff_Base_Cdf yields 0..=3");
+                    level = sym;
+                }
+                // §5.11.39 lines 65-70: `coeff_br` chain when `level >
+                // NUM_BASE_LEVELS`. Iterations capped at COEFF_BASE_RANGE
+                // / ( BR_CDF_SIZE - 1 ) = 12 / 3 = 4. Each `coeff_br`
+                // S() returns 0..=BR_CDF_SIZE-1 = 0..=3; the chain
+                // terminates the first time the value is strictly less
+                // than BR_CDF_SIZE - 1 = 3.
+                if level as usize > NUM_BASE_LEVELS {
+                    let br_iters = COEFF_BASE_RANGE / (BR_CDF_SIZE - 1);
+                    for _ in 0..br_iters {
+                        let ctx = get_br_ctx(quant, tx_size, tx_class, pos);
+                        let cdf = cdfs
+                            .coeff_br_cdf(tx_sz_ctx, ptype, ctx)
+                            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                        let coeff_br = decoder.read_symbol(cdf)?;
+                        debug_assert!(
+                            (coeff_br as usize) < BR_CDF_SIZE,
+                            "S() over Default_Coeff_Br_Cdf yields 0..BR_CDF_SIZE"
+                        );
+                        level += coeff_br;
+                        if (coeff_br as usize) < BR_CDF_SIZE - 1 {
+                            break;
+                        }
+                    }
+                }
+                // §5.11.39 line 71: `Quant[ pos ] = level` (magnitude
+                // only; the sign-apply runs in the forward-scan loop).
+                quant[pos] = level as i32;
+                c -= 1;
+            }
+        }
+
+        // ---------------- §5.11.39 forward-scan: signs + golomb -------
+        // §5.11.39 lines 73-100. Walks c from 0 to eob; for each
+        // non-zero `Quant[pos]` reads either `dc_sign` (S() at c == 0)
+        // or `sign_bit` (L(1) otherwise), then optionally extends the
+        // magnitude via the §5.11.39 lines 84-93 golomb chain when
+        // `Quant[pos] > NUM_BASE_LEVELS + COEFF_BASE_RANGE`.
+        let mut cul_level: u32 = 0;
+        let mut dc_category: u8 = 0;
+        for (c, &pos_u16) in scan.iter().enumerate().take(eob as usize) {
+            let pos = pos_u16 as usize;
+            let qpos = quant[pos];
+            let sign: u32 = if qpos != 0 {
+                if c == 0 {
+                    // §8.3.2 `dc_sign`: ctx from caller.
+                    let cdf = cdfs
+                        .dc_sign_cdf(ptype, dc_sign_ctx)
+                        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                    let dc_sign = decoder.read_symbol(cdf)?;
+                    debug_assert!(dc_sign <= 1, "S() over Default_Dc_Sign_Cdf yields 0 or 1");
+                    dc_sign
+                } else {
+                    decoder.read_literal(1)?
+                }
+            } else {
+                0
+            };
+
+            // §5.11.39 lines 84-93: golomb chain when magnitude exceeds
+            // NUM_BASE_LEVELS + COEFF_BASE_RANGE = 2 + 12 = 14.
+            let threshold = (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as i32;
+            if qpos > threshold {
+                // golomb_length_bit L(1) loop: `length` = position of
+                // the first 1-bit (1-indexed). The first iteration is
+                // always entered (do-while), so length >= 1.
+                let mut length: u32 = 0;
+                loop {
+                    length += 1;
+                    let bit = decoder.read_literal(1)?;
+                    if bit != 0 {
+                        break;
+                    }
+                }
+                // golomb_data_bit L(1) loop: `x = 1`, then `x = (x <<
+                // 1) | bit` for `i = length-2..=0`.
+                let mut x: u32 = 1;
+                let mut i: i32 = length as i32 - 2;
+                while i >= 0 {
+                    let bit = decoder.read_literal(1)?;
+                    x = (x << 1) | bit;
+                    i -= 1;
+                }
+                // §5.11.39 line 93: `Quant[ pos ] = x + COEFF_BASE_RANGE
+                // + NUM_BASE_LEVELS`.
+                quant[pos] = (x as i32) + (COEFF_BASE_RANGE as i32) + (NUM_BASE_LEVELS as i32);
+            }
+
+            // §5.11.39 lines 94-96: `dcCategory` derive on pos == 0.
+            // The spec uses the post-golomb `Quant[pos]` for the `> 0`
+            // gate; that's also the spec's `Quant[pos] != 0` value
+            // since the upstream forward-loop entered the sign branch.
+            if pos == 0 && quant[pos] > 0 {
+                dc_category = if sign != 0 { 1 } else { 2 };
+            }
+            // §5.11.39 line 97: `Quant[ pos ] = Quant[ pos ] & 0xFFFFF`.
+            // The mask is the §5.11.39 20-bit-coefficient clip; values
+            // never exceed it on a conformant stream (the max is
+            // NUM_BASE_LEVELS + COEFF_BASE_RANGE + max_golomb_x ≪ 2^20),
+            // but the mask is applied verbatim for spec parity.
+            quant[pos] &= 0xFFFFF;
+            // §5.11.39 line 98: `culLevel += Quant[ pos ]`.
+            cul_level = cul_level.saturating_add(quant[pos] as u32);
+            // §5.11.39 lines 99-100: sign apply.
+            if sign != 0 {
+                quant[pos] = -quant[pos];
+            }
+        }
+        // §5.11.39 line 102: `culLevel = Min( 63, culLevel )`.
+        let cul_level: u8 = core::cmp::min(63, cul_level) as u8;
+
+        Ok(CoefficientsReadout {
+            all_zero: false,
+            eob,
+            cul_level,
+            dc_category,
+        })
+    }
+
     /// `decode_block( r, c, subSize )` per §5.11.5 (av1-spec p.63-64)
     /// — the per-block syntax-walker entry. This is the
     /// long-skeleton-with-stubs sibling of the leaf-only
@@ -22495,6 +22997,57 @@ pub struct InterpolationFilterReadout {
     /// `interpolation_filter == SWITCHABLE && needs_interp_filter`
     /// S() path. Useful for caller-side bit-accounting tests.
     pub read_from_bitstream: [bool; 2],
+}
+
+/// §5.11.39 `coeffs( plane, startX, startY, txSz )` per-TU outcome —
+/// the four scalars the §5.11.39 body produces beyond the `Quant[ pos ]`
+/// magnitude array itself, plus the `all_zero` short-circuit indicator.
+///
+/// The reader that returns this aggregate
+/// ([`PartitionWalker::coefficients`]) writes the §5.11.39 `Quant[ pos ]`
+/// signed levels into the caller's output buffer (one cell per `pos` in
+/// `0..segEob`, with `segEob` derived from `txSz`); the aggregate carries
+/// the §5.11.39 scalar outputs the §5.11.34 caller needs to drive the
+/// surrounding §5.11.42 `reset_block_context` / §8.3.2 `culLevel` /
+/// §8.3.2 `dcCategory` context updates.
+///
+/// On the `all_zero == 1` short-circuit (the §5.11.39 line-5 "all
+/// coefficients are zero" arm) `eob == 0`, `cul_level == 0`,
+/// `dc_category == 0`, and the output buffer is left as the spec's
+/// pre-`all_zero` zero-fill (`Quant[c] = 0` for `c in 0..segEob`).
+///
+/// `eob` is the §5.11.39 `eob` return value (`0` when `all_zero`,
+/// otherwise in `1..=segEob` per the §5.11.39 `eob_pt_*` / `eob_extra`
+/// derivation); `cul_level` is the §5.11.39 `Min( 63, culLevel )` clamp;
+/// `dc_category` is the §5.11.39 `dcCategory ∈ {0, 1, 2}` (0 ⇔ no DC,
+/// 1 ⇔ negative DC, 2 ⇔ positive DC) the §8.3.2 `dc_sign` selector
+/// stamps into `AboveDcContext[ plane ][ x4 + i ]` /
+/// `LeftDcContext[ plane ][ y4 + i ]`.
+///
+/// `all_zero` is `true` when the §5.11.39 line-3 `all_zero` S() read
+/// returned `1` (the early-out path); the §5.11.34 caller uses this to
+/// skip the `reconstruct()` invocation per the §5.11.35
+/// `transform_block` line `if ( eob > 0 ) reconstruct(...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CoefficientsReadout {
+    /// `all_zero` — the §5.11.39 line-3 read. `true` ⇔ the TU is entirely
+    /// zero (no further reads). `false` ⇔ the §5.11.39 EOB / coefficient
+    /// cascade fired.
+    pub all_zero: bool,
+    /// §5.11.39 `eob` — the position past the last non-zero coefficient.
+    /// `0` ⇔ `all_zero == true`. Otherwise in `1..=segEob`.
+    pub eob: u32,
+    /// §5.11.39 `culLevel` after the `Min( 63, culLevel )` clamp — the
+    /// neighbour-magnitude context the §8.3.2 `all_zero` /
+    /// `get_coeff_base_ctx` selectors consume on neighbour TUs via
+    /// `AboveLevelContext[ plane ][ x4 + i ]` /
+    /// `LeftLevelContext[ plane ][ y4 + i ]`.
+    pub cul_level: u8,
+    /// §5.11.39 `dcCategory` — `0` ⇔ no DC coefficient was coded, `1` ⇔
+    /// negative DC, `2` ⇔ positive DC. The §8.3.2 `dc_sign` selector
+    /// consumes this on neighbour TUs via `AboveDcContext[ plane ][ x4 +
+    /// i ]` / `LeftDcContext[ plane ][ y4 + i ]`.
+    pub dc_category: u8,
 }
 
 #[cfg(test)]
@@ -41643,5 +42196,462 @@ mod tests {
                 assert_eq!(walker.interp_filters()[cell * 2 + 1], EIGHTTAP);
             }
         }
+    }
+
+    // ===================== §5.11.39 `coeffs( )` =====================
+
+    /// Test helper: build an `N`-entry CDF row (`N - 1` symbols +
+    /// counter) that forces a *fresh-state* `read_symbol` to return
+    /// `target_sym`. Convention: `cdf[i] = 0` for `i < target_sym` (a
+    /// 0-CDF entry gives `f = 1 << 15`; the §8.2.6 `cur` for that
+    /// symbol exceeds the decoder's fresh `value = (1 << 15) - 1 -
+    /// paddedBuf`, keeping `value < cur` → the loop continues past
+    /// `i`), then `cdf[i] = 1 << 15` for `i >= target_sym` (a `1 <<
+    /// 15` entry gives `f = 0`, `cur = EC_MIN_PROB * (N - 2 - i)`,
+    /// which is `<= value` → the loop breaks at the first such `i =
+    /// target_sym`). The final counter entry stays at `0`.
+    ///
+    /// **Note**: this rig is only guaranteed on the *first* read in
+    /// fresh `[0u8; _]`-init decoder state (where `value = (1 << 15) -
+    /// 1 = 32767`). After one or more reads the decoder's
+    /// renormalisation may push `range` above `1 << 15`, and the
+    /// `cur = ((range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 -
+    /// EC_PROB_SHIFT)` truncation can drop below `value` even for
+    /// `f = 1 << 15`. The tests using `rig_cdf` for a non-zero
+    /// `target_sym` therefore arrange the relevant CDF to be the
+    /// *first* read at that target — and tests that need a non-zero
+    /// target after several reads use the gate-closed (`all_zero =
+    /// 1`) short-circuit instead.
+    fn rig_cdf<const N: usize>(target_sym: usize) -> [u16; N] {
+        let mut out = [0u16; N];
+        let last = N - 1;
+        for (i, slot) in out.iter_mut().enumerate().take(last) {
+            *slot = if i < target_sym { 0 } else { 1 << 15 };
+        }
+        // counter (slot N-1) stays at 0
+        out
+    }
+
+    /// §5.11.39 line-3 short-circuit: when the `all_zero` S() read returns
+    /// `1`, the reader returns `CoefficientsReadout {
+    /// all_zero: true, eob: 0, cul_level: 0, dc_category: 0 }` with no
+    /// further S() / L(1) reads. Driven by forcing the `txb_skip` CDF to
+    /// always select symbol 1.
+    #[test]
+    fn coefficients_all_zero_short_circuits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force every txb_skip ctx row to select symbol 1 (all_zero = 1).
+        for sz in 0..TX_SIZES {
+            for ctx in 0..TXB_SKIP_CONTEXTS {
+                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+            }
+        }
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        // TX_4X4: 16 coefficients, scan is the identity 0..16 for tests.
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant = vec![999i32; 16]; // pre-fill to verify zero-fill
+        let r = walker
+            .coefficients(
+                &mut dec,
+                &mut cdfs,
+                /* plane = */ 0,
+                /* is_inter = */ 0,
+                TX_4X4,
+                TX_CLASS_2D,
+                /* txb_skip_ctx = */ 0,
+                /* dc_sign_ctx = */ 0,
+                &scan,
+                &mut quant,
+            )
+            .unwrap();
+        assert!(r.all_zero);
+        assert_eq!(r.eob, 0);
+        assert_eq!(r.cul_level, 0);
+        assert_eq!(r.dc_category, 0);
+        // The §5.11.39 line 8-9 pre-loop zero-fills Quant[ 0..segEob ];
+        // segEob = 16 here, so every cell is zeroed.
+        assert!(quant.iter().all(|&q| q == 0));
+    }
+
+    /// §5.11.39 gate-open smoke test: `all_zero` forced to 0 (cascade
+    /// fires); the reader runs to completion, producing a non-`all_zero`
+    /// readout with `eob` in `1..=segEob = 1..=16`. With `[0u8;
+    /// 8]`-init the §8.2.6 first-symbol selection is sym-0 for every
+    /// rigged CDF whose `cdf[0] = 1 << 15`. We confirm:
+    ///   * `all_zero == false` (the gate-closed test confirms the
+    ///     positive case).
+    ///   * `eob >= 1` (every gate-open path produces at least one
+    ///     coefficient).
+    ///   * `cul_level <= 63` (the §5.11.39 line-102 clamp).
+    ///   * `dc_category ∈ {0, 1, 2}` (the §5.11.39 line-94
+    ///     three-arm dispatch).
+    #[test]
+    fn coefficients_gate_open_smoke_default_cdfs() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force txb_skip to symbol 0 (first read; sym-0 wins from value=32767).
+        for sz in 0..TX_SIZES {
+            for ctx in 0..TXB_SKIP_CONTEXTS {
+                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+            }
+        }
+        // The remaining CDFs stay at the §9.4 defaults; the §8.2.6
+        // decoder selects whatever the default skew lands on. The test
+        // only asserts structural invariants of the readout.
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant = vec![0i32; 16];
+        let r = walker
+            .coefficients(
+                &mut dec,
+                &mut cdfs,
+                /* plane = */ 0,
+                /* is_inter = */ 0,
+                TX_4X4,
+                TX_CLASS_2D,
+                /* txb_skip_ctx = */ 0,
+                /* dc_sign_ctx = */ 0,
+                &scan,
+                &mut quant,
+            )
+            .unwrap();
+        assert!(!r.all_zero, "txb_skip rigged to 0 ⇒ cascade fires");
+        assert!(
+            r.eob >= 1 && r.eob <= 16,
+            "eob ∈ 1..=segEob = 1..=16 for TX_4X4; got {}",
+            r.eob
+        );
+        assert!(
+            r.cul_level <= 63,
+            "§5.11.39 line-102 clamp ensures cul_level ≤ 63; got {}",
+            r.cul_level
+        );
+        assert!(
+            r.dc_category <= 2,
+            "§5.11.39 line-94 three-arm dispatch yields {{0, 1, 2}}; got {}",
+            r.dc_category
+        );
+        // Decoder advanced past at least the txb_skip + eob_pt_16 reads.
+        assert!(
+            dec.position() > 0,
+            "gate-open cascade consumed at least one symbol bit"
+        );
+    }
+
+    /// §5.11.39 cdf adaptation smoke test: with `all_zero` forced to 0
+    /// (a §8.3 adapting CDF), the `txb_skip` row at the consulted
+    /// `(txSzCtx, ctx)` cell must have its counter slot incremented
+    /// (the §8.3 update increments `cdf[N]` after every successful
+    /// decode). This proves the reader is actually invoking
+    /// `read_symbol` against the right CDF row.
+    #[test]
+    fn coefficients_gate_open_adapts_txb_skip_cdf() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force txb_skip to symbol 0 across all rows.
+        for sz in 0..TX_SIZES {
+            for ctx in 0..TXB_SKIP_CONTEXTS {
+                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+            }
+        }
+        // Snapshot the row that will be consulted (TX_4X4 has txSzCtx=0,
+        // and the test passes txb_skip_ctx=0).
+        let counter_before = cdfs.txb_skip[0][0][2];
+        let bytes = [0u8; 8];
+        // Critical: use disable_cdf_update = FALSE so the adaptation runs.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, false).unwrap();
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant = vec![0i32; 16];
+        let _ = walker
+            .coefficients(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                TX_4X4,
+                TX_CLASS_2D,
+                0,
+                0,
+                &scan,
+                &mut quant,
+            )
+            .unwrap();
+        let counter_after = cdfs.txb_skip[0][0][2];
+        assert!(
+            counter_after > counter_before,
+            "§8.3 CDF update increments the txb_skip counter slot after read"
+        );
+    }
+
+    /// §5.11.39 caller-bug guards: each out-of-range argument returns
+    /// [`crate::Error::PartitionWalkOutOfRange`] without touching the
+    /// decoder state.
+    #[test]
+    fn coefficients_rejects_out_of_range_arguments() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant = vec![0i32; 16];
+
+        // tx_size out of range.
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            TX_SIZES_ALL,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &mut quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+
+        // tx_class out of range (TX_CLASS_VERT = 2; 3 is illegal).
+        let r = walker.coefficients(
+            &mut dec, &mut cdfs, 0, 0, TX_4X4, 3, 0, 0, &scan, &mut quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+
+        // plane out of range (> 2).
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            3,
+            0,
+            TX_4X4,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &mut quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+
+        // is_inter out of range (> 1).
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            0,
+            2,
+            TX_4X4,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &mut quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+
+        // txb_skip_ctx out of range.
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4,
+            TX_CLASS_2D,
+            TXB_SKIP_CONTEXTS,
+            0,
+            &scan,
+            &mut quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+
+        // dc_sign_ctx out of range.
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4,
+            TX_CLASS_2D,
+            0,
+            DC_SIGN_CONTEXTS,
+            &scan,
+            &mut quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+
+        // scan too short.
+        let short_scan: Vec<u16> = (0..4u16).collect();
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4,
+            TX_CLASS_2D,
+            0,
+            0,
+            &short_scan,
+            &mut quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+
+        // quant too small.
+        let mut tiny_quant = vec![0i32; 4];
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &mut tiny_quant,
+        );
+        assert!(matches!(r, Err(crate::Error::PartitionWalkOutOfRange)));
+    }
+
+    /// §5.11.39 line-4 `txSzCtx` derivation invariants: for every
+    /// square `TX_NxN` (TX_4X4..TX_64X64) both `Tx_Size_Sqr` and
+    /// `Tx_Size_Sqr_Up` return the same ordinal `n`, so the shift
+    /// `(n + n + 1) >> 1` collapses to `n`. This test runs the reader
+    /// across all five square ordinals with the gate-closed (`all_zero
+    /// = 1`) short-circuit to confirm none trip a bounds check —
+    /// proving the reader's internal `txSzCtx` formula stays in
+    /// `0..TX_SIZES` across every square tx size.
+    #[test]
+    fn coefficients_txszctx_square_tx_sizes_do_not_panic() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 64,
+            mi_col_start: 0,
+            mi_col_end: 64,
+        };
+        let mut walker = PartitionWalker::new(64, 64, geom).unwrap();
+        for tx in &[TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64] {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            // Force txb_skip to symbol 1 (gate closed — quickest path).
+            for sz in 0..TX_SIZES {
+                for ctx in 0..TXB_SKIP_CONTEXTS {
+                    cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+                }
+            }
+            let bytes = [0u8; 8];
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+            // Scan + quant sized for the largest case (TX_64X64 = 4096).
+            let scan: Vec<u16> = (0..4096u16).collect();
+            let mut quant = vec![0i32; 4096];
+            let r = walker
+                .coefficients(
+                    &mut dec,
+                    &mut cdfs,
+                    0,
+                    0,
+                    *tx,
+                    TX_CLASS_2D,
+                    0,
+                    0,
+                    &scan,
+                    &mut quant,
+                )
+                .unwrap();
+            assert!(
+                r.all_zero,
+                "rigged all_zero=1 ⇒ short-circuit for tx={}",
+                tx
+            );
+            assert_eq!(r.eob, 0);
+        }
+    }
+
+    /// §5.11.39 line-6 `segEob` derivation cross-check: for `TX_16X64`
+    /// the spec hard-codes `segEob = 512`, not the
+    /// `min(1024, tx_w * tx_h) = min(1024, 1024) = 1024` it would
+    /// otherwise be. The reader's `scan.len() >= segEob` guard fires
+    /// when the caller passes a scan shorter than 512 — the test
+    /// passes 511 cells and confirms the bug guard fires.
+    #[test]
+    fn coefficients_tx_16x64_uses_512_seg_eob() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        // scan length 511 — just below the 512-cap.
+        let scan: Vec<u16> = (0..511u16).collect();
+        let mut quant = vec![0i32; 16 * 64]; // 1024 cells, fits indexing.
+        let r = walker.coefficients(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            TX_16X64,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &mut quant,
+        );
+        assert!(
+            matches!(r, Err(crate::Error::PartitionWalkOutOfRange)),
+            "segEob = 512 for TX_16X64; scan.len() = 511 ⇒ guard fires"
+        );
+        // A 512-cell scan passes the guard.
+        let scan_ok: Vec<u16> = (0..512u16).collect();
+        let mut quant_ok = vec![0i32; 16 * 64];
+        // Force all_zero to short-circuit so we don't depend on EOB tables.
+        for sz in 0..TX_SIZES {
+            for ctx in 0..TXB_SKIP_CONTEXTS {
+                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+            }
+        }
+        let bytes2 = [0u8; 8];
+        let mut dec2 = SymbolDecoder::init_symbol(&bytes2, 8, true).unwrap();
+        let r2 = walker
+            .coefficients(
+                &mut dec2,
+                &mut cdfs,
+                0,
+                0,
+                TX_16X64,
+                TX_CLASS_2D,
+                0,
+                0,
+                &scan_ok,
+                &mut quant_ok,
+            )
+            .unwrap();
+        assert!(r2.all_zero);
+        assert_eq!(r2.eob, 0);
     }
 }

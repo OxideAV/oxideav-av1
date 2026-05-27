@@ -6,6 +6,59 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 179 — §5.11.39 `coeffs( )` per-TU coefficient reader.** Lands
+  the first body of the §5.11.34 `residual()` cascade — the gate to
+  the entire transform-coefficient pipeline. Exposed as
+  `PartitionWalker::coefficients(decoder, cdfs, plane, is_inter,
+  tx_size, tx_class, txb_skip_ctx, dc_sign_ctx, scan, quant)` returning
+  a new `CoefficientsReadout { all_zero, eob, cul_level, dc_category }`
+  aggregate. The §5.11.34 outer dispatch + §5.11.30
+  `compute_prediction()` walker site remain subsequent-arc targets; the
+  `PartitionWalker::decode_block_syntax` walker still short-circuits at
+  `DecodeBlockComputePredictionUnsupported` upstream of the new reader.
+
+  Implemented surface: §5.11.39 lines 1-7 derived sizes (`txSzCtx` /
+  `ptype` / `segEob` with TX_16X64 / TX_64X16 ⇒ 512 special case); the
+  line-8 `Quant[ 0..segEob ]` zero-fill; the line-13 `all_zero` S()
+  against `TileTxbSkipCdf[ txSzCtx ][ ctx ]` with early-out; the
+  lines-19-37 `eob_pt_{16, 32, 64, 128, 256, 512, 1024}` S() dispatch
+  via `eobMultisize`; the lines-39-55 `eob` derivation with
+  `eob_extra` S() + `eob_extra_bit` L(1) loop; the lines-56-71
+  reverse-scan reading `coeff_base_eob` / `coeff_base` against the
+  `TileCoeffBase{Eob,}Cdf[ txSzCtx ][ ptype ][ ctx ]` rows (ctx from
+  the existing `get_coeff_base_{eob,}ctx` / `get_br_ctx` helpers) with
+  the `coeff_br` S() chain when `level > NUM_BASE_LEVELS`; the
+  lines-73-100 forward-scan reading `dc_sign` S() at `c == 0` and
+  `sign_bit` L(1) otherwise, the §5.11.39 golomb chain
+  (`golomb_length_bit` L(1) do-while + `golomb_data_bit` L(1) loop)
+  for `Quant[ pos ] > NUM_BASE_LEVELS + COEFF_BASE_RANGE`, the
+  `dcCategory` derive, the 0xFFFFF clip, the `culLevel += Quant[ pos ]`
+  accumulation, the sign apply, and the line-102 `Min(63, culLevel)`
+  clamp.
+
+  Deferred to subsequent arcs:
+  - The §7.13 `Dequant[][]` dequantization step (true qmatrix
+    dequantization) — the reader produces the raw signed `Quant[]`
+    array, which is the §7.13 input.
+  - The §5.11.34 outer `widthChunks` / `heightChunks` / `transform_tree`
+    / `transform_block` dispatch.
+  - The §5.11.40 `transform_type` S() read + `compute_tx_type` lookup
+    (caller-supplied via `tx_class`).
+  - The §7.5 `get_scan` table lookup (caller-supplied `scan`).
+  - The `AboveLevelContext` / `LeftLevelContext` / `AboveDcContext` /
+    `LeftDcContext` walker arrays (caller-supplied `txb_skip_ctx` /
+    `dc_sign_ctx`; readout returns `cul_level` / `dc_category` for the
+    caller to apply).
+
+  New public types: `CoefficientsReadout` (re-exported through
+  `oxideav_av1::CoefficientsReadout`). 6 new unit tests cover the
+  gate-closed short-circuit, a gate-open smoke test asserting readout
+  invariants, a CDF-adaptation cross-check on `txb_skip`, the seven
+  caller-bug guards, the TX_16X64 `segEob = 512` boundary, and a
+  square-tx-size sweep across all five TX_NxN ordinals. Test count: 731
+  → 737 (+6). `decode_av1` / `encode_av1` continue to return
+  `Error::NotImplemented`.
+
 * **Round 178 — §5.11.x `read_interpolation_filter` reader.** Lands
   the LAST leaf of the §5.11.23 inter cascade. The §5.11.23
   dispatcher now runs the entire `inter_block_mode_info()` body to
