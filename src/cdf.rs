@@ -8400,6 +8400,131 @@ pub fn segment_id_ctx(prev_ul: Option<i32>, prev_u: Option<i32>, prev_l: Option<
     }
 }
 
+/// `get_segment_id()` per §5.11.21 (av1-spec p.72) — the inter-frame
+/// per-block segment-id **prediction** function. Returns the smallest
+/// `PrevSegmentIds[ row ][ col ]` value found within the on-screen
+/// region of the previous-frame segmentation map covered by the
+/// current block. The §5.11.19 `inter_segment_id( preSkip )` body
+/// reads `predictedSegmentId = get_segment_id()` once per block; the
+/// returned value is then either adopted directly
+/// (`!segmentation_update_map` arm; `seg_id_predicted == 1` arm) or
+/// folded into the §5.11.9 `read_segment_id()` `pred` derivation.
+///
+/// Spec body (av1-spec p.72):
+///
+/// ```text
+///   get_segment_id( ) {
+///       bw4 = Num_4x4_Blocks_Wide[ MiSize ]
+///       bh4 = Num_4x4_Blocks_High[ MiSize ]
+///       xMis = Min( MiCols - MiCol, bw4 )
+///       yMis = Min( MiRows - MiRow, bh4 )
+///       seg = 7
+///       for ( y = 0; y < yMis; y++ )
+///           for ( x = 0; x < xMis; x++ )
+///               seg = Min( seg, PrevSegmentIds[ MiRow + y ][ MiCol + x ] )
+///       return seg
+///   }
+/// ```
+///
+/// The initial sentinel `seg = 7` is `MAX_SEGMENTS - 1` — the
+/// largest legal segment id, so any same-or-smaller previous-frame id
+/// inside the window beats it; a window that finds no cell below `7`
+/// (e.g. a fresh previous frame with every cell at `7`) returns `7`.
+///
+/// `mi_row` / `mi_col` are the current block's top-left mi-unit
+/// position. `sub_size` is the §3 `BLOCK_*` ordinal indexing the §9.3
+/// [`NUM_4X4_BLOCKS_WIDE`] / [`NUM_4X4_BLOCKS_HIGH`] tables. `mi_rows`
+/// / `mi_cols` are the **current** frame's mi-extent (the spec writes
+/// `MiCols` / `MiRows`, which are §3 sequence-header-derived current-
+/// frame values), used only to clip `xMis` / `yMis` to the frame
+/// edge — they are unrelated to the previous frame's extent which is
+/// captured implicitly by `prev_mi_cols` and the length of
+/// `prev_segment_ids`.
+///
+/// `prev_segment_ids` is the previous frame's `SegmentIds[][]` grid
+/// in row-major layout: `prev_segment_ids[ r * prev_mi_cols + c ]`.
+/// Stored as `i32` so the §5.11.9 sentinel value `-1` (an
+/// unwritten cell — a previous frame with `segmentation_enabled ==
+/// false` writes the literal `0` instead of `-1`, but a partially
+/// written walker's grid retains `-1` per the
+/// [`PartitionWalker::segment_ids`] initialisation) round-trips
+/// faithfully; the `Min` reduction naturally treats `-1` as the
+/// smallest possible value.
+///
+/// `prev_mi_rows` / `prev_mi_cols` are the previous frame's mi-extent
+/// (the shape of `prev_segment_ids`). The §5.11.21 walk indexes
+/// `PrevSegmentIds[ MiRow + y ][ MiCol + x ]` directly — a
+/// previous-frame extent smaller than the current frame's would mean
+/// the §6.10 reference-frame walk produced an inconsistent surface,
+/// which is a caller bug surfaced as the out-of-range error rather
+/// than silently clipping.
+///
+/// Returns `None` for caller-bug arguments:
+/// * `sub_size >= BLOCK_SIZES` (not a valid §3 ordinal);
+/// * `mi_row >= mi_rows` or `mi_col >= mi_cols` (current block
+///   outside the current frame);
+/// * `prev_mi_rows < mi_rows` or `prev_mi_cols < mi_cols` (previous
+///   frame's segmentation surface doesn't cover the current frame's
+///   extent);
+/// * `prev_segment_ids.len() != prev_mi_rows * prev_mi_cols`
+///   (length / shape mismatch).
+///
+/// Otherwise returns the §5.11.21 spec value as an `i32` (range
+/// `-1..=7` — the `-1` sentinel surfaces only if a `-1` cell falls
+/// inside the window).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn get_segment_id(
+    prev_segment_ids: &[i32],
+    prev_mi_rows: u32,
+    prev_mi_cols: u32,
+    mi_rows: u32,
+    mi_cols: u32,
+    mi_row: u32,
+    mi_col: u32,
+    sub_size: usize,
+) -> Option<i32> {
+    if sub_size >= BLOCK_SIZES {
+        return None;
+    }
+    if mi_row >= mi_rows || mi_col >= mi_cols {
+        return None;
+    }
+    if prev_mi_rows < mi_rows || prev_mi_cols < mi_cols {
+        return None;
+    }
+    let prev_area = (prev_mi_rows as usize).checked_mul(prev_mi_cols as usize)?;
+    if prev_segment_ids.len() != prev_area {
+        return None;
+    }
+    let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+    let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+    // §5.11.21 `xMis = Min( MiCols - MiCol, bw4 )`; `yMis = Min( MiRows
+    // - MiRow, bh4 )`. The subtractions are safe because the range
+    // guards above proved `mi_col < mi_cols` and `mi_row < mi_rows`.
+    let x_mis = bw4.min(mi_cols - mi_col);
+    let y_mis = bh4.min(mi_rows - mi_row);
+    // §5.11.21 `seg = 7` initial sentinel — `MAX_SEGMENTS - 1`, the
+    // largest legal id, so any same-or-smaller previous-frame id in
+    // the window wins.
+    let mut seg: i32 = (MAX_SEGMENTS as i32) - 1;
+    for y in 0..y_mis {
+        let rr = mi_row + y;
+        for x in 0..x_mis {
+            let cc = mi_col + x;
+            // `prev_segment_ids` is row-major over the previous
+            // frame's `prev_mi_cols`-wide grid. `rr < mi_rows <=
+            // prev_mi_rows` and `cc < mi_cols <= prev_mi_cols` by
+            // construction, so the index never overflows.
+            let v = prev_segment_ids[(rr * prev_mi_cols + cc) as usize];
+            if v < seg {
+                seg = v;
+            }
+        }
+    }
+    Some(seg)
+}
+
 /// §5.11.9 `neg_deinterleave` — the spec helper that reconstructs a
 /// `segment_id` from the on-wire `diff` (the §5.11.9 `S()` symbol) the
 /// caller-known `ref` value (the §5.11.9 `pred` derivation), and the
@@ -25274,5 +25399,225 @@ mod tests {
         for i in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
             assert_eq!(ctx.segment_id_predicted[i][0], 10_000u16 + i as u16);
         }
+    }
+
+    // §5.11.21 `get_segment_id()` (av1-spec p.72) free-function tests.
+
+    /// A uniform `PrevSegmentIds[][]` of `0` returns `0` regardless of
+    /// block position or size — the §5.11.21 `Min` reduction over the
+    /// whole window finds `0 < 7`, then never beats it.
+    #[test]
+    fn get_segment_id_uniform_zero_returns_zero() {
+        let prev = vec![0i32; 8 * 8];
+        for sub in &[BLOCK_4X4, BLOCK_8X8, BLOCK_16X16, BLOCK_32X32] {
+            let v = get_segment_id(&prev, 8, 8, 8, 8, 0, 0, *sub).unwrap();
+            assert_eq!(v, 0, "uniform-0 prev grid must reduce to 0 for sub={sub}");
+        }
+    }
+
+    /// A uniform `PrevSegmentIds[][]` of `7` returns `7` — the
+    /// §5.11.21 sentinel `seg = 7` never gets beaten.
+    #[test]
+    fn get_segment_id_uniform_seven_returns_sentinel() {
+        let prev = vec![7i32; 4 * 4];
+        let v = get_segment_id(&prev, 4, 4, 4, 4, 0, 0, BLOCK_4X4).unwrap();
+        assert_eq!(v, 7);
+        // Also for a BLOCK_8X8 anchored at (0,0) covering 2x2 = 4 cells
+        // of the 4x4 prev grid; still 7.
+        let v8 = get_segment_id(&prev, 4, 4, 4, 4, 0, 0, BLOCK_8X8).unwrap();
+        assert_eq!(v8, 7);
+    }
+
+    /// The window reduction takes the **minimum** of the covered
+    /// cells. A `BLOCK_8X8` (bw4 = bh4 = 2) at (0,0) over a prev grid
+    /// whose top-left 2x2 holds `[5, 3, 4, 2]` (row-major) must return
+    /// `2` — the §5.11.21 `Min` over those four cells. Cells outside
+    /// the 2x2 window (positions `(0, 2..)`, `(1, 2..)`, `(2.., *)`)
+    /// must not contribute, even if they hold smaller values.
+    #[test]
+    fn get_segment_id_window_min_over_block_8x8() {
+        let mut prev = vec![7i32; 4 * 4];
+        let idx = |r: usize, c: usize| r * 4 + c;
+        // Window cells (top-left 2x2):
+        prev[idx(0, 0)] = 5;
+        prev[idx(0, 1)] = 3;
+        prev[idx(1, 0)] = 4;
+        prev[idx(1, 1)] = 2;
+        // Out-of-window decoy cells: smaller than the window min but
+        // must NOT contribute, proving the bw4/bh4 clipping bounds.
+        prev[idx(0, 2)] = 0;
+        prev[idx(2, 0)] = 0;
+        prev[idx(2, 2)] = 0;
+        prev[idx(3, 3)] = 0;
+        let v = get_segment_id(&prev, 4, 4, 4, 4, 0, 0, BLOCK_8X8).unwrap();
+        assert_eq!(v, 2);
+    }
+
+    /// Frame-edge clipping: a `BLOCK_16X16` (bw4 = bh4 = 4) anchored
+    /// at `(mi_row = 2, mi_col = 2)` of a 4x4 mi-grid covers
+    /// `xMis = Min(4 - 2, 4) = 2` and `yMis = Min(4 - 2, 4) = 2`
+    /// cells — only the bottom-right 2x2 of the prev grid contributes,
+    /// NOT the (uncovered, off-frame) cells the bw4/bh4 product would
+    /// imply.
+    #[test]
+    fn get_segment_id_clips_x_mis_y_mis_to_frame_edge() {
+        // Fill the prev grid such that only the bottom-right 2x2 sub-
+        // grid (positions (2,2)..(4,4)) holds the actual minimum;
+        // top-left cells hold a smaller "decoy" that must be ignored
+        // (the §5.11.21 walk starts at MiRow=2, MiCol=2, never visits
+        // (0,0)).
+        let mut prev = vec![7i32; 4 * 4];
+        let idx = |r: usize, c: usize| r * 4 + c;
+        prev[idx(0, 0)] = 0; // decoy — out of window
+        prev[idx(2, 2)] = 3;
+        prev[idx(2, 3)] = 5;
+        prev[idx(3, 2)] = 4;
+        prev[idx(3, 3)] = 6;
+        let v = get_segment_id(&prev, 4, 4, 4, 4, 2, 2, BLOCK_16X16).unwrap();
+        // Min over the bottom-right 2x2 = Min(3,5,4,6) = 3, NOT 0
+        // (the (0,0) decoy never enters the reduction).
+        assert_eq!(v, 3);
+    }
+
+    /// The `-1` sentinel (the [`PartitionWalker::segment_ids`]
+    /// initial-state value for a not-yet-decoded cell of the previous
+    /// frame's walker) round-trips: a `-1` cell inside the window
+    /// wins the `Min` reduction. The §5.11.19 caller's
+    /// `predicted_segment_id > last_active_seg_id` guard fires on the
+    /// returned `-1` (cast to `u8` becomes `255`), so callers will
+    /// reject this as an invariant violation rather than feed it
+    /// blindly into `decode_inter_segment_id`.
+    #[test]
+    fn get_segment_id_surfaces_minus_one_sentinel() {
+        let mut prev = vec![7i32; 2 * 2];
+        prev[0] = -1;
+        let v = get_segment_id(&prev, 2, 2, 2, 2, 0, 0, BLOCK_4X4).unwrap();
+        assert_eq!(v, -1);
+    }
+
+    /// The `prev_mi_cols` extent governs the row stride into
+    /// `prev_segment_ids`. A previous frame that is **wider** than
+    /// the current frame must still index correctly: the current
+    /// frame's `(mi_row, mi_col)` is unchanged, but each prev-frame
+    /// row spans `prev_mi_cols` cells.
+    #[test]
+    fn get_segment_id_handles_wider_prev_frame() {
+        // current frame: 2 rows x 2 cols. prev frame: 2 rows x 4 cols.
+        let mut prev = vec![7i32; 2 * 4];
+        // Prev row 0: [7, 7, 7, 7]; Prev row 1: [2, 7, 7, 7]
+        let idx = |r: usize, c: usize| r * 4 + c;
+        prev[idx(1, 0)] = 2;
+        let v = get_segment_id(&prev, 2, 4, 2, 2, 0, 0, BLOCK_8X8).unwrap();
+        // BLOCK_8X8 = bw4 = bh4 = 2, covers (0..2, 0..2) of prev =
+        // [7, 7, 2, 7] = Min = 2.
+        assert_eq!(v, 2);
+    }
+
+    /// A single-cell `BLOCK_4X4` window touches exactly one prev
+    /// cell — the value at `prev[MiRow][MiCol]`. No averaging, no
+    /// neighbour contribution.
+    #[test]
+    fn get_segment_id_single_cell_block_4x4() {
+        let mut prev = vec![7i32; 4 * 4];
+        let idx = |r: usize, c: usize| r * 4 + c;
+        prev[idx(2, 1)] = 3;
+        let v = get_segment_id(&prev, 4, 4, 4, 4, 2, 1, BLOCK_4X4).unwrap();
+        assert_eq!(v, 3);
+        // Neighbour cell must not contribute:
+        prev[idx(2, 2)] = 0; // adjacent to (2,1) but outside the 1x1 window
+        let v2 = get_segment_id(&prev, 4, 4, 4, 4, 2, 1, BLOCK_4X4).unwrap();
+        assert_eq!(v2, 3);
+    }
+
+    /// Out-of-range `sub_size` rejected.
+    #[test]
+    fn get_segment_id_rejects_invalid_sub_size() {
+        let prev = vec![0i32; 4 * 4];
+        assert!(get_segment_id(&prev, 4, 4, 4, 4, 0, 0, BLOCK_SIZES).is_none());
+        assert!(get_segment_id(&prev, 4, 4, 4, 4, 0, 0, BLOCK_SIZES + 1).is_none());
+    }
+
+    /// Out-of-range current-frame anchor rejected. `mi_row == mi_rows`
+    /// or `mi_col == mi_cols` is past the frame's mi extent.
+    #[test]
+    fn get_segment_id_rejects_anchor_outside_current_frame() {
+        let prev = vec![0i32; 4 * 4];
+        assert!(get_segment_id(&prev, 4, 4, 4, 4, 4, 0, BLOCK_4X4).is_none());
+        assert!(get_segment_id(&prev, 4, 4, 4, 4, 0, 4, BLOCK_4X4).is_none());
+        assert!(get_segment_id(&prev, 4, 4, 4, 4, 5, 5, BLOCK_4X4).is_none());
+    }
+
+    /// Previous-frame extent smaller than the current frame's →
+    /// rejected. The §6.10 reference-frame walk would have produced
+    /// an inconsistent surface in that case.
+    #[test]
+    fn get_segment_id_rejects_prev_extent_smaller_than_current() {
+        let prev = vec![0i32; 2 * 2];
+        assert!(get_segment_id(&prev, 2, 2, 4, 4, 0, 0, BLOCK_4X4).is_none());
+        assert!(get_segment_id(&prev, 2, 4, 4, 4, 0, 0, BLOCK_4X4).is_none());
+        assert!(get_segment_id(&prev, 4, 2, 4, 4, 0, 0, BLOCK_4X4).is_none());
+    }
+
+    /// `prev_segment_ids.len()` not matching `prev_mi_rows *
+    /// prev_mi_cols` → rejected.
+    #[test]
+    fn get_segment_id_rejects_prev_length_mismatch() {
+        let prev_short = vec![0i32; 3]; // declared 2x2 = 4
+        assert!(get_segment_id(&prev_short, 2, 2, 2, 2, 0, 0, BLOCK_4X4).is_none());
+        let prev_long = vec![0i32; 5]; // declared 2x2 = 4
+        assert!(get_segment_id(&prev_long, 2, 2, 2, 2, 0, 0, BLOCK_4X4).is_none());
+    }
+
+    /// The return value composes with the §5.11.19 caller axis: a
+    /// `get_segment_id` value of `0` fed into
+    /// `decode_inter_segment_id` on the `!segmentation_update_map`
+    /// arm is adopted as the literal `segment_id` with no bit reads.
+    /// This proves the §5.11.19 → §5.11.21 wiring is correct end-to-
+    /// end on the no-read happy path.
+    #[test]
+    fn get_segment_id_composes_with_decode_inter_segment_id_no_read_path() {
+        let prev = vec![3i32; 4 * 4];
+        let predicted = get_segment_id(&prev, 4, 4, 4, 4, 0, 0, BLOCK_4X4).unwrap();
+        assert_eq!(predicted, 3);
+
+        // Now feed `predicted` into decode_inter_segment_id on the
+        // `!segmentation_update_map` arm; expect the function to
+        // return `(3, lossless_array[3])` with zero bits consumed.
+        let mi_rows: u32 = 4;
+        let mi_cols: u32 = 4;
+        let geometry = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        };
+        let mut walker = PartitionWalker::new(mi_rows, mi_cols, geometry).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Hostile buffer the function must NOT touch on this arm.
+        let buf = [0xFFu8; 4];
+        let mut dec =
+            crate::symbol_decoder::SymbolDecoder::init_symbol(&buf, buf.len(), false).unwrap();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[3] = true;
+        let (sid, lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                BLOCK_4X4,
+                /* pre_skip = */ true,
+                /* skip = */ 0,
+                /* seg_id_pre_skip = */ true,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ false,
+                /* segmentation_temporal_update = */ false,
+                predicted as u8,
+                /* last_active_seg_id = */ 7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 3, "no-update-map arm must adopt predicted id");
+        assert!(lossless, "lossless table lookup must use the adopted id");
     }
 }

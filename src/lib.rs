@@ -1285,6 +1285,54 @@
 //!     next round's architectural payoff. `decode_av1` /
 //!     `encode_av1` continue to return `Error::NotImplemented`.
 //!
+//!   * **Round 163.** The §5.11.21 `get_segment_id()` pure-helper
+//!     function (av1-spec p.72) — the inter-frame per-block segment-id
+//!     **prediction** lookup that scans the previous frame's
+//!     `PrevSegmentIds[][]` over the on-screen window covered by the
+//!     current block and returns the smallest id found. Lands as a
+//!     new free function [`cdf::get_segment_id`] (re-exported at the
+//!     crate root) that takes the previous-frame segmentation surface
+//!     as a row-major `&[i32]` slice plus its (`prev_mi_rows`,
+//!     `prev_mi_cols`) extent, the current frame's mi-extent
+//!     (`mi_rows`, `mi_cols`) and anchor (`mi_row`, `mi_col`), and the
+//!     block's `sub_size` (§3 `BLOCK_*` ordinal). Returns
+//!     `Some(seg)` with the §5.11.21 `Min` reduction result over
+//!     `xMis = Min(MiCols - MiCol, bw4)` × `yMis = Min(MiRows - MiRow,
+//!     bh4)` cells; `seg` is in `-1..=7` (the `-1` sentinel surfaces
+//!     when an unwritten previous-frame cell falls inside the window,
+//!     letting callers detect a malformed reference surface via the
+//!     existing §5.11.19 `predicted_segment_id > last_active_seg_id`
+//!     range guard). Returns `None` for caller-bug arguments
+//!     (out-of-range `sub_size`, anchor outside the current frame,
+//!     previous-frame extent smaller than the current frame's, or
+//!     `prev_segment_ids` length not matching `prev_mi_rows *
+//!     prev_mi_cols`). The function is **pure** (no walker state, no
+//!     bitreader, no CDF) and complements the r162
+//!     [`cdf::PartitionWalker::decode_inter_segment_id`] caller —
+//!     which takes a pre-computed `predicted_segment_id: u8` so the
+//!     walker can stay inter-frame-state-free — by giving the §6.10
+//!     reference-frame walk a verbatim spec-shaped routine to compute
+//!     that argument from `PrevSegmentIds[]`. 12 new cdf-module
+//!     tests (520 → 532): uniform-0 / uniform-7 reductions over
+//!     several block sizes; explicit Min-over-2x2-window cells with
+//!     out-of-window decoy values that must not contribute; frame-edge
+//!     `xMis`/`yMis` clipping on a `BLOCK_16X16` anchored at the
+//!     bottom-right of a 4x4 mi-grid; `-1` sentinel round-trip; a
+//!     wider-than-current previous frame exercising the
+//!     `prev_mi_cols` row stride; single-cell `BLOCK_4X4` covering
+//!     exactly `prev[MiRow][MiCol]` with a neighbour-cell decoy;
+//!     out-of-range guards for invalid `sub_size`, anchor past frame
+//!     extent, previous-frame extent smaller than current frame's,
+//!     and length / shape mismatch; an end-to-end composition test
+//!     feeding `get_segment_id`'s result into
+//!     `decode_inter_segment_id`'s no-read
+//!     `!segmentation_update_map` arm and verifying the predicted id
+//!     is adopted with zero bit reads on a hostile `0xFF` buffer.
+//!     The §5.11.18 `inter_frame_mode_info()` top-level dispatcher,
+//!     §5.11.7 `use_intrabc` arm, and §5.11.22 `intra_block_mode_info`
+//!     composite remain the next round's targets. `decode_av1` /
+//!     `encode_av1` continue to return `Error::NotImplemented`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -1308,38 +1356,39 @@ pub mod uncompressed_header_tail;
 pub use cdf::{
     block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, coeff_cdf_q_ctx,
     compound_mode_ctx, compute_tx_type, get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx,
-    get_palette_color_context, get_tx_class, inter_tx_type_set, interintra_ctx, interp_filter_ctx,
-    intra_dir, intra_mode_ctx, intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mi_height_log2,
-    mi_width_log2, mv_ctx, neg_deinterleave, num_4x4_blocks_high, num_4x4_blocks_wide,
-    palette_color_context_from_neighbors, palette_color_ctx, palette_tokens_args,
-    palette_tokens_plane, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx,
-    partition_subsize, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,
-    split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, DecodedBlockRecord,
-    IntraFrameModeInfoPrefix, PaletteColorContext, PalettePlane, PaletteTokensArgs,
-    PartitionWalker, TileCdfContext, TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT,
-    ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64,
-    BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4,
-    BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32,
-    BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS,
-    CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
-    COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
-    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
-    COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
-    DCT_ADST, DCT_DCT, DCT_FLIPADST, DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF,
-    DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COEFF_BASE_CDF,
-    DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF, DEFAULT_COMPOUND_IDX_CDF,
-    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF,
-    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
-    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF,
-    DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF,
-    DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF,
-    DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF,
-    DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF, DEFAULT_INTER_INTRA_MODE_CDF,
-    DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF,
-    DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF,
-    DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
-    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
-    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
+    get_palette_color_context, get_segment_id, get_tx_class, inter_tx_type_set, interintra_ctx,
+    interp_filter_ctx, intra_dir, intra_mode_ctx, intra_tx_type_set, is_inter_ctx,
+    is_tx_type_in_set, mi_height_log2, mi_width_log2, mv_ctx, neg_deinterleave,
+    num_4x4_blocks_high, num_4x4_blocks_wide, palette_color_context_from_neighbors,
+    palette_color_ctx, palette_tokens_args, palette_tokens_plane, palette_uv_mode_ctx,
+    palette_y_mode_ctx, partition_ctx, partition_subsize, ref_count_ctx, segment_id_ctx,
+    size_group, skip_ctx, skip_mode_ctx, split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx,
+    txfm_split_ctx, DecodedBlockRecord, IntraFrameModeInfoPrefix, PaletteColorContext,
+    PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext, TileGeometry,
+    ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16,
+    BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64,
+    BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32,
+    BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES,
+    BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS,
+    CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET,
+    COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS, COMPOUND_MODES,
+    COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES, COMP_GROUP_IDX_CONTEXTS,
+    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DCT_ADST, DCT_DCT, DCT_FLIPADST,
+    DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF,
+    DEFAULT_COEFF_BASE_CDF, DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF,
+    DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF,
+    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF,
+    DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF,
+    DEFAULT_DELTA_Q_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF,
+    DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF,
+    DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF,
+    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF,
+    DEFAULT_INTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF,
+    DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF,
+    DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF,
+    DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
+    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
+    DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
     DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,

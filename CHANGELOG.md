@@ -6,6 +6,59 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 163 — §5.11.21 `get_segment_id()` predicted-segment-id helper.**
+  Lands a new free function [`cdf::get_segment_id`] (re-exported at the
+  crate root) implementing the §5.11.21 spec body (av1-spec p.72): the
+  inter-frame per-block segment-id **prediction** lookup over the
+  previous frame's `PrevSegmentIds[][]` map. The function scans the
+  `xMis = Min(MiCols - MiCol, bw4)` × `yMis = Min(MiRows - MiRow, bh4)`
+  on-screen window covered by the current block and returns the
+  `Min` of the cells visited, with the §5.11.21 sentinel `seg = 7`
+  (i.e. `MAX_SEGMENTS - 1`) as the upper bound.
+
+  Signature: `get_segment_id(prev_segment_ids: &[i32], prev_mi_rows: u32,
+  prev_mi_cols: u32, mi_rows: u32, mi_cols: u32, mi_row: u32, mi_col:
+  u32, sub_size: usize) -> Option<i32>`. The previous-frame segmentation
+  surface is passed as a row-major `&[i32]` slice (matching the
+  `PartitionWalker::segment_ids` layout — `i32` so the §5.11.9 `-1`
+  sentinel for an unwritten cell round-trips faithfully). Returns
+  `Some(seg)` with `seg` in `-1..=7`; the `-1` value surfaces only if
+  a not-yet-decoded cell of a previous walker falls inside the window,
+  letting callers detect a malformed reference surface via the existing
+  §5.11.19 `predicted_segment_id > last_active_seg_id` range guard.
+  Returns `None` for caller-bug arguments: out-of-range `sub_size`,
+  anchor outside the current frame, previous-frame extent smaller than
+  the current frame's, or `prev_segment_ids.len() != prev_mi_rows *
+  prev_mi_cols`.
+
+  The function is **pure** — no walker state, no bitreader, no CDF —
+  and complements the r162
+  [`cdf::PartitionWalker::decode_inter_segment_id`] caller, which
+  takes a pre-computed `predicted_segment_id: u8` so the walker can
+  stay inter-frame-state-free. The §6.10 reference-frame walk now
+  has a verbatim spec-shaped routine to compute that argument from
+  `PrevSegmentIds[]`.
+
+  12 new cdf-module tests (520 → 532): uniform-0 / uniform-7
+  reductions over several block sizes; explicit Min-over-2x2-window
+  cells with out-of-window decoy values that must not contribute;
+  frame-edge `xMis`/`yMis` clipping on a `BLOCK_16X16` anchored at the
+  bottom-right of a 4x4 mi-grid; `-1` sentinel round-trip; a
+  wider-than-current previous frame exercising the `prev_mi_cols`
+  row stride; single-cell `BLOCK_4X4` covering exactly
+  `prev[MiRow][MiCol]` with a neighbour-cell decoy; out-of-range
+  guards for invalid `sub_size`, anchor past frame extent,
+  previous-frame extent smaller than current frame's, and length /
+  shape mismatch; an end-to-end composition test feeding
+  `get_segment_id`'s result into `decode_inter_segment_id`'s no-read
+  `!segmentation_update_map` arm and verifying the predicted id is
+  adopted with zero bit reads on a hostile `0xFF` buffer.
+
+  The §5.11.18 `inter_frame_mode_info()` top-level dispatcher, §5.11.7
+  `use_intrabc` arm, and §5.11.22 `intra_block_mode_info` composite
+  remain the next round's targets. `decode_av1` / `encode_av1`
+  continue to return `Error::NotImplemented`.
+
 * **Round 162 — §5.11.19 `inter_segment_id( preSkip )` syntax element.**
   Lands a new
   [`PartitionWalker::decode_inter_segment_id`] method implementing the
