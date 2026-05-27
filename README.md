@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 192)
+## Status — 2026-05-28 (round 193)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,102 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 193 lifts the **§7.11.3.9-10 OBMC (Overlapped Block Motion
+Compensation) overlap-blend leaves** — the last §7.11.3 inter-prediction
+sample-generation body. With r193 the entire §7.11.3 layer
+(translational MC + WARP MC + OBMC overlap blend + the five compound
+mechanisms) is implemented as callable Rust; the only piece still
+deferred is the §7.11.3.1 driver entry point that iterates per-block
+candidates against `RefFrames[..]` plane buffers and dispatches per
+`motion_mode` (next arc).
+
+Three new public bodies in `inter_pred`:
+
+* **§7.11.3.10 [`overlap_blending`]** — the per-pixel blend kernel:
+  for `i in 0..predH`, `j in 0..predW`,
+  `currentPlane[i][j] = Round2( m * currentPlane[i][j] +
+  (64 - m) * obmcPred[i][j], 6 )` with `m = mask[i]` on the
+  `OverlapPass::Above` (vertical fall-off, spec `pass = 0`) arm and
+  `m = mask[j]` on the `OverlapPass::Left` (horizontal fall-off,
+  spec `pass = 1`) arm. The `>> 6` matches the §7.11.3.9 weights being
+  in `0..=64`. Implemented in-place against a `u16` current-plane row-
+  major buffer with explicit `(pred_x, pred_y, curr_stride)` framing
+  so the caller can wire it against `CurrFrame[plane][..][..]` without
+  re-allocating.
+
+* **§7.11.3.9 [`get_obmc_mask`]** — the length-to-table dispatch per
+  av1-spec p.276 lines 15381-15393: `length ∈ {2, 4, 8, 16}` maps to
+  the matching `Obmc_Mask_*` slice; any other length returns
+  `Obmc_Mask_32` per the spec's `else` clause.
+
+* **§7.11.3.9 [`overlap_neighbour_predict_blend`]** — the
+  `predict_overlap` step-8 wrapper: `get_obmc_mask(mask_length)` →
+  [`overlap_blending`]. This is the spec-direct entry point the
+  §7.11.3.1 driver will invoke once per qualifying neighbour, after
+  the caller has already iterated the above-row / left-column mi-grid
+  + run translational MC ([`block_inter_prediction`] +
+  [`clip1_single_ref`]) for the neighbour's MV and derived
+  `(predX, predY, predW, predH, pass)` per the §7.11.3.9
+  `(x4, y4, step4)` walk.
+
+Plus the [`OverlapPass`] enum (`Above` / `Left`, matching spec
+`pass ∈ {0, 1}`) and the five transcribed tables (verbatim from
+av1-spec.txt p.277 lines 15406-15418):
+
+* **[`OBMC_MASK_2`]**  — `[u8; 2]  = [45, 64]`.
+* **[`OBMC_MASK_4`]**  — `[u8; 4]  = [39, 50, 59, 64]`.
+* **[`OBMC_MASK_8`]**  — `[u8; 8]  = [36, 42, 48, 53, 57, 61, 64, 64]`.
+* **[`OBMC_MASK_16`]** — `[u8; 16] = [34, 37, 40, 43, 46, 49, 52, 54,
+                                       56, 58, 60, 61, 64, 64, 64, 64]`.
+* **[`OBMC_MASK_32`]** — `[u8; 32]` (rising 33→64 over the first 24
+  entries, then 8 ×64 saturated tail).
+
+The §7.11.3.9 outer mi-grid driver (the `while ( nCount < nLimit && x4
+< Min(MiCols, MiCol + w4) )` above-row walk + the mirror left-column
+walk + per-candidate `(candRow, candCol, step4)` derivation +
+`get_plane_residual_size( MiSize, plane ) >= BLOCK_8X8` gate) is *NOT*
+landed in r193: it depends on the partially-implemented mi-grid /
+`MiSizes[..]` / `RefFrames[..]` / `Mvs[..]` state and is part of the
+§7.11.3.1 driver wiring deferred to the next arc. Once the driver
+lands, it consumes [`overlap_neighbour_predict_blend`] once per
+qualifying neighbour with the §7.11.3.4 MC output for that neighbour's
+MV.
+
+Test count: 998 → 1011 (+13 in lib). New tests include
+`r193_obmc_mask_table_shapes` (lengths + every entry ≤ 64),
+`r193_obmc_mask_first_and_last_values` (literal first/last entries of
+all five tables), `r193_get_obmc_mask_dispatches_each_size`,
+`r193_get_obmc_mask_else_returns_mask_32` (`length ∈ {0, 1, 7, 33}`
+all fall through),
+`r193_overlap_blending_identity_when_obmc_equals_curr` (the fixed-
+point invariant `m * v + (64 - m) * v = 64 * v` survives `Round2(_, 6)`
+exactly because `64 = 1 << 6`),
+`r193_overlap_blending_above_uses_row_mask` /
+`r193_overlap_blending_left_uses_col_mask` (per-row vs per-col mask
+indexing with `curr = 0`, `obmc = 64`, output equals `64 - mask[axis]`),
+`r193_overlap_blending_is_convex_combination` (output bounded by
+`[min(curr, obmc), max(curr, obmc)]`),
+`r193_overlap_blending_above_hand_computed_8tap`
+(`Round2(36 * 200 + 28 * 40, 6) = 130` and the last-row
+`Obmc_Mask_8[7] = 64` boundary identity),
+`r193_overlap_blending_offsets_respected`
+(`(pred_x, pred_y) = (2, 3)` leaves rows < 3 + cols < 2 untouched),
+`r193_overlap_blending_rejects_caller_bugs` (7 caller-bug cases
+including `pred_w == 0`, `obmc_stride < pred_w`,
+`curr_stride < pred_x + pred_w`, short `mask`),
+`r193_overlap_neighbour_predict_blend_matches_direct`,
+`r193_overlap_neighbour_predict_blend_falls_back_to_mask_32`
+(`mask_length = 100` hits `OBMC_MASK_32[0] = 33`).
+
+**Deferred to next arc.** §7.11.3.1 driver entry point that
+iterates per-block MC candidates against `RefFrames[refList]` plane
+buffers and wires the four §7.11.3 sample-generation kernels
+(translational, WARP, OBMC overlap-blend, compound blends) per the
+§5.11.27-decoded `motion_mode`; §7.14 loop filter; §9.5.3 Quantizer_Matrix
+table; §5.11.17 `read_var_tx_size` recursion (inter `TX_MODE_SELECT &&
+!skip && !lossless` arm of §5.11.16); §5.11.22 intra-block-in-inter-
+frame stub.
 
 Round 192 lifts the **§7.11.3.5-8 WARP motion compensation kernel** —
 the affine warp predictor that the §7.11.3.1 driver invokes on the

@@ -42,11 +42,26 @@
 //! ## Scope
 //!
 //! Translational single-ref MC + the §7.11.3.11-15 compound-mask
-//! blend bodies + the §7.11.3.5-8 WARP MC kernel. Deferred to
-//! subsequent arcs:
+//! blend bodies + the §7.11.3.5-8 WARP MC kernel + the §7.11.3.9-10
+//! OBMC overlap-blending leaves. With r193 the entire §7.11.3 inter
+//! prediction sample-generation layer is in place; the §7.11.3.1
+//! driver entry point that wires the kernels against `RefFrames[..]`
+//! plane buffers + the per-block `motion_mode` arm dispatch is
+//! deferred to the next arc.
 //!
-//! * §7.11.3.9 — `overlapped_motion_compensation` (OBMC)
-//! * §7.11.3.10 — `overlap_blending` (OBMC blending)
+//! Round 193 adds the OBMC bodies:
+//!
+//! * §7.11.3.10 — [`overlap_blending`] (overlap-blend pixel kernel) —
+//!   the `Round2( m * curr + (64 - m) * obmcPred, 6 )` site with the
+//!   `pass`-driven mask-axis selection ([`OverlapPass::Above`] ⇒
+//!   `m = mask[i]`, [`OverlapPass::Left`] ⇒ `m = mask[j]`).
+//! * §7.11.3.9 — [`get_obmc_mask`] (length-to-table dispatch) +
+//!   [`overlap_neighbour_predict_blend`] (the `predict_overlap` step-8
+//!   wrapper). The mi-grid outer driver lives in the §7.11.3.1 wiring
+//!   (next arc); this round provides the per-candidate post-MC blend.
+//! * The five `Obmc_Mask_*` tables ([`OBMC_MASK_2`], [`OBMC_MASK_4`],
+//!   [`OBMC_MASK_8`], [`OBMC_MASK_16`], [`OBMC_MASK_32`]) — verbatim
+//!   from av1-spec p.277 lines 15406-15418.
 //!
 //! Round 192 adds the four WARP bodies:
 //!
@@ -2690,6 +2705,342 @@ pub fn block_warp(
     Ok(())
 }
 
+// =====================================================================
+// §7.11.3.9 + §7.11.3.10 — Overlapped Motion Compensation (av1-spec
+// p.275-278).
+// =====================================================================
+//
+// OBMC is the inter-prediction post-process that blends the
+// translational MC output of the current block with translational MC
+// outputs of its above-row and left-column neighbours, weighted by a
+// raised-cosine `Obmc_Mask_*` table whose length matches the overlap
+// extent (predH for the above-pass vertical fall-off, predW for the
+// left-pass horizontal fall-off).
+//
+// The dispatcher gate is `motion_mode == OBMC` per §5.11.27
+// (read_motion_mode, av1-spec p.190 lines 10511-10526); §7.11.2.x
+// invokes §7.11.3.9 with `(plane, w, h)` only on that branch.
+//
+// This module provides:
+//
+// * [`OBMC_MASK_2`] / [`OBMC_MASK_4`] / [`OBMC_MASK_8`] /
+//   [`OBMC_MASK_16`] / [`OBMC_MASK_32`] — the five blending-weight
+//   tables transcribed verbatim from av1-spec p.277.
+// * [`get_obmc_mask`] — the §7.11.3.9 spec dispatch returning the
+//   `Obmc_Mask_N` slice for `N in {2, 4, 8, 16, 32}`.
+// * [`overlap_blending`] — §7.11.3.10's pixel blend
+//   `Round2( m * curr + (64 - m) * obmcPred, 6 )` with the `pass`-
+//   driven mask-axis selection (pass = 0 ⇒ `m = mask[i]` for vertical
+//   above-pass fall-off, pass = 1 ⇒ `m = mask[j]` for horizontal
+//   left-pass fall-off).
+// * [`OverlapPass`] — `Above` / `Left` enum for callers; the spec
+//   encodes the same two values as `pass ∈ {0, 1}`.
+// * [`overlap_neighbour_predict_blend`] — the §7.11.3.9 "predict_overlap"
+//   inner loop: given a single neighbour candidate's translational MC
+//   output (already formed via [`block_inter_prediction`] +
+//   [`clip1_single_ref`]) and its `(predX, predY, predW, predH, pass)`
+//   tuple, applies the `get_obmc_mask` selection and runs the
+//   [`overlap_blending`] step against the in-place current-frame plane
+//   buffer. This is the spec-direct entry point for the §7.11.3.9
+//   above/left passes when the caller has already iterated the
+//   neighbour mi-grid and run translational MC for the neighbour MV.
+//
+// The §7.11.3.9 outer driver (which iterates `x4 += step4` along the
+// top row + `y4 += step4` down the left column, capped at
+// `nLimit = Min(4, Mi_{Width,Height}_Log2[ MiSize ])`, and chooses
+// `predW`/`predH` per `(MiSize, plane)`) is *NOT* wired here: that
+// loop needs the partially-implemented MiSizes / RefFrames / Mvs / mi
+// grid state (§5.11.x mi tracking is partial at r193), and is part of
+// the §7.11.3.1 driver wiring deferred to the next arc. Once the
+// outer driver lands, it consumes `overlap_neighbour_predict_blend`
+// once per qualifying neighbour with the `block_inter_prediction`
+// output for the neighbour's MV.
+
+/// `Obmc_Mask_2[2]` — the 2-tap OBMC blending weight table for an
+/// overlap extent of 2 samples (av1-spec p.277 line 15406). The
+/// blending weights are in `0..=64` (matching §7.11.3.10's
+/// `Round2( m * curr + (64 - m) * obmcPred, 6 )` divisor of
+/// `1 << 6 = 64`).
+pub const OBMC_MASK_2: [u8; 2] = [45, 64];
+
+/// `Obmc_Mask_4[4]` — the 4-tap OBMC blending weight table for an
+/// overlap extent of 4 samples (av1-spec p.277 line 15408).
+pub const OBMC_MASK_4: [u8; 4] = [39, 50, 59, 64];
+
+/// `Obmc_Mask_8[8]` — the 8-tap OBMC blending weight table for an
+/// overlap extent of 8 samples (av1-spec p.277 line 15410).
+pub const OBMC_MASK_8: [u8; 8] = [36, 42, 48, 53, 57, 61, 64, 64];
+
+/// `Obmc_Mask_16[16]` — the 16-tap OBMC blending weight table for an
+/// overlap extent of 16 samples (av1-spec p.277 lines 15412-15413).
+pub const OBMC_MASK_16: [u8; 16] = [
+    34, 37, 40, 43, 46, 49, 52, 54, 56, 58, 60, 61, 64, 64, 64, 64,
+];
+
+/// `Obmc_Mask_32[32]` — the 32-tap OBMC blending weight table for an
+/// overlap extent of 32 samples (av1-spec p.277 lines 15415-15418).
+pub const OBMC_MASK_32: [u8; 32] = [
+    33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48, 50, 51, 52, 53, 55, 56, 57, 58, 59, 60, 60, 61, 62,
+    64, 64, 64, 64, 64, 64, 64, 64,
+];
+
+/// §7.11.3.9 `get_obmc_mask(length)` (av1-spec p.276 lines 15381-15393).
+///
+/// Returns the OBMC blending weight slice whose length matches the
+/// overlap extent. The spec defines five tables for
+/// `length ∈ {2, 4, 8, 16, 32}`; for any other length the spec's
+/// `else` branch returns `Obmc_Mask_32`, so `length` values outside
+/// the table set (e.g. `length = 1` or `length > 32`) fall through to
+/// the 32-tap table.
+///
+/// In practice the §7.11.3.9 driver always calls this with
+/// `length ∈ {min(h >> 1, 32 >> subY), min(w >> 1, 32 >> subX)}`,
+/// which for the block sizes that admit OBMC
+/// (Mi_{Width,Height}_Log2 ≥ 1, i.e. ≥ BLOCK_8X8) and the supported
+/// chroma subsamplings always lands on `{2, 4, 8, 16, 32}`.
+pub fn get_obmc_mask(length: usize) -> &'static [u8] {
+    if length == 2 {
+        &OBMC_MASK_2
+    } else if length == 4 {
+        &OBMC_MASK_4
+    } else if length == 8 {
+        &OBMC_MASK_8
+    } else if length == 16 {
+        &OBMC_MASK_16
+    } else {
+        &OBMC_MASK_32
+    }
+}
+
+/// §7.11.3.9 `pass` parameter encoded as an enum.
+///
+/// `pass = 0` (`Above`) means the neighbour MV is from the above row,
+/// the fall-off is vertical, and §7.11.3.10's `m` is `mask[i]` (row
+/// index).
+///
+/// `pass = 1` (`Left`) means the neighbour MV is from the left
+/// column, the fall-off is horizontal, and §7.11.3.10's `m` is
+/// `mask[j]` (col index).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OverlapPass {
+    /// Above-row neighbour (`pass = 0`); §7.11.3.10 uses `mask[i]`.
+    Above,
+    /// Left-column neighbour (`pass = 1`); §7.11.3.10 uses `mask[j]`.
+    Left,
+}
+
+/// §7.11.3.10 (av1-spec p.277-278): the overlap-blending pixel kernel.
+///
+/// For `i in 0..predH`, `j in 0..predW`:
+///
+/// 1. `m` is selected from `mask` per `pass` (av1-spec p.278 lines
+///    15442-15446):
+///    * `pass == Above` (= spec `pass == 0`) ⇒ `m = mask[i]`.
+///    * `pass == Left`  (= spec `pass == 1`) ⇒ `m = mask[j]`.
+/// 2. `CurrFrame[plane][predY + i][predX + j]` is set to
+///    `Round2( m * CurrFrame[plane][predY + i][predX + j]
+///             + (64 - m) * obmc_pred[i][j], 6 )` (av1-spec p.278
+///    lines 15448-15449).
+///
+/// The shift by 6 follows from the `Obmc_Mask_*` weights being in
+/// `0..=64` so `m + (64 - m) = 64 = 1 << 6`.
+///
+/// ## Arguments
+///
+/// * `current_plane` — the current frame's plane samples, row-major;
+///   `current_plane[(pred_y + i) * curr_stride + (pred_x + j)]` is
+///   read and written in place for the blended region. `u16` matches
+///   the §7.11.3.4 / §7.11.3.5 output domain (any of 8/10/12-bit
+///   content fits in `u16`).
+/// * `curr_stride` — row stride of `current_plane` in samples.
+/// * `pred_x` / `pred_y` — top-left sample of the overlap region in
+///   the `current_plane` grid (§7.11.3.9 step-3/4 `predX` / `predY`).
+/// * `pred_w` / `pred_h` — width / height of the overlap region in
+///   samples.
+/// * `pass` — `Above` or `Left` per §7.11.3.10.
+/// * `obmc_pred` — the neighbour-MV prediction samples for the overlap
+///   region, row-major; `obmc_pred[i * obmc_stride + j]` is read for
+///   `i in 0..pred_h`, `j in 0..pred_w`. These should be the output
+///   of [`block_inter_prediction`] + [`clip1_single_ref`] (i.e. the
+///   `Clip1` step at av1-spec p.276 line 15373 — predict_overlap
+///   step 7).
+/// * `obmc_stride` — row stride of `obmc_pred` (≥ `pred_w`).
+/// * `mask` — the §7.11.3.9 `get_obmc_mask` output slice. `mask.len()`
+///   must be `>= pred_h` when `pass == Above`, `>= pred_w` when
+///   `pass == Left`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success. Returns
+/// [`crate::Error::PartitionWalkOutOfRange`] for caller-bug arguments:
+/// `pred_w == 0`, `pred_h == 0`, `obmc_stride < pred_w`,
+/// `curr_stride < pred_x + pred_w`, `obmc_pred` shorter than
+/// `pred_h * obmc_stride`, `current_plane` shorter than
+/// `(pred_y + pred_h) * curr_stride`, or `mask` shorter than the
+/// pass-axis length (`pred_h` for `Above`, `pred_w` for `Left`).
+#[allow(clippy::too_many_arguments)]
+pub fn overlap_blending(
+    current_plane: &mut [u16],
+    curr_stride: usize,
+    pred_x: usize,
+    pred_y: usize,
+    pred_w: usize,
+    pred_h: usize,
+    pass: OverlapPass,
+    obmc_pred: &[u16],
+    obmc_stride: usize,
+    mask: &[u8],
+) -> Result<(), crate::Error> {
+    // ---------- caller-bug guards ----------
+    if pred_w == 0 || pred_h == 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if obmc_stride < pred_w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if curr_stride < pred_x.saturating_add(pred_w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if obmc_pred.len() < pred_h * obmc_stride {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed_curr_rows = pred_y.saturating_add(pred_h);
+    if current_plane.len() < needed_curr_rows.saturating_mul(curr_stride) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let mask_axis_len = match pass {
+        OverlapPass::Above => pred_h,
+        OverlapPass::Left => pred_w,
+    };
+    if mask.len() < mask_axis_len {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.10 inner loop ----------
+    //
+    //   for i in 0..predH:
+    //     for j in 0..predW:
+    //       if pass == 0: m = mask[i]
+    //       else:         m = mask[j]
+    //       CurrFrame[plane][predY+i][predX+j] =
+    //           Round2( m * CurrFrame[plane][predY+i][predX+j]
+    //                   + (64 - m) * obmcPred[i][j], 6 )
+    //
+    // (av1-spec p.278 lines 15440-15449.)
+    //
+    // Split the pass match outside the inner loop: in the Above-pass
+    // `m` only depends on `i` so it stays constant across `j`; in the
+    // Left-pass `m` only depends on `j` so it's resolved per-column.
+    match pass {
+        OverlapPass::Above => {
+            for (i, &mi) in mask.iter().enumerate().take(pred_h) {
+                let m: u32 = mi as u32;
+                let curr_row_base = (pred_y + i) * curr_stride;
+                let obmc_row_base = i * obmc_stride;
+                for j in 0..pred_w {
+                    let curr_idx = curr_row_base + pred_x + j;
+                    let obmc_idx = obmc_row_base + j;
+                    let curr_sample = current_plane[curr_idx] as u32;
+                    let obmc_sample = obmc_pred[obmc_idx] as u32;
+                    // m ∈ [0, 64] so `64 - m` is non-negative; product
+                    // fits in u32 for any bit depth ≤ 14 (64 * (1<<14)
+                    // = 1<<20).
+                    let blended = m * curr_sample + (64 - m) * obmc_sample;
+                    // Round2(blended, 6) = (blended + (1 << 5)) >> 6.
+                    current_plane[curr_idx] = ((blended + (1u32 << 5)) >> 6) as u16;
+                }
+            }
+        }
+        OverlapPass::Left => {
+            for i in 0..pred_h {
+                let curr_row_base = (pred_y + i) * curr_stride;
+                let obmc_row_base = i * obmc_stride;
+                for (j, &mj) in mask.iter().enumerate().take(pred_w) {
+                    let m: u32 = mj as u32;
+                    let curr_idx = curr_row_base + pred_x + j;
+                    let obmc_idx = obmc_row_base + j;
+                    let curr_sample = current_plane[curr_idx] as u32;
+                    let obmc_sample = obmc_pred[obmc_idx] as u32;
+                    let blended = m * curr_sample + (64 - m) * obmc_sample;
+                    current_plane[curr_idx] = ((blended + (1u32 << 5)) >> 6) as u16;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// §7.11.3.9 `predict_overlap` step 8 wrapper (av1-spec p.276 lines
+/// 15375-15376).
+///
+/// Wraps the [`get_obmc_mask`] → [`overlap_blending`] pipeline that
+/// the spec's `predict_overlap` invokes once it has formed the
+/// `obmcPred[i][j]` array for a single neighbour candidate. Callers
+/// must:
+///
+/// 1. Have iterated the neighbour mi-grid (above row for `pass ==
+///    Above`, left column for `pass == Left`) and chosen the candidate
+///    cell `(candRow, candCol)` whose `RefFrames[..][0] > INTRA_FRAME`.
+/// 2. Have formed `obmc_pred` via [`block_inter_prediction`] (with
+///    the candidate's `Mvs[candRow][candCol][0]` and
+///    `ref_frame_idx[..]`) followed by [`clip1_single_ref`] (the spec
+///    explicitly applies `Clip1` at step 7 of `predict_overlap`).
+/// 3. Have derived `(pred_x, pred_y, pred_w, pred_h)` per §7.11.3.9
+///    `(x4, y4, step4)` walk:
+///       * `predX = (x4 * 4) >> subX`
+///       * `predY = (y4 * 4) >> subY`
+///       * For `pass == Above`: `predW = min(w, (step4 * MI_SIZE) >>
+///         subX)`, `predH = min(h >> 1, 32 >> subY)`,
+///         `mask_length = predH`.
+///       * For `pass == Left`: `predW = min(w >> 1, 32 >> subX)`,
+///         `predH = min(h, (step4 * MI_SIZE) >> subY)`,
+///         `mask_length = predW`.
+///
+/// The §7.11.3.9 outer mi-grid walk + the per-candidate step 1-7
+/// translational MC are deferred to the §7.11.3.1 driver wiring (next
+/// arc).
+///
+/// ## Arguments
+///
+/// Same as [`overlap_blending`], except `mask_length` is supplied
+/// separately so the helper performs the [`get_obmc_mask`] lookup
+/// itself (the spec applies the lookup inside `predict_overlap`'s
+/// outer loop, not inside the inner blend).
+///
+/// ## Returns
+///
+/// `Ok(())` on success. Returns
+/// [`crate::Error::PartitionWalkOutOfRange`] for the same caller-bug
+/// conditions as [`overlap_blending`].
+#[allow(clippy::too_many_arguments)]
+pub fn overlap_neighbour_predict_blend(
+    current_plane: &mut [u16],
+    curr_stride: usize,
+    pred_x: usize,
+    pred_y: usize,
+    pred_w: usize,
+    pred_h: usize,
+    pass: OverlapPass,
+    obmc_pred: &[u16],
+    obmc_stride: usize,
+    mask_length: usize,
+) -> Result<(), crate::Error> {
+    let mask = get_obmc_mask(mask_length);
+    overlap_blending(
+        current_plane,
+        curr_stride,
+        pred_x,
+        pred_y,
+        pred_w,
+        pred_h,
+        pass,
+        obmc_pred,
+        obmc_stride,
+        mask,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4047,6 +4398,466 @@ mod tests {
         assert_eq!(DIV_LUT[256], 8192);
         for w in DIV_LUT.windows(2) {
             assert!(w[0] >= w[1], "Div_Lut not monotonic at {} > {}", w[0], w[1]);
+        }
+    }
+
+    // ---------- §7.11.3.9-10 OBMC ----------
+
+    /// §7.11.3.9 + p.277: the five `Obmc_Mask_*` tables have the
+    /// declared lengths and every entry is in `0..=64` (since
+    /// §7.11.3.10's `64 - m` must stay non-negative).
+    #[test]
+    fn r193_obmc_mask_table_shapes() {
+        assert_eq!(OBMC_MASK_2.len(), 2);
+        assert_eq!(OBMC_MASK_4.len(), 4);
+        assert_eq!(OBMC_MASK_8.len(), 8);
+        assert_eq!(OBMC_MASK_16.len(), 16);
+        assert_eq!(OBMC_MASK_32.len(), 32);
+        for &m in OBMC_MASK_2
+            .iter()
+            .chain(OBMC_MASK_4.iter())
+            .chain(OBMC_MASK_8.iter())
+            .chain(OBMC_MASK_16.iter())
+            .chain(OBMC_MASK_32.iter())
+        {
+            assert!(m <= 64, "obmc mask entry {m} > 64");
+        }
+    }
+
+    /// §7.11.3.9 p.277 — the spec's literal table values: the first
+    /// entries (`Obmc_Mask_2[0] = 45`, `Obmc_Mask_4[0] = 39`,
+    /// `Obmc_Mask_8[0] = 36`, `Obmc_Mask_16[0] = 34`,
+    /// `Obmc_Mask_32[0] = 33`) and the table tails (last value of each
+    /// table = 64, indicating the overlap fully sticks to the original
+    /// sample at the boundary furthest from the neighbour).
+    #[test]
+    fn r193_obmc_mask_first_and_last_values() {
+        assert_eq!(OBMC_MASK_2[0], 45);
+        assert_eq!(OBMC_MASK_2[1], 64);
+        assert_eq!(OBMC_MASK_4[0], 39);
+        assert_eq!(*OBMC_MASK_4.last().unwrap(), 64);
+        assert_eq!(OBMC_MASK_8[0], 36);
+        assert_eq!(*OBMC_MASK_8.last().unwrap(), 64);
+        assert_eq!(OBMC_MASK_16[0], 34);
+        assert_eq!(*OBMC_MASK_16.last().unwrap(), 64);
+        assert_eq!(OBMC_MASK_32[0], 33);
+        assert_eq!(*OBMC_MASK_32.last().unwrap(), 64);
+    }
+
+    /// §7.11.3.9 `get_obmc_mask(length)` p.276 lines 15381-15393 —
+    /// returns the matching table for the five spec-listed lengths.
+    #[test]
+    fn r193_get_obmc_mask_dispatches_each_size() {
+        assert_eq!(get_obmc_mask(2), &OBMC_MASK_2[..]);
+        assert_eq!(get_obmc_mask(4), &OBMC_MASK_4[..]);
+        assert_eq!(get_obmc_mask(8), &OBMC_MASK_8[..]);
+        assert_eq!(get_obmc_mask(16), &OBMC_MASK_16[..]);
+        assert_eq!(get_obmc_mask(32), &OBMC_MASK_32[..]);
+    }
+
+    /// §7.11.3.9 `get_obmc_mask` `else` branch (p.276 line 15390) — any
+    /// length outside `{2, 4, 8, 16}` falls through to
+    /// `Obmc_Mask_32`. The driver never produces such a length in
+    /// practice but the function's contract preserves the spec's
+    /// `else` clause.
+    #[test]
+    fn r193_get_obmc_mask_else_returns_mask_32() {
+        assert_eq!(get_obmc_mask(32), &OBMC_MASK_32[..]);
+        assert_eq!(get_obmc_mask(33), &OBMC_MASK_32[..]);
+        assert_eq!(get_obmc_mask(1), &OBMC_MASK_32[..]);
+        assert_eq!(get_obmc_mask(0), &OBMC_MASK_32[..]);
+        assert_eq!(get_obmc_mask(7), &OBMC_MASK_32[..]);
+    }
+
+    /// §7.11.3.10 fixed-point invariant — when `obmc_pred == curr`
+    /// everywhere, the blend leaves the buffer unchanged for any
+    /// mask values:
+    ///
+    ///   Round2( m * v + (64 - m) * v, 6 ) = Round2(64 * v, 6) = v
+    ///
+    /// holds exactly because `64 = 1 << 6` so the Round2 rounding bit
+    /// `+(1 << 5)` is the canonical mid-point that maps back to v.
+    #[test]
+    fn r193_overlap_blending_identity_when_obmc_equals_curr() {
+        // 4x4 region inside a 6x8 plane, pred_x=1, pred_y=1.
+        let curr_stride = 8usize;
+        let curr_h = 6usize;
+        let mut curr: Vec<u16> = (0..(curr_stride * curr_h) as u16).collect();
+        let pre = curr.clone();
+        let pred_w = 4usize;
+        let pred_h = 4usize;
+        let pred_x = 1usize;
+        let pred_y = 1usize;
+        // obmcPred[i][j] = curr[pred_y + i][pred_x + j].
+        let mut obmc = vec![0u16; pred_w * pred_h];
+        for i in 0..pred_h {
+            for j in 0..pred_w {
+                obmc[i * pred_w + j] = curr[(pred_y + i) * curr_stride + pred_x + j];
+            }
+        }
+        overlap_blending(
+            &mut curr,
+            curr_stride,
+            pred_x,
+            pred_y,
+            pred_w,
+            pred_h,
+            OverlapPass::Above,
+            &obmc,
+            pred_w,
+            &OBMC_MASK_4,
+        )
+        .unwrap();
+        assert_eq!(curr, pre, "obmc == curr ⇒ blend identity");
+    }
+
+    /// §7.11.3.10 — `pass == Above` selects `m = mask[i]` (per row).
+    /// With `curr = 0`, `obmc = 64` everywhere, and the `Obmc_Mask_4`
+    /// table `{39, 50, 59, 64}`, the output rows are:
+    ///
+    ///   Round2( m * 0 + (64 - m) * 64, 6 )
+    ///     = Round2( (64 - m) * 64, 6 )
+    ///     = 64 - m
+    ///
+    /// so the output rows = {25, 14, 5, 0}.
+    #[test]
+    fn r193_overlap_blending_above_uses_row_mask() {
+        let curr_stride = 4usize;
+        let mut curr = vec![0u16; curr_stride * 4];
+        let obmc = vec![64u16; curr_stride * 4];
+        overlap_blending(
+            &mut curr,
+            curr_stride,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            curr_stride,
+            &OBMC_MASK_4,
+        )
+        .unwrap();
+        let expected_per_row: [u16; 4] = [64 - 39, 64 - 50, 64 - 59, 64 - 64];
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    curr[i * curr_stride + j],
+                    expected_per_row[i],
+                    "above row {i} col {j}",
+                );
+            }
+        }
+    }
+
+    /// §7.11.3.10 — `pass == Left` selects `m = mask[j]` (per col).
+    /// Mirror of the above-test: with `curr = 0`, `obmc = 64`, output
+    /// columns = `{25, 14, 5, 0}`.
+    #[test]
+    fn r193_overlap_blending_left_uses_col_mask() {
+        let curr_stride = 4usize;
+        let mut curr = vec![0u16; curr_stride * 4];
+        let obmc = vec![64u16; curr_stride * 4];
+        overlap_blending(
+            &mut curr,
+            curr_stride,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Left,
+            &obmc,
+            curr_stride,
+            &OBMC_MASK_4,
+        )
+        .unwrap();
+        let expected_per_col: [u16; 4] = [64 - 39, 64 - 50, 64 - 59, 64 - 64];
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    curr[i * curr_stride + j],
+                    expected_per_col[j],
+                    "left row {i} col {j}",
+                );
+            }
+        }
+    }
+
+    /// §7.11.3.10 — the blend is bounded by `max(curr, obmc)` and
+    /// floored by `min(curr, obmc)` regardless of mask weights (the
+    /// blend is a convex combination of the two inputs).
+    #[test]
+    fn r193_overlap_blending_is_convex_combination() {
+        let curr_stride = 8usize;
+        let mut curr = vec![100u16; curr_stride * 8];
+        let obmc = vec![300u16; curr_stride * 8];
+        overlap_blending(
+            &mut curr,
+            curr_stride,
+            0,
+            0,
+            8,
+            8,
+            OverlapPass::Above,
+            &obmc,
+            curr_stride,
+            &OBMC_MASK_8,
+        )
+        .unwrap();
+        for v in &curr {
+            assert!(*v >= 100 && *v <= 300, "value {v} outside [100, 300]");
+        }
+    }
+
+    /// §7.11.3.10 — `pass == Above` with `m = mask[0]` overrides the
+    /// top row's blend; the bottom row (`mask[pred_h - 1]`) overrides
+    /// the bottom row. For `Obmc_Mask_8 = {36, 42, 48, 53, 57, 61,
+    /// 64, 64}`, with `curr = 200`, `obmc = 40`:
+    ///
+    ///   row 0: Round2( 36 * 200 + 28 * 40, 6 )
+    ///        = Round2( 7200 + 1120, 6 ) = Round2( 8320, 6 ) = 130
+    ///   row 7: Round2( 64 * 200 +  0 * 40, 6 )
+    ///        = Round2( 12800, 6 )                              = 200
+    #[test]
+    fn r193_overlap_blending_above_hand_computed_8tap() {
+        let curr_stride = 8usize;
+        let mut curr = vec![200u16; curr_stride * 8];
+        let obmc = vec![40u16; curr_stride * 8];
+        overlap_blending(
+            &mut curr,
+            curr_stride,
+            0,
+            0,
+            8,
+            8,
+            OverlapPass::Above,
+            &obmc,
+            curr_stride,
+            &OBMC_MASK_8,
+        )
+        .unwrap();
+        // Row 0: Round2(36 * 200 + 28 * 40, 6) = Round2(8320, 6) = 130.
+        for (j, v) in curr.iter().enumerate().take(8) {
+            assert_eq!(*v, 130, "row 0 col {j}");
+        }
+        // Row 7: Round2(64 * 200 + 0 * 40, 6) = Round2(12800, 6) = 200.
+        let row7 = &curr[7 * curr_stride..7 * curr_stride + 8];
+        for (j, v) in row7.iter().enumerate() {
+            assert_eq!(*v, 200, "row 7 col {j}");
+        }
+    }
+
+    /// §7.11.3.10 — `pred_x` / `pred_y` correctly offset the write
+    /// region. With `pred_x = 2`, `pred_y = 3`, the rows above 3 and
+    /// the cols left of 2 must be unchanged.
+    #[test]
+    fn r193_overlap_blending_offsets_respected() {
+        let curr_stride = 8usize;
+        let mut curr = vec![17u16; curr_stride * 8];
+        let pre = curr.clone();
+        let obmc = vec![64u16; 4 * 4];
+        overlap_blending(
+            &mut curr,
+            curr_stride,
+            2,
+            3,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            4,
+            &OBMC_MASK_4,
+        )
+        .unwrap();
+        // Outside region: unchanged.
+        for i in 0..8 {
+            for j in 0..8 {
+                let in_region = (3..7).contains(&i) && (2..6).contains(&j);
+                if !in_region {
+                    assert_eq!(
+                        curr[i * curr_stride + j],
+                        pre[i * curr_stride + j],
+                        "outside-region ({i},{j}) modified",
+                    );
+                }
+            }
+        }
+    }
+
+    /// §7.11.3.10 — caller-bug rejections.
+    #[test]
+    fn r193_overlap_blending_rejects_caller_bugs() {
+        let mut curr = vec![0u16; 64];
+        let obmc = vec![0u16; 64];
+        // pred_w == 0
+        assert!(overlap_blending(
+            &mut curr,
+            8,
+            0,
+            0,
+            0,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            4,
+            &OBMC_MASK_4
+        )
+        .is_err());
+        // pred_h == 0
+        assert!(overlap_blending(
+            &mut curr,
+            8,
+            0,
+            0,
+            4,
+            0,
+            OverlapPass::Above,
+            &obmc,
+            4,
+            &OBMC_MASK_4
+        )
+        .is_err());
+        // obmc_stride < pred_w
+        assert!(overlap_blending(
+            &mut curr,
+            8,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            3,
+            &OBMC_MASK_4
+        )
+        .is_err());
+        // curr_stride < pred_x + pred_w
+        assert!(overlap_blending(
+            &mut curr,
+            4,
+            2,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            4,
+            &OBMC_MASK_4
+        )
+        .is_err());
+        // obmc too short
+        let tiny = vec![0u16; 4];
+        assert!(overlap_blending(
+            &mut curr,
+            8,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &tiny,
+            4,
+            &OBMC_MASK_4
+        )
+        .is_err());
+        // current_plane too short
+        let mut small = vec![0u16; 8];
+        assert!(overlap_blending(
+            &mut small,
+            8,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            4,
+            &OBMC_MASK_4
+        )
+        .is_err());
+        // mask too short for the pass axis
+        let mut curr2 = vec![0u16; 64];
+        let one = [64u8; 1];
+        assert!(overlap_blending(
+            &mut curr2,
+            8,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            4,
+            &one
+        )
+        .is_err());
+    }
+
+    /// §7.11.3.9 `predict_overlap` step-8 wrapper — calling the helper
+    /// with `mask_length = pred_h` (the Above-pass default) produces
+    /// the same output as a direct `overlap_blending` call with
+    /// `OBMC_MASK_4`.
+    #[test]
+    fn r193_overlap_neighbour_predict_blend_matches_direct() {
+        let curr_stride = 4usize;
+        let mut curr_a = vec![0u16; curr_stride * 4];
+        let mut curr_b = vec![0u16; curr_stride * 4];
+        let obmc = vec![64u16; curr_stride * 4];
+        overlap_blending(
+            &mut curr_a,
+            curr_stride,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            curr_stride,
+            &OBMC_MASK_4,
+        )
+        .unwrap();
+        overlap_neighbour_predict_blend(
+            &mut curr_b,
+            curr_stride,
+            0,
+            0,
+            4,
+            4,
+            OverlapPass::Above,
+            &obmc,
+            curr_stride,
+            /* mask_length */ 4,
+        )
+        .unwrap();
+        assert_eq!(curr_a, curr_b);
+    }
+
+    /// §7.11.3.9 `predict_overlap` step-8 wrapper — `mask_length`
+    /// outside `{2, 4, 8, 16}` falls through to `OBMC_MASK_32` (the
+    /// spec's `else` branch). Verifies the dispatch lands on
+    /// `OBMC_MASK_32[0] = 33` for an 8x8 above-pass region.
+    #[test]
+    fn r193_overlap_neighbour_predict_blend_falls_back_to_mask_32() {
+        let curr_stride = 8usize;
+        let mut curr = vec![0u16; curr_stride * 8];
+        let obmc = vec![64u16; curr_stride * 8];
+        overlap_neighbour_predict_blend(
+            &mut curr,
+            curr_stride,
+            0,
+            0,
+            8,
+            8,
+            OverlapPass::Above,
+            &obmc,
+            curr_stride,
+            /* mask_length */ 100,
+        )
+        .unwrap();
+        // Above-pass row 0 ⇒ m = OBMC_MASK_32[0] = 33. Output:
+        //   Round2(33 * 0 + 31 * 64, 6) = Round2(1984, 6) = 31.
+        for (j, v) in curr.iter().enumerate().take(8) {
+            assert_eq!(*v, 64 - 33, "row 0 col {j}");
         }
     }
 }

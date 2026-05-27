@@ -6,6 +6,30 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 193 — §7.11.3.9-10 OBMC (Overlapped Block Motion
+  Compensation) overlap-blend leaves.**
+  Three new public bodies in `inter_pred` lift the last §7.11.3
+  inter-prediction sample-generation body: `overlap_blending`
+  (§7.11.3.10 — per-pixel blend `currentPlane[i][j] = Round2(m *
+  currentPlane[i][j] + (64 - m) * obmcPred[i][j], 6)` with row-
+  vs-column mask indexing), `get_obmc_mask` (§7.11.3.9
+  length-to-table dispatch), `overlap_neighbour_predict_blend` (the
+  `predict_overlap` step-8 wrapper that runs the lookup +
+  blending). Plus the new `OverlapPass` enum (`Above` / `Left`
+  matching spec `pass ∈ {0, 1}`) and the five `OBMC_MASK_*` tables
+  transcribed verbatim from av1-spec p.277 lines 15406-15418
+  (`OBMC_MASK_2` = `[45, 64]`, `OBMC_MASK_4` = `[39, 50, 59, 64]`,
+  `OBMC_MASK_8` = `[36, 42, 48, 53, 57, 61, 64, 64]`,
+  `OBMC_MASK_16` rising 34→64 + 4×64 saturated tail,
+  `OBMC_MASK_32` rising 33→64 + 8×64 saturated tail).
+  The §7.11.3.9 outer mi-grid driver (`while ( nCount < nLimit && x4
+  < Min(MiCols, MiCol + w4) )` above-row walk + the mirror left-
+  column walk + `get_plane_residual_size( MiSize, plane ) >=
+  BLOCK_8X8` gate) needs partially-implemented mi-grid /
+  `MiSizes[..]` / `RefFrames[..]` / `Mvs[..]` state and lives in
+  the §7.11.3.1 driver wiring deferred to the next arc. Test
+  count: 998 → 1011 (+13 in lib).
+
 * **Round 192 — §7.11.3.5-8 WARP motion compensation.**
   Four new public bodies in `inter_pred` lift the §7.11.3.1
   driver's affine-warp MC arm (LOCALWARP + GLOBAL_GLOBALMV):
