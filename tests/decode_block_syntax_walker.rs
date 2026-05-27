@@ -24,9 +24,17 @@
 //!    and advances past §5.11.30; the §7.11.2.5 DC-PRED sample-
 //!    generation leaf is exposed standalone as
 //!    [`oxideav_av1::predict_intra_dc_pred`].
-//! 6. §5.11.34 `residual()` — STUBBED. The walker now short-circuits
-//!    here with
-//!    [`oxideav_av1::Error::DecodeBlockResidualUnsupported`].
+//! 6. §5.11.34 `residual()` — WIRED THROUGH (r181). The walker
+//!    invokes `PartitionWalker::residual` which drives the §5.11.34
+//!    outer dispatch + §5.11.36 transform_tree recursion + per-TU
+//!    §5.11.39 `PartitionWalker::coefficients` bitstream read. On the
+//!    `!skip` walker path the §5.11.39 reader will, with high
+//!    probability against an unrigged bitstream, decode at least one
+//!    non-zero TU and the walker short-circuits at
+//!    `Error::ResidualReconstructUnsupported` (the §7.6
+//!    inverse-transform + §7.7 reconstruction pass next-arc target).
+//!    The `skip == true` arm (when rigged so) returns through
+//!    `decode_block_syntax` cleanly with the per-block `DecodedBlock`.
 //!
 //! These tests drive the walker with synthesised in-memory state
 //! (no real bitstream decode required) on a minimal mi grid and
@@ -143,12 +151,22 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
     );
     let pos_after = dec.position();
 
-    // §5.11.34 stub fired — the walker now advances past §5.11.30
-    // `compute_prediction()` via the r180 §5.11.33 dispatcher.
+    // §5.11.34 fired — the walker advances past §5.11.34
+    // `residual()` (the r181 dispatcher) and reaches §5.11.35
+    // `reconstruct()` (the §7.6 inverse transform pass).
+    //
+    // Post-r181 the §5.11.34 dispatcher invokes the §5.11.39
+    // [`PartitionWalker::coefficients`] reader per TU on the `!skip`
+    // path. With the test fixture's rigged-zero CDFs the §5.11.39
+    // `all_zero` symbol returns `0` (non-all-zero) on the first
+    // reachable TU, the §5.11.39 reader walks the EOB / coeff
+    // cascade, and the dispatcher surfaces
+    // `ResidualReconstructUnsupported` on the
+    // `if ( eob > 0 ) reconstruct(...)` arm.
     assert_eq!(
         result,
-        Err(Error::DecodeBlockResidualUnsupported),
-        "post-r180 the §5.11.5 walker must short-circuit at §5.11.34 residual() after the intra mode-info + read_block_tx_size + §5.11.33 compute_prediction pass"
+        Err(Error::ResidualReconstructUnsupported),
+        "post-r181 the §5.11.5 walker must short-circuit at §5.11.35 reconstruct() after running §5.11.34 residual() + per-TU §5.11.39 coefficients() reads"
     );
 
     // The §5.11.5 prologue + §5.11.7 prefix consumed at least the
@@ -234,7 +252,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             /* subsampling_y = */ 1, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
         );
-        assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
+        assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
     }
 
     // Arm 2: bw4 == 1 && subsampling_x && MiCol & 1 == 0 ⇒ HasChroma = false.
@@ -249,7 +267,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             /* subsampling_y = */ 0, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
         );
-        assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
+        assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
     }
 
     // Arm 3 fall-through: no sub-sampling ⇒ HasChroma = num_planes > 1.
@@ -264,7 +282,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, true,
             0, false,
         );
-        assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
+        assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
     }
 }
 
@@ -326,7 +344,7 @@ fn decode_block_syntax_intra_pre_skip_arm_reaches_stub() {
         &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
     );
 
-    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
+    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
     // The §5.11.5 mode-info pass succeeded — the per-block stamp
     // landed on the BLOCK_8X8 (2×2) footprint.
     let mi_cols = walker.mi_cols() as usize;
@@ -398,7 +416,7 @@ fn decode_partition_syntax_routes_leaf_through_decode_block_syntax() {
 
     assert_eq!(
         result,
-        Err(Error::DecodeBlockResidualUnsupported),
+        Err(Error::ResidualReconstructUnsupported),
         "the partition driver must propagate the §5.11.30 stub from its leaf call"
     );
 
@@ -495,7 +513,7 @@ fn decode_block_syntax_block_8x16_grid_fill_footprint() {
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X16, true, 0, 0, 3, false, false, false, 0, &lossless,
         false, true, false, 0, false, false, 0, false, false, false, 0, false,
     );
-    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
+    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
 
     // BLOCK_8X16: bw4 = 2, bh4 = 4 ⇒ the §5.11.5 grid-fill stamps a
     // 2×4 footprint (2 cols × 4 rows) at (0, 0).
@@ -559,7 +577,7 @@ fn decode_block_syntax_cdef_bits_two_reaches_stub() {
         /* tx_mode_select = */ false,
     );
     let pos_after = dec.position();
-    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
+    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
     assert!(
         pos_after > pos_before,
         "literal cdef-bits read must advance the bit cursor"
@@ -987,7 +1005,7 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
         0,
         /* tx_mode_select = */ true,
     );
-    assert_eq!(result, Err(Error::DecodeBlockResidualUnsupported));
+    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
 
     let mi_cols = walker.mi_cols() as usize;
     for r in 0..4 {

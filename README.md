@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 180)
+## Status — 2026-05-28 (round 181)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,84 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 181 lifts the **§5.11.34 `residual()` outer dispatch** — the
+final §5.11.5 walker stub between the §5.11.30 prediction pass and the
+§7.6 / §7.7 reconstruction kernel. The §5.11.34 driver now walks
+`widthChunks` / `heightChunks` per av1-spec p.84-85 (1 chunk per 64-luma
+stride, with `Max(1, _)` clamping and the `BLOCK_64X64` `miSizeChunk`
+fallback for 128-luma blocks), then for every chunk iterates `for plane
+= 0..1 + HasChroma * 2` with the §5.11.37 `get_tx_size(plane, TxSize)` /
+§5.11.38 `get_plane_residual_size(miSizeChunk, plane)` per-plane size
+derivations. The inter-luma arm (`is_inter && !Lossless && !plane`)
+recurses through the §5.11.36 `transform_tree(startX, startY, w, h)`
+body — `w <= lumaW && h <= lumaH` leaf-emit (with `find_tx_size(w, h)`
+size resolution); `w > h` / `w < h` / `w == h` per-direction splits
+operating against the walker's `InterTxSizes[ row ][ col ]` grid (the
+§5.11.16 / §5.11.17 stamps the walker already tracks). Every other
+arm — non-inter luma or any chroma plane — falls through the §5.11.34
+`for y = 0..num4x4H step stepY, for x = 0..num4x4W step stepX
+transform_block(plane, ...)` direct iteration.
+
+Per leaf TU the §5.11.35 `transform_block(plane, baseX, baseY, txSz, x,
+y)` body runs the §5.11.35 `startX = baseX + 4 * x` /
+`startY = baseY + 4 * y` derivation, the `startX >= maxX || startY >=
+maxY` early-return, and — on the `!skip` arm — the §5.11.39
+`coefficients(plane, startX, startY, txSz)` reader landed in r179.
+Each per-TU `CoefficientsReadout` is captured alongside the per-TU task
+in a new `ResidualReadout { width_chunks, height_chunks, mi_size_chunk,
+num_planes_visited, tasks, coeffs, skip }` aggregate, with one
+`ResidualTuTask { plane, start_x, start_y, tx_size, chunk_x, chunk_y,
+from_transform_tree }` per emit.
+
+Wired into `decode_block_syntax`, lifting
+`Error::DecodeBlockResidualUnsupported`. The walker now reaches
+`Error::ResidualReconstructUnsupported` (§5.11.35
+`reconstruct(plane, startX, startY, txSz)` — the §7.6 inverse-transform
++ §7.13 dequant pre-pass + §7.7 reconstruction merge) on the first TU
+with `eob > 0`; the `all_zero == 1` short-circuit and `skip == true`
+arms both complete cleanly and return the per-block `DecodedBlock`.
+
+**Explicitly split off to subsequent arcs (per [`ResidualReadout`] docs):**
+(a) §5.11.40 `transform_type` per-luma-TU S() read into `TxTypes[]`
+(defaulted to `DCT_DCT`); (b) §5.11.41 `compute_tx_type` full body
+(defaulted to `DCT_DCT` alongside §5.11.40); (c) §7.5 `get_scan`
+table dispatch over `Default_Scan_*` / `Mrow_Scan_*` / `Mcol_Scan_*`
+(defaulted to identity scan `0..segEob`); (d) `AboveLevelContext` /
+`LeftLevelContext` / `AboveDcContext` / `LeftDcContext` per-plane
+context arrays (passed as `0` clean-state ctx); (e) `predict_intra` /
+`predict_palette` / `predict_chroma_from_luma` per-TU intra-prediction
+kernels (only DC_PRED has a standalone leaf via r180's
+`predict_intra_dc_pred`); (f) §5.11.35 `reconstruct(...)` — the §7.6
+inverse-transform kernel itself (the headline next-arc target); (g)
+§5.11.35 `LoopfilterTxSizes[]` / `BlockDecoded[]` per-TU stamps; (h)
+§7.13 `Dequant[][]` per-`(plane, pos)` dequantization. Each split is
+plumbed through the dispatcher's argument list so the next-arc patch
+that wires one can do so without re-touching the §5.11.34 driver
+itself.
+
+New public surface: `PartitionWalker::residual(...)`, `ResidualReadout`,
+`ResidualTuTask`, `get_tx_size(plane, tx_size, mi_size, subsampling_x,
+subsampling_y)` per §5.11.37. Three new `Error` variants
+(`ResidualReconstructUnsupported` / `ResidualTransformTreeUnsupported`
+/ `ResidualCoefficientsTxSizeUnsupported`) — only the first is reachable
+from `decode_block_syntax` today; the other two are caller-bug guards
+on direct `residual()` invocations.
+
+13 new tests (755 → 768): three on `get_tx_size` (plane-0 pass-through
+across all 19 sizes, 4:4:4 chroma residual = luma residual, 4:2:0
+BLOCK_64X64 / BLOCK_128X128 size clamp, caller-bug guards); seven on
+`residual` (skip-arm task-only emission + zero bits read, no-skip
+all_zero per-TU short-circuit completes without `reconstruct` stub,
+lossless `TX_4X4` forcing per plane, monochrome luma-only emission,
+BLOCK_128X128 4-chunk emission with `BLOCK_64X64` miSizeChunk, six
+caller-bug guards, inter-luma `transform_tree` 4-way recursion to
+`TX_4X4` leaves); two on `ResidualReadout` Clone/Debug/Eq smoke and
+on the `decode_block_syntax` walker reaching the new
+`ResidualReconstructUnsupported` short-circuit. The existing
+`decode_block_syntax` integration tests are updated to expect
+`Error::ResidualReconstructUnsupported`. `decode_av1` / `encode_av1`
+continue to return `Error::NotImplemented`.
 
 Round 180 lifts **§5.11.30 / §5.11.33 `compute_prediction()`** — the
 other major §5.11.5 walker stub (alongside r179's §5.11.39 inside

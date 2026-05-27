@@ -10815,6 +10815,76 @@ pub const SPLIT_TX_SIZE: [usize; TX_SIZES_ALL] = [
     TX_32X16, // TX_64X16 -> TX_32X16
 ];
 
+/// `get_tx_size( plane, txSz )` per §5.11.37 (av1-spec p.87-88) — the
+/// per-plane transform-size lookup the §5.11.34 `residual()` body
+/// invokes once per plane to translate the §5.11.16 / §5.11.17 luma
+/// `TxSize` into the chroma `txSz` argument that drives
+/// `transform_block(plane, ..., txSz, ...)`.
+///
+/// Spec body:
+///
+/// ```text
+///   get_tx_size( plane, txSz ) {
+///       if ( plane == 0 )
+///           return txSz
+///       uvTx = Max_Tx_Size_Rect[ get_plane_residual_size( MiSize, plane ) ]
+///       if ( Tx_Width[ uvTx ] == 64 || Tx_Height[ uvTx ] == 64 ) {
+///           if ( Tx_Width[ uvTx ] == 16 )  return TX_16X32
+///           if ( Tx_Height[ uvTx ] == 16 ) return TX_32X16
+///           return TX_32X32
+///       }
+///       return uvTx
+///   }
+/// ```
+///
+/// The `subsampling_x` / `subsampling_y` are routed through to
+/// [`get_plane_residual_size`] so the chroma residual size is correct
+/// for 4:4:4 (`0, 0`), 4:2:2 (`1, 0`), and 4:2:0 (`1, 1`) streams.
+///
+/// Returns `Some(txSz)` for in-range arguments. Returns `None` when
+/// `plane > 2`, `mi_size >= BLOCK_SIZES`, `tx_size >= TX_SIZES_ALL`,
+/// `subsampling_{x,y} > 1`, or [`get_plane_residual_size`] returns
+/// `None` (the §6.4.1 conformance gap).
+#[inline]
+#[must_use]
+pub fn get_tx_size(
+    plane: u8,
+    tx_size: usize,
+    mi_size: usize,
+    subsampling_x: u8,
+    subsampling_y: u8,
+) -> Option<usize> {
+    if plane > 2 {
+        return None;
+    }
+    if tx_size >= TX_SIZES_ALL {
+        return None;
+    }
+    if mi_size >= BLOCK_SIZES {
+        return None;
+    }
+    if subsampling_x > 1 || subsampling_y > 1 {
+        return None;
+    }
+    if plane == 0 {
+        return Some(tx_size);
+    }
+    let plane_sz = get_plane_residual_size(mi_size, plane, subsampling_x, subsampling_y)?;
+    let uv_tx = MAX_TX_SIZE_RECT[plane_sz];
+    let w = TX_WIDTH[uv_tx];
+    let h = TX_HEIGHT[uv_tx];
+    if w == 64 || h == 64 {
+        if w == 16 {
+            return Some(TX_16X32);
+        }
+        if h == 16 {
+            return Some(TX_32X16);
+        }
+        return Some(TX_32X32);
+    }
+    Some(uv_tx)
+}
+
 /// §6.10.19 / §3 transform-type ordinals. The spec lists `DCT_DCT = 0`
 /// through `H_FLIPADST = 15` in a single enumeration; these are the
 /// indices used by the [`MODE_TO_TXFM`] / [`TX_TYPE_IN_SET_INTRA`] /
@@ -20676,8 +20746,9 @@ impl PartitionWalker {
         // Per-block derived state surfaced through the returned
         // `DecodedBlock`. The §5.11.30 `compute_prediction()` /
         // §5.11.34 `residual()` calls follow this point in the spec;
-        // they are the next round's targets.
-        let _db = DecodedBlock {
+        // §5.11.30 is wired through [`Self::compute_prediction`]
+        // (r180); §5.11.34 is wired through [`Self::residual`] (r181).
+        let db = DecodedBlock {
             mi_row: mi_row_b,
             mi_col: mi_col_b,
             mi_size,
@@ -20753,14 +20824,63 @@ impl PartitionWalker {
             /* ref_frame_1_is_intra = */ false,
         )?;
 
-        // §5.11.5 line `residual( )` — §5.11.34 STUB. The walker has
-        // completed the §5.11.5 prologue + §5.11.6 `mode_info()`
-        // (intra arm) + §5.11.49 `palette_tokens()` (no-op) +
-        // §5.11.16 `read_block_tx_size()` + §5.11.33
-        // `compute_prediction()` (intra-DC enumeration) and now
-        // reaches the next §5.11.5 call. `residual()` (transform-
-        // coefficient read + reconstruction) is the next-arc target.
-        Err(crate::Error::DecodeBlockResidualUnsupported)
+        // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
+        //
+        // As of r181 the §5.11.34 outer dispatch + §5.11.36
+        // `transform_tree` recursion + §5.11.35 `transform_block`
+        // per-TU emit are wired through [`Self::residual`]. The
+        // per-TU §5.11.39 [`Self::coefficients`] reader is invoked on
+        // the `!skip` arm; the §5.11.40 `transform_type` /
+        // §5.11.41 `compute_tx_type` / §7.5 `get_scan` /
+        // `AboveLevelContext` / `LeftLevelContext` / `AboveDcContext`
+        // / `LeftDcContext` / §7.6 inverse-transform / §7.7
+        // reconstruct / §7.13 dequant axes are split-off (see
+        // [`ResidualReadout`]'s docs for the per-bullet rationale).
+        //
+        // On the §5.11.5 walker's reachable path:
+        //   * `is_inter = 0` (intra-only — the §5.11.7 reader's
+        //     reachable cell forces `YMode = DC_PRED`).
+        //   * `skip == 0` is the conformant block — the walker's CDF
+        //     rigging in `decode_block_syntax_reaches_compute_
+        //     prediction_stub_after_intra_mode_info` forces `skip =
+        //     0`, so the §5.11.34 dispatcher will visit the
+        //     `coefficients()` reader per TU.
+        //   * `skip == 1` short-circuits the per-TU bitstream read;
+        //     the dispatcher returns the per-TU task enumeration
+        //     only.
+        //
+        // The dispatcher surfaces
+        // [`crate::Error::ResidualReconstructUnsupported`] when the
+        // §5.11.39 reader reports `eob > 0` on the `!skip` path
+        // (the §7.6 inverse-transform pass). On the gate-closed
+        // (`all_zero == 1` for every TU) path the dispatcher returns
+        // [`ResidualReadout`] cleanly and the §5.11.5 walker advances
+        // past the §5.11.34 call site.
+        let _residual = self.residual(
+            decoder,
+            cdfs,
+            mi_row_b,
+            mi_col_b,
+            sub_size,
+            has_chroma,
+            subsampling_x,
+            subsampling_y,
+            is_inter != 0,
+            prefix.lossless,
+            prefix.skip != 0,
+            tx_size as usize,
+            use_128x128_superblock,
+        )?;
+        // §5.11.5 line `is_compound = RefFrame[ 1 ] > INTRA_FRAME` —
+        // already derived above. The §5.11.5 walker concludes the
+        // syntax pass; later sub-routines (§5.11.5 line
+        // `update_partition_context()` per §5.11.42, and the
+        // dispatcher-level §5.11.4 partition-tree continuation) live
+        // upstream of the per-block dispatcher.
+        //
+        // Suppress the per-block `is_compound` unused-variable note.
+        let _ = is_compound;
+        Ok(db)
     }
 
     /// `compute_prediction()` per §5.11.33 (av1-spec p.82-83) — the
@@ -21011,6 +21131,677 @@ impl PartitionWalker {
             num_planes_visited: num_planes,
             tasks,
         })
+    }
+
+    /// `residual()` per §5.11.34 (av1-spec p.84-85) — the per-block
+    /// outer dispatch the §5.11.5 [`Self::decode_block_syntax`] walker
+    /// invokes after [`Self::compute_prediction`] to drive the per-TU
+    /// `transform_block` enumeration + bitstream-coefficient reads.
+    ///
+    /// The spec body (av1-spec p.84-85) reads:
+    ///
+    /// ```text
+    ///   residual() {
+    ///     sbMask = use_128x128_superblock ? 31 : 15
+    ///     widthChunks  = Max( 1, Block_Width[  MiSize ] >> 6 )
+    ///     heightChunks = Max( 1, Block_Height[ MiSize ] >> 6 )
+    ///     miSizeChunk = ( widthChunks > 1 || heightChunks > 1 )
+    ///                       ? BLOCK_64X64 : MiSize
+    ///     for ( chunkY = 0; chunkY < heightChunks; chunkY++ ) {
+    ///       for ( chunkX = 0; chunkX < widthChunks; chunkX++ ) {
+    ///         miRowChunk = MiRow + ( chunkY << 4 )
+    ///         miColChunk = MiCol + ( chunkX << 4 )
+    ///         subBlockMiRow = miRowChunk & sbMask
+    ///         subBlockMiCol = miColChunk & sbMask
+    ///         for ( plane = 0; plane < 1 + HasChroma * 2; plane++ ) {
+    ///           txSz = Lossless ? TX_4X4
+    ///                            : get_tx_size( plane, TxSize )
+    ///           stepX = Tx_Width [ txSz ] >> 2
+    ///           stepY = Tx_Height[ txSz ] >> 2
+    ///           planeSz = get_plane_residual_size( miSizeChunk, plane )
+    ///           num4x4W = Num_4x4_Blocks_Wide[ planeSz ]
+    ///           num4x4H = Num_4x4_Blocks_High[ planeSz ]
+    ///           subX = (plane > 0) ? subsampling_x : 0
+    ///           subY = (plane > 0) ? subsampling_y : 0
+    ///           baseX = (miColChunk >> subX) * MI_SIZE
+    ///           baseY = (miRowChunk >> subY) * MI_SIZE
+    ///           if ( is_inter && !Lossless && !plane ) {
+    ///             transform_tree( baseX, baseY,
+    ///                             num4x4W * 4, num4x4H * 4 )
+    ///           } else {
+    ///             baseXBlock = (MiCol >> subX) * MI_SIZE
+    ///             baseYBlock = (MiRow >> subY) * MI_SIZE
+    ///             for ( y = 0; y < num4x4H; y += stepY )
+    ///               for ( x = 0; x < num4x4W; x += stepX )
+    ///                 transform_block( plane, baseXBlock, baseYBlock,
+    ///                                  txSz,
+    ///                                  x + ( ( chunkX << 4 ) >> subX ),
+    ///                                  y + ( ( chunkY << 4 ) >> subY ) )
+    ///           }
+    ///         }
+    ///       }
+    ///     }
+    ///   }
+    /// ```
+    ///
+    /// And the §5.11.36 `transform_tree( startX, startY, w, h )` body
+    /// (av1-spec p.86) the inter-luma arm recurses into:
+    ///
+    /// ```text
+    ///   transform_tree( startX, startY, w, h ) {
+    ///     maxX = MiCols * MI_SIZE
+    ///     maxY = MiRows * MI_SIZE
+    ///     if ( startX >= maxX || startY >= maxY ) return
+    ///     row = startY >> MI_SIZE_LOG2
+    ///     col = startX >> MI_SIZE_LOG2
+    ///     lumaTxSz = InterTxSizes[ row ][ col ]
+    ///     lumaW = Tx_Width [ lumaTxSz ]
+    ///     lumaH = Tx_Height[ lumaTxSz ]
+    ///     if ( w <= lumaW && h <= lumaH ) {
+    ///       txSz = find_tx_size( w, h )
+    ///       transform_block( 0, startX, startY, txSz, 0, 0 )
+    ///     } else if ( w > h ) {
+    ///       transform_tree( startX,           startY,        w/2, h )
+    ///       transform_tree( startX + w/2,     startY,        w/2, h )
+    ///     } else if ( w < h ) {
+    ///       transform_tree( startX,           startY,        w, h/2 )
+    ///       transform_tree( startX,           startY + h/2,  w, h/2 )
+    ///     } else {
+    ///       transform_tree( startX,           startY,        w/2, h/2 )
+    ///       transform_tree( startX + w/2,     startY,        w/2, h/2 )
+    ///       transform_tree( startX,           startY + h/2,  w/2, h/2 )
+    ///       transform_tree( startX + w/2,     startY + h/2,  w/2, h/2 )
+    ///     }
+    ///   }
+    /// ```
+    ///
+    /// The §5.11.35 `transform_block( plane, baseX, baseY, txSz, x, y )`
+    /// per-TU body invoked at every leaf is the
+    /// `predict_intra` / `predict_palette` /
+    /// `predict_chroma_from_luma` (intra) + `coeffs` + `reconstruct`
+    /// composition; the §5.11.39 [`Self::coefficients`] reader is the
+    /// `eob = coeffs( plane, startX, startY, txSz )` leaf the
+    /// `if ( !skip )` gate wraps.
+    ///
+    /// ## Implemented in this round (r181)
+    ///
+    /// * §5.11.34 outer `widthChunks` / `heightChunks` / `miSizeChunk`
+    ///   derivation (av1-spec p.84 lines 2-5).
+    /// * §5.11.34 outer chunk-loop + per-plane loop (lines 8-30).
+    /// * §5.11.37 [`get_tx_size`] for the per-plane `txSz` derivation
+    ///   on the §5.11.34 line 12 `Lossless ? TX_4X4 :
+    ///   get_tx_size( plane, TxSize )` selector.
+    /// * §5.11.38 [`get_plane_residual_size`] for the per-plane
+    ///   `planeSz` derivation (line 15).
+    /// * §5.11.34 inter-luma `transform_tree(baseX, baseY, num4x4W * 4,
+    ///   num4x4H * 4)` recursion via the internal
+    ///   `Self::residual_transform_tree` helper (av1-spec p.86 §5.11.36
+    ///   body).
+    /// * §5.11.34 non-inter / chroma direct iteration via the
+    ///   `for ( y = 0; y < num4x4H; y += stepY ) for ( x = 0; x <
+    ///   num4x4W; x += stepX ) transform_block(plane, ...)` loop with
+    ///   the §5.11.35 prologue's `stepX` / `stepY`.
+    /// * §5.11.35 `transform_block` early-return on `startX >= maxX ||
+    ///   startY >= maxY`.
+    /// * §5.11.35 `if ( !skip ) coeffs( plane, startX, startY, txSz )`
+    ///   per-leaf call via [`Self::coefficients`]. Each per-TU outcome
+    ///   is recorded in [`ResidualReadout::coeffs`] in `tasks` order.
+    /// * §5.11.34 `BLOCK_INVALID` chroma plane suppression — the
+    ///   spec's `get_plane_residual_size` returns `BLOCK_INVALID` for
+    ///   chroma planes that would underflow the 4×4 minimum residual
+    ///   size; on `None` here the plane visit short-circuits with no
+    ///   TU emission (matching the spec's implicit "no chroma residual"
+    ///   semantics for the sub-block chroma-edge cases).
+    ///
+    /// ## Explicit split-off list (see [`ResidualReadout`] for the
+    /// full per-bullet rationale)
+    ///
+    /// * §5.11.40 `transform_type` S() per-luma-TU read (defaulted to
+    ///   `DCT_DCT` ⇒ `tx_class = TX_CLASS_2D`).
+    /// * §5.11.41 `compute_tx_type( plane, txSz, x4, y4 )`
+    ///   (defaulted to `DCT_DCT` alongside §5.11.40).
+    /// * §7.5 `get_scan( txSz )` over `Default_Scan_*` / `Mrow_Scan_*`
+    ///   / `Mcol_Scan_*` (defaulted to identity scan `0..segEob`).
+    /// * `AboveLevelContext` / `LeftLevelContext` / `AboveDcContext` /
+    ///   `LeftDcContext` per-plane context arrays (`txb_skip_ctx` and
+    ///   `dc_sign_ctx` are passed as `0`, the clean-state context).
+    /// * §5.11.35 `predict_intra` / `predict_palette` /
+    ///   `predict_chroma_from_luma` per-TU intra-prediction kernels
+    ///   (the §7.11.2.x sample-generation leaves; only DC_PRED has
+    ///   a standalone leaf today via [`predict_intra_dc_pred`]).
+    /// * §5.11.35 `reconstruct( plane, startX, startY, txSz )` —
+    ///   surfaces [`crate::Error::ResidualReconstructUnsupported`]
+    ///   when reached on the `!skip && eob > 0` path.
+    /// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` /
+    ///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps.
+    /// * §7.13 `Dequant[][]` per-`(plane, pos)` dequantization.
+    ///
+    /// ## Argument contract
+    ///
+    /// * `decoder` / `cdfs` — the per-tile bitstream reader and CDF
+    ///   context. Forwarded to [`Self::coefficients`] for per-TU reads.
+    /// * `mi_row` / `mi_col` / `mi_size` — the §5.11.5 prologue's
+    ///   `MiRow` / `MiCol` / `MiSize`.
+    /// * `has_chroma` — §5.11.5 prologue derivation (drives the
+    ///   `1 + HasChroma * 2` plane-loop bound).
+    /// * `subsampling_x` / `subsampling_y` — §5.5.2 sequence-header
+    ///   chroma derivation. `0` / `0` for 4:4:4, `1` / `0` for 4:2:2,
+    ///   `1` / `1` for 4:2:0.
+    /// * `is_inter` — §5.11.20 / §5.11.7 derived flag (per-block).
+    ///   Gates the §5.11.34 `is_inter && !Lossless && !plane`
+    ///   `transform_tree` arm.
+    /// * `lossless` — `LosslessArray[ segment_id ]` per §6.8.11. Gates
+    ///   the §5.11.34 `Lossless ? TX_4X4 : get_tx_size(...)` selector
+    ///   and the inter-luma `transform_tree` arm.
+    /// * `skip` — §5.11.11 `skip` element. Gates the §5.11.35 `if (
+    ///   !skip ) coeffs(...)` per-leaf call.
+    /// * `tx_size` — §5.11.15 / §5.11.16 `TxSize` (the per-block luma
+    ///   transform size). Routed through `get_tx_size( plane, TxSize )`
+    ///   for the chroma plane.
+    /// * `use_128x128_superblock` — §5.9.15 sequence-header bit. Drives
+    ///   the §5.11.34 `sbMask = use_128x128_superblock ? 31 : 15` (used
+    ///   for the `subBlockMiRow` / `subBlockMiCol` derivation the
+    ///   §5.11.35 `BlockDecoded` stamps consume — no-op on this walker
+    ///   today; the field is plumbed for the round that wires
+    ///   `BlockDecoded`).
+    ///
+    /// ## Returns
+    ///
+    /// A [`ResidualReadout`] with the per-block enumeration. Returns
+    /// [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+    /// arguments (`mi_size >= BLOCK_SIZES`, `mi_row >= mi_rows`,
+    /// `mi_col >= mi_cols`, `subsampling_{x,y} > 1`,
+    /// `tx_size >= TX_SIZES_ALL`). Returns
+    /// [`crate::Error::ResidualCoefficientsTxSizeUnsupported`] when a
+    /// per-leaf `txSz` falls outside the §5.11.39 reader's accepted
+    /// range. Returns
+    /// [`crate::Error::ResidualReconstructUnsupported`] when the
+    /// `!skip` path reads a non-`all_zero` TU (the §7.6 / §7.7
+    /// reconstruction-pass invocation).
+    #[allow(clippy::too_many_arguments)]
+    pub fn residual(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        mi_size: usize,
+        has_chroma: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        is_inter: bool,
+        lossless: bool,
+        skip: bool,
+        tx_size: usize,
+        _use_128x128_superblock: bool,
+    ) -> Result<ResidualReadout, crate::Error> {
+        // ---------- caller-bug guards ----------
+        if mi_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if subsampling_x > 1 || subsampling_y > 1 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if tx_size >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.34 lines 3-4: `widthChunks` / `heightChunks`.
+        let block_w = block_width(mi_size);
+        let block_h = block_height(mi_size);
+        let width_chunks = core::cmp::max(1, block_w >> 6);
+        let height_chunks = core::cmp::max(1, block_h >> 6);
+        // §5.11.34 line 5: `miSizeChunk`.
+        let mi_size_chunk = if width_chunks > 1 || height_chunks > 1 {
+            BLOCK_64X64
+        } else {
+            mi_size
+        };
+
+        // §5.11.34 line 22-ish: `1 + HasChroma * 2`.
+        let num_planes = 1u8 + if has_chroma { 2 } else { 0 };
+
+        let mut readout = ResidualReadout {
+            width_chunks: width_chunks as u8,
+            height_chunks: height_chunks as u8,
+            mi_size_chunk: mi_size_chunk as u8,
+            num_planes_visited: num_planes,
+            tasks: Vec::new(),
+            coeffs: Vec::new(),
+            skip,
+        };
+
+        // §5.11.34 outer chunk loop. For `MiSize < BLOCK_128X128` the
+        // body executes once with `chunkY = chunkX = 0`. For
+        // `BLOCK_128X64` / `BLOCK_64X128` / `BLOCK_128X128` it
+        // executes 2 / 2 / 4 times respectively.
+        for chunk_y in 0..height_chunks {
+            for chunk_x in 0..width_chunks {
+                // §5.11.34 lines 10-11: `miRowChunk` / `miColChunk`.
+                let mi_row_chunk = mi_row + ((chunk_y as u32) << 4);
+                let mi_col_chunk = mi_col + ((chunk_x as u32) << 4);
+
+                // §5.11.34 per-plane body.
+                for plane in 0..num_planes {
+                    // §5.11.34 line 12: `txSz`.
+                    let tx_sz = if lossless {
+                        TX_4X4
+                    } else {
+                        match get_tx_size(plane, tx_size, mi_size, subsampling_x, subsampling_y) {
+                            Some(t) => t,
+                            None => return Err(crate::Error::PartitionWalkOutOfRange),
+                        }
+                    };
+                    // §5.11.34 lines 13-14: `stepX` / `stepY`.
+                    let step_x = TX_WIDTH[tx_sz] >> 2;
+                    let step_y = TX_HEIGHT[tx_sz] >> 2;
+                    // §5.11.34 line 15: `planeSz`.
+                    let plane_sz = match get_plane_residual_size(
+                        mi_size_chunk,
+                        plane,
+                        subsampling_x,
+                        subsampling_y,
+                    ) {
+                        Some(s) => s,
+                        // §6.4.1 conformance: a `None` here for chroma
+                        // is the implicit "no chroma residual" path —
+                        // the §5.11.5 `HasChroma` derivation should
+                        // have caught it. Treat as no-emit for chroma,
+                        // caller-bug for luma.
+                        None => {
+                            if plane == 0 {
+                                return Err(crate::Error::PartitionWalkOutOfRange);
+                            }
+                            continue;
+                        }
+                    };
+                    // §5.11.34 lines 16-17: `num4x4W` / `num4x4H`.
+                    let num4x4_w = NUM_4X4_BLOCKS_WIDE[plane_sz];
+                    let num4x4_h = NUM_4X4_BLOCKS_HIGH[plane_sz];
+                    // §5.11.34 lines 18-19: `subX` / `subY`.
+                    let sub_x = if plane > 0 { subsampling_x } else { 0 };
+                    let sub_y = if plane > 0 { subsampling_y } else { 0 };
+
+                    // §5.11.34 lines 23-24: `if ( is_inter && !Lossless
+                    // && !plane ) transform_tree(...)` arm vs. the
+                    // else arm.
+                    if is_inter && !lossless && plane == 0 {
+                        // §5.11.34 line 24: `transform_tree(baseX,
+                        // baseY, num4x4W * 4, num4x4H * 4)`.
+                        let base_x = (mi_col_chunk >> sub_x) * (MI_SIZE as u32);
+                        let base_y = (mi_row_chunk >> sub_y) * (MI_SIZE as u32);
+                        let w = (num4x4_w * 4) as u32;
+                        let h = (num4x4_h * 4) as u32;
+                        self.residual_transform_tree(
+                            decoder,
+                            cdfs,
+                            base_x,
+                            base_y,
+                            w,
+                            h,
+                            chunk_x as u8,
+                            chunk_y as u8,
+                            skip,
+                            &mut readout,
+                        )?;
+                    } else {
+                        // §5.11.34 line 26-27: `baseXBlock` /
+                        // `baseYBlock` (note the original `MiCol` /
+                        // `MiRow`, NOT the chunk-offset ones).
+                        let base_x_block = (mi_col >> sub_x) * (MI_SIZE as u32);
+                        let base_y_block = (mi_row >> sub_y) * (MI_SIZE as u32);
+                        // §5.11.34 lines 28-30: per-TU iteration.
+                        let mut y = 0usize;
+                        while y < num4x4_h {
+                            let mut x = 0usize;
+                            while x < num4x4_w {
+                                let x_arg = (x as u32) + (((chunk_x as u32) << 4) >> sub_x);
+                                let y_arg = (y as u32) + (((chunk_y as u32) << 4) >> sub_y);
+                                self.transform_block_emit(
+                                    decoder,
+                                    cdfs,
+                                    plane,
+                                    base_x_block,
+                                    base_y_block,
+                                    tx_sz,
+                                    x_arg,
+                                    y_arg,
+                                    sub_x,
+                                    sub_y,
+                                    chunk_x as u8,
+                                    chunk_y as u8,
+                                    /* from_transform_tree = */ false,
+                                    skip,
+                                    &mut readout,
+                                )?;
+                                if step_x == 0 {
+                                    break;
+                                }
+                                x += step_x;
+                            }
+                            if step_y == 0 {
+                                break;
+                            }
+                            y += step_y;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(readout)
+    }
+
+    /// `transform_tree( startX, startY, w, h )` per §5.11.36 (av1-spec
+    /// p.86) — the inter-luma recursive split the §5.11.34 outer
+    /// dispatch invokes for the `is_inter && !Lossless && !plane` arm.
+    ///
+    /// This is the internal recursion driven from [`Self::residual`].
+    /// Each leaf (when `w <= lumaW && h <= lumaH`) is routed through
+    /// [`Self::transform_block_emit`] with `plane = 0` (the inter-luma
+    /// arm only).
+    ///
+    /// The spec body decides the split direction by comparing the
+    /// requested `(w, h)` against `Tx_Width[ InterTxSizes[row][col] ]`
+    /// / `Tx_Height[ ... ]`; the walker's
+    /// [`Self::inter_tx_size_at`] helper reads the in-grid
+    /// `InterTxSizes` ordinal at the current top-left.
+    ///
+    /// The recursion is bounded by the §5.11.34 outer `transform_tree(
+    /// baseX, baseY, num4x4W * 4, num4x4H * 4 )` invocation; for every
+    /// reachable `MiSize` (max `128×128` luma) the recursion depth is
+    /// bounded by `log2( max(w, h) / 4 ) <= 5`.
+    #[allow(clippy::too_many_arguments)]
+    fn residual_transform_tree(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        start_x: u32,
+        start_y: u32,
+        w: u32,
+        h: u32,
+        chunk_x: u8,
+        chunk_y: u8,
+        skip: bool,
+        readout: &mut ResidualReadout,
+    ) -> Result<(), crate::Error> {
+        // §5.11.36 lines 1-3: `maxX = MiCols * MI_SIZE` / `maxY = MiRows
+        // * MI_SIZE` early-return.
+        let max_x = self.mi_cols * (MI_SIZE as u32);
+        let max_y = self.mi_rows * (MI_SIZE as u32);
+        if start_x >= max_x || start_y >= max_y {
+            return Ok(());
+        }
+        // §5.11.36 lines 4-5: `row` / `col` for the `InterTxSizes[
+        // row ][ col ]` lookup.
+        let row = (start_y >> (MI_SIZE_LOG2 as u32)) as i32;
+        let col = (start_x >> (MI_SIZE_LOG2 as u32)) as i32;
+        let luma_tx_sz = self.inter_tx_size_at(row, col) as usize;
+        if luma_tx_sz >= TX_SIZES_ALL {
+            return Err(crate::Error::ResidualTransformTreeUnsupported);
+        }
+        let luma_w = TX_WIDTH[luma_tx_sz] as u32;
+        let luma_h = TX_HEIGHT[luma_tx_sz] as u32;
+
+        // §5.11.36 lines 7-8: leaf-emit on `w <= lumaW && h <= lumaH`.
+        if w <= luma_w && h <= luma_h {
+            // §5.11.36 line 9: `txSz = find_tx_size( w, h )`.
+            let tx_sz = match find_tx_size(w as usize, h as usize) {
+                Some(t) => t,
+                None => return Err(crate::Error::ResidualTransformTreeUnsupported),
+            };
+            // §5.11.36 line 10: `transform_block( 0, startX, startY,
+            // txSz, 0, 0 )`. The `x` / `y` arguments are `0` (the leaf
+            // is the whole tx region — `startX` / `startY` already at
+            // the leaf's top-left).
+            return self.transform_block_emit(
+                decoder, cdfs, /* plane = */ 0, /* base_x = */ start_x,
+                /* base_y = */ start_y, tx_sz, /* x = */ 0, /* y = */ 0,
+                /* sub_x = */ 0, /* sub_y = */ 0, chunk_x, chunk_y,
+                /* from_transform_tree = */ true, skip, readout,
+            );
+        }
+        // §5.11.36 lines 12-25: per-direction split.
+        if w > h {
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x,
+                start_y,
+                w / 2,
+                h,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x + w / 2,
+                start_y,
+                w / 2,
+                h,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+        } else if w < h {
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x,
+                start_y,
+                w,
+                h / 2,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x,
+                start_y + h / 2,
+                w,
+                h / 2,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+        } else {
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x,
+                start_y,
+                w / 2,
+                h / 2,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x + w / 2,
+                start_y,
+                w / 2,
+                h / 2,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x,
+                start_y + h / 2,
+                w / 2,
+                h / 2,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+            self.residual_transform_tree(
+                decoder,
+                cdfs,
+                start_x + w / 2,
+                start_y + h / 2,
+                w / 2,
+                h / 2,
+                chunk_x,
+                chunk_y,
+                skip,
+                readout,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `transform_block( plane, baseX, baseY, txSz, x, y )` per §5.11.35
+    /// (av1-spec p.85) — the per-TU emit + bitstream-coefficient-read
+    /// the §5.11.34 outer dispatch and the §5.11.36 `transform_tree`
+    /// recursion both terminate in.
+    ///
+    /// The spec body composes (intra path):
+    ///
+    /// ```text
+    ///   startX = baseX + 4 * x
+    ///   startY = baseY + 4 * y
+    ///   ... // subBlockMi{Row,Col} for BlockDecoded stamps (deferred)
+    ///   if ( startX >= maxX || startY >= maxY ) return     // line 13
+    ///   if ( !is_inter ) {
+    ///       predict_intra( ... ) or predict_palette( ... ) or
+    ///       predict_chroma_from_luma( ... )                // deferred
+    ///   }
+    ///   if ( !skip ) {
+    ///       eob = coeffs( plane, startX, startY, txSz )    // §5.11.39
+    ///       if ( eob > 0 ) reconstruct( ... )              // deferred
+    ///   }
+    ///   // LoopfilterTxSizes / BlockDecoded stamps             // deferred
+    /// ```
+    ///
+    /// This dispatcher records every per-TU task in
+    /// [`ResidualReadout::tasks`], invokes [`Self::coefficients`] on
+    /// the `!skip` path (with the splits noted in
+    /// [`ResidualReadout`]'s docs feeding the deferred arguments),
+    /// and surfaces [`crate::Error::ResidualReconstructUnsupported`]
+    /// when the §5.11.39 reader reports `eob > 0` (the
+    /// reconstruction-pass invocation site).
+    #[allow(clippy::too_many_arguments)]
+    fn transform_block_emit(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        plane: u8,
+        base_x: u32,
+        base_y: u32,
+        tx_sz: usize,
+        x: u32,
+        y: u32,
+        sub_x: u8,
+        sub_y: u8,
+        chunk_x: u8,
+        chunk_y: u8,
+        from_transform_tree: bool,
+        skip: bool,
+        readout: &mut ResidualReadout,
+    ) -> Result<(), crate::Error> {
+        // §5.11.35 lines 1-2: `startX = baseX + 4 * x`, `startY =
+        // baseY + 4 * y`.
+        let start_x = base_x + 4 * x;
+        let start_y = base_y + 4 * y;
+        // §5.11.35 lines 10-11: `maxX = (MiCols * MI_SIZE) >> subX`,
+        // `maxY = (MiRows * MI_SIZE) >> subY`.
+        let max_x = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+        let max_y = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+        // §5.11.35 line 13: early-return on out-of-frame.
+        if start_x >= max_x || start_y >= max_y {
+            return Ok(());
+        }
+        if tx_sz >= TX_SIZES_ALL {
+            return Err(crate::Error::ResidualCoefficientsTxSizeUnsupported);
+        }
+
+        // Record the per-TU task (spec-order emission).
+        readout.tasks.push(ResidualTuTask {
+            plane,
+            start_x,
+            start_y,
+            tx_size: tx_sz as u8,
+            chunk_x,
+            chunk_y,
+            from_transform_tree,
+        });
+
+        // §5.11.35 line 32: `if ( !skip ) eob = coeffs( plane, startX,
+        // startY, txSz )` — invoke the §5.11.39 reader for the
+        // bitstream-coefficient read.
+        if !skip {
+            // §5.11.39 §8.3.2 axis arguments — see r181 split-off
+            // list:
+            //   * `tx_class = TX_CLASS_2D` (default for §5.11.40 /
+            //     §5.11.41 DCT_DCT fallback).
+            //   * `txb_skip_ctx = 0` (clean-state — no neighbour
+            //     `AboveLevelContext` / `LeftLevelContext`).
+            //   * `dc_sign_ctx = 0` (clean-state — no neighbour
+            //     `AboveDcContext` / `LeftDcContext`).
+            //   * `scan = 0..segEob` (identity scan — §7.5 `get_scan`
+            //     table dispatch deferred).
+            //   * `is_inter = 0` (the reachable §5.11.5 walker path
+            //     is intra-only; non-reachable inter path also passes
+            //     `0` for the §8.3.2 `eob_pt_*` axis on the few sizes
+            //     where the table is `[isInter][...]`).
+            let tx_w = TX_WIDTH[tx_sz];
+            let tx_h = TX_HEIGHT[tx_sz];
+            let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 {
+                512usize
+            } else {
+                core::cmp::min(1024, tx_w * tx_h)
+            };
+            // §7.5 identity scan placeholder — `seg_eob` cells in
+            // strictly ascending order. The §5.11.39 reader's
+            // gate-closed (`all_zero == 1`) path consults the scan
+            // only after the EOB derivation, which itself short-
+            // circuits before scan-table access.
+            let scan: Vec<u16> = (0..seg_eob as u16).collect();
+            let mut quant = vec![0i32; tx_w * tx_h];
+            let coeffs = self.coefficients(
+                decoder,
+                cdfs,
+                plane,
+                /* is_inter = */ 0,
+                tx_sz,
+                TX_CLASS_2D,
+                /* txb_skip_ctx = */ 0,
+                /* dc_sign_ctx = */ 0,
+                &scan,
+                &mut quant,
+            )?;
+            readout.coeffs.push(coeffs);
+            // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)`. The
+            // §7.6 inverse-transform body + §7.13 dequant pre-pass +
+            // §7.7 reconstruction merge are the next-arc target.
+            if coeffs.eob > 0 {
+                return Err(crate::Error::ResidualReconstructUnsupported);
+            }
+        }
+
+        // §5.11.35 lines 35-43: `LoopfilterTxSizes[ plane ][ ... ]` /
+        // `BlockDecoded[ plane ][ ... ]` per-TU stamps. Deferred —
+        // the walker doesn't yet allocate the per-plane LF /
+        // BlockDecoded grids. No-op here is the consistent placeholder.
+        Ok(())
     }
 
     /// `decode_partition_syntax( r, c, bSize )` — §5.11.4 partition
@@ -23648,6 +24439,193 @@ pub struct CoefficientsReadout {
     /// consumes this on neighbour TUs via `AboveDcContext[ plane ][ x4 +
     /// i ]` / `LeftDcContext[ plane ][ y4 + i ]`.
     pub dc_category: u8,
+}
+
+/// §5.11.34 / §5.11.35 / §5.11.36 per-TU enumeration — one entry per
+/// `transform_block( plane, baseX, baseY, txSz, x, y )` invocation the
+/// §5.11.34 `residual()` body would emit.
+///
+/// The §5.11.34 outer dispatch walks the
+/// `widthChunks` / `heightChunks` chunk grid (1 chunk per 64×64
+/// `MiSize` region per axis), then per-plane: on the inter-luma path it
+/// recurses through §5.11.36 `transform_tree(baseX, baseY, w, h)` to
+/// the per-TU `transform_block(0, startX, startY, txSz, 0, 0)` leaves;
+/// on every other path (intra or chroma) it directly iterates the
+/// per-plane block with `stepX` / `stepY` per the §5.11.35 prologue.
+///
+/// Every leaf is the `transform_block(plane, startX, startY, txSz, x, y)`
+/// call site — the per-TU bitstream-read kernel that wraps
+/// §5.11.35's predict / coeffs / reconstruct sub-routines.
+///
+/// The §5.11.34 dispatcher in this crate records every emitted leaf in
+/// [`ResidualReadout::tasks`] and, on the `!skip` path, invokes
+/// [`PartitionWalker::coefficients`] per leaf to drive the bitstream
+/// read; the per-TU `coefficients()` outcome is stored alongside in
+/// [`Self::coeffs`]. The `predict_intra` / `predict_palette` /
+/// `predict_chroma_from_luma` / `reconstruct` sub-routines that
+/// §5.11.35 also calls remain split-off (see [`ResidualReadout`]
+/// docs for the explicit split list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualTuTask {
+    /// `plane` — `0` (luma), `1` (Cb), `2` (Cr).
+    pub plane: u8,
+    /// `startX = baseX + 4 * x` per §5.11.35 line 1 — top-left luma-
+    /// sample x offset of the per-TU prediction / residual region
+    /// (post-subsampling for `plane > 0`).
+    pub start_x: u32,
+    /// `startY = baseY + 4 * y` per §5.11.35 line 2 — top-left luma-
+    /// sample y offset companion to [`Self::start_x`].
+    pub start_y: u32,
+    /// `txSz` — the per-TU `TX_SIZES_ALL` ordinal the §5.11.34 outer
+    /// dispatch routed to this leaf (post-`get_tx_size( plane,
+    /// TxSize )` for the chroma path; post-`find_tx_size( w, h )` for
+    /// the inter-luma `transform_tree` recursion).
+    pub tx_size: u8,
+    /// `chunkX` of the §5.11.34 outer loop — `0..widthChunks`. Records
+    /// the chunk this leaf belongs to. `0` for every block whose
+    /// `MiSize` is below the 64-luma chunk threshold.
+    pub chunk_x: u8,
+    /// `chunkY` of the §5.11.34 outer loop — `0..heightChunks`. `0`
+    /// for every block whose `MiSize` is below the 64-luma chunk
+    /// threshold.
+    pub chunk_y: u8,
+    /// `true` ⇔ this leaf was emitted by §5.11.34's inter-luma
+    /// `transform_tree(baseX, baseY, num4x4W * 4, num4x4H * 4)` recursion
+    /// (per the `is_inter && !Lossless && !plane` arm). `false` ⇔ leaf
+    /// emitted by the per-plane intra / chroma `for y, for x` direct
+    /// iteration.
+    pub from_transform_tree: bool,
+}
+
+/// §5.11.34 `residual()` post-walk outcome — the per-block list of
+/// per-TU tasks the §5.11.34 outer dispatch emitted, plus the
+/// matching per-TU `coefficients()` readouts.
+///
+/// ## What this readout covers
+///
+/// * §5.11.34 outer `widthChunks` / `heightChunks` loops with the
+///   `Block_Width[MiSize] >> 6` / `Block_Height[MiSize] >> 6`
+///   threshold (1 chunk per 64-luma stride per axis; clamped to
+///   `Max(1, _)`).
+/// * §5.11.34 `miSizeChunk = ( widthChunks > 1 || heightChunks > 1 ) ?
+///   BLOCK_64X64 : MiSize` derivation.
+/// * §5.11.34 per-plane `for ( plane = 0; plane < 1 + HasChroma * 2;
+///   plane++ )` loop with §5.11.37 `get_tx_size(plane, TxSize)` and
+///   §5.11.38 `get_plane_residual_size(miSizeChunk, plane)`.
+/// * §5.11.34 inter-luma `transform_tree(baseX, baseY, num4x4W * 4,
+///   num4x4H * 4)` recursion (per the `is_inter && !Lossless && !plane`
+///   arm) via [`PartitionWalker::residual`]'s internal
+///   `transform_tree` helper.
+/// * §5.11.36 `transform_tree( startX, startY, w, h )` recursion —
+///   `w <= lumaW && h <= lumaH` leaf-emit, `w > h` / `w < h` /
+///   `w == h` split arms — operating against the walker's
+///   `InterTxSizes[ row ][ col ]` grid.
+/// * §5.11.34 non-inter / chroma direct iteration via the
+///   `for ( y = 0; y < num4x4H; y += stepY ) for ( x = 0; x < num4x4W;
+///   x += stepX ) transform_block(plane, ...)` loop with the
+///   `stepX = Tx_Width[txSz] >> 2` / `stepY = Tx_Height[txSz] >> 2`
+///   step.
+/// * §5.11.35 `transform_block` early-return on `startX >= maxX ||
+///   startY >= maxY`.
+/// * §5.11.35 `if ( !skip ) eob = coeffs( plane, startX, startY, txSz )`
+///   per-leaf call via [`PartitionWalker::coefficients`], with the
+///   per-TU outcome captured in [`Self::coeffs`].
+///
+/// ## Explicit split-off list (not implemented in this round)
+///
+/// The following §5.11.34 / §5.11.35 sub-routines are deferred to
+/// subsequent arcs; the dispatcher records the per-TU task but does
+/// not invoke them:
+///
+/// * §5.11.35 `predict_intra(plane, startX, startY, ...)` /
+///   `predict_palette(...)` / `predict_chroma_from_luma(...)` (the
+///   §7.11.2.x sample-generation kernels). The standalone
+///   [`predict_intra_dc_pred`] leaf landed in r180; the remaining
+///   §7.11.2.x bodies and the `CurrFrame[plane][y][x]` sample-buffer
+///   wiring are split-off.
+/// * §5.11.35 `reconstruct(plane, startX, startY, txSz)` — the §7.6
+///   inverse-transform + §7.7 reconstruction pass (consumes the
+///   §5.11.39 `Quant[ pos ]` levels + §7.13 dequantization). Split-off
+///   in its entirety; the dispatcher surfaces
+///   [`crate::Error::ResidualReconstructUnsupported`] when reached on
+///   the `!skip && eob > 0` path.
+/// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` and
+///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps. The
+///   underlying walker grids are not yet allocated; the dispatcher
+///   no-ops on the stamp lines.
+/// * §5.11.40 `transform_type( x4, y4, txSz )` per-luma-TU S() read
+///   into `TxTypes[ y4 + j ][ x4 + i ]`. The dispatcher defaults the
+///   per-TU `txType` to `DCT_DCT` (the §5.11.40 fallback returned by
+///   `compute_tx_type` for `Lossless || txSzSqrUp > TX_32X32`),
+///   feeding `coefficients()` a `tx_class = TX_CLASS_2D`.
+/// * §5.11.41 `compute_tx_type( plane, txSz, x4, y4 )` — full §5.11.41
+///   body (`TxTypes[]` lookup, `Mode_To_Txfm[ UVMode ]` fallback,
+///   `is_tx_type_in_set` set membership). Defaulted to `DCT_DCT`
+///   alongside §5.11.40.
+/// * §7.5 `get_scan( txSz )` — the per-`(txSz, PlaneTxType)` scan-table
+///   dispatch over `Default_Scan_*` / `Mrow_Scan_*` / `Mcol_Scan_*`. The
+///   dispatcher passes `coefficients()` an identity scan `0..segEob`,
+///   sufficient for the gate-closed (`all_zero == 1`) bitstream path
+///   the §5.11.34 reachable site exercises today.
+/// * `AboveLevelContext` / `LeftLevelContext` / `AboveDcContext` /
+///   `LeftDcContext` per-plane context arrays. The §8.3.2 `txb_skip_ctx`
+///   / `dc_sign_ctx` derivation reads these; the dispatcher passes both
+///   contexts as `0` (the first-block / clean-state context — exactly
+///   matches the first TU of every reachable §5.11.34 site, where the
+///   neighbour arrays are zero-initialized).
+/// * §7.13 `Dequant[][]` per-`(plane, pos)` dequantization step.
+///   `coefficients()` returns the §5.11.39 `Quant[ pos ]` raw signed
+///   levels; the dequantization step is the inverse-quantization
+///   pre-pass to the §7.6 inverse transform.
+///
+/// ## Skip-path semantics
+///
+/// On `skip == true` the §5.11.34 / §5.11.35 dispatcher visits every
+/// per-TU task site to drive the `LoopfilterTxSizes[]` /
+/// `BlockDecoded[]` stamps (no-op on this walker), but does NOT invoke
+/// `coefficients()` — the §5.11.35 `if ( !skip )` gate short-circuits
+/// the bitstream read. [`Self::coeffs`] is empty on this path.
+///
+/// On `skip == false` (and `Lossless == false`) the dispatcher invokes
+/// `coefficients()` per leaf TU; the per-TU outcomes accumulate in
+/// [`Self::coeffs`] in `tasks` order. The next-arc `reconstruct(...)`
+/// fires when any per-TU `eob > 0` — at which point the dispatcher
+/// surfaces [`crate::Error::ResidualReconstructUnsupported`] (the §7.6
+/// inverse-transform body).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResidualReadout {
+    /// `widthChunks = Max( 1, Block_Width[ MiSize ] >> 6 )` per §5.11.34
+    /// line 3. For `MiSize < BLOCK_64X64` this is `1`. For 64×64
+    /// blocks this is `1` (Block_Width = 64, `64 >> 6 = 1`). For 128×*
+    /// blocks the spec yields `2`.
+    pub width_chunks: u8,
+    /// `heightChunks = Max( 1, Block_Height[ MiSize ] >> 6 )` companion
+    /// to [`Self::width_chunks`].
+    pub height_chunks: u8,
+    /// `miSizeChunk` per §5.11.34 line 5 — `BLOCK_64X64` on the
+    /// `widthChunks > 1 || heightChunks > 1` arm, otherwise `MiSize`.
+    /// The §5.11.38 `get_plane_residual_size(miSizeChunk, plane)` lookup
+    /// per-plane consumes this.
+    pub mi_size_chunk: u8,
+    /// `1 + HasChroma * 2` — the §5.11.34 outer `for plane = 0..1 +
+    /// HasChroma * 2` loop's bound.
+    pub num_planes_visited: u8,
+    /// Per-TU enumeration of every `transform_block` leaf the §5.11.34
+    /// outer dispatch emitted. Ordered as the §5.11.34 spec body
+    /// emits them: `chunkY` outer, `chunkX` next, `plane` next, then
+    /// the per-plane `(y, x)` step inside `transform_block`'s direct
+    /// iteration (or §5.11.36 `transform_tree` DFS for the inter-luma
+    /// arm).
+    pub tasks: Vec<ResidualTuTask>,
+    /// Per-TU `coefficients()` outcomes — one entry per `tasks` entry
+    /// on the `!skip && !Lossless` path; empty on the `skip == true`
+    /// path. On the `Lossless == true` path the §5.11.34 forces
+    /// `txSz = TX_4X4` and the coefficient read still fires per TU.
+    pub coeffs: Vec<CoefficientsReadout>,
+    /// `skip` — routed through from the §5.11.5 walker's `skip` field
+    /// (the per-block `skip` syntax element from §5.11.11). Recorded
+    /// for caller-side reconstruction-pass scheduling.
+    pub skip: bool,
 }
 
 /// §5.11.33 `compute_prediction()` per-plane enumeration — one entry
@@ -43394,5 +44372,435 @@ mod tests {
             .unwrap();
         assert!(r2.all_zero);
         assert_eq!(r2.eob, 0);
+    }
+
+    // ============================================================
+    // r181 — §5.11.34 `residual()` outer-dispatch tests.
+    // ============================================================
+
+    /// `get_tx_size( plane=0, ... )` is a pass-through — the §5.11.37
+    /// spec body line 2 short-circuits luma to the input `txSz`.
+    #[test]
+    fn get_tx_size_plane0_is_pass_through() {
+        for tx in 0..TX_SIZES_ALL {
+            assert_eq!(
+                get_tx_size(0, tx, BLOCK_16X16, 0, 0),
+                Some(tx),
+                "plane 0 pass-through (tx_size = {tx})",
+            );
+        }
+    }
+
+    /// `get_tx_size` chroma path with no subsampling (4:4:4) — chroma
+    /// residual equals luma residual, then §5.11.37 lookup via
+    /// `Max_Tx_Size_Rect`.
+    #[test]
+    fn get_tx_size_chroma_no_subsampling_matches_max_tx_size_rect() {
+        // BLOCK_16X16, 4:4:4 — chroma plane_sz = BLOCK_16X16; uvTx =
+        // MAX_TX_SIZE_RECT[BLOCK_16X16] = TX_16X16. Neither width nor
+        // height is 64, so returns uvTx = TX_16X16.
+        assert_eq!(get_tx_size(1, TX_16X16, BLOCK_16X16, 0, 0), Some(TX_16X16));
+        assert_eq!(get_tx_size(2, TX_16X16, BLOCK_16X16, 0, 0), Some(TX_16X16));
+        // BLOCK_32X32, 4:4:4 — uvTx = MAX_TX_SIZE_RECT[BLOCK_32X32] = TX_32X32.
+        assert_eq!(get_tx_size(1, TX_8X8, BLOCK_32X32, 0, 0), Some(TX_32X32));
+    }
+
+    /// `get_tx_size` 4:2:0 chroma path — BLOCK_64X64 → 32×32 chroma
+    /// residual → uvTx = TX_32X32 (no 64-side clamp fires).
+    #[test]
+    fn get_tx_size_chroma_420_block_64x64_is_tx_32x32() {
+        assert_eq!(get_tx_size(1, TX_64X64, BLOCK_64X64, 1, 1), Some(TX_32X32));
+        assert_eq!(get_tx_size(2, TX_64X64, BLOCK_64X64, 1, 1), Some(TX_32X32));
+    }
+
+    /// `get_tx_size` 4:2:0 chroma path on BLOCK_128X128 — chroma
+    /// plane_sz = BLOCK_64X64, uvTx = MAX_TX_SIZE_RECT[BLOCK_64X64] =
+    /// TX_64X64 → triggers the §5.11.37 64-side clamp arm → TX_32X32.
+    #[test]
+    fn get_tx_size_chroma_128x128_420_clamps_to_32x32() {
+        // 4:2:0 BLOCK_128X128 chroma plane_sz = BLOCK_64X64.
+        // uvTx = MAX_TX_SIZE_RECT[BLOCK_64X64] = TX_64X64 (w = h = 64).
+        // 64-clamp arm: w == 64 && h == 64, neither is 16 ⇒ TX_32X32.
+        let mi_size = BLOCK_64X64 + 3; // BLOCK_128X128
+        assert_eq!(get_tx_size(1, TX_64X64, mi_size, 1, 1), Some(TX_32X32));
+    }
+
+    /// `get_tx_size` out-of-range guards.
+    #[test]
+    fn get_tx_size_caller_bug_guards() {
+        assert_eq!(get_tx_size(3, TX_4X4, BLOCK_4X4, 0, 0), None);
+        assert_eq!(get_tx_size(0, TX_SIZES_ALL, BLOCK_4X4, 0, 0), None);
+        assert_eq!(get_tx_size(0, TX_4X4, BLOCK_SIZES, 0, 0), None);
+        assert_eq!(get_tx_size(0, TX_4X4, BLOCK_4X4, 2, 0), None);
+        assert_eq!(get_tx_size(0, TX_4X4, BLOCK_4X4, 0, 2), None);
+    }
+
+    /// `residual()` gate-closed skip arm: `skip == true` short-
+    /// circuits the per-TU `coefficients()` invocation. The
+    /// dispatcher returns a [`ResidualReadout`] with the per-TU task
+    /// enumeration filled in but the `coeffs` vec empty.
+    #[test]
+    fn residual_skip_arm_emits_tasks_only_no_coefficient_reads() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .residual(
+                &mut dec, &mut cdfs, /* mi_row = */ 0, /* mi_col = */ 0,
+                /* mi_size = */ BLOCK_8X8, /* has_chroma = */ true,
+                /* subsampling_x = */ 0, /* subsampling_y = */ 0,
+                /* is_inter = */ false, /* lossless = */ false, /* skip = */ true,
+                /* tx_size = */ TX_8X8, /* use_128x128_superblock = */ false,
+            )
+            .unwrap();
+        let pos_after = dec.position();
+        assert_eq!(r.width_chunks, 1, "BLOCK_8X8 ⇒ widthChunks = 1");
+        assert_eq!(r.height_chunks, 1, "BLOCK_8X8 ⇒ heightChunks = 1");
+        assert_eq!(r.mi_size_chunk, BLOCK_8X8 as u8);
+        assert_eq!(r.num_planes_visited, 3, "has_chroma ⇒ 3 planes");
+        // Each plane emits exactly one TU at TX_8X8 (stepX = stepY = 2
+        // and num4x4W = num4x4H = 2 ⇒ one (y, x) step).
+        assert_eq!(
+            r.tasks.len(),
+            3,
+            "one TU per plane on the BLOCK_8X8 / TX_8X8 path"
+        );
+        assert!(r.coeffs.is_empty(), "skip == true ⇒ no coefficient reads");
+        assert!(r.skip);
+        assert_eq!(pos_after, pos_before, "skip arm reads no bits");
+        // Per-plane task ordering: plane 0, 1, 2.
+        assert_eq!(r.tasks[0].plane, 0);
+        assert_eq!(r.tasks[1].plane, 1);
+        assert_eq!(r.tasks[2].plane, 2);
+        // Every task on the non-inter / chroma path has
+        // `from_transform_tree == false`.
+        for t in &r.tasks {
+            assert!(!t.from_transform_tree);
+        }
+    }
+
+    /// `residual()` gate-open `!skip` arm with `all_zero == 1` forced
+    /// on every TU: the dispatcher invokes `coefficients()` per TU
+    /// and the §5.11.39 reader short-circuits at the `all_zero` S().
+    /// `coeffs.len() == tasks.len()`; every entry has `all_zero ==
+    /// true` and `eob == 0`. The dispatcher does NOT fire
+    /// `ResidualReconstructUnsupported` because no TU has `eob > 0`.
+    #[test]
+    fn residual_no_skip_all_zero_completes_without_reconstruct_stub() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force §5.11.39 `all_zero` S() to return 1 for every TU.
+        for sz in 0..TX_SIZES {
+            for ctx in 0..TXB_SKIP_CONTEXTS {
+                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+            }
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker
+            .residual(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* has_chroma = */ true, 0, 0,
+                /* is_inter = */ false, /* lossless = */ false, /* skip = */ false,
+                TX_8X8, false,
+            )
+            .unwrap();
+        assert_eq!(r.tasks.len(), 3);
+        assert_eq!(r.coeffs.len(), 3, "!skip ⇒ one coefficient readout per TU");
+        for c in &r.coeffs {
+            assert!(c.all_zero, "rigged CDFs force all_zero = 1");
+            assert_eq!(c.eob, 0);
+            assert_eq!(c.cul_level, 0);
+            assert_eq!(c.dc_category, 0);
+        }
+    }
+
+    /// `residual()` lossless path forces `txSz = TX_4X4` (the §5.11.34
+    /// line 12 short-circuit). Verify per-plane task `tx_size = TX_4X4`.
+    #[test]
+    fn residual_lossless_forces_tx_4x4_per_plane() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker
+            .residual(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* has_chroma = */ true, 0, 0, false,
+                /* lossless = */ true, /* skip = */ true, TX_8X8, false,
+            )
+            .unwrap();
+        for t in &r.tasks {
+            assert_eq!(
+                t.tx_size as usize, TX_4X4,
+                "Lossless ⇒ TX_4X4 (got {} for plane {})",
+                t.tx_size, t.plane
+            );
+        }
+        // BLOCK_8X8 lossless ⇒ TX_4X4 ⇒ num4x4W = num4x4H = 2, stepX
+        // = stepY = 1 ⇒ 4 TUs per plane × 3 planes = 12 total.
+        assert_eq!(r.tasks.len(), 12);
+    }
+
+    /// `residual()` monochrome (`has_chroma == false`) emits only
+    /// plane 0 tasks.
+    #[test]
+    fn residual_monochrome_emits_only_luma_tasks() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker
+            .residual(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* has_chroma = */ false, 0, 0, false,
+                false, /* skip = */ true, TX_8X8, false,
+            )
+            .unwrap();
+        assert_eq!(r.num_planes_visited, 1, "monochrome ⇒ 1 plane");
+        for t in &r.tasks {
+            assert_eq!(t.plane, 0, "monochrome ⇒ only luma");
+        }
+    }
+
+    /// `residual()` BLOCK_128X128 chunk-grid: `widthChunks = 2`,
+    /// `heightChunks = 2`, `miSizeChunk = BLOCK_64X64`. Four chunks
+    /// emit per plane.
+    #[test]
+    fn residual_block_128x128_chunks_to_4_chunks() {
+        // 128x128 fits in a 32×32 mi grid (32 * 4 = 128 luma).
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mi_size_128x128 = BLOCK_64X64 + 3;
+        let r = walker
+            .residual(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                mi_size_128x128,
+                /* has_chroma = */ true,
+                0,
+                0,
+                false,
+                /* lossless = */ true,
+                /* skip = */ true,
+                TX_4X4,
+                /* use_128x128_superblock = */ true,
+            )
+            .unwrap();
+        assert_eq!(r.width_chunks, 2, "BLOCK_128X128 ⇒ widthChunks = 2");
+        assert_eq!(r.height_chunks, 2, "BLOCK_128X128 ⇒ heightChunks = 2");
+        assert_eq!(
+            r.mi_size_chunk, BLOCK_64X64 as u8,
+            "(widthChunks > 1 || heightChunks > 1) ⇒ miSizeChunk = BLOCK_64X64"
+        );
+        // chunkY axis emits before chunkX — verify (chunk_y, chunk_x)
+        // ordering of the first few tasks.
+        let first = r.tasks[0];
+        assert_eq!((first.chunk_x, first.chunk_y), (0, 0));
+        // Per-plane visits inside chunk (0,0) precede chunk (1,0).
+        let chunk_pairs: Vec<(u8, u8)> = r.tasks.iter().map(|t| (t.chunk_x, t.chunk_y)).collect();
+        // First emission should be chunk (0,0); somewhere later, chunk
+        // (1,0) and (0,1) and (1,1) appear.
+        assert!(chunk_pairs.contains(&(1, 0)));
+        assert!(chunk_pairs.contains(&(0, 1)));
+        assert!(chunk_pairs.contains(&(1, 1)));
+    }
+
+    /// `residual()` caller-bug guards.
+    #[test]
+    fn residual_caller_bug_guards() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+
+        // Out-of-range mi_size.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        assert_eq!(
+            walker.residual(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_SIZES,
+                false,
+                0,
+                0,
+                false,
+                false,
+                true,
+                TX_4X4,
+                false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+
+        // Out-of-range mi_row.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        assert_eq!(
+            walker.residual(
+                &mut dec, &mut cdfs, 9, 0, BLOCK_4X4, false, 0, 0, false, false, true, TX_4X4,
+                false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+
+        // Out-of-range mi_col.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        assert_eq!(
+            walker.residual(
+                &mut dec, &mut cdfs, 0, 9, BLOCK_4X4, false, 0, 0, false, false, true, TX_4X4,
+                false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+
+        // Out-of-range subsampling_x.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        assert_eq!(
+            walker.residual(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, false, 2, 0, false, false, true, TX_4X4,
+                false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+
+        // Out-of-range subsampling_y.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        assert_eq!(
+            walker.residual(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, false, 0, 2, false, false, true, TX_4X4,
+                false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+
+        // Out-of-range tx_size.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        assert_eq!(
+            walker.residual(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                false,
+                0,
+                0,
+                false,
+                false,
+                true,
+                TX_SIZES_ALL,
+                false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    /// `residual()` inter-luma `transform_tree` recursion: BLOCK_8X8
+    /// inter + non-lossless, plane 0 routes through the §5.11.36
+    /// recursion. With InterTxSizes default (TX_4X4) the recursion
+    /// splits the 8×8 region into 4× TX_4X4 leaves. `from_transform_
+    /// tree == true` on every plane-0 task.
+    #[test]
+    fn residual_inter_luma_transform_tree_emits_per_tx_leaf() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        // The walker's InterTxSizes grid defaults to TX_4X4. The
+        // §5.11.36 recursion at (start=0,0, w=8, h=8) sees lumaW =
+        // lumaH = 4 < 8, so splits 4-ways into four 4×4 leaves.
+        let r = walker
+            .residual(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8,
+                /* has_chroma = */ false, // skip chroma to simplify
+                0, 0, /* is_inter = */ true, /* lossless = */ false,
+                /* skip = */ true, TX_8X8, false,
+            )
+            .unwrap();
+        // 4 luma TUs via the transform_tree split + 0 chroma.
+        assert_eq!(r.tasks.len(), 4);
+        for t in &r.tasks {
+            assert_eq!(t.plane, 0);
+            assert!(
+                t.from_transform_tree,
+                "inter-luma arm routes through transform_tree"
+            );
+            assert_eq!(
+                t.tx_size as usize, TX_4X4,
+                "InterTxSizes default ⇒ find_tx_size(4, 4) = TX_4X4"
+            );
+        }
+    }
+
+    /// `ResidualReadout` `Clone` / `Debug` / `Eq` derive smoke.
+    #[test]
+    fn residual_readout_clone_debug_smoke() {
+        let r = ResidualReadout {
+            width_chunks: 1,
+            height_chunks: 1,
+            mi_size_chunk: BLOCK_8X8 as u8,
+            num_planes_visited: 3,
+            tasks: vec![ResidualTuTask {
+                plane: 0,
+                start_x: 0,
+                start_y: 0,
+                tx_size: TX_4X4 as u8,
+                chunk_x: 0,
+                chunk_y: 0,
+                from_transform_tree: false,
+            }],
+            coeffs: vec![],
+            skip: true,
+        };
+        let r2 = r.clone();
+        assert_eq!(r, r2);
+        // Debug formatter doesn't panic.
+        let _ = format!("{r:?}");
     }
 }

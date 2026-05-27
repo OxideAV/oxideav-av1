@@ -1635,6 +1635,11 @@ pub use cdf::{
     get_plane_residual_size, predict_intra_dc_pred, ComputePredictionReadout, PlanePredictionTask,
     COMPUTE_PRED_MODE_INTER, SUBSAMPLED_SIZE,
 };
+// r181: §5.11.34 `residual()` outer-dispatch readout
+// ([`cdf::ResidualReadout`] + [`cdf::ResidualTuTask`]) surfaced
+// through [`cdf::PartitionWalker::residual`], plus the §5.11.37
+// per-plane transform-size lookup [`cdf::get_tx_size`].
+pub use cdf::{get_tx_size, ResidualReadout, ResidualTuTask};
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
     InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,
@@ -1851,13 +1856,74 @@ pub enum Error {
     /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
     /// walker reached the §5.11.34 `residual()` call — the per-block
     /// transform-coefficient read + inverse-transform + reconstruction
-    /// pass. `residual()` and its §7.12 sub-routines are the next
-    /// round's target and currently STUBBED. Currently unreachable
-    /// from `decode_block_syntax` because the walker short-circuits
-    /// at [`Error::DecodeBlockReadBlockTxSizeUnsupported`] first; reserved
-    /// for the round that lands `compute_prediction()` and exposes
-    /// this stub.
+    /// pass.
+    ///
+    /// As of r181 the §5.11.34 outer dispatch
+    /// (`widthChunks` / `heightChunks` per-chunk loop +
+    /// §5.11.36 `transform_tree` recursion + §5.11.35
+    /// `transform_block` direct iteration) is wired into the walker
+    /// through [`crate::PartitionWalker::residual`]; on the `skip ==
+    /// true` arm the dispatcher completes the per-TU task enumeration
+    /// without invoking the bitstream-reading
+    /// [`crate::PartitionWalker::coefficients`] reader, and the walker
+    /// advances cleanly past the §5.11.34 call site (returning the
+    /// per-block `DecodedBlock`).
+    ///
+    /// This variant is retained as a defensive caller-bug fallback —
+    /// the dispatcher constructs it only when
+    /// [`crate::PartitionWalker::residual`] reports a configuration
+    /// the §5.11.34 / §5.11.35 driver can't yet drive (e.g. an
+    /// inter-luma `transform_tree` recursion on `Lossless == false`,
+    /// or a `!skip && eob > 0` reconstruction-pass call), at which
+    /// point it surfaces
+    /// [`Self::ResidualReconstructUnsupported`] /
+    /// [`Self::ResidualTransformTreeUnsupported`] /
+    /// [`Self::ResidualCoefficientsTxSizeUnsupported`] instead.
     DecodeBlockResidualUnsupported,
+    /// The §5.11.34 [`crate::PartitionWalker::residual`] dispatcher
+    /// completed the per-TU task enumeration with `skip == false` and
+    /// at least one TU returned `eob > 0` — at which point §5.11.35
+    /// invokes `reconstruct( plane, startX, startY, txSz )` (the §7.6
+    /// inverse transform + §7.7 reconstruction pass). The §7.6 / §7.7
+    /// bodies — `inverse_transform`, `Iadst_*`, `Idct_*`, `Iidentity`,
+    /// `Iflipadst_*`, `Iht_*`, plus the §7.13 `Dequant[][]` step that
+    /// precedes them — are the next-arc target.
+    ///
+    /// Reachable when the §5.11.5 walker drives `decode_block_syntax`
+    /// with a non-trivial coefficient block (one whose `all_zero`
+    /// CDF read returns `0`); the gate-closed (`skip == true`) walker
+    /// path the test fixtures exercise does NOT fire this error.
+    ResidualReconstructUnsupported,
+    /// The §5.11.34 [`crate::PartitionWalker::residual`] dispatcher
+    /// reached the inter-luma
+    /// `transform_tree(baseX, baseY, num4x4W*4, num4x4H*4)` recursion
+    /// (the §5.11.34 `is_inter && !Lossless && !plane` arm), and the
+    /// §5.11.36 recursion expects the §5.11.17 `read_var_tx_size`-
+    /// stamped `InterTxSizes[ row ][ col ]` grid to drive the per-leaf
+    /// `find_tx_size( w, h )` resolution.
+    ///
+    /// The §5.11.36 recursion itself runs to completion on the
+    /// dispatcher; this variant fires only when the in-grid
+    /// `InterTxSizes[ row ][ col ]` carries a `TX_*` ordinal whose
+    /// `(Tx_Width, Tx_Height)` doesn't match a `(w, h)` pair the
+    /// recursion's `find_tx_size` lookup can resolve to an in-range
+    /// `TX_SIZES_ALL` ordinal — an out-of-spec InterTxSizes grid
+    /// state. Unreachable on the §5.11.16 / §5.11.17 walker-driven
+    /// `InterTxSizes` writes; reserved for direct callers of
+    /// [`crate::PartitionWalker::residual`] that pre-populate the
+    /// grid out-of-band.
+    ResidualTransformTreeUnsupported,
+    /// The §5.11.34 [`crate::PartitionWalker::residual`] dispatcher
+    /// derived a per-leaf `txSz` (`get_tx_size( plane, TxSize )` for
+    /// chroma, `find_tx_size( w, h )` for inter-luma transform_tree
+    /// leaves, or `TxSize` directly for non-inter luma) that the
+    /// §5.11.39 [`crate::PartitionWalker::coefficients`] reader
+    /// declines (out-of-range `txSz`).
+    ///
+    /// Reachable only when the caller routes a non-conformant
+    /// `tx_size` through `decode_block_syntax` — the §5.11.16 /
+    /// §5.11.37 walker derivations all yield in-range ordinals.
+    ResidualCoefficientsTxSizeUnsupported,
     /// The §5.11.18 [`crate::PartitionWalker::decode_inter_frame_mode_info`]
     /// walker reached the §5.11.22 `intra_block_mode_info()` call — the
     /// per-block intra-mode-info composite (`y_mode` / `intra_angle_info_y`
@@ -2089,7 +2155,19 @@ impl core::fmt::Display for Error {
             ),
             Self::DecodeBlockResidualUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.5 decode_block reached §5.11.34 residual() — transform-coefficient read + reconstruction pending next round"
+                "oxideav-av1: §5.11.5 decode_block reached §5.11.34 residual() — defensive fallback retained post-r181 (the §5.11.34 outer dispatch + §5.11.36 transform_tree recursion + per-TU §5.11.39 coefficients() wiring is now landed; see ResidualReconstructUnsupported / ResidualTransformTreeUnsupported / ResidualCoefficientsTxSizeUnsupported for the live gaps)"
+            ),
+            Self::ResidualReconstructUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.34 residual() reached §5.11.35 reconstruct() — §7.6 inverse transform + §7.13 dequant + §7.7 reconstruction pass pending next-arc"
+            ),
+            Self::ResidualTransformTreeUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.34 residual() reached §5.11.36 transform_tree() with an out-of-spec InterTxSizes[r][c] grid state — find_tx_size(w, h) lookup failed"
+            ),
+            Self::ResidualCoefficientsTxSizeUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.34 residual() derived a per-leaf txSz the §5.11.39 coefficients() reader declined — caller-bug guard"
             ),
             Self::IntraBlockModeInfoUnsupported => write!(
                 f,

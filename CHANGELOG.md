@@ -6,6 +6,100 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 181 — §5.11.34 `residual()` outer dispatch + §5.11.36
+  `transform_tree` recursion + per-TU §5.11.39 wiring.** Lifts the
+  §5.11.5 walker's long-standing `DecodeBlockResidualUnsupported`
+  stub by landing the §5.11.34 outer dispatcher per av1-spec p.84-85.
+  Exposed as `PartitionWalker::residual(decoder, cdfs, mi_row, mi_col,
+  mi_size, has_chroma, subsampling_x, subsampling_y, is_inter,
+  lossless, skip, tx_size, use_128x128_superblock)` returning a new
+  `ResidualReadout { width_chunks, height_chunks, mi_size_chunk,
+  num_planes_visited, tasks, coeffs, skip }` aggregate. Per-TU tasks
+  are surfaced through `Vec<ResidualTuTask { plane, start_x, start_y,
+  tx_size, chunk_x, chunk_y, from_transform_tree }>` in §5.11.34 spec
+  order (`chunkY` outer / `chunkX` next / `plane` next / per-plane
+  `(y, x)` direct iteration inside `transform_block`; DFS leaf order
+  for the inter-luma `transform_tree` arm). The `tasks.len() ==
+  coeffs.len()` invariant holds on the `!skip` arm; on `skip == true`
+  the `coeffs` vec is empty (per the §5.11.35 `if ( !skip ) coeffs(
+  ... )` gate).
+
+  Implemented bodies:
+
+  * §5.11.34 outer `widthChunks` / `heightChunks` derivation
+    (`Max( 1, Block_Width[ MiSize ] >> 6 )` for both axes).
+  * §5.11.34 `miSizeChunk = ( widthChunks > 1 || heightChunks > 1 ) ?
+    BLOCK_64X64 : MiSize` per av1-spec p.84 line 5.
+  * §5.11.34 chunk-loop + per-plane loop bound to
+    `1 + HasChroma * 2`.
+  * §5.11.37 `get_tx_size(plane, txSz)` per-plane lookup with the
+    `Tx_Width[ uvTx ] == 64 || Tx_Height[ uvTx ] == 64` chroma clamp
+    arm.
+  * §5.11.38 `get_plane_residual_size(miSizeChunk, plane)` for the
+    per-plane `planeSz`.
+  * §5.11.36 `transform_tree( startX, startY, w, h )` recursive
+    split — `w <= lumaW && h <= lumaH` leaf-emit (with `find_tx_size(
+    w, h )` resolution), `w > h` / `w < h` / `w == h` per-direction
+    splits operating against the walker's `InterTxSizes[ row ][ col ]`
+    grid.
+  * §5.11.35 `transform_block(plane, baseX, baseY, txSz, x, y)`
+    per-TU emit with the `startX = baseX + 4 * x` /
+    `startY = baseY + 4 * y` derivation and the `startX >= maxX ||
+    startY >= maxY` early-return.
+  * §5.11.35 `if ( !skip ) eob = coeffs( ... )` invocation of the
+    r179 §5.11.39 `PartitionWalker::coefficients` reader. The
+    `if ( eob > 0 ) reconstruct(...)` arm surfaces
+    `Error::ResidualReconstructUnsupported`.
+
+  Wired into `decode_block_syntax`, lifting
+  `Error::DecodeBlockResidualUnsupported`. The walker now reaches
+  `Error::ResidualReconstructUnsupported` (the §7.6 inverse-
+  transform + §7.13 dequant + §7.7 reconstruction merge) when the
+  rigged-zero bitstream produces a non-`all_zero == 1` TU. On the
+  `skip == true` arm and on the `all_zero == 1`-for-every-TU arm the
+  walker returns through `decode_block_syntax` cleanly with the
+  per-block `DecodedBlock`. The `DecodeBlockResidualUnsupported`
+  variant is retained as a defensive caller-bug fallback.
+
+  Explicit splits to subsequent arcs:
+
+  * §5.11.40 `transform_type` per-luma-TU S() read into `TxTypes[]`
+    (defaulted to `DCT_DCT`).
+  * §5.11.41 `compute_tx_type` full body (defaulted to `DCT_DCT`).
+  * §7.5 `get_scan` table dispatch over `Default_Scan_*` /
+    `Mrow_Scan_*` / `Mcol_Scan_*` (defaulted to identity scan
+    `0..segEob`).
+  * `AboveLevelContext` / `LeftLevelContext` / `AboveDcContext` /
+    `LeftDcContext` per-plane context arrays (passed as `0`
+    clean-state context — exactly matches the first TU of every
+    reachable site).
+  * §5.11.35 `predict_intra` / `predict_palette` /
+    `predict_chroma_from_luma` per-TU intra-prediction kernels.
+  * §5.11.35 `reconstruct(plane, startX, startY, txSz)` — the §7.6
+    inverse-transform kernel itself (the headline next-arc target).
+  * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` /
+    `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps.
+  * §7.13 `Dequant[][]` per-`(plane, pos)` dequantization.
+
+  New public surface: `PartitionWalker::residual`, `ResidualReadout`,
+  `ResidualTuTask`, `get_tx_size`. New `Error` variants:
+  `ResidualReconstructUnsupported`,
+  `ResidualTransformTreeUnsupported`,
+  `ResidualCoefficientsTxSizeUnsupported`.
+
+  13 new tests (755 → 768): `get_tx_size` (plane-0 pass-through, 4:4:4
+  chroma residual = luma residual, 4:2:0 BLOCK_64X64 / BLOCK_128X128
+  size clamp, caller-bug guards); `residual` (skip-arm task-only
+  emission with zero bits read, no-skip all_zero per-TU short-
+  circuit, lossless `TX_4X4` forcing per plane, monochrome luma-only
+  emission, BLOCK_128X128 4-chunk emission with `BLOCK_64X64`
+  miSizeChunk, six caller-bug guards, inter-luma `transform_tree` 4-
+  way recursion to `TX_4X4` leaves); `ResidualReadout` Clone / Debug
+  / Eq derive smoke. The existing `decode_block_syntax` integration
+  tests are updated to expect `Error::ResidualReconstructUnsupported`.
+  `decode_av1` / `encode_av1` continue to return
+  `Error::NotImplemented`.
+
 * **Round 180 — §5.11.30 / §5.11.33 `compute_prediction()` dispatcher
   + §7.11.2.5 DC intra prediction leaf.** Lifts the §5.11.5 walker's
   long-standing `DecodeBlockComputePredictionUnsupported` stub by
