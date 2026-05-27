@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 182)
+## Status — 2026-05-28 (round 183)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,115 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 183 lifts the **§7.12.2 dequantization-function tables + §7.12.3
+step-1 dequantization loop + §5.11.47 `transform_type` per-TU S()
+reader** — the three split-offs the r182 walker left as placeholders.
+
+The new §7.12.2 helpers in `cdf` expose `Dc_Qlookup[3][256]` /
+`Ac_Qlookup[3][256]` (the per-bit-depth dc / ac quantizer index
+tables, verbatim from av1-spec p.289-292) and the `dc_q(bit_depth, b)`
+/ `ac_q(bit_depth, b)` lookups with the spec's `(BitDepth-8) >> 1`
+row select and `Clip3(0, 255, b)` column clamp. `get_qindex(quant,
+ignore_delta_q, seg_id)` reproduces av1-spec p.293 (segmentation
+`SEG_LVL_ALT_Q` arm + `delta_q_present` running-`CurrentQIndex`
+arm + `base_q_idx` fallback) and feeds `get_dc_quant(quant, plane,
+seg_id)` / `get_ac_quant(quant, plane, seg_id)` (per-plane
+`DeltaQ?Dc` / `DeltaQ?Ac` routing). The new `QuantizerParams`
+struct carries the §5.9.12 `base_q_idx` + four `delta_q_*` slots,
+the §5.9.18 `delta_q_present` / `current_q_index`, the §5.9.14
+segmentation `SEG_LVL_ALT_Q` `FeatureEnabled[]` / `FeatureData[]`
+tables, the §5.9.12 `using_qmatrix` bit, and the §6.4.1 `BitDepth`.
+
+`dequantize_step1(quant_levels, tx_size, plane, seg_id,
+plane_tx_type, seg_qm_level, &QuantizerParams)` runs the §7.12.3
+step-1 loop verbatim:
+`for i = 0..(th-1), j = 0..(tw-1) { q = (i==0 && j==0) ?
+get_dc_quant : get_ac_quant; q2 = q; dq = Quant[i*tw+j] * q2;
+sign = (dq < 0) ? -1 : 1; dq2 = sign * (|dq| & 0xFFFFFF) /
+dqDenom; Dequant[i][j] = Clip3(-(1<<(7+BitDepth)),
+(1<<(7+BitDepth)) - 1, dq2); }` — with `tw = Min(32, w)`, `th =
+Min(32, h)`, and `dqDenom = 4 / 2 / 1` per av1-spec p.294
+(`dequant_denom`). Cells with `i >= th || j >= tw` stay at the
+§5.11.39 `Dequant[i][j] = 0` pre-loop default. The §9.5.3
+`Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table is not yet
+tabulated; the `using_qmatrix && plane_tx_type < IDTX &&
+seg_qm_level < 15` arm therefore falls through to the no-QM
+identity (`q2 = q`) path with a `debug_assert!` guard.
+`seg_qm_level == 15` (the spec's "skip QM" sentinel) takes the
+no-QM path directly.
+
+`PartitionWalker::transform_type(decoder, cdfs, tx_size, is_inter,
+intra_dir, reduced_tx_set, segment_id, &QuantizerParams)` reads
+the §5.11.47 per-TU luma `TxType` S() against
+`TileIntraTxTypeSet{1,2}Cdf` / `TileInterTxTypeSet{1,2,3}Cdf`
+(routed via the existing `inter_tx_type_cdf` /
+`intra_tx_type_cdf` selectors) and inverts the symbol through
+the new spec inversion tables `TX_TYPE_INTRA_INV_SET1` (7-entry),
+`TX_TYPE_INTRA_INV_SET2` (5-entry), `TX_TYPE_INTER_INV_SET1`
+(16-entry), `TX_TYPE_INTER_INV_SET2` (12-entry),
+`TX_TYPE_INTER_INV_SET3` (`{ IDTX, DCT_DCT }`). The spec's `set
+> 0 && (segmentation_enabled ? get_qindex(1, segment_id) :
+base_q_idx) > 0` guard short-circuits to `DCT_DCT` (no bitstream
+read) on the §5.11.48 `TX_SET_DCTONLY` path AND on the
+`qindex == 0` path. The result is emitted as a
+`TransformTypeReadout { tx_type, w4, h4 }` so the caller can
+stamp `TxTypes[ y4 + j ][ x4 + i ] = TxType` over the per-TU
+4×4-luma footprint.
+
+A new walker-level `tx_types: Vec<u8>` grid (one cell per
+4×4-luma-sample / mi unit) tracks the §5.11.39 / §5.11.47
+`TxTypes[][]` luma cache. Exposed via `PartitionWalker::tx_types()`
+(read-only view), `tx_type_at(r, c)` (single-cell lookup with
+out-of-bounds → `DCT_DCT`), and `stamp_tx_type(x4, y4, w4, h4,
+tx_type)` (write the footprint with edge-clipping). The §5.11.40
+`compute_tx_type(plane, ...)` helper landed in r142 then reads
+`TxTypes[][]` on the chroma path via this grid.
+
+`PartitionWalker::residual` gains a `&ResidualContext` parameter
+that bundles the new per-block state (`QuantizerParams`,
+`reduced_tx_set`, `intra_dir`, `segment_id`, `seg_qm_level[3]`,
+`uv_mode`). The dispatcher's per-TU `transform_block_emit` now,
+on `!skip`, runs `transform_type` (luma only), `compute_tx_type`
+(per-plane), `get_tx_class(plane_tx_type)`, and `dequantize_step1`
+in order — replacing the r182 hard-coded `DCT_DCT` + identity
+dequant. The §7.13 `inverse_transform_2d` call now receives the
+true per-plane `PlaneTxType` and `BitDepth`. The §5.11.5
+`decode_block_syntax` walker synthesises a neutral
+`ResidualContext` (`base_q_idx = 0`, no segmentation, `intra_dir
+= y_mode`, `uv_mode = DC_PRED`, no QM) so the reachable walker
+path exercises the §5.11.47 `q_for_guard == 0 ⇒ DCT_DCT`
+short-circuit (every existing fixture in the corpus uses this
+arm and remains green).
+
+**Split off explicitly to subsequent arcs:** (a) §9.5.3
+`Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table transcription
+(~30 KB; needed for `using_qmatrix == 1 && seg_qm_level < 15`
+fixtures); (b) §7.5 `get_scan` table dispatch (still identity);
+(c) §7.12.3 step-3 frame-buffer merge (`CurrFrame[plane][y +
+yy][x + xx]` write with `flipLR` / `flipUD` and `Clip1`); (d)
+12 non-DC intra-prediction modes (V_PRED, H_PRED, SMOOTH, PAETH,
+directional); (e) §7.9 inter prediction.
+
+20 new tests (801 → 821): six on the dequant table primitives
+(table dimensions + spec-anchor bit-exact values; row select +
+`Clip3` clamp; `get_qindex` no-seg / delta-q / segmentation
+paths; per-plane delta routing through `get_dc_quant` /
+`get_ac_quant`); seven on the §7.12.3 step-1 dequant loop
+(DC-only 4×4 at `base_q_idx == 0`, AC + dqDenom, `dqDenom == 4`
+on 64×64, `Clip3` band saturation, `seg_qm_level == 15`
+QM-skip); five on `transform_type` (`base_q_idx == 0`
+short-circuit, `TX_SET_DCTONLY` short-circuit, intra-set1
+symbol read inverted to IDTX, the inversion-table verbatim
+spot-check, `ResidualContext::neutral` defaults); plus
+`stamp_tx_type` grid-footprint + out-of-bounds checks and a
+new end-to-end smoke (`residual_dc_only_block_pipeline_smoke`)
+that drives the §5.11.34 / §5.11.35 dispatcher with the new
+`ResidualContext` on the 4×4 intra-luma path with `all_zero ==
+1` rigged — the new pipeline runs without observable
+side-effects on the gate-closed path, confirming the wiring is
+hot. `decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 182 lifts the **§7.13 inverse transform process** — the
 headline §5.11.35 `reconstruct()` body the r181 walker stopped at.

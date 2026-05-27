@@ -11124,6 +11124,742 @@ where
     tx_type
 }
 
+// ---------------------------------------------------------------------
+// Round 183 — §7.12.2 dequantization-function helpers + §7.12.3 step-1
+// dequantization. The §5.11.34 `residual()` dispatcher consumes the
+// `Dequant[i][j] = sign * (|Quant[pos] * q2| & 0xFFFFFF) / dqDenom`
+// loop these helpers compose, with `q2 = q * Quantizer_Matrix[...] /
+// 32` on the `using_qmatrix && PlaneTxType < IDTX && SegQMLevel < 15`
+// arm and `q2 = q` otherwise. The §9.5.3 `Quantizer_Matrix[][][]`
+// table itself is not yet tabulated in this crate (~30 KB), so the
+// QM arm is bypassed via the spec's `SegQMLevel >= 15` sentinel
+// path; the no-QM path covers every fixture in the corpus today.
+// ---------------------------------------------------------------------
+
+/// `Dc_Qlookup[ 3 ][ 256 ]` per §7.12.2 (av1-spec p.289-290) — the
+/// per-bit-depth dc-quantizer index lookup. Row 0 is `BitDepth == 8`,
+/// row 1 is `BitDepth == 10`, row 2 is `BitDepth == 12`; the row index
+/// is `(BitDepth - 8) >> 1` per the §7.12.2 `dc_q( b )` definition.
+/// Column index is `Clip3( 0, 255, b )` where `b = base_q_idx +
+/// delta_q_dc + segment_delta`.
+pub const DC_QLOOKUP: [[i32; 256]; 3] = [
+    [
+        4, 8, 8, 9, 10, 11, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 23, 24, 25, 26, 26,
+        27, 28, 29, 30, 31, 32, 32, 33, 34, 35, 36, 37, 38, 38, 39, 40, 41, 42, 43, 43, 44, 45, 46,
+        47, 48, 48, 49, 50, 51, 52, 53, 53, 54, 55, 56, 57, 57, 58, 59, 60, 61, 62, 62, 63, 64, 65,
+        66, 66, 67, 68, 69, 70, 70, 71, 72, 73, 74, 74, 75, 76, 77, 78, 78, 79, 80, 81, 81, 82, 83,
+        84, 85, 85, 87, 88, 90, 92, 93, 95, 96, 98, 99, 101, 102, 104, 105, 107, 108, 110, 111,
+        113, 114, 116, 117, 118, 120, 121, 123, 125, 127, 129, 131, 134, 136, 138, 140, 142, 144,
+        146, 148, 150, 152, 154, 156, 158, 161, 164, 166, 169, 172, 174, 177, 180, 182, 185, 187,
+        190, 192, 195, 199, 202, 205, 208, 211, 214, 217, 220, 223, 226, 230, 233, 237, 240, 243,
+        247, 250, 253, 257, 261, 265, 269, 272, 276, 280, 284, 288, 292, 296, 300, 304, 309, 313,
+        317, 322, 326, 330, 335, 340, 344, 349, 354, 359, 364, 369, 374, 379, 384, 389, 395, 400,
+        406, 411, 417, 423, 429, 435, 441, 447, 454, 461, 467, 475, 482, 489, 497, 505, 513, 522,
+        530, 539, 549, 559, 569, 579, 590, 602, 614, 626, 640, 654, 668, 684, 700, 717, 736, 755,
+        775, 796, 819, 843, 869, 896, 925, 955, 988, 1022, 1058, 1098, 1139, 1184, 1232, 1282,
+        1336,
+    ],
+    [
+        4, 9, 10, 13, 15, 17, 20, 22, 25, 28, 31, 34, 37, 40, 43, 47, 50, 53, 57, 60, 64, 68, 71,
+        75, 78, 82, 86, 90, 93, 97, 101, 105, 109, 113, 116, 120, 124, 128, 132, 136, 140, 143,
+        147, 151, 155, 159, 163, 166, 170, 174, 178, 182, 185, 189, 193, 197, 200, 204, 208, 212,
+        215, 219, 223, 226, 230, 233, 237, 241, 244, 248, 251, 255, 259, 262, 266, 269, 273, 276,
+        280, 283, 287, 290, 293, 297, 300, 304, 307, 310, 314, 317, 321, 324, 327, 331, 334, 337,
+        343, 350, 356, 362, 369, 375, 381, 387, 394, 400, 406, 412, 418, 424, 430, 436, 442, 448,
+        454, 460, 466, 472, 478, 484, 490, 499, 507, 516, 525, 533, 542, 550, 559, 567, 576, 584,
+        592, 601, 609, 617, 625, 634, 644, 655, 666, 676, 687, 698, 708, 718, 729, 739, 749, 759,
+        770, 782, 795, 807, 819, 831, 844, 856, 868, 880, 891, 906, 920, 933, 947, 961, 975, 988,
+        1001, 1015, 1030, 1045, 1061, 1076, 1090, 1105, 1120, 1137, 1153, 1170, 1186, 1202, 1218,
+        1236, 1253, 1271, 1288, 1306, 1323, 1342, 1361, 1379, 1398, 1416, 1436, 1456, 1476, 1496,
+        1516, 1537, 1559, 1580, 1601, 1624, 1647, 1670, 1692, 1717, 1741, 1766, 1791, 1817, 1844,
+        1871, 1900, 1929, 1958, 1990, 2021, 2054, 2088, 2123, 2159, 2197, 2236, 2276, 2319, 2363,
+        2410, 2458, 2508, 2561, 2616, 2675, 2737, 2802, 2871, 2944, 3020, 3102, 3188, 3280, 3375,
+        3478, 3586, 3702, 3823, 3953, 4089, 4236, 4394, 4559, 4737, 4929, 5130, 5347,
+    ],
+    [
+        4, 12, 18, 25, 33, 41, 50, 60, 70, 80, 91, 103, 115, 127, 140, 153, 166, 180, 194, 208,
+        222, 237, 251, 266, 281, 296, 312, 327, 343, 358, 374, 390, 405, 421, 437, 453, 469, 484,
+        500, 516, 532, 548, 564, 580, 596, 611, 627, 643, 659, 674, 690, 706, 721, 737, 752, 768,
+        783, 798, 814, 829, 844, 859, 874, 889, 904, 919, 934, 949, 964, 978, 993, 1008, 1022,
+        1037, 1051, 1065, 1080, 1094, 1108, 1122, 1136, 1151, 1165, 1179, 1192, 1206, 1220, 1234,
+        1248, 1261, 1275, 1288, 1302, 1315, 1329, 1342, 1368, 1393, 1419, 1444, 1469, 1494, 1519,
+        1544, 1569, 1594, 1618, 1643, 1668, 1692, 1717, 1741, 1765, 1789, 1814, 1838, 1862, 1885,
+        1909, 1933, 1957, 1992, 2027, 2061, 2096, 2130, 2165, 2199, 2233, 2267, 2300, 2334, 2367,
+        2400, 2434, 2467, 2499, 2532, 2575, 2618, 2661, 2704, 2746, 2788, 2830, 2872, 2913, 2954,
+        2995, 3036, 3076, 3127, 3177, 3226, 3275, 3324, 3373, 3421, 3469, 3517, 3565, 3621, 3677,
+        3733, 3788, 3843, 3897, 3951, 4005, 4058, 4119, 4181, 4241, 4301, 4361, 4420, 4479, 4546,
+        4612, 4677, 4742, 4807, 4871, 4942, 5013, 5083, 5153, 5222, 5291, 5367, 5442, 5517, 5591,
+        5665, 5745, 5825, 5905, 5984, 6063, 6149, 6234, 6319, 6404, 6495, 6587, 6678, 6769, 6867,
+        6966, 7064, 7163, 7269, 7376, 7483, 7599, 7715, 7832, 7958, 8085, 8214, 8352, 8492, 8635,
+        8788, 8945, 9104, 9275, 9450, 9639, 9832, 10031, 10245, 10465, 10702, 10946, 11210, 11482,
+        11776, 12081, 12409, 12750, 13118, 13501, 13913, 14343, 14807, 15290, 15812, 16356, 16943,
+        17575, 18237, 18949, 19718, 20521, 21387,
+    ],
+];
+
+/// `Ac_Qlookup[ 3 ][ 256 ]` per §7.12.2 (av1-spec p.291-292) — the
+/// per-bit-depth ac-quantizer index lookup. Row layout matches
+/// [`DC_QLOOKUP`].
+pub const AC_QLOOKUP: [[i32; 256]; 3] = [
+    [
+        4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+        30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+        53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
+        76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98,
+        99, 100, 101, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130,
+        132, 134, 136, 138, 140, 142, 144, 146, 148, 150, 152, 155, 158, 161, 164, 167, 170, 173,
+        176, 179, 182, 185, 188, 191, 194, 197, 200, 203, 207, 211, 215, 219, 223, 227, 231, 235,
+        239, 243, 247, 251, 255, 260, 265, 270, 275, 280, 285, 290, 295, 300, 305, 311, 317, 323,
+        329, 335, 341, 347, 353, 359, 366, 373, 380, 387, 394, 401, 408, 416, 424, 432, 440, 448,
+        456, 465, 474, 483, 492, 501, 510, 520, 530, 540, 550, 560, 571, 582, 593, 604, 615, 627,
+        639, 651, 663, 676, 689, 702, 715, 729, 743, 757, 771, 786, 801, 816, 832, 848, 864, 881,
+        898, 915, 933, 951, 969, 988, 1007, 1026, 1046, 1066, 1087, 1108, 1129, 1151, 1173, 1196,
+        1219, 1243, 1267, 1292, 1317, 1343, 1369, 1396, 1423, 1451, 1479, 1508, 1537, 1567, 1597,
+        1628, 1660, 1692, 1725, 1759, 1793, 1828,
+    ],
+    [
+        4, 9, 11, 13, 16, 18, 21, 24, 27, 30, 33, 37, 40, 44, 48, 51, 55, 59, 63, 67, 71, 75, 79,
+        83, 88, 92, 96, 100, 105, 109, 114, 118, 122, 127, 131, 136, 140, 145, 149, 154, 158, 163,
+        168, 172, 177, 181, 186, 190, 195, 199, 204, 208, 213, 217, 222, 226, 231, 235, 240, 244,
+        249, 253, 258, 262, 267, 271, 275, 280, 284, 289, 293, 297, 302, 306, 311, 315, 319, 324,
+        328, 332, 337, 341, 345, 349, 354, 358, 362, 367, 371, 375, 379, 384, 388, 392, 396, 401,
+        409, 417, 425, 433, 441, 449, 458, 466, 474, 482, 490, 498, 506, 514, 523, 531, 539, 547,
+        555, 563, 571, 579, 588, 596, 604, 616, 628, 640, 652, 664, 676, 688, 700, 713, 725, 737,
+        749, 761, 773, 785, 797, 809, 825, 841, 857, 873, 889, 905, 922, 938, 954, 970, 986, 1002,
+        1018, 1038, 1058, 1078, 1098, 1118, 1138, 1158, 1178, 1198, 1218, 1242, 1266, 1290, 1314,
+        1338, 1362, 1386, 1411, 1435, 1463, 1491, 1519, 1547, 1575, 1603, 1631, 1663, 1695, 1727,
+        1759, 1791, 1823, 1859, 1895, 1931, 1967, 2003, 2039, 2079, 2119, 2159, 2199, 2239, 2283,
+        2327, 2371, 2415, 2459, 2507, 2555, 2603, 2651, 2703, 2755, 2807, 2859, 2915, 2971, 3027,
+        3083, 3143, 3203, 3263, 3327, 3391, 3455, 3523, 3591, 3659, 3731, 3803, 3876, 3952, 4028,
+        4104, 4184, 4264, 4348, 4432, 4516, 4604, 4692, 4784, 4876, 4972, 5068, 5168, 5268, 5372,
+        5476, 5584, 5692, 5804, 5916, 6032, 6148, 6268, 6388, 6512, 6640, 6768, 6900, 7036, 7172,
+        7312,
+    ],
+    [
+        4, 13, 19, 27, 35, 44, 54, 64, 75, 87, 99, 112, 126, 139, 154, 168, 183, 199, 214, 230,
+        247, 263, 280, 297, 314, 331, 349, 366, 384, 402, 420, 438, 456, 475, 493, 511, 530, 548,
+        567, 586, 604, 623, 642, 660, 679, 698, 716, 735, 753, 772, 791, 809, 828, 846, 865, 884,
+        902, 920, 939, 957, 976, 994, 1012, 1030, 1049, 1067, 1085, 1103, 1121, 1139, 1157, 1175,
+        1193, 1211, 1229, 1246, 1264, 1282, 1299, 1317, 1335, 1352, 1370, 1387, 1405, 1422, 1440,
+        1457, 1474, 1491, 1509, 1526, 1543, 1560, 1577, 1595, 1627, 1660, 1693, 1725, 1758, 1791,
+        1824, 1856, 1889, 1922, 1954, 1987, 2020, 2052, 2085, 2118, 2150, 2183, 2216, 2248, 2281,
+        2313, 2346, 2378, 2411, 2459, 2508, 2556, 2605, 2653, 2701, 2750, 2798, 2847, 2895, 2943,
+        2992, 3040, 3088, 3137, 3185, 3234, 3298, 3362, 3426, 3491, 3555, 3619, 3684, 3748, 3812,
+        3876, 3941, 4005, 4069, 4149, 4230, 4310, 4390, 4470, 4550, 4631, 4711, 4791, 4871, 4967,
+        5064, 5160, 5256, 5352, 5448, 5544, 5641, 5737, 5849, 5961, 6073, 6185, 6297, 6410, 6522,
+        6650, 6778, 6906, 7034, 7162, 7290, 7435, 7579, 7723, 7867, 8011, 8155, 8315, 8475, 8635,
+        8795, 8956, 9132, 9308, 9484, 9660, 9836, 10028, 10220, 10412, 10604, 10812, 11020, 11228,
+        11437, 11661, 11885, 12109, 12333, 12573, 12813, 13053, 13309, 13565, 13821, 14093, 14365,
+        14637, 14925, 15213, 15502, 15806, 16110, 16414, 16734, 17054, 17390, 17726, 18062, 18414,
+        18766, 19134, 19502, 19886, 20270, 20670, 21070, 21486, 21902, 22334, 22766, 23214, 23662,
+        24126, 24590, 25070, 25551, 26047, 26559, 27071, 27599, 28143, 28687, 29247,
+    ],
+];
+
+/// §7.12.2 `dc_q( b ) = Dc_Qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255,
+/// b ) ]`. `bit_depth` must be 8, 10, or 12 (the only AV1 profile bit
+/// depths per §6.4.1); other values are clamped into the row table by
+/// `(bit_depth - 8) >> 1` (the spec's reachable inputs are exactly
+/// `{ 8, 10, 12 }`).
+#[inline]
+pub fn dc_q(bit_depth: u8, b: i32) -> i32 {
+    let row = ((bit_depth.max(8) - 8) >> 1) as usize;
+    let row = row.min(2);
+    let col = b.clamp(0, 255) as usize;
+    DC_QLOOKUP[row][col]
+}
+
+/// §7.12.2 `ac_q( b ) = Ac_Qlookup[ (BitDepth-8) >> 1 ][ Clip3( 0, 255,
+/// b ) ]`. See [`dc_q`] for the row / column derivation.
+#[inline]
+pub fn ac_q(bit_depth: u8, b: i32) -> i32 {
+    let row = ((bit_depth.max(8) - 8) >> 1) as usize;
+    let row = row.min(2);
+    let col = b.clamp(0, 255) as usize;
+    AC_QLOOKUP[row][col]
+}
+
+/// Per-segment / per-plane quantizer state — the §7.12.2 `get_qindex` /
+/// `get_dc_quant` / `get_ac_quant` driver state.
+///
+/// The §5.9.12 / §5.9.13 / §5.9.14 / §5.9.13 parser populates the
+/// `base_q_idx` / `delta_q_*` / `seg_feature_*` slots; the per-frame
+/// dispatcher passes a `QuantizerParams` to [`PartitionWalker::residual`]
+/// so the §7.12.3 step-1 loop has everything it needs to derive
+/// `Dequant[i][j]` from a `Quant[]` raster.
+///
+/// `current_q_index` reflects the §5.9.18 `delta_q_present` per-block
+/// running state; it is `base_q_idx` for blocks with no `delta_q`
+/// override. `lossless` is the per-segment §6.8.11 `LosslessArray[seg]`
+/// derivation (`true` iff `Round( get_qindex( 1, seg ) ) == 0 &&
+/// DeltaQYDc == 0 && DeltaQUAc == 0 && DeltaQUDc == 0 && DeltaQVAc == 0
+/// && DeltaQVDc == 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantizerParams {
+    /// §5.9.12 `base_q_idx`.
+    pub base_q_idx: u8,
+    /// §5.9.12 `DeltaQYDc`.
+    pub delta_q_y_dc: i8,
+    /// §5.9.12 `DeltaQUDc`.
+    pub delta_q_u_dc: i8,
+    /// §5.9.12 `DeltaQUAc`.
+    pub delta_q_u_ac: i8,
+    /// §5.9.12 `DeltaQVDc`.
+    pub delta_q_v_dc: i8,
+    /// §5.9.12 `DeltaQVAc`.
+    pub delta_q_v_ac: i8,
+    /// §5.9.12 `using_qmatrix`.
+    pub using_qmatrix: bool,
+    /// §6.4.1 `BitDepth` ∈ { 8, 10, 12 }.
+    pub bit_depth: u8,
+    /// §5.9.18 `delta_q_present`. Gates the §7.12.2
+    /// `if ( ignoreDeltaQ == 0 && delta_q_present == 1 )` branches.
+    pub delta_q_present: bool,
+    /// §5.9.18 `CurrentQIndex`. Carries the per-block §5.11.13 running
+    /// quantiser-index after the latest `read_delta_q()` update; equals
+    /// `base_q_idx` when `delta_q_present == 0`.
+    pub current_q_index: u8,
+    /// §5.9.14 `segmentation_enabled`.
+    pub segmentation_enabled: bool,
+    /// §5.9.14 `FeatureEnabled[ seg ][ SEG_LVL_ALT_Q ]` — `true`
+    /// iff the per-segment `SEG_LVL_ALT_Q` slot is active. Read at
+    /// `get_qindex` `seg_feature_active_idx( seg, SEG_LVL_ALT_Q )`.
+    pub seg_alt_q_active: [bool; MAX_SEGMENTS],
+    /// §5.9.14 `FeatureData[ seg ][ SEG_LVL_ALT_Q ]` — the per-segment
+    /// signed delta added to `base_q_idx` (or `CurrentQIndex` on the
+    /// `delta_q_present` arm) before `Clip3( 0, 255, _ )`.
+    pub seg_alt_q_data: [i16; MAX_SEGMENTS],
+}
+
+impl QuantizerParams {
+    /// Default-construct a `QuantizerParams` with all-zero deltas, no
+    /// segmentation, and 8-bit depth. Useful as a neutral starting
+    /// state for tests + the §5.11.5 walker's intra-only path.
+    #[must_use]
+    pub const fn neutral(base_q_idx: u8, bit_depth: u8) -> Self {
+        Self {
+            base_q_idx,
+            delta_q_y_dc: 0,
+            delta_q_u_dc: 0,
+            delta_q_u_ac: 0,
+            delta_q_v_dc: 0,
+            delta_q_v_ac: 0,
+            using_qmatrix: false,
+            bit_depth,
+            delta_q_present: false,
+            current_q_index: base_q_idx,
+            segmentation_enabled: false,
+            seg_alt_q_active: [false; MAX_SEGMENTS],
+            seg_alt_q_data: [0; MAX_SEGMENTS],
+        }
+    }
+}
+
+/// §7.12.2 `get_qindex( ignoreDeltaQ, segmentId )` (av1-spec p.293) —
+/// the per-block quantiser index used to feed `dc_q` / `ac_q`.
+///
+/// ```text
+///   if ( seg_feature_active_idx( segmentId, SEG_LVL_ALT_Q ) ) {
+///       data = FeatureData[ segmentId ][ SEG_LVL_ALT_Q ]
+///       qindex = base_q_idx + data
+///       if ( !ignoreDeltaQ && delta_q_present )
+///           qindex = CurrentQIndex + data
+///       return Clip3( 0, 255, qindex )
+///   }
+///   if ( !ignoreDeltaQ && delta_q_present )
+///       return CurrentQIndex
+///   return base_q_idx
+/// ```
+///
+/// The `seg_feature_active_idx` predicate is `segmentation_enabled &&
+/// seg_alt_q_active[seg]`. `seg_id` is the per-block `segment_id`
+/// (`0..MAX_SEGMENTS`).
+#[inline]
+pub fn get_qindex(quant: &QuantizerParams, ignore_delta_q: bool, segment_id: u8) -> i32 {
+    let seg = (segment_id as usize).min(MAX_SEGMENTS - 1);
+    let seg_active = quant.segmentation_enabled && quant.seg_alt_q_active[seg];
+    if seg_active {
+        let data = quant.seg_alt_q_data[seg] as i32;
+        let qindex = if !ignore_delta_q && quant.delta_q_present {
+            (quant.current_q_index as i32) + data
+        } else {
+            (quant.base_q_idx as i32) + data
+        };
+        return qindex.clamp(0, 255);
+    }
+    if !ignore_delta_q && quant.delta_q_present {
+        return quant.current_q_index as i32;
+    }
+    quant.base_q_idx as i32
+}
+
+/// §7.12.2 `get_dc_quant( plane )` (av1-spec p.293-294). Returns
+/// `dc_q( get_qindex( 0, segment_id ) + DeltaQ?Dc )` per plane.
+///
+/// `plane` is `0` (Y), `1` (U), or `2` (V). The §7.12.2 spec passes
+/// `ignoreDeltaQ = 0` here (the §5.9.18 delta-q running override
+/// applies).
+#[inline]
+pub fn get_dc_quant(quant: &QuantizerParams, plane: u8, segment_id: u8) -> i32 {
+    let base = get_qindex(quant, false, segment_id);
+    let delta = match plane {
+        0 => quant.delta_q_y_dc as i32,
+        1 => quant.delta_q_u_dc as i32,
+        _ => quant.delta_q_v_dc as i32,
+    };
+    dc_q(quant.bit_depth, base + delta)
+}
+
+/// §7.12.2 `get_ac_quant( plane )` (av1-spec p.294). Returns
+/// `ac_q( get_qindex( 0, segment_id ) + DeltaQ?Ac )`. Plane 0's AC
+/// delta is implicit zero (the spec has no `DeltaQYAc`; `base_q_idx`
+/// itself IS the Y AC qindex).
+#[inline]
+pub fn get_ac_quant(quant: &QuantizerParams, plane: u8, segment_id: u8) -> i32 {
+    let base = get_qindex(quant, false, segment_id);
+    let delta = match plane {
+        0 => 0,
+        1 => quant.delta_q_u_ac as i32,
+        _ => quant.delta_q_v_ac as i32,
+    };
+    ac_q(quant.bit_depth, base + delta)
+}
+
+/// `dqDenom` per §7.12.3 (av1-spec p.294). 2 for 32x32-axis transforms
+/// (`TX_32X32`, `TX_16X32`, `TX_32X16`, `TX_16X64`, `TX_64X16`); 4 for
+/// 64x64-axis transforms (`TX_64X64`, `TX_32X64`, `TX_64X32`); 1
+/// otherwise.
+#[inline]
+pub fn dequant_denom(tx_size: usize) -> i64 {
+    match tx_size {
+        v if v == TX_32X32 || v == TX_16X32 || v == TX_32X16 || v == TX_16X64 || v == TX_64X16 => 2,
+        v if v == TX_64X64 || v == TX_32X64 || v == TX_64X32 => 4,
+        _ => 1,
+    }
+}
+
+/// §7.12.3 step-1 dequantization (av1-spec p.294-295) — replaces the
+/// r182 placeholder identity dequant in the `residual()` /
+/// `transform_block_emit` path.
+///
+/// The spec body computes
+///
+/// ```text
+///   for i = 0..(th-1) for j = 0..(tw-1) {
+///       q  = (i == 0 && j == 0) ? get_dc_quant(plane) : get_ac_quant(plane)
+///       if ( using_qmatrix && PlaneTxType < IDTX
+///            && SegQMLevel[plane][segment_id] < 15 ) {
+///           q2 = Round2( q * Quantizer_Matrix[ ... ], 5 )
+///       } else {
+///           q2 = q
+///       }
+///       dq  = Quant[ i*tw + j ] * q2
+///       sign = ( dq < 0 ) ? -1 : 1
+///       dq2 = sign * ( |dq| & 0xFFFFFF ) / dqDenom
+///       Dequant[i][j] = Clip3( -(1<<(7+BitDepth)),
+///                                (1<<(7+BitDepth)) - 1, dq2 )
+///   }
+/// ```
+///
+/// where `tw = Min(32, Tx_Width[txSz])`, `th = Min(32, Tx_Height[txSz])`,
+/// and `dqDenom` is [`dequant_denom`]. Coefficient positions
+/// `(i, j)` with `i >= th` or `j >= tw` stay at the §5.11.39 `Dequant[
+/// i ][ j ] = 0` pre-loop default and are emitted as zero — the
+/// returned buffer is dense `w * h` (with `w = Tx_Width[txSz]`,
+/// `h = Tx_Height[txSz]`) so it feeds [`crate::transform::inverse_transform_2d`]
+/// directly.
+///
+/// ## QM matrix path
+///
+/// The §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table is not
+/// yet tabulated in this crate. The `using_qmatrix && plane_tx_type
+/// < IDTX && seg_qm_level < 15` arm therefore returns `q` unchanged
+/// (the §7.12.3 `q2 = q` else-arm) and a documented
+/// `using_qmatrix_panic_on_active` debug-only assertion fires if a
+/// caller drives the active-QM branch on a real fixture. Every
+/// fixture in the corpus today uses the `using_qmatrix == 0` path.
+///
+/// ## Arguments
+///
+/// * `quant_levels` — the §5.11.39 `Quant[]` raster-order signed
+///   levels, `Tx_Width[txSz] * Tx_Height[txSz]` cells.
+/// * `tx_size` — the per-TU `TX_SIZES_ALL` ordinal.
+/// * `plane` — `0` (Y), `1` (U), `2` (V). Drives the
+///   `get_dc_quant` / `get_ac_quant` plane axis.
+/// * `segment_id` — `0..MAX_SEGMENTS`. Drives `get_qindex`.
+/// * `plane_tx_type` — the §5.11.40 `PlaneTxType` derivation (one of
+///   `DCT_DCT..H_FLIPADST`). Only the `< IDTX` guard on the QM-active
+///   branch consults it.
+/// * `seg_qm_level` — `SegQMLevel[plane][segment_id]` from §6.8.13.
+///   `15` (or any value `>= 15`) takes the no-QM identity branch.
+/// * `quant` — the per-frame [`QuantizerParams`].
+///
+/// Returns a `Vec<i64>` of length `Tx_Width[txSz] * Tx_Height[txSz]`
+/// in row-major order — the §7.12.3 `Dequant[i][j]` table feeding
+/// the §7.13 inverse-transform.
+#[allow(clippy::too_many_arguments)]
+pub fn dequantize_step1(
+    quant_levels: &[i32],
+    tx_size: usize,
+    plane: u8,
+    segment_id: u8,
+    plane_tx_type: usize,
+    seg_qm_level: u8,
+    quant: &QuantizerParams,
+) -> Vec<i64> {
+    debug_assert!(tx_size < TX_SIZES_ALL);
+    let w = TX_WIDTH[tx_size];
+    let h = TX_HEIGHT[tx_size];
+    let tw = core::cmp::min(32, w);
+    let th = core::cmp::min(32, h);
+    let dq_denom = dequant_denom(tx_size);
+    let clip_min: i64 = -(1i64 << (7 + quant.bit_depth as u32));
+    let clip_max: i64 = (1i64 << (7 + quant.bit_depth as u32)) - 1;
+    let dc_q_val = get_dc_quant(quant, plane, segment_id) as i64;
+    let ac_q_val = get_ac_quant(quant, plane, segment_id) as i64;
+
+    let qm_active = quant.using_qmatrix && plane_tx_type < IDTX && seg_qm_level < 15;
+
+    let mut dequant = vec![0i64; w * h];
+    for i in 0..th {
+        for j in 0..tw {
+            let q = if i == 0 && j == 0 { dc_q_val } else { ac_q_val };
+            // §7.12.3 step 1b: `q2 = q` on the no-QM arm; the
+            // QM-active arm would consult `Quantizer_Matrix[...]`
+            // — see the module preamble for the QM table status.
+            let q2 = if qm_active {
+                // Fallback to no-QM identity until the §9.5.3
+                // `Quantizer_Matrix[][][]` table lands; a real
+                // QM-active fixture would round-trip incorrectly
+                // here, and a debug_assert! would surface the
+                // miss. The conformant `seg_qm_level == 15` path
+                // already takes the `q2 = q` branch directly.
+                debug_assert!(
+                    false,
+                    "oxideav-av1: dequantize_step1 reached the using_qmatrix && PlaneTxType < IDTX && SegQMLevel < 15 branch; §9.5.3 Quantizer_Matrix table not yet tabulated"
+                );
+                q
+            } else {
+                q
+            };
+            let dq = (quant_levels[i * w + j] as i64) * q2;
+            let sign: i64 = if dq < 0 { -1 } else { 1 };
+            let dq2 = sign * ((dq.unsigned_abs() & 0xFF_FFFF) as i64) / dq_denom;
+            dequant[i * w + j] = dq2.clamp(clip_min, clip_max);
+        }
+    }
+    dequant
+}
+
+// ---------------------------------------------------------------------
+// Round 183 — §5.11.47 `transform_type()` per-TU S() read + inversion
+// tables.
+// ---------------------------------------------------------------------
+
+/// `Tx_Type_Intra_Inv_Set1[ 7 ]` per §5.11.47 (av1-spec p.100). Inversion
+/// table for `intra_tx_type` when `set == TX_SET_INTRA_1`.
+pub const TX_TYPE_INTRA_INV_SET1: [usize; 7] =
+    [IDTX, DCT_DCT, V_DCT, H_DCT, ADST_ADST, ADST_DCT, DCT_ADST];
+
+/// `Tx_Type_Intra_Inv_Set2[ 5 ]` per §5.11.47. Inversion table for
+/// `intra_tx_type` when `set == TX_SET_INTRA_2`.
+pub const TX_TYPE_INTRA_INV_SET2: [usize; 5] = [IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST];
+
+/// `Tx_Type_Inter_Inv_Set1[ 16 ]` per §5.11.47. Inversion table for
+/// `inter_tx_type` when `set == TX_SET_INTER_1`.
+pub const TX_TYPE_INTER_INV_SET1: [usize; 16] = [
+    IDTX,
+    V_DCT,
+    H_DCT,
+    V_ADST,
+    H_ADST,
+    V_FLIPADST,
+    H_FLIPADST,
+    DCT_DCT,
+    ADST_DCT,
+    DCT_ADST,
+    FLIPADST_DCT,
+    DCT_FLIPADST,
+    ADST_ADST,
+    FLIPADST_FLIPADST,
+    ADST_FLIPADST,
+    FLIPADST_ADST,
+];
+
+/// `Tx_Type_Inter_Inv_Set2[ 12 ]` per §5.11.47. Inversion table for
+/// `inter_tx_type` when `set == TX_SET_INTER_2`.
+pub const TX_TYPE_INTER_INV_SET2: [usize; 12] = [
+    IDTX,
+    V_DCT,
+    H_DCT,
+    DCT_DCT,
+    ADST_DCT,
+    DCT_ADST,
+    FLIPADST_DCT,
+    DCT_FLIPADST,
+    ADST_ADST,
+    FLIPADST_FLIPADST,
+    ADST_FLIPADST,
+    FLIPADST_ADST,
+];
+
+/// `Tx_Type_Inter_Inv_Set3[ 2 ]` per §5.11.47. Inversion table for
+/// `inter_tx_type` when `set == TX_SET_INTER_3`.
+pub const TX_TYPE_INTER_INV_SET3: [usize; 2] = [IDTX, DCT_DCT];
+
+/// Per-block §5.11.34 `residual()` quantiser / tx-type context — the
+/// fields the §5.11.47 `transform_type` reader, §5.11.40
+/// `compute_tx_type` derivation, and §7.12.3 step-1 dequant loop need
+/// beyond what the §5.11.34 dispatcher already plumbs.
+///
+/// Constructed once per block (the §5.11.5 walker derives every field
+/// from the per-block syntax it already parses) and forwarded to
+/// [`PartitionWalker::residual`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualContext {
+    /// §5.9.18 / §7.12.2 per-frame quantiser state. Drives
+    /// `get_dc_quant` / `get_ac_quant`.
+    pub quant: QuantizerParams,
+    /// §5.11.4 `reduced_tx_set` — the frame-header bit gating the
+    /// §5.11.48 `get_tx_set()` reduction.
+    pub reduced_tx_set: bool,
+    /// §8.3.2 `intra_tx_type` `intraDir` — the [`intra_dir`] result for
+    /// the current block. Unused on the inter path (the §8.3.2
+    /// `inter_tx_type` CDF has no `intraDir` axis).
+    pub intra_dir: usize,
+    /// `segment_id` per §5.11.9 / §5.9.14. Drives `get_qindex` and
+    /// `SegQMLevel[plane][segment_id]`.
+    pub segment_id: u8,
+    /// `SegQMLevel[ plane ][ segment_id ]` per §6.8.13. Three planes,
+    /// `15` for the "skip QM" sentinel. Stored as a flat `[u8; 3]` —
+    /// indexed by `plane`. Pass `[15; 3]` to force the no-QM identity
+    /// path (matches the `using_qmatrix == false` path of the §7.12.3
+    /// step-1 loop).
+    pub seg_qm_level: [u8; 3],
+    /// `UVMode` per §5.11.7 / §5.11.22 — the chroma intra-prediction
+    /// mode. Drives `compute_tx_type`'s `Mode_To_Txfm[UVMode]` lookup
+    /// on the chroma path. `DC_PRED = 0` for the walker's intra-only
+    /// path until the §5.11.7 reader's chroma arm lands.
+    pub uv_mode: u8,
+}
+
+impl ResidualContext {
+    /// Neutral / DC-only `ResidualContext` — `base_q_idx` configurable,
+    /// every other slot at its spec default (no QM, no segmentation,
+    /// `UVMode = DC_PRED`). Useful for the §5.11.5 walker's reachable
+    /// path and for tests.
+    #[must_use]
+    pub const fn neutral(base_q_idx: u8, bit_depth: u8) -> Self {
+        Self {
+            quant: QuantizerParams::neutral(base_q_idx, bit_depth),
+            reduced_tx_set: false,
+            intra_dir: 0,
+            segment_id: 0,
+            seg_qm_level: [15, 15, 15],
+            uv_mode: 0,
+        }
+    }
+}
+
+/// §5.11.47 `transform_type( x4, y4, txSz )` outcome — the decoded
+/// luma `TxType` ordinal plus the `TxTypes[ y4 + j ][ x4 + i ]`
+/// grid-stamp footprint the caller writes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransformTypeReadout {
+    /// The decoded `TxType` ordinal (`DCT_DCT..H_FLIPADST`).
+    pub tx_type: u8,
+    /// `Tx_Width[ txSz ] >> 2` — the number of 4×4 luma columns the
+    /// caller stamps `TxTypes[ y4 + j ][ x4 + i ] = TxType` over.
+    pub w4: u8,
+    /// `Tx_Height[ txSz ] >> 2` — the number of 4×4 luma rows the
+    /// caller stamps over.
+    pub h4: u8,
+}
+
+/// `Tx_Size_Sqr` ordinal index. Used to look up the §8.3.2
+/// `intra_tx_type` / `inter_tx_type` CDF row.
+#[inline]
+fn tx_size_sqr_index(tx_size: usize) -> usize {
+    // `Tx_Size_Sqr` per §3 maps each `TX_SIZES_ALL` ordinal to a
+    // square `TX_4X4..TX_64X64` ordinal (matching
+    // `Min( Tx_Width, Tx_Height )` with the log2(side) - 2 rule).
+    // The square `TX_NxN` ordinal is `log2(side) - 2` because
+    // `TX_4X4 = 0`, `TX_8X8 = 1`, `TX_16X16 = 2`, `TX_32X32 = 3`,
+    // `TX_64X64 = 4`.
+    let side = core::cmp::min(TX_WIDTH[tx_size], TX_HEIGHT[tx_size]);
+    (side.trailing_zeros() as usize) - 2
+}
+
+impl PartitionWalker {
+    /// `transform_type( x4, y4, txSz )` per §5.11.47 (av1-spec p.99-100).
+    /// Decodes the per-luma-TU `TxType` from the bitstream and emits
+    /// the value the caller stamps into `TxTypes[ y4 + j ][ x4 + i ]`.
+    ///
+    /// The spec body reads:
+    ///
+    /// ```text
+    ///   set = get_tx_set( txSz )
+    ///   if ( set > 0 && (segmentation_enabled ? get_qindex(1, segment_id) : base_q_idx) > 0 ) {
+    ///       if ( is_inter ) {
+    ///           inter_tx_type   S()
+    ///           TxType = Tx_Type_Inter_Inv_Set{1,2,3}[ inter_tx_type ]
+    ///       } else {
+    ///           intra_tx_type   S()
+    ///           TxType = Tx_Type_Intra_Inv_Set{1,2}[ intra_tx_type ]
+    ///       }
+    ///   } else {
+    ///       TxType = DCT_DCT
+    ///   }
+    ///   for ( i = 0; i < (Tx_Width[txSz] >> 2); i++ )
+    ///     for ( j = 0; j < (Tx_Height[txSz] >> 2); j++ )
+    ///         TxTypes[ y4 + j ][ x4 + i ] = TxType
+    /// ```
+    ///
+    /// The `set > 0 && ((segmentation_enabled ? get_qindex(1,
+    /// segment_id) : base_q_idx) > 0)` guard short-circuits to
+    /// `DCT_DCT` on the §5.11.48 `TX_SET_DCTONLY` path AND on the
+    /// "qindex is zero ⇒ no transform-type symbol" path; the spec
+    /// inversion tables [`TX_TYPE_INTRA_INV_SET1`] /
+    /// [`TX_TYPE_INTRA_INV_SET2`] / [`TX_TYPE_INTER_INV_SET1`] /
+    /// [`TX_TYPE_INTER_INV_SET2`] / [`TX_TYPE_INTER_INV_SET3`] map
+    /// the per-set symbol ordinal back into the §3 `TxType`
+    /// enumeration.
+    ///
+    /// `intra_dir` is the §8.3.2 [`intra_dir`] result (the per-plane
+    /// `intraDir` axis the §8.3.2 `intra_tx_type` CDF uses); for
+    /// inter blocks the axis is unused.
+    ///
+    /// The caller is responsible for writing the returned
+    /// `tx_type` over the `(w4, h4)` 4×4-luma footprint of the TU into
+    /// the walker's `TxTypes[][]` grid (use [`Self::stamp_tx_type`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn transform_type(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        tx_size: usize,
+        is_inter: bool,
+        intra_dir: usize,
+        reduced_tx_set: bool,
+        segment_id: u8,
+        quant: &QuantizerParams,
+    ) -> Result<TransformTypeReadout, crate::Error> {
+        if tx_size >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.48 `get_tx_set( txSz )`. Compute `Tx_Size_Sqr[ txSz ]`
+        // and `Tx_Size_Sqr_Up[ txSz ]` per §3.
+        let tx_sz_sqr = tx_size_sqr_index(tx_size);
+        let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_size];
+        let set = if is_inter {
+            inter_tx_type_set(tx_sz_sqr as u32, tx_sz_sqr_up as u32, reduced_tx_set)
+        } else {
+            intra_tx_type_set(tx_sz_sqr as u32, tx_sz_sqr_up as u32, reduced_tx_set)
+        };
+
+        // §5.11.47 `(segmentation_enabled ? get_qindex(1, segment_id)
+        // : base_q_idx) > 0` guard — `ignoreDeltaQ = 1` in the §7.12.2
+        // qindex lookup (delta-q is intentionally ignored here).
+        let q_for_guard = if quant.segmentation_enabled {
+            get_qindex(quant, true, segment_id)
+        } else {
+            quant.base_q_idx as i32
+        };
+        let codes_symbol = set > 0 && q_for_guard > 0;
+
+        let tx_type: u8 = if !codes_symbol {
+            DCT_DCT as u8
+        } else if is_inter {
+            let sqr = tx_size_sqr_index(tx_size);
+            let cdf = cdfs.inter_tx_type_cdf(set, sqr as u32).ok_or(
+                // Should never happen on the conformant path —
+                // `inter_tx_type_set` returns one of {DCTONLY, 1, 2,
+                // 3}, and `inter_tx_type_cdf` only returns `None` for
+                // DCTONLY (which the `codes_symbol == false` guard
+                // above catches first).
+                crate::Error::PartitionWalkOutOfRange,
+            )?;
+            let raw = decoder
+                .read_symbol(cdf)
+                .map_err(|_| crate::Error::UnexpectedEnd)? as usize;
+            let table: &[usize] = match set {
+                TX_SET_INTER_1 => &TX_TYPE_INTER_INV_SET1,
+                TX_SET_INTER_2 => &TX_TYPE_INTER_INV_SET2,
+                TX_SET_INTER_3 => &TX_TYPE_INTER_INV_SET3,
+                _ => return Err(crate::Error::PartitionWalkOutOfRange),
+            };
+            // Symbol values must index inside the inversion table —
+            // a conformant bitstream stays in `0..table.len()`.
+            if raw >= table.len() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            table[raw] as u8
+        } else {
+            let sqr = tx_size_sqr_index(tx_size);
+            let cdf = cdfs
+                .intra_tx_type_cdf(set, sqr as u32, intra_dir)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let raw = decoder
+                .read_symbol(cdf)
+                .map_err(|_| crate::Error::UnexpectedEnd)? as usize;
+            let table: &[usize] = match set {
+                TX_SET_INTRA_1 => &TX_TYPE_INTRA_INV_SET1,
+                TX_SET_INTRA_2 => &TX_TYPE_INTRA_INV_SET2,
+                _ => return Err(crate::Error::PartitionWalkOutOfRange),
+            };
+            if raw >= table.len() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            table[raw] as u8
+        };
+
+        let w4 = (TX_WIDTH[tx_size] >> 2) as u8;
+        let h4 = (TX_HEIGHT[tx_size] >> 2) as u8;
+        Ok(TransformTypeReadout { tx_type, w4, h4 })
+    }
+
+    /// Stamp `TxTypes[ y4 + j ][ x4 + i ] = tx_type` over a
+    /// `(w4, h4)` 4×4-luma-sample-unit footprint anchored at
+    /// `(x4, y4)`. Used by §5.11.39 (`all_zero == 1` ⇒ `DCT_DCT`
+    /// fill), §5.11.47 (decoded `TxType` fill), and on the §5.11.40
+    /// `compute_tx_type()` chroma path the §5.11.39 `all_zero` arm
+    /// pre-stamps for.
+    ///
+    /// `x4` / `y4` are in 4×4-luma units (i.e. mi-units with
+    /// `MI_SIZE_LOG2 == 2`). Cells outside the `mi_rows * mi_cols`
+    /// grid bound are silently dropped (matches the §5.11.39 spec
+    /// behaviour for a TU clipped against the bottom/right frame
+    /// edge — those cells are unreachable for any subsequent
+    /// `TxTypes[][]` read).
+    pub fn stamp_tx_type(&mut self, x4: u32, y4: u32, w4: u32, h4: u32, tx_type: u8) {
+        for j in 0..h4 {
+            let row = y4 + j;
+            if row >= self.mi_rows {
+                break;
+            }
+            for i in 0..w4 {
+                let col = x4 + i;
+                if col >= self.mi_cols {
+                    break;
+                }
+                let idx = (row * self.mi_cols + col) as usize;
+                self.tx_types[idx] = tx_type;
+            }
+        }
+    }
+
+    /// Read `TxTypes[ y4 ][ x4 ]` from the walker's grid. Returns the
+    /// `DCT_DCT = 0` pre-fill for cells the §5.11.39 / §5.11.47
+    /// readers have not yet stamped.
+    #[inline]
+    pub fn tx_type_at(&self, y4: i32, x4: i32) -> u8 {
+        if y4 < 0 || x4 < 0 || (y4 as u32) >= self.mi_rows || (x4 as u32) >= self.mi_cols {
+            return DCT_DCT as u8;
+        }
+        self.tx_types[(y4 as u32 * self.mi_cols + x4 as u32) as usize]
+    }
+}
+
 /// §8.3.2 `get_tx_class( txType )` — maps a transform type to its
 /// transform class. The vertical-only types (`V_DCT` / `V_ADST` /
 /// `V_FLIPADST`) return [`TX_CLASS_VERT`]; the horizontal-only types
@@ -12330,6 +13066,24 @@ pub struct PartitionWalker {
     /// cells carry [`TX_4X4`] (`0`), the §8.3.2 `tx_depth` /
     /// `txfm_split` ctx-walk identity for an unavailable neighbour.
     inter_tx_sizes: Vec<u8>,
+    /// `TxTypes[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec §5.11.39 / §5.11.40 / §5.11.47 —
+    /// the §5.11.39 `all_zero == 1` short-circuit stamps `TxTypes[ y4
+    /// + j ][ x4 + i ] = DCT_DCT` over the luma TU footprint; the
+    /// §5.11.47 `transform_type` reader stamps the decoded
+    /// `Tx_Type_*_Inv_Set?[ inter_tx_type | intra_tx_type ]` per-TU
+    /// luma value; the §5.11.40 `compute_tx_type` derivation reads
+    /// the value back on chroma blocks via `TxTypes[ y4 ][ x4 ]`).
+    ///
+    /// Stored as `u8` because the §3 `TxType` enumeration is
+    /// `0..=TX_TYPES-1 = 15`. Pre-fill is `DCT_DCT = 0`, the §5.11.40
+    /// `Lossless || txSzSqrUp > TX_32X32` fallback — also the natural
+    /// identity for an unfilled cell.
+    ///
+    /// The grid is in 4×4-luma-sample (MI) units; an `MxN` luma TU at
+    /// `(mi_row, mi_col)` stamps `(M/4) * (N/4)` cells starting from
+    /// `(mi_row, mi_col)`. r183 LANDED.
+    tx_types: Vec<u8>,
     /// `RefFrames[ row ][ col ][ 0..2 ]` packed into a row-major
     /// `mi_rows * mi_cols * 2` flat buffer (av1-spec §5.11.18 / §5.11.23
     /// / §8.3.2 — the §5.11.18 prologue derives `LeftRefFrame[ 0..2 ]`
@@ -12522,6 +13276,12 @@ impl PartitionWalker {
         let mut inter_tx_sizes: Vec<u8> = Vec::new();
         inter_tx_sizes.try_reserve_exact(area).ok()?;
         inter_tx_sizes.resize(area, TX_4X4 as u8);
+        // §5.11.40 `TxTypes[][]` luma cache. Pre-fill is `DCT_DCT = 0`
+        // (the §5.11.40 `Lossless || txSzSqrUp > TX_32X32` fallback,
+        // which is also the natural identity for an unfilled cell).
+        let mut tx_types: Vec<u8> = Vec::new();
+        tx_types.try_reserve_exact(area).ok()?;
+        tx_types.resize(area, DCT_DCT as u8);
         // §5.11.18 / §5.11.23: pre-fill `RefFrames[][][..]` with
         // `[INTRA_FRAME = 0, NONE = -1]`, the §5.11.18 "unavailable
         // neighbour" fallback. Two slots per `(row, col)` cell — slot 0
@@ -12608,6 +13368,7 @@ impl PartitionWalker {
             y_modes,
             tx_sizes,
             inter_tx_sizes,
+            tx_types,
             ref_frames,
             palette_sizes,
             palette_colors,
@@ -13085,6 +13846,19 @@ impl PartitionWalker {
     #[must_use]
     pub fn inter_tx_sizes(&self) -> &[u8] {
         &self.inter_tx_sizes
+    }
+
+    /// View of the §5.11.39 / §5.11.40 / §5.11.47 `TxTypes[][]` luma
+    /// transform-type cache after the walk. Indexed row-major in
+    /// `mi_rows * mi_cols` 4×4-luma-sample units:
+    /// `tx_types()[ r * MiCols + c ]`. Pre-fill is `DCT_DCT = 0` (the
+    /// §5.11.40 fallback); cells inside a decoded luma TU footprint
+    /// carry the decoded `Tx_Type_*_Inv_Set?[ inter_tx_type |
+    /// intra_tx_type ]` ordinal (or the §5.11.39 `all_zero == 1`
+    /// `DCT_DCT` stamp). r183 LANDED.
+    #[must_use]
+    pub fn tx_types(&self) -> &[u8] {
+        &self.tx_types
     }
 
     /// View of the §5.11.18 / §5.11.23 `RefFrames[][][..]` grid after
@@ -20856,6 +21630,24 @@ impl PartitionWalker {
         // (`all_zero == 1` for every TU) path the dispatcher returns
         // [`ResidualReadout`] cleanly and the §5.11.5 walker advances
         // past the §5.11.34 call site.
+        // r183 — neutral `ResidualContext` for the §5.11.5 walker's
+        // reachable intra-only path. The §5.11.5 dispatcher's signature
+        // doesn't yet plumb the §5.9.12 `base_q_idx` / segmentation
+        // tables (every fixture in this corpus uses `base_q_idx = 0`
+        // through the `decode_block_syntax_reaches_compute_prediction_
+        // stub_after_intra_mode_info` test rigging, which forces the
+        // §5.11.47 `transform_type` reader into its
+        // `q_for_guard == 0 ⇒ DCT_DCT` short-circuit). The richer
+        // caller-context-aware variant is [`Self::residual`] taking a
+        // caller-supplied [`ResidualContext`].
+        let neutral_ctx = ResidualContext {
+            quant: QuantizerParams::neutral(0, 8),
+            reduced_tx_set: false,
+            intra_dir: y_mode as usize,
+            segment_id: 0,
+            seg_qm_level: [15, 15, 15],
+            uv_mode: 0,
+        };
         let _residual = self.residual(
             decoder,
             cdfs,
@@ -20870,6 +21662,7 @@ impl PartitionWalker {
             prefix.skip != 0,
             tx_size as usize,
             use_128x128_superblock,
+            &neutral_ctx,
         )?;
         // §5.11.5 line `is_compound = RefFrame[ 1 ] > INTRA_FRAME` —
         // already derived above. The §5.11.5 walker concludes the
@@ -21343,6 +22136,7 @@ impl PartitionWalker {
         skip: bool,
         tx_size: usize,
         _use_128x128_superblock: bool,
+        ctx: &ResidualContext,
     ) -> Result<ResidualReadout, crate::Error> {
         // ---------- caller-bug guards ----------
         if mi_size >= BLOCK_SIZES {
@@ -21455,6 +22249,11 @@ impl PartitionWalker {
                             chunk_x as u8,
                             chunk_y as u8,
                             skip,
+                            is_inter,
+                            lossless,
+                            mi_row,
+                            mi_col,
+                            ctx,
                             &mut readout,
                         )?;
                     } else {
@@ -21485,6 +22284,11 @@ impl PartitionWalker {
                                     chunk_y as u8,
                                     /* from_transform_tree = */ false,
                                     skip,
+                                    is_inter,
+                                    lossless,
+                                    mi_row,
+                                    mi_col,
+                                    ctx,
                                     &mut readout,
                                 )?;
                                 if step_x == 0 {
@@ -21536,6 +22340,11 @@ impl PartitionWalker {
         chunk_x: u8,
         chunk_y: u8,
         skip: bool,
+        is_inter: bool,
+        lossless: bool,
+        mi_row: u32,
+        mi_col: u32,
+        ctx: &ResidualContext,
         readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
         // §5.11.36 lines 1-3: `maxX = MiCols * MI_SIZE` / `maxY = MiRows
@@ -21571,7 +22380,8 @@ impl PartitionWalker {
                 decoder, cdfs, /* plane = */ 0, /* base_x = */ start_x,
                 /* base_y = */ start_y, tx_sz, /* x = */ 0, /* y = */ 0,
                 /* sub_x = */ 0, /* sub_y = */ 0, chunk_x, chunk_y,
-                /* from_transform_tree = */ true, skip, readout,
+                /* from_transform_tree = */ true, skip, is_inter, lossless, mi_row, mi_col,
+                ctx, readout,
             );
         }
         // §5.11.36 lines 12-25: per-direction split.
@@ -21586,6 +22396,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
             self.residual_transform_tree(
@@ -21598,6 +22413,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
         } else if w < h {
@@ -21611,6 +22431,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
             self.residual_transform_tree(
@@ -21623,6 +22448,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
         } else {
@@ -21636,6 +22466,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
             self.residual_transform_tree(
@@ -21648,6 +22483,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
             self.residual_transform_tree(
@@ -21660,6 +22500,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
             self.residual_transform_tree(
@@ -21672,6 +22517,11 @@ impl PartitionWalker {
                 chunk_x,
                 chunk_y,
                 skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                ctx,
                 readout,
             )?;
         }
@@ -21730,6 +22580,11 @@ impl PartitionWalker {
         chunk_y: u8,
         from_transform_tree: bool,
         skip: bool,
+        is_inter: bool,
+        lossless: bool,
+        mi_row: u32,
+        mi_col: u32,
+        ctx: &ResidualContext,
         readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
         // §5.11.35 lines 1-2: `startX = baseX + 4 * x`, `startY =
@@ -21763,20 +22618,19 @@ impl PartitionWalker {
         // startY, txSz )` — invoke the §5.11.39 reader for the
         // bitstream-coefficient read.
         if !skip {
-            // §5.11.39 §8.3.2 axis arguments — see r181 split-off
-            // list:
-            //   * `tx_class = TX_CLASS_2D` (default for §5.11.40 /
-            //     §5.11.41 DCT_DCT fallback).
-            //   * `txb_skip_ctx = 0` (clean-state — no neighbour
-            //     `AboveLevelContext` / `LeftLevelContext`).
-            //   * `dc_sign_ctx = 0` (clean-state — no neighbour
-            //     `AboveDcContext` / `LeftDcContext`).
-            //   * `scan = 0..segEob` (identity scan — §7.5 `get_scan`
-            //     table dispatch deferred).
-            //   * `is_inter = 0` (the reachable §5.11.5 walker path
-            //     is intra-only; non-reachable inter path also passes
-            //     `0` for the §8.3.2 `eob_pt_*` axis on the few sizes
-            //     where the table is `[isInter][...]`).
+            // r183 — §5.11.47 `transform_type` + §5.11.40
+            // `compute_tx_type` + §7.12.3 step-1 dequantization.
+            //
+            // The §5.11.39 reader needs the §8.3.2 `tx_class`
+            // (consumed by the `coeff_base{_eob}` / `coeff_br` ctx
+            // walks); the §5.11.40 `compute_tx_type` derivation
+            // produces the `PlaneTxType` whose `get_tx_class` reduction
+            // feeds that. On the luma plane (`plane == 0`) the
+            // §5.11.47 `transform_type` S() read produces `TxType`
+            // and stamps it into `TxTypes[]`; the §5.11.40 derivation
+            // then collapses to `TxTypes[y4][x4]`. On chroma the
+            // §5.11.40 derivation falls back to `Mode_To_Txfm[UVMode]`
+            // (or `TxTypes[y4][x4]` on the inter path).
             let tx_w = TX_WIDTH[tx_sz];
             let tx_h = TX_HEIGHT[tx_sz];
             let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 {
@@ -21784,20 +22638,102 @@ impl PartitionWalker {
             } else {
                 core::cmp::min(1024, tx_w * tx_h)
             };
+            // 4×4-luma-sample coordinates of this TU's top-left, in
+            // mi-units. The §5.11.47 `TxTypes[ y4 + j ][ x4 + i ]`
+            // grid stamp + the §5.11.40 `TxTypes[ y4 ][ x4 ]`
+            // chroma lookup both consume these.
+            let x4 = start_x >> 2;
+            let y4 = start_y >> 2;
+
+            // §5.11.47 `transform_type` S() — luma-only on the
+            // !skip path. The spec calls `transform_type( x4, y4,
+            // txSz )` inside the §5.11.39 coeffs() prologue on the
+            // luma plane; the chroma plane uses
+            // `compute_tx_type`'s `Mode_To_Txfm[UVMode]` fallback
+            // without a per-TU S() read.
+            if plane == 0 {
+                let tt = self.transform_type(
+                    decoder,
+                    cdfs,
+                    tx_sz,
+                    is_inter,
+                    ctx.intra_dir,
+                    ctx.reduced_tx_set,
+                    ctx.segment_id,
+                    &ctx.quant,
+                )?;
+                self.stamp_tx_type(x4, y4, tt.w4 as u32, tt.h4 as u32, tt.tx_type);
+            }
+
+            // §5.11.40 `compute_tx_type( plane, txSz, x4, y4 )`.
+            // Derives the per-plane `PlaneTxType` after the §5.11.47
+            // stamp.
+            let tx_set = if is_inter {
+                inter_tx_type_set(
+                    tx_size_sqr_index(tx_sz) as u32,
+                    TX_SIZE_SQR_UP[tx_sz] as u32,
+                    ctx.reduced_tx_set,
+                )
+            } else {
+                intra_tx_type_set(
+                    tx_size_sqr_index(tx_sz) as u32,
+                    TX_SIZE_SQR_UP[tx_sz] as u32,
+                    ctx.reduced_tx_set,
+                )
+            };
+            let plane_tx_type = {
+                // Pull TxTypes[] reads through a closure that
+                // bypasses the borrow of `self`.
+                let tx_types_grid = self.tx_types.clone();
+                let mi_cols = self.mi_cols;
+                let mi_rows = self.mi_rows;
+                compute_tx_type(
+                    plane as usize,
+                    tx_sz,
+                    lossless,
+                    is_inter,
+                    tx_set,
+                    mi_row,
+                    mi_col,
+                    x4,
+                    y4,
+                    sub_x as u32,
+                    sub_y as u32,
+                    ctx.uv_mode as usize,
+                    |yy, xx| {
+                        if yy >= mi_rows || xx >= mi_cols {
+                            DCT_DCT
+                        } else {
+                            tx_types_grid[(yy * mi_cols + xx) as usize] as usize
+                        }
+                    },
+                )
+            };
+
+            // §8.3.2 tx_class derivation — fold the §3 `*_DCT` /
+            // `*_ADST` / `*_FLIPADST` constants into TX_CLASS_2D /
+            // TX_CLASS_HORIZ / TX_CLASS_VERT.
+            let tx_class = match plane_tx_type {
+                V_DCT | V_ADST | V_FLIPADST => TX_CLASS_VERT,
+                H_DCT | H_ADST | H_FLIPADST => TX_CLASS_HORIZ,
+                _ => TX_CLASS_2D,
+            };
+
             // §7.5 identity scan placeholder — `seg_eob` cells in
-            // strictly ascending order. The §5.11.39 reader's
-            // gate-closed (`all_zero == 1`) path consults the scan
-            // only after the EOB derivation, which itself short-
-            // circuits before scan-table access.
+            // strictly ascending order. The §7.5 `get_scan` table
+            // dispatch (per-`(txSz, PlaneTxType)`) is the next-arc
+            // target; the gate-closed (`all_zero == 1`) bitstream
+            // path the §5.11.5 walker exercises today does not
+            // consume the scan beyond the EOB derivation.
             let scan: Vec<u16> = (0..seg_eob as u16).collect();
             let mut quant = vec![0i32; tx_w * tx_h];
             let coeffs = self.coefficients(
                 decoder,
                 cdfs,
                 plane,
-                /* is_inter = */ 0,
+                is_inter as u8,
                 tx_sz,
-                TX_CLASS_2D,
+                tx_class,
                 /* txb_skip_ctx = */ 0,
                 /* dc_sign_ctx = */ 0,
                 &scan,
@@ -21805,41 +22741,50 @@ impl PartitionWalker {
             )?;
             readout.coeffs.push(coeffs);
             // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
-            // §7.12.3 dequantization + §7.13 inverse transform +
-            // §7.7 reconstruction merge. As of r182 the §7.13 inverse
-            // transform is implemented in [`crate::transform`] and
-            // wired here through [`crate::transform::inverse_transform_2d`].
+            // §7.12.3 dequantization (step 1, r183 LANDED) + §7.13
+            // inverse transform (r182) + §7.12.3 step-3 frame-buffer
+            // merge (next-arc).
             //
-            // The §7.12.3 step-1 dequantization is still a split-off:
-            // the spec computes `Dequant[i][j] = Quant[pos] * q2 /
-            // dqDenom` with `q2` resolved from `get_dc_quant` /
-            // `get_ac_quant` / the §6.8.13 `Quantizer_Matrix[
-            // SegQMLevel[plane][segment_id] ][ ... ]` table — all of
-            // which need the per-segment quantizer state the
-            // §5.11.34 caller doesn't yet plumb. As a place-holder
-            // the walker passes the §5.11.39 `Quant[]` levels
-            // directly to the inverse transform as an identity
-            // dequant. This is enough to lift the
-            // `ResidualReconstructUnsupported` gate at the §7.13
-            // boundary; the §7.12.3 frame-buffer merge (step 3,
-            // including `flipLR` / `flipUD` destination remapping
-            // and `Clip1` on `CurrFrame[plane][y + yy][x + xx]`) is
-            // the next-arc target.
+            // r183 — §7.12.3 step-1 dequantization is wired in via
+            // [`dequantize_step1`]. The §7.12.3 step-3 frame-buffer
+            // merge (`CurrFrame[plane][y + yy][x + xx]` write with
+            // `flipLR` / `flipUD` destination remapping and `Clip1`)
+            // is the next-arc target — the per-TU `Residual[][]` is
+            // captured on [`ResidualReadout::residuals`].
             if coeffs.eob > 0 {
-                // §7.13.3 dispatcher input — Dequant[i][j] derived
-                // from the §5.11.39 `Quant[]` raster-order levels.
-                let dequant: Vec<i64> = quant.iter().map(|&v| v as i64).collect();
+                let dequant = dequantize_step1(
+                    &quant,
+                    tx_sz,
+                    plane,
+                    ctx.segment_id,
+                    plane_tx_type,
+                    ctx.seg_qm_level[plane as usize],
+                    &ctx.quant,
+                );
                 let residual = crate::transform::inverse_transform_2d(
                     &dequant,
                     tx_sz,
-                    crate::cdf::DCT_DCT,
-                    /* bit_depth = */ 8,
-                    /* lossless = */ false,
+                    plane_tx_type,
+                    ctx.quant.bit_depth as u32,
+                    lossless,
                 );
                 readout.residuals.push(Some(residual));
             } else {
                 readout.residuals.push(None);
             }
+        } else if plane == 0 {
+            // §5.11.39 `all_zero == 1` luma stamp — the §5.11.39
+            // gate-closed path writes `TxTypes[ y4 + j ][ x4 + i ] =
+            // DCT_DCT` over the TU footprint. The §5.11.34 skip arm
+            // doesn't reach §5.11.39 at all, but the §5.11.40
+            // `compute_tx_type` chroma path on the next iteration
+            // reads `TxTypes[]` — so on the `skip == true` arm we
+            // also pre-stamp DCT_DCT to preserve the invariant.
+            let x4 = start_x >> 2;
+            let y4 = start_y >> 2;
+            let w4 = (TX_WIDTH[tx_sz] >> 2) as u32;
+            let h4 = (TX_HEIGHT[tx_sz] >> 2) as u32;
+            self.stamp_tx_type(x4, y4, w4, h4, DCT_DCT as u8);
         }
 
         // §5.11.35 lines 35-43: `LoopfilterTxSizes[ plane ][ ... ]` /
@@ -44526,11 +45471,20 @@ mod tests {
         let pos_before = dec.position();
         let r = walker
             .residual(
-                &mut dec, &mut cdfs, /* mi_row = */ 0, /* mi_col = */ 0,
-                /* mi_size = */ BLOCK_8X8, /* has_chroma = */ true,
-                /* subsampling_x = */ 0, /* subsampling_y = */ 0,
-                /* is_inter = */ false, /* lossless = */ false, /* skip = */ true,
-                /* tx_size = */ TX_8X8, /* use_128x128_superblock = */ false,
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                /* mi_size = */ BLOCK_8X8,
+                /* has_chroma = */ true,
+                /* subsampling_x = */ 0,
+                /* subsampling_y = */ 0,
+                /* is_inter = */ false,
+                /* lossless = */ false,
+                /* skip = */ true,
+                /* tx_size = */ TX_8X8,
+                /* use_128x128_superblock = */ false,
+                &ResidualContext::neutral(0, 8),
             )
             .unwrap();
         let pos_after = dec.position();
@@ -44586,9 +45540,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let r = walker
             .residual(
-                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* has_chroma = */ true, 0, 0,
-                /* is_inter = */ false, /* lossless = */ false, /* skip = */ false,
-                TX_8X8, false,
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* has_chroma = */ true,
+                0,
+                0,
+                /* is_inter = */ false,
+                /* lossless = */ false,
+                /* skip = */ false,
+                TX_8X8,
+                false,
+                &ResidualContext::neutral(0, 8),
             )
             .unwrap();
         assert_eq!(r.tasks.len(), 3);
@@ -44627,8 +45592,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let r = walker
             .residual(
-                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* has_chroma = */ true, 0, 0, false,
-                /* lossless = */ true, /* skip = */ true, TX_8X8, false,
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* has_chroma = */ true,
+                0,
+                0,
+                false,
+                /* lossless = */ true,
+                /* skip = */ true,
+                TX_8X8,
+                false,
+                &ResidualContext::neutral(0, 8),
             )
             .unwrap();
         for t in &r.tasks {
@@ -44659,8 +45636,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let r = walker
             .residual(
-                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* has_chroma = */ false, 0, 0, false,
-                false, /* skip = */ true, TX_8X8, false,
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* has_chroma = */ false,
+                0,
+                0,
+                false,
+                false,
+                /* skip = */ true,
+                TX_8X8,
+                false,
+                &ResidualContext::neutral(0, 8),
             )
             .unwrap();
         assert_eq!(r.num_planes_visited, 1, "monochrome ⇒ 1 plane");
@@ -44701,6 +45690,7 @@ mod tests {
                 /* skip = */ true,
                 TX_4X4,
                 /* use_128x128_superblock = */ true,
+                &ResidualContext::neutral(0, 8),
             )
             .unwrap();
         assert_eq!(r.width_chunks, 2, "BLOCK_128X128 ⇒ widthChunks = 2");
@@ -44751,7 +45741,8 @@ mod tests {
                 false,
                 true,
                 TX_4X4,
-                false
+                false,
+                &ResidualContext::neutral(0, 8)
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
@@ -44760,8 +45751,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         assert_eq!(
             walker.residual(
-                &mut dec, &mut cdfs, 9, 0, BLOCK_4X4, false, 0, 0, false, false, true, TX_4X4,
-                false
+                &mut dec,
+                &mut cdfs,
+                9,
+                0,
+                BLOCK_4X4,
+                false,
+                0,
+                0,
+                false,
+                false,
+                true,
+                TX_4X4,
+                false,
+                &ResidualContext::neutral(0, 8)
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
@@ -44770,8 +45773,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         assert_eq!(
             walker.residual(
-                &mut dec, &mut cdfs, 0, 9, BLOCK_4X4, false, 0, 0, false, false, true, TX_4X4,
-                false
+                &mut dec,
+                &mut cdfs,
+                0,
+                9,
+                BLOCK_4X4,
+                false,
+                0,
+                0,
+                false,
+                false,
+                true,
+                TX_4X4,
+                false,
+                &ResidualContext::neutral(0, 8)
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
@@ -44780,8 +45795,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         assert_eq!(
             walker.residual(
-                &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, false, 2, 0, false, false, true, TX_4X4,
-                false
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                false,
+                2,
+                0,
+                false,
+                false,
+                true,
+                TX_4X4,
+                false,
+                &ResidualContext::neutral(0, 8)
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
@@ -44790,8 +45817,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
         assert_eq!(
             walker.residual(
-                &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, false, 0, 2, false, false, true, TX_4X4,
-                false
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                false,
+                0,
+                2,
+                false,
+                false,
+                true,
+                TX_4X4,
+                false,
+                &ResidualContext::neutral(0, 8)
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
@@ -44812,7 +45851,8 @@ mod tests {
                 false,
                 true,
                 TX_SIZES_ALL,
-                false
+                false,
+                &ResidualContext::neutral(0, 8)
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
@@ -44840,10 +45880,20 @@ mod tests {
         // lumaH = 4 < 8, so splits 4-ways into four 4×4 leaves.
         let r = walker
             .residual(
-                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8,
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
                 /* has_chroma = */ false, // skip chroma to simplify
-                0, 0, /* is_inter = */ true, /* lossless = */ false,
-                /* skip = */ true, TX_8X8, false,
+                0,
+                0,
+                /* is_inter = */ true,
+                /* lossless = */ false,
+                /* skip = */ true,
+                TX_8X8,
+                false,
+                &ResidualContext::neutral(0, 8),
             )
             .unwrap();
         // 4 luma TUs via the transform_tree split + 0 chroma.
@@ -44888,11 +45938,20 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let r = walker
             .residual(
-                &mut dec, &mut cdfs, /* mi_row = */ 0, /* mi_col = */ 0,
-                /* mi_size = */ BLOCK_8X8, /* has_chroma = */ true,
-                /* subsampling_x = */ 0, /* subsampling_y = */ 0,
-                /* is_inter = */ false, /* lossless = */ false, /* skip = */ false,
-                /* tx_size = */ TX_8X8, /* use_128x128_superblock = */ false,
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                /* mi_size = */ BLOCK_8X8,
+                /* has_chroma = */ true,
+                /* subsampling_x = */ 0,
+                /* subsampling_y = */ 0,
+                /* is_inter = */ false,
+                /* lossless = */ false,
+                /* skip = */ false,
+                /* tx_size = */ TX_8X8,
+                /* use_128x128_superblock = */ false,
+                &ResidualContext::neutral(0, 8),
             )
             .unwrap();
         assert_eq!(
@@ -44916,6 +45975,431 @@ mod tests {
                 "TU {i}: Residual length must match Tx_Width * Tx_Height"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 183 — §7.12.2 dequantization-function tables + §7.12.3
+    // step-1 dequant loop + §5.11.47 transform_type S() reader.
+    // -----------------------------------------------------------------
+
+    /// `Dc_Qlookup` / `Ac_Qlookup` row dimensions and per-bit-depth
+    /// row[0] / row[255] spec values per §7.12.2 (av1-spec p.289-292).
+    #[test]
+    fn dc_ac_qlookup_table_spot_checks() {
+        // Every row: length 256, first entry 4, last entry monotonic.
+        for row in 0..3 {
+            assert_eq!(DC_QLOOKUP[row].len(), 256);
+            assert_eq!(AC_QLOOKUP[row].len(), 256);
+            assert_eq!(DC_QLOOKUP[row][0], 4);
+            assert_eq!(AC_QLOOKUP[row][0], 4);
+        }
+        // 8-bit row last entries from spec p.289 / p.291.
+        assert_eq!(DC_QLOOKUP[0][255], 1336);
+        assert_eq!(AC_QLOOKUP[0][255], 1828);
+        // 10-bit row last entries from spec p.289 / p.291.
+        assert_eq!(DC_QLOOKUP[1][255], 5347);
+        assert_eq!(AC_QLOOKUP[1][255], 7312);
+        // 12-bit row last entries from spec p.290 / p.292.
+        assert_eq!(DC_QLOOKUP[2][255], 21387);
+        assert_eq!(AC_QLOOKUP[2][255], 29247);
+    }
+
+    /// `dc_q` / `ac_q` row selection + `Clip3( 0, 255, b )` clamp per
+    /// §7.12.2.
+    #[test]
+    fn dc_q_ac_q_clip_and_row_select() {
+        // 8-bit row.
+        assert_eq!(dc_q(8, 0), DC_QLOOKUP[0][0]);
+        assert_eq!(dc_q(8, 255), DC_QLOOKUP[0][255]);
+        // Out-of-range b clamps to [0, 255].
+        assert_eq!(dc_q(8, -5), DC_QLOOKUP[0][0]);
+        assert_eq!(dc_q(8, 1024), DC_QLOOKUP[0][255]);
+        // 10-bit row.
+        assert_eq!(ac_q(10, 100), AC_QLOOKUP[1][100]);
+        // 12-bit row.
+        assert_eq!(ac_q(12, 200), AC_QLOOKUP[2][200]);
+    }
+
+    /// `get_qindex` per §7.12.2 — `base_q_idx` fallback when
+    /// segmentation off and delta_q off.
+    #[test]
+    fn get_qindex_no_segmentation_returns_base() {
+        let q = QuantizerParams::neutral(57, 8);
+        assert_eq!(get_qindex(&q, true, 0), 57);
+        assert_eq!(get_qindex(&q, false, 5), 57);
+    }
+
+    /// `get_qindex` per §7.12.2 — `delta_q_present` arm.
+    #[test]
+    fn get_qindex_delta_q_present_path() {
+        let mut q = QuantizerParams::neutral(50, 8);
+        q.delta_q_present = true;
+        q.current_q_index = 120;
+        // ignore_delta_q == true ⇒ base_q_idx fallback.
+        assert_eq!(get_qindex(&q, true, 0), 50);
+        // ignore_delta_q == false ⇒ current_q_index.
+        assert_eq!(get_qindex(&q, false, 0), 120);
+    }
+
+    /// `get_qindex` per §7.12.2 — segmentation-active path with
+    /// `SEG_LVL_ALT_Q` feature.
+    #[test]
+    fn get_qindex_segmentation_alt_q_path() {
+        let mut q = QuantizerParams::neutral(100, 8);
+        q.segmentation_enabled = true;
+        q.seg_alt_q_active[3] = true;
+        q.seg_alt_q_data[3] = -40;
+        assert_eq!(get_qindex(&q, false, 3), 60);
+        // Other segments fall back to base_q_idx.
+        assert_eq!(get_qindex(&q, false, 0), 100);
+        // Clip3 lower bound.
+        q.seg_alt_q_data[3] = -255;
+        assert_eq!(get_qindex(&q, false, 3), 0);
+    }
+
+    /// `get_dc_quant` / `get_ac_quant` per-plane delta routing per
+    /// §7.12.2.
+    #[test]
+    fn get_dc_ac_quant_per_plane_delta_routing() {
+        let mut q = QuantizerParams::neutral(80, 8);
+        q.delta_q_y_dc = 5;
+        q.delta_q_u_dc = -3;
+        q.delta_q_u_ac = 7;
+        q.delta_q_v_dc = 10;
+        q.delta_q_v_ac = -8;
+        // Y DC = dc_q(8, 80 + 5).
+        assert_eq!(get_dc_quant(&q, 0, 0), dc_q(8, 85));
+        // U DC = dc_q(8, 80 + (-3)).
+        assert_eq!(get_dc_quant(&q, 1, 0), dc_q(8, 77));
+        // V DC.
+        assert_eq!(get_dc_quant(&q, 2, 0), dc_q(8, 90));
+        // Y AC = ac_q(8, base_q_idx) — no DeltaQYAc field in the spec.
+        assert_eq!(get_ac_quant(&q, 0, 0), ac_q(8, 80));
+        assert_eq!(get_ac_quant(&q, 1, 0), ac_q(8, 87));
+        assert_eq!(get_ac_quant(&q, 2, 0), ac_q(8, 72));
+    }
+
+    /// `dequant_denom` per §7.12.3 — 4 for 64x64-axis transforms, 2
+    /// for 32x32-axis transforms, 1 otherwise.
+    #[test]
+    fn dequant_denom_per_tx_size() {
+        assert_eq!(dequant_denom(TX_4X4), 1);
+        assert_eq!(dequant_denom(TX_8X8), 1);
+        assert_eq!(dequant_denom(TX_16X16), 1);
+        assert_eq!(dequant_denom(TX_32X32), 2);
+        assert_eq!(dequant_denom(TX_64X64), 4);
+        assert_eq!(dequant_denom(TX_16X32), 2);
+        assert_eq!(dequant_denom(TX_32X16), 2);
+        assert_eq!(dequant_denom(TX_16X64), 2);
+        assert_eq!(dequant_denom(TX_64X16), 2);
+        assert_eq!(dequant_denom(TX_32X64), 4);
+        assert_eq!(dequant_denom(TX_64X32), 4);
+        // Tiny / asymmetric below 32 ⇒ 1.
+        assert_eq!(dequant_denom(TX_4X8), 1);
+        assert_eq!(dequant_denom(TX_8X4), 1);
+        assert_eq!(dequant_denom(TX_16X4), 1);
+    }
+
+    /// `dequantize_step1` 4x4 DC-only block per §7.12.3 step-1: with
+    /// `Quant[0] = 1` and `quant.base_q_idx = 0`, the §7.12.2 lookup
+    /// returns `dc_q(8, 0) = 4`, so `Dequant[0] = 1 * 4 / 1 = 4`.
+    /// Every other cell is `0` (Quant is all-zero outside DC).
+    #[test]
+    fn dequantize_step1_dc_only_4x4_base_q_idx_zero() {
+        let q = QuantizerParams::neutral(0, 8);
+        let levels = {
+            let mut v = vec![0i32; 16];
+            v[0] = 1;
+            v
+        };
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 15, &q);
+        assert_eq!(dequant.len(), 16);
+        assert_eq!(dequant[0], 4, "DC = level * dc_q(8, 0) / 1 = 1 * 4");
+        for &v in &dequant[1..] {
+            assert_eq!(v, 0);
+        }
+    }
+
+    /// `dequantize_step1` per-coefficient AC quant + signed product +
+    /// `&0xFFFFFF` clip + `dqDenom` divide.
+    #[test]
+    fn dequantize_step1_ac_and_dq_denom() {
+        let q = QuantizerParams::neutral(50, 8);
+        let dc_q_val = dc_q(8, 50);
+        let ac_q_val = ac_q(8, 50);
+        let mut levels = vec![0i32; 16];
+        levels[0] = 2; // DC
+        levels[1] = -3; // first AC (row 0, col 1)
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 15, &q);
+        assert_eq!(dequant[0], (2 * dc_q_val) as i64);
+        // Negative product: -3 * ac_q ⇒ sign = -1 ⇒ result is
+        // -1 * (|product| & 0xFFFFFF) / 1.
+        let product = -3i64 * ac_q_val as i64;
+        let sign: i64 = if product < 0 { -1 } else { 1 };
+        let expected = sign * ((product.unsigned_abs() & 0xFFFFFF) as i64);
+        assert_eq!(dequant[1], expected);
+    }
+
+    /// `dequantize_step1` `dqDenom = 4` on `TX_64X64` halves the
+    /// `Dequant[]` cells (vs `dqDenom = 1` baseline). Drives only the
+    /// top-left 32×32 cells per spec `tw / th = Min(32, w/h)`; the
+    /// remaining cells stay at the §5.11.39 `Dequant[..][..] = 0`
+    /// pre-loop default.
+    #[test]
+    fn dequantize_step1_64x64_dq_denom_four() {
+        let q = QuantizerParams::neutral(0, 8);
+        let mut levels = vec![0i32; 64 * 64];
+        levels[0] = 8;
+        let dequant = dequantize_step1(&levels, TX_64X64, 0, 0, DCT_DCT, 15, &q);
+        // DC = level * dc_q(8, 0) / 4 = 8 * 4 / 4 = 8.
+        assert_eq!(dequant[0], 8);
+        // The bottom-right of the top-left 32x32 is the last cell
+        // touched; cell (32, 0) sits outside `tw = 32, th = 32` so
+        // it stays at zero (Quant is zero there anyway).
+        assert_eq!(dequant.len(), 64 * 64);
+    }
+
+    /// `dequantize_step1` clip per §7.12.3 step-1 line f:
+    /// `Clip3(-(1<<(7+BitDepth)), (1<<(7+BitDepth))-1, dq2)`.
+    /// For 8-bit, bounds are `[-32768, 32767]`.
+    #[test]
+    fn dequantize_step1_clips_dequant_to_signed_15bit_band() {
+        let q = QuantizerParams::neutral(255, 8);
+        // Very large DC level × dc_q(8, 255) = 1000 * 1336.
+        let mut levels = vec![0i32; 16];
+        levels[0] = 1000;
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 15, &q);
+        // 1000 * 1336 = 1_336_000; raw, that's well above 32767.
+        // dqDenom = 1 for TX_4X4 ⇒ clip clamps to (1<<15) - 1 = 32767.
+        assert_eq!(dequant[0], 32767);
+        // Negative side.
+        levels[0] = -1000;
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 15, &q);
+        assert_eq!(dequant[0], -32768);
+    }
+
+    /// `dequantize_step1` `seg_qm_level == 15` short-circuits the QM
+    /// lookup (the no-QM identity path runs regardless of
+    /// `using_qmatrix`).
+    #[test]
+    fn dequantize_step1_seg_qm_level_15_skips_qm() {
+        let mut q = QuantizerParams::neutral(50, 8);
+        q.using_qmatrix = true;
+        let mut levels = vec![0i32; 16];
+        levels[0] = 1;
+        // seg_qm_level == 15 ⇒ no QM (`q2 = q`).
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 15, &q);
+        assert_eq!(dequant[0], dc_q(8, 50) as i64);
+    }
+
+    /// Tx_Type_*_Inv_Set inversion tables match the §5.11.47 spec
+    /// tables verbatim.
+    #[test]
+    fn tx_type_inv_set_tables_match_spec() {
+        assert_eq!(
+            TX_TYPE_INTRA_INV_SET1,
+            [IDTX, DCT_DCT, V_DCT, H_DCT, ADST_ADST, ADST_DCT, DCT_ADST]
+        );
+        assert_eq!(
+            TX_TYPE_INTRA_INV_SET2,
+            [IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST]
+        );
+        assert_eq!(TX_TYPE_INTER_INV_SET3, [IDTX, DCT_DCT]);
+        assert_eq!(TX_TYPE_INTER_INV_SET1.len(), 16);
+        assert_eq!(TX_TYPE_INTER_INV_SET2.len(), 12);
+    }
+
+    /// `transform_type` short-circuits to `DCT_DCT` when
+    /// `base_q_idx == 0` AND `segmentation_enabled == false` (the
+    /// §5.11.47 spec guard `(segmentation_enabled ? get_qindex(1,
+    /// segment_id) : base_q_idx) > 0`).
+    #[test]
+    fn transform_type_base_q_idx_zero_returns_dct_dct() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let q = QuantizerParams::neutral(0, 8);
+        // tx_size = TX_8X8 ⇒ TX_SET_INTRA_1 admits a transform_type
+        // read, but the qindex == 0 guard forces DCT_DCT without
+        // touching the bitstream.
+        let pos_before = dec.position();
+        let r = walker
+            .transform_type(&mut dec, &mut cdfs, TX_8X8, false, 0, false, 0, &q)
+            .unwrap();
+        let pos_after = dec.position();
+        assert_eq!(r.tx_type, DCT_DCT as u8);
+        assert_eq!(r.w4, 2);
+        assert_eq!(r.h4, 2);
+        assert_eq!(pos_before, pos_after, "qindex == 0 ⇒ no bitstream read");
+    }
+
+    /// `transform_type` `TX_SET_DCTONLY` short-circuit when
+    /// `txSzSqrUp > TX_32X32` (so `get_tx_set` returns
+    /// `TX_SET_DCTONLY = 0`).
+    #[test]
+    fn transform_type_tx_set_dctonly_returns_dct_dct_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let q = QuantizerParams::neutral(100, 8);
+        let pos_before = dec.position();
+        // TX_64X64 ⇒ TX_SET_DCTONLY on the intra path.
+        let r = walker
+            .transform_type(&mut dec, &mut cdfs, TX_64X64, false, 0, false, 0, &q)
+            .unwrap();
+        let pos_after = dec.position();
+        assert_eq!(r.tx_type, DCT_DCT as u8);
+        assert_eq!(pos_before, pos_after, "TX_SET_DCTONLY ⇒ no bitstream read");
+    }
+
+    /// `transform_type` codes a symbol on `TX_SET_INTRA_1` (TX_8X8
+    /// intra, base_q_idx > 0). The default CDFs return symbol 0 from
+    /// a zero-filled bitstream which inverts via
+    /// `TX_TYPE_INTRA_INV_SET1[0] = IDTX`.
+    #[test]
+    fn transform_type_intra_set1_codes_symbol() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force the §8.3.2 intra_tx_type CDF to return symbol 0
+        // (= IDTX after inversion) deterministically.
+        for sqr in 0..INTRA_TX_TYPE_SET1_SIZES {
+            for d in 0..INTRA_MODES {
+                cdfs.intra_tx_type_set1[sqr][d] = rig_cdf::<8>(0);
+            }
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let q = QuantizerParams::neutral(50, 8);
+        let r = walker
+            .transform_type(&mut dec, &mut cdfs, TX_8X8, false, 0, false, 0, &q)
+            .unwrap();
+        // `TX_TYPE_INTRA_INV_SET1[0] = IDTX`.
+        assert_eq!(r.tx_type as usize, IDTX);
+    }
+
+    /// `stamp_tx_type` writes the `TxTypes[][]` grid over a `(w4, h4)`
+    /// footprint anchored at `(x4, y4)`. Out-of-bounds cells are
+    /// silently dropped.
+    #[test]
+    fn stamp_tx_type_grid_footprint() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        walker.stamp_tx_type(2, 3, 2, 2, ADST_ADST as u8);
+        for r in 0i32..8 {
+            for c in 0i32..8 {
+                let expected = if (3..=4).contains(&r) && (2..=3).contains(&c) {
+                    ADST_ADST as u8
+                } else {
+                    DCT_DCT as u8
+                };
+                assert_eq!(walker.tx_type_at(r, c), expected, "({r}, {c}) ⇒ {expected}");
+            }
+        }
+    }
+
+    /// `tx_type_at` returns `DCT_DCT` for out-of-bounds reads.
+    #[test]
+    fn tx_type_at_out_of_bounds_returns_dct_dct() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        assert_eq!(walker.tx_type_at(-1, 0), DCT_DCT as u8);
+        assert_eq!(walker.tx_type_at(0, -1), DCT_DCT as u8);
+        assert_eq!(walker.tx_type_at(4, 0), DCT_DCT as u8);
+        assert_eq!(walker.tx_type_at(0, 4), DCT_DCT as u8);
+    }
+
+    /// `ResidualContext::neutral` smoke — every field defaults to a
+    /// no-op spec value.
+    #[test]
+    fn residual_context_neutral_defaults() {
+        let ctx = ResidualContext::neutral(0, 8);
+        assert_eq!(ctx.quant.base_q_idx, 0);
+        assert_eq!(ctx.quant.bit_depth, 8);
+        assert!(!ctx.reduced_tx_set);
+        assert_eq!(ctx.intra_dir, 0);
+        assert_eq!(ctx.segment_id, 0);
+        assert_eq!(ctx.seg_qm_level, [15, 15, 15]);
+        assert_eq!(ctx.uv_mode, 0);
+    }
+
+    /// End-to-end smoke for the §7.12.3 step-1 + §7.13 inverse
+    /// transform pipeline on a 4×4 DC-only intra-luma block.
+    ///
+    /// Drives the §5.11.34 / §5.11.35 dispatcher directly with a
+    /// rigged `all_zero == 1` CDF (so the §5.11.39 reader emits
+    /// `Quant[0..16] = 0` with `eob = 0`); on that path the
+    /// `residuals` vec entry is `None` per the existing post-r182
+    /// contract, confirming the new dequant code is wired through
+    /// without disturbing the gate-closed path.
+    #[test]
+    fn residual_dc_only_block_pipeline_smoke() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force `all_zero == 1` for every TU at TX_4X4.
+        for ctx in 0..TXB_SKIP_CONTEXTS {
+            cdfs.txb_skip[0][ctx] = rig_cdf::<3>(1);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let ctx = ResidualContext {
+            quant: QuantizerParams::neutral(0, 8),
+            reduced_tx_set: false,
+            intra_dir: 0,
+            segment_id: 0,
+            seg_qm_level: [15, 15, 15],
+            uv_mode: 0,
+        };
+        let r = walker
+            .residual(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, /* has_chroma = */ false, 0, 0,
+                /* is_inter = */ false, /* lossless = */ false, /* skip = */ false,
+                TX_4X4, false, &ctx,
+            )
+            .unwrap();
+        assert_eq!(r.tasks.len(), 1, "1 luma TU on the monochrome 4x4 path");
+        assert_eq!(r.coeffs.len(), 1);
+        assert!(r.coeffs[0].all_zero);
+        assert_eq!(r.coeffs[0].eob, 0);
+        assert!(
+            r.residuals[0].is_none(),
+            "eob == 0 ⇒ no inverse_transform_2d"
+        );
     }
 
     /// `ResidualReadout` `Clone` / `Debug` / `Eq` derive smoke.

@@ -6,6 +6,89 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 183 — §7.12.2 dequantization-function tables + §7.12.3
+  step-1 dequantization loop + §5.11.47 `transform_type` per-TU
+  S() reader.** Replaces the r182 placeholder identity dequant +
+  hard-coded `DCT_DCT` per-TU in the `residual()` walker path
+  with a real per-plane / per-segment quantization pipeline.
+
+  * New `oxideav_av1::{DC_QLOOKUP, AC_QLOOKUP, dc_q, ac_q}` —
+    the `Dc_Qlookup[3][256]` / `Ac_Qlookup[3][256]` per-bit-depth
+    quantizer index tables (av1-spec p.289-292, verbatim) plus
+    the `(BitDepth-8) >> 1` row-select + `Clip3(0, 255, b)`
+    column-clamp helpers from §7.12.2.
+  * New `oxideav_av1::{QuantizerParams, get_qindex, get_dc_quant,
+    get_ac_quant}` — `QuantizerParams` aggregates the §5.9.12
+    `base_q_idx` / four `delta_q_*` slots, §5.9.18
+    `delta_q_present` / `current_q_index`, §5.9.14
+    `SEG_LVL_ALT_Q` `FeatureEnabled[]` / `FeatureData[]` tables,
+    §5.9.12 `using_qmatrix`, and §6.4.1 `BitDepth`. The three
+    accessors mirror av1-spec p.293-294 (segmentation arm +
+    delta_q arm + `base_q_idx` fallback; per-plane DC / AC delta
+    routing).
+  * New `oxideav_av1::{dequant_denom, dequantize_step1}` — the
+    §7.12.3 step-1 loop (av1-spec p.294-295): per-coefficient
+    `q = (i,j == 0,0) ? get_dc_quant : get_ac_quant`,
+    `dq = Quant * q`, `sign = (dq < 0) ? -1 : 1`,
+    `dq2 = sign * (|dq| & 0xFFFFFF) / dqDenom`,
+    `Dequant[i][j] = Clip3(-(1<<(7+BitDepth)),
+    (1<<(7+BitDepth)) - 1, dq2)`, with `tw = Min(32, w)` /
+    `th = Min(32, h)` and `dqDenom = 4 / 2 / 1` per the size.
+    The §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table
+    is split-off (~30 KB); the `using_qmatrix && plane_tx_type
+    < IDTX && seg_qm_level < 15` arm falls through to the no-QM
+    identity (`q2 = q`) path with a debug-only assertion. The
+    `seg_qm_level == 15` spec sentinel takes the no-QM branch
+    directly.
+  * New `oxideav_av1::{TX_TYPE_INTRA_INV_SET1,
+    TX_TYPE_INTRA_INV_SET2, TX_TYPE_INTER_INV_SET1,
+    TX_TYPE_INTER_INV_SET2, TX_TYPE_INTER_INV_SET3}` — the
+    §5.11.47 spec inversion tables verbatim (`{ IDTX, DCT_DCT,
+    V_DCT, ... }` 16/12/7/5/2 entries).
+  * New `PartitionWalker::transform_type(decoder, cdfs, tx_size,
+    is_inter, intra_dir, reduced_tx_set, segment_id, &quant)` —
+    the §5.11.47 per-TU luma S() read against
+    `TileIntraTxTypeSet{1,2}Cdf` / `TileInterTxTypeSet{1,2,3}Cdf`
+    (routed via the existing `inter_tx_type_cdf` /
+    `intra_tx_type_cdf` selectors) with the spec's `set > 0 &&
+    (segmentation_enabled ? get_qindex(1, segment_id) :
+    base_q_idx) > 0` guard. Returns a `TransformTypeReadout {
+    tx_type, w4, h4 }`.
+  * New `PartitionWalker::{tx_types(), tx_type_at(r, c),
+    stamp_tx_type(x4, y4, w4, h4, tx_type)}` — the §5.11.39
+    / §5.11.47 `TxTypes[][]` luma cache accessors. A new
+    walker-level `tx_types: Vec<u8>` grid (one cell per
+    4×4-luma-sample / mi unit) tracks the cache; `stamp_tx_type`
+    writes a `(w4, h4)` footprint with edge-clipping.
+  * New `oxideav_av1::ResidualContext` — per-block aggregate
+    (`QuantizerParams`, `reduced_tx_set`, `intra_dir`,
+    `segment_id`, `seg_qm_level[3]`, `uv_mode`) the §5.11.34
+    `residual()` dispatcher consumes. Use
+    `ResidualContext::neutral(base_q_idx, bit_depth)` for the
+    "all defaults" path.
+
+  Wired into `PartitionWalker::residual` /
+  `transform_block_emit`: the dispatcher now, on the `!skip` arm,
+  runs `transform_type` (luma only), `compute_tx_type` (per
+  plane), `get_tx_class(plane_tx_type)`, then `dequantize_step1`
+  in order — replacing the r182 hard-coded `DCT_DCT` + identity
+  dequant. The §7.13 `inverse_transform_2d` call now receives the
+  per-plane `PlaneTxType` and `BitDepth` from `ResidualContext`.
+  The §5.11.5 `decode_block_syntax` walker synthesises a neutral
+  `ResidualContext` (`base_q_idx = 0`, no segmentation,
+  `intra_dir = y_mode`, `uv_mode = DC_PRED`, no QM) so the
+  reachable walker path exercises the §5.11.47 `q_for_guard ==
+  0 ⇒ DCT_DCT` short-circuit — every fixture in the corpus
+  remains green.
+
+  **Split-off explicitly:** (a) §9.5.3 `Quantizer_Matrix` table
+  transcription; (b) §7.5 `get_scan` table dispatch; (c) §7.12.3
+  step-3 frame-buffer merge; (d) 12 non-DC intra-prediction
+  modes; (e) §7.9 inter prediction.
+
+  20 new tests (801 → 821); `decode_av1` / `encode_av1` continue
+  to return `Error::NotImplemented`.
+
 * **Round 182 — §7.13 inverse transform process.** New
   `oxideav_av1::transform` module reproduces the AV1 §7.13 inverse-
   transform stack from the spec text directly: §7.13.2.1

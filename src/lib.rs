@@ -1641,6 +1641,22 @@ pub use cdf::{
 // through [`cdf::PartitionWalker::residual`], plus the §5.11.37
 // per-plane transform-size lookup [`cdf::get_tx_size`].
 pub use cdf::{get_tx_size, ResidualReadout, ResidualTuTask};
+// r183: §7.12.2 dequantization-function tables + helpers + §7.12.3
+// step-1 dequantization loop ([`cdf::dequantize_step1`]) + §5.11.47
+// `transform_type` per-TU S() reader ([`cdf::PartitionWalker::transform_type`])
+// — replaces the r182 placeholder identity dequant + `DCT_DCT`
+// hard-code in the `residual()` dispatcher. The `transform_type`
+// inversion tables `TX_TYPE_INTER_INV_SET{1,2,3}` /
+// `TX_TYPE_INTRA_INV_SET{1,2}` are surfaced for caller use; the
+// per-block [`cdf::ResidualContext`] aggregate bundles the
+// `base_q_idx` / segmentation / `delta_q_*` / `using_qmatrix` state
+// the dispatcher needs.
+pub use cdf::{
+    ac_q, dc_q, dequant_denom, dequantize_step1, get_ac_quant, get_dc_quant, get_qindex,
+    QuantizerParams, ResidualContext, TransformTypeReadout, AC_QLOOKUP, DC_QLOOKUP,
+    TX_TYPE_INTER_INV_SET1, TX_TYPE_INTER_INV_SET2, TX_TYPE_INTER_INV_SET3, TX_TYPE_INTRA_INV_SET1,
+    TX_TYPE_INTRA_INV_SET2,
+};
 // r182: §7.13 inverse transform (av1-spec p.295-307) — the
 // `inverse_transform_2d` 2D dispatcher consumes the §7.12.3 step-1
 // `Dequant[][]` buffer (placeholder identity-dequant of `Quant[]`
