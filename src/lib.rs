@@ -1333,6 +1333,72 @@
 //!     composite remain the next round's targets. `decode_av1` /
 //!     `encode_av1` continue to return `Error::NotImplemented`.
 //!
+//!   * **Round 166.** The §5.11.5 `decode_block()` syntax-walker
+//!     skeleton (av1-spec p.63-64) — the missing dispatcher that
+//!     the §5.11.4 partition walker recurses into at every leaf.
+//!     Lands as a new [`cdf::PartitionWalker::decode_block_syntax`]
+//!     method that performs the §5.11.5 prologue (`MiRow`, `MiCol`,
+//!     `MiSize`, `bw4`, `bh4`; the `HasChroma` three-arm dispatch
+//!     on `bh4 == 1 && subsampling_y && (MiRow & 1) == 0` and
+//!     `bw4 == 1 && subsampling_x && (MiCol & 1) == 0`; `AvailU`,
+//!     `AvailL`, `AvailUChroma`, `AvailLChroma` derivation with the
+//!     spec's chroma fix-up arm) and the §5.11.6 `mode_info()`
+//!     intra arm composed from r161's
+//!     [`cdf::PartitionWalker::decode_intra_frame_mode_info_prefix`],
+//!     r164's [`cdf::PartitionWalker::decode_use_intrabc`], and
+//!     r165's [`cdf::PartitionWalker::decode_intra_frame_y_mode`].
+//!     The §5.11.49 `palette_tokens()` call is a no-op on the
+//!     no-palette path. Short-circuits at the §5.11.16
+//!     `read_block_tx_size()` call with a new
+//!     [`Error::DecodeBlockReadBlockTxSizeUnsupported`] — the
+//!     immediate next-round target.
+//!
+//!     Four new [`Error`] variants surface the §5.11.5 next-round
+//!     boundaries one-to-one:
+//!     [`Error::DecodeBlockInterFrameUnsupported`] (§5.11.18
+//!     `inter_frame_mode_info()`, fires on `frame_is_intra = false`
+//!     with zero bits consumed);
+//!     [`Error::DecodeBlockReadBlockTxSizeUnsupported`] (§5.11.16,
+//!     the stub the walker actually reaches);
+//!     [`Error::DecodeBlockComputePredictionUnsupported`] (§5.11.30,
+//!     reserved for the round that lands §5.11.16); and
+//!     [`Error::DecodeBlockResidualUnsupported`] (§5.11.34,
+//!     reserved for the round that lands §5.11.30).
+//!
+//!     New [`cdf::DecodedBlock`] per-block aggregate — publicly
+//!     constructible — carries the §5.11.5 prologue + §5.11.7
+//!     mode-info derivations on the no-stub path. Reachable once
+//!     §5.11.16 lands.
+//!
+//!     §5.11.4 partition driver mirror:
+//!     [`cdf::PartitionWalker::decode_partition_syntax`] walks the
+//!     same recursion shape as
+//!     [`cdf::PartitionWalker::decode_partition`] but routes every
+//!     leaf through `decode_block_syntax` instead of the leaf-only
+//!     emitter. Stub propagates from the first leaf that fires it.
+//!
+//!     10 new integration tests
+//!     (`tests/decode_block_syntax_walker.rs`) cover the §5.11.5
+//!     prologue's three-arm `HasChroma` dispatch on `BLOCK_4X4`,
+//!     the §5.11.6 inter-arm stub, the §5.11.7 `SegIdPreSkip`
+//!     pre-skip arm reaching the §5.11.16 stub after the composed
+//!     reads fire in spec order, out-of-range guards, the §5.11.4
+//!     partition driver's `BLOCK_4X4` short-circuit arm propagating
+//!     the stub, the §5.11.4 `r >= MiRows` line-1 early return,
+//!     `DecodedBlock` public-API constructibility, `BLOCK_8X16`
+//!     grid-fill footprint (bw4 = 2, bh4 = 4), and `BLOCK_16X16`
+//!     with `cdef_bits = 2` exercising the §5.11.56 literal-bits
+//!     read.
+//!
+//!     The §5.11.7 follow-on `else`-arm elements
+//!     (`intra_angle_info_y`, `uv_mode`, `read_cfl_alphas`,
+//!     `intra_angle_info_uv`, `palette_mode_info`,
+//!     `filter_intra_mode_info`) and the `use_intrabc == 1`
+//!     MV-stack / assign-mv body remain bounded leaf targets that
+//!     can be slotted into a future round before or alongside
+//!     §5.11.16. `decode_av1` / `encode_av1` continue to return
+//!     [`Error::NotImplemented`].
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -1363,32 +1429,33 @@ pub use cdf::{
     palette_color_ctx, palette_tokens_args, palette_tokens_plane, palette_uv_mode_ctx,
     palette_y_mode_ctx, partition_ctx, partition_subsize, ref_count_ctx, segment_id_ctx,
     size_group, skip_ctx, skip_mode_ctx, split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx,
-    txfm_split_ctx, DecodedBlockRecord, IntraFrameModeInfoPrefix, PaletteColorContext,
-    PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext, TileGeometry,
-    ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16,
-    BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64,
-    BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32,
-    BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS,
-    CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET,
-    COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS, COMPOUND_MODES,
-    COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES, COMP_GROUP_IDX_CONTEXTS,
-    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DCT_ADST, DCT_DCT, DCT_FLIPADST,
-    DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF,
-    DEFAULT_COEFF_BASE_CDF, DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF,
-    DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF,
-    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF,
-    DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF,
-    DEFAULT_DELTA_Q_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF,
-    DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF,
-    DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF,
-    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF,
-    DEFAULT_INTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF,
-    DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRABC_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
-    DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF,
-    DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
-    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
-    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
+    txfm_split_ctx, DecodedBlock, DecodedBlockRecord, IntraFrameModeInfoPrefix,
+    PaletteColorContext, PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext,
+    TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128,
+    BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16,
+    BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128,
+    BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8,
+    BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE,
+    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
+    COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
+    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
+    COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
+    DCT_ADST, DCT_DCT, DCT_FLIPADST, DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF,
+    DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COEFF_BASE_CDF,
+    DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF, DEFAULT_COMPOUND_IDX_CDF,
+    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF,
+    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
+    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF,
+    DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF,
+    DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF,
+    DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF,
+    DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF, DEFAULT_INTER_INTRA_MODE_CDF,
+    DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF,
+    DEFAULT_INTRABC_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF,
+    DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF,
+    DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
+    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
+    DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
     DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,
@@ -1545,6 +1612,43 @@ pub enum Error {
     /// [`crate::PARTITION_SUBSIZE`] table values, so a conformant
     /// driver never produces one.
     PartitionWalkOutOfRange,
+    /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
+    /// walker reached the §5.11.6 `mode_info()` inter-frame arm
+    /// (`FrameIsIntra == 0`) — §5.11.18 `inter_frame_mode_info()` is
+    /// the next round's target and currently STUBBED. Triggered by
+    /// calling the syntax walker with `frame_is_intra = false`. The
+    /// keyframe / intra-only path (`frame_is_intra = true`) routes
+    /// through the implemented intra arm and never produces this.
+    DecodeBlockInterFrameUnsupported,
+    /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
+    /// walker reached the §5.11.16 `read_block_tx_size()` call — the
+    /// per-block transform-size syntax-tree read. The §5.11.15 /
+    /// §5.11.16 / §5.11.17 transform-tree readers are the next
+    /// round's target and currently STUBBED. The walker has completed
+    /// the §5.11.5 prologue + §5.11.6 `mode_info()` (intra arm) +
+    /// §5.11.49 `palette_tokens()` (no-op on the no-palette path) up
+    /// to but not including this call.
+    DecodeBlockReadBlockTxSizeUnsupported,
+    /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
+    /// walker reached the §5.11.30 `compute_prediction()` call — the
+    /// per-block intra / inter prediction sample-generation pass.
+    /// `compute_prediction()` and its §7.11 sub-routines are the next
+    /// round's target and currently STUBBED. Currently unreachable
+    /// from `decode_block_syntax` because the walker short-circuits
+    /// at [`Error::DecodeBlockReadBlockTxSizeUnsupported`] first; reserved
+    /// for the round that lands `read_block_tx_size()` and exposes
+    /// this stub.
+    DecodeBlockComputePredictionUnsupported,
+    /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
+    /// walker reached the §5.11.34 `residual()` call — the per-block
+    /// transform-coefficient read + inverse-transform + reconstruction
+    /// pass. `residual()` and its §7.12 sub-routines are the next
+    /// round's target and currently STUBBED. Currently unreachable
+    /// from `decode_block_syntax` because the walker short-circuits
+    /// at [`Error::DecodeBlockReadBlockTxSizeUnsupported`] first; reserved
+    /// for the round that lands `compute_prediction()` and exposes
+    /// this stub.
+    DecodeBlockResidualUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -1607,6 +1711,22 @@ impl core::fmt::Display for Error {
             Self::PartitionWalkOutOfRange => write!(
                 f,
                 "oxideav-av1: §5.11.4 decode_partition walker hit an out-of-range bSize / partition / bsl / Partition_Subsize lookup"
+            ),
+            Self::DecodeBlockInterFrameUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.5 decode_block reached §5.11.6 mode_info inter-frame arm — §5.11.18 inter_frame_mode_info() pending next round"
+            ),
+            Self::DecodeBlockReadBlockTxSizeUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.5 decode_block reached §5.11.16 read_block_tx_size() — §5.11.15 / §5.11.16 / §5.11.17 transform-tree readers pending next round"
+            ),
+            Self::DecodeBlockComputePredictionUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.5 decode_block reached §5.11.30 compute_prediction() — intra / inter prediction sample generation pending next round"
+            ),
+            Self::DecodeBlockResidualUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.5 decode_block reached §5.11.34 residual() — transform-coefficient read + reconstruction pending next round"
             ),
         }
     }

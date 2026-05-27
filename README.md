@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 165)
+## Status — 2026-05-27 (round 166)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,93 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 166 lands the §5.11.5 **`decode_block()` syntax-walker
+skeleton** (av1-spec p.63-64) — the missing dispatcher that the
+§5.11.4 partition walker recurses into at every leaf. Exposed as a
+new `PartitionWalker::decode_block_syntax` method that performs the
+§5.11.5 prologue (`MiRow` / `MiCol` / `MiSize` / `bw4` / `bh4` /
+`HasChroma` three-arm dispatch / `AvailU` / `AvailL` /
+`AvailUChroma` / `AvailLChroma` with the chroma fix-up arms for
+sub-sampled 1×1 edge cases) and the §5.11.6 `mode_info()` intra arm
+(routed through the implemented `decode_intra_frame_mode_info_prefix`
++ `decode_use_intrabc` + `decode_intra_frame_y_mode` composition,
+plus the `use_intrabc == 1` short-circuit's `YMode = DC_PRED` /
+`is_inter = 1` fixed assignments). The §5.11.49 `palette_tokens()`
+call is a no-op on the no-palette path reachable while
+`palette_mode_info()` remains unimplemented (the spec's outer `if
+( PaletteSize{Y,UV} )` guard short-circuits). After the mode-info
+pass completes the walker emits a `DecodedBlockRecord` leaf (same
+as `decode_partition`'s leaf emitter) and short-circuits at the
+§5.11.16 `read_block_tx_size()` call with a new
+`Error::DecodeBlockReadBlockTxSizeUnsupported` variant — the
+immediate next-round target.
+
+Four new `Error` stub variants surface the §5.11.5 next-round
+boundaries one-to-one: `DecodeBlockInterFrameUnsupported` (§5.11.18
+inter_frame_mode_info, fires on `frame_is_intra = false` with zero
+bits consumed); `DecodeBlockReadBlockTxSizeUnsupported` (§5.11.16
+read_block_tx_size, the immediate next stub); and the reserved
+`DecodeBlockComputePredictionUnsupported` (§5.11.30) and
+`DecodeBlockResidualUnsupported` (§5.11.34) variants for the rounds
+that land §5.11.16 → §5.11.30 → §5.11.34 in turn.
+
+New `DecodedBlock` per-block aggregate carries the §5.11.5 prologue
++ §5.11.7 mode-info derivations (`mi_row` / `mi_col` / `mi_size` /
+`bw4` / `bh4` / `has_chroma` / `avail_u` / `avail_l` /
+`avail_u_chroma` / `avail_l_chroma` + the `IntraFrameModeInfoPrefix`
+fields + `use_intrabc` / `is_inter` / `y_mode` / `is_compound`).
+Constructible publicly so the round that lands §5.11.16 can return
+it from the no-stub path.
+
+Partition-walker driver: a new
+`PartitionWalker::decode_partition_syntax` method mirrors the
+§5.11.4 recursion of `decode_partition` exactly (same partition
+symbol reads, same `partition_subsize` dispatch, same edge-of-frame
+fall-throughs) but routes every `decode_block( r, c, sz )` leaf
+call through `decode_block_syntax` instead of the leaf-only emitter.
+On a stub the recursion short-circuits with the stub variant; grid
+stamps stamped before the short-circuit remain observable on the
+walker's grid accessors.
+
+10 new integration tests
+(`tests/decode_block_syntax_walker.rs`): the baseline
+keyframe / no-segmentation / no-screen-content path reaches the
+§5.11.16 stub after consuming the §5.11.11 skip + §5.11.7
+`intra_frame_y_mode` bits + emitting one leaf record with the
+expected mi-grid stamps; the §5.11.5 prologue `HasChroma` three-arm
+dispatch on `BLOCK_4X4` (subsampling-y / subsampling-x / fall-
+through); the §5.11.6 inter-frame arm surfaces the §5.11.18 stub
+with zero bits consumed and no leaf record; the §5.11.7
+`SegIdPreSkip = true` arm reaches the stub after the pre-skip
+`intra_segment_id` + `read_skip` pair fire in spec order;
+out-of-range guard symmetry (`mi_row` / `mi_col` / `sub_size`); the
+§5.11.4 partition driver routes a `BLOCK_4X4` superblock (the
+`< BLOCK_8X8` short-circuit arm) through `decode_block_syntax` and
+propagates the stub; the §5.11.4 `r >= MiRows` early return
+short-circuits cleanly; `DecodedBlock` public-API constructibility;
+`BLOCK_8X16` grid-fill footprint (bw4 = 2, bh4 = 4) at the frame
+origin; `BLOCK_16X16` with `cdef_bits = 2` exercises the §5.11.56
+literal-bits read path.
+
+The §5.11.5 calls that are STUBBED with `NotImplemented`-class
+errors and become the next round's targets:
+
+* **§5.11.16 `read_block_tx_size()`** + its §5.11.15 / §5.11.17
+  sub-tree — the immediate next-round target.
+* **§5.11.18 `inter_frame_mode_info()`** — the inter arm of
+  §5.11.6 `mode_info()`.
+* **§5.11.30 `compute_prediction()`** — reachable once §5.11.16
+  lands.
+* **§5.11.34 `residual()`** — reachable once §5.11.30 lands.
+
+The §5.11.7 follow-on `else`-arm elements (`intra_angle_info_y`,
+`uv_mode`, `read_cfl_alphas`, `intra_angle_info_uv`,
+`palette_mode_info`, `filter_intra_mode_info`) and the `use_intrabc
+== 1` MV-stack / assign-mv body remain bounded leaf targets that
+can be slotted into a future round before or alongside §5.11.16.
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 165 lands the §5.11.7 / §5.11.22 **`intra_frame_y_mode` syntax
 element** (av1-spec p.65) as a new

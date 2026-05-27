@@ -13789,6 +13789,699 @@ impl PartitionWalker {
 
         Ok(y_mode)
     }
+
+    /// `decode_block( r, c, subSize )` per §5.11.5 (av1-spec p.63-64)
+    /// — the per-block syntax-walker entry. This is the
+    /// long-skeleton-with-stubs sibling of the leaf-only
+    /// [`Self::decode_block`] used internally by
+    /// [`Self::decode_partition`].
+    ///
+    /// The spec body (av1-spec p.63-64) reads:
+    ///
+    /// ```text
+    ///   decode_block( r, c, subSize ) {
+    ///       MiRow = r
+    ///       MiCol = c
+    ///       MiSize = subSize
+    ///       bw4 = Num_4x4_Blocks_Wide[ subSize ]
+    ///       bh4 = Num_4x4_Blocks_High[ subSize ]
+    ///       if ( bh4 == 1 && subsampling_y && (MiRow & 1) == 0 )
+    ///           HasChroma = 0
+    ///       else if ( bw4 == 1 && subsampling_x && (MiCol & 1) == 0 )
+    ///           HasChroma = 0
+    ///       else
+    ///           HasChroma = NumPlanes > 1
+    ///       AvailU = is_inside( r - 1, c )
+    ///       AvailL = is_inside( r, c - 1 )
+    ///       AvailUChroma = AvailU
+    ///       AvailLChroma = AvailL
+    ///       if ( HasChroma ) {
+    ///           if ( subsampling_y && bh4 == 1 )
+    ///               AvailUChroma = is_inside( r - 2, c )
+    ///           if ( subsampling_x && bw4 == 1 )
+    ///               AvailLChroma = is_inside( r, c - 2 )
+    ///       } else {
+    ///           AvailUChroma = 0
+    ///           AvailLChroma = 0
+    ///       }
+    ///       mode_info( )
+    ///       palette_tokens( )
+    ///       read_block_tx_size( )
+    ///       if ( skip )
+    ///           reset_block_context( bw4, bh4 )
+    ///       isCompound = RefFrame[ 1 ] > INTRA_FRAME
+    ///       … per-block grid fills for YModes / UVModes / RefFrames /
+    ///         (inter) CompGroupIdxs / CompoundIdxs / InterpFilters / Mvs …
+    ///       compute_prediction( )
+    ///       residual( )
+    ///       … per-block grid fills for IsInters / SkipModes / Skips /
+    ///         TxSizes / MiSizes / SegmentIds / PaletteSizes /
+    ///         PaletteColors / DeltaLFs …
+    ///   }
+    /// ```
+    ///
+    /// Implemented in this round:
+    ///
+    /// * §5.11.5 **prologue** — `MiRow` / `MiCol` / `MiSize` are
+    ///   caller-passed; `bw4` / `bh4` derived from
+    ///   [`NUM_4X4_BLOCKS_WIDE`] / [`NUM_4X4_BLOCKS_HIGH`]; `HasChroma`
+    ///   derived from the spec's three-arm dispatch on
+    ///   `subsampling_{x,y}` / `bw4` / `bh4` / `NumPlanes`; `AvailU` /
+    ///   `AvailL` from [`TileGeometry::is_inside`]; `AvailUChroma` /
+    ///   `AvailLChroma` from the chroma fix-up arm (`subsampling_y &&
+    ///   bh4 == 1` ⇒ `is_inside( r - 2, c )`, etc.).
+    /// * §5.11.6 **`mode_info()`** — `FrameIsIntra == 1` (key /
+    ///   intra-only frames) routes through
+    ///   [`Self::decode_intra_frame_mode_info_prefix`] (§5.11.7
+    ///   `intra_frame_mode_info`, lines 1-10) +
+    ///   [`Self::decode_use_intrabc`] (§5.11.7 `use_intrabc` element) +
+    ///   [`Self::decode_intra_frame_y_mode`] (§5.11.7 `else` arm
+    ///   `intra_frame_y_mode` element). The §5.11.7 follow-on body
+    ///   (`intra_angle_info_y`, `uv_mode`, `intra_angle_info_uv`,
+    ///   `palette_mode_info`, `filter_intra_mode_info`, plus the
+    ///   `use_intrabc == 1` arm body) and the §5.11.18
+    ///   `inter_frame_mode_info()` inter arm are next-round targets;
+    ///   the walker fast-paths past them on the keyframe + non-screen-
+    ///   content + non-intrabc case used by this round's test fixture
+    ///   and returns [`crate::Error::DecodeBlockInterFrameUnsupported`]
+    ///   on a `frame_is_intra = false` call.
+    /// * §5.11.5 **`palette_tokens()`** — gated by the §5.11.49
+    ///   `if ( PaletteSize{Y,UV} )` guard. On the no-palette path
+    ///   (`PaletteSize{Y,UV} == 0`, which is the only path reachable
+    ///   while `palette_mode_info()` remains unimplemented) the call
+    ///   is a no-op per the spec's outer guard. The §5.11.49
+    ///   [`palette_tokens_plane`] machinery itself already exists; it
+    ///   is exposed for once `palette_mode_info()` lands.
+    /// * §5.11.5 grid-fill **for the writes the walker computed** —
+    ///   `YModes[][]`, `RefFrames[][][0..2]`, `IsInters[][]`,
+    ///   `SkipModes[][]`, `Skips[][]`, `MiSizes[][]`, `SegmentIds[][]`
+    ///   already happen inside the composed leaves (the §5.11.5
+    ///   per-element grid-fill loops are factored into each leaf's
+    ///   own write). The walker additionally records the §5.11.5
+    ///   `IsCompound = RefFrame[1] > INTRA_FRAME` derivation (always
+    ///   `false` on the intra arm because `RefFrame[1] = NONE`).
+    ///
+    /// STUBBED in this round (each becomes the next round's target):
+    ///
+    /// * §5.11.16 [`crate::Error::DecodeBlockReadBlockTxSizeUnsupported`]
+    ///   — `read_block_tx_size()` and its §5.11.17 `read_var_tx_size`
+    ///   sub-tree. The walker hits this stub after the mode-info pass
+    ///   completes; the test fixture verifies the bitstream cursor is
+    ///   at the post-mode-info position when the error fires.
+    /// * §5.11.18 [`crate::Error::DecodeBlockInterFrameUnsupported`]
+    ///   — `inter_frame_mode_info()` for `FrameIsIntra == 0`.
+    /// * §5.11.30 [`crate::Error::DecodeBlockComputePredictionUnsupported`]
+    ///   — `compute_prediction()` (intra / inter prediction sample
+    ///   generation). Reachable once §5.11.16 lands.
+    /// * §5.11.34 [`crate::Error::DecodeBlockResidualUnsupported`] —
+    ///   `residual()` (transform-coefficient read + inverse-transform
+    ///   + reconstruction). Reachable once §5.11.30 lands.
+    ///
+    /// On the implemented prologue + intra mode-info path the walker
+    /// runs the same §8.3.2 / §5.11.x bitstream reads a conforming
+    /// decoder performs, then short-circuits at the first §5.11.5
+    /// post-mode-info stub. Successive landings of
+    /// `read_block_tx_size()` → `compute_prediction()` → `residual()`
+    /// extend the walker further into §5.11.5 without changing the
+    /// implemented surface or the §5.11.5 prologue / §5.11.6 dispatch
+    /// behaviour.
+    ///
+    /// ## Caller contract
+    ///
+    /// The §5.11.5 grid stamps that already happen in the composed
+    /// leaves (Skips / SkipModes / SegmentIds / MiSizes / YModes /
+    /// IsInters / cdef_idx) are observable on the walker's grid
+    /// accessors after a successful call. The §5.11.5 per-block
+    /// grid stamps that this round does NOT cover (`UVModes` /
+    /// `RefFrames` / `CompGroupIdxs` / `CompoundIdxs` /
+    /// `InterpFilters` / `Mvs` / `TxSizes` / `PaletteSizes` /
+    /// `PaletteColors` / `DeltaLFs`) need their own walker fields and
+    /// land in the round that implements their writers.
+    ///
+    /// On the stub paths the walker still emits a
+    /// [`DecodedBlockRecord`] leaf (the same one
+    /// [`Self::decode_partition`] would emit) so callers can observe
+    /// the §5.11.5 entry through [`Self::blocks`] regardless of the
+    /// stub fire site.
+    ///
+    /// Returns the §5.11.5 per-block derived state ([`DecodedBlock`])
+    /// on the no-stub path. Returns a §5.11.5 stub variant of
+    /// [`crate::Error`] when the walker reaches a next-round target,
+    /// or [`crate::Error::PartitionWalkOutOfRange`] for caller bugs
+    /// (out-of-range `sub_size`, `mi_row` / `mi_col` outside the
+    /// frame's mi extent).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_block_syntax(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        // §5.11.6 dispatch — `FrameIsIntra` (§5.9.4 derivation):
+        // true ⇔ frame_type ∈ {KEY_FRAME, INTRA_ONLY_FRAME}.
+        frame_is_intra: bool,
+        // §5.11.5 prologue — sequence-header chroma derivation
+        // (§5.5.2): `subsampling_x` / `subsampling_y` are 0/1, and
+        // `NumPlanes = mono_chrome ? 1 : 3`.
+        subsampling_x: u8,
+        subsampling_y: u8,
+        num_planes: u8,
+        // §5.11.7 / §5.11.8 dispatcher gates — caller threads these
+        // through to `decode_intra_frame_mode_info_prefix`. Field
+        // semantics match the §5.11.7 dispatcher (av1-spec p.65).
+        seg_id_pre_skip: bool,
+        segmentation_enabled: bool,
+        seg_skip_active: bool,
+        last_active_seg_id: u8,
+        lossless_array: &[bool; MAX_SEGMENTS],
+        coded_lossless: bool,
+        enable_cdef: bool,
+        allow_intrabc: bool,
+        cdef_bits: u32,
+        read_deltas: bool,
+        use_128x128_superblock: bool,
+        delta_q_res: u8,
+        delta_lf_present: bool,
+        delta_lf_multi: bool,
+        mono_chrome: bool,
+        delta_lf_res: u8,
+    ) -> Result<DecodedBlock, crate::Error> {
+        // §5.11.5 prologue — range guards (caller-bug detection).
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.5 lines 1-3: `MiRow = r`, `MiCol = c`, `MiSize =
+        // subSize`. We surface these as fields of the returned
+        // `DecodedBlock` rather than mutating any shared state — the
+        // spec's `MiRow` / `MiCol` / `MiSize` are per-block "current
+        // block coordinates" passed implicitly to every sub-routine,
+        // and our composed leaves take them as explicit arguments.
+        let mi_row_b = mi_row;
+        let mi_col_b = mi_col;
+        let mi_size = sub_size;
+
+        // §5.11.5 lines 4-5: `bw4 = Num_4x4_Blocks_Wide[ subSize ]`,
+        // `bh4 = Num_4x4_Blocks_High[ subSize ]`. Bounded by
+        // [`NUM_4X4_BLOCKS_WIDE`] / [`NUM_4X4_BLOCKS_HIGH`]'s spec
+        // values (1..=32).
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+
+        // §5.11.5 lines 6-13: `HasChroma` three-arm dispatch (spec
+        // text):
+        //   if ( bh4 == 1 && subsampling_y && (MiRow & 1) == 0 )
+        //       HasChroma = 0
+        //   else if ( bw4 == 1 && subsampling_x && (MiCol & 1) == 0 )
+        //       HasChroma = 0
+        //   else
+        //       HasChroma = NumPlanes > 1
+        // The first two arms both yield `false`; we collapse them
+        // into a single `if` with an `||` to satisfy clippy's
+        // `if_same_then_else` lint while preserving the spec's
+        // semantics one-to-one. The collapsed condition reads as
+        // "either chroma-edge-case fires".
+        let chroma_y_edge_case = bh4 == 1 && subsampling_y != 0 && (mi_row_b & 1) == 0;
+        let chroma_x_edge_case = bw4 == 1 && subsampling_x != 0 && (mi_col_b & 1) == 0;
+        let has_chroma = if chroma_y_edge_case || chroma_x_edge_case {
+            false
+        } else {
+            num_planes > 1
+        };
+
+        // §5.11.5 lines 14-17: `AvailU` / `AvailL` / `AvailUChroma` /
+        // `AvailLChroma` derivation.
+        let avail_u = self
+            .geometry
+            .is_inside(mi_row_b as i32 - 1, mi_col_b as i32);
+        let avail_l = self
+            .geometry
+            .is_inside(mi_row_b as i32, mi_col_b as i32 - 1);
+        let (avail_u_chroma, avail_l_chroma) = if has_chroma {
+            // §5.11.5 lines 18-21: chroma fix-ups for the
+            // `subsampling_y && bh4 == 1` (chroma above-neighbour is
+            // two rows up) and `subsampling_x && bw4 == 1` (chroma
+            // left-neighbour is two columns left) edge cases.
+            let auc = if subsampling_y != 0 && bh4 == 1 {
+                self.geometry
+                    .is_inside(mi_row_b as i32 - 2, mi_col_b as i32)
+            } else {
+                avail_u
+            };
+            let alc = if subsampling_x != 0 && bw4 == 1 {
+                self.geometry
+                    .is_inside(mi_row_b as i32, mi_col_b as i32 - 2)
+            } else {
+                avail_l
+            };
+            (auc, alc)
+        } else {
+            // §5.11.5 lines 22-25: `AvailUChroma = 0`,
+            // `AvailLChroma = 0` for the no-chroma block (sub-8 luma
+            // edge cases).
+            (false, false)
+        };
+
+        // §5.11.5 line `mode_info( )` — §5.11.6 dispatch. The
+        // implemented intra-frame arm composes the §5.11.7
+        // `intra_frame_mode_info` body through the
+        // `decode_intra_frame_mode_info_prefix` dispatcher (lines 1-10:
+        // `skip = 0`, `intra_segment_id`, `skip_mode = 0`, `read_skip`,
+        // post-skip `intra_segment_id`, `read_cdef`, `read_delta_qindex`,
+        // `read_delta_lf`, `ReadDeltas = 0`, `RefFrame[0] = INTRA_FRAME`,
+        // `RefFrame[1] = NONE`); then the `use_intrabc` element; then
+        // — on the implemented `use_intrabc == 0` / `allow_intrabc ==
+        // false` arm — the `intra_frame_y_mode` element. The §5.11.7
+        // follow-on body (`intra_angle_info_y`, `uv_mode`,
+        // `intra_angle_info_uv`, `palette_mode_info`,
+        // `filter_intra_mode_info`) and the `use_intrabc == 1` body
+        // are the next round's targets.
+        if !frame_is_intra {
+            return Err(crate::Error::DecodeBlockInterFrameUnsupported);
+        }
+        let prefix = self.decode_intra_frame_mode_info_prefix(
+            decoder,
+            cdfs,
+            mi_row_b,
+            mi_col_b,
+            sub_size,
+            seg_id_pre_skip,
+            segmentation_enabled,
+            seg_skip_active,
+            last_active_seg_id,
+            lossless_array,
+            coded_lossless,
+            enable_cdef,
+            allow_intrabc,
+            cdef_bits,
+            read_deltas,
+            use_128x128_superblock,
+            delta_q_res,
+            delta_lf_present,
+            delta_lf_multi,
+            mono_chrome,
+            delta_lf_res,
+        )?;
+        let use_intrabc =
+            self.decode_use_intrabc(decoder, cdfs, mi_row_b, mi_col_b, sub_size, allow_intrabc)?;
+        let (y_mode, is_inter) = if use_intrabc != 0 {
+            // §5.11.7 `use_intrabc == 1` body — sets `is_inter = 1`,
+            // `YMode = DC_PRED`, `UVMode = DC_PRED`, `PaletteSize{Y,UV}
+            // = 0`, `interp_filter[0..2] = BILINEAR`, and calls
+            // `find_mv_stack(0)` + `assign_mv(0)`. The MV stack /
+            // assign-mv path is a separate next-round target — for
+            // now we record the fixed `YMode = DC_PRED` /
+            // `is_inter = 1` assignments and surface them in the
+            // returned `DecodedBlock`. The MV stamps over
+            // `Mvs[][][0]` / `InterpFilters[][][0..2]` aren't yet
+            // tracked on the walker; they land with the MV-stack
+            // round.
+            (0u8 /* DC_PRED */, 1u8)
+        } else {
+            // §5.11.7 `else` arm — reads `intra_frame_y_mode` (the
+            // r165 `decode_intra_frame_y_mode` leaf). The `is_inter
+            // = 0` assignment is implicit in the `else` arm
+            // (`intra_frame_mode_info` line `is_inter = 0`).
+            let y_mode =
+                self.decode_intra_frame_y_mode(decoder, cdfs, mi_row_b, mi_col_b, sub_size)?;
+            (y_mode, 0u8)
+        };
+
+        // §5.11.5 line `palette_tokens( )` — §5.11.49 outer guard is
+        // `if ( PaletteSizeY ) ... if ( PaletteSizeUV ) ...`. On the
+        // currently-reachable path `palette_mode_info()` is not yet
+        // wired, so `PaletteSize{Y,UV} == 0` and the spec's outer
+        // guard short-circuits palette_tokens to a no-op. The
+        // [`palette_tokens_plane`] machinery is the standalone leaf
+        // ready for the round that lands `palette_mode_info()`.
+        //
+        // (No work here on the no-palette path — the spec body
+        // doesn't gate `read_block_tx_size()` on the palette result.)
+
+        // §5.11.5 line `read_block_tx_size( )` — §5.11.16 STUB. The
+        // walker has completed the §5.11.5 prologue + §5.11.6
+        // `mode_info()` (intra arm) + §5.11.49 `palette_tokens()`
+        // (no-op) and emits a [`DecodedBlockRecord`] so callers can
+        // observe the §5.11.5 entry through [`Self::blocks`].
+        self.decode_block(mi_row_b, mi_col_b, sub_size);
+
+        // The §5.11.5 / §5.11.6 / §5.11.7 reads above are all
+        // accounted for on the decoder's bit cursor; the next call
+        // is §5.11.16 `read_block_tx_size( )` and onwards. Surface
+        // the per-block derived state in the returned `DecodedBlock`
+        // before short-circuiting at the stub so the test fixture
+        // (and any future caller that ignores the stub) can observe
+        // the implemented prologue's outputs.
+        let _ = DecodedBlock {
+            mi_row: mi_row_b,
+            mi_col: mi_col_b,
+            mi_size,
+            bw4,
+            bh4,
+            has_chroma,
+            avail_u,
+            avail_l,
+            avail_u_chroma,
+            avail_l_chroma,
+            skip: prefix.skip,
+            skip_mode: prefix.skip_mode,
+            segment_id: prefix.segment_id,
+            lossless: prefix.lossless,
+            cdef_idx: prefix.cdef_idx,
+            current_q_index: prefix.current_q_index,
+            current_delta_lf: prefix.current_delta_lf,
+            ref_frame: prefix.ref_frame,
+            use_intrabc,
+            is_inter,
+            y_mode,
+            is_compound: false, // §5.11.5: RefFrame[1] = NONE ⇒ IsCompound = false
+        };
+        Err(crate::Error::DecodeBlockReadBlockTxSizeUnsupported)
+    }
+
+    /// `decode_partition_syntax( r, c, bSize )` — §5.11.4 partition
+    /// tree walker that calls [`Self::decode_block_syntax`] at every
+    /// leaf (instead of the leaf-only [`Self::decode_block`] used by
+    /// [`Self::decode_partition`]).
+    ///
+    /// Same recursive shape as [`Self::decode_partition`]: identical
+    /// `partition` / `split_or_horz` / `split_or_vert` symbol reads,
+    /// identical `partition_subsize` dispatch, identical edge-of-frame
+    /// fall-throughs. The only difference is that at every
+    /// `decode_block` call site in the §5.11.4 partition-decode
+    /// pseudocode we route through [`Self::decode_block_syntax`] —
+    /// which performs the §5.11.5 syntax walk for the leaf — instead
+    /// of the leaf-only emitter.
+    ///
+    /// On the first leaf that hits a §5.11.5 stub the walker
+    /// short-circuits with the stub variant of [`crate::Error`]. The
+    /// partition state stamped before the short-circuit (every leaf
+    /// that succeeded fully) remains observable on the grid
+    /// accessors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_partition_syntax(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        r: u32,
+        c: u32,
+        b_size: usize,
+        frame_is_intra: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        num_planes: u8,
+        seg_id_pre_skip: bool,
+        segmentation_enabled: bool,
+        seg_skip_active: bool,
+        last_active_seg_id: u8,
+        lossless_array: &[bool; MAX_SEGMENTS],
+        coded_lossless: bool,
+        enable_cdef: bool,
+        allow_intrabc: bool,
+        cdef_bits: u32,
+        read_deltas: bool,
+        use_128x128_superblock: bool,
+        delta_q_res: u8,
+        delta_lf_present: bool,
+        delta_lf_multi: bool,
+        mono_chrome: bool,
+        delta_lf_res: u8,
+    ) -> Result<(), crate::Error> {
+        // §5.11.4 line 1: `if ( r >= MiRows || c >= MiCols ) return 0`.
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return Ok(());
+        }
+        if b_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let num4x4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+        let half_block4x4 = num4x4 >> 1;
+        let quarter_block4x4 = half_block4x4 >> 1;
+        let has_rows = (r + half_block4x4) < self.mi_rows;
+        let has_cols = (c + half_block4x4) < self.mi_cols;
+
+        // §5.11.4 partition decode (mirrors `decode_partition`).
+        let partition = if b_size < BLOCK_8X8 {
+            PARTITION_NONE
+        } else {
+            let bsl = MI_WIDTH_LOG2[b_size] as u32;
+            let pctx = self.partition_ctx_for(r, c, bsl);
+            if has_rows && has_cols {
+                let cdf = cdfs
+                    .partition_cdf(bsl, pctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                decoder.read_symbol(cdf)? as usize
+            } else if has_cols {
+                let cdf_row = cdfs
+                    .partition_cdf(bsl, pctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let mut bin = split_or_horz_cdf(cdf_row, b_size)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let s = decoder.read_symbol(&mut bin)?;
+                if s == 0 {
+                    PARTITION_HORZ
+                } else {
+                    PARTITION_SPLIT
+                }
+            } else if has_rows {
+                let cdf_row = cdfs
+                    .partition_cdf(bsl, pctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let mut bin = split_or_vert_cdf(cdf_row, b_size)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let s = decoder.read_symbol(&mut bin)?;
+                if s == 0 {
+                    PARTITION_VERT
+                } else {
+                    PARTITION_SPLIT
+                }
+            } else {
+                PARTITION_SPLIT
+            }
+        };
+
+        let sub_size =
+            partition_subsize(partition, b_size).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let split_size = partition_subsize(PARTITION_SPLIT, b_size);
+
+        // Helper closure-style call site: every `decode_block( r, c,
+        // sz )` in the §5.11.4 pseudocode routes through
+        // `decode_block_syntax`.
+        macro_rules! db {
+            ($self:ident, $r:expr, $c:expr, $sz:expr) => {
+                $self.decode_block_syntax(
+                    decoder,
+                    cdfs,
+                    $r,
+                    $c,
+                    $sz,
+                    frame_is_intra,
+                    subsampling_x,
+                    subsampling_y,
+                    num_planes,
+                    seg_id_pre_skip,
+                    segmentation_enabled,
+                    seg_skip_active,
+                    last_active_seg_id,
+                    lossless_array,
+                    coded_lossless,
+                    enable_cdef,
+                    allow_intrabc,
+                    cdef_bits,
+                    read_deltas,
+                    use_128x128_superblock,
+                    delta_q_res,
+                    delta_lf_present,
+                    delta_lf_multi,
+                    mono_chrome,
+                    delta_lf_res,
+                )?
+            };
+        }
+
+        match partition {
+            PARTITION_NONE => {
+                db!(self, r, c, sub_size);
+            }
+            PARTITION_HORZ => {
+                db!(self, r, c, sub_size);
+                if has_rows {
+                    db!(self, r + half_block4x4, c, sub_size);
+                }
+            }
+            PARTITION_VERT => {
+                db!(self, r, c, sub_size);
+                if has_cols {
+                    db!(self, r, c + half_block4x4, sub_size);
+                }
+            }
+            PARTITION_SPLIT => {
+                self.decode_partition_syntax(
+                    decoder,
+                    cdfs,
+                    r,
+                    c,
+                    sub_size,
+                    frame_is_intra,
+                    subsampling_x,
+                    subsampling_y,
+                    num_planes,
+                    seg_id_pre_skip,
+                    segmentation_enabled,
+                    seg_skip_active,
+                    last_active_seg_id,
+                    lossless_array,
+                    coded_lossless,
+                    enable_cdef,
+                    allow_intrabc,
+                    cdef_bits,
+                    read_deltas,
+                    use_128x128_superblock,
+                    delta_q_res,
+                    delta_lf_present,
+                    delta_lf_multi,
+                    mono_chrome,
+                    delta_lf_res,
+                )?;
+                self.decode_partition_syntax(
+                    decoder,
+                    cdfs,
+                    r,
+                    c + half_block4x4,
+                    sub_size,
+                    frame_is_intra,
+                    subsampling_x,
+                    subsampling_y,
+                    num_planes,
+                    seg_id_pre_skip,
+                    segmentation_enabled,
+                    seg_skip_active,
+                    last_active_seg_id,
+                    lossless_array,
+                    coded_lossless,
+                    enable_cdef,
+                    allow_intrabc,
+                    cdef_bits,
+                    read_deltas,
+                    use_128x128_superblock,
+                    delta_q_res,
+                    delta_lf_present,
+                    delta_lf_multi,
+                    mono_chrome,
+                    delta_lf_res,
+                )?;
+                self.decode_partition_syntax(
+                    decoder,
+                    cdfs,
+                    r + half_block4x4,
+                    c,
+                    sub_size,
+                    frame_is_intra,
+                    subsampling_x,
+                    subsampling_y,
+                    num_planes,
+                    seg_id_pre_skip,
+                    segmentation_enabled,
+                    seg_skip_active,
+                    last_active_seg_id,
+                    lossless_array,
+                    coded_lossless,
+                    enable_cdef,
+                    allow_intrabc,
+                    cdef_bits,
+                    read_deltas,
+                    use_128x128_superblock,
+                    delta_q_res,
+                    delta_lf_present,
+                    delta_lf_multi,
+                    mono_chrome,
+                    delta_lf_res,
+                )?;
+                self.decode_partition_syntax(
+                    decoder,
+                    cdfs,
+                    r + half_block4x4,
+                    c + half_block4x4,
+                    sub_size,
+                    frame_is_intra,
+                    subsampling_x,
+                    subsampling_y,
+                    num_planes,
+                    seg_id_pre_skip,
+                    segmentation_enabled,
+                    seg_skip_active,
+                    last_active_seg_id,
+                    lossless_array,
+                    coded_lossless,
+                    enable_cdef,
+                    allow_intrabc,
+                    cdef_bits,
+                    read_deltas,
+                    use_128x128_superblock,
+                    delta_q_res,
+                    delta_lf_present,
+                    delta_lf_multi,
+                    mono_chrome,
+                    delta_lf_res,
+                )?;
+            }
+            PARTITION_HORZ_A => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                db!(self, r, c, split);
+                db!(self, r, c + half_block4x4, split);
+                db!(self, r + half_block4x4, c, sub_size);
+            }
+            PARTITION_HORZ_B => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                db!(self, r, c, sub_size);
+                db!(self, r + half_block4x4, c, split);
+                db!(self, r + half_block4x4, c + half_block4x4, split);
+            }
+            PARTITION_VERT_A => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                db!(self, r, c, split);
+                db!(self, r + half_block4x4, c, split);
+                db!(self, r, c + half_block4x4, sub_size);
+            }
+            PARTITION_VERT_B => {
+                let split = split_size.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                db!(self, r, c, sub_size);
+                db!(self, r, c + half_block4x4, split);
+                db!(self, r + half_block4x4, c + half_block4x4, split);
+            }
+            // PARTITION_HORZ_4: the spec writes `r +
+            // quarterBlock4x4 * { 0, 1, 2, 3 }`; clippy folds the
+            // `* 0` and `* 1` cases, so the body is shown with the
+            // folded forms (mirrors the [`Self::decode_partition`]
+            // sibling).
+            PARTITION_HORZ_4 => {
+                db!(self, r, c, sub_size);
+                db!(self, r + quarter_block4x4, c, sub_size);
+                db!(self, r + quarter_block4x4 * 2, c, sub_size);
+                if r + quarter_block4x4 * 3 < self.mi_rows {
+                    db!(self, r + quarter_block4x4 * 3, c, sub_size);
+                }
+            }
+            // The spec's `else { ... }` arm (PARTITION_VERT_4 — the
+            // tenth and final partition value). Same clippy-folded
+            // pattern as PARTITION_HORZ_4.
+            PARTITION_VERT_4 => {
+                db!(self, r, c, sub_size);
+                db!(self, r, c + quarter_block4x4, sub_size);
+                db!(self, r, c + quarter_block4x4 * 2, sub_size);
+                if c + quarter_block4x4 * 3 < self.mi_cols {
+                    db!(self, r, c + quarter_block4x4 * 3, sub_size);
+                }
+            }
+            _ => return Err(crate::Error::PartitionWalkOutOfRange),
+        }
+
+        Ok(())
+    }
 }
 
 /// Result of [`PartitionWalker::decode_intra_frame_mode_info_prefix`]
@@ -13842,6 +14535,101 @@ pub struct IntraFrameModeInfoPrefix {
     /// `INTRA_FRAME` / `NONE` regardless of the `use_intrabc`
     /// follow-on element.
     pub ref_frame: [i8; 2],
+}
+
+/// `DecodedBlock` — the per-block derived state the §5.11.5
+/// [`PartitionWalker::decode_block_syntax`] walker produces on the
+/// implemented prologue + §5.11.6 `mode_info()` (intra arm) path.
+///
+/// Combines:
+///
+/// * The §5.11.5 prologue derivations: `MiRow` / `MiCol` / `MiSize` /
+///   `bw4` / `bh4` / `HasChroma` / `AvailU` / `AvailL` /
+///   `AvailUChroma` / `AvailLChroma`.
+/// * The §5.11.7 [`IntraFrameModeInfoPrefix`] fields (`skip` /
+///   `skip_mode` / `segment_id` / `lossless` / `cdef_idx` /
+///   `current_q_index` / `current_delta_lf` / `ref_frame`).
+/// * The §5.11.7 mode-info pass results: `use_intrabc`, `is_inter`,
+///   `YMode`, `IsCompound`.
+///
+/// Fields are spec-shaped names that match the av1-spec p.63-64
+/// `decode_block` body variables one-to-one. Stamped over the block's
+/// `bw4 * bh4` footprint of the walker's grid arrays by each composed
+/// leaf as it fires.
+///
+/// Out of scope this round (next round's targets, surfaced here as
+/// the stub's caller-bug-free no-stub-path baseline):
+/// `palette_tokens()` output (`PaletteSize{Y,UV}` always `0` on the
+/// reachable path), `read_block_tx_size()` output (`TxSize` / the
+/// transform tree), `compute_prediction()` outputs (prediction
+/// samples), `residual()` outputs (transform coefficients +
+/// reconstructed samples), the inter arm's `RefFrame[0..2]` / `Mv[0..2]`
+/// / `InterpFilters[0..2]` / `CompGroupIdx` / `CompoundIdx` (these
+/// land with §5.11.18 inter_frame_mode_info).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedBlock {
+    /// §5.11.5 `MiRow = r` — mi-unit row of the block.
+    pub mi_row: u32,
+    /// §5.11.5 `MiCol = c` — mi-unit column of the block.
+    pub mi_col: u32,
+    /// §5.11.5 `MiSize = subSize` — the BLOCK_* ordinal selected by
+    /// the §5.11.4 partition tree for this leaf, in `0..BLOCK_SIZES`.
+    pub mi_size: usize,
+    /// §5.11.5 `bw4 = Num_4x4_Blocks_Wide[ MiSize ]`.
+    pub bw4: u32,
+    /// §5.11.5 `bh4 = Num_4x4_Blocks_High[ MiSize ]`.
+    pub bh4: u32,
+    /// §5.11.5 `HasChroma` — true ⇔ the block emits chroma samples.
+    /// Three-arm derivation: small-sample sub-sampled edge cases
+    /// force `false`; otherwise `num_planes > 1`.
+    pub has_chroma: bool,
+    /// §5.11.5 `AvailU = is_inside( r - 1, c )` — true ⇔ the block's
+    /// above neighbour is inside the current tile.
+    pub avail_u: bool,
+    /// §5.11.5 `AvailL = is_inside( r, c - 1 )` — true ⇔ the block's
+    /// left neighbour is inside the current tile.
+    pub avail_l: bool,
+    /// §5.11.5 `AvailUChroma` — `AvailU` plus the chroma fix-up arm
+    /// (`is_inside( r - 2, c )` when `subsampling_y && bh4 == 1`).
+    /// `false` when `!HasChroma`.
+    pub avail_u_chroma: bool,
+    /// §5.11.5 `AvailLChroma` — `AvailL` plus the chroma fix-up arm
+    /// (`is_inside( r, c - 2 )` when `subsampling_x && bw4 == 1`).
+    /// `false` when `!HasChroma`.
+    pub avail_l_chroma: bool,
+    /// §5.11.5 / §5.11.11 `Skips[r][c]`. `0` or `1`.
+    pub skip: u8,
+    /// §5.11.5 / §5.11.10 `SkipModes[r][c]`. Always `0` for the
+    /// intra-frame walk.
+    pub skip_mode: u8,
+    /// §5.11.5 / §5.11.9 `SegmentIds[r][c]`. In `0..MAX_SEGMENTS`.
+    pub segment_id: u8,
+    /// §5.11.8 `Lossless = LosslessArray[ segment_id ]`.
+    pub lossless: bool,
+    /// §5.11.56 `cdef_idx[r][c]`. `-1` on the short-circuit fall-through.
+    pub cdef_idx: i8,
+    /// §5.11.12 `CurrentQIndex` post-call (running accumulator).
+    pub current_q_index: i32,
+    /// §5.11.13 `DeltaLF[..]` row post-call (running accumulator).
+    pub current_delta_lf: [i32; FRAME_LF_COUNT],
+    /// §5.11.7 `RefFrame[0..2]` after the intra arm =
+    /// `[INTRA_FRAME, NONE]` = `[0, -1]`.
+    pub ref_frame: [i8; 2],
+    /// §5.11.7 `use_intrabc`. `0` for the implemented `allow_intrabc
+    /// = false` path; `1` is consumable but the `use_intrabc == 1`
+    /// MV-stack / assign-mv body is a next-round target.
+    pub use_intrabc: u8,
+    /// §5.11.5 / §5.11.7 `is_inter`. `0` on the `else` arm, `1` on
+    /// the `use_intrabc == 1` arm. The walker stamps this into
+    /// `IsInters[r+y][c+x]` for the implemented mode-info path.
+    pub is_inter: u8,
+    /// §5.11.7 `YMode = intra_frame_y_mode` (or `DC_PRED` on the
+    /// `use_intrabc == 1` arm).
+    pub y_mode: u8,
+    /// §5.11.5 `IsCompound = RefFrame[1] > INTRA_FRAME`. Always
+    /// `false` on the intra arm (where `RefFrame[1] = NONE = -1 <
+    /// INTRA_FRAME = 0`).
+    pub is_compound: bool,
 }
 
 #[cfg(test)]

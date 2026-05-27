@@ -6,6 +6,150 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 166 — §5.11.5 `decode_block()` syntax-walker skeleton
+  (`decode_block_syntax` + `decode_partition_syntax` + `DecodedBlock`).**
+  Lands the missing §5.11.5 per-block syntax-walker dispatcher that
+  the §5.11.4 partition walker recurses into at every leaf. Until
+  this round the §5.11.4 `decode_partition` walker had no body to
+  invoke at a `PARTITION_NONE` leaf — it stamped `MiSizes[]` and
+  emitted a `DecodedBlockRecord` but didn't run the §5.11.5 per-block
+  syntax pass. The new
+  [`PartitionWalker::decode_block_syntax`] method performs the
+  §5.11.5 prologue + §5.11.6 `mode_info()` intra arm + §5.11.49
+  `palette_tokens()` (no-op on the no-palette path) and short-
+  circuits at the §5.11.16 `read_block_tx_size()` stub — the
+  immediate next-round target.
+
+  §5.11.5 prologue implementation (av1-spec p.63 lines 1-25):
+  `MiRow = r`, `MiCol = c`, `MiSize = subSize`, `bw4 =
+  Num_4x4_Blocks_Wide[subSize]`, `bh4 = Num_4x4_Blocks_High[subSize]`;
+  the `HasChroma` three-arm dispatch (`bh4 == 1 && subsampling_y &&
+  (MiRow & 1) == 0 ⇒ false`; `bw4 == 1 && subsampling_x && (MiCol &
+  1) == 0 ⇒ false`; else `num_planes > 1`); `AvailU = is_inside(r-1,
+  c)`, `AvailL = is_inside(r, c-1)` via
+  [`TileGeometry::is_inside`]; `AvailUChroma` / `AvailLChroma` with
+  the spec's chroma fix-up arm (`subsampling_y && bh4 == 1 ⇒
+  is_inside(r-2, c)`; `subsampling_x && bw4 == 1 ⇒ is_inside(r, c-2)`).
+  All five derivations surface on the returned [`DecodedBlock`]
+  aggregate.
+
+  §5.11.6 `mode_info()` dispatch (av1-spec p.64): `frame_is_intra =
+  false` short-circuits with the new
+  `Error::DecodeBlockInterFrameUnsupported` (zero bits consumed —
+  the §5.11.5 prologue doesn't touch the bit cursor). The implemented
+  intra arm composes the §5.11.7 `intra_frame_mode_info` body
+  through r161's
+  [`PartitionWalker::decode_intra_frame_mode_info_prefix`]
+  (lines 1-10: `skip = 0`, `intra_segment_id`, `skip_mode = 0`,
+  `read_skip`, post-skip `intra_segment_id`, `read_cdef`,
+  `read_delta_qindex`, `read_delta_lf`, `ReadDeltas = 0`, the fixed
+  `RefFrame[0..2] = [INTRA_FRAME, NONE]` assignments) + r164's
+  [`PartitionWalker::decode_use_intrabc`] + r165's
+  [`PartitionWalker::decode_intra_frame_y_mode`] (on the `use_intrabc
+  == 0` arm). The `use_intrabc == 1` arm short-circuits to `YMode =
+  DC_PRED`, `is_inter = 1` (the find_mv_stack / assign_mv body is a
+  next-round target).
+
+  §5.11.49 `palette_tokens()`: gated by the spec's `if
+  ( PaletteSize{Y,UV} )` outer guard. On the reachable path
+  (`palette_mode_info()` is not yet wired ⇒ `PaletteSize{Y,UV} ==
+  0`), the call is a no-op per the spec.
+
+  Stub fire at §5.11.16: the walker emits a [`DecodedBlockRecord`]
+  leaf (matching the legacy `decode_partition` leaf emitter so the
+  `blocks()` accessor reports the same record either path) and
+  returns `Error::DecodeBlockReadBlockTxSizeUnsupported`. The
+  §5.11.5 grid-fill writes that already happen inside the composed
+  leaves (`Skips[][]`, `SkipModes[][]`, `SegmentIds[][]`,
+  `MiSizes[][]`, `YModes[][]`, `cdef_idx[][]`) remain observable on
+  the walker's grid accessors after the stub fires.
+
+  Four new `Error` variants surface the §5.11.5 next-round
+  boundaries one-to-one:
+    * `DecodeBlockInterFrameUnsupported` — §5.11.18
+      `inter_frame_mode_info()` (the inter arm of §5.11.6).
+    * `DecodeBlockReadBlockTxSizeUnsupported` — §5.11.16
+      `read_block_tx_size()`, the immediate next stub the walker
+      reaches.
+    * `DecodeBlockComputePredictionUnsupported` — §5.11.30
+      `compute_prediction()`, reserved for the round that lands
+      §5.11.16.
+    * `DecodeBlockResidualUnsupported` — §5.11.34 `residual()`,
+      reserved for the round that lands §5.11.30.
+
+  New `DecodedBlock` per-block aggregate (publicly constructible)
+  carries every value the §5.11.5 walker derives:
+    * Prologue: `mi_row` / `mi_col` / `mi_size` / `bw4` / `bh4` /
+      `has_chroma` / `avail_u` / `avail_l` / `avail_u_chroma` /
+      `avail_l_chroma`.
+    * Mode-info pass: every `IntraFrameModeInfoPrefix` field plus
+      `use_intrabc` / `is_inter` / `y_mode` / `is_compound`
+      (always `false` on the intra arm since `RefFrame[1] = NONE
+      < INTRA_FRAME`).
+
+  Partition-walker driver:
+  [`PartitionWalker::decode_partition_syntax`] mirrors the §5.11.4
+  recursion of [`PartitionWalker::decode_partition`] verbatim
+  (identical `partition` / `split_or_horz` / `split_or_vert`
+  reads, identical `partition_subsize` dispatch, identical
+  edge-of-frame fall-throughs); the only difference is that every
+  `decode_block( r, c, sz )` site in the §5.11.4 pseudocode now
+  routes through `decode_block_syntax` instead of the leaf-only
+  emitter. Stub propagates from the first leaf that fires it; grid
+  stamps from earlier leaves remain observable.
+
+  10 new integration tests (`tests/decode_block_syntax_walker.rs`):
+    * `decode_block_syntax_reaches_read_block_tx_size_stub_after_intra_mode_info`
+      — the baseline keyframe / no-segmentation / no-screen-content
+      path reaches the §5.11.16 stub, the bitstream cursor advanced
+      past the prologue, one leaf record emitted at (0, 0,
+      BLOCK_8X8), and the BLOCK_8X8 footprint of `Skips[]`,
+      `SegmentIds[]`, `MiSizes[]` carries the expected stamps.
+    * `decode_block_syntax_prologue_has_chroma_three_arm_dispatch` —
+      the §5.11.5 `HasChroma` three-arm dispatch on `BLOCK_4X4`
+      (subsampling-y arm 1, subsampling-x arm 2, no-subsampling
+      fall-through arm 3); each subcase reaches the §5.11.16 stub.
+    * `decode_block_syntax_inter_frame_arm_returns_stub` —
+      `frame_is_intra = false` ⇒ `Error::DecodeBlockInterFrameUnsupported`
+      with zero bits consumed and no leaf record emitted.
+    * `decode_block_syntax_intra_pre_skip_arm_reaches_stub` —
+      `seg_id_pre_skip = true` + `segmentation_enabled = true` ⇒
+      the §5.11.9 `intra_segment_id` read fires before
+      `read_skip`, and the §5.11.16 stub is reached after the
+      composed reads (with the BLOCK_8X8 footprint stamped).
+    * `decode_block_syntax_rejects_out_of_range` — `mi_row >=
+      MiRows`, `mi_col >= MiCols`, and `sub_size >= BLOCK_SIZES`
+      each surface `Error::PartitionWalkOutOfRange` before any bit
+      is read.
+    * `decode_partition_syntax_routes_leaf_through_decode_block_syntax`
+      — a `BLOCK_4X4` superblock (the `< BLOCK_8X8` short-circuit
+      arm) drives the partition walker into exactly one
+      `decode_block_syntax` call at (0, 0, BLOCK_4X4), which
+      surfaces the §5.11.16 stub; one leaf record emitted.
+    * `decode_partition_syntax_out_of_grid_short_circuits` — `r >=
+      MiRows` triggers the §5.11.4 line-1 early return with
+      `Ok(())` and no leaf records.
+    * `decoded_block_struct_public_api_smoke` — `DecodedBlock` is
+      publicly constructible with every field default-valid; the
+      struct is `Debug + Clone + Copy + PartialEq + Eq`.
+    * `decode_block_syntax_block_8x16_grid_fill_footprint` — a
+      `BLOCK_8X16` block (bw4 = 2, bh4 = 4) at (0, 0) stamps the
+      §5.11.5 grid-fill 2×4 footprint on `MiSizes[]`; cells
+      outside the footprint stay at the `BLOCK_INVALID` sentinel.
+    * `decode_block_syntax_cdef_bits_two_reaches_stub` — with
+      `cdef_bits = 2` the §5.11.56 literal-bits read consumes two
+      bits and the walker still reaches the §5.11.16 stub on a
+      `BLOCK_16X16` block; the 4×4 footprint of `MiSizes[]` and
+      `Skips[]` stamped.
+
+  The §5.11.7 follow-on `else`-arm elements
+  (`intra_angle_info_y`, `uv_mode`, `read_cfl_alphas`,
+  `intra_angle_info_uv`, `palette_mode_info`,
+  `filter_intra_mode_info`) and the `use_intrabc == 1` MV-stack /
+  assign-mv body remain bounded leaf targets that can be slotted
+  into a future round before or alongside §5.11.16. `decode_av1` /
+  `encode_av1` continue to return `Error::NotImplemented`.
+
 * **Round 165 — §5.11.7 / §5.11.22 `intra_frame_y_mode` syntax element
   (`decode_intra_frame_y_mode`).**
   Lands a new [`PartitionWalker::decode_intra_frame_y_mode`] method
