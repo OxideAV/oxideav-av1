@@ -6,6 +6,74 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 185 — §7.12.3 step-3 frame-buffer merge + `CurrFrame`
+  per-plane sample buffers.** Lifts the last remaining placeholder
+  in the §7.12.3 reconstruct chain: with r185 the per-TU
+  inverse-transform residual the r182 walker captured is merged
+  into a real per-plane `CurrFrame[plane][y][x]` sample buffer
+  with the spec's `flipUD` / `flipLR` destination remap for the
+  FLIPADST family and a `Clip1` envelope per `BitDepth`.
+
+  * **New `PartitionWalker` per-plane sample buffers.** Three
+    `Option<CurrFramePlane>` slots (Y / Cb / Cr) on the walker,
+    allocated lazily on the first §7.12.3 step-3 merge call
+    touching a plane. Per-plane dimensions follow §5.9.5 /
+    §5.11.34: luma is `MiRows * MI_SIZE × MiCols * MI_SIZE`
+    samples; chroma is `>> sub_y` / `>> sub_x` per the §5.11.34
+    line 19 `subX` / `subY` derivation (so 4:2:0 halves both
+    axes). Initial fill is zero — the spec's `Clip1(0 +
+    Residual[i][j])` additive identity before any §7.11.x
+    prediction-sample writer fires.
+  * **New `PartitionWalker::curr_frame(plane: usize) ->
+    Option<&[i32]>`** — row-major sample view (`plane` ∈
+    `0..3`). Returns `None` until the first §7.12.3 step-3
+    merge call on that plane has allocated the buffer.
+  * **New `PartitionWalker::curr_frame_dims(plane: usize) ->
+    Option<(u32, u32)>`** — `(rows, cols)` companion to
+    `curr_frame`.
+  * **`PartitionWalker::transform_block_emit` now applies the
+    §7.12.3 step-3 merge on the `!skip && eob > 0` arm** —
+    immediately after the r182 §7.13 inverse transform produces
+    the per-TU `Residual[][]`, and before recording the residual
+    onto `ResidualReadout::residuals`. Driven directly from the
+    `ResidualContext`'s `QuantizerParams::bit_depth` and the
+    r183 §5.11.40 `compute_tx_type` derivation of `PlaneTxType`.
+  * **`ResidualTuTask` gains a `plane_tx_type: u8` field** — the
+    per-TU §5.11.40 `compute_tx_type` outcome the step-3 merge
+    consults. Back-filled by the dispatcher on the `!skip` arm
+    after the §5.11.40 derivation; the `skip == true` arm
+    leaves it at the `DCT_DCT` placeholder (no transform fired,
+    the step-3 merge is gated to the prediction-only write —
+    DCT_DCT's neither-flip identity).
+  * **`Clip1(x) = Clip3(0, (1 << BitDepth) - 1, x)`** per §3
+    `Clip1`. The merge supports `BitDepth ∈ {8, 10, 12}`; the
+    pre-`Clip1` `prediction + Residual[i][j]` sum is `i64`-wide
+    so 12-bit-plus-large-residual edge cases don't overflow.
+  * **Out-of-buffer overhang is silently clipped.** A TU whose
+    `start_x + w > cols` or `start_y + h > rows` (possible at
+    the frame boundary per §5.11.34's chunk loop) lands its
+    in-buffer slice and drops the rest. Plane-out-of-range and
+    wrong-residual-size arguments are defensive no-ops.
+
+  16 new tests (843 → 859): unallocated-on-fresh-walker accessor
+  behaviour; `ensure_curr_frame_plane` per-subsampling sizing
+  (luma 16×16, 4:2:0 chroma 8×8 on the 4-mi-square fixture);
+  DCT_DCT identity write across a 4×4 TU; `Clip1` 8-bit
+  saturation at both the upper (200 + 200 → 255) and lower
+  (100 - 150 → 0) envelopes; `Clip1` 10-bit saturation (upper
+  bound 1023); FLIPADST_DCT row-flip (dst row `r` reads src row
+  `3 - r`); H_FLIPADST col-flip (dst col `c` reads src col `3 -
+  c`); FLIPADST_FLIPADST 180° rotation; offset top-left
+  placement; additive accumulation across two consecutive
+  merges; silent overhang clip; plane-out-of-range no-op;
+  wrong-residual-size no-op; chroma 4:2:0 plane allocation with
+  luma / V left unallocated; `ResidualTuTask::plane_tx_type`
+  back-fill on the walker's reachable intra-only path (every TU
+  carries DCT_DCT after the §5.11.40 derivation on the
+  `YMode = DC_PRED` fixture); skip-arm `plane_tx_type` stays at
+  the DCT_DCT placeholder. `decode_av1` / `encode_av1` continue
+  to return `Error::NotImplemented`.
+
 * **Round 184 — §7.5 / §5.11.41 `get_scan(txSz)` table dispatch.**
   Replaces the r183 identity-ascending scan placeholder in
   `transform_block_emit`'s call into `coefficients()` with the

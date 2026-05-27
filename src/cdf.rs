@@ -13196,6 +13196,40 @@ pub struct PartitionWalker {
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
+    /// `CurrFrame[ plane ][ y ][ x ]` (av1-spec §7.12.3 step-3 / §7.11.x
+    /// prediction kernels / §7.14 loop filter / §7.15 CDEF / §7.16
+    /// upscaling / §7.17 loop restoration). Three per-plane sample
+    /// buffers (Y / Cb / Cr); slot `plane` holds the `(rows, cols)`
+    /// row-major flat buffer. The buffer is lazily allocated on the
+    /// first per-plane §7.12.3 step-3 merge call (see
+    /// [`Self::ensure_curr_frame_plane`]); the entry stays `None` until
+    /// the first merge fires on that plane.
+    ///
+    /// Per-plane dimensions follow §5.9.5 / §5.11.34:
+    ///   * luma (`plane == 0`): `rows = MiRows * MI_SIZE`, `cols = MiCols
+    ///     * MI_SIZE`.
+    ///   * chroma (`plane > 0`): `rows = (MiRows * MI_SIZE) >> sub_y`,
+    ///     `cols = (MiCols * MI_SIZE) >> sub_x` per §5.11.34 line 19
+    ///     `subX` / `subY`.
+    ///
+    /// Initial fill is `0` for every sample — matching the natural
+    /// identity for the §7.12.3 step-3 additive merge before any
+    /// upstream §7.11.x prediction-sample writer fires (a TU with no
+    /// prediction sees `CurrFrame[..][..] = Clip1(0 + Residual[i][j])`,
+    /// the spec's `prediction == 0` arm). Stored as `i32` so the
+    /// pre-`Clip1` `prediction + Residual[i][j]` sum fits without
+    /// truncation across all `BitDepth ∈ {8, 10, 12}` modes.
+    curr_frame: [Option<CurrFramePlane>; 3],
+}
+
+/// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
+/// samples)` triple. The flat `samples` buffer is row-major with
+/// `rows * cols` `i32` entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CurrFramePlane {
+    rows: u32,
+    cols: u32,
+    samples: Vec<i32>,
 }
 
 impl PartitionWalker {
@@ -13377,6 +13411,10 @@ impl PartitionWalker {
             compound_idxs,
             interp_filters,
             blocks: Vec::new(),
+            // §7.12.3 step-3 `CurrFrame[plane]` buffers — allocated
+            // lazily on the first per-plane merge call (see
+            // [`Self::ensure_curr_frame_plane`]).
+            curr_frame: [None, None, None],
         })
     }
 
@@ -13433,6 +13471,162 @@ impl PartitionWalker {
     #[must_use]
     pub fn mi_sizes(&self) -> &[usize] {
         &self.mi_sizes
+    }
+
+    /// Row-major `CurrFrame[ plane ]` view (av1-spec §7.12.3 step-3 /
+    /// §7.11.x intra / §7.9 inter / §7.14 LF / §7.15 CDEF / §7.16
+    /// upscaling / §7.17 LR). Returns `None` until the first
+    /// §7.12.3 step-3 merge call on `plane` has fired (the buffer is
+    /// allocated lazily).
+    ///
+    /// Indexed `samples()[ y * cols + x ]` against the `(rows, cols)`
+    /// pair returned by [`Self::curr_frame_dims`]. Sample values are
+    /// `i32` post-`Clip1` (so always in `0..=(1 << BitDepth) - 1` for
+    /// the `BitDepth` the §7.12.3 step-3 merge was driven with).
+    ///
+    /// `plane` is `0` (Y), `1` (Cb), `2` (Cr); out-of-range `plane`
+    /// returns `None`.
+    #[must_use]
+    pub fn curr_frame(&self, plane: usize) -> Option<&[i32]> {
+        self.curr_frame
+            .get(plane)
+            .and_then(|p| p.as_ref().map(|cp| cp.samples.as_slice()))
+    }
+
+    /// `(rows, cols)` of the per-plane `CurrFrame[ plane ]` buffer.
+    /// Returns `None` if the buffer hasn't been allocated yet (no
+    /// merge call has fired on that plane). `plane` is `0` (Y), `1`
+    /// (Cb), `2` (Cr); out-of-range `plane` returns `None`.
+    #[must_use]
+    pub fn curr_frame_dims(&self, plane: usize) -> Option<(u32, u32)> {
+        self.curr_frame
+            .get(plane)
+            .and_then(|p| p.as_ref().map(|cp| (cp.rows, cp.cols)))
+    }
+
+    /// Ensure the per-plane `CurrFrame[ plane ]` buffer is allocated
+    /// at the §5.11.34-derived `(rows, cols)` extent. Idempotent: a
+    /// second call with the same `(rows, cols)` is a no-op; a call
+    /// with smaller dimensions than the existing allocation is a
+    /// no-op (the buffer is sized for the full frame at first
+    /// allocation, so subsequent per-TU merges always fit). The
+    /// initial fill is `0` per the §7.12.3 step-3 additive-merge
+    /// identity (`Clip1(0 + Residual[i][j])` before any §7.11.x
+    /// prediction writer has fired).
+    fn ensure_curr_frame_plane(&mut self, plane: usize, rows: u32, cols: u32) {
+        if plane >= 3 {
+            return;
+        }
+        if self.curr_frame[plane].is_some() {
+            return;
+        }
+        let len = (rows as usize).saturating_mul(cols as usize);
+        let mut samples: Vec<i32> = Vec::new();
+        if samples.try_reserve_exact(len).is_err() {
+            return;
+        }
+        samples.resize(len, 0);
+        self.curr_frame[plane] = Some(CurrFramePlane {
+            rows,
+            cols,
+            samples,
+        });
+    }
+
+    /// §7.12.3 step-3 frame-buffer merge (av1-spec p.295) — write
+    /// `CurrFrame[plane][y + yy][x + xx] = Clip1(CurrFrame[..][..] +
+    /// Residual[i][j])` for `(i, j) ∈ [0, h) × [0, w)` with the
+    /// FLIPADST destination remap:
+    ///
+    /// * `flipUD = 1` ⇔ `PlaneTxType ∈ { FLIPADST_DCT, FLIPADST_ADST,
+    ///   V_FLIPADST, FLIPADST_FLIPADST }`. `yy = h - i - 1` then;
+    ///   otherwise `yy = i`.
+    /// * `flipLR = 1` ⇔ `PlaneTxType ∈ { DCT_FLIPADST, ADST_FLIPADST,
+    ///   H_FLIPADST, FLIPADST_FLIPADST }`. `xx = w - j - 1` then;
+    ///   otherwise `xx = j`.
+    /// * `Clip1(x) = Clip3(0, (1 << BitDepth) - 1, x)` per §3 `Clip1`.
+    ///
+    /// `residual` is the row-major `w * h` `Residual[][]` buffer
+    /// produced by [`crate::transform::inverse_transform_2d`] (`w =
+    /// Tx_Width[tx_sz]`, `h = Tx_Height[tx_sz]`). `start_x` /
+    /// `start_y` are the per-TU top-left in the per-plane sample
+    /// space (already post-subsampling for chroma).
+    ///
+    /// Lazily allocates the per-plane buffer at `(MiRows * MI_SIZE)
+    /// >> sub_y` × `(MiCols * MI_SIZE) >> sub_x` if the merge is the
+    /// first one on `plane`. Out-of-buffer writes (e.g. a TU with a
+    /// `start_x + w > cols` overhang past the right / bottom frame
+    /// edge — possible at the frame boundary per §5.11.34's chunk
+    /// loop) are clipped silently; the in-buffer slice is still
+    /// merged. Returns silently for `plane >= 3`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn curr_frame_step3_merge(
+        &mut self,
+        plane: u8,
+        start_x: u32,
+        start_y: u32,
+        tx_sz: usize,
+        plane_tx_type: usize,
+        residual: &[i64],
+        bit_depth: u8,
+        sub_x: u8,
+        sub_y: u8,
+    ) {
+        if (plane as usize) >= 3 {
+            return;
+        }
+        let w = TX_WIDTH[tx_sz] as u32;
+        let h = TX_HEIGHT[tx_sz] as u32;
+        if (w as usize) * (h as usize) != residual.len() {
+            return;
+        }
+        // §7.12.3 step-3 flipUD / flipLR derivation (av1-spec lines
+        // 16292-16296).
+        let flip_ud = matches!(
+            plane_tx_type,
+            FLIPADST_DCT | FLIPADST_ADST | V_FLIPADST | FLIPADST_FLIPADST
+        );
+        let flip_lr = matches!(
+            plane_tx_type,
+            DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST
+        );
+        // Per-plane buffer extent — `MiRows * MI_SIZE` luma samples
+        // (subsampled for chroma per §5.11.34 line 19). Allocate on
+        // first merge.
+        let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+        let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+        self.ensure_curr_frame_plane(plane as usize, rows, cols);
+        let Some(buf) = self.curr_frame[plane as usize].as_mut() else {
+            return;
+        };
+        let cols_buf = buf.cols;
+        let max = (1i32 << bit_depth) - 1;
+        // §7.12.3 step-3 inner loop. `for i in 0..h for j in 0..w`.
+        for i in 0..h {
+            for j in 0..w {
+                let yy = if flip_ud { h - i - 1 } else { i };
+                let xx = if flip_lr { w - j - 1 } else { j };
+                let dst_y = start_y + yy;
+                let dst_x = start_x + xx;
+                if dst_y >= buf.rows || dst_x >= cols_buf {
+                    continue;
+                }
+                let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
+                let cur = buf.samples[idx] as i64;
+                let res = residual[(i as usize) * (w as usize) + (j as usize)];
+                let sum = cur.saturating_add(res);
+                // `Clip1(x) = Clip3(0, (1 << BitDepth) - 1, x)`.
+                let clipped = if sum < 0 {
+                    0
+                } else if sum > max as i64 {
+                    max
+                } else {
+                    sum as i32
+                };
+                buf.samples[idx] = clipped;
+            }
+        }
     }
 
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
@@ -22063,14 +22257,18 @@ impl PartitionWalker {
     ///   (the §7.11.2.x sample-generation leaves; only DC_PRED has
     ///   a standalone leaf today via [`predict_intra_dc_pred`]).
     /// * §5.11.35 `reconstruct( plane, startX, startY, txSz )` —
-    ///   §7.13 inverse transform is LANDED (r182); the dispatcher
-    ///   invokes [`crate::transform::inverse_transform_2d`] when
-    ///   `eob > 0`. The §7.12.3 step-1 dequantization
-    ///   (`get_dc_quant` / `get_ac_quant` / `using_qmatrix` /
-    ///   `Quantizer_Matrix[ SegQMLevel ][ ... ]`) is a placeholder
-    ///   identity dequant (the §7.12.3 step-3 frame-buffer merge,
-    ///   including `flipLR` / `flipUD` for the FLIPADST family,
-    ///   is split-off).
+    ///   §7.12.3 step-1 dequantization is LANDED (r183) via
+    ///   [`dequantize_step1`]; §7.13 inverse transform is LANDED
+    ///   (r182) via [`crate::transform::inverse_transform_2d`];
+    ///   §7.12.3 step-3 frame-buffer merge is LANDED (r185) and
+    ///   writes into the walker's per-plane [`Self::curr_frame`]
+    ///   sample buffer with `flipLR` / `flipUD` destination
+    ///   remapping for the FLIPADST family and a `Clip1` envelope
+    ///   per `BitDepth`. The §9.5.3
+    ///   `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table
+    ///   transcription is still pending; the `using_qmatrix &&
+    ///   plane_tx_type < IDTX && seg_qm_level < 15` arm of step-1
+    ///   currently falls through to the no-QM identity (`q2 = q`).
     /// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` /
     ///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps.
     /// * §7.12.3 step-1 `Dequant[][]` per-`(plane, pos)`
@@ -22603,7 +22801,14 @@ impl PartitionWalker {
             return Err(crate::Error::ResidualCoefficientsTxSizeUnsupported);
         }
 
-        // Record the per-TU task (spec-order emission).
+        // Record the per-TU task (spec-order emission). `plane_tx_type`
+        // is filled in below on the `!skip` arm once §5.11.40
+        // `compute_tx_type` runs; the `skip == true` path leaves it at
+        // the §5.11.40 `Lossless || txSzSqrUp > TX_32X32` fallback
+        // (DCT_DCT) — which is also the §7.12.3 step-3 flipUD / flipLR
+        // identity (neither flip flag fires for DCT_DCT, so a
+        // skip-path TU with no residual maps cleanly to a no-op step-3
+        // merge anyway).
         readout.tasks.push(ResidualTuTask {
             plane,
             start_x,
@@ -22612,6 +22817,7 @@ impl PartitionWalker {
             chunk_x,
             chunk_y,
             from_transform_tree,
+            plane_tx_type: DCT_DCT as u8,
         });
 
         // §5.11.35 line 32: `if ( !skip ) eob = coeffs( plane, startX,
@@ -22705,6 +22911,15 @@ impl PartitionWalker {
                 )
             };
 
+            // Back-fill the task's `plane_tx_type` with the §5.11.40
+            // derivation — the §7.12.3 step-3 merge below consults it
+            // for the `flipUD` / `flipLR` destination remap. The task
+            // was pushed above with the DCT_DCT placeholder; on this
+            // arm we replace it with the actual `PlaneTxType`.
+            if let Some(last) = readout.tasks.last_mut() {
+                last.plane_tx_type = plane_tx_type as u8;
+            }
+
             // §8.3.2 tx_class derivation — fold the §3 `*_DCT` /
             // `*_ADST` / `*_FLIPADST` constants into TX_CLASS_2D /
             // TX_CLASS_HORIZ / TX_CLASS_VERT.
@@ -22742,15 +22957,21 @@ impl PartitionWalker {
             readout.coeffs.push(coeffs);
             // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
             // §7.12.3 dequantization (step 1, r183 LANDED) + §7.13
-            // inverse transform (r182) + §7.12.3 step-3 frame-buffer
-            // merge (next-arc).
+            // inverse transform (r182 LANDED) + §7.12.3 step-3
+            // frame-buffer merge (r185 LANDED).
             //
-            // r183 — §7.12.3 step-1 dequantization is wired in via
-            // [`dequantize_step1`]. The §7.12.3 step-3 frame-buffer
-            // merge (`CurrFrame[plane][y + yy][x + xx]` write with
-            // `flipLR` / `flipUD` destination remapping and `Clip1`)
-            // is the next-arc target — the per-TU `Residual[][]` is
-            // captured on [`ResidualReadout::residuals`].
+            // r183: §7.12.3 step-1 dequantization wires in via
+            // [`dequantize_step1`].
+            // r182: §7.13 inverse transform wires in via
+            // [`crate::transform::inverse_transform_2d`].
+            // r185: §7.12.3 step-3 frame-buffer merge wires in via
+            // [`Self::curr_frame_step3_merge`]. The per-TU
+            // `CurrFrame[plane][y + yy][x + xx]` write (with
+            // `flipLR` / `flipUD` destination remap and `Clip1`
+            // envelope) lands directly into the per-plane sample
+            // buffer accessible via [`Self::curr_frame`]. The
+            // per-TU `Residual[][]` is still captured on
+            // [`ResidualReadout::residuals`] for caller inspection.
             if coeffs.eob > 0 {
                 let dequant = dequantize_step1(
                     &quant,
@@ -22767,6 +22988,24 @@ impl PartitionWalker {
                     plane_tx_type,
                     ctx.quant.bit_depth as u32,
                     lossless,
+                );
+                // §7.12.3 step-3 (av1-spec p.295) — merge the per-TU
+                // `Residual[i][j]` into `CurrFrame[plane][y + yy][x +
+                // xx]` with the `flipLR` / `flipUD` destination remap
+                // for the FLIPADST family and a `Clip1` envelope
+                // against `(1 << BitDepth) - 1`. The buffer is
+                // allocated lazily on the first per-plane merge call
+                // (see [`Self::ensure_curr_frame_plane`]).
+                self.curr_frame_step3_merge(
+                    plane,
+                    start_x,
+                    start_y,
+                    tx_sz,
+                    plane_tx_type,
+                    &residual,
+                    ctx.quant.bit_depth,
+                    sub_x,
+                    sub_y,
                 );
                 readout.residuals.push(Some(residual));
             } else {
@@ -25485,6 +25724,13 @@ pub struct ResidualTuTask {
     /// emitted by the per-plane intra / chroma `for y, for x` direct
     /// iteration.
     pub from_transform_tree: bool,
+    /// `PlaneTxType` per §5.11.40 `compute_tx_type( plane, txSz, x4, y4 )`
+    /// — the per-TU transform type the §7.12.3 step-3 frame-buffer
+    /// merge consults for the `flipUD` / `flipLR` destination remap.
+    /// One of the 16 §3 `TxType` ordinals (`DCT_DCT..H_FLIPADST`).
+    /// `DCT_DCT` on the `skip == true` path (no transform fired, the
+    /// step-3 merge for the TU is gated to the prediction-only write).
+    pub plane_tx_type: u8,
 }
 
 /// §5.11.34 `residual()` post-walk outcome — the per-block list of
@@ -25533,17 +25779,21 @@ pub struct ResidualTuTask {
 ///   [`predict_intra_dc_pred`] leaf landed in r180; the remaining
 ///   §7.11.2.x bodies and the `CurrFrame[plane][y][x]` sample-buffer
 ///   wiring are split-off.
-/// * §5.11.35 `reconstruct(plane, startX, startY, txSz)` — the §7.13
-///   inverse-transform LANDED (r182). The dispatcher invokes
-///   [`crate::transform::inverse_transform_2d`] on every TU with
-///   `eob > 0` and records the per-TU `Residual[][]` on
-///   [`Self::residuals`]. The §7.12.3 step-1 quantization-matrix
-///   derivation (`get_dc_quant` / `get_ac_quant` / `using_qmatrix` /
-///   `Quantizer_Matrix[ SegQMLevel ][ ... ]`) is a placeholder
-///   identity dequant; the §7.12.3 step-3 frame-buffer merge
-///   (`CurrFrame[plane][y + yy][x + xx]` write with `flipLR` /
-///   `flipUD` destination remapping and `Clip1` envelope) is the
-///   next-arc target.
+/// * §5.11.35 `reconstruct(plane, startX, startY, txSz)` — the full
+///   §7.12.3 step-1 / §7.13 step-2 / §7.12.3 step-3 chain is now
+///   wired through the dispatcher. r182 wires §7.13 inverse
+///   transform via [`crate::transform::inverse_transform_2d`]; r183
+///   wires §7.12.3 step-1 dequantization via [`dequantize_step1`];
+///   r185 wires §7.12.3 step-3 frame-buffer merge (a private
+///   `PartitionWalker` helper) writing into the walker's per-plane
+///   [`PartitionWalker::curr_frame`] sample buffer (with `flipLR`
+///   / `flipUD` destination remapping for the FLIPADST family and
+///   a `Clip1` envelope per `BitDepth`). The per-TU `Residual[][]`
+///   continues to be captured on [`Self::residuals`] for caller
+///   inspection. The §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]`
+///   table transcription is still pending; the `using_qmatrix &&
+///   plane_tx_type < IDTX && seg_qm_level < 15` arm of step-1 falls
+///   through to the no-QM identity (`q2 = q`).
 /// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` and
 ///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps. The
 ///   underlying walker grids are not yet allocated; the dispatcher
@@ -25629,15 +25879,16 @@ pub struct ResidualReadout {
     /// suppressed the coefficient read.
     ///
     /// Each `Vec<i64>` is the row-major `w * h` `Residual` buffer
-    /// (`w = Tx_Width[tx_sz]`, `h = Tx_Height[tx_sz]`) the
-    /// §7.12.3 step-3 frame-buffer write would consume next.
-    /// The §7.12.3 step-1 dequantization (`Dequant[i][j] = ...`)
-    /// is deferred — the walker passes the §5.11.39 `Quant[]`
-    /// levels directly to the inverse transform as a placeholder
-    /// identity dequant (full dequant requires `get_dc_quant` /
-    /// `get_ac_quant` / `using_qmatrix` / `Quantizer_Matrix` /
-    /// `SegQMLevel` state not yet plumbed). The §7.13 inverse
-    /// transform itself is bit-exact per spec.
+    /// (`w = Tx_Width[tx_sz]`, `h = Tx_Height[tx_sz]`). r185 wires
+    /// the §7.12.3 step-3 frame-buffer merge into the dispatcher
+    /// (`PartitionWalker::curr_frame_step3_merge`); the buffer is
+    /// mutated in-place and observable via
+    /// [`PartitionWalker::curr_frame`]. r183 wires the §7.12.3
+    /// step-1 dequantization via [`dequantize_step1`]; the §9.5.3
+    /// `Quantizer_Matrix` arm is still pending (the `using_qmatrix
+    /// && plane_tx_type < IDTX && seg_qm_level < 15` path falls
+    /// through to the no-QM identity). The §7.13 inverse transform
+    /// itself is bit-exact per spec.
     pub residuals: Vec<Option<Vec<i64>>>,
     /// `skip` — routed through from the §5.11.5 walker's `skip` field
     /// (the per-block `skip` syntax element from §5.11.11). Recorded
@@ -46418,6 +46669,7 @@ mod tests {
                 chunk_x: 0,
                 chunk_y: 0,
                 from_transform_tree: false,
+                plane_tx_type: DCT_DCT as u8,
             }],
             coeffs: vec![],
             residuals: vec![],
@@ -46427,5 +46679,519 @@ mod tests {
         assert_eq!(r, r2);
         // Debug formatter doesn't panic.
         let _ = format!("{r:?}");
+    }
+
+    // ============================================================
+    // r185 — §7.12.3 step-3 frame-buffer merge tests.
+    // ============================================================
+
+    /// `curr_frame()` / `curr_frame_dims()` are `None` on a freshly
+    /// constructed walker — the per-plane buffers are allocated
+    /// lazily on the first §7.12.3 step-3 merge call.
+    #[test]
+    fn curr_frame_unallocated_on_fresh_walker() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        for plane in 0..3 {
+            assert!(walker.curr_frame(plane).is_none());
+            assert!(walker.curr_frame_dims(plane).is_none());
+        }
+        // Out-of-range plane: also None (defensive).
+        assert!(walker.curr_frame(3).is_none());
+        assert!(walker.curr_frame_dims(3).is_none());
+    }
+
+    /// `ensure_curr_frame_plane` sizes the luma buffer at `MiRows *
+    /// MI_SIZE × MiCols * MI_SIZE` with a zero fill. Chroma buffer
+    /// dimensions follow `>> sub_y` / `>> sub_x` per §5.11.34 line
+    /// 19. The 4:2:0 chroma case halves both axes.
+    #[test]
+    fn ensure_curr_frame_plane_sizes_per_subsampling() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // Luma: 4 mi rows × 4 mi cols × MI_SIZE = 16 × 16.
+        walker.ensure_curr_frame_plane(0, 16, 16);
+        assert_eq!(walker.curr_frame_dims(0), Some((16, 16)));
+        let luma = walker.curr_frame(0).unwrap();
+        assert_eq!(luma.len(), 16 * 16);
+        assert!(luma.iter().all(|&s| s == 0));
+        // 4:2:0 chroma: half-rate both axes → 8 × 8.
+        walker.ensure_curr_frame_plane(1, 8, 8);
+        assert_eq!(walker.curr_frame_dims(1), Some((8, 8)));
+        let chroma_u = walker.curr_frame(1).unwrap();
+        assert_eq!(chroma_u.len(), 8 * 8);
+        assert!(chroma_u.iter().all(|&s| s == 0));
+    }
+
+    /// §7.12.3 step-3 merge with `PlaneTxType = DCT_DCT` (no flip):
+    /// every `Residual[i][j]` lands at `CurrFrame[plane][start_y +
+    /// i][start_x + j]` post-`Clip1`. Identity sample mapping; the
+    /// 4×4 residual is written to the top-left 4×4 corner of a 16×16
+    /// luma buffer.
+    #[test]
+    fn curr_frame_step3_merge_dct_dct_identity_write() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // 4×4 residual with i*4 + j+1 in each cell (1..=16).
+        let residual: Vec<i64> = (0..16).map(|k| (k + 1) as i64).collect();
+        walker.curr_frame_step3_merge(
+            /* plane = */ 0, /* start_x = */ 0, /* start_y = */ 0, TX_4X4, DCT_DCT,
+            &residual, /* bit_depth = */ 8, /* sub_x = */ 0, /* sub_y = */ 0,
+        );
+        assert_eq!(walker.curr_frame_dims(0), Some((16, 16)));
+        let buf = walker.curr_frame(0).unwrap();
+        // Top-left 4×4 matches residual; everything else is 0.
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    buf[i * 16 + j],
+                    (i * 4 + j + 1) as i32,
+                    "DCT_DCT identity write at ({i}, {j})",
+                );
+            }
+        }
+        for i in 0..16 {
+            for j in 0..16 {
+                if i < 4 && j < 4 {
+                    continue;
+                }
+                assert_eq!(
+                    buf[i * 16 + j],
+                    0,
+                    "untouched samples remain 0 at ({i}, {j})",
+                );
+            }
+        }
+    }
+
+    /// `Clip1` envelope at 8-bit (av1-spec §3 / line 16339): a
+    /// residual that drives the sum past `(1 << BitDepth) - 1 = 255`
+    /// clips to 255; a sum below `0` clips to `0`. The merge is
+    /// additive against the existing `CurrFrame[..]` cell, so we
+    /// pre-stamp 200 into the (0, 0) cell, then merge a residual of
+    /// `+200` (would yield 400) — expect 255 after clip.
+    #[test]
+    fn curr_frame_step3_merge_clip1_8bit_saturation() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // Allocate then pre-fill the (0, 0) cell with 200 — simulating
+        // an upstream §7.11.x prediction sample already in the buffer.
+        walker.ensure_curr_frame_plane(0, 16, 16);
+        walker.curr_frame[0].as_mut().unwrap().samples[0] = 200;
+        walker.curr_frame[0].as_mut().unwrap().samples[1] = 100;
+        // 4×4 residual: (+200, -150, 0, ...) — first cell clips high,
+        // second cell clips low (100 + (-150) = -50 ⇒ 0).
+        let mut residual = vec![0i64; 16];
+        residual[0] = 200;
+        residual[1] = -150;
+        walker.curr_frame_step3_merge(
+            0, 0, 0, TX_4X4, DCT_DCT, &residual, /* bit_depth = */ 8, 0, 0,
+        );
+        let buf = walker.curr_frame(0).unwrap();
+        assert_eq!(buf[0], 255, "200 + 200 = 400 clipped to 255");
+        assert_eq!(buf[1], 0, "100 + (-150) = -50 clipped to 0");
+    }
+
+    /// `Clip1` envelope at 10-bit: the upper bound becomes `(1 << 10)
+    /// - 1 = 1023`. Pre-stamp 800, merge +500 → 1300 clips to 1023.
+    #[test]
+    fn curr_frame_step3_merge_clip1_10bit_saturation() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        walker.ensure_curr_frame_plane(0, 16, 16);
+        walker.curr_frame[0].as_mut().unwrap().samples[0] = 800;
+        let mut residual = vec![0i64; 16];
+        residual[0] = 500;
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 10, 0, 0);
+        let buf = walker.curr_frame(0).unwrap();
+        assert_eq!(buf[0], 1023, "800 + 500 = 1300 clipped to 1023 (10-bit)");
+    }
+
+    /// §7.12.3 step-3 `flipUD = 1` derivation (av1-spec lines
+    /// 16292-16293): `PlaneTxType ∈ { FLIPADST_DCT, FLIPADST_ADST,
+    /// V_FLIPADST, FLIPADST_FLIPADST }`. Verify by merging a 4×4
+    /// residual whose row index encodes the source row — the
+    /// FLIPADST_DCT path lands row `i` at destination row `h - i - 1
+    /// = 3 - i`.
+    #[test]
+    fn curr_frame_step3_merge_flipadst_dct_flips_rows() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // Residual: row i carries value 10 + i (constant across the
+        // row). Source rows 0..3 → values 10, 11, 12, 13.
+        let mut residual = vec![0i64; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                residual[i * 4 + j] = (10 + i) as i64;
+            }
+        }
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, FLIPADST_DCT, &residual, 8, 0, 0);
+        let buf = walker.curr_frame(0).unwrap();
+        // Destination row r reads the source row `3 - r`. So dst row
+        // 0 ⇐ src row 3 = 13; dst row 1 ⇐ src row 2 = 12; etc.
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = (10 + (3 - r)) as i32;
+                assert_eq!(
+                    buf[r * 16 + c],
+                    expected,
+                    "FLIPADST_DCT row-flip at dst ({r}, {c}): expect src row {} = {expected}",
+                    3 - r,
+                );
+            }
+        }
+    }
+
+    /// §7.12.3 step-3 `flipLR = 1` derivation (av1-spec lines
+    /// 16295-16296): `PlaneTxType ∈ { DCT_FLIPADST, ADST_FLIPADST,
+    /// H_FLIPADST, FLIPADST_FLIPADST }`. Verify the H_FLIPADST path
+    /// mirrors per-column (dst col `c` ⇐ src col `w - c - 1`).
+    #[test]
+    fn curr_frame_step3_merge_h_flipadst_flips_cols() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // Residual: col j carries value 10 + j (constant down the
+        // col). Source cols 0..3 → values 10, 11, 12, 13.
+        let mut residual = vec![0i64; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                residual[i * 4 + j] = (10 + j) as i64;
+            }
+        }
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, H_FLIPADST, &residual, 8, 0, 0);
+        let buf = walker.curr_frame(0).unwrap();
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = (10 + (3 - c)) as i32;
+                assert_eq!(
+                    buf[r * 16 + c],
+                    expected,
+                    "H_FLIPADST col-flip at dst ({r}, {c}): expect src col {} = {expected}",
+                    3 - c,
+                );
+            }
+        }
+    }
+
+    /// §7.12.3 step-3 `FLIPADST_FLIPADST` ⇒ both `flipUD` and
+    /// `flipLR` fire. Dst cell at row r, col c reads src cell at row
+    /// `h - r - 1`, col `w - c - 1`. With a 4x4 residual whose row-
+    /// major linear index equals the cell value (so src top-left
+    /// holds zero and src bottom-right holds fifteen), the dst top-
+    /// left reads fifteen and the dst bottom-right reads zero.
+    #[test]
+    fn curr_frame_step3_merge_flipadst_flipadst_180_rotation() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let residual: Vec<i64> = (0..16).map(|k| k as i64).collect();
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, FLIPADST_FLIPADST, &residual, 8, 0, 0);
+        let buf = walker.curr_frame(0).unwrap();
+        // dst (r, c) = src (3 - r, 3 - c) ⇒ src linear index (3 - r)
+        // * 4 + (3 - c) = 12 - 4r + 3 - c = 15 - 4r - c.
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = (15 - 4 * r - c) as i32;
+                assert_eq!(
+                    buf[r * 16 + c],
+                    expected,
+                    "FLIPADST_FLIPADST 180° at ({r}, {c})"
+                );
+            }
+        }
+    }
+
+    /// `start_x` / `start_y` offsets place the merge at an arbitrary
+    /// top-left within the per-plane buffer. The merge for a 4×4 TU
+    /// at `(start_y = 4, start_x = 8)` writes the top-left at row 4,
+    /// col 8 of a 16×16 luma buffer. Untouched cells outside the 4×4
+    /// footprint stay at 0.
+    #[test]
+    fn curr_frame_step3_merge_offset_top_left_within_buffer() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let residual = vec![7i64; 16]; // 4×4, all 7s.
+        walker.curr_frame_step3_merge(
+            0, /* start_x = */ 8, /* start_y = */ 4, TX_4X4, DCT_DCT, &residual, 8, 0, 0,
+        );
+        let buf = walker.curr_frame(0).unwrap();
+        for r in 0..16 {
+            for c in 0..16 {
+                let expected = if (4..8).contains(&r) && (8..12).contains(&c) {
+                    7
+                } else {
+                    0
+                };
+                assert_eq!(buf[r * 16 + c], expected, "offset merge at ({r}, {c})");
+            }
+        }
+    }
+
+    /// Multiple consecutive merges accumulate (additive — §7.12.3
+    /// step-3's `CurrFrame[..] = Clip1(CurrFrame[..] + Residual[..])`
+    /// reads the pre-write cell value and adds). Two `+3` merges at
+    /// the same top-left yield `6` at every touched cell.
+    #[test]
+    fn curr_frame_step3_merge_is_additive_across_calls() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let residual = vec![3i64; 16];
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
+        let buf = walker.curr_frame(0).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(buf[i * 16 + j], 6, "two +3 merges at ({i}, {j})");
+            }
+        }
+    }
+
+    /// Out-of-buffer overhang (start_x + w > cols) is clipped
+    /// silently; the in-buffer slice is still merged. Position a 4×4
+    /// TU at start_x = 14 in a 16-wide luma buffer — cells with
+    /// dst_x ∈ {14, 15} land; dst_x ∈ {16, 17} drop. Verify the two
+    /// in-buffer columns received the merge and the rest stay at 0.
+    #[test]
+    fn curr_frame_step3_merge_silently_clips_overhang() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let residual = vec![5i64; 16];
+        walker.curr_frame_step3_merge(
+            0, /* start_x = */ 14, /* start_y = */ 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0,
+        );
+        let buf = walker.curr_frame(0).unwrap();
+        for r in 0..4 {
+            // dst_x = 14, 15 in-buffer; the rest out-of-buffer.
+            assert_eq!(buf[r * 16 + 14], 5);
+            assert_eq!(buf[r * 16 + 15], 5);
+        }
+    }
+
+    /// `curr_frame_step3_merge` returns silently on `plane >= 3` —
+    /// defensive caller-bug guard. The luma buffer stays
+    /// unallocated, no panic.
+    #[test]
+    fn curr_frame_step3_merge_plane_out_of_range_is_no_op() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let residual = vec![1i64; 16];
+        walker.curr_frame_step3_merge(3, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
+        for plane in 0..3 {
+            assert!(walker.curr_frame(plane).is_none());
+        }
+    }
+
+    /// `curr_frame_step3_merge` returns silently on a wrong-sized
+    /// residual buffer — defensive caller-bug guard.
+    #[test]
+    fn curr_frame_step3_merge_wrong_residual_size_is_no_op() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // TX_4X4 expects w*h = 16; pass 8.
+        let residual = vec![1i64; 8];
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
+        assert!(walker.curr_frame(0).is_none());
+    }
+
+    /// Chroma plane allocation uses subsampled dimensions. A 4×4
+    /// chroma TU on a 4:2:0 stream with luma `MiRows * MI_SIZE = 16`
+    /// sees `curr_frame_dims(1) = (8, 8)`.
+    #[test]
+    fn curr_frame_step3_merge_chroma_420_subsampled_dims() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let residual = vec![2i64; 16];
+        walker.curr_frame_step3_merge(
+            /* plane = */ 1, 0, 0, TX_4X4, DCT_DCT, &residual, 8, /* sub_x = */ 1,
+            /* sub_y = */ 1,
+        );
+        assert_eq!(walker.curr_frame_dims(1), Some((8, 8)));
+        let chroma = walker.curr_frame(1).unwrap();
+        assert_eq!(chroma.len(), 64);
+        // Top-left 4×4 has 2s, rest 0.
+        for r in 0..8 {
+            for c in 0..8 {
+                let expected = if r < 4 && c < 4 { 2 } else { 0 };
+                assert_eq!(chroma[r * 8 + c], expected, "chroma 4:2:0 at ({r}, {c})");
+            }
+        }
+        // Luma + V plane stay unallocated.
+        assert!(walker.curr_frame(0).is_none());
+        assert!(walker.curr_frame(2).is_none());
+    }
+
+    /// `ResidualTuTask` `plane_tx_type` field is back-filled from the
+    /// §5.11.40 `compute_tx_type` derivation on the `!skip` arm.
+    /// Drive the §5.11.5 walker's reachable path (all-zero CDFs ⇒
+    /// `coeffs.eob = 0`, no inverse transform, no merge) and verify
+    /// the tasks carry `plane_tx_type = DCT_DCT` (the `Lossless ||
+    /// txSzSqrUp > TX_32X32` fallback for the walker's intra-only
+    /// path with `YMode = DC_PRED`).
+    #[test]
+    fn residual_tu_task_plane_tx_type_back_filled_on_walker_path() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force §5.11.39 `all_zero` S() = 1 ⇒ eob = 0 per TU.
+        for sz in 0..TX_SIZES {
+            for ctx in 0..TXB_SKIP_CONTEXTS {
+                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(1);
+            }
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker
+            .residual(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* has_chroma = */ true,
+                0,
+                0,
+                /* is_inter = */ false,
+                /* lossless = */ false,
+                /* skip = */ false,
+                TX_8X8,
+                false,
+                &ResidualContext::neutral(0, 8),
+            )
+            .unwrap();
+        // All three TUs (Y / U / V) ran the §5.11.40 derivation ⇒
+        // plane_tx_type back-filled. Walker's reachable intra-only
+        // path with YMode = DC_PRED yields DCT_DCT.
+        assert_eq!(r.tasks.len(), 3);
+        for t in &r.tasks {
+            assert_eq!(
+                t.plane_tx_type, DCT_DCT as u8,
+                "plane_tx_type back-fill at plane {}",
+                t.plane,
+            );
+        }
+        // Every TU is all-zero so the merge didn't fire; CurrFrame
+        // stays unallocated.
+        for plane in 0..3 {
+            assert!(
+                walker.curr_frame(plane).is_none(),
+                "no merge for all-zero TU on plane {plane}",
+            );
+        }
+    }
+
+    /// Skip-arm `ResidualTuTask` carries the DCT_DCT placeholder for
+    /// `plane_tx_type` — the §5.11.34 `if ( !skip )` gate short-
+    /// circuits the §5.11.40 derivation. CurrFrame stays unallocated.
+    #[test]
+    fn residual_tu_task_skip_arm_plane_tx_type_is_dct_dct_placeholder() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker
+            .residual(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                true,
+                0,
+                0,
+                false,
+                false,
+                /* skip = */ true,
+                TX_8X8,
+                false,
+                &ResidualContext::neutral(0, 8),
+            )
+            .unwrap();
+        assert_eq!(r.tasks.len(), 3);
+        for t in &r.tasks {
+            assert_eq!(t.plane_tx_type, DCT_DCT as u8);
+        }
+        for plane in 0..3 {
+            assert!(walker.curr_frame(plane).is_none());
+        }
     }
 }

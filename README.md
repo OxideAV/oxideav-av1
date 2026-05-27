@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 184)
+## Status — 2026-05-28 (round 185)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,104 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 185 lifts the **§7.12.3 step-3 frame-buffer merge** — the
+per-TU sample-buffer write that turns the r182 inverse-transform
+residual into the actual reconstructed `CurrFrame[plane][y][x]`
+samples. With r185 the decoder produces real per-plane sample
+output for the first time (subject to the §7.11.x prediction
+kernels still being placeholder-zero for all intra modes except
+DC_PRED).
+
+`PartitionWalker` grows three lazily-allocated per-plane
+`CurrFrame` sample buffers — one for luma (`plane == 0`), one for
+each chroma plane (`plane == 1` / `plane == 2`). Per-plane
+dimensions follow §5.9.5 / §5.11.34: the luma buffer is `MiRows *
+MI_SIZE × MiCols * MI_SIZE` samples; chroma buffers are `>> sub_y`
+/ `>> sub_x` subsampled per the §5.11.34 line 19 derivation, so a
+4:2:0 stream halves both axes. The buffers are allocated on the
+first §7.12.3 step-3 merge call that touches the plane (a stream
+with no `eob > 0` TUs on a given plane leaves that buffer at the
+`None` sentinel; the new `PartitionWalker::curr_frame(plane)` /
+`curr_frame_dims(plane)` accessors return `None` until the first
+merge fires). The flat sample buffer is row-major `i32` with a
+zero initial fill — matching the spec's `CurrFrame[..] = Clip1(0
++ Residual[i][j])` additive-merge identity before any §7.11.x
+prediction-sample writer fires.
+
+The new `curr_frame_step3_merge` helper transcribes av1-spec
+p.295 step-3 verbatim: derive `flipUD = 1` iff `PlaneTxType ∈ {
+FLIPADST_DCT, FLIPADST_ADST, V_FLIPADST, FLIPADST_FLIPADST }`,
+derive `flipLR = 1` iff `PlaneTxType ∈ { DCT_FLIPADST,
+ADST_FLIPADST, H_FLIPADST, FLIPADST_FLIPADST }`, then iterate
+`for i in 0..h, j in 0..w` with `yy = flipUD ? h-i-1 : i` and `xx
+= flipLR ? w-j-1 : j` and apply `CurrFrame[plane][y + yy][x + xx]
+= Clip1(CurrFrame[..][..] + Residual[i][j])` where `Clip1(x) =
+Clip3(0, (1 << BitDepth) - 1, x)` per §3 `Clip1`. The bit depth
+(8 / 10 / 12) is routed from the per-block `ResidualContext`'s
+`QuantizerParams::bit_depth`.
+
+`PartitionWalker::transform_block_emit` now invokes
+`curr_frame_step3_merge` after the §7.13 inverse transform on the
+`!skip && eob > 0` arm — driven directly from the dequantized
+residual the r182 inverse transform produced and the r183 §5.11.40
+`compute_tx_type` derivation of `PlaneTxType`. The merge fires
+before the residual is recorded onto `ResidualReadout::residuals`
+(so a caller inspecting the readout sees both the per-TU residual
+AND a coherent `CurrFrame` state). The §7.12.3 step-3 task site
+fires on every TU emitted by both the per-plane intra / chroma
+`for y, for x` direct iteration AND the §5.11.36 `transform_tree`
+inter-luma recursion.
+
+`ResidualTuTask` gains a `plane_tx_type: u8` field — the per-TU
+§5.11.40 `compute_tx_type` outcome the §7.12.3 step-3 merge
+consults for `flipUD` / `flipLR`. The field is back-filled by
+the dispatcher after the §5.11.40 derivation on the `!skip` arm;
+the `skip == true` arm leaves it at the `DCT_DCT` placeholder
+(no transform fired, the step-3 merge for the TU is gated to the
+prediction-only write — which is also `DCT_DCT`'s neither-flip
+identity, so the bookkeeping stays consistent).
+
+Out-of-buffer overhang (a TU whose `start_x + w` extends past
+the right frame edge, possible at the frame boundary per
+§5.11.34's chunk loop) is silently clipped; the in-buffer slice
+is still merged. Plane-out-of-range and wrong-residual-size
+arguments are defensive no-ops.
+
+**Split off explicitly to subsequent arcs (unchanged from r184):**
+(a) 12 non-DC intra-prediction modes (V_PRED / H_PRED / SMOOTH_*
+/ PAETH_PRED / D45..D203 directional); (b) §7.9 inter prediction
+(sub-pixel interpolation, reference-frame sampling, warping);
+(c) §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table
+transcription; (d) §7.14 deblocking loop filter; (e) §7.15 CDEF;
+(f) §7.16 super-resolution; (g) §7.17 loop restoration. The
+§7.12.3 step-1 / step-2 / step-3 trio is now complete; the
+`CurrFrame[plane][y][x]` output buffer is ready for the §7.11.x
+intra prediction kernels and the §7.14 / §7.15 / §7.16 / §7.17
+post-processing chain to consume.
+
+16 new tests (843 → 859): unallocated-on-fresh-walker accessor
+behaviour; `ensure_curr_frame_plane` per-subsampling sizing
+(luma 16×16, 4:2:0 chroma 8×8 on the 4-mi-square fixture);
+DCT_DCT identity write across a 4×4 TU (top-left 4×4 matches the
+residual, untouched cells stay 0); `Clip1` 8-bit saturation at
+both the upper (200 + 200 → 255) and lower (100 - 150 → 0)
+envelopes; `Clip1` 10-bit saturation (upper bound 1023);
+FLIPADST_DCT row-flip (dst row `r` reads src row `3 - r`);
+H_FLIPADST col-flip (dst col `c` reads src col `3 - c`);
+FLIPADST_FLIPADST 180° rotation (both flips fire); offset
+top-left placement (4×4 TU at `(start_y = 4, start_x = 8)`
+writes into rows 4-7, cols 8-11); additive accumulation across
+two consecutive merges (two `+3` merges sum to 6); silent
+overhang clip (4×4 TU at `start_x = 14` in a 16-wide buffer
+lands cells 14, 15 only); plane-out-of-range no-op; wrong-
+residual-size no-op; chroma 4:2:0 plane allocation with luma /
+V left unallocated; `ResidualTuTask::plane_tx_type` back-fill on
+the walker's reachable intra-only path (every TU carries
+DCT_DCT after the §5.11.40 derivation on the `YMode = DC_PRED`
+fixture); skip-arm `plane_tx_type` stays at the DCT_DCT
+placeholder. `decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 184 lifts the **§7.5 / §5.11.41 `get_scan(txSz)` scan-table
 dispatcher** — the last placeholder the r183 walker left in the

@@ -1921,17 +1921,23 @@ pub enum Error {
     /// `reconstruct( plane, startX, startY, txSz )` would have run
     /// the §7.13 inverse transform. With r182 the §7.13 inverse
     /// transform is wired through [`crate::transform::inverse_transform_2d`]
-    /// — the dispatcher now invokes it directly, stores the per-TU
-    /// `Residual[][]` on [`crate::ResidualReadout::residuals`], and
-    /// returns `Ok(())`. The §7.12.3 step-1 dequantization
-    /// (`Dequant[i][j] = Quant[pos] * q2 / dqDenom` with per-segment
-    /// quantizer state) and the §7.12.3 step-3 frame-buffer merge
-    /// (`CurrFrame[plane][y + yy][x + xx] = Clip1(... + Residual[i][j])`,
-    /// including `flipLR` / `flipUD` destination remapping for the
-    /// FLIPADST family) remain split-off — but neither raises this
-    /// variant; the placeholder identity-dequant suffices to lift
-    /// the §7.13 boundary, and the frame buffer is captured on the
-    /// readout rather than written through.
+    /// — the dispatcher now invokes it directly and stores the per-TU
+    /// `Residual[][]` on [`crate::ResidualReadout::residuals`]. With
+    /// r183 the §7.12.3 step-1 dequantization (`Dequant[i][j] =
+    /// Clip3(-(1 << (7 + BitDepth)), (1 << (7 + BitDepth)) - 1,
+    /// sign * (|Quant[pos] * q2| & 0xFFFFFF) / dqDenom)` with
+    /// per-segment / per-plane quantizer state and the spec's
+    /// `using_qmatrix` / `Quantizer_Matrix` arm gated on §9.5.3
+    /// table transcription) wires in via `dequantize_step1`. With
+    /// r185 the §7.12.3 step-3 frame-buffer merge
+    /// (`CurrFrame[plane][y + yy][x + xx] = Clip1(... +
+    /// Residual[i][j])`, including `flipLR` / `flipUD` destination
+    /// remapping for the FLIPADST family) is applied directly
+    /// against the walker's per-plane `CurrFrame` buffer
+    /// (accessible via
+    /// [`crate::PartitionWalker::curr_frame`] /
+    /// [`crate::PartitionWalker::curr_frame_dims`]) — the dispatcher
+    /// returns `Ok(())` with the buffer mutated in-place.
     ///
     /// Retained as a typed sentinel for callers that wire custom
     /// reconstruct paths through the public API and want a known
