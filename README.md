@@ -2,9 +2,9 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 171)
+## Status — 2026-05-27 (round 172)
 
-**Clean-room rebuild, round 22.** The crate's prior implementation was
+**Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -1306,6 +1306,119 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 172 lands the **§7.10 `find_mv_stack` spatial-only path** —
+the motion-vector-stack derivation reached from the §5.11.23
+`inter_block_mode_info()` body once the §5.11.25 `read_ref_frames`
+prologue commits `RefFrame[0..2]`. The new
+`PartitionWalker::find_mv_stack(...)` method composes every
+sub-process from §7.10.2.1 setup-global-mv through §7.10.2.14
+context + clamping, on the `use_ref_frame_mvs == false` path.
+
+The §7.10.2 driver runs steps 1-16 + 18-36 in spec order:
+`NumMvFound = 0`, `NewMvCount = 0`, setup-global-mv for slot 0 (and
+slot 1 if compound), then the inner-ring scans
+(`scan_row(-1)` / `scan_col(-1)` / `scan_point(-1, bw4)` when
+`Max(bw4, bh4) ≤ 16`), the §7.10.2 step 15 `WeightStack[0..numNearest]
++= REF_CAT_LEVEL = 640` close-match bonus, the outer-ring scans
+(`scan_point(-1, -1)` / `scan_row(-3)` / `scan_col(-3)` /
+`scan_row(-5)` if `bh4 > 1` / `scan_col(-5)` if `bw4 > 1`), the
+§7.10.2.11 stable descending-by-weight sort over both segments
+(`[0..numNearest)` and `[numNearest..NumMvFound)`), the §7.10.2.12
+extra-search when `NumMvFound < 2` (two-pass partial-match scan over
+the row above + column to the left, then a `combinedMvs`
+fill from `RefIdMvs` + `RefDiffMvs` + `GlobalMvs` for compound, or
+direct `RefStackMv` extension for single — though single-pred does
+NOT increment `NumMvFound` per the §7.10.2.12 note), and the
+§7.10.2.14 context + clamping
+(`DrlCtxStack[idx]` derivation off the `WeightStack[idx] >=
+REF_CAT_LEVEL` / `WeightStack[idx+1] < REF_CAT_LEVEL` partition,
+per-list `clamp_mv_row` / `clamp_mv_col` with
+`border = MV_BORDER + (bh * 8) | (bw * 8)`, and the
+`NewMvContext` / `RefMvContext` three-arm ladder over `CloseMatches`).
+
+The §7.10.2.2 scan_row applies the `Abs(deltaRow) > 1` neighbour
+adjustment (`deltaRow += MiRow & 1; deltaCol = 1 - (MiCol & 1)`), the
+`useStep16 = bw4 >= 16` 4-step stride, and the per-neighbour
+weighted advance (`len = Min(bw4, Num_4x4_Blocks_Wide[MiSizes[mvRow]
+[mvCol]])`, then `Max(2, len)` outer-ring + `Max(4, len)` step16
+refinements). §7.10.2.3 scan_col is the vertical mirror. §7.10.2.4
+scan_point gates on `RefFrames[mvRow][mvCol][0] != INTRA_FRAME = 0`
+(matching the spec's "has been written" check; the walker's pre-fill
+`[INTRA_FRAME, NONE]` makes the gate the spec-correct identity).
+
+The §7.10.2.7 add_ref_mv_candidate gate
+(`IsInters[mvRow][mvCol] == 1`) then dispatches to §7.10.2.8
+search-stack (single-pred, for each `candList` where
+`RefFrames[mvRow][mvCol][candList] == RefFrame[0]`) or §7.10.2.9
+compound-search-stack (compound, when both
+`RefFrames[mvRow][mvCol][0..2]` match `RefFrame[0..2]`). The
+§7.10.2.10 lower-precision pass (LSB-strip when
+`allow_high_precision_mv == 0`, `(|a| + 3) >> 3 << 3` integer round
+when `force_integer_mv == 1`) is applied to every candidate MV
+before dedupe. The §7.10.2.8 `(candMode in {GLOBALMV,
+GLOBAL_GLOBALMV}) && GmType[RefFrame[0]] > TRANSLATION && large == 1`
+global-MV substitution arm is a no-op refinement on the conformant
+decode path — §5.11.31 `assign_mv` already stamps
+`Mvs[..][refList] = GlobalMvs[refList]` for those modes, so the
+"use Mvs[..]" fall-through produces the same bytes.
+
+The §7.10.2.5 temporal scan + §7.10.2.6 temporal sample sub-
+processes (step 17 of the §7.10.2 driver) are deferred — when the
+caller passes `use_ref_frame_mvs == true`, the new method returns
+`Error::TemporalMvScanUnsupported` without partial state mutation.
+The temporal scan needs a `MotionFieldMvs[ref][y8][x8]` grid that
+§7.9 `motion_field_estimation` is responsible for populating from
+the §5.9.20 `RefFrameSignBias` chain — that scaffolding lands with
+the next arc.
+
+The walker gains a new `Mvs[r][c][list][comp]` grid stored as a flat
+`Vec<i16>` with four `i16` slots per `(row, col)` cell (two lists ×
+two components). Pre-fill is zero; the §7.10.2.7
+`IsInters[mvRow][mvCol] == 0 ⇒ return` gate ensures the pre-fill
+is unobservable on the conformant path until §5.11.31 `assign_mv`
+(next-arc) writes it. New `mvs()` accessor exposes the grid.
+
+New aggregate `FindMvStackResult` surfaces every §7.10.2 output:
+`num_mv_found`, `new_mv_count`, `ref_stack_mv[idx][list][comp]`,
+`weight_stack[idx]`, `global_mvs[list]`, `new_mv_context`,
+`ref_mv_context`, `zero_mv_context`, `drl_ctx_stack[idx]` plus
+the §7.10.2 step 12-14 snapshot values `close_matches`,
+`total_matches`, `num_nearest`, `num_new`.
+
+20 new §3 / §6.10.22 / §7.10 constants land:
+`MAX_REF_MV_STACK_SIZE = 8`, `REF_CAT_LEVEL = 640`,
+`MV_BORDER = 128`, `WARPEDMODEL_PREC_BITS = 16` (cdf-local twin);
+GM type discriminants (`IDENTITY`/`TRANSLATION`/`ROTZOOM`/`AFFINE`
+= 0..=3); the §6.10.22 inter Y mode ordinal table
+(`MODE_NEARESTMV = 14`..`MODE_NEW_NEWMV = 25`) plus the
+`has_newmv(mode)` predicate.
+
+The §5.11.23 `decode_inter_block_mode_info` reader continues to
+return `Error::FindMvStackUnsupported` because the post-MV-stack
+reader cascade (`compound_mode` / `new_mv` / `zero_mv` / `ref_mv` /
+`drl_mode` / `assign_mv` / `read_motion_mode` /
+`read_interintra_mode` / `read_compound_type` /
+`read_interpolation_filter`) remains pending. The wiring of
+`find_mv_stack` into the dispatcher follows once those readers land.
+
+24 new unit tests cover: §7.10.2.10 lower-precision matrix
+(high-precision passthrough, LSB strip, `force_integer_mv` 3-bit
+round); §5.11.53 / §5.11.54 clamp bracket derivations; §7.10.2.11
+stable sort (descending by weight + equal-weight stability);
+§7.10.2.1 setup-global-mv (INTRA_FRAME ⇒ 0, IDENTITY ⇒ 0,
+TRANSLATION shift); empty-walker single-pred (NumMvFound = 0) and
+compound (NumMvFound = 2 global-fill) outcomes; caller-bug guards;
+temporal-scan deferral; one above-neighbour with NEWMV
+(REF_CAT_LEVEL bonus + NewMvContext = 2, RefMvContext = 3); one
+left-neighbour with NEARESTMV (numNew = 0, NewMvContext = 3);
+both-neighbours case (CloseMatches = 2 ⇒ NewMvContext = 4,
+RefMvContext = 5); mismatched-ref close-match exclusion +
+extra-search pickup; identical-MV dedupe; single-pred extra-search
+NumMvFound non-increment; `has_newmv` truth table; MV-stack
+constant values; DrlCtxStack[] derivation. Test count: 627 → 651
+(+24). `decode_av1` / `encode_av1` still return
+`Error::NotImplemented`.
 
 Round 171 lands the **§5.11.46 palette-entries reader**
 (`palette_colors_y[]` / `palette_colors_u[]` /

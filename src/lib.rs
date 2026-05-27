@@ -1842,7 +1842,32 @@ pub enum Error {
     /// subsequent-arc targets. This stub fires after the §5.11.25
     /// `read_ref_frames` reader commits to the §8.3 adaptation state
     /// and stamps `RefFrames[][][..]`.
+    ///
+    /// As of r172 the §7.10 spatial-only path lands and is reachable
+    /// via [`crate::PartitionWalker::find_mv_stack`]. The
+    /// `decode_inter_block_mode_info` reader still surfaces this stub
+    /// because the §5.11.23 post-`find_mv_stack` body
+    /// (`compound_mode` / `new_mv` / `zero_mv` / `ref_mv` /
+    /// `drl_mode` / `assign_mv` / `read_motion_mode` /
+    /// `read_interintra_mode` / `read_compound_type` /
+    /// `read_interpolation_filter`) remains pending; the wiring of
+    /// `find_mv_stack` into the §5.11.23 dispatcher follows once those
+    /// readers land.
     FindMvStackUnsupported,
+    /// The §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample sub-
+    /// processes (av1-spec p.223-226) reached from the §7.10.2 driver
+    /// when the §5.9.20 frame-level `use_ref_frame_mvs == 1`. Lifted
+    /// when the caller passes `use_ref_frame_mvs == false`, the §7.10
+    /// spatial-only path lands fully (r172). The temporal scan
+    /// requires a `MotionFieldMvs[ref][y8][x8]` grid that the
+    /// frame-header `motion_field_estimation` (§7.9, av1-spec p.215)
+    /// is responsible for populating from the §5.9.20
+    /// `RefFrameSignBias` chain — this grid is not yet tracked
+    /// across calls. The §7.10.2.6 body deduplicates against
+    /// `RefStackMv[]` with weight `2` per match and adjusts
+    /// `ZeroMvContext` based on whether the temporal MV diverges
+    /// from `GlobalMvs[..]` by more than 16 1/8-luma-sample units.
+    TemporalMvScanUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -1940,7 +1965,11 @@ impl core::fmt::Display for Error {
             ),
             Self::FindMvStackUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.23 inter_block_mode_info reached §7.10.2 find_mv_stack — MV-stack derivation + dependent readers pending next arc"
+                "oxideav-av1: §5.11.23 inter_block_mode_info reached §7.10.2 find_mv_stack — spatial-only path lands r172 via PartitionWalker::find_mv_stack; the §5.11.23 post-MV-stack reader cascade (compound_mode / new_mv / zero_mv / ref_mv / drl_mode / assign_mv / interpolation_filter) remains pending"
+            ),
+            Self::TemporalMvScanUnsupported => write!(
+                f,
+                "oxideav-av1: §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample reached — MotionFieldMvs[ref][y8][x8] grid + §7.9 motion_field_estimation pending next arc; only use_ref_frame_mvs == false is currently supported"
             ),
         }
     }
