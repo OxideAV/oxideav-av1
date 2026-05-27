@@ -1308,8 +1308,40 @@ pub const INTRA_FRAME: usize = 0;
 /// `LAST_FRAME` per §3 — the first inter-prediction reference index.
 pub const LAST_FRAME: usize = 1;
 
+/// `LAST2_FRAME` per §3 — second forward-direction inter reference.
+pub const LAST2_FRAME: usize = 2;
+
+/// `LAST3_FRAME` per §3 — third forward-direction inter reference.
+pub const LAST3_FRAME: usize = 3;
+
+/// `GOLDEN_FRAME` per §3 — fourth forward-direction inter reference.
+pub const GOLDEN_FRAME: usize = 4;
+
+/// `BWDREF_FRAME` per §3 — first backward-direction inter reference.
+/// `ref >= BWDREF_FRAME && ref <= ALTREF_FRAME` is the §8.3.2
+/// `check_backward()` predicate used by the `comp_mode` ctx walk.
+pub const BWDREF_FRAME: usize = 5;
+
+/// `ALTREF2_FRAME` per §3 — second backward-direction inter reference.
+pub const ALTREF2_FRAME: usize = 6;
+
 /// `ALTREF_FRAME` per §3 — the last inter-prediction reference index.
 pub const ALTREF_FRAME: usize = 7;
+
+/// `SINGLE_REFERENCE` per §3 — `comp_mode = 0` ⇒ block uses one ref.
+pub const SINGLE_REFERENCE: u8 = 0;
+
+/// `COMPOUND_REFERENCE` per §3 — `comp_mode = 1` ⇒ block uses two refs.
+pub const COMPOUND_REFERENCE: u8 = 1;
+
+/// `UNIDIR_COMP_REFERENCE` per §3 — `comp_ref_type = 0` ⇒ both
+/// reference frames come from the same direction group (forward or
+/// backward).
+pub const UNIDIR_COMP_REFERENCE: u8 = 0;
+
+/// `BIDIR_COMP_REFERENCE` per §3 — `comp_ref_type = 1` ⇒ one
+/// reference frame from each direction group.
+pub const BIDIR_COMP_REFERENCE: u8 = 1;
 
 /// `WARPEDMODEL_PREC_BITS` per §3 — internal precision of warped-motion
 /// models. The §5.9.24 identity default sets `gm_params[ref][i]` to

@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 169)
+## Status — 2026-05-27 (round 170)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1365,6 +1365,78 @@ arguments (`has_chroma`, `allow_screen_content_tools`,
 doesn't yet thread through. Direct callers can invoke
 `decode_intra_block_mode_info` with the missing arguments. Test count:
 587 → 602 (+15). `decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
+
+Round 170 lands **§5.11.23 `inter_block_mode_info()` prologue +
+§5.11.25 `read_ref_frames()`** (av1-spec p.74-77) — the per-block
+inter-mode reference-frame syntax tree reached from the §5.11.18
+`if (is_inter)` arm. The new
+`PartitionWalker::decode_inter_block_mode_info` reader composes:
+lines 1-2 (`PaletteSizeY = 0, PaletteSizeUV = 0`); §5.11.25
+`read_ref_frames()` four-arm dispatch — `skip_mode` arm
+(`RefFrame[0..2] = SkipModeFrame[0..2]`, no `S()`),
+`seg_feature_active(SEG_LVL_REF_FRAME)` arm
+(`RefFrame[0] = seg_ref_frame_data, RefFrame[1] = NONE`, no `S()`),
+`seg_feature_active(SEG_LVL_SKIP | SEG_LVL_GLOBALMV)` arm
+(`RefFrame[0] = LAST_FRAME, RefFrame[1] = NONE`, no `S()`), and the
+default syntax-tree arm (`comp_mode` `S()` gated on
+`reference_select && Min(bw4, bh4) >= 2`; COMPOUND splits into the
+UNIDIR_COMP cascade `uni_comp_ref` / `uni_comp_ref_p1` /
+`uni_comp_ref_p2` or the BIDIR_COMP cascade `comp_ref` /
+`comp_ref_p1` / `comp_ref_p2` + `comp_bwdref` / `comp_bwdref_p1`;
+SINGLE runs the `single_ref_p1..p6` cascade); line 4
+(`isCompound = RefFrame[1] > INTRA_FRAME`); and the walker grid stamp
+`RefFrames[r + y][c + x][0..2]` over the `bh4 * bw4` footprint.
+
+The reader then short-circuits at the §7.10.2 `find_mv_stack(isCompound)`
+entry with the new `Error::FindMvStackUnsupported`. The §7.10
+motion-vector-stack derivation (scan-row, scan-col, temporal-scan,
+sorting, extra-search, context-and-clamping) and every dependent
+§5.11.23 reader (`compound_mode`, `new_mv` / `zero_mv` / `ref_mv`,
+`drl_mode`, `assign_mv`, `read_motion_mode`, `read_interintra_mode`,
+`read_compound_type`, `read_interpolation_filter`) remain
+subsequent-arc targets. Every §5.11.25 `S()` read + the grid stamp
+commits to state before the stub fires; the §5.11.18 dispatcher's
+`if (is_inter)` arm now routes through the new reader (the
+`InterBlockModeInfoUnsupported` variant becomes a defensive
+caller-bug fallback no longer fired on the conformant path).
+
+Five new §8.3.2 free functions land for the ref-frame ctx walks:
+`check_backward(ref)` (`BWDREF_FRAME..=ALTREF_FRAME`),
+`is_samedir_ref_pair(ref0, ref1)`, `count_refs(frame_type, …)`,
+`comp_mode_ctx(…)` (the av1-spec p.366 nine-arm dispatch), and
+`comp_ref_type_ctx(…)` (the av1-spec p.382 three-nested-if
+dispatch).
+
+The walker gains a `RefFrames[][][..]` grid as a flat `Vec<i8>`
+with two slots per `(row, col)` cell, pre-filled with the §5.11.18
+"unavailable neighbour" identity `[INTRA_FRAME = 0, NONE = -1]`.
+View accessor `ref_frames()` exposes it for tests / callers; the
+§5.11.18 prologue's `Left/AboveRefFrame[..]` derivations now consult
+the grid so subsequent inter blocks observe the propagated values.
+
+Eight new ref-frame ordinal constants land: `LAST2_FRAME = 2`,
+`LAST3_FRAME = 3`, `GOLDEN_FRAME = 4`, `BWDREF_FRAME = 5`,
+`ALTREF2_FRAME = 6` (plus the existing `INTRA_FRAME = 0`,
+`LAST_FRAME = 1`, `ALTREF_FRAME = 7`), and the
+`SINGLE_REFERENCE = 0`, `COMPOUND_REFERENCE = 1`,
+`UNIDIR_COMP_REFERENCE = 0`, `BIDIR_COMP_REFERENCE = 1` enum
+constants. New aggregate `DecodedInterBlockModeInfo` carries the
+§5.11.25 output + `is_compound` derivation (observable only via the
+walker grid since the reader always returns `Err`-path until §7.10
+lands). The §5.11.18 dispatcher signature gains four new arguments
+(`skip_mode_frame: [i32; 2]`, `seg_skip_active`, `seg_ref_frame_data`,
+`reference_select`).
+
+13 new unit tests cover the §8.3.2 ctx helpers (check_backward /
+is_samedir_ref_pair / count_refs truth tables, comp_mode_ctx
+nine-arm corners), the §5.11.23 caller-bug guards (out-of-range
+mi_row / mi_col / sub_size / seg_ref_frame_data / skip_mode_frame),
+the four §5.11.25 arm dispatch paths (skip_mode, seg_ref_frame_active,
+seg_skip / seg_globalmv, default), the §5.11.25 small-block
+`Min(bw4, bh4) < 2` gate, and the walker `ref_frames()` grid
+propagation. Test count: 602 → 615 (+13).
+`decode_av1` / `encode_av1` continue to return
 `Error::NotImplemented`.
 
 Round 168 lands **§5.11.17 `read_var_tx_size()`** + **§5.11.18

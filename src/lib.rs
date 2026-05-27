@@ -1629,14 +1629,17 @@ pub use uncompressed_header_tail::{
     prev_gm_params_default, CdefParams, DeltaLfParams, DeltaQParams, FilmGrainContext,
     FilmGrainParams, FrameRestorationType, GlobalMotionParams, InterpolationFilter,
     LoopFilterParams, LrParams, QuantizationParams, SegmentationParams, TxMode, WarpModelType,
-    ALTREF_FRAME, CDEF_MAX_STRENGTHS, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS, GM_ABS_TRANS_ONLY_BITS,
-    GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS, INTRA_FRAME, LAST_FRAME,
-    LOOP_FILTER_MODE_DELTAS_DEFAULT, LOOP_FILTER_REF_DELTAS_DEFAULT, MAX_AR_COEFFS_UV,
-    MAX_AR_COEFFS_Y, MAX_LOOP_FILTER, MAX_NUM_CHROMA_POINTS, MAX_NUM_Y_POINTS, MAX_SEGMENTS,
-    REFS_PER_FRAME, RESTORATION_TILESIZE_MAX, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
+    ALTREF2_FRAME, ALTREF_FRAME, BIDIR_COMP_REFERENCE, BWDREF_FRAME, CDEF_MAX_STRENGTHS,
+    COMPOUND_REFERENCE, GM_ABS_ALPHA_BITS, GM_ABS_TRANS_BITS, GM_ABS_TRANS_ONLY_BITS,
+    GM_ALPHA_PREC_BITS, GM_TRANS_ONLY_PREC_BITS, GM_TRANS_PREC_BITS, GOLDEN_FRAME, INTRA_FRAME,
+    LAST2_FRAME, LAST3_FRAME, LAST_FRAME, LOOP_FILTER_MODE_DELTAS_DEFAULT,
+    LOOP_FILTER_REF_DELTAS_DEFAULT, MAX_AR_COEFFS_UV, MAX_AR_COEFFS_Y, MAX_LOOP_FILTER,
+    MAX_NUM_CHROMA_POINTS, MAX_NUM_Y_POINTS, MAX_SEGMENTS, REFS_PER_FRAME,
+    RESTORATION_TILESIZE_MAX, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_MAX,
     SEGMENTATION_FEATURE_SIGNED, SEG_LVL_ALT_LF_U, SEG_LVL_ALT_LF_V, SEG_LVL_ALT_LF_Y_H,
     SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME,
-    SEG_LVL_SKIP, TOTAL_REFS_PER_FRAME, TX_MODES, WARPEDMODEL_PREC_BITS,
+    SEG_LVL_SKIP, SINGLE_REFERENCE, TOTAL_REFS_PER_FRAME, TX_MODES, UNIDIR_COMP_REFERENCE,
+    WARPEDMODEL_PREC_BITS,
 };
 
 /// Crate-local error type.
@@ -1797,14 +1800,18 @@ pub enum Error {
     /// signature.
     IntraBlockModeInfoUnsupported,
     /// The §5.11.18 [`crate::PartitionWalker::decode_inter_frame_mode_info`]
-    /// walker reached the §5.11.23 `inter_block_mode_info()` call — the
-    /// per-block inter-mode-info composite (`read_ref_frames` /
-    /// `find_mv_stack` / compound-mode / `assign_mv` /
-    /// `read_interintra_mode` / `read_motion_mode` / `read_compound_type`
-    /// / interpolation-filter reads). The composite is reachable from
-    /// the §5.11.18 `if ( is_inter )` arm. The MV-stack / reference-frame
-    /// readers are next-round targets; this stub fires after the
-    /// §5.11.18 prologue + `read_is_inter` settle on `is_inter == 1`.
+    /// walker reached the §5.11.23 `inter_block_mode_info()` call. As
+    /// of r170 the dispatcher routes into the
+    /// [`crate::PartitionWalker::decode_inter_block_mode_info`] reader
+    /// directly; the §5.11.23 prologue (`PaletteSizeY = 0`,
+    /// `PaletteSizeUV = 0`, §5.11.25 `read_ref_frames()`, `RefFrame[0..2]`
+    /// assignment, `isCompound` derivation, `RefFrames[][][..]` grid
+    /// stamp) is now implemented, and the post-prologue gap surfaces as
+    /// [`Self::FindMvStackUnsupported`] (the §7.10.2 entry).
+    /// This variant is retained only as a defensive caller-bug fallback
+    /// (e.g. an out-of-range `mi_row` / `mi_col` reaching the inter arm
+    /// before the prologue's bounds check). The §5.11.18 dispatcher no
+    /// longer fires it on the conformant path.
     InterBlockModeInfoUnsupported,
     /// The §5.11.22 [`crate::PartitionWalker::decode_intra_block_mode_info`]
     /// reader decoded `has_palette_y == 1` or `has_palette_uv == 1` and
@@ -1818,6 +1825,24 @@ pub enum Error {
     /// `palette_size_*_minus_2` `S()` read commits to the §8.3
     /// adaptation state.
     PaletteEntriesUnsupported,
+    /// The §5.11.23 [`crate::PartitionWalker::decode_inter_block_mode_info`]
+    /// reader completed the §5.11.25 `read_ref_frames()` syntax tree
+    /// (single / compound / uni-comp / bi-dir reference selection) plus
+    /// the §5.11.23 prologue (`PaletteSizeY = 0`, `PaletteSizeUV = 0`,
+    /// `RefFrame[0..2]` assignment, `isCompound = RefFrame[1] >
+    /// INTRA_FRAME` derivation, walker `RefFrames[][][..]` stamp) and
+    /// then reached the §7.10.2 `find_mv_stack(isCompound)` call.
+    ///
+    /// The §7.10 motion-vector-stack derivation (scan-row, scan-col,
+    /// temporal-scan, sorting, extra-search, context-and-clamping)
+    /// and every §5.11.23 reader that depends on its outputs
+    /// (`compound_mode`, `new_mv`, `zero_mv`, `ref_mv`, `drl_mode`,
+    /// `assign_mv`, `read_motion_mode`, `read_interintra_mode`,
+    /// `read_compound_type`, `read_interpolation_filter`) are
+    /// subsequent-arc targets. This stub fires after the §5.11.25
+    /// `read_ref_frames` reader commits to the §8.3 adaptation state
+    /// and stamps `RefFrames[][][..]`.
+    FindMvStackUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -1907,11 +1932,15 @@ impl core::fmt::Display for Error {
             ),
             Self::InterBlockModeInfoUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.18 inter_frame_mode_info reached §5.11.23 inter_block_mode_info() — MV stack / ref-frame readers pending next round"
+                "oxideav-av1: §5.11.18 inter_frame_mode_info reached §5.11.23 inter_block_mode_info() — defensive fallback retained post-r170 (see FindMvStackUnsupported for the live gap)"
             ),
             Self::PaletteEntriesUnsupported => write!(
                 f,
                 "oxideav-av1: §5.11.22 intra_block_mode_info reached §5.11.46 palette-entries L(BitDepth) / L(paletteBits) reads — palette-entries arc pending"
+            ),
+            Self::FindMvStackUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.23 inter_block_mode_info reached §7.10.2 find_mv_stack — MV-stack derivation + dependent readers pending next arc"
             ),
         }
     }

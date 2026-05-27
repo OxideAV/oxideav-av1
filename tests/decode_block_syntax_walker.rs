@@ -1230,18 +1230,40 @@ fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
 
     let pos_before = dec.position();
     let result = walker.decode_inter_frame_mode_info(
-        &mut dec, &mut cdfs, /* mi_row = */ 0, /* mi_col = */ 0, BLOCK_8X8,
-        /* seg_id_pre_skip = */ false, /* segmentation_enabled = */ false,
+        &mut dec,
+        &mut cdfs,
+        /* mi_row = */ 0,
+        /* mi_col = */ 0,
+        BLOCK_8X8,
+        /* seg_id_pre_skip = */ false,
+        /* segmentation_enabled = */ false,
         /* segmentation_update_map = */ false,
-        /* segmentation_temporal_update = */ false, /* predicted_segment_id = */ 0,
-        /* last_active_seg_id = */ 0, &lossless, /* seg_skip_mode_off = */ false,
-        /* seg_ref_frame_active = */ false, /* seg_ref_frame_is_inter = */ false,
-        /* seg_globalmv_active = */ false, /* skip_mode_present = */ false,
-        /* coded_lossless = */ false, /* enable_cdef = */ true,
-        /* allow_intrabc = */ false, /* cdef_bits = */ 0, /* read_deltas = */ false,
-        /* use_128x128_superblock = */ false, /* delta_q_res = */ 0,
-        /* delta_lf_present = */ false, /* delta_lf_multi = */ false,
-        /* mono_chrome = */ false, /* delta_lf_res = */ 0,
+        /* segmentation_temporal_update = */ false,
+        /* predicted_segment_id = */ 0,
+        /* last_active_seg_id = */ 0,
+        &lossless,
+        /* seg_skip_mode_off = */ false,
+        /* seg_ref_frame_active = */ false,
+        /* seg_ref_frame_is_inter = */ false,
+        /* seg_globalmv_active = */ false,
+        /* skip_mode_present = */ false,
+        /* coded_lossless = */ false,
+        /* enable_cdef = */ true,
+        /* allow_intrabc = */ false,
+        /* cdef_bits = */ 0,
+        /* read_deltas = */ false,
+        /* use_128x128_superblock = */ false,
+        /* delta_q_res = */ 0,
+        /* delta_lf_present = */ false,
+        /* delta_lf_multi = */ false,
+        /* mono_chrome = */ false,
+        /* delta_lf_res = */ 0,
+        // r170 §5.11.25 args — the intra arm ignores them.
+        /* skip_mode_frame = */
+        [0, -1],
+        /* seg_skip_active = */ false,
+        /* seg_ref_frame_data = */ 0,
+        /* reference_select = */ false,
     );
     let pos_after = dec.position();
     assert_eq!(
@@ -1279,15 +1301,60 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
     let lossless = [false; MAX_SEGMENTS];
 
     let result = walker.decode_inter_frame_mode_info(
-        &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
-        /* seg_ref_frame_active = */ true, /* seg_ref_frame_is_inter = */ true, false,
-        false, false, true, false, 0, false, false, 0, false, false, false, 0,
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        BLOCK_8X8,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        &lossless,
+        false,
+        /* seg_ref_frame_active = */ true,
+        /* seg_ref_frame_is_inter = */ true,
+        false,
+        false,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+        // r170 §5.11.25 args. seg_ref_frame_active = true puts the
+        // §5.11.25 reader in the "RefFrame[0] = seg_ref_frame_data,
+        // RefFrame[1] = NONE" arm — no S() reads — so the §5.11.23
+        // reader then immediately hits the FindMvStackUnsupported
+        // stub at the §7.10 entry. Pass seg_ref_frame_data = 1
+        // (LAST_FRAME) so the value is a conformant ref.
+        /* skip_mode_frame = */
+        [0, -1],
+        /* seg_skip_active = */ false,
+        /* seg_ref_frame_data = */ 1,
+        /* reference_select = */ false,
     );
     assert_eq!(
         result,
-        Err(Error::InterBlockModeInfoUnsupported),
-        "seg_ref_frame_active + is_inter ⇒ §5.11.23 stub"
+        Err(Error::FindMvStackUnsupported),
+        "seg_ref_frame_active + is_inter ⇒ §5.11.25 read_ref_frames (no S()) ⇒ §7.10 find_mv_stack stub"
     );
+    // r170: §5.11.25 stamps RefFrames[0..2][0..2][0..2] over the
+    // BLOCK_8X8 footprint = [LAST_FRAME = 1, NONE = -1].
+    let mi_cols_grid = walker.mi_cols() as usize;
+    for r in 0..2 {
+        for c in 0..2 {
+            assert_eq!(walker.ref_frames()[(r * mi_cols_grid + c) * 2], 1);
+            assert_eq!(walker.ref_frames()[(r * mi_cols_grid + c) * 2 + 1], -1);
+        }
+    }
     let mi_cols = walker.mi_cols() as usize;
     for r in 0..2 {
         for c in 0..2 {
@@ -1342,11 +1409,20 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
         false,
         false,
         0,
+        // r170 §5.11.25 args. skip_mode = 1 puts the §5.11.25 reader
+        // in the "RefFrame[0..2] = SkipModeFrame[0..2]" arm. Pass
+        // [LAST_FRAME, ALTREF_FRAME] so the result is a conformant
+        // compound pair (so the post-stamp grid view is non-trivial).
+        /* skip_mode_frame = */
+        [1, 7],
+        /* seg_skip_active = */ false,
+        /* seg_ref_frame_data = */ 0,
+        /* reference_select = */ false,
     );
     assert_eq!(
         result,
-        Err(Error::InterBlockModeInfoUnsupported),
-        "skip_mode = 1 ⇒ is_inter = 1 ⇒ §5.11.23 inter_block_mode_info stub"
+        Err(Error::FindMvStackUnsupported),
+        "skip_mode = 1 ⇒ is_inter = 1 ⇒ §5.11.25 reads SkipModeFrame ⇒ §7.10 find_mv_stack stub"
     );
     // §5.11.18 grid-fill: Skips[][] stamped to 1 over the 4×4 footprint.
     let mi_cols = walker.mi_cols() as usize;
@@ -1355,6 +1431,9 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
             assert_eq!(walker.skips()[r * mi_cols + c], 1);
             assert_eq!(walker.skip_modes()[r * mi_cols + c], 1);
             assert_eq!(walker.is_inters()[r * mi_cols + c], 1);
+            // r170: RefFrames[][] stamped to [1, 7].
+            assert_eq!(walker.ref_frames()[(r * mi_cols + c) * 2], 1);
+            assert_eq!(walker.ref_frames()[(r * mi_cols + c) * 2 + 1], 7);
         }
     }
 }
@@ -1372,11 +1451,44 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
     let lossless = [false; MAX_SEGMENTS];
 
     let result = walker.decode_inter_frame_mode_info(
-        &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
-        false, false, /* seg_globalmv_active = */ true, false, false, true, false, 0, false,
-        false, 0, false, false, false, 0,
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        BLOCK_8X8,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        &lossless,
+        false,
+        false,
+        false,
+        /* seg_globalmv_active = */ true,
+        false,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+        // r170: seg_globalmv_active = true puts §5.11.25 in the
+        // "RefFrame[0] = LAST_FRAME, RefFrame[1] = NONE" arm — no
+        // S() — then §7.10 stub.
+        /* skip_mode_frame = */
+        [0, -1],
+        /* seg_skip_active = */ false,
+        /* seg_ref_frame_data = */ 0,
+        /* reference_select = */ false,
     );
-    assert_eq!(result, Err(Error::InterBlockModeInfoUnsupported));
+    assert_eq!(result, Err(Error::FindMvStackUnsupported));
 }
 
 /// §5.11.18 caller-bug detection: out-of-range arguments surface
@@ -1391,20 +1503,110 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
 
     // Out-of-range mi_row.
     let r = walker.decode_inter_frame_mode_info(
-        &mut dec, &mut cdfs, 8, 0, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
-        false, false, false, false, false, true, false, 0, false, false, 0, false, false, false, 0,
+        &mut dec,
+        &mut cdfs,
+        8,
+        0,
+        BLOCK_8X8,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        &lossless,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+        [0, -1],
+        false,
+        0,
+        false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range mi_col.
     let r = walker.decode_inter_frame_mode_info(
-        &mut dec, &mut cdfs, 0, 8, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
-        false, false, false, false, false, true, false, 0, false, false, 0, false, false, false, 0,
+        &mut dec,
+        &mut cdfs,
+        0,
+        8,
+        BLOCK_8X8,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        &lossless,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+        [0, -1],
+        false,
+        0,
+        false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range sub_size.
     let r = walker.decode_inter_frame_mode_info(
-        &mut dec, &mut cdfs, 0, 0, 999, false, false, false, false, 0, 0, &lossless, false, false,
-        false, false, false, false, true, false, 0, false, false, 0, false, false, false, 0,
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        999,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        &lossless,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+        [0, -1],
+        false,
+        0,
+        false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range last_active_seg_id.
@@ -1437,6 +1639,10 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         false,
         0,
+        [0, -1],
+        false,
+        0,
+        false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 }

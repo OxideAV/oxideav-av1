@@ -6,6 +6,87 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 170 — §5.11.23 `inter_block_mode_info()` prologue +
+  §5.11.25 `read_ref_frames()`
+  (`PartitionWalker::decode_inter_block_mode_info`).** Lands the
+  §5.11.23 inter-arm prologue + the full §5.11.25 reference-frame
+  syntax tree, lifting the §5.11.18 `if (is_inter)` arm out of the
+  r168 `InterBlockModeInfoUnsupported` stub. The composite runs to
+  completion through:
+
+  * Lines 1-2: `PaletteSizeY = 0, PaletteSizeUV = 0` (zero-init).
+  * Line 3 / §5.11.25 `read_ref_frames()` — four-arm dispatch:
+    * `skip_mode == 1` ⇒ `RefFrame[0..2] = SkipModeFrame[0..2]`
+      (no `S()` reads; values from §5.9.22 frame-header derivation
+      passed via the new caller argument).
+    * `seg_feature_active(SEG_LVL_REF_FRAME)` ⇒
+      `RefFrame[0] = FeatureData[seg][SEG_LVL_REF_FRAME]`,
+      `RefFrame[1] = NONE` (no `S()` reads).
+    * `seg_feature_active(SEG_LVL_SKIP | SEG_LVL_GLOBALMV)` ⇒
+      `RefFrame[0] = LAST_FRAME, RefFrame[1] = NONE` (no `S()`
+      reads).
+    * Default arm: `comp_mode` `S()` (gated on `reference_select &&
+      Min(bw4, bh4) >= 2`); on COMPOUND_REFERENCE the
+      `comp_ref_type` `S()` splits into the UNIDIR_COMP ladder
+      (`uni_comp_ref` / `uni_comp_ref_p1` / `uni_comp_ref_p2`
+      against `TileUniCompRefCdf[ctx][p]`) or the BIDIR_COMP ladder
+      (`comp_ref` / `comp_ref_p1` / `comp_ref_p2` /
+      `comp_bwdref` / `comp_bwdref_p1` against `TileCompRefCdf` /
+      `TileCompBwdRefCdf`); on SINGLE_REFERENCE the
+      `single_ref_p1..p6` cascade against `TileSingleRefCdf[ctx][p]`
+      runs.
+  * Line 4: `isCompound = RefFrame[1] > INTRA_FRAME` derivation.
+  * Walker grid stamp: `RefFrames[r + y][c + x][0..2]` over the
+    block's `bh4 * bw4` footprint, so subsequent §5.11.18
+    prologues + §8.3.2 ref-frame ctx walks observe the value.
+
+  The reader then short-circuits at the §7.10.2 `find_mv_stack`
+  entry with the new `Error::FindMvStackUnsupported` — the
+  motion-vector-stack derivation + every dependent §5.11.23
+  reader (`compound_mode`, `new_mv` / `zero_mv` / `ref_mv`,
+  `drl_mode`, `assign_mv`, `read_motion_mode`,
+  `read_interintra_mode`, `read_compound_type`,
+  `read_interpolation_filter`) are subsequent-arc targets. Every
+  §5.11.25 `S()` read + the grid stamp commits to state before
+  the stub fires.
+
+  New §8.3.2 ref-frame ctx helpers land as free functions:
+  * `check_backward(ref)` — `BWDREF_FRAME..=ALTREF_FRAME` predicate.
+  * `is_samedir_ref_pair(ref0, ref1)` — same-direction-group test.
+  * `count_refs(frame_type, …)` — neighbour-slot tallying.
+  * `comp_mode_ctx(…)` — `TileCompModeCdf[ctx]` derivation
+    (av1-spec p.366, 9-arm dispatch).
+  * `comp_ref_type_ctx(…)` — `TileCompRefTypeCdf[ctx]` derivation
+    (av1-spec p.382, three-nested-if dispatch).
+
+  Walker gains a `RefFrames[][][..]` grid (`Vec<i8>`, two slots
+  per `(row, col)` cell, pre-filled with `[INTRA_FRAME, NONE]`)
+  with the `ref_frames()` view accessor + internal `ref_frame_at`
+  neighbour-lookup helper. The §5.11.18 prologue's `LeftRefFrame[..]`
+  / `AboveRefFrame[..]` derivations now consult the grid (gated by
+  `AvailU` / `AvailL`); the §8.3.2 ref-frame ctx walks observe
+  propagated values from prior decoded inter blocks rather than
+  the previously-hardcoded fallback.
+
+  Eight new public ref-frame ordinal constants land:
+  `LAST2_FRAME = 2`, `LAST3_FRAME = 3`, `GOLDEN_FRAME = 4`,
+  `BWDREF_FRAME = 5`, `ALTREF2_FRAME = 6` (alongside the existing
+  `INTRA_FRAME = 0`, `LAST_FRAME = 1`, `ALTREF_FRAME = 7`), plus
+  `SINGLE_REFERENCE = 0`, `COMPOUND_REFERENCE = 1`,
+  `UNIDIR_COMP_REFERENCE = 0`, `BIDIR_COMP_REFERENCE = 1`.
+
+  The §5.11.18 dispatcher signature gains four new arguments
+  (`skip_mode_frame: [i32; 2]`, `seg_skip_active: bool`,
+  `seg_ref_frame_data: i32`, `reference_select: bool`) threaded
+  through to the §5.11.23 reader. New `DecodedInterBlockModeInfo`
+  aggregate carries the §5.11.25 output + `is_compound` derivation
+  (currently observable only via the walker grid since the reader
+  always returns `Err`-path until §7.10 lands).
+
+  Returns the new `Error::FindMvStackUnsupported` on the §7.10
+  entry. Caller-bug arguments surface
+  `Error::PartitionWalkOutOfRange`.
+
 * **Round 169 — §5.11.22 `intra_block_mode_info()`
   (`PartitionWalker::decode_intra_block_mode_info`).** Lands the
   per-block intra-mode syntax composite reached from the §5.11.18
