@@ -1333,6 +1333,52 @@
 //!     composite remain the next round's targets. `decode_av1` /
 //!     `encode_av1` continue to return `Error::NotImplemented`.
 //!
+//!   * **Round 167.** The §5.11.16 `read_block_tx_size()` reader
+//!     (av1-spec p.70) — the per-block transform-size syntax-tree
+//!     read that r166's §5.11.5 walker hit as the first stub on the
+//!     intra arm. Lands as a new
+//!     [`cdf::PartitionWalker::read_block_tx_size`] method
+//!     (callable standalone) and is wired into the §5.11.5 walker
+//!     so the walker now reaches
+//!     [`Error::DecodeBlockComputePredictionUnsupported`] (§5.11.30)
+//!     instead.
+//!
+//!     The reader transcribes the spec body one-to-one. The outer
+//!     `TX_MODE_SELECT && MiSize > BLOCK_4X4 && is_inter && !skip &&
+//!     !Lossless` arm routes to §5.11.17 `read_var_tx_size` (the
+//!     next-arc target — surfaces a new
+//!     [`Error::ReadVarTxSizeUnsupported`]). The `else` arm inlines
+//!     §5.11.15 `read_tx_size(!skip || !is_inter)`: a `Lossless`
+//!     short-circuit forces `TxSize = TX_4X4`; otherwise `TxSize`
+//!     starts at `Max_Tx_Size_Rect[ MiSize ]` and is further split
+//!     via `Split_Tx_Size[]` for `tx_depth` iterations when the
+//!     §5.11.15 `MiSize > BLOCK_4X4 && allowSelect && TxMode ==
+//!     TX_MODE_SELECT` gate fires. The §8.3.2 `tx_depth` ctx walks
+//!     the neighbour `IsInters[]` / `MiSizes[]` / `InterTxSizes[]`
+//!     ladder per `get_above_tx_width` / `get_left_tx_height` and
+//!     selects the CDF row via `Max_Tx_Depth[ MiSize ]`. The
+//!     `else`-arm grid-fill stamps both
+//!     [`cdf::PartitionWalker::inter_tx_sizes`] and the §5.11.5
+//!     footer's [`cdf::PartitionWalker::tx_sizes`] across the block
+//!     footprint.
+//!
+//!     New spec tables ([`cdf::MAX_TX_SIZE_RECT`] /
+//!     [`cdf::MAX_TX_DEPTH_TABLE`] / [`cdf::SPLIT_TX_SIZE`] /
+//!     [`cdf::MAX_VARTX_DEPTH`]) and 14 new rectangular `TX_*`
+//!     ordinals ([`cdf::TX_4X8`] / ... / [`cdf::TX_64X16`])
+//!     transcribe av1-spec p.402, p.69, p.404, §3 p.7, and §6.10.16
+//!     respectively. New [`cdf::PartitionWalker`] grids
+//!     `tx_sizes` / `inter_tx_sizes` cover §5.11.5 / §5.11.16
+//!     write semantics. [`cdf::DecodedBlock`] gains a `tx_size`
+//!     field; [`cdf::PartitionWalker::decode_block_syntax`] gains a
+//!     `tx_mode_select: bool` parameter (threaded from the
+//!     §5.9.21 / §6.8.21 frame-header `TxMode` derivation).
+//!
+//!     10 new integration tests cover the new reader's spec paths;
+//!     5 new unit tests verify the spec tables.
+//!     `decode_av1` / `encode_av1` continue to return
+//!     [`Error::NotImplemented`].
+//!
 //!   * **Round 166.** The §5.11.5 `decode_block()` syntax-walker
 //!     skeleton (av1-spec p.63-64) — the missing dispatcher that
 //!     the §5.11.4 partition walker recurses into at every leaf.
@@ -1478,10 +1524,11 @@ pub use cdf::{
     INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES, INTRA_FILTER_MODES, INTRA_MODES,
     INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, INTRA_TX_TYPE_SET1_SIZES, INTRA_TX_TYPE_SET2_SIZES,
     IS_INTER_CONTEXTS, LEVEL_CONTEXTS, MAG_REF_OFFSET_WITH_TX_CLASS, MAX_ANGLE_DELTA, MAX_TX_DEPTH,
-    MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_TO_TXFM, MOTION_MODES, MV_CLASSES,
-    MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS,
-    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS,
-    PALETTE_COLORS, PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
+    MAX_TX_DEPTH_TABLE, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2,
+    MI_WIDTH_LOG2, MODE_TO_TXFM, MOTION_MODES, MV_CLASSES, MV_COMPS, MV_CONTEXTS,
+    MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH,
+    NUM_4X4_BLOCKS_WIDE, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS,
+    PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
     PALETTE_MAX_COLOR_CONTEXT_HASH, PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS,
     PALETTE_Y_MODE_CONTEXTS, PARTITION_CONTEXTS, PARTITION_HORZ, PARTITION_HORZ_4,
     PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE, PARTITION_SPLIT, PARTITION_SUBSIZE,
@@ -1489,14 +1536,15 @@ pub use cdf::{
     PLANE_TYPES, REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
     SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_2D, SIG_COEF_CONTEXTS_EOB, SIG_REF_DIFF_OFFSET,
     SIG_REF_DIFF_OFFSET_NUM, SINGLE_REFS, SIZE_GROUP, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
-    TXB_SKIP_CONTEXTS, TXFM_PARTITION_CONTEXTS, TX_16X16, TX_32X32, TX_4X4, TX_64X64, TX_8X8,
-    TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SET_DCTONLY, TX_SET_INTER_1,
-    TX_SET_INTER_2, TX_SET_INTER_3, TX_SET_INTRA_1, TX_SET_INTRA_2, TX_SET_TYPES_INTER,
-    TX_SET_TYPES_INTRA, TX_SIZES, TX_SIZES_ALL, TX_SIZE_CONTEXTS, TX_SIZE_SQR_UP, TX_TYPES,
-    TX_TYPES_INTRA_SET1, TX_TYPES_INTRA_SET2, TX_TYPES_SET2, TX_TYPES_SET3, TX_TYPE_IN_SET_INTER,
-    TX_TYPE_IN_SET_INTRA, TX_WIDTH, TX_WIDTH_LOG2, UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED,
-    UV_INTRA_MODES_CFL_NOT_ALLOWED, V_ADST, V_DCT, V_FLIPADST, V_PRED, WEDGE_TYPES,
-    ZERO_MV_CONTEXTS,
+    SPLIT_TX_SIZE, TXB_SKIP_CONTEXTS, TXFM_PARTITION_CONTEXTS, TX_16X16, TX_16X32, TX_16X4,
+    TX_16X64, TX_16X8, TX_32X16, TX_32X32, TX_32X64, TX_32X8, TX_4X16, TX_4X4, TX_4X8, TX_64X16,
+    TX_64X32, TX_64X64, TX_8X16, TX_8X32, TX_8X4, TX_8X8, TX_CLASS_2D, TX_CLASS_HORIZ,
+    TX_CLASS_VERT, TX_HEIGHT, TX_SET_DCTONLY, TX_SET_INTER_1, TX_SET_INTER_2, TX_SET_INTER_3,
+    TX_SET_INTRA_1, TX_SET_INTRA_2, TX_SET_TYPES_INTER, TX_SET_TYPES_INTRA, TX_SIZES, TX_SIZES_ALL,
+    TX_SIZE_CONTEXTS, TX_SIZE_SQR_UP, TX_TYPES, TX_TYPES_INTRA_SET1, TX_TYPES_INTRA_SET2,
+    TX_TYPES_SET2, TX_TYPES_SET3, TX_TYPE_IN_SET_INTER, TX_TYPE_IN_SET_INTRA, TX_WIDTH,
+    TX_WIDTH_LOG2, UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    V_ADST, V_DCT, V_FLIPADST, V_PRED, WEDGE_TYPES, ZERO_MV_CONTEXTS,
 };
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
@@ -1628,7 +1676,25 @@ pub enum Error {
     /// the §5.11.5 prologue + §5.11.6 `mode_info()` (intra arm) +
     /// §5.11.49 `palette_tokens()` (no-op on the no-palette path) up
     /// to but not including this call.
+    ///
+    /// As of r167 the variant is retained for API stability but is no
+    /// longer produced by `decode_block_syntax` (the §5.11.16 reader
+    /// landed). It remains reachable via direct calls into the walker
+    /// from out-of-tree consumers that pre-date r167.
     DecodeBlockReadBlockTxSizeUnsupported,
+    /// The §5.11.16 [`crate::PartitionWalker::read_block_tx_size`]
+    /// reader reached the `TX_MODE_SELECT && MiSize > BLOCK_4X4 &&
+    /// is_inter && !skip && !Lossless` arm that loops over
+    /// `read_var_tx_size( row, col, maxTxSz, 0 )` per
+    /// `(txH4, txW4)` sub-rectangle. §5.11.17 `read_var_tx_size` is
+    /// the next round's target and currently STUBBED. Unreachable
+    /// from [`crate::PartitionWalker::decode_block_syntax`] because
+    /// that walker short-circuits the inter arm at
+    /// [`Self::DecodeBlockInterFrameUnsupported`] upstream; surfaces
+    /// only when callers drive [`crate::PartitionWalker::read_block_tx_size`]
+    /// directly with `is_inter = 1`, `skip = 0`, `lossless = false`,
+    /// `tx_mode_select = true`.
+    ReadVarTxSizeUnsupported,
     /// The §5.11.5 [`crate::PartitionWalker::decode_block_syntax`]
     /// walker reached the §5.11.30 `compute_prediction()` call — the
     /// per-block intra / inter prediction sample-generation pass.
@@ -1718,7 +1784,11 @@ impl core::fmt::Display for Error {
             ),
             Self::DecodeBlockReadBlockTxSizeUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.5 decode_block reached §5.11.16 read_block_tx_size() — §5.11.15 / §5.11.16 / §5.11.17 transform-tree readers pending next round"
+                "oxideav-av1: §5.11.5 decode_block reached §5.11.16 read_block_tx_size() — retained for API stability post-r167"
+            ),
+            Self::ReadVarTxSizeUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.16 read_block_tx_size reached §5.11.17 read_var_tx_size() — variable transform-tree recursion pending next round"
             ),
             Self::DecodeBlockComputePredictionUnsupported => write!(
                 f,

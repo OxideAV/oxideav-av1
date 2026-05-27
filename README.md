@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 166)
+## Status — 2026-05-27 (round 167)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,125 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 167 lands **§5.11.16 `read_block_tx_size()`** (av1-spec p.70) —
+the per-block transform-size syntax-tree read that the r166 §5.11.5
+walker hits as the first stub on the intra arm. Exposed as a new
+`PartitionWalker::read_block_tx_size` method (callable standalone) and
+wired into `decode_block_syntax` so the walker now reaches §5.11.30
+`compute_prediction()` instead.
+
+The §5.11.16 reader transcribes the spec body one-to-one:
+
+* `bw4` / `bh4` from `Num_4x4_Blocks_*[ MiSize ]`.
+* The outer `TX_MODE_SELECT && MiSize > BLOCK_4X4 && is_inter && !skip
+  && !Lossless` gate routes to §5.11.17 `read_var_tx_size` (deferred
+  to the next arc — surfaces `Error::ReadVarTxSizeUnsupported`).
+* The `else` arm performs §5.11.15 `read_tx_size(!skip || !is_inter)`
+  inline: the `Lossless` short-circuit forces `TxSize = TX_4X4` (no
+  S() consumed); otherwise `TxSize` starts at
+  `Max_Tx_Size_Rect[ MiSize ]` and is further split `tx_depth` times
+  via `Split_Tx_Size[]` when `MiSize > BLOCK_4X4 && allowSelect &&
+  TxMode == TX_MODE_SELECT`.
+* `tx_depth` is an `S()` against the §8.3.2-selected CDF. The
+  selector is `TileTx{8x8,16x16,32x32,64x64}Cdf[ ctx ]` indexed by
+  `maxTxDepth = Max_Tx_Depth[ MiSize ] ∈ { 1, 2, 3, 4 }`. The ctx
+  derivation `ctx = (aboveW >= maxTxWidth) + (leftH >= maxTxHeight)`
+  walks the §8.3.2 neighbour ladder: when `AvailU &&
+  IsInters[above]`, `aboveW = Block_Width[ MiSizes[above] ]`;
+  otherwise `aboveW = Tx_Width[ InterTxSizes[above] ]` per the
+  `get_above_tx_width` helper. Mirrored for `leftH`.
+* The `else`-arm grid-fill loops over `(row, col) ∈ MiRow + 0..bh4,
+  MiCol + 0..bw4` and stamps `InterTxSizes[ row ][ col ] = TxSize`.
+  The §5.11.5 outer footer additionally stamps
+  `TxSizes[ r + y ][ c + x ] = TxSize` over the same footprint —
+  both stamps land in the reader.
+
+New `PartitionWalker` grids: `tx_sizes: Vec<u8>` for the §5.11.5
+`TxSizes[][]` writes and `inter_tx_sizes: Vec<u8>` for the §5.11.16
+/ §5.11.17 `InterTxSizes[][]` writes. Both initialised to `TX_4X4`
+(the §8.3.2 ctx-walk identity for an unavailable neighbour:
+`Tx_Width[TX_4X4] = 4`). Public accessors `tx_sizes()` /
+`inter_tx_sizes()` surface them after the walk.
+
+New spec tables transcribed in `src/cdf.rs`:
+
+* `MAX_TX_SIZE_RECT[ BLOCK_SIZES ]` — `Max_Tx_Size_Rect[ MiSize ]`
+  from av1-spec p.402. The square `BLOCK_NxN → TX_NxN` identity for
+  the four primary square sizes, `TX_64X64` cap for the 128×*
+  blocks, and the matching rectangular `TX_*` entry for every
+  rectangular `BLOCK_*`.
+* `MAX_TX_DEPTH_TABLE[ BLOCK_SIZES ]` — `Max_Tx_Depth[ MiSize ]`
+  from av1-spec p.69. The four-row listing
+  `{ 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 4, 4, 4, 2, 2, 3, 3, 4,
+  4 }`. Named `MAX_TX_DEPTH_TABLE` to avoid shadowing the existing
+  `MAX_TX_DEPTH = 2` symbol-cap constant (per the §3 listing /
+  CDF row-length contract).
+* `SPLIT_TX_SIZE[ TX_SIZES_ALL ]` — `Split_Tx_Size[ TxSize ]` from
+  av1-spec p.404. The recursive-split table that takes a transform
+  size to the size obtained by splitting it into four
+  sub-transforms; `TX_4X4` is a fixed point.
+* `MAX_VARTX_DEPTH = 2` — the §3 constant table value for the
+  §5.11.17 recursion depth cap.
+
+New `TX_*` rectangular ordinals (`TX_4X8` through `TX_64X16`, ordinals
+5..=18 per §6.10.16), needed for `MAX_TX_SIZE_RECT` and the future
+§5.11.17 reader.
+
+`DecodedBlock` gains a `tx_size: u8` field carrying the §5.11.16
+return. The struct is the no-stub-path return of the §5.11.5 walker;
+it remains publicly constructible.
+
+`decode_block_syntax` gains a `tx_mode_select: bool` parameter
+(threaded from the §5.9.21 / §6.8.21 frame-header `TxMode ==
+TX_MODE_SELECT` derivation), now invokes `read_block_tx_size` after
+the §5.11.49 `palette_tokens()` no-op, and short-circuits with the
+new `Error::DecodeBlockComputePredictionUnsupported` (the §5.11.30
+target). The §5.11.16 stub variant
+`Error::DecodeBlockReadBlockTxSizeUnsupported` is retained for API
+stability but no longer reached from the walker.
+
+New `Error::ReadVarTxSizeUnsupported` variant surfaces the §5.11.17
+`read_var_tx_size` deferral on the inter `TX_MODE_SELECT && !skip &&
+!Lossless` arm. Currently unreachable from `decode_block_syntax`
+(the inter arm is stubbed upstream at
+`Error::DecodeBlockInterFrameUnsupported`); reachable from direct
+`read_block_tx_size` calls with the right (`is_inter = 1`, `skip = 0`,
+`lossless = false`, `tx_mode_select = true`) shape.
+
+10 new integration tests
+(`tests/decode_block_syntax_walker.rs`): the standalone reader's
+`Lossless` short-circuit forces `TX_4X4` with no S() consumed; the
+`TX_MODE_LARGEST` arm skips the `tx_depth` read and returns
+`maxRectTxSize`; the `BLOCK_4X4` arm skips the read regardless of
+TxMode (`MiSize > BLOCK_4X4` is false); `TX_MODE_SELECT` with rigged
+`tx_depth = 0` / `1` / `2` walks the `Split_Tx_Size` chain
+`TX_16X16 → TX_8X8 → TX_4X4` for a BLOCK_16X16 block; the inter
+`TX_MODE_SELECT` arm surfaces the `ReadVarTxSizeUnsupported` stub
+without bitstream consumption; the inter `skip` path falls through
+the `else` arm with `allowSelect = false` and yields `maxRectTxSize`;
+out-of-range guards reject the three caller-bug cases; and the
+integrated walker reaches `compute_prediction` after the
+`read_block_tx_size` pass stamps `TxSizes[]` / `InterTxSizes[]` over
+the BLOCK_16X16 footprint. Plus 5 new unit tests for `MAX_TX_SIZE_RECT`
+square-block identity, `MAX_TX_DEPTH_TABLE` spec-listing match,
+`SPLIT_TX_SIZE` recursive-split contract, `tx_depth_ctx` combination
+table, and `MAX_VARTX_DEPTH` value.
+
+The §5.11.5 calls that remain STUBBED:
+
+* **§5.11.17 `read_var_tx_size()`** — the variable-transform-tree
+  recursion the §5.11.16 inter-arm enters; the immediate next-round
+  target for the §5.11.16 inter-arm completion (paired with §5.11.18
+  inter mode-info).
+* **§5.11.18 `inter_frame_mode_info()`** — the inter arm of §5.11.6
+  `mode_info()`; the immediate next-round target along the intra arc.
+* **§5.11.30 `compute_prediction()`** — reached after §5.11.16. The
+  immediate next-round target on the intra arm.
+* **§5.11.34 `residual()`** — reachable once §5.11.30 lands.
+
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 166 lands the §5.11.5 **`decode_block()` syntax-walker
 skeleton** (av1-spec p.63-64) — the missing dispatcher that the

@@ -9698,6 +9698,134 @@ pub const TX_16X16: usize = 2;
 pub const TX_32X32: usize = 3;
 /// See [`TX_4X4`] for the §6.10.16 ordinal source.
 pub const TX_64X64: usize = 4;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `5` (4 wide × 8 tall).
+pub const TX_4X8: usize = 5;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `6` (8 wide × 4 tall).
+pub const TX_8X4: usize = 6;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `7` (8 wide × 16 tall).
+pub const TX_8X16: usize = 7;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `8` (16 wide × 8 tall).
+pub const TX_16X8: usize = 8;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `9` (16 wide × 32 tall).
+pub const TX_16X32: usize = 9;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `10` (32 wide × 16 tall).
+pub const TX_32X16: usize = 10;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `11` (32 wide × 64 tall).
+pub const TX_32X64: usize = 11;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `12` (64 wide × 32 tall).
+pub const TX_64X32: usize = 12;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `13` (4 wide × 16 tall).
+pub const TX_4X16: usize = 13;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `14` (16 wide × 4 tall).
+pub const TX_16X4: usize = 14;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `15` (8 wide × 32 tall).
+pub const TX_8X32: usize = 15;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `16` (32 wide × 8 tall).
+pub const TX_32X8: usize = 16;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `17` (16 wide × 64 tall).
+pub const TX_16X64: usize = 17;
+/// See [`TX_4X4`] for the §6.10.16 ordinal source. Rectangular
+/// `TX_SIZES_ALL` ordinal `18` (64 wide × 16 tall).
+pub const TX_64X16: usize = 18;
+
+/// `MAX_VARTX_DEPTH` (§3, av1-spec p.7) — maximum depth for variable
+/// transform trees. The §5.11.17 `read_var_tx_size` recursion stops
+/// reading `txfm_split` once `depth` reaches this value (or once
+/// `txSz == TX_4X4`).
+pub const MAX_VARTX_DEPTH: u32 = 2;
+
+/// `Max_Tx_Size_Rect[ BLOCK_SIZES ]` (§ Additional tables,
+/// av1-spec p.402). For each block size, the largest rectangular
+/// transform size that fits. Indexed by `MiSize` in `0..BLOCK_SIZES`.
+/// Entries are `TX_SIZES_ALL` ordinals. Used by §5.11.15
+/// `read_tx_size` (`maxRectTxSize = Max_Tx_Size_Rect[ MiSize ]`) and
+/// by §5.11.16 `read_block_tx_size`.
+pub const MAX_TX_SIZE_RECT: [usize; BLOCK_SIZES] = [
+    TX_4X4,   // BLOCK_4X4
+    TX_4X8,   // BLOCK_4X8
+    TX_8X4,   // BLOCK_8X4
+    TX_8X8,   // BLOCK_8X8
+    TX_8X16,  // BLOCK_8X16
+    TX_16X8,  // BLOCK_16X8
+    TX_16X16, // BLOCK_16X16
+    TX_16X32, // BLOCK_16X32
+    TX_32X16, // BLOCK_32X16
+    TX_32X32, // BLOCK_32X32
+    TX_32X64, // BLOCK_32X64
+    TX_64X32, // BLOCK_64X32
+    TX_64X64, // BLOCK_64X64
+    TX_64X64, // BLOCK_64X128
+    TX_64X64, // BLOCK_128X64
+    TX_64X64, // BLOCK_128X128
+    TX_4X16,  // BLOCK_4X16
+    TX_16X4,  // BLOCK_16X4
+    TX_8X32,  // BLOCK_8X32
+    TX_32X8,  // BLOCK_32X8
+    TX_16X64, // BLOCK_16X64
+    TX_64X16, // BLOCK_64X16
+];
+
+/// `Max_Tx_Depth[ BLOCK_SIZES ]` (§5.11.15, av1-spec p.69). For each
+/// block size, the maximum transform depth (the number of times the
+/// transform must be split to reach a 4×4 transform size). Indexed by
+/// `MiSize` in `0..BLOCK_SIZES`. Spec note: this value can exceed
+/// [`MAX_TX_DEPTH`] (`2`) for the larger block sizes — the
+/// `tx_depth` syntax element only encodes values in `0..=2`, which
+/// the §8.3.2 `tx_depth_cdf` lookup row dimensionality reflects.
+///
+/// Named `MAX_TX_DEPTH_TABLE` rather than `MAX_TX_DEPTH` to avoid
+/// shadowing the existing [`MAX_TX_DEPTH`] symbol-cap constant
+/// (the §3 constant, which is `2` and bounds the row length of
+/// `Default_Tx_*Cdf`).
+pub const MAX_TX_DEPTH_TABLE: [u32; BLOCK_SIZES] = [
+    0, 1, 1, 1, // BLOCK_4X4, BLOCK_4X8, BLOCK_8X4, BLOCK_8X8
+    2, 2, 2, 3, // BLOCK_8X16, BLOCK_16X8, BLOCK_16X16, BLOCK_16X32
+    3, 3, 4, 4, // BLOCK_32X16, BLOCK_32X32, BLOCK_32X64, BLOCK_64X32
+    4, 4, 4, 4, // BLOCK_64X64, BLOCK_64X128, BLOCK_128X64, BLOCK_128X128
+    2, 2, 3, 3, // BLOCK_4X16, BLOCK_16X4, BLOCK_8X32, BLOCK_32X8
+    4, 4, // BLOCK_16X64, BLOCK_64X16
+];
+
+/// `Split_Tx_Size[ TX_SIZES_ALL ]` (§ Additional tables,
+/// av1-spec p.404). For each transform size, the size obtained by
+/// splitting it into four sub-transforms. Indexed by `TxSize` in
+/// `0..TX_SIZES_ALL`. Used by §5.11.15 (the `tx_depth` loop that
+/// repeatedly splits `maxRectTxSize`) and by §5.11.17
+/// `read_var_tx_size` (the per-recursion split).
+pub const SPLIT_TX_SIZE: [usize; TX_SIZES_ALL] = [
+    TX_4X4,   // TX_4X4   -> TX_4X4 (no further split)
+    TX_4X4,   // TX_8X8   -> TX_4X4
+    TX_8X8,   // TX_16X16 -> TX_8X8
+    TX_16X16, // TX_32X32 -> TX_16X16
+    TX_32X32, // TX_64X64 -> TX_32X32
+    TX_4X4,   // TX_4X8   -> TX_4X4
+    TX_4X4,   // TX_8X4   -> TX_4X4
+    TX_8X8,   // TX_8X16  -> TX_8X8
+    TX_8X8,   // TX_16X8  -> TX_8X8
+    TX_16X16, // TX_16X32 -> TX_16X16
+    TX_16X16, // TX_32X16 -> TX_16X16
+    TX_32X32, // TX_32X64 -> TX_32X32
+    TX_32X32, // TX_64X32 -> TX_32X32
+    TX_4X8,   // TX_4X16  -> TX_4X8
+    TX_8X4,   // TX_16X4  -> TX_8X4
+    TX_8X16,  // TX_8X32  -> TX_8X16
+    TX_16X8,  // TX_32X8  -> TX_16X8
+    TX_16X32, // TX_16X64 -> TX_16X32
+    TX_32X16, // TX_64X16 -> TX_32X16
+];
 
 /// §6.10.19 / §3 transform-type ordinals. The spec lists `DCT_DCT = 0`
 /// through `H_FLIPADST = 15` in a single enumeration; these are the
@@ -10986,6 +11114,26 @@ pub struct PartitionWalker {
     /// `Intra_Mode_Context[ DC_PRED ] = 0` weight as an unavailable
     /// neighbour.
     y_modes: Vec<u8>,
+    /// `TxSizes[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec §5.11.5 / §5.11.16 — the
+    /// per-block §5.11.5 grid-fill writes `TxSizes[ r + y ][ c + x ] =
+    /// TxSize` after `read_block_tx_size()` returns). Entries hold the
+    /// `TxSize` ordinal (`TX_4X4 = 0..=TX_64X16 = 18` per §6.10.16).
+    /// Cells that no §5.11.16 [`Self::read_block_tx_size`] call has
+    /// stamped yet carry [`TX_4X4`] (`0`, the initial-value identity
+    /// for the §8.3.2 ctx walks that consult the grid — an
+    /// unfilled-cell neighbour contributes a TX_4X4 = 0-wide / 0-tall
+    /// summand which is the natural identity).
+    tx_sizes: Vec<u8>,
+    /// `InterTxSizes[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec §5.11.16 / §5.11.17 — both the
+    /// `read_block_tx_size` `else` arm (`InterTxSizes[..] = TxSize`)
+    /// and the `read_var_tx_size` recursive base case
+    /// (`InterTxSizes[..] = txSz`) stamp into this grid). Entries are
+    /// `TxSize` ordinals (`TX_4X4 = 0..=TX_64X16 = 18`); pre-write
+    /// cells carry [`TX_4X4`] (`0`), the §8.3.2 `tx_depth` /
+    /// `txfm_split` ctx-walk identity for an unavailable neighbour.
+    inter_tx_sizes: Vec<u8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -11057,6 +11205,18 @@ impl PartitionWalker {
         let mut y_modes: Vec<u8> = Vec::new();
         y_modes.try_reserve_exact(area).ok()?;
         y_modes.resize(area, 0);
+        // §5.11.16 / §5.11.5: pre-fill `TxSizes[]` and `InterTxSizes[]`
+        // with `TX_4X4 = 0`. An unavailable neighbour contributes the
+        // same `Tx_Width[ TX_4X4 ] = 4` / `Tx_Height[ TX_4X4 ] = 4`
+        // weight to the §8.3.2 `tx_depth` / `txfm_split` ctx walks as
+        // a not-yet-decoded cell, so the initial-zero state is the
+        // natural identity for the walks consulting either grid.
+        let mut tx_sizes: Vec<u8> = Vec::new();
+        tx_sizes.try_reserve_exact(area).ok()?;
+        tx_sizes.resize(area, TX_4X4 as u8);
+        let mut inter_tx_sizes: Vec<u8> = Vec::new();
+        inter_tx_sizes.try_reserve_exact(area).ok()?;
+        inter_tx_sizes.resize(area, TX_4X4 as u8);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -11072,6 +11232,8 @@ impl PartitionWalker {
             above_seg_pred_context,
             left_seg_pred_context,
             y_modes,
+            tx_sizes,
+            inter_tx_sizes,
             blocks: Vec::new(),
         })
     }
@@ -11489,6 +11651,30 @@ impl PartitionWalker {
             return 0;
         }
         self.y_modes[(r * self.mi_cols + c) as usize]
+    }
+
+    /// View of the §5.11.5 / §5.11.16 `TxSizes[]` grid after the walk.
+    /// Indexed row-major: `tx_sizes()[ r * MiCols + c ]`. Cells that
+    /// no §5.11.16 [`Self::read_block_tx_size`] call has stamped yet
+    /// carry [`TX_4X4`] (`0`, the constructor pre-fill). Cells inside
+    /// a decoded block's `bh4 * bw4` footprint carry the block's
+    /// `TxSize` ordinal (`0..TX_SIZES_ALL`).
+    #[must_use]
+    pub fn tx_sizes(&self) -> &[u8] {
+        &self.tx_sizes
+    }
+
+    /// View of the §5.11.16 / §5.11.17 `InterTxSizes[]` grid after the
+    /// walk. Indexed row-major: `inter_tx_sizes()[ r * MiCols + c ]`.
+    /// Cells that no §5.11.16 / §5.11.17 call has stamped yet carry
+    /// [`TX_4X4`] (`0`, the constructor pre-fill). Decoded-block
+    /// footprints carry the block's per-cell `TxSize` (which equals
+    /// the block-level `TxSize` for the §5.11.16 `else`-arm grid-fill,
+    /// and the per-sub-transform `txSz` for the §5.11.17 `read_var_tx_size`
+    /// recursive base case).
+    #[must_use]
+    pub fn inter_tx_sizes(&self) -> &[u8] {
+        &self.inter_tx_sizes
     }
 
     /// View of the §6.10.4 `SegmentIds[]` grid after the walk. Indexed
@@ -13790,6 +13976,313 @@ impl PartitionWalker {
         Ok(y_mode)
     }
 
+    /// Helper to read `InterTxSizes[ r ][ c ]` for the §8.3.2
+    /// `tx_depth` ctx walk. Returns `TX_4X4 = 0` for out-of-grid
+    /// coordinates (the §8.3.2 derivation falls back through the
+    /// `AvailU` / `AvailL` gate before consulting the grid, and the
+    /// `aboveW = 0` / `leftH = 0` fallback for an unavailable
+    /// neighbour matches what an unfilled cell would contribute via
+    /// `Tx_Width[ TX_4X4 ] = 4`).
+    #[inline]
+    fn inter_tx_size_at(&self, r: i32, c: i32) -> u8 {
+        if r < 0 || c < 0 {
+            return TX_4X4 as u8;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return TX_4X4 as u8;
+        }
+        self.inter_tx_sizes[(r * self.mi_cols + c) as usize]
+    }
+
+    /// `read_block_tx_size()` per §5.11.16 (av1-spec p.70) — the
+    /// per-block transform-size syntax-tree read.
+    ///
+    /// The spec body reads:
+    ///
+    /// ```text
+    ///   read_block_tx_size( ) {
+    ///       bw4 = Num_4x4_Blocks_Wide[ MiSize ]
+    ///       bh4 = Num_4x4_Blocks_High[ MiSize ]
+    ///       if ( TxMode == TX_MODE_SELECT &&
+    ///            MiSize > BLOCK_4X4 && is_inter &&
+    ///            !skip && !Lossless ) {
+    ///           maxTxSz = Max_Tx_Size_Rect[ MiSize ]
+    ///           txW4 = Tx_Width[ maxTxSz ] / MI_SIZE
+    ///           txH4 = Tx_Height[ maxTxSz ] / MI_SIZE
+    ///           for ( row = MiRow; row < MiRow + bh4; row += txH4 )
+    ///                for ( col = MiCol; col < MiCol + bw4; col += txW4 )
+    ///                    read_var_tx_size( row, col, maxTxSz, 0 )
+    ///       } else {
+    ///           read_tx_size( !skip || !is_inter )
+    ///           for ( row = MiRow; row < MiRow + bh4; row++ )
+    ///                for ( col = MiCol; col < MiCol + bw4; col++ )
+    ///                    InterTxSizes[ row ][ col ] = TxSize
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// And the §5.11.15 `read_tx_size( allowSelect )` body the `else`
+    /// arm invokes (av1-spec p.69):
+    ///
+    /// ```text
+    ///   read_tx_size( allowSelect ) {
+    ///       if ( Lossless ) { TxSize = TX_4X4; return }
+    ///       maxRectTxSize = Max_Tx_Size_Rect[ MiSize ]
+    ///       maxTxDepth = Max_Tx_Depth[ MiSize ]
+    ///       TxSize = maxRectTxSize
+    ///       if ( MiSize > BLOCK_4X4 && allowSelect && TxMode == TX_MODE_SELECT ) {
+    ///           tx_depth                                                  S()
+    ///           for ( i = 0; i < tx_depth; i++ )
+    ///               TxSize = Split_Tx_Size[ TxSize ]
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// And the §8.3.2 `tx_depth` ctx formula (av1-spec p.363):
+    ///
+    /// ```text
+    ///   maxTxWidth = Tx_Width[ maxRectTxSize ]
+    ///   maxTxHeight = Tx_Height[ maxRectTxSize ]
+    ///   if ( AvailU && IsInters[ MiRow - 1 ][ MiCol ] )
+    ///       aboveW = Block_Width[ MiSizes[ MiRow - 1 ][ MiCol ] ]
+    ///   else if ( AvailU )
+    ///       aboveW = get_above_tx_width( MiRow, MiCol )
+    ///   else
+    ///       aboveW = 0
+    ///   ... mirror for leftH ...
+    ///   ctx = ( aboveW >= maxTxWidth ) + ( leftH >= maxTxHeight )
+    /// ```
+    ///
+    /// Where (av1-spec p.364):
+    ///
+    /// ```text
+    ///   get_above_tx_width( row, col ) {
+    ///       if ( row == MiRow ) {
+    ///           if ( !AvailU ) return 64
+    ///           else if ( Skips[ row - 1 ][ col ] && IsInters[ row - 1 ][ col ] )
+    ///               return Block_Width[ MiSizes[ row - 1 ][ col ] ]
+    ///       }
+    ///       return Tx_Width[ InterTxSizes[ row - 1 ][ col ] ]
+    ///   }
+    /// ```
+    ///
+    /// Caller contract:
+    ///
+    /// * `mi_row` / `mi_col` — block top-left (`MiRow` / `MiCol` per
+    ///   §5.11.5).
+    /// * `sub_size` — the §5.11.5 `MiSize` ordinal.
+    /// * `lossless` — `LosslessArray[ segment_id ]` for this block per
+    ///   §5.11.8. When `true` the spec forces `TxSize = TX_4X4` with
+    ///   no symbol read.
+    /// * `is_inter` — `0` for intra blocks (the keyframe / intra-only
+    ///   arm always passes `0`); `1` for inter blocks.
+    /// * `skip` — the §5.11.11 `skip` value (`0` or `1`).
+    /// * `tx_mode_select` — `true` ⇔ §5.9.21 / §6.8.21 `TxMode ==
+    ///   TX_MODE_SELECT`. Sourced from the frame header by the caller.
+    ///
+    /// Returns the §6.10.16 `TxSize` ordinal selected for the block
+    /// (one of `TX_4X4..TX_64X16`, in `0..TX_SIZES_ALL`). On the
+    /// `else` arm the value is also stamped into the
+    /// `bh4 * bw4` footprint of [`Self::inter_tx_sizes`] and
+    /// [`Self::tx_sizes`].
+    ///
+    /// On the `TX_MODE_SELECT && is_inter` arm this round returns
+    /// [`crate::Error::ReadVarTxSizeUnsupported`] — §5.11.17
+    /// `read_var_tx_size` is the next-round target. The arm is
+    /// unreachable from the current §5.11.5 [`Self::decode_block_syntax`]
+    /// walker because that walker's `is_inter == 1` paths are stubbed
+    /// upstream at [`crate::Error::DecodeBlockInterFrameUnsupported`]
+    /// (the §5.11.18 inter mode-info dispatcher), so calling
+    /// `read_block_tx_size` directly with `is_inter = 1` and a
+    /// `tx_mode_select = true` frame surfaces the stub for tests that
+    /// drive the standalone reader.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_block_tx_size(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        lossless: bool,
+        is_inter: bool,
+        skip: bool,
+        tx_mode_select: bool,
+    ) -> Result<u8, crate::Error> {
+        // Caller-bug guards (the §5.11.5 driver already gates these,
+        // but this method is also part of the public API).
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.16 lines 1-2: `bw4 = Num_4x4_Blocks_Wide[ MiSize ]`,
+        // `bh4 = Num_4x4_Blocks_High[ MiSize ]`. Bounded by the
+        // [`NUM_4X4_BLOCKS_WIDE`] / [`NUM_4X4_BLOCKS_HIGH`] spec
+        // tables.
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+
+        // §5.11.16 outer dispatch: the `TX_MODE_SELECT && MiSize >
+        // BLOCK_4X4 && is_inter && !skip && !Lossless` arm gates the
+        // §5.11.17 `read_var_tx_size` recursion.
+        if tx_mode_select && sub_size > BLOCK_4X4 && is_inter && !skip && !lossless {
+            // §5.11.17 is the next round's target. The arm is
+            // unreachable from the current decode_block_syntax walker
+            // (which short-circuits on `frame_is_intra = false`); we
+            // surface a stub for callers that drive this method
+            // directly.
+            return Err(crate::Error::ReadVarTxSizeUnsupported);
+        }
+
+        // §5.11.16 `else` arm: `read_tx_size( !skip || !is_inter )`.
+        // For the intra arm (`is_inter == 0`) `allowSelect` is always
+        // `true`. For the inter arm with `skip == 1` `allowSelect` is
+        // also `true`.
+        let allow_select = !skip || !is_inter;
+
+        // §5.11.15 body — `read_tx_size( allowSelect )`.
+        let tx_size = if lossless {
+            // §5.11.15 first line: `if ( Lossless ) { TxSize = TX_4X4;
+            // return }`.
+            TX_4X4 as u8
+        } else {
+            // §5.11.15 lines 2-5: `maxRectTxSize = Max_Tx_Size_Rect[
+            // MiSize ]`, `maxTxDepth = Max_Tx_Depth[ MiSize ]`,
+            // `TxSize = maxRectTxSize`.
+            let max_rect_tx_size = MAX_TX_SIZE_RECT[sub_size];
+            let max_tx_depth = MAX_TX_DEPTH_TABLE[sub_size];
+            let mut tx_size = max_rect_tx_size;
+            // §5.11.15 lines 6-9: the `tx_depth` symbol read +
+            // recursive `Split_Tx_Size` walk. Gated by
+            // `MiSize > BLOCK_4X4 && allowSelect && TxMode ==
+            // TX_MODE_SELECT`. The §8.3.2 `tx_depth_cdf` selector
+            // already returns `None` for `max_tx_depth == 0`, which
+            // matches the spec's "no tx_depth read in that case"
+            // (the §5.11.15 `MiSize > BLOCK_4X4` gate also excludes
+            // every `max_tx_depth == 0` row of [`MAX_TX_DEPTH_TABLE`]
+            // — only `BLOCK_4X4` has `max_tx_depth == 0`).
+            if sub_size > BLOCK_4X4 && allow_select && tx_mode_select {
+                // §8.3.2 `tx_depth` ctx derivation (av1-spec p.363):
+                //   maxTxWidth = Tx_Width[ maxRectTxSize ]
+                //   maxTxHeight = Tx_Height[ maxRectTxSize ]
+                let max_tx_width = TX_WIDTH[max_rect_tx_size] as u32;
+                let max_tx_height = TX_HEIGHT[max_rect_tx_size] as u32;
+                // The §8.3.2 `aboveW` ladder. For our walker
+                // `MiRow == row` always (the §8.3.2 helpers are
+                // written generically over `row` but only invoked at
+                // the block's top-left).
+                let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+                let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+                let above_w: u32 = if avail_u {
+                    let above_is_inter = self.is_inter_at(mi_row as i32 - 1, mi_col as i32);
+                    if above_is_inter != 0 {
+                        // `IsInters[ above ] == 1` ⇒ `aboveW =
+                        // Block_Width[ MiSizes[ above ] ]`.
+                        let nb = self.mi_size_at(mi_row as i32 - 1, mi_col as i32);
+                        if nb < BLOCK_SIZES {
+                            block_width(nb) as u32
+                        } else {
+                            // Unfilled cell (still BLOCK_INVALID) —
+                            // treat the same as the
+                            // `get_above_tx_width` fall-through
+                            // `Tx_Width[ InterTxSizes ]` lookup with
+                            // the initial-zero TX_4X4 ⇒ 4.
+                            TX_WIDTH[TX_4X4] as u32
+                        }
+                    } else {
+                        // `else if ( AvailU )` arm:
+                        //   aboveW = get_above_tx_width( MiRow, MiCol )
+                        // For `row == MiRow && AvailU` and the
+                        // `Skips[above] && IsInters[above]` condition
+                        // false (we already established `IsInters ==
+                        // 0`), the fall-through returns
+                        // `Tx_Width[ InterTxSizes[ row - 1 ][ col ] ]`.
+                        let nb_tx = self.inter_tx_size_at(mi_row as i32 - 1, mi_col as i32);
+                        TX_WIDTH[nb_tx as usize] as u32
+                    }
+                } else {
+                    0
+                };
+                let left_h: u32 = if avail_l {
+                    let left_is_inter = self.is_inter_at(mi_row as i32, mi_col as i32 - 1);
+                    if left_is_inter != 0 {
+                        let nb = self.mi_size_at(mi_row as i32, mi_col as i32 - 1);
+                        if nb < BLOCK_SIZES {
+                            block_height(nb) as u32
+                        } else {
+                            TX_HEIGHT[TX_4X4] as u32
+                        }
+                    } else {
+                        let nb_tx = self.inter_tx_size_at(mi_row as i32, mi_col as i32 - 1);
+                        TX_HEIGHT[nb_tx as usize] as u32
+                    }
+                } else {
+                    0
+                };
+                let ctx = tx_depth_ctx(above_w, left_h, max_tx_width, max_tx_height);
+                debug_assert!(
+                    ctx < TX_SIZE_CONTEXTS,
+                    "§8.3.2 tx_depth ctx is bounded by 0..TX_SIZE_CONTEXTS"
+                );
+                // §8.3.2 CDF selection: `Tile{Tx8x8,Tx16x16,Tx32x32,
+                // Tx64x64}Cdf[ ctx ]` per `max_tx_depth`. We already
+                // gated `MiSize > BLOCK_4X4` (which excludes the only
+                // `max_tx_depth == 0` row), so the selector returns
+                // `Some(_)`.
+                let cdf = cdfs
+                    .tx_depth_cdf(max_tx_depth, ctx)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let tx_depth = decoder.read_symbol(cdf)?;
+                // §5.11.15 line 8: `for ( i = 0; i < tx_depth; i++ )
+                //                       TxSize = Split_Tx_Size[ TxSize ]`.
+                // The §5.11.15 spec note bounds `tx_depth` to
+                // `0..=MAX_TX_DEPTH = 0..=2` (the `Default_Tx_*Cdf`
+                // row length caps the S() output). The `Split_Tx_Size`
+                // lookup is total over `0..TX_SIZES_ALL`.
+                debug_assert!(
+                    tx_depth <= MAX_TX_DEPTH as u32,
+                    "tx_depth in 0..=MAX_TX_DEPTH per §5.11.15 note"
+                );
+                for _ in 0..tx_depth {
+                    debug_assert!(tx_size < TX_SIZES_ALL, "TxSize is bounded by TX_SIZES_ALL");
+                    tx_size = SPLIT_TX_SIZE[tx_size];
+                }
+            }
+            tx_size as u8
+        };
+
+        // §5.11.16 `else` arm grid-fill:
+        //   for ( row = MiRow; row < MiRow + bh4; row++ )
+        //       for ( col = MiCol; col < MiCol + bw4; col++ )
+        //           InterTxSizes[ row ][ col ] = TxSize
+        //
+        // Plus the §5.11.5 outer `TxSizes[ r + y ][ c + x ] = TxSize`
+        // grid-fill (which `decode_block` applies after
+        // `read_block_tx_size` returns). We perform both stamps here
+        // so the walker's grid invariants stay in sync.
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                let idx = (rr * self.mi_cols + cc) as usize;
+                self.inter_tx_sizes[idx] = tx_size;
+                self.tx_sizes[idx] = tx_size;
+            }
+        }
+
+        Ok(tx_size)
+    }
+
     /// `decode_block( r, c, subSize )` per §5.11.5 (av1-spec p.63-64)
     /// — the per-block syntax-walker entry. This is the
     /// long-skeleton-with-stubs sibling of the leaf-only
@@ -13872,9 +14365,24 @@ impl PartitionWalker {
     ///   is a no-op per the spec's outer guard. The §5.11.49
     ///   [`palette_tokens_plane`] machinery itself already exists; it
     ///   is exposed for once `palette_mode_info()` lands.
+    /// * §5.11.16 **`read_block_tx_size()`** — landed in r167 via
+    ///   [`Self::read_block_tx_size`]. On the implemented intra arm
+    ///   (`is_inter == 0`, which forces the §5.11.16 `else` arm
+    ///   `read_tx_size(!skip || !is_inter)`) the walker invokes
+    ///   `read_tx_size` per §5.11.15, reads `tx_depth` against the
+    ///   `Tx{8x8,16x16,32x32,64x64}Cdf` row selected by §8.3.2 (when
+    ///   `MiSize > BLOCK_4X4 && TxMode == TX_MODE_SELECT`), and
+    ///   stamps the resulting `TxSize` into both `TxSizes[]` and
+    ///   `InterTxSizes[]` over the block's `bh4 * bw4` footprint. The
+    ///   §5.11.16 inter `TX_MODE_SELECT && !skip && !Lossless` arm
+    ///   (the §5.11.17 `read_var_tx_size` recursion) is the next
+    ///   round's target — unreachable from this walker because the
+    ///   inter arm is stubbed upstream at
+    ///   [`crate::Error::DecodeBlockInterFrameUnsupported`].
     /// * §5.11.5 grid-fill **for the writes the walker computed** —
     ///   `YModes[][]`, `RefFrames[][][0..2]`, `IsInters[][]`,
-    ///   `SkipModes[][]`, `Skips[][]`, `MiSizes[][]`, `SegmentIds[][]`
+    ///   `SkipModes[][]`, `Skips[][]`, `MiSizes[][]`, `SegmentIds[][]`,
+    ///   `TxSizes[][]`, `InterTxSizes[][]`
     ///   already happen inside the composed leaves (the §5.11.5
     ///   per-element grid-fill loops are factored into each leaf's
     ///   own write). The walker additionally records the §5.11.5
@@ -13883,16 +14391,12 @@ impl PartitionWalker {
     ///
     /// STUBBED in this round (each becomes the next round's target):
     ///
-    /// * §5.11.16 [`crate::Error::DecodeBlockReadBlockTxSizeUnsupported`]
-    ///   — `read_block_tx_size()` and its §5.11.17 `read_var_tx_size`
-    ///   sub-tree. The walker hits this stub after the mode-info pass
-    ///   completes; the test fixture verifies the bitstream cursor is
-    ///   at the post-mode-info position when the error fires.
     /// * §5.11.18 [`crate::Error::DecodeBlockInterFrameUnsupported`]
     ///   — `inter_frame_mode_info()` for `FrameIsIntra == 0`.
     /// * §5.11.30 [`crate::Error::DecodeBlockComputePredictionUnsupported`]
     ///   — `compute_prediction()` (intra / inter prediction sample
-    ///   generation). Reachable once §5.11.16 lands.
+    ///   generation). The walker now hits this stub after
+    ///   `read_block_tx_size` completes on the intra arm.
     /// * §5.11.34 [`crate::Error::DecodeBlockResidualUnsupported`] —
     ///   `residual()` (transform-coefficient read + inverse-transform
     ///   + reconstruction). Reachable once §5.11.30 lands.
@@ -13966,6 +14470,12 @@ impl PartitionWalker {
         delta_lf_multi: bool,
         mono_chrome: bool,
         delta_lf_res: u8,
+        // §5.9.21 / §6.8.21 `TxMode == TX_MODE_SELECT`. Threaded
+        // through to `read_block_tx_size` per §5.11.16. Source: the
+        // §5.9.21 frame-header `TxMode` derivation
+        // (`read_tx_mode`); `false` corresponds to `TX_MODE_LARGEST`
+        // / `ONLY_4X4`.
+        tx_mode_select: bool,
     ) -> Result<DecodedBlock, crate::Error> {
         // §5.11.5 prologue — range guards (caller-bug detection).
         if sub_size >= BLOCK_SIZES {
@@ -14122,21 +14632,55 @@ impl PartitionWalker {
         // (No work here on the no-palette path — the spec body
         // doesn't gate `read_block_tx_size()` on the palette result.)
 
-        // §5.11.5 line `read_block_tx_size( )` — §5.11.16 STUB. The
+        // §5.11.5 line `read_block_tx_size( )` — §5.11.16 reader. The
         // walker has completed the §5.11.5 prologue + §5.11.6
         // `mode_info()` (intra arm) + §5.11.49 `palette_tokens()`
         // (no-op) and emits a [`DecodedBlockRecord`] so callers can
-        // observe the §5.11.5 entry through [`Self::blocks`].
+        // observe the §5.11.5 entry through [`Self::blocks`]. Then it
+        // performs the §5.11.16 read against the running grid state
+        // and stamps `TxSizes[]` / `InterTxSizes[]` across the block
+        // footprint via [`Self::read_block_tx_size`].
+        //
+        // On the implemented intra arm `is_inter == 0`, so §5.11.16's
+        // outer `TX_MODE_SELECT && is_inter` gate is false and the
+        // `else` arm always fires — `read_tx_size(!skip || true)` =
+        // `read_tx_size(true)`. The §5.11.15 body inside handles the
+        // `Lossless` short-circuit (forces `TX_4X4`) and the
+        // `MiSize > BLOCK_4X4 && allowSelect && TxMode == TX_MODE_SELECT`
+        // `tx_depth` read.
         self.decode_block(mi_row_b, mi_col_b, sub_size);
+        let tx_size = self.read_block_tx_size(
+            decoder,
+            cdfs,
+            mi_row_b,
+            mi_col_b,
+            sub_size,
+            prefix.lossless,
+            /* is_inter = */ is_inter != 0,
+            /* skip = */ prefix.skip != 0,
+            tx_mode_select,
+        )?;
 
-        // The §5.11.5 / §5.11.6 / §5.11.7 reads above are all
-        // accounted for on the decoder's bit cursor; the next call
-        // is §5.11.16 `read_block_tx_size( )` and onwards. Surface
-        // the per-block derived state in the returned `DecodedBlock`
-        // before short-circuiting at the stub so the test fixture
-        // (and any future caller that ignores the stub) can observe
-        // the implemented prologue's outputs.
-        let _ = DecodedBlock {
+        // §5.11.5 line `if ( skip ) reset_block_context( bw4, bh4 )`.
+        // `reset_block_context` per §5.11.42 (av1-spec p.92) zeroes
+        // per-superblock palette / above / left context arrays for
+        // the block's footprint. None of those arrays are tracked on
+        // the walker yet (the §5.11.42 context arrays are
+        // out-of-scope until the §5.11.34 residual reader lands), so
+        // this is a no-op on the current grid surface — the call
+        // site is preserved as a code-doc comment for the round that
+        // wires the §5.11.42 arrays.
+
+        // §5.11.5 line `isCompound = RefFrame[ 1 ] > INTRA_FRAME`.
+        // On the intra arm `RefFrame[ 1 ] = NONE = -1 < INTRA_FRAME =
+        // 0` so `isCompound = false`.
+        let is_compound = false;
+
+        // Per-block derived state surfaced through the returned
+        // `DecodedBlock`. The §5.11.30 `compute_prediction()` /
+        // §5.11.34 `residual()` calls follow this point in the spec;
+        // they are the next round's targets.
+        let _db = DecodedBlock {
             mi_row: mi_row_b,
             mi_col: mi_col_b,
             mi_size,
@@ -14158,9 +14702,17 @@ impl PartitionWalker {
             use_intrabc,
             is_inter,
             y_mode,
-            is_compound: false, // §5.11.5: RefFrame[1] = NONE ⇒ IsCompound = false
+            is_compound,
+            tx_size,
         };
-        Err(crate::Error::DecodeBlockReadBlockTxSizeUnsupported)
+
+        // §5.11.5 line `compute_prediction( )` — §5.11.30 STUB. The
+        // walker has completed the §5.11.5 prologue + §5.11.6
+        // `mode_info()` (intra arm) + §5.11.49 `palette_tokens()`
+        // (no-op) + §5.11.16 `read_block_tx_size()` and now reaches
+        // the next §5.11.5 call. `compute_prediction()` (intra / inter
+        // prediction sample generation) is the next round's target.
+        Err(crate::Error::DecodeBlockComputePredictionUnsupported)
     }
 
     /// `decode_partition_syntax( r, c, bSize )` — §5.11.4 partition
@@ -14210,6 +14762,7 @@ impl PartitionWalker {
         delta_lf_multi: bool,
         mono_chrome: bool,
         delta_lf_res: u8,
+        tx_mode_select: bool,
     ) -> Result<(), crate::Error> {
         // §5.11.4 line 1: `if ( r >= MiRows || c >= MiCols ) return 0`.
         if r >= self.mi_rows || c >= self.mi_cols {
@@ -14299,6 +14852,7 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    tx_mode_select,
                 )?
             };
         }
@@ -14346,6 +14900,7 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    tx_mode_select,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -14373,6 +14928,7 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    tx_mode_select,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -14400,6 +14956,7 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    tx_mode_select,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -14427,6 +14984,7 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    tx_mode_select,
                 )?;
             }
             PARTITION_HORZ_A => {
@@ -14630,6 +15188,14 @@ pub struct DecodedBlock {
     /// `false` on the intra arm (where `RefFrame[1] = NONE = -1 <
     /// INTRA_FRAME = 0`).
     pub is_compound: bool,
+    /// §5.11.5 / §5.11.16 `TxSize`. On the implemented intra arm the
+    /// value is `read_tx_size`'s return: `TX_4X4` when `Lossless`,
+    /// otherwise `maxRectTxSize` further split `tx_depth` times via
+    /// [`SPLIT_TX_SIZE`] when the frame's `TxMode == TX_MODE_SELECT`,
+    /// otherwise `maxRectTxSize`. The §5.11.5 footer also stamps this
+    /// into the walker's `TxSizes[]` and `InterTxSizes[]` grids over
+    /// the block's `bh4 * bw4` footprint.
+    pub tx_size: u8,
 }
 
 #[cfg(test)]
@@ -14714,6 +15280,89 @@ mod tests {
         assert_eq!(partition_ctx(true, false), 1);
         assert_eq!(partition_ctx(false, true), 2);
         assert_eq!(partition_ctx(true, true), 3);
+    }
+
+    /// §5.11.15 `Max_Tx_Size_Rect[ BLOCK_SIZES ]` square-block
+    /// invariants: a BLOCK_NxN row maps to TX_NxN for the four primary
+    /// square sizes (4×4 through 64×64). The 128×* / *×128 caps clip
+    /// to TX_64X64 per the spec.
+    #[test]
+    fn max_tx_size_rect_square_block_identity() {
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_4X4], TX_4X4);
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_8X8], TX_8X8);
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_16X16], TX_16X16);
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_32X32], TX_32X32);
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_64X64], TX_64X64);
+        // 128×128 / 64×128 / 128×64 cap at TX_64X64 — the spec's
+        // largest rectangular transform.
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_128X128], TX_64X64);
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_64X128], TX_64X64);
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_128X64], TX_64X64);
+        // Rectangular blocks pick the matching rectangular TX size.
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_4X8], TX_4X8);
+        assert_eq!(MAX_TX_SIZE_RECT[BLOCK_16X64], TX_16X64);
+    }
+
+    /// §5.11.15 `Max_Tx_Depth[ BLOCK_SIZES ]` invariants per the
+    /// spec listing on av1-spec p.69.
+    #[test]
+    fn max_tx_depth_table_matches_spec() {
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_4X4], 0);
+        // Row 1: 4×8 / 8×4 / 8×8 all depth 1.
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_4X8], 1);
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_8X4], 1);
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_8X8], 1);
+        // Row 2: 8×16 / 16×8 / 16×16 / 16×32.
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_8X16], 2);
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_16X16], 2);
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_16X32], 3);
+        // The 128×* tail is depth 4.
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_128X128], 4);
+        // The extended rectangular tail.
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_4X16], 2);
+        assert_eq!(MAX_TX_DEPTH_TABLE[BLOCK_64X16], 4);
+    }
+
+    /// §5.11.15 / §5.11.17 `Split_Tx_Size[ TX_SIZES_ALL ]`: every
+    /// entry maps to a smaller-or-equal TX size; chained splits
+    /// terminate at TX_4X4.
+    #[test]
+    fn split_tx_size_terminates_at_tx_4x4() {
+        // Square chain: TX_64X64 -> TX_32X32 -> TX_16X16 -> TX_8X8 -> TX_4X4 -> TX_4X4.
+        assert_eq!(SPLIT_TX_SIZE[TX_64X64], TX_32X32);
+        assert_eq!(SPLIT_TX_SIZE[TX_32X32], TX_16X16);
+        assert_eq!(SPLIT_TX_SIZE[TX_16X16], TX_8X8);
+        assert_eq!(SPLIT_TX_SIZE[TX_8X8], TX_4X4);
+        assert_eq!(SPLIT_TX_SIZE[TX_4X4], TX_4X4);
+        // Rectangular chain: TX_16X64 -> TX_16X32 -> TX_16X16 ...
+        assert_eq!(SPLIT_TX_SIZE[TX_16X64], TX_16X32);
+        assert_eq!(SPLIT_TX_SIZE[TX_16X32], TX_16X16);
+        // Asymmetric chain: TX_4X16 -> TX_4X8 -> TX_4X4.
+        assert_eq!(SPLIT_TX_SIZE[TX_4X16], TX_4X8);
+        assert_eq!(SPLIT_TX_SIZE[TX_4X8], TX_4X4);
+    }
+
+    /// §8.3.2 `tx_depth` ctx formula contract: ctx ∈ 0..TX_SIZE_CONTEXTS.
+    /// Each combination of (`aboveW >= maxTxWidth`, `leftH >= maxTxHeight`)
+    /// sums to a unique ctx.
+    #[test]
+    fn tx_depth_ctx_combination_table() {
+        // Neither neighbour reaches maxTxWidth/Height.
+        assert_eq!(tx_depth_ctx(0, 0, 16, 16), 0);
+        // Above only.
+        assert_eq!(tx_depth_ctx(16, 0, 16, 16), 1);
+        // Left only.
+        assert_eq!(tx_depth_ctx(0, 16, 16, 16), 1);
+        // Both reach.
+        assert_eq!(tx_depth_ctx(16, 16, 16, 16), 2);
+        // Above strictly larger: still counts.
+        assert_eq!(tx_depth_ctx(32, 8, 16, 16), 1);
+    }
+
+    /// §3 `MAX_VARTX_DEPTH = 2` per av1-spec p.7.
+    #[test]
+    fn max_vartx_depth_constant() {
+        assert_eq!(MAX_VARTX_DEPTH, 2);
     }
 
     /// §8.3.2 `partition` array selection by `bsl`.
