@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 173)
+## Status — 2026-05-28 (round 174)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,101 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 174 lands the **§5.11.31 `assign_mv` + §5.11.32 `read_mv_component`
+syntax tree** — wiring the per-block motion-vector decode into the
+§5.11.23 inter cascade so the §5.11.31 / §5.11.32 leaves run
+end-to-end. The r173 `Error::AssignMvUnsupported` stub is lifted; the
+reader now short-circuits one step later at the new
+`Error::MotionModeUnsupported` (§5.11.27 `read_motion_mode` is the
+next-arc target — its body composes `use_obmc` / `motion_mode` S()
+reads gated on §7.10.4 `find_warp_samples` + the §5.9.5
+`force_integer_mv` / global-motion arms).
+
+The §5.11.31 `assign_mv( isCompound )` body iterates over the active
+reference lists (`i = 0..1 + isCompound`) and resolves each per-list
+`Mv[ i ]` per the four-arm spec dispatch (av1-spec p.78):
+`compMode = get_mode(i)` (the §5.11.30 helper, also lands this round);
+`PredMv[ i ] = GlobalMvs[i]` when `compMode == GLOBALMV`, else
+`PredMv[ i ] = RefStackMv[ pos ][ i ]` with `pos = (compMode ==
+NEARESTMV) ? 0 : RefMvIdx` (forced to `0` when `compMode == NEWMV &&
+NumMvFound <= 1`); finally `Mv[ i ] = PredMv[ i ] + diffMv` when
+`compMode == NEWMV` (via §5.11.31 `read_mv`) or `Mv[ i ] = PredMv[ i ]`
+otherwise (no MV bits read).
+
+The §5.11.31 `read_mv( ref )` body composes one `mv_joint` S()
+against `TileMvJointCdf[ MvCtx ]` (the 4-way joint code
+`MV_JOINT_ZERO` / `MV_JOINT_HNZVZ` / `MV_JOINT_HZVNZ` /
+`MV_JOINT_HNZVNZ`), then conditionally invokes
+`read_mv_component( 0 )` and/or `read_mv_component( 1 )` per the
+spec body's gating (`HZVNZ || HNZVNZ` for `diffMv[0]`,
+`HNZVZ || HNZVNZ` for `diffMv[1]`), and finishes with
+`Mv[ ref ][ c ] = PredMv[ ref ][ c ] + diffMv[ c ]`. `MvCtx` is
+derived per the §5.11.31 `mv_ctx` helper (`MV_INTRABC_CONTEXT = 1`
+when `use_intrabc == 1`, `0` otherwise); the inter caller always
+passes `use_intrabc = false`.
+
+The §5.11.32 `read_mv_component( comp )` body composes the full
+two-branch sign-magnitude tree (av1-spec p.81-82): one `mv_sign` S()
+against `TileMvSignCdf[ MvCtx ][ comp ]`, one `mv_class` S() against
+`TileMvClassCdf[ MvCtx ][ comp ]` (one of `MV_CLASS_0..=MV_CLASS_10`),
+then either the **MV_CLASS_0 ladder** (`mv_class0_bit` S() +
+`mv_class0_fr` S() OR `= 3` when `force_integer_mv == 1` + `mv_class0_hp`
+S() OR `= 1` when `allow_high_precision_mv == 0`, then
+`mag = ((mv_class0_bit << 3) | (mv_class0_fr << 1) | mv_class0_hp) + 1`)
+or the **MV_CLASS_K ladder** for `K >= 1` (per-bit `mv_bit` S() loop
+`d |= mv_bit_i << i` for `i = 0..K`, then `mv_fr` / `mv_hp` reads with
+the same `force_integer_mv` / `allow_high_precision_mv` gating, and
+`mag = (CLASS0_SIZE << (mv_class + 2)) + ((d << 3) | (mv_fr << 1) |
+mv_hp) + 1`). The signed return is `mv_sign ? -mag : mag`; the
+§6.10.25 `is_mv_valid` conformance bound (`|Mv[ i ][ comp ]| < (1 <<
+14)`) is the caller's responsibility.
+
+The `Mvs[r][c][list][comp]` grid (introduced in r172 as a §7.10.2
+neighbour-walk feed) is now stamped over the bh4 * bw4 footprint
+after every `assign_mv` call. The pre-fill `0` value is replaced by
+the decoded per-list Mv (cast `i32` → `i16`; the §6.10.25 bound keeps
+the value in i16 range). Subsequent blocks' §7.10.2 spatial scans
+therefore observe the decoded motion vectors instead of the
+fresh-walker pre-fill.
+
+`DecodedInterBlockModeInfo` gains a `mv: [[i32; 2]; 2]` field
+carrying the §5.11.31 `Mv[ 0..2 ]` array. Slot `mv[0]` is always
+written; `mv[1]` is only meaningful on compound blocks
+(`is_compound == true`) — on single-pred blocks slot 1 stays at the
+§5.11.5 pre-fill `[0, 0]`. The aggregate remains observable only on
+the `Ok` path; the r174 dispatcher always returns `Err`
+(`MotionModeUnsupported`) since the §5.11.27 `read_motion_mode` body
+is not yet wired.
+
+New `get_mode(y_mode, ref_list)` helper (§5.11.30) folds a YMode +
+reference-list index into the per-list `compMode` used by §5.11.31
+(one of `MODE_NEWMV` / `MODE_NEARESTMV` / `MODE_NEARMV` /
+`MODE_GLOBALMV`). The single-pred branch (`ref_list == 0` AND
+`YMode < NEAREST_NEARESTMV`) is the identity; the compound branch
+applies the eight-row §6.10.22 → §5.11.30 mapping table.
+
+Six new §3 / §6.10.27 / §6.10.28 named constants land:
+`MV_JOINT_ZERO`, `MV_JOINT_HNZVZ`, `MV_JOINT_HZVNZ`,
+`MV_JOINT_HNZVNZ` (the four §6.10.27 mv_joint ordinals) plus
+`MV_CLASS_0` (the §5.11.32 small-magnitude class). The remaining
+`MV_CLASS_K` for `K = 1..=10` reuses the literal `K` value (the spec
+only names class 0 explicitly in the syntax body).
+
+11 new unit tests cover: `get_mode` single-pred identity on
+`ref_list = 0` (4 modes); `get_mode` compound table (8 modes ×
+2 ref_lists); `assign_mv` skip_mode arm with NEAREST_NEARESTMV
+producing zero MV bits read; `assign_mv` seg_globalmv arm using
+identity GlobalMvs; `read_mv` NEWMV with `mv_joint = MV_JOINT_ZERO`
+yielding zero diff (no per-component reads); `read_mv_component`
+direct exercise of the MV_CLASS_0 ladder (three sub-cases: all-sym-0
+with allow_hp ⇒ mag=1; all-sym-0 with hp=false fall-through ⇒ mag=2;
+all-sym-0 with sign=1 ⇒ mag=-2); `force_integer_mv` short-circuiting
+the `mv_class0_fr` read (forces fr=3 ⇒ mag=8); cascade structural
+smoke (NEWMV cascade with default CDFs producing in-range Mv per
+§6.10.25); and an `assign_mv` defensive guard (rejecting
+`use_intrabc = true` in the inter arm). Test count: 661 → 672 (+11).
+`decode_av1` / `encode_av1` still return `Error::NotImplemented`.
 
 Round 173 lands the **§5.11.23 post-find_mv_stack reader cascade** —
 wiring `find_mv_stack` into the `decode_inter_block_mode_info`

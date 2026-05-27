@@ -1855,9 +1855,10 @@ pub enum Error {
     /// `decode_inter_block_mode_info` wires `find_mv_stack` into the
     /// dispatcher directly and runs the post-`find_mv_stack`
     /// `compound_mode` / `new_mv` / `zero_mv` / `ref_mv` / `drl_mode`
-    /// cascade; the §5.11.23 reader now short-circuits one step later
-    /// at [`Self::AssignMvUnsupported`] (§5.11.31 `assign_mv` /
-    /// §5.11.32 `read_mv_component` are the next-arc target).
+    /// cascade. As of r174 the §5.11.31 `assign_mv` body is also
+    /// wired; the §5.11.23 reader now short-circuits at
+    /// [`Self::MotionModeUnsupported`] (§5.11.27 `read_motion_mode` is
+    /// the next-arc target).
     ///
     /// This variant is retained as a defensive caller-bug fallback —
     /// the §5.11.18 dispatcher only fires it on the
@@ -1870,36 +1871,44 @@ pub enum Error {
     /// single-pred), and the per-mode RefMvIdx + drl_mode loops, then
     /// reached **§5.11.31 `assign_mv( isCompound )`** (av1-spec p.78).
     ///
-    /// The §5.11.31 body composes `read_mv( ref )` per slot, which
-    /// drives the §5.11.32 `read_mv_component` syntax tree
-    /// (`mv_joint` S() then `mv_sign` plus `mv_class` plus the
-    /// `mv_class0_bit` / `mv_class0_fr` / `mv_class0_hp` cascade for
-    /// `MV_CLASS_0`, OR the `mv_bit` loop plus `mv_fr` / `mv_hp`
-    /// cascade for the larger classes). The §5.11.32 reader is the
-    /// next-arc target.
-    ///
-    /// All §5.11.23 reads prior to this point — `read_ref_frames` (S()
-    /// cascade), `compound_mode` / `new_mv` / `zero_mv` / `ref_mv`
-    /// (§5.11.23 YMode dispatch), and the `drl_mode` (per-position)
-    /// loops — commit to the bitstream + §8.3 adaptation state before
-    /// this stub fires. The decoded `RefFrame[..]` / `isCompound` /
-    /// `YMode` / `RefMvIdx` / the §7.10.2 stack-summary scalars
-    /// (`NumMvFound` / `NewMvContext` / `RefMvContext` /
-    /// `ZeroMvContext`) are observable through the
-    /// `DecodedInterBlockModeInfo` aggregate fields if the variant
-    /// becomes routed back through a follow-up arc.
-    ///
-    /// The §5.11.23 post-`assign_mv` readers (`read_interintra_mode` /
-    /// `read_motion_mode` / `read_compound_type` /
-    /// `read_interpolation_filter`) all depend on the §5.11.31 motion
-    /// vectors being decoded (the §5.11.27 motion-mode
-    /// `find_warp_samples` and `has_overlappable_candidates` walks
-    /// consume `Mv[..]`), so the natural arc ordering is `assign_mv`
-    /// then `read_motion_mode` then `read_interintra_mode` then
-    /// `read_compound_type` then `read_interpolation_filter`. The
-    /// remaining error variants for each leaf will land alongside the
-    /// corresponding sub-body.
+    /// **r174 LIFTED**: the §5.11.31 / §5.11.32 `read_mv` /
+    /// `read_mv_component` cascade is wired in, and the live gap moves
+    /// one step down to [`Self::MotionModeUnsupported`]
+    /// (§5.11.27 `read_motion_mode`). This variant is retained as a
+    /// defensive caller-bug fallback — the [`crate::PartitionWalker`]
+    /// internal `assign_mv` only surfaces this if the §5.11.7 intra-bc
+    /// arm is reached through the inter dispatcher (not currently
+    /// possible — that arm goes through its own caller).
     AssignMvUnsupported,
+    /// The §5.11.23 reader's §5.11.31 `assign_mv( isCompound )` call
+    /// completed (the per-list `Mv[ ref ]` is decoded, the §6.10.25
+    /// `is_mv_valid` conformance bound is the caller's responsibility)
+    /// and reached the §5.11.27 **`read_motion_mode( isCompound )`**
+    /// step (av1-spec p.79).
+    ///
+    /// The §5.11.27 body short-circuits to `motion_mode = SIMPLE` on
+    /// `skip_mode == 1` / `is_motion_mode_switchable == 0` / small
+    /// blocks / global-motion arms; otherwise it composes a
+    /// `find_warp_samples()` walk (§7.10.4) and either `use_obmc`
+    /// S() or `motion_mode` S() against `TileMotionModeCdf[ ctx ]`.
+    /// The `find_warp_samples` walk depends on the §5.11.31 `Mv[ ]`
+    /// grid stamp (already in place after r174) plus
+    /// `is_scaled(refFrame)` per the §6.10 ref-frame size table.
+    ///
+    /// All r174 §5.11.23 reads prior to this point (`read_ref_frames`,
+    /// the YMode / RefMvIdx / drl_mode loops, and the §5.11.31
+    /// `assign_mv` body) commit to the bitstream and §8.3 adaptation
+    /// state before this stub fires. The decoded
+    /// [`crate::DecodedInterBlockModeInfo`] aggregate (including the
+    /// new `mv` field) is observable on this short-circuit if a
+    /// follow-up arc routes it back through the dispatcher's return.
+    ///
+    /// Next-arc target. The post-`read_motion_mode` cascade
+    /// (`read_interintra_mode`, `read_compound_type`,
+    /// `read_interpolation_filter`) follows the natural §5.11.23
+    /// reading order and each leaf will land alongside its
+    /// corresponding sub-body.
+    MotionModeUnsupported,
     /// The §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample sub-
     /// processes (av1-spec p.223-226) reached from the §7.10.2 driver
     /// when the §5.9.20 frame-level `use_ref_frame_mvs == 1`. Lifted
@@ -2015,7 +2024,11 @@ impl core::fmt::Display for Error {
             ),
             Self::AssignMvUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.23 inter_block_mode_info reached §5.11.31 assign_mv — the §5.11.31 / §5.11.32 read_mv / read_mv_component syntax tree is the next-arc target (motion_mode / interintra_mode / compound_type / interpolation_filter cascade follows once assign_mv lands)"
+                "oxideav-av1: §5.11.31 assign_mv — defensive fallback retained post-r174 (the §5.11.31 / §5.11.32 read_mv / read_mv_component cascade is now wired into the dispatcher; see MotionModeUnsupported for the live gap)"
+            ),
+            Self::MotionModeUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.23 inter_block_mode_info reached §5.11.27 read_motion_mode — the §5.11.27 motion_mode / use_obmc S() reader is the next-arc target (post-find_warp_samples + is_scaled), with read_interintra_mode / read_compound_type / read_interpolation_filter following in §5.11.23 order"
             ),
             Self::TemporalMvScanUnsupported => write!(
                 f,

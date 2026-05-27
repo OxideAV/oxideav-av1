@@ -6,6 +6,69 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 174 — §5.11.31 `assign_mv` + §5.11.32 `read_mv_component`
+  syntax tree.** Wires the per-block motion-vector decode into the
+  §5.11.23 inter cascade. Lifts `Error::AssignMvUnsupported` (now a
+  defensive caller-bug fallback only) and surfaces
+  `Error::MotionModeUnsupported` (the new §5.11.27 `read_motion_mode`
+  next-arc target).
+
+  The §5.11.31 `assign_mv( isCompound )` body iterates over
+  `i = 0..1 + isCompound` and resolves each per-list `Mv[ i ]` per
+  the four-arm spec dispatch (av1-spec p.78): `compMode = get_mode(i)`
+  (the §5.11.30 helper, also lands this round); `PredMv[ i ] =
+  GlobalMvs[ i ]` for `GLOBALMV`, else `PredMv[ i ] =
+  RefStackMv[ pos ][ i ]` with `pos = (compMode == NEARESTMV) ? 0 :
+  RefMvIdx` (forced to `0` when `compMode == NEWMV && NumMvFound <=
+  1`); finally `Mv[ i ] = PredMv[ i ] + diffMv` via `read_mv( i )` on
+  `NEWMV` or `Mv[ i ] = PredMv[ i ]` otherwise.
+
+  The §5.11.31 `read_mv` body composes one `mv_joint` S() against
+  `TileMvJointCdf[ MvCtx ]` (the 4-way `MV_JOINT_ZERO` /
+  `MV_JOINT_HNZVZ` / `MV_JOINT_HZVNZ` / `MV_JOINT_HNZVNZ` code), then
+  conditionally invokes `read_mv_component( 0 )` and/or
+  `read_mv_component( 1 )` per the spec gating, finishing with
+  per-component addition to `PredMv`.
+
+  The §5.11.32 `read_mv_component( comp )` body composes the full
+  sign-magnitude tree: `mv_sign` + `mv_class` (one of
+  `MV_CLASS_0..=MV_CLASS_10`), then either the **MV_CLASS_0 ladder**
+  (`mv_class0_bit` + `mv_class0_fr` / `=3` on `force_integer_mv` +
+  `mv_class0_hp` / `=1` on `!allow_high_precision_mv`, with `mag =
+  ((bit << 3) | (fr << 1) | hp) + 1`) or the **MV_CLASS_K ladder**
+  for K >= 1 (per-bit `mv_bit` S() loop yielding `d = sum(mv_bit_i <<
+  i)`, then `mv_fr` / `mv_hp` with the same gating, and `mag =
+  (CLASS0_SIZE << (mv_class + 2)) + ((d << 3) | (fr << 1) | hp) + 1`).
+  Returns `mv_sign ? -mag : mag`; the §6.10.25 `is_mv_valid`
+  conformance bound is the caller's responsibility.
+
+  Six new §3 / §6.10.27 / §6.10.28 named constants: `MV_JOINT_ZERO` =
+  0, `MV_JOINT_HNZVZ` = 1, `MV_JOINT_HZVNZ` = 2, `MV_JOINT_HNZVNZ` =
+  3, `MV_CLASS_0` = 0.
+
+  New `get_mode(y_mode, ref_list)` public helper (§5.11.30) folds a
+  YMode + reference-list index into the per-list `compMode` value
+  used by §5.11.31.
+
+  The walker's `Mvs[r][c][list][comp]` grid (introduced in r172 as a
+  §7.10.2 neighbour-walk feed) is now stamped over the `bh4 * bw4`
+  footprint after every `assign_mv` call. `DecodedInterBlockModeInfo`
+  gains a `mv: [[i32; 2]; 2]` field carrying the §5.11.31
+  `Mv[ 0..2 ]` array (observable only on the `Ok` path; the
+  dispatcher still returns `Err(MotionModeUnsupported)` until
+  §5.11.27 lands).
+
+  11 new unit tests cover `get_mode` (single-pred identity + compound
+  table); `assign_mv` skip_mode + seg_globalmv arms (no MV bits
+  read); `read_mv` with `mv_joint = MV_JOINT_ZERO` yielding zero
+  diff; direct `read_mv_component` exercises of the MV_CLASS_0
+  ladder (3 sub-cases — all-sym-0 + allow_hp ⇒ mag=1; fall-through
+  hp=1 ⇒ mag=2; sign=1 ⇒ mag=-2); `force_integer_mv` short-circuiting
+  the `mv_class0_fr` read (mag=8); cascade structural smoke (Mv
+  values within the §6.10.25 bound); and the `assign_mv` defensive
+  guard rejecting `use_intrabc = true` in the inter arm. Test count:
+  661 → 672 (+11).
+
 * **Round 173 — §5.11.23 post-`find_mv_stack` reader cascade.** Wires
   `find_mv_stack` into `decode_inter_block_mode_info` and runs every
   bit-consuming leaf in §5.11.23 lines 1-32: YMode dispatch (four

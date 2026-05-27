@@ -1370,7 +1370,7 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
     );
     assert_eq!(
         result,
-        Err(Error::AssignMvUnsupported),
+        Err(Error::MotionModeUnsupported),
         "seg_ref_frame_active + is_inter ⇒ §5.11.25 read_ref_frames (no S()) ⇒ §7.10 find_mv_stack stub"
     );
     // r170: §5.11.25 stamps RefFrames[0..2][0..2][0..2] over the
@@ -1454,7 +1454,7 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
     );
     assert_eq!(
         result,
-        Err(Error::AssignMvUnsupported),
+        Err(Error::MotionModeUnsupported),
         "skip_mode = 1 ⇒ is_inter = 1 ⇒ §5.11.25 reads SkipModeFrame ⇒ §7.10 find_mv_stack stub"
     );
     // §5.11.18 grid-fill: Skips[][] stamped to 1 over the 4×4 footprint.
@@ -1527,7 +1527,7 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
         /* force_integer_mv = */ false,
         /* use_ref_frame_mvs = */ false,
     );
-    assert_eq!(result, Err(Error::AssignMvUnsupported));
+    assert_eq!(result, Err(Error::MotionModeUnsupported));
 }
 
 /// §5.11.18 caller-bug detection: out-of-range arguments surface

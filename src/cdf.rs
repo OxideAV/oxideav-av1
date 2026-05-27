@@ -291,6 +291,40 @@ pub const MV_OFFSET_BITS: usize = 10;
 /// has a horizontal and vertical component (`comp = 0..1`).
 pub const MV_COMPS: usize = 2;
 
+/// `MV_JOINT_ZERO` (§6.10.27, av1-spec p.186 — "MV Joint" table) — the
+/// §5.11.31 `mv_joint` ordinal for "both components are zero" (no
+/// `read_mv_component()` calls fire).
+pub const MV_JOINT_ZERO: u8 = 0;
+
+/// `MV_JOINT_HNZVZ` (§6.10.27) — `mv_joint` ordinal for "horizontal
+/// (row, `comp = 0`) is non-zero, vertical (col, `comp = 1`) is zero".
+/// The §5.11.31 body invokes `read_mv_component(0)` only.
+///
+/// Note: §6.10.27's "horizontal / vertical" labels match the spec's
+/// row-major component ordering: `comp = 0` is the row (vertical-axis
+/// pixel) component, `comp = 1` is the column (horizontal-axis pixel)
+/// component. The label "H non-zero" therefore corresponds to
+/// `diffMv[0] != 0` and "V non-zero" to `diffMv[1] != 0`.
+pub const MV_JOINT_HNZVZ: u8 = 1;
+
+/// `MV_JOINT_HZVNZ` (§6.10.27) — `mv_joint` ordinal for "horizontal
+/// (`comp = 0`) is zero, vertical (`comp = 1`) is non-zero". The
+/// §5.11.31 body invokes `read_mv_component(1)` only.
+pub const MV_JOINT_HZVNZ: u8 = 2;
+
+/// `MV_JOINT_HNZVNZ` (§6.10.27) — `mv_joint` ordinal for "both
+/// components are non-zero". The §5.11.31 body invokes both
+/// `read_mv_component(0)` and `read_mv_component(1)`.
+pub const MV_JOINT_HNZVNZ: u8 = 3;
+
+/// `MV_CLASS_0` (§6.10.28, av1-spec p.187 — "MV Class" table) — the
+/// §5.11.32 `mv_class` ordinal for the small-magnitude class. Selects
+/// the `mv_class0_bit` / `mv_class0_fr` / `mv_class0_hp` ladder
+/// (instead of the `mv_bit` loop). Every other `MV_CLASS_K` for `K =
+/// 1..=10` is just `K` itself; the spec only names class 0 explicitly
+/// in the syntax body.
+pub const MV_CLASS_0: u8 = 0;
+
 // ---------------------------------------------------------------------
 // §3 inter-mode / reference-frame constants (round 18).
 // ---------------------------------------------------------------------
@@ -15184,17 +15218,20 @@ impl PartitionWalker {
         };
         let _ = info;
         if is_inter != 0 {
-            // r173: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
+            // r174: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
             // §7.10 `find_mv_stack` (spatial-only path) + the §5.11.23
-            // YMode dispatch + per-mode RefMvIdx / drl_mode loops all
-            // run to completion; the §5.11.31 `assign_mv` call is the
-            // post-cascade gap surfaced as
-            // [`crate::Error::AssignMvUnsupported`].
+            // YMode dispatch + per-mode RefMvIdx / drl_mode loops + the
+            // §5.11.31 `assign_mv` body (calls §5.11.31 `read_mv` and
+            // §5.11.32 `read_mv_component`) all run to completion; the
+            // §5.11.27 `read_motion_mode` call is the post-cascade gap
+            // surfaced as [`crate::Error::MotionModeUnsupported`].
             //
-            // The inner method always returns `Err` on r173; once
-            // `assign_mv` + downstream readers land the dispatcher will
-            // need to lift the `DecodedInterBlockModeInfo` aggregate
-            // fields into the returned [`DecodedInterFrameModeInfo`].
+            // The inner method always returns `Err` on r174; once
+            // `read_motion_mode` + downstream readers land the
+            // dispatcher will need to lift the
+            // `DecodedInterBlockModeInfo` aggregate (including the new
+            // `mv` field) into the returned
+            // [`DecodedInterFrameModeInfo`].
             match self.decode_inter_block_mode_info(
                 decoder,
                 cdfs,
@@ -16230,12 +16267,56 @@ impl PartitionWalker {
         }
 
         // §5.11.23 line 33: `assign_mv( isCompound )` per §5.11.31.
-        // The §5.11.31 `read_mv` / §5.11.32 `read_mv_component` syntax
-        // tree (mv_joint S(), mv_sign / mv_class / mv_class0_*
-        // cascade, mv_bit loop) is the next-arc target — surface the
-        // §5.11.23 prologue + YMode + RefMvIdx + the full §7.10.2
-        // aggregate so callers verifying the cascade observe the
-        // decoded state before the stub fires.
+        // r174 wires the §5.11.31 / §5.11.32 `read_mv` /
+        // `read_mv_component` cascade. The inter path always has
+        // `use_intrabc == 0` (the §5.11.7 intra-bc arm is the only
+        // caller for `use_intrabc == 1` and lives behind a separate
+        // dispatcher). Pass `use_intrabc = false` so the §5.11.31 body's
+        // GLOBALMV / NEAREST / NEAR / NEWMV per-list cascade fires.
+        let mv = self.assign_mv(
+            decoder,
+            cdfs,
+            is_compound,
+            /* use_intrabc = */ false,
+            y_mode,
+            ref_mv_idx,
+            mv_stack.num_mv_found,
+            &mv_stack.ref_stack_mv,
+            &mv_stack.global_mvs,
+            allow_high_precision_mv,
+            force_integer_mv,
+        )?;
+
+        // §5.11.5 / §5.11.31 grid stamp: write the per-list MV over
+        // the bh4 * bw4 footprint so §7.10.2 neighbour walks for the
+        // next block observe the decoded values. The §7.10 component
+        // ordering is `mvs[ref][row][col]`; cast i32 → i16 (the
+        // §6.10.27 conformance bound `Abs( Mv[ i ][ comp ] ) < ( 1 <<
+        // 14 )` keeps the value in i16 range).
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                let cell = (rr * self.mi_cols + cc) as usize;
+                // [row][list][comp] flat layout: `(cell * 2 + list) * 2 + comp`.
+                self.mvs[(cell * 2) * 2] = mv[0][0] as i16;
+                self.mvs[(cell * 2) * 2 + 1] = mv[0][1] as i16;
+                self.mvs[(cell * 2 + 1) * 2] = mv[1][0] as i16;
+                self.mvs[(cell * 2 + 1) * 2 + 1] = mv[1][1] as i16;
+            }
+        }
+
+        // r174 short-circuit: the §5.11.23 post-`assign_mv` cascade
+        // (`read_motion_mode` / `read_interintra_mode` /
+        // `read_compound_type` / `read_interpolation_filter`) is the
+        // next-arc target. Surface the decoded state through the
+        // aggregate before the new gap fires.
         let _info = DecodedInterBlockModeInfo {
             mi_row,
             mi_col,
@@ -16248,8 +16329,349 @@ impl PartitionWalker {
             new_mv_context: mv_stack.new_mv_context,
             ref_mv_context: mv_stack.ref_mv_context,
             zero_mv_context: mv_stack.zero_mv_context,
+            mv,
         };
-        Err(crate::Error::AssignMvUnsupported)
+        Err(crate::Error::MotionModeUnsupported)
+    }
+
+    /// `assign_mv( isCompound )` per §5.11.31 (av1-spec p.78). Iterates
+    /// over the active reference lists (`i = 0..1+isCompound`) and
+    /// resolves each per-list `Mv[ i ]` to one of:
+    ///
+    /// * `GlobalMvs[ i ]` when `compMode == GLOBALMV`,
+    /// * `RefStackMv[ pos ][ i ]` for the NEAREST / NEAR family with
+    ///   `pos = ( compMode == NEARESTMV ) ? 0 : RefMvIdx` (forced to
+    ///   `0` when `compMode == NEWMV && NumMvFound <= 1`),
+    /// * `PredMv[ i ] + diffMv` for `compMode == NEWMV` (the
+    ///   §5.11.31 `read_mv()` reader is invoked, which composes
+    ///   `mv_joint S()` + per-axis `read_mv_component()` reads).
+    ///
+    /// `use_intrabc` is the §5.11.7 `use_intrabc` flag. The inter
+    /// caller (this crate's §5.11.23
+    /// [`Self::decode_inter_block_mode_info`]) always passes `false`;
+    /// the §5.11.7 intra-bc arm is the only caller for `true`, and a
+    /// subsequent intra-bc arc will provide a thin wrapper that
+    /// supplies the §5.11.31 intrabc fallback (`sbSize` / `MiRowStart`
+    /// inputs the inter path does not need).
+    ///
+    /// Returns the `Mv[ 0..2 ]` array. For single-pred calls the slot
+    /// `Mv[ 1 ]` is left at `[0, 0]` (matching the §5.11.5 pre-fill).
+    #[allow(clippy::too_many_arguments)]
+    fn assign_mv(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        is_compound: bool,
+        use_intrabc: bool,
+        y_mode: u8,
+        ref_mv_idx: u32,
+        num_mv_found: u32,
+        ref_stack_mv: &[[[i32; 2]; 2]; MAX_REF_MV_STACK_SIZE],
+        global_mvs: &[[i32; 2]; 2],
+        allow_high_precision_mv: bool,
+        force_integer_mv: bool,
+    ) -> Result<[[i32; 2]; 2], crate::Error> {
+        // §5.11.31 `MvCtx` derivation (av1-spec p.78): MvCtx =
+        // MV_INTRABC_CONTEXT when use_intrabc else 0. Computed once
+        // here and passed through to each `read_mv` call.
+        let mv_ctx = mv_ctx(use_intrabc);
+
+        // r174 inter-only guard: the inter dispatcher hard-codes
+        // `use_intrabc = false`. Reject the inter-arm call landing on
+        // `use_intrabc = true` (which would need the §5.11.7 intra-bc
+        // sbSize / MiRowStart inputs not threaded through this method).
+        // The future intra-bc arc will surface that path via a separate
+        // wrapper. Surface as `PartitionWalkOutOfRange` (the standard
+        // caller-bug variant) rather than minting a new gap variant.
+        if use_intrabc {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        let list_count = if is_compound { 2 } else { 1 };
+        let mut mv: [[i32; 2]; 2] = [[0, 0], [0, 0]];
+
+        for i in 0..list_count {
+            // §5.11.31 compMode selection (av1-spec p.78). `use_intrabc`
+            // is false in this branch, so always take the §5.11.30
+            // `get_mode( i )` path.
+            let comp_mode = get_mode(y_mode, i);
+
+            // §5.11.31 PredMv derivation (av1-spec p.78). With
+            // `use_intrabc == 0`:
+            //   if ( compMode == GLOBALMV )
+            //       PredMv[ i ] = GlobalMvs[ i ]
+            //   else {
+            //       pos = ( compMode == NEARESTMV ) ? 0 : RefMvIdx
+            //       if ( compMode == NEWMV && NumMvFound <= 1 ) pos = 0
+            //       PredMv[ i ] = RefStackMv[ pos ][ i ]
+            //   }
+            let pred_mv: [i32; 2] = if comp_mode == MODE_GLOBALMV {
+                global_mvs[i]
+            } else {
+                let mut pos = if comp_mode == MODE_NEARESTMV {
+                    0u32
+                } else {
+                    ref_mv_idx
+                };
+                if comp_mode == MODE_NEWMV && num_mv_found <= 1 {
+                    pos = 0;
+                }
+                // pos is in 0..MAX_REF_MV_STACK_SIZE = 0..8 by
+                // construction (RefMvIdx is bounded at 2 by the
+                // §5.11.23 drl_mode loops; 0/RefMvIdx is therefore in
+                // 0..=2). Indexing into the 8-slot stack is safe.
+                debug_assert!(
+                    (pos as usize) < MAX_REF_MV_STACK_SIZE,
+                    "PredMv pos must be in 0..MAX_REF_MV_STACK_SIZE"
+                );
+                ref_stack_mv[pos as usize][i]
+            };
+
+            // §5.11.31: `if ( compMode == NEWMV ) read_mv( i ) else
+            // Mv[ i ] = PredMv[ i ]`.
+            if comp_mode == MODE_NEWMV {
+                mv[i] = self.read_mv(
+                    decoder,
+                    cdfs,
+                    mv_ctx,
+                    pred_mv,
+                    allow_high_precision_mv,
+                    force_integer_mv,
+                )?;
+            } else {
+                mv[i] = pred_mv;
+            }
+        }
+
+        Ok(mv)
+    }
+
+    /// `read_mv( ref )` per §5.11.31 (av1-spec p.78). Composes:
+    ///
+    /// * `mv_joint` S() against `TileMvJointCdf[ MvCtx ]` — the 4-way
+    ///   joint code (`MV_JOINT_ZERO` / `MV_JOINT_HNZVZ` /
+    ///   `MV_JOINT_HZVNZ` / `MV_JOINT_HNZVNZ`).
+    /// * `read_mv_component( 0 )` gated on `MV_JOINT_HZVNZ ||
+    ///   MV_JOINT_HNZVNZ` (note: the spec body's `MV_JOINT_HZVNZ`
+    ///   gates `diffMv[0]`, not `diffMv[1]` — see §6.10.27 "MV Joint"
+    ///   table; the labels track horizontal / vertical pixel axes
+    ///   while `comp = 0` is the row (vertical) component, so the
+    ///   gating is `comp = 0 ⇔ vertical-non-zero` per the spec text).
+    /// * `read_mv_component( 1 )` gated on `MV_JOINT_HNZVZ ||
+    ///   MV_JOINT_HNZVNZ` (likewise `comp = 1 ⇔ horizontal-non-zero`).
+    /// * `Mv[ ref ][ comp ] = PredMv[ ref ][ comp ] + diffMv[ comp ]`
+    ///   per-component addition. The caller is responsible for the
+    ///   §6.10.25 `is_mv_valid` conformance bound (`Abs(Mv) < (1 <<
+    ///   14)`); this method does NOT clamp.
+    ///
+    /// Returns the final `Mv[ ref ]` pair (row, col) in 1/8-luma-sample
+    /// units.
+    fn read_mv(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mv_ctx: usize,
+        pred_mv: [i32; 2],
+        allow_high_precision_mv: bool,
+        force_integer_mv: bool,
+    ) -> Result<[i32; 2], crate::Error> {
+        let mut diff_mv: [i32; 2] = [0, 0];
+
+        // §5.11.31 `mv_joint` S() against `TileMvJointCdf[ MvCtx ]`.
+        let row = cdfs.mv_joint_cdf(mv_ctx);
+        let mv_joint = decoder.read_symbol(row)? as u8;
+        debug_assert!(
+            (mv_joint as usize) < MV_JOINTS,
+            "S() over TileMvJointCdf yields 0..MV_JOINTS"
+        );
+
+        // §5.11.31 gating: `MV_JOINT_HZVNZ` gates `diffMv[ 0 ]` and
+        // `MV_JOINT_HNZVZ` gates `diffMv[ 1 ]`. (The §6.10.27 table
+        // names track pixel-axis labels but the index gates are
+        // explicit in the §5.11.31 syntax body.)
+        if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
+            diff_mv[0] = self.read_mv_component(
+                decoder,
+                cdfs,
+                /* comp = */ 0,
+                mv_ctx,
+                allow_high_precision_mv,
+                force_integer_mv,
+            )?;
+        }
+        if mv_joint == MV_JOINT_HNZVZ || mv_joint == MV_JOINT_HNZVNZ {
+            diff_mv[1] = self.read_mv_component(
+                decoder,
+                cdfs,
+                /* comp = */ 1,
+                mv_ctx,
+                allow_high_precision_mv,
+                force_integer_mv,
+            )?;
+        }
+
+        // §5.11.31 final assignment: `Mv[ ref ][ c ] = PredMv[ ref ][
+        // c ] + diffMv[ c ]`. Use `wrapping_add` to mirror the spec's
+        // arithmetic (the §6.10.25 conformance bound `Abs(Mv) < (1 <<
+        // 14)` is checked by the caller).
+        Ok([
+            pred_mv[0].wrapping_add(diff_mv[0]),
+            pred_mv[1].wrapping_add(diff_mv[1]),
+        ])
+    }
+
+    /// `read_mv_component( comp )` per §5.11.32 (av1-spec p.81-82).
+    /// Reads one MV component (row when `comp == 0`, column when
+    /// `comp == 1`) as a signed magnitude in 1/8-luma-sample units.
+    ///
+    /// Spec body composition (av1-spec p.81-82):
+    ///
+    /// 1. `mv_sign` S() against `TileMvSignCdf[ MvCtx ][ comp ]`.
+    /// 2. `mv_class` S() against `TileMvClassCdf[ MvCtx ][ comp ]` —
+    ///    one of `MV_CLASS_0..=MV_CLASS_10` (`0..=10`).
+    /// 3. `MV_CLASS_0` branch (small magnitudes):
+    ///    * `mv_class0_bit` S() — the only `mv_class0_bit` slot is the
+    ///      flat 1-of-2 distribution.
+    ///    * `mv_class0_fr` S() against the per-class0_bit CDF, OR
+    ///      `mv_class0_fr = 3` when `force_integer_mv == 1` (the
+    ///      §5.9.5 frame-header bit).
+    ///    * `mv_class0_hp` S() OR `mv_class0_hp = 1` when
+    ///      `allow_high_precision_mv == 0` (the §5.9.5 frame-header
+    ///      bit). The §5.11.32 spec text uses the "fall-through to 1"
+    ///      convention (not 0) to keep the §6.10.27 `mag` formula
+    ///      `+ 1` arithmetic consistent.
+    ///    * `mag = ( ( mv_class0_bit << 3 ) | ( mv_class0_fr << 1 ) |
+    ///      mv_class0_hp ) + 1`.
+    /// 4. `MV_CLASS_K` branch for `K >= 1` (larger magnitudes):
+    ///    * `mv_bit` S() loop reading `K` bits (one CDF per bit
+    ///      position via `TileMvBitCdf[ MvCtx ][ comp ][ i ]`), packed
+    ///      into `d = sum(mv_bit_i << i)`.
+    ///    * `mag = CLASS0_SIZE << ( mv_class + 2 )`.
+    ///    * `mv_fr` S() OR `mv_fr = 3` (force_integer_mv arm).
+    ///    * `mv_hp` S() OR `mv_hp = 1` (allow_high_precision_mv arm).
+    ///    * `mag += ( ( d << 3 ) | ( mv_fr << 1 ) | mv_hp ) + 1`.
+    /// 5. `return mv_sign ? -mag : mag`.
+    ///
+    /// Returns the signed component magnitude as `i32` (the §6.10.25
+    /// conformance bound `Abs(Mv) < (1 << 14)` is checked by the
+    /// §5.11.31 caller). The maximum magnitude this method can produce
+    /// is bounded by `CLASS0_SIZE << ( MV_CLASSES + 1 ) - 1 = 4095`
+    /// for the class arm baseline plus the `( d << 3 | mv_fr << 1 |
+    /// mv_hp ) + 1` increment up to `8 << ( MV_CLASS_10 - 1 ) + ...`,
+    /// all of which fit in `i16` by construction (the §6.10.25 bound
+    /// is a tighter `1 << 14 = 16384`).
+    fn read_mv_component(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        comp: usize,
+        mv_ctx: usize,
+        allow_high_precision_mv: bool,
+        force_integer_mv: bool,
+    ) -> Result<i32, crate::Error> {
+        // §5.11.32 line 1: `mv_sign` S().
+        let row = cdfs.mv_sign_cdf(mv_ctx, comp);
+        let mv_sign = decoder.read_symbol(row)? as u8;
+        debug_assert!(mv_sign <= 1, "S() over TileMvSignCdf yields 0 or 1");
+
+        // §5.11.32 line 2: `mv_class` S().
+        let row = cdfs.mv_class_cdf(mv_ctx, comp);
+        let mv_class = decoder.read_symbol(row)? as u8;
+        debug_assert!(
+            (mv_class as usize) < MV_CLASSES,
+            "S() over TileMvClassCdf yields 0..MV_CLASSES = 0..11"
+        );
+
+        let mag: i32 = if mv_class == MV_CLASS_0 {
+            // §5.11.32 MV_CLASS_0 ladder (av1-spec p.81 lines 3-9).
+            // `mv_class0_bit` S().
+            let row = cdfs.mv_class0_bit_cdf(mv_ctx, comp);
+            let mv_class0_bit = decoder.read_symbol(row)? as u8;
+            debug_assert!(
+                (mv_class0_bit as usize) < CLASS0_SIZE,
+                "S() over TileMvClass0BitCdf yields 0..CLASS0_SIZE = 0..2"
+            );
+
+            // `mv_class0_fr`: gated on `force_integer_mv`.
+            let mv_class0_fr: u8 = if force_integer_mv {
+                3
+            } else {
+                let row = cdfs.mv_class0_fr_cdf(mv_ctx, comp, mv_class0_bit as usize);
+                let v = decoder.read_symbol(row)? as u8;
+                debug_assert!(
+                    (v as usize) < MV_JOINTS,
+                    "S() over TileMvClass0FrCdf yields 0..4"
+                );
+                v
+            };
+
+            // `mv_class0_hp`: gated on `allow_high_precision_mv`. The
+            // §5.11.32 spec text uses fall-through value `1` (not 0) so
+            // the `+ 1` outer arithmetic remains correct without
+            // requiring the explicit hp bit.
+            let mv_class0_hp: u8 = if allow_high_precision_mv {
+                let row = cdfs.mv_class0_hp_cdf(mv_ctx, comp);
+                let v = decoder.read_symbol(row)? as u8;
+                debug_assert!(v <= 1, "S() over TileMvClass0HpCdf yields 0 or 1");
+                v
+            } else {
+                1
+            };
+
+            // §5.11.32 mag formula: `( ( mv_class0_bit << 3 ) | (
+            // mv_class0_fr << 1 ) | mv_class0_hp ) + 1`.
+            (((mv_class0_bit as i32) << 3) | ((mv_class0_fr as i32) << 1) | (mv_class0_hp as i32))
+                + 1
+        } else {
+            // §5.11.32 MV_CLASS_K ladder for K >= 1 (av1-spec p.81-82
+            // lines 10-17).
+            //
+            // `d = 0; for ( i = 0; i < mv_class; i++ ) { mv_bit S(); d
+            // |= mv_bit << i }` — `mv_class` is in `1..=10` here, and
+            // `MV_OFFSET_BITS = 10` is the spec's upper bound. The
+            // §8.3.2 cdf selection is `TileMvBitCdf[ MvCtx ][ comp ][ i
+            // ]` for each bit position.
+            let mut d: u32 = 0;
+            for i in 0..(mv_class as usize) {
+                debug_assert!(
+                    i < MV_OFFSET_BITS,
+                    "mv_class iterations bounded by MV_OFFSET_BITS = {MV_OFFSET_BITS}"
+                );
+                let row = cdfs.mv_bit_cdf(mv_ctx, comp, i);
+                let mv_bit = decoder.read_symbol(row)?;
+                debug_assert!(mv_bit <= 1, "S() over TileMvBitCdf yields 0 or 1");
+                d |= mv_bit << i;
+            }
+
+            // `mag = CLASS0_SIZE << ( mv_class + 2 )` (the
+            // `MV_CLASS_K` baseline magnitude).
+            let mut mag: i32 = (CLASS0_SIZE as i32) << (mv_class + 2);
+
+            let mv_fr: u8 = if force_integer_mv {
+                3
+            } else {
+                let row = cdfs.mv_fr_cdf(mv_ctx, comp);
+                let v = decoder.read_symbol(row)? as u8;
+                debug_assert!((v as usize) < MV_JOINTS, "S() over TileMvFrCdf yields 0..4");
+                v
+            };
+
+            let mv_hp: u8 = if allow_high_precision_mv {
+                let row = cdfs.mv_hp_cdf(mv_ctx, comp);
+                let v = decoder.read_symbol(row)? as u8;
+                debug_assert!(v <= 1, "S() over TileMvHpCdf yields 0 or 1");
+                v
+            } else {
+                1
+            };
+
+            // `mag += ( ( d << 3 ) | ( mv_fr << 1 ) | mv_hp ) + 1`.
+            mag += (((d as i32) << 3) | ((mv_fr as i32) << 1) | (mv_hp as i32)) + 1;
+            mag
+        };
+
+        // §5.11.32 final `return mv_sign ? -mag : mag`.
+        Ok(if mv_sign != 0 { -mag } else { mag })
     }
 
     /// `read_ref_frames()` per §5.11.25 (av1-spec p.76) — the
@@ -19257,6 +19679,67 @@ fn has_nearmv(mode: u8) -> bool {
     )
 }
 
+/// `get_mode(refList)` per §5.11.30 (av1-spec p.81) — folds a YMode +
+/// reference-list index into the per-list `compMode` used by §5.11.31
+/// `assign_mv`. The returned ordinal is one of
+/// `MODE_NEWMV` / `MODE_NEARESTMV` / `MODE_NEARMV` / `MODE_GLOBALMV`
+/// (the four single-list compMode values).
+///
+/// Spec body (av1-spec p.81):
+///
+/// ```text
+///   get_mode( refList ) {
+///       if ( refList == 0 ) {
+///           if ( YMode < NEAREST_NEARESTMV )
+///                compMode = YMode
+///           else if ( YMode == NEW_NEWMV || YMode == NEW_NEARESTMV || YMode == NEW_NEARMV )
+///                compMode = NEWMV
+///           else if ( YMode == NEAREST_NEARESTMV || YMode == NEAREST_NEWMV )
+///                compMode = NEARESTMV
+///           else if ( YMode == NEAR_NEARMV || YMode == NEAR_NEWMV )
+///                compMode = NEARMV
+///           else
+///                compMode = GLOBALMV
+///       } else {
+///           if ( YMode == NEW_NEWMV || YMode == NEAREST_NEWMV || YMode == NEAR_NEWMV )
+///                compMode = NEWMV
+///           else if ( YMode == NEAREST_NEARESTMV || YMode == NEW_NEARESTMV )
+///                compMode = NEARESTMV
+///           else if ( YMode == NEAR_NEARMV || YMode == NEW_NEARMV )
+///                compMode = NEARMV
+///           else
+///                compMode = GLOBALMV
+///       }
+///       return compMode
+///   }
+/// ```
+///
+/// The single-pred branch (`ref_list == 0` AND `YMode <
+/// NEAREST_NEARESTMV = 18`) is the identity (the YMode IS the
+/// compMode), matching the §6.10.22 inter-Y-mode ordering
+/// `MODE_NEARESTMV..=MODE_NEWMV = 14..=17`.
+#[inline]
+pub fn get_mode(y_mode: u8, ref_list: usize) -> u8 {
+    if ref_list == 0 {
+        if y_mode < MODE_NEAREST_NEARESTMV {
+            return y_mode;
+        }
+        match y_mode {
+            MODE_NEW_NEWMV | MODE_NEW_NEARESTMV | MODE_NEW_NEARMV => MODE_NEWMV,
+            MODE_NEAREST_NEARESTMV | MODE_NEAREST_NEWMV => MODE_NEARESTMV,
+            MODE_NEAR_NEARMV | MODE_NEAR_NEWMV => MODE_NEARMV,
+            _ => MODE_GLOBALMV,
+        }
+    } else {
+        match y_mode {
+            MODE_NEW_NEWMV | MODE_NEAREST_NEWMV | MODE_NEAR_NEWMV => MODE_NEWMV,
+            MODE_NEAREST_NEARESTMV | MODE_NEW_NEARESTMV => MODE_NEARESTMV,
+            MODE_NEAR_NEARMV | MODE_NEW_NEARMV => MODE_NEARMV,
+            _ => MODE_GLOBALMV,
+        }
+    }
+}
+
 /// §7.10.2.11 sorting process. Stable modified-bubble-sort: descending
 /// by `WeightStack[]`, with the `swap_stack` swap copying both
 /// `WeightStack` and `RefStackMv[idx][list][comp]` for `list = 0..1 +
@@ -19936,10 +20419,13 @@ pub struct DecodedIntraBlockModeInfo {
 
 /// §5.11.23 per-block aggregate surfaced by
 /// [`PartitionWalker::decode_inter_block_mode_info`]. Carries the
-/// §5.11.23 prologue + §7.10.2 stack-summary + YMode + RefMvIdx
-/// outcomes; observable only on the `Ok` path, which currently
-/// short-circuits at [`crate::Error::AssignMvUnsupported`] (§5.11.31
-/// `assign_mv` is the next-arc target).
+/// §5.11.23 prologue + §7.10.2 stack-summary + YMode + RefMvIdx + the
+/// §5.11.31 `assign_mv` outcome; observable only on the `Ok` path,
+/// which currently short-circuits at
+/// [`crate::Error::MotionModeUnsupported`] (§5.11.27 `read_motion_mode`
+/// is the next-arc target). r174 lifted the §5.11.31 / §5.11.32
+/// `assign_mv` + `read_mv_component` cascade so the per-list `Mv[..]`
+/// is now decoded and surfaced through the new `mv` field below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedInterBlockModeInfo {
     /// §5.11.23 caller-passed mi-unit row of the block.
@@ -19994,6 +20480,25 @@ pub struct DecodedInterBlockModeInfo {
     /// Always `0` on the r172 spatial-only path (the temporal scan is
     /// the only writer of non-zero `ZeroMvContext`).
     pub zero_mv_context: u32,
+    /// `Mv[ ref ][ comp ]` — the §5.11.31 `assign_mv()` output. Each
+    /// per-list pair holds the row component in slot `0` and the
+    /// column component in slot `1`, both in 1/8-luma-sample units
+    /// (`MV_BORDER`-clamped per §6.10.25). For single-pred blocks
+    /// (`is_compound == false`) only `mv[0]` is meaningful; `mv[1]`
+    /// stays at its default `[0, 0]`. For compound blocks both pairs
+    /// are written.
+    ///
+    /// Each pair is either:
+    /// * `GlobalMvs[i]` when `get_mode(i) == MODE_GLOBALMV`
+    ///   (`GLOBAL_GLOBALMV` arm) — no MV bits read,
+    /// * `RefStackMv[ pos ][ i ]` for the NEAREST / NEAR cases with
+    ///   `pos = ( compMode == NEARESTMV ) ? 0 : RefMvIdx` (forced to
+    ///   `0` when `compMode == NEWMV && NumMvFound <= 1`) — no MV bits
+    ///   read,
+    /// * `PredMv[i] + diffMv` when `get_mode(i) == MODE_NEWMV`, where
+    ///   `diffMv` is the §5.11.31 `read_mv()` output (§5.11.32
+    ///   `read_mv_component` reads per axis gated on `mv_joint`).
+    pub mv: [[i32; 2]; 2],
 }
 
 #[cfg(test)]
@@ -33932,7 +34437,7 @@ mod tests {
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert_eq!(
             dec.position(),
             pos_before,
@@ -34006,7 +34511,7 @@ mod tests {
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
         // the §5.11.23 Arm 4 single-pred cascade then reads at least the
         // `new_mv` symbol.
@@ -34062,7 +34567,7 @@ mod tests {
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert_eq!(dec.position(), pos_before);
         // RefFrames[0][0] = [LAST_FRAME = 1, NONE = -1].
         assert_eq!(walker.ref_frames()[0], 1);
@@ -34101,7 +34606,7 @@ mod tests {
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert_eq!(dec2.position(), pos_before);
         assert_eq!(walker2.ref_frames()[0], 1);
         assert_eq!(walker2.ref_frames()[1], -1);
@@ -34154,7 +34659,7 @@ mod tests {
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         // The single-ref cascade reads at least the single_ref_p1
         // symbol, which is a conformant binary S() against the §9.4
         // default CDF — at minimum one bit gets consumed (the §8.2.6
@@ -34220,7 +34725,7 @@ mod tests {
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         let r0 = walker.ref_frames()[0];
         let r1 = walker.ref_frames()[1];
         // Either single-pred (r0 in 1..=7, r1 = NONE = -1) or compound
@@ -34281,7 +34786,7 @@ mod tests {
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
         assert_eq!(
             walker.ref_frames()[1],
@@ -34313,11 +34818,13 @@ mod tests {
             new_mv_context: 0,
             ref_mv_context: 0,
             zero_mv_context: 0,
+            mv: [[0, 0], [0, 0]],
         };
         assert_eq!(info.ref_frame[0], 1);
         assert_eq!(info.ref_frame[1], 7);
         assert!(info.is_compound);
         assert_eq!(info.y_mode, MODE_NEAREST_NEARESTMV);
+        assert_eq!(info.mv, [[0, 0], [0, 0]]);
         // Single-pred case.
         let info_single = DecodedInterBlockModeInfo {
             mi_row: 0,
@@ -34331,9 +34838,13 @@ mod tests {
             new_mv_context: 0,
             ref_mv_context: 0,
             zero_mv_context: 0,
+            mv: [[12, -8], [0, 0]],
         };
         assert!(!info_single.is_compound);
         assert_eq!(info_single.y_mode, MODE_NEARESTMV);
+        assert_eq!(info_single.mv[0], [12, -8]);
+        // Slot 1 stays at the §5.11.5 pre-fill on single-pred.
+        assert_eq!(info_single.mv[1], [0, 0]);
     }
 
     /// §5.11.18 prologue + §5.11.23 grid composition: stamp
@@ -34414,7 +34925,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert_eq!(
             dec.position(),
             pos_before,
@@ -34468,7 +34979,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert_eq!(
             dec.position(),
             pos_before,
@@ -34485,7 +34996,9 @@ mod tests {
     /// comp_mode and comp_ref_type to land on COMPOUND_REFERENCE +
     /// UNIDIR + RefFrame[0..2] = [BWDREF, ALTREF]) and confirms the
     /// `compound_mode` S() fires (position advances) and the
-    /// AssignMvUnsupported stub is reached.
+    /// MotionModeUnsupported stub is reached (post-r174 the §5.11.31
+    /// `assign_mv` body fully decoded; the live gap moved to
+    /// §5.11.27 `read_motion_mode`).
     #[test]
     fn cascade_compound_arm3_consumes_compound_mode_bit() {
         let geom = TileGeometry {
@@ -34539,7 +35052,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert!(
             dec.position() > pos_before,
             "Arm 3 ⇒ compound_mode S() must consume bits"
@@ -34608,7 +35121,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert!(
             dec.position() > pos_before,
             "Arm 4 ⇒ new_mv + single_ref cascade must consume bits"
@@ -34674,7 +35187,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         assert!(dec.position() > pos_before);
     }
 
@@ -34736,7 +35249,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
     }
 
     /// §5.11.23 drl_mode short-circuit: `NumMvFound = 0` on a fresh
@@ -34800,7 +35313,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
         // drl_mode CDFs must NOT have adapted (no read fired).
         for row in &cdfs.drl_mode {
             assert_eq!(
@@ -34927,8 +35440,624 @@ mod tests {
     }
 
     // ===================================================================
-    // §7.10 find_mv_stack tests (round 172)
+    // §5.11.30 get_mode + §5.11.31 assign_mv + §5.11.32
+    // read_mv_component tests (round 174)
     // ===================================================================
+
+    /// Test helper: build a `CDF_LEN`-entry CDF row that forces
+    /// [`crate::symbol_decoder::SymbolDecoder::read_symbol`] to return
+    /// `target_sym`. Convention: `cdf[i] = 1` for `i < target_sym`
+    /// (tiny probability — the §8.2.6 `cur` at those positions stays
+    /// close to `range`, so `value < cur` and the loop continues), then
+    /// `cdf[i] = 1 << 15` for `i >= target_sym` (`cur` is tiny, the
+    /// loop breaks at the first such `i = target_sym`). The final
+    /// counter entry stays at `0`. Robust across decoder-state
+    /// evolution (independent of `value` / `range` after multiple
+    /// reads).
+    fn force_cdf<const N: usize>(target_sym: usize) -> [u16; N] {
+        let mut out = [0u16; N];
+        let last = N - 1;
+        for (i, slot) in out.iter_mut().enumerate().take(last) {
+            *slot = if i < target_sym { 1 } else { 1 << 15 };
+        }
+        // counter (slot N-1) stays at 0
+        out
+    }
+
+    /// §5.11.30 `get_mode( refList )`: single-pred YModes (`YMode <
+    /// NEAREST_NEARESTMV = 18`) are the identity on `refList = 0`. The
+    /// four ordinals `MODE_NEARESTMV..=MODE_NEWMV = 14..=17` map to
+    /// themselves.
+    #[test]
+    fn get_mode_single_pred_identity_on_ref_list_0() {
+        for &m in &[MODE_NEARESTMV, MODE_NEARMV, MODE_GLOBALMV, MODE_NEWMV] {
+            assert_eq!(
+                get_mode(m, 0),
+                m,
+                "single-pred YMode is the identity on refList = 0"
+            );
+        }
+    }
+
+    /// §5.11.30 compound-mode mapping table (av1-spec p.81 — the
+    /// `else` arm of the spec body when `refList == 0` and the explicit
+    /// `refList == 1` arm). One row per §6.10.22 compound Y mode.
+    #[test]
+    fn get_mode_compound_table_matches_spec() {
+        // [y_mode, get_mode(.., 0), get_mode(.., 1)]
+        let table: &[(u8, u8, u8)] = &[
+            (MODE_NEAREST_NEARESTMV, MODE_NEARESTMV, MODE_NEARESTMV),
+            (MODE_NEAR_NEARMV, MODE_NEARMV, MODE_NEARMV),
+            (MODE_NEAREST_NEWMV, MODE_NEARESTMV, MODE_NEWMV),
+            (MODE_NEW_NEARESTMV, MODE_NEWMV, MODE_NEARESTMV),
+            (MODE_NEAR_NEWMV, MODE_NEARMV, MODE_NEWMV),
+            (MODE_NEW_NEARMV, MODE_NEWMV, MODE_NEARMV),
+            (MODE_GLOBAL_GLOBALMV, MODE_GLOBALMV, MODE_GLOBALMV),
+            (MODE_NEW_NEWMV, MODE_NEWMV, MODE_NEWMV),
+        ];
+        for &(y_mode, expect_l0, expect_l1) in table {
+            assert_eq!(
+                get_mode(y_mode, 0),
+                expect_l0,
+                "§5.11.30 ref_list=0 mismatch for YMode={y_mode}"
+            );
+            assert_eq!(
+                get_mode(y_mode, 1),
+                expect_l1,
+                "§5.11.30 ref_list=1 mismatch for YMode={y_mode}"
+            );
+        }
+    }
+
+    /// §5.11.23 r174 lift verification: with §5.11.25 forcing the
+    /// skip_mode arm + skip_mode_frame = [LAST, ALTREF] (compound) and
+    /// YMode = NEAREST_NEARESTMV (§5.11.23 Arm 1), `assign_mv` reads
+    /// `compMode = NEARESTMV` for BOTH lists and uses `RefStackMv[0][0..1]`
+    /// without reading any MV bits. The fresh walker's `find_mv_stack`
+    /// produces `RefStackMv[0] = [[0,0], [0,0]]` for the identity-GM
+    /// path, so `Mv = [[0,0], [0,0]]`. Position MUST equal pos_before
+    /// (skip_mode + NEAREST_NEAREST is a fully-non-reading path).
+    #[test]
+    fn assign_mv_skip_mode_nearest_nearest_reads_no_mv_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            4,
+            4,
+            BLOCK_8X8,
+            /* skip_mode = */ 1,
+            true,
+            true,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            /* skip_mode_frame = */ [1, 7],
+            false,
+            0,
+            false,
+            false,
+            true,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "§5.11.31 NEAREST/NEAREST + identity GM ⇒ no S() reads"
+        );
+        // §5.11.5 grid stamp: Mvs[r][c][list][comp] = 0 over the 2×2
+        // BLOCK_8X8 footprint at (4, 4) — the stamped value matches the
+        // fresh-walker RefStackMv[0][list] = [0, 0] for identity GM.
+        let mi_cols = walker.mi_cols() as usize;
+        for dr in 0..2 {
+            for dc in 0..2 {
+                let cell = (4 + dr) * mi_cols + (4 + dc);
+                assert_eq!(walker.mvs()[(cell * 2) * 2], 0);
+                assert_eq!(walker.mvs()[(cell * 2) * 2 + 1], 0);
+                assert_eq!(walker.mvs()[(cell * 2 + 1) * 2], 0);
+                assert_eq!(walker.mvs()[(cell * 2 + 1) * 2 + 1], 0);
+            }
+        }
+    }
+
+    /// §5.11.23 r174: §5.11.23 Arm 2 (seg_globalmv_active) ⇒ YMode =
+    /// GLOBALMV ⇒ `assign_mv`'s compMode = GLOBALMV uses GlobalMvs[0]
+    /// without reading any MV bits. With identity-GM
+    /// (`GmType[ref] = IDENTITY`) the §7.10.2.1 setup-global-mv returns
+    /// `GlobalMvs[0] = [0, 0]`, so the stamped Mv is `[0, 0]`.
+    #[test]
+    fn assign_mv_seg_globalmv_uses_global_mvs_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            /* seg_globalmv_active = */ true,
+            true,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "§5.11.31 GLOBALMV + identity-GM ⇒ no S() reads"
+        );
+        // Grid: single-pred ⇒ Mvs[0][0][0][0..2] = [0, 0]; Mvs[0][0][1][..] = [0, 0] (pre-fill).
+        // cell = 0 (row 0, col 0) ⇒ flat index = (0 * mi_cols + 0) = 0.
+        let cell: usize = 0;
+        assert_eq!(walker.mvs()[(cell * 2) * 2], 0);
+        assert_eq!(walker.mvs()[(cell * 2) * 2 + 1], 0);
+        assert_eq!(walker.mvs()[(cell * 2 + 1) * 2], 0);
+        assert_eq!(walker.mvs()[(cell * 2 + 1) * 2 + 1], 0);
+    }
+
+    /// §5.11.31 NEWMV + `mv_joint = MV_JOINT_ZERO`: rig the §5.11.23
+    /// Arm 4 single-pred cascade to YMode = NEWMV (`new_mv` ⇒ 0), then
+    /// rig `mv_joint` ⇒ symbol 0 (MV_JOINT_ZERO). With diffMv = [0, 0]
+    /// the final Mv = PredMv. Fresh walker on identity-GM has
+    /// `RefStackMv[0][0] = [0, 0]`, so the stamped Mv is also [0, 0].
+    ///
+    /// Verifies that the §5.11.31 cascade consumed exactly the
+    /// `new_mv` bit (the single-ref + zero/ref_mv arm reads don't fire
+    /// because NEWMV is the first arm), the `mv_joint` bit, and ZERO
+    /// `read_mv_component` calls — no `mv_sign` / `mv_class` reads.
+    #[test]
+    fn read_mv_newmv_with_mv_joint_zero_yields_zero_diff_mv() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig §5.11.23 Arm 4 single-pred for YMode = NEWMV.
+        for row in cdfs.new_mv.iter_mut() {
+            *row = force_binary_cdf(0);
+        }
+        // Single-ref deterministic — any conformant inter ref is fine.
+        for row in cdfs.single_ref.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_binary_cdf(0);
+            }
+        }
+        // §5.11.31 mv_joint ⇒ MV_JOINT_ZERO (symbol 0). 5-entry CDF
+        // (MV_JOINTS + 1 = 5). For an all-zero bitstream
+        // (SymbolValue ≈ range - 1) the §8.2.6 loop breaks at the first
+        // index `s` where `cdf[s] = (1 << 15)` (which makes `cur`
+        // tiny), so to force symbol 0 every CDF entry except the
+        // counter is `(1 << 15)`.
+        for row in cdfs.mv_joint.iter_mut() {
+            *row = [1 << 15, 1 << 15, 1 << 15, 1 << 15, 0];
+        }
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            /* reference_select = */ false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        // Mvs grid: identity-GM PredMv = [0, 0], MV_JOINT_ZERO diff =
+        // [0, 0], so final Mv[0] = [0, 0].
+        assert_eq!(walker.mvs()[0], 0);
+        assert_eq!(walker.mvs()[1], 0);
+        // mv_sign / mv_class CDF counters MUST stay 0 (no read fired).
+        for row in &cdfs.mv_sign {
+            for slot in row {
+                assert_eq!(
+                    slot[2], 0,
+                    "mv_sign CDF must not have adapted on MV_JOINT_ZERO"
+                );
+            }
+        }
+        for row in &cdfs.mv_class {
+            for slot in row {
+                assert_eq!(
+                    slot[11], 0,
+                    "mv_class CDF must not have adapted on MV_JOINT_ZERO"
+                );
+            }
+        }
+    }
+
+    /// §5.11.31 cascade structural smoke: when the §5.11.23 dispatch
+    /// reaches the inter cascade and the §5.11.31 assign_mv body
+    /// fires, the resulting Mv values are constrained by the
+    /// §6.10.25 conformance bound (`|Mv[i][c]| < (1 << 14)`). The
+    /// per-arc rigs above (NEWMV cascade with `mv_joint = MV_JOINT_ZERO`
+    /// plus identity GM) exercise the zero-diff path; this test
+    /// verifies the larger-diff path stays within the bound after a
+    /// full rigged cascade. Symbol-by-symbol assertions on the rigged
+    /// CDFs are not robust because the AV1 arithmetic coder is
+    /// stateful; instead we assert structural invariants.
+    #[test]
+    fn cascade_assign_mv_produces_in_range_mv_values() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // YMode = NEWMV ⇒ assign_mv invokes read_mv ⇒ read_mv_component.
+        for row in cdfs.new_mv.iter_mut() {
+            *row = force_binary_cdf(0);
+        }
+        for row in cdfs.single_ref.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_binary_cdf(0);
+            }
+        }
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        // §6.10.25 `is_mv_valid`: |Mv[i][c]| < (1 << 14) = 16384.
+        for list in 0..2 {
+            for comp in 0..2 {
+                let v = walker.mvs()[((list) * 2) * 2 + comp].unsigned_abs() as i32;
+                assert!(
+                    v < (1 << 14),
+                    "|Mv[{list}][{comp}]| = {v} must be < (1 << 14)"
+                );
+            }
+        }
+    }
+
+    /// §5.11.32 `read_mv_component` direct exercise — all five reads
+    /// rigged to symbol 0 (sign=0, class=0, class0_bit=0,
+    /// class0_fr=0, class0_hp=0 when allow_hp=true). The §8.2.6 cdf
+    /// rig `[1 << 15; CDF_LEN - 1] + [0]` (built by [`force_cdf`])
+    /// puts `cur = 4 * (N - 1)` at `s = 0` which is always <= the
+    /// decoder's `value` (regardless of state), so symbol 0 is
+    /// deterministic.
+    ///
+    /// With sign=0, class=0, class0_bit=0, class0_fr=0,
+    /// allow_high_precision_mv=true ⇒ class0_hp read fires and = 0.
+    /// mag = ((0 << 3) | (0 << 1) | 0) + 1 = 1.
+    #[test]
+    fn read_mv_component_direct_class0_all_zero_yields_mag_one() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force every symbol read to 0.
+        for row in cdfs.mv_sign.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        for row in cdfs.mv_class.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<12>(0);
+            }
+        }
+        for row in cdfs.mv_class0_bit.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        for row in cdfs.mv_class0_fr.iter_mut() {
+            for slot in row.iter_mut() {
+                for inner in slot.iter_mut() {
+                    *inner = force_cdf::<5>(0);
+                }
+            }
+        }
+        for row in cdfs.mv_class0_hp.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let r = walker.read_mv_component(
+            &mut dec, &mut cdfs, /* comp = */ 0, /* mv_ctx = */ 0,
+            /* allow_high_precision_mv = */ true, /* force_integer_mv = */ false,
+        );
+        assert_eq!(r, Ok(1), "all-sym-0 class-0 ladder ⇒ mag = 0 + 1 = 1");
+    }
+
+    /// §5.11.32 `read_mv_component` direct exercise — same as the
+    /// all-zero test but with `allow_high_precision_mv = false`. The
+    /// `mv_class0_hp` read is skipped and the §5.11.32 fall-through
+    /// `mv_class0_hp = 1` applies. mag = ((0<<3)|(0<<1)|1) + 1 = 2.
+    #[test]
+    fn read_mv_component_direct_class0_no_hp_yields_mag_two() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        for row in cdfs.mv_sign.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        for row in cdfs.mv_class.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<12>(0);
+            }
+        }
+        for row in cdfs.mv_class0_bit.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        for row in cdfs.mv_class0_fr.iter_mut() {
+            for slot in row.iter_mut() {
+                for inner in slot.iter_mut() {
+                    *inner = force_cdf::<5>(0);
+                }
+            }
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let r = walker.read_mv_component(
+            &mut dec, &mut cdfs, 0, 0, /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+        );
+        assert_eq!(
+            r,
+            Ok(2),
+            "fall-through hp=1 ⇒ mag = ((0<<3)|(0<<1)|1)+1 = 2"
+        );
+    }
+
+    /// §5.11.32 `read_mv_component` — `mv_sign = 1` negates the
+    /// magnitude. Same setup as the all-zero class-0 test but with
+    /// `mv_sign` rigged to symbol 1 via `[1, 1<<15, 0]` (which forces
+    /// sym 1 on the first read off a fresh decoder: value=32767,
+    /// cur(s=0) = ((128*511)>>1)+4*1 = 32704+4 = 32708, value >= cur
+    /// → wait, value=32767 ≥ 32708 ⇒ break, sym=0). For reliable
+    /// sym=1 on the FIRST read we need cur(s=0) > value(32767).
+    /// `cdf[0]=0` ⇒ cur = (128*512)>>1 + 4 = 32768+4 = 32772 > 32767
+    /// ⇒ continue. Then cdf[1]=(1<<15) ⇒ cur tiny ⇒ break with sym=1.
+    /// This pattern is deterministic ONLY for the first read off a
+    /// fresh decoder. (Subsequent reads' `value`/`range` evolve and
+    /// the cdf[0]=0 trick may then under-cur.)
+    #[test]
+    fn read_mv_component_direct_with_sign_negates_mag() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // mv_sign is the FIRST read; rig to symbol 1 via the
+        // fresh-state-only `[0, 1<<15, 0]` pattern (matches
+        // `force_binary_cdf(1)`).
+        for row in cdfs.mv_sign.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = [0, 1 << 15, 0];
+            }
+        }
+        // After the first read (mv_sign), subsequent rig back to
+        // robust sym-0.
+        for row in cdfs.mv_class.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<12>(0);
+            }
+        }
+        for row in cdfs.mv_class0_bit.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        for row in cdfs.mv_class0_fr.iter_mut() {
+            for slot in row.iter_mut() {
+                for inner in slot.iter_mut() {
+                    *inner = force_cdf::<5>(0);
+                }
+            }
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let r = walker.read_mv_component(
+            &mut dec, &mut cdfs, 0, 0, /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+        );
+        // mag = 2 (as above), sign = 1 ⇒ -2.
+        assert_eq!(r, Ok(-2), "mv_sign = 1 negates mag = 2 to -2");
+    }
+
+    /// §5.11.32 `read_mv_component` — `force_integer_mv = true`
+    /// short-circuits the `mv_class0_fr` read (forces value = 3) and
+    /// also the `mv_fr` read for class > 0. Combined with all other
+    /// reads forced to sym 0 (sign=0, class=0, class0_bit=0,
+    /// allow_high_precision_mv=false → class0_hp fall-through=1):
+    /// mag = ((0 << 3) | (3 << 1) | 1) + 1 = 7 + 1 = 8.
+    #[test]
+    fn read_mv_component_direct_force_integer_uses_fr_three() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        for row in cdfs.mv_sign.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        for row in cdfs.mv_class.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<12>(0);
+            }
+        }
+        for row in cdfs.mv_class0_bit.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = force_cdf::<3>(0);
+            }
+        }
+        // mv_class0_fr is rigged to symbol 0 to verify the §5.11.32
+        // `force_integer_mv = 1` path SKIPS the read entirely (so the
+        // rig is irrelevant — fr is always 3 on this path).
+        for row in cdfs.mv_class0_fr.iter_mut() {
+            for slot in row.iter_mut() {
+                for inner in slot.iter_mut() {
+                    *inner = force_cdf::<5>(0);
+                }
+            }
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let r = walker.read_mv_component(
+            &mut dec, &mut cdfs, 0, 0, /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ true,
+        );
+        assert_eq!(
+            r,
+            Ok(8),
+            "force_integer_mv ⇒ fr=3 ⇒ mag = ((0<<3)|(3<<1)|1)+1 = 8"
+        );
+    }
+
+    /// §5.11.31 assign_mv defensive guard: passing `use_intrabc =
+    /// true` through the internal helper surfaces
+    /// `PartitionWalkOutOfRange`. The inter dispatcher hard-codes
+    /// `use_intrabc = false`; this test directly exercises the guard.
+    #[test]
+    fn assign_mv_rejects_use_intrabc_in_inter_arm() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let stack: [[[i32; 2]; 2]; MAX_REF_MV_STACK_SIZE] = [[[0, 0]; 2]; MAX_REF_MV_STACK_SIZE];
+        let globals: [[i32; 2]; 2] = [[0, 0], [0, 0]];
+        let r = walker.assign_mv(
+            &mut dec,
+            &mut cdfs,
+            false,
+            /* use_intrabc = */ true,
+            MODE_NEARESTMV,
+            0,
+            0,
+            &stack,
+            &globals,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
+    }
 
     /// Helper: build the per-ref identity global-motion matrices
     /// (`GmType[ref] = IDENTITY` for every ref). The §7.10.2.1
@@ -35107,6 +36236,10 @@ mod tests {
         // After lower-precision strip: 1 has LSB set → 1 → 0 (toward zero).
         assert_eq!(mv_lo, [0, 0]);
     }
+
+    // ===================================================================
+    // §7.10 find_mv_stack tests (round 172)
+    // ===================================================================
 
     /// §7.10 driver on an empty walker (no inter neighbours), single
     /// prediction with IDENTITY global motion. Expected outcome:
