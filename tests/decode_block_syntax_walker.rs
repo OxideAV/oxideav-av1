@@ -42,9 +42,9 @@
 //!   stub through the recursion.
 
 use oxideav_av1::{
-    DecodedBlock, Error, PartitionWalker, SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16,
-    BLOCK_4X4, BLOCK_8X16, BLOCK_8X8, MAX_SEGMENTS, MAX_TX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4,
-    TX_8X8, TX_SIZE_CONTEXTS,
+    DecodedBlock, DecodedInterFrameModeInfo, Error, PartitionWalker, SymbolDecoder, TileCdfContext,
+    TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8, MAX_SEGMENTS, MAX_TX_DEPTH,
+    MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS,
 };
 
 /// Helper: force the §5.11.11 skip CDF to deterministically return
@@ -794,34 +794,61 @@ fn read_block_tx_size_tx_mode_select_depth_two_splits_twice() {
     );
 }
 
-/// §5.11.16 inter-arm stub: `TX_MODE_SELECT && MiSize > BLOCK_4X4 &&
+/// §5.11.16 inter-arm: `TX_MODE_SELECT && MiSize > BLOCK_4X4 &&
 /// is_inter && !skip && !Lossless` enters the §5.11.17
-/// `read_var_tx_size` recursion. That round's target is stubbed; the
-/// reader surfaces [`Error::ReadVarTxSizeUnsupported`].
+/// `read_var_tx_size` recursion (landed in r168). With both
+/// `txfm_split_cdf` rows rigged to symbol 0 (no split), the recursion
+/// bottoms out at depth 0 with `txfm_split = 0`, the terminal else
+/// arm stamps `InterTxSizes[]` over the `(h4, w4)` sub-block, and
+/// returns the input `txSz`. For BLOCK_16X16 with maxTxSz =
+/// TX_16X16, txW4 = txH4 = 4, the outer loop fires once, and the
+/// reader returns TX_16X16.
 #[test]
-fn read_block_tx_size_inter_arm_returns_var_tx_size_stub() {
+fn read_block_tx_size_inter_arm_no_split_returns_max_tx_size() {
     let mut walker = walker_n(8);
     let mut cdfs = TileCdfContext::new_from_defaults();
+    // Rig txfm_split CDF rows to all return symbol 0 (no split).
+    let rigged = force_binary_cdf(0);
+    for row in cdfs.txfm_split.iter_mut() {
+        *row = rigged;
+    }
     let bytes = [0u8; 4];
     let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
     let pos_before = dec.position();
-    let r = walker.read_block_tx_size(
-        &mut dec,
-        &mut cdfs,
-        0,
-        0,
-        BLOCK_16X16,
-        /* lossless = */ false,
-        /* is_inter = */ true,
-        /* skip = */ false,
-        /* tx_mode_select = */ true,
-    );
+    let tx = walker
+        .read_block_tx_size(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            /* lossless = */ false,
+            /* is_inter = */ true,
+            /* skip = */ false,
+            /* tx_mode_select = */ true,
+        )
+        .unwrap();
     let pos_after = dec.position();
-    assert_eq!(r, Err(Error::ReadVarTxSizeUnsupported));
     assert_eq!(
-        pos_after, pos_before,
-        "stub fires before any bitstream read"
+        tx, TX_16X16 as u8,
+        "no-split: read_var_tx_size returns the input txSz = max_tx_sz"
     );
+    assert!(
+        pos_after > pos_before,
+        "the §5.11.17 reader must consume the txfm_split bit"
+    );
+    // Verify the §5.11.17 terminal-else stamp landed over the BLOCK_16X16
+    // 4×4 footprint of `InterTxSizes[]`.
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..4 {
+        for c in 0..4 {
+            assert_eq!(
+                walker.inter_tx_sizes()[r * mi_cols + c],
+                TX_16X16 as u8,
+                "§5.11.17 terminal-else stamp at ({r}, {c})"
+            );
+        }
+    }
 }
 
 /// §5.11.16 inter-arm `else` path: with `skip = 1` the inter arm
@@ -948,4 +975,499 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
             );
         }
     }
+}
+
+// ===================================================================
+// §5.11.17 read_var_tx_size — direct-call coverage.
+//
+// The §5.11.17 reader was implemented in r168. It implements the
+// variable-transform-tree syntax recursion the §5.11.16 inter-arm
+// enters when `TX_MODE_SELECT && MiSize > BLOCK_4X4 && is_inter &&
+// !skip && !Lossless`. The recursion bottoms out at `txSz == TX_4X4`
+// or `depth == MAX_VARTX_DEPTH`, each terminal-else stamps
+// `InterTxSizes[]` over the `(h4, w4)` sub-block footprint.
+// ===================================================================
+
+/// §5.11.17 base case: `txSz == TX_4X4` short-circuits the
+/// `txfm_split` read (the spec body sets `txfm_split = 0` directly,
+/// no S() read) and stamps `InterTxSizes[]` at the anchor cell.
+#[test]
+fn read_var_tx_size_tx_4x4_no_read() {
+    let mut walker = walker_n(4);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let bytes = [0xFFu8; 4];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+    let pos_before = dec.position();
+    let tx = walker
+        .read_var_tx_size(
+            &mut dec, &mut cdfs, /* mi_row_b = */ 0, /* mi_col_b = */ 0, BLOCK_8X8,
+            /* row = */ 0, /* col = */ 0, TX_4X4, /* depth = */ 0,
+            /* is_inter = */ true,
+        )
+        .unwrap();
+    let pos_after = dec.position();
+    assert_eq!(tx, TX_4X4 as u8);
+    assert_eq!(
+        pos_after, pos_before,
+        "TX_4X4 base case must not consume bits"
+    );
+    assert_eq!(
+        walker.inter_tx_sizes()[0],
+        TX_4X4 as u8,
+        "terminal-else stamp at (0, 0)"
+    );
+}
+
+/// §5.11.17 depth cap: `depth == MAX_VARTX_DEPTH` forces
+/// `txfm_split = 0` (no S() read), stamps `InterTxSizes[]` and
+/// returns the input `txSz`.
+#[test]
+fn read_var_tx_size_max_depth_no_read() {
+    let mut walker = walker_n(8);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let bytes = [0xFFu8; 4];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+    let pos_before = dec.position();
+    let tx = walker
+        .read_var_tx_size(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            0,
+            0,
+            TX_16X16,
+            /* depth = */ MAX_VARTX_DEPTH,
+            true,
+        )
+        .unwrap();
+    let pos_after = dec.position();
+    assert_eq!(tx, TX_16X16 as u8);
+    assert_eq!(pos_after, pos_before, "depth cap must not consume bits");
+    // §5.11.17 terminal-else stamp covers the TX_16X16 footprint (4×4 mi cells).
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..4 {
+        for c in 0..4 {
+            assert_eq!(
+                walker.inter_tx_sizes()[r * mi_cols + c],
+                TX_16X16 as u8,
+                "§5.11.17 stamp at ({r}, {c})"
+            );
+        }
+    }
+}
+
+/// §5.11.17 split path: forcing `txfm_split = 1` enters the
+/// recursion which calls itself with `subTxSz = Split_Tx_Size[ txSz ]`
+/// and `depth + 1`. With both txfm_split CDF rows forcing symbol 1,
+/// the recursion descends to `MAX_VARTX_DEPTH = 2` then stamps the
+/// sub-block footprint. For BLOCK_16X16 with `tx_sz = TX_16X16` at
+/// depth 0: TX_16X16 → split → 4× TX_8X8 → each split → 4× TX_4X4
+/// (depth 2, the cap), each stamps 1×1 mi cells.
+#[test]
+fn read_var_tx_size_split_to_max_depth_stamps_tx_4x4() {
+    let mut walker = walker_n(8);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    for row in cdfs.txfm_split.iter_mut() {
+        *row = force_binary_cdf(1);
+    }
+    let bytes = [0u8; 16];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+    let pos_before = dec.position();
+    let tx = walker
+        .read_var_tx_size(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            0,
+            0,
+            TX_16X16,
+            0,
+            true,
+        )
+        .unwrap();
+    let _ = pos_before;
+    // Terminal `txSz` returned. At depth 2 the recursion stops with
+    // the spec's `txfm_split = 0` short-circuit and stamps TX_4X4.
+    assert_eq!(
+        tx, TX_4X4 as u8,
+        "last terminal-else assigns txSz = TX_4X4 at depth MAX_VARTX_DEPTH"
+    );
+    // The §5.11.17 stamp covers every 1×1 mi cell of the TX_16X16 footprint.
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..4 {
+        for c in 0..4 {
+            assert_eq!(
+                walker.inter_tx_sizes()[r * mi_cols + c],
+                TX_4X4 as u8,
+                "§5.11.17 deepest-split stamp at ({r}, {c})"
+            );
+        }
+    }
+}
+
+/// §5.11.17 frame-edge clip: `row >= MiRows || col >= MiCols`
+/// short-circuits with no read, no stamp, returning the input `txSz`.
+#[test]
+fn read_var_tx_size_out_of_frame_short_circuits() {
+    let mut walker = walker_n(4);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let bytes = [0xFFu8; 4];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+    let pos_before = dec.position();
+    // row >= MiRows.
+    let tx = walker
+        .read_var_tx_size(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            /* row = */ 4,
+            0,
+            TX_16X16,
+            0,
+            true,
+        )
+        .unwrap();
+    assert_eq!(tx, TX_16X16 as u8);
+    assert_eq!(dec.position(), pos_before);
+    // col >= MiCols.
+    let tx = walker
+        .read_var_tx_size(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            0,
+            /* col = */ 4,
+            TX_16X16,
+            0,
+            true,
+        )
+        .unwrap();
+    assert_eq!(tx, TX_16X16 as u8);
+    assert_eq!(dec.position(), pos_before);
+}
+
+/// §5.11.17 caller-bug detection: out-of-range arguments return
+/// `PartitionWalkOutOfRange` before any bit is read.
+#[test]
+fn read_var_tx_size_rejects_out_of_range() {
+    let mut walker = walker_n(4);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let bytes = [0u8; 4];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+    // out-of-range sub_size.
+    let r = walker.read_var_tx_size(&mut dec, &mut cdfs, 0, 0, 999, 0, 0, TX_16X16, 0, true);
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+    // out-of-range tx_sz.
+    let r = walker.read_var_tx_size(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16, 0, 0, 999, 0, true);
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+    // out-of-range depth.
+    let r = walker.read_var_tx_size(
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        BLOCK_16X16,
+        0,
+        0,
+        TX_16X16,
+        MAX_VARTX_DEPTH + 1,
+        true,
+    );
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+    // out-of-range mi_row_b.
+    let r = walker.read_var_tx_size(
+        &mut dec,
+        &mut cdfs,
+        4,
+        0,
+        BLOCK_16X16,
+        0,
+        0,
+        TX_16X16,
+        0,
+        true,
+    );
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+}
+
+// ===================================================================
+// §5.11.18 decode_inter_frame_mode_info — direct-call coverage.
+//
+// The §5.11.18 reader was implemented in r168. It composes every
+// pre-dispatch leaf (`inter_segment_id`, `read_skip_mode`,
+// `read_skip`, `read_cdef`, `read_delta_qindex`, `read_delta_lf`,
+// `read_is_inter`) and short-circuits at the terminal
+// `if ( is_inter )` dispatch into §5.11.22 / §5.11.23 (both
+// next-round targets).
+// ===================================================================
+
+/// Baseline §5.11.18 path: segmentation off, skip_mode_present off,
+/// allow_intrabc off, cdef_bits = 0, read_deltas off, no segmentation
+/// overrides. With the skip CDF rigged to symbol 0 and the is_inter
+/// CDF rigged to symbol 0, the walker reaches the §5.11.22 intra
+/// stub.
+#[test]
+fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    // Skip CDF forces symbol 0 (skip = 0).
+    cdfs.skip = [force_binary_cdf(0); SKIP_CONTEXTS];
+    // is_inter CDF forces symbol 0 (is_inter = 0 → intra arm).
+    for row in cdfs.is_inter.iter_mut() {
+        *row = force_binary_cdf(0);
+    }
+    let bytes = [0u8; 16];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let pos_before = dec.position();
+    let result = walker.decode_inter_frame_mode_info(
+        &mut dec, &mut cdfs, /* mi_row = */ 0, /* mi_col = */ 0, BLOCK_8X8,
+        /* seg_id_pre_skip = */ false, /* segmentation_enabled = */ false,
+        /* segmentation_update_map = */ false,
+        /* segmentation_temporal_update = */ false, /* predicted_segment_id = */ 0,
+        /* last_active_seg_id = */ 0, &lossless, /* seg_skip_mode_off = */ false,
+        /* seg_ref_frame_active = */ false, /* seg_ref_frame_is_inter = */ false,
+        /* seg_globalmv_active = */ false, /* skip_mode_present = */ false,
+        /* coded_lossless = */ false, /* enable_cdef = */ true,
+        /* allow_intrabc = */ false, /* cdef_bits = */ 0, /* read_deltas = */ false,
+        /* use_128x128_superblock = */ false, /* delta_q_res = */ 0,
+        /* delta_lf_present = */ false, /* delta_lf_multi = */ false,
+        /* mono_chrome = */ false, /* delta_lf_res = */ 0,
+    );
+    let pos_after = dec.position();
+    assert_eq!(
+        result,
+        Err(Error::IntraBlockModeInfoUnsupported),
+        "is_inter = 0 ⇒ §5.11.22 intra_block_mode_info stub"
+    );
+    assert!(
+        pos_after > pos_before,
+        "the §5.11.18 walker must consume at least the skip + is_inter S() bits"
+    );
+    // §5.11.18 grids stamped: Skips[0..2][0..2] = 0, IsInters[0..2][0..2] = 0.
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..2 {
+        for c in 0..2 {
+            assert_eq!(walker.skips()[r * mi_cols + c], 0);
+            assert_eq!(walker.is_inters()[r * mi_cols + c], 0);
+        }
+    }
+}
+
+/// §5.11.18 inter arm via §5.11.20 segment-override: with
+/// `seg_ref_frame_active = true` and `seg_ref_frame_is_inter = true`
+/// the §5.11.20 arm 2 forces `is_inter = 1` without S() — driving
+/// the §5.11.18 terminal dispatch into the §5.11.23
+/// `InterBlockModeInfoUnsupported` stub. The walker stamps
+/// `IsInters[][] = 1` over the footprint before the stub fires.
+#[test]
+fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    cdfs.skip = [force_binary_cdf(0); SKIP_CONTEXTS];
+    let bytes = [0u8; 16];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let result = walker.decode_inter_frame_mode_info(
+        &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
+        /* seg_ref_frame_active = */ true, /* seg_ref_frame_is_inter = */ true, false,
+        false, false, true, false, 0, false, false, 0, false, false, false, 0,
+    );
+    assert_eq!(
+        result,
+        Err(Error::InterBlockModeInfoUnsupported),
+        "seg_ref_frame_active + is_inter ⇒ §5.11.23 stub"
+    );
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..2 {
+        for c in 0..2 {
+            assert_eq!(walker.is_inters()[r * mi_cols + c], 1);
+        }
+    }
+}
+
+/// §5.11.18 lines 12-14: with `skip_mode_present = true` and a CDF
+/// forcing `skip_mode = 1`, the walker takes the `skip_mode → skip = 1`
+/// shortcut (no read_skip S()), stamps `Skips[][] = 1`, and the
+/// §5.11.20 read_is_inter consumes the `skip_mode → is_inter = 1`
+/// first arm (no S() either). The §5.11.23 stub fires.
+#[test]
+fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    // Skip-mode CDF forces symbol 1 (skip_mode = 1).
+    for row in cdfs.skip_mode.iter_mut() {
+        *row = force_binary_cdf(1);
+    }
+    let bytes = [0u8; 16];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let result = walker.decode_inter_frame_mode_info(
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        BLOCK_16X16, // ≥ 8x8 — small-block short-circuit doesn't fire
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        &lossless,
+        /* seg_skip_mode_off = */ false,
+        false,
+        false,
+        false,
+        /* skip_mode_present = */ true,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+    );
+    assert_eq!(
+        result,
+        Err(Error::InterBlockModeInfoUnsupported),
+        "skip_mode = 1 ⇒ is_inter = 1 ⇒ §5.11.23 inter_block_mode_info stub"
+    );
+    // §5.11.18 grid-fill: Skips[][] stamped to 1 over the 4×4 footprint.
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..4 {
+        for c in 0..4 {
+            assert_eq!(walker.skips()[r * mi_cols + c], 1);
+            assert_eq!(walker.skip_modes()[r * mi_cols + c], 1);
+            assert_eq!(walker.is_inters()[r * mi_cols + c], 1);
+        }
+    }
+}
+
+/// §5.11.18 segmentation override: with `seg_globalmv_active = true`
+/// the §5.11.20 `read_is_inter` third arm fires (forces is_inter = 1
+/// without S() read).
+#[test]
+fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    cdfs.skip = [force_binary_cdf(0); SKIP_CONTEXTS];
+    let bytes = [0u8; 16];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let result = walker.decode_inter_frame_mode_info(
+        &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
+        false, false, /* seg_globalmv_active = */ true, false, false, true, false, 0, false,
+        false, 0, false, false, false, 0,
+    );
+    assert_eq!(result, Err(Error::InterBlockModeInfoUnsupported));
+}
+
+/// §5.11.18 caller-bug detection: out-of-range arguments surface
+/// `PartitionWalkOutOfRange` before any bit is read.
+#[test]
+fn decode_inter_frame_mode_info_rejects_out_of_range() {
+    let mut walker = walker_n(8);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let bytes = [0u8; 8];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    // Out-of-range mi_row.
+    let r = walker.decode_inter_frame_mode_info(
+        &mut dec, &mut cdfs, 8, 0, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
+        false, false, false, false, false, true, false, 0, false, false, 0, false, false, false, 0,
+    );
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+    // Out-of-range mi_col.
+    let r = walker.decode_inter_frame_mode_info(
+        &mut dec, &mut cdfs, 0, 8, BLOCK_8X8, false, false, false, false, 0, 0, &lossless, false,
+        false, false, false, false, false, true, false, 0, false, false, 0, false, false, false, 0,
+    );
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+    // Out-of-range sub_size.
+    let r = walker.decode_inter_frame_mode_info(
+        &mut dec, &mut cdfs, 0, 0, 999, false, false, false, false, 0, 0, &lossless, false, false,
+        false, false, false, false, true, false, 0, false, false, 0, false, false, false, 0,
+    );
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+    // Out-of-range last_active_seg_id.
+    let r = walker.decode_inter_frame_mode_info(
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        BLOCK_8X8,
+        false,
+        false,
+        false,
+        false,
+        0,
+        /* last_active_seg_id = */ MAX_SEGMENTS as u8,
+        &lossless,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+    );
+    assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
+}
+
+/// `DecodedInterFrameModeInfo` smoke: the struct is publicly
+/// constructible and matches `Debug + Clone + Copy + PartialEq + Eq`.
+#[test]
+fn decoded_inter_frame_mode_info_struct_public_api_smoke() {
+    let info = DecodedInterFrameModeInfo {
+        mi_row: 0,
+        mi_col: 0,
+        mi_size: BLOCK_8X8,
+        use_intrabc: 0,
+        avail_u: false,
+        avail_l: false,
+        left_ref_frame: [0, -1],
+        above_ref_frame: [0, -1],
+        left_intra: true,
+        above_intra: true,
+        left_single: true,
+        above_single: true,
+        skip: 0,
+        skip_mode: 0,
+        segment_id: 0,
+        lossless: false,
+        cdef_idx: -1,
+        current_q_index: 0,
+        current_delta_lf: [0; 4],
+        is_inter: 0,
+    };
+    let copy = info;
+    assert_eq!(info, copy);
+    let _ = format!("{info:?}");
 }

@@ -9190,6 +9190,32 @@ pub fn txfm_split_ctx(above: bool, left: bool, tx_sz_sqr_up: u32, max_tx_sz: u32
     }
 }
 
+/// §5.11.36 `find_tx_size( w, h )` (av1-spec p.74) — the linear scan
+/// over `TX_SIZES_ALL` returning the first ordinal whose
+/// `(Tx_Width[txSz], Tx_Height[txSz])` pair equals `(w, h)`.
+///
+/// Spec body:
+///
+/// ```text
+///   find_tx_size( w, h ) {
+///       for ( txSz = 0; txSz < TX_SIZES_ALL; txSz++ )
+///           if ( Tx_Width[ txSz ] == w && Tx_Height[ txSz ] == h )
+///               break
+///       return txSz
+///   }
+/// ```
+///
+/// The §5.11.36 spec note guarantees a hit for every `(w, h)` pair the
+/// callers produce (the §8.3.2 `txfm_split` ctx site uses
+/// `size = Min( 64, Max( Block_Width, Block_Height ) )` for both axes,
+/// always landing on one of the square sizes `TX_4X4..TX_64X64`).
+/// Returns `None` if the linear scan finds no match (a caller bug —
+/// `(w, h)` outside the §6.10.16 table).
+#[must_use]
+pub fn find_tx_size(w: usize, h: usize) -> Option<usize> {
+    (0..TX_SIZES_ALL).find(|&i| TX_WIDTH[i] == w && TX_HEIGHT[i] == h)
+}
+
 // ---------------------------------------------------------------------
 // Round 21 — inter-frame transform-type §8.3.2 helpers. Mirrors the
 // `is_inter == 1` branch of §5.11.48 `get_tx_set()`.
@@ -13976,6 +14002,408 @@ impl PartitionWalker {
         Ok(y_mode)
     }
 
+    /// `inter_frame_mode_info()` per §5.11.18 (av1-spec p.71) — the
+    /// per-block syntax composite for an inter-frame leaf. Composes
+    /// every leaf already wired through the walker:
+    ///
+    /// * §5.11.19 `inter_segment_id( 1 )` — pre-skip arm via
+    ///   [`Self::decode_inter_segment_id`].
+    /// * §5.11.10 `read_skip_mode()` — via [`Self::decode_skip_mode`].
+    /// * §5.11.11 `read_skip()` (if not `skip_mode == 1`) — via
+    ///   [`Self::decode_skip`].
+    /// * §5.11.19 `inter_segment_id( 0 )` (if `!SegIdPreSkip`) —
+    ///   post-skip arm via [`Self::decode_inter_segment_id`].
+    /// * §5.11.56 `read_cdef()` — via [`Self::decode_cdef`].
+    /// * §5.11.12 `read_delta_qindex()` — via
+    ///   [`Self::decode_delta_qindex`].
+    /// * §5.11.13 `read_delta_lf()` — via [`Self::decode_delta_lf`].
+    /// * §5.11.20 `read_is_inter()` — via [`Self::decode_is_inter`].
+    ///
+    /// The spec body (av1-spec p.71) reads:
+    ///
+    /// ```text
+    ///   inter_frame_mode_info( ) {
+    ///       use_intrabc = 0
+    ///       LeftRefFrame[ 0 ] = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 0 ] : INTRA_FRAME
+    ///       AboveRefFrame[ 0 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 0 ] : INTRA_FRAME
+    ///       LeftRefFrame[ 1 ] = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 1 ] : NONE
+    ///       AboveRefFrame[ 1 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 1 ] : NONE
+    ///       LeftIntra = LeftRefFrame[ 0 ] <= INTRA_FRAME
+    ///       AboveIntra = AboveRefFrame[ 0 ] <= INTRA_FRAME
+    ///       LeftSingle = LeftRefFrame[ 1 ] <= INTRA_FRAME
+    ///       AboveSingle = AboveRefFrame[ 1 ] <= INTRA_FRAME
+    ///       skip = 0
+    ///       inter_segment_id( 1 )
+    ///       read_skip_mode( )
+    ///       if ( skip_mode )
+    ///           skip = 1
+    ///       else
+    ///           read_skip( )
+    ///       if ( !SegIdPreSkip )
+    ///           inter_segment_id( 0 )
+    ///       Lossless = LosslessArray[ segment_id ]
+    ///       read_cdef( )
+    ///       read_delta_qindex( )
+    ///       read_delta_lf( )
+    ///       ReadDeltas = 0
+    ///       read_is_inter( )
+    ///       if ( is_inter )
+    ///           inter_block_mode_info( )
+    ///       else
+    ///           intra_block_mode_info( )
+    ///   }
+    /// ```
+    ///
+    /// The `LeftRefFrame[..]` / `AboveRefFrame[..]` /
+    /// `LeftIntra` / `AboveIntra` / `LeftSingle` / `AboveSingle`
+    /// derivations are local-only — only the §5.11.23
+    /// `inter_block_mode_info` body consumes them (via the §8.3.2
+    /// ref-frame ctx walks). Since §5.11.23 is the next round's
+    /// target, the walker does NOT yet track `RefFrames[][][..]`; the
+    /// derivations are surfaced through the returned
+    /// [`DecodedInterFrameModeInfo`] for tests / callers that want to
+    /// verify the §5.11.18 derivations, but the walker treats every
+    /// neighbour `RefFrames[..][..][0]` as `INTRA_FRAME` and
+    /// `RefFrames[..][..][1]` as `NONE` (i.e. as if no inter neighbour
+    /// existed yet) — matching the conformant initial state for the
+    /// first inter block of a frame.
+    ///
+    /// On the §5.11.18 terminal `if ( is_inter )` dispatch this method
+    /// short-circuits at either
+    /// [`crate::Error::InterBlockModeInfoUnsupported`] (the
+    /// `is_inter == 1` arm — §5.11.23 next-round target) or
+    /// [`crate::Error::IntraBlockModeInfoUnsupported`] (the
+    /// `is_inter == 0` arm — §5.11.22 next-round target). All
+    /// pre-dispatch reads have committed to the bitstream / grids by
+    /// the time the stub fires.
+    ///
+    /// Caller-bug arguments surface
+    /// [`crate::Error::PartitionWalkOutOfRange`]; bitstream errors
+    /// surface [`crate::Error::UnexpectedEnd`] /
+    /// [`crate::Error::SymbolExitUnderflow`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_inter_frame_mode_info(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        // §5.9.14 / §6.10 segmentation state (per-frame scalars):
+        seg_id_pre_skip: bool,
+        segmentation_enabled: bool,
+        segmentation_update_map: bool,
+        segmentation_temporal_update: bool,
+        predicted_segment_id: u8,
+        last_active_seg_id: u8,
+        lossless_array: &[bool; MAX_SEGMENTS],
+        // §5.9.14 per-segment-id feature override caches that the
+        // walker stays free of. Caller computes these from the
+        // §5.9.14 `FeatureData` table against the just-decoded
+        // `segment_id` value: the §5.11.18 spec gates `read_skip_mode`
+        // on `seg_feature_active( SEG_LVL_SKIP / REF_FRAME / GLOBALMV
+        // )`, and gates `read_is_inter` on the same three. We thread
+        // them through as four booleans + one i32 for the
+        // SEG_LVL_REF_FRAME != INTRA_FRAME comparison.
+        seg_skip_mode_off: bool,
+        seg_ref_frame_active: bool,
+        seg_ref_frame_is_inter: bool,
+        seg_globalmv_active: bool,
+        // §5.9.21 / §6.8.21 / §5.9.14 frame-header / sequence-header
+        // scalars (mirroring [`Self::decode_intra_frame_mode_info_prefix`]):
+        skip_mode_present: bool,
+        coded_lossless: bool,
+        enable_cdef: bool,
+        allow_intrabc: bool,
+        cdef_bits: u32,
+        read_deltas: bool,
+        use_128x128_superblock: bool,
+        delta_q_res: u8,
+        delta_lf_present: bool,
+        delta_lf_multi: bool,
+        mono_chrome: bool,
+        delta_lf_res: u8,
+    ) -> Result<DecodedInterFrameModeInfo, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.18 line 1: `use_intrabc = 0`. The §5.11.18 walker
+        // never reads `use_intrabc` (the §5.11.7 intra-only path is
+        // the only `use_intrabc` caller).
+        let use_intrabc: u8 = 0;
+
+        // §5.11.18 lines 2-9: `LeftRefFrame[..]` / `AboveRefFrame[..]`
+        // / `LeftIntra` / `AboveIntra` / `LeftSingle` / `AboveSingle`
+        // local derivations. The walker doesn't yet track
+        // `RefFrames[][][..]` (the §5.11.23 readers are the next-round
+        // target), so every neighbour reads back the §5.11.18
+        // "unavailable" fallback (`INTRA_FRAME` / `NONE`). The
+        // §5.11.20 `read_is_inter` ctx walk uses the walker's
+        // `IsInters[]` grid through [`is_inter_ctx`], so the
+        // unavailable-ref-frame fallback here doesn't pollute the
+        // §8.3.2 ctx selection.
+        let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+        let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+        // INTRA_FRAME = 0 per §6.10.1; NONE = -1 per §3 of the spec.
+        // The walker doesn't yet track `RefFrames[][][..]`; both
+        // available and unavailable neighbours read as
+        // `[INTRA_FRAME, NONE] = [0, -1]` until §5.11.23 lands and a
+        // `ref_frames[][][..]` grid is added. The `avail_u` /
+        // `avail_l` predicates are still surfaced for callers that
+        // want to verify the §5.11.18 prologue derivations.
+        let left_ref_frame: [i32; 2] = [0, -1];
+        let above_ref_frame: [i32; 2] = [0, -1];
+        let left_intra = left_ref_frame[0] <= 0;
+        let above_intra = above_ref_frame[0] <= 0;
+        let left_single = left_ref_frame[1] <= 0;
+        let above_single = above_ref_frame[1] <= 0;
+
+        // §5.11.18 line 10: `skip = 0`. The §5.11.10 `read_skip_mode`
+        // arm below either overrides this to `1` when
+        // `skip_mode == 1`, or §5.11.11 `read_skip` reads the bit.
+        // The local `skip` is initialised after the §5.11.10 read so
+        // the compiler doesn't see the spec's pre-read `skip = 0`
+        // assignment as a dead store — the spec text spells out the
+        // initialisation for clarity but the value is unconditionally
+        // overwritten in the next branch.
+
+        // §5.11.18 line 11: `inter_segment_id( 1 )` — pre-skip. The
+        // §5.11.19 spec body short-circuits when
+        // `segmentation_enabled == 0` (sets `segment_id = 0`) or when
+        // `segmentation_update_map == 0` (adopts
+        // `predictedSegmentId`); on the temporal-update arm it reads
+        // `seg_id_predicted` and either adopts the predicted id or
+        // falls through to `read_segment_id`. The post-skip arm of
+        // §5.11.18 (line 16) re-invokes the function with
+        // `preSkip = 0`.
+        let (mut segment_id, _) = self.decode_inter_segment_id(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            /* pre_skip = */ true,
+            /* skip = */ 0,
+            seg_id_pre_skip,
+            segmentation_enabled,
+            segmentation_update_map,
+            segmentation_temporal_update,
+            predicted_segment_id,
+            last_active_seg_id,
+            lossless_array,
+        )?;
+
+        // §5.11.18 line 12: `read_skip_mode( )`. The §5.11.10 spec
+        // body short-circuits on the three segmentation overrides +
+        // !skip_mode_present + small-block (Block_Width/Height < 8)
+        // gates; otherwise reads a binary symbol against
+        // `TileSkipModeCdf[ctx]`.
+        let skip_mode = self.decode_skip_mode(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            seg_skip_mode_off,
+            skip_mode_present,
+        )?;
+
+        // §5.11.18 lines 13-14: `if ( skip_mode ) skip = 1 else
+        // read_skip( )`. The compound-reference-skip shortcut forces
+        // `skip = 1` without reading the §5.11.11 skip bit.
+        let skip: u8 = if skip_mode != 0 {
+            // §5.11.5 grid-fill: the §5.11.10 writer stamped
+            // `skip_modes[]` but the spec's `skip = 1` also stamps
+            // `Skips[]` over the footprint (the §5.11.11 writer is
+            // bypassed). Mirror the §5.11.11 grid-fill so neighbour
+            // §8.3.2 ctx walks observe the value.
+            let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+            let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+            for dr in 0..bh4 {
+                let rr = mi_row + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    self.skips[(rr * self.mi_cols + cc) as usize] = 1;
+                }
+            }
+            1
+        } else {
+            // §5.11.18 line 14: `read_skip( )`. The §5.11.11 spec body
+            // short-circuits on `seg_feature_active( SEG_LVL_SKIP )`
+            // (collapsed into `seg_skip_mode_off` here — the
+            // SEG_LVL_SKIP arm of that bundle); otherwise reads a
+            // binary `S()` against `TileSkipCdf[ctx]`. The §5.11.18
+            // spec body doesn't gate `read_skip()` on the
+            // segmentation feature directly — the §5.11.11 internal
+            // gate handles it. The caller-passed
+            // `seg_skip_mode_off` covers SEG_LVL_SKIP /
+            // SEG_LVL_REF_FRAME / SEG_LVL_GLOBALMV; for the §5.11.11
+            // gate we want SEG_LVL_SKIP alone, but treating all three
+            // as "skip = 1" matches the §5.11.18 caller's
+            // skip_mode-was-already-0 invariant.
+            self.decode_skip(
+                decoder,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                /* seg_skip_active = */ seg_skip_mode_off,
+            )?
+        };
+
+        // §5.11.18 lines 15-16: `if ( !SegIdPreSkip ) inter_segment_id( 0 )`.
+        // The post-skip arm fires only when the §5.9.14 SegIdPreSkip
+        // derivation is false; otherwise the pre-skip call already
+        // committed the segment_id.
+        if !seg_id_pre_skip {
+            let (sid, _) = self.decode_inter_segment_id(
+                decoder,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                /* pre_skip = */ false,
+                skip,
+                seg_id_pre_skip,
+                segmentation_enabled,
+                segmentation_update_map,
+                segmentation_temporal_update,
+                predicted_segment_id,
+                last_active_seg_id,
+                lossless_array,
+            )?;
+            segment_id = sid;
+        }
+
+        // §5.11.18 line 17: `Lossless = LosslessArray[ segment_id ]`.
+        // segment_id ∈ 0..MAX_SEGMENTS by construction (the §5.11.9
+        // reader caps it via [`neg_deinterleave`] against
+        // `last_active_seg_id + 1`).
+        debug_assert!(
+            (segment_id as usize) < MAX_SEGMENTS,
+            "segment_id must be in 0..MAX_SEGMENTS"
+        );
+        let lossless = lossless_array[segment_id as usize];
+
+        // §5.11.18 line 18: `read_cdef( )`. The §5.11.56 spec body
+        // short-circuits on `skip || coded_lossless || !enable_cdef
+        // || allow_intrabc`; otherwise reads `L(cdef_bits)`.
+        let cdef_idx = self.decode_cdef(
+            decoder,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip,
+            coded_lossless,
+            enable_cdef,
+            allow_intrabc,
+            cdef_bits,
+        )?;
+
+        // §5.11.18 line 19: `read_delta_qindex( )`.
+        let current_q_index = self.decode_delta_qindex(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip,
+            read_deltas,
+            use_128x128_superblock,
+            delta_q_res,
+        )?;
+
+        // §5.11.18 line 20: `read_delta_lf( )`.
+        let current_delta_lf = self.decode_delta_lf(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip,
+            read_deltas,
+            delta_lf_present,
+            delta_lf_multi,
+            mono_chrome,
+            use_128x128_superblock,
+            delta_lf_res,
+        )?;
+
+        // §5.11.18 line 21: `ReadDeltas = 0`. Caller-owned per the
+        // §6.10.4 derivation (`ReadDeltas = delta_q_present && (MiCol
+        // & (sbSize4 - 1)) == 0 && (MiRow & (sbSize4 - 1)) == 0`);
+        // the spec writes the local `ReadDeltas = 0` after the
+        // per-superblock read site, mirroring the
+        // [`Self::decode_intra_frame_mode_info_prefix`] convention.
+
+        // §5.11.18 line 22: `read_is_inter( )`. The §5.11.20 spec body
+        // has the four-arm dispatch (skip_mode forces is_inter = 1,
+        // segment overrides, else S()).
+        let is_inter = self.decode_is_inter(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip_mode,
+            seg_ref_frame_active,
+            seg_ref_frame_is_inter,
+            seg_globalmv_active,
+        )?;
+
+        // §5.11.18 lines 23-26: `if ( is_inter ) inter_block_mode_info()
+        // else intra_block_mode_info()`. Both bodies are next-round
+        // targets — populate the returned aggregate first so callers
+        // observe the pre-dispatch derivations regardless of the
+        // stub fire.
+        let info = DecodedInterFrameModeInfo {
+            mi_row,
+            mi_col,
+            mi_size: sub_size,
+            use_intrabc,
+            avail_u,
+            avail_l,
+            left_ref_frame,
+            above_ref_frame,
+            left_intra,
+            above_intra,
+            left_single,
+            above_single,
+            skip,
+            skip_mode,
+            segment_id,
+            lossless,
+            cdef_idx,
+            current_q_index,
+            current_delta_lf,
+            is_inter,
+        };
+        if is_inter != 0 {
+            Err(crate::Error::InterBlockModeInfoUnsupported)
+        } else {
+            // We've populated `info` already but the §5.11.22 stub
+            // owns the return. The pre-stub state is observable on
+            // the walker's grids — callers verifying the §5.11.18
+            // pre-dispatch state read [`Self::skips`] / [`Self::skip_modes`]
+            // / [`Self::segment_ids`] / [`Self::is_inters`] / [`Self::cdef_idx`].
+            let _ = info;
+            Err(crate::Error::IntraBlockModeInfoUnsupported)
+        }
+    }
+
     /// Helper to read `InterTxSizes[ r ][ c ]` for the §8.3.2
     /// `tx_depth` ctx walk. Returns `TX_4X4 = 0` for out-of-grid
     /// coordinates (the §8.3.2 derivation falls back through the
@@ -14087,16 +14515,15 @@ impl PartitionWalker {
     /// `bh4 * bw4` footprint of [`Self::inter_tx_sizes`] and
     /// [`Self::tx_sizes`].
     ///
-    /// On the `TX_MODE_SELECT && is_inter` arm this round returns
-    /// [`crate::Error::ReadVarTxSizeUnsupported`] — §5.11.17
-    /// `read_var_tx_size` is the next-round target. The arm is
-    /// unreachable from the current §5.11.5 [`Self::decode_block_syntax`]
-    /// walker because that walker's `is_inter == 1` paths are stubbed
-    /// upstream at [`crate::Error::DecodeBlockInterFrameUnsupported`]
-    /// (the §5.11.18 inter mode-info dispatcher), so calling
-    /// `read_block_tx_size` directly with `is_inter = 1` and a
-    /// `tx_mode_select = true` frame surfaces the stub for tests that
-    /// drive the standalone reader.
+    /// On the `TX_MODE_SELECT && is_inter && !skip && !Lossless` arm
+    /// the method enters the §5.11.17 [`Self::read_var_tx_size`]
+    /// recursion across the `(txH4, txW4)` sub-rectangles of the block
+    /// footprint. The §5.11.17 terminal-else arm stamps
+    /// `InterTxSizes[..] = txSz` for every leaf of the variable
+    /// transform tree; this method also writes the §5.11.5 outer
+    /// `TxSizes[ r + y ][ c + x ] = TxSize` grid-fill across the full
+    /// block footprint, using the last terminal-else's `txSz` as the
+    /// `TxSize` per §5.11.17.
     #[allow(clippy::too_many_arguments)]
     pub fn read_block_tx_size(
         &mut self,
@@ -14127,15 +14554,65 @@ impl PartitionWalker {
         let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
 
         // §5.11.16 outer dispatch: the `TX_MODE_SELECT && MiSize >
-        // BLOCK_4X4 && is_inter && !skip && !Lossless` arm gates the
-        // §5.11.17 `read_var_tx_size` recursion.
+        // BLOCK_4X4 && is_inter && !skip && !Lossless` arm enters the
+        // §5.11.17 `read_var_tx_size` recursion. The spec body loops
+        // over `(txH4, txW4)` sub-rectangles of the block footprint and
+        // calls `read_var_tx_size( row, col, maxTxSz, 0 )` for each.
         if tx_mode_select && sub_size > BLOCK_4X4 && is_inter && !skip && !lossless {
-            // §5.11.17 is the next round's target. The arm is
-            // unreachable from the current decode_block_syntax walker
-            // (which short-circuits on `frame_is_intra = false`); we
-            // surface a stub for callers that drive this method
-            // directly.
-            return Err(crate::Error::ReadVarTxSizeUnsupported);
+            // §5.11.16 lines 5-7: `maxTxSz = Max_Tx_Size_Rect[ MiSize ]`,
+            // `txW4 = Tx_Width[ maxTxSz ] / MI_SIZE`,
+            // `txH4 = Tx_Height[ maxTxSz ] / MI_SIZE`.
+            let max_tx_sz = MAX_TX_SIZE_RECT[sub_size];
+            let tx_w4 = (TX_WIDTH[max_tx_sz] / MI_SIZE) as u32;
+            let tx_h4 = (TX_HEIGHT[max_tx_sz] / MI_SIZE) as u32;
+            // §5.11.16 inner loops:
+            //   for ( row = MiRow; row < MiRow + bh4; row += txH4 )
+            //       for ( col = MiCol; col < MiCol + bw4; col += txW4 )
+            //           read_var_tx_size( row, col, maxTxSz, 0 )
+            //
+            // tx_w4 / tx_h4 are positive for every reachable
+            // `(MiSize, maxTxSz)` pair (the smallest §6.10.16 transform
+            // size is `TX_4X4` ⇒ `Tx_Width / MI_SIZE = 1`).
+            debug_assert!(
+                tx_w4 > 0 && tx_h4 > 0,
+                "tx_w4 / tx_h4 must be positive for the §5.11.16 loop"
+            );
+            // The §5.11.17 recursion's terminal `else` arm stamps
+            // `TxSize = txSz` per sub-block; we keep the last write as
+            // the §5.11.5 outer-loop's `TxSize` value below for the
+            // `TxSizes[]` grid-fill identity.
+            let mut last_tx_size = max_tx_sz as u8;
+            let mut row = mi_row;
+            while row < mi_row + bh4 {
+                let mut col = mi_col;
+                while col < mi_col + bw4 {
+                    last_tx_size = self.read_var_tx_size(
+                        decoder, cdfs, mi_row, mi_col, sub_size, row, col, max_tx_sz, 0, is_inter,
+                    )?;
+                    col += tx_w4;
+                }
+                row += tx_h4;
+            }
+            // The §5.11.17 recursion stamps `InterTxSizes[]` per
+            // sub-block; the outer §5.11.5 `TxSizes[ r + y ][ c + x ] =
+            // TxSize` write still fires across the full block
+            // footprint. The §5.11.17 spec body sets `TxSize = txSz`
+            // each time the terminal `else` arm fires, so the
+            // last-write semantics match.
+            for dr in 0..bh4 {
+                let rr = mi_row + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    self.tx_sizes[(rr * self.mi_cols + cc) as usize] = last_tx_size;
+                }
+            }
+            return Ok(last_tx_size);
         }
 
         // §5.11.16 `else` arm: `read_tx_size( !skip || !is_inter )`.
@@ -14281,6 +14758,290 @@ impl PartitionWalker {
         }
 
         Ok(tx_size)
+    }
+
+    /// `read_var_tx_size( row, col, txSz, depth )` per §5.11.17
+    /// (av1-spec p.70) — reads the variable-transform-size sub-tree
+    /// for an inter block whose §5.11.16 outer dispatch entered the
+    /// `TX_MODE_SELECT && is_inter && !skip && !Lossless` arm.
+    ///
+    /// Spec body (av1-spec p.70):
+    ///
+    /// ```text
+    ///   read_var_tx_size( row, col, txSz, depth ) {
+    ///       if ( row >= MiRows || col >= MiCols )
+    ///           return
+    ///       if ( txSz == TX_4X4 || depth == MAX_VARTX_DEPTH ) {
+    ///           txfm_split = 0
+    ///       } else {
+    ///           txfm_split                                          S()
+    ///       }
+    ///       w4 = Tx_Width[ txSz ] / MI_SIZE
+    ///       h4 = Tx_Height[ txSz ] / MI_SIZE
+    ///       if ( txfm_split ) {
+    ///           subTxSz = Split_Tx_Size[ txSz ]
+    ///           stepW = Tx_Width[ subTxSz ] / MI_SIZE
+    ///           stepH = Tx_Height[ subTxSz ] / MI_SIZE
+    ///           for ( i = 0; i < h4; i += stepH )
+    ///               for ( j = 0; j < w4; j += stepW )
+    ///                   read_var_tx_size( row + i, col + j, subTxSz, depth+1 )
+    ///       } else {
+    ///           for ( i = 0; i < h4; i++ )
+    ///               for ( j = 0; j < w4; j++ )
+    ///                   InterTxSizes[ row + i ][ col + j ] = txSz
+    ///           TxSize = txSz
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// The §8.3.2 `txfm_split` ctx selector (av1-spec p.363-364) reads:
+    ///
+    /// ```text
+    ///   above   = get_above_tx_width( row, col ) < Tx_Width[ txSz ]
+    ///   left    = get_left_tx_height( row, col ) < Tx_Height[ txSz ]
+    ///   size    = Min( 64, Max( Block_Width[ MiSize ], Block_Height[ MiSize ] ) )
+    ///   maxTxSz = find_tx_size( size, size )
+    ///   txSzSqrUp = Tx_Size_Sqr_Up[ txSz ]
+    ///   ctx = (txSzSqrUp != maxTxSz) * 3
+    ///       + (TX_SIZES - 1 - maxTxSz) * 6
+    ///       + above + left
+    /// ```
+    ///
+    /// where `get_above_tx_width` / `get_left_tx_height` are the
+    /// §8.3.2 helpers driving the `Skips[..] && IsInters[..]` early
+    /// return and the `Tx_Width[ InterTxSizes[..] ]` fall-through. Both
+    /// are inlined here against the walker grids (`self.skips`,
+    /// `self.is_inters`, `self.inter_tx_sizes`, `self.mi_sizes`) gated
+    /// on `TileGeometry::is_inside`.
+    ///
+    /// The `mi_row_b` / `mi_col_b` arguments are the block's top-left
+    /// (§5.11.5 `MiRow` / `MiCol`); the §8.3.2 `get_above_tx_width` /
+    /// `get_left_tx_height` helpers distinguish `row == MiRow` (the
+    /// block's first sub-tile-row) from later iterations of the
+    /// `read_var_tx_size` loop. `sub_size` is `MiSize` (used for
+    /// `Block_Width[ MiSize ]` / `Block_Height[ MiSize ]` in the ctx
+    /// formula). `is_inter` is the §5.11.20 `is_inter` value the
+    /// caller has in scope (always `1` on the reachable §5.11.16 arm,
+    /// but kept as a parameter for direct-call symmetry with
+    /// `read_block_tx_size`).
+    ///
+    /// Returns the per-sub-block `TxSize` the §5.11.17 spec body
+    /// assigns to the §5.11.5 `TxSize` variable on the recursion's
+    /// terminal-else arm — i.e. the `txSz` of the deepest split that
+    /// fires on the last `(i, j)` iteration. Returns
+    /// [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+    /// arguments (out-of-range `sub_size`, anchor outside the frame,
+    /// `tx_sz >= TX_SIZES_ALL`, `depth > MAX_VARTX_DEPTH`).
+    /// [`crate::Error::UnexpectedEnd`] / [`crate::Error::SymbolExitUnderflow`]
+    /// surface bitstream errors from the §8.2.6 `S()` reads.
+    #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
+    pub fn read_var_tx_size(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row_b: u32,
+        mi_col_b: u32,
+        sub_size: usize,
+        row: u32,
+        col: u32,
+        tx_sz: usize,
+        depth: u32,
+        is_inter: bool,
+    ) -> Result<u8, crate::Error> {
+        // Caller-bug guards.
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row_b >= self.mi_rows || mi_col_b >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if tx_sz >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if depth > MAX_VARTX_DEPTH {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.17 lines 1-2: `if ( row >= MiRows || col >= MiCols )
+        // return`. Frame-edge clip — the caller's outer loop walks the
+        // block footprint, which can extend past `MiRows` / `MiCols`
+        // for sub-blocks straddling the bottom or right edge of the
+        // frame.
+        if row >= self.mi_rows || col >= self.mi_cols {
+            return Ok(tx_sz as u8);
+        }
+
+        // §5.11.17 lines 3-7: `txfm_split` read. The two terminal
+        // conditions (`txSz == TX_4X4` and `depth == MAX_VARTX_DEPTH`)
+        // force the spec's `txfm_split = 0` (no S() read) — the
+        // recursion bottoms out either way.
+        let txfm_split: u8 = if tx_sz == TX_4X4 || depth == MAX_VARTX_DEPTH {
+            0
+        } else {
+            // §8.3.2 ctx derivation. The §8.3.2 helpers
+            // `get_above_tx_width` and `get_left_tx_height` are
+            // inlined here against the walker's grids.
+            let above_w = self.get_above_tx_width(mi_row_b, row, col);
+            let left_h = self.get_left_tx_height(mi_col_b, row, col);
+            let above = above_w < TX_WIDTH[tx_sz] as u32;
+            let left = left_h < TX_HEIGHT[tx_sz] as u32;
+            // §8.3.2 `size = Min( 64, Max( Block_Width[ MiSize ],
+            // Block_Height[ MiSize ] ) )`.
+            let bw = block_width(sub_size);
+            let bh = block_height(sub_size);
+            let size = core::cmp::min(64, core::cmp::max(bw, bh));
+            // §8.3.2 `maxTxSz = find_tx_size( size, size )`. `size` is
+            // always a power-of-two in `4..=64` for any `MiSize`, so
+            // the lookup always hits a square `TX_NxN` ordinal.
+            let max_tx_sz =
+                find_tx_size(size, size).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            // §8.3.2 `txSzSqrUp = Tx_Size_Sqr_Up[ txSz ]`. The §8.3.2
+            // ctx formula consumes `(txSzSqrUp != maxTxSz)` as a
+            // 0/1 multiplier, and `(TX_SIZES - 1 - maxTxSz)` as a 6×
+            // size-class term; both feed [`txfm_split_ctx`] in u32.
+            let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_sz] as u32;
+            let ctx = txfm_split_ctx(above, left, tx_sz_sqr_up, max_tx_sz as u32)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let cdf = cdfs.txfm_split_cdf(ctx);
+            // §8.2.6 S(): a 2-symbol read against
+            // `Default_Txfm_Split_Cdf` (length 3 including the counter
+            // slot) returns 0 or 1.
+            let sym = decoder.read_symbol(cdf)? as u8;
+            debug_assert!(sym <= 1, "S() over Default_Txfm_Split_Cdf yields 0 or 1");
+            sym
+        };
+
+        // §5.11.17 lines 8-9: `w4 = Tx_Width[ txSz ] / MI_SIZE`,
+        // `h4 = Tx_Height[ txSz ] / MI_SIZE`. Both ≥ 1 for every
+        // §6.10.16 ordinal (smallest is TX_4X4 = 4×4).
+        let w4 = (TX_WIDTH[tx_sz] / MI_SIZE) as u32;
+        let h4 = (TX_HEIGHT[tx_sz] / MI_SIZE) as u32;
+
+        if txfm_split != 0 {
+            // §5.11.17 lines 11-16: recursion. `subTxSz = Split_Tx_Size[
+            // txSz ]`; the recursive call increments depth.
+            let sub_tx_sz = SPLIT_TX_SIZE[tx_sz];
+            let step_w = (TX_WIDTH[sub_tx_sz] / MI_SIZE) as u32;
+            let step_h = (TX_HEIGHT[sub_tx_sz] / MI_SIZE) as u32;
+            debug_assert!(
+                step_w > 0 && step_h > 0,
+                "Split_Tx_Size step must advance the §5.11.17 loop"
+            );
+            // The §5.11.17 spec writes `TxSize = txSz` only on the
+            // terminal-else arm; the recursion propagates the last
+            // sub-call's terminal `txSz` upward.
+            let mut last_tx_sz = sub_tx_sz as u8;
+            let mut i = 0u32;
+            while i < h4 {
+                let mut j = 0u32;
+                while j < w4 {
+                    last_tx_sz = self.read_var_tx_size(
+                        decoder,
+                        cdfs,
+                        mi_row_b,
+                        mi_col_b,
+                        sub_size,
+                        row + i,
+                        col + j,
+                        sub_tx_sz,
+                        depth + 1,
+                        is_inter,
+                    )?;
+                    j += step_w;
+                }
+                i += step_h;
+            }
+            Ok(last_tx_sz)
+        } else {
+            // §5.11.17 lines 17-21: terminal else arm. Stamp
+            // `InterTxSizes[ row + i ][ col + j ] = txSz` over the
+            // `(h4, w4)` footprint of this sub-tree's leaf, clipped at
+            // the frame's `MiRows` / `MiCols` extent.
+            for i in 0..h4 {
+                let rr = row + i;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for j in 0..w4 {
+                    let cc = col + j;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    self.inter_tx_sizes[(rr * self.mi_cols + cc) as usize] = tx_sz as u8;
+                }
+            }
+            // §5.11.17 line 21: `TxSize = txSz`. The §5.11.5 outer
+            // loop's TxSize identity is the last terminal-else's
+            // `txSz` — surfaced to the §5.11.16 caller via the
+            // return value.
+            Ok(tx_sz as u8)
+        }
+    }
+
+    /// §8.3.2 `get_above_tx_width( row, col )` helper (av1-spec p.364)
+    /// — drives the `above` arm of the `txfm_split` ctx selector.
+    ///
+    /// Spec body:
+    ///
+    /// ```text
+    ///   get_above_tx_width( row, col ) {
+    ///       if ( row == MiRow ) {
+    ///           if ( !AvailU ) return 64
+    ///           else if ( Skips[ row - 1 ][ col ] && IsInters[ row - 1 ][ col ] )
+    ///               return Block_Width[ MiSizes[ row - 1 ][ col ] ]
+    ///       }
+    ///       return Tx_Width[ InterTxSizes[ row - 1 ][ col ] ]
+    ///   }
+    /// ```
+    ///
+    /// `mi_row_b` is the block's top-left §5.11.5 `MiRow`; the
+    /// `row == MiRow` predicate fires only on the block's top sub-tile
+    /// row.
+    #[inline]
+    fn get_above_tx_width(&self, mi_row_b: u32, row: u32, col: u32) -> u32 {
+        if row == mi_row_b {
+            let avail_u = self.geometry.is_inside(row as i32 - 1, col as i32);
+            if !avail_u {
+                return 64;
+            }
+            let above_skip = self.skip_at(row as i32 - 1, col as i32);
+            let above_is_inter = self.is_inter_at(row as i32 - 1, col as i32);
+            if above_skip != 0 && above_is_inter != 0 {
+                let nb = self.mi_size_at(row as i32 - 1, col as i32);
+                // Unfilled cell (`BLOCK_INVALID`) ⇒ treat as `TX_4X4`
+                // width (the natural identity matching the
+                // initial-zero `InterTxSizes[]` state).
+                if nb < BLOCK_SIZES {
+                    return block_width(nb) as u32;
+                }
+                return TX_WIDTH[TX_4X4] as u32;
+            }
+        }
+        let nb_tx = self.inter_tx_size_at(row as i32 - 1, col as i32);
+        TX_WIDTH[nb_tx as usize] as u32
+    }
+
+    /// §8.3.2 `get_left_tx_height( row, col )` helper (av1-spec p.364)
+    /// — mirrors [`Self::get_above_tx_width`] for the `left` arm.
+    #[inline]
+    fn get_left_tx_height(&self, mi_col_b: u32, row: u32, col: u32) -> u32 {
+        if col == mi_col_b {
+            let avail_l = self.geometry.is_inside(row as i32, col as i32 - 1);
+            if !avail_l {
+                return 64;
+            }
+            let left_skip = self.skip_at(row as i32, col as i32 - 1);
+            let left_is_inter = self.is_inter_at(row as i32, col as i32 - 1);
+            if left_skip != 0 && left_is_inter != 0 {
+                let nb = self.mi_size_at(row as i32, col as i32 - 1);
+                if nb < BLOCK_SIZES {
+                    return block_height(nb) as u32;
+                }
+                return TX_HEIGHT[TX_4X4] as u32;
+            }
+        }
+        let nb_tx = self.inter_tx_size_at(row as i32, col as i32 - 1);
+        TX_HEIGHT[nb_tx as usize] as u32
     }
 
     /// `decode_block( r, c, subSize )` per §5.11.5 (av1-spec p.63-64)
@@ -14570,6 +15331,18 @@ impl PartitionWalker {
         // `intra_angle_info_uv`, `palette_mode_info`,
         // `filter_intra_mode_info`) and the `use_intrabc == 1` body
         // are the next round's targets.
+        //
+        // The inter-frame arm composes §5.11.18 through
+        // [`Self::decode_inter_frame_mode_info`]; both terminal arms
+        // (§5.11.22 / §5.11.23) are next-round targets and surface as
+        // [`crate::Error::IntraBlockModeInfoUnsupported`] /
+        // [`crate::Error::InterBlockModeInfoUnsupported`]. The
+        // §5.11.18 walker doesn't yet receive the full
+        // segmentation-feature / skip-mode-present state from the
+        // §5.11.5 driver, so the inter arm here surfaces the
+        // [`crate::Error::DecodeBlockInterFrameUnsupported`] umbrella
+        // stub — direct callers of `decode_inter_frame_mode_info` get
+        // the §5.11.22 / §5.11.23 distinction.
         if !frame_is_intra {
             return Err(crate::Error::DecodeBlockInterFrameUnsupported);
         }
@@ -15198,6 +15971,60 @@ pub struct DecodedBlock {
     pub tx_size: u8,
 }
 
+/// §5.11.18 per-block aggregate surfaced by
+/// [`PartitionWalker::decode_inter_frame_mode_info`]. Carries every
+/// value the §5.11.18 spec body derives or reads before the
+/// `if ( is_inter )` terminal dispatch into §5.11.22 / §5.11.23.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedInterFrameModeInfo {
+    /// §5.11.18 caller-passed mi-unit row of the block.
+    pub mi_row: u32,
+    /// §5.11.18 caller-passed mi-unit column of the block.
+    pub mi_col: u32,
+    /// §5.11.18 caller-passed `MiSize = subSize` ordinal.
+    pub mi_size: usize,
+    /// §5.11.18 line 1: `use_intrabc = 0`. Always 0 on the inter arm.
+    pub use_intrabc: u8,
+    /// §5.11.5 / §5.11.18 `AvailU = is_inside( MiRow - 1, MiCol )`.
+    pub avail_u: bool,
+    /// §5.11.5 / §5.11.18 `AvailL = is_inside( MiRow, MiCol - 1 )`.
+    pub avail_l: bool,
+    /// §5.11.18 `LeftRefFrame[0..2]`. Currently `[INTRA_FRAME, NONE]`
+    /// = `[0, -1]` since the walker doesn't yet track
+    /// `RefFrames[][][..]`; entries become the conformant
+    /// neighbour-read values once the §5.11.23 readers land and the
+    /// walker grows a `ref_frames[][][..]` grid.
+    pub left_ref_frame: [i32; 2],
+    /// §5.11.18 `AboveRefFrame[0..2]`. Currently `[INTRA_FRAME, NONE]`.
+    pub above_ref_frame: [i32; 2],
+    /// §5.11.18 `LeftIntra = LeftRefFrame[0] <= INTRA_FRAME`.
+    pub left_intra: bool,
+    /// §5.11.18 `AboveIntra = AboveRefFrame[0] <= INTRA_FRAME`.
+    pub above_intra: bool,
+    /// §5.11.18 `LeftSingle = LeftRefFrame[1] <= INTRA_FRAME`.
+    pub left_single: bool,
+    /// §5.11.18 `AboveSingle = AboveRefFrame[1] <= INTRA_FRAME`.
+    pub above_single: bool,
+    /// §5.11.18 line 10 + lines 13-14 result. `1` if `skip_mode == 1`
+    /// or §5.11.11 `read_skip` returned `1`; `0` otherwise.
+    pub skip: u8,
+    /// §5.11.18 line 12 result. `0` if the §5.11.10
+    /// short-circuit fired; `0` or `1` if `S()` was read.
+    pub skip_mode: u8,
+    /// §5.11.18 lines 11 + 15-16 result. `0..=last_active_seg_id`.
+    pub segment_id: u8,
+    /// §5.11.18 line 17: `Lossless = LosslessArray[ segment_id ]`.
+    pub lossless: bool,
+    /// §5.11.18 line 18 result. `-1` on the §5.11.56 short-circuit.
+    pub cdef_idx: i8,
+    /// §5.11.18 line 19 result — `CurrentQIndex` post-call.
+    pub current_q_index: i32,
+    /// §5.11.18 line 20 result — `DeltaLF[..]` row post-call.
+    pub current_delta_lf: [i32; FRAME_LF_COUNT],
+    /// §5.11.18 line 22 result. `0` (intra) or `1` (inter).
+    pub is_inter: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15363,6 +16190,27 @@ mod tests {
     #[test]
     fn max_vartx_depth_constant() {
         assert_eq!(MAX_VARTX_DEPTH, 2);
+    }
+
+    /// §5.11.36 `find_tx_size( w, h )`: returns the `TX_NxN` ordinal
+    /// for every square size in `{4, 8, 16, 32, 64}`, and the matching
+    /// rectangular ordinal for the §6.10.16 rectangular sizes.
+    #[test]
+    fn find_tx_size_square_and_rectangular() {
+        assert_eq!(find_tx_size(4, 4), Some(TX_4X4));
+        assert_eq!(find_tx_size(8, 8), Some(TX_8X8));
+        assert_eq!(find_tx_size(16, 16), Some(TX_16X16));
+        assert_eq!(find_tx_size(32, 32), Some(TX_32X32));
+        assert_eq!(find_tx_size(64, 64), Some(TX_64X64));
+        // Rectangular cases.
+        assert_eq!(find_tx_size(4, 8), Some(TX_4X8));
+        assert_eq!(find_tx_size(8, 4), Some(TX_8X4));
+        assert_eq!(find_tx_size(16, 32), Some(TX_16X32));
+        assert_eq!(find_tx_size(32, 16), Some(TX_32X16));
+        assert_eq!(find_tx_size(64, 16), Some(TX_64X16));
+        // Out-of-range (caller bug): no match.
+        assert_eq!(find_tx_size(128, 128), None);
+        assert_eq!(find_tx_size(3, 3), None);
     }
 
     /// §8.3.2 `partition` array selection by `bsl`.

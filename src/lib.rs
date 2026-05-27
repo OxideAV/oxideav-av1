@@ -1333,6 +1333,68 @@
 //!     composite remain the next round's targets. `decode_av1` /
 //!     `encode_av1` continue to return `Error::NotImplemented`.
 //!
+//!   * **Round 168.** §5.11.17 `read_var_tx_size()` (av1-spec p.70) +
+//!     §5.11.18 `inter_frame_mode_info()` (av1-spec p.71) — the two
+//!     missing inter-arm composites that bound the §5.11.5 walker's
+//!     inter side. The §5.11.17 reader is exposed as
+//!     [`cdf::PartitionWalker::read_var_tx_size`] (callable
+//!     standalone) and wired into the §5.11.16 inter-arm so
+//!     [`cdf::PartitionWalker::read_block_tx_size`] no longer
+//!     surfaces [`Error::ReadVarTxSizeUnsupported`] on the
+//!     `TX_MODE_SELECT && is_inter && !skip && !Lossless` arm — the
+//!     recursion stamps `InterTxSizes[]` per terminal-else leaf and
+//!     the outer §5.11.5 footer stamps `TxSizes[]` over the full
+//!     block footprint. The §8.3.2 `txfm_split` ctx selector inlines
+//!     the spec's `get_above_tx_width` / `get_left_tx_height`
+//!     helpers as private [`cdf::PartitionWalker`] methods against
+//!     the walker's `Skips[]` / `IsInters[]` / `MiSizes[]` /
+//!     `InterTxSizes[]` grids, and routes the
+//!     `(above, left, txSzSqrUp, maxTxSz)` derivation through the
+//!     existing [`cdf::txfm_split_ctx`] helper. New free function
+//!     [`cdf::find_tx_size`] (§5.11.36 helper, re-exported) supports
+//!     the `maxTxSz = find_tx_size(size, size)` step of the ctx
+//!     formula.
+//!
+//!     The §5.11.18 reader is exposed as
+//!     [`cdf::PartitionWalker::decode_inter_frame_mode_info`]
+//!     composing every leaf already wired through the walker:
+//!     [`cdf::PartitionWalker::decode_inter_segment_id`] (pre- and
+//!     post-skip arms), [`cdf::PartitionWalker::decode_skip_mode`],
+//!     [`cdf::PartitionWalker::decode_skip`] (gated by
+//!     `skip_mode == 0`), [`cdf::PartitionWalker::decode_cdef`],
+//!     [`cdf::PartitionWalker::decode_delta_qindex`],
+//!     [`cdf::PartitionWalker::decode_delta_lf`], and
+//!     [`cdf::PartitionWalker::decode_is_inter`]. The terminal
+//!     `if (is_inter)` dispatch short-circuits at two new `Error`
+//!     variants: [`Error::InterBlockModeInfoUnsupported`] (§5.11.23
+//!     `inter_block_mode_info()` — the next-round target for the
+//!     MV stack / ref-frame readers) and
+//!     [`Error::IntraBlockModeInfoUnsupported`] (§5.11.22
+//!     `intra_block_mode_info()` — the next-round target for the
+//!     per-block intra angle / UV mode readers). New
+//!     [`cdf::DecodedInterFrameModeInfo`] aggregate carries every
+//!     §5.11.18 derived value.
+//!
+//!     The §5.11.5 [`cdf::PartitionWalker::decode_block_syntax`]
+//!     walker is unchanged on the `frame_is_intra = false` arm — it
+//!     still surfaces [`Error::DecodeBlockInterFrameUnsupported`]
+//!     (the umbrella stub) because the §5.11.18 reader needs
+//!     additional caller state (`segmentation_update_map` /
+//!     `segmentation_temporal_update` / `predicted_segment_id` /
+//!     `seg_*_active` overrides / `skip_mode_present`) the §5.11.5
+//!     driver doesn't yet thread through. Direct callers of
+//!     `decode_inter_frame_mode_info` get the full pre-dispatch walk
+//!     and the §5.11.22 / §5.11.23 distinction.
+//!
+//!     11 new integration tests cover the §5.11.17 base case + depth
+//!     cap + split path + frame-edge clip + caller-bug guards + the
+//!     wired §5.11.16 inter-arm, plus the §5.11.18 intra / inter
+//!     stub dispatch + skip-mode-forces-skip + segment-globalmv
+//!     arm + caller-bug guards + the `DecodedInterFrameModeInfo`
+//!     public-API smoke. Plus 1 new unit test for `find_tx_size`.
+//!     `decode_av1` / `encode_av1` continue to return
+//!     [`Error::NotImplemented`].
+//!
 //!   * **Round 167.** The §5.11.16 `read_block_tx_size()` reader
 //!     (av1-spec p.70) — the per-block transform-size syntax-tree
 //!     read that r166's §5.11.5 walker hit as the first stub on the
@@ -1467,41 +1529,41 @@ pub mod uncompressed_header_tail;
 
 pub use cdf::{
     block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, coeff_cdf_q_ctx,
-    compound_mode_ctx, compute_tx_type, get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx,
-    get_palette_color_context, get_segment_id, get_tx_class, inter_tx_type_set, interintra_ctx,
-    interp_filter_ctx, intra_dir, intra_mode_ctx, intra_tx_type_set, is_inter_ctx,
-    is_tx_type_in_set, mi_height_log2, mi_width_log2, mv_ctx, neg_deinterleave,
-    num_4x4_blocks_high, num_4x4_blocks_wide, palette_color_context_from_neighbors,
-    palette_color_ctx, palette_tokens_args, palette_tokens_plane, palette_uv_mode_ctx,
-    palette_y_mode_ctx, partition_ctx, partition_subsize, ref_count_ctx, segment_id_ctx,
-    size_group, skip_ctx, skip_mode_ctx, split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx,
-    txfm_split_ctx, DecodedBlock, DecodedBlockRecord, IntraFrameModeInfoPrefix,
-    PaletteColorContext, PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext,
-    TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128,
-    BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16,
-    BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128,
-    BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8,
-    BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE,
-    CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
-    COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
-    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
-    COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
-    DCT_ADST, DCT_DCT, DCT_FLIPADST, DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF,
-    DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COEFF_BASE_CDF,
-    DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF, DEFAULT_COMPOUND_IDX_CDF,
-    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF,
-    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
-    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF,
-    DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF,
-    DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF,
-    DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF,
-    DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF, DEFAULT_INTER_INTRA_MODE_CDF,
-    DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF,
-    DEFAULT_INTRABC_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF,
-    DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF,
-    DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
-    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
-    DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
+    compound_mode_ctx, compute_tx_type, find_tx_size, get_br_ctx, get_coeff_base_ctx,
+    get_coeff_base_eob_ctx, get_palette_color_context, get_segment_id, get_tx_class,
+    inter_tx_type_set, interintra_ctx, interp_filter_ctx, intra_dir, intra_mode_ctx,
+    intra_tx_type_set, is_inter_ctx, is_tx_type_in_set, mi_height_log2, mi_width_log2, mv_ctx,
+    neg_deinterleave, num_4x4_blocks_high, num_4x4_blocks_wide,
+    palette_color_context_from_neighbors, palette_color_ctx, palette_tokens_args,
+    palette_tokens_plane, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx,
+    partition_subsize, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,
+    split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, DecodedBlock,
+    DecodedBlockRecord, DecodedInterFrameModeInfo, IntraFrameModeInfoPrefix, PaletteColorContext,
+    PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext, TileGeometry,
+    ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16,
+    BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64,
+    BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32,
+    BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES,
+    BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS,
+    CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET,
+    COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS, COMPOUND_MODES,
+    COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES, COMP_GROUP_IDX_CONTEXTS,
+    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DCT_ADST, DCT_DCT, DCT_FLIPADST,
+    DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF,
+    DEFAULT_COEFF_BASE_CDF, DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF,
+    DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF,
+    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF,
+    DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF,
+    DEFAULT_DELTA_Q_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF,
+    DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF,
+    DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF,
+    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF,
+    DEFAULT_INTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF,
+    DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRABC_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
+    DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF,
+    DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
+    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
+    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
     DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,
@@ -1715,6 +1777,26 @@ pub enum Error {
     /// for the round that lands `compute_prediction()` and exposes
     /// this stub.
     DecodeBlockResidualUnsupported,
+    /// The §5.11.18 [`crate::PartitionWalker::decode_inter_frame_mode_info`]
+    /// walker reached the §5.11.22 `intra_block_mode_info()` call — the
+    /// per-block intra-mode-info composite (`y_mode` / `intra_angle_info_y`
+    /// / `uv_mode` / `read_cfl_alphas` / `intra_angle_info_uv` /
+    /// `palette_mode_info` / `filter_intra_mode_info`). The composite is
+    /// reachable from the §5.11.18 `else` arm of `if ( is_inter )`. The
+    /// remaining sub-elements (per-block intra angle-delta and UV-mode
+    /// readers) are next-round targets; this stub fires after the
+    /// §5.11.18 prologue + `read_is_inter` settle on `is_inter == 0`.
+    IntraBlockModeInfoUnsupported,
+    /// The §5.11.18 [`crate::PartitionWalker::decode_inter_frame_mode_info`]
+    /// walker reached the §5.11.23 `inter_block_mode_info()` call — the
+    /// per-block inter-mode-info composite (`read_ref_frames` /
+    /// `find_mv_stack` / compound-mode / `assign_mv` /
+    /// `read_interintra_mode` / `read_motion_mode` / `read_compound_type`
+    /// / interpolation-filter reads). The composite is reachable from
+    /// the §5.11.18 `if ( is_inter )` arm. The MV-stack / reference-frame
+    /// readers are next-round targets; this stub fires after the
+    /// §5.11.18 prologue + `read_is_inter` settle on `is_inter == 1`.
+    InterBlockModeInfoUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -1797,6 +1879,14 @@ impl core::fmt::Display for Error {
             Self::DecodeBlockResidualUnsupported => write!(
                 f,
                 "oxideav-av1: §5.11.5 decode_block reached §5.11.34 residual() — transform-coefficient read + reconstruction pending next round"
+            ),
+            Self::IntraBlockModeInfoUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.18 inter_frame_mode_info reached §5.11.22 intra_block_mode_info() — per-block intra angle / UV mode reads pending next round"
+            ),
+            Self::InterBlockModeInfoUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.18 inter_frame_mode_info reached §5.11.23 inter_block_mode_info() — MV stack / ref-frame readers pending next round"
             ),
         }
     }

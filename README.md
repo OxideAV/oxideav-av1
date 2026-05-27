@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 167)
+## Status — 2026-05-27 (round 168)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,94 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 168 lands **§5.11.17 `read_var_tx_size()`** + **§5.11.18
+`inter_frame_mode_info()`** (av1-spec p.70-71) — the two missing
+inter-arm composites that bound the §5.11.5 walker's inter side.
+
+The **§5.11.17 reader** is exposed as a new
+`PartitionWalker::read_var_tx_size` method (callable standalone). The
+spec body is a frame-edge clip + a recursive `txfm_split` symbol read
+that bottoms out at `txSz == TX_4X4` or `depth == MAX_VARTX_DEPTH`,
+with each terminal-else stamping `InterTxSizes[ row + i ][ col + j ] =
+txSz` over the `(h4, w4)` sub-block footprint. The §8.3.2 `txfm_split`
+ctx selector inlines the spec's `get_above_tx_width` /
+`get_left_tx_height` helpers against the walker's grids (`Skips[]` /
+`IsInters[]` / `MiSizes[]` / `InterTxSizes[]`) — the `row == MiRow` /
+`col == MiCol` arm gates the `Skips && IsInters` early return, and
+the fall-through reads `Tx_Width[ InterTxSizes[ above ] ]` /
+`Tx_Height[ InterTxSizes[ left ] ]`. The ctx formula
+`ctx = (txSzSqrUp != maxTxSz) * 3 + (TX_SIZES - 1 - maxTxSz) * 6 +
+above + left` already had its `txfm_split_ctx` helper from earlier
+rounds; this round wires it into the live recursion. The §5.11.16
+`read_block_tx_size` inter-arm now enters `read_var_tx_size` instead
+of surfacing `Error::ReadVarTxSizeUnsupported` — `TxSizes[]` is
+stamped with the last terminal-else's `txSz` over the full block
+footprint per §5.11.5.
+
+New free function `find_tx_size( w, h )` (§5.11.36 spec helper) —
+the linear scan over `TX_SIZES_ALL` returning the first ordinal whose
+`(Tx_Width, Tx_Height)` matches. Used by the §8.3.2 `txfm_split` ctx
+selector's `maxTxSz = find_tx_size( size, size )` derivation.
+
+The **§5.11.18 reader** is exposed as a new
+`PartitionWalker::decode_inter_frame_mode_info` method composing every
+pre-dispatch leaf in spec order: `use_intrabc = 0`; the §5.11.18
+`LeftRefFrame[..]` / `AboveRefFrame[..]` / `LeftIntra` / `AboveIntra`
+/ `LeftSingle` / `AboveSingle` local derivations (currently fixed at
+`[INTRA_FRAME, NONE]` since the walker doesn't yet track
+`RefFrames[][][..]` — the §5.11.23 readers' next-round target);
+`skip = 0`; §5.11.19 `inter_segment_id(1)` via
+`decode_inter_segment_id`; §5.11.10 `read_skip_mode()` via
+`decode_skip_mode`; the `if (skip_mode) skip = 1 else read_skip()`
+dispatch (the `skip_mode == 1` arm bypasses `decode_skip` and stamps
+`Skips[][] = 1` directly per the §5.11.5 grid-fill invariant);
+§5.11.19 `inter_segment_id(0)` (the post-skip arm, fired only when
+`!SegIdPreSkip`); `Lossless = LosslessArray[segment_id]`; §5.11.56
+`read_cdef()`; §5.11.12 `read_delta_qindex()`; §5.11.13
+`read_delta_lf()`; §5.11.20 `read_is_inter()` via `decode_is_inter`.
+
+The §5.11.18 terminal `if (is_inter) inter_block_mode_info() else
+intra_block_mode_info()` dispatch short-circuits at two new `Error`
+variants: `Error::InterBlockModeInfoUnsupported` (the §5.11.23
+`inter_block_mode_info()` next-round target — MV stack / ref-frame
+readers) and `Error::IntraBlockModeInfoUnsupported` (the §5.11.22
+`intra_block_mode_info()` next-round target — per-block intra angle
+/ UV mode readers). All pre-dispatch reads commit to the bitstream
+/ grids before the stub fires.
+
+New `DecodedInterFrameModeInfo` per-block aggregate carries every
+§5.11.18 derived value (`mi_row` / `mi_col` / `mi_size` / `use_intrabc`
+/ `avail_u` / `avail_l` / `left_ref_frame` / `above_ref_frame` /
+`left_intra` / `above_intra` / `left_single` / `above_single` / `skip`
+/ `skip_mode` / `segment_id` / `lossless` / `cdef_idx` /
+`current_q_index` / `current_delta_lf` / `is_inter`).
+
+The §5.11.5 `decode_block_syntax` walker is unchanged on the
+`frame_is_intra = false` arm — it still short-circuits with
+`Error::DecodeBlockInterFrameUnsupported` (the umbrella stub) because
+the §5.11.18 reader needs additional segmentation-feature /
+skip-mode-present caller state the §5.11.5 driver doesn't yet
+thread through. Direct callers of `decode_inter_frame_mode_info`
+get the full pre-dispatch walk and the §5.11.22 / §5.11.23
+distinction.
+
+11 new integration tests (`tests/decode_block_syntax_walker.rs`)
+cover: the §5.11.17 base case (`TX_4X4`) with no S() read; the
+depth cap (`MAX_VARTX_DEPTH`) with no S() read; the split path with
+all-`1` `txfm_split` returning `TX_4X4` at depth 2; the frame-edge
+clip; the caller-bug guards; the inter-arm `read_block_tx_size` now
+enters `read_var_tx_size` and returns the input `maxTxSz` on the
+no-split path with the `(4, 4)` footprint of `InterTxSizes[]`
+stamped; the §5.11.18 baseline path reaches the §5.11.22 intra stub;
+the §5.11.20 segment-override arm reaches the §5.11.23 inter stub;
+the `skip_mode = 1` arm forces `Skips[][] = 1` + reaches §5.11.23;
+the `seg_globalmv_active` arm reaches §5.11.23; the four
+caller-bug guards. Plus 1 new unit test for `find_tx_size` on
+square and rectangular sizes.
+
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 167 lands **§5.11.16 `read_block_tx_size()`** (av1-spec p.70) —
 the per-block transform-size syntax-tree read that the r166 §5.11.5
