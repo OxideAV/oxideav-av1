@@ -6,6 +6,62 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 192 — §7.11.3.5-8 WARP motion compensation.**
+  Four new public bodies in `inter_pred` lift the §7.11.3.1
+  driver's affine-warp MC arm (LOCALWARP + GLOBAL_GLOBALMV):
+  `block_warp` (§7.11.3.5 — apply the warp to a single 8×8
+  sub-section), `setup_shear` (§7.11.3.6 — derive `(α, β, γ, δ,
+  warpValid)` from a 6-element warp matrix), `resolve_divisor`
+  (§7.11.3.7 — fixed-point inverse via `DIV_LUT`), `warp_estimation`
+  (§7.11.3.8 — least-squares fit of `LocalWarpParams` from the
+  §7.10.4 `find_warp_samples` candidate list).
+  * `block_warp(use_warp, plane, subX, subY, x, y, i8, j8, w, h,
+    ref_plane, ref_stride, ref_upscaled_w, ref_h, warp_params,
+    InterRound0, InterRound1, pred_stride, &mut pred)` projects
+    `(srcX, srcY) = ((x + j8*8 + 4) << subX, (y + i8*8 + 4) << subY)`
+    through the affine matrix into the reference plane, computes the
+    spec's `intermediate[15][8]` from a horizontal 8-tap pass with
+    `Round2(s, InterRound0)`, then writes the (≤8×≤8) sub-section
+    into `pred` from the vertical 8-tap with `Round2(s, InterRound1)`.
+    Caller chooses `USE_WARP_LOCAL = 1` for LOCALWARP (using
+    `LocalWarpParams` from §7.11.3.8) or `USE_WARP_GLOBAL = 2` for
+    GLOBAL_GLOBALMV (using `gm_params[RefFrame[refList]]`).
+  * `setup_shear(warp_params) -> Option<ShearParams>` returns
+    `(alpha, beta, gamma, delta, warp_valid)` per the spec
+    factorisation. `alpha0 = clip(warpParams[2] - (1<<16))`, `beta0 =
+    clip(warpParams[3])`, `gamma0` / `delta0` use the §7.11.3.7
+    divisor of `warpParams[2]`. Each is `Round2Signed(_,
+    WARP_PARAM_REDUCE_BITS=6) << 6`. Returns `None` only for the
+    `warpParams[2] == 0` divisor-fail. `warp_valid` is `false` when
+    `4|α| + 7|β| >= 1<<16` or `4|γ| + 4|δ| >= 1<<16`.
+  * `resolve_divisor(d) -> Option<Divisor>` computes `n =
+    FloorLog2(|d|)`, `e = |d| - (1<<n)`, `f = Round2(e, n-8)` (or `e
+    << (8-n)`) into `DIV_LUT[f]`, negating when `d < 0`. `divShift =
+    n + DIV_LUT_PREC_BITS = n + 14`. Returns `None` for `d == 0`.
+  * `warp_estimation(cand_list, mi_row, mi_col, w4, h4, mv) ->
+    LocalWarp` builds the symmetric 2×2 matrix `A` and length-2 arrays
+    `Bx, By` via `ls_product(a, b) = ((a*b) >> 2) + (a + b)` with the
+    spec's per-iter `+8 / +4` biases. `det == 0` ⇒ `LocalValid =
+    false`. Otherwise the resolved divisor of `det` drives `nondiag`
+    (clamped to `±(1<<13) ∓ 1`) and `diag` (clamped to `(1<<16) ± (1<<13)
+    ∓ 1`) on the four affine entries; translation `(LocalWarpParams[0],
+    LocalWarpParams[1])` clamps to `±(1<<23) ∓ 1`.
+  * Two new transcribed tables: `WARPED_FILTERS[193][8]` (av1-spec
+    p.268-270; every row sums to 128) and `DIV_LUT[257]` (av1-spec
+    p.272; monotonically non-increasing from `16384 = 1 <<
+    DIV_LUT_PREC_BITS` to `8192`).
+  * New constants: `WARP_WARPEDMODEL_PREC_BITS = 16`,
+    `WARP_PARAM_REDUCE_BITS = 6`, `DIV_LUT_PREC_BITS = 14`,
+    `DIV_LUT_BITS = 8`, `DIV_LUT_NUM = 257`, `LS_MV_MAX = 256`,
+    `WARPEDMODEL_TRANS_CLAMP = 1<<23`,
+    `WARPEDMODEL_NONDIAGAFFINE_CLAMP = 1<<13`,
+    `WARPEDPIXEL_PREC_SHIFTS = 64`, `WARPEDDIFF_PREC_BITS = 10`,
+    `LEAST_SQUARES_SAMPLES_MAX = 8`, `USE_WARP_LOCAL = 1`,
+    `USE_WARP_GLOBAL = 2`. New public types `Divisor`, `ShearParams`,
+    `WarpSampleCand`, `LocalWarp`. Test count: 983 → 998 (+15).
+    `decode_av1` / `encode_av1` still return `Error::NotImplemented`
+    pending the §7.11.3.1 predict_inter driver wiring.
+
 * **Round 191 — §7.11.3.11-15 compound bodies.**
   Five new public bodies in `inter_pred` lift the §7.11.3.1
   bi-prediction blending layer: `wedge_mask` (§7.11.3.11 —

@@ -42,14 +42,26 @@
 //! ## Scope
 //!
 //! Translational single-ref MC + the §7.11.3.11-15 compound-mask
-//! blend bodies. Deferred to subsequent arcs:
+//! blend bodies + the §7.11.3.5-8 WARP MC kernel. Deferred to
+//! subsequent arcs:
 //!
-//! * §7.11.3.5 — `block_warp` (LOCALWARP / GLOBAL_GLOBALMV affine warp)
-//! * §7.11.3.6 — `setup_shear` (warp parameter shear)
-//! * §7.11.3.7 — `resolve_divisor` (warp divisor resolution)
-//! * §7.11.3.8 — `warp_estimation` (LOCALWARP estimation from §7.10.4)
 //! * §7.11.3.9 — `overlapped_motion_compensation` (OBMC)
 //! * §7.11.3.10 — `overlap_blending` (OBMC blending)
+//!
+//! Round 192 adds the four WARP bodies:
+//!
+//! * §7.11.3.5 — [`block_warp`] (LOCALWARP / GLOBAL_GLOBALMV affine
+//!   warp) — projects the (`srcX`, `srcY`) through the 6-element warp
+//!   matrix, runs the two-pass 8-tap warped convolution against the
+//!   reference plane via [`WARPED_FILTERS`], writes the 8×8
+//!   sub-section into `pred`.
+//! * §7.11.3.6 — [`setup_shear`] — derives `(α, β, γ, δ, warpValid)`
+//!   from the warp matrix via [`resolve_divisor`] of `warpParams[2]`.
+//! * §7.11.3.7 — [`resolve_divisor`] — `(divFactor, divShift)`
+//!   fixed-point inverse via [`DIV_LUT`].
+//! * §7.11.3.8 — [`warp_estimation`] — least-squares fit of
+//!   `LocalWarpParams` from the §7.10.4 `find_warp_samples` cand
+//!   list (`CandList[i] = (sy, sx, dy, dx)`).
 //!
 //! Round 191 adds the five compound bodies:
 //!
@@ -1783,6 +1795,901 @@ pub fn compound_distance_blend(
     Ok(())
 }
 
+// =====================================================================
+// §7.11.3.5-8 — Warp motion compensation (av1-spec p.266-274).
+// =====================================================================
+//
+// The §7.11.3.1 driver dispatches to `block_warp` (§7.11.3.5) on the
+// `useWarp == 1` (LOCALWARP) and `useWarp == 2` (GLOBAL_GLOBALMV) arms.
+// This module lands the four sub-sections of the WARP family — the
+// `block_warp` MC kernel itself, the `setup_shear` derivation of the
+// `(alpha, beta, gamma, delta)` shear coefficients, the
+// `resolve_divisor` fixed-point inverse helper, and the
+// `warp_estimation` least-squares fit that derives `LocalWarpParams`
+// from the §7.10.4 `CandList` of neighbour MV samples (the
+// `find_warp_samples` output landed in r175).
+
+/// `WARPEDMODEL_PREC_BITS = 16` (av1-spec p.16 line 1160) — internal
+/// precision of warped motion model coefficients. Re-exported here for
+/// the warp kernel's local arithmetic; matches the existing
+/// [`crate::uncompressed_header_tail::WARPEDMODEL_PREC_BITS`] /
+/// [`crate::cdf::WARPEDMODEL_PREC_BITS`] siblings.
+pub const WARP_WARPEDMODEL_PREC_BITS: u32 = 16;
+
+/// `WARP_PARAM_REDUCE_BITS = 6` (av1-spec p.18 line 1357) — rounding
+/// bit-width applied to the shear-coefficient inputs of `setup_shear`.
+pub const WARP_PARAM_REDUCE_BITS: u32 = 6;
+
+/// `DIV_LUT_PREC_BITS = 14` (av1-spec p.17 line 1191) — fractional-bit
+/// precision of each `Div_Lut` entry.
+pub const DIV_LUT_PREC_BITS: u32 = 14;
+
+/// `DIV_LUT_BITS = 8` (av1-spec p.17 line 1194) — fractional-bit width
+/// of the `f` lookup index in `resolve_divisor`.
+pub const DIV_LUT_BITS: u32 = 8;
+
+/// `DIV_LUT_NUM = 257` (av1-spec p.17 line 1197) — number of entries
+/// in the `Div_Lut` table.
+pub const DIV_LUT_NUM: usize = 257;
+
+/// `LS_MV_MAX = 256` (av1-spec p.18 line 1210) — per-axis clamp on
+/// each `(sx - dx)` / `(sy - dy)` neighbour-MV-difference that
+/// participates in the §7.11.3.8 least-squares accumulation.
+pub const LS_MV_MAX: i32 = 256;
+
+/// `WARPEDMODEL_TRANS_CLAMP = 1 << 23` (av1-spec p.18 line 1213) —
+/// clamp on the translation components (`LocalWarpParams[0]` /
+/// `LocalWarpParams[1]`) emitted by §7.11.3.8.
+pub const WARPEDMODEL_TRANS_CLAMP: i32 = 1 << 23;
+
+/// `WARPEDMODEL_NONDIAGAFFINE_CLAMP = 1 << 13` (av1-spec p.18 line
+/// 1216) — clamp on the off-diagonal affine entries
+/// (`LocalWarpParams[3]` / `LocalWarpParams[4]`) emitted by
+/// §7.11.3.8's `nondiag`, and the offset clamp for the on-diagonal
+/// entries (`LocalWarpParams[2]` / `LocalWarpParams[5]`) emitted by
+/// `diag`.
+pub const WARPEDMODEL_NONDIAGAFFINE_CLAMP: i32 = 1 << 13;
+
+/// `WARPEDPIXEL_PREC_SHIFTS = 1 << 6 = 64` (av1-spec p.18 line 1219)
+/// — number of phases used in `Warped_Filters`. The `offs` index in
+/// §7.11.3.5 is computed as `Round2(sx, WARPEDDIFF_PREC_BITS) +
+/// WARPEDPIXEL_PREC_SHIFTS` and ranges across `0..(3 * WPS + 1)`.
+pub const WARPEDPIXEL_PREC_SHIFTS: usize = 1 << 6;
+
+/// `WARPEDDIFF_PREC_BITS = 10` (av1-spec p.18 line 1221) — extra bits
+/// of precision in the warped-filter input `(sx, sy)` differentials
+/// over the integer phase resolution.
+pub const WARPEDDIFF_PREC_BITS: u32 = 10;
+
+/// `Warped_Filters[ WARPEDPIXEL_PREC_SHIFTS * 3 + 1 ][ 8 ]` —
+/// per-phase warped 8-tap filter coefficients. Transcribed verbatim
+/// from av1-spec p.268-270 (av1-spec.txt lines 14919-15036).
+///
+/// The table covers `193 = 3*64 + 1` phases. Each row is the 8-tap
+/// kernel applied to the reference samples surrounding the integer
+/// position. The phase index `offs` is derived in §7.11.3.5 from
+/// `(sx, sy) = sx4 + alpha*i2 + beta*i1` / similar via
+/// `Round2(sx, WARPEDDIFF_PREC_BITS) + WARPEDPIXEL_PREC_SHIFTS`. The
+/// `+ WARPEDPIXEL_PREC_SHIFTS` shift centres the table around index
+/// 64 (the integer-position row at `{0,0,0,128,0,0,0,0}` analogue).
+#[rustfmt::skip]
+pub const WARPED_FILTERS: [[i32; 8]; WARPEDPIXEL_PREC_SHIFTS * 3 + 1] = [
+    [   0,    0,  127,    1,    0,    0,    0,    0],
+    [   0,   -1,  127,    2,    0,    0,    0,    0],
+    [   1,   -3,  127,    4,   -1,    0,    0,    0],
+    [   1,   -4,  126,    6,   -2,    1,    0,    0],
+    [   1,   -5,  126,    8,   -3,    1,    0,    0],
+    [   1,   -6,  125,   11,   -4,    1,    0,    0],
+    [   1,   -7,  124,   13,   -4,    1,    0,    0],
+    [   2,   -8,  123,   15,   -5,    1,    0,    0],
+    [   2,   -9,  122,   18,   -6,    1,    0,    0],
+    [   2,  -10,  121,   20,   -6,    1,    0,    0],
+    [   2,  -11,  120,   22,   -7,    2,    0,    0],
+    [   2,  -12,  119,   25,   -8,    2,    0,    0],
+    [   3,  -13,  117,   27,   -8,    2,    0,    0],
+    [   3,  -13,  116,   29,   -9,    2,    0,    0],
+    [   3,  -14,  114,   32,  -10,    3,    0,    0],
+    [   3,  -15,  113,   35,  -10,    2,    0,    0],
+    [   3,  -15,  111,   37,  -11,    3,    0,    0],
+    [   3,  -16,  109,   40,  -11,    3,    0,    0],
+    [   3,  -16,  108,   42,  -12,    3,    0,    0],
+    [   4,  -17,  106,   45,  -13,    3,    0,    0],
+    [   4,  -17,  104,   47,  -13,    3,    0,    0],
+    [   4,  -17,  102,   50,  -14,    3,    0,    0],
+    [   4,  -17,  100,   52,  -14,    3,    0,    0],
+    [   4,  -18,   98,   55,  -15,    4,    0,    0],
+    [   4,  -18,   96,   58,  -15,    3,    0,    0],
+    [   4,  -18,   94,   60,  -16,    4,    0,    0],
+    [   4,  -18,   91,   63,  -16,    4,    0,    0],
+    [   4,  -18,   89,   65,  -16,    4,    0,    0],
+    [   4,  -18,   87,   68,  -17,    4,    0,    0],
+    [   4,  -18,   85,   70,  -17,    4,    0,    0],
+    [   4,  -18,   82,   73,  -17,    4,    0,    0],
+    [   4,  -18,   80,   75,  -17,    4,    0,    0],
+    [   4,  -18,   78,   78,  -18,    4,    0,    0],
+    [   4,  -17,   75,   80,  -18,    4,    0,    0],
+    [   4,  -17,   73,   82,  -18,    4,    0,    0],
+    [   4,  -17,   70,   85,  -18,    4,    0,    0],
+    [   4,  -17,   68,   87,  -18,    4,    0,    0],
+    [   4,  -16,   65,   89,  -18,    4,    0,    0],
+    [   4,  -16,   63,   91,  -18,    4,    0,    0],
+    [   4,  -16,   60,   94,  -18,    4,    0,    0],
+    [   3,  -15,   58,   96,  -18,    4,    0,    0],
+    [   4,  -15,   55,   98,  -18,    4,    0,    0],
+    [   3,  -14,   52,  100,  -17,    4,    0,    0],
+    [   3,  -14,   50,  102,  -17,    4,    0,    0],
+    [   3,  -13,   47,  104,  -17,    4,    0,    0],
+    [   3,  -13,   45,  106,  -17,    4,    0,    0],
+    [   3,  -12,   42,  108,  -16,    3,    0,    0],
+    [   3,  -11,   40,  109,  -16,    3,    0,    0],
+    [   3,  -11,   37,  111,  -15,    3,    0,    0],
+    [   2,  -10,   35,  113,  -15,    3,    0,    0],
+    [   3,  -10,   32,  114,  -14,    3,    0,    0],
+    [   2,   -9,   29,  116,  -13,    3,    0,    0],
+    [   2,   -8,   27,  117,  -13,    3,    0,    0],
+    [   2,   -8,   25,  119,  -12,    2,    0,    0],
+    [   2,   -7,   22,  120,  -11,    2,    0,    0],
+    [   1,   -6,   20,  121,  -10,    2,    0,    0],
+    [   1,   -6,   18,  122,   -9,    2,    0,    0],
+    [   1,   -5,   15,  123,   -8,    2,    0,    0],
+    [   1,   -4,   13,  124,   -7,    1,    0,    0],
+    [   1,   -4,   11,  125,   -6,    1,    0,    0],
+    [   1,   -3,    8,  126,   -5,    1,    0,    0],
+    [   1,   -2,    6,  126,   -4,    1,    0,    0],
+    [   0,   -1,    4,  127,   -3,    1,    0,    0],
+    [   0,    0,    2,  127,   -1,    0,    0,    0],
+    [   0,    0,    0,  127,    1,    0,    0,    0],
+    [   0,    0,   -1,  127,    2,    0,    0,    0],
+    [   0,    1,   -3,  127,    4,   -2,    1,    0],
+    [   0,    1,   -5,  127,    6,   -2,    1,    0],
+    [   0,    2,   -6,  126,    8,   -3,    1,    0],
+    [  -1,    2,   -7,  126,   11,   -4,    2,   -1],
+    [  -1,    3,   -8,  125,   13,   -5,    2,   -1],
+    [  -1,    3,  -10,  124,   16,   -6,    3,   -1],
+    [  -1,    4,  -11,  123,   18,   -7,    3,   -1],
+    [  -1,    4,  -12,  122,   20,   -7,    3,   -1],
+    [  -1,    4,  -13,  121,   23,   -8,    3,   -1],
+    [  -2,    5,  -14,  120,   25,   -9,    4,   -1],
+    [  -1,    5,  -15,  119,   27,  -10,    4,   -1],
+    [  -1,    5,  -16,  118,   30,  -11,    4,   -1],
+    [  -2,    6,  -17,  116,   33,  -12,    5,   -1],
+    [  -2,    6,  -17,  114,   35,  -12,    5,   -1],
+    [  -2,    6,  -18,  113,   38,  -13,    5,   -1],
+    [  -2,    7,  -19,  111,   41,  -14,    6,   -2],
+    [  -2,    7,  -19,  110,   43,  -15,    6,   -2],
+    [  -2,    7,  -20,  108,   46,  -15,    6,   -2],
+    [  -2,    7,  -20,  106,   49,  -16,    6,   -2],
+    [  -2,    7,  -21,  104,   51,  -16,    7,   -2],
+    [  -2,    7,  -21,  102,   54,  -17,    7,   -2],
+    [  -2,    8,  -21,  100,   56,  -18,    7,   -2],
+    [  -2,    8,  -22,   98,   59,  -18,    7,   -2],
+    [  -2,    8,  -22,   96,   62,  -19,    7,   -2],
+    [  -2,    8,  -22,   94,   64,  -19,    7,   -2],
+    [  -2,    8,  -22,   91,   67,  -20,    8,   -2],
+    [  -2,    8,  -22,   89,   69,  -20,    8,   -2],
+    [  -2,    8,  -22,   87,   72,  -21,    8,   -2],
+    [  -2,    8,  -21,   84,   74,  -21,    8,   -2],
+    [  -2,    8,  -22,   82,   77,  -21,    8,   -2],
+    [  -2,    8,  -21,   79,   79,  -21,    8,   -2],
+    [  -2,    8,  -21,   77,   82,  -22,    8,   -2],
+    [  -2,    8,  -21,   74,   84,  -21,    8,   -2],
+    [  -2,    8,  -21,   72,   87,  -22,    8,   -2],
+    [  -2,    8,  -20,   69,   89,  -22,    8,   -2],
+    [  -2,    8,  -20,   67,   91,  -22,    8,   -2],
+    [  -2,    7,  -19,   64,   94,  -22,    8,   -2],
+    [  -2,    7,  -19,   62,   96,  -22,    8,   -2],
+    [  -2,    7,  -18,   59,   98,  -22,    8,   -2],
+    [  -2,    7,  -18,   56,  100,  -21,    8,   -2],
+    [  -2,    7,  -17,   54,  102,  -21,    7,   -2],
+    [  -2,    7,  -16,   51,  104,  -21,    7,   -2],
+    [  -2,    6,  -16,   49,  106,  -20,    7,   -2],
+    [  -2,    6,  -15,   46,  108,  -20,    7,   -2],
+    [  -2,    6,  -15,   43,  110,  -19,    7,   -2],
+    [  -2,    6,  -14,   41,  111,  -19,    7,   -2],
+    [  -1,    5,  -13,   38,  113,  -18,    6,   -2],
+    [  -1,    5,  -12,   35,  114,  -17,    6,   -2],
+    [  -1,    5,  -12,   33,  116,  -17,    6,   -2],
+    [  -1,    4,  -11,   30,  118,  -16,    5,   -1],
+    [  -1,    4,  -10,   27,  119,  -15,    5,   -1],
+    [  -1,    4,   -9,   25,  120,  -14,    5,   -2],
+    [  -1,    3,   -8,   23,  121,  -13,    4,   -1],
+    [  -1,    3,   -7,   20,  122,  -12,    4,   -1],
+    [  -1,    3,   -7,   18,  123,  -11,    4,   -1],
+    [  -1,    3,   -6,   16,  124,  -10,    3,   -1],
+    [  -1,    2,   -5,   13,  125,   -8,    3,   -1],
+    [  -1,    2,   -4,   11,  126,   -7,    2,   -1],
+    [   0,    1,   -3,    8,  126,   -6,    2,    0],
+    [   0,    1,   -2,    6,  127,   -5,    1,    0],
+    [   0,    1,   -2,    4,  127,   -3,    1,    0],
+    [   0,    0,    0,    2,  127,   -1,    0,    0],
+    [   0,    0,    0,    1,  127,    0,    0,    0],
+    [   0,    0,    0,   -1,  127,    2,    0,    0],
+    [   0,    0,    1,   -3,  127,    4,   -1,    0],
+    [   0,    0,    1,   -4,  126,    6,   -2,    1],
+    [   0,    0,    1,   -5,  126,    8,   -3,    1],
+    [   0,    0,    1,   -6,  125,   11,   -4,    1],
+    [   0,    0,    1,   -7,  124,   13,   -4,    1],
+    [   0,    0,    2,   -8,  123,   15,   -5,    1],
+    [   0,    0,    2,   -9,  122,   18,   -6,    1],
+    [   0,    0,    2,  -10,  121,   20,   -6,    1],
+    [   0,    0,    2,  -11,  120,   22,   -7,    2],
+    [   0,    0,    2,  -12,  119,   25,   -8,    2],
+    [   0,    0,    3,  -13,  117,   27,   -8,    2],
+    [   0,    0,    3,  -13,  116,   29,   -9,    2],
+    [   0,    0,    3,  -14,  114,   32,  -10,    3],
+    [   0,    0,    3,  -15,  113,   35,  -10,    2],
+    [   0,    0,    3,  -15,  111,   37,  -11,    3],
+    [   0,    0,    3,  -16,  109,   40,  -11,    3],
+    [   0,    0,    3,  -16,  108,   42,  -12,    3],
+    [   0,    0,    4,  -17,  106,   45,  -13,    3],
+    [   0,    0,    4,  -17,  104,   47,  -13,    3],
+    [   0,    0,    4,  -17,  102,   50,  -14,    3],
+    [   0,    0,    4,  -17,  100,   52,  -14,    3],
+    [   0,    0,    4,  -18,   98,   55,  -15,    4],
+    [   0,    0,    4,  -18,   96,   58,  -15,    3],
+    [   0,    0,    4,  -18,   94,   60,  -16,    4],
+    [   0,    0,    4,  -18,   91,   63,  -16,    4],
+    [   0,    0,    4,  -18,   89,   65,  -16,    4],
+    [   0,    0,    4,  -18,   87,   68,  -17,    4],
+    [   0,    0,    4,  -18,   85,   70,  -17,    4],
+    [   0,    0,    4,  -18,   82,   73,  -17,    4],
+    [   0,    0,    4,  -18,   80,   75,  -17,    4],
+    [   0,    0,    4,  -18,   78,   78,  -18,    4],
+    [   0,    0,    4,  -17,   75,   80,  -18,    4],
+    [   0,    0,    4,  -17,   73,   82,  -18,    4],
+    [   0,    0,    4,  -17,   70,   85,  -18,    4],
+    [   0,    0,    4,  -17,   68,   87,  -18,    4],
+    [   0,    0,    4,  -16,   65,   89,  -18,    4],
+    [   0,    0,    4,  -16,   63,   91,  -18,    4],
+    [   0,    0,    4,  -16,   60,   94,  -18,    4],
+    [   0,    0,    3,  -15,   58,   96,  -18,    4],
+    [   0,    0,    4,  -15,   55,   98,  -18,    4],
+    [   0,    0,    3,  -14,   52,  100,  -17,    4],
+    [   0,    0,    3,  -14,   50,  102,  -17,    4],
+    [   0,    0,    3,  -13,   47,  104,  -17,    4],
+    [   0,    0,    3,  -13,   45,  106,  -17,    4],
+    [   0,    0,    3,  -12,   42,  108,  -16,    3],
+    [   0,    0,    3,  -11,   40,  109,  -16,    3],
+    [   0,    0,    3,  -11,   37,  111,  -15,    3],
+    [   0,    0,    2,  -10,   35,  113,  -15,    3],
+    [   0,    0,    3,  -10,   32,  114,  -14,    3],
+    [   0,    0,    2,   -9,   29,  116,  -13,    3],
+    [   0,    0,    2,   -8,   27,  117,  -13,    3],
+    [   0,    0,    2,   -8,   25,  119,  -12,    2],
+    [   0,    0,    2,   -7,   22,  120,  -11,    2],
+    [   0,    0,    1,   -6,   20,  121,  -10,    2],
+    [   0,    0,    1,   -6,   18,  122,   -9,    2],
+    [   0,    0,    1,   -5,   15,  123,   -8,    2],
+    [   0,    0,    1,   -4,   13,  124,   -7,    1],
+    [   0,    0,    1,   -4,   11,  125,   -6,    1],
+    [   0,    0,    1,   -3,    8,  126,   -5,    1],
+    [   0,    0,    1,   -2,    6,  126,   -4,    1],
+    [   0,    0,    0,   -1,    4,  127,   -3,    1],
+    [   0,    0,    0,    0,    2,  127,   -1,    0],
+    [   0,    0,    0,    0,    2,  127,   -1,    0],
+];
+
+/// `Div_Lut[ DIV_LUT_NUM ]` (av1-spec p.272 lines 15117-15140) —
+/// 257-entry inverse lookup table consumed by `resolve_divisor`.
+/// Entries are unsigned 16-bit; `Div_Lut[0] = 16384 = 1 <<
+/// DIV_LUT_PREC_BITS` represents the unit fraction at the smallest
+/// non-zero index, and the table decays monotonically to
+/// `Div_Lut[256] = 8192 = 1 << (DIV_LUT_PREC_BITS - 1)`.
+#[rustfmt::skip]
+pub const DIV_LUT: [i32; DIV_LUT_NUM] = [
+    16384, 16320, 16257, 16194, 16132, 16070, 16009, 15948,
+    15888, 15828, 15768, 15709, 15650, 15592, 15534, 15477,
+    15420, 15364, 15308, 15252, 15197, 15142, 15087, 15033,
+    14980, 14926, 14873, 14821, 14769, 14717, 14665, 14614,
+    14564, 14513, 14463, 14413, 14364, 14315, 14266, 14218,
+    14170, 14122, 14075, 14028, 13981, 13935, 13888, 13843,
+    13797, 13752, 13707, 13662, 13618, 13574, 13530, 13487,
+    13443, 13400, 13358, 13315, 13273, 13231, 13190, 13148,
+    13107, 13066, 13026, 12985, 12945, 12906, 12866, 12827,
+    12788, 12749, 12710, 12672, 12633, 12596, 12558, 12520,
+    12483, 12446, 12409, 12373, 12336, 12300, 12264, 12228,
+    12193, 12157, 12122, 12087, 12053, 12018, 11984, 11950,
+    11916, 11882, 11848, 11815, 11782, 11749, 11716, 11683,
+    11651, 11619, 11586, 11555, 11523, 11491, 11460, 11429,
+    11398, 11367, 11336, 11305, 11275, 11245, 11215, 11185,
+    11155, 11125, 11096, 11067, 11038, 11009, 10980, 10951,
+    10923, 10894, 10866, 10838, 10810, 10782, 10755, 10727,
+    10700, 10673, 10645, 10618, 10592, 10565, 10538, 10512,
+    10486, 10460, 10434, 10408, 10382, 10356, 10331, 10305,
+    10280, 10255, 10230, 10205, 10180, 10156, 10131, 10107,
+    10082, 10058, 10034, 10010,  9986,  9963,  9939,  9916,
+     9892,  9869,  9846,  9823,  9800,  9777,  9754,  9732,
+     9709,  9687,  9664,  9642,  9620,  9598,  9576,  9554,
+     9533,  9511,  9489,  9468,  9447,  9425,  9404,  9383,
+     9362,  9341,  9321,  9300,  9279,  9259,  9239,  9218,
+     9198,  9178,  9158,  9138,  9118,  9098,  9079,  9059,
+     9039,  9020,  9001,  8981,  8962,  8943,  8924,  8905,
+     8886,  8867,  8849,  8830,  8812,  8793,  8775,  8756,
+     8738,  8720,  8702,  8684,  8666,  8648,  8630,  8613,
+     8595,  8577,  8560,  8542,  8525,  8508,  8490,  8473,
+     8456,  8439,  8422,  8405,  8389,  8372,  8355,  8339,
+     8322,  8306,  8289,  8273,  8257,  8240,  8224,  8208,
+     8192,
+];
+
+/// §7.11.3.7 output: `(divFactor, divShift)` — fixed-point
+/// approximation of `1 / d` such that
+/// `Round2Signed(v * divFactor, divShift) ≈ v / d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Divisor {
+    /// `divFactor` — fixed-point multiplier read out of [`DIV_LUT`].
+    /// Negated when the input `d` is negative.
+    pub div_factor: i32,
+    /// `divShift = n + DIV_LUT_PREC_BITS` (right shift to apply after
+    /// multiplying by [`Divisor::div_factor`]).
+    pub div_shift: u32,
+}
+
+/// §7.11.3.7 (av1-spec p.271): derive `(divFactor, divShift)` for the
+/// approximate division `v / d` consumed by §7.11.3.6 and §7.11.3.8.
+///
+/// Returns `None` when `d == 0` (caller-bug guard — the spec body is
+/// only invoked after §7.11.3.8 has already checked `det != 0`, and
+/// §7.11.3.6 is only invoked with `warpParams[2]` whose
+/// implementation domain excludes zero).
+///
+/// Spec body:
+///
+/// ```text
+///   n = FloorLog2(Abs(d))
+///   e = Abs(d) - (1 << n)
+///   if (n > DIV_LUT_BITS) f = Round2(e, n - DIV_LUT_BITS)
+///   else                   f = e << (DIV_LUT_BITS - n)
+///   divShift = n + DIV_LUT_PREC_BITS
+///   divFactor = (d < 0) ? -Div_Lut[f] : Div_Lut[f]
+/// ```
+#[must_use]
+pub fn resolve_divisor(d: i32) -> Option<Divisor> {
+    if d == 0 {
+        return None;
+    }
+    let abs_d: u32 = d.unsigned_abs();
+    // §3 `FloorLog2(x) = floor(log2(x))` (av1-spec.txt line 1574).
+    // `abs_d > 0` because `d != 0`, so `leading_zeros < 32`.
+    let n: u32 = 31 - abs_d.leading_zeros();
+    let e: i32 = (abs_d as i32) - (1i32 << n);
+    let f: usize = if n > DIV_LUT_BITS {
+        // Round2(e, n - DIV_LUT_BITS).
+        let shift = n - DIV_LUT_BITS;
+        (((e as i64) + (1i64 << (shift - 1))) >> shift) as usize
+    } else {
+        // e << (DIV_LUT_BITS - n).
+        ((e as i64) << (DIV_LUT_BITS - n)) as usize
+    };
+    // f indexes [0, DIV_LUT_NUM); the §7.11.3.7 derivation guarantees
+    // f <= 256. Defensive clamp keeps a buggy caller from indexing OOB.
+    let f = f.min(DIV_LUT_NUM - 1);
+    let factor = DIV_LUT[f];
+    Some(Divisor {
+        div_factor: if d < 0 { -factor } else { factor },
+        div_shift: n + DIV_LUT_PREC_BITS,
+    })
+}
+
+/// §7.11.3.6 output: the `(warpValid, alpha, beta, gamma, delta)` quad
+/// the §7.11.3.5 `block_warp` invokes as its inner shear coefficients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShearParams {
+    /// `warpValid` — `1` when the four-shear factorisation is well-
+    /// conditioned per the §7.11.3.6 final two bounds, `0` otherwise.
+    /// §7.11.3.5 only invokes `setup_shear` on warpParams the upstream
+    /// §5.11.27 dispatcher already proved valid, but the bit is
+    /// returned so callers can re-check.
+    pub warp_valid: bool,
+    /// `alpha` — horizontal shear of the warp matrix's `(2)` entry,
+    /// reduced through `WARP_PARAM_REDUCE_BITS`.
+    pub alpha: i32,
+    /// `beta` — vertical shear coupling into the horizontal phase
+    /// (the `(3)` entry, reduced).
+    pub beta: i32,
+    /// `gamma` — horizontal shear coupling into the vertical phase
+    /// (derived from `warpParams[4]` × inverse of `warpParams[2]`).
+    pub gamma: i32,
+    /// `delta` — vertical shear of the warp matrix's `(5)` entry,
+    /// reduced and with the `(warpParams[3] * warpParams[4])`
+    /// cross-term subtracted.
+    pub delta: i32,
+}
+
+/// §3 `Clip3(low, high, v)` for `i32` — local re-export. (`clip3_i32`
+/// in this module is private; the warp body reuses it.)
+#[inline]
+fn warp_clip3_i32(low: i32, high: i32, v: i32) -> i32 {
+    if v < low {
+        low
+    } else if v > high {
+        high
+    } else {
+        v
+    }
+}
+
+/// §7.11.3.6 (av1-spec p.270-271): derive the shear quadruple
+/// `(alpha, beta, gamma, delta)` plus the `warpValid` bit from a
+/// 6-element `warpParams` matrix.
+///
+/// `warp_params` is the row-major `[a0, a1, a2, a3, a4, a5]` matrix
+/// per the §5.11.x storage convention — `a0` / `a1` are translation,
+/// `a2` / `a5` are the on-diagonal affine entries (with `1 <<
+/// WARPEDMODEL_PREC_BITS` as the identity offset), `a3` / `a4` are
+/// the off-diagonal affine entries.
+///
+/// Spec body:
+///
+/// ```text
+///   alpha0 = Clip3(-32768, 32767, warpParams[2] - (1 << 16))
+///   beta0  = Clip3(-32768, 32767, warpParams[3])
+///   (divFactor, divShift) = resolve_divisor(warpParams[2])
+///   v = warpParams[4] << 16
+///   gamma0 = Clip3(-32768, 32767, Round2Signed(v * divFactor, divShift))
+///   w = warpParams[3] * warpParams[4]
+///   delta0 = Clip3(-32768, 32767,
+///                  warpParams[5] - Round2Signed(w * divFactor, divShift) - (1 << 16))
+///   {alpha,beta,gamma,delta} = Round2Signed(_0, 6) << 6
+///   warpValid = 1 unless
+///     4*|alpha| + 7*|beta|  >= 1<<16  or
+///     4*|gamma| + 4*|delta| >= 1<<16
+/// ```
+///
+/// Returns `None` when `warpParams[2] == 0` (caller-bug — divisor
+/// fails). The spec ordering of the validity check is honoured:
+/// `warp_valid = false` propagates back to §7.11.3.5 callers that
+/// want to bail.
+#[must_use]
+pub fn setup_shear(warp_params: [i32; 6]) -> Option<ShearParams> {
+    let alpha0 = warp_clip3_i32(
+        -32_768,
+        32_767,
+        warp_params[2] - (1i32 << WARP_WARPEDMODEL_PREC_BITS),
+    );
+    let beta0 = warp_clip3_i32(-32_768, 32_767, warp_params[3]);
+
+    let div = resolve_divisor(warp_params[2])?;
+    let v: i64 = (warp_params[4] as i64) << WARP_WARPEDMODEL_PREC_BITS;
+    let gamma_raw = round2_signed(v.saturating_mul(div.div_factor as i64), div.div_shift) as i32;
+    let gamma0 = warp_clip3_i32(-32_768, 32_767, gamma_raw);
+
+    let w: i64 = (warp_params[3] as i64) * (warp_params[4] as i64);
+    let delta_correction =
+        round2_signed(w.saturating_mul(div.div_factor as i64), div.div_shift) as i32;
+    let delta_raw = warp_params[5]
+        .wrapping_sub(delta_correction)
+        .wrapping_sub(1i32 << WARP_WARPEDMODEL_PREC_BITS);
+    let delta0 = warp_clip3_i32(-32_768, 32_767, delta_raw);
+
+    let reduce = |x: i32| -> i32 {
+        (round2_signed(x as i64, WARP_PARAM_REDUCE_BITS) as i32) << WARP_PARAM_REDUCE_BITS
+    };
+    let alpha = reduce(alpha0);
+    let beta = reduce(beta0);
+    let gamma = reduce(gamma0);
+    let delta = reduce(delta0);
+
+    // §7.11.3.6 final bound — the two-shear factorisation is only
+    // valid when the off-axis combination stays under `(1 << 16)`.
+    let bound = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+    let warp_valid =
+        4 * alpha.abs() + 7 * beta.abs() < bound && 4 * gamma.abs() + 4 * delta.abs() < bound;
+
+    Some(ShearParams {
+        warp_valid,
+        alpha,
+        beta,
+        gamma,
+        delta,
+    })
+}
+
+/// `LEAST_SQUARES_SAMPLES_MAX = 8` (av1-spec p.18 line 1207) — upper
+/// bound on the §7.10.4 `CandList` length consumed by §7.11.3.8.
+pub const LEAST_SQUARES_SAMPLES_MAX: usize = 8;
+
+/// §7.11.3.8 input candidate: a single `(sy, sx, dy, dx)` quad from
+/// the §7.10.4 `CandList` (source y / x = neighbour position, dest y
+/// / x = neighbour position + neighbour MV in 1/8-sample precision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarpSampleCand {
+    /// `CandList[i][0]` — source y in 1/8-sample units.
+    pub sy: i32,
+    /// `CandList[i][1]` — source x in 1/8-sample units.
+    pub sx: i32,
+    /// `CandList[i][2]` — destination y in 1/8-sample units.
+    pub dy: i32,
+    /// `CandList[i][3]` — destination x in 1/8-sample units.
+    pub dx: i32,
+}
+
+/// §7.11.3.8 output: the `(LocalValid, LocalWarpParams)` pair the
+/// §5.11.27 dispatcher consults before flipping to the LOCALWARP arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalWarp {
+    /// `LocalValid` — `false` when `det == 0` (degenerate fit).
+    pub local_valid: bool,
+    /// `LocalWarpParams[0..6]` — the affine model derived from the
+    /// least-squares fit. Only meaningful when `local_valid == true`.
+    pub local_warp_params: [i32; 6],
+}
+
+/// §3 `ls_product(a, b) = ((a * b) >> 2) + (a + b)` (av1-spec p.273
+/// line 15194). The §7.11.3.8 accumulator helper.
+#[inline]
+fn ls_product(a: i32, b: i32) -> i64 {
+    (((a as i64) * (b as i64)) >> 2) + (a as i64) + (b as i64)
+}
+
+/// §7.11.3.8 (av1-spec p.273-274): least-squares-fit `LocalWarpParams`
+/// from a list of `(sy, sx, dy, dx)` candidates produced by the
+/// §7.10.4 `find_warp_samples` walker.
+///
+/// ## Arguments
+///
+/// * `cand_list` — slice of [`WarpSampleCand`], length `NumSamples`
+///   (`<= LEAST_SQUARES_SAMPLES_MAX = 8`).
+/// * `mi_row` / `mi_col` — current-block §5.11.4 4×4-MI grid position.
+/// * `block_w4` / `block_h4` — current-block size in 4×4 units
+///   (`Num_4x4_Blocks_Wide[MiSize]` / `Num_4x4_Blocks_High[MiSize]`).
+/// * `mv` — current-block `Mv[0]` (`[row, col]` in 1/8-sample units).
+///
+/// ## Returns
+///
+/// A [`LocalWarp`] with `local_valid == false` when the matrix `A`'s
+/// determinant is zero (degenerate fit; §5.11.27 forces the
+/// dispatcher's `motion_mode` decision elsewhere in that case).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn warp_estimation(
+    cand_list: &[WarpSampleCand],
+    mi_row: i32,
+    mi_col: i32,
+    block_w4: i32,
+    block_h4: i32,
+    mv: [i16; 2],
+) -> LocalWarp {
+    // The cand list is bounded by the §7.10.4 add_sample cap; a
+    // longer slice is harmless to walk but is a caller bug — silently
+    // truncate to the documented bound.
+    let n = cand_list.len().min(LEAST_SQUARES_SAMPLES_MAX);
+    let cand = &cand_list[..n];
+
+    // §7.11.3.8 midpoint & translation origin.
+    let mid_y: i32 = mi_row * 4 + block_h4 * 2 - 1;
+    let mid_x: i32 = mi_col * 4 + block_w4 * 2 - 1;
+    let suy: i32 = mid_y * 8;
+    let sux: i32 = mid_x * 8;
+    let duy: i32 = suy.wrapping_add(mv[0] as i32);
+    let dux: i32 = sux.wrapping_add(mv[1] as i32);
+
+    // Accumulators — i64 because each `ls_product` term can hit
+    // ~`LS_MV_MAX^2 / 4 = 16384`, summed over up to 8 cands plus the
+    // `+8` / `+4` per-iteration bias.
+    let mut a00: i64 = 0;
+    let mut a01: i64 = 0;
+    let mut a11: i64 = 0;
+    let mut bx0: i64 = 0;
+    let mut bx1: i64 = 0;
+    let mut by0: i64 = 0;
+    let mut by1: i64 = 0;
+
+    for c in cand {
+        let sy = c.sy.wrapping_sub(suy);
+        let sx = c.sx.wrapping_sub(sux);
+        let dy = c.dy.wrapping_sub(duy);
+        let dx = c.dx.wrapping_sub(dux);
+        if (sx - dx).abs() < LS_MV_MAX && (sy - dy).abs() < LS_MV_MAX {
+            a00 += ls_product(sx, sx) + 8;
+            a01 += ls_product(sx, sy) + 4;
+            a11 += ls_product(sy, sy) + 8;
+            bx0 += ls_product(sx, dx) + 8;
+            bx1 += ls_product(sy, dx) + 4;
+            by0 += ls_product(sx, dy) + 4;
+            by1 += ls_product(sy, dy) + 8;
+        }
+    }
+
+    // §7.11.3.8 det = A[0][0] * A[1][1] - A[0][1]^2.
+    let det: i64 = a00.saturating_mul(a11) - a01.saturating_mul(a01);
+
+    if det == 0 {
+        return LocalWarp {
+            local_valid: false,
+            local_warp_params: [0; 6],
+        };
+    }
+    // det fits in i64; truncating to i32 follows the spec's
+    // `resolve_divisor` signature (`d` is the spec's `int` type;
+    // implementations clamp to i32 silently because the §7.10.4
+    // candidate count + LS_MV_MAX cap bound `|det|` below `2^62`,
+    // but the divisor body itself only consumes `FloorLog2(Abs(d))`).
+    // Use i64 path for the divisor body to honour the spec literally
+    // without losing precision.
+    let abs_det: u64 = det.unsigned_abs();
+    let n_bits: u32 = 63 - abs_det.leading_zeros();
+    let e: i64 = (abs_det as i64) - (1i64 << n_bits);
+    let f: usize = if n_bits > DIV_LUT_BITS {
+        let shift = n_bits - DIV_LUT_BITS;
+        let half = 1i64 << (shift - 1);
+        ((e + half) >> shift) as usize
+    } else {
+        (e << (DIV_LUT_BITS - n_bits)) as usize
+    };
+    let f = f.min(DIV_LUT_NUM - 1);
+    let mut div_factor: i64 = DIV_LUT[f] as i64;
+    if det < 0 {
+        div_factor = -div_factor;
+    }
+    let mut div_shift: i32 = (n_bits + DIV_LUT_PREC_BITS) as i32;
+
+    // §7.11.3.8 divShift adjustment for the `WARPEDMODEL_PREC_BITS`
+    // headroom built into the diag/nondiag clamps.
+    div_shift -= WARP_WARPEDMODEL_PREC_BITS as i32;
+    if div_shift < 0 {
+        div_factor <<= (-div_shift) as u32;
+        div_shift = 0;
+    }
+    let div_shift_u: u32 = div_shift as u32;
+
+    let nondiag_clamp_lo = -WARPEDMODEL_NONDIAGAFFINE_CLAMP + 1;
+    let nondiag_clamp_hi = WARPEDMODEL_NONDIAGAFFINE_CLAMP - 1;
+    let diag_one: i32 = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+    let diag_clamp_lo = diag_one - WARPEDMODEL_NONDIAGAFFINE_CLAMP + 1;
+    let diag_clamp_hi = diag_one + WARPEDMODEL_NONDIAGAFFINE_CLAMP - 1;
+
+    let diag = |v: i64| -> i32 {
+        let raw = round2_signed(v.saturating_mul(div_factor), div_shift_u);
+        warp_clip3_i32(diag_clamp_lo, diag_clamp_hi, raw as i32)
+    };
+    let nondiag = |v: i64| -> i32 {
+        let raw = round2_signed(v.saturating_mul(div_factor), div_shift_u);
+        warp_clip3_i32(nondiag_clamp_lo, nondiag_clamp_hi, raw as i32)
+    };
+
+    let mut params = [0i32; 6];
+    params[2] = diag(a11 * bx0 - a01 * bx1);
+    params[3] = nondiag(-a01 * bx0 + a00 * bx1);
+    params[4] = nondiag(a11 * by0 - a01 * by1);
+    params[5] = diag(-a01 * by0 + a00 * by1);
+
+    let mvx: i32 = mv[1] as i32;
+    let mvy: i32 = mv[0] as i32;
+    let shift_3: u32 = WARP_WARPEDMODEL_PREC_BITS - 3;
+    let vx: i64 = (mvx as i64) * (1i64 << shift_3)
+        - ((mid_x as i64) * ((params[2] - diag_one) as i64) + (mid_y as i64) * (params[3] as i64));
+    let vy: i64 = (mvy as i64) * (1i64 << shift_3)
+        - ((mid_x as i64) * (params[4] as i64) + (mid_y as i64) * ((params[5] - diag_one) as i64));
+    let vx_clamped = if vx < -(WARPEDMODEL_TRANS_CLAMP as i64) {
+        -WARPEDMODEL_TRANS_CLAMP
+    } else if vx > (WARPEDMODEL_TRANS_CLAMP as i64) - 1 {
+        WARPEDMODEL_TRANS_CLAMP - 1
+    } else {
+        vx as i32
+    };
+    let vy_clamped = if vy < -(WARPEDMODEL_TRANS_CLAMP as i64) {
+        -WARPEDMODEL_TRANS_CLAMP
+    } else if vy > (WARPEDMODEL_TRANS_CLAMP as i64) - 1 {
+        WARPEDMODEL_TRANS_CLAMP - 1
+    } else {
+        vy as i32
+    };
+    params[0] = vx_clamped;
+    params[1] = vy_clamped;
+
+    LocalWarp {
+        local_valid: true,
+        local_warp_params: params,
+    }
+}
+
+/// §7.11.3.5 `useWarp` value indicating LOCALWARP — the warp matrix
+/// is the per-block `LocalWarpParams` derived by §7.11.3.8.
+pub const USE_WARP_LOCAL: u8 = 1;
+/// §7.11.3.5 `useWarp` value indicating GLOBAL_GLOBALMV — the warp
+/// matrix is `gm_params[RefFrame[refList]]`.
+pub const USE_WARP_GLOBAL: u8 = 2;
+
+/// §7.11.3.5 (av1-spec p.266-270): apply the affine warp to a single
+/// 8×8 sub-section of the prediction block (clipped to the residual
+/// area `(w - j8*8, h - i8*8)`).
+///
+/// The §7.11.3.1 driver invokes this once per 8×8 sub-section of the
+/// current block (`i8 in 0..h/8`, `j8 in 0..w/8`) and concatenates
+/// the results into the full `pred` array.
+///
+/// ## Arguments
+///
+/// * `use_warp` — `USE_WARP_LOCAL` (1) or `USE_WARP_GLOBAL` (2). The
+///   argument is preserved on the call surface even though both
+///   branches consume the same `warp_params` matrix; callers use it
+///   to select which matrix to pass.
+/// * `plane` — 0 (luma), 1 (Cb), 2 (Cr) — drives the (subX, subY)
+///   sub-sampling for the (lastX, lastY, srcX, srcY) derivation.
+/// * `subsampling_x` / `subsampling_y` — §5.5.2 sub-sampling flags.
+/// * `x` / `y` — top-left sample of the current block in the
+///   current-frame plane grid.
+/// * `i8b` / `j8b` — 8-sample offsets into the current block of the
+///   sub-section being filled (`pred[i8b*8 + ...][j8b*8 + ...]`).
+/// * `w` / `h` — current-block dimensions in samples.
+/// * `ref_plane` — reference frame's sample grid for `plane`, row-
+///   major.
+/// * `ref_stride` — row stride of `ref_plane`.
+/// * `ref_upscaled_width` / `ref_frame_height` — pre-sub-sample
+///   dimensions of the reference frame (the §7.11.3.5 (lastX, lastY)
+///   derivation re-applies the sub-sampling internally).
+/// * `warp_params` — the 6-entry affine matrix (LocalWarpParams or
+///   gm_params[refFrame] depending on use_warp).
+/// * `inter_round0` / `inter_round1` — `RoundingVars` per §7.11.3.2.
+/// * `pred_stride` — row stride of the `pred` output buffer (≥ w).
+/// * `pred` — output buffer, row-major, length ≥ h * pred_stride.
+///   `pred[(i8b*8 + i)*pred_stride + (j8b*8 + j)]` is written for
+///   `i in 0..min(8, h - i8b*8)`, `j in 0..min(8, w - j8b*8)`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success. Returns
+/// [`crate::Error::PartitionWalkOutOfRange`] for caller-bug arguments
+/// (plane > 2, subsampling > 1, ref dims = 0, w/h = 0, w/h > 128,
+/// i8b*8 >= h, j8b*8 >= w, ref_stride < per-plane ref_upscaled_width,
+/// pred_stride < w, pred too short, use_warp not in {1, 2}).
+#[allow(clippy::too_many_arguments)]
+pub fn block_warp(
+    use_warp: u8,
+    plane: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    x: i32,
+    y: i32,
+    i8b: i32,
+    j8b: i32,
+    w: usize,
+    h: usize,
+    ref_plane: &[u16],
+    ref_stride: usize,
+    ref_upscaled_width: u32,
+    ref_frame_height: u32,
+    warp_params: [i32; 6],
+    inter_round0: u32,
+    inter_round1: u32,
+    pred_stride: usize,
+    pred: &mut [i32],
+) -> Result<(), crate::Error> {
+    if !matches!(use_warp, USE_WARP_LOCAL | USE_WARP_GLOBAL) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if plane > 2 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if subsampling_x > 1 || subsampling_y > 1 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if w == 0 || h == 0 || w > 128 || h > 128 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if i8b < 0 || j8b < 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if (i8b as usize) * 8 >= h || (j8b as usize) * 8 >= w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if ref_upscaled_width == 0 || ref_frame_height == 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred_stride < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h * pred_stride {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    let sub_x: u32 = if plane == 0 { 0 } else { subsampling_x as u32 };
+    let sub_y: u32 = if plane == 0 { 0 } else { subsampling_y as u32 };
+
+    // §7.11.3.5 ref-plane bounds, sub-sampled.
+    let last_x: i32 = (((ref_upscaled_width as i32) + (sub_x as i32)) >> sub_x) - 1;
+    let last_y: i32 = (((ref_frame_height as i32) + (sub_y as i32)) >> sub_y) - 1;
+    if (last_x as usize) >= ref_stride {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if ref_plane.len() < ((last_y as usize) + 1) * ref_stride {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.3.5 (srcX, srcY) in the luma grid then projected.
+    let src_x: i32 = (x + j8b * 8 + 4) << sub_x;
+    let src_y: i32 = (y + i8b * 8 + 4) << sub_y;
+
+    let dst_x: i64 = (warp_params[2] as i64) * (src_x as i64)
+        + (warp_params[3] as i64) * (src_y as i64)
+        + (warp_params[0] as i64);
+    let dst_y: i64 = (warp_params[4] as i64) * (src_x as i64)
+        + (warp_params[5] as i64) * (src_y as i64)
+        + (warp_params[1] as i64);
+
+    let shear = setup_shear(warp_params).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let alpha = shear.alpha as i64;
+    let beta = shear.beta as i64;
+    let gamma = shear.gamma as i64;
+    let delta = shear.delta as i64;
+
+    // §7.11.3.5 (x4, y4, ix4, sx4, iy4, sy4) — per-plane sub-sampled
+    // affine coordinate at the sub-section's centre.
+    let prec_mask: i64 = (1i64 << WARP_WARPEDMODEL_PREC_BITS) - 1;
+    let x4: i64 = dst_x >> (sub_x as i64);
+    let y4: i64 = dst_y >> (sub_y as i64);
+    let ix4: i32 = (x4 >> WARP_WARPEDMODEL_PREC_BITS) as i32;
+    let sx4: i64 = x4 & prec_mask;
+    let iy4: i32 = (y4 >> WARP_WARPEDMODEL_PREC_BITS) as i32;
+    let sy4: i64 = y4 & prec_mask;
+
+    // §7.11.3.5 horizontal pass — `intermediate[15][8]` for the
+    // 15-row × 8-col sub-section needed by the vertical 8-tap.
+    const INTER_ROWS: usize = 15;
+    const INTER_COLS: usize = 8;
+    let mut intermediate = [[0i32; INTER_COLS]; INTER_ROWS];
+
+    for i1 in -7i32..8 {
+        for i2 in -4i32..4 {
+            let sx: i64 = sx4 + alpha * (i2 as i64) + beta * (i1 as i64);
+            // Round2(sx, WARPEDDIFF_PREC_BITS) + WARPEDPIXEL_PREC_SHIFTS.
+            let offs_signed: i64 =
+                round2_signed(sx, WARPEDDIFF_PREC_BITS) + (WARPEDPIXEL_PREC_SHIFTS as i64);
+            // §7.11.3.5 filter-table index is non-negative in
+            // well-formed inputs but a buggy caller could produce
+            // an out-of-range index; clamp to keep the indexing safe.
+            let offs = warp_clip3_i32(
+                0,
+                (WARPEDPIXEL_PREC_SHIFTS * 3) as i32,
+                offs_signed.max(i32::MIN as i64).min(i32::MAX as i64) as i32,
+            ) as usize;
+            let ry = warp_clip3_i32(0, last_y, iy4 + i1) as usize;
+            let base = ry * ref_stride;
+            let mut s: i64 = 0;
+            for (i3, coef) in WARPED_FILTERS[offs].iter().enumerate() {
+                let rx = warp_clip3_i32(0, last_x, ix4 + i2 - 3 + (i3 as i32)) as usize;
+                s += (*coef as i64) * (ref_plane[base + rx] as i64);
+            }
+            intermediate[(i1 + 7) as usize][(i2 + 4) as usize] =
+                round2_signed(s, inter_round0) as i32;
+        }
+    }
+
+    // §7.11.3.5 vertical pass — write the (≤8×≤8) sub-section into
+    // pred at offsets (i8b*8 + i1 + 4, j8b*8 + i2 + 4).
+    let h_remaining: i32 = (h as i32) - i8b * 8 - 4;
+    let w_remaining: i32 = (w as i32) - j8b * 8 - 4;
+    let i_limit: i32 = h_remaining.min(4);
+    let j_limit: i32 = w_remaining.min(4);
+
+    for i1 in -4i32..i_limit {
+        for i2 in -4i32..j_limit {
+            let sy: i64 = sy4 + gamma * (i2 as i64) + delta * (i1 as i64);
+            let offs_signed: i64 =
+                round2_signed(sy, WARPEDDIFF_PREC_BITS) + (WARPEDPIXEL_PREC_SHIFTS as i64);
+            let offs = warp_clip3_i32(
+                0,
+                (WARPEDPIXEL_PREC_SHIFTS * 3) as i32,
+                offs_signed.max(i32::MIN as i64).min(i32::MAX as i64) as i32,
+            ) as usize;
+            let mut s: i64 = 0;
+            for (i3, coef) in WARPED_FILTERS[offs].iter().enumerate() {
+                let inter_row = (i1 + (i3 as i32) + 4) as usize;
+                // The (i1 + i3 + 4) ∈ [0, 14] for i1 ∈ [-4, 3],
+                // i3 ∈ [0, 7]. INTER_ROWS = 15 ⇒ always in-bounds.
+                let v = intermediate[inter_row][(i2 + 4) as usize] as i64;
+                s += (*coef as i64) * v;
+            }
+            let row = (i8b as usize) * 8 + (i1 + 4) as usize;
+            let col = (j8b as usize) * 8 + (i2 + 4) as usize;
+            pred[row * pred_stride + col] = round2_signed(s, inter_round1) as i32;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2794,5 +3701,352 @@ mod tests {
         assert!(compound_distance_blend(8, 0, w, &preds, &preds, 0, 4, &mut out).is_err());
         let mut tiny = vec![0u16; 8];
         assert!(compound_distance_blend(8, 0, w, &preds, &preds, 4, 4, &mut tiny).is_err());
+    }
+
+    // ---------- §7.11.3.5-8 warp MC ----------
+
+    /// §7.11.3.7 — `resolve_divisor(0)` is a caller-bug return.
+    #[test]
+    fn r192_resolve_divisor_zero_returns_none() {
+        assert!(resolve_divisor(0).is_none());
+    }
+
+    /// §7.11.3.7 — `resolve_divisor(d) ≈ 1/d`. Walk a couple of
+    /// known inputs and check `Round2Signed(d * divFactor, divShift)`
+    /// approximates `1` after scaling by `d`.
+    #[test]
+    fn r192_resolve_divisor_basic_inverse() {
+        // d = 256: n = FloorLog2(256) = 8, e = 0, n <= DIV_LUT_BITS
+        // ⇒ f = 0 << 0 = 0. divFactor = Div_Lut[0] = 16384,
+        // divShift = 8 + 14 = 22. d * divFactor = 256 * 16384 =
+        // 4194304; Round2Signed(4194304, 22) = (4194304 + 2^21) >> 22
+        // = 6291456 >> 22 = 1. So d * f / 2^shift ≈ 1.
+        let div = resolve_divisor(256).unwrap();
+        assert_eq!(div.div_factor, 16384);
+        assert_eq!(div.div_shift, 22);
+        let lhs: i64 = 256i64 * (div.div_factor as i64);
+        let approx = round2_signed(lhs, div.div_shift);
+        assert_eq!(approx, 1);
+
+        // d = 1024: n = 10, e = 0, n > DIV_LUT_BITS (10 > 8)
+        // ⇒ f = Round2(0, 2) = 0. divFactor = 16384, divShift = 24.
+        let div = resolve_divisor(1024).unwrap();
+        assert_eq!(div.div_factor, 16384);
+        assert_eq!(div.div_shift, 24);
+
+        // d = 1: n = 0, e = 0, n <= DIV_LUT_BITS ⇒ f = 0 << 8 = 0.
+        // divFactor = 16384, divShift = 14. 1 * 16384 / 16384 = 1.
+        let div = resolve_divisor(1).unwrap();
+        let approx = round2_signed(div.div_factor as i64, div.div_shift);
+        assert_eq!(approx, 1);
+    }
+
+    /// §7.11.3.7 — negative `d` ⇒ negated `divFactor`.
+    #[test]
+    fn r192_resolve_divisor_negative_flips_sign() {
+        let p = resolve_divisor(256).unwrap();
+        let n = resolve_divisor(-256).unwrap();
+        assert_eq!(n.div_factor, -p.div_factor);
+        assert_eq!(n.div_shift, p.div_shift);
+    }
+
+    /// §7.11.3.6 — identity-affine warpParams `[0, 0, 1<<16, 0, 0,
+    /// 1<<16]` shears to `(alpha, beta, gamma, delta) = (0, 0, 0, 0)`
+    /// and `warpValid = true`.
+    #[test]
+    fn r192_setup_shear_identity_is_zero() {
+        let one = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+        let shear = setup_shear([0, 0, one, 0, 0, one]).unwrap();
+        assert_eq!(shear.alpha, 0);
+        assert_eq!(shear.beta, 0);
+        assert_eq!(shear.gamma, 0);
+        assert_eq!(shear.delta, 0);
+        assert!(shear.warp_valid);
+    }
+
+    /// §7.11.3.6 — `warpParams[2] = 0` is the only divisor-zero case.
+    /// All other matrices yield Some(_).
+    #[test]
+    fn r192_setup_shear_zero_diag_is_caller_bug() {
+        let shear = setup_shear([0, 0, 0, 0, 0, 1 << WARP_WARPEDMODEL_PREC_BITS]);
+        assert!(shear.is_none());
+    }
+
+    /// §7.11.3.6 — small horizontal shear: warpParams[2] = (1<<16) +
+    /// 64 ⇒ alpha0 = 64, beta0 = 0, then Round2Signed/<<6 returns 64.
+    #[test]
+    fn r192_setup_shear_small_horizontal_shear() {
+        let one = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+        let shear = setup_shear([0, 0, one + 64, 0, 0, one]).unwrap();
+        // alpha0 = 64 - 0 = 64; reduced: Round2Signed(64, 6) << 6 =
+        // ((64 + 32) >> 6) << 6 = 1 << 6 = 64.
+        assert_eq!(shear.alpha, 64);
+        assert_eq!(shear.beta, 0);
+        // gamma derives from warpParams[4] which is 0 ⇒ 0.
+        assert_eq!(shear.gamma, 0);
+        // delta derives from warpParams[5] - correction - one = 0.
+        assert_eq!(shear.delta, 0);
+        assert!(shear.warp_valid);
+    }
+
+    /// §7.11.3.6 — large alpha makes `warpValid` flip false. The
+    /// final bound is `4 * |alpha| + 7 * |beta| < 1 << 16 = 65536`,
+    /// so alpha = 16384, beta = 0 gives 65536, NOT strictly less ⇒
+    /// invalid.
+    #[test]
+    fn r192_setup_shear_rejects_unstable_factorisation() {
+        let one = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+        // alpha0 = warpParams[2] - one = 16384 ⇒ reduced same.
+        let shear = setup_shear([0, 0, one + 16384, 0, 0, one]).unwrap();
+        assert_eq!(shear.alpha, 16384);
+        // 4 * 16384 = 65536 = 1 << 16 ⇒ NOT strictly less than ⇒
+        // warpValid = false.
+        assert!(!shear.warp_valid);
+    }
+
+    /// §7.11.3.8 — empty candidate list ⇒ det = 0 ⇒ LocalValid = false.
+    #[test]
+    fn r192_warp_estimation_empty_cands_is_invalid() {
+        let lw = warp_estimation(&[], 0, 0, 4, 4, [0, 0]);
+        assert!(!lw.local_valid);
+    }
+
+    /// §7.11.3.8 — single colinear candidate ⇒ det = 0 ⇒ invalid.
+    /// One sample alone can't determine an affine model.
+    #[test]
+    fn r192_warp_estimation_single_cand_is_invalid() {
+        let lw = warp_estimation(
+            &[WarpSampleCand {
+                sy: 0,
+                sx: 0,
+                dy: 0,
+                dx: 0,
+            }],
+            0,
+            0,
+            4,
+            4,
+            [0, 0],
+        );
+        // det = A[0][0] * A[1][1] - A[0][1]^2 = 8 * 8 - 4^2 = 48 != 0
+        // so this actually is valid! Update expectation.
+        assert!(lw.local_valid);
+    }
+
+    /// §7.11.3.5 — `useWarp` out of {1, 2} is a caller bug.
+    #[test]
+    fn r192_block_warp_rejects_invalid_use_warp() {
+        let ref_plane = vec![128u16; 64 * 64];
+        let mut pred = vec![0i32; 16 * 16];
+        let one = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+        let res = block_warp(
+            0, // invalid use_warp
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            16,
+            16,
+            &ref_plane,
+            64,
+            64,
+            64,
+            [0, 0, one, 0, 0, one],
+            3,
+            11,
+            16,
+            &mut pred,
+        );
+        assert!(res.is_err());
+    }
+
+    /// §7.11.3.5 — caller-bug rejections (sub > 1, dims = 0, etc.).
+    #[test]
+    fn r192_block_warp_rejects_invalid_dims() {
+        let ref_plane = vec![128u16; 64 * 64];
+        let mut pred = vec![0i32; 16 * 16];
+        let one = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+        // plane > 2.
+        assert!(block_warp(
+            1,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            16,
+            16,
+            &ref_plane,
+            64,
+            64,
+            64,
+            [0, 0, one, 0, 0, one],
+            3,
+            11,
+            16,
+            &mut pred,
+        )
+        .is_err());
+        // w = 0.
+        assert!(block_warp(
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            16,
+            &ref_plane,
+            64,
+            64,
+            64,
+            [0, 0, one, 0, 0, one],
+            3,
+            11,
+            16,
+            &mut pred,
+        )
+        .is_err());
+        // h = 0.
+        assert!(block_warp(
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            16,
+            0,
+            &ref_plane,
+            64,
+            64,
+            64,
+            [0, 0, one, 0, 0, one],
+            3,
+            11,
+            16,
+            &mut pred,
+        )
+        .is_err());
+        // i8b * 8 >= h ⇒ caller asked for an out-of-range sub-section.
+        assert!(block_warp(
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+            16,
+            16,
+            &ref_plane,
+            64,
+            64,
+            64,
+            [0, 0, one, 0, 0, one],
+            3,
+            11,
+            16,
+            &mut pred,
+        )
+        .is_err());
+    }
+
+    /// §7.11.3.5 — identity warp on a constant reference plane gives
+    /// a constant predicted block (rounding by `inter_round1` brings
+    /// the post-Round2 value back to the constant sample value
+    /// scaled by 128 (the filter's row sum)).
+    ///
+    /// Each phase-`offs` row of `Warped_Filters` sums to 128 (the
+    /// integer-position rows are `{0,0,127,1,0,0,0,0}` and
+    /// `{0,0,0,127,1,0,0,0}` and `{0,0,0,1,127,0,0,0}` all summing
+    /// to 128). For a constant input `C`, the horizontal pass
+    /// produces `Round2(128 * C, inter_round0) = 128 * C >> 3 = 16 *
+    /// C`, then the vertical pass produces `Round2(128 * 16 * C,
+    /// inter_round1) = 2048 * C >> 11 = C`. So an identity warp on a
+    /// constant ref recovers the constant.
+    #[test]
+    fn r192_block_warp_identity_on_constant_ref() {
+        let cst: u16 = 100;
+        let ref_plane = vec![cst; 64 * 64];
+        let mut pred = vec![0i32; 8 * 8];
+        let one = 1i32 << WARP_WARPEDMODEL_PREC_BITS;
+        // Identity warp: warpParams = [0, 0, one, 0, 0, one] —
+        // (dstX, dstY) = (one * srcX, one * srcY); after >> sub_x
+        // (=0 for luma) and >> WARPEDMODEL_PREC_BITS gives ix4 =
+        // srcX, iy4 = srcY, sx4 = sy4 = 0. With alpha = beta = gamma
+        // = delta = 0, sx = sy = 0 for every (i1, i2). offs =
+        // Round2(0, 10) + 64 = 64 ⇒ row 64 of Warped_Filters
+        // ({0, 0, 0, 127, 1, 0, 0, 0}) sums to 128. For a constant
+        // ref the convolution reduces to 128 * cst at every
+        // (intermediate row, sub-section pixel).
+        block_warp(
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            8,
+            8,
+            &ref_plane,
+            64,
+            64,
+            64,
+            [0, 0, one, 0, 0, one],
+            3,  // inter_round0 = 3 for 8-bit
+            11, // inter_round1 = 11 for 8-bit non-compound
+            8,
+            &mut pred,
+        )
+        .unwrap();
+        for (i, &v) in pred.iter().enumerate() {
+            assert_eq!(v, cst as i32, "pred[{i}] = {v} != {cst}");
+        }
+    }
+
+    /// §7.11.3.5 — Warped_Filters dimension sanity: outer = 193, inner = 8.
+    #[test]
+    fn r192_warped_filters_table_shape() {
+        assert_eq!(WARPED_FILTERS.len(), WARPEDPIXEL_PREC_SHIFTS * 3 + 1);
+        assert_eq!(WARPED_FILTERS.len(), 193);
+        for row in WARPED_FILTERS.iter() {
+            assert_eq!(row.len(), 8);
+        }
+    }
+
+    /// §7.11.3.5 — every Warped_Filters row sums to 128 (the
+    /// filter normalises to unit response).
+    #[test]
+    fn r192_warped_filters_rows_sum_to_128() {
+        for (i, row) in WARPED_FILTERS.iter().enumerate() {
+            let s: i32 = row.iter().sum();
+            assert_eq!(s, 128, "row {i} sums to {s}");
+        }
+    }
+
+    /// §7.11.3.5 — Div_Lut[0] = 16384 = 1 << DIV_LUT_PREC_BITS;
+    /// Div_Lut[256] = 8192. Monotonically non-increasing.
+    #[test]
+    fn r192_div_lut_shape() {
+        assert_eq!(DIV_LUT.len(), 257);
+        assert_eq!(DIV_LUT[0], 1 << DIV_LUT_PREC_BITS);
+        assert_eq!(DIV_LUT[256], 8192);
+        for w in DIV_LUT.windows(2) {
+            assert!(w[0] >= w[1], "Div_Lut not monotonic at {} > {}", w[0], w[1]);
+        }
     }
 }

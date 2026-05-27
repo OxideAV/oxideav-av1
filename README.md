@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 191)
+## Status — 2026-05-28 (round 192)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,108 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 192 lifts the **§7.11.3.5-8 WARP motion compensation kernel** —
+the affine warp predictor that the §7.11.3.1 driver invokes on the
+LOCALWARP (`motion_mode == WARPED_CAUSAL` per §5.11.27) and
+GLOBAL_GLOBALMV (`§5.11.x` with `gm_type[refFrame] >= AFFINE`) arms.
+With r192 the only inter-prediction MC body still pending is OBMC
+(§7.11.3.9-10).
+
+Four new public bodies in `inter_pred`:
+
+* **§7.11.3.5 [`block_warp`]** — the warp kernel. Given a per-block
+  8-sample sub-section index `(i8, j8)`, the spec's 6-element
+  `warp_params` matrix, and the pre-computed shear coefficients, the
+  body projects each (`srcX`, `srcY`) through the affine matrix into
+  the reference frame, then applies the spec's two-pass 8-tap horizontal
+  + vertical convolution with phase index `Round2(sx,
+  WARPEDDIFF_PREC_BITS) + WARPEDPIXEL_PREC_SHIFTS` into the
+  `WARPED_FILTERS` table. The intermediate buffer is the spec-literal
+  `intermediate[15][8]` (`(i1+7, i2+4)` indexing for `i1 ∈ [-7, 8)`
+  and `i2 ∈ [-4, 4)`). The vertical pass clips its `i1` / `i2` upper
+  bounds against the residual block area (`Min(4, h - i8*8 - 4)` /
+  `Min(4, w - j8*8 - 4)`) per av1-spec p.267 lines 14895-14896. Output
+  is the §7.11.3.5 `Round2(s, InterRound1)` result, suitable for the
+  §7.11.3.1 compound or single-ref final-clip step.
+
+* **§7.11.3.6 [`setup_shear`]** — derives `(alpha, beta, gamma, delta,
+  warpValid)` from the 6-element warp matrix. `alpha0 = clip(
+  warpParams[2] - (1<<16))`, `beta0 = clip(warpParams[3])`, `gamma0`
+  / `delta0` use the §7.11.3.7 divisor of `warpParams[2]`, then each
+  is `Round2Signed(_, WARP_PARAM_REDUCE_BITS=6) << 6`. The final
+  bound `4|α| + 7|β| < 2^16` and `4|γ| + 4|δ| < 2^16` drives
+  `warpValid`. Returns `None` only on the divisor-fail
+  `warpParams[2] == 0` caller-bug input.
+
+* **§7.11.3.7 [`resolve_divisor`]** — the `(divFactor, divShift)`
+  fixed-point inverse helper. Computes `n = FloorLog2(|d|)`, `e = |d| -
+  (1 << n)`, `f = Round2(e, n - 8)` (or `e << (8 - n)`) into the 257-
+  entry `DIV_LUT` table. `divFactor` is negated when `d < 0`.
+  `divShift = n + DIV_LUT_PREC_BITS = n + 14`. Returns `None` for
+  `d == 0`.
+
+* **§7.11.3.8 [`warp_estimation`]** — least-squares fit of
+  `LocalWarpParams` from up to `LEAST_SQUARES_SAMPLES_MAX = 8`
+  `(sy, sx, dy, dx)` candidates produced by §7.10.4
+  `find_warp_samples`. Builds the symmetric 2×2 matrix `A` and length-2
+  arrays `Bx, By` via the spec's `ls_product(a, b) = ((a * b) >> 2) +
+  (a + b)` accumulator with the per-iter `+8 / +4` biases. The det = 0
+  short-circuit emits `LocalValid = false`. Otherwise the resolved
+  divisor of `det` drives `nondiag` / `diag` clamps on the four
+  affine entries, and the translation `(LocalWarpParams[0],
+  LocalWarpParams[1])` is derived from the current-block MV and
+  `(midX, midY)` with `WARPEDMODEL_TRANS_CLAMP = 1<<23` bounds.
+
+Plus the two transcribed tables (verbatim from av1-spec.txt lines
+14919-15036 and 15117-15140):
+
+* **[`WARPED_FILTERS`]** — `[i32; 8]; 193` (= `3 * 64 + 1` =
+  `WARPEDPIXEL_PREC_SHIFTS * 3 + 1`). Every row sums to 128 (the
+  filter normalises to unit response across its 8 taps).
+
+* **[`DIV_LUT`]** — `[i32; 257]`. Monotonically non-increasing from
+  `16384 = 1 << DIV_LUT_PREC_BITS` (at index 0) to `8192 = 1 << 13`
+  (at index 256).
+
+Plus the supporting constants `WARP_WARPEDMODEL_PREC_BITS = 16`,
+`WARP_PARAM_REDUCE_BITS = 6`, `DIV_LUT_PREC_BITS = 14`, `DIV_LUT_BITS
+= 8`, `DIV_LUT_NUM = 257`, `LS_MV_MAX = 256`,
+`WARPEDMODEL_TRANS_CLAMP = 1<<23`, `WARPEDMODEL_NONDIAGAFFINE_CLAMP =
+1<<13`, `WARPEDPIXEL_PREC_SHIFTS = 64`, `WARPEDDIFF_PREC_BITS = 10`,
+`USE_WARP_LOCAL = 1`, `USE_WARP_GLOBAL = 2`.
+
+Test count: 983 → 998 (+15 in lib). New tests include
+`r192_resolve_divisor_zero_returns_none`,
+`r192_resolve_divisor_basic_inverse` (d ∈ {1, 256, 1024} all yield
+`Round2Signed(d * divFactor, divShift) ≈ 1`),
+`r192_resolve_divisor_negative_flips_sign`,
+`r192_setup_shear_identity_is_zero` (`[0, 0, 1<<16, 0, 0, 1<<16]` ⇒
+shear quad `(0, 0, 0, 0)` + `warpValid = true`),
+`r192_setup_shear_zero_diag_is_caller_bug`,
+`r192_setup_shear_small_horizontal_shear` (`warpParams[2] = (1<<16) +
+64` ⇒ `alpha = 64`), `r192_setup_shear_rejects_unstable_factorisation`
+(`alpha = 16384` ⇒ `4|α| = 1<<16` ⇒ NOT strictly < ⇒ invalid),
+`r192_warp_estimation_empty_cands_is_invalid`,
+`r192_warp_estimation_single_cand_is_invalid` (single zero-vector
+sample with the `+8 / +4` per-iter biases gives det = 48 ≠ 0 ⇒
+formally valid; documents the spec's per-sample bias inflation),
+`r192_block_warp_rejects_invalid_use_warp` /
+`r192_block_warp_rejects_invalid_dims`,
+`r192_block_warp_identity_on_constant_ref` (identity warp on a
+constant-100 ref plane recovers `pred[i, j] = 100` at every of the
+8×8 output cells via the 128-sum filter normalisation chain through
+`Round2(128 * 100, 3)` then `Round2(128 * 16 * 100, 11)`),
+`r192_warped_filters_table_shape` / `r192_warped_filters_rows_sum_to_128`,
+`r192_div_lut_shape` (length 257, head 16384, tail 8192, monotonic).
+
+**Deferred to next arc.** §7.11.3.9-10 OBMC + overlap blending (the
+last inter-pred MC body), §7.11.3.1 driver entry point that wires the
+five compound bodies + the §7.11.3.4 translational kernel + the new
+§7.11.3.5 warp kernel together against `RefFrames[refList]` plane
+buffers, §7.14 loop filter, §5.11.17 `read_var_tx_size` recursion
+(inter `TX_MODE_SELECT && !skip && !lossless` arm of §5.11.16),
+§5.11.22 intra-block-in-inter-frame stub.
 
 Round 191 lifts the **§7.11.3.11-15 compound bodies** — the
 bi-prediction blending step that combines two §7.11.3.4-formed

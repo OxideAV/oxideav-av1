@@ -1760,22 +1760,28 @@ pub use transform::{
 // the per-task `predict_inter` body itself remains a separate leaf
 // the caller invokes against a real `RefFrames[refList]` plane buffer
 // + per-block `(InterpFilters, Mvs, RefFrames)` triple. The
-// next-arc targets are §7.11.3.5 `block_warp` (LOCALWARP / GLOBAL
-// affine warp), §7.11.3.9 `overlapped_motion_compensation` (OBMC),
-// and the §7.11.3.11-15 compound-mask / blend arms.
+// next-arc targets are §7.11.3.9-10 `overlapped_motion_compensation`
+// (OBMC) and the §7.11.3.1 predict_inter driver wiring. The §7.11.3.5
+// `block_warp` / §7.11.3.6 `setup_shear` / §7.11.3.7 `resolve_divisor`
+// / §7.11.3.8 `warp_estimation` warp MC arm landed in r192. The
+// §7.11.3.11-15 compound-mask / blend arms landed in r191.
 pub use inter_pred::{
-    block_inter_prediction, block_shape, clip1_single_ref, compound_distance_blend,
+    block_inter_prediction, block_shape, block_warp, clip1_single_ref, compound_distance_blend,
     difference_weight_mask, distance_weights, get_relative_dist, intra_mode_variant_mask,
-    mask_blend, mask_blend_interintra, master_mask_table, motion_vector_scaling,
-    rounding_variables, select_interp_filter_small_block, wedge_mask, DistanceWeights, MvScale,
-    RoundingVars, COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_INTRA,
-    COMPOUND_WEDGE, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP, FILTER_BITS as INTER_FILTER_BITS,
-    II_DC_PRED, II_H_PRED, II_SMOOTH_PRED, II_V_PRED, II_WEIGHTS_1D, MASK_MASTER_SIZE,
-    MAX_FRAME_DISTANCE, MAX_SB_SIZE, QUANT_DIST_LOOKUP, QUANT_DIST_WEIGHT, REF_SCALE_SHIFT,
-    SCALE_SUBPEL_BITS, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, WEDGE_BITS, WEDGE_CODEBOOK,
-    WEDGE_DIRECTIONS, WEDGE_HORIZONTAL, WEDGE_MASTER_OBLIQUE_EVEN, WEDGE_MASTER_OBLIQUE_ODD,
-    WEDGE_MASTER_VERTICAL, WEDGE_OBLIQUE117, WEDGE_OBLIQUE153, WEDGE_OBLIQUE27, WEDGE_OBLIQUE63,
-    WEDGE_VERTICAL,
+    mask_blend, mask_blend_interintra, master_mask_table, motion_vector_scaling, resolve_divisor,
+    rounding_variables, select_interp_filter_small_block, setup_shear, warp_estimation, wedge_mask,
+    DistanceWeights, Divisor, LocalWarp, MvScale, RoundingVars, ShearParams, WarpSampleCand,
+    COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_WEDGE, DIV_LUT,
+    DIV_LUT_BITS, DIV_LUT_NUM, DIV_LUT_PREC_BITS, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP,
+    FILTER_BITS as INTER_FILTER_BITS, II_DC_PRED, II_H_PRED, II_SMOOTH_PRED, II_V_PRED,
+    II_WEIGHTS_1D, LEAST_SQUARES_SAMPLES_MAX as INTER_LEAST_SQUARES_SAMPLES_MAX, LS_MV_MAX,
+    MASK_MASTER_SIZE, MAX_FRAME_DISTANCE, MAX_SB_SIZE, QUANT_DIST_LOOKUP, QUANT_DIST_WEIGHT,
+    REF_SCALE_SHIFT, SCALE_SUBPEL_BITS, SUBPEL_BITS, SUBPEL_FILTERS, SUBPEL_MASK, USE_WARP_GLOBAL,
+    USE_WARP_LOCAL, WARPEDDIFF_PREC_BITS, WARPEDMODEL_NONDIAGAFFINE_CLAMP, WARPEDMODEL_TRANS_CLAMP,
+    WARPEDPIXEL_PREC_SHIFTS, WARPED_FILTERS, WARP_PARAM_REDUCE_BITS, WARP_WARPEDMODEL_PREC_BITS,
+    WEDGE_BITS, WEDGE_CODEBOOK, WEDGE_DIRECTIONS, WEDGE_HORIZONTAL, WEDGE_MASTER_OBLIQUE_EVEN,
+    WEDGE_MASTER_OBLIQUE_ODD, WEDGE_MASTER_VERTICAL, WEDGE_OBLIQUE117, WEDGE_OBLIQUE153,
+    WEDGE_OBLIQUE27, WEDGE_OBLIQUE63, WEDGE_VERTICAL,
 };
 pub use uncompressed_header_tail::{
     parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,
@@ -1948,10 +1954,12 @@ pub enum Error {
     /// the §7.11.3.4 translational MC sample-generation leaf is the
     /// standalone helper [`crate::block_inter_prediction`] (with
     /// supporting [`crate::motion_vector_scaling`] for §7.11.3.3 and
-    /// [`crate::rounding_variables`] for §7.11.3.2). The remaining
-    /// §7.11.3.5 warp (LOCALWARP / GLOBAL_GLOBALMV affine), §7.11.3.9
-    /// OBMC, and §7.11.3.11-15 compound-mask / blend bodies are
-    /// next-arc.
+    /// [`crate::rounding_variables`] for §7.11.3.2). Per r191 the
+    /// §7.11.3.11-15 compound-mask / blend bodies landed; per r192 the
+    /// §7.11.3.5-8 WARP MC kernel landed via [`crate::block_warp`] /
+    /// [`crate::setup_shear`] / [`crate::resolve_divisor`] /
+    /// [`crate::warp_estimation`]. The remaining §7.11.3.9-10 OBMC
+    /// bodies are next-arc.
     ///
     /// This variant is retained for API stability and as a defensive
     /// fallback — the dispatcher no longer constructs it on the
@@ -2300,7 +2308,7 @@ impl core::fmt::Display for Error {
             ),
             Self::ComputePredictionInterUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.33 compute_prediction reached §7.11.3 predict_inter — defensive fallback retained post-r191 (§7.11.3.4 translational MC kernel landed via inter_pred::block_inter_prediction; §7.11.3.11 wedge_mask / §7.11.3.12 difference_weight_mask / §7.11.3.13 intra_mode_variant_mask / §7.11.3.14 mask_blend / §7.11.3.15 distance_weights compound bodies landed; §7.11.3.5 warp + §7.11.3.9 OBMC still pending next-arc)"
+                "oxideav-av1: §5.11.33 compute_prediction reached §7.11.3 predict_inter — defensive fallback retained post-r192 (§7.11.3.4 translational MC kernel via inter_pred::block_inter_prediction; §7.11.3.11-15 compound bodies (wedge / diffwtd / intra / mask_blend / distance) per r191; §7.11.3.5-8 WARP MC via block_warp / setup_shear / resolve_divisor / warp_estimation per r192; §7.11.3.9-10 OBMC still pending next-arc, plus the predict_inter driver wiring)"
             ),
             Self::ComputePredictionInterIntraUnsupported => write!(
                 f,
