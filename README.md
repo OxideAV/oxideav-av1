@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 189)
+## Status — 2026-05-28 (round 190)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,87 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 190 is the **`decode_block_syntax` inter-arm wire-up** —
+integration arc that lifts the historical
+`Error::DecodeBlockInterFrameUnsupported` short-circuit from the
+§5.11.5 walker and threads MV / ref-frame / interp-filter state from
+the §5.11.18 dispatcher into the §5.11.33 `compute_prediction` inter
+arm (per r189) and the §5.11.34 `residual()` `is_inter && !Lossless
+&& !plane` `transform_tree` arm.
+
+The change set:
+
+* `decode_block_syntax` and `decode_partition_syntax` grow an
+  `inter_ctx: Option<&InterFrameContext>` last argument. `None`
+  preserves the pre-r190 stub on `frame_is_intra == false` (legacy
+  callers see no behaviour change); `Some(&ctx)` routes through the
+  full §5.11.18 cascade and onward into prediction + residual.
+* A new public `InterFrameContext` struct bundles the 25+ per-frame
+  scalars `decode_inter_frame_mode_info` consumes (segmentation
+  overrides, `skip_mode_present`, `skip_mode_frame[]`,
+  `reference_select`, the §5.9.24 `gm_type` / `gm_params` /
+  `ref_frame_sign_bias` triple, `allow_high_precision_mv` /
+  `force_integer_mv` / `use_ref_frame_mvs`, the §5.11.27
+  motion-mode trio `is_motion_mode_switchable` /
+  `allow_warped_motion` / `is_scaled_per_ref[]`, the §5.11.28 /
+  §5.11.29 compound-blend quad `enable_interintra_compound` /
+  `enable_masked_compound` / `enable_jnt_comp` / `dist_equal`, and
+  the §5.11.x interp-filter pair `interpolation_filter` /
+  `enable_dual_filter`). An `identity_default()` constructor seeds
+  every flag off, identity §5.9.24 warp params
+  (`gm_params[ref][2] = gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`,
+  `gm_type = [GM_TYPE_IDENTITY; 8]`), and `EIGHTTAP` interp filter.
+* The §5.11.18 `decode_inter_frame_mode_info` dispatcher's `Ok(_)`
+  arm is lifted from `Err(InterBlockModeInfoUnsupported)` to
+  `Ok(DecodedInterFrameModeInfo { inter_block: Some(_), .. })`. A
+  new `inter_block: Option<DecodedInterBlockModeInfo>` field on
+  the aggregate carries the §5.11.23 readout through to the
+  §5.11.5 walker.
+* An internal `decode_block_syntax_inter_arm` helper bundles the
+  §5.11.5 inter-arm composition: §5.11.18 cascade → §5.11.16
+  `read_block_tx_size` (the §5.11.17 var-tx-size recursion is a
+  next-arc target, the walker uses the §5.11.15 `else` arm
+  fallback) → §5.11.33 `compute_prediction` (inter arm) → §5.11.34
+  `residual` (the `is_inter && !Lossless && !plane`
+  `transform_tree` arm fires on luma; chroma uses the direct
+  iteration path).
+
+End-to-end smoke: a P-frame `BLOCK_8X8` block with
+`seg_globalmv_active = true` (§5.11.20 third arm forces
+`is_inter = 1` without an S() read), `seg_skip_active = false`, no
+compound, no interintra, no warp, identity globalmv ⇒ MV = [0, 0],
+walks cleanly through every leaf. The §5.11.31 grid stamp records
+the MV over the `bw4 * bh4` footprint; the §5.11.18 grid stamp
+records `IsInters[r][c] = 1` over the same footprint.
+
+The §5.11.18 `is_inter == 0` arm of an inter frame (the §5.11.22
+intra-block stub) is unchanged — that arm still surfaces
+`Err(IntraBlockModeInfoUnsupported)` for the next arc.
+
+Test count: 949 → 954 (+5). New tests:
+`r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion`
+(end-to-end on the `seg_globalmv_active` path);
+`r190_decode_partition_syntax_with_inter_ctx_routes_through_inter_arm`
+(the §5.11.4 partition driver propagates the inter context to its
+`BLOCK_4X4` leaf);
+`r190_decode_block_syntax_inter_arm_without_ctx_keeps_legacy_stub`
+(`None` preserves the historical short-circuit);
+`r190_inter_frame_context_identity_default_matches_spec_identity_warp`
+(`identity_default()` matches the §5.9.24 identity-warp defaults);
+`r190_decoded_inter_frame_mode_info_intra_arm_still_stubs` (the
+§5.11.22 intra-arm stub is unchanged). Two pre-existing
+`decode_inter_frame_mode_info_*` tests were converted from
+asserting `Err(InterBlockModeInfoUnsupported)` to asserting
+`Ok(_)` with `inter_block: Some(_)` populated.
+
+**Deferred to subsequent arcs.** §7.11.3.5–8 warp / shear /
+divisor / warp-estimation (LOCALWARP / GLOBAL_GLOBALMV affine
+warp), §7.11.3.9–10 OBMC + overlap blending, §7.11.3.11–15
+compound bodies (wedge_mask / diff weight / mask_blend /
+distance_weights), §7.14 loop filter. The §5.11.17 `read_var_tx_size`
+recursion (inter `TX_MODE_SELECT && !skip && !lossless` arm of
+§5.11.16). The §5.11.22 intra-block-in-inter-frame stub.
 
 Round 189 lifts the **§7.11.3 inter prediction process** (av1-spec
 p.257-265) — the translational single-reference motion-compensation

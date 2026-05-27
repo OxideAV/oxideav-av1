@@ -18522,7 +18522,7 @@ impl PartitionWalker {
         // else intra_block_mode_info()`. Surface the pre-dispatch
         // aggregate first so callers observe the §5.11.18 prologue
         // state regardless of which terminal path fires.
-        let info = DecodedInterFrameModeInfo {
+        let mut info = DecodedInterFrameModeInfo {
             mi_row,
             mi_col,
             mi_size: sub_size,
@@ -18543,8 +18543,8 @@ impl PartitionWalker {
             current_q_index,
             current_delta_lf,
             is_inter,
+            inter_block: None,
         };
-        let _ = info;
         if is_inter != 0 {
             // r176: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
             // §7.10 `find_mv_stack` (spatial-only path) + the §5.11.23
@@ -18598,21 +18598,22 @@ impl PartitionWalker {
                 interpolation_filter,
                 enable_dual_filter,
             ) {
-                Ok(_inter_info) => {
-                    // r178: the §5.11.x `read_interpolation_filter`
-                    // body now runs to completion inside
-                    // `decode_inter_block_mode_info`, completing the
-                    // §5.11.23 inter cascade. The next-arc target is
-                    // §5.11.34 `residual()` (opens the coefficient
-                    // cascade); the [`DecodedInterFrameModeInfo`]
-                    // aggregate does not yet surface the inter-arm
-                    // body, so we still emit the historical
-                    // `InterBlockModeInfoUnsupported` stub for the
-                    // dispatcher's `Ok(_)` arm pending the §5.11.34
-                    // arc and a follow-on refactor that lifts the
-                    // [`DecodedInterBlockModeInfo`] aggregate into the
-                    // [`DecodedInterFrameModeInfo`] return path.
-                    Err(crate::Error::InterBlockModeInfoUnsupported)
+                Ok(inter_info) => {
+                    // r190: lift the historical
+                    // `InterBlockModeInfoUnsupported` stub. The
+                    // §5.11.23 inter cascade
+                    // (`read_ref_frames` / `find_mv_stack` / YMode
+                    // dispatch / `assign_mv` / `read_motion_mode` /
+                    // `read_interintra_mode` / `read_compound_type` /
+                    // `read_interpolation_filter`) is fully wired as
+                    // of r178; the per-block aggregate is now plumbed
+                    // through [`DecodedInterFrameModeInfo::inter_block`]
+                    // so the §5.11.5
+                    // [`Self::decode_block_syntax`] walker can thread
+                    // MV / ref-frame / interp-filter into
+                    // `compute_prediction` + `residual`.
+                    info.inter_block = Some(inter_info);
+                    Ok(info)
                 }
                 Err(e) => Err(e),
             }
@@ -23022,6 +23023,17 @@ impl PartitionWalker {
         // (`read_tx_mode`); `false` corresponds to `TX_MODE_LARGEST`
         // / `ONLY_4X4`.
         tx_mode_select: bool,
+        // r190: optional inter-arm context bundle. `None` ⇒ the
+        // walker keeps the pre-r190 short-circuit on the
+        // `frame_is_intra == false` branch
+        // (`Err(crate::Error::DecodeBlockInterFrameUnsupported)`),
+        // matching legacy intra-only callers. `Some(&ctx)` ⇒ the
+        // §5.11.18 `inter_frame_mode_info()` dispatcher runs to
+        // completion, the §5.11.23 inter-block aggregate is plumbed
+        // through to [`Self::compute_prediction`] +
+        // [`Self::residual`], and the walker advances past the
+        // historical r189 stub site.
+        inter_ctx: Option<&InterFrameContext>,
     ) -> Result<DecodedBlock, crate::Error> {
         // §5.11.5 prologue — range guards (caller-bug detection).
         if sub_size >= BLOCK_SIZES {
@@ -23129,7 +23141,56 @@ impl PartitionWalker {
         // stub — direct callers of `decode_inter_frame_mode_info` get
         // the §5.11.22 / §5.11.23 distinction.
         if !frame_is_intra {
-            return Err(crate::Error::DecodeBlockInterFrameUnsupported);
+            // r190 wire-up — route through the §5.11.18
+            // [`Self::decode_inter_frame_mode_info`] dispatcher when the
+            // caller supplies an [`InterFrameContext`]. The cascade
+            // (§5.11.18 prologue + §5.11.20 `read_is_inter` + §5.11.23
+            // inter-block body if `is_inter == 1`, else §5.11.22 stub)
+            // runs to completion; the §5.11.5 walker then threads the
+            // resulting MV / ref-frame / interp-filter state into
+            // [`Self::compute_prediction`] (the §5.11.33 inter arm
+            // already emits per-4x4 inter tasks per r189) and
+            // [`Self::residual`] (the §5.11.34 `is_inter && !Lossless
+            // && !plane` `transform_tree` arm). Callers passing `None`
+            // (the historical signature) keep the pre-r190 stub.
+            let ctx = match inter_ctx {
+                Some(c) => c,
+                None => return Err(crate::Error::DecodeBlockInterFrameUnsupported),
+            };
+            return self.decode_block_syntax_inter_arm(
+                decoder,
+                cdfs,
+                mi_row_b,
+                mi_col_b,
+                sub_size,
+                bw4,
+                bh4,
+                has_chroma,
+                avail_u,
+                avail_l,
+                avail_u_chroma,
+                avail_l_chroma,
+                subsampling_x,
+                subsampling_y,
+                seg_id_pre_skip,
+                segmentation_enabled,
+                seg_skip_active,
+                last_active_seg_id,
+                lossless_array,
+                coded_lossless,
+                enable_cdef,
+                allow_intrabc,
+                cdef_bits,
+                read_deltas,
+                use_128x128_superblock,
+                delta_q_res,
+                delta_lf_present,
+                delta_lf_multi,
+                mono_chrome,
+                delta_lf_res,
+                tx_mode_select,
+                ctx,
+            );
         }
         let prefix = self.decode_intra_frame_mode_info_prefix(
             decoder,
@@ -23391,6 +23452,254 @@ impl PartitionWalker {
         // Suppress the per-block `is_compound` unused-variable note.
         let _ = is_compound;
         Ok(db)
+    }
+
+    /// r190 — internal helper: §5.11.6 inter-arm completion of the
+    /// [`Self::decode_block_syntax`] dispatch. Invoked when the caller
+    /// passes `frame_is_intra == false` AND an
+    /// [`InterFrameContext`]; the §5.11.5 prologue has already
+    /// committed to the `(bw4, bh4, has_chroma, avail_*)` derivations
+    /// the intra arm consumes, so we reuse them here.
+    ///
+    /// Composes the §5.11.18 dispatcher
+    /// ([`Self::decode_inter_frame_mode_info`]) covering the pre-skip,
+    /// skip, post-skip segment-id cascade plus the §5.11.23
+    /// inter-block body when `is_inter == 1`; then §5.11.16
+    /// [`Self::read_block_tx_size`] (var-tx recursion is a next-arc
+    /// target, we use the §5.11.15 `else` arm for r190); then §5.11.33
+    /// [`Self::compute_prediction`] emitting one
+    /// [`PlanePredictionTask`] per (plane, 4x4 cell) with `mode ==
+    /// COMPUTE_PRED_MODE_INTER` per r189; then §5.11.34
+    /// [`Self::residual`] whose `is_inter && !Lossless && !plane`
+    /// transform_tree arm fires on luma (chroma uses the direct
+    /// iteration path).
+    ///
+    /// Returns the per-block [`DecodedBlock`] aggregate with the
+    /// `is_inter == 1` arm's fields populated. Returns the inner
+    /// dispatcher's error variant otherwise — the
+    /// `IntraBlockModeInfoUnsupported` stub on the §5.11.22 (intra
+    /// arm of an inter-frame) path is still a next-arc target;
+    /// every other error variant matches the §5.11.18 / §5.11.23
+    /// reader contracts.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_block_syntax_inter_arm(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        bw4: u32,
+        bh4: u32,
+        has_chroma: bool,
+        avail_u: bool,
+        avail_l: bool,
+        avail_u_chroma: bool,
+        avail_l_chroma: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        seg_id_pre_skip: bool,
+        segmentation_enabled: bool,
+        seg_skip_active: bool,
+        last_active_seg_id: u8,
+        lossless_array: &[bool; MAX_SEGMENTS],
+        coded_lossless: bool,
+        enable_cdef: bool,
+        allow_intrabc: bool,
+        cdef_bits: u32,
+        read_deltas: bool,
+        use_128x128_superblock: bool,
+        delta_q_res: u8,
+        delta_lf_present: bool,
+        delta_lf_multi: bool,
+        mono_chrome: bool,
+        delta_lf_res: u8,
+        tx_mode_select: bool,
+        ctx: &InterFrameContext,
+    ) -> Result<DecodedBlock, crate::Error> {
+        // §5.11.6 inter arm — full §5.11.18 cascade.
+        let info = self.decode_inter_frame_mode_info(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            seg_id_pre_skip,
+            segmentation_enabled,
+            ctx.segmentation_update_map,
+            ctx.segmentation_temporal_update,
+            ctx.predicted_segment_id,
+            last_active_seg_id,
+            lossless_array,
+            ctx.seg_skip_mode_off,
+            ctx.seg_ref_frame_active,
+            ctx.seg_ref_frame_is_inter,
+            ctx.seg_globalmv_active,
+            ctx.skip_mode_present,
+            coded_lossless,
+            enable_cdef,
+            allow_intrabc,
+            cdef_bits,
+            read_deltas,
+            use_128x128_superblock,
+            delta_q_res,
+            delta_lf_present,
+            delta_lf_multi,
+            mono_chrome,
+            delta_lf_res,
+            ctx.skip_mode_frame,
+            seg_skip_active,
+            ctx.seg_ref_frame_data,
+            ctx.reference_select,
+            ctx.gm_type,
+            ctx.gm_params,
+            ctx.ref_frame_sign_bias,
+            ctx.allow_high_precision_mv,
+            ctx.force_integer_mv,
+            ctx.use_ref_frame_mvs,
+            ctx.is_motion_mode_switchable,
+            ctx.allow_warped_motion,
+            ctx.is_scaled_per_ref,
+            ctx.enable_interintra_compound,
+            ctx.enable_masked_compound,
+            ctx.enable_jnt_comp,
+            ctx.dist_equal,
+            ctx.interpolation_filter,
+            ctx.enable_dual_filter,
+        )?;
+
+        // §5.11.18 `is_inter == 0` (intra inside an inter frame) is
+        // surfaced by the dispatcher as
+        // `Err(IntraBlockModeInfoUnsupported)`; the `Ok(_)` arm
+        // therefore guarantees `is_inter == 1`. Surface a
+        // defense-in-depth assert so a future spec/reader change is
+        // caught at the boundary.
+        debug_assert_eq!(
+            info.is_inter, 1,
+            "§5.11.18 Ok(_) arm implies inter (intra arm is stubbed at IntraBlockModeInfoUnsupported)"
+        );
+        let inter_block = info
+            .inter_block
+            .ok_or(crate::Error::InterBlockModeInfoUnsupported)?;
+
+        // §5.11.5 line `read_block_tx_size( )` — §5.11.16 reader. The
+        // walker emits a [`DecodedBlockRecord`] (mirrors the intra
+        // arm), then performs the §5.11.16 read.
+        self.decode_block(mi_row, mi_col, sub_size);
+        let tx_size = self.read_block_tx_size(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            info.lossless,
+            /* is_inter = */ true,
+            /* skip = */ info.skip != 0,
+            tx_mode_select,
+        )?;
+
+        // §5.11.5 `isCompound = RefFrame[1] > INTRA_FRAME` from the
+        // §5.11.23 aggregate (slot 1 in `LAST_FRAME = 1..=ALTREF_FRAME
+        // = 7` ⇒ true; `NONE = -1` or `INTRA_FRAME = 0` ⇒ false).
+        let is_compound = inter_block.is_compound;
+
+        // §5.11.33 `IsInterIntra = is_inter && RefFrame[1] ==
+        // INTRA_FRAME`. The §5.11.28 inner `if ( interintra )` arm
+        // imperatively sets `RefFrame[1] = INTRA_FRAME = 0`; we read
+        // back the post-grid-stamp slot-1 value to drive the
+        // `compute_prediction` `IsInterIntra` gate.
+        let ref_frame_1 = inter_block.ref_frame[1];
+        let ref_frame_1_is_intra = ref_frame_1 == 0;
+
+        // §5.11.33 chroma plane mode-info: the §5.11.28
+        // interintra path supplies a chroma intra mode (the
+        // §5.11.28 inner arm sets `UVMode = DC_PRED`); on the
+        // non-interintra path the §5.11.33 chroma arm is unused
+        // for an inter block (`is_inter == 1`) and the per-plane
+        // task carries `mode == COMPUTE_PRED_MODE_INTER`.
+        let uv_mode_for_compute = 0u8; // DC_PRED — the §5.11.28 inner arm's default
+
+        // §5.11.5 line `compute_prediction( )` — §5.11.33 dispatcher.
+        // r189 emits one inter [`PlanePredictionTask`] per
+        // (plane, 4x4-cell) on the `is_inter == 1` arm.
+        let _readout = self.compute_prediction(
+            mi_row,
+            mi_col,
+            sub_size,
+            has_chroma,
+            avail_u,
+            avail_l,
+            avail_u_chroma,
+            avail_l_chroma,
+            subsampling_x,
+            subsampling_y,
+            /* is_inter = */ true,
+            /* y_mode = */ inter_block.y_mode,
+            /* uv_mode = */ uv_mode_for_compute,
+            ref_frame_1_is_intra,
+        )?;
+
+        // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
+        // The §5.11.34 `is_inter && !Lossless && !plane`
+        // `transform_tree` arm fires on the luma plane; chroma
+        // falls through to the direct iteration path. As with the
+        // intra arm we feed a neutral `ResidualContext` until the
+        // §5.9.12 / §5.9.14 quantizer context is plumbed through
+        // the §5.11.5 walker signature.
+        let neutral_ctx = ResidualContext {
+            quant: QuantizerParams::neutral(0, 8),
+            reduced_tx_set: false,
+            intra_dir: 0,
+            segment_id: info.segment_id,
+            seg_qm_level: [15, 15, 15],
+            uv_mode: 0,
+        };
+        let _residual = self.residual(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            has_chroma,
+            subsampling_x,
+            subsampling_y,
+            /* is_inter = */ true,
+            info.lossless,
+            info.skip != 0,
+            tx_size as usize,
+            use_128x128_superblock,
+            &neutral_ctx,
+        )?;
+
+        Ok(DecodedBlock {
+            mi_row,
+            mi_col,
+            mi_size: sub_size,
+            bw4,
+            bh4,
+            has_chroma,
+            avail_u,
+            avail_l,
+            avail_u_chroma,
+            avail_l_chroma,
+            skip: info.skip,
+            skip_mode: info.skip_mode,
+            segment_id: info.segment_id,
+            lossless: info.lossless,
+            cdef_idx: info.cdef_idx,
+            current_q_index: info.current_q_index,
+            current_delta_lf: info.current_delta_lf,
+            // §5.11.23 `RefFrame[0..2]` from the inter aggregate.
+            ref_frame: [
+                inter_block.ref_frame[0] as i8,
+                inter_block.ref_frame[1] as i8,
+            ],
+            use_intrabc: info.use_intrabc,
+            is_inter: 1,
+            y_mode: inter_block.y_mode,
+            is_compound,
+            tx_size,
+        })
     }
 
     /// `compute_prediction()` per §5.11.33 (av1-spec p.82-83) — the
@@ -24690,6 +24999,10 @@ impl PartitionWalker {
         mono_chrome: bool,
         delta_lf_res: u8,
         tx_mode_select: bool,
+        // r190: optional inter-arm context. See
+        // [`Self::decode_block_syntax`]'s `inter_ctx` parameter for
+        // the contract.
+        inter_ctx: Option<&InterFrameContext>,
     ) -> Result<(), crate::Error> {
         // §5.11.4 line 1: `if ( r >= MiRows || c >= MiCols ) return 0`.
         if r >= self.mi_rows || c >= self.mi_cols {
@@ -24780,6 +25093,7 @@ impl PartitionWalker {
                     mono_chrome,
                     delta_lf_res,
                     tx_mode_select,
+                    inter_ctx,
                 )?
             };
         }
@@ -24828,6 +25142,7 @@ impl PartitionWalker {
                     mono_chrome,
                     delta_lf_res,
                     tx_mode_select,
+                    inter_ctx,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -24856,6 +25171,7 @@ impl PartitionWalker {
                     mono_chrome,
                     delta_lf_res,
                     tx_mode_select,
+                    inter_ctx,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -24884,6 +25200,7 @@ impl PartitionWalker {
                     mono_chrome,
                     delta_lf_res,
                     tx_mode_select,
+                    inter_ctx,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -24912,6 +25229,7 @@ impl PartitionWalker {
                     mono_chrome,
                     delta_lf_res,
                     tx_mode_select,
+                    inter_ctx,
                 )?;
             }
             PARTITION_HORZ_A => {
@@ -26880,6 +27198,162 @@ pub struct DecodedInterFrameModeInfo {
     pub current_delta_lf: [i32; FRAME_LF_COUNT],
     /// §5.11.18 line 22 result. `0` (intra) or `1` (inter).
     pub is_inter: u8,
+    /// §5.11.23 inter-arm body output (r190 wire-up). `Some(_)` when
+    /// the §5.11.18 `if ( is_inter )` arm fires and the §5.11.23
+    /// inter-block cascade (`read_ref_frames` / `find_mv_stack` /
+    /// YMode dispatch / `assign_mv` / `read_motion_mode` /
+    /// `read_interintra_mode` / `read_compound_type` /
+    /// `read_interpolation_filter`) completes. `None` on the
+    /// `is_inter == 0` (intra) arm or when the inter cascade returned
+    /// before completing. Prior to r190 the dispatcher returned
+    /// [`crate::Error::InterBlockModeInfoUnsupported`] on the `Ok(_)`
+    /// arm; r190 lifts that and surfaces the inner aggregate here so
+    /// the §5.11.5 [`PartitionWalker::decode_block_syntax`] walker can
+    /// thread the MV / ref-frame / interp-filter into
+    /// `compute_prediction` + `residual`.
+    pub inter_block: Option<DecodedInterBlockModeInfo>,
+}
+
+/// `InterFrameContext` — r190 bundle of the per-frame / per-segment
+/// scalars that [`PartitionWalker::decode_block_syntax`] passes through
+/// to [`PartitionWalker::decode_inter_frame_mode_info`] when wiring the
+/// §5.11.18 inter arm. Each field tracks a single §5.9 / §5.5.2 /
+/// §5.11.x derivation the §5.11.18 dispatcher consumes.
+///
+/// Callers staying on the §5.11.6 intra-only path pass `None` to
+/// [`PartitionWalker::decode_block_syntax`] / [`PartitionWalker::decode_partition_syntax`];
+/// the walker then preserves its pre-r190 short-circuit
+/// (`Err(crate::Error::DecodeBlockInterFrameUnsupported)`) on
+/// `frame_is_intra == false`. Callers wanting the §5.11.18 inter arm
+/// to run (and thread MV / ref-frame state into
+/// [`PartitionWalker::compute_prediction`] +
+/// [`PartitionWalker::residual`]) pass `Some(&ctx)` with the scalars
+/// derived from the §5.9 frame header and the §5.5.2 sequence header.
+///
+/// All fields mirror the
+/// [`PartitionWalker::decode_inter_frame_mode_info`] / [`PartitionWalker::decode_inter_block_mode_info`]
+/// argument shape one-to-one so callers can construct the context
+/// once per frame and reuse it across every per-block dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterFrameContext {
+    // ---- §5.9.14 / §6.10 segmentation state ----
+    /// `segmentation_update_map` (§5.9.14).
+    pub segmentation_update_map: bool,
+    /// `segmentation_temporal_update` (§5.9.14).
+    pub segmentation_temporal_update: bool,
+    /// `predictedSegmentId` for the current block per §5.11.19.
+    pub predicted_segment_id: u8,
+    /// `seg_feature_active(SEG_LVL_SKIP) || seg_feature_active(SEG_LVL_REF_FRAME)
+    /// || seg_feature_active(SEG_LVL_GLOBALMV)`-collapsed flag the
+    /// §5.11.10 `read_skip_mode` short-circuit consumes.
+    pub seg_skip_mode_off: bool,
+    /// `seg_feature_active(SEG_LVL_REF_FRAME)` for the current block's
+    /// `segment_id`.
+    pub seg_ref_frame_active: bool,
+    /// `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME`.
+    pub seg_ref_frame_is_inter: bool,
+    /// `seg_feature_active(SEG_LVL_GLOBALMV)` for the current block's
+    /// `segment_id`.
+    pub seg_globalmv_active: bool,
+    /// `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]` in `0..=7`.
+    pub seg_ref_frame_data: i32,
+    /// `skip_mode_present` (§5.9.22).
+    pub skip_mode_present: bool,
+    /// `SkipModeFrame[ 0..2 ]` per §5.9.22.
+    pub skip_mode_frame: [i32; 2],
+    /// `reference_select` / `frame_reference_mode` (§5.9.23).
+    pub reference_select: bool,
+    // ---- §7.10 / §5.9.24 global-motion + MV-stack state ----
+    /// `GmType[ refFrame ]` per §5.9.24, indexed in `0..NUM_REF_FRAMES = 0..8`.
+    pub gm_type: [i32; 8],
+    /// `gm_params[ refFrame ][ idx ]` per §5.9.24.
+    pub gm_params: [[i32; 6]; 8],
+    /// `RefFrameSignBias[ refFrame ]` per §7.8.
+    pub ref_frame_sign_bias: [i32; 8],
+    /// `allow_high_precision_mv` (§5.9.2).
+    pub allow_high_precision_mv: bool,
+    /// `force_integer_mv` (§5.9.2).
+    pub force_integer_mv: bool,
+    /// `use_ref_frame_mvs` (§5.9.2).
+    pub use_ref_frame_mvs: bool,
+    // ---- §5.11.27 motion-mode state ----
+    /// `is_motion_mode_switchable` (§5.9.2).
+    pub is_motion_mode_switchable: bool,
+    /// `allow_warped_motion` (§5.9.2).
+    pub allow_warped_motion: bool,
+    /// Per-`refFrame in LAST_FRAME..=ALTREF_FRAME = 1..=7` `is_scaled(refFrame)`
+    /// outcome per §5.11.27.
+    pub is_scaled_per_ref: [bool; 7],
+    // ---- §5.11.28 / §5.11.29 compound-blend state ----
+    /// `enable_interintra_compound` (§5.5.2).
+    pub enable_interintra_compound: bool,
+    /// `enable_masked_compound` (§5.5.2).
+    pub enable_masked_compound: bool,
+    /// `enable_jnt_comp` (§5.5.2).
+    pub enable_jnt_comp: bool,
+    /// `Abs(get_relative_dist(OrderHints[RefFrame[0]], OrderHint)) ==
+    /// Abs(get_relative_dist(OrderHints[RefFrame[1]], OrderHint))`
+    /// per §7.8.1.
+    pub dist_equal: bool,
+    // ---- §5.11.x interpolation-filter state ----
+    /// `interpolation_filter` (§5.9.10) — one of `EIGHTTAP..=SWITCHABLE = 0..=4`.
+    pub interpolation_filter: u8,
+    /// `enable_dual_filter` (§5.5.2).
+    pub enable_dual_filter: bool,
+}
+
+impl InterFrameContext {
+    /// Identity-default `InterFrameContext` — every flag off, segment
+    /// id `0`, `gm_params[ref][2] = gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`
+    /// (the §5.9.24 identity-warp defaults), zero MV / no skip-mode
+    /// frame, `EIGHTTAP` interp filter. Useful for tests + single-ref
+    /// non-segmented + non-compound P-frame fixtures that don't yet
+    /// exercise the segmentation / global-motion / compound paths.
+    ///
+    /// The `gm_params` slot pattern matches
+    /// [`PartitionWalker::decode_inter_frame_mode_info`]'s
+    /// "pass identity-default for callers that never run the inter arm"
+    /// guidance — `gm_params[ref][2] = gm_params[ref][5] = (1 <<
+    /// WARPEDMODEL_PREC_BITS) = 1 << 16 = 65536`.
+    pub fn identity_default() -> Self {
+        let mut gm_params = [[0i32; 6]; 8];
+        // §5.9.24 identity-warp defaults: slot 2 / slot 5 hold
+        // `1 << WARPEDMODEL_PREC_BITS = 1 << 16`. The other slots
+        // (0 / 1 / 3 / 4) hold zero for an identity affine.
+        let identity_scale: i32 = 1 << 16;
+        for row in gm_params.iter_mut() {
+            row[2] = identity_scale;
+            row[5] = identity_scale;
+        }
+        Self {
+            segmentation_update_map: false,
+            segmentation_temporal_update: false,
+            predicted_segment_id: 0,
+            seg_skip_mode_off: false,
+            seg_ref_frame_active: false,
+            seg_ref_frame_is_inter: false,
+            seg_globalmv_active: false,
+            seg_ref_frame_data: 0,
+            skip_mode_present: false,
+            skip_mode_frame: [0, -1],
+            reference_select: false,
+            gm_type: [GM_TYPE_IDENTITY; 8],
+            gm_params,
+            ref_frame_sign_bias: [0; 8],
+            allow_high_precision_mv: false,
+            force_integer_mv: false,
+            use_ref_frame_mvs: false,
+            is_motion_mode_switchable: false,
+            allow_warped_motion: false,
+            is_scaled_per_ref: [false; 7],
+            enable_interintra_compound: false,
+            enable_masked_compound: false,
+            enable_jnt_comp: false,
+            dist_equal: false,
+            interpolation_filter: crate::inter_pred::EIGHTTAP,
+            enable_dual_filter: false,
+        }
+    }
 }
 
 /// §5.11.22 per-block aggregate surfaced by

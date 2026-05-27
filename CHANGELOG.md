@@ -6,6 +6,58 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 190 — `decode_block_syntax` inter-arm wire-up.**
+  Integration arc lifting the historical
+  `Error::DecodeBlockInterFrameUnsupported` short-circuit from the
+  §5.11.5 walker and threading the §5.11.18 dispatcher's MV /
+  ref-frame / interp-filter state into the §5.11.33
+  `compute_prediction` inter arm (per r189) and the §5.11.34
+  `residual` `is_inter && !Lossless && !plane` `transform_tree`
+  arm.
+  * `PartitionWalker::decode_block_syntax` and
+    `PartitionWalker::decode_partition_syntax` grow an
+    `inter_ctx: Option<&InterFrameContext>` last argument.
+    Passing `None` preserves the historical short-circuit on
+    `frame_is_intra == false`; passing `Some(&ctx)` runs the
+    §5.11.18 cascade to completion.
+  * New public `InterFrameContext` struct bundling the 25+
+    per-frame / per-segment scalars
+    `decode_inter_frame_mode_info` consumes (segmentation
+    overrides, `skip_mode_present` / `skip_mode_frame[]`,
+    `reference_select`, §5.9.24 `gm_type` / `gm_params` /
+    `ref_frame_sign_bias`, MV-precision flags, motion-mode trio,
+    compound-blend quad, interp-filter pair). The
+    `identity_default()` constructor seeds every flag off,
+    identity warp params, `EIGHTTAP` interp filter.
+  * `DecodedInterFrameModeInfo` gains an
+    `inter_block: Option<DecodedInterBlockModeInfo>` field. The
+    §5.11.18 dispatcher's `Ok(_)` arm now populates it (lifting
+    the pre-r190 `Err(InterBlockModeInfoUnsupported)` stub) so the
+    §5.11.5 walker can read back the §5.11.23 outputs.
+  * Internal `PartitionWalker::decode_block_syntax_inter_arm`
+    helper composes §5.11.18 → §5.11.16 → §5.11.33 → §5.11.34 on
+    the inter path; returns a populated `DecodedBlock` with
+    `is_inter = 1`, `ref_frame[0..2]` carrying the §5.11.23
+    `ref_frame` output (cast `i32` → `i8` per the `DecodedBlock`
+    field type), `y_mode` carrying the §5.11.23 inter Y-mode
+    ordinal, `is_compound` from `RefFrame[1] > INTRA_FRAME`.
+  * Test count: 949 → 954 (+5). New tests in
+    `tests/decode_block_syntax_walker.rs`:
+    `r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion`
+    (end-to-end on the `seg_globalmv_active` path with identity
+    MV); `r190_decode_partition_syntax_with_inter_ctx_routes_through_inter_arm`
+    (the §5.11.4 driver propagates the context to its `BLOCK_4X4`
+    leaf); `r190_decode_block_syntax_inter_arm_without_ctx_keeps_legacy_stub`
+    (`None` preserves the historical short-circuit);
+    `r190_inter_frame_context_identity_default_matches_spec_identity_warp`
+    (constructor matches the §5.9.24 identity-warp defaults);
+    `r190_decoded_inter_frame_mode_info_intra_arm_still_stubs`
+    (the §5.11.22 stub on the `is_inter == 0` arm is unchanged).
+    Two pre-existing `decode_inter_frame_mode_info_*` tests were
+    converted from asserting `Err(InterBlockModeInfoUnsupported)`
+    to asserting `Ok(_)` with the new `inter_block: Some(_)`
+    field populated.
+
 * **Round 189 — §7.11.3 inter prediction process (translational
   single-reference MC kernel) per av1-spec p.257-265.** New
   `inter_pred` module exposing the three §7.11.3.{2,3,4} sample-

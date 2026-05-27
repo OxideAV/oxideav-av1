@@ -61,10 +61,10 @@
 //!   stub through the recursion.
 
 use oxideav_av1::{
-    DecodedBlock, DecodedInterFrameModeInfo, Error, PartitionWalker, SymbolDecoder, TileCdfContext,
-    TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8, GM_TYPE_IDENTITY, MAX_SEGMENTS,
-    MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS,
-    WARPEDMODEL_PREC_BITS,
+    DecodedBlock, DecodedInterFrameModeInfo, Error, InterFrameContext, PartitionWalker,
+    SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8,
+    GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4,
+    TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
 };
 
 /// Helper for r173 `decode_inter_frame_mode_info` tests: builds the
@@ -152,7 +152,7 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
         /* use_128x128_superblock = */ false, /* delta_q_res = */ 0,
         /* delta_lf_present = */ false, /* delta_lf_multi = */ false,
         /* mono_chrome = */ false, /* delta_lf_res = */ 0,
-        /* tx_mode_select = */ false,
+        /* tx_mode_select = */ false, /* inter_ctx = */ None,
     );
     let pos_after = dec.position();
 
@@ -247,6 +247,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, true, /* subsampling_x = */ 0,
             /* subsampling_y = */ 1, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
+            /* inter_ctx = */ None,
         );
         // r182: §5.11.34 cleanly returns Ok after §7.13 inverse transform.
         assert!(result.is_ok(), "arm 1 must return Ok(DecodedBlock)");
@@ -263,6 +264,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, true, /* subsampling_x = */ 1,
             /* subsampling_y = */ 0, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
+            /* inter_ctx = */ None,
         );
         assert!(result.is_ok(), "arm 2 must return Ok(DecodedBlock)");
     }
@@ -277,7 +279,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
         let result = walker.decode_block_syntax(
             &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, true, 0, 0, /* num_planes = */ 1, false,
             false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, true,
-            0, false,
+            0, false, /* inter_ctx = */ None,
         );
         assert!(result.is_ok(), "arm 3 must return Ok(DecodedBlock)");
     }
@@ -298,14 +300,14 @@ fn decode_block_syntax_inter_frame_arm_returns_stub() {
     let result = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* frame_is_intra = */ false, 0, 0, 3, false,
         false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0,
-        false,
+        false, /* inter_ctx = */ None,
     );
     let pos_after = dec.position();
 
     assert_eq!(
         result,
         Err(Error::DecodeBlockInterFrameUnsupported),
-        "§5.11.6 inter-frame arm must surface the §5.11.18 stub"
+        "§5.11.6 inter-frame arm with `inter_ctx = None` keeps the historical §5.11.18 stub"
     );
     // The §5.11.5 prologue derives sizes / availability without
     // touching the bitstream cursor — the inter stub fires before
@@ -339,6 +341,7 @@ fn decode_block_syntax_intra_pre_skip_arm_reaches_stub() {
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, true, 0, 0, 3, /* seg_id_pre_skip = */ true,
         /* segmentation_enabled = */ true, false, /* last_active_seg_id = */ 7,
         &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        /* inter_ctx = */ None,
     );
 
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
@@ -365,6 +368,7 @@ fn decode_block_syntax_rejects_out_of_range() {
     let r = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 8, 0, BLOCK_8X8, true, 0, 0, 3, false, false, false, 0, &lossless,
         false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        /* inter_ctx = */ None,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 
@@ -372,6 +376,7 @@ fn decode_block_syntax_rejects_out_of_range() {
     let r = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 8, BLOCK_8X8, true, 0, 0, 3, false, false, false, 0, &lossless,
         false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        /* inter_ctx = */ None,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 
@@ -379,6 +384,7 @@ fn decode_block_syntax_rejects_out_of_range() {
     let r = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, /* sub_size = */ 999, true, 0, 0, 3, false, false, false,
         0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        /* inter_ctx = */ None,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 }
@@ -409,7 +415,7 @@ fn decode_partition_syntax_routes_leaf_through_decode_block_syntax() {
     let result = walker.decode_partition_syntax(
         &mut dec, &mut cdfs, /* r = */ 0, /* c = */ 0, /* b_size = */ BLOCK_4X4,
         /* frame_is_intra = */ true, 0, 0, 3, false, false, false, 0, &lossless, false, true,
-        false, 0, false, false, 0, false, false, false, 0, false,
+        false, 0, false, false, 0, false, false, false, 0, false, /* inter_ctx = */ None,
     );
 
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
@@ -443,7 +449,7 @@ fn decode_partition_syntax_out_of_grid_short_circuits() {
     let result = walker.decode_partition_syntax(
         &mut dec, &mut cdfs, /* r = */ 4, /* c = */ 0, BLOCK_8X8, true, 0, 0, 3, false,
         false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0,
-        false,
+        false, /* inter_ctx = */ None,
     );
 
     assert_eq!(
@@ -511,6 +517,7 @@ fn decode_block_syntax_block_8x16_grid_fill_footprint() {
     let result = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X16, true, 0, 0, 3, false, false, false, 0, &lossless,
         false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        /* inter_ctx = */ None,
     );
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
     assert!(
@@ -578,6 +585,7 @@ fn decode_block_syntax_cdef_bits_two_reaches_stub() {
         false,
         0,
         /* tx_mode_select = */ false,
+        /* inter_ctx = */ None,
     );
     let pos_after = dec.position();
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
@@ -1011,6 +1019,7 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
         false,
         0,
         /* tx_mode_select = */ true,
+        /* inter_ctx = */ None,
     );
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
     assert!(
@@ -1424,11 +1433,24 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
     );
-    assert_eq!(
-        result,
-        Err(Error::InterBlockModeInfoUnsupported),
-        "r175: seg_ref_frame_active + is_inter ⇒ §5.11.25 read_ref_frames + §7.10 find_mv_stack + §5.11.27 read_motion_mode (SIMPLE short-circuit on !is_motion_mode_switchable) ⇒ §5.11.18 dispatcher's Ok-arm InterBlockModeInfoUnsupported stub for the pending post-`read_motion_mode` cascade"
-    );
+    // r190 — the §5.11.18 dispatcher's `Ok(_)` arm now lifts the
+    // historical `InterBlockModeInfoUnsupported` stub and surfaces
+    // the §5.11.23 inter-block aggregate through
+    // `DecodedInterFrameModeInfo::inter_block`. With
+    // `seg_ref_frame_active = true` + `is_inter = 1` the §5.11.23
+    // cascade runs to completion (`read_ref_frames` /
+    // `find_mv_stack` / `assign_mv` / `read_motion_mode` /
+    // `read_interintra_mode` / `read_compound_type` /
+    // `read_interpolation_filter`).
+    let info = result.expect("§5.11.18 inter cascade should now complete (r190 wire-up)");
+    assert_eq!(info.is_inter, 1);
+    let inter = info
+        .inter_block
+        .expect("§5.11.18 `is_inter == 1` ⇒ inter_block populated");
+    // §5.11.25 single-ref arm — RefFrame[0] = seg_ref_frame_data,
+    // RefFrame[1] = NONE.
+    assert_eq!(inter.ref_frame, [1, -1]);
+    assert!(!inter.is_compound);
     // r170: §5.11.25 stamps RefFrames[0..2][0..2][0..2] over the
     // BLOCK_8X8 footprint = [LAST_FRAME = 1, NONE = -1].
     let mi_cols_grid = walker.mi_cols() as usize;
@@ -1517,11 +1539,19 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
     );
-    assert_eq!(
-        result,
-        Err(Error::InterBlockModeInfoUnsupported),
-        "r175: skip_mode = 1 ⇒ is_inter = 1 ⇒ §5.11.25 reads SkipModeFrame ⇒ §7.10 find_mv_stack ⇒ §5.11.27 read_motion_mode (SIMPLE short-circuit on skip_mode=1) ⇒ §5.11.18 dispatcher's Ok-arm InterBlockModeInfoUnsupported stub"
-    );
+    // r190: the inter cascade now runs to completion through the
+    // §5.11.18 dispatcher's Ok-arm; the §5.11.23 aggregate is
+    // surfaced via `DecodedInterFrameModeInfo::inter_block`.
+    let info = result.expect("§5.11.18 inter cascade with skip_mode = 1 must complete");
+    assert_eq!(info.skip, 1, "skip_mode → skip = 1");
+    assert_eq!(info.skip_mode, 1);
+    assert_eq!(info.is_inter, 1, "skip_mode → is_inter = 1");
+    let inter = info
+        .inter_block
+        .expect("§5.11.18 `is_inter == 1` ⇒ inter_block populated");
+    // §5.11.25 skip-mode arm — RefFrame[0..2] = SkipModeFrame[0..2].
+    assert_eq!(inter.ref_frame, [1, 7]);
+    assert!(inter.is_compound, "[LAST_FRAME, ALTREF_FRAME] ⇒ compound");
     // §5.11.18 grid-fill: Skips[][] stamped to 1 over the 4×4 footprint.
     let mi_cols = walker.mi_cols() as usize;
     for r in 0..4 {
@@ -1601,7 +1631,22 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
     );
-    assert_eq!(result, Err(Error::InterBlockModeInfoUnsupported));
+    // r190: the inter cascade now runs to completion. The §5.11.20
+    // `read_is_inter` third arm fires (`seg_globalmv_active = true`
+    // ⇒ is_inter = 1 without S()).
+    let info = result.expect("§5.11.18 inter cascade with seg_globalmv override must complete");
+    assert_eq!(info.is_inter, 1);
+    let inter = info
+        .inter_block
+        .expect("§5.11.18 `is_inter == 1` ⇒ inter_block populated");
+    assert_eq!(
+        inter.ref_frame[0], 1,
+        "§5.11.25 globalmv arm sets RefFrame[0] = LAST_FRAME"
+    );
+    assert_eq!(
+        inter.ref_frame[1], -1,
+        "§5.11.25 globalmv arm leaves RefFrame[1] = NONE"
+    );
 }
 
 /// §5.11.18 caller-bug detection: out-of-range arguments surface
@@ -1845,6 +1890,7 @@ fn decoded_inter_frame_mode_info_struct_public_api_smoke() {
         current_q_index: 0,
         current_delta_lf: [0; 4],
         is_inter: 0,
+        inter_block: None,
     };
     let copy = info;
     assert_eq!(info, copy);
@@ -2334,4 +2380,321 @@ fn compute_prediction_readout_clone_debug_smoke() {
     let cloned = readout.clone();
     assert_eq!(readout, cloned);
     let _ = format!("{readout:?}");
+}
+
+// =====================================================================
+// r190 — `decode_block_syntax` wire-up tests.
+//
+// The §5.11.5 [`PartitionWalker::decode_block_syntax`] dispatcher now
+// accepts an `Option<&InterFrameContext>` last argument. The pre-r190
+// short-circuit (`Err(Error::DecodeBlockInterFrameUnsupported)` on
+// `frame_is_intra == false`) is preserved when the caller passes
+// `None` (covered by `decode_block_syntax_inter_frame_arm_returns_stub`
+// above). When the caller passes `Some(&ctx)` the §5.11.18 inter
+// dispatcher runs, the §5.11.23 inter-block cascade completes, and the
+// walker threads MV / ref-frame / interp-filter state into
+// [`PartitionWalker::compute_prediction`] (the §5.11.33 inter arm
+// per r189) + [`PartitionWalker::residual`] (the §5.11.34 `is_inter &&
+// !Lossless && !plane` transform_tree arm).
+// =====================================================================
+
+/// r190 wire-up: `decode_block_syntax(frame_is_intra = false,
+/// Some(&ctx))` lifts the pre-r190
+/// `Err(Error::DecodeBlockInterFrameUnsupported)` short-circuit and
+/// runs the §5.11.18 inter cascade + §5.11.33 inter-arm
+/// `compute_prediction` + §5.11.34 inter-arm `residual` to completion.
+///
+/// Test fixture: `BLOCK_8X8` inter block, intra-only sequence header
+/// surrogate (`subsampling_x = subsampling_y = 0`, `num_planes = 3`),
+/// segmentation disabled, `seg_globalmv_active = true` so the §5.11.20
+/// `read_is_inter` third arm forces `is_inter = 1` without an S()
+/// read, identity `InterFrameContext` defaults for every other inter
+/// scalar. The §5.11.25 `read_ref_frames` reader hits the
+/// `seg_skip_active || seg_globalmv_active` arm which sets
+/// `RefFrame[0] = LAST_FRAME`, `RefFrame[1] = NONE` (no S() bits
+/// read). The §5.11.23 YMode dispatch falls into the `seg_skip_active
+/// || seg_globalmv_active` arm (no S()) and resolves `YMode =
+/// GLOBALMV`. The §5.11.31 `assign_mv(GLOBALMV)` arm reads
+/// `GlobalMvs[0]` (identity → [0, 0]) — no S() bits. Motion mode
+/// short-circuits to SIMPLE (no S() bits) because
+/// `is_motion_mode_switchable = false`. `read_interintra_mode` /
+/// `read_compound_type` / `read_interpolation_filter` all
+/// short-circuit on the closed outer gates. The walker then advances
+/// through §5.11.33 (one per-4x4 inter task per plane) + §5.11.34
+/// (transform_tree on the luma plane, direct iteration on chroma).
+#[test]
+fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    // Skip CDF deterministically returns 0 so the §5.11.11 read_skip
+    // takes the "no-skip" arm — §5.11.34 will visit per-TU
+    // coefficient reads.
+    cdfs.skip = [force_binary_cdf(0); SKIP_CONTEXTS];
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let mut ctx = InterFrameContext::identity_default();
+    // §5.11.20 `read_is_inter` third arm: seg_globalmv_active forces
+    // is_inter = 1 with no S() read.
+    ctx.seg_globalmv_active = true;
+
+    let result = walker.decode_block_syntax(
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        BLOCK_8X8,
+        /* frame_is_intra = */ false,
+        /* subsampling_x = */ 0,
+        /* subsampling_y = */ 0,
+        /* num_planes = */ 3,
+        /* seg_id_pre_skip = */ false,
+        /* segmentation_enabled = */ false,
+        /* seg_skip_active = */ false,
+        /* last_active_seg_id = */ 0,
+        &lossless,
+        /* coded_lossless = */ false,
+        /* enable_cdef = */ true,
+        /* allow_intrabc = */ false,
+        /* cdef_bits = */ 0,
+        /* read_deltas = */ false,
+        /* use_128x128_superblock = */ false,
+        /* delta_q_res = */ 0,
+        /* delta_lf_present = */ false,
+        /* delta_lf_multi = */ false,
+        /* mono_chrome = */ false,
+        /* delta_lf_res = */ 0,
+        /* tx_mode_select = */ false,
+        /* inter_ctx = */ Some(&ctx),
+    );
+
+    let db = result.expect(
+        "r190 wire-up: §5.11.18 inter arm + §5.11.33 compute_prediction (inter) + §5.11.34 residual (inter transform_tree) should run to completion on the globalmv path",
+    );
+    assert_eq!(
+        db.is_inter, 1,
+        "r190: §5.11.18 `is_inter == 1` after seg_globalmv_active override"
+    );
+    assert_eq!(
+        db.ref_frame,
+        [1, -1],
+        "r190: §5.11.25 globalmv arm sets RefFrame = [LAST_FRAME, NONE]"
+    );
+    assert!(!db.is_compound, "single-ref: slot 1 = NONE ⇒ !isCompound");
+    assert_eq!(
+        db.mi_row, 0,
+        "r190: §5.11.5 prologue records the per-block coordinates"
+    );
+    assert_eq!(db.mi_col, 0);
+    assert_eq!(db.mi_size, BLOCK_8X8);
+    // r189: the §5.11.31 `assign_mv(GLOBALMV)` arm adopts the
+    // identity-default GlobalMvs[0] = [0, 0] (no bits read). The
+    // grid stamp over the bw4 * bh4 footprint records the zero MV
+    // for downstream §7.10 neighbour walks.
+    let mi_cols = walker.mi_cols() as usize;
+    // §5.11.5 / §5.11.31 grid stamp: `Mvs[r + y][c + x][refList]`.
+    // `[(cell * 2 + list) * 2 + comp]` per-list / per-component
+    // layout (mirrors the `decode_inter_block_mode_info` stamp).
+    let cell: usize = 0; // (mi_row * mi_cols + mi_col) at (0, 0).
+    assert_eq!(
+        walker.mvs()[(cell * 2) * 2],
+        0,
+        "identity globalmv ⇒ row component = 0"
+    );
+    assert_eq!(
+        walker.mvs()[(cell * 2) * 2 + 1],
+        0,
+        "identity globalmv ⇒ col component = 0"
+    );
+    // §5.11.5 / §5.11.18 grid stamps: `IsInters[r][c] = is_inter`
+    // over the 2×2 footprint.
+    for r in 0..2usize {
+        for c in 0..2usize {
+            assert_eq!(walker.is_inters()[r * mi_cols + c], 1);
+        }
+    }
+}
+
+/// r190 wire-up: `decode_partition_syntax(frame_is_intra = false,
+/// Some(&ctx))` propagates the inter context through the §5.11.4
+/// partition-tree recursion. With `BLOCK_4X4` (below `BLOCK_8X8` ⇒
+/// PARTITION_NONE short-circuit) the partition driver invokes
+/// `decode_block_syntax` exactly once at `(0, 0)` and the §5.11.18
+/// inter cascade runs through the same `seg_globalmv_active` arm as
+/// the previous test. CDF rigging mirrors the previous test.
+#[test]
+fn r190_decode_partition_syntax_with_inter_ctx_routes_through_inter_arm() {
+    let mut walker = walker_n(4);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    cdfs.skip = [force_binary_cdf(0); SKIP_CONTEXTS];
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let mut ctx = InterFrameContext::identity_default();
+    ctx.seg_globalmv_active = true;
+
+    let result = walker.decode_partition_syntax(
+        &mut dec,
+        &mut cdfs,
+        /* r = */ 0,
+        /* c = */ 0,
+        /* b_size = */ BLOCK_4X4,
+        /* frame_is_intra = */ false,
+        0,
+        0,
+        3,
+        false,
+        false,
+        false,
+        0,
+        &lossless,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+        false,
+        /* inter_ctx = */ Some(&ctx),
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "r190: §5.11.4 partition driver propagates the §5.11.5 walker's Ok(_) from the inter arm"
+    );
+    // Exactly one leaf block was emitted at (0, 0, BLOCK_4X4).
+    let blocks = walker.blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].sub_size, BLOCK_4X4);
+}
+
+/// r190: caller passing `frame_is_intra = false, inter_ctx = None`
+/// preserves the pre-r190 short-circuit semantics
+/// (`Err(Error::DecodeBlockInterFrameUnsupported)`). This guards the
+/// back-compat contract for callers that haven't yet built an
+/// `InterFrameContext` (e.g. tests that pre-date r190 or callers
+/// staying on the intra-only path).
+#[test]
+fn r190_decode_block_syntax_inter_arm_without_ctx_keeps_legacy_stub() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let bytes = [0xFFu8; 16];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let pos_before = dec.position();
+    let result = walker.decode_block_syntax(
+        &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* frame_is_intra = */ false, 0, 0, 3, false,
+        false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0,
+        false, /* inter_ctx = */ None,
+    );
+    assert_eq!(
+        result,
+        Err(Error::DecodeBlockInterFrameUnsupported),
+        "r190: `None` inter_ctx ⇒ legacy short-circuit preserved"
+    );
+    assert_eq!(
+        dec.position(),
+        pos_before,
+        "legacy short-circuit fires before any bitstream read"
+    );
+}
+
+/// r190: `InterFrameContext::identity_default` smoke — every field
+/// initialised to the §5.9.24 identity defaults
+/// (`gm_params[ref][2] = gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`,
+/// other slots = 0, `gm_type = [GM_TYPE_IDENTITY; 8]`, every flag off,
+/// `interpolation_filter = EIGHTTAP`).
+#[test]
+fn r190_inter_frame_context_identity_default_matches_spec_identity_warp() {
+    let ctx = InterFrameContext::identity_default();
+    for ref_idx in 0..8 {
+        assert_eq!(
+            ctx.gm_params[ref_idx][2],
+            1 << WARPEDMODEL_PREC_BITS,
+            "§5.9.24 identity warp: slot 2 = 1 << WARPEDMODEL_PREC_BITS"
+        );
+        assert_eq!(
+            ctx.gm_params[ref_idx][5],
+            1 << WARPEDMODEL_PREC_BITS,
+            "§5.9.24 identity warp: slot 5 = 1 << WARPEDMODEL_PREC_BITS"
+        );
+        assert_eq!(ctx.gm_params[ref_idx][0], 0);
+        assert_eq!(ctx.gm_params[ref_idx][1], 0);
+        assert_eq!(ctx.gm_params[ref_idx][3], 0);
+        assert_eq!(ctx.gm_params[ref_idx][4], 0);
+        assert_eq!(ctx.gm_type[ref_idx], GM_TYPE_IDENTITY);
+    }
+    assert!(!ctx.segmentation_update_map);
+    assert!(!ctx.seg_skip_mode_off);
+    assert!(!ctx.seg_globalmv_active);
+    assert_eq!(ctx.skip_mode_frame, [0, -1]);
+    assert!(!ctx.allow_high_precision_mv);
+    assert!(!ctx.enable_interintra_compound);
+    assert_eq!(ctx.interpolation_filter, 0 /* EIGHTTAP */);
+}
+
+/// r190: `DecodedInterFrameModeInfo::inter_block` is `None` on the
+/// §5.11.22 intra-arm path (when `is_inter == 0` inside an inter
+/// frame). Test the §5.11.18 dispatcher returns
+/// `Err(IntraBlockModeInfoUnsupported)` on the `is_inter == 0` arm
+/// (unchanged by r190 since the §5.11.22 stub is still upstream).
+#[test]
+fn r190_decoded_inter_frame_mode_info_intra_arm_still_stubs() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    // Skip CDF off; segmentation off; is_inter forced to 0 via the
+    // CDF surface: the §5.11.20 read_is_inter S() reads against
+    // is_inter_cdf — we want it to return 0. Set the CDF to force
+    // 0 deterministically.
+    cdfs.skip = [force_binary_cdf(0); SKIP_CONTEXTS];
+    for row in cdfs.is_inter.iter_mut() {
+        *row = force_binary_cdf(0);
+    }
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let ctx = InterFrameContext::identity_default();
+    let result = walker.decode_block_syntax(
+        &mut dec,
+        &mut cdfs,
+        0,
+        0,
+        BLOCK_8X8,
+        /* frame_is_intra = */ false,
+        0,
+        0,
+        3,
+        false,
+        false,
+        false,
+        0,
+        &lossless,
+        false,
+        true,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        false,
+        0,
+        false,
+        /* inter_ctx = */ Some(&ctx),
+    );
+    assert_eq!(
+        result,
+        Err(Error::IntraBlockModeInfoUnsupported),
+        "r190: §5.11.18 `is_inter == 0` arm still stubs at §5.11.22 (next-arc target)"
+    );
 }
