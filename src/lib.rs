@@ -1521,6 +1521,7 @@ use oxideav_core::RuntimeContext;
 mod bitreader;
 pub mod cdf;
 pub mod frame_header;
+pub mod inter_pred;
 pub mod obu;
 pub mod scan;
 pub mod sequence_header;
@@ -1735,6 +1736,39 @@ pub use transform::{
     inverse_identity4, inverse_identity8, inverse_transform_2d, inverse_wht4, round2, sin128,
     COS128_LOOKUP, SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9, TRANSFORM_ROW_SHIFT,
 };
+// r189: §7.11.3 Inter prediction process (av1-spec p.257-265) —
+// translational single-reference MC kernel. Three sample-generation
+// helpers admitted standalone alongside the §7.11.2 intra leaves:
+// §7.11.3.2 [`inter_pred::rounding_variables`] (the
+// `(InterRound0, InterRound1, InterPostRound)` rounding-shift
+// derivation), §7.11.3.3 [`inter_pred::motion_vector_scaling`] (the
+// `(startX, startY, stepX, stepY)` ref-coord derivation, 10
+// fractional bits), and §7.11.3.4 [`inter_pred::block_inter_prediction`]
+// (the 8-tap horizontal + vertical convolution kernel with `Clip3`
+// boundary clamp and Round2-after-each-pass). Plus the
+// [`inter_pred::SUBPEL_FILTERS`] table (`Subpel_Filters[6][16][8]`
+// verbatim from av1-spec p.263-265) and the
+// [`inter_pred::select_interp_filter_small_block`] remap (`w <= 4` /
+// `h <= 4` → `EIGHTTAP_4TAP` / `EIGHTTAP_SMOOTH_4TAP`). The §7.11.3
+// constants `FILTER_BITS` / `SUBPEL_BITS` / `SUBPEL_MASK` /
+// `SCALE_SUBPEL_BITS` / `REF_SCALE_SHIFT` and the
+// `EIGHTTAP_4TAP` / `EIGHTTAP_SMOOTH_4TAP` filter ordinals are
+// surfaced. The §5.11.33 `compute_prediction` dispatcher now also
+// admits the `is_inter == 1` arm — it emits one
+// [`PlanePredictionTask`] per `(plane, i8, j8)` `8 × 8` sub-block per
+// the §7.11.3.1 driver outer loop with `mode = COMPUTE_PRED_MODE_INTER`;
+// the per-task `predict_inter` body itself remains a separate leaf
+// the caller invokes against a real `RefFrames[refList]` plane buffer
+// + per-block `(InterpFilters, Mvs, RefFrames)` triple. The
+// next-arc targets are §7.11.3.5 `block_warp` (LOCALWARP / GLOBAL
+// affine warp), §7.11.3.9 `overlapped_motion_compensation` (OBMC),
+// and the §7.11.3.11-15 compound-mask / blend arms.
+pub use inter_pred::{
+    block_inter_prediction, clip1_single_ref, motion_vector_scaling, rounding_variables,
+    select_interp_filter_small_block, MvScale, RoundingVars, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP,
+    FILTER_BITS as INTER_FILTER_BITS, REF_SCALE_SHIFT, SCALE_SUBPEL_BITS, SUBPEL_BITS,
+    SUBPEL_FILTERS, SUBPEL_MASK,
+};
 pub use uncompressed_header_tail::{
     parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,
     parse_global_motion_params, parse_interpolation_filter, parse_loop_filter_params,
@@ -1900,15 +1934,22 @@ pub enum Error {
     /// [`Self::ComputePredictionInterIntraUnsupported`] /
     /// [`Self::ComputePredictionIntraModeUnsupported`] instead.
     DecodeBlockComputePredictionUnsupported,
-    /// The §5.11.33 [`crate::PartitionWalker::compute_prediction`]
-    /// dispatcher visited a plane whose task body would invoke
-    /// §5.11.33 `predict_inter` (the §7.9 motion-compensated inter
-    /// prediction sample generation). The §7.9 body — sub-pixel
-    /// interpolation, reference-frame sampling, warping — is a
-    /// next-arc target. The §5.11.33 dispatcher itself runs to
-    /// completion and surfaces the per-plane prediction tasks in
-    /// [`crate::ComputePredictionReadout::tasks`]; only the per-task
-    /// `predict_inter` body remains stubbed.
+    /// **r189 LIFTED**. The §5.11.33 dispatcher's `is_inter == 1` arm
+    /// now emits one [`crate::PlanePredictionTask`] per `(plane, i4,
+    /// j4)` 4x4 sub-block with `mode = [`crate::COMPUTE_PRED_MODE_INTER`]`;
+    /// the §7.11.3.4 translational MC sample-generation leaf is the
+    /// standalone helper [`crate::block_inter_prediction`] (with
+    /// supporting [`crate::motion_vector_scaling`] for §7.11.3.3 and
+    /// [`crate::rounding_variables`] for §7.11.3.2). The remaining
+    /// §7.11.3.5 warp (LOCALWARP / GLOBAL_GLOBALMV affine), §7.11.3.9
+    /// OBMC, and §7.11.3.11-15 compound-mask / blend bodies are
+    /// next-arc.
+    ///
+    /// This variant is retained for API stability and as a defensive
+    /// fallback — the dispatcher no longer constructs it on the
+    /// translational `is_inter == 1` arm (the task list grows
+    /// instead). A future caller-side enforcement (e.g. a per-task
+    /// "warp requested" check) may re-arm it.
     ComputePredictionInterUnsupported,
     /// The §5.11.33 dispatcher visited a plane whose `IsInterIntra ==
     /// 1` arm fires (`is_inter && RefFrame[1] == INTRA_FRAME` —
@@ -2251,7 +2292,7 @@ impl core::fmt::Display for Error {
             ),
             Self::ComputePredictionInterUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.33 compute_prediction reached §5.11.33 predict_inter — §7.9 motion-compensated inter prediction pending next-arc"
+                "oxideav-av1: §5.11.33 compute_prediction reached §7.11.3 predict_inter — defensive fallback retained post-r189 (§7.11.3.4 translational MC kernel landed via inter_pred::block_inter_prediction; §7.11.3.5 warp + §7.11.3.9 OBMC + §7.11.3.11-15 compound bodies pending next-arc)"
             ),
             Self::ComputePredictionInterIntraUnsupported => write!(
                 f,

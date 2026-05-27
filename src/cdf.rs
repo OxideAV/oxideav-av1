@@ -23464,9 +23464,17 @@ impl PartitionWalker {
     ///   `subX` / `subY` / `baseX` / `baseY`.
     /// * §5.11.33 `IsInterIntra` arm — gated; surfaces
     ///   [`crate::Error::ComputePredictionInterIntraUnsupported`].
-    /// * §5.11.33 `is_inter` arm — gated; surfaces
-    ///   [`crate::Error::ComputePredictionInterUnsupported`] (the §7.9
-    ///   `predict_inter` body is the next-arc target).
+    /// * §5.11.33 `is_inter` arm — emits one [`PlanePredictionTask`]
+    ///   per `(plane, i4, j4)` 4x4 sub-block carrying the §7.11.3.1
+    ///   `predict_inter` arguments (`start_x = baseX + j4*4`, `start_y
+    ///   = baseY + i4*4`, `log2_w = log2_h = 2`, `mode =
+    ///   [`COMPUTE_PRED_MODE_INTER`]`). The §7.11.3.4 translational
+    ///   8-tap MC kernel is the standalone leaf
+    ///   [`crate::inter_pred::block_inter_prediction`] (mirrors the
+    ///   §7.11.2 intra leaf pattern — dispatcher emits tasks, leaves
+    ///   are called separately against `RefFrames[refList]` /
+    ///   `Mvs[candRow][candCol]` / `InterpFilters[candRow][candCol]`
+    ///   state the §5.11.5 walker does not yet track).
     /// * §5.11.33 `!is_inter` (intra) arm — emits one
     ///   [`PlanePredictionTask`] per plane carrying the §5.11.33
     ///   `predict_intra` arguments (`mode`, `baseX`, `baseY`,
@@ -23597,15 +23605,56 @@ impl PartitionWalker {
 
             // §5.11.33 per-plane `is_inter` branch.
             if is_inter {
-                // §5.11.33 `predict_inter` body — §7.9 sub-pixel
-                // motion-compensated prediction. The dispatcher
-                // returns the §7.9 stub on the first task. (The
-                // dispatcher does NOT emit the per-(y, x)
-                // `predict_inter` tasks because the §7.9 body itself
-                // is the missing implementation — the task list would
-                // be a `predict_inter`-task stream against an
-                // unimplemented kernel.)
-                return Err(crate::Error::ComputePredictionInterUnsupported);
+                // §5.11.33 `predict_inter` body — §7.11.3 motion-
+                // compensated inter prediction (av1-spec p.257-265).
+                //
+                // The spec body (av1-spec p.84) enumerates the
+                // §7.11.3.1 `predict_inter` call once per `(plane, y,
+                // x)` 4x4-aligned position; the §7.11.3.1 driver
+                // itself groups those into 8x8-aligned `(i8, j8)`
+                // sub-blocks for the warp path (`i8 = 0..((h-1) >>
+                // 3)`, `j8 = 0..((w-1) >> 3)`, av1-spec p.258 line
+                // 14369). For the translational `useWarp == 0` path
+                // (the only path the §7.11.3 sample-generation leaves
+                // in this round cover), one `predict_inter` call per
+                // plane suffices — the kernel walks the whole `w × h`
+                // region in one pass. We emit one task per `(i4, j4)`
+                // 4x4-aligned position (per av1-spec p.84 the
+                // `predict_inter` argument is the per-TU sub-block);
+                // for the simplest translational case `num4x4W ==
+                // num4x4H == 1` (one 4x4 task per plane) holds at
+                // BLOCK_4X4, growing to `(num4x4H, num4x4W)` tasks
+                // at larger sizes.
+                //
+                // Block sizes per av1-spec p.84 line residual()
+                // `num4x4W = Num_4x4_Blocks_Wide[ planeSz ]`,
+                // `num4x4H = Num_4x4_Blocks_High[ planeSz ]`. We re-
+                // derive them inline from the (log2_w, log2_h)
+                // already computed — `num4x4{W,H} = 1 << (log2_{w,h}
+                // - 2)`, i.e. one 4x4 cell per 4 luma samples on each
+                // axis.
+                let num4x4_w = 1u32 << (log2_w - 2);
+                let num4x4_h = 1u32 << (log2_h - 2);
+                let (have_above_inter, have_left_inter) = if plane == 0 {
+                    (avail_u, avail_l)
+                } else {
+                    (avail_u_chroma, avail_l_chroma)
+                };
+                for i4 in 0..num4x4_h {
+                    for j4 in 0..num4x4_w {
+                        tasks.push(PlanePredictionTask {
+                            plane,
+                            start_x: base_x + j4 * 4,
+                            start_y: base_y + i4 * 4,
+                            log2_w: 2, // per-4x4-cell width
+                            log2_h: 2, // per-4x4-cell height
+                            mode: COMPUTE_PRED_MODE_INTER,
+                            have_left: have_left_inter,
+                            have_above: have_above_inter,
+                        });
+                    }
+                }
+                continue;
             }
 
             // §5.11.33 `!is_inter` (intra) arm. The §7.11.2.1 dispatch

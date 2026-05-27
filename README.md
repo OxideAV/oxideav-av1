@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 188)
+## Status — 2026-05-28 (round 189)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,89 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 189 lifts the **§7.11.3 inter prediction process** (av1-spec
+p.257-265) — the translational single-reference motion-compensation
+sample-generation surface. A new `inter_pred` module bundles three
+spec-faithful leaves the future §7.11.3.1 driver invokes on the
+`useWarp == 0` branch:
+
+* §7.11.3.2 `rounding_variables(bit_depth, is_compound)` — the
+  `(InterRound0, InterRound1, InterPostRound)` rounding-shift
+  derivation (six-case spec table verified bit-exact: 8/10-bit
+  single-ref → `(3, 11, 0)`, 8/10-bit compound → `(3, 7, 4)`,
+  12-bit single-ref → `(5, 9, 0)`, 12-bit compound → `(5, 7, 2)`).
+* §7.11.3.3 `motion_vector_scaling(plane, subX, subY, FW, FH,
+  RefUpscaledWidth, RefFrameHeight, x, y, mv)` — the
+  `(startX, startY, stepX, stepY)` reference-frame sample-location
+  derivation in `SCALE_SUBPEL_BITS = 10` fractional bits, including
+  the `halfSample = 1 << (SUBPEL_BITS - 1)` centre-of-sample offset,
+  the `(2 * mv) >> subX` per-plane MV downshift, and the `off = 1
+  << (SCALE_SUBPEL_BITS - SUBPEL_BITS) / 2` tap-selection rounding
+  bias.
+* §7.11.3.4 `block_inter_prediction(...)` — the 8-tap horizontal +
+  vertical convolution kernel with `Clip3(0, lastX/Y, ...)` boundary
+  clamp and `Round2(s, R0/R1)` after each pass. Drives the spec's
+  `intermediateHeight = ((h-1) * yStep + 1023) >> 10 + 8`
+  intermediate-array sizing and the phase index `(p >> 6) &
+  SUBPEL_MASK`.
+
+The 6 × 16 × 8 `Subpel_Filters[]` table (av1-spec p.263-265) is
+transcribed verbatim into `SUBPEL_FILTERS`: four 8-tap full-size
+filters (EIGHTTAP / EIGHTTAP_SMOOTH / EIGHTTAP_SHARP / BILINEAR) and
+two 4-tap small-block reductions (`EIGHTTAP_4TAP` = index 4,
+`EIGHTTAP_SMOOTH_4TAP` = index 5). Three table invariants verified
+across all 96 phase rows: every coefficient is even (av1-spec p.265
+note); each row sums to `1 << FILTER_BITS = 128` (sample
+conservation); the phase-0 row of every filter is the unit copy
+`(0, 0, 0, 128, 0, 0, 0, 0)` so an integer-aligned tap reproduces the
+reference sample exactly. The small-block 4-tap rows zero taps 0, 1,
+6, 7 at every phase.
+
+`select_interp_filter_small_block(f)` implements the spec's `w <= 4`
+/ `h <= 4` per-pass remap (`EIGHTTAP` / `EIGHTTAP_SHARP` →
+`EIGHTTAP_4TAP`, `EIGHTTAP_SMOOTH` → `EIGHTTAP_SMOOTH_4TAP`).
+`clip1_single_ref(bit_depth, pred, out)` implements the §7.11.3.1
+post-prediction `Clip1(preds[0])` clamp callers need for the
+single-reference, non-interintra path (av1-spec p.258 line 14402).
+
+The §5.11.33 `compute_prediction` dispatcher's `is_inter == 1` arm
+now emits one `PlanePredictionTask` per `(plane, i4, j4)` 4x4
+sub-block carrying `mode = COMPUTE_PRED_MODE_INTER`, `log2_w =
+log2_h = 2`, `start_x = baseX + j4 * 4`, `start_y = baseY + i4 * 4`
+— the per-task `predict_inter` body is the standalone
+`block_inter_prediction` leaf callers invoke against a real
+`RefFrames[refList]` plane buffer plus per-block `(InterpFilters,
+Mvs, RefFrames)` triple. A BLOCK_8X8 luma-only inter block now
+produces four tasks at `(0,0)`, `(4,0)`, `(0,4)`, `(4,4)`. The
+previous `Error::ComputePredictionInterUnsupported` short-circuit is
+retired (the variant is retained for API stability + future defensive
+use).
+
+Test count: 935 → 949 (+14). New tests: `rounding_variables`
+six-case spec-table verification + invalid-bit-depth guard;
+`motion_vector_scaling` identity-case `stepX = stepY = 1024` +
+integer-MV origin shift + six caller-bug guards; `SUBPEL_FILTERS`
+all-even invariant (768 entries) + phase-0 unit-copy (6 rows) +
+phase-rows-sum-to-128 (96 rows) + small-block 4-tap structure
+(zeros at taps 0/1/6/7); `select_interp_filter_small_block` remap
+truth table; `block_inter_prediction` phase-0 integer-aligned
+copy-from-reference (4 × 4 sample-bit-exact) + negative-start
+boundary-clamp with constant reference + six caller-bug guards;
+`clip1_single_ref` per-bit-depth clamp truth table.
+
+**Scope (sensibly split — translational single-ref MC only).**
+Deferred to subsequent arcs: §7.11.3.5 `block_warp` (LOCALWARP /
+GLOBAL_GLOBALMV affine warp), §7.11.3.6 `setup_shear`, §7.11.3.7
+`resolve_divisor`, §7.11.3.8 `warp_estimation`, §7.11.3.9
+`overlapped_motion_compensation` (OBMC), §7.11.3.10
+`overlap_blending`, §7.11.3.11 `wedge_mask` (COMPOUND_WEDGE),
+§7.11.3.12 `difference_weight_mask` (COMPOUND_DIFFWTD), §7.11.3.13
+`intra_mode_variant_mask` (COMPOUND_INTRA), §7.11.3.14 `mask_blend`,
+§7.11.3.15 `distance_weights` (COMPOUND_DISTANCE). The §7.11.3.1
+driver itself awaits the §5.11.5 walker's inter arm reaching
+`predict_inter` (today `decode_block_syntax` short-circuits at
+`Error::DecodeBlockInterFrameUnsupported`).
 
 Round 188 lifts the **§7.11.2.4 six non-degenerate directional D-mode
 sample-generation leaves** (D45 / D135 / D113 / D157 / D203 / D67) +

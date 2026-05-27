@@ -1973,16 +1973,36 @@ fn compute_prediction_luma_only_one_task() {
     assert!(r.tasks[0].have_left);
 }
 
-/// §5.11.33 `is_inter == true` arm currently surfaces the next-arc
-/// stub.
+/// r189: §5.11.33 `is_inter == true` arm — the dispatcher now emits
+/// one [`oxideav_av1::PlanePredictionTask`] per `(plane, i4, j4)` 4x4
+/// sub-block carrying the §7.11.3.1 `predict_inter` arguments
+/// (`mode = COMPUTE_PRED_MODE_INTER`). For a BLOCK_8X8 luma-only
+/// block this gives `2 x 2 = 4` tasks at (start_x, start_y) ∈
+/// {(0,0), (4,0), (0,4), (4,4)}.
 #[test]
-fn compute_prediction_inter_arm_surfaces_stub() {
+fn compute_prediction_inter_arm_emits_per_subblock_tasks() {
+    use oxideav_av1::COMPUTE_PRED_MODE_INTER;
     let mut walker = walker_n(16);
-    let result = walker.compute_prediction(
-        0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ true, 0, 0,
-        false,
-    );
-    assert_eq!(result, Err(Error::ComputePredictionInterUnsupported));
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ true,
+            0, 0, false,
+        )
+        .unwrap();
+    assert!(r.is_inter);
+    assert!(!r.is_inter_intra);
+    assert_eq!(r.num_planes_visited, 1);
+    // 8x8 luma block at MI_SIZE=4 / num4x4 = 8 / 4 = 2 ⇒ 2 × 2 = 4 tasks.
+    assert_eq!(r.tasks.len(), 4);
+    let expected_starts: [(u32, u32); 4] = [(0, 0), (4, 0), (0, 4), (4, 4)];
+    for (task, (ex, ey)) in r.tasks.iter().zip(expected_starts.iter()) {
+        assert_eq!(task.plane, 0);
+        assert_eq!(task.mode, COMPUTE_PRED_MODE_INTER);
+        assert_eq!(task.log2_w, 2);
+        assert_eq!(task.log2_h, 2);
+        assert_eq!(task.start_x, *ex);
+        assert_eq!(task.start_y, *ey);
+    }
 }
 
 /// §5.11.33 inter-intra arm currently surfaces the next-arc stub.

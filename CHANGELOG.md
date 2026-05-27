@@ -6,6 +6,77 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 189 — §7.11.3 inter prediction process (translational
+  single-reference MC kernel) per av1-spec p.257-265.** New
+  `inter_pred` module exposing the three §7.11.3.{2,3,4} sample-
+  generation leaves as standalone helpers (mirroring the §7.11.2
+  intra-leaf pattern from r180+):
+  * §7.11.3.2 `rounding_variables(bit_depth, is_compound)` — derives
+    the `(InterRound0, InterRound1, InterPostRound)` rounding shifts
+    per av1-spec p.259. Six-case spec table verified: `(8, false) →
+    (3, 11, 0)`, `(8, true) → (3, 7, 4)`, `(10, false) → (3, 11, 0)`,
+    `(10, true) → (3, 7, 4)`, `(12, false) → (5, 9, 0)`, `(12, true)
+    → (5, 7, 2)`.
+  * §7.11.3.3 `motion_vector_scaling(plane, subX, subY, FW, FH,
+    RefUpscaledWidth, RefFrameHeight, x, y, mv)` — returns
+    `(startX, startY, stepX, stepY)` in `SCALE_SUBPEL_BITS = 10`
+    fractional bits per av1-spec p.260-261. Identity case
+    (`RefUpscaledWidth == FrameWidth`, zero MV) yields `stepX = stepY
+    = 1024` and `startX = (x << 10) + 32` (the spec's `off` rounding
+    offset).
+  * §7.11.3.4 `block_inter_prediction(plane, subX, subY, refPlane,
+    refStride, refW, refH, startX, startY, stepX, stepY, w, h,
+    interpFilterX, interpFilterY, R0, R1, pred)` — the translational
+    8-tap horizontal + vertical convolution kernel with
+    `Clip3(0, lastX/Y, ...)` boundary clamp and `Round2(s, R0/R1)`
+    after each pass per av1-spec p.262-265. Phase-0 integer-aligned
+    case verified bit-exact: each `pred[r][c] = ref[start_y + r,
+    start_x + c]`. Constant-reference boundary-clamp verified.
+  * `SUBPEL_FILTERS[6][16][8]` — av1-spec p.263-265
+    `Subpel_Filters[]` table transcribed verbatim. All 96 phase rows
+    sum to `128` (sample-conservation invariant per av1-spec p.265
+    note); every entry even; phase-0 row of every filter is the
+    `(0, 0, 0, 128, 0, 0, 0, 0)` unit copy; small-block 4-tap
+    reductions (indices 4, 5) zero taps 0/1/6/7.
+  * `select_interp_filter_small_block(f)` — the spec's
+    `w <= 4` / `h <= 4` remap (`EIGHTTAP` / `EIGHTTAP_SHARP` →
+    `EIGHTTAP_4TAP`, `EIGHTTAP_SMOOTH` → `EIGHTTAP_SMOOTH_4TAP`).
+  * `clip1_single_ref(bit_depth, pred, out)` — the §7.11.3.1
+    `isCompound == 0, IsInterIntra == 0` post-prediction
+    `Clip1(preds[0])` clamp for callers that want sample-domain
+    outputs.
+  * Constants: `FILTER_BITS = 7` (re-exported as
+    `INTER_FILTER_BITS`), `SUBPEL_BITS = 4`, `SUBPEL_MASK = 15`,
+    `SCALE_SUBPEL_BITS = 10`, `REF_SCALE_SHIFT = 14`,
+    `EIGHTTAP_4TAP = 4`, `EIGHTTAP_SMOOTH_4TAP = 5`.
+  * §5.11.33 `compute_prediction` dispatcher's `is_inter == 1` arm
+    now emits one `PlanePredictionTask` per `(plane, i4, j4)` 4x4
+    sub-block carrying `mode = COMPUTE_PRED_MODE_INTER`, `log2_w =
+    log2_h = 2`, `start_x = baseX + j4 * 4`, `start_y = baseY + i4 *
+    4` (was: surfaced `Error::ComputePredictionInterUnsupported` on
+    the first task). A BLOCK_8X8 luma-only inter block now produces
+    four tasks at `(0,0)`, `(4,0)`, `(0,4)`, `(4,4)`.
+  * `Error::ComputePredictionInterUnsupported` retained for API
+    stability; the variant's docstring + `Display` body updated to
+    reflect that the translational MC kernel landed (the variant is
+    now defensive / no longer surfaced by the dispatcher on the
+    `is_inter == 1` arm).
+  * **+14 unit tests** in `inter_pred::tests`; one walker integration
+    test rewritten
+    (`compute_prediction_inter_arm_emits_per_subblock_tasks`).
+  * **Scope (sensibly split — single-ref translational only):**
+    deferred to subsequent arcs are §7.11.3.5 `block_warp`
+    (LOCALWARP / GLOBAL_GLOBALMV affine warp), §7.11.3.6
+    `setup_shear`, §7.11.3.7 `resolve_divisor`, §7.11.3.8
+    `warp_estimation`, §7.11.3.9 `overlapped_motion_compensation`
+    (OBMC), §7.11.3.10 `overlap_blending`, §7.11.3.11 `wedge_mask`,
+    §7.11.3.12 `difference_weight_mask`, §7.11.3.13
+    `intra_mode_variant_mask`, §7.11.3.14 `mask_blend`, §7.11.3.15
+    `distance_weights`. The §7.11.3.1 driver itself awaits the
+    §5.11.5 walker's inter arm reaching `predict_inter` (today
+    `decode_block_syntax` short-circuits at
+    `Error::DecodeBlockInterFrameUnsupported`).
+
 * **Round 188 — §7.11.2.4 six directional D-mode sample-generation
   leaves (D45 / D135 / D113 / D157 / D203 / D67) + §7.11.2.{7, 9, 10,
   11, 12} intra-edge helpers + `Mode_To_Angle[]` /
