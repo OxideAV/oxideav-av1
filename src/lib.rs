@@ -1227,6 +1227,64 @@
 //!     next round's targets. `decode_av1` / `encode_av1` continue
 //!     to return `Error::NotImplemented`.
 //!
+//!   * **Round 162.** The §5.11.19 `inter_segment_id( preSkip )`
+//!     syntax element (av1-spec p.71) — the inter-frame variant of
+//!     the per-block segment-id read, called twice per block from
+//!     §5.11.18 (once before §5.11.11 `read_skip()` with
+//!     `preSkip = 1` and once after with `preSkip = 0`). Lands as
+//!     a new [`PartitionWalker::decode_inter_segment_id`] method.
+//!     New `SEGMENT_ID_PREDICTED_CONTEXTS = 3` (§9.3) constant and
+//!     [`cdf::DEFAULT_SEGMENT_ID_PREDICTED_CDF`] table verbatim from
+//!     §9.4 (av1-spec p.442 — three uniform `[128 * 128, 32768, 0]`
+//!     rows for the binary `seg_id_predicted` symbol). New
+//!     [`cdf::TileCdfContext::segment_id_predicted`] field
+//!     initialised from `DEFAULT_SEGMENT_ID_PREDICTED_CDF` plus the
+//!     [`cdf::TileCdfContext::segment_id_predicted_cdf`] selector
+//!     implementing the §8.3.2 `TileSegmentIdPredictedCdf[ ctx ]`
+//!     index. New persistent `above_seg_pred_context` (length
+//!     `mi_cols`) and `left_seg_pred_context` (length `mi_rows`)
+//!     buffers on `PartitionWalker` per the §8.3.1 tile-entry
+//!     initialisation; the §8.3.2 ctx walk reads `LeftSegPredContext[
+//!     MiRow ] + AboveSegPredContext[ MiCol ]` (each `0..=1`; sum
+//!     `0..=2 < SEGMENT_ID_PREDICTED_CONTEXTS`).
+//!     [`PartitionWalker::above_seg_pred_context`] /
+//!     [`PartitionWalker::left_seg_pred_context`] accessors surface
+//!     the arrays. The dispatcher routes the full §5.11.19 cascade
+//!     exactly: outer `!segmentation_enabled` collapses to
+//!     `segment_id = 0`; inner `!segmentation_update_map` adopts
+//!     `predictedSegmentId`; `pre_skip && !SegIdPreSkip` early-exit
+//!     returns `segment_id = 0`; the post-skip `skip != 0` arm
+//!     zeroes the context arrays then descends into `decode_segment_id`
+//!     (the §5.11.9 skip short-circuit fires inside); the
+//!     `segmentation_temporal_update == 1` arm reads
+//!     `seg_id_predicted`, branches to `predictedSegmentId` adopt
+//!     or `read_segment_id()`, and stamps the context arrays with
+//!     the just-read flag; the `temporal_update == 0` fall-through
+//!     reads `read_segment_id()` without touching the context arrays
+//!     (per spec). `predicted_segment_id` (§5.11.21 `get_segment_id()`)
+//!     is caller-supplied from the §6.10 reference-frame walk so
+//!     the walker stays inter-frame-state-free. Range guards
+//!     (out-of-range `sub_size`, `mi_row`/`mi_col` past extent,
+//!     `last_active_seg_id >= MAX_SEGMENTS`, and the new
+//!     `predicted_segment_id > last_active_seg_id` invariant) fire
+//!     up-front on every arm. 11 new cdf-module tests (509 → 520):
+//!     fresh-walker context-array zeroing; `!segmentation_enabled`
+//!     no-read on both pre/post-skip arms; `!segmentation_update_map`
+//!     predicted-id adoption; `pre_skip && !SegIdPreSkip` early-exit;
+//!     post-skip + `skip != 0` zeroing context arrays then descending
+//!     into the §5.11.9 short-circuit (poisoned context arrays prove
+//!     the spec write fires); `temporal_update == 1` + rigged
+//!     `seg_id_predicted = 1` adopting predicted id and stamping
+//!     context to `1`; `temporal_update == 1` + rigged
+//!     `seg_id_predicted = 0` descending into `decode_segment_id`
+//!     and stamping context to `0`; `temporal_update == 0`
+//!     fall-through leaving context untouched; five-way out-of-range
+//!     guard; `Default_Segment_Id_Predicted_Cdf` layout; the
+//!     `segment_id_predicted_cdf` accessor round-trip. The §5.11.18
+//!     `inter_frame_mode_info()` top-level dispatcher remains the
+//!     next round's architectural payoff. `decode_av1` /
+//!     `encode_av1` continue to return `Error::NotImplemented`.
+//!
 //! Tile-group / tile-content decode (the per-tile coefficient,
 //! motion-vector, and reconstruction passes) remains out of scope, as
 //! does the §7.20 reference frame update process that would store a
@@ -1292,35 +1350,35 @@ pub use cdf::{
     DEFAULT_PALETTE_UV_MODE_CDF, DEFAULT_PALETTE_UV_SIZE_CDF, DEFAULT_PALETTE_Y_MODE_CDF,
     DEFAULT_PALETTE_Y_SIZE_CDF, DEFAULT_PARTITION_W128_CDF, DEFAULT_PARTITION_W16_CDF,
     DEFAULT_PARTITION_W32_CDF, DEFAULT_PARTITION_W64_CDF, DEFAULT_PARTITION_W8_CDF,
-    DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF,
-    DEFAULT_SKIP_MODE_CDF, DEFAULT_TXB_SKIP_CDF, DEFAULT_TXFM_SPLIT_CDF, DEFAULT_TX_16X16_CDF,
-    DEFAULT_TX_32X32_CDF, DEFAULT_TX_64X64_CDF, DEFAULT_TX_8X8_CDF, DEFAULT_UNI_COMP_REF_CDF,
-    DEFAULT_UV_MODE_CFL_ALLOWED_CDF, DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF, DEFAULT_WEDGE_INDEX_CDF,
-    DEFAULT_WEDGE_INTER_INTRA_CDF, DEFAULT_Y_MODE_CDF, DEFAULT_ZERO_MV_CDF, DELTA_LF_SMALL,
-    DELTA_Q_SMALL, DIRECTIONAL_MODES, DRL_MODE_CONTEXTS, EOB_COEF_CONTEXTS, EXT_PARTITION_TYPES,
-    FILTER_INTRA_MODE_TO_INTRA_DIR, FLIPADST_ADST, FLIPADST_DCT, FLIPADST_FLIPADST, FRAME_LF_COUNT,
-    FWD_REFS, H_ADST, H_DCT, H_FLIPADST, IDTX, INTERINTRA_MODES, INTERP_FILTERS,
-    INTERP_FILTER_CONTEXTS, INTERP_FILTER_NONE, INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES,
-    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS,
-    INTRA_TX_TYPE_SET1_SIZES, INTRA_TX_TYPE_SET2_SIZES, IS_INTER_CONTEXTS, LEVEL_CONTEXTS,
-    MAG_REF_OFFSET_WITH_TX_CLASS, MAX_ANGLE_DELTA, MAX_TX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE,
-    MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_TO_TXFM, MOTION_MODES, MV_CLASSES, MV_COMPS, MV_CONTEXTS,
-    MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH,
-    NUM_4X4_BLOCKS_WIDE, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS,
-    PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
+    DEFAULT_REF_MV_CDF, DEFAULT_SEGMENT_ID_CDF, DEFAULT_SEGMENT_ID_PREDICTED_CDF,
+    DEFAULT_SINGLE_REF_CDF, DEFAULT_SKIP_CDF, DEFAULT_SKIP_MODE_CDF, DEFAULT_TXB_SKIP_CDF,
+    DEFAULT_TXFM_SPLIT_CDF, DEFAULT_TX_16X16_CDF, DEFAULT_TX_32X32_CDF, DEFAULT_TX_64X64_CDF,
+    DEFAULT_TX_8X8_CDF, DEFAULT_UNI_COMP_REF_CDF, DEFAULT_UV_MODE_CFL_ALLOWED_CDF,
+    DEFAULT_UV_MODE_CFL_NOT_ALLOWED_CDF, DEFAULT_WEDGE_INDEX_CDF, DEFAULT_WEDGE_INTER_INTRA_CDF,
+    DEFAULT_Y_MODE_CDF, DEFAULT_ZERO_MV_CDF, DELTA_LF_SMALL, DELTA_Q_SMALL, DIRECTIONAL_MODES,
+    DRL_MODE_CONTEXTS, EOB_COEF_CONTEXTS, EXT_PARTITION_TYPES, FILTER_INTRA_MODE_TO_INTRA_DIR,
+    FLIPADST_ADST, FLIPADST_DCT, FLIPADST_FLIPADST, FRAME_LF_COUNT, FWD_REFS, H_ADST, H_DCT,
+    H_FLIPADST, IDTX, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_CONTEXTS, INTERP_FILTER_NONE,
+    INTER_TX_TYPE_SET1_SIZES, INTER_TX_TYPE_SET3_SIZES, INTRA_FILTER_MODES, INTRA_MODES,
+    INTRA_MODE_CONTEXT, INTRA_MODE_CONTEXTS, INTRA_TX_TYPE_SET1_SIZES, INTRA_TX_TYPE_SET2_SIZES,
+    IS_INTER_CONTEXTS, LEVEL_CONTEXTS, MAG_REF_OFFSET_WITH_TX_CLASS, MAX_ANGLE_DELTA, MAX_TX_DEPTH,
+    MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_TO_TXFM, MOTION_MODES, MV_CLASSES,
+    MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT, MV_JOINTS, MV_OFFSET_BITS, NEW_MV_CONTEXTS,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, NUM_BASE_LEVELS, PALETTE_BLOCK_SIZE_CONTEXTS,
+    PALETTE_COLORS, PALETTE_COLOR_CONTEXT, PALETTE_COLOR_CONTEXTS, PALETTE_COLOR_HASH_MULTIPLIERS,
     PALETTE_MAX_COLOR_CONTEXT_HASH, PALETTE_NUM_NEIGHBORS, PALETTE_SIZES, PALETTE_UV_MODE_CONTEXTS,
     PALETTE_Y_MODE_CONTEXTS, PARTITION_CONTEXTS, PARTITION_HORZ, PARTITION_HORZ_4,
     PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE, PARTITION_SPLIT, PARTITION_SUBSIZE,
     PARTITION_TYPES_TOTAL, PARTITION_VERT, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
-    PLANE_TYPES, REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SIG_COEF_CONTEXTS,
-    SIG_COEF_CONTEXTS_2D, SIG_COEF_CONTEXTS_EOB, SIG_REF_DIFF_OFFSET, SIG_REF_DIFF_OFFSET_NUM,
-    SINGLE_REFS, SIZE_GROUP, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, TXB_SKIP_CONTEXTS,
-    TXFM_PARTITION_CONTEXTS, TX_16X16, TX_32X32, TX_4X4, TX_64X64, TX_8X8, TX_CLASS_2D,
-    TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SET_DCTONLY, TX_SET_INTER_1, TX_SET_INTER_2,
-    TX_SET_INTER_3, TX_SET_INTRA_1, TX_SET_INTRA_2, TX_SET_TYPES_INTER, TX_SET_TYPES_INTRA,
-    TX_SIZES, TX_SIZES_ALL, TX_SIZE_CONTEXTS, TX_SIZE_SQR_UP, TX_TYPES, TX_TYPES_INTRA_SET1,
-    TX_TYPES_INTRA_SET2, TX_TYPES_SET2, TX_TYPES_SET3, TX_TYPE_IN_SET_INTER, TX_TYPE_IN_SET_INTRA,
-    TX_WIDTH, TX_WIDTH_LOG2, UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED,
+    PLANE_TYPES, REF_CONTEXTS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
+    SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_2D, SIG_COEF_CONTEXTS_EOB, SIG_REF_DIFF_OFFSET,
+    SIG_REF_DIFF_OFFSET_NUM, SINGLE_REFS, SIZE_GROUP, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
+    TXB_SKIP_CONTEXTS, TXFM_PARTITION_CONTEXTS, TX_16X16, TX_32X32, TX_4X4, TX_64X64, TX_8X8,
+    TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SET_DCTONLY, TX_SET_INTER_1,
+    TX_SET_INTER_2, TX_SET_INTER_3, TX_SET_INTRA_1, TX_SET_INTRA_2, TX_SET_TYPES_INTER,
+    TX_SET_TYPES_INTRA, TX_SIZES, TX_SIZES_ALL, TX_SIZE_CONTEXTS, TX_SIZE_SQR_UP, TX_TYPES,
+    TX_TYPES_INTRA_SET1, TX_TYPES_INTRA_SET2, TX_TYPES_SET2, TX_TYPES_SET3, TX_TYPE_IN_SET_INTER,
+    TX_TYPE_IN_SET_INTRA, TX_WIDTH, TX_WIDTH_LOG2, UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED,
     UV_INTRA_MODES_CFL_NOT_ALLOWED, V_ADST, V_DCT, V_FLIPADST, V_PRED, WEDGE_TYPES,
     ZERO_MV_CONTEXTS,
 };

@@ -6,6 +6,131 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 162 — §5.11.19 `inter_segment_id( preSkip )` syntax element.**
+  Lands a new
+  [`PartitionWalker::decode_inter_segment_id`] method implementing the
+  full §5.11.19 spec body (av1-spec p.71): the §5.11.18 inter-frame
+  per-block segment-id read, called twice per block (with `preSkip =
+  1` before §5.11.11 `read_skip()` and `preSkip = 0` after) so the
+  §5.9.14 `SegIdPreSkip` derivation routes the segment-id read to the
+  intended position relative to `skip`.
+
+  New `SEGMENT_ID_PREDICTED_CONTEXTS = 3` constant (§9.3) and new
+  [`DEFAULT_SEGMENT_ID_PREDICTED_CDF`] table verbatim from §9.4
+  (av1-spec p.442 — three uniform `[128 * 128, 32768, 0]` rows, the
+  §8.3.1 binary-symbol start). New
+  [`TileCdfContext::segment_id_predicted`] field initialised in
+  `new_from_defaults` from `DEFAULT_SEGMENT_ID_PREDICTED_CDF`, plus
+  the [`TileCdfContext::segment_id_predicted_cdf`] selector
+  implementing the §8.3.2 `TileSegmentIdPredictedCdf[ ctx ]` index.
+
+  New persistent `above_seg_pred_context: Vec<u8>` (length `mi_cols`)
+  and `left_seg_pred_context: Vec<u8>` (length `mi_rows`) buffers on
+  `PartitionWalker` per the §8.3.1 tile-entry initialisation
+  (`AboveSegPredContext[i] = 0`, `LeftSegPredContext[i] = 0` for
+  every column/row). The §8.3.2 ctx walk is `ctx =
+  LeftSegPredContext[ MiRow ] + AboveSegPredContext[ MiCol ]` (each
+  in `0..=1`; sum in `0..SEGMENT_ID_PREDICTED_CONTEXTS = 0..3`).
+  Public read-only accessors
+  [`PartitionWalker::above_seg_pred_context`] /
+  [`PartitionWalker::left_seg_pred_context`] surface flat views.
+
+  The dispatcher routes the full §5.11.19 cascade exactly:
+
+  * outer `!segmentation_enabled` → `segment_id = 0`, no read, grid
+    stamped, context arrays untouched;
+  * inner `!segmentation_update_map` → `segment_id =
+    predictedSegmentId`, no read, grid stamped, context arrays
+    untouched;
+  * `pre_skip && !SegIdPreSkip` early-exit → `segment_id = 0`, no
+    read, grid stamped, context arrays untouched;
+  * `!pre_skip && skip != 0` post-skip-with-skip arm → context arrays
+    zeroed over the `bw4`/`bh4` footprint, then `decode_segment_id`
+    is called (the §5.11.9 path short-circuits on `skip`);
+  * `segmentation_temporal_update == 1` → reads the binary
+    `seg_id_predicted` symbol against the §8.3.2 cdf; on `1` adopts
+    `predictedSegmentId` (no further read), on `0` descends into
+    `decode_segment_id`; stamps context arrays with the just-read
+    flag;
+  * `segmentation_temporal_update == 0` fall-through → straight
+    `decode_segment_id` call; context arrays untouched (per spec).
+
+  `predicted_segment_id` (§5.11.21 `get_segment_id()` over
+  `PrevSegmentIds[]`) is caller-supplied so the walker stays
+  inter-frame-state-free — the current-frame `segment_ids[]` grid is
+  the only segmentation surface it owns.
+
+  Range guards (`sub_size >= BLOCK_SIZES`, `mi_row >= MiRows`,
+  `mi_col >= MiCols`, `last_active_seg_id >= MAX_SEGMENTS`,
+  `predicted_segment_id > last_active_seg_id`) fire up-front on every
+  arm so the no-symbol paths are total over the same input space as
+  the bitstream-reading paths (matching the r160 `decode_intra_segment_id`
+  pattern).
+
+  11 new cdf-module tests (509 → 520):
+
+  * `fresh_walker_seg_pred_context_is_zero` — the §8.3.1 tile-entry
+    `AboveSegPredContext[]` / `LeftSegPredContext[]` arrays are sized
+    `MiCols` / `MiRows` and all-zero.
+  * `decode_inter_segment_id_segmentation_disabled_no_read` —
+    `!segmentation_enabled` on both `pre_skip = true` and `false`
+    yields `segment_id = 0` with no bits consumed on a hostile `0xFF`
+    buffer; grid stamped over the BLOCK_8X8 footprint; context
+    arrays untouched.
+  * `decode_inter_segment_id_no_update_map_adopts_predicted` —
+    `!segmentation_update_map` adopts `predictedSegmentId` without
+    reading any bits; grid stamped with the predicted id; context
+    arrays untouched.
+  * `decode_inter_segment_id_pre_skip_with_post_skip_pre_skip_flag_returns_zero`
+    — `pre_skip && !SegIdPreSkip` early-exit returns `segment_id = 0`
+    with no bits consumed; grid stamped to 0; context arrays
+    untouched.
+  * `decode_inter_segment_id_post_skip_with_skip_clears_context_and_short_circuits`
+    — the `!pre_skip && skip` arm zeroes the context arrays over the
+    footprint (verified by poisoning the arrays to `1` first); the
+    inner §5.11.9 `decode_segment_id` skip short-circuit fires with
+    no `S()` consumed; columns/rows outside the footprint retain
+    the poison value.
+  * `decode_inter_segment_id_temporal_update_predicted_adopts_predicted_id`
+    — `temporal_update == 1` + rigged `seg_id_predicted = 1` adopts
+    `predictedSegmentId` (no §5.11.9 descent); context arrays stamped
+    to `1` over the footprint; grid stamped with the predicted id.
+  * `decode_inter_segment_id_temporal_update_unpredicted_reads_segment_id`
+    — `temporal_update == 1` + rigged `seg_id_predicted = 0` descends
+    into `decode_segment_id`; context arrays stamped to `0` over the
+    footprint (verified by poisoning first); grid stamped with the
+    `decode_segment_id` return value.
+  * `decode_inter_segment_id_no_temporal_update_reads_segment_id_only`
+    — `temporal_update == 0` fall-through reads a literal
+    `read_segment_id()` without touching the context arrays (verified
+    by poisoning and confirming the poison survives).
+  * `decode_inter_segment_id_rejects_out_of_range` — five-way
+    out-of-range guard (`mi_row`, `mi_col`, `sub_size`,
+    `last_active_seg_id`, and the new `predicted_segment_id >
+    last_active_seg_id` invariant).
+  * `default_segment_id_predicted_cdf_layout` — the §9.4 table
+    transcription matches `[16384, 32768, 0]` per ctx row.
+  * `segment_id_predicted_cdf_accessor_round_trip` — the §8.3.2
+    selector round-trips through mutation.
+
+  The §5.11.18 `inter_frame_mode_info()` top-level dispatcher
+  (`use_intrabc` arm + the `LeftRefFrame` / `AboveRefFrame` /
+  `LeftIntra` / `AboveIntra` / `LeftSingle` / `AboveSingle`
+  derivations + the §5.11.18 two-call `inter_segment_id` protocol
+  composing on top of r152 `read_skip()` / r156 `read_cdef()` /
+  r154 `read_delta_qindex()` / r155 `read_delta_lf()` / r158
+  `read_is_inter()` / §5.11.22 `intra_block_mode_info` / §5.11.23
+  `inter_block_mode_info`) is the next round's architectural
+  payoff. `decode_av1` / `encode_av1` continue to return
+  `Error::NotImplemented`.
+
+  [`DEFAULT_SEGMENT_ID_PREDICTED_CDF`]: crate::cdf::DEFAULT_SEGMENT_ID_PREDICTED_CDF
+  [`PartitionWalker::decode_inter_segment_id`]: crate::cdf::PartitionWalker::decode_inter_segment_id
+  [`PartitionWalker::above_seg_pred_context`]: crate::cdf::PartitionWalker::above_seg_pred_context
+  [`PartitionWalker::left_seg_pred_context`]: crate::cdf::PartitionWalker::left_seg_pred_context
+  [`TileCdfContext::segment_id_predicted`]: crate::cdf::TileCdfContext::segment_id_predicted
+  [`TileCdfContext::segment_id_predicted_cdf`]: crate::cdf::TileCdfContext::segment_id_predicted_cdf
+
 * **Round 161 — §5.11.7 `intra_frame_mode_info()` prefix dispatcher.**
   Lands a new
   [`PartitionWalker::decode_intra_frame_mode_info_prefix`] method

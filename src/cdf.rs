@@ -241,6 +241,13 @@ pub const SKIP_CONTEXTS: usize = 3;
 /// `SEGMENT_ID_CONTEXTS` (§9.3) — number of contexts for `segment_id`.
 pub const SEGMENT_ID_CONTEXTS: usize = 3;
 
+/// `SEGMENT_ID_PREDICTED_CONTEXTS` (§9.3 — av1-spec p.220) — number of
+/// contexts for `seg_id_predicted`. The §8.3.2 selection is
+/// `ctx = LeftSegPredContext[ MiRow ] + AboveSegPredContext[ MiCol ]`,
+/// each neighbour contributing `0` or `1`, so the sum is in `0..=2 <
+/// SEGMENT_ID_PREDICTED_CONTEXTS`.
+pub const SEGMENT_ID_PREDICTED_CONTEXTS: usize = 3;
+
 /// `MAX_SEGMENTS` (§9.3) — number of segments allowed in the
 /// segmentation map (number of `segment_id` symbol values).
 pub const MAX_SEGMENTS: usize = 8;
@@ -1334,6 +1341,23 @@ pub const DEFAULT_SEGMENT_ID_CDF: [[u16; MAX_SEGMENTS + 1]; SEGMENT_ID_CONTEXTS]
     [5622, 7893, 16093, 18233, 27809, 28373, 32533, 32768, 0],
     [14274, 18230, 22557, 24935, 29980, 30851, 32344, 32768, 0],
     [27527, 28487, 28723, 28890, 32397, 32647, 32679, 32768, 0],
+];
+
+/// `Default_Segment_Id_Predicted_Cdf[ SEGMENT_ID_PREDICTED_CONTEXTS ][ 3 ]`
+/// (§9.4 — av1-spec p.442). Binary symbol `seg_id_predicted` (§5.11.19,
+/// the `segmentation_temporal_update == 1` arm) — `1` means the block's
+/// `segment_id` is taken from the previous frame's segmentation map via
+/// `get_segment_id()`, `0` means the `read_segment_id()` follow-on
+/// reads the literal id. Per the §9.4 table all three contexts share the
+/// uniform start `{ 128 * 128, 32768, 0 } = { 16384, 32768, 0 }` (the
+/// adaptation counter slot is the trailing zero per the §8.3.1 init
+/// convention). The §8.3.2 selection is
+/// `TileSegmentIdPredictedCdf[ ctx ]` with `ctx =
+/// LeftSegPredContext[ MiRow ] + AboveSegPredContext[ MiCol ]`.
+pub const DEFAULT_SEGMENT_ID_PREDICTED_CDF: [[u16; 3]; SEGMENT_ID_PREDICTED_CONTEXTS] = [
+    [128 * 128, 32768, 0],
+    [128 * 128, 32768, 0],
+    [128 * 128, 32768, 0],
 ];
 
 // ---------------------------------------------------------------------
@@ -6774,6 +6798,10 @@ pub struct TileCdfContext {
     pub skip: [[u16; 3]; SKIP_CONTEXTS],
     /// `TileSegmentIdCdf` (§8.3.1).
     pub segment_id: [[u16; MAX_SEGMENTS + 1]; SEGMENT_ID_CONTEXTS],
+    /// `TileSegmentIdPredictedCdf` (§8.3.1 — av1-spec p.155). Codes the
+    /// binary `seg_id_predicted` symbol per §5.11.19 (the
+    /// `segmentation_temporal_update == 1` arm of `inter_segment_id`).
+    pub segment_id_predicted: [[u16; 3]; SEGMENT_ID_PREDICTED_CONTEXTS],
 
     // -----------------------------------------------------------------
     // Round 17 — motion-vector working CDFs. §8.3.1 enumerates each as
@@ -7150,6 +7178,7 @@ impl TileCdfContext {
             partition_w128: DEFAULT_PARTITION_W128_CDF,
             skip: DEFAULT_SKIP_CDF,
             segment_id: DEFAULT_SEGMENT_ID_CDF,
+            segment_id_predicted: DEFAULT_SEGMENT_ID_PREDICTED_CDF,
 
             mv_joint: [DEFAULT_MV_JOINT_CDF; MV_CONTEXTS],
             mv_sign: [mv_sign_row; MV_CONTEXTS],
@@ -7325,6 +7354,17 @@ impl TileCdfContext {
     /// `0..SEGMENT_ID_CONTEXTS`); see [`segment_id_ctx`].
     pub fn segment_id_cdf(&mut self, ctx: usize) -> &mut [u16] {
         &mut self.segment_id[ctx]
+    }
+
+    /// §8.3.2 `seg_id_predicted`: the cdf is
+    /// `TileSegmentIdPredictedCdf[ ctx ]` where `ctx =
+    /// LeftSegPredContext[ MiRow ] + AboveSegPredContext[ MiCol ]`
+    /// (each neighbour contributing `0` or `1`; sum in
+    /// `0..SEGMENT_ID_PREDICTED_CONTEXTS = 0..3`). Read by the
+    /// §5.11.19 `inter_segment_id` `segmentation_temporal_update == 1`
+    /// arm; see [`PartitionWalker::decode_inter_segment_id`].
+    pub fn segment_id_predicted_cdf(&mut self, ctx: usize) -> &mut [u16] {
+        &mut self.segment_id_predicted[ctx]
     }
 
     // -----------------------------------------------------------------
@@ -10760,6 +10800,21 @@ pub struct PartitionWalker {
     /// `-1` sentinel is the literal spec value rather than a
     /// shoehorned encoding.
     segment_ids: Vec<i32>,
+    /// `AboveSegPredContext[ MiCol ]` (av1-spec §5.11.19 / §8.3.2 — the
+    /// `seg_id_predicted` ctx walk reads the column-indexed value).
+    /// One slot per `mi_col` column; entries are `0` until a §5.11.19
+    /// `inter_segment_id` call has stamped a `seg_id_predicted` value
+    /// into the column. The initial-zero state matches the §8.3.1
+    /// tile-entry initialisation (`AboveSegPredContext[ i ] = 0`
+    /// for every column at tile start).
+    above_seg_pred_context: Vec<u8>,
+    /// `LeftSegPredContext[ MiRow ]` (av1-spec §5.11.19 / §8.3.2 — the
+    /// `seg_id_predicted` ctx walk reads the row-indexed value). One
+    /// slot per `mi_row` row; entries are `0` until a §5.11.19 call
+    /// has stamped a `seg_id_predicted` value into the row. The
+    /// initial-zero state matches the §8.3.1 tile-entry initialisation
+    /// (`LeftSegPredContext[ i ] = 0` for every row at tile start).
+    left_seg_pred_context: Vec<u8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -10809,6 +10864,19 @@ impl PartitionWalker {
         // call on a cell replaces the sentinel with a value in
         // `0..MAX_SEGMENTS`.
         segment_ids.resize(area, -1);
+        // §8.3.1 `AboveSegPredContext[ i ] = 0` / `LeftSegPredContext[ i
+        // ] = 0` for every i at tile entry. One slot per column / row;
+        // re-stamped by §5.11.19 calls as blocks decode.
+        let mut above_seg_pred_context: Vec<u8> = Vec::new();
+        above_seg_pred_context
+            .try_reserve_exact(mi_cols as usize)
+            .ok()?;
+        above_seg_pred_context.resize(mi_cols as usize, 0);
+        let mut left_seg_pred_context: Vec<u8> = Vec::new();
+        left_seg_pred_context
+            .try_reserve_exact(mi_rows as usize)
+            .ok()?;
+        left_seg_pred_context.resize(mi_rows as usize, 0);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -10821,6 +10889,8 @@ impl PartitionWalker {
             cdef_idx,
             is_inters,
             segment_ids,
+            above_seg_pred_context,
+            left_seg_pred_context,
             blocks: Vec::new(),
         })
     }
@@ -11229,6 +11299,26 @@ impl PartitionWalker {
             return -1;
         }
         self.segment_ids[(r * self.mi_cols + c) as usize]
+    }
+
+    /// View of the §5.11.19 / §8.3.2 `AboveSegPredContext[ MiCol ]`
+    /// per-column flag array. One slot per `mi_col` column; entries
+    /// are `0` until a §5.11.19 `inter_segment_id` call has stamped a
+    /// `seg_id_predicted` value into the column. The §8.3.2 ctx walk
+    /// adds `AboveSegPredContext[ MiCol ]` to
+    /// `LeftSegPredContext[ MiRow ]` (each in `0..=1`) for a sum in
+    /// `0..SEGMENT_ID_PREDICTED_CONTEXTS = 0..3`.
+    #[must_use]
+    pub fn above_seg_pred_context(&self) -> &[u8] {
+        &self.above_seg_pred_context
+    }
+
+    /// View of the §5.11.19 / §8.3.2 `LeftSegPredContext[ MiRow ]`
+    /// per-row flag array. One slot per `mi_row` row; semantics
+    /// mirror [`Self::above_seg_pred_context`].
+    #[must_use]
+    pub fn left_seg_pred_context(&self) -> &[u8] {
+        &self.left_seg_pred_context
     }
 
     /// Helper to read `MiSizes[ r ][ c ]`. Returns [`BLOCK_INVALID`]
@@ -12291,6 +12381,315 @@ impl PartitionWalker {
         // total.
         let lossless = lossless_array[segment_id as usize];
         Ok((segment_id, lossless))
+    }
+
+    /// `inter_segment_id( preSkip )` per §5.11.19 (av1-spec p.71) — the
+    /// inter-frame per-block segment-id read, called twice from
+    /// §5.11.18 `inter_frame_mode_info`: once with `preSkip = 1` before
+    /// the §5.11.11 `read_skip()` call (the §5.9.14 `SegIdPreSkip == 1`
+    /// arm activates the early write) and once with `preSkip = 0`
+    /// after (the post-skip arm covers the `SegIdPreSkip == 0` case
+    /// and the temporal-update / skip-after-pre-skip update of the
+    /// segmentation-prediction context arrays).
+    ///
+    /// The spec body (av1-spec p.71) reads:
+    ///
+    /// ```text
+    ///   inter_segment_id( preSkip ) {
+    ///       if ( segmentation_enabled ) {
+    ///           predictedSegmentId = get_segment_id( )
+    ///           if ( segmentation_update_map ) {
+    ///               if ( preSkip && !SegIdPreSkip ) {
+    ///                   segment_id = 0
+    ///                   return
+    ///               }
+    ///               if ( !preSkip ) {
+    ///                   if ( skip ) {
+    ///                       seg_id_predicted = 0
+    ///                       for ( i = 0; i < Num_4x4_Blocks_Wide[ MiSize ]; i++ )
+    ///                           AboveSegPredContext[ MiCol + i ] = seg_id_predicted
+    ///                       for ( i = 0; i < Num_4x4_Blocks_High[ MiSize ]; i++ )
+    ///                           LeftSegPredContext[ MiRow + i ] = seg_id_predicted
+    ///                       read_segment_id( )
+    ///                       return
+    ///                   }
+    ///               }
+    ///               if ( segmentation_temporal_update == 1 ) {
+    ///                   seg_id_predicted                                       S()
+    ///                   if ( seg_id_predicted )
+    ///                       segment_id = predictedSegmentId
+    ///                   else
+    ///                       read_segment_id( )
+    ///                   for ( i = 0; i < Num_4x4_Blocks_Wide[ MiSize ]; i++ )
+    ///                       AboveSegPredContext[ MiCol + i ] = seg_id_predicted
+    ///                   for ( i = 0; i < Num_4x4_Blocks_High[ MiSize ]; i++ )
+    ///                       LeftSegPredContext[ MiRow + i ] = seg_id_predicted
+    ///               } else {
+    ///                   read_segment_id( )
+    ///               }
+    ///           } else {
+    ///               segment_id = predictedSegmentId
+    ///           }
+    ///       } else {
+    ///           segment_id = 0
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// `pre_skip` is the §5.11.18 caller-axis (`1` on the pre-skip
+    /// call, `0` on the post-skip call). `seg_id_pre_skip`,
+    /// `segmentation_enabled`, `segmentation_update_map`, and
+    /// `segmentation_temporal_update` are the §5.9.14 frame-header
+    /// fields surfaced through [`SegmentationParams`]. `skip` is the
+    /// §5.11.11 `decode_skip` return (ignored on the `pre_skip = 1`
+    /// arm — that arm fires before `read_skip` per §5.11.18, so the
+    /// caller passes `0`). `last_active_seg_id` is the §5.9.14
+    /// trailing derivation; `lossless_array` is the §6.8.2 per-segment
+    /// table.
+    ///
+    /// `predictedSegmentId = get_segment_id()` per §5.11.21 reads the
+    /// previous-frame segmentation map. Because the walker stays
+    /// inter-frame-state-free (the current-frame `segment_ids[]` grid
+    /// is the only segmentation surface it owns), callers pass the
+    /// pre-computed `predicted_segment_id` they derived from the §6.10
+    /// reference-frame walk's `PrevSegmentIds[]` lookup over the
+    /// `Min(MiCols - MiCol, bw4)` × `Min(MiRows - MiRow, bh4)` window.
+    /// For the §5.11.19 `temporal_update == 1` `seg_id_predicted = 1`
+    /// arm this becomes the literal `segment_id` (no `S()` read for
+    /// the id itself); for the `seg_id_predicted = 0` arm the
+    /// `read_segment_id()` follow-on reads the literal id off the
+    /// bitstream via [`Self::decode_segment_id`].
+    ///
+    /// Returns `(segment_id, lossless)` where `segment_id ∈
+    /// 0..=last_active_seg_id` (or `0` on the disabled / pre-skip
+    /// early-exit branches) and `lossless == lossless_array[ segment_id
+    /// as usize ]`. The [`Self::above_seg_pred_context`] /
+    /// [`Self::left_seg_pred_context`] arrays are re-stamped over the
+    /// block's `bw4` columns / `bh4` rows on the two arms that update
+    /// them (the `!preSkip && skip` arm and the
+    /// `temporal_update == 1` arm); the other arms leave the context
+    /// arrays untouched per the spec body.
+    ///
+    /// Returns [`Error::PartitionWalkOutOfRange`] for caller-bug
+    /// arguments (out-of-range `sub_size`, `mi_row` / `mi_col` past
+    /// the frame's mi extent, `last_active_seg_id >= MAX_SEGMENTS`,
+    /// or `predicted_segment_id > last_active_seg_id`).
+    /// [`Error::UnexpectedEnd`] / [`Error::SymbolExitUnderflow`]
+    /// surface bitstream errors from the inner reads.
+    ///
+    /// [`SegmentationParams`]: crate::uncompressed_header_tail::SegmentationParams
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_inter_segment_id(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        pre_skip: bool,
+        skip: u8,
+        seg_id_pre_skip: bool,
+        segmentation_enabled: bool,
+        segmentation_update_map: bool,
+        segmentation_temporal_update: bool,
+        predicted_segment_id: u8,
+        last_active_seg_id: u8,
+        lossless_array: &[bool; MAX_SEGMENTS],
+    ) -> Result<(u8, bool), crate::Error> {
+        // Range guards fire up-front on both arms so the no-symbol path
+        // is total over the same input space as the bitstream-reading
+        // path (matching the r160 `decode_intra_segment_id` pattern).
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if predicted_segment_id as u32 > last_active_seg_id as u32 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.19 outer `if ( segmentation_enabled )` gate. The
+        // disabled arm collapses to `segment_id = 0` with no bits
+        // read; stamp the grid for downstream §5.11.9 neighbour
+        // lookups (matching the §5.11.8 disabled-branch grid-fill).
+        if !segmentation_enabled {
+            self.stamp_segment_id_grid(mi_row, mi_col, sub_size, 0);
+            let lossless = lossless_array[0];
+            return Ok((0, lossless));
+        }
+
+        // §5.11.19 inner `if ( segmentation_update_map )` gate. The
+        // else-branch collapses to `segment_id = predictedSegmentId`
+        // (no bits read, no context updates). Stamp the grid the same
+        // way so neighbour lookups see the actual id, not the -1
+        // sentinel.
+        if !segmentation_update_map {
+            let sid = predicted_segment_id;
+            self.stamp_segment_id_grid(mi_row, mi_col, sub_size, sid as i32);
+            let lossless = lossless_array[sid as usize];
+            return Ok((sid, lossless));
+        }
+
+        // §5.11.19 `if ( preSkip && !SegIdPreSkip ) { segment_id = 0;
+        // return }`. The pre-skip caller fires this early-exit when
+        // the §5.9.14 `SegIdPreSkip` derivation says the segment-id
+        // should be deferred to the post-skip call. No bits read, no
+        // context updates, but the grid is still stamped so
+        // intervening §5.11.9 lookups see a real `0`.
+        if pre_skip && !seg_id_pre_skip {
+            self.stamp_segment_id_grid(mi_row, mi_col, sub_size, 0);
+            let lossless = lossless_array[0];
+            return Ok((0, lossless));
+        }
+
+        // §5.11.19 `if ( !preSkip ) { if ( skip ) { ... return } }` —
+        // the post-skip arm's skip-block branch. `seg_id_predicted` is
+        // forced to `0` (not read), the context arrays are stamped to
+        // `0`, then `read_segment_id()` reads the id off the
+        // bitstream (the §5.11.9 `skip` short-circuit fires inside
+        // because the caller-passed `skip == 1`, so `segment_id =
+        // pred` with no `S()` read).
+        if !pre_skip && skip != 0 {
+            self.stamp_seg_pred_context(mi_row, mi_col, sub_size, 0);
+            let sid = self.decode_segment_id(
+                decoder,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                skip,
+                last_active_seg_id,
+            )?;
+            let lossless = lossless_array[sid as usize];
+            return Ok((sid, lossless));
+        }
+
+        // §5.11.19 `if ( segmentation_temporal_update == 1 )` branch:
+        // read the binary `seg_id_predicted` symbol, then either
+        // adopt the predicted id (no further read) or fall through
+        // to `read_segment_id()`; in both cases, stamp the context
+        // arrays with the just-read flag.
+        if segmentation_temporal_update {
+            let ctx = self.seg_pred_ctx(mi_row, mi_col);
+            let cdf = cdfs.segment_id_predicted_cdf(ctx);
+            let seg_id_predicted = decoder.read_symbol(cdf)? as u8;
+            // The cdf is a binary symbol (3 slots: two cumulative + one
+            // counter); `read_symbol` returns 0 or 1.
+            debug_assert!(seg_id_predicted <= 1, "§5.11.19 seg_id_predicted is binary");
+            let sid: u8 = if seg_id_predicted != 0 {
+                // §5.11.19 `if ( seg_id_predicted ) segment_id =
+                // predictedSegmentId` — adopt the previous-frame id;
+                // still stamp the current-frame grid so neighbour
+                // lookups see the actual id.
+                self.stamp_segment_id_grid(mi_row, mi_col, sub_size, predicted_segment_id as i32);
+                predicted_segment_id
+            } else {
+                // §5.11.19 `else read_segment_id()` — descend into the
+                // r159 implementation, which stamps the grid itself.
+                // `skip` is the caller-passed value (0 on the pre-skip
+                // call; non-zero on the post-skip call short-circuits
+                // earlier, so here it's effectively 0).
+                self.decode_segment_id(
+                    decoder,
+                    cdfs,
+                    mi_row,
+                    mi_col,
+                    sub_size,
+                    skip,
+                    last_active_seg_id,
+                )?
+            };
+            self.stamp_seg_pred_context(mi_row, mi_col, sub_size, seg_id_predicted);
+            let lossless = lossless_array[sid as usize];
+            return Ok((sid, lossless));
+        }
+
+        // §5.11.19 `else read_segment_id()` — the
+        // `segmentation_temporal_update == 0` fall-through. The
+        // context arrays stay untouched (the spec writes them only
+        // on the two arms above), and the inner call stamps the
+        // segment-id grid.
+        let sid = self.decode_segment_id(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip,
+            last_active_seg_id,
+        )?;
+        let lossless = lossless_array[sid as usize];
+        Ok((sid, lossless))
+    }
+
+    /// Helper for [`Self::decode_inter_segment_id`]: re-stamp the
+    /// block's `bw4` columns of `AboveSegPredContext[]` and `bh4` rows
+    /// of `LeftSegPredContext[]` with the given binary `flag`.
+    /// Frame-edge cells are skipped (mirroring the §5.11.5 grid-fill
+    /// edge-clip pattern).
+    #[inline]
+    fn stamp_seg_pred_context(&mut self, mi_row: u32, mi_col: u32, sub_size: usize, flag: u8) {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for i in 0..bw4 {
+            let cc = mi_col + i;
+            if cc >= self.mi_cols {
+                break;
+            }
+            self.above_seg_pred_context[cc as usize] = flag;
+        }
+        for i in 0..bh4 {
+            let rr = mi_row + i;
+            if rr >= self.mi_rows {
+                break;
+            }
+            self.left_seg_pred_context[rr as usize] = flag;
+        }
+    }
+
+    /// Helper for [`Self::decode_inter_segment_id`]: stamp the
+    /// `bh4 * bw4` footprint of `segment_ids[]` with the given
+    /// `segment_id` value (used on the no-read arms — `segmentation_enabled
+    /// == false`, `!segmentation_update_map`, the pre-skip
+    /// `!SegIdPreSkip` early return, and the `seg_id_predicted == 1`
+    /// adoption of `predictedSegmentId`). The read-via-`decode_segment_id`
+    /// arms stamp the grid themselves and skip this helper.
+    #[inline]
+    fn stamp_segment_id_grid(&mut self, mi_row: u32, mi_col: u32, sub_size: usize, sid: i32) {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.segment_ids[(rr * self.mi_cols + cc) as usize] = sid;
+            }
+        }
+    }
+
+    /// Helper for [`Self::decode_inter_segment_id`]: derive the §8.3.2
+    /// `seg_id_predicted` ctx (`LeftSegPredContext[ MiRow ] +
+    /// AboveSegPredContext[ MiCol ]`). Each contribution is in
+    /// `0..=1`, so the sum is in `0..SEGMENT_ID_PREDICTED_CONTEXTS =
+    /// 0..3`.
+    #[inline]
+    fn seg_pred_ctx(&self, mi_row: u32, mi_col: u32) -> usize {
+        let left = self.left_seg_pred_context[mi_row as usize] as usize;
+        let above = self.above_seg_pred_context[mi_col as usize] as usize;
+        left + above
     }
 
     /// `read_delta_qindex()` per §5.11.12 (av1-spec p.67) — reads the
@@ -24278,6 +24677,602 @@ mod tests {
             assert_eq!(prefix.skip_mode, 0);
             // §5.11.7 line 4 left SkipModes[] untouched.
             assert_eq!(walker_local.skip_modes()[0], 0, "SkipModes[0][0] = 0");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Round 162 — §5.11.19 `inter_segment_id( preSkip )` tests.
+    // -----------------------------------------------------------------
+
+    /// Fresh walker exposes zeroed §5.11.19 / §8.3.2
+    /// `AboveSegPredContext[]` and `LeftSegPredContext[]` arrays of
+    /// length `MiCols` and `MiRows` respectively.
+    #[test]
+    fn fresh_walker_seg_pred_context_is_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        assert_eq!(walker.above_seg_pred_context().len(), 16);
+        assert_eq!(walker.left_seg_pred_context().len(), 16);
+        for &slot in walker.above_seg_pred_context() {
+            assert_eq!(slot, 0, "fresh AboveSegPredContext[] = 0");
+        }
+        for &slot in walker.left_seg_pred_context() {
+            assert_eq!(slot, 0, "fresh LeftSegPredContext[] = 0");
+        }
+    }
+
+    /// §5.11.19 `!segmentation_enabled` outer branch: `segment_id = 0`
+    /// with no bits read; grid stamped over the block footprint; the
+    /// `seg_pred_context` arrays stay untouched.
+    #[test]
+    fn decode_inter_segment_id_segmentation_disabled_no_read() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[0] = true;
+        for &pre_skip in &[true, false] {
+            let (sid, lossless) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut cdfs,
+                    0,
+                    0,
+                    BLOCK_8X8,
+                    pre_skip,
+                    0,
+                    /* seg_id_pre_skip = */ true,
+                    /* segmentation_enabled = */ false,
+                    /* segmentation_update_map = */ true,
+                    /* segmentation_temporal_update = */ true,
+                    /* predicted_segment_id = */ 5,
+                    /* last_active_seg_id = */ 7,
+                    &lossless_array,
+                )
+                .unwrap();
+            assert_eq!(sid, 0, "!segmentation_enabled ⇒ segment_id = 0");
+            assert!(lossless, "Lossless = LosslessArray[0] = true");
+            assert_eq!(dec.position(), pos_before, "no bits consumed");
+            for &slot in walker.above_seg_pred_context() {
+                assert_eq!(slot, 0, "seg_pred context untouched");
+            }
+            for &slot in walker.left_seg_pred_context() {
+                assert_eq!(slot, 0, "seg_pred context untouched");
+            }
+        }
+        // Grid-fill: footprint of BLOCK_8X8 (2×2) at (0, 0) is stamped.
+        for r in 0..2 {
+            for c in 0..2 {
+                assert_eq!(walker.segment_ids()[r * 16 + c], 0);
+            }
+        }
+        assert_eq!(walker.segment_ids()[2 * 16], -1);
+    }
+
+    /// §5.11.19 `!segmentation_update_map` inner branch:
+    /// `segment_id = predictedSegmentId` with no bits read; grid
+    /// stamped over the footprint; the `seg_pred_context` arrays stay
+    /// untouched. `Lossless = LosslessArray[ predictedSegmentId ]`.
+    #[test]
+    fn decode_inter_segment_id_no_update_map_adopts_predicted() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[3] = true;
+        let (sid, lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* pre_skip = */ true,
+                0,
+                /* seg_id_pre_skip = */ true,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ false,
+                /* segmentation_temporal_update = */ true,
+                /* predicted_segment_id = */ 3,
+                /* last_active_seg_id = */ 7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 3, "predictedSegmentId adopted on !update_map");
+        assert!(lossless, "Lossless = LosslessArray[3] = true");
+        assert_eq!(dec.position(), pos_before, "no bits consumed");
+        for &slot in walker.above_seg_pred_context() {
+            assert_eq!(slot, 0);
+        }
+        for &slot in walker.left_seg_pred_context() {
+            assert_eq!(slot, 0);
+        }
+        // Grid-fill: footprint stamped with predicted id 3.
+        assert_eq!(walker.segment_ids()[0], 3);
+        assert_eq!(walker.segment_ids()[1], 3);
+        assert_eq!(walker.segment_ids()[16], 3);
+        assert_eq!(walker.segment_ids()[17], 3);
+        assert_eq!(walker.segment_ids()[2 * 16], -1);
+    }
+
+    /// §5.11.19 `if ( preSkip && !SegIdPreSkip ) { segment_id = 0;
+    /// return }` early-exit: the pre-skip caller sees `segment_id = 0`
+    /// with no bits read; context arrays untouched; grid stamped to 0.
+    #[test]
+    fn decode_inter_segment_id_pre_skip_with_post_skip_pre_skip_flag_returns_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[0] = true;
+        let (sid, lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* pre_skip = */ true,
+                0,
+                /* seg_id_pre_skip = */ false,
+                true,
+                true,
+                true,
+                /* predicted_segment_id = */ 4,
+                7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 0, "pre_skip && !SegIdPreSkip ⇒ segment_id = 0");
+        assert!(lossless);
+        assert_eq!(dec.position(), pos_before, "no bits consumed");
+        for &slot in walker.above_seg_pred_context() {
+            assert_eq!(slot, 0);
+        }
+        for &slot in walker.left_seg_pred_context() {
+            assert_eq!(slot, 0);
+        }
+        // Grid stamped to 0 so subsequent neighbour lookups see a
+        // real zero rather than the -1 sentinel.
+        assert_eq!(walker.segment_ids()[0], 0);
+        assert_eq!(walker.segment_ids()[17], 0);
+    }
+
+    /// §5.11.19 `if ( !preSkip ) if ( skip ) { seg_id_predicted = 0;
+    /// stamp arrays; read_segment_id(); return }`: post-skip arm with
+    /// `skip = 1`. `seg_id_predicted = 0` so the context arrays are
+    /// stamped to 0 (their initial value, but the explicit write is
+    /// observable on a non-origin block — verify by pre-poisoning).
+    /// The §5.11.9 skip short-circuit fires inside `decode_segment_id`
+    /// (no `S()` read; `segment_id = pred = 0` at the frame origin).
+    #[test]
+    fn decode_inter_segment_id_post_skip_with_skip_clears_context_and_short_circuits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Poison the context arrays so the explicit `seg_id_predicted
+        // = 0` write is observable (otherwise the initial-zero state
+        // would mask the spec write).
+        for slot in walker.above_seg_pred_context.iter_mut() {
+            *slot = 1;
+        }
+        for slot in walker.left_seg_pred_context.iter_mut() {
+            *slot = 1;
+        }
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let lossless_array = [true; MAX_SEGMENTS];
+        let (sid, lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* pre_skip = */ false,
+                /* skip = */ 1,
+                /* seg_id_pre_skip = */ false,
+                true,
+                true,
+                true,
+                /* predicted_segment_id = */ 5,
+                7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 0, "§5.11.9 skip-short-circuit: pred = 0 at origin");
+        assert!(lossless);
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no `S()` read on the inner skip-short-circuit",
+        );
+        // Block footprint (BLOCK_8X8 = 2x2) re-stamped to 0.
+        for i in 0..2 {
+            assert_eq!(walker.above_seg_pred_context()[i], 0);
+            assert_eq!(walker.left_seg_pred_context()[i], 0);
+        }
+        // Columns / rows outside the footprint retain the poison.
+        assert_eq!(walker.above_seg_pred_context()[2], 1);
+        assert_eq!(walker.left_seg_pred_context()[2], 1);
+    }
+
+    /// §5.11.19 `temporal_update == 1, seg_id_predicted == 1` arm:
+    /// reads one `S()` against the rigged binary cdf forcing the `1`
+    /// symbol, then adopts `predictedSegmentId` with no further read.
+    /// Context arrays stamped to 1 over the footprint.
+    #[test]
+    fn decode_inter_segment_id_temporal_update_predicted_adopts_predicted_id() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig every ctx row to force `seg_id_predicted = 1`.
+        let rigged = force_binary_cdf(1);
+        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
+            cdfs.segment_id_predicted[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let mut lossless_array = [false; MAX_SEGMENTS];
+        lossless_array[6] = true;
+        let (sid, lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* pre_skip = */ true,
+                0,
+                /* seg_id_pre_skip = */ true,
+                true,
+                true,
+                /* segmentation_temporal_update = */ true,
+                /* predicted_segment_id = */ 6,
+                7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(
+            sid, 6,
+            "seg_id_predicted = 1 ⇒ segment_id = predictedSegmentId"
+        );
+        assert!(lossless, "Lossless = LosslessArray[6] = true");
+        // Context arrays stamped to 1 over BLOCK_8X8 (2x2).
+        for i in 0..2 {
+            assert_eq!(walker.above_seg_pred_context()[i], 1);
+            assert_eq!(walker.left_seg_pred_context()[i], 1);
+        }
+        // Grid stamped with id = 6 — the §5.11.19 `seg_id_predicted ==
+        // 1` arm adopts predictedSegmentId without descending into
+        // `read_segment_id()`, so no §5.11.5 grid stamp from the
+        // inner call; the helper's explicit `stamp_segment_id_grid`
+        // covers it.
+        assert_eq!(walker.segment_ids()[0], 6);
+        assert_eq!(walker.segment_ids()[17], 6);
+    }
+
+    /// §5.11.19 `temporal_update == 1, seg_id_predicted == 0` arm:
+    /// reads the binary `S()` returning 0, then descends into
+    /// `read_segment_id()` (the §5.11.9 path). Context arrays stamped
+    /// to 0. The exact `decode_segment_id` return depends on the
+    /// chained arithmetic-coder state after the binary read; the
+    /// invariants are (i) `sid` is in the `0..=last_active_seg_id`
+    /// range, (ii) the `seg_id_predicted == 0` context-array write
+    /// over the block footprint is observable (we poison the arrays
+    /// first), and (iii) the grid was stamped over the footprint.
+    #[test]
+    fn decode_inter_segment_id_temporal_update_unpredicted_reads_segment_id() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig seg_id_predicted to `0`.
+        let rigged_pred = force_binary_cdf(0);
+        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
+            cdfs.segment_id_predicted[ctx_idx] = rigged_pred;
+        }
+        // Poison context arrays so the explicit `0` write is visible.
+        for slot in walker.above_seg_pred_context.iter_mut() {
+            *slot = 1;
+        }
+        for slot in walker.left_seg_pred_context.iter_mut() {
+            *slot = 1;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+        let (sid, _lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* pre_skip = */ true,
+                0,
+                /* seg_id_pre_skip = */ true,
+                true,
+                true,
+                /* segmentation_temporal_update = */ true,
+                /* predicted_segment_id = */ 2,
+                /* last_active_seg_id = */ 7,
+                &lossless_array,
+            )
+            .unwrap();
+        // Invariant (i): sid is bounded.
+        assert!(sid <= 7, "sid = {sid} > last_active_seg_id");
+        // Invariant (ii): context arrays stamped to 0 over BLOCK_8X8.
+        for i in 0..2 {
+            assert_eq!(
+                walker.above_seg_pred_context()[i],
+                0,
+                "AboveSegPredContext[{i}] = 0 from seg_id_predicted write",
+            );
+            assert_eq!(
+                walker.left_seg_pred_context()[i],
+                0,
+                "LeftSegPredContext[{i}] = 0 from seg_id_predicted write",
+            );
+        }
+        // Columns / rows outside the footprint retain the poison.
+        assert_eq!(walker.above_seg_pred_context()[2], 1);
+        assert_eq!(walker.left_seg_pred_context()[2], 1);
+        // Invariant (iii): grid stamped over footprint — the
+        // descent into `decode_segment_id` did write the cells.
+        assert_ne!(
+            walker.segment_ids()[0],
+            -1,
+            "segment_ids[0] stamped (not the -1 sentinel)",
+        );
+        assert_eq!(walker.segment_ids()[0], sid as i32);
+    }
+
+    /// §5.11.19 `temporal_update == 0` fall-through: straight
+    /// `read_segment_id()` call; context arrays untouched per spec
+    /// (the writes happen only on the two arms above).
+    #[test]
+    fn decode_inter_segment_id_no_temporal_update_reads_segment_id_only() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_segment_id_cdf(2);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged;
+        }
+        // Poison context arrays — should remain poisoned (no spec
+        // write on this arm).
+        for slot in walker.above_seg_pred_context.iter_mut() {
+            *slot = 1;
+        }
+        for slot in walker.left_seg_pred_context.iter_mut() {
+            *slot = 1;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+        let (sid, _lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                /* pre_skip = */ true,
+                0,
+                /* seg_id_pre_skip = */ true,
+                true,
+                true,
+                /* segmentation_temporal_update = */ false,
+                /* predicted_segment_id = */ 1,
+                7,
+                &lossless_array,
+            )
+            .unwrap();
+        assert_eq!(sid, 2);
+        // Context arrays unchanged from the poison value (the spec
+        // writes them only on the `!preSkip && skip` arm and the
+        // `temporal_update == 1` arm).
+        for &slot in walker.above_seg_pred_context() {
+            assert_eq!(slot, 1, "no spec write on the no-temporal-update arm");
+        }
+        for &slot in walker.left_seg_pred_context() {
+            assert_eq!(slot, 1, "no spec write on the no-temporal-update arm");
+        }
+    }
+
+    /// §5.11.19 § range guards fire on all arms (out-of-range
+    /// `sub_size`, `mi_row` / `mi_col`, `last_active_seg_id`, and the
+    /// `predicted_segment_id > last_active_seg_id` invariant) without
+    /// reading the bitstream.
+    #[test]
+    fn decode_inter_segment_id_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 4];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 4, true).unwrap();
+        let lossless_array = [false; MAX_SEGMENTS];
+        // mi_row out of range.
+        assert_eq!(
+            walker.decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                8,
+                0,
+                BLOCK_4X4,
+                true,
+                0,
+                true,
+                true,
+                true,
+                false,
+                0,
+                0,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+        // mi_col out of range.
+        assert_eq!(
+            walker.decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                8,
+                BLOCK_4X4,
+                true,
+                0,
+                true,
+                true,
+                true,
+                false,
+                0,
+                0,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+        // sub_size out of range.
+        assert_eq!(
+            walker.decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_SIZES,
+                true,
+                0,
+                true,
+                true,
+                true,
+                false,
+                0,
+                0,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+        // last_active_seg_id >= MAX_SEGMENTS.
+        assert_eq!(
+            walker.decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                true,
+                0,
+                true,
+                true,
+                true,
+                false,
+                0,
+                8,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+        // predicted_segment_id > last_active_seg_id.
+        assert_eq!(
+            walker.decode_inter_segment_id(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                true,
+                0,
+                true,
+                true,
+                true,
+                false,
+                5,
+                4,
+                &lossless_array,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange),
+        );
+    }
+
+    /// §8.3.1 init: `TileSegmentIdPredictedCdf` is set to a copy of
+    /// `Default_Segment_Id_Predicted_Cdf` per av1-spec p.155. Verify
+    /// the field is laid out per §9.4 (three rows of `[16384, 32768,
+    /// 0]`).
+    #[test]
+    fn default_segment_id_predicted_cdf_layout() {
+        let ctx = TileCdfContext::new_from_defaults();
+        for ctx_idx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
+            assert_eq!(ctx.segment_id_predicted[ctx_idx], [16384, 32768, 0]);
+        }
+    }
+
+    /// §8.3.2 selector: `segment_id_predicted_cdf(ctx)` returns the
+    /// `ctx`-th row of the working CDF. Mutating through the returned
+    /// reference is observable.
+    #[test]
+    fn segment_id_predicted_cdf_accessor_round_trip() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        for i in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
+            let row = ctx.segment_id_predicted_cdf(i);
+            row[0] = (10_000u16 + i as u16).wrapping_add(0);
+        }
+        for i in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
+            assert_eq!(ctx.segment_id_predicted[i][0], 10_000u16 + i as u16);
         }
     }
 }

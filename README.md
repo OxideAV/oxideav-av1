@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 161)
+## Status — 2026-05-27 (round 162)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,65 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 162 lands the §5.11.19 **`inter_segment_id( preSkip )` syntax
+element** (av1-spec p.71) as a new
+`PartitionWalker::decode_inter_segment_id` method. `inter_segment_id`
+is the §5.11.18 inter-frame variant of the per-block segment-id read,
+called twice per block (once with `preSkip = 1` before the §5.11.11
+`read_skip()` call and once with `preSkip = 0` after); together with
+the §5.9.14 `SegIdPreSkip` derivation, the two calls cover every
+combination of "segment-id read before / after skip" the inter-frame
+walk encounters. New `SEGMENT_ID_PREDICTED_CONTEXTS = 3` constant and
+new `DEFAULT_SEGMENT_ID_PREDICTED_CDF[3][3]` table verbatim from
+av1-spec p.442 (each ctx row is the uniform `[128 * 128, 32768, 0]`
+binary start). New `TileCdfContext::segment_id_predicted` field plus
+`segment_id_predicted_cdf(ctx)` accessor implementing the §8.3.2
+selection. New persistent `above_seg_pred_context: Vec<u8>` (length
+`mi_cols`) and `left_seg_pred_context: Vec<u8>` (length `mi_rows`)
+buffers on `PartitionWalker` per the §8.3.1 tile-entry initialisation
+(`AboveSegPredContext[i] = 0`, `LeftSegPredContext[i] = 0`); the
+§8.3.2 ctx walk reads `LeftSegPredContext[ MiRow ] +
+AboveSegPredContext[ MiCol ]` (each `0..=1`, sum `0..=2`). The
+dispatcher routes the full §5.11.19 cascade exactly: outer
+`!segmentation_enabled` collapses to `segment_id = 0`; inner
+`!segmentation_update_map` adopts `predictedSegmentId` without
+reading; the `pre_skip && !SegIdPreSkip` early-exit returns
+`segment_id = 0`; the post-skip `skip != 0` arm zeroes the context
+arrays then descends into `decode_segment_id` (the §5.11.9 path
+short-circuits on `skip`); the `segmentation_temporal_update == 1`
+arm reads the binary `seg_id_predicted` symbol, branches to
+`predictedSegmentId` adopt or `read_segment_id()`, then stamps the
+context arrays; the `temporal_update == 0` fall-through reads
+`read_segment_id()` without touching the context arrays. The
+`predicted_segment_id` (§5.11.21 `get_segment_id()`) is caller-supplied
+from the §6.10 reference-frame walk's `PrevSegmentIds[]` lookup so
+the walker stays inter-frame-state-free. Range guards (`sub_size >=
+BLOCK_SIZES`, `mi_row`/`mi_col` past extent, `last_active_seg_id >=
+MAX_SEGMENTS`, `predicted_segment_id > last_active_seg_id`) fire
+up-front. 11 new cdf-module tests (509 → 520): fresh-walker
+context-array zeroing; `!segmentation_enabled` no-read on both
+pre/post-skip arms; `!segmentation_update_map` adopts predicted-id
+without reading; `pre_skip && !SegIdPreSkip` early-exit;
+post-skip + `skip != 0` zeroes context arrays then descends into
+the §5.11.9 short-circuit (poisoned-context arrays prove the spec
+write fires); `temporal_update == 1` + rigged `seg_id_predicted = 1`
+adopts `predictedSegmentId` and stamps context arrays to `1`;
+`temporal_update == 1` + rigged `seg_id_predicted = 0` descends into
+`read_segment_id()` and stamps context arrays to `0`;
+`temporal_update == 0` fall-through leaves context arrays untouched;
+five-way out-of-range guard; `Default_Segment_Id_Predicted_Cdf`
+layout (`[16384, 32768, 0]` per row) and the
+`segment_id_predicted_cdf` accessor round-trip. The §5.11.18
+`inter_frame_mode_info()` top-level dispatcher (`use_intrabc` arm
++ the `LeftRefFrame`/`AboveRefFrame`/`LeftIntra`/`AboveIntra` /
+`LeftSingle`/`AboveSingle` derivations + the §5.11.18 two-call
+`inter_segment_id` protocol composing on top of r152
+`read_skip()` / r156 `read_cdef()` / r154 `read_delta_qindex()` /
+r155 `read_delta_lf()` / r158 `read_is_inter()` /
+§5.11.22 `intra_block_mode_info` / §5.11.23 `inter_block_mode_info`)
+is the next round's architectural payoff. `decode_av1` /
+`encode_av1` continue to return `Error::NotImplemented`.
 
 Round 161 lands the §5.11.7 **`intra_frame_mode_info()` prefix
 dispatcher** (av1-spec p.64) as a new
