@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 177)
+## Status — 2026-05-28 (round 178)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1485,6 +1485,73 @@ showing `skip_mode = 1` surfacing
 `Ok(DecodedInterBlockModeInfo { motion_mode: SIMPLE, .. })`. Test
 count: 672 → 691 (+19). `decode_av1` / `encode_av1` still return
 `Error::NotImplemented`.
+
+Round 178 lands the **§5.11.x `read_interpolation_filter` reader** —
+the LAST leaf of the §5.11.23 inter cascade. The §5.11.23 dispatcher
+now runs the entire `inter_block_mode_info()` body to completion;
+the §5.11.18 dispatcher continues to surface
+`InterBlockModeInfoUnsupported` from its `Ok(_)` arm pending the
+next-arc §5.11.34 `residual()` lift and the follow-on refactor that
+lifts the `DecodedInterBlockModeInfo` aggregate into the
+`DecodedInterFrameModeInfo` return path.
+
+The §5.11.x body composes two paths: the `interpolation_filter ==
+SWITCHABLE` arm runs the per-direction `for dir = 0..(enable_dual_filter
+? 2 : 1)` loop with the inner `if ( needs_interp_filter( ) )
+interp_filter[ dir ] S() against TileInterpFilterCdf[ ctx ] else
+interp_filter[ dir ] = EIGHTTAP` branch, and on the
+`!enable_dual_filter` post-loop mirror sets `interp_filter[ 1 ] =
+interp_filter[ 0 ]`. The `else` arm forces both slots to the
+frame-header value (`interpolation_filter`) with no per-block bits.
+
+`needs_interp_filter( )` (av1-spec p.75) is also lifted: it closes
+the gate on `skip_mode || motion_mode == LOCALWARP`, plus the two
+large-block GLOBALMV / GLOBAL_GLOBALMV paths consult the
+caller-supplied `GmType[ RefFrame[ . ] ] == TRANSLATION` predicate;
+the default arm returns `1`.
+
+The §8.3.2 `interp_filter` ctx walk consumes the §8.3.2 paragraph
+verbatim through `interp_filter_ctx` (already in place since round
+22): a folded `((dir & 1) * 2 + (RefFrame[1] > INTRA_FRAME)) * 4` ctx
+seed, then the two neighbour-mismatch / match-and-equal / one-mismatch
+arms. The match test consults the neighbour cell's
+`RefFrames[..][..][0..2]` against the current block's `RefFrame[0]`;
+non-matching neighbours collapse to the `aboveType = leftType = 3`
+sentinel (`INTERP_FILTER_NONE`).
+
+The walker grows an `InterpFilters[r][c][dir]` grid (two slots per
+cell, pre-fill `EIGHTTAP = 0`), stamped over the bh4 * bw4 footprint
+on every inter block decode so the next block's ctx walk observes
+the values. The `interp_filters()` accessor surfaces it.
+
+New §6.8.9 named ordinals land: `EIGHTTAP = 0`, `EIGHTTAP_SMOOTH = 1`,
+`EIGHTTAP_SHARP = 2`, `BILINEAR = 3`, `SWITCHABLE = 4`. New
+`InterpolationFilterReadout` aggregate carries `interp_filter: [u8; 2]`
+and `read_from_bitstream: [bool; 2]` (the per-dir "did this slot
+fire an S()?" flag). `DecodedInterBlockModeInfo` gains an
+`interp_filter: InterpolationFilterReadout` field.
+`decode_inter_block_mode_info` and `decode_inter_frame_mode_info` gain
+two new caller-supplied scalars: `interpolation_filter: u8` (§5.9.10
+frame-header value) and `enable_dual_filter: bool` (§5.5.2
+sequence-header bit).
+
+10 new unit tests cover: the §6.8.9 ordinal alignment (and the
+`INTERP_FILTERS` boundary against `BILINEAR`); the non-switchable
+arm (both slots forced to the frame-header value, no bits read);
+the four `needs_interp_filter == 0` short-circuits (`skip_mode`,
+`motion_mode == LOCALWARP`, large GLOBALMV + non-TRANSLATION
+gm_type) all collapsing to EIGHTTAP with no bits; the
+`SWITCHABLE && needs_interp_filter` single-dir path (one S() ⇒ both
+slots get the symbol, `read_from_bitstream = [true, false]`); the
+dual-dir path (two S()s ⇒ `read_from_bitstream = [true, true]`); the
+three caller-bug guards (out-of-range `sub_size` /
+`interpolation_filter` / `ref_frame[0]` all surface
+`PartitionWalkOutOfRange`); and an end-to-end §5.11.23 cascade test
+through the dispatcher witnessing the `InterpolationFilterReadout`
+on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
+the walker's `interp_filters` grid stamped EIGHTTAP over the
+BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
+`encode_av1` still return `Error::NotImplemented`.
 
 Round 177 lands the **§5.11.29 `read_compound_type` reader** —
 wiring the inter-inter compound-blending controls into the §5.11.23

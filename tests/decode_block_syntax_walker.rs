@@ -1292,6 +1292,8 @@ fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     let pos_after = dec.position();
     assert_eq!(
@@ -1381,6 +1383,8 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     assert_eq!(
         result,
@@ -1472,6 +1476,8 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     assert_eq!(
         result,
@@ -1554,6 +1560,8 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     assert_eq!(result, Err(Error::InterBlockModeInfoUnsupported));
 }
@@ -1615,6 +1623,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range mi_col.
@@ -1664,6 +1674,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range sub_size.
@@ -1713,6 +1725,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range last_active_seg_id.
@@ -1762,6 +1776,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* enable_masked_compound = */ false,
         /* enable_jnt_comp = */ false,
         /* dist_equal = */ false,
+        /* interpolation_filter = */ 0,
+        /* enable_dual_filter = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 }

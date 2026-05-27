@@ -1615,6 +1615,13 @@ pub use cdf::{
     MODE_NEAREST_NEWMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
     MODE_NEW_NEARESTMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_BORDER, REF_CAT_LEVEL,
 };
+// r178: §5.11.x `read_interpolation_filter` named ordinals + readout
+// aggregate, plus the §5.11.28 / §5.11.29 readout aggregates exposed
+// alongside (each `DecodedInterBlockModeInfo` field references them).
+pub use cdf::{
+    CompoundTypeReadout, InterIntraReadout, InterpolationFilterReadout, BILINEAR, EIGHTTAP,
+    EIGHTTAP_SHARP, EIGHTTAP_SMOOTH, SWITCHABLE,
+};
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
     InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,
@@ -1899,10 +1906,17 @@ pub enum Error {
     /// `Wedge_Bits[ MiSize ]` table, and the §8.3.2
     /// `comp_group_idx` / `compound_idx` ctx walks plus the
     /// `compound_type` S() / `wedge_index` S() / `wedge_sign` L(1) /
-    /// `mask_type` L(1) sub-branches). The post-`read_compound_type`
-    /// gap is now `read_interpolation_filter` (§5.11.x), still
-    /// surfaced via the §5.11.18 dispatcher's `Ok(_)` arm as
-    /// [`Self::InterBlockModeInfoUnsupported`].
+    /// `mask_type` L(1) sub-branches). Post-r178 the §5.11.x
+    /// `read_interpolation_filter` body lands (gating on
+    /// `interpolation_filter == SWITCHABLE`, the `needs_interp_filter(
+    /// )` predicate, and the §8.3.2 `interp_filter` ctx walk plus per-
+    /// dir `interp_filter` S() against `TileInterpFilterCdf[ ctx ]`)
+    /// — completing the §5.11.23 inter cascade. The §5.11.18
+    /// dispatcher's `Ok(_)` arm continues to surface
+    /// [`Self::InterBlockModeInfoUnsupported`] pending the next-arc
+    /// §5.11.34 `residual()` lift and a follow-on refactor that lifts
+    /// the [`cdf::DecodedInterBlockModeInfo`] aggregate into the
+    /// [`cdf::DecodedInterFrameModeInfo`] return path.
     MotionModeUnsupported,
     /// The §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample sub-
     /// processes (av1-spec p.223-226) reached from the §7.10.2 driver
@@ -2023,7 +2037,7 @@ impl core::fmt::Display for Error {
             ),
             Self::MotionModeUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.27 read_motion_mode — defensive fallback retained post-r175 (the §5.11.27 reader is now wired into the dispatcher with §7.10.3 has_overlappable_candidates + §7.10.4 find_warp_samples; post-r176 the §5.11.28 read_interintra_mode and post-r177 the §5.11.29 read_compound_type readers are also wired; the live gap moves to read_interpolation_filter, surfaced via the §5.11.18 dispatcher's Ok-arm InterBlockModeInfoUnsupported)"
+                "oxideav-av1: §5.11.27 read_motion_mode — defensive fallback retained post-r175 (the §5.11.27 reader is now wired into the dispatcher with §7.10.3 has_overlappable_candidates + §7.10.4 find_warp_samples; post-r176 the §5.11.28 read_interintra_mode, post-r177 the §5.11.29 read_compound_type, and post-r178 the §5.11.x read_interpolation_filter readers are also wired — completing the §5.11.23 inter cascade; the §5.11.18 dispatcher's Ok-arm continues to surface InterBlockModeInfoUnsupported pending the §5.11.34 residual lift)"
             ),
             Self::TemporalMvScanUnsupported => write!(
                 f,

@@ -6,6 +6,55 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 178 — §5.11.x `read_interpolation_filter` reader.** Lands
+  the LAST leaf of the §5.11.23 inter cascade. The §5.11.23
+  dispatcher now runs the entire `inter_block_mode_info()` body to
+  completion (through the `interpolation_filter` arm at av1-spec
+  p.74). The §5.11.18 dispatcher's `Ok(_)` arm continues to surface
+  `InterBlockModeInfoUnsupported` pending the next-arc §5.11.34
+  `residual()` lift and a follow-on refactor that lifts
+  `DecodedInterBlockModeInfo` into `DecodedInterFrameModeInfo`.
+
+  The reader composes two paths: `interpolation_filter == SWITCHABLE`
+  runs the per-dir loop with the inner `needs_interp_filter( ) ?
+  interp_filter S() : EIGHTTAP` branch (and the post-loop
+  `!enable_dual_filter` mirror); the else arm forces both slots to
+  the frame-header value with zero per-block bits.
+  `needs_interp_filter()` is inlined: closes the gate on `skip_mode
+  || motion_mode == LOCALWARP`, the two large-block GLOBALMV /
+  GLOBAL_GLOBALMV gm_type-TRANSLATION paths, and defaults to `1`.
+
+  The §8.3.2 ctx walk reuses the round-22 `interp_filter_ctx` helper,
+  seeding it from a new `InterpFilters[r][c][dir]` walker grid (two
+  slots per cell, pre-fill `EIGHTTAP`) stamped over the bh4 * bw4
+  footprint on every inter block decode. The `interp_filters()`
+  accessor surfaces it.
+
+  Five new §6.8.9 named constants land: `EIGHTTAP = 0`,
+  `EIGHTTAP_SMOOTH = 1`, `EIGHTTAP_SHARP = 2`, `BILINEAR = 3`,
+  `SWITCHABLE = 4`. New `InterpolationFilterReadout` aggregate
+  carries `interp_filter: [u8; 2]` (per-dir resolved ordinal) and
+  `read_from_bitstream: [bool; 2]` (per-dir "did this slot fire an
+  S()?" flag). `DecodedInterBlockModeInfo` gains an
+  `interp_filter: InterpolationFilterReadout` field.
+  `decode_inter_block_mode_info` and `decode_inter_frame_mode_info`
+  gain two new caller-supplied scalars: `interpolation_filter: u8`
+  (§5.9.10 frame-header value) and `enable_dual_filter: bool`
+  (§5.5.2 sequence-header bit).
+
+  10 new unit tests cover: §6.8.9 ordinal alignment; the
+  non-switchable arm (both slots forced, no bits); the four
+  `needs_interp_filter == 0` short-circuit paths (skip_mode /
+  LOCALWARP / large GLOBALMV + non-TRANSLATION gm_type), each
+  asserting zero state advancement; the `SWITCHABLE` single-dir
+  path (one S() ⇒ both slots, `read_from_bitstream = [true, false]`);
+  the dual-dir path (two S()s ⇒ `read_from_bitstream = [true, true]`);
+  three caller-bug guards (out-of-range `sub_size` /
+  `interpolation_filter` / `ref_frame[0]`); and an end-to-end §5.11.23
+  cascade test through the dispatcher witnessing the readout +
+  `interp_filters` grid stamp on the SWITCHABLE + skip_mode (gate-
+  closed needs_interp_filter) path. Test count: 721 → 731 (+10).
+
 * **Round 176 — §5.11.28 `read_interintra_mode` reader.** Wires the
   inter-intra blending triple into the §5.11.23 inter cascade. Reads
   `interintra` against `TileInterIntraCdf[ Size_Group[ MiSize ] - 1 ]`
