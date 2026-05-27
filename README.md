@@ -1486,6 +1486,68 @@ showing `skip_mode = 1` surfacing
 count: 672 → 691 (+19). `decode_av1` / `encode_av1` still return
 `Error::NotImplemented`.
 
+Round 176 lands the **§5.11.28 `read_interintra_mode` reader** —
+wiring the inter-intra blending triple into the §5.11.23 inter
+cascade. The §5.11.23 dispatcher now runs the full §5.11.23 body
+through line 35 (`read_interintra_mode( isCompound )`); the §5.11.18
+dispatcher continues to surface `InterBlockModeInfoUnsupported` for
+the still-pending §5.11.29 `read_compound_type` /
+`read_interpolation_filter` post-cascade.
+
+The §5.11.28 body composes the outer gate (`skip_mode == 0 &&
+enable_interintra_compound && !isCompound && BLOCK_8X8 <= MiSize <=
+BLOCK_32X32`) and the inner four-symbol arm: `interintra` S() against
+`TileInterIntraCdf[ Size_Group[ MiSize ] - 1 ]`; on
+`interintra == 1` then `interintra_mode` S() against
+`TileInterIntraModeCdf[ ctx ]` (one of the four §6.10.27 `II_*`
+modes — `II_DC_PRED` / `II_V_PRED` / `II_H_PRED` / `II_SMOOTH_PRED`),
+`wedge_interintra` S() against `TileWedgeInterIntraCdf[ MiSize ]`,
+and on `wedge_interintra == 1` then `wedge_index` S() against
+`TileWedgeIndexCdf[ MiSize ]` (the 16-symbol element shared with
+§5.11.29). On the closed-gate path zero bits are consumed and the
+returned `InterIntraReadout` has `interintra = 0` with the per-symbol
+`Option` fields at `None`.
+
+Inner-arm side-effect: the spec sets `RefFrame[ 1 ] = INTRA_FRAME` on
+the inner arm; the §5.11.23 dispatcher restamps the walker's slot-1
+`RefFrames[..][..][1]` grid over the bh4 * bw4 block footprint so
+subsequent neighbour walks observe the override. The §5.11.27 readers
+covered in r175 consult slot 0 only, so the slot-1 override does not
+perturb r175 behaviour; the §5.11.29 reader (next-arc) will consult
+slot 1 explicitly via the §8.3.2 `comp_group_idx` ctx. The
+imperative `AngleDeltaY = AngleDeltaUV = use_filter_intra = 0` writes
+the spec spells out are inter-block scalars not currently tracked.
+
+Four new §6.10.27 named constants land: `II_DC_PRED = 0`,
+`II_V_PRED = 1`, `II_H_PRED = 2`, `II_SMOOTH_PRED = 3` — spanning the
+`INTERINTRA_MODES = 4` axis. New `InterIntraReadout` aggregate carries
+`interintra: u8` plus three `Option<u8>` companions; the inner-arm
+arms populate `interintra_mode` + `wedge_interintra` always and
+`wedge_index` only when `wedge_interintra == 1`.
+`DecodedInterBlockModeInfo` gains an `interintra: InterIntraReadout`
+field. `decode_inter_block_mode_info` and
+`decode_inter_frame_mode_info` gain a new
+`enable_interintra_compound: bool` parameter — the §5.5.2 sequence-
+header bit caller-supplied.
+
+10 new unit tests cover: the four §6.10.27 II_* ordinal identities;
+five outer-gate-closed paths (`skip_mode = 1`, !enable_interintra_-
+compound, `is_compound = true`, `MiSize < BLOCK_8X8` via `BLOCK_4X4`,
+`MiSize > BLOCK_32X32` via `BLOCK_64X64`) each verified to read zero
+S() bits; the `MiSize = BLOCK_SIZES` defensive fallback collapsing to
+the closed-gate path; the gate-open + `interintra = 0` arm
+(witnessed by `inter_intra` row CDF adaptation alongside an untouched
+`inter_intra_mode` row); the four-symbol path reachability
+(100-trial property test biased toward the inner arm, witnessing the
+`wedge_index` row CDF adaptation); and two end-to-end §5.11.23
+cascade tests — `enable_interintra_compound = false` short-circuiting
+through the dispatcher with `interintra = 0` + every Option `None`,
+and `enable_interintra_compound = true` witnessing the
+`inter_intra` row adaptation through the dispatcher with the
+conditional slot-1 grid stamp asserted on the inner-arm trials. Test
+count: 691 → 703 (+12). `decode_av1` / `encode_av1` still return
+`Error::NotImplemented`.
+
 Round 173 lands the **§5.11.23 post-find_mv_stack reader cascade** —
 wiring `find_mv_stack` into the `decode_inter_block_mode_info`
 dispatcher so the inter arm of §5.11.18 runs end-to-end through every

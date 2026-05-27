@@ -1224,6 +1224,21 @@ pub const UV_CFL_PRED: usize = 13;
 /// CDFs.
 pub const INTERINTRA_MODES: usize = 4;
 
+/// `II_DC_PRED` (§6.10.27) — `interintra_mode` ordinal `0`. Maps to
+/// `DC_PRED` via the §7.11.5 `interintra_mode → mode` translation
+/// table (av1-spec p.176). Consumed by the §5.11.28
+/// `read_interintra_mode` `interintra_mode` S() when `interintra == 1`.
+pub const II_DC_PRED: u8 = 0;
+/// `II_V_PRED` (§6.10.27) — `interintra_mode` ordinal `1`. Maps to
+/// `V_PRED`.
+pub const II_V_PRED: u8 = 1;
+/// `II_H_PRED` (§6.10.27) — `interintra_mode` ordinal `2`. Maps to
+/// `H_PRED`.
+pub const II_H_PRED: u8 = 2;
+/// `II_SMOOTH_PRED` (§6.10.27) — `interintra_mode` ordinal `3`. Maps
+/// to `SMOOTH_PRED`.
+pub const II_SMOOTH_PRED: u8 = 3;
+
 /// `WEDGE_TYPES` (§3) — number of directions for the wedge mask process
 /// (the spec text reads: *"Number of directions for the wedge mask
 /// process"*). Drives the symbol axis of [`DEFAULT_WEDGE_INDEX_CDF`]
@@ -15040,6 +15055,9 @@ impl PartitionWalker {
         is_motion_mode_switchable: bool,
         allow_warped_motion: bool,
         is_scaled_per_ref: [bool; 7],
+        // r176: §5.11.28 caller-supplied sequence-header scalar (see
+        // [`Self::decode_inter_block_mode_info`]).
+        enable_interintra_compound: bool,
     ) -> Result<DecodedInterFrameModeInfo, crate::Error> {
         if sub_size >= BLOCK_SIZES {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -15323,18 +15341,21 @@ impl PartitionWalker {
         };
         let _ = info;
         if is_inter != 0 {
-            // r175: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
+            // r176: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
             // §7.10 `find_mv_stack` (spatial-only path) + the §5.11.23
             // YMode dispatch + per-mode RefMvIdx / drl_mode loops + the
             // §5.11.31 `assign_mv` body + the §5.11.27 `read_motion_mode`
             // body (with §7.10.3 `has_overlappable_candidates` and
-            // §7.10.4 `find_warp_samples`) all run to completion. The
-            // post-`read_motion_mode` cascade (`read_interintra_mode` /
-            // `read_compound_type` / `read_interpolation_filter`) is
-            // the next-arc target — for now the §5.11.18 dispatcher
-            // surfaces an `InterBlockModeInfoUnsupported` Err on the
-            // `Ok(_)` arm so the inner per-block aggregate observable
-            // via tests is not dropped silently.
+            // §7.10.4 `find_warp_samples`) + the §5.11.28
+            // `read_interintra_mode` body (with `RefFrame[1] =
+            // INTRA_FRAME` grid-stamp override on the inner arm) all
+            // run to completion. The post-`read_interintra_mode`
+            // cascade (`read_compound_type` per §5.11.29 /
+            // `read_interpolation_filter` per §5.11.x) is the next-arc
+            // target — for now the §5.11.18 dispatcher surfaces an
+            // `InterBlockModeInfoUnsupported` Err on the `Ok(_)` arm
+            // so the inner per-block aggregate observable via tests is
+            // not dropped silently.
             match self.decode_inter_block_mode_info(
                 decoder,
                 cdfs,
@@ -15365,12 +15386,13 @@ impl PartitionWalker {
                 is_motion_mode_switchable,
                 allow_warped_motion,
                 is_scaled_per_ref,
+                enable_interintra_compound,
             ) {
                 Ok(_inter_info) => {
-                    // The §5.11.23 post-`read_motion_mode` cascade
-                    // (`read_interintra_mode` / `read_compound_type` /
-                    // `read_interpolation_filter`) is the next-arc
-                    // target; once it lands, expand
+                    // The §5.11.23 post-`read_interintra_mode` cascade
+                    // (`read_compound_type` per §5.11.29 /
+                    // `read_interpolation_filter` per §5.11.x) is the
+                    // next-arc target; once it lands, expand
                     // [`DecodedInterFrameModeInfo`] to carry the
                     // inter-arm aggregate and route the Ok values
                     // here.
@@ -16183,6 +16205,14 @@ impl PartitionWalker {
         is_motion_mode_switchable: bool,
         allow_warped_motion: bool,
         is_scaled_per_ref: [bool; 7],
+        // r176 §5.11.28 caller-supplied frame-header scalar.
+        //
+        // * `enable_interintra_compound` — §5.5.2 sequence-header bit
+        //   (`SequenceHeader::enable_interintra_compound`). When
+        //   `false` the §5.11.28 outer gate is closed, no S() bits are
+        //   read, and the `interintra` field of the returned
+        //   [`DecodedInterBlockModeInfo::interintra`] aggregate is `0`.
+        enable_interintra_compound: bool,
     ) -> Result<DecodedInterBlockModeInfo, crate::Error> {
         // §5.11.23 caller-bug guards. Each inner method re-checks its
         // own bounds, but failing fast at the dispatcher keeps the
@@ -16468,6 +16498,53 @@ impl PartitionWalker {
             is_scaled_per_ref,
         )?;
 
+        // §5.11.23 line 35: `read_interintra_mode( isCompound )` per
+        // §5.11.28 (av1-spec p.79-80). Reads the inter-intra blending
+        // triple gated on `enable_interintra_compound && !isCompound &&
+        // BLOCK_8X8 <= MiSize <= BLOCK_32X32`. When the inner
+        // `if ( interintra )` arm fires the spec body overrides
+        // `RefFrame[ 1 ] = INTRA_FRAME`; restamp the walker grid's
+        // slot-1 entry over the bh4 * bw4 footprint so the next block's
+        // §5.11.18 prologue / §8.3.2 ref-frame ctx walks observe the
+        // override. The post-`read_interintra_mode` cascade
+        // (`read_compound_type` per §5.11.29 / `read_interpolation_filter`
+        // per §5.11.x) is the next-arc target and is currently surfaced
+        // as [`crate::Error::InterBlockModeInfoUnsupported`] from the
+        // §5.11.18 dispatcher's `Ok(_)` arm.
+        let interintra = self.read_interintra_mode(
+            decoder,
+            cdfs,
+            sub_size,
+            skip_mode,
+            is_compound,
+            enable_interintra_compound,
+        )?;
+
+        if interintra.interintra == 1 {
+            // §5.11.28: `RefFrame[ 1 ] = INTRA_FRAME = 0`. Restamp the
+            // grid's slot-1 entry over the block footprint so the next
+            // block's `RefFrames[ ..][ ..][ 1 ]` reads observe the
+            // override. Slot 0 is unchanged. The §7.10.3 / §7.10.4
+            // walkers covered in r175 read only slot 0, so the
+            // override does not perturb r175 testing; the §5.11.29
+            // `read_compound_type` reader (next arc) will look at
+            // slot 1 explicitly per the §8.3.2 `comp_group_idx` ctx.
+            for dr in 0..bh4 {
+                let rr = mi_row + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    let cell = ((rr * self.mi_cols + cc) as usize) * 2;
+                    self.ref_frames[cell + 1] = 0; // INTRA_FRAME
+                }
+            }
+        }
+
         Ok(DecodedInterBlockModeInfo {
             mi_row,
             mi_col,
@@ -16483,6 +16560,7 @@ impl PartitionWalker {
             mv,
             motion_mode,
             num_warp_samples: num_samples,
+            interintra,
         })
     }
 
@@ -16938,6 +17016,149 @@ impl PartitionWalker {
             );
             Ok(mm)
         }
+    }
+
+    /// `read_interintra_mode( isCompound )` per §5.11.28 (av1-spec
+    /// p.79-80). Reads the inter-intra blending triple
+    /// (`interintra` + `interintra_mode` + `wedge_interintra` +
+    /// optional `wedge_index`) and returns the outcome as a
+    /// [`InterIntraReadout`] aggregate.
+    ///
+    /// The §5.11.28 outer gate is:
+    ///
+    /// ```text
+    ///   if ( !skip_mode && enable_interintra_compound && !isCompound &&
+    ///        MiSize >= BLOCK_8X8 && MiSize <= BLOCK_32X32 ) {
+    ///       interintra                                          S()
+    ///       if ( interintra ) {
+    ///           interintra_mode                                 S()
+    ///           RefFrame[ 1 ] = INTRA_FRAME
+    ///           AngleDeltaY = 0
+    ///           AngleDeltaUV = 0
+    ///           use_filter_intra = 0
+    ///           wedge_interintra                                S()
+    ///           if ( wedge_interintra ) {
+    ///               wedge_index                                 S()
+    ///               wedge_sign = 0
+    ///           }
+    ///       }
+    ///   } else {
+    ///       interintra = 0
+    ///   }
+    /// ```
+    ///
+    /// When the outer gate is closed the spec sets `interintra = 0`
+    /// and reads no bits; the returned [`InterIntraReadout`] has
+    /// `interintra = 0` with the per-symbol fields at `None`.
+    ///
+    /// When the inner `if ( interintra )` arm fires, `RefFrame[ 1 ]` is
+    /// overridden to `INTRA_FRAME = 0` per the spec; the caller is
+    /// responsible for restamping the walker grid if it cares
+    /// (downstream §7.10.3 / §7.10.4 / §8.3.2 neighbour walks consult
+    /// `RefFrames[..][..][0]` only, so the slot-1 override does not
+    /// affect any post-§5.11.28 reader covered through r175).
+    ///
+    /// `mi_size` is the current block's `MiSize`; the §5.11.28 syntax
+    /// gate confines coded blocks to `BLOCK_8X8..=BLOCK_32X32`
+    /// (per §6.10.27). The §8.3.2 selection for `interintra` and
+    /// `interintra_mode` is `ctx = Size_Group[ MiSize ] - 1`,
+    /// resolved via [`interintra_ctx`]; the §8.3.2 selection for
+    /// `wedge_interintra` is the straight `MiSize` index; the §8.3.2
+    /// selection for `wedge_index` is also the straight `MiSize`
+    /// index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_interintra_mode(
+        &self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        sub_size: usize,
+        skip_mode: u8,
+        is_compound: bool,
+        enable_interintra_compound: bool,
+    ) -> Result<InterIntraReadout, crate::Error> {
+        // §5.11.28 outer gate: every clause must hold for the
+        // `interintra` S() to fire.
+        let gate_open = skip_mode == 0
+            && enable_interintra_compound
+            && !is_compound
+            && (BLOCK_8X8..=BLOCK_32X32).contains(&sub_size);
+
+        if !gate_open {
+            return Ok(InterIntraReadout {
+                interintra: 0,
+                interintra_mode: None,
+                wedge_interintra: None,
+                wedge_index: None,
+            });
+        }
+
+        // §5.11.28 `interintra` S() against `TileInterIntraCdf[ ctx ]`,
+        // `ctx = Size_Group[ MiSize ] - 1`. The outer gate confines
+        // `MiSize` to `BLOCK_8X8..=BLOCK_32X32` where `Size_Group` is
+        // `{1, 2, 3}`, so `interintra_ctx` always returns `Some(_)`;
+        // the `None` arm is a defensive caller-bug fallback.
+        let ctx = interintra_ctx(sub_size).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let row = cdfs
+            .inter_intra_cdf(ctx)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let interintra = decoder.read_symbol(row)? as u8;
+        debug_assert!(interintra <= 1, "S() over TileInterIntraCdf yields 0 or 1");
+
+        if interintra == 0 {
+            return Ok(InterIntraReadout {
+                interintra: 0,
+                interintra_mode: None,
+                wedge_interintra: None,
+                wedge_index: None,
+            });
+        }
+
+        // §5.11.28 `interintra_mode` S() against
+        // `TileInterIntraModeCdf[ ctx ]`, same `ctx`.
+        let row = cdfs
+            .inter_intra_mode_cdf(ctx)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let ii_mode = decoder.read_symbol(row)? as u8;
+        debug_assert!(
+            (ii_mode as usize) < INTERINTRA_MODES,
+            "S() over TileInterIntraModeCdf yields 0..INTERINTRA_MODES"
+        );
+
+        // §5.11.28 `wedge_interintra` S() against
+        // `TileWedgeInterIntraCdf[ MiSize ]` (straight `MiSize`
+        // index).
+        let row = cdfs
+            .wedge_inter_intra_cdf(sub_size)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let wedge_ii = decoder.read_symbol(row)? as u8;
+        debug_assert!(
+            wedge_ii <= 1,
+            "S() over TileWedgeInterIntraCdf yields 0 or 1"
+        );
+
+        let wedge_idx = if wedge_ii == 1 {
+            // §5.11.28 `wedge_index` S() against
+            // `TileWedgeIndexCdf[ MiSize ]` — same default CDF as the
+            // §5.11.29 `COMPOUND_WEDGE` branch.
+            let row = cdfs
+                .wedge_index_cdf(sub_size)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let wi = decoder.read_symbol(row)? as u8;
+            debug_assert!(
+                (wi as usize) < WEDGE_TYPES,
+                "S() over TileWedgeIndexCdf yields 0..WEDGE_TYPES"
+            );
+            Some(wi)
+        } else {
+            None
+        };
+
+        Ok(InterIntraReadout {
+            interintra: 1,
+            interintra_mode: Some(ii_mode),
+            wedge_interintra: Some(wedge_ii),
+            wedge_index: wedge_idx,
+        })
     }
 
     /// `assign_mv( isCompound )` per §5.11.31 (av1-spec p.78). Iterates
@@ -21125,6 +21346,47 @@ pub struct DecodedInterBlockModeInfo {
     /// fires when this is `0`; the `motion_mode` arm consumes it via
     /// the §7.11 warp-affine projection (downstream arc).
     pub num_warp_samples: u32,
+    /// §5.11.28 `read_interintra_mode( )` outcome. Carries the
+    /// `interintra` flag and — when `interintra == 1` — the
+    /// `interintra_mode`, `wedge_interintra`, and (when
+    /// `wedge_interintra == 1`) `wedge_index` values. On the closed
+    /// outer gate (skip_mode / !enable_interintra_compound /
+    /// isCompound / outside the `BLOCK_8X8..=BLOCK_32X32` band) the
+    /// `interintra` flag is `0` and the per-symbol fields are `None`.
+    pub interintra: InterIntraReadout,
+}
+
+/// §5.11.28 `read_interintra_mode( isCompound )` per-block outcome —
+/// the `interintra` flag together with the optional per-symbol values
+/// the inner `if ( interintra )` arm reads (`interintra_mode`,
+/// `wedge_interintra`, `wedge_index`). When `interintra == 0` (either
+/// the outer gate is closed or the `interintra` S() returned 0) every
+/// per-symbol field is `None`. When `interintra == 1` the
+/// `interintra_mode` and `wedge_interintra` fields are always
+/// populated; `wedge_index` is populated only when
+/// `wedge_interintra == 1`.
+///
+/// The spec body also imperatively writes `RefFrame[ 1 ] = INTRA_FRAME`
+/// and `AngleDeltaY = AngleDeltaUV = use_filter_intra = 0` on the
+/// inner arm; the [`PartitionWalker::read_interintra_mode`] helper
+/// returns this struct so the caller can apply those overrides (the
+/// §5.11.23 dispatcher does so on the walker grids).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterIntraReadout {
+    /// §5.11.28 `interintra` flag. `0` ⇔ the outer gate closed OR the
+    /// `interintra` S() returned 0. `1` ⇔ the full inner arm fired.
+    pub interintra: u8,
+    /// §5.11.28 `interintra_mode` — in `0..INTERINTRA_MODES = 0..4`
+    /// (one of `II_DC_PRED` / `II_V_PRED` / `II_H_PRED` /
+    /// `II_SMOOTH_PRED`). `Some(_)` ⇔ `interintra == 1`.
+    pub interintra_mode: Option<u8>,
+    /// §5.11.28 `wedge_interintra` flag. `Some(0)` or `Some(1)` ⇔
+    /// `interintra == 1`; `None` otherwise.
+    pub wedge_interintra: Option<u8>,
+    /// §5.11.28 `wedge_index` — in `0..WEDGE_TYPES = 0..16`.
+    /// `Some(_)` ⇔ `interintra == 1 && wedge_interintra == 1`; `None`
+    /// otherwise.
+    pub wedge_index: Option<u8>,
 }
 
 #[cfg(test)]
@@ -34892,6 +35154,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_row.
@@ -34925,6 +35188,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_col.
@@ -34958,6 +35222,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range seg_ref_frame_data.
@@ -34991,6 +35256,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range skip_mode_frame[0].
@@ -35024,6 +35290,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         assert_eq!(
@@ -35080,6 +35347,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -35157,6 +35425,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
@@ -35216,6 +35485,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec.position(), pos_before);
@@ -35258,6 +35528,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec2.position(), pos_before);
@@ -35314,6 +35585,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // The single-ref cascade reads at least the single_ref_p1
@@ -35383,6 +35655,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         let r0 = walker.ref_frames()[0];
@@ -35447,6 +35720,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
@@ -35483,6 +35757,12 @@ mod tests {
             mv: [[0, 0], [0, 0]],
             motion_mode: MOTION_MODE_SIMPLE,
             num_warp_samples: 0,
+            interintra: InterIntraReadout {
+                interintra: 0,
+                interintra_mode: None,
+                wedge_interintra: None,
+                wedge_index: None,
+            },
         };
         assert_eq!(info.ref_frame[0], 1);
         assert_eq!(info.ref_frame[1], 7);
@@ -35491,6 +35771,7 @@ mod tests {
         assert_eq!(info.mv, [[0, 0], [0, 0]]);
         assert_eq!(info.motion_mode, MOTION_MODE_SIMPLE);
         assert_eq!(info.num_warp_samples, 0);
+        assert_eq!(info.interintra.interintra, 0);
         // Single-pred case.
         let info_single = DecodedInterBlockModeInfo {
             mi_row: 0,
@@ -35507,12 +35788,22 @@ mod tests {
             mv: [[12, -8], [0, 0]],
             motion_mode: MOTION_MODE_SIMPLE,
             num_warp_samples: 0,
+            interintra: InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(II_DC_PRED),
+                wedge_interintra: Some(0),
+                wedge_index: None,
+            },
         };
         assert!(!info_single.is_compound);
         assert_eq!(info_single.y_mode, MODE_NEARESTMV);
         assert_eq!(info_single.mv[0], [12, -8]);
         // Slot 1 stays at the §5.11.5 pre-fill on single-pred.
         assert_eq!(info_single.mv[1], [0, 0]);
+        assert_eq!(info_single.interintra.interintra, 1);
+        assert_eq!(info_single.interintra.interintra_mode, Some(II_DC_PRED));
+        assert_eq!(info_single.interintra.wedge_interintra, Some(0));
+        assert_eq!(info_single.interintra.wedge_index, None);
     }
 
     /// §5.11.18 prologue + §5.11.23 grid composition: stamp
@@ -35595,6 +35886,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -35652,6 +35944,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -35728,6 +36021,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
@@ -35800,6 +36094,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
@@ -35869,6 +36164,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(dec.position() > pos_before);
@@ -35934,6 +36230,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
     }
@@ -36001,6 +36298,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // drl_mode CDFs must NOT have adapted (no read fired).
@@ -36080,6 +36378,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
     }
@@ -36130,6 +36429,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert_eq!(r, Err(crate::Error::TemporalMvScanUnsupported));
     }
@@ -36255,6 +36555,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -36325,6 +36626,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -36412,6 +36714,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Mvs grid: identity-GM PredMv = [0, 0], MV_JOINT_ZERO diff =
@@ -36498,6 +36801,7 @@ mod tests {
             /* is_motion_mode_switchable = */ false,
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
+            /* enable_interintra_compound = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §6.10.25 `is_mv_valid`: |Mv[i][c]| < (1 << 14) = 16384.
@@ -38152,10 +38456,529 @@ mod tests {
                 /* is_motion_mode_switchable = */ true,
                 /* allow_warped_motion = */ true,
                 /* is_scaled_per_ref = */ [false; 7],
+                /* enable_interintra_compound = */ false,
             )
             .expect("§5.11.27 SIMPLE short-circuit ⇒ dispatcher returns Ok");
         assert_eq!(info.motion_mode, MOTION_MODE_SIMPLE);
         assert_eq!(info.num_warp_samples, 0);
         assert_eq!(info.mi_size, BLOCK_8X8);
+    }
+
+    // ===================================================================
+    // §5.11.28 read_interintra_mode tests (round 176)
+    // ===================================================================
+
+    /// §6.10.27 II_* ordinals — `II_DC_PRED = 0`, `II_V_PRED = 1`,
+    /// `II_H_PRED = 2`, `II_SMOOTH_PRED = 3`. They span
+    /// `0..INTERINTRA_MODES`.
+    #[test]
+    fn ii_mode_ordinals_match_spec() {
+        assert_eq!(II_DC_PRED, 0);
+        assert_eq!(II_V_PRED, 1);
+        assert_eq!(II_H_PRED, 2);
+        assert_eq!(II_SMOOTH_PRED, 3);
+        assert!((II_SMOOTH_PRED as usize) + 1 == INTERINTRA_MODES);
+    }
+
+    /// §5.11.28 outer gate closed via `skip_mode == 1`: no S() bit
+    /// read, `interintra == 0`, every per-symbol field `None`.
+    #[test]
+    fn read_interintra_mode_skip_mode_closes_gate_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_interintra_mode(
+                &mut dec,
+                &mut cdfs,
+                BLOCK_16X16,
+                /* skip_mode = */ 1,
+                /* is_compound = */ false,
+                /* enable_interintra_compound = */ true,
+            )
+            .unwrap();
+        assert_eq!(r.interintra, 0);
+        assert_eq!(r.interintra_mode, None);
+        assert_eq!(r.wedge_interintra, None);
+        assert_eq!(r.wedge_index, None);
+        assert_eq!(dec.position(), pos_before, "skip_mode closes gate ⇒ 0 bits");
+    }
+
+    /// §5.11.28 outer gate closed via `!enable_interintra_compound`:
+    /// no S() bit read.
+    #[test]
+    fn read_interintra_mode_disabled_compound_closes_gate_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_interintra_mode(
+                &mut dec,
+                &mut cdfs,
+                BLOCK_16X16,
+                0,
+                false,
+                /* enable_interintra_compound = */ false,
+            )
+            .unwrap();
+        assert_eq!(r.interintra, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.28 outer gate closed via `isCompound == true`: no S() bit
+    /// read.
+    #[test]
+    fn read_interintra_mode_compound_closes_gate_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_interintra_mode(
+                &mut dec,
+                &mut cdfs,
+                BLOCK_16X16,
+                0,
+                /* is_compound = */ true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(r.interintra, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.28 outer gate closed via `MiSize < BLOCK_8X8`: no S() bit
+    /// read. `BLOCK_4X4 = 0 < BLOCK_8X8 = 3` exercises the gate.
+    #[test]
+    fn read_interintra_mode_small_block_closes_gate_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_interintra_mode(&mut dec, &mut cdfs, BLOCK_4X4, 0, false, true)
+            .unwrap();
+        assert_eq!(r.interintra, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.28 outer gate closed via `MiSize > BLOCK_32X32`:
+    /// `BLOCK_64X64 = 12 > BLOCK_32X32 = 9` exercises the gate.
+    #[test]
+    fn read_interintra_mode_large_block_closes_gate_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_interintra_mode(&mut dec, &mut cdfs, BLOCK_64X64, 0, false, true)
+            .unwrap();
+        assert_eq!(r.interintra, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.28 outer gate open + `interintra` CDF forced to 0:
+    /// `interintra` S() fires (one bit consumed), inner arm skipped.
+    #[test]
+    fn read_interintra_mode_gate_open_interintra_zero_reads_one_symbol() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force interintra S() ⇒ 0 for the ctx = Size_Group[BLOCK_16X16]
+        // - 1 = 2 - 1 = 1 row.
+        let ctx = interintra_ctx(BLOCK_16X16).unwrap();
+        cdfs.inter_intra[ctx] = force_binary_cdf(0);
+        let inter_intra_before = cdfs.inter_intra[ctx];
+        let inter_intra_mode_before = cdfs.inter_intra_mode[ctx];
+
+        let bytes = [0u8; 16];
+        // disable_cdf_update = false ⇒ §8.3 update_cdf walks the row.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_interintra_mode(&mut dec, &mut cdfs, BLOCK_16X16, 0, false, true)
+            .unwrap();
+        assert_eq!(r.interintra, 0);
+        assert_eq!(r.interintra_mode, None);
+        assert_eq!(r.wedge_interintra, None);
+        assert_eq!(r.wedge_index, None);
+        // The §8.3 update_cdf adapted the row (witness that S() fired).
+        assert_ne!(cdfs.inter_intra[ctx], inter_intra_before);
+        // The interintra_mode row stayed untouched (inner arm skipped).
+        assert_eq!(cdfs.inter_intra_mode[ctx], inter_intra_mode_before);
+        assert!(
+            dec.position() > pos_before,
+            "interintra S() must consume at least one bit"
+        );
+    }
+
+    /// §5.11.28 outer gate open + interintra forced to 1 + wedge
+    /// forced to 0: reads three S() symbols (interintra,
+    /// interintra_mode, wedge_interintra), skips wedge_index. All
+    /// three CDF rows adapt; wedge_index row is untouched.
+    #[test]
+    fn read_interintra_mode_inner_arm_no_wedge_reads_three_symbols() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let ctx = interintra_ctx(BLOCK_16X16).unwrap();
+        // Force interintra S() ⇒ 1 ⇒ enter inner arm.
+        cdfs.inter_intra[ctx] = force_binary_cdf(1);
+        // Force wedge_interintra S() ⇒ 0 ⇒ skip wedge_index.
+        cdfs.wedge_inter_intra[BLOCK_16X16] = force_binary_cdf(0);
+
+        let interintra_before = cdfs.inter_intra[ctx];
+        let mode_before = cdfs.inter_intra_mode[ctx];
+        let wedge_ii_before = cdfs.wedge_inter_intra[BLOCK_16X16];
+        let wedge_idx_before = cdfs.wedge_index[BLOCK_16X16];
+
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let r = walker
+            .read_interintra_mode(&mut dec, &mut cdfs, BLOCK_16X16, 0, false, true)
+            .unwrap();
+        assert_eq!(r.interintra, 1);
+        assert!(r.interintra_mode.is_some());
+        let ii_mode = r.interintra_mode.unwrap();
+        assert!(
+            (ii_mode as usize) < INTERINTRA_MODES,
+            "interintra_mode must be in 0..INTERINTRA_MODES; got {ii_mode}"
+        );
+        assert_eq!(r.wedge_interintra, Some(0));
+        assert_eq!(r.wedge_index, None);
+
+        // All three CDF rows adapted.
+        assert_ne!(cdfs.inter_intra[ctx], interintra_before);
+        assert_ne!(cdfs.inter_intra_mode[ctx], mode_before);
+        assert_ne!(cdfs.wedge_inter_intra[BLOCK_16X16], wedge_ii_before);
+        // wedge_index row stayed untouched (sub-branch skipped).
+        assert_eq!(cdfs.wedge_index[BLOCK_16X16], wedge_idx_before);
+    }
+
+    /// §5.11.28 outer gate open + interintra = 1 + wedge_interintra =
+    /// 1: drives the inner arm 100 times against fresh decoders and
+    /// asserts at least one trial produced `wedge_index = Some(_)`
+    /// alongside `wedge_interintra = Some(1)`, witnessing that the
+    /// four-symbol path is reachable. `disable_cdf_update = false` so
+    /// the CDFs adapt across trials and the observation distribution
+    /// migrates toward the forced bias.
+    ///
+    /// Each successful inner-arm trial also implies the
+    /// `wedge_interintra` row was sampled, so its CDF adapts; we
+    /// witness the adaptation as a second property assertion.
+    #[test]
+    fn read_interintra_mode_inner_arm_wedge_path_reachable() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let ctx = interintra_ctx(BLOCK_16X16).unwrap();
+        // Bias both rows toward 1; CDF adaptation will keep them there.
+        cdfs.inter_intra[ctx] = force_binary_cdf(1);
+        cdfs.wedge_inter_intra[BLOCK_16X16] = force_binary_cdf(1);
+        let wedge_idx_before = cdfs.wedge_index[BLOCK_16X16];
+
+        let mut wedge_reached = 0usize;
+        let mut inner_arm_count = 0usize;
+        for trial in 0..100u32 {
+            // Vary the buffer slightly per trial so SymbolValue differs.
+            let mut bytes = [0u8; 32];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = ((trial.wrapping_mul(2654435761) ^ (i as u32 * 11)) & 0xFF) as u8;
+            }
+            let mut dec = SymbolDecoder::init_symbol(&bytes, 32, false).unwrap();
+            let r = walker
+                .read_interintra_mode(&mut dec, &mut cdfs, BLOCK_16X16, 0, false, true)
+                .unwrap();
+            if r.interintra == 1 {
+                inner_arm_count += 1;
+                assert!(r.interintra_mode.is_some());
+                assert!(r.wedge_interintra.is_some());
+                if r.wedge_interintra == Some(1) {
+                    assert!(
+                        r.wedge_index.is_some(),
+                        "wedge_interintra=1 ⇒ wedge_index Some"
+                    );
+                    let wi = r.wedge_index.unwrap();
+                    assert!(
+                        (wi as usize) < WEDGE_TYPES,
+                        "wedge_index must be in 0..WEDGE_TYPES; got {wi}"
+                    );
+                    wedge_reached += 1;
+                } else {
+                    assert_eq!(r.wedge_index, None);
+                }
+            } else {
+                assert_eq!(r.interintra_mode, None);
+                assert_eq!(r.wedge_interintra, None);
+                assert_eq!(r.wedge_index, None);
+            }
+        }
+        assert!(
+            inner_arm_count > 0,
+            "biased interintra CDF must produce at least one inner-arm trial in 100"
+        );
+        assert!(
+            wedge_reached > 0,
+            "biased wedge_interintra CDF must produce at least one wedge_index read in 100 trials"
+        );
+        // Witness: the wedge_index CDF row adapted (was sampled at
+        // least once by the four-symbol path).
+        assert_ne!(
+            cdfs.wedge_index[BLOCK_16X16], wedge_idx_before,
+            "the wedge_index row must have adapted after the four-symbol path fired"
+        );
+    }
+
+    /// §5.11.28 caller-bug — `mi_size >= BLOCK_SIZES` surfaces
+    /// `PartitionWalkOutOfRange` via the [`interintra_ctx`] /
+    /// [`wedge_inter_intra_cdf`] fallback. This only matters if the
+    /// caller bypasses the upstream guards; the §5.11.23 dispatcher
+    /// rejects `sub_size >= BLOCK_SIZES` up-front (`PartitionWalkOutOfRange`).
+    ///
+    /// We exercise the path by passing a sub_size in the gated open
+    /// band (so the outer gate does NOT trigger early-return) but
+    /// out-of-range. The outer gate's `sub_size <= BLOCK_32X32` clause
+    /// closes for any value > BLOCK_32X32, so we'd take the no-bits
+    /// path — meaning the spec gate naturally precludes the
+    /// caller-bug path. This test pins the gate-close behaviour for
+    /// `mi_size == BLOCK_SIZES` (one past the last valid ordinal),
+    /// matching the §5.11.28 spec's MiSize <= BLOCK_32X32 clause.
+    #[test]
+    fn read_interintra_mode_mi_size_past_band_returns_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_interintra_mode(&mut dec, &mut cdfs, BLOCK_SIZES, 0, false, true)
+            .unwrap();
+        assert_eq!(r.interintra, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// End-to-end through the §5.11.23 dispatcher: with
+    /// `enable_interintra_compound = false` the §5.11.28 outer gate is
+    /// closed and the returned `DecodedInterBlockModeInfo.interintra`
+    /// carries `interintra = 0` + every Option `None`.
+    #[test]
+    fn cascade_read_interintra_mode_disabled_compound_surfaces_zero_through_aggregate() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let info = walker
+            .decode_inter_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                /* sub_size = */ BLOCK_16X16,
+                /* skip_mode = */ 0,
+                /* avail_u = */ false,
+                /* avail_l = */ false,
+                /* above_ref_frame = */ [0, -1],
+                /* left_ref_frame = */ [0, -1],
+                /* above_intra = */ true,
+                /* left_intra = */ true,
+                /* above_single = */ true,
+                /* left_single = */ true,
+                /* skip_mode_frame = */ [0, -1],
+                /* seg_ref_frame_active = */ false,
+                /* seg_ref_frame_data = */ 0,
+                /* seg_skip_active = */ false,
+                /* seg_globalmv_active = */ false,
+                /* reference_select = */ false,
+                [GM_TYPE_IDENTITY; 8],
+                identity_gm_params(),
+                [0; 8],
+                false,
+                false,
+                false,
+                /* is_motion_mode_switchable = */ false,
+                /* allow_warped_motion = */ false,
+                /* is_scaled_per_ref = */ [false; 7],
+                /* enable_interintra_compound = */ false,
+            )
+            .expect("§5.11.28 closed-gate ⇒ dispatcher returns Ok");
+        assert_eq!(info.interintra.interintra, 0);
+        assert_eq!(info.interintra.interintra_mode, None);
+        assert_eq!(info.interintra.wedge_interintra, None);
+        assert_eq!(info.interintra.wedge_index, None);
+        // Slot-1 grid stamp untouched on the closed-gate path
+        // (RefFrame[1] = NONE from §5.11.25 default arm with no
+        // reference_select).
+        let r1 = walker.ref_frames()[1];
+        assert_eq!(
+            r1, -1,
+            "closed gate ⇒ slot-1 grid stamp stays at the §5.11.25 outcome"
+        );
+    }
+
+    /// End-to-end through the §5.11.23 dispatcher: with
+    /// `enable_interintra_compound = true`, the §5.11.28 reader is
+    /// reachable from the dispatcher and the `interintra` CDF row
+    /// adapts as a witness that the S() call fired. The aggregate
+    /// `DecodedInterBlockModeInfo.interintra.interintra` flag is in
+    /// `{0, 1}` and the `Option` companion fields are consistent
+    /// (`None` when `interintra == 0`, `Some(_)` for
+    /// `interintra_mode` and `wedge_interintra` when `interintra == 1`).
+    ///
+    /// Whenever the inner arm fires, the dispatcher stamps the
+    /// walker's slot-1 grid over the BLOCK_16X16 footprint to
+    /// `INTRA_FRAME = 0`. We assert this conditional grid effect
+    /// rather than insisting the inner arm fire on any single trial.
+    #[test]
+    fn cascade_read_interintra_mode_enabled_compound_witnesses_adaptation() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let ctx = interintra_ctx(BLOCK_16X16).unwrap();
+        let inter_intra_before = cdfs.inter_intra[ctx];
+
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, false).unwrap();
+        let info = walker
+            .decode_inter_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                /* sub_size = */ BLOCK_16X16,
+                /* skip_mode = */ 0,
+                /* avail_u = */ false,
+                /* avail_l = */ false,
+                /* above_ref_frame = */ [0, -1],
+                /* left_ref_frame = */ [0, -1],
+                /* above_intra = */ true,
+                /* left_intra = */ true,
+                /* above_single = */ true,
+                /* left_single = */ true,
+                /* skip_mode_frame = */ [0, -1],
+                /* seg_ref_frame_active = */ false,
+                /* seg_ref_frame_data = */ 0,
+                /* seg_skip_active = */ false,
+                /* seg_globalmv_active = */ false,
+                /* reference_select = */ false,
+                [GM_TYPE_IDENTITY; 8],
+                identity_gm_params(),
+                [0; 8],
+                false,
+                false,
+                false,
+                /* is_motion_mode_switchable = */ false,
+                /* allow_warped_motion = */ false,
+                /* is_scaled_per_ref = */ [false; 7],
+                /* enable_interintra_compound = */ true,
+            )
+            .expect("§5.11.28 enabled ⇒ dispatcher returns Ok");
+
+        // The reader fired (witness via inter_intra CDF adaptation).
+        assert_ne!(
+            cdfs.inter_intra[ctx], inter_intra_before,
+            "the §5.11.28 reader's `interintra` S() must have adapted the inter_intra CDF row"
+        );
+
+        // Aggregate consistency: per-symbol fields agree with the
+        // gate-result flag.
+        assert!(matches!(info.interintra.interintra, 0 | 1));
+        if info.interintra.interintra == 0 {
+            assert_eq!(info.interintra.interintra_mode, None);
+            assert_eq!(info.interintra.wedge_interintra, None);
+            assert_eq!(info.interintra.wedge_index, None);
+        } else {
+            assert!(info.interintra.interintra_mode.is_some());
+            assert!(info.interintra.wedge_interintra.is_some());
+        }
+
+        // Conditional grid stamp: if the inner arm fired, every cell
+        // of the BLOCK_16X16 (bh4=bw4=4) footprint at (0, 0) carries
+        // slot-1 = INTRA_FRAME = 0 per the §5.11.28 spec override.
+        if info.interintra.interintra == 1 {
+            let mi_cols = walker.mi_cols() as usize;
+            for r in 0..4 {
+                for c in 0..4 {
+                    let cell = (r * mi_cols + c) * 2;
+                    assert_eq!(
+                        walker.ref_frames()[cell + 1],
+                        0,
+                        "§5.11.28 inner-arm overrides slot-1 to INTRA_FRAME at ({r}, {c})"
+                    );
+                }
+            }
+        }
+        // The aggregate `ref_frame[1]` retains the §5.11.25 outcome —
+        // the §5.11.28 override is recorded only in the walker grid,
+        // not in the per-block aggregate snapshot.
+        let _ = info.ref_frame;
     }
 }

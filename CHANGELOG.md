@@ -6,6 +6,48 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 176 — §5.11.28 `read_interintra_mode` reader.** Wires the
+  inter-intra blending triple into the §5.11.23 inter cascade. Reads
+  `interintra` against `TileInterIntraCdf[ Size_Group[ MiSize ] - 1 ]`
+  when the outer gate (`skip_mode == 0 && enable_interintra_compound
+  && !isCompound && BLOCK_8X8 <= MiSize <= BLOCK_32X32`) is open; when
+  `interintra == 1` continues with `interintra_mode` against
+  `TileInterIntraModeCdf[ ctx ]` (4-way `II_DC_PRED` / `II_V_PRED` /
+  `II_H_PRED` / `II_SMOOTH_PRED`), `wedge_interintra` against
+  `TileWedgeInterIntraCdf[ MiSize ]`, and on the wedge sub-branch
+  `wedge_index` against `TileWedgeIndexCdf[ MiSize ]` (16-symbol shared
+  with §5.11.29).
+
+  Inner-arm side-effect: the spec sets `RefFrame[ 1 ] = INTRA_FRAME`
+  on the §5.11.28 inner arm; the §5.11.23 dispatcher restamps the
+  walker's slot-1 grid over the `bh4 * bw4` footprint so downstream
+  neighbour walks observe the override. `AngleDeltaY`, `AngleDeltaUV`,
+  and `use_filter_intra` are forced to 0 per the spec but are
+  inter-block scalars not currently tracked.
+
+  Four new §6.10.27 named constants: `II_DC_PRED = 0`,
+  `II_V_PRED = 1`, `II_H_PRED = 2`, `II_SMOOTH_PRED = 3`. New
+  `InterIntraReadout` aggregate carries `interintra: u8` plus
+  `Option<u8>` companions for `interintra_mode` / `wedge_interintra` /
+  `wedge_index`. `DecodedInterBlockModeInfo` gains an `interintra`
+  field of this type.
+
+  `decode_inter_block_mode_info` and `decode_inter_frame_mode_info`
+  gain a new `enable_interintra_compound: bool` parameter (the
+  caller-supplied §5.5.2 sequence-header bit).
+
+  10 new unit tests cover: II_* ordinal alignment; the five outer-
+  gate-closed paths (skip_mode / !enable_interintra_compound /
+  isCompound / MiSize < BLOCK_8X8 / MiSize > BLOCK_32X32), each
+  asserting zero bits consumed; the `MiSize = BLOCK_SIZES` defensive
+  fallback; the gate-open + interintra=0 path (witnessed by
+  inter_intra CDF adaptation and untouched inter_intra_mode row);
+  the four-symbol reachability path (100-trial property test biased
+  toward the inner arm, witnessing the `wedge_index` CDF adaptation);
+  and two end-to-end §5.11.23 cascade tests (disabled-compound
+  short-circuits, enabled-compound witnesses CDF adaptation and the
+  conditional slot-1 grid stamp). Test count: 691 → 703 (+12).
+
 * **Round 174 — §5.11.31 `assign_mv` + §5.11.32 `read_mv_component`
   syntax tree.** Wires the per-block motion-vector decode into the
   §5.11.23 inter cascade. Lifts `Error::AssignMvUnsupported` (now a
