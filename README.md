@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 186)
+## Status — 2026-05-28 (round 187)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1551,6 +1551,115 @@ through the dispatcher witnessing the `InterpolationFilterReadout`
 on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
+`encode_av1` still return `Error::NotImplemented`.
+
+Round 187 lifts the **§7.11.2.2 PAETH and §7.11.2.6 SMOOTH /
+SMOOTH_V / SMOOTH_H sample-generation leaves**, alongside the
+**§7.11.2.1 `AboveRow[-1]` / `LeftCol[-1]` corner-sample
+derivation** (the corner cell PAETH needs and r186 deferred). The
+§5.11.33 `compute_prediction` dispatcher's intra arm now admits
+seven of thirteen Y intra modes —
+`{DC_PRED, V_PRED, H_PRED, SMOOTH_PRED, SMOOTH_V_PRED,
+SMOOTH_H_PRED, PAETH_PRED}` — leaving only the six §7.11.2.4
+non-degenerate directional D-modes (D45 / D67 / D113 / D135 / D157
+/ D203) for the next arc.
+
+`derive_above_left(have_above, have_left, x, y, curr_frame,
+curr_frame_cols, bit_depth) -> u16` transcribes §7.11.2.1 corner
+arms 1-4 (av1-spec p.242). Four-arm dispatch on
+`(haveAbove, haveLeft)`: `(1, 1)` reads
+`CurrFrame[plane][y-1][x-1]` (the up-left diagonal); `(1, 0)`
+reads `CurrFrame[plane][y-1][x]`; `(0, 1)` reads
+`CurrFrame[plane][y][x-1]`; `(0, 0)` returns `1 << (BitDepth - 1)`
+— the symmetric mid-grey value, NOT the `±1`-offset asymmetric
+values arms 1 / 2 of `derive_above_row` / `derive_left_col` use.
+The spec sets `LeftCol[-1] = AboveRow[-1]`, so a single helper
+covers both.
+
+`predict_intra_paeth_pred(w, h, above_row, left_col, above_left,
+pred)` transcribes the §7.11.2.2 basic intra prediction process
+(av1-spec p.243) verbatim. For each `(i, j)`: `base = AboveRow[j]
++ LeftCol[i] - AboveRow[-1]`; compute `pLeft = |base -
+LeftCol[i]|`, `pTop = |base - AboveRow[j]|`, `pTopLeft = |base -
+AboveRow[-1]|`; pick `LeftCol[i]` if `pLeft <= pTop && pLeft <=
+pTopLeft` (first arm), else `AboveRow[j]` if `pTop <= pTopLeft`
+(second arm), else `AboveRow[-1]` (third arm). The intermediates
+are computed in `i32` so the subtraction is exact. The first arm
+dominates when `AboveRow[j]` and `AboveRow[-1]` are close (PAETH
+degenerates to H_PRED); the second arm dominates when `LeftCol[i]`
+and `AboveRow[-1]` are close (PAETH degenerates to V_PRED); the
+third arm fires when neither edge is close to the corner.
+
+`predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row,
+left_col, pred)` transcribes the §7.11.2.6 SMOOTH_PRED arm
+(av1-spec p.250). 4-tap bidirectional weighted blend:
+`smoothPred = smWeightsY[i] * AboveRow[j] + (256 - smWeightsY[i])
+* LeftCol[h-1] + smWeightsX[j] * LeftCol[i] + (256 - smWeightsX[j])
+* AboveRow[w-1]`, then `Round2(smoothPred, 9)`. The weight tables
+`smWeightsX` / `smWeightsY` are picked from `Sm_Weights_Tx_{NxN}`
+(N ∈ {4, 8, 16, 32, 64}) by `log2_w - 2` / `log2_h - 2`. Crucially
+the SMOOTH formula references `LeftCol[h-1]` (the bottom-left of
+the per-edge neighbour array, the spec's "bottom-left reference
+sample") and `AboveRow[w-1]` (top-right reference) — NOT the
+corner cell `AboveRow[-1]` (the corner is consumed exclusively by
+PAETH).
+
+`predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col,
+pred)` transcribes the §7.11.2.6 SMOOTH_V_PRED arm. Vertical-only
+2-tap blend `smWeights[i] * AboveRow[j] + (256 - smWeights[i]) *
+LeftCol[h-1]`, then `Round2(_, 8)`. The top row (where
+`smWeights[0] = 255`) is anchored to `AboveRow[j]`; the bottom
+row (`smWeights[h-1] ∈ {64, 32, 16, 8, 4}` per the per-size
+tables) is anchored to `LeftCol[h-1]`.
+
+`predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col,
+pred)` transcribes the §7.11.2.6 SMOOTH_H_PRED arm. Horizontal-
+only 2-tap blend `smWeights[j] * LeftCol[i] + (256 -
+smWeights[j]) * AboveRow[w-1]`, then `Round2(_, 8)`. Mirror of
+SMOOTH_V along the other axis.
+
+The `Sm_Weights_Tx_{4x4, 8x8, 16x16, 32x32, 64x64}` tables are
+transcribed verbatim from av1-spec p.508 — five size variants
+covering the §3 transform-size set, with monotone-decreasing
+weight profiles (`[255, …, 64]` for 4x4, down to `[255, …, 4]`
+for 64x64).
+
+The §5.11.33 `compute_prediction` dispatcher's intra-mode gate now
+admits `mode ∈ {DC_PRED, V_PRED, H_PRED, SMOOTH_PRED,
+SMOOTH_V_PRED, SMOOTH_H_PRED, PAETH_PRED}` (seven of thirteen Y
+intra modes). `Error::ComputePredictionIntraModeUnsupported` still
+fires for the six remaining D-mode directional ordinals (`D45_PRED`
+= 3 through `D67_PRED` = 8) — the §7.11.2.4 non-degenerate body
+with `Dr_Intra_Derivative[]` driven sample projection and the
+§7.11.2.{10..12} intra-edge upsample / filter pre-passes is the
+next-arc target. New named §6.10.x intra-mode ordinals
+`SMOOTH_PRED` = 9, `SMOOTH_V_PRED` = 10, `SMOOTH_H_PRED` = 11,
+`PAETH_PRED` = 12 exposed as `pub const`.
+
+Test count: 885 → 914 (+29). New tests: SMOOTH / PAETH ordinal
+pins; `Sm_Weights_Tx_*` boundary-value transcription pins;
+`derive_above_left` four-arm dispatch on top-left / above-only /
+left-only / no-neighbour for 8 / 10 / 12-bit `BitDepth`;
+out-of-range sample clipping to `[0, (1 << BitDepth) - 1]`; PAETH
+on constant-neighbour blocks (first arm always wins); PAETH
+H_PRED-degeneracy (`AboveRow[j] == corner` for all `j`); PAETH
+V_PRED-degeneracy (`LeftCol[i] == corner` for all `i`); PAETH
+first-arm tie-break (`pLeft == pTop` and both `<= pTopLeft`);
+PAETH third-arm hand-trace where `pTopLeft = 0 < pLeft = pTop`
+fires the corner-cell write; PAETH caller-bug guards;
+SMOOTH_PRED constant-neighbour produces constant block (the
+`c * 512 / 512 = c` identity); SMOOTH_PRED `pred[0][0]` and
+`pred[h-1][w-1]` hand-traces against av1-spec p.250 (the
+`(255*100 + 200 + 255*200 + 100 + 256) >> 9 = 150` pin);
+SMOOTH_PRED 64×64 max-size 12-bit ceiling round-trip;
+SMOOTH_V top-row / bottom-row weighting asymmetry; SMOOTH_H
+left-col / right-col weighting asymmetry; all-three SMOOTH leaves'
+caller-bug guards; dispatcher acceptance of SMOOTH_PRED /
+SMOOTH_V_PRED / SMOOTH_H_PRED / PAETH_PRED with task-list mode
+forwarding on a 3-plane 4:2:0 block; dispatcher rejection of
+D45 / D135 / D67 at the D-mode-interval boundaries; end-to-end
+PAETH and SMOOTH_PRED through the §7.11.2.1 derivation helpers
+against a real `CurrFrame[plane]`-shaped buffer. `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
 
 Round 186 lifts the **§7.11.2.4 V_PRED and H_PRED sample-generation

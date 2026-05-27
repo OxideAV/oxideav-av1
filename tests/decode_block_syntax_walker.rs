@@ -2040,32 +2040,103 @@ fn compute_prediction_h_pred_dispatches_one_task_per_plane() {
     assert_eq!(r.tasks[2].mode, 2);
 }
 
-/// r186: §5.11.33 non-{DC_PRED, V_PRED, H_PRED} intra modes still
-/// surface the next-arc stub. Verifies SMOOTH_PRED (= 9) and the
-/// other supported-set boundary (mode == 3 = D45_PRED).
+/// r187: §5.11.33 non-{DC, V, H, SMOOTH*, PAETH}_PRED intra modes
+/// (the six directional D-mode ordinals `3..=8`) still surface the
+/// next-arc stub. Verifies the D-mode interval boundaries (`D45_PRED
+/// = 3` and `D67_PRED = 8`) plus an interior point (`D135_PRED = 4`).
 #[test]
-fn compute_prediction_non_dc_v_h_pred_surfaces_stub() {
+fn compute_prediction_d_mode_intra_modes_surface_stub() {
     let mut walker = walker_n(16);
-    // mode = 3 (D45_PRED) — first unsupported.
+    // mode = 3 (D45_PRED) — first unsupported (D-mode interval lower
+    // bound, immediately above the §7.11.2.4-degenerate H_PRED).
     let result = walker.compute_prediction(
         0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 3, 0,
         false,
     );
     assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
 
-    // mode = 9 (SMOOTH_PRED) — a different unsupported mode.
+    // mode = 4 (D135_PRED) — D-mode interior.
     let result = walker.compute_prediction(
-        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 9, 0,
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 4, 0,
         false,
     );
     assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
 
-    // mode = 12 (PAETH_PRED) — last in-range unsupported.
+    // mode = 8 (D67_PRED) — last D-mode ordinal (the upper boundary,
+    // immediately below SMOOTH_PRED = 9 which IS now supported).
     let result = walker.compute_prediction(
-        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 12, 0,
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 8, 0,
         false,
     );
     assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
+}
+
+/// r187: §5.11.33 SMOOTH_PRED (= 9) now admitted on the dispatcher's
+/// intra arm. Mirror of the r186 V_PRED / H_PRED dispatcher acceptance
+/// tests.
+#[test]
+fn compute_prediction_smooth_pred_dispatches_one_task_per_plane() {
+    let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
+            /* y_mode = */ 9, // SMOOTH_PRED
+            /* uv_mode = */ 9, false,
+        )
+        .expect("SMOOTH_PRED intra arm must dispatch post-r187");
+    assert_eq!(r.num_planes_visited, 3);
+    assert_eq!(r.tasks.len(), 3);
+    assert_eq!(r.tasks[0].mode, 9);
+    assert_eq!(r.tasks[1].mode, 9);
+    assert_eq!(r.tasks[2].mode, 9);
+}
+
+/// r187: §5.11.33 SMOOTH_V_PRED (= 10) admitted on the dispatcher's
+/// intra arm.
+#[test]
+fn compute_prediction_smooth_v_pred_dispatches_one_task_per_plane() {
+    let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
+            /* y_mode = */ 10, // SMOOTH_V_PRED
+            /* uv_mode = */ 10, false,
+        )
+        .expect("SMOOTH_V_PRED intra arm must dispatch post-r187");
+    assert_eq!(r.num_planes_visited, 3);
+    assert_eq!(r.tasks[0].mode, 10);
+}
+
+/// r187: §5.11.33 SMOOTH_H_PRED (= 11) admitted on the dispatcher's
+/// intra arm.
+#[test]
+fn compute_prediction_smooth_h_pred_dispatches_one_task_per_plane() {
+    let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
+            /* y_mode = */ 11, // SMOOTH_H_PRED
+            /* uv_mode = */ 11, false,
+        )
+        .expect("SMOOTH_H_PRED intra arm must dispatch post-r187");
+    assert_eq!(r.num_planes_visited, 3);
+    assert_eq!(r.tasks[0].mode, 11);
+}
+
+/// r187: §5.11.33 PAETH_PRED (= 12) admitted on the dispatcher's
+/// intra arm.
+#[test]
+fn compute_prediction_paeth_pred_dispatches_one_task_per_plane() {
+    let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
+            /* y_mode = */ 12, // PAETH_PRED
+            /* uv_mode = */ 12, false,
+        )
+        .expect("PAETH_PRED intra arm must dispatch post-r187");
+    assert_eq!(r.num_planes_visited, 3);
+    assert_eq!(r.tasks[0].mode, 12);
 }
 
 /// §5.11.33 caller-bug guards.

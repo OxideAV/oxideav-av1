@@ -6,6 +6,105 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 187 — §7.11.2.2 PAETH + §7.11.2.6 SMOOTH / SMOOTH_V /
+  SMOOTH_H sample-generation leaves + §7.11.2.1 `AboveRow[-1]`
+  corner-sample derivation.** Extends the §5.11.33
+  `compute_prediction` dispatcher's intra arm from
+  `{DC_PRED, V_PRED, H_PRED}` (r186) to seven of thirteen Y intra
+  modes — the four "smooth" predictors that share neighbour-array
+  infrastructure with V_PRED / H_PRED, plus the §7.11.2.2 PAETH
+  basic intra prediction that introduces the corner-cell read.
+
+  * **New `derive_above_left(have_above, have_left, x, y, curr_frame,
+    curr_frame_cols, bit_depth) -> u16`** — §7.11.2.1 corner-cell
+    derivation (av1-spec p.242). Four-arm dispatch on
+    `(haveAbove, haveLeft)`: `(1, 1)` ⇒
+    `CurrFrame[plane][y-1][x-1]`; `(1, 0)` ⇒
+    `CurrFrame[plane][y-1][x]`; `(0, 1)` ⇒
+    `CurrFrame[plane][y][x-1]`; `(0, 0)` ⇒ `1 << (BitDepth - 1)`
+    (the symmetric mid-grey value, NOT the `±1`-offset asymmetric
+    values arms 1 / 2 of `derive_above_row` / `derive_left_col`
+    use). The spec sets `LeftCol[-1] = AboveRow[-1]`, so a single
+    helper covers both.
+  * **New `predict_intra_paeth_pred(w, h, above_row, left_col,
+    above_left, pred)`** — §7.11.2.2 basic intra prediction process
+    (av1-spec p.243). Per-cell, computes `base = AboveRow[j] +
+    LeftCol[i] - AboveRow[-1]` and the three absolute deltas
+    `pLeft`, `pTop`, `pTopLeft`; tie-break is
+    `LeftCol[i]` (first arm) > `AboveRow[j]` (second arm) >
+    `AboveRow[-1]` (third arm). Reachable when `mode == PAETH_PRED
+    == 12`.
+  * **New `predict_intra_smooth_pred(log2_w, log2_h, w, h,
+    above_row, left_col, pred)`** — §7.11.2.6 SMOOTH_PRED arm
+    (av1-spec p.250). 4-tap bidirectional blend
+    `smoothPred = smWeightsY[i] * AboveRow[j] + (256 -
+    smWeightsY[i]) * LeftCol[h-1] + smWeightsX[j] * LeftCol[i] +
+    (256 - smWeightsX[j]) * AboveRow[w-1]`, then `Round2(_, 9)`.
+    `smWeightsX = Sm_Weights_Tx_{1 << log2_w}x...`, similarly
+    `smWeightsY`. Note the spec uses `LeftCol[h-1]` and
+    `AboveRow[w-1]` (the LAST entries of the per-edge neighbour
+    arrays, NOT the corner cell `AboveRow[-1]`).
+  * **New `predict_intra_smooth_v_pred(log2_h, w, h, above_row,
+    left_col, pred)`** — §7.11.2.6 SMOOTH_V_PRED arm
+    (av1-spec p.250-251). Vertical-only 2-tap blend
+    `smWeights[i] * AboveRow[j] + (256 - smWeights[i]) *
+    LeftCol[h-1]`, then `Round2(_, 8)`.
+  * **New `predict_intra_smooth_h_pred(log2_w, w, h, above_row,
+    left_col, pred)`** — §7.11.2.6 SMOOTH_H_PRED arm
+    (av1-spec p.251). Horizontal-only 2-tap blend
+    `smWeights[j] * LeftCol[i] + (256 - smWeights[j]) *
+    AboveRow[w-1]`, then `Round2(_, 8)`.
+  * **New `Sm_Weights_Tx_{4x4, 8x8, 16x16, 32x32, 64x64}` tables**
+    — verbatim transcription from av1-spec p.508. Five size
+    variants cover the §3 transform-size set; indexed by
+    `log2_n - 2`.
+  * **Dispatcher gate widened.** The §5.11.33
+    `PartitionWalker::compute_prediction` intra arm now admits
+    `mode ∈ {DC_PRED, V_PRED, H_PRED, SMOOTH_PRED, SMOOTH_V_PRED,
+    SMOOTH_H_PRED, PAETH_PRED}` (seven of thirteen Y intra modes).
+    `ComputePredictionIntraModeUnsupported` still fires for the
+    remaining six directional D-modes (D45_PRED / D135_PRED /
+    D113_PRED / D157_PRED / D203_PRED / D67_PRED — ordinals
+    `3..=8`) — next-arc targets.
+  * **New named §6.10.x intra-mode ordinals** —
+    `SMOOTH_PRED = 9`, `SMOOTH_V_PRED = 10`, `SMOOTH_H_PRED = 11`,
+    `PAETH_PRED = 12` exported as `pub const`.
+
+  Test count: 885 → 914 (+29). New tests cover: SMOOTH / PAETH
+  ordinal pins; `Sm_Weights_Tx_*` boundary-value transcription
+  pins; `derive_above_left` four-arm dispatch (top-left
+  diagonal / above-only / left-only / no-neighbour mid-grey for 8 /
+  10 / 12-bit `BitDepth`); negative + over-range sample clipping
+  to `[0, (1 << BitDepth) - 1]`; PAETH on constant-neighbour
+  blocks (all three deltas zero ⇒ first-arm wins); PAETH
+  degenerating to H_PRED when `AboveRow[j] == AboveRow[-1]`;
+  PAETH degenerating to V_PRED when `LeftCol[i] == AboveRow[-1]`;
+  PAETH first-arm tie-break (`pLeft == pTop`); PAETH third-arm
+  hand-trace where `pTopLeft` is the unique minimum; PAETH
+  caller-bug guards; SMOOTH_PRED constant-neighbour produces
+  constant block; SMOOTH_PRED corner cell hand-trace (`pred[0][0]
+  = (255*100 + 200 + 255*200 + 100 + 256) >> 9 = 150`);
+  SMOOTH_PRED bottom-right hand-trace; SMOOTH_PRED 64×64 max-size
+  12-bit ceiling round-trip; SMOOTH_V top-row / bottom-row
+  weighting asymmetry; SMOOTH_H left-col / right-col weighting
+  asymmetry; all-three SMOOTH leaves' caller-bug guards;
+  dispatcher acceptance of SMOOTH_PRED / SMOOTH_V_PRED /
+  SMOOTH_H_PRED / PAETH_PRED with task-list mode forwarding on a
+  3-plane 4:2:0 block; dispatcher rejection of D45 / D135 / D67
+  at the D-mode-interval boundaries; end-to-end PAETH and
+  SMOOTH_PRED through the §7.11.2.1 derivation helpers against a
+  real `CurrFrame[plane]`-shaped buffer.
+
+  The dispatcher itself still returns a per-plane task list rather
+  than invoking the prediction kernels directly; the walker
+  integration (driving the leaves end-to-end through the walker's
+  `CurrFrame[plane]` buffer) lands when the §5.11.5 driver has
+  the §5.11.6 / §5.11.5 mode-info read fully wired. The six
+  directional D-modes (`D45_PRED` / `D135_PRED` / `D113_PRED` /
+  `D157_PRED` / `D203_PRED` / `D67_PRED`) — the §7.11.2.4 non-
+  degenerate body with `Dr_Intra_Derivative[]` driven sample
+  projection — are the next-arc target.
+
 * **Round 186 — §7.11.2.4 V_PRED + H_PRED sample-generation leaves
   + §7.11.2.1 `AboveRow[]` / `LeftCol[]` neighbour derivation.**
   Extends the §5.11.33 `compute_prediction` dispatcher's intra arm

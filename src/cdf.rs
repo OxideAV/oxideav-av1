@@ -1702,6 +1702,501 @@ pub fn predict_intra_h_pred(
 }
 
 // ---------------------------------------------------------------------
+// Round 187 — §7.11.2.1 `AboveRow[-1]` / `LeftCol[-1]` corner-sample
+// derivation, plus the §7.11.2.2 PAETH_PRED and §7.11.2.6 SMOOTH /
+// SMOOTH_V / SMOOTH_H sample-generation leaves.
+//
+// The §7.11.2.1 prologue (av1-spec p.242) closes its neighbour-array
+// derivation with a single corner sample shared between `AboveRow[-1]`
+// and `LeftCol[-1]` (the spec text reads: "The array LeftCol[ i ] for
+// i = -1 is set equal to AboveRow[ -1 ]"). The four-arm dispatch is:
+//
+//   * `(haveAbove, haveLeft) == (1, 1)` ⇒ `CurrFrame[plane][y-1][x-1]`
+//   * `(haveAbove, haveLeft) == (1, 0)` ⇒ `CurrFrame[plane][y-1][x]`
+//   * `(haveAbove, haveLeft) == (0, 1)` ⇒ `CurrFrame[plane][y][x-1]`
+//   * `(haveAbove, haveLeft) == (0, 0)` ⇒ `1 << (BitDepth - 1)` (the
+//     symmetric mid-grey value, NOT the `±1`-offset values that arms
+//     1 / 2 of the `AboveRow[]` / `LeftCol[]` derivation use).
+//
+// PAETH_PRED (§7.11.2.2 — "Basic intra prediction process", av1-spec
+// p.243) is the only §7.11.2.{2..6} leaf that reads the corner cell.
+// SMOOTH / SMOOTH_V / SMOOTH_H (§7.11.2.6) read `LeftCol[h-1]` and
+// `AboveRow[w-1]` — the LAST values of the two neighbour arrays (the
+// bottom-left and top-right of the extended `0..w+h-1` slots), not the
+// corner. The SMOOTH leaves therefore do not consume the corner cell.
+//
+// PAETH per-cell (i = 0..h-1, j = 0..w-1):
+//
+//   base     = AboveRow[j] + LeftCol[i] - AboveRow[-1]
+//   pLeft    = Abs(base - LeftCol[i])
+//   pTop     = Abs(base - AboveRow[j])
+//   pTopLeft = Abs(base - AboveRow[-1])
+//   pred[i][j] =
+//     LeftCol[i]      if pLeft <= pTop  and pLeft <= pTopLeft
+//     AboveRow[j]     else if pTop <= pTopLeft
+//     AboveRow[-1]    otherwise
+//
+// SMOOTH_PRED per-cell (i = 0..h-1, j = 0..w-1):
+//
+//   smoothPred =   smWeightsY[i] * AboveRow[j]
+//                + (256 - smWeightsY[i]) * LeftCol[h-1]
+//                + smWeightsX[j] * LeftCol[i]
+//                + (256 - smWeightsX[j]) * AboveRow[w-1]
+//   pred[i][j] = Round2(smoothPred, 9)
+//
+// SMOOTH_V_PRED per-cell:
+//
+//   smoothPred = smWeights[i] * AboveRow[j]
+//              + (256 - smWeights[i]) * LeftCol[h-1]
+//   pred[i][j] = Round2(smoothPred, 8)
+//
+// SMOOTH_H_PRED per-cell:
+//
+//   smoothPred = smWeights[j] * LeftCol[i]
+//              + (256 - smWeights[j]) * AboveRow[w-1]
+//   pred[i][j] = Round2(smoothPred, 8)
+//
+// `Round2(x, n) = (x + (1 << (n - 1))) >> n` (§3 `Round2`); for
+// non-negative `x` (the smooth-prediction sums always are) this is the
+// nearest-integer round with ties-to-even-power-of-two break.
+//
+// The `Sm_Weights_Tx_*` tables are transcribed verbatim from av1-spec
+// p.508. Indexed by `log2W - 2` / `log2H - 2`, sizes `2..=6` cover
+// `w / h ∈ {4, 8, 16, 32, 64}` (the §3 transform-size set).
+// ---------------------------------------------------------------------
+
+/// `SMOOTH_PRED` (§6.10.x intra-mode enumeration) — the first of the
+/// three smooth intra modes (`SMOOTH_PRED == 9`, `SMOOTH_V_PRED ==
+/// 10`, `SMOOTH_H_PRED == 11`). The sample-generation leaf is
+/// [`predict_intra_smooth_pred`]; §7.11.2.6 (av1-spec p.250).
+pub const SMOOTH_PRED: usize = 9;
+
+/// `SMOOTH_V_PRED` (§6.10.x intra-mode enumeration). Sample-generation
+/// leaf: [`predict_intra_smooth_v_pred`]; §7.11.2.6 second arm
+/// (av1-spec p.250-251).
+pub const SMOOTH_V_PRED: usize = 10;
+
+/// `SMOOTH_H_PRED` (§6.10.x intra-mode enumeration). Sample-generation
+/// leaf: [`predict_intra_smooth_h_pred`]; §7.11.2.6 third arm
+/// (av1-spec p.251).
+pub const SMOOTH_H_PRED: usize = 11;
+
+/// `PAETH_PRED` (§6.10.x intra-mode enumeration) — the basic intra
+/// prediction mode (`PAETH_PRED == 12`, the last Y intra mode before
+/// `UV_CFL_PRED == 13` is added for chroma). Sample-generation leaf:
+/// [`predict_intra_paeth_pred`]; §7.11.2.2 (av1-spec p.243).
+pub const PAETH_PRED: usize = 12;
+
+/// `Sm_Weights_Tx_4x4` (av1-spec p.508) — smooth-prediction weights
+/// for the 4-sample side. Used when `log2W == 2` (SMOOTH_PRED x-axis,
+/// SMOOTH_H_PRED) or `log2H == 2` (SMOOTH_PRED y-axis, SMOOTH_V_PRED).
+pub const SM_WEIGHTS_TX_4X4: [u16; 4] = [255, 149, 85, 64];
+
+/// `Sm_Weights_Tx_8x8` (av1-spec p.508) — smooth-prediction weights
+/// for the 8-sample side.
+pub const SM_WEIGHTS_TX_8X8: [u16; 8] = [255, 197, 146, 105, 73, 50, 37, 32];
+
+/// `Sm_Weights_Tx_16x16` (av1-spec p.508) — smooth-prediction weights
+/// for the 16-sample side.
+pub const SM_WEIGHTS_TX_16X16: [u16; 16] = [
+    255, 225, 196, 170, 145, 123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16,
+];
+
+/// `Sm_Weights_Tx_32x32` (av1-spec p.508) — smooth-prediction weights
+/// for the 32-sample side.
+pub const SM_WEIGHTS_TX_32X32: [u16; 32] = [
+    255, 240, 225, 210, 196, 182, 169, 157, 145, 133, 122, 111, 101, 92, 83, 74, 66, 59, 52, 45,
+    39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8,
+];
+
+/// `Sm_Weights_Tx_64x64` (av1-spec p.508) — smooth-prediction weights
+/// for the 64-sample side.
+pub const SM_WEIGHTS_TX_64X64: [u16; 64] = [
+    255, 248, 240, 233, 225, 218, 210, 203, 196, 189, 182, 176, 169, 163, 156, 150, 144, 138, 133,
+    127, 121, 116, 111, 106, 101, 96, 91, 86, 82, 77, 73, 69, 65, 61, 57, 54, 50, 47, 44, 41, 38,
+    35, 32, 29, 27, 25, 22, 20, 18, 16, 15, 13, 12, 10, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4,
+];
+
+/// Internal dispatch on `log2_n` for the smooth-prediction weight
+/// tables. Returns the slice the spec's `smWeightsX` / `smWeightsY` /
+/// `smWeights` selector resolves to (`log2_n ∈ 2..=6`).
+fn sm_weights_for_log2(log2_n: u32) -> Option<&'static [u16]> {
+    match log2_n {
+        2 => Some(&SM_WEIGHTS_TX_4X4),
+        3 => Some(&SM_WEIGHTS_TX_8X8),
+        4 => Some(&SM_WEIGHTS_TX_16X16),
+        5 => Some(&SM_WEIGHTS_TX_32X32),
+        6 => Some(&SM_WEIGHTS_TX_64X64),
+        _ => None,
+    }
+}
+
+/// §7.11.2.1 corner-sample derivation (av1-spec p.242) — returns the
+/// `AboveRow[-1]` value, which the spec also assigns to `LeftCol[-1]`.
+///
+/// The four-arm dispatch on `(haveAbove, haveLeft)`:
+///
+/// * `(1, 1)` ⇒ `CurrFrame[plane][y-1][x-1]`
+/// * `(1, 0)` ⇒ `CurrFrame[plane][y-1][x]`
+/// * `(0, 1)` ⇒ `CurrFrame[plane][y][x-1]`
+/// * `(0, 0)` ⇒ `1 << (BitDepth - 1)` (symmetric mid-grey, NOT the
+///   `±1` offsets arms 1 / 2 of `derive_above_row` / `derive_left_col`
+///   use).
+///
+/// ## Arguments
+///
+/// * `have_above` / `have_left` — §7.11.2.1 inputs.
+/// * `x` / `y` — per-plane top-left in `CurrFrame[plane]` sample space.
+/// * `curr_frame` — flat row-major `CurrFrame[plane]` buffer.
+/// * `curr_frame_cols` — column stride.
+/// * `bit_depth` — §5.5.2 bit depth (`8`, `10`, or `12`); used for
+///   arm-4 mid-grey fallback.
+///
+/// ## Returns
+///
+/// `Ok(sample)` with the derived `AboveRow[-1]` value, clipped to
+/// `[0, (1 << BitDepth) - 1]`.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments: `bit_depth ∉ {8, 10, 12}`, `curr_frame_cols == 0`,
+/// `(y == 0)` with `have_above == 1`, `(x == 0)` with `have_left == 1
+/// && have_above == 0` (arm 3 needs `x-1`), `(x == 0)` with
+/// `have_above == 1 && have_left == 1` (arm 1 needs `x-1`), or an
+/// `(row, col)` read landing outside `curr_frame`.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_above_left(
+    have_above: u8,
+    have_left: u8,
+    x: u32,
+    y: u32,
+    curr_frame: &[i32],
+    curr_frame_cols: u32,
+    bit_depth: u8,
+) -> Result<u16, crate::Error> {
+    if !matches!(bit_depth, 8 | 10 | 12) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if curr_frame_cols == 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    if have_above == 0 && have_left == 0 {
+        // §7.11.2.1 corner arm 4: AboveRow[-1] = 1 << (BitDepth - 1).
+        return Ok(1u16 << (bit_depth - 1));
+    }
+
+    let (row, col) = if have_above != 0 && have_left != 0 {
+        // §7.11.2.1 corner arm 1: CurrFrame[plane][y-1][x-1].
+        if x == 0 || y == 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        ((y as usize) - 1, (x as usize) - 1)
+    } else if have_above != 0 {
+        // §7.11.2.1 corner arm 2: CurrFrame[plane][y-1][x].
+        if y == 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        ((y as usize) - 1, x as usize)
+    } else {
+        // §7.11.2.1 corner arm 3: CurrFrame[plane][y][x-1].
+        if x == 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        (y as usize, (x as usize) - 1)
+    };
+
+    let cols = curr_frame_cols as usize;
+    let idx = row
+        .checked_mul(cols)
+        .and_then(|p| p.checked_add(col))
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if idx >= curr_frame.len() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let max_val = (1i32 << bit_depth) - 1;
+    Ok(curr_frame[idx].clamp(0, max_val) as u16)
+}
+
+/// §7.11.2.2 basic intra prediction process (av1-spec p.243) — fills
+/// `pred[ 0..h*w ]` with PAETH_PRED samples.
+///
+/// Per-cell (`i = 0..h-1`, `j = 0..w-1`):
+///
+/// ```text
+///   base     = AboveRow[j] + LeftCol[i] - AboveRow[-1]
+///   pLeft    = Abs(base - LeftCol[i])     // = |AboveRow[j]  - AboveRow[-1]|
+///   pTop     = Abs(base - AboveRow[j])    // = |LeftCol[i]   - AboveRow[-1]|
+///   pTopLeft = Abs(base - AboveRow[-1])   // = |AboveRow[j]+LeftCol[i] - 2*AboveRow[-1]|
+///   pred[i][j] =
+///     LeftCol[i]     if pLeft <= pTop && pLeft <= pTopLeft
+///     AboveRow[j]    else if pTop <= pTopLeft
+///     AboveRow[-1]   otherwise
+/// ```
+///
+/// The intermediates are computed in `i32` so the `AboveRow[j] +
+/// LeftCol[i] - AboveRow[-1]` step is exact (each sample is at most
+/// `12` bits, so the sum fits in `i32` with massive headroom; the
+/// subsequent `Abs(base - ...)` differences are also in `i32`).
+///
+/// ## Arguments
+///
+/// * `w` / `h` — region width / height in plane samples (`4..=64`).
+/// * `above_row` — `AboveRow[ 0..w-1 ]`. Length must be `>= w`.
+/// * `left_col` — `LeftCol[ 0..h-1 ]`. Length must be `>= h`.
+/// * `above_left` — `AboveRow[-1]` (= `LeftCol[-1]`); from
+///   [`derive_above_left`].
+/// * `pred` — output buffer, row-major; length must be `>= h * w`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments (`w > 64`, `h > 64`, undersized `above_row` / `left_col`
+/// / `pred`).
+pub fn predict_intra_paeth_pred(
+    w: usize,
+    h: usize,
+    above_row: &[u16],
+    left_col: &[u16],
+    above_left: u16,
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if above_row.len() < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if left_col.len() < h {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    let above_left_i = above_left as i32;
+    for i in 0..h {
+        let left = left_col[i] as i32;
+        for j in 0..w {
+            let top = above_row[j] as i32;
+            // §7.11.2.2 step 1: base = AboveRow[j] + LeftCol[i] -
+            // AboveRow[-1].
+            let base = top + left - above_left_i;
+            // Steps 2-4: absolute deltas to the three candidates.
+            let p_left = (base - left).abs();
+            let p_top = (base - top).abs();
+            let p_top_left = (base - above_left_i).abs();
+            // Steps 5-7: tie-break in the order the spec specifies
+            // (LeftCol > AboveRow > AboveRow[-1]).
+            let v = if p_left <= p_top && p_left <= p_top_left {
+                left_col[i]
+            } else if p_top <= p_top_left {
+                above_row[j]
+            } else {
+                above_left
+            };
+            pred[i * w + j] = v;
+        }
+    }
+    Ok(())
+}
+
+/// §7.11.2.6 smooth intra prediction process — `SMOOTH_PRED` arm
+/// (av1-spec p.250). Fills `pred[ 0..h*w ]` with the 4-tap
+/// bidirectional blend:
+///
+/// ```text
+///   smoothPred =   smWeightsY[i] * AboveRow[j]
+///                + (256 - smWeightsY[i]) * LeftCol[h-1]
+///                + smWeightsX[j] * LeftCol[i]
+///                + (256 - smWeightsX[j]) * AboveRow[w-1]
+///   pred[i][j] = Round2(smoothPred, 9)
+/// ```
+///
+/// `smWeightsX = Sm_Weights_Tx_{1 << log2_w}x...`, indexed by
+/// `log2_w ∈ 2..=6`. Likewise `smWeightsY`. The right / bottom edges
+/// (`AboveRow[w-1]` / `LeftCol[h-1]`) are the **last entries** of the
+/// per-edge neighbour arrays — NOT the corner cell `AboveRow[-1]`
+/// (the corner cell is consumed only by `predict_intra_paeth_pred`).
+///
+/// ## Arguments
+///
+/// * `log2_w` / `log2_h` — base-2 logs of region width / height
+///   (`2..=6`).
+/// * `w` / `h` — region width / height in plane samples, with
+///   `w == (1 << log2_w)` / `h == (1 << log2_h)`.
+/// * `above_row` — `AboveRow[ 0..w-1 ]`. Length must be `>= w`.
+/// * `left_col` — `LeftCol[ 0..h-1 ]`. Length must be `>= h`.
+/// * `pred` — output buffer, row-major; length must be `>= h * w`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments (`log2_w / log2_h` outside `2..=6`, `w != (1 << log2_w)`,
+/// `h != (1 << log2_h)`, undersized buffers).
+#[allow(clippy::too_many_arguments)]
+pub fn predict_intra_smooth_pred(
+    log2_w: u32,
+    log2_h: u32,
+    w: usize,
+    h: usize,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    let sm_w = sm_weights_for_log2(log2_w).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let sm_h = sm_weights_for_log2(log2_h).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if w != (1usize << log2_w) || h != (1usize << log2_h) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if above_row.len() < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if left_col.len() < h {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.2.6 SMOOTH_PRED constants: `LeftCol[h-1]` and
+    // `AboveRow[w-1]` — the last entries of the per-edge neighbour
+    // arrays (the spec's bottom-left / top-right reference samples).
+    let bottom_left = left_col[h - 1] as u32;
+    let top_right = above_row[w - 1] as u32;
+
+    for i in 0..h {
+        let wy = sm_h[i] as u32;
+        let left = left_col[i] as u32;
+        for j in 0..w {
+            let wx = sm_w[j] as u32;
+            let top = above_row[j] as u32;
+            // §7.11.2.6 SMOOTH_PRED step 3:
+            //   smoothPred =   smWeightsY[i] * AboveRow[j]
+            //                + (256 - smWeightsY[i]) * LeftCol[h-1]
+            //                + smWeightsX[j] * LeftCol[i]
+            //                + (256 - smWeightsX[j]) * AboveRow[w-1]
+            //
+            // Maxima: each `smWeight*` is `<= 255`; each sample is
+            // `<= 4095` (12-bit). Each term is then `<= 255 * 4095 <
+            // 2^20`, and the four-term sum is `< 2^22` — well within
+            // `u32`.
+            let smooth_pred =
+                wy * top + (256 - wy) * bottom_left + wx * left + (256 - wx) * top_right;
+            // §3 Round2(x, 9) = (x + (1 << 8)) >> 9.
+            let v = (smooth_pred + (1u32 << 8)) >> 9;
+            pred[i * w + j] = v as u16;
+        }
+    }
+    Ok(())
+}
+
+/// §7.11.2.6 smooth intra prediction process — `SMOOTH_V_PRED` arm
+/// (av1-spec p.250-251). Fills `pred[ 0..h*w ]` with the vertical
+/// 2-tap blend:
+///
+/// ```text
+///   smoothPred = smWeights[i] * AboveRow[j]
+///              + (256 - smWeights[i]) * LeftCol[h-1]
+///   pred[i][j] = Round2(smoothPred, 8)
+/// ```
+///
+/// where `smWeights = Sm_Weights_Tx_{1 << log2_h}x...` (per
+/// `log2_h ∈ 2..=6`).
+pub fn predict_intra_smooth_v_pred(
+    log2_h: u32,
+    w: usize,
+    h: usize,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    let sm = sm_weights_for_log2(log2_h).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if h != (1usize << log2_h) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if w > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if above_row.len() < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if left_col.len() < h {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    let bottom_left = left_col[h - 1] as u32;
+    for i in 0..h {
+        let wy = sm[i] as u32;
+        let comp = 256 - wy;
+        for j in 0..w {
+            let top = above_row[j] as u32;
+            let smooth_pred = wy * top + comp * bottom_left;
+            // §3 Round2(x, 8) = (x + (1 << 7)) >> 8.
+            let v = (smooth_pred + (1u32 << 7)) >> 8;
+            pred[i * w + j] = v as u16;
+        }
+    }
+    Ok(())
+}
+
+/// §7.11.2.6 smooth intra prediction process — `SMOOTH_H_PRED` arm
+/// (av1-spec p.251). Fills `pred[ 0..h*w ]` with the horizontal 2-tap
+/// blend:
+///
+/// ```text
+///   smoothPred = smWeights[j] * LeftCol[i]
+///              + (256 - smWeights[j]) * AboveRow[w-1]
+///   pred[i][j] = Round2(smoothPred, 8)
+/// ```
+///
+/// where `smWeights = Sm_Weights_Tx_{1 << log2_w}x...` (per
+/// `log2_w ∈ 2..=6`).
+pub fn predict_intra_smooth_h_pred(
+    log2_w: u32,
+    w: usize,
+    h: usize,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    let sm = sm_weights_for_log2(log2_w).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if w != (1usize << log2_w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if above_row.len() < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if left_col.len() < h {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    let top_right = above_row[w - 1] as u32;
+    for i in 0..h {
+        let left = left_col[i] as u32;
+        for j in 0..w {
+            let wx = sm[j] as u32;
+            let smooth_pred = wx * left + (256 - wx) * top_right;
+            let v = (smooth_pred + (1u32 << 7)) >> 8;
+            pred[i * w + j] = v as u16;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // Round 149 — §5.11.49 caller-side argument derivation.
 // Computes the four `palette_tokens_plane` size arguments
 // (`block_w`, `block_h`, `onscreen_w`, `onscreen_h`) from the parser-
@@ -22346,14 +22841,20 @@ impl PartitionWalker {
     ///   `log2W`, `log2H`, `haveAbove` / `haveLeft` from the
     ///   §5.11.5 `AvailU` / `AvailL` / `AvailUChroma` / `AvailLChroma`
     ///   flags). Plane 0 carries `y_mode`; planes 1/2 carry `uv_mode`.
-    /// * §5.11.33 reachable-mode gate — currently `DC_PRED`,
-    ///   `V_PRED`, and `H_PRED` (the §7.11.2.5 DC sample-generation
-    ///   leaf is [`crate::predict_intra_dc_pred`]; the §7.11.2.4
-    ///   step-10 / step-11 V_PRED / H_PRED sample-generation leaves
-    ///   are [`crate::predict_intra_v_pred`] / [`crate::
-    ///   predict_intra_h_pred`]). The remaining 10 intra modes
-    ///   (`SMOOTH_PRED` / `SMOOTH_V_PRED` / `SMOOTH_H_PRED` /
-    ///   `PAETH_PRED` / `D45_PRED` / `D135_PRED` / `D113_PRED` /
+    /// * §5.11.33 reachable-mode gate — `DC_PRED`, `V_PRED`,
+    ///   `H_PRED`, `SMOOTH_PRED`, `SMOOTH_V_PRED`, `SMOOTH_H_PRED`,
+    ///   and `PAETH_PRED` (the §7.11.2.5 DC sample-generation leaf is
+    ///   [`crate::predict_intra_dc_pred`]; the §7.11.2.4 step-10 /
+    ///   step-11 V_PRED / H_PRED sample-generation leaves are
+    ///   [`crate::predict_intra_v_pred`] / [`crate::
+    ///   predict_intra_h_pred`]; the §7.11.2.6 SMOOTH variants are
+    ///   [`crate::predict_intra_smooth_pred`] / [`crate::
+    ///   predict_intra_smooth_v_pred`] / [`crate::
+    ///   predict_intra_smooth_h_pred`]; the §7.11.2.2 PAETH leaf is
+    ///   [`crate::predict_intra_paeth_pred`], whose
+    ///   `AboveRow[-1]` corner sample is derived by
+    ///   [`crate::derive_above_left`]). The remaining six directional
+    ///   D-modes (`D45_PRED` / `D135_PRED` / `D113_PRED` /
     ///   `D157_PRED` / `D203_PRED` / `D67_PRED`) surface
     ///   [`crate::Error::ComputePredictionIntraModeUnsupported`].
     ///
@@ -22478,28 +22979,48 @@ impl PartitionWalker {
             // §5.11.33 `!is_inter` (intra) arm. The §7.11.2.1 dispatch
             // routes to one of §7.11.2.5 (DC_PRED) / §7.11.2.6
             // (SMOOTH_*) / §7.11.2.4 (directional) / §7.11.2.2
-            // (PAETH_PRED) per `mode`. Today §7.11.2.5 (DC_PRED) and
+            // (PAETH_PRED) per `mode`. As of r187 seven of the
+            // thirteen Y intra modes land as standalone leaves:
+            // §7.11.2.5 DC_PRED ([`crate::predict_intra_dc_pred`]),
             // the two §7.11.2.4 degenerate directional cases V_PRED
-            // (`pAngle == 90`, step 10) and H_PRED (`pAngle == 180`,
-            // step 11) land as standalone leaves
-            // ([`crate::predict_intra_dc_pred`] /
-            // [`crate::predict_intra_v_pred`] /
-            // [`crate::predict_intra_h_pred`]); the other §7.11.2.x
-            // bodies (SMOOTH variants, PAETH, the non-degenerate
-            // D-modes) are next-arc.
+            // (`pAngle == 90`, step 10) / H_PRED (`pAngle == 180`,
+            // step 11) ([`crate::predict_intra_v_pred`] /
+            // [`crate::predict_intra_h_pred`]), the three §7.11.2.6
+            // SMOOTH arms (SMOOTH / SMOOTH_V / SMOOTH_H —
+            // [`crate::predict_intra_smooth_pred`] /
+            // [`crate::predict_intra_smooth_v_pred`] /
+            // [`crate::predict_intra_smooth_h_pred`]), and §7.11.2.2
+            // PAETH ([`crate::predict_intra_paeth_pred`]). The six
+            // non-degenerate D-mode directional bodies (D45 / D67 /
+            // D113 / D135 / D157 / D203 — `3..=8`) are next-arc.
             let plane_mode = if plane == 0 { y_mode } else { uv_mode };
 
-            // §5.11.33 reachable-mode gate (intra-DC + V_PRED + H_PRED
-            // today; modes 3..=12 next-arc).
+            // §5.11.33 reachable-mode gate (DC / V / H / SMOOTH* /
+            // PAETH today; D-modes 3..=8 next-arc).
             if plane_mode as usize >= INTRA_MODES && plane_mode != UV_CFL_PRED as u8 {
                 // Out-of-range mode (caller bug — the §5.11.7 /
                 // §5.11.22 readers cap at `INTRA_MODES`).
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            // `DC_PRED == 0`, `V_PRED == 1`, `H_PRED == 2`. Everything
-            // outside this triple still surfaces the §7.11.2.{2,3,4,6}
-            // stub for the next arc.
-            if plane_mode > H_PRED as u8 {
+            // `DC_PRED == 0`, `V_PRED == 1`, `H_PRED == 2`,
+            // `SMOOTH_PRED == 9`, `SMOOTH_V_PRED == 10`,
+            // `SMOOTH_H_PRED == 11`, `PAETH_PRED == 12`. The seven-
+            // mode supported set covers §7.11.2.5 + §7.11.2.4 step-10/
+            // step-11 + §7.11.2.6 (all three SMOOTH arms) + §7.11.2.2
+            // PAETH. Everything else (the six directional D-modes:
+            // D45 / D67 / D113 / D135 / D157 / D203 — `3..=8` per the
+            // §6.10.x enumeration) still surfaces the next-arc stub.
+            let supported = matches!(
+                plane_mode as usize,
+                DC_PRED
+                    | V_PRED
+                    | H_PRED
+                    | SMOOTH_PRED
+                    | SMOOTH_V_PRED
+                    | SMOOTH_H_PRED
+                    | PAETH_PRED
+            );
+            if !supported {
                 return Err(crate::Error::ComputePredictionIntraModeUnsupported);
             }
 
@@ -26921,6 +27442,536 @@ mod tests {
             derive_left_col(0, 1, 0, 1, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut left),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // r187 — §7.11.2.1 corner + §7.11.2.2 PAETH + §7.11.2.6 SMOOTH*
+    // -----------------------------------------------------------------
+
+    /// r187: §6.10.x intra-mode ordinals — `SMOOTH_PRED == 9`,
+    /// `SMOOTH_V_PRED == 10`, `SMOOTH_H_PRED == 11`, `PAETH_PRED == 12`.
+    #[test]
+    fn intra_mode_ordinals_smooth_and_paeth_match_spec() {
+        assert_eq!(SMOOTH_PRED, 9);
+        assert_eq!(SMOOTH_V_PRED, 10);
+        assert_eq!(SMOOTH_H_PRED, 11);
+        assert_eq!(PAETH_PRED, 12);
+    }
+
+    /// r187: `Sm_Weights_Tx_*` tables — verbatim transcription pin
+    /// against av1-spec p.508. Boundary values from each table.
+    #[test]
+    fn sm_weights_tables_match_spec_transcription() {
+        // 4x4.
+        assert_eq!(SM_WEIGHTS_TX_4X4, [255, 149, 85, 64]);
+        // 8x8.
+        assert_eq!(SM_WEIGHTS_TX_8X8, [255, 197, 146, 105, 73, 50, 37, 32]);
+        // 16x16 — first / last entries.
+        assert_eq!(SM_WEIGHTS_TX_16X16[0], 255);
+        assert_eq!(SM_WEIGHTS_TX_16X16[15], 16);
+        assert_eq!(SM_WEIGHTS_TX_16X16.len(), 16);
+        // 32x32 — first / last entries.
+        assert_eq!(SM_WEIGHTS_TX_32X32[0], 255);
+        assert_eq!(SM_WEIGHTS_TX_32X32[31], 8);
+        assert_eq!(SM_WEIGHTS_TX_32X32.len(), 32);
+        // 64x64 — first / last entries.
+        assert_eq!(SM_WEIGHTS_TX_64X64[0], 255);
+        assert_eq!(SM_WEIGHTS_TX_64X64[63], 4);
+        assert_eq!(SM_WEIGHTS_TX_64X64.len(), 64);
+    }
+
+    /// r187: §7.11.2.1 corner-cell arm 1 — `(haveAbove, haveLeft) ==
+    /// (1, 1)` reads `CurrFrame[plane][y-1][x-1]`.
+    #[test]
+    fn derive_above_left_arm1_reads_top_left_diagonal() {
+        // 4×4 frame, place `77` at (row=0, col=0).
+        let mut frame = vec![0i32; 16];
+        frame[0] = 77;
+        // TU at (x=1, y=1) → corner reads (0, 0).
+        let v = derive_above_left(1, 1, 1, 1, &frame, 4, 8).unwrap();
+        assert_eq!(v, 77);
+    }
+
+    /// r187: §7.11.2.1 corner-cell arm 2 — `(haveAbove, haveLeft) ==
+    /// (1, 0)` reads `CurrFrame[plane][y-1][x]`.
+    #[test]
+    fn derive_above_left_arm2_reads_above_only_sample() {
+        let mut frame = vec![0i32; 16];
+        frame[2] = 88; // (row=0, col=2)
+        let v = derive_above_left(1, 0, 2, 1, &frame, 4, 8).unwrap();
+        assert_eq!(v, 88);
+    }
+
+    /// r187: §7.11.2.1 corner-cell arm 3 — `(haveAbove, haveLeft) ==
+    /// (0, 1)` reads `CurrFrame[plane][y][x-1]`.
+    #[test]
+    fn derive_above_left_arm3_reads_left_only_sample() {
+        let mut frame = vec![0i32; 16];
+        frame[2 * 4 + 1] = 99; // (row=2, col=1)
+        let v = derive_above_left(0, 1, 2, 2, &frame, 4, 8).unwrap();
+        assert_eq!(v, 99);
+    }
+
+    /// r187: §7.11.2.1 corner-cell arm 4 — both unavailable returns
+    /// the symmetric mid-grey `1 << (BitDepth - 1)`. Note this differs
+    /// from the `AboveRow[]` (`mid - 1`) / `LeftCol[]` (`mid + 1`)
+    /// asymmetric fills.
+    #[test]
+    fn derive_above_left_no_neighbour_returns_mid_grey() {
+        let frame = vec![0i32; 16];
+        assert_eq!(derive_above_left(0, 0, 0, 0, &frame, 4, 8).unwrap(), 128);
+        assert_eq!(derive_above_left(0, 0, 0, 0, &frame, 4, 10).unwrap(), 512);
+        assert_eq!(derive_above_left(0, 0, 0, 0, &frame, 4, 12).unwrap(), 2048);
+    }
+
+    /// r187: `derive_above_left` clips negative / over-range samples
+    /// in the buffer to `[0, (1 << BitDepth) - 1]`.
+    #[test]
+    fn derive_above_left_clips_to_bit_depth_range() {
+        let mut frame = vec![0i32; 16];
+        frame[0] = -50;
+        frame[1] = 99_999;
+        assert_eq!(derive_above_left(1, 1, 1, 1, &frame, 4, 8).unwrap(), 0);
+        assert_eq!(derive_above_left(1, 0, 1, 1, &frame, 4, 8).unwrap(), 255);
+    }
+
+    /// r187: `derive_above_left` caller-bug guards.
+    #[test]
+    fn derive_above_left_caller_bug_guards() {
+        let frame = vec![0i32; 16];
+        // bit_depth out of range.
+        assert!(matches!(
+            derive_above_left(0, 0, 0, 0, &frame, 4, 9),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // curr_frame_cols == 0.
+        assert!(matches!(
+            derive_above_left(0, 0, 0, 0, &frame, 0, 8),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // arm 1 with x == 0.
+        assert!(matches!(
+            derive_above_left(1, 1, 0, 1, &frame, 4, 8),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // arm 1 with y == 0.
+        assert!(matches!(
+            derive_above_left(1, 1, 1, 0, &frame, 4, 8),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // arm 2 with y == 0.
+        assert!(matches!(
+            derive_above_left(1, 0, 1, 0, &frame, 4, 8),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // arm 3 with x == 0.
+        assert!(matches!(
+            derive_above_left(0, 1, 0, 1, &frame, 4, 8),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r187: §7.11.2.2 PAETH on a constant neighbour environment —
+    /// `AboveRow[j] == LeftCol[i] == AboveRow[-1] == c` produces
+    /// `base = c + c - c = c`, all three deltas are 0, the tie-break
+    /// `pLeft <= pTop && pLeft <= pTopLeft` arm fires, and every cell
+    /// equals `LeftCol[i] = c`.
+    #[test]
+    fn paeth_constant_neighbours_produce_constant_block() {
+        let above = vec![50u16; 4];
+        let left = vec![50u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_paeth_pred(4, 4, &above, &left, 50, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 50));
+    }
+
+    /// r187: §7.11.2.2 PAETH — when `AboveRow[j] == AboveRow[-1]` for
+    /// all j and `LeftCol[i]` varies, `base = LeftCol[i]`, so `pLeft
+    /// = 0` and the first arm always wins: `pred[i][j] = LeftCol[i]`.
+    /// This is the H_PRED-degenerate case (each row a copy of
+    /// `LeftCol[i]`).
+    #[test]
+    fn paeth_degenerates_to_h_pred_when_above_equals_corner() {
+        let above = [100u16; 4];
+        let left = [10u16, 20, 30, 40];
+        let mut pred = [0u16; 16];
+        // AboveRow[-1] == AboveRow[j] = 100 ⇒ base = 100 + LeftCol[i]
+        //   - 100 = LeftCol[i] ⇒ pLeft = 0 wins.
+        predict_intra_paeth_pred(4, 4, &above, &left, 100, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(pred[i * 4 + j], left[i]);
+            }
+        }
+    }
+
+    /// r187: §7.11.2.2 PAETH — when `LeftCol[i] == AboveRow[-1]` for
+    /// all i and `AboveRow[j]` varies, `base = AboveRow[j]`. Then
+    /// `pLeft = |AboveRow[j] - corner|`, `pTop = 0`, `pTopLeft =
+    /// |AboveRow[j] - corner|`. With `pTop = 0 < pLeft` (when
+    /// `AboveRow[j] != corner`) and `pTop <= pTopLeft`, the second
+    /// arm wins: `pred[i][j] = AboveRow[j]`. This is V_PRED-degenerate.
+    #[test]
+    fn paeth_degenerates_to_v_pred_when_left_equals_corner() {
+        let above = [10u16, 20, 30, 40];
+        let left = [100u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_paeth_pred(4, 4, &above, &left, 100, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(pred[i * 4 + j], above[j]);
+            }
+        }
+    }
+
+    /// r187: §7.11.2.2 PAETH — 4×4 hand-trace pinning the first-arm
+    /// tie-break. `AboveRow[*] = LeftCol[*] = 200`, corner = `50`:
+    /// `base = 200 + 200 - 50 = 350`,
+    /// `pLeft = pTop = 150`, `pTopLeft = 300`.
+    /// pLeft (150) <= pTop (150) and pLeft (150) <= pTopLeft (300) →
+    /// first arm wins, pred = LeftCol[i] = 200 in every cell.
+    #[test]
+    fn paeth_first_arm_wins_when_pleft_ties_ptop_and_dominates_ptl() {
+        let above = [200u16; 4];
+        let left = [200u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_paeth_pred(4, 4, &above, &left, 50, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 200));
+    }
+
+    /// r187: §7.11.2.2 PAETH third-arm reachable case — set
+    /// `AboveRow[j] = 250`, `LeftCol[i] = 250`, corner = `0`. Then
+    /// `base = 250 + 250 - 0 = 500`,
+    /// `pLeft = |500 - 250| = 250`,
+    /// `pTop = |500 - 250| = 250`,
+    /// `pTopLeft = |500 - 0| = 500`.
+    /// pLeft (250) <= pTop (250) and pLeft (250) <= pTopLeft (500) →
+    /// the first arm wins ⇒ pred = LeftCol[i] = 250. The third arm
+    /// is genuinely hard to hit; we exercise it with the spec's
+    /// degenerate inverse: `AboveRow == corner == LeftCol == c`
+    /// trivially returns c by ANY arm.
+    ///
+    /// True third-arm trigger: pLeft > pTopLeft AND pTop > pTopLeft.
+    /// Try `AboveRow = 0`, `LeftCol = 0`, corner = 100:
+    /// `base = 0 + 0 - 100 = -100`,
+    /// `pLeft = |-100 - 0| = 100`,
+    /// `pTop = |-100 - 0| = 100`,
+    /// `pTopLeft = |-100 - 100| = 200`.
+    /// pLeft (100) <= pTop (100) and pLeft (100) <= pTopLeft (200)
+    /// — still first arm.
+    ///
+    /// To actually fire the third arm we need `pTopLeft < pLeft` AND
+    /// `pTopLeft < pTop`. Try `AboveRow = 100, LeftCol = 100,
+    /// corner = 100`: all deltas zero ⇒ first arm wins.
+    ///
+    /// `AboveRow = 110, LeftCol = 90, corner = 100`:
+    /// `base = 110 + 90 - 100 = 100`,
+    /// `pLeft = |100 - 90| = 10`,
+    /// `pTop = |100 - 110| = 10`,
+    /// `pTopLeft = |100 - 100| = 0`.
+    /// Now pLeft (10) > pTopLeft (0) and pTop (10) > pTopLeft (0):
+    /// first arm fails (10 > 0 fails the `<=` to pTopLeft), second
+    /// arm checks `pTop <= pTopLeft` → 10 <= 0 fails → THIRD arm
+    /// fires: pred = corner = 100.
+    #[test]
+    fn paeth_third_arm_reached_when_corner_uniquely_minimises() {
+        let above = [110u16; 4];
+        let left = [90u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_paeth_pred(4, 4, &above, &left, 100, &mut pred).unwrap();
+        // Every cell falls into the third arm and returns corner.
+        assert!(
+            pred.iter().all(|&v| v == 100),
+            "third arm should produce corner-cell value, got {pred:?}"
+        );
+    }
+
+    /// r187: PAETH caller-bug guards.
+    #[test]
+    fn paeth_caller_bug_guards() {
+        let above = [10u16; 4];
+        let left = [20u16; 4];
+        let mut pred = [0u16; 16];
+        assert!(matches!(
+            predict_intra_paeth_pred(65, 4, &above, &left, 0, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            predict_intra_paeth_pred(4, 65, &above, &left, 0, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        let short = [10u16; 3];
+        assert!(matches!(
+            predict_intra_paeth_pred(4, 4, &short, &left, 0, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            predict_intra_paeth_pred(4, 4, &above, &short, 0, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        let mut small = [0u16; 8];
+        assert!(matches!(
+            predict_intra_paeth_pred(4, 4, &above, &left, 0, &mut small),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r187: §7.11.2.6 SMOOTH_PRED on a constant neighbour environment
+    /// (`AboveRow[*] == LeftCol[*] == c`) produces a constant block
+    /// `pred[i][j] == c`. Round2 of `c * (smY + smX + (256-smY) +
+    /// (256-smX)) = c * 512` then `>> 9` is `c` exactly.
+    #[test]
+    fn smooth_constant_neighbours_produce_constant_block() {
+        let above = [77u16; 4];
+        let left = [77u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_smooth_pred(2, 2, 4, 4, &above, &left, &mut pred).unwrap();
+        assert!(
+            pred.iter().all(|&v| v == 77),
+            "constant block expected, got {pred:?}"
+        );
+    }
+
+    /// r187: §7.11.2.6 SMOOTH_PRED — corner cell `pred[0][0]` of a
+    /// 4×4 block hand-trace. With `sm_h[0] = sm_w[0] = 255` (the
+    /// `Sm_Weights_Tx_4x4[0]`) and reference samples `AboveRow[0]`,
+    /// `LeftCol[0]`, `LeftCol[h-1=3]`, `AboveRow[w-1=3]`:
+    ///
+    /// `smoothPred = 255*AboveRow[0] + 1*LeftCol[3]
+    ///             + 255*LeftCol[0] + 1*AboveRow[3]`
+    /// `pred[0][0] = (smoothPred + 256) >> 9`
+    ///
+    /// With `AboveRow = [100, 100, 100, 100]`,
+    /// `LeftCol = [200, 200, 200, 200]`:
+    /// `smoothPred = 255*100 + 1*200 + 255*200 + 1*100 = 25500 + 200
+    ///   + 51000 + 100 = 76800`
+    /// `pred[0][0] = (76800 + 256) >> 9 = 77056 >> 9 = 150` (exact).
+    #[test]
+    fn smooth_pred_corner_cell_hand_trace() {
+        let above = [100u16; 4];
+        let left = [200u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_smooth_pred(2, 2, 4, 4, &above, &left, &mut pred).unwrap();
+        assert_eq!(pred[0], 150);
+    }
+
+    /// r187: §7.11.2.6 SMOOTH_PRED bottom-right corner pred[h-1][w-1]
+    /// of a 4×4 block. `sm_h[3] = sm_w[3] = 64`, references same as
+    /// above:
+    /// `smoothPred = 64*AboveRow[3] + (256-64)*LeftCol[3]
+    ///             + 64*LeftCol[3]  + (256-64)*AboveRow[3]`
+    ///            = `64*100 + 192*200 + 64*200 + 192*100`
+    ///            = `6400 + 38400 + 12800 + 19200 = 76800`
+    /// `pred[3][3] = (76800 + 256) >> 9 = 150`.
+    /// (Same answer here only because of the constant-edges symmetry;
+    /// per-cell positions still write the same Round2.)
+    #[test]
+    fn smooth_pred_bottom_right_cell_hand_trace() {
+        let above = [100u16; 4];
+        let left = [200u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_smooth_pred(2, 2, 4, 4, &above, &left, &mut pred).unwrap();
+        assert_eq!(pred[3 * 4 + 3], 150);
+    }
+
+    /// r187: §7.11.2.6 SMOOTH_PRED admits the largest §3 transform
+    /// size (64×64) — output stays within 12-bit range when both
+    /// neighbour arrays sit at the 12-bit ceiling.
+    #[test]
+    fn smooth_pred_max_size_64x64_within_12bit_range() {
+        let above = vec![4095u16; 64];
+        let left = vec![4095u16; 64];
+        let mut pred = vec![0u16; 64 * 64];
+        predict_intra_smooth_pred(6, 6, 64, 64, &above, &left, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 4095));
+    }
+
+    /// r187: §7.11.2.6 SMOOTH_V_PRED — constant-edge case produces a
+    /// constant block. `wy * c + (256 - wy) * c = 256 * c`, Round2(_,
+    /// 8) is `c` exactly.
+    #[test]
+    fn smooth_v_constant_above_and_left_h_minus_1_equal_produces_constant() {
+        let above = [50u16; 4];
+        let left = [50u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_smooth_v_pred(2, 4, 4, &above, &left, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 50));
+    }
+
+    /// r187: §7.11.2.6 SMOOTH_V_PRED — top row uses `sm_h[0] = 255`
+    /// for the `AboveRow` weight (so it's heavily anchored to top),
+    /// bottom row uses `sm_h[h-1] = 64` (so it's heavily anchored to
+    /// `LeftCol[h-1]`). With `AboveRow = 0`, `LeftCol[h-1] = 100`:
+    ///
+    /// `pred[0][j] = (255*0 + 1*100 + 128) >> 8 = 228 >> 8 = 0`.
+    /// `pred[3][j] = (64*0  + 192*100 + 128) >> 8 = 19328 >> 8 = 75`.
+    #[test]
+    fn smooth_v_pred_top_row_anchored_to_above_bottom_to_bottom_left() {
+        let above = [0u16; 4];
+        let left = [0u16, 0, 0, 100]; // only LeftCol[h-1=3] matters
+        let mut pred = [0u16; 16];
+        predict_intra_smooth_v_pred(2, 4, 4, &above, &left, &mut pred).unwrap();
+        // top row (sm_h[0] = 255): heavily AboveRow-weighted ⇒ 0.
+        assert_eq!(pred[0], 0);
+        assert_eq!(pred[3], 0);
+        // bottom row (sm_h[3] = 64): heavily LeftCol[h-1]-weighted.
+        // (64*0 + 192*100 + 128) >> 8 = (19200 + 128) >> 8 = 19328 >> 8 = 75.
+        assert_eq!(pred[3 * 4], 75);
+        assert_eq!(pred[3 * 4 + 3], 75);
+    }
+
+    /// r187: §7.11.2.6 SMOOTH_H_PRED — left column uses `sm_w[0] =
+    /// 255` for the LeftCol weight; right column uses `sm_w[w-1] = 64`
+    /// for LeftCol. Mirror of the SMOOTH_V test above.
+    #[test]
+    fn smooth_h_pred_left_col_anchored_to_left_right_to_top_right() {
+        let above = [0u16, 0, 0, 100]; // only AboveRow[w-1=3] matters
+        let left = [0u16; 4];
+        let mut pred = [0u16; 16];
+        predict_intra_smooth_h_pred(2, 4, 4, &above, &left, &mut pred).unwrap();
+        // left col (sm_w[0] = 255): heavily LeftCol-weighted ⇒ 0.
+        assert_eq!(pred[0], 0);
+        assert_eq!(pred[3 * 4], 0);
+        // right col (sm_w[3] = 64): heavily AboveRow[w-1]-weighted.
+        // (64*0 + 192*100 + 128) >> 8 = 75.
+        assert_eq!(pred[3], 75);
+        assert_eq!(pred[3 * 4 + 3], 75);
+    }
+
+    /// r187: SMOOTH_PRED caller-bug guards.
+    #[test]
+    fn smooth_pred_caller_bug_guards() {
+        let above = [10u16; 4];
+        let left = [20u16; 4];
+        let mut pred = [0u16; 16];
+        // log2 out of supported range.
+        assert!(matches!(
+            predict_intra_smooth_pred(1, 2, 2, 4, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            predict_intra_smooth_pred(7, 2, 128, 4, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // w mismatch with log2_w.
+        assert!(matches!(
+            predict_intra_smooth_pred(2, 2, 8, 4, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // Undersized buffers.
+        let short = [10u16; 3];
+        assert!(matches!(
+            predict_intra_smooth_pred(2, 2, 4, 4, &short, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            predict_intra_smooth_pred(2, 2, 4, 4, &above, &short, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        let mut small = [0u16; 8];
+        assert!(matches!(
+            predict_intra_smooth_pred(2, 2, 4, 4, &above, &left, &mut small),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r187: SMOOTH_V_PRED / SMOOTH_H_PRED caller-bug guards.
+    #[test]
+    fn smooth_v_and_h_caller_bug_guards() {
+        let above = [10u16; 4];
+        let left = [20u16; 4];
+        let mut pred = [0u16; 16];
+        // V: log2_h out of range.
+        assert!(matches!(
+            predict_intra_smooth_v_pred(1, 4, 2, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // V: h mismatch.
+        assert!(matches!(
+            predict_intra_smooth_v_pred(2, 4, 8, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // V: w > 64.
+        assert!(matches!(
+            predict_intra_smooth_v_pred(2, 65, 4, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // H: log2_w out of range.
+        assert!(matches!(
+            predict_intra_smooth_h_pred(7, 128, 4, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // H: w mismatch.
+        assert!(matches!(
+            predict_intra_smooth_h_pred(2, 8, 4, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // H: h > 64.
+        assert!(matches!(
+            predict_intra_smooth_h_pred(2, 4, 65, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r187: end-to-end PAETH through the §7.11.2.1 derivation —
+    /// `derive_above_row` + `derive_left_col` + `derive_above_left`
+    /// → `predict_intra_paeth_pred` against a real CurrFrame slice.
+    /// On the all-unavailable arm (`haveAbove = haveLeft = 0`), the
+    /// AboveRow / LeftCol fills are mid-grey ± 1; corner is mid-grey;
+    /// PAETH then produces a near-constant mid-grey block.
+    #[test]
+    fn paeth_end_to_end_no_neighbours_writes_mid_grey_block() {
+        let frame = vec![0i32; 16];
+        let mut above = [0u16; 8];
+        let mut left = [0u16; 8];
+        derive_above_row(0, 0, 0, 0, 0, 4, 4, 3, &frame, 4, 8, &mut above).unwrap();
+        derive_left_col(0, 0, 0, 0, 0, 4, 4, 3, &frame, 4, 8, &mut left).unwrap();
+        let corner = derive_above_left(0, 0, 0, 0, &frame, 4, 8).unwrap();
+        assert_eq!(corner, 128);
+        assert!(above.iter().all(|&v| v == 127));
+        assert!(left.iter().all(|&v| v == 129));
+        let mut pred = [0u16; 16];
+        predict_intra_paeth_pred(4, 4, &above, &left, corner, &mut pred).unwrap();
+        // Hand-trace one cell. AboveRow[j] = 127, LeftCol[i] = 129,
+        // corner = 128. base = 127 + 129 - 128 = 128. pLeft = |128 -
+        // 129| = 1, pTop = |128 - 127| = 1, pTopLeft = |128 - 128|
+        // = 0. pLeft (1) > pTopLeft (0) so first arm fails. pTop (1)
+        // > pTopLeft (0) so second arm fails. Third arm fires ⇒ pred
+        // = corner = 128.
+        assert!(pred.iter().all(|&v| v == 128));
+    }
+
+    /// r187: end-to-end SMOOTH_PRED through the §7.11.2.1 derivation
+    /// on a real CurrFrame slice — a 4×4 TU at (x=1, y=1) inside a
+    /// 5×5 frame whose top row + left column carry distinct samples.
+    /// Verifies the leaves can be driven through the derivation
+    /// helpers end-to-end.
+    #[test]
+    fn smooth_pred_end_to_end_with_derive_neighbours() {
+        // Build a 5x5 frame whose top row + left col are non-zero.
+        let mut frame = vec![0i32; 25];
+        for (j, slot) in frame.iter_mut().take(5).enumerate() {
+            *slot = (10 + j as i32) * 10; // row 0
+        }
+        for i in 0..5 {
+            frame[i * 5] = (50 + i as i32) * 2; // col 0
+        }
+        let mut above = [0u16; 8];
+        let mut left = [0u16; 8];
+        derive_above_row(1, 1, 0, 1, 1, 4, 4, 4, &frame, 5, 8, &mut above).unwrap();
+        derive_left_col(1, 1, 0, 1, 1, 4, 4, 4, &frame, 5, 8, &mut left).unwrap();
+        let corner = derive_above_left(1, 1, 1, 1, &frame, 5, 8).unwrap();
+        // Sanity: corner is frame[0][0] = (10+0)*10 = 100, BUT it was
+        // overwritten by the col-0 walk: frame[0][0] = (50+0)*2 = 100
+        // (same value either way). Above[0] = frame[0][1] = 110.
+        // Left[0] = frame[1][0] = 102.
+        assert_eq!(corner, 100);
+        assert_eq!(above[0], 110);
+        assert_eq!(left[0], 102);
+        let mut pred = [0u16; 16];
+        predict_intra_smooth_pred(2, 2, 4, 4, &above, &left, &mut pred).unwrap();
+        // SMOOTH outputs are samples in `[0, 255]` (8-bit).
+        assert!(pred.iter().all(|&v| v <= 255));
     }
 
     /// §8.3.1: a fresh context is a verbatim copy of the §9.4 defaults,

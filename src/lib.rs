@@ -1646,6 +1646,22 @@ pub use cdf::{
 pub use cdf::{
     derive_above_row, derive_left_col, predict_intra_h_pred, predict_intra_v_pred, DC_PRED, H_PRED,
 };
+// r187: §7.11.2.2 PAETH_PRED + §7.11.2.6 SMOOTH / SMOOTH_V /
+// SMOOTH_H_PRED sample-generation leaves admitted to the dispatcher
+// alongside {DC, V, H}_PRED — seven of thirteen intra modes now
+// covered, leaving the six directional D-modes (D45 / D67 / D113 /
+// D135 / D157 / D203) for the next arc. Plus the §7.11.2.1
+// `AboveRow[-1]` / `LeftCol[-1]` corner-sample derivation
+// ([`cdf::derive_above_left`]) that PAETH consumes, plus the named
+// §6.10.x intra-mode ordinals (`SMOOTH_PRED` / `SMOOTH_V_PRED` /
+// `SMOOTH_H_PRED` / `PAETH_PRED`) and the §7.11.2.6 `Sm_Weights_Tx_*`
+// weight tables verbatim from av1-spec p.508.
+pub use cdf::{
+    derive_above_left, predict_intra_paeth_pred, predict_intra_smooth_h_pred,
+    predict_intra_smooth_pred, predict_intra_smooth_v_pred, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED,
+    SMOOTH_V_PRED, SM_WEIGHTS_TX_16X16, SM_WEIGHTS_TX_32X32, SM_WEIGHTS_TX_4X4,
+    SM_WEIGHTS_TX_64X64, SM_WEIGHTS_TX_8X8,
+};
 // r181: §5.11.34 `residual()` outer-dispatch readout
 // ([`cdf::ResidualReadout`] + [`cdf::ResidualTuTask`]) surfaced
 // through [`cdf::PartitionWalker::residual`], plus the §5.11.37
@@ -1886,16 +1902,22 @@ pub enum Error {
     ComputePredictionInterIntraUnsupported,
     /// The §5.11.33 dispatcher visited an intra-mode plane whose
     /// `mode` (the §5.11.33 `predict_intra` `mode` argument) is not
-    /// in the §7.11.2 set the walker currently supports. As of r186
-    /// three standalone leaves land:
+    /// in the §7.11.2 set the walker currently supports. As of r187
+    /// seven standalone leaves land:
     ///
     /// * §7.11.2.5 DC_PRED — [`crate::predict_intra_dc_pred`]
     /// * §7.11.2.4 step-10 V_PRED — [`crate::predict_intra_v_pred`]
     /// * §7.11.2.4 step-11 H_PRED — [`crate::predict_intra_h_pred`]
+    /// * §7.11.2.6 SMOOTH_PRED — [`crate::predict_intra_smooth_pred`]
+    /// * §7.11.2.6 SMOOTH_V_PRED — [`crate::predict_intra_smooth_v_pred`]
+    /// * §7.11.2.6 SMOOTH_H_PRED — [`crate::predict_intra_smooth_h_pred`]
+    /// * §7.11.2.2 PAETH_PRED — [`crate::predict_intra_paeth_pred`]
+    ///   (consumes the corner-cell sample
+    ///   [`crate::derive_above_left`] derives)
     ///
-    /// The remaining 10 intra modes (SMOOTH_PRED / SMOOTH_V_PRED /
-    /// SMOOTH_H_PRED / PAETH_PRED / D45_PRED / D135_PRED / D113_PRED
-    /// / D157_PRED / D203_PRED / D67_PRED) are next-arc targets.
+    /// The remaining six directional D-mode intra modes
+    /// (D45_PRED / D135_PRED / D113_PRED / D157_PRED / D203_PRED /
+    /// D67_PRED — ordinals `3..=8`) are next-arc targets.
     /// Reachable only when the caller drives the dispatcher with an
     /// out-of-supported-set mode; the §5.11.5 walker's current
     /// intra-arm path always emits `YMode == DC_PRED` (the
@@ -2215,7 +2237,7 @@ impl core::fmt::Display for Error {
             ),
             Self::ComputePredictionIntraModeUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.33 compute_prediction visited an intra mode outside the supported {{DC_PRED, V_PRED, H_PRED}} set — §7.11.2.{{2,3,4,6}} (SMOOTH variants / PAETH / non-degenerate D-mode directional) pending next-arc"
+                "oxideav-av1: §5.11.33 compute_prediction visited an intra mode outside the supported {{DC_PRED, V_PRED, H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, SMOOTH_H_PRED, PAETH_PRED}} set — §7.11.2.4 directional D-modes (D45 / D67 / D113 / D135 / D157 / D203) pending next-arc"
             ),
             Self::DecodeBlockResidualUnsupported => write!(
                 f,
