@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 190)
+## Status — 2026-05-28 (round 191)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,126 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 191 lifts the **§7.11.3.11-15 compound bodies** — the
+bi-prediction blending step that combines two §7.11.3.4-formed
+predictions per the §5.11.29-decoded `compound_type`. With r191 the
+§7.11.3.1 inter-prediction layer admits all five compound mechanisms:
+`COMPOUND_AVERAGE` (already worked via the §7.11.3.1 inline
+`Clip1(Round2(p0+p1, 1+InterPostRound))`); `COMPOUND_WEDGE` (now via
+§7.11.3.11 + §7.11.3.14); `COMPOUND_DIFFWTD` (now via §7.11.3.12 +
+§7.11.3.14); `COMPOUND_INTRA` (now via §7.11.3.13 +
+[`mask_blend_interintra`]); `COMPOUND_DISTANCE` (now via §7.11.3.15 +
+[`compound_distance_blend`]). The five new public bodies (all in the
+`inter_pred` module):
+
+* **§7.11.3.11 `wedge_mask(mi_size, num_4x4_w, num_4x4_h, wedge_index,
+  wedge_sign, &mut mask)`** — the COMPOUND_WEDGE per-block-size
+  wedge-mask materializer. Uses the spec's generation algorithm: a
+  lazily-built `MasterMask[6][64][64]` table (`MASK_MASTER_SIZE = 64`)
+  filled from the three 1d driver arrays (`WEDGE_MASTER_OBLIQUE_ODD`,
+  `WEDGE_MASTER_OBLIQUE_EVEN`, `WEDGE_MASTER_VERTICAL`, each `64`
+  entries with values in `0..=64`) is then sliced at the `(yoff,
+  xoff)` offsets the spec computes from `(get_wedge_xoff,
+  get_wedge_yoff) * (w, h) >> 3`. The `flipSign` average-of-edge
+  adjustment is honoured (`avg < 32` ⇒ stored sense inverted; the
+  `wedge_sign` argument selects between the two stored variants). The
+  `WEDGE_CODEBOOK[3][16][3]` table maps `(block_shape, wedge_index)`
+  to `(direction, xoff, yoff)`; `block_shape` is `0` (tall: h4 > w4),
+  `1` (wide), or `2` (square). 9 wedge-eligible block sizes
+  (`BLOCK_8X8`, `8x16`, `16x8`, `16x16`, `16x32`, `32x16`, `32x32`,
+  `8x32`, `32x8`) per `WEDGE_BITS`.
+
+* **§7.11.3.12 `difference_weight_mask(bit_depth, inter_post_round,
+  mask_type, preds0, preds1, w, h, &mut mask)`** — the
+  COMPOUND_DIFFWTD per-pixel `m = Clip3(0, 64, 38 +
+  Round2(|p0-p1|, (BD-8)+InterPostRound) / 16)` driver. `mask_type ==
+  1` (`DIFFWTD_38_INV`) inverts to `64 - m`. Equal-prediction case
+  yields the constant `38` (or `26` for inverted).
+
+* **§7.11.3.13 `intra_mode_variant_mask(interintra_mode, w, h, &mut
+  mask)`** — the COMPOUND_INTRA smooth-mask driver. The `II_V_PRED` /
+  `II_H_PRED` / `II_SMOOTH_PRED` arms index into the 128-entry
+  `II_WEIGHTS_1D` table via `i * sizeScale`, `j * sizeScale`, or
+  `Min(i,j) * sizeScale`. The `II_DC_PRED` arm emits a uniform `32`
+  (50/50 blend). Table is monotonically non-increasing from `60` at
+  index `0` to `1` at index `127` (verified by an invariant test).
+
+* **§7.11.3.14 `mask_blend(bit_depth, inter_post_round, sub_x, sub_y,
+  preds0, preds1, w, h, mask, mask_stride, &mut out)`** — the
+  inter-inter mask-driven blend per `out = Clip1(Round2(m * p0 +
+  (64-m) * p1, 6 + InterPostRound))`. Honours the `(sub_x, sub_y)`
+  chroma-mask averaging: `(0,0)` reads `Mask[y][x]` directly; `(1,0)`
+  averages two adjacent luma-mask values; `(0,1)` averages two
+  vertical neighbours; `(1,1)` averages four (`Round2(sum, 1)` /
+  `Round2(sum, 2)`). The companion **`mask_blend_interintra(bit_depth,
+  inter_post_round, preds0, w, h, mask, &mut dst)`** body handles the
+  `IsInterIntra == 1` arm where `pred1 = CurrFrame[plane][...]`
+  (already holding the intra prediction); the inter prediction is
+  pre-Clip'd via `Clip1(Round2(preds[0], InterPostRound))` and blended
+  with the shift-6 path the spec specifies.
+
+* **§7.11.3.15 `distance_weights(order_hint_bits, current_order_hint,
+  order_hint_ref0, order_hint_ref1) -> DistanceWeights {fwd_weight,
+  bck_weight}`** — the COMPOUND_DISTANCE `(FwdWeight, BckWeight)`
+  derivation from the two refs' `OrderHints[]` deltas relative to the
+  current frame. Includes the §5.9.3 `get_relative_dist(a, b,
+  order_hint_bits)` sign-extending subtraction (returns `0` when
+  `order_hint_bits == 0` per `enable_order_hint == 0`). The
+  `Quant_Dist_Weight[4][2]` + `Quant_Dist_Lookup[4][2]` tables are
+  transcribed verbatim; the early-return `d0 == 0 || d1 == 0` branch
+  is honoured (chooses row `[3]`), as is the per-`i` search loop
+  with the `order_bool ? d0*c0 > d1*c1 : d0*c0 < d1*c1` break
+  condition. `MAX_FRAME_DISTANCE = 31` saturates the per-list
+  distances. The two output weights sum to `16` by construction (an
+  invariant test asserts `QUANT_DIST_LOOKUP[i][0] +
+  QUANT_DIST_LOOKUP[i][1] == 16` for every row). Companion
+  **`compound_distance_blend(bit_depth, inter_post_round, weights,
+  preds0, preds1, w, h, &mut out)`** applies the spec's `Clip1(
+  Round2(FwdWeight * preds[0] + BckWeight * preds[1], 4 +
+  InterPostRound))` site (av1-spec p.258 line 14408).
+
+Test count: 954 → 983 (+29 across lib + integration). New
+inter_pred tests in lib (29 total): `r191_wedge_master_1d_values_within_0_64`
++ `r191_master_mask_table_values_within_0_64` (every entry in `0..=64`);
+`r191_master_mask_horizontal_is_vertical_transpose` +
+`r191_master_mask_oblique27_is_oblique63_transpose` (the spec's
+derivation symmetries hold across all 4096 entries); `r191_block_shape_truth_table`
+(tall / wide / square dispatch); `r191_wedge_mask_block_8x8_values_within_0_64`
+(all 32 `(wedge_index, wedge_sign)` combinations of BLOCK_8X8 yield
+in-range pixels); `r191_wedge_mask_sign_flip_inverts` (sign flip
+toggles `64 - m` per pixel); `r191_wedge_mask_rejects_invalid_inputs`
+(six caller-bug guards); `r191_difference_weight_mask_equal_preds_yields_38`
+(spec degenerate case = 38 / 26); `r191_difference_weight_mask_saturates_at_64`
+(extreme-diff saturation in both directions); `r191_difference_weight_mask_rejects_invalid_inputs`
+(five guards); `r191_intra_mode_variant_mask_dc_yields_32` (II_DC_PRED ⇒
+uniform `32`); `r191_intra_mode_variant_mask_v_pred_row_uniform` (rows
+match `Ii_Weights_1d`); `r191_intra_mode_variant_mask_h_pred_col_uniform`
+(columns match `Ii_Weights_1d`); `r191_intra_mode_variant_mask_smooth_pred_diagonal_symmetric`
+(`Min(i,j)` symmetry); `r191_ii_weights_1d_monotone_non_increasing`;
+`r191_intra_mode_variant_mask_rejects_invalid_inputs`; `r191_mask_blend_full_mask_yields_pred0`
+(m=64 ⇒ p0, m=0 ⇒ p1); `r191_mask_blend_chroma_subsample_4x_average`
+(4× luma → 1 chroma averaging matches expectation); `r191_mask_blend_interintra_endpoints`
+(m=64 ⇒ unchanged intra dst; m=0 ⇒ Clip'd inter pred); `r191_mask_blend_rejects_invalid_inputs`;
+`r191_get_relative_dist_truth_table` (sign extension at 7-bit OHB +
+the `OHB == 0` short-circuit); `r191_quant_dist_lookup_sums_to_16`;
+`r191_distance_weights_equal_distances` (`d0 == d1` ⇒ weights sum to
+16); `r191_distance_weights_zero_distance_branch` (early-return
+`[3]` row); `r191_distance_weights_no_order_hint` (OHB=0 path);
+`r191_distance_weights_asymmetric_far_forward` (loop falls through to
+`i = 3`); `r191_compound_distance_blend_symmetric` (8/8 weights ⇒
+arithmetic mean); `r191_compound_distance_blend_rejects_invalid_inputs`.
+
+**Deferred to subsequent arcs.** §7.11.3.5-8 warp / shear / divisor
+/ warp-estimation (LOCALWARP / GLOBAL_GLOBALMV affine warp),
+§7.11.3.9-10 OBMC + overlap blending, §7.14 loop filter, §5.11.17
+`read_var_tx_size` recursion (inter `TX_MODE_SELECT && !skip &&
+!lossless` arm of §5.11.16), §5.11.22 intra-block-in-inter-frame
+stub. The §7.11.3.1 driver itself still awaits a `predict_inter`
+entry point that wires the five compound bodies and the §7.11.3.4
+single-ref kernel together against `RefFrames[refList]` plane
+buffers; today `decode_block_syntax`'s inter arm short-circuits
+inside `compute_prediction`.
 
 Round 190 is the **`decode_block_syntax` inter-arm wire-up** —
 integration arc that lifts the historical

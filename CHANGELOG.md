@@ -6,6 +6,81 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 191 — §7.11.3.11-15 compound bodies.**
+  Five new public bodies in `inter_pred` lift the §7.11.3.1
+  bi-prediction blending layer: `wedge_mask` (§7.11.3.11 —
+  COMPOUND_WEDGE), `difference_weight_mask` (§7.11.3.12 —
+  COMPOUND_DIFFWTD), `intra_mode_variant_mask` (§7.11.3.13 —
+  COMPOUND_INTRA), `mask_blend` / `mask_blend_interintra` (§7.11.3.14
+  — combine two preds via mask), and `distance_weights` /
+  `compound_distance_blend` (§7.11.3.15 — COMPOUND_DISTANCE).
+  * `wedge_mask(mi_size, num_4x4_w, num_4x4_h, wedge_index,
+    wedge_sign, &mut mask)` generates the per-`(bsize, wedge_index)`
+    mask via the spec's `initialise_wedge_mask_table` algorithm: a
+    lazily-built 24 KiB `MasterMask[6][64][64]` table backs the
+    `(yoff, xoff)` slice extraction; the `flipSign` average-of-edge
+    correction is honoured. The 1d driver tables
+    (`WEDGE_MASTER_OBLIQUE_{ODD,EVEN}`, `WEDGE_MASTER_VERTICAL`),
+    the `WEDGE_CODEBOOK[3][16][3]` per-shape codebook, and the
+    `WEDGE_BITS[22]` per-block-size flag table are transcribed
+    verbatim. New constants: `MASK_MASTER_SIZE = 64`,
+    `WEDGE_DIRECTIONS = 6`, and the six `WEDGE_{HORIZONTAL,
+    VERTICAL, OBLIQUE27, OBLIQUE63, OBLIQUE117, OBLIQUE153}`
+    direction ordinals. `block_shape(num_4x4_wide, num_4x4_high)`
+    helper returns the codebook outer dimension.
+  * `difference_weight_mask(bit_depth, inter_post_round, mask_type,
+    preds0, preds1, w, h, &mut mask)` fills the per-pixel `m =
+    Clip3(0, 64, 38 + Round2(|p0-p1|, (BD-8)+IPR) / 16)` with the
+    `mask_type` toggle inverting to `64 - m`.
+  * `intra_mode_variant_mask(interintra_mode, w, h, &mut mask)`
+    dispatches on `II_DC_PRED` / `II_V_PRED` / `II_H_PRED` /
+    `II_SMOOTH_PRED` (new constants) into the 128-entry
+    `II_WEIGHTS_1D` table (transcribed verbatim from av1-spec
+    p.283-284). New constant `MAX_SB_SIZE = 128`.
+  * `mask_blend(...)` applies the inter-inter blend `out =
+    Clip1(Round2(m*p0 + (64-m)*p1, 6 + IPR))` with the four
+    `(sub_x, sub_y)` chroma-mask averaging cases. Companion
+    `mask_blend_interintra(...)` handles the interintra arm where
+    the destination already holds the intra prediction and `preds0`
+    is the pre-Clip inter prediction.
+  * `distance_weights(order_hint_bits, current, ref0, ref1) ->
+    DistanceWeights { fwd_weight, bck_weight }` derives the
+    COMPOUND_DISTANCE weights from the two refs' `OrderHints[]`
+    relative distances. New helper `get_relative_dist(a, b, OHB)`
+    implements §5.9.3. New constants `MAX_FRAME_DISTANCE = 31`,
+    `QUANT_DIST_WEIGHT[4][2]`, `QUANT_DIST_LOOKUP[4][2]` (all
+    transcribed verbatim from av1-spec p.285). The early-return
+    `d0 == 0 || d1 == 0` branch and the per-`i` search loop with
+    its order-dependent break condition are honoured. Companion
+    `compound_distance_blend(...)` applies the
+    `Clip1(Round2(fwd*p0 + bck*p1, 4 + IPR))` site (av1-spec p.258
+    line 14408). New constants `COMPOUND_WEDGE = 0`,
+    `COMPOUND_DIFFWTD = 1`, `COMPOUND_AVERAGE = 2`,
+    `COMPOUND_INTRA = 3`, `COMPOUND_DISTANCE = 4` (av1-spec p.185
+    table) reproduced locally.
+  * `Error::ComputePredictionInterUnsupported` display message
+    updated to reflect that the §7.11.3.11-15 compound bodies
+    have landed (the variant is retained as a defensive fallback
+    because the §7.11.3.1 driver wiring all five bodies into a
+    `predict_inter` entry point is still pending).
+  * Test count: 954 → 983 (+29). New tests cover: master 1d
+    arrays / `MasterMask` value-range invariant; the
+    HORIZONTAL=VERTICAL^T and OBLIQUE27=OBLIQUE63^T derivation
+    symmetries; `block_shape` truth table; per-pixel range +
+    sign-flip-inverts invariants for `wedge_mask`; spec degenerate
+    cases for `difference_weight_mask` (38 / 26 / saturation);
+    per-arm uniformity / symmetry for `intra_mode_variant_mask`;
+    `II_WEIGHTS_1D` monotone-non-increasing invariant; endpoint
+    cases (`m == 0` / `m == 64`) for both `mask_blend` and
+    `mask_blend_interintra`; `(1, 1)` chroma-subsample averaging
+    correctness; `get_relative_dist` sign-extension + OHB=0 path;
+    `QUANT_DIST_LOOKUP` row-sums-to-16 invariant; four
+    `distance_weights` regime tests (equal d / zero d / OHB=0 / far
+    forward); symmetric-weight `compound_distance_blend` reduces to
+    arithmetic mean. Each body also has a dedicated caller-bug
+    rejection test enforcing the `Err(PartitionWalkOutOfRange)`
+    contract.
+
 * **Round 190 — `decode_block_syntax` inter-arm wire-up.**
   Integration arc lifting the historical
   `Error::DecodeBlockInterFrameUnsupported` short-circuit from the
