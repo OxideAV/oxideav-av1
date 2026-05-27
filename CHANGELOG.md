@@ -6,6 +6,73 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 184 — §7.5 / §5.11.41 `get_scan(txSz)` table dispatch.**
+  Replaces the r183 identity-ascending scan placeholder in
+  `transform_block_emit`'s call into `coefficients()` with the
+  full §5.11.41 dispatcher.
+
+  * New `oxideav_av1::scan` module (`pub mod scan` in `lib.rs`)
+    with the full §7.5 scan-table family from av1-spec p.388-399:
+    * **Default scans (14 tables):** `DEFAULT_SCAN_4X4`,
+      `_4X8`, `_8X4`, `_8X8`, `_8X16`, `_16X8`, `_16X16`,
+      `_16X32`, `_32X16`, `_32X32`, `_4X16`, `_16X4`, `_8X32`,
+      `_32X8` (16..1024 entries; the zig-zag positions the
+      §5.11.39 reader walks for symmetric `PlaneTxType`
+      values).
+    * **Mcol scans (9 tables):** `MCOL_SCAN_4X4`, `_4X8`,
+      `_8X4`, `_8X8`, `_8X16`, `_16X8`, `_16X16`, `_4X16`,
+      `_16X4` (column-major rasters for `H_DCT` / `H_ADST` /
+      `H_FLIPADST`; only sizes whose `Tx_Size_Sqr_Up <=
+      TX_16X16` are admitted by the §5.11.40 / §5.11.48 set
+      restrictions, matching the spec enumeration).
+    * **Mrow scans (9 tables):** `MROW_SCAN_4X4`, `_4X8`,
+      `_8X4`, `_8X8`, `_8X16`, `_16X8`, `_16X16`, `_4X16`,
+      `_16X4` (row-major identity rasters for `V_DCT` /
+      `V_ADST` / `V_FLIPADST`).
+  * New `oxideav_av1::scan::{get_default_scan, get_mcol_scan,
+    get_mrow_scan, get_scan}` — the four §5.11.41 dispatchers
+    (av1-spec p.93-94). `get_scan( txSz, PlaneTxType )` routes
+    per the spec's three short-circuits (`TX_16X64` →
+    `Default_Scan_16x32`, `TX_64X16` → `Default_Scan_32x16`,
+    `Tx_Size_Sqr_Up[txSz] == TX_64X64` → `Default_Scan_32x32`),
+    then the `IDTX` → default arm, then the `preferRow` arm
+    (V_DCT / V_ADST / V_FLIPADST → `get_mrow_scan`), the
+    `preferCol` arm (H_DCT / H_ADST / H_FLIPADST →
+    `get_mcol_scan`), and finally the symmetric tx-type default
+    arm.
+  * `PartitionWalker::transform_block_emit` (the §5.11.35 per-TU
+    driver) now invokes `scan::get_scan(tx_sz, plane_tx_type)`
+    instead of constructing a `Vec<u16>` of `0..segEob` per
+    iteration. The returned `&'static [u16]` is passed straight
+    to `self.coefficients(..., scan, &mut quant)`. The stale
+    `seg_eob` derivation in `transform_block_emit` (only used
+    by the placeholder) is dropped; the §5.11.39 reader still
+    re-derives it internally from `tx_sz`.
+
+  22 new tests (821 → 843): permutation checks for every default
+  / Mcol / Mrow table (each scan visits every coefficient
+  position exactly once); identity check for every Mrow table;
+  `col * h + row → row * w + col` column-major formula check for
+  every Mcol table; spec-anchor 4x4 / 8x8 default-scan
+  prologue values; `get_default_scan` / `get_mcol_scan` /
+  `get_mrow_scan` per-size enumeration including spec-tail
+  fallback (TX_32X32 → `DEFAULT_SCAN_32X32`, anything not in
+  Mcol's / Mrow's listed sizes → `MCOL_SCAN_16X4` /
+  `MROW_SCAN_16X4`); `get_scan` arm-by-arm coverage
+  (`TX_16X64` / `TX_64X16` / `Tx_Size_Sqr_Up == TX_64X64` /
+  IDTX / preferRow / preferCol / symmetric) under every
+  representative `PlaneTxType`; and `scan.len() >= segEob` over
+  the §5.11.40-admitted `(tx_sz, plane_tx_type)` reachable
+  subset for every transform size in `TX_SIZES_ALL`.
+
+  **Split off explicitly to subsequent arcs (unchanged from r183):**
+  (a) §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table
+  transcription; (b) §7.12.3 step-3 frame-buffer merge; (c) 12
+  non-DC intra-prediction modes; (d) §7.9 inter prediction.
+
+  `decode_av1` / `encode_av1` continue to return
+  `Error::NotImplemented`.
+
 * **Round 183 — §7.12.2 dequantization-function tables + §7.12.3
   step-1 dequantization loop + §5.11.47 `transform_type` per-TU
   S() reader.** Replaces the r182 placeholder identity dequant +

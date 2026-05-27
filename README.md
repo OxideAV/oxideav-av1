@@ -2,9 +2,9 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 183)
+## Status — 2026-05-28 (round 184)
 
-**Clean-room rebuild, round 23.** The crate's prior implementation was
+**Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
 core decoder modules could not be defended against the "no external
 library source as reference" rule that governs every crate in this
@@ -1552,6 +1552,69 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 184 lifts the **§7.5 / §5.11.41 `get_scan(txSz)` scan-table
+dispatcher** — the last placeholder the r183 walker left in the
+§5.11.39 coefficients-reader call site.
+
+A new `scan` module (`pub mod scan` in `lib.rs`) transcribes the full
+§7.5 scan-table family from av1-spec p.388-399 verbatim: 14 default
+scans (`DEFAULT_SCAN_4X4` through `DEFAULT_SCAN_32X8`, covering every
+size enumerated by `get_default_scan`), 9 column-major scans
+(`MCOL_SCAN_4X4` through `MCOL_SCAN_16X4`), and 9 row-major identity
+scans (`MROW_SCAN_4X4` through `MROW_SCAN_16X4`). The Mcol / Mrow
+families only enumerate sizes whose `Tx_Size_Sqr_Up <= TX_16X16`
+because the §5.11.40 / §5.11.48 set restrictions only admit `H_*` /
+`V_*` plane-tx-types for those sizes (the spec's
+`return Mrow_Scan_16x4` / `return Mcol_Scan_16x4` tail in
+`get_mrow_scan` / `get_mcol_scan` is a defensive fallback on an
+unreachable branch — we mirror it directly).
+
+`scan::get_scan(tx_sz, plane_tx_type)` reproduces the §5.11.41
+dispatcher verbatim from av1-spec p.94: the three size-driven
+short-circuits (`TX_16X64` → `Default_Scan_16x32`, `TX_64X16` →
+`Default_Scan_32x16`, `Tx_Size_Sqr_Up[txSz] == TX_64X64` →
+`Default_Scan_32x32`) catch every size whose `segEob = 512` cap
+(per §5.11.39 on `TX_16X64` / `TX_64X16`) or `segEob = Min(1024,
+w*h) = 1024` cap (per the 32×32 coefficient-grid limit on the
+larger sizes) makes the smaller scan table cover the reachable
+positions; then the `IDTX` arm routes to the per-size default,
+the `preferRow` arm (V_DCT / V_ADST / V_FLIPADST) routes to
+`get_mrow_scan`, the `preferCol` arm (H_DCT / H_ADST / H_FLIPADST)
+routes to `get_mcol_scan`, and symmetric tx types
+(DCT_DCT / ADST_DCT / DCT_ADST / ADST_ADST / FLIPADST_DCT /
+DCT_FLIPADST / FLIPADST_FLIPADST / ADST_FLIPADST / FLIPADST_ADST)
+fall through to `get_default_scan`.
+
+`PartitionWalker::transform_block_emit` now calls
+`scan::get_scan(tx_sz, plane_tx_type)` directly and forwards the
+returned `&'static [u16]` to `self.coefficients(...)`. The previous
+`Vec<u16>` of `0..segEob` per-iteration allocation (and the local
+`seg_eob` derivation that fed it) is dropped; the §5.11.39 reader
+re-computes `segEob` internally from `tx_sz` for its zero-fill and
+bounds check, so the caller never needs it.
+
+**Split off explicitly to subsequent arcs (unchanged from r183):**
+(a) §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table
+transcription; (b) §7.12.3 step-3 frame-buffer merge
+(`CurrFrame[plane][y + yy][x + xx]` write with `flipLR` / `flipUD`
+and `Clip1`); (c) 12 non-DC intra-prediction modes; (d) §7.9 inter
+prediction.
+
+22 new tests (821 → 843): scan-permutation checks (every default /
+Mcol / Mrow table visits every coefficient position exactly once);
+Mrow-identity check (every `MROW_SCAN_*[i] == i`); Mcol
+column-major formula check (`scan[col*h + row] == row*w + col`);
+spec-anchor zig-zag prologue checks (`DEFAULT_SCAN_4X4[..4] ==
+[0,1,4,8]`; `DEFAULT_SCAN_8X8[..6] == [0,1,8,16,9,2]`);
+`get_default_scan` / `get_mcol_scan` / `get_mrow_scan` per-size
+enumeration including spec-tail fallback; `get_scan` arm-by-arm
+coverage (`TX_16X64` / `TX_64X16` / `Tx_Size_Sqr_Up == TX_64X64` /
+IDTX / preferRow / preferCol / symmetric) under every
+representative `PlaneTxType`; and `scan.len() >= segEob` covers
+the §5.11.40-admitted `(tx_sz, plane_tx_type)` reachable subset
+for every transform size in `TX_SIZES_ALL`. `decode_av1` /
+`encode_av1` continue to return `Error::NotImplemented`.
 
 Round 183 lifts the **§7.12.2 dequantization-function tables + §7.12.3
 step-1 dequantization loop + §5.11.47 `transform_type` per-TU S()

@@ -22633,11 +22633,6 @@ impl PartitionWalker {
             // (or `TxTypes[y4][x4]` on the inter path).
             let tx_w = TX_WIDTH[tx_sz];
             let tx_h = TX_HEIGHT[tx_sz];
-            let seg_eob = if tx_sz == TX_16X64 || tx_sz == TX_64X16 {
-                512usize
-            } else {
-                core::cmp::min(1024, tx_w * tx_h)
-            };
             // 4×4-luma-sample coordinates of this TU's top-left, in
             // mi-units. The §5.11.47 `TxTypes[ y4 + j ][ x4 + i ]`
             // grid stamp + the §5.11.40 `TxTypes[ y4 ][ x4 ]`
@@ -22719,13 +22714,18 @@ impl PartitionWalker {
                 _ => TX_CLASS_2D,
             };
 
-            // §7.5 identity scan placeholder — `seg_eob` cells in
-            // strictly ascending order. The §7.5 `get_scan` table
-            // dispatch (per-`(txSz, PlaneTxType)`) is the next-arc
-            // target; the gate-closed (`all_zero == 1`) bitstream
-            // path the §5.11.5 walker exercises today does not
-            // consume the scan beyond the EOB derivation.
-            let scan: Vec<u16> = (0..seg_eob as u16).collect();
+            // §7.5 / §5.11.41 `get_scan( txSz )` — routes per
+            // `(txSz, PlaneTxType)` to the per-size Default / Mrow /
+            // Mcol scan table the §5.11.39 reader walks. Replaces
+            // the r183 identity-ascending placeholder; the returned
+            // slice always has `len >= segEob` per the §7.5
+            // construction (`TX_16X64` / `TX_64X16` are 512 from
+            // Default_Scan_16x32 / Default_Scan_32x16, and the
+            // `Tx_Size_Sqr_Up == TX_64X64` arm yields 1024 from
+            // Default_Scan_32x32). The §5.11.39 reader re-derives
+            // `segEob` internally from `tx_sz` for its zero-fill +
+            // bounds check.
+            let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
             let mut quant = vec![0i32; tx_w * tx_h];
             let coeffs = self.coefficients(
                 decoder,
@@ -22736,7 +22736,7 @@ impl PartitionWalker {
                 tx_class,
                 /* txb_skip_ctx = */ 0,
                 /* dc_sign_ctx = */ 0,
-                &scan,
+                scan,
                 &mut quant,
             )?;
             readout.coeffs.push(coeffs);

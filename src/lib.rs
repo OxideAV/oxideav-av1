@@ -1522,6 +1522,7 @@ mod bitreader;
 pub mod cdf;
 pub mod frame_header;
 pub mod obu;
+pub mod scan;
 pub mod sequence_header;
 pub mod symbol_decoder;
 pub mod tile_info;
