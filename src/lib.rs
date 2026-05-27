@@ -1891,9 +1891,16 @@ pub enum Error {
     /// §5.11.23 dispatcher no longer constructs it on the conformant
     /// path.
     ///
-    /// The next-arc target moves one step down to the post-
-    /// `read_motion_mode` cascade (`read_interintra_mode` /
-    /// `read_compound_type` / `read_interpolation_filter`), currently
+    /// Post-r176 the §5.11.28 `read_interintra_mode` body is also
+    /// wired into the dispatcher (with the inner-arm
+    /// `RefFrame[1] = INTRA_FRAME` grid-stamp override). Post-r177 the
+    /// §5.11.29 `read_compound_type` body lands (gating on
+    /// `enable_masked_compound` / `enable_jnt_comp`, the §3
+    /// `Wedge_Bits[ MiSize ]` table, and the §8.3.2
+    /// `comp_group_idx` / `compound_idx` ctx walks plus the
+    /// `compound_type` S() / `wedge_index` S() / `wedge_sign` L(1) /
+    /// `mask_type` L(1) sub-branches). The post-`read_compound_type`
+    /// gap is now `read_interpolation_filter` (§5.11.x), still
     /// surfaced via the §5.11.18 dispatcher's `Ok(_)` arm as
     /// [`Self::InterBlockModeInfoUnsupported`].
     MotionModeUnsupported,
@@ -2016,7 +2023,7 @@ impl core::fmt::Display for Error {
             ),
             Self::MotionModeUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.27 read_motion_mode — defensive fallback retained post-r175 (the §5.11.27 reader is now wired into the dispatcher with §7.10.3 has_overlappable_candidates + §7.10.4 find_warp_samples; the post-`read_motion_mode` cascade — read_interintra_mode / read_compound_type / read_interpolation_filter — surfaces via the §5.11.18 dispatcher's Ok-arm InterBlockModeInfoUnsupported)"
+                "oxideav-av1: §5.11.27 read_motion_mode — defensive fallback retained post-r175 (the §5.11.27 reader is now wired into the dispatcher with §7.10.3 has_overlappable_candidates + §7.10.4 find_warp_samples; post-r176 the §5.11.28 read_interintra_mode and post-r177 the §5.11.29 read_compound_type readers are also wired; the live gap moves to read_interpolation_filter, surfaced via the §5.11.18 dispatcher's Ok-arm InterBlockModeInfoUnsupported)"
             ),
             Self::TemporalMvScanUnsupported => write!(
                 f,

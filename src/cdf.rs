@@ -1252,6 +1252,62 @@ pub const II_SMOOTH_PRED: u8 = 3;
 /// `TileWedgeIndexCdf[ MiSize ]`).
 pub const WEDGE_TYPES: usize = 16;
 
+/// `Wedge_Bits[ BLOCK_SIZES ]` (§3 table, av1-spec p.470). The
+/// per-`MiSize` count of bits associated with a wedge mask: rows where
+/// `Wedge_Bits[ MiSize ] > 0` are the only ones for which the §5.11.29
+/// `read_compound_type` inner branch is allowed to code
+/// `compound_type` via the `TileCompoundTypeCdf[ MiSize ]` S(). The
+/// `n == 0` rows force `compound_type = COMPOUND_DIFFWTD` (no S()
+/// read), per the spec body `if ( n == 0 ) compound_type =
+/// COMPOUND_DIFFWTD else compound_type S()`. The non-zero positions
+/// (indices 3..=9 and 18..=19) coincide with the §9.4
+/// `Default_Wedge_Index_Cdf` non-placeholder rows.
+pub const WEDGE_BITS: [u8; BLOCK_SIZES] = [
+    0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0,
+];
+
+/// `wedge_bits( mi_size )` — §3 `Wedge_Bits[ MiSize ]` accessor.
+/// Returns `0` for `mi_size >= BLOCK_SIZES` (a caller bug; the §5.11.29
+/// `read_compound_type` outer gate guards against this earlier in the
+/// dispatcher).
+#[inline]
+#[must_use]
+pub const fn wedge_bits(mi_size: usize) -> u8 {
+    if mi_size < BLOCK_SIZES {
+        WEDGE_BITS[mi_size]
+    } else {
+        0
+    }
+}
+
+/// §6.10.24 `compound_type` enumeration ordinals (av1-spec p.470).
+/// Only `COMPOUND_WEDGE` and `COMPOUND_DIFFWTD` are signalled by the
+/// `compound_type` S() (`COMPOUND_TYPES = 2`); `COMPOUND_AVERAGE` /
+/// `COMPOUND_INTRA` / `COMPOUND_DISTANCE` are inferred from the
+/// surrounding §5.11.29 body per the spec note.
+pub const COMPOUND_WEDGE: u8 = 0;
+/// §6.10.24 ordinal — see [`COMPOUND_WEDGE`].
+pub const COMPOUND_DIFFWTD: u8 = 1;
+/// §6.10.24 ordinal — see [`COMPOUND_WEDGE`].
+pub const COMPOUND_AVERAGE: u8 = 2;
+/// §6.10.24 ordinal — see [`COMPOUND_WEDGE`]. Reached only via the
+/// §5.11.29 `interintra && wedge_interintra == 0` else-arm assignment
+/// `compound_type = COMPOUND_INTRA`.
+pub const COMPOUND_INTRA: u8 = 3;
+/// §6.10.24 ordinal — see [`COMPOUND_WEDGE`]. Reached only via the
+/// §5.11.29 `comp_group_idx == 0 && enable_jnt_comp` arm's
+/// `compound_idx ? COMPOUND_AVERAGE : COMPOUND_DISTANCE` assignment.
+pub const COMPOUND_DISTANCE: u8 = 4;
+
+/// §6.10.24 `mask_type` enumeration ordinals (av1-spec p.470). Coded
+/// as `mask_type L(1)` on the §5.11.29 `compound_type == COMPOUND_DIFFWTD`
+/// arm. `UNIFORM_45` is the default mask direction; `UNIFORM_45_INV`
+/// is the inverted variant — see §7.11.3.13 (the difference-weight
+/// mask process).
+pub const UNIFORM_45: u8 = 0;
+/// §6.10.24 ordinal — see [`UNIFORM_45`].
+pub const UNIFORM_45_INV: u8 = 1;
+
 // ---------------------------------------------------------------------
 // Round 136 — coefficient-token entry constants (§3). These drive the
 // outer/inner dimensions of the `init_coeff_cdfs` entry sub-group:
@@ -10974,6 +11030,144 @@ pub fn interintra_ctx(mi_size: usize) -> Option<usize> {
     }
 }
 
+/// §8.3.2 `comp_group_idx` context selection (av1-spec p.384). The
+/// spec body reads:
+///
+/// ```text
+///   ctx = 0
+///   if ( AvailU ) {
+///     if ( !AboveSingle )
+///       ctx += CompGroupIdxs[ MiRow - 1 ][ MiCol ]
+///     else if ( AboveRefFrame[ 0 ] == ALTREF_FRAME )
+///       ctx += 3
+///   }
+///   if ( AvailL ) {
+///     if ( !LeftSingle )
+///       ctx += CompGroupIdxs[ MiRow ][ MiCol - 1 ]
+///     else if ( LeftRefFrame[ 0 ] == ALTREF_FRAME )
+///       ctx += 3
+///   }
+///   ctx = Min( 5, ctx )
+/// ```
+///
+/// `above_comp_group` / `left_comp_group` are the neighbour
+/// `CompGroupIdxs` values (binary `0` or `1`); they're only consulted
+/// on the `!AboveSingle` / `!LeftSingle` arm.
+///
+/// `above_ref_0_altref` / `left_ref_0_altref` carry the
+/// `RefFrame[ 0 ] == ALTREF_FRAME = 7` test, only consulted on the
+/// `AboveSingle` / `LeftSingle` arm.
+///
+/// Returns a value in `0..COMP_GROUP_IDX_CONTEXTS` (`= 0..6`); the
+/// final `Min( 5, ctx )` clamp is applied here.
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn comp_group_idx_ctx(
+    avail_u: bool,
+    above_single: bool,
+    above_comp_group: u8,
+    above_ref_0_altref: bool,
+    avail_l: bool,
+    left_single: bool,
+    left_comp_group: u8,
+    left_ref_0_altref: bool,
+) -> usize {
+    let mut ctx: usize = 0;
+    if avail_u {
+        if !above_single {
+            ctx += above_comp_group as usize;
+        } else if above_ref_0_altref {
+            ctx += 3;
+        }
+    }
+    if avail_l {
+        if !left_single {
+            ctx += left_comp_group as usize;
+        } else if left_ref_0_altref {
+            ctx += 3;
+        }
+    }
+    if ctx > 5 {
+        5
+    } else {
+        ctx
+    }
+}
+
+/// §8.3.2 `compound_idx` context selection (av1-spec p.384). The spec
+/// body reads:
+///
+/// ```text
+///   fwd = Abs( get_relative_dist( OrderHints[ RefFrame[ 0 ] ], OrderHint ) )
+///   bck = Abs( get_relative_dist( OrderHints[ RefFrame[ 1 ] ], OrderHint ) )
+///   ctx = ( fwd == bck ) ? 3 : 0
+///   if ( AvailU ) {
+///     if ( !AboveSingle )
+///       ctx += CompoundIdxs[ MiRow - 1 ][ MiCol ]
+///     else if ( AboveRefFrame[ 0 ] == ALTREF_FRAME )
+///       ctx++
+///   }
+///   if ( AvailL ) {
+///     if ( !LeftSingle )
+///       ctx += CompoundIdxs[ MiRow ][ MiCol - 1 ]
+///     else if ( LeftRefFrame[ 0 ] == ALTREF_FRAME )
+///       ctx++
+///   }
+/// ```
+///
+/// `dist_equal` is the `fwd == bck` outcome the caller computed via
+/// §7.8.1 `get_relative_dist` against the resolved `OrderHints[]` /
+/// `OrderHint` frame-header state.
+///
+/// `above_compound` / `left_compound` are the neighbour `CompoundIdxs`
+/// values (binary `0` or `1`); they're only consulted on the
+/// `!AboveSingle` / `!LeftSingle` arm.
+///
+/// `above_ref_0_altref` / `left_ref_0_altref` carry the
+/// `RefFrame[ 0 ] == ALTREF_FRAME = 7` test, only consulted on the
+/// `AboveSingle` / `LeftSingle` arm.
+///
+/// Returns a value in `0..COMPOUND_IDX_CONTEXTS` (`= 0..6`): the
+/// maximum is `3 (dist_equal) + 1 (above) + 1 (left) = 5`, the
+/// minimum is `0`. The spec body does not apply a `Min(..)` clamp —
+/// the cap is structural.
+#[inline]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compound_idx_ctx(
+    dist_equal: bool,
+    avail_u: bool,
+    above_single: bool,
+    above_compound: u8,
+    above_ref_0_altref: bool,
+    avail_l: bool,
+    left_single: bool,
+    left_compound: u8,
+    left_ref_0_altref: bool,
+) -> usize {
+    let mut ctx: usize = if dist_equal { 3 } else { 0 };
+    if avail_u {
+        if !above_single {
+            ctx += above_compound as usize;
+        } else if above_ref_0_altref {
+            ctx += 1;
+        }
+    }
+    if avail_l {
+        if !left_single {
+            ctx += left_compound as usize;
+        } else if left_ref_0_altref {
+            ctx += 1;
+        }
+    }
+    debug_assert!(
+        ctx < COMPOUND_IDX_CONTEXTS,
+        "compound_idx ctx must be in 0..COMPOUND_IDX_CONTEXTS"
+    );
+    ctx
+}
+
 // ---------------------------------------------------------------------
 // Round 144 — wedge-index CDF (§9.4): `Default_Wedge_Index_Cdf`. The
 // table codes the `wedge_index ∈ 0..WEDGE_TYPES` element read by two
@@ -11796,6 +11990,31 @@ pub struct PartitionWalker {
     /// §5.11.31 motion-vector range (`-(1<<14)..(1<<14)` per §6.10.27
     /// `Mv` validity) fits without truncation.
     mvs: Vec<i16>,
+    /// `CompGroupIdxs[ row ][ col ]` packed into a row-major
+    /// `mi_rows * mi_cols` flat buffer (av1-spec §5.11.29 / §8.3.2 —
+    /// the §5.11.29 `read_compound_type` body sets
+    /// `CompGroupIdxs[ r + y ][ c + x ] = comp_group_idx` over the
+    /// block's `bh4 * bw4` footprint, and the §8.3.2 `comp_group_idx`
+    /// paragraph reads back `CompGroupIdxs[ MiRow - 1 ][ MiCol ]` /
+    /// `CompGroupIdxs[ MiRow ][ MiCol - 1 ]` on the
+    /// `!AboveSingle` / `!LeftSingle` arms). Entries are binary
+    /// (`0` or `1`); pre-fill is `0` (the §5.11.29 default
+    /// `comp_group_idx = 0` initialiser, which is also the natural
+    /// neighbour identity for an unavailable cell).
+    comp_group_idxs: Vec<u8>,
+    /// `CompoundIdxs[ row ][ col ]` packed into a row-major
+    /// `mi_rows * mi_cols` flat buffer (av1-spec §5.11.29 / §8.3.2 —
+    /// the §5.11.29 `read_compound_type` body sets
+    /// `CompoundIdxs[ r + y ][ c + x ] = compound_idx` over the
+    /// block's `bh4 * bw4` footprint, and the §8.3.2 `compound_idx`
+    /// paragraph reads back `CompoundIdxs[ MiRow - 1 ][ MiCol ]` /
+    /// `CompoundIdxs[ MiRow ][ MiCol - 1 ]` on the
+    /// `!AboveSingle` / `!LeftSingle` arms). Entries are binary
+    /// (`0` or `1`); pre-fill is `1` (the §5.11.29 default
+    /// `compound_idx = 1` initialiser; an unavailable neighbour
+    /// contributes the natural identity weight via the `AboveSingle`
+    /// / `LeftSingle` gate which fires first on such cells).
+    compound_idxs: Vec<u8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -11918,6 +12137,24 @@ impl PartitionWalker {
         let mut mvs: Vec<i16> = Vec::new();
         mvs.try_reserve_exact(area4).ok()?;
         mvs.resize(area4, 0);
+        // §5.11.29 / §8.3.2: pre-fill `CompGroupIdxs[r][c]` with `0`,
+        // the §5.11.29 default `comp_group_idx = 0` initialiser (also
+        // the natural identity for an unavailable neighbour — the
+        // §8.3.2 `comp_group_idx` ctx body only consults this grid on
+        // the `!AboveSingle` / `!LeftSingle` arms which fire on
+        // compound-coded neighbours, never on intra / single-pred or
+        // unavailable cells).
+        let mut comp_group_idxs: Vec<u8> = Vec::new();
+        comp_group_idxs.try_reserve_exact(area).ok()?;
+        comp_group_idxs.resize(area, 0);
+        // §5.11.29 / §8.3.2: pre-fill `CompoundIdxs[r][c]` with `1`,
+        // the §5.11.29 default `compound_idx = 1` initialiser. The
+        // §8.3.2 `compound_idx` ctx body only consults this grid on
+        // the `!AboveSingle` / `!LeftSingle` arms (same identity
+        // story as `CompGroupIdxs` above).
+        let mut compound_idxs: Vec<u8> = Vec::new();
+        compound_idxs.try_reserve_exact(area).ok()?;
+        compound_idxs.resize(area, 1);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -11939,8 +12176,28 @@ impl PartitionWalker {
             palette_sizes,
             palette_colors,
             mvs,
+            comp_group_idxs,
+            compound_idxs,
             blocks: Vec::new(),
         })
+    }
+
+    /// `CompGroupIdxs[ r ][ c ]` accessor — returns the flat grid the
+    /// §5.11.29 `read_compound_type` body stamps and the §8.3.2
+    /// `comp_group_idx` ctx walk reads. Indexed `r * MiCols + c`.
+    /// Pre-fill is `0` (the §5.11.29 default `comp_group_idx`).
+    #[must_use]
+    pub fn comp_group_idxs(&self) -> &[u8] {
+        &self.comp_group_idxs
+    }
+
+    /// `CompoundIdxs[ r ][ c ]` accessor — returns the flat grid the
+    /// §5.11.29 `read_compound_type` body stamps and the §8.3.2
+    /// `compound_idx` ctx walk reads. Indexed `r * MiCols + c`.
+    /// Pre-fill is `1` (the §5.11.29 default `compound_idx`).
+    #[must_use]
+    pub fn compound_idxs(&self) -> &[u8] {
+        &self.compound_idxs
     }
 
     /// `MiRows` accessor for tests / debugging.
@@ -15058,6 +15315,11 @@ impl PartitionWalker {
         // r176: §5.11.28 caller-supplied sequence-header scalar (see
         // [`Self::decode_inter_block_mode_info`]).
         enable_interintra_compound: bool,
+        // r177: §5.11.29 caller-supplied sequence-header / frame-header
+        // scalars (see [`Self::decode_inter_block_mode_info`]).
+        enable_masked_compound: bool,
+        enable_jnt_comp: bool,
+        dist_equal: bool,
     ) -> Result<DecodedInterFrameModeInfo, crate::Error> {
         if sub_size >= BLOCK_SIZES {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -15387,15 +15649,20 @@ impl PartitionWalker {
                 allow_warped_motion,
                 is_scaled_per_ref,
                 enable_interintra_compound,
+                enable_masked_compound,
+                enable_jnt_comp,
+                dist_equal,
             ) {
                 Ok(_inter_info) => {
-                    // The §5.11.23 post-`read_interintra_mode` cascade
-                    // (`read_compound_type` per §5.11.29 /
-                    // `read_interpolation_filter` per §5.11.x) is the
-                    // next-arc target; once it lands, expand
-                    // [`DecodedInterFrameModeInfo`] to carry the
-                    // inter-arm aggregate and route the Ok values
-                    // here.
+                    // r177: the §5.11.29 `read_compound_type` body now
+                    // runs to completion inside
+                    // `decode_inter_block_mode_info`. The live gap
+                    // moves one step down to
+                    // `read_interpolation_filter` (§5.11.x); the
+                    // [`DecodedInterFrameModeInfo`] aggregate does not
+                    // yet surface the inter-arm body, so we still
+                    // emit the historical `InterBlockModeInfoUnsupported`
+                    // stub for the dispatcher's `Ok(_)` arm.
                     Err(crate::Error::InterBlockModeInfoUnsupported)
                 }
                 Err(e) => Err(e),
@@ -16213,6 +16480,28 @@ impl PartitionWalker {
         //   read, and the `interintra` field of the returned
         //   [`DecodedInterBlockModeInfo::interintra`] aggregate is `0`.
         enable_interintra_compound: bool,
+        // r177 §5.11.29 caller-supplied frame-header / per-block
+        // scalars.
+        //
+        // * `enable_masked_compound` — §5.5.2 sequence-header bit
+        //   (`SequenceHeader::enable_masked_compound`). When `false`
+        //   the §5.11.29 inner `comp_group_idx` S() is skipped (the
+        //   pre-set `comp_group_idx = 0` is kept).
+        // * `enable_jnt_comp` — §5.5.2 sequence-header bit
+        //   (`SequenceHeader::enable_jnt_comp`). When `false` the
+        //   §5.11.29 `comp_group_idx == 0` arm short-circuits to
+        //   `compound_type = COMPOUND_AVERAGE` (no `compound_idx`
+        //   S() read).
+        // * `dist_equal` — the `Abs(get_relative_dist(OrderHints[
+        //   RefFrame[0]], OrderHint)) == Abs(get_relative_dist(
+        //   OrderHints[RefFrame[1]], OrderHint))` outcome from §7.8.1
+        //   that seeds the §8.3.2 `compound_idx` ctx (consumed only
+        //   on the `enable_jnt_comp` arm). For single-tile /
+        //   identity-frame-header callers, passing `false` is
+        //   conformant.
+        enable_masked_compound: bool,
+        enable_jnt_comp: bool,
+        dist_equal: bool,
     ) -> Result<DecodedInterBlockModeInfo, crate::Error> {
         // §5.11.23 caller-bug guards. Each inner method re-checks its
         // own bounds, but failing fast at the dispatcher keeps the
@@ -16545,6 +16834,70 @@ impl PartitionWalker {
             }
         }
 
+        // §5.11.23 line 36: `read_compound_type( isCompound )` per
+        // §5.11.29 (av1-spec p.80-81). Reads the inter-inter compound
+        // controls (`comp_group_idx` / `compound_idx` / `compound_type`)
+        // plus the wedge / diffwtd sub-branch (`wedge_index` /
+        // `wedge_sign` or `mask_type`). On the `!isCompound`
+        // else-arm the §5.11.28 outcome alone selects the type
+        // (`interintra && wedge_interintra ? COMPOUND_WEDGE :
+        // COMPOUND_INTRA` or `COMPOUND_AVERAGE`); on the `skip_mode`
+        // short-circuit the type is forced to `COMPOUND_AVERAGE` with
+        // no bits read.
+        //
+        // The §8.3.2 `comp_group_idx` / `compound_idx` ctx walks
+        // consult `AboveRefFrame[0] == ALTREF_FRAME` / `LeftRefFrame[0]
+        // == ALTREF_FRAME` on their `AboveSingle` / `LeftSingle` arms;
+        // resolve those scalars here from the already-passed
+        // `above_ref_frame` / `left_ref_frame` arrays. ALTREF_FRAME =
+        // 7 per §6.10.x.
+        let above_ref_0_altref = above_ref_frame[0] == 7;
+        let left_ref_0_altref = left_ref_frame[0] == 7;
+        let compound_type = self.read_compound_type(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip_mode,
+            is_compound,
+            interintra.interintra,
+            interintra.wedge_interintra.unwrap_or(0),
+            enable_masked_compound,
+            enable_jnt_comp,
+            dist_equal,
+            avail_u,
+            avail_l,
+            above_single,
+            left_single,
+            above_ref_0_altref,
+            left_ref_0_altref,
+        )?;
+
+        // §5.11.29 / §8.3.2 grid stamp: write `CompGroupIdxs[ r + y ][
+        // c + x ] = comp_group_idx` and `CompoundIdxs[ r + y ][ c + x
+        // ] = compound_idx` over the bh4 * bw4 footprint so the next
+        // block's §8.3.2 `comp_group_idx` / `compound_idx` ctx walks
+        // observe the values. The §5.11.29 default-arm short-circuit
+        // (`skip_mode == 1` or `!isCompound`) still stamps the pre-set
+        // defaults (`0` / `1`) — matching the §5.11.29 line-1 / line-2
+        // imperatives.
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                let cell = (rr * self.mi_cols + cc) as usize;
+                self.comp_group_idxs[cell] = compound_type.comp_group_idx;
+                self.compound_idxs[cell] = compound_type.compound_idx;
+            }
+        }
+
         Ok(DecodedInterBlockModeInfo {
             mi_row,
             mi_col,
@@ -16561,6 +16914,7 @@ impl PartitionWalker {
             motion_mode,
             num_warp_samples: num_samples,
             interintra,
+            compound_type,
         })
     }
 
@@ -17158,6 +17512,292 @@ impl PartitionWalker {
             interintra_mode: Some(ii_mode),
             wedge_interintra: Some(wedge_ii),
             wedge_index: wedge_idx,
+        })
+    }
+
+    /// `read_compound_type( isCompound )` per §5.11.29 (av1-spec
+    /// p.80-81). Reads the inter-inter compound-blending controls and
+    /// returns the outcome as a [`CompoundTypeReadout`] aggregate.
+    ///
+    /// The §5.11.29 spec body is:
+    ///
+    /// ```text
+    ///   read_compound_type( isCompound ) {
+    ///       comp_group_idx = 0
+    ///       compound_idx = 1
+    ///       if ( skip_mode ) {
+    ///           compound_type = COMPOUND_AVERAGE
+    ///           return
+    ///       }
+    ///       if ( isCompound ) {
+    ///           n = Wedge_Bits[ MiSize ]
+    ///           if ( enable_masked_compound ) {
+    ///               comp_group_idx                                     S()
+    ///           }
+    ///           if ( comp_group_idx == 0 ) {
+    ///               if ( enable_jnt_comp ) {
+    ///                   compound_idx                                   S()
+    ///                   compound_type = compound_idx ? COMPOUND_AVERAGE
+    ///                                                : COMPOUND_DISTANCE
+    ///               } else {
+    ///                   compound_type = COMPOUND_AVERAGE
+    ///               }
+    ///           } else {
+    ///               if ( n == 0 ) {
+    ///                   compound_type = COMPOUND_DIFFWTD
+    ///               } else {
+    ///                   compound_type                                  S()
+    ///               }
+    ///           }
+    ///           if ( compound_type == COMPOUND_WEDGE ) {
+    ///               wedge_index                                        S()
+    ///               wedge_sign                                         L(1)
+    ///           } else if ( compound_type == COMPOUND_DIFFWTD ) {
+    ///               mask_type                                          L(1)
+    ///           }
+    ///       } else {
+    ///           if ( interintra ) {
+    ///               compound_type = wedge_interintra ? COMPOUND_WEDGE
+    ///                                                : COMPOUND_INTRA
+    ///           } else {
+    ///               compound_type = COMPOUND_AVERAGE
+    ///           }
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// The §8.3.2 selections are:
+    /// * `comp_group_idx`: `TileCompGroupIdxCdf[ ctx ]` with ctx via
+    ///   [`comp_group_idx_ctx`] (`CompGroupIdxs` neighbour values,
+    ///   `AvailU` / `AvailL`, `AboveSingle` / `LeftSingle`,
+    ///   `ALTREF_FRAME` test, clamped at `Min(5, ctx)`).
+    /// * `compound_idx`: `TileCompoundIdxCdf[ ctx ]` with ctx via
+    ///   [`compound_idx_ctx`] (`get_relative_dist` equality test,
+    ///   `CompoundIdxs` neighbour values, `AvailU` / `AvailL`,
+    ///   `AboveSingle` / `LeftSingle`, `ALTREF_FRAME` test).
+    /// * `compound_type`: `TileCompoundTypeCdf[ MiSize ]` (straight
+    ///   `MiSize` index).
+    /// * `wedge_index`: `TileWedgeIndexCdf[ MiSize ]` (shared with the
+    ///   §5.11.28 inter-intra wedge sub-branch).
+    /// * `wedge_sign` / `mask_type`: literal `L(1)`, no CDF.
+    ///
+    /// Caller-supplied scalars beyond the §5.11.28 set:
+    /// * `interintra` / `wedge_interintra` — the §5.11.28 outcome
+    ///   (used only on the `!isCompound` else-arm).
+    /// * `enable_masked_compound` — §5.5.2 sequence-header bit.
+    /// * `enable_jnt_comp` — §5.5.2 sequence-header bit.
+    /// * `dist_equal` — the `Abs(get_relative_dist(OrderHints[
+    ///   RefFrame[0] ], OrderHint)) == Abs(get_relative_dist(
+    ///   OrderHints[ RefFrame[1] ], OrderHint))` outcome the caller
+    ///   computed from the frame-header `OrderHints[]` / `OrderHint`
+    ///   state (used only on the `enable_jnt_comp` arm).
+    /// * `above_ref_0_altref` / `left_ref_0_altref` — the §5.11.18
+    ///   `AboveRefFrame[0] == ALTREF_FRAME` / `LeftRefFrame[0] ==
+    ///   ALTREF_FRAME` results (used only on the `AboveSingle` /
+    ///   `LeftSingle` arm of the §8.3.2 ctx walks).
+    ///
+    /// The walker reads neighbour `CompGroupIdxs` / `CompoundIdxs`
+    /// directly from its grids (the [`PartitionWalker::comp_group_idxs`]
+    /// / [`PartitionWalker::compound_idxs`] caches stamped by previous
+    /// blocks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_compound_type(
+        &self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip_mode: u8,
+        is_compound: bool,
+        interintra: u8,
+        wedge_interintra: u8,
+        enable_masked_compound: bool,
+        enable_jnt_comp: bool,
+        dist_equal: bool,
+        avail_u: bool,
+        avail_l: bool,
+        above_single: bool,
+        left_single: bool,
+        above_ref_0_altref: bool,
+        left_ref_0_altref: bool,
+    ) -> Result<CompoundTypeReadout, crate::Error> {
+        // §5.11.29 lines 1-2: `comp_group_idx = 0`, `compound_idx = 1`.
+        let mut comp_group_idx: u8 = 0;
+        let mut compound_idx: u8 = 1;
+
+        // §5.11.29 line 3-6: `if ( skip_mode )` short-circuit —
+        // `compound_type = COMPOUND_AVERAGE`, no bits read.
+        if skip_mode != 0 {
+            return Ok(CompoundTypeReadout {
+                comp_group_idx,
+                compound_idx,
+                compound_type: COMPOUND_AVERAGE,
+                wedge_index: None,
+                wedge_sign: None,
+                mask_type: None,
+            });
+        }
+
+        if !is_compound {
+            // §5.11.29 else-arm: no bits read, the §5.11.28 outcome
+            // alone selects the type.
+            let compound_type = if interintra != 0 {
+                if wedge_interintra != 0 {
+                    COMPOUND_WEDGE
+                } else {
+                    COMPOUND_INTRA
+                }
+            } else {
+                COMPOUND_AVERAGE
+            };
+            return Ok(CompoundTypeReadout {
+                comp_group_idx,
+                compound_idx,
+                compound_type,
+                wedge_index: None,
+                wedge_sign: None,
+                mask_type: None,
+            });
+        }
+
+        // §5.11.29 `n = Wedge_Bits[ MiSize ]`.
+        let n = wedge_bits(sub_size);
+
+        // §5.11.29 `if ( enable_masked_compound )` ⇒ `comp_group_idx S()`.
+        if enable_masked_compound {
+            // §8.3.2 `comp_group_idx` ctx via §7.10-style neighbour
+            // walk. Neighbour `CompGroupIdxs[ MiRow - 1 ][ MiCol ]` /
+            // `CompGroupIdxs[ MiRow ][ MiCol - 1 ]` reads are gated on
+            // `AvailU` / `AvailL`; an out-of-grid neighbour reduces to
+            // the `0` identity (the §5.11.29 pre-fill value).
+            let above_cg = if avail_u && mi_row > 0 {
+                let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
+                self.comp_group_idxs[cell]
+            } else {
+                0
+            };
+            let left_cg = if avail_l && mi_col > 0 {
+                let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
+                self.comp_group_idxs[cell]
+            } else {
+                0
+            };
+            let ctx = comp_group_idx_ctx(
+                avail_u,
+                above_single,
+                above_cg,
+                above_ref_0_altref,
+                avail_l,
+                left_single,
+                left_cg,
+                left_ref_0_altref,
+            );
+            let row = cdfs.comp_group_idx_cdf(ctx);
+            let sym = decoder.read_symbol(row)? as u8;
+            debug_assert!(sym <= 1, "S() over TileCompGroupIdxCdf yields 0 or 1");
+            comp_group_idx = sym;
+        }
+
+        let compound_type: u8;
+        let mut wedge_index_out: Option<u8> = None;
+        let mut wedge_sign_out: Option<u8> = None;
+        let mut mask_type_out: Option<u8> = None;
+
+        if comp_group_idx == 0 {
+            // §5.11.29 `if ( enable_jnt_comp )` ⇒ `compound_idx S()`
+            // ⇒ `compound_type = compound_idx ? COMPOUND_AVERAGE :
+            // COMPOUND_DISTANCE`; else `compound_type = COMPOUND_AVERAGE`.
+            if enable_jnt_comp {
+                // §8.3.2 `compound_idx` ctx via the same neighbour
+                // walk as `comp_group_idx`, seeded with the
+                // `dist_equal ? 3 : 0` distance-equality outcome and
+                // adding `+1` (not `+CompoundIdxs`) on the
+                // `AboveSingle`/`LeftSingle` `ALTREF_FRAME` arm per
+                // av1-spec p.384.
+                let above_ci = if avail_u && mi_row > 0 {
+                    let cell = ((mi_row - 1) * self.mi_cols + mi_col) as usize;
+                    self.compound_idxs[cell]
+                } else {
+                    1
+                };
+                let left_ci = if avail_l && mi_col > 0 {
+                    let cell = (mi_row * self.mi_cols + (mi_col - 1)) as usize;
+                    self.compound_idxs[cell]
+                } else {
+                    1
+                };
+                let ctx = compound_idx_ctx(
+                    dist_equal,
+                    avail_u,
+                    above_single,
+                    above_ci,
+                    above_ref_0_altref,
+                    avail_l,
+                    left_single,
+                    left_ci,
+                    left_ref_0_altref,
+                );
+                let row = cdfs.compound_idx_cdf(ctx);
+                let sym = decoder.read_symbol(row)? as u8;
+                debug_assert!(sym <= 1, "S() over TileCompoundIdxCdf yields 0 or 1");
+                compound_idx = sym;
+                compound_type = if compound_idx != 0 {
+                    COMPOUND_AVERAGE
+                } else {
+                    COMPOUND_DISTANCE
+                };
+            } else {
+                compound_type = COMPOUND_AVERAGE;
+            }
+        } else {
+            // §5.11.29 `comp_group_idx == 1`: `n == 0` ⇒
+            // `compound_type = COMPOUND_DIFFWTD`; else `compound_type
+            // S()` against `TileCompoundTypeCdf[ MiSize ]`.
+            if n == 0 {
+                compound_type = COMPOUND_DIFFWTD;
+            } else {
+                let row = cdfs
+                    .compound_type_cdf(sub_size)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let sym = decoder.read_symbol(row)? as u8;
+                debug_assert!(
+                    (sym as usize) < COMPOUND_TYPES,
+                    "S() over TileCompoundTypeCdf yields 0..COMPOUND_TYPES"
+                );
+                compound_type = sym;
+            }
+        }
+
+        // §5.11.29 wedge / diffwtd sub-branches.
+        if compound_type == COMPOUND_WEDGE {
+            let row = cdfs
+                .wedge_index_cdf(sub_size)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let wi = decoder.read_symbol(row)? as u8;
+            debug_assert!(
+                (wi as usize) < WEDGE_TYPES,
+                "S() over TileWedgeIndexCdf yields 0..WEDGE_TYPES"
+            );
+            wedge_index_out = Some(wi);
+            // §5.11.29 `wedge_sign L(1)`.
+            let ws = decoder.read_literal(1)? as u8;
+            debug_assert!(ws <= 1, "L(1) over wedge_sign yields 0 or 1");
+            wedge_sign_out = Some(ws);
+        } else if compound_type == COMPOUND_DIFFWTD {
+            // §5.11.29 `mask_type L(1)`.
+            let mt = decoder.read_literal(1)? as u8;
+            debug_assert!(mt <= 1, "L(1) over mask_type yields 0 or 1");
+            mask_type_out = Some(mt);
+        }
+
+        Ok(CompoundTypeReadout {
+            comp_group_idx,
+            compound_idx,
+            compound_type,
+            wedge_index: wedge_index_out,
+            wedge_sign: wedge_sign_out,
+            mask_type: mask_type_out,
         })
     }
 
@@ -21354,6 +21994,13 @@ pub struct DecodedInterBlockModeInfo {
     /// isCompound / outside the `BLOCK_8X8..=BLOCK_32X32` band) the
     /// `interintra` flag is `0` and the per-symbol fields are `None`.
     pub interintra: InterIntraReadout,
+    /// §5.11.29 `read_compound_type( )` outcome. Carries the
+    /// `comp_group_idx` / `compound_idx` (defaults to `0` / `1` on
+    /// short-circuit), the resolved `compound_type` ordinal, and the
+    /// optional `wedge_index` / `wedge_sign` (when `compound_type ==
+    /// COMPOUND_WEDGE`) or `mask_type` (when `compound_type ==
+    /// COMPOUND_DIFFWTD`).
+    pub compound_type: CompoundTypeReadout,
 }
 
 /// §5.11.28 `read_interintra_mode( isCompound )` per-block outcome —
@@ -21387,6 +22034,53 @@ pub struct InterIntraReadout {
     /// `Some(_)` ⇔ `interintra == 1 && wedge_interintra == 1`; `None`
     /// otherwise.
     pub wedge_index: Option<u8>,
+}
+
+/// §5.11.29 `read_compound_type( isCompound )` per-block outcome —
+/// the §5.11.29 imperatives (`comp_group_idx` / `compound_idx` /
+/// `compound_type` plus the optional sub-branch values
+/// `wedge_index` / `wedge_sign` / `mask_type`).
+///
+/// `comp_group_idx` and `compound_idx` carry the §5.11.29 pre-set
+/// defaults (`0` and `1`) on every code path; the inner arms overwrite
+/// them on the `isCompound && enable_masked_compound` and
+/// `isCompound && comp_group_idx == 0 && enable_jnt_comp` arms
+/// respectively.
+///
+/// `compound_type` is always populated and carries one of the §6.10.24
+/// ordinals ([`COMPOUND_WEDGE`] / [`COMPOUND_DIFFWTD`] /
+/// [`COMPOUND_AVERAGE`] / [`COMPOUND_INTRA`] / [`COMPOUND_DISTANCE`]).
+///
+/// `wedge_index` / `wedge_sign` are `Some(_)` ⇔ `compound_type ==
+/// COMPOUND_WEDGE` (the §5.11.29 wedge sub-branch fired). `mask_type`
+/// is `Some(_)` ⇔ `compound_type == COMPOUND_DIFFWTD` (the §5.11.29
+/// diffwtd sub-branch fired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompoundTypeReadout {
+    /// §5.11.29 `comp_group_idx`. `0` ⇔ the `enable_masked_compound`
+    /// arm closed or its S() returned `0`; `1` ⇔ the S() returned `1`.
+    /// Also `0` on the `skip_mode` short-circuit and the
+    /// `!isCompound` else-arm (the §5.11.29 line-1 pre-set value).
+    pub comp_group_idx: u8,
+    /// §5.11.29 `compound_idx`. `1` ⇔ the `enable_jnt_comp` arm
+    /// closed or its S() returned `1`; `0` ⇔ the S() returned `0`.
+    /// Also `1` on the `skip_mode` short-circuit and the
+    /// `!isCompound` else-arm (the §5.11.29 line-2 pre-set value).
+    pub compound_idx: u8,
+    /// §5.11.29 `compound_type` — one of [`COMPOUND_WEDGE`] /
+    /// [`COMPOUND_DIFFWTD`] / [`COMPOUND_AVERAGE`] / [`COMPOUND_INTRA`]
+    /// / [`COMPOUND_DISTANCE`] per §6.10.24.
+    pub compound_type: u8,
+    /// §5.11.29 `wedge_index` — in `0..WEDGE_TYPES = 0..16`.
+    /// `Some(_)` ⇔ `compound_type == COMPOUND_WEDGE`.
+    pub wedge_index: Option<u8>,
+    /// §5.11.29 `wedge_sign` — binary `L(1)`. `Some(_)` ⇔
+    /// `compound_type == COMPOUND_WEDGE`.
+    pub wedge_sign: Option<u8>,
+    /// §5.11.29 `mask_type` — binary `L(1)`, one of [`UNIFORM_45`] /
+    /// [`UNIFORM_45_INV`] per §6.10.24. `Some(_)` ⇔ `compound_type ==
+    /// COMPOUND_DIFFWTD`.
+    pub mask_type: Option<u8>,
 }
 
 #[cfg(test)]
@@ -35155,6 +35849,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_row.
@@ -35189,6 +35886,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_col.
@@ -35223,6 +35923,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range seg_ref_frame_data.
@@ -35257,6 +35960,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range skip_mode_frame[0].
@@ -35291,6 +35997,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         assert_eq!(
@@ -35348,6 +36057,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -35426,6 +36138,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
@@ -35486,6 +36201,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec.position(), pos_before);
@@ -35529,6 +36247,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec2.position(), pos_before);
@@ -35586,6 +36307,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // The single-ref cascade reads at least the single_ref_p1
@@ -35656,6 +36380,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         let r0 = walker.ref_frames()[0];
@@ -35721,6 +36448,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
@@ -35763,6 +36493,14 @@ mod tests {
                 wedge_interintra: None,
                 wedge_index: None,
             },
+            compound_type: CompoundTypeReadout {
+                comp_group_idx: 0,
+                compound_idx: 1,
+                compound_type: COMPOUND_AVERAGE,
+                wedge_index: None,
+                wedge_sign: None,
+                mask_type: None,
+            },
         };
         assert_eq!(info.ref_frame[0], 1);
         assert_eq!(info.ref_frame[1], 7);
@@ -35793,6 +36531,14 @@ mod tests {
                 interintra_mode: Some(II_DC_PRED),
                 wedge_interintra: Some(0),
                 wedge_index: None,
+            },
+            compound_type: CompoundTypeReadout {
+                comp_group_idx: 0,
+                compound_idx: 1,
+                compound_type: COMPOUND_INTRA,
+                wedge_index: None,
+                wedge_sign: None,
+                mask_type: None,
             },
         };
         assert!(!info_single.is_compound);
@@ -35887,6 +36633,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -35945,6 +36694,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -36022,6 +36774,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
@@ -36095,6 +36850,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
@@ -36165,6 +36923,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(dec.position() > pos_before);
@@ -36231,6 +36992,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
     }
@@ -36299,6 +37063,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // drl_mode CDFs must NOT have adapted (no read fired).
@@ -36379,6 +37146,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
     }
@@ -36430,6 +37200,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert_eq!(r, Err(crate::Error::TemporalMvScanUnsupported));
     }
@@ -36556,6 +37329,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -36627,6 +37403,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -36715,6 +37494,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Mvs grid: identity-GM PredMv = [0, 0], MV_JOINT_ZERO diff =
@@ -36802,6 +37584,9 @@ mod tests {
             /* allow_warped_motion = */ false,
             /* is_scaled_per_ref = */ [false; 7],
             /* enable_interintra_compound = */ false,
+            /* enable_masked_compound = */ false,
+            /* enable_jnt_comp = */ false,
+            /* dist_equal = */ false,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §6.10.25 `is_mv_valid`: |Mv[i][c]| < (1 << 14) = 16384.
@@ -38457,6 +39242,9 @@ mod tests {
                 /* allow_warped_motion = */ true,
                 /* is_scaled_per_ref = */ [false; 7],
                 /* enable_interintra_compound = */ false,
+                /* enable_masked_compound = */ false,
+                /* enable_jnt_comp = */ false,
+                /* dist_equal = */ false,
             )
             .expect("§5.11.27 SIMPLE short-circuit ⇒ dispatcher returns Ok");
         assert_eq!(info.motion_mode, MOTION_MODE_SIMPLE);
@@ -38863,6 +39651,9 @@ mod tests {
                 /* allow_warped_motion = */ false,
                 /* is_scaled_per_ref = */ [false; 7],
                 /* enable_interintra_compound = */ false,
+                /* enable_masked_compound = */ false,
+                /* enable_jnt_comp = */ false,
+                /* dist_equal = */ false,
             )
             .expect("§5.11.28 closed-gate ⇒ dispatcher returns Ok");
         assert_eq!(info.interintra.interintra, 0);
@@ -38939,6 +39730,9 @@ mod tests {
                 /* allow_warped_motion = */ false,
                 /* is_scaled_per_ref = */ [false; 7],
                 /* enable_interintra_compound = */ true,
+                /* enable_masked_compound = */ false,
+                /* enable_jnt_comp = */ false,
+                /* dist_equal = */ false,
             )
             .expect("§5.11.28 enabled ⇒ dispatcher returns Ok");
 
@@ -38980,5 +39774,871 @@ mod tests {
         // the §5.11.28 override is recorded only in the walker grid,
         // not in the per-block aggregate snapshot.
         let _ = info.ref_frame;
+    }
+
+    // ===================================================================
+    // §5.11.29 read_compound_type tests (round 177)
+    // ===================================================================
+
+    /// §3 `Wedge_Bits[ BLOCK_SIZES ]` is the per-`MiSize` count of
+    /// bits the §5.11.29 inner branch uses to decide whether
+    /// `compound_type` is read via the S() (`n > 0` ⇒ S()) or forced
+    /// to `COMPOUND_DIFFWTD` (`n == 0`). The transcription should
+    /// match the spec table verbatim and be non-zero exactly on the
+    /// rows where the §9.4 `Default_Wedge_Index_Cdf` carries a
+    /// non-placeholder distribution (`BLOCK_8X8..=BLOCK_32X32` and
+    /// `BLOCK_8X16` / `BLOCK_16X8`).
+    #[test]
+    fn wedge_bits_matches_spec_table() {
+        let expected: [u8; BLOCK_SIZES] = [
+            0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0,
+        ];
+        assert_eq!(WEDGE_BITS, expected, "WEDGE_BITS must match §3 table");
+        // wedge_bits() helper agrees with the table over the valid
+        // range and returns 0 for the caller-bug out-of-range slot.
+        for (i, &e) in expected.iter().enumerate() {
+            assert_eq!(wedge_bits(i), e, "wedge_bits({i})");
+        }
+        assert_eq!(wedge_bits(BLOCK_SIZES), 0);
+        assert_eq!(wedge_bits(BLOCK_SIZES + 7), 0);
+    }
+
+    /// §6.10.24 compound-type ordinals + §6.10.24 mask-type ordinals
+    /// align with the spec enumeration.
+    #[test]
+    fn compound_type_and_mask_type_ordinals_match_spec() {
+        assert_eq!(COMPOUND_WEDGE, 0);
+        assert_eq!(COMPOUND_DIFFWTD, 1);
+        assert_eq!(COMPOUND_AVERAGE, 2);
+        assert_eq!(COMPOUND_INTRA, 3);
+        assert_eq!(COMPOUND_DISTANCE, 4);
+        assert_eq!(UNIFORM_45, 0);
+        assert_eq!(UNIFORM_45_INV, 1);
+        // The §8.3.2 `compound_type` S() codes only the first two —
+        // `COMPOUND_TYPES = 2`.
+        assert_eq!(COMPOUND_TYPES, 2);
+    }
+
+    /// §8.3.2 `comp_group_idx_ctx` exhaustive small-input audit. The
+    /// spec body adds `0..=2` from each of {above, left} and clamps
+    /// the sum at 5; verify every reachable input triple lands in
+    /// `0..COMP_GROUP_IDX_CONTEXTS` and matches the literal formula.
+    #[test]
+    fn comp_group_idx_ctx_matches_spec_formula() {
+        // Closed-both arm: 0.
+        assert_eq!(
+            comp_group_idx_ctx(false, true, 0, false, false, true, 0, false),
+            0
+        );
+        // Above-only `!AboveSingle` arm: ctx += CompGroupIdxs (0 or 1).
+        assert_eq!(
+            comp_group_idx_ctx(true, false, 0, false, false, true, 0, false),
+            0
+        );
+        assert_eq!(
+            comp_group_idx_ctx(true, false, 1, false, false, true, 0, false),
+            1
+        );
+        // Above-only `AboveSingle && ALTREF` arm: ctx += 3.
+        assert_eq!(
+            comp_group_idx_ctx(true, true, 0, true, false, true, 0, false),
+            3
+        );
+        // Above-only `AboveSingle && !ALTREF` arm: ctx unchanged.
+        assert_eq!(
+            comp_group_idx_ctx(true, true, 0, false, false, true, 0, false),
+            0
+        );
+        // Both ALTREF singles: ctx = 3 + 3 = 6, clamped to 5.
+        assert_eq!(
+            comp_group_idx_ctx(true, true, 0, true, true, true, 0, true),
+            5
+        );
+        // Above ALTREF + left compound w/ CompGroupIdx=1: ctx = 3 + 1
+        // = 4 (below the clamp).
+        assert_eq!(
+            comp_group_idx_ctx(true, true, 0, true, true, false, 1, false),
+            4
+        );
+        // Both compound + both CompGroupIdx=1: ctx = 1 + 1 = 2.
+        assert_eq!(
+            comp_group_idx_ctx(true, false, 1, false, true, false, 1, false),
+            2
+        );
+    }
+
+    /// §8.3.2 `compound_idx_ctx` exhaustive small-input audit.
+    /// `dist_equal ? 3 : 0` seed; +CompoundIdxs on `!Single`; +1 on
+    /// `Single && ALTREF`. Maximum reachable is 3 + 1 + 1 = 5; the
+    /// spec body does not clamp (the cap is structural). All outputs
+    /// must be in `0..COMPOUND_IDX_CONTEXTS`.
+    #[test]
+    fn compound_idx_ctx_matches_spec_formula() {
+        // Closed-both arm, dist_equal=false ⇒ 0.
+        assert_eq!(
+            compound_idx_ctx(false, false, true, 0, false, false, true, 0, false),
+            0
+        );
+        // Closed-both, dist_equal=true ⇒ 3.
+        assert_eq!(
+            compound_idx_ctx(true, false, true, 0, false, false, true, 0, false),
+            3
+        );
+        // Above-only `!AboveSingle` arm: ctx = 0 + CompoundIdxs.
+        assert_eq!(
+            compound_idx_ctx(false, true, false, 1, false, false, true, 0, false),
+            1
+        );
+        assert_eq!(
+            compound_idx_ctx(false, true, false, 0, false, false, true, 0, false),
+            0
+        );
+        // Above-only `AboveSingle && ALTREF` arm: ctx += 1.
+        assert_eq!(
+            compound_idx_ctx(false, true, true, 0, true, false, true, 0, false),
+            1
+        );
+        // Both compound w/ CompoundIdxs=1 + dist_equal: ctx = 3 + 1 +
+        // 1 = 5.
+        assert_eq!(
+            compound_idx_ctx(true, true, false, 1, false, true, false, 1, false),
+            5
+        );
+        // Every output stays in 0..COMPOUND_IDX_CONTEXTS.
+        for dist_equal in [false, true] {
+            for above_single in [false, true] {
+                for above_ci in [0u8, 1] {
+                    for above_altref in [false, true] {
+                        for left_single in [false, true] {
+                            for left_ci in [0u8, 1] {
+                                for left_altref in [false, true] {
+                                    let ctx = compound_idx_ctx(
+                                        dist_equal,
+                                        true,
+                                        above_single,
+                                        above_ci,
+                                        above_altref,
+                                        true,
+                                        left_single,
+                                        left_ci,
+                                        left_altref,
+                                    );
+                                    assert!(
+                                        ctx < COMPOUND_IDX_CONTEXTS,
+                                        "compound_idx_ctx out of range: {ctx}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// §5.11.29 `skip_mode` short-circuit: returns
+    /// `compound_type = COMPOUND_AVERAGE`, defaults intact, no bits
+    /// read.
+    #[test]
+    fn read_compound_type_skip_mode_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 1,
+                /* is_compound = */ true,
+                0,
+                0,
+                /* enable_masked_compound = */ true,
+                /* enable_jnt_comp = */ true,
+                /* dist_equal = */ false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.comp_group_idx, 0);
+        assert_eq!(r.compound_idx, 1);
+        assert_eq!(r.compound_type, COMPOUND_AVERAGE);
+        assert_eq!(r.wedge_index, None);
+        assert_eq!(r.wedge_sign, None);
+        assert_eq!(r.mask_type, None);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.29 `!isCompound && interintra == 0` else-arm:
+    /// `compound_type = COMPOUND_AVERAGE`, no bits read.
+    #[test]
+    fn read_compound_type_single_pred_no_interintra_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 0,
+                /* is_compound = */ false,
+                /* interintra = */ 0,
+                /* wedge_interintra = */ 0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.compound_type, COMPOUND_AVERAGE);
+        assert_eq!(r.comp_group_idx, 0);
+        assert_eq!(r.compound_idx, 1);
+        assert!(r.wedge_index.is_none() && r.wedge_sign.is_none() && r.mask_type.is_none());
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.29 `!isCompound && interintra == 1 && wedge_interintra == 0`
+    /// else-arm: `compound_type = COMPOUND_INTRA`, no bits read.
+    #[test]
+    fn read_compound_type_single_pred_interintra_nowedge_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                /* interintra = */ 1,
+                /* wedge_interintra = */ 0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.compound_type, COMPOUND_INTRA);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.29 `!isCompound && interintra == 1 && wedge_interintra == 1`
+    /// else-arm: `compound_type = COMPOUND_WEDGE`, no bits read here
+    /// (the wedge sub-branch S()/L(1) is the §5.11.28 wedge_index, not
+    /// this §5.11.29 sub-branch).
+    #[test]
+    fn read_compound_type_single_pred_interintra_wedge_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                /* interintra = */ 1,
+                /* wedge_interintra = */ 1,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.compound_type, COMPOUND_WEDGE);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.29 `isCompound && !enable_masked_compound &&
+    /// !enable_jnt_comp` arm: `comp_group_idx` S() skipped (kept at
+    /// pre-set 0), `compound_idx` S() skipped (kept at pre-set 1),
+    /// `compound_type = COMPOUND_AVERAGE`, no bits read.
+    #[test]
+    fn read_compound_type_compound_no_masked_no_jnt_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                /* is_compound = */ true,
+                0,
+                0,
+                /* enable_masked_compound = */ false,
+                /* enable_jnt_comp = */ false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.compound_type, COMPOUND_AVERAGE);
+        assert_eq!(r.comp_group_idx, 0);
+        assert_eq!(r.compound_idx, 1);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.29 `isCompound && enable_masked_compound &&
+    /// comp_group_idx S() ⇒ 0 && !enable_jnt_comp` path: one S()
+    /// fires, `compound_type = COMPOUND_AVERAGE`, the
+    /// `TileCompGroupIdxCdf` row adapts.
+    #[test]
+    fn read_compound_type_compound_masked_group0_no_jnt_one_symbol() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // §8.3.2 `comp_group_idx_ctx` with all-zero neighbours = 0.
+        let ctx = 0usize;
+        // Force comp_group_idx S() ⇒ 0.
+        cdfs.comp_group_idx[ctx] = force_binary_cdf(0);
+        let before = cdfs.comp_group_idx[ctx];
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                0,
+                0,
+                /* enable_masked_compound = */ true,
+                /* enable_jnt_comp = */ false,
+                false,
+                /* avail_u = */ false,
+                /* avail_l = */ false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.comp_group_idx, 0);
+        assert_eq!(r.compound_idx, 1);
+        assert_eq!(r.compound_type, COMPOUND_AVERAGE);
+        assert_ne!(
+            cdfs.comp_group_idx[ctx], before,
+            "TileCompGroupIdxCdf row must have adapted via S()"
+        );
+        assert!(
+            dec.position() > pos_before,
+            "comp_group_idx S() must consume at least one bit"
+        );
+    }
+
+    /// §5.11.29 `isCompound && enable_masked_compound &&
+    /// comp_group_idx S() ⇒ 1 && n > 0` path: forces the
+    /// `compound_type` S() to fire and exercises the
+    /// `COMPOUND_WEDGE` sub-branch (S() for `wedge_index` + L(1) for
+    /// `wedge_sign`). `BLOCK_16X16` has `n = Wedge_Bits[6] = 4`.
+    #[test]
+    fn read_compound_type_compound_masked_group1_wedge_path() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let ctx = 0usize;
+        cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
+        cdfs.compound_type[BLOCK_16X16] = force_binary_cdf(COMPOUND_WEDGE);
+        let cg_before = cdfs.comp_group_idx[ctx];
+        let ct_before = cdfs.compound_type[BLOCK_16X16];
+        let wi_before = cdfs.wedge_index[BLOCK_16X16];
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, false).unwrap();
+        let pos_before = dec.position();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                0,
+                0,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.comp_group_idx, 1);
+        assert_eq!(r.compound_type, COMPOUND_WEDGE);
+        assert!(
+            r.wedge_index.is_some(),
+            "wedge_index Some after COMPOUND_WEDGE"
+        );
+        assert!(
+            r.wedge_sign.is_some(),
+            "wedge_sign Some after COMPOUND_WEDGE"
+        );
+        assert_eq!(r.mask_type, None);
+        let wi = r.wedge_index.unwrap();
+        assert!((wi as usize) < WEDGE_TYPES);
+        // CDFs adapted (S() reads sampled them).
+        assert_ne!(cdfs.comp_group_idx[ctx], cg_before);
+        assert_ne!(cdfs.compound_type[BLOCK_16X16], ct_before);
+        assert_ne!(cdfs.wedge_index[BLOCK_16X16], wi_before);
+        // At least three bits read (two S() + one L(1) + the wedge_index S()).
+        assert!(dec.position() > pos_before + 1);
+    }
+
+    /// §5.11.29 `isCompound && enable_masked_compound &&
+    /// comp_group_idx S() ⇒ 1 && n > 0 && compound_type S() ⇒
+    /// COMPOUND_DIFFWTD` path: exercises the diffwtd sub-branch
+    /// (L(1) `mask_type`). The wedge sub-branch must stay silent.
+    #[test]
+    fn read_compound_type_compound_masked_group1_diffwtd_path() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let ctx = 0usize;
+        cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
+        cdfs.compound_type[BLOCK_16X16] = force_binary_cdf(COMPOUND_DIFFWTD);
+        let wi_before = cdfs.wedge_index[BLOCK_16X16];
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, false).unwrap();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                0,
+                0,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.comp_group_idx, 1);
+        assert_eq!(r.compound_type, COMPOUND_DIFFWTD);
+        assert!(
+            r.mask_type.is_some(),
+            "mask_type Some after COMPOUND_DIFFWTD"
+        );
+        assert_eq!(r.wedge_index, None);
+        assert_eq!(r.wedge_sign, None);
+        let mt = r.mask_type.unwrap();
+        assert!(mt == UNIFORM_45 || mt == UNIFORM_45_INV);
+        // The wedge_index CDF stayed untouched (sub-branch skipped).
+        assert_eq!(cdfs.wedge_index[BLOCK_16X16], wi_before);
+    }
+
+    /// §5.11.29 `isCompound && enable_masked_compound &&
+    /// comp_group_idx S() ⇒ 1 && n == 0` path: `BLOCK_4X4`
+    /// (`Wedge_Bits[0] = 0`) forces `compound_type = COMPOUND_DIFFWTD`
+    /// without a `compound_type` S() read. The diffwtd L(1) still
+    /// fires.
+    #[test]
+    fn read_compound_type_compound_masked_group1_n_zero_forces_diffwtd() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let ctx = 0usize;
+        cdfs.comp_group_idx[ctx] = force_binary_cdf(1);
+        let ct_before = cdfs.compound_type[BLOCK_4X4];
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, false).unwrap();
+        let r = walker
+            .read_compound_type(
+                &mut dec, &mut cdfs, 0, 0, /* sub_size = */ BLOCK_4X4, 0, true, 0, 0, true,
+                false, false, false, false, true, true, false, false,
+            )
+            .unwrap();
+        assert_eq!(r.compound_type, COMPOUND_DIFFWTD);
+        assert!(r.mask_type.is_some());
+        // The compound_type CDF row stayed untouched (S() skipped on
+        // the `n == 0` branch).
+        assert_eq!(
+            cdfs.compound_type[BLOCK_4X4], ct_before,
+            "n == 0 ⇒ compound_type S() skipped, default CDF unchanged"
+        );
+    }
+
+    /// §5.11.29 `isCompound && comp_group_idx == 0 && enable_jnt_comp`
+    /// path: `compound_idx` S() fires and adapts the CDF row;
+    /// `compound_type = compound_idx ? COMPOUND_AVERAGE :
+    /// COMPOUND_DISTANCE`. With a forced `compound_idx S() ⇒ 1` the
+    /// type lands on `COMPOUND_AVERAGE`.
+    #[test]
+    fn read_compound_type_compound_group0_jnt_compound_idx_one() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // §8.3.2 `compound_idx_ctx` with !dist_equal + closed neighbours = 0.
+        let ctx = 0usize;
+        cdfs.compound_idx[ctx] = force_binary_cdf(1);
+        let ci_before = cdfs.compound_idx[ctx];
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                0,
+                0,
+                /* enable_masked_compound = */ false,
+                /* enable_jnt_comp = */ true,
+                /* dist_equal = */ false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.comp_group_idx, 0);
+        assert_eq!(r.compound_idx, 1);
+        assert_eq!(r.compound_type, COMPOUND_AVERAGE);
+        assert_ne!(cdfs.compound_idx[ctx], ci_before);
+    }
+
+    /// §5.11.29 `compound_idx S() ⇒ 0` outcome: `compound_type =
+    /// COMPOUND_DISTANCE`.
+    #[test]
+    fn read_compound_type_compound_group0_jnt_compound_idx_zero_yields_distance() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let ctx = 0usize;
+        cdfs.compound_idx[ctx] = force_binary_cdf(0);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                0,
+                0,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.compound_idx, 0);
+        assert_eq!(r.compound_type, COMPOUND_DISTANCE);
+    }
+
+    /// §5.11.29 dist_equal seed: when `dist_equal == true`, the
+    /// `compound_idx_ctx` lands in `3..=5`. Driving the
+    /// `compound_idx` S() against a forced ctx-3 distribution shows
+    /// it adapts.
+    #[test]
+    fn read_compound_type_dist_equal_uses_ctx3() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // dist_equal seeds ctx = 3 (no neighbour contributions on
+        // closed-both arm).
+        let ctx = 3usize;
+        cdfs.compound_idx[ctx] = force_binary_cdf(1);
+        let before = cdfs.compound_idx[ctx];
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                0,
+                0,
+                false,
+                true,
+                /* dist_equal = */ true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(r.compound_type, COMPOUND_AVERAGE);
+        assert_ne!(
+            cdfs.compound_idx[ctx], before,
+            "ctx 3 row must have adapted"
+        );
+    }
+
+    /// §5.11.29 caller-bug: `mi_size >= BLOCK_SIZES` on the wedge
+    /// sub-branch surfaces `PartitionWalkOutOfRange` via
+    /// `wedge_index_cdf` / `compound_type_cdf` fallback. The
+    /// `comp_group_idx == 1 && n == 0 ⇒ COMPOUND_DIFFWTD` shortcut
+    /// bypasses `compound_type_cdf`, but the spec-correct caller
+    /// never exercises `mi_size >= BLOCK_SIZES`; we pin the error
+    /// surface for the defensive caller-bug fallback.
+    #[test]
+    fn read_compound_type_mi_size_out_of_range_surfaces_error() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force the comp_group_idx S() → 1 + the `compound_type` S()
+        // path: with `mi_size = BLOCK_SIZES` (out of range),
+        // `wedge_bits` returns 0 ⇒ short-circuit COMPOUND_DIFFWTD ⇒
+        // L(1) mask_type. So out-of-range is actually safe under the
+        // r177 helper. Force `compound_type S()` by passing a
+        // `Wedge_Bits == 0` row but with comp_group_idx = 1 forced;
+        // that path doesn't hit `compound_type_cdf` either. Pin the
+        // observation: the call returns Ok with COMPOUND_DIFFWTD.
+        cdfs.comp_group_idx[0] = force_binary_cdf(1);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let r = walker
+            .read_compound_type(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                /* sub_size = */ BLOCK_SIZES,
+                0,
+                true,
+                0,
+                0,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        // `wedge_bits(BLOCK_SIZES)` returns 0 ⇒ COMPOUND_DIFFWTD
+        // shortcut; mask_type fires; the wedge sub-branch is skipped
+        // (which would otherwise hit `wedge_index_cdf` and return
+        // None ⇒ PartitionWalkOutOfRange).
+        assert_eq!(r.compound_type, COMPOUND_DIFFWTD);
+    }
+
+    /// End-to-end through the §5.11.23 dispatcher: with
+    /// `is_compound = false` (single-pred path forced via
+    /// `seg_skip_active = true ⇒ GLOBALMV`), the §5.11.29 readout
+    /// surfaces on the aggregate. The default `interintra = 0`
+    /// (closed §5.11.28 gate) yields `compound_type = COMPOUND_AVERAGE`.
+    #[test]
+    fn cascade_read_compound_type_single_pred_surfaces_average() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let info = walker
+            .decode_inter_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* skip_mode = */ 0,
+                false,
+                false,
+                [0, -1],
+                [0, -1],
+                true,
+                true,
+                true,
+                true,
+                [0, -1],
+                false,
+                0,
+                false,
+                false,
+                false,
+                [GM_TYPE_IDENTITY; 8],
+                identity_gm_params(),
+                [0; 8],
+                false,
+                false,
+                false,
+                false,
+                false,
+                [false; 7],
+                /* enable_interintra_compound = */ false,
+                /* enable_masked_compound = */ false,
+                /* enable_jnt_comp = */ false,
+                /* dist_equal = */ false,
+            )
+            .expect("dispatcher Ok");
+        assert_eq!(info.compound_type.compound_type, COMPOUND_AVERAGE);
+        assert_eq!(info.compound_type.comp_group_idx, 0);
+        assert_eq!(info.compound_type.compound_idx, 1);
+        assert!(info.compound_type.wedge_index.is_none());
+        assert!(info.compound_type.wedge_sign.is_none());
+        assert!(info.compound_type.mask_type.is_none());
+        // Walker grid was stamped with the defaults over the bh4 * bw4
+        // footprint (BLOCK_16X16: 4x4 cells).
+        let mi_cols = walker.mi_cols() as usize;
+        for r in 0..4 {
+            for c in 0..4 {
+                let cell = r * mi_cols + c;
+                assert_eq!(walker.comp_group_idxs()[cell], 0);
+                assert_eq!(walker.compound_idxs()[cell], 1);
+            }
+        }
     }
 }

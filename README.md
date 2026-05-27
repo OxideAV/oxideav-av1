@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 175)
+## Status — 2026-05-28 (round 177)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1484,6 +1484,101 @@ use_obmc untouched; the `is_scaled = true` routing forcing the
 showing `skip_mode = 1` surfacing
 `Ok(DecodedInterBlockModeInfo { motion_mode: SIMPLE, .. })`. Test
 count: 672 → 691 (+19). `decode_av1` / `encode_av1` still return
+`Error::NotImplemented`.
+
+Round 177 lands the **§5.11.29 `read_compound_type` reader** —
+wiring the inter-inter compound-blending controls into the §5.11.23
+inter cascade. The §5.11.23 dispatcher now runs the full §5.11.23
+body through line 36 (`read_compound_type( isCompound )`); the
+§5.11.18 dispatcher continues to surface `InterBlockModeInfoUnsupported`
+for the still-pending `read_interpolation_filter` post-cascade.
+
+The §5.11.29 body composes five paths: (1) the `skip_mode == 1`
+short-circuit (`compound_type = COMPOUND_AVERAGE`, defaults
+`comp_group_idx = 0` / `compound_idx = 1`, no bits); (2) the
+`!isCompound` else-arm (the §5.11.28 outcome alone selects the type
+— `interintra && wedge_interintra ? COMPOUND_WEDGE : COMPOUND_INTRA`
+or `COMPOUND_AVERAGE`, no bits); (3) the `isCompound &&
+enable_masked_compound` arm (`comp_group_idx` S() against
+`TileCompGroupIdxCdf[ ctx ]` with ctx from the §8.3.2 paragraph
+combining `CompGroupIdxs` neighbour values, `AvailU` / `AvailL`,
+`AboveSingle` / `LeftSingle`, and the `AboveRefFrame[0] / LeftRefFrame[0]
+== ALTREF_FRAME` tests, clamped at `Min(5, ctx)`); (4) the
+`comp_group_idx == 0 && enable_jnt_comp` sub-arm (`compound_idx` S()
+against `TileCompoundIdxCdf[ ctx ]` with ctx seeded by `dist_equal
+? 3 : 0` and incremented by the same neighbour walk, then
+`compound_type = compound_idx ? COMPOUND_AVERAGE : COMPOUND_DISTANCE`);
+(5) the `comp_group_idx == 1` sub-arm (`n = Wedge_Bits[ MiSize ];
+n == 0 ? COMPOUND_DIFFWTD : compound_type S() against
+TileCompoundTypeCdf[ MiSize ]`). The wedge sub-branch reads
+`wedge_index` S() against `TileWedgeIndexCdf[ MiSize ]` (the
+16-symbol element shared with the §5.11.28 inter-intra wedge arm)
+plus `wedge_sign` L(1); the diffwtd sub-branch reads `mask_type`
+L(1) selecting `UNIFORM_45` (0) or `UNIFORM_45_INV` (1) per §6.10.24.
+
+The walker grows two grids — `CompGroupIdxs[r][c]` (pre-fill `0`)
+and `CompoundIdxs[r][c]` (pre-fill `1`, matching the §5.11.29
+default initialiser) — stamped over the bh4 * bw4 footprint on
+every block decode so the next block's §8.3.2 ctx walks observe the
+values. `comp_group_idxs()` / `compound_idxs()` accessors surface
+both grids for tests / external consumers.
+
+New §3 `WEDGE_BITS` table (`[u8; BLOCK_SIZES]`, av1-spec p.470
+verbatim — non-zero only on the `BLOCK_8X8..=BLOCK_32X32` band plus
+the `BLOCK_8X16` / `BLOCK_16X8` 2:1 rectangles, matching the §9.4
+`Default_Wedge_Index_Cdf` non-placeholder rows) + `wedge_bits()`
+accessor. New §6.10.24 named constants land: `COMPOUND_WEDGE = 0`,
+`COMPOUND_DIFFWTD = 1`, `COMPOUND_AVERAGE = 2`, `COMPOUND_INTRA = 3`,
+`COMPOUND_DISTANCE = 4` (the spec note clarifies the last three are
+inferred from other syntax elements rather than coded directly via
+the §8.3.2 `compound_type` S()); plus the two `mask_type` ordinals
+`UNIFORM_45` / `UNIFORM_45_INV`. New §8.3.2 ctx helpers
+`comp_group_idx_ctx` / `compound_idx_ctx` accept the neighbour scalar
+inputs (closed forms covered by exhaustive small-input audits).
+
+New `CompoundTypeReadout` aggregate carries `comp_group_idx` (u8) +
+`compound_idx` (u8) + `compound_type` (u8) plus three `Option<u8>`
+companions (`wedge_index` / `wedge_sign` Some on `COMPOUND_WEDGE`;
+`mask_type` Some on `COMPOUND_DIFFWTD`). `DecodedInterBlockModeInfo`
+gains a `compound_type: CompoundTypeReadout` field.
+`decode_inter_block_mode_info` and `decode_inter_frame_mode_info`
+gain three new caller-supplied scalars: `enable_masked_compound: bool`
+(§5.5.2 sequence-header bit), `enable_jnt_comp: bool` (§5.5.2),
+and `dist_equal: bool` (the `Abs(get_relative_dist(OrderHints[
+RefFrame[0]], OrderHint)) == Abs(get_relative_dist(OrderHints[
+RefFrame[1]], OrderHint))` outcome the caller computes from
+frame-header state).
+
+18 new unit tests cover: the `WEDGE_BITS` table verbatim cross-check
++ `wedge_bits()` helper out-of-range fallback; the §6.10.24
+ordinal identities (compound-type + mask-type); the §8.3.2
+`comp_group_idx_ctx` formula across every closed-form arm (closed-
+both, above-only !Single, above-only Single+ALTREF, both-singles
+ALTREF clamp at 5, mixed arms); the §8.3.2 `compound_idx_ctx`
+formula across the dist_equal seed + every neighbour arm + a
+2^7 = 128-trial exhaustive bound-check; six per-arm reader tests
+exercising the `skip_mode` short-circuit (no bits), the three
+`!isCompound` else-arms (`interintra=0`, `interintra=1 +
+wedge_interintra=0`, `interintra=1 + wedge_interintra=1`, no bits
+each), the `isCompound && !enable_masked_compound && !enable_jnt_comp`
+no-bits arm, the `enable_masked_compound + comp_group_idx S()⇒0 +
+!enable_jnt_comp` one-symbol arm (witnessed by CDF row adaptation),
+the wedge-sub-branch path (forced `comp_group_idx⇒1` +
+`compound_type⇒COMPOUND_WEDGE`; checks `wedge_index` + `wedge_sign`
+both Some + the wedge_index row CDF adaptation), the
+diffwtd-sub-branch path (forced `comp_group_idx⇒1` +
+`compound_type⇒COMPOUND_DIFFWTD`; checks `mask_type` Some + the
+wedge_index row stayed untouched), the `n == 0 ⇒ COMPOUND_DIFFWTD`
+shortcut on `BLOCK_4X4` (no `compound_type` S() read; CDF row
+unchanged), the `compound_idx S()⇒1 ⇒ COMPOUND_AVERAGE` and
+`compound_idx S()⇒0 ⇒ COMPOUND_DISTANCE` arms, the `dist_equal=true`
+ctx-3 seed witness, the `mi_size = BLOCK_SIZES` caller-bug defensive
+fallback (collapses to the `wedge_bits == 0` shortcut without
+hitting `wedge_index_cdf`); and an end-to-end §5.11.23 cascade test
+through the dispatcher witnessing the `CompoundTypeReadout` on the
+single-pred + closed-§5.11.28-gate path with the walker
+`comp_group_idxs` / `compound_idxs` grids stamped. Test count: 703
+→ 721 (+18). `decode_av1` / `encode_av1` still return
 `Error::NotImplemented`.
 
 Round 176 lands the **§5.11.28 `read_interintra_mode` reader** —
