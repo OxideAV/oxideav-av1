@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 172)
+## Status — 2026-05-27 (round 173)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,84 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 173 lands the **§5.11.23 post-find_mv_stack reader cascade** —
+wiring `find_mv_stack` into the `decode_inter_block_mode_info`
+dispatcher so the inter arm of §5.11.18 runs end-to-end through every
+bit-consuming leaf in §5.11.23 lines 1-32. The §5.11.23
+`Error::FindMvStackUnsupported` stub is lifted; the reader now
+short-circuits one step later at the new
+`Error::AssignMvUnsupported` (§5.11.31 `assign_mv` is the next-arc
+target — its body composes `read_mv` / `read_mv_component` which is
+the large §5.11.32 syntax tree).
+
+The cascade implements the four-arm YMode dispatch in spec order
+(av1-spec p.74). Arm 1 (`skip_mode == 1`) forces
+`YMode = NEAREST_NEARESTMV` with no S() read. Arm 2
+(`seg_feature_active(SEG_LVL_SKIP|GLOBALMV)`) forces `YMode =
+GLOBALMV` with no S() read. Arm 3 (compound, `RefFrame[1] >
+INTRA_FRAME`) reads one `S()` against `TileCompoundModeCdf[ctx]`
+where `ctx = Compound_Mode_Ctx_Map[RefMvContext >> 1][Min(NewMvContext,
+COMP_NEWMV_CTXS - 1)]` per §8.3.2, then `YMode = NEAREST_NEARESTMV +
+compound_mode`. Arm 4 (single-pred fall-through) walks the
+`new_mv` ⇒ `zero_mv` ⇒ `ref_mv` ladder: each is one S() against the
+matching `TileNewMvCdf[NewMvContext]` / `TileZeroMvCdf[ZeroMvContext]` /
+`TileRefMvCdf[RefMvContext]` row from §7.10.2.14, terminating in one
+of NEWMV / GLOBALMV / NEARESTMV / NEARMV.
+
+The §5.11.23 RefMvIdx + drl_mode loops then run (av1-spec p.74-75).
+On `YMode ∈ {NEWMV, NEW_NEWMV}` the loop iterates `idx = 0, 1`; on
+`has_nearmv(YMode)` true (= one of NEARMV / NEAR_NEARMV / NEAR_NEWMV /
+NEW_NEARMV) the loop seeds `RefMvIdx = 1` and iterates `idx = 1, 2`.
+Each iteration is gated on `NumMvFound > idx + 1`; when fired it
+reads one `S()` against `TileDrlModeCdf[DrlCtxStack[idx]]`, breaking
+to `RefMvIdx = idx` on symbol 0 or continuing with `RefMvIdx = idx +
+1` on symbol 1. On fresh-walker / `NumMvFound = 0` paths the loop
+runs zero iterations and `RefMvIdx = 0`.
+
+The §7.10 `find_mv_stack` call is wired in directly via the r172
+spatial-only entry. Six new caller scalars are threaded through:
+`gm_type[8]` / `gm_params[8][6]` (§7.10.2.1 setup-global-mv),
+`ref_frame_sign_bias[8]` (§7.10.2.13 extra-MV negation arm),
+`allow_high_precision_mv` / `force_integer_mv` (§7.10.2.10 lower-
+precision LSB strip vs 3-bit integer round), and `use_ref_frame_mvs`
+(the §7.10.2.5 temporal-scan deferral — when true, the reader
+surfaces `Error::TemporalMvScanUnsupported` without partial state
+mutation). The §5.11.18 `decode_inter_frame_mode_info` dispatcher
+threads the same six scalars to keep the §5.11.18 → §5.11.23 call
+chain end-to-end.
+
+`DecodedInterBlockModeInfo` gains six new fields surfaced for caller
+verification: `y_mode` (one of `MODE_NEARESTMV..=MODE_NEW_NEWMV =
+14..=25`); `ref_mv_idx` (in `0..=2`); and the §7.10.2 stack-summary
+snapshot — `num_mv_found`, `new_mv_context`, `ref_mv_context`,
+`zero_mv_context`. These are observable only when the dispatcher
+returns `Ok`; the r173 method always returns `Err`
+(`AssignMvUnsupported`) since the §5.11.31 body is not yet wired —
+direct callers can inspect the stamped walker grids
+(`ref_frames()` / `is_inters()`) for the conformant prologue state
+that committed before the stub fired.
+
+New `has_nearmv(mode)` predicate (av1-spec p.75) returns true for
+NEARMV / NEAR_NEARMV / NEAR_NEWMV / NEW_NEARMV (the four NEARMV-
+bearing inter Y modes). Joins the existing `has_newmv` predicate
+that already covers the six NEWMV-bearing modes.
+
+10 new unit tests cover: Arm 1 `skip_mode = 1` yielding NEAREST_NEARESTMV
+with zero bits consumed past §5.11.25; Arm 2 `seg_skip_active`
+yielding GLOBALMV with zero bits consumed; Arm 3 compound case with
+rigged `comp_mode` / `comp_ref_type` / `uni_comp_ref` cascade
+producing `RefFrame = [BWDREF, ALTREF]` and the `compound_mode` S()
+consuming bits; Arm 4 single-pred three terminal outcomes
+(`new_mv = 0` ⇒ NEWMV; `new_mv = 1, zero_mv = 0` ⇒ GLOBALMV;
+`new_mv = 1, zero_mv = 1, ref_mv = 0` ⇒ NEARESTMV); drl_mode loop
+short-circuit on `NumMvFound = 0` (CDF counter stays 0 ⇒ no read
+fired); `has_nearmv` truth table over the entire inter Y-mode
+enumeration; caller-bug guards unchanged with the new r173 args;
+and the `use_ref_frame_mvs == true` arm surfacing
+`TemporalMvScanUnsupported` ahead of the cascade. Test count: 651 →
+661 (+10). `decode_av1` / `encode_av1` still return
+`Error::NotImplemented`.
 
 Round 172 lands the **§7.10 `find_mv_stack` spatial-only path** —
 the motion-vector-stack derivation reached from the §5.11.23

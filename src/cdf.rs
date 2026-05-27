@@ -14885,6 +14885,22 @@ impl PartitionWalker {
         seg_skip_active: bool,
         seg_ref_frame_data: i32,
         reference_select: bool,
+        // r173 §7.10 caller-supplied frame-header scalars threaded
+        // through to [`Self::find_mv_stack`] via
+        // [`Self::decode_inter_block_mode_info`]. The intra arm
+        // ignores these; the inter arm consumes them when the
+        // §5.11.23 dispatcher invokes `find_mv_stack`. Pass the
+        // §5.9.24 identity-default `gm_params` (`gm_params[ref][2] =
+        // gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`, other
+        // slots = 0) + `[GM_TYPE_IDENTITY; 8]` + `[0; 8]` /
+        // `false / false / false` for callers that never run the
+        // inter arm.
+        gm_type: [i32; 8],
+        gm_params: [[i32; 6]; 8],
+        ref_frame_sign_bias: [i32; 8],
+        allow_high_precision_mv: bool,
+        force_integer_mv: bool,
+        use_ref_frame_mvs: bool,
     ) -> Result<DecodedInterFrameModeInfo, crate::Error> {
         if sub_size >= BLOCK_SIZES {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -15168,18 +15184,17 @@ impl PartitionWalker {
         };
         let _ = info;
         if is_inter != 0 {
-            // r170: §5.11.23 prologue + §5.11.25 read_ref_frames now
-            // runs to completion; the post-prologue body is the
-            // [`crate::Error::FindMvStackUnsupported`] subsequent-arc
-            // target. The §5.11.25 reads commit to the bitstream + the
-            // walker `RefFrames[][][..]` stamp commits before the stub
-            // fires (callers verifying the §5.11.25 state read
-            // [`Self::ref_frames`]).
-            // The §5.11.23 reader is r170-scoped to always return
-            // `Err` (the post-`read_ref_frames` body is a subsequent
-            // arc); when it eventually grows an `Ok` path the
-            // dispatcher will need to lift the `DecodedInterBlockModeInfo`
-            // fields into the returned aggregate.
+            // r173: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
+            // §7.10 `find_mv_stack` (spatial-only path) + the §5.11.23
+            // YMode dispatch + per-mode RefMvIdx / drl_mode loops all
+            // run to completion; the §5.11.31 `assign_mv` call is the
+            // post-cascade gap surfaced as
+            // [`crate::Error::AssignMvUnsupported`].
+            //
+            // The inner method always returns `Err` on r173; once
+            // `assign_mv` + downstream readers land the dispatcher will
+            // need to lift the `DecodedInterBlockModeInfo` aggregate
+            // fields into the returned [`DecodedInterFrameModeInfo`].
             match self.decode_inter_block_mode_info(
                 decoder,
                 cdfs,
@@ -15201,12 +15216,19 @@ impl PartitionWalker {
                 seg_skip_active,
                 seg_globalmv_active,
                 reference_select,
+                gm_type,
+                gm_params,
+                ref_frame_sign_bias,
+                allow_high_precision_mv,
+                force_integer_mv,
+                use_ref_frame_mvs,
             ) {
                 Ok(_inter_info) => {
-                    // Unreachable on the r170 scope (the inner method
-                    // always returns Err). Once §7.10 lands, expand
-                    // [`DecodedInterFrameModeInfo`] to carry the
-                    // inter-arm fields and route here.
+                    // Unreachable on r173 scope (inner method always
+                    // returns Err). Once §5.11.31 / §5.11.32 land,
+                    // expand [`DecodedInterFrameModeInfo`] to carry the
+                    // inter-arm aggregate and route the Ok values
+                    // here.
                     Err(crate::Error::InterBlockModeInfoUnsupported)
                 }
                 Err(e) => Err(e),
@@ -15988,6 +16010,14 @@ impl PartitionWalker {
         seg_skip_active: bool,
         seg_globalmv_active: bool,
         reference_select: bool,
+        // r173 §7.10 caller-supplied frame-header scalars (see
+        // [`Self::find_mv_stack`]).
+        gm_type: [i32; 8],
+        gm_params: [[i32; 6]; 8],
+        ref_frame_sign_bias: [i32; 8],
+        allow_high_precision_mv: bool,
+        force_integer_mv: bool,
+        use_ref_frame_mvs: bool,
     ) -> Result<DecodedInterBlockModeInfo, crate::Error> {
         // §5.11.23 caller-bug guards. Each inner method re-checks its
         // own bounds, but failing fast at the dispatcher keeps the
@@ -16067,23 +16097,159 @@ impl PartitionWalker {
         }
 
         // §5.11.23 line 5: `find_mv_stack( isCompound )` per §7.10.2.
-        // The MV-stack derivation + every §5.11.23 reader that
-        // depends on its outputs (`compound_mode` / `new_mv` /
-        // `zero_mv` / `ref_mv` / `drl_mode` / `assign_mv` /
-        // `read_motion_mode` / `read_interintra_mode` /
-        // `read_compound_type` / `read_interpolation_filter`) are
-        // subsequent-arc targets. Surface the aggregate first so
-        // callers verifying the §5.11.25 / §5.11.23 prologue state
-        // observe the decoded `RefFrame[..]` + `isCompound` even
-        // though the post-prologue body is not yet implemented.
+        // r173: spatial-only path is wired in (the §7.10.2.5 temporal-
+        // scan deferral surfaces as [`crate::Error::TemporalMvScanUnsupported`]
+        // when `use_ref_frame_mvs == true`; the post-find_mv_stack
+        // §5.11.23 cascade below is the r173 increment).
+        let mv_stack = self.find_mv_stack(
+            mi_row,
+            mi_col,
+            sub_size,
+            ref_frame,
+            is_compound,
+            use_ref_frame_mvs,
+            gm_type,
+            gm_params,
+            ref_frame_sign_bias,
+            allow_high_precision_mv,
+            force_integer_mv,
+        )?;
+
+        // §5.11.23 lines 6-18: YMode dispatch (av1-spec p.74). Four
+        // arms in spec order — the first match fires; no bit is read
+        // on the short-circuit arms.
+        //
+        // The §5.11.23 spec body's segmentation conditions
+        // (`seg_feature_active(SEG_LVL_SKIP|GLOBALMV)`) are caller-
+        // supplied via `seg_skip_active` / `seg_globalmv_active`
+        // (matching the §5.11.20 read_is_inter convention).
+        let y_mode: u8 = if skip_mode != 0 {
+            // Arm 1: skip_mode = 1 ⇒ NEAREST_NEARESTMV (no S()).
+            MODE_NEAREST_NEARESTMV
+        } else if seg_skip_active || seg_globalmv_active {
+            // Arm 2: SEG_LVL_SKIP / SEG_LVL_GLOBALMV ⇒ GLOBALMV
+            // (no S()).
+            MODE_GLOBALMV
+        } else if is_compound {
+            // Arm 3: compound ⇒ `compound_mode` S() against
+            // `TileCompoundModeCdf[ ctx ]`, then
+            // `YMode = NEAREST_NEARESTMV + compound_mode`.
+            //
+            // §8.3.2 `compound_mode` ctx (av1-spec p.378): see
+            // [`compound_mode_ctx`].
+            let cm_ctx = compound_mode_ctx(
+                mv_stack.ref_mv_context as usize,
+                mv_stack.new_mv_context as usize,
+            );
+            let row = cdfs.compound_mode_cdf(cm_ctx);
+            let cm = decoder.read_symbol(row)? as u8;
+            debug_assert!(
+                (cm as usize) < COMPOUND_MODES,
+                "S() over TileCompoundModeCdf yields 0..COMPOUND_MODES"
+            );
+            MODE_NEAREST_NEARESTMV + cm
+        } else {
+            // Arm 4: single-pred ⇒ NEWMV / GLOBALMV / NEARESTMV /
+            // NEARMV cascade. Three S() reads gated on the binary
+            // outcomes of `new_mv` / `zero_mv` / `ref_mv`.
+            let new_mv_row = cdfs.new_mv_cdf(mv_stack.new_mv_context as usize);
+            let new_mv = decoder.read_symbol(new_mv_row)? as u8;
+            debug_assert!(new_mv <= 1, "S() over TileNewMvCdf yields 0 or 1");
+            if new_mv == 0 {
+                MODE_NEWMV
+            } else {
+                let zero_mv_row = cdfs.zero_mv_cdf(mv_stack.zero_mv_context as usize);
+                let zero_mv = decoder.read_symbol(zero_mv_row)? as u8;
+                debug_assert!(zero_mv <= 1, "S() over TileZeroMvCdf yields 0 or 1");
+                if zero_mv == 0 {
+                    MODE_GLOBALMV
+                } else {
+                    let ref_mv_row = cdfs.ref_mv_cdf(mv_stack.ref_mv_context as usize);
+                    let ref_mv = decoder.read_symbol(ref_mv_row)? as u8;
+                    debug_assert!(ref_mv <= 1, "S() over TileRefMvCdf yields 0 or 1");
+                    if ref_mv == 0 {
+                        MODE_NEARESTMV
+                    } else {
+                        MODE_NEARMV
+                    }
+                }
+            }
+        };
+
+        // §5.11.23 lines 19-32: `RefMvIdx = 0`; per-mode drl_mode
+        // loops. Two outer arms — `YMode == NEWMV || YMode ==
+        // NEW_NEWMV` (av1-spec p.74) and the `has_nearmv( )` arm
+        // (av1-spec p.74-75 `has_nearmv` helper). On each iteration the
+        // §8.3.2 `drl_mode` selection is `TileDrlModeCdf[ DrlCtxStack[
+        // idx ] ]` (the §7.10.2.14 per-position context).
+        let mut ref_mv_idx: u32 = 0;
+        if y_mode == MODE_NEWMV || y_mode == MODE_NEW_NEWMV {
+            // Spec body:
+            //   for ( idx = 0; idx < 2; idx++ )
+            //     if ( NumMvFound > idx + 1 ) {
+            //       drl_mode S()
+            //       if ( drl_mode == 0 ) { RefMvIdx = idx; break }
+            //       RefMvIdx = idx + 1
+            //     }
+            for idx in 0u32..2 {
+                if mv_stack.num_mv_found > idx + 1 {
+                    let drl_ctx = mv_stack.drl_ctx_stack[idx as usize] as usize;
+                    let row = cdfs.drl_mode_cdf(drl_ctx);
+                    let drl = decoder.read_symbol(row)? as u8;
+                    debug_assert!(drl <= 1, "S() over TileDrlModeCdf yields 0 or 1");
+                    if drl == 0 {
+                        ref_mv_idx = idx;
+                        break;
+                    }
+                    ref_mv_idx = idx + 1;
+                }
+            }
+        } else if has_nearmv(y_mode) {
+            // Spec body:
+            //   RefMvIdx = 1
+            //   for ( idx = 1; idx < 3; idx++ )
+            //     if ( NumMvFound > idx + 1 ) {
+            //       drl_mode S()
+            //       if ( drl_mode == 0 ) { RefMvIdx = idx; break }
+            //       RefMvIdx = idx + 1
+            //     }
+            ref_mv_idx = 1;
+            for idx in 1u32..3 {
+                if mv_stack.num_mv_found > idx + 1 {
+                    let drl_ctx = mv_stack.drl_ctx_stack[idx as usize] as usize;
+                    let row = cdfs.drl_mode_cdf(drl_ctx);
+                    let drl = decoder.read_symbol(row)? as u8;
+                    debug_assert!(drl <= 1, "S() over TileDrlModeCdf yields 0 or 1");
+                    if drl == 0 {
+                        ref_mv_idx = idx;
+                        break;
+                    }
+                    ref_mv_idx = idx + 1;
+                }
+            }
+        }
+
+        // §5.11.23 line 33: `assign_mv( isCompound )` per §5.11.31.
+        // The §5.11.31 `read_mv` / §5.11.32 `read_mv_component` syntax
+        // tree (mv_joint S(), mv_sign / mv_class / mv_class0_*
+        // cascade, mv_bit loop) is the next-arc target — surface the
+        // §5.11.23 prologue + YMode + RefMvIdx + the full §7.10.2
+        // aggregate so callers verifying the cascade observe the
+        // decoded state before the stub fires.
         let _info = DecodedInterBlockModeInfo {
             mi_row,
             mi_col,
             mi_size: sub_size,
             ref_frame,
             is_compound,
+            y_mode,
+            ref_mv_idx,
+            num_mv_found: mv_stack.num_mv_found,
+            new_mv_context: mv_stack.new_mv_context,
+            ref_mv_context: mv_stack.ref_mv_context,
+            zero_mv_context: mv_stack.zero_mv_context,
         };
-        Err(crate::Error::FindMvStackUnsupported)
+        Err(crate::Error::AssignMvUnsupported)
     }
 
     /// `read_ref_frames()` per §5.11.25 (av1-spec p.76) — the
@@ -19067,6 +19233,30 @@ fn has_newmv(mode: u8) -> bool {
     )
 }
 
+/// `has_nearmv()` per §5.11.23 (av1-spec p.75 — the helper definition
+/// immediately following the `inter_block_mode_info` body). Returns
+/// whether `mode` is one of the four NEARMV-bearing inter Y modes —
+/// the ones whose §5.11.23 RefMvIdx loop iterates from `idx = 1` to
+/// `idx < 3` (i.e. the `idx ∈ {1, 2}` window where the §7.10.2 stack
+/// already has slot 0 = NEAREST and slot 1+2 are NEAR-class
+/// candidates).
+///
+/// Spec body:
+///
+/// ```text
+///   has_nearmv( ) {
+///       return (YMode == NEARMV || YMode == NEAR_NEARMV
+///               || YMode == NEAR_NEWMV || YMode == NEW_NEARMV)
+///   }
+/// ```
+#[inline]
+fn has_nearmv(mode: u8) -> bool {
+    matches!(
+        mode,
+        MODE_NEARMV | MODE_NEAR_NEARMV | MODE_NEAR_NEWMV | MODE_NEW_NEARMV
+    )
+}
+
 /// §7.10.2.11 sorting process. Stable modified-bubble-sort: descending
 /// by `WeightStack[]`, with the `swap_stack` swap copying both
 /// `WeightStack` and `RefStackMv[idx][list][comp]` for `list = 0..1 +
@@ -19745,15 +19935,11 @@ pub struct DecodedIntraBlockModeInfo {
 }
 
 /// §5.11.23 per-block aggregate surfaced by
-/// [`PartitionWalker::decode_inter_block_mode_info`] in its r170 scope.
-/// Carries the §5.11.23 prologue results — the §5.11.25 decoded
-/// `RefFrame[ 0..2 ]` and the derived `isCompound`. Subsequent arcs
-/// will extend the struct as the §7.10 MV-stack derivation +
-/// post-prologue readers land; the r170 method always returns
-/// [`crate::Error::FindMvStackUnsupported`] after stamping the
-/// `RefFrames[][][..]` grid, so this aggregate is currently observable
-/// only through direct inspection of the walker grid (no `Ok`-path
-/// returns yet).
+/// [`PartitionWalker::decode_inter_block_mode_info`]. Carries the
+/// §5.11.23 prologue + §7.10.2 stack-summary + YMode + RefMvIdx
+/// outcomes; observable only on the `Ok` path, which currently
+/// short-circuits at [`crate::Error::AssignMvUnsupported`] (§5.11.31
+/// `assign_mv` is the next-arc target).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedInterBlockModeInfo {
     /// §5.11.23 caller-passed mi-unit row of the block.
@@ -19780,12 +19966,55 @@ pub struct DecodedInterBlockModeInfo {
     /// produce slot-1-INTRA so the latter case is unreachable on this
     /// path).
     pub is_compound: bool,
+    /// §5.11.23 YMode after the four-arm dispatch (av1-spec p.74). In
+    /// `MODE_NEARESTMV..=MODE_NEW_NEWMV = 14..=25`. The §5.11.23 spec
+    /// body resolves YMode to one of the inter Y-mode ordinals from
+    /// §6.10.22 — see [`MODE_NEAREST_NEARESTMV`] etc.
+    pub y_mode: u8,
+    /// §5.11.23 `RefMvIdx` after the per-mode drl_mode loops. In
+    /// `0..=2` (§7.10.2 caps `NumMvFound` at `MAX_REF_MV_STACK_SIZE =
+    /// 8`; the §5.11.23 drl_mode loops cap idx at `2`). On the
+    /// short-circuit YMode arms (NEAREST_NEARESTMV / GLOBALMV /
+    /// NEARMV / NEARESTMV / GLOBAL_GLOBALMV / NEAREST_NEWMV /
+    /// NEW_NEARESTMV) the loops do not run and `ref_mv_idx = 0`.
+    pub ref_mv_idx: u32,
+    /// §7.10.2 `NumMvFound` snapshot at the point the §5.11.23
+    /// post-find_mv_stack cascade fires. In `0..=MAX_REF_MV_STACK_SIZE
+    /// = 0..=8`.
+    pub num_mv_found: u32,
+    /// §7.10.2.14 `NewMvContext` snapshot consumed by the §5.11.23
+    /// `new_mv` selection (Arm 4). In `0..NEW_MV_CONTEXTS = 0..6`.
+    pub new_mv_context: u32,
+    /// §7.10.2.14 `RefMvContext` snapshot consumed by the §5.11.23
+    /// `ref_mv` selection (Arm 4) AND by [`compound_mode_ctx`] (Arm 3).
+    /// In `0..REF_MV_CONTEXTS = 0..6`.
+    pub ref_mv_context: u32,
+    /// §7.10.2 `ZeroMvContext` snapshot consumed by the §5.11.23
+    /// `zero_mv` selection (Arm 4). In `0..ZERO_MV_CONTEXTS = 0..2`.
+    /// Always `0` on the r172 spatial-only path (the temporal scan is
+    /// the only writer of non-zero `ZeroMvContext`).
+    pub zero_mv_context: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::symbol_decoder::SymbolDecoder;
+
+    /// Helper for §5.11.23 decode_inter_block_mode_info tests: builds
+    /// the §5.9.24 identity-default `gm_params` table
+    /// (`gm_params[ref][2] = gm_params[ref][5] = 1 <<
+    /// WARPEDMODEL_PREC_BITS`, other slots = 0). Returns the matrix
+    /// alone; pair with `[GM_TYPE_IDENTITY; 8]` for the §7.10.2.1
+    /// identity short-circuit.
+    fn identity_gm_params() -> [[i32; 6]; 8] {
+        let mut params = [[0i32; 6]; 8];
+        for p in &mut params {
+            p[2] = 1 << WARPEDMODEL_PREC_BITS;
+            p[5] = 1 << WARPEDMODEL_PREC_BITS;
+        }
+        params
+    }
 
     /// §8.3.1: a fresh context is a verbatim copy of the §9.4 defaults,
     /// and the well-formedness invariants the §8.2.6 decoder relies on
@@ -33523,6 +33752,12 @@ mod tests {
             false,
             false,
             false,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_row.
@@ -33547,6 +33782,12 @@ mod tests {
             false,
             false,
             false,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_col.
@@ -33571,6 +33812,12 @@ mod tests {
             false,
             false,
             false,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range seg_ref_frame_data.
@@ -33595,6 +33842,12 @@ mod tests {
             false,
             false,
             false,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range skip_mode_frame[0].
@@ -33619,6 +33872,12 @@ mod tests {
             false,
             false,
             false,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         assert_eq!(
@@ -33666,8 +33925,14 @@ mod tests {
             /* seg_skip_active = */ false,
             /* seg_globalmv_active = */ false,
             /* reference_select = */ true, // ignored on the skip_mode arm
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::FindMvStackUnsupported));
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
         assert_eq!(
             dec.position(),
             pos_before,
@@ -33695,9 +33960,13 @@ mod tests {
 
     /// §5.11.25 arm 2: `seg_ref_frame_active == 1` (with
     /// `skip_mode == 0`) ⇒ `RefFrame[0] = seg_ref_frame_data, RefFrame[1]
-    /// = NONE`, no `S()` reads.
+    /// = NONE` per §5.11.25 (no S() in that arm). Post-r173 the
+    /// §5.11.23 YMode dispatch Arm 4 then runs the single-pred
+    /// `new_mv` / `zero_mv` / `ref_mv` cascade (consuming bits), so
+    /// `dec.position()` advances past `pos_before` and the §5.11.31
+    /// stub fires.
     #[test]
-    fn decode_inter_block_mode_info_seg_ref_frame_active_no_reads() {
+    fn decode_inter_block_mode_info_seg_ref_frame_active_runs_cascade() {
         let geom = TileGeometry {
             mi_row_start: 0,
             mi_row_end: 8,
@@ -33730,12 +33999,20 @@ mod tests {
             false,
             false,
             true,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::FindMvStackUnsupported));
-        assert_eq!(
-            dec.position(),
-            pos_before,
-            "seg_ref_frame_active arm reads 0 bits"
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
+        // the §5.11.23 Arm 4 single-pred cascade then reads at least the
+        // `new_mv` symbol.
+        assert!(
+            dec.position() > pos_before,
+            "§5.11.23 Arm 4 single-pred cascade must consume at least one bit"
         );
         // RefFrames[0][0] = [GOLDEN_FRAME, NONE].
         assert_eq!(walker.ref_frames()[0], 4);
@@ -33778,8 +34055,14 @@ mod tests {
             /* seg_skip_active = */ true,
             /* seg_globalmv_active = */ false,
             true,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::FindMvStackUnsupported));
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
         assert_eq!(dec.position(), pos_before);
         // RefFrames[0][0] = [LAST_FRAME = 1, NONE = -1].
         assert_eq!(walker.ref_frames()[0], 1);
@@ -33811,8 +34094,14 @@ mod tests {
             false,
             /* seg_globalmv_active = */ true,
             true,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::FindMvStackUnsupported));
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
         assert_eq!(dec2.position(), pos_before);
         assert_eq!(walker2.ref_frames()[0], 1);
         assert_eq!(walker2.ref_frames()[1], -1);
@@ -33858,8 +34147,14 @@ mod tests {
             false,
             false,
             /* reference_select = */ false,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::FindMvStackUnsupported));
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
         // The single-ref cascade reads at least the single_ref_p1
         // symbol, which is a conformant binary S() against the §9.4
         // default CDF — at minimum one bit gets consumed (the §8.2.6
@@ -33918,8 +34213,14 @@ mod tests {
             false,
             false,
             /* reference_select = */ true,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::FindMvStackUnsupported));
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
         let r0 = walker.ref_frames()[0];
         let r1 = walker.ref_frames()[1];
         // Either single-pred (r0 in 1..=7, r1 = NONE = -1) or compound
@@ -33973,8 +34274,14 @@ mod tests {
             false,
             false,
             /* reference_select = */ true,
+            /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+            /* gm_params = */ identity_gm_params(),
+            /* ref_frame_sign_bias = */ [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ false,
+            /* use_ref_frame_mvs = */ false,
         );
-        assert_eq!(r, Err(crate::Error::FindMvStackUnsupported));
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
         assert_eq!(
             walker.ref_frames()[1],
@@ -34000,10 +34307,17 @@ mod tests {
             mi_size: BLOCK_4X4,
             ref_frame: [1, 7],
             is_compound: true,
+            y_mode: MODE_NEAREST_NEARESTMV,
+            ref_mv_idx: 0,
+            num_mv_found: 0,
+            new_mv_context: 0,
+            ref_mv_context: 0,
+            zero_mv_context: 0,
         };
         assert_eq!(info.ref_frame[0], 1);
         assert_eq!(info.ref_frame[1], 7);
         assert!(info.is_compound);
+        assert_eq!(info.y_mode, MODE_NEAREST_NEARESTMV);
         // Single-pred case.
         let info_single = DecodedInterBlockModeInfo {
             mi_row: 0,
@@ -34011,8 +34325,15 @@ mod tests {
             mi_size: BLOCK_4X4,
             ref_frame: [1, -1],
             is_compound: false,
+            y_mode: MODE_NEARESTMV,
+            ref_mv_idx: 0,
+            num_mv_found: 0,
+            new_mv_context: 0,
+            ref_mv_context: 0,
+            zero_mv_context: 0,
         };
         assert!(!info_single.is_compound);
+        assert_eq!(info_single.y_mode, MODE_NEARESTMV);
     }
 
     /// §5.11.18 prologue + §5.11.23 grid composition: stamp
@@ -34038,6 +34359,571 @@ mod tests {
         assert_eq!(walker.ref_frame_at(-1, 0, 1), -1);
         assert_eq!(walker.ref_frame_at(0, 100, 0), 0);
         assert_eq!(walker.ref_frame_at(0, 100, 1), -1);
+    }
+
+    // ===================================================================
+    // §5.11.23 post-find_mv_stack cascade tests (round 173)
+    // ===================================================================
+
+    /// §5.11.23 Arm 1 (`skip_mode == 1`): YMode = NEAREST_NEARESTMV
+    /// (no `compound_mode` / `new_mv` / `zero_mv` / `ref_mv` S());
+    /// `RefMvIdx = 0` and the drl_mode loops do NOT run because
+    /// NEAREST_NEARESTMV is neither NEWMV/NEW_NEWMV nor has_nearmv.
+    /// Position MUST equal `pos_before` (no bit was consumed past the
+    /// §5.11.25 skip_mode arm, which itself reads 0 bits). Stack
+    /// summary reflects spatial-only fresh-walker state
+    /// (`num_mv_found = 0`, contexts = (0, 0, 0)).
+    #[test]
+    fn cascade_skip_mode_arm1_no_bits_consumed_y_mode_nearest_nearestmv() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 32]; // hostile — Arm 1 must not touch it.
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            4,
+            4,
+            BLOCK_8X8,
+            /* skip_mode = */ 1,
+            true,
+            true,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            /* skip_mode_frame = */ [1, 7],
+            false,
+            0,
+            false,
+            false,
+            true,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "Arm 1 (skip_mode=1) ⇒ NEAREST_NEARESTMV reads no bits"
+        );
+    }
+
+    /// §5.11.23 Arm 2 (`seg_skip_active || seg_globalmv_active`):
+    /// YMode = GLOBALMV (no S()); single-pred RefFrame = [LAST, NONE]
+    /// (read_ref_frames arm 3 with seg_skip_active). `GLOBALMV` is
+    /// neither NEWMV/NEW_NEWMV nor has_nearmv, so the drl_mode loops
+    /// do NOT run; `RefMvIdx = 0`. Position MUST equal `pos_before`.
+    #[test]
+    fn cascade_seg_skip_arm2_no_bits_consumed_y_mode_globalmv() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            /* seg_skip_active = */ true,
+            false,
+            true,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "Arm 2 (seg_skip_active) ⇒ GLOBALMV reads no bits"
+        );
+    }
+
+    /// §5.11.23 Arm 3 (compound): §5.11.25 skip_mode arm produces
+    /// `RefFrame = [LAST, ALTREF]` ⇒ isCompound = true. The cascade
+    /// must then take Arm 3 (`compound_mode` S() against
+    /// `TileCompoundModeCdf[ctx]`), but on `skip_mode == 1` the §5.11.23
+    /// Arm 1 takes precedence (NEAREST_NEARESTMV) — so this test seeds
+    /// a compound ref-frame via the §5.11.25 default arm (rigging
+    /// comp_mode and comp_ref_type to land on COMPOUND_REFERENCE +
+    /// UNIDIR + RefFrame[0..2] = [BWDREF, ALTREF]) and confirms the
+    /// `compound_mode` S() fires (position advances) and the
+    /// AssignMvUnsupported stub is reached.
+    #[test]
+    fn cascade_compound_arm3_consumes_compound_mode_bit() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig §5.11.25 default arm: comp_mode = COMPOUND_REFERENCE (1).
+        for row in cdfs.comp_mode.iter_mut() {
+            *row = [0, 1 << 15, 0];
+        }
+        // comp_ref_type = UNIDIR_COMP_REFERENCE (0).
+        for row in cdfs.comp_ref_type.iter_mut() {
+            *row = [1 << 15, 1 << 15, 0];
+        }
+        // uni_comp_ref = 1 ⇒ BWDREF / ALTREF (no more uni_comp_ref reads).
+        for row in cdfs.uni_comp_ref.iter_mut() {
+            row[0] = [0, 1 << 15, 0];
+        }
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_8X8,
+            /* skip_mode = */ 0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            /* reference_select = */ true,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert!(
+            dec.position() > pos_before,
+            "Arm 3 ⇒ compound_mode S() must consume bits"
+        );
+        // RefFrame[0..2] = [BWDREF_FRAME = 5, ALTREF_FRAME = 7].
+        assert_eq!(walker.ref_frames()[0], 5);
+        assert_eq!(walker.ref_frames()[1], 7);
+    }
+
+    /// §5.11.23 Arm 4 (single-pred): with §5.11.25 forcing the default
+    /// arm into single-pred (`reference_select = false`), the cascade
+    /// reads `new_mv` S(). Rigging `new_mv` ⇒ symbol 0 forces YMode =
+    /// NEWMV. Because YMode = NEWMV AND the fresh-walker NumMvFound
+    /// starts at 0, the drl_mode loop's `NumMvFound > idx + 1`
+    /// condition fails immediately for `idx = 0` and `idx = 1` ⇒ the
+    /// loop runs zero iterations ⇒ RefMvIdx = 0.
+    #[test]
+    fn cascade_single_pred_arm4_new_mv_zero_yields_newmv_no_drl() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig new_mv ⇒ symbol 0 ⇒ YMode = NEWMV.
+        for row in cdfs.new_mv.iter_mut() {
+            *row = [0, 1 << 15, 0];
+        }
+        // Rig single_ref CDFs to a deterministic outcome (force
+        // single_ref_p1 ⇒ 0 so the cascade lands on LAST_FRAME / LAST2_FRAME).
+        for row in cdfs.single_ref.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = [1 << 15, 1 << 15, 0];
+            }
+        }
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            /* reference_select = */ false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert!(
+            dec.position() > pos_before,
+            "Arm 4 ⇒ new_mv + single_ref cascade must consume bits"
+        );
+        // single-pred ⇒ RefFrame[1] = NONE.
+        assert_eq!(walker.ref_frames()[1], -1);
+    }
+
+    /// §5.11.23 Arm 4 single-pred, `new_mv` ⇒ symbol 1 then `zero_mv`
+    /// ⇒ symbol 0 ⇒ YMode = GLOBALMV. The drl_mode loops do NOT run
+    /// because GLOBALMV is not NEWMV/NEW_NEWMV/NEARMV/NEAR_NEARMV.
+    #[test]
+    fn cascade_single_pred_arm4_zero_mv_zero_yields_globalmv() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // new_mv ⇒ 1 (NEWMV not chosen).
+        for row in cdfs.new_mv.iter_mut() {
+            *row = [1 << 15, 1 << 15, 0];
+        }
+        // zero_mv ⇒ 0 ⇒ GLOBALMV.
+        for row in cdfs.zero_mv.iter_mut() {
+            *row = [0, 1 << 15, 0];
+        }
+        for row in cdfs.single_ref.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = [1 << 15, 1 << 15, 0];
+            }
+        }
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        assert!(dec.position() > pos_before);
+    }
+
+    /// §5.11.23 Arm 4 single-pred, `new_mv` ⇒ 1, `zero_mv` ⇒ 1,
+    /// `ref_mv` ⇒ 0 ⇒ YMode = NEARESTMV. RefMvIdx loops skipped
+    /// (NEARESTMV is not has_nearmv either).
+    #[test]
+    fn cascade_single_pred_arm4_ref_mv_zero_yields_nearestmv() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        for row in cdfs.new_mv.iter_mut() {
+            *row = [1 << 15, 1 << 15, 0];
+        }
+        for row in cdfs.zero_mv.iter_mut() {
+            *row = [1 << 15, 1 << 15, 0];
+        }
+        // ref_mv ⇒ 0 ⇒ NEARESTMV.
+        for row in cdfs.ref_mv.iter_mut() {
+            *row = [0, 1 << 15, 0];
+        }
+        for row in cdfs.single_ref.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = [1 << 15, 1 << 15, 0];
+            }
+        }
+        let bytes = [0u8; 32];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+    }
+
+    /// §5.11.23 drl_mode short-circuit: `NumMvFound = 0` on a fresh
+    /// walker means the `NumMvFound > idx + 1` predicate fails for
+    /// every iteration. Confirm by selecting YMode = NEWMV and
+    /// verifying the position advance reflects ONLY the new_mv read,
+    /// not any drl_mode reads.
+    #[test]
+    fn cascade_drl_mode_loop_short_circuits_when_num_mv_found_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // new_mv ⇒ 0 ⇒ NEWMV (triggers drl_mode loop guard).
+        for row in cdfs.new_mv.iter_mut() {
+            *row = [0, 1 << 15, 0];
+        }
+        // Rig drl_mode CDFs to a value that would be DETECTABLE if a
+        // read fired (favoring symbol 1 — a "search again" signal). On
+        // the conformant path the loop never reads it.
+        for row in cdfs.drl_mode.iter_mut() {
+            *row = [0, 1 << 15, 0];
+        }
+        for row in cdfs.single_ref.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = [1 << 15, 1 << 15, 0];
+            }
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let pos_before = dec.position();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::AssignMvUnsupported));
+        // drl_mode CDFs must NOT have adapted (no read fired).
+        for row in &cdfs.drl_mode {
+            assert_eq!(
+                row[2], 0,
+                "drl_mode CDF counter must stay 0 (no read on NumMvFound=0)"
+            );
+        }
+        let _ = pos_before;
+    }
+
+    /// `has_nearmv` helper covers the four NEARMV-bearing Y modes per
+    /// §5.11.23 spec (av1-spec p.75): NEARMV / NEAR_NEARMV /
+    /// NEAR_NEWMV / NEW_NEARMV. Everything else returns false.
+    #[test]
+    fn has_nearmv_helper_matches_spec_set() {
+        assert!(has_nearmv(MODE_NEARMV));
+        assert!(has_nearmv(MODE_NEAR_NEARMV));
+        assert!(has_nearmv(MODE_NEAR_NEWMV));
+        assert!(has_nearmv(MODE_NEW_NEARMV));
+        // Negatives.
+        assert!(!has_nearmv(MODE_NEAREST_NEARESTMV));
+        assert!(!has_nearmv(MODE_NEAREST_NEWMV));
+        assert!(!has_nearmv(MODE_NEW_NEARESTMV));
+        assert!(!has_nearmv(MODE_GLOBAL_GLOBALMV));
+        assert!(!has_nearmv(MODE_NEW_NEWMV));
+        assert!(!has_nearmv(MODE_NEARESTMV));
+        assert!(!has_nearmv(MODE_GLOBALMV));
+        assert!(!has_nearmv(MODE_NEWMV));
+    }
+
+    /// §5.11.23 caller-bug guards remain in place when the new r173
+    /// args are passed: out-of-range `gm_params` array (we accept any
+    /// shape here — no validation), but the existing `sub_size`,
+    /// `mi_row` / `mi_col`, `seg_ref_frame_data`, `skip_mode_frame`
+    /// guards still fire as before.
+    #[test]
+    fn cascade_caller_bug_guards_unchanged_with_r173_args() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_SIZES, // out-of-range sub_size
+            0,
+            false,
+            false,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [0, -1],
+            false,
+            0,
+            false,
+            false,
+            false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.23 r173: `use_ref_frame_mvs == true` surfaces the
+    /// §7.10.2.5 deferral (`TemporalMvScanUnsupported`) BEFORE the
+    /// post-find_mv_stack cascade runs. This matches the §7.10.2
+    /// driver's fail-fast contract.
+    #[test]
+    fn cascade_use_ref_frame_mvs_surfaces_temporal_scan_deferral() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker.decode_inter_block_mode_info(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            /* skip_mode = */ 1,
+            true,
+            true,
+            [0, -1],
+            [0, -1],
+            true,
+            true,
+            true,
+            true,
+            [1, 7],
+            false,
+            0,
+            false,
+            false,
+            true,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            false,
+            false,
+            /* use_ref_frame_mvs = */ true,
+        );
+        assert_eq!(r, Err(crate::Error::TemporalMvScanUnsupported));
     }
 
     // ===================================================================

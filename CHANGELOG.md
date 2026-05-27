@@ -6,6 +6,73 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 173 — §5.11.23 post-`find_mv_stack` reader cascade.** Wires
+  `find_mv_stack` into `decode_inter_block_mode_info` and runs every
+  bit-consuming leaf in §5.11.23 lines 1-32: YMode dispatch (four
+  arms — `skip_mode` / SEG_LVL_SKIP|GLOBALMV / isCompound /
+  single-pred), per-mode `RefMvIdx` + `drl_mode` loops, and the
+  §7.10.2 stack-summary surfaced through the `DecodedInterBlockModeInfo`
+  aggregate.
+
+  Lifts `Error::FindMvStackUnsupported` (now a defensive caller-bug
+  fallback only) and surfaces `Error::AssignMvUnsupported` (the new
+  §5.11.31 next-arc target — `read_mv` / `read_mv_component` syntax
+  tree). The §5.11.23 dispatcher therefore now consumes:
+
+  * **§5.11.25 `read_ref_frames`** — r170 prologue (S() cascade).
+  * **§7.10 `find_mv_stack`** — r172 spatial-only path, wired in r173.
+  * **§5.11.23 YMode dispatch**: Arm 1 (skip_mode = 1 ⇒
+    NEAREST_NEARESTMV); Arm 2 (seg_skip / seg_globalmv ⇒ GLOBALMV);
+    Arm 3 (compound) reads `compound_mode` against
+    `TileCompoundModeCdf[ctx]` (ctx from
+    [`compound_mode_ctx`](src/cdf.rs) per §8.3.2); Arm 4 (single)
+    walks `new_mv` ⇒ `zero_mv` ⇒ `ref_mv` ladder against
+    `TileNewMvCdf[NewMvContext]` / `TileZeroMvCdf[ZeroMvContext]` /
+    `TileRefMvCdf[RefMvContext]`.
+  * **§5.11.23 RefMvIdx + drl_mode loops**: on `YMode ∈ {NEWMV,
+    NEW_NEWMV}` iterate `idx = 0, 1`; on `has_nearmv(YMode)` true seed
+    `RefMvIdx = 1` and iterate `idx = 1, 2`. Each iteration is gated
+    on `NumMvFound > idx + 1` and reads against
+    `TileDrlModeCdf[DrlCtxStack[idx]]`.
+
+  Six new caller scalars on `decode_inter_block_mode_info` (and
+  threaded through `decode_inter_frame_mode_info`): `gm_type[8]`,
+  `gm_params[8][6]`, `ref_frame_sign_bias[8]`,
+  `allow_high_precision_mv`, `force_integer_mv`, `use_ref_frame_mvs`.
+
+  `DecodedInterBlockModeInfo` extended with six new fields surfaced
+  on the (currently unreachable) `Ok` arm: `y_mode` (in
+  `MODE_NEARESTMV..=MODE_NEW_NEWMV = 14..=25`), `ref_mv_idx` (in
+  `0..=2`), and the §7.10.2 stack-summary snapshot — `num_mv_found`,
+  `new_mv_context`, `ref_mv_context`, `zero_mv_context`.
+
+  New `has_nearmv(mode)` predicate (av1-spec p.75) — returns true
+  for the four NEARMV-bearing inter Y modes (NEARMV / NEAR_NEARMV /
+  NEAR_NEWMV / NEW_NEARMV). Joins the existing `has_newmv`.
+
+  Public re-exports extended with `DecodedInterBlockModeInfo`,
+  `FindMvStackResult`, `GM_TYPE_IDENTITY` / `_TRANSLATION` /
+  `_ROTZOOM` / `_AFFINE`, `MAX_REF_MV_STACK_SIZE`, `MV_BORDER`,
+  `REF_CAT_LEVEL`, and the §6.10.22 inter Y-mode ordinals
+  (`MODE_NEARESTMV` through `MODE_NEW_NEWMV`).
+
+  10 new unit tests cover: Arm 1 zero-bit path; Arm 2 zero-bit path;
+  Arm 3 compound case (rigged ref-frame cascade landing on
+  `[BWDREF, ALTREF]` + `compound_mode` S() firing); Arm 4 three
+  terminal modes (NEWMV / GLOBALMV / NEARESTMV); drl_mode loop
+  short-circuit on fresh-walker `NumMvFound = 0` (CDF counter stays
+  0 ⇒ no read fired); `has_nearmv` truth table over the full inter
+  Y-mode set; caller-bug guards unchanged with the new args; and the
+  `use_ref_frame_mvs = true` arm surfacing `TemporalMvScanUnsupported`
+  ahead of the cascade. Test count: 651 → 661 (+10).
+
+  The §5.11.23 post-`assign_mv` readers (`read_motion_mode` /
+  `read_interintra_mode` / `read_compound_type` /
+  `read_interpolation_filter`) remain pending; the natural arc
+  ordering is `assign_mv` first (the §5.11.27 motion-mode walks
+  consume `Mv[..]`). `decode_av1` / `encode_av1` continue to return
+  `Error::NotImplemented`.
+
 * **Round 172 — §7.10 `find_mv_stack` spatial-only path.** Lifts the
   `Error::FindMvStackUnsupported` stub the r170 §5.11.23 reader
   surfaced after the §5.11.25 `read_ref_frames` prologue, on the

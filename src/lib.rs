@@ -1538,32 +1538,33 @@ pub use cdf::{
     palette_tokens_plane, palette_uv_mode_ctx, palette_y_mode_ctx, partition_ctx,
     partition_subsize, ref_count_ctx, segment_id_ctx, size_group, skip_ctx, skip_mode_ctx,
     split_or_horz_cdf, split_or_vert_cdf, tx_depth_ctx, txfm_split_ctx, DecodedBlock,
-    DecodedBlockRecord, DecodedInterFrameModeInfo, IntraFrameModeInfoPrefix, PaletteColorContext,
-    PalettePlane, PaletteTokensArgs, PartitionWalker, TileCdfContext, TileGeometry,
-    ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT, ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16,
-    BLOCK_16X32, BLOCK_16X4, BLOCK_16X64, BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64,
-    BLOCK_32X8, BLOCK_4X16, BLOCK_4X4, BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32,
-    BLOCK_64X64, BLOCK_8X16, BLOCK_8X32, BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS, CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS,
-    CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET, COEFF_BASE_POS_CTX_OFFSET,
-    COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS, COMPOUND_MODES,
-    COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES, COMP_GROUP_IDX_CONTEXTS,
-    COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS, DCT_ADST, DCT_DCT, DCT_FLIPADST,
-    DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF, DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF,
-    DEFAULT_COEFF_BASE_CDF, DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF,
-    DEFAULT_COMPOUND_IDX_CDF, DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF,
-    DEFAULT_COMP_BWD_REF_CDF, DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF,
-    DEFAULT_COMP_REF_CDF, DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF,
-    DEFAULT_DELTA_Q_CDF, DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF,
-    DEFAULT_EOB_PT_128_CDF, DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF,
-    DEFAULT_EOB_PT_512_CDF, DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF,
-    DEFAULT_FILTER_INTRA_MODE_CDF, DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF,
-    DEFAULT_INTER_INTRA_MODE_CDF, DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF,
-    DEFAULT_INTER_TX_TYPE_SET3_CDF, DEFAULT_INTRABC_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF,
-    DEFAULT_INTRA_TX_TYPE_SET1_CDF, DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF,
-    DEFAULT_MOTION_MODE_CDF, DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF,
-    DEFAULT_MV_CLASS0_FR_CDF, DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF,
-    DEFAULT_MV_HP_CDF, DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
+    DecodedBlockRecord, DecodedInterBlockModeInfo, DecodedInterFrameModeInfo, FindMvStackResult,
+    IntraFrameModeInfoPrefix, PaletteColorContext, PalettePlane, PaletteTokensArgs,
+    PartitionWalker, TileCdfContext, TileGeometry, ADJUSTED_TX_SIZE, ADST_ADST, ADST_DCT,
+    ADST_FLIPADST, BLOCK_128X128, BLOCK_128X64, BLOCK_16X16, BLOCK_16X32, BLOCK_16X4, BLOCK_16X64,
+    BLOCK_16X8, BLOCK_32X16, BLOCK_32X32, BLOCK_32X64, BLOCK_32X8, BLOCK_4X16, BLOCK_4X4,
+    BLOCK_4X8, BLOCK_64X128, BLOCK_64X16, BLOCK_64X32, BLOCK_64X64, BLOCK_8X16, BLOCK_8X32,
+    BLOCK_8X4, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, BLOCK_SIZE_GROUPS, BR_CDF_SIZE, BWD_REFS,
+    CFL_ALPHABET_SIZE, CFL_ALPHA_CONTEXTS, CFL_JOINT_SIGNS, CLASS0_SIZE, COEFF_BASE_CTX_OFFSET,
+    COEFF_BASE_POS_CTX_OFFSET, COEFF_BASE_RANGE, COEFF_CDF_Q_CTXS, COMPOUND_IDX_CONTEXTS,
+    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_MODE_CTX_MAP, COMPOUND_TYPES,
+    COMP_GROUP_IDX_CONTEXTS, COMP_INTER_CONTEXTS, COMP_NEWMV_CTXS, COMP_REF_TYPE_CONTEXTS,
+    DCT_ADST, DCT_DCT, DCT_FLIPADST, DC_SIGN_CONTEXTS, DEFAULT_ANGLE_DELTA_CDF,
+    DEFAULT_CFL_ALPHA_CDF, DEFAULT_CFL_SIGN_CDF, DEFAULT_COEFF_BASE_CDF,
+    DEFAULT_COEFF_BASE_EOB_CDF, DEFAULT_COEFF_BR_CDF, DEFAULT_COMPOUND_IDX_CDF,
+    DEFAULT_COMPOUND_MODE_CDF, DEFAULT_COMPOUND_TYPE_CDF, DEFAULT_COMP_BWD_REF_CDF,
+    DEFAULT_COMP_GROUP_IDX_CDF, DEFAULT_COMP_MODE_CDF, DEFAULT_COMP_REF_CDF,
+    DEFAULT_COMP_REF_TYPE_CDF, DEFAULT_DC_SIGN_CDF, DEFAULT_DELTA_LF_CDF, DEFAULT_DELTA_Q_CDF,
+    DEFAULT_DRL_MODE_CDF, DEFAULT_EOB_EXTRA_CDF, DEFAULT_EOB_PT_1024_CDF, DEFAULT_EOB_PT_128_CDF,
+    DEFAULT_EOB_PT_16_CDF, DEFAULT_EOB_PT_256_CDF, DEFAULT_EOB_PT_32_CDF, DEFAULT_EOB_PT_512_CDF,
+    DEFAULT_EOB_PT_64_CDF, DEFAULT_FILTER_INTRA_CDF, DEFAULT_FILTER_INTRA_MODE_CDF,
+    DEFAULT_INTERP_FILTER_CDF, DEFAULT_INTER_INTRA_CDF, DEFAULT_INTER_INTRA_MODE_CDF,
+    DEFAULT_INTER_TX_TYPE_SET1_CDF, DEFAULT_INTER_TX_TYPE_SET2_CDF, DEFAULT_INTER_TX_TYPE_SET3_CDF,
+    DEFAULT_INTRABC_CDF, DEFAULT_INTRA_FRAME_Y_MODE_CDF, DEFAULT_INTRA_TX_TYPE_SET1_CDF,
+    DEFAULT_INTRA_TX_TYPE_SET2_CDF, DEFAULT_IS_INTER_CDF, DEFAULT_MOTION_MODE_CDF,
+    DEFAULT_MV_BIT_CDF, DEFAULT_MV_CLASS0_BIT_CDF, DEFAULT_MV_CLASS0_FR_CDF,
+    DEFAULT_MV_CLASS0_HP_CDF, DEFAULT_MV_CLASS_CDF, DEFAULT_MV_FR_CDF, DEFAULT_MV_HP_CDF,
+    DEFAULT_MV_JOINT_CDF, DEFAULT_MV_SIGN_CDF, DEFAULT_NEW_MV_CDF,
     DEFAULT_PALETTE_SIZE_2_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_2_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_3_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_3_Y_COLOR_CDF,
     DEFAULT_PALETTE_SIZE_4_UV_COLOR_CDF, DEFAULT_PALETTE_SIZE_4_Y_COLOR_CDF,
@@ -1607,6 +1608,12 @@ pub use cdf::{
     TX_TYPES_SET2, TX_TYPES_SET3, TX_TYPE_IN_SET_INTER, TX_TYPE_IN_SET_INTRA, TX_WIDTH,
     TX_WIDTH_LOG2, UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
     V_ADST, V_DCT, V_FLIPADST, V_PRED, WEDGE_TYPES, ZERO_MV_CONTEXTS,
+};
+pub use cdf::{
+    GM_TYPE_AFFINE, GM_TYPE_IDENTITY, GM_TYPE_ROTZOOM, GM_TYPE_TRANSLATION, MAX_REF_MV_STACK_SIZE,
+    MODE_GLOBALMV, MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV,
+    MODE_NEAREST_NEWMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
+    MODE_NEW_NEARESTMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_BORDER, REF_CAT_LEVEL,
 };
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
@@ -1844,16 +1851,55 @@ pub enum Error {
     /// and stamps `RefFrames[][][..]`.
     ///
     /// As of r172 the §7.10 spatial-only path lands and is reachable
-    /// via [`crate::PartitionWalker::find_mv_stack`]. The
-    /// `decode_inter_block_mode_info` reader still surfaces this stub
-    /// because the §5.11.23 post-`find_mv_stack` body
-    /// (`compound_mode` / `new_mv` / `zero_mv` / `ref_mv` /
-    /// `drl_mode` / `assign_mv` / `read_motion_mode` /
-    /// `read_interintra_mode` / `read_compound_type` /
-    /// `read_interpolation_filter`) remains pending; the wiring of
-    /// `find_mv_stack` into the §5.11.23 dispatcher follows once those
-    /// readers land.
+    /// via [`crate::PartitionWalker::find_mv_stack`]. As of r173
+    /// `decode_inter_block_mode_info` wires `find_mv_stack` into the
+    /// dispatcher directly and runs the post-`find_mv_stack`
+    /// `compound_mode` / `new_mv` / `zero_mv` / `ref_mv` / `drl_mode`
+    /// cascade; the §5.11.23 reader now short-circuits one step later
+    /// at [`Self::AssignMvUnsupported`] (§5.11.31 `assign_mv` /
+    /// §5.11.32 `read_mv_component` are the next-arc target).
+    ///
+    /// This variant is retained as a defensive caller-bug fallback —
+    /// the §5.11.18 dispatcher only fires it on the
+    /// `use_ref_frame_mvs == true` path (which currently surfaces
+    /// [`Self::TemporalMvScanUnsupported`] from the §7.10.2 entry).
     FindMvStackUnsupported,
+    /// The §5.11.23 [`crate::PartitionWalker::decode_inter_block_mode_info`]
+    /// reader completed the §7.10.2 `find_mv_stack` call, the §5.11.23
+    /// YMode dispatch (skip_mode / SEG_LVL_SKIP|GLOBALMV / isCompound /
+    /// single-pred), and the per-mode RefMvIdx + drl_mode loops, then
+    /// reached **§5.11.31 `assign_mv( isCompound )`** (av1-spec p.78).
+    ///
+    /// The §5.11.31 body composes `read_mv( ref )` per slot, which
+    /// drives the §5.11.32 `read_mv_component` syntax tree
+    /// (`mv_joint` S() then `mv_sign` plus `mv_class` plus the
+    /// `mv_class0_bit` / `mv_class0_fr` / `mv_class0_hp` cascade for
+    /// `MV_CLASS_0`, OR the `mv_bit` loop plus `mv_fr` / `mv_hp`
+    /// cascade for the larger classes). The §5.11.32 reader is the
+    /// next-arc target.
+    ///
+    /// All §5.11.23 reads prior to this point — `read_ref_frames` (S()
+    /// cascade), `compound_mode` / `new_mv` / `zero_mv` / `ref_mv`
+    /// (§5.11.23 YMode dispatch), and the `drl_mode` (per-position)
+    /// loops — commit to the bitstream + §8.3 adaptation state before
+    /// this stub fires. The decoded `RefFrame[..]` / `isCompound` /
+    /// `YMode` / `RefMvIdx` / the §7.10.2 stack-summary scalars
+    /// (`NumMvFound` / `NewMvContext` / `RefMvContext` /
+    /// `ZeroMvContext`) are observable through the
+    /// `DecodedInterBlockModeInfo` aggregate fields if the variant
+    /// becomes routed back through a follow-up arc.
+    ///
+    /// The §5.11.23 post-`assign_mv` readers (`read_interintra_mode` /
+    /// `read_motion_mode` / `read_compound_type` /
+    /// `read_interpolation_filter`) all depend on the §5.11.31 motion
+    /// vectors being decoded (the §5.11.27 motion-mode
+    /// `find_warp_samples` and `has_overlappable_candidates` walks
+    /// consume `Mv[..]`), so the natural arc ordering is `assign_mv`
+    /// then `read_motion_mode` then `read_interintra_mode` then
+    /// `read_compound_type` then `read_interpolation_filter`. The
+    /// remaining error variants for each leaf will land alongside the
+    /// corresponding sub-body.
+    AssignMvUnsupported,
     /// The §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample sub-
     /// processes (av1-spec p.223-226) reached from the §7.10.2 driver
     /// when the §5.9.20 frame-level `use_ref_frame_mvs == 1`. Lifted
@@ -1965,7 +2011,11 @@ impl core::fmt::Display for Error {
             ),
             Self::FindMvStackUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.23 inter_block_mode_info reached §7.10.2 find_mv_stack — spatial-only path lands r172 via PartitionWalker::find_mv_stack; the §5.11.23 post-MV-stack reader cascade (compound_mode / new_mv / zero_mv / ref_mv / drl_mode / assign_mv / interpolation_filter) remains pending"
+                "oxideav-av1: §5.11.23 inter_block_mode_info reached §7.10.2 find_mv_stack — defensive fallback retained post-r173 (the find_mv_stack call is now wired into the dispatcher; see AssignMvUnsupported for the live gap)"
+            ),
+            Self::AssignMvUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.23 inter_block_mode_info reached §5.11.31 assign_mv — the §5.11.31 / §5.11.32 read_mv / read_mv_component syntax tree is the next-arc target (motion_mode / interintra_mode / compound_type / interpolation_filter cascade follows once assign_mv lands)"
             ),
             Self::TemporalMvScanUnsupported => write!(
                 f,

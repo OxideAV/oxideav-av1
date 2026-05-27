@@ -43,9 +43,24 @@
 
 use oxideav_av1::{
     DecodedBlock, DecodedInterFrameModeInfo, Error, PartitionWalker, SymbolDecoder, TileCdfContext,
-    TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8, MAX_SEGMENTS, MAX_TX_DEPTH,
-    MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS,
+    TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8, GM_TYPE_IDENTITY, MAX_SEGMENTS,
+    MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS,
+    WARPEDMODEL_PREC_BITS,
 };
+
+/// Helper for r173 `decode_inter_frame_mode_info` tests: builds the
+/// §5.9.24 identity-default `gm_params` table
+/// (`gm_params[ref][2] = gm_params[ref][5] = 1 <<
+/// WARPEDMODEL_PREC_BITS`, other slots = 0). Pair with
+/// `[GM_TYPE_IDENTITY; 8]` for the §7.10.2.1 identity short-circuit.
+fn identity_gm_params() -> [[i32; 6]; 8] {
+    let mut params = [[0i32; 6]; 8];
+    for p in &mut params {
+        p[2] = 1 << WARPEDMODEL_PREC_BITS;
+        p[5] = 1 << WARPEDMODEL_PREC_BITS;
+    }
+    params
+}
 
 /// Helper: force the §5.11.11 skip CDF to deterministically return
 /// `symbol` on every context — every test below uses this to gate
@@ -1264,6 +1279,12 @@ fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
         /* seg_skip_active = */ false,
         /* seg_ref_frame_data = */ 0,
         /* reference_select = */ false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
     let pos_after = dec.position();
     assert_eq!(
@@ -1340,10 +1361,16 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
         /* seg_skip_active = */ false,
         /* seg_ref_frame_data = */ 1,
         /* reference_select = */ false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
     assert_eq!(
         result,
-        Err(Error::FindMvStackUnsupported),
+        Err(Error::AssignMvUnsupported),
         "seg_ref_frame_active + is_inter ⇒ §5.11.25 read_ref_frames (no S()) ⇒ §7.10 find_mv_stack stub"
     );
     // r170: §5.11.25 stamps RefFrames[0..2][0..2][0..2] over the
@@ -1418,10 +1445,16 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
         /* seg_skip_active = */ false,
         /* seg_ref_frame_data = */ 0,
         /* reference_select = */ false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
     assert_eq!(
         result,
-        Err(Error::FindMvStackUnsupported),
+        Err(Error::AssignMvUnsupported),
         "skip_mode = 1 ⇒ is_inter = 1 ⇒ §5.11.25 reads SkipModeFrame ⇒ §7.10 find_mv_stack stub"
     );
     // §5.11.18 grid-fill: Skips[][] stamped to 1 over the 4×4 footprint.
@@ -1487,8 +1520,14 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
         /* seg_skip_active = */ false,
         /* seg_ref_frame_data = */ 0,
         /* reference_select = */ false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
-    assert_eq!(result, Err(Error::FindMvStackUnsupported));
+    assert_eq!(result, Err(Error::AssignMvUnsupported));
 }
 
 /// §5.11.18 caller-bug detection: out-of-range arguments surface
@@ -1535,6 +1574,12 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range mi_col.
@@ -1571,6 +1616,12 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range sub_size.
@@ -1607,6 +1658,12 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range last_active_seg_id.
@@ -1643,6 +1700,12 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         false,
+        /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+        /* gm_params = */ identity_gm_params(),
+        /* ref_frame_sign_bias = */ [0; 8],
+        /* allow_high_precision_mv = */ false,
+        /* force_integer_mv = */ false,
+        /* use_ref_frame_mvs = */ false,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 }
