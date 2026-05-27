@@ -10971,6 +10971,21 @@ pub struct PartitionWalker {
     /// initial-zero state matches the §8.3.1 tile-entry initialisation
     /// (`LeftSegPredContext[ i ] = 0` for every row at tile start).
     left_seg_pred_context: Vec<u8>,
+    /// `YModes[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec p.378 / §5.11.5 line
+    /// `YModes[ r + y ][ c + x ] = YMode`). Entries are `0`
+    /// (= `DC_PRED`, the §3 intra-mode enumeration's ordinal-zero
+    /// value) for not-yet-decoded cells and the block's `YMode`
+    /// (`0..INTRA_MODES`) for cells in the `bh4 * bw4` footprint of a
+    /// block whose §5.11.7 / §5.11.22
+    /// [`Self::decode_intra_frame_y_mode`] has already fired. The
+    /// initial-zero state matches the §8.3.2 `intra_frame_y_mode` ctx
+    /// walk for an unavailable neighbour: the spec writes
+    /// `abovemode = Intra_Mode_Context[ AvailU ? YModes[ MiRow - 1 ][
+    /// MiCol ] : DC_PRED ]`, so a pre-write cell contributes the same
+    /// `Intra_Mode_Context[ DC_PRED ] = 0` weight as an unavailable
+    /// neighbour.
+    y_modes: Vec<u8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -11033,6 +11048,15 @@ impl PartitionWalker {
             .try_reserve_exact(mi_rows as usize)
             .ok()?;
         left_seg_pred_context.resize(mi_rows as usize, 0);
+        // §5.11.5 / §8.3.2: pre-fill `YModes[]` with `DC_PRED == 0`,
+        // the §3 intra-mode enumeration ordinal. An unavailable
+        // neighbour contributes the same `Intra_Mode_Context[ DC_PRED
+        // ] = 0` weight as a not-yet-decoded cell, so the initial-zero
+        // state is the natural identity for the
+        // `decode_intra_frame_y_mode` ctx walk.
+        let mut y_modes: Vec<u8> = Vec::new();
+        y_modes.try_reserve_exact(area).ok()?;
+        y_modes.resize(area, 0);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -11047,6 +11071,7 @@ impl PartitionWalker {
             segment_ids,
             above_seg_pred_context,
             left_seg_pred_context,
+            y_modes,
             blocks: Vec::new(),
         })
     }
@@ -11422,6 +11447,48 @@ impl PartitionWalker {
             return 0;
         }
         self.is_inters[(r * self.mi_cols + c) as usize]
+    }
+
+    /// View of the §6.10.4 `YModes[]` grid after the walk. Indexed
+    /// row-major: `y_modes()[ r * MiCols + c ]`. Cells that no leaf
+    /// covered carry `0` (= `DC_PRED`, the §3 intra-mode enumeration
+    /// ordinal-zero value); cells in the `bh4 * bw4` footprint of a
+    /// decoded block whose §5.11.7 / §5.11.22
+    /// [`Self::decode_intra_frame_y_mode`] call has fired carry the
+    /// block's `YMode` (in `0..INTRA_MODES`). The §5.11.5
+    /// `YModes[ r + y ][ c + x ] = YMode` writer fills only the
+    /// in-grid portion of a block straddling the bottom or right
+    /// edge.
+    #[must_use]
+    pub fn y_modes(&self) -> &[u8] {
+        &self.y_modes
+    }
+
+    /// Helper to read `YModes[ r ][ c ]` for the §8.3.2
+    /// `intra_frame_y_mode` neighbour-lookup. Returns `0`
+    /// (= `DC_PRED`) for out-of-grid coordinates, matching the
+    /// `AvailU ? YModes[ MiRow - 1 ][ MiCol ] : DC_PRED` /
+    /// `AvailL ? YModes[ MiRow ][ MiCol - 1 ] : DC_PRED` gating in
+    /// the spec's ctx derivation. Returns the stored value for
+    /// in-grid coordinates; if no leaf has touched the cell yet, the
+    /// stored value is also `0` (the constructor's pre-fill), which
+    /// is the same `DC_PRED` value the spec's "neighbour unavailable"
+    /// arm produces. Callers must therefore use
+    /// [`TileGeometry::is_inside`] to derive `AvailU` / `AvailL`
+    /// before consulting the grid — an unavailable-but-in-tile
+    /// neighbour is still treated as `DC_PRED` per the spec, and
+    /// this helper's `0` return for an out-of-grid coordinate
+    /// coincides with that.
+    #[inline]
+    fn y_mode_at(&self, r: i32, c: i32) -> u8 {
+        if r < 0 || c < 0 {
+            return 0;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        self.y_modes[(r * self.mi_cols + c) as usize]
     }
 
     /// View of the §6.10.4 `SegmentIds[]` grid after the walk. Indexed
@@ -13556,6 +13623,171 @@ impl PartitionWalker {
         };
 
         Ok(use_intrabc)
+    }
+
+    /// `intra_frame_y_mode` per §5.11.7 (av1-spec p.65 — the
+    /// `intra_frame_mode_info()` `else` arm when `use_intrabc == 0`)
+    /// — reads the per-block `intra_frame_y_mode` syntax element at
+    /// the leaf `(mi_row, mi_col)` of a block whose §5.11.5 `MiSize`
+    /// is `sub_size`. The spec text reads:
+    ///
+    /// ```text
+    ///   intra_frame_y_mode                                          S()
+    ///   YMode = intra_frame_y_mode
+    /// ```
+    ///
+    /// This is the single syntax element that selects the luma intra
+    /// prediction mode for an intra block in a key frame or intra-only
+    /// frame (the non-`use_intrabc` arm of §5.11.7). The decoded value
+    /// is in `0..INTRA_MODES = 0..13` per the §9.3 enumeration
+    /// (`DC_PRED = 0` through `PAETH_PRED = 12`) and becomes the
+    /// per-block `YMode`.
+    ///
+    /// The §8.3.2 selection (av1-spec p.361) is
+    ///
+    /// ```text
+    ///   intra_frame_y_mode: The cdf for intra_frame_y_mode is given by
+    ///     TileIntraFrameYModeCdf[ abovemode ][ leftmode ]
+    ///   where:
+    ///     abovemode = Intra_Mode_Context[ AvailU ? YModes[ MiRow - 1 ][ MiCol ] : DC_PRED ]
+    ///     leftmode  = Intra_Mode_Context[ AvailL ? YModes[ MiRow ][ MiCol - 1 ] : DC_PRED ]
+    /// ```
+    ///
+    /// The walker reads `YModes[]` via [`Self::y_mode_at`] (which
+    /// returns `DC_PRED == 0` for out-of-grid coordinates), gates on
+    /// `AvailU` / `AvailL` via [`TileGeometry::is_inside`], maps each
+    /// neighbour's `YMode` through [`intra_mode_ctx`] (=
+    /// `Intra_Mode_Context[mode]`, in `0..INTRA_MODE_CONTEXTS`), and
+    /// selects the CDF row via
+    /// [`TileCdfContext::intra_frame_y_mode_cdf`]. A `S()` symbol is
+    /// then decoded against that row; the result is in
+    /// `0..INTRA_MODES` per the §9.4
+    /// `Default_Intra_Frame_Y_Mode_Cdf` width (each row is `INTRA_MODES
+    /// + 1 = 14` entries, the last being the §8.2.6 counter slot).
+    ///
+    /// The decoded `YMode` value is then stamped over the block's
+    /// `bw4 * bh4` footprint of [`Self::y_modes`] per the §5.11.5
+    /// per-block invariant
+    ///
+    /// ```text
+    ///   for ( y = 0; y < bh4; y++ )
+    ///     for ( x = 0; x < bw4; x++ )
+    ///         YModes[ r + y ][ c + x ] = YMode
+    /// ```
+    ///
+    /// (av1-spec p.65) so the next block's §8.3.2
+    /// `intra_frame_y_mode` ctx walk observes the value. Cells
+    /// straddling the bottom or right edge are clipped at the frame's
+    /// `MiRows` / `MiCols` extent.
+    ///
+    /// Returns the decoded `YMode` (0..INTRA_MODES) on success, or
+    /// [`Error::PartitionWalkOutOfRange`] for caller bugs (out-of-range
+    /// `sub_size`, `mi_row` / `mi_col` outside the frame's mi extent).
+    /// [`Error::UnexpectedEnd`] surfaces if the bitstream runs out
+    /// mid-symbol.
+    ///
+    /// Note: this method is the §5.11.22 `intra_block_mode_info`
+    /// composite's first sub-element. It is also the second
+    /// `S()`-typed leaf of the §5.11.7 `else` arm (after r161's
+    /// `decode_intra_frame_mode_info_prefix` covers the §5.11.7 body
+    /// down through `read_delta_lf( )`, and r164's
+    /// `decode_use_intrabc` covers the `use_intrabc` element). It is
+    /// distinct from `y_mode` (§5.11.22 in `intra_block_mode_info` for
+    /// inter-frame intra blocks), which uses the `Size_Group`-based
+    /// CDF [`TileCdfContext::y_mode_cdf`] instead of the
+    /// neighbour-mode-based one selected here. The §5.11.7 follow-on
+    /// elements (`intra_angle_info_y`, `uv_mode`, `read_cfl_alphas`,
+    /// `intra_angle_info_uv`, `palette_mode_info`,
+    /// `filter_intra_mode_info`) remain the next round's targets.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    pub fn decode_intra_frame_y_mode(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+    ) -> Result<u8, crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §8.3.2 ctx derivation (av1-spec p.361):
+        //   abovemode = Intra_Mode_Context[ AvailU ? YModes[ MiRow - 1 ][ MiCol ] : DC_PRED ]
+        //   leftmode  = Intra_Mode_Context[ AvailL ? YModes[ MiRow ][ MiCol - 1 ] : DC_PRED ]
+        //
+        // `AvailU` / `AvailL` are the §5.11.51 tile-bound predicates;
+        // an unavailable neighbour contributes the spec's
+        // `DC_PRED == 0` fallback, which `y_mode_at` returns naturally
+        // for out-of-grid coordinates. The `is_inside` gate
+        // additionally suppresses neighbours that are in-grid but
+        // outside the current tile (a real tile-mid block's left
+        // neighbour can be in-grid yet in the previous tile, where
+        // `AvailL` is false per §5.11.51).
+        let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+        let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+        let above_mode = if avail_u {
+            self.y_mode_at(mi_row as i32 - 1, mi_col as i32) as usize
+        } else {
+            0 // DC_PRED per spec
+        };
+        let left_mode = if avail_l {
+            self.y_mode_at(mi_row as i32, mi_col as i32 - 1) as usize
+        } else {
+            0 // DC_PRED per spec
+        };
+        // `intra_mode_ctx` is total over `0..INTRA_MODES`; both
+        // neighbour values are bounded by the §3 enumeration so the
+        // mapping is safe.
+        debug_assert!(
+            above_mode < INTRA_MODES,
+            "neighbour above YMode out of §3 enumeration range"
+        );
+        debug_assert!(
+            left_mode < INTRA_MODES,
+            "neighbour left YMode out of §3 enumeration range"
+        );
+        let abovemode_ctx = intra_mode_ctx(above_mode);
+        let leftmode_ctx = intra_mode_ctx(left_mode);
+
+        // §8.3.2 selection + §8.2.6 S() over a 14-entry CDF row (13
+        // symbol slots + the counter). The §9.4
+        // `Default_Intra_Frame_Y_Mode_Cdf` shape is
+        // `[[u16; INTRA_MODES + 1]; INTRA_MODE_CONTEXTS];
+        // INTRA_MODE_CONTEXTS`.
+        let cdf = cdfs.intra_frame_y_mode_cdf(abovemode_ctx, leftmode_ctx);
+        let y_mode = decoder.read_symbol(cdf)? as u8;
+        debug_assert!(
+            (y_mode as usize) < INTRA_MODES,
+            "S() over Default_Intra_Frame_Y_Mode_Cdf yields 0..INTRA_MODES"
+        );
+
+        // §5.11.5 grid-fill: stamp `YMode` over the block's bh4 * bw4
+        // footprint, clipped at the frame's MiRows / MiCols extent so
+        // a leaf straddling the bottom or right edge fills only the
+        // in-grid portion.
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.y_modes[(rr * self.mi_cols + cc) as usize] = y_mode;
+            }
+        }
+
+        Ok(y_mode)
     }
 }
 
@@ -25094,6 +25326,281 @@ mod tests {
         assert_eq!(accessor_view[0], 30531);
         assert_eq!(accessor_view[1], 32768);
         assert_eq!(accessor_view[2], 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Round 165 — §5.11.7 / §5.11.22 `decode_intra_frame_y_mode` tests.
+    // -----------------------------------------------------------------
+
+    /// §5.11.5 fresh `YModes[]` grid is filled with `DC_PRED == 0`
+    /// (the §3 intra-mode enumeration's ordinal-zero value, which
+    /// the §8.3.2 `intra_frame_y_mode` ctx walk's "neighbour
+    /// unavailable" arm also produces).
+    #[test]
+    fn fresh_walker_y_modes_grid_is_dc_pred() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        assert_eq!(walker.y_modes().len(), 16 * 16);
+        for &v in walker.y_modes() {
+            assert_eq!(v, 0, "fresh YModes[] = DC_PRED (== 0)");
+        }
+    }
+
+    /// Build a rigged `Default_Intra_Frame_Y_Mode_Cdf`-shaped row
+    /// (`INTRA_MODES + 1 = 14` entries) that forces the next §8.2.6
+    /// `S()` read to return `symbol ∈ 0..INTRA_MODES`. The
+    /// `read_symbol` decoder scans for the first symbol whose
+    /// cumulative `cur > 0` is strictly below `SymbolValue = 32767`;
+    /// setting every slot `< symbol` to `0` and every slot `>=
+    /// symbol` (up to the trailing `INTRA_MODES`-th, which is the
+    /// `1 << 15` cap) puts `cur = 0` for every smaller symbol and
+    /// the cap for the target.
+    fn force_intra_frame_y_mode_cdf(symbol: u8) -> [u16; INTRA_MODES + 1] {
+        assert!(
+            (symbol as usize) < INTRA_MODES,
+            "force_intra_frame_y_mode_cdf supports 0..INTRA_MODES only"
+        );
+        let mut row = [0u16; INTRA_MODES + 1];
+        for slot in row.iter_mut().take(INTRA_MODES).skip(symbol as usize) {
+            *slot = 1 << 15;
+        }
+        // The N-th slot (INTRA_MODES) is the §8.2.6 counter; leave at 0.
+        row
+    }
+
+    /// §5.11.7 / §5.11.22 caller-bug bounds: `sub_size >=
+    /// BLOCK_SIZES`, `mi_row >= MiRows`, `mi_col >= MiCols` all surface
+    /// `PartitionWalkOutOfRange` before any bit is read.
+    #[test]
+    fn decode_intra_frame_y_mode_rejects_out_of_range() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        assert!(matches!(
+            walker.decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_SIZES),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            walker.decode_intra_frame_y_mode(&mut dec, &mut cdfs, 16, 0, BLOCK_4X4),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            walker.decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, 16, BLOCK_4X4),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no symbol bit read on the bounds-rejection path"
+        );
+    }
+
+    /// §5.11.7 / §5.11.22 happy path with a rigged CDF forcing
+    /// `symbol = 0` (`DC_PRED`): the decoder returns the forced
+    /// symbol and writes it into the `YModes[]` grid over the
+    /// block's `bh4 * bw4` footprint.
+    #[test]
+    fn decode_intra_frame_y_mode_returns_symbol_zero_and_stamps_grid() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force every (abovemode, leftmode) ctx pair to select symbol 0.
+        let rigged = force_intra_frame_y_mode_cdf(0);
+        for a in 0..INTRA_MODE_CONTEXTS {
+            for l in 0..INTRA_MODE_CONTEXTS {
+                cdfs.intra_frame_y_mode[a][l] = rigged;
+            }
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let y_mode = walker
+            .decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_16X16)
+            .unwrap();
+        assert_eq!(y_mode, 0, "rigged CDF returns DC_PRED");
+        // BLOCK_16X16 footprint is 4x4 mi cells; every cell carries 0.
+        let bw4 = NUM_4X4_BLOCKS_WIDE[BLOCK_16X16] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[BLOCK_16X16] as u32;
+        for dr in 0..bh4 {
+            for dc in 0..bw4 {
+                let idx = (dr * walker.mi_cols() + dc) as usize;
+                assert_eq!(
+                    walker.y_modes()[idx],
+                    0,
+                    "footprint cell ({dr},{dc}) stamped with YMode=0"
+                );
+            }
+        }
+    }
+
+    /// §5.11.7 / §5.11.22 happy path with a rigged CDF forcing
+    /// `symbol = 12` (`PAETH_PRED`, the largest valid `YMode`): the
+    /// decoder returns the forced symbol and stamps it across the
+    /// block's footprint. Confirms the full 13-symbol range is
+    /// reachable through the accessor.
+    #[test]
+    fn decode_intra_frame_y_mode_returns_symbol_max_and_stamps_grid() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let rigged = force_intra_frame_y_mode_cdf(12);
+        for a in 0..INTRA_MODE_CONTEXTS {
+            for l in 0..INTRA_MODE_CONTEXTS {
+                cdfs.intra_frame_y_mode[a][l] = rigged;
+            }
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let y_mode = walker
+            .decode_intra_frame_y_mode(&mut dec, &mut cdfs, 4, 4, BLOCK_8X8)
+            .unwrap();
+        assert_eq!(y_mode, 12, "rigged CDF returns PAETH_PRED");
+        // BLOCK_8X8 footprint is 2x2 mi cells anchored at (4,4).
+        let bw4 = NUM_4X4_BLOCKS_WIDE[BLOCK_8X8] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[BLOCK_8X8] as u32;
+        for dr in 0..bh4 {
+            for dc in 0..bw4 {
+                let idx = ((4 + dr) * walker.mi_cols() + (4 + dc)) as usize;
+                assert_eq!(
+                    walker.y_modes()[idx],
+                    12,
+                    "footprint cell stamped with YMode=12"
+                );
+            }
+        }
+        // A cell outside the footprint stays at its initial DC_PRED == 0.
+        assert_eq!(
+            walker.y_modes()[0],
+            0,
+            "non-footprint cell (0,0) remains DC_PRED"
+        );
+    }
+
+    /// §8.3.2 ctx derivation against §5.11.51 `AvailU` / `AvailL`:
+    /// the (0,0) top-left block always has both neighbours
+    /// unavailable, so `abovemode_ctx = leftmode_ctx =
+    /// Intra_Mode_Context[ DC_PRED == 0 ] = 0`. The CDF row used
+    /// must be `intra_frame_y_mode[0][0]`.
+    #[test]
+    fn decode_intra_frame_y_mode_corner_uses_dc_pred_neighbours() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig only the [0][0] row to return symbol 7 (SMOOTH_PRED);
+        // every other row keeps the §9.4 default. If the corner truly
+        // picks (0,0), the returned symbol is 7.
+        cdfs.intra_frame_y_mode[0][0] = force_intra_frame_y_mode_cdf(7);
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let y_mode = walker
+            .decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_4X4)
+            .unwrap();
+        assert_eq!(y_mode, 7, "top-left corner block routes through ctx (0, 0)");
+    }
+
+    /// §8.3.2 ctx derivation reads the §5.11.5-stamped `YModes[]`
+    /// grid: after a first block at (0,0) stamps `YMode = V_PRED = 1`
+    /// across its footprint, the next block at (0, bw4) sees that
+    /// value as its left neighbour, so `leftmode_ctx =
+    /// Intra_Mode_Context[ 1 ] = 1` (and `abovemode_ctx = 0`,
+    /// since `AvailU` is false on the top row). We verify by rigging
+    /// `intra_frame_y_mode[0][1]` to a distinctive symbol and
+    /// confirming the second call returns it.
+    #[test]
+    fn decode_intra_frame_y_mode_reads_neighbour_ymodes_grid() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // First call at (0,0), BLOCK_8X8 (2x2 footprint), force YMode=1.
+        cdfs.intra_frame_y_mode[0][0] = force_intra_frame_y_mode_cdf(1);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let first = walker
+            .decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_8X8)
+            .unwrap();
+        assert_eq!(first, 1, "first block stamps YMode=V_PRED=1");
+        // Now the second block at (0, bw4) sees the stamped value as its
+        // left neighbour; ctx = (abovemode=0, leftmode=1). Rig that
+        // exact row to return symbol 5 (D113_PRED); other rows
+        // (including the contaminated [0][0]) stay rigged at 1.
+        cdfs.intra_frame_y_mode[0][1] = force_intra_frame_y_mode_cdf(5);
+        let bw4 = NUM_4X4_BLOCKS_WIDE[BLOCK_8X8] as u32;
+        let second = walker
+            .decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, bw4, BLOCK_8X8)
+            .unwrap();
+        assert_eq!(
+            second, 5,
+            "second block routes through ctx (abovemode=0, leftmode=1)"
+        );
+    }
+
+    /// §8.3.2 `Intra_Mode_Context[]` mapping is applied at ctx
+    /// derivation time, not at write time: stamping a `YMode = 4`
+    /// (`D203_PRED`) neighbour selects a ctx of `4` per the §8.3.2
+    /// table (`[0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0]`). We rig
+    /// `intra_frame_y_mode[0][4]` to a distinctive symbol and confirm
+    /// the second call observes that row.
+    #[test]
+    fn decode_intra_frame_y_mode_applies_intra_mode_context_mapping() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // First block at (0,0), BLOCK_4X4, force YMode=4 (D203_PRED).
+        cdfs.intra_frame_y_mode[0][0] = force_intra_frame_y_mode_cdf(4);
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let first = walker
+            .decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, 0, BLOCK_4X4)
+            .unwrap();
+        assert_eq!(first, 4);
+        // Per §8.3.2 `Intra_Mode_Context[4] = 4`; the next block at
+        // (0, 1) (BLOCK_4X4 is 1x1 mi) should route through
+        // (abovemode=0, leftmode=4). Rig that row distinctively.
+        cdfs.intra_frame_y_mode[0][4] = force_intra_frame_y_mode_cdf(9);
+        let second = walker
+            .decode_intra_frame_y_mode(&mut dec, &mut cdfs, 0, 1, BLOCK_4X4)
+            .unwrap();
+        assert_eq!(
+            second, 9,
+            "Intra_Mode_Context[4] = 4 routes second block to ctx (0, 4)"
+        );
     }
 
     /// §5.11.7 `decode_use_intrabc` is **stateless** in the §5.11.5

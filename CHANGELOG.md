@@ -6,6 +6,82 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 165 — §5.11.7 / §5.11.22 `intra_frame_y_mode` syntax element
+  (`decode_intra_frame_y_mode`).**
+  Lands a new [`PartitionWalker::decode_intra_frame_y_mode`] method
+  implementing the §5.11.7 `intra_frame_y_mode` syntax element
+  (av1-spec p.65) — the per-block luma intra-prediction-mode selector
+  read on the §5.11.7 `intra_frame_mode_info()` `else` arm
+  (`use_intrabc == 0`), immediately after the `is_inter = 0`
+  assignment that r164's [`PartitionWalker::decode_use_intrabc`]
+  fall-through arm produced. The spec body is the two-line
+  `intra_frame_y_mode S(); YMode = intra_frame_y_mode`; the
+  dispatcher reads a single `S()` symbol against the §8.3.2
+  `intra_frame_y_mode` ctx-selected CDF and stamps the result over
+  the block's `bw4 * bh4` footprint of a new `YModes[][]` grid.
+
+  New `PartitionWalker::y_modes: Vec<u8>` field — a `mi_rows *
+  mi_cols` row-major buffer covering the §6.10.4 `YModes[ r ][ c ]`
+  grid (av1-spec p.378 / §5.11.5 line `YModes[ r + y ][ c + x ] =
+  YMode`). Cells are initialised to `0` (= `DC_PRED`, the §3
+  intra-mode enumeration's ordinal-zero value); the initial-zero
+  state matches the §8.3.2 `intra_frame_y_mode` ctx walk's
+  "neighbour unavailable" arm, where the spec writes `abovemode =
+  Intra_Mode_Context[ AvailU ? YModes[ MiRow - 1 ][ MiCol ] :
+  DC_PRED ]` (an unavailable-or-pre-write neighbour contributes the
+  same `Intra_Mode_Context[ DC_PRED ] = 0` weight). The new
+  `y_modes()` read accessor surfaces the grid; a `y_mode_at`
+  private helper performs the bounds-clipped neighbour lookup.
+
+  §8.3.2 ctx derivation honours both §5.11.51 tile-bound predicates
+  (`AvailU` / `AvailL` via [`TileGeometry::is_inside`]) and the
+  §8.3.2 `Intra_Mode_Context[]` mapping (driven through the existing
+  [`intra_mode_ctx`] helper). The CDF row is selected via the
+  existing [`TileCdfContext::intra_frame_y_mode_cdf`] accessor —
+  no new `Default_*` table is added (r127 already transcribed the
+  §9.4 `Default_Intra_Frame_Y_Mode_Cdf` array verbatim).
+
+  7 new cdf-module tests (539 → 546):
+    * `fresh_walker_y_modes_grid_is_dc_pred` — the constructor's
+      pre-fill matches the §5.11.5 `YModes[]` initial-zero (=
+      `DC_PRED`) state across every cell.
+    * `decode_intra_frame_y_mode_rejects_out_of_range` — `sub_size
+      >= BLOCK_SIZES` / `mi_row >= MiRows` / `mi_col >= MiCols`
+      all surface `PartitionWalkOutOfRange` before any bit is read.
+    * `decode_intra_frame_y_mode_returns_symbol_zero_and_stamps_grid`
+      — a rigged CDF forcing symbol 0 (`DC_PRED`) is returned, and
+      the value is stamped across the `BLOCK_16X16` footprint
+      (4×4 mi cells).
+    * `decode_intra_frame_y_mode_returns_symbol_max_and_stamps_grid`
+      — a rigged CDF forcing symbol 12 (`PAETH_PRED`, the largest
+      valid `YMode`) is returned and stamped across a `BLOCK_8X8`
+      footprint at (4,4); a non-footprint cell at (0,0) remains
+      `DC_PRED`.
+    * `decode_intra_frame_y_mode_corner_uses_dc_pred_neighbours` —
+      the (0,0) top-left block routes through ctx `(abovemode=0,
+      leftmode=0)` (both neighbours unavailable ⇒ both map to
+      `DC_PRED` ⇒ both ctx indices are 0).
+    * `decode_intra_frame_y_mode_reads_neighbour_ymodes_grid` —
+      after a first block at (0,0) stamps `YMode = V_PRED = 1`
+      across its footprint, the next block at (0, bw4) routes
+      through ctx `(abovemode=0, leftmode=1)`, observable through
+      the rigged distinctive-symbol return.
+    * `decode_intra_frame_y_mode_applies_intra_mode_context_mapping`
+      — stamping a `YMode = 4` (`D203_PRED`) neighbour selects a
+      leftmode_ctx of `4` per the §8.3.2 `Intra_Mode_Context[]`
+      table (`[0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0]`).
+
+  Together with r164's [`PartitionWalker::decode_use_intrabc`] this
+  closes the first leaf of the §5.11.7 `else` arm and the first
+  sub-element of the §5.11.22 `intra_block_mode_info` composite. The
+  remaining §5.11.7 `else`-arm elements (`intra_angle_info_y`,
+  `uv_mode`, `read_cfl_alphas`, `intra_angle_info_uv`,
+  `palette_mode_info`, `filter_intra_mode_info`) remain bounded leaf
+  targets for r166+. The `use_intrabc == 1` short-circuit
+  (`find_mv_stack(0)` / `assign_mv(0)`) still awaits the
+  motion-vector stack walker. `decode_av1` / `encode_av1` continue
+  to return `Error::NotImplemented`.
+
 * **Round 164 — §5.11.7 `use_intrabc` syntax element (`decode_use_intrabc`).**
   Lands a new [`PartitionWalker::decode_use_intrabc`] method
   implementing the §5.11.7 `use_intrabc` syntax element (av1-spec
