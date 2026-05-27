@@ -1323,6 +1323,385 @@ fn clip1_bit_depth(x: u32, bit_depth: u8) -> u32 {
 }
 
 // ---------------------------------------------------------------------
+// Round 186 — §7.11.2.1 `AboveRow[]` / `LeftCol[]` neighbour derivation.
+//
+// The §7.11.2.1 prologue (av1-spec p.241-242) walks `CurrFrame[plane]`
+// at the per-TU `(x, y)` top-left to populate the two neighbour
+// arrays the §7.11.2.{2..6} leaves consume:
+//
+//   * `AboveRow[ 0..w+h-1 ]` — top edge samples, with the right-tail
+//     clamped to `maxX` when the TU is at the frame's right boundary
+//     and constant-propagated from the single available LEFT cell
+//     when `haveAbove == 0 && haveLeft == 1`.
+//   * `LeftCol[ 0..w+h-1 ]` — left edge samples, mirrored derivation.
+//
+// On the all-unavailable arm (`haveAbove == 0 && haveLeft == 0`)
+// `AboveRow[i]` is filled with `(1 << (BitDepth - 1)) - 1` and
+// `LeftCol[i]` with `(1 << (BitDepth - 1)) + 1` — the spec's
+// asymmetric mid-grey offsets that the §7.11.2.2 PAETH base-sample
+// derivation depends on to break ties cleanly.
+//
+// These helpers stage the prologue as standalone routines so the
+// V_PRED / H_PRED leaves (and the next-arc D-mode / SMOOTH /
+// PAETH bodies) can be driven end-to-end from a `CurrFrame[plane]`
+// buffer the walker's §7.12.3 step-3 merge has populated. The
+// `AboveRow[-1]` / `LeftCol[-1]` corner sample (§7.11.2.1 last
+// bullet) is not derived here — V_PRED / H_PRED do not consult it;
+// it lands alongside the next-arc PAETH leaf which is its only
+// reader on the degenerate-angle subset.
+// ---------------------------------------------------------------------
+
+/// §7.11.2.1 `AboveRow[ 0..w+h-1 ]` derivation (av1-spec p.241) —
+/// fills `above_row[ 0..w+h-1 ]` from the per-plane `CurrFrame`
+/// buffer at the `(x, y)` top-left of the current transform block.
+///
+/// ## Arguments
+///
+/// * `have_above` — `1` if the TU has valid samples above (`haveAbove`
+///   from §7.11.2.1). Routed from the §5.11.5 `AvailU` derivation.
+/// * `have_left` — `1` if the TU has valid samples to the left
+///   (`haveLeft` from §7.11.2.1).
+/// * `have_above_right` — `1` if the TU has valid samples above-right
+///   (drives the `aboveLimit` `2*w` extension).
+/// * `x` / `y` — the per-plane top-left in `CurrFrame[plane]` sample
+///   space (already post-subsampling for `plane > 0`).
+/// * `w` / `h` — prediction region width / height in plane samples.
+/// * `max_x` — `(MiCols * MI_SIZE) - 1` for plane 0; for `plane > 0`
+///   it is `((MiCols * MI_SIZE) >> subsampling_x) - 1`. The spec's
+///   per-plane right-edge sample index clamp.
+/// * `curr_frame` — flat row-major `CurrFrame[plane]` buffer.
+/// * `curr_frame_cols` — column stride of `curr_frame`. The flat
+///   index for `(row, col)` is `row * curr_frame_cols + col`.
+/// * `bit_depth` — §5.5.2 bit depth (`8`, `10`, or `12`); used only
+///   for the all-unavailable mid-grey fallback.
+/// * `above_row` — output buffer; length must be `>= w + h`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success.
+///
+/// [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments: `w > 64`, `h > 64`, `above_row.len() < w + h`,
+/// `bit_depth ∉ {8, 10, 12}`, `curr_frame_cols == 0`, or the
+/// `have_above != 0` arm's `(y - 1, x + i)` reads landing outside
+/// the buffer (a real walker post-§7.12.3-merge invariant keeps
+/// the per-TU coordinates in-buffer; this guard catches the
+/// caller-bug case where they don't).
+#[allow(clippy::too_many_arguments)]
+pub fn derive_above_row(
+    have_above: u8,
+    have_left: u8,
+    have_above_right: u8,
+    x: u32,
+    y: u32,
+    w: usize,
+    h: usize,
+    max_x: u32,
+    curr_frame: &[i32],
+    curr_frame_cols: u32,
+    bit_depth: u8,
+    above_row: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if !matches!(bit_depth, 8 | 10 | 12) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed = w
+        .checked_add(h)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if above_row.len() < needed {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if curr_frame_cols == 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    if have_above == 0 && have_left == 1 {
+        // §7.11.2.1 arm 1: AboveRow[i] = CurrFrame[plane][y][x-1].
+        // The `x-1` index is well-defined when `haveLeft == 1` (the
+        // §5.11.5 walker only sets `AvailL == true` for `x > 0`);
+        // a `have_left = 1 && x == 0` argument is a caller bug.
+        if x == 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let cols = curr_frame_cols as usize;
+        let col = (x as usize) - 1;
+        let row = y as usize;
+        let idx = row
+            .checked_mul(cols)
+            .and_then(|p| p.checked_add(col))
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        if idx >= curr_frame.len() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let sample = curr_frame[idx].clamp(0, (1i32 << bit_depth) - 1) as u16;
+        for slot in above_row.iter_mut().take(needed) {
+            *slot = sample;
+        }
+    } else if have_above == 0 && have_left == 0 {
+        // §7.11.2.1 arm 2: AboveRow[i] = (1 << (BitDepth - 1)) - 1.
+        let mid_minus = ((1u32 << (bit_depth - 1)) - 1) as u16;
+        for slot in above_row.iter_mut().take(needed) {
+            *slot = mid_minus;
+        }
+    } else {
+        // §7.11.2.1 arm 3 (haveAbove == 1):
+        //   aboveLimit = Min(maxX, x + (haveAboveRight ? 2*w : w) - 1).
+        //   AboveRow[i] = CurrFrame[plane][y - 1][Min(aboveLimit, x + i)].
+        if y == 0 {
+            // haveAbove == 1 with y == 0 is a caller bug.
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let extend = if have_above_right != 0 { 2 * w } else { w };
+        // `extend == 0` would underflow; the §3 transform-size table
+        // forbids w == 0 (smallest is 4).
+        let above_limit = (max_x).min((x as u64 + extend as u64 - 1) as u32);
+        let cols = curr_frame_cols as usize;
+        let row = (y as usize) - 1;
+        let base = row
+            .checked_mul(cols)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let max_in_buffer = curr_frame.len();
+        let max_val = (1i32 << bit_depth) - 1;
+        for (i, slot) in above_row.iter_mut().take(needed).enumerate() {
+            let col = (x as u64 + i as u64).min(above_limit as u64) as usize;
+            let idx = base
+                .checked_add(col)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            if idx >= max_in_buffer {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            *slot = curr_frame[idx].clamp(0, max_val) as u16;
+        }
+    }
+    Ok(())
+}
+
+/// §7.11.2.1 `LeftCol[ 0..w+h-1 ]` derivation (av1-spec p.242) —
+/// mirror of [`derive_above_row`] for the left-edge neighbour
+/// array. `max_y` is the per-plane bottom-edge clamp (`(MiRows *
+/// MI_SIZE) - 1` for plane 0).
+#[allow(clippy::too_many_arguments)]
+pub fn derive_left_col(
+    have_left: u8,
+    have_above: u8,
+    have_below_left: u8,
+    x: u32,
+    y: u32,
+    w: usize,
+    h: usize,
+    max_y: u32,
+    curr_frame: &[i32],
+    curr_frame_cols: u32,
+    bit_depth: u8,
+    left_col: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if !matches!(bit_depth, 8 | 10 | 12) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed = w
+        .checked_add(h)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if left_col.len() < needed {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if curr_frame_cols == 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    if have_left == 0 && have_above == 1 {
+        // §7.11.2.1 arm 1 (LeftCol): LeftCol[i] = CurrFrame[plane][y - 1][x].
+        if y == 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let cols = curr_frame_cols as usize;
+        let row = (y as usize) - 1;
+        let col = x as usize;
+        let idx = row
+            .checked_mul(cols)
+            .and_then(|p| p.checked_add(col))
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        if idx >= curr_frame.len() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let sample = curr_frame[idx].clamp(0, (1i32 << bit_depth) - 1) as u16;
+        for slot in left_col.iter_mut().take(needed) {
+            *slot = sample;
+        }
+    } else if have_left == 0 && have_above == 0 {
+        // §7.11.2.1 arm 2 (LeftCol): LeftCol[i] = (1 << (BitDepth - 1)) + 1.
+        let mid_plus = ((1u32 << (bit_depth - 1)) + 1) as u16;
+        for slot in left_col.iter_mut().take(needed) {
+            *slot = mid_plus;
+        }
+    } else {
+        // §7.11.2.1 arm 3 (haveLeft == 1):
+        //   leftLimit = Min(maxY, y + (haveBelowLeft ? 2*h : h) - 1).
+        //   LeftCol[i] = CurrFrame[plane][Min(leftLimit, y + i)][x - 1].
+        if x == 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let extend = if have_below_left != 0 { 2 * h } else { h };
+        let left_limit = (max_y).min((y as u64 + extend as u64 - 1) as u32);
+        let cols = curr_frame_cols as usize;
+        let col = (x as usize) - 1;
+        let max_in_buffer = curr_frame.len();
+        let max_val = (1i32 << bit_depth) - 1;
+        for (i, slot) in left_col.iter_mut().take(needed).enumerate() {
+            let row = (y as u64 + i as u64).min(left_limit as u64) as usize;
+            let idx = row
+                .checked_mul(cols)
+                .and_then(|p| p.checked_add(col))
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            if idx >= max_in_buffer {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            *slot = curr_frame[idx].clamp(0, max_val) as u16;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Round 186 — §7.11.2.4 V_PRED and H_PRED sample-generation leaves.
+//
+// V_PRED and H_PRED are the two degenerate directional intra modes
+// (`Mode_To_Angle[V_PRED] = 90`, `Mode_To_Angle[H_PRED] = 180`; av1-
+// spec p.485). The §7.11.2.4 directional process collapses on those
+// angles to steps 10 and 11 of the §7.11.2.4 body (av1-spec p.247):
+//
+//   * step 10 (pAngle == 90, V_PRED): `pred[i][j] = AboveRow[j]` for
+//     i = 0..h-1, j = 0..w-1 — each row is a copy of `AboveRow`.
+//   * step 11 (pAngle == 180, H_PRED): `pred[i][j] = LeftCol[i]` for
+//     i = 0..h-1, j = 0..w-1 — each column is a copy of `LeftCol`.
+//
+// On the `AngleDeltaY == 0` / `AngleDeltaUV == 0` path the §5.11.5
+// walker's `decode_intra_block_mode_info` defaults to today, the
+// step-2 `pAngle = Mode_To_Angle[mode] + 0 * ANGLE_STEP` is exactly
+// `90` for V_PRED and `180` for H_PRED. (Non-zero angle deltas
+// shift `pAngle` into the strict `< 90` / `90 < .. < 180` /
+// `> 180` arms of §7.11.2.4, which are the D-mode bodies covered by
+// a subsequent arc.)
+//
+// The §7.11.2.1 prologue (av1-spec p.241-242) derives `AboveRow[]` /
+// `LeftCol[]` from `CurrFrame[plane][..][..]` and falls back to
+// `(1 << (BitDepth - 1)) ± 1` mid-grey when both neighbours are
+// unavailable. These leaves take pre-derived neighbour arrays and
+// write `pred[ 0..h*w ]`; the caller (the [`PartitionWalker::
+// compute_prediction`] dispatcher's intra arm) drives the
+// neighbour-sample derivation through a separate §7.11.2.1
+// `derive_above_row` / `derive_left_col` helper, mirroring the r180
+// DC_PRED leaf's caller-supplies-edges convention.
+// ---------------------------------------------------------------------
+
+/// §7.11.2.4 step 10 — vertical (V_PRED) intra prediction (av1-spec
+/// p.247). Fills `pred[ 0..h*w ]` with `pred[i][j] = AboveRow[j]`
+/// for `i = 0..h-1`, `j = 0..w-1` (each row is a copy of the top-
+/// edge sample at column `j`).
+///
+/// The spec body collapses to step 10 when `pAngle == 90`, i.e.
+/// `mode == V_PRED` (the §6.10.x intra-mode ordinal `1`) and
+/// `angleDelta == 0` (`AngleDeltaY` / `AngleDeltaUV` from §5.11.42 /
+/// §5.11.43, both default-zero on the §5.11.5 walker's reachable
+/// path today).
+///
+/// ## Arguments
+///
+/// * `w` / `h` — the prediction region's width / height in plane
+///   samples. Both in `4..=64` per the §3 transform-size table.
+/// * `above_row` — `AboveRow[ 0..w-1 ]`. Length must be `>= w`.
+/// * `pred` — output buffer, row-major; length must be `>= h * w`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments (`w > 64`, `h > 64`, `above_row.len() < w`,
+/// `pred.len() < h * w`).
+pub fn predict_intra_v_pred(
+    w: usize,
+    h: usize,
+    above_row: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if above_row.len() < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.2.4 step 10: each row of the block is filled with a
+    // copy of `AboveRow[ 0..w-1 ]`.
+    for i in 0..h {
+        let row = &mut pred[i * w..i * w + w];
+        row.copy_from_slice(&above_row[..w]);
+    }
+    Ok(())
+}
+
+/// §7.11.2.4 step 11 — horizontal (H_PRED) intra prediction (av1-
+/// spec p.247). Fills `pred[ 0..h*w ]` with `pred[i][j] =
+/// LeftCol[i]` for `i = 0..h-1`, `j = 0..w-1` (each column is a
+/// copy of the left-edge sample at row `i`).
+///
+/// The spec body collapses to step 11 when `pAngle == 180`, i.e.
+/// `mode == H_PRED` (the §6.10.x intra-mode ordinal `2`) and
+/// `angleDelta == 0`.
+///
+/// ## Arguments
+///
+/// * `w` / `h` — the prediction region's width / height in plane
+///   samples. Both in `4..=64`.
+/// * `left_col` — `LeftCol[ 0..h-1 ]`. Length must be `>= h`.
+/// * `pred` — output buffer, row-major; length must be `>= h * w`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments (`w > 64`, `h > 64`, `left_col.len() < h`,
+/// `pred.len() < h * w`).
+pub fn predict_intra_h_pred(
+    w: usize,
+    h: usize,
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if left_col.len() < h {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.2.4 step 11: each column of the block is filled with a
+    // copy of `LeftCol[ 0..h-1 ]`. Implemented row-major: row `i`
+    // gets `LeftCol[i]` repeated `w` times.
+    for i in 0..h {
+        let v = left_col[i];
+        let row = &mut pred[i * w..i * w + w];
+        for cell in row.iter_mut() {
+            *cell = v;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // Round 149 — §5.11.49 caller-side argument derivation.
 // Computes the four `palette_tokens_plane` size arguments
 // (`block_w`, `block_h`, `onscreen_w`, `onscreen_h`) from the parser-
@@ -1528,11 +1907,28 @@ pub const DIRECTIONAL_MODES: usize = 8;
 /// [`DEFAULT_ANGLE_DELTA_CDF`].
 pub const MAX_ANGLE_DELTA: usize = 3;
 
+/// `DC_PRED` (§6.10.x intra-mode enumeration) — the zero ordinal of
+/// the §3 intra-mode enumeration (`DC_PRED == 0`, `V_PRED == 1`,
+/// `H_PRED == 2`, …, `PAETH_PRED == 12`). The §7.11.2.5 DC
+/// intra-prediction process leaf is [`predict_intra_dc_pred`]; the
+/// §5.11.33 `compute_prediction` dispatcher routes a plane with
+/// `mode == DC_PRED` to it.
+pub const DC_PRED: usize = 0;
+
 /// `V_PRED` (§6.10.x intra-mode enumeration) — the first directional
 /// intra mode (`DC_PRED == 0`, `V_PRED == 1`, …, `D67_PRED == 8`). The
 /// §8.3.2 `angle_delta` selections rebase a directional `YMode` / `UVMode`
-/// onto `0..DIRECTIONAL_MODES` by subtracting this value.
+/// onto `0..DIRECTIONAL_MODES` by subtracting this value. The
+/// §7.11.2.4 step-10 sample-generation leaf is
+/// [`predict_intra_v_pred`].
 pub const V_PRED: usize = 1;
+
+/// `H_PRED` (§6.10.x intra-mode enumeration) — the horizontal
+/// directional intra mode (`DC_PRED == 0`, `V_PRED == 1`,
+/// `H_PRED == 2`). `Mode_To_Angle[H_PRED] == 180`, so the §7.11.2.4
+/// directional process collapses to step 11 on `angleDelta == 0`.
+/// The sample-generation leaf is [`predict_intra_h_pred`].
+pub const H_PRED: usize = 2;
 
 /// `D67_PRED` (§6.10.x intra-mode enumeration) — the last directional
 /// intra mode. §5.11.44 `is_directional_mode(mode)` returns `1` for
@@ -21950,10 +22346,16 @@ impl PartitionWalker {
     ///   `log2W`, `log2H`, `haveAbove` / `haveLeft` from the
     ///   §5.11.5 `AvailU` / `AvailL` / `AvailUChroma` / `AvailLChroma`
     ///   flags). Plane 0 carries `y_mode`; planes 1/2 carry `uv_mode`.
-    /// * §5.11.33 reachable-mode gate — currently `DC_PRED` only
-    ///   (the §7.11.2.5 sample-generation leaf is
-    ///   [`crate::predict_intra_dc_pred`]). Non-`DC_PRED` modes
-    ///   surface [`crate::Error::ComputePredictionIntraModeUnsupported`].
+    /// * §5.11.33 reachable-mode gate — currently `DC_PRED`,
+    ///   `V_PRED`, and `H_PRED` (the §7.11.2.5 DC sample-generation
+    ///   leaf is [`crate::predict_intra_dc_pred`]; the §7.11.2.4
+    ///   step-10 / step-11 V_PRED / H_PRED sample-generation leaves
+    ///   are [`crate::predict_intra_v_pred`] / [`crate::
+    ///   predict_intra_h_pred`]). The remaining 10 intra modes
+    ///   (`SMOOTH_PRED` / `SMOOTH_V_PRED` / `SMOOTH_H_PRED` /
+    ///   `PAETH_PRED` / `D45_PRED` / `D135_PRED` / `D113_PRED` /
+    ///   `D157_PRED` / `D203_PRED` / `D67_PRED`) surface
+    ///   [`crate::Error::ComputePredictionIntraModeUnsupported`].
     ///
     /// ## Argument contract
     ///
@@ -22076,21 +22478,28 @@ impl PartitionWalker {
             // §5.11.33 `!is_inter` (intra) arm. The §7.11.2.1 dispatch
             // routes to one of §7.11.2.5 (DC_PRED) / §7.11.2.6
             // (SMOOTH_*) / §7.11.2.4 (directional) / §7.11.2.2
-            // (PAETH_PRED) per `mode`. Today only §7.11.2.5
-            // (DC_PRED) lands as a standalone leaf
-            // ([`crate::predict_intra_dc_pred`]); the other §7.11.2.x
-            // bodies are next-arc.
+            // (PAETH_PRED) per `mode`. Today §7.11.2.5 (DC_PRED) and
+            // the two §7.11.2.4 degenerate directional cases V_PRED
+            // (`pAngle == 90`, step 10) and H_PRED (`pAngle == 180`,
+            // step 11) land as standalone leaves
+            // ([`crate::predict_intra_dc_pred`] /
+            // [`crate::predict_intra_v_pred`] /
+            // [`crate::predict_intra_h_pred`]); the other §7.11.2.x
+            // bodies (SMOOTH variants, PAETH, the non-degenerate
+            // D-modes) are next-arc.
             let plane_mode = if plane == 0 { y_mode } else { uv_mode };
 
-            // §5.11.33 reachable-mode gate (intra-DC only today).
+            // §5.11.33 reachable-mode gate (intra-DC + V_PRED + H_PRED
+            // today; modes 3..=12 next-arc).
             if plane_mode as usize >= INTRA_MODES && plane_mode != UV_CFL_PRED as u8 {
                 // Out-of-range mode (caller bug — the §5.11.7 /
                 // §5.11.22 readers cap at `INTRA_MODES`).
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            if plane_mode != 0
-            /* DC_PRED */
-            {
+            // `DC_PRED == 0`, `V_PRED == 1`, `H_PRED == 2`. Everything
+            // outside this triple still surfaces the §7.11.2.{2,3,4,6}
+            // stub for the next arc.
+            if plane_mode > H_PRED as u8 {
                 return Err(crate::Error::ComputePredictionIntraModeUnsupported);
             }
 
@@ -26055,6 +26464,463 @@ mod tests {
         assert_eq!(clip1_bit_depth(300, 8), 255);
         assert_eq!(clip1_bit_depth(2000, 10), 1023);
         assert_eq!(clip1_bit_depth(8000, 12), 4095);
+    }
+
+    /// r186: §7.11.2.4 step 10 V_PRED — every row is a copy of
+    /// `AboveRow[ 0..w-1 ]`. Verify on a 4×4 block with distinct
+    /// per-column above samples.
+    #[test]
+    fn v_pred_broadcasts_above_row_into_every_row() {
+        let above = [10u16, 20, 30, 40];
+        let mut pred = [0u16; 16];
+        predict_intra_v_pred(4, 4, &above, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    pred[i * 4 + j],
+                    above[j],
+                    "row {i} col {j} must equal AboveRow[{j}]"
+                );
+            }
+        }
+    }
+
+    /// r186: §7.11.2.4 step 11 H_PRED — every column is a copy of
+    /// `LeftCol[ 0..h-1 ]`. Verify on a 4×4 block with distinct
+    /// per-row left samples.
+    #[test]
+    fn h_pred_broadcasts_left_col_into_every_col() {
+        let left = [10u16, 20, 30, 40];
+        let mut pred = [0u16; 16];
+        predict_intra_h_pred(4, 4, &left, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    pred[i * 4 + j],
+                    left[i],
+                    "row {i} col {j} must equal LeftCol[{i}]"
+                );
+            }
+        }
+    }
+
+    /// r186: V_PRED on a rectangular `w=8, h=4` block exercises the
+    /// non-square case (row stride differs from `h`).
+    #[test]
+    fn v_pred_rectangular_8x4_uses_w_for_row_stride() {
+        let above = [1u16, 2, 3, 4, 5, 6, 7, 8];
+        let mut pred = [0u16; 32];
+        predict_intra_v_pred(8, 4, &above, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..8 {
+                assert_eq!(pred[i * 8 + j], above[j]);
+            }
+        }
+    }
+
+    /// r186: H_PRED on a rectangular `w=4, h=8` block — eight rows
+    /// of constant samples, indexed by `i`.
+    #[test]
+    fn h_pred_rectangular_4x8_uses_left_per_row() {
+        let left = [100u16, 101, 102, 103, 104, 105, 106, 107];
+        let mut pred = [0u16; 32];
+        predict_intra_h_pred(4, 8, &left, &mut pred).unwrap();
+        for i in 0..8 {
+            for j in 0..4 {
+                assert_eq!(pred[i * 4 + j], left[i]);
+            }
+        }
+    }
+
+    /// r186: V_PRED admits the largest §3 transform width (64) and
+    /// height (64). The §7.11.2.4 step-10 body has no bit-depth
+    /// dependence on the input samples themselves — the values are
+    /// just copied — so a `2^16 - 1`-sized sample (the largest a
+    /// 12-bit decoded sample can be) round-trips intact.
+    #[test]
+    fn v_pred_max_size_64x64_round_trips_12bit_samples() {
+        let above = vec![4095u16; 64];
+        let mut pred = vec![0u16; 64 * 64];
+        predict_intra_v_pred(64, 64, &above, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 4095));
+    }
+
+    /// r186: H_PRED admits the largest §3 transform height (64).
+    #[test]
+    fn h_pred_max_size_64x64_round_trips_12bit_samples() {
+        let left = vec![4095u16; 64];
+        let mut pred = vec![0u16; 64 * 64];
+        predict_intra_h_pred(64, 64, &left, &mut pred).unwrap();
+        assert!(pred.iter().all(|&v| v == 4095));
+    }
+
+    /// r186: V_PRED only reads `above_row[ 0..w-1 ]`. Trailing slots
+    /// (`w..w+h-1` carried by a real `AboveRow` array per §7.11.2.1)
+    /// are ignored on the step-10 path. Verify the helper writes
+    /// only the first `w` slots' values.
+    #[test]
+    fn v_pred_ignores_above_row_past_w() {
+        let above = [1u16, 2, 3, 4, 99, 99, 99, 99];
+        let mut pred = [0u16; 16];
+        predict_intra_v_pred(4, 4, &above, &mut pred).unwrap();
+        for j in 0..4 {
+            assert_eq!(pred[j], above[j]);
+        }
+        // Sanity: none of the trailing `99`-sentinel slots leaked
+        // into the prediction buffer (only `1..=4` should appear).
+        assert!(pred.iter().all(|&v| (1..=4).contains(&v)));
+    }
+
+    /// r186: H_PRED only reads `left_col[ 0..h-1 ]`.
+    #[test]
+    fn h_pred_ignores_left_col_past_h() {
+        let left = [1u16, 2, 3, 4, 99, 99, 99, 99];
+        let mut pred = [0u16; 16];
+        predict_intra_h_pred(4, 4, &left, &mut pred).unwrap();
+        for i in 0..4 {
+            assert_eq!(pred[i * 4], left[i]);
+        }
+        assert!(pred.iter().all(|&v| (1..=4).contains(&v)));
+    }
+
+    /// r186: V_PRED caller-bug guards — undersized `above_row`,
+    /// undersized `pred`, out-of-range `w` / `h`.
+    #[test]
+    fn v_pred_caller_bug_guards() {
+        let above = [1u16; 4];
+        let mut pred = [0u16; 16];
+        // w > 64 — caller bug.
+        assert!(matches!(
+            predict_intra_v_pred(65, 4, &above, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // h > 64 — caller bug.
+        assert!(matches!(
+            predict_intra_v_pred(4, 65, &above, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // above_row.len() < w — caller bug.
+        let short_above = [1u16; 3];
+        assert!(matches!(
+            predict_intra_v_pred(4, 4, &short_above, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // pred.len() < h * w — caller bug.
+        let mut short_pred = [0u16; 8];
+        assert!(matches!(
+            predict_intra_v_pred(4, 4, &above, &mut short_pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r186: H_PRED caller-bug guards — undersized `left_col`,
+    /// undersized `pred`, out-of-range `w` / `h`.
+    #[test]
+    fn h_pred_caller_bug_guards() {
+        let left = [1u16; 4];
+        let mut pred = [0u16; 16];
+        assert!(matches!(
+            predict_intra_h_pred(65, 4, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            predict_intra_h_pred(4, 65, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        let short_left = [1u16; 3];
+        assert!(matches!(
+            predict_intra_h_pred(4, 4, &short_left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        let mut short_pred = [0u16; 8];
+        assert!(matches!(
+            predict_intra_h_pred(4, 4, &left, &mut short_pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r186: §3 / §6.10.x intra-mode ordinals — `DC_PRED == 0`,
+    /// `V_PRED == 1`, `H_PRED == 2`. Pins the constants the dispatcher
+    /// gate consults.
+    #[test]
+    fn intra_mode_ordinals_dc_v_h_match_spec() {
+        assert_eq!(DC_PRED, 0);
+        assert_eq!(V_PRED, 1);
+        assert_eq!(H_PRED, 2);
+    }
+
+    /// r186: §7.11.2.1 `AboveRow[]` arm 3 — `haveAbove == 1` reads
+    /// `CurrFrame[plane][y-1][x..x+w-1]` (clamped by `aboveLimit`).
+    /// Build a 4-row × 8-col buffer with a recognisable above row and
+    /// confirm the derivation picks it up.
+    #[test]
+    fn derive_above_row_have_above_reads_curr_frame_top_row() {
+        // 4 rows × 8 cols. Row 0 = [10, 20, 30, 40, 50, 60, 70, 80];
+        // other rows = 0.
+        let mut frame = vec![0i32; 4 * 8];
+        for (j, slot) in frame.iter_mut().take(8).enumerate() {
+            *slot = ((j + 1) * 10) as i32;
+        }
+        let mut above = [0u16; 8];
+        // TU at (x=0, y=1), w=4, h=4 — reads row 0.
+        derive_above_row(
+            /* have_above = */ 1, /* have_left = */ 0, /* have_above_right = */ 0,
+            /* x = */ 0, /* y = */ 1, /* w = */ 4, /* h = */ 4,
+            /* max_x = */ 7, &frame, /* curr_frame_cols = */ 8, /* bit_depth = */ 8,
+            &mut above,
+        )
+        .unwrap();
+        assert_eq!(&above[..4], &[10u16, 20, 30, 40]);
+        // The `aboveLimit = Min(7, 0 + 4 - 1) = 3` clamp pins the
+        // tail to `CurrFrame[0][3] = 40`.
+        assert_eq!(&above[4..8], &[40u16; 4]);
+    }
+
+    /// r186: §7.11.2.1 `AboveRow[]` arm 3 — `haveAboveRight == 1`
+    /// extends the tail with samples up to `x + 2w - 1`.
+    #[test]
+    fn derive_above_row_have_above_right_extends_tail() {
+        let mut frame = vec![0i32; 4 * 8];
+        for (j, slot) in frame.iter_mut().take(8).enumerate() {
+            *slot = ((j + 1) * 10) as i32;
+        }
+        let mut above = [0u16; 8];
+        derive_above_row(
+            1, 0, /* have_above_right = */ 1, 0, 1, 4, 4, 7, &frame, 8, 8, &mut above,
+        )
+        .unwrap();
+        // aboveLimit = Min(7, 0 + 8 - 1) = 7 → full row visible.
+        assert_eq!(&above[..8], &[10u16, 20, 30, 40, 50, 60, 70, 80]);
+    }
+
+    /// r186: §7.11.2.1 `AboveRow[]` arm 3 — `max_x` clamps the tail
+    /// before `x + 2w - 1` does (frame-right-boundary case).
+    #[test]
+    fn derive_above_row_max_x_clamps_tail() {
+        let mut frame = vec![0i32; 4 * 4];
+        for (j, slot) in frame.iter_mut().take(4).enumerate() {
+            *slot = ((j + 1) * 10) as i32;
+        }
+        let mut above = [0u16; 8];
+        // x=0, w=4, have_above_right=1 ⇒ extend would request col 7,
+        // but max_x = 3 (4-col frame). Clamp pins everything past col 3
+        // to frame[3] = 40.
+        derive_above_row(
+            1, 0, 1, 0, 1, 4, 4, /* max_x = */ 3, &frame, 4, 8, &mut above,
+        )
+        .unwrap();
+        assert_eq!(&above[..4], &[10u16, 20, 30, 40]);
+        assert_eq!(&above[4..], &[40u16; 4]);
+    }
+
+    /// r186: §7.11.2.1 `AboveRow[]` arm 1 — `haveAbove == 0 &&
+    /// haveLeft == 1` propagates `CurrFrame[plane][y][x-1]` (a single
+    /// sample) into every cell.
+    #[test]
+    fn derive_above_row_have_left_only_propagates_left_sample() {
+        let mut frame = vec![0i32; 4 * 4];
+        // Place 123 at (row=1, col=0); test reads (y=1, x=1) ⇒ col=0.
+        frame[4] = 123;
+        let mut above = [0u16; 8];
+        derive_above_row(
+            /* have_above = */ 0, /* have_left = */ 1, 0, /* x = */ 1,
+            /* y = */ 1, 4, 4, 3, &frame, 4, 8, &mut above,
+        )
+        .unwrap();
+        assert!(above[..8].iter().all(|&v| v == 123));
+    }
+
+    /// r186: §7.11.2.1 `AboveRow[]` arm 2 — `haveAbove == 0 &&
+    /// haveLeft == 0` fills with `(1 << (BitDepth - 1)) - 1`
+    /// (mid-grey minus one).
+    #[test]
+    fn derive_above_row_no_neighbour_fills_mid_grey_minus_one() {
+        let frame = vec![0i32; 4 * 4];
+        let mut above = [0u16; 8];
+        derive_above_row(
+            0, 0, 0, 0, 0, 4, 4, 3, &frame, 4, /* bit_depth = */ 8, &mut above,
+        )
+        .unwrap();
+        assert!(above[..8].iter().all(|&v| v == 127));
+
+        let mut above10 = [0u16; 8];
+        derive_above_row(0, 0, 0, 0, 0, 4, 4, 3, &frame, 4, 10, &mut above10).unwrap();
+        assert!(above10[..8].iter().all(|&v| v == 511));
+
+        let mut above12 = [0u16; 8];
+        derive_above_row(0, 0, 0, 0, 0, 4, 4, 3, &frame, 4, 12, &mut above12).unwrap();
+        assert!(above12[..8].iter().all(|&v| v == 2047));
+    }
+
+    /// r186: §7.11.2.1 `LeftCol[]` arm 3 — `haveLeft == 1` reads
+    /// `CurrFrame[plane][y..y+h-1][x-1]` (clamped by `leftLimit`).
+    #[test]
+    fn derive_left_col_have_left_reads_curr_frame_left_col() {
+        // 8 rows × 4 cols. Col 0 = [10, 20, 30, 40, 50, 60, 70, 80].
+        let mut frame = vec![0i32; 8 * 4];
+        for i in 0..8 {
+            frame[i * 4] = ((i + 1) * 10) as i32;
+        }
+        let mut left = [0u16; 8];
+        derive_left_col(
+            /* have_left = */ 1, /* have_above = */ 0, /* have_below_left = */ 0,
+            /* x = */ 1, // col-0 reads x - 1 = 0
+            /* y = */ 0, /* w = */ 4, /* h = */ 4, /* max_y = */ 7, &frame,
+            /* curr_frame_cols = */ 4, /* bit_depth = */ 8, &mut left,
+        )
+        .unwrap();
+        assert_eq!(&left[..4], &[10u16, 20, 30, 40]);
+        // leftLimit = Min(7, 0 + 4 - 1) = 3 ⇒ tail pins to row-3
+        // sample (= 40).
+        assert_eq!(&left[4..8], &[40u16; 4]);
+    }
+
+    /// r186: §7.11.2.1 `LeftCol[]` arm 3 — `haveBelowLeft == 1`
+    /// extends the tail with samples up to `y + 2h - 1`.
+    #[test]
+    fn derive_left_col_have_below_left_extends_tail() {
+        let mut frame = vec![0i32; 8 * 4];
+        for i in 0..8 {
+            frame[i * 4] = ((i + 1) * 10) as i32;
+        }
+        let mut left = [0u16; 8];
+        derive_left_col(
+            1, 0, /* have_below_left = */ 1, 1, 0, 4, 4, 7, &frame, 4, 8, &mut left,
+        )
+        .unwrap();
+        // leftLimit = Min(7, 0 + 8 - 1) = 7 → full column visible.
+        assert_eq!(&left[..8], &[10u16, 20, 30, 40, 50, 60, 70, 80]);
+    }
+
+    /// r186: §7.11.2.1 `LeftCol[]` arm 1 — `haveLeft == 0 &&
+    /// haveAbove == 1` propagates `CurrFrame[plane][y-1][x]`.
+    #[test]
+    fn derive_left_col_have_above_only_propagates_above_sample() {
+        let mut frame = vec![0i32; 4 * 4];
+        frame[1] = 200; // row 0, col 1
+        let mut left = [0u16; 8];
+        derive_left_col(
+            0, 1, 0, /* x = */ 1, /* y = */ 1, 4, 4, 3, &frame, 4, 8, &mut left,
+        )
+        .unwrap();
+        assert!(left[..8].iter().all(|&v| v == 200));
+    }
+
+    /// r186: §7.11.2.1 `LeftCol[]` arm 2 — no-neighbour fill is
+    /// `(1 << (BitDepth - 1)) + 1` (mid-grey plus one). Note the
+    /// asymmetry vs `AboveRow[]`'s `-1`.
+    #[test]
+    fn derive_left_col_no_neighbour_fills_mid_grey_plus_one() {
+        let frame = vec![0i32; 4 * 4];
+        let mut left = [0u16; 8];
+        derive_left_col(0, 0, 0, 0, 0, 4, 4, 3, &frame, 4, 8, &mut left).unwrap();
+        assert!(left[..8].iter().all(|&v| v == 129));
+
+        let mut left10 = [0u16; 8];
+        derive_left_col(0, 0, 0, 0, 0, 4, 4, 3, &frame, 4, 10, &mut left10).unwrap();
+        assert!(left10[..8].iter().all(|&v| v == 513));
+    }
+
+    /// r186: end-to-end V_PRED through the §7.11.2.1 derivation —
+    /// `derive_above_row` → `predict_intra_v_pred` produces a block
+    /// whose every row is a copy of the top CurrFrame row.
+    #[test]
+    fn v_pred_end_to_end_with_derive_above_row() {
+        let mut frame = vec![0i32; 4 * 4];
+        for (j, slot) in frame.iter_mut().take(4).enumerate() {
+            *slot = ((j + 1) * 16) as i32; // row 0 = [16, 32, 48, 64]
+        }
+        let mut above = [0u16; 8];
+        derive_above_row(1, 0, 0, 0, 1, 4, 4, 3, &frame, 4, 8, &mut above).unwrap();
+        let mut pred = [0u16; 16];
+        predict_intra_v_pred(4, 4, &above, &mut pred).unwrap();
+        for i in 0..4 {
+            assert_eq!(&pred[i * 4..i * 4 + 4], &[16u16, 32, 48, 64]);
+        }
+    }
+
+    /// r186: end-to-end H_PRED through the §7.11.2.1 derivation —
+    /// `derive_left_col` → `predict_intra_h_pred` produces a block
+    /// whose every column is a copy of the left CurrFrame column.
+    #[test]
+    fn h_pred_end_to_end_with_derive_left_col() {
+        let mut frame = vec![0i32; 4 * 4];
+        for i in 0..4 {
+            frame[i * 4] = ((i + 1) * 16) as i32; // col 0 = [16, 32, 48, 64]
+        }
+        let mut left = [0u16; 8];
+        derive_left_col(1, 0, 0, 1, 0, 4, 4, 3, &frame, 4, 8, &mut left).unwrap();
+        let mut pred = [0u16; 16];
+        predict_intra_h_pred(4, 4, &left, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(pred[i * 4 + j], ((i + 1) * 16) as u16);
+            }
+        }
+    }
+
+    /// r186: `derive_above_row` caller-bug guards.
+    #[test]
+    fn derive_above_row_caller_bug_guards() {
+        let frame = vec![0i32; 16];
+        let mut above = [0u16; 8];
+        // w > 64.
+        assert!(matches!(
+            derive_above_row(0, 0, 0, 0, 0, 65, 4, 0, &frame, 4, 8, &mut above),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // bit_depth out of range.
+        assert!(matches!(
+            derive_above_row(0, 0, 0, 0, 0, 4, 4, 0, &frame, 4, /* bit_depth = */ 9, &mut above),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // above_row too small.
+        let mut small = [0u16; 4];
+        assert!(matches!(
+            derive_above_row(0, 0, 0, 0, 0, 4, 4, 0, &frame, 4, 8, &mut small),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // curr_frame_cols == 0.
+        assert!(matches!(
+            derive_above_row(0, 0, 0, 0, 0, 4, 4, 0, &frame, 0, 8, &mut above),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // have_above == 1 with y == 0 (caller bug — no row -1).
+        assert!(matches!(
+            derive_above_row(1, 0, 0, 0, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut above),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // have_left == 1 with have_above == 0, x == 0 (caller bug
+        // — no col -1).
+        assert!(matches!(
+            derive_above_row(0, 1, 0, /* x = */ 0, 1, 4, 4, 3, &frame, 4, 8, &mut above),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r186: `derive_left_col` caller-bug guards (mirror of above).
+    #[test]
+    fn derive_left_col_caller_bug_guards() {
+        let frame = vec![0i32; 16];
+        let mut left = [0u16; 8];
+        assert!(matches!(
+            derive_left_col(0, 0, 0, 0, 0, 4, 65, 0, &frame, 4, 8, &mut left),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            derive_left_col(0, 0, 0, 0, 0, 4, 4, 0, &frame, 4, 7, &mut left),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // have_left == 1 with x == 0 (no col -1).
+        assert!(matches!(
+            derive_left_col(1, 0, 0, /* x = */ 0, 0, 4, 4, 3, &frame, 4, 8, &mut left),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // have_above == 1 with y == 0 (no row -1).
+        assert!(matches!(
+            derive_left_col(0, 1, 0, 1, /* y = */ 0, 4, 4, 3, &frame, 4, 8, &mut left),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
     }
 
     /// §8.3.1: a fresh context is a verbatim copy of the §9.4 defaults,

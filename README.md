@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 185)
+## Status — 2026-05-28 (round 186)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1551,6 +1551,64 @@ through the dispatcher witnessing the `InterpolationFilterReadout`
 on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
+`encode_av1` still return `Error::NotImplemented`.
+
+Round 186 lifts the **§7.11.2.4 V_PRED and H_PRED sample-generation
+leaves** alongside the **§7.11.2.1 `AboveRow[]` / `LeftCol[]`
+neighbour derivation** that feeds them — the two cheapest non-DC
+intra modes, covering the degenerate directional cases where
+`pAngle == 90` (V_PRED) and `pAngle == 180` (H_PRED) collapse the
+§7.11.2.4 directional process to a row / column broadcast.
+
+`predict_intra_v_pred(w, h, above_row, pred)` (§7.11.2.4 step 10)
+fills `pred[i][j] = AboveRow[j]` — every row of the block is a
+copy of the top-edge sample at column `j`.
+`predict_intra_h_pred(w, h, left_col, pred)` (step 11) is the
+mirror: `pred[i][j] = LeftCol[i]`. Both reachable when the
+§5.11.5 walker's `decode_intra_block_mode_info` emits the matching
+`YMode` and `angleDelta == 0`.
+
+`derive_above_row(have_above, have_left, have_above_right, x, y,
+w, h, max_x, curr_frame, curr_frame_cols, bit_depth, above_row)`
+transcribes §7.11.2.1 arms 1-3 — reads the r185
+`CurrFrame[plane]` buffer at the per-TU top-left to populate the
+`AboveRow[0..w+h-1]` neighbour array. Honours the spec's
+`haveAboveRight ? 2*w : w` tail extension, the `aboveLimit =
+Min(maxX, x + extend - 1)` frame-right-boundary clamp, the
+left-only constant-propagation arm, and the asymmetric
+all-unavailable `(1 << (BitDepth - 1)) - 1` mid-grey fallback.
+`derive_left_col(...)` is the mirror with the asymmetric
+`(1 << (BitDepth - 1)) + 1` no-neighbour fill.
+
+The §5.11.33 `compute_prediction` dispatcher's intra arm now
+admits `mode ∈ {DC_PRED, V_PRED, H_PRED}` (rebroken-down from
+DC_PRED-only at r180). `Error::ComputePredictionIntraModeUnsupported`
+still fires for the 10 remaining intra modes (SMOOTH_PRED /
+SMOOTH_V_PRED / SMOOTH_H_PRED / PAETH_PRED / D45_PRED /
+D135_PRED / D113_PRED / D157_PRED / D203_PRED / D67_PRED) —
+next-arc targets. New named ordinals `DC_PRED` and `H_PRED`
+exposed as `pub const` alongside the pre-existing `V_PRED`.
+
+The §7.11.2.1 corner sample (`AboveRow[-1]` / `LeftCol[-1]`) is
+not derived in r186 — V_PRED and H_PRED do not consult it. It
+lands with the next-arc PAETH leaf which is its only reader on
+the degenerate-angle subset.
+
+Test count: 859 → 885 (+26). New tests: V_PRED row broadcast on
+4×4 / 8×4 / 64×64; H_PRED column broadcast on 4×4 / 4×8 / 64×64;
+both leaves ignore neighbour-array slots past `w` / `h` (the
+§7.11.2.1 prologue derives `w + h` but step-10 / step-11 only
+consume `w` / `h`); caller-bug guards on each leaf;
+`derive_above_row` arms 1-3 (top-row read, `haveAboveRight` tail
+extension, `max_x` clamp, left-only propagation,
+mid-grey-minus-one all-unavailable for 8 / 10 / 12-bit
+`BitDepth`); `derive_left_col` arms 1-3 mirror; end-to-end
+`derive_above_row` → `predict_intra_v_pred` + `derive_left_col`
+→ `predict_intra_h_pred` round trips through a real
+`CurrFrame[plane]`-shaped buffer; dispatcher acceptance of
+V_PRED / H_PRED with task-list mode forwarding on a 3-plane
+4:2:0 block; dispatcher rejection of D45_PRED / SMOOTH_PRED /
+PAETH_PRED at the next-arc-gap boundary. `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
 
 Round 185 lifts the **§7.12.3 step-3 frame-buffer merge** — the

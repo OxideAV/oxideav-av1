@@ -6,6 +6,90 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 186 — §7.11.2.4 V_PRED + H_PRED sample-generation leaves
+  + §7.11.2.1 `AboveRow[]` / `LeftCol[]` neighbour derivation.**
+  Extends the §5.11.33 `compute_prediction` dispatcher's intra arm
+  from DC_PRED-only (r180) to {DC_PRED, V_PRED, H_PRED} — the two
+  cheapest non-DC intra modes, covering the §7.11.2.4 degenerate
+  directional cases (`pAngle == 90` for V_PRED, `pAngle == 180` for
+  H_PRED) where the directional process collapses to a row /
+  column broadcast.
+
+  * **New `predict_intra_v_pred(w, h, above_row, pred)`** —
+    §7.11.2.4 step 10 (av1-spec p.247). Fills `pred[i][j] =
+    AboveRow[j]` for `i ∈ 0..h`, `j ∈ 0..w` (each row of the
+    block is a copy of the top-edge sample at column `j`).
+    Reachable when `mode == V_PRED == 1` and `angleDelta == 0`
+    (the §5.11.5 walker's default on the
+    `decode_intra_block_mode_info` path).
+  * **New `predict_intra_h_pred(w, h, left_col, pred)`** —
+    §7.11.2.4 step 11. Mirror of V_PRED: `pred[i][j] =
+    LeftCol[i]` for `i ∈ 0..h`, `j ∈ 0..w` (each column of the
+    block is a copy of the left-edge sample at row `i`).
+  * **New `derive_above_row(have_above, have_left,
+    have_above_right, x, y, w, h, max_x, curr_frame,
+    curr_frame_cols, bit_depth, above_row)`** — §7.11.2.1
+    prologue arms 1-3 (av1-spec p.241). Reads `CurrFrame[plane]`
+    at the per-TU `(x, y)` top-left to populate the
+    `AboveRow[0..w+h-1]` neighbour array, with the spec's
+    `haveAboveRight ? 2*w : w` tail extension and the `aboveLimit
+    = Min(maxX, x + extend - 1)` frame-right-boundary clamp. On
+    the `haveAbove == 0 && haveLeft == 1` arm the array is
+    constant-propagated from `CurrFrame[plane][y][x-1]`; on the
+    all-unavailable arm it is filled with `(1 << (BitDepth - 1))
+    - 1` (mid-grey minus one — the spec's asymmetric
+    `AboveRow[]` no-neighbour value).
+  * **New `derive_left_col(have_left, have_above,
+    have_below_left, x, y, w, h, max_y, curr_frame,
+    curr_frame_cols, bit_depth, left_col)`** — §7.11.2.1
+    prologue mirror for `LeftCol[0..w+h-1]`. `haveBelowLeft ?
+    2*h : h` tail extension, `leftLimit = Min(maxY, y + extend -
+    1)` bottom-boundary clamp, `(1 << (BitDepth - 1)) + 1`
+    (mid-grey plus one — the spec's asymmetric `LeftCol[]`
+    no-neighbour value) all-unavailable fill.
+  * **Dispatcher gate narrowed.** The §5.11.33
+    `PartitionWalker::compute_prediction` intra arm now admits
+    `mode ∈ {DC_PRED, V_PRED, H_PRED}` instead of DC_PRED only.
+    `ComputePredictionIntraModeUnsupported` still fires for the
+    remaining 10 intra modes (SMOOTH_PRED / SMOOTH_V_PRED /
+    SMOOTH_H_PRED / PAETH_PRED / D45_PRED / D135_PRED /
+    D113_PRED / D157_PRED / D203_PRED / D67_PRED) — next-arc
+    targets.
+  * **New named §6.10.x intra-mode ordinals** — `DC_PRED = 0` /
+    `H_PRED = 2` exported as `pub const`. `V_PRED = 1` already
+    existed via the §8.3.2 angle-delta selector base. Pins the
+    constants the dispatcher gate consults so callers can route
+    on named values instead of magic numbers.
+
+  Test count: 859 → 885 (+26). The new tests cover V_PRED row
+  broadcast on 4×4 / 8×4 / 64×64 blocks; H_PRED column broadcast
+  on 4×4 / 4×8 / 64×64 blocks; both leaves ignore neighbour-array
+  slots past `w` / `h` (the §7.11.2.1 prologue derives `w + h`
+  samples but step-10 / step-11 only consume the first `w` /
+  `h`); caller-bug guards on both leaves; `AboveRow[]` arms 1-3
+  (top-row read, `haveAboveRight` tail extension, `max_x` clamp,
+  left-only propagation, all-unavailable mid-grey-minus-one);
+  `LeftCol[]` arms 1-3 (left-col read, `haveBelowLeft` tail
+  extension, above-only propagation, all-unavailable
+  mid-grey-plus-one for 8-bit and 10-bit `BitDepth`); end-to-end
+  `derive_above_row` → `predict_intra_v_pred` and
+  `derive_left_col` → `predict_intra_h_pred` round trips through
+  the §7.11.2.1 prologue against a real `CurrFrame[plane]`-shaped
+  buffer; dispatcher acceptance of V_PRED and H_PRED with task-
+  list mode forwarding on a 3-plane 4:2:0 block; dispatcher
+  rejection of D45_PRED / SMOOTH_PRED / PAETH_PRED at the
+  next-arc-gap boundary; intra-mode ordinal pins.
+
+  The §7.11.2.1 corner-sample derivation (`AboveRow[-1]` /
+  `LeftCol[-1]`) is not landed in r186 — V_PRED and H_PRED do not
+  consult it. It is the only PAETH_PRED dependency on the
+  degenerate-angle subset and lands with the PAETH leaf in a
+  later arc. The dispatcher itself still returns a per-plane
+  task list rather than invoking the prediction kernels directly:
+  the walker integration (driving the leaves end-to-end through
+  the walker's `CurrFrame[plane]` buffer) lands when the §5.11.5
+  walker starts emitting non-DC_PRED `YMode` cells.
+
 * **Round 185 — §7.12.3 step-3 frame-buffer merge + `CurrFrame`
   per-plane sample buffers.** Lifts the last remaining placeholder
   in the §7.12.3 reconstruct chain: with r185 the per-TU

@@ -1996,13 +1996,73 @@ fn compute_prediction_inter_intra_arm_surfaces_stub() {
     assert_eq!(result, Err(Error::ComputePredictionInterIntraUnsupported));
 }
 
-/// §5.11.33 non-DC_PRED intra mode (e.g. V_PRED = 1) currently
-/// surfaces the next-arc stub.
+/// r186: §5.11.33 V_PRED admitted on the dispatcher's intra arm —
+/// `y_mode == V_PRED == 1` produces a per-plane task with the
+/// V_PRED mode ordinal forwarded into the task. The dispatcher
+/// itself does not invoke the §7.11.2.4 step-10 leaf
+/// ([`predict_intra_v_pred`]); it surfaces the per-plane prediction
+/// task list for the caller to drive against `CurrFrame[plane]`.
 #[test]
-fn compute_prediction_non_dc_pred_surfaces_stub() {
+fn compute_prediction_v_pred_dispatches_one_task_per_plane() {
     let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
+            /* y_mode = */ 1, // V_PRED
+            /* uv_mode = */ 1, // V_PRED
+            false,
+        )
+        .expect("V_PRED intra arm must dispatch post-r186");
+    assert_eq!(r.num_planes_visited, 3);
+    assert_eq!(r.tasks.len(), 3);
+    assert_eq!(r.tasks[0].mode, 1, "plane 0 V_PRED forwarded");
+    assert_eq!(r.tasks[1].mode, 1, "plane 1 V_PRED forwarded");
+    assert_eq!(r.tasks[2].mode, 1, "plane 2 V_PRED forwarded");
+}
+
+/// r186: §5.11.33 H_PRED admitted on the dispatcher's intra arm —
+/// mirror of the V_PRED test with `y_mode == H_PRED == 2`.
+#[test]
+fn compute_prediction_h_pred_dispatches_one_task_per_plane() {
+    let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
+            /* y_mode = */ 2, // H_PRED
+            /* uv_mode = */ 2, // H_PRED
+            false,
+        )
+        .expect("H_PRED intra arm must dispatch post-r186");
+    assert_eq!(r.num_planes_visited, 3);
+    assert_eq!(r.tasks.len(), 3);
+    assert_eq!(r.tasks[0].mode, 2);
+    assert_eq!(r.tasks[1].mode, 2);
+    assert_eq!(r.tasks[2].mode, 2);
+}
+
+/// r186: §5.11.33 non-{DC_PRED, V_PRED, H_PRED} intra modes still
+/// surface the next-arc stub. Verifies SMOOTH_PRED (= 9) and the
+/// other supported-set boundary (mode == 3 = D45_PRED).
+#[test]
+fn compute_prediction_non_dc_v_h_pred_surfaces_stub() {
+    let mut walker = walker_n(16);
+    // mode = 3 (D45_PRED) — first unsupported.
     let result = walker.compute_prediction(
-        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 1, 0,
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 3, 0,
+        false,
+    );
+    assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
+
+    // mode = 9 (SMOOTH_PRED) — a different unsupported mode.
+    let result = walker.compute_prediction(
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 9, 0,
+        false,
+    );
+    assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
+
+    // mode = 12 (PAETH_PRED) — last in-range unsupported.
+    let result = walker.compute_prediction(
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 12, 0,
         false,
     );
     assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
