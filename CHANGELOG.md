@@ -6,6 +6,91 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 182 — §7.13 inverse transform process.** New
+  `oxideav_av1::transform` module reproduces the AV1 §7.13 inverse-
+  transform stack from the spec text directly: §7.13.2.1
+  `butterfly_b` / `butterfly_h` / `cos128` / `sin128` /
+  `brev` primitives driven by the spec's 65-entry
+  `Cos128_Lookup[65]` quarter-period table; §7.13.2.2 inverse DCT
+  permutation; §7.13.2.3 `inverse_dct(t, n, r)` for `n in 2..=6`
+  (sizes 4 / 8 / 16 / 32 / 64; 31-step `B`/`H` butterfly schedule
+  reproduced verbatim); §7.13.2.4 / §7.13.2.5 inverse ADST input
+  + output Gray-code permutations; §7.13.2.6 `inverse_adst4`
+  closed-form with the `SINPI_1_9 = 1321` /  `SINPI_2_9 = 2482` /
+  `SINPI_3_9 = 3344` / `SINPI_4_9 = 3803` constants; §7.13.2.7
+  `inverse_adst8` 7-step butterfly schedule; §7.13.2.8
+  `inverse_adst16` 9-step butterfly schedule; §7.13.2.9
+  `inverse_adst` dispatcher; §7.13.2.10 `inverse_wht4` (Lossless
+  4-point Walsh-Hadamard); §7.13.2.11..§7.13.2.14 inverse identity
+  4 / 8 / 16 / 32 (with the spec's `5793` / `11586` scaling pairs
+  and `*2` / `*4` doublings); §7.13.2.15 `inverse_identity`
+  dispatcher.
+
+  The §7.13.3 2D dispatcher `inverse_transform_2d(dequant, tx_sz,
+  tx_type, bit_depth, lossless)` returns the row-major `w * h`
+  `Residual[][]` buffer. Implements the full row-then-column
+  composition over the 16-element `PlaneTxType` matrix (DCT_DCT
+  through H_FLIPADST per §6.10.19), the `Abs(log2W - log2H) == 1`
+  rectangular `Round2(t * 2896, 12)` pre-scale, the
+  `Transform_Row_Shift[TX_SIZES_ALL]` per-size row right-shift, the
+  between-stage `Clip3` envelope at `colClampRange = Max(BitDepth +
+  6, 16)` bits, and the `Lossless` short-circuit through WHT.
+
+  Wired into `PartitionWalker::residual` / `transform_block_emit`:
+  on every TU with `eob > 0` the walker invokes
+  `inverse_transform_2d` (passing `Quant[]` directly as a
+  placeholder identity dequant — the §7.12.3 step-1 true
+  dequantization is split-off) and records the per-TU `Residual`
+  on a new `ResidualReadout::residuals: Vec<Option<Vec<i64>>>`
+  field (aligned to `tasks` length). The walker now returns
+  `Ok(DecodedBlock)` cleanly on every §5.11.5 path it reaches —
+  **lifting `Error::ResidualReconstructUnsupported`** (variant
+  retained as a defensive caller-bug sentinel).
+
+  Split-off explicitly: (1) §7.12.3 step-1 true dequantization
+  with `get_dc_quant` / `get_ac_quant` / `Quantizer_Matrix[
+  SegQMLevel ][ ... ]`; (2) §7.12.3 step-3 frame-buffer merge
+  with `flipLR` / `flipUD` destination remap on
+  `CurrFrame[plane][y + yy][x + xx]`; (3) §5.11.40 / §5.11.41
+  per-TU `PlaneTxType` read (still defaults to `DCT_DCT`); (4)
+  §7.5 `get_scan` table dispatch; (5) `AboveLevelContext` /
+  `LeftLevelContext` neighbour grids; (6) 10/12-bit `BitDepth`
+  (hardcoded to `8`).
+
+  Public surface added: `transform::inverse_transform_2d`,
+  `transform::inverse_dct` / `inverse_dct_permute`,
+  `transform::inverse_adst` / `inverse_adst4` / `inverse_adst8` /
+  `inverse_adst16` / `inverse_adst_input_permute` /
+  `inverse_adst_output_permute`, `transform::inverse_wht4`,
+  `transform::inverse_identity` / `inverse_identity4` /
+  `inverse_identity8` / `inverse_identity16` / `inverse_identity32`,
+  `transform::butterfly_b` / `butterfly_h`, `transform::cos128` /
+  `sin128` / `brev` / `round2` / `clip3`,
+  `transform::COS128_LOOKUP`, `transform::SINPI_1_9..SINPI_4_9`,
+  `transform::TRANSFORM_ROW_SHIFT`. `ResidualReadout` gains
+  `residuals: Vec<Option<Vec<i64>>>`.
+
+  33 new tests (768 → 801): twelve on the §7.13.2 1D primitives
+  (cos128 anchors at 0/32/64/96/128/160/192/224, sin128 ==
+  cos128(a-64) over the full period, brev, round2 sign-handling,
+  DCT permute n=2, ADST input permute n=3, zero-input
+  zero-preservation for IDCT 4 / 8 / 16 / 32 / 64 and IADST 4 / 8
+  / 16, identity 4 / 8 / 16 / 32 scaling with bit-exact
+  expectations, identity dispatcher); eight on the §7.13.3 2D
+  dispatcher (DCT_DCT 4×4 DC-only bit-exact = `128` per cell,
+  DCT_DCT zero-preserves, IDTX 4×4 DC-only bit-exact = `512` at
+  origin, Lossless zero-preserves, TX_4X8 rectangular
+  zero-preserves, 8×8 / 16×16 / 32×32 / 64×64 zero-preserves,
+  FLIPADST_FLIPADST and the six V_ / H_ variants zero-preserve);
+  one IDCT4 linearity check; one
+  `residual_no_skip_eob_positive_invokes_inverse_transform`
+  walker-integration test asserting `Some(Residual)` of length
+  `Tx_Width * Tx_Height` per gate-open TU. The seven existing
+  `decode_block_syntax` integration tests previously asserting
+  `Err(ResidualReconstructUnsupported)` now assert
+  `Ok(DecodedBlock)`. `decode_av1` / `encode_av1` continue to
+  return `Error::NotImplemented`.
+
 * **Round 181 — §5.11.34 `residual()` outer dispatch + §5.11.36
   `transform_tree` recursion + per-TU §5.11.39 wiring.** Lifts the
   §5.11.5 walker's long-standing `DecodeBlockResidualUnsupported`

@@ -21270,11 +21270,18 @@ impl PartitionWalker {
     ///   (the §7.11.2.x sample-generation leaves; only DC_PRED has
     ///   a standalone leaf today via [`predict_intra_dc_pred`]).
     /// * §5.11.35 `reconstruct( plane, startX, startY, txSz )` —
-    ///   surfaces [`crate::Error::ResidualReconstructUnsupported`]
-    ///   when reached on the `!skip && eob > 0` path.
+    ///   §7.13 inverse transform is LANDED (r182); the dispatcher
+    ///   invokes [`crate::transform::inverse_transform_2d`] when
+    ///   `eob > 0`. The §7.12.3 step-1 dequantization
+    ///   (`get_dc_quant` / `get_ac_quant` / `using_qmatrix` /
+    ///   `Quantizer_Matrix[ SegQMLevel ][ ... ]`) is a placeholder
+    ///   identity dequant (the §7.12.3 step-3 frame-buffer merge,
+    ///   including `flipLR` / `flipUD` for the FLIPADST family,
+    ///   is split-off).
     /// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` /
     ///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps.
-    /// * §7.13 `Dequant[][]` per-`(plane, pos)` dequantization.
+    /// * §7.12.3 step-1 `Dequant[][]` per-`(plane, pos)`
+    ///   dequantization (placeholder identity in r182).
     ///
     /// ## Argument contract
     ///
@@ -21314,10 +21321,12 @@ impl PartitionWalker {
     /// `tx_size >= TX_SIZES_ALL`). Returns
     /// [`crate::Error::ResidualCoefficientsTxSizeUnsupported`] when a
     /// per-leaf `txSz` falls outside the §5.11.39 reader's accepted
-    /// range. Returns
-    /// [`crate::Error::ResidualReconstructUnsupported`] when the
-    /// `!skip` path reads a non-`all_zero` TU (the §7.6 / §7.7
-    /// reconstruction-pass invocation).
+    /// range. r182 LIFTS
+    /// [`crate::Error::ResidualReconstructUnsupported`]: the §7.13
+    /// inverse transform now fires through
+    /// [`crate::transform::inverse_transform_2d`] on the `!skip &&
+    /// eob > 0` path; the residual is captured on
+    /// [`ResidualReadout::residuals`].
     #[allow(clippy::too_many_arguments)]
     pub fn residual(
         &mut self,
@@ -21371,6 +21380,7 @@ impl PartitionWalker {
             num_planes_visited: num_planes,
             tasks: Vec::new(),
             coeffs: Vec::new(),
+            residuals: Vec::new(),
             skip,
         };
 
@@ -21695,9 +21705,14 @@ impl PartitionWalker {
     /// [`ResidualReadout::tasks`], invokes [`Self::coefficients`] on
     /// the `!skip` path (with the splits noted in
     /// [`ResidualReadout`]'s docs feeding the deferred arguments),
-    /// and surfaces [`crate::Error::ResidualReconstructUnsupported`]
-    /// when the §5.11.39 reader reports `eob > 0` (the
-    /// reconstruction-pass invocation site).
+    /// and — as of r182 — invokes
+    /// [`crate::transform::inverse_transform_2d`] (§7.13.3 2D
+    /// inverse transform) whenever the §5.11.39 reader reports
+    /// `eob > 0`, recording the per-TU `Residual[][]` on
+    /// [`ResidualReadout::residuals`]. The dispatcher returns
+    /// `Ok(())` cleanly; the previous
+    /// [`crate::Error::ResidualReconstructUnsupported`] gate has
+    /// been lifted.
     #[allow(clippy::too_many_arguments)]
     fn transform_block_emit(
         &mut self,
@@ -21789,11 +21804,41 @@ impl PartitionWalker {
                 &mut quant,
             )?;
             readout.coeffs.push(coeffs);
-            // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)`. The
-            // §7.6 inverse-transform body + §7.13 dequant pre-pass +
-            // §7.7 reconstruction merge are the next-arc target.
+            // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
+            // §7.12.3 dequantization + §7.13 inverse transform +
+            // §7.7 reconstruction merge. As of r182 the §7.13 inverse
+            // transform is implemented in [`crate::transform`] and
+            // wired here through [`crate::transform::inverse_transform_2d`].
+            //
+            // The §7.12.3 step-1 dequantization is still a split-off:
+            // the spec computes `Dequant[i][j] = Quant[pos] * q2 /
+            // dqDenom` with `q2` resolved from `get_dc_quant` /
+            // `get_ac_quant` / the §6.8.13 `Quantizer_Matrix[
+            // SegQMLevel[plane][segment_id] ][ ... ]` table — all of
+            // which need the per-segment quantizer state the
+            // §5.11.34 caller doesn't yet plumb. As a place-holder
+            // the walker passes the §5.11.39 `Quant[]` levels
+            // directly to the inverse transform as an identity
+            // dequant. This is enough to lift the
+            // `ResidualReconstructUnsupported` gate at the §7.13
+            // boundary; the §7.12.3 frame-buffer merge (step 3,
+            // including `flipLR` / `flipUD` destination remapping
+            // and `Clip1` on `CurrFrame[plane][y + yy][x + xx]`) is
+            // the next-arc target.
             if coeffs.eob > 0 {
-                return Err(crate::Error::ResidualReconstructUnsupported);
+                // §7.13.3 dispatcher input — Dequant[i][j] derived
+                // from the §5.11.39 `Quant[]` raster-order levels.
+                let dequant: Vec<i64> = quant.iter().map(|&v| v as i64).collect();
+                let residual = crate::transform::inverse_transform_2d(
+                    &dequant,
+                    tx_sz,
+                    crate::cdf::DCT_DCT,
+                    /* bit_depth = */ 8,
+                    /* lossless = */ false,
+                );
+                readout.residuals.push(Some(residual));
+            } else {
+                readout.residuals.push(None);
             }
         }
 
@@ -24543,12 +24588,17 @@ pub struct ResidualTuTask {
 ///   [`predict_intra_dc_pred`] leaf landed in r180; the remaining
 ///   §7.11.2.x bodies and the `CurrFrame[plane][y][x]` sample-buffer
 ///   wiring are split-off.
-/// * §5.11.35 `reconstruct(plane, startX, startY, txSz)` — the §7.6
-///   inverse-transform + §7.7 reconstruction pass (consumes the
-///   §5.11.39 `Quant[ pos ]` levels + §7.13 dequantization). Split-off
-///   in its entirety; the dispatcher surfaces
-///   [`crate::Error::ResidualReconstructUnsupported`] when reached on
-///   the `!skip && eob > 0` path.
+/// * §5.11.35 `reconstruct(plane, startX, startY, txSz)` — the §7.13
+///   inverse-transform LANDED (r182). The dispatcher invokes
+///   [`crate::transform::inverse_transform_2d`] on every TU with
+///   `eob > 0` and records the per-TU `Residual[][]` on
+///   [`Self::residuals`]. The §7.12.3 step-1 quantization-matrix
+///   derivation (`get_dc_quant` / `get_ac_quant` / `using_qmatrix` /
+///   `Quantizer_Matrix[ SegQMLevel ][ ... ]`) is a placeholder
+///   identity dequant; the §7.12.3 step-3 frame-buffer merge
+///   (`CurrFrame[plane][y + yy][x + xx]` write with `flipLR` /
+///   `flipUD` destination remapping and `Clip1` envelope) is the
+///   next-arc target.
 /// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` and
 ///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps. The
 ///   underlying walker grids are not yet allocated; the dispatcher
@@ -24573,10 +24623,12 @@ pub struct ResidualTuTask {
 ///   contexts as `0` (the first-block / clean-state context — exactly
 ///   matches the first TU of every reachable §5.11.34 site, where the
 ///   neighbour arrays are zero-initialized).
-/// * §7.13 `Dequant[][]` per-`(plane, pos)` dequantization step.
+/// * §7.12.3 step-1 `Dequant[][]` per-`(plane, pos)` dequantization.
 ///   `coefficients()` returns the §5.11.39 `Quant[ pos ]` raw signed
-///   levels; the dequantization step is the inverse-quantization
-///   pre-pass to the §7.6 inverse transform.
+///   levels; the r182 dispatcher feeds these directly to the §7.13
+///   inverse transform as a placeholder identity dequant (the spec's
+///   `Dequant[i][j] = Quant[pos] * q2 / dqDenom` would require
+///   per-segment quantizer / Quantizer_Matrix state not yet plumbed).
 ///
 /// ## Skip-path semantics
 ///
@@ -24588,10 +24640,12 @@ pub struct ResidualTuTask {
 ///
 /// On `skip == false` (and `Lossless == false`) the dispatcher invokes
 /// `coefficients()` per leaf TU; the per-TU outcomes accumulate in
-/// [`Self::coeffs`] in `tasks` order. The next-arc `reconstruct(...)`
-/// fires when any per-TU `eob > 0` — at which point the dispatcher
-/// surfaces [`crate::Error::ResidualReconstructUnsupported`] (the §7.6
-/// inverse-transform body).
+/// [`Self::coeffs`] in `tasks` order. For each TU with `eob > 0` the
+/// dispatcher then invokes
+/// [`crate::transform::inverse_transform_2d`] and pushes
+/// `Some(residual)` onto [`Self::residuals`]; for `eob == 0` it
+/// pushes `None`. The dispatcher returns `Ok(())` cleanly on this
+/// path post-r182.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResidualReadout {
     /// `widthChunks = Max( 1, Block_Width[ MiSize ] >> 6 )` per §5.11.34
@@ -24622,6 +24676,24 @@ pub struct ResidualReadout {
     /// path. On the `Lossless == true` path the §5.11.34 forces
     /// `txSz = TX_4X4` and the coefficient read still fires per TU.
     pub coeffs: Vec<CoefficientsReadout>,
+    /// r182: per-TU `Residual[][]` arrays produced by §7.13.3
+    /// [`crate::transform::inverse_transform_2d`]. One entry per
+    /// `tasks` entry on the `!skip && eob > 0` path; entries are
+    /// `Some(residual)` when the inverse-transform fired, `None`
+    /// when the TU was all-zero (`eob == 0`) or the `skip` gate
+    /// suppressed the coefficient read.
+    ///
+    /// Each `Vec<i64>` is the row-major `w * h` `Residual` buffer
+    /// (`w = Tx_Width[tx_sz]`, `h = Tx_Height[tx_sz]`) the
+    /// §7.12.3 step-3 frame-buffer write would consume next.
+    /// The §7.12.3 step-1 dequantization (`Dequant[i][j] = ...`)
+    /// is deferred — the walker passes the §5.11.39 `Quant[]`
+    /// levels directly to the inverse transform as a placeholder
+    /// identity dequant (full dequant requires `get_dc_quant` /
+    /// `get_ac_quant` / `using_qmatrix` / `Quantizer_Matrix` /
+    /// `SegQMLevel` state not yet plumbed). The §7.13 inverse
+    /// transform itself is bit-exact per spec.
+    pub residuals: Vec<Option<Vec<i64>>>,
     /// `skip` — routed through from the §5.11.5 walker's `skip` field
     /// (the per-block `skip` syntax element from §5.11.11). Recorded
     /// for caller-side reconstruction-pass scheduling.
@@ -44491,8 +44563,9 @@ mod tests {
     /// on every TU: the dispatcher invokes `coefficients()` per TU
     /// and the §5.11.39 reader short-circuits at the `all_zero` S().
     /// `coeffs.len() == tasks.len()`; every entry has `all_zero ==
-    /// true` and `eob == 0`. The dispatcher does NOT fire
-    /// `ResidualReconstructUnsupported` because no TU has `eob > 0`.
+    /// true` and `eob == 0`. The dispatcher completes cleanly; on
+    /// every `eob == 0` TU the r182 residuals vec carries `None`
+    /// (no §7.13 inverse-transform call).
     #[test]
     fn residual_no_skip_all_zero_completes_without_reconstruct_stub() {
         let geom = TileGeometry {
@@ -44525,6 +44598,16 @@ mod tests {
             assert_eq!(c.eob, 0);
             assert_eq!(c.cul_level, 0);
             assert_eq!(c.dc_category, 0);
+        }
+        // r182: every all_zero TU records `None` on the residuals vec —
+        // §7.13.3 inverse_transform_2d is gated on `eob > 0`.
+        assert_eq!(
+            r.residuals.len(),
+            3,
+            "!skip ⇒ residuals length matches tasks length"
+        );
+        for residual in &r.residuals {
+            assert!(residual.is_none(), "all_zero TU ⇒ no Residual computed");
         }
     }
 
@@ -44778,6 +44861,63 @@ mod tests {
         }
     }
 
+    /// r182: `residual()` gate-open `!skip` arm with `txb_skip` rigged
+    /// to `0` (the §5.11.39 `all_zero` short-circuit closed); the
+    /// reader produces a non-zero `eob` per TU, and the §5.11.34
+    /// dispatcher invokes [`crate::transform::inverse_transform_2d`]
+    /// on every such TU. The per-TU `Residual[][]` is recorded as
+    /// `Some(...)` of length `Tx_Width[txSz] * Tx_Height[txSz]`.
+    #[test]
+    fn residual_no_skip_eob_positive_invokes_inverse_transform() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Force §5.11.39 `all_zero` S() to return 0 for every TU
+        // (cascade fires; eob >= 1).
+        for sz in 0..TX_SIZES {
+            for ctx in 0..TXB_SKIP_CONTEXTS {
+                cdfs.txb_skip[sz][ctx] = rig_cdf::<3>(0);
+            }
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let r = walker
+            .residual(
+                &mut dec, &mut cdfs, /* mi_row = */ 0, /* mi_col = */ 0,
+                /* mi_size = */ BLOCK_8X8, /* has_chroma = */ true,
+                /* subsampling_x = */ 0, /* subsampling_y = */ 0,
+                /* is_inter = */ false, /* lossless = */ false, /* skip = */ false,
+                /* tx_size = */ TX_8X8, /* use_128x128_superblock = */ false,
+            )
+            .unwrap();
+        assert_eq!(
+            r.tasks.len(),
+            3,
+            "3 planes ⇒ 3 TUs on the BLOCK_8X8 / TX_8X8 path"
+        );
+        assert_eq!(r.coeffs.len(), 3);
+        assert_eq!(r.residuals.len(), 3);
+        // Every TU went through §5.11.39 cascade ⇒ eob >= 1 ⇒
+        // §7.13.3 inverse_transform_2d fired ⇒ Some(Vec).
+        for (i, residual) in r.residuals.iter().enumerate() {
+            let res = residual
+                .as_ref()
+                .unwrap_or_else(|| panic!("TU {i}: §7.13.3 must fire when eob > 0"));
+            let tx_sz = r.tasks[i].tx_size as usize;
+            let expected_len = TX_WIDTH[tx_sz] * TX_HEIGHT[tx_sz];
+            assert_eq!(
+                res.len(),
+                expected_len,
+                "TU {i}: Residual length must match Tx_Width * Tx_Height"
+            );
+        }
+    }
+
     /// `ResidualReadout` `Clone` / `Debug` / `Eq` derive smoke.
     #[test]
     fn residual_readout_clone_debug_smoke() {
@@ -44796,6 +44936,7 @@ mod tests {
                 from_transform_tree: false,
             }],
             coeffs: vec![],
+            residuals: vec![],
             skip: true,
         };
         let r2 = r.clone();

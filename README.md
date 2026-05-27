@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 181)
+## Status — 2026-05-28 (round 182)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,76 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 182 lifts the **§7.13 inverse transform process** — the
+headline §5.11.35 `reconstruct()` body the r181 walker stopped at.
+A new `transform` module reproduces the §7.13.2.1 butterflies (`B(a,
+b, angle, flip, r)` rotation, `H(a, b, flip, r)` Hadamard, `cos128`
+/ `sin128` per the spec's 65-entry quarter-period
+`Cos128_Lookup[65]`, `brev` bit-reversal) plus the full 1D
+transform stack: §7.13.2.3 inverse DCT for `n in 2..=6` (sizes 4 /
+8 / 16 / 32 / 64; 31-step butterfly schedule with `permute` →
+n-conditional `B`/`H` stages reproduced verbatim), §7.13.2.6 /
+§7.13.2.7 / §7.13.2.8 inverse ADST 4 / 8 / 16 (the ADST4
+closed-form `SINPI_*` sum, ADST8 7-step schedule, ADST16 9-step
+schedule, all wrapped in §7.13.2.4 input + §7.13.2.5 output
+Gray-code permutations), §7.13.2.10 inverse WHT4 (Lossless path),
+and §7.13.2.11..§7.13.2.14 inverse identity 4 / 8 / 16 / 32 (the
+`5793 / 11586` scaling pairs and `*2 / *4` doublings). The
+§7.13.3 2D dispatcher composes row-then-column over the 16-element
+`PlaneTxType` matrix (DCT_DCT through H_FLIPADST), including the
+`Abs(log2W - log2H) == 1` rectangular `2896` pre-scale, the
+`Transform_Row_Shift[TX_SIZES_ALL]` per-size row right-shift, the
+between-stage `colClampRange = Max(BitDepth + 6, 16)` clamp, and
+the `Lossless` short-circuit through the WHT (shift 2 row / shift
+0 col). The FLIPADST destination flip (`flipLR` / `flipUD`) is
+documented as a §7.12.3-step-3 frame-buffer-write concern, not a
+§7.13.3 transform-pass concern.
+
+Wired into `PartitionWalker::residual` / `transform_block_emit`:
+on every TU with `eob > 0` (the §5.11.39 `!all_zero` cascade) the
+walker now invokes `inverse_transform_2d` and pushes
+`Some(residual)` onto a new `ResidualReadout::residuals: Vec<Option<Vec<i64>>>`;
+TUs with `eob == 0` push `None`. The walker returns
+`Ok(DecodedBlock)` cleanly on every path the §5.11.5 walker can
+reach today — **lifting `Error::ResidualReconstructUnsupported`**
+(the variant is retained as a defensive caller-bug sentinel; the
+walker no longer surfaces it).
+
+**Split off explicitly to subsequent arcs:** (a) §7.12.3 step-1
+true dequantization (`Dequant[i][j] = Quant[pos] * q2 / dqDenom`
+with `q2` derived from `get_dc_quant` / `get_ac_quant` /
+`using_qmatrix` / `Quantizer_Matrix[ SegQMLevel[plane][segment_id]
+][ ... ]`; the walker passes `Quant[]` directly as a placeholder
+identity dequant — sufficient to lift the §7.13 boundary, not
+sufficient for bit-exact CurrFrame samples); (b) §7.12.3 step-3
+frame-buffer merge (`CurrFrame[plane][y + yy][x + xx] =
+Clip1(CurrFrame[...] + Residual[i][j])` with `xx = flipLR ? w - j
+- 1 : j`, `yy = flipUD ? h - i - 1 : i`; needs a `CurrFrame[][][]`
+backing buffer); (c) §5.11.40 / §5.11.41 per-TU `PlaneTxType` read
+(the walker still defaults to `DCT_DCT`); (d) §7.5 `get_scan`
+table dispatch (still identity scan); (e) `AboveLevelContext` /
+`LeftLevelContext` neighbour grids; (f) 10/12-bit `BitDepth` —
+hardcoded to `8` for now.
+
+33 new tests (768 → 801): twelve on the 1D primitives (cos128
+anchors, sin128 == cos128(a-64) over the full period, brev basic,
+round2 sign-handling, DCT permute, ADST input permute n=3, zero
+inputs for IDCT 4 / 8 / 16 / 32 / 64, zero inputs for IADST 4 / 8
+/ 16, identity 4 / 8 / 16 / 32 scaling, identity dispatcher);
+eight on the §7.13.3 2D dispatcher (DCT_DCT 4x4 DC-only bit-exact
+expected = `128` per cell, DCT_DCT zero-preserves, IDTX 4x4
+DC-only bit-exact = `512` at origin, Lossless zero-preserves, 4x8
+rectangular zero-preserves, 8x8 / 16x16 / 32x32 / 64x64
+zero-preserves, FLIPADST and V_ / H_ variants zero-preserve);
+one IDCT4 linearity check; plus one new walker-integration test
+(`residual_no_skip_eob_positive_invokes_inverse_transform`)
+asserting that gate-open TUs do produce `Some(Residual)` of length
+`Tx_Width * Tx_Height` on the `ResidualReadout`. The seven
+existing `decode_block_syntax` integration tests that previously
+asserted `Err(ResidualReconstructUnsupported)` now assert
+`Ok(DecodedBlock)`. `decode_av1` / `encode_av1` continue to
+return `Error::NotImplemented`.
 
 Round 181 lifts the **§5.11.34 `residual()` outer dispatch** — the
 final §5.11.5 walker stub between the §5.11.30 prediction pass and the

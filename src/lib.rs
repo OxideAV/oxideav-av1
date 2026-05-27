@@ -1525,6 +1525,7 @@ pub mod obu;
 pub mod sequence_header;
 pub mod symbol_decoder;
 pub mod tile_info;
+pub mod transform;
 pub mod uncompressed_header_tail;
 
 pub use cdf::{
@@ -1640,6 +1641,15 @@ pub use cdf::{
 // through [`cdf::PartitionWalker::residual`], plus the §5.11.37
 // per-plane transform-size lookup [`cdf::get_tx_size`].
 pub use cdf::{get_tx_size, ResidualReadout, ResidualTuTask};
+// r182: §7.13 inverse transform (av1-spec p.295-307) — the
+// `inverse_transform_2d` 2D dispatcher consumes the §7.12.3 step-1
+// `Dequant[][]` buffer (placeholder identity-dequant of `Quant[]`
+// in the walker today) and returns the §7.13.3 `Residual[][]`
+// buffer the §7.12.3 step-3 frame-buffer write would consume. The
+// 1D primitives (`inverse_dct` / `inverse_adst` / `inverse_wht4` /
+// `inverse_identity`) and the §7.13.2.1 butterfly building blocks
+// (`butterfly_b` / `butterfly_h` / `cos128` / `sin128` / `brev`)
+// are exposed standalone for bit-exact testing.
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
     InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,
@@ -1653,6 +1663,13 @@ pub use sequence_header::{
 pub use symbol_decoder::SymbolDecoder;
 pub use tile_info::{
     parse_tile_info, TileInfo, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH,
+};
+pub use transform::{
+    brev, butterfly_b, butterfly_h, clip3, cos128, inverse_adst, inverse_adst16, inverse_adst4,
+    inverse_adst8, inverse_adst_input_permute, inverse_adst_output_permute, inverse_dct,
+    inverse_dct_permute, inverse_identity, inverse_identity16, inverse_identity32,
+    inverse_identity4, inverse_identity8, inverse_transform_2d, inverse_wht4, round2, sin128,
+    COS128_LOOKUP, SINPI_1_9, SINPI_2_9, SINPI_3_9, SINPI_4_9, TRANSFORM_ROW_SHIFT,
 };
 pub use uncompressed_header_tail::{
     parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,
@@ -1880,19 +1897,28 @@ pub enum Error {
     /// [`Self::ResidualTransformTreeUnsupported`] /
     /// [`Self::ResidualCoefficientsTxSizeUnsupported`] instead.
     DecodeBlockResidualUnsupported,
-    /// The §5.11.34 [`crate::PartitionWalker::residual`] dispatcher
-    /// completed the per-TU task enumeration with `skip == false` and
-    /// at least one TU returned `eob > 0` — at which point §5.11.35
-    /// invokes `reconstruct( plane, startX, startY, txSz )` (the §7.6
-    /// inverse transform + §7.7 reconstruction pass). The §7.6 / §7.7
-    /// bodies — `inverse_transform`, `Iadst_*`, `Idct_*`, `Iidentity`,
-    /// `Iflipadst_*`, `Iht_*`, plus the §7.13 `Dequant[][]` step that
-    /// precedes them — are the next-arc target.
+    /// **Defensive fallback — no longer reached on the walker path
+    /// as of r182.** Historically (r181) the §5.11.34
+    /// [`crate::PartitionWalker::residual`] dispatcher surfaced this
+    /// variant on the `!skip && eob > 0` arm when §5.11.35
+    /// `reconstruct( plane, startX, startY, txSz )` would have run
+    /// the §7.13 inverse transform. With r182 the §7.13 inverse
+    /// transform is wired through [`crate::transform::inverse_transform_2d`]
+    /// — the dispatcher now invokes it directly, stores the per-TU
+    /// `Residual[][]` on [`crate::ResidualReadout::residuals`], and
+    /// returns `Ok(())`. The §7.12.3 step-1 dequantization
+    /// (`Dequant[i][j] = Quant[pos] * q2 / dqDenom` with per-segment
+    /// quantizer state) and the §7.12.3 step-3 frame-buffer merge
+    /// (`CurrFrame[plane][y + yy][x + xx] = Clip1(... + Residual[i][j])`,
+    /// including `flipLR` / `flipUD` destination remapping for the
+    /// FLIPADST family) remain split-off — but neither raises this
+    /// variant; the placeholder identity-dequant suffices to lift
+    /// the §7.13 boundary, and the frame buffer is captured on the
+    /// readout rather than written through.
     ///
-    /// Reachable when the §5.11.5 walker drives `decode_block_syntax`
-    /// with a non-trivial coefficient block (one whose `all_zero`
-    /// CDF read returns `0`); the gate-closed (`skip == true`) walker
-    /// path the test fixtures exercise does NOT fire this error.
+    /// Retained as a typed sentinel for callers that wire custom
+    /// reconstruct paths through the public API and want a known
+    /// error ordinal for "post-§7.13 caller refused to merge".
     ResidualReconstructUnsupported,
     /// The §5.11.34 [`crate::PartitionWalker::residual`] dispatcher
     /// reached the inter-luma
@@ -2159,7 +2185,7 @@ impl core::fmt::Display for Error {
             ),
             Self::ResidualReconstructUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.34 residual() reached §5.11.35 reconstruct() — §7.6 inverse transform + §7.13 dequant + §7.7 reconstruction pass pending next-arc"
+                "oxideav-av1: §5.11.34 residual() reached §5.11.35 reconstruct() — defensive fallback retained post-r182 (the §7.13 inverse transform is now wired through crate::transform::inverse_transform_2d; the §7.12.3 step-1 quantization-matrix derivation and step-3 frame-buffer merge remain split-off but neither raises this variant on the walker path)"
             ),
             Self::ResidualTransformTreeUnsupported => write!(
                 f,

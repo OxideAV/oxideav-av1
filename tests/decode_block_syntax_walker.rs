@@ -30,11 +30,16 @@
 //!    §5.11.39 `PartitionWalker::coefficients` bitstream read. On the
 //!    `!skip` walker path the §5.11.39 reader will, with high
 //!    probability against an unrigged bitstream, decode at least one
-//!    non-zero TU and the walker short-circuits at
-//!    `Error::ResidualReconstructUnsupported` (the §7.6
-//!    inverse-transform + §7.7 reconstruction pass next-arc target).
-//!    The `skip == true` arm (when rigged so) returns through
-//!    `decode_block_syntax` cleanly with the per-block `DecodedBlock`.
+//!    non-zero TU.
+//! 7. §5.11.35 `reconstruct()` — WIRED THROUGH (r182). For every TU
+//!    with `eob > 0` the walker invokes
+//!    [`oxideav_av1::inverse_transform_2d`] (§7.13.3 2D inverse
+//!    transform) on the §5.11.39 `Quant[]` levels (passed through as
+//!    a placeholder identity dequant — the §7.12.3 step-1
+//!    quantization-matrix derivation is the next-arc target). The
+//!    per-TU `Residual[][]` buffer is recorded on the readout. The
+//!    walker now returns `Ok(DecodedBlock)` on both the `skip == 1`
+//!    and the `!skip` cleanly-reconstructed paths.
 //!
 //! These tests drive the walker with synthesised in-memory state
 //! (no real bitstream decode required) on a minimal mi grid and
@@ -151,22 +156,13 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
     );
     let pos_after = dec.position();
 
-    // §5.11.34 fired — the walker advances past §5.11.34
-    // `residual()` (the r181 dispatcher) and reaches §5.11.35
-    // `reconstruct()` (the §7.6 inverse transform pass).
-    //
-    // Post-r181 the §5.11.34 dispatcher invokes the §5.11.39
-    // [`PartitionWalker::coefficients`] reader per TU on the `!skip`
-    // path. With the test fixture's rigged-zero CDFs the §5.11.39
-    // `all_zero` symbol returns `0` (non-all-zero) on the first
-    // reachable TU, the §5.11.39 reader walks the EOB / coeff
-    // cascade, and the dispatcher surfaces
-    // `ResidualReconstructUnsupported` on the
-    // `if ( eob > 0 ) reconstruct(...)` arm.
-    assert_eq!(
-        result,
-        Err(Error::ResidualReconstructUnsupported),
-        "post-r181 the §5.11.5 walker must short-circuit at §5.11.35 reconstruct() after running §5.11.34 residual() + per-TU §5.11.39 coefficients() reads"
+    // r182: the §5.11.34 dispatcher advances cleanly past §5.11.35
+    // `reconstruct()` — the §7.13 inverse transform is now wired
+    // through [`oxideav_av1::inverse_transform_2d`] and produces a
+    // `Residual[][]` buffer for every TU with `eob > 0`. The walker
+    // returns `Ok(DecodedBlock)` on this path.
+    let _block = result.expect(
+        "post-r182 the §5.11.5 walker must return Ok(DecodedBlock) after running §5.11.34 residual() + per-TU §5.11.39 coefficients() reads + §7.13 inverse_transform_2d",
     );
 
     // The §5.11.5 prologue + §5.11.7 prefix consumed at least the
@@ -252,7 +248,8 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             /* subsampling_y = */ 1, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
         );
-        assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
+        // r182: §5.11.34 cleanly returns Ok after §7.13 inverse transform.
+        assert!(result.is_ok(), "arm 1 must return Ok(DecodedBlock)");
     }
 
     // Arm 2: bw4 == 1 && subsampling_x && MiCol & 1 == 0 ⇒ HasChroma = false.
@@ -267,7 +264,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             /* subsampling_y = */ 0, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
         );
-        assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
+        assert!(result.is_ok(), "arm 2 must return Ok(DecodedBlock)");
     }
 
     // Arm 3 fall-through: no sub-sampling ⇒ HasChroma = num_planes > 1.
@@ -282,7 +279,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, true,
             0, false,
         );
-        assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
+        assert!(result.is_ok(), "arm 3 must return Ok(DecodedBlock)");
     }
 }
 
@@ -344,7 +341,8 @@ fn decode_block_syntax_intra_pre_skip_arm_reaches_stub() {
         &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
     );
 
-    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
+    // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
+    assert!(result.is_ok(), "pre-skip arm must reach Ok(DecodedBlock)");
     // The §5.11.5 mode-info pass succeeded — the per-block stamp
     // landed on the BLOCK_8X8 (2×2) footprint.
     let mi_cols = walker.mi_cols() as usize;
@@ -414,10 +412,11 @@ fn decode_partition_syntax_routes_leaf_through_decode_block_syntax() {
         false, 0, false, false, 0, false, false, false, 0, false,
     );
 
+    // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
     assert_eq!(
         result,
-        Err(Error::ResidualReconstructUnsupported),
-        "the partition driver must propagate the §5.11.30 stub from its leaf call"
+        Ok(()),
+        "the partition driver must propagate the §5.11.34 Ok-return from its leaf call"
     );
 
     // Exactly one leaf emitted at (0, 0, BLOCK_4X4) — the
@@ -513,7 +512,11 @@ fn decode_block_syntax_block_8x16_grid_fill_footprint() {
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X16, true, 0, 0, 3, false, false, false, 0, &lossless,
         false, true, false, 0, false, false, 0, false, false, false, 0, false,
     );
-    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
+    // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
+    assert!(
+        result.is_ok(),
+        "BLOCK_8X16 walker must return Ok(DecodedBlock)"
+    );
 
     // BLOCK_8X16: bw4 = 2, bh4 = 4 ⇒ the §5.11.5 grid-fill stamps a
     // 2×4 footprint (2 cols × 4 rows) at (0, 0).
@@ -577,7 +580,11 @@ fn decode_block_syntax_cdef_bits_two_reaches_stub() {
         /* tx_mode_select = */ false,
     );
     let pos_after = dec.position();
-    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
+    // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
+    assert!(
+        result.is_ok(),
+        "cdef_bits walker must return Ok(DecodedBlock)"
+    );
     assert!(
         pos_after > pos_before,
         "literal cdef-bits read must advance the bit cursor"
@@ -1005,7 +1012,11 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
         0,
         /* tx_mode_select = */ true,
     );
-    assert_eq!(result, Err(Error::ResidualReconstructUnsupported));
+    // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
+    assert!(
+        result.is_ok(),
+        "TX_MODE_SELECT walker must return Ok(DecodedBlock)"
+    );
 
     let mi_cols = walker.mi_cols() as usize;
     for r in 0..4 {
