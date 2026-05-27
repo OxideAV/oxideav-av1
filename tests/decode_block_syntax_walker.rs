@@ -2040,35 +2040,61 @@ fn compute_prediction_h_pred_dispatches_one_task_per_plane() {
     assert_eq!(r.tasks[2].mode, 2);
 }
 
-/// r187: §5.11.33 non-{DC, V, H, SMOOTH*, PAETH}_PRED intra modes
-/// (the six directional D-mode ordinals `3..=8`) still surface the
-/// next-arc stub. Verifies the D-mode interval boundaries (`D45_PRED
-/// = 3` and `D67_PRED = 8`) plus an interior point (`D135_PRED = 4`).
+/// r188: §5.11.33 D-mode intra-mode ordinals (`3..=8`) admitted on
+/// the dispatcher's intra arm. Mirrors the r186 / r187 dispatcher
+/// acceptance tests — all six §7.11.2.4 non-degenerate directional
+/// arms (D45 / D135 / D113 / D157 / D203 / D67) produce a per-plane
+/// task with the D-mode ordinal forwarded into the task.
 #[test]
-fn compute_prediction_d_mode_intra_modes_surface_stub() {
+fn compute_prediction_d_mode_intra_modes_dispatch_one_task_per_plane() {
     let mut walker = walker_n(16);
-    // mode = 3 (D45_PRED) — first unsupported (D-mode interval lower
-    // bound, immediately above the §7.11.2.4-degenerate H_PRED).
-    let result = walker.compute_prediction(
-        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 3, 0,
-        false,
-    );
-    assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
+    for &mode in &[3u8, 4, 5, 6, 7, 8] {
+        let r = walker
+            .compute_prediction(
+                0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false, mode, mode, false,
+            )
+            .unwrap_or_else(|e| panic!("D-mode {mode} must dispatch post-r188 (got {e:?})"));
+        assert_eq!(r.num_planes_visited, 3);
+        assert_eq!(r.tasks.len(), 3);
+        for t in r.tasks {
+            assert_eq!(t.mode, mode);
+        }
+    }
+}
 
-    // mode = 4 (D135_PRED) — D-mode interior.
+/// r188: §5.11.33 dispatcher rejects `UV_CFL_PRED == 13` when it
+/// reaches the luma plane (plane 0). The mode-bounds guard
+/// (`plane_mode >= INTRA_MODES && plane_mode != UV_CFL_PRED`) lets
+/// `13` pass because chroma legitimately uses it; the post-guard
+/// supported check then rejects with
+/// `ComputePredictionIntraModeUnsupported`. With r188 admitting all
+/// `0..INTRA_MODES` Y intra modes, this is the only remaining path
+/// that reaches `ComputePredictionIntraModeUnsupported` on the luma
+/// plane.
+#[test]
+fn compute_prediction_uv_cfl_on_luma_rejected() {
+    let mut walker = walker_n(16);
     let result = walker.compute_prediction(
-        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 4, 0,
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 13, 0,
         false,
     );
     assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
+}
 
-    // mode = 8 (D67_PRED) — last D-mode ordinal (the upper boundary,
-    // immediately below SMOOTH_PRED = 9 which IS now supported).
+/// r188: §5.11.33 dispatcher rejects out-of-range Y intra modes
+/// (`mode >= INTRA_MODES + 1`) as a caller-bug. The §5.11.7 /
+/// §5.11.22 readers cap at INTRA_MODES (or `INTRA_MODES + 1` for
+/// UV_CFL_PRED on chroma), so this is the §6.4.1 conformance gate.
+#[test]
+fn compute_prediction_above_uv_cfl_rejected_as_caller_bug() {
+    let mut walker = walker_n(16);
+    // mode = 14 (one past UV_CFL_PRED) — out of every conformant
+    // §5.11.7 / §5.11.22 reader emission.
     let result = walker.compute_prediction(
-        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 8, 0,
+        0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 14, 0,
         false,
     );
-    assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
+    assert_eq!(result, Err(Error::PartitionWalkOutOfRange));
 }
 
 /// r187: §5.11.33 SMOOTH_PRED (= 9) now admitted on the dispatcher's

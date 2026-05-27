@@ -1662,6 +1662,28 @@ pub use cdf::{
     SMOOTH_V_PRED, SM_WEIGHTS_TX_16X16, SM_WEIGHTS_TX_32X32, SM_WEIGHTS_TX_4X4,
     SM_WEIGHTS_TX_64X64, SM_WEIGHTS_TX_8X8,
 };
+// r188: §7.11.2.4 six non-degenerate directional D-mode sample-
+// generation leaves (`predict_intra_directional` keyed by `pAngle`;
+// `predict_intra_d_mode` keyed by §6.10.x intra-mode ordinal) admitted
+// to the dispatcher alongside the seven non-D modes — all 13 §6.10.x
+// Y intra modes now covered. Plus the §7.11.2.4 `Mode_To_Angle[]` +
+// `Dr_Intra_Derivative[ 90 ]` tables (av1-spec p.485 / p.487) and
+// `ANGLE_STEP = 3` (av1-spec p.485). Plus the §7.11.2.{7, 9, 10, 11,
+// 12} intra-edge helpers (`filter_corner` /
+// `intra_edge_filter_strength_selection` /
+// `intra_edge_upsample_selection` / `intra_edge_upsample` /
+// `intra_edge_filter`) — the spec's pre-pass helpers, exposed as
+// standalone functions; the dispatcher runs the no-upsample / no-
+// filter path of step-4 (strength == 0, useUpsample == 0) so the body
+// produces the correct shape with the lower-quality un-filtered edges.
+// Plus the six named §6.10.x D-mode intra-mode ordinals (`D45_PRED` /
+// `D135_PRED` / `D113_PRED` / `D157_PRED` / `D203_PRED` / `D67_PRED`).
+pub use cdf::{
+    filter_corner, intra_edge_filter, intra_edge_filter_strength_selection, intra_edge_upsample,
+    intra_edge_upsample_selection, predict_intra_d_mode, predict_intra_directional, ANGLE_STEP,
+    D113_PRED, D135_PRED, D157_PRED, D203_PRED, D45_PRED, D67_PRED, DR_INTRA_DERIVATIVE,
+    INTRA_EDGE_KERNEL, INTRA_EDGE_KERNELS, INTRA_EDGE_TAPS, MODE_TO_ANGLE,
+};
 // r181: §5.11.34 `residual()` outer-dispatch readout
 // ([`cdf::ResidualReadout`] + [`cdf::ResidualTuTask`]) surfaced
 // through [`cdf::PartitionWalker::residual`], plus the §5.11.37

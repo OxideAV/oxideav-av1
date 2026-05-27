@@ -2197,6 +2197,638 @@ pub fn predict_intra_smooth_h_pred(
 }
 
 // ---------------------------------------------------------------------
+// Round 188 — §7.11.2.4 directional intra prediction (the six
+// non-degenerate D-mode arms — D45 / D67 / D113 / D135 / D157 / D203)
+// + §7.11.2.7 filter corner + §7.11.2.9 intra edge filter strength
+// + §7.11.2.10 intra edge upsample selection + §7.11.2.11 intra edge
+// upsample + §7.11.2.12 intra edge filter pre-passes. The six D-modes
+// share a single sample-generation body keyed off `pAngle`
+// (`Mode_To_Angle[ mode ] + angleDelta * ANGLE_STEP` per av1-spec
+// p.485 + p.487). The body itself transcribes §7.11.2.4 steps 5..9
+// (av1-spec p.246-248) verbatim.
+//
+// §7.11.2.4 directional projection (steps 5..9):
+//
+//   * step 5 derives `dx` from `Dr_Intra_Derivative[]`:
+//       - `pAngle < 90`  ⇒ dx = Dr_Intra_Derivative[ pAngle ];
+//       - `90 < pAngle < 180` ⇒ dx = Dr_Intra_Derivative[ 180 - pAngle ];
+//       - otherwise dx is undefined.
+//   * step 6 derives `dy`:
+//       - `90 < pAngle < 180` ⇒ dy = Dr_Intra_Derivative[ pAngle - 90 ];
+//       - `pAngle > 180` ⇒ dy = Dr_Intra_Derivative[ 270 - pAngle ];
+//       - otherwise dy is undefined.
+//   * step 7 (`pAngle < 90`) — D45-like, projects from AboveRow only:
+//       `idx = (i + 1) * dx`,
+//       `base = (idx >> (6 - upsampleAbove)) + (j << upsampleAbove)`,
+//       `shift = ((idx << upsampleAbove) >> 1) & 0x1F`,
+//       `maxBaseX = (w + h - 1) << upsampleAbove`,
+//       `pred = base < maxBaseX
+//              ? Round2(AboveRow[base] * (32 - shift) +
+//                       AboveRow[base + 1] * shift, 5)
+//              : AboveRow[maxBaseX]`.
+//   * step 8 (`90 < pAngle < 180`) — D113 / D135 / D157, hybrid: projects
+//     from AboveRow when `base >= -(1 << upsampleAbove)`; otherwise
+//     redoes the projection along the Y axis through LeftCol.
+//   * step 9 (`pAngle > 180`) — D203-like, projects from LeftCol only
+//     (mirror of step 7).
+//
+// `ANGLE_STEP = 3` per the §6.10.x intra-mode enumeration (the
+// `angle_delta_y` / `angle_delta_uv` are 7-step ranges centred on 0; a
+// single delta unit moves `pAngle` by 3°). r188 hard-codes
+// `angleDelta = 0` (the §5.11.5 walker has not yet stitched in
+// `intra_angle_info`), so `pAngle == Mode_To_Angle[ mode ]` for all six
+// D-modes, falling cleanly into one of steps 7 / 8 / 9 per the table:
+//
+//     D45_PRED  (3) →  45° → step 7 (above-only projection)
+//     D135_PRED (4) → 135° → step 8 (hybrid above/left projection)
+//     D113_PRED (5) → 113° → step 8
+//     D157_PRED (6) → 157° → step 8
+//     D203_PRED (7) → 203° → step 9 (left-only projection)
+//     D67_PRED  (8) →  67° → step 7
+//
+// r188 takes the "no-upsample, no-filter" path through the §7.11.2.4
+// step-4 pre-pass: `enable_intra_edge_filter` is read from the parsed
+// sequence header but the pre-passes themselves run a no-op when the
+// strength / useUpsample selection returns 0. The §7.11.2.{9..11}
+// selection / upsample / filter helpers are exposed as standalone
+// functions so a future arc can stitch them into the walker; for the
+// dispatcher's per-plane task list the `upsampleAbove =
+// upsampleLeft = 0` short-circuit covers the §5.11.5 path the walker
+// currently emits. (When `useUpsample = 0` step-7..9 collapse the
+// `upsampleAbove` shifts to zero and produce the "base" un-upsampled
+// projection — the lower-quality but correct shape per the spec.)
+//
+// Sample-generation kernels are exposed both as a single
+// `predict_intra_directional` dispatcher (keyed by `pAngle`) and as
+// `predict_intra_d_mode` (keyed by the §6.10.x intra-mode ordinal); the
+// latter is the dispatcher's entry point.
+// ---------------------------------------------------------------------
+
+/// `D45_PRED` (§6.10.x intra-mode enumeration) — first directional
+/// D-mode ordinal. `Mode_To_Angle[ D45_PRED ] == 45` (av1-spec p.485).
+/// The §7.11.2.4 sample-generation body routes through step 7
+/// (`pAngle < 90` — above-only projection).
+pub const D45_PRED: usize = 3;
+/// `D135_PRED` (§6.10.x intra-mode enumeration). `Mode_To_Angle[
+/// D135_PRED ] == 135`. §7.11.2.4 step 8 (hybrid above/left).
+pub const D135_PRED: usize = 4;
+/// `D113_PRED` (§6.10.x intra-mode enumeration). `Mode_To_Angle[
+/// D113_PRED ] == 113`. §7.11.2.4 step 8.
+pub const D113_PRED: usize = 5;
+/// `D157_PRED` (§6.10.x intra-mode enumeration). `Mode_To_Angle[
+/// D157_PRED ] == 157`. §7.11.2.4 step 8.
+pub const D157_PRED: usize = 6;
+/// `D203_PRED` (§6.10.x intra-mode enumeration). `Mode_To_Angle[
+/// D203_PRED ] == 203`. §7.11.2.4 step 9 (left-only projection,
+/// mirror of step 7).
+pub const D203_PRED: usize = 7;
+// Note: `D67_PRED == 8` is already exported above (the original r180
+// boundary marker for `V_PRED <= mode <= D67_PRED` predicate). Its
+// `Mode_To_Angle[ D67_PRED ] == 67`. §7.11.2.4 step 7.
+
+/// `ANGLE_STEP` per av1-spec p.485 — the per-unit angular increment
+/// each `angle_delta_y` / `angle_delta_uv` step contributes to
+/// `pAngle = Mode_To_Angle[ mode ] + angleDelta * ANGLE_STEP`. Three
+/// degrees per step; with `angle_delta_y ∈ -3..=3` the per-mode
+/// `pAngle` ranges +/-9° around the table entry.
+pub const ANGLE_STEP: i32 = 3;
+
+/// `Mode_To_Angle[ INTRA_MODES ]` (av1-spec p.485). Maps each of the
+/// thirteen Y intra-mode ordinals to its base directional angle in
+/// degrees. Non-directional modes (`DC_PRED == 0`, `SMOOTH_PRED == 9`,
+/// `SMOOTH_V_PRED == 10`, `SMOOTH_H_PRED == 11`, `PAETH_PRED == 12`)
+/// map to `0`. The seven directional entries are
+/// `V_PRED (1) → 90`, `H_PRED (2) → 180`, `D45_PRED (3) → 45`,
+/// `D135_PRED (4) → 135`, `D113_PRED (5) → 113`, `D157_PRED (6) → 157`,
+/// `D203_PRED (7) → 203`, `D67_PRED (8) → 67`. `V_PRED` (`pAngle ==
+/// 90`) and `H_PRED` (`pAngle == 180`) are the §7.11.2.4 step-10 /
+/// step-11 degenerate cases (already lifted in r186 by
+/// [`predict_intra_v_pred`] / [`predict_intra_h_pred`]).
+pub const MODE_TO_ANGLE: [i32; INTRA_MODES] = [0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0];
+
+/// `Dr_Intra_Derivative[ 90 ]` (av1-spec p.487). Per-angle directional
+/// derivative the §7.11.2.4 sample-generation body multiplies by
+/// `(i + 1)` (step 7) / `(j + 1)` (step 9) to produce the `idx` value
+/// driving the per-cell projection along the directional edge.
+///
+/// Indexed by one of `pAngle`, `180 - pAngle`, `pAngle - 90`, or
+/// `270 - pAngle` per the §7.11.2.4 step-5 / step-6 dispatch. Length
+/// is 90 (the spec's `[90]`), with non-zero entries only at the angles
+/// the §6.10.x enumeration of `Mode_To_Angle` + `ANGLE_STEP *
+/// angle_delta` actually emits (`3°, 6°, 9°, …, 87°`).
+///
+/// The non-zero indices (i, value) per spec transcription:
+/// `(3, 1023)`, `(6, 547)`, `(9, 372)`, `(14, 273)`, `(17, 215)`,
+/// `(20, 178)`, `(23, 151)`, `(26, 132)`, `(29, 116)`, `(32, 102)`,
+/// `(36, 90)`, `(39, 80)`, `(42, 71)`, `(45, 64)`, `(48, 57)`,
+/// `(51, 51)`, `(54, 45)`, `(58, 40)`, `(61, 35)`, `(64, 31)`,
+/// `(67, 27)`, `(70, 23)`, `(73, 19)`, `(76, 15)`, `(81, 11)`,
+/// `(84, 7)`, `(87, 3)`.
+pub const DR_INTRA_DERIVATIVE: [u16; 90] = [
+    0, 0, 0, 1023, 0, 0, 547, 0, 0, 372, 0, 0, 0, 0, 273, 0, 0, 215, 0, 0, 178, 0, 0, 151, 0, 0,
+    132, 0, 0, 116, 0, 0, 102, 0, 0, 0, 90, 0, 0, 80, 0, 0, 71, 0, 0, 64, 0, 0, 57, 0, 0, 51, 0, 0,
+    45, 0, 0, 0, 40, 0, 0, 35, 0, 0, 31, 0, 0, 27, 0, 0, 23, 0, 0, 19, 0, 0, 15, 0, 0, 0, 0, 11, 0,
+    0, 7, 0, 0, 3, 0, 0,
+];
+
+/// `INTRA_EDGE_TAPS = 5` per §7.11.2.12 (av1-spec p.255-256). Per-row
+/// width of [`INTRA_EDGE_KERNEL`].
+pub const INTRA_EDGE_TAPS: usize = 5;
+
+/// `INTRA_EDGE_KERNELS = 3` per §7.11.2.12 — the three filter strengths
+/// `[1, 2, 3]` selected by the §7.11.2.9 strength-selection process.
+/// Strength `0` skips the §7.11.2.12 filter entirely.
+pub const INTRA_EDGE_KERNELS: usize = 3;
+
+/// `Intra_Edge_Kernel[ INTRA_EDGE_KERNELS ][ INTRA_EDGE_TAPS ]` per
+/// av1-spec p.256. The three 5-tap symmetric filters keyed by
+/// `strength - 1`. The §7.11.2.12 filter applies
+/// `s = Σ_j kernel[strength-1][j] * edge[Clip3(0, sz-1, i - 2 + j)]`
+/// then `buf[i - 1] = (s + 8) >> 4` — i.e. `Round2(s, 4)`.
+pub const INTRA_EDGE_KERNEL: [[i32; INTRA_EDGE_TAPS]; INTRA_EDGE_KERNELS] =
+    [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+
+/// §7.11.2.10 intra edge upsample selection process (av1-spec p.254).
+/// Decides whether the §7.11.2.11 2x upsample pre-pass is applied to
+/// the above edge (`pAngle - 90` input) or the left edge (`pAngle -
+/// 180` input). Output is `1` (apply upsample) or `0` (skip).
+///
+/// The decision is driven by `|delta|` and `w + h`:
+///   * `|delta| <= 0 || |delta| >= 40` ⇒ `0` (no upsample for the
+///     near-axis and near-corner angles where the projection step is
+///     small enough that the un-upsampled edge suffices).
+///   * `filterType == 0`: upsample iff `w + h <= 16`.
+///   * `filterType == 1`: upsample iff `w + h <= 8`.
+pub fn intra_edge_upsample_selection(w: usize, h: usize, filter_type: u8, delta: i32) -> u8 {
+    let d = delta.unsigned_abs();
+    if d == 0 || d >= 40 {
+        return 0;
+    }
+    let blk_wh = w + h;
+    if filter_type == 0 {
+        if blk_wh <= 16 {
+            1
+        } else {
+            0
+        }
+    } else if blk_wh <= 8 {
+        1
+    } else {
+        0
+    }
+}
+
+/// §7.11.2.9 intra edge filter strength selection (av1-spec p.253). The
+/// `delta` argument is `pAngle - 90` (for the above edge) or
+/// `pAngle - 180` (for the left edge). Output is in `0..=3`. Strength
+/// `0` skips the §7.11.2.12 filter (an early-return path).
+pub fn intra_edge_filter_strength_selection(w: usize, h: usize, filter_type: u8, delta: i32) -> u8 {
+    let d = delta.unsigned_abs();
+    let blk_wh = w + h;
+    let mut strength: u8 = 0;
+    if filter_type == 0 {
+        if blk_wh <= 8 {
+            if d >= 56 {
+                strength = 1;
+            }
+        } else if blk_wh <= 16 {
+            // §7.11.2.9 spec lists `blk_wh <= 12` and `blk_wh <= 16` as
+            // separate branches with the same body (`d >= 40 ⇒ strength
+            // = 1`); collapsed into one `<= 16` arm.
+            if d >= 40 {
+                strength = 1;
+            }
+        } else if blk_wh <= 24 {
+            if d >= 8 {
+                strength = 1;
+            }
+            if d >= 16 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else if blk_wh <= 32 {
+            strength = 1;
+            if d >= 4 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else {
+            strength = 3;
+        }
+    } else if blk_wh <= 8 {
+        if d >= 40 {
+            strength = 1;
+        }
+        if d >= 64 {
+            strength = 2;
+        }
+    } else if blk_wh <= 16 {
+        if d >= 20 {
+            strength = 1;
+        }
+        if d >= 48 {
+            strength = 2;
+        }
+    } else if blk_wh <= 24 {
+        if d >= 4 {
+            strength = 3;
+        }
+    } else {
+        strength = 3;
+    }
+    strength
+}
+
+/// §7.11.2.7 filter corner process (av1-spec p.252). Three-tap filter
+/// producing the new value for the top-left corner cell from
+/// `LeftCol[0]`, `AboveRow[-1]`, `AboveRow[0]`. The output replaces
+/// both `LeftCol[-1]` and `AboveRow[-1]` (the §7.11.2.1 invariant
+/// `LeftCol[-1] = AboveRow[-1]` is preserved by the filter — a single
+/// scalar is returned).
+///
+/// `s = LeftCol[0] * 5 + AboveRow[-1] * 6 + AboveRow[0] * 5`, then
+/// `Round2(s, 4)`. Inputs are clipped per `BitDepth` on the way in by
+/// the §7.11.2.1 derivation helpers; the output is in
+/// `[0, (1 << BitDepth) - 1]` because the kernel sums to 16 and the
+/// shift is by 4 (so the un-clipped output is already bit-depth-bounded).
+pub fn filter_corner(left_col_0: u16, above_left: u16, above_row_0: u16) -> u16 {
+    let s: u32 = (left_col_0 as u32) * 5 + (above_left as u32) * 6 + (above_row_0 as u32) * 5;
+    ((s + 8) >> 4) as u16
+}
+
+/// §7.11.2.11 intra edge upsample process (av1-spec p.255). 2x
+/// upsamples `num_px` samples in-place. The buffer's valid range
+/// before this call is `-1 .. num_px - 1`; after this call the valid
+/// range is `-2 .. 2 * num_px - 2`. The caller is responsible for
+/// allocating the buffer with the required head + tail headroom.
+///
+/// The spec's interpretation of indices `-1`, `-2`, `2 * i - 1`,
+/// `2 * i` is carried by a slice that holds the negative slots in the
+/// first two cells (offset `0` ↔ index `-2`, offset `1` ↔ index `-1`,
+/// offset `2` ↔ index `0`, …).
+///
+/// `dir` is `0` for the above edge (caller passes `&mut AboveRow[]`)
+/// or `1` for the left edge (`&mut LeftCol[]`); the spec routes the
+/// `buf` reference accordingly, but with a single-buffer signature the
+/// caller passes the appropriate edge.
+///
+/// `bit_depth` clips each upsampled sample to `[0, (1 << BitDepth) -
+/// 1]` per the §7.11.2.11 `Clip1` step.
+///
+/// `buf` layout: the first `2` slots hold pre-process indices `-2` and
+/// `-1`; offset `i + 2` holds pre-process index `i`. Post-process,
+/// offset `2 * i + 2` holds index `2 * i` and offset `2 * i + 1` holds
+/// index `2 * i - 1`. The buffer must be of length
+/// `>= 2 * num_px + 2`. (The §7.11.2.11 spec's `dup[]` intermediate
+/// is consumed in-place from the original `buf[-1 .. num_px - 1]`
+/// values via a small temporary array.)
+///
+/// Returns `Err(Error::PartitionWalkOutOfRange)` when `num_px == 0`
+/// (the spec requires `num_px >= 1`) or `buf.len() < 2 * num_px + 2`.
+pub fn intra_edge_upsample(
+    num_px: usize,
+    bit_depth: u8,
+    buf: &mut [u16],
+) -> Result<(), crate::Error> {
+    if num_px == 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if !(8..=12).contains(&bit_depth) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if buf.len() < 2 * num_px + 2 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // Build `dup[ 0 .. num_px + 3 ]` by extending `buf[ -1 .. num_px -
+    // 1 ]` (offset `1 .. num_px + 1` in our representation) by one
+    // sample at each end. `dup[ 0 ] = buf[ -1 ]`; `dup[ i + 2 ] = buf[
+    // i ]` for `i ∈ -1 .. num_px`; `dup[ num_px + 2 ] = buf[ num_px - 1
+    // ]`. With our offset convention `dup[ k ] = buf_offset[ k + 1 ]`
+    // for `k ∈ 0..num_px + 1`, then duplicate the last live cell into
+    // the trailing slot.
+    let mut dup = vec![0i32; num_px + 3];
+    dup[0] = buf[1] as i32; // dup[0] = buf[-1]
+    for i in 0..num_px {
+        // dup[ i + 2 ] = buf[ i ] (offset i + 2 ↔ index i)
+        dup[i + 2] = buf[i + 2] as i32;
+    }
+    // dup[1] = buf[-1] (= dup[0] per i = -1 iteration of the loop)
+    dup[1] = buf[1] as i32;
+    // dup[ num_px + 2 ] = buf[ num_px - 1 ] (tail extension)
+    dup[num_px + 2] = buf[num_px + 1] as i32;
+
+    // `buf[ -2 ] = dup[ 0 ]` (per spec head extension; index -2 in our
+    // offset convention is offset 0).
+    buf[0] = dup[0] as u16;
+    let max_val: u32 = (1u32 << bit_depth) - 1;
+    for i in 0..num_px {
+        let s_raw = -dup[i] + 9 * dup[i + 1] + 9 * dup[i + 2] - dup[i + 3];
+        // Round2(s, 4) — the spec's symmetric rounding for a signed `s`
+        // is `(s + 8) >> 4` when `s >= 0`; for negative `s` we mirror
+        // the rounding direction. Use `round2_signed_local` to keep
+        // the symmetric semantics.
+        let rounded = if s_raw >= 0 {
+            (s_raw + 8) >> 4
+        } else {
+            -(((-s_raw) + 8) >> 4)
+        };
+        let clipped = if rounded < 0 {
+            0u32
+        } else if (rounded as u32) > max_val {
+            max_val
+        } else {
+            rounded as u32
+        };
+        // buf[ 2 * i - 1 ] ↔ offset (2 * i - 1) + 2 = 2 * i + 1.
+        buf[2 * i + 1] = clipped as u16;
+        // buf[ 2 * i ] = dup[ i + 2 ] (= the original buf[ i ]).
+        let copy_in = dup[i + 2] as u32;
+        let copy_clipped = if copy_in > max_val { max_val } else { copy_in };
+        buf[2 * i + 2] = copy_clipped as u16;
+    }
+    Ok(())
+}
+
+/// §7.11.2.12 intra edge filter process (av1-spec p.255-256). Applies
+/// the `Intra_Edge_Kernel[ strength - 1 ]` 5-tap kernel to the edge
+/// samples (`AboveRow[]` when `left == 0`, `LeftCol[]` when `left ==
+/// 1`).
+///
+/// `sz` is the §7.11.2.4 `numPx` value the caller derived (always
+/// `<= 129`). `strength` is in `0..=3` (the §7.11.2.9 strength
+/// selection output); `0` is a no-op early-return.
+///
+/// The buffer layout matches [`intra_edge_upsample`]: offset `0`
+/// holds pre-process index `-2`, offset `1` holds index `-1`, offset
+/// `i + 2` holds index `i`. The spec's `edge[ i ]` for `i ∈ 0 .. sz -
+/// 1` is `buf[ i - 1 ]` (offset `i + 1`); the output `buf[ i - 1 ]
+/// = (s + 8) >> 4` writes back to the same offsets `1 .. sz`.
+///
+/// Returns `Err(Error::PartitionWalkOutOfRange)` for caller-bug args
+/// (`sz > 129` per the spec's `sz <= 129` bound, `strength > 3`,
+/// `buf.len() < sz + 1`).
+pub fn intra_edge_filter(sz: usize, strength: u8, buf: &mut [u16]) -> Result<(), crate::Error> {
+    if sz > 129 || strength > 3 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if buf.len() < sz + 1 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if strength == 0 || sz == 0 {
+        return Ok(());
+    }
+    let kernel = &INTRA_EDGE_KERNEL[(strength - 1) as usize];
+    // Snapshot `edge[ i ] = buf[ i - 1 ]` for `i ∈ 0..sz`. Output
+    // writes overwrite the same cells, so we need a read-side copy.
+    let mut edge = vec![0i32; sz];
+    for (i, slot) in edge.iter_mut().enumerate().take(sz) {
+        // edge[ i ] = buf[ i - 1 ] ↔ offset (i - 1) + 2 = i + 1.
+        *slot = buf[i + 1] as i32;
+    }
+    for i in 1..sz {
+        let mut s: i32 = 0;
+        for (j, &kj) in kernel.iter().enumerate().take(INTRA_EDGE_TAPS) {
+            // k = Clip3( 0, sz - 1, i - 2 + j ).
+            let k_raw = i as i32 - 2 + j as i32;
+            let k = if k_raw < 0 {
+                0
+            } else if k_raw > (sz as i32 - 1) {
+                sz - 1
+            } else {
+                k_raw as usize
+            };
+            s += kj * edge[k];
+        }
+        let out = (s + 8) >> 4;
+        let clipped = if out < 0 { 0 } else { out };
+        // Output writes to buf[ i - 1 ] (offset i + 1).
+        buf[i + 1] = clipped as u16;
+    }
+    Ok(())
+}
+
+/// §7.11.2.4 directional intra prediction process (av1-spec p.245-248)
+/// — the unified body covering the six non-degenerate D-modes (D45 /
+/// D67 / D113 / D135 / D157 / D203). Routes to one of step 7 / step 8
+/// / step 9 keyed by `p_angle`. The two degenerate cases (`p_angle ==
+/// 90` ⇒ V_PRED, `p_angle == 180` ⇒ H_PRED) are handled by the
+/// dedicated [`predict_intra_v_pred`] / [`predict_intra_h_pred`]
+/// leaves (r186) and rejected here as caller-bug.
+///
+/// ## Arguments
+///
+/// * `w` / `h` — prediction-region dimensions in plane samples; both
+///   in `4..=64`.
+/// * `p_angle` — the directional angle in degrees per
+///   `pAngle = MODE_TO_ANGLE[ mode ] + angleDelta * ANGLE_STEP`.
+///   Must be one of the §7.11.2.4 non-degenerate values: `pAngle <
+///   90`, `90 < pAngle < 180`, or `pAngle > 180` (with `0 <= pAngle <
+///   360`). `pAngle == 90` / `pAngle == 180` is caller-bug.
+/// * `upsample_above` / `upsample_left` — `0` (the §7.11.2.11
+///   2x-upsample pre-pass was not applied) or `1` (it was applied).
+///   The r188 walker integration runs the no-upsample path (`0` /
+///   `0`); future arcs can stitch the pre-pass into the dispatcher and
+///   pass `1` on the small-block / steep-angle subset selected by
+///   [`intra_edge_upsample_selection`].
+/// * `above_row` — `AboveRow[ 0 .. (w + h) * (1 << upsample_above) -
+///   1 ]`. The `(w + h)` extent comes from the §7.11.2.1 derivation
+///   (`AboveRow[]` is sized `w + h` plus the `-1` corner). After
+///   upsampling the length doubles plus the two-slot head extension.
+/// * `left_col` — `LeftCol[ 0 .. (w + h) * (1 << upsample_left) - 1 ]`.
+/// * `pred` — output buffer; length must be `>= h * w`.
+///
+/// Buffer layout for `above_row` / `left_col` mirrors
+/// [`intra_edge_upsample`]: offset `0` holds index `-2`, offset `1`
+/// holds index `-1`, offset `i + 2` holds index `i`. When `upsample_*
+/// == 0` only offset `1 .. w + h + 1` is read (the index `-1` slot
+/// holds the §7.11.2.1 corner cell).
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_intra_directional(
+    w: usize,
+    h: usize,
+    p_angle: i32,
+    upsample_above: u8,
+    upsample_left: u8,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w == 0 || h == 0 || w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if upsample_above > 1 || upsample_left > 1 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if !(0..360).contains(&p_angle) || p_angle == 90 || p_angle == 180 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.2.4 step 5: `dx`.
+    let dx: i32 = if p_angle < 90 {
+        DR_INTRA_DERIVATIVE[p_angle as usize] as i32
+    } else if p_angle < 180 {
+        DR_INTRA_DERIVATIVE[(180 - p_angle) as usize] as i32
+    } else {
+        0 // undefined per spec; not read on the step-9 path.
+    };
+    // §7.11.2.4 step 6: `dy`.
+    let dy: i32 = if (90..180).contains(&p_angle) {
+        DR_INTRA_DERIVATIVE[(p_angle - 90) as usize] as i32
+    } else if p_angle > 180 {
+        DR_INTRA_DERIVATIVE[(270 - p_angle) as usize] as i32
+    } else {
+        0 // undefined per spec; not read on the step-7 path.
+    };
+
+    // Offsets into the head-extended buffers. Index `k` (spec) ↔ offset
+    // `k + 2` (our representation). Index `-1` ↔ offset `1`; index `-2`
+    // ↔ offset `0`. `above[ k ]` reads `above_row[ k + 2 ]`, but we
+    // guard the negative range carefully.
+    let read_above = |k: i32| -> Result<u16, crate::Error> {
+        let off = k + 2;
+        if off < 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let o = off as usize;
+        if o >= above_row.len() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        Ok(above_row[o])
+    };
+    let read_left = |k: i32| -> Result<u16, crate::Error> {
+        let off = k + 2;
+        if off < 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let o = off as usize;
+        if o >= left_col.len() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        Ok(left_col[o])
+    };
+
+    if p_angle < 90 {
+        // §7.11.2.4 step 7 — D45 / D67 family.
+        let max_base_x: i32 = ((w + h - 1) << upsample_above) as i32;
+        for i in 0..h {
+            for j in 0..w {
+                let idx = (i as i32 + 1) * dx;
+                let base = (idx >> (6 - upsample_above as i32)) + ((j as i32) << upsample_above);
+                let shift = ((idx << upsample_above as i32) >> 1) & 0x1F;
+                let pv: u32 = if base < max_base_x {
+                    let a0 = read_above(base)? as u32;
+                    let a1 = read_above(base + 1)? as u32;
+                    let s = a0 * (32 - shift as u32) + a1 * (shift as u32);
+                    (s + 16) >> 5
+                } else {
+                    read_above(max_base_x)? as u32
+                };
+                pred[i * w + j] = pv as u16;
+            }
+        }
+    } else if p_angle < 180 {
+        // §7.11.2.4 step 8 — D113 / D135 / D157 (hybrid). Note step 8
+        // does NOT define a `max_base_x` short-circuit; the spec gates
+        // on `base >= -(1 << upsampleAbove)` ⇒ read AboveRow; else
+        // re-project along Y through LeftCol.
+        for i in 0..h {
+            for j in 0..w {
+                let idx_x = ((j as i32) << 6) - (i as i32 + 1) * dx;
+                let base_x = idx_x >> (6 - upsample_above as i32);
+                let lower_bound: i32 = -(1 << upsample_above as i32);
+                if base_x >= lower_bound {
+                    let shift = ((idx_x << upsample_above as i32) >> 1) & 0x1F;
+                    let a0 = read_above(base_x)? as u32;
+                    let a1 = read_above(base_x + 1)? as u32;
+                    let s = a0 * (32 - shift as u32) + a1 * (shift as u32);
+                    pred[i * w + j] = ((s + 16) >> 5) as u16;
+                } else {
+                    let idx_y = ((i as i32) << 6) - (j as i32 + 1) * dy;
+                    let base_y = idx_y >> (6 - upsample_left as i32);
+                    let shift = ((idx_y << upsample_left as i32) >> 1) & 0x1F;
+                    let l0 = read_left(base_y)? as u32;
+                    let l1 = read_left(base_y + 1)? as u32;
+                    let s = l0 * (32 - shift as u32) + l1 * (shift as u32);
+                    pred[i * w + j] = ((s + 16) >> 5) as u16;
+                }
+            }
+        }
+    } else {
+        // §7.11.2.4 step 9 — D203 family (mirror of step 7 along the
+        // left edge).
+        let max_base_y: i32 = ((w + h - 1) << upsample_left) as i32;
+        for i in 0..h {
+            for j in 0..w {
+                let idx = (j as i32 + 1) * dy;
+                let base = (idx >> (6 - upsample_left as i32)) + ((i as i32) << upsample_left);
+                let shift = ((idx << upsample_left as i32) >> 1) & 0x1F;
+                let pv: u32 = if base < max_base_y {
+                    let l0 = read_left(base)? as u32;
+                    let l1 = read_left(base + 1)? as u32;
+                    let s = l0 * (32 - shift as u32) + l1 * (shift as u32);
+                    (s + 16) >> 5
+                } else {
+                    read_left(max_base_y)? as u32
+                };
+                pred[i * w + j] = pv as u16;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §7.11.2.4 directional intra prediction keyed by the §6.10.x
+/// intra-mode ordinal (`D45_PRED == 3`, `D135_PRED == 4`, `D113_PRED
+/// == 5`, `D157_PRED == 6`, `D203_PRED == 7`, `D67_PRED == 8`). Looks
+/// up `Mode_To_Angle[ mode ]`, applies `pAngle = MODE_TO_ANGLE[ mode ]
+/// + angle_delta * ANGLE_STEP`, then delegates to
+/// [`predict_intra_directional`].
+///
+/// Caller-bug guards: rejects modes outside `3..=8` (the non-degenerate
+/// D-mode range) — the degenerate `V_PRED` / `H_PRED` cases route
+/// through [`predict_intra_v_pred`] / [`predict_intra_h_pred`].
+#[allow(clippy::too_many_arguments)]
+pub fn predict_intra_d_mode(
+    mode: usize,
+    angle_delta: i32,
+    w: usize,
+    h: usize,
+    upsample_above: u8,
+    upsample_left: u8,
+    above_row: &[u16],
+    left_col: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if !(D45_PRED..=D67_PRED).contains(&mode) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if !(-3..=3).contains(&angle_delta) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let p_angle = MODE_TO_ANGLE[mode] + angle_delta * ANGLE_STEP;
+    predict_intra_directional(
+        w,
+        h,
+        p_angle,
+        upsample_above,
+        upsample_left,
+        above_row,
+        left_col,
+        pred,
+    )
+}
+
+// ---------------------------------------------------------------------
 // Round 149 — §5.11.49 caller-side argument derivation.
 // Computes the four `palette_tokens_plane` size arguments
 // (`block_w`, `block_h`, `onscreen_w`, `onscreen_h`) from the parser-
@@ -23002,24 +23634,22 @@ impl PartitionWalker {
                 // §5.11.22 readers cap at `INTRA_MODES`).
                 return Err(crate::Error::PartitionWalkOutOfRange);
             }
-            // `DC_PRED == 0`, `V_PRED == 1`, `H_PRED == 2`,
-            // `SMOOTH_PRED == 9`, `SMOOTH_V_PRED == 10`,
-            // `SMOOTH_H_PRED == 11`, `PAETH_PRED == 12`. The seven-
-            // mode supported set covers §7.11.2.5 + §7.11.2.4 step-10/
-            // step-11 + §7.11.2.6 (all three SMOOTH arms) + §7.11.2.2
-            // PAETH. Everything else (the six directional D-modes:
-            // D45 / D67 / D113 / D135 / D157 / D203 — `3..=8` per the
-            // §6.10.x enumeration) still surfaces the next-arc stub.
-            let supported = matches!(
-                plane_mode as usize,
-                DC_PRED
-                    | V_PRED
-                    | H_PRED
-                    | SMOOTH_PRED
-                    | SMOOTH_V_PRED
-                    | SMOOTH_H_PRED
-                    | PAETH_PRED
-            );
+            // r188: all 13 §6.10.x Y intra modes admitted.
+            // `DC_PRED == 0`, `V_PRED == 1`, `H_PRED == 2`, `D45_PRED ==
+            // 3`, `D135_PRED == 4`, `D113_PRED == 5`, `D157_PRED == 6`,
+            // `D203_PRED == 7`, `D67_PRED == 8`, `SMOOTH_PRED == 9`,
+            // `SMOOTH_V_PRED == 10`, `SMOOTH_H_PRED == 11`, `PAETH_PRED
+            // == 12`. The thirteen-mode supported set covers §7.11.2.5
+            // (DC) + §7.11.2.4 (the two step-10/step-11 degenerate cases
+            // V_PRED / H_PRED plus the six step-7/8/9 D-modes via
+            // [`predict_intra_d_mode`]) + §7.11.2.6 (all three SMOOTH
+            // arms) + §7.11.2.2 (PAETH). With r188 the
+            // `ComputePredictionIntraModeUnsupported` error is reachable
+            // only on a caller-bug `plane_mode >= INTRA_MODES` (caught
+            // by the bounds guard above) — i.e. no intra mode legally
+            // emitted by the §5.11.7 / §5.11.22 readers should ever
+            // produce it.
+            let supported = (plane_mode as usize) < INTRA_MODES;
             if !supported {
                 return Err(crate::Error::ComputePredictionIntraModeUnsupported);
             }
@@ -49110,5 +49740,433 @@ mod tests {
         for plane in 0..3 {
             assert!(walker.curr_frame(plane).is_none());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Round 188 — §7.11.2.4 D-mode directional intra prediction tests.
+    // ---------------------------------------------------------------
+
+    /// r188: `Mode_To_Angle[ INTRA_MODES ]` length + non-directional
+    /// entries are 0 + the seven directional entries match the
+    /// av1-spec p.485 transcription.
+    #[test]
+    fn mode_to_angle_table_matches_spec_transcription() {
+        assert_eq!(MODE_TO_ANGLE.len(), INTRA_MODES);
+        assert_eq!(MODE_TO_ANGLE[DC_PRED], 0);
+        assert_eq!(MODE_TO_ANGLE[V_PRED], 90);
+        assert_eq!(MODE_TO_ANGLE[H_PRED], 180);
+        assert_eq!(MODE_TO_ANGLE[D45_PRED], 45);
+        assert_eq!(MODE_TO_ANGLE[D135_PRED], 135);
+        assert_eq!(MODE_TO_ANGLE[D113_PRED], 113);
+        assert_eq!(MODE_TO_ANGLE[D157_PRED], 157);
+        assert_eq!(MODE_TO_ANGLE[D203_PRED], 203);
+        assert_eq!(MODE_TO_ANGLE[D67_PRED], 67);
+        assert_eq!(MODE_TO_ANGLE[SMOOTH_PRED], 0);
+        assert_eq!(MODE_TO_ANGLE[SMOOTH_V_PRED], 0);
+        assert_eq!(MODE_TO_ANGLE[SMOOTH_H_PRED], 0);
+        assert_eq!(MODE_TO_ANGLE[PAETH_PRED], 0);
+    }
+
+    /// r188: `Dr_Intra_Derivative[ 90 ]` length + the 27 non-zero
+    /// transcription pins per av1-spec p.487. Every other slot is `0`.
+    #[test]
+    fn dr_intra_derivative_table_matches_spec_transcription() {
+        assert_eq!(DR_INTRA_DERIVATIVE.len(), 90);
+        let nonzero = [
+            (3, 1023),
+            (6, 547),
+            (9, 372),
+            (14, 273),
+            (17, 215),
+            (20, 178),
+            (23, 151),
+            (26, 132),
+            (29, 116),
+            (32, 102),
+            (36, 90),
+            (39, 80),
+            (42, 71),
+            (45, 64),
+            (48, 57),
+            (51, 51),
+            (54, 45),
+            (58, 40),
+            (61, 35),
+            (64, 31),
+            (67, 27),
+            (70, 23),
+            (73, 19),
+            (76, 15),
+            (81, 11),
+            (84, 7),
+            (87, 3),
+        ];
+        let nonzero_idx: std::collections::HashSet<usize> =
+            nonzero.iter().map(|&(i, _)| i).collect();
+        for &(i, v) in &nonzero {
+            assert_eq!(DR_INTRA_DERIVATIVE[i], v, "Dr_Intra_Derivative[{i}]");
+        }
+        for (i, &v) in DR_INTRA_DERIVATIVE.iter().enumerate() {
+            if !nonzero_idx.contains(&i) {
+                assert_eq!(v, 0, "Dr_Intra_Derivative[{i}] must be 0");
+            }
+        }
+    }
+
+    /// r188: `Intra_Edge_Kernel[ 3 ][ 5 ]` transcription pin per av1-
+    /// spec p.256. Three rows: `[0, 4, 8, 4, 0]`, `[0, 5, 6, 5, 0]`,
+    /// `[2, 4, 4, 4, 2]`. Each row sums to 16 (so `(s + 8) >> 4`
+    /// preserves DC).
+    #[test]
+    fn intra_edge_kernel_transcription_pins() {
+        assert_eq!(INTRA_EDGE_KERNEL[0], [0, 4, 8, 4, 0]);
+        assert_eq!(INTRA_EDGE_KERNEL[1], [0, 5, 6, 5, 0]);
+        assert_eq!(INTRA_EDGE_KERNEL[2], [2, 4, 4, 4, 2]);
+        for (k, row) in INTRA_EDGE_KERNEL.iter().enumerate() {
+            let sum: i32 = row.iter().sum();
+            assert_eq!(sum, 16, "row {k} DC-preserving sum");
+        }
+    }
+
+    /// r188: §7.11.2.7 `filter_corner` averages
+    /// `(5 * 100 + 6 * 100 + 5 * 100 + 8) >> 4 = (1608) >> 4 = 100`
+    /// for a constant input (the constant-DC identity within rounding).
+    #[test]
+    fn filter_corner_constant_input_is_dc_preserving() {
+        assert_eq!(filter_corner(100, 100, 100), 100);
+        assert_eq!(filter_corner(0, 0, 0), 0);
+        assert_eq!(filter_corner(255, 255, 255), 255);
+    }
+
+    /// r188: §7.11.2.7 `filter_corner` mid-point hand-trace.
+    /// `5 * 50 + 6 * 200 + 5 * 50 = 250 + 1200 + 250 = 1700`,
+    /// `(1700 + 8) >> 4 = 1708 / 16 = 106`.
+    #[test]
+    fn filter_corner_hand_trace() {
+        assert_eq!(filter_corner(50, 200, 50), 106);
+    }
+
+    /// r188: §7.11.2.10 `intra_edge_upsample_selection`. `|delta| <= 0`
+    /// or `|delta| >= 40` ⇒ `0`. Otherwise filter_type == 0 ⇒
+    /// `w + h <= 16`; filter_type == 1 ⇒ `w + h <= 8`.
+    #[test]
+    fn intra_edge_upsample_selection_pin() {
+        // |delta| == 0 ⇒ 0 (degenerate-axis: V_PRED / H_PRED handled
+        // by dedicated leaves).
+        assert_eq!(intra_edge_upsample_selection(4, 4, 0, 0), 0);
+        // |delta| == 40 ⇒ 0 (boundary).
+        assert_eq!(intra_edge_upsample_selection(4, 4, 0, 40), 0);
+        assert_eq!(intra_edge_upsample_selection(4, 4, 0, -40), 0);
+        // filter_type 0, w+h = 8, |delta| = 20 (in range) ⇒ 1.
+        assert_eq!(intra_edge_upsample_selection(4, 4, 0, 20), 1);
+        // filter_type 0, w+h = 16 ⇒ 1 (boundary).
+        assert_eq!(intra_edge_upsample_selection(8, 8, 0, 20), 1);
+        // filter_type 0, w+h = 17 ⇒ 0 (above bound).
+        assert_eq!(intra_edge_upsample_selection(8, 9, 0, 20), 0);
+        // filter_type 1, w+h = 8 ⇒ 1.
+        assert_eq!(intra_edge_upsample_selection(4, 4, 1, 20), 1);
+        // filter_type 1, w+h = 9 ⇒ 0.
+        assert_eq!(intra_edge_upsample_selection(4, 5, 1, 20), 0);
+    }
+
+    /// r188: §7.11.2.9 `intra_edge_filter_strength_selection` truth
+    /// table. Spot-checks each of the per-(filter_type, blkWh) branches
+    /// per av1-spec p.253.
+    #[test]
+    fn intra_edge_filter_strength_selection_pin() {
+        // filter_type 0, blkWh = 8 ⇒ strength 1 only when |d| >= 56.
+        assert_eq!(intra_edge_filter_strength_selection(4, 4, 0, 0), 0);
+        assert_eq!(intra_edge_filter_strength_selection(4, 4, 0, 56), 1);
+        assert_eq!(intra_edge_filter_strength_selection(4, 4, 0, -56), 1);
+        // filter_type 0, blkWh = 12 ⇒ strength 1 when |d| >= 40.
+        assert_eq!(intra_edge_filter_strength_selection(4, 8, 0, 40), 1);
+        assert_eq!(intra_edge_filter_strength_selection(4, 8, 0, 39), 0);
+        // filter_type 0, blkWh = 24 ⇒ {1, 2, 3} ladder.
+        assert_eq!(intra_edge_filter_strength_selection(8, 16, 0, 8), 1);
+        assert_eq!(intra_edge_filter_strength_selection(8, 16, 0, 16), 2);
+        assert_eq!(intra_edge_filter_strength_selection(8, 16, 0, 32), 3);
+        // filter_type 0, blkWh > 32 ⇒ always 3.
+        assert_eq!(intra_edge_filter_strength_selection(32, 32, 0, 0), 3);
+        // filter_type 1, blkWh = 8 ⇒ |d| >= 40 ⇒ 1; |d| >= 64 ⇒ 2.
+        assert_eq!(intra_edge_filter_strength_selection(4, 4, 1, 0), 0);
+        assert_eq!(intra_edge_filter_strength_selection(4, 4, 1, 40), 1);
+        assert_eq!(intra_edge_filter_strength_selection(4, 4, 1, 64), 2);
+        // filter_type 1, blkWh > 24 ⇒ always 3.
+        assert_eq!(intra_edge_filter_strength_selection(16, 16, 1, 0), 3);
+    }
+
+    /// r188: §7.11.2.12 `intra_edge_filter` strength == 0 is a no-op
+    /// (the spec's `if (strength == 0) return` short-circuit).
+    #[test]
+    fn intra_edge_filter_strength_zero_is_no_op() {
+        // Layout: [index -2, index -1, index 0, index 1, ..., index 7].
+        // sz = 5 (a 5-sample edge); buf length needs >= sz + 1 = 6.
+        let mut buf = vec![0u16, 100, 10, 20, 30, 40, 50];
+        let before = buf.clone();
+        intra_edge_filter(5, 0, &mut buf).unwrap();
+        assert_eq!(buf, before);
+    }
+
+    /// r188: §7.11.2.12 `intra_edge_filter` on constant input preserves
+    /// the constant (each kernel row sums to 16, so `(16 * c + 8) >>
+    /// 4 = c`). The output at offset `i + 1` (= spec's `buf[i - 1]`)
+    /// equals `c` for `i = 1..sz` after the filter; the index `-1` /
+    /// `-2` head slots are untouched.
+    #[test]
+    fn intra_edge_filter_constant_input_dc_preserving() {
+        let sz: usize = 8;
+        for strength in 1..=3u8 {
+            // Constant edge of `50` across `index 0 .. sz - 1`.
+            let mut buf = vec![50u16; sz + 1];
+            // Head slot index -1 = offset 1.
+            buf[0] = 50; // index -2 (untouched)
+            buf[1] = 50; // index -1 (untouched)
+            intra_edge_filter(sz, strength, &mut buf).unwrap();
+            for (i, &v) in buf.iter().enumerate().skip(1) {
+                assert_eq!(v, 50, "strength {strength} offset {i}");
+            }
+        }
+    }
+
+    /// r188: §7.11.2.11 `intra_edge_upsample` on constant input
+    /// preserves the constant (the 4-tap kernel `(-1, 9, 9, -1) / 16`
+    /// sums to 16 in the inner term, so a constant `c` produces
+    /// `((−c + 9c + 9c − c) + 8) >> 4 = (16c + 8) >> 4 = c` on every
+    /// upsampled slot).
+    #[test]
+    fn intra_edge_upsample_constant_input_dc_preserving() {
+        let num_px: usize = 4;
+        // Layout: [-2, -1, 0, 1, 2, 3, _ , _ , _ , _ ] — buf needs
+        // 2 * num_px + 2 = 10 slots for output.
+        let mut buf = vec![25u16; 2 * num_px + 2];
+        intra_edge_upsample(num_px, 8, &mut buf).unwrap();
+        // After upsample valid range is -2..2 * num_px - 2; in our
+        // offset convention this is offsets 0..2*num_px. Every cell
+        // should still be 25.
+        for (i, &v) in buf.iter().take(2 * num_px).enumerate() {
+            assert_eq!(v, 25, "offset {i} after upsample");
+        }
+    }
+
+    /// r188: §7.11.2.4 step 7 `predict_intra_directional` on
+    /// `D45_PRED` (`pAngle == 45`) with a constant `AboveRow`
+    /// produces a constant block (the per-cell `(32 - shift) * c +
+    /// shift * c = 32 * c` collapses to `Round2(32 * c, 5) = c`).
+    #[test]
+    fn directional_d45_constant_above_produces_constant() {
+        // 4×4 block; we read up to base = (i + 1) * dx >> 6 + j with
+        // dx = Dr_Intra_Derivative[45] = 64 and i ∈ 0..3, j ∈ 0..3.
+        // Max base index = ((3+1)*64 >> 6) + 3 = 4 + 3 = 7.
+        // (w + h - 1) = 7, so max_base_x = 7. Need AboveRow[0..=7]
+        // populated. Layout: [-2, -1, 0, 1, …, 7] (10 entries).
+        let above: Vec<u16> = vec![77u16; 10];
+        let left: Vec<u16> = vec![77u16; 10];
+        let mut pred = [0u16; 16];
+        predict_intra_directional(4, 4, 45, 0, 0, &above, &left, &mut pred).unwrap();
+        for (k, &v) in pred.iter().enumerate() {
+            assert_eq!(v, 77, "D45 cell {k}");
+        }
+    }
+
+    /// r188: §7.11.2.4 step 8 `predict_intra_directional` on
+    /// `D135_PRED` (`pAngle == 135`) with constant neighbours produces
+    /// a constant block — both the above-axis and the left-axis fall-
+    /// back arms blend `c * 32 / 32 = c`.
+    #[test]
+    fn directional_d135_constant_neighbours_produce_constant() {
+        let above: Vec<u16> = vec![123u16; 10];
+        let left: Vec<u16> = vec![123u16; 10];
+        let mut pred = [0u16; 16];
+        predict_intra_directional(4, 4, 135, 0, 0, &above, &left, &mut pred).unwrap();
+        for &v in pred.iter() {
+            assert_eq!(v, 123);
+        }
+    }
+
+    /// r188: §7.11.2.4 step 9 `predict_intra_directional` on
+    /// `D203_PRED` (`pAngle == 203`) with constant `LeftCol` produces
+    /// a constant block — the step-9 mirror of D45.
+    #[test]
+    fn directional_d203_constant_left_produces_constant() {
+        let above: Vec<u16> = vec![200u16; 10];
+        let left: Vec<u16> = vec![200u16; 10];
+        let mut pred = [0u16; 16];
+        predict_intra_directional(4, 4, 203, 0, 0, &above, &left, &mut pred).unwrap();
+        for &v in pred.iter() {
+            assert_eq!(v, 200);
+        }
+    }
+
+    /// r188: §7.11.2.4 step 7 D45 — when `AboveRow` is monotone
+    /// (ramp `j -> j * 10`), the prediction copies `AboveRow` along
+    /// the 45° diagonal: `pred[0][0]` reads near `AboveRow[1]`,
+    /// `pred[1][0]` reads near `AboveRow[2]`, etc. With `dx = 64`,
+    /// `idx = (i + 1) * 64`, `base = idx >> 6 = i + 1`, `shift = 0`
+    /// (so the upper sample dominates). `pred[i][j] = AboveRow[i + 1 +
+    /// j]` for `base < max_base_x = w + h - 1 = 7`. Beyond that the
+    /// `AboveRow[7]` ceiling pin fires.
+    #[test]
+    fn directional_d45_ramp_above_diagonal_copy() {
+        // Layout: [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7]; offset i + 2 holds
+        // index i. AboveRow[i] = (i + 1) * 10 for i ∈ 0..=7.
+        let mut above = vec![0u16; 10];
+        for i in 0..=7i32 {
+            above[(i + 2) as usize] = ((i + 1) * 10) as u16;
+        }
+        let left = vec![0u16; 10];
+        let mut pred = [0u16; 16];
+        predict_intra_directional(4, 4, 45, 0, 0, &above, &left, &mut pred).unwrap();
+        // pred[i][j] = AboveRow[i + 1 + j] = (i + 2 + j) * 10 when in
+        // range; clamps to AboveRow[7] = 80 when base >= 7.
+        for i in 0..4 {
+            for j in 0..4 {
+                let base = (i + 1) + j;
+                let expected = if base < 7 {
+                    ((base + 1) * 10) as u16
+                } else {
+                    80
+                };
+                assert_eq!(pred[i * 4 + j], expected, "i={i} j={j}");
+            }
+        }
+    }
+
+    /// r188: `predict_intra_d_mode` ordinal-to-angle dispatch. Each
+    /// of the six D-modes routes through `MODE_TO_ANGLE[ mode ] + 0 *
+    /// ANGLE_STEP` (the r188 walker emits `angleDelta == 0`).
+    #[test]
+    fn predict_intra_d_mode_constant_neighbours_match_directional() {
+        let above: Vec<u16> = vec![64u16; 10];
+        let left: Vec<u16> = vec![64u16; 10];
+        for &m in &[
+            D45_PRED, D135_PRED, D113_PRED, D157_PRED, D203_PRED, D67_PRED,
+        ] {
+            let mut pred = [0u16; 16];
+            predict_intra_d_mode(m, 0, 4, 4, 0, 0, &above, &left, &mut pred).unwrap();
+            for &v in pred.iter() {
+                assert_eq!(v, 64, "mode {m}");
+            }
+        }
+    }
+
+    /// r188: `predict_intra_d_mode` caller-bug guards — out-of-range
+    /// mode + out-of-range angle_delta + degenerate `V_PRED` /
+    /// `H_PRED` rejection.
+    #[test]
+    fn predict_intra_d_mode_caller_bug_guards() {
+        let above = vec![0u16; 10];
+        let left = vec![0u16; 10];
+        let mut pred = [0u16; 16];
+        // Below D45_PRED (the V_PRED degenerate, handled elsewhere).
+        assert_eq!(
+            predict_intra_d_mode(V_PRED, 0, 4, 4, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // Above D67_PRED (the SMOOTH_PRED ordinal).
+        assert_eq!(
+            predict_intra_d_mode(SMOOTH_PRED, 0, 4, 4, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // angle_delta out of range.
+        assert_eq!(
+            predict_intra_d_mode(D45_PRED, 4, 4, 4, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            predict_intra_d_mode(D45_PRED, -4, 4, 4, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    /// r188: `predict_intra_directional` caller-bug guards.
+    #[test]
+    fn predict_intra_directional_caller_bug_guards() {
+        let above = vec![0u16; 16];
+        let left = vec![0u16; 16];
+        let mut pred = [0u16; 16];
+        // p_angle == 90 (V_PRED degenerate) is rejected — caller must
+        // route through predict_intra_v_pred.
+        assert_eq!(
+            predict_intra_directional(4, 4, 90, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // p_angle == 180 (H_PRED degenerate).
+        assert_eq!(
+            predict_intra_directional(4, 4, 180, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // p_angle out of range.
+        assert_eq!(
+            predict_intra_directional(4, 4, -1, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            predict_intra_directional(4, 4, 360, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // w / h out of range.
+        assert_eq!(
+            predict_intra_directional(0, 4, 45, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            predict_intra_directional(4, 65, 45, 0, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // upsample flag out of range.
+        assert_eq!(
+            predict_intra_directional(4, 4, 45, 2, 0, &above, &left, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        // pred too short.
+        let mut tiny = [0u16; 8];
+        assert_eq!(
+            predict_intra_directional(4, 4, 45, 0, 0, &above, &left, &mut tiny),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    /// r188: `intra_edge_filter` caller-bug guards — `sz > 129` /
+    /// `strength > 3` / short buffer.
+    #[test]
+    fn intra_edge_filter_caller_bug_guards() {
+        let mut buf = vec![0u16; 8];
+        assert_eq!(
+            intra_edge_filter(130, 1, &mut buf),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            intra_edge_filter(4, 4, &mut buf),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        let mut tiny = vec![0u16; 2];
+        assert_eq!(
+            intra_edge_filter(8, 1, &mut tiny),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+    }
+
+    /// r188: `intra_edge_upsample` caller-bug guards — `num_px == 0` /
+    /// `bit_depth` out of range / short buffer.
+    #[test]
+    fn intra_edge_upsample_caller_bug_guards() {
+        let mut buf = vec![0u16; 10];
+        assert_eq!(
+            intra_edge_upsample(0, 8, &mut buf),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            intra_edge_upsample(4, 7, &mut buf),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        assert_eq!(
+            intra_edge_upsample(4, 13, &mut buf),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
+        let mut tiny = vec![0u16; 4];
+        assert_eq!(
+            intra_edge_upsample(4, 8, &mut tiny),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        );
     }
 }

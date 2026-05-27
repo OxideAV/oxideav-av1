@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 187)
+## Status — 2026-05-28 (round 188)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,156 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 188 lifts the **§7.11.2.4 six non-degenerate directional D-mode
+sample-generation leaves** (D45 / D135 / D113 / D157 / D203 / D67) +
+the **§7.11.2.{7, 9, 10, 11, 12} intra-edge helpers** (filter corner /
+strength selection / upsample selection / 2x upsample / 5-tap filter)
++ the **`Mode_To_Angle[ INTRA_MODES ]`** (av1-spec p.485) and
+**`Dr_Intra_Derivative[ 90 ]`** (av1-spec p.487) tables. With r188
+the §5.11.33 `compute_prediction` dispatcher's intra arm admits all
+**13 §6.10.x Y intra modes** — `Error::
+ComputePredictionIntraModeUnsupported` is reachable only via the
+caller-bug `UV_CFL_PRED == 13` on the luma plane.
+
+`predict_intra_directional(w, h, p_angle, upsample_above,
+upsample_left, above_row, left_col, pred)` transcribes §7.11.2.4
+steps 5-9 (av1-spec p.245-248) verbatim. The body fans out on
+`p_angle`:
+
+* `p_angle < 90` (step 7 — D45 / D67): per-cell `idx = (i + 1) * dx`,
+  `base = (idx >> (6 - upsampleAbove)) + (j << upsampleAbove)`,
+  `shift = ((idx << upsampleAbove) >> 1) & 0x1F`, `maxBaseX = (w + h
+  - 1) << upsampleAbove`. Output is
+  `Round2(AboveRow[base] * (32 - shift) + AboveRow[base + 1] * shift,
+  5)` when `base < maxBaseX`, else `AboveRow[maxBaseX]`.
+* `90 < p_angle < 180` (step 8 — D113 / D135 / D157, hybrid): per-cell
+  `idx_x = (j << 6) - (i + 1) * dx`. When `base_x = idx_x >> (6 -
+  upsampleAbove)` is `>= -(1 << upsampleAbove)` the AboveRow arm
+  fires (above projection); otherwise the spec re-projects along the
+  Y axis: `idx_y = (i << 6) - (j + 1) * dy`, then a LeftCol blend.
+* `p_angle > 180` (step 9 — D203, mirror of step 7): per-cell `idx =
+  (j + 1) * dy`, `base = (idx >> (6 - upsampleLeft)) + (i <<
+  upsampleLeft)`, blend on `LeftCol[base]` / `LeftCol[base + 1]`.
+
+`dx` / `dy` are looked up from `DR_INTRA_DERIVATIVE[]` per §7.11.2.4
+step 5 / step 6 (av1-spec p.246). The dispatch is `p_angle < 90 ⇒ dx
+= DR_INTRA_DERIVATIVE[ p_angle ]`; `90 < p_angle < 180 ⇒ dx =
+DR_INTRA_DERIVATIVE[ 180 - p_angle ]` + `dy = DR_INTRA_DERIVATIVE[
+p_angle - 90 ]`; `p_angle > 180 ⇒ dy = DR_INTRA_DERIVATIVE[ 270 -
+p_angle ]`. The `dx` value for D45 (`pAngle = 45`) is `64`, for D67
+(`pAngle = 67`) is `27`, for D135 (`pAngle = 135`) is `64` (`180 -
+135 = 45`), and so on per the table.
+
+`predict_intra_d_mode(mode, angle_delta, w, h, upsample_above,
+upsample_left, above_row, left_col, pred)` is the §6.10.x ordinal
+wrapper. Looks up `MODE_TO_ANGLE[ mode ] + angle_delta * ANGLE_STEP`
+and delegates to `predict_intra_directional`. The r188 dispatcher
+passes `angle_delta = 0` (the §5.11.5 walker has not yet stitched in
+`intra_angle_info`), so `pAngle == MODE_TO_ANGLE[ mode ]` for every
+D-mode: D45 → 45, D135 → 135, D113 → 113, D157 → 157, D203 → 203,
+D67 → 67. Each falls into one of the step-7 / step-8 / step-9 arms
+naturally.
+
+`MODE_TO_ANGLE[ INTRA_MODES ]` (av1-spec p.485) is transcribed as
+`[0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0]`. Seven
+directional entries (the V_PRED / H_PRED / six D-modes) and six
+non-directional zero entries (DC, three SMOOTH arms, PAETH).
+`ANGLE_STEP = 3` per the same page.
+
+`DR_INTRA_DERIVATIVE[ 90 ]` (av1-spec p.487) is transcribed verbatim
+with 27 non-zero per-angle derivatives at the angles the §6.10.x
+enumeration plus `angle_delta ∈ -3..=3` can produce (3°, 6°, 9°,
+…, 87° in multiples of 3°). The non-zero pins:
+
+| index | value | index | value | index | value |
+|------:|------:|------:|------:|------:|------:|
+| 3 | 1023 | 36 | 90 | 67 | 27 |
+| 6 | 547 | 39 | 80 | 70 | 23 |
+| 9 | 372 | 42 | 71 | 73 | 19 |
+| 14 | 273 | 45 | 64 | 76 | 15 |
+| 17 | 215 | 48 | 57 | 81 | 11 |
+| 20 | 178 | 51 | 51 | 84 | 7 |
+| 23 | 151 | 54 | 45 | 87 | 3 |
+| 26 | 132 | 58 | 40 | | |
+| 29 | 116 | 61 | 35 | | |
+| 32 | 102 | 64 | 31 | | |
+
+`filter_corner(left_col_0, above_left, above_row_0) -> u16`
+transcribes §7.11.2.7 (av1-spec p.252) — three-tap filter
+`(5, 6, 5) / 16` producing the new value for the top-left corner cell.
+Each kernel sums to 16, so a constant input is preserved (`(5*c +
+6*c + 5*c + 8) >> 4 == c`).
+
+`intra_edge_filter_strength_selection(w, h, filter_type, delta) ->
+u8` and `intra_edge_upsample_selection(w, h, filter_type, delta) ->
+u8` transcribe §7.11.2.9 (p.253) and §7.11.2.10 (p.254). The
+strength-selection branches on `blkWh = w + h` and `|delta|`; the
+two consecutive `<= 12` and `<= 16` `filter_type == 0` arms are
+collapsed (identical body per spec — `if d >= 40 strength = 1`). The
+upsample-selection short-circuits `|delta| <= 0 || |delta| >= 40`
+to `0`.
+
+`intra_edge_upsample(num_px, bit_depth, buf)` transcribes §7.11.2.11
+(p.255). 2x in-place upsampling with the 4-tap symmetric kernel
+`(-1, 9, 9, -1) / 16` plus `Clip1` to `BitDepth`. The buffer layout
+shifts index `-2` / `-1` into offsets `0` / `1`; offset `i + 2`
+holds spec index `i`. Constant input is preserved (the inner term
+sums to 16).
+
+`intra_edge_filter(sz, strength, buf)` transcribes §7.11.2.12
+(p.255-256). 5-tap kernel `Intra_Edge_Kernel[ strength - 1 ]`
+applied at `i ∈ 1..sz`, with `Clip3( 0, sz - 1, i - 2 + j )`
+boundary handling. Strength `0` is an early-return no-op. Constant
+input is preserved across strengths 1 / 2 / 3 (each kernel row sums
+to 16).
+
+The §5.11.33 `compute_prediction` dispatcher's intra-mode gate widens
+to `0..INTRA_MODES` — every `plane_mode` in `0..13` is admitted.
+`Error::ComputePredictionIntraModeUnsupported` is reachable only when
+`plane_mode == UV_CFL_PRED == 13` arrives on the luma plane (the
+§5.11.7 / §5.11.22 readers cap at the legal per-plane range, so no
+conformant stream surfaces this error post-r188). New named §6.10.x
+intra-mode ordinals exposed: `D45_PRED = 3`, `D135_PRED = 4`,
+`D113_PRED = 5`, `D157_PRED = 6`, `D203_PRED = 7` (`D67_PRED = 8`
+already exposed via the r180 boundary marker).
+
+The r188 dispatcher takes the **no-upsample, no-filter** path
+through §7.11.2.4 step 4 (the `enable_intra_edge_filter == 0`
+short-circuit + `useUpsample == 0` short-circuit from the §7.11.2.10
+selection). The §7.11.2.{9, 10, 11, 12} helpers are exposed as
+standalone functions so a future arc can stitch them into the
+walker; today's path produces the correct shape with un-filtered /
+un-upsampled edges (lower quality, but spec-conformant for the
+non-`enable_intra_edge_filter` profile).
+
+Test count: 914 → 935 (+21). New tests: `MODE_TO_ANGLE` length +
+13-cell value pin; `DR_INTRA_DERIVATIVE` length + 27 non-zero
+index/value pins + every-other-cell-is-zero pin;
+`INTRA_EDGE_KERNEL` three-row transcription pin + per-row sum-to-16
+DC-preserving pin; `filter_corner` constant-input identity +
+asymmetric mid-point hand-trace; `intra_edge_upsample_selection`
+truth-table; `intra_edge_filter_strength_selection` truth-table
+covering both `filter_type` values across all `blkWh` branches;
+`intra_edge_filter` strength-0 no-op + constant-input
+DC-preservation across strengths 1 / 2 / 3; `intra_edge_upsample`
+constant-input DC-preservation; `predict_intra_directional` D45 /
+D135 / D203 constant-neighbour identity (the
+`32 * c / 32 = c` collapse on every projection step); D45 ramp
+diagonal-copy hand-trace (with `dx = DR_INTRA_DERIVATIVE[45] = 64`,
+`pred[i][j] = AboveRow[i + 1 + j]` up to the `max_base_x = w + h -
+1 = 7` ceiling); `predict_intra_d_mode` ordinal dispatch across all
+six D-modes; caller-bug guards on out-of-range mode (`V_PRED` /
+`SMOOTH_PRED`) / out-of-range `angle_delta` (`±4`);
+`predict_intra_directional` caller-bug guards on degenerate `pAngle
+∈ {90, 180}` / out-of-range `pAngle` / `w == 0` / `h > 64` /
+upsample flag > 1 / short pred buffer; `intra_edge_filter` /
+`intra_edge_upsample` caller-bug guards; dispatcher acceptance for
+each of the six D-modes (`3..=8`) on a 3-plane 4:2:0 block;
+dispatcher rejection of `UV_CFL_PRED == 13` on luma as
+`ComputePredictionIntraModeUnsupported`; dispatcher rejection of
+out-of-range mode `== 14` as `PartitionWalkOutOfRange`. `decode_av1`
+/ `encode_av1` still return `Error::NotImplemented`.
 
 Round 187 lifts the **§7.11.2.2 PAETH and §7.11.2.6 SMOOTH /
 SMOOTH_V / SMOOTH_H sample-generation leaves**, alongside the
