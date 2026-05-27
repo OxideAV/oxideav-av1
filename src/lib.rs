@@ -1880,34 +1880,22 @@ pub enum Error {
     /// arm is reached through the inter dispatcher (not currently
     /// possible — that arm goes through its own caller).
     AssignMvUnsupported,
-    /// The §5.11.23 reader's §5.11.31 `assign_mv( isCompound )` call
-    /// completed (the per-list `Mv[ ref ]` is decoded, the §6.10.25
-    /// `is_mv_valid` conformance bound is the caller's responsibility)
-    /// and reached the §5.11.27 **`read_motion_mode( isCompound )`**
-    /// step (av1-spec p.79).
+    /// **r175 LIFTED**: the §5.11.27 `read_motion_mode( isCompound )`
+    /// body now runs to completion (with §7.10.3
+    /// `has_overlappable_candidates` and §7.10.4 `find_warp_samples`
+    /// helpers in place), and the §5.11.23 dispatcher surfaces the
+    /// decoded `motion_mode` ordinal through
+    /// [`crate::DecodedInterBlockModeInfo::motion_mode`] (with the
+    /// §7.10.4 `NumSamples` snapshot on `num_warp_samples`). This
+    /// variant is retained as a defensive caller-bug fallback — the
+    /// §5.11.23 dispatcher no longer constructs it on the conformant
+    /// path.
     ///
-    /// The §5.11.27 body short-circuits to `motion_mode = SIMPLE` on
-    /// `skip_mode == 1` / `is_motion_mode_switchable == 0` / small
-    /// blocks / global-motion arms; otherwise it composes a
-    /// `find_warp_samples()` walk (§7.10.4) and either `use_obmc`
-    /// S() or `motion_mode` S() against `TileMotionModeCdf[ ctx ]`.
-    /// The `find_warp_samples` walk depends on the §5.11.31 `Mv[ ]`
-    /// grid stamp (already in place after r174) plus
-    /// `is_scaled(refFrame)` per the §6.10 ref-frame size table.
-    ///
-    /// All r174 §5.11.23 reads prior to this point (`read_ref_frames`,
-    /// the YMode / RefMvIdx / drl_mode loops, and the §5.11.31
-    /// `assign_mv` body) commit to the bitstream and §8.3 adaptation
-    /// state before this stub fires. The decoded
-    /// [`crate::DecodedInterBlockModeInfo`] aggregate (including the
-    /// new `mv` field) is observable on this short-circuit if a
-    /// follow-up arc routes it back through the dispatcher's return.
-    ///
-    /// Next-arc target. The post-`read_motion_mode` cascade
-    /// (`read_interintra_mode`, `read_compound_type`,
-    /// `read_interpolation_filter`) follows the natural §5.11.23
-    /// reading order and each leaf will land alongside its
-    /// corresponding sub-body.
+    /// The next-arc target moves one step down to the post-
+    /// `read_motion_mode` cascade (`read_interintra_mode` /
+    /// `read_compound_type` / `read_interpolation_filter`), currently
+    /// surfaced via the §5.11.18 dispatcher's `Ok(_)` arm as
+    /// [`Self::InterBlockModeInfoUnsupported`].
     MotionModeUnsupported,
     /// The §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample sub-
     /// processes (av1-spec p.223-226) reached from the §7.10.2 driver
@@ -2024,11 +2012,11 @@ impl core::fmt::Display for Error {
             ),
             Self::AssignMvUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.31 assign_mv — defensive fallback retained post-r174 (the §5.11.31 / §5.11.32 read_mv / read_mv_component cascade is now wired into the dispatcher; see MotionModeUnsupported for the live gap)"
+                "oxideav-av1: §5.11.31 assign_mv — defensive fallback retained post-r174 (the §5.11.31 / §5.11.32 read_mv / read_mv_component cascade is now wired into the dispatcher; the live gap moved past §5.11.27 read_motion_mode in r175 to the post-`read_motion_mode` cascade, surfaced via the §5.11.18 dispatcher's Ok-arm InterBlockModeInfoUnsupported)"
             ),
             Self::MotionModeUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.23 inter_block_mode_info reached §5.11.27 read_motion_mode — the §5.11.27 motion_mode / use_obmc S() reader is the next-arc target (post-find_warp_samples + is_scaled), with read_interintra_mode / read_compound_type / read_interpolation_filter following in §5.11.23 order"
+                "oxideav-av1: §5.11.27 read_motion_mode — defensive fallback retained post-r175 (the §5.11.27 reader is now wired into the dispatcher with §7.10.3 has_overlappable_candidates + §7.10.4 find_warp_samples; the post-`read_motion_mode` cascade — read_interintra_mode / read_compound_type / read_interpolation_filter — surfaces via the §5.11.18 dispatcher's Ok-arm InterBlockModeInfoUnsupported)"
             ),
             Self::TemporalMvScanUnsupported => write!(
                 f,

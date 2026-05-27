@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 174)
+## Status — 2026-05-28 (round 175)
 
 **Clean-room rebuild, round 23.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1401,6 +1401,90 @@ smoke (NEWMV cascade with default CDFs producing in-range Mv per
 §6.10.25); and an `assign_mv` defensive guard (rejecting
 `use_intrabc = true` in the inter arm). Test count: 661 → 672 (+11).
 `decode_av1` / `encode_av1` still return `Error::NotImplemented`.
+
+Round 175 lands the **§5.11.27 `read_motion_mode` reader** — with its
+§7.10.3 `has_overlappable_candidates` and §7.10.4 `find_warp_samples`
+helpers — wiring the per-block motion-mode decode into the §5.11.23
+inter cascade. The r174 `Error::MotionModeUnsupported` stub is lifted;
+the §5.11.18 dispatcher now reaches its `Ok(_)` arm and surfaces the
+next-arc gap (`read_interintra_mode` / `read_compound_type` /
+`read_interpolation_filter`) as `InterBlockModeInfoUnsupported`.
+
+The §5.11.27 body composes the five short-circuit arms in spec order
+(av1-spec p.79): `skip_mode == 1` ⇒ SIMPLE; `!is_motion_mode_switchable`
+⇒ SIMPLE; `Min(Block_Width, Block_Height) < 8` ⇒ SIMPLE;
+`!force_integer_mv && YMode ∈ {GLOBALMV, GLOBAL_GLOBALMV} &&
+GmType[RefFrame[0]] > TRANSLATION` ⇒ SIMPLE; `isCompound ||
+RefFrame[1] == INTRA_FRAME || !has_overlappable_candidates()` ⇒ SIMPLE.
+Otherwise the body invokes §7.10.4 `find_warp_samples()` then either
+the **`use_obmc` S()** arm (`force_integer_mv || NumSamples == 0 ||
+!allow_warped_motion || is_scaled(RefFrame[0])`) returning
+SIMPLE / OBMC, or the **`motion_mode` S()** arm returning
+SIMPLE / OBMC / WARPED_CAUSAL directly.
+
+The §7.10.3 `has_overlappable_candidates()` helper walks the 8x8-
+granular above + left ref-frame grid (`(x4 | 1)` / `(y4 | 1)` probes
+into `RefFrames[][][0]`) returning true on the first non-INTRA_FRAME
+slot. The §7.10.4 `find_warp_samples()` walk runs the spec's
+above-neighbour + left-neighbour + top-left + top-right `add_sample`
+invocations, threading the §7.10.4.2 in-tile / written-cell /
+matching-ref / single-list gates and the magnitude-validity check
+(`Clip3(16, 112, Max(Block_Width, Block_Height))`-bounded
+`|mvDiffRow| + |mvDiffCol|`). The §7.10.4.1 "first large MV kept if no
+small one matches" special case is honoured (`NumSamples = 1` when all
+scanned samples failed the magnitude bound). The §3
+`LEAST_SQUARES_SAMPLES_MAX = 8` cap on `NumSamplesScanned` short-
+circuits the walk per the §7.10.4.2 first-line guard. The `CandList`
+itself is not surfaced (the §7.11.4 `warp_estimation()` consumer is a
+downstream arc; the data is recoverable from the `Mvs[]` / `MiSizes[]`
+walker grids on demand).
+
+The default `Default_Use_Obmc_Cdf[BLOCK_SIZES][3]` table (§9.4) is
+transcribed verbatim, surfaced through the new
+`TileCdfContext::use_obmc` field + `use_obmc_cdf(mi_size)` selector.
+The §9.4 note (indices `0..=2` and `16..=17` of the first dimension
+unreachable) is honoured by the §5.11.27 prologue's `Min(BW, BH) >= 8`
+gate. Three new §6.10.26 named constants land: `MOTION_MODE_SIMPLE`,
+`MOTION_MODE_OBMC`, `MOTION_MODE_WARPED_CAUSAL`. Two new §3 constants
+land: `LEAST_SQUARES_SAMPLES_MAX = 8`, `REF_SCALE_SHIFT = 14`.
+
+Three new §5.11.27 frame-header scalars thread through
+`decode_inter_block_mode_info` (and the §5.11.18 dispatcher):
+`is_motion_mode_switchable` (§5.9.2 bit), `allow_warped_motion`
+(§5.9.2 bit), `is_scaled_per_ref: [bool; 7]` (caller-precomputed per-
+reference `is_scaled` lookup; `is_scaled_per_ref[refFrame - LAST_FRAME]`
+mirrors the §5.11.27 `is_scaled(RefFrame[0])` predicate without
+threading the frame-size / RefInfo arrays into the walker).
+
+`DecodedInterBlockModeInfo` gains two new fields: `motion_mode: u8`
+(carrying one of the three `MOTION_MODE_*` ordinals) and
+`num_warp_samples: u32` (the §7.10.4 `NumSamples` snapshot at the
+§5.11.27 site, in `0..=LEAST_SQUARES_SAMPLES_MAX = 0..=8`). Observable
+through the §5.11.23 dispatcher's `Ok(_)` arm — now reached on every
+conformant inter block — even though the §5.11.18 dispatcher still
+surfaces `InterBlockModeInfoUnsupported` for the pending
+post-`read_motion_mode` cascade.
+
+19 new unit tests cover: `DEFAULT_USE_OBMC_CDF` row-shape sanity
+(BLOCK_SIZES rows × 3 cumulative frequencies + counter); the
+`use_obmc_cdf(mi_size)` selector against the §9.4 source for every
+in-range index plus None for out-of-range; the §6.10.26 ordinal
+identities; `has_overlappable_candidates` returning false on a fresh
+walker and true after stamping an above (resp. left) inter
+neighbour; `find_warp_samples` returning 0 on a fresh walker, ≥1 on a
+same-ref + matching-MV above neighbour, and 0 on a mismatched-ref
+neighbour; the five §5.11.27 SIMPLE short-circuit arms (skip_mode,
+!is_motion_mode_switchable, small block, GLOBALMV + non-TRANSLATION
+gm_type, compound, no overlappable candidates) each verified to read
+zero S() bits; the `use_obmc` arm consuming the §8.3 `update_cdf` of
+the use_obmc row while leaving the motion_mode row untouched; the
+`motion_mode` arm consuming the `motion_mode` row while leaving
+use_obmc untouched; the `is_scaled = true` routing forcing the
+`use_obmc` arm; and an end-to-end §5.11.23 dispatcher exercise
+showing `skip_mode = 1` surfacing
+`Ok(DecodedInterBlockModeInfo { motion_mode: SIMPLE, .. })`. Test
+count: 672 → 691 (+19). `decode_av1` / `encode_av1` still return
+`Error::NotImplemented`.
 
 Round 173 lands the **§5.11.23 post-find_mv_stack reader cascade** —
 wiring `find_mv_stack` into the `decode_inter_block_mode_info`

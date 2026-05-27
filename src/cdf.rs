@@ -758,6 +758,48 @@ pub const INTERP_FILTER_CONTEXTS: usize = 16;
 /// adaptation counter).
 pub const MOTION_MODES: usize = 3;
 
+/// `SIMPLE` (§6.10.26 `motion_mode` semantics) — the §5.11.27
+/// `motion_mode` SIMPLE ordinal. The block uses plain translational
+/// motion compensation; no §7.11 OBMC blend and no §7.11 warp-affine
+/// projection. Reached either through the §5.11.27 short-circuit arms
+/// (skip-mode / `!is_motion_mode_switchable` / small block / GLOBALMV
+/// with a TRANSLATION gm_type / compound / inter-intra / no
+/// overlappable candidates) or through the post-`find_warp_samples`
+/// `motion_mode` S() returning `0`.
+pub const MOTION_MODE_SIMPLE: u8 = 0;
+
+/// `OBMC` (§6.10.26 `motion_mode` semantics) — the §5.11.27
+/// `motion_mode` OBMC ordinal. The block uses §7.11 overlapped block
+/// motion compensation: predictions from the spatially-neighbouring
+/// inter-block reference frames are blended with the block's own
+/// translational prediction. Reached either through the §5.11.27
+/// `use_obmc` S() returning `1` (the `force_integer_mv ||
+/// !allow_warped_motion || is_scaled` arm) or through the
+/// `motion_mode` S() returning `1`.
+pub const MOTION_MODE_OBMC: u8 = 1;
+
+/// `WARPED_CAUSAL` (§6.10.26 `motion_mode` semantics) — the §5.11.27
+/// `motion_mode` LOCALWARP ordinal. The block uses a per-block warp-
+/// affine model derived from the §7.10.4 `find_warp_samples` candidate
+/// list. Reached only through the post-`find_warp_samples` `motion_mode`
+/// S() returning `2`; the `use_obmc` arm of §5.11.27 cannot produce
+/// this value (its binary outcome is SIMPLE or OBMC).
+pub const MOTION_MODE_WARPED_CAUSAL: u8 = 2;
+
+/// `LEAST_SQUARES_SAMPLES_MAX` (§3 constant table) — upper bound on the
+/// number of candidate samples retained by the §7.10.4
+/// `find_warp_samples` process. The §7.10.4.2 `add_sample` body
+/// immediately exits once `NumSamplesScanned >=
+/// LEAST_SQUARES_SAMPLES_MAX`, so `CandList` is bounded at this size.
+pub const LEAST_SQUARES_SAMPLES_MAX: usize = 8;
+
+/// `REF_SCALE_SHIFT` (§3 constant table) — fixed-point shift used by
+/// the §5.11.27 `is_scaled` reference-frame scaling check.
+/// `xScale = ((RefUpscaledWidth[refIdx] << REF_SCALE_SHIFT) + (FrameWidth
+/// / 2)) / FrameWidth`; `noScale = 1 << REF_SCALE_SHIFT`. A reference
+/// frame is "scaled" iff `xScale != noScale || yScale != noScale`.
+pub const REF_SCALE_SHIFT: u32 = 14;
+
 /// `COMPOUND_TYPES` per §3 — number of values for `compound_type`
 /// (the §8.3.2 binary symbol selecting `COMPOUND_WEDGE` vs
 /// `COMPOUND_DIFFWTD`; see §6.10.24 semantics). Drives the row width
@@ -2346,6 +2388,40 @@ pub const DEFAULT_MOTION_MODE_CDF: [[u16; MOTION_MODES + 1]; BLOCK_SIZES] = [
     [26431, 30774, 32768, 0],
     [28973, 31594, 32768, 0],
     [29742, 31203, 32768, 0],
+];
+
+/// `Default_Use_Obmc_Cdf[ BLOCK_SIZES ][ 3 ]` (§9.4). Binary symbol
+/// `use_obmc` (§5.11.27 — selects between OBMC and SIMPLE on the
+/// post-`find_warp_samples` arm gated by `force_integer_mv ||
+/// NumSamples == 0 || !allow_warped_motion || is_scaled(RefFrame[0])`).
+/// Indexed by `MiSize` per the §8.3.2 selection (`TileUseObmcCdf[ MiSize
+/// ]`). Per the §9.4 note, first-dimension indices `0..=2` and `16..=17`
+/// are never reached by the §5.11.27 selection (those `MiSize` values
+/// fail the §5.11.27 `Min(Block_Width, Block_Height) >= 8` gate); the
+/// table is still transcribed full-width.
+pub const DEFAULT_USE_OBMC_CDF: [[u16; 3]; BLOCK_SIZES] = [
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [10437, 32768, 0],
+    [9371, 32768, 0],
+    [9301, 32768, 0],
+    [17432, 32768, 0],
+    [14423, 32768, 0],
+    [15142, 32768, 0],
+    [25817, 32768, 0],
+    [22823, 32768, 0],
+    [22083, 32768, 0],
+    [30128, 32768, 0],
+    [31014, 32768, 0],
+    [31560, 32768, 0],
+    [32638, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [23664, 32768, 0],
+    [20901, 32768, 0],
+    [24008, 32768, 0],
+    [26879, 32768, 0],
 ];
 
 // ---------------------------------------------------------------------
@@ -7162,6 +7238,11 @@ pub struct TileCdfContext {
     /// `TileMotionModeCdf[ BLOCK_SIZES ]` (§8.3.1). Codes `motion_mode`
     /// (§5.11.x `read_motion_mode`), selected by `MiSize`.
     pub motion_mode: [[u16; MOTION_MODES + 1]; BLOCK_SIZES],
+    /// `TileUseObmcCdf[ BLOCK_SIZES ]` (§8.3.1). Codes the binary
+    /// `use_obmc` (§5.11.27 — the `force_integer_mv || NumSamples == 0
+    /// || !allow_warped_motion || is_scaled(RefFrame[0])` arm), selected
+    /// by `MiSize`.
+    pub use_obmc: [[u16; 3]; BLOCK_SIZES],
 
     // -----------------------------------------------------------------
     // Round 24 — compound-prediction group. §8.3.1 enumerates these as
@@ -7418,6 +7499,7 @@ impl TileCdfContext {
 
             // Round 23 — motion-mode group.
             motion_mode: DEFAULT_MOTION_MODE_CDF,
+            use_obmc: DEFAULT_USE_OBMC_CDF,
 
             // Round 24 — compound-prediction group.
             comp_group_idx: DEFAULT_COMP_GROUP_IDX_CDF,
@@ -7980,6 +8062,24 @@ impl TileCdfContext {
     pub fn motion_mode_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
         if mi_size < BLOCK_SIZES {
             Some(&mut self.motion_mode[mi_size])
+        } else {
+            None
+        }
+    }
+
+    /// §8.3.2 `use_obmc`: the cdf is `TileUseObmcCdf[ MiSize ]`, a
+    /// straight `0..BLOCK_SIZES` index — no neighbour-context
+    /// arithmetic. Returns `None` if `mi_size >= BLOCK_SIZES` (a caller
+    /// bug — the §3 enumeration bounds `MiSize`).
+    ///
+    /// Per the §9.4 note on `Default_Use_Obmc_Cdf`, `MiSize` indices
+    /// `0..=2` and `16..=17` are never reached by the §5.11.27
+    /// selection (the §5.11.27 gate `Min(Block_Width, Block_Height) >=
+    /// 8` excludes those block sizes), but the selector still returns
+    /// the in-table row so the behaviour is purely indexical.
+    pub fn use_obmc_cdf(&mut self, mi_size: usize) -> Option<&mut [u16]> {
+        if mi_size < BLOCK_SIZES {
+            Some(&mut self.use_obmc[mi_size])
         } else {
             None
         }
@@ -14935,6 +15035,11 @@ impl PartitionWalker {
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
         use_ref_frame_mvs: bool,
+        // r175: §5.11.27 caller-supplied frame-header scalars (see
+        // [`Self::decode_inter_block_mode_info`]).
+        is_motion_mode_switchable: bool,
+        allow_warped_motion: bool,
+        is_scaled_per_ref: [bool; 7],
     ) -> Result<DecodedInterFrameModeInfo, crate::Error> {
         if sub_size >= BLOCK_SIZES {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -15218,20 +15323,18 @@ impl PartitionWalker {
         };
         let _ = info;
         if is_inter != 0 {
-            // r174: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
+            // r175: §5.11.23 prologue + §5.11.25 `read_ref_frames` +
             // §7.10 `find_mv_stack` (spatial-only path) + the §5.11.23
             // YMode dispatch + per-mode RefMvIdx / drl_mode loops + the
-            // §5.11.31 `assign_mv` body (calls §5.11.31 `read_mv` and
-            // §5.11.32 `read_mv_component`) all run to completion; the
-            // §5.11.27 `read_motion_mode` call is the post-cascade gap
-            // surfaced as [`crate::Error::MotionModeUnsupported`].
-            //
-            // The inner method always returns `Err` on r174; once
-            // `read_motion_mode` + downstream readers land the
-            // dispatcher will need to lift the
-            // `DecodedInterBlockModeInfo` aggregate (including the new
-            // `mv` field) into the returned
-            // [`DecodedInterFrameModeInfo`].
+            // §5.11.31 `assign_mv` body + the §5.11.27 `read_motion_mode`
+            // body (with §7.10.3 `has_overlappable_candidates` and
+            // §7.10.4 `find_warp_samples`) all run to completion. The
+            // post-`read_motion_mode` cascade (`read_interintra_mode` /
+            // `read_compound_type` / `read_interpolation_filter`) is
+            // the next-arc target — for now the §5.11.18 dispatcher
+            // surfaces an `InterBlockModeInfoUnsupported` Err on the
+            // `Ok(_)` arm so the inner per-block aggregate observable
+            // via tests is not dropped silently.
             match self.decode_inter_block_mode_info(
                 decoder,
                 cdfs,
@@ -15259,11 +15362,16 @@ impl PartitionWalker {
                 allow_high_precision_mv,
                 force_integer_mv,
                 use_ref_frame_mvs,
+                is_motion_mode_switchable,
+                allow_warped_motion,
+                is_scaled_per_ref,
             ) {
                 Ok(_inter_info) => {
-                    // Unreachable on r173 scope (inner method always
-                    // returns Err). Once §5.11.31 / §5.11.32 land,
-                    // expand [`DecodedInterFrameModeInfo`] to carry the
+                    // The §5.11.23 post-`read_motion_mode` cascade
+                    // (`read_interintra_mode` / `read_compound_type` /
+                    // `read_interpolation_filter`) is the next-arc
+                    // target; once it lands, expand
+                    // [`DecodedInterFrameModeInfo`] to carry the
                     // inter-arm aggregate and route the Ok values
                     // here.
                     Err(crate::Error::InterBlockModeInfoUnsupported)
@@ -16055,6 +16163,26 @@ impl PartitionWalker {
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
         use_ref_frame_mvs: bool,
+        // r175 §5.11.27 caller-supplied frame-header scalars.
+        //
+        // * `is_motion_mode_switchable` — §5.9.2 frame-header bit. When
+        //   `false` the §5.11.27 body short-circuits to
+        //   `motion_mode = SIMPLE` with no S() read.
+        // * `allow_warped_motion` — §5.9.2 frame-header bit. When
+        //   `false` the §5.11.27 post-`find_warp_samples` arm forces
+        //   the `use_obmc` S() reader (instead of `motion_mode` S()).
+        // * `is_scaled_per_ref` — frame-header derived: for each
+        //   `refFrame in LAST_FRAME..=ALTREF_FRAME` (1..=7), whether
+        //   the §5.11.27 `is_scaled(refFrame)` predicate (av1-spec
+        //   p.79) is true. The caller computes this from
+        //   `RefUpscaledWidth[ref_frame_idx[refFrame - LAST_FRAME]]` /
+        //   `RefFrameHeight[..]` / `FrameWidth` / `FrameHeight` once
+        //   per frame; passing `[false; 7]` matches a no-scaling-
+        //   reference-pool case and is the conformant default for
+        //   single-tile / single-resolution streams.
+        is_motion_mode_switchable: bool,
+        allow_warped_motion: bool,
+        is_scaled_per_ref: [bool; 7],
     ) -> Result<DecodedInterBlockModeInfo, crate::Error> {
         // §5.11.23 caller-bug guards. Each inner method re-checks its
         // own bounds, but failing fast at the dispatcher keeps the
@@ -16312,12 +16440,35 @@ impl PartitionWalker {
             }
         }
 
-        // r174 short-circuit: the §5.11.23 post-`assign_mv` cascade
-        // (`read_motion_mode` / `read_interintra_mode` /
-        // `read_compound_type` / `read_interpolation_filter`) is the
-        // next-arc target. Surface the decoded state through the
-        // aggregate before the new gap fires.
-        let _info = DecodedInterBlockModeInfo {
+        // §5.11.23 line 34: `read_motion_mode( isCompound )` per §5.11.27
+        // (av1-spec p.79). r175 wires the §5.11.27 body and its
+        // §7.10.3 `has_overlappable_candidates` + §7.10.4
+        // `find_warp_samples` helpers; the post-`read_motion_mode`
+        // cascade (`read_interintra_mode` / `read_compound_type` /
+        // `read_interpolation_filter`) is the next-arc target and is
+        // currently surfaced as
+        // [`crate::Error::InterBlockModeInfoUnsupported`] from the
+        // §5.11.18 dispatcher's `Ok(_)` arm.
+        let num_samples = self.find_warp_samples(mi_row, mi_col, sub_size, ref_frame[0], mv);
+        let motion_mode = self.read_motion_mode(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            skip_mode,
+            is_compound,
+            ref_frame,
+            y_mode,
+            num_samples,
+            is_motion_mode_switchable,
+            allow_warped_motion,
+            force_integer_mv,
+            gm_type,
+            is_scaled_per_ref,
+        )?;
+
+        Ok(DecodedInterBlockModeInfo {
             mi_row,
             mi_col,
             mi_size: sub_size,
@@ -16330,8 +16481,463 @@ impl PartitionWalker {
             ref_mv_context: mv_stack.ref_mv_context,
             zero_mv_context: mv_stack.zero_mv_context,
             mv,
+            motion_mode,
+            num_warp_samples: num_samples,
+        })
+    }
+
+    /// `has_overlappable_candidates( )` per §7.10.3 (av1-spec p.236).
+    /// Returns `true` ⇔ the block has at least one inter-block
+    /// neighbour above or to the left at 8x8 granularity (the §7.10.3
+    /// "check is only made at 8x8 granularity" line). Both walks step
+    /// in 2-cell increments and probe the cell with the low bit forced
+    /// to `1` (`x4 | 1` / `y4 | 1`), giving the 8x8-anchor's bottom
+    /// (resp. right) edge.
+    ///
+    /// The §7.10.3 spec body is:
+    ///
+    /// ```text
+    ///   if ( AvailU ) {
+    ///     w4 = Num_4x4_Blocks_Wide[ MiSize ]
+    ///     for ( x4 = MiCol; x4 < Min( MiCols, MiCol + w4 ); x4 += 2 )
+    ///       if ( RefFrames[ MiRow - 1 ][ x4 | 1 ][ 0 ] > INTRA_FRAME )
+    ///         return 1
+    ///   }
+    ///   if ( AvailL ) {
+    ///     h4 = Num_4x4_Blocks_High[ MiSize ]
+    ///     for ( y4 = MiRow; y4 < Min( MiRows, MiRow + h4 ); y4 += 2 )
+    ///       if ( RefFrames[ y4 | 1 ][ MiCol - 1 ][ 0 ] > INTRA_FRAME )
+    ///         return 1
+    ///   }
+    ///   return 0
+    /// ```
+    ///
+    /// `AvailU` / `AvailL` derive from [`TileGeometry::is_inside`]
+    /// just as in the §5.11.18 prologue. `INTRA_FRAME = 0`, so the
+    /// `> INTRA_FRAME` test is "slot 0 of `RefFrames` is a non-intra
+    /// inter reference" — i.e. the neighbour was decoded as an inter
+    /// block and stamped its ref-frame into the grid.
+    pub fn has_overlappable_candidates(&self, mi_row: u32, mi_col: u32, sub_size: usize) -> bool {
+        debug_assert!(sub_size < BLOCK_SIZES);
+        let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+        let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+        if avail_u {
+            let w4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+            let lim = core::cmp::min(self.mi_cols, mi_col + w4);
+            let mut x4 = mi_col;
+            while x4 < lim {
+                let probe = (x4 | 1) as i32;
+                let r = self.ref_frame_at(mi_row as i32 - 1, probe, 0);
+                if r > 0 {
+                    return true;
+                }
+                x4 += 2;
+            }
+        }
+        if avail_l {
+            let h4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+            let lim = core::cmp::min(self.mi_rows, mi_row + h4);
+            let mut y4 = mi_row;
+            while y4 < lim {
+                let probe = (y4 | 1) as i32;
+                let r = self.ref_frame_at(probe, mi_col as i32 - 1, 0);
+                if r > 0 {
+                    return true;
+                }
+                y4 += 2;
+            }
+        }
+        false
+    }
+
+    /// `find_warp_samples( )` per §7.10.4 (av1-spec p.237). Returns
+    /// `NumSamples` (the §7.10.4 "number of valid candidates found").
+    /// Each candidate is one §7.10.4.2 `add_sample` invocation that
+    /// passed the inter-neighbour / matching-ref-frame / single-list /
+    /// in-tile gates AND the §7.10.4.2 magnitude check
+    /// (`(|mvDiffRow| + |mvDiffCol|) <= threshold` with `threshold =
+    /// Clip3(16, 112, Max(Block_Width, Block_Height))`). The
+    /// "first large MV is kept if no small one matches" special case
+    /// of §7.10.4.1 is honoured: on the all-large path the function
+    /// returns `1` instead of `0`.
+    ///
+    /// `mv` is the per-list `Mv[ 0..2 ][ 0..2 ]` for the current block,
+    /// freshly returned by §5.11.31 `assign_mv`. Only `mv[0]` is read:
+    /// the §7.10.4.2 spec compares `Mvs[..][0][0..2]` (the §7.10
+    /// neighbour list 0 MV) against `Mv[0]` (the current block's list
+    /// 0 MV).
+    ///
+    /// `CandList` itself is not surfaced — the §7.10.4 caller (§5.11.27
+    /// `read_motion_mode`) only consults `NumSamples` (zero ⇒ no
+    /// warp), and the WARPED_CAUSAL sample-list consumer is the
+    /// §7.11.4 `warp_estimation()` driver that lives in a downstream
+    /// arc. The candidate-list aggregation is the §7.11.4 / §7.11.6
+    /// driver's responsibility, and the data needed to repopulate it
+    /// from this function's inputs is available in
+    /// `Mvs[..][..][0][0..2]` / `MiSizes[..][..]` on the walker grid.
+    pub fn find_warp_samples(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        ref_frame_0: i32,
+        mv: [[i32; 2]; 2],
+    ) -> u32 {
+        debug_assert!(sub_size < BLOCK_SIZES);
+        debug_assert!((0..=7).contains(&ref_frame_0));
+
+        let w4 = NUM_4X4_BLOCKS_WIDE[sub_size] as i32;
+        let h4 = NUM_4X4_BLOCKS_HIGH[sub_size] as i32;
+
+        // §7.10.4 state.
+        let mut num_samples: u32 = 0;
+        let mut num_samples_scanned: u32 = 0;
+        let mut do_top_left = true;
+        let mut do_top_right = true;
+
+        let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+        let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+
+        // §7.10.4.1: above-neighbour walk.
+        if avail_u {
+            let src_size = self.mi_size_at(mi_row as i32 - 1, mi_col as i32);
+            let src_w = if src_size < BLOCK_SIZES {
+                NUM_4X4_BLOCKS_WIDE[src_size] as i32
+            } else {
+                // §5.11.4 unwritten cell — treat as a single 4x4
+                // (smallest §7.10.4 walk step). The §5.11.4 walker
+                // does not pre-decode neighbours outside the current
+                // partition tree, so the unwritten case is reached on
+                // top-row blocks where AvailU is also false — the
+                // outer `avail_u` gate would have prevented entry,
+                // but stay defensive.
+                1
+            };
+            if w4 <= src_w {
+                let col_offset = -((mi_col as i32) & (src_w - 1));
+                if col_offset < 0 {
+                    do_top_left = false;
+                }
+                if col_offset + src_w > w4 {
+                    do_top_right = false;
+                }
+                self.add_sample(
+                    mi_row,
+                    mi_col,
+                    sub_size,
+                    ref_frame_0,
+                    mv,
+                    -1,
+                    0,
+                    &mut num_samples,
+                    &mut num_samples_scanned,
+                );
+            } else {
+                let lim = core::cmp::min(w4, (self.mi_cols as i32) - (mi_col as i32));
+                let mut i: i32 = 0;
+                while i < lim {
+                    let src_size = self.mi_size_at(mi_row as i32 - 1, mi_col as i32 + i);
+                    let src_w = if src_size < BLOCK_SIZES {
+                        NUM_4X4_BLOCKS_WIDE[src_size] as i32
+                    } else {
+                        1
+                    };
+                    let mi_step = core::cmp::min(w4, src_w);
+                    self.add_sample(
+                        mi_row,
+                        mi_col,
+                        sub_size,
+                        ref_frame_0,
+                        mv,
+                        -1,
+                        i,
+                        &mut num_samples,
+                        &mut num_samples_scanned,
+                    );
+                    if mi_step <= 0 {
+                        break;
+                    }
+                    i += mi_step;
+                }
+            }
+        }
+
+        // §7.10.4.1: left-neighbour walk.
+        if avail_l {
+            let src_size = self.mi_size_at(mi_row as i32, mi_col as i32 - 1);
+            let src_h = if src_size < BLOCK_SIZES {
+                NUM_4X4_BLOCKS_HIGH[src_size] as i32
+            } else {
+                1
+            };
+            if h4 <= src_h {
+                let row_offset = -((mi_row as i32) & (src_h - 1));
+                if row_offset < 0 {
+                    do_top_left = false;
+                }
+                self.add_sample(
+                    mi_row,
+                    mi_col,
+                    sub_size,
+                    ref_frame_0,
+                    mv,
+                    0,
+                    -1,
+                    &mut num_samples,
+                    &mut num_samples_scanned,
+                );
+            } else {
+                let lim = core::cmp::min(h4, (self.mi_rows as i32) - (mi_row as i32));
+                let mut i: i32 = 0;
+                while i < lim {
+                    let src_size = self.mi_size_at(mi_row as i32 + i, mi_col as i32 - 1);
+                    let src_h = if src_size < BLOCK_SIZES {
+                        NUM_4X4_BLOCKS_HIGH[src_size] as i32
+                    } else {
+                        1
+                    };
+                    let mi_step = core::cmp::min(h4, src_h);
+                    self.add_sample(
+                        mi_row,
+                        mi_col,
+                        sub_size,
+                        ref_frame_0,
+                        mv,
+                        i,
+                        -1,
+                        &mut num_samples,
+                        &mut num_samples_scanned,
+                    );
+                    if mi_step <= 0 {
+                        break;
+                    }
+                    i += mi_step;
+                }
+            }
+        }
+
+        // §7.10.4.1: top-left + top-right corner samples.
+        if do_top_left {
+            self.add_sample(
+                mi_row,
+                mi_col,
+                sub_size,
+                ref_frame_0,
+                mv,
+                -1,
+                -1,
+                &mut num_samples,
+                &mut num_samples_scanned,
+            );
+        }
+        if do_top_right && core::cmp::max(w4, h4) <= 16 {
+            self.add_sample(
+                mi_row,
+                mi_col,
+                sub_size,
+                ref_frame_0,
+                mv,
+                -1,
+                w4,
+                &mut num_samples,
+                &mut num_samples_scanned,
+            );
+        }
+
+        // §7.10.4.1: "first large MV is kept if no small one matches".
+        if num_samples == 0 && num_samples_scanned > 0 {
+            num_samples = 1;
+        }
+
+        num_samples
+    }
+
+    /// `add_sample( deltaRow, deltaCol )` per §7.10.4.2 (av1-spec
+    /// p.238). Increments `NumSamplesScanned`, applies the
+    /// §7.10.4.2 gates, and increments `NumSamples` iff `valid == 1`.
+    /// Exits immediately if `NumSamplesScanned >=
+    /// LEAST_SQUARES_SAMPLES_MAX` per the §7.10.4.2 first-line guard.
+    ///
+    /// The function does NOT populate the `CandList` — see
+    /// [`Self::find_warp_samples`] for the rationale (the consumer
+    /// lives in a downstream arc and the data is recoverable from the
+    /// walker grids).
+    #[allow(clippy::too_many_arguments)]
+    fn add_sample(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        ref_frame_0: i32,
+        mv: [[i32; 2]; 2],
+        delta_row: i32,
+        delta_col: i32,
+        num_samples: &mut u32,
+        num_samples_scanned: &mut u32,
+    ) {
+        if (*num_samples_scanned as usize) >= LEAST_SQUARES_SAMPLES_MAX {
+            return;
+        }
+        let mv_row = mi_row as i32 + delta_row;
+        let mv_col = mi_col as i32 + delta_col;
+        if !self.geometry.is_inside(mv_row, mv_col) {
+            return;
+        }
+        // RefFrames[mvRow][mvCol][0] "not written" check: the walker
+        // pre-fill leaves both slots at [INTRA_FRAME = 0, NONE = -1]
+        // for unwritten cells, so the §7.10.4.2 "not written" line
+        // collapses to a `IsInters[mvRow][mvCol] == 0 || RefFrames[..]
+        // [0] == INTRA_FRAME` test (an intra block in the grid is
+        // never a valid warp neighbour either way).
+        let cell = (mv_row as u32 * self.mi_cols + mv_col as u32) as usize;
+        if self.is_inters[cell] == 0 {
+            return;
+        }
+        let nb_ref_0 = self.ref_frames[cell * 2];
+        let nb_ref_1 = self.ref_frames[cell * 2 + 1];
+        if (nb_ref_0 as i32) != ref_frame_0 {
+            return;
+        }
+        if nb_ref_1 != -1 {
+            return;
+        }
+
+        let cand_sz = self.mi_size_at(mv_row, mv_col);
+        if cand_sz >= BLOCK_SIZES {
+            return;
+        }
+        let cand_w4 = NUM_4X4_BLOCKS_WIDE[cand_sz] as i32;
+        let cand_h4 = NUM_4X4_BLOCKS_HIGH[cand_sz] as i32;
+        let cand_row = mv_row & !(cand_h4 - 1);
+        let cand_col = mv_col & !(cand_w4 - 1);
+
+        // Magnitude validity check.
+        let bw = block_width(sub_size) as i32;
+        let bh = block_height(sub_size) as i32;
+        let threshold = core::cmp::max(bw, bh).clamp(16, 112);
+        let nb_cell = (cand_row as u32 * self.mi_cols + cand_col as u32) as usize;
+        let nb_mv_row = self.mvs[(nb_cell * 2) * 2] as i32;
+        let nb_mv_col = self.mvs[(nb_cell * 2) * 2 + 1] as i32;
+        let mv_diff_row = (nb_mv_row - mv[0][0]).unsigned_abs() as i64;
+        let mv_diff_col = (nb_mv_col - mv[0][1]).unsigned_abs() as i64;
+        let valid = mv_diff_row + mv_diff_col <= threshold as i64;
+
+        *num_samples_scanned += 1;
+        if !valid && *num_samples_scanned > 1 {
+            return;
+        }
+        // §7.10.4.2 step 3: CandList[NumSamples][j] = cand[j] — the
+        // `CandList` slot index is `NumSamples`; the function caps
+        // there. We elide the cand[] population per the
+        // documented-deferral above.
+        if valid {
+            *num_samples += 1;
+        }
+    }
+
+    /// `read_motion_mode( isCompound )` per §5.11.27 (av1-spec p.79).
+    /// Returns the §6.10.26 `motion_mode` ordinal (`SIMPLE = 0` /
+    /// `OBMC = 1` / `WARPED_CAUSAL = 2`).
+    ///
+    /// The spec body short-circuits to `SIMPLE` on:
+    ///   * `skip_mode == 1`,
+    ///   * `!is_motion_mode_switchable`,
+    ///   * `Min(Block_Width, Block_Height) < 8`,
+    ///   * `!force_integer_mv && (YMode in {GLOBALMV, GLOBAL_GLOBALMV})
+    ///     && GmType[RefFrame[0]] > TRANSLATION`,
+    ///   * `isCompound || RefFrame[1] == INTRA_FRAME ||
+    ///     !has_overlappable_candidates()`.
+    ///
+    /// Otherwise invokes §7.10.4 `find_warp_samples()` (the caller's
+    /// `num_samples` argument) and chooses between two arms:
+    ///   * `force_integer_mv || NumSamples == 0 || !allow_warped_motion
+    ///     || is_scaled(RefFrame[0])` ⇒ `use_obmc` S(); result is
+    ///     `OBMC` (when `use_obmc == 1`) or `SIMPLE`.
+    ///   * Otherwise ⇒ `motion_mode` S(); result is one of `SIMPLE` /
+    ///     `OBMC` / `WARPED_CAUSAL` directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_motion_mode(
+        &self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        skip_mode: u8,
+        is_compound: bool,
+        ref_frame: [i32; 2],
+        y_mode: u8,
+        num_samples: u32,
+        is_motion_mode_switchable: bool,
+        allow_warped_motion: bool,
+        force_integer_mv: bool,
+        gm_type: [i32; 8],
+        is_scaled_per_ref: [bool; 7],
+    ) -> Result<u8, crate::Error> {
+        // §5.11.27 short-circuit arms.
+        if skip_mode != 0 {
+            return Ok(MOTION_MODE_SIMPLE);
+        }
+        if !is_motion_mode_switchable {
+            return Ok(MOTION_MODE_SIMPLE);
+        }
+        if core::cmp::min(block_width(sub_size), block_height(sub_size)) < 8 {
+            return Ok(MOTION_MODE_SIMPLE);
+        }
+        if !force_integer_mv && (y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV) {
+            let ref0 = ref_frame[0];
+            if (0..8).contains(&ref0) && gm_type[ref0 as usize] > GM_TYPE_TRANSLATION {
+                return Ok(MOTION_MODE_SIMPLE);
+            }
+        }
+        // `RefFrame[1] == INTRA_FRAME` — INTRA_FRAME = 0; the §5.11.25
+        // reader does not currently produce slot-1-INTRA, but the test
+        // is included for spec literalness.
+        if is_compound
+            || ref_frame[1] == 0
+            || !self.has_overlappable_candidates(mi_row, mi_col, sub_size)
+        {
+            return Ok(MOTION_MODE_SIMPLE);
+        }
+
+        // §5.11.27 post-`find_warp_samples` arm dispatch.
+        //
+        // `is_scaled(RefFrame[0])` per §5.11.27: only valid when
+        // `RefFrame[0]` is in `LAST_FRAME..=ALTREF_FRAME = 1..=7`. The
+        // SIMPLE-shortcircuit above already filters compound + slot-1-
+        // INTRA; with single-pred + slot-0 != INTRA_FRAME the spec's
+        // `RefFrame[0] - LAST_FRAME` index is in `0..=6`.
+        let ref0 = ref_frame[0];
+        let scaled = if (1..=7).contains(&ref0) {
+            is_scaled_per_ref[(ref0 - 1) as usize]
+        } else {
+            false
         };
-        Err(crate::Error::MotionModeUnsupported)
+
+        if force_integer_mv || num_samples == 0 || !allow_warped_motion || scaled {
+            // Arm A: `use_obmc` S() against `TileUseObmcCdf[ MiSize ]`.
+            let row = cdfs
+                .use_obmc_cdf(sub_size)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let use_obmc = decoder.read_symbol(row)? as u8;
+            debug_assert!(use_obmc <= 1, "S() over TileUseObmcCdf yields 0 or 1");
+            Ok(if use_obmc == 1 {
+                MOTION_MODE_OBMC
+            } else {
+                MOTION_MODE_SIMPLE
+            })
+        } else {
+            // Arm B: `motion_mode` S() against `TileMotionModeCdf[ MiSize ]`.
+            let row = cdfs
+                .motion_mode_cdf(sub_size)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let mm = decoder.read_symbol(row)? as u8;
+            debug_assert!(
+                (mm as usize) < MOTION_MODES,
+                "S() over TileMotionModeCdf yields 0..MOTION_MODES"
+            );
+            Ok(mm)
+        }
     }
 
     /// `assign_mv( isCompound )` per §5.11.31 (av1-spec p.78). Iterates
@@ -20420,12 +21026,15 @@ pub struct DecodedIntraBlockModeInfo {
 /// §5.11.23 per-block aggregate surfaced by
 /// [`PartitionWalker::decode_inter_block_mode_info`]. Carries the
 /// §5.11.23 prologue + §7.10.2 stack-summary + YMode + RefMvIdx + the
-/// §5.11.31 `assign_mv` outcome; observable only on the `Ok` path,
-/// which currently short-circuits at
-/// [`crate::Error::MotionModeUnsupported`] (§5.11.27 `read_motion_mode`
-/// is the next-arc target). r174 lifted the §5.11.31 / §5.11.32
-/// `assign_mv` + `read_mv_component` cascade so the per-list `Mv[..]`
-/// is now decoded and surfaced through the new `mv` field below.
+/// §5.11.31 `assign_mv` outcome + the §5.11.27 `read_motion_mode`
+/// outcome. r175 lifted the §5.11.27 reader (with its §7.10.3
+/// `has_overlappable_candidates` and §7.10.4 `find_warp_samples`
+/// helpers), so the new `motion_mode` + `num_warp_samples` fields
+/// below are populated on the `Ok` path. The post-`read_motion_mode`
+/// cascade (`read_interintra_mode` / `read_compound_type` /
+/// `read_interpolation_filter`) is the next-arc target; the §5.11.18
+/// dispatcher currently surfaces an `InterBlockModeInfoUnsupported`
+/// Err on its `Ok(_)` arm until that cascade lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedInterBlockModeInfo {
     /// §5.11.23 caller-passed mi-unit row of the block.
@@ -20499,6 +21108,23 @@ pub struct DecodedInterBlockModeInfo {
     ///   `diffMv` is the §5.11.31 `read_mv()` output (§5.11.32
     ///   `read_mv_component` reads per axis gated on `mv_joint`).
     pub mv: [[i32; 2]; 2],
+    /// §5.11.27 `motion_mode` outcome. One of
+    /// [`MOTION_MODE_SIMPLE`] / [`MOTION_MODE_OBMC`] /
+    /// [`MOTION_MODE_WARPED_CAUSAL`]. On the §5.11.27 short-circuit
+    /// arms (skip_mode / `!is_motion_mode_switchable` / small block /
+    /// GLOBALMV+non-TRANSLATION gm_type / compound / inter-intra / no
+    /// overlappable candidates) the value is `SIMPLE` and no S() is
+    /// read. On the `use_obmc` arm the value is `SIMPLE` or `OBMC`. On
+    /// the `motion_mode` arm the value is any of the three.
+    pub motion_mode: u8,
+    /// §7.10.4 `NumSamples` snapshot returned by
+    /// [`PartitionWalker::find_warp_samples`] at the §5.11.27 cascade
+    /// site. Always `0` on the short-circuit arms (the call is skipped
+    /// when the §5.11.27 prologue gates fire). In `0..=8` (the
+    /// §3 `LEAST_SQUARES_SAMPLES_MAX` cap). The §5.11.27 `use_obmc` arm
+    /// fires when this is `0`; the `motion_mode` arm consumes it via
+    /// the §7.11 warp-affine projection (downstream arc).
+    pub num_warp_samples: u32,
 }
 
 #[cfg(test)]
@@ -34263,6 +34889,9 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_row.
@@ -34293,6 +34922,9 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_col.
@@ -34323,6 +34955,9 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range seg_ref_frame_data.
@@ -34353,6 +34988,9 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range skip_mode_frame[0].
@@ -34383,6 +35021,9 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         assert_eq!(
@@ -34436,8 +35077,11 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
             dec.position(),
             pos_before,
@@ -34510,8 +35154,11 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
         // the §5.11.23 Arm 4 single-pred cascade then reads at least the
         // `new_mv` symbol.
@@ -34566,8 +35213,11 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec.position(), pos_before);
         // RefFrames[0][0] = [LAST_FRAME = 1, NONE = -1].
         assert_eq!(walker.ref_frames()[0], 1);
@@ -34605,8 +35255,11 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec2.position(), pos_before);
         assert_eq!(walker2.ref_frames()[0], 1);
         assert_eq!(walker2.ref_frames()[1], -1);
@@ -34658,8 +35311,11 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // The single-ref cascade reads at least the single_ref_p1
         // symbol, which is a conformant binary S() against the §9.4
         // default CDF — at minimum one bit gets consumed (the §8.2.6
@@ -34724,8 +35380,11 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         let r0 = walker.ref_frames()[0];
         let r1 = walker.ref_frames()[1];
         // Either single-pred (r0 in 1..=7, r1 = NONE = -1) or compound
@@ -34785,8 +35444,11 @@ mod tests {
             /* allow_high_precision_mv = */ false,
             /* force_integer_mv = */ false,
             /* use_ref_frame_mvs = */ false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
         assert_eq!(
             walker.ref_frames()[1],
@@ -34819,12 +35481,16 @@ mod tests {
             ref_mv_context: 0,
             zero_mv_context: 0,
             mv: [[0, 0], [0, 0]],
+            motion_mode: MOTION_MODE_SIMPLE,
+            num_warp_samples: 0,
         };
         assert_eq!(info.ref_frame[0], 1);
         assert_eq!(info.ref_frame[1], 7);
         assert!(info.is_compound);
         assert_eq!(info.y_mode, MODE_NEAREST_NEARESTMV);
         assert_eq!(info.mv, [[0, 0], [0, 0]]);
+        assert_eq!(info.motion_mode, MOTION_MODE_SIMPLE);
+        assert_eq!(info.num_warp_samples, 0);
         // Single-pred case.
         let info_single = DecodedInterBlockModeInfo {
             mi_row: 0,
@@ -34839,6 +35505,8 @@ mod tests {
             ref_mv_context: 0,
             zero_mv_context: 0,
             mv: [[12, -8], [0, 0]],
+            motion_mode: MOTION_MODE_SIMPLE,
+            num_warp_samples: 0,
         };
         assert!(!info_single.is_compound);
         assert_eq!(info_single.y_mode, MODE_NEARESTMV);
@@ -34924,8 +35592,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
             dec.position(),
             pos_before,
@@ -34978,8 +35649,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
             dec.position(),
             pos_before,
@@ -35051,8 +35725,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
             dec.position() > pos_before,
             "Arm 3 ⇒ compound_mode S() must consume bits"
@@ -35120,8 +35797,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
             dec.position() > pos_before,
             "Arm 4 ⇒ new_mv + single_ref cascade must consume bits"
@@ -35186,8 +35866,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(dec.position() > pos_before);
     }
 
@@ -35248,8 +35931,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
     }
 
     /// §5.11.23 drl_mode short-circuit: `NumMvFound = 0` on a fresh
@@ -35312,8 +35998,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // drl_mode CDFs must NOT have adapted (no read fired).
         for row in &cdfs.drl_mode {
             assert_eq!(
@@ -35388,6 +36077,9 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
     }
@@ -35435,6 +36127,9 @@ mod tests {
             false,
             false,
             /* use_ref_frame_mvs = */ true,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
         assert_eq!(r, Err(crate::Error::TemporalMvScanUnsupported));
     }
@@ -35557,8 +36252,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
             dec.position(),
             pos_before,
@@ -35624,8 +36322,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
             dec.position(),
             pos_before,
@@ -35708,8 +36409,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Mvs grid: identity-GM PredMv = [0, 0], MV_JOINT_ZERO diff =
         // [0, 0], so final Mv[0] = [0, 0].
         assert_eq!(walker.mvs()[0], 0);
@@ -35791,8 +36495,11 @@ mod tests {
             false,
             false,
             false,
+            /* is_motion_mode_switchable = */ false,
+            /* allow_warped_motion = */ false,
+            /* is_scaled_per_ref = */ [false; 7],
         );
-        assert_eq!(r, Err(crate::Error::MotionModeUnsupported));
+        assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §6.10.25 `is_mv_valid`: |Mv[i][c]| < (1 << 14) = 16384.
         for list in 0..2 {
             for comp in 0..2 {
@@ -36825,5 +37532,630 @@ mod tests {
         // Only slot 0 has a candidate; DrlCtxStack[0] = 0 since there's
         // no idx + 1.
         assert_eq!(res.drl_ctx_stack[0], 0);
+    }
+
+    // ===================================================================
+    // §5.11.27 read_motion_mode + §7.10.3 has_overlappable_candidates +
+    // §7.10.4 find_warp_samples tests (round 175)
+    // ===================================================================
+
+    /// §5.11.27 default-table sanity: the row width is `MOTION_MODES +
+    /// 1 = 4` for `motion_mode` and `3` for the binary `use_obmc`.
+    #[test]
+    fn use_obmc_default_table_shape() {
+        assert_eq!(DEFAULT_USE_OBMC_CDF.len(), BLOCK_SIZES);
+        for row in DEFAULT_USE_OBMC_CDF.iter() {
+            assert_eq!(row.len(), 3);
+            // Last slot is the §8.3 adaptation counter (starts at 0).
+            assert_eq!(row[2], 0);
+            // Middle slot is the §8.3 cumulative-frequency cap (32768).
+            assert_eq!(row[1], 32768);
+            // First slot is in `1..32768` (a valid binary CDF
+            // threshold).
+            assert!(row[0] >= 1 && row[0] < 32768);
+        }
+    }
+
+    /// §8.3.2 `use_obmc` selector returns the §9.4 default row for
+    /// every `MiSize` and `None` for out-of-range.
+    #[test]
+    fn use_obmc_cdf_selector_returns_default_rows() {
+        let mut ctx = TileCdfContext::new_from_defaults();
+        for (i, expected) in DEFAULT_USE_OBMC_CDF.iter().enumerate() {
+            let row = ctx.use_obmc_cdf(i).unwrap();
+            assert_eq!(row[0], expected[0]);
+            assert_eq!(row[1], 32768);
+            assert_eq!(row[2], 0);
+        }
+        assert!(ctx.use_obmc_cdf(BLOCK_SIZES).is_none());
+        assert!(ctx.use_obmc_cdf(BLOCK_SIZES + 11).is_none());
+    }
+
+    /// §6.10.26 motion-mode ordinal sanity: the three §5.11.27 result
+    /// values match the spec's `SIMPLE = 0` / `OBMC = 1` /
+    /// `WARPED_CAUSAL = 2` enumeration.
+    #[test]
+    fn motion_mode_ordinals_match_spec() {
+        assert_eq!(MOTION_MODE_SIMPLE, 0);
+        assert_eq!(MOTION_MODE_OBMC, 1);
+        assert_eq!(MOTION_MODE_WARPED_CAUSAL, 2);
+        assert!((MOTION_MODE_WARPED_CAUSAL as usize) < MOTION_MODES);
+    }
+
+    /// §7.10.3: a fresh walker has no decoded neighbours → no
+    /// overlappable candidates → returns false.
+    #[test]
+    fn has_overlappable_candidates_fresh_walker_returns_false() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        // Block at (2, 2) sees no inter neighbours.
+        assert!(!walker.has_overlappable_candidates(2, 2, BLOCK_8X8));
+        // Block at (0, 0) has no above / left neighbours at all.
+        assert!(!walker.has_overlappable_candidates(0, 0, BLOCK_8X8));
+    }
+
+    /// §7.10.3: a stamped inter neighbour above the block flips the
+    /// result to true.
+    #[test]
+    fn has_overlappable_candidates_above_inter_neighbour() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        // Stamp an inter block at (0, 0..=1): RefFrames[0][1][0] =
+        // LAST_FRAME > INTRA_FRAME, so the §7.10.3 above-walk for the
+        // block at (2, 0) BLOCK_8X8 hits the (MiRow - 1 = 1, x4 | 1 =
+        // 1) probe.
+        walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
+        assert!(walker.has_overlappable_candidates(2, 0, BLOCK_8X8));
+    }
+
+    /// §7.10.3: a stamped inter neighbour to the left flips the result
+    /// to true (left-walk arm).
+    #[test]
+    fn has_overlappable_candidates_left_inter_neighbour() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        // Stamp an inter block at (0, 0..=1) — the block at (0, 2) of
+        // BLOCK_8X8 sees (y4 | 1 = 1, MiCol - 1 = 1) as an inter
+        // neighbour.
+        walker.stamp_inter_neighbour(0, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
+        assert!(walker.has_overlappable_candidates(0, 2, BLOCK_8X8));
+    }
+
+    /// §7.10.4: a fresh walker has no decoded inter neighbours so
+    /// `find_warp_samples` returns 0 — the §5.11.27 caller then takes
+    /// the `use_obmc` arm.
+    #[test]
+    fn find_warp_samples_fresh_walker_returns_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let ns = walker.find_warp_samples(2, 2, BLOCK_8X8, 1, [[0, 0], [0, 0]]);
+        assert_eq!(ns, 0);
+    }
+
+    /// §7.10.4: an inter neighbour with the SAME `RefFrame[0]` and a
+    /// matching MV (within `threshold`) counts as a valid sample.
+    #[test]
+    fn find_warp_samples_matching_neighbour_increments_num_samples() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        // Stamp a same-ref inter neighbour above the block at (2, 0).
+        // BLOCK_8X8 = 2x2 cells; the above-walk fires
+        // `add_sample(-1, 0)`. With MV = (1, 1) on neighbour and (1, 1)
+        // on the block, `mvDiffRow + mvDiffCol = 0 <= 16`, so the
+        // sample is valid.
+        walker.stamp_inter_neighbour(0, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[1, 1], [0, 0]]);
+        let ns = walker.find_warp_samples(2, 0, BLOCK_8X8, 1, [[1, 1], [0, 0]]);
+        assert!(
+            ns >= 1,
+            "matching same-ref inter neighbour ⇒ NumSamples >= 1"
+        );
+    }
+
+    /// §7.10.4: a neighbour with a DIFFERENT `RefFrame[0]` is rejected
+    /// in the `add_sample` ref-frame check → `NumSamples` stays at 0.
+    #[test]
+    fn find_warp_samples_mismatched_ref_yields_zero() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        // Neighbour ref_frame[0] = 2 (LAST2_FRAME); query with
+        // ref_frame_0 = 1 (LAST_FRAME) — `add_sample` short-circuits.
+        walker.stamp_inter_neighbour(0, 0, BLOCK_8X8, [2, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
+        let ns = walker.find_warp_samples(2, 0, BLOCK_8X8, 1, [[0, 0], [0, 0]]);
+        assert_eq!(ns, 0);
+    }
+
+    /// §5.11.27 Arm 1: `skip_mode == 1` short-circuits to SIMPLE with
+    /// no S() read.
+    #[test]
+    fn read_motion_mode_skip_mode_arm_returns_simple_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                2,
+                2,
+                BLOCK_8X8,
+                /* skip_mode = */ 1,
+                /* is_compound = */ false,
+                /* ref_frame = */ [1, 7],
+                /* y_mode = */ MODE_NEAREST_NEARESTMV,
+                /* num_samples = */ 0,
+                /* is_motion_mode_switchable = */ true,
+                /* allow_warped_motion = */ true,
+                /* force_integer_mv = */ false,
+                [GM_TYPE_IDENTITY; 8],
+                [false; 7],
+            )
+            .unwrap();
+        assert_eq!(mm, MOTION_MODE_SIMPLE);
+        assert_eq!(dec.position(), pos_before, "skip_mode arm reads 0 bits");
+    }
+
+    /// §5.11.27 Arm 2: `!is_motion_mode_switchable` short-circuits to
+    /// SIMPLE with no S() read.
+    #[test]
+    fn read_motion_mode_not_switchable_returns_simple_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                2,
+                2,
+                BLOCK_16X16,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                3,
+                /* is_motion_mode_switchable = */ false,
+                true,
+                false,
+                [GM_TYPE_IDENTITY; 8],
+                [false; 7],
+            )
+            .unwrap();
+        assert_eq!(mm, MOTION_MODE_SIMPLE);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.27 Arm 3: `Min(Block_Width, Block_Height) < 8` short-
+    /// circuits to SIMPLE with no S() read.
+    #[test]
+    fn read_motion_mode_small_block_returns_simple_no_bits() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        // BLOCK_4X4: width 4 < 8 ⇒ arm fires.
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_4X4,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                0,
+                true,
+                true,
+                false,
+                [GM_TYPE_IDENTITY; 8],
+                [false; 7],
+            )
+            .unwrap();
+        assert_eq!(mm, MOTION_MODE_SIMPLE);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.27 Arm 4: GLOBALMV (or GLOBAL_GLOBALMV) + non-TRANSLATION
+    /// gm_type for `RefFrame[0]` ⇒ SIMPLE with no S() read (gated by
+    /// `!force_integer_mv`).
+    #[test]
+    fn read_motion_mode_globalmv_with_rotzoom_returns_simple() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mut gm_type = [GM_TYPE_IDENTITY; 8];
+        // RefFrame[0] = 1 (LAST_FRAME) is ROTZOOM (= 2 > TRANSLATION = 1).
+        gm_type[1] = GM_TYPE_ROTZOOM;
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                [1, -1],
+                MODE_GLOBALMV,
+                3,
+                true,
+                true,
+                /* force_integer_mv = */ false,
+                gm_type,
+                [false; 7],
+            )
+            .unwrap();
+        assert_eq!(mm, MOTION_MODE_SIMPLE);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.27 Arm 5a: `isCompound == true` short-circuits to SIMPLE
+    /// with no S() read.
+    #[test]
+    fn read_motion_mode_compound_returns_simple() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                /* is_compound = */ true,
+                [1, 7],
+                MODE_NEAREST_NEARESTMV,
+                3,
+                true,
+                true,
+                false,
+                [GM_TYPE_IDENTITY; 8],
+                [false; 7],
+            )
+            .unwrap();
+        assert_eq!(mm, MOTION_MODE_SIMPLE);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.27 Arm 5c: `!has_overlappable_candidates()` short-circuits
+    /// to SIMPLE with no S() read. A fresh walker has no overlappable
+    /// candidates ⇒ this arm fires for a non-compound, switchable,
+    /// large-enough, non-GLOBALMV block.
+    #[test]
+    fn read_motion_mode_no_overlappable_candidates_returns_simple() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let pos_before = dec.position();
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                4,
+                4,
+                BLOCK_16X16,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                0,
+                /* is_motion_mode_switchable = */ true,
+                true,
+                false,
+                [GM_TYPE_IDENTITY; 8],
+                [false; 7],
+            )
+            .unwrap();
+        assert_eq!(mm, MOTION_MODE_SIMPLE);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.27 post-find_warp_samples Arm A (`use_obmc` S()): with
+    /// `force_integer_mv = true` and an overlappable above neighbour,
+    /// the `use_obmc` CDF is consulted and adapts.
+    ///
+    /// Witness is CDF adaptation (with `disable_cdf_update = false`):
+    /// after a successful Arm-A read the `use_obmc` row for `BLOCK_8X8`
+    /// must differ from the §9.4 default value (the §8.3
+    /// `update_cdf` rescales every slot). The decoded `motion_mode`
+    /// is in `{SIMPLE, OBMC}` (no WARPED_CAUSAL on Arm A); the
+    /// `motion_mode` CDF row for `BLOCK_8X8` is left unchanged (Arm B
+    /// did not fire).
+    #[test]
+    fn read_motion_mode_use_obmc_arm_adapts_use_obmc_cdf() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
+
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let use_obmc_before = cdfs.use_obmc[BLOCK_8X8];
+        let motion_mode_before = cdfs.motion_mode[BLOCK_8X8];
+
+        let bytes = [0u8; 16];
+        // disable_cdf_update = false ⇒ §8.3 update_cdf runs after the S()
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                2,
+                0,
+                BLOCK_8X8,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                0,
+                true,
+                true,
+                /* force_integer_mv = */ true, // forces Arm A
+                [GM_TYPE_IDENTITY; 8],
+                [false; 7],
+            )
+            .unwrap();
+        // Arm A returns SIMPLE or OBMC, never WARPED_CAUSAL.
+        assert!(
+            mm == MOTION_MODE_SIMPLE || mm == MOTION_MODE_OBMC,
+            "Arm A must return SIMPLE or OBMC; got {mm}"
+        );
+        // The §8.3 update_cdf walked the use_obmc row (witness that S()
+        // fired against it).
+        assert_ne!(
+            cdfs.use_obmc[BLOCK_8X8], use_obmc_before,
+            "Arm A must read use_obmc S() ⇒ §8.3 update_cdf mutates the row"
+        );
+        // The motion_mode row is untouched (Arm B did NOT fire).
+        assert_eq!(
+            cdfs.motion_mode[BLOCK_8X8], motion_mode_before,
+            "Arm A must NOT read motion_mode S()"
+        );
+    }
+
+    /// §5.11.27 post-find_warp_samples Arm B (`motion_mode` S()): with
+    /// `force_integer_mv = false`, `num_samples > 0`,
+    /// `allow_warped_motion = true`, `is_scaled = false`, the
+    /// `motion_mode` CDF is consulted and adapts. The `use_obmc` row is
+    /// left unchanged (Arm A did not fire).
+    #[test]
+    fn read_motion_mode_motion_mode_arm_adapts_motion_mode_cdf() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
+
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let motion_mode_before = cdfs.motion_mode[BLOCK_8X8];
+        let use_obmc_before = cdfs.use_obmc[BLOCK_8X8];
+
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                2,
+                0,
+                BLOCK_8X8,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                /* num_samples = */ 2,
+                true,
+                /* allow_warped_motion = */ true,
+                /* force_integer_mv = */ false,
+                [GM_TYPE_IDENTITY; 8],
+                /* is_scaled_per_ref = */ [false; 7],
+            )
+            .unwrap();
+        assert!(
+            (mm as usize) < MOTION_MODES,
+            "Arm B return must be in 0..MOTION_MODES; got {mm}"
+        );
+        assert_ne!(
+            cdfs.motion_mode[BLOCK_8X8], motion_mode_before,
+            "Arm B must read motion_mode S() ⇒ §8.3 update_cdf mutates the row"
+        );
+        assert_eq!(
+            cdfs.use_obmc[BLOCK_8X8], use_obmc_before,
+            "Arm B must NOT read use_obmc S()"
+        );
+    }
+
+    /// §5.11.27 post-find_warp_samples Arm A forced by
+    /// `is_scaled(RefFrame[0]) = true`. With LAST_FRAME flagged as
+    /// scaled, even `force_integer_mv = false` + `num_samples > 0` +
+    /// `allow_warped_motion = true` must route through Arm A
+    /// (use_obmc). Witness via CDF adaptation.
+    #[test]
+    fn read_motion_mode_scaled_ref_routes_to_use_obmc_arm() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
+
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let use_obmc_before = cdfs.use_obmc[BLOCK_8X8];
+        let motion_mode_before = cdfs.motion_mode[BLOCK_8X8];
+
+        let mut is_scaled = [false; 7];
+        is_scaled[0] = true; // LAST_FRAME (refFrame=1) → idx 0
+
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, false).unwrap();
+        let _mm = walker
+            .read_motion_mode(
+                &mut dec,
+                &mut cdfs,
+                2,
+                0,
+                BLOCK_8X8,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                /* num_samples = */ 4,
+                true,
+                /* allow_warped_motion = */ true,
+                /* force_integer_mv = */ false,
+                [GM_TYPE_IDENTITY; 8],
+                is_scaled,
+            )
+            .unwrap();
+        assert_ne!(
+            cdfs.use_obmc[BLOCK_8X8], use_obmc_before,
+            "is_scaled=true ⇒ Arm A (use_obmc) ⇒ §8.3 update_cdf mutates use_obmc row"
+        );
+        assert_eq!(
+            cdfs.motion_mode[BLOCK_8X8], motion_mode_before,
+            "is_scaled=true ⇒ Arm B (motion_mode) must NOT fire"
+        );
+    }
+
+    /// End-to-end through the §5.11.23 dispatcher: an inter block with
+    /// `skip_mode = 1` reaches `read_motion_mode` which short-circuits
+    /// to SIMPLE, and the dispatcher returns
+    /// `Ok(DecodedInterBlockModeInfo { motion_mode: SIMPLE, .. })`.
+    #[test]
+    fn cascade_read_motion_mode_skip_mode_surfaces_simple_through_aggregate() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0xFFu8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let info = walker
+            .decode_inter_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 2,
+                /* mi_col = */ 2,
+                /* sub_size = */ BLOCK_8X8,
+                /* skip_mode = */ 1,
+                /* avail_u = */ true,
+                /* avail_l = */ true,
+                /* above_ref_frame = */ [0, -1],
+                /* left_ref_frame = */ [0, -1],
+                /* above_intra = */ true,
+                /* left_intra = */ true,
+                /* above_single = */ true,
+                /* left_single = */ true,
+                /* skip_mode_frame = */ [1, -1],
+                /* seg_ref_frame_active = */ false,
+                /* seg_ref_frame_data = */ 0,
+                /* seg_skip_active = */ false,
+                /* seg_globalmv_active = */ false,
+                /* reference_select = */ false,
+                [GM_TYPE_IDENTITY; 8],
+                identity_gm_params(),
+                [0; 8],
+                false,
+                false,
+                false,
+                /* is_motion_mode_switchable = */ true,
+                /* allow_warped_motion = */ true,
+                /* is_scaled_per_ref = */ [false; 7],
+            )
+            .expect("§5.11.27 SIMPLE short-circuit ⇒ dispatcher returns Ok");
+        assert_eq!(info.motion_mode, MOTION_MODE_SIMPLE);
+        assert_eq!(info.num_warp_samples, 0);
+        assert_eq!(info.mi_size, BLOCK_8X8);
     }
 }
