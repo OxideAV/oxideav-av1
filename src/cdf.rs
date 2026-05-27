@@ -1024,6 +1024,20 @@ pub const MAX_ANGLE_DELTA: usize = 3;
 /// onto `0..DIRECTIONAL_MODES` by subtracting this value.
 pub const V_PRED: usize = 1;
 
+/// `D67_PRED` (§6.10.x intra-mode enumeration) — the last directional
+/// intra mode. §5.11.44 `is_directional_mode(mode)` returns `1` for
+/// `V_PRED <= mode <= D67_PRED`.
+pub const D67_PRED: usize = 8;
+
+/// `UV_CFL_PRED` (§3 / §6.10.x chroma-mode enumeration) — the
+/// chroma-from-luma intra mode. Numerically `13` in the §3 enumeration
+/// (one past the largest Y intra mode `PAETH_PRED = 12`). The §5.11.22
+/// `if ( UVMode == UV_CFL_PRED )` arm gates the §5.11.45
+/// `read_cfl_alphas` reader; the §8.3.2 `uv_mode` CFL-allowed CDF
+/// (`Default_Uv_Mode_Cfl_Allowed_Cdf`) is the only row carrying a
+/// non-zero probability for this symbol.
+pub const UV_CFL_PRED: usize = 13;
+
 /// `INTERINTRA_MODES` (§3 / §6.10.27) — number of values for
 /// `interintra_mode` (`II_DC_PRED = 0`, `II_V_PRED = 1`, `II_H_PRED = 2`,
 /// `II_SMOOTH_PRED = 3`). Drives the row width of
@@ -8250,6 +8264,77 @@ pub fn size_group(mi_size: usize) -> usize {
     SIZE_GROUP[mi_size]
 }
 
+/// §5.11.44 `is_directional_mode( mode )`: returns `true` if `mode` is
+/// a directional intra mode, i.e. `V_PRED <= mode <= D67_PRED`. The
+/// §5.11.42 / §5.11.43 `intra_angle_info_{y,uv}` gates fire only when
+/// this predicate holds; the §8.3.2 `intra_tx_type` selection uses the
+/// `Filter_Intra_Mode_To_Intra_Dir` remap (a different `mode` source)
+/// on its `use_filter_intra == 1` branch.
+#[inline]
+#[must_use]
+pub const fn is_directional(mode: u8) -> bool {
+    let m = mode as usize;
+    m >= V_PRED && m <= D67_PRED
+}
+
+/// §8.3.2 `uv_mode` CFL-allowance derivation. The §8.3.2 paragraph
+/// reads:
+///
+/// ```text
+///   • Lossless == 1 AND get_plane_residual_size( MiSize, 1 ) == BLOCK_4X4
+///     ⇒ TileUVModeCflAllowedCdf[ YMode ]
+///   • Otherwise, Lossless == 0 AND Max( Block_Width[ MiSize ],
+///     Block_Height[ MiSize ] ) <= 32
+///     ⇒ TileUVModeCflAllowedCdf[ YMode ]
+///   • Otherwise
+///     ⇒ TileUVModeCflNotAllowedCdf[ YMode ]
+/// ```
+///
+/// `lossless` is the §5.11.18 / §5.11.7 `LosslessArray[ segment_id ]`
+/// value the caller already derived. The §5.11.38
+/// `get_plane_residual_size( MiSize, 1 )` test on the `lossless`
+/// branch checks whether the chroma residual block — after
+/// `subsampling_x` / `subsampling_y` are applied to the luma
+/// `Block_Width` / `Block_Height` — collapses to BLOCK_4X4 (i.e. both
+/// dimensions equal `4`).
+///
+/// Returns `false` if `mi_size >= BLOCK_SIZES` (a caller bug — the
+/// §5.11.22 dispatcher's bounds guard fires earlier in that case).
+#[inline]
+#[must_use]
+pub fn cfl_allowed_for_uv_mode(
+    lossless: bool,
+    mi_size: usize,
+    subsampling_x: bool,
+    subsampling_y: bool,
+) -> bool {
+    if mi_size >= BLOCK_SIZES {
+        return false;
+    }
+    let bw = block_width(mi_size);
+    let bh = block_height(mi_size);
+    if lossless {
+        // §5.11.38 get_plane_residual_size(MiSize, 1) == BLOCK_4X4 ⇔
+        // post-subsampling chroma residual is 4×4. The §5.11.38 path
+        // applies the §5.7.2 subsampling shifts directly:
+        //   subW = bw >> subsampling_x
+        //   subH = bh >> subsampling_y
+        // The result is BLOCK_4X4 iff both ≤ 4 (the §5.11.38 routing
+        // promotes a 2×n / n×2 down-shift back to 4×n / n×4 via the
+        // §3 enumeration, which still keeps the chroma residual size
+        // at BLOCK_4X4 for the lossless / smallest-block intersection
+        // — the conformant gate here is "post-subsampling block fits
+        // in a 4×4 chroma cell"). Equivalent: bw / bh <= 4 once
+        // shifted.
+        let sub_w = bw >> (subsampling_x as usize);
+        let sub_h = bh >> (subsampling_y as usize);
+        sub_w <= 4 && sub_h <= 4
+    } else {
+        // §8.3.2 second arm: Max(Block_Width, Block_Height) <= 32.
+        bw.max(bh) <= 32
+    }
+}
+
 /// §8.3.1 `init_coeff_cdfs`: derive the coefficient-CDF q-context `idx`
 /// from `base_q_idx`:
 ///
@@ -14404,6 +14489,551 @@ impl PartitionWalker {
         }
     }
 
+    /// `intra_block_mode_info()` per §5.11.22 (av1-spec p.73) — the
+    /// per-block intra-mode syntax composite. Reached as the `else`
+    /// arm of the §5.11.18 `if ( is_inter )` dispatch (for an
+    /// inter-frame block whose §5.11.20 `read_is_inter` returned 0);
+    /// the §5.11.7 keyframe / intra-only path reads `intra_frame_y_mode`
+    /// instead and so does NOT route through this composite (see
+    /// [`Self::decode_intra_frame_y_mode`]).
+    ///
+    /// The spec body (av1-spec p.73) reads:
+    ///
+    /// ```text
+    ///   intra_block_mode_info( ) {
+    ///       RefFrame[ 0 ] = INTRA_FRAME
+    ///       RefFrame[ 1 ] = NONE
+    ///       y_mode                                                  S()
+    ///       YMode = y_mode
+    ///       intra_angle_info_y( )
+    ///       if ( HasChroma ) {
+    ///           uv_mode                                              S()
+    ///           UVMode = uv_mode
+    ///           if ( UVMode == UV_CFL_PRED ) {
+    ///               read_cfl_alphas( )
+    ///           }
+    ///           intra_angle_info_uv( )
+    ///       }
+    ///       PaletteSizeY = 0
+    ///       PaletteSizeUV = 0
+    ///       if ( MiSize >= BLOCK_8X8 &&
+    ///            Block_Width[ MiSize ] <= 64 &&
+    ///            Block_Height[ MiSize ] <= 64 &&
+    ///            allow_screen_content_tools )
+    ///           palette_mode_info( )
+    ///       filter_intra_mode_info( )
+    ///   }
+    /// ```
+    ///
+    /// Each leaf composes a §8.3.2 selection + §8.2.6 `S()` read:
+    ///
+    /// * `y_mode` — `TileYModeCdf[ ctx = Size_Group[ MiSize ] ]` per
+    ///   §8.3.2 (av1-spec p.376). Range `0..INTRA_MODES = 13`.
+    ///   Distinct from the §5.11.7 keyframe `intra_frame_y_mode` CDF
+    ///   (`TileIntraFrameYModeCdf[ abovemode ][ leftmode ]`), which
+    ///   the [`Self::decode_intra_frame_y_mode`] reader handles.
+    ///
+    /// * `intra_angle_info_y` — §5.11.42 short-circuits to
+    ///   `AngleDeltaY = 0` when `MiSize < BLOCK_8X8` or `YMode` is not
+    ///   directional (§5.11.44 `is_directional_mode`: `V_PRED <= YMode
+    ///   <= D67_PRED`, i.e. `1..=8`). Otherwise reads one `S()`
+    ///   against `TileAngleDeltaCdf[ YMode - V_PRED ]`; the decoded
+    ///   value is biased by `MAX_ANGLE_DELTA = 3` so the returned
+    ///   `AngleDeltaY` is in `-3..=3`.
+    ///
+    /// * `uv_mode` — gated on `HasChroma`. The §8.3.2 selection picks
+    ///   between `TileUVModeCflAllowedCdf[ YMode ]` (the §8.3.2
+    ///   "CFL allowed" derivation: `Lossless == 1` &&
+    ///   `get_plane_residual_size(MiSize, 1) == BLOCK_4X4`, OR
+    ///   `!Lossless` && `Max(Block_Width, Block_Height) <= 32`) and
+    ///   `TileUVModeCflNotAllowedCdf[ YMode ]`. The CFL-allowed row is
+    ///   14-wide (`UV_CFL_PRED = 13` is reachable); the CFL-not-allowed
+    ///   row is 13-wide (`UV_CFL_PRED` is excluded).
+    ///
+    /// * `read_cfl_alphas` — §5.11.45 (only on `UVMode == UV_CFL_PRED ==
+    ///   13`). Reads `cfl_alpha_signs` (`S()` over `TileCflSignCdf`,
+    ///   range `0..CFL_JOINT_SIGNS = 8`), derives the joint sign
+    ///   components `signU = (signs + 1) / 3`, `signV = (signs + 1) %
+    ///   3` (each in `0..3`: `CFL_SIGN_ZERO = 0`, `CFL_SIGN_NEG = 1`,
+    ///   `CFL_SIGN_POS = 2`). Per axis: if the sign is non-zero, read
+    ///   one `S()` against `TileCflAlphaCdf[ ctx ]` (with `ctx` =
+    ///   [`cfl_alpha_u_ctx`] / [`cfl_alpha_v_ctx`]) and compute
+    ///   `CflAlpha{U,V} = (signed) (1 + cfl_alpha_*)`. When zero,
+    ///   `CflAlpha{U,V} = 0` (no `S()` consumed).
+    ///
+    /// * `intra_angle_info_uv` — §5.11.43 mirror of the luma reader
+    ///   gated on `UVMode` being directional and `MiSize >= BLOCK_8X8`.
+    ///
+    /// * `palette_mode_info` — §5.11.46. Reaches only when the outer
+    ///   gate (`MiSize >= BLOCK_8X8` && `Block_Width <= 64` &&
+    ///   `Block_Height <= 64` && `allow_screen_content_tools`) is true
+    ///   AND, per-plane, `YMode == DC_PRED` (luma) / `HasChroma &&
+    ///   UVMode == DC_PRED` (chroma). On either inner arm, reads:
+    ///
+    ///   - `has_palette_{y,uv}` — `S()` against
+    ///     `TilePaletteYModeCdf[ bsizeCtx ][ ctx ]` (luma) or
+    ///     `TilePaletteUVModeCdf[ ctx ]` (chroma). `bsizeCtx` =
+    ///     `Mi_Width_Log2[ MiSize ] + Mi_Height_Log2[ MiSize ] - 2`
+    ///     (in `0..PALETTE_BLOCK_SIZE_CONTEXTS = 7`); the luma `ctx`
+    ///     is [`palette_y_mode_ctx`] (caller-passed neighbour-palette
+    ///     booleans), the chroma `ctx` is [`palette_uv_mode_ctx`]
+    ///     (= `(PaletteSizeY > 0) ? 1 : 0`).
+    ///
+    ///   - On `has_palette_* == 1`: read `palette_size_*_minus_2` —
+    ///     `S()` against `TilePaletteYSizeCdf[ bsizeCtx ]` /
+    ///     `TilePaletteUVSizeCdf[ bsizeCtx ]`. Decoded value is in
+    ///     `0..PALETTE_SIZES = 7`, so `PaletteSize* = decoded + 2` is
+    ///     in `2..=PALETTE_COLORS = 8`. After the size read, §5.11.46
+    ///     reads the actual palette entries (`palette_colors_*[]` via
+    ///     `L(1)` / `L(BitDepth)` / `L(2)` literals + `L(paletteBits)`
+    ///     deltas) — this composite **does not** decode the palette
+    ///     entries themselves; the parser-scope `BitDepth` /
+    ///     `PaletteCache[]` plumbing the §5.11.46 entries need is not
+    ///     yet wired through the walker (the §5.11.46 entry reads will
+    ///     land as a subsequent arc once the walker tracks the palette
+    ///     grids `PaletteSizes[]` / `PaletteColors[]`). Callers that
+    ///     reach a non-zero `palette_size_*` therefore receive
+    ///     `Err(Error::PaletteEntriesUnsupported)` immediately after
+    ///     the size read; the size value itself is committed to the
+    ///     §8.3 adaptation state via the `S()` read.
+    ///
+    /// * `filter_intra_mode_info` — §5.11.24. Outer gate is
+    ///   `enable_filter_intra && YMode == DC_PRED && PaletteSizeY == 0
+    ///   && Max(Block_Width, Block_Height) <= 32`. Inner reads
+    ///   `use_filter_intra` (`S()` against
+    ///   `TileFilterIntraCdf[ MiSize ]`); on `use_filter_intra == 1`
+    ///   reads `filter_intra_mode` (`S()` against
+    ///   `TileFilterIntraModeCdf`, a context-free row coding 5 modes).
+    ///
+    /// ## Grid stamping
+    ///
+    /// The reader stamps `YModes[]` over the `bh4 * bw4` footprint
+    /// (mirroring [`Self::decode_intra_frame_y_mode`]) so neighbour
+    /// §8.3.2 `intra_frame_y_mode` ctx walks observe the value (the
+    /// §5.11.22 spec body's `YModes[r+y][c+x] = YMode` write site
+    /// shared with §5.11.5). The walker does NOT yet track
+    /// `UVModes[]`, `PaletteSizes[][]`, `PaletteColors[][][]` (those
+    /// grids land alongside the §5.11.49 palette-tokens wiring); the
+    /// uv / palette values are surfaced through
+    /// [`DecodedIntraBlockModeInfo`] for callers that want them.
+    ///
+    /// ## Caller-passed arguments
+    ///
+    /// The §5.11.22 body consumes seven frame-header / sequence-header
+    /// scalars that the walker does not yet track:
+    ///
+    /// * `lossless` — `LosslessArray[ segment_id ]` (already computed
+    ///   in the §5.11.18 prologue / §5.11.7 prefix); drives the §8.3.2
+    ///   `uv_mode` CFL-allowance derivation alongside §5.11.38
+    ///   `get_plane_residual_size`.
+    /// * `has_chroma` — §5.11.5 `HasChroma` (depends on `NumPlanes`,
+    ///   `subsampling_x`, `subsampling_y`, `MiRow`, `MiCol`, `bw4`,
+    ///   `bh4`); the §5.11.22 body uses it to gate the `uv_mode` /
+    ///   `cfl_alphas` / `intra_angle_info_uv` reads + the chroma arm
+    ///   of `palette_mode_info`.
+    /// * `allow_screen_content_tools` — §5.9.5 sequence-header bit;
+    ///   the §5.11.22 outer gate for `palette_mode_info`.
+    /// * `enable_filter_intra` — §5.5.2 sequence-header bit; the
+    ///   §5.11.24 outer gate.
+    /// * `subsampling_x`, `subsampling_y` — §5.7.2 sequence-header
+    ///   bits; needed only for the §8.3.2 `uv_mode` CFL-allowance
+    ///   derivation when `lossless == 1` (the
+    ///   `get_plane_residual_size(MiSize, 1) == BLOCK_4X4` test). On
+    ///   the `!lossless` path the walker uses the simpler
+    ///   `Max(Block_Width, Block_Height) <= 32` test, which doesn't
+    ///   read either subsampling flag.
+    /// * `above_palette_y` / `left_palette_y` — booleans for
+    ///   [`palette_y_mode_ctx`] (the §8.3.2 `has_palette_y` ctx is
+    ///   `(above_palette_y as usize) + (left_palette_y as usize)`).
+    ///   The walker doesn't yet track `PaletteSizes[][]`, so callers
+    ///   that don't have the neighbour-palette state pass `false /
+    ///   false` (the conformant identity for an all-fresh-state
+    ///   tile-start block).
+    ///
+    /// On success returns the full [`DecodedIntraBlockModeInfo`]
+    /// aggregate. Returns
+    /// [`crate::Error::PaletteEntriesUnsupported`] when a non-zero
+    /// `palette_size_*` is decoded (the §5.11.46 entry reads land in a
+    /// subsequent arc). Caller-bug arguments surface
+    /// [`crate::Error::PartitionWalkOutOfRange`]; bitstream errors
+    /// surface [`crate::Error::UnexpectedEnd`] /
+    /// [`crate::Error::SymbolExitUnderflow`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_intra_block_mode_info(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        // §5.11.18 / §5.11.7 already-derived per-block state:
+        lossless: bool,
+        has_chroma: bool,
+        // §5.9.5 / §5.5.2 sequence-header gates:
+        allow_screen_content_tools: bool,
+        enable_filter_intra: bool,
+        // §5.7.2 sequence-header chroma-subsampling flags (only
+        // consumed via §5.11.38 `get_plane_residual_size` on the
+        // `lossless` branch of the §8.3.2 `uv_mode` CFL-allowance
+        // derivation; pass `0` / `0` for an unsubsampled stream):
+        subsampling_x: bool,
+        subsampling_y: bool,
+        // §8.3.2 `has_palette_y` neighbour ctx booleans (`true` iff
+        // the corresponding neighbour block has a non-empty Y palette;
+        // the walker doesn't yet track `PaletteSizes[][]`, so pass
+        // `false / false` for a fresh-state run):
+        above_palette_y: bool,
+        left_palette_y: bool,
+    ) -> Result<DecodedIntraBlockModeInfo, crate::Error> {
+        // §5.11.22 caller-bug guards: every inner method re-checks
+        // its own bounds, but failing fast at the dispatcher keeps
+        // the bit stream untouched on a caller bug (no partial reads).
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.22 line 1: `RefFrame[ 0 ] = INTRA_FRAME, RefFrame[ 1 ]
+        // = NONE`. INTRA_FRAME = 0 per §6.10.1, NONE = -1 per §3.
+        let ref_frame: [i32; 2] = [0, -1];
+
+        // §5.11.22 line 2: `y_mode S()`. The §8.3.2 selection is
+        // `TileYModeCdf[ ctx = Size_Group[ MiSize ] ]`; the row is
+        // `INTRA_MODES + 1 = 14` wide (13 symbol slots + the §8.2.6
+        // counter). The §3 enumeration bounds the decoded value to
+        // `0..INTRA_MODES`.
+        let y_mode_ctx = size_group(sub_size);
+        let y_mode_cdf = cdfs
+            .y_mode_cdf(y_mode_ctx)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let y_mode = decoder.read_symbol(y_mode_cdf)? as u8;
+        debug_assert!(
+            (y_mode as usize) < INTRA_MODES,
+            "S() over Default_Y_Mode_Cdf yields 0..INTRA_MODES"
+        );
+
+        // §5.11.22 line 3: `YModes[r + y][c + x] = YMode` over the
+        // bh4 * bw4 footprint (av1-spec p.378 / §5.11.5). Mirrors
+        // [`Self::decode_intra_frame_y_mode`]'s grid-fill so the next
+        // block's §8.3.2 `intra_frame_y_mode` ctx walk (when the
+        // §5.11.7 keyframe path runs adjacent in a future tile)
+        // observes the value.
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.y_modes[(rr * self.mi_cols + cc) as usize] = y_mode;
+            }
+        }
+
+        // §5.11.22 line 4: `intra_angle_info_y( )` per §5.11.42.
+        // Short-circuits to `AngleDeltaY = 0` when `MiSize < BLOCK_8X8`
+        // OR `YMode` is not directional (§5.11.44: `V_PRED = 1 <= YMode
+        // <= D67_PRED = 8`). Otherwise reads `S()` against
+        // `TileAngleDeltaCdf[ YMode - V_PRED ]`; decoded value (in
+        // `0..(2 * MAX_ANGLE_DELTA + 1) = 7`) is biased by
+        // `MAX_ANGLE_DELTA = 3` so `AngleDeltaY` is in `-3..=3`.
+        let angle_delta_y: i8 = if sub_size >= BLOCK_8X8 && is_directional(y_mode) {
+            let row = cdfs
+                .angle_delta_cdf(y_mode as usize)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let raw = decoder.read_symbol(row)? as i32;
+            debug_assert!(
+                (0..(2 * MAX_ANGLE_DELTA + 1) as i32).contains(&raw),
+                "S() over Default_Angle_Delta_Cdf yields 0..(2 * MAX_ANGLE_DELTA + 1)"
+            );
+            (raw - MAX_ANGLE_DELTA as i32) as i8
+        } else {
+            0
+        };
+
+        // §5.11.22 lines 5-12: `if ( HasChroma )` arm.
+        let mut uv_mode_out: Option<u8> = None;
+        let mut cfl_alpha_u_out: Option<i8> = None;
+        let mut cfl_alpha_v_out: Option<i8> = None;
+        let mut angle_delta_uv_out: Option<i8> = None;
+        if has_chroma {
+            // §5.11.22 line 6: `uv_mode S()`. §8.3.2 selection picks
+            // between the CFL-allowed and CFL-not-allowed rows per the
+            // §8.3.2 paragraph:
+            //
+            //   • Lossless == 1 AND get_plane_residual_size(MiSize, 1)
+            //     == BLOCK_4X4 ⇒ CFL allowed
+            //   • Lossless == 0 AND Max(Block_Width, Block_Height) <=
+            //     32                                ⇒ CFL allowed
+            //   • else                              ⇒ CFL not allowed
+            //
+            // [`cfl_allowed_for_uv_mode`] performs the derivation
+            // against `lossless` / `mi_size` / subsampling flags.
+            let cfl_allowed =
+                cfl_allowed_for_uv_mode(lossless, sub_size, subsampling_x, subsampling_y);
+            let uv_cdf = cdfs
+                .uv_mode_cdf(cfl_allowed, y_mode as usize)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let uv_mode = decoder.read_symbol(uv_cdf)? as u8;
+            // §3 enumeration bound: CFL-allowed row width is 14
+            // (UV_CFL_PRED = 13 reachable); CFL-not-allowed row width
+            // is 13 (UV_CFL_PRED excluded).
+            debug_assert!(
+                (uv_mode as usize)
+                    < if cfl_allowed {
+                        UV_INTRA_MODES_CFL_ALLOWED
+                    } else {
+                        UV_INTRA_MODES_CFL_NOT_ALLOWED
+                    },
+                "S() over Default_Uv_Mode_*_Cdf yields 0..width"
+            );
+            uv_mode_out = Some(uv_mode);
+
+            // §5.11.22 line 8: `if ( UVMode == UV_CFL_PRED )
+            // read_cfl_alphas( )`. UV_CFL_PRED = 13 per §3.
+            if uv_mode as usize == UV_CFL_PRED {
+                // §5.11.45: `cfl_alpha_signs S()` over `TileCflSignCdf`
+                // (8-symbol context-free row).
+                let signs_cdf = cdfs.cfl_sign_cdf();
+                let signs = decoder.read_symbol(signs_cdf)?;
+                debug_assert!(
+                    (signs as usize) < CFL_JOINT_SIGNS,
+                    "S() over Default_Cfl_Sign_Cdf yields 0..CFL_JOINT_SIGNS"
+                );
+                // §5.11.45: signU = (signs + 1) / 3, signV = (signs +
+                // 1) % 3. Each in `0..3` (CFL_SIGN_ZERO = 0,
+                // CFL_SIGN_NEG = 1, CFL_SIGN_POS = 2).
+                let sign_u = ((signs + 1) / 3) as usize;
+                let sign_v = ((signs + 1) % 3) as usize;
+                // §5.11.45 U arm: `if ( signU != CFL_SIGN_ZERO )
+                // cfl_alpha_u S(); CflAlphaU = 1 + cfl_alpha_u; if (
+                // signU == CFL_SIGN_NEG ) CflAlphaU = -CflAlphaU. else
+                // CflAlphaU = 0.` CFL_SIGN_ZERO = 0; CFL_SIGN_NEG = 1.
+                let cfl_alpha_u: i8 = if sign_u != 0 {
+                    let ctx_u = cfl_alpha_u_ctx(sign_u, sign_v);
+                    let row_u = cdfs.cfl_alpha_cdf(ctx_u);
+                    let raw_u = decoder.read_symbol(row_u)? as i32;
+                    debug_assert!(
+                        (raw_u as usize) < CFL_ALPHABET_SIZE,
+                        "S() over Default_Cfl_Alpha_Cdf yields 0..CFL_ALPHABET_SIZE"
+                    );
+                    let signed = (1 + raw_u) as i8;
+                    if sign_u == 1 {
+                        -signed
+                    } else {
+                        signed
+                    }
+                } else {
+                    0
+                };
+                // §5.11.45 V arm: mirror of U.
+                let cfl_alpha_v: i8 = if sign_v != 0 {
+                    let ctx_v = cfl_alpha_v_ctx(sign_u, sign_v);
+                    let row_v = cdfs.cfl_alpha_cdf(ctx_v);
+                    let raw_v = decoder.read_symbol(row_v)? as i32;
+                    debug_assert!(
+                        (raw_v as usize) < CFL_ALPHABET_SIZE,
+                        "S() over Default_Cfl_Alpha_Cdf yields 0..CFL_ALPHABET_SIZE"
+                    );
+                    let signed = (1 + raw_v) as i8;
+                    if sign_v == 1 {
+                        -signed
+                    } else {
+                        signed
+                    }
+                } else {
+                    0
+                };
+                cfl_alpha_u_out = Some(cfl_alpha_u);
+                cfl_alpha_v_out = Some(cfl_alpha_v);
+            }
+
+            // §5.11.22 line 10: `intra_angle_info_uv( )` per §5.11.43.
+            // Mirror of the luma reader (same short-circuit + same
+            // `S()` against `TileAngleDeltaCdf[ UVMode - V_PRED ]`).
+            if sub_size >= BLOCK_8X8 && is_directional(uv_mode) {
+                let row = cdfs
+                    .angle_delta_cdf(uv_mode as usize)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let raw = decoder.read_symbol(row)? as i32;
+                debug_assert!(
+                    (0..(2 * MAX_ANGLE_DELTA + 1) as i32).contains(&raw),
+                    "S() over Default_Angle_Delta_Cdf yields 0..(2 * MAX_ANGLE_DELTA + 1)"
+                );
+                angle_delta_uv_out = Some((raw - MAX_ANGLE_DELTA as i32) as i8);
+            } else {
+                angle_delta_uv_out = Some(0);
+            }
+        }
+
+        // §5.11.22 lines 11-12: `PaletteSizeY = 0, PaletteSizeUV = 0`.
+        // The §5.11.46 inner arms overwrite `palette_size_y` to a
+        // non-zero value when `has_palette_y == 1` — but in that case
+        // the function returns `Err(PaletteEntriesUnsupported)`
+        // immediately (the §5.11.46 palette-entries reads are a
+        // subsequent arc). On the conformant success path
+        // `palette_size_y == 0` always, so the §5.11.24 outer-gate
+        // `PaletteSizeY == 0` check below trivially passes.
+        // `palette_size_*_out` therefore stays `None` on every
+        // success-path return (matching the surfaced "value not
+        // observed by §5.11.22 lines 11-12 fall-through" semantics
+        // documented on [`DecodedIntraBlockModeInfo::palette_size_y`]
+        // / `palette_size_uv`).
+        let mut palette_size_y: u32 = 0;
+        let mut has_palette_y_out: Option<u8> = None;
+        let palette_size_y_out: Option<u8> = None;
+        let mut has_palette_uv_out: Option<u8> = None;
+        let palette_size_uv_out: Option<u8> = None;
+
+        // §5.11.22 line 13-15: `palette_mode_info( )` outer gate.
+        // `MiSize >= BLOCK_8X8 && Block_Width <= 64 && Block_Height
+        // <= 64 && allow_screen_content_tools`. The first three are
+        // covered by the §9.3 mapping (BLOCK_8X8 = 3 onwards has
+        // Block_W/H >= 8; sizes with Block_W > 64 are
+        // BLOCK_64X128 / BLOCK_128X64 / BLOCK_128X128 indices 13..15;
+        // the extended sizes 16..21 all have Block_W <= 64 and
+        // Block_H <= 64 per the §9.3 table).
+        let bw = block_width(sub_size) as u32;
+        let bh = block_height(sub_size) as u32;
+        let palette_outer_gate =
+            sub_size >= BLOCK_8X8 && bw <= 64 && bh <= 64 && allow_screen_content_tools;
+        if palette_outer_gate {
+            // §5.11.46: `bsizeCtx = Mi_Width_Log2[ MiSize ] +
+            // Mi_Height_Log2[ MiSize ] - 2`. The §9.3 mapping ensures
+            // `bsizeCtx ∈ 0..PALETTE_BLOCK_SIZE_CONTEXTS = 7` for any
+            // MiSize that passed the outer gate (BLOCK_8X8 has
+            // (1, 1) ⇒ bsizeCtx = 0; the largest reachable is
+            // BLOCK_64X64's (4, 4) ⇒ bsizeCtx = 6).
+            let bsize_ctx = mi_width_log2(sub_size) + mi_height_log2(sub_size) - 2;
+            debug_assert!(
+                bsize_ctx < PALETTE_BLOCK_SIZE_CONTEXTS,
+                "§5.11.46 bsizeCtx must be in 0..PALETTE_BLOCK_SIZE_CONTEXTS"
+            );
+
+            // §5.11.46 luma arm: `if ( YMode == DC_PRED )`. DC_PRED = 0.
+            if y_mode == 0 {
+                // §5.11.46: `has_palette_y S()` against
+                // `TilePaletteYModeCdf[ bsizeCtx ][ ctx ]`. The §8.3.2
+                // ctx is `(above_palette_y as usize) +
+                // (left_palette_y as usize)`.
+                let ctx_y = palette_y_mode_ctx(above_palette_y, left_palette_y);
+                let row = cdfs.palette_y_mode_cdf(bsize_ctx, ctx_y);
+                let has_palette_y = decoder.read_symbol(row)? as u8;
+                debug_assert!(
+                    has_palette_y <= 1,
+                    "S() over Default_Palette_Y_Mode_Cdf yields 0 or 1"
+                );
+                has_palette_y_out = Some(has_palette_y);
+                if has_palette_y == 1 {
+                    // §5.11.46: `palette_size_y_minus_2 S()` against
+                    // `TilePaletteYSizeCdf[ bsizeCtx ]`. Decoded value
+                    // is in `0..PALETTE_SIZES = 7`; PaletteSizeY = +2
+                    // is in `2..=PALETTE_COLORS = 8`.
+                    let row_sz = cdfs.palette_y_size_cdf(bsize_ctx);
+                    let minus_2 = decoder.read_symbol(row_sz)?;
+                    debug_assert!(
+                        (minus_2 as usize) < PALETTE_SIZES,
+                        "S() over Default_Palette_Y_Size_Cdf yields 0..PALETTE_SIZES"
+                    );
+                    palette_size_y = minus_2 + 2;
+                    // §5.11.46 follows with the palette-entries reads
+                    // (`palette_colors_y[]` via L(1) / L(BitDepth) /
+                    // L(2) literals + L(paletteBits) deltas). Those
+                    // need parser-scope BitDepth + PaletteCache[]
+                    // plumbing the walker doesn't yet track — surface
+                    // the gap to the caller. The decoded
+                    // `palette_size_y` value is consumed by the §8.3
+                    // adaptation update inside `read_symbol`; we
+                    // surface neither it nor the partial aggregate
+                    // since the §5.11.46 spec body is contractually
+                    // mid-update at the point of the missing reads.
+                    let _ = palette_size_y;
+                    return Err(crate::Error::PaletteEntriesUnsupported);
+                }
+            }
+
+            // §5.11.46 chroma arm: `if ( HasChroma && UVMode ==
+            // DC_PRED )`. DC_PRED = 0. The chroma arm reads
+            // `palette_size_y_minus_2` against a `bsizeCtx`-keyed row
+            // — the §8.3.2 chroma `bsizeCtx` is the SAME `bsizeCtx`
+            // derived from `MiSize` above.
+            if has_chroma && uv_mode_out == Some(0) {
+                let ctx_uv = palette_uv_mode_ctx(palette_size_y as usize);
+                let row = cdfs.palette_uv_mode_cdf(ctx_uv);
+                let has_palette_uv = decoder.read_symbol(row)? as u8;
+                debug_assert!(
+                    has_palette_uv <= 1,
+                    "S() over Default_Palette_Uv_Mode_Cdf yields 0 or 1"
+                );
+                has_palette_uv_out = Some(has_palette_uv);
+                if has_palette_uv == 1 {
+                    let row_sz = cdfs.palette_uv_size_cdf(bsize_ctx);
+                    let minus_2 = decoder.read_symbol(row_sz)?;
+                    debug_assert!(
+                        (minus_2 as usize) < PALETTE_SIZES,
+                        "S() over Default_Palette_Uv_Size_Cdf yields 0..PALETTE_SIZES"
+                    );
+                    let _palette_size_uv = minus_2 + 2;
+                    return Err(crate::Error::PaletteEntriesUnsupported);
+                }
+            }
+        }
+
+        // §5.11.22 line 16: `filter_intra_mode_info( )` per §5.11.24.
+        // Outer gate: `enable_filter_intra && YMode == DC_PRED &&
+        // PaletteSizeY == 0 && Max(Block_Width, Block_Height) <= 32`.
+        let mut use_filter_intra_out: Option<u8> = None;
+        let mut filter_intra_mode_out: Option<u8> = None;
+        if enable_filter_intra && y_mode == 0 && palette_size_y == 0 && bw.max(bh) <= 32 {
+            // §5.11.24: `use_filter_intra S()` against
+            // `TileFilterIntraCdf[ MiSize ]`.
+            let row = cdfs.filter_intra_cdf(sub_size);
+            let use_filter_intra = decoder.read_symbol(row)? as u8;
+            debug_assert!(
+                use_filter_intra <= 1,
+                "S() over Default_Filter_Intra_Cdf yields 0 or 1"
+            );
+            use_filter_intra_out = Some(use_filter_intra);
+            if use_filter_intra == 1 {
+                // §5.11.24: `filter_intra_mode S()` against
+                // `TileFilterIntraModeCdf` (context-free row coding 5
+                // modes).
+                let row = cdfs.filter_intra_mode_cdf();
+                let mode = decoder.read_symbol(row)? as u8;
+                debug_assert!(
+                    (mode as usize) < INTRA_FILTER_MODES,
+                    "S() over Default_Filter_Intra_Mode_Cdf yields 0..INTRA_FILTER_MODES"
+                );
+                filter_intra_mode_out = Some(mode);
+            }
+        }
+
+        Ok(DecodedIntraBlockModeInfo {
+            mi_row,
+            mi_col,
+            mi_size: sub_size,
+            ref_frame,
+            y_mode,
+            angle_delta_y,
+            uv_mode: uv_mode_out,
+            cfl_alpha_u: cfl_alpha_u_out,
+            cfl_alpha_v: cfl_alpha_v_out,
+            angle_delta_uv: angle_delta_uv_out,
+            has_palette_y: has_palette_y_out,
+            palette_size_y: palette_size_y_out,
+            has_palette_uv: has_palette_uv_out,
+            palette_size_uv: palette_size_uv_out,
+            use_filter_intra: use_filter_intra_out,
+            filter_intra_mode: filter_intra_mode_out,
+        })
+    }
+
     /// Helper to read `InterTxSizes[ r ][ c ]` for the §8.3.2
     /// `tx_depth` ctx walk. Returns `TX_4X4 = 0` for out-of-grid
     /// coordinates (the §8.3.2 derivation falls back through the
@@ -16023,6 +16653,86 @@ pub struct DecodedInterFrameModeInfo {
     pub current_delta_lf: [i32; FRAME_LF_COUNT],
     /// §5.11.18 line 22 result. `0` (intra) or `1` (inter).
     pub is_inter: u8,
+}
+
+/// §5.11.22 per-block aggregate surfaced by
+/// [`PartitionWalker::decode_intra_block_mode_info`]. Carries every
+/// value the §5.11.22 spec body derives or reads in syntax order. The
+/// optional fields (`uv_mode`, `cfl_alpha_*`, `angle_delta_uv`,
+/// `palette_size_*`, `has_palette_*`, `use_filter_intra`,
+/// `filter_intra_mode`) are `None` on the spec's "not read" arms — the
+/// caller can rebuild §5.11.22's locally-derived `UVMode = uv_mode` /
+/// `PaletteSizeY` / `PaletteSizeUV` / `use_filter_intra = 0`
+/// assignments from these fields directly (matching the §5.11.22 spec
+/// body's initial-zero / `if`-guarded write sites).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedIntraBlockModeInfo {
+    /// §5.11.22 caller-passed mi-unit row of the block.
+    pub mi_row: u32,
+    /// §5.11.22 caller-passed mi-unit column of the block.
+    pub mi_col: u32,
+    /// §5.11.22 caller-passed `MiSize` ordinal.
+    pub mi_size: usize,
+    /// §5.11.22 line 1: `RefFrame[ 0 ] = INTRA_FRAME`, `RefFrame[ 1 ] =
+    /// NONE`. Always `[0, -1]` on this arm per §6.10.1 / §3.
+    pub ref_frame: [i32; 2],
+    /// §5.11.22 line 2: `y_mode` (= `YMode`). In `0..INTRA_MODES = 13`
+    /// per §3 (the §3 intra-mode enumeration: `DC_PRED = 0` through
+    /// `PAETH_PRED = 12`).
+    pub y_mode: u8,
+    /// §5.11.42 `intra_angle_info_y` result: `AngleDeltaY = angle_delta_y -
+    /// MAX_ANGLE_DELTA`, in `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA` for a
+    /// directional `YMode`. `0` on the §5.11.42 short-circuit (`MiSize <
+    /// BLOCK_8X8` or `!is_directional_mode(YMode)`).
+    pub angle_delta_y: i8,
+    /// §5.11.22 line 4: `uv_mode` (= `UVMode`). `None` when
+    /// `!HasChroma` (the §5.11.22 spec body wraps the `uv_mode` read in
+    /// `if ( HasChroma )`). When present, in `0..UV_INTRA_MODES_CFL_ALLOWED
+    /// = 14` per §3 (the §3 chroma-mode enumeration, with `UV_CFL_PRED =
+    /// 13` reachable only on the `cfl_allowed` branch).
+    pub uv_mode: Option<u8>,
+    /// §5.11.45 `read_cfl_alphas` result for the U plane. `None` when
+    /// `UVMode != UV_CFL_PRED` or `!HasChroma`. When the §5.11.45
+    /// `signU == CFL_SIGN_ZERO` arm fires, the field is `Some(0)` (the
+    /// spec body sets `CflAlphaU = 0`); otherwise `Some(±(1 +
+    /// cfl_alpha_u))` per §5.11.45.
+    pub cfl_alpha_u: Option<i8>,
+    /// §5.11.45 `read_cfl_alphas` result for the V plane. Mirrors
+    /// [`Self::cfl_alpha_u`].
+    pub cfl_alpha_v: Option<i8>,
+    /// §5.11.43 `intra_angle_info_uv` result. `None` when `!HasChroma`
+    /// or the §5.11.43 short-circuit fired. Otherwise `AngleDeltaUV =
+    /// angle_delta_uv - MAX_ANGLE_DELTA`, in
+    /// `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA`.
+    pub angle_delta_uv: Option<i8>,
+    /// §5.11.46 `has_palette_y`. `None` when the §5.11.46 spec body's
+    /// `YMode == DC_PRED` gate is false (or the §5.11.22 outer gate
+    /// rejects the block); otherwise `Some(0)` / `Some(1)`.
+    pub has_palette_y: Option<u8>,
+    /// §5.11.46 `PaletteSizeY = palette_size_y_minus_2 + 2`. `None`
+    /// when `has_palette_y` was not read or was `0` (the §5.11.46 body
+    /// then leaves `PaletteSizeY = 0` from §5.11.22 line 11). When
+    /// present, in `2..=PALETTE_COLORS = 8`.
+    pub palette_size_y: Option<u8>,
+    /// §5.11.46 `has_palette_uv`. `None` when the §5.11.46 spec body's
+    /// `HasChroma && UVMode == DC_PRED` gate is false; otherwise
+    /// `Some(0)` / `Some(1)`.
+    pub has_palette_uv: Option<u8>,
+    /// §5.11.46 `PaletteSizeUV = palette_size_uv_minus_2 + 2`. `None`
+    /// when `has_palette_uv` was not read or was `0`. When present, in
+    /// `2..=PALETTE_COLORS = 8`.
+    pub palette_size_uv: Option<u8>,
+    /// §5.11.24 `use_filter_intra` flag. `None` when the §5.11.24
+    /// outer gate (`enable_filter_intra && YMode == DC_PRED &&
+    /// PaletteSizeY == 0 && Max(Block_Width, Block_Height) <= 32`) is
+    /// false (the spec body's first line sets `use_filter_intra = 0`).
+    /// When present, in `{0, 1}`.
+    pub use_filter_intra: Option<u8>,
+    /// §5.11.24 `filter_intra_mode`. `None` when `use_filter_intra ==
+    /// 0` (the spec body only reads the mode on the inner `if (
+    /// use_filter_intra )` arm). When present, in
+    /// `0..INTRA_FILTER_MODES = 5`.
+    pub filter_intra_mode: Option<u8>,
 }
 
 #[cfg(test)]
@@ -28739,5 +29449,548 @@ mod tests {
             .unwrap();
         assert_eq!(sid, 3, "no-update-map arm must adopt predicted id");
         assert!(lossless, "lossless table lookup must use the adopted id");
+    }
+
+    // ===================================================================
+    // §5.11.22 decode_intra_block_mode_info — direct-call coverage (r169).
+    // ===================================================================
+
+    /// Build a `BLOCK_SIZES`-wide rigged CDF that forces an `S()` read
+    /// against a row of width `WIDTH` to return `symbol`.
+    fn rigged_row<const N: usize>(symbol: u8) -> [u16; N] {
+        let nm1 = N - 1;
+        assert!((symbol as usize) < nm1, "symbol out of row range");
+        let mut row = [0u16; N];
+        for slot in row.iter_mut().take(nm1).skip(symbol as usize) {
+            *slot = 1 << 15;
+        }
+        // The N-th slot stays at 0 (the §8.2.6 counter).
+        row
+    }
+
+    /// Helper: build a §5.11.22-ready walker + cdfs + a 32-byte
+    /// zero-buffer SymbolDecoder.
+    fn intra_block_mode_info_fixture() -> (PartitionWalker, TileCdfContext, [u8; 32]) {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 32];
+        (walker, cdfs, bytes)
+    }
+
+    /// §5.11.22 caller-bug guards: out-of-range `sub_size` / `mi_row` /
+    /// `mi_col` surface `PartitionWalkOutOfRange` before any bit is
+    /// read.
+    #[test]
+    fn decode_intra_block_mode_info_rejects_out_of_range() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        assert!(matches!(
+            walker.decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_SIZES,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            walker.decode_intra_block_mode_info(
+                &mut dec, &mut cdfs, 32, 0, BLOCK_4X4, false, true, false, false, false, false,
+                false, false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert!(matches!(
+            walker.decode_intra_block_mode_info(
+                &mut dec, &mut cdfs, 0, 32, BLOCK_4X4, false, true, false, false, false, false,
+                false, false
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no bit read on the bounds-rejection path"
+        );
+    }
+
+    /// §5.11.22 happy path: rig every CDF the §5.11.22 body might read
+    /// against to force `y_mode = 0 = DC_PRED` (non-directional ⇒ no
+    /// angle-delta-y read), `uv_mode = 0 = DC_PRED` (also
+    /// non-directional ⇒ no angle-delta-uv read and not UV_CFL_PRED ⇒
+    /// no read_cfl_alphas), with palette + filter-intra gates OFF.
+    /// The reader returns successfully with every leaf in its
+    /// short-circuit value.
+    #[test]
+    fn decode_intra_block_mode_info_dc_pred_happy_path_all_gates_off() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        // Rig y_mode rows (BLOCK_SIZE_GROUPS) → symbol 0.
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0);
+        }
+        // Rig both uv_mode tables → symbol 0.
+        for row in cdfs.uv_mode_cfl_not_allowed.iter_mut() {
+            *row = rigged_row::<{ UV_INTRA_MODES_CFL_NOT_ALLOWED + 1 }>(0);
+        }
+        for row in cdfs.uv_mode_cfl_allowed.iter_mut() {
+            *row = rigged_row::<{ UV_INTRA_MODES_CFL_ALLOWED + 1 }>(0);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 4,
+                /* mi_col = */ 4,
+                /* sub_size = */ BLOCK_16X16,
+                /* lossless = */ false,
+                /* has_chroma = */ true,
+                /* allow_screen_content_tools = */ false,
+                /* enable_filter_intra = */ false,
+                /* subsampling_x = */ false,
+                /* subsampling_y = */ false,
+                /* above_palette_y = */ false,
+                /* left_palette_y = */ false,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, 0, "rigged y_mode = DC_PRED");
+        assert_eq!(info.ref_frame, [0, -1], "INTRA_FRAME / NONE");
+        // DC_PRED is not directional → angle_delta_y short-circuit.
+        assert_eq!(info.angle_delta_y, 0);
+        // HasChroma = true → uv_mode is read.
+        assert_eq!(info.uv_mode, Some(0));
+        // DC_PRED is not directional → angle_delta_uv short-circuit
+        // also returns 0 (the §5.11.43 spec body initialises
+        // AngleDeltaUV = 0 unconditionally in the HasChroma arm).
+        assert_eq!(info.angle_delta_uv, Some(0));
+        // UVMode != UV_CFL_PRED → cfl_alphas not read.
+        assert_eq!(info.cfl_alpha_u, None);
+        assert_eq!(info.cfl_alpha_v, None);
+        // Palette + filter-intra gates off → all None.
+        assert_eq!(info.has_palette_y, None);
+        assert_eq!(info.palette_size_y, None);
+        assert_eq!(info.has_palette_uv, None);
+        assert_eq!(info.palette_size_uv, None);
+        assert_eq!(info.use_filter_intra, None);
+        assert_eq!(info.filter_intra_mode, None);
+        // Footprint of BLOCK_16X16 is 4×4 mi cells anchored at (4,4).
+        let bw4 = NUM_4X4_BLOCKS_WIDE[BLOCK_16X16] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[BLOCK_16X16] as u32;
+        for dr in 0..bh4 {
+            for dc in 0..bw4 {
+                let idx = ((4 + dr) * walker.mi_cols() + (4 + dc)) as usize;
+                assert_eq!(walker.y_modes()[idx], 0, "footprint stamped with YMode=0");
+            }
+        }
+    }
+
+    /// §5.11.22 HasChroma == false short-circuit: uv_mode /
+    /// cfl_alpha_* / angle_delta_uv all stay `None`. Useful for
+    /// monochrome streams where the §5.11.5 `HasChroma = NumPlanes > 1`
+    /// derivation yields 0. The §5.11.22 reader only consumes the
+    /// y_mode bit(s); the bit position must advance past the §8.2.6
+    /// initial state.
+    #[test]
+    fn decode_intra_block_mode_info_monochrome_skips_chroma_reads() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let pos_before = dec.position();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                /* has_chroma = */ false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let pos_after = dec.position();
+        // Only the y_mode S() bit(s) consumed.
+        assert!(
+            pos_after > pos_before,
+            "y_mode S() advanced the bit position"
+        );
+        assert_eq!(info.y_mode, 0);
+        assert_eq!(info.uv_mode, None);
+        assert_eq!(info.cfl_alpha_u, None);
+        assert_eq!(info.cfl_alpha_v, None);
+        assert_eq!(info.angle_delta_uv, None);
+        // Palette / filter-intra gates also off.
+        assert_eq!(info.has_palette_y, None);
+        assert_eq!(info.has_palette_uv, None);
+        assert_eq!(info.use_filter_intra, None);
+    }
+
+    /// §5.11.42 angle_delta_y arm structure: a non-directional `YMode`
+    /// (e.g. DC_PRED) plus a `MiSize >= BLOCK_8X8` block must
+    /// short-circuit to `AngleDeltaY = 0` without an `S()` read; the
+    /// reader's behaviour is verified by comparing the bit position
+    /// before/after a HasChroma=false run with rigged y_mode = 0.
+    #[test]
+    fn decode_intra_block_mode_info_dc_pred_skips_angle_delta_y() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(info.angle_delta_y, 0, "DC_PRED → §5.11.42 short-circuit");
+    }
+
+    /// §5.11.42 angle_delta_y small-block short-circuit: `MiSize <
+    /// BLOCK_8X8` also forces `AngleDeltaY = 0` regardless of `YMode`.
+    /// BLOCK_4X4 is the smallest size and exercises the
+    /// `sub_size >= BLOCK_8X8` outer guard.
+    #[test]
+    fn decode_intra_block_mode_info_small_block_skips_angle_delta_y() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        // Rig y_mode to V_PRED (directional, would normally trigger
+        // angle-delta read) but the BLOCK_4X4 size short-circuits.
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(V_PRED as u8);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, false, false, false, false, false, false,
+                false, false,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, V_PRED as u8);
+        assert_eq!(
+            info.angle_delta_y, 0,
+            "BLOCK_4X4 < BLOCK_8X8 → §5.11.42 short-circuit"
+        );
+    }
+
+    /// §5.11.46 outer-gate short-circuit: with
+    /// `allow_screen_content_tools = false`, the palette path is not
+    /// reached regardless of `YMode == DC_PRED`. `has_palette_*` stay
+    /// `None`. Verified by running on a DC_PRED block with the gate
+    /// off.
+    #[test]
+    fn decode_intra_block_mode_info_palette_gate_off_skips_palette_reads() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0); // DC_PRED
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                false,
+                /* allow_screen_content_tools = */ false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(info.has_palette_y, None);
+        assert_eq!(info.palette_size_y, None);
+        assert_eq!(info.has_palette_uv, None);
+        assert_eq!(info.palette_size_uv, None);
+    }
+
+    /// §5.11.46 outer-gate block-size short-circuit: a non-DC y_mode
+    /// must also bypass the palette path even when
+    /// `allow_screen_content_tools = true`. (The §5.11.46 luma arm
+    /// is `if ( YMode == DC_PRED )`; a non-DC mode skips the
+    /// has_palette_y read.)
+    #[test]
+    fn decode_intra_block_mode_info_non_dc_y_mode_skips_palette_luma_arm() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        // Rig y_mode → V_PRED (non-DC).
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(V_PRED as u8);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                false,
+                /* allow_screen_content_tools = */ true,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        // Luma palette arm short-circuited (YMode != DC_PRED).
+        assert_eq!(info.has_palette_y, None);
+    }
+
+    /// §5.11.24 outer-gate short-circuit: `enable_filter_intra =
+    /// false` skips the entire §5.11.24 read regardless of `YMode`.
+    #[test]
+    fn decode_intra_block_mode_info_filter_intra_disabled_short_circuit() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                false,
+                false,
+                /* enable_filter_intra = */ false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(info.use_filter_intra, None);
+        assert_eq!(info.filter_intra_mode, None);
+    }
+
+    /// §5.11.24 outer-gate Y-mode short-circuit: a non-DC `YMode`
+    /// also short-circuits the §5.11.24 read (regardless of
+    /// `enable_filter_intra`), since the gate is `YMode == DC_PRED`.
+    #[test]
+    fn decode_intra_block_mode_info_non_dc_y_mode_skips_filter_intra() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        // Rig y_mode → V_PRED.
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(V_PRED as u8);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                false,
+                false,
+                /* enable_filter_intra = */ true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(info.use_filter_intra, None);
+        assert_eq!(info.filter_intra_mode, None);
+    }
+
+    /// §5.11.24 outer-gate block-size short-circuit: a block with
+    /// `Max(Block_Width, Block_Height) > 32` (BLOCK_64X64 ⇒ 64)
+    /// short-circuits the §5.11.24 read.
+    #[test]
+    fn decode_intra_block_mode_info_large_block_skips_filter_intra() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_64X64,
+                false,
+                false,
+                false,
+                /* enable_filter_intra = */ true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(info.use_filter_intra, None);
+    }
+
+    /// §5.11.22 RefFrame derivation: always `[INTRA_FRAME = 0, NONE
+    /// = -1]` regardless of `MiSize` / `HasChroma`.
+    #[test]
+    fn decode_intra_block_mode_info_ref_frame_always_intra_none() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, false, false, false, false, false, false,
+                false, false,
+            )
+            .unwrap();
+        assert_eq!(info.ref_frame, [0, -1]);
+    }
+
+    /// §5.11.22 grid stamping: `YModes[r + y][c + x] = YMode` over the
+    /// `bh4 * bw4` footprint, mirroring [`Self::decode_intra_frame_y_mode`].
+    #[test]
+    fn decode_intra_block_mode_info_stamps_y_modes_grid() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(0); // DC_PRED
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        walker
+            .decode_intra_block_mode_info(
+                &mut dec, &mut cdfs, /* mi_row = */ 2, /* mi_col = */ 2,
+                /* sub_size = */ BLOCK_8X8, false, false, false, false, false, false, false,
+                false,
+            )
+            .unwrap();
+        // BLOCK_8X8 footprint is 2x2 mi cells anchored at (2,2);
+        // every cell carries 0 (DC_PRED, which also matches the
+        // pre-fill identity but we cover the path).
+        let bw4 = NUM_4X4_BLOCKS_WIDE[BLOCK_8X8] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[BLOCK_8X8] as u32;
+        for dr in 0..bh4 {
+            for dc in 0..bw4 {
+                let idx = ((2 + dr) * walker.mi_cols() + (2 + dc)) as usize;
+                assert_eq!(walker.y_modes()[idx], 0, "footprint stamped");
+            }
+        }
+    }
+
+    /// §5.11.22 grid stamping with a non-zero `YMode` value (forced
+    /// V_PRED): every cell in the `bh4 * bw4` footprint carries the
+    /// decoded value, distinguishable from the pre-fill identity (0).
+    #[test]
+    fn decode_intra_block_mode_info_stamps_non_dc_y_mode() {
+        let (mut walker, mut cdfs, bytes) = intra_block_mode_info_fixture();
+        for row in cdfs.y_mode.iter_mut() {
+            *row = rigged_row::<{ INTRA_MODES + 1 }>(V_PRED as u8);
+        }
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let bw4 = NUM_4X4_BLOCKS_WIDE[BLOCK_16X16] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[BLOCK_16X16] as u32;
+        for dr in 0..bh4 {
+            for dc in 0..bw4 {
+                let idx = (dr * walker.mi_cols() + dc) as usize;
+                assert_eq!(walker.y_modes()[idx], V_PRED as u8);
+            }
+        }
+        // A cell outside the footprint stays at its initial 0.
+        let outside_idx = ((bh4) * walker.mi_cols() + bw4) as usize;
+        assert_eq!(walker.y_modes()[outside_idx], 0);
+    }
+
+    /// §5.11.44 is_directional_mode: V_PRED..=D67_PRED return true,
+    /// every other mode false.
+    #[test]
+    fn is_directional_matches_spec_range() {
+        for mode in 0u8..INTRA_MODES as u8 {
+            let want = (mode as usize) >= V_PRED && (mode as usize) <= D67_PRED;
+            assert_eq!(
+                is_directional(mode),
+                want,
+                "is_directional({mode}) must match §5.11.44 spec",
+            );
+        }
+        // Out-of-enumeration upper bound also returns false.
+        assert!(!is_directional(255));
+    }
+
+    /// §8.3.2 `cfl_allowed_for_uv_mode`: explicit truth-table check
+    /// against the three spec arms.
+    #[test]
+    fn cfl_allowed_truth_table_matches_spec() {
+        // Lossless = true + post-subsampling 4×4 chroma → allowed.
+        // BLOCK_4X4 luma (4×4) + no subsampling → chroma 4×4.
+        assert!(cfl_allowed_for_uv_mode(true, BLOCK_4X4, false, false));
+        // BLOCK_8X8 luma (8×8) + 4:2:0 subsampling → chroma 4×4 →
+        // allowed under lossless.
+        assert!(cfl_allowed_for_uv_mode(true, BLOCK_8X8, true, true));
+        // BLOCK_8X8 luma + no subsampling → chroma 8×8 → NOT allowed
+        // under lossless (residual exceeds 4×4).
+        assert!(!cfl_allowed_for_uv_mode(true, BLOCK_8X8, false, false));
+        // Lossless = false: gate is Max(W, H) <= 32.
+        assert!(cfl_allowed_for_uv_mode(false, BLOCK_16X16, false, false));
+        assert!(cfl_allowed_for_uv_mode(false, BLOCK_32X32, false, false));
+        // BLOCK_64X64 → Max = 64 → not allowed.
+        assert!(!cfl_allowed_for_uv_mode(false, BLOCK_64X64, false, false));
+        // BLOCK_128X128 → Max = 128 → not allowed.
+        assert!(!cfl_allowed_for_uv_mode(false, BLOCK_128X128, false, false));
+        // Out-of-range mi_size → false (caller-bug guard).
+        assert!(!cfl_allowed_for_uv_mode(false, BLOCK_SIZES, false, false));
     }
 }

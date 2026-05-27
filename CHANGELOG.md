@@ -6,6 +6,125 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 169 — §5.11.22 `intra_block_mode_info()`
+  (`PartitionWalker::decode_intra_block_mode_info`).** Lands the
+  per-block intra-mode syntax composite reached from the §5.11.18
+  `else` arm of `if (is_inter)` (the §5.11.7 keyframe path uses
+  `intra_frame_y_mode` instead). Reader composes every §5.11.22 leaf
+  in spec order:
+
+  * Line 1: `RefFrame[0] = INTRA_FRAME, RefFrame[1] = NONE`
+    (constant `[0, -1]`).
+  * Line 2: `y_mode` S() against `TileYModeCdf[ctx = Size_Group[MiSize]]`
+    via the existing `size_group` helper + `TileCdfContext::y_mode_cdf`
+    accessor. Decoded value in `0..INTRA_MODES = 13`.
+  * Line 3 grid-fill: `YModes[r + y][c + x] = YMode` over the
+    `bh4 * bw4` footprint, mirroring `decode_intra_frame_y_mode`.
+  * §5.11.42 `intra_angle_info_y()` — gated on `MiSize >= BLOCK_8X8 &&
+    is_directional(YMode)`. Reads `S()` against
+    `TileAngleDeltaCdf[YMode - V_PRED]`; result is biased into
+    `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA = -3..=3`.
+  * `if (HasChroma)` arm — `uv_mode` S() with §8.3.2 CFL-allowance
+    branch (lossless + post-subsampling 4×4 OR !lossless +
+    Max(W,H) ≤ 32 → `TileUVModeCflAllowedCdf[YMode]`, else
+    `TileUVModeCflNotAllowedCdf[YMode]`). Decoded value in
+    `0..UV_INTRA_MODES_CFL_{ALLOWED,NOT_ALLOWED}`.
+  * §5.11.45 `read_cfl_alphas()` — gated on `UVMode == UV_CFL_PRED`.
+    Reads `cfl_alpha_signs` S() (8-symbol context-free), derives
+    `signU = (signs+1)/3, signV = (signs+1)%3` (CFL_SIGN_ZERO/NEG/POS
+    = 0/1/2). Per axis, if sign ≠ ZERO, reads `cfl_alpha_{u,v}` S()
+    against `TileCflAlphaCdf[ctx]` (ctx from existing
+    `cfl_alpha_{u,v}_ctx` helpers); computes
+    `CflAlpha{U,V} = ±(1 + raw)` (negated on SIGN_NEG).
+  * §5.11.43 `intra_angle_info_uv()` — mirror of §5.11.42 against
+    `TileAngleDeltaCdf[UVMode - V_PRED]`.
+  * §5.11.46 `palette_mode_info()` — outer gate
+    `MiSize >= BLOCK_8X8 && Block_W <= 64 && Block_H <= 64 &&
+    allow_screen_content_tools`. Per-plane:
+    * Luma arm (`YMode == DC_PRED`): `has_palette_y` S() against
+      `TilePaletteYModeCdf[bsizeCtx][ctx]` (`bsizeCtx =
+      Mi_W_Log2 + Mi_H_Log2 - 2`, `ctx = above_pal + left_pal`
+      via existing `palette_y_mode_ctx`); on 1, reads
+      `palette_size_y_minus_2` S() then surfaces
+      `Err(PaletteEntriesUnsupported)` (the §5.11.46 entries L(*)
+      reads need parser-scope `BitDepth` + `PaletteCache[]`
+      plumbing — subsequent arc).
+    * Chroma arm (`HasChroma && UVMode == DC_PRED`): `has_palette_uv`
+      S() against `TilePaletteUVModeCdf[ctx = (PaletteSizeY > 0)]`;
+      on 1, reads `palette_size_uv_minus_2` S() then surfaces
+      `PaletteEntriesUnsupported`.
+  * §5.11.24 `filter_intra_mode_info()` — outer gate
+    `enable_filter_intra && YMode == DC_PRED && PaletteSizeY == 0 &&
+    Max(Block_W, Block_H) <= 32`. Reads `use_filter_intra` S()
+    against `TileFilterIntraCdf[MiSize]`; on 1, reads
+    `filter_intra_mode` S() against `TileFilterIntraModeCdf`
+    (context-free, 5 modes).
+
+  Returns the full `DecodedIntraBlockModeInfo` aggregate carrying
+  every decoded value (with `Option<…>` fields for the spec's
+  "not read" arms). The §5.11.18 dispatcher stub
+  (`IntraBlockModeInfoUnsupported`) remains in place — the new
+  reader needs the additional sequence-header arguments
+  (`has_chroma`, `allow_screen_content_tools`,
+  `enable_filter_intra`, `subsampling_x`, `subsampling_y`,
+  `above_palette_y`, `left_palette_y`) that the §5.11.18
+  signature doesn't yet thread through; direct callers can invoke
+  `decode_intra_block_mode_info` with the missing arguments.
+
+  Two new public free functions land alongside:
+
+  * `is_directional(mode)` — §5.11.44 predicate
+    (`V_PRED <= mode <= D67_PRED`).
+  * `cfl_allowed_for_uv_mode(lossless, mi_size, sub_x, sub_y)` —
+    §8.3.2 `uv_mode` CFL-allowance derivation.
+
+  Three new public constants: `D67_PRED = 8`, `UV_CFL_PRED = 13`,
+  and one new error variant: `PaletteEntriesUnsupported`.
+
+  Tests added (15 new direct-call tests):
+
+  * `decode_intra_block_mode_info_rejects_out_of_range` — bounds
+    guards (sub_size / mi_row / mi_col) surface
+    `PartitionWalkOutOfRange` before any bit read.
+  * `decode_intra_block_mode_info_dc_pred_happy_path_all_gates_off`
+    — DC_PRED + HasChroma + all gates off, every field at its
+    short-circuit value.
+  * `decode_intra_block_mode_info_monochrome_skips_chroma_reads` —
+    HasChroma = false skips uv_mode / cfl / angle_delta_uv.
+  * `decode_intra_block_mode_info_dc_pred_skips_angle_delta_y` —
+    §5.11.42 non-directional short-circuit.
+  * `decode_intra_block_mode_info_small_block_skips_angle_delta_y`
+    — §5.11.42 small-block (BLOCK_4X4) short-circuit.
+  * `decode_intra_block_mode_info_palette_gate_off_skips_palette_reads`
+    — `allow_screen_content_tools = false` skips §5.11.46.
+  * `decode_intra_block_mode_info_non_dc_y_mode_skips_palette_luma_arm`
+    — non-DC YMode skips luma palette read.
+  * `decode_intra_block_mode_info_filter_intra_disabled_short_circuit`
+    — `enable_filter_intra = false` skips §5.11.24.
+  * `decode_intra_block_mode_info_non_dc_y_mode_skips_filter_intra`
+    — non-DC YMode skips §5.11.24 (gate's `YMode == DC_PRED` term).
+  * `decode_intra_block_mode_info_large_block_skips_filter_intra` —
+    Max(W, H) > 32 skips §5.11.24.
+  * `decode_intra_block_mode_info_ref_frame_always_intra_none` —
+    `[INTRA_FRAME, NONE] = [0, -1]` invariant.
+  * `decode_intra_block_mode_info_stamps_y_modes_grid` /
+    `decode_intra_block_mode_info_stamps_non_dc_y_mode` — §5.11.5
+    grid-fill verification.
+  * `is_directional_matches_spec_range` — §5.11.44 truth-table.
+  * `cfl_allowed_truth_table_matches_spec` — §8.3.2 CFL-allowance
+    truth-table (lossless + post-subsampling 4×4, !lossless +
+    Max ≤ 32, out-of-range caller-bug guard).
+
+  Test count: 587 → 602 (+15 new).
+
+  Provenance: AV1 Specification (av1-spec.txt) §5.11.22 / §5.11.24
+  / §5.11.42 / §5.11.43 / §5.11.44 / §5.11.45 / §5.11.46 + §8.3.2
+  ("y_mode", "uv_mode", "angle_delta_y", "angle_delta_uv",
+  "has_palette_y", "has_palette_uv", "palette_size_y_minus_2",
+  "palette_size_uv_minus_2", "use_filter_intra",
+  "filter_intra_mode", "cfl_alpha_signs", "cfl_alpha_u",
+  "cfl_alpha_v") + the §9.4 default CDFs already in the crate.
+
 * **Round 168 — §5.11.17 `read_var_tx_size()` + §5.11.18
   `inter_frame_mode_info()` (`PartitionWalker::read_var_tx_size` +
   `decode_inter_frame_mode_info`).** Lands the two missing inter-arm

@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-27 (round 168)
+## Status — 2026-05-27 (round 169)
 
 **Clean-room rebuild, round 22.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1306,6 +1306,66 @@ ctx-2 both-neighbour paths; non-zero tile origin clearing AvailU
 §5.11.5 `decode_block()` body itself (coefficient / motion-vector
 / reconstruction) remains the next round's target. `decode_av1`
 and `encode_av1` still return `Error::NotImplemented`.
+
+Round 169 lands **§5.11.22 `intra_block_mode_info()`** (av1-spec
+p.73) — the per-block intra-mode syntax composite reached from the
+§5.11.18 `else` arm of `if (is_inter)`. The new
+`PartitionWalker::decode_intra_block_mode_info` reader composes every
+§5.11.22 leaf in spec order: `RefFrame[0] = INTRA_FRAME, RefFrame[1] =
+NONE` (constant `[0, -1]`); `y_mode` S() against `TileYModeCdf[ctx =
+Size_Group[MiSize]]` (decoded value in `0..INTRA_MODES = 13`) + the
+§5.11.5 `YModes[r + y][c + x] = YMode` grid-fill over the `bh4 * bw4`
+footprint; §5.11.42 `intra_angle_info_y()` (gated on `MiSize >=
+BLOCK_8X8 && is_directional(YMode)`, reads against
+`TileAngleDeltaCdf[YMode - V_PRED]`, biased into
+`-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA = -3..=3`); the `if (HasChroma)`
+arm with `uv_mode` S() (§8.3.2 CFL-allowance branch routes through the
+new `cfl_allowed_for_uv_mode` helper: lossless + post-subsampling 4×4
+OR !lossless + Max(W,H) ≤ 32 → `TileUVModeCflAllowedCdf[YMode]`, else
+`TileUVModeCflNotAllowedCdf[YMode]`); §5.11.45 `read_cfl_alphas()`
+(gated on `UVMode == UV_CFL_PRED == 13`, reads `cfl_alpha_signs` S()
+against `TileCflSignCdf` then per-axis `cfl_alpha_{u,v}` S() against
+`TileCflAlphaCdf[ctx]` with sign-decomposition `signU =
+(signs+1)/3, signV = (signs+1)%3` and `CflAlpha{U,V} = ±(1 + raw)` per
+sign); §5.11.43 `intra_angle_info_uv()` (mirror of §5.11.42 against
+`TileAngleDeltaCdf[UVMode - V_PRED]`); §5.11.46 `palette_mode_info()`
+(outer gate `MiSize >= BLOCK_8X8 && Block_W ≤ 64 && Block_H ≤ 64 &&
+allow_screen_content_tools`, per-plane reads `has_palette_*` S() then
+on 1 reads `palette_size_*_minus_2` S() and surfaces
+`Err(PaletteEntriesUnsupported)` — the §5.11.46 `palette_colors_*[]`
+literal + delta reads need parser-scope `BitDepth` + `PaletteCache[]`
+plumbing the walker doesn't yet thread through); §5.11.24
+`filter_intra_mode_info()` (outer gate `enable_filter_intra && YMode
+== DC_PRED && PaletteSizeY == 0 && Max(Block_W, Block_H) ≤ 32`, reads
+`use_filter_intra` S() against `TileFilterIntraCdf[MiSize]` then on 1
+reads `filter_intra_mode` S() against `TileFilterIntraModeCdf`).
+
+Returns `DecodedIntraBlockModeInfo` carrying every decoded value with
+`Option<…>` fields for the spec's "not read" arms (uv_mode /
+cfl_alpha_* / angle_delta_uv / palette_size_* / use_filter_intra /
+filter_intra_mode). Two new public free functions:
+`is_directional(mode)` (§5.11.44, `V_PRED ≤ mode ≤ D67_PRED`) and
+`cfl_allowed_for_uv_mode(lossless, mi_size, sub_x, sub_y)`
+(§8.3.2 derivation). Three new public constants: `D67_PRED = 8`,
+`UV_CFL_PRED = 13`, plus one new `Error` variant
+`PaletteEntriesUnsupported`. 15 new unit tests cover the bounds
+guards, the DC_PRED all-gates-off happy path, the HasChroma-false
+short-circuit, the §5.11.42 non-directional / small-block
+short-circuits, the §5.11.46 / §5.11.24 outer-gate short-circuits,
+the §5.11.22 RefFrame invariant, the §5.11.5 grid-fill (DC and
+non-DC), the §5.11.44 truth-table, and the §8.3.2 CFL-allowance
+truth-table.
+
+The §5.11.18 `decode_inter_frame_mode_info` dispatcher still
+short-circuits at `Error::IntraBlockModeInfoUnsupported` — wiring the
+new reader into the dispatcher needs additional sequence-header
+arguments (`has_chroma`, `allow_screen_content_tools`,
+`enable_filter_intra`, `subsampling_x`, `subsampling_y`,
+`above_palette_y`, `left_palette_y`) that the §5.11.18 signature
+doesn't yet thread through. Direct callers can invoke
+`decode_intra_block_mode_info` with the missing arguments. Test count:
+587 → 602 (+15). `decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 168 lands **§5.11.17 `read_var_tx_size()`** + **§5.11.18
 `inter_frame_mode_info()`** (av1-spec p.70-71) — the two missing

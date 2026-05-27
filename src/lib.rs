@@ -1783,9 +1783,18 @@ pub enum Error {
     /// / `uv_mode` / `read_cfl_alphas` / `intra_angle_info_uv` /
     /// `palette_mode_info` / `filter_intra_mode_info`). The composite is
     /// reachable from the §5.11.18 `else` arm of `if ( is_inter )`. The
-    /// remaining sub-elements (per-block intra angle-delta and UV-mode
-    /// readers) are next-round targets; this stub fires after the
-    /// §5.11.18 prologue + `read_is_inter` settle on `is_inter == 0`.
+    /// §5.11.22 reader itself landed in r169 as
+    /// [`crate::PartitionWalker::decode_intra_block_mode_info`]; that
+    /// method takes the additional sequence-header arguments
+    /// (`has_chroma`, `allow_screen_content_tools`,
+    /// `enable_filter_intra`, `subsampling_x`, `subsampling_y`,
+    /// `above_palette_y`, `left_palette_y`) the §5.11.18 dispatcher
+    /// doesn't yet thread through. The dispatcher therefore still
+    /// short-circuits with this error; direct callers can now invoke
+    /// the §5.11.22 reader with the missing arguments. The wiring of
+    /// `decode_intra_block_mode_info` into the §5.11.18 dispatcher
+    /// lands once those scalars are added to the dispatcher's
+    /// signature.
     IntraBlockModeInfoUnsupported,
     /// The §5.11.18 [`crate::PartitionWalker::decode_inter_frame_mode_info`]
     /// walker reached the §5.11.23 `inter_block_mode_info()` call — the
@@ -1797,6 +1806,18 @@ pub enum Error {
     /// readers are next-round targets; this stub fires after the
     /// §5.11.18 prologue + `read_is_inter` settle on `is_inter == 1`.
     InterBlockModeInfoUnsupported,
+    /// The §5.11.22 [`crate::PartitionWalker::decode_intra_block_mode_info`]
+    /// reader decoded `has_palette_y == 1` or `has_palette_uv == 1` and
+    /// then needed to read the §5.11.46 palette entries themselves
+    /// (`palette_colors_y[]` / `palette_colors_uv[]` via the
+    /// `L(BitDepth)` / `L(2)` / `L(paletteBits)` literal + delta loop).
+    /// Those reads need parser-scope `BitDepth` + `PaletteCache[]`
+    /// plumbing that the §5.11.22 reader does not yet thread through —
+    /// the palette-entries arc will land alongside the §5.11.49
+    /// palette-tokens caller wiring. This stub fires after the
+    /// `palette_size_*_minus_2` `S()` read commits to the §8.3
+    /// adaptation state.
+    PaletteEntriesUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -1887,6 +1908,10 @@ impl core::fmt::Display for Error {
             Self::InterBlockModeInfoUnsupported => write!(
                 f,
                 "oxideav-av1: §5.11.18 inter_frame_mode_info reached §5.11.23 inter_block_mode_info() — MV stack / ref-frame readers pending next round"
+            ),
+            Self::PaletteEntriesUnsupported => write!(
+                f,
+                "oxideav-av1: §5.11.22 intra_block_mode_info reached §5.11.46 palette-entries L(BitDepth) / L(paletteBits) reads — palette-entries arc pending"
             ),
         }
     }
