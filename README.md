@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 202)
+## Status — 2026-05-28 (round 203)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1626,6 +1626,115 @@ the caller hooks into the §5.11.58 decode state (`lr_type`,
 `lr_wiener`, `lr_sgr_set`, `lr_sgr_xqd`), letting the driver run
 against synthetic predicates. The §5.9.20 [`LrParams`] (r10) and
 §5.11.58 per-unit reads will plug straight into these closures.
+
+Round 203 wires the **§7.11.3.1 OBMC motion-mode arm** of the
+[`predict_inter`] driver (av1-spec p.258 line 14414 + §7.11.3.9 +
+§7.11.3.10) — the r194 driver short-circuit at `motion_mode ==
+MOTION_MODE_OBMC` is retired in favour of an end-to-end dispatch that
+performs the §7.11.3.9 `overlapped_motion_compensation` mi-grid
+neighbour walk and runs the §7.11.3.10 overlap blend against each
+qualifying above-row / left-column neighbour's translational MC. The
+§7.11.3.9-10 pixel-blend leaves landed in r193 ([`overlap_blending`] /
+[`overlap_neighbour_predict_blend`] / [`get_obmc_mask`] / the five
+`OBMC_MASK_*` tables); r203 is the driver-side mi-grid walk that
+consumes them. **All four motion modes (SIMPLE / WARPED_CAUSAL /
+OBMC + compound) are now driver-side complete.**
+
+New public surface:
+
+* **[`ObmcParams<'a, 'n>`]** — caller-resolved mi-grid context:
+  * `mi_row` / `mi_col` / `mi_cols` / `mi_rows` — §5.9.5 mi-grid
+    coordinates of the current block + frame dimensions. Used for the
+    `x4 < Min(MiCols, MiCol + w4)` (above) / `y4 < Min(MiRows, MiRow
+    + h4)` (left) loop-bound per av1-spec p.275 lines 15309 / 15332.
+  * `mi_width_log2` / `mi_height_log2` — `Mi_{Width,Height}_Log2[
+    MiSize ]` driving `nLimit = Min(4, …)` (av1-spec p.275 lines
+    15308 / 15331).
+  * `avail_u` / `avail_l` — §5.11.18 availability gates for the two
+    passes (av1-spec p.275 lines 15301 / 15325).
+  * `plane_residual_size_ge_block_8x8` — the additional above-pass
+    gate `get_plane_residual_size(MiSize, plane) >= BLOCK_8X8` (av1-
+    spec p.275 line 15302). The left-pass is unconditional on this
+    per the av1-spec p.275 line 15283 carve-out ("For small blocks,
+    only the left neighbor will be used").
+  * `above_neighbours` / `left_neighbours` — ordered slices of the
+    per-axis qualifying neighbours (caller pre-filters `RefFrames[
+    candRow][candCol][0] > INTRA_FRAME` per av1-spec p.275 lines
+    15314 / 15337).
+
+* **[`ObmcNeighbour<'a>`]** — per-neighbour bundle: `bundle:
+  PredictInterRef` carries the neighbour's `Mvs[..][0]` + ref-frame
+  plane resolution; `step4: u8` is the `Clip3(2, 16,
+  Num_4x4_Blocks_{Wide,High}[ candSz ])` advance per spec lines
+  15313 / 15336. The driver iterates the slice in order, advancing
+  `x4 += step4` (above) or `y4 += step4` (left), capped at `nLimit`.
+
+The §7.11.3.9 `predict_overlap` per-candidate steps 1-8 are wired
+inside the module-private `obmc_walk_axis` helper:
+
+1. Steps 1-2 — `mv` and `refIdx` are pre-resolved into the neighbour
+   `PredictInterRef`.
+2. Steps 3-4 — `predX = (x4 * 4) >> subX` / `predY = (y4 * 4) >>
+   subY` derive the plane-coordinate top-left of the overlap region.
+3. Steps 5-6 — `predict_inter_per_ref` runs `motion_vector_scaling`
+   + `block_inter_prediction` against `predW × predH` (per-pass per
+   spec lines 15316-15317 / 15339-15340).
+4. Step 7 — `clip1_single_ref` on the i32 prediction.
+5. Step 8 — `overlap_neighbour_predict_blend` blends the neighbour
+   prediction into the per-block `pred_out` buffer (treated as a
+   `(h, w)` window of `CurrFrame[plane]` with origin at the block's
+   plane coords `(x, y)`).
+
+[`predict_inter`]'s signature gains a trailing `obmc:
+Option<&ObmcParams<'_, '_>>` argument before `pred_out`. A caller
+that passes `obmc = None` runs the prior translational / compound /
+warp paths unchanged (the OBMC post-step is gated on `motion_mode
+== MOTION_MODE_OBMC` only). A caller that sets `motion_mode ==
+MOTION_MODE_OBMC` without supplying `ObmcParams` returns
+`Error::PartitionWalkOutOfRange` (caller bug). The
+`Error::PredictInterObmcUnsupported` variant is removed (no longer
+reachable). With r203 every motion-mode arm of [`predict_inter`] is
+driver-side complete.
+
+Test count: 1033 → 1041 (+8 in lib). New `inter_pred::tests`:
+
+* **`r203_predict_inter_obmc_no_neighbours_matches_simple`** — pins
+  the empty-list base case: `AvailU == AvailL == true` with empty
+  `above_neighbours` and `left_neighbours` lists yields the SIMPLE
+  translational baseline byte-for-byte (no blend invocations).
+* **`r203_predict_inter_obmc_unavailable_neighbours_noops`** — pins
+  the §5.11.18 outer-gate behaviour: `avail_u = avail_l = false`
+  short-circuits both passes even when neighbour slices are
+  populated.
+* **`r203_predict_inter_obmc_identical_above_neighbour_idempotent`** —
+  exercises the above-pass with one identical neighbour (same ref +
+  same MV); the §7.11.3.10 identity `Round2(64 * curr, 6) = curr`
+  pins that the blend wiring is correct without depending on a
+  specific reference-sample trace.
+* **`r203_predict_inter_obmc_identical_left_neighbour_idempotent`** —
+  same identity property for the left-pass (which uses `mask[j]`
+  rather than `mask[i]` per av1-spec p.278 lines 15442-15446).
+* **`r203_predict_inter_obmc_above_modifies_top_half_only`** — pins
+  the above-pass extent: with `predH = h >> 1 = 4` for an 8×8 block
+  and a non-zero neighbour MV, rows 4..8 must equal the SIMPLE
+  baseline byte-for-byte while at least one cell in rows 0..4 must
+  differ.
+* **`r203_predict_inter_obmc_above_gated_by_plane_residual_size`** —
+  pins the `get_plane_residual_size(MiSize, plane) >= BLOCK_8X8`
+  above-pass-only gate (av1-spec p.275 line 15302).
+* **`r203_predict_inter_obmc_n_limit_caps_above_walk`** — pins the
+  `nLimit = Min(4, Mi_Width_Log2[ MiSize ])` cap: a 4-wide block
+  with `mi_width_log2 = 0` yields `nLimit = 0` and the walk skips
+  the neighbour even when supplied.
+* **`r203_predict_inter_obmc_multi_above_neighbours_walk_correctly`**
+  — exercises the multi-neighbour `x4 += step4` advance with two
+  ordered `step4 = 2` neighbours on a 16-wide block (`nLimit = 2`).
+
+Followup candidates (next arcs): §9.5.3 Quantizer matrix; §7.10.2.5
+/ §7.10.2.6 temporal-MV scan; §5.11.34 transform-coefficient residual
+parser; encoder.
+
+The prior r202 round notes (preserved verbatim for traceability):
 
 Round 202 wires the **§7.11.3.1 WARPED_CAUSAL motion-mode arm** of the
 [`predict_inter`] driver (av1-spec p.257-258 lines 14308-14370) — the

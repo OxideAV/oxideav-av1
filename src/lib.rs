@@ -1780,11 +1780,13 @@ pub use transform::{
 // translational fallback per av1-spec p.257 lines 14308-14349, and the
 // step-12 per-8×8 `block_warp` loop is driven from
 // [`inter_pred::predict_inter`] through the new
-// [`inter_pred::WarpDriverParams`] arg. The OBMC arm still
-// short-circuits to [`Error::PredictInterObmcUnsupported`] pending
-// driver-side wiring of the §7.11.3.9 mi-grid neighbour walk (the
-// per-pair overlap-blend leaves themselves landed in r193). The
-// next-arc target is wiring the OBMC arm into the driver.
+// [`inter_pred::WarpDriverParams`] arg. r203 wires the OBMC arm into
+// the same driver: the §7.11.3.9 above-row + left-column mi-grid
+// neighbour walk + per-candidate §7.11.3.10 overlap blend run inside
+// [`inter_pred::predict_inter`]'s post-step on `motion_mode == OBMC`
+// against the caller-resolved [`inter_pred::ObmcParams`] context.
+// All four motion modes (SIMPLE / WARPED_CAUSAL / OBMC + compound)
+// are now driver-side complete.
 pub use cdef::{
     cdef_block, cdef_direction, cdef_filter_block, cdef_frame, constrain, CdefFrameContext,
     CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, DIV_TABLE,
@@ -2270,15 +2272,6 @@ pub enum Error {
     /// `ZeroMvContext` based on whether the temporal MV diverges
     /// from `GlobalMvs[..]` by more than 16 1/8-luma-sample units.
     TemporalMvScanUnsupported,
-    /// The §7.11.3.1 [`crate::inter_pred::predict_inter`] driver was
-    /// invoked with `motion_mode == MOTION_MODE_OBMC`. The §7.11.3.9
-    /// / §7.11.3.10 OBMC overlap-blending leaves are landed (r193) via
-    /// [`crate::inter_pred::overlap_blending`] /
-    /// [`crate::inter_pred::overlap_neighbour_predict_blend`] /
-    /// [`crate::inter_pred::get_obmc_mask`], but the per-block
-    /// `overlapped_motion_compensation` mi-grid neighbour walk is a
-    /// next-arc target. Translational SIMPLE blocks land in r194.
-    PredictInterObmcUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -2413,10 +2406,6 @@ impl core::fmt::Display for Error {
             Self::TemporalMvScanUnsupported => write!(
                 f,
                 "oxideav-av1: §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample reached — MotionFieldMvs[ref][y8][x8] grid + §7.9 motion_field_estimation pending next arc; only use_ref_frame_mvs == false is currently supported"
-            ),
-            Self::PredictInterObmcUnsupported => write!(
-                f,
-                "oxideav-av1: §7.11.3.1 predict_inter driver reached motion_mode == OBMC — the §7.11.3.9-10 overlapped_motion_compensation mi-grid neighbour walk is a next-arc target (the per-pair overlap-blend leaves landed in r193)"
             ),
         }
     }

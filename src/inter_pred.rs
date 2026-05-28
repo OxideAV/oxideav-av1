@@ -901,8 +901,12 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
 //   [`crate::PartitionWalker::curr_frame`]). The compound arm writes
 //   into the same `pred_out` buffer with the §7.11.3.11-15 combined
 //   output.
-// * §7.11.3.1 post-step `motion_mode == OBMC` — short-circuits at
-//   `Error::PredictInterObmcUnsupported`.
+// * §7.11.3.1 post-step `motion_mode == OBMC` — runs the §7.11.3.9
+//   `overlapped_motion_compensation` mi-grid walk (above-pass +
+//   left-pass) against the caller-supplied [`ObmcParams`] context,
+//   blending each qualifying neighbour's translational MC into the
+//   in-place `pred_out` buffer via §7.11.3.10
+//   [`overlap_neighbour_predict_blend`].
 
 /// §7.11.3.1 per-`refList` MV / ref descriptor (av1-spec p.257
 /// step 5-10): the per-list inputs the driver consumes once for
@@ -1035,12 +1039,14 @@ pub enum CompoundParams<'a> {
 ///     spec line 14386-14393's `plane == 0` guard, with the per-plane
 ///     downsampling handled inside `mask_blend` via `(sub_x, sub_y)`).
 ///
-/// ## Stubbed arms (each surfaces a dedicated [`crate::Error`])
+/// ## Stubbed arms
 ///
-/// * Steps 2,3,6,7,12 `motion_mode == MOTION_MODE_WARPED_CAUSAL` /
-///   `useWarp != 0`  → [`crate::Error::PredictInterWarpUnsupported`].
-/// * Post-step `motion_mode == MOTION_MODE_OBMC`  →
-///   [`crate::Error::PredictInterObmcUnsupported`].
+/// Post-r203 every motion mode (SIMPLE, WARPED_CAUSAL, OBMC, plus
+/// compound) has driver-side wiring. The remaining caller-bug
+/// guards surface [`crate::Error::PartitionWalkOutOfRange`] when a
+/// caller signals a motion mode without supplying its required
+/// context bundle (WARPED_CAUSAL without `WarpDriverParams`, OBMC
+/// without `ObmcParams`).
 ///
 /// ## Arguments
 ///
@@ -1079,15 +1085,14 @@ pub enum CompoundParams<'a> {
 ///
 /// ## Returns
 ///
-/// `Ok(())` on the supported arms. Returns
-/// `Error::PredictInterWarpUnsupported` /
-/// `Error::PredictInterObmcUnsupported` per the stub-arm table
-/// above. Returns `Error::PartitionWalkOutOfRange` for caller-bug
-/// arguments: `plane > 2`, `subsampling_{x,y} > 1`, `bit_depth ∉
-/// {8, 10, 12}`, `frame_{width,height} == 0`, `w == 0 || h == 0 ||
-/// w > 256 || h > 256`, `refs.is_empty()`, `refs.len() < 2` on the
-/// compound path, missing/spurious `compound` argument, `pred_out.len()
-/// < w * h`, or any sub-condition the `motion_vector_scaling` /
+/// `Ok(())` on success (all four motion modes wired post-r203).
+/// Returns `Error::PartitionWalkOutOfRange` for caller-bug arguments:
+/// `plane > 2`, `subsampling_{x,y} > 1`, `bit_depth ∉ {8, 10, 12}`,
+/// `frame_{width,height} == 0`, `w == 0 || h == 0 || w > 256 ||
+/// h > 256`, `refs.is_empty()`, `refs.len() < 2` on the compound
+/// path, missing/spurious `compound` argument, `pred_out.len() <
+/// w * h`, missing `warp` on the WARPED_CAUSAL arm, missing `obmc`
+/// on the OBMC arm, or any sub-condition the `motion_vector_scaling` /
 /// `block_inter_prediction` / `clip1_single_ref` / `mask_blend` /
 /// `compound_distance_blend` leaves reject.
 /// §7.11.3.1 step 5-13 per-`refList` body (av1-spec p.257 lines
@@ -1304,6 +1309,114 @@ pub struct WarpDriverParams {
     /// on intra frames or when explicitly signalled per av1-spec
     /// §5.9.5.)
     pub force_integer_mv: bool,
+}
+
+/// §7.11.3.9 `predict_overlap` per-neighbour candidate (av1-spec p.275
+/// lines 15301-15346 + p.276 lines 15349-15376) — one qualifying mi-grid
+/// neighbour the OBMC post-step blends into the current block's
+/// prediction. The caller pre-resolves the spec's `RefFrames[candRow]
+/// [candCol][0] > INTRA_FRAME` gate, the `Mvs[candRow][candCol][0]`
+/// motion vector, and the `ref_frame_idx[..]` → ref-frame buffer
+/// indirection into a single self-contained bundle so the driver can
+/// run §7.11.3.9 steps 1-8 without re-entering the §7 mi-grid state
+/// (which is only partially modelled in `oxideav-av1`).
+///
+/// The driver still owns the §7.11.3.9 outer `(x4, y4, step4, nLimit)`
+/// iteration — the caller supplies the *ordered* sequence of
+/// qualifying neighbours along one axis (above-row or left-col) and
+/// their `step4` advances. The driver consumes them in order, capped
+/// at `nLimit = Min(4, Mi_{Width,Height}_Log2[MiSize])` per the spec.
+///
+/// `step4 = Clip3( 2, 16, Num_4x4_Blocks_{Wide,High}[ candSz ] )` per
+/// av1-spec p.275 line 15313 / 15336. The caller is responsible for
+/// the Clip3.
+#[derive(Debug, Clone, Copy)]
+pub struct ObmcNeighbour<'a> {
+    /// §7.11.3.9 step 5 `refIdx` → spec `RefFrames[candRow][candCol]
+    /// [0]` resolved into a ref-frame plane bundle. The bundle's
+    /// `ref_plane` / `ref_stride` / `ref_upscaled_width` / `ref_width`
+    /// / `ref_height` fields match the same `(plane, subsampling_*)`
+    /// the §7.11.3.1 driver was invoked with (the caller does the
+    /// per-plane resolution).
+    ///
+    /// The `mv` field carries `Mvs[candRow][candCol][0]` per av1-spec
+    /// p.276 line 15359.
+    pub bundle: PredictInterRef<'a>,
+    /// `step4 = Clip3( 2, 16, Num_4x4_Blocks_{Wide,High}[ candSz ] )`
+    /// per av1-spec p.275 lines 15313 / 15336 — how many 4×4 mi cells
+    /// this neighbour spans along the walk axis. The driver advances
+    /// `x4 += step4` (above-pass) or `y4 += step4` (left-pass) after
+    /// consuming the neighbour.
+    pub step4: u8,
+}
+
+/// §7.11.3.9 OBMC mi-grid context — caller-resolved neighbour lists
+/// and the `(MiRow, MiCol, MiSize, AvailU, AvailL)` block context the
+/// outer `(x4, y4)` walk needs.
+///
+/// The driver consumes this whenever `motion_mode == MOTION_MODE_OBMC`
+/// (av1-spec p.258 line 14414). On `motion_mode != MOTION_MODE_OBMC`
+/// the param is ignored (the caller may pass `None`). On
+/// `motion_mode == MOTION_MODE_OBMC` the param **must** be `Some(_)`
+/// (the driver returns `Error::PartitionWalkOutOfRange` otherwise —
+/// caller bug).
+///
+/// ## Field semantics
+///
+/// * `mi_row` / `mi_col` / `mi_cols` / `mi_rows` — §5.9.5 mi-grid
+///   coordinates of the current block + frame dimensions. Used for the
+///   `x4 < Min(MiCols, MiCol + w4)` / `y4 < Min(MiRows, MiRow + h4)`
+///   loop bound (av1-spec p.275 lines 15309 / 15332).
+/// * `mi_width_log2` / `mi_height_log2` — `Mi_Width_Log2[ MiSize ]` /
+///   `Mi_Height_Log2[ MiSize ]`. Used for `nLimit = Min(4, …)` per
+///   av1-spec p.275 lines 15308 / 15331.
+/// * `avail_u` / `avail_l` — §5.11.18 `AvailU` / `AvailL` for the
+///   current block. The above-pass is gated by `avail_u`, the
+///   left-pass by `avail_l` (av1-spec p.275 lines 15301 / 15325).
+/// * `plane_residual_size_ge_block_8x8` — `get_plane_residual_size(
+///   MiSize, plane ) >= BLOCK_8X8` (av1-spec p.275 line 15302). The
+///   above-pass is additionally gated by this; the left-pass is
+///   gated by the spec's "small block" carve-out (line 15283: "For
+///   small blocks, only the left neighbor will be used"). The left
+///   pass therefore runs whenever `avail_l == true` regardless.
+/// * `above_neighbours` / `left_neighbours` — ordered slices of the
+///   per-axis qualifying neighbour candidates (already-filtered for
+///   the §7.11.3.9 `RefFrames[..][0] > INTRA_FRAME` gate). Empty
+///   slice = no qualifying neighbour on that axis = no overlap blend
+///   contribution.
+#[derive(Debug, Clone, Copy)]
+pub struct ObmcParams<'a, 'n> {
+    /// §5.9.5 `MiRow` of the current block (luma mi-grid).
+    pub mi_row: u32,
+    /// §5.9.5 `MiCol` of the current block (luma mi-grid).
+    pub mi_col: u32,
+    /// §5.9.5 `MiCols` of the current frame.
+    pub mi_cols: u32,
+    /// §5.9.5 `MiRows` of the current frame.
+    pub mi_rows: u32,
+    /// §3 `Mi_Width_Log2[ MiSize ]` of the current block.
+    pub mi_width_log2: u8,
+    /// §3 `Mi_Height_Log2[ MiSize ]` of the current block.
+    pub mi_height_log2: u8,
+    /// §5.11.18 `AvailU` for the current block.
+    pub avail_u: bool,
+    /// §5.11.18 `AvailL` for the current block.
+    pub avail_l: bool,
+    /// §7.11.3.9 above-pass gate: `get_plane_residual_size( MiSize,
+    /// plane ) >= BLOCK_8X8` (av1-spec p.275 line 15302). The
+    /// left-pass is unconditional on this per the "small blocks → left
+    /// neighbour only" carve-out (av1-spec p.275 line 15283).
+    pub plane_residual_size_ge_block_8x8: bool,
+    /// §7.11.3.9 above-pass qualifying neighbour list (ordered along
+    /// `x4` ascending). Each entry's `step4` is the `Clip3(2, 16,
+    /// Num_4x4_Blocks_Wide[ candSz ])` advance for the slot it
+    /// occupies.
+    pub above_neighbours: &'n [ObmcNeighbour<'a>],
+    /// §7.11.3.9 left-pass qualifying neighbour list (ordered along
+    /// `y4` ascending). Each entry's `step4` is the `Clip3(2, 16,
+    /// Num_4x4_Blocks_High[ candSz ])` advance for the slot it
+    /// occupies.
+    pub left_neighbours: &'n [ObmcNeighbour<'a>],
 }
 
 /// §7.11.3.1 step-7 output: which `block_warp` matrix to apply for
@@ -1570,6 +1683,237 @@ fn predict_inter_one_ref(
     }
 }
 
+/// §7.11.3.9 OBMC mi-grid neighbour walk + per-candidate
+/// `predict_overlap` (av1-spec p.275-276) — single-axis driver shared
+/// between the above-pass (`pass = OverlapPass::Above`) and the
+/// left-pass (`pass = OverlapPass::Left`).
+///
+/// Iterates the caller-supplied ordered neighbour list, tracks the
+/// `x4` (above) or `y4` (left) advance per spec line 15321 / 15344,
+/// honours the `nCount < nLimit && x4 < Min(MiCols, MiCol + w4)`
+/// (above) or `nCount < nLimit && y4 < Min(MiRows, MiRow + h4)`
+/// (left) loop condition (av1-spec p.275 lines 15309 / 15332), and
+/// runs §7.11.3.9 steps 1-8 for each qualifying neighbour:
+///
+/// * Steps 1, 2 — `mv` and `refIdx` are pre-resolved into the
+///   neighbour's `PredictInterRef` bundle by the caller.
+/// * Steps 3, 4 — `predX = (x4 * 4) >> subX`, `predY = (y4 * 4) >>
+///   subY` (the §7.11.3.9 plane-relative coordinates).
+/// * Steps 5, 6 — `motion_vector_scaling` + `block_inter_prediction`
+///   are run via [`predict_inter_per_ref`] for the neighbour MV
+///   against `predW × predH`.
+/// * Step 7 — `clip1_single_ref` on the i32 prediction → u16 obmc_pred.
+/// * Step 8 — `overlap_neighbour_predict_blend` against the in-place
+///   `pred_out` buffer at the buffer-relative coordinates
+///   `(predX - x_block_plane, predY - y_block_plane)`.
+///
+/// `pred_w_for_neighbour` / `pred_h_for_neighbour` encode the
+/// pass-specific `predW` / `predH` derivation:
+///
+/// * Above-pass (av1-spec p.275 lines 15316-15317):
+///   * `predW = Min(w, (step4 * MI_SIZE) >> subX)`.
+///   * `predH = Min(h >> 1, 32 >> subY)`.
+///   * `mask_length = predH`.
+/// * Left-pass (av1-spec p.275 lines 15339-15340):
+///   * `predW = Min(w >> 1, 32 >> subX)`.
+///   * `predH = Min(h, (step4 * MI_SIZE) >> subY)`.
+///   * `mask_length = predW`.
+///
+/// The walker passes `pred_out` as a `(h, w)` buffer with stride `w`
+/// — i.e. exactly the per-block buffer `predict_inter` was given.
+/// Pred-region coordinates are translated from plane-absolute
+/// (`x_block_plane = (MiCol * MI_SIZE) >> subX`, similarly for y) to
+/// buffer-relative before the §7.11.3.10 blend.
+#[allow(clippy::too_many_arguments)]
+fn obmc_walk_axis(
+    pass: OverlapPass,
+    plane: u8,
+    block_x_plane: i32,
+    block_y_plane: i32,
+    block_w: usize,
+    block_h: usize,
+    mi_row: u32,
+    mi_col: u32,
+    mi_cols: u32,
+    mi_rows: u32,
+    mi_width_log2: u8,
+    mi_height_log2: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    inter_round0: u32,
+    inter_round1: u32,
+    bit_depth: u8,
+    neighbours: &[ObmcNeighbour<'_>],
+    pred_out: &mut [u16],
+) -> Result<(), crate::Error> {
+    let mi_size: u32 = crate::cdf::MI_SIZE as u32;
+    let sub_x = subsampling_x as u32;
+    let sub_y = subsampling_y as u32;
+
+    // §7.11.3.9 outer-loop bounds:
+    //
+    //   Above-pass:  w4 = Num_4x4_Blocks_Wide[ MiSize ];
+    //                nLimit = Min(4, Mi_Width_Log2[ MiSize ]);
+    //                x4 walks MiCol → Min(MiCols, MiCol + w4).
+    //   Left-pass:   h4 = Num_4x4_Blocks_High[ MiSize ];
+    //                nLimit = Min(4, Mi_Height_Log2[ MiSize ]);
+    //                y4 walks MiRow → Min(MiRows, MiRow + h4).
+    //
+    // `Num_4x4_Blocks_{Wide,High}[ MiSize ]` = `1 << Mi_{Width,
+    // Height}_Log2[ MiSize ]` per §3 (av1-spec p.20).
+    let (axis_limit_log2, frame_limit, axis_start, axis_block_extent) = match pass {
+        OverlapPass::Above => {
+            let w4 = 1u32 << (mi_width_log2 as u32);
+            (
+                mi_width_log2,
+                mi_cols.min(mi_col.saturating_add(w4)),
+                mi_col,
+                w4,
+            )
+        }
+        OverlapPass::Left => {
+            let h4 = 1u32 << (mi_height_log2 as u32);
+            (
+                mi_height_log2,
+                mi_rows.min(mi_row.saturating_add(h4)),
+                mi_row,
+                h4,
+            )
+        }
+    };
+    let _ = axis_block_extent;
+    let n_limit: u32 = 4.min(axis_limit_log2 as u32);
+
+    let mut n_count: u32 = 0;
+    let mut axis_pos: u32 = axis_start;
+    let mut neighbour_iter = neighbours.iter();
+
+    while n_count < n_limit && axis_pos < frame_limit {
+        let Some(cand) = neighbour_iter.next() else {
+            // The caller supplied fewer qualifying neighbours than
+            // the loop would visit; the spec's `if (RefFrames[..][0] >
+            // INTRA_FRAME)` gate would have skipped the missing
+            // slots. We treat exhausting the list as "no more
+            // qualifying candidates on this axis" and stop.
+            break;
+        };
+        // §7.11.3.9 step4 = Clip3(2, 16, Num_4x4_Blocks_{Wide,High}[
+        // candSz]). The caller already applied the Clip3.
+        let step4: u32 = cand.step4 as u32;
+        if !(2..=16).contains(&step4) {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // The spec increments `nCount` only for the qualifying
+        // branch (`RefFrames[..][0] > INTRA_FRAME`); we honour that
+        // by counting only neighbours the caller surfaces (they
+        // pre-filter the gate).
+        n_count = n_count.saturating_add(1);
+
+        // §7.11.3.9 step 3 / 4 — predX, predY in plane coordinates.
+        let (pred_x_plane, pred_y_plane): (u32, u32) = match pass {
+            OverlapPass::Above => {
+                let px = (axis_pos.saturating_mul(4)) >> sub_x;
+                let py = (mi_row.saturating_mul(4)) >> sub_y;
+                (px, py)
+            }
+            OverlapPass::Left => {
+                let px = (mi_col.saturating_mul(4)) >> sub_x;
+                let py = (axis_pos.saturating_mul(4)) >> sub_y;
+                (px, py)
+            }
+        };
+
+        // av1-spec p.275 lines 15316-15317 (Above) / 15339-15340 (Left).
+        let (pred_w, pred_h, mask_length) = match pass {
+            OverlapPass::Above => {
+                let pw = block_w.min(((step4 * mi_size) >> sub_x) as usize);
+                let ph = (block_h >> 1).min((32u32 >> sub_y) as usize);
+                (pw, ph, ph)
+            }
+            OverlapPass::Left => {
+                let pw = (block_w >> 1).min((32u32 >> sub_x) as usize);
+                let ph = block_h.min(((step4 * mi_size) >> sub_y) as usize);
+                (pw, ph, pw)
+            }
+        };
+
+        // Buffer-relative offsets. `block_x_plane` / `block_y_plane`
+        // are the prediction region top-left in plane coords (= `(x,
+        // y)` the §7.11.3.1 driver was invoked with). The neighbour's
+        // overlap region must land entirely inside the (block_w,
+        // block_h) buffer — if it doesn't (caller-bug: wrong MiRow /
+        // MiCol vs. (x, y), or a step4 that pushes past the block
+        // edge), clamp pred_w/pred_h to what fits and skip if there's
+        // no overlap left.
+        if pred_w == 0 || pred_h == 0 {
+            axis_pos = axis_pos.saturating_add(step4);
+            continue;
+        }
+        let off_x = (pred_x_plane as i64) - (block_x_plane as i64);
+        let off_y = (pred_y_plane as i64) - (block_y_plane as i64);
+        if off_x < 0 || off_y < 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let off_x = off_x as usize;
+        let off_y = off_y as usize;
+        if off_x >= block_w || off_y >= block_h {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let fit_w = pred_w.min(block_w - off_x);
+        let fit_h = pred_h.min(block_h - off_y);
+        if fit_w == 0 || fit_h == 0 {
+            axis_pos = axis_pos.saturating_add(step4);
+            continue;
+        }
+
+        // §7.11.3.9 steps 5/6 — run the translational MC kernel for
+        // the neighbour MV / refIdx at this `(predX, predY)` against
+        // a `pred_w × pred_h` (fitted) region.
+        let obmc_pred_i32 = predict_inter_per_ref(
+            &cand.bundle,
+            plane,
+            pred_x_plane as i32,
+            pred_y_plane as i32,
+            fit_w,
+            fit_h,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            interp_filter_x,
+            interp_filter_y,
+            inter_round0,
+            inter_round1,
+        )?;
+
+        // §7.11.3.9 step 7 — Clip1 on the i32 prediction.
+        let mut obmc_pred_u16 = vec![0u16; fit_w * fit_h];
+        clip1_single_ref(bit_depth, &obmc_pred_i32, &mut obmc_pred_u16)?;
+
+        // §7.11.3.9 step 8 — overlap blend against the per-block
+        // buffer treated as a `(block_h, block_w)` plane window.
+        overlap_neighbour_predict_blend(
+            pred_out,
+            /* curr_stride */ block_w,
+            /* pred_x */ off_x,
+            /* pred_y */ off_y,
+            fit_w,
+            fit_h,
+            pass,
+            &obmc_pred_u16,
+            /* obmc_stride */ fit_w,
+            mask_length,
+        )?;
+
+        axis_pos = axis_pos.saturating_add(step4);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn predict_inter(
     plane: u8,
@@ -1590,6 +1934,7 @@ pub fn predict_inter(
     refs: &[PredictInterRef<'_>],
     compound: Option<CompoundParams<'_>>,
     warp: Option<&WarpDriverParams>,
+    obmc: Option<&ObmcParams<'_, '_>>,
     pred_out: &mut [u16],
 ) -> Result<(), crate::Error> {
     // ---------- caller-bug guards ----------
@@ -1648,6 +1993,17 @@ pub fn predict_inter(
     // sets `motion_mode == MOTION_MODE_WARPED_CAUSAL` (= spec
     // LOCALWARP) but supplies `warp = None` is a caller bug.
     if motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL && warp.is_none() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.1 post-step — OBMC caller-bug guard ------
+    //
+    // av1-spec p.258 line 14414 invokes §7.11.3.9 (overlapped motion
+    // compensation) only on `motion_mode == OBMC`. The neighbour
+    // mi-grid walk needs `ObmcParams` (above/left neighbour lists +
+    // MiRow/MiCol context); a caller that signals OBMC without
+    // supplying the bundle is a caller bug.
+    if motion_mode == crate::cdf::MOTION_MODE_OBMC && obmc.is_none() {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
@@ -1770,23 +2126,94 @@ pub fn predict_inter(
         clip1_single_ref(bit_depth, &pred0, pred_out)?;
     }
 
-    // ---------- §7.11.3.1 post-step — OBMC short-circuit --------
+    // ---------- §7.11.3.1 post-step — OBMC overlap blend ---------
     //
     // av1-spec p.258 line 14414: "If motion_mode is equal to OBMC,
     // the overlapped motion compensation in section 7.11.3.9 is
-    // invoked with plane, w, h as inputs." The §7.11.3.9-10 per-pair
-    // overlap-blend leaves landed in r193 but the mi-grid neighbour
-    // walk is a next-arc target.
+    // invoked with plane, w, h as inputs."
     //
-    // Surfacing this *after* the translational prediction has been
-    // written into `pred_out` matches the spec ordering — the
-    // overlap blend runs on top of the already-written current
-    // prediction. A caller that wants the un-blended translational
-    // prediction can ignore the error and consume `pred_out` as-is;
-    // however, conformance requires the blend, so reporting the
-    // stub here is what walker integration will key on.
+    // The blend runs *after* the translational MC has already been
+    // written into `pred_out` — the §7.11.3.10 kernel modifies
+    // `CurrFrame[plane][predY + i][predX + j]` in place. We treat
+    // the per-block `pred_out` buffer as a `(h, w)` window of
+    // `CurrFrame[plane]` with origin at plane coords `(x, y)`; the
+    // §7.11.3.9 outer walk produces plane-absolute `(predX, predY)`
+    // coordinates we translate to buffer-relative inside
+    // [`obmc_walk_axis`].
+    //
+    // Above-pass first (gated by `AvailU &&
+    // get_plane_residual_size(MiSize, plane) >= BLOCK_8X8`), then
+    // left-pass (gated by `AvailL` only — the spec carves out small
+    // blocks so that only the left neighbour is used per av1-spec
+    // p.275 line 15283).
     if motion_mode == crate::cdf::MOTION_MODE_OBMC {
-        return Err(crate::Error::PredictInterObmcUnsupported);
+        // SAFETY: the OBMC caller-bug guard above returned
+        // `PartitionWalkOutOfRange` if `obmc.is_none()`, so this
+        // unwrap cannot panic.
+        let op = obmc.expect("OBMC requires ObmcParams (guarded above)");
+
+        // av1-spec p.275 line 15301: `if (AvailU)` outer gate +
+        // line 15302: `if (get_plane_residual_size(MiSize, plane) >=
+        // BLOCK_8X8)` inner gate for the above-pass.
+        if op.avail_u && op.plane_residual_size_ge_block_8x8 {
+            obmc_walk_axis(
+                OverlapPass::Above,
+                plane,
+                x,
+                y,
+                w,
+                h,
+                op.mi_row,
+                op.mi_col,
+                op.mi_cols,
+                op.mi_rows,
+                op.mi_width_log2,
+                op.mi_height_log2,
+                subsampling_x,
+                subsampling_y,
+                frame_width,
+                frame_height,
+                interp_filter_x,
+                interp_filter_y,
+                rv.inter_round0,
+                rv.inter_round1,
+                bit_depth,
+                op.above_neighbours,
+                pred_out,
+            )?;
+        }
+        // av1-spec p.275 line 15325: `if (AvailL)` outer gate for the
+        // left-pass. Unlike the above-pass there is no
+        // `get_plane_residual_size >= BLOCK_8X8` gate — the spec's
+        // line 15283 carve-out ("For small blocks, only the left
+        // neighbor will be used") is precisely the asymmetry.
+        if op.avail_l {
+            obmc_walk_axis(
+                OverlapPass::Left,
+                plane,
+                x,
+                y,
+                w,
+                h,
+                op.mi_row,
+                op.mi_col,
+                op.mi_cols,
+                op.mi_rows,
+                op.mi_width_log2,
+                op.mi_height_log2,
+                subsampling_x,
+                subsampling_y,
+                frame_width,
+                frame_height,
+                interp_filter_x,
+                interp_filter_y,
+                rv.inter_round0,
+                rv.inter_round1,
+                bit_depth,
+                op.left_neighbours,
+                pred_out,
+            )?;
+        }
     }
 
     Ok(())
@@ -3713,13 +4140,13 @@ pub fn block_warp(
 // The §7.11.3.9 outer driver (which iterates `x4 += step4` along the
 // top row + `y4 += step4` down the left column, capped at
 // `nLimit = Min(4, Mi_{Width,Height}_Log2[ MiSize ])`, and chooses
-// `predW`/`predH` per `(MiSize, plane)`) is *NOT* wired here: that
-// loop needs the partially-implemented MiSizes / RefFrames / Mvs / mi
-// grid state (§5.11.x mi tracking is partial at r193), and is part of
-// the §7.11.3.1 driver wiring deferred to the next arc. Once the
-// outer driver lands, it consumes `overlap_neighbour_predict_blend`
-// once per qualifying neighbour with the `block_inter_prediction`
-// output for the neighbour's MV.
+// `predW`/`predH` per `(MiSize, plane)`) is wired in r203 inside
+// [`predict_inter`]'s OBMC post-step arm via the [`obmc_walk_axis`]
+// per-axis helper. The walker consumes a caller-resolved
+// [`ObmcParams`] context (above/left ordered neighbour lists +
+// MiRow/MiCol/MiSize block context + AvailU/AvailL gates) so the
+// driver does not have to re-enter the §5.11.x mi-grid state that
+// is only partially modelled in `oxideav-av1`.
 
 /// `Obmc_Mask_2[2]` — the 2-tap OBMC blending weight table for an
 /// overlap extent of 2 samples (av1-spec p.277 line 15406). The
@@ -3963,8 +4390,9 @@ pub fn overlap_blending(
 ///         `mask_length = predW`.
 ///
 /// The §7.11.3.9 outer mi-grid walk + the per-candidate step 1-7
-/// translational MC are deferred to the §7.11.3.1 driver wiring (next
-/// arc).
+/// translational MC are driven from [`predict_inter`]'s OBMC post-
+/// step arm via the module-private `obmc_walk_axis` helper (r203);
+/// see [`ObmcParams`] for the caller-resolved context bundle.
 ///
 /// ## Arguments
 ///
@@ -5878,6 +6306,7 @@ mod tests {
             &refs,
             /* compound */ None,
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("predict_inter SIMPLE single-ref translational path");
@@ -5930,19 +6359,21 @@ mod tests {
         );
     }
 
-    /// §7.11.3.1 stub-arm matrix (post-r202) — the WARP arm now
-    /// dispatches via `WarpDriverParams` (see `r202_predict_inter_*`);
-    /// only the OBMC post-step arm still short-circuits to its
-    /// dedicated [`crate::Error`] variant. The r194
-    /// `PredictInterCompoundUnsupported` arm was retired in r201 and
-    /// the r194 `PredictInterWarpUnsupported` arm is retired in r202.
+    /// §7.11.3.1 caller-bug matrix (post-r203) — all four motion
+    /// modes now have driver-side wiring; what remain are the
+    /// caller-bug guards that surface `PartitionWalkOutOfRange` when
+    /// the caller signals a motion mode without supplying its
+    /// required context bundle:
     ///
-    /// This test additionally pins the r202 caller-bug guard:
-    /// `motion_mode == WARPED_CAUSAL` without a `WarpDriverParams`
-    /// supplied returns `PartitionWalkOutOfRange` (the per-block
-    /// useWarp derivation needs at least `local_warp_params` /
-    /// `local_valid` to decide whether to route to LOCALWARP or fall
-    /// back to translational).
+    /// * `motion_mode == WARPED_CAUSAL` without `WarpDriverParams` ⇒
+    ///   `PartitionWalkOutOfRange` (r202 guard).
+    /// * `motion_mode == OBMC` without `ObmcParams` ⇒
+    ///   `PartitionWalkOutOfRange` (r203 guard — replaces the prior
+    ///   `PredictInterObmcUnsupported` stub).
+    ///
+    /// The r194 `PredictInterCompoundUnsupported` / r194
+    /// `PredictInterWarpUnsupported` / r194 `PredictInterObmcUnsupported`
+    /// stub arms are all retired (r201 / r202 / r203 respectively).
     #[test]
     fn r194_predict_inter_stub_arms_each_surface_dedicated_error() {
         let ref_w: usize = 16;
@@ -5980,16 +6411,18 @@ mod tests {
             &refs,
             None,
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out_8x8,
         )
         .unwrap_err();
         assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
 
-        // motion_mode == OBMC ⇒ PredictInterObmcUnsupported.
-        // The translational prediction runs to completion first
-        // (per av1-spec p.258 line 14414's "post-step" ordering);
-        // the OBMC stub fires after the prediction has been
-        // written to `pred_out`.
+        // r203 caller-bug guard: motion_mode == OBMC without
+        // `ObmcParams` ⇒ PartitionWalkOutOfRange. The §7.11.3.9
+        // mi-grid walk needs MiRow/MiCol/MiSize + the AvailU/AvailL
+        // gates + the above/left qualifying neighbour lists; a
+        // caller that signals OBMC without surfacing that context
+        // is a caller bug.
         let e = predict_inter(
             0,
             0,
@@ -6009,10 +6442,11 @@ mod tests {
             &refs,
             None,
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .unwrap_err();
-        assert_eq!(e, crate::Error::PredictInterObmcUnsupported);
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
     }
 
     /// §7.11.3.1 caller-bug guards: `refs.is_empty()`,
@@ -6055,6 +6489,7 @@ mod tests {
             &empty_refs,
             None,
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -6081,6 +6516,7 @@ mod tests {
             &refs,
             None,
             /* warp */ None,
+            /* obmc */ None,
             &mut small,
         )
         .unwrap_err();
@@ -6106,6 +6542,7 @@ mod tests {
             &refs,
             None,
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -6172,6 +6609,7 @@ mod tests {
             &refs,
             Some(CompoundParams::Average),
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("compound AVERAGE arm");
@@ -6286,6 +6724,7 @@ mod tests {
             &refs,
             Some(CompoundParams::Distance(weights)),
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("compound DISTANCE arm");
@@ -6404,6 +6843,7 @@ mod tests {
                 mask_stride: 0,
             }),
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("compound WEDGE arm");
@@ -6540,6 +6980,7 @@ mod tests {
                 mask_stride: 0,
             }),
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("compound DIFFWTD arm");
@@ -6659,6 +7100,7 @@ mod tests {
                 mask_stride: 0,
             }),
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("compound INTRA arm");
@@ -6757,6 +7199,7 @@ mod tests {
             &single,
             Some(CompoundParams::Average),
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -6782,6 +7225,7 @@ mod tests {
             &double,
             None,
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -6807,6 +7251,7 @@ mod tests {
             &single,
             Some(CompoundParams::Average),
             /* warp */ None,
+            /* obmc */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -6880,6 +7325,7 @@ mod tests {
             &refs,
             /* compound */ None,
             /* warp */ Some(&warp),
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("predict_inter LOCALWARP arm");
@@ -6980,6 +7426,7 @@ mod tests {
             &refs,
             None,
             Some(&warp),
+            /* obmc */ None,
             &mut pred_out,
         )
         .expect("predict_inter GLOBAL_WARP arm");
@@ -7072,6 +7519,7 @@ mod tests {
             &refs,
             None,
             Some(&warp),
+            /* obmc */ None,
             &mut warp_out,
         )
         .expect("WARP arm with w<8 must fall back to translational");
@@ -7097,6 +7545,7 @@ mod tests {
             &refs,
             None,
             None,
+            /* obmc */ None,
             &mut simple_out,
         )
         .expect("SIMPLE arm baseline");
@@ -7161,6 +7610,7 @@ mod tests {
             &refs,
             None,
             Some(&warp_force_int),
+            /* obmc */ None,
             &mut force_int_out,
         )
         .expect("WARP arm with force_integer_mv must fall back to translational");
@@ -7185,6 +7635,7 @@ mod tests {
             &refs,
             None,
             None,
+            /* obmc */ None,
             &mut simple_out,
         )
         .expect("SIMPLE arm baseline");
@@ -7252,6 +7703,7 @@ mod tests {
             &refs,
             None,
             Some(&warp),
+            /* obmc */ None,
             &mut warp_out,
         )
         .expect("LOCALWARP+!LocalValid must fall back to translational");
@@ -7276,6 +7728,7 @@ mod tests {
             &refs,
             None,
             None,
+            /* obmc */ None,
             &mut simple_out,
         )
         .expect("SIMPLE arm baseline");
@@ -7339,6 +7792,7 @@ mod tests {
             &refs,
             None,
             Some(&warp),
+            /* obmc */ None,
             &mut warp_out,
         )
         .expect("is_scaled must block step-7 ◦ 4");
@@ -7363,6 +7817,7 @@ mod tests {
             &refs,
             None,
             None,
+            /* obmc */ None,
             &mut simple_out,
         )
         .expect("SIMPLE baseline");
@@ -7428,6 +7883,7 @@ mod tests {
             &refs,
             None,
             Some(&warp),
+            /* obmc */ None,
             &mut warp_out,
         )
         .expect("step-3 must demote bad_local to translational fallback");
@@ -7548,5 +8004,854 @@ mod tests {
             ),
             UseWarpDecision::Translational
         );
+    }
+
+    // ---------- r203 §7.11.3.1 predict_inter OBMC arm ----------
+
+    /// §7.11.3.9 OBMC arm — when both `above_neighbours` and
+    /// `left_neighbours` lists are empty (the spec's `AvailU` or
+    /// `AvailL` gate triggers but no qualifying `RefFrames[..][0] >
+    /// INTRA_FRAME` neighbour exists), the post-step is a no-op and
+    /// `pred_out` matches the SIMPLE single-ref translational
+    /// prediction byte-for-byte.
+    #[test]
+    fn r203_predict_inter_obmc_no_neighbours_matches_simple() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 16 + c) & 0xff) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+
+        let w = 8;
+        let h = 8;
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            4,
+            4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .expect("SIMPLE baseline");
+
+        // OBMC with empty neighbour lists. AvailU/AvailL true so the
+        // outer gates fire, but the inner walk exhausts before
+        // visiting any qualifying neighbour.
+        let obmc = ObmcParams {
+            mi_row: 1,
+            mi_col: 1,
+            mi_cols: 8,
+            mi_rows: 8,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: true,
+            avail_l: true,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[],
+            left_neighbours: &[],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            4,
+            4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .expect("OBMC with no neighbours");
+
+        assert_eq!(
+            simple_out, obmc_out,
+            "OBMC with no qualifying neighbours must match SIMPLE translational"
+        );
+    }
+
+    /// §7.11.3.9 OBMC arm — when `AvailU == false && AvailL ==
+    /// false` both passes are gated off (no §7.11.3.10 invocation),
+    /// matching the SIMPLE translational prediction.
+    #[test]
+    fn r203_predict_inter_obmc_unavailable_neighbours_noops() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for v in refp.iter_mut().enumerate() {
+            *v.1 = (v.0 & 0xff) as u16;
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+
+        let w = 8;
+        let h = 8;
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            4,
+            4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .unwrap();
+
+        // The neighbour-bundle below would normally contribute, but
+        // AvailU == false && AvailL == false short-circuits both
+        // outer gates per av1-spec p.275 lines 15301 / 15325.
+        let nb = ObmcNeighbour {
+            bundle: refs[0],
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 1,
+            mi_col: 1,
+            mi_cols: 8,
+            mi_rows: 8,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: false,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[nb],
+            left_neighbours: &[nb],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            4,
+            4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .unwrap();
+
+        assert_eq!(simple_out, obmc_out);
+    }
+
+    /// §7.11.3.9 above-pass with an identical neighbour (same ref +
+    /// same MV) — the blend `Round2(m*curr + (64 - m)*obmc, 6)` with
+    /// `curr == obmc` reduces to `Round2(64 * curr, 6) = curr`, so
+    /// the result is byte-identical to SIMPLE translational. This
+    /// pins the above-pass blend kernel without depending on
+    /// reference samples that exercise off-by-one.
+    #[test]
+    fn r203_predict_inter_obmc_identical_above_neighbour_idempotent() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for (i, v) in refp.iter_mut().enumerate() {
+            *v = ((i * 7) & 0xff) as u16;
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+
+        // Block at plane coords (x=8, y=8) ⇒ MiRow = MiCol = 2.
+        let w = 8;
+        let h = 8;
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .unwrap();
+
+        // One qualifying above-row neighbour with identical ref +
+        // identical MV; step4 = 2 covers the first half of the
+        // 8-sample-wide block. Identity property of the blend.
+        let above_nb = ObmcNeighbour {
+            bundle: refs[0],
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 8,
+            mi_rows: 8,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: true,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[above_nb],
+            left_neighbours: &[],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .unwrap();
+
+        // Identity property: Round2(64 * curr, 6) = curr exactly.
+        assert_eq!(
+            simple_out, obmc_out,
+            "identical-neighbour OBMC blend must be identity"
+        );
+    }
+
+    /// §7.11.3.9 left-pass with an identical neighbour — same
+    /// identity property as above, but exercising the left-pass
+    /// `mask[j]` axis (vs above-pass `mask[i]`).
+    #[test]
+    fn r203_predict_inter_obmc_identical_left_neighbour_idempotent() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for (i, v) in refp.iter_mut().enumerate() {
+            *v = ((i * 11) & 0xff) as u16;
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+
+        let w = 8;
+        let h = 8;
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .unwrap();
+
+        let left_nb = ObmcNeighbour {
+            bundle: refs[0],
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 8,
+            mi_rows: 8,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: false,
+            avail_l: true,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[],
+            left_neighbours: &[left_nb],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .unwrap();
+
+        assert_eq!(simple_out, obmc_out);
+    }
+
+    /// §7.11.3.9 above-pass with a *different* neighbour MV — the
+    /// overlap region (top half of the block) must change vs.
+    /// SIMPLE, while the non-overlap region (bottom half) must
+    /// match SIMPLE byte-for-byte (the blend only writes rows 0..predH).
+    /// For w=h=8, subY=0: predH = min(8 >> 1, 32) = 4. The bottom
+    /// 4 rows are outside any blend.
+    #[test]
+    fn r203_predict_inter_obmc_above_modifies_top_half_only() {
+        let ref_w: usize = 48;
+        let ref_h: usize = 48;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for (i, v) in refp.iter_mut().enumerate() {
+            *v = ((i * 3) & 0xff) as u16;
+        }
+
+        let curr_ref = PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        };
+        let refs = [curr_ref];
+
+        let w = 8;
+        let h = 8;
+        let bx = 8;
+        let by = 8;
+
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            bx,
+            by,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .unwrap();
+
+        // Neighbour with the same ref-plane buffer but a non-zero
+        // integer-aligned MV (mv_row = 8 ⇒ 1 luma sample). This
+        // changes the neighbour's translational MC vs. the current
+        // block's prediction so the blend has a real effect.
+        let nb_ref = PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [8, 0],
+        };
+        let above_nb = ObmcNeighbour {
+            bundle: nb_ref,
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 16,
+            mi_rows: 16,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: true,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[above_nb],
+            left_neighbours: &[],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            bx,
+            by,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .unwrap();
+
+        // Above-pass predH = h >> 1 = 4. Rows 4..8 are outside any
+        // blend (no left-pass either), so they must match SIMPLE
+        // byte-for-byte.
+        for row in 4..h {
+            for col in 0..w {
+                assert_eq!(
+                    simple_out[row * w + col],
+                    obmc_out[row * w + col],
+                    "row {row} col {col} below the above-pass extent must equal SIMPLE"
+                );
+            }
+        }
+
+        // The blend region top-half must differ from SIMPLE because
+        // the neighbour's MV is non-zero — at least one cell of rows
+        // 0..4 changes.
+        let differs = (0..4)
+            .any(|row| (0..w).any(|col| simple_out[row * w + col] != obmc_out[row * w + col]));
+        assert!(
+            differs,
+            "above-pass with a different MV must change the top half"
+        );
+    }
+
+    /// §7.11.3.9 above-pass small-block carve-out — when
+    /// `plane_residual_size_ge_block_8x8 == false`, the above-pass
+    /// gate at av1-spec p.275 line 15302 fails and only the
+    /// left-pass runs. With `avail_l == false` too, the OBMC arm
+    /// becomes a no-op even when above_neighbours is non-empty.
+    #[test]
+    fn r203_predict_inter_obmc_above_gated_by_plane_residual_size() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for (i, v) in refp.iter_mut().enumerate() {
+            *v = ((i * 5) & 0xff) as u16;
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+
+        let w = 8;
+        let h = 8;
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .unwrap();
+
+        // Non-zero-MV neighbour that *would* change pred_out if the
+        // above-pass were to fire. With
+        // `plane_residual_size_ge_block_8x8 == false` it doesn't.
+        let nb_ref = PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [16, 0],
+        };
+        let above_nb = ObmcNeighbour {
+            bundle: nb_ref,
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 8,
+            mi_rows: 8,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: true,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: false,
+            above_neighbours: &[above_nb],
+            left_neighbours: &[],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            simple_out, obmc_out,
+            "above-pass must be gated off when plane_residual_size < BLOCK_8X8"
+        );
+    }
+
+    /// §7.11.3.9 `nLimit = Min(4, Mi_Width_Log2[ MiSize ])` — the
+    /// driver must cap the neighbour walk at `nLimit`. With
+    /// `mi_width_log2 = 0` (BLOCK_4X4 width), `nLimit = 0`, so no
+    /// neighbours are visited regardless of the slice length. The
+    /// output must match SIMPLE byte-for-byte.
+    #[test]
+    fn r203_predict_inter_obmc_n_limit_caps_above_walk() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for (i, v) in refp.iter_mut().enumerate() {
+            *v = ((i * 13) & 0xff) as u16;
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+
+        // 4-wide block (w = 4). `nLimit` reads `Mi_Width_Log2[
+        // BLOCK_4X*]` which is 0, so nLimit = Min(4, 0) = 0; the
+        // walk does not enter the loop body.
+        let w = 4;
+        let h = 8;
+        let bx = 8;
+        let by = 8;
+
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            bx,
+            by,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .unwrap();
+
+        // Would-be-effective neighbour — but the nLimit = 0 cap
+        // means the driver doesn't visit it.
+        let nb_ref = PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [8, 0],
+        };
+        let above_nb = ObmcNeighbour {
+            bundle: nb_ref,
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 8,
+            mi_rows: 8,
+            // mi_width_log2 = 0 ⇒ nLimit = 0.
+            mi_width_log2: 0,
+            mi_height_log2: 0,
+            avail_u: true,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[above_nb],
+            left_neighbours: &[],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            bx,
+            by,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .unwrap();
+
+        assert_eq!(simple_out, obmc_out);
+    }
+
+    /// §7.11.3.9 multi-neighbour above-pass — two ordered neighbours
+    /// with `step4 = 2` each, visiting the left half and right half
+    /// of a 16-wide block in turn. With both neighbours identical to
+    /// the current MV, the blend is identity on both halves; this
+    /// pins that the driver iterates more than one neighbour per
+    /// axis correctly. For BLOCK_16X16: `mi_width_log2 = 2 ⇒ w4 =
+    /// 4`, `nLimit = Min(4, 2) = 2`, so both neighbours are visited
+    /// (axis_pos walks `MiCol`, `MiCol + 2`, then halts at `MiCol +
+    /// 4 = MiCol + w4`).
+    #[test]
+    fn r203_predict_inter_obmc_multi_above_neighbours_walk_correctly() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for (i, v) in refp.iter_mut().enumerate() {
+            *v = ((i * 17) & 0xff) as u16;
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+
+        // BLOCK_16X16: w = h = 16, block top-left at plane (8, 8)
+        // ⇒ MiRow = MiCol = 2.
+        let w = 16;
+        let h = 16;
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            /* obmc */ None,
+            &mut simple_out,
+        )
+        .unwrap();
+
+        let nb = ObmcNeighbour {
+            bundle: refs[0],
+            step4: 2,
+        };
+        // BLOCK_16X16: mi_width_log2 = 2 ⇒ w4 = 4, nLimit = Min(4, 2)
+        // = 2. The walk visits x4 = MiCol (2), then x4 + 2 (4), then
+        // stops because x4 + 2 = 6 == MiCol + w4 = 6 fails the
+        // strict-less-than bound (Min(MiCols, MiCol + w4) = 6).
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 8,
+            mi_rows: 8,
+            mi_width_log2: 2,
+            mi_height_log2: 2,
+            avail_u: true,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[nb, nb],
+            left_neighbours: &[],
+        };
+        let mut obmc_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&obmc),
+            &mut obmc_out,
+        )
+        .unwrap();
+
+        // Both neighbours produce identity blends ⇒ output equals SIMPLE.
+        assert_eq!(simple_out, obmc_out);
     }
 }

@@ -6,6 +6,42 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 203 — §7.11.3.1 OBMC motion-mode arm wired into
+  `predict_inter`.** The r194 `PredictInterObmcUnsupported` stub is
+  retired in favour of an end-to-end OBMC dispatch: the driver now
+  performs the §7.11.3.9 `overlapped_motion_compensation` mi-grid
+  neighbour walk (above-row + left-column passes per av1-spec p.275
+  lines 15301-15346) and runs the §7.11.3.10 overlap blend (p.277-278
+  lines 15440-15449) against each qualifying neighbour's translational
+  MC. The §7.11.3.9-10 pixel-blend leaves landed in r193
+  (`overlap_blending` / `overlap_neighbour_predict_blend` /
+  `get_obmc_mask` / the five `OBMC_MASK_*` tables); r203 is the
+  driver-side mi-grid walk that consumes them. New public
+  `ObmcParams<'a, 'n>` struct plumbs the spec inputs (`MiRow` /
+  `MiCol` / `MiCols` / `MiRows` / `Mi_{Width,Height}_Log2[MiSize]` /
+  `AvailU` / `AvailL` / `get_plane_residual_size(MiSize, plane) >=
+  BLOCK_8X8`) plus two ordered slices of qualifying neighbours
+  (`above_neighbours` / `left_neighbours`); new
+  `ObmcNeighbour<'a>` bundles the neighbour's `PredictInterRef` (mv +
+  ref-frame plane) plus the `Clip3(2, 16,
+  Num_4x4_Blocks_{Wide,High}[candSz])` step-4 advance. The
+  module-private `obmc_walk_axis` helper drives the spec's per-pass
+  `(x4, y4, step4, nLimit)` walk + per-candidate `predict_overlap`
+  steps 1-8. `predict_inter`'s signature gains a trailing `obmc:
+  Option<&ObmcParams<'_, '_>>` argument before `pred_out`; passing
+  `obmc = None` with `motion_mode == MOTION_MODE_OBMC` is a caller
+  bug (returns `PartitionWalkOutOfRange`). All non-OBMC arms behave
+  identically to r202 when `obmc == None`. The
+  `Error::PredictInterObmcUnsupported` variant is removed (no longer
+  reachable). **All four motion modes (SIMPLE / WARPED_CAUSAL /
+  OBMC + compound) are now driver-side complete.** Test count: 1033
+  → 1041 (+8 in lib): empty-list baseline, AvailU/AvailL-off gate,
+  identity-blend above-pass, identity-blend left-pass, top-half-only
+  modification with non-zero neighbour MV,
+  `plane_residual_size_ge_block_8x8` above-pass gate,
+  `nLimit = Min(4, Mi_Width_Log2)` cap, and a multi-neighbour
+  `step4 += step4` walk on a 16-wide block.
+
 * **Round 202 — §7.11.3.1 WARPED_CAUSAL motion-mode arm wired into
   `predict_inter`.** The r194 `PredictInterWarpUnsupported` stub is
   retired in favour of an end-to-end WARP dispatch: the driver now
