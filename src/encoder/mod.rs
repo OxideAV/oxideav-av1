@@ -143,12 +143,12 @@
 //! transpose of the §7.13.2.3 inverse DCT-4 reproduced in
 //! [`crate::transform::inverse_dct`] (`n = 2` branch). Round-trip
 //! lockstep against the inverse confirms `M^T · M ≈ 2 · I` (exactly
-//! diagonal; ≈ 1.999 on even rows and ≈ 2.072 on odd rows because the
-//! AV1 cosine constants are integer-rounded approximations of the
-//! analytic values). The off-diagonal entries are exactly zero — the
-//! basis is mutually orthogonal. This primitive is the bridge between
-//! the arc-1..12 syntax-only encoder (consumes pre-decided `Quant[]`)
-//! and a real encoder that takes pixel residuals as input.
+//! diagonal; `≈ 1.99988` on even rows and `≈ 1.99994` on odd rows
+//! because the AV1 cosine constants are integer-rounded approximations
+//! of the analytic values). The off-diagonal entries are exactly zero
+//! — the basis is mutually orthogonal. This primitive is the bridge
+//! between the arc-1..12 syntax-only encoder (consumes pre-decided
+//! `Quant[]`) and a real encoder that takes pixel residuals as input.
 //!
 //! Next arc: forward DCT for sizes 8 / 16 / 32 / 64; forward ADST /
 //! FLIPADST / WHT / IDTX; quantization primitive; full pixel-space

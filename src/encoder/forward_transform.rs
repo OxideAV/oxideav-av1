@@ -262,16 +262,17 @@ mod tests {
         // amplitude 4096, run inverse then forward and verify the
         // off-diagonal entries are exactly zero (the basis is
         // mutually orthogonal under M^T M). The diagonal entry is
-        // approximately 2 * input but not exactly: column norms of
-        // M (scaled by 1 / 4096) are 2 * 2896^2 / 4096^2 ≈ 1.999 for
-        // the even columns (k = 0, 2) and 2 * (3784^2 + 1567^2) /
-        // 4096^2 ≈ 2.072 for the odd columns (k = 1, 3), because
-        // 2896 = round(4096 / sqrt(2)) and 3784 / 1567 = round(4096
-        // * cos(pi/8) / 4096 * sin(pi/8)) are integer-rounded
-        // approximations of the analytic cosines. The exact
-        // roundtrip is forward(inverse(c)) = (M^T M) c / 4096^2 with
-        // per-stage Round2(_, 12), which gives the diagonal values
-        // measured here.
+        // approximately 2 * input: column norms of M (scaled by
+        // 1 / 4096) are 2 * 2896^2 / 4096^2 ≈ 1.99988 for the even
+        // columns (k = 0, 2) and 2 * (3784^2 + 1567^2) / 4096^2 ≈
+        // 1.99994 for the odd columns (k = 1, 3) — both very close
+        // to 2 (the cosine constants 2896 = round(4096 / sqrt(2)),
+        // 3784 ≈ round(4096 * cos(pi/8)), 1567 ≈ round(4096 *
+        // sin(pi/8)) are integer-rounded approximations of the
+        // analytic cosines). The exact roundtrip is
+        // forward(inverse(c)) = (M^T M) c / 4096^2 with per-stage
+        // Round2(_, 12), which gives the diagonal values measured
+        // here.
         let expected_diag: [i64; 4] = [8190, 8191, 8190, 8191];
         for k in 0..4 {
             let mut c = [0i64; 4];
