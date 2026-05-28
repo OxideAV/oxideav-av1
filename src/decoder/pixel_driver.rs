@@ -90,13 +90,21 @@ use crate::Error;
 /// every sample plane outright so the caller can drop the source IVF
 /// buffer.
 ///
-/// Round 224 surfaces only the
-/// [`Self::Yuv420_16x16`] variant; later arcs may admit other extents
-/// and monochrome variants.
+/// Round 224 surfaced only the [`Self::Yuv420_16x16`] variant; round 230
+/// adds [`Self::Yuv420Dyn`] for the dynamic-extent encoder
+/// ([`crate::encoder::encode_intra_frame_yuv_dyn`]) output. The enum is
+/// `#[non_exhaustive]` so future extents (monochrome / 4:2:2 / 4:4:4 /
+/// 10-bit) can land without a SemVer bump.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+// The fixed-size `Yuv420_16x16` variant inlines its three plane arrays
+// (`16*16 + 8*8*2 = 384` bytes) while `Yuv420Dyn` carries three Vec
+// handles + two u32s (~80 bytes). Boxing the fixed-size payload would
+// regress the existing arc-18 API; we accept the variance.
+#[allow(clippy::large_enum_variant)]
 pub enum Frame {
-    /// 16×16 4:2:0 YUV — the encoder pixel-driver's bit-exact output
-    /// shape.
+    /// 16×16 4:2:0 YUV — the original fixed-size encoder pixel-driver
+    /// output shape.
     Yuv420_16x16 {
         /// Luma plane (`Y`). Row-major `[row][col]`.
         y: [[u8; FRAME_WIDTH]; FRAME_HEIGHT],
@@ -105,6 +113,22 @@ pub enum Frame {
         u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
         /// Second chroma plane (`V` / `Cr`).
         v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    },
+    /// Dynamic-extent 4:2:0 YUV — emitted by the r230
+    /// [`crate::encoder::encode_intra_frame_yuv_dyn`] driver for any
+    /// `(width, height)` ∈ {8, 16, 24, 32, 40, 48, 56, 64} × itself.
+    /// Plane data is Vec-backed (row-major).
+    Yuv420Dyn {
+        /// Luma width in pixels.
+        width: u32,
+        /// Luma height in pixels.
+        height: u32,
+        /// Luma plane, row-major, length `width * height`.
+        y: Vec<u8>,
+        /// U plane, row-major, length `(width / 2) * (height / 2)`.
+        u: Vec<u8>,
+        /// V plane, same shape as `u`.
+        v: Vec<u8>,
     },
 }
 
@@ -232,21 +256,27 @@ fn decode_frame(
     fh: &FrameHeader,
     tile_group_body: &[u8],
 ) -> Result<Frame, Error> {
-    // Arc-18 scope check: 16×16 frame, 4:2:0 YUV, not monochrome.
+    // Frame-size dispatch: 16×16 4:2:0 routes through the arc-18
+    // fixed-size driver below; any other (width, height) that satisfies
+    // the r230 dyn driver's constraint set
+    // ([`super::pixel_driver_dyn::decode_frame_dyn`]) routes through
+    // there instead and emits [`Frame::Yuv420Dyn`].
     let fs = fh
         .frame_size
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    if fs.frame_width != FRAME_WIDTH as u32 || fs.frame_height != FRAME_HEIGHT as u32 {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    if fs.mi_cols != 4 || fs.mi_rows != 4 {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
     if seq.color_config.mono_chrome {
         return Err(Error::PartitionWalkOutOfRange);
     }
     if !seq.color_config.subsampling_x || !seq.color_config.subsampling_y {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if fs.frame_width != FRAME_WIDTH as u32 || fs.frame_height != FRAME_HEIGHT as u32 {
+        // Dyn dispatch — any aligned (w, h) ∈ {8..=64} × {8..=64} the
+        // r230 driver accepts.
+        return crate::decoder::pixel_driver_dyn::decode_frame_dyn(seq, fh, tile_group_body);
+    }
+    if fs.mi_cols != 4 || fs.mi_rows != 4 {
         return Err(Error::PartitionWalkOutOfRange);
     }
     // Arc-18 mirrors the encoder pixel driver exactly. The encoder
@@ -1209,6 +1239,7 @@ mod tests {
                 assert_eq!(u, &input.u);
                 assert_eq!(v, &input.v);
             }
+            other => panic!("expected Yuv420_16x16, got {other:?}"),
         }
     }
 
@@ -1243,6 +1274,7 @@ mod tests {
                 assert_eq!(u, &input.u, "U roundtrip");
                 assert_eq!(v, &input.v, "V roundtrip");
             }
+            other => panic!("expected Yuv420_16x16, got {other:?}"),
         }
     }
 
@@ -1299,7 +1331,9 @@ mod tests {
     fn decode_zeroed_yuv420_16x16_factory_zeros_each_plane() {
         // Sanity-check the public Frame constructor.
         let f = Frame::zeroed_yuv420_16x16();
-        let Frame::Yuv420_16x16 { y, u, v } = f;
+        let Frame::Yuv420_16x16 { y, u, v } = f else {
+            panic!("zeroed_yuv420_16x16 must return Yuv420_16x16")
+        };
         assert!(y.iter().flatten().all(|&p| p == 0));
         assert!(u.iter().flatten().all(|&p| p == 0));
         assert!(v.iter().flatten().all(|&p| p == 0));

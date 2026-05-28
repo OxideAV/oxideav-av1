@@ -2,6 +2,55 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 230)
+
+Round 230 generalises the pixel driver beyond the 16×16 hard-coded
+extent. The new
+`encoder::pixel_driver_dyn::encode_intra_frame_yuv_dyn` accepts a
+Vec-backed `Yuv420Frame { width, height, y, u, v }` for any
+`(width, height)` where both dimensions ∈ {8, 16, 24, 32, 40, 48, 56,
+64} (multiples of 8 ≤ 64 per the §5.11.5 4:2:0 chroma cell
+constraint) and synthesises its own conformant SequenceHeader +
+FrameHeader from the requested extent via
+`build_intra_only_yuv420_8bit_seq` /
+`build_intra_only_yuv420_8bit_fh` — callers no longer need to
+supply a fixture descriptor. The recursive `build_partition_tree`
+helper walks the smallest covering power-of-two super-block (one of
+BLOCK_16X16 / BLOCK_32X32 / BLOCK_64X64) and emits
+`EncodeNode::dummy_oob()` for fully-out-of-frame quadrants — the
+§5.11.4 driver's line-1 `r >= MiRows || c >= MiCols` early return
+swallows them.
+
+The decoder side gains
+`decoder::pixel_driver_dyn::decode_frame_dyn` and a new
+`Frame::Yuv420Dyn { width, height, y, u, v }` variant; the public
+`decode_av1` entry dispatches automatically based on the parsed
+frame extent (existing 16×16 streams continue to surface
+`Frame::Yuv420_16x16` byte-for-byte unchanged). The `Frame` enum is
+now `#[non_exhaustive]` so future extents (monochrome / 4:2:2 /
+10-bit) can land without a SemVer bump.
+
+Composition of primitives is unchanged from r223+r229: the same
+13-mode intra picker on luma (`pick_best_intra_mode_4x4`) and
+chroma (`pick_best_intra_mode_4x4_chroma_joint`) drives a per-leaf
+forward-WHT + forward-quantize + dequantize + inverse-WHT chain.
+The lossless `base_q_idx = 0` arm makes every leaf a bit-exact
+reversible step, so the full encode → decode_av1 → pixel-equality
+contract holds for any allowed dynamic extent — verified end-to-end
+on flat-grey, pseudo-random, and horizontal-gradient inputs at
+16×16, 32×32, and 64×64.
+
++18 lib unit tests (1457 → 1475; 13 encoder dyn + 5 decoder dyn) +
+5 new integration roundtrip tests (18 → 23) covering 32×32 flat,
+32×32 pseudo-random, 32×32 horizontal gradient, 64×64 flat, and
+64×64 pseudo-random YUV.
+
+Out of scope (next arc): frames larger than 64×64 (multi-super-
+block tiling), rectangular partitions, larger TX sizes,
+`base_q_idx > 0`, monochrome / 4:2:2 / 4:4:4 sampling,
+UV_CFL_PRED (§7.11.5.3 αU/αV linear predictor), inter mode_info,
+and a bit-cost-aware RD picker.
+
 ## Status — 2026-05-29 (round 229)
 
 Round 229 mirrors r228's luma picker on the **chroma path** —

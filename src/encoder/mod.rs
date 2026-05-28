@@ -252,6 +252,7 @@ pub mod obu;
 pub mod partition;
 pub mod partition_tree;
 pub mod pixel_driver;
+pub mod pixel_driver_dyn;
 pub mod sequence_obu;
 pub mod symbol_writer;
 pub mod temporal_unit;
@@ -296,6 +297,10 @@ pub use pixel_driver::{
     dispatch_order_cells, encode_intra_frame_y, encode_intra_frame_yuv, CellCoord, EncodedFrame,
     EncodedFrameYuv, Yuv420Frame16x16, CELLS_HIGH, CELLS_WIDE, CHROMA_CELLS_HIGH,
     CHROMA_CELLS_WIDE, CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH, MI_COLS, MI_ROWS,
+};
+pub use pixel_driver_dyn::{
+    build_intra_only_yuv420_8bit_fh, build_intra_only_yuv420_8bit_seq, dispatch_order_leaves,
+    encode_intra_frame_yuv_dyn, root_super_block, EncodedFrameDyn, Yuv420Frame, MAX_DIM, MIN_DIM,
 };
 pub use sequence_obu::write_sequence_header_obu;
 pub use symbol_writer::SymbolWriter;

@@ -46,6 +46,7 @@ fn encode_decode_flat_grey_yuv_roundtrip() {
             assert_eq!(u, &input.u, "U plane bit-exact recovery");
             assert_eq!(v, &input.v, "V plane bit-exact recovery");
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
 }
 
@@ -77,6 +78,7 @@ fn encode_decode_horizontal_chroma_gradient_roundtrip() {
             assert_eq!(u, &input.u);
             assert_eq!(v, &input.v);
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
 }
 
@@ -113,6 +115,7 @@ fn encode_decode_pseudo_random_yuv_roundtrip() {
             assert_eq!(u, &input.u, "U plane bit-exact on pseudo-random input");
             assert_eq!(v, &input.v, "V plane bit-exact on pseudo-random input");
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
 }
 
@@ -145,6 +148,7 @@ fn encode_decode_extremes_yuv_roundtrip() {
             assert_eq!(u, &input.u);
             assert_eq!(v, &input.v);
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
 }
 
@@ -280,6 +284,7 @@ fn encode_decode_roundtrip_with_13_mode_picker_on_horizontal_gradient() {
             assert_eq!(u, &input.u);
             assert_eq!(v, &input.v);
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
     // At least one cell should have picked a non-DC mode on the gradient.
     let non_dc_count = encoded
@@ -330,6 +335,7 @@ fn encode_decode_roundtrip_with_13_mode_picker_on_pseudorandom_yuv() {
             assert_eq!(u, &input.u);
             assert_eq!(v, &input.v);
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
 }
 
@@ -504,6 +510,7 @@ fn encode_decode_roundtrip_with_chroma_picker_on_chroma_gradient() {
             assert_eq!(u, &input.u, "U bit-exact after chroma picker + decode");
             assert_eq!(v, &input.v, "V bit-exact after chroma picker + decode");
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
     let non_dc_count = encoded
         .committed_uv_modes
@@ -554,6 +561,7 @@ fn encode_decode_roundtrip_with_chroma_picker_on_pseudorandom_yuv() {
             assert_eq!(u, &input.u);
             assert_eq!(v, &input.v);
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
     }
 }
 
@@ -602,5 +610,175 @@ fn encode_decode_roundtrip_with_chroma_picker_on_extremes() {
             assert_eq!(u, &input.u);
             assert_eq!(v, &input.v);
         }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
+    }
+}
+
+// -------------------------------------------------------------------------
+// Arc r230 — dynamic-extent encode -> decode_av1 roundtrip.
+//
+// `encode_intra_frame_yuv_dyn` is the Vec-backed sibling of
+// `encode_intra_frame_yuv`. It builds its own SH+FH from the requested
+// (width, height) so the public `decode_av1` entry routes to the dyn
+// decoder branch and emits `Frame::Yuv420Dyn`. These tests close the
+// encoder→decoder loop on the new path for both 32×32 and 64×64
+// frames — the milestone exercise this arc unlocks.
+// -------------------------------------------------------------------------
+
+#[test]
+fn dyn_encode_decode_flat_grey_32x32_roundtrip() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    let input = Yuv420Frame::filled(32, 32, 128);
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    assert_eq!(decoded.len(), 1);
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 32);
+            assert_eq!(*height, 32);
+            assert_eq!(y, &input.y, "luma bit-exact at 32×32");
+            assert_eq!(u, &input.u, "U bit-exact at 32×32");
+            assert_eq!(v, &input.v, "V bit-exact at 32×32");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_pseudorandom_32x32_roundtrip_bit_exact() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    let mut input = Yuv420Frame::filled(32, 32, 0);
+    let mut state: u64 = 0xCAFE_BABE_F00D_BEEF;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = step();
+    }
+    for p in input.u.iter_mut() {
+        *p = step();
+    }
+    for p in input.v.iter_mut() {
+        *p = step();
+    }
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 32);
+            assert_eq!(*height, 32);
+            assert_eq!(y, &input.y, "Y mismatch 32×32 pseudo-random");
+            assert_eq!(u, &input.u, "U mismatch 32×32 pseudo-random");
+            assert_eq!(v, &input.v, "V mismatch 32×32 pseudo-random");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_horizontal_gradient_32x32_roundtrip_bit_exact() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    let mut input = Yuv420Frame::filled(32, 32, 0);
+    let width = input.width as usize;
+    let cwidth = input.chroma_width() as usize;
+    for i in 0..(input.height as usize) {
+        for j in 0..width {
+            input.y[i * width + j] = (j * 8) as u8;
+        }
+    }
+    for i in 0..(input.chroma_height() as usize) {
+        for j in 0..cwidth {
+            input.u[i * cwidth + j] = (j * 16) as u8;
+            input.v[i * cwidth + j] = (255u8).wrapping_sub((j * 16) as u8);
+        }
+    }
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn { y, u, v, .. } => {
+            assert_eq!(y, &input.y);
+            assert_eq!(u, &input.u);
+            assert_eq!(v, &input.v);
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_flat_grey_64x64_roundtrip() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    let input = Yuv420Frame::filled(64, 64, 200);
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 64);
+            assert_eq!(*height, 64);
+            assert_eq!(y, &input.y);
+            assert_eq!(u, &input.u);
+            assert_eq!(v, &input.v);
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_pseudorandom_64x64_roundtrip_bit_exact() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    let mut input = Yuv420Frame::filled(64, 64, 0);
+    let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = step();
+    }
+    for p in input.u.iter_mut() {
+        *p = step();
+    }
+    for p in input.v.iter_mut() {
+        *p = step();
+    }
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 64);
+            assert_eq!(*height, 64);
+            assert_eq!(y, &input.y, "Y mismatch 64×64 pseudo-random");
+            assert_eq!(u, &input.u, "U mismatch 64×64 pseudo-random");
+            assert_eq!(v, &input.v, "V mismatch 64×64 pseudo-random");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
     }
 }

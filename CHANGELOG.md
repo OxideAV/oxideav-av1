@@ -6,6 +6,56 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 230 — Pixel-driver frame-size generalisation: 32×32 and 64×64
+  4:2:0 YUV encode → decode_av1 roundtrip.** The encoder gains a
+  Vec-backed dynamic-extent driver
+  (`encoder::pixel_driver_dyn::encode_intra_frame_yuv_dyn`,
+  `Yuv420Frame { width, height, y, u, v }`,
+  `EncodedFrameDyn`) that accepts any `(width, height)` with both
+  dimensions ∈ {8, 16, 24, 32, 40, 48, 56, 64} (multiples of 8 ≤ 64
+  per the §5.11.5 4:2:0 chroma cell constraint) and synthesises its
+  own SequenceHeader + FrameHeader from the requested dimensions via
+  `build_intra_only_yuv420_8bit_seq` / `build_intra_only_yuv420_8bit_fh`
+  — callers no longer need to supply a fixture descriptor. The
+  recursive `build_partition_tree` helper walks the smallest covering
+  power-of-two super-block (one of BLOCK_16X16 / BLOCK_32X32 /
+  BLOCK_64X64) and emits `EncodeNode::dummy_oob()` for fully-out-of-
+  frame quadrants — the §5.11.4 driver's line-1 `r >= MiRows ||
+  c >= MiCols` early return swallows them.
+
+  The decoder side gains a matching dyn driver
+  (`decoder::pixel_driver_dyn::decode_frame_dyn`) and a new
+  `Frame::Yuv420Dyn { width, height, y, u, v }` variant; the public
+  `decode_av1` entry dispatches automatically based on the parsed
+  frame extent (the existing fixed-size 16×16 path continues to surface
+  `Frame::Yuv420_16x16` byte-for-byte unchanged). The `Frame` enum is
+  now `#[non_exhaustive]` so future extents (monochrome / 4:2:2 / 10-bit)
+  can land without a SemVer bump.
+
+  Composition of primitives is unchanged from r223+r229: the same
+  13-mode intra picker on luma (`pick_best_intra_mode_4x4`) and chroma
+  (`pick_best_intra_mode_4x4_chroma_joint`) drives a per-leaf forward-
+  WHT + forward-quantize + dequantize + inverse-WHT chain. The lossless
+  `base_q_idx = 0` arm makes every leaf a bit-exact reversible step, so
+  the full encode → decode_av1 → pixel-equality contract holds for any
+  allowed dynamic extent — verified end-to-end on flat-grey + pseudo-
+  random + horizontal-gradient inputs at 16×16, 32×32, and 64×64.
+
+  Tests: 13 new lib tests in `encoder::pixel_driver_dyn` (dispatch
+  coverage + size validation + flat/pseudo-random encode-only
+  roundtrip at 16×16/32×32/64×64), 5 new lib tests in
+  `decoder::pixel_driver_dyn` (encode → decode_av1 → pixel-equality at
+  16×16 / 32×32 / 64×64 flat + 32×32 + 64×64 pseudo-random), 5 new
+  integration tests in `tests/encode_decode_pixel_roundtrip.rs`
+  (encode → decode_av1 → pixel-equality at 32×32 flat + 32×32
+  pseudo-random + 32×32 horizontal gradient + 64×64 flat + 64×64
+  pseudo-random). Total +23 tests.
+
+  Out of scope: frames larger than 64×64 (multi-super-block tiling),
+  rectangular partitions, larger TX sizes, `base_q_idx > 0`, monochrome
+  / 4:2:2 / 4:4:4 sampling, inter mode_info, and a bit-cost-aware RD
+  picker — all follow-ups for subsequent arcs.
+
 * **Round 229 — Encoder picks from all 13 §6.10.x intra prediction
   modes per chroma 4×4 block (mirror of r228's luma picker).** The
   pixel driver (`encoder::pixel_driver::encode_intra_frame_yuv`) now

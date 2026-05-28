@@ -66,5 +66,6 @@
 //!   * §7.13 — Inverse transform.
 
 pub mod pixel_driver;
+pub mod pixel_driver_dyn;
 
 pub use pixel_driver::{decode_av1, decode_temporal_unit, Frame, TemporalUnitResult};
