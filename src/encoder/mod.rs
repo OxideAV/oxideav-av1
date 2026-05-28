@@ -91,13 +91,19 @@
 //!     [`crate::cdf::get_br_ctx`] derive them from the running `Quant[]`
 //!     array on both sides.
 //!
-//! Next arc: the `golomb_length_bit` / `golomb_data_bit` tail for
-//! coefficient magnitudes above `NUM_BASE_LEVELS + COEFF_BASE_RANGE`,
-//! followed by the §5.11.39 driver loop (the reverse-scan +
-//! forward-scan composite) and the §5.11.4 partition decision-tree
-//! writer; inter-arm mode_info writers (§5.11.18 dispatcher composite).
-//! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
-//! signed-subexp inverse for the remaining inter-frame paths.
+//! Arc 8 (round 214) landed the `golomb_length_bit` / `golomb_data_bit`
+//! magnitude tail (§5.11.39 lines 84-93) for coefficient magnitudes
+//! above `NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`, with the
+//! §6.10.34 `length <= 20` conformance bound enforced as a caller-bug
+//! reject.
+//!
+//! Next arc: the §5.11.39 driver loop (the reverse-scan + forward-scan
+//! composite that sequences `coeff_base_eob` / `coeff_base` /
+//! `coeff_br` / sign / `golomb` for every scan position) and the
+//! §5.11.4 partition decision-tree writer; inter-arm mode_info writers
+//! (§5.11.18 dispatcher composite). §5.9.7 `frame_size_with_refs()`
+//! inverse + §5.9.24 `read_global_param` signed-subexp inverse for the
+//! remaining inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
@@ -116,7 +122,7 @@ pub use block_mode_info::{
 };
 pub use coefficients::{
     write_coeff_base, write_coeff_base_eob, write_coeff_br, write_dc_sign, write_eob_pt,
-    write_txb_skip,
+    write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
 };
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;

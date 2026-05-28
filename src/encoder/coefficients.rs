@@ -41,11 +41,21 @@
 //!     `TileDcSignCdf[ ptype ][ ctx ]` (§8.3.2). Writer:
 //!     [`write_dc_sign`].
 //!
-//! Scope of this arc is intentionally tight: the per-magnitude
-//! `golomb_length_bit` / `golomb_data_bit` tail (§5.11.39 lines 84-93,
-//! for magnitudes above `NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`) is
-//! out of scope, as is the full `coefficients()` driver loop that
-//! sequences these primitives across the reverse + forward scans.
+//! Arc 8 (round 214) extends with the §5.11.39 lines 84-93 golomb
+//! magnitude-tail writer for coefficient magnitudes above
+//! `NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`:
+//!
+//!   * Inside the forward-scan loop, when `Quant[pos] > 14` the decoder
+//!     enters a `golomb_length_bit` do-while unary loop followed by a
+//!     `golomb_data_bit` MSB-first L(1) payload that rebuilds the
+//!     magnitude as `x + COEFF_BASE_RANGE + NUM_BASE_LEVELS`. Writer:
+//!     [`write_golomb`]. The §6.10.34 conformance bound
+//!     (`length <= 20`) is enforced as a caller-bug reject.
+//!
+//! Scope of this arc is the per-magnitude golomb tail only; the full
+//! `coefficients()` driver loop that sequences `coeff_base_eob` /
+//! `coeff_base` / `coeff_br` / sign / `golomb` across the reverse +
+//! forward scans is the next arc.
 //!
 //! ## Stateless on purpose
 //!
@@ -71,12 +81,21 @@
 //! [`block_mode_info`]: crate::encoder::block_mode_info
 
 use crate::cdf::{
-    TileCdfContext, BR_CDF_SIZE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS, LEVEL_CONTEXTS, PLANE_TYPES,
-    SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB, TXB_SKIP_CONTEXTS, TX_SIZES, TX_SIZES_ALL,
-    TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
+    TileCdfContext, BR_CDF_SIZE, COEFF_BASE_RANGE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS,
+    LEVEL_CONTEXTS, NUM_BASE_LEVELS, PLANE_TYPES, SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB,
+    TXB_SKIP_CONTEXTS, TX_SIZES, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
+
+/// Maximum §5.11.39 golomb `length` permitted by the conformance
+/// constraint of §6.10.34 (av1-spec p.392): "If length is equal to 20,
+/// it is a requirement of bitstream conformance that golomb_length_bit
+/// is equal to 1." A `length > 20` would describe a magnitude exceeding
+/// the 20-bit `Quant[pos] & 0xFFFFF` clip the §5.11.39 line-97 mask
+/// enforces, so the writer rejects it as a caller bug rather than
+/// emitting a non-conformant stream.
+pub const GOLOMB_MAX_LENGTH: u32 = 20;
 
 /// `txb_skip` (== `all_zero`) writer per §5.11.39 line 13 (av1-spec
 /// p.89) and §8.3.2 (av1-spec p.371).
@@ -614,6 +633,109 @@ pub fn write_coeff_br(
         .coeff_br_cdf(tx_sz_ctx, ptype, ctx)
         .ok_or(Error::PartitionWalkOutOfRange)?;
     writer.write_symbol(sym as u32, cdf)
+}
+
+/// `golomb` magnitude-tail writer per §5.11.39 lines 84-93 (av1-spec
+/// p.91) and §6.10.34 semantics (av1-spec p.392).
+///
+/// Spec body (extracted, inside the forward-scan loop when
+/// `Quant[pos] > NUM_BASE_LEVELS + COEFF_BASE_RANGE`):
+/// ```text
+///   length = 0
+///   do {
+///       length++
+///       golomb_length_bit                                       L(1)
+///   } while ( !golomb_length_bit )
+///
+///   x = 1
+///   for ( i = length - 2; i >= 0; i-- ) {
+///       golomb_data_bit                                         L(1)
+///       x = ( x << 1 ) | golomb_data_bit
+///   }
+///   Quant[ pos ] = x + COEFF_BASE_RANGE + NUM_BASE_LEVELS
+/// ```
+///
+/// ## Inverse strategy
+///
+/// Given a target magnitude `value` (the §5.11.39 `Quant[pos]` after the
+/// `coeff_base` + `coeff_br` chain has saturated at `NUM_BASE_LEVELS +
+/// COEFF_BASE_RANGE = 14` and the caller has determined the magnitude
+/// must continue), the writer derives `x = value - 14` (always
+/// `x >= 1`) and `length = floor_log2(x) + 1` (the bit-length of `x`).
+///
+/// It then emits the §5.11.39 line 76-79 unary length prefix as
+/// `length - 1` `L(1) = 0` bits followed by an `L(1) = 1` terminator —
+/// the do-while loop on the decoder side reads bits until the first
+/// `1`, so `length` is the index (1-based) of the terminator. Finally
+/// it emits the `length - 1` `golomb_data_bit` payload bits MSB-first:
+/// the implicit leading `1` of `x` is the §5.11.39 line 87 `x = 1`
+/// seed, and the remaining `length - 1` bits of `x` are emitted in
+/// descending position order to match the decoder's
+/// `x = (x << 1) | golomb_data_bit` rebuild.
+///
+/// ## Caller-supplied state
+///
+/// * `value` — the target post-golomb `Quant[pos]` magnitude (unsigned;
+///   the sign lives in the `dc_sign` / `sign_bit` write that already
+///   landed before this call inside the forward-scan loop). MUST
+///   satisfy `value > NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`; a
+///   smaller value would not have entered the §5.11.39 line-73 gate and
+///   is a caller bug.
+///
+/// ## Conformance
+///
+/// The §6.10.34 semantics constrain `length <= 20`: at `length == 20`
+/// the `golomb_length_bit` is required to be `1` (the do-while
+/// terminator), and a `length > 20` would code a magnitude past the
+/// §5.11.39 line-97 `Quant[pos] & 0xFFFFF` 20-bit clip. The writer
+/// rejects `value` that would derive `length > GOLOMB_MAX_LENGTH = 20`
+/// as a caller bug — `value <= 0xFFFFF + 14 = 1048589` is the
+/// representable range, and `x >= 0x80000 = 524288` already saturates
+/// `length == 20`.
+///
+/// Returns [`Error::PartitionWalkOutOfRange`] for any out-of-range
+/// `value` and propagates any [`SymbolWriter::write_literal`] error.
+pub fn write_golomb(writer: &mut SymbolWriter, value: u32) -> Result<(), Error> {
+    let threshold = (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as u32;
+    if value <= threshold {
+        // §5.11.39 line 73 gate: the golomb tail is only emitted when
+        // the magnitude exceeds NUM_BASE_LEVELS + COEFF_BASE_RANGE.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let x: u32 = value - threshold;
+    // §5.11.39 line 87 derivation: `x = 1` is the do-while loop's
+    // post-condition seed; `length` is the bit-length of `x` (so that
+    // `length - 1` data bits, prepended with the implicit MSB = 1,
+    // rebuild `x` exactly).
+    debug_assert!(x >= 1, "value > threshold guarantees x >= 1");
+    let length: u32 = 32 - x.leading_zeros();
+    if length > GOLOMB_MAX_LENGTH {
+        // §6.10.34 conformance constraint: length <= 20.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.39 lines 75-79: unary length prefix. The decoder's do-while
+    // loop increments `length` before checking the bit, so the first
+    // iteration is always entered — i.e. the bit stream is
+    // `0` * (length - 1) followed by `1`. Total bits emitted = length.
+    for _ in 0..(length - 1) {
+        writer.write_literal(1, 0)?;
+    }
+    writer.write_literal(1, 1)?;
+
+    // §5.11.39 lines 87-91: data-bit payload. The decoder seeds `x = 1`
+    // and shifts in `length - 1` bits MSB-first via
+    // `x = (x << 1) | bit`. The inverse: emit bits `length - 2 .. 0` of
+    // `x` (the high `length - 1` bits below the implicit MSB).
+    if length >= 2 {
+        let payload_bits = length - 1;
+        for i in (0..payload_bits).rev() {
+            let bit = (x >> i) & 0x1;
+            writer.write_literal(1, bit)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1366,5 +1488,179 @@ mod tests {
             dec.read_symbol(cdf).unwrap()
         };
         assert_eq!(sym_br, 0, "coeff_br round-trips");
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.39 write_golomb — round-trips through the matching L(1)
+    // loops (golomb_length_bit + golomb_data_bit) at the magnitude-tail
+    // entry inside the forward-scan loop.
+    // -----------------------------------------------------------------
+
+    /// Shim mirroring the §5.11.39 lines 75-93 reader: a do-while unary
+    /// length prefix followed by `length - 1` raw L(1) data bits.
+    /// Returns the rebuilt `Quant[pos]` magnitude (`x + COEFF_BASE_RANGE
+    /// + NUM_BASE_LEVELS`). The §6.10.34 conformance constraint allows
+    /// `length` up to 20.
+    fn read_golomb(dec: &mut SymbolDecoder<'_>) -> u32 {
+        let mut length: u32 = 0;
+        loop {
+            length += 1;
+            let bit = dec.read_literal(1).unwrap();
+            if bit != 0 {
+                break;
+            }
+            assert!(length <= GOLOMB_MAX_LENGTH, "length must terminate by 20");
+        }
+        let mut x: u32 = 1;
+        if length >= 2 {
+            let payload_bits = length - 1;
+            for _ in 0..payload_bits {
+                let bit = dec.read_literal(1).unwrap();
+                x = (x << 1) | bit;
+            }
+        }
+        x + (COEFF_BASE_RANGE as u32) + (NUM_BASE_LEVELS as u32)
+    }
+
+    /// `value = 15` — the smallest §5.11.39 magnitude that enters the
+    /// golomb tail (just past the `NUM_BASE_LEVELS + COEFF_BASE_RANGE =
+    /// 14` gate). `x = 1`, `length = 1` ⇒ just the unary terminator,
+    /// no data bits. Round-trips.
+    #[test]
+    fn write_golomb_min_magnitude_round_trip() {
+        let mut writer = SymbolWriter::new(false);
+        write_golomb(&mut writer, 15).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let value = read_golomb(&mut dec);
+        assert_eq!(value, 15);
+    }
+
+    /// `value = 16` — `x = 2`, `length = 2` ⇒ one zero, one terminator,
+    /// one data bit = 0. Round-trips.
+    #[test]
+    fn write_golomb_value_16_round_trip() {
+        let mut writer = SymbolWriter::new(false);
+        write_golomb(&mut writer, 16).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let value = read_golomb(&mut dec);
+        assert_eq!(value, 16);
+    }
+
+    /// `value = 21` — `x = 7 = 0b111`, `length = 3` ⇒ `00 1 11` (two
+    /// zeros, terminator, two data bits = 1, 1). Round-trips and
+    /// confirms MSB-first data emission.
+    #[test]
+    fn write_golomb_value_21_round_trip() {
+        let mut writer = SymbolWriter::new(false);
+        write_golomb(&mut writer, 21).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let value = read_golomb(&mut dec);
+        assert_eq!(value, 21);
+    }
+
+    /// `value = 270` — `x = 256 = 0b1_0000_0000`, `length = 9`. Eight
+    /// zero data bits below the implicit MSB. Round-trips and exercises
+    /// the middle-of-range length.
+    #[test]
+    fn write_golomb_value_270_round_trip() {
+        let mut writer = SymbolWriter::new(false);
+        write_golomb(&mut writer, 270).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let value = read_golomb(&mut dec);
+        assert_eq!(value, 270);
+    }
+
+    /// `value` exhaustively swept across small magnitudes — every
+    /// representable magnitude with `length <= 4` (i.e. `x ∈ 1..=15`,
+    /// `Quant[pos] ∈ 15..=29`) round-trips. This exercises every byte
+    /// boundary the BitWriter padding might wander past on a single
+    /// magnitude.
+    #[test]
+    fn write_golomb_small_magnitudes_round_trip_exhaustive() {
+        for value in 15u32..=29 {
+            let mut writer = SymbolWriter::new(false);
+            write_golomb(&mut writer, value).unwrap();
+            let bytes = writer.finish();
+
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let got = read_golomb(&mut dec);
+            assert_eq!(got, value, "value {value} did not round-trip");
+        }
+    }
+
+    /// `value = 1048589` — the maximum representable magnitude
+    /// (`x = 0xFFFFF = 1_048_575`, `length = 20`). Confirms the
+    /// §6.10.34 upper edge round-trips.
+    #[test]
+    fn write_golomb_max_magnitude_round_trip() {
+        let value: u32 = (0xFFFFFu32) + (COEFF_BASE_RANGE as u32) + (NUM_BASE_LEVELS as u32);
+        let mut writer = SymbolWriter::new(false);
+        write_golomb(&mut writer, value).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let got = read_golomb(&mut dec);
+        assert_eq!(got, value);
+    }
+
+    /// `value = 14` is a caller bug — the §5.11.39 line-73 gate
+    /// requires `Quant[pos] > NUM_BASE_LEVELS + COEFF_BASE_RANGE` for
+    /// the golomb tail to be entered at all.
+    #[test]
+    fn write_golomb_rejects_value_at_threshold() {
+        let mut writer = SymbolWriter::new(false);
+        let err = write_golomb(&mut writer, 14).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `value = 0` is also a caller bug — well below the gate.
+    #[test]
+    fn write_golomb_rejects_zero() {
+        let mut writer = SymbolWriter::new(false);
+        let err = write_golomb(&mut writer, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `value = 1048590` exceeds the §6.10.34 conformance limit
+    /// (`length` would be 21) — caller bug.
+    #[test]
+    fn write_golomb_rejects_value_past_conformance_limit() {
+        let value: u32 = (0xFFFFFu32) + (COEFF_BASE_RANGE as u32) + (NUM_BASE_LEVELS as u32) + 1;
+        let mut writer = SymbolWriter::new(false);
+        let err = write_golomb(&mut writer, value).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Sequence `dc_sign` then `write_golomb` — the natural pairing
+    /// inside the §5.11.39 forward-scan loop at `c == 0` when the DC
+    /// magnitude exceeds 14. Confirms the L(1) golomb bits compose
+    /// correctly after a §8.2.6 S() sign emission.
+    #[test]
+    fn sequence_dc_sign_then_golomb_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // dc_sign = 1 (negative DC), luma ptype, ctx 0.
+        write_dc_sign(&mut writer, &mut enc_cdfs, 1, 0, 0).unwrap();
+        // golomb magnitude = 18 (x = 4, length = 3).
+        write_golomb(&mut writer, 18).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sign = {
+            let cdf = dec_cdfs.dc_sign_cdf(0, 0).unwrap();
+            dec.read_symbol(cdf).unwrap()
+        };
+        assert_eq!(sign, 1);
+        let magnitude = read_golomb(&mut dec);
+        assert_eq!(magnitude, 18);
     }
 }
