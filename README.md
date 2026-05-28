@@ -2,6 +2,53 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 220)
+
+Round 220 continues the **pixel-space encoder bootstrap** with the
+**forward quantization primitive** — the inverse of the §7.12.3 step-1
+dequant loop in `cdf::dequantize_step1`. Round 219 landed the forward
+4×4 DCT (pixel residuals → coefficients); round 220 lands the next
+stage (coefficients → `Quant[]` levels) so the §5.11.39 `coefficients()`
+writer (round 215) has something to consume from a pixel-space
+encoder.
+
+`encoder::forward_quantize` — one stateless function (re-exported from
+`encoder`):
+
+* **`forward_quantize(coeffs, tx_size, plane, segment_id,
+  plane_tx_type, seg_qm_level, quant) -> Vec<i32>`** — derives `q2`,
+  `dqDenom`, and the `qm_active` predicate using the same
+  `cdf::dequant_denom` / `cdf::get_{dc,ac}_quant` /
+  `qmatrix::qmatrix_value` helpers the decoder reads, then inverts
+  the spec's `Dequant = sign(Quant) * (|Quant| * q2 / dqDenom)`
+  truncating divide with round-half-away-from-zero. The half-away
+  bias on the encoder side balances the toward-zero bias on the
+  decoder side, so `dequant(forward_quantize(c))` lands on the
+  nearest reachable lattice point to `c`.
+
+Bit-exact roundtrip is verified through `cdf::dequantize_step1`: for
+any caller-chosen `Quant[]` whose dequant stays in range,
+`forward_quantize(dequantize_step1(Quant)) == Quant` bit-exactly. For
+arbitrary off-lattice coefficients the per-coefficient error is
+bounded by one quantization step.
+
+10 new lib tests (1298 → 1308): lossless `q_index = 0` TX_4X4 (DC +
+AC slots), sign preservation, lossy half-away rounding behaviour at
+`q_index = 0` (ties round up in magnitude), higher `q_index = 16`
+aligned-coeff roundtrip, TX_8X8 lossless roundtrip (the 8×8 active
+region), all-zero-coeff identity across multiple `q_index` values,
+`dequant → forward_quantize` roundtrip inversion over four distinct
+level patterns including magnitudes up to 4096, QM-active branch
+roundtrip (`using_qmatrix = true`, `seg_qm_level = 0`,
+`plane_tx_type = DCT_DCT`), and two caller-bug panic tests (short
+buffer + out-of-range `tx_size`).
+
+Out of scope this arc (next): forward DCT for sizes 8 / 16 / 32 / 64;
+forward ADST / FLIPADST / WHT / IDTX; §7.13.3-equivalent forward 2D
+dispatcher with row-/col-shift envelope; full pixel-space encoder
+driver assembling the forward kernels with `forward_quantize` + the
+r211–r218 syntax writers, packaged as a YUV → IVF entry.
+
 ## Status — 2026-05-28 (round 219)
 
 Round 219 starts the **pixel-space encoder bootstrap** — the bridge

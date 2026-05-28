@@ -6,6 +6,45 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 220 — forward quantization primitive.** Encoder counterpart
+  of the §7.12.3 step-1 dequant loop (`cdf::dequantize_step1`). New
+  function `encoder::forward_quantize::forward_quantize(coeffs,
+  tx_size, plane, segment_id, plane_tx_type, seg_qm_level, quant) ->
+  Vec<i32>` consumes a post-forward-transform coefficient buffer plus
+  the per-frame `QuantizerParams` and per-block selectors and returns
+  the dense `Tx_Width[tx] * Tx_Height[tx]` `Quant[]` array a §5.11.39
+  `coefficients()` writer (round 215) consumes.
+
+  Derivation: the spec body
+  `dq2 = sign(dq) * (|dq| & 0xFFFFFF) / dqDenom` simplifies (under
+  typical `|Quant * q2| < 2^24`) to
+  `Dequant = sign(Quant) * (|Quant| * q2 / dqDenom)` with the divide
+  truncating toward zero. Solving for `Quant` with round-half-away-
+  from-zero gives `Quant = round((|coeff| * dqDenom) / q2)` carrying
+  the sign of `coeff`. The `q2`, `dqDenom`, and `qm_active`
+  derivations are reused from `cdf` so the encoder reads the same
+  §7.12.2 lookups and the same §9.5.3 `Quantizer_Matrix[][][]` the
+  decoder reads.
+
+  Bit-exact roundtrip is verified through the decoder's existing
+  `dequantize_step1`: for any caller-chosen `Quant[]` whose dequant
+  stays in range, `forward_quantize(dequantize_step1(Quant)) == Quant`
+  exactly. For arbitrary (off-lattice) coefficients the recovered
+  level is within one quantization step of the analytic optimum.
+
+  10 tests: lossless `q_index = 0` TX_4X4 (DC + AC slots), sign
+  preservation, lossy half-away rounding behaviour at `q_index = 0`
+  (ties round up in magnitude — matches the encoder's half-away-from-
+  zero bias against the decoder's toward-zero truncation), higher
+  `q_index = 16` aligned-coeff roundtrip, TX_8X8 lossless roundtrip
+  (the 8×8 active region), all-zero-coeff identity across multiple
+  `q_index` values, full `dequant → forward_quantize` roundtrip
+  inversion over four distinct level patterns including magnitudes up
+  to 4096, QM-active branch roundtrip (`using_qmatrix = true`,
+  `seg_qm_level = 0`, `plane_tx_type = DCT_DCT`), and two caller-bug
+  panic tests (short buffer + out-of-range `tx_size`). Test total
+  1298 → 1308.
+
 * **Round 219 — pixel-space encoder bootstrap: forward 4×4 DCT.** First
   primitive that takes pixel residuals as input (the rest of the
   encoder arc 1..12 consumed pre-decided `Quant[]` arrays). Two

@@ -150,17 +150,29 @@
 //! between the arc-1..12 syntax-only encoder (consumes pre-decided
 //! `Quant[]`) and a real encoder that takes pixel residuals as input.
 //!
+//! Arc 14 (round 220) lands the **forward quantization primitive** —
+//! [`forward_quantize::forward_quantize`], the encoder counterpart of
+//! [`crate::cdf::dequantize_step1`]. Consumes a post-forward-transform
+//! coefficient buffer, the per-frame [`crate::cdf::QuantizerParams`],
+//! and the per-block plane / segment / tx-type / qm-level selectors;
+//! returns the dense `Tx_Width * Tx_Height` `Quant[]` array the
+//! §5.11.39 `coefficients()` writer consumes. Round-half-away-from-
+//! zero inversion of the spec's `(|dq| & 0xFF_FFFF) / dqDenom`
+//! truncating divide; bit-exact roundtrip on the lossless
+//! `q_index = 0` lattice and within one quantization step elsewhere.
+//!
 //! Next arc: forward DCT for sizes 8 / 16 / 32 / 64; forward ADST /
-//! FLIPADST / WHT / IDTX; quantization primitive; full pixel-space
-//! encoder driver assembling the forward kernels with quant + the
-//! r211–r218 syntax writers. §5.11.18 inter-arm `mode_info()`
-//! dispatcher; intra angle / palette encode. §5.9.7
+//! FLIPADST / WHT / IDTX; full pixel-space encoder driver assembling
+//! the forward kernels with [`forward_quantize`] + the r211–r218
+//! syntax writers, packaged as a YUV → IVF entry. §5.11.18 inter-arm
+//! `mode_info()` dispatcher; intra angle / palette encode. §5.9.7
 //! `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
 //! signed-subexp inverse for the remaining inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
 pub mod coefficients;
+pub mod forward_quantize;
 pub mod forward_transform;
 pub mod frame_obu;
 pub mod ivf;
@@ -181,6 +193,7 @@ pub use coefficients::{
     write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,
     write_eob_pt, write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
 };
+pub use forward_quantize::forward_quantize;
 pub use forward_transform::{forward_dct_4, forward_dct_4x4};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;
