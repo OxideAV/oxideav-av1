@@ -2,6 +2,60 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 229)
+
+Round 229 mirrors r228's luma picker on the **chroma path** —
+`encoder::pixel_driver::encode_intra_frame_yuv` now selects per
+chroma 4×4 block from all 13 §6.10.x intra modes (`DC_PRED` through
+`PAETH_PRED`, the §3 INTRA_MODES set) by **combined U+V residual
+SSD**, replacing the r223 hardcoded `uv_mode = DC_PRED`. Per §5.11.22
+one `intra_uv_mode()` symbol governs both chroma planes, so the
+picker minimises joint residual energy rather than picking U and V
+independently. The chosen mode is committed via `write_intra_uv_mode`
+(r211) under the CFL-allowed CDF row (lossless = false, sub_size
+BLOCK_4X4 ≤ 32 ⇒ §8.3.2 picks `TileUVModeCflAllowedCdf[ YMode ]`,
+14 outcomes; the picker enumerates only 0..13).
+
+The decoder gains a matching §7.11.2.{2..6} chroma dispatch in
+`decoder::pixel_driver::decode_block_leaf` keyed by the decoded
+`uv_mode`, replacing the r228 hard-reject of non-DC_PRED chroma.
+`derive_intra_neighbours_4x4_chroma` (decoder side) computes the
+§7.11.2.1 prologue against the running reconstructed chroma plane;
+`predict_intra_chroma_for_mode_4x4` then routes through the
+matching kernel (`predict_intra_dc_pred` / `predict_intra_v_pred` /
+`predict_intra_h_pred` / `predict_intra_d_mode` /
+`predict_intra_smooth*_pred` / `predict_intra_paeth_pred`). The
+full encode → decode → pixels roundtrip stays bit-exact under the
+lossless `base_q_idx = 0` arm regardless of which chroma mode the
+picker selects.
+
+`EncodedFrameYuv` gains a `committed_uv_modes: Vec<u8>` field
+surfacing the per-chroma-cell picker output (4 entries under the
+4:2:0 BLOCK_4X4 walk). UV_CFL_PRED (ordinal 13) is out of scope
+this arc — the chroma kernels don't yet implement the §7.11.5.3 CFL
+αU/αV linear predictor path; the decoder hard-rejects
+`uv_mode >= 13`.
+
+The picker is residual-SSD-only — it does **not** model the §5.11.22
+`uv_mode` rate cost (the §8.3.2 chroma-CDF row probabilities) so
+non-DC selections can occasionally cost more symbol bits than they
+save in residual energy. Full RD with bit-cost weighting is a
+follow-up arc (same as the luma side).
+
+5 new lib unit tests (1452 → 1457) + 7 new integration tests on
+`encode_decode_pixel_roundtrip` (11 → 18): chroma picker enumerates
+each mode once, horizontal-chroma-gradient input ⇒ non-DC pick,
+vertical-chroma-gradient input ⇒ non-DC pick, flat-128 ⇒ DC_PRED
+tie-break, committed range bounded by `NUM_INTRA_MODES_Y`,
+end-to-end roundtrip bit-exact on chroma gradient / pseudo-random
+YUV / 0-255 extremes.
+
+Out of scope (next arc): UV_CFL_PRED (§7.11.5.3 CFL αU/αV linear
+predictor); rectangular TX sizes for `forward_transform_2d`;
+§5.11.18 inter-arm `mode_info()` dispatcher; intra angle / palette
+encode; full RD with §5.11.22 bit-cost weighting; larger frame
+extents past 16×16.
+
 ## Status — 2026-05-29 (round 228)
 
 Round 228 lands the **encoder's 13-mode intra prediction picker** —

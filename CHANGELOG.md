@@ -6,6 +6,43 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 229 — Encoder picks from all 13 §6.10.x intra prediction
+  modes per chroma 4×4 block (mirror of r228's luma picker).** The
+  pixel driver (`encoder::pixel_driver::encode_intra_frame_yuv`) now
+  runs a combined-U+V-SSD picker over each of the 13 §6.10.x intra
+  modes (the §3 INTRA_MODES set — `DC_PRED` through `PAETH_PRED`) on
+  every chroma 4×4 block and commits the lowest-SSD pick via
+  `write_intra_uv_mode` (r211). Per §5.11.22 one `intra_uv_mode()`
+  symbol governs both U and V planes, so the picker minimises joint
+  residual energy rather than picking U and V independently. Replaces
+  the r223 hardcoded `uv_mode = DC_PRED`. The decoder gains a matching
+  §7.11.2.{2..6} dispatch in `decoder::pixel_driver::decode_block_leaf`
+  that routes the decoded `uv_mode` through the matching
+  sample-generation kernel against a `CHROMA_HEIGHT × CHROMA_WIDTH`
+  surface (`predict_intra_chroma_for_mode_4x4` +
+  `derive_intra_neighbours_4x4_chroma`).
+
+  Lossless `base_q_idx = 0` arm is preserved: every chroma picker
+  selection still routes through the bit-exact forward WHT → forward
+  quantize → dequantize → inverse WHT chain so the end-to-end YUV
+  roundtrip stays bit-exact regardless of which chroma mode the
+  picker selects. `EncodedFrameYuv` gains a
+  `committed_uv_modes: Vec<u8>` field surfacing the per-chroma-cell
+  picker output (4 entries under the 4:2:0 BLOCK_4X4 walk).
+  UV_CFL_PRED (ordinal 13) stays out of scope this arc — the §7.11.5.3
+  CFL αU/αV linear predictor path isn't wired yet; the decoder
+  hard-rejects `uv_mode >= 13`. New test coverage: 5 lib unit tests +
+  7 integration tests (horizontal-chroma-gradient ⇒ picker selects
+  non-DC, vertical chroma gradient ⇒ non-DC, flat-128 ⇒ DC_PRED
+  tie-break, in-range bounds, end-to-end roundtrip bit-exact on
+  chroma gradient / pseudo-random YUV / 0-255 extremes).
+
+  The picker is residual-SSD-only — it does **not** model the
+  §5.11.22 `uv_mode` rate cost (the §8.3.2 chroma-CDF row
+  probabilities) so non-DC selections can occasionally cost more
+  symbol bits than they save in residual energy. Full RD with
+  bit-cost weighting is a follow-up arc (same as the luma side).
+
 * **Round 228 — Encoder picks from all 13 §6.10.x Y intra prediction
   modes per BLOCK_4X4 leaf.** The pixel driver
   (`encoder::pixel_driver::encode_intra_frame_y` /

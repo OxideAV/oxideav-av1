@@ -348,3 +348,259 @@ fn encoder_keeps_dc_pred_on_flat_grey_input_y_only() {
         );
     }
 }
+
+// --------------------------------------------------------------------------
+// Arc r229 — chroma 13-mode intra prediction picker tests.
+//
+// The encoder's `pick_best_intra_mode_4x4_chroma` selects whichever of the
+// 13 §6.10.x intra modes yields the smallest *combined* U+V residual SSD
+// against the input chroma 4×4 block. These tests confirm:
+//
+//   1. The picker can select a non-DC_PRED mode on chroma surfaces with
+//      a clear directional / smooth structure.
+//   2. The decoder dispatches the decoded `uv_mode` correctly so the full
+//      roundtrip stays pixel-exact under the lossless WHT chain.
+//   3. The encoder's `committed_uv_modes` field is in-range and matches
+//      the number of HasChroma cells (4 under the 4:2:0 BLOCK_4X4 walk).
+//   4. Flat-grey input keeps the DC_PRED tie-break.
+// --------------------------------------------------------------------------
+
+#[test]
+fn encoder_picks_non_dc_pred_on_horizontal_chroma_gradient() {
+    // U and V planes carry a horizontal gradient (j * 30) while luma
+    // stays flat at 100 — V_PRED is the best fit on chroma cells past
+    // the leftmost column (the above-row reconstructed sample equals
+    // every cell below it by construction).
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    for row in input.y.iter_mut() {
+        for c in row.iter_mut() {
+            *c = 100;
+        }
+    }
+    for row in input.u.iter_mut() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = ((j as u32) * 30) as u8;
+        }
+    }
+    for row in input.v.iter_mut() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = (255u8).wrapping_sub(((j as u32) * 30) as u8);
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let non_dc_count = encoded
+        .committed_uv_modes
+        .iter()
+        .filter(|&&m| m as usize != 0 /* DC_PRED ordinal */)
+        .count();
+    assert!(
+        non_dc_count > 0,
+        "expected at least one non-DC_PRED uv_mode on a horizontal chroma gradient, got {:?}",
+        encoded.committed_uv_modes
+    );
+}
+
+#[test]
+fn encoder_picks_non_dc_pred_on_vertical_chroma_gradient() {
+    // Vertical chroma gradient — H_PRED is the best fit on cells past
+    // the top row.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    for row in input.y.iter_mut() {
+        for c in row.iter_mut() {
+            *c = 100;
+        }
+    }
+    for (i, row) in input.u.iter_mut().enumerate() {
+        for cell in row.iter_mut() {
+            *cell = ((i as u32) * 30) as u8;
+        }
+    }
+    for (i, row) in input.v.iter_mut().enumerate() {
+        for cell in row.iter_mut() {
+            *cell = (255u8).wrapping_sub(((i as u32) * 30) as u8);
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let non_dc_count = encoded
+        .committed_uv_modes
+        .iter()
+        .filter(|&&m| m as usize != 0)
+        .count();
+    assert!(
+        non_dc_count > 0,
+        "expected at least one non-DC_PRED uv_mode on a vertical chroma gradient, got {:?}",
+        encoded.committed_uv_modes
+    );
+}
+
+#[test]
+fn encoder_committed_uv_modes_are_all_in_intra_mode_range() {
+    // Every committed_uv_modes entry must be in 0..13. Run against
+    // pseudo-random chroma planes.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    let mut state: u64 = 0xDEAD_BEEF_FEED_BABE;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for row in input.y.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    for row in input.u.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    for row in input.v.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    assert_eq!(encoded.committed_uv_modes.len(), 4);
+    for (idx, &m) in encoded.committed_uv_modes.iter().enumerate() {
+        assert!(
+            (m as usize) < 13,
+            "chroma cell {idx}: uv_mode = {m} out of 0..13"
+        );
+    }
+}
+
+#[test]
+fn encode_decode_roundtrip_with_chroma_picker_on_chroma_gradient() {
+    // Full encode → decode roundtrip stays bit-exact on a chroma-only
+    // gradient. The lossless WHT chain is bit-exact for any prediction,
+    // and the decoder's r229 dispatcher routes the decoded uv_mode
+    // through the matching §7.11.2.{2..6} chroma kernel.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    for row in input.y.iter_mut() {
+        for c in row.iter_mut() {
+            *c = 100;
+        }
+    }
+    for row in input.u.iter_mut() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = ((j as u32) * 30) as u8;
+        }
+    }
+    for (i, row) in input.v.iter_mut().enumerate() {
+        for cell in row.iter_mut() {
+            *cell = ((i as u32) * 30) as u8;
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let decoded = decode_av1(&encoded.ivf_bytes).unwrap();
+    match &decoded[0] {
+        Frame::Yuv420_16x16 { y, u, v } => {
+            assert_eq!(y, &input.y, "Y bit-exact after chroma picker + decode");
+            assert_eq!(u, &input.u, "U bit-exact after chroma picker + decode");
+            assert_eq!(v, &input.v, "V bit-exact after chroma picker + decode");
+        }
+    }
+    let non_dc_count = encoded
+        .committed_uv_modes
+        .iter()
+        .filter(|&&m| m as usize != 0)
+        .count();
+    assert!(
+        non_dc_count > 0,
+        "expected non-DC_PRED uv_mode on chroma gradient, got {:?}",
+        encoded.committed_uv_modes
+    );
+}
+
+#[test]
+fn encode_decode_roundtrip_with_chroma_picker_on_pseudorandom_yuv() {
+    // Pseudo-random YUV — chroma picker selection per cell is
+    // essentially arbitrary, but the roundtrip is still bit-exact
+    // end-to-end. Mirrors the luma r228 test against the chroma path.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    let mut state: u64 = 0xBEEF_C0DE_FACE_FACE;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for row in input.y.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    for row in input.u.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    for row in input.v.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let decoded = decode_av1(&encoded.ivf_bytes).unwrap();
+    match &decoded[0] {
+        Frame::Yuv420_16x16 { y, u, v } => {
+            assert_eq!(y, &input.y);
+            assert_eq!(u, &input.u);
+            assert_eq!(v, &input.v);
+        }
+    }
+}
+
+#[test]
+fn encoder_keeps_dc_pred_on_flat_grey_input_chroma() {
+    // Flat-128 input on every plane ⇒ every chroma prediction collapses
+    // to 128 ⇒ ties ⇒ DC_PRED wins on every chroma cell.
+    let (seq, fh) = tiny_descriptors();
+    let input = Yuv420Frame16x16::default(); // all-128 mid-grey
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    for (idx, &m) in encoded.committed_uv_modes.iter().enumerate() {
+        assert_eq!(
+            m as usize, 0,
+            "flat-128 chroma: cell {idx} should pick DC_PRED (0), got {m}"
+        );
+    }
+}
+
+#[test]
+fn encode_decode_roundtrip_with_chroma_picker_on_extremes() {
+    // 0/255 extremes on chroma planes — the picker may select any of
+    // the 13 modes per cell, but the lossless arm must still recover
+    // bit-exact.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    for (i, row) in input.y.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = if (i + j) & 1 == 0 { 0 } else { 255 };
+        }
+    }
+    for (i, row) in input.u.iter_mut().enumerate() {
+        for cell in row.iter_mut() {
+            *cell = if i & 1 == 0 { 0 } else { 255 };
+        }
+    }
+    for row in input.v.iter_mut() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = if j & 1 == 0 { 0 } else { 255 };
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let decoded = decode_av1(&encoded.ivf_bytes).unwrap();
+    match &decoded[0] {
+        Frame::Yuv420_16x16 { y, u, v } => {
+            assert_eq!(y, &input.y);
+            assert_eq!(u, &input.u);
+            assert_eq!(v, &input.v);
+        }
+    }
+}

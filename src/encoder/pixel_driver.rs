@@ -87,8 +87,9 @@
 //!     reaching pixel roundtrip via the decoder is a separate arc.
 //!   * Anything beyond TX_4X4 DCT_DCT. Forward transforms for larger
 //!     sizes / non-DCT kernels are subsequent arcs.
-//!   * Non-`DC_PRED` chroma modes. r223 always picks `uv_mode = DC_PRED`
-//!     (matches the luma side). CFL / V_PRED / etc. are future arcs.
+//!   * UV_CFL_PRED (the §7.11.5.3 CFL αU/αV linear predictor).
+//!     r229 wires the picker through the 13 §6.10.x intra modes that
+//!     mirror the luma set; the CFL chroma path is a future arc.
 //!
 //! ## Spec provenance
 //!
@@ -235,6 +236,17 @@ pub struct EncodedFrameYuv {
     /// Per-chroma-cell V-plane `Quant[]` — same indexing as
     /// `committed_quants_u`.
     pub committed_quants_v: Vec<Vec<i32>>,
+    /// Per-chroma-cell §6.10.x intra mode the encoder selected for the
+    /// shared `uv_mode` symbol (§5.11.22 writes ONE `intra_uv_mode()`
+    /// per leaf governing both U and V planes). Indexed in the same
+    /// chroma-dispatch order as `committed_quants_u`. Each value is in
+    /// `0..NUM_INTRA_MODES_Y` (`DC_PRED = 0`, `V_PRED = 1`, …,
+    /// `PAETH_PRED = 12`). The picker evaluates each candidate against
+    /// the combined U+V SSD on the chroma 4×4 block (mirroring the
+    /// "one symbol governs both planes" rule), so the pick is the
+    /// joint-residual minimum rather than per-plane optima. Added in
+    /// arc r229 alongside the chroma 13-mode intra picker.
+    pub committed_uv_modes: Vec<u8>,
 }
 
 /// Single 4×4 cell of the luma plane the encoder visits per leaf. Used
@@ -342,6 +354,14 @@ fn dc_pred_for_cell_y(
 ///
 /// `(c_row, c_col)` are 4×4 chroma-cell coordinates in
 /// `0..CHROMA_CELLS_HIGH` × `0..CHROMA_CELLS_WIDE`.
+///
+/// Unused at the chroma walk site in r229+ (the chroma path now goes
+/// through the 13-mode picker via `predict_intra_mode_4x4_chroma`
+/// which calls into the §7.11.2.5 `predict_intra_dc_pred` kernel
+/// directly), but kept as the documented narrow-surface helper for
+/// any caller that wants a single-mode chroma DC_PRED without the
+/// picker overhead.
+#[allow(dead_code)]
 fn dc_pred_for_cell_chroma(
     reconstructed: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
     c_row: usize,
@@ -566,10 +586,8 @@ fn derive_intra_neighbours_4x4_y(
 
 /// §7.11.2.1 prologue for one chroma 4×4 cell — mirror of
 /// [`derive_intra_neighbours_4x4_y`] against the smaller
-/// `CHROMA_WIDTH × CHROMA_HEIGHT` plane. Currently unused (chroma still
-/// picks `DC_PRED` in r228); kept as the seed for the next-arc chroma
+/// `CHROMA_WIDTH × CHROMA_HEIGHT` plane. Used by the r229 chroma
 /// 13-mode picker.
-#[allow(dead_code)]
 fn derive_intra_neighbours_4x4_chroma(
     reconstructed: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
     row0: usize,
@@ -778,6 +796,116 @@ fn pick_best_intra_mode_4x4_y(
         }
     }
     (best_mode, best_pred)
+}
+
+// ---------------------------------------------------------------------
+// Arc r229 — chroma 13-mode intra-prediction picker.
+//
+// Mirror of the r228 luma picker against the smaller
+// `CHROMA_WIDTH × CHROMA_HEIGHT` plane. For each 4×4 chroma cell the
+// encoder runs the same 13 §6.10.x intra-mode candidates
+// (`INTRA_MODE_CANDIDATES_Y` — the §3 INTRA_MODES set, ordinals 0..13)
+// against the running reconstructed chroma plane and picks the
+// lowest-SSD mode. The chosen mode is then committed via
+// `write_intra_uv_mode` (r211) — the §8.3.2 chroma CDF row stays the
+// CFL-allowed bound (14 outcomes) because the encoder hard-codes
+// `state.lossless = false` and the sub_size BLOCK_4X4 is ≤ 32 in both
+// dimensions; the picker enumerates only the first 13 outcomes
+// (UV_CFL_PRED = 13 stays out of scope this arc — CFL needs a luma-
+// driven αU/αV linear-predictor path the §7.11.5.3 dispatcher).
+//
+// Both U and V are picked independently — same neighbour-derivation +
+// per-mode dispatch as the luma picker, just routed through the
+// smaller chroma plane. The lossless `base_q_idx = 0` arm is preserved
+// because every prediction is integer and the residual still rides the
+// forward-WHT → forward-quantize → dequantize → inverse-WHT chain.
+// ---------------------------------------------------------------------
+
+/// Compute the prediction for a single §6.10.x intra mode against the
+/// supplied pre-derived neighbour arrays for one 4×4 chroma cell. Same
+/// dispatch as the luma helper [`predict_intra_mode_4x4`]; the only
+/// difference is that the caller's neighbour buffers come from a
+/// chroma plane (`CHROMA_HEIGHT × CHROMA_WIDTH`) rather than the luma
+/// plane. The per-mode §7.11.2.{2..6} kernels themselves take no
+/// plane-specific arguments, so the body is unchanged.
+fn predict_intra_mode_4x4_chroma(
+    mode: usize,
+    have_above: u8,
+    have_left: u8,
+    above_ext: &[u16; 10],
+    left_ext: &[u16; 10],
+    above_left: u16,
+) -> Option<[u8; 16]> {
+    // Same dispatch as `predict_intra_mode_4x4` — the predictor kernels
+    // don't read the luma / chroma plane directly, only the neighbour
+    // arrays the caller built. Reuse the luma helper verbatim.
+    predict_intra_mode_4x4(mode, have_above, have_left, above_ext, left_ext, above_left)
+}
+
+/// Pick the §6.10.x intra mode with the smallest **combined** U+V
+/// residual SSD against one 4×4 chroma cell. Returns
+/// `(best_mode, best_pred_u, best_pred_v)`.
+///
+/// Per §5.11.22 one `intra_uv_mode()` symbol is written per leaf and
+/// governs both chroma planes, so the picker minimises the joint
+/// residual energy rather than picking U and V independently. The
+/// neighbour-derivation prologue is run once per plane against that
+/// plane's running reconstruction — `derive_intra_neighbours_4x4_chroma`
+/// reads from the per-plane reconstructed surface so the U-plane
+/// neighbours come from `recon_u` and the V-plane neighbours from
+/// `recon_v`. The 13 candidate modes (`INTRA_MODE_CANDIDATES_Y` =
+/// `DC_PRED..PAETH_PRED`, the §3 INTRA_MODES set) are enumerated
+/// against both planes and the lowest summed-SSD wins.
+///
+/// `DC_PRED` is the tie-breaker (same enumeration order as the luma
+/// picker): when multiple modes yield the same SSD, the lowest mode
+/// ordinal wins.
+fn pick_best_intra_mode_4x4_chroma(
+    recon_u: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    recon_v: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    input_u: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    input_v: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    row0: usize,
+    col0: usize,
+) -> (u8, [u8; 16], [u8; 16]) {
+    let (ha_u, hl_u, above_u, left_u, al_u) =
+        derive_intra_neighbours_4x4_chroma(recon_u, row0, col0);
+    let (ha_v, hl_v, above_v, left_v, al_v) =
+        derive_intra_neighbours_4x4_chroma(recon_v, row0, col0);
+    let mut best_mode = DC_PRED as u8;
+    let mut best_pred_u = [0u8; 16];
+    let mut best_pred_v = [0u8; 16];
+    let mut best_ssd: u64 = u64::MAX;
+    for &mode in &INTRA_MODE_CANDIDATES_Y {
+        let Some(pred_u) = predict_intra_mode_4x4_chroma(mode, ha_u, hl_u, &above_u, &left_u, al_u)
+        else {
+            continue;
+        };
+        let Some(pred_v) = predict_intra_mode_4x4_chroma(mode, ha_v, hl_v, &above_v, &left_v, al_v)
+        else {
+            continue;
+        };
+        let mut ssd: u64 = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                let pu = input_u[row0 + i][col0 + j] as i32;
+                let qu = pred_u[i * 4 + j] as i32;
+                let du = (pu - qu) as i64;
+                ssd += (du * du) as u64;
+                let pv = input_v[row0 + i][col0 + j] as i32;
+                let qv = pred_v[i * 4 + j] as i32;
+                let dv = (pv - qv) as i64;
+                ssd += (dv * dv) as u64;
+            }
+        }
+        if ssd < best_ssd {
+            best_ssd = ssd;
+            best_mode = mode as u8;
+            best_pred_u = pred_u;
+            best_pred_v = pred_v;
+        }
+    }
+    (best_mode, best_pred_u, best_pred_v)
 }
 
 /// Encode a 16×16 monochrome Y-only intra-only frame at `base_q_idx = 0`
@@ -1060,6 +1188,7 @@ pub fn encode_intra_frame_yuv(
     let mut committed_quants_v: Vec<Vec<i32>> =
         Vec::with_capacity(CHROMA_CELLS_WIDE * CHROMA_CELLS_HIGH);
     let mut committed_y_modes: Vec<u8> = Vec::with_capacity(CELLS_WIDE * CELLS_HIGH);
+    let mut committed_uv_modes: Vec<u8> = Vec::with_capacity(CHROMA_CELLS_WIDE * CHROMA_CELLS_HIGH);
 
     let cells = dispatch_order_cells();
     let mut leaves: Vec<EncodeBlock> = Vec::with_capacity(cells.len());
@@ -1114,12 +1243,37 @@ pub fn encode_intra_frame_yuv(
             let crow0 = cr * 4;
             let ccol0 = cc_idx * 4;
 
-            // Walk U then V — same chain as luma, plane = 1 / 2.
-            for (plane, recon_chroma, input_chroma, committed) in [
-                (1u8, &mut recon_u, &input.u, &mut committed_quants_u),
-                (2u8, &mut recon_v, &input.v, &mut committed_quants_v),
+            // r229: pick the §6.10.x intra mode minimising combined U+V
+            // residual SSD on this chroma 4×4 block. Per §5.11.22 a
+            // single `intra_uv_mode()` symbol governs both planes, so
+            // both U and V share the same pick. The keep-pred-output
+            // form of the picker avoids recomputing prediction inside
+            // the per-plane forward-quantize loop.
+            let (uv_pick, pred_u, pred_v) = pick_best_intra_mode_4x4_chroma(
+                &recon_u, &recon_v, &input.u, &input.v, crow0, ccol0,
+            );
+            committed_uv_modes.push(uv_pick);
+
+            // Walk U then V — same chain as luma, plane = 1 / 2. The
+            // per-plane prediction was already chosen by the picker; we
+            // only need to compute residual / forward-transform /
+            // quantize / dequantize-back.
+            for (plane, recon_chroma, input_chroma, committed, pred_c) in [
+                (
+                    1u8,
+                    &mut recon_u,
+                    &input.u,
+                    &mut committed_quants_u,
+                    &pred_u,
+                ),
+                (
+                    2u8,
+                    &mut recon_v,
+                    &input.v,
+                    &mut committed_quants_v,
+                    &pred_v,
+                ),
             ] {
-                let pred_c = dc_pred_for_cell_chroma(recon_chroma, cr, cc_idx);
                 let mut residual_c = [0i64; 16];
                 for i in 0..4 {
                     for j in 0..4 {
@@ -1156,7 +1310,7 @@ pub fn encode_intra_frame_yuv(
                     quant: quant_c,
                 });
             }
-            Some(DC_PRED as u8)
+            Some(uv_pick)
         } else {
             None
         };
@@ -1267,6 +1421,7 @@ pub fn encode_intra_frame_yuv(
         committed_quants_u,
         committed_quants_v,
         committed_y_modes,
+        committed_uv_modes,
     })
 }
 
@@ -2065,5 +2220,139 @@ mod tests {
         let input = Yuv420Frame16x16::default();
         let result = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
         assert_eq!(result.committed_y_modes.len(), CELLS_WIDE * CELLS_HIGH);
+    }
+
+    // ------------------------------------------------------------------
+    // Arc r229 — chroma 13-mode intra-prediction picker tests.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pick_best_intra_mode_4x4_chroma_flat_planes_picks_dc() {
+        // Flat reconstructed + flat input on both planes ⇒ every mode
+        // yields the same SSD (= 0 against the matching no-neighbour
+        // mid-grey baseline at the (0,0) cell) ⇒ DC_PRED wins on the
+        // enumeration-order tie-break.
+        let recon_u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        let recon_v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        let input_u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        let input_v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        let (mode, pred_u, pred_v) =
+            pick_best_intra_mode_4x4_chroma(&recon_u, &recon_v, &input_u, &input_v, 0, 0);
+        assert_eq!(mode as usize, DC_PRED);
+        assert_eq!(pred_u, [128u8; 16]);
+        assert_eq!(pred_v, [128u8; 16]);
+    }
+
+    #[test]
+    fn pick_best_intra_mode_4x4_chroma_returns_pred_for_each_plane() {
+        // Non-zero reconstructed neighbours ⇒ at least the V_PRED arm
+        // returns a non-128 sample. Cross-check that the per-plane
+        // predictions are the supplied planes' respective predictions
+        // (not the same buffer for U and V).
+        let mut recon_u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] =
+            [[10u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        let mut recon_v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] =
+            [[200u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        // Cell (1, 1) — both above (row 3) and left (col 3) neighbours exist.
+        for row in recon_u.iter_mut() {
+            row[3] = 50;
+        }
+        for cell in recon_u[3].iter_mut() {
+            *cell = 50;
+        }
+        for row in recon_v.iter_mut() {
+            row[3] = 240;
+        }
+        for cell in recon_v[3].iter_mut() {
+            *cell = 240;
+        }
+        // Inputs: U-plane matches its left neighbour (50), V-plane
+        // matches its left neighbour (240). H_PRED is the best fit on
+        // each plane individually.
+        let mut input_u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[0u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        let mut input_v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[0u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
+        for i in 0..4 {
+            for j in 0..4 {
+                input_u[4 + i][4 + j] = 50;
+                input_v[4 + i][4 + j] = 240;
+            }
+        }
+        let (_mode, pred_u, pred_v) =
+            pick_best_intra_mode_4x4_chroma(&recon_u, &recon_v, &input_u, &input_v, 4, 4);
+        // V plane prediction must differ from U plane prediction
+        // because the V plane's neighbour is 240, not 50.
+        assert_ne!(pred_u, pred_v);
+    }
+
+    #[test]
+    fn encode_intra_frame_yuv_committed_uv_modes_has_one_entry_per_chroma_cell() {
+        // The chroma picker fires once per HasChroma cell — there are
+        // exactly `CHROMA_CELLS_WIDE * CHROMA_CELLS_HIGH = 4` of them
+        // under the 4:2:0 BLOCK_4X4 walk.
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        let input = Yuv420Frame16x16::default();
+        let result = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+        assert_eq!(
+            result.committed_uv_modes.len(),
+            CHROMA_CELLS_WIDE * CHROMA_CELLS_HIGH
+        );
+    }
+
+    #[test]
+    fn encode_intra_frame_yuv_committed_uv_modes_are_all_in_intra_mode_range() {
+        // Every chroma pick must be in 0..NUM_INTRA_MODES_Y. Run
+        // against a pseudo-random YUV input to stress every chroma
+        // block.
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        let mut input = Yuv420Frame16x16::default();
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut step = || -> u8 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        };
+        for row in input.y.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = step();
+            }
+        }
+        for row in input.u.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = step();
+            }
+        }
+        for row in input.v.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = step();
+            }
+        }
+        let result = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+        for (i, &m) in result.committed_uv_modes.iter().enumerate() {
+            assert!(
+                (m as usize) < NUM_INTRA_MODES_Y,
+                "chroma cell {i}: uv_mode = {m} out of 0..{NUM_INTRA_MODES_Y}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_intra_frame_yuv_flat_grey_input_keeps_uv_mode_dc_pred() {
+        // Flat-128 input on every plane ⇒ every prediction collapses to
+        // 128 ⇒ ties ⇒ DC_PRED wins the enumeration-order tie-break on
+        // every chroma cell. Mirror of the luma `keeps_dc_pred_on_flat`
+        // test.
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        let input = Yuv420Frame16x16::default(); // every plane all-128
+        let result = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+        for (i, &m) in result.committed_uv_modes.iter().enumerate() {
+            assert_eq!(
+                m as usize, DC_PRED,
+                "flat-128 input: chroma cell {i} should pick DC_PRED (0), got {m}"
+            );
+        }
     }
 }

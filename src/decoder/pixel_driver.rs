@@ -39,8 +39,11 @@
 //!     `enable_restoration == 0`, `enable_superres == 0`,
 //!     `apply_grain == 0`).
 //!   * One tile per frame.
-//!   * Intra-only keyframes (`y_mode = DC_PRED`, optional
-//!     `uv_mode = DC_PRED`).
+//!   * Intra-only keyframes — `y_mode` ∈ {DC_PRED, V_PRED, H_PRED,
+//!     D45_PRED, D135_PRED, D113_PRED, D157_PRED, D203_PRED, D67_PRED,
+//!     SMOOTH_PRED, SMOOTH_V_PRED, SMOOTH_H_PRED, PAETH_PRED} (the §3
+//!     INTRA_MODES set, r228) and `uv_mode` from the same set on
+//!     HasChroma leaves (r229). UV_CFL_PRED stays out of scope.
 //!
 //! Outside the scope, [`decode_av1`] returns
 //! [`crate::Error::PartitionWalkOutOfRange`].
@@ -71,7 +74,9 @@ use crate::cdf::{
     TX_4X4, TX_CLASS_2D, V_PRED,
 };
 use crate::encoder::ivf::IvfReader;
-use crate::encoder::pixel_driver::{CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH};
+use crate::encoder::pixel_driver::{
+    CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH, NUM_INTRA_MODES_Y,
+};
 use crate::encoder::tile_group_obu::parse_tile_group_obu_body;
 use crate::frame_header::{parse_frame_header, FrameHeader};
 use crate::obu::{ObuIter, ObuType};
@@ -631,16 +636,29 @@ fn decode_block_leaf(
     // subsampling_x=true, subsampling_y=true)`; the encoder hard-codes
     // `state.lossless = false` (separate from CodedLossless), so we
     // mirror exactly.
-    if has_chroma {
+    // r229: decoded `uv_mode` is captured here and threaded into the
+    // chroma reconstruction block below. Replaces the r228 "must be
+    // DC_PRED" hard reject — the chroma dispatcher now mirrors the
+    // §7.11.2.{2..6} fan-out the luma path landed in r228.
+    let uv_mode: u8 = if has_chroma {
         let cfl_allowed = cfl_allowed_for_uv_mode(false, sub_size, true, true);
         let cdf = cdfs
             .uv_mode_cdf(cfl_allowed, y_mode as usize)
             .ok_or(Error::PartitionWalkOutOfRange)?;
-        let uv_mode = decoder.read_symbol(cdf)? as u8;
-        if uv_mode as usize != DC_PRED {
+        let m = decoder.read_symbol(cdf)? as u8;
+        // The encoder picks from the 13 §3 INTRA_MODES set
+        // (DC_PRED..PAETH_PRED, ordinals 0..13). UV_CFL_PRED (= 13) is
+        // out of scope this arc — the chroma kernels below would need
+        // a §7.11.5.3 CFL αU/αV linear predictor path. Reject any
+        // out-of-set decoded mode rather than silently dispatching it
+        // through a wrong predictor.
+        if (m as usize) >= NUM_INTRA_MODES_Y {
             return Err(Error::PartitionWalkOutOfRange);
         }
-    }
+        m
+    } else {
+        DC_PRED as u8
+    };
 
     // Quantizer scratch buffer reused per plane — TX_4X4 has 16 cells.
     let mut quant_y = vec![0i32; 16];
@@ -711,7 +729,10 @@ fn decode_block_leaf(
             scan,
             &mut quant_u,
         )?;
-        let pred_u = dc_pred_chroma(recon_u, cr, cc_idx);
+        // r229: dispatch on the decoded uv_mode (one of the 13 §6.10.x
+        // intra modes) — mirror of the luma r228 dispatcher.
+        let pred_u = predict_intra_chroma_for_mode_4x4(recon_u, cr, cc_idx, uv_mode as usize)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
         if skip == 0 {
             let dequant = dequantize_step1(&quant_u, TX_4X4, 1, 0, DCT_DCT, 15, qp);
             let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, true);
@@ -742,7 +763,8 @@ fn decode_block_leaf(
             scan,
             &mut quant_v,
         )?;
-        let pred_v = dc_pred_chroma(recon_v, cr, cc_idx);
+        let pred_v = predict_intra_chroma_for_mode_4x4(recon_v, cr, cc_idx, uv_mode as usize)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
         if skip == 0 {
             let dequant = dequantize_step1(&quant_v, TX_4X4, 2, 0, DCT_DCT, 15, qp);
             let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, true);
@@ -901,6 +923,148 @@ fn predict_intra_luma_for_mode_4x4(
     Some(pred8)
 }
 
+/// §7.11.2.1 prologue for one 4×4 chroma cell — mirror of
+/// [`derive_intra_neighbours_4x4_luma`] against the smaller
+/// `CHROMA_WIDTH × CHROMA_HEIGHT` plane. Same head-extended buffer
+/// convention so the §7.11.2.{2..6} kernels can be invoked
+/// uniformly. Used by the r229 chroma 13-mode dispatcher.
+fn derive_intra_neighbours_4x4_chroma(
+    reconstructed: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    row0: usize,
+    col0: usize,
+) -> (u8, u8, [u16; 10], [u16; 10], u16) {
+    let w = 4usize;
+    let h = 4usize;
+    let bit_depth = 8u8;
+    let have_above = (row0 > 0) as u8;
+    let have_left = (col0 > 0) as u8;
+
+    let above_left: u16 = if have_above != 0 && have_left != 0 {
+        reconstructed[row0 - 1][col0 - 1] as u16
+    } else if have_above != 0 {
+        reconstructed[row0 - 1][col0] as u16
+    } else if have_left != 0 {
+        reconstructed[row0][col0 - 1] as u16
+    } else {
+        1u16 << (bit_depth - 1)
+    };
+
+    let mut above_ext = [0u16; 10];
+    above_ext[0] = above_left;
+    above_ext[1] = above_left;
+    if have_above != 0 {
+        let above_row = &reconstructed[row0 - 1];
+        for k in 0..(w + h) {
+            let col = (col0 + k).min(CHROMA_WIDTH - 1);
+            above_ext[2 + k] = above_row[col] as u16;
+        }
+    } else if have_left != 0 {
+        let sample = reconstructed[row0][col0 - 1] as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        let mid_minus = ((1u32 << (bit_depth - 1)) - 1) as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_minus;
+        }
+    }
+
+    let mut left_ext = [0u16; 10];
+    left_ext[0] = above_left;
+    left_ext[1] = above_left;
+    if have_left != 0 {
+        for k in 0..(w + h) {
+            let row = (row0 + k).min(CHROMA_HEIGHT - 1);
+            left_ext[2 + k] = reconstructed[row][col0 - 1] as u16;
+        }
+    } else if have_above != 0 {
+        let sample = reconstructed[row0 - 1][col0] as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        let mid_plus = ((1u32 << (bit_depth - 1)) + 1) as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_plus;
+        }
+    }
+
+    (have_above, have_left, above_ext, left_ext, above_left)
+}
+
+/// §7.11.2.{2..6} dispatcher — compute the 4×4 **chroma** prediction
+/// for the supplied §6.10.x intra mode. Mirror of
+/// [`predict_intra_luma_for_mode_4x4`] against the smaller chroma
+/// plane (`CHROMA_HEIGHT × CHROMA_WIDTH`). Returns `None` for an
+/// out-of-set mode (the caller's r229 guard at the `uv_mode` read site
+/// already rejects `uv_mode >= NUM_INTRA_MODES_Y`).
+///
+/// `(cell_row, cell_col)` are 4×4 chroma-cell coordinates in
+/// `0..CHROMA_CELLS_HIGH` × `0..CHROMA_CELLS_WIDE`.
+fn predict_intra_chroma_for_mode_4x4(
+    reconstructed: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    cell_row: usize,
+    cell_col: usize,
+    mode: usize,
+) -> Option<[u8; 16]> {
+    let w = 4usize;
+    let h = 4usize;
+    let log2_w = 2u32;
+    let log2_h = 2u32;
+    let bit_depth = 8u8;
+    let row0 = cell_row * 4;
+    let col0 = cell_col * 4;
+    let (have_above, have_left, above_ext, left_ext, above_left) =
+        derive_intra_neighbours_4x4_chroma(reconstructed, row0, col0);
+    let above_row = &above_ext[2..2 + w + h];
+    let left_col = &left_ext[2..2 + w + h];
+
+    let mut pred16 = [0u16; 16];
+    match mode {
+        m if m == DC_PRED => {
+            predict_intra_dc_pred(
+                have_left,
+                have_above,
+                log2_w,
+                log2_h,
+                w,
+                h,
+                bit_depth,
+                above_row,
+                left_col,
+                &mut pred16,
+            )
+            .ok()?;
+        }
+        m if m == V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred16).ok()?,
+        m if m == H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred16).ok()?,
+        m if (D45_PRED..=D67_PRED).contains(&m) => {
+            predict_intra_d_mode(m, 0, w, h, 0, 0, &above_ext, &left_ext, &mut pred16).ok()?;
+        }
+        m if m == SMOOTH_PRED => {
+            predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred16)
+                .ok()?;
+        }
+        m if m == SMOOTH_V_PRED => {
+            predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred16).ok()?;
+        }
+        m if m == SMOOTH_H_PRED => {
+            predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred16).ok()?;
+        }
+        m if m == PAETH_PRED => {
+            predict_intra_paeth_pred(w, h, above_row, left_col, above_left, &mut pred16).ok()?;
+        }
+        _ => return None,
+    }
+
+    let mut pred8 = [0u8; 16];
+    for (slot, v) in pred8.iter_mut().zip(pred16.iter().copied()) {
+        *slot = v as u8;
+    }
+    Some(pred8)
+}
+
 /// §7.11.2.5 DC_PRED prediction for one 4×4 luma cell — mirror of the
 /// encoder's `dc_pred_for_cell_y`.
 #[allow(dead_code)]
@@ -947,7 +1111,11 @@ fn dc_pred_luma(
 }
 
 /// §7.11.2.5 DC_PRED prediction for one 4×4 chroma cell — mirror of
-/// the encoder's `dc_pred_for_cell_chroma`.
+/// the encoder's `dc_pred_for_cell_chroma`. Unused at the chroma walk
+/// site in r229+ (the dispatcher now routes through
+/// [`predict_intra_chroma_for_mode_4x4`]) but kept as the documented
+/// narrow-surface helper.
+#[allow(dead_code)]
 fn dc_pred_chroma(
     reconstructed: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
     c_row: usize,
