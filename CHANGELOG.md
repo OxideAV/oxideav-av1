@@ -6,6 +6,41 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 231 — UV_CFL_PRED (§7.11.5.3 chroma-from-luma) end-to-end.**
+  The chroma intra picker in `encoder::pixel_driver::encode_intra_frame_yuv`
+  gains a 14th candidate alongside the 13 §6.10.x modes that landed in
+  r229: §7.11.5.3 chroma-from-luma over a compact (αU, αV) sign/magnitude
+  search grid (`{±1, ±2, ±4}` per channel, single-channel arms
+  included, excluding the §6.10.36 forbidden `(0, 0)` joint sign).
+  When CFL wins on combined U+V SSD the picker commits the (αU, αV)
+  pair as signed §5.11.45 `CflAlpha{U,V}` values; new fields
+  `cfl_alpha_u` / `cfl_alpha_v` on `EncodeBlock` thread them into
+  `write_encode_block_leaf`, which emits §5.11.45 via the new
+  `encoder::block_mode_info::write_cfl_alphas` writer (joint
+  `cfl_alpha_signs` over `Default_Cfl_Sign_Cdf` + per-channel
+  `cfl_alpha_u` / `cfl_alpha_v` magnitude over
+  `Default_Cfl_Alpha_Cdf[ ctx ]`).
+
+  The decoder (`decoder::pixel_driver::decode_block_leaf`) now
+  accepts `uv_mode == 13`, reads §5.11.45 via a new
+  `read_cfl_alphas` helper, and dispatches both chroma planes
+  through `cfl_predict_4x4_for_plane` (DC_PRED base +
+  `Round2Signed(α * (L - lumaAvg), 6)` clipped to byte) using a
+  §7.11.5.3 subsampled-luma window the encoder and decoder compute
+  identically against the running reconstructed luma. The lossless
+  WHT chain keeps the full encode → decode → pixel-equality
+  contract bit-exact on the new path.
+
+  +14 lib unit tests (1475 → 1489): 7 `write_cfl_alphas` round-trips
+  (pos/pos, neg/neg, zero-U-pos-V, neg-U-zero-V, max magnitudes,
+  both-zero rejection, out-of-range magnitude rejection) + 2
+  `round2_signed` arms + 1 subsampled-luma flat-luma sanity + 3
+  `cfl_predict_4x4_for_plane` (α=0 returns dc_pred, positive-α
+  tracks luma excess, clipping at byte bounds) + 1 candidate-set
+  no-zero-pair guard. +3 integration tests (23 → 26): CFL roundtrip
+  bit-exact on a luma-correlated chroma input, encoder picks CFL on
+  the same input, committed uv_mode stays in `0..=13`.
+
 * **Round 230 — Pixel-driver frame-size generalisation: 32×32 and 64×64
   4:2:0 YUV encode → decode_av1 roundtrip.** The encoder gains a
   Vec-backed dynamic-extent driver

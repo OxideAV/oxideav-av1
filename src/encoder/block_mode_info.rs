@@ -48,8 +48,9 @@
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
 use crate::cdf::{
-    neg_deinterleave, TileCdfContext, BLOCK_SIZE_GROUPS, INTRA_MODES, INTRA_MODE_CONTEXTS,
-    MAX_SEGMENTS, SKIP_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_deinterleave, TileCdfContext, BLOCK_SIZE_GROUPS,
+    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES, INTRA_MODE_CONTEXTS, MAX_SEGMENTS,
+    SKIP_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -288,6 +289,100 @@ pub fn write_intra_uv_mode(
         .uv_mode_cdf(cfl_allowed, y_mode as usize)
         .ok_or(Error::PartitionWalkOutOfRange)?;
     writer.write_symbol(uv_mode as u32, cdf)
+}
+
+/// `read_cfl_alphas()` inverse per §5.11.45 (av1-spec p.96) — r231.
+///
+/// Spec body:
+/// ```text
+///   read_cfl_alphas() {
+///       cfl_alpha_signs                                  S()
+///       signU = (cfl_alpha_signs + 1) / 3
+///       signV = (cfl_alpha_signs + 1) % 3
+///       if (signU != CFL_SIGN_ZERO) {
+///           cfl_alpha_u                                  S()
+///           CflAlphaU = 1 + cfl_alpha_u
+///           if (signU == CFL_SIGN_NEG)
+///               CflAlphaU = -CflAlphaU
+///       } else {
+///           CflAlphaU = 0
+///       }
+///       // (mirror arm for V)
+///   }
+/// ```
+///
+/// `alpha_u` and `alpha_v` are the signed §5.11.45 `CflAlpha{U,V}`
+/// outputs the caller (e.g. the encoder's CFL picker) committed to.
+/// Each MUST be in `-16..=-1 | 0 | 1..=16` per the §5.11.45 derivation
+/// (`CflAlpha = ±(1 + cfl_alpha_*)` with `cfl_alpha_*` ∈
+/// `0..CFL_ALPHABET_SIZE`), and not both `0` simultaneously (per
+/// §6.10.36 the `(CFL_SIGN_ZERO, CFL_SIGN_ZERO)` joint-sign
+/// combination is prohibited as redundant with `UV_DC_PRED`).
+///
+/// CDF selection per §8.3.2:
+///   * `cfl_alpha_signs` reads `TileCflSignCdf`
+///     (`Default_Cfl_Sign_Cdf`, 8-symbol, no `ctx`).
+///   * `cfl_alpha_u` reads `TileCflAlphaCdf[ ctx_u ]` with
+///     `ctx_u = cfl_alpha_u_ctx(signU, signV)` (only fires when
+///     `signU != CFL_SIGN_ZERO`).
+///   * `cfl_alpha_v` reads `TileCflAlphaCdf[ ctx_v ]` with
+///     `ctx_v = cfl_alpha_v_ctx(signU, signV)` (only fires when
+///     `signV != CFL_SIGN_ZERO`).
+///
+/// Returns [`Error::PartitionWalkOutOfRange`] for out-of-range
+/// `alpha_u` / `alpha_v` or the prohibited `(0, 0)` pair.
+pub fn write_cfl_alphas(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    alpha_u: i8,
+    alpha_v: i8,
+) -> Result<(), Error> {
+    // §5.11.45 magnitude bounds: |CflAlpha| ∈ {0, 1..=CFL_ALPHABET_SIZE}.
+    let abs_u: i32 = alpha_u.unsigned_abs() as i32;
+    let abs_v: i32 = alpha_v.unsigned_abs() as i32;
+    if abs_u as usize > CFL_ALPHABET_SIZE || abs_v as usize > CFL_ALPHABET_SIZE {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §6.10.36: (CFL_SIGN_ZERO, CFL_SIGN_ZERO) is prohibited.
+    if alpha_u == 0 && alpha_v == 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.45: signU = ZERO/NEG/POS for alpha 0 / <0 / >0.
+    let sign_u: usize = match alpha_u.signum() {
+        0 => 0,  // CFL_SIGN_ZERO
+        -1 => 1, // CFL_SIGN_NEG
+        _ => 2,  // CFL_SIGN_POS
+    };
+    let sign_v: usize = match alpha_v.signum() {
+        0 => 0,
+        -1 => 1,
+        _ => 2,
+    };
+    // §5.11.45: `signU = (cfl_alpha_signs + 1) / 3`,
+    // `signV = (cfl_alpha_signs + 1) % 3` ⇒ inverse
+    // `cfl_alpha_signs = 3 * signU + signV - 1`. Result is in
+    // `0..CFL_JOINT_SIGNS = 8`.
+    let joint: i32 = 3 * (sign_u as i32) + (sign_v as i32) - 1;
+    if !(0..(CFL_JOINT_SIGNS as i32)).contains(&joint) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let signs_cdf = cdfs.cfl_sign_cdf();
+    writer.write_symbol(joint as u32, signs_cdf)?;
+    // §5.11.45 U arm.
+    if sign_u != 0 {
+        let raw_u = abs_u - 1; // `cfl_alpha_u = CflAlphaU.abs() - 1`.
+        let ctx_u = cfl_alpha_u_ctx(sign_u, sign_v);
+        let row_u = cdfs.cfl_alpha_cdf(ctx_u);
+        writer.write_symbol(raw_u as u32, row_u)?;
+    }
+    // §5.11.45 V arm.
+    if sign_v != 0 {
+        let raw_v = abs_v - 1;
+        let ctx_v = cfl_alpha_v_ctx(sign_u, sign_v);
+        let row_v = cdfs.cfl_alpha_cdf(ctx_v);
+        writer.write_symbol(raw_v as u32, row_v)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -754,5 +849,122 @@ mod tests {
             .unwrap();
         assert_eq!(info.y_mode, DC_PRED_U8);
         assert_eq!(info.uv_mode, Some(DC_PRED_U8));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.45 `write_cfl_alphas` — round-trips through
+    // `decode_intra_block_mode_info`'s built-in §5.11.45 reader (the
+    // `UVMode == UV_CFL_PRED` arm). r231.
+    // -----------------------------------------------------------------
+
+    /// Helper that emits the §5.11.7 / §5.11.11 / §5.11.22 prefix at
+    /// frame origin + the §5.11.45 alphas, then walks the bitstream
+    /// back through the decoder's `decode_intra_block_mode_info` and
+    /// returns the recovered `(CflAlphaU, CflAlphaV)`.
+    fn round_trip_cfl_alphas(alpha_u: i8, alpha_v: i8) -> (Option<i8>, Option<i8>) {
+        use crate::cdf::UV_CFL_PRED;
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_skip(&mut writer, &mut enc_cdfs, 0, skip_ctx(0, 0), false).unwrap();
+        write_intra_segment_id(&mut writer, &mut enc_cdfs, 0, 0, 0, 0, false, 0).unwrap();
+        let y_ctx = size_group(BLOCK_16X16);
+        write_y_mode(&mut writer, &mut enc_cdfs, DC_PRED_U8, y_ctx).unwrap();
+        // CFL-allowed on 16x16, no subsampling, no lossless.
+        let cfl_allowed = cfl_allowed_for_uv_mode(false, BLOCK_16X16, false, false);
+        write_intra_uv_mode(
+            &mut writer,
+            &mut enc_cdfs,
+            DC_PRED_U8,
+            UV_CFL_PRED as u8,
+            cfl_allowed,
+        )
+        .unwrap();
+        write_cfl_alphas(&mut writer, &mut enc_cdfs, alpha_u, alpha_v).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let _skip = walker
+            .decode_skip(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false)
+            .unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* lossless = */ false,
+                /* has_chroma = */ true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.uv_mode, Some(UV_CFL_PRED as u8));
+        (info.cfl_alpha_u, info.cfl_alpha_v)
+    }
+
+    #[test]
+    fn write_cfl_alphas_round_trip_pos_pos() {
+        let (au, av) = round_trip_cfl_alphas(1, 1);
+        assert_eq!(au, Some(1));
+        assert_eq!(av, Some(1));
+    }
+
+    #[test]
+    fn write_cfl_alphas_round_trip_neg_neg() {
+        let (au, av) = round_trip_cfl_alphas(-3, -7);
+        assert_eq!(au, Some(-3));
+        assert_eq!(av, Some(-7));
+    }
+
+    #[test]
+    fn write_cfl_alphas_round_trip_zero_u_pos_v() {
+        // signU = ZERO: only V's magnitude is written; U's value
+        // reconstructs to 0 on the decoder.
+        let (au, av) = round_trip_cfl_alphas(0, 4);
+        assert_eq!(au, Some(0));
+        assert_eq!(av, Some(4));
+    }
+
+    #[test]
+    fn write_cfl_alphas_round_trip_neg_u_zero_v() {
+        let (au, av) = round_trip_cfl_alphas(-2, 0);
+        assert_eq!(au, Some(-2));
+        assert_eq!(av, Some(0));
+    }
+
+    #[test]
+    fn write_cfl_alphas_round_trip_max_magnitudes() {
+        // |alpha| = 16 corresponds to cfl_alpha_u = 15 (the max raw
+        // value the §5.11.45 S() reads from `Default_Cfl_Alpha_Cdf`).
+        let (au, av) = round_trip_cfl_alphas(16, -16);
+        assert_eq!(au, Some(16));
+        assert_eq!(av, Some(-16));
+    }
+
+    #[test]
+    fn write_cfl_alphas_rejects_both_zero() {
+        // §6.10.36: (CFL_SIGN_ZERO, CFL_SIGN_ZERO) is prohibited as
+        // redundant with UV_DC_PRED.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_cfl_alphas(&mut writer, &mut cdfs, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    #[test]
+    fn write_cfl_alphas_rejects_out_of_range_magnitude() {
+        // |alpha| > CFL_ALPHABET_SIZE = 16 is out of the §5.11.45
+        // alphabet.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_cfl_alphas(&mut writer, &mut cdfs, 17, 1).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

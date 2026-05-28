@@ -443,8 +443,9 @@ fn encoder_picks_non_dc_pred_on_vertical_chroma_gradient() {
 
 #[test]
 fn encoder_committed_uv_modes_are_all_in_intra_mode_range() {
-    // Every committed_uv_modes entry must be in 0..13. Run against
-    // pseudo-random chroma planes.
+    // Every committed_uv_modes entry must be in 0..=UV_CFL_PRED (= 13)
+    // — the §3 INTRA_MODES set plus the §7.11.5.3 UV_CFL_PRED slot
+    // landed in r231. Run against pseudo-random chroma planes.
     let (seq, fh) = tiny_descriptors();
     let mut input = Yuv420Frame16x16::default();
     let mut state: u64 = 0xDEAD_BEEF_FEED_BABE;
@@ -473,8 +474,8 @@ fn encoder_committed_uv_modes_are_all_in_intra_mode_range() {
     assert_eq!(encoded.committed_uv_modes.len(), 4);
     for (idx, &m) in encoded.committed_uv_modes.iter().enumerate() {
         assert!(
-            (m as usize) < 13,
-            "chroma cell {idx}: uv_mode = {m} out of 0..13"
+            (m as usize) <= 13,
+            "chroma cell {idx}: uv_mode = {m} out of 0..=13"
         );
     }
 }
@@ -780,5 +781,122 @@ fn dyn_encode_decode_pseudorandom_64x64_roundtrip_bit_exact() {
             assert_eq!(v, &input.v, "V mismatch 64×64 pseudo-random");
         }
         other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// r231 — UV_CFL_PRED (§7.11.5.3 chroma-from-luma) integration tests.
+// ---------------------------------------------------------------------
+
+/// Construct a 4:2:0 YUV input where the chroma planes are
+/// `Cu = 128 + (y - 128) / 4` / `Cv = 128 - (y - 128) / 4` — a strong
+/// linear function of the luma sample, the textbook case where
+/// UV_CFL_PRED beats every §6.10.x intra mode on combined U+V SSD.
+fn luma_correlated_yuv_input() -> Yuv420Frame16x16 {
+    let mut input = Yuv420Frame16x16::default();
+    // Build a luma gradient (column-direction) so the chroma planes
+    // have a useful range to track.
+    for i in 0..16usize {
+        for j in 0..16usize {
+            input.y[i][j] = (16u32 * j as u32) as u8;
+        }
+    }
+    // Chroma planes: 8×8, each chroma sample tracks the corresponding
+    // 2×2 luma average. Compute the average and apply the linear map.
+    for ci in 0..8usize {
+        for cj in 0..8usize {
+            let li = ci * 2;
+            let lj = cj * 2;
+            let avg = (input.y[li][lj] as u32
+                + input.y[li][lj + 1] as u32
+                + input.y[li + 1][lj] as u32
+                + input.y[li + 1][lj + 1] as u32)
+                / 4;
+            let centred = avg as i32 - 128;
+            input.u[ci][cj] = (128i32 + centred / 4).clamp(0, 255) as u8;
+            input.v[ci][cj] = (128i32 - centred / 4).clamp(0, 255) as u8;
+        }
+    }
+    input
+}
+
+#[test]
+fn encode_decode_cfl_yuv_roundtrip_bit_exact() {
+    // r231: full encode → decode → pixel-equality on a chroma signal
+    // that's a clean linear function of luma. The encoder picks
+    // UV_CFL_PRED for at least one chroma cell; the decoder mirrors
+    // its CFL prediction and the lossless WHT chain stays bit-exact.
+    let (seq, fh) = tiny_descriptors();
+    let input = luma_correlated_yuv_input();
+    let encoded = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let decoded = decode_av1(&encoded.ivf_bytes).unwrap();
+    match &decoded[0] {
+        Frame::Yuv420_16x16 { y, u, v } => {
+            assert_eq!(y, &input.y, "luma plane bit-exact on CFL input");
+            assert_eq!(u, &input.u, "U plane bit-exact on CFL input");
+            assert_eq!(v, &input.v, "V plane bit-exact on CFL input");
+        }
+        other => panic!("expected Yuv420_16x16, got {other:?}"),
+    }
+}
+
+#[test]
+fn encoder_picks_cfl_on_luma_correlated_chroma() {
+    // r231: the chroma picker should commit UV_CFL_PRED (= 13) for at
+    // least one chroma cell on a luma-correlated input. Confirms that
+    // the §5.11.45 `read_cfl_alphas` arm fires in the bitstream, not
+    // just that the encoder *could* pick CFL.
+    let (seq, fh) = tiny_descriptors();
+    let input = luma_correlated_yuv_input();
+    let encoded = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let cfl_count = encoded
+        .committed_uv_modes
+        .iter()
+        .filter(|&&m| m as usize == 13)
+        .count();
+    assert!(
+        cfl_count > 0,
+        "expected at least one UV_CFL_PRED pick on luma-correlated chroma, got modes {:?}",
+        encoded.committed_uv_modes
+    );
+}
+
+#[test]
+fn encoder_committed_uv_modes_include_zero_or_more_cfl_picks() {
+    // Sanity-check companion to `encoder_picks_cfl_on_luma_correlated_chroma`:
+    // on a uniformly random YUV input where chroma is uncorrelated
+    // with luma, the picker is allowed to pick CFL but typically
+    // settles on a §6.10.x mode. Either way, every entry stays in
+    // `0..=13`.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    let mut state: u64 = 0xABAD_BABA_DEAD_BEEF;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for row in input.y.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    for row in input.u.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    for row in input.v.iter_mut() {
+        for c in row.iter_mut() {
+            *c = step();
+        }
+    }
+    let encoded = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    for (idx, &m) in encoded.committed_uv_modes.iter().enumerate() {
+        assert!(
+            (m as usize) <= 13,
+            "chroma cell {idx}: uv_mode = {m} out of 0..=13"
+        );
     }
 }

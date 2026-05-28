@@ -2,6 +2,58 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 231)
+
+Round 231 lands the §7.11.5.3 **`UV_CFL_PRED`** chroma-from-luma
+predictor end-to-end. The chroma picker in
+`encoder::pixel_driver::encode_intra_frame_yuv` now evaluates
+UV_CFL_PRED in addition to the 13 §6.10.x intra modes that landed in
+r229: per chroma 4×4 block the picker derives the DC_PRED chroma
+base, subsamples the §7.11.5.3 luma window over the matching 4:2:0
+luma region (`L[i][j] = (Σ 2×2 luma) << 1`,
+`lumaAvg = Round2(Σ L, 4)`), and searches a compact (αU, αV) grid of
+sign/magnitude pairs (`{±1, ±2, ±4}` per channel, with
+single-channel arms; total 20 candidate alpha pairs, excluding the
+§6.10.36 forbidden `(0, 0)` joint sign). The winner is committed
+alongside the chosen `uv_mode` and emitted via the new
+`encoder::block_mode_info::write_cfl_alphas` writer, which inverts
+§5.11.45 (joint `cfl_alpha_signs` over `Default_Cfl_Sign_Cdf` plus
+the per-channel `cfl_alpha_u` / `cfl_alpha_v` magnitude over
+`Default_Cfl_Alpha_Cdf[ ctx ]` with `ctx` from `cfl_alpha_u_ctx` /
+`cfl_alpha_v_ctx`).
+
+`EncodeBlock` gains two new `Option<i8>` fields (`cfl_alpha_u` /
+`cfl_alpha_v`) that thread the picker's choice into
+`write_encode_block_leaf`; when `uv_mode == UV_CFL_PRED` the leaf
+writer fires `write_cfl_alphas`, otherwise it stays silent
+(matching the §5.11.22 line-8 gate).
+
+The decoder side (`decoder::pixel_driver::decode_block_leaf`) now
+accepts `uv_mode == 13`, reads §5.11.45 via a new `read_cfl_alphas`
+helper, recomputes the same §7.11.5.3 subsampled-luma + lumaAvg
+window, and dispatches both U and V prediction through
+`cfl_predict_4x4_for_plane` (DC_PRED chroma base +
+`Round2Signed(α * (L - lumaAvg), 6)` clipped to byte). The lossless
+WHT chain keeps the full encode → decode → pixel-equality contract
+bit-exact on the new path — verified end-to-end on a synthetic
+input where each chroma sample is a clean linear function of the
+corresponding 2×2 luma average (the textbook case where CFL beats
+every §6.10.x intra mode on combined SSD), and tested for the
+prohibited `(0, 0)` joint-sign rejection.
+
++14 lib unit tests (1475 → 1489: 7 `write_cfl_alphas` round-trips +
+2 `round2_signed` arms + 1 subsampled-luma + 3
+`cfl_predict_4x4_for_plane` + 1 candidate-set guard) + 3 new
+integration tests (23 → 26: CFL roundtrip bit-exact,
+encoder-picks-CFL-on-luma-correlated-chroma, committed UV range
+guard).
+
+Out of scope (next arc): rectangular TX sizes, §5.11.18 inter
+mode_info, full RD with §5.11.22 / §5.11.45 bit-cost weighting,
+expanding the CFL αU/αV search beyond the compact `{±1, ±2, ±4}`
+grid, CFL on the dynamic-extent driver (`pixel_driver_dyn`), and
+frames larger than 64×64.
+
 ## Status — 2026-05-29 (round 230)
 
 Round 230 generalises the pixel driver beyond the 16×16 hard-coded

@@ -107,7 +107,7 @@ use crate::cdf::{
     predict_intra_smooth_v_pred, predict_intra_v_pred, QuantizerParams, TileCdfContext,
     TileGeometry, BLOCK_16X16, D113_PRED, D135_PRED, D157_PRED, D203_PRED, D45_PRED, D67_PRED,
     DCT_DCT, DC_PRED, H_PRED, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4,
-    TX_CLASS_2D, V_PRED,
+    TX_CLASS_2D, UV_CFL_PRED, V_PRED,
 };
 use crate::encoder::forward_quantize::forward_quantize;
 use crate::encoder::forward_transform::forward_dct_4x4;
@@ -842,9 +842,138 @@ fn predict_intra_mode_4x4_chroma(
     predict_intra_mode_4x4(mode, have_above, have_left, above_ext, left_ext, above_left)
 }
 
+/// §7.11.5.3 subsampled-luma + lumaAvg derivation, restricted to one
+/// 4:2:0 4×4 chroma block at chroma-pixel origin `(crow0, ccol0)`.
+///
+/// Returns `(L, luma_avg)` with the same 3-fractional-bit fixed-point
+/// encoding the spec uses (`L[i][j] = t << (3 - subX - subY)` =
+/// `t << 1` at 4:2:0, and `lumaAvg = Round2(sum, Tx_Width_Log2 +
+/// Tx_Height_Log2) = Round2(sum, 4)` for TX_4X4).
+///
+/// `recon_y` is the running reconstructed luma plane;
+/// `max_luma_w` / `max_luma_h` are the §7.11.5.3 `MaxLumaW` /
+/// `MaxLumaH` clamps (here the luma frame extent in pixels).
+fn cfl_subsampled_luma_4x4_420(
+    recon_y: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
+    crow0: usize,
+    ccol0: usize,
+) -> ([i32; 16], i32) {
+    // §7.11.5.3 — for 4:2:0: subX = subY = 1, w = h = 4 (TX_4X4). The
+    // §7.11.5.3 luma window covers `[crow0*2 .. crow0*2 + 7]` ×
+    // `[ccol0*2 .. ccol0*2 + 7]`, with right/bottom-edge clamps to
+    // `MaxLumaW - (1 << subX)` / `MaxLumaH - (1 << subY)` = `W - 2` /
+    // `H - 2`.
+    let mut l_arr = [0i32; 16];
+    let mut sum: i32 = 0;
+    for i in 0..4 {
+        let mut luma_y0 = (crow0 + i) << 1;
+        if luma_y0 > FRAME_HEIGHT - 2 {
+            luma_y0 = FRAME_HEIGHT - 2;
+        }
+        for j in 0..4 {
+            let mut luma_x0 = (ccol0 + j) << 1;
+            if luma_x0 > FRAME_WIDTH - 2 {
+                luma_x0 = FRAME_WIDTH - 2;
+            }
+            // t = sum over (dy = 0..=subY, dx = 0..=subX) = 2 × 2 box.
+            let mut t: i32 = 0;
+            for dy in 0..=1usize {
+                for dx in 0..=1usize {
+                    t += recon_y[luma_y0 + dy][luma_x0 + dx] as i32;
+                }
+            }
+            // v = t << (3 - subX - subY) = t << 1.
+            let v = t << 1;
+            l_arr[i * 4 + j] = v;
+            sum += v;
+        }
+    }
+    // lumaAvg = Round2(sum, Tx_Width_Log2 + Tx_Height_Log2) =
+    //          Round2(sum, 4). §3 Round2(x, n) = (x + (1 << (n - 1)))
+    //          >> n on x >= 0; signed Round2 sign-handling not needed
+    //          here because `sum >= 0`.
+    let luma_avg = (sum + 8) >> 4;
+    (l_arr, luma_avg)
+}
+
+/// §3 `Round2Signed(x, n)` — symmetric rounding for signed inputs
+/// (`x < 0` arm round-half-away-from-zero, matching the spec's
+/// `if x < 0 then -Round2(-x, n) else Round2(x, n)` definition).
+#[inline]
+fn round2_signed(x: i64, n: u32) -> i64 {
+    let half: i64 = 1i64 << (n - 1);
+    if x < 0 {
+        -(((-x) + half) >> n)
+    } else {
+        (x + half) >> n
+    }
+}
+
+/// §7.11.5.3 CFL chroma prediction — combine the DC_PRED chroma base
+/// with the alpha-scaled luma residual `L - lumaAvg`. Returns the 16
+/// predicted chroma samples (`u8` clipped) for one 4×4 chroma block at
+/// chroma origin `(crow0, ccol0)` on the chroma plane whose neighbours
+/// were captured by `dc_pred`.
+///
+/// `alpha` is the signed §5.11.45 `CflAlpha{U,V}` value
+/// (`-16..=-1 | 0 | 1..=16`); the §7.11.5.3 `scaledLuma` reduces to
+/// zero when `alpha == 0`, in which case the result equals
+/// `dc_pred` byte-for-byte.
+fn cfl_predict_4x4_for_plane(
+    dc_pred: &[u8; 16],
+    l_arr: &[i32; 16],
+    luma_avg: i32,
+    alpha: i8,
+) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for k in 0..16 {
+        let scaled = round2_signed((alpha as i64) * ((l_arr[k] - luma_avg) as i64), 6);
+        let p = dc_pred[k] as i64 + scaled;
+        out[k] = p.clamp(0, 255) as u8;
+    }
+    out
+}
+
+/// §5.11.45 candidate (αU, αV) pairs the r231 encoder picker enumerates.
+///
+/// The full §5.11.45 alphabet is `64` non-redundant (signU, signV,
+/// |αU|, |αV|) combinations (8 joint signs × 16 magnitudes, with the
+/// CFL_SIGN_ZERO arms only emitting one channel's magnitude). The
+/// r231 picker explores a compact subset that's effective on the
+/// strongly-luma-correlated chroma the lossless arm produces while
+/// keeping the per-block search bounded: small magnitudes
+/// {±1, ±2, ±4} with single-channel and equal-channel combinations.
+///
+/// Each entry is the signed (`CflAlphaU`, `CflAlphaV`) tuple
+/// (`-16..=-1 | 0 | 1..=16`). The all-zero pair is excluded per
+/// §6.10.36 (redundant with `UV_DC_PRED`). Single-channel zero is
+/// allowed.
+const CFL_ALPHA_CANDIDATES: &[(i8, i8)] = &[
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (-1, -1),
+    (1, -1),
+    (-1, 1),
+    (2, 0),
+    (-2, 0),
+    (0, 2),
+    (0, -2),
+    (2, 2),
+    (-2, -2),
+    (2, -2),
+    (-2, 2),
+    (4, 0),
+    (-4, 0),
+    (0, 4),
+    (0, -4),
+];
+
 /// Pick the §6.10.x intra mode with the smallest **combined** U+V
 /// residual SSD against one 4×4 chroma cell. Returns
-/// `(best_mode, best_pred_u, best_pred_v)`.
+/// `(best_mode, best_pred_u, best_pred_v, cfl_alpha)`.
 ///
 /// Per §5.11.22 one `intra_uv_mode()` symbol is written per leaf and
 /// governs both chroma planes, so the picker minimises the joint
@@ -857,17 +986,32 @@ fn predict_intra_mode_4x4_chroma(
 /// `DC_PRED..PAETH_PRED`, the §3 INTRA_MODES set) are enumerated
 /// against both planes and the lowest summed-SSD wins.
 ///
+/// r231: also evaluates UV_CFL_PRED (§7.11.5.3) over the compact
+/// (`CFL_ALPHA_CANDIDATES`) αU/αV grid built on top of the
+/// `DC_PRED` chroma prediction (matching the §7.11.5.3 input — the
+/// `dc` in `dc + Round2Signed(alpha * (L - lumaAvg), 6)` is the
+/// reconstructed-DC chroma sample, which on the first §7.11.5.3
+/// invocation equals the §7.11.2.5 DC_PRED computed in this picker).
+/// When a CFL (αU, αV) beats every §6.10.x intra mode on combined SSD,
+/// the picker returns `UV_CFL_PRED` as the mode with `Some((αU, αV))`
+/// in the fourth tuple slot; otherwise that slot is `None`.
+///
 /// `DC_PRED` is the tie-breaker (same enumeration order as the luma
 /// picker): when multiple modes yield the same SSD, the lowest mode
-/// ordinal wins.
+/// ordinal wins. CFL is enumerated after DC_PRED so a tie keeps the
+/// simpler symbol.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn pick_best_intra_mode_4x4_chroma(
+    recon_y: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
     recon_u: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
     recon_v: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
     input_u: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
     input_v: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    _luma_row0: usize,
+    _luma_col0: usize,
     row0: usize,
     col0: usize,
-) -> (u8, [u8; 16], [u8; 16]) {
+) -> (u8, [u8; 16], [u8; 16], Option<(i8, i8)>) {
     let (ha_u, hl_u, above_u, left_u, al_u) =
         derive_intra_neighbours_4x4_chroma(recon_u, row0, col0);
     let (ha_v, hl_v, above_v, left_v, al_v) =
@@ -875,7 +1019,12 @@ fn pick_best_intra_mode_4x4_chroma(
     let mut best_mode = DC_PRED as u8;
     let mut best_pred_u = [0u8; 16];
     let mut best_pred_v = [0u8; 16];
+    let mut best_alpha: Option<(i8, i8)> = None;
     let mut best_ssd: u64 = u64::MAX;
+    // Capture the DC_PRED chroma prediction explicitly so the CFL arm
+    // can reuse it as the §7.11.5.3 `dc` base.
+    let mut dc_pred_u = [0u8; 16];
+    let mut dc_pred_v = [0u8; 16];
     for &mode in &INTRA_MODE_CANDIDATES_Y {
         let Some(pred_u) = predict_intra_mode_4x4_chroma(mode, ha_u, hl_u, &above_u, &left_u, al_u)
         else {
@@ -885,6 +1034,10 @@ fn pick_best_intra_mode_4x4_chroma(
         else {
             continue;
         };
+        if mode == DC_PRED {
+            dc_pred_u = pred_u;
+            dc_pred_v = pred_v;
+        }
         let mut ssd: u64 = 0;
         for i in 0..4 {
             for j in 0..4 {
@@ -903,9 +1056,38 @@ fn pick_best_intra_mode_4x4_chroma(
             best_mode = mode as u8;
             best_pred_u = pred_u;
             best_pred_v = pred_v;
+            best_alpha = None;
         }
     }
-    (best_mode, best_pred_u, best_pred_v)
+    // r231: UV_CFL_PRED arm. §7.11.5.3 `dc` base = the chroma DC_PRED
+    // captured above. Compute the §7.11.5.3 subsampled-luma window +
+    // lumaAvg once, then enumerate the αU/αV candidate grid.
+    let (l_arr, luma_avg) = cfl_subsampled_luma_4x4_420(recon_y, row0, col0);
+    for &(au, av) in CFL_ALPHA_CANDIDATES {
+        let pred_u = cfl_predict_4x4_for_plane(&dc_pred_u, &l_arr, luma_avg, au);
+        let pred_v = cfl_predict_4x4_for_plane(&dc_pred_v, &l_arr, luma_avg, av);
+        let mut ssd: u64 = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                let pu = input_u[row0 + i][col0 + j] as i32;
+                let qu = pred_u[i * 4 + j] as i32;
+                let du = (pu - qu) as i64;
+                ssd += (du * du) as u64;
+                let pv = input_v[row0 + i][col0 + j] as i32;
+                let qv = pred_v[i * 4 + j] as i32;
+                let dv = (pv - qv) as i64;
+                ssd += (dv * dv) as u64;
+            }
+        }
+        if ssd < best_ssd {
+            best_ssd = ssd;
+            best_mode = UV_CFL_PRED as u8;
+            best_pred_u = pred_u;
+            best_pred_v = pred_v;
+            best_alpha = Some((au, av));
+        }
+    }
+    (best_mode, best_pred_u, best_pred_v, best_alpha)
 }
 
 /// Encode a 16×16 monochrome Y-only intra-only frame at `base_q_idx = 0`
@@ -1027,6 +1209,8 @@ pub fn encode_intra_frame_y(
             segment_pred: 0,
             y_mode: y_mode_pick,
             uv_mode: None,
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
             coefficients: vec![plane_y],
         });
     }
@@ -1238,6 +1422,8 @@ pub fn encode_intra_frame_yuv(
             quant: quant_y.clone(),
         });
 
+        let mut cfl_alpha_u: Option<i8> = None;
+        let mut cfl_alpha_v: Option<i8> = None;
         let uv_mode = if cell_has_chroma_420(*cc) {
             let (cr, cc_idx) = cell_to_chroma_block(*cc);
             let crow0 = cr * 4;
@@ -1249,9 +1435,21 @@ pub fn encode_intra_frame_yuv(
             // both U and V share the same pick. The keep-pred-output
             // form of the picker avoids recomputing prediction inside
             // the per-plane forward-quantize loop.
-            let (uv_pick, pred_u, pred_v) = pick_best_intra_mode_4x4_chroma(
-                &recon_u, &recon_v, &input.u, &input.v, crow0, ccol0,
+            //
+            // r231: extends the picker to also evaluate UV_CFL_PRED
+            // (`§7.11.5.3` chroma-from-luma) over a compact αU/αV
+            // search set. When CFL wins on combined U+V SSD, the
+            // picker also surfaces the chosen αU / αV pair as
+            // signed §5.11.45 `CflAlpha{U,V}` values; otherwise both
+            // are `None` and §5.11.45 is not emitted (mirroring the
+            // §5.11.22 line-8 gate).
+            let (uv_pick, pred_u, pred_v, alpha_uv) = pick_best_intra_mode_4x4_chroma(
+                &recon_y, &recon_u, &recon_v, &input.u, &input.v, row0, col0, crow0, ccol0,
             );
+            if let Some((au, av)) = alpha_uv {
+                cfl_alpha_u = Some(au);
+                cfl_alpha_v = Some(av);
+            }
             committed_uv_modes.push(uv_pick);
 
             // Walk U then V — same chain as luma, plane = 1 / 2. The
@@ -1321,6 +1519,8 @@ pub fn encode_intra_frame_yuv(
             segment_pred: 0,
             y_mode: y_mode_pick,
             uv_mode,
+            cfl_alpha_u,
+            cfl_alpha_v,
             coefficients,
         });
     }
@@ -2231,16 +2431,22 @@ mod tests {
         // Flat reconstructed + flat input on both planes ⇒ every mode
         // yields the same SSD (= 0 against the matching no-neighbour
         // mid-grey baseline at the (0,0) cell) ⇒ DC_PRED wins on the
-        // enumeration-order tie-break.
+        // enumeration-order tie-break. Flat luma ⇒ `L - lumaAvg == 0`
+        // for every CFL candidate ⇒ every CFL prediction equals
+        // DC_PRED ⇒ ties broken in favour of the simpler DC_PRED
+        // symbol (CFL is enumerated after the 13 §6.10.x modes).
+        let recon_y: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
         let recon_u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
         let recon_v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
         let input_u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
         let input_v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] = [[128u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
-        let (mode, pred_u, pred_v) =
-            pick_best_intra_mode_4x4_chroma(&recon_u, &recon_v, &input_u, &input_v, 0, 0);
+        let (mode, pred_u, pred_v, alpha) = pick_best_intra_mode_4x4_chroma(
+            &recon_y, &recon_u, &recon_v, &input_u, &input_v, 0, 0, 0, 0,
+        );
         assert_eq!(mode as usize, DC_PRED);
         assert_eq!(pred_u, [128u8; 16]);
         assert_eq!(pred_v, [128u8; 16]);
+        assert_eq!(alpha, None);
     }
 
     #[test]
@@ -2249,6 +2455,7 @@ mod tests {
         // returns a non-128 sample. Cross-check that the per-plane
         // predictions are the supplied planes' respective predictions
         // (not the same buffer for U and V).
+        let recon_y: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
         let mut recon_u: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] =
             [[10u8; CHROMA_WIDTH]; CHROMA_HEIGHT];
         let mut recon_v: [[u8; CHROMA_WIDTH]; CHROMA_HEIGHT] =
@@ -2277,8 +2484,9 @@ mod tests {
                 input_v[4 + i][4 + j] = 240;
             }
         }
-        let (_mode, pred_u, pred_v) =
-            pick_best_intra_mode_4x4_chroma(&recon_u, &recon_v, &input_u, &input_v, 4, 4);
+        let (_mode, pred_u, pred_v, _alpha) = pick_best_intra_mode_4x4_chroma(
+            &recon_y, &recon_u, &recon_v, &input_u, &input_v, 8, 8, 4, 4,
+        );
         // V plane prediction must differ from U plane prediction
         // because the V plane's neighbour is 240, not 50.
         assert_ne!(pred_u, pred_v);
@@ -2301,8 +2509,10 @@ mod tests {
 
     #[test]
     fn encode_intra_frame_yuv_committed_uv_modes_are_all_in_intra_mode_range() {
-        // Every chroma pick must be in 0..NUM_INTRA_MODES_Y. Run
-        // against a pseudo-random YUV input to stress every chroma
+        // Every chroma pick must be in 0..UV_INTRA_MODES_CFL_ALLOWED
+        // (= NUM_INTRA_MODES_Y + 1; the §3 INTRA_MODES set plus
+        // UV_CFL_PRED = 13, the §7.11.5.3 chroma-from-luma slot).
+        // Run against a pseudo-random YUV input to stress every chroma
         // block.
         let seq = tiny_seq();
         let fh = tiny_fh(&seq);
@@ -2332,8 +2542,8 @@ mod tests {
         let result = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
         for (i, &m) in result.committed_uv_modes.iter().enumerate() {
             assert!(
-                (m as usize) < NUM_INTRA_MODES_Y,
-                "chroma cell {i}: uv_mode = {m} out of 0..{NUM_INTRA_MODES_Y}"
+                (m as usize) <= UV_CFL_PRED,
+                "chroma cell {i}: uv_mode = {m} out of 0..={UV_CFL_PRED}"
             );
         }
     }
@@ -2353,6 +2563,97 @@ mod tests {
                 m as usize, DC_PRED,
                 "flat-128 input: chroma cell {i} should pick DC_PRED (0), got {m}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // r231 — UV_CFL_PRED §7.11.5.3 helpers (`cfl_subsampled_luma_4x4_420`,
+    // `round2_signed`, `cfl_predict_4x4_for_plane`).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn round2_signed_positive_inputs_match_round2_unsigned() {
+        // Round2Signed(x, 6) for x >= 0 matches (x + 32) >> 6.
+        assert_eq!(round2_signed(0, 6), 0);
+        assert_eq!(round2_signed(31, 6), 0);
+        assert_eq!(round2_signed(32, 6), 1);
+        assert_eq!(round2_signed(64, 6), 1);
+        assert_eq!(round2_signed(96, 6), 2);
+    }
+
+    #[test]
+    fn round2_signed_negative_inputs_round_away_from_zero() {
+        // Symmetric rounding per spec body (`-Round2(-x, n)`).
+        assert_eq!(round2_signed(-32, 6), -1);
+        assert_eq!(round2_signed(-31, 6), 0);
+        assert_eq!(round2_signed(-96, 6), -2);
+    }
+
+    #[test]
+    fn cfl_subsampled_luma_4x4_420_flat_luma_gives_zero_centred() {
+        // Flat luma ⇒ each `L[i][j] = 128 * 4 << 1 = 1024`, and
+        // `lumaAvg = (1024 * 16 + 8) >> 4 = 1024`. So `L - lumaAvg == 0`.
+        let recon_y: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        let (l_arr, luma_avg) = cfl_subsampled_luma_4x4_420(&recon_y, 0, 0);
+        assert_eq!(luma_avg, 1024);
+        for &v in &l_arr {
+            assert_eq!(v, 1024);
+        }
+    }
+
+    #[test]
+    fn cfl_predict_4x4_for_plane_alpha_zero_returns_dc_pred() {
+        // alpha == 0 ⇒ scaledLuma == 0 ⇒ output == dc_pred byte-for-byte.
+        let dc_pred = [128u8; 16];
+        let l_arr = [1024i32; 16]; // any value
+        let out = cfl_predict_4x4_for_plane(&dc_pred, &l_arr, 0, 0);
+        assert_eq!(out, dc_pred);
+    }
+
+    #[test]
+    fn cfl_predict_4x4_for_plane_positive_alpha_tracks_luma_excess() {
+        // L > lumaAvg ⇒ positive alpha increases the chroma sample.
+        let dc_pred = [128u8; 16];
+        // L[k] = 1024 + 64 ⇒ (L - lumaAvg) = 64; alpha = 1 ⇒
+        // scaled = Round2Signed(64, 6) = 1; output = 129.
+        let mut l_arr = [1024i32; 16];
+        for v in l_arr.iter_mut() {
+            *v += 64;
+        }
+        let out = cfl_predict_4x4_for_plane(&dc_pred, &l_arr, 1024, 1);
+        for &px in &out {
+            assert_eq!(px, 129);
+        }
+    }
+
+    #[test]
+    fn cfl_predict_4x4_for_plane_clips_at_byte_bounds() {
+        // Very large positive alpha + positive `L - lumaAvg` should
+        // saturate at 255; mirror with negative on 0.
+        let dc_pred = [255u8; 16];
+        let mut l_arr = [1024i32; 16];
+        for v in l_arr.iter_mut() {
+            *v += 1024;
+        }
+        let out = cfl_predict_4x4_for_plane(&dc_pred, &l_arr, 1024, 16);
+        for &px in &out {
+            assert_eq!(px, 255);
+        }
+        let dc_pred = [0u8; 16];
+        let out = cfl_predict_4x4_for_plane(&dc_pred, &l_arr, 1024, -16);
+        for &px in &out {
+            assert_eq!(px, 0);
+        }
+    }
+
+    #[test]
+    fn cfl_alpha_candidates_set_excludes_both_zero() {
+        // §6.10.36 prohibits (CFL_SIGN_ZERO, CFL_SIGN_ZERO); the
+        // r231 candidate set must mirror that constraint.
+        for &(au, av) in CFL_ALPHA_CANDIDATES {
+            assert!(au != 0 || av != 0, "(0, 0) pair forbidden by §6.10.36");
+            assert!(au.unsigned_abs() as usize <= CHROMA_WIDTH);
+            assert!(av.unsigned_abs() as usize <= CHROMA_WIDTH);
         }
     }
 }

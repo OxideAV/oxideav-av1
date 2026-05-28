@@ -937,6 +937,11 @@ pub fn encode_intra_frame_yuv_dyn(input: &Yuv420Frame) -> Result<EncodedFrameDyn
             segment_pred: 0,
             y_mode: leaf.y_mode,
             uv_mode: leaf.uv_mode,
+            // r231: CFL αU/αV — `None` on the dyn driver (which sticks
+            // to the §6.10.x INTRA_MODES set for chroma; UV_CFL_PRED
+            // is opt-in via the fixed-size pixel_driver this arc).
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
             coefficients: leaf.coefficients,
         }
     });

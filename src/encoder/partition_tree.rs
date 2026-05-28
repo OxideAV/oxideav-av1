@@ -109,10 +109,11 @@ use crate::cdf::{
     cfl_allowed_for_uv_mode, intra_mode_ctx, partition_ctx, partition_subsize, size_group,
     skip_ctx, TileCdfContext, TileGeometry, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DC_PRED,
     MI_HEIGHT_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PARTITION_NONE,
-    PARTITION_SPLIT,
+    PARTITION_SPLIT, UV_CFL_PRED,
 };
 use crate::encoder::block_mode_info::{
-    write_intra_frame_y_mode, write_intra_segment_id, write_intra_uv_mode, write_skip, write_y_mode,
+    write_cfl_alphas, write_intra_frame_y_mode, write_intra_segment_id, write_intra_uv_mode,
+    write_skip, write_y_mode,
 };
 use crate::encoder::coefficients::write_coefficients;
 use crate::encoder::partition::write_partition;
@@ -168,6 +169,20 @@ pub struct EncodeBlock {
     /// §5.11.22 `uv_mode`. `None` for monochrome leaves;
     /// `Some(0..UV_INTRA_MODES_*)` otherwise.
     pub uv_mode: Option<u8>,
+    /// §5.11.45 `CflAlphaU` — the signed U-channel CFL alpha. `None`
+    /// when `uv_mode != UV_CFL_PRED` (the §5.11.22 gate skips the
+    /// §5.11.45 reader entirely). When `Some`, the value MUST be in
+    /// `-16..=-1 | 0 | 1..=16` per §5.11.45's `CflAlpha = ±(1 +
+    /// cfl_alpha_*)` derivation (`0` corresponds to `signU == CFL_SIGN_ZERO`
+    /// — no `cfl_alpha_u` symbol emitted). Both alphas being `0` is
+    /// prohibited by §6.10.36 (the joint-sign `cfl_alpha_signs` table
+    /// excludes the `(ZERO, ZERO)` combination as redundant with
+    /// `UV_DC_PRED`), so when `Some` at least one of `cfl_alpha_u` /
+    /// `cfl_alpha_v` is non-zero. Added r231.
+    pub cfl_alpha_u: Option<i8>,
+    /// §5.11.45 `CflAlphaV` — mirror of [`Self::cfl_alpha_u`] for the
+    /// V channel. Added r231.
+    pub cfl_alpha_v: Option<i8>,
     /// §5.11.39 `coefficients()` input per plane the leaf walks.
     /// Length `1` (monochrome) or `3` (luma + 2 chroma).
     pub coefficients: Vec<PlaneCoefficients>,
@@ -207,6 +222,8 @@ impl EncodeNode {
             segment_pred: 0,
             y_mode: 0,
             uv_mode: None,
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
             coefficients: Vec::new(),
         })
     }
@@ -509,6 +526,17 @@ fn write_encode_block_leaf(
             state.subsampling_y,
         );
         write_intra_uv_mode(writer, cdfs, block.y_mode, uv_mode, cfl_allowed)?;
+        // §5.11.22 line 8: `if ( UVMode == UV_CFL_PRED ) read_cfl_alphas()`
+        // — r231. The encoder's CFL picker (in
+        // [`crate::encoder::pixel_driver`]) committed to a specific
+        // (CflAlphaU, CflAlphaV) when it chose UV_CFL_PRED; replay it
+        // here through `write_cfl_alphas` so the decoder reads the
+        // same scalars.
+        if uv_mode as usize == UV_CFL_PRED {
+            let alpha_u = block.cfl_alpha_u.ok_or(Error::PartitionWalkOutOfRange)?;
+            let alpha_v = block.cfl_alpha_v.ok_or(Error::PartitionWalkOutOfRange)?;
+            write_cfl_alphas(writer, cdfs, alpha_u, alpha_v)?;
+        }
     }
 
     // §5.11.39 coefficients() per plane.
@@ -578,6 +606,8 @@ mod tests {
             segment_pred: 0,
             y_mode: DC_PRED as u8,
             uv_mode: Some(DC_PRED as u8),
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
             coefficients: Vec::new(),
         }
     }
@@ -626,6 +656,8 @@ mod tests {
             segment_pred: 0,
             y_mode: DC_PRED as u8,
             uv_mode: Some(DC_PRED as u8),
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
             coefficients,
         }
     }
@@ -1052,6 +1084,8 @@ mod tests {
             segment_pred: 0,
             y_mode,
             uv_mode: Some(uv_mode),
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
             coefficients: Vec::new(),
         }
     }
