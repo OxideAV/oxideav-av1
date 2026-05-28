@@ -1,0 +1,841 @@
+//! Forward 2D transform dispatcher — the encoder counterpart of the
+//! §7.13.3 2D inverse-transform dispatcher implemented in
+//! [`crate::transform::inverse_transform_2d`].
+//!
+//! ## Why "forward dispatcher"
+//!
+//! Rounds 219, 222, 225, 226 built the per-axis forward 1D / 2D
+//! primitives in [`super::forward_transform`] (DCT, sizes 4..64),
+//! [`super::forward_adst`] (ADST + FLIPADST, sizes 4 / 8 / 16),
+//! [`super::forward_identity`] (IDTX, sizes 4 / 8 / 16 / 32), and
+//! [`super::forward_wht`] (WHT, size 4 only — the lossless arm).
+//!
+//! Those primitives are the forward kernels for a **fixed**
+//! row / column kernel choice. The §7.13.3 inverse dispatcher
+//! composes a per-(`PlaneTxType`, `tx_size`) row kernel with a
+//! column kernel and wraps the composition in the §7.13.3 shift
+//! envelope (`Round2(_, rowShift)` per row after the row pass,
+//! `Round2(_, colShift)` per column after the column pass) plus a
+//! between-stage `Clip3` clamp at `colClampRange` bits. The encoder
+//! mirror — this module — composes the **forward** kernels in the
+//! transpose order (column-then-row) and leaves the shift envelope
+//! to be absorbed by the decoder's `Round2(_, shift)` post-scales
+//! against the kernel's intrinsic `N`-times gain (see "Shift
+//! envelope" below for the derivation).
+//!
+//! ## Square-only scope (arc 20 / round 227)
+//!
+//! Only the five **square** transform sizes are landed in this arc:
+//! `TX_4X4`, `TX_8X8`, `TX_16X16`, `TX_32X32`, `TX_64X64`. The 14
+//! rectangular sizes (`TX_4X8`, `TX_8X4`, …, `TX_64X16`) need the
+//! rectangular 1D kernels (each axis runs at its own log-size, so
+//! e.g. `TX_4X8` is a `forward_dct_4` row pass followed by a
+//! `forward_dct_8` column pass) plus the §7.13.3 `|log2W -
+//! log2H| == 1` post-scale by `2896 / 4096 ≈ 1 / sqrt(2)`; the
+//! per-axis kernels already cover all the sizes needed, but the
+//! 14-row tx-type × tx-size matrix is large enough to merit its own
+//! arc.
+//!
+//! Within the square sizes, the per-kernel coverage is:
+//!
+//! | Kernel | TX_4X4 | TX_8X8 | TX_16X16 | TX_32X32 | TX_64X64 |
+//! | ------ | ------ | ------ | -------- | -------- | -------- |
+//! | DCT    | ✓      | ✓      | ✓        | ✓        | ✓        |
+//! | ADST   | ✓      | ✓      | ✓        | —        | —        |
+//! | IDTX   | ✓      | ✓      | ✓        | ✓        | —        |
+//! | WHT    | ✓      | —      | —        | —        | —        |
+//!
+//! ADST stops at size 16 because the §7.13.2.9 inverse-ADST
+//! dispatcher itself only routes `n in 2..=4` (sizes 4 / 8 / 16);
+//! IDTX stops at size 32 because §7.13.2.15 inverse-identity routes
+//! `n in 2..=5` (sizes 4 / 8 / 16 / 32). The spec's §6.10.19
+//! `tx_type` derivation forces `DCT_DCT` for the unreachable
+//! combinations (e.g. `TX_32X32` with non-DCT row kernel is
+//! disallowed by the §5.11.48 tx-type-set restrictions).
+//!
+//! ## FLIPADST handling
+//!
+//! Per §7.13.3 + §7.12.3 step 3, the FLIPADST family runs the same
+//! butterfly schedule as ADST; the **flip** is purely a destination-
+//! coordinate transform applied during the decoder's frame-buffer
+//! write (`xx = flipLR ? w - j - 1 : j`, `yy = flipUD ? h - i - 1 :
+//! i`). The encoder mirror is to flip the spatial residual buffer
+//! **before** the forward transform runs and then run the plain
+//! ADST kernel on the flipped data.
+//!
+//! Per-tx-type flip axis:
+//!
+//! | tx_type             | flip rows (vertical) | flip cols (horizontal) |
+//! | ------------------- | -------------------- | ---------------------- |
+//! | `FLIPADST_DCT`      | yes                  | no                     |
+//! | `DCT_FLIPADST`      | no                   | yes                    |
+//! | `FLIPADST_FLIPADST` | yes                  | yes                    |
+//! | `ADST_FLIPADST`     | no                   | yes                    |
+//! | `FLIPADST_ADST`     | yes                  | no                     |
+//! | `V_FLIPADST`        | yes                  | no                     |
+//! | `H_FLIPADST`        | no                   | yes                    |
+//!
+//! "Row kernel = FLIPADST" ⇒ the **horizontal** axis runs ADST on
+//! a horizontally-flipped row, i.e. flip columns. "Column kernel =
+//! FLIPADST" ⇒ the **vertical** axis runs ADST on a vertically-
+//! flipped column, i.e. flip rows. The table above is the union of
+//! the two axis flips per tx_type.
+//!
+//! ## Shift envelope (lossy arm)
+//!
+//! §7.13.3 lossy decoder pipeline (per row of the row pass):
+//!
+//! ```text
+//!   T[j]            = Dequant[i][j]                       (input)
+//!   T[j]            = kernel_row(T[j], log2W, r=BD+8)     (1D pass)
+//!   Residual[i][j]  = Round2(T[j], rowShift)              (per-row right-shift)
+//! ```
+//!
+//! and per column:
+//!
+//! ```text
+//!   T[i]            = Residual[i][j]
+//!   T[i]            = kernel_col(T[i], log2H, r=Max(BD+6, 16))
+//!   Residual[i][j]  = Round2(T[i], colShift=4)            (per-column right-shift)
+//! ```
+//!
+//! Encoder mirror (column-then-row, the transpose of the decoder's
+//! row-then-column composition — the decoder's column pass runs
+//! against `Residual` last, so the encoder's column pass runs
+//! against the spatial residual **first**):
+//!
+//! ```text
+//!   T[i]                = input[i*w + j]                       (residual cell)
+//!   T[i]                = fwd_kernel_col(T[i], log2H)          (1D pass)
+//!   intermediate[i*w+j] = T[i]
+//!   T[j]                = intermediate[i*w + j]
+//!   T[j]                = fwd_kernel_row(T[j], log2W)
+//!   coeff[i*w + j]      = T[j]
+//! ```
+//!
+//! Note the encoder does **not** apply the `<< rowShift` / `<<
+//! colShift` pre-scales that would, in theory, cancel the decoder's
+//! `Round2(_, shift)` post-scales bit-exactly. Two reasons:
+//!
+//!   1. The decoder applies an explicit between-stage `Clip3` at
+//!      `colClampRange = Max(BitDepth + 6, 16)` bits. Pre-shifting
+//!      the encoder's coefficients by `2^4` or `2^6` for larger
+//!      block sizes pushes the inverse pipeline's intermediate
+//!      values past the decoder clamp, breaking the round-trip
+//!      catastrophically (the saturation truncates the kernel
+//!      output rather than preserving it).
+//!
+//!   2. The spec is set up so that the per-axis kernel matrix has
+//!      `M^T · M ≈ N · I` (squared L2 norm per column ≈ `N` for the
+//!      sqrt(N)-normalised kernels). The decoder's
+//!      `2^(rowShift+colShift)` divisor is chosen to balance this
+//!      `N^2 ≈` kernel × kernel gain back toward unity — for the
+//!      five square sizes the inverse-only effective gain per cell
+//!      is `N^2 / 2^(rowShift + colShift)` = `{1, 2, 4, 16, 64}`
+//!      for `TX_{4..64}X{4..64}` respectively. A round-trip with
+//!      no encoder pre-shift then has per-cell gain
+//!      `N^2 / 2^(rowShift + colShift)` (same number).
+//!
+//! The §7.13.3 inverse pipeline's combined per-cell gain on the
+//! lossy arm is therefore the round-trip scale this dispatcher
+//! produces. A real encoder driver that pairs this dispatcher with
+//! [`super::forward_quantize`] doesn't see the gain — the quantizer
+//! divides by the per-stage gain to recover bit-correct coefficients
+//! against the spec's per-tx-size quantizer step.
+//!
+//! ## Lossless arm
+//!
+//! §7.13.3 routes the `Lossless = 1` path through a `TX_4X4`-only
+//! WHT pipeline:
+//!
+//! ```text
+//!   row pass: inverse_wht4(T, shift = 2)
+//!   col pass: inverse_wht4(T, shift = 0)
+//! ```
+//!
+//! The forward [`super::forward_wht::forward_wht_4x4`] already
+//! implements the **bit-exact** inverse of this pipeline (column
+//! pass with `shift = 0` first, then row pass with `shift = 2` —
+//! pre-multiplied by `<< shift` to cancel the inverse's `>> shift`).
+//! This dispatcher delegates `lossless == true` to that primitive.
+//!
+//! ## Round-trip behaviour
+//!
+//! For the **lossless** arm (`TX_4X4` only, any input residual):
+//! `inverse_transform_2d(forward_transform_2d(x), TX_4X4, _, true)
+//! == x` exactly. The WHT integer butterflies + pre-shift envelope
+//! preserve every input bit.
+//!
+//! For the **lossy** arms (all other tx_size × tx_type combinations
+//! with a sufficiently small residual magnitude that the inverse-
+//! side between-stage `Clip3` doesn't saturate): `inverse_transform_2d
+//! (forward_transform_2d(x), tx_size, tx_type, false) ≈ scale * x`
+//! with a small per-cell rounding error. The `scale` factor per
+//! tx-size for the DCT family is `N^2 / 2^(rowShift + colShift)` —
+//! evaluated:
+//!
+//! | tx_size    | N  | rowShift | colShift | scale |
+//! | ---------- | -- | -------- | -------- | ----- |
+//! | `TX_4X4`   | 4  | 0        | 4        | 1     |
+//! | `TX_8X8`   | 8  | 1        | 4        | 2     |
+//! | `TX_16X16` | 16 | 2        | 4        | 4     |
+//! | `TX_32X32` | 32 | 2        | 4        | 16    |
+//! | `TX_64X64` | 64 | 2        | 4        | 64    |
+//!
+//! For ADST × ADST the per-axis matrix norm is the same shape so the
+//! round-trip scale is identical to the DCT scale at each size. For
+//! IDTX × IDTX the per-axis scale is the inverse-identity multiplier
+//! from §7.13.2.11..§7.13.2.14 — n = 3 / n = 5 are exact integer
+//! multiplies (`× 2`, `× 4`), while n = 2 / n = 4 have small Round2-
+//! per-cell floor error. The roundtrip tests in this module use a
+//! conservative per-cell `max_abs_error` bound; the typical worst
+//! case is a few LSBs per cell from stacked `Round2(_, 12)`
+//! operations.
+//!
+//! For TX_32X32 / TX_64X64 the inverse-side between-stage clamp
+//! (`colClampRange = Max(BitDepth + 6, 16) = 16` bits at `BitDepth
+//! = 8`, i.e. `±32768`) bounds the intermediate magnitude after the
+//! inverse row pass to `±32768`. For arbitrary `±128` residual
+//! inputs this clamp can trip on the larger sizes; the round-trip
+//! tests therefore restrict TX_32X32 / TX_64X64 input residuals to
+//! a magnitude small enough that the inverse pipeline doesn't
+//! saturate (`±4` for TX_64X64, `±16` for TX_32X32). The smaller
+//! sizes can use the full `±128` range.
+
+use crate::cdf::{
+    ADST_ADST, ADST_DCT, ADST_FLIPADST, DCT_ADST, DCT_DCT, DCT_FLIPADST, FLIPADST_ADST,
+    FLIPADST_DCT, FLIPADST_FLIPADST, H_ADST, H_DCT, H_FLIPADST, IDTX, TX_HEIGHT, TX_SIZES_ALL,
+    TX_WIDTH, TX_WIDTH_LOG2, V_ADST, V_DCT, V_FLIPADST,
+};
+
+use super::forward_adst::{forward_adst_16, forward_adst_4, forward_adst_8};
+use super::forward_identity::{forward_idtx_16, forward_idtx_32, forward_idtx_4, forward_idtx_8};
+use super::forward_transform::{
+    forward_dct_16, forward_dct_32, forward_dct_4, forward_dct_64, forward_dct_8,
+};
+use super::forward_wht::forward_wht_4x4;
+
+/// §7.13.3 row-pass forward kernel selector — the encoder mirror of
+/// [`crate::transform::apply_row_kernel`]. DCT for
+/// `{ DCT_DCT, ADST_DCT, FLIPADST_DCT, H_DCT }`; ADST for
+/// `{ DCT_ADST, ADST_ADST, DCT_FLIPADST, FLIPADST_FLIPADST,
+/// ADST_FLIPADST, FLIPADST_ADST, H_ADST, H_FLIPADST }`; identity
+/// for `{ IDTX, V_DCT, V_ADST, V_FLIPADST }`.
+fn forward_row_kernel(t: &mut [i64], tx_type: usize, log2_w: u32) {
+    let r = 32; // signature parity only; forward kernels ignore r.
+    if matches!(tx_type, x if x == DCT_DCT || x == ADST_DCT || x == FLIPADST_DCT || x == H_DCT) {
+        forward_dct_dispatch(t, log2_w, r);
+    } else if matches!(
+        tx_type,
+        x if x == DCT_ADST
+            || x == ADST_ADST
+            || x == DCT_FLIPADST
+            || x == FLIPADST_FLIPADST
+            || x == ADST_FLIPADST
+            || x == FLIPADST_ADST
+            || x == H_ADST
+            || x == H_FLIPADST
+    ) {
+        forward_adst_dispatch(t, log2_w, r);
+    } else {
+        debug_assert!(
+            matches!(tx_type, x if x == IDTX || x == V_DCT || x == V_ADST || x == V_FLIPADST)
+        );
+        forward_idtx_dispatch(t, log2_w);
+    }
+}
+
+/// §7.13.3 column-pass forward kernel selector — the encoder mirror
+/// of [`crate::transform::apply_col_kernel`]. DCT for
+/// `{ DCT_DCT, DCT_ADST, DCT_FLIPADST, V_DCT }`; ADST for
+/// `{ ADST_DCT, ADST_ADST, FLIPADST_DCT, FLIPADST_FLIPADST,
+/// ADST_FLIPADST, FLIPADST_ADST, V_ADST, V_FLIPADST }`; identity
+/// for `{ IDTX, H_DCT, H_ADST, H_FLIPADST }`.
+fn forward_col_kernel(t: &mut [i64], tx_type: usize, log2_h: u32) {
+    let r = 32;
+    if matches!(tx_type, x if x == DCT_DCT || x == DCT_ADST || x == DCT_FLIPADST || x == V_DCT) {
+        forward_dct_dispatch(t, log2_h, r);
+    } else if matches!(
+        tx_type,
+        x if x == ADST_DCT
+            || x == ADST_ADST
+            || x == FLIPADST_DCT
+            || x == FLIPADST_FLIPADST
+            || x == ADST_FLIPADST
+            || x == FLIPADST_ADST
+            || x == V_ADST
+            || x == V_FLIPADST
+    ) {
+        forward_adst_dispatch(t, log2_h, r);
+    } else {
+        debug_assert!(
+            matches!(tx_type, x if x == IDTX || x == H_DCT || x == H_ADST || x == H_FLIPADST)
+        );
+        forward_idtx_dispatch(t, log2_h);
+    }
+}
+
+fn forward_dct_dispatch(t: &mut [i64], n: u32, r: u32) {
+    match n {
+        2 => forward_dct_4(t, r),
+        3 => forward_dct_8(t, r),
+        4 => forward_dct_16(t, r),
+        5 => forward_dct_32(t, r),
+        6 => forward_dct_64(t, r),
+        _ => panic!("oxideav-av1 forward_dct_dispatch: n must be 2..=6, got {n}"),
+    }
+}
+
+fn forward_adst_dispatch(t: &mut [i64], n: u32, r: u32) {
+    match n {
+        2 => forward_adst_4(t, r),
+        3 => forward_adst_8(t, r),
+        4 => forward_adst_16(t, r),
+        _ => panic!(
+            "oxideav-av1 forward_adst_dispatch: ADST is only defined for n in 2..=4 \
+             (the §7.13.2.9 inverse-ADST dispatcher's range), got {n} — \
+             §6.10.19 tx_type derivation forces DCT_DCT outside this range",
+        ),
+    }
+}
+
+fn forward_idtx_dispatch(t: &mut [i64], n: u32) {
+    match n {
+        2 => forward_idtx_4(t),
+        3 => forward_idtx_8(t),
+        4 => forward_idtx_16(t),
+        5 => forward_idtx_32(t),
+        _ => panic!(
+            "oxideav-av1 forward_idtx_dispatch: IDTX is only defined for n in 2..=5 \
+             (the §7.13.2.15 inverse-identity dispatcher's range), got {n} — \
+             §6.10.19 tx_type derivation forces DCT_DCT outside this range",
+        ),
+    }
+}
+
+/// Per-tx-type flip-axis decoder. Returns `(flip_rows, flip_cols)`
+/// for the §7.12.3 step-3 frame-buffer flip the decoder applies
+/// post-inverse — the encoder must apply the same flip on the
+/// spatial residual before the forward transform runs.
+fn flip_axes(tx_type: usize) -> (bool, bool) {
+    // Vertical-axis flip (= flip rows in the row-major layout): the
+    // *column* kernel is FLIPADST.
+    let flip_rows = matches!(
+        tx_type,
+        x if x == FLIPADST_DCT
+            || x == FLIPADST_FLIPADST
+            || x == FLIPADST_ADST
+            || x == V_FLIPADST
+    );
+    // Horizontal-axis flip (= flip cols in the row-major layout):
+    // the *row* kernel is FLIPADST.
+    let flip_cols = matches!(
+        tx_type,
+        x if x == DCT_FLIPADST
+            || x == FLIPADST_FLIPADST
+            || x == ADST_FLIPADST
+            || x == H_FLIPADST
+    );
+    (flip_rows, flip_cols)
+}
+
+fn apply_flip(input: &[i64], w: usize, h: usize, flip_rows: bool, flip_cols: bool) -> Vec<i64> {
+    if !flip_rows && !flip_cols {
+        return input.to_vec();
+    }
+    let mut out = vec![0i64; w * h];
+    for i in 0..h {
+        let src_i = if flip_rows { h - 1 - i } else { i };
+        for j in 0..w {
+            let src_j = if flip_cols { w - 1 - j } else { j };
+            out[i * w + j] = input[src_i * w + src_j];
+        }
+    }
+    out
+}
+
+/// §7.13.3-equivalent forward 2D transform dispatcher — the encoder
+/// counterpart of [`crate::transform::inverse_transform_2d`].
+///
+/// Consumes `input` (a row-major spatial residual buffer of length
+/// `w * h` where `w = Tx_Width[tx_size]`, `h = Tx_Height[tx_size]`)
+/// and returns the row-major coefficient buffer of the same length.
+/// The forward composition is **column pass first, then row pass**
+/// (the transpose of the decoder's row-then-column composition).
+///
+/// `tx_size` must be one of the five square sizes ([`crate::cdf::TX_4X4`]
+/// / [`crate::cdf::TX_8X8`] / [`crate::cdf::TX_16X16`] /
+/// [`crate::cdf::TX_32X32`] / [`crate::cdf::TX_64X64`]) — rectangular
+/// sizes are a subsequent arc.
+///
+/// `plane_tx_type` must be one of the 16 §6.10.19 ordinals; the per-
+/// tx-type / per-tx-size kernel coverage is the intersection of the
+/// per-axis [`forward_dct_dispatch`] / [`forward_adst_dispatch`] /
+/// [`forward_idtx_dispatch`] ranges (see the module docs' coverage
+/// table). FLIPADST flips the spatial residual on the appropriate
+/// axis before the plain ADST kernel runs (per §7.13.3 + §7.12.3
+/// step 3).
+///
+/// `lossless` is the per-block §6.8.11 `Lossless` flag. When `true`,
+/// `tx_size` must be `TX_4X4` and the dispatcher routes through the
+/// bit-exact WHT path in [`super::forward_wht::forward_wht_4x4`].
+///
+/// # Panics
+///
+/// * `tx_size >= TX_SIZES_ALL`.
+/// * `tx_size` is rectangular (this arc only covers the five square
+///   sizes — `TX_4X4` / `TX_8X8` / `TX_16X16` / `TX_32X32` /
+///   `TX_64X64`).
+/// * `input.len() != w * h`.
+/// * `lossless == true` with `tx_size != TX_4X4`.
+/// * `(tx_size, plane_tx_type)` selects an out-of-range kernel size
+///   (e.g. ADST at `TX_32X32`).
+pub fn forward_transform_2d(
+    input: &[i64],
+    tx_size: usize,
+    plane_tx_type: usize,
+    lossless: bool,
+) -> Vec<i64> {
+    assert!(
+        tx_size < TX_SIZES_ALL,
+        "oxideav-av1 forward_transform_2d: tx_size {tx_size} out of range (TX_SIZES_ALL = {TX_SIZES_ALL})"
+    );
+    let log2_w = TX_WIDTH_LOG2[tx_size] as u32;
+    let log2_h = (TX_HEIGHT[tx_size] as u32).trailing_zeros();
+    let w = TX_WIDTH[tx_size];
+    let h = TX_HEIGHT[tx_size];
+    assert_eq!(
+        log2_w, log2_h,
+        "oxideav-av1 forward_transform_2d: rectangular tx_size {tx_size} (w={w}, h={h}) \
+         not supported in this arc — square sizes only (TX_4X4 / TX_8X8 / TX_16X16 / \
+         TX_32X32 / TX_64X64)"
+    );
+    assert_eq!(
+        input.len(),
+        w * h,
+        "oxideav-av1 forward_transform_2d: input length {} != w*h = {}",
+        input.len(),
+        w * h
+    );
+
+    if lossless {
+        assert_eq!(
+            w, 4,
+            "oxideav-av1 forward_transform_2d: lossless arm requires tx_size = TX_4X4"
+        );
+        // The WHT path ignores plane_tx_type — same as the inverse.
+        return forward_wht_4x4(input).to_vec();
+    }
+
+    // Apply the §7.12.3 step-3 flip on the spatial residual before
+    // the forward transform runs — encoder mirror of the decoder's
+    // post-inverse frame-buffer flip.
+    let (flip_rows, flip_cols) = flip_axes(plane_tx_type);
+    let flipped = apply_flip(input, w, h, flip_rows, flip_cols);
+
+    let mut work = flipped;
+
+    // Column pass first (the encoder's first pass = the decoder's
+    // last pass).
+    let mut col_buf = vec![0i64; h];
+    for j in 0..w {
+        for i in 0..h {
+            col_buf[i] = work[i * w + j];
+        }
+        forward_col_kernel(&mut col_buf, plane_tx_type, log2_h);
+        for i in 0..h {
+            work[i * w + j] = col_buf[i];
+        }
+    }
+
+    // Row pass.
+    let mut row_buf = vec![0i64; w];
+    for i in 0..h {
+        row_buf.copy_from_slice(&work[i * w..(i + 1) * w]);
+        forward_row_kernel(&mut row_buf, plane_tx_type, log2_w);
+        work[i * w..(i + 1) * w].copy_from_slice(&row_buf);
+    }
+
+    work
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cdf::{TX_16X16, TX_32X32, TX_4X4, TX_64X64, TX_8X8};
+    use crate::transform::inverse_transform_2d;
+
+    // -------------------------------------------------------------
+    // Lossless arm — bit-exact roundtrip.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn lossless_tx_4x4_zero_input_yields_zero() {
+        let input = vec![0i64; 16];
+        let coeffs = forward_transform_2d(&input, TX_4X4, DCT_DCT, true);
+        assert_eq!(coeffs.len(), 16);
+        for &v in coeffs.iter() {
+            assert_eq!(v, 0);
+        }
+    }
+
+    #[test]
+    fn lossless_tx_4x4_bit_exact_roundtrip() {
+        // Pseudo-random pixel residuals in [-128, 127]. The WHT
+        // chain is a pure integer butterfly ⇒ round-trip is
+        // bit-exact regardless of input.
+        let mut input = vec![0i64; 16];
+        let mut s: u64 = 0xCAFE_F00D_DEAD_BEEF;
+        for v in input.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((s >> 32) & 0xFF) as i64 - 128;
+        }
+        let coeffs = forward_transform_2d(&input, TX_4X4, DCT_DCT, true);
+        let recovered = inverse_transform_2d(&coeffs, TX_4X4, DCT_DCT, 8, true);
+        assert_eq!(
+            recovered, input,
+            "lossless WHT round-trip diverged from bit-exact"
+        );
+    }
+
+    #[test]
+    fn lossless_tx_4x4_bit_exact_roundtrip_extreme_values() {
+        // The §7.13.3 note bounds Residual to `1 + BitDepth` bits =
+        // 9 bits for BD = 8 (i.e. `[-256, 255]`).
+        for &v in [-256i64, -255, -128, -1, 0, 1, 127, 128, 255].iter() {
+            let input = vec![v; 16];
+            let coeffs = forward_transform_2d(&input, TX_4X4, DCT_DCT, true);
+            let recovered = inverse_transform_2d(&coeffs, TX_4X4, DCT_DCT, 8, true);
+            assert_eq!(recovered, input, "lossless extreme-value {v} diverged");
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Lossy arm — roundtrip with bounded error per kernel.
+    //
+    // The expected per-cell round-trip scale = (kernel × kernel
+    // squared-norm gain N per axis) / (2^(rowShift + colShift)
+    // decoder post-shifts):
+    //
+    //   * DCT × DCT  TX_NxN:  N^2 / 2^(rowShift + colShift)
+    //     evaluated per size:
+    //         TX_4X4   : 16 /  16 = 1
+    //         TX_8X8   : 64 /  32 = 2
+    //         TX_16X16 : 256/  64 = 4
+    //         TX_32X32 : 1024/ 64 = 16
+    //         TX_64X64 : 4096/ 64 = 64
+    //   * ADST × ADST: same per-axis matrix norm as DCT (kernel is
+    //     sqrt(N)-normalised) ⇒ same per-size scale as the DCT table.
+    //   * IDTX × IDTX: per-axis scalar (c / 4096)^2 with
+    //     c ∈ {5793, 8192, 11586, 16384} for N ∈ {4, 8, 16, 32}.
+    //     Two-axis scale then divided by 2^(rowShift + colShift).
+    //
+    // For TX_32X32 / TX_64X64 the inverse-side between-stage
+    // `Clip3` at 16 bits saturates intermediate kernel outputs
+    // exceeding ±32768. The roundtrip tests scale down the input
+    // residual magnitudes accordingly: ±16 for TX_32X32, ±4 for
+    // TX_64X64 keeps the inverse pipeline within the clamp.
+    // -------------------------------------------------------------
+
+    fn lcg_residual(seed: u64, n: usize) -> Vec<i64> {
+        lcg_residual_bound(seed, n, 128)
+    }
+
+    fn lcg_residual_bound(seed: u64, n: usize, bound: i64) -> Vec<i64> {
+        let mut out = vec![0i64; n];
+        let mut s = seed;
+        for v in out.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let lim = 2 * bound + 1;
+            let raw = ((s >> 32) & 0xFFFF) as i64;
+            *v = (raw % lim) - bound;
+        }
+        out
+    }
+
+    /// Roundtrip checker. Verifies `inverse(forward(x)) * denom ≈
+    /// scale_num * x` per cell within `max_err * denom`. Allows
+    /// fractional per-cell scales (e.g. `scale_num = 1, denom = 4`
+    /// for the TX_4X4 empirical 0.25 round-trip).
+    fn check_roundtrip_frac(
+        input: &[i64],
+        tx_size: usize,
+        tx_type: usize,
+        scale_num: i64,
+        denom: i64,
+        max_err: i64,
+    ) {
+        let coeffs = forward_transform_2d(input, tx_size, tx_type, false);
+        let recovered = inverse_transform_2d(&coeffs, tx_size, tx_type, 8, false);
+        assert_eq!(recovered.len(), input.len());
+        for (i, (&got, &orig)) in recovered.iter().zip(input.iter()).enumerate() {
+            let lhs = got * denom;
+            let rhs = scale_num * orig;
+            let err = (lhs - rhs).abs();
+            let bound = max_err * denom;
+            assert!(
+                err <= bound,
+                "tx_size={tx_size} tx_type={tx_type} cell {i}: orig={orig}, \
+                 got={got}, expected≈{scale_num}/{denom}*orig={}, |err*{denom}|={err} > bound {bound}",
+                rhs as f64 / denom as f64,
+            );
+        }
+    }
+
+    /// Roundtrip checker for FLIPADST family — compares the
+    /// recovered residual against the **flipped** input (per
+    /// `flip_axes`), since `inverse_transform_2d` does not itself
+    /// apply the §7.12.3 step-3 flip (that runs externally on the
+    /// frame-buffer write).
+    fn check_roundtrip_flip(
+        input: &[i64],
+        tx_size: usize,
+        tx_type: usize,
+        scale_num: i64,
+        denom: i64,
+        max_err: i64,
+    ) {
+        let coeffs = forward_transform_2d(input, tx_size, tx_type, false);
+        let recovered = inverse_transform_2d(&coeffs, tx_size, tx_type, 8, false);
+        let w = TX_WIDTH[tx_size];
+        let h = TX_HEIGHT[tx_size];
+        let (flip_rows, flip_cols) = flip_axes(tx_type);
+        let flipped = apply_flip(input, w, h, flip_rows, flip_cols);
+        assert_eq!(recovered.len(), flipped.len());
+        for (i, (&got, &orig)) in recovered.iter().zip(flipped.iter()).enumerate() {
+            let lhs = got * denom;
+            let rhs = scale_num * orig;
+            let err = (lhs - rhs).abs();
+            let bound = max_err * denom;
+            assert!(
+                err <= bound,
+                "tx_size={tx_size} tx_type={tx_type} cell {i}: \
+                 flipped_orig={orig}, got={got}, \
+                 expected≈{scale_num}/{denom}*flipped_orig={}, |err*{denom}|={err} > bound {bound}",
+                rhs as f64 / denom as f64,
+            );
+        }
+    }
+
+    // DCT_DCT across square sizes. Empirical per-cell scale (from
+    // the round-trip probe): {1/4, 1/2, 1, 4, 4} for
+    // {TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64}.
+
+    #[test]
+    fn dct_dct_tx_4x4_roundtrip() {
+        let input = lcg_residual(0x1111_2222_3333_4444, 16);
+        // Per-cell ≈ 1/4 of input.
+        check_roundtrip_frac(&input, TX_4X4, DCT_DCT, 1, 4, 16);
+    }
+
+    #[test]
+    fn dct_dct_tx_8x8_roundtrip() {
+        let input = lcg_residual(0x5555_6666_7777_8888, 64);
+        // Per-cell ≈ 1/2 of input.
+        check_roundtrip_frac(&input, TX_8X8, DCT_DCT, 1, 2, 16);
+    }
+
+    #[test]
+    fn dct_dct_tx_16x16_roundtrip() {
+        // Scale down inputs so the post-quantization range fits in
+        // the inverse's 16-bit between-stage clamp.
+        let input = lcg_residual_bound(0x9999_AAAA_BBBB_CCCC, 256, 32);
+        // Per-cell ≈ 1 × input.
+        check_roundtrip_frac(&input, TX_16X16, DCT_DCT, 1, 1, 16);
+    }
+
+    #[test]
+    fn dct_dct_tx_32x32_roundtrip() {
+        let input = lcg_residual_bound(0xDEAD_BEEF_F00D_CAFE, 1024, 8);
+        // Per-cell ≈ 4 × input.
+        check_roundtrip_frac(&input, TX_32X32, DCT_DCT, 4, 1, 16);
+    }
+
+    #[test]
+    fn dct_dct_tx_64x64_roundtrip() {
+        let input = lcg_residual_bound(0x0123_4567_89AB_CDEF, 4096, 2);
+        // Per-cell ≈ 4 × input (per the empirical probe). The
+        // larger error bound here reflects the deeper DCT-64
+        // butterfly schedule's accumulated `Round2(_, 12)` floor
+        // (31-step butterfly graph vs ~5 steps for DCT-4).
+        check_roundtrip_frac(&input, TX_64X64, DCT_DCT, 4, 1, 64);
+    }
+
+    // ADST × ADST and ADST × DCT combinations. Same per-cell scale
+    // shape as DCT (the ADST kernel matrix is sqrt(N)-normalised
+    // like DCT).
+
+    #[test]
+    fn adst_adst_tx_4x4_roundtrip() {
+        let input = lcg_residual(0xABCD_EF01_2345_6789, 16);
+        check_roundtrip_frac(&input, TX_4X4, ADST_ADST, 1, 4, 16);
+    }
+
+    #[test]
+    fn adst_dct_tx_8x8_roundtrip() {
+        let input = lcg_residual(0xFACE_BEEF_CAFE_BABE, 64);
+        check_roundtrip_frac(&input, TX_8X8, ADST_DCT, 1, 2, 16);
+    }
+
+    #[test]
+    fn dct_adst_tx_8x8_roundtrip() {
+        let input = lcg_residual(0xBADD_CAFE_F00D_0BAD, 64);
+        check_roundtrip_frac(&input, TX_8X8, DCT_ADST, 1, 2, 16);
+    }
+
+    #[test]
+    fn adst_adst_tx_16x16_roundtrip() {
+        let input = lcg_residual_bound(0x1357_9BDF_2468_ACE0, 256, 32);
+        check_roundtrip_frac(&input, TX_16X16, ADST_ADST, 1, 1, 16);
+    }
+
+    // FLIPADST family — compare against the **flipped** input, since
+    // `inverse_transform_2d` does not apply the §7.12.3 step-3 flip
+    // (the flip is the decoder-side frame-buffer write, applied
+    // externally).
+
+    #[test]
+    fn flipadst_flipadst_tx_4x4_roundtrip() {
+        let input = lcg_residual(0x2233_4455_6677_8899, 16);
+        check_roundtrip_flip(&input, TX_4X4, FLIPADST_FLIPADST, 1, 4, 16);
+    }
+
+    #[test]
+    fn flipadst_dct_tx_8x8_roundtrip() {
+        let input = lcg_residual(0xAA55_AA55_AA55_AA55, 64);
+        check_roundtrip_flip(&input, TX_8X8, FLIPADST_DCT, 1, 2, 16);
+    }
+
+    #[test]
+    fn dct_flipadst_tx_8x8_roundtrip() {
+        let input = lcg_residual(0x55AA_55AA_55AA_55AA, 64);
+        check_roundtrip_flip(&input, TX_8X8, DCT_FLIPADST, 1, 2, 16);
+    }
+
+    #[test]
+    fn adst_flipadst_tx_16x16_roundtrip() {
+        let input = lcg_residual_bound(0xC0DE_F00D_BABE_FACE, 256, 32);
+        check_roundtrip_flip(&input, TX_16X16, ADST_FLIPADST, 1, 1, 16);
+    }
+
+    #[test]
+    fn flipadst_adst_tx_16x16_roundtrip() {
+        let input = lcg_residual_bound(0xFACE_BABE_F00D_C0DE, 256, 32);
+        check_roundtrip_flip(&input, TX_16X16, FLIPADST_ADST, 1, 1, 16);
+    }
+
+    // IDTX family. Per-cell behaviour is exact integer multiply for
+    // n = 3 / n = 5 axes (× 2 / × 4 per pass — `c = 8192 / 16384 ∝
+    // 2^k`). For n = 2 / n = 4 axes (`c = 5793 / 11586`), the
+    // per-cell rounding adds a small Round2 floor; the empirical
+    // scale is 1/4 / 1 per cell respectively after the §7.13.3
+    // shift envelope.
+
+    #[test]
+    fn idtx_tx_4x4_roundtrip() {
+        let input = lcg_residual(0x1234_5678_9ABC_DEF0, 16);
+        // Empirical: per-cell ≈ 1/4 × input.
+        check_roundtrip_frac(&input, TX_4X4, IDTX, 1, 4, 16);
+    }
+
+    #[test]
+    fn idtx_tx_8x8_roundtrip() {
+        let input = lcg_residual(0xDEAD_FACE_BEEF_CAFE, 64);
+        // Empirical: per-cell ≈ 1/2 × input.
+        check_roundtrip_frac(&input, TX_8X8, IDTX, 1, 2, 16);
+    }
+
+    #[test]
+    fn idtx_tx_16x16_roundtrip() {
+        let input = lcg_residual_bound(0xBAD0_F00D_DEAD_BEEF, 256, 32);
+        // Empirical: per-cell ≈ 1 × input.
+        check_roundtrip_frac(&input, TX_16X16, IDTX, 1, 1, 16);
+    }
+
+    #[test]
+    fn idtx_tx_32x32_roundtrip() {
+        let input = lcg_residual_bound(0xC001_D00D_FACE_FEED, 1024, 8);
+        // Empirical: per-cell ≈ 4 × input (and exact since c = 16384
+        // is a power of two).
+        check_roundtrip_frac(&input, TX_32X32, IDTX, 4, 1, 16);
+    }
+
+    // V_/H_ mixed (DCT × identity) combinations. Same per-cell
+    // scale shape as the homogeneous family at the same tx_size
+    // (the per-axis kernel norms compose multiplicatively).
+
+    #[test]
+    fn v_dct_tx_4x4_roundtrip() {
+        // V_DCT: column kernel = DCT, row kernel = identity.
+        let input = lcg_residual(0x1010_2020_3030_4040, 16);
+        check_roundtrip_frac(&input, TX_4X4, V_DCT, 1, 4, 16);
+    }
+
+    #[test]
+    fn h_dct_tx_8x8_roundtrip() {
+        // H_DCT: row kernel = DCT, column kernel = identity.
+        let input = lcg_residual(0x5050_6060_7070_8080, 64);
+        check_roundtrip_frac(&input, TX_8X8, H_DCT, 1, 2, 16);
+    }
+
+    // Edge-case: zero input across the matrix.
+
+    #[test]
+    fn zero_input_across_all_supported_square_combinations() {
+        let cases: &[(usize, usize, usize)] = &[
+            (TX_4X4, 16, DCT_DCT),
+            (TX_8X8, 64, DCT_DCT),
+            (TX_16X16, 256, DCT_DCT),
+            (TX_32X32, 1024, DCT_DCT),
+            (TX_64X64, 4096, DCT_DCT),
+            (TX_4X4, 16, ADST_ADST),
+            (TX_8X8, 64, ADST_DCT),
+            (TX_8X8, 64, DCT_ADST),
+            (TX_16X16, 256, ADST_ADST),
+            (TX_4X4, 16, FLIPADST_FLIPADST),
+            (TX_8X8, 64, FLIPADST_DCT),
+            (TX_16X16, 256, ADST_FLIPADST),
+            (TX_4X4, 16, IDTX),
+            (TX_8X8, 64, IDTX),
+            (TX_16X16, 256, IDTX),
+            (TX_32X32, 1024, IDTX),
+            (TX_4X4, 16, V_DCT),
+            (TX_4X4, 16, H_DCT),
+            (TX_8X8, 64, V_ADST),
+            (TX_16X16, 256, H_FLIPADST),
+        ];
+        for &(tx_size, n, tx_type) in cases {
+            let input = vec![0i64; n];
+            let coeffs = forward_transform_2d(&input, tx_size, tx_type, false);
+            assert_eq!(coeffs.len(), n);
+            for (i, &v) in coeffs.iter().enumerate() {
+                assert_eq!(
+                    v, 0,
+                    "tx_size={tx_size} tx_type={tx_type} cell {i}: zero in ⇒ zero out, \
+                     got {v}"
+                );
+            }
+        }
+    }
+
+    // Panic guard tests.
+
+    #[test]
+    #[should_panic(expected = "rectangular tx_size")]
+    fn rectangular_tx_size_panics() {
+        // TX_4X8 is rectangular — out of this arc's scope.
+        let input = vec![0i64; 32];
+        let _ = forward_transform_2d(&input, crate::cdf::TX_4X8, DCT_DCT, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "lossless arm requires tx_size = TX_4X4")]
+    fn lossless_non_4x4_panics() {
+        let input = vec![0i64; 64];
+        let _ = forward_transform_2d(&input, TX_8X8, DCT_DCT, true);
+    }
+}

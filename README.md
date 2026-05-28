@@ -2,6 +2,59 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 227)
+
+Round 227 closes the encoder's forward-transform stack: the
+**§7.13.3-equivalent forward 2D dispatcher**
+`encoder::forward_transform_2d(input, tx_size, plane_tx_type,
+lossless)` composes the r219/r222/r225/r226 per-axis forward
+primitives (DCT / ADST / FLIPADST / IDTX / WHT) into the
+column-then-row pipeline that mirrors the decoder's
+`transform::inverse_transform_2d`. Per `(tx_size, plane_tx_type)`
+the dispatcher selects the matching row and column kernels via the
+same 16-arm decision tree the inverse uses (§7.13.3 pp.306-307);
+FLIPADST flips the spatial residual along the appropriate axis
+(vertical for `FLIPADST_*` column kernel, horizontal for
+`*_FLIPADST` row kernel) before the plain ADST kernel runs —
+encoder mirror of the decoder's §7.12.3 step-3 post-inverse
+frame-buffer flip.
+
+Square-only scope this arc — the five sizes `TX_4X4`, `TX_8X8`,
+`TX_16X16`, `TX_32X32`, `TX_64X64`. ADST is capped at `TX_16X16`
+because `inverse_adst` itself only routes `n in 2..=4`, IDTX at
+`TX_32X32` (`inverse_identity` n in 2..=5) — `tx_type` derivation
+per §6.10.19 forces `DCT_DCT` for the unreachable combinations.
+Rectangular sizes (`TX_4X8`, `TX_8X4`, …, `TX_64X16`) are the next
+arc.
+
+Lossless arm (`tx_size = TX_4X4`) routes through r222's
+`forward_wht_4x4` and is **bit-exact** for any integer input. Lossy
+arm round-trips recover the input scaled by the per-cell factor
+`N^2 / 2^(rowShift + colShift)` (analytic = empirical): `{1/4, 1/2,
+1, 4, 4}` for the five square sizes. The encoder does not apply
+matching `<< colShift` / `<< rowShift` pre-scales because doing so
+pushes the decoder's between-stage `Clip3` clamp (16 bits at
+BD = 8) past saturation — the kernel's intrinsic ≈`N` gain per
+pass is the design's natural compensation for the inverse-side
+post-shifts.
+
+26 new lib tests (1419 → 1445): bit-exact lossless WHT round-trip
+across pseudo-random and `±256` extreme-value inputs; per-tx-size
+lossy round-trips for DCT × DCT, ADST × ADST, ADST × DCT,
+DCT × ADST, IDTX × IDTX, and the V_/H_ mixed (DCT × identity)
+arms; FLIPADST family verified against the flipped input
+reference (since `inverse_transform_2d` doesn't apply the §7.12.3
+flip — that runs externally at frame-buffer write time);
+zero-input ⇒ zero-output across 20 `(tx_size, tx_type)`
+combinations; panic guards on rectangular `tx_size` and
+lossless-with-non-TX_4X4.
+
+Out of scope (next arc): rectangular block sizes for
+`forward_transform_2d` (each axis independent in 1D size, plus the
+§7.13.3 `Abs(log2W - log2H) == 1` post-scale by 2896); pixel-driver
+chroma path beyond DC_PRED; §5.11.18 inter-arm `mode_info()`
+dispatcher; intra angle / palette encode.
+
 ## Status — 2026-05-29 (round 226)
 
 Round 226 rounds out the **forward 1D/2D non-DCT transform menu**:

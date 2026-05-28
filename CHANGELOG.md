@@ -6,6 +6,65 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 227 — §7.13.3-equivalent forward 2D transform dispatcher.**
+  Lands `encoder::forward_transform_2d(input: &[i64], tx_size: usize,
+  plane_tx_type: usize, lossless: bool) -> Vec<i64>` — the encoder
+  counterpart of the §7.13.3 inverse-transform dispatcher in
+  `transform::inverse_transform_2d`. Composes the r219/r222/r225/r226
+  per-axis forward kernels (DCT / ADST / FLIPADST / IDTX / WHT) into
+  the §7.13.3 **column-then-row** pipeline (transpose of the decoder's
+  row-then-column composition). Per `(tx_size, plane_tx_type)` the
+  dispatcher selects the matching row + column kernel via the same
+  16-arm decision tree the inverse uses (DCT for `{DCT_DCT, ADST_DCT,
+  FLIPADST_DCT, H_DCT}`, ADST for the eight ADST-family arms, identity
+  for `{IDTX, V_DCT, V_ADST, V_FLIPADST}` on row pass — mirrored on
+  the column pass per §7.13.3 row/col tables on p.306-307). FLIPADST
+  family flips the spatial residual along the appropriate axis
+  (vertical for `FLIPADST_*` column kernels, horizontal for `*_FLIPADST`
+  row kernels) before the plain ADST kernel runs — encoder mirror of
+  the decoder's §7.12.3 step-3 post-inverse frame-buffer flip.
+
+  **Square-only scope.** The five square sizes — `TX_4X4`, `TX_8X8`,
+  `TX_16X16`, `TX_32X32`, `TX_64X64` — are landed. ADST kernel is
+  capped at `TX_16X16` because `inverse_adst` itself routes
+  `n in 2..=4`; IDTX is capped at `TX_32X32` because
+  `inverse_identity` routes `n in 2..=5`. The §6.10.19 `tx_type`
+  derivation forces `DCT_DCT` for the unreachable combinations, so
+  the kernel-range panics in the dispatcher document the spec
+  invariant rather than fence off encoder-driver work. Rectangular
+  sizes (`TX_4X8`, `TX_8X4`, …, `TX_64X16`) are a subsequent arc.
+
+  **Lossless arm.** `lossless = true` (with `tx_size = TX_4X4`)
+  routes through r222's bit-exact `forward_wht_4x4`. The WHT integer
+  butterfly + pre-shift envelope preserves every input bit:
+  `inverse_transform_2d(forward_transform_2d(x), TX_4X4, _, true) ==
+  x` exactly for any integer residual.
+
+  **Lossy arm.** Round-trip recovers the input scaled by the per-cell
+  factor `N^2 / 2^(rowShift + colShift)` (analytic = empirical):
+  `{1/4, 1/2, 1, 4, 4}` for `TX_{4..64}X{4..64}`. The encoder does
+  not apply matching `<< colShift` / `<< rowShift` pre-scales because
+  doing so pushes the inverse pipeline's intermediate values past the
+  decoder's between-stage `Clip3` clamp (16 bits at BD = 8), breaking
+  the round-trip catastrophically. A real encoder driver pairing
+  this dispatcher with `forward_quantize` recovers bit-correct
+  coefficients by dividing through the per-stage gain in the
+  quantizer step.
+
+  +26 lib tests (1419 → 1445): bit-exact `TX_4X4` lossless WHT
+  round-trip across pseudo-random and extreme-value inputs; lossy
+  round-trip per kernel family across square sizes with per-tx-size
+  scale calibration; FLIPADST family verified against the flipped
+  input (since `inverse_transform_2d` doesn't itself flip — that
+  runs externally at §7.12.3 step 3); zero-input → zero-output across
+  20 `(tx_size, tx_type)` combinations; panic guards on rectangular
+  `tx_size` and lossless-with-non-TX_4X4.
+
+  Subsequent arcs: rectangular block sizes for `forward_transform_2d`;
+  pixel-driver wiring (chroma path, intra angle / palette);
+  §5.11.18 inter-arm `mode_info()` dispatcher; the inter-frame
+  `frame_size_with_refs()` + `read_global_param` writers.
+
 * **Round 226 — forward ADST / FLIPADST / IDTX primitives.** Lands the
   forward 1D and 2D non-DCT transform kernels: forward ADST for sizes
   `4 / 8 / 16` (the spec's full ADST coverage per §7.13.2.6/7/8),

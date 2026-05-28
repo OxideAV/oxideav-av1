@@ -203,15 +203,39 @@
 //! picking `tx_type` per block; the §7.13.3-equivalent forward 2D
 //! dispatcher with row-/col-shift envelope is the next arc.
 //!
+//! Arc 20 (round 227) lands the **§7.13.3-equivalent forward 2D
+//! transform dispatcher** in [`forward_transform_2d`]:
+//! [`forward_transform_2d::forward_transform_2d`] consumes a row-
+//! major spatial residual buffer + `(tx_size, plane_tx_type,
+//! lossless)` and returns the row-major coefficient buffer the
+//! decoder's [`crate::transform::inverse_transform_2d`] would
+//! consume. Composes the r219/r222/r225/r226 per-axis forward
+//! kernels (DCT / ADST / FLIPADST / IDTX / WHT) into the §7.13.3
+//! column-then-row pipeline (transpose of the decoder's row-then-
+//! column composition), with the §7.13.3 `colShift` / `rowShift`
+//! shift envelope applied as **pre-scales** (`<< colShift` before
+//! the column pass, `<< rowShift` before the row pass) so the
+//! decoder's `Round2(_, shift)` post-scales cancel exactly. Square
+//! sizes only this arc (`TX_4X4`, `TX_8X8`, `TX_16X16`, `TX_32X32`,
+//! `TX_64X64`); rectangular sizes (`TX_4X8`, …, `TX_64X16`) deferred
+//! to a subsequent arc.
+//!
+//! Round-trip validation: lossless `TX_4X4` arm is **bit-exact** on
+//! arbitrary integer inputs (WHT chain). Lossy arms recover the
+//! input scaled by the analytic per-axis kernel norms (DCT-N ≈ N,
+//! ADST-N ≈ N/2, IDTX with §7.13.2.11..14 scalars) within a
+//! conservative per-cell rounding bound. FLIPADST family pre-flips
+//! the spatial residual along the appropriate axis (§7.12.3 step-3
+//! mirror) before the plain ADST kernel runs.
+//!
 //! Next arc: pixel-driver chroma path (needs frame-header build with
-//! `monochrome = false`); §7.13.3-equivalent forward 2D dispatcher
-//! with row-/col-shift envelope; rectangular block sizes (`TX_4X8`
-//! / `TX_8X16` / … / `TX_32X64`); standalone `decode_av1` entry that
-//! wires the existing decoder modules into a full pipeline. §5.11.18
-//! inter-arm `mode_info()` dispatcher; intra angle / palette encode.
-//! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24
-//! `read_global_param` signed-subexp inverse for the remaining
-//! inter-frame paths.
+//! `monochrome = false`); rectangular block sizes (`TX_4X8` /
+//! `TX_8X16` / … / `TX_32X64`) for [`forward_transform_2d`];
+//! standalone `decode_av1` entry that wires the existing decoder
+//! modules into a full pipeline. §5.11.18 inter-arm `mode_info()`
+//! dispatcher; intra angle / palette encode. §5.9.7
+//! `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
+//! signed-subexp inverse for the remaining inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
@@ -220,6 +244,7 @@ pub mod forward_adst;
 pub mod forward_identity;
 pub mod forward_quantize;
 pub mod forward_transform;
+pub mod forward_transform_2d;
 pub mod forward_wht;
 pub mod frame_obu;
 pub mod ivf;
@@ -255,6 +280,7 @@ pub use forward_transform::{
     forward_dct_16, forward_dct_16x16, forward_dct_32, forward_dct_32x32, forward_dct_4,
     forward_dct_4x4, forward_dct_64, forward_dct_64x64, forward_dct_8, forward_dct_8x8,
 };
+pub use forward_transform_2d::forward_transform_2d;
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
