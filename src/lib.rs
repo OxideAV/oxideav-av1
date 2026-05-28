@@ -1625,6 +1625,12 @@ pub use cdf::{
     MODE_NEAREST_NEWMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
     MODE_NEW_NEARESTMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_BORDER, REF_CAT_LEVEL,
 };
+// r205: §7.9 motion-field-estimation helpers + the §7.10.2.5 /
+// §7.10.2.6 temporal-scan grid + §3 constants.
+pub use cdf::{
+    get_block_position, get_mv_projection, MotionFieldMvs, DIV_MULT, MAX_OFFSET_HEIGHT,
+    MAX_OFFSET_WIDTH, MFMV_INVALID, MFMV_STACK_SIZE, MV_IN_USE_BITS,
+};
 // r178: §5.11.x `read_interpolation_filter` named ordinals + readout
 // aggregate, plus the §5.11.28 / §5.11.29 readout aggregates exposed
 // alongside (each `DecodedInterBlockModeInfo` field references them).
@@ -2212,9 +2218,12 @@ pub enum Error {
     /// the next-arc target).
     ///
     /// This variant is retained as a defensive caller-bug fallback —
-    /// the §5.11.18 dispatcher only fires it on the
-    /// `use_ref_frame_mvs == true` path (which currently surfaces
-    /// [`Self::TemporalMvScanUnsupported`] from the §7.10.2 entry).
+    /// the §5.11.18 dispatcher no longer constructs it on the
+    /// conformant path. As of r205 the §7.10.2.5 temporal-scan +
+    /// §7.10.2.6 temporal-sample sub-processes are wired in alongside
+    /// the §7.10.2.1-4 spatial scans, so `use_ref_frame_mvs == true`
+    /// also runs to completion as long as the caller supplies a
+    /// `MotionFieldMvs` grid.
     FindMvStackUnsupported,
     /// The §5.11.23 [`crate::PartitionWalker::decode_inter_block_mode_info`]
     /// reader completed the §7.10.2 `find_mv_stack` call, the §5.11.23
@@ -2262,20 +2271,6 @@ pub enum Error {
     /// the [`cdf::DecodedInterBlockModeInfo`] aggregate into the
     /// [`cdf::DecodedInterFrameModeInfo`] return path.
     MotionModeUnsupported,
-    /// The §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample sub-
-    /// processes (av1-spec p.223-226) reached from the §7.10.2 driver
-    /// when the §5.9.20 frame-level `use_ref_frame_mvs == 1`. Lifted
-    /// when the caller passes `use_ref_frame_mvs == false`, the §7.10
-    /// spatial-only path lands fully (r172). The temporal scan
-    /// requires a `MotionFieldMvs[ref][y8][x8]` grid that the
-    /// frame-header `motion_field_estimation` (§7.9, av1-spec p.215)
-    /// is responsible for populating from the §5.9.20
-    /// `RefFrameSignBias` chain — this grid is not yet tracked
-    /// across calls. The §7.10.2.6 body deduplicates against
-    /// `RefStackMv[]` with weight `2` per match and adjusts
-    /// `ZeroMvContext` based on whether the temporal MV diverges
-    /// from `GlobalMvs[..]` by more than 16 1/8-luma-sample units.
-    TemporalMvScanUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -2406,10 +2401,6 @@ impl core::fmt::Display for Error {
             Self::MotionModeUnsupported => write!(
                 f,
                 "oxideav-av1: §5.11.27 read_motion_mode — defensive fallback retained post-r175 (the §5.11.27 reader is now wired into the dispatcher with §7.10.3 has_overlappable_candidates + §7.10.4 find_warp_samples; post-r176 the §5.11.28 read_interintra_mode, post-r177 the §5.11.29 read_compound_type, and post-r178 the §5.11.x read_interpolation_filter readers are also wired — completing the §5.11.23 inter cascade; the §5.11.18 dispatcher's Ok-arm continues to surface InterBlockModeInfoUnsupported pending the §5.11.34 residual lift)"
-            ),
-            Self::TemporalMvScanUnsupported => write!(
-                f,
-                "oxideav-av1: §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample reached — MotionFieldMvs[ref][y8][x8] grid + §7.9 motion_field_estimation pending next arc; only use_ref_frame_mvs == false is currently supported"
             ),
         }
     }

@@ -6,6 +6,46 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 205 — §7.10.2.5 temporal scan + §7.10.2.6 temporal
+  sample wired into `find_mv_stack`; §7.9 motion-field
+  estimation helpers landed.** The r172 `TemporalMvScanUnsupported`
+  deferral is retired. `find_mv_stack` now accepts a
+  `&MotionFieldMvs` grid and, when `use_ref_frame_mvs == true`,
+  invokes the §7.10.2.5 `scan_blk` driver at step 17 of the §7.10.2
+  outer body. The §7.10.2.5 inner loops cover the per-block 4×4
+  step grid (`stepW4 = bw4 >= 16 ? 4 : 2`, `stepH4 = bh4 >= 16 ? 4
+  : 2`, capped at `Min(b{w,h}4, 16)`) plus the §7.10.2.5
+  `allowExtension` corner-offset table `{{bh4,-2},{bh4,bw4},
+  {bh4-2,bw4}}` gated on `BLOCK_8X8 <= block < BLOCK_64X64` and
+  the §7.10.2.5 `check_sb_border` 16×16-MI window. The §7.10.2.6
+  body reads `MotionFieldMvs[RefFrame[list]][y8][x8]`, short-
+  circuits on the `MFMV_INVALID = -1 << 15` sentinel, runs the
+  §7.10.2.10 lower-precision pass, then dedupes / appends to the
+  stack with weight 2 — single-pred + compound branches both
+  honoured. The §7.10.2.6 centre-cell `ZeroMvContext` adjustment
+  (set to 1 unconditionally at `(dr=0, dc=0)`; refined to 0 only
+  when the MV diverges from `GlobalMvs` by < 16 1/8-sample units
+  on a non-sentinel cell) is wired verbatim. New
+  `MotionFieldMvs` aggregate (per-ref 7-frame × `h8` × `w8` × 2
+  i16 grid sized for `MiRows >> 1 × MiCols >> 1` per §7.9.1) with
+  `new_invalid` constructor, `set` / `get` / `set_all_refs`
+  accessors. New §7.9.3 `get_mv_projection(mv, num, denom)`
+  helper using the `Div_Mult[32]` quantised-inverse table
+  (av1-spec p.215) with §4.7.2 `Round2Signed(_, 14)` clamp into
+  `±((1 << MV_IN_USE_BITS) - 1)`. New §7.9.4 `get_block_position(
+  x8, y8, dst_sign, projMv, mi_rows, mi_cols)` helper returning
+  `Option<(u32, u32)>` for the §7.9.4 `posValid` outcome. New §3
+  constants `MFMV_STACK_SIZE = 3`, `MAX_OFFSET_WIDTH = 8`,
+  `MAX_OFFSET_HEIGHT = 0`, `MV_IN_USE_BITS = 14`, `MFMV_INVALID =
+  -1 << 15`, `DIV_MULT[32]` (av1-spec p.215). `InterFrameContext`
+  gains a `motion_field_mvs: &'a MotionFieldMvs` field plus an
+  `'a` lifetime parameter (and drops `Copy`); `identity_default(
+  motion_field_mvs)` takes a borrow. `decode_inter_block_mode_info`
+  / `decode_inter_frame_mode_info` gain a trailing
+  `motion_field_mvs: &MotionFieldMvs` parameter. The
+  `TemporalMvScanUnsupported` error variant is removed. +9 lib
+  tests (1056 → 1065), workspace-wide 1119 → 1128.
+
 * **Round 204 — §9.5.3 Quantizer matrix tables + §7.12.3 step-1b
   QM-active arm wired.** Transcribes the normative `Qm_Offset[
   TX_SIZES_ALL ]` (av1-spec p.510) and `Quantizer_Matrix[ 15 ][ 2

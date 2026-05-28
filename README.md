@@ -2,6 +2,50 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 205)
+
+Round 205 closes the last documented §7.10.2 driver gap by wiring
+**§7.10.2.5 temporal scan** + **§7.10.2.6 temporal sample** into
+`find_mv_stack` and surfacing the §7.9 motion-field-estimation
+helpers (`get_mv_projection` / `get_block_position`) the §7.10.2.5
+read site relies on. The r172 `Error::TemporalMvScanUnsupported`
+deferral is retired. A new public `MotionFieldMvs` aggregate
+(per-ref 7-frame × `h8` × `w8` × 2 i16 grid sized for `MiRows >> 1
+× MiCols >> 1` per §7.9.1) carries the §7.9.2 projection output
+into the §5.11.23 / §7.10.2 cascade through `find_mv_stack` and
+the §5.11.18 dispatcher (`InterFrameContext` gains a
+`motion_field_mvs: &'a MotionFieldMvs` field). When the caller
+opts in via `use_ref_frame_mvs == true`, the §7.10.2.5 `scan_blk`
+driver walks the per-block 4×4 step grid (`stepW4 = (bw4 >= 16) ?
+4 : 2`, `stepH4 = (bh4 >= 16) ? 4 : 2`, capped at `Min(b{w,h}4,
+16)`) plus the §7.10.2.5 `allowExtension` corner-offset table
+`{{bh4,-2}, {bh4,bw4}, {bh4-2,bw4}}` gated on `BLOCK_8X8 <= block
+< BLOCK_64X64` and §7.10.2.5 `check_sb_border`'s 16×16-MI
+superblock window. The §7.10.2.6 body reads
+`MotionFieldMvs[RefFrame[list]][y8][x8]`, short-circuits on the
+`MFMV_INVALID = -1 << 15` sentinel, runs the §7.10.2.10 lower-
+precision pass, then dedupes / appends to the stack with weight 2
+on a hit (with the §7.10.2.6 centre-cell `ZeroMvContext` adjust
+applied per spec — single-pred + compound branches both wired).
+New §3 constants `MFMV_STACK_SIZE = 3`, `MAX_OFFSET_WIDTH = 8`,
+`MAX_OFFSET_HEIGHT = 0`, `MV_IN_USE_BITS = 14`, `MFMV_INVALID = -1
+<< 15`, plus the `DIV_MULT[32]` quantised-inverse table from
+av1-spec p.215. New `get_mv_projection(mv, num, denom)` runs the
+§7.9.3 `Round2Signed(mv * num * Div_Mult[denom], 14)` clamp into
+`±((1 << MV_IN_USE_BITS) - 1)`; new `get_block_position(x8, y8,
+dst_sign, projMv, mi_rows, mi_cols)` returns `Option<(u32, u32)>`
+matching the §7.9.4 `posValid` outcome. 9 new tests (1056 -> 1065
+lib, workspace-wide 1119 -> 1128): MotionFieldMvs `new_invalid`
+sentinel-fills + sizes; set / get round-trip + out-of-grid
+sentinel; set_all_refs stamps every ref; get_mv_projection identity
+when num==denom; get_mv_projection clamp into `MV_IN_USE_BITS`;
+get_block_position valid + invalid; temporal_scan single-pred
+centre-cell lands a candidate; compound branch drops on
+second-ref-sentinel; +1 cascade reshape (`find_mv_stack` with
+opt-in + invalid-grid asserts the §7.10.2.6 ZeroMvContext stamp).
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
+
 ## Status — 2026-05-28 (round 204)
 
 Round 204 lands the **§9.5.3 Quantizer matrix tables** (av1-spec

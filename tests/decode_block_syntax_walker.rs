@@ -61,10 +61,10 @@
 //!   stub through the recursion.
 
 use oxideav_av1::{
-    DecodedBlock, DecodedInterFrameModeInfo, Error, InterFrameContext, PartitionWalker,
-    SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8,
-    GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4,
-    TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
+    DecodedBlock, DecodedInterFrameModeInfo, Error, InterFrameContext, MotionFieldMvs,
+    PartitionWalker, SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16, BLOCK_4X4,
+    BLOCK_8X16, BLOCK_8X8, GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH,
+    SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
 };
 
 /// Helper for r173 `decode_inter_frame_mode_info` tests: builds the
@@ -1291,6 +1291,7 @@ fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
     let lossless = [false; MAX_SEGMENTS];
 
     let pos_before = dec.position();
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let result = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1341,6 +1342,7 @@ fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     let pos_after = dec.position();
     assert_eq!(
@@ -1377,6 +1379,7 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
     let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
     let lossless = [false; MAX_SEGMENTS];
 
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let result = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1432,6 +1435,7 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     // r190 — the §5.11.18 dispatcher's `Ok(_)` arm now lifts the
     // historical `InterBlockModeInfoUnsupported` stub and surfaces
@@ -1485,6 +1489,7 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
     let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
     let lossless = [false; MAX_SEGMENTS];
 
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let result = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1538,6 +1543,7 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     // r190: the inter cascade now runs to completion through the
     // §5.11.18 dispatcher's Ok-arm; the §5.11.23 aggregate is
@@ -1578,6 +1584,7 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
     let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
     let lossless = [false; MAX_SEGMENTS];
 
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let result = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1630,6 +1637,7 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     // r190: the inter cascade now runs to completion. The §5.11.20
     // `read_is_inter` third arm fires (`seg_globalmv_active = true`
@@ -1660,6 +1668,7 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
     let lossless = [false; MAX_SEGMENTS];
 
     // Out-of-range mi_row.
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let r = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1708,9 +1717,11 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range mi_col.
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let r = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1759,9 +1770,11 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range sub_size.
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let r = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1810,9 +1823,11 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
     // Out-of-range last_active_seg_id.
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let r = walker.decode_inter_frame_mode_info(
         &mut dec,
         &mut cdfs,
@@ -1861,6 +1876,7 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         /* dist_equal = */ false,
         /* interpolation_filter = */ 0,
         /* enable_dual_filter = */ false,
+        &mfmvs,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 }
@@ -2434,7 +2450,8 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
     let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
     let lossless = [false; MAX_SEGMENTS];
 
-    let mut ctx = InterFrameContext::identity_default();
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+    let mut ctx = InterFrameContext::identity_default(&mfmvs);
     // §5.11.20 `read_is_inter` third arm: seg_globalmv_active forces
     // is_inter = 1 with no S() read.
     ctx.seg_globalmv_active = true;
@@ -2532,7 +2549,8 @@ fn r190_decode_partition_syntax_with_inter_ctx_routes_through_inter_arm() {
     let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
     let lossless = [false; MAX_SEGMENTS];
 
-    let mut ctx = InterFrameContext::identity_default();
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+    let mut ctx = InterFrameContext::identity_default(&mfmvs);
     ctx.seg_globalmv_active = true;
 
     let result = walker.decode_partition_syntax(
@@ -2614,7 +2632,8 @@ fn r190_decode_block_syntax_inter_arm_without_ctx_keeps_legacy_stub() {
 /// `interpolation_filter = EIGHTTAP`).
 #[test]
 fn r190_inter_frame_context_identity_default_matches_spec_identity_warp() {
-    let ctx = InterFrameContext::identity_default();
+    let mfmvs = MotionFieldMvs::new_invalid(16, 16);
+    let ctx = InterFrameContext::identity_default(&mfmvs);
     for ref_idx in 0..8 {
         assert_eq!(
             ctx.gm_params[ref_idx][2],
@@ -2662,7 +2681,8 @@ fn r190_decoded_inter_frame_mode_info_intra_arm_still_stubs() {
     let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
     let lossless = [false; MAX_SEGMENTS];
 
-    let ctx = InterFrameContext::identity_default();
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+    let ctx = InterFrameContext::identity_default(&mfmvs);
     let result = walker.decode_block_syntax(
         &mut dec,
         &mut cdfs,

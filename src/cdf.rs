@@ -467,6 +467,53 @@ pub const REF_CAT_LEVEL: u32 = 640;
 /// clamp.
 pub const MV_BORDER: i32 = 128;
 
+/// `MFMV_STACK_SIZE` per §3 (av1-spec p.16) — the number of reference
+/// frames whose motion fields are projected by §7.9
+/// `motion_field_estimation`. Used as the §7.9.1 `refStamp` cap (the
+/// stamp counter starts at `MFMV_STACK_SIZE - 2` and decreases per
+/// successful projection until the cap is exhausted).
+pub const MFMV_STACK_SIZE: i32 = 3;
+
+/// `MAX_OFFSET_WIDTH` per §3 (av1-spec p.16) — the §7.9.4
+/// `get_block_position` cap on a projected motion vector's horizontal
+/// displacement from the source 8×8 location. Values beyond the cap
+/// clear `posValid`, dropping the projection.
+pub const MAX_OFFSET_WIDTH: i32 = 8;
+
+/// `MAX_OFFSET_HEIGHT` per §3 (av1-spec p.16) — vertical mirror of
+/// [`MAX_OFFSET_WIDTH`].
+pub const MAX_OFFSET_HEIGHT: i32 = 0;
+
+/// `MV_IN_USE_BITS = 14` per §3 — the half-range bound for projected
+/// motion vectors. §7.9.3 clamps each component into
+/// `-(1 << 14) + 1 ..= (1 << 14) - 1` after the §4.7.2
+/// `Round2Signed(mv * num * Div_Mult[denom], 14)` scale.
+pub const MV_IN_USE_BITS: u32 = 14;
+
+/// `Div_Mult[ 1..=31 ]` per §7.9.3 (av1-spec p.215) — the fixed
+/// multiplicative-inverse lookup that lets the projection process
+/// scale a saved MV by `clippedNumerator / clippedDenominator` using
+/// only a multiply + arithmetic right shift. Slot 0 is the
+/// `denominator == 0` divide-by-zero guard and is set to 0; the
+/// §7.9.2 caller never invokes the projection for that case.
+///
+/// The entries are quantised inverses: `Div_Mult[d] = round(2^14 / d)`
+/// for `d = 1..=31`.
+pub const DIV_MULT: [i32; 32] = [
+    0, 16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638, 1489, 1365, 1260, 1170, 1092,
+    1024, 963, 910, 862, 819, 780, 744, 712, 682, 655, 630, 606, 585, 564, 546, 528,
+];
+
+/// Sentinel value placed in `MotionFieldMvs[ref][y8][x8][0]` to mark a
+/// motion-field slot as "no projection landed here". Per §7.9.1
+/// initialisation (av1-spec p.212): `MotionFieldMvs[ ref ][ y ][ x ][ j
+/// ] = -1 << 15` for every cell before any §7.9.2 projection runs. The
+/// §7.10.2.6 temporal-sample body short-circuits when
+/// `candMv[ 0 ] == -1 << 15`, so the §7.10.2.5 scan is a no-op on a
+/// freshly-initialised grid (which is what
+/// [`MotionFieldMvs::new_invalid`] returns).
+pub const MFMV_INVALID: i16 = -1 << 15;
+
 // ---------------------------------------------------------------------
 // §3 / §6.10.22 inter-mode ordinal constants (av1-spec p.180 — round 172,
 // the YMode = NEAREST_NEARESTMV + compound_mode offset table).
@@ -18258,6 +18305,11 @@ impl PartitionWalker {
         // scalars (see [`Self::decode_inter_block_mode_info`]).
         interpolation_filter: u8,
         enable_dual_filter: bool,
+        // r205: §7.10.2.5 / §7.10.2.6 motion-field grid. Only
+        // consulted when `use_ref_frame_mvs == true`; pass
+        // `&MotionFieldMvs::new_invalid(mi_rows, mi_cols)` for an
+        // all-sentinel grid (which makes the temporal scan a no-op).
+        motion_field_mvs: &MotionFieldMvs,
     ) -> Result<DecodedInterFrameModeInfo, crate::Error> {
         if sub_size >= BLOCK_SIZES {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -18592,6 +18644,7 @@ impl PartitionWalker {
                 dist_equal,
                 interpolation_filter,
                 enable_dual_filter,
+                motion_field_mvs,
             ) {
                 Ok(inter_info) => {
                     // r190: lift the historical
@@ -19461,6 +19514,12 @@ impl PartitionWalker {
         //   two independent symbols.
         interpolation_filter: u8,
         enable_dual_filter: bool,
+        // r205 §7.10.2.5 / §7.10.2.6 caller-supplied motion-field
+        // grid. Only consulted when `use_ref_frame_mvs == true`; on a
+        // freshly-initialised `MotionFieldMvs::new_invalid` grid
+        // every cell is the `MFMV_INVALID` sentinel so the §7.10.2.6
+        // body short-circuits at every step.
+        motion_field_mvs: &MotionFieldMvs,
     ) -> Result<DecodedInterBlockModeInfo, crate::Error> {
         // §5.11.23 caller-bug guards. Each inner method re-checks its
         // own bounds, but failing fast at the dispatcher keeps the
@@ -19540,10 +19599,10 @@ impl PartitionWalker {
         }
 
         // §5.11.23 line 5: `find_mv_stack( isCompound )` per §7.10.2.
-        // r173: spatial-only path is wired in (the §7.10.2.5 temporal-
-        // scan deferral surfaces as [`crate::Error::TemporalMvScanUnsupported`]
-        // when `use_ref_frame_mvs == true`; the post-find_mv_stack
-        // §5.11.23 cascade below is the r173 increment).
+        // r205: full §7.10.2 driver wired in (r173 spatial scans plus
+        // §7.10.2.5 / §7.10.2.6 temporal scan + sample, with the
+        // caller-supplied `motion_field_mvs` grid consulted on the
+        // `use_ref_frame_mvs == true` path).
         let mv_stack = self.find_mv_stack(
             mi_row,
             mi_col,
@@ -19556,6 +19615,7 @@ impl PartitionWalker {
             ref_frame_sign_bias,
             allow_high_precision_mv,
             force_integer_mv,
+            motion_field_mvs,
         )?;
 
         // §5.11.23 lines 6-18: YMode dispatch (av1-spec p.74). Four
@@ -23561,6 +23621,7 @@ impl PartitionWalker {
             ctx.dist_equal,
             ctx.interpolation_filter,
             ctx.enable_dual_filter,
+            ctx.motion_field_mvs,
         )?;
 
         // §5.11.18 `is_inter == 0` (intra inside an inter frame) is
@@ -25396,28 +25457,28 @@ impl PartitionWalker {
     /// * `drl_ctx_stack` — `DrlCtxStack[idx]` per §7.10.2.14, in
     ///   `0..DRL_MODE_CONTEXTS`.
     ///
-    /// ## r172 scope
+    /// ## r205 scope
     ///
-    /// This round lands the **spatial-only** path: §7.10.2 steps 1-16,
-    /// 18-36, plus §7.10.2.1 (setup-global-mv), §7.10.2.2 (scan-row),
-    /// §7.10.2.3 (scan-col), §7.10.2.4 (scan-point), §7.10.2.7 (add-ref-
-    /// mv-candidate), §7.10.2.8 (search-stack), §7.10.2.9
-    /// (compound-search-stack), §7.10.2.10 (lower-precision), §7.10.2.11
-    /// (sorting), §7.10.2.12 (extra-search) + §7.10.2.13 (add-extra-mv
-    /// candidate), and §7.10.2.14 (context + clamping).
+    /// This round closes the §7.10.2 driver by wiring **§7.10.2.5
+    /// temporal scan** + **§7.10.2.6 temporal sample** at step 17.
+    /// The full surface now covers §7.10.2 steps 1-36, including
+    /// §7.10.2.1 (setup-global-mv), §7.10.2.2 (scan-row), §7.10.2.3
+    /// (scan-col), §7.10.2.4 (scan-point), §7.10.2.5 (temporal-scan),
+    /// §7.10.2.6 (temporal-sample), §7.10.2.7 (add-ref-mv-candidate),
+    /// §7.10.2.8 (search-stack), §7.10.2.9 (compound-search-stack),
+    /// §7.10.2.10 (lower-precision), §7.10.2.11 (sorting), §7.10.2.12
+    /// (extra-search) + §7.10.2.13 (add-extra-mv candidate), and
+    /// §7.10.2.14 (context + clamping).
     ///
-    /// The **temporal scan** §7.10.2.5 + §7.10.2.6 (steps 17, between
-    /// 16 and 18 of the §7.10.2 driver) is deferred to a subsequent
-    /// arc — when the caller passes `use_ref_frame_mvs == true`, this
-    /// method returns [`crate::Error::TemporalMvScanUnsupported`]
-    /// without partially mutating state. The §7.10.2 deferred sub-process
-    /// requires a `MotionFieldMvs[ref][y8][x8]` grid that the
-    /// frame-header `motion_field_estimation` (§7.9) is responsible for
-    /// populating from the §5.9.20 `RefFrameSignBias` chain — that
-    /// scaffolding lands with the next arc. Spatial-only is the
-    /// majority of conformant blocks and is sufficient to unblock the
-    /// §5.11.23 post-prologue cascade for any frame with
-    /// `use_ref_frame_mvs == 0`.
+    /// The §7.10.2.5 / §7.10.2.6 step-17 body consults the caller's
+    /// `MotionFieldMvs` grid (sized for the current frame's
+    /// `MiRows × MiCols` per §7.9.1). On a freshly-initialised grid
+    /// (`MotionFieldMvs::new_invalid`), every slot carries the
+    /// `MFMV_INVALID` sentinel and the §7.10.2.6
+    /// `if (candMv[0] == -1 << 15) return` early-out fires for every
+    /// position — so callers that pass `use_ref_frame_mvs == true`
+    /// with an unprojected grid see the same observable output as
+    /// `use_ref_frame_mvs == false`.
     ///
     /// Caller-bug guards (`Err(PartitionWalkOutOfRange)` with no
     /// mutation):
@@ -25471,6 +25532,7 @@ impl PartitionWalker {
         ref_frame_sign_bias: [i32; 8],
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
+        motion_field_mvs: &MotionFieldMvs,
     ) -> Result<FindMvStackResult, crate::Error> {
         // §7.10 caller-bug guards.
         if sub_size >= BLOCK_SIZES {
@@ -25488,13 +25550,6 @@ impl PartitionWalker {
         if is_compound != (ref_frame[1] > 0) {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        // r172: §7.10.2.5 temporal-scan deferred. Fail fast before any
-        // mutation so the caller can re-issue the request on a fresh
-        // walker once the temporal scan lands.
-        if use_ref_frame_mvs {
-            return Err(crate::Error::TemporalMvScanUnsupported);
-        }
-
         let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as i32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as i32;
         let num_lists: usize = if is_compound { 2 } else { 1 };
@@ -25593,7 +25648,29 @@ impl PartitionWalker {
         }
 
         // 16: ZeroMvContext = 0 (already initialised by MvStackState::new).
-        // 17: Temporal-scan deferred — short-circuit above.
+
+        // 17: §7.10.2.5 temporal scan — only invoked when the frame
+        // opted into per-block motion-field reuse (§5.9.20
+        // `use_ref_frame_mvs == 1`). The §7.10.2.6 body
+        // short-circuits on every cell with the `MFMV_INVALID`
+        // sentinel (which a freshly-initialised
+        // `MotionFieldMvs::new_invalid` grid carries everywhere), so
+        // a caller that opts in without populating the grid is
+        // observably equivalent to a caller that opts out.
+        if use_ref_frame_mvs {
+            self.temporal_scan(
+                mi_row,
+                mi_col,
+                sub_size,
+                is_compound,
+                ref_frame,
+                &global_mvs,
+                allow_high_precision_mv,
+                force_integer_mv,
+                motion_field_mvs,
+                &mut state,
+            );
+        }
 
         // 18-19: scan_point(-1, -1) top-left; merge into foundAboveMatch.
         self.scan_point(
@@ -26354,6 +26431,266 @@ impl PartitionWalker {
             }
         }
     }
+
+    /// §7.10.2.5 temporal scan process (av1-spec p.223 — the
+    /// `scan_blk` outer + extension loops). Walks the per-block 4×4
+    /// step grid `(bw4, bh4)` with the §7.10.2.5 stride
+    /// `stepW4 = (bw4 >= 16) ? 4 : 2`, `stepH4 = (bh4 >= 16) ? 4 : 2`,
+    /// invoking `add_tpl_ref_mv` (= §7.10.2.6 temporal-sample) for
+    /// each cell. Then, when the block satisfies the §7.10.2.5
+    /// `allowExtension` predicate (`BLOCK_8X8 <= block < BLOCK_64X64`
+    /// on both axes), the three §7.10.2.5 `tplSamplePos[3][2]` corner
+    /// offsets `{bh4, -2}, {bh4, bw4}, {bh4 - 2, bw4}` are tested
+    /// against the §7.10.2.5 `check_sb_border` 16×16-MI window.
+    ///
+    /// The function is a no-op when the block's §7.10.2.5 step grid
+    /// produces zero candidate positions (which only happens for
+    /// degenerate `bw4 == 0` / `bh4 == 0` inputs the caller-bug
+    /// guards already exclude).
+    #[allow(clippy::too_many_arguments)]
+    fn temporal_scan(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        is_compound: bool,
+        ref_frame: [i32; 2],
+        global_mvs: &[[i32; 2]; 2],
+        allow_high_precision_mv: bool,
+        force_integer_mv: bool,
+        motion_field_mvs: &MotionFieldMvs,
+        state: &mut MvStackState,
+    ) {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as i32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as i32;
+        let step_w4 = if bw4 >= 16 { 4 } else { 2 };
+        let step_h4 = if bh4 >= 16 { 4 } else { 2 };
+
+        // §7.10.2.5 `for (deltaRow = 0; deltaRow < Min(bh4, 16);
+        // deltaRow += stepH4) for (deltaCol = 0; deltaCol <
+        // Min(bw4, 16); deltaCol += stepW4) add_tpl_ref_mv(...)`.
+        let max_dr = core::cmp::min(bh4, 16);
+        let max_dc = core::cmp::min(bw4, 16);
+        let mut dr = 0i32;
+        while dr < max_dr {
+            let mut dc = 0i32;
+            while dc < max_dc {
+                self.temporal_sample(
+                    mi_row,
+                    mi_col,
+                    dr,
+                    dc,
+                    is_compound,
+                    ref_frame,
+                    global_mvs,
+                    allow_high_precision_mv,
+                    force_integer_mv,
+                    motion_field_mvs,
+                    state,
+                );
+                dc += step_w4;
+            }
+            dr += step_h4;
+        }
+
+        // §7.10.2.5 `allowExtension = (bh4 in [BLOCK_8X8, BLOCK_64X64))
+        // && (bw4 in [BLOCK_8X8, BLOCK_64X64))`. The thresholds are
+        // 2 (BLOCK_8X8 in 4×4 units) and 16 (BLOCK_64X64 in 4×4
+        // units).
+        let bw8 = NUM_4X4_BLOCKS_WIDE[BLOCK_8X8] as i32;
+        let bh8 = NUM_4X4_BLOCKS_HIGH[BLOCK_8X8] as i32;
+        let bw64 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as i32;
+        let bh64 = NUM_4X4_BLOCKS_HIGH[BLOCK_64X64] as i32;
+        let allow_extension = bh4 >= bh8 && bh4 < bh64 && bw4 >= bw8 && bw4 < bw64;
+        if allow_extension {
+            // §7.10.2.5 `tplSamplePos[3][2] = { {bh4, -2}, {bh4, bw4},
+            // {bh4 - 2, bw4} }`.
+            let tpl_sample_pos: [[i32; 2]; 3] = [[bh4, -2], [bh4, bw4], [bh4 - 2, bw4]];
+            for pos in &tpl_sample_pos {
+                let dr = pos[0];
+                let dc = pos[1];
+                // §7.10.2.5 `check_sb_border(deltaRow, deltaCol)` —
+                // the candidate must remain inside the current
+                // superblock's 16×16-MI footprint.
+                let row = ((mi_row as i32) & 15) + dr;
+                let col = ((mi_col as i32) & 15) + dc;
+                if !(0..16).contains(&row) || !(0..16).contains(&col) {
+                    continue;
+                }
+                self.temporal_sample(
+                    mi_row,
+                    mi_col,
+                    dr,
+                    dc,
+                    is_compound,
+                    ref_frame,
+                    global_mvs,
+                    allow_high_precision_mv,
+                    force_integer_mv,
+                    motion_field_mvs,
+                    state,
+                );
+            }
+        }
+    }
+
+    /// §7.10.2.6 temporal sample process (av1-spec p.223-226 — the
+    /// `add_tpl_ref_mv` body). Reads
+    /// `MotionFieldMvs[ RefFrame[ list ] ][ y8 ][ x8 ]` for each
+    /// reference frame and inserts the §7.10.2.10
+    /// `lower_mv_precision`-rounded value into the §7.10.2 stack
+    /// with weight 2 (or increments an existing slot's weight by 2
+    /// on a duplicate hit, per the §7.10.2.6 dedupe inner loop).
+    ///
+    /// Side effects:
+    /// * Updates `state.ref_stack_mv[..]` / `state.weight_stack[..]`
+    ///   / `state.num_mv_found` exactly as the §7.10.2.6 spec body
+    ///   prescribes.
+    /// * Sets `state.zero_mv_context` to `0` or `1` on the centre
+    ///   cell `deltaRow == 0 && deltaCol == 0` based on whether the
+    ///   temporal MV diverges from `GlobalMvs[..]` by >= 16
+    ///   1/8-luma-sample units (the spec's `Abs(candMv - GlobalMvs)
+    ///   >= 16` test).
+    ///
+    /// Caller-side dependencies: the §7.10.2.6 `is_inside` gate is
+    /// applied to `(mvRow | 1, mvCol | 1)`, exactly as the spec
+    /// body specifies. An out-of-tile position is silently dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn temporal_sample(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        delta_row: i32,
+        delta_col: i32,
+        is_compound: bool,
+        ref_frame: [i32; 2],
+        global_mvs: &[[i32; 2]; 2],
+        allow_high_precision_mv: bool,
+        force_integer_mv: bool,
+        motion_field_mvs: &MotionFieldMvs,
+        state: &mut MvStackState,
+    ) {
+        // §7.10.2.6 `mvRow = (MiRow + deltaRow) | 1`, `mvCol = (MiCol +
+        // deltaCol) | 1`. The `| 1` aligns the read to the odd MI
+        // position the §7.9.2 projection stamped (§7.9.2 stores at
+        // `row = 2*y8 + 1`, `col = 2*x8 + 1`).
+        let mv_row = ((mi_row as i32) + delta_row) | 1;
+        let mv_col = ((mi_col as i32) + delta_col) | 1;
+
+        // §7.10.2.6 `if (is_inside(mvRow, mvCol) == 0) return`. Mirror
+        // the §7.10.2.4 `geometry.is_inside` gate.
+        if !self.geometry.is_inside(mv_row, mv_col) {
+            return;
+        }
+
+        // §7.10.2.6: x8 = mvCol >> 1; y8 = mvRow >> 1.
+        let x8 = (mv_col >> 1) as u32;
+        let y8 = (mv_row >> 1) as u32;
+
+        if delta_row == 0 && delta_col == 0 {
+            // §7.10.2.6 centre-cell ZeroMvContext base value (becomes
+            // `0` later only if both lists' MVs match GlobalMvs to
+            // within 16 1/8-sample units).
+            state.zero_mv_context = 1;
+        }
+
+        if !is_compound {
+            // §7.10.2.6 single-pred branch.
+            let r0 = ref_frame[0] as usize;
+            let raw = motion_field_mvs.get(r0, y8, x8);
+            if raw[0] == MFMV_INVALID {
+                return;
+            }
+            let cand_mv = lower_mv_precision(
+                [raw[0] as i32, raw[1] as i32],
+                allow_high_precision_mv,
+                force_integer_mv,
+            );
+
+            if delta_row == 0 && delta_col == 0 {
+                let g0 = global_mvs[0];
+                if (cand_mv[0] - g0[0]).abs() >= 16 || (cand_mv[1] - g0[1]).abs() >= 16 {
+                    state.zero_mv_context = 1;
+                } else {
+                    state.zero_mv_context = 0;
+                }
+            }
+
+            // §7.10.2.6 dedupe loop — match only on list 0.
+            let mut found_idx: Option<usize> = None;
+            for idx in 0..state.num_mv_found as usize {
+                if state.ref_stack_mv[idx][0] == cand_mv {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = found_idx {
+                state.weight_stack[idx] = state.weight_stack[idx].saturating_add(2);
+            } else if (state.num_mv_found as usize) < MAX_REF_MV_STACK_SIZE {
+                let idx = state.num_mv_found as usize;
+                state.ref_stack_mv[idx][0] = cand_mv;
+                // §7.10.2.6 leaves slot 1 untouched on single-pred.
+                state.weight_stack[idx] = 2;
+                state.num_mv_found += 1;
+            }
+        } else {
+            // §7.10.2.6 compound-pred branch — both lists must
+            // produce a non-sentinel projection or the whole sample
+            // is dropped.
+            let r0 = ref_frame[0] as usize;
+            let r1 = ref_frame[1] as usize;
+            let raw0 = motion_field_mvs.get(r0, y8, x8);
+            if raw0[0] == MFMV_INVALID {
+                return;
+            }
+            let raw1 = motion_field_mvs.get(r1, y8, x8);
+            if raw1[0] == MFMV_INVALID {
+                return;
+            }
+            let cand0 = lower_mv_precision(
+                [raw0[0] as i32, raw0[1] as i32],
+                allow_high_precision_mv,
+                force_integer_mv,
+            );
+            let cand1 = lower_mv_precision(
+                [raw1[0] as i32, raw1[1] as i32],
+                allow_high_precision_mv,
+                force_integer_mv,
+            );
+
+            if delta_row == 0 && delta_col == 0 {
+                let g0 = global_mvs[0];
+                let g1 = global_mvs[1];
+                if (cand0[0] - g0[0]).abs() >= 16
+                    || (cand0[1] - g0[1]).abs() >= 16
+                    || (cand1[0] - g1[0]).abs() >= 16
+                    || (cand1[1] - g1[1]).abs() >= 16
+                {
+                    state.zero_mv_context = 1;
+                } else {
+                    state.zero_mv_context = 0;
+                }
+            }
+
+            // §7.10.2.6 dedupe across both lists.
+            let mut found_idx: Option<usize> = None;
+            for idx in 0..state.num_mv_found as usize {
+                if state.ref_stack_mv[idx][0] == cand0 && state.ref_stack_mv[idx][1] == cand1 {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = found_idx {
+                state.weight_stack[idx] = state.weight_stack[idx].saturating_add(2);
+            } else if (state.num_mv_found as usize) < MAX_REF_MV_STACK_SIZE {
+                let idx = state.num_mv_found as usize;
+                state.ref_stack_mv[idx][0] = cand0;
+                state.ref_stack_mv[idx][1] = cand1;
+                state.weight_stack[idx] = 2;
+                state.num_mv_found += 1;
+            }
+        }
+    }
 }
 
 /// §7.10.2 working-state bag (`NumMvFound` / `NewMvCount` /
@@ -26380,6 +26717,217 @@ impl MvStackState {
             zero_mv_context: 0,
         }
     }
+}
+
+/// `MotionFieldMvs[ ref ][ y ][ x ][ comp ]` — the per-frame motion
+/// field used by §7.10.2.5 / §7.10.2.6 temporal MV scan (av1-spec
+/// p.212-216, p.223-226). Indexed by reference-frame
+/// (`LAST_FRAME..=ALTREF_FRAME = 1..=7`), 8×8-luma-sample grid
+/// position `(y8, x8)`, and motion-vector component
+/// (`0 = row, 1 = col`). Stored as a flat `Vec<i16>` of length `7 * h8
+/// * w8 * 2`.
+///
+/// The grid is populated by §7.9 `motion_field_estimation` once per
+/// inter frame from the saved reference-frame motion vectors plus
+/// frame-distance projection. The §7.10.2.6 temporal-sample body
+/// reads `MotionFieldMvs[ RefFrame[ list ] ][ y8 ][ x8 ]` for each
+/// candidate position; an unprojected slot sentinels as
+/// `[MFMV_INVALID, MFMV_INVALID]` and short-circuits the body
+/// (§7.10.2.6 line "if (candMv[0] == -1 << 15) return").
+///
+/// [`MotionFieldMvs::new_invalid`] creates a grid sized for the
+/// current frame's `MiRows × MiCols` (with `h8 = MiRows >> 1`,
+/// `w8 = MiCols >> 1` per §7.9.1 setup) and initialises every slot
+/// to the sentinel — exactly the state the §7.9.1 initialiser
+/// produces before any projection runs.
+#[derive(Debug, Clone)]
+pub struct MotionFieldMvs {
+    h8: u32,
+    w8: u32,
+    /// Layout: `data[((ref - 1) * h8 + y8) * w8 + x8) * 2 + comp]`.
+    /// Slot 0 of the outer dimension corresponds to `LAST_FRAME = 1`
+    /// (the §7.9.1 grid skips `INTRA_FRAME = 0` since it is never an
+    /// inter prediction reference).
+    data: Vec<i16>,
+}
+
+impl MotionFieldMvs {
+    /// `REFS_PER_FRAME = 7` — `LAST_FRAME..=ALTREF_FRAME = 1..=7` are
+    /// the inter-prediction references whose motion fields the
+    /// §7.10.2.5 scan iterates over. `INTRA_FRAME = 0` is excluded
+    /// (intra blocks never expose motion vectors).
+    pub const NUM_REFS: usize = 7;
+
+    /// Construct a fresh `MotionFieldMvs` sized for the given frame
+    /// geometry (`mi_rows`, `mi_cols` in 4×4 units; the grid stores
+    /// `h8 = mi_rows >> 1`, `w8 = mi_cols >> 1` per §7.9.1). Every
+    /// slot is initialised to the [`MFMV_INVALID`] sentinel so the
+    /// §7.10.2.6 reader correctly short-circuits on an unprojected
+    /// position.
+    pub fn new_invalid(mi_rows: u32, mi_cols: u32) -> Self {
+        let h8 = mi_rows >> 1;
+        let w8 = mi_cols >> 1;
+        let total = Self::NUM_REFS * (h8 as usize) * (w8 as usize) * 2;
+        Self {
+            h8,
+            w8,
+            data: vec![MFMV_INVALID; total],
+        }
+    }
+
+    /// Height of the motion-field grid in 8×8-luma-sample units
+    /// (`MiRows >> 1` per §7.9.1).
+    #[inline]
+    pub fn h8(&self) -> u32 {
+        self.h8
+    }
+
+    /// Width of the motion-field grid in 8×8-luma-sample units
+    /// (`MiCols >> 1` per §7.9.1).
+    #[inline]
+    pub fn w8(&self) -> u32 {
+        self.w8
+    }
+
+    #[inline]
+    fn slot_index(&self, ref_frame: usize, y8: u32, x8: u32, comp: usize) -> usize {
+        debug_assert!(
+            (1..=7).contains(&ref_frame),
+            "MotionFieldMvs is indexed by LAST_FRAME..=ALTREF_FRAME (= 1..=7)"
+        );
+        debug_assert!(y8 < self.h8);
+        debug_assert!(x8 < self.w8);
+        debug_assert!(comp < 2);
+        ((ref_frame - 1) * (self.h8 as usize) + (y8 as usize)) * (self.w8 as usize) * 2
+            + (x8 as usize) * 2
+            + comp
+    }
+
+    /// Read `MotionFieldMvs[ ref_frame ][ y8 ][ x8 ]` per §7.10.2.6.
+    /// Returns the [`MFMV_INVALID`] sentinel for any out-of-grid
+    /// position so the §7.10.2.6 short-circuit fires naturally on
+    /// frame-edge candidates that survive the §7.10.2.6 `is_inside`
+    /// pre-check but reference a `y8`/`x8` clipped to the grid edge.
+    #[inline]
+    pub fn get(&self, ref_frame: usize, y8: u32, x8: u32) -> [i16; 2] {
+        if !(1..=7).contains(&ref_frame) || y8 >= self.h8 || x8 >= self.w8 {
+            return [MFMV_INVALID, MFMV_INVALID];
+        }
+        let base = self.slot_index(ref_frame, y8, x8, 0);
+        [self.data[base], self.data[base + 1]]
+    }
+
+    /// Stamp `MotionFieldMvs[ ref_frame ][ y8 ][ x8 ] = [row, col]`
+    /// per §7.9.2. Out-of-range writes panic (debug builds) — caller
+    /// is responsible for honouring `(y8, x8) < (h8, w8)` and
+    /// `ref_frame in 1..=7`.
+    #[inline]
+    pub fn set(&mut self, ref_frame: usize, y8: u32, x8: u32, mv: [i16; 2]) {
+        let base = self.slot_index(ref_frame, y8, x8, 0);
+        self.data[base] = mv[0];
+        self.data[base + 1] = mv[1];
+    }
+
+    /// Stamp `MotionFieldMvs[ ref ][ y8 ][ x8 ] = mv` for every
+    /// reference frame `ref in LAST_FRAME..=ALTREF_FRAME`. Matches
+    /// the §7.9.2 inner loop body:
+    /// `for (dst = LAST_FRAME; dst <= ALTREF_FRAME; dst++)`.
+    #[inline]
+    pub fn set_all_refs(&mut self, y8: u32, x8: u32, mv: [i16; 2]) {
+        for ref_frame in 1..=7 {
+            self.set(ref_frame, y8, x8, mv);
+        }
+    }
+}
+
+/// `get_mv_projection( mv, numerator, denominator )` per §7.9.3
+/// (av1-spec p.215). Scales a saved motion vector by
+/// `numerator / denominator` using the [`DIV_MULT`] quantised inverse
+/// table, then clamps each component into
+/// `-(1 << MV_IN_USE_BITS) + 1 ..= (1 << MV_IN_USE_BITS) - 1`.
+///
+/// Spec body:
+///
+/// ```text
+///   clippedDenominator = Min(MAX_FRAME_DISTANCE, denominator)
+///   clippedNumerator   = Clip3(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE, numerator)
+///   for ( i = 0; i < 2; i++ ) {
+///       scaled = Round2Signed(mv[i] * clippedNumerator * Div_Mult[clippedDenominator], 14)
+///       projMv[i] = Clip3(-(1<<14)+1, (1<<14)-1, scaled)
+///   }
+/// ```
+pub fn get_mv_projection(mv: [i16; 2], numerator: i32, denominator: i32) -> [i16; 2] {
+    use crate::inter_pred::MAX_FRAME_DISTANCE;
+    let clipped_denominator = core::cmp::min(MAX_FRAME_DISTANCE, denominator) as usize;
+    let clipped_numerator = numerator.clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
+    let div = DIV_MULT[clipped_denominator] as i64;
+    let max_val = (1i64 << MV_IN_USE_BITS) - 1;
+    let min_val = -max_val;
+    let mut proj = [0i16; 2];
+    for i in 0..2 {
+        let scaled = round2_signed((mv[i] as i64) * (clipped_numerator as i64) * div, 14);
+        proj[i] = scaled.clamp(min_val, max_val) as i16;
+    }
+    proj
+}
+
+/// `get_block_position( x8, y8, dstSign, projMv )` per §7.9.4
+/// (av1-spec p.215). Returns `Some((pos_y8, pos_x8))` when the
+/// projected position lies inside both the motion-field grid and
+/// the per-direction `MAX_OFFSET_*` window; `None` otherwise (the
+/// spec's `posValid = 0` outcome).
+///
+/// The inner `project` helper (av1-spec p.216):
+///
+/// ```text
+///   project(v8, delta, dstSign, max8, maxOff8) {
+///       base8 = (v8 >> 3) << 3
+///       if (delta >= 0) {
+///           offset8 = delta >> (3 + 1 + MI_SIZE_LOG2)
+///       } else {
+///           offset8 = -((-delta) >> (3 + 1 + MI_SIZE_LOG2))
+///       }
+///       v8 += dstSign * offset8
+///       if (v8 < 0 || v8 >= max8 ||
+///           v8 < base8 - maxOff8 ||
+///           v8 >= base8 + 8 + maxOff8) {
+///           posValid = 0
+///       }
+///       return v8
+///   }
+/// ```
+pub fn get_block_position(
+    x8: i32,
+    y8: i32,
+    dst_sign: i32,
+    proj_mv: [i16; 2],
+    mi_rows: u32,
+    mi_cols: u32,
+) -> Option<(u32, u32)> {
+    // §7.9.4: PosY8 = project(y8, projMv[0], dstSign, MiRows >> 1, MAX_OFFSET_HEIGHT)
+    //         PosX8 = project(x8, projMv[1], dstSign, MiCols >> 1, MAX_OFFSET_WIDTH)
+    let max_y = (mi_rows >> 1) as i32;
+    let max_x = (mi_cols >> 1) as i32;
+    let (pos_y, valid_y) = project_axis(y8, proj_mv[0] as i32, dst_sign, max_y, MAX_OFFSET_HEIGHT);
+    let (pos_x, valid_x) = project_axis(x8, proj_mv[1] as i32, dst_sign, max_x, MAX_OFFSET_WIDTH);
+    if valid_y && valid_x {
+        Some((pos_y as u32, pos_x as u32))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn project_axis(v8_in: i32, delta: i32, dst_sign: i32, max8: i32, max_off8: i32) -> (i32, bool) {
+    let base8 = (v8_in >> 3) << 3;
+    let offset8 = if delta >= 0 {
+        delta >> (3 + 1 + MI_SIZE_LOG2)
+    } else {
+        -((-delta) >> (3 + 1 + MI_SIZE_LOG2))
+    };
+    let v8 = v8_in + dst_sign * offset8;
+    let valid = v8 >= 0 && v8 < max8 && v8 >= base8 - max_off8 && v8 < base8 + 8 + max_off8;
+    (v8, valid)
 }
 
 /// `setup_global_mv( refList )` per §7.10.2.1 (av1-spec p.219). Returns
@@ -27230,8 +27778,8 @@ pub struct DecodedInterFrameModeInfo {
 /// [`PartitionWalker::decode_inter_frame_mode_info`] / [`PartitionWalker::decode_inter_block_mode_info`]
 /// argument shape one-to-one so callers can construct the context
 /// once per frame and reuse it across every per-block dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InterFrameContext {
+#[derive(Debug, Clone)]
+pub struct InterFrameContext<'a> {
     // ---- §5.9.14 / §6.10 segmentation state ----
     /// `segmentation_update_map` (§5.9.14).
     pub segmentation_update_map: bool,
@@ -27296,9 +27844,18 @@ pub struct InterFrameContext {
     pub interpolation_filter: u8,
     /// `enable_dual_filter` (§5.5.2).
     pub enable_dual_filter: bool,
+    // ---- r205 §7.10.2.5 / §7.10.2.6 motion-field state ----
+    /// `MotionFieldMvs[ref][y8][x8]` populated by §7.9
+    /// `motion_field_estimation`. The grid is consulted by §7.10.2.5
+    /// temporal scan when `use_ref_frame_mvs == true`; pass an
+    /// all-`MFMV_INVALID` grid via
+    /// [`MotionFieldMvs::new_invalid`] for callers that haven't yet
+    /// run §7.9 (the temporal-scan body short-circuits on the
+    /// sentinel).
+    pub motion_field_mvs: &'a MotionFieldMvs,
 }
 
-impl InterFrameContext {
+impl<'a> InterFrameContext<'a> {
     /// Identity-default `InterFrameContext` — every flag off, segment
     /// id `0`, `gm_params[ref][2] = gm_params[ref][5] = 1 << WARPEDMODEL_PREC_BITS`
     /// (the §5.9.24 identity-warp defaults), zero MV / no skip-mode
@@ -27311,7 +27868,7 @@ impl InterFrameContext {
     /// "pass identity-default for callers that never run the inter arm"
     /// guidance — `gm_params[ref][2] = gm_params[ref][5] = (1 <<
     /// WARPEDMODEL_PREC_BITS) = 1 << 16 = 65536`.
-    pub fn identity_default() -> Self {
+    pub fn identity_default(motion_field_mvs: &'a MotionFieldMvs) -> Self {
         let mut gm_params = [[0i32; 6]; 8];
         // §5.9.24 identity-warp defaults: slot 2 / slot 5 hold
         // `1 << WARPEDMODEL_PREC_BITS = 1 << 16`. The other slots
@@ -27348,6 +27905,7 @@ impl InterFrameContext {
             dist_equal: false,
             interpolation_filter: crate::inter_pred::EIGHTTAP,
             enable_dual_filter: false,
+            motion_field_mvs,
         }
     }
 }
@@ -42839,6 +43397,7 @@ mod tests {
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec.position();
         // Out-of-range sub_size.
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -42875,9 +43434,11 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_row.
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -42914,9 +43475,11 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range mi_col.
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -42953,9 +43516,11 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range seg_ref_frame_data.
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -42992,9 +43557,11 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         // Out-of-range skip_mode_frame[0].
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43031,6 +43598,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
         assert_eq!(
@@ -43057,6 +43625,7 @@ mod tests {
         let bytes = [0xFFu8; 32]; // hostile buffer the reader must not touch
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43093,6 +43662,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -43140,6 +43710,7 @@ mod tests {
         let bytes = [0xFFu8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43176,6 +43747,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §5.11.25 itself reads 0 bits on the seg_ref_frame_active arm;
@@ -43205,6 +43777,7 @@ mod tests {
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43241,6 +43814,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec.position(), pos_before);
@@ -43289,6 +43863,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(dec2.position(), pos_before);
@@ -43315,6 +43890,7 @@ mod tests {
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43351,6 +43927,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // The single-ref cascade reads at least the single_ref_p1
@@ -43390,6 +43967,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43426,6 +44004,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         let r0 = walker.ref_frames()[0];
@@ -43460,6 +44039,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43496,6 +44076,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Small-block gate forces single-pred → RefFrame[1] = NONE.
@@ -43655,6 +44236,7 @@ mod tests {
         let bytes = [0xFFu8; 32]; // hostile — Arm 1 must not touch it.
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43691,6 +44273,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -43718,6 +44301,7 @@ mod tests {
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43754,6 +44338,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -43800,6 +44385,7 @@ mod tests {
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43836,6 +44422,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
@@ -43878,6 +44465,7 @@ mod tests {
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43914,6 +44502,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(
@@ -43953,6 +44542,7 @@ mod tests {
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -43989,6 +44579,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert!(dec.position() > pos_before);
@@ -44024,6 +44615,7 @@ mod tests {
         }
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44060,6 +44652,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
     }
@@ -44097,6 +44690,7 @@ mod tests {
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44133,6 +44727,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // drl_mode CDFs must NOT have adapted (no read fired).
@@ -44182,6 +44777,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44218,16 +44814,19 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert_eq!(r, Err(crate::Error::PartitionWalkOutOfRange));
     }
 
-    /// §5.11.23 r173: `use_ref_frame_mvs == true` surfaces the
-    /// §7.10.2.5 deferral (`TemporalMvScanUnsupported`) BEFORE the
-    /// post-find_mv_stack cascade runs. This matches the §7.10.2
-    /// driver's fail-fast contract.
+    /// §5.11.23 r205: `use_ref_frame_mvs == true` with an
+    /// all-`MFMV_INVALID` motion-field grid runs the §7.10.2 driver
+    /// (including §7.10.2.5 temporal scan + §7.10.2.6 temporal
+    /// sample) to completion — the §7.10.2.6 short-circuit on the
+    /// sentinel makes the temporal scan observably a no-op so the
+    /// cascade behaves identically to `use_ref_frame_mvs == false`.
     #[test]
-    fn cascade_use_ref_frame_mvs_surfaces_temporal_scan_deferral() {
+    fn cascade_use_ref_frame_mvs_with_invalid_grid_runs_to_completion() {
         let geom = TileGeometry {
             mi_row_start: 0,
             mi_row_end: 8,
@@ -44238,6 +44837,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44274,8 +44874,15 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
-        assert_eq!(r, Err(crate::Error::TemporalMvScanUnsupported));
+        // §5.11.23 + §7.10.2 cascade now runs to completion with the
+        // §7.10.2.5 temporal scan no-op'd by the sentinel grid. The
+        // skip_mode == 1 arm short-circuits YMode to
+        // NEAREST_NEARESTMV without reading any extra bits, so the
+        // cascade returns a fully-decoded aggregate.
+        let info = r.expect("§7.10.2 driver with invalid grid runs to completion");
+        assert_eq!(info.y_mode, MODE_NEAREST_NEARESTMV);
     }
 
     // ===================================================================
@@ -44369,6 +44976,7 @@ mod tests {
         let bytes = [0xFFu8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44405,6 +45013,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -44445,6 +45054,7 @@ mod tests {
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
         let pos_before = dec.position();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44481,6 +45091,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         assert_eq!(
@@ -44538,6 +45149,7 @@ mod tests {
         }
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44574,6 +45186,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // Mvs grid: identity-GM PredMv = [0, 0], MV_JOINT_ZERO diff =
@@ -44630,6 +45243,7 @@ mod tests {
         }
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let r = walker.decode_inter_block_mode_info(
             &mut dec,
             &mut cdfs,
@@ -44666,6 +45280,7 @@ mod tests {
             /* dist_equal = */ false,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
+            &mfmvs,
         );
         assert!(r.is_ok(), "r175: §5.11.27 read_motion_mode short-circuits to SIMPLE (no S()) on !is_motion_mode_switchable; the §5.11.23 dispatcher returns Ok(DecodedInterBlockModeInfo {{ motion_mode: SIMPLE, .. }}) — got {r:?}");
         // §6.10.25 `is_mv_valid`: |Mv[i][c]| < (1 << 14) = 16384.
@@ -45131,6 +45746,7 @@ mod tests {
         };
         let walker = PartitionWalker::new(16, 16, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45144,6 +45760,7 @@ mod tests {
                 zero_sign_bias(),
                 false,
                 false,
+                &mfmvs,
             )
             .unwrap();
         assert_eq!(res.num_mv_found, 0, "no inter neighbours ⇒ stack empty");
@@ -45172,6 +45789,7 @@ mod tests {
         };
         let walker = PartitionWalker::new(16, 16, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45185,6 +45803,7 @@ mod tests {
                 zero_sign_bias(),
                 false,
                 false,
+                &mfmvs,
             )
             .unwrap();
         // §7.10.2.12 compound: NumMvFound was 0 ⇒ extra-search emits
@@ -45213,6 +45832,7 @@ mod tests {
         };
         let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
 
         // sub_size >= BLOCK_SIZES
         assert!(matches!(
@@ -45228,6 +45848,7 @@ mod tests {
                 zero_sign_bias(),
                 false,
                 false,
+                &mfmvs,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
@@ -45245,6 +45866,7 @@ mod tests {
                 zero_sign_bias(),
                 false,
                 false,
+                &mfmvs,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
@@ -45262,6 +45884,7 @@ mod tests {
                 zero_sign_bias(),
                 false,
                 false,
+                &mfmvs,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
@@ -45279,6 +45902,7 @@ mod tests {
                 zero_sign_bias(),
                 false,
                 false,
+                &mfmvs,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
@@ -45296,16 +45920,22 @@ mod tests {
                 zero_sign_bias(),
                 false,
                 false,
+                &mfmvs,
             ),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
     }
 
-    /// §7.10 temporal-scan deferral: `use_ref_frame_mvs == true` ⇒
-    /// `Err(TemporalMvScanUnsupported)` with no state observed via
-    /// `Ok(_)`.
+    /// §7.10 r205 temporal-scan opt-in with an all-sentinel
+    /// motion-field grid runs to completion. The §7.10.2.6
+    /// `candMv[0] == MFMV_INVALID` early-return fires at every
+    /// position, so num_mv_found / weight_stack / ref_stack_mv are
+    /// not perturbed. The only observable side effect is the
+    /// §7.10.2.6 centre-cell ZeroMvContext stamp (`deltaRow == 0
+    /// && deltaCol == 0` ⇒ `ZeroMvContext = 1`), which the spec
+    /// sets BEFORE the invalid-sentinel return.
     #[test]
-    fn find_mv_stack_temporal_scan_deferred() {
+    fn find_mv_stack_temporal_scan_invalid_grid_only_stamps_zero_mv_context() {
         let geom = TileGeometry {
             mi_row_start: 0,
             mi_row_end: 8,
@@ -45314,20 +45944,247 @@ mod tests {
         };
         let walker = PartitionWalker::new(8, 8, geom).unwrap();
         let (gm_type, gm_params) = identity_gm();
-        let r = walker.find_mv_stack(
-            0,
-            0,
-            BLOCK_4X4,
-            [1, -1],
-            false,
-            true, // use_ref_frame_mvs
-            gm_type,
-            gm_params,
-            zero_sign_bias(),
-            false,
-            false,
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+        let r_opt_in = walker
+            .find_mv_stack(
+                0,
+                0,
+                BLOCK_4X4,
+                [1, -1],
+                false,
+                true, // use_ref_frame_mvs
+                gm_type,
+                gm_params,
+                zero_sign_bias(),
+                false,
+                false,
+                &mfmvs,
+            )
+            .expect("invalid-grid opt-in runs to completion");
+        let r_opt_out = walker
+            .find_mv_stack(
+                0,
+                0,
+                BLOCK_4X4,
+                [1, -1],
+                false,
+                false,
+                gm_type,
+                gm_params,
+                zero_sign_bias(),
+                false,
+                false,
+                &mfmvs,
+            )
+            .expect("opt-out path runs to completion");
+        // Stack contents identical: no candidate landed.
+        assert_eq!(r_opt_in.num_mv_found, r_opt_out.num_mv_found);
+        assert_eq!(r_opt_in.new_mv_count, r_opt_out.new_mv_count);
+        assert_eq!(r_opt_in.ref_stack_mv, r_opt_out.ref_stack_mv);
+        assert_eq!(r_opt_in.weight_stack, r_opt_out.weight_stack);
+        assert_eq!(r_opt_in.global_mvs, r_opt_out.global_mvs);
+        assert_eq!(r_opt_in.new_mv_context, r_opt_out.new_mv_context);
+        assert_eq!(r_opt_in.ref_mv_context, r_opt_out.ref_mv_context);
+        // §7.10.2.6 centre-cell stamp on the opt-in path:
+        // ZeroMvContext = 1.
+        assert_eq!(r_opt_in.zero_mv_context, 1);
+        // Opt-out path leaves the §7.10.2 step-16 default of 0.
+        assert_eq!(r_opt_out.zero_mv_context, 0);
+    }
+
+    /// r205 §7.9.1 motion-field grid initialisation:
+    /// `MotionFieldMvs::new_invalid` sizes the grid to `(mi_rows >> 1)
+    /// × (mi_cols >> 1)` per the §7.9.1 setup and fills every cell
+    /// with the `MFMV_INVALID = -32768` sentinel.
+    #[test]
+    fn motion_field_mvs_new_invalid_sizes_and_sentinels() {
+        let grid = MotionFieldMvs::new_invalid(16, 8);
+        assert_eq!(grid.h8(), 8);
+        assert_eq!(grid.w8(), 4);
+        for ref_frame in 1..=7 {
+            for y in 0..grid.h8() {
+                for x in 0..grid.w8() {
+                    assert_eq!(grid.get(ref_frame, y, x), [MFMV_INVALID, MFMV_INVALID]);
+                }
+            }
+        }
+    }
+
+    /// r205 §7.9.2 motion-field stamp: `set` overwrites both
+    /// components; `get` returns the stamped value. Out-of-grid
+    /// reads return the sentinel.
+    #[test]
+    fn motion_field_mvs_set_get_round_trip_and_out_of_grid_sentinel() {
+        let mut grid = MotionFieldMvs::new_invalid(8, 8);
+        grid.set(/* LAST_FRAME = */ 1, 2, 3, [123, -456]);
+        assert_eq!(grid.get(1, 2, 3), [123, -456]);
+        // Other refs at (2, 3) unchanged.
+        assert_eq!(grid.get(2, 2, 3), [MFMV_INVALID, MFMV_INVALID]);
+        // Out-of-grid reads return the sentinel (the §7.10.2.6
+        // outer is_inside check is the caller's responsibility, but
+        // out-of-grid still doesn't panic).
+        assert_eq!(grid.get(1, 100, 0), [MFMV_INVALID, MFMV_INVALID]);
+        assert_eq!(grid.get(1, 0, 100), [MFMV_INVALID, MFMV_INVALID]);
+        // INTRA_FRAME (= 0) and out-of-range refs sentinel out.
+        assert_eq!(grid.get(0, 0, 0), [MFMV_INVALID, MFMV_INVALID]);
+        assert_eq!(grid.get(8, 0, 0), [MFMV_INVALID, MFMV_INVALID]);
+    }
+
+    /// r205 §7.9.2 `set_all_refs` stamps every reference frame at
+    /// the same `(y8, x8)` with the same MV — the §7.9.2 inner-loop
+    /// shape (`for dst = LAST_FRAME; dst <= ALTREF_FRAME; dst++`).
+    #[test]
+    fn motion_field_mvs_set_all_refs_stamps_every_ref() {
+        let mut grid = MotionFieldMvs::new_invalid(8, 8);
+        grid.set_all_refs(1, 2, [99, 100]);
+        for ref_frame in 1..=7 {
+            assert_eq!(grid.get(ref_frame, 1, 2), [99, 100]);
+        }
+    }
+
+    /// r205 §7.9.3 `get_mv_projection`: numerator == denominator
+    /// returns the source MV unchanged (modulo clamping). The
+    /// `Div_Mult[denom]` table is the round-to-nearest inverse:
+    /// `round(2^14 / denom)`. With numerator == denominator the
+    /// product `numerator * Div_Mult[denom]` ≈ 2^14, and the
+    /// `Round2Signed(mv * 2^14, 14)` recovers the input.
+    #[test]
+    fn get_mv_projection_identity_when_num_eq_denom() {
+        // numerator == denominator == 4: Div_Mult[4] = 4096 = 2^12.
+        // mv * 4 * 4096 = mv * 2^14 → Round2Signed(_, 14) = mv.
+        let mv = get_mv_projection([100, -100], 4, 4);
+        assert_eq!(mv, [100, -100]);
+        // denominator == 1 ⇒ Div_Mult[1] = 16384 = 2^14 → mv * 1 *
+        // 2^14, Round2Signed(_, 14) = mv.
+        let mv = get_mv_projection([42, 17], 1, 1);
+        assert_eq!(mv, [42, 17]);
+    }
+
+    /// r205 §7.9.3 clamp: projected components saturate at
+    /// `±((1 << MV_IN_USE_BITS) - 1)`. A large source MV scaled with
+    /// numerator > denominator overflows the §7.9.3 clamp range.
+    #[test]
+    fn get_mv_projection_clamps_into_mv_in_use_bits() {
+        // Source 30000 * 8 / 1 = 240000 ⇒ clamps to (1<<14)-1 = 16383.
+        let mv = get_mv_projection([30000, -30000], 8, 1);
+        assert_eq!(mv, [16383, -16383]);
+    }
+
+    /// r205 §7.9.4 `get_block_position` valid: a tiny projection
+    /// keeps the position inside both the §7.9.4 grid bound
+    /// (`max8 = mi_rows/cols >> 1`) and the per-direction
+    /// `MAX_OFFSET_*` window.
+    #[test]
+    fn get_block_position_valid_for_small_delta() {
+        // mi_rows = mi_cols = 16 ⇒ max_y = max_x = 8.
+        // y8 = x8 = 4. delta = 0 ⇒ project returns (4, 4).
+        let pos = get_block_position(4, 4, /* dst_sign = */ 1, [0, 0], 16, 16);
+        assert_eq!(pos, Some((4, 4)));
+    }
+
+    /// r205 §7.9.4 `get_block_position` invalid: a projection that
+    /// would move the position outside the §7.9.4 grid bound
+    /// returns `None` (= `posValid == 0`).
+    #[test]
+    fn get_block_position_invalid_when_outside_grid() {
+        // y8 = 7 (the bottom row). A large positive projMv[0] pushes
+        // the projected position past `max_y = 8`. delta = 1 << 14
+        // (=16384) ⇒ offset8 = 16384 >> 6 = 256, well past the row
+        // bound. Returns None.
+        let pos = get_block_position(4, 7, /* dst_sign = */ 1, [16384, 0], 16, 16);
+        assert_eq!(pos, None);
+    }
+
+    /// r205 §7.10.2.6 temporal-sample with a valid centre-cell MV
+    /// appends a candidate to the stack. Single-pred, BLOCK_4X4 at
+    /// (mi_row=2, mi_col=2): the §7.10.2.6 read site is
+    /// `((mi_row + 0) | 1) >> 1, ((mi_col + 0) | 1) >> 1` = `(1, 1)`.
+    /// Stamping `MotionFieldMvs[LAST_FRAME][1][1] = [40, -32]` makes
+    /// the temporal sample land a candidate with weight 2.
+    #[test]
+    fn temporal_scan_single_pred_centre_cell_lands_candidate() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let (gm_type, gm_params) = identity_gm();
+        // mi_rows = mi_cols = 8 ⇒ h8 = w8 = 4. Stamp at (y8=1, x8=1).
+        let mut mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+        mfmvs.set(/* LAST_FRAME = */ 1, 1, 1, [40, -32]);
+        let res = walker
+            .find_mv_stack(
+                2,
+                2,
+                BLOCK_4X4,
+                [1, -1],
+                false,
+                /* use_ref_frame_mvs = */ true,
+                gm_type,
+                gm_params,
+                zero_sign_bias(),
+                /* allow_high_precision_mv = */ false,
+                /* force_integer_mv = */ false,
+                &mfmvs,
+            )
+            .expect("§7.10.2 driver with valid temporal candidate runs to completion");
+        assert!(
+            res.num_mv_found >= 1,
+            "temporal scan should land at least one candidate from the populated grid cell"
         );
-        assert_eq!(r, Err(crate::Error::TemporalMvScanUnsupported));
+        // §7.10.2.6 single-pred writes to slot [0][0..2]. Per
+        // §7.10.2.10 with `allow_high_precision_mv == 0` and
+        // `force_integer_mv == 0`, the LSBs are stripped: 40 stays,
+        // -32 stays (both are even). After §7.10.2.14 clamp the
+        // values lie inside the [-MV_BORDER, +MV_BORDER + bw*8] range.
+        assert_eq!(res.ref_stack_mv[0][0], [40, -32]);
+    }
+
+    /// r205 §7.10.2.6 temporal-sample compound: both reference
+    /// frames' MotionFieldMvs cells must be non-sentinel or the
+    /// candidate is dropped. Stamp only `LAST_FRAME` ⇒ the compound
+    /// branch returns early on `RefFrame[1]`'s invalid slot, no
+    /// candidate lands.
+    #[test]
+    fn temporal_scan_compound_drops_when_second_ref_sentinel() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let (gm_type, gm_params) = identity_gm();
+        let mut mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+        // Only ref 1 stamped; ref 7 stays sentinel.
+        mfmvs.set(1, 1, 1, [40, -32]);
+        let res = walker
+            .find_mv_stack(
+                2,
+                2,
+                BLOCK_4X4,
+                [1, 7], // compound: LAST + ALTREF
+                true,
+                /* use_ref_frame_mvs = */ true,
+                gm_type,
+                gm_params,
+                zero_sign_bias(),
+                false,
+                false,
+                &mfmvs,
+            )
+            .expect("§7.10.2 driver with mixed-sentinel compound grid runs to completion");
+        // §7.10.2.12 extra-search compound fill still emits the two
+        // global-MV slots. The temporal sample dropped its candidate
+        // because slot 1's grid cell carries the sentinel.
+        for idx in 0..res.num_mv_found as usize {
+            // No temporal candidate (which would have been [40, -32]
+            // on slot [0]); only the global-MV fill (= [0, 0] in the
+            // identity-warp test fixture).
+            assert_ne!(res.ref_stack_mv[idx][0], [40, -32]);
+        }
     }
 
     /// §7.10.2 with a single stamped inter neighbour matching the
@@ -45356,6 +46213,7 @@ mod tests {
         // 4 + (-1) = 3, cols 4..=4+bw4=4+2 = 4,5. Wait — scan_row(-1)
         // reads MiSizes[3][4]; we stamped (2, 4) over 2x2 → cells
         // (2..=3, 4..=5) so (3, 4) is covered.
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45369,6 +46227,7 @@ mod tests {
                 zero_sign_bias(),
                 true, // high-precision-on so MV passes through unchanged
                 false,
+                &mfmvs,
             )
             .unwrap();
         assert_eq!(res.num_mv_found, 1, "one inter neighbour ⇒ one stack slot");
@@ -45409,6 +46268,7 @@ mod tests {
             [[16, -32], [0, 0]],
         );
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45422,6 +46282,7 @@ mod tests {
                 zero_sign_bias(),
                 true,
                 false,
+                &mfmvs,
             )
             .unwrap();
         assert_eq!(res.num_mv_found, 1);
@@ -45448,6 +46309,7 @@ mod tests {
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[10, 0], [0, 0]]);
         walker.stamp_inter_neighbour(4, 2, BLOCK_8X8, [1, -1], MODE_NEWMV, [[20, 0], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45461,6 +46323,7 @@ mod tests {
                 zero_sign_bias(),
                 true,
                 false,
+                &mfmvs,
             )
             .unwrap();
         assert_eq!(res.num_mv_found, 2);
@@ -45498,6 +46361,7 @@ mod tests {
         // (= 1).
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [4, -1], MODE_NEWMV, [[42, 42], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45511,6 +46375,7 @@ mod tests {
                 zero_sign_bias(),
                 true,
                 false,
+                &mfmvs,
             )
             .unwrap();
         // §7.10.2 step 12-14: foundAboveMatch / foundLeftMatch only set
@@ -45545,6 +46410,7 @@ mod tests {
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[7, 7], [0, 0]]);
         walker.stamp_inter_neighbour(4, 2, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[7, 7], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45558,6 +46424,7 @@ mod tests {
                 zero_sign_bias(),
                 true,
                 false,
+                &mfmvs,
             )
             .unwrap();
         assert_eq!(res.num_mv_found, 1, "duplicate MV ⇒ accumulated weight");
@@ -45584,6 +46451,7 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[5, 5], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45597,6 +46465,7 @@ mod tests {
                 zero_sign_bias(),
                 true,
                 false,
+                &mfmvs,
             )
             .unwrap();
         // One spatial candidate. NumMvFound = 1; extra-search single-
@@ -45681,6 +46550,7 @@ mod tests {
         let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
         walker.stamp_inter_neighbour(2, 4, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[1, 0], [0, 0]]);
         let (gm_type, gm_params) = identity_gm();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let res = walker
             .find_mv_stack(
                 4,
@@ -45694,6 +46564,7 @@ mod tests {
                 zero_sign_bias(),
                 true,
                 false,
+                &mfmvs,
             )
             .unwrap();
         assert_eq!(res.num_mv_found, 1);
@@ -46289,6 +47160,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0xFFu8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let info = walker
             .decode_inter_block_mode_info(
                 &mut dec,
@@ -46326,6 +47198,7 @@ mod tests {
                 /* dist_equal = */ false,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
+                &mfmvs,
             )
             .expect("§5.11.27 SIMPLE short-circuit ⇒ dispatcher returns Ok");
         assert_eq!(info.motion_mode, MOTION_MODE_SIMPLE);
@@ -46700,6 +47573,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let info = walker
             .decode_inter_block_mode_info(
                 &mut dec,
@@ -46737,6 +47611,7 @@ mod tests {
                 /* dist_equal = */ false,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
+                &mfmvs,
             )
             .expect("§5.11.28 closed-gate ⇒ dispatcher returns Ok");
         assert_eq!(info.interintra.interintra, 0);
@@ -46781,6 +47656,7 @@ mod tests {
 
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, false).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let info = walker
             .decode_inter_block_mode_info(
                 &mut dec,
@@ -46818,6 +47694,7 @@ mod tests {
                 /* dist_equal = */ false,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
+                &mfmvs,
             )
             .expect("§5.11.28 enabled ⇒ dispatcher returns Ok");
 
@@ -47672,6 +48549,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let info = walker
             .decode_inter_block_mode_info(
                 &mut dec,
@@ -47709,6 +48587,7 @@ mod tests {
                 /* dist_equal = */ false,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
+                &mfmvs,
             )
             .expect("dispatcher Ok");
         assert_eq!(info.compound_type.compound_type, COMPOUND_AVERAGE);
@@ -48125,6 +49004,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 16];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let info = walker
             .decode_inter_block_mode_info(
                 &mut dec,
@@ -48162,6 +49042,7 @@ mod tests {
                 /* dist_equal = */ false,
                 /* interpolation_filter = */ EIGHTTAP_SMOOTH,
                 /* enable_dual_filter = */ true,
+                &mfmvs,
             )
             .expect("cascade Ok");
         assert_eq!(
@@ -48198,6 +49079,7 @@ mod tests {
         let mut cdfs = TileCdfContext::new_from_defaults();
         let bytes = [0u8; 32];
         let mut dec = SymbolDecoder::init_symbol(&bytes, 32, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
         let info = walker
             .decode_inter_block_mode_info(
                 &mut dec,
@@ -48235,6 +49117,7 @@ mod tests {
                 /* dist_equal = */ false,
                 /* interpolation_filter = */ SWITCHABLE,
                 /* enable_dual_filter = */ true,
+                &mfmvs,
             )
             .expect("cascade Ok");
         // skip_mode == 1 ⇒ needs_interp_filter == 0 ⇒ EIGHTTAP for both
