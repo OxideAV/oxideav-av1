@@ -196,6 +196,125 @@ impl SymbolWriter {
         self.write_symbol(bit, &mut cdf)
     }
 
+    /// `write_literal( n, value )` — inverse of §8.2.5
+    /// [`crate::symbol_decoder::SymbolDecoder::read_literal`].
+    ///
+    /// The §8.2.5 decoder is the loop
+    /// `for ( i = 0; i < n; i++ ) x = 2 * x + read_bool()`; the
+    /// inverse emits the low `n` bits of `value` MSB-first via
+    /// [`Self::write_bool`]. `value` must fit in `n` bits (`n <= 32`).
+    pub fn write_literal(&mut self, n: u32, value: u32) -> Result<(), Error> {
+        debug_assert!(n <= 32, "§8.2.5 read_literal only consumes up to 32 bits");
+        debug_assert!(
+            n == 32 || value < (1u32 << n),
+            "value {value} does not fit in {n} bits"
+        );
+        // MSB-first: bit (n-1) emitted first so the decoder's `x = 2*x +
+        // bit` rebuild yields the original value.
+        for i in (0..n).rev() {
+            let bit = (value >> i) & 0x1;
+            self.write_bool(bit)?;
+        }
+        Ok(())
+    }
+
+    /// `write_ns( n, value )` — inverse of §4.10.10 `NS(n)` (the
+    /// arithmetic-coded counterpart of §4.10.7 `ns(n)`), implemented as
+    /// the inverse of
+    /// [`crate::symbol_decoder::SymbolDecoder::read_ns`].
+    ///
+    /// The §4.10.10 decoder is
+    ///
+    /// ```text
+    ///   w = FloorLog2(n) + 1
+    ///   m = (1 << w) - n
+    ///   v = L(w - 1)
+    ///   if (v < m) return v
+    ///   extra_bit = L(1)
+    ///   return (v << 1) - m + extra_bit
+    /// ```
+    ///
+    /// The inverse: values `0..m` are coded directly in `w - 1` literal
+    /// bits; values `m..n` are coded as `(value + m)` in `w` literal
+    /// bits (the high bit of `value + m` becomes the §4.10.10 `v`
+    /// post-condition `v >= m`, and the low bit lands as `extra_bit`).
+    /// This mirrors `BitWriter::write_ns` (§4.10.7) one level up the
+    /// stack but over the arithmetic-coded literal path.
+    pub fn write_ns(&mut self, n: u32, value: u32) -> Result<(), Error> {
+        debug_assert!(n >= 1, "§4.10.10 NS(n) requires n >= 1");
+        debug_assert!(value < n, "NS({n}) value {value} out of range");
+        let w = floor_log2(n) + 1;
+        let m = (1u32 << w) - n;
+        if value < m {
+            self.write_literal(w - 1, value)
+        } else {
+            // `(value + m)` written in `w` literal bits. The decoder's
+            // `L(w - 1)` reads the high `w - 1` bits — call it `v` —
+            // and then `L(1)` reads the low bit as `extra_bit`. The
+            // reconstruction `(v << 1) - m + extra_bit` rearranges to
+            // `(v << 1) | extra_bit - m == (value + m) - m == value`.
+            let coded = value + m;
+            self.write_literal(w, coded)
+        }
+    }
+
+    /// `write_subexp_bool( num_syms, k, value )` — inverse of §5.9.28
+    /// [`crate::symbol_decoder::SymbolDecoder::decode_subexp_bool`].
+    ///
+    /// The §5.9.28 decoder loop:
+    ///
+    /// ```text
+    ///   i = 0; mk = 0
+    ///   while (1) {
+    ///     b2 = i ? k + i - 1 : k
+    ///     a = 1 << b2
+    ///     if ( numSyms <= mk + 3 * a ) {
+    ///       subexp_unif_bools = NS(numSyms - mk)
+    ///       return subexp_unif_bools + mk
+    ///     } else {
+    ///       subexp_more_bools = L(1)
+    ///       if ( subexp_more_bools ) { i++; mk += a }
+    ///       else { subexp_bools = L(b2); return subexp_bools + mk }
+    ///     }
+    ///   }
+    /// ```
+    ///
+    /// The inverse walks the same `(i, mk)` ladder against the supplied
+    /// `value`: while the current step's `a`-wide chunk does not cover
+    /// `value`, emit `subexp_more_bools = 1`, advance to the next rung.
+    /// Once the step covers `value`, emit either the uniform tail
+    /// (`NS(numSyms - mk)` carrying `value - mk`) or the fixed-width
+    /// tail (`subexp_more_bools = 0` followed by `L(b2)` carrying
+    /// `value - mk`).
+    pub fn write_subexp_bool(&mut self, num_syms: u32, k: u32, value: u32) -> Result<(), Error> {
+        debug_assert!(num_syms >= 1, "§5.9.28 subexp requires numSyms >= 1");
+        debug_assert!(value < num_syms, "subexp value {value} out of range");
+        let mut i: u32 = 0;
+        let mut mk: u32 = 0;
+        loop {
+            let b2 = if i != 0 { k + i - 1 } else { k };
+            let a = 1u32 << b2;
+            if num_syms <= mk + 3 * a {
+                // Uniform tail: the §5.9.28 decoder takes `NS(numSyms -
+                // mk)` and adds `mk`. The encoder writes `value - mk`
+                // through the same `NS(numSyms - mk)`.
+                return self.write_ns(num_syms - mk, value - mk);
+            }
+            if value >= mk + a {
+                // Not yet covered by this rung — emit `subexp_more_bools
+                // = 1` and advance.
+                self.write_literal(1, 1)?;
+                i += 1;
+                mk += a;
+            } else {
+                // Fixed-width tail: emit `subexp_more_bools = 0` then
+                // `L(b2)` carrying `value - mk`.
+                self.write_literal(1, 0)?;
+                return self.write_literal(b2, value - mk);
+            }
+        }
+    }
+
     /// Compute the decoder's `cur(s)` for the symbol-search step at the
     /// current `range`. Pulled into a helper so [`Self::write_symbol`]
     /// can also use it for `prev = cur(s - 1)`.
@@ -454,6 +573,149 @@ mod tests {
         let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
         for _ in 0..n {
             assert_eq!(d.read_bool().unwrap(), 0);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §8.2.5 read_literal / §4.10.10 NS / §5.9.28 decode_subexp_bool —
+    // composition-wrapper round-trips through the decoder side.
+    // -----------------------------------------------------------------
+
+    /// `write_literal(n, v)` round-trips through §8.2.5 `read_literal(n)`
+    /// for a representative set of widths covering 1 through 16 bits.
+    #[test]
+    fn write_literal_round_trip_widths_1_to_16() {
+        let cases: &[(u32, u32)] = &[
+            (1, 0),
+            (1, 1),
+            (3, 0),
+            (3, 5),
+            (3, 7),
+            (4, 0xA),
+            (8, 0xCD),
+            (12, 0xABC),
+            (16, 0xDEAD),
+            (16, 0xBEEF),
+            (16, 0),
+        ];
+        for &(n, v) in cases {
+            let mut w = SymbolWriter::new(true);
+            w.write_literal(n, v).unwrap();
+            let bytes = w.finish();
+            let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+            assert_eq!(
+                d.read_literal(n).unwrap(),
+                v,
+                "L({n}) round-trip mismatch for {v}"
+            );
+        }
+    }
+
+    /// `write_literal(0, 0)` writes no bits; the decoder's `read_literal(0)`
+    /// also consumes no bits, so the writer's state is unchanged.
+    #[test]
+    fn write_literal_n_zero_emits_no_bits() {
+        let mut w = SymbolWriter::new(true);
+        w.write_literal(0, 0).unwrap();
+        let bytes = w.finish();
+        let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        assert_eq!(d.read_literal(0).unwrap(), 0);
+    }
+
+    /// Several `write_literal` calls back-to-back on the same writer
+    /// must read back in order as separate values.
+    #[test]
+    fn write_literal_concatenated_round_trip() {
+        let mut w = SymbolWriter::new(true);
+        w.write_literal(3, 5).unwrap();
+        w.write_literal(5, 17).unwrap();
+        w.write_literal(8, 0xAB).unwrap();
+        let bytes = w.finish();
+        let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        assert_eq!(d.read_literal(3).unwrap(), 5);
+        assert_eq!(d.read_literal(5).unwrap(), 17);
+        assert_eq!(d.read_literal(8).unwrap(), 0xAB);
+    }
+
+    /// `write_ns(n, v)` round-trips through §4.10.10 `NS(n)` for every
+    /// representable value at a range of `n`s covering the low / power-
+    /// of-two / non-power-of-two cases the §5.9 subexp wrappers hit.
+    #[test]
+    fn write_ns_round_trip_against_read_ns() {
+        for n in [1u32, 2, 3, 4, 5, 7, 8, 9, 13, 16, 17] {
+            for v in 0..n {
+                let mut w = SymbolWriter::new(true);
+                w.write_ns(n, v).unwrap();
+                let bytes = w.finish();
+                let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+                assert_eq!(
+                    d.read_ns(n).unwrap(),
+                    v,
+                    "NS({n}) round-trip mismatch for {v}"
+                );
+            }
+        }
+    }
+
+    /// `write_ns(1, 0)` is a no-op (the decoder's `L(0)` returns 0
+    /// without consuming any bits).
+    #[test]
+    fn write_ns_n_equals_one_no_bits() {
+        let mut w = SymbolWriter::new(true);
+        w.write_ns(1, 0).unwrap();
+        let bytes = w.finish();
+        let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        assert_eq!(d.read_ns(1).unwrap(), 0);
+    }
+
+    /// `write_subexp_bool(numSyms, k, v)` round-trips through §5.9.28
+    /// `decode_subexp_bool` for a representative numSyms × k × value
+    /// grid. Values are sampled rather than exhaustive to keep the test
+    /// quick while still exercising the three §5.9.28 code paths:
+    /// the immediate-uniform branch (`numSyms <= 3 * a`), the
+    /// `subexp_more_bools=0` fixed-width tail, and the
+    /// `subexp_more_bools=1` ladder advance.
+    #[test]
+    fn write_subexp_bool_round_trip_grid() {
+        let cases: &[(u32, u32, &[u32])] = &[
+            // Small numSyms → immediate uniform branch.
+            (2, 0, &[0, 1]),
+            (3, 1, &[0, 1, 2]),
+            // Larger numSyms with k=1 forces several ladder advances.
+            (32, 1, &[0, 1, 2, 3, 6, 7, 8, 15, 16, 31]),
+            // numSyms equal to a power of two with k=2.
+            (64, 2, &[0, 5, 11, 12, 24, 32, 47, 63]),
+            // numSyms not a power of two; exercises the tail uniform
+            // branch over a non-power-of-two interval.
+            (50, 0, &[0, 1, 2, 10, 25, 40, 49]),
+        ];
+        for &(num_syms, k, values) in cases {
+            for &v in values {
+                let mut w = SymbolWriter::new(true);
+                w.write_subexp_bool(num_syms, k, v).unwrap();
+                let bytes = w.finish();
+                let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+                assert_eq!(
+                    d.decode_subexp_bool(num_syms, k).unwrap(),
+                    v,
+                    "subexp_bool(num_syms={num_syms}, k={k}) round-trip mismatch for {v}"
+                );
+            }
+        }
+    }
+
+    /// Several subexp values back-to-back on the same writer.
+    #[test]
+    fn write_subexp_bool_concatenated_round_trip() {
+        let triples: &[(u32, u32, u32)] = &[(16, 1, 5), (8, 0, 3), (32, 2, 17), (64, 1, 0)];
+        let mut w = SymbolWriter::new(true);
+        for &(num_syms, k, v) in triples {
+            w.write_subexp_bool(num_syms, k, v).unwrap();
+        }
+        let bytes = w.finish();
+        let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        for &(num_syms, k, v) in triples {
+            assert_eq!(d.decode_subexp_bool(num_syms, k).unwrap(), v);
         }
     }
 }

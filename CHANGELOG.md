@@ -6,6 +6,45 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 210 — §5.11.1 `tile_group_obu` framing writer + entropy-
+  encoder composition wrappers.** The §5.11.1 body framer is the next
+  arc on top of the r209 `SymbolWriter`; the composition wrappers
+  bring the encoder side to parity with the `SymbolDecoder`'s
+  `read_literal` / `read_ns` / `decode_subexp_bool` primitives so the
+  per-block §5.11 syntax writers can be composed without further
+  scaffolding.
+
+  New public API in `encoder::tile_group_obu`:
+  * `TilePayload { bytes }` — one tile's entropy bytes (the raw
+    `SymbolWriter::finish` output, including §8.2.4 zero pads).
+  * `TileGroupObu { num_tiles, tile_cols_log2, tile_rows_log2,
+    tile_size_bytes, tg_start, tg_end, start_and_end_present, tiles }`
+    — §5.11.1 descriptor; `TileGroupObu::whole_frame(...)` for the
+    §6.10.1 single-tile-group default.
+  * `TileGroupObuWriter` / `write_tile_group_obu(&obu)` — emits the
+    §5.11.1 body: `tile_start_and_end_present_flag` (`f(1)`, NumTiles
+    > 1 only), `tg_start` / `tg_end` (`f(tileBits)` each, flag = 1
+    only), `byte_alignment()`, per non-last tile `tile_size_minus_1`
+    (`le(TileSizeBytes)`) + tile bytes, last tile bytes (no size).
+  * `parse_tile_group_obu_body(body, ..) -> ParsedTileGroup` —
+    walker used by the round-trip tests.
+
+  New public API in `encoder::symbol_writer`:
+  * `SymbolWriter::write_literal(n, value)` — inverse of §8.2.5
+    `read_literal(n)`. MSB-first composition of `write_bool`.
+  * `SymbolWriter::write_ns(n, value)` — inverse of §4.10.10 `NS(n)`.
+    Values `0..m` written in `w - 1` literal bits; `m..n` written as
+    `(value + m)` in `w` literal bits.
+  * `SymbolWriter::write_subexp_bool(num_syms, k, value)` — inverse
+    of §5.9.28 `decode_subexp_bool`. Walks the `(i, mk)` ladder,
+    emitting `subexp_more_bools` advances until the current rung
+    covers `value`, then the `NS(num_syms - mk)` uniform tail or the
+    `L(b2)` fixed-width tail.
+
+  15 new lib tests (1152 → 1167) — every wrapper round-trips through
+  the existing `SymbolDecoder` primitives and every `TileGroupObu`
+  shape round-trips through `parse_tile_group_obu_body`.
+
 * **Round 209 — §8.2 entropy *encoder* (`SymbolWriter`).** Inverse of
   `SymbolDecoder` (§8.2.2 `init_symbol` / §8.2.6 `read_symbol` /
   §8.2.4 `exit_symbol`). The foundation every §5.11 tile-content

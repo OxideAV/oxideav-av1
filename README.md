@@ -2,6 +2,78 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 210)
+
+Round 210 lands the **§5.11.1 `tile_group_obu` framing writer** on top
+of the r209 [`SymbolWriter`], plus three **composition wrappers** on
+the entropy encoder (`write_literal` / `write_ns` / `write_subexp_bool`)
+that mirror the inverse `SymbolDecoder` primitives the §5.11 per-block
+syntax will use.
+
+`encoder::tile_group_obu` — §5.11.1 body framing:
+
+* **`TilePayload { bytes }`** — one tile's entropy-coded byte run, the
+  raw output of `SymbolWriter::finish` (including the §8.2.4 trailing
+  zero pads `init_symbol`/`exit_symbol` consume).
+* **`TileGroupObu { num_tiles, tile_cols_log2, tile_rows_log2,
+  tile_size_bytes, tg_start, tg_end, start_and_end_present, tiles }`**
+  — the descriptor; helpers `TileGroupObu::whole_frame(...)` for the
+  §6.10.1 single-tile-group default (flag = 0, `tg_start = 0`, `tg_end
+  = NumTiles - 1`).
+* **`write_tile_group_obu(&obu) -> Vec<u8>`** — emits the §5.11.1 body
+  in spec order:
+  `tile_start_and_end_present_flag` (`f(1)`, NumTiles > 1 only),
+  `tg_start` / `tg_end` (`f(tileBits)` each, flag = 1 only),
+  `byte_alignment()`, then per non-last tile `tile_size_minus_1`
+  (`le(TileSizeBytes)`) + tile bytes, then the last tile's bytes (no
+  size). Wrappable via `write_obu_with_size(.., OBU_TILE_GROUP, body)`
+  which §5.3.1 excludes from the §5.3.4 trailer.
+* **`parse_tile_group_obu_body(body, ..)`** — companion walker that
+  reads the §5.11.1 body back out (used by the round-trip tests; no
+  production caller yet — the parser side will land alongside the
+  per-block decode arc).
+
+`encoder::symbol_writer` — three new composition wrappers (inverses of
+the §8.2.5 / §4.10.10 / §5.9.28 decoder primitives, all composed of
+existing `write_bool` / `write_symbol`):
+
+* **`write_literal(n, value)`** — inverse of §8.2.5 `read_literal(n)`:
+  emits the low `n` bits of `value` MSB-first via `write_bool`.
+* **`write_ns(n, value)`** — inverse of §4.10.10 `NS(n)`: values
+  `0..m` written in `w - 1` literal bits; values `m..n` written as
+  `(value + m)` in `w` literal bits where `w = FloorLog2(n) + 1` and
+  `m = (1 << w) - n`.
+* **`write_subexp_bool(num_syms, k, value)`** — inverse of §5.9.28
+  `decode_subexp_bool`: walks the `(i, mk)` rung ladder; for each
+  rung whose `a`-wide chunk doesn't cover `value`, emits
+  `subexp_more_bools = 1` and advances. Once covered, emits either
+  the `NS(num_syms - mk)` uniform tail or the `subexp_more_bools = 0`
+  + `L(b2)` fixed-width tail with `value - mk`.
+
+15 new lib tests (1152 → 1167), all bit-exact round-trips:
+
+* `write_literal`: width-1..16 grid + concatenation + `n = 0` no-op
+  (3 tests).
+* `write_ns`: exhaustive value sweep at `n ∈ {1, 2, 3, 4, 5, 7, 8, 9,
+  13, 16, 17}` + `n = 1` no-op (2 tests).
+* `write_subexp_bool`: grid covering the §5.9.28 immediate-uniform
+  branch + tail uniform + ladder-advance + fixed-width tail paths,
+  plus a concatenation test (2 tests).
+* `tile_group_obu`: single-tile (no flag/size), multi-tile flag = 0,
+  multi-tile flag = 1 (`tg_start` / `tg_end` writes),
+  `TileSizeBytes = 2` (byte-order check), `TileSizeBytes = 4`
+  (max width), `OBU_TILE_GROUP` wrap-and-walk via
+  `write_obu_with_size` + `parse_obu`, zero-padded `SymbolWriter`
+  payload size accounting, `whole_frame` constructor defaults
+  (8 tests).
+
+Out of scope this arc (next): per-block §5.11 syntax — `skip` /
+`mode_info` / the first §5.11.39 coefficient-encode primitives so
+emitted tile payloads decode to real pixel data; §5.11.4 partition
+decision tree; §5.9.7 `frame_size_with_refs()` inverse for the inter
+frame size path; §5.9.24 `read_global_param` signed-subexp inverse
+for non-IDENTITY refs.
+
 ## Status — 2026-05-28 (round 209)
 
 Round 209 lands the **§8.2 entropy *encoder*** (`SymbolWriter`) — the
