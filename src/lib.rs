@@ -1530,6 +1530,7 @@ pub mod loop_restoration;
 pub mod obu;
 pub mod scan;
 pub mod sequence_header;
+pub mod superres;
 pub mod symbol_decoder;
 pub mod tile_info;
 pub mod transform;
@@ -1729,6 +1730,12 @@ pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
 pub use sequence_header::{
     parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
     SequenceHeader, TimingInfo,
+};
+pub use superres::{
+    upscale_frame, upscale_plane, upscale_sample, SuperresError, SuperresFrameContext,
+    FILTER_BITS as SUPERRES_TAP_FILTER_BITS, SUPERRES_EXTRA_BITS, SUPERRES_FILTER_BITS,
+    SUPERRES_FILTER_OFFSET, SUPERRES_FILTER_SHIFTS, SUPERRES_FILTER_TAPS, SUPERRES_SCALE_BITS,
+    SUPERRES_SCALE_MASK, UPSCALE_FILTER,
 };
 pub use symbol_decoder::SymbolDecoder;
 pub use tile_info::{

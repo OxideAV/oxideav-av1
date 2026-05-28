@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 199)
+## Status — 2026-05-28 (round 200)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1626,6 +1626,97 @@ the caller hooks into the §5.11.58 decode state (`lr_type`,
 `lr_wiener`, `lr_sgr_set`, `lr_sgr_xqd`), letting the driver run
 against synthetic predicates. The §5.9.20 [`LrParams`] (r10) and
 §5.11.58 per-unit reads will plug straight into these closures.
+
+Round 200 lands the **§7.16 superres upscaling** process — the
+horizontal post-CDEF / pre-LR pass that takes the encoded `FrameWidth`-
+wide downscaled frame and produces an `UpscaledWidth`-wide frame per
+av1-spec p.325-326. With this arc the per-frame post-processing
+pipeline (§7.14 LF → §7.15 CDEF → §7.16 superres → §7.17 LR →
+§7.18.3 film grain) is now complete end-to-end at the
+sample-filtering level. Coverage lands as a new `superres` module:
+
+* **[`upscale_frame`]** — top-level per-plane driver. Iterates
+  `plane ∈ [0, NumPlanes)`; on `use_superres == 0` (or
+  `FrameWidth == UpscaledWidth`) returns a verbatim copy of the input
+  planes per av1-spec p.325 line 17968. Otherwise dispatches each
+  plane to [`upscale_plane`].
+* **[`upscale_plane`]** — per-plane body. Derives `(subX, subY,
+  downscaledPlaneW, upscaledPlaneW, planeH, stepX, err,
+  initialSubpelX, miW, minX, maxX)` per av1-spec p.325 lines
+  17979-17999, then walks `(y, x) ∈ [0, planeH) × [0,
+  upscaledPlaneW)` and writes `outputFrame[plane][y][x] =
+  Clip1(Round2(Σ px * Upscale_Filter[srcXSubpel][k], FILTER_BITS))`
+  per av1-spec p.325 lines 18000-18013.
+* **[`upscale_sample`]** — per-output-pixel inner loop. Performs the
+  8-tap polyphase convolution against `UPSCALE_FILTER[srcXSubpel]`
+  with the §3 `Clip3(minX, maxX, srcXPx + (k - SUPERRES_FILTER_OFFSET))`
+  left/right edge replication.
+* **[`UPSCALE_FILTER`]** — the
+  `Upscale_Filter[SUPERRES_FILTER_SHIFTS][SUPERRES_FILTER_TAPS]`
+  table verbatim from av1-spec p.326 lines 18027-18060 — 64 sub-pixel
+  phases × 8 taps, each tap a signed `i32` scaled to the
+  `FILTER_BITS = 7` precision (Σ taps per row = 128, pinned by
+  `upscale_filter_table_sums_to_128`).
+* **§3 named constants surfaced** —
+  [`SUPERRES_FILTER_BITS`] / [`SUPERRES_FILTER_SHIFTS`] /
+  [`SUPERRES_FILTER_TAPS`] / [`SUPERRES_FILTER_OFFSET`] /
+  [`SUPERRES_SCALE_BITS`] / [`SUPERRES_SCALE_MASK`] /
+  [`SUPERRES_EXTRA_BITS`] / [`FILTER_BITS`][superres::FILTER_BITS] per
+  av1-spec p.32 lines 1395-1412. The §5.9.8 `SUPERRES_NUM` /
+  `SUPERRES_DENOM_MIN` / `SUPERRES_DENOM_BITS` continue to live in
+  [`crate::frame_header`] where the bitstream-parse path needs them.
+
+The driver takes a small `SuperresFrameContext` bundling
+`(use_superres, FrameWidth, UpscaledWidth, FrameHeight, MiCols,
+NumPlanes, BitDepth, subsampling_x, subsampling_y)` — straight from
+the §5.5.2 / §5.9.5 / §5.9.8 parsed frame header — plus input and
+output `PlaneBuffer<'_>` slices. The §7.17 driver's
+`UpscaledCdefFrame` input is now genuinely the upscaled version of
+`CdefFrame`; the prior placeholder in r197/r198 was a verbatim copy.
+
+Test count: 1070 → 1082 (+12 in lib). New `superres::tests`:
+
+* **`upscale_filter_table_sums_to_128`** — every row of
+  `Upscale_Filter` sums to `128 = 1 << FILTER_BITS`, so the
+  `Round2(., FILTER_BITS)` reduction preserves average brightness
+  on a constant input.
+* **`upscale_filter_table_geometry`** — 64 rows × 8 taps; phase 0 is
+  the identity kernel `[0,0,0,128,0,0,0,0]`.
+* **`upscale_constants_match_spec`** — pins the named-constant table
+  relations (`SUPERRES_FILTER_SHIFTS == 1 << SUPERRES_FILTER_BITS`,
+  `SUPERRES_EXTRA_BITS == SUPERRES_SCALE_BITS - SUPERRES_FILTER_BITS`,
+  `SUPERRES_SCALE_MASK == (1 << SUPERRES_SCALE_BITS) - 1`).
+* **`use_superres_false_copies_planes_verbatim`** — av1-spec p.325
+  line 17968 short-circuit.
+* **`equal_widths_copies_planes_verbatim`** — even with
+  `use_superres == true`, `FrameWidth == UpscaledWidth` skips the
+  filter (so the FILTER_OFFSET drift doesn't bleed through).
+* **`flat_input_yields_flat_output`** — convolving a constant input
+  with a unity-sum filter returns the same constant exactly (the
+  rounding term `+ 64` lands cleanly when `Σ taps * v = 128 * v`).
+* **`upscale_clips_to_bit_depth`** — 8-bit envelope holds on a spiky
+  255/0 input through every `(y, x)` of the inner loop.
+* **`upscaled_smaller_than_downscaled_is_rejected`** — av1-spec p.326
+  line 18063 conformance: `upscaledPlaneW > downscaledPlaneW` when
+  `use_superres == 1`.
+* **`upscale_sample_phase_zero_is_passthrough`** — phase 0 of the
+  helper is the identity kernel for any srcXPx well inside the row.
+* **`upscale_sample_edge_replicates_via_clip3`** — Clip3 edge taps
+  pull from the first/last sample.
+* **`upscale_plane_geometry_mismatch_is_rejected`** — caller-supplied
+  buffer extent disagreeing with the ctx-derived plane extent returns
+  `SuperresError::PlaneShapeMismatch` rather than panicking.
+* **`chroma_subsampling_halves_widths`** — for 4:2:0 the chroma plane
+  derivation halves both downscaledPlaneW and upscaledPlaneW per
+  `Round2(., subX)` and the flat-input invariant still holds across
+  all three planes.
+
+This completes the per-frame post-processing pipeline. Next-arc
+candidates: inter driver arming (compound / WARP / OBMC sample paths
+are landed but not yet dispatched from `predict_inter`); §9.5.3
+Quantizer matrices; or §7.10.2.5 / §7.10.2.6 temporal-MV scan.
+
+The prior r199 round notes (preserved verbatim for traceability):
 
 Round 199 lands the **§7.18.3 film grain synthesis** post-processing
 layer — the final stage of the AV1 decode pipeline, applied after the
