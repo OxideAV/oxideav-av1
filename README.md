@@ -2,6 +2,70 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 216)
+
+Round 216 lands the §5.11.4 **partition decision-tree writer** — the
+encoder counterpart of the decoder's `PartitionWalker::decode_partition`
+symbol-read portion. Unblocks multi-block frames on the encode side: the
+bottom of the §5.11 stack is now expressible.
+
+`encoder::partition` — one writer + two predicate helpers (re-exported
+from `encoder`):
+
+* **`write_partition(writer, cdfs, partition, b_size, has_rows,
+  has_cols, ctx) -> Result<(), Error>`** — emits the right §8.2.6
+  symbol(s) for the chosen partition, mirroring the §5.11.4
+  first-conditional cascade:
+
+  * `bSize < BLOCK_8X8` ⇒ no symbol; `partition` MUST be `PARTITION_NONE`.
+  * `hasRows && hasCols` ⇒ one `partition S()` over the §8.3.2
+    `bsl`-selected partition CDF row (5 / 10 / 8 ordinals for W8 /
+    W16-W64 / W128).
+  * `hasCols` only ⇒ one binary `split_or_horz S()` over the folded
+    2-symbol CDF from `split_or_horz_cdf`; `partition` MUST be
+    `PARTITION_HORZ` (sym 0) or `PARTITION_SPLIT` (sym 1).
+  * `hasRows` only ⇒ one binary `split_or_vert S()` over the folded
+    2-symbol CDF from `split_or_vert_cdf`; `partition` MUST be
+    `PARTITION_VERT` (sym 0) or `PARTITION_SPLIT` (sym 1).
+  * `!hasRows && !hasCols` ⇒ no symbol; `partition` MUST be
+    `PARTITION_SPLIT` (the bottom-right frame-edge corner forces the
+    split).
+
+* **`partition_none_only(b_size) -> bool`** — first-conditional
+  predicate (no symbol; forced `PARTITION_NONE`).
+
+* **`partition_split_only(b_size, has_rows, has_cols) -> bool`** —
+  fall-through predicate (no symbol; forced `PARTITION_SPLIT`).
+
+Caller-bug surface (`Error::PartitionWalkOutOfRange`): out-of-range
+`b_size`; a partition ordinal that doesn't match the branch the caller
+landed in (e.g. `PARTITION_VERT` in `split_or_horz`, or
+`PARTITION_HORZ_4` on W128 which drops that ordinal from its CDF row);
+or an internal CDF-row-too-short surface from the `split_or_*` folders.
+
+Stateless on purpose, same shape as the `block_mode_info` /
+`coefficients` writers: the encoder driver threads its own
+`PartitionWalker` for the §6.10.4 `MiSizes[]` grid and feeds the same
+(`has_rows`, `has_cols`, `ctx`) the decoder derives — no shared mutable
+walker between writer and reader.
+
+15 new lib tests (1237 → 1252). Coverage: predicate match against the
+spec; no-symbol short-circuit at BLOCK_4X4 (`PARTITION_NONE`);
+no-symbol forced-split in the bottom-right corner; full 10-ordinal
+alphabet round-trip on W16 × every `PARTITION_CONTEXTS` ctx;
+8-ordinal alphabet round-trip on W128; W128 horz4/vert4 reject;
+`split_or_horz` 2-symbol round-trip; `split_or_vert` 2-symbol
+round-trip; both directional binary-CDF reject paths; out-of-range
+`b_size` reject; a 14-step multi-block composition that round-trips
+through a parallel decoder under running §8.3 CDF adaptation lockstep.
+
+Out of scope this arc (next): the §5.11.4 recursive **dispatch** body
+(`decode_partition( r, c, subSize )` recursion + per-arm `decode_block`
+emit — that's the encode driver); §5.11.36 `transform_tree` /
+`tx_size` writer; §5.11.18 inter-arm `mode_info()` dispatcher; intra
+angle / palette encode; §7.13 dequant + §7.7 inverse-transform stages
+that consume the §5.11.39 coefficients on the encode-side RD loop.
+
 ## Status — 2026-05-28 (round 215)
 
 Round 215 completes the §5.11.39 coefficient encode **end-to-end** by

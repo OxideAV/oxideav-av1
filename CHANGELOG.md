@@ -6,6 +6,50 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 216 — §5.11.4 partition decision-tree writer.** The encoder
+  counterpart of [`crate::cdf::PartitionWalker::decode_partition`]'s
+  symbol-read portion. Two predicate helpers + one writer:
+
+  * `partition_none_only(b_size) -> bool` — the §5.11.4 first-conditional
+    branch `bSize < BLOCK_8X8` ⇒ `PARTITION_NONE` with no symbol emit.
+  * `partition_split_only(b_size, has_rows, has_cols) -> bool` — the
+    §5.11.4 fall-through `!hasRows && !hasCols` corner-of-frame branch
+    ⇒ `PARTITION_SPLIT` with no symbol emit.
+  * `write_partition(writer, cdfs, partition, b_size, has_rows,
+    has_cols, ctx) -> Result<(), Error>` — emits the right §8.2.6
+    symbol(s) for the chosen partition: full N-value alphabet against
+    the §8.3.2 `bsl`-selected partition CDF when `has_rows && has_cols`;
+    binary `split_or_horz` (HORZ vs SPLIT) over the folded 2-symbol CDF
+    from [`split_or_horz_cdf`] when `has_cols` only; binary
+    `split_or_vert` (VERT vs SPLIT) over the folded 2-symbol CDF from
+    [`split_or_vert_cdf`] when `has_rows` only; nothing in the no-symbol
+    branches above. Stateless on purpose, same shape as the
+    `block_mode_info` / `coefficients` writers — the encoder driver
+    threads its own `PartitionWalker` for the §6.10.4 `MiSizes[]` grid
+    and feeds the same (`has_rows`, `has_cols`, `ctx`) the decoder will
+    derive.
+
+  Symbol-mode caller bug surface (`Error::PartitionWalkOutOfRange`):
+  out-of-range `b_size`, a partition ordinal that doesn't match the
+  branch the caller landed in (e.g. `PARTITION_VERT` in the
+  `split_or_horz` branch, `PARTITION_HORZ_4` on W128 which drops that
+  ordinal from its row), or a CDF-row-too-short surface from the
+  `split_or_*` folders.
+
+  15 new lib tests (1237 → 1252) cover the four §5.11.4 branches +
+  caller-bug rejects + a multi-block composition that round-trips
+  through a parallel decoder using a running adapting `TileCdfContext`:
+  predicate match against the spec; no-symbol short-circuit at
+  BLOCK_4X4; no-symbol forced-split in the bottom-right corner; full
+  10-ordinal alphabet round-trip on W16 × every `PARTITION_CONTEXTS`
+  ctx; 8-ordinal alphabet round-trip on W128; W128 horz4/vert4 reject;
+  `split_or_horz` 2-symbol round-trip; `split_or_vert` 2-symbol
+  round-trip; both directional binary-CDF reject paths; out-of-range
+  `b_size` reject; multi-block sequence with §8.3 adaptation lockstep.
+
+  fmt + clippy --all-targets clean. Unblocks multi-block frames on the
+  encode side: the bottom of the §5.11 stack is now expressible.
+
 * **Round 215 — §5.11.39 `coefficients()` driver loop (end-to-end).**
   Composes every per-coefficient writer landed in rounds 212–214
   (`txb_skip` / `eob_pt` / `coeff_base_eob` / `coeff_base` /

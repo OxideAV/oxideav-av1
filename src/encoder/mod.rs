@@ -97,13 +97,22 @@
 //! §6.10.34 `length <= 20` conformance bound enforced as a caller-bug
 //! reject.
 //!
-//! Next arc: the §5.11.39 driver loop (the reverse-scan + forward-scan
-//! composite that sequences `coeff_base_eob` / `coeff_base` /
-//! `coeff_br` / sign / `golomb` for every scan position) and the
-//! §5.11.4 partition decision-tree writer; inter-arm mode_info writers
-//! (§5.11.18 dispatcher composite). §5.9.7 `frame_size_with_refs()`
-//! inverse + §5.9.24 `read_global_param` signed-subexp inverse for the
-//! remaining inter-frame paths.
+//! Arc 10 (round 216) lands the §5.11.4 [`partition`] decision-tree
+//! **symbol writer**: the inverse of the `partition` / `split_or_horz`
+//! / `split_or_vert` S() reads inside
+//! [`crate::cdf::PartitionWalker::decode_partition`]. Encoder drivers
+//! pick a partition ordinal from their RD search, call
+//! [`partition::write_partition`] with the chosen partition + the same
+//! (`has_rows`, `has_cols`, `ctx`) the decoder will derive on its
+//! recursive walk, then recurse on the appropriate `subSize` children.
+//! Two predicate helpers ([`partition::partition_none_only`] /
+//! [`partition::partition_split_only`]) surface the §5.11.4 first /
+//! last conditional so the driver knows when to skip the writer call.
+//!
+//! Next arc: §5.11.36 transform_tree / tx_size writer; §5.11.18
+//! inter-arm `mode_info()` dispatcher; intra angle / palette encode.
+//! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
+//! signed-subexp inverse for the remaining inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
@@ -111,6 +120,7 @@ pub mod coefficients;
 pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
+pub mod partition;
 pub mod sequence_obu;
 pub mod symbol_writer;
 pub mod temporal_unit;
@@ -130,6 +140,7 @@ pub use obu::{
     build_temporal_unit, obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,
     ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,
 };
+pub use partition::{partition_none_only, partition_split_only, write_partition};
 pub use sequence_obu::write_sequence_header_obu;
 pub use symbol_writer::SymbolWriter;
 pub use temporal_unit::{encode_sequence_header_obu, encode_temporal_unit, TemporalUnitPlan};
