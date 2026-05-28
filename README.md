@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 196)
+## Status — 2026-05-28 (round 197)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,120 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 197 lands the **§7.17 loop restoration — driver + Wiener arm
++ §7.17.5 coefficient reconstruction + §7.17.6 stripe-aware source
+fetch**, sitting on top of the post-§7.15 CDEF samples per av1-spec
+p.327-335. The new `loop_restoration` module exposes:
+
+* **§7.17 [`loop_restoration_frame`]** — top-level driver: walks the
+  frame in `MI_SIZE` steps over `(y, x) ∈ [0, FrameHeight) ×
+  [0, UpscaledWidth)`, copies `UpscaledCdefFrame ↦ LrFrame` up-front,
+  short-circuits on `UsesLr == 0`, and otherwise dispatches each
+  `(plane, row, col)` whose `FrameRestorationType[plane] !=
+  RESTORE_NONE` to [`loop_restore_block`].
+* **§7.17.1 [`loop_restore_block`]** — per-block driver: computes the
+  `(unitRow, unitCol, x, y, w, h)` geometry, the stripe extents
+  `(StripeStartY, StripeEndY)` from `stripeNum = (lumaY + 8) / 64`,
+  and the plane extents `(PlaneEndX, PlaneEndY)`; dispatches by
+  `rType = LrType[plane][unitRow][unitCol]` to the Wiener / self-guided
+  / no-op arm.
+* **§7.17.4 [`wiener_filter`]** — two-pass separable 7-tap convolution:
+  horizontal pass builds `intermediate[h+6][w]` via `Round2(s,
+  InterRound0)` + `Clip3(-offset, limit - offset, v)`; vertical pass
+  writes `LrFrame[plane][y + r][x + c] = Clip1(Round2(s, InterRound1))`
+  with `(InterRound0, InterRound1)` from the §7.11.3.2 `isCompound = 0`
+  schedule (`(3, 11)` for 8/10-bit, `(5, 9)` for 12-bit).
+* **§7.17.5 [`wiener_coefficients`]** — `filter[3] = 128`, `filter[i] =
+  filter[6 - i] = coeff[i]`, `filter[3] -= 2 * Σ coeff[i]`. Reconstructs
+  the symmetric 7-tap filter from 3 transmitted coefficients; the
+  symmetric DC gain `Σ filter == 128` (asserted in the test suite).
+* **§7.17.6 [`get_source_sample`]** — clamps `(x, y)` to `[0,
+  PlaneEndX] × [0, PlaneEndY]`, then routes the fetch by the stripe
+  boundary: `y < StripeStartY` ⇒ `UpscaledCurrFrame` with
+  `y = max(StripeStartY - 2, y)` (two-line reach); `y > StripeEndY` ⇒
+  `UpscaledCurrFrame` with `y = min(StripeEndY + 2, y)`; otherwise ⇒
+  `UpscaledCdefFrame`.
+* **[`derive_block_geometry`]** — pure-function geometry derivation that
+  bundles all §7.17.1 named locals into a single [`LrBlockGeometry`]
+  return value; consumed by both `loop_restore_block` and (next-arc)
+  the self-guided arm.
+
+The tables [`WIENER_TAPS_MID`] / [`WIENER_TAPS_MIN`] /
+[`WIENER_TAPS_MAX`] / [`WIENER_TAPS_K`] (`{3,-7,15} / {-5,-23,-17} /
+{10,8,46} / {1,2,3}`), [`SGRPROJ_XQD_MID`] / [`SGRPROJ_XQD_MIN`] /
+[`SGRPROJ_XQD_MAX`] (`{-32,31} / {-96,-32} / {31,95}`), and the full
+16-entry [`SGR_PARAMS`] table (av1-spec p.332 lines 18395-18400) are
+transcribed verbatim. The §3 / §5.9.20 constants [`LR_FILTER_BITS`]
+(= 7), [`WIENER_COEFFS`] (= 3), [`SGRPROJ_PARAMS_BITS`] (= 4),
+[`SGRPROJ_PRJ_SUBEXP_K`] (= 4), [`SGRPROJ_PRJ_BITS`] (= 7),
+[`SGRPROJ_RST_BITS`] (= 4), [`SGRPROJ_MTABLE_BITS`] (= 20),
+[`SGRPROJ_RECIP_BITS`] (= 12), and [`SGRPROJ_SGR_BITS`] (= 8) are
+exported. [`count_units_in_frame`] implements the §5.9.20 helper
+`Max((frameSize + (unitSize >> 1)) / unitSize, 1)`.
+
+A small standalone [`LoopRestorationFrameContext`] bundles the §5.5 /
+§5.9.5 / §5.9.20 frame-header fields plus two `&dyn Fn(...)` closures
+the caller hooks into the §5.11.58 decode state (`lr_type`,
+`lr_wiener`), letting the driver run against synthetic predicates. The
+§5.9.20 [`LrParams`] (r10) and §5.11.58 per-unit reads (next-arc)
+will plug straight into these closures.
+
+The §7.17.2 / §7.17.3 self-guided projection arm is **stubbed** for
+this arc: a unit whose `FrameRestorationType` is `RESTORE_SGRPROJ`
+inherits the pre-copied `LrFrame = UpscaledCdefFrame` content (a
+straight pass-through, equivalent to `RESTORE_NONE`). The constant
+tables [`SGR_PARAMS`] / [`SGRPROJ_*_BITS`] / [`SGRPROJ_XQD_*`] are
+already in place; the next arc lands the §7.17.3 box-filter body
+(`A[]/B[]` integral-image accumulator + `Sgr_Params`-driven eps
+scaling) and the §7.17.2 projection combine as a body-only patch.
+
+Test count: 1040 → 1053 (+13 in lib). New tests (all in
+`loop_restoration::tests`):
+
+* **`wiener_taps_tables_match_spec`** — verbatim `[Mid|Min|Max|K]`
+  + `Sgrproj_Xqd_[Mid|Min|Max]` constant tables.
+* **`sgr_params_table_matches_spec`** — spot-checks `SGR_PARAMS` rows
+  0 / 10 / 14 and asserts the `1 << SGRPROJ_PARAMS_BITS` length.
+* **`wiener_coefficients_unit_dc_gain`** — exercises four `coeff`
+  inputs (zero / mid / min / max), asserts `Σ filter == 128`, the
+  `filter[i] == filter[6 - i]` symmetry, and the `coeff[i] == filter[i]`
+  transmitted-tap landing.
+* **`wiener_coefficients_zero_centre_is_128`** — zero taps ⇒
+  `[0,0,0,128,0,0,0]`.
+* **`count_units_in_frame_matches_spec`** — three corner cases
+  (`(64, 256)`, `(64, 100)`, `(64, 0)`, `(256, 240)`).
+* **`loop_restoration_frame_no_op_when_uses_lr_false`** — `UsesLr = 0`
+  ⇒ `LrFrame = UpscaledCdefFrame` and the closures are never consulted.
+* **`loop_restoration_frame_restore_none_keeps_cdef_copy`** —
+  `FrameRestorationType[0] = RESTORE_NONE` ⇒ `LrFrame` holds the CDEF
+  copy unchanged even with `UsesLr = 1`.
+* **`wiener_filter_identity_filter_recovers_source`** — `coeff =
+  [0, 0, 0]` ⇒ identity 7-tap filter scaled by 128; a 64×64 uniform
+  input plane round-trips through the two-pass convolution to the same
+  uniform value (the `>> InterRound0` and `>> InterRound1` shifts
+  cancel: `128 << 7 / 2^(3+11) = 1`).
+* **`get_source_sample_inside_stripe_reads_cdef`** — `y ∈
+  [StripeStartY, StripeEndY]` ⇒ reads `UpscaledCdefFrame`.
+* **`get_source_sample_above_stripe_reads_curr_clamped`** — `y <
+  StripeStartY` ⇒ reads `UpscaledCurrFrame` with `y = max(StripeStartY
+  - 2, y)`.
+* **`get_source_sample_below_stripe_reads_curr`** — `y > StripeEndY`
+  ⇒ reads `UpscaledCurrFrame` with `y = min(StripeEndY + 2, y)`.
+* **`derive_block_geometry_luma_top_left`** — `(row, col) = (0, 0)`
+  on a 64×64 plane: `unit_row = unit_col = 0`, `(x, y, w, h) = (0, 0,
+  4, 4)`, `(plane_end_x, plane_end_y) = (63, 63)`, `(stripe_start_y,
+  stripe_end_y) = (-8, 55)`.
+* **`restore_sgrproj_passes_cdef_through`** — `RESTORE_SGRPROJ` (no-op
+  for this arc) ⇒ `LrFrame` holds the pre-copied CDEF content.
+
+The §7.15 CDEF de-ringing pass landed in r196; r197 adds the loop
+restoration pass that runs immediately after, completing the
+`reconstruct ↦ deblock ↦ CDEF ↦ LR` sample-flow (modulo §7.16 superres
+upscaling which decouples `UpscaledCurrFrame` from `CurrFrame`). §7.16
+upscaling, the §7.17.2 / §7.17.3 self-guided arm, and §7.20 film-grain
+post-pass remain on the roadmap for subsequent arcs. `decode_av1` /
+`encode_av1` continue to return `Error::NotImplemented`.
 
 Round 196 lands the **§7.15 CDEF (Constrained Directional Enhancement
 Filter) — driver + direction search + primary + secondary tap
