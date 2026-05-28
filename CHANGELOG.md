@@ -6,6 +6,67 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 217 — §5.11.4 recursive dispatch driver.** The encoder
+  counterpart of [`crate::cdf::PartitionWalker::decode_partition`]'s
+  recursive walk: a complete intra-arm partition-tree walker that
+  composes the r211–r216 per-block writers (`write_skip`,
+  `write_intra_segment_id`, `write_y_mode`, `write_intra_uv_mode`,
+  per-plane `write_coefficients`) with the r216 `write_partition`
+  symbol writer.
+
+  New public types in `encoder::partition_tree`:
+
+  * `PlaneCoefficients { plane, is_inter, tx_size, tx_class,
+    txb_skip_ctx, dc_sign_ctx, scan, quant }` — per-plane §5.11.39
+    `coefficients()` input forwarded verbatim to `write_coefficients`.
+  * `EncodeBlock { skip, segment_id, segment_pred, y_mode, uv_mode,
+    coefficients }` — per-leaf intra-arm scalar bundle.
+  * `EncodeNode::Leaf(EncodeBlock)` / `EncodeNode::Split([Box<EncodeNode>; 4])`
+    — partition-tree node. `EncodeNode::dummy_oob()` sentinel for
+    out-of-frame quadrants.
+  * `PartitionTreeWriter::new(mi_rows, mi_cols, geometry,
+    segmentation_enabled, last_active_seg_id, lossless, subsampling_x,
+    subsampling_y)` — driver state; maintains the §6.10.4 `MiSizes[]`
+    grid so the §8.3.2 `partition_ctx_for` lookup observes the same
+    neighbour widths the decoder's parallel
+    [`crate::cdf::PartitionWalker`] observes.
+  * `write_partition_tree(writer, cdfs, state, node, r, c, b_size)` —
+    recursive entry. Mirrors the §5.11.4 first conditional precisely:
+    `r >= MiRows || c >= MiCols` early return; `bSize < BLOCK_8X8`
+    forced-NONE leaf (no symbol); `!hasRows && !hasCols` forced-SPLIT
+    corner (no symbol); otherwise emit the
+    `partition` / `split_or_horz` / `split_or_vert` symbol via
+    `write_partition`, then dispatch.
+
+  Scope: PARTITION_NONE leaves + PARTITION_SPLIT splits only (the two
+  recursive shapes the §5.11.4 walk uses for "pure" partition trees).
+  The asymmetric partitions (`PARTITION_HORZ` / `PARTITION_VERT` /
+  `*_A` / `*_B` / `*_4`) are out of scope for this arc — the
+  `write_partition` symbol writer already supports their alphabet, but
+  the multi-leaf mixed-size dispatch is a separate piece of work.
+
+  Caller-bug surface (`Error::PartitionWalkOutOfRange`): out-of-range
+  `b_size`, a `Leaf` at a forced-SPLIT corner, a `Split` at a
+  forced-NONE node, plus any block-syntax / coefficient-write surface
+  error propagated from the per-block writers.
+
+  15 new lib tests (1252 → 1267) cover the recursive driver:
+  constructor + state guards (zero-extent / oversize / inverted
+  geometries), caller-bug shape rejections (Split at forced-NONE,
+  Leaf at forced-SPLIT, out-of-range `b_size`, out-of-frame quadrant
+  short-circuit), and five round-trip shapes through a mirror walker
+  that replays the encoder's exact bit ordering (single PARTITION_NONE
+  leaf, forced-NONE `bSize < BLOCK_8X8`, one-level SPLIT recovering
+  four BLOCK_8X8 leaves, forced-SPLIT corner with three out-of-frame
+  quadrants, two-level SPLIT on 16×16 frame recovering 7 mixed-size
+  leaves) plus per-leaf block-syntax recovery (skip, V_PRED y_mode,
+  all-zero §5.11.39 coefficients across Y/U/V planes). The mirror
+  walker also asserts §8.3 CDF-adaptation lockstep on the encode +
+  decode partition rows. With this arc the encoder is a true encoder
+  end-to-end on the intra-only path: caller supplies a partition tree
+  + per-block scalars + per-plane `Quant[]`, the encoder emits bytes
+  the decoder walks back to identical scalars + identical leaf shape.
+
 * **Round 216 — §5.11.4 partition decision-tree writer.** The encoder
   counterpart of [`crate::cdf::PartitionWalker::decode_partition`]'s
   symbol-read portion. Two predicate helpers + one writer:

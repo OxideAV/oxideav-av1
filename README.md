@@ -2,6 +2,71 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 217)
+
+Round 217 lands the §5.11.4 **recursive dispatch driver** — the encoder
+counterpart of `PartitionWalker::decode_partition`'s recursive walk and
+the milestone that makes the encoder a true encoder end-to-end on the
+intra-only path: a caller supplies an `EncodeNode` partition tree
++ per-block scalars + per-plane `Quant[]`, the driver emits bytes the
+decoder walks back to identical leaf shape + identical scalars.
+
+`encoder::partition_tree` — one driver + four public types (re-exported
+from `encoder`):
+
+* **`write_partition_tree(writer, cdfs, state, node, r, c, b_size) -> Result<(), Error>`**
+  — recursive entry; composes the r211–r216 per-block writers
+  (`write_skip` / `write_intra_segment_id` / `write_y_mode` /
+  `write_intra_uv_mode` / per-plane `write_coefficients`) with the r216
+  `write_partition` symbol writer. Mirrors the §5.11.4 first
+  conditional precisely: out-of-frame quadrant early-return,
+  `bSize < BLOCK_8X8` forced-NONE leaf (no symbol), `!hasRows && !hasCols`
+  forced-SPLIT corner (no symbol), otherwise emit the partition
+  symbol then dispatch.
+* **`EncodeNode::Leaf(EncodeBlock)`** / **`EncodeNode::Split([Box<EncodeNode>; 4])`**
+  — the partition tree. `EncodeNode::dummy_oob()` sentinel for
+  out-of-frame quadrants of a `Split`.
+* **`EncodeBlock { skip, segment_id, segment_pred, y_mode, uv_mode, coefficients }`**
+  — per-leaf intra-arm scalar bundle.
+* **`PlaneCoefficients { plane, is_inter, tx_size, tx_class, txb_skip_ctx, dc_sign_ctx, scan, quant }`**
+  — per-plane §5.11.39 input forwarded verbatim to `write_coefficients`.
+* **`PartitionTreeWriter`** — driver state. Maintains its own §6.10.4
+  `MiSizes[]` grid so the §8.3.2 `partition_ctx_for` lookup observes
+  the same neighbour widths the decoder's parallel
+  `PartitionWalker` observes — the key to §8.3 CDF-adaptation
+  lockstep across the recursion.
+
+Scope for this arc: PARTITION_NONE + PARTITION_SPLIT only (the two
+recursive shapes the §5.11.4 walk uses for "pure" partition trees).
+Asymmetric partitions (`PARTITION_HORZ` / `PARTITION_VERT` / `*_A` /
+`*_B` / `*_4`) are out of scope — `write_partition` already supports
+their alphabet, but the multi-leaf mixed-size dispatch is a separate
+piece of work.
+
+Caller-bug surface (`Error::PartitionWalkOutOfRange`): out-of-range
+`b_size`; a `Leaf` at a forced-SPLIT corner; a `Split` at a
+forced-NONE node; plus any block-syntax / coefficient-write surface
+error propagated from the per-block writers.
+
+15 new lib tests (1252 → 1267). Coverage: constructor + state guards
+(zero-extent / oversize / inverted geometries); caller-bug shape
+rejections (Split at forced-NONE, Leaf at forced-SPLIT, out-of-range
+`b_size`, out-of-frame quadrant short-circuit); five round-trip shapes
+through a mirror walker that replays the encoder's exact bit ordering
+(single PARTITION_NONE leaf, forced-NONE `bSize < BLOCK_8X8`,
+one-level SPLIT recovering four BLOCK_8X8 leaves, forced-SPLIT corner
+with three out-of-frame quadrants, two-level SPLIT on 16×16 frame
+recovering 7 mixed-size leaves); per-leaf block-syntax recovery (skip,
+V_PRED y_mode, all-zero §5.11.39 coefficients across Y/U/V planes).
+The mirror walker also asserts §8.3 CDF-adaptation lockstep on encode
++ decode partition rows.
+
+Out of scope this arc (next): §5.11.36 `transform_tree` / `tx_size`
+writer; §5.11.18 inter-arm `mode_info()` dispatcher; intra angle /
+palette encode; asymmetric partition dispatch (HORZ / VERT / *_A /
+*_B / *_4); pixel-space encoder bootstrap (forward-transform +
+quantization + RD search above this driver).
+
 ## Status — 2026-05-28 (round 216)
 
 Round 216 lands the §5.11.4 **partition decision-tree writer** — the

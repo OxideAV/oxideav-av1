@@ -109,6 +109,20 @@
 //! [`partition::partition_split_only`]) surface the §5.11.4 first /
 //! last conditional so the driver knows when to skip the writer call.
 //!
+//! Arc 11 (round 217) lands the §5.11.4 recursive **dispatch driver**:
+//! [`partition_tree::write_partition_tree`] composes the r211–r216 per-block
+//! writers (`write_skip`, `write_intra_segment_id`, `write_y_mode`,
+//! `write_intra_uv_mode`, per-plane `write_coefficients`) together with the
+//! r216 `write_partition` symbol writer into a complete intra-arm
+//! partition-tree walker driven from a caller-supplied
+//! [`partition_tree::EncodeNode`] tree. The driver maintains its own
+//! `MiSizes[]` grid so the §8.3.2 `partition_ctx_for` lookup observes the
+//! same neighbour widths the decoder's parallel
+//! [`crate::cdf::PartitionWalker`] observes. Round-trips a leaf or 7-leaf
+//! two-level split tree back through `decode_partition` plus manual
+//! `decode_block` replay; the encoder is now a true encoder end-to-end
+//! for the intra-only path.
+//!
 //! Next arc: §5.11.36 transform_tree / tx_size writer; §5.11.18
 //! inter-arm `mode_info()` dispatcher; intra angle / palette encode.
 //! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
@@ -121,6 +135,7 @@ pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
 pub mod partition;
+pub mod partition_tree;
 pub mod sequence_obu;
 pub mod symbol_writer;
 pub mod temporal_unit;
@@ -141,6 +156,9 @@ pub use obu::{
     ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,
 };
 pub use partition::{partition_none_only, partition_split_only, write_partition};
+pub use partition_tree::{
+    write_partition_tree, EncodeBlock, EncodeNode, PartitionTreeWriter, PlaneCoefficients,
+};
 pub use sequence_obu::write_sequence_header_obu;
 pub use symbol_writer::SymbolWriter;
 pub use temporal_unit::{encode_sequence_header_obu, encode_temporal_unit, TemporalUnitPlan};
