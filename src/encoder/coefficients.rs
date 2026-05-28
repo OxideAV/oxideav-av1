@@ -1,6 +1,10 @@
-//! Per-coefficient **writers** for the §5.11.39 `coefficients()` body —
-//! arc 6 (round 212) first slice: `txb_skip` (the `all_zero` symbol),
-//! `eob_pt` (the EOB position class + refinement bits), and `dc_sign`.
+//! Per-coefficient **writers** for the §5.11.39 `coefficients()` body.
+//!
+//! Arc 6 (round 212) landed the framing primitives `txb_skip` (the
+//! `all_zero` symbol), `eob_pt` (the EOB position class + refinement
+//! bits), and `dc_sign`. Arc 7 (round 213) extends with the
+//! per-coefficient base-level chain at each reverse-scan position:
+//! `coeff_base_eob`, `coeff_base`, and `coeff_br`.
 //!
 //! These are the encoder counterparts to the §5.11.39 reader inside
 //! [`crate::cdf::PartitionWalker::coefficients`]:
@@ -14,18 +18,34 @@
 //!     selector), then an optional `eob_extra` `S()` followed by an
 //!     `eob_extra_bit` raw `L(1)` loop to refine `eob` toward its final
 //!     value. Writer: [`write_eob_pt`].
+//!   * On the reverse-scan iteration at `c == eob - 1` the decoder
+//!     reads `coeff_base_eob` (`S()` against `TileCoeffBaseEobCdf[
+//!     txSzCtx ][ ptype ][ ctx ]`); for `c < eob - 1` it reads
+//!     `coeff_base` (`S()` against `TileCoeffBaseCdf[ txSzCtx ][ ptype
+//!     ][ ctx ]`). The `ctx` axis on both is derived by the §8.3.2
+//!     helpers [`crate::cdf::get_coeff_base_eob_ctx`] /
+//!     [`crate::cdf::get_coeff_base_ctx`] from the running `Quant[]`
+//!     array (the caller pre-computes; the writer is stateless).
+//!     Writers: [`write_coeff_base_eob`] / [`write_coeff_base`].
+//!   * When the level (`coeff_base_eob + 1` or `coeff_base`) exceeds
+//!     `NUM_BASE_LEVELS = 2`, the decoder runs up to
+//!     `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) = 4` iterations of
+//!     `coeff_br` (each `S()` against `TileCoeffBrCdf[ Min(txSzCtx,
+//!     TX_32X32) ][ ptype ][ ctx ]`), terminating when the symbol
+//!     falls below `BR_CDF_SIZE - 1 = 3`. The `ctx` axis is the
+//!     §8.3.2 [`crate::cdf::get_br_ctx`] result. Writer:
+//!     [`write_coeff_br`] (one `S()` per call — the driver loop that
+//!     stacks up to 4 of them is the next arc).
 //!   * Inside the forward-scan loop, the first non-zero coefficient
 //!     (`c == 0` arm) reads one `dc_sign` `S()` against
 //!     `TileDcSignCdf[ ptype ][ ctx ]` (§8.3.2). Writer:
 //!     [`write_dc_sign`].
 //!
-//! Scope of this arc is intentionally tight: the per-coefficient
-//! `coeff_base` / `coeff_base_eob` / `coeff_br` chain and the
-//! per-magnitude `golomb_length_bit` / `golomb_data_bit` tail are out
-//! of scope for r212 — they sit on top of these primitives in a
-//! subsequent arc (and on top of the `Quant[]` context plumbing the
-//! §8.3.2 `get_coeff_base_ctx` / `get_coeff_base_eob_ctx` / `get_br_ctx`
-//! derivations want).
+//! Scope of this arc is intentionally tight: the per-magnitude
+//! `golomb_length_bit` / `golomb_data_bit` tail (§5.11.39 lines 84-93,
+//! for magnitudes above `NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`) is
+//! out of scope, as is the full `coefficients()` driver loop that
+//! sequences these primitives across the reverse + forward scans.
 //!
 //! ## Stateless on purpose
 //!
@@ -51,7 +71,8 @@
 //! [`block_mode_info`]: crate::encoder::block_mode_info
 
 use crate::cdf::{
-    TileCdfContext, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS, TXB_SKIP_CONTEXTS, TX_SIZES, TX_SIZES_ALL,
+    TileCdfContext, BR_CDF_SIZE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS, LEVEL_CONTEXTS, PLANE_TYPES,
+    SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB, TXB_SKIP_CONTEXTS, TX_SIZES, TX_SIZES_ALL,
     TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
@@ -414,11 +435,193 @@ pub fn write_dc_sign(
     writer.write_symbol(dc_sign as u32, cdf)
 }
 
+/// `coeff_base_eob` writer per §5.11.39 line 60 (av1-spec p.91) and
+/// §8.3.2 p.376.
+///
+/// Spec body (extracted, inside the reverse-scan loop at the
+/// `c == eob - 1` iteration):
+/// ```text
+///   coeff_base_eob                                              S()
+///   level = coeff_base_eob + 1
+/// ```
+///
+/// `coeff_base_eob` is a 3-symbol `S()` against
+/// `TileCoeffBaseEobCdf[ txSzCtx ][ ptype ][ ctx ]`. The §9.4 alphabet
+/// is `{ 0, 1, 2 }`, mapping to levels `{ 1, 2, 3 }` (the §5.11.39
+/// line-60 `level = coeff_base_eob + 1` derivation makes 0 the smallest
+/// because the EOB-position coefficient is known non-zero).
+///
+/// `ctx` is the `coeff_base_eob` context the caller derives via
+/// [`crate::cdf::get_coeff_base_eob_ctx`] — the §8.3.2 reduction of
+/// `get_coeff_base_ctx(..., is_eob = true)` onto
+/// `0..SIG_COEF_CONTEXTS_EOB = 4`. Passing the already-derived `ctx`
+/// (mirroring [`write_dc_sign`]'s caller-supplied `ctx`) keeps the
+/// writer stateless: the §5.11.39 driver loop the next arc lands will
+/// supply the `Quant[]`-aware ctx; today the round-trip tests below
+/// supply a fixed ctx.
+///
+/// `sym` MUST be in `0..=2` (the 3-symbol alphabet). `tx_sz_ctx` is the
+/// §5.11.39 line-4 derivation in `0..TX_SIZES = 5`; `ptype` is
+/// `plane > 0` in `0..PLANE_TYPES = 2`.
+///
+/// Returns [`Error::PartitionWalkOutOfRange`] for any caller-supplied
+/// index out of range.
+pub fn write_coeff_base_eob(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    sym: u8,
+    tx_sz_ctx: usize,
+    ptype: usize,
+    ctx: usize,
+) -> Result<(), Error> {
+    if sym > 2 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if tx_sz_ctx >= TX_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if ptype >= PLANE_TYPES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if ctx >= SIG_COEF_CONTEXTS_EOB {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let cdf = cdfs
+        .coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(sym as u32, cdf)
+}
+
+/// `coeff_base` writer per §5.11.39 line 63 (av1-spec p.91) and §8.3.2
+/// p.371.
+///
+/// Spec body (extracted, inside the reverse-scan loop for
+/// `c < eob - 1`):
+/// ```text
+///   coeff_base                                                  S()
+///   level = coeff_base
+/// ```
+///
+/// `coeff_base` is a 4-symbol `S()` against
+/// `TileCoeffBaseCdf[ txSzCtx ][ ptype ][ ctx ]`. The §9.4 alphabet is
+/// `{ 0, 1, 2, 3 }`, mapping directly to levels `{ 0, 1, 2, 3 }`.
+/// Symbol `0` means the coefficient at this scan position is zero;
+/// symbol `3` means the magnitude continues through the §5.11.39
+/// lines 65-70 `coeff_br` chain (which [`write_coeff_br`] handles one
+/// `S()` at a time).
+///
+/// `ctx` is the `coeff_base` context the caller derives via
+/// [`crate::cdf::get_coeff_base_ctx`] with `is_eob = false` — the
+/// §8.3.2 neighbour-magnitude accumulation reducing onto
+/// `0..SIG_COEF_CONTEXTS = 42`. Same stateless caller pattern as
+/// [`write_coeff_base_eob`]; the driver loop produces the ctx from
+/// the running `Quant[]` array.
+///
+/// `sym` MUST be in `0..=3`. `tx_sz_ctx` is `0..TX_SIZES = 5`; `ptype`
+/// is `0..PLANE_TYPES = 2`.
+///
+/// Returns [`Error::PartitionWalkOutOfRange`] for any caller-supplied
+/// index out of range.
+pub fn write_coeff_base(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    sym: u8,
+    tx_sz_ctx: usize,
+    ptype: usize,
+    ctx: usize,
+) -> Result<(), Error> {
+    if sym > 3 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if tx_sz_ctx >= TX_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if ptype >= PLANE_TYPES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if ctx >= SIG_COEF_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let cdf = cdfs
+        .coeff_base_cdf(tx_sz_ctx, ptype, ctx)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(sym as u32, cdf)
+}
+
+/// `coeff_br` writer per §5.11.39 lines 65-70 (av1-spec p.91) and
+/// §8.3.2 p.378.
+///
+/// Spec body (extracted, the per-iteration `S()` inside the
+/// `coeff_br` chain that runs while `level > NUM_BASE_LEVELS`):
+/// ```text
+///   for ( idx = 0; idx < COEFF_BASE_RANGE / ( BR_CDF_SIZE - 1 ); idx++ ) {
+///       coeff_br                                                S()
+///       level += coeff_br
+///       if ( coeff_br < BR_CDF_SIZE - 1 ) break
+///   }
+/// ```
+///
+/// Each `coeff_br` is a `BR_CDF_SIZE`-symbol `S()` against
+/// `TileCoeffBrCdf[ Min(txSzCtx, TX_32X32) ][ ptype ][ ctx ]`. The
+/// `txSzCtx` clamp at `TX_32X32 = 3` lives inside
+/// [`TileCdfContext::coeff_br_cdf`], so this writer simply forwards the
+/// caller's `tx_sz_ctx`. The §9.4 alphabet is `{ 0, 1, 2, 3 }`
+/// (`BR_CDF_SIZE = 4`); symbol `BR_CDF_SIZE - 1 = 3` means the chain
+/// continues into the next `coeff_br` iteration, any smaller value
+/// terminates the chain (the spec's `if (coeff_br < BR_CDF_SIZE - 1)
+/// break` guard).
+///
+/// This writer encodes **one** `coeff_br` `S()` per call — the driver
+/// loop that runs up to `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) = 4`
+/// iterations is a follow-on arc. The per-call shape matches the
+/// per-iteration `decoder.read_symbol(cdf)` call inside
+/// [`crate::cdf::PartitionWalker::coefficients`].
+///
+/// `ctx` is the `coeff_br` context the caller derives via
+/// [`crate::cdf::get_br_ctx`] — the §8.3.2 three-neighbour magnitude
+/// accumulation onto `0..LEVEL_CONTEXTS = 21`. `sym` MUST be in
+/// `0..BR_CDF_SIZE = 0..=3`; `tx_sz_ctx` is `0..TX_SIZES = 5` (the
+/// selector clamps at `TX_32X32` internally); `ptype` is
+/// `0..PLANE_TYPES = 2`.
+///
+/// Returns [`Error::PartitionWalkOutOfRange`] for any caller-supplied
+/// index out of range.
+pub fn write_coeff_br(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    sym: u8,
+    tx_sz_ctx: usize,
+    ptype: usize,
+    ctx: usize,
+) -> Result<(), Error> {
+    if (sym as usize) >= BR_CDF_SIZE {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if tx_sz_ctx >= TX_SIZES {
+        // The selector clamps to TX_32X32 internally, but a frankly
+        // out-of-range tx_sz_ctx is a caller bug worth surfacing
+        // explicitly — same surface contract as the other writers in
+        // this module.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if ptype >= PLANE_TYPES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if ctx >= LEVEL_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let cdf = cdfs
+        .coeff_br_cdf(tx_sz_ctx, ptype, ctx)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(sym as u32, cdf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cdf::{
-        TileCdfContext, TX_16X16, TX_32X32, TX_4X4, TX_8X8, TX_CLASS_2D, TX_CLASS_HORIZ,
+        get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, TileCdfContext, TX_16X16, TX_32X32,
+        TX_4X4, TX_8X8, TX_CLASS_2D, TX_CLASS_HORIZ,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -844,5 +1047,324 @@ mod tests {
         assert_eq!(all_zero, 0);
         let eob = read_eob(&mut dec, &mut dec_cdfs, TX_4X4, TX_CLASS_2D, 0, 0);
         assert_eq!(eob, 4);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.39 write_coeff_base_eob — round-trips through a single S()
+    // read against the matching `TileCoeffBaseEobCdf` row.
+    // -----------------------------------------------------------------
+
+    /// Shim mirroring the §5.11.39 line-60 reader: one S() against
+    /// `coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx)`. Returns the §9.4
+    /// symbol (0..=2); the spec maps `level = sym + 1`.
+    fn read_coeff_base_eob(
+        dec: &mut SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> u32 {
+        let cdf = cdfs.coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx).unwrap();
+        dec.read_symbol(cdf).unwrap()
+    }
+
+    /// `coeff_base_eob = 0` (level 1) on the simplest ctx — round-trips.
+    #[test]
+    fn write_coeff_base_eob_zero_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_coeff_base_eob(&mut writer, &mut enc_cdfs, 0, 0, 0, 0).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sym = read_coeff_base_eob(&mut dec, &mut dec_cdfs, 0, 0, 0);
+        assert_eq!(sym, 0);
+    }
+
+    /// `coeff_base_eob = 2` (level 3 — the largest base level codable
+    /// via `coeff_base_eob` per §5.11.39 p.91) on TX_16X16 chroma at
+    /// ctx 3 (upper edge of SIG_COEF_CONTEXTS_EOB) — round-trips.
+    #[test]
+    fn write_coeff_base_eob_max_sym_round_trip_chroma() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // tx_sz_ctx = 2 (TX_16X16's §5.11.39 line-4 derivation lands in
+        // the 16-class bucket); ptype = 1 (chroma); ctx = 3
+        // (SIG_COEF_CONTEXTS_EOB - 1).
+        write_coeff_base_eob(&mut writer, &mut enc_cdfs, 2, 2, 1, 3).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sym = read_coeff_base_eob(&mut dec, &mut dec_cdfs, 2, 1, 3);
+        assert_eq!(sym, 2);
+    }
+
+    /// Out-of-range `sym` (alphabet is 3 symbols) is a caller bug.
+    #[test]
+    fn write_coeff_base_eob_rejects_out_of_range_symbol() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_coeff_base_eob(&mut writer, &mut cdfs, 3, 0, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Out-of-range `ctx` (SIG_COEF_CONTEXTS_EOB = 4) is a caller bug.
+    #[test]
+    fn write_coeff_base_eob_rejects_out_of_range_ctx() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_coeff_base_eob(&mut writer, &mut cdfs, 0, 0, 0, SIG_COEF_CONTEXTS_EOB)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.39 write_coeff_base — round-trips through a single S()
+    // read against the matching `TileCoeffBaseCdf` row.
+    // -----------------------------------------------------------------
+
+    /// Shim mirroring the §5.11.39 line-63 reader: one S() against
+    /// `coeff_base_cdf(tx_sz_ctx, ptype, ctx)`. Returns the §9.4 symbol
+    /// (0..=3) which is also the spec's `level`.
+    fn read_coeff_base(
+        dec: &mut SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> u32 {
+        let cdf = cdfs.coeff_base_cdf(tx_sz_ctx, ptype, ctx).unwrap();
+        dec.read_symbol(cdf).unwrap()
+    }
+
+    /// `coeff_base = 0` (level 0 — the coefficient is zero) on the
+    /// simplest ctx — round-trips.
+    #[test]
+    fn write_coeff_base_zero_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_coeff_base(&mut writer, &mut enc_cdfs, 0, 0, 0, 0).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sym = read_coeff_base(&mut dec, &mut dec_cdfs, 0, 0, 0);
+        assert_eq!(sym, 0);
+    }
+
+    /// `coeff_base = 3` (level 3 — the chain-continues sentinel per
+    /// §5.11.39 line 64 `level > NUM_BASE_LEVELS` gate) on TX_32X32
+    /// luma at ctx 41 (upper edge of SIG_COEF_CONTEXTS = 42) — round
+    /// trips.
+    #[test]
+    fn write_coeff_base_continues_round_trip_luma_upper_ctx() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // tx_sz_ctx = 3 (TX_32X32); ptype = 0 (Y); ctx =
+        // SIG_COEF_CONTEXTS - 1 = 41.
+        write_coeff_base(&mut writer, &mut enc_cdfs, 3, 3, 0, SIG_COEF_CONTEXTS - 1).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sym = read_coeff_base(&mut dec, &mut dec_cdfs, 3, 0, SIG_COEF_CONTEXTS - 1);
+        assert_eq!(sym, 3);
+    }
+
+    /// Out-of-range `sym` (alphabet is 4 symbols) is a caller bug.
+    #[test]
+    fn write_coeff_base_rejects_out_of_range_symbol() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_coeff_base(&mut writer, &mut cdfs, 4, 0, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Out-of-range `ctx` (SIG_COEF_CONTEXTS = 42) is a caller bug.
+    #[test]
+    fn write_coeff_base_rejects_out_of_range_ctx() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_coeff_base(&mut writer, &mut cdfs, 0, 0, 0, SIG_COEF_CONTEXTS).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.39 write_coeff_br — round-trips through a single S() read
+    // against the matching `TileCoeffBrCdf` row.
+    // -----------------------------------------------------------------
+
+    /// Shim mirroring the §5.11.39 lines 65-70 per-iteration reader:
+    /// one S() against `coeff_br_cdf(tx_sz_ctx, ptype, ctx)`. Returns
+    /// the §9.4 symbol (0..=BR_CDF_SIZE-1 = 0..=3).
+    fn read_coeff_br(
+        dec: &mut SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        tx_sz_ctx: usize,
+        ptype: usize,
+        ctx: usize,
+    ) -> u32 {
+        let cdf = cdfs.coeff_br_cdf(tx_sz_ctx, ptype, ctx).unwrap();
+        dec.read_symbol(cdf).unwrap()
+    }
+
+    /// `coeff_br = 0` — the chain terminates after one iteration with
+    /// no magnitude extension. Round-trips on the simplest ctx.
+    #[test]
+    fn write_coeff_br_zero_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_coeff_br(&mut writer, &mut enc_cdfs, 0, 0, 0, 0).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sym = read_coeff_br(&mut dec, &mut dec_cdfs, 0, 0, 0);
+        assert_eq!(sym, 0);
+    }
+
+    /// `coeff_br = BR_CDF_SIZE - 1 = 3` — the chain-continues sentinel
+    /// per §5.11.39 line 68 `if (coeff_br < BR_CDF_SIZE - 1) break`
+    /// guard. On TX_8X8 chroma at ctx 20 (upper edge of
+    /// LEVEL_CONTEXTS = 21).
+    #[test]
+    fn write_coeff_br_continues_round_trip_chroma_upper_ctx() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_coeff_br(
+            &mut writer,
+            &mut enc_cdfs,
+            (BR_CDF_SIZE - 1) as u8,
+            1, // tx_sz_ctx — TX_8X8.
+            1, // ptype — chroma.
+            LEVEL_CONTEXTS - 1,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sym = read_coeff_br(&mut dec, &mut dec_cdfs, 1, 1, LEVEL_CONTEXTS - 1);
+        assert_eq!(sym, (BR_CDF_SIZE - 1) as u32);
+    }
+
+    /// `coeff_br` on TX_64X64 — the §8.3.2 selector clamps `txSzCtx`
+    /// at `TX_32X32`, so a caller passing `tx_sz_ctx = TX_64X64 = 4`
+    /// must still round-trip (the selector mirror in both writer +
+    /// reader applies the same clamp).
+    #[test]
+    fn write_coeff_br_tx_size_clamp_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // tx_sz_ctx = 4 ≥ TX_32X32 = 3 ⇒ selector clamps to 3 inside
+        // coeff_br_cdf; sym = 1.
+        write_coeff_br(&mut writer, &mut enc_cdfs, 1, 4, 0, 0).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sym = read_coeff_br(&mut dec, &mut dec_cdfs, 4, 0, 0);
+        assert_eq!(sym, 1);
+    }
+
+    /// Out-of-range `sym` (BR_CDF_SIZE = 4) is a caller bug.
+    #[test]
+    fn write_coeff_br_rejects_out_of_range_symbol() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_coeff_br(&mut writer, &mut cdfs, BR_CDF_SIZE as u8, 0, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Out-of-range `ctx` (LEVEL_CONTEXTS = 21) is a caller bug.
+    #[test]
+    fn write_coeff_br_rejects_out_of_range_ctx() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_coeff_br(&mut writer, &mut cdfs, 0, 0, 0, LEVEL_CONTEXTS).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // Driver-shape integration: cross-check the writer + §8.3.2 ctx
+    // helpers stay in lockstep with the decoder's per-coefficient
+    // ctx derivations. The driver loop itself is a follow-on arc; this
+    // test just confirms a hand-built short sequence — coeff_base_eob
+    // at c = eob - 1 followed by coeff_base + coeff_br at c = 0 — round
+    // trips when both sides feed the same Quant[] into the §8.3.2
+    // helpers.
+    // -----------------------------------------------------------------
+
+    /// Tiny synthetic block at TX_4X4 luma, TX_CLASS_2D, with eob = 2
+    /// (two non-zero scan positions). At c = 1 (the EOB position) we
+    /// write `coeff_base_eob = 0` (level 1); at c = 0 we write
+    /// `coeff_base = 3` (level 3) followed by `coeff_br = 0` (no
+    /// magnitude extension, chain terminates). Round-trips through
+    /// `get_coeff_base_eob_ctx` / `get_coeff_base_ctx` / `get_br_ctx`.
+    #[test]
+    fn driver_shape_eob2_round_trip_tx4x4() {
+        // §5.11.39 line 9: Quant[] zero-initialised. Per-position writes
+        // happen during the reverse-scan loop; for the round-trip we
+        // pre-populate the same Quant[] the §8.3.2 ctx helpers walk on
+        // each side.
+        let scan_pos_eob = 1usize; // scan[c = 1]
+        let scan_pos_dc = 0usize; // scan[c = 0]
+
+        // Reverse-scan, iteration 1 (c = eob - 1 = 1): Quant[] still
+        // zero. After we record level = 1 at pos = 1.
+        let mut quant_after_eob = [0i32; 16];
+        quant_after_eob[scan_pos_eob] = 1;
+        // Reverse-scan, iteration 2 (c = 0): Quant[] now has the EOB
+        // level recorded. After we record level = 3 at pos = 0.
+        // (`coeff_br = 0` ⇒ no further increment.)
+
+        // §8.3.2 ctx derivations. Both sides compute these identically
+        // from the running Quant[] array; we cache them here so the
+        // round-trip test stays self-documenting.
+        let ctx_eob = get_coeff_base_eob_ctx(&[0i32; 16], TX_4X4, TX_CLASS_2D, scan_pos_eob, 1);
+        let ctx_base =
+            get_coeff_base_ctx(&quant_after_eob, TX_4X4, TX_CLASS_2D, scan_pos_dc, 0, false);
+        let ctx_br = get_br_ctx(&quant_after_eob, TX_4X4, TX_CLASS_2D, scan_pos_dc);
+
+        // tx_sz_ctx for TX_4X4 == 0 (§5.11.39 line-4 derivation).
+        let tx_sz_ctx = 0usize;
+        let ptype = 0usize;
+
+        // -------- encode --------
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // iteration 1: coeff_base_eob = 0 ⇒ level 1.
+        write_coeff_base_eob(&mut writer, &mut enc_cdfs, 0, tx_sz_ctx, ptype, ctx_eob).unwrap();
+        // iteration 2: coeff_base = 3 ⇒ level 3 (chain enters coeff_br).
+        write_coeff_base(&mut writer, &mut enc_cdfs, 3, tx_sz_ctx, ptype, ctx_base).unwrap();
+        // coeff_br = 0 ⇒ no increment, chain terminates.
+        write_coeff_br(&mut writer, &mut enc_cdfs, 0, tx_sz_ctx, ptype, ctx_br).unwrap();
+        let bytes = writer.finish();
+
+        // -------- decode --------
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        // iteration 1 (c = eob - 1): coeff_base_eob.
+        let sym_eob = {
+            let cdf = dec_cdfs
+                .coeff_base_eob_cdf(tx_sz_ctx, ptype, ctx_eob)
+                .unwrap();
+            dec.read_symbol(cdf).unwrap()
+        };
+        assert_eq!(sym_eob, 0, "coeff_base_eob round-trips");
+        // iteration 2 (c = 0): coeff_base.
+        let sym_base = {
+            let cdf = dec_cdfs.coeff_base_cdf(tx_sz_ctx, ptype, ctx_base).unwrap();
+            dec.read_symbol(cdf).unwrap()
+        };
+        assert_eq!(sym_base, 3, "coeff_base round-trips");
+        // coeff_br for level extension.
+        let sym_br = {
+            let cdf = dec_cdfs.coeff_br_cdf(tx_sz_ctx, ptype, ctx_br).unwrap();
+            dec.read_symbol(cdf).unwrap()
+        };
+        assert_eq!(sym_br, 0, "coeff_br round-trips");
     }
 }

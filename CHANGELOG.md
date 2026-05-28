@@ -6,6 +6,51 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 213 — §5.11.39 coefficient base-level chain writers.** Extends
+  `encoder::coefficients` with the per-coefficient `coeff_base_eob` /
+  `coeff_base` / `coeff_br` writers — the reverse-scan body the §5.11.39
+  driver loop calls into for every coded coefficient.
+
+  New public API in `encoder::coefficients` (re-exported from
+  `encoder`):
+  * `write_coeff_base_eob(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)` —
+    inverse of the §5.11.39 line-60 `coeff_base_eob S()` against
+    `TileCoeffBaseEobCdf[txSzCtx][ptype][ctx]` (§8.3.2 p.376). One
+    3-symbol §9.4 alphabet write (`sym ∈ 0..=2`, level = `sym + 1`).
+    `ctx` is `0..SIG_COEF_CONTEXTS_EOB = 4` — the §8.3.2 reduction of
+    `get_coeff_base_ctx(..., is_eob = true)` already exposed as the
+    public helper `crate::cdf::get_coeff_base_eob_ctx`.
+  * `write_coeff_base(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)` —
+    inverse of the §5.11.39 line-63 `coeff_base S()` against
+    `TileCoeffBaseCdf[txSzCtx][ptype][ctx]` (§8.3.2 p.371). One
+    4-symbol §9.4 alphabet write (`sym ∈ 0..=3`, level = `sym`). `ctx`
+    is `0..SIG_COEF_CONTEXTS = 42` — the public helper
+    `crate::cdf::get_coeff_base_ctx` (`is_eob = false`) supplies it
+    from the running `Quant[]` array.
+  * `write_coeff_br(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)` —
+    inverse of one §5.11.39 line-67 `coeff_br S()` against
+    `TileCoeffBrCdf[Min(txSzCtx, TX_32X32)][ptype][ctx]` (§8.3.2
+    p.378). One `BR_CDF_SIZE = 4`-symbol §9.4 alphabet write (`sym ∈
+    0..=3`). `ctx` is `0..LEVEL_CONTEXTS = 21` — the public helper
+    `crate::cdf::get_br_ctx` supplies it. One write per call; the
+    chain-stacker that bounds at `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)
+    = 4` iterations lives in the follow-on arc that lands the full
+    §5.11.39 driver loop.
+
+  Stateless on purpose, same pattern as round 212. 14 new lib tests
+  (1201 → 1215): per-writer round-trips at the zero / chain-continues /
+  upper-ctx edges, the `coeff_br` `Min(txSzCtx, TX_32X32)` clamp,
+  out-of-range guards for each axis, and a hand-built two-coefficient
+  driver-shape integration test that drives the §8.3.2 helpers on both
+  encoder and decoder sides off the same `Quant[]` array
+  (`coeff_base_eob = 0` at `c = eob - 1`, then `coeff_base = 3` +
+  `coeff_br = 0` at `c = 0`).
+
+  Next arc: the `golomb_length_bit` / `golomb_data_bit` magnitude tail
+  for coefficients above `NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`,
+  followed by the §5.11.39 driver loop and the §5.11.4 partition
+  decision-tree writer.
+
 * **Round 212 — first §5.11.39 coefficient-encode primitives.** New
   `encoder::coefficients` module: the encoder counterparts to the
   three "entry" §8.2.6 `S()` reads inside

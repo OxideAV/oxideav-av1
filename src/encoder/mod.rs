@@ -77,19 +77,27 @@
 //!     `coefficients()` writers: `write_txb_skip` (the `all_zero` S()),
 //!     `write_eob_pt` (eob_pt_{16..1024} S() + eob_extra S() +
 //!     eob_extra_bit L(1) refinement loop) and `write_dc_sign` (the
-//!     `c == 0` forward-scan S()). Same stateless surface as
-//!     `block_mode_info`; the §8.3.2 ctx values are caller-supplied.
+//!     `c == 0` forward-scan S()). Arc 7 (round 213) extends with the
+//!     per-coefficient base-level chain: `write_coeff_base_eob` (the
+//!     3-symbol §9.4 alphabet at `c == eob - 1`), `write_coeff_base`
+//!     (the 4-symbol alphabet at non-EOB positions) and `write_coeff_br`
+//!     (one `BR_CDF_SIZE`-symbol §9.4 alphabet S() per `coeff_br` chain
+//!     iteration, capped at `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) = 4`
+//!     repetitions by the spec's `if (coeff_br < BR_CDF_SIZE - 1) break`
+//!     guard). Same stateless surface as `block_mode_info`; the §8.3.2
+//!     ctx values are caller-supplied — the existing decoder helpers
+//!     [`crate::cdf::get_coeff_base_ctx`] /
+//!     [`crate::cdf::get_coeff_base_eob_ctx`] /
+//!     [`crate::cdf::get_br_ctx`] derive them from the running `Quant[]`
+//!     array on both sides.
 //!
-//! Next arc: per-coefficient `coeff_base{_eob}` + `coeff_br` writers
-//! (the four- / three-symbol §9.4 alphabets plus the §8.3.2
-//! `get_coeff_base_ctx` / `get_coeff_base_eob_ctx` / `get_br_ctx`
-//! plumbing) and the `golomb_length_bit` / `golomb_data_bit` tail for
+//! Next arc: the `golomb_length_bit` / `golomb_data_bit` tail for
 //! coefficient magnitudes above `NUM_BASE_LEVELS + COEFF_BASE_RANGE`,
-//! followed by the §5.11.39 driver loop and the §5.11.4 partition
-//! decision-tree writer; inter-arm mode_info writers (§5.11.18
-//! dispatcher composite). §5.9.7 `frame_size_with_refs()` inverse +
-//! §5.9.24 `read_global_param` signed-subexp inverse for the remaining
-//! inter-frame paths.
+//! followed by the §5.11.39 driver loop (the reverse-scan +
+//! forward-scan composite) and the §5.11.4 partition decision-tree
+//! writer; inter-arm mode_info writers (§5.11.18 dispatcher composite).
+//! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
+//! signed-subexp inverse for the remaining inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
@@ -106,7 +114,10 @@ pub use bitwriter::BitWriter;
 pub use block_mode_info::{
     write_intra_frame_y_mode, write_intra_segment_id, write_intra_uv_mode, write_skip, write_y_mode,
 };
-pub use coefficients::{write_dc_sign, write_eob_pt, write_txb_skip};
+pub use coefficients::{
+    write_coeff_base, write_coeff_base_eob, write_coeff_br, write_dc_sign, write_eob_pt,
+    write_txb_skip,
+};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;
 pub use obu::{

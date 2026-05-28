@@ -2,6 +2,67 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 213)
+
+Round 213 extends `encoder::coefficients` with the **§5.11.39
+per-coefficient base-level chain writers** — `coeff_base_eob` /
+`coeff_base` / `coeff_br`. Each is the inverse of one §8.2.6 `S()`
+the §5.11.39 reverse-scan loop inside `PartitionWalker::coefficients`
+issues per coded coefficient.
+
+`encoder::coefficients` — three new pure, stateless writers
+(re-exported from `encoder`):
+
+* **`write_coeff_base_eob(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)`**
+  — inverse of the §5.11.39 line-60 `coeff_base_eob S()` against
+  `TileCoeffBaseEobCdf[txSzCtx][ptype][ctx]` (§8.3.2 p.376). One
+  3-symbol §9.4 alphabet write (`sym ∈ 0..=2`, level = `sym + 1`).
+  `ctx` is `0..SIG_COEF_CONTEXTS_EOB = 4` — the §8.3.2 reduction
+  `get_coeff_base_ctx(..., is_eob = true) - SIG_COEF_CONTEXTS +
+  SIG_COEF_CONTEXTS_EOB` is already exposed as the public helper
+  `cdf::get_coeff_base_eob_ctx`.
+* **`write_coeff_base(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)`** —
+  inverse of the §5.11.39 line-63 `coeff_base S()` against
+  `TileCoeffBaseCdf[txSzCtx][ptype][ctx]` (§8.3.2 p.371). One
+  4-symbol §9.4 alphabet write (`sym ∈ 0..=3`, level = `sym`). `ctx`
+  is `0..SIG_COEF_CONTEXTS = 42` — the public helper
+  `cdf::get_coeff_base_ctx(..., is_eob = false)` derives it from the
+  running `Quant[]` array (the same array the decoder side updates as
+  it walks the reverse-scan loop).
+* **`write_coeff_br(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)`** —
+  inverse of one §5.11.39 line-67 `coeff_br S()` against
+  `TileCoeffBrCdf[Min(txSzCtx, TX_32X32)][ptype][ctx]` (§8.3.2 p.378).
+  One `BR_CDF_SIZE = 4`-symbol §9.4 alphabet write (`sym ∈ 0..=3`,
+  `sym = BR_CDF_SIZE - 1 = 3` keeps the chain going). `ctx` is
+  `0..LEVEL_CONTEXTS = 21` — the public helper `cdf::get_br_ctx`
+  supplies it. One write per call; the chain-stacker that bounds at
+  `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) = 4` iterations lives in the
+  follow-on arc.
+
+Stateless on purpose, same surface contract as r212: every writer takes
+its §8.3.2 ctx values as inputs and the §8.3 CDF adaptation runs in
+lockstep with the matching `PartitionWalker::coefficients` reader.
+
+14 new lib tests (1201 → 1215), bit-exact round-trips encode →
+`SymbolWriter` → decode through small read shims wrapping
+`coeff_base_eob_cdf` / `coeff_base_cdf` / `coeff_br_cdf`. Coverage:
+per-writer round-trips at the zero / chain-continues sentinel /
+upper-ctx edges (`SIG_COEF_CONTEXTS_EOB - 1`, `SIG_COEF_CONTEXTS - 1`,
+`LEVEL_CONTEXTS - 1`); the `coeff_br` `Min(txSzCtx, TX_32X32)` clamp
+exercised at `tx_sz_ctx = TX_64X64 = 4`; out-of-range guards
+(`sym >= alphabet`, `ctx >= bound`) returning
+`Error::PartitionWalkOutOfRange`; and a hand-built two-coefficient
+driver-shape integration test that drives the §8.3.2 helpers
+identically on both sides off the same `Quant[]` (`coeff_base_eob = 0`
+at `c = eob - 1`, then `coeff_base = 3` + `coeff_br = 0` at `c = 0`).
+
+Out of scope this arc (next): the `golomb_length_bit` /
+`golomb_data_bit` magnitude tail for coefficients above
+`NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`; the §5.11.39 driver loop
+composing all of the above into the reverse + forward-scan composite;
+§5.11.4 partition decision-tree writer; inter-arm mode_info writers
+(§5.11.18 dispatcher composite, §5.11.23 `inter_block_mode_info`).
+
 ## Status — 2026-05-28 (round 212)
 
 Round 212 lands the **first §5.11.39 coefficient-encode primitives** —
