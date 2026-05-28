@@ -2088,9 +2088,12 @@ pub enum Error {
     /// r183 the §7.12.3 step-1 dequantization (`Dequant[i][j] =
     /// Clip3(-(1 << (7 + BitDepth)), (1 << (7 + BitDepth)) - 1,
     /// sign * (|Quant[pos] * q2| & 0xFFFFFF) / dqDenom)` with
-    /// per-segment / per-plane quantizer state and the spec's
-    /// `using_qmatrix` / `Quantizer_Matrix` arm gated on §9.5.3
-    /// table transcription) wires in via `dequantize_step1`. With
+    /// per-segment / per-plane quantizer state wires in via
+    /// `dequantize_step1`; r204 lands the §9.5.3
+    /// `Quantizer_Matrix[15][2][3344]` tables in [`crate::qmatrix`]
+    /// so the `using_qmatrix && PlaneTxType < IDTX && SegQMLevel <
+    /// 15` arm now evaluates `q2 = Round2( q * Quantizer_Matrix[
+    /// ... ], 5 )` directly. With
     /// r185 the §7.12.3 step-3 frame-buffer merge
     /// (`CurrFrame[plane][y + yy][x + xx] = Clip1(... +
     /// Residual[i][j])`, including `flipLR` / `flipUD` destination

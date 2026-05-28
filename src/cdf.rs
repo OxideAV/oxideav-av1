@@ -12651,12 +12651,11 @@ where
 // Round 183 — §7.12.2 dequantization-function helpers + §7.12.3 step-1
 // dequantization. The §5.11.34 `residual()` dispatcher consumes the
 // `Dequant[i][j] = sign * (|Quant[pos] * q2| & 0xFFFFFF) / dqDenom`
-// loop these helpers compose, with `q2 = q * Quantizer_Matrix[...] /
-// 32` on the `using_qmatrix && PlaneTxType < IDTX && SegQMLevel < 15`
-// arm and `q2 = q` otherwise. The §9.5.3 `Quantizer_Matrix[][][]`
-// table itself is not yet tabulated in this crate (~30 KB), so the
-// QM arm is bypassed via the spec's `SegQMLevel >= 15` sentinel
-// path; the no-QM path covers every fixture in the corpus today.
+// loop these helpers compose, with `q2 = Round2( q * Quantizer_Matrix[
+// ... ], 5 )` on the `using_qmatrix && PlaneTxType < IDTX &&
+// SegQMLevel < 15` arm and `q2 = q` otherwise. The §9.5.3
+// `Quantizer_Matrix[][][]` table lands in [`crate::qmatrix`] (r204);
+// `dequantize_step1` reads it via `qmatrix::qmatrix_value`.
 // ---------------------------------------------------------------------
 
 /// `Dc_Qlookup[ 3 ][ 256 ]` per §7.12.2 (av1-spec p.289-290) — the
@@ -24179,10 +24178,11 @@ impl PartitionWalker {
     ///   sample buffer with `flipLR` / `flipUD` destination
     ///   remapping for the FLIPADST family and a `Clip1` envelope
     ///   per `BitDepth`. The §9.5.3
-    ///   `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table
-    ///   transcription is still pending; the `using_qmatrix &&
+    ///   `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table is LANDED
+    ///   (r204) in [`crate::qmatrix`]; the `using_qmatrix &&
     ///   plane_tx_type < IDTX && seg_qm_level < 15` arm of step-1
-    ///   currently falls through to the no-QM identity (`q2 = q`).
+    ///   now evaluates `q2 = Round2( q * Quantizer_Matrix[ ... ],
+    ///   5 )` per §7.12.3.
     /// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` /
     ///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps.
     /// * §7.12.3 step-1 `Dequant[][]` per-`(plane, pos)`
@@ -27869,10 +27869,11 @@ pub struct ResidualTuTask {
 ///   / `flipUD` destination remapping for the FLIPADST family and
 ///   a `Clip1` envelope per `BitDepth`). The per-TU `Residual[][]`
 ///   continues to be captured on [`Self::residuals`] for caller
-///   inspection. The §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]`
-///   table transcription is still pending; the `using_qmatrix &&
-///   plane_tx_type < IDTX && seg_qm_level < 15` arm of step-1 falls
-///   through to the no-QM identity (`q2 = q`).
+///   inspection. r204 wires the §9.5.3
+///   `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table from
+///   [`crate::qmatrix`]; the `using_qmatrix && plane_tx_type <
+///   IDTX && seg_qm_level < 15` arm of step-1 now evaluates
+///   `q2 = Round2( q * Quantizer_Matrix[ ... ], 5 )` per §7.12.3.
 /// * §5.11.35 `LoopfilterTxSizes[ plane ][ row ][ col ] = txSz` and
 ///   `BlockDecoded[ plane ][ row ][ col ] = 1` per-TU stamps. The
 ///   underlying walker grids are not yet allocated; the dispatcher
