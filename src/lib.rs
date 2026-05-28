@@ -1521,6 +1521,8 @@ use oxideav_core::RuntimeContext;
 mod bitreader;
 pub mod cdef;
 pub mod cdf;
+pub mod film_grain;
+mod film_grain_tables;
 pub mod frame_header;
 pub mod inter_pred;
 pub mod loop_filter;
@@ -1772,6 +1774,10 @@ pub use transform::{
 pub use cdef::{
     cdef_block, cdef_direction, cdef_filter_block, cdef_frame, constrain, CdefFrameContext,
     CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, DIV_TABLE,
+};
+pub use film_grain::{
+    add_noise_synthesis, film_grain_synthesis, generate_grain, scale_lut, scaling_lookup_init,
+    GrainArrays, RandomRegister, ScalingLut, LUMA_GRAIN_H, LUMA_GRAIN_W, MC_IDENTITY,
 };
 pub use inter_pred::{
     block_inter_prediction, block_shape, block_warp, clip1_single_ref, compound_distance_blend,

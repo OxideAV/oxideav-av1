@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 198)
+## Status — 2026-05-28 (round 199)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1626,6 +1626,77 @@ the caller hooks into the §5.11.58 decode state (`lr_type`,
 `lr_wiener`, `lr_sgr_set`, `lr_sgr_xqd`), letting the driver run
 against synthetic predicates. The §5.9.20 [`LrParams`] (r10) and
 §5.11.58 per-unit reads will plug straight into these closures.
+
+Round 199 lands the **§7.18.3 film grain synthesis** post-processing
+layer — the final stage of the AV1 decode pipeline, applied after the
+§7.17 loop restoration pass. Coverage spans the §7.18.3.1 driver,
+§7.18.3.2 LFSR random number process, §7.18.3.3 generate-grain (white
+noise + AR filter, including the chroma-from-luma cross term),
+§7.18.3.4 scaling-lookup initialisation (256-entry per-plane lookup
+tables built by piecewise linear interpolation of the §5.9.30
+`(point_*_value, point_*_scaling)` pairs), and §7.18.3.5 add-noise
+synthesis (per-stripe `noiseStripe`/`noiseImage` construction with
+`overlap_flag` X/Y blending, then the per-sample blend via
+`scale_lut` with the `cb_mult` / `cb_luma_mult` / `cb_offset` /
+`cr_mult` / `cr_luma_mult` / `cr_offset` chroma-from-luma merge and
+the `clip_to_restricted_range` ↦ `(minValue, maxLuma, maxChroma)`
+clamp). The verbatim 2048-entry `Gaussian_Sequence` from av1-spec
+p.411-414 lives in a sibling `film_grain_tables` module. The
+top-level [`film_grain_synthesis`] entry takes the parsed
+[`FilmGrainParams`] (§5.9.30, already populated by the r10 / r158
+bit-reader), frame-level `(bit_depth, num_planes, sub_x, sub_y,
+matrix_coefficients)`, and mutable [`crate::loop_filter::PlaneBuffer`]s
+for the post-LR `OutY` / `OutU` / `OutV` samples; sub-stage helpers
+[`generate_grain`], [`scaling_lookup_init`], [`add_noise_synthesis`],
+[`scale_lut`], and the [`RandomRegister`] LFSR are exposed for direct
+testing.
+
+Test count: 1058 → 1070 (+12 in lib). New `film_grain::tests`:
+
+* **`lfsr_first_three_draws_for_seed_one`** — pins the §7.18.3.2 LFSR
+  tap polynomial against the seed=1 trajectory (`r=1 ⇒ 0x8000 ⇒
+  0x4000`; 11-bit results `0x400, 0x200`).
+* **`lfsr_eight_bit_draw_matches_top_byte`** — `get_random_number(8)`
+  returns the post-shift register's high byte (seed=0xff00 ⇒ 0xff,
+  state=0xff80).
+* **`scaling_lookup_zero_num_points_is_zero_table`** —
+  `numPoints == 0` branch zero-fills all three planes.
+* **`scaling_lookup_two_point_ramp_interpolates`** — `(0,0) →
+  (255,255)` two-point ramp yields ≈x for all `x ∈ [0, 256)` after
+  the §7.18.3.4 `(65536 + deltaX/2) / deltaX` reciprocal.
+* **`scaling_lookup_left_plateau_holds`** — entries `[0,
+  point_y_value[0])` carry `point_y_scaling[0]`; the right edge
+  carries `point_y_scaling[numPoints-1]`.
+* **`generate_grain_zero_when_num_y_points_zero`** —
+  `num_y_points == 0` ⇒ `LumaGrain` is all-zero; with no chroma
+  points and no `chroma_scaling_from_luma`, `CbGrain` / `CrGrain` are
+  also all-zero. Chroma dims `(44, 38)` for 4:2:0.
+* **`generate_grain_luma_first_sample_matches_round2_of_first_gauss_draw`**
+  — first written `LumaGrain[0][0]` equals
+  `Round2(Gaussian_Sequence[LFSR.next(11)], 12 - BitDepth +
+  grain_scale_shift)`; pins the §7.18.3.3 white-noise pass.
+* **`film_grain_synthesis_no_apply_is_noop`** — `apply_grain == 0`
+  short-circuits before §7.18.3.3; planes unchanged.
+* **`film_grain_synthesis_zero_y_points_leaves_luma_unchanged`** —
+  `apply_grain == 1` but `num_y_points == 0` ⇒ ScalingLut is zero;
+  the §7.18.3.5 luma blend is gated, output unchanged; chroma blend
+  also gated by `num_cb_points == num_cr_points == 0 &&
+  !chroma_scaling_from_luma`.
+* **`scale_lut_8bit_is_direct_indexing`** — `BitDepth == 8` path is a
+  direct `ScalingLut[plane][index]` lookup.
+* **`scale_lut_10bit_interpolates`** — `BitDepth == 10` path bridges
+  two adjacent entries via `start + Round2((end - start) * rem,
+  shift)` (`table[2]=100, table[3]=200, index=9` ⇒ `125`).
+* **`film_grain_synthesis_luma_ramp_mutates_samples`** — full
+  pipeline smoke test against a 64×64 constant-128 monochrome plane
+  with `(point_y_value, point_y_scaling) = (0, 64) → (255, 64)`,
+  `grain_seed = 7`; asserts the blend mutates at least some samples
+  and all samples stay in `[0, 256)`.
+
+This completes the §7.18 output / film grain stage; §7.16 superres
+upscaling is now the lone remaining post-processing layer.
+
+The prior r198 round notes (preserved verbatim for traceability):
 
 Round 198 lands the **§7.17.2 / §7.17.3 self-guided projection arm**
 on top of the r197 driver scaffold. [`self_guided_filter`] reads the
