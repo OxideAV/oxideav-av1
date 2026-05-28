@@ -1521,6 +1521,7 @@ use oxideav_core::RuntimeContext;
 mod bitreader;
 pub mod cdef;
 pub mod cdf;
+pub mod decoder;
 pub mod encoder;
 pub mod film_grain;
 mod film_grain_tables;
@@ -2409,11 +2410,24 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Decode an AV1 elementary stream.
+/// Decode an AV1 IVF v0 buffer into a vector of decoded [`decoder::Frame`]s.
 ///
-/// Still a stub: this round only added the OBU bytestream walker.
-pub fn decode_av1(_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    Err(Error::NotImplemented)
+/// As of round 224 (arc 18) this wires together the existing decoder
+/// modules — IVF demuxer, OBU walker, sequence-header parser,
+/// frame-header parser, tile-group-OBU parser, the §5.11.4 partition
+/// tree, §5.11.5 per-leaf decoder, §5.11.39 coefficient reader, §7.12.3
+/// dequantizer, §7.13 inverse transform (lossless WHT arm), and
+/// §7.11.2.5 DC_PRED prediction — into a single pixel-out entry that
+/// inverts [`crate::encoder::encode_intra_frame_yuv`] /
+/// [`crate::encoder::encode_intra_frame_y`].
+///
+/// Arc-18 hard scope: 16×16 frame, 4:2:0 YUV (`monochrome = false`,
+/// `subsampling_x = subsampling_y = 1`), `base_q_idx = 0` (lossless
+/// WHT arm), intra-only keyframes with DC_PRED, single tile, no in-loop
+/// post-processing. Streams outside that scope return
+/// [`Error::PartitionWalkOutOfRange`].
+pub fn decode_av1(bytes: &[u8]) -> Result<Vec<decoder::Frame>, Error> {
+    decoder::decode_av1(bytes)
 }
 
 /// Encode YUV data into an AV1 elementary stream.

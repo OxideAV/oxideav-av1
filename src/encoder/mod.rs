@@ -227,7 +227,7 @@ pub use forward_quantize::forward_quantize;
 pub use forward_transform::{forward_dct_4, forward_dct_4x4};
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
-pub use ivf::IvfWriter;
+pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
 pub use obu::{
     build_temporal_unit, obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,
     ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,

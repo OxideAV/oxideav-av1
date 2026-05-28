@@ -189,6 +189,170 @@ pub fn build_frame_header(frame_size: u32, pts: u64) -> [u8; IVF_FRAME_HEADER_LE
     h
 }
 
+/// One frame demuxed from an IVF v0 file. Owns its payload bytes so
+/// callers can drop the source buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvfFrame {
+    /// 64-bit presentation timestamp in `1 / time_base` ticks per the
+    /// IVF v0 layout — see the module docs.
+    pub pts: u64,
+    /// Frame payload bytes — the encoder's §7.5 temporal-unit body
+    /// (TD + optional SH + per-frame OBU sequence) in the AV1 case.
+    pub payload: Vec<u8>,
+}
+
+/// Parsed IVF v0 file header. Construct via [`parse_file_header`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IvfFileHeader {
+    /// `version` field at bytes 4..6. The v0 layout has `version == 0`.
+    pub version: u16,
+    /// `header_length` field at bytes 6..8. The v0 layout has
+    /// `header_length == 32`.
+    pub header_length: u16,
+    /// `codec` FOURCC at bytes 8..12 (e.g. `b"AV01"`).
+    pub fourcc: [u8; 4],
+    /// `width` (pixels) at bytes 12..14.
+    pub width: u16,
+    /// `height` (pixels) at bytes 14..16.
+    pub height: u16,
+    /// `fps_num` (timebase numerator) at bytes 16..20.
+    pub fps_num: u32,
+    /// `fps_den` (timebase denominator) at bytes 20..24.
+    pub fps_den: u32,
+    /// `frame_count` at bytes 24..28. Encoders that don't track the
+    /// final count up front leave this at `0`.
+    pub frame_count: u32,
+}
+
+/// IVF v0 demuxer error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IvfReadError {
+    /// Buffer ended mid-header or mid-payload.
+    UnexpectedEnd,
+    /// File header magic was not `b"DKIF"`.
+    BadMagic,
+    /// File header `header_length` was not 32 (only the v0 layout is
+    /// supported).
+    UnsupportedHeaderLength(u16),
+    /// File header `version` was not `0`.
+    UnsupportedVersion(u16),
+}
+
+/// Parse the 32-byte IVF v0 file header. Returns the populated
+/// [`IvfFileHeader`] on success.
+pub fn parse_file_header(bytes: &[u8]) -> Result<IvfFileHeader, IvfReadError> {
+    if bytes.len() < IVF_FILE_HEADER_LEN {
+        return Err(IvfReadError::UnexpectedEnd);
+    }
+    if &bytes[0..4] != b"DKIF" {
+        return Err(IvfReadError::BadMagic);
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != 0 {
+        return Err(IvfReadError::UnsupportedVersion(version));
+    }
+    let header_length = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if header_length as usize != IVF_FILE_HEADER_LEN {
+        return Err(IvfReadError::UnsupportedHeaderLength(header_length));
+    }
+    let mut fourcc = [0u8; 4];
+    fourcc.copy_from_slice(&bytes[8..12]);
+    let width = u16::from_le_bytes([bytes[12], bytes[13]]);
+    let height = u16::from_le_bytes([bytes[14], bytes[15]]);
+    let fps_num = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let fps_den = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    let frame_count = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    Ok(IvfFileHeader {
+        version,
+        header_length,
+        fourcc,
+        width,
+        height,
+        fps_num,
+        fps_den,
+        frame_count,
+    })
+}
+
+/// IVF v0 demuxer over an in-memory buffer.
+///
+/// Reads the 32-byte file header on construction and exposes an
+/// iterator over the per-frame `(pts, payload)` records that follow.
+/// The reader retains a borrow of the underlying byte slice; the
+/// produced [`IvfFrame`] payloads are independent `Vec<u8>` copies so
+/// callers can drop the source buffer once iteration ends.
+#[derive(Debug)]
+pub struct IvfReader<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    header: IvfFileHeader,
+}
+
+impl<'a> IvfReader<'a> {
+    /// Parse the file header and position the reader at the first
+    /// per-frame record.
+    pub fn new(bytes: &'a [u8]) -> Result<Self, IvfReadError> {
+        let header = parse_file_header(bytes)?;
+        Ok(Self {
+            bytes,
+            cursor: IVF_FILE_HEADER_LEN,
+            header,
+        })
+    }
+
+    /// Parsed file header.
+    pub fn header(&self) -> &IvfFileHeader {
+        &self.header
+    }
+
+    /// Read the next frame's (pts, payload) pair. Returns `Ok(None)`
+    /// when the buffer is exhausted at a frame boundary.
+    pub fn read_next_frame(&mut self) -> Result<Option<IvfFrame>, IvfReadError> {
+        if self.cursor >= self.bytes.len() {
+            return Ok(None);
+        }
+        if self.cursor + IVF_FRAME_HEADER_LEN > self.bytes.len() {
+            return Err(IvfReadError::UnexpectedEnd);
+        }
+        let size = u32::from_le_bytes([
+            self.bytes[self.cursor],
+            self.bytes[self.cursor + 1],
+            self.bytes[self.cursor + 2],
+            self.bytes[self.cursor + 3],
+        ]) as usize;
+        let pts = u64::from_le_bytes([
+            self.bytes[self.cursor + 4],
+            self.bytes[self.cursor + 5],
+            self.bytes[self.cursor + 6],
+            self.bytes[self.cursor + 7],
+            self.bytes[self.cursor + 8],
+            self.bytes[self.cursor + 9],
+            self.bytes[self.cursor + 10],
+            self.bytes[self.cursor + 11],
+        ]);
+        let payload_start = self.cursor + IVF_FRAME_HEADER_LEN;
+        let payload_end = payload_start
+            .checked_add(size)
+            .ok_or(IvfReadError::UnexpectedEnd)?;
+        if payload_end > self.bytes.len() {
+            return Err(IvfReadError::UnexpectedEnd);
+        }
+        let payload = self.bytes[payload_start..payload_end].to_vec();
+        self.cursor = payload_end;
+        Ok(Some(IvfFrame { pts, payload }))
+    }
+
+    /// Drain every remaining frame into a `Vec<IvfFrame>`. Returns the
+    /// first read error encountered.
+    pub fn read_all(mut self) -> Result<Vec<IvfFrame>, IvfReadError> {
+        let mut out = Vec::new();
+        while let Some(frame) = self.read_next_frame()? {
+            out.push(frame);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +515,98 @@ mod tests {
         let w = IvfWriter::new(buf, FOURCC_AV01, 16, 16, 25, 1).unwrap();
         let inner = w.into_inner();
         assert_eq!(inner.len(), 32);
+    }
+
+    // --- IVF v0 reader (round 224) -------------------------------------
+
+    #[test]
+    fn parse_file_header_round_trip() {
+        let built = build_file_header(FOURCC_AV01, 320, 240, 30, 1, 7);
+        let parsed = parse_file_header(&built).expect("file header parses");
+        assert_eq!(parsed.version, 0);
+        assert_eq!(parsed.header_length as usize, IVF_FILE_HEADER_LEN);
+        assert_eq!(parsed.fourcc, FOURCC_AV01);
+        assert_eq!(parsed.width, 320);
+        assert_eq!(parsed.height, 240);
+        assert_eq!(parsed.fps_num, 30);
+        assert_eq!(parsed.fps_den, 1);
+        assert_eq!(parsed.frame_count, 7);
+    }
+
+    #[test]
+    fn parse_file_header_rejects_short_buffer() {
+        let err = parse_file_header(&[0u8; 16]).unwrap_err();
+        assert_eq!(err, IvfReadError::UnexpectedEnd);
+    }
+
+    #[test]
+    fn parse_file_header_rejects_bad_magic() {
+        let mut h = build_file_header(FOURCC_AV01, 16, 16, 25, 1, 0);
+        h[0] = b'X';
+        let err = parse_file_header(&h).unwrap_err();
+        assert_eq!(err, IvfReadError::BadMagic);
+    }
+
+    #[test]
+    fn ivf_reader_round_trips_writer_output() {
+        // Round-trip: writer → reader, three variable-length frames.
+        let mut backing = Vec::new();
+        {
+            let mut w =
+                IvfWriter::new(Cursor::new(&mut backing), FOURCC_AV01, 16, 16, 25, 1).unwrap();
+            w.write_frame(&[0xAA, 0xBB], 0).unwrap();
+            w.write_frame(&[0xCC], 5).unwrap();
+            w.write_frame(&[0xDD, 0xEE, 0xFF, 0x00, 0x11], 42).unwrap();
+            w.patch_frame_count().unwrap();
+        }
+        let r = IvfReader::new(&backing).unwrap();
+        assert_eq!(r.header().fourcc, FOURCC_AV01);
+        assert_eq!(r.header().width, 16);
+        assert_eq!(r.header().height, 16);
+        assert_eq!(r.header().frame_count, 3);
+        let frames = r.read_all().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].pts, 0);
+        assert_eq!(frames[0].payload, vec![0xAA, 0xBB]);
+        assert_eq!(frames[1].pts, 5);
+        assert_eq!(frames[1].payload, vec![0xCC]);
+        assert_eq!(frames[2].pts, 42);
+        assert_eq!(frames[2].payload, vec![0xDD, 0xEE, 0xFF, 0x00, 0x11]);
+    }
+
+    #[test]
+    fn ivf_reader_empty_buffer_returns_none() {
+        let mut backing = Vec::new();
+        {
+            let _ = IvfWriter::new(&mut backing, FOURCC_AV01, 16, 16, 25, 1).unwrap();
+        }
+        // Just a file header, no frames.
+        let mut r = IvfReader::new(&backing).unwrap();
+        assert!(r.read_next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn ivf_reader_truncated_frame_header_errors() {
+        // 32-byte header + only 6 bytes of a 12-byte frame header.
+        let mut buf = build_file_header(FOURCC_AV01, 16, 16, 25, 1, 1).to_vec();
+        buf.extend_from_slice(&[0; 6]);
+        let mut r = IvfReader::new(&buf).unwrap();
+        assert_eq!(
+            r.read_next_frame().unwrap_err(),
+            IvfReadError::UnexpectedEnd
+        );
+    }
+
+    #[test]
+    fn ivf_reader_truncated_payload_errors() {
+        // Frame header claims 10-byte payload, only 4 supplied.
+        let mut buf = build_file_header(FOURCC_AV01, 16, 16, 25, 1, 1).to_vec();
+        buf.extend_from_slice(&build_frame_header(10, 0));
+        buf.extend_from_slice(&[0u8; 4]);
+        let mut r = IvfReader::new(&buf).unwrap();
+        assert_eq!(
+            r.read_next_frame().unwrap_err(),
+            IvfReadError::UnexpectedEnd
+        );
     }
 }

@@ -2,6 +2,59 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 224)
+
+Round 224 lands the **standalone `decode_av1` public entry** that
+inverts the encoder's arc-15..17 pixel driver. This is the milestone
+arc — the encoder→decoder→pixels loop now closes via the public API.
+
+`decode_av1(&[u8]) -> Result<Vec<Frame>>` (in `crate` root, mirroring
+the existing `encode_av1` shape) demuxes IVF v0 bytes via the new
+`encoder::ivf::IvfReader`, walks every OBU through the existing
+`ObuIter` parser, then per frame:
+
+  * Reparses the §5.5.1 / §5.9.1 SH / FH bodies through
+    `parse_sequence_header` / `parse_frame_header`.
+  * Reparses the §5.11.1 tile-group body through
+    `parse_tile_group_obu_body`.
+  * Initialises a §8.2.2 `SymbolDecoder` over the tile bytes.
+  * Walks the §5.11.4 BLOCK_16X16 → BLOCK_8X8 → BLOCK_4X4 SPLIT tree
+    (mirroring the encoder's `write_partition_tree` recursion).
+  * At every BLOCK_4X4 leaf, reads the §5.11.5 per-leaf scalars
+    (`skip` / `y_mode` / `uv_mode` gated on §5.11.5 `HasChroma`).
+  * Reads the per-plane §5.11.39 `coefficients()` blocks via the
+    existing `PartitionWalker::coefficients` reader.
+  * Reconstructs each 4×4 sample buffer via §7.12.3 `dequantize_step1`
+    + §7.13 `inverse_transform_2d` (lossless WHT arm) + §7.11.2.5
+    DC_PRED prediction from the running reconstructed plane.
+
+The output is `decoder::Frame::Yuv420_16x16 { y, u, v }`. On the
+lossless arc-18 path the recovered pixels equal the encoder's input
+plane-by-plane, **byte-for-byte**.
+
+Arc-18 hard scope (matches the encoder pixel driver): 16×16 frame,
+4:2:0 YUV (`monochrome = false`, `subsampling_x = subsampling_y = 1`),
+`base_q_idx = 0` lossless WHT arm, intra-only with DC_PRED only,
+single tile, no in-loop post-processing. Streams outside that scope
+return `Error::PartitionWalkOutOfRange`.
+
+13 new lib tests (1340 → 1353): 6 IVF reader, 7 decoder pixel-driver
+(including the milestone `decode_av1_recovers_non_flat_yuv` that
+runs a non-uniform luma + gradient chroma input through encode → IVF
+bytes → `decode_av1` → bit-exact pixel recovery). 5 new integration
+tests (`tests/encode_decode_pixel_roundtrip.rs`) covering flat-grey,
+horizontal-chroma-gradient, LCG pseudo-random, 0/255 extremes, and the
+non-conformant-Y-only-encode-path rejection.
+
+Out of scope (next arc): in-loop filter pipeline exercise (LF /
+CDEF / superres / LR / film grain — they're no-ops at the arc-18
+parameter set so the decoder skips them; a next-arc fixture with
+non-zero filter levels exercises the existing decoder-side
+`loop_filter::loop_filter_frame` / `cdef::cdef_frame` / etc.); forward
+DCT for sizes 8 / 16 / 32 / 64 + ADST / FLIPADST / IDTX kernels;
+intra mode picker beyond DC_PRED; §5.11.18 inter-arm `mode_info()`
+dispatcher; intra angle / palette encode; multi-tile frames.
+
 ## Status — 2026-05-29 (round 223)
 
 Round 223 lands the **pixel-driver chroma (4:2:0 YUV) path** — the

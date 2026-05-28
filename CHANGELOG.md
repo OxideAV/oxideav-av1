@@ -6,6 +6,75 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 224 — `decode_av1` public entry + first encode→decode pixel
+  roundtrip.** The arc that closes the loop: the existing decoder
+  modules (`obu::ObuIter` / `parse_sequence_header` /
+  `parse_frame_header` / `parse_tile_group_obu_body` / the §5.11.39
+  `PartitionWalker::coefficients` reader / §7.12.3 `dequantize_step1` /
+  §7.13 `inverse_transform_2d` lossless WHT arm / §7.11.2.5
+  `predict_intra_dc_pred`) are now composed into a single public
+  pixel-out entry, `decode_av1(&[u8]) -> Result<Vec<Frame>>`, that is
+  the inverse of `encoder::encode_intra_frame_yuv` on the lossless
+  arc-17 4:2:0 YUV path.
+
+  Supporting additions:
+
+  * **`encoder::ivf::IvfReader`** — the demuxer counterpart of
+    `IvfWriter`. Parses the 32-byte v0 file header
+    (`parse_file_header` exposed standalone) and iterates per-frame
+    `(pts, payload)` records via `read_next_frame` /
+    `read_all`. Public `IvfFileHeader` / `IvfFrame` /
+    `IvfReadError` aggregates.
+  * **`decoder` module** with `decoder::pixel_driver` containing the
+    arc-18 dispatch: `decode_av1`, `decode_temporal_unit`,
+    `TemporalUnitResult`, and the `Frame::Yuv420_16x16` output
+    enum. The dispatch walks the §5.11.4 BLOCK_16X16 →
+    BLOCK_8X8 → BLOCK_4X4 SPLIT tree (mirroring the encoder's
+    `write_partition_tree`), reads the §5.11.5 per-leaf scalars
+    (`read_skip`, `y_mode` over the Size_Group ctx, `uv_mode`
+    gated on §5.11.5 `HasChroma`), and feeds the per-plane
+    `coefficients()` output through the lossless WHT inverse
+    chain plus DC_PRED reconstruction.
+  * **`decode_av1` in `lib.rs`** is now wired (was a stub returning
+    `Error::NotImplemented`). Returns `Vec<decoder::Frame>`.
+
+  Arc-18 hard scope (matches the encoder pixel driver): 16×16
+  frame, 4:2:0 YUV (`monochrome = false`, `subsampling_x =
+  subsampling_y = 1`), `base_q_idx = 0` lossless WHT arm,
+  intra-only with DC_PRED only, single tile, no in-loop
+  post-processing. Streams outside the scope return
+  `Error::PartitionWalkOutOfRange`.
+
+  **Milestone**: encoder → `decode_av1` → pixel equality is now
+  exercised end-to-end via the public API. Five integration tests
+  (`tests/encode_decode_pixel_roundtrip.rs`) cover flat-grey, a
+  horizontal-chroma-gradient, pseudo-random YUV (LCG), 0/255 extremes,
+  and the intentionally-non-conformant Y-only encode-path rejection.
+
+  13 new lib tests (1340 → 1353): 6 IVF reader tests
+  (`parse_file_header_round_trip`,
+  `parse_file_header_rejects_short_buffer`,
+  `parse_file_header_rejects_bad_magic`,
+  `ivf_reader_round_trips_writer_output`,
+  `ivf_reader_empty_buffer_returns_none`,
+  `ivf_reader_truncated_frame_header_errors`,
+  `ivf_reader_truncated_payload_errors`); 6 decoder pixel-driver
+  tests (`decode_av1_recovers_flat_grey_yuv`,
+  `decode_av1_recovers_non_flat_yuv`,
+  `decode_av1_y_only_encoder_path_emits_non_conformant_stream`,
+  `decode_av1_rejects_short_buffer`,
+  `temporal_unit_result_carries_sh_when_present`,
+  `decode_zeroed_yuv420_16x16_factory_zeros_each_plane`).
+
+  Deferred to subsequent arcs (subset of the encoder's deferred list):
+  forward DCT for sizes 8 / 16 / 32 / 64; forward ADST / FLIPADST /
+  IDTX kernels; intra mode picker beyond DC_PRED; §5.11.18 inter-arm
+  `mode_info()` dispatcher; intra angle / palette encode; multi-tile
+  frames; in-loop filter (LF / CDEF / superres / LR / film grain)
+  exercise (they are spec-correct no-ops on the arc-18 frame's
+  parameter set so the decoder skips them, but the chain itself is
+  exercised by next-arc test fixtures with non-zero filter levels).
+
 * **Round 223 — pixel-driver chroma (4:2:0 YUV) path.** New
   `encoder::pixel_driver::encode_intra_frame_yuv(input, seq, fh) ->
   EncodedFrameYuv` accepts a 16×16 luma + two 8×8 chroma planes
