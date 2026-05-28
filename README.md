@@ -2,6 +2,67 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 212)
+
+Round 212 lands the **first §5.11.39 coefficient-encode primitives** —
+the encoder counterparts to the three opening §8.2.6 `S()` reads
+inside `PartitionWalker::coefficients` (`txb_skip` / `eob_pt` /
+`dc_sign`). The larger §5.11.39 reader body (per-coefficient
+`coeff_base{_eob}` / `coeff_br` chain and the `golomb_*` magnitude
+tail) stays deferred to the follow-on arc.
+
+`encoder::coefficients` — three pure, stateless writers (re-exported
+from `encoder`):
+
+* **`write_txb_skip(writer, cdfs, all_zero, tx_sz_ctx, ctx)`** —
+  inverse of the §5.11.39 line-13 `all_zero S()` against
+  `TileTxbSkipCdf[txSzCtx][ctx]` (§8.3.2 p.371). One binary symbol.
+* **`write_eob_pt(writer, cdfs, eob, tx_size, tx_class, plane,
+  is_inter)`** — inverse of the §5.11.39 lines 19–55 EOB block: the
+  `eob_pt_{16,32,64,128,256,512,1024}` selector S() plus the optional
+  `eob_extra` S() and the raw `eob_extra_bit` L(1) loop. Solves for
+  `eobPt` from the target `eob` via the §5.11.39 line-39 base-eob
+  inverse (`eobPt = floor_log2(eob - 1) + 2` for `eob ≥ 3`), then
+  emits the `(eobPt - 2)`-bit residue MSB-first against the
+  contextual `eob_extra` row + the raw L(1) loop, in lockstep with
+  the decoder.
+* **`write_dc_sign(writer, cdfs, dc_sign, plane, ctx)`** — inverse of
+  the §5.11.39 line-564 `dc_sign S()` against
+  `TileDcSignCdf[ptype][ctx]` (§8.3.2 p.377). Caller honours the
+  `Quant[0] != 0` gate before invoking.
+
+Stateless on purpose, same surface contract as `block_mode_info`:
+every writer takes its §8.3.2 ctx values as inputs. The follow-on arc
+lands the `coeff_base{_eob}` (four- / three-symbol §9.4 alphabets) +
+`coeff_br` per-coefficient writers and the `golomb_length_bit` /
+`golomb_data_bit` magnitude tail for coefficients above
+`NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`.
+
+21 new lib tests (1180 → 1201), all bit-exact round-trips: encode
+through `SymbolWriter`, decode back through small `read_*` shims that
+mirror the §5.11.39 reader's first three `S()` reads (the full
+reader also consumes the coeff_base / coeff_br chain we don't emit
+yet). Coverage: `txb_skip ∈ {0, 1}` at `(0, 0)` and the upper grid
+`(TX_SIZES - 1, TXB_SKIP_CONTEXTS - 1)`; `eob` ∈ `{1, 2, 3, 8, 16}`
+on `TX_4X4` / `TX_8X8` (eobMultisize ∈ {0, 1}; refinement bit-widths
+0 → 3); `eob = 5` on `TX_16X16` chroma intra with `TX_CLASS_HORIZ`
+(exercising the `ptype = 1` axis + the non-`TX_CLASS_2D` ctx flip);
+`eob = 17` on `TX_32X32` inter (eobMultisize = 3); `dc_sign ∈ {0,
+1}` on luma `ctx = 0` and chroma `ctx = 2`; plus a sequenced
+`txb_skip = 0` → `eob_pt(4)` round-trip confirming §8.3 CDF
+adaptation stays in lockstep across multiple writer calls.
+Caller-bug guards (`eob = 0`, `tx_size >= TX_SIZES_ALL`,
+alphabet-overflow `eob`, out-of-range ctx/symbol) surface as
+`Error::PartitionWalkOutOfRange`.
+
+Out of scope this arc (next): per-coefficient `coeff_base{_eob}` +
+`coeff_br` writers and the `golomb_*` magnitude tail; §5.11.39
+driver loop composing all of the above with `Quant[]`-aware §8.3.2
+`get_coeff_base_ctx` / `get_coeff_base_eob_ctx` / `get_br_ctx`
+plumbing; §5.11.4 partition decision-tree writer; inter-arm
+mode_info writers (§5.11.18 dispatcher composite, §5.11.23
+`inter_block_mode_info`).
+
 ## Status — 2026-05-28 (round 211)
 
 Round 211 lands the **first per-block syntax writers** on top of the

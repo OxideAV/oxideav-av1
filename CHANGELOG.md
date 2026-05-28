@@ -6,6 +6,54 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 212 — first §5.11.39 coefficient-encode primitives.** New
+  `encoder::coefficients` module: the encoder counterparts to the
+  three "entry" §8.2.6 `S()` reads inside
+  `PartitionWalker::coefficients` (the §5.11.39 `coefficients()`
+  reader).
+
+  New public API in `encoder::coefficients` (re-exported from
+  `encoder`):
+  * `write_txb_skip(writer, cdfs, all_zero, tx_sz_ctx, ctx)` —
+    inverse of the §5.11.39 line-13 `all_zero S()` against
+    `TileTxbSkipCdf[txSzCtx][ctx]` (§8.3.2 p.371). One binary symbol.
+  * `write_eob_pt(writer, cdfs, eob, tx_size, tx_class, plane,
+    is_inter)` — inverse of the §5.11.39 lines 19–55 EOB block: the
+    `eob_pt_{16,32,64,128,256,512,1024}` selector S() plus the
+    optional `eob_extra` S() and the raw `eob_extra_bit` L(1) tail.
+    Solves for `eobPt` from the target `eob` via the §5.11.39 line-39
+    `(eobPt < 2 ? eobPt : (1 << (eobPt - 2)) + 1)` inverse, then
+    emits the `(eobPt - 2)`-bit residue MSB-first against the
+    contextual `eob_extra` row + the raw L(1) loop, in lockstep with
+    the decoder.
+  * `write_dc_sign(writer, cdfs, dc_sign, plane, ctx)` — inverse of
+    the §5.11.39 line-564 `dc_sign S()` against
+    `TileDcSignCdf[ptype][ctx]` (§8.3.2 p.377). Caller honours the
+    `Quant[0] != 0` gate before invoking.
+
+  Stateless on purpose, same pattern as `block_mode_info`: every
+  writer takes its §8.3.2 ctx values as inputs. The follow-on arc
+  lands `coeff_base{_eob}` + `coeff_br` (the four- / three-symbol
+  per-coefficient alphabets) and the `golomb_length_bit` /
+  `golomb_data_bit` magnitude tail.
+
+  21 new lib tests (1180 → 1201), all bit-exact round-trips: encode
+  through `SymbolWriter`, decode back through small `read_*` shims
+  that mirror the §5.11.39 reader's first three `S()` reads (the
+  full reader also reads the coeff_base / coeff_br chain we don't
+  emit yet). Coverage includes `txb_skip ∈ {0, 1}` at `(0, 0)` and
+  the upper grid `(TX_SIZES - 1, TXB_SKIP_CONTEXTS - 1)`, `eob` ∈
+  `{1, 2, 3, 8, 16}` on `TX_4X4` / `TX_8X8` (eobMultisize ∈ {0, 1};
+  refinement bit-widths 0 → 3), `eob = 5` on `TX_16X16` chroma intra
+  with `TX_CLASS_HORIZ` (exercising the `ptype = 1` axis + the
+  non-`TX_CLASS_2D` ctx flip), `eob = 17` on `TX_32X32` inter
+  (eobMultisize = 3), `dc_sign ∈ {0, 1}` on luma `ctx = 0` and
+  chroma `ctx = 2`, plus a sequenced `txb_skip = 0` → `eob_pt(4)`
+  round-trip confirming §8.3 CDF adaptation stays in lockstep across
+  multiple writer calls. Caller-bug guards (`eob = 0`, `tx_size >=
+  TX_SIZES_ALL`, alphabet-overflow `eob`, out-of-range ctx/symbol)
+  surface as `Error::PartitionWalkOutOfRange`.
+
 * **Round 211 — first per-block syntax writers (intra arm).** New
   `encoder::block_mode_info` module: pure stateless writers covering
   the §5.11.7 / §5.11.8 / §5.11.11 / §5.11.22 syntax elements an
