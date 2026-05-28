@@ -1521,6 +1521,7 @@ use oxideav_core::RuntimeContext;
 mod bitreader;
 pub mod cdef;
 pub mod cdf;
+pub mod encoder;
 pub mod film_grain;
 mod film_grain_tables;
 pub mod frame_header;

@@ -1,0 +1,45 @@
+//! Encoder side of the crate.
+//!
+//! Arc 1 (round 206) scope: the bit-output plumbing only.
+//!
+//! Three layers land here:
+//!
+//!   * [`bitwriter::BitWriter`] — MSB-first bit-output buffer, the
+//!     inverse of [`crate::bitreader::BitReader`] (§8.1 `read_bit`),
+//!     plus a `write_leb128()` helper for the byte-aligned §4.10.5
+//!     `leb128()` size field that the OBU framer emits.
+//!
+//!   * [`obu`] — Open Bitstream Unit framer per §5.3. Writes the
+//!     §5.3.2 one-byte `obu_header`, the optional §5.3.3
+//!     `obu_extension_header`, and the optional `leb128()`
+//!     `obu_size` size field for the §5.2 low-overhead bytestream
+//!     format. Concatenation of multiple OBUs into a temporal unit
+//!     is byte-aligned and simply uses [`ObuWriter::write`] N times.
+//!
+//!   * [`sequence_obu`] — `sequence_header_obu()` writer per §5.5.1
+//!     (with §5.5.2 `color_config`, §5.5.3 `timing_info`, §5.5.4
+//!     `decoder_model_info`, §5.5.5 `operating_parameters_info`).
+//!     The inverse of [`crate::sequence_header::parse_sequence_header`].
+//!     Reuses the same [`crate::sequence_header::SequenceHeader`]
+//!     struct as the source-of-truth descriptor, so a written
+//!     payload immediately round-trips through the parser.
+//!
+//!   * [`ivf`] — IVF v0 container writer (32-byte file header + 12-
+//!     byte per-frame header) for shipping the encoded OBU temporal
+//!     units into a playable file. IVF is a trivial public file
+//!     format developed for VP8 testing; the byte layout used here
+//!     matches the `.ivf` fixtures already in `docs/video/av1/
+//!     fixtures/`.
+//!
+//! No frame-header writer, no tile encoder, no coefficient encoder
+//! yet — those are subsequent arcs.
+
+pub mod bitwriter;
+pub mod ivf;
+pub mod obu;
+pub mod sequence_obu;
+
+pub use bitwriter::BitWriter;
+pub use ivf::IvfWriter;
+pub use obu::{ObuExtensionHeader, ObuHeader, ObuWriter};
+pub use sequence_obu::write_sequence_header_obu;

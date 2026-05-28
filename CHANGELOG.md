@@ -6,6 +6,47 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 206 — encoder bootstrap (arc 1: bit-output plumbing).**
+  New `crate::encoder` module groups three writers covering the
+  byte-aligned framing layers above any future coefficient/tile
+  encode work:
+  * `encoder::bitwriter::BitWriter` — MSB-first bit-output buffer,
+    the inverse of `crate::bitreader::BitReader` (§8.1 `read_bit`).
+    Primitives: `write_bit`, `write_bits(n, value)` (inverse of
+    §4.10.2 `f(n)`), `write_leb128(value)` (inverse of §4.10.5
+    `leb128()`, with the same `(1 << 32) - 1` cap), `byte_align`,
+    `leb128_size`, `finish`.
+  * `encoder::obu` — `ObuHeader` / `ObuExtensionHeader` / `ObuWriter`
+    plus the free `write_obu()` function emitting the §5.3.2
+    `obu_header`, optional §5.3.3 `obu_extension_header`, and the
+    §5.3.1 / §4.10.5 `obu_size` leb128 for the §5.2 low-overhead
+    bytestream format. Multiple OBUs concatenate as the byte-aligned
+    stream the parser's `ObuIter` walks.
+  * `encoder::sequence_obu::write_sequence_header_obu` —
+    `sequence_header_obu()` payload writer per §5.5.1 (with §5.5.2
+    `color_config`, §5.5.3 `timing_info`, §5.5.4
+    `decoder_model_info`, §5.5.5 `operating_parameters_info`).
+    Reuses the parser's `crate::sequence_header::SequenceHeader`
+    struct as source-of-truth descriptor, so every encoder output
+    round-trips through `parse_sequence_header` byte-for-byte
+    (modulo the `bits_consumed` field which is parse-side
+    bookkeeping).
+  * `encoder::ivf` — IVF v0 container writer (`IvfWriter<W: Write>`
+    + free `build_file_header` / `build_frame_header` helpers).
+    Trivial public file format byte layout (32-byte file header +
+    12-byte per-frame header, all little-endian) is documented
+    inline at module level. `patch_frame_count` available when the
+    sink is `Seek`. Byte-for-byte exact against the
+    `tiny-i-only-16x16-prof0/input.ivf` fixture file header.
+
+  +43 tests (1065 → 1108 lib): 8 BitWriter, 7 OBU, 9 IVF, 19
+  sequence-OBU (including round-trips through the decoder for
+  reduced-still-picture, monochrome, profile-2 4:2:2 12-bit,
+  multi-operating-point, timing+decoder-model, color description,
+  frame-id-numbers, screen-content-tools toggles). No
+  `frame_header_obu` / tile / coefficient encode yet — subsequent
+  arcs. `encode_av1` continues to return `Error::NotImplemented`.
+
 * **Round 205 — §7.10.2.5 temporal scan + §7.10.2.6 temporal
   sample wired into `find_mv_stack`; §7.9 motion-field
   estimation helpers landed.** The r172 `TemporalMvScanUnsupported`

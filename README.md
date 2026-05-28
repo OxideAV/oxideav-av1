@@ -2,6 +2,66 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 206)
+
+Round 206 opens the **encoder side** of the crate. Arc 1 lands the
+bit-output plumbing only — no encode decisions yet. New
+`crate::encoder` module ships four writers:
+
+* **`encoder::bitwriter::BitWriter`** — MSB-first bit-output buffer
+  (inverse of `crate::bitreader::BitReader` from §8.1). Primitives:
+  `write_bit`, `write_bits(n, value)` (inverse of §4.10.2 `f(n)`),
+  `write_leb128(value)` (inverse of §4.10.5 `leb128()`, with the
+  same `(1 << 32) - 1` conformance cap), `byte_align`,
+  `leb128_size`, `finish`.
+* **`encoder::obu::{ObuHeader, ObuExtensionHeader, ObuWriter,
+  write_obu}`** — §5.3 OBU framer. One-byte §5.3.2 `obu_header`
+  (with `obu_forbidden_bit == 0`, 4-bit `obu_type`,
+  `obu_extension_flag`, `obu_has_size_field`, reserved low bit) +
+  optional one-byte §5.3.3 `obu_extension_header` (3-bit
+  `temporal_id`, 2-bit `spatial_id`, 3 reserved bits) + optional
+  §5.3.1 / §4.10.5 `obu_size` leb128 prefix for the §5.2
+  low-overhead bytestream format. Multi-OBU temporal units are
+  byte-aligned concatenations the parser's `ObuIter` walks.
+* **`encoder::sequence_obu::write_sequence_header_obu(&SequenceHeader)
+  -> Vec<u8>`** — `sequence_header_obu()` payload writer per §5.5.1
+  (with §5.5.2 `color_config`, §5.5.3 `timing_info`, §5.5.4
+  `decoder_model_info`, §5.5.5 `operating_parameters_info`).
+  Reuses the parser's `crate::sequence_header::SequenceHeader` as
+  the source-of-truth descriptor; every output round-trips through
+  `parse_sequence_header` byte-for-byte (the decoder is the oracle).
+* **`encoder::ivf::IvfWriter<W: Write>`** — IVF v0 container
+  writer. Trivial public file format: 32-byte file header (`DKIF`
+  magic, `version=0`, `header_length=32`, codec FOURCC,
+  `u16 width / height`, `u32 fps_num / fps_den`, `u32 frame_count`,
+  4 unused bytes) + per-frame 12-byte header (`u32 size + u64
+  pts`). `patch_frame_count` available when the sink is `Seek`.
+  File-header bytes match the `tiny-i-only-16x16-prof0/input.ivf`
+  fixture exactly.
+
+43 new tests (1065 → 1108 lib): 8 BitWriter (MSB packing, n=0
+no-op, byte_align padding, leb128 single/multi-byte +
+round-trip-against-parser, 64-bit width), 7 OBU framer (byte-exact
+TD, round-trip through parser for every `ObuType`, multi-OBU walk,
+extension-header byte layout, reserved-type pass-through, multi-byte
+leb128 size), 9 IVF (file-header byte-exact vs fixture, frame-header
+byte-exact, single-frame layout, multi-frame pts round-trip,
+patch_frame_count, empty-payload frame, FOURCC constants,
+`into_inner`), 19 sequence-OBU round-trip (tiny 16×16 profile-0,
+monochrome, profile-2 4:2:2 12-bit, reduced-still-picture, timing
+info with equal-picture-interval, timing+decoder-model+operating-
+parameters, multi-operating-point with seq_level_idx>7 tier bit,
+initial-display-delay, color description present, frame-id-numbers,
+seq_force_screen_content_tools=0, explicit force_integer_mv,
+order-hint disabled, uvlc round-trip across decade-scale values +
+sentinel).
+
+No `frame_header_obu` writer, no tile encode, no coefficient
+encode yet — those are subsequent arcs. The crate's `encode_av1`
+public entry continues to return `Error::NotImplemented`; the
+encoder is wired up at the framing layer but the actual encode
+decisions still need to land.
+
 ## Status — 2026-05-28 (round 205)
 
 Round 205 closes the last documented §7.10.2 driver gap by wiring
