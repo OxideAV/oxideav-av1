@@ -161,6 +161,20 @@
 //! truncating divide; bit-exact roundtrip on the lossless
 //! `q_index = 0` lattice and within one quantization step elsewhere.
 //!
+//! Arc 17 (round 223) extends the pixel driver to **4:2:0 YUV input**
+//! via [`pixel_driver::encode_intra_frame_yuv`]. The chroma walk mirrors
+//! the luma side: DC_PRED from the running reconstructed chroma plane,
+//! forward WHT (lossless arm), forward quantize, write_coefficients per
+//! plane. Per §5.11.5 `HasChroma` at 4:2:0 / BLOCK_4X4 the chroma
+//! coefficient pass fires only on luma cells `(1,1), (1,3), (3,1),
+//! (3,3)` (the SE corner of each 8×8 luma quadrant), so each chroma
+//! 4×4 block is emitted exactly once. The same `(SequenceHeader,
+//! FrameHeader)` pair feeds both Y-only and YUV entry points — the
+//! tiny-i-only-16x16-prof0 fixture is `monochrome = false` /
+//! subsampling_x = subsampling_y = 1 already. Every chroma plane
+//! round-trips pixel-for-pixel at `base_q_idx = 0` on arbitrary
+//! inputs (lossless WHT chain).
+//!
 //! Arc 16 (round 222) lands the **forward 4×4 Walsh-Hadamard transform**
 //! in [`forward_wht`]: 1D [`forward_wht::forward_wht4`] and 2D
 //! [`forward_wht::forward_wht_4x4`]. Derived clean-room by inverting
@@ -223,8 +237,9 @@ pub use partition_tree::{
     write_partition_tree, EncodeBlock, EncodeNode, PartitionTreeWriter, PlaneCoefficients,
 };
 pub use pixel_driver::{
-    dispatch_order_cells, encode_intra_frame_y, CellCoord, EncodedFrame, CELLS_HIGH, CELLS_WIDE,
-    FRAME_HEIGHT, FRAME_WIDTH, MI_COLS, MI_ROWS,
+    dispatch_order_cells, encode_intra_frame_y, encode_intra_frame_yuv, CellCoord, EncodedFrame,
+    EncodedFrameYuv, Yuv420Frame16x16, CELLS_HIGH, CELLS_WIDE, CHROMA_CELLS_HIGH,
+    CHROMA_CELLS_WIDE, CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH, MI_COLS, MI_ROWS,
 };
 pub use sequence_obu::write_sequence_header_obu;
 pub use symbol_writer::SymbolWriter;

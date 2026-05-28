@@ -6,6 +6,43 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 223 — pixel-driver chroma (4:2:0 YUV) path.** New
+  `encoder::pixel_driver::encode_intra_frame_yuv(input, seq, fh) ->
+  EncodedFrameYuv` accepts a 16×16 luma + two 8×8 chroma planes
+  (`Yuv420Frame16x16`) and returns IVF bytes plus all three
+  reconstructed planes. The chroma walk mirrors the luma side:
+  §7.11.2.5 DC_PRED (built from the running reconstructed chroma plane),
+  forward WHT (lossless arm), forward quantize (plane = 1 / 2), inverse
+  chain for the reconstruction. Per §5.11.5 `HasChroma` at 4:2:0 /
+  BLOCK_4X4 with `bw4 == bh4 == 1`, chroma coefficients fire only on
+  luma cells whose `MiRow` and `MiCol` are both odd ⇒ exactly four
+  chroma 4×4 blocks per 16×16 frame, hung off the SE corner of each
+  8×8 luma quadrant.
+
+  The same `(SequenceHeader, FrameHeader)` pair feeds both Y-only and
+  YUV entry points — the `tiny-i-only-16x16-prof0` fixture is already
+  `monochrome = false` / `subsampling_x = subsampling_y = 1`, so the
+  difference between the two paths is entirely in the per-block
+  coefficient stream (and the leaf's `uv_mode` slot). End-to-end the
+  encoder reconstructs **arbitrary 4:2:0 YUV inputs pixel-for-pixel on
+  every plane** at `base_q_idx = 0` (lossless WHT chain on Y / U / V).
+
+  New public surface: `Yuv420Frame16x16`, `EncodedFrameYuv`,
+  `encode_intra_frame_yuv`, plus chroma constants `CHROMA_WIDTH`,
+  `CHROMA_HEIGHT`, `CHROMA_CELLS_WIDE`, `CHROMA_CELLS_HIGH`. Re-exported
+  from `oxideav_av1::encoder`.
+
+  15 new tests (1329 → 1340 lib, 6 → 10 integration): chroma-cell
+  dispatch (`has_chroma_cells_are_se_corners_of_each_8x8_quadrant`,
+  `cell_to_chroma_block_maps_se_corners_to_chroma_grid`); per-plane
+  flat-128 zero-quant + bit-exact reconstruction; non-flat chroma
+  lossless roundtrip (flat-64 U + flat-192 V); chroma horizontal
+  gradient; pseudo-random YUV roundtrip; YUV tile-group payload
+  strictly larger than Y-only for the same luma input (proof the
+  chroma syntax reaches the bitstream); YUV-with-flat-chroma luma walk
+  equals Y-only-driver luma walk; SH / FH OBU reparse equality on the
+  YUV path.
+
 * **Round 222 — forward Walsh-Hadamard transform (lossless milestone).**
   Encoder counterpart of the §7.13.2.10 inverse WHT used by the §7.13.3
   `Lossless` arm. New module `encoder::forward_wht` exposes

@@ -2,6 +2,55 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 223)
+
+Round 223 lands the **pixel-driver chroma (4:2:0 YUV) path** — the
+encoder now consumes a full 16×16 luma + two 8×8 chroma planes via
+`encoder::pixel_driver::encode_intra_frame_yuv(&Yuv420Frame16x16, seq,
+fh) -> EncodedFrameYuv`. The chroma walk mirrors the luma side:
+DC_PRED from the running reconstructed chroma plane, forward WHT
+(lossless arm), `forward_quantize` with `plane = 1` / `plane = 2`,
+then the inverse chain (`dequantize_step1` + `inverse_transform_2d`
+with `lossless = true`) for the encoder-internal reconstruction.
+
+Chroma coefficient emission follows §5.11.5 `HasChroma`: at 4:2:0 with
+`bw4 == bh4 == 1`, chroma fires only on luma cells whose `MiRow` and
+`MiCol` are both odd. In a 4×4 mi grid that's the four cells `(1,1)`,
+`(1,3)`, `(3,1)`, `(3,3)` — the SE corner of each 8×8 luma quadrant
+— covering exactly the four chroma 4×4 blocks of the 8×8 chroma plane.
+Non-chroma luma leaves pass `uv_mode = None` to the §5.11.4 driver, so
+the decoder's parallel `HasChroma` walk derives the same boolean and
+never expects a chroma coefficient block at those positions.
+
+The same `(SequenceHeader, FrameHeader)` pair feeds both Y-only and
+YUV entry points — the `tiny-i-only-16x16-prof0` fixture is already
+`monochrome = false` / `subsampling_x = subsampling_y = 1`. The
+difference between the two paths is entirely in the per-block
+coefficient stream and the leaf's `uv_mode` slot. End-to-end the
+encoder reconstructs **arbitrary 4:2:0 YUV input pixel-for-pixel on
+every plane** at `base_q_idx = 0` (lossless WHT chain on Y / U / V).
+
+New public surface (re-exported from `encoder`): `Yuv420Frame16x16`,
+`EncodedFrameYuv`, `encode_intra_frame_yuv`, plus chroma constants
+`CHROMA_WIDTH = 8`, `CHROMA_HEIGHT = 8`, `CHROMA_CELLS_WIDE = 2`,
+`CHROMA_CELLS_HIGH = 2`.
+
+15 new tests (1329 → 1340 lib, 6 → 10 integration): chroma-cell
+dispatch coverage (the four SE-corner positions appear at dispatch
+indices `[3, 7, 11, 15]`), per-plane flat-128 zero-quant + bit-exact
+reconstruction, non-flat chroma lossless roundtrip (flat-64 U +
+flat-192 V), horizontal chroma gradient, pseudo-random YUV roundtrip,
+YUV tile-group payload strictly larger than the Y-only encode for the
+same luma input (proof the chroma syntax actually reaches the
+bitstream), YUV-with-flat-chroma luma walk equals the Y-only luma
+walk, and SH / FH OBU reparse equality on the YUV path.
+
+Out of scope (next arc): the standalone `decode_av1` entry that wires
+the existing decoder modules back into a full pipeline; forward DCT
+for TX sizes 8 / 16 / 32 / 64 + ADST / FLIPADST / IDTX kernels; intra
+mode picker beyond DC_PRED; §5.11.18 inter-arm `mode_info()`
+dispatcher; intra angle / palette encode.
+
 ## Status — 2026-05-28 (round 222)
 
 Round 222 lands the **forward 4×4 Walsh-Hadamard transform** — the

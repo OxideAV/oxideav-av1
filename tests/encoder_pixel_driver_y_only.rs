@@ -30,10 +30,13 @@
 //!     row/column kernel, which has no encoder counterpart yet).
 //!     Lossless input/output equivalence at non-mid-grey inputs needs
 //!     a forward WHT primitive landed in a subsequent arc.
-//!   * Chroma planes — this arc is monochrome luma only.
+//!   * (r221 only) Chroma planes. r223 added the YUV path —
+//!     [`encode_intra_frame_yuv`] is covered by the
+//!     `yuv_encode_*` test cases below.
 
 use oxideav_av1::encoder::pixel_driver::{
-    encode_intra_frame_y, internal_roundtrip, EncodedFrame, FRAME_HEIGHT, FRAME_WIDTH,
+    encode_intra_frame_y, encode_intra_frame_yuv, internal_roundtrip, EncodedFrame,
+    EncodedFrameYuv, Yuv420Frame16x16, CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH,
 };
 use oxideav_av1::frame_header::parse_frame_header;
 use oxideav_av1::obu::{ObuIter, ObuType};
@@ -125,6 +128,109 @@ fn pixel_driver_internal_helper_matches_driver_reconstruction() {
     let result = encode_flat_128_frame();
     let recon = internal_roundtrip::reconstruct_from_quants(&result.committed_quants);
     assert_eq!(recon, result.reconstructed_y);
+}
+
+// ---------------------------------------------------------------------
+// Round 223 — chroma (YUV 4:2:0) integration coverage.
+// ---------------------------------------------------------------------
+
+fn encode_flat_128_yuv_frame() -> EncodedFrameYuv {
+    let seq = parse_sequence_header(TINY_SEQ_PAYLOAD).unwrap();
+    let fh = parse_frame_header(TINY_FRAME_PAYLOAD, &seq).unwrap();
+    let input = Yuv420Frame16x16::default();
+    encode_intra_frame_yuv(&input, &seq, &fh).expect("encode succeeds")
+}
+
+#[test]
+fn pixel_driver_yuv_flat_128_input_reconstructs_bit_exact_on_every_plane() {
+    let result = encode_flat_128_yuv_frame();
+    for i in 0..FRAME_HEIGHT {
+        for j in 0..FRAME_WIDTH {
+            assert_eq!(result.reconstructed_y[i][j], 128);
+        }
+    }
+    for i in 0..CHROMA_HEIGHT {
+        for j in 0..CHROMA_WIDTH {
+            assert_eq!(result.reconstructed_u[i][j], 128);
+            assert_eq!(result.reconstructed_v[i][j], 128);
+        }
+    }
+}
+
+#[test]
+fn pixel_driver_yuv_flat_128_committed_quants_zero_on_every_plane() {
+    let result = encode_flat_128_yuv_frame();
+    assert_eq!(result.committed_quants_y.len(), 16);
+    assert_eq!(result.committed_quants_u.len(), 4);
+    assert_eq!(result.committed_quants_v.len(), 4);
+    for q in result.committed_quants_y.iter() {
+        for &v in q {
+            assert_eq!(v, 0);
+        }
+    }
+    for q in result.committed_quants_u.iter() {
+        for &v in q {
+            assert_eq!(v, 0);
+        }
+    }
+    for q in result.committed_quants_v.iter() {
+        for &v in q {
+            assert_eq!(v, 0);
+        }
+    }
+}
+
+#[test]
+fn pixel_driver_yuv_lossless_pseudorandom_roundtrips_bit_exact() {
+    // Lossless WHT chain ⇒ arbitrary 4:2:0 input round-trips
+    // pixel-for-pixel on every plane at base_q_idx = 0.
+    let seq = parse_sequence_header(TINY_SEQ_PAYLOAD).unwrap();
+    let fh = parse_frame_header(TINY_FRAME_PAYLOAD, &seq).unwrap();
+    let mut input = Yuv420Frame16x16 {
+        y: [[0u8; FRAME_WIDTH]; FRAME_HEIGHT],
+        u: [[0u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+        v: [[0u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    };
+    let mut state: u64 = 0xCAFE_BABE_DEAD_BEEF;
+    let step = |state: &mut u64| -> u8 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 56) as u8
+    };
+    for row in input.y.iter_mut() {
+        for cell in row.iter_mut() {
+            *cell = step(&mut state);
+        }
+    }
+    for row in input.u.iter_mut() {
+        for cell in row.iter_mut() {
+            *cell = step(&mut state);
+        }
+    }
+    for row in input.v.iter_mut() {
+        for cell in row.iter_mut() {
+            *cell = step(&mut state);
+        }
+    }
+    let result = encode_intra_frame_yuv(&input, &seq, &fh).expect("encode succeeds");
+    assert_eq!(result.reconstructed_y, input.y);
+    assert_eq!(result.reconstructed_u, input.u);
+    assert_eq!(result.reconstructed_v, input.v);
+}
+
+#[test]
+fn pixel_driver_yuv_ivf_bytes_walk_back_as_td_sh_fh_tg() {
+    let result = encode_flat_128_yuv_frame();
+    assert_eq!(&result.ivf_bytes[0..4], b"DKIF");
+    let descs: Vec<_> = ObuIter::new(&result.temporal_unit_bytes)
+        .collect::<Result<_, _>>()
+        .expect("OBU walk succeeds");
+    assert_eq!(descs.len(), 4);
+    assert_eq!(descs[0].obu_type, ObuType::TemporalDelimiter);
+    assert_eq!(descs[1].obu_type, ObuType::SequenceHeader);
+    assert_eq!(descs[2].obu_type, ObuType::FrameHeader);
+    assert_eq!(descs[3].obu_type, ObuType::TileGroup);
 }
 
 #[test]
