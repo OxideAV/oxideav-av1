@@ -2,6 +2,76 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 226)
+
+Round 226 rounds out the **forward 1D/2D non-DCT transform menu**:
+forward ADST + FLIPADST for sizes `4 / 8 / 16` (the spec's full
+ADST coverage — §7.13.2.6/7/8 only define inverses up to `n = 4`)
+and forward IDTX (identity) for sizes `4 / 8 / 16 / 32`. Combined
+with r225's forward DCT for sizes 4..64 and r222's forward WHT for
+size 4, the encoder can now compute coefficients for **every
+`tx_type` × `tx_sz` square pair** the §7.13 inverse stack covers —
+the per-block RD search has the full transform vocabulary to choose
+from.
+
+New entry points (1D):
+
+  * `encoder::forward_adst_4(&mut [i64], r)` /
+    `forward_adst_8` / `forward_adst_16`
+  * `encoder::forward_flipadst_4(&mut [i64], r)` /
+    `forward_flipadst_8` / `forward_flipadst_16`
+  * `encoder::forward_idtx_4(&mut [i64])` /
+    `forward_idtx_8` / `forward_idtx_16` / `forward_idtx_32`
+
+Matching 2D square primitives:
+
+  * `encoder::forward_adst_4x4` / `_8x8` / `_16x16`
+  * `encoder::forward_flipadst_4x4` / `_8x8` / `_16x16`
+  * `encoder::forward_idtx_4x4` / `_8x8` / `_16x16` /
+    `forward_idtx_32x32` (`Vec<i64>` return for the 1024-cell case)
+
+Derivation (clean-room, generalising r225). The §7.13.2 inverse
+ADST for `n in 2..=4` is a fixed integer linear map approximated by
+the butterfly schedule; the forward ADST is the matrix transpose,
+built once per size by probing `inverse_adst` on each of the `N`
+unit-coefficient basis inputs and caching the resulting `N * N`
+response matrix in a `std::sync::OnceLock`. Per-call cost is then
+a single `O(N^2)` inner product per output coefficient.
+
+FLIPADST shares the **same butterfly kernel** as ADST — per §7.13.3
+the flip is applied externally during the §7.12.3 frame-buffer
+write. The encoder mirror reverses the residual before the forward
+ADST kernel runs and reverses the output coefficient cells back; the
+2D `forward_flipadst_NxN` does this on both axes (the
+FLIPADST_FLIPADST `tx_type`). Callers driving the per-axis FLIP
+arms (V_FLIPADST, H_FLIPADST, ADST_FLIPADST, FLIPADST_ADST) compose
+`forward_adst_N` per axis with the matching per-axis reverse.
+
+IDTX uses the same matrix-cache machinery (which collapses to a
+scalar for the diagonal identity map): `forward_idtx_4` per cell is
+`Round2(5793 * in, 12)`, `_8` is `2 * in` exactly, `_16` is
+`Round2(11586 * in, 12)`, `_32` is `4 * in` exactly. The 2D
+forms are the per-axis composition, equivalent to a single
+combined scalar multiply per cell (`forward_idtx_8x8` per cell =
+`4 * in`, `_32x32` per cell = `16 * in`).
+
+44 new lib tests (1375 → 1419). Coverage: zero-input identity per
+each 1D and 2D primitive; per-cell scalar values for IDTX matched
+against the spec multipliers; `inverse(forward(x))` roundtrip on
+flat-DC and LCG-pseudo-random inputs for ADST (within a bounded
+per-cell Round2 noise floor); the FLIPADST convention proven via
+`forward_flipadst_N(x) == reverse(forward_adst_N(reverse(x)))` and
+the 2D `forward_flipadst_NxN(x) ==
+double_reverse(forward_adst_NxN(double_reverse(x)))` lockstep.
+
+Out of scope (next arc): the §7.13.3-equivalent **forward 2D
+dispatcher** with row-/col-shift envelope (the inverse direction's
+`Round2(_, rowShift)` / `Round2(_, colShift)` glue plus the
+`Abs(log2W - log2H) == 1` rectangular post-scale by 2896) and the
+rectangular block sizes (`TX_4X8` / `TX_8X16` / … / `TX_32X64`);
+intra mode picker beyond DC_PRED; §5.11.18 inter-arm `mode_info()`
+dispatcher.
+
 ## Status — 2026-05-29 (round 225)
 
 Round 225 lands the **forward DCT for the four remaining spec sizes

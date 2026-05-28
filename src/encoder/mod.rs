@@ -188,9 +188,25 @@
 //! (`base_q_idx == 0 && DeltaQ?? all zero`), unlocking pixel-perfect
 //! roundtrip on arbitrary inputs at `base_q_idx = 0`.
 //!
+//! Arc 19 (round 226) lands the **forward ADST / FLIPADST / IDTX**
+//! primitives in [`forward_adst`] and [`forward_identity`]. Same
+//! matrix-cache recipe as r225's forward DCT: the §7.13.2.6/7/8
+//! inverse ADST is a fixed integer linear map for `n in 2..=4` and
+//! the §7.13.2.11..§7.13.2.14 inverse identity is a per-cell scalar
+//! map for `n in 2..=5`; the forward kernels are the algebraic
+//! transposes (matrix transpose for ADST, scalar transpose-=-self
+//! for the diagonal IDTX). FLIPADST reuses the ADST kernel and
+//! applies the involutory reverse on the residual input — per
+//! §7.13.3 the flip is purely a coordinate transform on the frame-
+//! buffer write, NOT a separate butterfly. This rounds out the menu
+//! of forward 1D/2D primitives the encoder needs to consider when
+//! picking `tx_type` per block; the §7.13.3-equivalent forward 2D
+//! dispatcher with row-/col-shift envelope is the next arc.
+//!
 //! Next arc: pixel-driver chroma path (needs frame-header build with
-//! `monochrome = false`); forward DCT for sizes 8 / 16 / 32 / 64;
-//! forward ADST / FLIPADST / IDTX; standalone `decode_av1` entry that
+//! `monochrome = false`); §7.13.3-equivalent forward 2D dispatcher
+//! with row-/col-shift envelope; rectangular block sizes (`TX_4X8`
+//! / `TX_8X16` / … / `TX_32X64`); standalone `decode_av1` entry that
 //! wires the existing decoder modules into a full pipeline. §5.11.18
 //! inter-arm `mode_info()` dispatcher; intra angle / palette encode.
 //! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24
@@ -200,6 +216,8 @@
 pub mod bitwriter;
 pub mod block_mode_info;
 pub mod coefficients;
+pub mod forward_adst;
+pub mod forward_identity;
 pub mod forward_quantize;
 pub mod forward_transform;
 pub mod forward_wht;
@@ -222,6 +240,15 @@ pub use block_mode_info::{
 pub use coefficients::{
     write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,
     write_eob_pt, write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
+};
+pub use forward_adst::{
+    forward_adst_16, forward_adst_16x16, forward_adst_4, forward_adst_4x4, forward_adst_8,
+    forward_adst_8x8, forward_flipadst_16, forward_flipadst_16x16, forward_flipadst_4,
+    forward_flipadst_4x4, forward_flipadst_8, forward_flipadst_8x8,
+};
+pub use forward_identity::{
+    forward_idtx_16, forward_idtx_16x16, forward_idtx_32, forward_idtx_32x32, forward_idtx_4,
+    forward_idtx_4x4, forward_idtx_8, forward_idtx_8x8,
 };
 pub use forward_quantize::forward_quantize;
 pub use forward_transform::{

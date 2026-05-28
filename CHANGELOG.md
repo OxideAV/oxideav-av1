@@ -6,6 +6,35 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 226 — forward ADST / FLIPADST / IDTX primitives.** Lands the
+  forward 1D and 2D non-DCT transform kernels: forward ADST for sizes
+  `4 / 8 / 16` (the spec's full ADST coverage per §7.13.2.6/7/8),
+  forward FLIPADST for the same sizes, and forward IDTX (identity)
+  for sizes `4 / 8 / 16 / 32`. New API: `encoder::forward_adst_4` /
+  `_8` / `_16` (1D) + `forward_adst_4x4` / `_8x8` / `_16x16` (2D);
+  the matching `encoder::forward_flipadst_*` and `forward_idtx_*`
+  entry points.
+
+  Derivation generalises r225's matrix-cache recipe: the inverse
+  ADST is a fixed integer linear map for each `n`, the forward is
+  the algebraic transpose built once per size by probing the inverse
+  on unit-coefficient basis inputs and caching the response matrix
+  in a `OnceLock`. FLIPADST shares the same butterfly kernel as ADST
+  per §7.13.3 — the flip is purely a coordinate transform on the
+  frame-buffer write — so `forward_flipadst_*` reverses the residual
+  before the forward ADST kernel and reverses the output coefficient
+  cells back. IDTX is a diagonal scalar map: `forward_idtx_4` is
+  `Round2(5793 * in, 12)`, `_8` is `2 * in` exactly, `_16` is
+  `Round2(11586 * in, 12)`, `_32` is `4 * in` exactly.
+
+  +44 lib tests (1375 → 1419): zero-input identities for every 1D
+  and 2D primitive; per-cell scalar values matched against the spec
+  multipliers for IDTX; `inverse(forward(x))` roundtrips on flat-DC
+  and LCG-pseudo-random inputs for ADST; the FLIPADST convention
+  proven via the `forward_flipadst_N(x) ==
+  reverse(forward_adst_N(reverse(x)))` lockstep + the 2D
+  `double_reverse` equivalent.
+
 * **Round 225 — forward DCT for sizes 8 / 16 / 32 / 64.** Extends the
   r219 forward 4×4 DCT primitive to every spec-defined square DCT
   block size. New API: 1D primitives `encoder::forward_dct_8` /
