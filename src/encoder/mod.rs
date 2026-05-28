@@ -123,10 +123,23 @@
 //! `decode_block` replay; the encoder is now a true encoder end-to-end
 //! for the intra-only path.
 //!
-//! Next arc: §5.11.36 transform_tree / tx_size writer; §5.11.18
-//! inter-arm `mode_info()` dispatcher; intra angle / palette encode.
-//! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
-//! signed-subexp inverse for the remaining inter-frame paths.
+//! Arc 12 (round 218) lands the §5.11.36 transform_tree / tx_size
+//! **writers**: [`transform_tree::write_block_tx_size`] (the §5.11.15
+//! `tx_depth` symbol for the §5.11.16 `else` arm — inverse of
+//! [`crate::cdf::PartitionWalker::read_block_tx_size`]) and
+//! [`transform_tree::write_var_tx_size`] (the §5.11.17 recursive
+//! `txfm_split` chain — inverse of
+//! [`crate::cdf::PartitionWalker::read_var_tx_size`]). The
+//! variable-transform writer takes a caller-supplied
+//! [`transform_tree::VarTxNode`] tree describing the desired
+//! `(txfm_split, sub_tx_size)` decisions per node, mirroring the same
+//! Leaf/Split shape already used for the §5.11.4 `partition_tree`
+//! dispatch.
+//!
+//! Next arc: §5.11.18 inter-arm `mode_info()` dispatcher; intra angle
+//! / palette encode. §5.9.7 `frame_size_with_refs()` inverse + §5.9.24
+//! `read_global_param` signed-subexp inverse for the remaining
+//! inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
@@ -140,6 +153,7 @@ pub mod sequence_obu;
 pub mod symbol_writer;
 pub mod temporal_unit;
 pub mod tile_group_obu;
+pub mod transform_tree;
 
 pub use bitwriter::BitWriter;
 pub use block_mode_info::{
@@ -166,3 +180,4 @@ pub use tile_group_obu::{
     parse_tile_group_obu_body, write_tile_group_obu, ParsedTileGroup, TileGroupObu,
     TileGroupObuWriter, TilePayload,
 };
+pub use transform_tree::{write_block_tx_size, write_var_tx_size, VarTxNode, VarTxNodeKind};

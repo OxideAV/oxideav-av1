@@ -6,6 +6,35 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 218 — §5.11.36 transform_tree / tx_size writers.** The
+  encoder counterpart of
+  [`crate::cdf::PartitionWalker::read_block_tx_size`] and
+  [`crate::cdf::PartitionWalker::read_var_tx_size`]. Two stateless
+  writers exposed from `encoder::transform_tree`:
+
+  * `write_block_tx_size(writer, cdfs, tx_size, sub_size, lossless,
+    allow_select, tx_mode_select, ctx)` — emits the §5.11.15
+    `tx_depth` symbol for the §5.11.16 `else` arm. Derives the
+    spec's `tx_depth` value by walking `Split_Tx_Size` from
+    `Max_Tx_Size_Rect[MiSize]` until reaching the caller's chosen
+    `tx_size`. Skips the symbol entirely on the no-symbol arms
+    (Lossless, `sub_size <= BLOCK_4X4`, `!allow_select`, or
+    `!tx_mode_select`) and asserts the caller's `tx_size` matches
+    the spec-forced value on each.
+  * `write_var_tx_size(writer, cdfs, root)` — recursive driver
+    emitting one `txfm_split S()` per non-terminal node of a
+    caller-supplied `VarTxNode` tree. Mirrors the §5.11.17 recursion's
+    spec-forced terminal at `txSz == TX_4X4 || depth == MAX_VARTX_DEPTH`
+    (no symbol emitted at terminals), enforces the `Split_Tx_Size`
+    quadrant-decomposition child-count invariant per
+    `(h4 / stepH) * (w4 / stepW)`, and rejects illegal splits at the
+    spec-forced terminal as caller bugs.
+
+  New public types: `VarTxNode { tx_size, ctx, kind }` and
+  `VarTxNodeKind { Leaf, Split(Vec<VarTxNode>) }`. 21 roundtrip /
+  rejection tests (writer → `SymbolDecoder::read_symbol` against a
+  parallel `TileCdfContext`).
+
 * **Round 217 — §5.11.4 recursive dispatch driver.** The encoder
   counterpart of [`crate::cdf::PartitionWalker::decode_partition`]'s
   recursive walk: a complete intra-arm partition-tree walker that
