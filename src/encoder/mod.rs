@@ -41,20 +41,33 @@
 //!     matches the `.ivf` fixtures already in `docs/video/av1/
 //!     fixtures/`.
 //!
-//! Next arc: §5.3.1 OBU size-field self-counts + §5.3.4
-//! `trailing_bits()` wiring so an OBU framer can wrap a frame-header
-//! payload into a complete `OBU_FRAME_HEADER` unit; §5.9.7
-//! `frame_size_with_refs()` inverse for the inter path; §5.9.24
-//! `read_global_param` signed-subexp inverse for non-IDENTITY refs.
+//!   * [`temporal_unit`] — arc 3 (round 208) glue. Wraps the per-OBU
+//!     body writers above with the §5.3.4 `trailing_bits()` trailer
+//!     and the §5.3.1 `obu_size` size field, then aggregates a
+//!     sequence of OBUs into a §7.5 temporal unit (TD prefix +
+//!     optional SH + the frame OBUs). The product is a complete
+//!     byte-aligned bytestream a downstream parser walks back via
+//!     [`crate::obu::ObuIter`].
+//!
+//! Next arc: §5.11 / §5.12 `tile_group_obu` writer for actual tile
+//! encode (entropy coder + coefficient encode + per-block syntax);
+//! §5.9.7 `frame_size_with_refs()` inverse for inter-frame size
+//! plumbing; §5.9.24 `read_global_param` signed-subexp inverse for
+//! non-IDENTITY refs.
 
 pub mod bitwriter;
 pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
 pub mod sequence_obu;
+pub mod temporal_unit;
 
 pub use bitwriter::BitWriter;
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;
-pub use obu::{ObuExtensionHeader, ObuHeader, ObuWriter};
+pub use obu::{
+    build_temporal_unit, obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,
+    ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,
+};
 pub use sequence_obu::write_sequence_header_obu;
+pub use temporal_unit::{encode_sequence_header_obu, encode_temporal_unit, TemporalUnitPlan};

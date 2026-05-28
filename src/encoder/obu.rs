@@ -11,11 +11,21 @@
 //!   * §5.3.1 / §4.10.5 — optional `leb128()` `obu_size` size
 //!     field, when `obu_has_size_field == 1` (the §5.2 low-overhead
 //!     bytestream format every OBU emitted here uses).
+//!   * §5.3.4 `trailing_bits()` — appended to the body of any OBU
+//!     with `obu_size > 0` whose `obu_type` is not `OBU_TILE_GROUP`
+//!     / `OBU_TILE_LIST` / `OBU_FRAME` (per the §5.3.1
+//!     `open_bitstream_unit()` tail). [`write_obu_with_size`] handles
+//!     this for the caller — the body writer returns its bytes
+//!     byte-aligned and the wrapper appends the §5.3.4 trailer
+//!     before computing `obu_size`.
 //!
 //! Multiple OBUs in a temporal unit are written by calling
 //! [`ObuWriter::write`] in sequence on the same output `Vec<u8>`
 //! (or any byte sink that implements [`std::io::Write`]); the
-//! concatenation is the §5.2 byte-aligned stream.
+//! concatenation is the §5.2 byte-aligned stream. The
+//! [`write_temporal_unit`] convenience walks a sequence of
+//! [`ObuFrame`] descriptors and emits them in §7.5 order with the
+//! §5.3.4 trailing_bits applied per OBU.
 //!
 //! See also [`crate::obu::ObuType`] — the same `obu_type`
 //! taxonomy the parser uses.
@@ -96,6 +106,113 @@ impl ObuWriter {
         write_obu(out, header, payload);
         out.len() - start_len
     }
+}
+
+/// `true` if the §5.3.1 wrapper appends `trailing_bits()` to a
+/// non-empty body for this `obu_type`. From the §5.3.1
+/// `open_bitstream_unit()` tail: every type **except**
+/// `OBU_TILE_GROUP`, `OBU_TILE_LIST`, and `OBU_FRAME` gets the
+/// trailing-bits treatment when `obu_size > 0`. (The three excluded
+/// types own their own byte-alignment inside their body syntax —
+/// `tile_group_obu()` and friends call `byte_alignment()` directly.)
+pub fn obu_type_takes_trailing_bits(t: ObuType) -> bool {
+    !matches!(t, ObuType::TileGroup | ObuType::TileList | ObuType::Frame)
+}
+
+/// Wrap a freshly-built OBU body into a complete OBU unit per §5.3.1,
+/// applying §5.3.4 `trailing_bits` for the OBU types that require it,
+/// then writing `obu_header` + `leb128(obu_size)` + the body bytes
+/// into `out`.
+///
+/// `body_bytes` is the byte-aligned payload the relevant body writer
+/// (`write_sequence_header_obu` / `write_frame_header_obu` / etc.)
+/// returned via `BitWriter::finish` — it must NOT already include the
+/// §5.3.4 trailer. The wrapper appends a one-byte `0x80` trailer
+/// (`trailing_one_bit = 1` followed by 7 zero pad bits) per §5.3.4
+/// when `obu_size > 0` and the §5.3.1 type-gate fires; the resulting
+/// `obu_size` is the trailer-inclusive byte count.
+///
+/// Returns the number of bytes appended to `out`.
+pub fn write_obu_with_size(out: &mut Vec<u8>, header: &ObuHeader, body_bytes: &[u8]) -> usize {
+    debug_assert!(
+        header.has_size,
+        "write_obu_with_size requires obu_has_size_field == 1 (§5.2 low-overhead)"
+    );
+    let needs_trailer = !body_bytes.is_empty() && obu_type_takes_trailing_bits(header.obu_type);
+    let start_len = out.len();
+    if needs_trailer {
+        // §5.3.4 trailer on a byte-aligned body collapses to one byte
+        // `0x80` (`trailing_one_bit` + 7 zero pads). `obu_size` then
+        // accounts for body bytes plus this trailer byte.
+        let mut buf = Vec::with_capacity(body_bytes.len() + 1);
+        buf.extend_from_slice(body_bytes);
+        buf.push(0x80);
+        write_obu(out, header, &buf);
+    } else {
+        write_obu(out, header, body_bytes);
+    }
+    out.len() - start_len
+}
+
+/// One OBU's worth of pre-built body bytes plus the framing header.
+///
+/// `body` is the byte-aligned payload the OBU body writer
+/// (`write_sequence_header_obu` / `write_frame_header_obu` / etc.)
+/// produced; `header` is the §5.3.2 header descriptor (and `has_size`
+/// must be `true` because [`write_temporal_unit`] emits the §5.2
+/// low-overhead format).
+#[derive(Debug, Clone)]
+pub struct ObuFrame {
+    pub header: ObuHeader,
+    pub body: Vec<u8>,
+}
+
+impl ObuFrame {
+    /// Convenience constructor with `has_size = true` and no extension.
+    pub fn new(obu_type: ObuType, body: Vec<u8>) -> Self {
+        Self {
+            header: ObuHeader::new(obu_type),
+            body,
+        }
+    }
+}
+
+/// Aggregate a sequence of OBUs into one §7.5 temporal unit and
+/// return the byte-aligned concatenation.
+///
+/// The §5.2 low-overhead format permits any concatenation of
+/// `open_bitstream_unit()` outputs; this helper walks the supplied
+/// `frames` in order, calls [`write_obu_with_size`] for each, and
+/// returns the resulting buffer. Per §7.5 the caller is expected to
+/// place an `OBU_TEMPORAL_DELIMITER` at the start of the unit and any
+/// applicable `OBU_SEQUENCE_HEADER` before the first frame headers
+/// of a new coded video sequence — see [`build_temporal_unit`] for a
+/// helper that handles the TD prefix automatically.
+pub fn write_temporal_unit(frames: &[ObuFrame]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for frame in frames {
+        write_obu_with_size(&mut out, &frame.header, &frame.body);
+    }
+    out
+}
+
+/// Build a §7.5 temporal unit with an automatic `OBU_TEMPORAL_DELIMITER`
+/// prefix and an optional `OBU_SEQUENCE_HEADER`.
+///
+/// `seq_payload`, when supplied, is wrapped as an `OBU_SEQUENCE_HEADER`
+/// OBU and emitted right after the TD (per §7.5: "the first OBU in
+/// the first frame_unit of each temporal_unit must be a temporal
+/// delimiter OBU"). The `frame_obus` follow in caller order.
+pub fn build_temporal_unit(seq_payload: Option<&[u8]>, frame_obus: &[ObuFrame]) -> Vec<u8> {
+    let mut frames: Vec<ObuFrame> = Vec::with_capacity(2 + frame_obus.len());
+    // §7.5: OBU_TEMPORAL_DELIMITER carries zero payload — the §5.3.1
+    // wrapper skips trailing_bits because obu_size == 0.
+    frames.push(ObuFrame::new(ObuType::TemporalDelimiter, Vec::new()));
+    if let Some(sh) = seq_payload {
+        frames.push(ObuFrame::new(ObuType::SequenceHeader, sh.to_vec()));
+    }
+    frames.extend_from_slice(frame_obus);
+    write_temporal_unit(&frames)
 }
 
 /// Append one OBU. Free function form of [`ObuWriter::write`] for
@@ -274,5 +391,121 @@ mod tests {
         write_obu(&mut out, &header, &[0xde]);
         let (desc, _) = parse_obu(&out).unwrap();
         assert_eq!(desc.obu_type, ObuType::Reserved(9));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.3.1 + §5.3.4 — write_obu_with_size / temporal_unit aggregation
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn write_obu_with_size_appends_trailing_bits_for_sequence_header() {
+        // §5.3.1 gate fires (SH is not TG/TL/FRAME and obu_size > 0)
+        // ⇒ one 0x80 trailer byte appended; obu_size counts the trailer.
+        let body = vec![0x11, 0x22, 0x33];
+        let mut out = Vec::new();
+        write_obu_with_size(&mut out, &ObuHeader::new(ObuType::SequenceHeader), &body);
+        let (desc, _consumed) = parse_obu(&out).unwrap();
+        assert_eq!(desc.obu_type, ObuType::SequenceHeader);
+        assert_eq!(desc.payload_len, 4); // body + 1-byte trailer
+        assert_eq!(&desc.payload[..3], &body[..]);
+        assert_eq!(desc.payload[3], 0x80);
+    }
+
+    #[test]
+    fn write_obu_with_size_skips_trailer_for_frame_obu() {
+        // §5.3.1 explicit exclusion: OBU_FRAME owns its own alignment.
+        let body = vec![0xAA, 0xBB];
+        let mut out = Vec::new();
+        write_obu_with_size(&mut out, &ObuHeader::new(ObuType::Frame), &body);
+        let (desc, _) = parse_obu(&out).unwrap();
+        assert_eq!(desc.payload_len, 2);
+        assert_eq!(desc.payload, &body[..]);
+    }
+
+    #[test]
+    fn write_obu_with_size_skips_trailer_for_tile_group_and_tile_list() {
+        for ty in [ObuType::TileGroup, ObuType::TileList] {
+            let body = vec![0x77, 0x88];
+            let mut out = Vec::new();
+            write_obu_with_size(&mut out, &ObuHeader::new(ty), &body);
+            let (desc, _) = parse_obu(&out).unwrap();
+            assert_eq!(desc.payload_len, 2, "type {ty:?}");
+            assert_eq!(desc.payload, &body[..], "type {ty:?}");
+        }
+    }
+
+    #[test]
+    fn write_obu_with_size_zero_body_emits_no_trailer() {
+        // §5.3.1 conditional `obu_size > 0` short-circuits for empty
+        // bodies, including OBU_TEMPORAL_DELIMITER.
+        let mut out = Vec::new();
+        write_obu_with_size(&mut out, &ObuHeader::new(ObuType::TemporalDelimiter), &[]);
+        // 1 header byte + 1 leb128(0) byte = 2 bytes total.
+        assert_eq!(out, vec![0x12, 0x00]);
+    }
+
+    #[test]
+    fn write_temporal_unit_walks_in_order() {
+        // TD + SH + FH, all framed. Walk the result with ObuIter.
+        let frames = vec![
+            ObuFrame::new(ObuType::TemporalDelimiter, Vec::new()),
+            ObuFrame::new(ObuType::SequenceHeader, vec![0xAA, 0xBB]),
+            ObuFrame::new(ObuType::FrameHeader, vec![0x11]),
+        ];
+        let bytes = write_temporal_unit(&frames);
+        let descs: Vec<_> = ObuIter::new(&bytes).collect::<Result<_, _>>().unwrap();
+        assert_eq!(descs.len(), 3);
+        assert_eq!(descs[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(descs[1].obu_type, ObuType::SequenceHeader);
+        // SH body + 1-byte §5.3.4 trailer => payload_len = 3
+        assert_eq!(descs[1].payload_len, 3);
+        assert_eq!(descs[2].obu_type, ObuType::FrameHeader);
+        assert_eq!(descs[2].payload_len, 2);
+    }
+
+    #[test]
+    fn build_temporal_unit_emits_td_then_sh_then_frames() {
+        let sh_payload = [0xDE, 0xAD];
+        let fh = ObuFrame::new(ObuType::FrameHeader, vec![0xBE, 0xEF]);
+        let bytes = build_temporal_unit(Some(&sh_payload), &[fh]);
+        let descs: Vec<_> = ObuIter::new(&bytes).collect::<Result<_, _>>().unwrap();
+        assert_eq!(descs.len(), 3);
+        assert_eq!(descs[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(descs[0].payload_len, 0);
+        assert_eq!(descs[1].obu_type, ObuType::SequenceHeader);
+        // SH body (2) + trailer (1) = 3.
+        assert_eq!(descs[1].payload_len, 3);
+        assert_eq!(&descs[1].payload[..2], &sh_payload);
+        assert_eq!(descs[1].payload[2], 0x80);
+        assert_eq!(descs[2].obu_type, ObuType::FrameHeader);
+        assert_eq!(descs[2].payload_len, 3); // FH body + trailer
+    }
+
+    #[test]
+    fn build_temporal_unit_without_sh_just_emits_td_and_frames() {
+        let fh = ObuFrame::new(ObuType::FrameHeader, vec![0x42]);
+        let bytes = build_temporal_unit(None, &[fh]);
+        let descs: Vec<_> = ObuIter::new(&bytes).collect::<Result<_, _>>().unwrap();
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].obu_type, ObuType::TemporalDelimiter);
+        assert_eq!(descs[1].obu_type, ObuType::FrameHeader);
+    }
+
+    #[test]
+    fn obu_type_takes_trailing_bits_matches_spec_exclusions() {
+        for ty in [
+            ObuType::SequenceHeader,
+            ObuType::TemporalDelimiter,
+            ObuType::FrameHeader,
+            ObuType::Metadata,
+            ObuType::RedundantFrameHeader,
+            ObuType::Padding,
+            ObuType::Reserved(9),
+        ] {
+            assert!(obu_type_takes_trailing_bits(ty), "type {ty:?}");
+        }
+        for ty in [ObuType::TileGroup, ObuType::TileList, ObuType::Frame] {
+            assert!(!obu_type_takes_trailing_bits(ty), "type {ty:?}");
+        }
     }
 }

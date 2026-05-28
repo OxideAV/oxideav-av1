@@ -2,6 +2,63 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 208)
+
+Round 208 closes the **framing layer** of the encoder. The §5.3.4
+`trailing_bits()` helper, the §5.3.1 OBU `obu_size` self-counts
+wrapper, and the §7.5 temporal-unit aggregator now glue the r206
+sequence-header writer and r207 frame-header writer into a complete,
+parser-walkable IVF file.
+
+Three layers land on top of arcs 1 + 2:
+
+* **`BitWriter::trailing_bits` / `trailing_bits_to_alignment`** —
+  §5.3.4 `trailing_bits(nbBits)` (1 `trailing_one_bit` +
+  `nbBits - 1` zero pads). The alignment helper emits a full `0x80`
+  byte when the writer is already byte-aligned (the common §5.3.1
+  case for a body that finished on a byte boundary).
+* **`encoder::obu::write_obu_with_size`** — §5.3.1 composite that
+  appends the §5.3.4 trailer for the OBU types the spec wraps (every
+  type except `OBU_TILE_GROUP` / `OBU_TILE_LIST` / `OBU_FRAME`),
+  computes `obu_size` over the trailer-inclusive body, and writes
+  `obu_header` + `leb128(obu_size)` + body in one call. Companion
+  helpers: `obu_type_takes_trailing_bits(t)`,
+  `ObuFrame { header, body }`,
+  `write_temporal_unit(&[ObuFrame])`,
+  `build_temporal_unit(seq_payload, &[ObuFrame])` (the §7.5 helper
+  that auto-prefixes an `OBU_TEMPORAL_DELIMITER` + optional
+  `OBU_SEQUENCE_HEADER`).
+* **`encoder::temporal_unit`** — typed
+  `TemporalUnitPlan { seq, emit_sequence_header, frames }` aggregator.
+  `encode_temporal_unit` produces the complete byte-aligned
+  bytestream for one TU; convenience wrappers
+  `encode_sequence_header_obu(seq)` and
+  `encode_frame_header_obu(fh, seq)` build single OBUs.
+
+End-to-end smoke fixture (`tests/encoder_end_to_end_ivf.rs`): builds
+a `SequenceHeader` + `FrameHeader` from the
+`tiny-i-only-16x16-prof0` corpus fixture, encodes a single-TU IVF
+file via the new aggregator + r206 `IvfWriter`, demuxes it back,
+walks the OBUs via the parser-side `ObuIter`, and confirms
+`parse_sequence_header` + `parse_frame_header` round-trip the
+embedded descriptors. A second test covers multi-TU streams that
+ship the `OBU_SEQUENCE_HEADER` only in TU0.
+
+15 new lib tests + 2 end-to-end IVF integration tests (1126 → 1141
+lib): 3 BitWriter (`trailing_bits(5)`, byte-aligned full-byte
+trailer, partial-byte pad), 7 OBU framer (`write_obu_with_size` ×
+SH / Frame / TileGroup / TileList / zero-body,
+`write_temporal_unit`, `build_temporal_unit` with + without SH, the
+§5.3.1 type-gate table), 4 typed-descriptor wrappers (SH OBU, FH
+OBU, TU with SH, TU without SH), 2 integration (single-frame +
+multi-frame end-to-end IVF round-trip).
+
+Out of scope this arc (next): §5.11 `tile_group_obu()` writer
+(entropy coder + coefficient encode + per-block syntax) so the
+emitted file decodes to pixels; §5.9.7 `frame_size_with_refs()`
+inverse for the inter frames that override the seq size; §5.9.24
+`read_global_param` signed-subexp inverse for non-IDENTITY refs.
+
 ## Status — 2026-05-28 (round 207)
 
 Round 207 lands the **`frame_header_obu()` writer** — the encoder

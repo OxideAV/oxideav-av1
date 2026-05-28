@@ -101,6 +101,57 @@ impl BitWriter {
         self.bits_in_cur = 0;
     }
 
+    /// Emit `trailing_bits(nbBits)` per §5.3.4: a single
+    /// `trailing_one_bit` (`1`) followed by `nbBits - 1` zero
+    /// `trailing_zero_bit`s. `nb_bits` must be `>= 1` (the §5.3.4
+    /// "nbBits is greater than zero" pre-condition stated in §6.3.4).
+    ///
+    /// When called with `nb_bits` set to `(8 - (bit_position() & 7)) &
+    /// 7 + 1`-style values, the writer ends up byte-aligned, which is
+    /// the §5.3.1 contract before the OBU framer measures
+    /// `payloadBits` and writes the next `obu_size`.
+    pub fn trailing_bits(&mut self, nb_bits: u32) {
+        debug_assert!(
+            nb_bits >= 1,
+            "§5.3.4 / §6.3.4 require nbBits > 0 (the trailing_one_bit slot)"
+        );
+        // §5.3.4 step 1: trailing_one_bit = 1.
+        self.write_bit(1);
+        // §5.3.4 loop: nbBits-- then write a zero bit while nbBits > 0.
+        for _ in 1..nb_bits {
+            self.write_bit(0);
+        }
+    }
+
+    /// Emit just enough §5.3.4 `trailing_bits` to reach the next byte
+    /// boundary. Equivalent to:
+    ///
+    ///   * if already byte-aligned: write a full byte `1000_0000`
+    ///     (§5.3.4 still requires the `trailing_one_bit`).
+    ///   * otherwise: write `trailing_one_bit` + zero pad to align.
+    ///
+    /// This is the §5.3.1 wrapper's standard tail: an OBU body that
+    /// is not `OBU_TILE_GROUP` / `OBU_TILE_LIST` / `OBU_FRAME` must
+    /// receive `trailing_bits(obu_size * 8 - payloadBits)`. When the
+    /// framer writes the body byte-aligned (the common path: a single
+    /// `sequence_header_obu()` / `frame_header_obu()` payload finished
+    /// via `BitWriter::finish`), `payloadBits` already equals
+    /// `bytes.len() * 8`; the §5.3.1 framer in that case emits one
+    /// extra byte `0x80` so `obu_size` accounts for one byte of
+    /// `trailing_bits`.
+    ///
+    /// Returns the number of bits the call emitted (1..=8).
+    pub fn trailing_bits_to_alignment(&mut self) -> u32 {
+        let pos = self.bit_position() & 7;
+        // If already aligned, the §5.3.4 trailer is a full byte
+        // (1 + 7 zeros). Otherwise it pads to the next byte boundary:
+        // (8 - pos) bits total, starting with `trailing_one_bit`.
+        let nb_bits = if pos == 0 { 8 } else { 8 - pos as u32 };
+        self.trailing_bits(nb_bits);
+        debug_assert!(self.is_byte_aligned());
+        nb_bits
+    }
+
     /// Write a `leb128()` value per §4.10.5. The encoding emits
     /// seven value-bits per byte (low 7 bits) with the high bit of
     /// each non-terminal byte set to 1; the terminal byte's high
@@ -442,5 +493,44 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_ns(1, 0);
         assert_eq!(bw.bit_position(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // §5.3.4 trailing_bits()
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn trailing_bits_explicit_count_emits_one_then_zeros() {
+        // trailing_bits(5) on a byte-aligned writer => 1 0 0 0 0 then
+        // 3 zero pad bits via finish() => 1000_0000 = 0x80.
+        let mut bw = BitWriter::new();
+        bw.trailing_bits(5);
+        assert_eq!(bw.bit_position(), 5);
+        let bytes = bw.finish();
+        assert_eq!(bytes, vec![0b1000_0000]);
+    }
+
+    #[test]
+    fn trailing_bits_to_alignment_from_byte_boundary_emits_full_byte() {
+        // §5.3.4 must always emit the trailing_one_bit. When the
+        // writer is already byte-aligned, the §5.3.1 framer needs a
+        // full byte of trailing_bits so obu_size accounts for it.
+        let mut bw = BitWriter::new();
+        let written = bw.trailing_bits_to_alignment();
+        assert_eq!(written, 8);
+        assert!(bw.is_byte_aligned());
+        assert_eq!(bw.finish(), vec![0b1000_0000]);
+    }
+
+    #[test]
+    fn trailing_bits_to_alignment_pads_partial_byte() {
+        // 3 bits already written ⇒ alignment trailer = 5 bits
+        // (1 + 4 zeros). Final byte = 101_10000 = 0xB0.
+        let mut bw = BitWriter::new();
+        bw.write_bits(3, 0b101);
+        let written = bw.trailing_bits_to_alignment();
+        assert_eq!(written, 5);
+        assert!(bw.is_byte_aligned());
+        assert_eq!(bw.finish(), vec![0b1011_0000]);
     }
 }
