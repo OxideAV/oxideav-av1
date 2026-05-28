@@ -121,8 +121,8 @@ pub use block_mode_info::{
     write_intra_frame_y_mode, write_intra_segment_id, write_intra_uv_mode, write_skip, write_y_mode,
 };
 pub use coefficients::{
-    write_coeff_base, write_coeff_base_eob, write_coeff_br, write_dc_sign, write_eob_pt,
-    write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
+    write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,
+    write_eob_pt, write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
 };
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;

@@ -81,9 +81,10 @@
 //! [`block_mode_info`]: crate::encoder::block_mode_info
 
 use crate::cdf::{
-    TileCdfContext, BR_CDF_SIZE, COEFF_BASE_RANGE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS,
-    LEVEL_CONTEXTS, NUM_BASE_LEVELS, PLANE_TYPES, SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB,
-    TXB_SKIP_CONTEXTS, TX_SIZES, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
+    get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, TileCdfContext, BR_CDF_SIZE,
+    COEFF_BASE_RANGE, DC_SIGN_CONTEXTS, EOB_COEF_CONTEXTS, LEVEL_CONTEXTS, NUM_BASE_LEVELS,
+    PLANE_TYPES, SIG_COEF_CONTEXTS, SIG_COEF_CONTEXTS_EOB, TXB_SKIP_CONTEXTS, TX_SIZES,
+    TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, TX_WIDTH_LOG2,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -736,6 +737,303 @@ pub fn write_golomb(writer: &mut SymbolWriter, value: u32) -> Result<(), Error> 
     }
 
     Ok(())
+}
+
+/// Full §5.11.39 `coefficients()` **driver loop** — composes every
+/// per-coefficient primitive above into one per-transform-block encode.
+///
+/// This is the encoder counterpart to
+/// [`crate::cdf::PartitionWalker::coefficients`] (the §5.11.39 reader).
+/// Given a caller-supplied final-`Quant[]` array (signed, post-decoder
+/// values — what the decoder would produce at exit), the driver walks
+/// the §5.11.39 body and emits every symbol / literal the reader would
+/// consume, so the output bytes round-trip back through the reader to
+/// the same `Quant[]` array.
+///
+/// ## Spec body (av1-spec p.88–93)
+///
+/// ```text
+///   coefficients( plane, x4, y4, txSz ) {
+///       ...                                          // §5.11.39 1-9 derive sizes + zero Quant[]
+///       all_zero                                     S()                // §5.11.39 line 13
+///       if ( all_zero ) { ... return }                                 // §5.11.39 line 14
+///       eob_pt_<N> + eob_extra + eob_extra_bit loop                    // §5.11.39 lines 19-55
+///       for ( c = eob - 1; c >= 0; c-- ) {                              // §5.11.39 lines 56-71
+///           if ( c == eob - 1 ) coeff_base_eob  S(); level = sym + 1
+///           else                coeff_base      S(); level = sym
+///           if ( level > NUM_BASE_LEVELS ) coeff_br chain (≤ 4 iters)
+///           Quant[ pos ] = level
+///       }
+///       for ( c = 0; c < eob; c++ ) {                                   // §5.11.39 lines 73-100
+///           if ( Quant[ pos ] != 0 ) {
+///               sign = c == 0 ? dc_sign S() : sign_bit L(1)
+///           }
+///           if ( Quant[ pos ] > 14 ) golomb tail                       // §5.11.39 lines 84-93
+///           ...                                                         // dcCategory + 0xFFFFF clip + culLevel + sign apply
+///       }
+///   }
+/// ```
+///
+/// ## Inverse strategy
+///
+/// 1. **Compute `eob`** as the largest `c + 1` over `0..scan_len` for
+///    which `quant_in[ scan[c] ] != 0`. `eob == 0` ⇒ `all_zero = 1`,
+///    no further writes. `eob >= 1` ⇒ `all_zero = 0` and the cascade
+///    fires.
+/// 2. **Maintain a running magnitude buffer.** The §8.3.2 ctx
+///    derivations consume the `Quant[]` array as the reverse-scan
+///    populates it. The driver mirrors this on the encoder side: it
+///    initialises a local `running` buffer to zero and writes each
+///    iteration's `coded_mag = min(|quant_in[pos]|, 15)` into it
+///    before the next iteration's ctx scan runs. The reader's
+///    `Quant[]` at the same step holds the same value, so
+///    `get_coeff_base_*_ctx` / `get_br_ctx` agree on both sides.
+/// 3. **Reverse-scan emission.** For each `c = eob - 1 .. 0`:
+///    * `coded_mag = min(target_abs, 15)` (post-`coeff_br` saturation
+///      level — `NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1 = 15` is the
+///      cap because a `coeff_base{,_eob}` of 3 entry + four chain
+///      iterations of `+3` each maxes out at level 15).
+///    * If `is_eob`: write `coeff_base_eob(min(coded_mag - 1, 2))`
+///      (alphabet `0..=2` ⇒ level `1..=3`).
+///    * Else: write `coeff_base(min(coded_mag, 3))` (alphabet `0..=3`
+///      ⇒ level `0..=3`).
+///    * If the level lands at 3 (the chain-continues sentinel),
+///      enter the `coeff_br` chain: each iter emits
+///      `min(residue, BR_CDF_SIZE - 1 = 3)` where `residue` is
+///      `coded_mag - chain_level_so_far`. Chain caps at 4 iterations
+///      total per the spec's `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) = 4`.
+///    * Stamp `running[pos] = coded_mag` for downstream ctx walks.
+/// 4. **Forward-scan emission.** For each `c = 0 .. eob`:
+///    * If `target_abs != 0` and `c == 0`: write `dc_sign(sign)`.
+///    * Else if `target_abs != 0`: write `sign_bit` as `L(1)`.
+///    * If `target_abs > NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`:
+///      write the §5.11.39 lines 84-93 golomb tail via
+///      [`write_golomb`].
+///
+/// ## Caller-supplied state
+///
+/// * `plane` — `0` (Y), `1`/`2` (U/V).
+/// * `is_inter` — `0`/`1`. (Currently consumed only as a guard; the
+///   §5.11.39 reader passes it through to the same forwarded
+///   [`write_eob_pt`].)
+/// * `tx_size` — `0..TX_SIZES_ALL = 19`.
+/// * `tx_class` — `0..=TX_CLASS_VERT = 2`.
+/// * `txb_skip_ctx` — §8.3.2 `all_zero` ctx in
+///   `0..TXB_SKIP_CONTEXTS = 13`. Caller derives.
+/// * `dc_sign_ctx` — §8.3.2 `dc_sign` ctx in
+///   `0..DC_SIGN_CONTEXTS = 3`. Caller derives.
+/// * `scan` — the §7.5 scan table for `tx_size` / `tx_class` (length
+///   ≥ `seg_eob`).
+/// * `quant_in` — the per-position **signed final** `Quant[]` array
+///   (length ≥ `tx_w * tx_h`). The driver consumes this read-only;
+///   it does NOT mutate the caller's buffer. Range constraint: each
+///   `|quant_in[pos]|` must be ≤ `0xFFFFF + 14 = 1_048_589` per the
+///   §5.11.39 line-97 `& 0xFFFFF` clip + §6.10.34 golomb-length
+///   conformance bound (both enforced via [`write_golomb`]).
+///
+/// ## Returns
+///
+/// [`Error::PartitionWalkOutOfRange`] for any out-of-range index or
+/// quant-buffer / scan-buffer length shortfall. Propagates
+/// [`SymbolWriter::write_symbol`] / `write_literal` / `write_golomb`
+/// errors.
+///
+/// ## Spec provenance
+///
+/// `docs/video/av1/av1-spec.txt` §5.11.39 (p.88–93) + §6.5.10 syntax
+/// table + §8.3.2 context derivations (p.371–378) + §9.4 default
+/// CDFs.
+#[allow(clippy::too_many_arguments)]
+pub fn write_coefficients(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    plane: u8,
+    is_inter: u8,
+    tx_size: usize,
+    tx_class: usize,
+    txb_skip_ctx: usize,
+    dc_sign_ctx: usize,
+    scan: &[u16],
+    quant_in: &[i32],
+) -> Result<u32, Error> {
+    // ---------------- caller-bug guards (mirror the reader's) ---------
+    if tx_size >= TX_SIZES_ALL {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if tx_class > crate::cdf::TX_CLASS_VERT {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if plane > 2 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if is_inter > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if txb_skip_ctx >= TXB_SKIP_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if dc_sign_ctx >= DC_SIGN_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.39 lines 1-7: derived sizes (mirror the reader).
+    let tx_w = TX_WIDTH[tx_size];
+    let tx_h = crate::cdf::TX_HEIGHT[tx_size];
+    let tx_sz_sqr = {
+        let side = core::cmp::min(tx_w, tx_h);
+        (side.trailing_zeros() as usize) - 2
+    };
+    let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_size];
+    let tx_sz_ctx = (tx_sz_sqr + tx_sz_sqr_up + 1) >> 1;
+    let ptype = (plane > 0) as usize;
+    // §5.11.39 line 6: `segEob`.
+    let seg_eob = if tx_size == crate::cdf::TX_16X64 || tx_size == crate::cdf::TX_64X16 {
+        512usize
+    } else {
+        core::cmp::min(1024, tx_w * tx_h)
+    };
+
+    if scan.len() < seg_eob {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if quant_in.len() < tx_w * tx_h {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------------- compute target eob from quant_in ----------------
+    // §5.11.39 lines 56-71: the reverse-scan loop reads coefficients in
+    // descending scan order; `eob` is the position past the highest
+    // non-zero coefficient. We pick `eob` as the largest `c + 1` in
+    // `0..seg_eob` for which `quant_in[scan[c]] != 0`. `eob == 0` ⇒
+    // every scan position is zero ⇒ short-circuit.
+    let mut eob: u32 = 0;
+    for c in (0..seg_eob).rev() {
+        let pos = scan[c] as usize;
+        if pos >= quant_in.len() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if quant_in[pos] != 0 {
+            eob = (c as u32) + 1;
+            break;
+        }
+    }
+
+    // §5.11.39 line 13: `all_zero S()`.
+    let all_zero: u8 = if eob == 0 { 1 } else { 0 };
+    write_txb_skip(writer, cdfs, all_zero, tx_sz_ctx, txb_skip_ctx)?;
+    if eob == 0 {
+        // §5.11.39 line 14: short-circuit. No further reads on the
+        // reader side ⇒ no further writes here.
+        return Ok(0);
+    }
+
+    // §5.11.39 lines 19-55: eob_pt + eob_extra + eob_extra_bit loop.
+    write_eob_pt(writer, cdfs, eob, tx_size, tx_class, plane, is_inter)?;
+
+    // ---------------- §5.11.39 reverse-scan: base levels + br chain ---
+    // Running magnitude buffer — mirrors the decoder's `Quant[]` state
+    // as the reverse scan populates it. The §8.3.2 ctx helpers walk
+    // this same buffer on both sides.
+    let mut running: Vec<i32> = vec![0i32; tx_w * tx_h];
+
+    let threshold_post_br: u32 = (NUM_BASE_LEVELS + COEFF_BASE_RANGE + 1) as u32; // = 15
+    let threshold_golomb: u32 = (NUM_BASE_LEVELS + COEFF_BASE_RANGE) as u32; // = 14
+    let max_base_eob: u8 = 2; // alphabet 0..=2 ⇒ level 1..=3
+    let max_base: u8 = 3; // alphabet 0..=3 ⇒ level 0..=3
+
+    {
+        let mut c: i32 = eob as i32 - 1;
+        while c >= 0 {
+            let pos = scan[c as usize] as usize;
+            // |q| >= 1 at c = eob - 1 (the §5.11.39 line-56 highest
+            // non-zero); >= 0 below. Saturate at 15 — anything larger
+            // gets the rest from the §5.11.39 lines 84-93 golomb tail.
+            let target_abs: u32 = quant_in[pos].unsigned_abs();
+            let coded_mag: u32 = core::cmp::min(target_abs, threshold_post_br);
+
+            let is_eob = c == (eob as i32 - 1);
+            // Sanity: the EOB position must be non-zero (line-56 says
+            // so; the §8.2.6 reader debug_asserts this).
+            if is_eob && coded_mag == 0 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+
+            let base_sym: u8 = if is_eob {
+                // coeff_base_eob alphabet: 0..=2 ⇒ level 1..=3.
+                // sym = min(coded_mag - 1, 2).
+                core::cmp::min((coded_mag - 1) as u8, max_base_eob)
+            } else {
+                // coeff_base alphabet: 0..=3 ⇒ level 0..=3.
+                // sym = min(coded_mag, 3).
+                core::cmp::min(coded_mag as u8, max_base)
+            };
+
+            // §8.3.2 ctx derivations against the running magnitude
+            // buffer (zero-filled at entry; populated by prior reverse-
+            // scan iterations).
+            if is_eob {
+                let ctx = get_coeff_base_eob_ctx(&running, tx_size, tx_class, pos, c as usize);
+                write_coeff_base_eob(writer, cdfs, base_sym, tx_sz_ctx, ptype, ctx)?;
+            } else {
+                let ctx = get_coeff_base_ctx(&running, tx_size, tx_class, pos, c as usize, false);
+                write_coeff_base(writer, cdfs, base_sym, tx_sz_ctx, ptype, ctx)?;
+            }
+
+            // Level reconstructed exactly as the reader does it.
+            let mut level: u32 = if is_eob {
+                (base_sym as u32) + 1
+            } else {
+                base_sym as u32
+            };
+
+            // §5.11.39 lines 65-70: coeff_br chain when `level >
+            // NUM_BASE_LEVELS`. Both reader and writer cap at
+            // COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) = 4 iterations.
+            if level as usize > NUM_BASE_LEVELS {
+                let br_iters: u32 = (COEFF_BASE_RANGE / (BR_CDF_SIZE - 1)) as u32;
+                let br_step: u32 = (BR_CDF_SIZE - 1) as u32; // = 3
+                for _ in 0..br_iters {
+                    // remaining magnitude to encode in the chain.
+                    let residue = coded_mag - level;
+                    let sym: u8 = core::cmp::min(residue, br_step) as u8;
+                    let ctx = get_br_ctx(&running, tx_size, tx_class, pos);
+                    write_coeff_br(writer, cdfs, sym, tx_sz_ctx, ptype, ctx)?;
+                    level += sym as u32;
+                    if (sym as usize) < BR_CDF_SIZE - 1 {
+                        break;
+                    }
+                }
+            }
+
+            // §5.11.39 line 71: stamp the post-chain magnitude into the
+            // running buffer so subsequent iterations' ctx scans see it.
+            running[pos] = level as i32;
+            c -= 1;
+        }
+    }
+
+    // ---------------- §5.11.39 forward-scan: signs + golomb ----------
+    for (c, &pos_u16) in scan.iter().enumerate().take(eob as usize) {
+        let pos = pos_u16 as usize;
+        let target = quant_in[pos];
+        let target_abs: u32 = target.unsigned_abs();
+        if target_abs != 0 {
+            let sign: u8 = if target < 0 { 1 } else { 0 };
+            if c == 0 {
+                write_dc_sign(writer, cdfs, sign, plane, dc_sign_ctx)?;
+            } else {
+                // §5.11.39 line 79: raw L(1) sign_bit.
+                writer.write_literal(1, sign as u32)?;
+            }
+        }
+        // §5.11.39 lines 84-93: golomb magnitude tail for magnitudes
+        // past NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14.
+        if target_abs > threshold_golomb {
+            write_golomb(writer, target_abs)?;
+        }
+    }
+
+    Ok(eob)
 }
 
 #[cfg(test)]
@@ -1662,5 +1960,419 @@ mod tests {
         assert_eq!(sign, 1);
         let magnitude = read_golomb(&mut dec);
         assert_eq!(magnitude, 18);
+    }
+
+    // =================================================================
+    // §5.11.39 driver loop — end-to-end round-trips through the
+    // §5.11.39 `coefficients()` reader inside
+    // `PartitionWalker::coefficients`.
+    // =================================================================
+
+    use crate::cdf::{PartitionWalker, TileGeometry, TX_4X4 as TX_4X4_C, TX_8X8 as TX_8X8_C};
+
+    /// Helper: build a minimal `PartitionWalker` to host a
+    /// `coefficients()` invocation. The reader is stateless on `self`
+    /// (the body only reads `decoder` / `cdfs` / the caller args), so
+    /// any well-formed walker works for the round-trip.
+    fn make_walker() -> PartitionWalker {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        PartitionWalker::new(8, 8, geom).expect("walker construction")
+    }
+
+    /// Helper: encode `quant_in` with the driver, then decode the bytes
+    /// back through `PartitionWalker::coefficients`, and return both the
+    /// reader's `CoefficientsReadout` and the populated decoder
+    /// `Quant[]` array. Both sides start with fresh §9.4 default CDFs
+    /// and CDF adaptation enabled.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_round_trip(
+        plane: u8,
+        is_inter: u8,
+        tx_size: usize,
+        tx_class: usize,
+        txb_skip_ctx: usize,
+        dc_sign_ctx: usize,
+        scan: &[u16],
+        quant_in: &[i32],
+    ) -> (crate::cdf::CoefficientsReadout, Vec<i32>) {
+        // ----- encode -----
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let eob = write_coefficients(
+            &mut writer,
+            &mut enc_cdfs,
+            plane,
+            is_inter,
+            tx_size,
+            tx_class,
+            txb_skip_ctx,
+            dc_sign_ctx,
+            scan,
+            quant_in,
+        )
+        .expect("driver encode succeeded");
+        let bytes = writer.finish();
+
+        // ----- decode -----
+        let mut walker = make_walker();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let mut quant_out = vec![0i32; quant_in.len()];
+        let readout = walker
+            .coefficients(
+                &mut dec,
+                &mut dec_cdfs,
+                plane,
+                is_inter,
+                tx_size,
+                tx_class,
+                txb_skip_ctx,
+                dc_sign_ctx,
+                scan,
+                &mut quant_out,
+            )
+            .expect("reader decode succeeded");
+
+        // §5.11.39 line-13 short-circuit: all_zero path returns eob = 0;
+        // matches the driver's `Ok(0)` short-circuit return.
+        if quant_in.iter().all(|&q| q == 0) {
+            assert_eq!(eob, 0, "encoder eob == 0 for all-zero input");
+            assert!(readout.all_zero, "decoder all_zero == true");
+            assert_eq!(readout.eob, 0);
+        } else {
+            assert!(!readout.all_zero, "non-empty block must clear all_zero");
+            assert_eq!(eob, readout.eob, "encoder eob matches decoder eob");
+        }
+        (readout, quant_out)
+    }
+
+    /// End-to-end round-trip 1: all-zero TX_4X4 luma block. The
+    /// driver's §5.11.39 line-13 short-circuit emits a single
+    /// `txb_skip = 1` S(); the reader returns
+    /// `CoefficientsReadout { all_zero: true, eob: 0, .. }` and the
+    /// `Quant[]` array is fully zero.
+    #[test]
+    fn driver_round_trip_all_zero_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let quant_in = vec![0i32; 16];
+        let (_readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert!(quant_out.iter().all(|&q| q == 0));
+    }
+
+    /// End-to-end round-trip 2: TX_4X4 luma with a single non-zero
+    /// coefficient at scan[0] (the DC). Magnitude 1, positive sign.
+    /// Exercises the smallest non-trivial coefficient encode:
+    /// `txb_skip = 0`, `eob_pt(eob = 1)`, one `coeff_base_eob` at
+    /// `c = 0`, one `dc_sign`. No `coeff_br`, no `sign_bit`, no
+    /// golomb.
+    #[test]
+    fn driver_round_trip_single_dc_one_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = 1;
+        let (_readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(quant_out[0], 1);
+        assert!(quant_out[1..].iter().all(|&q| q == 0));
+    }
+
+    /// End-to-end round-trip 3: TX_4X4 luma with two non-zero
+    /// coefficients — DC = -1 and scan[1] = +2. Exercises the
+    /// reverse-scan loop with two iterations (`coeff_base_eob` at
+    /// `c = 1`, `coeff_base` at `c = 0`), the negative-DC `dc_sign`
+    /// emission at `c = 0`, and a positive `sign_bit` L(1) at `c = 1`.
+    #[test]
+    fn driver_round_trip_two_coeffs_signed_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = -1;
+        quant_in[1] = 2;
+        let (_readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(quant_out[0], -1);
+        assert_eq!(quant_out[1], 2);
+        assert!(quant_out[2..].iter().all(|&q| q == 0));
+    }
+
+    /// End-to-end round-trip 4: TX_4X4 luma with magnitude 3 at DC,
+    /// which forces the §5.11.39 line-64 `level > NUM_BASE_LEVELS = 2`
+    /// gate open ⇒ enters the `coeff_br` chain (one iteration with
+    /// `coeff_br = 0`, no extension). Confirms the chain-entry +
+    /// immediate-terminate path.
+    #[test]
+    fn driver_round_trip_level3_no_br_extension_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = 3;
+        let (_readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(quant_out[0], 3);
+    }
+
+    /// End-to-end round-trip 5: TX_4X4 luma with magnitude 8 at DC.
+    /// `coeff_base_eob = 2` (level 3) + `coeff_br` chain of sym = 3,
+    /// then sym = 2 (level 3 + 3 + 2 = 8). Exercises a mid-chain
+    /// terminate after 2 iterations.
+    #[test]
+    fn driver_round_trip_level8_br_chain_terminate_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = 8;
+        let (_readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(quant_out[0], 8);
+    }
+
+    /// End-to-end round-trip 6: TX_4X4 luma with magnitude 14 at DC —
+    /// the §5.11.39 line-73 golomb-gate boundary. coeff_base_eob = 2 +
+    /// four coeff_br iters (each sym = 3 or the last sym = 2; here
+    /// 3+3+3+2 = 11 ⇒ level 14, full chain except last). No golomb.
+    #[test]
+    fn driver_round_trip_level14_boundary_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = 14;
+        let (_readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(quant_out[0], 14);
+    }
+
+    /// End-to-end round-trip 7: TX_4X4 luma with magnitude 15 at DC.
+    /// coeff_base_eob = 2 + four coeff_br iters each sym = 3 ⇒ level
+    /// saturates at 15; then forward-scan golomb tail fires (x = 1,
+    /// length = 1). Exercises the §5.11.39 line-73 golomb entry +
+    /// minimal-magnitude golomb (single terminator bit, no data bits).
+    #[test]
+    fn driver_round_trip_level15_min_golomb_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = 15;
+        let (_readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(quant_out[0], 15);
+    }
+
+    /// End-to-end round-trip 8: TX_4X4 luma with magnitude 30 at
+    /// scan[1] (mid-block AC, not DC) — the forward-scan sign at c = 1
+    /// is an L(1) `sign_bit`, not `dc_sign`. Magnitude saturates the
+    /// base+br chain at 15 then golomb writes x = 16, length = 5.
+    #[test]
+    fn driver_round_trip_ac_golomb_with_sign_bit_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        // DC = 0 ⇒ no dc_sign, no first-coeff sign; only the c=1
+        // sign_bit will be emitted.
+        quant_in[1] = -30;
+        let (readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(quant_out[1], -30);
+        assert_eq!(quant_out[0], 0);
+        assert_eq!(readout.eob, 2, "eob counts past the highest non-zero");
+    }
+
+    /// End-to-end round-trip 9: TX_8X8 luma with a small dense pattern
+    /// across the first 6 scan positions, mixed signs, all magnitudes
+    /// ≤ 3. Exercises the reverse-scan loop over several iterations
+    /// with non-trivial Quant[] state feeding the §8.3.2 ctx walks on
+    /// both sides.
+    #[test]
+    fn driver_round_trip_dense_small_pattern_tx8x8_luma() {
+        let scan: Vec<u16> = (0..64u16).collect();
+        let mut quant_in = vec![0i32; 64];
+        quant_in[0] = 2;
+        quant_in[1] = -1;
+        quant_in[2] = 3;
+        quant_in[3] = -2;
+        quant_in[4] = 1;
+        quant_in[5] = -1;
+        let (readout, quant_out) =
+            drive_round_trip(0, 0, TX_8X8_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(readout.eob, 6, "eob = 6 (highest non-zero at scan[5])");
+        for (i, (&expect, &got)) in quant_in.iter().zip(quant_out.iter()).enumerate() {
+            assert_eq!(
+                got, expect,
+                "Quant[{i}] mismatch: expected {expect}, got {got}"
+            );
+        }
+    }
+
+    /// End-to-end round-trip 10: TX_4X4 chroma U with positive DC and
+    /// a single AC. Exercises the `plane = 1` / `ptype = 1` axis —
+    /// distinct CDF rows on both sides — plus `dc_sign_ctx = 1` and
+    /// `txb_skip_ctx = 5` (off the (0, 0) origin).
+    #[test]
+    fn driver_round_trip_chroma_ptype_axis_tx4x4() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = 4;
+        quant_in[2] = -1;
+        let (_readout, quant_out) =
+            drive_round_trip(1, 0, TX_4X4_C, TX_CLASS_2D, 5, 1, &scan, &quant_in);
+        assert_eq!(quant_out[0], 4);
+        assert_eq!(quant_out[2], -1);
+    }
+
+    /// End-to-end round-trip 11: TX_4X4 luma with a large golomb-tail
+    /// magnitude (200) at scan[2] (AC). x = 186 = 0b1011_1010,
+    /// length = 8. Exercises a wide golomb data payload composed with
+    /// a normal-magnitude DC and base-only AC at c = 1.
+    #[test]
+    fn driver_round_trip_large_golomb_tx4x4_luma() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let mut quant_in = vec![0i32; 16];
+        quant_in[0] = 1;
+        quant_in[1] = -2;
+        quant_in[2] = 200;
+        let (readout, quant_out) =
+            drive_round_trip(0, 0, TX_4X4_C, TX_CLASS_2D, 0, 0, &scan, &quant_in);
+        assert_eq!(readout.eob, 3);
+        assert_eq!(quant_out[0], 1);
+        assert_eq!(quant_out[1], -2);
+        assert_eq!(quant_out[2], 200);
+    }
+
+    /// Driver caller-bug guards: each out-of-range argument returns
+    /// [`Error::PartitionWalkOutOfRange`] without producing partial
+    /// output (the SymbolWriter may have buffered an early write
+    /// before the guard fires; the test asserts on the Result, not on
+    /// bytes).
+    #[test]
+    fn driver_rejects_out_of_range_arguments() {
+        let scan: Vec<u16> = (0..16u16).collect();
+        let quant_in = vec![0i32; 16];
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        // tx_size out of range.
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(
+            &mut w,
+            &mut cdfs,
+            0,
+            0,
+            TX_SIZES_ALL,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &quant_in,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // tx_class out of range (TX_CLASS_VERT = 2; 3 is illegal).
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(&mut w, &mut cdfs, 0, 0, TX_4X4_C, 3, 0, 0, &scan, &quant_in)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // plane out of range.
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(
+            &mut w,
+            &mut cdfs,
+            3,
+            0,
+            TX_4X4_C,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &quant_in,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // is_inter out of range.
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(
+            &mut w,
+            &mut cdfs,
+            0,
+            2,
+            TX_4X4_C,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &quant_in,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // txb_skip_ctx out of range.
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(
+            &mut w,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4_C,
+            TX_CLASS_2D,
+            TXB_SKIP_CONTEXTS,
+            0,
+            &scan,
+            &quant_in,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // dc_sign_ctx out of range.
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(
+            &mut w,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4_C,
+            TX_CLASS_2D,
+            0,
+            DC_SIGN_CONTEXTS,
+            &scan,
+            &quant_in,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // scan too short.
+        let short_scan: Vec<u16> = (0..4u16).collect();
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(
+            &mut w,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4_C,
+            TX_CLASS_2D,
+            0,
+            0,
+            &short_scan,
+            &quant_in,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // quant_in too small.
+        let tiny_quant: Vec<i32> = vec![0i32; 4];
+        let mut w = SymbolWriter::new(false);
+        let err = write_coefficients(
+            &mut w,
+            &mut cdfs,
+            0,
+            0,
+            TX_4X4_C,
+            TX_CLASS_2D,
+            0,
+            0,
+            &scan,
+            &tiny_quant,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

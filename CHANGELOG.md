@@ -6,6 +6,94 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 215 — §5.11.39 `coefficients()` driver loop (end-to-end).**
+  Composes every per-coefficient writer landed in rounds 212–214
+  (`txb_skip` / `eob_pt` / `coeff_base_eob` / `coeff_base` /
+  `coeff_br` / `dc_sign` / `golomb`) into a single per-transform-block
+  encode that round-trips through the §5.11.39
+  `PartitionWalker::coefficients` reader.
+
+  New public API in `encoder::coefficients` (re-exported from
+  `encoder`):
+  * `write_coefficients(writer, cdfs, plane, is_inter, tx_size,
+    tx_class, txb_skip_ctx, dc_sign_ctx, scan, quant_in) -> Result<u32,
+    Error>` — the full §5.11.39 driver. Takes the caller's
+    final-`Quant[]` array (signed, post-decoder values) and emits
+    every symbol / literal the reader would consume. Returns the
+    written `eob` (0 on the §5.11.39 line-13 all-zero short-circuit;
+    otherwise the position past the highest non-zero coefficient).
+    Mirrors the reader's caller-bug guards (`tx_size <
+    TX_SIZES_ALL`, `tx_class <= TX_CLASS_VERT`, `plane <= 2`,
+    `is_inter <= 1`, `txb_skip_ctx < TXB_SKIP_CONTEXTS`,
+    `dc_sign_ctx < DC_SIGN_CONTEXTS`, `scan.len() >= seg_eob`,
+    `quant_in.len() >= tx_w * tx_h`).
+
+  ## Inverse strategy
+
+  1. Compute `eob` from `quant_in`. `eob == 0` ⇒ `write_txb_skip(1)`
+     and return; the §5.11.39 line-13 short-circuit is byte-exact.
+  2. Maintain a running magnitude buffer that mirrors the decoder's
+     `Quant[]` state as the reverse scan populates it. Both
+     `get_coeff_base_*_ctx` and `get_br_ctx` walk this buffer; the
+     encoder + decoder agree because both write into the same
+     running state in the same order.
+  3. **Reverse-scan** for `c = eob - 1 .. 0`: emit
+     `coeff_base_eob(min(|q|-1, 2))` (at `c == eob - 1`) or
+     `coeff_base(min(|q|, 3))` (otherwise); if the level hits 3,
+     chain `coeff_br` with `sym = min(residue, 3)` per iter, capped
+     at 4 iters per the §5.11.39 line-66 `COEFF_BASE_RANGE /
+     (BR_CDF_SIZE - 1) = 4` bound. Stamp `running[pos] = min(|q|, 15)`.
+  4. **Forward-scan** for `c = 0 .. eob`: emit `dc_sign(sign)` at
+     `c == 0` (when `|q| > 0`) or `sign_bit` L(1) otherwise; if
+     `|q| > 14` (= NUM_BASE_LEVELS + COEFF_BASE_RANGE), emit the
+     §5.11.39 lines 84-93 golomb tail via `write_golomb(|q|)`.
+
+  12 new end-to-end round-trip lib tests (1225 → 1237). Every test
+  encodes `quant_in` through `write_coefficients`, decodes the bytes
+  back through `PartitionWalker::coefficients`, and asserts the
+  decoder's `Quant[]` matches `quant_in` cell-for-cell on TX_4X4 luma
+  / chroma and TX_8X8 luma:
+  - all-zero block (line-13 short-circuit; eob = 0, no further bits)
+  - single DC = 1 (smallest non-trivial: eob = 1, one
+    `coeff_base_eob`, one `dc_sign`, no chain / no golomb / no
+    sign_bit)
+  - two coefficients with mixed signs (DC = -1, AC = +2 ⇒ exercises
+    `dc_sign` and `sign_bit`)
+  - level 3 (chain-entry + immediate-terminate; one `coeff_br = 0`)
+  - level 8 (mid-chain terminate; two `coeff_br` iters of 3 + 2)
+  - level 14 (boundary; four `coeff_br` iters of 3 + 3 + 3 + 2; no
+    golomb)
+  - level 15 (chain saturates ⇒ golomb fires with x = 1, length = 1;
+    minimal golomb)
+  - AC magnitude 30 with `sign_bit` (no `dc_sign` because DC = 0)
+  - TX_8X8 dense small pattern (6 non-zero positions, mixed signs)
+  - chroma ptype = 1 axis with off-origin `txb_skip_ctx = 5` /
+    `dc_sign_ctx = 1`
+  - large golomb (200; x = 186, length = 8) composed with a normal
+    DC + AC
+  - exhaustive caller-bug guard sweep (8 out-of-range arguments)
+
+  fmt + clippy --all-targets clean.
+
+  Next arc: §5.11.4 partition decision-tree writer; §5.11.18
+  inter-arm `mode_info()` dispatcher; transform_tree / tx_size
+  encode; intra angle / palette encode.
+
+* **Round 214 — §5.11.39 golomb magnitude-tail writer.** Extends
+  `encoder::coefficients` with the per-magnitude `golomb_length_bit`
+  (do-while unary prefix) + `golomb_data_bit` (MSB-first L(1)
+  payload) tail for coefficient magnitudes above
+  `NUM_BASE_LEVELS + COEFF_BASE_RANGE = 14`. Single
+  `write_golomb(value)` writer; one composite call emits both halves.
+  `GOLOMB_MAX_LENGTH = 20` constant captures the §6.10.34 conformance
+  bound (any `value` that would derive `length > 20` is rejected as a
+  caller bug — would overflow the §5.11.39 line-97 `Quant[pos] &
+  0xFFFFF` 20-bit clip). 10 new lib tests (1215 → 1225): min magnitude
+  (15, length 1), value 16 / 21 / 270, exhaustive sweep 15..=29,
+  max representable (1_048_589, length 20), threshold / zero / past-
+  conformance rejects, and a `dc_sign` then `golomb` sequence at the
+  forward-scan c = 0 composition. fmt + clippy --all-targets clean.
+
 * **Round 213 — §5.11.39 coefficient base-level chain writers.** Extends
   `encoder::coefficients` with the per-coefficient `coeff_base_eob` /
   `coeff_base` / `coeff_br` writers — the reverse-scan body the §5.11.39

@@ -2,6 +2,73 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 215)
+
+Round 215 completes the §5.11.39 coefficient encode **end-to-end** by
+composing every per-coefficient primitive landed in rounds 212–214
+(`txb_skip` / `eob_pt` / `coeff_base_eob` / `coeff_base` / `coeff_br` /
+`dc_sign` / `golomb`) into a single per-transform-block driver that
+round-trips through the §5.11.39 `PartitionWalker::coefficients`
+reader.
+
+`encoder::coefficients` — one new pure, stateless driver
+(re-exported from `encoder`):
+
+* **`write_coefficients(writer, cdfs, plane, is_inter, tx_size,
+  tx_class, txb_skip_ctx, dc_sign_ctx, scan, quant_in) -> Result<u32,
+  Error>`** — full §5.11.39 driver. Takes the caller's final-`Quant[]`
+  array (signed, post-decoder values) and emits every symbol / literal
+  the reader would consume. Returns the written `eob` (0 on the
+  §5.11.39 line-13 all-zero short-circuit; otherwise the position
+  past the highest non-zero coefficient in scan order). Internally
+  maintains a running magnitude buffer that mirrors the decoder's
+  `Quant[]` state as the reverse-scan populates it, so the §8.3.2 ctx
+  helpers (`get_coeff_base_ctx` / `get_coeff_base_eob_ctx` /
+  `get_br_ctx`) agree on both sides. Same caller-bug guards as the
+  reader (`tx_size < TX_SIZES_ALL`, `tx_class <= TX_CLASS_VERT`,
+  `plane <= 2`, `is_inter <= 1`, `txb_skip_ctx < TXB_SKIP_CONTEXTS`,
+  `dc_sign_ctx < DC_SIGN_CONTEXTS`, `scan.len() >= seg_eob`,
+  `quant_in.len() >= tx_w * tx_h`).
+
+### Inverse strategy
+
+1. **Compute `eob`** as the largest `c + 1` over `0..seg_eob` for
+   which `quant_in[scan[c]] != 0`. `eob == 0` ⇒ `write_txb_skip(1)`
+   and return; the §5.11.39 line-13 short-circuit is byte-exact.
+2. **Reverse-scan** for `c = eob - 1 .. 0`: emit
+   `coeff_base_eob(min(|q|-1, 2))` (at `c == eob - 1`) or
+   `coeff_base(min(|q|, 3))` (otherwise); if the level lands at 3,
+   chain `coeff_br` with `sym = min(residue, 3)` per iteration,
+   capped at 4 iters per the §5.11.39 line-66
+   `COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) = 4` bound. Stamp
+   `running[pos] = min(|q|, 15)` so subsequent iterations' ctx
+   scans walk the same state the decoder will.
+3. **Forward-scan** for `c = 0 .. eob`: emit `dc_sign(sign)` at
+   `c == 0` (when `|q| > 0`) or `sign_bit` L(1) otherwise; if
+   `|q| > 14` (= NUM_BASE_LEVELS + COEFF_BASE_RANGE), emit the
+   §5.11.39 lines 84-93 golomb tail via `write_golomb(|q|)`.
+
+12 new end-to-end round-trip lib tests (1225 → 1237). Every test
+encodes `quant_in` through `write_coefficients`, decodes the bytes
+back through `PartitionWalker::coefficients`, and asserts the
+decoder's `Quant[]` matches `quant_in` cell-for-cell. Coverage:
+all-zero short-circuit, single DC = 1 (smallest non-trivial), two
+coefficients with mixed signs (DC = -1, AC = +2 — `dc_sign` +
+`sign_bit`), level 3 (chain-entry + immediate-terminate), level 8
+(mid-chain terminate), level 14 (full chain except last, no golomb),
+level 15 (chain saturates ⇒ minimal golomb), AC magnitude 30 with
+`sign_bit` (no `dc_sign` because DC = 0), TX_8X8 dense small pattern
+(6 non-zero positions, mixed signs), chroma ptype = 1 axis with
+off-origin `txb_skip_ctx` / `dc_sign_ctx`, large golomb (magnitude
+200, length 8) composed with a normal DC + AC, and an exhaustive
+caller-bug guard sweep (8 out-of-range arguments).
+
+Out of scope this arc (next): §5.11.4 partition decision-tree
+writer; §5.11.18 inter-arm `mode_info()` dispatcher; transform_tree /
+tx_size encode; intra angle / palette encode; the §7.13 dequant +
+§7.7 inverse-transform stages that consume the §5.11.39 coefficients
+on the encode-side rate-distortion loop.
+
 ## Status — 2026-05-28 (round 213)
 
 Round 213 extends `encoder::coefficients` with the **§5.11.39
