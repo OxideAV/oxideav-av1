@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 195)
+## Status — 2026-05-28 (round 196)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,98 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 196 lands the **§7.15 CDEF (Constrained Directional Enhancement
+Filter) — driver + direction search + primary + secondary tap
+filter**, sitting on top of the post-§7.14 deblocked `CurrFrame[plane]`
+samples per av1-spec p.318-324. The new `cdef` module exposes:
+
+* **§7.15.1 [`cdef_frame`] / [`cdef_block`]** — top-level per-8×8
+  walk over the luma `(MiRows, MiCols)` grid with the spec's `step4 =
+  Num_4x4_Blocks_Wide[BLOCK_8X8] = 2` stride; per-block driver that
+  copies `CurrFrame[plane]` into `CdefFrame[plane]` (the per-plane
+  8×8 region with subsampling), short-circuits when `idx == -1` or
+  when the four 4×4 cells' `Skips[]` all hold, and otherwise dispatches
+  the §7.15.2 direction search + the §7.15.3 primary / secondary
+  filter per plane. The luma path applies the `(priStr * (4 +
+  varStr) + 8) >> 4` strength rescale per av1-spec p.319 line 17683;
+  chroma uses the [`CDEF_UV_DIR`] lookup to translate `yDir` ↦ `dir`
+  per the §7.15.1 line 17696 schedule.
+* **§7.15.2 [`cdef_direction`]** — 8-direction match against the
+  `partial[8][15]` projection sums, scored via the [`DIV_TABLE`]
+  constant. The 4 cardinal directions (0 / 2 / 4 / 6) use the spec's
+  paired-symmetry accumulator; the 4 oblique directions (1 / 3 / 5
+  / 7) use the slab + tail formulation. Returns `(yDir, var)` with
+  `var = (bestCost - cost[(yDir + 4) & 7]) >> 10`.
+* **§7.15.3 [`cdef_filter_block`]** — per-plane filter that walks
+  the `h × w` plane region (`h = 8 >> subY`, `w = 8 >> subX`), and
+  for each output sample accumulates the [`CDEF_PRI_TAPS`][`(priStr
+  >> coeffShift) & 1`] tap pair along `dir` and the [`CDEF_SEC_TAPS`]
+  tap pair along `(dir ± 2) & 7`, both filtered through the
+  [`constrain`] damping primitive. The output is
+  `Clip3(min, max, x + ((8 + sum - (sum < 0)) >> 4))` per av1-spec
+  p.324 line 17892, where `min` / `max` track the actually-consulted
+  neighbour samples only (the `is_inside_filter_region` gate per
+  §5.11.52 / av1-spec p.103 drops off-region taps).
+* **[`constrain`]** — `sign * Clip3(0, |diff|, threshold - (|diff|
+  >> dampingAdj))` with `dampingAdj = Max(0, damping -
+  FloorLog2(threshold))` and a `threshold == 0 ⇒ 0` short-circuit.
+
+The tables [`CDEF_PRI_TAPS`], [`CDEF_SEC_TAPS`], [`CDEF_DIRECTIONS`],
+[`CDEF_SEC_TAPS`], [`DIV_TABLE`], and [`CDEF_UV_DIR`] are transcribed
+verbatim from av1-spec p.320-324.
+
+A small standalone [`CdefFrameContext`] bundles the §5.5 / §5.9.5 /
+§5.9.19 frame-header fields plus two `&dyn Fn(...)` closures the
+caller hooks into the §5.11 decode state (`cdef_idx`, `skip`),
+letting the driver run against synthetic predicates. The §5.9.19
+`CdefParams` (r10) and §5.11.56 `cdef_idx[]` walker (r157) are now
+consumed end-to-end: the parser-produced strength schedule + per-leaf
+index drive the sample-modification pass.
+
+Test count: 1026 → 1040 (+14 in lib). New tests (all in
+`cdef::tests`):
+
+* **`constrain_returns_zero_for_zero_threshold`** — `threshold == 0`
+  ⇒ 0 per av1-spec p.324 line 17920.
+* **`constrain_signs_match_diff_sign`** — modest `|diff| ≤
+  threshold` returns `±diff` verbatim (sign-preserving identity).
+* **`constrain_large_diff_clamped_by_threshold_minus_shifted`** —
+  large `|diff|` shifted past `threshold` collapses to 0.
+* **`cdef_directions_table_matches_spec`** — sanity-check three rows
+  of [`CDEF_DIRECTIONS`].
+* **`div_table_matches_spec`** — verbatim [`DIV_TABLE`] match.
+* **`cdef_uv_dir_lookup_identity_for_444`** — `subX = subY = 0`
+  passes `yDir` through unchanged.
+* **`direction_search_uniform_block_returns_zero_var`** — uniform
+  100-luma block ⇒ `(yDir = 0, var = 0)`.
+* **`direction_search_horizontal_stripes_pick_direction_2`** —
+  row-varying input picks direction 2 (taps along x, edge runs
+  horizontally).
+* **`direction_search_vertical_stripes_pick_direction_6`** —
+  column-varying input picks direction 6 (taps along y, edge runs
+  vertically).
+* **`cdef_block_with_idx_neg1_only_copies`** — `idx == -1` copies
+  the 8×8 source region into the destination and returns without
+  invoking §7.15.2 / §7.15.3.
+* **`cdef_block_with_skip_only_copies`** — every 4×4 `Skip[]` set
+  ⇒ filter path skipped; only the copy survives.
+* **`cdef_filter_uniform_block_is_idempotent`** — uniform input ⇒
+  `p - x = 0` ⇒ `sum = 0` ⇒ `delta = 0` ⇒ identity.
+* **`cdef_frame_driver_walks_every_8x8_anchor`** — 32×32 frame ⇒
+  4×4 anchors, all `idx == -1`, every cell of the destination
+  matches the source after the driver returns.
+* **`cdef_frame_chroma_copy_respects_subsampling`** — 16×16 luma +
+  8×8 chroma at 4:2:0, the driver copies each plane at its
+  sub-sampled stride.
+
+The §7.14 deblock pass landed in r195; r196 adds the de-ringing pass
+that runs immediately after, completing the
+`reconstruct ↦ deblock ↦ CDEF ↦ (upscale) ↦ (LR)` sample-flow. §7.16
+superres upscaling and §7.17 loop restoration remain on the roadmap
+for subsequent arcs, as does the §7.20 film-grain post-pass.
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
 
 Round 195 lands the **§7.14 loop filter (deblocking) — driver +
 edge-strength + 4/8/14-tap filter bodies**, sitting on top of the

@@ -6,6 +6,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 196 — §7.15 CDEF (Constrained Directional Enhancement
+  Filter) — top-level driver + direction search + primary +
+  secondary tap filter.**
+  New `cdef` module exposes the full §7.15 de-ringing surface acting
+  on the post-§7.14 deblocked `CurrFrame[plane]` samples per av1-spec
+  p.318-324: `cdef_frame` (§7.15.1 per-8×8 walk with `step4 = 2`
+  stride and `cdef_idx[r & cdefMask4][c & cdefMask4]` anchor lookup),
+  `cdef_block` (§7.15.1 per-block driver — `CurrFrame ↦ CdefFrame`
+  copy, `idx == -1` / `Skips[]`-all short-circuits, luma `(priStr *
+  (4 + varStr) + 8) >> 4` strength rescale, chroma `CDEF_UV_DIR`
+  translation), `cdef_direction` (§7.15.2 — 8-direction
+  `partial[8][15]` projection + `DIV_TABLE` cost accumulator + `var
+  = (bestCost - cost[(yDir + 4) & 7]) >> 10`), `cdef_filter_block`
+  (§7.15.3 per-plane filter — `CDEF_PRI_TAPS` along `dir` +
+  `CDEF_SEC_TAPS` along `(dir ± 2) & 7`, both filtered through
+  `constrain` damping, output `Clip3(min, max, x + ((8 + sum -
+  (sum < 0)) >> 4))`), and `constrain` (§7.15.3 primitive — `sign *
+  Clip3(0, |diff|, threshold - (|diff| >> dampingAdj))` with
+  `dampingAdj = Max(0, damping - FloorLog2(threshold))`).
+  Tables `CDEF_PRI_TAPS`, `CDEF_SEC_TAPS`, `CDEF_DIRECTIONS`,
+  `DIV_TABLE`, `CDEF_UV_DIR` are transcribed verbatim from av1-spec
+  p.320-324. A small standalone `CdefFrameContext` bundles the
+  §5.5 / §5.9.5 / §5.9.19 frame-header inputs plus closures for the
+  §5.11 decode state (`cdef_idx`, `skip`). The §5.9.19 `CdefParams`
+  (r10) and §5.11.56 `cdef_idx[]` walker (r157) are now consumed
+  end-to-end. Test count 1026 → 1040 (+14 in lib): 3 `constrain`
+  axis tests, 3 table sanity tests, 3 direction-search tests
+  (uniform / horizontal / vertical stripes), 3 `cdef_block`
+  copy / skip / filter-identity tests, and 2 frame-level
+  driver-walk tests covering the chroma sub-sampling path.
 * **Round 195 — §7.14 loop filter (deblocking) — top-level driver +
   edge-strength + narrow/wide filter bodies.**
   New `loop_filter` module exposes the full §7.14 deblocking surface

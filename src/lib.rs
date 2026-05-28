@@ -1519,6 +1519,7 @@
 use oxideav_core::RuntimeContext;
 
 mod bitreader;
+pub mod cdef;
 pub mod cdf;
 pub mod frame_header;
 pub mod inter_pred;
@@ -1767,6 +1768,10 @@ pub use transform::{
 // §7.11.3.9-10 sample-generation leaves (themselves landed in r191 /
 // r192 / r193). The next-arc targets are wiring the compound / WARP /
 // OBMC arms into the driver, and §7.14 loop filter.
+pub use cdef::{
+    cdef_block, cdef_direction, cdef_filter_block, cdef_frame, constrain, CdefFrameContext,
+    CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, DIV_TABLE,
+};
 pub use inter_pred::{
     block_inter_prediction, block_shape, block_warp, clip1_single_ref, compound_distance_blend,
     difference_weight_mask, distance_weights, get_relative_dist, intra_mode_variant_mask,
