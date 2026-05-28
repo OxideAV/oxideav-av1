@@ -2,6 +2,51 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 219)
+
+Round 219 starts the **pixel-space encoder bootstrap** — the bridge
+between the arc-1..12 syntax-only encoder (consumed pre-decided
+`Quant[]` arrays) and a real encoder that takes pixel residuals as
+input. Landed: the **forward 4×4 DCT** primitive, matrix transpose of
+the §7.13.2.3 inverse DCT-4 in `crate::transform::inverse_dct` (`n = 2`
+branch).
+
+`encoder::forward_transform` — two stateless functions (re-exported
+from `encoder`):
+
+* **`forward_dct_4(t, r)`** — 1D DCT-II of length 4. Single
+  §4.7.2 `Round2(_, 12)` per output coefficient. The integer matrix
+  `M^T = (1 / 4096) * [[2896, 2896, 2896, 2896], [3784, 1567, -1567,
+  -3784], [2896, -2896, -2896, 2896], [1567, -3784, 3784, -1567]]` is
+  derived clean-room by walking the inverse on the four unit-
+  coefficient inputs.
+* **`forward_dct_4x4(input) -> [i64; 16]`** — 2D DCT-II for `TX_4X4`,
+  row-then-column composition of `forward_dct_4`.
+
+Roundtrip verification: `M^T · M` is exactly diagonal (the basis is
+mutually orthogonal — off-diagonal entries are exact zeros) with
+diagonal `≈ 1.99988` on even rows and `≈ 1.99994` on odd rows because
+the AV1 cosine constants `2896`, `3784`, `1567` are integer-rounded
+approximations of the analytic cosines used by the continuous DCT-II.
+The §7.13.3 dispatcher conceals this asymmetry behind the
+`Round2(_, rowShift)` / `Round2(_, colShift)` per-axis right-shifts;
+a real encoder applies a forward-equivalent quantization step with
+per-axis quantizers tuned to absorb the basis-vector scale difference
+before storing coefficients.
+
+10 new lib tests (1288 → 1298): zero-input, DC-only, unit-vector
+matrix-transpose probe, two-mode roundtrip (DC shorthand + full
+matrix `M^T · M` exact-diagonal-and-zero-off-diagonal), linearity
+at 4096-aligned inputs, 2D zero / DC / impulse / all-position bound
+coverage.
+
+Out of scope this arc (next): forward DCT for sizes 8 / 16 / 32 / 64;
+forward ADST / FLIPADST / WHT / IDTX; quantization primitive
+(`Quant[]` ← scaled coefficients); §7.13.3-equivalent forward 2D
+dispatcher with row-/col-shift envelope; full pixel-space encoder
+driver assembling the forward kernels with quant + the r211–r218
+syntax writers.
+
 ## Status — 2026-05-28 (round 217)
 
 Round 217 lands the §5.11.4 **recursive dispatch driver** — the encoder

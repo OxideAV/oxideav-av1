@@ -6,6 +6,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 219 — pixel-space encoder bootstrap: forward 4×4 DCT.** First
+  primitive that takes pixel residuals as input (the rest of the
+  encoder arc 1..12 consumed pre-decided `Quant[]` arrays). Two
+  stateless functions in `encoder::forward_transform`:
+
+  * `forward_dct_4(t, r)` — 1D DCT-II of length 4. Matrix transpose
+    of the §7.13.2.3 inverse DCT-4 reproduced in
+    [`crate::transform::inverse_dct`] (`n = 2` branch). Single
+    §4.7.2 `Round2(_, 12)` per output coefficient. Coefficients
+    derived by walking the inverse on the four 4-dimensional unit-
+    coefficient inputs: `M^T = (1 / 4096) * [[2896, 2896, 2896,
+    2896], [3784, 1567, -1567, -3784], [2896, -2896, -2896, 2896],
+    [1567, -3784, 3784, -1567]]`.
+  * `forward_dct_4x4(input) -> [i64; 16]` — 2D DCT-II for `TX_4X4`,
+    row-then-column composition of `forward_dct_4`. No `Lossless`
+    short-circuit, no rectangular scaling (square block), no row-
+    /col-shift envelope (those belong to a §7.13.3-equivalent
+    forward 2D dispatcher, the subsequent arc).
+
+  Roundtrip verification: `M^T · M` is exactly diagonal (the basis is
+  mutually orthogonal — off-diagonal entries are exact zeros) with
+  diagonal `≈ 1.99988` on even rows and `≈ 1.99994` on odd rows
+  because the AV1 cosine constants `2896`, `3784`, `1567` are
+  integer-rounded approximations of the analytic cosines used by the
+  continuous DCT-II. 8 tests: zero-input, DC-only, unit-vector
+  matrix-transpose probe, all-basis-coefficient roundtrip (exact
+  diagonal + exact zero off-diagonal), linearity at 4096-aligned
+  inputs, 2D zero / DC / impulse / all-position bound coverage. Test
+  total 1288 → 1298.
+
 * **Round 218 — §5.11.36 transform_tree / tx_size writers.** The
   encoder counterpart of
   [`crate::cdf::PartitionWalker::read_block_tx_size`] and

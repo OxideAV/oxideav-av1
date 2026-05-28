@@ -136,14 +136,32 @@
 //! Leaf/Split shape already used for the §5.11.4 `partition_tree`
 //! dispatch.
 //!
-//! Next arc: §5.11.18 inter-arm `mode_info()` dispatcher; intra angle
-//! / palette encode. §5.9.7 `frame_size_with_refs()` inverse + §5.9.24
-//! `read_global_param` signed-subexp inverse for the remaining
-//! inter-frame paths.
+//! Arc 13 (round 219) bootstraps the **pixel-space encoder** with the
+//! forward 4×4 DCT primitive in [`forward_transform`]: 1D
+//! [`forward_transform::forward_dct_4`] and 2D
+//! [`forward_transform::forward_dct_4x4`]. The kernel is the matrix
+//! transpose of the §7.13.2.3 inverse DCT-4 reproduced in
+//! [`crate::transform::inverse_dct`] (`n = 2` branch). Round-trip
+//! lockstep against the inverse confirms `M^T · M ≈ 2 · I` (exactly
+//! diagonal; ≈ 1.999 on even rows and ≈ 2.072 on odd rows because the
+//! AV1 cosine constants are integer-rounded approximations of the
+//! analytic values). The off-diagonal entries are exactly zero — the
+//! basis is mutually orthogonal. This primitive is the bridge between
+//! the arc-1..12 syntax-only encoder (consumes pre-decided `Quant[]`)
+//! and a real encoder that takes pixel residuals as input.
+//!
+//! Next arc: forward DCT for sizes 8 / 16 / 32 / 64; forward ADST /
+//! FLIPADST / WHT / IDTX; quantization primitive; full pixel-space
+//! encoder driver assembling the forward kernels with quant + the
+//! r211–r218 syntax writers. §5.11.18 inter-arm `mode_info()`
+//! dispatcher; intra angle / palette encode. §5.9.7
+//! `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
+//! signed-subexp inverse for the remaining inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
 pub mod coefficients;
+pub mod forward_transform;
 pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
@@ -163,6 +181,7 @@ pub use coefficients::{
     write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,
     write_eob_pt, write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
 };
+pub use forward_transform::{forward_dct_4, forward_dct_4x4};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;
 pub use obu::{
