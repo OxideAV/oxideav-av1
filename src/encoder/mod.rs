@@ -179,6 +179,7 @@ pub mod ivf;
 pub mod obu;
 pub mod partition;
 pub mod partition_tree;
+pub mod pixel_driver;
 pub mod sequence_obu;
 pub mod symbol_writer;
 pub mod temporal_unit;
@@ -204,6 +205,10 @@ pub use obu::{
 pub use partition::{partition_none_only, partition_split_only, write_partition};
 pub use partition_tree::{
     write_partition_tree, EncodeBlock, EncodeNode, PartitionTreeWriter, PlaneCoefficients,
+};
+pub use pixel_driver::{
+    dispatch_order_cells, encode_intra_frame_y, CellCoord, EncodedFrame, CELLS_HIGH, CELLS_WIDE,
+    FRAME_HEIGHT, FRAME_WIDTH, MI_COLS, MI_ROWS,
 };
 pub use sequence_obu::write_sequence_header_obu;
 pub use symbol_writer::SymbolWriter;

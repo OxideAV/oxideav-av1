@@ -2,6 +2,66 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 221)
+
+Round 221 lands the **first pixel-in / bytes-out encoder driver** —
+the milestone arc bridging the r206..r220 syntax-only encoder and a
+real encoder. `encoder::pixel_driver::encode_intra_frame_y(luma_in,
+seq, fh) -> EncodedFrame` composes every primitive landed between
+r206 and r220 into one entry point that takes a 16×16 monochrome
+luma plane and returns the IVF bytes plus the encoder's internal
+reconstructed pixel plane:
+
+* §7.11.2.5 DC_PRED prediction (`cdf::predict_intra_dc_pred`,
+  built from the running reconstructed-neighbour buffer in the same
+  §5.11.4 dispatch order the decoder observes).
+* Pixel residual = input − prediction.
+* Forward 4×4 DCT (r219 `encoder::forward_dct_4x4`).
+* Forward quantization (r220 `encoder::forward_quantize`).
+* §5.11.4 recursive partition writer (r217 `encoder::write_partition_tree`):
+  BLOCK_16X16 root → SPLIT into 4 BLOCK_8X8 → each SPLIT into 4
+  BLOCK_4X4 leaves; 16 leaves total per frame.
+* §5.11.39 coefficient writer (r212–r215 `encoder::write_coefficients`).
+* §5.11.1 tile-group OBU framing (r210).
+* §7.5 temporal-unit aggregation (r208, extended this arc to carry
+  FrameHeader OBU **and** TileGroup OBU per frame).
+* IVF v0 container (r206).
+
+**Bit-exact pixel roundtrip on flat-128 input.** Feeding a 16×16
+mid-grey luma plane (every sample = 128) at `base_q_idx = 0`
+produces zero `Quant[]` at every leaf; the encoder-internal
+reconstruction (the same `dequantize_step1` + `inverse_transform_2d`
+chain the decoder runs at each leaf) recovers the input exactly.
+This is the first pixel-input that round-trips through the encoder.
+
+**Structural roundtrip through the OBU framework.** The IVF bytes
+the driver emits walk back through `ObuIter` as TD + SH + FrameHeader
+OBU + TileGroup OBU; the SH and FH reparse identically against the
+original tiny fixture inputs.
+
+**What still doesn't pixel-roundtrip.** Inputs whose residual is
+non-zero (any non-flat-128 input) round-trip through the encoder's
+inverse chain self-consistently but with the inherent DCT_DCT quant
+loss at `q_index = 0` (the §7.13.3 `Lossless` flag requires the WHT
+row/column kernel — there is no forward-WHT primitive yet; that's
+the next-arc unlock for true pixel-perfect lossless).
+
+8 new lib tests + 6 new integration tests
+(`encoder_pixel_driver_y_only.rs`) (1308 → 1316 lib; +6 integration):
+dispatch-order coverage + Z-curve shape, flat-128 zero-quant proof,
+flat-128 reconstruction bit-exactness, internal-helper vs driver
+agreement, IVF preamble + 4-OBU walk, SH/FH reparse equality,
+tile-group OBU payload non-emptiness.
+
+Out of scope this arc (next): forward WHT for the §7.13.3 Lossless
+path (unlocks pixel-perfect roundtrip on arbitrary input at
+`q_index = 0`); pixel-driver chroma path (needs frame-header build
+with `monochrome = false`); forward DCT for TX sizes
+8 / 16 / 32 / 64 + non-DCT row/column kernels (ADST / FLIPADST /
+IDTX); pixel-driver via the standalone `decode_av1` entry (that
+entry remains a stub — wiring the existing decoder modules into a
+full pipeline is its own arc).
+
 ## Status — 2026-05-28 (round 220)
 
 Round 220 continues the **pixel-space encoder bootstrap** with the

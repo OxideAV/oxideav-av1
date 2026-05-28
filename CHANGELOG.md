@@ -6,6 +6,47 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 221 — pixel-space encoder driver (milestone arc).** First
+  end-to-end pixel-in / bytes-out entry point. New module
+  `encoder::pixel_driver` exposes
+  `encode_intra_frame_y(luma_in, seq, fh) -> EncodedFrame` composing
+  r219 `forward_dct_4x4`, r220 `forward_quantize`, r217
+  `write_partition_tree`, r210 `write_tile_group_obu`, r208 temporal
+  unit aggregation, and r206 IVF — into one call that converts a
+  16×16 monochrome luma plane into a complete IVF byte buffer.
+
+  The driver builds its own §7.11.2.5 DC_PRED prediction from the
+  running reconstructed neighbour buffer in §5.11.4 dispatch order
+  (NW → NE → SW → SE recursion across the BLOCK_16X16 / BLOCK_8X8 /
+  BLOCK_4X4 two-level split), then per-leaf computes the residual,
+  applies the forward DCT, forward-quantizes at `base_q_idx = 0`, and
+  immediately runs the decoder's `dequantize_step1` +
+  `inverse_transform_2d` chain to reconstruct the leaf's pixels for
+  the next leaf's prediction. Output `EncodedFrame` bundles the IVF
+  bytes, the temporal-unit body, the per-leaf committed `Quant[]`
+  arrays, and the encoder-internal reconstructed luma plane.
+
+  **Bit-exact pixel roundtrip on flat-128 input.** For a 16×16
+  mid-grey luma plane the DC_PRED prediction equals the input at
+  every leaf ⇒ residual = 0 ⇒ all coefficients = 0 ⇒ all
+  `Quant[]` = 0 ⇒ recovered residual = 0 ⇒ recovered pixels = 128
+  exactly. The first end-to-end pixel roundtrip the encoder
+  achieves.
+
+  Out of scope (next arc): the forward WHT primitive that unlocks
+  the §7.13.3 `Lossless` path (for arbitrary-input pixel-perfect
+  roundtrip at `q_index = 0`); chroma path; forward DCT for larger
+  sizes / non-DCT row+column kernels.
+
+  14 tests total (8 lib + 6 integration in
+  `tests/encoder_pixel_driver_y_only.rs`): dispatch-order coverage
+  + Z-curve shape verification, flat-128 zero-quant proof, flat-128
+  bit-exact reconstruction, internal-helper vs driver agreement,
+  IVF preamble + 4-OBU walk (TD + SH + FrameHeader OBU + TileGroup
+  OBU), SH/FH reparse equality, tile-group OBU payload
+  non-emptiness, lossy-but-self-consistent uniform-64 input round-
+  trip.
+
 * **Round 220 — forward quantization primitive.** Encoder counterpart
   of the §7.12.3 step-1 dequant loop (`cdf::dequantize_step1`). New
   function `encoder::forward_quantize::forward_quantize(coeffs,
