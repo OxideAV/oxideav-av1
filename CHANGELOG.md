@@ -6,6 +6,45 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 222 — forward Walsh-Hadamard transform (lossless milestone).**
+  Encoder counterpart of the §7.13.2.10 inverse WHT used by the §7.13.3
+  `Lossless` arm. New module `encoder::forward_wht` exposes
+  `forward_wht4(t, shift)` (1D length-4 with caller-supplied pre-shift)
+  and `forward_wht_4x4(input) -> [i64; 16]` (2D `TX_4X4` with the
+  §7.13.3 lossless shift envelope: column pass `shift = 0`, row pass
+  `shift = 2`).
+
+  Derived clean-room by inverting the §7.13.2.10 inverse body
+  algebraically: the four output cells `(a_out, b_out, c_out, d_out)`
+  determine `A = a_out + b_out` and `D = d_out - c_out`, from which the
+  pre-shift values `(a0, b0, c0, d0)` are recovered exactly; the
+  `(A - D) >> 1` floor-halving is shared between forward and inverse
+  so the round-trip is bit-exact regardless of `(A - D)` parity. The
+  forward output is multiplied by `1 << shift` to cancel the inverse's
+  `>> shift` pre-scaling, keeping the row-pass round-trip lossless.
+
+  `encoder::pixel_driver::encode_intra_frame_y` now routes through the
+  forward WHT when the §5.9.2 `CodedLossless` predicate fires
+  (`base_q_idx == 0 && DeltaQ?? all zero`, satisfied by the tiny
+  fixture's `QuantizerParams::neutral(0, 8)`). Because every WHT
+  coefficient is divisible by the lossless `q2 = 4` (the row pass
+  multiplies by `1 << 2`), the forward-quantize round-trip is exact;
+  the encoder-internal reconstruction (decoder's `dequantize_step1` +
+  `inverse_transform_2d` with `lossless = true`) recovers any input
+  pixel-for-pixel. **Bit-exact pixel roundtrip on arbitrary input —
+  the milestone unlock.**
+
+  13 new lib tests (1316 → 1329): 10 in `encoder::forward_wht`
+  (shift = 0 / shift = 2 1D sweeps over the `[-256, 255]` range across
+  every slot; mixed-slot round-trip including odd-parity cases; 2D
+  zero/flat-DC/unit-impulse/LCG-sweep/linearity round-trips against
+  `inverse_transform_2d(lossless = true)`; short-buffer caller-bug
+  panic) and 3 in `encoder::pixel_driver` (non-uniform pattern,
+  horizontal gradient, pseudo-random LCG — all now bit-exact through
+  the lossless WHT path). The pre-existing flat-64 reconstruction
+  test is upgraded from a generous `|delta| <= 80` envelope to a
+  strict bit-exact equality.
+
 * **Round 221 — pixel-space encoder driver (milestone arc).** First
   end-to-end pixel-in / bytes-out entry point. New module
   `encoder::pixel_driver` exposes

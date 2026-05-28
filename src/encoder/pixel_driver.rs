@@ -91,6 +91,7 @@ use crate::cdf::{
 };
 use crate::encoder::forward_quantize::forward_quantize;
 use crate::encoder::forward_transform::forward_dct_4x4;
+use crate::encoder::forward_wht::forward_wht_4x4;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::obu::ObuFrame;
 use crate::encoder::partition_tree::{
@@ -263,6 +264,22 @@ pub fn encode_intra_frame_y(
     // header: dc_q = ac_q = 4, dqDenom = 1, no QM.
     let qp = QuantizerParams::neutral(0, 8);
     let scan = get_default_scan(TX_4X4).to_vec();
+    // §5.9.2 `CodedLossless` predicate, simplified for the
+    // neutral-quantizer / no-segmentation path this driver runs on:
+    // `base_q_idx == 0 && all DeltaQ?? == 0` (the `QuantizerParams::neutral`
+    // constructor zeros every delta). When true, the per-block §6.10.1
+    // `Lossless` flag is `1` for every block in the frame ⇒ §5.11.5
+    // forces `tx_size = TX_4X4` and §7.13.3 routes through the
+    // §7.13.2.10 inverse WHT path. The encoder mirrors this with the
+    // forward WHT instead of forward DCT, which makes the
+    // `(forward_wht, forward_quantize) → (dequantize_step1, inverse_WHT)`
+    // chain bit-exact on arbitrary inputs.
+    let lossless = qp.base_q_idx == 0
+        && qp.delta_q_y_dc == 0
+        && qp.delta_q_u_dc == 0
+        && qp.delta_q_u_ac == 0
+        && qp.delta_q_v_dc == 0
+        && qp.delta_q_v_ac == 0;
 
     // Encoder-side state: a running reconstructed-pixel buffer and a
     // per-cell list of committed `Quant[]` arrays in dispatch order.
@@ -289,18 +306,31 @@ pub fn encode_intra_frame_y(
                 residual[i * 4 + j] = p - q;
             }
         }
-        // Forward transform.
-        let coeffs = forward_dct_4x4(&residual);
+        // Forward transform. On the lossless arm route through the
+        // forward 4×4 WHT (the bit-exact integer inverse of the
+        // §7.13.2.10 inverse WHT used by §7.13.3's `Lossless` branch);
+        // otherwise the forward DCT (lossy at q_index > 0).
+        let coeffs = if lossless {
+            forward_wht_4x4(&residual).to_vec()
+        } else {
+            forward_dct_4x4(&residual).to_vec()
+        };
         // Forward quantize at q_index = 0, DCT_DCT, no QM (seg_qm_level
-        // = 15 takes the identity branch).
+        // = 15 takes the identity branch). On the lossless arm, every
+        // `forward_wht_4x4` output is divisible by `4 = q2 / dq_denom`
+        // (the row pass multiplies by `1 << 2`), so the forward
+        // quantizer round-trip is bit-exact.
         let quant = forward_quantize(&coeffs, TX_4X4, /* plane = */ 0, 0, DCT_DCT, 15, &qp);
         committed_quants.push(quant.clone());
 
         // Encoder-internal pixel reconstruction: decoder walk of these
-        // same `quant` values.
+        // same `quant` values. Pass the `lossless` flag through to the
+        // §7.13.3 dispatcher so the inverse WHT path matches the
+        // encoder's forward WHT choice.
         let dequant = dequantize_step1(&quant, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
-        let residual_back =
-            inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, /* bit_depth = */ 8, false);
+        let residual_back = inverse_transform_2d(
+            &dequant, TX_4X4, DCT_DCT, /* bit_depth = */ 8, lossless,
+        );
         for i in 0..4 {
             for j in 0..4 {
                 let p = pred[i * 4 + j] as i64 + residual_back[i * 4 + j];
@@ -456,6 +486,12 @@ pub mod internal_roundtrip {
     /// re-running the encoder driver.
     pub fn reconstruct_from_quants(quants: &[Vec<i32>]) -> [[u8; FRAME_WIDTH]; FRAME_HEIGHT] {
         let qp = QuantizerParams::neutral(0, 8);
+        let lossless = qp.base_q_idx == 0
+            && qp.delta_q_y_dc == 0
+            && qp.delta_q_u_dc == 0
+            && qp.delta_q_u_ac == 0
+            && qp.delta_q_v_dc == 0
+            && qp.delta_q_v_ac == 0;
         let mut reconstructed: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] =
             [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
         let cells = dispatch_order_cells();
@@ -464,7 +500,7 @@ pub mod internal_roundtrip {
             let (row0, col0) = cc.pixel_origin();
             let pred = dc_pred_for_cell_y(&reconstructed, cc.cell_row, cc.cell_col);
             let dequant = dequantize_step1(quant, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
-            let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, false);
+            let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, lossless);
             for i in 0..4 {
                 for j in 0..4 {
                     let p = pred[i * 4 + j] as i64 + residual[i * 4 + j];
@@ -626,47 +662,98 @@ mod tests {
     }
 
     #[test]
-    fn encode_uniform_64_input_internal_inverse_chain_is_self_consistent() {
-        // Flat input ≠ mid-grey ⇒ DCT + quantization introduces a
-        // measurable but bounded lossy error (q_index = 0, DCT_DCT is
-        // NOT lossless — pixel-perfect lossless requires the §7.13.3
-        // `Lossless` WHT path, which needs a forward WHT primitive
-        // landed in a follow-up arc). The non-trivial roundtrip
-        // contract this arc validates is **encoder-internal
-        // consistency**: the driver's reconstruction equals what the
-        // `internal_roundtrip` helper produces from the same committed
-        // `Quant[]` arrays. This is the same chain the decoder would
-        // run, so it confirms the encoder's `(forward_dct, forward_quantize)`
-        // chain is the true inverse of the decoder's
-        // `(dequantize_step1, inverse_transform_2d)` chain.
+    fn encode_uniform_64_input_internal_inverse_chain_is_bit_exact() {
+        // Flat input ≠ mid-grey ⇒ first-block residual is `-64` (every
+        // pixel minus the no-neighbour DC_PRED = 128 default). The
+        // r222 forward WHT routes the q_index = 0 path through the
+        // §7.13.3 `Lossless` arm, so the encoder's reconstruction is
+        // pixel-perfect bit-exact — no per-pixel error envelope this
+        // time (subsequent blocks predict from the recovered 64 pixels
+        // ⇒ zero residual chain).
         let seq = tiny_seq();
         let fh = tiny_fh(&seq);
         let luma: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[64u8; FRAME_WIDTH]; FRAME_HEIGHT];
         let result = encode_intra_frame_y(&luma, &seq, &fh).expect("encode succeeds");
         let recon = internal_roundtrip::reconstruct_from_quants(&result.committed_quants);
         assert_eq!(recon, result.reconstructed_y);
-        // Bound the per-pixel error against the input. The DCT_DCT
-        // round-trip on a flat residual of -64 produces a DC quant of
-        // ~Round2(-64 * 8190 / 4096, 4) = ~-32; dequant scales it back
-        // by `4 * dqDenom = 4`, then the inverse transform's
-        // colShift = 4 right-shift produces a recovered residual ≈ -64
-        // ± O(1) per cell (with intermediate rounding in the four
-        // Round2 stages of the DCT). Empirically observed: first-row
-        // pixel 0 = 112 (recovered residual ≈ -16, off by 48 from the
-        // ideal -64). The bound is intentionally generous — the DCT
-        // basis isn't unitary in the 1 / 4096 integer form, so the
-        // per-pixel error scales with the residual magnitude. The
-        // *exact* recovery of the flat-128 case (zero residual ⇒ zero
-        // error) is the pixel-perfect guarantee this arc lands.
         for i in 0..FRAME_HEIGHT {
             for j in 0..FRAME_WIDTH {
-                let recon_val = result.reconstructed_y[i][j] as i32;
-                assert!(
-                    (recon_val - 64).abs() <= 80,
-                    "[{i}][{j}]: recon = {recon_val}, |delta| > 80 from input 64"
+                assert_eq!(
+                    result.reconstructed_y[i][j], 64,
+                    "[{i}][{j}]: recon = {} != 64 (lossless WHT path)",
+                    result.reconstructed_y[i][j]
                 );
             }
         }
+    }
+
+    /// Bit-exact pixel roundtrip on a non-uniform input — the r222
+    /// milestone unlock. At `base_q_idx = 0` the §7.13.3 `Lossless`
+    /// arm routes through the §7.13.2.10 WHT, which is a pure
+    /// integer-reversible butterfly. The encoder mirrors with
+    /// `forward_wht_4x4`, and every coefficient ends up divisible by
+    /// the lossless q2 = 4 (the WHT row pass multiplies by `1 << 2`),
+    /// so the quantize → dequantize chain is exact. End-to-end the
+    /// encoder's reconstruction must equal the input pixel-for-pixel.
+    #[test]
+    fn encode_non_uniform_input_roundtrips_bit_exact_lossless() {
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        // Deterministic non-uniform pattern: pixel = (16 * row + col)
+        // mod 256, which exercises a wide range of inter-cell deltas
+        // and forces non-zero residuals at every block.
+        let mut luma: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        for (i, row) in luma.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = ((16 * i + j) & 0xFF) as u8;
+            }
+        }
+        let result = encode_intra_frame_y(&luma, &seq, &fh).expect("encode succeeds");
+        assert_eq!(
+            result.reconstructed_y, luma,
+            "lossless WHT roundtrip failed on non-uniform input"
+        );
+    }
+
+    /// Bit-exact pixel roundtrip on a horizontal-gradient input —
+    /// stresses the row-direction WHT path. The gradient covers the
+    /// full `[0, 255]` u8 range across the frame width.
+    #[test]
+    fn encode_horizontal_gradient_roundtrips_bit_exact_lossless() {
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        let mut luma: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        for row in luma.iter_mut() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = (j * 16) as u8;
+            }
+        }
+        let result = encode_intra_frame_y(&luma, &seq, &fh).expect("encode succeeds");
+        assert_eq!(result.reconstructed_y, luma);
+    }
+
+    /// Bit-exact pixel roundtrip on a pseudo-random input — the
+    /// definitive "any pixels round-trip exactly" test. Deterministic
+    /// LCG so failures replay identically.
+    #[test]
+    fn encode_pseudorandom_input_roundtrips_bit_exact_lossless() {
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        let mut luma: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        let mut state: u64 = 0x0123_4567_89AB_CDEF;
+        for row in luma.iter_mut() {
+            for cell in row.iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *cell = (state >> 56) as u8;
+            }
+        }
+        let result = encode_intra_frame_y(&luma, &seq, &fh).expect("encode succeeds");
+        assert_eq!(
+            result.reconstructed_y, luma,
+            "lossless WHT roundtrip failed on pseudo-random input"
+        );
     }
 
     #[test]

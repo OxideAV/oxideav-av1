@@ -161,19 +161,34 @@
 //! truncating divide; bit-exact roundtrip on the lossless
 //! `q_index = 0` lattice and within one quantization step elsewhere.
 //!
-//! Next arc: forward DCT for sizes 8 / 16 / 32 / 64; forward ADST /
-//! FLIPADST / WHT / IDTX; full pixel-space encoder driver assembling
-//! the forward kernels with [`forward_quantize`] + the r211–r218
-//! syntax writers, packaged as a YUV → IVF entry. §5.11.18 inter-arm
-//! `mode_info()` dispatcher; intra angle / palette encode. §5.9.7
-//! `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
-//! signed-subexp inverse for the remaining inter-frame paths.
+//! Arc 16 (round 222) lands the **forward 4×4 Walsh-Hadamard transform**
+//! in [`forward_wht`]: 1D [`forward_wht::forward_wht4`] and 2D
+//! [`forward_wht::forward_wht_4x4`]. Derived clean-room by inverting
+//! the §7.13.2.10 inverse-WHT body algebraically (the four output cells
+//! determine `A = a + b` and `D = d - c` uniquely; the `(A - D) >> 1`
+//! halving is shared between forward and inverse so the round-trip is
+//! exact regardless of parity). Unlike the integer-approximated DCT,
+//! the WHT is a **pure integer butterfly** ⇒ **bit-exact round-trip
+//! for any integer input**. [`pixel_driver::encode_intra_frame_y`] now
+//! routes through the forward WHT on the §5.9.2 `CodedLossless` arm
+//! (`base_q_idx == 0 && DeltaQ?? all zero`), unlocking pixel-perfect
+//! roundtrip on arbitrary inputs at `base_q_idx = 0`.
+//!
+//! Next arc: pixel-driver chroma path (needs frame-header build with
+//! `monochrome = false`); forward DCT for sizes 8 / 16 / 32 / 64;
+//! forward ADST / FLIPADST / IDTX; standalone `decode_av1` entry that
+//! wires the existing decoder modules into a full pipeline. §5.11.18
+//! inter-arm `mode_info()` dispatcher; intra angle / palette encode.
+//! §5.9.7 `frame_size_with_refs()` inverse + §5.9.24
+//! `read_global_param` signed-subexp inverse for the remaining
+//! inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;
 pub mod coefficients;
 pub mod forward_quantize;
 pub mod forward_transform;
+pub mod forward_wht;
 pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
@@ -196,6 +211,7 @@ pub use coefficients::{
 };
 pub use forward_quantize::forward_quantize;
 pub use forward_transform::{forward_dct_4, forward_dct_4x4};
+pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;
 pub use obu::{

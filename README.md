@@ -2,6 +2,62 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 222)
+
+Round 222 lands the **forward 4×4 Walsh-Hadamard transform** — the
+encoder counterpart of the §7.13.2.10 inverse WHT used by the §7.13.3
+`Lossless` arm — and routes the r221 pixel driver through it. The
+WHT is a **pure integer butterfly** (only `+`, `-`, and `>> 1`), so
+forward+inverse round-trips are **bit-exact for any integer input**.
+This is the milestone unlock for **pixel-perfect roundtrip on
+arbitrary inputs** at `base_q_idx = 0`.
+
+`encoder::forward_wht` — two stateless functions (re-exported from
+`encoder`):
+
+* **`forward_wht4(t, shift)`** — 1D length-4 with caller-supplied
+  pre-shift. Derived clean-room by inverting the §7.13.2.10 inverse
+  body algebraically: the four output cells determine `A` and `D`
+  uniquely, and the `(A - D) >> 1` floor-halving is shared between
+  forward and inverse so the round-trip is exact regardless of
+  `(A - D)` parity. The output is multiplied by `1 << shift` so the
+  inverse's `>> shift` pre-scaling cancels.
+* **`forward_wht_4x4(input) -> [i64; 16]`** — 2D `TX_4X4` with the
+  §7.13.3 lossless shift envelope: column pass first (`shift = 0`)
+  then row pass (`shift = 2`), the exact transpose of the inverse 2D
+  dispatcher's row-then-column composition. No rectangular scaling
+  (TX_4X4 is square) and no between-stage clamp (the spec's
+  conformance bound is on the inverse path).
+
+`encoder::pixel_driver::encode_intra_frame_y` now detects the §5.9.2
+`CodedLossless` predicate (`base_q_idx == 0 && DeltaQ?? all zero`)
+and routes through `forward_wht_4x4` instead of `forward_dct_4x4`;
+the encoder-internal reconstruction passes `lossless = true` to
+`inverse_transform_2d` so the inverse WHT path matches. Every WHT
+coefficient is divisible by the lossless `q2 = 4` (the row pass
+multiplies by `1 << 2`), so `forward_quantize` /
+`dequantize_step1` round-trips bit-exactly. End-to-end the encoder
+now reconstructs **arbitrary inputs pixel-for-pixel** at
+`base_q_idx = 0`.
+
+13 new lib tests (1316 → 1329): 10 in `encoder::forward_wht`
+(shift = 0 / shift = 2 1D sweeps over the `[-256, 255]` range across
+every slot; mixed-slot round-trip including odd-parity `(A - D)`
+cases; 2D zero / flat-DC / unit-impulse / pseudo-random LCG sweep /
+linearity round-trips against `inverse_transform_2d(lossless = true)`;
+short-buffer caller-bug panic) and 3 in `encoder::pixel_driver`
+(non-uniform `(16 * row + col) mod 256` pattern, horizontal
+gradient, pseudo-random LCG — all bit-exact through the lossless
+WHT path). The pre-existing flat-64 reconstruction test is upgraded
+from a generous `|delta| <= 80` envelope to a strict bit-exact
+equality.
+
+Out of scope (next arc): pixel-driver chroma path (needs frame-header
+build with `monochrome = false`); forward DCT for TX sizes
+8 / 16 / 32 / 64 + non-DCT row/column kernels (ADST / FLIPADST /
+IDTX); the standalone `decode_av1` entry that wires the existing
+decoder modules into a full pipeline.
+
 ## Status — 2026-05-28 (round 221)
 
 Round 221 lands the **first pixel-in / bytes-out encoder driver** —
