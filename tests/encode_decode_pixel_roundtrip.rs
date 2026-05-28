@@ -167,3 +167,184 @@ fn y_only_encode_path_does_not_roundtrip_under_yuv_sh() {
     let res = decode_av1(&encoded.ivf_bytes);
     assert!(res.is_err());
 }
+
+// --------------------------------------------------------------------------
+// Arc r228 — 13-mode intra prediction picker tests.
+//
+// The encoder's `pick_best_intra_mode_4x4_y` selects whichever of the 13
+// §6.10.x Y intra modes yields the smallest residual SSD against the
+// input. These tests confirm:
+//
+//   1. A non-DC_PRED mode is actually picked on inputs designed to favour
+//      directional / smooth / paeth prediction.
+//   2. The full roundtrip (encode → decode → pixels) remains bit-exact on
+//      arbitrary inputs (the picker change must not regress the existing
+//      lossless WHT guarantee).
+//   3. The encoder's `committed_y_modes` array is in-range and matches the
+//      `encode_intra_frame_y` per-cell selection (one mode per BLOCK_4X4
+//      leaf).
+// --------------------------------------------------------------------------
+
+#[test]
+fn encoder_picks_non_dc_pred_on_horizontal_gradient_y_only() {
+    // A purely-horizontal gradient (`col * 16`, constant across rows) is
+    // best matched by V_PRED at most cells past the leftmost column — the
+    // above-row sample equals every cell below it by construction. DC_PRED
+    // would average a non-zero left col + above row to a worse value.
+    let (seq, fh) = tiny_descriptors();
+    let mut luma = [[0u8; 16]; 16];
+    for row in luma.iter_mut() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = (j * 16) as u8;
+        }
+    }
+    let result = oxideav_av1::encoder::encode_intra_frame_y(&luma, &seq, &fh).unwrap();
+    assert_eq!(result.committed_y_modes.len(), 16);
+    let non_dc_count = result
+        .committed_y_modes
+        .iter()
+        .filter(|&&m| m as usize != 0 /* DC_PRED ordinal */)
+        .count();
+    assert!(
+        non_dc_count > 0,
+        "expected at least one non-DC_PRED y_mode on a horizontal gradient, got {:?}",
+        result.committed_y_modes
+    );
+}
+
+#[test]
+fn encoder_picks_non_dc_pred_on_vertical_gradient_y_only() {
+    // A purely-vertical gradient (`row * 16`, constant across cols) is
+    // best matched by H_PRED at most cells past the top row.
+    let (seq, fh) = tiny_descriptors();
+    let mut luma = [[0u8; 16]; 16];
+    for (i, row) in luma.iter_mut().enumerate() {
+        for cell in row.iter_mut() {
+            *cell = (i * 16) as u8;
+        }
+    }
+    let result = oxideav_av1::encoder::encode_intra_frame_y(&luma, &seq, &fh).unwrap();
+    let non_dc_count = result
+        .committed_y_modes
+        .iter()
+        .filter(|&&m| m as usize != 0)
+        .count();
+    assert!(
+        non_dc_count > 0,
+        "expected at least one non-DC_PRED y_mode on a vertical gradient, got {:?}",
+        result.committed_y_modes
+    );
+}
+
+#[test]
+fn encoder_committed_y_modes_are_all_in_intra_mode_range() {
+    // Whatever the picker selects, every entry must be in 0..=12 (the §3
+    // INTRA_MODES set). Run on a pseudo-random input to stress every cell.
+    let (seq, fh) = tiny_descriptors();
+    let mut luma = [[0u8; 16]; 16];
+    let mut state: u64 = 0xCAFE_F00D_BEEF_1234;
+    for row in luma.iter_mut() {
+        for cell in row.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *cell = (state >> 56) as u8;
+        }
+    }
+    let result = oxideav_av1::encoder::encode_intra_frame_y(&luma, &seq, &fh).unwrap();
+    for (cell_idx, &m) in result.committed_y_modes.iter().enumerate() {
+        assert!(
+            (m as usize) < 13,
+            "cell {cell_idx}: y_mode = {m} out of 0..13"
+        );
+    }
+}
+
+#[test]
+fn encode_decode_roundtrip_with_13_mode_picker_on_horizontal_gradient() {
+    // The full encode → decode roundtrip must still be pixel-exact even
+    // though the encoder now picks from 13 modes — the lossless WHT chain
+    // is bit-exact for any prediction.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    for row in input.y.iter_mut() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = (j * 16) as u8;
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let decoded = decode_av1(&encoded.ivf_bytes).unwrap();
+    match &decoded[0] {
+        Frame::Yuv420_16x16 { y, u, v } => {
+            assert_eq!(y, &input.y, "Y bit-exact after 13-mode picker + decode");
+            assert_eq!(u, &input.u);
+            assert_eq!(v, &input.v);
+        }
+    }
+    // At least one cell should have picked a non-DC mode on the gradient.
+    let non_dc_count = encoded
+        .committed_y_modes
+        .iter()
+        .filter(|&&m| m as usize != 0)
+        .count();
+    assert!(
+        non_dc_count > 0,
+        "expected non-DC_PRED on a horizontal gradient under YUV encode, got {:?}",
+        encoded.committed_y_modes
+    );
+}
+
+#[test]
+fn encode_decode_roundtrip_with_13_mode_picker_on_pseudorandom_yuv() {
+    // Pseudo-random YUV — the picker selection per cell is essentially
+    // arbitrary, but the roundtrip is still bit-exact end-to-end.
+    let (seq, fh) = tiny_descriptors();
+    let mut input = Yuv420Frame16x16::default();
+    let mut state: u64 = 0xFACE_F00D_BAAD_BEEF;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for row in input.y.iter_mut() {
+        for cell in row.iter_mut() {
+            *cell = step();
+        }
+    }
+    for row in input.u.iter_mut() {
+        for cell in row.iter_mut() {
+            *cell = step();
+        }
+    }
+    for row in input.v.iter_mut() {
+        for cell in row.iter_mut() {
+            *cell = step();
+        }
+    }
+    let encoded = oxideav_av1::encoder::encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+    let decoded = decode_av1(&encoded.ivf_bytes).unwrap();
+    match &decoded[0] {
+        Frame::Yuv420_16x16 { y, u, v } => {
+            assert_eq!(y, &input.y);
+            assert_eq!(u, &input.u);
+            assert_eq!(v, &input.v);
+        }
+    }
+}
+
+#[test]
+fn encoder_keeps_dc_pred_on_flat_grey_input_y_only() {
+    // Flat-128 input ⇒ every prediction mode produces 128 ⇒ tie ⇒ the
+    // picker's enumeration order gives DC_PRED. Verifies the "no
+    // gratuitous mode-switching" baseline.
+    let (seq, fh) = tiny_descriptors();
+    let luma = [[128u8; 16]; 16];
+    let result = oxideav_av1::encoder::encode_intra_frame_y(&luma, &seq, &fh).unwrap();
+    for (cell_idx, &m) in result.committed_y_modes.iter().enumerate() {
+        assert_eq!(
+            m as usize, 0,
+            "flat-128 input: cell {cell_idx} should pick DC_PRED (ordinal 0), got {m}"
+        );
+    }
+}

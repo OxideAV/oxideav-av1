@@ -2,6 +2,48 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 228)
+
+Round 228 lands the **encoder's 13-mode intra prediction picker** —
+the pixel driver (`encoder::pixel_driver::encode_intra_frame_y` /
+`encode_intra_frame_yuv`) now selects per BLOCK_4X4 leaf from each of
+the 13 §6.10.x Y intra modes (`DC_PRED` through `PAETH_PRED`) by
+residual SSD against the actual input, replacing the r221/r223
+hardcoded `DC_PRED` luma path. The decoder gains a matching
+§7.11.2.{2..6} dispatch in `decoder::pixel_driver::decode_block_leaf`
+keyed by the decoded `y_mode`, so the full encode → decode → pixels
+roundtrip is bit-exact under the lossless `base_q_idx = 0` arm
+regardless of which mode the picker selects.
+
+Neighbour derivations (`AboveRow[]`, `LeftCol[]`, `AboveRow[-1]`
+corner) are computed inline from the running reconstructed luma
+plane via a §7.11.2.1 prologue restricted to the BLOCK_4X4 cell
+extent. Head-extended `above_ext` / `left_ext` buffers (offset 0 =
+index -2, offset 1 = index -1, offset 2+k = index k) match the
+`predict_intra_directional` calling convention so the six
+non-degenerate D-modes (D45 / D135 / D113 / D157 / D203 / D67)
+consume the same neighbour arrays as the V / H / SMOOTH / PAETH
+leaves.
+
+The picker is residual-SSD-only — it does **not** model the §5.11.22
+`y_mode` rate cost (the §8.3.2 `TileYModeCdf[ Size_Group ]` row
+probabilities) so non-DC selections can occasionally cost more
+symbol bits than they save in residual energy. Full RD with bit-cost
+weighting is a follow-up arc. Chroma still picks `uv_mode = DC_PRED`.
+`EncodedFrame` / `EncodedFrameYuv` gain a `committed_y_modes:
+Vec<u8>` field surfacing the per-leaf picker output.
+
+13 new tests (1445 → 1452 lib + 5 → 11 integration on
+`encode_decode_pixel_roundtrip`): picker enumerates each mode once,
+horizontal-gradient input ⇒ V_PRED, vertical-gradient input ⇒
+H_PRED, flat-128 ⇒ DC_PRED (tie-break), out-of-range mode rejected,
+end-to-end roundtrip bit-exact under YUV / pseudo-random / extremes.
+
+Out of scope (next arc): rectangular TX sizes for
+`forward_transform_2d`; §5.11.18 inter-arm `mode_info()`
+dispatcher; intra angle / palette encode; full RD with §5.11.22
+bit-cost weighting on the y_mode picker.
+
 ## Status — 2026-05-29 (round 227)
 
 Round 227 closes the encoder's forward-transform stack: the

@@ -61,11 +61,14 @@
 
 use crate::cdf::{
     cfl_allowed_for_uv_mode, dequantize_step1, partition_ctx, partition_subsize,
-    predict_intra_dc_pred, size_group, skip_ctx, split_or_horz_cdf, split_or_vert_cdf,
+    predict_intra_d_mode, predict_intra_dc_pred, predict_intra_h_pred, predict_intra_paeth_pred,
+    predict_intra_smooth_h_pred, predict_intra_smooth_pred, predict_intra_smooth_v_pred,
+    predict_intra_v_pred, size_group, skip_ctx, split_or_horz_cdf, split_or_vert_cdf,
     PartitionWalker, QuantizerParams, TileCdfContext, TileGeometry, BLOCK_16X16, BLOCK_8X8,
-    BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, MI_HEIGHT_LOG2, MI_WIDTH_LOG2,
-    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT,
-    PARTITION_VERT, TX_4X4, TX_CLASS_2D,
+    BLOCK_INVALID, BLOCK_SIZES, D45_PRED, D67_PRED, DCT_DCT, DC_PRED, H_PRED, MI_HEIGHT_LOG2,
+    MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PAETH_PRED, PARTITION_HORZ,
+    PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED,
+    TX_4X4, TX_CLASS_2D, V_PRED,
 };
 use crate::encoder::ivf::IvfReader;
 use crate::encoder::pixel_driver::{CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH};
@@ -611,8 +614,10 @@ fn decode_block_leaf(
             .ok_or(Error::PartitionWalkOutOfRange)?;
         decoder.read_symbol(cdf)? as u8
     };
-    if y_mode as usize != DC_PRED {
-        // Arc-18 scope: encoder always picks DC_PRED.
+    // r228: support all 13 §6.10.x Y intra modes (`DC_PRED` through
+    // `PAETH_PRED`). The encoder picks per leaf via residual-SSD; the
+    // decoder mirrors via `predict_intra_luma_for_mode` below.
+    if (y_mode as usize) >= 13 {
         return Err(Error::PartitionWalkOutOfRange);
     }
 
@@ -659,7 +664,11 @@ fn decode_block_leaf(
 
     // Pixel reconstruction (luma).
     let (row0, col0) = ((mi_row as usize) * 4, (mi_col as usize) * 4);
-    let pred_y = dc_pred_luma(recon_y, mi_row as usize, mi_col as usize);
+    // r228: dispatch on the decoded y_mode (one of the 13 §6.10.x
+    // intra modes) — mirror of the encoder's r228 picker.
+    let pred_y =
+        predict_intra_luma_for_mode_4x4(recon_y, mi_row as usize, mi_col as usize, y_mode as usize)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
     if skip == 0 {
         // §7.12.3 + §7.13: dequant + inverse transform on the lossless
         // arm.
@@ -755,8 +764,146 @@ fn decode_block_leaf(
     Ok(())
 }
 
+/// §7.11.2.1 prologue — derive the neighbour arrays for one BLOCK_4X4
+/// luma cell at `(row0, col0)`. Mirror of the encoder helper used by
+/// the r228 13-mode picker; see
+/// [`crate::encoder::pixel_driver`] private docs for the head-extended
+/// buffer convention (`above_ext[0]` = index `-2`, `above_ext[1]` =
+/// index `-1`, `above_ext[2 + k]` = index `k`).
+fn derive_intra_neighbours_4x4_luma(
+    reconstructed: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
+    row0: usize,
+    col0: usize,
+) -> (u8, u8, [u16; 10], [u16; 10], u16) {
+    let w = 4usize;
+    let h = 4usize;
+    let bit_depth = 8u8;
+    let have_above = (row0 > 0) as u8;
+    let have_left = (col0 > 0) as u8;
+
+    let above_left: u16 = if have_above != 0 && have_left != 0 {
+        reconstructed[row0 - 1][col0 - 1] as u16
+    } else if have_above != 0 {
+        reconstructed[row0 - 1][col0] as u16
+    } else if have_left != 0 {
+        reconstructed[row0][col0 - 1] as u16
+    } else {
+        1u16 << (bit_depth - 1)
+    };
+
+    let mut above_ext = [0u16; 10];
+    above_ext[0] = above_left;
+    above_ext[1] = above_left;
+    if have_above != 0 {
+        let above_row = &reconstructed[row0 - 1];
+        for k in 0..(w + h) {
+            let col = (col0 + k).min(FRAME_WIDTH - 1);
+            above_ext[2 + k] = above_row[col] as u16;
+        }
+    } else if have_left != 0 {
+        let sample = reconstructed[row0][col0 - 1] as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        let mid_minus = ((1u32 << (bit_depth - 1)) - 1) as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_minus;
+        }
+    }
+
+    let mut left_ext = [0u16; 10];
+    left_ext[0] = above_left;
+    left_ext[1] = above_left;
+    if have_left != 0 {
+        for k in 0..(w + h) {
+            let row = (row0 + k).min(FRAME_HEIGHT - 1);
+            left_ext[2 + k] = reconstructed[row][col0 - 1] as u16;
+        }
+    } else if have_above != 0 {
+        let sample = reconstructed[row0 - 1][col0] as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        let mid_plus = ((1u32 << (bit_depth - 1)) + 1) as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_plus;
+        }
+    }
+
+    (have_above, have_left, above_ext, left_ext, above_left)
+}
+
+/// §7.11.2.{2..6} dispatcher — compute the 4×4 luma prediction for the
+/// supplied §6.10.x Y intra mode. Mirror of the encoder helper used by
+/// the r228 picker. Returns `None` for an out-of-range mode.
+fn predict_intra_luma_for_mode_4x4(
+    reconstructed: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
+    cell_row: usize,
+    cell_col: usize,
+    mode: usize,
+) -> Option<[u8; 16]> {
+    let w = 4usize;
+    let h = 4usize;
+    let log2_w = 2u32;
+    let log2_h = 2u32;
+    let bit_depth = 8u8;
+    let row0 = cell_row * 4;
+    let col0 = cell_col * 4;
+    let (have_above, have_left, above_ext, left_ext, above_left) =
+        derive_intra_neighbours_4x4_luma(reconstructed, row0, col0);
+    let above_row = &above_ext[2..2 + w + h];
+    let left_col = &left_ext[2..2 + w + h];
+
+    let mut pred16 = [0u16; 16];
+    match mode {
+        m if m == DC_PRED => {
+            predict_intra_dc_pred(
+                have_left,
+                have_above,
+                log2_w,
+                log2_h,
+                w,
+                h,
+                bit_depth,
+                above_row,
+                left_col,
+                &mut pred16,
+            )
+            .ok()?;
+        }
+        m if m == V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred16).ok()?,
+        m if m == H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred16).ok()?,
+        m if (D45_PRED..=D67_PRED).contains(&m) => {
+            predict_intra_d_mode(m, 0, w, h, 0, 0, &above_ext, &left_ext, &mut pred16).ok()?;
+        }
+        m if m == SMOOTH_PRED => {
+            predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred16)
+                .ok()?;
+        }
+        m if m == SMOOTH_V_PRED => {
+            predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred16).ok()?;
+        }
+        m if m == SMOOTH_H_PRED => {
+            predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred16).ok()?;
+        }
+        m if m == PAETH_PRED => {
+            predict_intra_paeth_pred(w, h, above_row, left_col, above_left, &mut pred16).ok()?;
+        }
+        _ => return None,
+    }
+
+    let mut pred8 = [0u8; 16];
+    for (slot, v) in pred8.iter_mut().zip(pred16.iter().copied()) {
+        *slot = v as u8;
+    }
+    Some(pred8)
+}
+
 /// §7.11.2.5 DC_PRED prediction for one 4×4 luma cell — mirror of the
 /// encoder's `dc_pred_for_cell_y`.
+#[allow(dead_code)]
 fn dc_pred_luma(
     reconstructed: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
     cell_row: usize,

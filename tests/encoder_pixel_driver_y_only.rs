@@ -126,7 +126,10 @@ fn pixel_driver_sh_fh_obus_reparse_equal_to_input() {
 #[test]
 fn pixel_driver_internal_helper_matches_driver_reconstruction() {
     let result = encode_flat_128_frame();
-    let recon = internal_roundtrip::reconstruct_from_quants(&result.committed_quants);
+    let recon = internal_roundtrip::reconstruct_from_quants(
+        &result.committed_quants,
+        &result.committed_y_modes,
+    );
     assert_eq!(recon, result.reconstructed_y);
 }
 

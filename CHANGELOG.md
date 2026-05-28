@@ -6,6 +6,47 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 228 — Encoder picks from all 13 §6.10.x Y intra prediction
+  modes per BLOCK_4X4 leaf.** The pixel driver
+  (`encoder::pixel_driver::encode_intra_frame_y` /
+  `encode_intra_frame_yuv`) now runs a residual-SSD picker over each of
+  the 13 §6.10.x intra Y modes — `DC_PRED`, `V_PRED`, `H_PRED`,
+  `D45_PRED`, `D135_PRED`, `D113_PRED`, `D157_PRED`, `D203_PRED`,
+  `D67_PRED`, `SMOOTH_PRED`, `SMOOTH_V_PRED`, `SMOOTH_H_PRED`,
+  `PAETH_PRED` — and commits the lowest-SSD pick via `write_y_mode`
+  (r211) + `forward_transform_2d` (r227) + `forward_quantize` (r220) +
+  `write_coefficients` (r215). Replaces the r221/r223 hardcoded
+  `DC_PRED` luma path. The decoder gains a matching dispatch in
+  `decoder::pixel_driver::decode_block_leaf` that routes the decoded
+  `y_mode` to the matching §7.11.2.{2..6} sample-generation leaf
+  (`predict_intra_dc_pred` / `predict_intra_v_pred` /
+  `predict_intra_h_pred` / `predict_intra_d_mode` /
+  `predict_intra_smooth*_pred` / `predict_intra_paeth_pred`).
+
+  All `AboveRow[]`, `LeftCol[]`, and `AboveRow[-1]` corner samples for
+  the picker are derived inline from the running reconstructed luma
+  plane via a §7.11.2.1 prologue restricted to the BLOCK_4X4 cell
+  extent. The head-extended `above_ext` / `left_ext` buffers (offset 0
+  = index -2, offset 1 = index -1, offset 2+k = index k) match the
+  `predict_intra_directional` calling convention so the six
+  non-degenerate D-modes consume the same neighbour arrays as the
+  V / H / SMOOTH / PAETH leaves. Lossless `base_q_idx = 0` arm is
+  preserved: every picker selection still routes through the bit-exact
+  forward WHT → forward quantize → dequantize → inverse WHT chain so
+  the existing end-to-end YUV roundtrip is unchanged. New test
+  coverage: 7 lib unit tests + 6 integration tests (incl.
+  horizontal-gradient input ⇒ picker selects `V_PRED`, vertical
+  gradient ⇒ `H_PRED`, flat-128 ⇒ picker keeps `DC_PRED` tie-break).
+  `EncodedFrame` / `EncodedFrameYuv` gain a `committed_y_modes:
+  Vec<u8>` field surfacing the per-leaf picker output.
+
+  The picker is residual-SSD-only — it does **not** model the §5.11.22
+  `y_mode` rate cost (the §8.3.2 `TileYModeCdf[ Size_Group ]` row
+  probabilities) so non-DC selections can occasionally cost more
+  symbol bits than they save in residual energy. Full RD with
+  bit-cost weighting is a follow-up arc. Chroma still picks
+  `uv_mode = DC_PRED`.
+
 * **Round 227 — §7.13.3-equivalent forward 2D transform dispatcher.**
   Lands `encoder::forward_transform_2d(input: &[i64], tx_size: usize,
   plane_tx_type: usize, lossless: bool) -> Vec<i64>` — the encoder

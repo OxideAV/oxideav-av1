@@ -101,8 +101,12 @@
 //!   * §7.13.3   — Inverse transform 2D (p.305–307).
 
 use crate::cdf::{
-    dequantize_step1, predict_intra_dc_pred, QuantizerParams, TileCdfContext, TileGeometry,
-    BLOCK_16X16, DCT_DCT, DC_PRED, TX_4X4, TX_CLASS_2D,
+    dequantize_step1, predict_intra_d_mode, predict_intra_dc_pred, predict_intra_h_pred,
+    predict_intra_paeth_pred, predict_intra_smooth_h_pred, predict_intra_smooth_pred,
+    predict_intra_smooth_v_pred, predict_intra_v_pred, QuantizerParams, TileCdfContext,
+    TileGeometry, BLOCK_16X16, D113_PRED, D135_PRED, D157_PRED, D203_PRED, D45_PRED, D67_PRED,
+    DCT_DCT, DC_PRED, H_PRED, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4,
+    TX_CLASS_2D, V_PRED,
 };
 use crate::encoder::forward_quantize::forward_quantize;
 use crate::encoder::forward_transform::forward_dct_4x4;
@@ -166,6 +170,12 @@ pub struct EncodedFrame {
     ///  (2,0), (2,1), (3,0), (3,1), (2,2), (2,3), (3,2), (3,3)]` in
     ///  (cell_row, cell_col) coordinates).
     pub committed_quants: Vec<Vec<i32>>,
+    /// Per-block-position §6.10.x Y intra mode the encoder selected for
+    /// each leaf, indexed in the same §5.11.4 dispatch order as
+    /// `committed_quants`. Each value is in `0..NUM_INTRA_MODES_Y`
+    /// (`DC_PRED = 0`, `V_PRED = 1`, …, `PAETH_PRED = 12`). Added in
+    /// arc r228 alongside the 13-mode intra picker.
+    pub committed_y_modes: Vec<u8>,
 }
 
 /// 4:2:0 YUV input the chroma driver consumes: 16×16 luma + two 8×8
@@ -213,6 +223,10 @@ pub struct EncodedFrameYuv {
     /// Per-luma-cell committed `Quant[]` in §5.11.4 dispatch order; same
     /// shape + meaning as [`EncodedFrame::committed_quants`].
     pub committed_quants_y: Vec<Vec<i32>>,
+    /// Per-luma-cell §6.10.x Y intra mode the encoder selected; same
+    /// shape + meaning as [`EncodedFrame::committed_y_modes`]. Added in
+    /// arc r228 alongside the 13-mode intra picker.
+    pub committed_y_modes: Vec<u8>,
     /// Per-chroma-cell U-plane `Quant[]` in chroma-dispatch order:
     /// `[(0,0), (0,1), (1,0), (1,1)]` covering the four chroma 4×4
     /// blocks (one per 8×8 luma quadrant, surfaced in the §5.11.4 cell
@@ -399,6 +413,373 @@ fn cell_to_chroma_block(cc: CellCoord) -> (usize, usize) {
     ((cc.cell_row - 1) / 2, (cc.cell_col - 1) / 2)
 }
 
+// ---------------------------------------------------------------------
+// Arc r228 — full 13-mode intra-prediction picker.
+//
+// For each 4×4 luma cell the encoder now computes a prediction with each
+// of the 13 §6.10.x intra Y modes (`DC_PRED`, `V_PRED`, `H_PRED`,
+// `D45_PRED`, `D135_PRED`, `D113_PRED`, `D157_PRED`, `D203_PRED`,
+// `D67_PRED`, `SMOOTH_PRED`, `SMOOTH_V_PRED`, `SMOOTH_H_PRED`,
+// `PAETH_PRED`) and selects whichever yields the smallest residual SSD
+// against the actual input. The chosen mode is then committed via
+// `write_y_mode` (r211) and the residual is encoded with
+// `forward_transform_2d` (r227) + `forward_quantize` (r220) +
+// `write_coefficients` (r215).
+//
+// The picker is residual-variance-only — it does NOT model the §5.11.22
+// `y_mode` rate cost (the §8.3.2 `TileYModeCdf[ Size_Group ]` row
+// probabilities) — which means non-DC_PRED choices can occasionally cost
+// more bits than they save in residual energy. Full RD with bit-cost
+// weighting is a follow-up.
+//
+// The lossless `base_q_idx = 0` arm is preserved: every mode's
+// prediction is integer, the residual is forward-WHT'd, and the
+// quantize / dequantize chain is bit-exact ⇒ the existing end-to-end
+// roundtrip tests still pass regardless of which mode the picker
+// selects.
+//
+// All neighbour derivations (`AboveRow[]`, `LeftCol[]`, `AboveRow[-1]`)
+// come from the running reconstructed luma plane via plain index reads,
+// mirroring the §7.11.2.1 prologue restricted to the BLOCK_4X4 cell
+// extent.
+// ---------------------------------------------------------------------
+
+/// Number of §6.10.x Y intra modes — `DC_PRED` through `PAETH_PRED`
+/// inclusive (`13` per §3 `INTRA_MODES`).
+pub const NUM_INTRA_MODES_Y: usize = 13;
+
+/// The 13 §6.10.x Y intra mode ordinals (`0..=12`), in the order the
+/// picker enumerates them. Constant; exposed so test code can assert
+/// completeness.
+pub const INTRA_MODE_CANDIDATES_Y: [usize; NUM_INTRA_MODES_Y] = [
+    DC_PRED,
+    V_PRED,
+    H_PRED,
+    D45_PRED,
+    D135_PRED,
+    D113_PRED,
+    D157_PRED,
+    D203_PRED,
+    D67_PRED,
+    SMOOTH_PRED,
+    SMOOTH_V_PRED,
+    SMOOTH_H_PRED,
+    PAETH_PRED,
+];
+
+/// §7.11.2.1 prologue — derive the §7.11.2.{2..6} neighbour arrays for
+/// one BLOCK_4X4 cell at `(row0, col0)` against the running
+/// `reconstructed` luma plane. Returns the seven values the per-mode
+/// kernels consume:
+///
+///   * `have_above` / `have_left` — `1` when the cell has a neighbour
+///     above / to the left (`row0 > 0` / `col0 > 0`).
+///   * `above_ext` — the head-extended `AboveRow[]` buffer
+///     (`above_ext[0]` = index `-2`, `above_ext[1]` = index `-1`,
+///     `above_ext[2 + k]` = index `k` for `k = 0..w+h-1`). Used both by
+///     the V_PRED / SMOOTH leaves (which read offsets `2 .. 2 + w`) and
+///     by `predict_intra_directional` (which reads index `-2..w+h-1`).
+///     Length `2 + w + h = 10` for 4×4.
+///   * `left_ext` — head-extended `LeftCol[]`, same convention. Length
+///     `10`.
+///   * `above_left` — the §7.11.2.1 corner sample (`AboveRow[-1]` =
+///     `LeftCol[-1]`), with the §7.11.2.1 four-arm dispatch.
+///
+/// All values are derived from the running reconstructed plane, exactly
+/// as the spec's §7.11.2.1 prologue would after the previous block's
+/// §7.12.3 step-3 merge. The `enable_intra_edge_filter` /
+/// `enable_intra_edge_upsample` pre-passes are no-ops on the
+/// `upsample = 0` / `filter_strength = 0` arm this picker takes.
+fn derive_intra_neighbours_4x4_y(
+    reconstructed: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
+    row0: usize,
+    col0: usize,
+) -> (u8, u8, [u16; 10], [u16; 10], u16) {
+    let w = 4usize;
+    let h = 4usize;
+    let bit_depth = 8u8;
+    let have_above = (row0 > 0) as u8;
+    let have_left = (col0 > 0) as u8;
+
+    // §7.11.2.1 AboveRow[-1] / LeftCol[-1] corner (av1-spec p.242).
+    let above_left: u16 = if have_above != 0 && have_left != 0 {
+        reconstructed[row0 - 1][col0 - 1] as u16
+    } else if have_above != 0 {
+        reconstructed[row0 - 1][col0] as u16
+    } else if have_left != 0 {
+        reconstructed[row0][col0 - 1] as u16
+    } else {
+        1u16 << (bit_depth - 1)
+    };
+
+    // §7.11.2.1 AboveRow[ 0..w+h-1 ]. Index `k` lives at offset `k + 2`
+    // in the head-extended buffer.
+    let mut above_ext = [0u16; 10];
+    above_ext[0] = above_left;
+    above_ext[1] = above_left;
+    if have_above != 0 {
+        // Real samples from CurrFrame above the cell.
+        let above_row = &reconstructed[row0 - 1];
+        // §7.11.2.1 arm 3: take samples `[col0 .. col0 + w + h - 1]`,
+        // clamped to the right edge of the frame (`FRAME_WIDTH - 1`).
+        for k in 0..(w + h) {
+            let col = (col0 + k).min(FRAME_WIDTH - 1);
+            above_ext[2 + k] = above_row[col] as u16;
+        }
+    } else if have_left != 0 {
+        // §7.11.2.1 arm 1 (have_left only): broadcast `CurrFrame[y][x-1]`.
+        let sample = reconstructed[row0][col0 - 1] as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        // §7.11.2.1 arm 2: `(1 << (BitDepth - 1)) - 1`.
+        let mid_minus = ((1u32 << (bit_depth - 1)) - 1) as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_minus;
+        }
+    }
+
+    // §7.11.2.1 LeftCol[ 0..w+h-1 ].
+    let mut left_ext = [0u16; 10];
+    left_ext[0] = above_left;
+    left_ext[1] = above_left;
+    if have_left != 0 {
+        for k in 0..(w + h) {
+            let row = (row0 + k).min(FRAME_HEIGHT - 1);
+            left_ext[2 + k] = reconstructed[row][col0 - 1] as u16;
+        }
+    } else if have_above != 0 {
+        let sample = reconstructed[row0 - 1][col0] as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        let mid_plus = ((1u32 << (bit_depth - 1)) + 1) as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_plus;
+        }
+    }
+
+    (have_above, have_left, above_ext, left_ext, above_left)
+}
+
+/// §7.11.2.1 prologue for one chroma 4×4 cell — mirror of
+/// [`derive_intra_neighbours_4x4_y`] against the smaller
+/// `CHROMA_WIDTH × CHROMA_HEIGHT` plane. Currently unused (chroma still
+/// picks `DC_PRED` in r228); kept as the seed for the next-arc chroma
+/// 13-mode picker.
+#[allow(dead_code)]
+fn derive_intra_neighbours_4x4_chroma(
+    reconstructed: &[[u8; CHROMA_WIDTH]; CHROMA_HEIGHT],
+    row0: usize,
+    col0: usize,
+) -> (u8, u8, [u16; 10], [u16; 10], u16) {
+    let w = 4usize;
+    let h = 4usize;
+    let bit_depth = 8u8;
+    let have_above = (row0 > 0) as u8;
+    let have_left = (col0 > 0) as u8;
+
+    let above_left: u16 = if have_above != 0 && have_left != 0 {
+        reconstructed[row0 - 1][col0 - 1] as u16
+    } else if have_above != 0 {
+        reconstructed[row0 - 1][col0] as u16
+    } else if have_left != 0 {
+        reconstructed[row0][col0 - 1] as u16
+    } else {
+        1u16 << (bit_depth - 1)
+    };
+
+    let mut above_ext = [0u16; 10];
+    above_ext[0] = above_left;
+    above_ext[1] = above_left;
+    if have_above != 0 {
+        let above_row = &reconstructed[row0 - 1];
+        for k in 0..(w + h) {
+            let col = (col0 + k).min(CHROMA_WIDTH - 1);
+            above_ext[2 + k] = above_row[col] as u16;
+        }
+    } else if have_left != 0 {
+        let sample = reconstructed[row0][col0 - 1] as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        let mid_minus = ((1u32 << (bit_depth - 1)) - 1) as u16;
+        for slot in above_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_minus;
+        }
+    }
+
+    let mut left_ext = [0u16; 10];
+    left_ext[0] = above_left;
+    left_ext[1] = above_left;
+    if have_left != 0 {
+        for k in 0..(w + h) {
+            let row = (row0 + k).min(CHROMA_HEIGHT - 1);
+            left_ext[2 + k] = reconstructed[row][col0 - 1] as u16;
+        }
+    } else if have_above != 0 {
+        let sample = reconstructed[row0 - 1][col0] as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = sample;
+        }
+    } else {
+        let mid_plus = ((1u32 << (bit_depth - 1)) + 1) as u16;
+        for slot in left_ext.iter_mut().skip(2).take(w + h) {
+            *slot = mid_plus;
+        }
+    }
+
+    (have_above, have_left, above_ext, left_ext, above_left)
+}
+
+/// Compute the prediction for a single §6.10.x Y intra mode against
+/// the supplied pre-derived neighbour arrays. Returns the 16 sample
+/// `pred[0..16]` as `u8` (clamped to `[0, 255]` for `bit_depth = 8`).
+///
+/// Routes to the matching `cdf::predict_intra_*` leaf:
+///
+///   * `DC_PRED`        → [`predict_intra_dc_pred`]
+///   * `V_PRED`         → [`predict_intra_v_pred`]
+///   * `H_PRED`         → [`predict_intra_h_pred`]
+///   * `D{45,113,135,157,203,67}_PRED` → [`predict_intra_d_mode`]
+///   * `SMOOTH_PRED`    → [`predict_intra_smooth_pred`]
+///   * `SMOOTH_V_PRED`  → [`predict_intra_smooth_v_pred`]
+///   * `SMOOTH_H_PRED`  → [`predict_intra_smooth_h_pred`]
+///   * `PAETH_PRED`     → [`predict_intra_paeth_pred`]
+///
+/// Returns `None` for an unrecognised mode (caller bug).
+fn predict_intra_mode_4x4(
+    mode: usize,
+    have_above: u8,
+    have_left: u8,
+    above_ext: &[u16; 10],
+    left_ext: &[u16; 10],
+    above_left: u16,
+) -> Option<[u8; 16]> {
+    let w = 4usize;
+    let h = 4usize;
+    let log2_w = 2u32;
+    let log2_h = 2u32;
+    let bit_depth = 8u8;
+    // The V_PRED / H_PRED / DC_PRED / SMOOTH / PAETH leaves consume the
+    // §7.11.2.1 `AboveRow[ 0..w-1 ]` / `LeftCol[ 0..h-1 ]` (indices `0
+    // .. w+h-1` minus the head extension). Slice them out.
+    let above_row = &above_ext[2..2 + w + h];
+    let left_col = &left_ext[2..2 + w + h];
+
+    let mut pred16 = [0u16; 16];
+    match mode {
+        m if m == DC_PRED => {
+            predict_intra_dc_pred(
+                have_left,
+                have_above,
+                log2_w,
+                log2_h,
+                w,
+                h,
+                bit_depth,
+                above_row,
+                left_col,
+                &mut pred16,
+            )
+            .ok()?;
+        }
+        m if m == V_PRED => {
+            predict_intra_v_pred(w, h, above_row, &mut pred16).ok()?;
+        }
+        m if m == H_PRED => {
+            predict_intra_h_pred(w, h, left_col, &mut pred16).ok()?;
+        }
+        m if (D45_PRED..=D67_PRED).contains(&m) => {
+            // `predict_intra_d_mode` reads index `-2..w+h-1` from the
+            // head-extended buffers we built; pass the full `above_ext`
+            // / `left_ext` (length 10) so the negative-index reads land
+            // on the corner.
+            predict_intra_d_mode(
+                m,
+                /* angle_delta = */ 0,
+                w,
+                h,
+                /* upsample_above = */ 0,
+                /* upsample_left = */ 0,
+                above_ext,
+                left_ext,
+                &mut pred16,
+            )
+            .ok()?;
+        }
+        m if m == SMOOTH_PRED => {
+            predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred16)
+                .ok()?;
+        }
+        m if m == SMOOTH_V_PRED => {
+            predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred16).ok()?;
+        }
+        m if m == SMOOTH_H_PRED => {
+            predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred16).ok()?;
+        }
+        m if m == PAETH_PRED => {
+            predict_intra_paeth_pred(w, h, above_row, left_col, above_left, &mut pred16).ok()?;
+        }
+        _ => return None,
+    }
+
+    let mut pred8 = [0u8; 16];
+    for (slot, v) in pred8.iter_mut().zip(pred16.iter().copied()) {
+        *slot = v as u8;
+    }
+    Some(pred8)
+}
+
+/// Pick the §6.10.x Y intra mode with the smallest residual SSD against
+/// the actual block samples. Returns `(best_mode, best_prediction)`.
+///
+/// SSD is computed over the 16 cell samples as `Σ (input - pred)²`,
+/// which is a coarse proxy for "smaller residual" but ignores the
+/// §5.11.22 `y_mode` rate cost. Full RD with bit-cost weighting is a
+/// follow-up arc.
+///
+/// `DC_PRED` is the tie-breaker: when multiple modes yield the same
+/// SSD, the lowest mode ordinal wins (mirrors the enumeration order in
+/// [`INTRA_MODE_CANDIDATES_Y`]).
+fn pick_best_intra_mode_4x4_y(
+    reconstructed: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
+    input: &[[u8; FRAME_WIDTH]; FRAME_HEIGHT],
+    row0: usize,
+    col0: usize,
+) -> (u8, [u8; 16]) {
+    let (have_above, have_left, above_ext, left_ext, above_left) =
+        derive_intra_neighbours_4x4_y(reconstructed, row0, col0);
+    let mut best_mode = DC_PRED as u8;
+    let mut best_pred = [0u8; 16];
+    let mut best_ssd: u64 = u64::MAX;
+    for &mode in &INTRA_MODE_CANDIDATES_Y {
+        let Some(pred) = predict_intra_mode_4x4(
+            mode, have_above, have_left, &above_ext, &left_ext, above_left,
+        ) else {
+            continue;
+        };
+        let mut ssd: u64 = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = input[row0 + i][col0 + j] as i32;
+                let q = pred[i * 4 + j] as i32;
+                let d = (p - q) as i64;
+                ssd += (d * d) as u64;
+            }
+        }
+        if ssd < best_ssd {
+            best_ssd = ssd;
+            best_mode = mode as u8;
+            best_pred = pred;
+        }
+    }
+    (best_mode, best_pred)
+}
+
 /// Encode a 16×16 monochrome Y-only intra-only frame at `base_q_idx = 0`
 /// against the tiny-fixture-derived sequence + frame headers.
 ///
@@ -440,19 +821,25 @@ pub fn encode_intra_frame_y(
     // per-cell list of committed `Quant[]` arrays in dispatch order.
     let mut reconstructed: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
     let mut committed_quants: Vec<Vec<i32>> = Vec::with_capacity(CELLS_WIDE * CELLS_HIGH);
+    let mut committed_y_modes: Vec<u8> = Vec::with_capacity(CELLS_WIDE * CELLS_HIGH);
 
     // Build the §5.11.4 dispatch-ordered list of (cell, EncodeBlock)
     // pairs. For each cell, the leaf carries the per-plane
     // `coefficients` from `forward_quantize(forward_dct_4x4(residual))`.
-    // The DC_PRED prediction is computed from the running
+    // The intra prediction is computed from the running
     // `reconstructed` buffer — this keeps the encoder's predictor in
     // lockstep with what the decoder would compute on its parallel walk.
     let cells = dispatch_order_cells();
     let mut leaves: Vec<EncodeBlock> = Vec::with_capacity(cells.len());
     for cc in &cells {
         let (row0, col0) = cc.pixel_origin();
-        let pred = dc_pred_for_cell_y(&reconstructed, cc.cell_row, cc.cell_col);
-        // Residual = input - prediction.
+        // r228: pick the §6.10.x Y intra mode with the smallest residual
+        // SSD against the actual block samples (variance-based picker,
+        // no bit-cost weighting yet). Replaces the hardcoded DC_PRED.
+        let (y_mode_pick, pred) = pick_best_intra_mode_4x4_y(&reconstructed, luma_in, row0, col0);
+        committed_y_modes.push(y_mode_pick);
+        let _ = dc_pred_for_cell_y; // keep symbol referenced for now
+                                    // Residual = input - prediction.
         let mut residual = [0i64; 16];
         for i in 0..4 {
             for j in 0..4 {
@@ -510,7 +897,7 @@ pub fn encode_intra_frame_y(
             skip: 0,
             segment_id: 0,
             segment_pred: 0,
-            y_mode: DC_PRED as u8,
+            y_mode: y_mode_pick,
             uv_mode: None,
             coefficients: vec![plane_y],
         });
@@ -625,6 +1012,7 @@ pub fn encode_intra_frame_y(
         temporal_unit_bytes,
         reconstructed_y: reconstructed,
         committed_quants,
+        committed_y_modes,
     })
 }
 
@@ -671,6 +1059,7 @@ pub fn encode_intra_frame_yuv(
         Vec::with_capacity(CHROMA_CELLS_WIDE * CHROMA_CELLS_HIGH);
     let mut committed_quants_v: Vec<Vec<i32>> =
         Vec::with_capacity(CHROMA_CELLS_WIDE * CHROMA_CELLS_HIGH);
+    let mut committed_y_modes: Vec<u8> = Vec::with_capacity(CELLS_WIDE * CELLS_HIGH);
 
     let cells = dispatch_order_cells();
     let mut leaves: Vec<EncodeBlock> = Vec::with_capacity(cells.len());
@@ -678,7 +1067,10 @@ pub fn encode_intra_frame_yuv(
     for cc in &cells {
         // --- Luma walk (identical to encode_intra_frame_y) ---
         let (row0, col0) = cc.pixel_origin();
-        let pred_y = dc_pred_for_cell_y(&recon_y, cc.cell_row, cc.cell_col);
+        // r228: pick from all 13 §6.10.x Y intra modes by residual SSD
+        // (same scheme as `encode_intra_frame_y`).
+        let (y_mode_pick, pred_y) = pick_best_intra_mode_4x4_y(&recon_y, &input.y, row0, col0);
+        committed_y_modes.push(y_mode_pick);
         let mut residual_y = [0i64; 16];
         for i in 0..4 {
             for j in 0..4 {
@@ -773,7 +1165,7 @@ pub fn encode_intra_frame_yuv(
             skip: 0,
             segment_id: 0,
             segment_pred: 0,
-            y_mode: DC_PRED as u8,
+            y_mode: y_mode_pick,
             uv_mode,
             coefficients,
         });
@@ -874,6 +1266,7 @@ pub fn encode_intra_frame_yuv(
         committed_quants_y,
         committed_quants_u,
         committed_quants_v,
+        committed_y_modes,
     })
 }
 
@@ -883,12 +1276,20 @@ pub mod internal_roundtrip {
     use super::*;
 
     /// Re-derive the encoder's reconstructed plane from a list of
-    /// committed `Quant[]` arrays + the original input plane (for the
-    /// prediction baseline). Mirrors the per-leaf reconstruction loop
-    /// inside [`super::encode_intra_frame_y`]; provided so test code can
+    /// committed `Quant[]` arrays + per-cell §6.10.x Y intra modes.
+    /// Mirrors the per-leaf reconstruction loop inside
+    /// [`super::encode_intra_frame_y`]; provided so test code can
     /// independently verify the per-leaf pixel reconstruction without
     /// re-running the encoder driver.
-    pub fn reconstruct_from_quants(quants: &[Vec<i32>]) -> [[u8; FRAME_WIDTH]; FRAME_HEIGHT] {
+    ///
+    /// `y_modes[i]` must be the §6.10.x ordinal the encoder selected
+    /// for `cells[i]` (i.e. the `committed_y_modes[i]` value the encoder
+    /// surfaced in [`super::EncodedFrame`]). On the r228 picker every
+    /// value is in `0..NUM_INTRA_MODES_Y`.
+    pub fn reconstruct_from_quants(
+        quants: &[Vec<i32>],
+        y_modes: &[u8],
+    ) -> [[u8; FRAME_WIDTH]; FRAME_HEIGHT] {
         let qp = QuantizerParams::neutral(0, 8);
         let lossless = qp.base_q_idx == 0
             && qp.delta_q_y_dc == 0
@@ -900,15 +1301,26 @@ pub mod internal_roundtrip {
             [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
         let cells = dispatch_order_cells();
         assert_eq!(quants.len(), cells.len());
-        for (cc, quant) in cells.iter().zip(quants.iter()) {
+        assert_eq!(y_modes.len(), cells.len());
+        for (i, cc) in cells.iter().enumerate() {
             let (row0, col0) = cc.pixel_origin();
-            let pred = dc_pred_for_cell_y(&reconstructed, cc.cell_row, cc.cell_col);
-            let dequant = dequantize_step1(quant, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
+            let (have_above, have_left, above_ext, left_ext, above_left) =
+                derive_intra_neighbours_4x4_y(&reconstructed, row0, col0);
+            let pred = predict_intra_mode_4x4(
+                y_modes[i] as usize,
+                have_above,
+                have_left,
+                &above_ext,
+                &left_ext,
+                above_left,
+            )
+            .expect("oxideav-av1 reconstruct_from_quants: y_modes[i] in range");
+            let dequant = dequantize_step1(&quants[i], TX_4X4, 0, 0, DCT_DCT, 15, &qp);
             let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, lossless);
-            for i in 0..4 {
-                for j in 0..4 {
-                    let p = pred[i * 4 + j] as i64 + residual[i * 4 + j];
-                    reconstructed[row0 + i][col0 + j] = p.clamp(0, 255) as u8;
+            for di in 0..4 {
+                for dj in 0..4 {
+                    let p = pred[di * 4 + dj] as i64 + residual[di * 4 + dj];
+                    reconstructed[row0 + di][col0 + dj] = p.clamp(0, 255) as u8;
                 }
             }
         }
@@ -1061,7 +1473,10 @@ mod tests {
         let fh = tiny_fh(&seq);
         let luma: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
         let result = encode_intra_frame_y(&luma, &seq, &fh).expect("encode succeeds");
-        let recon = internal_roundtrip::reconstruct_from_quants(&result.committed_quants);
+        let recon = internal_roundtrip::reconstruct_from_quants(
+            &result.committed_quants,
+            &result.committed_y_modes,
+        );
         assert_eq!(recon, result.reconstructed_y);
     }
 
@@ -1078,7 +1493,10 @@ mod tests {
         let fh = tiny_fh(&seq);
         let luma: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[64u8; FRAME_WIDTH]; FRAME_HEIGHT];
         let result = encode_intra_frame_y(&luma, &seq, &fh).expect("encode succeeds");
-        let recon = internal_roundtrip::reconstruct_from_quants(&result.committed_quants);
+        let recon = internal_roundtrip::reconstruct_from_quants(
+            &result.committed_quants,
+            &result.committed_y_modes,
+        );
         assert_eq!(recon, result.reconstructed_y);
         for i in 0..FRAME_HEIGHT {
             for j in 0..FRAME_WIDTH {
@@ -1529,5 +1947,123 @@ mod tests {
         let yuv = encode_intra_frame_yuv(&input, &seq, &fh).expect("encode succeeds");
         assert_eq!(yuv.committed_quants_y, y_only.committed_quants);
         assert_eq!(yuv.reconstructed_y, y_only.reconstructed_y);
+    }
+
+    // -----------------------------------------------------------------
+    // Arc r228 — 13-mode intra prediction picker unit tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn intra_mode_candidates_y_covers_all_13_intra_modes() {
+        // The picker enumerates each §6.10.x Y intra mode exactly once.
+        assert_eq!(INTRA_MODE_CANDIDATES_Y.len(), NUM_INTRA_MODES_Y);
+        let mut seen = [false; NUM_INTRA_MODES_Y];
+        for &m in &INTRA_MODE_CANDIDATES_Y {
+            assert!(
+                m < NUM_INTRA_MODES_Y,
+                "mode {m} out of 0..{NUM_INTRA_MODES_Y}"
+            );
+            assert!(!seen[m], "mode {m} listed twice in INTRA_MODE_CANDIDATES_Y");
+            seen[m] = true;
+        }
+        for (i, &s) in seen.iter().enumerate() {
+            assert!(s, "mode ordinal {i} missing from INTRA_MODE_CANDIDATES_Y");
+        }
+    }
+
+    #[test]
+    fn pick_best_intra_mode_4x4_y_flat_reconstructed_flat_input_picks_dc() {
+        // When `reconstructed` is flat-128 and `input` is also flat-128
+        // every mode produces a perfect match ⇒ SSD ties at zero ⇒ the
+        // enumeration order tie-break gives DC_PRED.
+        let recon: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        let input = recon;
+        // Pick at cell (1, 1) so both have_above and have_left fire (cell
+        // (0, 0) is the no-neighbour corner — modes give different
+        // fallbacks there).
+        let (mode, _) = pick_best_intra_mode_4x4_y(&recon, &input, 4, 4);
+        assert_eq!(mode as usize, DC_PRED);
+    }
+
+    #[test]
+    fn pick_best_intra_mode_4x4_y_horizontal_gradient_input_prefers_v_pred() {
+        // Vertical-uniform input (each col is constant across rows) is
+        // perfectly predicted by V_PRED when the above row matches: set
+        // the reconstructed above row to the same column gradient as the
+        // input cell so V_PRED gives zero residual.
+        let mut recon: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        // Row 3 (just above the cell at row0 = 4) carries the gradient.
+        for (j, cell) in recon[3].iter_mut().enumerate() {
+            *cell = (j * 16) as u8;
+        }
+        let mut input: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        for row in input.iter_mut() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = (j * 16) as u8;
+            }
+        }
+        let (mode, pred) = pick_best_intra_mode_4x4_y(&recon, &input, 4, 4);
+        // V_PRED gives a perfect match (every input row equals the above
+        // row); SSD is 0 so the tie-break order picks V_PRED only if it's
+        // strictly the first zero in enumeration order. DC_PRED comes
+        // first; it would also produce a non-zero residual here (it
+        // averages above + left rather than copying above), so V_PRED's
+        // zero SSD beats DC_PRED's positive SSD.
+        assert_eq!(mode as usize, V_PRED, "expected V_PRED, got mode {mode}");
+        // Verify the picker returned the matching prediction (each row = above row).
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(pred[i * 4 + j], (((4 + j) * 16) as u8));
+            }
+        }
+    }
+
+    #[test]
+    fn pick_best_intra_mode_4x4_y_vertical_gradient_input_prefers_h_pred() {
+        // Mirror of the V_PRED test: horizontal-uniform input (each row
+        // constant across cols), reconstructed left column carries the
+        // gradient, so H_PRED gives zero residual.
+        let mut recon: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        // Col 3 (just left of the cell at col0 = 4) carries the gradient.
+        for (i, row) in recon.iter_mut().enumerate() {
+            row[3] = (i * 16) as u8;
+        }
+        let mut input: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        for (i, row) in input.iter_mut().enumerate() {
+            for cell in row.iter_mut() {
+                *cell = (i * 16) as u8;
+            }
+        }
+        let (mode, _) = pick_best_intra_mode_4x4_y(&recon, &input, 4, 4);
+        assert_eq!(mode as usize, H_PRED, "expected H_PRED, got mode {mode}");
+    }
+
+    #[test]
+    fn predict_intra_mode_4x4_returns_none_for_invalid_mode() {
+        let recon: [[u8; FRAME_WIDTH]; FRAME_HEIGHT] = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        let (have_above, have_left, above_ext, left_ext, above_left) =
+            derive_intra_neighbours_4x4_y(&recon, 4, 4);
+        // Mode 13 is `UV_CFL_PRED` — not in the Y intra mode set.
+        let out =
+            predict_intra_mode_4x4(13, have_above, have_left, &above_ext, &left_ext, above_left);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn encode_intra_frame_y_committed_y_modes_has_one_entry_per_cell() {
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        let luma = [[128u8; FRAME_WIDTH]; FRAME_HEIGHT];
+        let result = encode_intra_frame_y(&luma, &seq, &fh).unwrap();
+        assert_eq!(result.committed_y_modes.len(), CELLS_WIDE * CELLS_HIGH);
+    }
+
+    #[test]
+    fn encode_intra_frame_yuv_committed_y_modes_has_one_entry_per_luma_cell() {
+        let seq = tiny_seq();
+        let fh = tiny_fh(&seq);
+        let input = Yuv420Frame16x16::default();
+        let result = encode_intra_frame_yuv(&input, &seq, &fh).unwrap();
+        assert_eq!(result.committed_y_modes.len(), CELLS_WIDE * CELLS_HIGH);
     }
 }
