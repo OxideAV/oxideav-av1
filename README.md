@@ -2,6 +2,83 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 211)
+
+Round 211 lands the **first per-block syntax writers** on top of the
+r210 `tile_group_obu` framing — the encoder counterparts to
+`PartitionWalker::decode_skip` / `decode_intra_segment_id` /
+`decode_intra_frame_y_mode` / the `y_mode` + `uv_mode` arm of
+`decode_intra_block_mode_info`. Intra arm only: no inter mode_info,
+no MV encode, no partition split, no coefficient encode (next arcs).
+
+`encoder::block_mode_info` — five pure, stateless writers (re-exported
+from `encoder`):
+
+* **`write_skip(writer, cdfs, skip, ctx, seg_skip_active)`** — inverse
+  of §5.11.11 `read_skip`. The `seg_skip_active` arm (`SegIdPreSkip &&
+  seg_feature_active(SEG_LVL_SKIP)`) emits no bits and demands
+  `skip == 1`; otherwise writes one §8.2.6 `S()` against
+  `Default_Skip_Cdf[ctx]`. `ctx` is the §8.3.2 sum-of-neighbour
+  derivation through `crate::cdf::skip_ctx`.
+* **`write_intra_segment_id(writer, cdfs, segment_id, skip, pred, ctx,
+  segmentation_enabled, last_active_seg_id)`** — inverse of §5.11.8
+  `intra_segment_id` and its §5.11.9 `read_segment_id` dispatch. The
+  `segmentation_enabled = false` and `skip != 0` arms emit no bits;
+  the active arm solves `neg_deinterleave(diff, pred, max) ==
+  segment_id` by O(max) search over the §5.11.9 bijection and writes
+  the recovered `diff` against `TileSegmentIdCdf[ctx]`.
+* **`write_intra_frame_y_mode(writer, cdfs, y_mode, abovemode_ctx,
+  leftmode_ctx)`** — inverse of §5.11.7 line 13 `intra_frame_y_mode`
+  S(). The §8.3.2 ctx (`Intra_Mode_Context[neighbour]`) is
+  caller-derived via `crate::cdf::intra_mode_ctx`; the writer drives
+  the keyframe's `TileIntraFrameYModeCdf[above][left]` row.
+* **`write_y_mode(writer, cdfs, y_mode, size_group_ctx)`** — inverse
+  of §5.11.22 line 3 `y_mode` S() (the inter-frame intra-block path,
+  `Size_Group[MiSize]` ctx).
+* **`write_intra_uv_mode(writer, cdfs, y_mode, uv_mode, cfl_allowed)`**
+  — inverse of §5.11.22 line 6 `uv_mode` S(). Caller selects the
+  CFL-allowed / CFL-not-allowed row via
+  `crate::cdf::cfl_allowed_for_uv_mode`.
+
+Stateless on purpose: mirroring `SymbolWriter::write_symbol`'s
+caller-supplied CDF slice pattern, every writer takes its §8.3.2
+context indices as inputs rather than a `PartitionWalker` reference.
+Callers derive ctx through the public `cdf::` helpers exactly as the
+decoder side does — neighbour state lives in the caller's own grid
+(e.g. a shared `PartitionWalker` instance, or a custom encoder-side
+tracker).
+
+13 new lib tests (1167 → 1180), all bit-exact round-trips: encode
+through `SymbolWriter`, then decode through the matching
+`PartitionWalker::decode_*` methods on a fresh walker + default CDFs.
+Coverage:
+
+* `write_skip`: seg-short-circuit no-bit arm, `skip = 0` at origin
+  with §8.3 adaptation engaged on both sides, `skip = 1` at origin,
+  caller-bug rejection of `skip != 1` on seg-arm (4 tests).
+* `write_intra_segment_id`: disabled no-bit arm, §5.11.9 skip
+  short-circuit (segmentation enabled but `skip == 1` ⇒ `segment_id
+  = pred`, no bits), else-branch `neg_deinterleave` round-trip at
+  origin with `pred = 0` (3 tests).
+* `write_intra_frame_y_mode`: `DC_PRED` at origin, `V_PRED`
+  (directional, non-DC) at origin, caller-bug rejection of `y_mode
+  >= INTRA_MODES` (3 tests).
+* `write_y_mode` + `write_intra_uv_mode`: composed `(DC_PRED,
+  DC_PRED)` on `BLOCK_16X16` through `decode_intra_block_mode_info`
+  (CFL-allowed selector, palette + filter-intra gates off); monochrome
+  (`has_chroma = false`) y_mode-only path (2 tests).
+* Composed `{skip, intra_segment_id, y_mode, uv_mode}` smoke test in
+  §5.11.7 order at frame origin on `BLOCK_8X8` (1 test).
+
+Out of scope this arc (next): §5.11.4 partition decision-tree writer;
+first §5.11.39 coefficient-encode primitives (`txb_skip` / `eob` /
+`coeff_base`) so emitted tile payloads decode to real pixel data;
+inter-arm mode_info writers (§5.11.18 dispatcher composite,
+§5.11.23 `inter_block_mode_info`); §5.11.42 `intra_angle_info_y`
+inverse for directional Y modes; §5.11.46 `palette_mode_info` inverse;
+§5.11.24 `filter_intra_mode_info` inverse; §5.11.56 `read_cdef` /
+§5.11.12-13 delta inverses.
+
 ## Status — 2026-05-28 (round 210)
 
 Round 210 lands the **§5.11.1 `tile_group_obu` framing writer** on top

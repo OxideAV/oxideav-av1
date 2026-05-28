@@ -61,14 +61,27 @@
 //!     wraps in an `OBU_TILE_GROUP` (which §5.3.1 explicitly
 //!     excludes from the §5.3.4 trailer).
 //!
-//! Next arc: per-block §5.11 syntax — `skip` / `mode_info` and the
-//! first §5.11.39 coefficient-encode primitives so emitted tile
-//! payloads decode to real pixel data, plus the §5.11.4 partition
-//! decision tree. §5.9.7 `frame_size_with_refs()` inverse + §5.9.24
-//! `read_global_param` signed-subexp inverse for the remaining
-//! inter-frame paths.
+//!   * [`block_mode_info`] — arc 5 (round 211) per-block §5.11 syntax
+//!     writers, intra arm only: `write_skip` (§5.11.11),
+//!     `write_intra_segment_id` (§5.11.8 + §5.11.9), `write_intra_frame_y_mode`
+//!     (§5.11.7 line 13 with the §8.3.2 neighbour-CDF ctx),
+//!     `write_y_mode` (§5.11.22 line 3 with the `Size_Group[ MiSize ]`
+//!     ctx), and `write_intra_uv_mode` (§5.11.22 line 6 with the
+//!     §8.3.2 CFL-allowed selector). Pure stateless: ctx is
+//!     caller-supplied (mirroring [`SymbolWriter::write_symbol`]'s
+//!     caller-supplied CDF slice pattern); round-trip tests drive the
+//!     output back through the matching `PartitionWalker::decode_*`
+//!     methods.
+//!
+//! Next arc: §5.11.4 partition decision tree; first §5.11.39
+//! coefficient-encode primitives (`txb_skip` / `eob` / `coeff_base`)
+//! so emitted tile payloads decode to real pixel data; inter-arm
+//! mode_info writers (§5.11.18 dispatcher composite). §5.9.7
+//! `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
+//! signed-subexp inverse for the remaining inter-frame paths.
 
 pub mod bitwriter;
+pub mod block_mode_info;
 pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
@@ -78,6 +91,9 @@ pub mod temporal_unit;
 pub mod tile_group_obu;
 
 pub use bitwriter::BitWriter;
+pub use block_mode_info::{
+    write_intra_frame_y_mode, write_intra_segment_id, write_intra_uv_mode, write_skip, write_y_mode,
+};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;
 pub use obu::{

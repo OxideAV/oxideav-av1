@@ -6,6 +6,56 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 211 — first per-block syntax writers (intra arm).** New
+  `encoder::block_mode_info` module: pure stateless writers covering
+  the §5.11.7 / §5.11.8 / §5.11.11 / §5.11.22 syntax elements an
+  intra-only single-block payload needs.
+
+  New public API in `encoder::block_mode_info` (re-exported from
+  `encoder`):
+  * `write_skip(writer, cdfs, skip, ctx, seg_skip_active)` — inverse
+    of `decode_skip` (§5.11.11). `seg_skip_active` arm emits no bits;
+    otherwise writes one `S()` against `Default_Skip_Cdf[ctx]`.
+  * `write_intra_segment_id(writer, cdfs, segment_id, skip, pred,
+    ctx, segmentation_enabled, last_active_seg_id)` — inverse of
+    `decode_intra_segment_id` (§5.11.8 + §5.11.9). Disabled / skip /
+    pred arms emit no bits; the active arm writes the `diff` whose
+    `neg_deinterleave(diff, pred, max) == segment_id` reconstruction
+    yields the target id (O(8) inverse search over the §5.11.9
+    bijection).
+  * `write_intra_frame_y_mode(writer, cdfs, y_mode, abovemode_ctx,
+    leftmode_ctx)` — inverse of `decode_intra_frame_y_mode` (§5.11.7
+    line 13 with the §8.3.2 neighbour-CDF `TileIntraFrameYModeCdf
+    [abovemode][leftmode]` row).
+  * `write_y_mode(writer, cdfs, y_mode, size_group_ctx)` — inverse
+    of the §5.11.22 line 3 `y_mode` S() with the `Size_Group[MiSize]`
+    ctx (the inter-frame intra-block path).
+  * `write_intra_uv_mode(writer, cdfs, y_mode, uv_mode, cfl_allowed)`
+    — inverse of the §5.11.22 line 6 `uv_mode` S() with the §8.3.2
+    CFL-allowed selector (caller passes the resolved boolean, e.g.
+    via `cdf::cfl_allowed_for_uv_mode`).
+
+  Stateless on purpose: every writer takes its §8.3.2 ctx as input,
+  mirroring `SymbolWriter::write_symbol`'s caller-supplied CDF slice
+  pattern. The caller derives ctx through the public §8.3.2 helpers
+  (`skip_ctx`, `intra_mode_ctx`, `size_group`, `segment_id_ctx`)
+  exactly as the decoder side does.
+
+  13 new lib tests (1167 → 1180), all bit-exact round-trips: encode
+  through `SymbolWriter`, then decode back through the matching
+  `PartitionWalker::decode_skip` / `decode_intra_segment_id` /
+  `decode_intra_frame_y_mode` / `decode_intra_block_mode_info`
+  methods on a fresh walker + default CDFs. Coverage includes the
+  `seg_skip_active` no-bit arm, the `segmentation_enabled = false`
+  no-bit arm, the §5.11.9 skip short-circuit, the segmentation
+  else-branch `neg_deinterleave` round-trip, the §5.11.7
+  `DC_PRED` / `V_PRED` intra-frame y_mode round-trips, the §5.11.22
+  composed `y_mode` + `uv_mode` round-trip on a CFL-allowed block,
+  the §5.11.22 monochrome (`has_chroma = false`) y_mode-only path,
+  the `seg_skip_active` arm `skip != 1` caller-bug rejection, and
+  the composed `{skip, intra_segment_id, y_mode, uv_mode}` smoke
+  test in §5.11.7 order.
+
 * **Round 210 — §5.11.1 `tile_group_obu` framing writer + entropy-
   encoder composition wrappers.** The §5.11.1 body framer is the next
   arc on top of the r209 `SymbolWriter`; the composition wrappers
