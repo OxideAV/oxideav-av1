@@ -6,6 +6,47 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 195 — §7.14 loop filter (deblocking) — top-level driver +
+  edge-strength + narrow/wide filter bodies.**
+  New `loop_filter` module exposes the full §7.14 deblocking surface
+  acting on the post-§7.12.3 reconstructed `CurrFrame[plane]`
+  samples: `loop_filter_frame` (§7.14.1 per-plane × per-pass × per-row
+  × per-col walk with the `rowStep`/`colStep` chroma stride),
+  `loop_filter_edge` (§7.14.2 per-edge driver — `onScreen` + `(xP, yP)`
+  + `(prevRow, prevCol)` + `isBlockEdge` + `isTxEdge` + `applyFilter`
+  gates), `filter_size` (§7.14.3 — `Min(plane==0?16:8,
+  Min(Tx_*[txSz], Tx_*[prevTxSz]))`),
+  `adaptive_filter_strength` + `adaptive_filter_strength_selection`
+  (§7.14.4 + §7.14.5 — `(lvl, limit, blimit, thresh)` with
+  per-segment `SEG_LVL_ALT_LF_*` + `loop_filter_ref_deltas[]` /
+  `loop_filter_mode_deltas[]` adjustments, both `Clip3(0,
+  MAX_LOOP_FILTER)` clipped), `sample_filtering` (§7.14.6.1 mask →
+  narrow/wide dispatch), `filter_mask` (§7.14.6.2 — `hevMask` +
+  `filterMask` + `flatMask` + `flatMask2`), `narrow_filter`
+  (§7.14.6.3 — 4-pixel-window edge filter with `filter4_clamp` to
+  `[-(1<<(BD-1)), (1<<(BD-1))-1]` and the two-tap `Round2(filter1,
+  1)` low-energy arm gated on `!hevMask`), and `wide_filter`
+  (§7.14.6.4 — 6/8/14-tap low-pass with `n ∈ {2, 3, 6}` and `n2 ∈ {0,
+  1}` per `log2Size`/`plane`, `Clip3(-(n+1), n, ...)` edge
+  replication, `i64` accumulator for the 14-tap luma path). New
+  public types: `LoopFilterFrameContext<'_>` (frame-level inputs +
+  closure surface for `is_intra` / `skip` / `ref_frame` / `mode` /
+  `segment_id` / `delta_lf` / `seg_feature_active` /
+  `seg_feature_data` / `lf_tx_size` / `mi_size`), `PlaneBuffer<'_>`
+  (per-plane sample-buffer mutable view with `(rows, cols, samples)`
+  triple), `FilterStrength`, `FilterMaskOutput`. New public ordinal
+  constants in `loop_filter`: `NEARESTMV` / `GLOBALMV` /
+  `GLOBAL_GLOBALMV` (mirroring `cdf::MODE_*` for the §7.14.4 mode-type
+  comparison) and `SEG_LVL_ALT_LF_Y_V = 1`. Test count: 1014 → 1026
+  (+12 in lib): four §7.14.4/§7.14.5 strength tests (lvl=0 ⇒ skip;
+  basic lvl=32 sharp=0 table; intra ref-delta lifts lvl; clipped at
+  `MAX_LOOP_FILTER`); one §7.14.3 filter-size cap test; two narrow
+  filter tests (uniform-input idempotency; step-edge softening with
+  symmetric move about the mid-point); two wide filter
+  uniform-preservation tests at `log2Size ∈ {3, 4}`; two §7.14.6.2
+  mask tests (flat region allows filter; steep edge vetoes it); one
+  §7.14.1 driver iteration-count test on a 2×2 mi-grid.
+
 * **Round 194 — §7.11.3.1 `predict_inter` driver skeleton
   (translational single-ref SIMPLE arm).**
   New free function `inter_pred::predict_inter(plane, x, y, w, h,

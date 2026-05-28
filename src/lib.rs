@@ -1522,6 +1522,7 @@ mod bitreader;
 pub mod cdf;
 pub mod frame_header;
 pub mod inter_pred;
+pub mod loop_filter;
 pub mod obu;
 pub mod scan;
 pub mod sequence_header;
@@ -1784,6 +1785,11 @@ pub use inter_pred::{
     WEDGE_BITS, WEDGE_CODEBOOK, WEDGE_DIRECTIONS, WEDGE_HORIZONTAL, WEDGE_MASTER_OBLIQUE_EVEN,
     WEDGE_MASTER_OBLIQUE_ODD, WEDGE_MASTER_VERTICAL, WEDGE_OBLIQUE117, WEDGE_OBLIQUE153,
     WEDGE_OBLIQUE27, WEDGE_OBLIQUE63, WEDGE_VERTICAL,
+};
+pub use loop_filter::{
+    adaptive_filter_strength, adaptive_filter_strength_selection, filter_mask, filter_size,
+    loop_filter_edge, loop_filter_frame, narrow_filter, sample_filtering, wide_filter,
+    FilterMaskOutput, FilterStrength, LoopFilterFrameContext, PlaneBuffer,
 };
 pub use uncompressed_header_tail::{
     parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,

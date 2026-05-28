@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 194)
+## Status — 2026-05-28 (round 195)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1552,6 +1552,108 @@ on the SWITCHABLE + skip_mode (needs_interp_filter == 0) path with
 the walker's `interp_filters` grid stamped EIGHTTAP over the
 BLOCK_16X16 footprint. Test count: 721 → 731 (+10). `decode_av1` /
 `encode_av1` still return `Error::NotImplemented`.
+
+Round 195 lands the **§7.14 loop filter (deblocking) — driver +
+edge-strength + 4/8/14-tap filter bodies**, sitting on top of the
+post-§7.12.3 `CurrFrame[plane]` reconstructed samples per av1-spec
+p.307-318. The new `loop_filter` module exposes:
+
+* **§7.14.1 [`loop_filter_frame`]** — top-level per-plane × per-pass
+  (vertical-then-horizontal) × per-row × per-col walk with the
+  `rowStep`/`colStep = (plane == 0) ? 1 : (1 << subY/X)` chroma
+  stride. Mutates the per-plane [`PlaneBuffer`]s in place.
+* **§7.14.2 [`loop_filter_edge`]** — per-edge driver: derives
+  `(dx, dy)`, `(x, y)`, `(xP, yP)`, `(prevRow, prevCol)`, `onScreen`,
+  `isBlockEdge`, `isTxEdge`, and `applyFilter` per the spec's exact
+  gate ordering; then runs §7.14.3 + §7.14.4 + §7.14.6 against the
+  `MI_SIZE`-pixel span of the boundary.
+* **§7.14.3 [`filter_size`]** — `Min(plane==0 ? 16 : 8, Min(Tx_*[txSz],
+  Tx_*[prevTxSz]))`, with `pass == 0` consulting `Tx_Width[]` and
+  `pass == 1` consulting `Tx_Height[]`.
+* **§7.14.4 [`adaptive_filter_strength`]** — derives the
+  [`FilterStrength`] bundle `(lvl, limit, blimit, thresh)`: `lvl`
+  from §7.14.5; `limit` via the `loop_filter_sharpness`-driven
+  shift + `Clip3(1, 9 - sharp, lvl >> shift)` / `Max(1, lvl >>
+  shift)` branch; `blimit = 2 * (lvl + 2) + limit`; `thresh = lvl
+  >> 4`.
+* **§7.14.5 [`adaptive_filter_strength_selection`]** — the per-segment
+  `SEG_LVL_ALT_LF_Y_V + i` adjustment + the
+  `loop_filter_ref_deltas[INTRA_FRAME]` (intra path) / `+ ref + mode`
+  (inter path) shifted-by-`lvlSeg >> 5` adjustment, both clipped to
+  `[0, MAX_LOOP_FILTER]`.
+* **§7.14.6.1 [`sample_filtering`]** — per-pixel dispatch from
+  [`filter_mask`] outputs: `filterMask == 0` ⇒ no-op; otherwise
+  `filterSize == 4 || !flatMask` ⇒ [`narrow_filter`], else
+  `filterSize == 8 || !flatMask2` ⇒ [`wide_filter`] with
+  `log2Size = 3`, else `wide_filter` with `log2Size = 4`.
+* **§7.14.6.2 [`filter_mask`]** — computes the four masks
+  [`FilterMaskOutput`] (`hevMask`, `filterMask`, `flatMask`,
+  `flatMask2`) from samples at `(x ± k*dx, y ± k*dy)` for `k ∈
+  {0..6}` plus the seventh `p6 / q6` slot. `filterLen` widens with
+  `(plane != 0)` (6) / `filterSize == 8` (8) / else 16.
+* **§7.14.6.3 [`narrow_filter`]** — the 4-pixel-window edge filter:
+  subtract `0x80 << (BitDepth - 8)` from inputs, build `filter`
+  from `hevMask ? ps1 - qs1 : 0` plus `3 * (qs0 - ps0)`,
+  `filter4_clamp` to `[-(1 << (BitDepth-1)), (1 << (BitDepth-1)) -
+  1]`, then `filter1 = (filter + 4) >> 3` / `filter2 = (filter + 3)
+  >> 3` ⇒ `oq0 = qs0 - filter1 + half`, `op0 = ps0 + filter2 +
+  half`. The `!hevMask` arm additionally writes `oq1` / `op1` via a
+  `Round2(filter1, 1)` half-strength tap.
+* **§7.14.6.4 [`wide_filter`]** — the low-pass 6/8/14-tap filter for
+  detected flat regions: `n ∈ {2, 3, 6}` (chroma-8 / luma-8 / 16
+  branches), `n2 ∈ {0, 1}`, with the `Clip3(-(n+1), n, i + j)`
+  replicated-edge index. Inner accumulator runs in `i64` so the
+  14-tap luma path doesn't overflow at 12-bit content.
+
+A small standalone [`LoopFilterFrameContext`] bundles the §5.9.11 /
+§5.9.18 / §5.5 / §5.9.5 frame-header fields the driver needs plus
+seven `&dyn Fn(...)` closures the caller hooks into the §5.11 decode
+state — `is_intra`, `skip`, `ref_frame`, `mode`, `segment_id`,
+`delta_lf`, `seg_feature_active` / `seg_feature_data`, `lf_tx_size`,
+`mi_size`. Letting the driver run against synthetic predicates keeps
+the §7.14 walk testable without the full §5.11.x walker wired up.
+
+Test count: 1014 → 1026 (+12 in lib). New tests (all in
+`loop_filter::tests`):
+
+* **`strength_returns_zero_when_loop_filter_level_zero`** — the
+  §7.14.5 short-circuit when `loop_filter_level[i] == 0` and no
+  deltas are enabled returns `lvl == 0`, suppressing the edge.
+* **`strength_basic_table_lvl_32_sharp_0`** — sanity:
+  `lvl=32, sharp=0` ⇒ `limit=32, blimit=100, thresh=2` per the §7.14.4
+  formulas.
+* **`strength_intra_ref_delta_lifts_lvl`** — with
+  `loop_filter_delta_enabled` + `ref_deltas[INTRA_FRAME] = 5`,
+  `lvl_seg = 10 + (5 << (10 >> 5))` = 15 (n_shift = 0).
+* **`strength_clipped_at_max_loop_filter`** — `lvl=60` + ref_delta `10`
+  shifted by `n_shift = 60 >> 5 = 1` (⇒ 80) clips to 63.
+* **`filter_size_luma_caps_at_16_chroma_at_8`** — `TX_64X64`
+  64-wide ⇒ luma 16 / chroma 8; `TX_4X4` 4-wide ⇒ 4.
+* **`narrow_filter_idempotent_on_uniform_input`** — uniform 128 ⇒
+  every sample unchanged (filter terms collapse to ±0).
+* **`narrow_filter_softens_sharp_step_edge`** — left-100 / right-156
+  step ⇒ `p0` rises above 100, `q0` falls below 156, and the move
+  is symmetric about the mid-point (128).
+* **`wide_filter_log2_3_luma_preserves_uniform_input`** — uniform 200
+  ⇒ each tap-summed result equals 200 (DC-gain-1 design).
+* **`wide_filter_log2_4_luma_preserves_uniform_input`** — uniform 64
+  ⇒ unchanged.
+* **`filter_mask_flat_region_allows_filter`** — uniform 100 with
+  generous thresholds ⇒ `filter_mask && flat_mask && !hev_mask`.
+* **`filter_mask_steep_edge_blocks_filter`** — sharp 50/200 step with
+  tight thresholds ⇒ `!filter_mask` (filter vetoed).
+* **`driver_iterates_correct_edge_count_for_2x2_mi_grid`** — 2×2
+  mi-grid × 2 passes × on-screen gate ⇒ exactly 4 edges visit the
+  per-block predicate.
+
+The §5.9.11 `loop_filter_params()` parse landed in r5 + was
+stream-wired in r9; r195 turns the parsed parameters into the actual
+post-reconstruction sample modifications they govern. The driver does
+not yet wire against [`PartitionWalker`] directly — the next arc will
+plumb the closure surface into the walker's `y_modes` / `is_inters`
+/ `segment_ids` / `skips` accessors so a full decode can apply the
+deblock pass without bespoke predicates. §7.15 CDEF and §7.17 LR
+remain on the roadmap for subsequent arcs.
 
 Round 194 lands the **§7.11.3.1 [`predict_inter`] driver skeleton** —
 the entry point the §5.11.33 dispatcher invokes per inter task. The
