@@ -839,15 +839,35 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
 // (when `motion_mode == OBMC`) hands off to §7.11.3.9-10 for the
 // overlap blend.
 //
-// r194 implements the minimum end-to-end path: single-reference
+// r194 landed the minimum end-to-end path: single-reference
 // translational MC (`is_compound == false`, `motion_mode ==
 // MOTION_MODE_SIMPLE`, `IsInterIntra == false`) — i.e. the §7.11.3.1
 // steps 1, 4, 5 (refList=0), 8, 9, 10, 13, then the
 // `isCompound == 0 && IsInterIntra == 0` final-clip arm of the
 // "inter predicted samples are then derived" step (av1-spec p.258
-// line 14402). The three remaining motion modes / compound /
-// interintra arms surface dedicated [`crate::Error`] variants — the
-// caller can therefore narrow the call site once each arm lands.
+// line 14402).
+//
+// r201 wires the §7.11.3.1 step-14 compound arm: when `is_compound ==
+// true`, the driver iterates `refList ∈ {0, 1}`, runs the same §7.11.3.3
+// + §7.11.3.4 pipeline twice (one per ref), then dispatches on
+// `compound_type` per av1-spec p.258 lines 14400-14412:
+//
+//   * `COMPOUND_AVERAGE` (line 14405) — `Clip1(Round2(preds[0] +
+//     preds[1], 1 + InterPostRound))` per pixel.
+//   * `COMPOUND_DISTANCE` (line 14408) — `Clip1(Round2(FwdWeight *
+//     preds[0] + BckWeight * preds[1], 4 + InterPostRound))` per pixel
+//     using `(FwdWeight, BckWeight)` from §7.11.3.15.
+//   * `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` (line
+//     14412) — `mask_blend(preds, plane, x, y, w, h)` with the
+//     §7.11.3.11 / §7.11.3.12 / §7.11.3.13 mask. The mask is computed
+//     once at `plane == 0` (spec line 14386-14393 condition) and reused
+//     for chroma via [`mask_blend`]'s `(sub_x, sub_y)` downsampling.
+//     The driver does not compute the mask itself — the caller supplies
+//     the already-derived luma-grid mask through `CompoundParams`.
+//
+// The remaining `motion_mode == WARPED_CAUSAL` / `motion_mode == OBMC`
+// arms surface dedicated [`crate::Error`] variants — the caller can
+// therefore narrow the call site once each arm lands.
 //
 // Steps mapped to this driver:
 //
@@ -868,15 +888,19 @@ pub fn clip1_single_ref(bit_depth: u8, pred: &[i32], out: &mut [u16]) -> Result<
 //   caller responsibility, same rationale as step 9).
 // * Step 12 → WARP arm — short-circuits as above.
 // * Step 13 → [`block_inter_prediction`] (the §7.11.3.4 leaf).
-// * Step 14 → `is_compound == 1` short-circuits at
-//   `Error::PredictInterCompoundUnsupported`.
+// * Step 14 → `is_compound == 1` repeats steps 5-13 for `refList = 1`
+//   into a second `preds[1]` buffer, then dispatches the
+//   `compound_type` arm of the "inter predicted samples are then
+//   derived" step.
 // * "Mask" prep / "inter predicted samples are then derived" —
 //   `isCompound == 0 && IsInterIntra == 0` arm:
 //   `CurrFrame[plane][y+i][x+j] = Clip1( preds[0][i][j] )`. We write
 //   into a caller-supplied flat `pred_out: &mut [u16]` per-block
 //   buffer; integrating the per-`CurrFrame[plane]` merge is the
 //   walker's responsibility (it owns the per-plane buffer; see
-//   [`crate::PartitionWalker::curr_frame`]).
+//   [`crate::PartitionWalker::curr_frame`]). The compound arm writes
+//   into the same `pred_out` buffer with the §7.11.3.11-15 combined
+//   output.
 // * §7.11.3.1 post-step `motion_mode == OBMC` — short-circuits at
 //   `Error::PredictInterObmcUnsupported`.
 
@@ -917,6 +941,65 @@ pub struct PredictInterRef<'a> {
     pub mv: [i16; 2],
 }
 
+/// §7.11.3.1 step-14 compound-combine descriptor (av1-spec p.258 lines
+/// 14384-14412): selects one of the five `compound_type` combine arms
+/// and carries the per-arm side data the §7.11.3.11-15 leaves consume.
+///
+/// The driver receives this as `Some(_)` when `is_compound == true`
+/// and `None` (or ignored) on the single-ref path. Per av1-spec p.258
+/// line 14386-14393, the §7.11.3.11 / §7.11.3.12 / §7.11.3.13 mask is
+/// computed once at `plane == 0` and **reused** for chroma planes
+/// (downsampled by [`mask_blend`]'s `(sub_x, sub_y)` argument). The
+/// caller is responsible for computing the mask once at `plane == 0`
+/// and passing the same buffer on subsequent `plane == 1` / `plane == 2`
+/// invocations — the driver does not cache it across calls.
+#[derive(Debug, Clone, Copy)]
+pub enum CompoundParams<'a> {
+    /// `COMPOUND_AVERAGE` (av1-spec p.258 line 14405) — `Clip1(Round2(
+    /// preds[0] + preds[1], 1 + InterPostRound))` per pixel. No mask /
+    /// weights needed.
+    Average,
+    /// `COMPOUND_DISTANCE` (av1-spec p.258 line 14408) — `Clip1(Round2(
+    /// FwdWeight * preds[0] + BckWeight * preds[1], 4 + InterPostRound))`
+    /// per pixel, using `(FwdWeight, BckWeight)` from the §7.11.3.15
+    /// `distance_weights` body.
+    Distance(DistanceWeights),
+    /// `COMPOUND_WEDGE` (av1-spec p.258 line 14412 via §7.11.3.11 +
+    /// §7.11.3.14) — wedge-mask blend. The mask is the §7.11.3.11
+    /// output filled at `plane == 0` (luma grid) and reused across
+    /// planes via [`mask_blend`]'s `(sub_x, sub_y)` downsampling.
+    /// `mask_stride` is the row stride of `mask`; `0` selects the
+    /// natural `2*w` (when `sub_x == 1`) or `w` row stride.
+    Wedge {
+        /// Luma-grid wedge mask (filled by [`wedge_mask`]).
+        mask: &'a [u8],
+        /// Row stride of `mask` in `u8`s; `0` selects the default.
+        mask_stride: usize,
+    },
+    /// `COMPOUND_DIFFWTD` (av1-spec p.258 line 14412 via §7.11.3.12 +
+    /// §7.11.3.14) — difference-weight mask blend. Mask is computed by
+    /// [`difference_weight_mask`] from `(preds[0], preds[1])`, so it is
+    /// inherently luma-grid (plane == 0) sized.
+    Diffwtd {
+        /// Luma-grid difference-weight mask (filled by
+        /// [`difference_weight_mask`]).
+        mask: &'a [u8],
+        /// Row stride of `mask` in `u8`s; `0` selects the default.
+        mask_stride: usize,
+    },
+    /// `COMPOUND_INTRA` (av1-spec p.258 line 14412 via §7.11.3.13 +
+    /// §7.11.3.14) — inter-intra-variant mask blend (also reached on
+    /// the `IsInterIntra == 0 && compound_type == COMPOUND_INTRA`
+    /// compound path per p.258 lines 14389-14390). The mask is the
+    /// §7.11.3.13 output from [`intra_mode_variant_mask`].
+    Intra {
+        /// Mask buffer (filled by [`intra_mode_variant_mask`]).
+        mask: &'a [u8],
+        /// Row stride of `mask` in `u8`s; `0` selects the default.
+        mask_stride: usize,
+    },
+}
+
 /// §7.11.3.1 driver — translational single-reference MC arm.
 ///
 /// Composes [`rounding_variables`] (§7.11.3.2),
@@ -926,28 +1009,34 @@ pub struct PredictInterRef<'a> {
 /// §7.11.3.1 single-ref final-clip (`CurrFrame[plane][y+i][x+j] =
 /// Clip1( preds[0][i][j] )`, av1-spec p.258 line 14402).
 ///
-/// ## Implemented in this round (r194)
+/// ## Implemented (r194 single-ref + r201 compound)
 ///
-/// * Step 1 — `rounding_variables(bit_depth, is_compound)` (caller
-///   passes `is_compound == false` on this driver — see the
-///   `PredictInterCompoundUnsupported` short-circuit).
-/// * Step 4 — `refList = 0` only (the step-14 compound `refList = 1`
-///   repeat is next-arc).
+/// * Step 1 — `rounding_variables(bit_depth, is_compound)`.
+/// * Step 4 — `refList = 0` (single-ref + compound) plus the step-14
+///   `refList = 1` repeat on the compound arm.
 /// * Steps 8-10 — `motion_vector_scaling(plane, subsampling_*,
 ///   frame_*, ref_upscaled_width, ref_frame_height, x, y, mv)`.
 /// * Step 13 — `block_inter_prediction(plane, subsampling_*,
 ///   ref_plane, ref_stride, ref_width, ref_height, startX, startY,
 ///   stepX, stepY, w, h, interp_filter_x, interp_filter_y,
 ///   InterRound0, InterRound1, pred)`.
-/// * "inter predicted samples are then derived" final-clip arm —
-///   `isCompound == 0 && IsInterIntra == 0`: writes
-///   `Clip1(pred[i*w+j])` into `pred_out[i*w+j]` via
-///   [`clip1_single_ref`].
+/// * "inter predicted samples are then derived" arms (av1-spec p.258
+///   lines 14400-14412):
+///   * `isCompound == 0 && IsInterIntra == 0` — single-ref final-clip
+///     `Clip1(pred[i*w+j])` via [`clip1_single_ref`].
+///   * `COMPOUND_AVERAGE` — `Clip1(Round2(preds[0] + preds[1],
+///     1 + InterPostRound))` per pixel.
+///   * `COMPOUND_DISTANCE` — `Clip1(Round2(FwdWeight * preds[0] +
+///     BckWeight * preds[1], 4 + InterPostRound))` via
+///     [`compound_distance_blend`].
+///   * `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` —
+///     [`mask_blend`] with the caller-supplied luma-grid mask (the
+///     mask is computed once at `plane == 0` and reused for chroma per
+///     spec line 14386-14393's `plane == 0` guard, with the per-plane
+///     downsampling handled inside `mask_blend` via `(sub_x, sub_y)`).
 ///
 /// ## Stubbed arms (each surfaces a dedicated [`crate::Error`])
 ///
-/// * Step 14 `is_compound == 1`  →
-///   [`crate::Error::PredictInterCompoundUnsupported`].
 /// * Steps 2,3,6,7,12 `motion_mode == MOTION_MODE_WARPED_CAUSAL` /
 ///   `useWarp != 0`  → [`crate::Error::PredictInterWarpUnsupported`].
 /// * Post-step `motion_mode == MOTION_MODE_OBMC`  →
@@ -962,7 +1051,8 @@ pub struct PredictInterRef<'a> {
 /// * `motion_mode` — §5.11.27 `motion_mode` ordinal
 ///   ([`crate::MOTION_MODE_SIMPLE`] / `MOTION_MODE_OBMC` /
 ///   `MOTION_MODE_WARPED_CAUSAL`). r194 supports `SIMPLE` only.
-/// * `is_compound` — §7.11.3.1 `isCompound`. r194 requires `false`.
+/// * `is_compound` — §7.11.3.1 `isCompound`. When `true`, `refs` must
+///   contain at least 2 entries and `compound` must be `Some(_)`.
 /// * `is_inter_intra` — §5.11.33 `IsInterIntra`. r194 requires
 ///   `false` (the interintra final-blend body is wired through
 ///   [`mask_blend_interintra`] but its driver invocation site is
@@ -977,27 +1067,165 @@ pub struct PredictInterRef<'a> {
 ///   `EIGHTTAP_SMOOTH` / `EIGHTTAP_SHARP` / `BILINEAR`). The
 ///   §7.11.3.4 small-block remap is applied inside the leaf.
 /// * `refs` — per-list `(ref_plane, ref_stride, mv, ref_dims)`
-///   bundles. On the single-ref path `refs.len() == 1` (only
-///   `refs[0]` is consulted); on the compound path the caller would
-///   pass 2 entries — but the compound arm short-circuits before
-///   the second list is read.
+///   bundles. On the single-ref path `refs.len() >= 1` (only
+///   `refs[0]` is consulted); on the compound path `refs.len() >= 2`.
+/// * `compound` — `Some(CompoundParams)` on the compound arm
+///   (`is_compound == true`); must be `None` on the single-ref arm.
+///   See [`CompoundParams`] for the per-`compound_type` payloads.
 /// * `pred_out` — flat `w * h` row-major output buffer
 ///   (`pred_out[i*w + j]`). Receives the §7.11.3.1 single-ref
-///   `Clip1(preds[0][i][j])`.
+///   `Clip1(preds[0][i][j])` on the single-ref arm, or the
+///   §7.11.3.11-15 combined output on the compound arm.
 ///
 /// ## Returns
 ///
-/// `Ok(())` on the single-ref translational path. Returns
-/// `Error::PredictInterCompoundUnsupported` /
+/// `Ok(())` on the supported arms. Returns
 /// `Error::PredictInterWarpUnsupported` /
 /// `Error::PredictInterObmcUnsupported` per the stub-arm table
 /// above. Returns `Error::PartitionWalkOutOfRange` for caller-bug
 /// arguments: `plane > 2`, `subsampling_{x,y} > 1`, `bit_depth ∉
 /// {8, 10, 12}`, `frame_{width,height} == 0`, `w == 0 || h == 0 ||
-/// w > 256 || h > 256`, `refs.is_empty()` on the single-ref path,
-/// `pred_out.len() < w * h`, or any sub-condition the
-/// `motion_vector_scaling` / `block_inter_prediction` /
-/// `clip1_single_ref` leaves reject.
+/// w > 256 || h > 256`, `refs.is_empty()`, `refs.len() < 2` on the
+/// compound path, missing/spurious `compound` argument, `pred_out.len()
+/// < w * h`, or any sub-condition the `motion_vector_scaling` /
+/// `block_inter_prediction` / `clip1_single_ref` / `mask_blend` /
+/// `compound_distance_blend` leaves reject.
+/// §7.11.3.1 step 5-13 per-`refList` body (av1-spec p.257 lines
+/// 14315-14374) — produce the `preds[refList][i][j]` `i32` prediction
+/// array for one reference. Used twice on the compound arm.
+///
+/// Drives [`motion_vector_scaling`] (§7.11.3.3) → [`block_inter_prediction`]
+/// (§7.11.3.4) with the same `(plane, subsampling_*, frame_*,
+/// interp_filter_*, inter_round0, inter_round1)` shared across refs.
+///
+/// Allocates the `w * h` `i32` buffer fallibly (returns
+/// `Error::PartitionWalkOutOfRange` on alloc failure).
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_per_ref(
+    r: &PredictInterRef<'_>,
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    inter_round0: u32,
+    inter_round1: u32,
+) -> Result<Vec<i32>, crate::Error> {
+    let mvs = motion_vector_scaling(
+        plane,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        r.ref_upscaled_width,
+        r.ref_height,
+        x,
+        y,
+        r.mv,
+    )?;
+
+    let mut pred: Vec<i32> = Vec::new();
+    if pred.try_reserve_exact(w * h).is_err() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    pred.resize(w * h, 0);
+
+    block_inter_prediction(
+        plane,
+        subsampling_x,
+        subsampling_y,
+        r.ref_plane,
+        r.ref_stride,
+        r.ref_width,
+        r.ref_height,
+        mvs.start_x,
+        mvs.start_y,
+        mvs.step_x,
+        mvs.step_y,
+        w,
+        h,
+        interp_filter_x,
+        interp_filter_y,
+        inter_round0,
+        inter_round1,
+        &mut pred,
+    )?;
+    Ok(pred)
+}
+
+/// §7.11.3.1 step-14 compound combine (av1-spec p.258 lines 14400-14412)
+/// — dispatch on `CompoundParams` to apply one of the five §7.11.3.11-15
+/// blend mechanisms and write the result into `pred_out`.
+///
+/// * `COMPOUND_AVERAGE` is inlined here (the §7.11.3.1 body itself
+///   carries it — no separate leaf).
+/// * `COMPOUND_DISTANCE` routes to [`compound_distance_blend`].
+/// * `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` route to
+///   [`mask_blend`] with the caller-supplied luma-grid mask.
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_compound_blend(
+    bit_depth: u8,
+    inter_post_round: u32,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    w: usize,
+    h: usize,
+    pred0: &[i32],
+    pred1: &[i32],
+    params: CompoundParams<'_>,
+    pred_out: &mut [u16],
+) -> Result<(), crate::Error> {
+    match params {
+        CompoundParams::Average => {
+            // av1-spec p.258 line 14405:
+            //   CurrFrame[plane][y+i][x+j] =
+            //       Clip1(Round2(preds[0][i][j] + preds[1][i][j],
+            //                    1 + InterPostRound))
+            let max: i32 = (1i32 << bit_depth) - 1;
+            let shift: u32 = 1 + inter_post_round;
+            for i in 0..h {
+                for j in 0..w {
+                    let acc = pred0[i * w + j] as i64 + pred1[i * w + j] as i64;
+                    let rounded = round2(acc, shift) as i32;
+                    pred_out[i * w + j] = clip3_i32(0, max, rounded) as u16;
+                }
+            }
+            Ok(())
+        }
+        CompoundParams::Distance(weights) => compound_distance_blend(
+            bit_depth,
+            inter_post_round,
+            weights,
+            pred0,
+            pred1,
+            w,
+            h,
+            pred_out,
+        ),
+        CompoundParams::Wedge { mask, mask_stride }
+        | CompoundParams::Diffwtd { mask, mask_stride }
+        | CompoundParams::Intra { mask, mask_stride } => mask_blend(
+            bit_depth,
+            inter_post_round,
+            subsampling_x,
+            subsampling_y,
+            pred0,
+            pred1,
+            w,
+            h,
+            mask,
+            mask_stride,
+            pred_out,
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn predict_inter(
     plane: u8,
@@ -1016,6 +1244,7 @@ pub fn predict_inter(
     interp_filter_x: u8,
     interp_filter_y: u8,
     refs: &[PredictInterRef<'_>],
+    compound: Option<CompoundParams<'_>>,
     pred_out: &mut [u16],
 ) -> Result<(), crate::Error> {
     // ---------- caller-bug guards ----------
@@ -1040,16 +1269,17 @@ pub fn predict_inter(
     if refs.is_empty() {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-
-    // ---------- §7.11.3.1 step 14 — compound short-circuit ----------
-    //
-    // Step 14 repeats steps 5-13 for `refList = 1`, then applies one
-    // of the COMPOUND_{AVERAGE,DISTANCE,WEDGE,DIFFWTD,INTRA} combine
-    // arms (av1-spec p.258 lines 14381-14412). The §7.11.3.11-15
-    // sample-generation leaves are landed (r191) but the per-block
-    // driver wiring is a next-arc target.
+    // The compound arm reads `refs[1]`; the single-ref arm rejects a
+    // spurious `compound = Some(_)` to keep the contract bidirectional.
     if is_compound {
-        return Err(crate::Error::PredictInterCompoundUnsupported);
+        if refs.len() < 2 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if compound.is_none() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+    } else if compound.is_some() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
     // ---------- §7.11.3.1 step 2,3,6,7,12 — WARP short-circuit ----
@@ -1085,61 +1315,85 @@ pub fn predict_inter(
 
     // ---------- §7.11.3.1 step 4-13 — refList = 0 ----------
     //
-    // Steps 5,8,9 are subsumed into the caller-supplied `refs[0]`
+    // Steps 5,8,9 are subsumed into the caller-supplied `refs[refList]`
     // bundle. Step 10 = `motion_vector_scaling`. Step 13 =
     // `block_inter_prediction` against the
-    // `(startX, startY, stepX, stepY)` quadruple.
-    let r0 = &refs[0];
-
-    let mvs = motion_vector_scaling(
+    // `(startX, startY, stepX, stepY)` quadruple. The compound arm
+    // (step 14) repeats the same body for `refList = 1`.
+    let pred0 = predict_inter_per_ref(
+        &refs[0],
         plane,
+        x,
+        y,
+        w,
+        h,
         subsampling_x,
         subsampling_y,
         frame_width,
         frame_height,
-        r0.ref_upscaled_width,
-        r0.ref_height,
-        x,
-        y,
-        r0.mv,
-    )?;
-
-    let mut pred0: Vec<i32> = Vec::new();
-    if pred0.try_reserve_exact(w * h).is_err() {
-        return Err(crate::Error::PartitionWalkOutOfRange);
-    }
-    pred0.resize(w * h, 0);
-
-    block_inter_prediction(
-        plane,
-        subsampling_x,
-        subsampling_y,
-        r0.ref_plane,
-        r0.ref_stride,
-        r0.ref_width,
-        r0.ref_height,
-        mvs.start_x,
-        mvs.start_y,
-        mvs.step_x,
-        mvs.step_y,
-        w,
-        h,
         interp_filter_x,
         interp_filter_y,
         rv.inter_round0,
         rv.inter_round1,
-        &mut pred0,
     )?;
 
-    // ---------- §7.11.3.1 final-clip (single-ref arm) ----------
+    // ---------- §7.11.3.1 step 14 + final blend ----------
     //
-    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
-    // Clip1( preds[0][i][j] )` for `(i, j) ∈ [0, h) × [0, w)`. We
-    // write into the caller-supplied per-block buffer; the merge
-    // into [`crate::PartitionWalker::curr_frame`] is the walker's
-    // responsibility (it owns the per-plane buffer and the (x, y)
-    // offsetting).
-    clip1_single_ref(bit_depth, &pred0, pred_out)?;
+    // av1-spec p.258 lines 14400-14412:
+    //   * `isCompound == 0 && IsInterIntra == 0` ⇒ `CurrFrame =
+    //     Clip1(preds[0])` (single-ref final-clip).
+    //   * `COMPOUND_AVERAGE` ⇒ `Clip1(Round2(preds[0] + preds[1],
+    //     1 + InterPostRound))`.
+    //   * `COMPOUND_DISTANCE` ⇒ `Clip1(Round2(FwdWeight * preds[0] +
+    //     BckWeight * preds[1], 4 + InterPostRound))`.
+    //   * `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` ⇒
+    //     `mask_blend(preds, plane, x, y, w, h)`.
+    //
+    // The interintra branch (`IsInterIntra == 1`) is gated by the
+    // earlier `Error::ComputePredictionInterIntraUnsupported` short-
+    // circuit, so it never reaches here.
+    if is_compound {
+        // step 14: build preds[1] from refs[1] with the same pipeline.
+        let pred1 = predict_inter_per_ref(
+            &refs[1],
+            plane,
+            x,
+            y,
+            w,
+            h,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            interp_filter_x,
+            interp_filter_y,
+            rv.inter_round0,
+            rv.inter_round1,
+        )?;
+        // SAFETY: the `is_compound` arm guarded `compound.is_some()`
+        // above, so `unwrap` cannot panic.
+        let cp = compound.expect("compound checked above");
+        predict_inter_compound_blend(
+            bit_depth,
+            rv.inter_post_round,
+            subsampling_x,
+            subsampling_y,
+            w,
+            h,
+            &pred0,
+            &pred1,
+            cp,
+            pred_out,
+        )?;
+    } else {
+        // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
+        // Clip1( preds[0][i][j] )` for `(i, j) ∈ [0, h) × [0, w)`.
+        // We write into the caller-supplied per-block buffer; the merge
+        // into [`crate::PartitionWalker::curr_frame`] is the walker's
+        // responsibility (it owns the per-plane buffer and the (x, y)
+        // offsetting).
+        clip1_single_ref(bit_depth, &pred0, pred_out)?;
+    }
 
     // ---------- §7.11.3.1 post-step — OBMC short-circuit --------
     //
@@ -5247,6 +5501,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             &refs,
+            /* compound */ None,
             &mut pred_out,
         )
         .expect("predict_inter SIMPLE single-ref translational path");
@@ -5299,12 +5554,11 @@ mod tests {
         );
     }
 
-    /// §7.11.3.1 stub-arm matrix — each unsupported arm short-
-    /// circuits to its dedicated [`crate::Error`] variant. Verifies
-    /// the dispatcher can be narrowed at the call site by checking
-    /// for `PredictInterCompoundUnsupported` /
-    /// `PredictInterWarpUnsupported` / `PredictInterObmcUnsupported`
-    /// independently.
+    /// §7.11.3.1 stub-arm matrix (post-r201) — the WARP and OBMC arms
+    /// still short-circuit to their dedicated [`crate::Error`] variants.
+    /// The r194 `PredictInterCompoundUnsupported` arm was retired in
+    /// r201 — see `r201_predict_inter_compound_*` for compound-arm
+    /// coverage.
     #[test]
     fn r194_predict_inter_stub_arms_each_surface_dedicated_error() {
         let ref_w: usize = 16;
@@ -5319,29 +5573,6 @@ mod tests {
             mv: [0, 0],
         }];
         let mut pred_out = vec![0u16; 16];
-
-        // is_compound == true ⇒ PredictInterCompoundUnsupported.
-        let e = predict_inter(
-            0,
-            0,
-            0,
-            4,
-            4,
-            crate::cdf::MOTION_MODE_SIMPLE,
-            /* is_compound */ true,
-            false,
-            8,
-            0,
-            0,
-            ref_w as u32,
-            ref_h as u32,
-            EIGHTTAP,
-            EIGHTTAP,
-            &refs,
-            &mut pred_out,
-        )
-        .unwrap_err();
-        assert_eq!(e, crate::Error::PredictInterCompoundUnsupported);
 
         // motion_mode == WARPED_CAUSAL ⇒ PredictInterWarpUnsupported.
         let mut pred_out_8x8 = vec![0u16; 64];
@@ -5362,6 +5593,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             &refs,
+            None,
             &mut pred_out_8x8,
         )
         .unwrap_err();
@@ -5389,6 +5621,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             &refs,
+            None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -5433,6 +5666,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             &empty_refs,
+            None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -5457,6 +5691,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             &refs,
+            None,
             &mut small,
         )
         .unwrap_err();
@@ -5480,6 +5715,700 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             &refs,
+            None,
+            &mut pred_out,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- r201 §7.11.3.1 predict_inter compound arm ----------
+
+    /// §7.11.3.1 step-14 + line 14405 — `COMPOUND_AVERAGE` driver path.
+    /// The compound driver must produce the same per-pixel output as a
+    /// hand-composed two-`predict_inter_per_ref`-plus-blend path
+    /// (`Clip1(Round2(p0+p1, 1+InterPostRound))`). We use the degenerate
+    /// `ref0 == ref1` setup so the expected pixel value is just the
+    /// standalone single-ref prediction (preds round-trip through the
+    /// blend identity `(p+p)/2 == p`).
+    #[test]
+    fn r201_predict_inter_compound_average_matches_hand_blend() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (r * 16 + c) as u16;
+            }
+        }
+        let refs = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+        ];
+        let w = 4;
+        let h = 4;
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            2,
+            2,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            /* is_compound */ true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            Some(CompoundParams::Average),
+            &mut pred_out,
+        )
+        .expect("compound AVERAGE arm");
+
+        // Hand-derived expected: run the same leaf twice (both refs
+        // identical) → preds[0] == preds[1] → average is the
+        // single-ref prediction (after rounding).
+        let rv = rounding_variables(8, true).unwrap();
+        let mvs = motion_vector_scaling(
+            0,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            ref_w as u32,
+            ref_h as u32,
+            2,
+            2,
+            [0, 0],
+        )
+        .unwrap();
+        let mut leaf = vec![0i32; w * h];
+        block_inter_prediction(
+            0,
+            0,
+            0,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            mvs.start_x,
+            mvs.start_y,
+            mvs.step_x,
+            mvs.step_y,
+            w,
+            h,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            &mut leaf,
+        )
+        .unwrap();
+        let shift: u32 = 1 + rv.inter_post_round;
+        let max: i32 = (1i32 << 8) - 1;
+        let mut expected = vec![0u16; w * h];
+        for i in 0..h {
+            for j in 0..w {
+                let acc = leaf[i * w + j] as i64 + leaf[i * w + j] as i64;
+                let r = ((acc + (1i64 << (shift - 1))) >> shift) as i32;
+                expected[i * w + j] = r.clamp(0, max) as u16;
+            }
+        }
+        assert_eq!(pred_out, expected, "AVERAGE arm pixel mismatch");
+    }
+
+    /// §7.11.3.1 step-14 + line 14408 — `COMPOUND_DISTANCE` driver
+    /// path. Verifies the driver routes to `compound_distance_blend`
+    /// with the caller-supplied `(FwdWeight, BckWeight)`.
+    #[test]
+    fn r201_predict_inter_compound_distance_matches_hand_blend() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 17 + c * 5) & 0xFF) as u16;
+            }
+        }
+        let refs = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+        ];
+        let weights = DistanceWeights {
+            fwd_weight: 9,
+            bck_weight: 7,
+        };
+        let w = 4;
+        let h = 4;
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            2,
+            2,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            Some(CompoundParams::Distance(weights)),
+            &mut pred_out,
+        )
+        .expect("compound DISTANCE arm");
+
+        let rv = rounding_variables(8, true).unwrap();
+        let mvs = motion_vector_scaling(
+            0,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            ref_w as u32,
+            ref_h as u32,
+            2,
+            2,
+            [0, 0],
+        )
+        .unwrap();
+        let mut leaf = vec![0i32; w * h];
+        block_inter_prediction(
+            0,
+            0,
+            0,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            mvs.start_x,
+            mvs.start_y,
+            mvs.step_x,
+            mvs.step_y,
+            w,
+            h,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            &mut leaf,
+        )
+        .unwrap();
+        let mut expected = vec![0u16; w * h];
+        compound_distance_blend(
+            8,
+            rv.inter_post_round,
+            weights,
+            &leaf,
+            &leaf,
+            w,
+            h,
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(pred_out, expected, "DISTANCE arm pixel mismatch");
+    }
+
+    /// §7.11.3.1 step-14 + line 14412 — `COMPOUND_WEDGE` driver path.
+    /// The mask is a hand-built 8×8 wedge buffer (no chroma subsampling
+    /// so the mask is read directly per pixel by `mask_blend`).
+    #[test]
+    fn r201_predict_inter_compound_wedge_routes_to_mask_blend() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r + c) & 0xFF) as u16;
+            }
+        }
+        let refs = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+        ];
+        let w = 8;
+        let h = 8;
+        // Build an 8×8 wedge mask via the §7.11.3.11 leaf
+        // (BLOCK_8X8 ⇒ num_4x4 = 2,2; mi_size = 3 per BLOCK_8X8
+        // ordinal — `WEDGE_BITS[3]` is 4 so a wedge_index in 0..16).
+        let mut mask = vec![0u8; w * h];
+        wedge_mask(3, 2, 2, 0, 0, &mut mask).unwrap();
+
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            0,
+            0,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            Some(CompoundParams::Wedge {
+                mask: &mask,
+                mask_stride: 0,
+            }),
+            &mut pred_out,
+        )
+        .expect("compound WEDGE arm");
+
+        // With ref0 == ref1, preds[0] == preds[1], and the mask blend
+        // collapses to `Round2((m + 64 - m) * pred, 6 + InterPostRound)
+        // = Round2(64 * pred, 6 + InterPostRound) = pred (rounded)`.
+        let rv = rounding_variables(8, true).unwrap();
+        let mvs = motion_vector_scaling(
+            0,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            ref_w as u32,
+            ref_h as u32,
+            0,
+            0,
+            [0, 0],
+        )
+        .unwrap();
+        let mut leaf = vec![0i32; w * h];
+        block_inter_prediction(
+            0,
+            0,
+            0,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            mvs.start_x,
+            mvs.start_y,
+            mvs.step_x,
+            mvs.step_y,
+            w,
+            h,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            &mut leaf,
+        )
+        .unwrap();
+        let mut expected = vec![0u16; w * h];
+        mask_blend(
+            8,
+            rv.inter_post_round,
+            0,
+            0,
+            &leaf,
+            &leaf,
+            w,
+            h,
+            &mask,
+            0,
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(pred_out, expected, "WEDGE arm pixel mismatch");
+    }
+
+    /// §7.11.3.1 step-14 + line 14412 — `COMPOUND_DIFFWTD` driver path
+    /// (mask buffer supplied by caller via §7.11.3.12).
+    #[test]
+    fn r201_predict_inter_compound_diffwtd_routes_to_mask_blend() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 9 + c) & 0xFF) as u16;
+            }
+        }
+        let refs = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+        ];
+        let w = 8;
+        let h = 8;
+        // Build the §7.11.3.12 difference-weight mask from two
+        // deliberately-different fake preds so the mask values are
+        // varied (preds for the driver itself still use ref0==ref1).
+        let preds_diff_a = vec![100i32; w * h];
+        let preds_diff_b = (0..(w * h)).map(|i| (i * 8) as i32).collect::<Vec<_>>();
+        let mut mask = vec![0u8; w * h];
+        let rv = rounding_variables(8, true).unwrap();
+        difference_weight_mask(
+            8,
+            rv.inter_post_round,
+            0,
+            &preds_diff_a,
+            &preds_diff_b,
+            w,
+            h,
+            &mut mask,
+        )
+        .unwrap();
+
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            0,
+            0,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            Some(CompoundParams::Diffwtd {
+                mask: &mask,
+                mask_stride: 0,
+            }),
+            &mut pred_out,
+        )
+        .expect("compound DIFFWTD arm");
+
+        // Same self-blend identity as WEDGE: preds[0]==preds[1] makes
+        // the mask weights cancel.
+        let mvs = motion_vector_scaling(
+            0,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            ref_w as u32,
+            ref_h as u32,
+            0,
+            0,
+            [0, 0],
+        )
+        .unwrap();
+        let mut leaf = vec![0i32; w * h];
+        block_inter_prediction(
+            0,
+            0,
+            0,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            mvs.start_x,
+            mvs.start_y,
+            mvs.step_x,
+            mvs.step_y,
+            w,
+            h,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            &mut leaf,
+        )
+        .unwrap();
+        let mut expected = vec![0u16; w * h];
+        mask_blend(
+            8,
+            rv.inter_post_round,
+            0,
+            0,
+            &leaf,
+            &leaf,
+            w,
+            h,
+            &mask,
+            0,
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(pred_out, expected, "DIFFWTD arm pixel mismatch");
+    }
+
+    /// §7.11.3.1 step-14 + line 14412 — `COMPOUND_INTRA` driver path
+    /// (mask buffer supplied by caller via §7.11.3.13
+    /// `intra_mode_variant_mask`).
+    #[test]
+    fn r201_predict_inter_compound_intra_routes_to_mask_blend() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r + c * 2) & 0xFF) as u16;
+            }
+        }
+        let refs = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+        ];
+        let w = 8;
+        let h = 8;
+        let mut mask = vec![0u8; w * h];
+        intra_mode_variant_mask(II_SMOOTH_PRED, w, h, &mut mask).unwrap();
+
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            0,
+            0,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            Some(CompoundParams::Intra {
+                mask: &mask,
+                mask_stride: 0,
+            }),
+            &mut pred_out,
+        )
+        .expect("compound INTRA arm");
+
+        let rv = rounding_variables(8, true).unwrap();
+        let mvs = motion_vector_scaling(
+            0,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            ref_w as u32,
+            ref_h as u32,
+            0,
+            0,
+            [0, 0],
+        )
+        .unwrap();
+        let mut leaf = vec![0i32; w * h];
+        block_inter_prediction(
+            0,
+            0,
+            0,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            mvs.start_x,
+            mvs.start_y,
+            mvs.step_x,
+            mvs.step_y,
+            w,
+            h,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            &mut leaf,
+        )
+        .unwrap();
+        let mut expected = vec![0u16; w * h];
+        mask_blend(
+            8,
+            rv.inter_post_round,
+            0,
+            0,
+            &leaf,
+            &leaf,
+            w,
+            h,
+            &mask,
+            0,
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(pred_out, expected, "INTRA arm pixel mismatch");
+    }
+
+    /// §7.11.3.1 r201 — caller-bug guards on the compound arm:
+    /// `is_compound == true` with `refs.len() < 2` or
+    /// `compound == None`; and the reverse `is_compound == false`
+    /// with a spurious `Some(_)` compound argument.
+    #[test]
+    fn r201_predict_inter_compound_rejects_caller_bugs() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let refp = vec![0u16; ref_w * ref_h];
+        let single = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let double = [single[0]; 2];
+        let mut pred_out = vec![0u16; 16];
+
+        // is_compound == true but refs.len() == 1.
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &single,
+            Some(CompoundParams::Average),
+            &mut pred_out,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
+
+        // is_compound == true but compound == None.
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &double,
+            None,
+            &mut pred_out,
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
+
+        // is_compound == false but a Some(_) compound supplied.
+        let e = predict_inter(
+            0,
+            0,
+            0,
+            4,
+            4,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &single,
+            Some(CompoundParams::Average),
             &mut pred_out,
         )
         .unwrap_err();

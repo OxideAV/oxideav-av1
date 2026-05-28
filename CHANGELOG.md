@@ -6,6 +6,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 201 — §7.11.3.1 step-14 compound arm wired into
+  `predict_inter`.** The r194 `PredictInterCompoundUnsupported` stub is
+  retired in favour of an end-to-end compound dispatch: when
+  `is_compound == true`, the driver iterates `refList ∈ {0, 1}`, runs
+  §7.11.3.3 + §7.11.3.4 twice, and combines via one of the five
+  `compound_type` mechanisms per av1-spec p.258 lines 14400-14412
+  (`COMPOUND_AVERAGE` inline, `COMPOUND_DISTANCE` via
+  `compound_distance_blend`, `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` /
+  `COMPOUND_INTRA` via `mask_blend` against the caller-supplied
+  luma-grid mask). New public `CompoundParams<'a>` enum carries the
+  per-arm side data (`Average`, `Distance(DistanceWeights)`,
+  `Wedge { mask, mask_stride }`, `Diffwtd { mask, mask_stride }`,
+  `Intra { mask, mask_stride }`). `predict_inter`'s signature gains a
+  trailing `compound: Option<CompoundParams<'_>>` argument; passing
+  `Some(_)` on the single-ref arm (or `None` on the compound arm) is
+  rejected as a caller bug. Per av1-spec p.258 lines 14386-14393 the
+  mask is computed once at `plane == 0` and reused for chroma planes
+  — the driver does not cache it across calls; the caller is
+  responsible for supplying the same buffer on subsequent plane
+  invocations. Internal refactor: the per-`refList` steps 5-13 are
+  factored into a new private `predict_inter_per_ref` helper so the
+  compound arm runs it twice without code duplication. The
+  `Error::PredictInterCompoundUnsupported` variant is removed (no
+  longer reachable). Test count: 1019 → 1025 (+6 in lib): one test per
+  compound-type arm (`COMPOUND_AVERAGE` / `COMPOUND_DISTANCE` /
+  `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA`) verifying
+  driver output equals hand-composed external blend on a `ref0 == ref1`
+  setup, plus a caller-bug guard test for the
+  `(is_compound, refs.len(), compound)` mismatch matrix.
+
 * **Round 198 — §7.17.2 / §7.17.3 self-guided projection arm.**
   Completes the §7.17 loop-restoration layer that landed in r197
   (driver + Wiener arm) by implementing the previously-stubbed

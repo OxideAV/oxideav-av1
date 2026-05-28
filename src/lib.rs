@@ -1771,13 +1771,16 @@ pub use transform::{
 // the §7.11.3.1 driver outer loop with `mode = COMPUTE_PRED_MODE_INTER`.
 // As of r194 the per-task `predict_inter` body lands as
 // [`inter_pred::predict_inter`] (single-reference translational SIMPLE
-// arm only); compound / WARP / OBMC arms each short-circuit to a
-// dedicated [`Error`] variant (`PredictInterCompoundUnsupported` /
-// `PredictInterWarpUnsupported` / `PredictInterObmcUnsupported`)
-// pending driver-side wiring of the §7.11.3.11-15 / §7.11.3.5-8 /
-// §7.11.3.9-10 sample-generation leaves (themselves landed in r191 /
-// r192 / r193). The next-arc targets are wiring the compound / WARP /
-// OBMC arms into the driver, and §7.14 loop filter.
+// arm), and r201 wires the step-14 compound arm (five
+// `compound_type` mechanisms — `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE`
+// / `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` —
+// dispatched through the new [`inter_pred::CompoundParams`] arg). The
+// WARP / OBMC arms still short-circuit to a dedicated [`Error`] variant
+// (`PredictInterWarpUnsupported` / `PredictInterObmcUnsupported`)
+// pending driver-side wiring of the §7.11.3.5-8 / §7.11.3.9-10
+// sample-generation leaves (themselves landed in r192 / r193). The
+// next-arc targets are wiring the WARP / OBMC arms into the driver,
+// and §7.14 loop filter.
 pub use cdef::{
     cdef_block, cdef_direction, cdef_filter_block, cdef_frame, constrain, CdefFrameContext,
     CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, DIV_TABLE,
@@ -1791,8 +1794,8 @@ pub use inter_pred::{
     difference_weight_mask, distance_weights, get_relative_dist, intra_mode_variant_mask,
     mask_blend, mask_blend_interintra, master_mask_table, motion_vector_scaling, predict_inter,
     resolve_divisor, rounding_variables, select_interp_filter_small_block, setup_shear,
-    warp_estimation, wedge_mask, DistanceWeights, Divisor, LocalWarp, MvScale, PredictInterRef,
-    RoundingVars, ShearParams, WarpSampleCand, COMPOUND_AVERAGE, COMPOUND_DIFFWTD,
+    warp_estimation, wedge_mask, CompoundParams, DistanceWeights, Divisor, LocalWarp, MvScale,
+    PredictInterRef, RoundingVars, ShearParams, WarpSampleCand, COMPOUND_AVERAGE, COMPOUND_DIFFWTD,
     COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_WEDGE, DIV_LUT, DIV_LUT_BITS, DIV_LUT_NUM,
     DIV_LUT_PREC_BITS, EIGHTTAP_4TAP, EIGHTTAP_SMOOTH_4TAP, FILTER_BITS as INTER_FILTER_BITS,
     II_DC_PRED, II_H_PRED, II_SMOOTH_PRED, II_V_PRED, II_WEIGHTS_1D,
@@ -2264,16 +2267,6 @@ pub enum Error {
     /// from `GlobalMvs[..]` by more than 16 1/8-luma-sample units.
     TemporalMvScanUnsupported,
     /// The §7.11.3.1 [`crate::inter_pred::predict_inter`] driver was
-    /// invoked on a compound-prediction block (`is_compound == true`).
-    /// The §7.11.3.1 step-14 outer loop repeats steps 5-13 for
-    /// `refList = 1`, then applies one of the COMPOUND_AVERAGE /
-    /// COMPOUND_DISTANCE / COMPOUND_WEDGE / COMPOUND_DIFFWTD /
-    /// COMPOUND_INTRA combine arms; the §7.11.3.11-15 sample-generation
-    /// leaves are landed (r191) but the per-block driver wiring is a
-    /// next-arc target. Single-reference (`is_compound == false`)
-    /// blocks land in r194.
-    PredictInterCompoundUnsupported,
-    /// The §7.11.3.1 [`crate::inter_pred::predict_inter`] driver was
     /// invoked with `motion_mode == MOTION_MODE_WARPED_CAUSAL` (or
     /// step-7 derived `useWarp != 0`). The §7.11.3.5-8 warp MC kernel
     /// is landed (r192) via [`crate::block_warp`] /
@@ -2427,10 +2420,6 @@ impl core::fmt::Display for Error {
             Self::TemporalMvScanUnsupported => write!(
                 f,
                 "oxideav-av1: §7.10.2.5 temporal-scan + §7.10.2.6 temporal-sample reached — MotionFieldMvs[ref][y8][x8] grid + §7.9 motion_field_estimation pending next arc; only use_ref_frame_mvs == false is currently supported"
-            ),
-            Self::PredictInterCompoundUnsupported => write!(
-                f,
-                "oxideav-av1: §7.11.3.1 predict_inter driver reached step-14 is_compound == 1 — the §7.11.3.11-15 compound combine wiring is a next-arc target (the sample-generation leaves landed in r191)"
             ),
             Self::PredictInterWarpUnsupported => write!(
                 f,

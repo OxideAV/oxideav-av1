@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 200)
+## Status — 2026-05-28 (round 201)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1627,6 +1627,101 @@ the caller hooks into the §5.11.58 decode state (`lr_type`,
 against synthetic predicates. The §5.9.20 [`LrParams`] (r10) and
 §5.11.58 per-unit reads will plug straight into these closures.
 
+Round 201 wires the **§7.11.3.1 step-14 compound arm** of the
+[`predict_inter`] driver (av1-spec p.258 lines 14381-14412) — the
+r194 driver stub at `is_compound == true` is retired in favour of an
+end-to-end dispatch that iterates `refList ∈ {0, 1}`, runs the
+§7.11.3.3 + §7.11.3.4 pipeline twice (one prediction per ref), and
+combines via one of the five `compound_type` mechanisms. The five
+§7.11.3.11-15 sample-generation leaves landed in r191; r201 is the
+driver-side wiring against them.
+
+New public surface:
+
+* **[`CompoundParams<'a>`]** — enum carrying the per-`compound_type`
+  side data the driver dispatches on:
+  * `Average` — `Clip1(Round2(preds[0] + preds[1],
+    1 + InterPostRound))` per pixel (av1-spec p.258 line 14405).
+    No side data.
+  * `Distance(DistanceWeights)` — `Clip1(Round2(FwdWeight * preds[0]
+    + BckWeight * preds[1], 4 + InterPostRound))` per pixel (av1-spec
+    p.258 line 14408); the weights come from
+    [`distance_weights`] (§7.11.3.15).
+  * `Wedge { mask, mask_stride }` — wedge-blended compound mode
+    (av1-spec p.258 line 14386 + §7.11.3.11 + §7.11.3.14). Mask is
+    the [`wedge_mask`] output on the luma grid; reused across planes
+    via [`mask_blend`]'s `(sub_x, sub_y)` downsampling.
+  * `Diffwtd { mask, mask_stride }` — difference-weighted compound
+    mode (§7.11.3.12 + §7.11.3.14). Mask is the
+    [`difference_weight_mask`] output.
+  * `Intra { mask, mask_stride }` — inter-intra-variant blend
+    (§7.11.3.13 + §7.11.3.14). Mask is the
+    [`intra_mode_variant_mask`] output.
+
+`predict_inter` now takes a `Option<CompoundParams<'_>>` argument:
+`Some(_)` on the compound arm, `None` (or rejected) on the single-ref
+arm. Per av1-spec p.258 lines 14386-14393, the §7.11.3.11 /
+§7.11.3.12 / §7.11.3.13 mask is computed once at `plane == 0` and
+reused for chroma planes — the driver does not cache it across
+calls; the walker / caller is responsible for supplying the same mask
+buffer on subsequent `plane == 1` / `plane == 2` invocations.
+
+Internal refactor: the per-`refList` body (steps 5-13) is factored
+into a new internal `predict_inter_per_ref` helper so the compound arm
+can run it twice without duplicating the `motion_vector_scaling` +
+`block_inter_prediction` + fallible alloc plumbing. The compound
+dispatch lives in a new internal `predict_inter_compound_blend`
+that pattern-matches on [`CompoundParams`] and routes to the inline
+`COMPOUND_AVERAGE` body, [`compound_distance_blend`], or
+[`mask_blend`].
+
+Caller-bug guards:
+
+* `is_compound == true` ⇒ `refs.len() >= 2` and `compound.is_some()`.
+* `is_compound == false` ⇒ `compound.is_none()` (a spurious
+  `Some(_)` is rejected).
+
+The r194 [`Error::PredictInterCompoundUnsupported`] variant is
+removed (no longer reachable). The WARP and OBMC stub arms still
+surface their dedicated [`Error::PredictInterWarpUnsupported`] /
+[`Error::PredictInterObmcUnsupported`] — those are the next-arc
+targets (r202 / r203).
+
+Test count: 1019 → 1025 (+6 in lib). New tests:
+
+* **`r201_predict_inter_compound_average_matches_hand_blend`** —
+  drives `Some(CompoundParams::Average)` on a `ref0 == ref1` setup
+  and verifies the per-pixel output equals a hand-derived
+  `Clip1(Round2(p+p, 1+InterPostRound))` against the standalone
+  `block_inter_prediction` leaf.
+* **`r201_predict_inter_compound_distance_matches_hand_blend`** —
+  drives `Some(CompoundParams::Distance(DistanceWeights {
+  fwd_weight: 9, bck_weight: 7 }))` and verifies the driver matches
+  [`compound_distance_blend`] applied externally.
+* **`r201_predict_inter_compound_wedge_routes_to_mask_blend`** —
+  feeds a §7.11.3.11 wedge mask through
+  `Some(CompoundParams::Wedge { mask, .. })` and verifies the driver
+  output matches the external [`mask_blend`] composition.
+* **`r201_predict_inter_compound_diffwtd_routes_to_mask_blend`** —
+  same shape against a §7.11.3.12 difference-weight mask.
+* **`r201_predict_inter_compound_intra_routes_to_mask_blend`** —
+  same shape against a §7.11.3.13 `II_SMOOTH_PRED` mask.
+* **`r201_predict_inter_compound_rejects_caller_bugs`** —
+  `(is_compound, refs.len(), compound)` mismatch matrix:
+  `is_compound + refs.len() == 1`, `is_compound + compound == None`,
+  `!is_compound + compound == Some`, each returning
+  `PartitionWalkOutOfRange` without entering the rounding-variables /
+  scaling / convolution pipeline.
+
+Followup candidates (next arcs): wiring the WARP arm into the driver
+(§7.11.3.5-8 kernels are landed in r192; the step-2/3/6/7 `useWarp`
+derivation + step-12 `(i8, j8)` sub-block loop is the remaining
+piece); wiring the OBMC arm (§7.11.3.9-10 leaves landed in r193;
+needs the `overlapped_motion_compensation` mi-grid neighbour walk);
+§9.5.3 Quantizer matrix; §7.10.2.5 / §7.10.2.6 temporal-MV scan.
+
+The prior r200 round notes (preserved verbatim for traceability):
+
 Round 200 lands the **§7.16 superres upscaling** process — the
 horizontal post-CDEF / pre-LR pass that takes the encoded `FrameWidth`-
 wide downscaled frame and produces an `UpscaledWidth`-wide frame per
@@ -2109,10 +2204,11 @@ the entry point the §5.11.33 dispatcher invokes per inter task. The
 driver composes the four r189-r193 leaves into one `w × h` prediction
 per the av1-spec p.257-258 process; on this round only the
 **single-reference translational SIMPLE arm** is wired end-to-end.
-Compound (`is_compound == true`), WARP (`motion_mode ==
-MOTION_MODE_WARPED_CAUSAL`), and OBMC (`motion_mode ==
-MOTION_MODE_OBMC`) each short-circuit to a dedicated
-[`Error::PredictInterCompoundUnsupported`] /
+Compound (`is_compound == true`) was a stub on r194 surfacing
+`Error::PredictInterCompoundUnsupported`; **r201 retires that variant
+and wires the step-14 compound arm** (see below). WARP (`motion_mode
+== MOTION_MODE_WARPED_CAUSAL`) and OBMC (`motion_mode ==
+MOTION_MODE_OBMC`) still short-circuit to a dedicated
 [`Error::PredictInterWarpUnsupported`] /
 [`Error::PredictInterObmcUnsupported`], so callers can narrow against
 the exact unsupported arm.
@@ -2149,14 +2245,10 @@ walker (modulo the still-pending `RefFrames[..]` / `Mvs[..]` /
 `InterpFilters[..]` plumbing the dispatcher passes through to its
 caller).
 
-Three new [`Error`] variants surface the still-stubbed arms:
+Two [`Error`] variants surface the still-stubbed arms (the r194
+`PredictInterCompoundUnsupported` variant was retired in r201 once
+the step-14 compound combine wiring landed):
 
-* **`Error::PredictInterCompoundUnsupported`** — `is_compound ==
-  true` (step 14 `refList = 1` repeat + COMPOUND_{AVERAGE, DISTANCE,
-  WEDGE, DIFFWTD, INTRA} combine). The five §7.11.3.11-15
-  sample-generation leaves landed in r191 (wedge_mask /
-  difference_weight_mask / intra_mode_variant_mask / mask_blend /
-  distance_weights); driver-side wiring is a next-arc target.
 * **`Error::PredictInterWarpUnsupported`** — `motion_mode ==
   MOTION_MODE_WARPED_CAUSAL`. The §7.11.3.5-8 [`block_warp`] /
   [`setup_shear`] / [`resolve_divisor`] / [`warp_estimation`]
