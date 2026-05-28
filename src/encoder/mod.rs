@@ -224,7 +224,10 @@ pub use coefficients::{
     write_eob_pt, write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
 };
 pub use forward_quantize::forward_quantize;
-pub use forward_transform::{forward_dct_4, forward_dct_4x4};
+pub use forward_transform::{
+    forward_dct_16, forward_dct_16x16, forward_dct_32, forward_dct_32x32, forward_dct_4,
+    forward_dct_4x4, forward_dct_64, forward_dct_64x64, forward_dct_8, forward_dct_8x8,
+};
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};

@@ -2,6 +2,67 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-29 (round 225)
+
+Round 225 lands the **forward DCT for the four remaining spec sizes
+8 / 16 / 32 / 64** (1D + matching square 2D), bringing the encoder's
+transform menu to every square DCT block size the §7.13 inverse
+covers. The encoder is no longer stuck on `TX_4X4`: an RD search
+can now pick the best transform size for smooth blocks (typically
+the larger sizes win on flat regions, with dramatic compression
+gains over forcing 4×4).
+
+New entry points (1D):
+
+  * `encoder::forward_dct_8(&mut [i64], r)`
+  * `encoder::forward_dct_16(&mut [i64], r)`
+  * `encoder::forward_dct_32(&mut [i64], r)`
+  * `encoder::forward_dct_64(&mut [i64], r)`
+
+Matching 2D square primitives:
+
+  * `encoder::forward_dct_8x8(&[i64]) -> [i64; 64]`
+  * `encoder::forward_dct_16x16(&[i64]) -> [i64; 256]`
+  * `encoder::forward_dct_32x32(&[i64]) -> Vec<i64>` (1024 cells; Vec
+    return to dodge the ~8 KiB stack footprint of a `[i64; 1024]`)
+  * `encoder::forward_dct_64x64(&[i64]) -> Vec<i64>` (4096 cells)
+
+Derivation (clean-room, generalising r219). The §7.13.2.3 inverse
+DCT for `n in 2..=6` is a fixed integer linear map `inverse_dct(c)
+≈ M_inv[n] @ c / 4096` where `M_inv[n]` is the integer-rounded
+response matrix the spec's 31-step butterfly schedule materialises.
+The forward DCT is `M_inv[n]^T @ x / 4096`. We build `M_inv[n]` at
+first use by walking `inverse_dct` on each of the `N` unit-
+coefficient basis inputs `[4096, 0, …]`, `[0, 4096, …]`, … and
+cache the resulting `N * N` matrix in a `std::sync::OnceLock`.
+Per-call cost is then a single `O(N^2)` inner product per output
+coefficient — same shape as the r219 open-coded `forward_dct_4`,
+just data-driven for the larger sizes.
+
+22 new lib tests (1353 → 1375). The well-posed invariant is
+`inverse(forward(x)) ≈ (N/2) * x` per cell (the integer-rounded
+butterfly accumulates `Round2` noise across multiple stages, so
+`M_inv^T · M_inv` is **only approximately** diagonal for n >= 3,
+but the round-trip recovers the input scaled by the basis squared
+norm). Tests cover:
+
+  * Zero-input identity for each 1D and 2D size.
+  * DC-bin energy concentration on flat-DC inputs: forward of
+    `[k; N]` returns ≈ `Round2(N * 2896 * k, 12)` in bin 0 with the
+    other bins bounded by a small noise floor (the column-norm
+    residue of `M_inv`).
+  * `inverse(forward(x))` roundtrips on flat-DC and LCG-pseudo-
+    random pixel inputs, asserting per-cell recovery within a
+    bounded error.
+
+Out of scope (next arc): forward ADST / FLIPADST / IDTX (same
+recipe applies — `inverse_adst` / `inverse_identity` are also fixed
+integer linear maps), the §7.13.3 forward 2D dispatcher with row-/
+col-shift envelope (the inverse direction's `Round2(_, rowShift)` /
+`Round2(_, colShift)` glue), the rectangular block sizes (`TX_4X8`
+/ `TX_8X16` / … / `TX_32X64`), and the §7.13.2.10 forward-WHT
+non-lossless arm.
+
 ## Status — 2026-05-29 (round 224)
 
 Round 224 lands the **standalone `decode_av1` public entry** that

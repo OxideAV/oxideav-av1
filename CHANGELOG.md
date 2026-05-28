@@ -6,6 +6,37 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 225 — forward DCT for sizes 8 / 16 / 32 / 64.** Extends the
+  r219 forward 4×4 DCT primitive to every spec-defined square DCT
+  block size. New API: 1D primitives `encoder::forward_dct_8` /
+  `_16` / `_32` / `_64`, and the matching square 2D primitives
+  `encoder::forward_dct_8x8` / `_16x16` / `_32x32` / `_64x64`.
+
+  The derivation generalises r219's matrix-transpose argument: for
+  each size `N = 2^n` (`n in 2..=6`) we materialise the response
+  matrix `M_inv[n]` by walking `crate::transform::inverse_dct` on
+  each of the `N` unit-coefficient basis inputs `[4096, 0, …]`,
+  `[0, 4096, …]`, … and cache it in a `OnceLock`. The forward then
+  computes `forward(x)[k] = Round2(sum_i M_inv[n][i + N * k] * x[i],
+  12)` — the inner product of `x` with the `k`-th column of `M_inv`,
+  which is `M_inv^T @ x / 4096`. Same `Round2(_, 12)` rounding
+  shape, same `O(N^2)` per 1D pass, same row-then-column composition
+  for the 2D primitives.
+
+  +22 lib tests (1353 → 1375): zero-input identities, DC-bin energy
+  concentration with bounded off-DC noise, `inverse(forward(x))`
+  roundtrips on flat-DC and pseudo-random inputs (the well-posed
+  invariant: integer rounding accumulates across the multi-stage
+  butterfly so `M_inv^T · M_inv` is only **approximately** diagonal
+  for n >= 3, but `inverse(forward(x))` recovers `x` scaled by
+  `≈ N/2` within a bounded noise floor).
+
+  Unblocks: encoder rate-distortion search across all spec DCT
+  block sizes (previously the encoder was stuck at TX_4X4 only).
+  Subsequent arcs: forward ADST / FLIPADST / IDTX, the rectangular
+  block sizes (TX_4X8 / TX_8X16 / etc.), and the §7.13.3-equivalent
+  forward 2D dispatcher with row-/col-shift envelope.
+
 * **Round 224 — `decode_av1` public entry + first encode→decode pixel
   roundtrip.** The arc that closes the loop: the existing decoder
   modules (`obu::ObuIter` / `parse_sequence_header` /

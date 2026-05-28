@@ -84,16 +84,38 @@
 //! for odd) and exact zeros off-diagonal for unit-coefficient inputs
 //! at amplitude `4096`.
 //!
-//! ## Scope (arc 13 / round 219)
+//! ## Scope (arc 13 / round 219 + arc 18 / round 225)
 //!
-//! Only [`forward_dct_4`] (length-4 1D) and [`forward_dct_4x4`] (4×4
-//! 2D, row-then-column composition without the §7.13.3 `Lossless`
-//! / rectangular / row-shift / col-shift envelope). Larger sizes
-//! (8, 16, 32, 64) and the non-DCT row/column kernels (ADST, FLIPADST,
-//! WHT, IDTX, V_*/H_*) are subsequent arcs. The §7.13.3-equivalent 2D
-//! dispatcher is a subsequent arc.
+//! Round 219 landed [`forward_dct_4`] (length-4 1D) and
+//! [`forward_dct_4x4`] (4×4 2D, row-then-column composition without
+//! the §7.13.3 `Lossless` / rectangular / row-shift / col-shift
+//! envelope).
+//!
+//! Round 225 extends the same shape to **sizes 8, 16, 32, 64** —
+//! [`forward_dct_8`], [`forward_dct_16`], [`forward_dct_32`],
+//! [`forward_dct_64`] (1D) and the matching `forward_dct_<N>x<N>` 2D
+//! square primitives. The derivation strategy generalises r219: the
+//! forward 1D DCT for length `N = 2^n` (`n in 2..=6`) is the
+//! algebraic transpose of [`crate::transform::inverse_dct`] for the
+//! same `n`. Rather than hand-transcribe the 31-step butterfly graph
+//! for each size, we materialise the inverse-DCT response matrix `M`
+//! once per size at first use (by walking the inverse on each of the
+//! `N` unit-coefficient basis inputs `[4096, 0, …]`, `[0, 4096, …]`,
+//! …) and reuse `M^T` per call. Same `Round2(_, 12)` rounding shape,
+//! same matrix-transpose argument, same asymptotic `O(N^2)` per 1D
+//! pass — the only difference from r219 is that the matrix entries
+//! are loaded from cache rather than open-coded.
+//!
+//! Non-DCT row/column kernels (ADST, FLIPADST, WHT, IDTX, V_*/H_*),
+//! the rectangular block sizes (`TX_4X8`, …, `TX_32X64`), and the
+//! §7.13.3-equivalent forward 2D dispatcher with row-/col-shift
+//! envelope remain subsequent arcs. The matrix-cache approach
+//! generalises trivially to ADST/FLIPADST once those forward primitives
+//! are wired — `inverse_adst` is also a fixed integer linear map, so
+//! the same probe-and-transpose recipe applies.
 
-use crate::transform::round2;
+use crate::transform::{inverse_dct, round2};
+use std::sync::OnceLock;
 
 /// Forward 1D DCT-II for length 4 — the transpose of the §7.13.2.3
 /// inverse DCT-4 kernel.
@@ -172,6 +194,243 @@ pub fn forward_dct_4x4(input: &[i64]) -> [i64; 16] {
         }
     }
     work
+}
+
+// ---------------------------------------------------------------------
+// Sizes 8 / 16 / 32 / 64 — matrix-cache implementation.
+//
+// For each supported size `N = 2^n` (`n in 2..=6`), we cache the row-
+// major `N * N` integer matrix `M_inv[n]` such that the §7.13.2.3
+// inverse DCT acting on the unit-coefficient basis input `c_k = 4096 *
+// δ_{j, k}` produces `M_inv[n][i + N * k] = inverse_dct(c_k)[i]`.
+// Equivalently, `M_inv[n][i + N * k] / 4096` is the `(i, k)` entry of
+// the spec's inverse-DCT matrix, so:
+//
+//     inverse_dct(c)[i] ≈ sum_k M_inv[n][i + N * k] * c[k] / 4096
+//
+// The forward DCT (pixel -> coefficient) is `M_inv[n]^T / 4096`:
+//
+//     forward(x)[k] = round2(sum_i M_inv[n][i + N * k] * x[i], 12)
+//
+// — that is, `forward(x)[k]` is the inner product of `x` with the
+// `k`-th *column* of `M_inv[n]`. The outer index of our cache stride
+// `i + N * k` is therefore the input pixel index, and the inner index
+// is the output coefficient index (transposed from the inverse).
+//
+// `r = 32` is used when probing the inverse so the §7.13.2.1 `clip3`
+// at `[-2^31, 2^31 - 1]` never trips on the unit-coefficient amplitude
+// 4096 (the inverse DCT for `n = 6` produces intermediate butterfly
+// sums up to a few hundred thousand in absolute value, comfortably
+// within i32 but above the conformance-friendly `r = 16` bound).
+// ---------------------------------------------------------------------
+
+/// Returns the cached `N * N` row-major inverse-DCT response matrix
+/// for `n in 2..=6` (`N = 1 << n`). Computes on first call, then
+/// returns the cached reference for subsequent calls.
+fn inverse_dct_matrix(n: u32) -> &'static [i64] {
+    debug_assert!((2..=6).contains(&n));
+    static M2: OnceLock<Vec<i64>> = OnceLock::new();
+    static M3: OnceLock<Vec<i64>> = OnceLock::new();
+    static M4: OnceLock<Vec<i64>> = OnceLock::new();
+    static M5: OnceLock<Vec<i64>> = OnceLock::new();
+    static M6: OnceLock<Vec<i64>> = OnceLock::new();
+    let cell = match n {
+        2 => &M2,
+        3 => &M3,
+        4 => &M4,
+        5 => &M5,
+        6 => &M6,
+        _ => unreachable!("forward DCT size n must be in 2..=6"),
+    };
+    cell.get_or_init(|| {
+        let nn = 1usize << n;
+        let mut m = vec![0i64; nn * nn];
+        let mut probe = vec![0i64; nn];
+        for k in 0..nn {
+            for v in probe.iter_mut() {
+                *v = 0;
+            }
+            probe[k] = 4096;
+            inverse_dct(&mut probe, n, 32);
+            for i in 0..nn {
+                m[i + nn * k] = probe[i];
+            }
+        }
+        m
+    })
+}
+
+/// Forward 1D DCT-II for length `N = 1 << n`, `n in 2..=6`. The
+/// algebraic transpose of [`crate::transform::inverse_dct`] for the
+/// same `n`. Reads `N` spatial values from `t[0..N]` and writes `N`
+/// DCT-II coefficients back into the same slots.
+///
+/// # Panics
+///
+/// Panics if `n` is outside `2..=6` or if `t.len() < (1 << n)`.
+fn forward_dct_n(t: &mut [i64], n: u32) {
+    assert!(
+        (2..=6).contains(&n),
+        "oxideav-av1 forward_dct_n requires n in 2..=6, got {n}"
+    );
+    let nn = 1usize << n;
+    assert!(
+        t.len() >= nn,
+        "oxideav-av1 forward_dct_n: buffer too short for length {nn}"
+    );
+    let m = inverse_dct_matrix(n);
+    // x = copy of the input slots.
+    let mut x = [0i64; 64];
+    x[..nn].copy_from_slice(&t[..nn]);
+    for k in 0..nn {
+        // Output coefficient k = inner product of x with column k of
+        // M_inv. Column k of M_inv is `m[i + nn * k]` for i in 0..nn.
+        let mut acc: i64 = 0;
+        for i in 0..nn {
+            acc += m[i + nn * k] * x[i];
+        }
+        t[k] = round2(acc, 12);
+    }
+}
+
+/// Forward 1D DCT-II for length 8 — the transpose of the §7.13.2.3
+/// inverse DCT-8 kernel.
+///
+/// # Panics
+///
+/// Panics if `t.len() < 8`.
+pub fn forward_dct_8(t: &mut [i64], _r: u32) {
+    forward_dct_n(t, 3);
+}
+
+/// Forward 1D DCT-II for length 16 — the transpose of the §7.13.2.3
+/// inverse DCT-16 kernel.
+///
+/// # Panics
+///
+/// Panics if `t.len() < 16`.
+pub fn forward_dct_16(t: &mut [i64], _r: u32) {
+    forward_dct_n(t, 4);
+}
+
+/// Forward 1D DCT-II for length 32 — the transpose of the §7.13.2.3
+/// inverse DCT-32 kernel.
+///
+/// # Panics
+///
+/// Panics if `t.len() < 32`.
+pub fn forward_dct_32(t: &mut [i64], _r: u32) {
+    forward_dct_n(t, 5);
+}
+
+/// Forward 1D DCT-II for length 64 — the transpose of the §7.13.2.3
+/// inverse DCT-64 kernel.
+///
+/// # Panics
+///
+/// Panics if `t.len() < 64`.
+pub fn forward_dct_64(t: &mut [i64], _r: u32) {
+    forward_dct_n(t, 6);
+}
+
+/// Forward 2D DCT-II for an `N * N` square block (`N in {8, 16, 32,
+/// 64}`). Row-then-column composition through the 1D primitive of the
+/// matching size. No row-/col-shift envelope (same scope contract as
+/// [`forward_dct_4x4`]).
+///
+/// # Panics
+///
+/// Panics if `input.len() != n * n` or `n` is outside `{4, 8, 16, 32,
+/// 64}`.
+fn forward_dct_nxn(input: &[i64], side: usize) -> Vec<i64> {
+    assert!(
+        matches!(side, 4 | 8 | 16 | 32 | 64),
+        "oxideav-av1 forward_dct_nxn requires side in {{4,8,16,32,64}}, got {side}"
+    );
+    assert_eq!(
+        input.len(),
+        side * side,
+        "oxideav-av1 forward_dct_nxn expects side * side = {} samples",
+        side * side
+    );
+    let n: u32 = match side {
+        4 => 2,
+        8 => 3,
+        16 => 4,
+        32 => 5,
+        64 => 6,
+        _ => unreachable!(),
+    };
+    let mut work = input.to_vec();
+    // Row pass.
+    let mut row_buf = vec![0i64; side];
+    for i in 0..side {
+        row_buf.copy_from_slice(&work[i * side..(i + 1) * side]);
+        forward_dct_n(&mut row_buf, n);
+        work[i * side..(i + 1) * side].copy_from_slice(&row_buf);
+    }
+    // Column pass.
+    let mut col_buf = vec![0i64; side];
+    for j in 0..side {
+        for i in 0..side {
+            col_buf[i] = work[i * side + j];
+        }
+        forward_dct_n(&mut col_buf, n);
+        for i in 0..side {
+            work[i * side + j] = col_buf[i];
+        }
+    }
+    work
+}
+
+/// Forward 2D DCT-II for the `TX_8X8` block size. Same row-then-
+/// column composition shape as [`forward_dct_4x4`].
+///
+/// # Panics
+///
+/// Panics if `input.len() != 64`.
+pub fn forward_dct_8x8(input: &[i64]) -> [i64; 64] {
+    let v = forward_dct_nxn(input, 8);
+    let mut out = [0i64; 64];
+    out.copy_from_slice(&v);
+    out
+}
+
+/// Forward 2D DCT-II for the `TX_16X16` block size.
+///
+/// # Panics
+///
+/// Panics if `input.len() != 256`.
+pub fn forward_dct_16x16(input: &[i64]) -> [i64; 256] {
+    let v = forward_dct_nxn(input, 16);
+    let mut out = [0i64; 256];
+    out.copy_from_slice(&v);
+    out
+}
+
+/// Forward 2D DCT-II for the `TX_32X32` block size.
+///
+/// # Panics
+///
+/// Panics if `input.len() != 1024`.
+pub fn forward_dct_32x32(input: &[i64]) -> Vec<i64> {
+    // Returned as Vec<i64> rather than [i64; 1024] to keep the stack
+    // footprint at the call site small (1024 * 8 = 8 KiB; large but
+    // tolerable). Callers that need a `[i64; 1024]` can `try_into`.
+    forward_dct_nxn(input, 32)
+}
+
+/// Forward 2D DCT-II for the `TX_64X64` block size.
+///
+/// # Panics
+///
+/// Panics if `input.len() != 4096`.
+pub fn forward_dct_64x64(input: &[i64]) -> Vec<i64> {
+    // Returned as Vec<i64> — 4096 * 8 = 32 KiB array on the stack is
+    // beyond the default 8 MiB main-thread stack budget on many
+    // platforms once nested. Vec heap allocation keeps the surface
+    // safe for use from sub-threads with smaller stacks.
+    forward_dct_nxn(input, 64)
 }
 
 #[cfg(test)]
@@ -363,6 +622,352 @@ mod tests {
             1108, 1448, 1108, 599, //
         ];
         assert_eq!(out, expected);
+    }
+
+    // -----------------------------------------------------------------
+    // Sizes 8 / 16 / 32 / 64 — DC-concentration + roundtrip-via-inverse
+    // sanity tests.
+    //
+    // Approach. The §7.13.2.3 inverse DCT for `n >= 3` accumulates per-
+    // butterfly `Round2` error across many stages (n = 3 has 6 stages,
+    // n = 6 has all 31). The cached response matrix `M_inverse[n]`
+    // therefore is **only approximately** column-orthogonal — the
+    // off-diagonal entries of `M_inverse[n]^T · M_inverse[n]` carry
+    // the accumulated rounding noise. This is intrinsic to the
+    // integer butterfly, not a property of our derivation.
+    //
+    // For an encoder, the well-posed identity is `inverse(forward(x))
+    // ≈ scale * x` (apply forward to pixels, recover them through the
+    // inverse). We verify this directly on a DC plane (the input
+    // `[k, k, …, k]` rebuilds to `[scale * k + small_noise, …]`
+    // after `inverse(forward(…))`).
+    // -----------------------------------------------------------------
+
+    fn run_forward_dct(c: &mut [i64], n: u32) {
+        match n {
+            3 => forward_dct_8(c, 32),
+            4 => forward_dct_16(c, 32),
+            5 => forward_dct_32(c, 32),
+            6 => forward_dct_64(c, 32),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `inverse(forward([k; N]))` on a flat-DC input. The forward
+    /// projects all energy onto the DC bin (cell 0), the inverse
+    /// then projects it back to a flat plane scaled by the DC-bin
+    /// magnitude divided by 4096. The output is approximately
+    /// `k * (N * 2896 * 2896) / 4096^2` per cell ≈ `k * N / 2`.
+    /// Bound the per-cell relative error at a small fraction of `k`.
+    fn dc_roundtrip_via_inverse(n: u32, k: i64, max_per_cell_abs_error: i64) {
+        let nn = 1usize << n;
+        let mut c = vec![k; nn];
+        run_forward_dct(&mut c, n);
+        // c is now the forward coefficients. Apply the inverse to
+        // recover the pixel plane.
+        crate::transform::inverse_dct(&mut c, n, 32);
+        // Expected: every cell ≈ k * (N * cos0^2) / 4096^2 where
+        // cos0 = 2896 ≈ 4096 / sqrt(2). The product `N * 2896^2 /
+        // 4096^2` is `N / 2 * (2896^2 / 2048^2)` = `N/2 *
+        // 1.99988...`. For k = 1024, n = 3 (N = 8): expected ≈ 4096
+        // per cell.
+        // We expand the expectation rigorously: the forward output
+        // at bin 0 is `Round2(N * 2896 * k, 12)`. Calling that `D`,
+        // the inverse applied to `[D, 0, 0, …, 0]` returns `Round2(
+        // D * 2896, 12)` per cell. So the recovered cell value is
+        // `Round2(Round2(N * 2896 * k, 12) * 2896, 12)`.
+        let pre = (nn as i64) * 2896 * k;
+        let d = crate::transform::round2(pre, 12);
+        let expected_cell = crate::transform::round2(d * 2896, 12);
+        for (i, &got) in c.iter().enumerate() {
+            let err = (got - expected_cell).abs();
+            assert!(
+                err <= max_per_cell_abs_error,
+                "n={n} k={k} cell {i}: got {got}, expected {expected_cell} (|err| {err} > bound {max_per_cell_abs_error})"
+            );
+        }
+    }
+
+    /// `inverse(forward(x))` on an arbitrary input plane, asserting
+    /// the recovered plane is close to `scale * x` (the round-trip
+    /// scaling factor `≈ N/2` for the integer DCT-II basis).
+    fn arbitrary_roundtrip_via_inverse(n: u32, input: &[i64], max_abs_error: i64) {
+        let nn = 1usize << n;
+        assert_eq!(input.len(), nn);
+        // Expected scale: each forward bin is approximately
+        // `sum_k (M^T)[i, k] * x[k] / 4096`. The inverse undoes
+        // this approximately to recover x scaled by N/2 (the
+        // diagonal of M^T M / 4096^2 ≈ N/2 in the integer-rounded
+        // approximation). Round-trip nominal scale is therefore
+        // `N/2` per spatial cell, with rounding noise per cell.
+        let mut buf = input.to_vec();
+        run_forward_dct(&mut buf, n);
+        crate::transform::inverse_dct(&mut buf, n, 32);
+        let scale = (nn as i64) / 2;
+        for (i, (&got, &orig)) in buf.iter().zip(input.iter()).enumerate() {
+            let expected = scale * orig;
+            let err = (got - expected).abs();
+            assert!(
+                err <= max_abs_error,
+                "n={n} cell {i}: orig={orig}, got={got}, expected≈{expected} (|err| {err} > bound {max_abs_error})"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_dct_8_zero_input_yields_zero() {
+        let mut t = [0i64; 8];
+        forward_dct_8(&mut t, 32);
+        assert_eq!(t, [0; 8]);
+    }
+
+    #[test]
+    fn forward_dct_8_dc_concentrates_energy() {
+        // Flat DC: forward of [k; 8] = [round2(8 * 2896 * k, 12), 0,
+        // 0, ...]; row 0 of M^T is [2896, 2896, ..., 2896]. For k =
+        // 1024: 8 * 2896 * 1024 = 23724032. Round2(., 12) = 5792.
+        // Off-DC bins are NOT exactly zero for n >= 3 (rounding
+        // residue in M's columns); bound them tightly.
+        let mut t = [1024i64; 8];
+        forward_dct_8(&mut t, 32);
+        // DC bin: row 0 of M^T = column 0 of M. For an orthogonal
+        // basis, column 0 should be the constant `2896`. Verify the
+        // DC bin matches `Round2(N * 2896 * 1024, 12)` to within a
+        // tight bound (Round2 residue from the n=3 butterfly chain).
+        let nominal = crate::transform::round2(8i64 * 2896 * 1024, 12);
+        assert!(
+            (t[0] - nominal).abs() <= 8,
+            "DC bin got {} expected≈{nominal}",
+            t[0]
+        );
+        // Off-DC bins should be small: orthogonality residue scales
+        // with the input magnitude and the Round2 noise floor.
+        for (i, v) in t.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 16, "off-DC bin {i} = {v}, exceeds noise bound");
+        }
+    }
+
+    #[test]
+    fn forward_dct_8_dc_roundtrip_via_inverse() {
+        // forward then inverse on a flat-DC input returns a flat-DC
+        // plane scaled by ≈ N/2. The integer-rounded butterfly leaks
+        // a small Round2-floor noise into every cell; bound at 4
+        // LSBs.
+        dc_roundtrip_via_inverse(3, 1024, 4);
+    }
+
+    #[test]
+    fn forward_dct_8x8_zero_input_yields_zero() {
+        let input = [0i64; 64];
+        let out = forward_dct_8x8(&input);
+        assert_eq!(out, [0; 64]);
+    }
+
+    #[test]
+    fn forward_dct_8x8_dc_concentrates_in_top_left() {
+        // Flat 1024 input. After row pass each row ≈ [5792, 0, …, 0]
+        // (DC concentration per row). After column pass each column
+        // ≈ [Round2(N * 2896 * 5792, 12), 0, …, 0] in column 0,
+        // ≈ zero elsewhere.
+        let input = [1024i64; 64];
+        let out = forward_dct_8x8(&input);
+        // Verify cell (0, 0) is the dominant DC magnitude (within a
+        // small noise bound around the nominal value), and every
+        // other cell is small.
+        let dc_after_row = crate::transform::round2(8i64 * 2896 * 1024, 12);
+        let dc_nominal = crate::transform::round2(8i64 * 2896 * dc_after_row, 12);
+        assert!(
+            (out[0] - dc_nominal).abs() <= 64,
+            "8x8 DC cell {} vs nominal {dc_nominal}",
+            out[0]
+        );
+        for (i, &v) in out.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 256, "8x8 off-DC cell {i} = {v} too large");
+        }
+    }
+
+    #[test]
+    fn forward_dct_16_zero_input_yields_zero() {
+        let mut t = [0i64; 16];
+        forward_dct_16(&mut t, 32);
+        assert_eq!(t, [0; 16]);
+    }
+
+    #[test]
+    fn forward_dct_16_dc_concentrates_energy() {
+        let mut t = [1024i64; 16];
+        forward_dct_16(&mut t, 32);
+        let nominal = crate::transform::round2(16i64 * 2896 * 1024, 12);
+        assert!(
+            (t[0] - nominal).abs() <= 16,
+            "DC bin {} expected≈{nominal}",
+            t[0]
+        );
+        for (i, v) in t.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 32, "off-DC bin {i} = {v} exceeds noise bound");
+        }
+    }
+
+    #[test]
+    fn forward_dct_16_dc_roundtrip_via_inverse() {
+        dc_roundtrip_via_inverse(4, 1024, 16);
+    }
+
+    #[test]
+    fn forward_dct_16x16_zero_input_yields_zero() {
+        let input = [0i64; 256];
+        let out = forward_dct_16x16(&input);
+        assert_eq!(out, [0; 256]);
+    }
+
+    #[test]
+    fn forward_dct_16x16_dc_concentrates_in_top_left() {
+        let input = [1024i64; 256];
+        let out = forward_dct_16x16(&input);
+        let row_dc = crate::transform::round2(16i64 * 2896 * 1024, 12);
+        let nominal = crate::transform::round2(16i64 * 2896 * row_dc, 12);
+        assert!(
+            (out[0] - nominal).abs() <= 256,
+            "16x16 DC cell {} vs nominal {nominal}",
+            out[0]
+        );
+        for (i, &v) in out.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 1024, "16x16 off-DC cell {i} = {v} too large");
+        }
+    }
+
+    #[test]
+    fn forward_dct_32_zero_input_yields_zero() {
+        let mut t = [0i64; 32];
+        forward_dct_32(&mut t, 32);
+        assert_eq!(t, [0; 32]);
+    }
+
+    #[test]
+    fn forward_dct_32_dc_concentrates_energy() {
+        let mut t = [1024i64; 32];
+        forward_dct_32(&mut t, 32);
+        let nominal = crate::transform::round2(32i64 * 2896 * 1024, 12);
+        assert!(
+            (t[0] - nominal).abs() <= 32,
+            "DC bin {} expected≈{nominal}",
+            t[0]
+        );
+        for (i, v) in t.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 64, "off-DC bin {i} = {v} exceeds noise bound");
+        }
+    }
+
+    #[test]
+    fn forward_dct_32_dc_roundtrip_via_inverse() {
+        dc_roundtrip_via_inverse(5, 1024, 64);
+    }
+
+    #[test]
+    fn forward_dct_32x32_zero_input_yields_zero() {
+        let input = vec![0i64; 1024];
+        let out = forward_dct_32x32(&input);
+        assert_eq!(out.len(), 1024);
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, 0, "32x32 zero-input bin {i} = {v}");
+        }
+    }
+
+    #[test]
+    fn forward_dct_32x32_dc_concentrates_in_top_left() {
+        let input = vec![1024i64; 1024];
+        let out = forward_dct_32x32(&input);
+        let row_dc = crate::transform::round2(32i64 * 2896 * 1024, 12);
+        let nominal = crate::transform::round2(32i64 * 2896 * row_dc, 12);
+        assert!(
+            (out[0] - nominal).abs() <= 1024,
+            "32x32 DC cell {} vs nominal {nominal}",
+            out[0]
+        );
+        for (i, &v) in out.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 4096, "32x32 off-DC cell {i} = {v} too large");
+        }
+    }
+
+    #[test]
+    fn forward_dct_64_zero_input_yields_zero() {
+        let mut t = [0i64; 64];
+        forward_dct_64(&mut t, 32);
+        assert_eq!(t, [0; 64]);
+    }
+
+    #[test]
+    fn forward_dct_64_dc_concentrates_energy() {
+        let mut t = [1024i64; 64];
+        forward_dct_64(&mut t, 32);
+        let nominal = crate::transform::round2(64i64 * 2896 * 1024, 12);
+        assert!(
+            (t[0] - nominal).abs() <= 64,
+            "DC bin {} expected≈{nominal}",
+            t[0]
+        );
+        for (i, v) in t.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 128, "off-DC bin {i} = {v} exceeds noise bound");
+        }
+    }
+
+    #[test]
+    fn forward_dct_64_dc_roundtrip_via_inverse() {
+        dc_roundtrip_via_inverse(6, 1024, 256);
+    }
+
+    #[test]
+    fn forward_dct_64x64_zero_input_yields_zero() {
+        let input = vec![0i64; 4096];
+        let out = forward_dct_64x64(&input);
+        assert_eq!(out.len(), 4096);
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, 0, "64x64 zero-input bin {i} = {v}");
+        }
+    }
+
+    #[test]
+    fn forward_dct_64x64_dc_concentrates_in_top_left() {
+        let input = vec![1024i64; 4096];
+        let out = forward_dct_64x64(&input);
+        let row_dc = crate::transform::round2(64i64 * 2896 * 1024, 12);
+        let nominal = crate::transform::round2(64i64 * 2896 * row_dc, 12);
+        assert!(
+            (out[0] - nominal).abs() <= 4096,
+            "64x64 DC cell {} vs nominal {nominal}",
+            out[0]
+        );
+        for (i, &v) in out.iter().enumerate().skip(1) {
+            assert!(v.abs() <= 16384, "64x64 off-DC cell {i} = {v} too large");
+        }
+    }
+
+    #[test]
+    fn forward_dct_8_arbitrary_roundtrip_via_inverse() {
+        // LCG-pseudo-random small inputs; verify inverse(forward(x))
+        // recovers x scaled by N/2 within a bounded noise floor.
+        let mut input = [0i64; 8];
+        let mut s: u64 = 0x12345678;
+        for v in input.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((s >> 32) & 0xFF) as i64 - 128;
+        }
+        arbitrary_roundtrip_via_inverse(3, &input, 16);
+    }
+
+    #[test]
+    fn forward_dct_16_arbitrary_roundtrip_via_inverse() {
+        let mut input = [0i64; 16];
+        let mut s: u64 = 0xCAFEBABE;
+        for v in input.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((s >> 32) & 0xFF) as i64 - 128;
+        }
+        arbitrary_roundtrip_via_inverse(4, &input, 32);
     }
 
     #[test]
