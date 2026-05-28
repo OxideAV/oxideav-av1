@@ -6,6 +6,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 202 — §7.11.3.1 WARPED_CAUSAL motion-mode arm wired into
+  `predict_inter`.** The r194 `PredictInterWarpUnsupported` stub is
+  retired in favour of an end-to-end WARP dispatch: the driver now
+  performs the av1-spec p.257 lines 14308-14349 step-2/3/6/7 `useWarp`
+  derivation per `refList` and, when `useWarp ∈ {1, 2}`, drives the
+  §7.11.3.5 `block_warp` kernel through the step-12 per-8×8 sub-block
+  loop (`i8 ∈ 0..((h-1) >> 3)`, `j8 ∈ 0..((w-1) >> 3)`) in lieu of
+  the §7.11.3.4 translational kernel. New public
+  `WarpDriverParams` struct plumbs the spec inputs (`YMode`,
+  `GmType[refFrame]`, `gm_params[refFrame]`, `LocalWarpParams`,
+  `LocalValid`, `is_scaled(refFrame)`, `force_integer_mv`); the
+  step-7 decision tree is exposed through the module-private
+  `derive_use_warp` helper covering all five spec arms (`w/h < 8` ⇒
+  0; `force_integer_mv` ⇒ 0; LOCALWARP + LocalValid ⇒ 1;
+  GLOBAL_GLOBALMV + `GmType > TRANSLATION` + `!is_scaled` +
+  globalValid ⇒ 2; else 0). The step-3 `plane == 0`
+  `setup_shear(LocalWarpParams)` re-validation is performed
+  internally — a `LocalWarpParams` with a degenerate `[2] == 0`
+  diagonal demotes the run to translational fallback even when the
+  caller passes `local_valid = true`. `predict_inter`'s signature
+  gains a trailing `warp: Option<&WarpDriverParams>` argument before
+  `pred_out`; passing `warp = None` with `motion_mode ==
+  WARPED_CAUSAL` is a caller bug (returns `PartitionWalkOutOfRange`).
+  All non-WARP arms behave identically to r201 when `warp == None`.
+  The `Error::PredictInterWarpUnsupported` variant is removed (no
+  longer reachable). Test count: 1025 → 1033 (+8 in lib): per-arm
+  routing tests for LOCALWARP and GLOBAL_WARP (hand-composed
+  `block_warp` equivalence), three fallback tests pinning step-7
+  ◦ 1 (`w/h < 8`) / ◦ 2 (`force_integer_mv`) / ◦ 3-negative
+  (`!LocalValid`) / ◦ 4-blocked-by-`is_scaled`, one step-3
+  re-validation test, and a `derive_use_warp` truth-table test
+  covering all seven step-7 paths.
+
 * **Round 201 — §7.11.3.1 step-14 compound arm wired into
   `predict_inter`.** The r194 `PredictInterCompoundUnsupported` stub is
   retired in favour of an end-to-end compound dispatch: when

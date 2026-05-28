@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 201)
+## Status — 2026-05-28 (round 202)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1626,6 +1626,97 @@ the caller hooks into the §5.11.58 decode state (`lr_type`,
 `lr_wiener`, `lr_sgr_set`, `lr_sgr_xqd`), letting the driver run
 against synthetic predicates. The §5.9.20 [`LrParams`] (r10) and
 §5.11.58 per-unit reads will plug straight into these closures.
+
+Round 202 wires the **§7.11.3.1 WARPED_CAUSAL motion-mode arm** of the
+[`predict_inter`] driver (av1-spec p.257-258 lines 14308-14370) — the
+r194 driver stub at `motion_mode == MOTION_MODE_WARPED_CAUSAL` is
+retired in favour of an end-to-end WARP dispatch that performs the
+step-2/3/6/7 `useWarp` derivation per `refList` and, when `useWarp ∈
+{1, 2}`, drives the §7.11.3.5 [`block_warp`] kernel through the
+step-12 per-8×8 sub-block loop (`i8 ∈ 0..((h-1) >> 3)`, `j8 ∈
+0..((w-1) >> 3)`) in lieu of the §7.11.3.4 translational kernel. The
+four warp sub-bodies landed in r192 ([`block_warp`] / [`setup_shear`]
+/ [`resolve_divisor`] / [`warp_estimation`]); r202 is the driver-side
+wiring against them.
+
+New public surface:
+
+* **[`WarpDriverParams`]** — struct plumbing the spec inputs the
+  step-2/3/6/7 derivation consumes:
+  * `y_mode[refList]` — §5.11.x `YMode` per-ref; the step-7 ◦ 4 gate
+    requires `YMode ∈ {GLOBALMV, GLOBAL_GLOBALMV}`.
+  * `gm_type[refList]` — §5.9.x `GmType[refFrame]` per-ref; the
+    step-7 ◦ 4 gate requires `gm_type > TRANSLATION`.
+  * `gm_params[refList][0..6]` — §5.9.x `gm_params[refFrame]` per-ref;
+    the `useWarp == 2` arm passes this matrix to [`block_warp`].
+  * `local_warp_params[0..6]` — §7.11.3.8 [`warp_estimation`] output;
+    the `useWarp == 1` arm passes this matrix to [`block_warp`].
+  * `local_valid` — §7.11.3.8 `LocalValid` bit; re-validated against
+    [`setup_shear`] internally per step-3 (av1-spec p.257 line 14311).
+  * `ref_is_scaled[refList]` — §5.11.27 `is_scaled(refFrame)` per-ref;
+    the step-7 ◦ 4 gate requires `false`.
+  * `force_integer_mv` — §5.9.x frame flag; step-7 ◦ 2 forces
+    `useWarp = 0` when `true`.
+
+The step-7 decision tree is exposed through the module-private
+`derive_use_warp` helper covering all five spec arms (`w/h < 8` ⇒ 0;
+`force_integer_mv` ⇒ 0; LOCALWARP + LocalValid ⇒ 1; GLOBAL_GLOBALMV +
+`GmType > TRANSLATION` + `!is_scaled` + `globalValid` ⇒ 2; else 0).
+The driver also performs the step-3 `plane == 0`
+`setup_shear(LocalWarpParams)` re-validation internally — a
+`LocalWarpParams` with a degenerate `[2] == 0` diagonal demotes the
+run to translational fallback even when the caller passes
+`local_valid = true`.
+
+[`predict_inter`]'s signature gains a trailing
+`warp: Option<&WarpDriverParams>` argument before `pred_out`; a
+caller that supplies `warp = None` runs the prior translational /
+compound path unchanged. A caller that sets `motion_mode ==
+WARPED_CAUSAL` without supplying `WarpDriverParams` returns
+`Error::PartitionWalkOutOfRange` (caller bug). The
+`Error::PredictInterWarpUnsupported` variant is removed (no longer
+reachable). After r202, only `motion_mode == OBMC` still
+short-circuits to a dedicated error.
+
+Test count: 1025 → 1033 (+8 in lib). New `inter_pred::tests`:
+
+* **`r202_predict_inter_localwarp_routes_to_block_warp`** — pins the
+  step-7 ◦ 3 (`useWarp = 1`) routing: `motion_mode == WARPED_CAUSAL`
+  + `local_valid = true` + `WARP_IDENTITY` matrix triggers the
+  per-8×8 [`block_warp`] dispatch, and the driver output equals a
+  hand-composed [`block_warp`] + [`clip1_single_ref`] call.
+* **`r202_predict_inter_global_warp_routes_to_block_warp`** — same
+  for step-7 ◦ 4 (`useWarp = 2`): SIMPLE motion mode with
+  `YMode == GLOBAL_GLOBALMV` and `gm_type == ROTZOOM` triggers the
+  GLOBAL_WARP path with `gm_params[refFrame]`.
+* **`r202_predict_inter_use_warp_small_block_falls_back_to_translational`**
+  — step-7 ◦ 1: `w < 8` forces translational fallback even with
+  `WARPED_CAUSAL` motion mode and a valid `local_warp_params`.
+  Output equals the SIMPLE-mode baseline.
+* **`r202_predict_inter_force_integer_mv_disables_warp`** — step-7 ◦
+  2: `force_integer_mv = true` forces translational fallback.
+* **`r202_predict_inter_local_invalid_falls_back_to_translational`** —
+  step-7 ◦ 3 negative arm: `local_valid = false` flows through to
+  step-7 ◦ 5 (no LOCALWARP, no GLOBAL via `gm_type == IDENTITY`).
+* **`r202_predict_inter_global_blocked_by_is_scaled`** — step-7 ◦ 4
+  negative arm: flipping `ref_is_scaled[0]` to `true` blocks the
+  GLOBAL gate; output equals the SIMPLE baseline.
+* **`r202_predict_inter_step3_shear_revalidates_localwarp`** — pins
+  the step-3 internal re-validation: a `LocalWarpParams` with
+  `[2] == 0` (which `setup_shear` rejects via
+  `resolve_divisor(0) ⇒ None`) demotes `effective_local_valid` to
+  `false` and the dispatch falls back to translational.
+* **`r202_derive_use_warp_truth_table`** — `derive_use_warp` truth
+  table covering all five spec cases plus three negative-arm cases of
+  step-7 ◦ 4 (gm_type == TRANSLATION; globalValid == false; y_mode
+  not in {GLOBALMV, GLOBAL_GLOBALMV}).
+
+Followup candidates (next arcs): wiring the **OBMC** arm
+(§7.11.3.9-10 leaves landed in r193; needs the
+`overlapped_motion_compensation` mi-grid neighbour walk); §9.5.3
+Quantizer matrix; §7.10.2.5 / §7.10.2.6 temporal-MV scan.
+
+The prior r201 round notes (preserved verbatim for traceability):
 
 Round 201 wires the **§7.11.3.1 step-14 compound arm** of the
 [`predict_inter`] driver (av1-spec p.258 lines 14381-14412) — the

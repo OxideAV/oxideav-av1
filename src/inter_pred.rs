@@ -1226,6 +1226,350 @@ fn predict_inter_compound_blend(
     }
 }
 
+/// §7.11.3.1 step-2/3/6/7 useWarp-derivation inputs (av1-spec p.257
+/// lines 14308-14349) — the per-block warp context [`predict_inter`]
+/// consumes once on its WARP arm to decide between LOCALWARP
+/// (`useWarp == 1`) and GLOBAL_GLOBALMV (`useWarp == 2`) dispatch.
+///
+/// The driver receives this as `Some(_)` whenever
+/// `motion_mode == MOTION_MODE_WARPED_CAUSAL` (= spec LOCALWARP) or
+/// the §5.11.x cascade has already decided
+/// `YMode ∈ {GLOBALMV, GLOBAL_GLOBALMV}` against a `GmType[refFrame] >
+/// TRANSLATION` reference. A caller-supplied `None` keeps the prior
+/// translational-only path — the driver behaves exactly as the r194
+/// / r201 SIMPLE / compound arms do when `motion_mode ==
+/// MOTION_MODE_SIMPLE` and no global-warp gating fires.
+///
+/// Step-by-step the driver consumes:
+///
+/// * **Step 2** — `motion_mode == LOCALWARP` ⇒ the §7.11.3.8
+///   `warp_estimation` is invoked at the caller site; the result is
+///   plumbed in via `local_warp_params` / `local_valid`.
+/// * **Step 3** — `plane == 0 && motion_mode == LOCALWARP &&
+///   LocalValid == 1` ⇒ the §7.11.3.6 `setup_shear` is re-validated
+///   on `LocalWarpParams`; failure flips `local_valid` to false. The
+///   driver performs this check internally on `plane == 0`.
+/// * **Step 6** — `YMode ∈ {GLOBALMV, GLOBAL_GLOBALMV} && GmType[
+///   refFrame] > TRANSLATION` ⇒ §7.11.3.6 `setup_shear` on
+///   `gm_params[refFrame]` produces `globalValid`. The driver
+///   performs this internally per-`refList`.
+/// * **Step 7** — the `useWarp` decision tree (`w < 8 || h < 8` ⇒ 0;
+///   `force_integer_mv` ⇒ 0; LOCALWARP + LocalValid ⇒ 1;
+///   GLOBALMV-class + `GmType > TRANSLATION` + `!is_scaled` +
+///   globalValid ⇒ 2; else 0).
+///
+/// Per-`refList` fields (`y_mode`, `gm_type`, `gm_params`,
+/// `ref_is_scaled`) are indexed by `refList ∈ {0, 1}` matching the
+/// `refs[refList]` array `predict_inter` consumes. On the single-ref
+/// arm only `[0]` is consulted.
+///
+/// The §5.11.27 LOCALWARP arm is luma-only; for chroma planes
+/// `predict_inter` re-uses the luma-derived `LocalValid` directly
+/// (step 3's `plane == 0` gate means chroma never re-runs
+/// `setup_shear`, but the same `LocalValid` bit propagates).
+#[derive(Debug, Clone, Copy)]
+pub struct WarpDriverParams {
+    /// §5.11.x `YMode` per-refList — used for the step-7 `useWarp
+    /// = 2` global-warp gate (`YMode ∈ {GLOBALMV,
+    /// GLOBAL_GLOBALMV}`). Indexed by `refList`; only
+    /// `[0]` is consulted on the single-ref path.
+    pub y_mode: [u8; 2],
+    /// §5.9.x `GmType[refFrame]` per-refList — the `IDENTITY` /
+    /// `TRANSLATION` / `ROTZOOM` / `AFFINE` discriminant of the
+    /// per-ref global-motion model. The step-7 `useWarp = 2` gate
+    /// requires `gm_type > TRANSLATION`.
+    pub gm_type: [u8; 2],
+    /// §5.9.x `gm_params[refFrame][0..6]` per-refList — the affine
+    /// matrix for the GLOBAL_GLOBALMV `useWarp == 2` arm; consumed by
+    /// `block_warp` when the step-7 derivation lands on global warp.
+    pub gm_params: [[i32; 6]; 2],
+    /// §7.11.3.8 `LocalWarpParams[0..6]` — the per-block warp matrix
+    /// produced by `warp_estimation`; consumed by `block_warp` when
+    /// `useWarp == 1`. Only meaningful when `local_valid == true`.
+    /// Shared across `refList` since LOCALWARP is single-reference
+    /// only (`isCompound == 0` on the LOCALWARP cascade per §5.11.27).
+    pub local_warp_params: [i32; 6],
+    /// §7.11.3.8 `LocalValid` bit — `true` when `warp_estimation`'s
+    /// least-squares fit produced a non-singular `A` matrix. False
+    /// flips the step-7 LOCALWARP arm to `useWarp = 0` (translational
+    /// fallback).
+    pub local_valid: bool,
+    /// §5.11.27 `is_scaled(refFrame)` per-refList — `true` when the
+    /// ref frame's `(xScale, yScale) != (noScale, noScale)`. Step-7
+    /// `useWarp = 2` requires `is_scaled == false` per av1-spec p.257
+    /// line 14345.
+    pub ref_is_scaled: [bool; 2],
+    /// §5.9.x `force_integer_mv` frame flag — when `true`, step-7
+    /// forces `useWarp = 0` regardless of motion mode. (`true` only
+    /// on intra frames or when explicitly signalled per av1-spec
+    /// §5.9.5.)
+    pub force_integer_mv: bool,
+}
+
+/// §7.11.3.1 step-7 output: which `block_warp` matrix to apply for
+/// one `refList`. `Translational` indicates `useWarp == 0` (fall
+/// through to the existing §7.11.3.4 8-tap kernel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UseWarpDecision {
+    /// `useWarp == 0` per av1-spec p.257 line 14332/14334/14349.
+    Translational,
+    /// `useWarp == 1` per av1-spec p.257 line 14336 — invoke
+    /// `block_warp` with `LocalWarpParams`.
+    Local,
+    /// `useWarp == 2` per av1-spec p.257 line 14339 — invoke
+    /// `block_warp` with `gm_params[refFrame]`.
+    Global,
+}
+
+/// §7.11.3.1 step-7 derivation (av1-spec p.257 lines 14330-14349) —
+/// pick `useWarp ∈ {0, 1, 2}` for one `refList`.
+///
+/// The bundle of step-7 conditions is exactly:
+///
+/// 1. `w < 8 || h < 8` → 0.
+/// 2. `force_integer_mv == 1` → 0.
+/// 3. `motion_mode == LOCALWARP && LocalValid == 1` → 1.
+/// 4. `YMode ∈ {GLOBALMV, GLOBAL_GLOBALMV} && GmType[refFrame] >
+///    TRANSLATION && !is_scaled(refFrame) && globalValid == 1` → 2.
+/// 5. otherwise → 0.
+///
+/// `global_valid` is the §7.11.3.6 `warpValid` re-derived from
+/// `gm_params[refFrame]` at the call site (per av1-spec p.257
+/// step 6). When the gate (YMode + GmType) doesn't fire, the
+/// caller does not need to run §7.11.3.6 and may pass `false`
+/// — the gate short-circuits before consulting `global_valid`.
+#[allow(clippy::too_many_arguments)]
+fn derive_use_warp(
+    w: usize,
+    h: usize,
+    motion_mode: u8,
+    y_mode: u8,
+    gm_type: u8,
+    ref_is_scaled: bool,
+    local_valid: bool,
+    global_valid: bool,
+    force_integer_mv: bool,
+) -> UseWarpDecision {
+    // Step-7 ◦ 1 — w/h < 8.
+    if w < 8 || h < 8 {
+        return UseWarpDecision::Translational;
+    }
+    // Step-7 ◦ 2 — force_integer_mv.
+    if force_integer_mv {
+        return UseWarpDecision::Translational;
+    }
+    // Step-7 ◦ 3 — LOCALWARP + LocalValid.
+    if motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL && local_valid {
+        return UseWarpDecision::Local;
+    }
+    // Step-7 ◦ 4 — global-warp gate (the four-AND of YMode in
+    // {GLOBALMV, GLOBAL_GLOBALMV}, GmType > TRANSLATION,
+    // !is_scaled, globalValid).
+    let y_is_global = matches!(
+        y_mode,
+        crate::cdf::MODE_GLOBALMV | crate::cdf::MODE_GLOBAL_GLOBALMV
+    );
+    let gm_is_warp = (gm_type as i32) > crate::cdf::GM_TYPE_TRANSLATION;
+    if y_is_global && gm_is_warp && !ref_is_scaled && global_valid {
+        return UseWarpDecision::Global;
+    }
+    // Step-7 ◦ 5 — fall-through.
+    UseWarpDecision::Translational
+}
+
+/// §7.11.3.1 step-12 per-`refList` warp body (av1-spec p.257 lines
+/// 14368-14370) — drives `block_warp` once per 8×8 sub-block of the
+/// `w × h` prediction region and returns the `w * h` `i32`
+/// pre-`Clip1` prediction matching what `predict_inter_per_ref`
+/// would have produced on the translational arm.
+///
+/// `warp_params` is `LocalWarpParams` (when `use_warp ==
+/// USE_WARP_LOCAL`) or `gm_params[refFrame]` (when `use_warp ==
+/// USE_WARP_GLOBAL`); the caller picks per the step-7 derivation.
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_per_ref_warp(
+    r: &PredictInterRef<'_>,
+    use_warp: u8,
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    warp_params: [i32; 6],
+    inter_round0: u32,
+    inter_round1: u32,
+) -> Result<Vec<i32>, crate::Error> {
+    let mut pred: Vec<i32> = Vec::new();
+    if pred.try_reserve_exact(w * h).is_err() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    pred.resize(w * h, 0);
+
+    // av1-spec p.257 line 14369: "i8 = 0..((h-1) >> 3) and for j8 =
+    // 0..((w-1) >> 3)". The inclusive upper bound expressed as
+    // `(dim - 1) >> 3` matches `dim.div_ceil(8) - 1`; the §7.11.3.1
+    // step-7 ◦ 1 gate guarantees `w >= 8 && h >= 8` here so both
+    // loops run at least once.
+    let i_blocks = h.div_ceil(8);
+    let j_blocks = w.div_ceil(8);
+    for i8b in 0..i_blocks {
+        for j8b in 0..j_blocks {
+            block_warp(
+                use_warp,
+                plane,
+                subsampling_x,
+                subsampling_y,
+                x,
+                y,
+                i8b as i32,
+                j8b as i32,
+                w,
+                h,
+                r.ref_plane,
+                r.ref_stride,
+                r.ref_upscaled_width,
+                r.ref_height,
+                warp_params,
+                inter_round0,
+                inter_round1,
+                /* pred_stride */ w,
+                &mut pred,
+            )?;
+        }
+    }
+    Ok(pred)
+}
+
+/// §7.11.3.1 step-5/8/9/10/12/13 per-`refList` dispatch — pick the
+/// translational kernel ([`predict_inter_per_ref`]) or the warp kernel
+/// ([`predict_inter_per_ref_warp`]) based on the step-7 `useWarp`
+/// derivation and run it once for one reference.
+///
+/// `effective_local_valid` is the §7.11.3.1 step-3 output (the
+/// caller-supplied `WarpDriverParams::local_valid` after the
+/// `plane == 0` re-check against `setup_shear(LocalWarpParams)`).
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_one_ref(
+    r: &PredictInterRef<'_>,
+    ref_list: usize,
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    motion_mode: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    inter_round0: u32,
+    inter_round1: u32,
+    warp: Option<&WarpDriverParams>,
+    effective_local_valid: bool,
+) -> Result<Vec<i32>, crate::Error> {
+    // ---------- §7.11.3.1 step 6/7 — derive useWarp ----------
+    //
+    // Step 6 invokes §7.11.3.6 setup_shear on `gm_params[refFrame]`
+    // and assigns warpValid → globalValid; we run it lazily (only
+    // when YMode + GmType clear the rest of the step-7 gate, since
+    // the call costs an inverse-divisor that's pointless otherwise).
+    let decision = if let Some(wp) = warp {
+        let y_mode = wp.y_mode[ref_list];
+        let gm_type = wp.gm_type[ref_list];
+        let ref_is_scaled = wp.ref_is_scaled[ref_list];
+        let y_is_global = matches!(
+            y_mode,
+            crate::cdf::MODE_GLOBALMV | crate::cdf::MODE_GLOBAL_GLOBALMV
+        );
+        let gm_is_warp = (gm_type as i32) > crate::cdf::GM_TYPE_TRANSLATION;
+        // Step 6 — only run setup_shear when the gate would consult
+        // globalValid. The other arms of step-7 either short-circuit
+        // before consulting it (`w/h < 8`, `force_integer_mv`,
+        // LOCALWARP+LocalValid) or short-circuit before the AND chain
+        // (`!(y_is_global && gm_is_warp)`).
+        let global_valid = if y_is_global && gm_is_warp && !ref_is_scaled {
+            matches!(setup_shear(wp.gm_params[ref_list]), Some(s) if s.warp_valid)
+        } else {
+            false
+        };
+        derive_use_warp(
+            w,
+            h,
+            motion_mode,
+            y_mode,
+            gm_type,
+            ref_is_scaled,
+            effective_local_valid,
+            global_valid,
+            wp.force_integer_mv,
+        )
+    } else {
+        UseWarpDecision::Translational
+    };
+
+    // ---------- §7.11.3.1 step 12 / 13 — dispatch ----------
+    match decision {
+        UseWarpDecision::Translational => predict_inter_per_ref(
+            r,
+            plane,
+            x,
+            y,
+            w,
+            h,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            interp_filter_x,
+            interp_filter_y,
+            inter_round0,
+            inter_round1,
+        ),
+        UseWarpDecision::Local => {
+            // av1-spec p.257 step-7 ◦ 3: LOCALWARP. `warp.is_some()`
+            // is guaranteed by `derive_use_warp` returning `Local`
+            // only when LocalValid && motion_mode == LOCALWARP, both
+            // of which require a non-None `warp`.
+            let wp = warp.expect("Local requires WarpDriverParams");
+            predict_inter_per_ref_warp(
+                r,
+                USE_WARP_LOCAL,
+                plane,
+                x,
+                y,
+                w,
+                h,
+                subsampling_x,
+                subsampling_y,
+                wp.local_warp_params,
+                inter_round0,
+                inter_round1,
+            )
+        }
+        UseWarpDecision::Global => {
+            let wp = warp.expect("Global requires WarpDriverParams");
+            predict_inter_per_ref_warp(
+                r,
+                USE_WARP_GLOBAL,
+                plane,
+                x,
+                y,
+                w,
+                h,
+                subsampling_x,
+                subsampling_y,
+                wp.gm_params[ref_list],
+                inter_round0,
+                inter_round1,
+            )
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn predict_inter(
     plane: u8,
@@ -1245,6 +1589,7 @@ pub fn predict_inter(
     interp_filter_y: u8,
     refs: &[PredictInterRef<'_>],
     compound: Option<CompoundParams<'_>>,
+    warp: Option<&WarpDriverParams>,
     pred_out: &mut [u16],
 ) -> Result<(), crate::Error> {
     // ---------- caller-bug guards ----------
@@ -1282,24 +1627,6 @@ pub fn predict_inter(
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
-    // ---------- §7.11.3.1 step 2,3,6,7,12 — WARP short-circuit ----
-    //
-    // The §7.11.3.1 driver routes through the §7.11.3.5-8
-    // `block_warp` kernel when `useWarp != 0`. r194 implements only
-    // the translational SIMPLE arm; the LOCALWARP / global-warp arms
-    // are a next-arc target (the kernels themselves landed in r192).
-    //
-    // We short-circuit on `motion_mode == MOTION_MODE_WARPED_CAUSAL`
-    // without trying to derive `useWarp` itself — the §7.11.3.1
-    // step-7 `useWarp = 2` global-warp arm fires only on
-    // `YMode == GLOBAL{,_GLOBAL}MV && GmType[refFrame] > TRANSLATION
-    // && ...`, none of which the driver's r194 caller can
-    // distinguish from a translational SIMPLE block without
-    // plumbing GmType + YMode through.
-    if motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL {
-        return Err(crate::Error::PredictInterWarpUnsupported);
-    }
-
     // ---------- §7.11.3.1 IsInterIntra short-circuit ----------
     //
     // The §5.11.33 dispatcher's IsInterIntra arm currently surfaces
@@ -1310,23 +1637,65 @@ pub fn predict_inter(
         return Err(crate::Error::ComputePredictionInterIntraUnsupported);
     }
 
+    // ---------- §7.11.3.1 step 2/3/6/7 — WARP context plumbing ----
+    //
+    // The WARP arm (av1-spec p.257 lines 14308-14349, p.258 line
+    // 14368) requires the caller to supply step-2/3/6/7 useWarp
+    // derivation inputs through [`WarpDriverParams`]. A caller that
+    // passes `warp = None` runs the translational-only path
+    // unchanged — equivalent to the r194/r201 behaviour for
+    // `motion_mode == MOTION_MODE_SIMPLE` blocks. A caller that
+    // sets `motion_mode == MOTION_MODE_WARPED_CAUSAL` (= spec
+    // LOCALWARP) but supplies `warp = None` is a caller bug.
+    if motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL && warp.is_none() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
     // ---------- §7.11.3.1 step 1 — rounding variables -----------
     let rv = rounding_variables(bit_depth, is_compound)?;
+
+    // ---------- §7.11.3.1 step 3 (luma) — LocalValid re-derivation -
+    //
+    // av1-spec p.257 line 14311: "If plane is equal to 0 and
+    // motion_mode is equal to LOCALWARP and LocalValid is equal to
+    // 1, the setup shear process specified in section 7.11.3.6 is
+    // invoked with LocalWarpParams as input, and the output
+    // warpValid is assigned to LocalValid (the other outputs are
+    // discarded)."
+    //
+    // We perform this gate per-frame at the caller surface (the
+    // shear validity is purely a function of `LocalWarpParams`, so
+    // running it once at `plane == 0` is bit-equivalent to running
+    // it for every plane). Re-check here so a caller that derives
+    // `local_valid` from the §7.11.3.8 fit without re-checking
+    // §7.11.3.6 doesn't sneak past the spec's two-step validity.
+    let mut effective_local_valid: bool = warp.is_some_and(|w| w.local_valid);
+    if let Some(wp) = warp {
+        if motion_mode == crate::cdf::MOTION_MODE_WARPED_CAUSAL && wp.local_valid {
+            match setup_shear(wp.local_warp_params) {
+                Some(s) if s.warp_valid => {}
+                _ => effective_local_valid = false,
+            }
+        }
+    }
 
     // ---------- §7.11.3.1 step 4-13 — refList = 0 ----------
     //
     // Steps 5,8,9 are subsumed into the caller-supplied `refs[refList]`
     // bundle. Step 10 = `motion_vector_scaling`. Step 13 =
     // `block_inter_prediction` against the
-    // `(startX, startY, stepX, stepY)` quadruple. The compound arm
-    // (step 14) repeats the same body for `refList = 1`.
-    let pred0 = predict_inter_per_ref(
+    // `(startX, startY, stepX, stepY)` quadruple — or, on the WARP
+    // arm, step 12 = `block_warp` per 8×8 sub-section. The compound
+    // arm (step 14) repeats the same body for `refList = 1`.
+    let pred0 = predict_inter_one_ref(
         &refs[0],
+        /* ref_list */ 0,
         plane,
         x,
         y,
         w,
         h,
+        motion_mode,
         subsampling_x,
         subsampling_y,
         frame_width,
@@ -1335,6 +1704,8 @@ pub fn predict_inter(
         interp_filter_y,
         rv.inter_round0,
         rv.inter_round1,
+        warp,
+        effective_local_valid,
     )?;
 
     // ---------- §7.11.3.1 step 14 + final blend ----------
@@ -1354,13 +1725,15 @@ pub fn predict_inter(
     // circuit, so it never reaches here.
     if is_compound {
         // step 14: build preds[1] from refs[1] with the same pipeline.
-        let pred1 = predict_inter_per_ref(
+        let pred1 = predict_inter_one_ref(
             &refs[1],
+            /* ref_list */ 1,
             plane,
             x,
             y,
             w,
             h,
+            motion_mode,
             subsampling_x,
             subsampling_y,
             frame_width,
@@ -1369,6 +1742,8 @@ pub fn predict_inter(
             interp_filter_y,
             rv.inter_round0,
             rv.inter_round1,
+            warp,
+            effective_local_valid,
         )?;
         // SAFETY: the `is_compound` arm guarded `compound.is_some()`
         // above, so `unwrap` cannot panic.
@@ -5502,6 +5877,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             /* compound */ None,
+            /* warp */ None,
             &mut pred_out,
         )
         .expect("predict_inter SIMPLE single-ref translational path");
@@ -5554,11 +5930,19 @@ mod tests {
         );
     }
 
-    /// §7.11.3.1 stub-arm matrix (post-r201) — the WARP and OBMC arms
-    /// still short-circuit to their dedicated [`crate::Error`] variants.
-    /// The r194 `PredictInterCompoundUnsupported` arm was retired in
-    /// r201 — see `r201_predict_inter_compound_*` for compound-arm
-    /// coverage.
+    /// §7.11.3.1 stub-arm matrix (post-r202) — the WARP arm now
+    /// dispatches via `WarpDriverParams` (see `r202_predict_inter_*`);
+    /// only the OBMC post-step arm still short-circuits to its
+    /// dedicated [`crate::Error`] variant. The r194
+    /// `PredictInterCompoundUnsupported` arm was retired in r201 and
+    /// the r194 `PredictInterWarpUnsupported` arm is retired in r202.
+    ///
+    /// This test additionally pins the r202 caller-bug guard:
+    /// `motion_mode == WARPED_CAUSAL` without a `WarpDriverParams`
+    /// supplied returns `PartitionWalkOutOfRange` (the per-block
+    /// useWarp derivation needs at least `local_warp_params` /
+    /// `local_valid` to decide whether to route to LOCALWARP or fall
+    /// back to translational).
     #[test]
     fn r194_predict_inter_stub_arms_each_surface_dedicated_error() {
         let ref_w: usize = 16;
@@ -5574,7 +5958,8 @@ mod tests {
         }];
         let mut pred_out = vec![0u16; 16];
 
-        // motion_mode == WARPED_CAUSAL ⇒ PredictInterWarpUnsupported.
+        // r202 caller-bug guard: motion_mode == WARPED_CAUSAL
+        // without `WarpDriverParams` ⇒ PartitionWalkOutOfRange.
         let mut pred_out_8x8 = vec![0u16; 64];
         let e = predict_inter(
             0,
@@ -5594,10 +5979,11 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* warp */ None,
             &mut pred_out_8x8,
         )
         .unwrap_err();
-        assert_eq!(e, crate::Error::PredictInterWarpUnsupported);
+        assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
 
         // motion_mode == OBMC ⇒ PredictInterObmcUnsupported.
         // The translational prediction runs to completion first
@@ -5622,6 +6008,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* warp */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -5667,6 +6054,7 @@ mod tests {
             EIGHTTAP,
             &empty_refs,
             None,
+            /* warp */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -5692,6 +6080,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* warp */ None,
             &mut small,
         )
         .unwrap_err();
@@ -5716,6 +6105,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* warp */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -5781,6 +6171,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             Some(CompoundParams::Average),
+            /* warp */ None,
             &mut pred_out,
         )
         .expect("compound AVERAGE arm");
@@ -5894,6 +6285,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             Some(CompoundParams::Distance(weights)),
+            /* warp */ None,
             &mut pred_out,
         )
         .expect("compound DISTANCE arm");
@@ -6011,6 +6403,7 @@ mod tests {
                 mask: &mask,
                 mask_stride: 0,
             }),
+            /* warp */ None,
             &mut pred_out,
         )
         .expect("compound WEDGE arm");
@@ -6146,6 +6539,7 @@ mod tests {
                 mask: &mask,
                 mask_stride: 0,
             }),
+            /* warp */ None,
             &mut pred_out,
         )
         .expect("compound DIFFWTD arm");
@@ -6264,6 +6658,7 @@ mod tests {
                 mask: &mask,
                 mask_stride: 0,
             }),
+            /* warp */ None,
             &mut pred_out,
         )
         .expect("compound INTRA arm");
@@ -6361,6 +6756,7 @@ mod tests {
             EIGHTTAP,
             &single,
             Some(CompoundParams::Average),
+            /* warp */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -6385,6 +6781,7 @@ mod tests {
             EIGHTTAP,
             &double,
             None,
+            /* warp */ None,
             &mut pred_out,
         )
         .unwrap_err();
@@ -6409,9 +6806,747 @@ mod tests {
             EIGHTTAP,
             &single,
             Some(CompoundParams::Average),
+            /* warp */ None,
             &mut pred_out,
         )
         .unwrap_err();
         assert_eq!(e, crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- r202 §7.11.3.1 predict_inter WARP arm ----------
+
+    /// Identity warp matrix per the §7.11.3.5 / §5.9.x convention:
+    /// `[a0=0, a1=0, a2=1<<16, a3=0, a4=0, a5=1<<16]` ⇒ the affine
+    /// transform `dst = (a2*src + a0, a5*src + a1)` is the identity in
+    /// fixed-point. Useful as a degenerate warp matrix that should
+    /// reproduce (modulo the warp filter phase) a zero-MV translational
+    /// prediction.
+    const WARP_IDENTITY: [i32; 6] = [0, 0, 1 << 16, 0, 0, 1 << 16];
+
+    /// §7.11.3.1 step-7 ◦ 3 (`useWarp = 1` for LOCALWARP + LocalValid)
+    /// — invoking the driver with `motion_mode == WARPED_CAUSAL` and
+    /// a valid `WarpDriverParams` triggers per-8×8 `block_warp`
+    /// dispatch instead of `block_inter_prediction`. The output must
+    /// equal the per-sub-block `block_warp` composition computed
+    /// outside the driver.
+    #[test]
+    fn r202_predict_inter_localwarp_routes_to_block_warp() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 19 + c * 7) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let warp = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_GLOBALMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_IDENTITY as u8, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+
+        let w = 8;
+        let h = 8;
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            /* plane */ 0,
+            /* x */ 8,
+            /* y */ 8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            /* is_compound */ false,
+            /* is_inter_intra */ false,
+            /* bit_depth */ 8,
+            /* subsampling_x */ 0,
+            /* subsampling_y */ 0,
+            /* frame_width */ ref_w as u32,
+            /* frame_height */ ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            /* compound */ None,
+            /* warp */ Some(&warp),
+            &mut pred_out,
+        )
+        .expect("predict_inter LOCALWARP arm");
+
+        // Hand-composition: run block_warp(USE_WARP_LOCAL, ..) per
+        // 8×8 sub-block (here a single sub-block since w == h == 8),
+        // then clip1.
+        let rv = rounding_variables(8, false).unwrap();
+        let mut leaf = vec![0i32; w * h];
+        block_warp(
+            USE_WARP_LOCAL,
+            0,
+            0,
+            0,
+            8,
+            8,
+            0,
+            0,
+            w,
+            h,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            WARP_IDENTITY,
+            rv.inter_round0,
+            rv.inter_round1,
+            /* pred_stride */ w,
+            &mut leaf,
+        )
+        .unwrap();
+        let mut expected = vec![0u16; w * h];
+        clip1_single_ref(8, &leaf, &mut expected).unwrap();
+        assert_eq!(
+            pred_out, expected,
+            "LOCALWARP driver output must equal hand-composed block_warp"
+        );
+    }
+
+    /// §7.11.3.1 step-7 ◦ 4 (`useWarp = 2` for GLOBAL_GLOBALMV) — when
+    /// motion_mode is SIMPLE but `YMode == GLOBAL_GLOBALMV` and
+    /// `GmType[refFrame] > TRANSLATION`, the driver routes to
+    /// `block_warp(USE_WARP_GLOBAL, gm_params[refFrame])`. We use a
+    /// `setup_shear`-valid identity-class matrix so `globalValid` is
+    /// `true` and the step-7 AND chain clears.
+    #[test]
+    fn r202_predict_inter_global_warp_routes_to_block_warp() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 13 + c * 11) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        // GmType = ROTZOOM (> TRANSLATION) so step-7's `gm_type >
+        // TRANSLATION` gate fires.
+        let warp = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_GLOBAL_GLOBALMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_ROTZOOM as u8, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: false,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+
+        let w = 8;
+        let h = 8;
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            // SIMPLE motion mode; the step-7 ◦ 4 GLOBAL arm fires
+            // independent of motion_mode per av1-spec p.257 line 14339.
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(&warp),
+            &mut pred_out,
+        )
+        .expect("predict_inter GLOBAL_WARP arm");
+
+        let rv = rounding_variables(8, false).unwrap();
+        let mut leaf = vec![0i32; w * h];
+        block_warp(
+            USE_WARP_GLOBAL,
+            0,
+            0,
+            0,
+            8,
+            8,
+            0,
+            0,
+            w,
+            h,
+            &refp,
+            stride,
+            ref_w as u32,
+            ref_h as u32,
+            WARP_IDENTITY,
+            rv.inter_round0,
+            rv.inter_round1,
+            w,
+            &mut leaf,
+        )
+        .unwrap();
+        let mut expected = vec![0u16; w * h];
+        clip1_single_ref(8, &leaf, &mut expected).unwrap();
+        assert_eq!(
+            pred_out, expected,
+            "GLOBAL_WARP driver output must equal hand-composed block_warp"
+        );
+    }
+
+    /// §7.11.3.1 step-7 ◦ 1 — `w < 8 || h < 8` forces `useWarp = 0`
+    /// (translational fallback) even on `motion_mode == WARPED_CAUSAL`
+    /// with a valid `local_warp_params`. The driver output must match
+    /// the SIMPLE translational path.
+    #[test]
+    fn r202_predict_inter_use_warp_small_block_falls_back_to_translational() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r + c * 3) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let warp = WarpDriverParams {
+            y_mode: [0, 0],
+            gm_type: [0, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+
+        // w = 4 < 8 — step-7 ◦ 1 short-circuits to translational.
+        let w = 4;
+        let h = 4;
+        let mut warp_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            2,
+            2,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(&warp),
+            &mut warp_out,
+        )
+        .expect("WARP arm with w<8 must fall back to translational");
+
+        // Equivalent SIMPLE call with no WarpDriverParams.
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            2,
+            2,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            &mut simple_out,
+        )
+        .expect("SIMPLE arm baseline");
+
+        assert_eq!(
+            warp_out, simple_out,
+            "step-7 ◦ 1 (w/h < 8) must produce the SIMPLE translational output"
+        );
+    }
+
+    /// §7.11.3.1 step-7 ◦ 2 — `force_integer_mv == 1` forces
+    /// `useWarp = 0` regardless of motion_mode. Same shape as the
+    /// w<8 test above.
+    #[test]
+    fn r202_predict_inter_force_integer_mv_disables_warp() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 5 + c * 3) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let warp_force_int = WarpDriverParams {
+            y_mode: [0, 0],
+            gm_type: [0, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: true,
+        };
+
+        let w = 8;
+        let h = 8;
+        let mut force_int_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(&warp_force_int),
+            &mut force_int_out,
+        )
+        .expect("WARP arm with force_integer_mv must fall back to translational");
+
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            &mut simple_out,
+        )
+        .expect("SIMPLE arm baseline");
+
+        assert_eq!(
+            force_int_out, simple_out,
+            "step-7 ◦ 2 (force_integer_mv) must produce SIMPLE translational output"
+        );
+    }
+
+    /// §7.11.3.1 step-7 ◦ 3 negative path — LOCALWARP with
+    /// `LocalValid == false` falls through to step-7 ◦ 5 (the bottom
+    /// `useWarp = 0` branch) since the global-warp gate of ◦ 4 also
+    /// can't fire (`GmType == IDENTITY`). The driver must produce the
+    /// same output as a SIMPLE-mode call.
+    #[test]
+    fn r202_predict_inter_local_invalid_falls_back_to_translational() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 7 + c * 17) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        // local_valid = false ⇒ step-7 ◦ 3 doesn't fire.
+        let warp = WarpDriverParams {
+            y_mode: [0, 0],
+            gm_type: [crate::cdf::GM_TYPE_IDENTITY as u8, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: false,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+
+        let w = 8;
+        let h = 8;
+        let mut warp_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(&warp),
+            &mut warp_out,
+        )
+        .expect("LOCALWARP+!LocalValid must fall back to translational");
+
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            &mut simple_out,
+        )
+        .expect("SIMPLE arm baseline");
+
+        assert_eq!(warp_out, simple_out);
+    }
+
+    /// §7.11.3.1 step-7 ◦ 4 — the global-warp AND chain has four
+    /// terms (y_mode in {GLOBALMV, GLOBAL_GLOBALMV}, gm_type >
+    /// TRANSLATION, !is_scaled, globalValid). Flipping the
+    /// `is_scaled` term blocks the dispatch (which would otherwise
+    /// pick GLOBAL) and the driver falls back to translational.
+    #[test]
+    fn r202_predict_inter_global_blocked_by_is_scaled() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r + c) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let warp = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_GLOBAL_GLOBALMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_ROTZOOM as u8, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: false,
+            ref_is_scaled: [true, false], // ⇐ blocks step-7 ◦ 4
+            force_integer_mv: false,
+        };
+
+        let w = 8;
+        let h = 8;
+        let mut warp_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(&warp),
+            &mut warp_out,
+        )
+        .expect("is_scaled must block step-7 ◦ 4");
+
+        let mut simple_out = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            &mut simple_out,
+        )
+        .expect("SIMPLE baseline");
+
+        assert_eq!(warp_out, simple_out);
+    }
+
+    /// §7.11.3.1 step-3 — `setup_shear(LocalWarpParams)` must
+    /// re-validate. A `LocalWarpParams` with `[2] == 0` (which
+    /// `setup_shear` rejects via `resolve_divisor` returning `None`)
+    /// must demote `effective_local_valid` to `false` and route the
+    /// dispatch to translational fallback. This pins the step-3
+    /// re-validation gate.
+    #[test]
+    fn r202_predict_inter_step3_shear_revalidates_localwarp() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let refp = vec![0u16; ref_h * stride];
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        // LocalWarpParams with [2] = 0: resolve_divisor(0) ⇒ None ⇒
+        // setup_shear ⇒ None ⇒ effective_local_valid = false.
+        let bad_local = [0, 0, 0, 0, 0, 1 << 16];
+        let warp = WarpDriverParams {
+            y_mode: [0, 0],
+            gm_type: [0, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: bad_local,
+            // Caller claims local_valid=true, but step-3 must reject.
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+
+        let w = 8;
+        let h = 8;
+        let mut warp_out = vec![0u16; w * h];
+        // Must not panic / error — the step-3 demotion turns the
+        // LOCALWARP path into a translational fallback.
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(&warp),
+            &mut warp_out,
+        )
+        .expect("step-3 must demote bad_local to translational fallback");
+
+        // Output must match a SIMPLE-mode prediction on the same
+        // zero-constant ref (which is identically zero post-clip).
+        assert!(warp_out.iter().all(|&v| v == 0));
+    }
+
+    /// `derive_use_warp` truth table — pin the five cases of the
+    /// step-7 decision tree. Helper-level test (the `derive_use_warp`
+    /// signature is module-private).
+    #[test]
+    fn r202_derive_use_warp_truth_table() {
+        // Case 1 — w < 8 ⇒ Translational regardless.
+        assert_eq!(
+            derive_use_warp(
+                4,
+                8,
+                crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+                0,
+                0,
+                false,
+                true,
+                true,
+                false
+            ),
+            UseWarpDecision::Translational
+        );
+        // Case 2 — force_integer_mv ⇒ Translational.
+        assert_eq!(
+            derive_use_warp(
+                8,
+                8,
+                crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+                0,
+                0,
+                false,
+                true,
+                true,
+                /* force_int */ true
+            ),
+            UseWarpDecision::Translational
+        );
+        // Case 3 — LOCALWARP + LocalValid ⇒ Local.
+        assert_eq!(
+            derive_use_warp(
+                8,
+                8,
+                crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+                0,
+                0,
+                false,
+                true,
+                false,
+                false
+            ),
+            UseWarpDecision::Local
+        );
+        // Case 4 — GLOBAL_GLOBALMV + GmType > TRANSLATION + !is_scaled
+        //   + globalValid ⇒ Global.
+        assert_eq!(
+            derive_use_warp(
+                8,
+                8,
+                crate::cdf::MOTION_MODE_SIMPLE,
+                crate::cdf::MODE_GLOBAL_GLOBALMV,
+                crate::cdf::GM_TYPE_ROTZOOM as u8,
+                false,
+                false,
+                true,
+                false
+            ),
+            UseWarpDecision::Global
+        );
+        // Case 4 negative — gm_type == TRANSLATION ⇒ Translational.
+        assert_eq!(
+            derive_use_warp(
+                8,
+                8,
+                crate::cdf::MOTION_MODE_SIMPLE,
+                crate::cdf::MODE_GLOBAL_GLOBALMV,
+                crate::cdf::GM_TYPE_TRANSLATION as u8,
+                false,
+                false,
+                true,
+                false
+            ),
+            UseWarpDecision::Translational
+        );
+        // Case 4 negative — globalValid == false ⇒ Translational.
+        assert_eq!(
+            derive_use_warp(
+                8,
+                8,
+                crate::cdf::MOTION_MODE_SIMPLE,
+                crate::cdf::MODE_GLOBAL_GLOBALMV,
+                crate::cdf::GM_TYPE_AFFINE as u8,
+                false,
+                false,
+                false,
+                false
+            ),
+            UseWarpDecision::Translational
+        );
+        // Case 5 — SIMPLE + no LOCALWARP + no global gate ⇒ Translational.
+        assert_eq!(
+            derive_use_warp(
+                16,
+                16,
+                crate::cdf::MOTION_MODE_SIMPLE,
+                crate::cdf::MODE_GLOBALMV,
+                crate::cdf::GM_TYPE_TRANSLATION as u8,
+                false,
+                false,
+                false,
+                false
+            ),
+            UseWarpDecision::Translational
+        );
     }
 }
