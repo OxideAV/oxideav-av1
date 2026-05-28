@@ -1,13 +1,15 @@
 //! Encoder side of the crate.
 //!
-//! Arc 1 (round 206) scope: the bit-output plumbing only.
+//! Arc 1 (round 206) landed the bit-output plumbing. Arc 2 (round
+//! 207) lands the `frame_header_obu()` writer on top.
 //!
-//! Three layers land here:
+//! Layers:
 //!
 //!   * [`bitwriter::BitWriter`] — MSB-first bit-output buffer, the
 //!     inverse of [`crate::bitreader::BitReader`] (§8.1 `read_bit`),
-//!     plus a `write_leb128()` helper for the byte-aligned §4.10.5
-//!     `leb128()` size field that the OBU framer emits.
+//!     plus `write_leb128()` (§4.10.5), `write_uvlc()` (§4.10.3),
+//!     `write_su(n)` (§4.10.6), and `write_ns(n)` (§4.10.7) — the
+//!     full descriptor-inverse set the §5.5 / §5.9 writers need.
 //!
 //!   * [`obu`] — Open Bitstream Unit framer per §5.3. Writes the
 //!     §5.3.2 one-byte `obu_header`, the optional §5.3.3
@@ -24,6 +26,14 @@
 //!     struct as the source-of-truth descriptor, so a written
 //!     payload immediately round-trips through the parser.
 //!
+//!   * [`frame_obu`] — `frame_header_obu()` writer per §5.9.1 /
+//!     §5.9.2 plus every sub-procedure §5.9.2 calls into. The
+//!     inverse of [`crate::frame_header::parse_frame_header`] on the
+//!     intra / show-existing-frame / reduced-still paths and on the
+//!     inter shared tail above `disable_frame_end_update_cdf`.
+//!     Reuses the parser's [`crate::frame_header::FrameHeader`] as
+//!     source-of-truth descriptor.
+//!
 //!   * [`ivf`] — IVF v0 container writer (32-byte file header + 12-
 //!     byte per-frame header) for shipping the encoded OBU temporal
 //!     units into a playable file. IVF is a trivial public file
@@ -31,15 +41,20 @@
 //!     matches the `.ivf` fixtures already in `docs/video/av1/
 //!     fixtures/`.
 //!
-//! No frame-header writer, no tile encoder, no coefficient encoder
-//! yet — those are subsequent arcs.
+//! Next arc: §5.3.1 OBU size-field self-counts + §5.3.4
+//! `trailing_bits()` wiring so an OBU framer can wrap a frame-header
+//! payload into a complete `OBU_FRAME_HEADER` unit; §5.9.7
+//! `frame_size_with_refs()` inverse for the inter path; §5.9.24
+//! `read_global_param` signed-subexp inverse for non-IDENTITY refs.
 
 pub mod bitwriter;
+pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
 pub mod sequence_obu;
 
 pub use bitwriter::BitWriter;
+pub use frame_obu::write_frame_header_obu;
 pub use ivf::IvfWriter;
 pub use obu::{ObuExtensionHeader, ObuHeader, ObuWriter};
 pub use sequence_obu::write_sequence_header_obu;

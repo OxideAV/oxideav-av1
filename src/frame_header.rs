@@ -152,6 +152,12 @@ pub const PRIMARY_REF_NONE: u8 = 7;
 /// `allFrames = (1 << NUM_REF_FRAMES) - 1` from §5.9.2.
 const ALL_FRAMES: u8 = 0xff;
 
+/// Public mirror of [`ALL_FRAMES`] (`0xff`), exposed so the encoder
+/// can construct [`FrameHeader`] instances whose `refresh_frame_flags`
+/// matches the §5.9.2 derived value for `SWITCH_FRAME` or
+/// `(KEY_FRAME && show_frame)` headers.
+pub const ALL_FRAMES_PUB: u8 = ALL_FRAMES;
+
 /// `SUPERRES_NUM` (§3): numerator for the super-resolution upscaling
 /// ratio.
 pub const SUPERRES_NUM: u32 = 8;

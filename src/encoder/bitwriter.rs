@@ -21,8 +21,12 @@
 //!     with `0` bits. Used by the §5.3.4 `trailing_bits()` / OBU
 //!     framing.
 //!
-//! `write_uvlc` / `write_su` / `write_ns` will land alongside the
-//! frame-header writer in the next arc.
+//! Additional descriptor inverses landed alongside the frame-header
+//! writer (round 207):
+//!
+//!   * [`BitWriter::write_uvlc`] — inverse of §4.10.3 `uvlc()`.
+//!   * [`BitWriter::write_su`] — inverse of §4.10.6 `su(n)`.
+//!   * [`BitWriter::write_ns`] — inverse of §4.10.7 `ns(n)`.
 
 /// MSB-first bit writer.
 #[derive(Debug, Default, Clone)]
@@ -142,6 +146,84 @@ impl BitWriter {
             n += 1;
         }
         n
+    }
+
+    /// Write a `uvlc()` value per §4.10.3 — the inverse of
+    /// [`crate::bitreader::BitReader::uvlc`].
+    ///
+    /// For value `v < u32::MAX`: encode `leadingZeros =
+    /// floor(log2(v + 1))` zero bits, then a single `1` bit, then
+    /// the low `leadingZeros` bits of `v + 1`. For `v == u32::MAX`:
+    /// emit 32 zero bits + a single `1` (the §4.10.3 sentinel
+    /// short-circuit reads back as `u32::MAX`).
+    pub fn write_uvlc(&mut self, value: u32) {
+        if value == u32::MAX {
+            // §4.10.3 sentinel encoding: 32 zeros + a single '1'.
+            for _ in 0..32 {
+                self.write_bit(0);
+            }
+            self.write_bit(1);
+            return;
+        }
+        let v_plus_one = u64::from(value) + 1;
+        // `floor(log2(v + 1))` — `v_plus_one >= 1` so `leading_zeros < 64`.
+        let leading_zeros = 63 - v_plus_one.leading_zeros();
+        for _ in 0..leading_zeros {
+            self.write_bit(0);
+        }
+        self.write_bit(1);
+        let payload_mask = (1u64 << leading_zeros) - 1;
+        let payload = v_plus_one & payload_mask;
+        self.write_bits(leading_zeros, payload);
+    }
+
+    /// Write a `su(n)` signed value per §4.10.6 — the inverse of
+    /// [`crate::bitreader::BitReader::su`].
+    ///
+    /// Encodes the two's-complement representation of `value` in the
+    /// low `n` bits. `n` must be in `1..=32` and `value` must fit in
+    /// the signed `n`-bit range `-(1 << (n-1))..(1 << (n-1))`.
+    pub fn write_su(&mut self, n: u32, value: i32) {
+        debug_assert!((1..=32).contains(&n), "§4.10.6 su(n) requires 1 <= n <= 32");
+        let half = 1i64 << (n - 1);
+        debug_assert!(
+            i64::from(value) >= -half && i64::from(value) < half,
+            "value out of su({n}) range"
+        );
+        let mask: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let raw = (i64::from(value) as u64) & mask;
+        self.write_bits(n, raw);
+    }
+
+    /// Write an `ns(n)` value per §4.10.7 — the inverse of
+    /// [`crate::bitreader::BitReader::ns`].
+    ///
+    /// `n` must be `>= 1` and `value` must be in `0..n`. The §4.10.7
+    /// rule: `w = FloorLog2(n) + 1`, `m = (1 << w) - n`. Values
+    /// `0..m` are written in `w - 1` bits; the remaining `m..n` are
+    /// recovered by encoding `value + m` in `w` bits.
+    pub fn write_ns(&mut self, n: u32, value: u32) {
+        debug_assert!(n >= 1, "§4.10.7 ns(n) requires n >= 1");
+        debug_assert!(value < n, "ns({n}) value {value} out of range");
+        // `FloorLog2(n) + 1` — for n = 1 this is 1 (w - 1 = 0 bits read).
+        let w = if n == 0 {
+            0
+        } else {
+            32 - (n - 1).leading_zeros()
+        };
+        // `w` is the bit width that covers `n - 1`; matches the reader's
+        // `floor_log2(n) + 1`.
+        let m = (1u32 << w) - n;
+        if value < m {
+            self.write_bits(w - 1, u64::from(value));
+        } else {
+            // §4.10.7: write (value + m) in `w` bits — the reader's
+            // `extra_bit` branch reconstructs `(v << 1) - m + extra_bit`
+            // from `v = f(w - 1)` and `extra_bit = f(1)`, which is the
+            // bit decomposition of `value + m` at width `w`.
+            let coded = value + m;
+            self.write_bits(w, u64::from(coded));
+        }
     }
 
     /// Consume the writer and return the assembled bytes. A
@@ -286,5 +368,79 @@ mod tests {
         let bytes = bw.finish();
         let mut br = crate::bitreader::BitReader::new(&bytes);
         assert_eq!(br.f(64).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    // ---------------------------------------------------------------
+    // §4.10.3 / §4.10.6 / §4.10.7 descriptor inverses
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn uvlc_round_trip_against_reader() {
+        for v in [0u32, 1, 2, 3, 7, 8, 100, 1_000, 65_535, 1_000_000] {
+            let mut bw = BitWriter::new();
+            bw.write_uvlc(v);
+            let bytes = bw.finish();
+            let mut br = crate::bitreader::BitReader::new(&bytes);
+            assert_eq!(br.uvlc().unwrap(), v, "uvlc round-trip mismatch for {v}");
+        }
+    }
+
+    #[test]
+    fn uvlc_sentinel_round_trip() {
+        let mut bw = BitWriter::new();
+        bw.write_uvlc(u32::MAX);
+        let bytes = bw.finish();
+        let mut br = crate::bitreader::BitReader::new(&bytes);
+        assert_eq!(br.uvlc().unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn su_round_trip_through_reader() {
+        // Try a range of (n, value) pairs that the frame-header
+        // sub-procedures hit (loop_filter ref-deltas at su(7),
+        // delta_q at su(7), segmentation feature values at su(7)).
+        let cases = [
+            (7i32, 0i32),
+            (7, 21),
+            (7, -1),
+            (7, -64),
+            (7, 63),
+            (1, 0),
+            (8, -128),
+            (8, 127),
+            (16, -32768),
+            (16, 32767),
+            (32, i32::MIN),
+            (32, i32::MAX),
+        ];
+        for (n, v) in cases {
+            let mut bw = BitWriter::new();
+            bw.write_su(n as u32, v);
+            let bytes = bw.finish();
+            let mut br = crate::bitreader::BitReader::new(&bytes);
+            assert_eq!(br.su(n as u32).unwrap(), v, "su({n}) round-trip {v}");
+        }
+    }
+
+    #[test]
+    fn ns_round_trip_against_reader() {
+        // Walk a few n values that the frame-header writer hits
+        // (tile_info width_in_sbs_minus_1 / height_in_sbs_minus_1).
+        for n in [1u32, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
+            for v in 0..n {
+                let mut bw = BitWriter::new();
+                bw.write_ns(n, v);
+                let bytes = bw.finish();
+                let mut br = crate::bitreader::BitReader::new(&bytes);
+                assert_eq!(br.ns(n).unwrap(), v, "ns({n}) round-trip {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn ns_n_equals_one_writes_no_bits() {
+        let mut bw = BitWriter::new();
+        bw.write_ns(1, 0);
+        assert_eq!(bw.bit_position(), 0);
     }
 }

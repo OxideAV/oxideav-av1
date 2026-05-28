@@ -6,6 +6,64 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 207 — encoder arc 2: `frame_header_obu()` writer.**
+  `encoder::frame_obu::write_frame_header_obu` lands as the encoder
+  counterpart to `crate::frame_header::parse_frame_header`. Takes a
+  fully-populated `FrameHeader` + the active `SequenceHeader` and
+  emits the §5.9.1 `uncompressed_header()` payload bytes the OBU
+  framer should wrap with `obu_type == OBU_FRAME_HEADER`.
+  Sub-procedures covered:
+  * §5.9.2 `uncompressed_header()` — show-existing-frame replay,
+    reduced-still-picture-header, intra (KEY / INTRA_ONLY), and the
+    inter shared-tail (above `disable_frame_end_update_cdf`) for
+    headers where `frame_size_with_refs()` would have bailed.
+  * §5.9.3 `allow_intrabc` gate (`allow_scc && UpscaledWidth ==
+    FrameWidth`).
+  * §5.9.5 `frame_size()` + §5.9.6 `render_size()` + §5.9.8
+    `superres_params()` + §5.9.9 `compute_image_size()`.
+  * §5.9.10 `read_interpolation_filter()` (inter path).
+  * §5.9.11 `loop_filter_params()` (with the `CodedLossless ||
+    allow_intrabc` short-circuit + ref/mode-delta update walks).
+  * §5.9.12 `quantization_params()` + §5.9.13 `read_delta_q()`.
+  * §5.9.14 `segmentation_params()` (with `update_data` feature
+    walk over `MAX_SEGMENTS * SEG_LVL_MAX` slots, signed / unsigned
+    feature bit widths from `SEGMENTATION_FEATURE_BITS[]` and
+    `SEGMENTATION_FEATURE_SIGNED[]`).
+  * §5.9.15 `tile_info()` (uniform + non-uniform paths with the
+    `width_in_sbs_minus_1` / `height_in_sbs_minus_1` `ns(n)` walks).
+  * §5.9.17 `delta_q_params()` + §5.9.18 `delta_lf_params()`.
+  * §5.9.19 `cdef_params()` (with the secondary `4 ⇒ 3` invert of
+    the §5.9.19 `== 3 ⇒ += 1` adjustment).
+  * §5.9.20 `lr_params()` (with the `lr_unit_shift` /
+    `lr_unit_extra_shift` / `lr_uv_shift` bit derivations).
+  * §5.9.21 `read_tx_mode()` (no bits under `CodedLossless`).
+  * §5.9.22 `skip_mode_params()` + §5.9.23 `frame_reference_mode()`
+    intra short-circuits.
+  * §5.9.24 `global_motion_params()` intra short-circuit + inter
+    `IDENTITY`-only emission.
+  * §5.9.30 `film_grain_params()` short-circuit + reset path +
+    fully-populated apply_grain==true path.
+
+  Three new `BitWriter` primitives land alongside: `write_uvlc`
+  (§4.10.3), `write_su` (§4.10.6), `write_ns` (§4.10.7) — the
+  inverses of the parser's existing `uvlc()` / `su(n)` / `ns(n)`
+  descriptor readers.
+
+  +18 tests (1108 → 1126 lib): 5 new primitive round-trips (uvlc,
+  su over a range of n/value pairs, ns over n in 1..=17, ns(1) zero
+  bits) plus 13 frame-header round-trips covering the tiny-i-only
+  fixture (KEY frame, 72 bits exact match), synthetic intra over
+  the same seq, lossless intra (CodedLossless ⇒ all the
+  short-circuit paths fire), QM-enabled, non-zero delta-q offsets,
+  non-trivial CDEF strengths (with the `4`-invert path), LR with
+  Wiener on Y plane, segmentation with active ALT_Q feature, render
+  size different from frame size, loop-filter delta updates,
+  show-existing-frame replay. The §5.9.1 OBU-payload framing
+  (size-field self-counts + trailing bits) and the §5.9.24 inter
+  `read_global_param` signed-subexp inverse are next-arc; the
+  §5.9.31 `temporal_point_info` round-trip is gated by a debug
+  assert that fires the same way the parser refuses to descend.
+
 * **Round 206 — encoder bootstrap (arc 1: bit-output plumbing).**
   New `crate::encoder` module groups three writers covering the
   byte-aligned framing layers above any future coefficient/tile

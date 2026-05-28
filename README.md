@@ -2,6 +2,58 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 207)
+
+Round 207 lands the **`frame_header_obu()` writer** — the encoder
+counterpart to `crate::frame_header::parse_frame_header`. Takes a
+fully-populated `FrameHeader` + the active `SequenceHeader` and emits
+the §5.9.1 `uncompressed_header()` payload that an `OBU_FRAME_HEADER`
+/ `OBU_REDUNDANT_FRAME_HEADER` / `OBU_FRAME` should wrap. Round-trip
+discipline: every encoder output feeds straight into the parser and
+yields a structurally equal `FrameHeader`.
+
+Sub-procedures covered (intra + show-existing-frame + reduced-still
+paths, plus the inter shared tail above `disable_frame_end_update_cdf`
+for headers where `frame_size_with_refs()` would have bailed):
+
+* §5.9.2 `uncompressed_header()` — show-existing / reduced-still /
+  intra (KEY / INTRA_ONLY); inter shared tail.
+* §5.9.3 `allow_intrabc` gate, §5.9.5 `frame_size()` + §5.9.6
+  `render_size()` + §5.9.8 `superres_params()` + §5.9.9
+  `compute_image_size()`.
+* §5.9.10 `read_interpolation_filter()` (inter); §5.9.11
+  `loop_filter_params()` with ref/mode-delta walks; §5.9.12/13
+  `quantization_params()` + `read_delta_q()`.
+* §5.9.14 `segmentation_params()` (full per-segment / per-feature
+  walk including `SEGMENTATION_FEATURE_SIGNED`-gated `su(1+bits)`).
+* §5.9.15 `tile_info()` (uniform + non-uniform); §5.9.17
+  `delta_q_params()` + §5.9.18 `delta_lf_params()`; §5.9.19
+  `cdef_params()` (with the secondary `4⇒3` invert of the spec's
+  `==3 ⇒ +=1`); §5.9.20 `lr_params()` (with the `lr_unit_shift` /
+  `lr_unit_extra_shift` / `lr_uv_shift` bit derivations).
+* §5.9.21 `read_tx_mode()`; §5.9.22/23 `skip_mode_params()` /
+  `frame_reference_mode()` short-circuits; §5.9.24
+  `global_motion_params()` intra short-circuit + inter
+  `IDENTITY`-only emission; §5.9.30 `film_grain_params()` full path.
+
+Three new `BitWriter` primitives land alongside: `write_uvlc`
+(§4.10.3), `write_su(n)` (§4.10.6), `write_ns(n)` (§4.10.7) — the
+inverses of the parser's `BitReader::{uvlc,su,ns}` descriptor readers.
+
+18 new tests (1108 → 1126 lib): 5 primitive round-trips through the
+reader and 13 frame-header round-trips covering the tiny-i-only
+fixture (byte-exact at 72 bits), lossless intra (every short-circuit
+path fires), QM-enabled, non-zero delta-q offsets, non-trivial CDEF
+strengths (with the `4`-invert path), LR with Wiener on Y, active
+ALT_Q segmentation, render-size-different, loop-filter delta updates,
+show-existing-frame replay.
+
+Out of scope this arc (next arc): §5.3.1 OBU size-field self-counts
++ §5.3.4 `trailing_bits()` wiring, §5.9.7 `frame_size_with_refs()`
+inverse for inter frames with overridden size, §5.9.24
+`read_global_param` signed-subexp inverse for non-IDENTITY refs,
+§5.9.31 `temporal_point_info()` round-trip.
+
 ## Status — 2026-05-28 (round 206)
 
 Round 206 opens the **encoder side** of the crate. Arc 1 lands the
