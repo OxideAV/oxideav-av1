@@ -12994,13 +12994,18 @@ pub fn dequant_denom(tx_size: usize) -> i64 {
 ///
 /// ## QM matrix path
 ///
-/// The §9.5.3 `Quantizer_Matrix[15][2][QM_TOTAL_SIZE]` table is not
-/// yet tabulated in this crate. The `using_qmatrix && plane_tx_type
-/// < IDTX && seg_qm_level < 15` arm therefore returns `q` unchanged
-/// (the §7.12.3 `q2 = q` else-arm) and a documented
-/// `using_qmatrix_panic_on_active` debug-only assertion fires if a
-/// caller drives the active-QM branch on a real fixture. Every
-/// fixture in the corpus today uses the `using_qmatrix == 0` path.
+/// When `using_qmatrix == 1 && plane_tx_type < IDTX && seg_qm_level
+/// < 15` the spec replaces `q2 = q` with
+///
+/// ```text
+///   q2 = Round2( q * Quantizer_Matrix[ seg_qm_level ][ plane > 0 ]
+///                       [ Qm_Offset[ tx_size ] + i * tw + j ], 5 )
+/// ```
+///
+/// The full §9.5.3 `Quantizer_Matrix[15][2][3344]` and
+/// `Qm_Offset[TX_SIZES_ALL]` tables live in [`crate::qmatrix`]; this
+/// loop reads them via [`crate::qmatrix::qmatrix_value`]. `Round2`
+/// is the §A.3 integer form `(x + (1 << (n - 1))) >> n`.
 ///
 /// ## Arguments
 ///
@@ -13048,20 +13053,11 @@ pub fn dequantize_step1(
         for j in 0..tw {
             let q = if i == 0 && j == 0 { dc_q_val } else { ac_q_val };
             // §7.12.3 step 1b: `q2 = q` on the no-QM arm; the
-            // QM-active arm would consult `Quantizer_Matrix[...]`
-            // — see the module preamble for the QM table status.
+            // QM-active arm reads §9.5.3 Quantizer_Matrix.
             let q2 = if qm_active {
-                // Fallback to no-QM identity until the §9.5.3
-                // `Quantizer_Matrix[][][]` table lands; a real
-                // QM-active fixture would round-trip incorrectly
-                // here, and a debug_assert! would surface the
-                // miss. The conformant `seg_qm_level == 15` path
-                // already takes the `q2 = q` branch directly.
-                debug_assert!(
-                    false,
-                    "oxideav-av1: dequantize_step1 reached the using_qmatrix && PlaneTxType < IDTX && SegQMLevel < 15 branch; §9.5.3 Quantizer_Matrix table not yet tabulated"
-                );
-                q
+                let qm = crate::qmatrix::qmatrix_value(seg_qm_level, plane, tx_size, i, j) as i64;
+                // Round2( q * qm, 5 ) per §3 p.13: (x + (1<<4)) >> 5.
+                (q * qm + 16) >> 5
             } else {
                 q
             };
@@ -49511,6 +49507,75 @@ mod tests {
         // seg_qm_level == 15 ⇒ no QM (`q2 = q`).
         let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 15, &q);
         assert_eq!(dequant[0], dc_q(8, 50) as i64);
+    }
+
+    /// §7.12.3 step-1b QM-active arm. Level 0 luma DC entry is
+    /// `Quantizer_Matrix[0][0][0] = 32`, so
+    /// `q2 = Round2( q * 32, 5 ) = (q * 32 + 16) >> 5`. For
+    /// `base_q_idx = 50` and `Quant[0] = 1`, the result must match
+    /// the spec's Round2 form.
+    #[test]
+    fn dequantize_step1_qm_active_level0_luma_dc() {
+        let mut q = QuantizerParams::neutral(50, 8);
+        q.using_qmatrix = true;
+        let mut levels = vec![0i32; 16];
+        levels[0] = 1;
+        // seg_qm_level = 0 + PlaneTxType = DCT_DCT < IDTX ⇒ QM-active.
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 0, &q);
+        let dc_q_val = dc_q(8, 50) as i64;
+        // Quantizer_Matrix[0][0][0] = 32.
+        let expected_q2 = (dc_q_val * 32 + 16) >> 5;
+        assert_eq!(dequant[0], expected_q2);
+    }
+
+    /// §7.12.3 step-1b QM-active arm: a chroma-plane lookup uses
+    /// `plane > 0` to select the chroma-class matrix. Level 0 chroma
+    /// 4x4 DC = 35 per spec p.511.
+    #[test]
+    fn dequantize_step1_qm_active_chroma_uses_plane_class_one() {
+        let mut q = QuantizerParams::neutral(60, 8);
+        q.using_qmatrix = true;
+        let mut levels = vec![0i32; 16];
+        levels[0] = 1;
+        let dequant_u = dequantize_step1(&levels, TX_4X4, 1, 0, DCT_DCT, 0, &q);
+        let dequant_v = dequantize_step1(&levels, TX_4X4, 2, 0, DCT_DCT, 0, &q);
+        let dc_q_u = get_dc_quant(&q, 1, 0) as i64;
+        let dc_q_v = get_dc_quant(&q, 2, 0) as i64;
+        // Quantizer_Matrix[0][1][0] = 35 for chroma DC.
+        assert_eq!(dequant_u[0], (dc_q_u * 35 + 16) >> 5);
+        assert_eq!(dequant_v[0], (dc_q_v * 35 + 16) >> 5);
+    }
+
+    /// §7.12.3 step-1b QM-active arm: `plane_tx_type >= IDTX` falls
+    /// through to the identity `q2 = q` branch even when the other
+    /// guards (using_qmatrix && seg_qm_level < 15) hold.
+    #[test]
+    fn dequantize_step1_qm_inactive_when_plane_tx_type_is_idtx() {
+        let mut q = QuantizerParams::neutral(50, 8);
+        q.using_qmatrix = true;
+        let mut levels = vec![0i32; 16];
+        levels[0] = 1;
+        // IDTX guard ⇒ QM short-circuits to `q2 = q`.
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, IDTX, 0, &q);
+        assert_eq!(dequant[0], dc_q(8, 50) as i64);
+    }
+
+    /// §7.12.3 step-1b QM-active arm on an AC bin. Level 0 luma 4x4
+    /// position (0, 1) is 43 per spec p.511, so the AC product uses
+    /// the `q * 43` rounded form.
+    #[test]
+    fn dequantize_step1_qm_active_ac_uses_correct_bin_weight() {
+        let mut q = QuantizerParams::neutral(80, 8);
+        q.using_qmatrix = true;
+        let mut levels = vec![0i32; 16];
+        levels[1] = 2; // first AC at (i=0, j=1).
+        let dequant = dequantize_step1(&levels, TX_4X4, 0, 0, DCT_DCT, 0, &q);
+        let ac_q_val = ac_q(8, 80) as i64;
+        // Quantizer_Matrix[0][0][1] = 43 for luma (0, 1).
+        let q2 = (ac_q_val * 43 + 16) >> 5;
+        let dq = 2 * q2;
+        let expected = (dq.unsigned_abs() & 0xFFFFFF) as i64; // sign = +1
+        assert_eq!(dequant[1], expected);
     }
 
     /// Tx_Type_*_Inv_Set inversion tables match the §5.11.47 spec

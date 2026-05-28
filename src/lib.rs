@@ -1528,6 +1528,7 @@ pub mod inter_pred;
 pub mod loop_filter;
 pub mod loop_restoration;
 pub mod obu;
+pub mod qmatrix;
 pub mod scan;
 pub mod sequence_header;
 pub mod superres;

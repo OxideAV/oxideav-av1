@@ -2,6 +2,45 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 204)
+
+Round 204 lands the **§9.5.3 Quantizer matrix tables** (av1-spec
+p.510-553) and wires them into the §7.12.3 step-1 dequantization
+loop. New `crate::qmatrix` module transcribes the normative
+`Qm_Offset[ TX_SIZES_ALL ]` (p.510, 19 entries including five
+share-with-parent entries: `TX_64X64` / `TX_32X64` / `TX_64X32`
+share `TX_32X32`'s 32×32 region at offset 336; `TX_16X64` /
+`TX_64X16` share `TX_16X32` / `TX_32X16` at offsets 1680 / 2192)
+and the full `Quantizer_Matrix[ 15 ][ 2 ][ QM_TOTAL_SIZE = 3344 ]`
+table (~98 KiB of `.rodata`, all values in u8 range 30..=242,
+indexed by `SegQMLevel[ plane ][ segment_id ]` ∈ `0..=14` × plane
+class `plane > 0 ? 1 : 0` × per-bin offset `Qm_Offset[ txSz ] + i
+* tw + j`). Level 15 short-circuits at the §7.12.3 step-1b guard
+and is not represented. New constants `QM_TOTAL_SIZE = 3344`,
+`QM_LEVELS = 15`, `QM_PLANES = 2`; new helper `qmatrix_value(
+seg_qm_level, plane, tx_size, i, j ) -> u8` with the spec's `tw
+= min(32, Tx_Width[ txSz ])` / `th = min(32, Tx_Height[ txSz ])`
+clamp baked in. The `cdf::dequantize_step1` QM-active arm
+(previously fell through with a `debug_assert!`) now evaluates
+`q2 = Round2( q * Quantizer_Matrix[ ... ], 5 ) = (q * qm + 16)
+>> 5` per §7.12.3 step-1b + §3 p.13 integer Round2. Branch
+guards (`using_qmatrix && PlaneTxType < IDTX && SegQMLevel <
+15`) preserved verbatim. 15 new tests (1104 -> 1119): 10
+qmatrix-module tests (`QM_TOTAL_SIZE` / `QM_LEVELS` / `QM_PLANES`
+constants; `Qm_Offset` literal-match + unique-entry sum = 3344;
+level-0 luma 4×4 first row + bottom-right; level-0 chroma 4×4
+first row + plane=2 mirror; level-14 luma 4×4 first row = 31;
+range invariant 30..=242 across all 100320 cells; every
+TX_SIZES_ALL covered within `tw`/`th` for both plane classes;
+TX_64X64 ↔ TX_32X32 share; TX_16X64 ↔ TX_16X32 and TX_64X16 ↔
+TX_32X16 share; Qm_Offset advance = tw*th invariant on the 14
+unique sizes) plus 4 new cdf-module integration tests for
+`dequantize_step1` (QM-active level-0 luma DC with Round2 form;
+chroma `plane > 0` selector across plane=1 and plane=2; IDTX
+fall-through guard; AC bin uses the right matrix weight).
+`decode_av1` / `encode_av1` continue to return
+`Error::NotImplemented`.
+
 ## Status — 2026-05-28 (round 203)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was

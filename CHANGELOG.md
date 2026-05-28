@@ -6,6 +6,29 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 204 — §9.5.3 Quantizer matrix tables + §7.12.3 step-1b
+  QM-active arm wired.** Transcribes the normative `Qm_Offset[
+  TX_SIZES_ALL ]` (av1-spec p.510) and `Quantizer_Matrix[ 15 ][ 2
+  ][ QM_TOTAL_SIZE = 3344 ]` (p.511-553) tables verbatim into a new
+  `crate::qmatrix` module (~98 KiB of `.rodata`, observed value
+  range 30..=242 fits in u8). Five `Qm_Offset` entries share
+  storage per the §9.5.2 derivation: TX_64X64 / TX_32X64 /
+  TX_64X32 share TX_32X32's 32×32 region (offset 336); TX_16X64
+  shares TX_16X32 (offset 1680); TX_64X16 shares TX_32X16 (offset
+  2192). New constants `QM_TOTAL_SIZE`, `QM_LEVELS = 15` (level 15
+  is the no-QM short-circuit and is not stored), `QM_PLANES = 2`
+  (`0` = luma, `1` = chroma; spec selector `plane > 0`); new helper
+  `qmatrix_value( seg_qm_level, plane, tx_size, i, j ) -> u8` with
+  the spec's `tw = min(32, Tx_Width[ txSz ])` / `th = min(32,
+  Tx_Height[ txSz ])` clamp baked in. The `cdf::dequantize_step1`
+  QM-active arm — previously a `debug_assert!`-guarded
+  fall-through to `q2 = q` — now evaluates `q2 = Round2( q *
+  Quantizer_Matrix[ ... ], 5 ) = (q * qm + 16) >> 5` per §7.12.3
+  step-1b + §3 p.13 integer Round2. The §7.12.3 guards
+  (`using_qmatrix && PlaneTxType < IDTX && SegQMLevel < 15`) are
+  preserved verbatim. +15 lib tests (1041 → 1056), workspace-wide
+  1104 → 1119.
+
 * **Round 203 — §7.11.3.1 OBMC motion-mode arm wired into
   `predict_inter`.** The r194 `PredictInterObmcUnsupported` stub is
   retired in favour of an end-to-end OBMC dispatch: the driver now
