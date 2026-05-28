@@ -1799,11 +1799,12 @@ pub use loop_filter::{
 };
 pub use loop_restoration::{
     count_units_in_frame, derive_block_geometry, get_source_sample, loop_restoration_frame,
-    loop_restore_block, wiener_coefficients, wiener_filter, LoopRestorationFrameContext,
-    LrBlockGeometry, FILTER_BITS as LR_FILTER_BITS, SGRPROJ_MTABLE_BITS, SGRPROJ_PARAMS_BITS,
-    SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K, SGRPROJ_RECIP_BITS, SGRPROJ_RST_BITS, SGRPROJ_SGR_BITS,
-    SGRPROJ_XQD_MAX, SGRPROJ_XQD_MID, SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K,
-    WIENER_TAPS_MAX, WIENER_TAPS_MID, WIENER_TAPS_MIN,
+    loop_restore_block, self_guided_filter, wiener_coefficients, wiener_filter,
+    LoopRestorationFrameContext, LrBlockGeometry, FILTER_BITS as LR_FILTER_BITS,
+    SGRPROJ_MTABLE_BITS, SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K,
+    SGRPROJ_RECIP_BITS, SGRPROJ_RST_BITS, SGRPROJ_SGR_BITS, SGRPROJ_XQD_MAX, SGRPROJ_XQD_MID,
+    SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX, WIENER_TAPS_MID,
+    WIENER_TAPS_MIN,
 };
 pub use uncompressed_header_tail::{
     parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,

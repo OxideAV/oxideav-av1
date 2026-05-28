@@ -2,7 +2,7 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-05-28 (round 197)
+## Status — 2026-05-28 (round 198)
 
 **Clean-room rebuild, round 24.** The crate's prior implementation was
 retired under the workspace clean-room policy: provenance for several
@@ -1586,10 +1586,26 @@ p.327-335. The new `loop_restoration` module exposes:
   `y = max(StripeStartY - 2, y)` (two-line reach); `y > StripeEndY` ⇒
   `UpscaledCurrFrame` with `y = min(StripeEndY + 2, y)`; otherwise ⇒
   `UpscaledCdefFrame`.
+* **§7.17.2 [`self_guided_filter`]** — projection-arm driver: runs
+  the §7.17.3 box filter twice with `(r0, eps0)` and `(r1, eps1)`
+  from `SGR_PARAMS[set]`, then combines the two filtered outputs
+  with weights `(w0, w1)` from `LrSgrXqd` (and derived `w2 = (1 <<
+  SGRPROJ_PRJ_BITS) - w0 - w1`) against `u = UpscaledCdefFrame <<
+  SGRPROJ_RST_BITS`, rounding via `SGRPROJ_RST_BITS +
+  SGRPROJ_PRJ_BITS` and clipping to the sample range. The `r == 0`
+  branch substitutes `u` for `flt` per av1-spec p.330 lines
+  18263-18269.
+* **§7.17.3 box filter** (internal `box_filter` helper) — builds the
+  `A[]/B[]` integral-style tables across `[-1, h + 1] × [-1, w + 1]`
+  via the `(2r + 1)²` sum kernel, applies the `Sgr_Params`-driven
+  `m`-table nonlinearity (`s = ((1 << SGRPROJ_MTABLE_BITS) + n2e/2)
+  / n2e`; piecewise `a2`), and convolves with the §7.17.3 weighted
+  3×3 footprint (pass-0 odd-row-only; pass-1 centre-plus-cross 4 /
+  corner 3).
 * **[`derive_block_geometry`]** — pure-function geometry derivation that
   bundles all §7.17.1 named locals into a single [`LrBlockGeometry`]
-  return value; consumed by both `loop_restore_block` and (next-arc)
-  the self-guided arm.
+  return value; consumed by both `loop_restore_block` and the
+  self-guided arm.
 
 The tables [`WIENER_TAPS_MID`] / [`WIENER_TAPS_MIN`] /
 [`WIENER_TAPS_MAX`] / [`WIENER_TAPS_K`] (`{3,-7,15} / {-5,-23,-17} /
@@ -1605,22 +1621,86 @@ exported. [`count_units_in_frame`] implements the §5.9.20 helper
 `Max((frameSize + (unitSize >> 1)) / unitSize, 1)`.
 
 A small standalone [`LoopRestorationFrameContext`] bundles the §5.5 /
-§5.9.5 / §5.9.20 frame-header fields plus two `&dyn Fn(...)` closures
+§5.9.5 / §5.9.20 frame-header fields plus four `&dyn Fn(...)` closures
 the caller hooks into the §5.11.58 decode state (`lr_type`,
-`lr_wiener`), letting the driver run against synthetic predicates. The
-§5.9.20 [`LrParams`] (r10) and §5.11.58 per-unit reads (next-arc)
-will plug straight into these closures.
+`lr_wiener`, `lr_sgr_set`, `lr_sgr_xqd`), letting the driver run
+against synthetic predicates. The §5.9.20 [`LrParams`] (r10) and
+§5.11.58 per-unit reads will plug straight into these closures.
 
-The §7.17.2 / §7.17.3 self-guided projection arm is **stubbed** for
-this arc: a unit whose `FrameRestorationType` is `RESTORE_SGRPROJ`
-inherits the pre-copied `LrFrame = UpscaledCdefFrame` content (a
-straight pass-through, equivalent to `RESTORE_NONE`). The constant
-tables [`SGR_PARAMS`] / [`SGRPROJ_*_BITS`] / [`SGRPROJ_XQD_*`] are
-already in place; the next arc lands the §7.17.3 box-filter body
-(`A[]/B[]` integral-image accumulator + `Sgr_Params`-driven eps
-scaling) and the §7.17.2 projection combine as a body-only patch.
+Round 198 lands the **§7.17.2 / §7.17.3 self-guided projection arm**
+on top of the r197 driver scaffold. [`self_guided_filter`] reads the
+per-unit `set = LrSgrSet[plane][unitRow][unitCol]` selector + the two
+weights `(w0, w1) = LrSgrXqd[plane][unitRow][unitCol][0..2]`, derives
+`w2 = (1 << SGRPROJ_PRJ_BITS) - w0 - w1` per av1-spec p.330 line
+18255, invokes the new `box_filter` helper twice (with `(r0, eps0) =
+(SGR_PARAMS[set][0], SGR_PARAMS[set][1])` and `(r1, eps1) =
+(SGR_PARAMS[set][2], SGR_PARAMS[set][3])`), then combines the two
+filtered outputs against `u = UpscaledCdefFrame[plane][y + i][x + j]
+<< SGRPROJ_RST_BITS` per the §7.17.2 projection
+`v = w1 * u + w0 * (flt0 or u) + w2 * (flt1 or u)`,
+`Clip1(Round2(v, SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS))`. The `r == 0`
+branch (sets 10..=13 for `r0`; sets 14..=15 for `r1`) substitutes `u`
+for the corresponding `flt` per av1-spec p.330 lines 18263-18269.
 
-Test count: 1040 → 1053 (+13 in lib). New tests (all in
+`box_filter` implements §7.17.3 verbatim: builds the `A[]/B[]`
+tables across the `[-1, h + 1] × [-1, w + 1]` extended neighbourhood
+via the `(2r + 1)²` box-sum kernel, normalises by the `n2e = n² · eps`
+divisor (`s = ((1 << SGRPROJ_MTABLE_BITS) + n2e/2) / n2e`), applies
+the piecewise `a2 ∈ {1, ((z << SGR_BITS) + z/2) / (z + 1), 256}`
+nonlinearity, computes `b2 = ((1 << SGR_BITS) - a2) * b * oneOverN`
+with `oneOverN = ((1 << SGRPROJ_RECIP_BITS) + n/2) / n`, and rounds
+`B = Round2(b2, SGRPROJ_RECIP_BITS)`. The second pass convolves
+`(A, B)` with the §7.17.3 weighted 3×3 footprint: pass-0 uses the
+odd-row `(5, 6, 5, 0, 0, 0)` weights with `shift = 4` on odd
+output rows / `shift = 5` on even rows; pass-1 uses the
+centre-plus-cross `4` / corner `3` weighting with uniform `shift =
+5`. The final `F = Round2(a * u + b, SGR_BITS + shift - RST_BITS)`
+matches av1-spec p.332 line 18383. The 10/12-bit profile widens the
+`bd_shift_{a, b} = 2 * (BitDepth - 8) / (BitDepth - 8)` Round2
+shifts; intermediates that overflow `i32` (the `b2` product reaches
+`2³⁹` at 12-bit) are held in `i64` via a new [`round2_i64`] helper.
+
+Test count: 1053 → 1058 (+5 net in lib; +6 SGR tests minus the
+retired `restore_sgrproj_passes_cdef_through` stub-pass-through
+assertion). New SGR tests (all in `loop_restoration::tests`):
+
+* **`self_guided_uniform_zero_weights_recovers_source`** — `(w0, w1)
+  = (0, 0)` ⇒ `w2 = 128`; on a uniform 222-sample plane the
+  projection `128 * flt1 >> 11` recovers the source within ±1 LSB
+  across the deep interior `[4, 12)²` patch (boundary samples reach
+  through the box-sum's `(2r + 1)²` neighbourhood into the clipped
+  edge).
+* **`self_guided_w2_zero_recovers_source_directly`** — `(w0, w1) =
+  (0, 128)` ⇒ `w2 = 0`; projection collapses to `128 * u`, and the
+  `Round2(., 11)` recovers `cdef` exactly without going through the
+  box-filter nonlinearity.
+* **`self_guided_set_10_r0_zero_uses_u_for_flt0`** —
+  `SGR_PARAMS[10] = [0, 0, 1, 5]` triggers the `r == 0` early-exit;
+  the projection substitutes `u` for `flt0`. With `(w0, w1) = (128,
+  0)` ⇒ `w2 = 0`, the projection becomes `128 * u`, recovering
+  `cdef`.
+* **`self_guided_set_14_r1_zero_uses_u_for_flt1`** — symmetric
+  variant: `SGR_PARAMS[14] = [2, 30, 0, 0]` triggers the `r1 == 0`
+  early-exit and substitutes `u` for `flt1`. `(w0, w1) = (0, 128)`
+  recovers `cdef` exactly.
+* **`box_filter_r0_returns_zeroed_buffer`** — direct test of the
+  helper's `r == 0` exit: returns a zero-filled `h * w` buffer (the
+  caller's projection substitutes `u` for `flt` in that branch, so
+  the zeros are never read on the §7.17.2 path).
+* **`self_guided_clips_to_sample_range`** — pathological weights
+  `(w0, w1) = (-96, 95)` (`Sgrproj_Xqd_Min[0]` / `Sgrproj_Xqd_Max[1]`)
+  with `w2 = 129`; the output sample range stays inside `[0, 255]`
+  for an 8-bit decode, exercising the `Clip1(s)` clamp at av1-spec
+  p.330 line 18271.
+
+The §7.17 dispatcher's `SgrProj` arm now routes to
+[`self_guided_filter`] instead of leaving the pre-copied
+`UpscaledCdefFrame` in place; the §7.17.4 / §7.17.5 / §7.17.6 Wiener
+path is unchanged from r197.
+
+The prior r197 round notes (preserved verbatim for traceability):
+
+Test count: 1040 → 1053 (+13 in lib). r197 tests (all in
 `loop_restoration::tests`):
 
 * **`wiener_taps_tables_match_spec`** — verbatim `[Mid|Min|Max|K]`
@@ -1659,11 +1739,12 @@ Test count: 1040 → 1053 (+13 in lib). New tests (all in
 * **`restore_sgrproj_passes_cdef_through`** — `RESTORE_SGRPROJ` (no-op
   for this arc) ⇒ `LrFrame` holds the pre-copied CDEF content.
 
-The §7.15 CDEF de-ringing pass landed in r196; r197 adds the loop
-restoration pass that runs immediately after, completing the
-`reconstruct ↦ deblock ↦ CDEF ↦ LR` sample-flow (modulo §7.16 superres
-upscaling which decouples `UpscaledCurrFrame` from `CurrFrame`). §7.16
-upscaling, the §7.17.2 / §7.17.3 self-guided arm, and §7.20 film-grain
+The §7.15 CDEF de-ringing pass landed in r196; r197 adds the
+Wiener arm of the loop restoration pass that runs immediately after;
+r198 completes the §7.17.2 / §7.17.3 self-guided projection arm,
+finishing the `reconstruct ↦ deblock ↦ CDEF ↦ LR` sample-flow
+(modulo §7.16 superres upscaling which decouples `UpscaledCurrFrame`
+from `CurrFrame`). §7.16 upscaling and the §7.20 film-grain
 post-pass remain on the roadmap for subsequent arcs. `decode_av1` /
 `encode_av1` continue to return `Error::NotImplemented`.
 

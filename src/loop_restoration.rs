@@ -1,10 +1,11 @@
 //! §7.17 Loop restoration — the post-CDEF restoration pass that sits
 //! **after** the §7.15 CDEF de-ringing pass per av1-spec p.327-335.
 //!
-//! ## Coverage (round 197 — close-out push)
+//! ## Coverage (round 198 — close-out push)
 //!
-//! This module covers the §7.17 loop-restoration top-level driver and
-//! the §7.17.4 Wiener arm end-to-end at the sample-filtering level:
+//! This module covers the §7.17 loop-restoration top-level driver, the
+//! §7.17.4 Wiener arm, and the §7.17.2 / §7.17.3 self-guided
+//! projection arm end-to-end at the sample-filtering level:
 //!
 //! * §7.17 — [`loop_restoration_frame`]: top-level walk over `(y, x)`
 //!   in `MI_SIZE` steps, dispatching per plane / per
@@ -13,6 +14,17 @@
 //!   derives `(unitRow, unitCol, x, y, w, h, StripeStartY, StripeEndY,
 //!   PlaneEndX, PlaneEndY)` and dispatches by `rType` to the Wiener,
 //!   self-guided, or no-op arm.
+//! * §7.17.2 — [`self_guided_filter`]: invokes the §7.17.3 box filter
+//!   twice (`pass = 0` with `(r0, eps0)` and `pass = 1` with
+//!   `(r1, eps1)` from `Sgr_Params[set]`) and combines `flt0` / `flt1`
+//!   with the projection weights `(w0, w1, w2)` against the
+//!   `UpscaledCdefFrame << SGRPROJ_RST_BITS` reference.
+//! * §7.17.3 — [`box_filter`]: builds the `A[]` / `B[]` integral-style
+//!   per-sample mean / variance arrays over a `(2r + 1)²` window with
+//!   the `Sgr_Params[set][pass * 2 + 1]` eps-driven `m`-table
+//!   nonlinearity, then convolves `A` / `B` with the §7.17.3 weighted
+//!   3×3 footprint (pass-0 uses only odd-row neighbours; pass-1 uses
+//!   the centre-plus-cross 4 / corner-3 weighting).
 //! * §7.17.4 — [`wiener_filter`]: 7-tap horizontal × 7-tap vertical
 //!   separable convolution with the §7.11.3.2 `(InterRound0,
 //!   InterRound1)` rounding-shift schedule.
@@ -36,16 +48,6 @@
 //! * [`SGR_PARAMS`] — §7.17.3 `Sgr_Params[16][4]` per av1-spec p.332
 //!   lines 18395-18400. Each `set` row is `(r0, eps0, r1, eps1)`.
 //!
-//! ## Self-guided projection arm
-//!
-//! The §7.17.2 self-guided projection arm is currently stubbed: a unit
-//! whose `FrameRestorationType` is `RESTORE_SGRPROJ` falls through to a
-//! straight `CdefFrame ↦ LrFrame` copy (the same effect as
-//! `RESTORE_NONE`) and the driver returns `Ok(())`. The §7.17.3 box
-//! filter (`A[]/B[]` integral-image accumulator + `Sgr_Params`-driven
-//! eps scaling) lands in the next arc; constant tables already live
-//! here so the next-arc patch is a body-only addition.
-//!
 //! ## Standalone-friendly surface
 //!
 //! Like the §7.14 / §7.15 drivers, the top-level driver takes a small
@@ -55,6 +57,11 @@
 //! * Per-unit `LrType[plane][unitRow][unitCol]` (§5.11.58).
 //! * Per-unit `LrWiener[plane][unitRow][unitCol][pass][i]` (§5.11.58 —
 //!   only consulted when `LrType == RESTORE_WIENER`).
+//! * Per-unit `LrSgrSet[plane][unitRow][unitCol]` (§5.11.58 — only
+//!   consulted when `LrType == RESTORE_SGRPROJ`; the index into
+//!   [`SGR_PARAMS`]).
+//! * Per-unit `LrSgrXqd[plane][unitRow][unitCol][i]` (§5.11.58 —
+//!   `i ∈ {0, 1}`; only consulted when `LrType == RESTORE_SGRPROJ`).
 //! * Per-plane subsampling, bit depth, MI dimensions, plane sizes, and
 //!   the [`crate::LrParams`] schedule.
 //!
@@ -70,8 +77,6 @@
 //!
 //! ## Out-of-scope for this arc
 //!
-//! * §7.17.2 / §7.17.3 self-guided projection filter body — see the
-//!   "self-guided projection arm" note above.
 //! * §7.18 output process — separate pass that runs after loop
 //!   restoration.
 //! * Cross-plane SIMD / cache-friendly batched filtering — the
@@ -216,6 +221,16 @@ pub struct LoopRestorationFrameContext<'a> {
     /// coefficients. Only consulted when the per-unit `LrType` is
     /// `RESTORE_WIENER`.
     pub lr_wiener: &'a dyn Fn(u8, u32, u32, u8, usize) -> i32,
+    /// `LrSgrSet[plane][unitRow][unitCol]` per §5.11.58 — index in
+    /// `[0, 16)` into [`SGR_PARAMS`]. Only consulted when the per-unit
+    /// `LrType` is `RESTORE_SGRPROJ`.
+    pub lr_sgr_set: &'a dyn Fn(u8, u32, u32) -> u8,
+    /// `LrSgrXqd[plane][unitRow][unitCol][i]` per §5.11.58 —
+    /// `i ∈ {0, 1}` selects one of the two transmitted self-guided
+    /// projection weights (`w0` / `w1`); `w2` is derived as
+    /// `(1 << SGRPROJ_PRJ_BITS) - w0 - w1`. Only consulted when the
+    /// per-unit `LrType` is `RESTORE_SGRPROJ`.
+    pub lr_sgr_xqd: &'a dyn Fn(u8, u32, u32, usize) -> i32,
 }
 
 impl std::fmt::Debug for LoopRestorationFrameContext<'_> {
@@ -432,9 +447,7 @@ pub fn loop_restore_block(
             wiener_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, &geom);
         }
         FrameRestorationType::SgrProj => {
-            // §7.17.2 self-guided projection arm is stubbed: leave the
-            // pre-copied `LrFrame = UpscaledCdefFrame` content alone.
-            // The next-arc patch lands the box-filter body here.
+            self_guided_filter(ctx, curr_planes, cdef_planes, lr_planes, plane, &geom);
         }
         FrameRestorationType::None | FrameRestorationType::Switchable => {
             // RESTORE_NONE — `LrFrame` already holds `UpscaledCdefFrame`
@@ -444,6 +457,275 @@ pub fn loop_restore_block(
             // conformant decode but kept exhaustive.
         }
     }
+}
+
+// =====================================================================
+// §7.17.2 Self-guided filter — av1-spec p.330 lines 18218-18273.
+// §7.17.3 Box filter      — av1-spec p.331-332 lines 18277-18389.
+// =====================================================================
+
+/// §7.17.2 self-guided projection filter — av1-spec p.330 lines
+/// 18218-18273.
+///
+/// Reads the per-unit selector `set = LrSgrSet[plane][unitRow][unitCol]`
+/// and the two projection weights
+/// `(w0, w1) = LrSgrXqd[plane][unitRow][unitCol][0..2]`. Runs the
+/// §7.17.3 box filter twice — once with `(r0, eps0) =
+/// (Sgr_Params[set][0], Sgr_Params[set][1])` (`pass = 0`) and once with
+/// `(r1, eps1) = (Sgr_Params[set][2], Sgr_Params[set][3])`
+/// (`pass = 1`) — then combines `flt0[i][j]` / `flt1[i][j]` against
+/// `u = UpscaledCdefFrame[plane][y + i][x + j] << SGRPROJ_RST_BITS`
+/// per the spec's `(w0, w1, w2)` projection:
+/// `v = w1 * u + w0 * (flt0 or u) + w2 * (flt1 or u)`,
+/// `s = Round2(v, SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS)`,
+/// `LrFrame[plane][y + i][x + j] = Clip1(s)`.
+///
+/// `w2` is derived as `(1 << SGRPROJ_PRJ_BITS) - w0 - w1` per av1-spec
+/// p.330 line 18255.
+pub fn self_guided_filter(
+    ctx: &LoopRestorationFrameContext<'_>,
+    curr_planes: &[PlaneBuffer<'_>],
+    cdef_planes: &[PlaneBuffer<'_>],
+    lr_planes: &mut [PlaneBuffer<'_>],
+    plane: u8,
+    geom: &LrBlockGeometry,
+) {
+    if geom.w == 0 || geom.h == 0 {
+        return;
+    }
+    // av1-spec p.330 line 18231: set = LrSgrSet[plane][unitRow][unitCol].
+    let set = (ctx.lr_sgr_set)(plane, geom.unit_row, geom.unit_col) as usize;
+    let set = set.min(SGR_PARAMS.len() - 1);
+    let r0 = SGR_PARAMS[set][0];
+    let eps0 = SGR_PARAMS[set][1];
+    let r1 = SGR_PARAMS[set][2];
+    let eps1 = SGR_PARAMS[set][3];
+    // av1-spec p.330 lines 18253-18255: w0 / w1 read, w2 = (1 << PRJ) -
+    // w0 - w1.
+    let w0 = (ctx.lr_sgr_xqd)(plane, geom.unit_row, geom.unit_col, 0);
+    let w1 = (ctx.lr_sgr_xqd)(plane, geom.unit_row, geom.unit_col, 1);
+    let w2 = (1i32 << SGRPROJ_PRJ_BITS) - w0 - w1;
+    // av1-spec p.330 lines 18233-18241: box_filter twice, with the
+    // per-pass `(r, eps)` from Sgr_Params[set].
+    let flt0 = box_filter(
+        curr_planes,
+        cdef_planes,
+        plane,
+        geom,
+        ctx.bit_depth,
+        r0,
+        eps0,
+        0,
+    );
+    let flt1 = box_filter(
+        curr_planes,
+        cdef_planes,
+        plane,
+        geom,
+        ctx.bit_depth,
+        r1,
+        eps1,
+        1,
+    );
+    // av1-spec p.330 lines 18258-18272: per-sample projection.
+    let h = geom.h as usize;
+    let w = geom.w as usize;
+    let bit_depth = ctx.bit_depth as i32;
+    let max_sample = (1i32 << bit_depth) - 1;
+    let shift = SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS;
+    let Some(lr) = lr_planes.get_mut(plane as usize) else {
+        return;
+    };
+    let lr_rows = lr.rows as i32;
+    let lr_cols = lr.cols as i32;
+    let lr_cols_usize = lr.cols as usize;
+    let Some(cdef) = cdef_planes.get(plane as usize) else {
+        return;
+    };
+    let cdef_rows = cdef.rows as i32;
+    let cdef_cols = cdef.cols as i32;
+    let cdef_cols_usize = cdef.cols as usize;
+    for i in 0..h {
+        for j in 0..w {
+            let py = geom.y as i32 + i as i32;
+            let px = geom.x as i32 + j as i32;
+            // av1-spec p.330 line 18260: u = CDEF[y + i][x + j] << RST_BITS.
+            let u = if py >= 0 && py < cdef_rows && px >= 0 && px < cdef_cols {
+                cdef.samples[(py as usize) * cdef_cols_usize + px as usize] << SGRPROJ_RST_BITS
+            } else {
+                0
+            };
+            // av1-spec p.330 lines 18261-18269: v = w1 * u + w0 * (...) +
+            // w2 * (...).
+            let mut v = w1 * u;
+            if r0 != 0 {
+                v += w0 * flt0[i * w + j];
+            } else {
+                v += w0 * u;
+            }
+            if r1 != 0 {
+                v += w2 * flt1[i * w + j];
+            } else {
+                v += w2 * u;
+            }
+            // av1-spec p.330 lines 18270-18271: Round2 + Clip1.
+            let s = round2_i32(v, shift);
+            let out = clip3(0, max_sample, s);
+            if py >= 0 && py < lr_rows && px >= 0 && px < lr_cols {
+                lr.samples[(py as usize) * lr_cols_usize + px as usize] = out;
+            }
+        }
+    }
+}
+
+/// §7.17.3 box filter process — av1-spec p.331-332 lines 18277-18389.
+///
+/// Builds the per-sample `(A, B)` tables across the `[-1, h + 1] ×
+/// [-1, w + 1]` extended neighbourhood via the `(2r + 1)²` box-sum
+/// kernel, then convolves them with the §7.17.3 weighted 3×3 footprint
+/// (pass-0 uses odd-row neighbours only with `(5, 6, 5, 0, 0, 0)` row
+/// weights; pass-1 uses the centre-plus-cross 4 / corner-3 footprint).
+///
+/// When `r == 0` the output buffer is returned filled with zeros — the
+/// §7.17.2 caller substitutes `u` for `flt` in that case (so the
+/// returned zeros are never read), matching the spec's "If r is equal
+/// to 0, then this process immediately terminates" guard at line 18294.
+#[allow(clippy::too_many_arguments)]
+fn box_filter(
+    curr_planes: &[PlaneBuffer<'_>],
+    cdef_planes: &[PlaneBuffer<'_>],
+    plane: u8,
+    geom: &LrBlockGeometry,
+    bit_depth: u8,
+    r: i32,
+    eps: i32,
+    pass: u8,
+) -> Vec<i32> {
+    let h = geom.h as usize;
+    let w = geom.w as usize;
+    let mut f = vec![0i32; h * w];
+    // av1-spec p.331 line 18294: r == 0 ⇒ early-terminate (caller uses u
+    // in place of flt, so the zero-filled buffer is a safe sentinel).
+    if r == 0 {
+        return f;
+    }
+    // av1-spec p.332 lines 18309-18311: n = (2r + 1)²; n2e = n²·eps;
+    // s = ((1 << MTABLE) + n2e/2) / n2e.
+    let n = (2 * r + 1) * (2 * r + 1);
+    let n2e = (n as i64) * (n as i64) * (eps as i64);
+    let s_div: i64 = ((1i64 << SGRPROJ_MTABLE_BITS) + n2e / 2) / n2e.max(1);
+    // av1-spec p.332 line 18333: oneOverN = ((1 << RECIP_BITS) + n/2) / n.
+    let one_over_n = ((1i32 << SGRPROJ_RECIP_BITS) + n / 2) / n;
+    // A / B span [-1, h + 1] × [-1, w + 1] per av1-spec p.331 line 18298.
+    let aw = w + 2;
+    let ah = h + 2;
+    let mut a_arr = vec![0i32; ah * aw];
+    let mut b_arr = vec![0i32; ah * aw];
+    let bd_shift_a = 2 * (bit_depth as i32 - 8).max(0);
+    let bd_shift_b = (bit_depth as i32 - 8).max(0);
+    // av1-spec p.332 lines 18312-18338: build (A, B) per (i, j).
+    for i in -1..=(h as i32) {
+        for j in -1..=(w as i32) {
+            let mut a_acc: i64 = 0;
+            let mut b_acc: i64 = 0;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let sx = geom.x as i32 + j + dx;
+                    let sy = geom.y as i32 + i + dy;
+                    let c = get_source_sample(curr_planes, cdef_planes, plane, sx, sy, geom) as i64;
+                    a_acc += c * c;
+                    b_acc += c;
+                }
+            }
+            // av1-spec p.332 lines 18323-18324: Round2 by bit-depth shift.
+            let a_r = round2_i64(a_acc, bd_shift_a as u32) as i32;
+            let d_r = round2_i64(b_acc, bd_shift_b as u32) as i32;
+            // av1-spec p.332 line 18325: p = Max(0, a * n - d * d).
+            let p = ((a_r as i64) * (n as i64) - (d_r as i64) * (d_r as i64)).max(0);
+            // av1-spec p.332 line 18326: z = Round2(p * s, MTABLE_BITS).
+            let z = round2_i64(p.saturating_mul(s_div), SGRPROJ_MTABLE_BITS) as i32;
+            // av1-spec p.332 lines 18327-18332: piecewise a2.
+            let a2 = if z >= 255 {
+                256
+            } else if z == 0 {
+                1
+            } else {
+                ((z << SGRPROJ_SGR_BITS) + (z / 2)) / (z + 1)
+            };
+            // av1-spec p.332 line 18334: b2 = ((1 << SGR_BITS) - a2) *
+            //                                 b * oneOverN. The §7.17.3
+            // spec's `b` is the post-Round2 scalar `d`, not the raw
+            // accumulator — we clamp into [-i32::MAX, i32::MAX] for the
+            // 10/12-bit profiles before the `i64` multiply.
+            let b_eff = b_acc.clamp(i32::MIN as i64, i32::MAX as i64);
+            let b2 = i64::from((1i32 << SGRPROJ_SGR_BITS) - a2) * b_eff * i64::from(one_over_n);
+            // Store at offset (i + 1, j + 1) inside [0, ah) × [0, aw).
+            let ai = (i + 1) as usize;
+            let aj = (j + 1) as usize;
+            a_arr[ai * aw + aj] = a2;
+            b_arr[ai * aw + aj] = round2_i64(b2, SGRPROJ_RECIP_BITS) as i32;
+        }
+    }
+    // av1-spec p.332 lines 18359-18385: F[i][j] from weighted 3×3 of
+    // (A, B) and the centre `u = UpscaledCdefFrame[plane][y + i][x + j]`.
+    let Some(cdef) = cdef_planes.get(plane as usize) else {
+        return f;
+    };
+    let cdef_rows = cdef.rows as i32;
+    let cdef_cols = cdef.cols as i32;
+    let cdef_cols_usize = cdef.cols as usize;
+    for i in 0..h {
+        // av1-spec p.332 lines 18360-18362: shift = 5 by default, 4 on
+        // odd rows when pass == 0.
+        let shift = if pass == 0 && (i & 1) == 1 {
+            4u32
+        } else {
+            5u32
+        };
+        for j in 0..w {
+            let mut a_sum: i64 = 0;
+            let mut b_sum: i64 = 0;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    // av1-spec p.332 lines 18369-18377: per-pass weights.
+                    let weight: i32 = if pass == 0 {
+                        let i_dy = i as i32 + dy;
+                        if (i_dy & 1) != 0 {
+                            if dx == 0 {
+                                6
+                            } else {
+                                5
+                            }
+                        } else {
+                            0
+                        }
+                    } else if dx == 0 || dy == 0 {
+                        4
+                    } else {
+                        3
+                    };
+                    let ai = ((i as i32) + dy + 1) as usize;
+                    let aj = ((j as i32) + dx + 1) as usize;
+                    a_sum += (weight as i64) * (a_arr[ai * aw + aj] as i64);
+                    b_sum += (weight as i64) * (b_arr[ai * aw + aj] as i64);
+                }
+            }
+            // av1-spec p.332 line 18382: v = a * UpscaledCdefFrame[..] + b.
+            let py = geom.y as i32 + i as i32;
+            let px = geom.x as i32 + j as i32;
+            let u = if py >= 0 && py < cdef_rows && px >= 0 && px < cdef_cols {
+                cdef.samples[(py as usize) * cdef_cols_usize + px as usize] as i64
+            } else {
+                0
+            };
+            let v = a_sum * u + b_sum;
+            // av1-spec p.332 line 18383: F = Round2(v, SGR_BITS + shift -
+            //                                            RST_BITS).
+            let total_shift = SGRPROJ_SGR_BITS + shift - SGRPROJ_RST_BITS;
+            f[i * w + j] = round2_i64(v, total_shift) as i32;
+        }
+    }
+    f
 }
 
 // =====================================================================
@@ -653,6 +935,18 @@ fn round2_i32(x: i32, n: u32) -> i32 {
     }
 }
 
+/// `Round2(x, n)` over `i64` — needed by the §7.17.3 box filter where
+/// `a * n - d * d` and `b2` intermediates exceed the `i32` range at
+/// the 10/12-bit profiles.
+#[inline]
+fn round2_i64(x: i64, n: u32) -> i64 {
+    if n == 0 {
+        x
+    } else {
+        (x + (1i64 << (n - 1))) >> n
+    }
+}
+
 /// §3 `Clip3(a, b, x)` — clamp `x` to `[a, b]`.
 #[inline]
 fn clip3(a: i32, b: i32, x: i32) -> i32 {
@@ -820,6 +1114,8 @@ mod tests {
             lr_params: &params,
             lr_type: &|_, _, _| FrameRestorationType::None,
             lr_wiener: &|_, _, _, _, _| 0,
+            lr_sgr_set: &|_, _, _| 0,
+            lr_sgr_xqd: &|_, _, _, _| 0,
         };
         loop_restoration_frame(
             &ctx,
@@ -868,6 +1164,8 @@ mod tests {
             lr_params: &params,
             lr_type: &|_, _, _| FrameRestorationType::None,
             lr_wiener: &|_, _, _, _, _| 0,
+            lr_sgr_set: &|_, _, _| 0,
+            lr_sgr_xqd: &|_, _, _, _| 0,
         };
         loop_restoration_frame(
             &ctx,
@@ -918,6 +1216,8 @@ mod tests {
             lr_params: &params,
             lr_type: &|_, _, _| FrameRestorationType::Wiener,
             lr_wiener: &|_, _, _, _, _| 0,
+            lr_sgr_set: &|_, _, _| 0,
+            lr_sgr_xqd: &|_, _, _, _| 0,
         };
         loop_restoration_frame(
             &ctx,
@@ -1067,6 +1367,8 @@ mod tests {
             lr_params: &params,
             lr_type: &|_, _, _| FrameRestorationType::None,
             lr_wiener: &|_, _, _, _, _| 0,
+            lr_sgr_set: &|_, _, _| 0,
+            lr_sgr_xqd: &|_, _, _, _| 0,
         };
         let geom = derive_block_geometry(&ctx, 0, 0, 0);
         assert_eq!(geom.unit_row, 0);
@@ -1084,9 +1386,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_sgrproj_passes_cdef_through() {
-        // Self-guided arm is stubbed for this arc; expect LrFrame to
-        // hold UpscaledCdefFrame after the driver returns.
+    fn self_guided_uniform_zero_weights_recovers_source() {
+        // Per av1-spec p.330 lines 18260-18271: when w0 == w1 == 0 (so
+        // w2 = 128) and both r0 / r1 are non-zero, the projection is
+        // v = 128 * flt1. On a uniform plane the box-filter output
+        // closely tracks `u = cdef << RST_BITS` (variance term zeroes
+        // to a == 1, so the convolution is dominated by `b ≈ u`), and
+        // `Round2(128 * flt1, 11)` recovers the original sample (modulo
+        // sub-LSB rounding noise — accepted within ±1 here).
         let mut curr = make_plane(16, 16, 50);
         let mut cdef = make_plane(16, 16, 222);
         let mut lr = make_plane(16, 16, 0);
@@ -1119,6 +1426,10 @@ mod tests {
             lr_params: &params,
             lr_type: &|_, _, _| FrameRestorationType::SgrProj,
             lr_wiener: &|_, _, _, _, _| 0,
+            // set 0 ⇒ (r0, eps0, r1, eps1) = (2, 12, 1, 4).
+            lr_sgr_set: &|_, _, _| 0,
+            // w0 = w1 = 0 ⇒ w2 = 128.
+            lr_sgr_xqd: &|_, _, _, _| 0,
         };
         loop_restoration_frame(
             &ctx,
@@ -1126,6 +1437,268 @@ mod tests {
             std::slice::from_ref(&cdef_buf),
             std::slice::from_mut(&mut lr_buf),
         );
-        assert!(lr_buf.samples.iter().all(|&v| v == 222));
+        // Spot-check the deep interior so we avoid the boundary-fetch
+        // path where the box-sum sees clipped neighbours.
+        for y in 4..12 {
+            for x in 4..12 {
+                let v = lr_buf.samples[y * 16 + x];
+                assert!((v - 222).abs() <= 1, "lr[{y},{x}] = {v} (expected ≈ 222)");
+            }
+        }
+    }
+
+    #[test]
+    fn self_guided_w2_zero_recovers_source_directly() {
+        // w0 = 0, w1 = 128 ⇒ w2 = 0; projection reduces to
+        // v = 128 * u = 128 * (cdef << 4). Round2(., 11) collapses to
+        // (cdef << 4) >> 4 = cdef. Recovers the source exactly without
+        // running through the box filter's nonlinearity.
+        let mut curr = make_plane(16, 16, 0);
+        let mut cdef = make_plane(16, 16, 137);
+        let mut lr = make_plane(16, 16, 0);
+        let curr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut curr,
+        };
+        let cdef_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut cdef,
+        };
+        let mut lr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut lr,
+        };
+        let mut params = make_lr_params(true, [RESTORATION_TILESIZE_MAX; 3]);
+        params.frame_restoration_type[0] = FrameRestorationType::SgrProj;
+        let ctx = LoopRestorationFrameContext {
+            mi_rows: 4,
+            mi_cols: 4,
+            num_planes: 1,
+            bit_depth: 8,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_height: 16,
+            upscaled_width: 16,
+            lr_params: &params,
+            lr_type: &|_, _, _| FrameRestorationType::SgrProj,
+            lr_wiener: &|_, _, _, _, _| 0,
+            lr_sgr_set: &|_, _, _| 0,
+            lr_sgr_xqd: &|_, _, _, i| if i == 1 { 128 } else { 0 },
+        };
+        loop_restoration_frame(
+            &ctx,
+            std::slice::from_ref(&curr_buf),
+            std::slice::from_ref(&cdef_buf),
+            std::slice::from_mut(&mut lr_buf),
+        );
+        for &v in lr_buf.samples.iter() {
+            assert_eq!(v, 137);
+        }
+    }
+
+    #[test]
+    fn self_guided_set_10_r0_zero_uses_u_for_flt0() {
+        // SGR_PARAMS[10] = [0, 0, 1, 5] ⇒ r0 == 0. Per av1-spec p.330
+        // line 18263-18264, the projection substitutes `u` for `flt0`.
+        // With w0 = 128, w1 = 0 (⇒ w2 = 0), the projection becomes
+        // v = 0 * u + 128 * u + 0 * flt1 = 128 * u, recovering `cdef`.
+        let mut curr = make_plane(16, 16, 0);
+        let mut cdef = make_plane(16, 16, 200);
+        let mut lr = make_plane(16, 16, 0);
+        let curr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut curr,
+        };
+        let cdef_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut cdef,
+        };
+        let mut lr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut lr,
+        };
+        let mut params = make_lr_params(true, [RESTORATION_TILESIZE_MAX; 3]);
+        params.frame_restoration_type[0] = FrameRestorationType::SgrProj;
+        let ctx = LoopRestorationFrameContext {
+            mi_rows: 4,
+            mi_cols: 4,
+            num_planes: 1,
+            bit_depth: 8,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_height: 16,
+            upscaled_width: 16,
+            lr_params: &params,
+            lr_type: &|_, _, _| FrameRestorationType::SgrProj,
+            lr_wiener: &|_, _, _, _, _| 0,
+            // SGR_PARAMS[10] = (r0=0, eps0=0, r1=1, eps1=5).
+            lr_sgr_set: &|_, _, _| 10,
+            lr_sgr_xqd: &|_, _, _, i| if i == 0 { 128 } else { 0 },
+        };
+        loop_restoration_frame(
+            &ctx,
+            std::slice::from_ref(&curr_buf),
+            std::slice::from_ref(&cdef_buf),
+            std::slice::from_mut(&mut lr_buf),
+        );
+        for &v in lr_buf.samples.iter() {
+            assert_eq!(v, 200);
+        }
+    }
+
+    #[test]
+    fn self_guided_set_14_r1_zero_uses_u_for_flt1() {
+        // SGR_PARAMS[14] = [2, 30, 0, 0] ⇒ r1 == 0. Symmetric to the
+        // r0 == 0 case: the projection substitutes `u` for `flt1`.
+        // With w0 = 0, w1 = 128 (⇒ w2 = 0), v = 128 * u recovers cdef.
+        let mut curr = make_plane(16, 16, 0);
+        let mut cdef = make_plane(16, 16, 88);
+        let mut lr = make_plane(16, 16, 0);
+        let curr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut curr,
+        };
+        let cdef_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut cdef,
+        };
+        let mut lr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut lr,
+        };
+        let mut params = make_lr_params(true, [RESTORATION_TILESIZE_MAX; 3]);
+        params.frame_restoration_type[0] = FrameRestorationType::SgrProj;
+        let ctx = LoopRestorationFrameContext {
+            mi_rows: 4,
+            mi_cols: 4,
+            num_planes: 1,
+            bit_depth: 8,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_height: 16,
+            upscaled_width: 16,
+            lr_params: &params,
+            lr_type: &|_, _, _| FrameRestorationType::SgrProj,
+            lr_wiener: &|_, _, _, _, _| 0,
+            // SGR_PARAMS[14] = (r0=2, eps0=30, r1=0, eps1=0).
+            lr_sgr_set: &|_, _, _| 14,
+            lr_sgr_xqd: &|_, _, _, i| if i == 1 { 128 } else { 0 },
+        };
+        loop_restoration_frame(
+            &ctx,
+            std::slice::from_ref(&curr_buf),
+            std::slice::from_ref(&cdef_buf),
+            std::slice::from_mut(&mut lr_buf),
+        );
+        for &v in lr_buf.samples.iter() {
+            assert_eq!(v, 88);
+        }
+    }
+
+    #[test]
+    fn box_filter_r0_returns_zeroed_buffer() {
+        // av1-spec p.331 line 18294: r == 0 ⇒ box_filter terminates
+        // immediately. We surface that by returning a zero-filled
+        // buffer of the requested (h * w) extent — the §7.17.2 caller
+        // substitutes `u` for `flt` when r == 0, so the zeros are
+        // never read on the projection path.
+        let mut curr = make_plane(8, 8, 0);
+        let mut cdef = make_plane(8, 8, 100);
+        let curr_buf = PlaneBuffer {
+            rows: 8,
+            cols: 8,
+            samples: &mut curr,
+        };
+        let cdef_buf = PlaneBuffer {
+            rows: 8,
+            cols: 8,
+            samples: &mut cdef,
+        };
+        let geom = LrBlockGeometry {
+            unit_row: 0,
+            unit_col: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            stripe_start_y: -8,
+            stripe_end_y: 55,
+            plane_end_x: 7,
+            plane_end_y: 7,
+        };
+        let out = box_filter(
+            std::slice::from_ref(&curr_buf),
+            std::slice::from_ref(&cdef_buf),
+            0,
+            &geom,
+            8,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(out.len(), 16);
+        assert!(out.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn self_guided_clips_to_sample_range() {
+        // The projection result is `Clip1(s)` per av1-spec p.330 line
+        // 18271 — for 8-bit decode that's `[0, 255]`. Set up a
+        // pathological w1 = 95 (max) + w0 = -96 (min) ⇒ w2 = 129. The
+        // projection should still emerge inside `[0, 255]` for any
+        // uniform input.
+        let mut curr = make_plane(16, 16, 0);
+        let mut cdef = make_plane(16, 16, 128);
+        let mut lr = make_plane(16, 16, 0);
+        let curr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut curr,
+        };
+        let cdef_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut cdef,
+        };
+        let mut lr_buf = PlaneBuffer {
+            rows: 16,
+            cols: 16,
+            samples: &mut lr,
+        };
+        let mut params = make_lr_params(true, [RESTORATION_TILESIZE_MAX; 3]);
+        params.frame_restoration_type[0] = FrameRestorationType::SgrProj;
+        let ctx = LoopRestorationFrameContext {
+            mi_rows: 4,
+            mi_cols: 4,
+            num_planes: 1,
+            bit_depth: 8,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_height: 16,
+            upscaled_width: 16,
+            lr_params: &params,
+            lr_type: &|_, _, _| FrameRestorationType::SgrProj,
+            lr_wiener: &|_, _, _, _, _| 0,
+            lr_sgr_set: &|_, _, _| 0,
+            lr_sgr_xqd: &|_, _, _, i| if i == 0 { -96 } else { 95 },
+        };
+        loop_restoration_frame(
+            &ctx,
+            std::slice::from_ref(&curr_buf),
+            std::slice::from_ref(&cdef_buf),
+            std::slice::from_mut(&mut lr_buf),
+        );
+        for &v in lr_buf.samples.iter() {
+            assert!((0..=255).contains(&v), "lr sample {v} escapes [0, 255]");
+        }
     }
 }

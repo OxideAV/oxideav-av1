@@ -6,6 +6,61 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 198 — §7.17.2 / §7.17.3 self-guided projection arm.**
+  Completes the §7.17 loop-restoration layer that landed in r197
+  (driver + Wiener arm) by implementing the previously-stubbed
+  self-guided projection path. New public `self_guided_filter`
+  reads the per-unit `set = LrSgrSet[plane][unitRow][unitCol]` and
+  weights `(w0, w1) = LrSgrXqd[plane][unitRow][unitCol][0..2]` (two
+  new `&dyn Fn(...)` closures on `LoopRestorationFrameContext`:
+  `lr_sgr_set`, `lr_sgr_xqd`), invokes the new internal `box_filter`
+  helper twice with `(r0, eps0)` / `(r1, eps1)` from
+  `SGR_PARAMS[set]`, and combines the two outputs against
+  `u = UpscaledCdefFrame[plane][y + i][x + j] << SGRPROJ_RST_BITS`
+  per the §7.17.2 projection `v = w1 * u + w0 * (flt0 or u) + w2 *
+  (flt1 or u)`, `w2 = (1 << SGRPROJ_PRJ_BITS) - w0 - w1`,
+  `LrFrame = Clip1(Round2(v, SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS))`
+  per av1-spec p.330 lines 18253-18272. `box_filter` implements
+  §7.17.3 verbatim (p.331-332 lines 18277-18389): builds `A[]/B[]`
+  across `[-1, h + 1] × [-1, w + 1]` via the `(2r + 1)²` box-sum
+  kernel, normalises by `n2e = n² · eps`, applies the piecewise
+  `a2 ∈ {1, ((z << SGR_BITS) + z/2) / (z + 1), 256}` nonlinearity,
+  computes `b2 = ((1 << SGR_BITS) - a2) * b * oneOverN`,
+  `B = Round2(b2, SGRPROJ_RECIP_BITS)`, and the second pass
+  convolves `(A, B)` with the §7.17.3 weighted 3×3 footprint
+  (pass-0 odd-row-only `(5, 6, 5, 0, 0, 0)`; pass-1
+  centre-plus-cross 4 / corner 3). The 10/12-bit profile widens
+  the `2 * (BitDepth - 8)` / `(BitDepth - 8)` Round2 shifts;
+  `i32`-overflowing intermediates use a new internal `round2_i64`
+  helper. The `r == 0` early-exit branch (sets 10..=13 for `r0`,
+  sets 14..=15 for `r1`) substitutes `u` for the corresponding
+  `flt`. `loop_restore_block`'s `SgrProj` arm now routes to
+  `self_guided_filter` instead of leaving the pre-copied
+  `UpscaledCdefFrame` content. Test count 1053 → 1058 (+5 net in
+  lib; +6 new SGR tests minus the retired
+  `restore_sgrproj_passes_cdef_through` stub-pass-through
+  assertion).
+* **Round 197 — §7.17 loop restoration — driver + Wiener arm +
+  §7.17.5 coefficient reconstruction + §7.17.6 stripe-aware source
+  fetch.** New `loop_restoration` module exposes the §7.17 top-level
+  driver (`loop_restoration_frame` walking the frame in `MI_SIZE`
+  steps), the §7.17.1 per-block driver (`loop_restore_block` deriving
+  `(unitRow, unitCol, x, y, w, h, StripeStartY, StripeEndY,
+  PlaneEndX, PlaneEndY)`), the §7.17.4 Wiener arm
+  (`wiener_filter` — two-pass separable 7-tap convolution with the
+  §7.11.3.2 `(InterRound0, InterRound1)` rounding shifts), the
+  §7.17.5 coefficient reconstruction (`wiener_coefficients` — DC-gain
+  128 constraint), and the §7.17.6 stripe-aware source fetch
+  (`get_source_sample` — routes inside-stripe reads to
+  `UpscaledCdefFrame` and out-of-stripe to `UpscaledCurrFrame` with
+  the cropped `StripeStartY - 2` / `StripeEndY + 2` neighbour-line
+  reach). Constant tables `WIENER_TAPS_{MID,MIN,MAX,K}`,
+  `SGRPROJ_XQD_{MID,MIN,MAX}`, `SGR_PARAMS[16][4]`, and the bit-
+  precision constants `SGRPROJ_{PARAMS,PRJ,RST,MTABLE,RECIP,SGR}_BITS`
+  are transcribed verbatim from av1-spec p.74 / p.107 / p.332. The
+  §7.17.2 / §7.17.3 self-guided projection arm was stubbed at this
+  round (`RESTORE_SGRPROJ` ⇒ pre-copied `UpscaledCdefFrame`); r198
+  implements the body. Test count 1040 → 1053 (+13 in lib).
 * **Round 196 — §7.15 CDEF (Constrained Directional Enhancement
   Filter) — top-level driver + direction search + primary +
   secondary tap filter.**
