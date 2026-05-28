@@ -2,6 +2,61 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-28 (round 209)
+
+Round 209 lands the **§8.2 entropy *encoder*** (`SymbolWriter`) — the
+inverse of the existing `SymbolDecoder` (§8.2.2 `init_symbol` / §8.2.6
+`read_symbol` / §8.2.4 `exit_symbol`). This is the foundation every
+§5.11 tile-content encode pass sits on top of: without it nothing
+inside `tile_group_obu()` can be written.
+
+`encoder::symbol_writer::SymbolWriter`:
+
+* **`write_symbol(symbol, cdf)`** — inverse of §8.2.6
+  `read_symbol(cdf)`. Computes the same `cur(s)` / `prev` boundaries
+  the decoder uses (`((range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 -
+  EC_PROB_SHIFT) + EC_MIN_PROB * (N - s - 1)`), advances `low` to
+  the symbol's u-space interval (`offset = range - prev`), shrinks
+  `range`, then renormalises by appending `bits = 15 -
+  FloorLog2(range)` zero bits to the accumulated `low`.
+* **`write_bool(bit)`** — inverse of §8.2.3 `read_bool()`; uses the
+  fresh `[1<<14, 1<<15, 0]` CDF and discards the §8.3 adaptation
+  per the spec's note.
+* **`finish()`** — emits the accumulated `low` bits MSB-first as the
+  encoded bytestream. The decoder's `paddedBuf` is the top 15 bits
+  of that emission, which (by construction) lies in the encoder's
+  recorded `[low, low + range)` interval for every symbol — so the
+  decode round-trip is bit-exact.
+* `disable_cdf_update` honoured exactly as on the decoder side: when
+  `false`, the §8.3 `update_cdf` runs on every `write_symbol` so
+  the encoder and decoder evolve identical CDFs along the same
+  symbol stream.
+
+The §8.2 algebra is `u = (SymbolRange - 1) - SymbolValue`: after
+init, `u == paddedBuf` (the top 15 bits of input the decoder
+consumes); the §8.2.6 update `value -= cur` becomes `u_post = u_pre
+- (range_pre - prev)` and the §8.2.6 renorm becomes `u_new = (u_post
+<< bits) | paddedData`. The encoder accumulates `low` as the lower
+edge of the valid `u` interval; bits aren't carry-propagated because
+the entire `low` is kept as a `Vec<bool>` big-endian bigint until
+`finish()` packs it into bytes.
+
+11 new lib tests (1141 → 1152), all bit-exact round-trips through
+the existing `SymbolDecoder`: single bool 0 / 1, mixed-pattern
+bools, multi-symbol N=4 with §8.3 adaptation (encoder/decoder CDFs
+remain equal across the run), heavy- and rare-side skewed CDFs,
+200-symbol N=8 with §8.3 adaptation, mixed bool + multi-symbol on
+one writer, empty-payload sanity, all-ones and all-zeros bool
+streams.
+
+Out of scope this arc (next): `read_literal` / `NS` /
+`decode_subexp_bool` inverses for the descriptor wrappers; §5.11
+`tile_group_obu()` writer skeleton on top of `SymbolWriter`; the
+first per-block syntax (skip / mode_info / coefficient encode);
+byte-level flushing during encode for multi-megabyte tile payloads
+(the current implementation holds the entire accumulated `low` in
+RAM until `finish` — fine for current test sizes).
+
 ## Status — 2026-05-28 (round 208)
 
 Round 208 closes the **framing layer** of the encoder. The §5.3.4

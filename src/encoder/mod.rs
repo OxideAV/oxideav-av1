@@ -60,6 +60,7 @@ pub mod frame_obu;
 pub mod ivf;
 pub mod obu;
 pub mod sequence_obu;
+pub mod symbol_writer;
 pub mod temporal_unit;
 
 pub use bitwriter::BitWriter;
@@ -70,4 +71,5 @@ pub use obu::{
     ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,
 };
 pub use sequence_obu::write_sequence_header_obu;
+pub use symbol_writer::SymbolWriter;
 pub use temporal_unit::{encode_sequence_header_obu, encode_temporal_unit, TemporalUnitPlan};

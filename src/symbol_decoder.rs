@@ -382,7 +382,7 @@ impl<'a> SymbolDecoder<'a> {
 ///   }
 ///   cdf[N] += (cdf[N] < 32)
 /// ```
-fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
+pub(crate) fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
     let count = u32::from(cdf[n as usize]);
     let rate = 3 + u32::from(count > 15) + u32::from(count > 31) + core::cmp::min(floor_log2(n), 2);
 
@@ -403,6 +403,14 @@ fn update_cdf(cdf: &mut [u16], symbol: u32, n: u32) {
     if count < 32 {
         cdf[n as usize] = (count + 1) as u16;
     }
+}
+
+/// Re-export of [`update_cdf`] for the encoder side
+/// ([`crate::encoder::symbol_writer::SymbolWriter`]) — the §8.3 update is
+/// shared between encode and decode, so both sides apply the exact same
+/// adaptation rule to the same CDF arrays.
+pub(crate) fn update_cdf_for_encoder(cdf: &mut [u16], symbol: u32, n: u32) {
+    update_cdf(cdf, symbol, n);
 }
 
 #[cfg(test)]

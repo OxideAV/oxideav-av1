@@ -6,6 +6,53 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ### Added
 
+* **Round 209 — §8.2 entropy *encoder* (`SymbolWriter`).** Inverse of
+  `SymbolDecoder` (§8.2.2 `init_symbol` / §8.2.6 `read_symbol` /
+  §8.2.4 `exit_symbol`). The foundation every §5.11 tile-content
+  encode pass sits on top of: without it nothing inside
+  `tile_group_obu()` can be written.
+
+  New public API in `encoder::symbol_writer`:
+  * `SymbolWriter::new(disable_cdf_update: bool)` — construct.
+  * `SymbolWriter::write_symbol(symbol, cdf)` — inverse of §8.2.6
+    `read_symbol(cdf)`. Computes the same `cur(s)` / `prev`
+    boundaries the decoder uses, advances `low` to the symbol's
+    u-space interval (`offset = range - prev`), shrinks `range`,
+    and renormalises by appending `bits = 15 - FloorLog2(range)`
+    zero bits to the accumulated `low`. Applies §8.3 `update_cdf`
+    in lockstep with the decoder when `!disable_cdf_update`.
+  * `SymbolWriter::write_bool(bit)` — inverse of §8.2.3
+    `read_bool()`; uses the fresh `[1<<14, 1<<15, 0]` CDF and
+    discards the §8.3 adaptation per the spec's note.
+  * `SymbolWriter::finish() -> Vec<u8>` — emits accumulated `low`
+    bits MSB-first as the encoded bytestream the decoder consumes.
+
+  Implementation: the encoder maintains `low` as a `Vec<bool>` of
+  MSB-first bits with explicit big-integer addition; carry-free,
+  byte-flush-free, bounded by tile-payload sizes that fit in RAM.
+  A future arc that needs to encode multi-megabyte tiles can
+  swap in the standard carry-buffer flush without changing the
+  external API.
+
+  Helper made `pub(crate)`:
+  `symbol_decoder::update_cdf_for_encoder` — the §8.3 update is
+  shared between encode and decode (same arithmetic), so both sides
+  apply the exact same rule to the same CDF arrays.
+
+  11 new lib tests (1141 → 1152), all bit-exact round-trips through
+  the existing `SymbolDecoder`: single bool 0 / 1, mixed-pattern
+  bools, multi-symbol N=4 with §8.3 adaptation (encoder/decoder
+  CDFs remain equal across the run), heavy- and rare-side skewed
+  CDFs, 200-symbol N=8 with §8.3 adaptation, mixed bool +
+  multi-symbol on one writer, empty-payload sanity, all-ones and
+  all-zeros bool streams.
+
+  Out of scope this arc (next): `read_literal` / `NS` /
+  `decode_subexp_bool` inverses for the descriptor wrappers; §5.11
+  `tile_group_obu()` writer skeleton on top of `SymbolWriter`; the
+  first per-block syntax (skip / mode_info / coefficient encode);
+  byte-level flushing during encode.
+
 * **Round 208 — encoder arc 3: §5.3.4 `trailing_bits` + §5.3.1 OBU
   size-field wrapper + §7.5 temporal-unit aggregator.** End-to-end
   glue that takes the existing `write_sequence_header_obu` (r206) +
