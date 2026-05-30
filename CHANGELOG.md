@@ -4,6 +4,139 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-av1/compare/v0.1.8...v0.1.9) - 2026-05-29
+
+### Other
+
+- release v0.1.8 ([#11](https://github.com/OxideAV/oxideav-av1/pull/11))
+- encoder/decoder r231: UV_CFL_PRED (§7.11.5.3 chroma-from-luma)
+- encoder/decoder r230: pixel-driver frame-size generalisation
+- encoder r229: 13-mode chroma intra prediction picker (DC/V/H/D-modes/SMOOTH/PAETH)
+- encoder r228: 13-mode intra prediction picker (DC/V/H/D-modes/SMOOTH/PAETH)
+- round 227 — §7.13.3-equivalent forward 2D transform dispatcher
+- encoder r226: forward ADST / FLIPADST / IDTX primitives
+- encoder r225: forward DCT for sizes 8 / 16 / 32 / 64
+- decoder r224: standalone decode_av1 + first encode→decode pixel roundtrip
+- encoder r223: pixel-driver chroma path (4:2:0 YUV)
+- encoder r222: forward Walsh-Hadamard transform (lossless milestone)
+- encoder r221: pixel-space driver (YUV in → IVF out, milestone arc)
+- encoder r220: forward quantization primitive
+- encoder r219: scrub stale 2.072 / 1.999 numbers from M^T·M comments
+- encoder r219: forward 4×4 DCT primitive (pixel-space bootstrap)
+- encoder r218: §5.11.36 transform_tree / tx_size writers
+- encoder r217: §5.11.4 recursive dispatch driver (intra-only)
+- §5.11.4 partition decision-tree writer (round 216)
+- round 215: §5.11.39 coefficients() driver loop end-to-end
+- round 214: §5.11.39 golomb magnitude tail writer
+- round 213: §5.11.39 coeff_base{_eob} + coeff_br writers
+- round 212: first §5.11.39 coefficient-encode primitives
+- round 211: first per-block syntax writers — intra arm
+- encoder r210: §5.11.1 tile_group_obu framing + entropy composition wrappers
+- Round 209 — encoder arc 4: §8.2 entropy encoder (SymbolWriter)
+- Round 208 — encoder arc 3: trailing_bits + OBU+size wrapper + temporal_unit aggregator + end-to-end IVF smoke
+- Round 207 — encoder arc 2: frame_header_obu() writer
+- Round 206 — encoder arc 1: bit-output plumbing (BitWriter / OBU framer / sequence_header_obu writer / IVF v0 container)
+- Round 205 — wire §7.10.2.5 temporal scan + §7.10.2.6 temporal sample
+- refresh stale doc comments now that §9.5.3 QM is LANDED
+- §9.5.3 Quantizer matrix tables + §7.12.3 step-1b QM-active arm
+- §7.11.3.1 OBMC motion-mode arm wired into predict_inter
+- §7.11.3.1 WARPED_CAUSAL motion-mode arm wired into predict_inter
+- §7.11.3.1 step-14 compound arm wired into predict_inter
+- §7.16 superres upscaling — per-frame pipeline complete
+- r199 — §7.18.3 film grain synthesis (close-out post-processing layer)
+- r198 — §7.17.2 / §7.17.3 self-guided projection arm
+- r197 — §7.17 loop restoration — driver + Wiener arm
+- §7.15 CDEF — driver + direction search + primary/secondary filter
+- r195 — §7.14 loop filter (deblocking) — driver + edge-strength + narrow/wide filter bodies
+- r194 — §7.11.3.1 predict_inter driver skeleton (SIMPLE single-ref arm)
+- r193 — §7.11.3.9-10 OBMC overlap-blend leaves
+- r192 — §7.11.3.5-8 WARP motion compensation
+- r191 — §7.11.3.11-15 compound bodies
+- r190 — `decode_block_syntax` inter-arm wire-up + `InterFrameContext`
+- §7.11.3 inter prediction — translational single-ref MC kernel
+- r188 — §7.11.2.4 six D-mode directional intra prediction + §7.11.2.{7,9,10,11,12} intra-edge helpers + Mode_To_Angle / Dr_Intra_Derivative tables
+- r187 — §7.11.2.2 PAETH + §7.11.2.6 SMOOTH / SMOOTH_V / SMOOTH_H leaves + §7.11.2.1 corner derivation
+- r186 — §7.11.2.4 V_PRED + H_PRED leaves + §7.11.2.1 AboveRow/LeftCol derivation
+- r185 — §7.12.3 step-3 frame-buffer merge + CurrFrame buffers
+- r184 — §7.5 / §5.11.41 get_scan(txSz) table dispatcher
+- r183 — §7.12.2 dequant tables + §7.12.3 step-1 + §5.11.47 transform_type
+- r182 — §7.13 inverse transform process; lift ResidualReconstructUnsupported
+- r181 — §5.11.34 residual() outer dispatch + §5.11.36 transform_tree recursion + per-TU §5.11.39 wiring
+- r180 — §5.11.30 / §5.11.33 compute_prediction() dispatcher + §7.11.2.5 DC_PRED leaf
+- §5.11.39 coefficients reader (the first §5.11.34 body)
+- §5.11.x read_interpolation_filter reader
+- §5.11.29 read_compound_type reader
+- §5.11.28 read_interintra_mode reader
+- §5.11.27 read_motion_mode + §7.10.3/§7.10.4 helpers
+- §5.11.31 assign_mv + §5.11.32 read_mv_component cascade
+- §5.11.23 post-find_mv_stack reader cascade
+- §7.10 find_mv_stack spatial-only path
+- av1 r171: §5.11.46 palette-entries reader + §5.11.49 get_palette_cache
+- round 170 — §5.11.23 inter_block_mode_info() prologue + §5.11.25 read_ref_frames()
+- round 169 — §5.11.22 intra_block_mode_info()
+- §5.11.17 read_var_tx_size + §5.11.18 inter_frame_mode_info
+- round 167 — §5.11.16 read_block_tx_size() + §5.11.15 read_tx_size
+- round 166 — §5.11.5 decode_block() syntax-walker skeleton
+- round 165 — §5.11.7 / §5.11.22 intra_frame_y_mode syntax element
+- round 164 — §5.11.7 use_intrabc syntax element
+- round 163 — §5.11.21 get_segment_id() predicted-segment-id helper
+- round 162 — §5.11.19 inter_segment_id(preSkip) syntax element
+- round 161 — §5.11.7 intra_frame_mode_info() prefix dispatcher
+- round 160 — §5.11.8 intra_segment_id() syntax element
+- round 159 — §5.11.9 read_segment_id() syntax element
+- round 158 — §5.11.20 read_is_inter() syntax element
+- round 157 — §5.11.56 read_cdef() + §5.11.55 clear_cdef()
+- round 156 — §5.11.13 read_delta_lf() syntax element
+- round 155 — §5.11.12 read_delta_qindex() syntax element
+- round 154 — §5.11.10 read_skip_mode() syntax element
+- round 152 — §5.11.11 read_skip() syntax element
+- round 151 — §5.11.4 decode_partition() recursive walker
+- round 150 — §9.3 Partition_Subsize table + §3 BLOCK_* enum staging
+- round 149 — §5.11.49 palette_tokens caller-side arg derivation
+- round 148 — §9.3 block-size conversion tables
+- round 147 — §5.11.49 palette_tokens per-plane diagonal walker
+- round 146 — §5.11.50 get_palette_color_context derivation
+- round 145 — §8.3.2 split_or_horz / split_or_vert cdf derivation
+- round 144 — §9.4 wedge-index default-CDF
+- round 143 — §9.4 inter-intra default-CDF group
+- round 142 — §5.11.40 compute_tx_type() derivation
+- r141 follow-up — re-export §8.3.2 helpers + add §3 constants to crate-root glob + lib.rs round-note + sync test count
+- §8.3.2 get_coeff_base_ctx / get_br_ctx neighbour derivation (r141)
+- round 140 — §9.4 Default_Coeff_Br_Cdf + §8.3.1 init_coeff_cdfs / §8.3.2 selection (coeff_br sub-group)
+- Round 139 — coefficient `coeff_base` sub-group default CDF + selectors
+- round 138 — §9.4 Default_Coeff_Base_Eob_Cdf + §8.3.1 init_coeff_cdfs / §8.3.2 selection (coeff_base_eob sub-group)
+- round 137 — intra-frame transform-type default CDF group
+- round 136 — §9.4 default-CDF + §8.3.1 init_coeff_cdfs / §8.3.2 selection (coefficient-token entry sub-group)
+- round 135 — §9.4 default-CDF + §8.3.1 / §8.3.2 selection (angle-delta subset)
+- round 134 — §9.4 default-CDF + §8.3.1 / §8.3.2 selection (inter-frame intra-mode subset)
+- round 24 — §9.4 default-CDF + §8.3.1 / §8.3.2 selection (compound-prediction subset)
+- round 23 — §9.4 default-CDF + §8.3.1 / §8.3.2 selection (motion-mode subset)
+- round 22 — §9.4 default-CDF + §8.3.1 / §8.3.2 selection (inter-frame interpolation-filter subset)
+- round 21 — §9.4 default CDFs + §8.3.1 / §8.3.2 selection (inter-frame transform-type subset)
+- round 20 — transform-size §9.4 default CDFs + §8.3.2 selection
+- round 19 follow-up — rename FILTER_INTRA_MODES to spec name INTRA_FILTER_MODES
+- round 19 — §9.4 default CDFs + §8.3.1/§8.3.2 selection (palette/filter-intra/CFL subset)
+- round 18 — §9.4 default CDFs + §8.3.1/§8.3.2 selection (inter-mode/ref-frame subset)
+- Round 17: §9.4 default CDF tables + §8.3.2 selection (motion-vector
+- Round 16: §9.4 default CDF tables + §8.3.1/§8.3.2 selection (intra-mode/partition subset)
+- round 15 — §8.2 symbol (arithmetic / msac) decoder
+- round 14 — inter-frame uncompressed_header() path (set_frame_refs / frame_size_with_refs / ref_frame_idx)
+- round 13 — §5.9.24 global_motion_params + §5.9.30 film_grain_params
+- round 12 — read_tx_mode() (§5.9.21) wired into streaming parser
+- round 11 — wire lr_params() (§5.9.20) into the streaming parser
+- round 10 — wire cdef_params() (§5.9.19) into the streaming parser
+- round 9 — wire loop_filter_params() (§5.9.11) + CodedLossless derivation
+- wire §5.9.17 delta_q_params + §5.9.18 delta_lf_params into streaming parse (round 8)
+- frame header r7: wire §5.9.14 segmentation_params (+ §5.9.12 quantization_params) into streaming parse
+- round 6 — §5.9.3 allow_intrabc + §5.9.15 tile_info wired into the streaming parse_frame_header walk
+- round 5 — §5.9.10 / §5.9.11 / §5.9.12 uncompressed-header tail sub-syntaxes
+- round 4 — §5.9.5–§5.9.9 frame-size sub-syntax block
+- round 3 — §5.9.2 uncompressed_header prefix parse
+- embed sequence-header fixture corpus instead of reading docs/
+- round 2: sequence_header_obu parse (§5.5)
+- round 1: OBU bytestream walker (§5.3 / §4.10.5)
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ## [0.1.8](https://github.com/OxideAV/oxideav-av1/compare/v0.1.7...v0.1.8) - 2026-05-28
 
 ### Other
