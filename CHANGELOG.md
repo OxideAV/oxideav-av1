@@ -4,6 +4,15 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder/decoder r232: UV_CFL_PRED on the dynamic-extent driver
+  (§7.11.5.3 chroma-from-luma now wired through
+  `encode_intra_frame_yuv_dyn` + `Frame::Yuv420Dyn`). Picks the
+  §5.11.45 (αU, αV) over a compact `{±1, ±2, ±4}` grid against the
+  §7.11.5.3 subsampled-luma window; full encode → decode → pixel-
+  equality stays bit-exact at 32×32 and 64×64 on luma-correlated
+  chroma. +3 integration tests (29 → 32 in
+  `encode_decode_pixel_roundtrip`).
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-av1/compare/v0.1.8...v0.1.9) - 2026-05-29
 
 ### Other

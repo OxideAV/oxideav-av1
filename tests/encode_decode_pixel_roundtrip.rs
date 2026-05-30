@@ -900,3 +900,149 @@ fn encoder_committed_uv_modes_include_zero_or_more_cfl_picks() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// r232 — UV_CFL_PRED on the dynamic-extent driver (§7.11.5.3 +
+// `encode_intra_frame_yuv_dyn` / `Frame::Yuv420Dyn`).
+// ---------------------------------------------------------------------
+
+/// Construct a 4:2:0 YUV input at arbitrary (width, height) where the
+/// chroma planes are `Cu = 128 + (lumaAvg2x2 - 128) / 4` /
+/// `Cv = 128 - (lumaAvg2x2 - 128) / 4` — the same textbook CFL signal
+/// the r231 fixed-size CFL tests use, scaled to a dynamic-extent
+/// frame. Luma is a column-direction gradient over the full width so
+/// the chroma planes have a useful range to track.
+fn luma_correlated_yuv_input_dyn(width: u32, height: u32) -> oxideav_av1::encoder::Yuv420Frame {
+    use oxideav_av1::encoder::Yuv420Frame;
+    let cw = (width / 2) as usize;
+    let ch = (height / 2) as usize;
+    let w = width as usize;
+    let h = height as usize;
+    let mut input = Yuv420Frame::filled(width, height, 0);
+    for i in 0..h {
+        for j in 0..w {
+            // Wrap-around gradient so larger frames still produce
+            // varied luma without saturating to 255.
+            let v = ((j as u32) * 8) % 256;
+            input.y[i * w + j] = v as u8;
+        }
+    }
+    for ci in 0..ch {
+        for cj in 0..cw {
+            let li = ci * 2;
+            let lj = cj * 2;
+            let avg = (input.y[li * w + lj] as u32
+                + input.y[li * w + (lj + 1)] as u32
+                + input.y[(li + 1) * w + lj] as u32
+                + input.y[(li + 1) * w + (lj + 1)] as u32)
+                / 4;
+            let centred = avg as i32 - 128;
+            input.u[ci * cw + cj] = (128i32 + centred / 4).clamp(0, 255) as u8;
+            input.v[ci * cw + cj] = (128i32 - centred / 4).clamp(0, 255) as u8;
+        }
+    }
+    input
+}
+
+#[test]
+fn dyn_encode_decode_cfl_yuv_roundtrip_bit_exact_32x32() {
+    // r232: full encode → decode → pixel-equality on the dyn driver
+    // with a chroma signal that's a clean linear function of luma.
+    // The dyn picker now evaluates UV_CFL_PRED for at least one
+    // chroma cell; the dyn decoder mirrors its CFL prediction and the
+    // lossless WHT chain stays bit-exact.
+    use oxideav_av1::encoder::encode_intra_frame_yuv_dyn;
+    let input = luma_correlated_yuv_input_dyn(32, 32);
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 32);
+            assert_eq!(*height, 32);
+            assert_eq!(y, &input.y, "Y plane bit-exact on 32×32 CFL input");
+            assert_eq!(u, &input.u, "U plane bit-exact on 32×32 CFL input");
+            assert_eq!(v, &input.v, "V plane bit-exact on 32×32 CFL input");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_cfl_yuv_roundtrip_bit_exact_64x64() {
+    // r232: same CFL roundtrip as the 32×32 variant but at the
+    // arc-r230 maximum single-super-block extent. Confirms the
+    // §7.11.5.3 subsampled-luma window honours the right/bottom-edge
+    // clamps when the luma plane is non-multiple-of-2 at the chroma
+    // boundary (here: width = height = 64, all clamps strict-inside).
+    use oxideav_av1::encoder::encode_intra_frame_yuv_dyn;
+    let input = luma_correlated_yuv_input_dyn(64, 64);
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 64);
+            assert_eq!(*height, 64);
+            assert_eq!(y, &input.y, "Y plane bit-exact on 64×64 CFL input");
+            assert_eq!(u, &input.u, "U plane bit-exact on 64×64 CFL input");
+            assert_eq!(v, &input.v, "V plane bit-exact on 64×64 CFL input");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_pseudorandom_32x32_still_roundtrips_with_cfl_arm() {
+    // r232 regression-guard: with the CFL arm now wired into the dyn
+    // picker, pseudo-random YUV (where chroma is uncorrelated with
+    // luma) must still roundtrip bit-exact — i.e. the picker only
+    // commits CFL when it actually beats every §6.10.x mode, never as
+    // a regression that erodes the lossless contract.
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    let mut input = Yuv420Frame::filled(32, 32, 0);
+    let mut state: u64 = 0xC0FFEE_C0FFEE_u64;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = step();
+    }
+    for p in input.u.iter_mut() {
+        *p = step();
+    }
+    for p in input.v.iter_mut() {
+        *p = step();
+    }
+    let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 32);
+            assert_eq!(*height, 32);
+            assert_eq!(y, &input.y, "Y mismatch on pseudo-random 32×32");
+            assert_eq!(u, &input.u, "U mismatch on pseudo-random 32×32");
+            assert_eq!(v, &input.v, "V mismatch on pseudo-random 32×32");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}

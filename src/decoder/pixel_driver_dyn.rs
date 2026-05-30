@@ -25,15 +25,16 @@
 //! Outside that scope, returns [`Error::PartitionWalkOutOfRange`].
 
 use crate::cdf::{
-    cfl_allowed_for_uv_mode, dequantize_step1, partition_ctx, partition_subsize,
-    predict_intra_d_mode, predict_intra_dc_pred, predict_intra_h_pred, predict_intra_paeth_pred,
-    predict_intra_smooth_h_pred, predict_intra_smooth_pred, predict_intra_smooth_v_pred,
-    predict_intra_v_pred, size_group, skip_ctx, split_or_horz_cdf, split_or_vert_cdf,
-    PartitionWalker, QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_8X8,
-    BLOCK_INVALID, BLOCK_SIZES, D45_PRED, D67_PRED, DCT_DCT, DC_PRED, H_PRED, MI_HEIGHT_LOG2,
-    MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PAETH_PRED, PARTITION_HORZ,
-    PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED,
-    TX_4X4, TX_CLASS_2D, V_PRED,
+    cfl_allowed_for_uv_mode, cfl_alpha_u_ctx, cfl_alpha_v_ctx, dequantize_step1, partition_ctx,
+    partition_subsize, predict_intra_d_mode, predict_intra_dc_pred, predict_intra_h_pred,
+    predict_intra_paeth_pred, predict_intra_smooth_h_pred, predict_intra_smooth_pred,
+    predict_intra_smooth_v_pred, predict_intra_v_pred, size_group, skip_ctx, split_or_horz_cdf,
+    split_or_vert_cdf, PartitionWalker, QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4,
+    BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, D45_PRED, D67_PRED,
+    DCT_DCT, DC_PRED, H_PRED, MI_HEIGHT_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH,
+    NUM_4X4_BLOCKS_WIDE, PAETH_PRED, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT,
+    PARTITION_VERT, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4, TX_CLASS_2D, UV_CFL_PRED,
+    V_PRED,
 };
 use crate::decoder::pixel_driver::Frame;
 use crate::encoder::pixel_driver::NUM_INTRA_MODES_Y;
@@ -430,18 +431,34 @@ fn decode_block_leaf(
         return Err(Error::PartitionWalkOutOfRange);
     }
     let has_chroma = (mi_row & 1) != 0 && (mi_col & 1) != 0;
-    let uv_mode: u8 = if has_chroma {
+    // r232: dyn driver now accepts `UV_CFL_PRED` (ordinal 13, the
+    // §7.11.5.3 chroma-from-luma αU/αV predictor) in addition to the
+    // 13 §6.10.x intra modes. When the §8.3.2 CFL-allowed CDF row
+    // surfaces ordinal 13, the §5.11.22 line-8 gate fires
+    // `read_cfl_alphas()` (§5.11.45) for the per-block CflAlphaU /
+    // CflAlphaV; the chroma dispatcher below then routes through
+    // `cfl_predict_4x4_for_plane_dyn` instead of one of the §6.10.x
+    // kernels.
+    let (uv_mode, cfl_alpha_u, cfl_alpha_v): (u8, i8, i8) = if has_chroma {
         let cfl_allowed = cfl_allowed_for_uv_mode(false, sub_size, true, true);
         let cdf = cdfs
             .uv_mode_cdf(cfl_allowed, y_mode as usize)
             .ok_or(Error::PartitionWalkOutOfRange)?;
         let m = decoder.read_symbol(cdf)? as u8;
-        if (m as usize) >= NUM_INTRA_MODES_Y {
+        // Encoder picks from `0..=UV_CFL_PRED` (the §3 INTRA_MODES set
+        // plus UV_CFL_PRED = 13). Any out-of-set decoded mode is a
+        // contract violation — reject.
+        if (m as usize) > UV_CFL_PRED {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        m
+        if (m as usize) == UV_CFL_PRED {
+            let (au, av) = read_cfl_alphas(decoder, cdfs)?;
+            (m, au, av)
+        } else {
+            (m, 0, 0)
+        }
     } else {
-        DC_PRED as u8
+        (DC_PRED as u8, 0, 0)
     };
 
     let mut quant_y = vec![0i32; 16];
@@ -494,6 +511,16 @@ fn decode_block_leaf(
         let crow0 = cr * 4;
         let ccol0 = cc_idx * 4;
 
+        // r232: §7.11.5.3 subsampled-luma window + lumaAvg are shared
+        // across U and V. Compute once (only when UV_CFL_PRED won at
+        // the encoder side); otherwise the helpers stay unused
+        // (`cfl_alpha_* == 0`).
+        let (l_arr, luma_avg) = if uv_mode as usize == UV_CFL_PRED {
+            cfl_subsampled_luma_4x4_420_dyn(recon_y, width, height, cr, cc_idx)
+        } else {
+            ([0i32; 16], 0)
+        };
+
         let _readout_u = coeff_walker.coefficients(
             decoder,
             cdfs,
@@ -506,15 +533,31 @@ fn decode_block_leaf(
             scan,
             &mut quant_u,
         )?;
-        let pred_u = predict_intra_for_mode_4x4(
-            recon_u,
-            chroma_width,
-            chroma_height,
-            cr,
-            cc_idx,
-            uv_mode as usize,
-        )
-        .ok_or(Error::PartitionWalkOutOfRange)?;
+        // r232: when `uv_mode == UV_CFL_PRED` the §7.11.5.3 path takes
+        // DC_PRED as the `dc` base and adds the alpha-scaled luma
+        // residual.
+        let pred_u: [u8; 16] = if uv_mode as usize == UV_CFL_PRED {
+            let dc_pred = predict_intra_for_mode_4x4(
+                recon_u,
+                chroma_width,
+                chroma_height,
+                cr,
+                cc_idx,
+                DC_PRED,
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+            cfl_predict_4x4_for_plane_dyn(&dc_pred, &l_arr, luma_avg, cfl_alpha_u)
+        } else {
+            predict_intra_for_mode_4x4(
+                recon_u,
+                chroma_width,
+                chroma_height,
+                cr,
+                cc_idx,
+                uv_mode as usize,
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?
+        };
         if skip == 0 {
             let dequant = dequantize_step1(&quant_u, TX_4X4, 1, 0, DCT_DCT, 15, qp);
             let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, true);
@@ -544,15 +587,28 @@ fn decode_block_leaf(
             scan,
             &mut quant_v,
         )?;
-        let pred_v = predict_intra_for_mode_4x4(
-            recon_v,
-            chroma_width,
-            chroma_height,
-            cr,
-            cc_idx,
-            uv_mode as usize,
-        )
-        .ok_or(Error::PartitionWalkOutOfRange)?;
+        let pred_v: [u8; 16] = if uv_mode as usize == UV_CFL_PRED {
+            let dc_pred = predict_intra_for_mode_4x4(
+                recon_v,
+                chroma_width,
+                chroma_height,
+                cr,
+                cc_idx,
+                DC_PRED,
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+            cfl_predict_4x4_for_plane_dyn(&dc_pred, &l_arr, luma_avg, cfl_alpha_v)
+        } else {
+            predict_intra_for_mode_4x4(
+                recon_v,
+                chroma_width,
+                chroma_height,
+                cr,
+                cc_idx,
+                uv_mode as usize,
+            )
+            .ok_or(Error::PartitionWalkOutOfRange)?
+        };
         if skip == 0 {
             let dequant = dequantize_step1(&quant_v, TX_4X4, 2, 0, DCT_DCT, 15, qp);
             let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, true);
@@ -694,6 +750,141 @@ fn predict_intra_for_mode_4x4(
         *slot = v as u8;
     }
     Some(pred8)
+}
+
+// ----------------------------------------------------------------------
+// r232 — §7.11.5.3 CFL chroma-from-luma prediction (dyn driver edition).
+//
+// Mirrors the fixed-size driver's helpers (`read_cfl_alphas`,
+// `cfl_subsampled_luma_4x4_420`, `round2_signed`,
+// `cfl_predict_4x4_for_plane`) but reads from / produces results
+// against the Vec-backed dyn plane buffers.
+// ----------------------------------------------------------------------
+
+/// §5.11.45 `read_cfl_alphas()` — read the joint sign + per-channel
+/// magnitude and reconstruct the signed `(CflAlphaU, CflAlphaV)`.
+///
+/// Mirror of the fixed-size driver's helper of the same name (see
+/// [`crate::decoder::pixel_driver`]). The §5.11.45 / §8.3.2 CDF
+/// selection rules are independent of frame extent so the logic
+/// matches byte-for-byte.
+fn read_cfl_alphas(
+    decoder: &mut SymbolDecoder<'_>,
+    cdfs: &mut TileCdfContext,
+) -> Result<(i8, i8), Error> {
+    let signs_cdf = cdfs.cfl_sign_cdf();
+    let signs = decoder.read_symbol(signs_cdf)? as usize;
+    if signs >= CFL_JOINT_SIGNS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.45: signU = (signs + 1) / 3, signV = (signs + 1) % 3 with
+    // values in {CFL_SIGN_ZERO=0, CFL_SIGN_NEG=1, CFL_SIGN_POS=2}.
+    let sign_u: usize = (signs + 1) / 3;
+    let sign_v: usize = (signs + 1) % 3;
+    let cfl_alpha_u: i8 = if sign_u != 0 {
+        let ctx_u = cfl_alpha_u_ctx(sign_u, sign_v);
+        let row_u = cdfs.cfl_alpha_cdf(ctx_u);
+        let raw_u = decoder.read_symbol(row_u)? as i32;
+        if raw_u as usize >= CFL_ALPHABET_SIZE {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let mag = (1 + raw_u) as i8;
+        if sign_u == 1 {
+            -mag
+        } else {
+            mag
+        }
+    } else {
+        0
+    };
+    let cfl_alpha_v: i8 = if sign_v != 0 {
+        let ctx_v = cfl_alpha_v_ctx(sign_u, sign_v);
+        let row_v = cdfs.cfl_alpha_cdf(ctx_v);
+        let raw_v = decoder.read_symbol(row_v)? as i32;
+        if raw_v as usize >= CFL_ALPHABET_SIZE {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let mag = (1 + raw_v) as i8;
+        if sign_v == 1 {
+            -mag
+        } else {
+            mag
+        }
+    } else {
+        0
+    };
+    Ok((cfl_alpha_u, cfl_alpha_v))
+}
+
+/// §7.11.5.3 subsampled-luma + lumaAvg derivation for one 4:2:0 TX_4X4
+/// chroma block on a Vec-backed luma plane.
+///
+/// Mirror of the encoder-side helper of the same name in
+/// [`crate::encoder::pixel_driver_dyn`].
+fn cfl_subsampled_luma_4x4_420_dyn(
+    recon_y: &[u8],
+    luma_w: usize,
+    luma_h: usize,
+    cell_row: usize,
+    cell_col: usize,
+) -> ([i32; 16], i32) {
+    let crow0_chroma = cell_row * 4;
+    let ccol0_chroma = cell_col * 4;
+    let mut l_arr = [0i32; 16];
+    let mut sum: i32 = 0;
+    for i in 0..4 {
+        let mut luma_y0 = (crow0_chroma + i) << 1;
+        if luma_y0 > luma_h - 2 {
+            luma_y0 = luma_h - 2;
+        }
+        for j in 0..4 {
+            let mut luma_x0 = (ccol0_chroma + j) << 1;
+            if luma_x0 > luma_w - 2 {
+                luma_x0 = luma_w - 2;
+            }
+            let mut t: i32 = 0;
+            for dy in 0..=1usize {
+                for dx in 0..=1usize {
+                    t += recon_y[(luma_y0 + dy) * luma_w + (luma_x0 + dx)] as i32;
+                }
+            }
+            let v = t << 1;
+            l_arr[i * 4 + j] = v;
+            sum += v;
+        }
+    }
+    let luma_avg = (sum + 8) >> 4;
+    (l_arr, luma_avg)
+}
+
+/// §3 `Round2Signed(x, n)` — symmetric rounding for signed inputs
+/// (`x < 0` arm round-half-away-from-zero).
+#[inline]
+fn round2_signed(x: i64, n: u32) -> i64 {
+    let half: i64 = 1i64 << (n - 1);
+    if x < 0 {
+        -(((-x) + half) >> n)
+    } else {
+        (x + half) >> n
+    }
+}
+
+/// §7.11.5.3 CFL chroma prediction — `dc_pred[k] + Round2Signed(α *
+/// (L[k] - lumaAvg), 6)` clipped to byte. Mirror of the encoder-side
+/// helper of the same name.
+fn cfl_predict_4x4_for_plane_dyn(
+    dc_pred: &[u8; 16],
+    l_arr: &[i32; 16],
+    luma_avg: i32,
+    alpha: i8,
+) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for k in 0..16 {
+        let scaled = round2_signed((alpha as i64) * ((l_arr[k] - luma_avg) as i64), 6);
+        let p = dc_pred[k] as i64 + scaled;
+        out[k] = p.clamp(0, 255) as u8;
+    }
+    out
 }
 
 #[cfg(test)]

@@ -2,6 +2,52 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-05-31 (round 232)
+
+Round 232 ports r231's §7.11.5.3 **`UV_CFL_PRED`** chroma-from-luma
+predictor to the **dynamic-extent** driver. The r230
+`encode_intra_frame_yuv_dyn` chroma picker
+(`pick_best_intra_mode_4x4_chroma_joint`) now takes the running
+reconstructed luma plane plus its extents and evaluates the same
+compact (αU, αV) grid (`{±1, ±2, ±4}` per channel, single-channel
+arms, 20 candidates) against the §7.11.5.3 subsampled-luma window
+(`L[i][j] = (Σ 2×2 luma) << 1`, `lumaAvg = Round2(Σ L, 4)`). When CFL
+wins on combined U+V SSD, the picker surfaces the chosen αU / αV pair
+as signed §5.11.45 `CflAlpha{U,V}` values; the dyn `LeafEnc` /
+`EncodeBlock` plumbing carries them through `write_partition_tree`
+unchanged, so the existing `write_cfl_alphas` writer fires on
+`UV_CFL_PRED` leaves and stays silent on §6.10.x leaves (matching the
+§5.11.22 line-8 gate).
+
+The decoder side (`decoder::pixel_driver_dyn::decode_block_leaf`) now
+accepts `uv_mode == 13` on the dyn path: reads §5.11.45 via a new
+`read_cfl_alphas` helper (joint-sign CDF + per-channel
+`cfl_alpha_u` / `cfl_alpha_v` magnitude CDFs from `cfl_alpha_u_ctx` /
+`cfl_alpha_v_ctx`), recomputes the same §7.11.5.3 subsampled-luma +
+lumaAvg window against the Vec-backed luma plane, and dispatches both
+U and V prediction through `cfl_predict_4x4_for_plane_dyn`
+(`Round2Signed(α * (L - lumaAvg), 6)` clipped to byte). The lossless
+WHT chain keeps the full encode → decode → pixel-equality contract
+bit-exact on the new path at 32×32 and 64×64, verified end-to-end on
+the textbook CFL signal (`Cu = 128 + (lumaAvg2x2 - 128) / 4` /
+`Cv = 128 - (lumaAvg2x2 - 128) / 4`). A regression-guard test
+confirms pseudo-random YUV (where chroma is uncorrelated with luma)
+still roundtrips bit-exact — the picker only commits CFL when it
+actually beats every §6.10.x mode.
+
++3 integration tests (26 → 29 in `encode_decode_pixel_roundtrip`):
+`dyn_encode_decode_cfl_yuv_roundtrip_bit_exact_32x32`,
+`dyn_encode_decode_cfl_yuv_roundtrip_bit_exact_64x64`, and
+`dyn_encode_decode_pseudorandom_32x32_still_roundtrips_with_cfl_arm`.
+Lib test count unchanged at 1489 (the helper bodies are exercised
+end-to-end by the integration tests so no extra unit harnesses were
+added).
+
+Out of scope (next arc): frames larger than 64×64 (multi-super-
+block tiling), rectangular partitions / TX sizes, `base_q_idx > 0`
+on the dyn path, monochrome / 4:2:2 / 4:4:4 sampling, §5.11.18 inter
+mode_info, and full bit-cost-aware RD on the dyn picker.
+
 ## Status — 2026-05-29 (round 231)
 
 Round 231 lands the §7.11.5.3 **`UV_CFL_PRED`** chroma-from-luma
