@@ -57,6 +57,7 @@ use crate::cdf::{
     NUM_4X4_BLOCKS_WIDE, PARTITION_NONE, PARTITION_SPLIT, TX_4X4, TX_CLASS_2D, UV_CFL_PRED,
 };
 use crate::encoder::forward_quantize::forward_quantize;
+use crate::encoder::forward_transform_2d::forward_transform_2d;
 use crate::encoder::forward_wht::forward_wht_4x4;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::obu::ObuFrame;
@@ -302,11 +303,34 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
 /// `base_q_idx = 0` (lossless), `Only4x4` TxMode, in-loop filters
 /// disabled. Mirrors the `synthetic_intra_round_trip_lossless` test
 /// shape in [`crate::encoder::frame_obu`].
+///
+/// Equivalent to [`build_intra_only_yuv420_8bit_fh_with_q`] with
+/// `base_q_idx = 0`; kept for back-compat with arc-r230 callers.
 #[must_use]
 pub fn build_intra_only_yuv420_8bit_fh(
     seq: &SequenceHeader,
     width: u32,
     height: u32,
+) -> FrameHeader {
+    build_intra_only_yuv420_8bit_fh_with_q(seq, width, height, 0)
+}
+
+/// Build the minimal intra-only `FrameHeader` for the dyn driver at
+/// the caller-supplied `base_q_idx`, `Only4x4` TxMode, in-loop filters
+/// disabled. `base_q_idx == 0` is the §5.9.2 `CodedLossless` arm
+/// (lossless WHT path on the leaf transform); `base_q_idx > 0` selects
+/// the lossy DCT_DCT path on the leaf transform.
+///
+/// `delta_q_present` stays `false` regardless — the dyn driver's
+/// scope is "one global qindex for the whole frame". §5.9.13's
+/// per-segment deltas, per-plane DC offsets, and per-block §5.11.34
+/// `read_delta_qindex` are all out-of-scope this arc.
+#[must_use]
+pub fn build_intra_only_yuv420_8bit_fh_with_q(
+    seq: &SequenceHeader,
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
 ) -> FrameHeader {
     let fs = FrameSize {
         frame_width: width,
@@ -333,7 +357,7 @@ pub fn build_intra_only_yuv420_8bit_fh(
         mi_row_starts: vec![0, fs.mi_rows],
     };
     let qp = QuantizationParams {
-        base_q_idx: 0,
+        base_q_idx,
         delta_q_y_dc: 0,
         diff_uv_delta: false,
         delta_q_u_dc: 0,
@@ -381,7 +405,20 @@ pub fn build_intra_only_yuv420_8bit_fh(
             loop_restoration_size: [0; 3],
             short_circuited: true,
         }),
-        tx_mode: Some(TxMode::Only4x4),
+        // §5.9.21 `read_tx_mode()`: `ONLY_4X4` is only valid under the
+        // §5.9.2 `CodedLossless` arm (`base_q_idx == 0` + all delta_q
+        // zero). For lossy quant (`base_q_idx > 0`) the FH writer
+        // enforces `TxModeLargest` / `TxModeSelect`. The dyn driver
+        // produces only TX_4X4 leaves at this arc; `TxModeLargest`
+        // surfaces "the largest TX size each block can take" which the
+        // decoder honours block-by-block — since every BLOCK_4X4 leaf's
+        // largest TX is TX_4X4, the decoder ends up reading the same
+        // coefficient blocks the encoder wrote.
+        tx_mode: Some(if base_q_idx == 0 {
+            TxMode::Only4x4
+        } else {
+            TxMode::TxModeLargest
+        }),
         reference_select: Some(false),
         skip_mode_present: Some(false),
         allow_warped_motion: Some(false),
@@ -945,12 +982,53 @@ pub fn dispatch_order_leaves(b_size: usize, mi_rows: u32, mi_cols: u32) -> Vec<(
 /// [`build_intra_only_yuv420_8bit_fh`] — the caller does not need to
 /// supply a fixture descriptor.
 ///
+/// Thin wrapper over [`encode_intra_frame_yuv_dyn_with_q`] with
+/// `base_q_idx = 0`; preserved for back-compat with all arc-r230..r232
+/// callers (the bit-exact lossless WHT roundtrip property is unchanged).
+///
 /// ## Errors
 ///
 /// * `input.validate()` fails (dimensions out of range / wrong plane
 ///   length) ⇒ [`Error::PartitionWalkOutOfRange`].
 /// * Any internal partition-tree / coefficient writer overflow.
 pub fn encode_intra_frame_yuv_dyn(input: &Yuv420Frame) -> Result<EncodedFrameDyn, Error> {
+    encode_intra_frame_yuv_dyn_with_q(input, 0)
+}
+
+/// Encode one 4:2:0 YUV intra-only frame at the caller-supplied
+/// `base_q_idx` (round 233 — first lossy-quant arc on the dyn
+/// driver). `base_q_idx == 0` selects the §5.9.2 `CodedLossless` arm
+/// (forward WHT + bit-exact lossless WHT roundtrip on the leaf
+/// transform); `base_q_idx > 0` selects the §7.13.3 forward DCT path
+/// with §7.12.3 forward quantize → decoder dequantize → §7.13.3
+/// inverse DCT.
+///
+/// Lossy contract: at `base_q_idx > 0` the encoder's running
+/// reconstructed plane is the bit-exact image the decoder would
+/// reconstruct from the same FH + tile bytes (the encoder runs the
+/// decoder's inverse pipeline on its own quantized coefficients before
+/// stamping `recon_*`). `decode_av1(encoded.ivf_bytes)` matches
+/// `encoded.reconstructed_*` byte-for-byte at any `base_q_idx`. The
+/// recovered planes do NOT in general equal `input.*` — quantization
+/// introduces rounding error bounded by the per-axis lookup
+/// (`dc_q_lookup[0][base_q_idx]` / `ac_q_lookup[0][base_q_idx]` per
+/// the §7.12.2 tables).
+///
+/// Scope this arc:
+///   * 4:2:0, 8-bit, intra-only, single tile, BLOCK_4X4 + TX_4X4 +
+///     DCT_DCT (no rectangular TX, no §5.11.18 inter mode_info, no
+///     per-segment / per-block delta_q, no QM, no in-loop filters).
+///   * `base_q_idx ∈ 0..=255`; the picker uses `DCT_DCT` exclusively
+///     at >0 (forward WHT only at the lossless arm).
+///
+/// ## Errors
+///
+/// * `input.validate()` fails ⇒ [`Error::PartitionWalkOutOfRange`].
+/// * Any internal partition-tree / coefficient writer overflow.
+pub fn encode_intra_frame_yuv_dyn_with_q(
+    input: &Yuv420Frame,
+    base_q_idx: u8,
+) -> Result<EncodedFrameDyn, Error> {
     input.validate()?;
     let width = input.width as usize;
     let height = input.height as usize;
@@ -965,11 +1043,17 @@ pub fn encode_intra_frame_yuv_dyn(input: &Yuv420Frame) -> Result<EncodedFrameDyn
 
     // Build the SH+FH for this frame.
     let seq = build_intra_only_yuv420_8bit_seq(input.width, input.height);
-    let fh = build_intra_only_yuv420_8bit_fh(&seq, input.width, input.height);
+    let fh = build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
 
-    // Lossless arm — encoder mirrors the §5.9.2 CodedLossless predicate
-    // (base_q_idx == 0 && every delta_q == 0).
-    let qp = QuantizerParams::neutral(0, 8);
+    // §5.9.2 `CodedLossless` predicate: `base_q_idx == 0 && every
+    // delta_q == 0`. The dyn FH keeps all delta_q* fields zero so the
+    // predicate reduces to `base_q_idx == 0`. The leaf transform routes
+    // through forward WHT on the lossless arm and forward DCT
+    // (`forward_transform_2d(..., DCT_DCT, false)`) on the lossy arm;
+    // the decoder dispatches symmetrically via `inverse_transform_2d`'s
+    // `lossless` flag.
+    let lossless = base_q_idx == 0;
+    let qp = QuantizerParams::neutral(base_q_idx, 8);
     let scan = get_default_scan(TX_4X4).to_vec();
 
     // Running reconstructed-pixel buffers (Vec-backed; row-major).
@@ -1006,11 +1090,19 @@ pub fn encode_intra_frame_yuv_dyn(input: &Yuv420Frame) -> Result<EncodedFrameDyn
                 residual_y[i * 4 + j] = p - q;
             }
         }
-        let coeffs_y = forward_wht_4x4(&residual_y).to_vec();
+        // §5.9.2 lossless arm: forward WHT (bit-exact lattice). Lossy
+        // arm (`base_q_idx > 0`): §7.13.3 forward DCT_DCT. The
+        // `lossless` flag passes through to `inverse_transform_2d` to
+        // match the decoder.
+        let coeffs_y = if lossless {
+            forward_wht_4x4(&residual_y).to_vec()
+        } else {
+            forward_transform_2d(&residual_y, TX_4X4, DCT_DCT, false)
+        };
         let quant_y = forward_quantize(&coeffs_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
 
         let dequant_y = dequantize_step1(&quant_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
-        let resid_back_y = inverse_transform_2d(&dequant_y, TX_4X4, DCT_DCT, 8, true);
+        let resid_back_y = inverse_transform_2d(&dequant_y, TX_4X4, DCT_DCT, 8, lossless);
         for i in 0..4 {
             for j in 0..4 {
                 let p = pred_y[i * 4 + j] as i64 + resid_back_y[i * 4 + j];
@@ -1078,11 +1170,17 @@ pub fn encode_intra_frame_yuv_dyn(input: &Yuv420Frame) -> Result<EncodedFrameDyn
                         residual_c[i * 4 + j] = p - q;
                     }
                 }
-                let coeffs_c = forward_wht_4x4(&residual_c).to_vec();
+                // §5.9.2 lossless arm vs lossy DCT — same dispatch as
+                // the luma walk.
+                let coeffs_c = if lossless {
+                    forward_wht_4x4(&residual_c).to_vec()
+                } else {
+                    forward_transform_2d(&residual_c, TX_4X4, DCT_DCT, false)
+                };
                 let quant_c = forward_quantize(&coeffs_c, TX_4X4, plane, 0, DCT_DCT, 15, &qp);
 
                 let dequant_c = dequantize_step1(&quant_c, TX_4X4, plane, 0, DCT_DCT, 15, &qp);
-                let resid_back_c = inverse_transform_2d(&dequant_c, TX_4X4, DCT_DCT, 8, true);
+                let resid_back_c = inverse_transform_2d(&dequant_c, TX_4X4, DCT_DCT, 8, lossless);
                 for i in 0..4 {
                     for j in 0..4 {
                         let p = pred_c[i * 4 + j] as i64 + resid_back_c[i * 4 + j];
@@ -1443,5 +1541,141 @@ mod tests {
             v: vec![0u8; 8],
         };
         assert!(encode_intra_frame_yuv_dyn(&bad).is_err());
+    }
+
+    // ---- r196/r233: lossy-quant path on the dyn driver. ----
+
+    #[test]
+    fn fh_with_q_zero_matches_legacy_lossless_fh_byte_for_byte() {
+        // Sanity: `build_intra_only_yuv420_8bit_fh_with_q(_, 0)` and
+        // the legacy `build_intra_only_yuv420_8bit_fh` must produce
+        // the same FrameHeader bytes (FH is the contract surface, so a
+        // field-by-field equality is the right guard).
+        let seq = build_intra_only_yuv420_8bit_seq(32, 32);
+        let fh_legacy = build_intra_only_yuv420_8bit_fh(&seq, 32, 32);
+        let fh_q0 = build_intra_only_yuv420_8bit_fh_with_q(&seq, 32, 32, 0);
+        assert_eq!(fh_legacy, fh_q0, "with_q(0) must equal the legacy FH");
+    }
+
+    #[test]
+    fn fh_with_q_one_carries_base_q_idx_and_switches_to_tx_mode_largest() {
+        // At base_q_idx > 0 the FH must declare `TxModeLargest`
+        // (§5.9.21 disallows `Only4x4` outside `CodedLossless`).
+        let seq = build_intra_only_yuv420_8bit_seq(32, 32);
+        let fh = build_intra_only_yuv420_8bit_fh_with_q(&seq, 32, 32, 1);
+        let qp = fh.quantization_params.as_ref().expect("intra has qparams");
+        assert_eq!(qp.base_q_idx, 1);
+        assert_eq!(qp.delta_q_y_dc, 0);
+        assert_eq!(qp.delta_q_u_dc, 0);
+        assert_eq!(qp.delta_q_u_ac, 0);
+        assert_eq!(qp.delta_q_v_dc, 0);
+        assert_eq!(qp.delta_q_v_ac, 0);
+        assert!(!qp.using_qmatrix);
+        assert_eq!(fh.tx_mode, Some(TxMode::TxModeLargest));
+    }
+
+    #[test]
+    fn fh_with_q_zero_keeps_tx_mode_only_4x4() {
+        // The legacy lossless arm uses `Only4x4` per §5.9.21 line 1.
+        let seq = build_intra_only_yuv420_8bit_seq(32, 32);
+        let fh = build_intra_only_yuv420_8bit_fh_with_q(&seq, 32, 32, 0);
+        assert_eq!(fh.tx_mode, Some(TxMode::Only4x4));
+    }
+
+    #[test]
+    fn fh_with_q_max_still_writes_a_valid_fh() {
+        // base_q_idx = 255 ⇒ TxModeLargest. Build + spot-check.
+        let seq = build_intra_only_yuv420_8bit_seq(32, 32);
+        let fh = build_intra_only_yuv420_8bit_fh_with_q(&seq, 32, 32, 255);
+        assert_eq!(
+            fh.quantization_params.as_ref().unwrap().base_q_idx,
+            255,
+            "base_q_idx clamps to u8::MAX"
+        );
+        assert_eq!(fh.tx_mode, Some(TxMode::TxModeLargest));
+    }
+
+    #[test]
+    fn encode_with_q_zero_matches_legacy_lossless_byte_for_byte() {
+        // Regression guard mirror of the integration test: the lib
+        // exposes both `encode_intra_frame_yuv_dyn` and
+        // `encode_intra_frame_yuv_dyn_with_q(_, 0)`; they must produce
+        // identical IVF bytes + reconstruction.
+        let input = Yuv420Frame::filled(32, 32, 128);
+        let legacy = encode_intra_frame_yuv_dyn(&input).expect("legacy ok");
+        let with_q0 = encode_intra_frame_yuv_dyn_with_q(&input, 0).expect("with_q(0) ok");
+        assert_eq!(legacy.ivf_bytes, with_q0.ivf_bytes);
+        assert_eq!(legacy.reconstructed_y, with_q0.reconstructed_y);
+        assert_eq!(legacy.reconstructed_u, with_q0.reconstructed_u);
+        assert_eq!(legacy.reconstructed_v, with_q0.reconstructed_v);
+    }
+
+    #[test]
+    fn encode_with_q_one_produces_different_bytes_than_q_zero() {
+        // q_idx = 1 selects the §7.13.3 DCT path + TxModeLargest; bytes
+        // MUST diverge from the lossless WHT/Only4x4 path. (At minimum
+        // the §5.9.12 `base_q_idx` slot in the FH is `1` vs `0`.)
+        let input = Yuv420Frame::filled(32, 32, 128);
+        let q0 = encode_intra_frame_yuv_dyn_with_q(&input, 0).expect("q=0 ok");
+        let q1 = encode_intra_frame_yuv_dyn_with_q(&input, 1).expect("q=1 ok");
+        assert_ne!(
+            q0.ivf_bytes, q1.ivf_bytes,
+            "lossy IVF bytes must differ from lossless at the same input"
+        );
+        assert_eq!(q0.fh.quantization_params.as_ref().unwrap().base_q_idx, 0);
+        assert_eq!(q1.fh.quantization_params.as_ref().unwrap().base_q_idx, 1);
+    }
+
+    #[test]
+    fn encode_with_q_succeeds_across_a_range_of_qindexes() {
+        // Smoke test: any qindex 0..=255 produces a parseable IVF byte
+        // stream. The full encode → decode loop is exercised in the
+        // integration tests; this lib test just makes sure no qindex
+        // is rejected at the encoder.
+        let input = Yuv420Frame::filled(32, 32, 64);
+        for &q in &[0u8, 1, 8, 16, 32, 64, 128, 200, 255] {
+            let res = encode_intra_frame_yuv_dyn_with_q(&input, q);
+            assert!(res.is_ok(), "encoder must accept base_q_idx = {q}");
+            let enc = res.unwrap();
+            assert_eq!(enc.fh.quantization_params.as_ref().unwrap().base_q_idx, q);
+        }
+    }
+
+    #[test]
+    fn encode_with_q_validation_still_rejects_invalid_dims() {
+        // The validation guard fires before the base_q_idx is consulted
+        // — invalid dims at any qindex must be rejected.
+        let bad = Yuv420Frame {
+            width: 16,
+            height: 16,
+            y: vec![0u8; 8],
+            u: vec![0u8; 8],
+            v: vec![0u8; 8],
+        };
+        assert!(encode_intra_frame_yuv_dyn_with_q(&bad, 0).is_err());
+        assert!(encode_intra_frame_yuv_dyn_with_q(&bad, 64).is_err());
+    }
+
+    #[test]
+    fn encode_with_q_one_recon_equals_recon_via_decoder_pipeline() {
+        // The encoder's running reconstructed plane is built by
+        // running the decoder's `dequantize_step1 → inverse_transform_2d`
+        // pipeline on the encoder's own `forward_quantize` output. The
+        // self-decode contract is therefore: feed the produced IVF
+        // bytes back through `crate::decoder::decode_av1` and observe
+        // the same byte stream as `encoded.reconstructed_*`. This is
+        // the lib-level mirror of the integration test.
+        use crate::decoder::{decode_av1, Frame};
+        let input = Yuv420Frame::filled(32, 32, 200);
+        let enc = encode_intra_frame_yuv_dyn_with_q(&input, 1).expect("encode succeeds");
+        let dec = decode_av1(&enc.ivf_bytes).expect("decode succeeds");
+        match &dec[0] {
+            Frame::Yuv420Dyn { y, u, v, .. } => {
+                assert_eq!(y, &enc.reconstructed_y);
+                assert_eq!(u, &enc.reconstructed_u);
+                assert_eq!(v, &enc.reconstructed_v);
+            }
+            other => panic!("expected Yuv420Dyn, got {other:?}"),
+        }
     }
 }

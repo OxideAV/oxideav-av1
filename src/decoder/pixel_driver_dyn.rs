@@ -77,15 +77,21 @@ pub(crate) fn decode_frame_dyn(
     let chroma_height = (height / 2) as usize;
     let mi_cols = fs.mi_cols;
     let mi_rows = fs.mi_rows;
-    // The encoder hard-codes the lossless quantizer state regardless of
-    // the FrameHeader's `base_q_idx` declaration. The decoder mirrors
-    // this for round-trip correctness — see the arc-18 driver comment
-    // on `_qp_fh`.
-    let _qp_fh = fh
+    // r233: lossy-quant support on the dyn driver. The decoder now
+    // reads §5.9.12 `base_q_idx` from the parsed FH and dispatches the
+    // leaf inverse transform via `inverse_transform_2d`'s `lossless`
+    // flag (`true` ⇔ `base_q_idx == 0` per the dyn-driver scope; no
+    // per-segment / per-block delta_q this arc). At `base_q_idx > 0`
+    // the encoder uses §7.13.3 forward DCT_DCT + §7.12.3 forward
+    // quantize; the decoder mirrors via §7.12.3 dequantize_step1 + the
+    // §7.13.3 inverse DCT_DCT (lossy arm). Only `base_q_idx` is read —
+    // the per-plane / per-segment `delta_q_*` slots stay at zero per
+    // this arc's scope.
+    let qp_fh = fh
         .quantization_params
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    let q_params = QuantizerParams::neutral(0, 8);
+    let q_params = QuantizerParams::neutral(qp_fh.base_q_idx, 8);
     let _ = seq;
 
     let parsed = parse_tile_group_obu_body(
@@ -415,6 +421,12 @@ fn decode_block_leaf(
     recon_u: &mut [u8],
     recon_v: &mut [u8],
 ) -> Result<(), Error> {
+    // r233: §5.9.2 `CodedLossless` predicate per the dyn driver scope
+    // (no per-segment / per-block delta_q this arc ⇒ the FH-level
+    // `base_q_idx == 0` is the whole predicate). Drives the
+    // `inverse_transform_2d` dispatch — WHT path at lossless,
+    // §7.13.3 inverse DCT_DCT otherwise.
+    let lossless = qp.base_q_idx == 0;
     let skip_ctx_val = skip_ctx(0, 0);
     let skip = {
         let cdf = cdfs.skip_cdf(skip_ctx_val);
@@ -490,7 +502,7 @@ fn decode_block_leaf(
     .ok_or(Error::PartitionWalkOutOfRange)?;
     if skip == 0 {
         let dequant = dequantize_step1(&quant_y, TX_4X4, 0, 0, DCT_DCT, 15, qp);
-        let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, true);
+        let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, lossless);
         for i in 0..4 {
             for j in 0..4 {
                 let p = pred_y[i * 4 + j] as i64 + residual[i * 4 + j];
@@ -560,7 +572,7 @@ fn decode_block_leaf(
         };
         if skip == 0 {
             let dequant = dequantize_step1(&quant_u, TX_4X4, 1, 0, DCT_DCT, 15, qp);
-            let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, true);
+            let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, lossless);
             for i in 0..4 {
                 for j in 0..4 {
                     let p = pred_u[i * 4 + j] as i64 + residual[i * 4 + j];
@@ -611,7 +623,7 @@ fn decode_block_leaf(
         };
         if skip == 0 {
             let dequant = dequantize_step1(&quant_v, TX_4X4, 2, 0, DCT_DCT, 15, qp);
-            let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, true);
+            let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, lossless);
             for i in 0..4 {
                 for j in 0..4 {
                     let p = pred_v[i * 4 + j] as i64 + residual[i * 4 + j];

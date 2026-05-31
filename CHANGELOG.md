@@ -4,6 +4,28 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder/decoder r196/r233: `base_q_idx > 0` (lossy quant) on the
+  dynamic-extent driver. New public entry
+  `encode_intra_frame_yuv_dyn_with_q(input, base_q_idx)` (additive;
+  the legacy `encode_intra_frame_yuv_dyn` is now a thin wrapper at
+  `base_q_idx = 0` that produces byte-for-byte identical IVF +
+  reconstruction output). At `base_q_idx > 0` the encoder routes the
+  leaf transform through §7.13.3 forward DCT_DCT + §7.12.3 forward
+  quantize and emits the FH with `TxModeLargest` (§5.9.21 requires
+  `Only4x4` only under §5.9.2 `CodedLossless`); the decoder reads
+  `base_q_idx` from the parsed FH and dispatches
+  `inverse_transform_2d`'s `lossless` flag symmetrically. Contract:
+  `decode_av1(enc.ivf_bytes)` matches `enc.reconstructed_*`
+  byte-for-byte at any qindex. New helper
+  `build_intra_only_yuv420_8bit_fh_with_q` + lib re-exports. +9 lib
+  tests (1489 → 1498) covering the lossy-FH builder, the q=0
+  back-compat invariant, qindex enumeration, and the self-decode
+  contract. +6 integration tests (29 → 35 in
+  `encode_decode_pixel_roundtrip`) covering q=1 flat/64×64, q=16
+  horizontal gradient, q=64 pseudo-random, q=255 stress, and the
+  with_q(0) ↔ legacy byte-for-byte equality regression guard. Lossy
+  rectangular TX, §5.11.18 inter mode_info, frames > 64×64, and
+  §5.11.34 per-block delta_q remain out of scope.
 - encoder/decoder r232: UV_CFL_PRED on the dynamic-extent driver
   (§7.11.5.3 chroma-from-luma now wired through
   `encode_intra_frame_yuv_dyn` + `Frame::Yuv420Dyn`). Picks the

@@ -2,6 +2,61 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-01 (round 233)
+
+Round 233 lands the first **lossy-quant** path on the dynamic-extent
+driver: `base_q_idx > 0` now selects the §7.13.3 forward DCT_DCT +
+§7.12.3 forward quantize chain (where the §5.9.2 `CodedLossless`
+path's r222 forward WHT used to be hard-wired). New public encoder
+entry `encode_intra_frame_yuv_dyn_with_q(input, base_q_idx)` accepts
+the caller's chosen qindex (`0..=255`); the legacy
+`encode_intra_frame_yuv_dyn` is now a thin wrapper at
+`base_q_idx = 0` that produces byte-for-byte identical IVF and
+reconstruction output (covered by an explicit regression guard).
+
+At `base_q_idx > 0` the encoder synthesises the FH with
+`TxModeLargest` (§5.9.21 line 1's `Only4x4` arm is illegal outside
+`CodedLossless`) via the new
+`build_intra_only_yuv420_8bit_fh_with_q` helper, runs the §7.13.3
+forward DCT on each 4×4 residual instead of the WHT, quantizes
+through `forward_quantize` at the chosen qindex, then dequantizes +
+inverse-DCTs back into the running reconstructed plane so the
+encoder's `recon_*` is the bit-exact image a conformant decoder
+would produce. The decoder side
+(`decoder::pixel_driver_dyn::decode_frame_dyn`) reads `base_q_idx`
+from the parsed FH (no longer hard-codes
+`QuantizerParams::neutral(0, 8)`) and threads `lossless = (qp.
+base_q_idx == 0)` through every leaf's `inverse_transform_2d` call
+— old streams with `base_q_idx == 0` keep the bit-exact lossless WHT
+path while new lossy streams take the §7.13.3 inverse DCT path
+symmetric to the encoder.
+
+The lossy contract: `decode_av1(encoded.ivf_bytes)` matches
+`encoded.reconstructed_*` byte-for-byte at any caller-supplied
+`base_q_idx`. The recovered planes do NOT in general equal the
+input — quantization introduces rounding error bounded by the
+§7.12.2 `dc_q_lookup` / `ac_q_lookup` step at the chosen qindex —
+but the encoder-recon ↔ decoder-out invariant is total. Verified
+end-to-end on `q ∈ {1, 16, 64, 255}` at 32×32 and 64×64 on flat,
+gradient, and pseudo-random inputs.
+
++9 lib unit tests (1489 → 1498: FH-builder q=0/q=1/q=max equality,
+encoder q=0↔legacy byte-for-byte regression guard, q≠0 byte
+divergence, qindex enumeration smoke, validation reject, self-decode
+contract) + 6 new integration tests (29 → 35 on
+`encode_decode_pixel_roundtrip`: lossy q=1 flat 32×32, lossy q=16
+horizontal gradient 32×32, lossy q=64 pseudo-random 32×32, lossy
+q=1 64×64, lossy q=255 stress, and with_q(0) ↔ legacy parity).
+
+Out of scope (next arc): frames larger than 64×64 (multi-super-
+block tiling), rectangular partitions / TX sizes, monochrome /
+4:2:2 / 4:4:4 sampling, §5.11.18 inter mode_info, §5.11.34
+per-block delta_q / §5.9.13 per-segment delta_q (the dyn driver
+emits one global `base_q_idx` per frame this arc), full bit-cost-
+aware RD on the dyn picker (the picker still ranks modes purely by
+residual SSD, not by §5.11.22 / §5.11.45 symbol bits — at large
+qindex this can cost a few stream bytes vs the RD-optimal pick).
+
 ## Status — 2026-05-31 (round 232)
 
 Round 232 ports r231's §7.11.5.3 **`UV_CFL_PRED`** chroma-from-luma

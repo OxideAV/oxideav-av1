@@ -1046,3 +1046,248 @@ fn dyn_encode_decode_pseudorandom_32x32_still_roundtrips_with_cfl_arm() {
         other => panic!("expected Yuv420Dyn, got {other:?}"),
     }
 }
+
+// -------------------------------------------------------------------------
+// r196/r233 — `base_q_idx > 0` (lossy quant) on the dyn driver.
+//
+// The lossy contract is: `decode_av1(encoded.ivf_bytes)` matches
+// `encoded.reconstructed_*` byte-for-byte at any caller-supplied
+// `base_q_idx`. The recovered planes do NOT in general equal `input.*`
+// — quantization introduces rounding error bounded by the §7.12.2
+// `dc_q_lookup` / `ac_q_lookup` step at the chosen qindex. The test
+// guard is therefore "decoder output == encoder reconstruction", not
+// "decoder output == input".
+//
+// The encoder side's running reconstructed buffers are the bit-exact
+// image the decoder would reconstruct from the same FH + tile bytes
+// because the encoder runs the same `dequantize_step1 →
+// inverse_transform_2d` pipeline on its own quantized coefficients
+// before stamping `recon_*`.
+// -------------------------------------------------------------------------
+
+#[test]
+fn dyn_encode_decode_lossy_q1_flat_grey_32x32_decoder_matches_encoder_recon() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_with_q, Yuv420Frame};
+    let input = Yuv420Frame::filled(32, 32, 128);
+    // q_idx = 1 — the smallest non-zero qindex. Still well within the
+    // bit-exact tolerance for flat-grey input (every DC residual
+    // collapses to a quantized zero and chroma DC_PRED brings the
+    // residual to zero on a flat plane).
+    let encoded =
+        encode_intra_frame_yuv_dyn_with_q(&input, 1).expect("encode succeeds at base_q_idx = 1");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn { y, u, v, .. } => {
+            assert_eq!(
+                y, &encoded.reconstructed_y,
+                "Y decoder output must match encoder reconstruction at base_q_idx = 1"
+            );
+            assert_eq!(
+                u, &encoded.reconstructed_u,
+                "U decoder output must match encoder reconstruction at base_q_idx = 1"
+            );
+            assert_eq!(
+                v, &encoded.reconstructed_v,
+                "V decoder output must match encoder reconstruction at base_q_idx = 1"
+            );
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_lossy_q16_horizontal_gradient_32x32_decoder_matches_encoder_recon() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_with_q, Yuv420Frame};
+    // q_idx = 16: `dc_q_lookup[0][16] = 20`, `ac_q_lookup[0][16] = 23`.
+    // A horizontal gradient exercises both the V_PRED-favouring picker
+    // and the §7.13.3 forward DCT_DCT path with non-trivial AC content.
+    let mut input = Yuv420Frame::filled(32, 32, 0);
+    let width = input.width as usize;
+    let cwidth = input.chroma_width() as usize;
+    for i in 0..(input.height as usize) {
+        for j in 0..width {
+            input.y[i * width + j] = (j * 8) as u8;
+        }
+    }
+    for i in 0..(input.chroma_height() as usize) {
+        for j in 0..cwidth {
+            input.u[i * cwidth + j] = (j * 16) as u8;
+            input.v[i * cwidth + j] = (255u8).wrapping_sub((j * 16) as u8);
+        }
+    }
+    let encoded =
+        encode_intra_frame_yuv_dyn_with_q(&input, 16).expect("encode succeeds at base_q_idx = 16");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn { y, u, v, .. } => {
+            assert_eq!(
+                y, &encoded.reconstructed_y,
+                "Y decoder output must match encoder reconstruction at base_q_idx = 16"
+            );
+            assert_eq!(
+                u, &encoded.reconstructed_u,
+                "U decoder output must match encoder reconstruction at base_q_idx = 16"
+            );
+            assert_eq!(
+                v, &encoded.reconstructed_v,
+                "V decoder output must match encoder reconstruction at base_q_idx = 16"
+            );
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_lossy_q64_pseudorandom_32x32_decoder_matches_encoder_recon() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_with_q, Yuv420Frame};
+    // q_idx = 64: a typical "mid-quality" qindex.
+    // `dc_q_lookup[0][64] = 76`, `ac_q_lookup[0][64] = 83`. The picker
+    // sees a pseudo-random input across the full byte range; the lossy
+    // arm must still round-trip encoder-recon → decoder-out bit-exact.
+    let mut input = Yuv420Frame::filled(32, 32, 0);
+    let mut state: u64 = 0xDEAD_BEEF_FEED_FACE;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = step();
+    }
+    for p in input.u.iter_mut() {
+        *p = step();
+    }
+    for p in input.v.iter_mut() {
+        *p = step();
+    }
+    let encoded =
+        encode_intra_frame_yuv_dyn_with_q(&input, 64).expect("encode succeeds at base_q_idx = 64");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn { y, u, v, .. } => {
+            assert_eq!(
+                y, &encoded.reconstructed_y,
+                "Y decoder output must match encoder reconstruction at base_q_idx = 64"
+            );
+            assert_eq!(
+                u, &encoded.reconstructed_u,
+                "U decoder output must match encoder reconstruction at base_q_idx = 64"
+            );
+            assert_eq!(
+                v, &encoded.reconstructed_v,
+                "V decoder output must match encoder reconstruction at base_q_idx = 64"
+            );
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_lossy_q1_64x64_decoder_matches_encoder_recon() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_with_q, Yuv420Frame};
+    // Largest dyn extent + smallest non-zero qindex. Exercises the
+    // multi-cell §7.13.3 forward DCT walk on the 64×64 super-block.
+    let input = Yuv420Frame::filled(64, 64, 200);
+    let encoded = encode_intra_frame_yuv_dyn_with_q(&input, 1).expect("encode succeeds");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn { y, u, v, .. } => {
+            assert_eq!(y, &encoded.reconstructed_y);
+            assert_eq!(u, &encoded.reconstructed_u);
+            assert_eq!(v, &encoded.reconstructed_v);
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn dyn_encode_decode_lossy_q_zero_via_with_q_matches_legacy_lossless_path() {
+    // Regression guard: `encode_intra_frame_yuv_dyn_with_q(_, 0)` must
+    // produce the exact same IVF bytes + reconstruction as the legacy
+    // `encode_intra_frame_yuv_dyn`. Catches any future divergence
+    // between the two entry points on the lossless arm.
+    use oxideav_av1::encoder::{
+        encode_intra_frame_yuv_dyn, encode_intra_frame_yuv_dyn_with_q, Yuv420Frame,
+    };
+    let mut input = Yuv420Frame::filled(32, 32, 0);
+    let mut state: u64 = 0x4242_4242_4242_4242;
+    let mut step = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = step();
+    }
+    for p in input.u.iter_mut() {
+        *p = step();
+    }
+    for p in input.v.iter_mut() {
+        *p = step();
+    }
+    let lossless_legacy = encode_intra_frame_yuv_dyn(&input).expect("legacy lossless encodes");
+    let lossless_via_q0 = encode_intra_frame_yuv_dyn_with_q(&input, 0).expect("with_q(0) encodes");
+    assert_eq!(
+        lossless_legacy.ivf_bytes, lossless_via_q0.ivf_bytes,
+        "with_q(0) must produce identical IVF bytes to the legacy lossless path"
+    );
+    assert_eq!(
+        lossless_legacy.reconstructed_y, lossless_via_q0.reconstructed_y,
+        "with_q(0) Y recon must match legacy lossless"
+    );
+    assert_eq!(
+        lossless_legacy.reconstructed_u, lossless_via_q0.reconstructed_u,
+        "with_q(0) U recon must match legacy lossless"
+    );
+    assert_eq!(
+        lossless_legacy.reconstructed_v, lossless_via_q0.reconstructed_v,
+        "with_q(0) V recon must match legacy lossless"
+    );
+    // Bit-exact equality against input is the lossless contract still
+    // in effect at q=0.
+    assert_eq!(lossless_via_q0.reconstructed_y, input.y);
+    assert_eq!(lossless_via_q0.reconstructed_u, input.u);
+    assert_eq!(lossless_via_q0.reconstructed_v, input.v);
+}
+
+#[test]
+fn dyn_encode_decode_lossy_q255_decoder_still_matches_encoder_recon() {
+    // Maximum lossy qindex (`base_q_idx = 255`) — `dc_q[0][255] = 1828`
+    // / `ac_q[0][255] = 1828`. Every coefficient quantizes to zero, so
+    // the encoder's reconstruction equals its prediction sequence. The
+    // decoder must reproduce the same picture byte-for-byte; this is
+    // the worst-case stress for the §7.12.3 dequantize + §7.13.3
+    // inverse DCT pipeline at the high end of the qindex table.
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_with_q, Yuv420Frame};
+    let mut input = Yuv420Frame::filled(32, 32, 0);
+    // Use a horizontal gradient so the predictor's choices are
+    // non-trivial across the frame.
+    let width = input.width as usize;
+    for i in 0..(input.height as usize) {
+        for j in 0..width {
+            input.y[i * width + j] = (j * 8) as u8;
+        }
+    }
+    let encoded = encode_intra_frame_yuv_dyn_with_q(&input, 255)
+        .expect("encode succeeds at base_q_idx = 255");
+    let decoded = decode_av1(&encoded.ivf_bytes).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn { y, u, v, .. } => {
+            assert_eq!(
+                y, &encoded.reconstructed_y,
+                "Y decoder output must match encoder reconstruction at base_q_idx = 255"
+            );
+            assert_eq!(
+                u, &encoded.reconstructed_u,
+                "U decoder output must match encoder reconstruction at base_q_idx = 255"
+            );
+            assert_eq!(
+                v, &encoded.reconstructed_v,
+                "V decoder output must match encoder reconstruction at base_q_idx = 255"
+            );
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}

@@ -299,8 +299,10 @@ pub use pixel_driver::{
     CHROMA_CELLS_WIDE, CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH, MI_COLS, MI_ROWS,
 };
 pub use pixel_driver_dyn::{
-    build_intra_only_yuv420_8bit_fh, build_intra_only_yuv420_8bit_seq, dispatch_order_leaves,
-    encode_intra_frame_yuv_dyn, root_super_block, EncodedFrameDyn, Yuv420Frame, MAX_DIM, MIN_DIM,
+    build_intra_only_yuv420_8bit_fh, build_intra_only_yuv420_8bit_fh_with_q,
+    build_intra_only_yuv420_8bit_seq, dispatch_order_leaves, encode_intra_frame_yuv_dyn,
+    encode_intra_frame_yuv_dyn_with_q, root_super_block, EncodedFrameDyn, Yuv420Frame, MAX_DIM,
+    MIN_DIM,
 };
 pub use sequence_obu::write_sequence_header_obu;
 pub use symbol_writer::SymbolWriter;
