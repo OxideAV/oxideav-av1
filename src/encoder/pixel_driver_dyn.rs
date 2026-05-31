@@ -24,23 +24,36 @@
 //!      quadrants. The existing §5.11.4 driver short-circuits these
 //!      via its line-1 `r >= MiRows || c >= MiCols` early return.
 //!
-//! ## Scope (arc r230)
+//! ## Scope (arc r230 + r233 + r234)
 //!
 //! * `width`, `height` ∈ {8, 16, 24, 32, 40, 48, 56, 64} (multiples
-//!   of 8, ≤ 64).
+//!   of 8, ≤ 64). Width and height are independent — rectangular
+//!   frame extents (`8×16`, `16×32`, `24×40`, `32×64`, `64×32`, ...)
+//!   are supported. The §5.11.4 partition tree's per-quadrant
+//!   `r >= mi_rows || c >= mi_cols` early-return swallows
+//!   out-of-frame quadrants of the smallest power-of-two super-block
+//!   that covers `max(mi_cols, mi_rows)` — see
+//!   [`build_partition_tree`] for the recursion shape.
 //! * `subsampling_x = subsampling_y = 1` (4:2:0), `bit_depth = 8`,
 //!   `monochrome = false`.
-//! * Intra-only, single tile, `base_q_idx = 0` (lossless WHT arm),
-//!   `tx_size = TX_4X4` everywhere, no segmentation, no QM, no
-//!   in-loop filters.
-//! * 13-mode intra picker on luma + chroma (the r228/r229 picker).
+//! * Intra-only, single tile, `base_q_idx ∈ 0..=255` (`= 0` selects
+//!   the §5.9.2 `CodedLossless` arm + forward WHT on the leaf
+//!   transform; `> 0` selects §7.13.3 forward DCT_DCT + §7.12.3
+//!   forward quantize). `tx_size = TX_4X4` everywhere, no
+//!   segmentation, no QM, no in-loop filters.
+//! * 13-mode intra picker on luma + chroma (the r228/r229 picker)
+//!   plus the r194/r232 §7.11.5.3 `UV_CFL_PRED` arm on chroma.
 //!
 //! ## What this arc does NOT do
 //!
 //! * Frames > 64×64 (multi-super-block tiling).
 //! * Non-8 bit-depth, non-4:2:0 sampling, monochrome.
-//! * `base_q_idx > 0` (only the lossless WHT arm is wired).
-//! * Larger transform blocks; rectangular partitions; inter mode_info.
+//! * Rectangular **transform sizes** (the §3 `TX_4X8` / `TX_8X4` /
+//!   `TX_8X16` / `TX_16X8` family). The leaf transform is `TX_4X4`
+//!   everywhere; only the **frame extent** is allowed to be
+//!   rectangular.
+//! * §5.11.18 inter mode_info, per-segment / per-block delta_q, RD
+//!   picker.
 //!
 //! ## Spec provenance
 //!
@@ -101,7 +114,11 @@ use crate::cdf::{
 /// construction time.
 pub const MIN_DIM: u32 = 8;
 /// Largest super-block this arc handles in one root partition tree
-/// (`BLOCK_64X64`). Multi-super-block tiling is a follow-up.
+/// (`BLOCK_64X64`). Multi-super-block tiling is a follow-up. Width
+/// and height are independently bounded by this constant — the
+/// per-quadrant out-of-frame sentinel in [`build_partition_tree`]
+/// lets a rectangular extent (e.g. `16 × 64` ⇒ `mi 4 × 16`) ride the
+/// same `BLOCK_64X64` root as a square 64×64 frame would.
 pub const MAX_DIM: u32 = 64;
 
 /// Dynamic-extent 4:2:0 YUV input the dyn driver consumes. Plane data
@@ -1016,8 +1033,10 @@ pub fn encode_intra_frame_yuv_dyn(input: &Yuv420Frame) -> Result<EncodedFrameDyn
 ///
 /// Scope this arc:
 ///   * 4:2:0, 8-bit, intra-only, single tile, BLOCK_4X4 + TX_4X4 +
-///     DCT_DCT (no rectangular TX, no §5.11.18 inter mode_info, no
-///     per-segment / per-block delta_q, no QM, no in-loop filters).
+///     DCT_DCT (no rectangular **TX_SIZE** family, no §5.11.18 inter
+///     mode_info, no per-segment / per-block delta_q, no QM, no
+///     in-loop filters). Frame **extent** may be rectangular within
+///     {8, 16, 24, 32, 40, 48, 56, 64} per axis.
 ///   * `base_q_idx ∈ 0..=255`; the picker uses `DCT_DCT` exclusively
 ///     at >0 (forward WHT only at the lossless arm).
 ///
@@ -1676,6 +1695,218 @@ mod tests {
                 assert_eq!(v, &enc.reconstructed_v);
             }
             other => panic!("expected Yuv420Dyn, got {other:?}"),
+        }
+    }
+
+    // ---- r197/r234: rectangular frame-extent coverage. ----
+    //
+    // The §5.11.4 partition tree's per-quadrant `r >= mi_rows || c >=
+    // mi_cols` early return + `EncodeNode::dummy_oob` sentinel already
+    // give the dyn driver "rectangular extent" support for free —
+    // every quadrant outside the in-frame rectangle gets a
+    // SPLIT-recursion that bottoms out into sentinels the
+    // §5.11.4 driver swallows on line 1. These tests promote that
+    // property to a tested invariant + add fixture coverage at every
+    // rectangular extent the §5.11.5 4:2:0 chroma constraint admits
+    // within `MIN_DIM..=MAX_DIM`.
+
+    /// `dispatch_order_leaves` must enumerate every in-frame BLOCK_4X4
+    /// cell exactly once at a rectangular `(mi_rows, mi_cols)` extent
+    /// (where the root super-block is the smallest power-of-two
+    /// covering `max(mi_cols, mi_rows)`). Out-of-frame cells must not
+    /// be enumerated.
+    #[test]
+    fn dispatch_order_leaves_covers_every_in_frame_cell_rectangular() {
+        // (mi_rows, mi_cols, expected_root_size) — covers every shape
+        // class: short+wide, tall+narrow, partial-coverage extents.
+        for (mi_rows, mi_cols) in [
+            (2u32, 4u32), // 8 × 16
+            (4, 2),       // 16 × 8
+            (4, 8),       // 16 × 32
+            (8, 4),       // 32 × 16
+            (6, 8),       // 24 × 32
+            (8, 6),       // 32 × 24
+            (10, 4),      // 40 × 16
+            (4, 10),      // 16 × 40
+            (12, 8),      // 48 × 32
+            (8, 12),      // 32 × 48
+            (16, 8),      // 64 × 32
+            (8, 16),      // 32 × 64
+            (10, 16),     // 40 × 64
+            (16, 10),     // 64 × 40
+        ] {
+            let root = root_super_block(mi_cols, mi_rows);
+            let leaves = dispatch_order_leaves(root, mi_rows, mi_cols);
+            let expected = (mi_rows * mi_cols) as usize;
+            assert_eq!(
+                leaves.len(),
+                expected,
+                "mi {mi_rows}x{mi_cols} (root b={root}) expected {expected} leaves, got {}",
+                leaves.len()
+            );
+            // Exactly-once coverage.
+            let mut seen = vec![false; expected];
+            for &(r, c) in &leaves {
+                assert!(
+                    r < mi_rows && c < mi_cols,
+                    "leaf ({r},{c}) outside frame mi {mi_rows}x{mi_cols}"
+                );
+                let idx = (r * mi_cols + c) as usize;
+                assert!(!seen[idx], "cell ({r},{c}) visited twice");
+                seen[idx] = true;
+            }
+            assert!(
+                seen.iter().all(|&b| b),
+                "mi {mi_rows}x{mi_cols} (root b={root}) missed at least one cell"
+            );
+        }
+    }
+
+    #[test]
+    fn root_super_block_handles_rectangular_extents() {
+        // The root picks the smallest power-of-two covering
+        // max(mi_cols, mi_rows). Every rectangular extent ≤ 64×64
+        // therefore lands on BLOCK_16X16 / 32X32 / 64X64.
+        // mi 2×4 (8×16) ⇒ max 4 ⇒ BLOCK_16X16
+        assert_eq!(root_super_block(2, 4), BLOCK_16X16);
+        // mi 4×2 (16×8) ⇒ max 4 ⇒ BLOCK_16X16
+        assert_eq!(root_super_block(4, 2), BLOCK_16X16);
+        // mi 4×8 (16×32) ⇒ max 8 ⇒ BLOCK_32X32
+        assert_eq!(root_super_block(4, 8), BLOCK_32X32);
+        // mi 8×4 (32×16) ⇒ max 8 ⇒ BLOCK_32X32
+        assert_eq!(root_super_block(8, 4), BLOCK_32X32);
+        // mi 10×4 (40×16) ⇒ max 10 ⇒ BLOCK_64X64
+        assert_eq!(root_super_block(10, 4), BLOCK_64X64);
+        // mi 4×16 (16×64) ⇒ max 16 ⇒ BLOCK_64X64
+        assert_eq!(root_super_block(4, 16), BLOCK_64X64);
+    }
+
+    #[test]
+    fn yuv420_frame_validate_accepts_every_rectangular_aligned_dim() {
+        // Sweep every (w, h) pair in {8,16,24,32,40,48,56,64}². validate()
+        // accepts the lot, including the strictly-rectangular pairs.
+        let dims = [8u32, 16, 24, 32, 40, 48, 56, 64];
+        for &w in &dims {
+            for &h in &dims {
+                let f = Yuv420Frame::filled(w, h, 128);
+                assert!(
+                    f.validate().is_ok(),
+                    "{w}x{h} should validate (every (multiples-of-8) extent ≤ MAX_DIM is in scope)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_flat_grey_rectangular_extents_recon_matches_input() {
+        // Lossless WHT arm: every rectangular extent's reconstruction
+        // must equal the input plane-for-plane. Spot-checks the
+        // four cardinal rectangular shapes against the existing
+        // BLOCK_64X64 / 32X32 / 16X16 root super-blocks.
+        for (w, h) in [
+            (8u32, 16u32),
+            (16, 8),
+            (16, 32),
+            (32, 16),
+            (24, 40),
+            (40, 24),
+            (32, 64),
+            (64, 32),
+        ] {
+            let input = Yuv420Frame::filled(w, h, 128);
+            let res = encode_intra_frame_yuv_dyn(&input)
+                .unwrap_or_else(|e| panic!("encode {w}x{h} failed: {e:?}"));
+            assert_eq!(res.reconstructed_y, input.y, "Y mismatch at {w}x{h}");
+            assert_eq!(res.reconstructed_u, input.u, "U mismatch at {w}x{h}");
+            assert_eq!(res.reconstructed_v, input.v, "V mismatch at {w}x{h}");
+            // FH carries the rectangular extent verbatim.
+            let fs = res.fh.frame_size.as_ref().expect("intra has frame_size");
+            assert_eq!(fs.frame_width, w);
+            assert_eq!(fs.frame_height, h);
+        }
+    }
+
+    #[test]
+    fn encode_with_q_succeeds_on_every_rectangular_extent() {
+        // Smoke: every rectangular extent must encode at every qindex
+        // we plumb in the lossy arm. Per-leaf reconstruction is asserted
+        // by the integration tests; this lib test just confirms the
+        // encoder never refuses a rectangular shape at q > 0.
+        for (w, h) in [
+            (8u32, 16u32),
+            (16, 8),
+            (16, 32),
+            (32, 16),
+            (24, 40),
+            (40, 24),
+            (48, 32),
+            (32, 48),
+            (32, 64),
+            (64, 32),
+        ] {
+            for &q in &[1u8, 16, 64, 255] {
+                let input = Yuv420Frame::filled(w, h, 64);
+                let res = encode_intra_frame_yuv_dyn_with_q(&input, q);
+                assert!(
+                    res.is_ok(),
+                    "encoder rejected {w}x{h} at q={q}: {:?}",
+                    res.err()
+                );
+                let enc = res.unwrap();
+                assert_eq!(enc.fh.quantization_params.as_ref().unwrap().base_q_idx, q);
+                let fs = enc.fh.frame_size.as_ref().unwrap();
+                assert_eq!(fs.frame_width, w);
+                assert_eq!(fs.frame_height, h);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_rectangular_lossy_self_decodes_byte_for_byte() {
+        // Lib-level mirror of the integration test: lossy encode of a
+        // rectangular extent + immediate decode_av1 of the produced IVF
+        // bytes ⇒ recovered planes equal `encoded.reconstructed_*`.
+        // Exercises the §7.13.3 inverse-DCT decoder path against
+        // partial-coverage out-of-frame quadrants.
+        use crate::decoder::{decode_av1, Frame};
+        for (w, h) in [(16u32, 32u32), (32, 16), (8, 16), (16, 8)] {
+            let mut input = Yuv420Frame::filled(w, h, 0);
+            let mut state: u64 = (w as u64).wrapping_mul(2654435761).wrapping_add(h as u64);
+            let mut next = || -> u8 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 56) as u8
+            };
+            for p in input.y.iter_mut() {
+                *p = next();
+            }
+            for p in input.u.iter_mut() {
+                *p = next();
+            }
+            for p in input.v.iter_mut() {
+                *p = next();
+            }
+            let enc = encode_intra_frame_yuv_dyn_with_q(&input, 16)
+                .unwrap_or_else(|e| panic!("encode {w}x{h} q=16 failed: {e:?}"));
+            let dec = decode_av1(&enc.ivf_bytes)
+                .unwrap_or_else(|e| panic!("decode {w}x{h} q=16 failed: {e:?}"));
+            match &dec[0] {
+                Frame::Yuv420Dyn {
+                    width,
+                    height,
+                    y,
+                    u,
+                    v,
+                } => {
+                    assert_eq!(*width, w, "decoded width mismatch at {w}x{h}");
+                    assert_eq!(*height, h, "decoded height mismatch at {w}x{h}");
+                    assert_eq!(y, &enc.reconstructed_y, "Y mismatch at {w}x{h}");
+                    assert_eq!(u, &enc.reconstructed_u, "U mismatch at {w}x{h}");
+                    assert_eq!(v, &enc.reconstructed_v, "V mismatch at {w}x{h}");
+                }
+                other => panic!("expected Yuv420Dyn at {w}x{h}, got {other:?}"),
+            }
         }
     }
 }

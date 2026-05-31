@@ -2,6 +2,63 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-01 (round 234)
+
+Round 234 promotes **rectangular frame extents** on the dynamic-extent
+encoder + decoder driver from "works incidentally" to a tested
+invariant. The §5.11.4 partition tree's per-quadrant `r >= mi_rows ||
+c >= mi_cols` early return + `EncodeNode::dummy_oob` sentinel already
+let the dyn driver walk an extent whose `(mi_cols, mi_rows)` aren't
+square — the root super-block (smallest power-of-two covering
+`max(mi_cols, mi_rows)`) absorbs the empty quadrants via SPLIT
+recursion until every quadrant either fires a real BLOCK_4X4 leaf or
+hits the line-1 OOB sentinel. This round pins the property with
+fixture-grid integration tests covering every cardinal rectangular
+shape:
+
+* BLOCK_16X16 root: 8×16, 16×8
+* BLOCK_32X32 root: 16×32, 32×16, 24×32, 32×24, 32×48, 48×32 (with
+  partial-coverage right / bottom edges)
+* BLOCK_64X64 root: 40×16, 16×40, 32×64, 64×32
+
+… at the §5.9.2 `CodedLossless` arm (`base_q_idx = 0`, forward WHT
+on the leaf transform — recovered planes equal the input
+plane-for-plane) and at the §7.13.3 lossy DCT arm across the qindex
+spans `q ∈ {1, 16, 32, 64, 128, 200, 255}` (encoder reconstruction
+matches decoder output byte-for-byte).
+
+The scope docs on `encoder::pixel_driver_dyn` +
+`decoder::pixel_driver_dyn` are updated to clarify that the
+out-of-scope "no rectangular partitions" line referred to the §3
+**`TX_SIZE` family** (`TX_4X8` / `TX_8X4` / `TX_8X16` / `TX_16X8`),
+not to the frame **extent** — every leaf is still TX_4X4 this arc;
+only the frame dimensions are allowed to be rectangular.
+
+The IVF v0 header bytes 12..14 (width LE) and 14..16 (height LE) +
+the FH `frame_size.{frame_width,frame_height,mi_cols,mi_rows}` carry
+the rectangular extent verbatim; a dimension-write check on six
+rectangular shapes rules out any "decoder happened to match because
+the encoder fell back to a square" latent bug.
+
++6 lib unit tests (1498 → 1504: rectangular `dispatch_order_leaves`
+coverage, rectangular `root_super_block` shape table, every-extent
+`validate` acceptance over `{8,16,24,32,40,48,56,64}²`, flat-grey
+rectangular recon equality, every-extent lossy q-grid encode, and a
+lib-level rectangular-lossy self-decode contract on
+`{16×32, 32×16, 8×16, 16×8}` at q=16).
+
++22 integration tests (35 → 57 on `encode_decode_pixel_roundtrip`):
+12 lossless pseudorandom rectangular extents + 9 lossy rectangular
+roundtrips spanning the qindex range + 1 IVF/FH dimension-write check.
+
+Out of scope (next arc): rectangular **TX_SIZE family** (`TX_4X8` /
+`TX_8X4` / `TX_8X16` / `TX_16X8` — would require new forward
+transform primitives at non-square shapes + §5.11.36
+`transform_tree` writer support + decoder dispatch) — TX_4X4
+leaves remain everywhere this arc; multi-super-block tiling (frames
+> 64×64); §5.11.18 inter mode_info; per-segment / per-block delta_q;
+full bit-cost-aware RD on the dyn picker.
+
 ## Status — 2026-06-01 (round 233)
 
 Round 233 lands the first **lossy-quant** path on the dynamic-extent

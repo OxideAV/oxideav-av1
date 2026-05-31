@@ -1291,3 +1291,243 @@ fn dyn_encode_decode_lossy_q255_decoder_still_matches_encoder_recon() {
         other => panic!("expected Yuv420Dyn, got {other:?}"),
     }
 }
+
+// ----------------------------------------------------------------------
+// r197 / r234 — Rectangular frame-extent coverage on the dyn driver.
+//
+// The §5.11.4 partition tree's per-quadrant `r >= mi_rows || c >=
+// mi_cols` early return + `EncodeNode::dummy_oob` sentinel already let
+// the dyn encoder + decoder handle any extent in `MIN_DIM..=MAX_DIM`
+// (multiples of 8). These integration tests promote that property from
+// "works incidentally" to a tested invariant, sweeping the cardinal
+// rectangular shapes — short+wide, tall+narrow, partial-coverage at
+// every super-block class (BLOCK_16X16 / 32X32 / 64X64 root) — across
+// the lossless WHT arm and the §7.13.3 lossy DCT arm at every plumbed
+// qindex.
+//
+// The picker's `tx_size = TX_4X4` everywhere stays unchanged this
+// round; only the **frame extent** is allowed to be rectangular. The
+// rectangular **TX_SIZE** family (`TX_4X8` / `TX_8X4` / `TX_8X16` /
+// `TX_16X8`) remains a follow-up arc.
+
+fn random_yuv(w: u32, h: u32, seed: u64) -> oxideav_av1::encoder::Yuv420Frame {
+    use oxideav_av1::encoder::Yuv420Frame;
+    let mut input = Yuv420Frame::filled(w, h, 0);
+    let mut state: u64 = seed
+        .wrapping_mul(2654435761)
+        .wrapping_add((w as u64) << 16)
+        .wrapping_add(h as u64);
+    let mut next = || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = next();
+    }
+    for p in input.u.iter_mut() {
+        *p = next();
+    }
+    for p in input.v.iter_mut() {
+        *p = next();
+    }
+    input
+}
+
+/// Helper — assert encoder → decoder bit-exact round-trip on one
+/// rectangular `(w, h)` extent at one `q`. The encoder's
+/// reconstruction is what the decoder must reproduce (lossless input
+/// equality is asserted separately at `q == 0` only).
+fn assert_rect_roundtrip_bit_exact(w: u32, h: u32, q: u8) {
+    use oxideav_av1::encoder::encode_intra_frame_yuv_dyn_with_q;
+    let input = random_yuv(w, h, 0xA5A5_5A5A);
+    let encoded = encode_intra_frame_yuv_dyn_with_q(&input, q)
+        .unwrap_or_else(|e| panic!("encode {w}x{h} q={q} failed: {e:?}"));
+    let decoded = decode_av1(&encoded.ivf_bytes)
+        .unwrap_or_else(|e| panic!("decode {w}x{h} q={q} failed: {e:?}"));
+    assert_eq!(
+        decoded.len(),
+        1,
+        "one frame in, one frame out ({w}x{h} q={q})"
+    );
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, w, "decoded width mismatch at {w}x{h} q={q}");
+            assert_eq!(*height, h, "decoded height mismatch at {w}x{h} q={q}");
+            assert_eq!(
+                y, &encoded.reconstructed_y,
+                "Y decoder ≠ encoder.recon at {w}x{h} q={q}"
+            );
+            assert_eq!(
+                u, &encoded.reconstructed_u,
+                "U decoder ≠ encoder.recon at {w}x{h} q={q}"
+            );
+            assert_eq!(
+                v, &encoded.reconstructed_v,
+                "V decoder ≠ encoder.recon at {w}x{h} q={q}"
+            );
+            if q == 0 {
+                assert_eq!(y, &input.y, "Y lossless WHT recovery mismatch at {w}x{h}");
+                assert_eq!(u, &input.u, "U lossless WHT recovery mismatch at {w}x{h}");
+                assert_eq!(v, &input.v, "V lossless WHT recovery mismatch at {w}x{h}");
+            }
+        }
+        other => panic!("expected Yuv420Dyn at {w}x{h} q={q}, got {other:?}"),
+    }
+}
+
+// --- Lossless WHT arm (`q == 0`) at every cardinal rectangular shape. ---
+
+#[test]
+fn dyn_encode_decode_rect_lossless_16x32_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(16, 32, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_32x16_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(32, 16, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_8x16_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(8, 16, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_16x8_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(16, 8, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_24x32_pseudorandom_bit_exact() {
+    // Partial-coverage extent — mi 6×8, root BLOCK_32X32, the right
+    // BLOCK_16X16 quadrants partially overflow the frame width.
+    assert_rect_roundtrip_bit_exact(24, 32, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_32x24_pseudorandom_bit_exact() {
+    // Transposed partial-coverage shape — mi 8×6, bottom quadrants
+    // partially out-of-frame on height.
+    assert_rect_roundtrip_bit_exact(32, 24, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_40x16_pseudorandom_bit_exact() {
+    // Forces BLOCK_64X64 root super-block (max(mi) = 10).
+    assert_rect_roundtrip_bit_exact(40, 16, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_16x40_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(16, 40, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_48x32_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(48, 32, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_32x48_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(32, 48, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_32x64_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(32, 64, 0);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossless_64x32_pseudorandom_bit_exact() {
+    assert_rect_roundtrip_bit_exact(64, 32, 0);
+}
+
+// --- §7.13.3 lossy DCT arm — every rectangular extent across qindex
+//     spans the dyn driver supports. Asserts encoder.recon ↔ decoder
+//     bit-equality (the lossy self-decode contract). ---
+
+#[test]
+fn dyn_encode_decode_rect_lossy_16x32_q1_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(16, 32, 1);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_32x16_q16_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(32, 16, 16);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_8x16_q64_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(8, 16, 64);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_16x8_q255_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(16, 8, 255);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_24x32_q32_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(24, 32, 32);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_40x16_q128_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(40, 16, 128);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_16x40_q200_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(16, 40, 200);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_32x64_q64_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(32, 64, 64);
+}
+
+#[test]
+fn dyn_encode_decode_rect_lossy_64x32_q255_decoder_matches_encoder_recon() {
+    assert_rect_roundtrip_bit_exact(64, 32, 255);
+}
+
+// --- Coverage / API surface: a rectangular extent the encoder accepts
+//     must surface in the produced IVF v0 header (`bytes 12..14 = width
+//     LE`, `bytes 14..16 = height LE`). This rules out a "decode
+//     happens to work because the encoder fell back to a square" sort
+//     of latent bug. ---
+
+#[test]
+fn dyn_encode_rect_writes_correct_dimensions_in_ivf_v0_header() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    for (w, h) in [
+        (16u32, 32u32),
+        (32, 16),
+        (8, 16),
+        (16, 8),
+        (40, 24),
+        (24, 40),
+    ] {
+        let input = Yuv420Frame::filled(w, h, 64);
+        let res = encode_intra_frame_yuv_dyn(&input)
+            .unwrap_or_else(|e| panic!("encode {w}x{h} failed: {e:?}"));
+        let ivf_w = u16::from_le_bytes([res.ivf_bytes[12], res.ivf_bytes[13]]) as u32;
+        let ivf_h = u16::from_le_bytes([res.ivf_bytes[14], res.ivf_bytes[15]]) as u32;
+        assert_eq!(ivf_w, w, "IVF v0 header width mismatch for {w}x{h}");
+        assert_eq!(ivf_h, h, "IVF v0 header height mismatch for {w}x{h}");
+        let fs = res.fh.frame_size.as_ref().expect("intra has frame_size");
+        assert_eq!(fs.frame_width, w);
+        assert_eq!(fs.frame_height, h);
+        // The FH `mi_cols`/`mi_rows` derivation: 2 * ceil(dim/8).
+        assert_eq!(fs.mi_cols, 2 * ((w + 7) >> 3));
+        assert_eq!(fs.mi_rows, 2 * ((h + 7) >> 3));
+    }
+}

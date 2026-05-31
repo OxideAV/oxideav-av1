@@ -9,18 +9,27 @@
 //! that the running reconstructed plane is a Vec-backed buffer sized
 //! to the per-frame extent rather than `[[u8; 16]; 16]`.
 //!
-//! Scope mirrors the r230 encoder exactly:
+//! Scope mirrors the r230 + r233 + r234 encoder exactly:
 //!
 //!   * `subsampling_x = subsampling_y = 1` (4:2:0), `bit_depth = 8`,
 //!     not monochrome.
 //!   * `frame_width`, `frame_height` ∈ {8, 16, 24, 32, 40, 48, 56,
 //!     64}; both must be multiples of 8 (the 4:2:0 chroma
-//!     constraint).
-//!   * `base_q_idx == 0` (the §5.9.2 `CodedLossless` arm — encoder
-//!     uses forward WHT, decoder uses the §7.13.2.10 inverse WHT).
-//!   * Intra-only, single tile, BLOCK_4X4 leaves, TX_4X4 DCT_DCT,
-//!     default scan, no segmentation, no QM, no in-loop filters.
-//!   * 13-mode intra picker on luma + chroma (the r228/r229 picker).
+//!     constraint). Width and height are independent — rectangular
+//!     frame extents (`8×16`, `16×32`, `24×40`, `32×64`, ...) ride
+//!     the smallest power-of-two super-block covering
+//!     `max(mi_cols, mi_rows)` with out-of-frame quadrants swallowed
+//!     by the §5.11.4 per-quadrant early return.
+//!   * `base_q_idx ∈ 0..=255`. `== 0` is the §5.9.2 `CodedLossless`
+//!     arm (encoder uses forward WHT, decoder uses the §7.13.2.10
+//!     inverse WHT); `> 0` is the §7.13.3 inverse DCT_DCT lossy
+//!     arm (decoder threads `lossless` through every leaf's
+//!     `inverse_transform_2d` based on the parsed FH `base_q_idx`).
+//!   * Intra-only, single tile, BLOCK_4X4 leaves, TX_4X4 (no
+//!     rectangular **TX_SIZE** family), default scan, no
+//!     segmentation, no QM, no in-loop filters.
+//!   * 13-mode intra picker on luma + chroma (the r228/r229 picker)
+//!     plus the r232 §7.11.5.3 `UV_CFL_PRED` arm on chroma.
 //!
 //! Outside that scope, returns [`Error::PartitionWalkOutOfRange`].
 

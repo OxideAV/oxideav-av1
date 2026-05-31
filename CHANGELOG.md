@@ -4,6 +4,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder/decoder r197/r234: rectangular frame extents on the
+  dynamic-extent driver — promoted from "works incidentally" to a
+  tested invariant. Width and height are now independently bounded by
+  `MIN_DIM..=MAX_DIM` (8..=64, multiples of 8); the §5.11.4 partition
+  tree's per-quadrant `r >= mi_rows || c >= mi_cols` early return +
+  `EncodeNode::dummy_oob` sentinel already let the encoder + decoder
+  walk any rectangular `(mi_rows, mi_cols)` rooted in the smallest
+  power-of-two super-block covering `max(mi_cols, mi_rows)` — the
+  tests pin the property at `{8,16}×{16,8}` (BLOCK_16X16 root),
+  `{16,32}×{32,16}` (BLOCK_32X32), `{24,32}×{32,24}` /
+  `{32,48}×{48,32}` (BLOCK_32X32 + partial-coverage), and
+  `{40,16}×{16,40}` / `{32,64}×{64,32}` (BLOCK_64X64). Scope docs on
+  `encoder::pixel_driver_dyn` + `decoder::pixel_driver_dyn` updated
+  to reflect that "no rectangular partitions" referred to the
+  §3 `TX_4X8` / `TX_8X4` / `TX_8X16` / `TX_16X8` **transform-size**
+  family (still out of scope this arc — TX_4X4 leaves everywhere) and
+  NOT to the frame extent (which is now in scope). +6 lib tests
+  (1498 → 1504; rectangular `dispatch_order_leaves` coverage,
+  rectangular `root_super_block` shape table, every-extent
+  `validate` acceptance, flat-grey rectangular recon equality,
+  every-extent lossy q-grid, and a lib-level rectangular-lossy
+  self-decode contract). +22 integration tests
+  (35 → 57 in `encode_decode_pixel_roundtrip`): 12 lossless
+  pseudorandom rectangular extents (16×32 / 32×16 / 8×16 / 16×8 /
+  24×32 / 32×24 / 40×16 / 16×40 / 48×32 / 32×48 / 32×64 / 64×32) +
+  9 lossy rectangular roundtrips across q ∈ {1, 16, 32, 64, 128, 200,
+  255} + 1 IVF v0 header dimension-write check on six rectangular
+  shapes. Rectangular **TX_SIZE** family, multi-super-block tiling,
+  §5.11.18 inter mode_info, monochrome / 4:2:2 / 4:4:4 sampling, and
+  per-segment / per-block delta_q remain out of scope.
 - encoder/decoder r196/r233: `base_q_idx > 0` (lossy quant) on the
   dynamic-extent driver. New public entry
   `encode_intra_frame_yuv_dyn_with_q(input, base_q_idx)` (additive;
