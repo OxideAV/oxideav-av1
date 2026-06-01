@@ -1531,3 +1531,157 @@ fn dyn_encode_rect_writes_correct_dimensions_in_ivf_v0_header() {
         assert_eq!(fs.mi_rows, 2 * ((h + 7) >> 3));
     }
 }
+
+// =====================================================================
+// r207 — multi-super-block monochrome (Y-only) dyn driver integration
+// tests.
+//
+// Exercises the §5.11.1 SB-grid walk introduced in r207 by encoding
+// then decoding frames whose extent exceeds the prior single-SB cap of
+// 64 × 64 (up to the new 128 × 128 ceiling). The end-to-end contract
+// is the same as for the ≤ 64×64 path: at `base_q_idx = 0` the
+// recovered Y plane equals the input plane-for-plane; at
+// `base_q_idx > 0` the decoded plane equals the encoder-internal
+// reconstruction byte-for-byte.
+// =====================================================================
+
+#[test]
+fn mono_y_multi_sb_dyn_encode_decode_lossless_roundtrip_96x64() {
+    use oxideav_av1::encoder::{encode_intra_frame_y_dyn_multi_sb, MonoYFrameMultiSb};
+    let mut input = MonoYFrameMultiSb::filled(96, 64, 0);
+    let mut s: u64 = 0xCAFE_F00D_DEAD_BEEF;
+    for p in input.y.iter_mut() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *p = (s >> 56) as u8;
+    }
+    let enc = encode_intra_frame_y_dyn_multi_sb(&input).expect("encode");
+    assert_eq!(enc.reconstructed_y, input.y);
+    let dec = decode_av1(&enc.ivf_bytes).expect("decode");
+    assert_eq!(dec.len(), 1);
+    match &dec[0] {
+        Frame::YDyn { width, height, y } => {
+            assert_eq!(*width, 96);
+            assert_eq!(*height, 64);
+            assert_eq!(y, &input.y, "96x64 lossless bit-exact recovery");
+        }
+        other => panic!("expected YDyn at 96x64, got {other:?}"),
+    }
+}
+
+#[test]
+fn mono_y_multi_sb_dyn_encode_decode_lossless_roundtrip_128x128() {
+    use oxideav_av1::encoder::{encode_intra_frame_y_dyn_multi_sb, MonoYFrameMultiSb};
+    let mut input = MonoYFrameMultiSb::filled(128, 128, 0);
+    let mut s: u64 = 0x1234_5678_9ABC_DEF0;
+    for p in input.y.iter_mut() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *p = (s >> 56) as u8;
+    }
+    let enc = encode_intra_frame_y_dyn_multi_sb(&input).expect("encode");
+    assert_eq!(enc.reconstructed_y, input.y);
+    let dec = decode_av1(&enc.ivf_bytes).expect("decode");
+    match &dec[0] {
+        Frame::YDyn { width, height, y } => {
+            assert_eq!(*width, 128);
+            assert_eq!(*height, 128);
+            assert_eq!(y, &input.y, "128x128 lossless bit-exact recovery");
+        }
+        other => panic!("expected YDyn at 128x128, got {other:?}"),
+    }
+}
+
+#[test]
+fn mono_y_multi_sb_dyn_encode_decode_lossless_roundtrip_rectangular_edges() {
+    use oxideav_av1::encoder::{encode_intra_frame_y_dyn_multi_sb, MonoYFrameMultiSb};
+    // Stress per-SB OOB short-circuit by selecting extents that
+    // create partial-coverage edge SBs in the row, column, and
+    // bottom-right corner. Each row exercises a different
+    // (width % 64, height % 64) combination.
+    let extents: &[(u32, u32)] = &[
+        (72, 64),   // 1 partial col SB on the right
+        (64, 72),   // 1 partial row SB on the bottom
+        (104, 72),  // partial col + partial row + partial corner
+        (128, 72),  // full col SB row, partial row SB
+        (88, 128),  // partial col, two full row SBs
+        (120, 120), // 2×2 grid all partial
+    ];
+    let mut s: u64 = 0xDEAD_BEEF_C0DE_BABE;
+    for &(w, h) in extents {
+        let mut input = MonoYFrameMultiSb::filled(w, h, 0);
+        for p in input.y.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *p = (s >> 56) as u8;
+        }
+        let enc = encode_intra_frame_y_dyn_multi_sb(&input)
+            .unwrap_or_else(|_| panic!("encode failed at {w}x{h}"));
+        assert_eq!(
+            enc.reconstructed_y, input.y,
+            "encoder recon at {w}x{h} must equal input on the lossless WHT arm"
+        );
+        let dec = decode_av1(&enc.ivf_bytes).unwrap_or_else(|_| panic!("decode failed at {w}x{h}"));
+        match &dec[0] {
+            Frame::YDyn { width, height, y } => {
+                assert_eq!(*width, w);
+                assert_eq!(*height, h);
+                assert_eq!(y, &input.y, "lossless bit-exact at {w}x{h}");
+            }
+            other => panic!("expected YDyn at {w}x{h}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn mono_y_multi_sb_dyn_encode_decode_lossy_q32_self_consistent_96x64() {
+    use oxideav_av1::encoder::{encode_intra_frame_y_dyn_multi_sb_with_q, MonoYFrameMultiSb};
+    let mut input = MonoYFrameMultiSb::filled(96, 64, 0);
+    let mut s: u64 = 0xFEED_FACE_C0DE_BABE;
+    for p in input.y.iter_mut() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *p = (s >> 56) as u8;
+    }
+    let enc = encode_intra_frame_y_dyn_multi_sb_with_q(&input, 32).expect("encode q=32");
+    let dec = decode_av1(&enc.ivf_bytes).expect("decode");
+    match &dec[0] {
+        Frame::YDyn { width, height, y } => {
+            assert_eq!(*width, 96);
+            assert_eq!(*height, 64);
+            assert_eq!(
+                y, &enc.reconstructed_y,
+                "lossy q=32 decoder out = encoder recon byte-for-byte"
+            );
+            // Verify quantization changed the output: at least one
+            // sample should differ from the input.
+            let differs = y.iter().zip(input.y.iter()).any(|(a, b)| a != b);
+            assert!(differs, "q=32 must perturb at least one sample");
+        }
+        other => panic!("expected YDyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn mono_y_multi_sb_dyn_encode_writes_correct_dimensions_in_ivf_header() {
+    use oxideav_av1::encoder::{encode_intra_frame_y_dyn_multi_sb, MonoYFrameMultiSb};
+    // Multi-SB extents must surface verbatim in the IVF v0 header.
+    for (w, h) in [(96u32, 64u32), (128, 64), (64, 128), (128, 128), (104, 72)] {
+        let input = MonoYFrameMultiSb::filled(w, h, 64);
+        let res = encode_intra_frame_y_dyn_multi_sb(&input)
+            .unwrap_or_else(|e| panic!("encode {w}x{h} failed: {e:?}"));
+        let ivf_w = u16::from_le_bytes([res.ivf_bytes[12], res.ivf_bytes[13]]) as u32;
+        let ivf_h = u16::from_le_bytes([res.ivf_bytes[14], res.ivf_bytes[15]]) as u32;
+        assert_eq!(ivf_w, w, "IVF v0 width mismatch at {w}x{h}");
+        assert_eq!(ivf_h, h, "IVF v0 height mismatch at {w}x{h}");
+        let fs = res.fh.frame_size.as_ref().expect("intra has frame_size");
+        assert_eq!(fs.frame_width, w);
+        assert_eq!(fs.frame_height, h);
+        assert_eq!(fs.mi_cols, 2 * ((w + 7) >> 3));
+        assert_eq!(fs.mi_rows, 2 * ((h + 7) >> 3));
+    }
+}

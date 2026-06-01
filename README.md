@@ -2,6 +2,124 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-02 (round 207)
+
+Round 207 lifts the **multi-super-block** ceiling on the monochrome
+(Y-only) dynamic-extent driver. Where r235 capped the Y-only path at
+`MAX_DIM = 64`, r207 adds a parallel
+`encode_intra_frame_y_dyn_multi_sb_with_q` /
+`encode_intra_frame_y_dyn_multi_sb` entry pair that accepts the new
+`MonoYFrameMultiSb { width, height, y: Vec<u8> }` input at any
+extent `(w, h) ∈ {8..=128} × {8..=128}` aligned to 8 (the
+`MAX_DIM_Y_MULTI_SB = 128` ceiling). The encoder walks the §5.11.1
+SB grid literally:
+
+```text
+for r += sbSize4 (=16):
+    for c += sbSize4:
+        decode_partition(r, c, BLOCK_64X64)
+```
+
+Each `(sb_r, sb_c)` origin gets a fresh `BLOCK_64X64`-rooted
+`EncodeNode` tree built from the captured leaves; the per-quadrant
+§5.11.4 line-1 OOB short-circuit + `EncodeNode::dummy_oob` (introduced
+in r234 for rectangular extents ≤ 64) already swallow partial-coverage
+SBs on edge / corner extents like 72×64 (`mi 16×18`, one full SB plus
+a half-width edge SB) or 104×72 (full + partial col + partial row +
+partial corner). The §5.11.1 inter-SB context resets
+(`clear_above_context` / `clear_left_context` per §6.10.2) are
+vacuously satisfied because the dyn driver hard-codes
+`txb_skip_ctx = 0` / `dc_sign_ctx = 0` at every leaf — the encoder +
+decoder agree on `0` context throughout, so multi-SB self-consistency
+is preserved.
+
+The decoder side lifts the same `decode_frame_dyn_y` cap from
+`MAX_DIM` to `MAX_DIM_Y_MULTI_SB` and dispatches to a multi-SB walk
+loop when either `frame_width > MAX_DIM` or `frame_height > MAX_DIM`
+(otherwise the legacy single-root behaviour from r235 stays in
+charge so existing IVF outputs remain byte-for-byte identical). The
+public `decode_av1` entry routes any mono SH to
+`decode_frame_dyn_y` already (r235), so the new ceiling is reachable
+through the standard API.
+
+New public surface:
+
+* `MonoYFrameMultiSb { width, height, y: Vec<u8> }` —
+  `validate()` enforces `width ∈ MIN_DIM..=MAX_DIM_Y_MULTI_SB`,
+  `height ∈ MIN_DIM..=MAX_DIM_Y_MULTI_SB`, both multiples of 8,
+  `y.len() == width * height`.
+* `EncodedFrameDynYMultiSb { ivf_bytes, temporal_unit_bytes,
+  reconstructed_y, seq, fh }` — same shape as r235's
+  `EncodedFrameDynY`.
+* `encode_intra_frame_y_dyn_multi_sb_with_q(&MonoYFrameMultiSb, u8)
+  -> Result<EncodedFrameDynYMultiSb, Error>` — the main entry.
+* `encode_intra_frame_y_dyn_multi_sb(&MonoYFrameMultiSb)` — thin
+  wrapper at `base_q_idx = 0`.
+* `sb_grid_origins(mi_rows, mi_cols) -> Vec<(u32, u32)>` — the
+  §5.11.1 row-major SB-origin sequence; also reused by the decoder.
+* `sb_grid_dispatch_order_leaves(mi_rows, mi_cols) -> Vec<(u32,
+  u32)>` — every in-frame BLOCK_4X4 cell in the order
+  `encode_intra_frame_y_dyn_multi_sb_with_q` writes it.
+* `MAX_DIM_Y_MULTI_SB: u32 = 128` and `SB_SIZE4_64: u32 = 16` —
+  the new constants.
+
+Lossless contract: at `base_q_idx = 0` the encoder's running
+`recon_y` equals the input plane-for-plane (forward WHT round-trips
+bit-exactly), and `decode_av1(encoded.ivf_bytes)` returns a
+`Frame::YDyn { width, height, y }` whose `y` equals the input.
+Lossy contract: at `base_q_idx > 0` the encoder's `recon_y` equals
+`decode_av1(...)`'s `y` byte-for-byte (quantization is identical on
+both sides; the recovered plane does NOT in general equal the input
+— rounding error bounded by §7.12.2 step at the chosen qindex).
+
+Pinned with 17 new tests across the encoder + decoder:
+
+* SB-grid origins shape table on single-SB extents (returns the
+  single `(0, 0)` origin) and 2×2 grids (row-major over
+  `(0,0)` / `(0,16)` / `(16,0)` / `(16,16)`).
+* Multi-SB dispatch-order coverage: every BLOCK_4X4 cell at 96×64
+  (`mi 16×24` ⇒ 384 cells, 1×2 SB row) and 128×128 (`mi 32×32` ⇒
+  1024 cells, 2×2 SB grid) is visited exactly once.
+* `MonoYFrameMultiSb::validate` acceptance over `{8..=128}² ∩ mod
+  8 = 0` (sweep) + oversized + wrong-length rejection.
+* Flat-grey internal reconstruction equals input on the lossless
+  WHT arm at 96×64.
+* Pseudo-random lossless internal reconstruction equals input at
+  128×128.
+* `encode_intra_frame_y_dyn_multi_sb` at 64×64 produces the
+  **byte-for-byte identical** IVF stream as the legacy
+  `encode_intra_frame_y_dyn` (`root_super_block(16, 16) =
+  BLOCK_64X64` agrees with the multi-SB always-`BLOCK_64X64` root).
+* `with_q(0)` ↔ `with_q(32)` byte divergence at 96×64.
+* End-to-end encode → `decode_av1` → bit-exact recovery at 10
+  representative extents covering legacy 64×64, both axes growing,
+  `2×1` / `1×2` / `2×2` SB grids, and partial-coverage edge SBs
+  (`64×64`, `72×64`, `96×64`, `64×72`, `64×96`, `104×72`, `128×64`,
+  `64×128`, `96×96`, `128×128`).
+* Lossy q ∈ {1, 32, 200} self-consistency on 96×64
+  (`enc.reconstructed_y == decode_av1(enc.ivf_bytes).y`).
+* 5 new integration tests in `encode_decode_pixel_roundtrip` covering
+  96×64 + 128×128 lossless, a 6-extent rectangular-edge sweep
+  (`{72×64, 64×72, 104×72, 128×72, 88×128, 120×120}`), a q=32 lossy
+  self-consistency at 96×64, and an IVF v0 dimension-write check
+  over `{96×64, 128×64, 64×128, 128×128, 104×72}`.
+
+Total: 1516 → 1528 lib tests, 57 → 62 `encode_decode_pixel_roundtrip`
+integration tests. Workspace: 1665 tests pass across all targets.
+
+Out of scope (next arc): 4:2:0 YUV multi-SB (would need the
+§7.11.5.3 CFL subsampled-luma window to compose correctly across
+SBs — the dyn YUV path stays at the `MAX_DIM = 64` cap this round
+because the CFL window already correctly clips on the existing
+4:2:0 chroma cells, but multi-SB needs an integration sweep
+mirroring r207's mono path), 128×128 super-blocks
+(`use_128x128_superblock = true` — would change `sbSize = BLOCK_
+128X128` and require new partition_subsize transitions), rectangular
+**TX sizes** (`TX_4X8` / `TX_8X4` / `TX_8X16` / `TX_16X8` — TX_4X4
+leaves remain throughout the multi-SB path too), 10-bit, 4:2:2 /
+4:4:4 chroma, §5.11.18 inter mode_info, per-segment / per-block
+delta_q, full bit-cost-aware RD on the dyn picker.
+
 ## Status — 2026-06-01 (round 235)
 
 Round 235 lands **Y-only (monochrome) support** on the dynamic-extent

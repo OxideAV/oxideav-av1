@@ -302,8 +302,11 @@ pub use pixel_driver_dyn::{
     build_intra_only_y_8bit_fh, build_intra_only_y_8bit_fh_with_q, build_intra_only_y_8bit_seq,
     build_intra_only_yuv420_8bit_fh, build_intra_only_yuv420_8bit_fh_with_q,
     build_intra_only_yuv420_8bit_seq, dispatch_order_leaves, encode_intra_frame_y_dyn,
+    encode_intra_frame_y_dyn_multi_sb, encode_intra_frame_y_dyn_multi_sb_with_q,
     encode_intra_frame_y_dyn_with_q, encode_intra_frame_yuv_dyn, encode_intra_frame_yuv_dyn_with_q,
-    root_super_block, EncodedFrameDyn, EncodedFrameDynY, MonoYFrame, Yuv420Frame, MAX_DIM, MIN_DIM,
+    root_super_block, sb_grid_dispatch_order_leaves, sb_grid_origins, EncodedFrameDyn,
+    EncodedFrameDynY, EncodedFrameDynYMultiSb, MonoYFrame, MonoYFrameMultiSb, Yuv420Frame, MAX_DIM,
+    MAX_DIM_Y_MULTI_SB, MIN_DIM, SB_SIZE4_64,
 };
 pub use sequence_obu::write_sequence_header_obu;
 pub use symbol_writer::SymbolWriter;

@@ -4,6 +4,41 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder/decoder r207: multi-super-block tiling on the monochrome
+  (Y-only) dyn driver — extends the r235 Y-only path's ceiling from
+  `MAX_DIM = 64` to a new `MAX_DIM_Y_MULTI_SB = 128` by walking the
+  §5.11.1 SB grid (`for r += sbSize4; for c += sbSize4; decode_partition
+  (r, c, sbSize)`) literally over `sbSize = BLOCK_64X64`,
+  `sbSize4 = SB_SIZE4_64 = 16`. New encoder entries
+  `encode_intra_frame_y_dyn_multi_sb` / `_with_q` accept a
+  `MonoYFrameMultiSb { width, height, y: Vec<u8> }` input at any
+  rectangular extent `(w, h) ∈ {8..=128} × {8..=128}` aligned to 8;
+  the decoder mirrors by lifting `decode_frame_dyn_y`'s cap from
+  `MAX_DIM` to `MAX_DIM_Y_MULTI_SB` and dispatching to the multi-SB
+  walk when either dimension exceeds `MAX_DIM`. Extents ≤ 64 keep the
+  single-root behaviour from r235 (IVF bytes byte-for-byte identical
+  to prior output). Each SB is a fresh `BLOCK_64X64`-rooted
+  `EncodeNode` tree; edge SBs with `(width % 64) != 0` or
+  `(height % 64) != 0` rely on the existing `EncodeNode::dummy_oob` +
+  §5.11.4 line-1 OOB short-circuit (introduced in r234 for
+  rectangular extents ≤ 64) to swallow partial-coverage quadrants.
+  New `sb_grid_origins` / `sb_grid_dispatch_order_leaves` helpers
+  expose the §5.11.1 SB-row-major ordering for tests + future
+  YUV/CFL multi-SB extensions.
+  +12 lib unit tests (1516 → 1528: `sb_grid_origins` shape table over
+  single-SB and 2×2 grids, `sb_grid_dispatch_order_leaves` exactly-
+  once coverage at 96×64 + 128×128, `MonoYFrameMultiSb::validate`
+  acceptance over `{8..=128}² ∩ mod 8 = 0` + oversized + wrong-len
+  rejection, encoder flat-grey internal recon at 96×64, pseudo-
+  random lossless internal recon at 128×128, multi-SB ↔ legacy
+  64×64 byte-for-byte parity, lossy q ≠ 0 byte divergence at 96×64,
+  10-extent encode→decode→bit-exact integration roundtrip, and a
+  3-qindex lossy self-consistency on 96×64) + 5 new integration
+  tests (57 → 62 on `encode_decode_pixel_roundtrip`: lossless
+  96×64, lossless 128×128, 6-extent rectangular-edge sweep
+  covering all partial-coverage SB shapes, lossy q=32 self-
+  consistency, IVF v0 dimension-write check on multi-SB extents).
+
 - encoder/decoder r235: Y-only (monochrome) on the dynamic-extent
   driver — `MonoYFrame { width, height, y: Vec<u8> }` input + new
   `encode_intra_frame_y_dyn` / `encode_intra_frame_y_dyn_with_q`

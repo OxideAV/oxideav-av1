@@ -39,15 +39,17 @@ use crate::cdf::{
     predict_intra_paeth_pred, predict_intra_smooth_h_pred, predict_intra_smooth_pred,
     predict_intra_smooth_v_pred, predict_intra_v_pred, size_group, skip_ctx, split_or_horz_cdf,
     split_or_vert_cdf, PartitionWalker, QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4,
-    BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, D45_PRED, D67_PRED,
-    DCT_DCT, DC_PRED, H_PRED, MI_HEIGHT_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH,
-    NUM_4X4_BLOCKS_WIDE, PAETH_PRED, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT,
-    PARTITION_VERT, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4, TX_CLASS_2D, UV_CFL_PRED,
-    V_PRED,
+    BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS,
+    D45_PRED, D67_PRED, DCT_DCT, DC_PRED, H_PRED, MI_HEIGHT_LOG2, MI_WIDTH_LOG2,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PAETH_PRED, PARTITION_HORZ, PARTITION_NONE,
+    PARTITION_SPLIT, PARTITION_VERT, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4,
+    TX_CLASS_2D, UV_CFL_PRED, V_PRED,
 };
 use crate::decoder::pixel_driver::Frame;
 use crate::encoder::pixel_driver::NUM_INTRA_MODES_Y;
-use crate::encoder::pixel_driver_dyn::{root_super_block, MAX_DIM, MIN_DIM};
+use crate::encoder::pixel_driver_dyn::{
+    root_super_block, sb_grid_origins, MAX_DIM, MAX_DIM_Y_MULTI_SB, MIN_DIM,
+};
 use crate::encoder::tile_group_obu::parse_tile_group_obu_body;
 use crate::frame_header::FrameHeader;
 use crate::scan::get_default_scan;
@@ -945,10 +947,17 @@ pub(crate) fn decode_frame_dyn_y(
         .ok_or(Error::PartitionWalkOutOfRange)?;
     let width = fs.frame_width;
     let height = fs.frame_height;
+    // r207: ceiling lifted from `MAX_DIM` (64) to
+    // `MAX_DIM_Y_MULTI_SB` (128) on the mono dyn path. Extents in
+    // `(MAX_DIM, MAX_DIM_Y_MULTI_SB]` (i.e. > 64×64) dispatch to the
+    // §5.11.1-conformant SB-grid walk via the per-SB
+    // `decode_partition_node_y(... BLOCK_64X64)` loop below; extents
+    // ≤ 64×64 keep the single-root behaviour from r235 for IVF
+    // byte-for-byte parity with prior outputs.
     if width < MIN_DIM
         || height < MIN_DIM
-        || width > MAX_DIM
-        || height > MAX_DIM
+        || width > MAX_DIM_Y_MULTI_SB
+        || height > MAX_DIM_Y_MULTI_SB
         || width % MIN_DIM != 0
         || height % MIN_DIM != 0
     {
@@ -994,21 +1003,43 @@ pub(crate) fn decode_frame_dyn_y(
     let mut recon_y = vec![0u8; (width as usize) * (height as usize)];
     let scan: Vec<u16> = get_default_scan(TX_4X4).to_vec();
 
-    let root_b = root_super_block(mi_cols, mi_rows);
-    decode_partition_node_y(
-        &mut decoder,
-        &mut cdfs,
-        &mut state,
-        &mut coeff_walker,
-        0,
-        0,
-        root_b,
-        width as usize,
-        height as usize,
-        &scan,
-        &q_params,
-        &mut recon_y,
-    )?;
+    // r207 dispatch — extents > MAX_DIM (64) take the §5.11.1
+    // multi-SB row-major walk; extents ≤ MAX_DIM keep the single-
+    // root behaviour from r235.
+    if width > MAX_DIM || height > MAX_DIM {
+        for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
+            decode_partition_node_y(
+                &mut decoder,
+                &mut cdfs,
+                &mut state,
+                &mut coeff_walker,
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                width as usize,
+                height as usize,
+                &scan,
+                &q_params,
+                &mut recon_y,
+            )?;
+        }
+    } else {
+        let root_b = root_super_block(mi_cols, mi_rows);
+        decode_partition_node_y(
+            &mut decoder,
+            &mut cdfs,
+            &mut state,
+            &mut coeff_walker,
+            0,
+            0,
+            root_b,
+            width as usize,
+            height as usize,
+            &scan,
+            &q_params,
+            &mut recon_y,
+        )?;
+    }
 
     Ok(Frame::YDyn {
         width,

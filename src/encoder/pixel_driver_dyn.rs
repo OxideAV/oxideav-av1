@@ -114,12 +114,27 @@ use crate::cdf::{
 /// construction time.
 pub const MIN_DIM: u32 = 8;
 /// Largest super-block this arc handles in one root partition tree
-/// (`BLOCK_64X64`). Multi-super-block tiling is a follow-up. Width
-/// and height are independently bounded by this constant — the
-/// per-quadrant out-of-frame sentinel in [`build_partition_tree`]
-/// lets a rectangular extent (e.g. `16 × 64` ⇒ `mi 4 × 16`) ride the
-/// same `BLOCK_64X64` root as a square 64×64 frame would.
+/// (`BLOCK_64X64`). Multi-super-block tiling is the r207 follow-up
+/// arc (`MAX_DIM_Y_MULTI_SB = 128`) on the Y-only path; the
+/// `MAX_DIM = 64` ceiling is preserved for the single-SB YUV + Y
+/// drivers so existing IVF outputs remain byte-for-byte identical
+/// across r207. Width and height are independently bounded by this
+/// constant — the per-quadrant out-of-frame sentinel in
+/// [`build_partition_tree`] lets a rectangular extent
+/// (e.g. `16 × 64` ⇒ `mi 4 × 16`) ride the same `BLOCK_64X64` root as
+/// a square 64×64 frame would.
 pub const MAX_DIM: u32 = 64;
+/// r207 — multi-super-block ceiling for the §5.11.1 SB-grid walk on
+/// the Y-only (mono) dyn driver. Two SBs in each axis (16-mi each at
+/// `use_128x128_superblock = false`, sbSize4 = 16). Width and height
+/// remain independent. Each SB is a single `BLOCK_64X64` root
+/// partition tree per §5.11.1 line 13 (`sbSize = BLOCK_64X64`).
+pub const MAX_DIM_Y_MULTI_SB: u32 = 128;
+/// r207 — §5.11.1 sbSize4 (the number of 4×4 mi-units per
+/// super-block) for `use_128x128_superblock = false`. The dyn
+/// multi-SB walks iterate `(sb_r, sb_c) ∈ (0..mi_rows).step_by(16)
+/// × (0..mi_cols).step_by(16)` in row-major order.
+pub const SB_SIZE4_64: u32 = 16;
 
 /// Dynamic-extent 4:2:0 YUV input the dyn driver consumes. Plane data
 /// is Vec-backed so the same struct admits any allowed (width,
@@ -1682,6 +1697,404 @@ pub fn encode_intra_frame_y_dyn_with_q(
     })
 }
 
+// ----------------------------------------------------------------------
+// r207 — multi-super-block monochrome (Y-only) dyn driver.
+// ----------------------------------------------------------------------
+//
+// Generalises the r235 single-SB Y-only path to extents up to
+// 128×128 by following the §5.11.1 `decode_tile` SB-grid walk
+// literally — for `r += sbSize4` then `c += sbSize4` (with
+// `sbSize4 = SB_SIZE4_64 = 16` since
+// `use_128x128_superblock = false`), the driver builds a separate
+// `EncodeNode` tree per SB rooted at `BLOCK_64X64` and feeds them
+// to `write_partition_tree` one at a time. Per-SB trees compose
+// correctly because:
+//
+//   1. `PartitionTreeWriter` tracks the full `mi_sizes[]` grid; each
+//      `write_partition_tree` call stamps its own SB's cells while
+//      reading prior SBs' neighbour stamps for the `partition_ctx`
+//      derivation.
+//   2. `EncodeNode::dummy_oob` + the §5.11.4 line-1 early return
+//      already short-circuit OOB quadrants of edge SBs at
+//      rectangular extents (e.g. `80 × 64`, with `mi_cols = 20`),
+//      so we don't have to special-case "edge SB" geometry.
+//   3. The dyn driver hard-codes `txb_skip_ctx = 0` and
+//      `dc_sign_ctx = 0` at every leaf, so the §5.11.1
+//      `clear_left_context()` / `clear_above_context()` resets that
+//      §6.10.2 specifies between SB rows / tile starts are
+//      vacuously satisfied — the dyn encoder + decoder agree on
+//      `0` context throughout.
+//
+// This arc lifts the Y-only ceiling from `MAX_DIM = 64` to
+// `MAX_DIM_Y_MULTI_SB = 128`. Existing extents ≤ 64 are NOT
+// affected — they still go through the r235
+// `encode_intra_frame_y_dyn{,_with_q}` entries (single-SB root_b
+// from `root_super_block`); the multi-SB entries are a new
+// parallel API. This preserves byte-for-byte IVF output for every
+// existing test + caller.
+//
+// Spec provenance: docs/video/av1/av1-spec.txt §5.11.1 lines 13-25
+// (the explicit `for r/c += sbSize4` loop + `decode_partition(r,
+// c, sbSize)` body), §6.10.2 `clear_left_context` /
+// `clear_above_context` notes (level / dc / seg arrays — irrelevant
+// at ctx=0 throughout), §5.5.2 mono color-config (unchanged).
+
+/// r207 — dynamic-extent monochrome input the multi-SB Y-only dyn
+/// driver consumes. Same shape as [`MonoYFrame`] but with the
+/// extent ceiling raised to [`MAX_DIM_Y_MULTI_SB`] (128).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonoYFrameMultiSb {
+    /// Luma width in pixels. Multiple of [`MIN_DIM`],
+    /// ≤ [`MAX_DIM_Y_MULTI_SB`].
+    pub width: u32,
+    /// Luma height in pixels. Same constraints as
+    /// [`Self::width`].
+    pub height: u32,
+    /// Luma plane (`Y`), row-major, length `width * height`.
+    pub y: Vec<u8>,
+}
+
+impl MonoYFrameMultiSb {
+    /// All-`fill` luma input. Useful for tests + as the default
+    /// constructor.
+    #[must_use]
+    pub fn filled(width: u32, height: u32, fill: u8) -> Self {
+        Self {
+            width,
+            height,
+            y: vec![fill; (width * height) as usize],
+        }
+    }
+
+    /// Validate the input's dimensions + Y-plane length. Returns
+    /// [`Error::PartitionWalkOutOfRange`] on any mismatch.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.width < MIN_DIM
+            || self.height < MIN_DIM
+            || self.width > MAX_DIM_Y_MULTI_SB
+            || self.height > MAX_DIM_Y_MULTI_SB
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if self.width % MIN_DIM != 0 || self.height % MIN_DIM != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if self.y.len() != (self.width * self.height) as usize {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        Ok(())
+    }
+}
+
+/// Result of [`encode_intra_frame_y_dyn_multi_sb`]. Same shape as
+/// [`EncodedFrameDynY`].
+#[derive(Debug, Clone)]
+pub struct EncodedFrameDynYMultiSb {
+    /// IVF bytes — file header + one IVF frame.
+    pub ivf_bytes: Vec<u8>,
+    /// §7.5 temporal unit bytes (TD + SH + FH + TileGroup OBU).
+    pub temporal_unit_bytes: Vec<u8>,
+    /// Reconstructed Y plane (row-major, length `width * height`).
+    pub reconstructed_y: Vec<u8>,
+    /// SequenceHeader the driver synthesised + emitted
+    /// (`mono_chrome = true`, `num_planes = 1`).
+    pub seq: SequenceHeader,
+    /// FrameHeader the driver synthesised + emitted.
+    pub fh: FrameHeader,
+}
+
+/// r207 — §5.11.1-conformant SB-grid walk over a (mi_rows ×
+/// mi_cols) frame. Returns `(sb_r, sb_c)` origins in row-major
+/// order; each tuple addresses one BLOCK_64X64 SB (16 × 16 mi
+/// units, with the trailing SBs clipped to the frame extent via
+/// the §5.11.4 line-1 OOB short-circuit on edge quadrants). Used
+/// by both the multi-SB encoder and decoder.
+///
+/// Equivalent to the spec's literal:
+/// ```text
+/// for (r = MiRowStart; r < MiRowEnd; r += sbSize4) {
+///     for (c = MiColStart; c < MiColEnd; c += sbSize4) {
+///         decode_partition(r, c, sbSize)
+///     }
+/// }
+/// ```
+/// with `MiRowStart = MiColStart = 0`, `MiRowEnd = mi_rows`,
+/// `MiColEnd = mi_cols`, and `sbSize4 = SB_SIZE4_64 = 16`.
+#[must_use]
+pub fn sb_grid_origins(mi_rows: u32, mi_cols: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut r = 0u32;
+    while r < mi_rows {
+        let mut c = 0u32;
+        while c < mi_cols {
+            out.push((r, c));
+            c += SB_SIZE4_64;
+        }
+        r += SB_SIZE4_64;
+    }
+    out
+}
+
+/// r207 — §5.11.4 dispatch-order BLOCK_4X4 cell walk over the
+/// `(mi_rows × mi_cols)` frame via the §5.11.1 SB-grid traversal
+/// (i.e. outer SB-row-major × inner per-SB NW/NE/SW/SE recursion).
+/// Used by the multi-SB encoder driver to populate its `leaf_table`
+/// in the §5.11.1 / §5.11.4 visiting order.
+///
+/// Concretely: for every `(sb_r, sb_c)` from
+/// [`sb_grid_origins`], invokes the per-SB NW/NE/SW/SE recursion of
+/// [`build_partition_tree`] rooted at `BLOCK_64X64` and emits each
+/// in-frame BLOCK_4X4 leaf in the order it would be written.
+#[must_use]
+pub fn sb_grid_dispatch_order_leaves(mi_rows: u32, mi_cols: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
+        fn walk(
+            b_size: usize,
+            r: u32,
+            c: u32,
+            mi_rows: u32,
+            mi_cols: u32,
+            out: &mut Vec<(u32, u32)>,
+        ) {
+            if r >= mi_rows || c >= mi_cols {
+                return;
+            }
+            if b_size == BLOCK_4X4 {
+                out.push((r, c));
+                return;
+            }
+            let sub_size =
+                partition_subsize(PARTITION_SPLIT, b_size).expect("valid SPLIT sub-size");
+            let half = (NUM_4X4_BLOCKS_WIDE[b_size] as u32) >> 1;
+            walk(sub_size, r, c, mi_rows, mi_cols, out);
+            walk(sub_size, r, c + half, mi_rows, mi_cols, out);
+            walk(sub_size, r + half, c, mi_rows, mi_cols, out);
+            walk(sub_size, r + half, c + half, mi_rows, mi_cols, out);
+        }
+        walk(BLOCK_64X64, sb_r, sb_c, mi_rows, mi_cols, &mut out);
+    }
+    out
+}
+
+/// r207 — encode one monochrome intra-only frame at the
+/// caller-supplied `base_q_idx` for any allowed extent ∈
+/// [MIN_DIM, MAX_DIM_Y_MULTI_SB]². The §5.11.1 SB-grid is walked
+/// row-major; each SB is a single `BLOCK_64X64` root partition tree.
+///
+/// `base_q_idx == 0` selects the §5.9.2 `CodedLossless` arm (forward
+/// WHT on the leaf transform — encoder-internal reconstruction
+/// equals input plane-for-plane). `> 0` selects the §7.13.3 forward
+/// DCT_DCT path with §7.12.3 quantize.
+///
+/// Multi-SB contract: at `base_q_idx > 0`, `decode_av1(encoded.ivf_bytes)`
+/// matches `encoded.reconstructed_y` byte-for-byte for any allowed
+/// extent. At `base_q_idx == 0` the recovered Y plane additionally
+/// equals the input plane-for-plane.
+///
+/// ## Errors
+///
+/// * `input.validate()` fails ⇒ [`Error::PartitionWalkOutOfRange`].
+/// * Any internal partition-tree / coefficient-writer overflow.
+pub fn encode_intra_frame_y_dyn_multi_sb_with_q(
+    input: &MonoYFrameMultiSb,
+    base_q_idx: u8,
+) -> Result<EncodedFrameDynYMultiSb, Error> {
+    input.validate()?;
+    let width = input.width as usize;
+    let height = input.height as usize;
+    let mi_cols = 2 * (((width + 7) >> 3) as u32);
+    let mi_rows = 2 * (((height + 7) >> 3) as u32);
+
+    let seq = build_intra_only_y_8bit_seq(input.width, input.height);
+    let fh = build_intra_only_y_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+
+    let lossless = base_q_idx == 0;
+    let qp = QuantizerParams::neutral(base_q_idx, 8);
+    let scan = get_default_scan(TX_4X4).to_vec();
+
+    let mut recon_y = vec![0u8; width * height];
+
+    // Walk every in-frame BLOCK_4X4 leaf in §5.11.1 SB-grid order:
+    // outer SB-row-major over `sb_grid_origins`, inner per-SB
+    // §5.11.4 NW/NE/SW/SE recursion. The dispatch order matches
+    // the order `decode_tile` reads symbols in.
+    let leaves_order = sb_grid_dispatch_order_leaves(mi_rows, mi_cols);
+    debug_assert_eq!(
+        leaves_order.len(),
+        (width / 4) * (height / 4),
+        "every in-frame BLOCK_4X4 cell must be visited exactly once"
+    );
+
+    let mut leaf_table: std::collections::HashMap<(u32, u32), LeafEnc> =
+        std::collections::HashMap::with_capacity(leaves_order.len());
+
+    for &(mi_r, mi_c) in &leaves_order {
+        let row0 = (mi_r as usize) * 4;
+        let col0 = (mi_c as usize) * 4;
+        let (y_mode, pred_y) =
+            pick_best_intra_mode_4x4(&recon_y, &input.y, width, height, row0, col0);
+        let mut residual_y = [0i64; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = input.y[(row0 + i) * width + (col0 + j)] as i64;
+                let q = pred_y[i * 4 + j] as i64;
+                residual_y[i * 4 + j] = p - q;
+            }
+        }
+        let coeffs_y = if lossless {
+            forward_wht_4x4(&residual_y).to_vec()
+        } else {
+            forward_transform_2d(&residual_y, TX_4X4, DCT_DCT, false)
+        };
+        let quant_y = forward_quantize(&coeffs_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
+
+        let dequant_y = dequantize_step1(&quant_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
+        let resid_back_y = inverse_transform_2d(&dequant_y, TX_4X4, DCT_DCT, 8, lossless);
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = pred_y[i * 4 + j] as i64 + resid_back_y[i * 4 + j];
+                recon_y[(row0 + i) * width + (col0 + j)] = p.clamp(0, 255) as u8;
+            }
+        }
+
+        let coefficients: Vec<PlaneCoefficients> = vec![PlaneCoefficients {
+            plane: 0,
+            is_inter: 0,
+            tx_size: TX_4X4,
+            tx_class: TX_CLASS_2D,
+            txb_skip_ctx: 0,
+            dc_sign_ctx: 0,
+            scan: scan.clone(),
+            quant: quant_y,
+        }];
+
+        leaf_table.insert(
+            (mi_r, mi_c),
+            LeafEnc {
+                y_mode,
+                uv_mode: None,
+                cfl_alpha_u: None,
+                cfl_alpha_v: None,
+                coefficients,
+            },
+        );
+    }
+
+    // §5.11 entropy-coder run for the single tile, multi-SB version.
+    let mut writer = SymbolWriter::new(false);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let mut state = PartitionTreeWriter::new(
+        mi_rows,
+        mi_cols,
+        TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        },
+        /* segmentation_enabled = */ false,
+        /* last_active_seg_id = */ 0,
+        /* lossless = */ false,
+        /* subsampling_x = */ true,
+        /* subsampling_y = */ true,
+    )
+    .ok_or(Error::PartitionWalkOutOfRange)?;
+
+    // For each SB in §5.11.1 row-major order: build a
+    // BLOCK_64X64-rooted EncodeNode tree using the captured
+    // leaves, then write_partition_tree starting at that SB origin.
+    for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
+        let sb_root =
+            build_partition_tree(BLOCK_64X64, sb_r, sb_c, mi_rows, mi_cols, &mut |r, c| {
+                let leaf = leaf_table
+                    .remove(&(r, c))
+                    .expect("dispatch-order leaf must have been populated");
+                EncodeBlock {
+                    skip: 0,
+                    segment_id: 0,
+                    segment_pred: 0,
+                    y_mode: leaf.y_mode,
+                    uv_mode: leaf.uv_mode,
+                    cfl_alpha_u: leaf.cfl_alpha_u,
+                    cfl_alpha_v: leaf.cfl_alpha_v,
+                    coefficients: leaf.coefficients,
+                }
+            });
+        write_partition_tree(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &sb_root,
+            sb_r,
+            sb_c,
+            BLOCK_64X64,
+        )?;
+    }
+    let tile_bytes = writer.finish();
+
+    let tile_group = TileGroupObu {
+        num_tiles: 1,
+        tile_cols_log2: 0,
+        tile_rows_log2: 0,
+        tile_size_bytes: 1,
+        tg_start: 0,
+        tg_end: 0,
+        start_and_end_present: false,
+        tiles: vec![TilePayload::new(tile_bytes)],
+    };
+    let tile_group_body = write_tile_group_obu(&tile_group)?;
+
+    let fh_body = crate::encoder::frame_obu::write_frame_header_obu(&fh, &seq);
+    let frame_obus: Vec<ObuFrame> = vec![
+        ObuFrame::new(ObuType::FrameHeader, fh_body),
+        ObuFrame::new(ObuType::TileGroup, tile_group_body),
+    ];
+
+    let temporal_unit_bytes = {
+        use crate::encoder::obu::build_temporal_unit;
+        use crate::encoder::sequence_obu::write_sequence_header_obu;
+        let sh_body = write_sequence_header_obu(&seq);
+        build_temporal_unit(Some(&sh_body), &frame_obus)
+    };
+
+    let mut ivf_bytes: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut ivf_bytes);
+        let mut iw = IvfWriter::new(
+            cursor,
+            FOURCC_AV01,
+            input.width as u16,
+            input.height as u16,
+            25,
+            1,
+        )
+        .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        iw.write_frame(&temporal_unit_bytes, 0)
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        iw.patch_frame_count()
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+    }
+
+    Ok(EncodedFrameDynYMultiSb {
+        ivf_bytes,
+        temporal_unit_bytes,
+        reconstructed_y: recon_y,
+        seq,
+        fh,
+    })
+}
+
+/// r207 — encode one monochrome intra-only frame at `base_q_idx = 0`
+/// (lossless WHT arm) for any allowed extent up to
+/// [`MAX_DIM_Y_MULTI_SB`]. Thin wrapper over
+/// [`encode_intra_frame_y_dyn_multi_sb_with_q`].
+pub fn encode_intra_frame_y_dyn_multi_sb(
+    input: &MonoYFrameMultiSb,
+) -> Result<EncodedFrameDynYMultiSb, Error> {
+    encode_intra_frame_y_dyn_multi_sb_with_q(input, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2313,6 +2726,249 @@ mod tests {
         assert_ne!(q0.ivf_bytes, q1.ivf_bytes);
         assert_eq!(q0.fh.quantization_params.as_ref().unwrap().base_q_idx, 0);
         assert_eq!(q1.fh.quantization_params.as_ref().unwrap().base_q_idx, 1);
+    }
+
+    // ---- r207 — multi-SB Y-only dyn driver lib tests ----
+
+    #[test]
+    fn sb_grid_origins_single_sb_for_le_64() {
+        // 64×64 ⇒ mi 16×16 ⇒ 1 SB at (0, 0).
+        let v = sb_grid_origins(16, 16);
+        assert_eq!(v, vec![(0, 0)]);
+        // 64×32 ⇒ mi 8×16 ⇒ 1 SB at (0, 0) (row exhausted in <16).
+        let v = sb_grid_origins(8, 16);
+        assert_eq!(v, vec![(0, 0)]);
+        // 8×8 ⇒ mi 2×2 ⇒ still 1 SB at (0, 0).
+        let v = sb_grid_origins(2, 2);
+        assert_eq!(v, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn sb_grid_origins_multi_sb_row_major() {
+        // 96×64 ⇒ mi 16×24 (rows × cols) ⇒ 2 SBs in the row at
+        // c = {0, 16}, 1 SB row only ⇒ [(0,0), (0,16)].
+        let v = sb_grid_origins(16, 24);
+        assert_eq!(v, vec![(0, 0), (0, 16)]);
+        // 128×64 ⇒ mi 16×32 ⇒ 2 SB cols ⇒ [(0,0), (0,16)].
+        let v = sb_grid_origins(16, 32);
+        assert_eq!(v, vec![(0, 0), (0, 16)]);
+        // 64×128 ⇒ mi 32×16 ⇒ 2 SB rows ⇒ [(0,0), (16,0)].
+        let v = sb_grid_origins(32, 16);
+        assert_eq!(v, vec![(0, 0), (16, 0)]);
+        // 128×128 ⇒ mi 32×32 ⇒ 2×2 grid ⇒ row-major.
+        let v = sb_grid_origins(32, 32);
+        assert_eq!(v, vec![(0, 0), (0, 16), (16, 0), (16, 16)]);
+        // 96×96 ⇒ mi 24×24 ⇒ 2×2 grid still (the bottom / right SBs
+        // are partial; each spans mi 8 × 8 in-frame).
+        let v = sb_grid_origins(24, 24);
+        assert_eq!(v, vec![(0, 0), (0, 16), (16, 0), (16, 16)]);
+    }
+
+    #[test]
+    fn sb_grid_dispatch_order_leaves_covers_every_in_frame_cell_96x64() {
+        // 96×64 ⇒ mi 16×24 ⇒ expect 16 × 24 / 1 = 24×16 = 384 cells.
+        let leaves = sb_grid_dispatch_order_leaves(16, 24);
+        assert_eq!(leaves.len(), 16 * 24);
+        let mut seen = vec![false; 16 * 24];
+        for &(r, c) in &leaves {
+            assert!(r < 16 && c < 24);
+            let idx = (r * 24 + c) as usize;
+            assert!(!seen[idx], "({r},{c}) visited twice");
+            seen[idx] = true;
+        }
+        assert!(seen.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn sb_grid_dispatch_order_leaves_covers_every_in_frame_cell_128x128() {
+        // 128×128 ⇒ mi 32×32 ⇒ 1024 cells; 2×2 SB grid.
+        let leaves = sb_grid_dispatch_order_leaves(32, 32);
+        assert_eq!(leaves.len(), 1024);
+        let mut seen = vec![false; 1024];
+        for &(r, c) in &leaves {
+            let idx = (r * 32 + c) as usize;
+            assert!(!seen[idx]);
+            seen[idx] = true;
+        }
+        assert!(seen.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn mono_y_multi_sb_validate_accepts_extents_up_to_128() {
+        // Every (w, h) ∈ {8..=128} aligned to 8 validates.
+        for w in (MIN_DIM..=MAX_DIM_Y_MULTI_SB).step_by(MIN_DIM as usize) {
+            for h in (MIN_DIM..=MAX_DIM_Y_MULTI_SB).step_by(MIN_DIM as usize) {
+                let f = MonoYFrameMultiSb::filled(w, h, 0);
+                assert!(f.validate().is_ok(), "{w}x{h} should validate");
+            }
+        }
+    }
+
+    #[test]
+    fn mono_y_multi_sb_validate_rejects_oversized_dims() {
+        // 136 > 128 ⇒ reject.
+        let bad = MonoYFrameMultiSb {
+            width: 136,
+            height: 64,
+            y: vec![0u8; 136 * 64],
+        };
+        assert!(bad.validate().is_err());
+        // Wrong y length.
+        let bad = MonoYFrameMultiSb {
+            width: 96,
+            height: 64,
+            y: vec![0u8; 100],
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn mono_y_multi_sb_encode_96x64_flat_grey_internal_recon_matches_input() {
+        let input = MonoYFrameMultiSb::filled(96, 64, 128);
+        let res = encode_intra_frame_y_dyn_multi_sb(&input).expect("encode ok");
+        assert_eq!(res.reconstructed_y, input.y);
+        assert!(res.seq.color_config.mono_chrome);
+        assert_eq!(res.seq.color_config.num_planes, 1);
+        // SH advertises max_frame_width / max_frame_height matching the
+        // input extent.
+        assert_eq!(res.seq.max_frame_width_minus_1, 95);
+        assert_eq!(res.seq.max_frame_height_minus_1, 63);
+    }
+
+    #[test]
+    fn mono_y_multi_sb_encode_128x128_pseudorandom_lossless_recon_bit_exact() {
+        let mut input = MonoYFrameMultiSb::filled(128, 128, 0);
+        let mut s: u64 = 0xC001_F00D_DEAD_BEEF;
+        for p in input.y.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *p = (s >> 56) as u8;
+        }
+        let res = encode_intra_frame_y_dyn_multi_sb(&input).expect("encode ok");
+        assert_eq!(
+            res.reconstructed_y, input.y,
+            "128×128 lossless WHT arm ⇒ encoder-internal recon equals input"
+        );
+    }
+
+    #[test]
+    fn mono_y_multi_sb_encode_with_q_zero_matches_legacy_byte_for_byte_at_64x64() {
+        // The multi-SB path at extent ≤ 64×64 still walks one SB.
+        // The single root selected by `root_super_block(16, 16) =
+        // BLOCK_64X64` happens to match the multi-SB `BLOCK_64X64`
+        // root, so at exactly 64×64 the byte stream from the legacy
+        // entry and the multi-SB entry must coincide.
+        let input_y = MonoYFrame::filled(64, 64, 200);
+        let legacy = encode_intra_frame_y_dyn(&input_y).expect("legacy ok");
+        let multi = encode_intra_frame_y_dyn_multi_sb(&MonoYFrameMultiSb {
+            width: 64,
+            height: 64,
+            y: input_y.y.clone(),
+        })
+        .expect("multi ok");
+        assert_eq!(
+            legacy.ivf_bytes, multi.ivf_bytes,
+            "at 64×64 the multi-SB and single-SB Y-only paths must produce identical IVF bytes"
+        );
+        assert_eq!(legacy.reconstructed_y, multi.reconstructed_y);
+    }
+
+    #[test]
+    fn mono_y_multi_sb_encode_q_diverges_from_lossless() {
+        let input = MonoYFrameMultiSb::filled(96, 64, 64);
+        let q0 = encode_intra_frame_y_dyn_multi_sb_with_q(&input, 0).expect("q=0");
+        let q32 = encode_intra_frame_y_dyn_multi_sb_with_q(&input, 32).expect("q=32");
+        assert_ne!(q0.ivf_bytes, q32.ivf_bytes);
+        assert_eq!(q0.fh.quantization_params.as_ref().unwrap().base_q_idx, 0);
+        assert_eq!(q32.fh.quantization_params.as_ref().unwrap().base_q_idx, 32);
+    }
+
+    /// End-to-end encode → `decode_av1` → pixel-equality contract for
+    /// the multi-SB Y-only path at representative extents that
+    /// exercise:
+    ///   * the legacy ≤ 64×64 single-SB regime (64×64),
+    ///   * one extra SB along x (96×64),
+    ///   * one extra SB along y (64×96),
+    ///   * the full 2×2 SB grid at 128×128,
+    ///   * a partial-coverage edge SB (104×72).
+    #[test]
+    fn mono_y_multi_sb_encode_decode_lossless_roundtrip_representative_extents() {
+        use crate::decoder::{decode_av1, Frame};
+        let extents: &[(u32, u32)] = &[
+            (64, 64),
+            (72, 64),
+            (96, 64),
+            (64, 72),
+            (64, 96),
+            (104, 72),
+            (128, 64),
+            (64, 128),
+            (96, 96),
+            (128, 128),
+        ];
+        let mut s: u64 = 0xBEEF_C0DE_F00D_FACE;
+        for &(w, h) in extents {
+            let mut input = MonoYFrameMultiSb::filled(w, h, 0);
+            for p in input.y.iter_mut() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *p = (s >> 56) as u8;
+            }
+            let enc = encode_intra_frame_y_dyn_multi_sb(&input)
+                .unwrap_or_else(|_| panic!("encode failed at {w}×{h}"));
+            assert_eq!(
+                enc.reconstructed_y, input.y,
+                "encoder-internal recon must equal input at {w}×{h} on the lossless WHT arm"
+            );
+            let dec =
+                decode_av1(&enc.ivf_bytes).unwrap_or_else(|_| panic!("decode failed at {w}×{h}"));
+            assert_eq!(dec.len(), 1);
+            match &dec[0] {
+                Frame::YDyn { width, height, y } => {
+                    assert_eq!(*width, w, "decoded width mismatch at {w}×{h}");
+                    assert_eq!(*height, h, "decoded height mismatch at {w}×{h}");
+                    assert_eq!(y, &enc.reconstructed_y, "Y mismatch at {w}×{h}");
+                    assert_eq!(y, &input.y, "bit-exact recovery at {w}×{h}");
+                }
+                other => panic!("expected YDyn at {w}×{h}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Lossy contract on the multi-SB path: encoder-internal recon =
+    /// `decode_av1(enc.ivf_bytes)` byte-for-byte at q > 0 (the
+    /// recovered Y plane does NOT in general equal the input —
+    /// quantization rounds). Covers a 96×64 extent at q ∈ {1, 32, 200}.
+    #[test]
+    fn mono_y_multi_sb_lossy_encode_decode_self_consistency() {
+        use crate::decoder::{decode_av1, Frame};
+        let mut input = MonoYFrameMultiSb::filled(96, 64, 0);
+        let mut s: u64 = 0xABCD_1234_5678_9ABC;
+        for p in input.y.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *p = (s >> 56) as u8;
+        }
+        for &q in &[1u8, 32, 200] {
+            let enc = encode_intra_frame_y_dyn_multi_sb_with_q(&input, q)
+                .unwrap_or_else(|_| panic!("encode failed at q={q}"));
+            let dec =
+                decode_av1(&enc.ivf_bytes).unwrap_or_else(|_| panic!("decode failed at q={q}"));
+            match &dec[0] {
+                Frame::YDyn { width, height, y } => {
+                    assert_eq!(*width, 96);
+                    assert_eq!(*height, 64);
+                    assert_eq!(
+                        y, &enc.reconstructed_y,
+                        "encoder recon = decoder out at q={q}"
+                    );
+                }
+                other => panic!("expected YDyn, got {other:?}"),
+            }
+        }
     }
 
     /// At every allowed (w, h) ∈ {8..=64} × {8..=64} aligned to 8, the
