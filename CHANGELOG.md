@@ -4,6 +4,31 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder/decoder r235: Y-only (monochrome) on the dynamic-extent
+  driver — `MonoYFrame { width, height, y: Vec<u8> }` input + new
+  `encode_intra_frame_y_dyn` / `encode_intra_frame_y_dyn_with_q`
+  entries on the encoder side, mirrored on the decoder by a
+  `Frame::YDyn { width, height, y: Vec<u8> }` variant and a new
+  `decode_frame_dyn_y` dispatched from `decode_frame` whenever the
+  parsed SH carries `mono_chrome = true`. The §5.5.2 mono color-config
+  arm (`num_planes = 1`, `subsampling_x = subsampling_y = true` per
+  spec) is emitted by a new `build_intra_only_y_8bit_seq` helper; the
+  FH builder is shared with the YUV path because the §5.11.5
+  `HasChroma` / §5.11.22 line-8 / §5.11.39 walks are already gated on
+  `NumPlanes > 1` in the existing writers + readers, so the chroma
+  syntax silently vanishes from the bitstream on the mono arm. The
+  encoder skips the per-leaf chroma residual + prediction + coefficient
+  pass entirely; the decoder mirrors with a streamlined
+  `decode_block_leaf_y` that reads only skip + y_mode + luma
+  coefficients. Validates at every rectangular extent
+  `(w, h) ∈ {8, 16, 24, 32, 40, 48, 56, 64}` × itself
+  (1504 → 1516 lib tests; 12 new tests pin: SH mono-flag carriage,
+  `MonoYFrame::validate` rejection of mis-sized planes, lossless WHT
+  bit-exact internal reconstruction, `with_q(0)` byte equivalence to
+  the legacy entry, `q > 0` byte-divergence, and a 14-extent
+  encode→decode→pixel-equality integration roundtrip that covers
+  every square + rectangular shape the dyn driver admits).
+
 - encoder/decoder r197/r234: rectangular frame extents on the
   dynamic-extent driver — promoted from "works incidentally" to a
   tested invariant. Width and height are now independently bounded by

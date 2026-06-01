@@ -908,6 +908,340 @@ fn cfl_predict_4x4_for_plane_dyn(
     out
 }
 
+// ----------------------------------------------------------------------
+// r235 — Y-only (monochrome) dyn decoder.
+// ----------------------------------------------------------------------
+//
+// Inverse of `crate::encoder::encode_intra_frame_y_dyn`. Mirrors
+// [`decode_frame_dyn`] but skips every chroma branch:
+//
+//   * `decode_block_leaf_y` reads only luma `y_mode` + luma
+//     `coefficients()` per leaf — the `uv_mode` / U-V `coefficients()`
+//     / `read_cfl_alphas()` reads are gated on `NumPlanes > 1` per the
+//     spec, so on `NumPlanes == 1` the bitstream contains no chroma
+//     syntax.
+//   * The reconstructed frame surfaces as
+//     [`super::pixel_driver::Frame::YDyn`] (no U/V planes).
+//
+// Called from [`super::pixel_driver::decode_frame`] when
+// `seq.color_config.mono_chrome == true`.
+
+/// Decode one dynamic-extent monochrome intra-only frame and surface it
+/// as [`Frame::YDyn`].
+///
+/// Pre-conditions (enforced by the caller in
+/// [`super::pixel_driver::decode_frame`]):
+/// `seq.color_config.mono_chrome == true`, `seq.color_config.num_planes
+/// == 1`.
+pub(crate) fn decode_frame_dyn_y(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    tile_group_body: &[u8],
+) -> Result<Frame, Error> {
+    let _ = seq;
+    let fs = fh
+        .frame_size
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let width = fs.frame_width;
+    let height = fs.frame_height;
+    if width < MIN_DIM
+        || height < MIN_DIM
+        || width > MAX_DIM
+        || height > MAX_DIM
+        || width % MIN_DIM != 0
+        || height % MIN_DIM != 0
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let mi_cols = fs.mi_cols;
+    let mi_rows = fs.mi_rows;
+    let qp_fh = fh
+        .quantization_params
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let q_params = QuantizerParams::neutral(qp_fh.base_q_idx, 8);
+
+    let parsed = parse_tile_group_obu_body(
+        tile_group_body,
+        /* num_tiles = */ 1,
+        /* tile_cols_log2 = */ 0,
+        /* tile_rows_log2 = */ 0,
+        /* tile_size_bytes = */ 1,
+    )?;
+    if parsed.tiles.len() != 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let tile_bytes = &parsed.tiles[0].bytes;
+
+    let mut decoder =
+        SymbolDecoder::init_symbol(tile_bytes, tile_bytes.len(), fh.disable_cdf_update)?;
+    let mut cdfs = TileCdfContext::new_from_defaults();
+
+    let mut state = DecoderStateDyn::new(mi_rows, mi_cols);
+    let mut coeff_walker = PartitionWalker::new(
+        mi_rows,
+        mi_cols,
+        TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        },
+    )
+    .ok_or(Error::PartitionWalkOutOfRange)?;
+
+    let mut recon_y = vec![0u8; (width as usize) * (height as usize)];
+    let scan: Vec<u16> = get_default_scan(TX_4X4).to_vec();
+
+    let root_b = root_super_block(mi_cols, mi_rows);
+    decode_partition_node_y(
+        &mut decoder,
+        &mut cdfs,
+        &mut state,
+        &mut coeff_walker,
+        0,
+        0,
+        root_b,
+        width as usize,
+        height as usize,
+        &scan,
+        &q_params,
+        &mut recon_y,
+    )?;
+
+    Ok(Frame::YDyn {
+        width,
+        height,
+        y: recon_y,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_partition_node_y(
+    decoder: &mut SymbolDecoder<'_>,
+    cdfs: &mut TileCdfContext,
+    state: &mut DecoderStateDyn,
+    coeff_walker: &mut PartitionWalker,
+    r: u32,
+    c: u32,
+    b_size: usize,
+    width: usize,
+    height: usize,
+    scan: &[u16],
+    qp: &QuantizerParams,
+    recon_y: &mut [u8],
+) -> Result<(), Error> {
+    if r >= state.mi_rows || c >= state.mi_cols {
+        return Ok(());
+    }
+    if b_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    let num4x4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+    let half_block4x4 = num4x4 >> 1;
+    let has_rows = (r + half_block4x4) < state.mi_rows;
+    let has_cols = (c + half_block4x4) < state.mi_cols;
+
+    let partition = if b_size < BLOCK_8X8 {
+        PARTITION_NONE
+    } else {
+        let bsl = MI_WIDTH_LOG2[b_size] as u32;
+        let pctx = state.partition_ctx_for(r, c, bsl);
+        if has_rows && has_cols {
+            let cdf = cdfs
+                .partition_cdf(bsl, pctx)
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+            decoder.read_symbol(cdf)? as usize
+        } else if has_cols {
+            let cdf_row = cdfs
+                .partition_cdf(bsl, pctx)
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+            let mut bin =
+                split_or_horz_cdf(cdf_row, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+            let s = decoder.read_symbol(&mut bin)?;
+            if s == 0 {
+                PARTITION_HORZ
+            } else {
+                PARTITION_SPLIT
+            }
+        } else if has_rows {
+            let cdf_row = cdfs
+                .partition_cdf(bsl, pctx)
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+            let mut bin =
+                split_or_vert_cdf(cdf_row, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+            let s = decoder.read_symbol(&mut bin)?;
+            if s == 0 {
+                PARTITION_VERT
+            } else {
+                PARTITION_SPLIT
+            }
+        } else {
+            PARTITION_SPLIT
+        }
+    };
+
+    let sub_size = partition_subsize(partition, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+
+    match partition {
+        PARTITION_NONE => {
+            state.stamp_mi_sizes(r, c, sub_size);
+            decode_block_leaf_y(
+                decoder,
+                cdfs,
+                coeff_walker,
+                r,
+                c,
+                sub_size,
+                width,
+                height,
+                scan,
+                qp,
+                recon_y,
+            )?;
+        }
+        PARTITION_SPLIT => {
+            decode_partition_node_y(
+                decoder,
+                cdfs,
+                state,
+                coeff_walker,
+                r,
+                c,
+                sub_size,
+                width,
+                height,
+                scan,
+                qp,
+                recon_y,
+            )?;
+            decode_partition_node_y(
+                decoder,
+                cdfs,
+                state,
+                coeff_walker,
+                r,
+                c + half_block4x4,
+                sub_size,
+                width,
+                height,
+                scan,
+                qp,
+                recon_y,
+            )?;
+            decode_partition_node_y(
+                decoder,
+                cdfs,
+                state,
+                coeff_walker,
+                r + half_block4x4,
+                c,
+                sub_size,
+                width,
+                height,
+                scan,
+                qp,
+                recon_y,
+            )?;
+            decode_partition_node_y(
+                decoder,
+                cdfs,
+                state,
+                coeff_walker,
+                r + half_block4x4,
+                c + half_block4x4,
+                sub_size,
+                width,
+                height,
+                scan,
+                qp,
+                recon_y,
+            )?;
+        }
+        _ => return Err(Error::PartitionWalkOutOfRange),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_block_leaf_y(
+    decoder: &mut SymbolDecoder<'_>,
+    cdfs: &mut TileCdfContext,
+    coeff_walker: &mut PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+    sub_size: usize,
+    width: usize,
+    height: usize,
+    scan: &[u16],
+    qp: &QuantizerParams,
+    recon_y: &mut [u8],
+) -> Result<(), Error> {
+    let lossless = qp.base_q_idx == 0;
+    let skip_ctx_val = skip_ctx(0, 0);
+    let skip = {
+        let cdf = cdfs.skip_cdf(skip_ctx_val);
+        decoder.read_symbol(cdf)? as u8
+    };
+    let size_group_ctx = size_group(sub_size);
+    let y_mode = {
+        let cdf = cdfs
+            .y_mode_cdf(size_group_ctx)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        decoder.read_symbol(cdf)? as u8
+    };
+    if (y_mode as usize) >= NUM_INTRA_MODES_Y {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.5 mono arm — no uv_mode / CflAlpha / chroma coefficients
+    // read because §5.11.22 line-8 and §5.11.39 walk are gated on
+    // `NumPlanes > 1`.
+
+    let mut quant_y = vec![0i32; 16];
+    let _readout_y = coeff_walker.coefficients(
+        decoder,
+        cdfs,
+        /* plane = */ 0,
+        0,
+        TX_4X4,
+        TX_CLASS_2D,
+        0,
+        0,
+        scan,
+        &mut quant_y,
+    )?;
+
+    let (row0, col0) = ((mi_row as usize) * 4, (mi_col as usize) * 4);
+    let pred_y = predict_intra_for_mode_4x4(
+        recon_y,
+        width,
+        height,
+        mi_row as usize,
+        mi_col as usize,
+        y_mode as usize,
+    )
+    .ok_or(Error::PartitionWalkOutOfRange)?;
+    if skip == 0 {
+        let dequant = dequantize_step1(&quant_y, TX_4X4, 0, 0, DCT_DCT, 15, qp);
+        let residual = inverse_transform_2d(&dequant, TX_4X4, DCT_DCT, 8, lossless);
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = pred_y[i * 4 + j] as i64 + residual[i * 4 + j];
+                recon_y[(row0 + i) * width + (col0 + j)] = p.clamp(0, 255) as u8;
+            }
+        }
+    } else {
+        for i in 0..4 {
+            for j in 0..4 {
+                recon_y[(row0 + i) * width + (col0 + j)] = pred_y[i * 4 + j];
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1273,7 @@ mod tests {
                 assert_eq!(y, &expected);
             }
             Frame::Yuv420Dyn { .. } => panic!("16×16 should route through fixed driver"),
+            _ => panic!("unexpected Frame variant"),
         }
     }
 
@@ -1063,6 +1398,120 @@ mod tests {
                 assert_eq!(v, &input.v, "V mismatch at 64×64");
             }
             _ => panic!("expected Yuv420Dyn for 64×64"),
+        }
+    }
+
+    // ---- r235 Y-only dyn roundtrips ----
+
+    fn pseudo_random_plane(seed: u64, len: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = vec![0u8; len];
+        for slot in out.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *slot = (s >> 56) as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn dyn_y_decode_flat_grey_32x32_roundtrip() {
+        use crate::encoder::pixel_driver_dyn::{encode_intra_frame_y_dyn, MonoYFrame};
+        let input = MonoYFrame::filled(32, 32, 128);
+        let encoded = encode_intra_frame_y_dyn(&input).expect("encode");
+        let decoded = decode_av1(&encoded.ivf_bytes).expect("decode");
+        match &decoded[0] {
+            Frame::YDyn { width, height, y } => {
+                assert_eq!(*width, 32);
+                assert_eq!(*height, 32);
+                assert_eq!(y, &input.y);
+            }
+            other => panic!("expected YDyn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dyn_y_decode_pseudorandom_32x32_roundtrip_bit_exact() {
+        use crate::encoder::pixel_driver_dyn::{encode_intra_frame_y_dyn, MonoYFrame};
+        let input = MonoYFrame {
+            width: 32,
+            height: 32,
+            y: pseudo_random_plane(0xCAFE_F00D_BAAD_F00D, 32 * 32),
+        };
+        let encoded = encode_intra_frame_y_dyn(&input).expect("encode");
+        let decoded = decode_av1(&encoded.ivf_bytes).expect("decode");
+        match &decoded[0] {
+            Frame::YDyn { width, height, y } => {
+                assert_eq!(*width, 32);
+                assert_eq!(*height, 32);
+                assert_eq!(y, &input.y, "Y mismatch at 32×32 mono");
+            }
+            other => panic!("expected YDyn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dyn_y_decode_pseudorandom_64x64_roundtrip_bit_exact() {
+        use crate::encoder::pixel_driver_dyn::{encode_intra_frame_y_dyn, MonoYFrame};
+        let input = MonoYFrame {
+            width: 64,
+            height: 64,
+            y: pseudo_random_plane(0xABCD_1234_5678_9F0E, 64 * 64),
+        };
+        let encoded = encode_intra_frame_y_dyn(&input).expect("encode");
+        let decoded = decode_av1(&encoded.ivf_bytes).expect("decode");
+        match &decoded[0] {
+            Frame::YDyn { width, height, y } => {
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+                assert_eq!(y, &input.y, "Y mismatch at 64×64 mono");
+            }
+            other => panic!("expected YDyn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dyn_y_decode_rectangular_24x40_roundtrip_bit_exact() {
+        use crate::encoder::pixel_driver_dyn::{encode_intra_frame_y_dyn, MonoYFrame};
+        let input = MonoYFrame {
+            width: 24,
+            height: 40,
+            y: pseudo_random_plane(0xFEED_F00D_DEAD_BEEF, 24 * 40),
+        };
+        let encoded = encode_intra_frame_y_dyn(&input).expect("encode");
+        let decoded = decode_av1(&encoded.ivf_bytes).expect("decode");
+        match &decoded[0] {
+            Frame::YDyn { width, height, y } => {
+                assert_eq!(*width, 24);
+                assert_eq!(*height, 40);
+                assert_eq!(y, &input.y, "Y mismatch at 24×40 mono");
+            }
+            other => panic!("expected YDyn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dyn_y_decode_lossy_q32_smoke() {
+        use crate::encoder::pixel_driver_dyn::{encode_intra_frame_y_dyn_with_q, MonoYFrame};
+        // At base_q_idx > 0 the lossless WHT bit-exact property goes
+        // away (the §7.13.3 forward DCT + §7.12.3 quantize/dequant
+        // chain is lossy by design); just verify the roundtrip
+        // completes and surfaces a YDyn frame.
+        let input = MonoYFrame {
+            width: 32,
+            height: 32,
+            y: pseudo_random_plane(0x1111_2222_3333_4444, 32 * 32),
+        };
+        let encoded = encode_intra_frame_y_dyn_with_q(&input, 32).expect("encode");
+        let decoded = decode_av1(&encoded.ivf_bytes).expect("decode");
+        match &decoded[0] {
+            Frame::YDyn { width, height, y } => {
+                assert_eq!(*width, 32);
+                assert_eq!(*height, 32);
+                assert_eq!(y.len(), 32 * 32);
+            }
+            other => panic!("expected YDyn, got {other:?}"),
         }
     }
 }

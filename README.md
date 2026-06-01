@@ -2,6 +2,50 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-01 (round 235)
+
+Round 235 lands **Y-only (monochrome) support** on the dynamic-extent
+encoder + decoder driver. A new `MonoYFrame { width, height, y: Vec<u8> }`
+input + `encode_intra_frame_y_dyn` / `encode_intra_frame_y_dyn_with_q`
+entries produce streams whose SH carries the §5.5.2 mono color-config
+arm (`mono_chrome = true`, `num_planes = 1`, `subsampling_x =
+subsampling_y = true`). The decoder mirrors via a new
+`Frame::YDyn { width, height, y: Vec<u8> }` variant + `decode_frame_dyn_y`
+entry, dispatched from `decode_frame` whenever the parsed SH carries
+`mono_chrome = true`.
+
+The mono arm reuses every existing primitive (13-mode luma intra
+picker, forward WHT / forward DCT_DCT, forward quantize, §5.11.39
+coefficient writer, §5.11.4 partition tree, §5.11.1 tile-group, §7.5
+temporal unit, IVF v0); the only deltas are the SH builder flipping
+`mono_chrome = true, num_planes = 1` and the per-leaf walk skipping
+the chroma residual + prediction + coefficient pass. The chroma
+syntax (`uv_mode`, U/V `coefficients()`, `CflAlpha{U,V}`) silently
+vanishes from the bitstream because the §5.11.5 `HasChroma` /
+§5.11.22 line-8 / §5.11.39 walks are already gated on `NumPlanes > 1`
+in the existing writers + readers.
+
+Pinned with 12 new tests across encoder + decoder:
+
+* SH mono-flag carriage (`mono_chrome = true, num_planes = 1`,
+  subsampling preserved per §5.5.2).
+* `MonoYFrame::validate` rejection of mis-sized planes +
+  out-of-range dimensions.
+* Lossless WHT bit-exact internal reconstruction at 32×32 + 40×32 on
+  pseudorandom luma.
+* `encode_intra_frame_y_dyn_with_q(_, 0)` byte equivalence to the
+  legacy `encode_intra_frame_y_dyn` entry.
+* `q > 0` byte-divergence vs the lossless arm.
+* End-to-end encode → decode pixel-equality at every allowed extent
+  `(w, h) ∈ {8, 16, 24, 32, 40, 48, 56, 64} × itself` plus the
+  rectangular subset `{(8,16), (16,8), (24,32), (32,24), (40,16),
+  (16,40)}` — 14 extents total, all bit-exact on the lossless WHT
+  arm.
+* Lossy q=32 smoke roundtrip surfacing a `Frame::YDyn` with the
+  expected Y-plane length.
+
+Total: 1504 → 1516 lib tests.
+
 ## Status — 2026-06-01 (round 234)
 
 Round 234 promotes **rectangular frame extents** on the dynamic-extent

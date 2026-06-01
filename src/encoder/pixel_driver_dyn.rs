@@ -1351,6 +1351,337 @@ const _BSIZE_KEEP_ALIVE: (usize, usize, usize, usize) =
 #[allow(dead_code)]
 const _P_KEEP_ALIVE: usize = PARTITION_NONE;
 
+// ----------------------------------------------------------------------
+// r235 — Y-only (monochrome) dynamic-extent driver.
+// ----------------------------------------------------------------------
+//
+// Layered on top of the r230..r234 helpers. The only deltas vs the
+// 4:2:0 YUV path are:
+//
+//   1. The SH carries `mono_chrome = true, num_planes = 1` (instead of
+//      `mono_chrome = false, num_planes = 3, subsampling_x = subsampling_y
+//      = true`). §5.5.2 still enforces `subsampling_x = subsampling_y =
+//      true` on the mono arm to keep the §5.9.9 `compute_image_size`
+//      derivation (`MiCols = 2 * ((width + 7) >> 3)`) unchanged.
+//   2. Each §5.11.5 leaf encodes only the luma plane. The §5.11.5
+//      `HasChroma` predicate is gated on `NumPlanes > 1` per the
+//      spec, so on `NumPlanes == 1` no chroma syntax (`uv_mode`, U/V
+//      `coefficients()`, `CflAlpha{U,V}`) is emitted regardless of
+//      mi-position.
+//   3. The encoder reconstructs only the luma plane; the U/V Vecs are
+//      not populated.
+//
+// Every other primitive (partition tree, 13-mode luma intra picker,
+// forward WHT / forward DCT_DCT, forward quantize, §5.11.39
+// coefficient writer, §5.11.1 tile-group OBU, §7.5 temporal unit, IVF
+// v0) is reused unchanged from the YUV path.
+
+/// Dynamic-extent monochrome input the r235 Y-only dyn driver consumes.
+/// Mirrors [`Yuv420Frame`] but drops the chroma planes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonoYFrame {
+    /// Luma width in pixels. Same constraints as [`Yuv420Frame::width`]
+    /// (multiple of [`MIN_DIM`], ≤ [`MAX_DIM`]).
+    pub width: u32,
+    /// Luma height in pixels. Same constraints as
+    /// [`Yuv420Frame::height`].
+    pub height: u32,
+    /// Luma plane (`Y`), row-major, length `width * height`.
+    pub y: Vec<u8>,
+}
+
+impl MonoYFrame {
+    /// All-`fill` mid-grey input.
+    #[must_use]
+    pub fn filled(width: u32, height: u32, fill: u8) -> Self {
+        Self {
+            width,
+            height,
+            y: vec![fill; (width * height) as usize],
+        }
+    }
+
+    /// Validate the input's dimensions + plane length. Same rules as
+    /// [`Yuv420Frame::validate`] sans the chroma checks.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.width < MIN_DIM
+            || self.height < MIN_DIM
+            || self.width > MAX_DIM
+            || self.height > MAX_DIM
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if self.width % MIN_DIM != 0 || self.height % MIN_DIM != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if self.y.len() != (self.width * self.height) as usize {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        Ok(())
+    }
+}
+
+/// Result of [`encode_intra_frame_y_dyn`]. Bundles the IVF bytes with
+/// the reconstructed luma plane (encoder-internal walk; bit-exact equal
+/// to the input on the lossless WHT arm).
+#[derive(Debug, Clone)]
+pub struct EncodedFrameDynY {
+    /// IVF bytes — file header + one IVF frame.
+    pub ivf_bytes: Vec<u8>,
+    /// §7.5 temporal unit bytes (TD + SH + FH + TileGroup OBU).
+    pub temporal_unit_bytes: Vec<u8>,
+    /// Reconstructed Y plane (row-major, length `width * height`).
+    pub reconstructed_y: Vec<u8>,
+    /// SequenceHeader the driver synthesised + emitted
+    /// (`mono_chrome = true`, `num_planes = 1`).
+    pub seq: SequenceHeader,
+    /// FrameHeader the driver synthesised + emitted.
+    pub fh: FrameHeader,
+}
+
+/// Build the minimal 8-bit monochrome `SequenceHeader` for an
+/// intra-only frame. Same shape as
+/// [`build_intra_only_yuv420_8bit_seq`] but flips the color-config to
+/// `mono_chrome = true, num_planes = 1`.
+///
+/// Per §5.5.2 the mono arm still carries `subsampling_x =
+/// subsampling_y = true` (the §5.5.2 mono path explicitly sets both
+/// flags). `color_range` is written on wire so we surface the
+/// implementation-defined `false` ⇒ studio swing default.
+#[must_use]
+pub fn build_intra_only_y_8bit_seq(max_width: u32, max_height: u32) -> SequenceHeader {
+    let mut seq = build_intra_only_yuv420_8bit_seq(max_width, max_height);
+    seq.color_config.mono_chrome = true;
+    seq.color_config.num_planes = 1;
+    // §5.5.2 mono path: subsampling stays true (per spec), CSP_UNKNOWN,
+    // separate_uv_delta_q = false. Already set by the YUV builder.
+    seq
+}
+
+/// Build the minimal intra-only `FrameHeader` for the r235 Y-only dyn
+/// driver. Same field set as
+/// [`build_intra_only_yuv420_8bit_fh_with_q`]; the `num_planes`-gated
+/// FH writer sub-syntax (e.g. `loop_filter_level[2..4]`,
+/// `delta_q_u_*` / `delta_q_v_*`) is suppressed automatically by the
+/// FH encoder when `seq.color_config.num_planes == 1`.
+#[must_use]
+pub fn build_intra_only_y_8bit_fh_with_q(
+    seq: &SequenceHeader,
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> FrameHeader {
+    build_intra_only_yuv420_8bit_fh_with_q(seq, width, height, base_q_idx)
+}
+
+/// Build the minimal intra-only `FrameHeader` for the r235 Y-only dyn
+/// driver at `base_q_idx = 0`. Thin wrapper.
+#[must_use]
+pub fn build_intra_only_y_8bit_fh(seq: &SequenceHeader, width: u32, height: u32) -> FrameHeader {
+    build_intra_only_y_8bit_fh_with_q(seq, width, height, 0)
+}
+
+/// Encode one monochrome intra-only frame at `base_q_idx = 0`
+/// (lossless WHT arm). The reconstructed luma plane on the
+/// `EncodedFrameDynY` is bit-exact equal to the input.
+///
+/// Thin wrapper over [`encode_intra_frame_y_dyn_with_q`].
+///
+/// ## Errors
+///
+/// * `input.validate()` fails ⇒ [`Error::PartitionWalkOutOfRange`].
+/// * Any internal partition-tree / coefficient-writer overflow.
+pub fn encode_intra_frame_y_dyn(input: &MonoYFrame) -> Result<EncodedFrameDynY, Error> {
+    encode_intra_frame_y_dyn_with_q(input, 0)
+}
+
+/// Encode one monochrome intra-only frame at the caller-supplied
+/// `base_q_idx`. `base_q_idx == 0` selects the §5.9.2 `CodedLossless`
+/// arm; `base_q_idx > 0` selects the §7.13.3 forward DCT path. The
+/// per-leaf code path mirrors [`encode_intra_frame_yuv_dyn_with_q`]'s
+/// luma walk exactly; the chroma walk is skipped.
+///
+/// ## Errors
+///
+/// Same as [`encode_intra_frame_yuv_dyn_with_q`] minus the chroma-shape
+/// checks (no chroma planes ⇒ none can mismatch).
+pub fn encode_intra_frame_y_dyn_with_q(
+    input: &MonoYFrame,
+    base_q_idx: u8,
+) -> Result<EncodedFrameDynY, Error> {
+    input.validate()?;
+    let width = input.width as usize;
+    let height = input.height as usize;
+    let mi_cols = 2 * (((width + 7) >> 3) as u32);
+    let mi_rows = 2 * (((height + 7) >> 3) as u32);
+    let cells_wide = width / 4;
+    let cells_high = height / 4;
+
+    // Build the mono SH+FH for this frame.
+    let seq = build_intra_only_y_8bit_seq(input.width, input.height);
+    let fh = build_intra_only_y_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+
+    let lossless = base_q_idx == 0;
+    let qp = QuantizerParams::neutral(base_q_idx, 8);
+    let scan = get_default_scan(TX_4X4).to_vec();
+
+    let mut recon_y = vec![0u8; width * height];
+
+    // Walk every in-frame BLOCK_4X4 leaf in §5.11.4 dispatch order.
+    let leaves_order = dispatch_order_leaves(root_super_block(mi_cols, mi_rows), mi_rows, mi_cols);
+    debug_assert_eq!(leaves_order.len(), cells_wide * cells_high);
+
+    let mut leaf_table: std::collections::HashMap<(u32, u32), LeafEnc> =
+        std::collections::HashMap::with_capacity(leaves_order.len());
+
+    for &(mi_r, mi_c) in &leaves_order {
+        let row0 = (mi_r as usize) * 4;
+        let col0 = (mi_c as usize) * 4;
+        // Luma walk only.
+        let (y_mode, pred_y) =
+            pick_best_intra_mode_4x4(&recon_y, &input.y, width, height, row0, col0);
+        let mut residual_y = [0i64; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = input.y[(row0 + i) * width + (col0 + j)] as i64;
+                let q = pred_y[i * 4 + j] as i64;
+                residual_y[i * 4 + j] = p - q;
+            }
+        }
+        let coeffs_y = if lossless {
+            forward_wht_4x4(&residual_y).to_vec()
+        } else {
+            forward_transform_2d(&residual_y, TX_4X4, DCT_DCT, false)
+        };
+        let quant_y = forward_quantize(&coeffs_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
+
+        let dequant_y = dequantize_step1(&quant_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
+        let resid_back_y = inverse_transform_2d(&dequant_y, TX_4X4, DCT_DCT, 8, lossless);
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = pred_y[i * 4 + j] as i64 + resid_back_y[i * 4 + j];
+                recon_y[(row0 + i) * width + (col0 + j)] = p.clamp(0, 255) as u8;
+            }
+        }
+
+        // §5.11.22 line-8: `uv_mode` is gated on `NumPlanes > 1`.
+        // mono ⇒ uv_mode = None on every leaf, no chroma coefficients.
+        let coefficients: Vec<PlaneCoefficients> = vec![PlaneCoefficients {
+            plane: 0,
+            is_inter: 0,
+            tx_size: TX_4X4,
+            tx_class: TX_CLASS_2D,
+            txb_skip_ctx: 0,
+            dc_sign_ctx: 0,
+            scan: scan.clone(),
+            quant: quant_y,
+        }];
+
+        leaf_table.insert(
+            (mi_r, mi_c),
+            LeafEnc {
+                y_mode,
+                uv_mode: None,
+                cfl_alpha_u: None,
+                cfl_alpha_v: None,
+                coefficients,
+            },
+        );
+    }
+
+    // Build the `EncodeNode` tree from the captured leaves.
+    let root_b = root_super_block(mi_cols, mi_rows);
+    let root = build_partition_tree(root_b, 0, 0, mi_rows, mi_cols, &mut |r, c| {
+        let leaf = leaf_table
+            .remove(&(r, c))
+            .expect("dispatch-order leaf must have been populated");
+        EncodeBlock {
+            skip: 0,
+            segment_id: 0,
+            segment_pred: 0,
+            y_mode: leaf.y_mode,
+            uv_mode: leaf.uv_mode,
+            cfl_alpha_u: leaf.cfl_alpha_u,
+            cfl_alpha_v: leaf.cfl_alpha_v,
+            coefficients: leaf.coefficients,
+        }
+    });
+
+    // §5.11 entropy-coder run for the single tile. `subsampling_x` /
+    // `subsampling_y` still flagged true (matches the SH).
+    let mut writer = SymbolWriter::new(false);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let mut state = PartitionTreeWriter::new(
+        mi_rows,
+        mi_cols,
+        TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        },
+        /* segmentation_enabled = */ false,
+        /* last_active_seg_id = */ 0,
+        /* lossless = */ false,
+        /* subsampling_x = */ true,
+        /* subsampling_y = */ true,
+    )
+    .ok_or(Error::PartitionWalkOutOfRange)?;
+    write_partition_tree(&mut writer, &mut cdfs, &mut state, &root, 0, 0, root_b)?;
+    let tile_bytes = writer.finish();
+
+    let tile_group = TileGroupObu {
+        num_tiles: 1,
+        tile_cols_log2: 0,
+        tile_rows_log2: 0,
+        tile_size_bytes: 1,
+        tg_start: 0,
+        tg_end: 0,
+        start_and_end_present: false,
+        tiles: vec![TilePayload::new(tile_bytes)],
+    };
+    let tile_group_body = write_tile_group_obu(&tile_group)?;
+
+    let fh_body = crate::encoder::frame_obu::write_frame_header_obu(&fh, &seq);
+    let frame_obus: Vec<ObuFrame> = vec![
+        ObuFrame::new(ObuType::FrameHeader, fh_body),
+        ObuFrame::new(ObuType::TileGroup, tile_group_body),
+    ];
+
+    let temporal_unit_bytes = {
+        use crate::encoder::obu::build_temporal_unit;
+        use crate::encoder::sequence_obu::write_sequence_header_obu;
+        let sh_body = write_sequence_header_obu(&seq);
+        build_temporal_unit(Some(&sh_body), &frame_obus)
+    };
+
+    let mut ivf_bytes: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut ivf_bytes);
+        let mut iw = IvfWriter::new(
+            cursor,
+            FOURCC_AV01,
+            input.width as u16,
+            input.height as u16,
+            25,
+            1,
+        )
+        .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        iw.write_frame(&temporal_unit_bytes, 0)
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        iw.patch_frame_count()
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+    }
+
+    Ok(EncodedFrameDynY {
+        ivf_bytes,
+        temporal_unit_bytes,
+        reconstructed_y: recon_y,
+        seq,
+        fh,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1906,6 +2237,128 @@ mod tests {
                     assert_eq!(v, &enc.reconstructed_v, "V mismatch at {w}x{h}");
                 }
                 other => panic!("expected Yuv420Dyn at {w}x{h}, got {other:?}"),
+            }
+        }
+    }
+
+    // ---- r235 — Y-only dyn driver lib tests ----
+
+    #[test]
+    fn y_dyn_seq_carries_monochrome_flag() {
+        let seq = build_intra_only_y_8bit_seq(32, 32);
+        assert!(seq.color_config.mono_chrome, "Y-only SH ⇒ mono_chrome");
+        assert_eq!(seq.color_config.num_planes, 1, "Y-only SH ⇒ num_planes 1");
+        // The mono arm still requires subsampling = true per §5.5.2.
+        assert!(seq.color_config.subsampling_x);
+        assert!(seq.color_config.subsampling_y);
+    }
+
+    #[test]
+    fn y_dyn_validate_rejects_mismatched_y_len() {
+        let bad = MonoYFrame {
+            width: 16,
+            height: 16,
+            y: vec![0u8; 8],
+        };
+        assert!(bad.validate().is_err());
+        let bad_dim = MonoYFrame {
+            width: 12,
+            height: 16,
+            y: vec![0u8; 12 * 16],
+        };
+        assert!(bad_dim.validate().is_err());
+    }
+
+    #[test]
+    fn y_dyn_encode_flat_grey_recon_matches_input() {
+        let input = MonoYFrame::filled(32, 32, 128);
+        let res = encode_intra_frame_y_dyn(&input).expect("encode ok");
+        assert_eq!(res.reconstructed_y, input.y);
+        // The SH+FH the encoder emitted carry the mono flag.
+        assert!(res.seq.color_config.mono_chrome);
+        assert_eq!(res.seq.color_config.num_planes, 1);
+    }
+
+    #[test]
+    fn y_dyn_encode_pseudorandom_internal_recon_bit_exact_on_lossless_arm() {
+        let mut input = MonoYFrame::filled(40, 32, 0);
+        let mut s: u64 = 0xFACE_C0DE_BABE_1234;
+        for p in input.y.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *p = (s >> 56) as u8;
+        }
+        let res = encode_intra_frame_y_dyn(&input).expect("encode ok");
+        assert_eq!(
+            res.reconstructed_y, input.y,
+            "lossless WHT arm ⇒ encoder-internal recon equals input plane"
+        );
+    }
+
+    #[test]
+    fn y_dyn_encode_with_q_zero_matches_legacy_byte_for_byte() {
+        let input = MonoYFrame::filled(32, 32, 128);
+        let legacy = encode_intra_frame_y_dyn(&input).expect("legacy ok");
+        let with_q0 = encode_intra_frame_y_dyn_with_q(&input, 0).expect("with_q(0) ok");
+        assert_eq!(legacy.ivf_bytes, with_q0.ivf_bytes);
+        assert_eq!(legacy.reconstructed_y, with_q0.reconstructed_y);
+    }
+
+    #[test]
+    fn y_dyn_encode_with_q_one_diverges_from_lossless_arm() {
+        let input = MonoYFrame::filled(32, 32, 128);
+        let q0 = encode_intra_frame_y_dyn_with_q(&input, 0).expect("q=0 ok");
+        let q1 = encode_intra_frame_y_dyn_with_q(&input, 1).expect("q=1 ok");
+        assert_ne!(q0.ivf_bytes, q1.ivf_bytes);
+        assert_eq!(q0.fh.quantization_params.as_ref().unwrap().base_q_idx, 0);
+        assert_eq!(q1.fh.quantization_params.as_ref().unwrap().base_q_idx, 1);
+    }
+
+    /// At every allowed (w, h) ∈ {8..=64} × {8..=64} aligned to 8, the
+    /// Y-only dyn driver must produce a parseable IVF + a Y plane the
+    /// dyn-Y decoder reproduces bit-exactly on the lossless WHT arm.
+    #[test]
+    fn y_dyn_encode_decode_lossless_roundtrip_every_extent() {
+        use crate::decoder::{decode_av1, Frame};
+        // Sample a representative set of extents (square + rectangular).
+        let extents: &[(u32, u32)] = &[
+            (8, 8),
+            (16, 16),
+            (24, 24),
+            (32, 32),
+            (40, 40),
+            (48, 48),
+            (56, 56),
+            (64, 64),
+            (8, 16),
+            (16, 8),
+            (24, 32),
+            (32, 24),
+            (40, 16),
+            (16, 40),
+        ];
+        let mut s: u64 = 0xC001_BABE_F00D_FACE;
+        for &(w, h) in extents {
+            let mut input = MonoYFrame::filled(w, h, 0);
+            for p in input.y.iter_mut() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *p = (s >> 56) as u8;
+            }
+            let enc = encode_intra_frame_y_dyn(&input)
+                .unwrap_or_else(|_| panic!("encode failed at {w}x{h}"));
+            let dec =
+                decode_av1(&enc.ivf_bytes).unwrap_or_else(|_| panic!("decode failed at {w}x{h}"));
+            match &dec[0] {
+                Frame::YDyn { width, height, y } => {
+                    assert_eq!(*width, w, "decoded width mismatch at {w}x{h}");
+                    assert_eq!(*height, h, "decoded height mismatch at {w}x{h}");
+                    assert_eq!(y, &enc.reconstructed_y, "Y plane mismatch at {w}x{h}");
+                    assert_eq!(y, &input.y, "Y bit-exact recovery at {w}x{h}");
+                }
+                other => panic!("expected YDyn at {w}x{h}, got {other:?}"),
             }
         }
     }

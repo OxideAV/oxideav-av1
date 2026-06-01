@@ -129,6 +129,19 @@ pub enum Frame {
         /// V plane, same shape as `u`.
         v: Vec<u8>,
     },
+    /// Dynamic-extent monochrome — emitted by the r235
+    /// [`crate::encoder::encode_intra_frame_y_dyn`] driver. The SH
+    /// carries `mono_chrome = true, num_planes = 1`; the §5.11.5 leaf
+    /// walk skips every chroma read so the decoded frame surfaces only
+    /// the luma plane.
+    YDyn {
+        /// Luma width in pixels.
+        width: u32,
+        /// Luma height in pixels.
+        height: u32,
+        /// Luma plane, row-major, length `width * height`.
+        y: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -265,7 +278,11 @@ fn decode_frame(
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
     if seq.color_config.mono_chrome {
-        return Err(Error::PartitionWalkOutOfRange);
+        // r235 monochrome dispatch — any aligned (w, h) ∈ {8..=64} ×
+        // {8..=64} the dyn-y driver accepts. The 4:2:0 / 16×16 fixed
+        // path below requires `mono_chrome == false`, so a monochrome
+        // SH always routes to the dyn-y entry.
+        return crate::decoder::pixel_driver_dyn::decode_frame_dyn_y(seq, fh, tile_group_body);
     }
     if !seq.color_config.subsampling_x || !seq.color_config.subsampling_y {
         return Err(Error::PartitionWalkOutOfRange);
