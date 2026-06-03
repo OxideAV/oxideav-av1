@@ -2273,6 +2273,29 @@ pub enum Error {
     /// the [`cdf::DecodedInterBlockModeInfo`] aggregate into the
     /// [`cdf::DecodedInterFrameModeInfo`] return path.
     MotionModeUnsupported,
+    /// The arithmetic-coder state violated one of the §8.2.6 post-
+    /// renormalization invariants:
+    ///
+    /// 1. `32768 ≤ SymbolRange ≤ 65535` — the §8.2.6 ordered steps 1
+    ///    and 2 (`bits = 15 − FloorLog2(SymbolRange)`, then
+    ///    `SymbolRange = SymbolRange << bits`) restore the range to
+    ///    the top half of the 16-bit window after every symbol
+    ///    decode / encode.
+    /// 2. `SymbolValue < SymbolRange` — the §8.2.6 symbol-search loop
+    ///    terminates exactly when `SymbolValue >= cur` lands the
+    ///    accumulator inside the current symbol's sub-interval, and
+    ///    the post-decode rewrite `SymbolValue -= cur` /
+    ///    `SymbolRange = prev − cur` plus the renormalization shift
+    ///    preserve this ordering.
+    ///
+    /// Surfacing this as an [`Error`] (rather than panicking on a
+    /// `debug_assert!`) lets bitstream-conformance failures be
+    /// reported through the normal error path. The two invariants are
+    /// documented in §8.2.6 of the AV1 Bitstream & Decoding Process
+    /// Specification and re-stated as cross-implementation oracles
+    /// in `docs/video/av1/fixtures/issue_796/msac-trace.md` — the
+    /// "Invariants observed across all 256 rows" section.
+    SymbolStateInvariantBroken,
 }
 
 impl core::fmt::Display for Error {
@@ -2403,6 +2426,10 @@ impl core::fmt::Display for Error {
             Self::MotionModeUnsupported => write!(
                 f,
                 "oxideav-av1: §5.11.27 read_motion_mode — defensive fallback retained post-r175 (the §5.11.27 reader is now wired into the dispatcher with §7.10.3 has_overlappable_candidates + §7.10.4 find_warp_samples; post-r176 the §5.11.28 read_interintra_mode, post-r177 the §5.11.29 read_compound_type, and post-r178 the §5.11.x read_interpolation_filter readers are also wired — completing the §5.11.23 inter cascade; the §5.11.18 dispatcher's Ok-arm continues to surface InterBlockModeInfoUnsupported pending the §5.11.34 residual lift)"
+            ),
+            Self::SymbolStateInvariantBroken => write!(
+                f,
+                "oxideav-av1: §8.2.6 post-renorm invariant broken (SymbolRange not in [32768, 65535], or SymbolValue >= SymbolRange)"
             ),
         }
     }

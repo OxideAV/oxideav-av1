@@ -2,6 +2,78 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-03 (round 223)
+
+Round 223 hardens the §8.2 arithmetic coder on both surfaces by
+asserting the two §8.2.6 post-renormalisation invariants at runtime.
+Where the prior `SymbolDecoder::renormalize` / `SymbolWriter::write_symbol`
+paths trusted the partition arithmetic to keep `SymbolRange` /
+`SymbolValue` in spec, r223 lifts these into explicit guarded checks
+that surface a new `Error::SymbolStateInvariantBroken` if the §8.2.6
+ordered renormalisation step leaves the state out of window:
+
+```text
+1. 32768 ≤ SymbolRange ≤ 65535   (§8.2.6 ordered steps 1–2 restore the
+                                  range to the top half of the 16-bit
+                                  window after every decode / encode.)
+2. SymbolValue < SymbolRange     (§8.2.6 symbol-search loop terminates
+                                  exactly when the accumulator first
+                                  lands inside the selected sub-interval;
+                                  the subsequent rewrite + renorm
+                                  preserve this ordering.)
+```
+
+The two invariants are explicitly re-stated as cross-implementation
+oracles in the freshly-staged trace doc
+`docs/video/av1/fixtures/issue_796/msac-trace.md` ("Invariants observed
+across all 256 rows" section), which records the §8.2 state evolution
+over the first 256 symbol decodes of a single AV1 bitstream and
+verifies both invariants programmatically row-for-row, with zero
+violations. r223 mirrors that oracle into in-tree runtime enforcement.
+
+The behaviour on every existing fixture / round-trip test is unchanged
+byte-for-byte: the invariants hold under conformant input, so the new
+checks are no-ops on the 1537-test corpus inherited from r214 and
+short-circuit only on malformed input or an internal CDF / partition-
+arithmetic precision bug.
+
+Six new tests pin the new surface:
+
+* `post_renorm_range_in_top_half_across_decodes` — sweeps four
+  pseudo-random 4-byte starting windows and confirms `32768 ≤
+  SymbolRange ≤ 65535` after every read_symbol on the §8.2.3 boolean
+  CDF.
+* `post_renorm_value_below_range_across_decodes` — same sweep,
+  asserting `SymbolValue < SymbolRange`.
+* `invariant_check_returns_error_on_each_violation` — direct call
+  into `check_post_renorm_invariants` over the §8.2.6 boundaries
+  (in-range, `range = 1 << 15`, `range = (1 << 16) − 1`) and over
+  each of the three out-of-window edges.
+* `invariants_hold_across_adaptive_multisymbol_run` — 40 adaptive
+  decodes through a 4-symbol CDF with §8.3 updates enabled — the
+  closest reproducible in-tree analogue of the trace doc's "all 256
+  rows" assertion (the issue_796 bitstream itself is not committed to
+  the repo).
+* `encoder_decoder_state_stays_in_top_half_window` — mixed bool /
+  multi-symbol encode followed by decode, with the invariants probed
+  on the decoder side after every step (the encoder's `range`
+  evolves identically, so a violation on either side surfaces here).
+* `encoder_range_invariant_check_distinguishes_boundaries` — direct
+  call into `SymbolWriter::check_range_invariant` over the §8.2.6
+  boundary + out-of-window edges.
+
+Total: 1537 → 1543 lib tests; the integration test counts
+(`encode_decode_pixel_roundtrip` 67, `decode_block_syntax_walker` 59,
+`encoder_pixel_driver_y_only` 10, `encoder_end_to_end_ivf` 2,
+`frame_header_fixtures` 3, `sequence_header_fixtures` 1) are unchanged
+because no public API beyond the new Error variant landed.
+
+Out of scope (still next arc, unchanged): 128×128 super-blocks
+(`use_128x128_superblock = true`), rectangular TX sizes (TX_4X8 /
+TX_8X4 / TX_8X16 / TX_16X8), 10-bit, 4:2:2 / 4:4:4 chroma, §5.11.18
+inter mode_info, per-segment / per-block delta_q, full bit-cost-aware
+RD on the dyn picker.
+
 ## Status — 2026-06-03 (round 214)
 
 Round 214 lifts the **multi-super-block** ceiling on the 4:2:0 YUV
@@ -7744,6 +7816,16 @@ observation. `decode_av1` / `encode_av1` continue to return
 * Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
   files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
   treated as opaque ground-truth, no source consulted).
+* `docs/video/av1/fixtures/issue_796/msac-trace.md` — clean-room
+  behavioural trace of the §8.2 symbol decoder's
+  `(SymbolRange, SymbolValue, SymbolMaxBits)` state evolution over
+  256 symbol decodes of a single AV1 bitstream (numeric values +
+  spec-field names only, per the doc's own attestation). r223
+  consults its "Invariants observed across all 256 rows" section as
+  the cross-implementation oracle for the §8.2.6 post-renormalisation
+  invariants the new runtime checks enforce; no source code, comment,
+  or private identifier from any reference decoder is reproduced
+  there or read by r223.
 
 No external library source — libaom, dav1d, libgav1, rav1e, SVT-AV1,
 FFmpeg AV1 — was consulted. No third-party crate that wraps or

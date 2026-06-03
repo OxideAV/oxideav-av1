@@ -178,12 +178,45 @@ impl SymbolWriter {
             self.low_bits.push(false);
         }
 
+        // §8.2.6 post-renorm invariant — the encoder's `range` is in
+        // exactly the same `[32768, 65535]` window the decoder's
+        // `SymbolRange` lives in after step 2 of the §8.2.6 ordered
+        // renormalisation steps. (`SymbolValue < SymbolRange` is the
+        // decoder-side invariant; the encoder maintains the equivalent
+        // `low < low + range` trivially by construction, since `low` is
+        // grown by `range_pre − prev ≤ range_pre − 1`.) A violation
+        // here would indicate either a caller-supplied CDF that does
+        // not obey the §8.2.6 contract (`cdf[N-1] != 1 << 15`,
+        // out-of-order entries) or an internal precision bug.
+        Self::check_range_invariant(self.range)?;
+
         // §8.3 CDF update — identical to the decoder side. Skipped when
         // the frame header's `disable_cdf_update` was set.
         if !self.disable_cdf_update {
             crate::symbol_decoder::update_cdf_for_encoder(cdf, symbol, n);
         }
 
+        Ok(())
+    }
+
+    /// Verify the §8.2.6 post-renormalisation range invariant
+    /// `32768 ≤ range ≤ 65535`.
+    ///
+    /// Mirrors [`crate::symbol_decoder::SymbolDecoder::check_post_renorm_invariants`]
+    /// on the encoder side. The cross-implementation oracle
+    /// `docs/video/av1/fixtures/issue_796/msac-trace.md` lists this as
+    /// invariant #1 ("`32768 ≤ SymbolRange ≤ 65535`") and observes it
+    /// holding across all 256 recorded rows. A violation indicates a
+    /// caller-supplied CDF that breaks the §8.2.6 contract or an
+    /// internal partition-arithmetic precision bug; we surface it as
+    /// [`Error::SymbolStateInvariantBroken`] rather than leaving the
+    /// encoder in a state the decoder cannot resync from.
+    fn check_range_invariant(range: u32) -> Result<(), Error> {
+        const RANGE_MIN: u32 = 1 << 15; // 32768
+        const RANGE_MAX: u32 = (1 << 16) - 1; // 65535
+        if !(RANGE_MIN..=RANGE_MAX).contains(&range) {
+            return Err(Error::SymbolStateInvariantBroken);
+        }
         Ok(())
     }
 
@@ -717,5 +750,97 @@ mod tests {
         for &(num_syms, k, v) in triples {
             assert_eq!(d.decode_subexp_bool(num_syms, k).unwrap(), v);
         }
+    }
+
+    /// §8.2.6 post-renormalisation `32768 ≤ range ≤ 65535` invariant
+    /// holds across a representative mixed bool / multi-symbol encode.
+    /// The encoder's `range` field is private, so we exercise the
+    /// invariant by encoding then immediately decoding and checking
+    /// every post-decode `SymbolRange` lands in the documented window —
+    /// the encoder's `range` and the decoder's `SymbolRange` evolve
+    /// through identical §8.2.6 ordered steps, so a violation on either
+    /// side would show up here.
+    #[test]
+    fn encoder_decoder_state_stays_in_top_half_window() {
+        let mut w = SymbolWriter::new(true);
+        // Mix bools and multi-symbol writes that exercise renormalisation
+        // by different shift amounts.
+        let mut cdf_for_write: [u16; 5] = [8192, 16384, 24576, 32768, 0];
+        for s in 0..5u32 {
+            w.write_symbol(s % 4, &mut cdf_for_write).unwrap();
+        }
+        for b in [0u32, 1, 1, 0, 1, 0].iter() {
+            w.write_bool(*b).unwrap();
+        }
+        let mut cdf_for_write2: [u16; 5] = [4096, 12288, 22000, 32768, 0];
+        for s in [3u32, 0, 2, 1].iter() {
+            w.write_symbol(*s, &mut cdf_for_write2).unwrap();
+        }
+        let bytes = w.finish();
+
+        let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        let mut cdf_for_read: [u16; 5] = [8192, 16384, 24576, 32768, 0];
+        for _ in 0..5 {
+            d.read_symbol(&mut cdf_for_read).unwrap();
+            let r = d.symbol_range();
+            let v = d.symbol_value();
+            assert!(
+                (1u32 << 15..=u32::from(u16::MAX)).contains(&r),
+                "invariant #1: SymbolRange = {r}"
+            );
+            assert!(v < r, "invariant #2: SymbolValue={v} SymbolRange={r}");
+        }
+        for _ in 0..6 {
+            d.read_bool().unwrap();
+            let r = d.symbol_range();
+            let v = d.symbol_value();
+            assert!(
+                (1u32 << 15..=u32::from(u16::MAX)).contains(&r),
+                "invariant #1: SymbolRange = {r}"
+            );
+            assert!(v < r, "invariant #2: SymbolValue={v} SymbolRange={r}");
+        }
+        let mut cdf_for_read2: [u16; 5] = [4096, 12288, 22000, 32768, 0];
+        for _ in 0..4 {
+            d.read_symbol(&mut cdf_for_read2).unwrap();
+            let r = d.symbol_range();
+            let v = d.symbol_value();
+            assert!(
+                (1u32 << 15..=u32::from(u16::MAX)).contains(&r),
+                "invariant #1: SymbolRange = {r}"
+            );
+            assert!(v < r, "invariant #2: SymbolValue={v} SymbolRange={r}");
+        }
+    }
+
+    /// Direct unit test of [`SymbolWriter::check_range_invariant`] on
+    /// the §8.2.6 boundary values and the two out-of-window edges. The
+    /// function is private; we route through `super`.
+    #[test]
+    fn encoder_range_invariant_check_distinguishes_boundaries() {
+        // In-window OK.
+        assert!(SymbolWriter::check_range_invariant(1 << 15).is_ok());
+        assert!(SymbolWriter::check_range_invariant((1 << 16) - 1).is_ok());
+        assert!(SymbolWriter::check_range_invariant(40000).is_ok());
+
+        // Below the §8.2.6 lower edge.
+        assert_eq!(
+            SymbolWriter::check_range_invariant((1 << 15) - 1).unwrap_err(),
+            Error::SymbolStateInvariantBroken
+        );
+        assert_eq!(
+            SymbolWriter::check_range_invariant(0).unwrap_err(),
+            Error::SymbolStateInvariantBroken
+        );
+
+        // Above the §8.2.6 upper edge.
+        assert_eq!(
+            SymbolWriter::check_range_invariant(1 << 16).unwrap_err(),
+            Error::SymbolStateInvariantBroken
+        );
+        assert_eq!(
+            SymbolWriter::check_range_invariant(u32::MAX).unwrap_err(),
+            Error::SymbolStateInvariantBroken
+        );
     }
 }

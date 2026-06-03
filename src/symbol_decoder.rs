@@ -205,6 +205,12 @@ impl<'a> SymbolDecoder<'a> {
     /// reading the new bits from the bitstream (or §8.2.2 padding zeros
     /// once `SymbolMaxBits` is exhausted). The seven ordered steps of
     /// §8.2.6.
+    ///
+    /// On exit the §8.2.6 invariants checked by
+    /// [`Self::check_post_renorm_invariants`] hold; a CDF / partition-
+    /// arithmetic bug that drives the state out of range surfaces as
+    /// [`Error::SymbolStateInvariantBroken`] instead of leaving the
+    /// decoder in an undefined state.
     fn renormalize(&mut self) -> Result<(), Error> {
         // 1. bits = 15 - FloorLog2(SymbolRange)
         let bits = 15 - floor_log2(self.range);
@@ -221,6 +227,40 @@ impl<'a> SymbolDecoder<'a> {
         self.value = padded_data ^ (((self.value + 1) << bits) - 1);
         // 7. SymbolMaxBits = SymbolMaxBits - bits
         self.max_bits -= i64::from(bits);
+
+        self.check_post_renorm_invariants()
+    }
+
+    /// Verify the two §8.2.6 post-renormalisation invariants.
+    ///
+    /// 1. `32768 ≤ SymbolRange ≤ 65535` — the §8.2.6 ordered steps 1
+    ///    (`bits = 15 − FloorLog2(SymbolRange)`) and 2
+    ///    (`SymbolRange <<= bits`) restore the range to the top half
+    ///    of the 16-bit window.
+    /// 2. `SymbolValue < SymbolRange` — the §8.2.6 symbol-search loop
+    ///    terminates when the accumulator first lands inside the
+    ///    selected sub-interval; the subsequent `SymbolValue -= cur` /
+    ///    `SymbolRange = prev − cur` rewrite plus the renormalisation
+    ///    shift preserve this ordering.
+    ///
+    /// Both invariants are stated in §8.2.6 of the AV1 Bitstream &
+    /// Decoding Process Specification and verified row-for-row across
+    /// the 256-symbol cross-implementation oracle in
+    /// `docs/video/av1/fixtures/issue_796/msac-trace.md`. A violation
+    /// indicates either a malformed bitstream or an internal bug
+    /// (CDF misordering, renormalisation off-by-one, partition-
+    /// arithmetic precision error, etc.); we surface it as
+    /// [`Error::SymbolStateInvariantBroken`] rather than allowing the
+    /// decoder to continue from an undefined state.
+    fn check_post_renorm_invariants(&self) -> Result<(), Error> {
+        const SYMBOL_RANGE_MIN: u32 = 1 << 15; // 32768
+        const SYMBOL_RANGE_MAX: u32 = (1 << 16) - 1; // 65535
+        if self.range < SYMBOL_RANGE_MIN || self.range > SYMBOL_RANGE_MAX {
+            return Err(Error::SymbolStateInvariantBroken);
+        }
+        if self.value >= self.range {
+            return Err(Error::SymbolStateInvariantBroken);
+        }
         Ok(())
     }
 
@@ -691,6 +731,131 @@ mod tests {
             let mut cdf: [u16; 3] = [1 << 14, 1 << 15, 0];
             let r = d.read_symbol(&mut cdf);
             assert!(r.is_ok());
+        }
+    }
+
+    /// §8.2.6 post-renormalisation invariant #1: `32768 ≤ SymbolRange ≤
+    /// 65535`. We sweep a few different starting byte windows + a
+    /// boolean-CDF mix and confirm the range stays in the top half of
+    /// the 16-bit window after every decode.
+    #[test]
+    fn post_renorm_range_in_top_half_across_decodes() {
+        let starts: [[u8; 4]; 4] = [
+            [0x00, 0x00, 0x00, 0x00],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x80, 0x01, 0x42, 0x37],
+            [0x55, 0xAA, 0x33, 0xCC],
+        ];
+        for bytes in &starts {
+            let mut d = SymbolDecoder::init_symbol(bytes, bytes.len(), true).unwrap();
+            for _ in 0..16 {
+                let mut cdf: [u16; 3] = [1 << 14, 1 << 15, 0];
+                d.read_symbol(&mut cdf).unwrap();
+                let r = d.symbol_range();
+                assert!(
+                    (1u32 << 15..=u32::from(u16::MAX)).contains(&r),
+                    "§8.2.6 invariant #1 broken: SymbolRange = {r}"
+                );
+            }
+        }
+    }
+
+    /// §8.2.6 post-renormalisation invariant #2: `SymbolValue <
+    /// SymbolRange`. Same sweep as above, asserting the ordering on
+    /// every step.
+    #[test]
+    fn post_renorm_value_below_range_across_decodes() {
+        let starts: [[u8; 4]; 4] = [
+            [0x00, 0x00, 0x00, 0x00],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x80, 0x01, 0x42, 0x37],
+            [0x55, 0xAA, 0x33, 0xCC],
+        ];
+        for bytes in &starts {
+            let mut d = SymbolDecoder::init_symbol(bytes, bytes.len(), true).unwrap();
+            for _ in 0..16 {
+                let mut cdf: [u16; 3] = [1 << 14, 1 << 15, 0];
+                d.read_symbol(&mut cdf).unwrap();
+                assert!(
+                    d.symbol_value() < d.symbol_range(),
+                    "§8.2.6 invariant #2 broken: SymbolValue={}, SymbolRange={}",
+                    d.symbol_value(),
+                    d.symbol_range()
+                );
+            }
+        }
+    }
+
+    /// Direct unit test of [`SymbolDecoder::check_post_renorm_invariants`]
+    /// on a hand-constructed in-range state and on each of the three
+    /// out-of-range edges (`range < 32768`, `range > 65535`,
+    /// `value >= range`).
+    #[test]
+    fn invariant_check_returns_error_on_each_violation() {
+        // In-range: 32768 <= range, value < range.
+        let bytes = [0x00u8, 0x00u8];
+        let mut d = SymbolDecoder::init_symbol(&bytes, 2, true).unwrap();
+        d.value = 1;
+        d.range = 1 << 15;
+        assert!(d.check_post_renorm_invariants().is_ok());
+
+        // Boundary OK: range = 65535, value = 65534.
+        d.value = 65534;
+        d.range = 65535;
+        assert!(d.check_post_renorm_invariants().is_ok());
+
+        // range below 32768.
+        d.value = 0;
+        d.range = (1 << 15) - 1;
+        assert_eq!(
+            d.check_post_renorm_invariants().unwrap_err(),
+            Error::SymbolStateInvariantBroken
+        );
+
+        // range above 65535.
+        d.value = 0;
+        d.range = (1 << 16) + 1;
+        assert_eq!(
+            d.check_post_renorm_invariants().unwrap_err(),
+            Error::SymbolStateInvariantBroken
+        );
+
+        // value >= range.
+        d.value = 1 << 15;
+        d.range = 1 << 15;
+        assert_eq!(
+            d.check_post_renorm_invariants().unwrap_err(),
+            Error::SymbolStateInvariantBroken
+        );
+    }
+
+    /// The §8.2.6 invariants must hold across the *full* sequence of a
+    /// non-boolean adaptive CDF decode (4-symbol CDF with §8.3 update
+    /// enabled). This is the closest reproducible analogue of the
+    /// `docs/video/av1/fixtures/issue_796/msac-trace.md` "Invariants
+    /// observed across all 256 rows" assertion that we can run in-tree
+    /// (without the issue_796 bitstream).
+    #[test]
+    fn invariants_hold_across_adaptive_multisymbol_run() {
+        let bytes: [u8; 16] = [
+            0x9F, 0x12, 0x37, 0xAB, 0x4C, 0xDE, 0x5F, 0x68, 0x71, 0x82, 0x93, 0xA4, 0xB5, 0xC6,
+            0xD7, 0xE8,
+        ];
+        let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        // 4-symbol CDF (N = 4); cdf[3] = 1 << 15 per §8.2.6 contract.
+        let mut cdf: [u16; 5] = [8192, 16384, 24576, 32768, 0];
+        for _ in 0..40 {
+            d.read_symbol(&mut cdf).unwrap();
+            let r = d.symbol_range();
+            let v = d.symbol_value();
+            assert!(
+                (1u32 << 15..=u32::from(u16::MAX)).contains(&r),
+                "invariant #1 broken: SymbolRange = {r}"
+            );
+            assert!(
+                v < r,
+                "invariant #2 broken: SymbolValue={v} SymbolRange={r}"
+            );
         }
     }
 }

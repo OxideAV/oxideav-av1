@@ -4,6 +4,50 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder/encoder r223 (2026-06-03): §8.2.6 post-renormalisation
+  invariant probes wired into `SymbolDecoder::renormalize` and
+  `SymbolWriter::write_symbol`. Both surfaces now check the two §8.2.6
+  invariants after every renormalisation step rather than trusting the
+  partition arithmetic blindly:
+    1. `32768 ≤ SymbolRange ≤ 65535` (the §8.2.6 ordered steps 1 + 2
+       restore the range to the top half of the 16-bit window after
+       every symbol decode / encode).
+    2. `SymbolValue < SymbolRange` (the §8.2.6 symbol-search loop
+       terminates the moment `SymbolValue >= cur` lands inside the
+       selected symbol's interval; the subsequent `SymbolValue -= cur`
+       / `SymbolRange = prev − cur` rewrite plus renormalisation
+       preserve this ordering).
+  A violation surfaces as a new `Error::SymbolStateInvariantBroken`
+  variant rather than panicking on `debug_assert!`; this lets bitstream
+  conformance failures and internal CDF / partition-arithmetic bugs be
+  reported through the normal error path instead of leaving the codec
+  in an undefined state. The two invariants are re-stated as
+  cross-implementation oracles in the freshly-staged trace doc
+  `docs/video/av1/fixtures/issue_796/msac-trace.md` ("Invariants
+  observed across all 256 rows" section, both holding row-for-row
+  across the §8.2 256-symbol capture).
+
+  Six new unit tests pin the new surface: two §8.2.6 invariant sweeps
+  on the decoder side over four different starting byte windows
+  (`post_renorm_range_in_top_half_across_decodes`,
+  `post_renorm_value_below_range_across_decodes`), a direct boundary
+  test of `check_post_renorm_invariants`
+  (`invariant_check_returns_error_on_each_violation` — in-range +
+  boundary OK + each of the three out-of-range edges), an adaptive
+  4-symbol CDF run with §8.3 updates that mirrors the trace doc's
+  "all 256 rows" assertion as closely as a synthetic in-tree input
+  allows (`invariants_hold_across_adaptive_multisymbol_run`), a mixed
+  bool / multi-symbol encode→decode pair that exercises both writer
+  and reader simultaneously
+  (`encoder_decoder_state_stays_in_top_half_window`), and a direct
+  boundary test of the encoder's `check_range_invariant`
+  (`encoder_range_invariant_check_distinguishes_boundaries`).
+
+  Total: 1537 → 1543 lib tests. No public API change beyond the new
+  `Error::SymbolStateInvariantBroken` variant; existing happy-path
+  tests continue to pass byte-exact, confirming the runtime checks are
+  no-ops on every conformant decode produced so far.
+
 - encoder/decoder r214: multi-super-block tiling on the 4:2:0 YUV dyn
   driver — extends the single-SB YUV path's ceiling from `MAX_DIM = 64`
   to a new `MAX_DIM_YUV_MULTI_SB = 128` by walking the §5.11.1 SB grid
