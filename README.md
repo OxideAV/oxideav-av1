@@ -2,6 +2,117 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-03 (round 214)
+
+Round 214 lifts the **multi-super-block** ceiling on the 4:2:0 YUV
+dynamic-extent driver, completing the round-207 work for the chroma-
+bearing arc. Where the single-SB YUV path
+(`encode_intra_frame_yuv_dyn{,_with_q}`) capped extents at `MAX_DIM =
+64`, r214 adds a parallel
+`encode_intra_frame_yuv_dyn_multi_sb_with_q` /
+`encode_intra_frame_yuv_dyn_multi_sb` entry pair that accepts the new
+`Yuv420FrameMultiSb { width, height, y, u, v }` input at any extent
+`(w, h) ∈ {8..=128} × {8..=128}` aligned to 8 (the new
+`MAX_DIM_YUV_MULTI_SB = 128` ceiling). The encoder walks the §5.11.1
+SB grid literally, identically to the r207 mono path:
+
+```text
+for r += sbSize4 (=16):
+    for c += sbSize4:
+        decode_partition(r, c, BLOCK_64X64)
+```
+
+The §5.11.5 HasChroma predicate (`(mi_r & 1) != 0 && (mi_c & 1) != 0`
+at 4:2:0 BLOCK_4X4) composes across SBs by construction: both `mi_r`
+and `mi_c` are frame-global mi coords, so every in-frame chroma cell
+fires exactly once over the SB-grid traversal regardless of which SB
+holds the leaf. The chroma cell index `((mi_r-1)/2, (mi_c-1)/2)` is
+likewise frame-global. The §7.11.5.3 CFL subsampled-luma window
+(`cfl_subsampled_luma_4x4_420_dyn`) already clips at the chroma plane
+edge for any extent — the only new thing it sees on multi-SB is a
+larger luma plane, which is the input it already takes. Per-SB
+`clear_above_context` / `clear_left_context` resets (§5.11.1 /
+§6.10.2) stay vacuous because the dyn driver pins `txb_skip_ctx = 0`
+/ `dc_sign_ctx = 0` at every leaf on every plane.
+
+The decoder side lifts `decode_frame_dyn`'s `MAX_DIM` cap to
+`MAX_DIM_YUV_MULTI_SB` and dispatches to a multi-SB walk loop when
+either `frame_width > MAX_DIM` or `frame_height > MAX_DIM`. Extents
+≤64×64 stay on the legacy single-root code path so existing IVF
+outputs remain byte-for-byte identical. The public `decode_av1` entry
+routes a 4:2:0 SH to `decode_frame_dyn` whenever `(width, height) !=
+(16, 16)`, so the lifted ceiling reaches the standard API
+automatically.
+
+New public surface:
+
+* `Yuv420FrameMultiSb { width, height, y, u, v }` — `validate()`
+  enforces `width ∈ MIN_DIM..=MAX_DIM_YUV_MULTI_SB`, `height ∈
+  MIN_DIM..=MAX_DIM_YUV_MULTI_SB`, both multiples of 8, all three
+  plane Vecs sized correctly.
+* `EncodedFrameDynYuvMultiSb { ivf_bytes, temporal_unit_bytes,
+  reconstructed_{y,u,v}, seq, fh }`.
+* `encode_intra_frame_yuv_dyn_multi_sb_with_q(&Yuv420FrameMultiSb,
+  u8) -> Result<EncodedFrameDynYuvMultiSb, Error>`.
+* `encode_intra_frame_yuv_dyn_multi_sb(&Yuv420FrameMultiSb)` — thin
+  wrapper at `base_q_idx = 0`.
+* `MAX_DIM_YUV_MULTI_SB: u32 = 128`.
+
+Lossless contract: at `base_q_idx = 0` the encoder's running
+`recon_{y,u,v}` equal the input plane-for-plane (forward WHT
+round-trips bit-exactly on all three planes), and
+`decode_av1(encoded.ivf_bytes)` returns a `Frame::Yuv420Dyn` whose
+`{y, u, v}` equal the input.
+
+Lossy contract: at `base_q_idx > 0`, `decode_av1(...)`'s `{y, u, v}`
+equal `encoded.reconstructed_{y,u,v}` byte-for-byte (quantization
+runs identically on both sides; the recovered planes do NOT in
+general equal the input — per-axis rounding bounded by the §7.12.2
+step at the chosen qindex).
+
+Pinned with 14 new tests across the encoder + decoder:
+
+* `Yuv420FrameMultiSb::validate` acceptance over `{8..=128}² ∩ mod
+  8 = 0` (sweep) + oversized + wrong-length rejection on each plane.
+* Flat-grey internal reconstruction equals input on the lossless WHT
+  arm at 96×64 (SH advertises 4:2:0 + `max_frame_*_minus_1` = input
+  extent − 1).
+* Pseudo-random lossless internal reconstruction equals input at
+  128×128 on Y/U/V.
+* `encode_intra_frame_yuv_dyn_multi_sb` at 64×64 produces the
+  **byte-for-byte identical** IVF stream as the legacy
+  `encode_intra_frame_yuv_dyn` (single SB at 64×64 ⇒
+  `root_super_block(16, 16) = BLOCK_64X64` is the same root the
+  multi-SB path uses).
+* `with_q(0)` ↔ `with_q(32)` byte divergence at 96×64.
+* End-to-end encode → `decode_av1` → bit-exact recovery on all three
+  planes at 10 representative extents covering legacy 64×64, both
+  axes growing, `2×1` / `1×2` / `2×2` SB grids, and partial-coverage
+  edge SBs (`64×64`, `72×64`, `96×64`, `64×72`, `64×96`, `104×72`,
+  `128×64`, `64×128`, `96×96`, `128×128`).
+* Lossy q ∈ {1, 32, 200} self-consistency on 96×64 (encoder recon =
+  `decode_av1`'s `{y, u, v}` byte-for-byte on all three planes).
+* IVF v0 dimension-write check over `{96×64, 128×64, 64×128,
+  128×128, 104×72}` confirming the FH `frame_size.{frame_width,
+  frame_height, mi_cols, mi_rows}` carry the rectangular extent
+  verbatim.
+* 5 new integration tests in `encode_decode_pixel_roundtrip` covering
+  96×64 + 128×128 lossless, a 6-extent rectangular-edge sweep
+  (`{72×64, 64×72, 104×72, 128×72, 88×128, 120×120}`), q=32 lossy
+  self-consistency at 96×64, and an IVF v0 dimension-write check.
+
+Total: 1528 → 1537 lib tests, 62 → 67 `encode_decode_pixel_roundtrip`
+integration tests.
+
+Out of scope (next arc): 128×128 super-blocks
+(`use_128x128_superblock = true` — would change `sbSize =
+BLOCK_128X128` and require new partition_subsize transitions),
+rectangular **TX sizes** (`TX_4X8` / `TX_8X4` / `TX_8X16` /
+`TX_16X8` — TX_4X4 leaves remain throughout the YUV multi-SB path
+too), 10-bit, 4:2:2 / 4:4:4 chroma, §5.11.18 inter mode_info,
+per-segment / per-block delta_q, full bit-cost-aware RD on the dyn
+picker.
+
 ## Status — 2026-06-02 (round 207)
 
 Round 207 lifts the **multi-super-block** ceiling on the monochrome

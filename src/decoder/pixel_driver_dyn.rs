@@ -48,7 +48,7 @@ use crate::cdf::{
 use crate::decoder::pixel_driver::Frame;
 use crate::encoder::pixel_driver::NUM_INTRA_MODES_Y;
 use crate::encoder::pixel_driver_dyn::{
-    root_super_block, sb_grid_origins, MAX_DIM, MAX_DIM_Y_MULTI_SB, MIN_DIM,
+    root_super_block, sb_grid_origins, MAX_DIM, MAX_DIM_YUV_MULTI_SB, MAX_DIM_Y_MULTI_SB, MIN_DIM,
 };
 use crate::encoder::tile_group_obu::parse_tile_group_obu_body;
 use crate::frame_header::FrameHeader;
@@ -75,10 +75,17 @@ pub(crate) fn decode_frame_dyn(
         .ok_or(Error::PartitionWalkOutOfRange)?;
     let width = fs.frame_width;
     let height = fs.frame_height;
+    // r214: ceiling lifted from `MAX_DIM` (64) to
+    // `MAX_DIM_YUV_MULTI_SB` (128) on the 4:2:0 YUV dyn path. Extents
+    // in `(MAX_DIM, MAX_DIM_YUV_MULTI_SB]` (i.e. > 64×64) dispatch to
+    // the §5.11.1-conformant SB-grid walk via the per-SB
+    // `decode_partition_node(... BLOCK_64X64)` loop below; extents
+    // ≤ 64×64 keep the single-root behaviour from prior arcs for IVF
+    // byte-for-byte parity with prior outputs.
     if width < MIN_DIM
         || height < MIN_DIM
-        || width > MAX_DIM
-        || height > MAX_DIM
+        || width > MAX_DIM_YUV_MULTI_SB
+        || height > MAX_DIM_YUV_MULTI_SB
         || width % MIN_DIM != 0
         || height % MIN_DIM != 0
     {
@@ -139,25 +146,51 @@ pub(crate) fn decode_frame_dyn(
     let mut recon_v = vec![0u8; chroma_width * chroma_height];
     let scan: Vec<u16> = get_default_scan(TX_4X4).to_vec();
 
-    let root_b = root_super_block(mi_cols, mi_rows);
-    decode_partition_node(
-        &mut decoder,
-        &mut cdfs,
-        &mut state,
-        &mut coeff_walker,
-        0,
-        0,
-        root_b,
-        width as usize,
-        height as usize,
-        chroma_width,
-        chroma_height,
-        &scan,
-        &q_params,
-        &mut recon_y,
-        &mut recon_u,
-        &mut recon_v,
-    )?;
+    // r214 dispatch — extents > MAX_DIM (64) take the §5.11.1
+    // multi-SB row-major walk; extents ≤ MAX_DIM keep the single-
+    // root behaviour from prior arcs for IVF byte-for-byte parity.
+    if width > MAX_DIM || height > MAX_DIM {
+        for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
+            decode_partition_node(
+                &mut decoder,
+                &mut cdfs,
+                &mut state,
+                &mut coeff_walker,
+                sb_r,
+                sb_c,
+                BLOCK_64X64,
+                width as usize,
+                height as usize,
+                chroma_width,
+                chroma_height,
+                &scan,
+                &q_params,
+                &mut recon_y,
+                &mut recon_u,
+                &mut recon_v,
+            )?;
+        }
+    } else {
+        let root_b = root_super_block(mi_cols, mi_rows);
+        decode_partition_node(
+            &mut decoder,
+            &mut cdfs,
+            &mut state,
+            &mut coeff_walker,
+            0,
+            0,
+            root_b,
+            width as usize,
+            height as usize,
+            chroma_width,
+            chroma_height,
+            &scan,
+            &q_params,
+            &mut recon_y,
+            &mut recon_u,
+            &mut recon_v,
+        )?;
+    }
 
     Ok(Frame::Yuv420Dyn {
         width,

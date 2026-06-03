@@ -1685,3 +1685,212 @@ fn mono_y_multi_sb_dyn_encode_writes_correct_dimensions_in_ivf_header() {
         assert_eq!(fs.mi_rows, 2 * ((h + 7) >> 3));
     }
 }
+
+// ----------------------------------------------------------------------
+// r214 — multi-super-block 4:2:0 YUV dyn driver integration tests
+// ----------------------------------------------------------------------
+
+#[test]
+fn yuv_multi_sb_dyn_encode_decode_lossless_roundtrip_96x64() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_multi_sb, Yuv420FrameMultiSb};
+    let mut input = Yuv420FrameMultiSb::filled(96, 64, 0);
+    let mut s: u64 = 0xABCD_DEAD_C0DE_FACE;
+    let mut next = || -> u8 {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = next();
+    }
+    for p in input.u.iter_mut() {
+        *p = next();
+    }
+    for p in input.v.iter_mut() {
+        *p = next();
+    }
+    let enc = encode_intra_frame_yuv_dyn_multi_sb(&input).expect("encode");
+    let dec = decode_av1(&enc.ivf_bytes).expect("decode");
+    match &dec[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 96);
+            assert_eq!(*height, 64);
+            assert_eq!(y, &input.y, "Y bit-exact recovery at 96x64");
+            assert_eq!(u, &input.u, "U bit-exact recovery at 96x64");
+            assert_eq!(v, &input.v, "V bit-exact recovery at 96x64");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn yuv_multi_sb_dyn_encode_decode_lossless_roundtrip_128x128() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_multi_sb, Yuv420FrameMultiSb};
+    let mut input = Yuv420FrameMultiSb::filled(128, 128, 0);
+    let mut s: u64 = 0x4242_BABE_DEAD_F00D;
+    let mut next = || -> u8 {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = next();
+    }
+    for p in input.u.iter_mut() {
+        *p = next();
+    }
+    for p in input.v.iter_mut() {
+        *p = next();
+    }
+    let enc = encode_intra_frame_yuv_dyn_multi_sb(&input).expect("encode");
+    let dec = decode_av1(&enc.ivf_bytes).expect("decode");
+    match &dec[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 128);
+            assert_eq!(*height, 128);
+            assert_eq!(y, &input.y, "Y bit-exact recovery at 128x128");
+            assert_eq!(u, &input.u, "U bit-exact recovery at 128x128");
+            assert_eq!(v, &input.v, "V bit-exact recovery at 128x128");
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn yuv_multi_sb_dyn_encode_decode_lossless_roundtrip_rectangular_edges() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_multi_sb, Yuv420FrameMultiSb};
+    // Six rectangular multi-SB extents that exercise:
+    //   * one extra SB along x with a partial right SB (72x64, 104x72),
+    //   * one extra SB along y with a partial bottom SB (64x72, 88x128),
+    //   * a 2x2 grid with partial cells (120x120),
+    //   * a full 2-SB column (128x72).
+    let extents: &[(u32, u32)] = &[
+        (72, 64),
+        (64, 72),
+        (104, 72),
+        (128, 72),
+        (88, 128),
+        (120, 120),
+    ];
+    let mut s: u64 = 0x1010_F00D_3434_CAFE;
+    let next = |s: &mut u64| -> u8 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*s >> 56) as u8
+    };
+    for &(w, h) in extents {
+        let mut input = Yuv420FrameMultiSb::filled(w, h, 0);
+        for p in input.y.iter_mut() {
+            *p = next(&mut s);
+        }
+        for p in input.u.iter_mut() {
+            *p = next(&mut s);
+        }
+        for p in input.v.iter_mut() {
+            *p = next(&mut s);
+        }
+        let enc = encode_intra_frame_yuv_dyn_multi_sb(&input)
+            .unwrap_or_else(|_| panic!("encode failed at {w}x{h}"));
+        let dec = decode_av1(&enc.ivf_bytes).unwrap_or_else(|_| panic!("decode failed at {w}x{h}"));
+        match &dec[0] {
+            Frame::Yuv420Dyn {
+                width,
+                height,
+                y,
+                u,
+                v,
+            } => {
+                assert_eq!(*width, w, "decoded width at {w}x{h}");
+                assert_eq!(*height, h, "decoded height at {w}x{h}");
+                assert_eq!(y, &input.y, "Y bit-exact recovery at {w}x{h}");
+                assert_eq!(u, &input.u, "U bit-exact recovery at {w}x{h}");
+                assert_eq!(v, &input.v, "V bit-exact recovery at {w}x{h}");
+            }
+            other => panic!("expected Yuv420Dyn at {w}x{h}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn yuv_multi_sb_dyn_encode_decode_lossy_q32_self_consistent_96x64() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_multi_sb_with_q, Yuv420FrameMultiSb};
+    let mut input = Yuv420FrameMultiSb::filled(96, 64, 0);
+    let mut s: u64 = 0x7777_AAAA_3333_FFFF;
+    let next = |s: &mut u64| -> u8 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*s >> 56) as u8
+    };
+    for p in input.y.iter_mut() {
+        *p = next(&mut s);
+    }
+    for p in input.u.iter_mut() {
+        *p = next(&mut s);
+    }
+    for p in input.v.iter_mut() {
+        *p = next(&mut s);
+    }
+    let enc = encode_intra_frame_yuv_dyn_multi_sb_with_q(&input, 32).expect("encode q=32");
+    let dec = decode_av1(&enc.ivf_bytes).expect("decode");
+    match &dec[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, 96);
+            assert_eq!(*height, 64);
+            assert_eq!(
+                y, &enc.reconstructed_y,
+                "Y lossy q=32 decoder out = encoder recon byte-for-byte"
+            );
+            assert_eq!(
+                u, &enc.reconstructed_u,
+                "U lossy q=32 decoder out = encoder recon byte-for-byte"
+            );
+            assert_eq!(
+                v, &enc.reconstructed_v,
+                "V lossy q=32 decoder out = encoder recon byte-for-byte"
+            );
+        }
+        other => panic!("expected Yuv420Dyn, got {other:?}"),
+    }
+}
+
+#[test]
+fn yuv_multi_sb_dyn_encode_writes_correct_dimensions_in_ivf_header() {
+    use oxideav_av1::encoder::{encode_intra_frame_yuv_dyn_multi_sb, Yuv420FrameMultiSb};
+    // Multi-SB YUV extents must surface verbatim in the IVF v0 header.
+    for (w, h) in [(96u32, 64u32), (128, 64), (64, 128), (128, 128), (104, 72)] {
+        let input = Yuv420FrameMultiSb::filled(w, h, 128);
+        let res = encode_intra_frame_yuv_dyn_multi_sb(&input)
+            .unwrap_or_else(|e| panic!("encode {w}x{h} failed: {e:?}"));
+        let ivf_w = u16::from_le_bytes([res.ivf_bytes[12], res.ivf_bytes[13]]) as u32;
+        let ivf_h = u16::from_le_bytes([res.ivf_bytes[14], res.ivf_bytes[15]]) as u32;
+        assert_eq!(ivf_w, w, "IVF v0 width mismatch at {w}x{h}");
+        assert_eq!(ivf_h, h, "IVF v0 height mismatch at {w}x{h}");
+        let fs = res.fh.frame_size.as_ref().expect("intra has frame_size");
+        assert_eq!(fs.frame_width, w);
+        assert_eq!(fs.frame_height, h);
+        assert_eq!(fs.mi_cols, 2 * ((w + 7) >> 3));
+        assert_eq!(fs.mi_rows, 2 * ((h + 7) >> 3));
+    }
+}

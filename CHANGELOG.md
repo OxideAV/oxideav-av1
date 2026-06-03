@@ -4,6 +4,40 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder/decoder r214: multi-super-block tiling on the 4:2:0 YUV dyn
+  driver — extends the single-SB YUV path's ceiling from `MAX_DIM = 64`
+  to a new `MAX_DIM_YUV_MULTI_SB = 128` by walking the §5.11.1 SB grid
+  literally (`for r += sbSize4; for c += sbSize4;
+  decode_partition(r, c, sbSize)` with `sbSize = BLOCK_64X64`,
+  `sbSize4 = 16`), reusing the r207 `sb_grid_origins` /
+  `sb_grid_dispatch_order_leaves` helpers. New encoder entries
+  `encode_intra_frame_yuv_dyn_multi_sb` / `_with_q` accept a
+  `Yuv420FrameMultiSb { width, height, y, u, v }` input at any extent
+  `(w, h) ∈ {8..=128} × {8..=128}` aligned to 8; the decoder mirrors
+  by lifting `decode_frame_dyn`'s cap from `MAX_DIM` to
+  `MAX_DIM_YUV_MULTI_SB` and dispatching to the multi-SB walk when
+  either dimension exceeds `MAX_DIM`. Extents ≤ 64 keep the
+  single-root behaviour (IVF bytes byte-for-byte identical to prior
+  output). §5.11.5 HasChroma composes across SBs by construction
+  (`(mi_r & 1) != 0 && (mi_c & 1) != 0` over frame-global mi coords),
+  §7.11.5.3 CFL subsampled-luma window already clips at the chroma
+  plane edge for any extent, per-SB context resets are vacuous at the
+  driver's hard-coded ctx=0 leaves. +9 lib unit tests
+  (1528 → 1537: validate sweep over `{8..=128}² ∩ mod 8 = 0`,
+  validate rejection on oversized dims + wrong plane lengths,
+  flat-grey 96×64 internal recon equality + SH flag carriage, 128×128
+  pseudo-random lossless bit-exact recon on Y/U/V, 64×64 multi-SB ↔
+  single-SB IVF byte-identity, q-divergence at 96×64, 10-extent
+  encode→decode→bit-exact roundtrip on all three planes, q∈{1,32,200}
+  lossy self-consistency at 96×64, IVF dimension-write check on 5
+  extents). +5 integration tests in `encode_decode_pixel_roundtrip`
+  (62 → 67) covering 96×64 + 128×128 lossless, 6-extent rectangular-
+  edge sweep, q=32 lossy self-consistency, and IVF v0 dimension
+  carriage. Provenance: docs/video/av1/av1-spec.txt §5.11.1 (decode_
+  tile SB-grid walk + sbSize/sbSize4 derivation), §5.11.5 (HasChroma
+  predicate), §7.11.5.3 (CFL subsampled-luma window — already
+  edge-clipping), §5.5.2 (4:2:0 color-config — unchanged), §6.10.2
+  (clear_left/above_context — vacuous at ctx=0).
 - encoder/decoder r207: multi-super-block tiling on the monochrome
   (Y-only) dyn driver — extends the r235 Y-only path's ceiling from
   `MAX_DIM = 64` to a new `MAX_DIM_Y_MULTI_SB = 128` by walking the

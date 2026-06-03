@@ -2095,6 +2095,456 @@ pub fn encode_intra_frame_y_dyn_multi_sb(
     encode_intra_frame_y_dyn_multi_sb_with_q(input, 0)
 }
 
+// ----------------------------------------------------------------------
+// r214 — multi-super-block 4:2:0 YUV dyn driver.
+// ----------------------------------------------------------------------
+//
+// Generalises the single-SB YUV path (`encode_intra_frame_yuv_dyn{,
+// _with_q}` — single `BLOCK_64X64`-root partition tree, `MAX_DIM = 64`
+// cap) to extents up to 128×128 by following the same §5.11.1
+// `decode_tile` SB-grid walk the r207 mono-Y multi-SB path uses (see
+// `sb_grid_origins` for the `for r/c += sbSize4` body), but with the
+// luma + 4:2:0 chroma walks active at every BLOCK_4X4 leaf where
+// §5.11.5 HasChroma fires.
+//
+// HasChroma composition across SBs (4:2:0):
+//   * The 4:2:0 BLOCK_4X4 HasChroma predicate is `(mi_r & 1) != 0 &&
+//     (mi_c & 1) != 0` — see §5.11.5. Both `mi_r` and `mi_c` are
+//     absolute (frame-global), so any in-frame chroma cell is hit
+//     exactly once across the SB-grid walk regardless of which SB
+//     fired the leaf. The chroma cell index `((mi_r-1)/2, (mi_c-1)/2)`
+//     is likewise frame-global.
+//   * The §7.11.5.3 CFL subsampled-luma window (`cfl_subsampled_luma_
+//     4x4_420_dyn`) reads `recon_y` over the corresponding 8×8 luma
+//     footprint — the running `recon_y` buffer already covers the
+//     full frame extent and is updated leaf-by-leaf in the same
+//     dispatch order the decoder reads, so the chroma walk on the
+//     last leaf of an SB still sees correctly-reconstructed luma
+//     stamped by every prior leaf of that SB and every prior SB. The
+//     window correctly clips at the chroma plane edge — already
+//     covered for the single-SB cap.
+//   * Per-SB context resets (`clear_above_context` / `clear_left_
+//     context` per §5.11.1 / §6.10.2) are vacuously satisfied
+//     because the dyn driver hard-codes `txb_skip_ctx = 0` /
+//     `dc_sign_ctx = 0` at every leaf (both luma and chroma planes)
+//     — the encoder + decoder agree on `0` context throughout.
+//
+// This arc lifts the YUV ceiling from `MAX_DIM = 64` to a new
+// `MAX_DIM_YUV_MULTI_SB = 128`. Existing extents ≤ 64 are NOT
+// affected — they still go through the single-SB
+// `encode_intra_frame_yuv_dyn{,_with_q}` entries; the multi-SB
+// entries are a new parallel API. This preserves byte-for-byte IVF
+// output for every existing test + caller.
+//
+// Spec provenance: docs/video/av1/av1-spec.txt §5.11.1 lines 13-25
+// (the explicit `for r/c += sbSize4` loop + `decode_partition(r, c,
+// sbSize)` body), §5.11.5 (`HasChroma` predicate +
+// `NumPlanes > 1` gate), §7.11.5.3 (CFL subsampled-luma window —
+// already verified to clip at the chroma plane edge on the single-SB
+// path), §5.5.2 (4:2:0 color-config — unchanged across SBs),
+// §6.10.2 (`clear_left_context` / `clear_above_context` semantics —
+// vacuous at ctx=0).
+
+/// r214 — multi-super-block YUV ceiling for the §5.11.1 SB-grid walk
+/// on the 4:2:0 YUV dyn driver. Same ceiling as the mono-Y path
+/// ([`MAX_DIM_Y_MULTI_SB`]) — two SBs per axis at
+/// `use_128x128_superblock = false`.
+pub const MAX_DIM_YUV_MULTI_SB: u32 = 128;
+
+/// r214 — dynamic-extent 4:2:0 YUV input the multi-SB dyn driver
+/// consumes. Same shape as [`Yuv420Frame`] but with the extent
+/// ceiling raised to [`MAX_DIM_YUV_MULTI_SB`] (128).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Yuv420FrameMultiSb {
+    /// Luma width in pixels. Multiple of [`MIN_DIM`],
+    /// ≤ [`MAX_DIM_YUV_MULTI_SB`].
+    pub width: u32,
+    /// Luma height in pixels. Same constraints as [`Self::width`].
+    pub height: u32,
+    /// Luma plane (`Y`), row-major, length `width * height`.
+    pub y: Vec<u8>,
+    /// First chroma plane (`U` / `Cb`) at half horizontal + vertical
+    /// resolution; length `(width / 2) * (height / 2)`.
+    pub u: Vec<u8>,
+    /// Second chroma plane (`V` / `Cr`); same shape as `u`.
+    pub v: Vec<u8>,
+}
+
+impl Yuv420FrameMultiSb {
+    /// All-`fill` mid-grey input. Useful for tests + as the default
+    /// constructor; every plane is set to the same value.
+    #[must_use]
+    pub fn filled(width: u32, height: u32, fill: u8) -> Self {
+        let cw = width / 2;
+        let ch = height / 2;
+        Self {
+            width,
+            height,
+            y: vec![fill; (width * height) as usize],
+            u: vec![fill; (cw * ch) as usize],
+            v: vec![fill; (cw * ch) as usize],
+        }
+    }
+
+    /// Chroma plane width — `width / 2` per the 4:2:0 sampling
+    /// pattern.
+    #[must_use]
+    pub fn chroma_width(&self) -> u32 {
+        self.width / 2
+    }
+
+    /// Chroma plane height — `height / 2` per the 4:2:0 sampling
+    /// pattern.
+    #[must_use]
+    pub fn chroma_height(&self) -> u32 {
+        self.height / 2
+    }
+
+    /// Validate the input's dimensions + plane lengths. Returns
+    /// [`Error::PartitionWalkOutOfRange`] on any mismatch.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.width < MIN_DIM
+            || self.height < MIN_DIM
+            || self.width > MAX_DIM_YUV_MULTI_SB
+            || self.height > MAX_DIM_YUV_MULTI_SB
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if self.width % MIN_DIM != 0 || self.height % MIN_DIM != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let expected_y = (self.width * self.height) as usize;
+        let expected_uv = (self.chroma_width() * self.chroma_height()) as usize;
+        if self.y.len() != expected_y || self.u.len() != expected_uv || self.v.len() != expected_uv
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        Ok(())
+    }
+}
+
+/// Result of [`encode_intra_frame_yuv_dyn_multi_sb`]. Same shape as
+/// [`EncodedFrameDyn`].
+#[derive(Debug, Clone)]
+pub struct EncodedFrameDynYuvMultiSb {
+    /// IVF bytes — file header + one IVF frame.
+    pub ivf_bytes: Vec<u8>,
+    /// §7.5 temporal unit bytes (TD + SH + FH + TileGroup OBU).
+    pub temporal_unit_bytes: Vec<u8>,
+    /// Reconstructed Y plane (row-major, length `width * height`).
+    pub reconstructed_y: Vec<u8>,
+    /// Reconstructed U plane (row-major, length
+    /// `(width/2) * (height/2)`).
+    pub reconstructed_u: Vec<u8>,
+    /// Reconstructed V plane.
+    pub reconstructed_v: Vec<u8>,
+    /// SequenceHeader the driver synthesised + emitted (4:2:0).
+    pub seq: SequenceHeader,
+    /// FrameHeader the driver synthesised + emitted.
+    pub fh: FrameHeader,
+}
+
+/// r214 — encode one 4:2:0 YUV intra-only frame at the
+/// caller-supplied `base_q_idx` for any allowed extent ∈
+/// [MIN_DIM, MAX_DIM_YUV_MULTI_SB]². The §5.11.1 SB-grid is walked
+/// row-major; each SB is a single `BLOCK_64X64` root partition tree.
+///
+/// `base_q_idx == 0` selects the §5.9.2 `CodedLossless` arm (forward
+/// WHT on the leaf transform — encoder-internal reconstruction
+/// equals input plane-for-plane on all three planes). `> 0` selects
+/// the §7.13.3 forward DCT_DCT path with §7.12.3 quantize on all
+/// three planes.
+///
+/// Multi-SB contract: at `base_q_idx > 0`,
+/// `decode_av1(encoded.ivf_bytes)` matches
+/// `encoded.reconstructed_{y,u,v}` byte-for-byte for any allowed
+/// extent. At `base_q_idx == 0` the recovered planes additionally
+/// equal the input planes plane-for-plane.
+///
+/// ## Errors
+///
+/// * `input.validate()` fails ⇒ [`Error::PartitionWalkOutOfRange`].
+/// * Any internal partition-tree / coefficient-writer overflow.
+pub fn encode_intra_frame_yuv_dyn_multi_sb_with_q(
+    input: &Yuv420FrameMultiSb,
+    base_q_idx: u8,
+) -> Result<EncodedFrameDynYuvMultiSb, Error> {
+    input.validate()?;
+    let width = input.width as usize;
+    let height = input.height as usize;
+    let chroma_width = input.chroma_width() as usize;
+    let chroma_height = input.chroma_height() as usize;
+    let mi_cols = 2 * (((width + 7) >> 3) as u32);
+    let mi_rows = 2 * (((height + 7) >> 3) as u32);
+
+    let seq = build_intra_only_yuv420_8bit_seq(input.width, input.height);
+    let fh = build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+
+    let lossless = base_q_idx == 0;
+    let qp = QuantizerParams::neutral(base_q_idx, 8);
+    let scan = get_default_scan(TX_4X4).to_vec();
+
+    let mut recon_y = vec![0u8; width * height];
+    let mut recon_u = vec![0u8; chroma_width * chroma_height];
+    let mut recon_v = vec![0u8; chroma_width * chroma_height];
+
+    // Walk every in-frame BLOCK_4X4 leaf in §5.11.1 SB-grid order:
+    // outer SB-row-major over `sb_grid_origins`, inner per-SB
+    // §5.11.4 NW/NE/SW/SE recursion. The chroma cells at any
+    // (mi_r, mi_c) where both indices are odd fire HasChroma per
+    // §5.11.5.
+    let leaves_order = sb_grid_dispatch_order_leaves(mi_rows, mi_cols);
+    debug_assert_eq!(
+        leaves_order.len(),
+        (width / 4) * (height / 4),
+        "every in-frame BLOCK_4X4 cell must be visited exactly once"
+    );
+
+    let mut leaf_table: std::collections::HashMap<(u32, u32), LeafEnc> =
+        std::collections::HashMap::with_capacity(leaves_order.len());
+
+    for &(mi_r, mi_c) in &leaves_order {
+        let row0 = (mi_r as usize) * 4;
+        let col0 = (mi_c as usize) * 4;
+        // --- Luma walk ---
+        let (y_mode, pred_y) =
+            pick_best_intra_mode_4x4(&recon_y, &input.y, width, height, row0, col0);
+        let mut residual_y = [0i64; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = input.y[(row0 + i) * width + (col0 + j)] as i64;
+                let q = pred_y[i * 4 + j] as i64;
+                residual_y[i * 4 + j] = p - q;
+            }
+        }
+        let coeffs_y = if lossless {
+            forward_wht_4x4(&residual_y).to_vec()
+        } else {
+            forward_transform_2d(&residual_y, TX_4X4, DCT_DCT, false)
+        };
+        let quant_y = forward_quantize(&coeffs_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
+
+        let dequant_y = dequantize_step1(&quant_y, TX_4X4, 0, 0, DCT_DCT, 15, &qp);
+        let resid_back_y = inverse_transform_2d(&dequant_y, TX_4X4, DCT_DCT, 8, lossless);
+        for i in 0..4 {
+            for j in 0..4 {
+                let p = pred_y[i * 4 + j] as i64 + resid_back_y[i * 4 + j];
+                recon_y[(row0 + i) * width + (col0 + j)] = p.clamp(0, 255) as u8;
+            }
+        }
+
+        let mut coefficients: Vec<PlaneCoefficients> = Vec::with_capacity(3);
+        coefficients.push(PlaneCoefficients {
+            plane: 0,
+            is_inter: 0,
+            tx_size: TX_4X4,
+            tx_class: TX_CLASS_2D,
+            txb_skip_ctx: 0,
+            dc_sign_ctx: 0,
+            scan: scan.clone(),
+            quant: quant_y,
+        });
+
+        // --- §5.11.5 HasChroma at 4:2:0 BLOCK_4X4: both mi coords
+        // odd. The chroma cell index `((mi_r-1)/2, (mi_c-1)/2)` is
+        // frame-global, so no per-SB rewrite is needed.
+        let has_chroma = (mi_r & 1) != 0 && (mi_c & 1) != 0;
+        let mut cfl_alpha_u: Option<i8> = None;
+        let mut cfl_alpha_v: Option<i8> = None;
+        let uv_mode_picked = if has_chroma {
+            let cr = ((mi_r as usize) - 1) / 2;
+            let cc = ((mi_c as usize) - 1) / 2;
+            let crow0 = cr * 4;
+            let ccol0 = cc * 4;
+            let (uv_pick, pred_u, pred_v, alpha_uv) = pick_best_intra_mode_4x4_chroma_joint(
+                &recon_y,
+                &recon_u,
+                &recon_v,
+                &input.u,
+                &input.v,
+                width,
+                height,
+                chroma_width,
+                chroma_height,
+                crow0,
+                ccol0,
+            );
+            if let Some((au, av)) = alpha_uv {
+                cfl_alpha_u = Some(au);
+                cfl_alpha_v = Some(av);
+            }
+            for (plane, recon_chroma, input_chroma, pred_c) in [
+                (1u8, &mut recon_u, &input.u, &pred_u),
+                (2u8, &mut recon_v, &input.v, &pred_v),
+            ] {
+                let mut residual_c = [0i64; 16];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        let p = input_chroma[(crow0 + i) * chroma_width + (ccol0 + j)] as i64;
+                        let q = pred_c[i * 4 + j] as i64;
+                        residual_c[i * 4 + j] = p - q;
+                    }
+                }
+                let coeffs_c = if lossless {
+                    forward_wht_4x4(&residual_c).to_vec()
+                } else {
+                    forward_transform_2d(&residual_c, TX_4X4, DCT_DCT, false)
+                };
+                let quant_c = forward_quantize(&coeffs_c, TX_4X4, plane, 0, DCT_DCT, 15, &qp);
+
+                let dequant_c = dequantize_step1(&quant_c, TX_4X4, plane, 0, DCT_DCT, 15, &qp);
+                let resid_back_c = inverse_transform_2d(&dequant_c, TX_4X4, DCT_DCT, 8, lossless);
+                for i in 0..4 {
+                    for j in 0..4 {
+                        let p = pred_c[i * 4 + j] as i64 + resid_back_c[i * 4 + j];
+                        recon_chroma[(crow0 + i) * chroma_width + (ccol0 + j)] =
+                            p.clamp(0, 255) as u8;
+                    }
+                }
+                coefficients.push(PlaneCoefficients {
+                    plane,
+                    is_inter: 0,
+                    tx_size: TX_4X4,
+                    tx_class: TX_CLASS_2D,
+                    txb_skip_ctx: 0,
+                    dc_sign_ctx: 0,
+                    scan: scan.clone(),
+                    quant: quant_c,
+                });
+            }
+            Some(uv_pick)
+        } else {
+            None
+        };
+
+        leaf_table.insert(
+            (mi_r, mi_c),
+            LeafEnc {
+                y_mode,
+                uv_mode: uv_mode_picked,
+                cfl_alpha_u,
+                cfl_alpha_v,
+                coefficients,
+            },
+        );
+    }
+
+    // §5.11 entropy-coder run for the single tile, multi-SB version.
+    let mut writer = SymbolWriter::new(false);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let mut state = PartitionTreeWriter::new(
+        mi_rows,
+        mi_cols,
+        TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        },
+        /* segmentation_enabled = */ false,
+        /* last_active_seg_id = */ 0,
+        /* lossless = */ false,
+        /* subsampling_x = */ true,
+        /* subsampling_y = */ true,
+    )
+    .ok_or(Error::PartitionWalkOutOfRange)?;
+
+    // For each SB in §5.11.1 row-major order: build a
+    // BLOCK_64X64-rooted EncodeNode tree using the captured leaves,
+    // then write_partition_tree starting at that SB origin.
+    for (sb_r, sb_c) in sb_grid_origins(mi_rows, mi_cols) {
+        let sb_root =
+            build_partition_tree(BLOCK_64X64, sb_r, sb_c, mi_rows, mi_cols, &mut |r, c| {
+                let leaf = leaf_table
+                    .remove(&(r, c))
+                    .expect("dispatch-order leaf must have been populated");
+                EncodeBlock {
+                    skip: 0,
+                    segment_id: 0,
+                    segment_pred: 0,
+                    y_mode: leaf.y_mode,
+                    uv_mode: leaf.uv_mode,
+                    cfl_alpha_u: leaf.cfl_alpha_u,
+                    cfl_alpha_v: leaf.cfl_alpha_v,
+                    coefficients: leaf.coefficients,
+                }
+            });
+        write_partition_tree(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &sb_root,
+            sb_r,
+            sb_c,
+            BLOCK_64X64,
+        )?;
+    }
+    let tile_bytes = writer.finish();
+
+    let tile_group = TileGroupObu {
+        num_tiles: 1,
+        tile_cols_log2: 0,
+        tile_rows_log2: 0,
+        tile_size_bytes: 1,
+        tg_start: 0,
+        tg_end: 0,
+        start_and_end_present: false,
+        tiles: vec![TilePayload::new(tile_bytes)],
+    };
+    let tile_group_body = write_tile_group_obu(&tile_group)?;
+
+    let fh_body = crate::encoder::frame_obu::write_frame_header_obu(&fh, &seq);
+    let frame_obus: Vec<ObuFrame> = vec![
+        ObuFrame::new(ObuType::FrameHeader, fh_body),
+        ObuFrame::new(ObuType::TileGroup, tile_group_body),
+    ];
+
+    let temporal_unit_bytes = {
+        use crate::encoder::obu::build_temporal_unit;
+        use crate::encoder::sequence_obu::write_sequence_header_obu;
+        let sh_body = write_sequence_header_obu(&seq);
+        build_temporal_unit(Some(&sh_body), &frame_obus)
+    };
+
+    let mut ivf_bytes: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut ivf_bytes);
+        let mut iw = IvfWriter::new(
+            cursor,
+            FOURCC_AV01,
+            input.width as u16,
+            input.height as u16,
+            25,
+            1,
+        )
+        .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        iw.write_frame(&temporal_unit_bytes, 0)
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+        iw.patch_frame_count()
+            .map_err(|_| Error::PartitionWalkOutOfRange)?;
+    }
+
+    Ok(EncodedFrameDynYuvMultiSb {
+        ivf_bytes,
+        temporal_unit_bytes,
+        reconstructed_y: recon_y,
+        reconstructed_u: recon_u,
+        reconstructed_v: recon_v,
+        seq,
+        fh,
+    })
+}
+
+/// r214 — encode one 4:2:0 YUV intra-only frame at `base_q_idx = 0`
+/// (lossless WHT arm) for any allowed extent up to
+/// [`MAX_DIM_YUV_MULTI_SB`]. Thin wrapper over
+/// [`encode_intra_frame_yuv_dyn_multi_sb_with_q`].
+pub fn encode_intra_frame_yuv_dyn_multi_sb(
+    input: &Yuv420FrameMultiSb,
+) -> Result<EncodedFrameDynYuvMultiSb, Error> {
+    encode_intra_frame_yuv_dyn_multi_sb_with_q(input, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2968,6 +3418,309 @@ mod tests {
                 }
                 other => panic!("expected YDyn, got {other:?}"),
             }
+        }
+    }
+
+    // ---- r214 — multi-SB 4:2:0 YUV dyn driver lib tests ----
+
+    #[test]
+    fn yuv_multi_sb_validate_accepts_extents_up_to_128() {
+        // Every (w, h) ∈ {8..=128} aligned to 8 validates.
+        for w in (MIN_DIM..=MAX_DIM_YUV_MULTI_SB).step_by(MIN_DIM as usize) {
+            for h in (MIN_DIM..=MAX_DIM_YUV_MULTI_SB).step_by(MIN_DIM as usize) {
+                let f = Yuv420FrameMultiSb::filled(w, h, 128);
+                assert!(f.validate().is_ok(), "{w}x{h} should validate");
+            }
+        }
+    }
+
+    #[test]
+    fn yuv_multi_sb_validate_rejects_oversized_dims() {
+        // 136 > 128 ⇒ reject.
+        let bad = Yuv420FrameMultiSb {
+            width: 136,
+            height: 64,
+            y: vec![0u8; 136 * 64],
+            u: vec![0u8; (136 / 2) * (64 / 2)],
+            v: vec![0u8; (136 / 2) * (64 / 2)],
+        };
+        assert!(bad.validate().is_err());
+        // Wrong y length.
+        let bad = Yuv420FrameMultiSb {
+            width: 96,
+            height: 64,
+            y: vec![0u8; 100],
+            u: vec![0u8; 48 * 32],
+            v: vec![0u8; 48 * 32],
+        };
+        assert!(bad.validate().is_err());
+        // Wrong U length.
+        let bad = Yuv420FrameMultiSb {
+            width: 96,
+            height: 64,
+            y: vec![0u8; 96 * 64],
+            u: vec![0u8; 8],
+            v: vec![0u8; 48 * 32],
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn yuv_multi_sb_encode_96x64_flat_grey_internal_recon_matches_input() {
+        let input = Yuv420FrameMultiSb::filled(96, 64, 128);
+        let res = encode_intra_frame_yuv_dyn_multi_sb(&input).expect("encode ok");
+        assert_eq!(res.reconstructed_y, input.y);
+        assert_eq!(res.reconstructed_u, input.u);
+        assert_eq!(res.reconstructed_v, input.v);
+        // SH advertises 4:2:0 layout (not mono).
+        assert!(!res.seq.color_config.mono_chrome);
+        assert_eq!(res.seq.color_config.num_planes, 3);
+        assert_eq!(res.seq.max_frame_width_minus_1, 95);
+        assert_eq!(res.seq.max_frame_height_minus_1, 63);
+    }
+
+    #[test]
+    fn yuv_multi_sb_encode_128x128_pseudorandom_lossless_recon_bit_exact() {
+        let mut input = Yuv420FrameMultiSb::filled(128, 128, 0);
+        let mut s: u64 = 0x5A5A_A5A5_5A5A_A5A5;
+        let mut next = || -> u8 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        for p in input.y.iter_mut() {
+            *p = next();
+        }
+        for p in input.u.iter_mut() {
+            *p = next();
+        }
+        for p in input.v.iter_mut() {
+            *p = next();
+        }
+        let res = encode_intra_frame_yuv_dyn_multi_sb(&input).expect("encode ok");
+        assert_eq!(
+            res.reconstructed_y, input.y,
+            "128×128 Y lossless WHT mismatch"
+        );
+        assert_eq!(
+            res.reconstructed_u, input.u,
+            "128×128 U lossless WHT mismatch"
+        );
+        assert_eq!(
+            res.reconstructed_v, input.v,
+            "128×128 V lossless WHT mismatch"
+        );
+    }
+
+    #[test]
+    fn yuv_multi_sb_encode_with_q_zero_matches_legacy_byte_for_byte_at_64x64() {
+        // At extent ≤ 64×64 the multi-SB path walks a single SB rooted
+        // at BLOCK_64X64, which is exactly what `root_super_block(16,
+        // 16)` returns for the single-SB path. The IVF bytes must
+        // therefore coincide.
+        let mut s: u64 = 0x1357_9BDF_2468_ACE0;
+        let mut next = || -> u8 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 56) as u8
+        };
+        let mut yv = vec![0u8; 64 * 64];
+        for p in yv.iter_mut() {
+            *p = next();
+        }
+        let mut uv = vec![0u8; 32 * 32];
+        for p in uv.iter_mut() {
+            *p = next();
+        }
+        let mut vv = vec![0u8; 32 * 32];
+        for p in vv.iter_mut() {
+            *p = next();
+        }
+        let legacy_input = Yuv420Frame {
+            width: 64,
+            height: 64,
+            y: yv.clone(),
+            u: uv.clone(),
+            v: vv.clone(),
+        };
+        let multi_input = Yuv420FrameMultiSb {
+            width: 64,
+            height: 64,
+            y: yv,
+            u: uv,
+            v: vv,
+        };
+        let legacy = encode_intra_frame_yuv_dyn(&legacy_input).expect("legacy ok");
+        let multi = encode_intra_frame_yuv_dyn_multi_sb(&multi_input).expect("multi ok");
+        assert_eq!(
+            legacy.ivf_bytes, multi.ivf_bytes,
+            "at 64×64 the multi-SB and single-SB YUV paths must produce identical IVF bytes"
+        );
+        assert_eq!(legacy.reconstructed_y, multi.reconstructed_y);
+        assert_eq!(legacy.reconstructed_u, multi.reconstructed_u);
+        assert_eq!(legacy.reconstructed_v, multi.reconstructed_v);
+    }
+
+    #[test]
+    fn yuv_multi_sb_encode_q_diverges_from_lossless() {
+        let input = Yuv420FrameMultiSb::filled(96, 64, 64);
+        let q0 = encode_intra_frame_yuv_dyn_multi_sb_with_q(&input, 0).expect("q=0");
+        let q32 = encode_intra_frame_yuv_dyn_multi_sb_with_q(&input, 32).expect("q=32");
+        assert_ne!(q0.ivf_bytes, q32.ivf_bytes);
+        assert_eq!(q0.fh.quantization_params.as_ref().unwrap().base_q_idx, 0);
+        assert_eq!(q32.fh.quantization_params.as_ref().unwrap().base_q_idx, 32);
+    }
+
+    /// End-to-end encode → `decode_av1` → pixel-equality contract for
+    /// the multi-SB YUV path at representative extents that exercise:
+    ///   * the legacy ≤ 64×64 single-SB regime (64×64),
+    ///   * one extra SB along x (96×64) — partial-coverage edge SB,
+    ///   * one extra SB along y (64×96),
+    ///   * the full 2×2 SB grid at 128×128,
+    ///   * a partial-coverage corner SB (104×72).
+    #[test]
+    fn yuv_multi_sb_encode_decode_lossless_roundtrip_representative_extents() {
+        use crate::decoder::{decode_av1, Frame};
+        let extents: &[(u32, u32)] = &[
+            (64, 64),
+            (72, 64),
+            (96, 64),
+            (64, 72),
+            (64, 96),
+            (104, 72),
+            (128, 64),
+            (64, 128),
+            (96, 96),
+            (128, 128),
+        ];
+        let mut s: u64 = 0xDEAD_BEEF_C0DE_FACE;
+        let next = |s: &mut u64| -> u8 {
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*s >> 56) as u8
+        };
+        for &(w, h) in extents {
+            let mut input = Yuv420FrameMultiSb::filled(w, h, 0);
+            for p in input.y.iter_mut() {
+                *p = next(&mut s);
+            }
+            for p in input.u.iter_mut() {
+                *p = next(&mut s);
+            }
+            for p in input.v.iter_mut() {
+                *p = next(&mut s);
+            }
+            let enc = encode_intra_frame_yuv_dyn_multi_sb(&input)
+                .unwrap_or_else(|_| panic!("encode failed at {w}×{h}"));
+            assert_eq!(
+                enc.reconstructed_y, input.y,
+                "Y recon must equal input at {w}×{h} on the lossless WHT arm"
+            );
+            assert_eq!(
+                enc.reconstructed_u, input.u,
+                "U recon must equal input at {w}×{h} on the lossless WHT arm"
+            );
+            assert_eq!(
+                enc.reconstructed_v, input.v,
+                "V recon must equal input at {w}×{h} on the lossless WHT arm"
+            );
+            let dec =
+                decode_av1(&enc.ivf_bytes).unwrap_or_else(|_| panic!("decode failed at {w}×{h}"));
+            assert_eq!(dec.len(), 1);
+            match &dec[0] {
+                Frame::Yuv420Dyn {
+                    width,
+                    height,
+                    y,
+                    u,
+                    v,
+                } => {
+                    assert_eq!(*width, w, "decoded width mismatch at {w}×{h}");
+                    assert_eq!(*height, h, "decoded height mismatch at {w}×{h}");
+                    assert_eq!(y, &enc.reconstructed_y, "Y mismatch at {w}×{h}");
+                    assert_eq!(u, &enc.reconstructed_u, "U mismatch at {w}×{h}");
+                    assert_eq!(v, &enc.reconstructed_v, "V mismatch at {w}×{h}");
+                    assert_eq!(y, &input.y, "Y bit-exact recovery at {w}×{h}");
+                    assert_eq!(u, &input.u, "U bit-exact recovery at {w}×{h}");
+                    assert_eq!(v, &input.v, "V bit-exact recovery at {w}×{h}");
+                }
+                other => panic!("expected Yuv420Dyn at {w}×{h}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Lossy contract on the multi-SB YUV path: encoder-internal recon
+    /// = `decode_av1(enc.ivf_bytes)` byte-for-byte on all three planes
+    /// at q > 0 (the recovered planes do NOT in general equal the
+    /// input — quantization rounds).
+    #[test]
+    fn yuv_multi_sb_lossy_encode_decode_self_consistency() {
+        use crate::decoder::{decode_av1, Frame};
+        let mut input = Yuv420FrameMultiSb::filled(96, 64, 0);
+        let mut s: u64 = 0xBAD_F00D_FEED_BEEF;
+        let next = |s: &mut u64| -> u8 {
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*s >> 56) as u8
+        };
+        for p in input.y.iter_mut() {
+            *p = next(&mut s);
+        }
+        for p in input.u.iter_mut() {
+            *p = next(&mut s);
+        }
+        for p in input.v.iter_mut() {
+            *p = next(&mut s);
+        }
+        for &q in &[1u8, 32, 200] {
+            let enc = encode_intra_frame_yuv_dyn_multi_sb_with_q(&input, q)
+                .unwrap_or_else(|_| panic!("encode failed at q={q}"));
+            let dec =
+                decode_av1(&enc.ivf_bytes).unwrap_or_else(|_| panic!("decode failed at q={q}"));
+            match &dec[0] {
+                Frame::Yuv420Dyn {
+                    width,
+                    height,
+                    y,
+                    u,
+                    v,
+                } => {
+                    assert_eq!(*width, 96);
+                    assert_eq!(*height, 64);
+                    assert_eq!(
+                        y, &enc.reconstructed_y,
+                        "Y encoder recon = decoder out at q={q}"
+                    );
+                    assert_eq!(
+                        u, &enc.reconstructed_u,
+                        "U encoder recon = decoder out at q={q}"
+                    );
+                    assert_eq!(
+                        v, &enc.reconstructed_v,
+                        "V encoder recon = decoder out at q={q}"
+                    );
+                }
+                other => panic!("expected Yuv420Dyn, got {other:?}"),
+            }
+        }
+    }
+
+    /// IVF v0 width/height encode-side carriage on multi-SB YUV
+    /// extents — bytes 12..14 (width LE) and 14..16 (height LE) carry
+    /// the input dimensions verbatim across the SB threshold.
+    #[test]
+    fn yuv_multi_sb_encoded_ivf_carries_dynamic_dimensions_in_header() {
+        for &(w, h) in &[(96u32, 64u32), (128, 64), (64, 128), (128, 128), (104, 72)] {
+            let input = Yuv420FrameMultiSb::filled(w, h, 128);
+            let res = encode_intra_frame_yuv_dyn_multi_sb(&input).expect("encode ok");
+            let ivf_w = u16::from_le_bytes([res.ivf_bytes[12], res.ivf_bytes[13]]);
+            let ivf_h = u16::from_le_bytes([res.ivf_bytes[14], res.ivf_bytes[15]]);
+            assert_eq!(ivf_w as u32, w, "IVF width at {w}×{h}");
+            assert_eq!(ivf_h as u32, h, "IVF height at {w}×{h}");
         }
     }
 
