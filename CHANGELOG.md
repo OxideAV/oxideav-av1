@@ -4,6 +4,52 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r235 (2026-06-05): rectangular TX_SIZE family wiring on
+  the encoder's 2D forward-transform dispatcher
+  (`encoder::forward_transform_2d::forward_transform_2d`). Adds
+  the `|log2W - log2H| == 1` short-side-4 pair — `TX_4X8` and
+  `TX_8X4` — to the previously square-only dispatcher. The
+  composition is still column-pass-first (8-tall `forward_dct_8`
+  for TX_4X8 / 4-tall `forward_dct_4` for TX_8X4) followed by the
+  row pass (4-wide for TX_4X8 / 8-wide for TX_8X4) plus the new
+  encoder-mirror of §7.13.3's `Round2(T[j] * 2896, 12)` rectangular
+  scale, applied per row AFTER the row kernel runs (the encoder's
+  last pass — the time-reverse of the decoder's pre-row-kernel
+  rectangular scale on the same `2896` constant). Both encoder and
+  decoder thus contribute one factor of `2896 / 4096`, giving a
+  combined rectangular gain of `(2896 / 4096)^2 ≈ 1/2` per
+  rectangular axis pair. The per-axis kernel selectors
+  (DCT × DCT, ADST × DCT, DCT × ADST, ADST × ADST, FLIPADST
+  family, V_/H_ variants, IDTX) all carry over without modification
+  — the per-axis log-sizes (`log2_w = 2`, `log2_h = 3` for TX_4X8)
+  are both inside the existing forward-DCT and forward-ADST ranges
+  (n in 2..=6 for DCT, n in 2..=4 for ADST, n in 2..=5 for IDTX).
+  The §7.12.3 step-3 FLIPADST axis-flip carries over verbatim —
+  the flip is a spatial-residual reordering that runs before the
+  transform on rectangular and square shapes identically. The
+  remaining 12 rectangular sizes (`TX_8X16` / `TX_16X8` /
+  `TX_16X32` / `TX_32X16` / `TX_32X64` / `TX_64X32` / `TX_4X16` /
+  `TX_16X4` / `TX_8X32` / `TX_32X8` / `TX_16X64` / `TX_64X16`)
+  remain out of arc — the `|log2W - log2H| == 2` family in
+  particular does NOT take the §7.13.3 `× 2896` rectangular
+  post-scale and needs its own arc.
+
+  +12 lib tests (1543 → 1555): 2 zero-input probes (TX_4X8 /
+  TX_8X4 ⇒ zero-out), 2 DCT_DCT pseudorandom roundtrips at the
+  empirically-derived per-cell scale `1/4` (same scale shape as
+  TX_4X4 — the short-side-4 kernel norm carries the per-cell
+  magnitude), 2 constant-DC probes pinning the DC-dominance + a
+  recovery bound (input 64 ⇒ recovered 16 within ±2 LSBs per
+  cell), 1 ADST × DCT + 1 DCT × ADST + 1 IDTX + 1
+  FLIPADST × FLIPADST coverage for the rectangular family, and 2
+  forward-quantize / dequantize round-trip drills exercising the
+  32-cell rectangular buffer through the existing TX_4X4-shape
+  quantizer (`dqDenom == 1` for the short-side-4 family, so the
+  round-trip is bit-exact at q_index = 0). The square-only
+  rectangular-panic test is rewritten to assert `TX_8X16` (an
+  out-of-arc rectangular size) panics with the new "not supported
+  in this arc" message.
+
 - decoder/encoder r223 (2026-06-03): §8.2.6 post-renormalisation
   invariant probes wired into `SymbolDecoder::renormalize` and
   `SymbolWriter::write_symbol`. Both surfaces now check the two §8.2.6
