@@ -50299,6 +50299,8 @@ mod tests {
         assert_eq!(dequant_denom(TX_4X8), 1);
         assert_eq!(dequant_denom(TX_8X4), 1);
         assert_eq!(dequant_denom(TX_16X4), 1);
+        assert_eq!(dequant_denom(TX_8X16), 1);
+        assert_eq!(dequant_denom(TX_16X8), 1);
     }
 
     /// `dequantize_step1` 4x4 DC-only block per §7.12.3 step-1: with

@@ -4,6 +4,50 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r238 (2026-06-05): extend the rectangular TX_SIZE family
+  arc on the encoder's 2D forward-transform dispatcher
+  (`encoder::forward_transform_2d::forward_transform_2d`) by one
+  more `|log2W - log2H| == 1` pair — the short-side-8 pair
+  `TX_8X16` and `TX_16X8`. The dispatcher now accepts the five
+  square sizes plus four rectangular sizes (`TX_4X8` / `TX_8X4`
+  from r235 + `TX_8X16` / `TX_16X8` from r238). Same composition
+  shape as r235 — column pass first (16-tall `forward_dct_16` for
+  TX_8X16 / 8-tall `forward_dct_8` for TX_16X8) followed by the row
+  pass (8-wide for TX_8X16 / 16-wide for TX_16X8) plus the per-row
+  encoder-mirror `Round2(T[j] * 2896, 12)` rectangular post-scale.
+  The per-axis kernel selectors all extend without modification:
+  `forward_dct_dispatch` (n in 2..=6), `forward_adst_dispatch` (n in
+  2..=4 — both log2_w = 3 and log2_h = 4 are in range, so ADST × DCT
+  / DCT × ADST / ADST × ADST / the FLIPADST family / V_/H_ variants
+  all reach), `forward_idtx_dispatch` (n in 2..=5). The empirical
+  round-trip per-cell scale on a constant-DC probe is `1/2` of the
+  input (vs `1/4` for short-side-4 — input `32` ⇒ recovered `16`):
+  the larger N_w × N_h kernel norm (128 vs 32) gains `4×` over the
+  short-side-4 pair while the larger row-shift envelope
+  (`Transform_Row_Shift[TX_8X16] = 1` vs `0` for TX_4X8) eats back
+  `2×`, netting the `2×` larger per-cell round-trip scale. The
+  `dequant_denom(TX_8X16) == dequant_denom(TX_16X8) == 1` lookup
+  matches the existing TX_4X4 / TX_8X8 / TX_4X8 / TX_8X4 path, so
+  the forward-quantize / dequantize round-trip on the new shapes is
+  bit-exact at q_index = 0. The remaining 10 rectangular sizes
+  (`TX_16X32` / `TX_32X16` / `TX_32X64` / `TX_64X32` / `TX_4X16` /
+  `TX_16X4` / `TX_8X32` / `TX_32X8` / `TX_16X64` / `TX_64X16`)
+  remain out of arc.
+
+  +13 lib tests (1555 → 1568): 2 zero-input probes (TX_8X16 /
+  TX_16X8 ⇒ zero-out), 2 DCT_DCT pseudorandom roundtrips at the
+  empirically-derived per-cell scale `1/2`, 2 constant-DC probes
+  pinning the DC-dominance + a recovery bound (input 32 ⇒ recovered
+  16 within ±2 LSBs per cell), 1 ADST × DCT (TX_8X16), 1 DCT × ADST
+  (TX_16X8), 1 IDTX (TX_8X16), 1 FLIPADST × FLIPADST (TX_16X8),
+  1 ADST × ADST (TX_8X16) covering the kernel-selector matrix; 2
+  forward-quantize / dequantize round-trip drills exercising the
+  128-cell rectangular buffer through the existing `dqDenom == 1`
+  quantizer path; and 2 entries appended to
+  `dequant_denom_per_tx_size` for TX_8X16 / TX_16X8 (both = 1). The
+  out-of-arc rectangular-panic guard is updated to assert TX_16X32
+  panics (TX_8X16 is now in-arc).
+
 - encoder r235 (2026-06-05): rectangular TX_SIZE family wiring on
   the encoder's 2D forward-transform dispatcher
   (`encoder::forward_transform_2d::forward_transform_2d`). Adds

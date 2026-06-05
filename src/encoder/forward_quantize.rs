@@ -221,7 +221,7 @@ pub fn forward_quantize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdf::{dequantize_step1, DCT_DCT, TX_4X4, TX_4X8, TX_8X4, TX_8X8};
+    use crate::cdf::{dequantize_step1, DCT_DCT, TX_16X8, TX_4X4, TX_4X8, TX_8X16, TX_8X4, TX_8X8};
 
     /// At `q_index = 0` the DC + AC quantizers both equal `4` (the
     /// first cell of `Dc_Qlookup[0]` and `Ac_Qlookup[0]`), `dqDenom =
@@ -382,6 +382,51 @@ mod tests {
             assert_eq!(lv, expected, "TX_8X4 AC quant level mismatch at k = {k}");
         }
         let dequant = dequantize_step1(&levels, TX_8X4, 0, 0, DCT_DCT, 15, &qp);
+        assert_eq!(dequant, coeffs);
+    }
+
+    /// `dqDenom == 1` for the §7.13.3 short-side-8 rectangular pair
+    /// (TX_8X16 / TX_16X8 — the §7.12.3 `dqDenom == 2` branch only
+    /// trips on 32-axis transforms, so TX_8X16 / TX_16X8 stay at
+    /// `1`). The quantize + dequantize round-trip therefore mirrors
+    /// the short-side-4 contract: any `Quant` pattern whose dequant
+    /// fits the §6.10.34 24-bit envelope round-trips bit-exactly.
+    #[test]
+    fn forward_quantize_tx8x16_round_trip_lossless_q_index_zero() {
+        let qp = QuantizerParams::neutral(0, 8);
+        // TX_8X16 ⇒ 8 * 16 = 128 cells row-major.
+        let mut coeffs = vec![0i64; 128];
+        coeffs[0] = 40; // DC = 40 ⇒ Quant = 40 / 4 = 10 at q_index = 0.
+        for (k, slot) in coeffs.iter_mut().enumerate().skip(1) {
+            *slot = ((k as i64) % 7) * 4; // strictly in dequant_step1 range
+        }
+        let levels = forward_quantize(&coeffs, TX_8X16, 0, 0, DCT_DCT, 15, &qp);
+        assert_eq!(levels[0], 10, "TX_8X16 DC quant level mismatch");
+        for (k, &lv) in levels.iter().enumerate().skip(1) {
+            let expected = ((k as i64) % 7) as i32;
+            assert_eq!(lv, expected, "TX_8X16 AC quant level mismatch at k = {k}");
+        }
+        let dequant = dequantize_step1(&levels, TX_8X16, 0, 0, DCT_DCT, 15, &qp);
+        assert_eq!(dequant, coeffs, "TX_8X16 dequant did not round-trip");
+    }
+
+    /// Mirror of the TX_8X16 round-trip on TX_16X8 (the transpose
+    /// rectangular partner; w = 16, h = 8, also `dqDenom == 1`).
+    #[test]
+    fn forward_quantize_tx16x8_round_trip_lossless_q_index_zero() {
+        let qp = QuantizerParams::neutral(0, 8);
+        let mut coeffs = vec![0i64; 128];
+        coeffs[0] = 36;
+        for (k, slot) in coeffs.iter_mut().enumerate().skip(1) {
+            *slot = ((k as i64) % 8) * 4;
+        }
+        let levels = forward_quantize(&coeffs, TX_16X8, 0, 0, DCT_DCT, 15, &qp);
+        assert_eq!(levels[0], 9);
+        for (k, &lv) in levels.iter().enumerate().skip(1) {
+            let expected = ((k as i64) % 8) as i32;
+            assert_eq!(lv, expected, "TX_16X8 AC quant level mismatch at k = {k}");
+        }
+        let dequant = dequantize_step1(&levels, TX_16X8, 0, 0, DCT_DCT, 15, &qp);
         assert_eq!(dequant, coeffs);
     }
 

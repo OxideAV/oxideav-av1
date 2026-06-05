@@ -2,14 +2,36 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
-## Status — 2026-06-05 (round 235)
+## Status — 2026-06-05 (round 238)
 
-Round 235 wires the **rectangular `TX_SIZE` family** into the
-encoder's 2D forward-transform dispatcher
-(`encoder::forward_transform_2d::forward_transform_2d`). The
-dispatcher previously rejected every rectangular shape with an
-explicit panic ("rectangular tx_size … not supported in this arc —
-square sizes only"); r235 lifts that restriction for the
+Round 238 extends the encoder's 2D forward-transform dispatcher
+(`encoder::forward_transform_2d::forward_transform_2d`) by the
+**next `|log2W - log2H| == 1`** rectangular pair after the
+short-side-4 family landed in r235: **`TX_8X16`** and
+**`TX_16X8`** — the short-side-8 rectangular pair. The dispatcher
+now accepts the five square sizes plus four rectangular sizes
+(`TX_4X8` / `TX_8X4` / `TX_8X16` / `TX_16X8`) and routes the §7.13.3
+forward pipeline end-to-end through `forward_transform_2d` →
+`forward_quantize` → `dequantize_step1` → `inverse_transform_2d`
+for each.
+
+The §7.13.3 row-shift envelope at `Transform_Row_Shift[TX_8X16] =
+Transform_Row_Shift[TX_16X8] = 1` (vs `0` for TX_4X8 / TX_8X4)
+combined with the same `Round2(T[j] * 2896, 12)` encoder-mirror
+rectangular post-scale lands at an empirical per-cell round-trip
+scale of `1/2` (vs `1/4` for short-side-4 — input `32` recovers
+`16` within ±2 LSBs per cell). The larger N_w × N_h kernel norm
+(`128` for TX_8X16 vs `32` for TX_4X8) gains `4×` over the
+short-side-4 pair while the larger row-shift loses back `2×`,
+netting the `2×` larger per-cell scale.
+
+### Round 235 (carry-over)
+
+Round 235 wired the **rectangular `TX_SIZE` family** into the
+encoder's 2D forward-transform dispatcher. The dispatcher
+previously rejected every rectangular shape with an explicit
+panic ("rectangular tx_size … not supported in this arc —
+square sizes only"); r235 lifted that restriction for the
 `|log2W - log2H| == 1` short-side-4 pair — **`TX_4X8`** and
 **`TX_8X4`** — so the encoder can now drive a 4×8 or 8×4 transform
 unit through the full pipeline (`forward_transform_2d` →
@@ -48,28 +70,40 @@ forward-quantize / dequantize round-trip on these new shapes is
 bit-exact at `q_index = 0` — and the lossy round-trip carries the
 same `±2` LSB profile as the TX_4X4 baseline.
 
-Total: 1543 → 1555 lib tests (+12). 2 zero-input probes (TX_4X8 /
-TX_8X4 ⇒ zero-out), 2 DCT × DCT pseudorandom roundtrips at the
-`1/4` per-cell scale (same checker `check_roundtrip_frac` as the
-square-size tests), 2 constant-DC dominance + recovery probes
-(input 64 ⇒ recovered 16 within ±2 LSBs), 1 ADST × DCT, 1 DCT ×
-ADST, 1 IDTX, 1 FLIPADST × FLIPADST round-trip across the
-rectangular family covering the kernel-selector matrix; and 2
-forward-quantize / dequantize round-trip drills exercising the
-32-cell rectangular buffer through the existing TX_4X4-shape
-quantizer at `q_index = 0`.
+r235 totals (carry-over): 1543 → 1555 lib tests (+12) covering the
+short-side-4 rectangular pair.
 
-Out of scope (next arcs): the remaining 12 rectangular sizes —
-`TX_8X16` / `TX_16X8` / `TX_16X32` / `TX_32X16` / `TX_32X64` /
-`TX_64X32` (the `|log2W - log2H| == 1` chain at higher kernel
-sizes), and `TX_4X16` / `TX_16X4` / `TX_8X32` / `TX_32X8` /
-`TX_16X64` / `TX_64X16` (the `|log2W - log2H| == 2` family, which
-does NOT take the `× 2896` rectangular post-scale and has its own
-per-tx-size shift envelope). Also unchanged: the rectangular sizes
-are still not selected by the encoder's pixel-driver (the dyn
-driver still hardcodes TX_4X4); a follow-up arc wires the
-rectangular-aware TX-size dispatch into the partition-tree picker
-and the §5.11.18 inter mode_info path.
+### Round 238 test summary
+
+Total: 1555 → 1568 lib tests (+13). 2 zero-input probes (TX_8X16 /
+TX_16X8 ⇒ zero-out), 2 DCT × DCT pseudorandom roundtrips at the
+`1/2` per-cell scale, 2 constant-DC dominance + recovery probes
+(input `32` ⇒ recovered `16` within ±2 LSBs per cell — DC clearly
+dominates the kernel-rounded off-DC floor by > 10×), 1 ADST × DCT
+on TX_8X16, 1 DCT × ADST on TX_16X8, 1 IDTX on TX_8X16, 1
+FLIPADST × FLIPADST round-trip on TX_16X8 (verifying the §7.12.3
+step-3 spatial-residual flip composes correctly with the
+rectangular post-scale), 1 ADST × ADST on TX_8X16 — covering the
+forward-ADST `n in 2..=4` range on both rectangular axes; and 2
+forward-quantize / dequantize round-trip drills (TX_8X16 / TX_16X8)
+exercising the 128-cell rectangular buffer through the existing
+`dqDenom == 1` quantizer path at `q_index = 0`. Plus a 2-entry
+expansion of the `dequant_denom_per_tx_size` test for TX_8X16 /
+TX_16X8 (both = 1).
+
+Out of scope (next arcs): the remaining 10 rectangular sizes —
+`TX_16X32` / `TX_32X16` / `TX_32X64` / `TX_64X32` (the
+`|log2W - log2H| == 1` chain at the largest kernel sizes, where
+the `dqDenom != 1` quantizer denominator combines with the
+`row_shift = 1 / 2` envelope on the 32-axis and 64-axis sizes),
+and `TX_4X16` / `TX_16X4` / `TX_8X32` / `TX_32X8` / `TX_16X64` /
+`TX_64X16` (the `|log2W - log2H| == 2` family, which does NOT take
+the `× 2896` rectangular post-scale and has its own per-tx-size
+shift envelope). Also unchanged: the rectangular sizes are still
+not selected by the encoder's pixel-driver (the dyn driver still
+hardcodes TX_4X4); a follow-up arc wires the rectangular-aware
+TX-size dispatch into the partition-tree picker and the §5.11.18
+inter mode_info path.
 
 ## Status — 2026-06-03 (round 223)
 
