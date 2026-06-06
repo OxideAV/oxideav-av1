@@ -4,6 +4,64 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r244 (2026-06-07): extend the rectangular TX_SIZE family
+  arc on the encoder's 2D forward-transform dispatcher
+  (`encoder::forward_transform_2d::forward_transform_2d`) by the
+  last `|log2W - log2H| == 1` pair on the chain — the short-side-32
+  pair `TX_32X64` and `TX_64X32` (the max-kernel pair on the
+  `Abs(log2W - log2H) == 1` family). The dispatcher now accepts the
+  five square sizes plus eight rectangular sizes (`TX_4X8` /
+  `TX_8X4` from r235 + `TX_8X16` / `TX_16X8` from r238 +
+  `TX_16X32` / `TX_32X16` from r241 + `TX_32X64` / `TX_64X32` from
+  r244). Same composition shape — column pass first (64-tall
+  `forward_dct_64` for TX_32X64 / 32-tall `forward_dct_32` for
+  TX_64X32) followed by the row pass plus the per-row
+  encoder-mirror `Round2(T[j] * 2896, 12)` rectangular post-scale.
+  The per-axis kernel selectors extend without modification:
+  `forward_dct_dispatch` (n in 2..=6) covers both 32 and 64;
+  `forward_idtx_dispatch` (n in 2..=5) covers 32 only (n=6 /
+  length-64 is out of range); `forward_adst_dispatch` (n in 2..=4)
+  covers neither, so any ADST × {32|64} tx_type combination is
+  forced to DCT by §6.10.19. For TX_32X64 the row selector picks
+  IDTX via tx_type = V_DCT (row length 32 = in IDTX range, col
+  length 64 = in DCT range); for TX_64X32 the col selector picks
+  IDTX via tx_type = H_DCT (col length 32 = in IDTX range, row
+  length 64 = in DCT range). The empirical round-trip per-cell
+  scale on a constant-DC probe is `8 ×` input (input 2 ⇒ recovered
+  16): the larger `N_w * N_h = 2048` kernel norm gains another
+  `4×` over the short-side-16 pair's `512` while the row-shift
+  envelope stays at `Transform_Row_Shift = 1`, so the full `4×`
+  lands in the per-cell scale (`2 × 4 = 8`). Per §7.12.3,
+  `dqDenom = 4` for both `TX_32X64` and `TX_64X32` (the 64-axis
+  presence promotes the §7.12.3 dqDenom from `2` to `4`); the
+  forward quantizer already routes this through
+  `crate::cdf::dequant_denom`.
+
+  +8 lib tests (1580 → 1588): 2 zero-input probes (TX_32X64 /
+  TX_64X32 ⇒ zero-out), 2 DCT_DCT pseudorandom roundtrips at the
+  empirically-derived per-cell scale `8` (input bound `±2` + loose
+  `max_err = 64` envelope mirrors the TX_64X64 square test —
+  length-64 axis drives the inverse pipeline's 16-bit between-stage
+  clamp closer to saturation than the constant-DC probe does, and
+  the DCT-64 butterfly graph's 31-step accumulated `Round2(_, 12)`
+  floor adds more LSB jitter), 2 constant-DC probes pinning the
+  DC-dominance + a recovery bound (input 2 ⇒ recovered 16 within
+  ±2 LSBs per cell), 1 V_DCT (TX_32X64, col DCT length 64 + row
+  IDTX length 32 — the only IDTX-reachable axis combination), 1
+  H_DCT (TX_64X32, row DCT length 64 + col IDTX length 32, by
+  transpose). The out-of-arc rectangular-panic guard is updated to
+  assert `TX_4X16` panics (a `|log2W - log2H| == 2` size, still out
+  of arc) — `TX_32X64` is now in-arc. The zero-input matrix-walk
+  test gains 4 new cases (TX_32X64 / TX_64X32 with DCT_DCT and
+  V_DCT / H_DCT respectively).
+
+  Out of scope (next arc): the `|log2W - log2H| == 2` family
+  (`TX_4X16` / `TX_16X4` / `TX_8X32` / `TX_32X8` / `TX_16X64` /
+  `TX_64X16`), which per §7.13.3 av1-spec p.305 does follow a
+  different path — the `× 2896` rectangular post-scale fires only
+  on the `Abs(log2W - log2H) == 1` branch, so this family stays at
+  the bare per-axis kernel composition.
+
 - encoder r241 (2026-06-06): extend the rectangular TX_SIZE family
   arc on the encoder's 2D forward-transform dispatcher
   (`encoder::forward_transform_2d::forward_transform_2d`) by one
