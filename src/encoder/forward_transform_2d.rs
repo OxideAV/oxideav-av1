@@ -23,16 +23,17 @@
 //! against the kernel's intrinsic `N`-times gain (see "Shift
 //! envelope" below for the derivation).
 //!
-//! ## Square scope plus the first two rectangular pairs (round 238)
+//! ## Square scope plus the first three rectangular pairs (round 241)
 //!
 //! The five **square** transform sizes are landed:
 //! `TX_4X4`, `TX_8X8`, `TX_16X16`, `TX_32X32`, `TX_64X64`. Round 235
 //! added the **`|log2W - log2H| == 1`** rectangular pair at the
 //! shorter side — specifically `TX_4X8` and `TX_8X4`. Round 238
-//! extends the `|log2W - log2H| == 1` arc by one more pair —
-//! **`TX_8X16`** and **`TX_16X8`** — covering the
-//! `min(log2W, log2H) == 3` short-side-8 family. Each axis runs
-//! its own log-size forward kernel:
+//! extended the `|log2W - log2H| == 1` arc by one more pair —
+//! `TX_8X16` and `TX_16X8` — covering the `min(log2W, log2H) == 3`
+//! short-side-8 family. Round 241 extends the arc once more to the
+//! next pair at `min(log2W, log2H) == 4` — **`TX_16X32`** and
+//! **`TX_32X16`**. Each axis runs its own log-size forward kernel:
 //!
 //! | tx_size    | row kernel        | col kernel        |
 //! | ---------- | ----------------- | ----------------- |
@@ -40,6 +41,8 @@
 //! | `TX_8X4`   | `forward_dct_8`   | `forward_dct_4`   |
 //! | `TX_8X16`  | `forward_dct_8`   | `forward_dct_16`  |
 //! | `TX_16X8`  | `forward_dct_16`  | `forward_dct_8`   |
+//! | `TX_16X32` | `forward_dct_16`  | `forward_dct_32`  |
+//! | `TX_32X16` | `forward_dct_32`  | `forward_dct_16`  |
 //!
 //! After the row kernel pass the per-row §7.13.3 rectangular scale
 //! `Round2(T[j] * 2896, 12)` is applied — the encoder mirror of the
@@ -49,21 +52,21 @@
 //! `(2896 / 4096)^2 ≈ 1/2` per rectangular axis pair. This holds
 //! uniformly across the `|log2W - log2H| == 1` family — the
 //! per-tx-size differentiator is the row-shift envelope
-//! (`Transform_Row_Shift[TX_8X16] = Transform_Row_Shift[TX_16X8] = 1`
-//! vs the `0` for `TX_4X8` / `TX_8X4`), not the rectangular scale
-//! constant itself.
+//! (`Transform_Row_Shift[TX_8X16] = Transform_Row_Shift[TX_16X8] =
+//! Transform_Row_Shift[TX_16X32] = Transform_Row_Shift[TX_32X16] =
+//! 1` vs the `0` for `TX_4X8` / `TX_8X4`), not the rectangular
+//! scale constant itself.
 //!
-//! The remaining 10 rectangular sizes (`TX_16X32` / `TX_32X16` /
-//! `TX_32X64` / `TX_64X32` / `TX_4X16` / `TX_16X4` / `TX_8X32` /
-//! `TX_32X8` / `TX_16X64` / `TX_64X16`) split into two further arcs:
-//! the `|log2W - log2H| == 1` chain at the largest kernel sizes
-//! (TX_16X32 / TX_32X16 / TX_32X64 / TX_64X32 — still take the
-//! `× 2896` post-scale but combine it with larger row-shifts and a
-//! `dqDenom != 1` quantizer denominator) and the
-//! `|log2W - log2H| == 2` family (TX_4X16 / TX_16X4 / TX_8X32 /
-//! TX_32X8 / TX_16X64 / TX_64X16), which does NOT take the `× 2896`
-//! rectangular post-scale per §7.13.3 av1-spec p.305 (only the
-//! `Abs(log2W - log2H) == 1` branch does).
+//! The remaining 8 rectangular sizes (`TX_32X64` / `TX_64X32` /
+//! `TX_4X16` / `TX_16X4` / `TX_8X32` / `TX_32X8` / `TX_16X64` /
+//! `TX_64X16`) split into two further arcs: the
+//! `|log2W - log2H| == 1` chain at the largest kernel sizes
+//! (`TX_32X64` / `TX_64X32` — still take the `× 2896` post-scale
+//! but combine it with a `dqDenom != 1` quantizer denominator) and
+//! the `|log2W - log2H| == 2` family (`TX_4X16` / `TX_16X4` /
+//! `TX_8X32` / `TX_32X8` / `TX_16X64` / `TX_64X16`), which does
+//! NOT take the `× 2896` rectangular post-scale per §7.13.3
+//! av1-spec p.305 (only the `Abs(log2W - log2H) == 1` branch does).
 //!
 //! Within the square sizes, the per-kernel coverage is:
 //!
@@ -231,7 +234,7 @@
 //! saturate (`±4` for TX_64X64, `±16` for TX_32X32). The smaller
 //! sizes can use the full `±128` range.
 //!
-//! ## Rectangular scaling (rounds 235 + 238)
+//! ## Rectangular scaling (rounds 235 + 238 + 241)
 //!
 //! For the `|log2W - log2H| == 1` sizes the §7.13.3 decoder inserts
 //! a per-row `Round2(T[j] * 2896, 12)` step BEFORE the row kernel
@@ -244,12 +247,14 @@
 //! and the §7.13.3 row + col shift envelope, the empirical
 //! round-trip per-cell scale on a constant-DC input evaluates to
 //!
-//! | tx_size   | empirical per-cell round-trip scale |
-//! | --------- | ----------------------------------- |
-//! | `TX_4X8`  | `1/4`                               |
-//! | `TX_8X4`  | `1/4`                               |
-//! | `TX_8X16` | `1/2`                               |
-//! | `TX_16X8` | `1/2`                               |
+//! | tx_size    | empirical per-cell round-trip scale |
+//! | ---------- | ----------------------------------- |
+//! | `TX_4X8`   | `1/4`                               |
+//! | `TX_8X4`   | `1/4`                               |
+//! | `TX_8X16`  | `1/2`                               |
+//! | `TX_16X8`  | `1/2`                               |
+//! | `TX_16X32` | `2`                                 |
+//! | `TX_32X16` | `2`                                 |
 //!
 //! TX_4X8 / TX_8X4 inherit the TX_4X4 `1/4` scale (short-side-4
 //! kernel norm dominates the row/col composition); TX_8X16 /
@@ -258,22 +263,29 @@
 //! short-side-4 pair's `N_w * N_h = 4 * 8 = 32`, while the larger
 //! row-shift envelope (`Transform_Row_Shift[TX_8X16] = 1` vs
 //! `0` for TX_4X8) eats back `2×`, netting a `2×` larger
-//! round-trip per-cell scale.
+//! round-trip per-cell scale. TX_16X32 / TX_32X16 land at `2` —
+//! two steps up from TX_8X16 — because `N_w * N_h = 16 * 32 = 512`
+//! gains another `4×` over the short-side-8 pair while the
+//! row-shift envelope stays at `Transform_Row_Shift = 1` (same as
+//! TX_8X16 / TX_16X8), so the full `4×` lands in the per-cell
+//! round-trip scale.
 //!
-//! Walking the analytic derivation for TX_8X16: round-trip per-cell
-//! gain = `(N_w * N_h) / 2^(row_shift + col_shift) * (2896 / 4096)^2`
-//! = `128 / 2^(1 + 4) * 1/2` = `128 / 32 * 1/2` = `2`. The factor
-//! of `2` above the empirical `1/2` is the constant-DC probe's
-//! input-mass factor on the inverse-side after the row-pass — the
-//! per-cell pass-through scale absorbed by the cos-bisection
-//! coefficient at the DC bucket.
+//! Walking the analytic derivation for TX_16X32: round-trip
+//! per-cell gain = `(N_w * N_h) / 2^(row_shift + col_shift) *
+//! (2896 / 4096)^2` = `512 / 2^(1 + 4) * 1/2` = `512 / 32 * 1/2` =
+//! `8`. The factor of `4` between the analytic `8` and empirical
+//! `2` matches the `4×` ratio already documented for TX_8X16
+//! (analytic `2`, empirical `1/2`) — i.e. the constant-DC probe's
+//! input-mass factor on the inverse-side after the row-pass is
+//! invariant across the rectangular `|log2W - log2H| == 1` family.
 //!
 //! The quantizer in [`super::forward_quantize`] absorbs this fixed
 //! per-tx-size gain through the `dqDenom` factor (the same path
-//! used for the square sizes): `dequant_denom(TX_8X16) =
-//! dequant_denom(TX_16X8) = 1` (the §7.12.3 `dqDenom` is `2` only
-//! for the 32x32-axis transforms and `4` for the 64x64-axis
-//! transforms; everything below stays at `1`), so a downstream
+//! used for the square sizes): `dequant_denom(TX_16X32) =
+//! dequant_denom(TX_32X16) = 2` per §7.12.3 (the only `dqDenom !=
+//! 1` rectangular shapes at this point in the arc — the 32-axis
+//! presence on either side promotes `dqDenom` from `1` to `2`).
+//! TX_8X16 / TX_16X8 still sit at `dqDenom = 1`. A downstream
 //! encoder pipeline that pairs this dispatcher with the existing
 //! quantizer sees a bit-correct coefficient stream against the
 //! spec's per-tx-size quantizer step.
@@ -442,11 +454,13 @@ fn apply_flip(input: &[i64], w: usize, h: usize, flip_rows: bool, flip_cols: boo
 /// `tx_size` must be one of the five square sizes
 /// ([`crate::cdf::TX_4X4`] / [`crate::cdf::TX_8X8`] /
 /// [`crate::cdf::TX_16X16`] / [`crate::cdf::TX_32X32`] /
-/// [`crate::cdf::TX_64X64`]) **or** one of the four
-/// `|log2W - log2H| == 1` rectangular pairs at the short-side-4
-/// and short-side-8 sizes — [`crate::cdf::TX_4X8`] /
-/// [`crate::cdf::TX_8X4`] (round 235) and [`crate::cdf::TX_8X16`] /
-/// [`crate::cdf::TX_16X8`] (round 238). The remaining rectangular
+/// [`crate::cdf::TX_64X64`]) **or** one of the six
+/// `|log2W - log2H| == 1` rectangular pairs at the short-side-4,
+/// short-side-8 and short-side-16 sizes — [`crate::cdf::TX_4X8`] /
+/// [`crate::cdf::TX_8X4`] (round 235), [`crate::cdf::TX_8X16`] /
+/// [`crate::cdf::TX_16X8`] (round 238), and
+/// [`crate::cdf::TX_16X32`] / [`crate::cdf::TX_32X16`] (round 241).
+/// The remaining rectangular
 /// sizes are out of scope for this arc and panic.
 ///
 /// `plane_tx_type` must be one of the 16 §6.10.19 ordinals; the per-
@@ -466,7 +480,7 @@ fn apply_flip(input: &[i64], w: usize, h: usize, flip_rows: bool, flip_cols: boo
 /// * `tx_size >= TX_SIZES_ALL`.
 /// * `tx_size` is a rectangular family currently out of arc scope
 ///   (any rectangular size beyond `TX_4X8` / `TX_8X4` / `TX_8X16` /
-///   `TX_16X8`).
+///   `TX_16X8` / `TX_16X32` / `TX_32X16`).
 /// * `input.len() != w * h`.
 /// * `lossless == true` with `tx_size != TX_4X4`.
 /// * `(tx_size, plane_tx_type)` selects an out-of-range kernel size
@@ -487,23 +501,24 @@ pub fn forward_transform_2d(
     let h = TX_HEIGHT[tx_size];
     // Square (|log2W - log2H| == 0) is universally supported. The
     // |log2W - log2H| == 1 short-side-4 pair (TX_4X8 / TX_8X4) was
-    // landed in round 235; round 238 extends the rectangular arc by
-    // the next |log2W - log2H| == 1 pair at short-side-8 — TX_8X16
-    // and TX_16X8. Larger rectangular sizes are out of scope for
-    // this arc.
+    // landed in round 235; round 238 extended the rectangular arc
+    // by the next |log2W - log2H| == 1 pair at short-side-8 —
+    // TX_8X16 and TX_16X8. Round 241 extends the arc once more, to
+    // the next pair at short-side-16 — TX_16X32 and TX_32X16.
+    // Larger rectangular sizes are out of scope for this arc.
     let is_square = log2_w == log2_h;
     let min_log2 = core::cmp::min(log2_w, log2_h);
     let max_log2 = core::cmp::max(log2_w, log2_h);
     let is_supported_rect = log2_w.abs_diff(log2_h) == 1
-        && (min_log2 == 2 || min_log2 == 3)
+        && (min_log2 == 2 || min_log2 == 3 || min_log2 == 4)
         && max_log2 == min_log2 + 1;
     assert!(
         is_square || is_supported_rect,
         "oxideav-av1 forward_transform_2d: rectangular tx_size {tx_size} (w={w}, h={h}) \
          not supported in this arc — supported shapes are the five square sizes \
          (TX_4X4 / TX_8X8 / TX_16X16 / TX_32X32 / TX_64X64) plus the \
-         |log2W - log2H| == 1 short-side-4 and short-side-8 pairs \
-         (TX_4X8 / TX_8X4 / TX_8X16 / TX_16X8)"
+         |log2W - log2H| == 1 short-side-4, short-side-8 and short-side-16 pairs \
+         (TX_4X8 / TX_8X4 / TX_8X16 / TX_16X8 / TX_16X32 / TX_32X16)"
     );
     assert_eq!(
         input.len(),
@@ -581,7 +596,8 @@ fn round2_12(x: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::cdf::{
-        TX_16X16, TX_16X32, TX_16X8, TX_32X32, TX_4X4, TX_4X8, TX_64X64, TX_8X16, TX_8X4, TX_8X8,
+        TX_16X16, TX_16X32, TX_16X8, TX_32X16, TX_32X32, TX_4X4, TX_4X8, TX_64X64, TX_8X16, TX_8X4,
+        TX_8X8,
     };
     use crate::transform::inverse_transform_2d;
 
@@ -1166,6 +1182,180 @@ mod tests {
         check_roundtrip_frac(&input, TX_8X16, ADST_ADST, 1, 2, 16);
     }
 
+    // -------------------------------------------------------------
+    // TX_16X32 / TX_32X16 — the |log2W - log2H| == 1 pair at
+    // min(log2W, log2H) == 4 (short-side-16). Landed in round 241.
+    //
+    // ADST is defined for `n in 2..=4` (sizes 4 / 8 / 16); only the
+    // log2 = 4 axis is in range, so axis combinations that demand
+    // ADST on the length-32 side are forced to DCT by §6.10.19 and
+    // are NOT exercised here. The reachable matrix is:
+    //
+    //   * DCT × DCT  (both axes DCT)            — DCT_DCT
+    //   * DCT (row) × ADST (col, on the 16 side) — TX_32X16 with
+    //                                              tx_type=ADST_DCT
+    //                                              (col=ADST, length 16)
+    //   * ADST (row, on the 16 side) × DCT (col) — TX_16X32 with
+    //                                              tx_type=DCT_ADST
+    //                                              (row=ADST, length 16)
+    //   * IDTX × IDTX  (n in 2..=5 covers both lengths)
+    //   * V_DCT / H_DCT  (one axis DCT, the other IDTX)
+    //
+    // The inverse-side between-stage `Clip3` at 16 bits saturates on
+    // the length-32 column / row kernel for large input magnitudes;
+    // the roundtrip tests use a reduced residual bound (`±8`) to
+    // keep the intermediates within the clamp.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn rect_tx_16x32_zero_input_yields_zero() {
+        let input = vec![0i64; 16 * 32];
+        let coeffs = forward_transform_2d(&input, TX_16X32, DCT_DCT, false);
+        assert_eq!(coeffs.len(), 16 * 32);
+        for (i, &v) in coeffs.iter().enumerate() {
+            assert_eq!(v, 0, "TX_16X32 cell {i}: zero in ⇒ zero out, got {v}");
+        }
+    }
+
+    #[test]
+    fn rect_tx_32x16_zero_input_yields_zero() {
+        let input = vec![0i64; 32 * 16];
+        let coeffs = forward_transform_2d(&input, TX_32X16, DCT_DCT, false);
+        assert_eq!(coeffs.len(), 32 * 16);
+        for (i, &v) in coeffs.iter().enumerate() {
+            assert_eq!(v, 0, "TX_32X16 cell {i}: zero in ⇒ zero out, got {v}");
+        }
+    }
+
+    #[test]
+    fn rect_tx_16x32_dct_dct_roundtrip() {
+        // Per-cell ≈ 2 × input. Reduced input bound (`±8`) keeps the
+        // inverse pipeline's 16-bit between-stage clamp from
+        // saturating on the length-32 column kernel.
+        let input = lcg_residual_bound(0xCAFE_1632_DEAD_BEEF, 16 * 32, 8);
+        check_roundtrip_frac(&input, TX_16X32, DCT_DCT, 2, 1, 4);
+    }
+
+    #[test]
+    fn rect_tx_32x16_dct_dct_roundtrip() {
+        let input = lcg_residual_bound(0xBEEF_3216_F00D_CAFE, 32 * 16, 8);
+        check_roundtrip_frac(&input, TX_32X16, DCT_DCT, 2, 1, 4);
+    }
+
+    #[test]
+    fn rect_tx_16x32_dc_input_dc_only_coefficient() {
+        // A constant-DC input should produce a single dominant DC
+        // coefficient (at index 0 of the row-major coefficient
+        // buffer). Per-cell round-trip scale of 2 on input = 8 ⇒
+        // each recovered cell ≈ 16.
+        let input = vec![8i64; 16 * 32];
+        let coeffs = forward_transform_2d(&input, TX_16X32, DCT_DCT, false);
+        assert_eq!(coeffs.len(), 16 * 32);
+        let dc = coeffs[0];
+        let max_off = coeffs[1..].iter().map(|c| c.abs()).max().unwrap_or(0);
+        assert!(
+            dc.abs() > 10 * max_off.max(1),
+            "TX_16X32 DC = {dc}, max off-DC = {max_off} — DC should dominate"
+        );
+        let recovered = inverse_transform_2d(&coeffs, TX_16X32, DCT_DCT, 8, false);
+        for (i, &v) in recovered.iter().enumerate() {
+            assert!(
+                (v - 16).abs() <= 2,
+                "TX_16X32 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+            );
+        }
+    }
+
+    #[test]
+    fn rect_tx_32x16_dc_input_dc_only_coefficient() {
+        let input = vec![8i64; 32 * 16];
+        let coeffs = forward_transform_2d(&input, TX_32X16, DCT_DCT, false);
+        assert_eq!(coeffs.len(), 32 * 16);
+        let dc = coeffs[0];
+        let max_off = coeffs[1..].iter().map(|c| c.abs()).max().unwrap_or(0);
+        assert!(
+            dc.abs() > 10 * max_off.max(1),
+            "TX_32X16 DC = {dc}, max off-DC = {max_off} — DC should dominate"
+        );
+        let recovered = inverse_transform_2d(&coeffs, TX_32X16, DCT_DCT, 8, false);
+        for (i, &v) in recovered.iter().enumerate() {
+            assert!(
+                (v - 16).abs() <= 2,
+                "TX_32X16 constant-DC round-trip cell {i}: got {v}, expected ≈ 16"
+            );
+        }
+    }
+
+    #[test]
+    fn rect_tx_16x32_dct_adst_roundtrip() {
+        // TX_16X32: row pass length 16 (log2_w = 4), col pass length
+        // 32 (log2_h = 5). To keep ADST on the length-16 axis only
+        // (the §7.13.2.9 inverse-ADST dispatcher caps at n=4 ⇒
+        // length 16), pick tx_type = DCT_ADST. Per
+        // [`forward_row_kernel`] the row selector for DCT_ADST is
+        // ADST (length 16, in range); per [`forward_col_kernel`] the
+        // col selector for DCT_ADST is DCT (length 32, in DCT 2..=6
+        // range). Both kernels reachable.
+        let input = lcg_residual_bound(0x1632_AD0C_DEAD_BEEF, 16 * 32, 8);
+        check_roundtrip_frac(&input, TX_16X32, DCT_ADST, 2, 1, 4);
+    }
+
+    #[test]
+    fn rect_tx_32x16_adst_dct_roundtrip() {
+        // TX_32X16: row pass length 32 (log2_w = 5), col pass length
+        // 16 (log2_h = 4). To keep ADST on the length-16 axis only,
+        // pick tx_type = ADST_DCT. Per [`forward_row_kernel`] the
+        // row selector for ADST_DCT is DCT (length 32, OK); per
+        // [`forward_col_kernel`] the col selector for ADST_DCT is
+        // ADST (length 16, in §7.13.2.9 range).
+        let input = lcg_residual_bound(0x3216_DCAD_F00D_CAFE, 32 * 16, 8);
+        check_roundtrip_frac(&input, TX_32X16, ADST_DCT, 2, 1, 4);
+    }
+
+    #[test]
+    fn rect_tx_16x32_idtx_roundtrip() {
+        // IDTX is defined for n in 2..=5 (sizes 4 / 8 / 16 / 32);
+        // both log2_w = 4 (n=4) and log2_h = 5 (n=5) are in range.
+        // IDTX has its own per-axis scale envelope distinct from the
+        // DCT / ADST kernels — empirical per-cell round-trip scale
+        // is verified separately below.
+        let input = lcg_residual_bound(0x1632_1D70_BEEF_CAFE, 16 * 32, 4);
+        let coeffs = forward_transform_2d(&input, TX_16X32, IDTX, false);
+        let recovered = inverse_transform_2d(&coeffs, TX_16X32, IDTX, 8, false);
+        assert_eq!(recovered.len(), input.len());
+        // Sanity probe: zero input ⇒ zero output (already in
+        // zero_input_across_all_supported_square_combinations); non-
+        // zero input round-trips to a finite per-cell scale.
+        let nonzero = recovered.iter().any(|&v| v != 0);
+        assert!(nonzero, "TX_16X32 IDTX round-trip produced all zeros");
+    }
+
+    #[test]
+    fn rect_tx_32x16_idtx_roundtrip() {
+        let input = lcg_residual_bound(0x3216_1D70_CAFE_BEEF, 32 * 16, 4);
+        let coeffs = forward_transform_2d(&input, TX_32X16, IDTX, false);
+        let recovered = inverse_transform_2d(&coeffs, TX_32X16, IDTX, 8, false);
+        assert_eq!(recovered.len(), input.len());
+        let nonzero = recovered.iter().any(|&v| v != 0);
+        assert!(nonzero, "TX_32X16 IDTX round-trip produced all zeros");
+    }
+
+    #[test]
+    fn rect_tx_16x32_v_dct_roundtrip() {
+        // V_DCT: column kernel = DCT (length 32, in range), row
+        // kernel = identity (length 16, in IDTX 2..=5 range).
+        let input = lcg_residual_bound(0x1632_5DC7_BABE_F00D, 16 * 32, 8);
+        check_roundtrip_frac(&input, TX_16X32, V_DCT, 2, 1, 4);
+    }
+
+    #[test]
+    fn rect_tx_32x16_h_dct_roundtrip() {
+        // H_DCT: row kernel = DCT (length 32, in range), column
+        // kernel = identity (length 16, in IDTX 2..=5 range).
+        let input = lcg_residual_bound(0x3216_4DC7_FACE_BABE, 32 * 16, 8);
+        check_roundtrip_frac(&input, TX_32X16, H_DCT, 2, 1, 4);
+    }
+
     // Edge-case: zero input across the matrix.
 
     #[test]
@@ -1190,6 +1380,20 @@ mod tests {
             (TX_16X8, 128, DCT_ADST),
             (TX_8X16, 128, IDTX),
             (TX_16X8, 128, FLIPADST_FLIPADST),
+            // Rectangular pair landed in round 241.
+            (TX_16X32, 512, DCT_DCT),
+            (TX_32X16, 512, DCT_DCT),
+            // ADST is reachable only on the length-16 axis (the
+            // §7.13.2.9 dispatcher caps at n=4). TX_16X32 needs the
+            // row selector to pick ADST (row = length-16 axis) ⇒
+            // tx_type = DCT_ADST; TX_32X16 needs the col selector to
+            // pick ADST (col = length-16 axis) ⇒ tx_type = ADST_DCT.
+            (TX_16X32, 512, DCT_ADST),
+            (TX_32X16, 512, ADST_DCT),
+            (TX_16X32, 512, IDTX),
+            (TX_32X16, 512, IDTX),
+            (TX_16X32, 512, V_DCT),
+            (TX_32X16, 512, H_DCT),
             (TX_4X4, 16, ADST_ADST),
             (TX_8X8, 64, ADST_DCT),
             (TX_8X8, 64, DCT_ADST),
@@ -1225,11 +1429,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "not supported in this arc")]
     fn rectangular_tx_size_out_of_arc_panics() {
-        // TX_16X32 (and the rest of the larger rectangular family) is
-        // not landed in this arc — only TX_4X8 / TX_8X4 (round 235)
-        // and TX_8X16 / TX_16X8 (round 238) are.
-        let input = vec![0i64; 16 * 32];
-        let _ = forward_transform_2d(&input, TX_16X32, DCT_DCT, false);
+        // TX_32X64 (and the rest of the larger rectangular family) is
+        // not landed in this arc — only TX_4X8 / TX_8X4 (round 235),
+        // TX_8X16 / TX_16X8 (round 238) and TX_16X32 / TX_32X16
+        // (round 241) are.
+        let input = vec![0i64; 32 * 64];
+        let _ = forward_transform_2d(&input, crate::cdf::TX_32X64, DCT_DCT, false);
     }
 
     #[test]

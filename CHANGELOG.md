@@ -4,6 +4,47 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r241 (2026-06-06): extend the rectangular TX_SIZE family
+  arc on the encoder's 2D forward-transform dispatcher
+  (`encoder::forward_transform_2d::forward_transform_2d`) by one
+  more `|log2W - log2H| == 1` pair — the short-side-16 pair
+  `TX_16X32` and `TX_32X16`. The dispatcher now accepts the five
+  square sizes plus six rectangular sizes (`TX_4X8` / `TX_8X4`
+  from r235 + `TX_8X16` / `TX_16X8` from r238 + `TX_16X32` /
+  `TX_32X16` from r241). Same composition shape — column pass
+  first (32-tall `forward_dct_32` for TX_16X32 / 16-tall
+  `forward_dct_16` for TX_32X16) followed by the row pass plus the
+  per-row encoder-mirror `Round2(T[j] * 2896, 12)` rectangular
+  post-scale. The per-axis kernel selectors extend without
+  modification: `forward_dct_dispatch` (n in 2..=6 covers both 16
+  and 32), `forward_idtx_dispatch` (n in 2..=5 covers both 16 and
+  32). ADST is only reachable on the length-16 axis (the
+  §7.13.2.9 dispatcher caps at n=4), so the §6.10.19 tx_type
+  derivation routes ADST × length-32 combinations to DCT — for
+  TX_16X32 the row selector picks ADST via tx_type = DCT_ADST
+  (row length 16 = in range); for TX_32X16 the col selector picks
+  ADST via tx_type = ADST_DCT (col length 16 = in range). The
+  empirical round-trip per-cell scale on a constant-DC probe is
+  `2 ×` input (input 8 ⇒ recovered 16): the larger N_w × N_h
+  kernel norm (`512` vs `128` for TX_8X16) gains another `4×`
+  over the short-side-8 pair while the row-shift envelope stays at
+  `Transform_Row_Shift = 1`, so the full `4×` lands in the per-cell
+  scale (`1/2 × 4 = 2`). Per §7.12.3, `dqDenom = 2` for both
+  `TX_16X32` and `TX_32X16` (the 32-axis presence on either side
+  promotes the §7.12.3 dqDenom from `1` to `2`).
+
+  +12 lib tests (1568 → 1580): 2 zero-input probes (TX_16X32 /
+  TX_32X16 ⇒ zero-out), 2 DCT_DCT pseudorandom roundtrips at the
+  empirically-derived per-cell scale `2`, 2 constant-DC probes
+  pinning the DC-dominance + a recovery bound (input 8 ⇒ recovered
+  16 within ±2 LSBs per cell), 1 DCT × ADST (TX_16X32), 1
+  ADST × DCT (TX_32X16) keeping ADST on the length-16 axis, 2
+  IDTX nonzero-roundtrip drills (IDTX scale envelope is checked
+  separately from DCT), 1 V_DCT (TX_16X32, col DCT length 32 +
+  row IDTX length 16), 1 H_DCT (TX_32X16, row DCT length 32 +
+  col IDTX length 16). The out-of-arc rectangular-panic guard is
+  updated to assert TX_32X64 panics (TX_16X32 is now in-arc).
+
 - encoder r238 (2026-06-05): extend the rectangular TX_SIZE family
   arc on the encoder's 2D forward-transform dispatcher
   (`encoder::forward_transform_2d::forward_transform_2d`) by one

@@ -2,6 +2,84 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-06 (round 241)
+
+Round 241 extends the encoder's 2D forward-transform dispatcher
+(`encoder::forward_transform_2d::forward_transform_2d`) by the
+**next `|log2W - log2H| == 1`** rectangular pair after the
+short-side-8 family landed in r238: **`TX_16X32`** and
+**`TX_32X16`** — the short-side-16 rectangular pair. The
+dispatcher now accepts the five square sizes plus six rectangular
+sizes (`TX_4X8` / `TX_8X4` / `TX_8X16` / `TX_16X8` / `TX_16X32` /
+`TX_32X16`). Each axis runs its own log-size forward kernel —
+`forward_dct_16` × `forward_dct_32` (TX_16X32) and
+`forward_dct_32` × `forward_dct_16` (TX_32X16) — followed by the
+same per-row encoder-mirror `Round2(T[j] * 2896, 12)` rectangular
+post-scale the r235 / r238 pairs use.
+
+The §7.13.3 row-shift envelope at `Transform_Row_Shift[TX_16X32] =
+Transform_Row_Shift[TX_32X16] = 1` (same as TX_8X16 / TX_16X8)
+combined with the same rectangular post-scale lands at an empirical
+per-cell round-trip scale of `2` (vs `1/2` for TX_8X16 — input `8`
+recovers `16` within ±2 LSBs per cell). The larger N_w × N_h
+kernel norm (`512` vs `128` for TX_8X16) gains another `4×` while
+the row-shift envelope stays unchanged, so the full `4×` lands in
+the per-cell scale — `1/2 × 4 = 2`.
+
+Per-axis kernel reachability: `forward_dct_dispatch` (n in 2..=6)
+covers both 16 and 32 ⇒ DCT × DCT, V_DCT, H_DCT all reach;
+`forward_idtx_dispatch` (n in 2..=5) covers both ⇒ IDTX × IDTX
+reaches. ADST is only defined for `n in 2..=4` (the §7.13.2.9
+inverse-ADST dispatcher cap), so ADST is reachable only on the
+length-16 axis. The §6.10.19 `tx_type` derivation routes:
+
+* **TX_16X32**: row axis = length 16, col axis = length 32. To
+  reach ADST on the length-16 axis, pick tx_type = `DCT_ADST` —
+  the row kernel selector picks ADST (for `DCT_ADST` row =
+  length 16, in §7.13.2.9 range), the col kernel selector picks
+  DCT (length 32, in DCT range).
+* **TX_32X16**: row axis = length 32, col axis = length 16. To
+  reach ADST on the length-16 axis, pick tx_type = `ADST_DCT` —
+  the row selector picks DCT (length 32, in DCT range), the col
+  selector picks ADST (length 16, in §7.13.2.9 range).
+
+Per §7.12.3, `dqDenom = 2` for both `TX_16X32` and `TX_32X16` —
+the 32-axis presence promotes the §7.12.3 dqDenom from `1` to `2`
+(the only rectangular shapes at this point in the arc with
+`dqDenom != 1`).
+
+### Round 241 test summary
+
+Total: 1568 → 1580 lib tests (+12). 2 zero-input probes (TX_16X32
+/ TX_32X16 ⇒ zero-out), 2 DCT × DCT pseudorandom roundtrips at the
+`2×` per-cell scale (input bound `±8` keeps the inverse pipeline's
+16-bit between-stage clamp from saturating on the length-32
+kernel), 2 constant-DC dominance + recovery probes (input `8` ⇒
+recovered `16` within ±2 LSBs per cell — DC clearly dominates the
+off-DC floor by > 10×), 1 DCT × ADST on TX_16X32 keeping ADST on
+the length-16 row axis, 1 ADST × DCT on TX_32X16 keeping ADST on
+the length-16 col axis, 2 IDTX nonzero-roundtrip drills (IDTX
+scale envelope is checked separately from DCT — the test asserts
+non-trivial recovery, not a specific scale, since the IDTX kernel's
+per-axis scalar gain differs from DCT's), 1 V_DCT (TX_16X32, col
+DCT length 32 + row IDTX length 16), 1 H_DCT (TX_32X16, row DCT
+length 32 + col IDTX length 16). The out-of-arc rectangular-panic
+guard is updated to assert `TX_32X64` panics (TX_16X32 is now
+in-arc).
+
+Out of scope (next arcs): the remaining 8 rectangular sizes —
+`TX_32X64` / `TX_64X32` (the `|log2W - log2H| == 1` chain at the
+largest kernel sizes, where `dqDenom` jumps to `4` for the
+64-axis transforms), and `TX_4X16` / `TX_16X4` / `TX_8X32` /
+`TX_32X8` / `TX_16X64` / `TX_64X16` (the `|log2W - log2H| == 2`
+family, which does NOT take the `× 2896` rectangular post-scale
+per §7.13.3 av1-spec p.305 and has its own per-tx-size shift
+envelope). Also unchanged: the rectangular sizes are still not
+selected by the encoder's pixel-driver (the dyn driver still
+hardcodes TX_4X4); a follow-up arc wires the rectangular-aware
+TX-size dispatch into the partition-tree picker and the §5.11.18
+inter mode_info path.
+
 ## Status — 2026-06-05 (round 238)
 
 Round 238 extends the encoder's 2D forward-transform dispatcher
