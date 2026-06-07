@@ -2,6 +2,105 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 255)
+
+Round 255 lands **`encoder::block_mode_info::write_segment_id`**
+— the §5.11.9 `read_segment_id()` syntax-element writer
+(av1-spec p.66). This is the shared per-block segment-id
+primitive both the §5.11.8 `intra_segment_id` and the (still
+pending) §5.11.19 `inter_segment_id` writers compose; r254's
+`write_intra_segment_id` is refactored to delegate to it.
+
+To support the writer in `O(1)` (instead of the prior O(8)
+search), round 255 also adds **`cdf::neg_interleave`** — the
+analytic inverse of `cdf::neg_deinterleave` (the §5.11.9 helper
+that maps the §8.2.6 `S()` `diff` symbol back to `segment_id`).
+`neg_interleave` mirrors `neg_deinterleave` arm-by-arm:
+
+* `pred == 0` — identity over `0..max`.
+* `pred >= max - 1` — `diff = max - segment_id - 1`.
+* `2 * pred < max` (upward-bias bidirectional fan covering
+  `segment_id ∈ 0..=2 * pred`): inside the fan, odd `diff = 2 *
+  (segment_id - pred) - 1`, even `diff = 2 * (pred - segment_id)`;
+  outside, `diff = segment_id`.
+* `2 * pred >= max` (downward-bias bidirectional fan covering
+  `segment_id ∈ (2 * pred + 1 - max)..max`): inside the fan, same
+  up/down formulas; outside, `diff = max - segment_id - 1`.
+
+The pair `(neg_interleave, neg_deinterleave)` is a bijection on
+`0..max` for every fixed `pred ∈ 0..max` — exhaustive round-trip
+tests pin both directions over the full `max ∈ 1..=8` × `pred ∈
+0..max` × `s ∈ 0..max` cube.
+
+The writer transcribes the §5.11.9 two-arm dispatch:
+
+1. `if ( skip )` arm — `segment_id = pred`, no symbol emitted.
+   Caller-bug shape `segment_id != pred` ⇒
+   `Error::PartitionWalkOutOfRange`.
+2. `else` arm — emits one §8.2.6 `S()` symbol against
+   `TileSegmentIdCdf[ ctx ]`, with `diff = neg_interleave(
+   segment_id, pred, last_active_seg_id + 1 )`. `ctx` is the
+   §8.3.2 derivation via the existing
+   [`crate::cdf::segment_id_ctx`] helper.
+
+Stateless mirror of the rest of `encoder::block_mode_info` — no
+encoder-side `SegmentIds[]` grid; the caller threads its own
+walk and supplies the §5.11.9 `pred` value pre-computed via the
+neighbour cascade. Range guards
+(`last_active_seg_id >= MAX_SEGMENTS = 8`, `segment_id >= max`,
+`pred >= max`, `ctx >= SEGMENT_ID_CONTEXTS = 3` on the `S()`
+arm) surface as `Error::PartitionWalkOutOfRange`.
+
+### Round 255 test summary
+
++13 unit tests (9 against `write_segment_id`, 4 against
+`neg_interleave`):
+
+* `write_segment_id_skip_short_circuit_writes_no_bits` —
+  `skip == 1` arm: no `S()` coded, decoder position unchanged,
+  `segment_id` reconstructed via `pred`.
+* `write_segment_id_else_branch_at_origin_round_trip` —
+  `pred = 0` fall-through at the frame origin (identity arm of
+  `neg_interleave`): writer → decoder reconstructs the same
+  `segment_id` over all 8 alphabet values via the existing
+  `decode_segment_id` reader.
+* `write_segment_id_else_branch_upward_fan_round_trip` /
+  `write_segment_id_else_branch_downward_fan_round_trip` —
+  two-block sequences that stamp the first block to `pred = 2`
+  / `pred = 5`, then exhaust `segment_id ∈ 0..8` on a second
+  block at (4, 0); covers both bidirectional-fan arms of
+  `neg_interleave` via the writer-decoder round-trip.
+* `write_segment_id_rejects_skip_arm_mismatch` /
+  `write_segment_id_rejects_segment_id_out_of_alphabet` /
+  `write_segment_id_rejects_pred_out_of_alphabet` /
+  `write_segment_id_rejects_out_of_range_last_active` /
+  `write_segment_id_rejects_out_of_range_ctx` — the five
+  range-guard rejections.
+* `neg_interleave_roundtrip_exhaustive` /
+  `neg_interleave_reverse_roundtrip_exhaustive` — exhaustive
+  bijection check over every `(s, pred, max)` triple in
+  `max ∈ 1..=8`, both directions.
+* `neg_interleave_matches_upward_branch_worked_example` /
+  `neg_interleave_matches_downward_branch_worked_example` —
+  inverse columns of the existing `decode_segment_id_*` worked
+  examples (`pred = 2` and `pred = 5` at `max = 8`).
+
+Full library test count moves to 1657 (was 1644).
+
+### Out of scope for round 255 / pending follow-ups
+
+* §5.11.19 `inter_segment_id( preSkip )` writer — the next
+  natural caller of `write_segment_id`; needs the
+  `seg_id_predicted` binary writer + the §8.3.2 `seg_pred_ctx`
+  context (the encoder-side mirror of
+  `PartitionWalker::seg_pred_ctx`).
+* §5.11.23 `inter_block_mode_info` chain (ref-frame pair,
+  inter-mode, MV writers, interintra / motion-mode / compound-type
+  + interpolation filter) — the bulk of the §5.11.18 inter cascade
+  remains decoder-only.
+* §7.10 inter-prediction primitive driver, §7.14 loop-filter,
+  §7.15 CDEF bring-up — the three near-term encoder milestones.
+
 ## Status — 2026-06-08 (round 254)
 
 Round 254 lands **`encoder::block_mode_info::write_skip_mode`** —

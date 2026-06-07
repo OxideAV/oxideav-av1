@@ -48,10 +48,10 @@
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
 use crate::cdf::{
-    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_deinterleave, TileCdfContext,
+    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_interleave, TileCdfContext,
     BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES,
-    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_SEGMENTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
-    UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_SEGMENTS, SEGMENT_ID_CONTEXTS, SKIP_CONTEXTS,
+    SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -106,6 +106,105 @@ pub fn write_skip(
     writer.write_symbol(skip as u32, cdf)
 }
 
+/// `read_segment_id()` inverse per §5.11.9 (av1-spec p.66) — the
+/// shared per-block segment-id writer the §5.11.8 `intra_segment_id`
+/// and §5.11.19 `inter_segment_id` writers both compose. Mirrors
+/// [`crate::cdf::PartitionWalker::decode_segment_id`].
+///
+/// Spec body (av1-spec p.66, §5.11.9):
+///
+/// ```text
+///   read_segment_id( ) {
+///       prev_ul = AvailU && AvailL ? PrevSegmentIds[r-1][c-1] : -1
+///       prev_u  = AvailU           ? PrevSegmentIds[r-1][c  ] : -1
+///       prev_l  = AvailL           ? PrevSegmentIds[r  ][c-1] : -1
+///       if ( prev_u == -1 ) {
+///           if ( prev_l == -1 ) pred = 0
+///           else                pred = prev_l
+///       } else if ( prev_l == -1 ) {
+///           pred = prev_u
+///       } else if ( prev_ul == prev_u ) {
+///           pred = prev_u
+///       } else {
+///           pred = prev_l
+///       }
+///       if ( skip ) {
+///           segment_id = pred
+///       } else {
+///           segment_id                                          S()
+///           segment_id = neg_deinterleave( segment_id, pred,
+///                                          LastActiveSegId + 1 )
+///       }
+///   }
+/// ```
+///
+/// The §5.11.9 `pred` derivation is the *neighbour cascade* — the
+/// caller threads it in pre-computed (the encoder owns a parallel
+/// grid walk; see the round-trip tests below for the pattern). The
+/// `last_active_seg_id` argument supplies `max = LastActiveSegId + 1`
+/// for the `neg_deinterleave` inverse.
+///
+/// Two arms; both transcribe one decoder branch each:
+///
+/// * `skip != 0` — `segment_id = pred`, no symbol emitted. Caller-bug
+///   shape: `segment_id != pred` ⇒ [`Error::PartitionWalkOutOfRange`].
+/// * `skip == 0` — emits one §8.2.6 `S()` symbol against
+///   `TileSegmentIdCdf[ ctx ]`. The on-wire `diff` is the inverse of
+///   `neg_deinterleave`, computed analytically via
+///   [`crate::cdf::neg_interleave`] (`O(1)` — no search). `ctx` is
+///   the §8.3.2 derivation from [`crate::cdf::segment_id_ctx`].
+///
+/// Range guards mirror the decoder side and surface as
+/// [`Error::PartitionWalkOutOfRange`]:
+///   * `last_active_seg_id >= MAX_SEGMENTS = 8`.
+///   * `segment_id >= max` (max = `last_active_seg_id + 1`).
+///   * `pred >= max`.
+///   * `ctx >= SEGMENT_ID_CONTEXTS = 3` on the `S()` arm.
+///
+/// Round-trip semantics: feeding the bytes this writer produces back
+/// into [`crate::cdf::PartitionWalker::decode_segment_id`] (with the
+/// matching `sub_size`/`mi_row`/`mi_col`/`skip`/`last_active_seg_id`
+/// arguments) reconstructs the same `segment_id`. The decoder's
+/// §5.11.5 grid-fill of the leaf footprint happens decoder-side; the
+/// stateless writer does not maintain an encoder grid (caller responsibility).
+pub fn write_segment_id(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    segment_id: u8,
+    skip: u8,
+    pred: u8,
+    ctx: usize,
+    last_active_seg_id: u8,
+) -> Result<(), Error> {
+    if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let max = last_active_seg_id as u32 + 1;
+    if segment_id as u32 >= max {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if pred as u32 >= max {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.9 `if ( skip ) segment_id = pred` — no bits emitted.
+    if skip != 0 {
+        if segment_id != pred {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+    // §5.11.9 `else segment_id S()` — `ctx` from §8.3.2
+    // `segment_id_ctx`.
+    if ctx >= SEGMENT_ID_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // Analytic inverse of `neg_deinterleave` via `neg_interleave`
+    // (bijection on `0..max`, O(1) — replaces the prior O(8) search).
+    let diff = neg_interleave(segment_id as u32, pred as u32, max);
+    let cdf = cdfs.segment_id_cdf(ctx);
+    writer.write_symbol(diff, cdf)
+}
+
 /// `intra_segment_id()` inverse per §5.11.8 (av1-spec p.65).
 ///
 /// Spec body:
@@ -119,22 +218,19 @@ pub fn write_skip(
 ///   }
 /// ```
 ///
-/// `read_segment_id()` then dispatches per §5.11.9:
-///   * `if ( skip )` arm — `segment_id = pred`, no bit read.
-///   * `else`        arm — `diff S()` against `TileSegmentIdCdf[ ctx ]`
-///     and `segment_id = neg_deinterleave( diff, pred, max )` with
-///     `max = LastActiveSegId + 1`.
-///
-/// The inverse of `neg_deinterleave` is found by search: for a fixed
-/// `pred` / `max`, `neg_deinterleave` is a bijection on `0..max`, so
-/// the encoder searches `diff ∈ 0..max` for the one whose forward
-/// `neg_deinterleave( diff, pred, max ) == segment_id`. Since
-/// `max = LastActiveSegId + 1 <= MAX_SEGMENTS = 8` the search is O(8).
+/// Composes [`write_segment_id`] (§5.11.9) under the
+/// `segmentation_enabled` gate. On the disabled branch no bits are
+/// emitted and `segment_id` MUST be `0`; on the enabled branch the
+/// `read_segment_id` inverse runs through its skip / non-skip
+/// dispatch.
 ///
 /// Parameters mirror [`crate::cdf::PartitionWalker::decode_intra_segment_id`]
-/// plus `pred` (the §5.11.9 neighbour-cascade value the caller already
-/// has on hand from the encoder's own grid walk) and `ctx` (the
-/// §8.3.2 `segment_id_ctx` — see [`crate::cdf::segment_id_ctx`]).
+/// plus `pred` (the §5.11.9 neighbour-cascade value the caller
+/// already has on hand from the encoder's own grid walk) and `ctx`
+/// (the §8.3.2 `segment_id_ctx` — see [`crate::cdf::segment_id_ctx`]).
+/// Lossless resolution (the spec's
+/// `Lossless = LosslessArray[ segment_id ]` step) is the caller's
+/// concern — the writer's responsibility ends at the on-wire bits.
 #[allow(clippy::too_many_arguments)]
 pub fn write_intra_segment_id(
     writer: &mut SymbolWriter,
@@ -153,39 +249,17 @@ pub fn write_intra_segment_id(
         }
         return Ok(());
     }
-    // Range guards mirroring the decoder.
-    if (last_active_seg_id as usize) >= MAX_SEGMENTS {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    let max = last_active_seg_id as u32 + 1;
-    if segment_id as u32 >= max {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    if pred as u32 >= max {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    // §5.11.9 skip-block short-circuit: `segment_id = pred`, no bits.
-    if skip != 0 {
-        if segment_id != pred {
-            return Err(Error::PartitionWalkOutOfRange);
-        }
-        return Ok(());
-    }
-    if ctx >= 3 {
-        // SEGMENT_ID_CONTEXTS = 3.
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    // Solve `neg_deinterleave( diff, pred, max ) == segment_id` for diff.
-    let mut diff_opt: Option<u32> = None;
-    for cand in 0..max {
-        if neg_deinterleave(cand, pred as u32, max) == segment_id as u32 {
-            diff_opt = Some(cand);
-            break;
-        }
-    }
-    let diff = diff_opt.ok_or(Error::PartitionWalkOutOfRange)?;
-    let cdf = cdfs.segment_id_cdf(ctx);
-    writer.write_symbol(diff, cdf)
+    // §5.11.8 enabled-branch: delegate to the §5.11.9
+    // `read_segment_id` inverse.
+    write_segment_id(
+        writer,
+        cdfs,
+        segment_id,
+        skip,
+        pred,
+        ctx,
+        last_active_seg_id,
+    )
 }
 
 /// `intra_frame_y_mode` S() inverse per §5.11.7 line 13 / §8.3.2
@@ -986,6 +1060,336 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sid, 3);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.9 read_segment_id — write_segment_id round-trips through
+    // decode_segment_id directly (the shared primitive feeding both
+    // §5.11.8 intra_segment_id and §5.11.19 inter_segment_id).
+    // -----------------------------------------------------------------
+
+    /// §5.11.9 `if ( skip )` short-circuit: no `S()` symbol coded
+    /// (the writer takes the no-op arm), and the decoder also reads
+    /// no symbol (the §5.11.9 skip branch fires before any
+    /// `read_symbol` call). At frame origin every neighbour is
+    /// missing ⇒ `pred = 0`, so the round trip lands on `segment_id
+    /// = 0`. `decoder.position()` must be unchanged across the
+    /// decode call.
+    #[test]
+    fn write_segment_id_skip_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 0,
+            /* skip = */ 1,
+            /* pred = */ 0,
+            /* ctx = */ 0,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        // `finish()` may emit a flush byte even when no `S()` was
+        // coded — the SymbolWriter's terminator-byte protocol is
+        // independent of payload. Match the existing
+        // `write_intra_segment_id_skip_short_circuit` test's pattern.
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let sid = walker
+            .decode_segment_id(
+                &mut dec,
+                &mut dec_cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                BLOCK_16X16,
+                /* skip = */ 1,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+        assert_eq!(sid, 0);
+        assert_eq!(dec.position(), pos_before, "no S() read on skip path");
+    }
+
+    /// §5.11.9 `else` arm at frame origin: `pred = 0` makes
+    /// `neg_deinterleave(diff, 0, max) == diff` (the identity), so
+    /// `segment_id = 5` encodes as `diff = 5` and the decoder
+    /// reconstructs `segment_id = 5`. Smoke that the
+    /// `neg_interleave`-based writer matches the existing
+    /// `neg_deinterleave`-based reader.
+    #[test]
+    fn write_segment_id_else_branch_at_origin_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // At origin: all neighbours absent ⇒ §8.3.2 segment_id_ctx
+        // returns 0.
+        write_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 5,
+            /* skip = */ 0,
+            /* pred = */ 0,
+            /* ctx = */ 0,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let sid = walker
+            .decode_segment_id(
+                &mut dec,
+                &mut dec_cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                BLOCK_16X16,
+                /* skip = */ 0,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+        assert_eq!(sid, 5);
+    }
+
+    /// §5.11.9 `else` arm with a non-zero `pred` — covers the upward
+    /// bidirectional fan in `neg_interleave`. Stamps the (mi_row=0,
+    /// mi_col=0) neighbour by a first encode-then-decode pair at
+    /// `segment_id = 2`, so the *second* decode at (mi_row=4,
+    /// mi_col=0) sees `prev_u = 2` ⇒ `pred = 2` by the §5.11.9
+    /// neighbour cascade (`prev_l == -1, prev_ul == -1, prev_u !=
+    /// -1` ⇒ `pred = prev_u`). The second writer call emits
+    /// `diff = neg_interleave(s, 2, 8)`; the second decoder call
+    /// reads it and reconstructs `s` via `neg_deinterleave`. Exhaust
+    /// `segment_id ∈ 0..8`.
+    #[test]
+    fn write_segment_id_else_branch_upward_fan_round_trip() {
+        for sid_in in 0..8u8 {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            // First write: stamp seg_id = 2 at (0, 0) — pred = 0 ⇒
+            // diff = 2 on the wire.
+            write_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ 2,
+                /* skip = */ 0,
+                /* pred = */ 0,
+                /* ctx = */ 0,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+            // Second write: at (4, 0) the §5.11.9 neighbour cascade
+            // matches the decoder's view: `pred = prev_u = 2`.
+            write_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ sid_in,
+                /* skip = */ 0,
+                /* pred = */ 2,
+                /* ctx = */ 0,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let sid_first = walker
+                .decode_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    /* mi_row = */ 0,
+                    /* mi_col = */ 0,
+                    BLOCK_16X16,
+                    /* skip = */ 0,
+                    /* last_active_seg_id = */ 7,
+                )
+                .unwrap();
+            assert_eq!(sid_first, 2);
+            let sid_out = walker
+                .decode_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    /* mi_row = */ 4,
+                    /* mi_col = */ 0,
+                    BLOCK_16X16,
+                    /* skip = */ 0,
+                    /* last_active_seg_id = */ 7,
+                )
+                .unwrap();
+            assert_eq!(sid_out, sid_in, "round trip failed at sid = {}", sid_in);
+        }
+    }
+
+    /// §5.11.9 `else` arm with `pred` on the downward bidirectional
+    /// fan. Mirror of the upward test with `pred = 5`. Stamps the
+    /// (0, 0) neighbour to 5 first, then exercises the second-block
+    /// round trip over the 8-symbol alphabet.
+    #[test]
+    fn write_segment_id_else_branch_downward_fan_round_trip() {
+        for sid_in in 0..8u8 {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            // First write: stamp seg_id = 5 at (0, 0); pred = 0 ⇒
+            // diff = 5 on the wire.
+            write_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ 5,
+                /* skip = */ 0,
+                /* pred = */ 0,
+                /* ctx = */ 0,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+            // Second write: at (4, 0) the §5.11.9 cascade yields
+            // `pred = prev_u = 5`.
+            write_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ sid_in,
+                /* skip = */ 0,
+                /* pred = */ 5,
+                /* ctx = */ 0,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let sid_first = walker
+                .decode_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    /* mi_row = */ 0,
+                    /* mi_col = */ 0,
+                    BLOCK_16X16,
+                    /* skip = */ 0,
+                    /* last_active_seg_id = */ 7,
+                )
+                .unwrap();
+            assert_eq!(sid_first, 5);
+            let sid_out = walker
+                .decode_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    /* mi_row = */ 4,
+                    /* mi_col = */ 0,
+                    BLOCK_16X16,
+                    /* skip = */ 0,
+                    /* last_active_seg_id = */ 7,
+                )
+                .unwrap();
+            assert_eq!(sid_out, sid_in, "round trip failed at sid = {}", sid_in);
+        }
+    }
+
+    /// §5.11.9 caller-bug shape: `skip == 1` but `segment_id != pred`
+    /// — the spec forces `segment_id = pred` in that arm, so the
+    /// encoder caller is contradicting itself. Surface as
+    /// [`Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn write_segment_id_rejects_skip_arm_mismatch() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 3,
+            /* skip = */ 1,
+            /* pred = */ 0, // mismatched: forced to equal pred under skip
+            /* ctx = */ 0,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.9 caller-bug shape: `segment_id > last_active_seg_id`
+    /// (i.e. outside `0..max`). The decoder's §5.11.9 alphabet caps
+    /// the `S()` read at `LastActiveSegId + 1`; an encoder that
+    /// presents a larger value is asking for a symbol that doesn't
+    /// exist. Surface as [`Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn write_segment_id_rejects_segment_id_out_of_alphabet() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 5,
+            /* skip = */ 0,
+            /* pred = */ 0,
+            /* ctx = */ 0,
+            /* last_active_seg_id = */ 3, // alphabet 0..=3
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.9 caller-bug shape: `pred > last_active_seg_id` — the
+    /// §5.11.9 `pred` derivation is bounded by `last_active_seg_id`
+    /// (neighbours' stored ids are ≤ `last_active_seg_id`, and the
+    /// fallback is 0), so a caller passing a larger `pred` is a
+    /// grid-walk bug.
+    #[test]
+    fn write_segment_id_rejects_pred_out_of_alphabet() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 0,
+            /* skip = */ 0,
+            /* pred = */ 5,
+            /* ctx = */ 0,
+            /* last_active_seg_id = */ 3,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.9 caller-bug shape: `last_active_seg_id >= MAX_SEGMENTS`
+    /// — §6.10.8 caps `LastActiveSegId` at `MAX_SEGMENTS - 1 = 7`.
+    #[test]
+    fn write_segment_id_rejects_out_of_range_last_active() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 0,
+            /* skip = */ 0,
+            /* pred = */ 0,
+            /* ctx = */ 0,
+            /* last_active_seg_id = */ 8,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.9 caller-bug shape: `ctx >= SEGMENT_ID_CONTEXTS = 3` on
+    /// the `S()` arm — the §8.3.2 ctx derivation lives in
+    /// `0..SEGMENT_ID_CONTEXTS`.
+    #[test]
+    fn write_segment_id_rejects_out_of_range_ctx() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 0,
+            /* skip = */ 0,
+            /* pred = */ 0,
+            /* ctx = */ 3,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 
     // -----------------------------------------------------------------

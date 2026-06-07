@@ -10921,6 +10921,93 @@ pub fn neg_deinterleave(diff: u32, r: u32, max: u32) -> u32 {
     }
 }
 
+/// Analytic inverse of [`neg_deinterleave`] — the §5.11.9 encoder-side
+/// helper that derives the `diff` symbol the §8.2.6 `S()` write must
+/// emit so that the decoder's `neg_deinterleave( diff, pred, max )`
+/// reconstructs the caller's `segment_id`.
+///
+/// `neg_deinterleave` is a bijection on `0..max` for any fixed
+/// `pred ∈ 0..max`, so this inverse is total over the same domain.
+/// Each spec arm has an algebraic inverse (no search):
+///
+/// * `pred == 0` — `neg_deinterleave` is the identity; so is this.
+/// * `pred >= max - 1` — `neg_deinterleave` is `max - diff - 1`;
+///   inverse is `diff = max - segment_id - 1`.
+/// * `2 * pred < max` ("upward-bias" arm): the bidirectional fan
+///   centred on `pred` covers `segment_id ∈ 0..=2 * pred`. Inside the
+///   fan, odd `diff` walks up (`diff = 2 * (segment_id - pred) - 1`),
+///   even `diff` walks down (`diff = 2 * (pred - segment_id)`).
+///   Outside the fan (`segment_id > 2 * pred`), `neg_deinterleave`
+///   is the identity, so `diff = segment_id`.
+/// * `2 * pred >= max` ("downward-bias" arm): the bidirectional fan
+///   covers `segment_id ∈ (2 * pred - max + 1)..max`. Inside the fan,
+///   the same up/down formulas hold. Outside the fan (`segment_id <
+///   2 * pred - max + 1`), `neg_deinterleave` is
+///   `max - (diff + 1)`, so `diff = max - segment_id - 1`.
+///
+/// All arguments are `u32`. Preconditions: `max >= 1`, `pred < max`,
+/// `segment_id < max`. The decoder-side `debug_assert!` shape carries
+/// over — these correspond to the §5.11.9 spec surrounds. Panics on
+/// `max == 0` (caller bug; `max = LastActiveSegId + 1 >= 1` always).
+///
+/// The implementation is bit-exact paired with [`neg_deinterleave`]:
+/// `neg_deinterleave( neg_interleave( s, p, m ), p, m ) == s` for
+/// every `(s, p, m)` with `s < m` and `p < m` and `m >= 1`. Exhaustive
+/// round-trip tests over `m ∈ 1..=MAX_SEGMENTS + 1 = 9` live alongside
+/// the forward tests.
+#[must_use]
+pub fn neg_interleave(segment_id: u32, pred: u32, max: u32) -> u32 {
+    debug_assert!(max >= 1, "max = LastActiveSegId + 1 >= 1");
+    debug_assert!(pred < max, "pred < max per the §5.11.9 surrounds");
+    debug_assert!(
+        segment_id < max,
+        "segment_id < max per the §5.11.9 surrounds"
+    );
+    if pred == 0 {
+        return segment_id;
+    }
+    if pred >= max - 1 {
+        return max - segment_id - 1;
+    }
+    // §5.11.9 `2 * pred < max` arm — upward-bias bidirectional fan.
+    if 2 * pred < max {
+        let fan_high = 2 * pred; // segment_ids 0..=fan_high covered by the fan
+        if segment_id <= fan_high {
+            // Inside the fan. segment_id == pred ⇒ diff == 0.
+            // segment_id > pred ⇒ odd diff = 2 * (segment_id - pred) - 1.
+            // segment_id < pred ⇒ even diff = 2 * (pred - segment_id).
+            if segment_id == pred {
+                0
+            } else if segment_id > pred {
+                2 * (segment_id - pred) - 1
+            } else {
+                2 * (pred - segment_id)
+            }
+        } else {
+            // Outside the fan: `neg_deinterleave` is the identity
+            // (`return diff`), so `diff = segment_id`.
+            segment_id
+        }
+    } else {
+        // §5.11.9 `2 * pred >= max` arm — downward-bias bidirectional fan.
+        let fan_low = 2 * pred + 1 - max; // segment_ids fan_low..max covered
+        if segment_id >= fan_low {
+            // Inside the fan, same up/down formulas as the upward arm.
+            if segment_id == pred {
+                0
+            } else if segment_id > pred {
+                2 * (segment_id - pred) - 1
+            } else {
+                2 * (pred - segment_id)
+            }
+        } else {
+            // Outside the fan: `neg_deinterleave` is `max - (diff +
+            // 1)`, so `diff = max - segment_id - 1`.
+            max - segment_id - 1
+        }
+    }
+}
+
 /// §5.11.31 `read_mv()` `MvCtx` derivation. Returns
 /// [`MV_INTRABC_CONTEXT`] when `use_intrabc == 1` and `0` otherwise;
 /// the result is the first index into every `Mv*Cdf` selector above.
@@ -40012,6 +40099,88 @@ mod tests {
         assert_eq!(neg_deinterleave(1, 0, 2), 1);
         assert_eq!(neg_deinterleave(0, 1, 2), 1);
         assert_eq!(neg_deinterleave(1, 1, 2), 0);
+    }
+
+    /// §5.11.9 encoder-side `neg_interleave` bijection check —
+    /// exhaustive round trip over every `(segment_id, pred, max)`
+    /// triple within the spec's `0..MAX_SEGMENTS + 1 = 0..9` range.
+    /// Verifies `neg_deinterleave( neg_interleave( s, p, m ), p, m )
+    /// == s` for the full input space.
+    #[test]
+    fn neg_interleave_roundtrip_exhaustive() {
+        // `MAX_SEGMENTS = 8` and `LastActiveSegId <= 7` gives `max ∈
+        // 1..=8`. Walk the full closed range to also cover
+        // single-symbol alphabets.
+        for max in 1..=8u32 {
+            for pred in 0..max {
+                for sid in 0..max {
+                    let diff = neg_interleave(sid, pred, max);
+                    assert!(diff < max, "neg_interleave produces diff < max");
+                    let back = neg_deinterleave(diff, pred, max);
+                    assert_eq!(
+                        back, sid,
+                        "round-trip failed at (sid={}, pred={}, max={}) ⇒ diff={}",
+                        sid, pred, max, diff
+                    );
+                }
+            }
+        }
+    }
+
+    /// §5.11.9 encoder-side `neg_interleave` bijection check from the
+    /// opposite direction — every `(diff, pred, max)` triple round
+    /// trips through `neg_interleave( neg_deinterleave( d, p, m ), p,
+    /// m ) == d`. Combined with the forward exhaustive test, this
+    /// pins both functions as mutual inverses on the spec domain.
+    #[test]
+    fn neg_interleave_reverse_roundtrip_exhaustive() {
+        for max in 1..=8u32 {
+            for pred in 0..max {
+                for diff in 0..max {
+                    let sid = neg_deinterleave(diff, pred, max);
+                    let back = neg_interleave(sid, pred, max);
+                    assert_eq!(
+                        back, diff,
+                        "reverse round-trip failed at (diff={}, pred={}, max={}) ⇒ sid={}",
+                        diff, pred, max, sid
+                    );
+                }
+            }
+        }
+    }
+
+    /// §5.11.9 `neg_interleave` matches the worked-example tables from
+    /// `decode_segment_id_neg_deinterleave_{upward,downward}_branch`.
+    /// Forward maps `pred = 2, max = 8`: diff 0..7 ⇒ sid 2,3,1,4,0,5,6,7.
+    /// Inverse maps must invert this column exactly.
+    #[test]
+    fn neg_interleave_matches_upward_branch_worked_example() {
+        // pred = 2, max = 8 — `2 * pred < max` arm.
+        assert_eq!(neg_interleave(2, 2, 8), 0);
+        assert_eq!(neg_interleave(3, 2, 8), 1);
+        assert_eq!(neg_interleave(1, 2, 8), 2);
+        assert_eq!(neg_interleave(4, 2, 8), 3);
+        assert_eq!(neg_interleave(0, 2, 8), 4);
+        assert_eq!(neg_interleave(5, 2, 8), 5);
+        assert_eq!(neg_interleave(6, 2, 8), 6);
+        assert_eq!(neg_interleave(7, 2, 8), 7);
+    }
+
+    /// §5.11.9 `neg_interleave` matches the worked-example tables
+    /// from `decode_segment_id_neg_deinterleave_downward_branch`.
+    /// Forward maps `pred = 5, max = 8`: diff 0..7 ⇒ sid 5,6,4,7,3,2,1,0.
+    /// Inverse maps must invert this column exactly.
+    #[test]
+    fn neg_interleave_matches_downward_branch_worked_example() {
+        // pred = 5, max = 8 — `2 * pred >= max` arm.
+        assert_eq!(neg_interleave(5, 5, 8), 0);
+        assert_eq!(neg_interleave(6, 5, 8), 1);
+        assert_eq!(neg_interleave(4, 5, 8), 2);
+        assert_eq!(neg_interleave(7, 5, 8), 3);
+        assert_eq!(neg_interleave(3, 5, 8), 4);
+        assert_eq!(neg_interleave(2, 5, 8), 5);
+        assert_eq!(neg_interleave(1, 5, 8), 6);
+        assert_eq!(neg_interleave(0, 5, 8), 7);
     }
 
     /// §5.11.9 ctx-0 selection at the frame origin (`AvailU =

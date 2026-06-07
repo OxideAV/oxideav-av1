@@ -4,6 +4,50 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r255 (2026-06-08): add
+  `encoder::block_mode_info::write_segment_id` — the §5.11.9
+  `read_segment_id()` syntax-element writer (av1-spec p.66). This
+  is the shared per-block segment-id primitive both the §5.11.8
+  `intra_segment_id` and the (pending) §5.11.19 `inter_segment_id`
+  writers compose; r254's `write_intra_segment_id` is refactored
+  to delegate to it instead of inlining the inverse search.
+
+  Companion change: add `cdf::neg_interleave` — the analytic
+  inverse of `cdf::neg_deinterleave` (the §5.11.9 helper). The
+  inverse mirrors `neg_deinterleave` arm-by-arm: identity for
+  `pred == 0`; `max - segment_id - 1` for `pred >= max - 1`; the
+  two bidirectional-fan formulas for the upward (`2 * pred < max`)
+  and downward (`2 * pred >= max`) arms, each with an in-fan vs.
+  out-of-fan branch. The pair `(neg_interleave,
+  neg_deinterleave)` is a bijection on `0..max` for every fixed
+  `pred ∈ 0..max`; exhaustive round-trip tests pin both
+  directions over the full `max ∈ 1..=8` × `pred ∈ 0..max` × `s
+  ∈ 0..max` cube. Replaces an O(8) search inside
+  `write_intra_segment_id` with an O(1) inverse.
+
+  Writer two-arm dispatch transcribes §5.11.9 directly:
+  `skip != 0` ⇒ `segment_id = pred`, no symbol emitted (caller
+  must pass `segment_id == pred`); `skip == 0` ⇒ one §8.2.6 `S()`
+  symbol against `TileSegmentIdCdf[ ctx ]`, with `diff =
+  neg_interleave(segment_id, pred, last_active_seg_id + 1)`.
+  `ctx` is the §8.3.2 derivation via the existing
+  `cdf::segment_id_ctx` helper.
+
+  Stateless mirror of the rest of `encoder::block_mode_info` — no
+  encoder-side `SegmentIds[]` grid; the caller threads its own
+  walk and supplies the §5.11.9 `pred` value pre-computed via the
+  neighbour cascade. Range guards
+  (`last_active_seg_id >= MAX_SEGMENTS = 8`, `segment_id >= max`,
+  `pred >= max`, `ctx >= SEGMENT_ID_CONTEXTS = 3` on the `S()`
+  arm) surface as `Error::PartitionWalkOutOfRange`.
+
+  +13 unit tests: 9 against `write_segment_id` (skip arm, origin
+  else arm, upward + downward fan exhaustive round-trips via
+  writer-decoder pairs, five range-guard rejections), 4 against
+  `neg_interleave` (forward + reverse exhaustive bijection
+  checks, upward + downward fan worked-example matches). Full
+  library test count moves to 1657 (was 1644).
+
 - encoder r254 (2026-06-08): add
   `encoder::block_mode_info::write_skip_mode` — the §5.11.10
   `read_skip_mode()` syntax-element writer (av1-spec p.67). Lands
