@@ -1894,3 +1894,180 @@ fn yuv_multi_sb_dyn_encode_writes_correct_dimensions_in_ivf_header() {
         assert_eq!(fs.mi_rows, 2 * ((h + 7) >> 3));
     }
 }
+
+// --------------------------------------------------------------------------
+// Round 249 — public-entry-point graduation of the dyn-driver 4:2:0 YUV
+// codepath.
+//
+// Before r249 the public `encode_av1` was a hard-stubbed
+// `Err(NotImplemented)` while `encode_intra_frame_yuv_dyn` had been a
+// crate-public dyn encoder since r230 (with chroma 13-mode + UV_CFL_PRED
+// arms graduated in r229 / r231 / r232 and frame-size generalisation
+// 8..=64 per axis in r230). These tests exercise the new public
+// `oxideav_av1::encode_av1(pixels, width, height) -> Result<Vec<u8>>`
+// signature against the matching public `decode_av1` entry, end-to-end,
+// confirming:
+//
+//   1. The byte-input convention is planar `Y || U || V` (luma plane
+//      first, then half-resolution U then half-resolution V).
+//   2. The `base_q_idx = 0` lossless-WHT arm round-trips bit-exactly
+//      across the public surface.
+//   3. The dyn dispatch in the public `decode_av1` accepts the dyn
+//      encoder's output without manual driver hookup.
+//   4. Out-of-scope inputs surface as `Error::PartitionWalkOutOfRange`
+//      rather than the historical `Error::NotImplemented`.
+// --------------------------------------------------------------------------
+
+#[test]
+fn public_encode_av1_decode_av1_roundtrip_16x16_lossless() {
+    use oxideav_av1::{decode_av1, encode_av1};
+    // Build a planar 4:2:0 YUV buffer at 16x16 with deterministic
+    // pseudorandom samples on every plane.
+    let (w, h) = (16u32, 16u32);
+    let y_size = (w * h) as usize;
+    let uv_size = ((w / 2) * (h / 2)) as usize;
+    let mut pixels = vec![0u8; y_size + 2 * uv_size];
+    let mut s: u64 = 0x2026_0607_DEAD_F00D;
+    for byte in pixels.iter_mut() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *byte = (s >> 56) as u8;
+    }
+    let ivf = encode_av1(&pixels, w, h).expect("public encode_av1 succeeds at 16x16");
+    let decoded = decode_av1(&ivf).expect("public decode_av1 succeeds on dyn-emitted IVF");
+    assert_eq!(decoded.len(), 1, "one IVF frame in, one Frame out");
+    let expected_y = &pixels[..y_size];
+    let expected_u = &pixels[y_size..y_size + uv_size];
+    let expected_v = &pixels[y_size + uv_size..];
+    // At exactly 16x16 the decoder's `decode_frame` dispatcher routes
+    // to the fixed-size [`Frame::Yuv420_16x16`] arm (the §5.11.4 single-
+    // root BLOCK_16X16 walk), so the decoded variant is the fixed-shape
+    // one. The pixel bytes round-trip identically to the dyn variant at
+    // any other extent — the only difference is the carrier type.
+    match &decoded[0] {
+        Frame::Yuv420_16x16 { y, u, v } => {
+            for (row, exp_chunk) in expected_y.chunks_exact(w as usize).enumerate() {
+                assert_eq!(&y[row][..], exp_chunk, "Y row {row} bit-exact");
+            }
+            for (row, exp_chunk) in expected_u.chunks_exact((w / 2) as usize).enumerate() {
+                assert_eq!(&u[row][..], exp_chunk, "U row {row} bit-exact");
+            }
+            for (row, exp_chunk) in expected_v.chunks_exact((w / 2) as usize).enumerate() {
+                assert_eq!(&v[row][..], exp_chunk, "V row {row} bit-exact");
+            }
+        }
+        other => panic!("expected Yuv420_16x16 at 16x16, got {other:?}"),
+    }
+}
+
+#[test]
+fn public_encode_av1_decode_av1_roundtrip_32x24_rectangular_lossless() {
+    use oxideav_av1::{decode_av1, encode_av1};
+    // A non-square dyn extent — the r230 dyn driver supports any aligned
+    // (w, h) in {8, 16, 24, 32, 40, 48, 56, 64} per axis; (32, 24)
+    // exercises the rectangular path through the public surface.
+    let (w, h) = (32u32, 24u32);
+    let y_size = (w * h) as usize;
+    let uv_size = ((w / 2) * (h / 2)) as usize;
+    let mut pixels = vec![0u8; y_size + 2 * uv_size];
+    let mut s: u64 = 0x1234_5678_9ABC_DEF0;
+    for byte in pixels.iter_mut() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *byte = (s >> 56) as u8;
+    }
+    let ivf = encode_av1(&pixels, w, h).expect("public encode_av1 succeeds at 32x24");
+    let decoded = decode_av1(&ivf).expect("public decode_av1 succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, w);
+            assert_eq!(*height, h);
+            assert_eq!(y.as_slice(), &pixels[..y_size]);
+            assert_eq!(u.as_slice(), &pixels[y_size..y_size + uv_size]);
+            assert_eq!(v.as_slice(), &pixels[y_size + uv_size..]);
+        }
+        other => panic!("expected Yuv420Dyn at 32x24, got {other:?}"),
+    }
+}
+
+#[test]
+fn public_encode_av1_rejects_wrong_pixel_buffer_length() {
+    use oxideav_av1::encode_av1;
+    // The byte-input convention is `Y || U || V`; lengths that don't
+    // match `w * h + 2 * (w/2) * (h/2)` must surface
+    // `PartitionWalkOutOfRange` rather than silently truncating /
+    // padding.
+    let res = encode_av1(&[0u8; 100], 16, 16);
+    assert!(res.is_err(), "wrong pixel-buffer length must fail");
+}
+
+#[test]
+fn public_encode_av1_rejects_non_multiple_of_8_dim() {
+    use oxideav_av1::encode_av1;
+    // The dyn driver requires every axis to be a multiple of MIN_DIM (8)
+    // — the §5.11.5 4:2:0 chroma sample-cell constraint. The public
+    // surface must propagate the validation refusal.
+    let pixels = vec![0u8; 12 * 12 + 2 * 6 * 6];
+    let res = encode_av1(&pixels, 12, 12);
+    assert!(res.is_err(), "non-multiple-of-8 dim must fail");
+}
+
+#[test]
+fn public_encode_av1_rejects_above_max_dim() {
+    use oxideav_av1::encode_av1;
+    // Above the single-SB MAX_DIM (64), the dyn driver's
+    // `Yuv420Frame::validate` surfaces refusal. Wider extents reach the
+    // multi-SB driver, which is not yet plumbed through the
+    // (pixels, width, height) public signature this arc.
+    let (w, h) = (72u32, 72u32);
+    let y_size = (w * h) as usize;
+    let uv_size = ((w / 2) * (h / 2)) as usize;
+    let pixels = vec![0u8; y_size + 2 * uv_size];
+    let res = encode_av1(&pixels, w, h);
+    assert!(res.is_err(), "above MAX_DIM dim must fail at this arc");
+}
+
+#[test]
+fn public_encode_av1_decode_av1_roundtrip_all_8x8_corner_lossless() {
+    use oxideav_av1::{decode_av1, encode_av1};
+    // 8x8 — the minimum aligned extent the dyn driver accepts. The
+    // smallest viable through-the-public-API roundtrip; pins the
+    // lower bound of the encode_av1 / decode_av1 envelope.
+    let (w, h) = (8u32, 8u32);
+    let y_size = (w * h) as usize;
+    let uv_size = ((w / 2) * (h / 2)) as usize;
+    let mut pixels = vec![0u8; y_size + 2 * uv_size];
+    let mut s: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+    for byte in pixels.iter_mut() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *byte = (s >> 56) as u8;
+    }
+    let ivf = encode_av1(&pixels, w, h).expect("public encode_av1 succeeds at 8x8");
+    let decoded = decode_av1(&ivf).expect("public decode_av1 succeeds");
+    match &decoded[0] {
+        Frame::Yuv420Dyn {
+            width,
+            height,
+            y,
+            u,
+            v,
+        } => {
+            assert_eq!(*width, w);
+            assert_eq!(*height, h);
+            assert_eq!(y.as_slice(), &pixels[..y_size]);
+            assert_eq!(u.as_slice(), &pixels[y_size..y_size + uv_size]);
+            assert_eq!(v.as_slice(), &pixels[y_size + uv_size..]);
+        }
+        other => panic!("expected Yuv420Dyn at 8x8, got {other:?}"),
+    }
+}

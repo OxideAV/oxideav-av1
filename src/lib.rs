@@ -2445,27 +2445,127 @@ impl std::error::Error for Error {}
 
 /// Decode an AV1 IVF v0 buffer into a vector of decoded [`decoder::Frame`]s.
 ///
-/// As of round 224 (arc 18) this wires together the existing decoder
-/// modules — IVF demuxer, OBU walker, sequence-header parser,
-/// frame-header parser, tile-group-OBU parser, the §5.11.4 partition
-/// tree, §5.11.5 per-leaf decoder, §5.11.39 coefficient reader, §7.12.3
-/// dequantizer, §7.13 inverse transform (lossless WHT arm), and
-/// §7.11.2.5 DC_PRED prediction — into a single pixel-out entry that
-/// inverts [`crate::encoder::encode_intra_frame_yuv`] /
-/// [`crate::encoder::encode_intra_frame_y`].
+/// Wires together the existing decoder modules — IVF demuxer, OBU
+/// walker, sequence-header parser, frame-header parser, tile-group-OBU
+/// parser, the §5.11.4 partition tree, §5.11.5 per-leaf decoder,
+/// §5.11.39 coefficient reader, §7.12.3 dequantizer, §7.13 inverse
+/// transform, and the §7.11.2 / §7.11.5.3 intra prediction set — into
+/// a single pixel-out entry that inverts the encoder pixel-driver
+/// family ([`crate::encoder::encode_intra_frame_yuv`] for the fixed
+/// 16×16 path, [`crate::encoder::encode_intra_frame_yuv_dyn`] /
+/// [`crate::encoder::encode_intra_frame_y_dyn`] /
+/// [`crate::encoder::encode_intra_frame_yuv_dyn_multi_sb`] /
+/// [`crate::encoder::encode_intra_frame_y_dyn_multi_sb`] for the
+/// dynamic-extent paths). Internally dispatches on the FrameHeader's
+/// `frame_width` / `frame_height` + the SH's `mono_chrome` flag.
 ///
-/// Arc-18 hard scope: 16×16 frame, 4:2:0 YUV (`monochrome = false`,
-/// `subsampling_x = subsampling_y = 1`), `base_q_idx = 0` (lossless
-/// WHT arm), intra-only keyframes with DC_PRED, single tile, no in-loop
-/// post-processing. Streams outside that scope return
-/// [`Error::PartitionWalkOutOfRange`].
+/// ## Accepted scope (as of round 249)
+///
+/// * **Frame extent** — `(frame_width, frame_height)` either exactly
+///   `(16, 16)` (the fixed-size [`decoder::Frame::Yuv420_16x16`]
+///   variant) or any `(w, h)` ∈ `[8, 128]` × `[8, 128]` both multiples
+///   of 8 (the [`decoder::Frame::Yuv420Dyn`] /
+///   [`decoder::Frame::YDyn`] variants). Rectangular extents
+///   independent per axis. Extents `> 64` per axis ride the §5.11.1
+///   multi-super-block grid walk; ≤ 64 per axis ride the single-root
+///   partition tree.
+/// * **Pixel format** — 4:2:0 YUV 8-bit (`subsampling_x =
+///   subsampling_y = 1`) or 8-bit monochrome
+///   (`mono_chrome = true`, `num_planes = 1`).
+/// * **Quantizer** — `base_q_idx ∈ 0..=255`. `== 0` selects the
+///   §5.9.2 `CodedLossless` arm (§7.13.2.10 inverse WHT, bit-exact
+///   roundtrip against the matching encoder); `> 0` selects the
+///   §7.13.3 inverse DCT_DCT lossy arm (encoder-decoder self-
+///   consistency: the recovered planes match the encoder's
+///   `reconstructed_*` byte-for-byte, with quantization error bounded
+///   by the §7.12.2 `dc_q_lookup` / `ac_q_lookup` tables).
+/// * **Intra mode set** — the 13-mode §3 `INTRA_MODES` set
+///   (`DC_PRED`, `V_PRED`, `H_PRED`, four D-modes
+///   {`D45_PRED`, `D135_PRED`, `D113_PRED`, `D157_PRED`, `D203_PRED`,
+///   `D67_PRED`}, `SMOOTH_PRED`, `SMOOTH_V_PRED`, `SMOOTH_H_PRED`,
+///   `PAETH_PRED`) on the luma path + the same set plus the §7.11.5.3
+///   `UV_CFL_PRED` (chroma-from-luma) arm on the HasChroma chroma
+///   path.
+/// * **Tile layout** — single tile per frame
+///   (`tile_cols_log2 = tile_rows_log2 = 0`).
+/// * **Partition + transform** — `BLOCK_4X4` leaves, `TX_4X4`,
+///   default scan, intra-only keyframes.
+/// * **In-loop / post-processing** — `loop_filter_level = 0`,
+///   `enable_cdef = 0`, `enable_restoration = 0`,
+///   `enable_superres = 0`, `apply_grain = 0` (the §7.14–§7.18.3
+///   passes are no-ops under this parameter set).
+///
+/// Streams outside that scope return
+/// [`Error::PartitionWalkOutOfRange`] (or another more-specific
+/// `Error` variant for syntax / framing violations).
 pub fn decode_av1(bytes: &[u8]) -> Result<Vec<decoder::Frame>, Error> {
     decoder::decode_av1(bytes)
 }
 
-/// Encode YUV data into an AV1 elementary stream.
-pub fn encode_av1(_pixels: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>, Error> {
-    Err(Error::NotImplemented)
+/// Encode planar 4:2:0 8-bit YUV pixels into an intra-only AV1
+/// elementary stream (IVF v0 container).
+///
+/// Round 249 graduates the dynamic-extent pixel driver
+/// ([`crate::encoder::encode_intra_frame_yuv_dyn`]) into the public
+/// entry point. The byte input is interpreted as three contiguous
+/// planes in `Y || U || V` order:
+///
+/// * `pixels[0 .. width * height]` — Y (luma) plane, row-major.
+/// * `pixels[width * height .. width * height + chroma_size]` — U
+///   (Cb) chroma plane at half horizontal + vertical resolution.
+/// * `pixels[width * height + chroma_size .. width * height +
+///   2 * chroma_size]` — V (Cr) chroma plane.
+///
+/// where `chroma_size = (width / 2) * (height / 2)`.
+///
+/// ## Accepted scope (round 249)
+///
+/// * `width`, `height` ∈ `[8, 64]` per axis, both multiples of 8.
+/// * 8-bit 4:2:0 YUV. Single-frame output (one IVF frame).
+/// * `base_q_idx = 0` — the §5.9.2 `CodedLossless` arm. The matching
+///   [`decode_av1`] invocation on the returned IVF bytes recovers
+///   the input planes byte-for-byte.
+///
+/// Wider extents (multi-super-block) + lossy quant + monochrome are
+/// reachable through the per-driver crate-public entries
+/// ([`crate::encoder::encode_intra_frame_yuv_dyn_multi_sb`],
+/// [`crate::encoder::encode_intra_frame_yuv_dyn_with_q`],
+/// [`crate::encoder::encode_intra_frame_y_dyn`], etc.); a single
+/// `(pixels, width, height)` public signature would have to multiplex
+/// pixel-format + quantizer + multi-SB through extra parameters,
+/// so they stay on the per-driver entries until the public surface
+/// grows an explicit config struct in a later arc.
+///
+/// ## Errors
+///
+/// * `pixels.len() != width * height + 2 * (width / 2) * (height / 2)`
+///   ⇒ [`Error::PartitionWalkOutOfRange`].
+/// * Dimensions out of `[8, 64]` per axis or not multiples of 8 ⇒
+///   [`Error::PartitionWalkOutOfRange`] (surfaced via
+///   `encode_intra_frame_yuv_dyn`'s `Yuv420Frame::validate`).
+/// * Internal partition-tree / coefficient writer overflow — same
+///   `Error` variants the dyn driver surfaces.
+pub fn encode_av1(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
+    use crate::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    let chroma_w = (width / 2) as usize;
+    let chroma_h = (height / 2) as usize;
+    let y_size = (width as usize) * (height as usize);
+    let uv_size = chroma_w * chroma_h;
+    let expected = y_size + 2 * uv_size;
+    if pixels.len() != expected {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let (y_bytes, rest) = pixels.split_at(y_size);
+    let (u_bytes, v_bytes) = rest.split_at(uv_size);
+    let frame = Yuv420Frame {
+        width,
+        height,
+        y: y_bytes.to_vec(),
+        u: u_bytes.to_vec(),
+        v: v_bytes.to_vec(),
+    };
+    let encoded = encode_intra_frame_yuv_dyn(&frame)?;
+    Ok(encoded.ivf_bytes)
 }
 
 /// No-op codec registration — the clean-room scaffold does not yet

@@ -4,6 +4,63 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- public-API r249 (2026-06-07): graduate the dyn-driver 4:2:0 YUV
+  intra-only codepath into the top-level public entry point. Before
+  this round, `oxideav_av1::encode_av1(pixels, width, height)` was a
+  hard-stubbed `Err(Error::NotImplemented)` while
+  `encode_intra_frame_yuv_dyn` had been a crate-public dyn encoder
+  since r230 (with the §3 13-mode intra picker on chroma graduated in
+  r229 / r231 / r232 and frame-size generalisation across `[8, 64]`
+  per axis in r230). The public `encode_av1` now interprets `pixels`
+  as the planar `Y || U || V` byte layout (Y row-major
+  `width × height`, then U + V each `(width/2) × (height/2)`) and
+  delegates to `encode_intra_frame_yuv_dyn` for any `(width, height)`
+  the dyn driver accepts (multiples of `MIN_DIM = 8`, each axis in
+  `[8, MAX_DIM] = [8, 64]`). Out-of-scope inputs surface as
+  `Error::PartitionWalkOutOfRange` rather than the historical
+  `NotImplemented`.
+
+  The matching public `decode_av1` docstring is brought up to date
+  with the actual accepted scope: the §5.5.1 dispatch in
+  `decoder::pixel_driver::decode_frame` was already routing through
+  the r230 dyn driver (`decode_frame_dyn`) for any 4:2:0 frame
+  `(w, h) != (16, 16)`, through the r235 monochrome dyn driver
+  (`decode_frame_dyn_y`) for `mono_chrome == true`, and through the
+  r207 / r214 multi-super-block grid walk for any axis `> MAX_DIM`.
+  All those codepaths — UV_CFL_PRED, frame-size generalisation past
+  16×16, partial-SB right edge, multi-SB tiling, and base_q_idx > 0
+  lossy quant — are reachable through the public surface; this round
+  documents that contract in the `decode_av1` docstring.
+
+  +6 integration tests (67 → 73 in
+  `tests/encode_decode_pixel_roundtrip.rs`):
+  `public_encode_av1_decode_av1_roundtrip_8x8_corner_lossless` (the
+  smallest aligned extent the dyn driver accepts),
+  `public_encode_av1_decode_av1_roundtrip_16x16_lossless` (the
+  fixed-size `Frame::Yuv420_16x16` arm under the dyn-encoded IVF —
+  the decoder routes back to the fixed-size path because the IVF
+  frame_width / frame_height match the fixed-size driver's scope),
+  `public_encode_av1_decode_av1_roundtrip_32x24_rectangular_lossless`
+  (a non-square dyn extent surfacing the `Frame::Yuv420Dyn` arm), and
+  three refusal probes pinning the validation propagation —
+  `public_encode_av1_rejects_wrong_pixel_buffer_length`,
+  `public_encode_av1_rejects_non_multiple_of_8_dim`,
+  `public_encode_av1_rejects_above_max_dim`.
+
+  Wider extents (multi-super-block) + lossy quant + monochrome remain
+  reachable through the per-driver crate-public entries
+  (`encoder::encode_intra_frame_yuv_dyn_multi_sb`,
+  `encoder::encode_intra_frame_yuv_dyn_with_q`,
+  `encoder::encode_intra_frame_y_dyn`, etc.); a single
+  `(pixels, width, height)` public signature would have to multiplex
+  pixel format + quantizer + multi-SB through extra parameters, so
+  they stay on the per-driver entries until the public surface grows
+  an explicit config struct in a later arc.
+
+  Wall respected: only this crate, `oxideav-core` public API, and
+  `docs/video/av1/` material were consulted. No external library
+  source, no web search.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-av1/compare/v0.1.9...v0.1.10) - 2026-06-07
 
 ### Other
