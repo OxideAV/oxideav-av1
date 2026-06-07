@@ -2,6 +2,95 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 252)
+
+Round 252 closes the **`|log2W - log2H| == 2`** rectangular arc on
+the encoder's 2D forward-transform dispatcher
+(`encoder::forward_transform_2d::forward_transform_2d`) with the
+remaining mid pair — **`TX_8X32`** and **`TX_32X8`**, the shape
+at `min(log2W, log2H) == 3` / `max(log2W, log2H) == 5`. The
+dispatcher now accepts the five square sizes, the eight
+`|log2W - log2H| == 1` pairs from r235 / r238 / r241 / r244, the
+long-side-64 endpoint from r250 (`TX_16X64` / `TX_64X16`), the
+short-side-4 endpoint from r251 (`TX_4X16` / `TX_16X4`), and the
+mid endpoint from r252 (`TX_8X32` / `TX_32X8`) — all twelve §5.11
+`TX_SIZES_ALL` rectangular shapes are now dispatcher-supported.
+
+`TX_8X32` / `TX_32X8` sit at `Tx_Size_Sqr_Up == TX_32X32`, so per
+§5.11.40 `compute_tx_type()` the `txSzSqrUp > TX_32X32 ⇒ return
+DCT_DCT` short-circuit does NOT fire (the gate is strict). But
+§5.11.48 `get_tx_set()` routes the equality
+`txSzSqrUp == TX_32X32` to either `TX_SET_DCTONLY` on the intra
+arm (whose §6.10.19 inversion table admits only `DCT_DCT`) or
+`TX_SET_INTER_3` on the inter arm (whose §6.10.19 inversion table
+`Tx_Type_Inter_Inv_Set3 = { IDTX, DCT_DCT }` admits exactly two
+ordinals). So the reachable per-shape tx_type set on this pair is
+`{DCT_DCT, IDTX}` — narrower than the r251 pair's full 16-ordinal
+matrix but wider than the r250 pair's single-ordinal pin.
+
+Per-axis kernel reachability matches the reachable tx_type set:
+both axes (`n=3` for 8-length and `n=5` for 32-length) are in
+`forward_dct_dispatch` (`n in 2..=6`) and `forward_idtx_dispatch`
+(`n in 2..=5`), so both reachable ordinals walk real per-axis
+kernel pairs. `forward_adst_dispatch` (`n in 2..=4`) is out of
+range on the length-32 axis — irrelevant because no ADST ordinal
+sits in either reachable tx-type set.
+
+Per §7.13.3 the `Round2(T[j] * 2896, 12)` rectangular row-pass
+step gates EXACTLY on `Abs(log2W - log2H) == 1`, so this pair —
+like the r250 and r251 pairs — runs the bare per-axis kernel
+composition without the rectangular `2896` factor. Per §7.12.3
+`dqDenom` falls to the default `1` arm: neither `TX_8X32` nor
+`TX_32X8` is in the `dqDenom = 2` set
+`{TX_32X32, TX_16X32, TX_32X16, TX_16X64, TX_64X16}` nor in the
+`dqDenom = 4` set `{TX_64X64, TX_32X64, TX_64X32}` per av1-spec
+p.294; `super::forward_quantize` already routes this through
+`crate::cdf::dequant_denom`.
+
+Analytic per-cell round-trip scale (no rectangular factor):
+`(N_w * N_h) / 2^(row_shift + col_shift)` = `256 / 2^(2 + 4)` =
+`4`. Empirical per-cell round-trip scale is `1` — the `4×`
+constant-DC input-mass factor documented across the rectangular
+family (analytic `4` → empirical `1`). A constant input of `4`
+recovers `4` per cell within ±1 LSB.
+
+### Round 252 test summary
+
++8 forward_transform_2d tests (86 → 94):
+
+* `rect_tx_8x32_zero_input_yields_zero` and
+  `rect_tx_32x8_zero_input_yields_zero` pin the trivial sanity
+  invariant.
+* `rect_tx_8x32_dct_dct_roundtrip` /
+  `rect_tx_32x8_dct_dct_roundtrip` walk the DCT × DCT arm
+  reachable on both intra and inter (the only ordinal in
+  `TX_SET_DCTONLY`, also in `TX_SET_INTER_3`).
+* `rect_tx_8x32_idtx_roundtrip` / `rect_tx_32x8_idtx_roundtrip`
+  walk the IDTX × IDTX arm reachable on the inter arm
+  (`TX_SET_INTER_3 = {IDTX, DCT_DCT}`); both per-axis lengths
+  sit inside `forward_idtx_dispatch`'s `n in 2..=5` range.
+* `rect_tx_8x32_dc_input_dc_only_coefficient` and
+  `rect_tx_32x8_dc_input_dc_only_coefficient` confirm DC
+  dominance and constant-DC recovery (input `4` ⇒ recovered `4`
+  within ±1 LSB per cell).
+* The matrix-walk `zero_input_across_all_supported_square_combinations`
+  gains 4 cases covering the §6.10.19-reachable tx_type set
+  (`{DCT_DCT, IDTX}`) on both shapes.
+* The pre-r252 panic guard `rectangular_tx_size_out_of_arc_panics`
+  is retired (no rectangular shape is out of arc as of r252);
+  the replacement `tx_size_above_tx_sizes_all_panics` pins the
+  remaining first-line dispatcher reject — a `tx_size` at or
+  beyond `TX_SIZES_ALL` (= 19).
+
+### Out of scope for round 252 / pending follow-ups
+
+* The forward transform dispatcher is now feature-complete across
+  §5.11 `TX_SIZES_ALL` (five square + twelve rectangular shapes).
+  Next work on the encoder's transform pipeline is per-mode
+  block-tx_type selection (§5.11.47 `transform_type()` encoder
+  mirror) and `Lossless = 1` tx_size validation on the rectangular
+  family (currently asserted at TX_4X4 only).
+
 ## Status — 2026-06-07 (round 251)
 
 Round 251 extends the **`|log2W - log2H| == 2`** rectangular arc

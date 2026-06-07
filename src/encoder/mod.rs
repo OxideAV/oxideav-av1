@@ -229,17 +229,18 @@
 //! mirror) before the plain ADST kernel runs.
 //!
 //! Next arc: pixel-driver chroma path (needs frame-header build with
-//! `monochrome = false`); the `|log2W - log2H| == 2` rectangular
-//! family (`TX_4X16` / `TX_16X4` / `TX_8X32` / `TX_32X8` / `TX_16X64`
-//! / `TX_64X16`) for [`forward_transform_2d`] — the
-//! `|log2W - log2H| == 1` family is now fully landed across r235 /
-//! r238 / r241 / r244 (`TX_4X8` / `TX_8X4` / `TX_8X16` / `TX_16X8` /
-//! `TX_16X32` / `TX_32X16` / `TX_32X64` / `TX_64X32`). Standalone
-//! `decode_av1` entry that wires the existing decoder modules into
-//! a full pipeline. §5.11.18 inter-arm `mode_info()` dispatcher;
-//! intra angle / palette encode. §5.9.7 `frame_size_with_refs()`
-//! inverse + §5.9.24 `read_global_param` signed-subexp inverse for
-//! the remaining inter-frame paths.
+//! `monochrome = false`). The `|log2W - log2H| == 1` family was
+//! landed across r235 / r238 / r241 / r244 (`TX_4X8` / `TX_8X4` /
+//! `TX_8X16` / `TX_16X8` / `TX_16X32` / `TX_32X16` / `TX_32X64` /
+//! `TX_64X32`); the `|log2W - log2H| == 2` family was landed across
+//! r250 / r251 / r252 (`TX_16X64` / `TX_64X16` / `TX_4X16` /
+//! `TX_16X4` / `TX_8X32` / `TX_32X8`) — all twelve §5.11
+//! `TX_SIZES_ALL` rectangular shapes are now dispatcher-supported.
+//! Standalone `decode_av1` entry that wires the existing decoder
+//! modules into a full pipeline. §5.11.18 inter-arm `mode_info()`
+//! dispatcher; intra angle / palette encode. §5.9.7
+//! `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
+//! signed-subexp inverse for the remaining inter-frame paths.
 
 pub mod bitwriter;
 pub mod block_mode_info;

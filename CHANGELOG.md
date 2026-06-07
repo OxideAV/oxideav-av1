@@ -4,6 +4,53 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r252 (2026-06-08): close the rectangular TX_SIZE family
+  on the encoder's 2D forward-transform dispatcher
+  (`encoder::forward_transform_2d::forward_transform_2d`) with the
+  mid pair of the `|log2W - log2H| == 2` family — `TX_8X32` and
+  `TX_32X8`, the rectangular pair at `min(log2W, log2H) == 3` /
+  `max(log2W, log2H) == 5`. Together with r235 / r238 / r241 / r244
+  (the eight `|log2W - log2H| == 1` pairs) and r250 / r251 (the
+  endpoints of the `|log2W - log2H| == 2` family), all twelve
+  §5.11 `TX_SIZES_ALL` rectangular shapes are now dispatcher-
+  supported.
+
+  Per §5.11.40 `compute_tx_type()` the gate `txSzSqrUp > TX_32X32`
+  is strict, so this pair (`Tx_Size_Sqr_Up == TX_32X32`) escapes
+  the `return DCT_DCT` short-circuit. The §5.11.48 `get_tx_set()`
+  routing on `txSzSqrUp == TX_32X32` lands intra-coded blocks on
+  `TX_SET_DCTONLY` (only `DCT_DCT`) and inter-coded blocks on
+  `TX_SET_INTER_3` whose §6.10.19 inversion table
+  `Tx_Type_Inter_Inv_Set3 = { IDTX, DCT_DCT }` admits exactly two
+  ordinals — so the reachable per-shape tx_type set is
+  `{DCT_DCT, IDTX}`. Per-axis kernel reachability matches: both
+  axes (`n=3` for length-8 and `n=5` for length-32) are inside
+  `forward_dct_dispatch n in 2..=6` and
+  `forward_idtx_dispatch n in 2..=5`, so both reachable ordinals
+  walk a real per-axis kernel pair.
+
+  Per §7.13.3 the rectangular `× 2896` row-pass step gates
+  EXACTLY on `Abs(log2W - log2H) == 1`, so this pair skips it.
+  Per §7.12.3 `dqDenom` falls to the default `1` arm — neither
+  `TX_8X32` nor `TX_32X8` is in the `dqDenom = 2` set
+  `{TX_32X32, TX_16X32, TX_32X16, TX_16X64, TX_64X16}` nor in the
+  `dqDenom = 4` set `{TX_64X64, TX_32X64, TX_64X32}` per av1-spec
+  p.294; the existing `super::forward_quantize` routing through
+  `crate::cdf::dequant_denom` already covers this.
+
+  Analytic per-cell round-trip scale (no rectangular factor):
+  `(N_w * N_h) / 2^(row_shift + col_shift)` = `256 / 2^(2 + 4)` =
+  `4`. Empirical per-cell round-trip scale is `1` — the `4×`
+  constant-DC input-mass factor documented across the rectangular
+  family (analytic `4` → empirical `1`).
+
+  Test count: +8 forward_transform_2d tests (86 → 94). The pre-r252
+  panic guard `rectangular_tx_size_out_of_arc_panics` is retired
+  (no rectangular shape is out of arc as of r252); the replacement
+  `tx_size_above_tx_sizes_all_panics` pins the remaining first-line
+  dispatcher reject — a `tx_size` at or beyond `TX_SIZES_ALL` (=
+  19).
+
 - encoder r251 (2026-06-07): extend the rectangular TX_SIZE family
   arc on the encoder's 2D forward-transform dispatcher
   (`encoder::forward_transform_2d::forward_transform_2d`) by the
