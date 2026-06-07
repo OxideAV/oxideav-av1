@@ -1858,7 +1858,13 @@ pub use uncompressed_header_tail::{
 };
 
 /// Crate-local error type.
+///
+/// `#[non_exhaustive]` so future variants (each new round-work commit
+/// can grow new failure modes as the clean-room rebuild expands) are
+/// additive — not semver-breaking — for downstream callers' `match`
+/// arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A high-level API path is still a scaffold pending the
     /// clean-room rebuild.
