@@ -2,6 +2,104 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-07 (round 251)
+
+Round 251 extends the **`|log2W - log2H| == 2`** rectangular arc
+on the encoder's 2D forward-transform dispatcher
+(`encoder::forward_transform_2d::forward_transform_2d`) by the
+short-side-4 endpoint — **`TX_4X16`** and **`TX_16X4`**, the
+shape at `min(log2W, log2H) == 2` / `max(log2W, log2H) == 4`. The
+dispatcher now accepts the five square sizes, the eight
+`|log2W - log2H| == 1` rectangular pairs from r235 / r238 / r241 /
+r244, the long-side-64 endpoint of the `|log2W - log2H| == 2`
+family from r250 (`TX_16X64` / `TX_64X16`), and the short-side-4
+endpoint of the same family from r251 (`TX_4X16` / `TX_16X4`) —
+thirteen shapes in total. Only `TX_8X32` / `TX_32X8` (the
+mid-family pair at `min_log2 == 3`) remain out of arc.
+
+Unlike the r250 pair, `TX_4X16` / `TX_16X4` sit at
+`Tx_Size_Sqr_Up == TX_16X16` (≤ `TX_32X32`), so per §5.11.40
+`compute_tx_type()` the `txSzSqrUp > TX_32X32 ⇒ return DCT_DCT`
+short-circuit does NOT fire — the full §5.11.48 / §6.10.19
+`tx_type` matrix (DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST,
+FLIPADST variants, IDTX, V_DCT / H_DCT / V_ADST / H_ADST /
+V_FLIPADST / H_FLIPADST — 16 ordinals total) is reachable on
+this pair. Per-axis kernel reachability is complete: both axes
+(`n=2` and `n=4`) are covered by `forward_dct_dispatch`
+(`n in 2..=6`), `forward_adst_dispatch` (`n in 2..=4`), and
+`forward_idtx_dispatch` (`n in 2..=5`), so every `tx_type`
+ordinal walks a real per-axis kernel pair.
+
+Per §7.13.3 the `Round2(T[j] * 2896, 12)` rectangular row-pass
+step gates EXACTLY on `Abs(log2W - log2H) == 1`, so this pair —
+like the r250 pair — runs the bare per-axis kernel composition
+without the rectangular `2896` factor. Per §7.12.3 `dqDenom`
+falls to the default `1` arm (neither `TX_4X16` nor `TX_16X4` is
+in the `dqDenom = 2` set or the `dqDenom = 4` set per av1-spec
+p.294); `super::forward_quantize` already routes this through
+`crate::cdf::dequant_denom`.
+
+Analytic per-cell round-trip scale (no rectangular factor):
+`(N_w * N_h) / 2^(row_shift + col_shift)` = `64 / 2^(1 + 4)` =
+`2`. Empirical per-cell round-trip scale is `1/2` — the `4×`
+constant-DC input-mass factor documented across the rectangular
+family (analytic `2` → empirical `1/2`). A constant input of `4`
+recovers `2` per cell within ±1 LSB.
+
+### Round 251 test summary
+
++11 forward_transform_2d tests (75 → 86):
+
+* `rect_tx_4x16_zero_input_yields_zero` and
+  `rect_tx_16x4_zero_input_yields_zero` pin the trivial sanity
+  invariant.
+* `rect_tx_4x16_dct_dct_roundtrip` /
+  `rect_tx_16x4_dct_dct_roundtrip` and the
+  `rect_tx_4x16_adst_adst_roundtrip` /
+  `rect_tx_16x4_adst_adst_roundtrip` pairs walk the DCT and ADST
+  axis kernels at full ±128 residual range (the inverse-side
+  16-bit between-stage clamp has plenty of headroom on this
+  small shape, so unlike the length-64-axis r250 pair we don't
+  need a tight ±2 envelope).
+* `rect_tx_4x16_idtx_roundtrip` and `rect_tx_16x4_idtx_roundtrip`
+  walk the IDTX × IDTX arm reachable through both axes' identity
+  kernels.
+* `rect_tx_4x16_flipadst_flipadst_roundtrip` exercises the
+  FLIPADST × FLIPADST flip composition via `check_roundtrip_flip`
+  (the encoder pre-flips both axes; the inverse pipeline emits
+  the flipped signal directly).
+* `rect_tx_16x4_v_dct_roundtrip` and
+  `rect_tx_4x16_h_adst_roundtrip` pin mixed-kernel arms
+  (DCT × IDTX and ADST × IDTX).
+* `rect_tx_4x16_dc_input_dc_only_coefficient` and
+  `rect_tx_16x4_dc_input_dc_only_coefficient` confirm DC
+  dominance and constant-DC recovery (input `4` ⇒ recovered `2`
+  within ±1 LSB per cell).
+* The matrix-walk `zero_input_across_all_supported_square_combinations`
+  gains 20 cases covering the full §6.10.19 `tx_type` ordinal
+  matrix for both new shapes — every ordinal exercises a real
+  kernel pair on this pair, in contrast to the r250 pair's
+  DCT_DCT-only walk.
+* The panic guard `rectangular_tx_size_out_of_arc_panics` is
+  re-pinned on `TX_8X32` — still in the `|log2W - log2H| == 2`
+  family but at `min_log2 = 3` / `max_log2 = 5`, outside both
+  currently-landed `|log2W - log2H| == 2` endpoints (r250
+  min_log2 = 4 / r251 min_log2 = 2). The dispatcher still rejects
+  it.
+
+### Out of scope for round 251 / pending follow-ups
+
+* The remaining two `|log2W - log2H| == 2` rectangular sizes —
+  `TX_8X32` / `TX_32X8` (`min_log2 = 3` / `max_log2 = 5`). Per
+  §5.11.40 these sit at `txSzSqrUp = TX_32X32 ≤ TX_32X32` so
+  they also reach the full §6.10.19 `tx_type` matrix; per-axis
+  reachability is tighter than the r251 pair (length-32 axis is
+  in `forward_dct_dispatch n in 2..=6` and
+  `forward_idtx_dispatch n in 2..=5` but OUT of
+  `forward_adst_dispatch n in 2..=4` — ADST on the length-32
+  axis is unreachable per §6.10.19's §5.11.48 tx-type set
+  restrictions). `dqDenom = 1` per §7.12.3.
+
 ## Status — 2026-06-07 (round 250)
 
 Round 250 opens the **`|log2W - log2H| == 2`** rectangular arc on

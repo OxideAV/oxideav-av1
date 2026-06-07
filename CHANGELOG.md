@@ -4,6 +4,72 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r251 (2026-06-07): extend the rectangular TX_SIZE family
+  arc on the encoder's 2D forward-transform dispatcher
+  (`encoder::forward_transform_2d::forward_transform_2d`) by the
+  short-side-4 endpoint of the `|log2W - log2H| == 2` family —
+  `TX_4X16` and `TX_16X4`, the rectangular pair at
+  `min(log2W, log2H) == 2` / `max(log2W, log2H) == 4`. Together
+  with the r250 long-side-64 endpoint (`TX_16X64` / `TX_64X16`)
+  this lands both endpoints of the `|log2W - log2H| == 2` family;
+  only the mid-family `TX_8X32` / `TX_32X8` pair (at `min_log2 ==
+  3`) remains.
+
+  Unlike the r250 pair, `TX_4X16` / `TX_16X4` sit at
+  `Tx_Size_Sqr_Up == TX_16X16` ≤ `TX_32X32`, so per §5.11.40
+  `compute_tx_type()` the `txSzSqrUp > TX_32X32 ⇒ return DCT_DCT`
+  short-circuit does NOT fire and the full §5.11.48 / §6.10.19
+  `tx_type` matrix is reachable (DCT_DCT, ADST_DCT, DCT_ADST,
+  ADST_ADST, FLIPADST_DCT, DCT_FLIPADST, FLIPADST_FLIPADST,
+  ADST_FLIPADST, FLIPADST_ADST, IDTX, V_DCT, H_DCT, V_ADST,
+  H_ADST, V_FLIPADST, H_FLIPADST — 16 ordinals total). Per-axis
+  kernel reachability is complete: both axes (`n=2` and `n=4`)
+  fall inside every per-axis dispatcher's range
+  (`forward_dct_dispatch n in 2..=6`, `forward_adst_dispatch n
+  in 2..=4`, `forward_idtx_dispatch n in 2..=5`).
+
+  Per §7.13.3 the `Round2(T[j] * 2896, 12)` rectangular row-pass
+  step gates EXACTLY on `Abs(log2W - log2H) == 1`, so this pair —
+  like the r250 pair — skips the rectangular post-scale. Per
+  §7.12.3 `dqDenom` falls to the default `1` arm (neither
+  `TX_4X16` nor `TX_16X4` is in the `dqDenom = 2` set or the
+  `dqDenom = 4` set per av1-spec p.294); the existing
+  `super::forward_quantize` routing through
+  `crate::cdf::dequant_denom` already covers this.
+
+  Analytic per-cell round-trip scale (no rectangular factor):
+  `(N_w * N_h) / 2^(row_shift + col_shift)` = `64 / 2^(1 + 4)` =
+  `2`. Empirical per-cell round-trip scale is `1/2` — the `4×`
+  constant-DC input-mass factor documented across the rectangular
+  family (analytic `2` → empirical `1/2`). A constant input of
+  `4` recovers `2` per cell within ±1 LSB.
+
+  +11 forward_transform_2d tests (75 → 86) plus 20 entries added
+  to the `zero_input_across_all_supported_square_combinations`
+  matrix walk (covering the full 16-ordinal §6.10.19 reachable
+  matrix on each of the two new shapes). Tests exercise the
+  DCT × DCT arm, ADST × ADST arm, IDTX × IDTX arm, FLIPADST ×
+  FLIPADST flip composition (via `check_roundtrip_flip`), mixed
+  DCT × IDTX (`V_DCT`) and ADST × IDTX (`H_ADST`) arms,
+  constant-DC dominance + recovery, and zero-input ⇒ zero-output
+  invariants. Tests use the full ±128 residual envelope — the
+  inverse-side 16-bit between-stage `Clip3` has plenty of
+  headroom on these small shapes, unlike the length-64-axis r250
+  pair's ±2 envelope. The out-of-arc panic guard is re-pinned on
+  `TX_8X32` (still in the `|log2W - log2H| == 2` family but
+  outside both currently-landed endpoints).
+
+  Spec provenance: `docs/video/av1/av1-spec.txt` §7.13.3
+  (av1-spec p.305 — the `Round2(T[j] * 2896, 12)` rectangular
+  row-pass scale fires only on `Abs(log2W - log2H) == 1`),
+  §5.11.40 `compute_tx_type()` (p.92 — `txSzSqrUp > TX_32X32 ⇒
+  return DCT_DCT` short-circuit does NOT fire on this pair),
+  §5.11.48 / §6.10.19 (p.178-180 — full reachable `tx_type`
+  matrix on `txSzSqrUp ≤ TX_32X32` shapes), §7.12.3 (p.294 —
+  `dqDenom = 1` default arm for this pair). Only this crate,
+  oxideav-core public API, and `docs/video/av1/` material were
+  consulted. No external library source, no web search.
+
 - encoder r250 (2026-06-07): extend the rectangular TX_SIZE family
   arc on the encoder's 2D forward-transform dispatcher
   (`encoder::forward_transform_2d::forward_transform_2d`) by the
