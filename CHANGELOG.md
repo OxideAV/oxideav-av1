@@ -4,6 +4,51 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r254 (2026-06-08): add
+  `encoder::block_mode_info::write_skip_mode` — the §5.11.10
+  `read_skip_mode()` syntax-element writer (av1-spec p.67). Lands
+  beside r253's `write_is_inter` (whose Arm 1 is gated by
+  `skip_mode`) and mirrors the existing decoder reader
+  [`crate::cdf::PartitionWalker::decode_skip_mode`].
+
+  The writer transcribes the §5.11.10 two-arm dispatch verbatim:
+
+  1. Short-circuit set (any-true ⇒ `skip_mode = 0`, no bits): the
+     three `seg_feature_active( SEG_LVL_SKIP / SEG_LVL_REF_FRAME /
+     SEG_LVL_GLOBALMV )` predicates (caller collapses into
+     `seg_skip_mode_off`), the §5.9.21 `skip_mode_present`
+     frame-header scalar (collapses to `!skip_mode_present`), and
+     the small-block check `Block_Width[ MiSize ] < 8 ||
+     Block_Height[ MiSize ] < 8` (derived locally from `sub_size`
+     via the §9.3 [`crate::cdf::block_width`] /
+     [`crate::cdf::block_height`] tables).
+  2. Fall-through `else`: `skip_mode` is emitted as one §8.2.6
+     `S()` symbol against `TileSkipModeCdf[ ctx ]`. `ctx` is the
+     §8.3.2 `skip_mode` context the caller pre-computes via
+     [`crate::cdf::skip_mode_ctx`] from the §5.11.5 `SkipModes[]`
+     neighbour-sum.
+
+  Stateless on purpose (mirrors `write_skip` / `write_is_inter`) —
+  does not maintain an encoder-side `SkipModes[]` grid; the caller
+  threads whatever grid state the encode-side §8.3.2 ctx derivations
+  need. Arm-precondition violations (caller-supplied `skip_mode != 0`
+  on any short-circuit arm, `ctx >= SKIP_MODE_CONTEXTS = 3` on the
+  fall-through arm, `skip_mode > 1` everywhere,
+  `sub_size >= BLOCK_SIZES = 22`) surface as
+  `Error::PartitionWalkOutOfRange`.
+
+  +15 unit tests: one per short-circuit arm (seg-active / present-
+  false / small-width / small-height / both-small-4x4) each asserting
+  the decoder bit position is unchanged across the writer → decoder
+  round-trip and the decoder recovers `skip_mode = 0`; two
+  fall-through round-trips at the frame origin for `skip_mode ∈ {0,
+  1}` with §8.3 CDF adaptation engaged; §8.3.2 ctx admissibility
+  across every `(above_sm, left_sm)` combo (4 combos × 2 = 8
+  writes); six out-of-range / arm-mismatch rejections; one
+  arm-ordering invariant pinning that any short-circuit arm fires
+  before the ctx admissibility check. Full lib test count 1629 →
+  1644.
+
 - encoder r253 (2026-06-08): add
   `encoder::block_mode_info::write_is_inter` — the §5.11.20
   `read_is_inter()` syntax-element writer (av1-spec p.71). Lands at

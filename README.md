@@ -2,6 +2,93 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 254)
+
+Round 254 lands **`encoder::block_mode_info::write_skip_mode`** —
+the §5.11.10 `read_skip_mode()` syntax-element writer (av1-spec
+p.67). Slots in beside `write_skip` (§5.11.11) and below r253's
+`write_is_inter` (whose Arm 1 is gated by `skip_mode == 1`);
+mirrors the existing decoder reader
+[`crate::cdf::PartitionWalker::decode_skip_mode`].
+
+The writer transcribes the §5.11.10 two-arm dispatch verbatim:
+
+1. **Short-circuit set** (any-true ⇒ `skip_mode = 0`, no bits
+   written): the three `seg_feature_active( SEG_LVL_SKIP /
+   SEG_LVL_REF_FRAME / SEG_LVL_GLOBALMV )` predicates (caller
+   collapses into `seg_skip_mode_off`), the §5.9.21
+   `skip_mode_present` frame-header scalar (collapses to
+   `!skip_mode_present`), and the small-block check `Block_Width[
+   MiSize ] < 8 || Block_Height[ MiSize ] < 8` (derived locally
+   from `sub_size` via the §9.3 [`crate::cdf::block_width`] /
+   [`crate::cdf::block_height`] tables, mirroring the decoder's
+   own derivation).
+2. Fall-through `else`: `skip_mode` is emitted as one §8.2.6 `S()`
+   symbol against `TileSkipModeCdf[ ctx ]`. `ctx` is the §8.3.2
+   `skip_mode` context the caller pre-computes via
+   [`crate::cdf::skip_mode_ctx`] from the §5.11.5 `SkipModes[]`
+   neighbour-sum.
+
+Like every block-mode writer through r253, `write_skip_mode` is
+stateless on purpose — it does not maintain an encoder-side
+`SkipModes[]` grid; the caller threads whatever grid state the
+encode-side §8.3.2 ctx derivation needs. Arm-precondition
+violations (caller-supplied `skip_mode != 0` on any short-circuit
+arm, `ctx >= SKIP_MODE_CONTEXTS = 3` on the fall-through arm,
+`skip_mode > 1` everywhere, `sub_size >= BLOCK_SIZES = 22`)
+surface as `Error::PartitionWalkOutOfRange`.
+
+### Round 254 test summary
+
++15 unit tests (block_mode_info module: 52 → 67):
+
+* `write_skip_mode_seg_short_circuit_writes_no_bits` /
+  `write_skip_mode_present_false_short_circuit_writes_no_bits` /
+  `write_skip_mode_small_width_short_circuit_writes_no_bits` /
+  `write_skip_mode_small_height_short_circuit_writes_no_bits` /
+  `write_skip_mode_small_4x4_short_circuit_writes_no_bits` — one
+  per short-circuit arm (collapsed seg-active, `!skip_mode_present`,
+  small-W on `BLOCK_4X8`, small-H on `BLOCK_8X4`, both-small on
+  `BLOCK_4X4`); each asserts the decoder's bit position is
+  unchanged across the writer → decoder round-trip and that the
+  decoder recovers `skip_mode = 0`.
+* `write_skip_mode_zero_else_branch_round_trip_at_origin` /
+  `write_skip_mode_one_else_branch_round_trip_at_origin` —
+  fall-through `S()` round-trip at the frame origin for both
+  `skip_mode ∈ {0, 1}` with §8.3 CDF adaptation engaged on both
+  sides; the encoder's choice of `ctx` (which CDF row it writes
+  into) MUST match the decoder's `skip_mode_ctx(0, 0) = 0`
+  derivation — any mismatch would either fail to decode or recover
+  a different value.
+* `write_skip_mode_accepts_every_8_3_2_ctx` — every `(above_sm,
+  left_sm) ∈ {0, 1} × {0, 1}` combination `skip_mode_ctx`
+  distinguishes (4 combos × 2 `skip_mode` values = 8 writes) is
+  accepted by the fall-through arm.
+* `write_skip_mode_rejects_out_of_range_skip_mode` /
+  `write_skip_mode_rejects_out_of_range_sub_size` /
+  `write_skip_mode_rejects_out_of_range_ctx_on_else_arm` /
+  `write_skip_mode_rejects_one_on_seg_arm` /
+  `write_skip_mode_rejects_one_on_present_false_arm` /
+  `write_skip_mode_rejects_one_on_small_block_arm` — the six
+  out-of-range / arm-mismatch rejections.
+* `write_skip_mode_short_circuit_skips_ctx_check` — pins the
+  arm-ordering invariant that the short-circuit set fires before
+  the fall-through ctx admissibility check, so an out-of-range ctx
+  is fine when `seg_skip_mode_off` (or any other short-circuit
+  predicate) is true.
+
+Full library test count moves to 1644 (was 1629).
+
+### Out of scope for round 254 / pending follow-ups
+
+* §5.11.23 `inter_block_mode_info` — the writers below the
+  `is_inter` gate: ref-frame pair, inter-mode (`new_mv`, `zeromv`,
+  `refmv`), MV (`mv_class`, `mv_class0_bit` + fractional bits).
+* §7.10 inter-prediction primitive driver wiring, §7.14 loop-
+  filter primitive bring-up, §7.15 CDEF primitive bring-up — the
+  three near-term encoder milestones, deferred this round to keep
+  the §5.11 mode_info delta small and spec-aligned.
+
 ## Status — 2026-06-08 (round 253)
 
 Round 253 lands **`encoder::block_mode_info::write_is_inter`** —

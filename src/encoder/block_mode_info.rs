@@ -48,9 +48,10 @@
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
 use crate::cdf::{
-    cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_deinterleave, TileCdfContext, BLOCK_SIZE_GROUPS,
-    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
-    MAX_SEGMENTS, SKIP_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_deinterleave, TileCdfContext,
+    BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES,
+    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_SEGMENTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
+    UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -499,12 +500,121 @@ pub fn write_is_inter(
     writer.write_symbol(is_inter as u32, cdf)
 }
 
+/// `read_skip_mode()` inverse per §5.11.10 (av1-spec p.67) — the
+/// per-block `skip_mode` syntax element on the §5.11.18
+/// `inter_frame_mode_info` path. Lives at the same dispatcher level
+/// as [`write_skip`] and mirrors
+/// [`crate::cdf::PartitionWalker::decode_skip_mode`]. `skip_mode`
+/// is the inter-frame "compound-reference shortcut" flag — it
+/// gates Arm 1 of [`write_is_inter`] (`skip_mode == 1` ⇒
+/// `is_inter = 1`, no symbol read).
+///
+/// Spec body (av1-spec p.67, §5.11.10):
+///
+/// ```text
+///   read_skip_mode( ) {
+///       if ( seg_feature_active( SEG_LVL_SKIP ) ||
+///            seg_feature_active( SEG_LVL_REF_FRAME ) ||
+///            seg_feature_active( SEG_LVL_GLOBALMV ) ||
+///            !skip_mode_present ||
+///            Block_Width[ MiSize ] < 8 ||
+///            Block_Height[ MiSize ] < 8 ) {
+///           skip_mode = 0
+///       } else {
+///           skip_mode                                            S()
+///       }
+///   }
+/// ```
+///
+/// The six-condition disjunction collapses, per the decoder
+/// reader's parameter surface, into:
+///
+/// * `seg_skip_mode_off` — caller-precomputed
+///   `seg_feature_active( SEG_LVL_SKIP ) ||
+///   seg_feature_active( SEG_LVL_REF_FRAME ) ||
+///   seg_feature_active( SEG_LVL_GLOBALMV )`.
+/// * `skip_mode_present` — the §5.9.21 frame-header scalar gating
+///   skip-mode for the whole frame.
+/// * `sub_size` — the §5.11.5 `MiSize` of the leaf block. The
+///   small-block short-circuit
+///   (`Block_Width[ MiSize ] < 8 || Block_Height[ MiSize ] < 8`) is
+///   derived locally via the §9.3 [`block_width`] / [`block_height`]
+///   tables, mirroring the decoder's own derivation. `sub_size`
+///   MUST be in `0..BLOCK_SIZES = 22`.
+///
+/// On the fall-through `else` arm a single §8.2.6 `S()` symbol is
+/// emitted against `TileSkipModeCdf[ ctx ]`. `ctx` is the §8.3.2
+/// `skip_mode` context (the sum of the neighbour `SkipModes[]`
+/// flags) the caller pre-computes via [`crate::cdf::skip_mode_ctx`]
+/// from the §5.11.5 `SkipModes[]` grid state. `ctx` MUST be in
+/// `0..SKIP_MODE_CONTEXTS = 3`.
+///
+/// ## Out-of-range / mismatch cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * `skip_mode > 1` — outside the §3 binary alphabet.
+/// * `sub_size >= BLOCK_SIZES` — invalid §5.11.5 `MiSize`.
+/// * any short-circuit arm fires (`seg_skip_mode_off`,
+///   `!skip_mode_present`, or `sub_size` ⇒ `Block_W < 8 ||
+///   Block_H < 8`) and `skip_mode != 0` — the spec forces
+///   `skip_mode = 0` on every short-circuit arm.
+/// * `ctx >= SKIP_MODE_CONTEXTS` on the fall-through arm — invalid
+///   §8.3.2 ctx.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// The decoder's `decode_skip_mode` stamps the resulting
+/// `skip_mode` over the block's `bh4 * bw4` footprint into
+/// `walker.skip_modes[]`. The writer is stateless (mirroring
+/// [`write_skip`] / [`write_is_inter`]) and does not maintain an
+/// encoder-side `SkipModes[]` grid; the caller threads whatever
+/// grid state the encode-side §8.3.2 ctx derivations need
+/// (typically by a parallel [`crate::cdf::PartitionWalker`] used
+/// only for its grid stamps — see the round-trip tests below).
+pub fn write_skip_mode(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    skip_mode: u8,
+    ctx: usize,
+    sub_size: usize,
+    seg_skip_mode_off: bool,
+    skip_mode_present: bool,
+) -> Result<(), Error> {
+    // §3 binary alphabet bound.
+    if skip_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.5 sub_size domain.
+    if sub_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.10 small-block short-circuit set
+    // `Block_Width[ MiSize ] < 8 || Block_Height[ MiSize ] < 8`,
+    // derived locally from sub_size via the §9.3 tables (mirrors
+    // `decode_skip_mode`'s own derivation).
+    let small_block = block_width(sub_size) < 8 || block_height(sub_size) < 8;
+    // §5.11.10 short-circuit set: any-true ⇒ skip_mode = 0, no bits.
+    if seg_skip_mode_off || !skip_mode_present || small_block {
+        if skip_mode != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+    // Fall-through `else`: `skip_mode S()` over
+    // `TileSkipModeCdf[ ctx ]`.
+    if ctx >= SKIP_MODE_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let cdf = cdfs.skip_mode_cdf(ctx);
+    writer.write_symbol(skip_mode as u32, cdf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cdf::{
-        cfl_allowed_for_uv_mode, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx,
-        PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_8X8, DC_PRED, V_PRED,
+        cfl_allowed_for_uv_mode, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx, skip_mode_ctx,
+        PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_4X8, BLOCK_8X4, BLOCK_8X8,
+        DC_PRED, V_PRED,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -1452,6 +1562,289 @@ mod tests {
             1,   // Arm 1 active
             true,
             false,
+            true,
+        )
+        .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.10 read_skip_mode — write_skip_mode round-trips through
+    // decode_skip_mode. The six-condition short-circuit set collapses
+    // (per the decoder's own parameter surface) into three encoder
+    // inputs — `seg_skip_mode_off`, `!skip_mode_present`, and a
+    // small-block check derived locally from `sub_size`. The
+    // fall-through `S()` arm gets both skip_mode = 0 and skip_mode = 1
+    // round-trips plus exhaustive §8.3.2 ctx coverage.
+    // -----------------------------------------------------------------
+
+    /// §5.11.10 `seg_skip_mode_off = true` arm — collapsed
+    /// `SEG_LVL_SKIP || SEG_LVL_REF_FRAME || SEG_LVL_GLOBALMV` —
+    /// forces `skip_mode = 0` with no bits emitted. The decoder side
+    /// (`decode_skip_mode` with `seg_skip_mode_off = true`) likewise
+    /// short-circuits without a symbol read.
+    #[test]
+    fn write_skip_mode_seg_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_skip_mode(&mut writer, &mut enc_cdfs, 0, 0, BLOCK_16X16, true, true).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        // No-symbol path — the decoder needs at least one byte to
+        // initialise the symbol decoder.
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, true, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0, "§5.11.10 seg-arm: any-active ⇒ skip_mode = 0");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no symbol bit read on the seg short-circuit arm"
+        );
+    }
+
+    /// §5.11.10 `!skip_mode_present` arm — the §5.9.21 frame-header
+    /// scalar is false ⇒ `skip_mode = 0`, no bits emitted.
+    #[test]
+    fn write_skip_mode_present_false_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_skip_mode(&mut writer, &mut enc_cdfs, 0, 0, BLOCK_16X16, false, false).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false, false)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.10 small-block short-circuit: `Block_Width[ MiSize ] < 8`
+    /// on `BLOCK_4X8` (width 4, height 8) ⇒ `skip_mode = 0`, no bits.
+    #[test]
+    fn write_skip_mode_small_width_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_skip_mode(&mut writer, &mut enc_cdfs, 0, 0, BLOCK_4X8, false, true).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_4X8, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.10 small-block short-circuit: `Block_Height[ MiSize ] < 8`
+    /// on `BLOCK_8X4` (width 8, height 4) ⇒ `skip_mode = 0`, no bits.
+    #[test]
+    fn write_skip_mode_small_height_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_skip_mode(&mut writer, &mut enc_cdfs, 0, 0, BLOCK_8X4, false, true).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_8X4, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.10 small-block short-circuit: both dimensions < 8 on
+    /// `BLOCK_4X4` ⇒ `skip_mode = 0`, no bits.
+    #[test]
+    fn write_skip_mode_small_4x4_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_skip_mode(&mut writer, &mut enc_cdfs, 0, 0, BLOCK_4X4, false, true).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_4X4, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.10 fall-through `S()` arm: `skip_mode = 0` at the frame
+    /// origin (both neighbours unavailable ⇒ §8.3.2 ctx = 0).
+    /// Round-trip through `decode_skip_mode` with §8.3 CDF adaptation
+    /// engaged on both sides.
+    #[test]
+    fn write_skip_mode_zero_else_branch_round_trip_at_origin() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = skip_mode_ctx(0, 0);
+        assert_eq!(ctx, 0, "origin neighbours unavailable ⇒ ctx = 0");
+        write_skip_mode(&mut writer, &mut enc_cdfs, 0, ctx, BLOCK_16X16, false, true).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 0);
+    }
+
+    /// §5.11.10 fall-through `S()` arm: `skip_mode = 1` at the frame
+    /// origin (same ctx). Round-trip through the decoder.
+    #[test]
+    fn write_skip_mode_one_else_branch_round_trip_at_origin() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = skip_mode_ctx(0, 0);
+        write_skip_mode(&mut writer, &mut enc_cdfs, 1, ctx, BLOCK_16X16, false, true).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let skip_mode = walker
+            .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false, true)
+            .unwrap();
+        assert_eq!(skip_mode, 1);
+    }
+
+    /// §8.3.2 `skip_mode` ctx is the neighbour-`SkipModes[]` sum, in
+    /// `0..SKIP_MODE_CONTEXTS = 3`. Walk every `(above_sm, left_sm)`
+    /// combination (`{0,1} × {0,1}` plus the `(1,1)` upper-bound case)
+    /// and confirm the writer accepts each ctx for both `skip_mode ∈
+    /// {0, 1}` on the fall-through arm.
+    #[test]
+    fn write_skip_mode_accepts_every_8_3_2_ctx() {
+        let cases: &[(u8, u8)] = &[(0, 0), (0, 1), (1, 0), (1, 1)];
+        for &(above, left) in cases {
+            let ctx = skip_mode_ctx(above, left);
+            assert!(ctx < SKIP_MODE_CONTEXTS);
+            for skip_mode_val in [0u8, 1u8] {
+                let mut cdfs = TileCdfContext::new_from_defaults();
+                let mut writer = SymbolWriter::new(false);
+                write_skip_mode(
+                    &mut writer,
+                    &mut cdfs,
+                    skip_mode_val,
+                    ctx,
+                    BLOCK_16X16,
+                    false,
+                    true,
+                )
+                .expect("§8.3.2 ctx admissible on the fall-through arm");
+                let _bytes = writer.finish();
+            }
+        }
+    }
+
+    /// `skip_mode > 1` is outside the §3 binary alphabet — caller bug.
+    #[test]
+    fn write_skip_mode_rejects_out_of_range_skip_mode() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err =
+            write_skip_mode(&mut writer, &mut cdfs, 2, 0, BLOCK_16X16, false, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `sub_size >= BLOCK_SIZES` is outside the §5.11.5 `MiSize`
+    /// domain — caller bug.
+    #[test]
+    fn write_skip_mode_rejects_out_of_range_sub_size() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err =
+            write_skip_mode(&mut writer, &mut cdfs, 0, 0, BLOCK_SIZES, false, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.10 short-circuit arm: caller-supplied `skip_mode != 0` on
+    /// any short-circuit arm is a caller bug — the spec forces
+    /// `skip_mode = 0`.
+    #[test]
+    fn write_skip_mode_rejects_one_on_seg_arm() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_skip_mode(&mut writer, &mut cdfs, 1, 0, BLOCK_16X16, true, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.10 short-circuit arm: caller-supplied `skip_mode != 0` on
+    /// the `!skip_mode_present` arm is a caller bug.
+    #[test]
+    fn write_skip_mode_rejects_one_on_present_false_arm() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_skip_mode(&mut writer, &mut cdfs, 1, 0, BLOCK_16X16, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.10 short-circuit arm: caller-supplied `skip_mode != 0` on
+    /// the small-block (Block_W < 8 || Block_H < 8) arm is a caller
+    /// bug.
+    #[test]
+    fn write_skip_mode_rejects_one_on_small_block_arm() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_skip_mode(&mut writer, &mut cdfs, 1, 0, BLOCK_4X4, false, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.10 fall-through arm: `ctx >= SKIP_MODE_CONTEXTS = 3` is
+    /// an invalid §8.3.2 ctx — caller bug.
+    #[test]
+    fn write_skip_mode_rejects_out_of_range_ctx_on_else_arm() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_skip_mode(
+            &mut writer,
+            &mut cdfs,
+            0,
+            SKIP_MODE_CONTEXTS,
+            BLOCK_16X16,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.10 arm-ordering invariant: when any short-circuit arm
+    /// fires (`seg_skip_mode_off`, `!skip_mode_present`, or
+    /// small-block), the `ctx` parameter is NOT consulted. So an
+    /// out-of-range ctx is fine on a short-circuit arm.
+    #[test]
+    fn write_skip_mode_short_circuit_skips_ctx_check() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        // out-of-range ctx, but seg-arm fires first ⇒ no error.
+        write_skip_mode(
+            &mut writer,
+            &mut cdfs,
+            0,
+            999, // would normally reject if fall-through reached
+            BLOCK_16X16,
+            true, // seg arm active
             true,
         )
         .unwrap();
