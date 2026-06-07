@@ -2,9 +2,97 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 253)
+
+Round 253 lands **`encoder::block_mode_info::write_is_inter`** —
+the §5.11.20 `read_is_inter()` syntax-element writer (av1-spec
+p.71). This is the first **inter-arm** scalar the encoder side can
+emit; everything in `encoder::block_mode_info` up through r252
+covered the §5.11.18 intra arm only (`skip`, `intra_segment_id`,
+`intra_frame_y_mode`, `y_mode`, `uv_mode`, `cfl_alphas`). With
+r253 the same module reaches the §5.11.18 `inter_frame_mode_info`
+pre-dispatch step — the writer mirrors the existing decoder reader
+[`crate::cdf::PartitionWalker::decode_is_inter`].
+
+The writer transcribes the §5.11.20 four-arm dispatch verbatim:
+
+1. `if ( skip_mode )` ⇒ `is_inter = 1`, no bits written.
+2. `else if ( seg_feature_active( SEG_LVL_REF_FRAME ) )` ⇒
+   `is_inter = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME`,
+   no bits written (caller pre-computes the `!= INTRA_FRAME`
+   comparison as `seg_ref_frame_is_inter`).
+3. `else if ( seg_feature_active( SEG_LVL_GLOBALMV ) )` ⇒
+   `is_inter = 1`, no bits written.
+4. Fall-through `else`: `is_inter` is emitted as one §8.2.6 `S()`
+   symbol against `TileIsInterCdf[ ctx ]`. `ctx` is the §8.3.2
+   `is_inter` context the caller pre-computes via
+   [`crate::cdf::is_inter_ctx`] from the neighbour
+   `LeftIntra` / `AboveIntra` predicates (or `None` for an
+   unavailable neighbour per §5.11.18).
+
+Like the r211 intra writers, `write_is_inter` is stateless on
+purpose — it does not maintain an encoder-side `IsInters[]` grid;
+the caller threads whatever grid state the §8.3.2 ctx derivation
+needs. Arm-precondition violations (caller-supplied `is_inter`
+disagreeing with the spec-derived value on Arms 1 / 2 / 3,
+`ctx >= IS_INTER_CONTEXTS = 4` on Arm 4, `is_inter > 1`
+everywhere) surface as `Error::PartitionWalkOutOfRange`.
+
+### Round 253 test summary
+
++14 unit tests (block_mode_info module: 38 → 52):
+
+* `write_is_inter_skip_mode_short_circuit_writes_no_bits` /
+  `write_is_inter_seg_ref_frame_intra_routes_to_zero_no_bits` /
+  `write_is_inter_seg_ref_frame_inter_routes_to_one_no_bits` /
+  `write_is_inter_seg_globalmv_short_circuit_writes_no_bits` — one
+  per short-circuit arm; each asserts the decoder's bit position
+  is unchanged across the writer → decoder round-trip and that the
+  decoder recovers the spec-forced `is_inter` value.
+* `write_is_inter_zero_else_branch_round_trip_at_origin` /
+  `write_is_inter_one_else_branch_round_trip_at_origin` — Arm 4
+  `S()` round-trip at the frame origin for both `is_inter ∈ {0,
+  1}` with §8.3 CDF adaptation engaged on both sides; the
+  encoder's choice of `ctx` (which CDF row it writes into) MUST
+  match the decoder's `is_inter_ctx(None, None) = 0` derivation.
+* `write_is_inter_else_branch_round_trip_at_origin_both_is_inter_values`
+  — the value-product walk consolidating both round-trips with an
+  explicit `ctx == 0` assertion.
+* `write_is_inter_accepts_every_8_3_2_ctx` — every
+  `(above_intra, left_intra)` combination [`is_inter_ctx`]
+  distinguishes (9 combos × 2 `is_inter` values = 18 writes) is
+  accepted by the fall-through arm.
+* `write_is_inter_rejects_out_of_range_is_inter` /
+  `write_is_inter_rejects_out_of_range_ctx_on_else_arm` /
+  `write_is_inter_rejects_zero_on_skip_mode_arm` /
+  `write_is_inter_rejects_arm2_mismatch` /
+  `write_is_inter_rejects_zero_on_globalmv_arm` — the five
+  out-of-range / arm-mismatch rejections.
+* `write_is_inter_arm1_skips_later_arm_checks` — pins the
+  arm-ordering invariant that Arm 1 short-circuits before Arms 2 /
+  3 / 4 are consulted, so an out-of-range Arm 4 ctx is fine when
+  `skip_mode == 1`.
+
+Full library test count moves to 1629 (was 1615).
+
+### Out of scope for round 253 / pending follow-ups
+
+* §5.11.23 `inter_block_mode_info` — the writers below the
+  `is_inter` gate: ref-frame pair, inter-mode (`new_mv`,
+  `zeromv`, `refmv`), MV (`mv_class`, `mv_class0_bit` +
+  fractional bits).
+* The §5.11.10 `skip_mode` syntax-element writer (which gates Arm
+  1 of `read_is_inter`) — a 1-bit `S()` against
+  `TileSkipModeCdf[ ctx ]`; would slot in beside `write_skip`.
+* §7.10 inter-prediction primitive driver wiring, §7.14 loop-
+  filter primitive bring-up, §7.15 CDEF primitive bring-up — the
+  three other candidate near-term encoder milestones, deferred
+  this round to keep the §5.11 mode_info delta small and
+  spec-aligned.
+
 ## Status — 2026-06-08 (round 252)
 
-Round 252 closes the **`|log2W - log2H| == 2`** rectangular arc on
+Round 252 closed the **`|log2W - log2H| == 2`** rectangular arc on
 the encoder's 2D forward-transform dispatcher
 (`encoder::forward_transform_2d::forward_transform_2d`) with the
 remaining mid pair — **`TX_8X32`** and **`TX_32X8`**, the shape

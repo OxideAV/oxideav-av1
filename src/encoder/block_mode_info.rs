@@ -49,8 +49,8 @@
 
 use crate::cdf::{
     cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_deinterleave, TileCdfContext, BLOCK_SIZE_GROUPS,
-    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES, INTRA_MODE_CONTEXTS, MAX_SEGMENTS,
-    SKIP_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
+    MAX_SEGMENTS, SKIP_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -385,12 +385,126 @@ pub fn write_cfl_alphas(
     Ok(())
 }
 
+/// `read_is_inter()` inverse per §5.11.20 (av1-spec p.71) — the
+/// per-block `is_inter` syntax element on the §5.11.18
+/// `inter_frame_mode_info` path. Lives at the same dispatcher level
+/// as [`write_skip`] / [`write_intra_segment_id`] and mirrors
+/// [`crate::cdf::PartitionWalker::decode_is_inter`].
+///
+/// Spec body (av1-spec p.71, §5.11.20):
+///
+/// ```text
+///   read_is_inter( ) {
+///       if ( skip_mode ) {
+///           is_inter = 1
+///       } else if ( seg_feature_active( SEG_LVL_REF_FRAME ) ) {
+///           is_inter = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME
+///       } else if ( seg_feature_active( SEG_LVL_GLOBALMV ) ) {
+///           is_inter = 1
+///       } else {
+///           is_inter                                            S()
+///       }
+///   }
+/// ```
+///
+/// The four-arm `if / else if / else if / else` chain is short-circuit
+/// on the first match, exactly mirroring the decoder. Only the
+/// fall-through `else` arm emits an `S()` symbol; the other three arms
+/// write zero bits and demand that the caller-supplied `is_inter`
+/// matches the spec-derived value.
+///
+/// ## Parameter surface
+///
+/// Mirrors [`crate::cdf::PartitionWalker::decode_is_inter`]:
+///
+/// * `skip_mode` — per-block §5.11.10 `SkipModes[r][c]` flag (0 or 1).
+/// * `seg_ref_frame_active` — caller-precomputed
+///   `seg_feature_active( SEG_LVL_REF_FRAME )` per §6.4.2.
+/// * `seg_ref_frame_is_inter` — caller-precomputed
+///   `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME`.
+///   Only consulted on the `seg_ref_frame_active == true` arm.
+/// * `seg_globalmv_active` — caller-precomputed
+///   `seg_feature_active( SEG_LVL_GLOBALMV )`. Only consulted on the
+///   `else if` arm after the SEG_LVL_REF_FRAME gate.
+/// * `ctx` — the §8.3.2 `is_inter` context computed via
+///   [`crate::cdf::is_inter_ctx`] from the neighbour
+///   `LeftIntra` / `AboveIntra` predicates (or `None` for an
+///   unavailable neighbour per §5.11.18). MUST be in
+///   `0..IS_INTER_CONTEXTS = 4`. Only consulted on the fall-through
+///   `else` arm.
+///
+/// ## Out-of-range / mismatch cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * `is_inter > 1` — outside the §3 `IsInter` binary alphabet.
+/// * `skip_mode == 1` and `is_inter != 1` — Arm 1 forces `is_inter = 1`.
+/// * `seg_ref_frame_active == true` and
+///   `is_inter != seg_ref_frame_is_inter as u8` — Arm 2 forces the
+///   spec-derived value.
+/// * `seg_globalmv_active == true` (with the two above false) and
+///   `is_inter != 1` — Arm 3 forces `is_inter = 1`.
+/// * `ctx >= IS_INTER_CONTEXTS` on the fall-through arm — invalid
+///   §8.3.2 ctx.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// The decoder's `decode_is_inter` stamps the resulting `is_inter`
+/// over the block's `bh4 * bw4` footprint into `walker.is_inters[]`.
+/// The writer is stateless (mirroring [`write_skip`]) and does not
+/// maintain an encoder-side `IsInters[]` grid; the caller threads
+/// whatever grid state the encode-side §8.3.2 ctx derivations need
+/// (typically by a parallel [`crate::cdf::PartitionWalker`] used only
+/// for its grid stamps — see the round-trip tests below).
+#[allow(clippy::too_many_arguments)]
+pub fn write_is_inter(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    is_inter: u8,
+    ctx: usize,
+    skip_mode: u8,
+    seg_ref_frame_active: bool,
+    seg_ref_frame_is_inter: bool,
+    seg_globalmv_active: bool,
+) -> Result<(), Error> {
+    // §3 binary alphabet bound.
+    if is_inter > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // Arm 1: `if ( skip_mode ) is_inter = 1` — no bits.
+    if skip_mode != 0 {
+        if is_inter != 1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+    // Arm 2: SEG_LVL_REF_FRAME ⇒ is_inter = FeatureData != INTRA_FRAME, no bits.
+    if seg_ref_frame_active {
+        let expected = seg_ref_frame_is_inter as u8;
+        if is_inter != expected {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+    // Arm 3: SEG_LVL_GLOBALMV ⇒ is_inter = 1, no bits.
+    if seg_globalmv_active {
+        if is_inter != 1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+    // Arm 4 (fall-through): `is_inter S()` over `TileIsInterCdf[ ctx ]`.
+    if ctx >= IS_INTER_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let cdf = cdfs.is_inter_cdf(ctx);
+    writer.write_symbol(is_inter as u32, cdf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cdf::{
-        cfl_allowed_for_uv_mode, intra_mode_ctx, size_group, skip_ctx, PartitionWalker,
-        TileGeometry, BLOCK_16X16, BLOCK_8X8, DC_PRED, V_PRED,
+        cfl_allowed_for_uv_mode, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx,
+        PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_8X8, DC_PRED, V_PRED,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -966,5 +1080,380 @@ mod tests {
         let mut writer = SymbolWriter::new(false);
         let err = write_cfl_alphas(&mut writer, &mut cdfs, 17, 1).unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.20 read_is_inter — write_is_inter round-trips through
+    // decode_is_inter. Each arm of the four-arm dispatch gets a test;
+    // the fall-through `S()` arm gets both is_inter = 0 and is_inter = 1
+    // round-trips plus the §8.3.2 ctx coverage.
+    // -----------------------------------------------------------------
+
+    /// §5.11.20 Arm 1: `skip_mode == 1` ⇒ `is_inter = 1`, no bits
+    /// written. Mirrors `decode_is_inter_skip_mode_short_circuit_no_symbol_read`.
+    #[test]
+    fn write_is_inter_skip_mode_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_is_inter(&mut writer, &mut enc_cdfs, 1, 0, 1, false, false, false).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        // No-symbol path — the decoder needs *some* buffer; a single
+        // byte is enough. `init_symbol` requires `sz >= 1`.
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                1,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1, "§5.11.20 Arm 1: skip_mode = 1 ⇒ is_inter = 1");
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no symbol bit read on the skip_mode arm"
+        );
+    }
+
+    /// §5.11.20 Arm 2 (intra-routing branch): SEG_LVL_REF_FRAME
+    /// active and FeatureData == INTRA_FRAME (caller encodes as
+    /// `seg_ref_frame_is_inter = false`) ⇒ `is_inter = 0`, no bits.
+    #[test]
+    fn write_is_inter_seg_ref_frame_intra_routes_to_zero_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_is_inter(&mut writer, &mut enc_cdfs, 0, 0, 0, true, false, false).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            is_inter, 0,
+            "Arm 2: FeatureData == INTRA_FRAME ⇒ is_inter = 0"
+        );
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.20 Arm 2 (inter-routing branch): SEG_LVL_REF_FRAME
+    /// active and FeatureData != INTRA_FRAME (caller encodes as
+    /// `seg_ref_frame_is_inter = true`) ⇒ `is_inter = 1`, no bits.
+    #[test]
+    fn write_is_inter_seg_ref_frame_inter_routes_to_one_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_is_inter(&mut writer, &mut enc_cdfs, 1, 0, 0, true, true, false).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            is_inter, 1,
+            "Arm 2: FeatureData != INTRA_FRAME ⇒ is_inter = 1"
+        );
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.20 Arm 3: SEG_LVL_GLOBALMV active (with Arms 1 / 2 false)
+    /// ⇒ `is_inter = 1`, no bits.
+    #[test]
+    fn write_is_inter_seg_globalmv_short_circuit_writes_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_is_inter(&mut writer, &mut enc_cdfs, 1, 0, 0, false, false, true).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let pos_before = dec.position();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1, "Arm 3: SEG_LVL_GLOBALMV ⇒ is_inter = 1");
+        assert_eq!(dec.position(), pos_before);
+    }
+
+    /// §5.11.20 Arm 4 (fall-through `S()`): all three short-circuit
+    /// arms false, `is_inter = 0` at the frame origin. The §8.3.2 ctx
+    /// at `(mi_row = 0, mi_col = 0)` is `is_inter_ctx(None, None) = 0`
+    /// (both neighbours unavailable). Round-trip through `decode_is_inter`
+    /// with the §8.3 CDF adaptation engaged on both sides.
+    #[test]
+    fn write_is_inter_zero_else_branch_round_trip_at_origin() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = is_inter_ctx(None, None);
+        write_is_inter(&mut writer, &mut enc_cdfs, 0, ctx, 0, false, false, false).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 0);
+    }
+
+    /// §5.11.20 Arm 4: `is_inter = 1` at the frame origin (same ctx as
+    /// above). Round-trip through the decoder.
+    #[test]
+    fn write_is_inter_one_else_branch_round_trip_at_origin() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = is_inter_ctx(None, None);
+        write_is_inter(&mut writer, &mut enc_cdfs, 1, ctx, 0, false, false, false).unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(is_inter, 1);
+    }
+
+    /// §5.11.20 Arm 4 §8.3.2 ctx coverage at frame origin: walk every
+    /// `(above_intra, left_intra)` combination [`is_inter_ctx`]
+    /// distinguishes for `(None, None)` — i.e. both unavailable at the
+    /// origin — and round-trip both `is_inter = 0` and `is_inter = 1`
+    /// through the decoder. CDF adaptation engaged on both sides so
+    /// the encoder's choice of `ctx` (which CDF row it writes into)
+    /// MUST match the decoder's `is_inter_ctx(None, None) = 0` ctx
+    /// derivation: any mismatch would either fail to decode (different
+    /// row → different probability mass than the encoder used) or
+    /// produce a different `is_inter` value than written.
+    #[test]
+    fn write_is_inter_else_branch_round_trip_at_origin_both_is_inter_values() {
+        for is_inter_val in [0u8, 1u8] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let ctx = is_inter_ctx(None, None);
+            assert_eq!(ctx, 0, "origin neighbours unavailable ⇒ ctx = 0");
+            assert!(ctx < IS_INTER_CONTEXTS);
+            write_is_inter(
+                &mut writer,
+                &mut enc_cdfs,
+                is_inter_val,
+                ctx,
+                0,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let decoded = walker
+                .decode_is_inter(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    0,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(decoded, is_inter_val);
+        }
+    }
+
+    /// §8.3.2 ctx exhaustive coverage: every
+    /// `(above_intra, left_intra)` combination [`is_inter_ctx`]
+    /// recognises stays in `0..IS_INTER_CONTEXTS`, so any of them is
+    /// an admissible `ctx` input to [`write_is_inter`] on the Arm 4
+    /// fall-through path. The smoke test confirms write_is_inter
+    /// accepts every ctx without erroring.
+    #[test]
+    fn write_is_inter_accepts_every_8_3_2_ctx() {
+        let cases: &[(Option<bool>, Option<bool>)] = &[
+            (None, None),
+            (Some(true), None),
+            (Some(false), None),
+            (None, Some(true)),
+            (None, Some(false)),
+            (Some(true), Some(true)),
+            (Some(true), Some(false)),
+            (Some(false), Some(true)),
+            (Some(false), Some(false)),
+        ];
+        for &(above, left) in cases {
+            let ctx = is_inter_ctx(above, left);
+            assert!(ctx < IS_INTER_CONTEXTS);
+            for is_inter_val in [0u8, 1u8] {
+                let mut cdfs = TileCdfContext::new_from_defaults();
+                let mut writer = SymbolWriter::new(false);
+                write_is_inter(
+                    &mut writer,
+                    &mut cdfs,
+                    is_inter_val,
+                    ctx,
+                    0,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("§8.3.2 ctx admissible on Arm 4");
+                let _bytes = writer.finish();
+            }
+        }
+    }
+
+    /// `is_inter > 1` is outside the §3 binary alphabet — caller bug.
+    #[test]
+    fn write_is_inter_rejects_out_of_range_is_inter() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_is_inter(&mut writer, &mut cdfs, 2, 0, 0, false, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.20 Arm 1: caller-supplied `is_inter != 1` on the skip_mode
+    /// arm is a caller bug — the spec forces `is_inter = 1`.
+    #[test]
+    fn write_is_inter_rejects_zero_on_skip_mode_arm() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_is_inter(&mut writer, &mut cdfs, 0, 0, 1, false, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.20 Arm 2: caller-supplied `is_inter` must equal
+    /// `seg_ref_frame_is_inter as u8` — mismatch is a caller bug.
+    #[test]
+    fn write_is_inter_rejects_arm2_mismatch() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        // SEG_LVL_REF_FRAME active, FeatureData == INTRA_FRAME (encoded
+        // as `seg_ref_frame_is_inter = false`) — caller MUST pass
+        // is_inter = 0; passing 1 is a bug.
+        let err = write_is_inter(&mut writer, &mut cdfs, 1, 0, 0, true, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.20 Arm 3: caller-supplied `is_inter != 1` on the
+    /// SEG_LVL_GLOBALMV arm is a caller bug — the spec forces 1.
+    #[test]
+    fn write_is_inter_rejects_zero_on_globalmv_arm() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_is_inter(&mut writer, &mut cdfs, 0, 0, 0, false, false, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.20 Arm 4: `ctx >= IS_INTER_CONTEXTS = 4` on the
+    /// fall-through arm is an invalid §8.3.2 ctx — caller bug.
+    #[test]
+    fn write_is_inter_rejects_out_of_range_ctx_on_else_arm() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_is_inter(
+            &mut writer,
+            &mut cdfs,
+            0,
+            IS_INTER_CONTEXTS,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.20 arm-ordering invariant: when Arm 1 (`skip_mode == 1`)
+    /// fires, the SEG_LVL_REF_FRAME / SEG_LVL_GLOBALMV / ctx parameters
+    /// are NOT consulted. So setting them to values that would
+    /// otherwise reject (e.g. an out-of-range ctx) is fine — Arm 1
+    /// short-circuits before any of them is checked.
+    #[test]
+    fn write_is_inter_arm1_skips_later_arm_checks() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        // out-of-range ctx, but Arm 1 fires first ⇒ no error.
+        write_is_inter(
+            &mut writer,
+            &mut cdfs,
+            1,
+            999, // would normally reject if Arm 4 were reached
+            1,   // Arm 1 active
+            true,
+            false,
+            true,
+        )
+        .unwrap();
     }
 }

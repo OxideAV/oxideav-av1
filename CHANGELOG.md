@@ -4,6 +4,60 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r253 (2026-06-08): add
+  `encoder::block_mode_info::write_is_inter` — the §5.11.20
+  `read_is_inter()` syntax-element writer (av1-spec p.71). Lands at
+  the same dispatcher level as r211's
+  `write_skip` / `write_intra_segment_id` / `write_intra_frame_y_mode`
+  / `write_y_mode` / `write_intra_uv_mode` / `write_cfl_alphas` — the
+  encoder mirror of
+  [`crate::cdf::PartitionWalker::decode_is_inter`].
+
+  The writer transcribes the §5.11.20 four-arm dispatch verbatim:
+
+  1. `if ( skip_mode )` ⇒ `is_inter = 1`, no bits written.
+  2. `else if ( seg_feature_active( SEG_LVL_REF_FRAME ) )` ⇒
+     `is_inter = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME`
+     (the caller pre-computes the `!= INTRA_FRAME` comparison as
+     `seg_ref_frame_is_inter`), no bits written.
+  3. `else if ( seg_feature_active( SEG_LVL_GLOBALMV ) )` ⇒
+     `is_inter = 1`, no bits written.
+  4. Fall-through `else`: `is_inter` is emitted as one §8.2.6 `S()`
+     symbol against `TileIsInterCdf[ ctx ]`. `ctx` is the §8.3.2
+     `is_inter` context the caller pre-computes via the existing
+     public [`crate::cdf::is_inter_ctx`] helper from the neighbour
+     `LeftIntra` / `AboveIntra` predicates (or `None` for an
+     unavailable neighbour per §5.11.18).
+
+  The writer is stateless on purpose — it does not maintain an
+  encoder-side `IsInters[]` grid; the caller is responsible for
+  threading whatever grid state the §8.3.2 ctx derivation needs
+  (mirroring the §5.11.7 / §5.11.11 / §5.11.22 intra-arm writer
+  pattern landed in r211). Out-of-range and arm-precondition
+  violations (caller-supplied `is_inter` disagreeing with the
+  spec-derived value on Arms 1 / 2 / 3, `ctx >= IS_INTER_CONTEXTS = 4`
+  on Arm 4, `is_inter > 1` everywhere) are surfaced as
+  [`Error::PartitionWalkOutOfRange`].
+
+  +14 unit tests covering every arm — short-circuit on Arms 1 / 2 /
+  3 (no bits, decoder position unchanged), fall-through `S()`
+  round-trip at the frame origin for both `is_inter ∈ {0, 1}` with
+  §8.3 CDF adaptation engaged on both sides, §8.3.2 ctx
+  admissibility across every `(above_intra, left_intra)`
+  combination [`is_inter_ctx`] distinguishes (9 combos × 2 values),
+  out-of-range guards on `is_inter > 1` and `ctx >= 4`, the three
+  arm-mismatch rejections, and the arm-ordering invariant that Arm 1
+  short-circuits before Arms 2 / 3 / 4 are consulted.
+
+  Brings encoder mode_info coverage to the same six §5.11 elements
+  the decoder reaches at the §5.11.18 `inter_frame_mode_info`
+  pre-dispatch step (`skip` + `intra_segment_id` +
+  `intra_frame_y_mode` + `y_mode` + `uv_mode` + `cfl_alphas` +
+  `is_inter`) and is the first inter-arm scalar the encoder side
+  can now emit. The follow-on §5.11.23 `inter_block_mode_info`
+  syntax elements (ref-frame pair, inter-mode, MV) remain
+  out-of-scope.
+
 - encoder r252 (2026-06-08): close the rectangular TX_SIZE family
   on the encoder's 2D forward-transform dispatcher
   (`encoder::forward_transform_2d::forward_transform_2d`) with the
