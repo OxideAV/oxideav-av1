@@ -4,6 +4,65 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r250 (2026-06-07): extend the rectangular TX_SIZE family
+  arc on the encoder's 2D forward-transform dispatcher
+  (`encoder::forward_transform_2d::forward_transform_2d`) by the
+  first `|log2W - log2H| == 2` pair — `TX_16X64` and `TX_64X16`,
+  the rectangular pair at `min(log2W, log2H) == 4` /
+  `max(log2W, log2H) == 6` (short-side-16 / long-side-64). This is
+  the smallest spec-aligned delta from r244's `TX_32X64` /
+  `TX_64X32` pair (same length-64 axis, short axis 32 ⇒ 16).
+
+  Per §5.11.40 `compute_tx_type()` the `txSzSqrUp > TX_32X32 ⇒
+  return DCT_DCT` short-circuit forces this pair to the
+  `TX_SET_DCTONLY` set — `DCT_DCT` is the only reachable `tx_type`
+  ordinal per §6.10.19. The dispatcher composes `forward_dct_16` ×
+  `forward_dct_64` (TX_16X64) / `forward_dct_64` × `forward_dct_16`
+  (TX_64X16) in the standard column-then-row order; per-axis kernel
+  reachability is `forward_dct_dispatch (n in 2..=6)` covering both
+  16 (n=4) and 64 (n=6). The other per-axis selectors
+  (`forward_idtx_dispatch n in 2..=5`, `forward_adst_dispatch
+  n in 2..=4`) are irrelevant on this pair because §6.10.19 has
+  already forced DCT_DCT.
+
+  Per §7.13.3 (av1-spec p.305), the `Round2(T[j] * 2896, 12)`
+  rectangular row-pass step gates on EXACTLY `Abs(log2W - log2H) ==
+  1` — so the encoder's mirror step (applied after the row kernel)
+  also skips on this pair. The dispatcher's existing
+  `log2_w.abs_diff(log2_h) == 1` gate already handles this; the
+  round 250 change extends only the front-of-function `assert!`
+  that accepts the new shape and adds the test surface.
+
+  Analytic per-cell round-trip scale: `(N_w * N_h) /
+  2^(row_shift + col_shift)` with NO rectangular factor =
+  `(16 * 64) / 2^(2 + 4)` = `1024 / 64` = `16`. Empirical
+  constant-DC scale is `4` (input `4` ⇒ recovered `16` within ±2
+  LSBs per cell) — the documented `4×` constant-DC input-mass
+  factor across the rectangular family. Both shapes pull the
+  §7.12.3 `dqDenom = 4` branch (any 64-axis transform), already
+  routed by `super::forward_quantize`.
+
+  +9 forward_transform_2d tests (64 → 73): zero-input ⇒ zero-output
+  on both shapes (TX_16X64, TX_64X16), pseudorandom DCT_DCT
+  round-trips (bound ±2 + max_err = 64 mirrors the TX_64X64 /
+  TX_32X64 / TX_64X32 envelopes — length-64 axis drives the 16-bit
+  between-stage clamp closer to saturation), constant-DC dominance
+  + recovery probes (input 4 ⇒ recovered 16 within ±2 LSBs per
+  cell). Zero-input matrix walk gains 2 new cases (TX_16X64,
+  TX_64X16 with DCT_DCT only). Out-of-arc panic guard stays on
+  TX_4X16 — still a `|log2W - log2H| == 2` shape but with
+  `min_log2 = 2`, outside the round-250 (`min_log2 = 4`) slice.
+
+  Spec provenance: `docs/video/av1/av1-spec.txt` §7.13.3
+  (av1-spec p.305 — the `Round2(T[j] * 2896, 12)` rectangular
+  row-pass scale fires only on `Abs(log2W - log2H) == 1`),
+  §5.11.40 `compute_tx_type()` (p.92 — `txSzSqrUp > TX_32X32 ⇒
+  return DCT_DCT`), §6.10.19 (p.178 — `TX_SET_DCTONLY` contains
+  only DCT_DCT), §7.12.3 (av1-spec p.294 — `dqDenom = 4` for any
+  64-axis transform). Only this crate, `oxideav-core` public API,
+  and `docs/video/av1/` material were consulted. No external
+  library source, no web search.
+
 - public-API r249 (2026-06-07): graduate the dyn-driver 4:2:0 YUV
   intra-only codepath into the top-level public entry point. Before
   this round, `oxideav_av1::encode_av1(pixels, width, height)` was a

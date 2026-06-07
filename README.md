@@ -2,6 +2,85 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-07 (round 250)
+
+Round 250 opens the **`|log2W - log2H| == 2`** rectangular arc on
+the encoder's 2D forward-transform dispatcher
+(`encoder::forward_transform_2d::forward_transform_2d`) with the
+pair sharing the length-64 axis with r244 — **`TX_16X64`** and
+**`TX_64X16`**, the shape at `min(log2W, log2H) == 4` /
+`max(log2W, log2H) == 6` (short-side-16, long-side-64). The
+dispatcher now accepts the five square sizes, the eight
+`|log2W - log2H| == 1` rectangular pairs from r235 / r238 / r241 /
+r244, and the first `|log2W - log2H| == 2` pair from r250 — eleven
+shapes in total.
+
+Per §5.11.40 `compute_tx_type()` (av1-spec p.92) the
+`txSzSqrUp > TX_32X32 ⇒ return DCT_DCT` short-circuit forces both
+shapes to the `TX_SET_DCTONLY` set (per §6.10.19 only `DCT_DCT` is
+in that set), so the dispatcher only needs to walk the DCT × DCT
+arm here: `forward_dct_16` × `forward_dct_64` for TX_16X64 and
+`forward_dct_64` × `forward_dct_16` for TX_64X16. The other axes
+of the per-axis kernel matrix (ADST / IDTX) are irrelevant on this
+pair because §6.10.19 has already forced DCT_DCT.
+
+Per §7.13.3 the `Round2(T[j] * 2896, 12)` rectangular row-pass
+step gates EXACTLY on `Abs(log2W - log2H) == 1` (av1-spec p.305
+line "if (Abs(log2W - log2H) == 1) T[j] = Round2(T[j] * 2896,
+12)"), so this pair runs the bare per-axis kernel composition
+without the rectangular `2896` factor on either side. The
+analytic per-cell round-trip scale is `(N_w * N_h) /
+2^(row_shift + col_shift)` = `1024 / 2^(2 + 4)` = `16`; the
+empirical constant-DC scale is `4` — the documented `4×`
+constant-DC input-mass factor across the rectangular family.
+A constant input of `4` recovers `16` within ±2 LSBs per cell.
+
+Per-axis kernel reachability: `forward_dct_dispatch` (n in 2..=6)
+covers both 16 (n=4) and 64 (n=6) ⇒ DCT × DCT reaches;
+`forward_idtx_dispatch` (n in 2..=5) covers 16 (n=4) only (n=6 /
+length-64 is out of range) — irrelevant since the spec has forced
+DCT_DCT; `forward_adst_dispatch` (n in 2..=4) covers 16 (n=4)
+only — same point.
+
+§7.12.3 `dqDenom = 4` (any 64-axis transform) — same branch as
+r244, already routed by `super::forward_quantize` via
+`crate::cdf::dequant_denom`.
+
+### Round 250 test summary
+
++9 forward_transform_2d tests (64 → 73):
+
+* `rect_tx_16x64_zero_input_yields_zero` and
+  `rect_tx_64x16_zero_input_yields_zero` pin the trivial sanity
+  invariant.
+* `rect_tx_16x64_dct_dct_roundtrip` and
+  `rect_tx_64x16_dct_dct_roundtrip` exercise the DCT-DCT path with
+  pseudorandom residuals at ±2 magnitude (the length-64 axis drives
+  the inverse pipeline's 16-bit between-stage clamp close to
+  saturation; same envelope as TX_64X64 / TX_32X64 / TX_64X32).
+* `rect_tx_16x64_dc_input_dc_only_coefficient` and
+  `rect_tx_64x16_dc_input_dc_only_coefficient` confirm DC dominance
+  + constant-DC recovery (input 4 ⇒ recovered 16 within ±2 LSBs per
+  cell).
+* The matrix-walk `zero_input_across_all_supported_square_combinations`
+  gains 2 cases (TX_16X64 / TX_64X16 with DCT_DCT only — the only
+  reachable tx_type per §5.11.40 + §6.10.19).
+* The panic guard `rectangular_tx_size_out_of_arc_panics` stays on
+  TX_4X16 — also a `|log2W - log2H| == 2` shape but with
+  `min_log2 = 2`, outside the round-250 (`min_log2 = 4`) slice, so
+  the dispatcher still rejects it.
+
+### Out of scope for round 250 / pending follow-ups
+
+* The remaining four `|log2W - log2H| == 2` rectangular sizes —
+  `TX_4X16` / `TX_16X4` (`min_log2 = 2`) and `TX_8X32` / `TX_32X8`
+  (`min_log2 = 3`). Per §5.11.40 these sit at
+  `txSzSqrUp <= TX_32X32` so they reach the full `TX_SET_INTRA_*` /
+  `TX_SET_INTER_*` matrix (DCT / ADST / FLIPADST / IDTX / V_/H_
+  variants), not just DCT_DCT — substantially more reachable
+  tx_types to exercise per round than the TX_16X64 / TX_64X16 pair
+  landed here.
+
 ## Status — 2026-06-07 (round 249)
 
 Round 249 graduates the dyn-driver 4:2:0 YUV intra-only codepath
