@@ -4,6 +4,23 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-av1/compare/v0.1.9...v0.2.0) - 2026-06-07
+
+### Other
+
+- drop release-plz.toml — use release-plz defaults across the workspace
+- encoder r244: extend rectangular TX_SIZE arc by TX_32X64 / TX_64X32
+- encoder r241: extend rectangular TX_SIZE arc by TX_16X32 / TX_32X16
+- encoder r238: extend rectangular TX_SIZE arc by TX_8X16 / TX_16X8
+- encoder r235: rectangular TX_SIZE family on forward_transform_2d (TX_4X8 / TX_8X4)
+- decoder/encoder r223: §8.2.6 post-renorm invariant probes
+- multi-super-block 4:2:0 YUV dyn driver (extends ceiling to 128)
+- encoder/decoder r207: multi-super-block tiling on the Y-only dyn driver
+- encoder/decoder r235: Y-only (monochrome) on the dyn driver
+- encoder/decoder r197/r234: rectangular frame extents on the dyn driver
+- encoder/decoder r233: base_q_idx > 0 (lossy quant) on the dyn driver
+- encoder/decoder r232: UV_CFL_PRED on the dynamic-extent driver
+
 - encoder r244 (2026-06-07): extend the rectangular TX_SIZE family
   arc on the encoder's 2D forward-transform dispatcher
   (`encoder::forward_transform_2d::forward_transform_2d`) by the
