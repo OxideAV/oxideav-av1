@@ -2579,6 +2579,414 @@ fn pick_palette_extra_bits_y(
     Err(Error::PartitionWalkOutOfRange)
 }
 
+/// `palette_colors_u[]` + `palette_colors_v[]` writer per §5.11.46
+/// (av1-spec p.97-98) — r263. The UV-plane half of the §5.11.46
+/// palette-entries syntax: the inverse of
+/// [`crate::cdf::read_palette_entries_uv`].
+///
+/// Spec body (UV arms of §5.11.46, post-`PaletteSizeUV` read):
+/// ```text
+///   // U plane — mirrors Y, minus the `delta_u++` step and minus the
+///   // `- 1` on the range derivation.
+///   cache[] = get_palette_cache( 1, mi_row, mi_col )
+///   idx = 0
+///   for ( i = 0; i < cache_n && idx < PaletteSizeUV; i++ ) {
+///       use_palette_color_cache_u                          L(1)
+///       if ( use_palette_color_cache_u ) {
+///           palette_colors_u[ idx++ ] = cache[ i ]
+///       }
+///   }
+///   if ( idx < PaletteSizeUV ) {
+///       palette_colors_u[ idx++ ]                          L(BitDepth)
+///   }
+///   if ( idx < PaletteSizeUV ) {
+///       minBits     = BitDepth - 3
+///       palette_num_extra_bits_u                           L(2)
+///       paletteBits = minBits + palette_num_extra_bits_u
+///   }
+///   while ( idx < PaletteSizeUV ) {
+///       palette_delta_u                                    L(paletteBits)
+///       palette_colors_u[ idx ] = Clip1( palette_colors_u[ idx - 1 ]
+///                                        + palette_delta_u )
+///       range = ( 1 << BitDepth ) - palette_colors_u[ idx ]
+///       paletteBits = Min( paletteBits, CeilLog2( range ) )
+///       idx++
+///   }
+///   sort( palette_colors_u[ 0 .. PaletteSizeUV - 1 ] )
+///
+///   // V plane — two-arm dispatcher gated on `delta_encode_palette_colors_v`.
+///   delta_encode_palette_colors_v                          L(1)
+///   if ( delta_encode_palette_colors_v ) {
+///       minBits     = BitDepth - 4
+///       maxVal      = 1 << BitDepth
+///       palette_num_extra_bits_v                           L(2)
+///       paletteBits = minBits + palette_num_extra_bits_v
+///       palette_colors_v[ 0 ]                              L(BitDepth)
+///       for ( idx = 1; idx < PaletteSizeUV; idx++ ) {
+///           palette_delta_v                                L(paletteBits)
+///           if ( palette_delta_v ) {
+///               palette_delta_sign_bit_v                   L(1)
+///               if ( palette_delta_sign_bit_v ) palette_delta_v = -palette_delta_v
+///           }
+///           val = palette_colors_v[ idx - 1 ] + palette_delta_v
+///           if ( val < 0 )       val += maxVal
+///           if ( val >= maxVal ) val -= maxVal
+///           palette_colors_v[ idx ] = Clip1( val )
+///       }
+///       // NOTE: no sort() on the V delta arm — source order preserved.
+///   } else {
+///       for ( idx = 0; idx < PaletteSizeUV; idx++ ) {
+///           palette_colors_v[ idx ]                        L(BitDepth)
+///       }
+///   }
+/// ```
+///
+/// **U-plane mirror invariant.** Caller passes `palette_colors_u` already
+/// in the post-sort canonical order (non-strictly ascending — duplicate
+/// entries are legal here because the U delta loop has no `++` step).
+/// The cache + literal + paletteBits + delta loop then reconstructs the
+/// exact L(1) / L(BitDepth) / L(2) / L(paletteBits) bit stream that,
+/// when fed back through [`crate::cdf::read_palette_entries_uv`],
+/// reproduces the same sorted U entries.
+///
+/// **U paletteBits derivation.** Mirrors the Y picker but with the
+/// U-specific delta formula: `delta_raw = cur - prev` (no `- 1`) and
+/// `range = maxVal - cur` (no `- 1`). The maximum raw delta is bounded
+/// by `2^BitDepth - 1`, which fits in `BitDepth` bits — `minBits + 3
+/// = BitDepth - 3 + 3 = BitDepth`. The §5.11.46 refinement only reduces
+/// `paletteBits` along the way (since `range = maxVal - cur <= maxVal`).
+///
+/// **V-plane arm selection.** The `delta_encode_v` parameter chooses
+/// the arm:
+/// * `false` (direct-literal arm): each `palette_colors_v[idx]` emits as
+///   `L(BitDepth)`. No monotonicity or sort requirement.
+/// * `true` (signed-delta arm): the writer picks the smallest
+///   `palette_num_extra_bits_v ∈ {0, 1, 2, 3}` such that every
+///   `palette_delta_v` magnitude (`cur - prev`, allowing the §5.11.46
+///   modular wrap to pick the smaller-magnitude alternative
+///   `cur - prev ± maxVal`) fits in `paletteBits`. The wrap means the
+///   writer can always find a representable signed delta with
+///   `|delta| <= maxVal / 2`, which fits in `BitDepth - 1` bits — well
+///   within the `minBits + 3 = BitDepth - 1` ceiling.
+///
+/// **Caller contract.** Inputs must satisfy:
+/// * `bit_depth ∈ {8, 10, 12}` (§5.5.2).
+/// * `palette_size_uv ∈ 2..=PALETTE_COLORS` (§5.11.46 contract).
+/// * `palette_colors_u[0 .. palette_size_uv]` non-strictly ascending,
+///   each entry in `[0, 2^bit_depth)`. Descending entries surface
+///   [`Error::PartitionWalkOutOfRange`] (the U delta arm only encodes
+///   non-negative `cur - prev`).
+/// * `palette_colors_v[0 .. palette_size_uv]` arbitrary entries in
+///   `[0, 2^bit_depth)`. Not required to be sorted (the §5.11.46 V arm
+///   does not sort after decode).
+/// * `walker` MUST be at the same §5.11.49 cache state the reader
+///   would observe (caller threads its own [`PartitionWalker`] and
+///   stamps any preceding decoded blocks into the `PaletteSizes` /
+///   `PaletteColors` grids before this call).
+///
+/// On success, the encoder has committed the §5.11.46 UV palette
+/// entries to the bit stream in exact lock-step with the
+/// [`crate::cdf::read_palette_entries_uv`] reader.
+#[allow(clippy::too_many_arguments)]
+pub fn write_palette_entries_uv(
+    writer: &mut SymbolWriter,
+    bit_depth: u8,
+    palette_size_uv: usize,
+    palette_colors_u: &[u16],
+    palette_colors_v: &[u16],
+    delta_encode_v: bool,
+    walker: &PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<(), Error> {
+    if !matches!(bit_depth, 8 | 10 | 12) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if !(2..=PALETTE_COLORS).contains(&palette_size_uv) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if palette_colors_u.len() < palette_size_uv {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if palette_colors_v.len() < palette_size_uv {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let bd = bit_depth as u32;
+    let max_val: u32 = 1u32 << bd;
+    // §5.11.46 caller contract: U entries non-strictly ascending and
+    // each within [0, 2^BitDepth). Mirrors the reader's invariant after
+    // the trailing sort + Clip1. Duplicates are admitted because the U
+    // delta loop has no `++` step (raw delta == 0 is legal).
+    for (i, &c) in palette_colors_u.iter().take(palette_size_uv).enumerate() {
+        if (c as u32) >= max_val {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if i > 0 && (c as u32) < palette_colors_u[i - 1] as u32 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+    // §5.11.46 caller contract: V entries each within [0, 2^BitDepth).
+    // No monotonicity requirement (the §5.11.46 V arm does not sort).
+    for &c in palette_colors_v.iter().take(palette_size_uv) {
+        if (c as u32) >= max_val {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+
+    // -------- U plane --------
+    // §5.11.49 cache via the same walker accessor the reader uses
+    // (plane = 1 ⇒ U).
+    let mut cache_buf = [0u16; 2 * PALETTE_COLORS];
+    let cache_n = walker.get_palette_cache(1, mi_row, mi_col, &mut cache_buf);
+
+    // §5.11.46 cache-coded indices loop for U. Same decision-tree as Y:
+    // "is this cache slot the next palette entry?" → L(1).
+    let mut idx: usize = 0;
+    {
+        let mut i = 0usize;
+        while i < cache_n && idx < palette_size_uv {
+            let use_cache = if cache_buf[i] == palette_colors_u[idx] {
+                1u32
+            } else {
+                0u32
+            };
+            writer.write_literal(1, use_cache)?;
+            if use_cache != 0 {
+                idx += 1;
+            }
+            i += 1;
+        }
+    }
+
+    // §5.11.46 first "new" U entry as L(BitDepth) literal.
+    if idx < palette_size_uv {
+        let v = palette_colors_u[idx] as u32;
+        writer.write_literal(bd, v)?;
+        idx += 1;
+    }
+
+    // §5.11.46 paletteBits derivation for U. Same `minBits = BitDepth -
+    // 3` as Y; the L(2) read is skipped when no entries remain.
+    if idx < palette_size_uv {
+        let min_bits = bd - 3;
+        let start_idx = idx;
+        let extra = pick_palette_extra_bits_u(palette_colors_u, palette_size_uv, start_idx, bd)?;
+        writer.write_literal(2, extra)?;
+        let mut palette_bits = min_bits + extra;
+        // §5.11.46 U delta loop: no `++`, range without `- 1`.
+        while idx < palette_size_uv {
+            let prev = palette_colors_u[idx - 1] as u32;
+            let cur = palette_colors_u[idx] as u32;
+            // Non-strict ascending invariant ⇒ cur >= prev.
+            let delta_raw = cur - prev;
+            if palette_bits == 0 {
+                if delta_raw != 0 {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                writer.write_literal(0, 0)?;
+            } else {
+                if delta_raw >= (1u32 << palette_bits) {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                writer.write_literal(palette_bits, delta_raw)?;
+            }
+            // §5.11.46 paletteBits refinement: `range = (1 << BitDepth)
+            // - palette_colors_u[idx]` (no `- 1`).
+            let range = max_val.saturating_sub(cur);
+            palette_bits = palette_bits.min(ceil_log2_av1(range));
+            idx += 1;
+        }
+    }
+
+    // -------- V plane --------
+    // §5.11.46 V arm selector — L(1) `delta_encode_palette_colors_v`.
+    writer.write_literal(1, if delta_encode_v { 1 } else { 0 })?;
+    if delta_encode_v {
+        // §5.11.46 V delta-encoded arm. `minBits = BitDepth - 4` ⇒
+        // `minBits ∈ {4, 6, 8}` for `BitDepth ∈ {8, 10, 12}`.
+        let min_bits_v = bd - 4;
+        let extra_v = pick_palette_extra_bits_v(palette_colors_v, palette_size_uv, bd)?;
+        writer.write_literal(2, extra_v)?;
+        let palette_bits_v = min_bits_v + extra_v;
+        // First V entry as L(BitDepth) literal.
+        let first = palette_colors_v[0] as u32;
+        writer.write_literal(bd, first)?;
+        // §5.11.46 V delta loop: for each remaining entry, pick the
+        // shorter-magnitude signed delta from the two §5.11.46
+        // modular-wrap candidates `cur - prev` and `cur - prev ± maxVal`.
+        for i in 1..palette_size_uv {
+            let prev = palette_colors_v[i - 1] as i32;
+            let cur = palette_colors_v[i] as i32;
+            let signed_delta = pick_v_signed_delta(prev, cur, max_val as i32, palette_bits_v)?;
+            // §5.11.46 emit: `L(paletteBits) palette_delta_v` (magnitude),
+            // then on non-zero `L(1) palette_delta_sign_bit_v`.
+            let magnitude = signed_delta.unsigned_abs();
+            if palette_bits_v == 0 {
+                if magnitude != 0 {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                writer.write_literal(0, 0)?;
+            } else {
+                if magnitude >= (1u32 << palette_bits_v) {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                writer.write_literal(palette_bits_v, magnitude)?;
+            }
+            if magnitude != 0 {
+                let sign_bit = if signed_delta < 0 { 1u32 } else { 0u32 };
+                writer.write_literal(1, sign_bit)?;
+            }
+        }
+    } else {
+        // §5.11.46 V direct-literal arm: each entry as L(BitDepth).
+        for &c in palette_colors_v.iter().take(palette_size_uv) {
+            writer.write_literal(bd, c as u32)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Pick the smallest `palette_num_extra_bits_u` (L(2) ⇒ 0..=3) such
+/// that every remaining §5.11.46 U-plane delta fits in the
+/// reader-refined `paletteBits`. Returns
+/// [`Error::PartitionWalkOutOfRange`] when no choice in 0..=3 admits
+/// all deltas — this only happens on a malformed
+/// `palette_colors_u` (the non-strict-ascending + bit-depth check
+/// before this call rules out conformant input).
+fn pick_palette_extra_bits_u(
+    palette_colors_u: &[u16],
+    palette_size_uv: usize,
+    start_idx: usize,
+    bd: u32,
+) -> Result<u32, Error> {
+    let min_bits = bd - 3;
+    let max_val: u32 = 1u32 << bd;
+    for extra in 0..=3u32 {
+        let mut palette_bits = min_bits + extra;
+        let mut ok = true;
+        let mut idx = start_idx;
+        while idx < palette_size_uv {
+            let prev = palette_colors_u[idx - 1] as u32;
+            let cur = palette_colors_u[idx] as u32;
+            // U: no `++` ⇒ delta_raw = cur - prev.
+            let delta_raw = cur - prev;
+            let capacity = if palette_bits >= 32 {
+                u32::MAX
+            } else {
+                1u32 << palette_bits
+            };
+            if palette_bits == 0 {
+                if delta_raw != 0 {
+                    ok = false;
+                    break;
+                }
+            } else if delta_raw >= capacity {
+                ok = false;
+                break;
+            }
+            // §5.11.46 U refinement: `range = maxVal - cur` (no `- 1`).
+            let range = max_val.saturating_sub(cur);
+            palette_bits = palette_bits.min(ceil_log2_av1(range));
+            idx += 1;
+        }
+        if ok {
+            return Ok(extra);
+        }
+    }
+    Err(Error::PartitionWalkOutOfRange)
+}
+
+/// Pick the smallest `palette_num_extra_bits_v` (L(2) ⇒ 0..=3) such
+/// that every §5.11.46 V-plane signed delta magnitude fits in
+/// `paletteBits = (BitDepth - 4) + extra`. Returns
+/// [`Error::PartitionWalkOutOfRange`] when no choice admits all
+/// deltas (a malformed input would be required to hit this — for any
+/// `BitDepth ∈ {8, 10, 12}`, the smaller-magnitude wrap candidate is
+/// bounded by `maxVal / 2 = 2^(BitDepth - 1)`, which fits in
+/// `BitDepth - 1` bits, well within `minBits + 3 = BitDepth - 1`).
+fn pick_palette_extra_bits_v(
+    palette_colors_v: &[u16],
+    palette_size_uv: usize,
+    bd: u32,
+) -> Result<u32, Error> {
+    let min_bits = bd - 4;
+    let max_val: i32 = 1i32 << bd;
+    for extra in 0..=3u32 {
+        let palette_bits = min_bits + extra;
+        let mut ok = true;
+        for i in 1..palette_size_uv {
+            let prev = palette_colors_v[i - 1] as i32;
+            let cur = palette_colors_v[i] as i32;
+            if pick_v_signed_delta(prev, cur, max_val, palette_bits).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return Ok(extra);
+        }
+    }
+    Err(Error::PartitionWalkOutOfRange)
+}
+
+/// Pick the signed delta the §5.11.46 V delta-encoded arm should emit
+/// for the transition `prev -> cur`. The reader applies modular wrap
+/// to `prev + signed_delta` so there are up to three candidates:
+/// `cur - prev`, `cur - prev + maxVal`, `cur - prev - maxVal`. We pick
+/// the one with the smallest magnitude that fits in `paletteBits`
+/// (magnitude < `2^paletteBits`). Ties on magnitude prefer the
+/// natural (non-wrapped) candidate.
+///
+/// Returns [`Error::PartitionWalkOutOfRange`] if no candidate fits —
+/// the picker's `extra` loop catches this and bumps `paletteBits`.
+fn pick_v_signed_delta(prev: i32, cur: i32, max_val: i32, palette_bits: u32) -> Result<i32, Error> {
+    let capacity: u32 = if palette_bits == 0 {
+        // L(0) only encodes magnitude 0.
+        1
+    } else if palette_bits >= 32 {
+        u32::MAX
+    } else {
+        1u32 << palette_bits
+    };
+    // The three §5.11.46 wrap candidates.
+    let natural = cur - prev;
+    let candidates = [natural, natural + max_val, natural - max_val];
+    let mut best: Option<i32> = None;
+    for &cand in &candidates {
+        // Reader's L(paletteBits) read returns `raw ∈ [0, 2^paletteBits)`,
+        // then the optional sign bit can negate it. So the encodable
+        // signed range is `[-(2^paletteBits - 1), 2^paletteBits - 1]`
+        // (magnitude < 2^paletteBits).
+        let mag = cand.unsigned_abs();
+        if mag >= capacity {
+            continue;
+        }
+        // Verify the §5.11.46 reader's modular wrap on this candidate
+        // actually reconstructs `cur` from `prev`: `prev + cand` then
+        // wrapped into `[0, maxVal)` must equal `cur`.
+        let mut val = prev + cand;
+        if val < 0 {
+            val += max_val;
+        }
+        if val >= max_val {
+            val -= max_val;
+        }
+        if val != cur {
+            continue;
+        }
+        match best {
+            None => best = Some(cand),
+            Some(b) => {
+                if cand.unsigned_abs() < b.unsigned_abs() {
+                    best = Some(cand);
+                }
+            }
+        }
+    }
+    best.ok_or(Error::PartitionWalkOutOfRange)
+}
+
 /// `intra_block_mode_info( )` dispatcher per §5.11.22 (av1-spec p.72)
 /// — r261. Composes the §5.11.22 leaf writers into the full §5.11.22
 /// body for the **no-palette** + **no-CFL** + **DC_PRED** path,
@@ -7837,6 +8245,386 @@ mod tests {
         entries[1] = 1;
         let mut writer = SymbolWriter::new(true);
         let err = write_palette_entries_y(&mut writer, 9, 2, &entries, &walker, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.46 write_palette_entries_uv — round-trip through
+    // crate::cdf::read_palette_entries_uv. The reader sorts U after
+    // decode (canonical form); V is left in source order on both arms.
+    // -----------------------------------------------------------------
+
+    /// 2-entry UV palette `[0, 0]` U + `[0, 0]` V at 8 bit-depth on the
+    /// V direct-literal arm, fresh walker (empty cache). Mirrors the
+    /// cdf-side `read_palette_entries_uv_size_2_zero_bitstream_direct_literal_arm`
+    /// fixture: writer emits the L(8) first U literal then L(2)
+    /// extra_bits then L(paletteBits) raw delta then L(1)=0 for
+    /// `delta_encode_v` then two L(8) V literals.
+    #[test]
+    fn write_palette_entries_uv_size_2_round_trip_8bit_direct_v_arm() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 0;
+        u[1] = 0;
+        v[0] = 0;
+        v[1] = 0;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 8, 2, &u, &v, false, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 8]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 8, 2, &walker, 0, 0).unwrap();
+        assert_eq!(u_dec[0], 0);
+        assert_eq!(u_dec[1], 0);
+        assert_eq!(v_dec[0], 0);
+        assert_eq!(v_dec[1], 0);
+    }
+
+    /// 3-entry UV palette with ascending U and arbitrary V on the
+    /// direct-literal arm at 8 bit-depth. U `[10, 50, 200]` exercises
+    /// the U delta loop (no `++`); V `[123, 7, 200]` exercises the
+    /// direct-literal arm where order is preserved.
+    #[test]
+    fn write_palette_entries_uv_size_3_round_trip_8bit_direct_v_arm() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 10;
+        u[1] = 50;
+        u[2] = 200;
+        v[0] = 123;
+        v[1] = 7;
+        v[2] = 200;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 8, 3, &u, &v, false, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 16]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 8, 3, &walker, 0, 0).unwrap();
+        assert_eq!(u_dec[0], 10);
+        assert_eq!(u_dec[1], 50);
+        assert_eq!(u_dec[2], 200);
+        // V on direct-literal arm preserves source order.
+        assert_eq!(v_dec[0], 123);
+        assert_eq!(v_dec[1], 7);
+        assert_eq!(v_dec[2], 200);
+    }
+
+    /// 3-entry UV palette on the V delta-encoded arm at 8 bit-depth.
+    /// U `[10, 50, 200]`; V `[100, 110, 90]` — exercises both positive
+    /// (`110 - 100 = +10`) and negative (`90 - 110 = -20`) signed
+    /// deltas with the §5.11.46 sign-bit emission. Round-trip matches.
+    #[test]
+    fn write_palette_entries_uv_size_3_round_trip_8bit_delta_v_arm() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 10;
+        u[1] = 50;
+        u[2] = 200;
+        v[0] = 100;
+        v[1] = 110;
+        v[2] = 90;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 8, 3, &u, &v, true, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 16]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 8, 3, &walker, 0, 0).unwrap();
+        assert_eq!(u_dec[0], 10);
+        assert_eq!(u_dec[1], 50);
+        assert_eq!(u_dec[2], 200);
+        assert_eq!(v_dec[0], 100);
+        assert_eq!(v_dec[1], 110);
+        assert_eq!(v_dec[2], 90);
+    }
+
+    /// §5.11.46 V delta-arm modular wrap: V `[10, 250]` at 8 bit-depth.
+    /// The natural delta `250 - 10 = +240` has magnitude 240; the
+    /// wrap candidate `240 - 256 = -16` has magnitude 16 (much
+    /// smaller). The writer picks the wrap candidate, the reader's
+    /// modular-wrap step reconstructs `cur = 250` from `prev = 10 +
+    /// (-16) = -6 → -6 + 256 = 250`.
+    #[test]
+    fn write_palette_entries_uv_v_delta_arm_modular_wrap_round_trip() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 0;
+        u[1] = 1;
+        v[0] = 10;
+        v[1] = 250;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 8, 2, &u, &v, true, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 8]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (_, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 8, 2, &walker, 0, 0).unwrap();
+        assert_eq!(v_dec[0], 10);
+        assert_eq!(v_dec[1], 250);
+    }
+
+    /// Full palette of size 8 on the V delta arm at 8 bit-depth —
+    /// exercises every step of the V delta loop. U is the same
+    /// ascending sequence the Y refinement test uses (`[1, 30, 60,
+    /// 90, 120, 180, 220, 250]`); V samples arbitrary entries.
+    #[test]
+    fn write_palette_entries_uv_max_size_round_trip_8bit_delta_v_arm() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        let u_vals: [u16; 8] = [1, 30, 60, 90, 120, 180, 220, 250];
+        u[..8].copy_from_slice(&u_vals);
+        // V samples chosen so each consecutive transition's smallest
+        // §5.11.46 wrap-candidate magnitude stays < 2^paletteBits at
+        // the writer's maximum paletteBits_v = bd - 4 + 3 = 7 (=>
+        // magnitude < 128). The wrap-around bound is maxVal/2 = 128 at
+        // 8-bit; staying strictly below that ceiling keeps every
+        // candidate representable.
+        let v_vals: [u16; 8] = [128, 65, 192, 70, 200, 100, 156, 35];
+        v[..8].copy_from_slice(&v_vals);
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 8, 8, &u, &v, true, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 32]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 8, 8, &walker, 0, 0).unwrap();
+        assert_eq!(&u_dec[..8], &u_vals);
+        assert_eq!(&v_dec[..8], &v_vals);
+    }
+
+    /// 10 bit-depth path on the direct-literal V arm — exercises L(10)
+    /// literals + `minBits = bd - 3 = 7` on U.
+    #[test]
+    fn write_palette_entries_uv_size_3_round_trip_10bit_direct_v_arm() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        // 10-bit range is [0, 1023].
+        u[0] = 100;
+        u[1] = 500;
+        u[2] = 900;
+        v[0] = 800;
+        v[1] = 200;
+        v[2] = 600;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 10, 3, &u, &v, false, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 16]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 10, 3, &walker, 0, 0).unwrap();
+        assert_eq!(u_dec[0], 100);
+        assert_eq!(u_dec[1], 500);
+        assert_eq!(u_dec[2], 900);
+        assert_eq!(v_dec[0], 800);
+        assert_eq!(v_dec[1], 200);
+        assert_eq!(v_dec[2], 600);
+    }
+
+    /// 12 bit-depth path on the V delta arm — `minBits_v = bd - 4 = 8`.
+    #[test]
+    fn write_palette_entries_uv_size_2_round_trip_12bit_delta_v_arm() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        // 12-bit range is [0, 4095].
+        u[0] = 1000;
+        u[1] = 3000;
+        v[0] = 2000;
+        v[1] = 2500;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 12, 2, &u, &v, true, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 16]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 12, 2, &walker, 0, 0).unwrap();
+        assert_eq!(u_dec[0], 1000);
+        assert_eq!(u_dec[1], 3000);
+        assert_eq!(v_dec[0], 2000);
+        assert_eq!(v_dec[1], 2500);
+    }
+
+    /// §5.11.49 cache-hit round-trip on U: stamp a left-neighbour U
+    /// palette `[11, 22]` at (0, 0); encode matching U `[11, 22]` +
+    /// arbitrary V at (0, 1). The writer emits two L(1)=1 cache flags
+    /// for U (no literal/L(2)/delta loop), then the V direct-literal
+    /// arm. Round-trip matches.
+    #[test]
+    fn write_palette_entries_uv_cache_hit_round_trip() {
+        let mut walker = fresh_palette_walker();
+        // Stamp left-neighbour U palette at (0, 0) — plane = 1.
+        walker.stamp_palette_for_test(1, 0, 0, &[11, 22]).unwrap();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 11;
+        u[1] = 22;
+        v[0] = 33;
+        v[1] = 44;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 8, 2, &u, &v, false, &walker, 0, 1).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 8]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, v_dec) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 8, 2, &walker, 0, 1).unwrap();
+        assert_eq!(u_dec[0], 11);
+        assert_eq!(u_dec[1], 22);
+        assert_eq!(v_dec[0], 33);
+        assert_eq!(v_dec[1], 44);
+    }
+
+    /// Caller bug: U descending — non-strict ascending invariant
+    /// surfaces `PartitionWalkOutOfRange`.
+    #[test]
+    fn write_palette_entries_uv_rejects_u_descending() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 50;
+        u[1] = 10;
+        v[0] = 0;
+        v[1] = 0;
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_palette_entries_uv(&mut writer, 8, 2, &u, &v, false, &walker, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// U duplicates are LEGAL on the UV writer (the U delta arm has
+    /// no `++`, so delta_raw == 0 is valid). Round-trip succeeds.
+    #[test]
+    fn write_palette_entries_uv_u_duplicates_accepted() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 10;
+        u[1] = 10;
+        v[0] = 0;
+        v[1] = 0;
+        let mut writer = SymbolWriter::new(true);
+        write_palette_entries_uv(&mut writer, 8, 2, &u, &v, false, &walker, 0, 0).unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() {
+            vec![0u8; 8]
+        } else {
+            bytes
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+        let (u_dec, _) =
+            crate::cdf::read_palette_entries_uv(&mut dec, 8, 2, &walker, 0, 0).unwrap();
+        assert_eq!(u_dec[0], 10);
+        assert_eq!(u_dec[1], 10);
+    }
+
+    /// Caller bug: U entry above the bit-depth range.
+    #[test]
+    fn write_palette_entries_uv_rejects_u_above_bit_depth_range() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 100;
+        u[1] = 256;
+        v[0] = 0;
+        v[1] = 0;
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_palette_entries_uv(&mut writer, 8, 2, &u, &v, false, &walker, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: V entry above the bit-depth range.
+    #[test]
+    fn write_palette_entries_uv_rejects_v_above_bit_depth_range() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 0;
+        u[1] = 1;
+        v[0] = 0;
+        v[1] = 256;
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_palette_entries_uv(&mut writer, 8, 2, &u, &v, false, &walker, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: `palette_size_uv` below the §5.11.46 minimum of 2.
+    #[test]
+    fn write_palette_entries_uv_rejects_size_below_two() {
+        let walker = fresh_palette_walker();
+        let u = [0u16; crate::cdf::PALETTE_COLORS];
+        let v = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_palette_entries_uv(&mut writer, 8, 1, &u, &v, false, &walker, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: `palette_size_uv` above PALETTE_COLORS (=8).
+    #[test]
+    fn write_palette_entries_uv_rejects_size_above_max() {
+        let walker = fresh_palette_walker();
+        let u = [0u16; crate::cdf::PALETTE_COLORS];
+        let v = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_palette_entries_uv(&mut writer, 8, 9, &u, &v, false, &walker, 0, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: invalid bit_depth (§5.5.2 admits 8 / 10 / 12 only).
+    #[test]
+    fn write_palette_entries_uv_rejects_invalid_bit_depth() {
+        let walker = fresh_palette_walker();
+        let mut u = [0u16; crate::cdf::PALETTE_COLORS];
+        let mut v = [0u16; crate::cdf::PALETTE_COLORS];
+        u[0] = 0;
+        u[1] = 1;
+        v[0] = 0;
+        v[1] = 0;
+        let mut writer = SymbolWriter::new(true);
+        let err =
+            write_palette_entries_uv(&mut writer, 9, 2, &u, &v, false, &walker, 0, 0).unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 

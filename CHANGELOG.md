@@ -4,6 +4,63 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r263 (2026-06-09): add §5.11.46 UV-plane palette-entries
+  writer (`encoder::block_mode_info::write_palette_entries_uv`,
+  av1-spec p.97-98) — the inverse of
+  `crate::cdf::read_palette_entries_uv`. Closes the second half of
+  r261's `write_palette_mode_info` `PaletteEntriesUnsupported` arc:
+  with r262 (luma) + r263 (chroma) both arms of §5.11.46 are now
+  expressible on the encoder side.
+
+  The U plane mirrors the §5.11.49 cache + L(BitDepth) literal + L(2)
+  `palette_num_extra_bits_u` + L(paletteBits) delta loop, with two
+  spec-driven differences vs the Y plane: no `palette_delta_u++` step
+  (raw delta == `cur - prev`, duplicates legal) and the refinement
+  uses `range = (1 << BitDepth) - palette_colors_u[idx]` without the
+  `- 1`. A dedicated `pick_palette_extra_bits_u` picker simulates the
+  reader's per-step refinement and chooses the smallest `extra ∈
+  {0, 1, 2, 3}` that admits every remaining U delta.
+
+  The V plane is a two-arm dispatcher gated on the L(1)
+  `delta_encode_palette_colors_v` selector. On the direct-literal
+  arm (`= 0`) each entry rides L(BitDepth) in source order with no
+  monotonicity requirement and no trailing sort. On the
+  signed-delta arm (`= 1`) the writer emits the first entry as
+  L(BitDepth), then for each remaining transition picks the
+  smallest-magnitude signed delta from the three §5.11.46 modular
+  wrap candidates (`cur - prev`, `cur - prev + maxVal`, `cur - prev
+  - maxVal`) that fits in the chosen `paletteBits_v = (BitDepth - 4)
+  + extra_v`; emits L(paletteBits_v) magnitude followed by L(1) sign
+  bit on non-zero. The wrap-candidate selection guarantees the
+  smaller-magnitude candidate has |delta| ≤ maxVal/2, which always
+  fits at `extra_v = 3` (paletteBits_v = BitDepth - 1).
+
+  +15 round-trip tests through `read_palette_entries_uv`: size 2 on
+  the V direct-literal arm at 8 / 10 / 12 bit-depth, size 3 with
+  ascending U + arbitrary V on both arms, full PALETTE_COLORS=8
+  max-size palette on the V delta arm (V samples chosen so each
+  consecutive transition's smaller-magnitude wrap candidate stays
+  < 2^paletteBits at the writer's max paletteBits_v = 7 at 8-bit),
+  §5.11.46 V-arm modular-wrap stress (V `[10, 250]` at 8-bit picks
+  the `-16` wrap over the natural `+240`), §5.11.49 cache-hit
+  round-trip on U (left-neighbour palette adopted via both L(1)=1
+  cache flags); plus caller-bug rejections for U descending, U
+  duplicates accepted (legal here), U / V above 2^BitDepth, size
+  below 2, size above PALETTE_COLORS, and invalid `bit_depth`.
+
+  Library test count moves to 1770 (was 1755).
+
+  Followups for r264+:
+  * Lift the §5.11.22 dispatcher's `has_palette_y == 0 /
+    has_palette_uv == 0` precondition: with both §5.11.46 writers
+    landed the dispatcher can now thread the `palette_size_*_minus_2`
+    S() reads + `write_palette_entries_y` / `_uv` invocations.
+  * §5.11.23 inter_block_mode_info scaffold (the inter-block sibling
+    of §5.11.22).
+  * §5.11.22 line-8 CFL arm fold (currently the dispatcher rejects
+    `uv_mode = UV_CFL_PRED = 13` as caller bug; lift this once
+    `write_cfl_alphas` composition lands).
+
 - encoder r262 (2026-06-09): add §5.11.46 luma-plane palette-entries
   writer (`encoder::block_mode_info::write_palette_entries_y`,
   av1-spec p.97-98) — the inverse of

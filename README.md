@@ -2,6 +2,55 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-09 (round 263)
+
+Round 263 lands the §5.11.46 UV-plane palette-entries writer —
+the encoder-side inverse of `crate::cdf::read_palette_entries_uv`.
+With r262 (luma) + r263 (chroma) both arms of §5.11.46 are now
+expressible on the encoder side; the §5.11.22 dispatcher's
+no-palette precondition is the only remaining shim.
+
+* `encoder::block_mode_info::write_palette_entries_uv` (§5.11.46
+  inverse, av1-spec p.97-98) — U plane mirrors §5.11.49 cache + L(BitDepth)
+  literal + L(2) `palette_num_extra_bits_u` + L(paletteBits) delta loop,
+  with two spec-driven differences vs Y: no `palette_delta_u++` step
+  (raw delta = `cur - prev`, duplicates legal) and refinement uses
+  `range = (1 << BitDepth) - palette_colors_u[idx]` without `- 1`.
+  V plane is a two-arm dispatcher gated on L(1)
+  `delta_encode_palette_colors_v`: the direct-literal arm emits each
+  entry as L(BitDepth) in source order (no sort); the signed-delta
+  arm emits the first entry as L(BitDepth) and for each remaining
+  transition picks the smallest-magnitude signed delta from the
+  three §5.11.46 modular-wrap candidates that fits in
+  `paletteBits_v = (BitDepth - 4) + extra_v`, emitting
+  L(paletteBits_v) magnitude + L(1) sign bit on non-zero.
+
++15 round-trip tests through `read_palette_entries_uv`: size 2 on
+the V direct-literal arm at 8 / 10 / 12 bit-depth, size 3 on both
+arms, full PALETTE_COLORS=8 max-size palette on the V delta arm,
+§5.11.46 V-arm modular-wrap stress (`[10, 250]` picks the `-16`
+wrap over the natural `+240`), §5.11.49 cache-hit on U; plus
+caller-bug rejections for U descending, U / V above 2^BitDepth,
+size below 2, size above PALETTE_COLORS, invalid bit_depth.
+U duplicates are accepted (legal on the no-`++` U arm) and the
+test verifies the round-trip.
+
+Full library test count moves to 1770 (was 1755).
+
+### Pending follow-ups for round 264+
+
+* Lift the §5.11.22 dispatcher's `has_palette_y == 0 /
+  has_palette_uv == 0` precondition: with both §5.11.46 writers
+  landed the dispatcher can now thread the `palette_size_*_minus_2`
+  S() reads + `write_palette_entries_*` invocations.
+* §5.11.23 inter_block_mode_info scaffold (the inter-block sibling
+  of §5.11.22).
+* §5.11.22 line-8 CFL arm fold (currently the dispatcher rejects
+  `uv_mode = UV_CFL_PRED = 13` as caller bug; lift once
+  `write_cfl_alphas` composition lands).
+
+---
+
 ## Status — 2026-06-09 (round 262)
 
 Round 262 lands the §5.11.46 luma-plane palette-entries writer —
