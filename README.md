@@ -2,6 +2,57 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 259)
+
+Round 259 composes the r258 §5.11.18 lines 18-20 leaf writers
+(`write_cdef` / `write_delta_qindex` / `write_delta_lf`) into the
+r257 `write_inter_frame_mode_info_prefix` dispatcher, completing
+the prefix up to the `read_is_inter()` call (the §5.11.18 line
+23-26 `if ( is_inter )` terminal dispatch into §5.11.22 / §5.11.23
+remains the next-round encoder-side target).
+
+The lines 18-20 per-block inputs are bundled into a new
+`InterFrameDeltaSiteInputs` struct (with a `Default` impl giving the
+all-short-circuit configuration — `enable_cdef = false`,
+`read_deltas = false`, zero deltas — so callers that don't yet
+exercise CDEF or delta-Q/LF only need `&Default::default()`).
+`InterFrameModeInfoPrefix` grows three derived fields surfacing the
+lines 18-20 results: `cdef_idx: Option<i8>` (`None` on the §5.11.56
+short-circuit / anchor-already-stamped arms, `Some(value)` on the
+first-leaf-in-anchor write), `reduced_delta_q_index: i32`, and
+`reduced_delta_lf: [i32; FRAME_LF_COUNT]`. The caller still owns
+the running `CurrentQIndex` / `DeltaLF[..]` / `cdef_idx[..]`
+accumulators (decoder-symmetric).
+
+### Round 259 test summary
+
++4 round-trip tests covering the new path: (1) default
+`InterFrameDeltaSiteInputs` ⇒ no bits emitted on any of the three
+lines; (2) `write_cdef` first-leaf-in-anchor arm round-trip through
+the dispatcher's full byte run against the matching `decode_cdef`
+call (with all eight composed decoder reads in spec-body order);
+(3) §5.11.12 literal-branch round-trip verifying the §5.11.12
+`Clip3(1, 255, ...)` accumulator update; (4) §5.11.13 single-LF
+round-trip verifying the `Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+...)` accumulator update.
+
+All 8 prior dispatcher tests pass unchanged — they each pass
+`&InterFrameDeltaSiteInputs::default()` so the §5.11.18 lines
+18-20 short-circuit on every prior assertion.
+
+Full library test count moves to 1705 (was 1701).
+
+### Out of scope for round 259 / pending follow-ups
+
+* §5.11.18 line 23 `if ( is_inter )` terminal arms — §5.11.22
+  `intra_block_mode_info` writer (the `else` arm) and §5.11.23
+  `inter_block_mode_info` writer (the `if` arm), the latter
+  composing §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+  §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode` +
+  §5.11.29 `read_compound_type` writers.
+* §7.10 inter-prediction primitive driver, §7.14 loop-filter,
+  §7.15 CDEF bring-up — the three near-term encoder milestones.
+
 ## Status — 2026-06-08 (round 258)
 
 Round 258 lands the three §5.11.18 lines 18-20 leaf writers that the

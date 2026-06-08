@@ -997,11 +997,132 @@ pub struct InterFrameModeInfoPrefix {
     pub is_inter: u8,
     /// §5.11.18 line 17 result.
     pub lossless: bool,
+    /// §5.11.18 line 18 result — `cdef_idx` returned by
+    /// [`write_cdef`]. `None` on the §5.11.56 short-circuit set
+    /// (`skip || coded_lossless || !enable_cdef || allow_intrabc`)
+    /// or when an earlier leaf in the same 64×64 anchor already
+    /// stamped the literal (the writer emits no bits on either arm).
+    /// `Some(cdef_idx)` on the first-leaf-in-anchor write arm.
+    pub cdef_idx: Option<i8>,
+    /// §5.11.18 line 19 result — caller-passed `reduced_delta_q_index`
+    /// surfaced for chaining. `0` on every short-circuit arm; the
+    /// caller owns the `CurrentQIndex` accumulator the §5.11.12 spec
+    /// updates via `Clip3` (the writer is pure on grid-state).
+    pub reduced_delta_q_index: i32,
+    /// §5.11.18 line 20 result — caller-passed `reduced_delta_lf`
+    /// row surfaced for chaining. `[0; FRAME_LF_COUNT]` on every
+    /// short-circuit arm; the caller owns the `DeltaLF[ i ]`
+    /// accumulator the §5.11.13 spec updates via `Clip3`.
+    pub reduced_delta_lf: [i32; FRAME_LF_COUNT],
+}
+
+/// §5.11.18 lines 18-20 input bundle — the per-block scalars the
+/// `read_cdef()` / `read_delta_qindex()` / `read_delta_lf()` writers
+/// consume. Bundled into a single argument so the
+/// [`write_inter_frame_mode_info_prefix`] dispatcher's parameter
+/// surface doesn't grow another 11 positional arguments.
+///
+/// All fields mirror the matching argument of [`write_cdef`] /
+/// [`write_delta_qindex`] / [`write_delta_lf`]:
+///
+/// * §5.11.56 `read_cdef` — `cdef_idx` / `cdef_idx_prior_stamp` /
+///   `cdef_bits` / `coded_lossless` / `enable_cdef` / `allow_intrabc`
+///   / `anchor_already_stamped`.
+/// * §5.11.12 `read_delta_qindex` — `reduced_delta_q_index` /
+///   `read_deltas` / `use_128x128_superblock` / `delta_q_res`.
+/// * §5.11.13 `read_delta_lf` — `reduced_delta_lf` / `read_deltas`
+///   (shared with `delta_qindex`) / `delta_lf_present` /
+///   `delta_lf_multi` / `mono_chrome` / `delta_lf_res`.
+///
+/// A `Default` impl yields the all-short-circuit configuration
+/// (`enable_cdef = false`, `read_deltas = false`, zero deltas) —
+/// suitable for callers that target the §5.11.18 lines 18-20
+/// no-bits-emitted arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterFrameDeltaSiteInputs {
+    /// §5.11.56 `cdef_idx` value to commit on the first-leaf-in-anchor
+    /// arm. Range-checked against `cdef_bits` (`0..(1 << cdef_bits)`).
+    pub cdef_idx: i8,
+    /// §5.11.56 prior-leaf `cdef_idx` stamp — passed straight through
+    /// to [`write_cdef`]'s `anchor_already_stamped == true` arm so the
+    /// writer can verify the caller's `cdef_idx` matches.
+    pub cdef_idx_prior_stamp: i8,
+    /// §5.9.19 `cdef_bits` field, `0..=3` (`f(2)` cap).
+    pub cdef_bits: u32,
+    /// §6.8.21 `CodedLossless` derivation. Short-circuits §5.11.56.
+    pub coded_lossless: bool,
+    /// §5.9.19 `enable_cdef` flag. Short-circuits §5.11.56.
+    pub enable_cdef: bool,
+    /// §5.9.20 `allow_intrabc` flag. Short-circuits §5.11.56.
+    pub allow_intrabc: bool,
+    /// §5.11.56 outer-`if` precondition: `anchor_already_stamped =
+    /// (cdef_idx[r][c] != -1)` per the matching `decode_cdef`
+    /// derivation, where `(r, c) = (mi_row, mi_col) & ~(cdefSize4 - 1)`.
+    /// `true` ⇒ the writer emits no bits on this leaf and the caller
+    /// MUST pass `cdef_idx == cdef_idx_prior_stamp`.
+    pub anchor_already_stamped: bool,
+    /// §5.11.12 `reducedDeltaQIndex` signed intermediate (the value
+    /// the §5.11.12 spec computes between the sign-bit read and the
+    /// `Clip3` update). The caller owns the `CurrentQIndex`
+    /// accumulator the spec updates with this value (`CurrentQIndex
+    /// = Clip3(1, 255, CurrentQIndex + (reducedDeltaQIndex << delta_q_res))`).
+    pub reduced_delta_q_index: i32,
+    /// §5.11.13 `reducedDeltaLfLevel` row — one entry per LF strength.
+    /// Only the first `frameLfCount` entries (per §5.11.13 derivation)
+    /// are consumed; entries beyond MUST be `0`.
+    pub reduced_delta_lf: [i32; FRAME_LF_COUNT],
+    /// §6.10.4 `ReadDeltas` flag — shared gate for §5.11.12 and
+    /// §5.11.13.
+    pub read_deltas: bool,
+    /// §5.5.1 `use_128x128_superblock` flag — used for the per-call
+    /// `sbSize` derivation that gates the superblock-skip
+    /// short-circuit.
+    pub use_128x128_superblock: bool,
+    /// §5.9.17 `delta_q_res` field, `0..=3`.
+    pub delta_q_res: u8,
+    /// §5.9.18 `delta_lf_present` flag — gates §5.11.13 reads.
+    pub delta_lf_present: bool,
+    /// §5.9.18 `delta_lf_multi` flag — selects per-LF or single-LF
+    /// row width via the `frameLfCount` derivation.
+    pub delta_lf_multi: bool,
+    /// §5.5.2 `mono_chrome` flag — narrows the multi-LF row to
+    /// `FRAME_LF_COUNT - 2` entries.
+    pub mono_chrome: bool,
+    /// §5.9.18 `delta_lf_res` field, `0..=3`.
+    pub delta_lf_res: u8,
+}
+
+impl Default for InterFrameDeltaSiteInputs {
+    /// All-short-circuit defaults: `enable_cdef = false` (§5.11.56
+    /// short-circuit), `read_deltas = false` (§5.11.12 / §5.11.13
+    /// outer-`if` false), zero `reduced_delta_*` so the §5.11.12 /
+    /// §5.11.13 short-circuit-validates pass. No bits emitted on
+    /// lines 18-20.
+    fn default() -> Self {
+        Self {
+            cdef_idx: 0,
+            cdef_idx_prior_stamp: -1,
+            cdef_bits: 0,
+            coded_lossless: false,
+            enable_cdef: false,
+            allow_intrabc: false,
+            anchor_already_stamped: false,
+            reduced_delta_q_index: 0,
+            reduced_delta_lf: [0; FRAME_LF_COUNT],
+            read_deltas: false,
+            use_128x128_superblock: false,
+            delta_q_res: 0,
+            delta_lf_present: false,
+            delta_lf_multi: false,
+            mono_chrome: false,
+            delta_lf_res: 0,
+        }
+    }
 }
 
 /// `inter_frame_mode_info()` writer prefix per §5.11.18 (av1-spec p.71) —
 /// the per-block syntax dispatcher for an inter-frame leaf. Composes
-/// every leaf writer landed across r253-r256:
+/// every leaf writer landed across r253-r258:
 ///
 /// * §5.11.19 `inter_segment_id( 1 )` — pre-skip arm via
 ///   [`write_inter_segment_id`].
@@ -1009,6 +1130,9 @@ pub struct InterFrameModeInfoPrefix {
 /// * §5.11.11 `read_skip()` (when `skip_mode == 0`) — via [`write_skip`].
 /// * §5.11.19 `inter_segment_id( 0 )` (when `!seg_id_pre_skip`) —
 ///   post-skip arm via [`write_inter_segment_id`].
+/// * §5.11.56 `read_cdef()` — via [`write_cdef`] (r258).
+/// * §5.11.12 `read_delta_qindex()` — via [`write_delta_qindex`] (r258).
+/// * §5.11.13 `read_delta_lf()` — via [`write_delta_lf`] (r258).
 /// * §5.11.20 `read_is_inter()` — via [`write_is_inter`].
 ///
 /// The spec body (av1-spec p.71) reads:
@@ -1029,9 +1153,9 @@ pub struct InterFrameModeInfoPrefix {
 ///       if ( !SegIdPreSkip )
 ///           inter_segment_id( 0 )                             ← writer
 ///       Lossless = LosslessArray[ segment_id ]
-///       read_cdef( )                                          (next round)
-///       read_delta_qindex( )                                  (next round)
-///       read_delta_lf( )                                      (next round)
+///       read_cdef( )                                          ← writer (r259)
+///       read_delta_qindex( )                                  ← writer (r259)
+///       read_delta_lf( )                                      ← writer (r259)
 ///       ReadDeltas = 0
 ///       read_is_inter( )                                      ← writer
 ///       if ( is_inter )
@@ -1043,11 +1167,11 @@ pub struct InterFrameModeInfoPrefix {
 ///
 /// ## Scope of this writer
 ///
-/// The dispatcher writes the §5.11.18 *prefix*: the five S()-emitting
-/// sub-writers above. The §5.11.18 line 18 `read_cdef`, line 19
-/// `read_delta_qindex`, line 20 `read_delta_lf`, and the line 23-26
-/// terminal `if ( is_inter )` dispatch into §5.11.22 / §5.11.23 are
-/// next-round encoder-side targets — none have writer counterparts yet.
+/// The dispatcher writes the §5.11.18 *prefix*: the eight S()-emitting
+/// sub-writers above. The line 23-26 terminal `if ( is_inter )` dispatch
+/// into §5.11.22 `intra_block_mode_info` / §5.11.23 `inter_block_mode_info`
+/// remains a next-round encoder-side target — neither has a writer
+/// counterpart yet.
 ///
 /// The writer's return value is an [`InterFrameModeInfoPrefix`]
 /// aggregate covering every value committed to the bitstream so far,
@@ -1123,6 +1247,10 @@ pub fn write_inter_frame_mode_info_prefix(
     skip_mode_present: bool,
     // §5.11.18 line 17 lookup:
     lossless_array: &[bool; MAX_SEGMENTS],
+    // §5.11.18 lines 18-20 inputs — `read_cdef` / `read_delta_qindex` /
+    // `read_delta_lf` per-block scalars. See
+    // [`InterFrameDeltaSiteInputs`] for the field-by-field contract.
+    delta_inputs: &InterFrameDeltaSiteInputs,
 ) -> Result<InterFrameModeInfoPrefix, Error> {
     if (last_active_seg_id as usize) >= MAX_SEGMENTS {
         return Err(Error::PartitionWalkOutOfRange);
@@ -1238,9 +1366,56 @@ pub fn write_inter_frame_mode_info_prefix(
     );
     let lossless = lossless_array[segment_id as usize];
 
-    // §5.11.18 lines 18-21: `read_cdef( ) / read_delta_qindex( ) /
-    // read_delta_lf( ) / ReadDeltas = 0` — next-round writer targets;
-    // skipped here.
+    // §5.11.18 line 18: `read_cdef( )`. The §5.11.56 spec body
+    // short-circuits on `skip || coded_lossless || !enable_cdef ||
+    // allow_intrabc` and on `anchor_already_stamped`; otherwise emits
+    // one `L(cdef_bits)`. The writer returns `Ok(None)` for either
+    // short-circuit and `Ok(Some(cdef_idx))` on the first-leaf write.
+    let cdef_idx_committed = write_cdef(
+        writer,
+        delta_inputs.cdef_idx,
+        delta_inputs.cdef_idx_prior_stamp,
+        delta_inputs.cdef_bits,
+        final_skip,
+        delta_inputs.coded_lossless,
+        delta_inputs.enable_cdef,
+        delta_inputs.allow_intrabc,
+        delta_inputs.anchor_already_stamped,
+    )?;
+
+    // §5.11.18 line 19: `read_delta_qindex( )`. The §5.11.12 spec body
+    // short-circuits on `MiSize == sbSize && skip` or `!ReadDeltas`;
+    // otherwise emits the S() + escape ladder + sign bit cascade for
+    // the caller-supplied signed `reducedDeltaQIndex`.
+    write_delta_qindex(
+        writer,
+        cdfs,
+        sub_size,
+        delta_inputs.reduced_delta_q_index,
+        final_skip,
+        delta_inputs.read_deltas,
+        delta_inputs.use_128x128_superblock,
+        delta_inputs.delta_q_res,
+    )?;
+
+    // §5.11.18 line 20: `read_delta_lf( )`. Per-iteration shape
+    // identical to §5.11.12; gated by `ReadDeltas && delta_lf_present`.
+    write_delta_lf(
+        writer,
+        cdfs,
+        sub_size,
+        &delta_inputs.reduced_delta_lf,
+        final_skip,
+        delta_inputs.read_deltas,
+        delta_inputs.delta_lf_present,
+        delta_inputs.delta_lf_multi,
+        delta_inputs.mono_chrome,
+        delta_inputs.use_128x128_superblock,
+        delta_inputs.delta_lf_res,
+    )?;
+
+    // §5.11.18 line 21: `ReadDeltas = 0`. Caller-owned state per the
+    // §6.10.4 derivation; the writer doesn't track it.
 
     // §5.11.18 line 22: `read_is_inter( )`.
     write_is_inter(
@@ -1260,6 +1435,9 @@ pub fn write_inter_frame_mode_info_prefix(
         skip: final_skip,
         is_inter,
         lossless,
+        cdef_idx: cdef_idx_committed,
+        reduced_delta_q_index: delta_inputs.reduced_delta_q_index,
+        reduced_delta_lf: delta_inputs.reduced_delta_lf,
     })
 }
 
@@ -4214,6 +4392,7 @@ mod tests {
                 /* last_active_seg_id = */ 7,
                 /* skip_mode_present = */ false,
                 &LOSSLESS_ALL_FALSE,
+                &InterFrameDeltaSiteInputs::default(),
             )
             .unwrap();
             assert_eq!(prefix.segment_id, 0);
@@ -4282,6 +4461,7 @@ mod tests {
             /* last_active_seg_id = */ 7,
             /* skip_mode_present = */ true,
             &LOSSLESS_ALL_FALSE,
+            &InterFrameDeltaSiteInputs::default(),
         )
         .unwrap();
         assert_eq!(prefix.segment_id, 0);
@@ -4351,6 +4531,7 @@ mod tests {
             /* last_active_seg_id = */ 7,
             /* skip_mode_present = */ true,
             &LOSSLESS_ALL_FALSE,
+            &InterFrameDeltaSiteInputs::default(),
         )
         .unwrap();
         assert_eq!(prefix.segment_id, 3);
@@ -4421,6 +4602,7 @@ mod tests {
             /* last_active_seg_id = */ 7,
             /* skip_mode_present = */ true,
             &LOSSLESS_ALL_FALSE,
+            &InterFrameDeltaSiteInputs::default(),
         )
         .unwrap();
         assert_eq!(prefix.segment_id, 2);
@@ -4484,6 +4666,7 @@ mod tests {
             /* last_active_seg_id = */ MAX_SEGMENTS as u8,
             false,
             &LOSSLESS_ALL_FALSE,
+            &InterFrameDeltaSiteInputs::default(),
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
@@ -4525,6 +4708,7 @@ mod tests {
             7,
             false,
             &LOSSLESS_ALL_FALSE,
+            &InterFrameDeltaSiteInputs::default(),
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
@@ -4564,6 +4748,7 @@ mod tests {
             7,
             true,
             &LOSSLESS_ALL_FALSE,
+            &InterFrameDeltaSiteInputs::default(),
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
@@ -4606,6 +4791,7 @@ mod tests {
             7,
             false, // skip_mode_present
             &lossless,
+            &InterFrameDeltaSiteInputs::default(),
         )
         .unwrap();
         assert_eq!(prefix.segment_id, 3);
@@ -4613,6 +4799,407 @@ mod tests {
             prefix.lossless,
             "LosslessArray[3] == true ⇒ lossless = true"
         );
+    }
+
+    /// Default `InterFrameDeltaSiteInputs` (`enable_cdef = false`,
+    /// `read_deltas = false`, zero deltas) is the all-short-circuit
+    /// arm for §5.11.18 lines 18-20: no bits emitted on any of the
+    /// three calls, prefix `cdef_idx == None`, `reduced_delta_q_index
+    /// == 0`, `reduced_delta_lf == [0; FRAME_LF_COUNT]`. The §5.11.18
+    /// line 22 `read_is_inter` still fires through.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_delta_site_default_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let prefix = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            /* segment_id = */ 0,
+            0,
+            0,
+            /* is_inter = */ 1,
+            0,
+            0,
+            0,
+            skip_ctx(0, 0),
+            0,
+            0,
+            is_inter_ctx(None, None),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            0,
+            7,
+            false,
+            &LOSSLESS_ALL_FALSE,
+            &InterFrameDeltaSiteInputs::default(),
+        )
+        .unwrap();
+        assert_eq!(prefix.cdef_idx, None);
+        assert_eq!(prefix.reduced_delta_q_index, 0);
+        assert_eq!(prefix.reduced_delta_lf, [0; FRAME_LF_COUNT]);
+        assert_eq!(prefix.is_inter, 1);
+    }
+
+    /// `enable_cdef = true, skip = 0` ⇒ §5.11.18 line 18 emits one
+    /// `L(cdef_bits)` literal. Round-trip the dispatcher's full byte
+    /// run through the matching decoder-side composed call sequence
+    /// and verify the `cdef_idx` decoded by `decode_cdef` matches the
+    /// writer's input. `read_deltas = false` keeps lines 19-20 on the
+    /// short-circuit arms.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_cdef_first_leaf_round_trip() {
+        for cdef_value in [0i8, 2, 5, 7] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(true);
+            let delta_inputs = InterFrameDeltaSiteInputs {
+                cdef_idx: cdef_value,
+                cdef_idx_prior_stamp: -1,
+                cdef_bits: 3,
+                enable_cdef: true,
+                ..Default::default()
+            };
+            let prefix = write_inter_frame_mode_info_prefix(
+                &mut writer,
+                &mut enc_cdfs,
+                BLOCK_16X16,
+                /* segment_id = */ 0,
+                /* skip_mode = */ 0,
+                /* skip = */ 0,
+                /* is_inter = */ 1,
+                0,
+                0,
+                0,
+                skip_ctx(0, 0),
+                0,
+                0,
+                is_inter_ctx(None, None),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                0,
+                7,
+                false,
+                &LOSSLESS_ALL_FALSE,
+                &delta_inputs,
+            )
+            .unwrap();
+            assert_eq!(prefix.cdef_idx, Some(cdef_value));
+
+            // Decoder-side replay through the dispatcher's full
+            // composed call sequence — pre-skip seg_id, skip_mode,
+            // skip, post-skip seg_id (none here — pre-skip is true),
+            // cdef, delta_q, delta_lf, is_inter.
+            let bytes = writer.finish();
+            let pad = pad_no_symbol(bytes);
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), true).unwrap();
+            let (_sid, _) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    true,
+                    0,
+                    true,
+                    false,
+                    false,
+                    false,
+                    0,
+                    7,
+                    &LOSSLESS_ALL_FALSE,
+                )
+                .unwrap();
+            let _ = walker
+                .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false, false)
+                .unwrap();
+            let _ = walker
+                .decode_skip(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false)
+                .unwrap();
+            let decoded_cdef = walker
+                .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 3)
+                .unwrap();
+            assert_eq!(decoded_cdef, cdef_value);
+            let _ = walker
+                .decode_delta_qindex(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    0,
+                    false,
+                    false,
+                    0,
+                )
+                .unwrap();
+            let _ = walker
+                .decode_delta_lf(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    0,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                )
+                .unwrap();
+            let decoded_is_inter = walker
+                .decode_is_inter(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    0,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(decoded_is_inter, 1);
+        }
+    }
+
+    /// §5.11.18 line 19 active arm: `read_deltas = true`, non-zero
+    /// `reduced_delta_q_index` ⇒ `read_delta_qindex` emits one S() +
+    /// sign bit. Round-trip and verify the `current_q_index` accumulator
+    /// the decoder produces matches `seed + (reduced << delta_q_res)`
+    /// (post-Clip3). `enable_cdef = false` keeps line 18 silent;
+    /// `delta_lf_present = false` (default) keeps line 20 silent.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_delta_qindex_literal_round_trip() {
+        for reduced in [1i32, -1, 2, -2] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(true);
+            let delta_inputs = InterFrameDeltaSiteInputs {
+                reduced_delta_q_index: reduced,
+                read_deltas: true,
+                delta_q_res: 1,
+                ..Default::default()
+            };
+            let prefix = write_inter_frame_mode_info_prefix(
+                &mut writer,
+                &mut enc_cdfs,
+                BLOCK_16X16,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                skip_ctx(0, 0),
+                0,
+                0,
+                is_inter_ctx(None, None),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                0,
+                7,
+                false,
+                &LOSSLESS_ALL_FALSE,
+                &delta_inputs,
+            )
+            .unwrap();
+            assert_eq!(prefix.reduced_delta_q_index, reduced);
+
+            let bytes = writer.finish();
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            walker.set_current_q_index(120);
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+            let (_sid, _) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    true,
+                    0,
+                    true,
+                    false,
+                    false,
+                    false,
+                    0,
+                    7,
+                    &LOSSLESS_ALL_FALSE,
+                )
+                .unwrap();
+            let _ = walker
+                .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false, false)
+                .unwrap();
+            let _ = walker
+                .decode_skip(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false)
+                .unwrap();
+            let _ = walker
+                .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, false, false, 0)
+                .unwrap();
+            let q_post = walker
+                .decode_delta_qindex(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    0,
+                    true,
+                    false,
+                    1,
+                )
+                .unwrap();
+            // §5.11.12 update: Clip3(1, 255, 120 + (reduced << 1)).
+            let expected = (120i32 + (reduced << 1)).clamp(1, 255);
+            assert_eq!(q_post, expected);
+        }
+    }
+
+    /// §5.11.18 line 20 active arm: `read_deltas && delta_lf_present`
+    /// ⇒ `read_delta_lf` emits one S() + sign bit per LF lane. Single-LF
+    /// path (`delta_lf_multi = false`) ⇒ one lane. Verify decoder side
+    /// observes the matching `DeltaLF[ 0 ]` accumulator update.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_delta_lf_single_round_trip() {
+        for reduced in [1i32, -1, 3] {
+            let mut row = [0i32; FRAME_LF_COUNT];
+            row[0] = reduced;
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(true);
+            let delta_inputs = InterFrameDeltaSiteInputs {
+                reduced_delta_lf: row,
+                read_deltas: true,
+                delta_lf_present: true,
+                delta_lf_multi: false,
+                delta_lf_res: 1,
+                ..Default::default()
+            };
+            let prefix = write_inter_frame_mode_info_prefix(
+                &mut writer,
+                &mut enc_cdfs,
+                BLOCK_16X16,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                skip_ctx(0, 0),
+                0,
+                0,
+                is_inter_ctx(None, None),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                0,
+                7,
+                false,
+                &LOSSLESS_ALL_FALSE,
+                &delta_inputs,
+            )
+            .unwrap();
+            assert_eq!(prefix.reduced_delta_lf[0], reduced);
+
+            let bytes = writer.finish();
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+            let (_sid, _) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    true,
+                    0,
+                    true,
+                    false,
+                    false,
+                    false,
+                    0,
+                    7,
+                    &LOSSLESS_ALL_FALSE,
+                )
+                .unwrap();
+            let _ = walker
+                .decode_skip_mode(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false, false)
+                .unwrap();
+            let _ = walker
+                .decode_skip(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false)
+                .unwrap();
+            let _ = walker
+                .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, false, false, 0)
+                .unwrap();
+            // §5.11.18 line 19 — read_deltas = true on the dispatcher
+            // side (shared gate with delta_lf); the writer emits S(0)
+            // for the zero delta, the decoder must read it.
+            let _ = walker
+                .decode_delta_qindex(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    0,
+                    true,
+                    false,
+                    0,
+                )
+                .unwrap();
+            let lf_post = walker
+                .decode_delta_lf(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    0,
+                    true,
+                    true,
+                    false,
+                    false,
+                    false,
+                    1,
+                )
+                .unwrap();
+            // §5.11.13 update: Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+            // 0 + (reduced << 1)). MAX_LOOP_FILTER = 63 per §3.
+            let expected = (reduced << 1).clamp(-63, 63);
+            assert_eq!(lf_post[0], expected);
+        }
     }
 
     // -----------------------------------------------------------------

@@ -4,6 +4,75 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r259 (2026-06-08): compose the r258 §5.11.18 lines 18-20
+  leaf writers (`write_cdef` / `write_delta_qindex` / `write_delta_lf`)
+  into `encoder::block_mode_info::write_inter_frame_mode_info_prefix`,
+  completing the §5.11.18 prefix dispatcher up to the
+  `read_is_inter()` call.
+
+  Lines 18-20 inputs are bundled into a new
+  `InterFrameDeltaSiteInputs` struct (with a `Default` impl yielding
+  the all-short-circuit configuration — `enable_cdef = false`,
+  `read_deltas = false`, zero deltas — so callers that target the
+  §5.11.18 no-bits-emitted arms only need `&Default::default()`).
+  The dispatcher's eight-line prologue is now:
+
+  * §5.11.19 `inter_segment_id( 1 )` — `write_inter_segment_id`.
+  * §5.11.10 `read_skip_mode( )` — `write_skip_mode`.
+  * §5.11.11 `read_skip( )` (when `skip_mode == 0`) — `write_skip`.
+  * §5.11.19 `inter_segment_id( 0 )` (when `!SegIdPreSkip`) —
+    `write_inter_segment_id`.
+  * §5.11.18 line 17 `Lossless = LosslessArray[ segment_id ]` lookup.
+  * §5.11.56 `read_cdef( )` — `write_cdef`.
+  * §5.11.12 `read_delta_qindex( )` — `write_delta_qindex`.
+  * §5.11.13 `read_delta_lf( )` — `write_delta_lf`.
+  * §5.11.18 line 21 `ReadDeltas = 0` (caller-owned state).
+  * §5.11.20 `read_is_inter( )` — `write_is_inter`.
+
+  `InterFrameModeInfoPrefix` grows three derived fields surfacing
+  the lines 18-20 results: `cdef_idx: Option<i8>` (`None` on the
+  §5.11.56 short-circuit or the anchor-already-stamped arm,
+  `Some(value)` on the first-leaf-in-anchor write),
+  `reduced_delta_q_index: i32` (the caller-passed §5.11.12 signed
+  intermediate, surfaced for chaining into the encoder-owned
+  `CurrentQIndex` accumulator), and `reduced_delta_lf: [i32;
+  FRAME_LF_COUNT]` (likewise for the §5.11.13 row).
+
+  +4 round-trip tests covering the new path: (1) all-short-circuit
+  arm with default `InterFrameDeltaSiteInputs` (no bits on any of
+  the three lines, `cdef_idx == None`); (2) `write_cdef`
+  first-leaf-in-anchor arm round-trip through the dispatcher's full
+  byte run against `decode_cdef`, including all eight composed
+  decoder reads in order; (3) §5.11.12 literal-branch round-trip
+  with `read_deltas = true` and non-zero `reducedDeltaQIndex`,
+  verifying the §5.11.12 `Clip3(1, 255, ...)` accumulator update;
+  (4) §5.11.13 single-LF round-trip with non-zero `DeltaLF[0]`
+  delta, verifying the `Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+  ...)` accumulator update.
+
+  All 8 existing dispatcher tests + 4 leaf-writer round-trip
+  batteries pass unchanged — the new parameter (`delta_inputs:
+  &InterFrameDeltaSiteInputs`) appears as the trailing positional
+  arg on every callsite, and the existing tests pass
+  `&InterFrameDeltaSiteInputs::default()` so the §5.11.18 lines
+  18-20 short-circuit on every prior assertion.
+
+  Library test count moves to 1705 (was 1701).
+
+  Followups for r260+:
+  * §5.11.18 line 23 `if ( is_inter )` terminal arms — §5.11.22
+    `intra_block_mode_info` writer (the `else` arm) and §5.11.23
+    `inter_block_mode_info` writer (the `if` arm), the latter
+    composing §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+    §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode` +
+    §5.11.29 `read_compound_type` writers.
+  * Wire the dispatcher's new `cdef_idx_committed` /
+    `reduced_delta_q_index` / `reduced_delta_lf` surfaced fields
+    into a downstream `WriteInterBlockMvState` aggregate once the
+    §5.11.23 inter-block dispatcher writer lands; the encoder-owned
+    `CurrentQIndex` / `DeltaLF[..]` / `cdef_idx[..]` accumulators
+    naturally fold in there.
+
 - encoder r258 (2026-06-08): add three §5.11.18 lines 18-20 leaf
   writers — `encoder::block_mode_info::write_cdef` (§5.11.56
   inverse, av1-spec p.104), `encoder::block_mode_info::write_delta_qindex`
