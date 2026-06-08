@@ -50,8 +50,9 @@
 use crate::cdf::{
     block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_interleave, TileCdfContext,
     BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES,
-    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_SEGMENTS, SEGMENT_ID_CONTEXTS, SKIP_CONTEXTS,
-    SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_SEGMENTS, SEGMENT_ID_CONTEXTS,
+    SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED,
+    UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -680,6 +681,282 @@ pub fn write_skip_mode(
     }
     let cdf = cdfs.skip_mode_cdf(ctx);
     writer.write_symbol(skip_mode as u32, cdf)
+}
+
+/// `inter_segment_id( preSkip )` inverse per §5.11.19 (av1-spec p.71) —
+/// the inter-frame per-block segment-id writer. Mirrors
+/// [`crate::cdf::PartitionWalker::decode_inter_segment_id`]. Called
+/// twice from the §5.11.18 `inter_frame_mode_info` writer: once with
+/// `pre_skip = true` before the §5.11.11 `read_skip()` call (the §5.9.14
+/// `SegIdPreSkip == 1` arm activates the early write) and once with
+/// `pre_skip = false` after (the post-skip arm covers the
+/// `SegIdPreSkip == 0` case and the temporal-update / skip-after-pre-skip
+/// update of the segmentation-prediction context arrays).
+///
+/// Spec body (av1-spec p.71, §5.11.19):
+///
+/// ```text
+///   inter_segment_id( preSkip ) {
+///       if ( segmentation_enabled ) {
+///           predictedSegmentId = get_segment_id( )
+///           if ( segmentation_update_map ) {
+///               if ( preSkip && !SegIdPreSkip ) {
+///                   segment_id = 0
+///                   return
+///               }
+///               if ( !preSkip ) {
+///                   if ( skip ) {
+///                       seg_id_predicted = 0
+///                       for ( i = 0; i < Num_4x4_Blocks_Wide[ MiSize ]; i++ )
+///                           AboveSegPredContext[ MiCol + i ] = seg_id_predicted
+///                       for ( i = 0; i < Num_4x4_Blocks_High[ MiSize ]; i++ )
+///                           LeftSegPredContext[ MiRow + i ] = seg_id_predicted
+///                       read_segment_id( )
+///                       return
+///                   }
+///               }
+///               if ( segmentation_temporal_update == 1 ) {
+///                   seg_id_predicted                                       S()
+///                   if ( seg_id_predicted )
+///                       segment_id = predictedSegmentId
+///                   else
+///                       read_segment_id( )
+///                   for ( i = 0; i < Num_4x4_Blocks_Wide[ MiSize ]; i++ )
+///                       AboveSegPredContext[ MiCol + i ] = seg_id_predicted
+///                   for ( i = 0; i < Num_4x4_Blocks_High[ MiSize ]; i++ )
+///                       LeftSegPredContext[ MiRow + i ] = seg_id_predicted
+///               } else {
+///                   read_segment_id( )
+///               }
+///           } else {
+///               segment_id = predictedSegmentId
+///           }
+///       } else {
+///           segment_id = 0
+///       }
+///   }
+/// ```
+///
+/// ## Arm dispatch (encoder mirror)
+///
+/// The writer transcribes each spec arm; arms that the decoder
+/// services with zero `S()` reads are also serviced here with zero
+/// `write_symbol` calls:
+///
+/// 1. `!segmentation_enabled` — no bits; `segment_id` MUST be `0`.
+/// 2. `!segmentation_update_map` — no bits; `segment_id` MUST equal
+///    `predicted_segment_id` (the §5.11.21 `get_segment_id()` result
+///    the caller pre-computes).
+/// 3. `pre_skip && !seg_id_pre_skip` — no bits; `segment_id` MUST be
+///    `0`. The post-skip call services the actual id read.
+/// 4. `!pre_skip && skip != 0` (post-skip arm's skip-block branch) —
+///    the decoder forces `seg_id_predicted = 0` (no `S()` read) and
+///    immediately descends to `read_segment_id()` with `skip = 1`,
+///    which inside §5.11.9 short-circuits to `segment_id = pred`.
+///    The writer mirrors: stamp `seg_id_predicted = 0` is the
+///    caller's grid responsibility; here we delegate to
+///    [`write_segment_id`] with `skip = 1` (no bits). `segment_id`
+///    MUST equal `pred` on this arm.
+/// 5. `segmentation_temporal_update` — emits one §8.2.6 `S()` symbol
+///    `seg_id_predicted` against `TileSegmentIdPredictedCdf[ ctx ]`
+///    where `ctx` is the §8.3.2 `seg_pred_ctx` (= `LeftSegPredContext[
+///    MiRow ] + AboveSegPredContext[ MiCol ]`, caller-derived in
+///    `0..SEGMENT_ID_PREDICTED_CONTEXTS = 3`). Then either:
+///    * `seg_id_predicted == 1` ⇒ adopt `predicted_segment_id` (no
+///      further bits); `segment_id` MUST equal `predicted_segment_id`.
+///    * `seg_id_predicted == 0` ⇒ delegate to [`write_segment_id`]
+///      with `skip = 0` for the literal id read (one §8.2.6 `S()`
+///      against `TileSegmentIdCdf[ seg_id_read_ctx ]`).
+///
+///    Per §6.10.9 spec-note "It is allowed for seg_id_predicted to be
+///    equal to 0 even if the value coded for the segment_id is equal
+///    to predictedSegmentId" — the caller chooses the flag and the
+///    writer does not second-guess it.
+/// 6. Fall-through (`segmentation_temporal_update == 0`) — delegate
+///    to [`write_segment_id`] with `skip = 0` for the literal id
+///    read.
+///
+/// ## Parameters
+///
+/// * `segment_id` — the final `segment_id ∈ 0..=last_active_seg_id`
+///   the block should decode to (≤ `MAX_SEGMENTS - 1 = 7`).
+/// * `pred` — the §5.11.9 neighbour-cascade predictor the caller
+///   already has on hand (used only on arms 4 + 5-else + 6, where
+///   `write_segment_id` is invoked).
+/// * `seg_id_read_ctx` — the §8.3.2 `segment_id_ctx` value the
+///   caller pre-computes via [`crate::cdf::segment_id_ctx`] for the
+///   inner `write_segment_id` `S()` arm. Only consulted on arms 4,
+///   5-else, and 6.
+/// * `seg_pred_ctx` — the §8.3.2 `seg_id_predicted` ctx value the
+///   caller pre-computes (= `LeftSegPredContext[ MiRow ] +
+///   AboveSegPredContext[ MiCol ]`, in `0..3`). Only consulted on
+///   arm 5.
+/// * `pre_skip` — the §5.11.18 caller-axis (`true` on the pre-skip
+///   call, `false` on the post-skip call).
+/// * `skip` — the §5.11.11 `read_skip` return (passed `0` on the
+///   pre-skip call — `read_skip` fires after `inter_segment_id( 1 )`).
+/// * `seg_id_predicted` — caller's choice on arm 5: `1` to adopt the
+///   `predicted_segment_id` (saves bits), `0` to code the literal id.
+///   Ignored on every other arm.
+/// * `segmentation_enabled` / `segmentation_update_map` /
+///   `segmentation_temporal_update` / `seg_id_pre_skip` — the §5.9.14
+///   frame-header derivations surfaced through
+///   [`SegmentationParams`].
+/// * `predicted_segment_id` — `get_segment_id()` result the caller
+///   pre-computes from the §6.10 reference-frame walk.
+/// * `last_active_seg_id` — §6.10.8 derivation
+///   (`MAX_SEGMENTS - 1 = 7` upper bound).
+///
+/// ## Range / mismatch guards (`Error::PartitionWalkOutOfRange`)
+///
+/// * `last_active_seg_id >= MAX_SEGMENTS = 8`.
+/// * `segment_id > last_active_seg_id`.
+/// * `pred > last_active_seg_id`.
+/// * `predicted_segment_id > last_active_seg_id`.
+/// * `seg_pred_ctx >= SEGMENT_ID_PREDICTED_CONTEXTS = 3` on arm 5.
+/// * `seg_id_read_ctx >= SEGMENT_ID_CONTEXTS = 3` on the
+///   `write_segment_id` `S()` arm (re-checked inside the inner
+///   writer).
+/// * `seg_id_predicted > 1` on arm 5.
+/// * Arm-precondition violations — `segment_id != 0` on arms 1 and
+///   3; `segment_id != predicted_segment_id` on arm 2 and on the
+///   `seg_id_predicted == 1` branch of arm 5; `segment_id != pred`
+///   on arm 4.
+///
+/// ## Stateless — no encoder-side grids
+///
+/// Mirroring the rest of `encoder::block_mode_info`, no
+/// `SegmentIds[]` / `AboveSegPredContext[]` / `LeftSegPredContext[]`
+/// arrays are maintained here. The decoder stamps those grids
+/// itself; an encoder caller typically threads a parallel
+/// [`crate::cdf::PartitionWalker`] purely for the grid stamps and
+/// uses [`crate::cdf::PartitionWalker::seg_pred_ctx`] (or the
+/// equivalent neighbour-array lookup) to derive `seg_pred_ctx`.
+///
+/// [`SegmentationParams`]: crate::uncompressed_header_tail::SegmentationParams
+#[allow(clippy::too_many_arguments)]
+pub fn write_inter_segment_id(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    segment_id: u8,
+    pred: u8,
+    seg_id_read_ctx: usize,
+    seg_pred_ctx: usize,
+    pre_skip: bool,
+    skip: u8,
+    seg_id_predicted: u8,
+    segmentation_enabled: bool,
+    segmentation_update_map: bool,
+    segmentation_temporal_update: bool,
+    seg_id_pre_skip: bool,
+    predicted_segment_id: u8,
+    last_active_seg_id: u8,
+) -> Result<(), Error> {
+    // Up-front range guards (mirror `decode_inter_segment_id`).
+    if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let max = last_active_seg_id as u32 + 1;
+    if segment_id as u32 >= max {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if pred as u32 >= max {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if predicted_segment_id as u32 >= max {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // Arm 1: §5.11.19 `if ( !segmentation_enabled ) segment_id = 0`.
+    if !segmentation_enabled {
+        if segment_id != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // Arm 2: §5.11.19 `else if ( !segmentation_update_map )
+    // segment_id = predictedSegmentId`.
+    if !segmentation_update_map {
+        if segment_id != predicted_segment_id {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // Arm 3: §5.11.19 `if ( preSkip && !SegIdPreSkip ) { segment_id = 0;
+    // return }` — the pre-skip caller defers to the post-skip call.
+    if pre_skip && !seg_id_pre_skip {
+        if segment_id != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // Arm 4: §5.11.19 `if ( !preSkip ) { if ( skip ) { seg_id_predicted
+    // = 0; ... read_segment_id(); return } }`. The inner
+    // `read_segment_id()` is called with `skip = 1`, which §5.11.9
+    // short-circuits to `segment_id = pred` (no `S()` read). The
+    // forced `seg_id_predicted = 0` grid stamp is the caller's job.
+    if !pre_skip && skip != 0 {
+        return write_segment_id(
+            writer,
+            cdfs,
+            segment_id,
+            /* skip = */ 1,
+            pred,
+            seg_id_read_ctx,
+            last_active_seg_id,
+        );
+    }
+
+    // Arm 5: §5.11.19 `if ( segmentation_temporal_update == 1 )` — code
+    // the binary `seg_id_predicted` S(), then either adopt or
+    // fall through.
+    if segmentation_temporal_update {
+        if seg_id_predicted > 1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if seg_pred_ctx >= SEGMENT_ID_PREDICTED_CONTEXTS {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let cdf = cdfs.segment_id_predicted_cdf(seg_pred_ctx);
+        writer.write_symbol(seg_id_predicted as u32, cdf)?;
+        if seg_id_predicted != 0 {
+            // §5.11.19 `if ( seg_id_predicted ) segment_id =
+            // predictedSegmentId` — adopt the previous-frame id; no
+            // further bits.
+            if segment_id != predicted_segment_id {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            return Ok(());
+        }
+        // `seg_id_predicted == 0` ⇒ §5.11.19 `else read_segment_id()`.
+        return write_segment_id(
+            writer,
+            cdfs,
+            segment_id,
+            /* skip = */ 0,
+            pred,
+            seg_id_read_ctx,
+            last_active_seg_id,
+        );
+    }
+
+    // Arm 6 (fall-through, `segmentation_temporal_update == 0`):
+    // §5.11.19 `else read_segment_id()` with `skip = 0` (the post-skip
+    // call's `skip == 1` arm was handled in Arm 4; the pre-skip call's
+    // `skip` parameter is forced to `0` by the §5.11.18 dispatch
+    // ordering).
+    write_segment_id(
+        writer,
+        cdfs,
+        segment_id,
+        /* skip = */ 0,
+        pred,
+        seg_id_read_ctx,
+        last_active_seg_id,
+    )
 }
 
 #[cfg(test)]
@@ -2252,5 +2529,751 @@ mod tests {
             true,
         )
         .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.19 read_inter_segment_id — write_inter_segment_id
+    // round-trips through PartitionWalker::decode_inter_segment_id.
+    // -----------------------------------------------------------------
+
+    /// Constant `LosslessArray` shape the round-trip tests share —
+    /// all-false matches the default §6.8.2 derivation and lets us
+    /// inspect the returned `lossless` flag without setting up the
+    /// quantiser path.
+    const LOSSLESS_ALL_FALSE: [bool; MAX_SEGMENTS] = [false; MAX_SEGMENTS];
+
+    /// Helper — pad an empty payload (the no-S() arms) so
+    /// `SymbolDecoder::init_symbol` accepts the buffer. Matches the
+    /// pattern in the `write_skip_seg_short_circuit` /
+    /// `write_segment_id_skip_short_circuit` tests.
+    fn pad_no_symbol(bytes: Vec<u8>) -> Vec<u8> {
+        if bytes.is_empty() {
+            vec![0u8]
+        } else {
+            bytes
+        }
+    }
+
+    /// Arm 1: `!segmentation_enabled` — no bits written, no bits read,
+    /// `segment_id == 0` on both sides.
+    #[test]
+    fn write_inter_segment_id_disabled_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_inter_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 0,
+            /* pred = */ 0,
+            /* seg_id_read_ctx = */ 0,
+            /* seg_pred_ctx = */ 0,
+            /* pre_skip = */ true,
+            /* skip = */ 0,
+            /* seg_id_predicted = */ 0,
+            /* segmentation_enabled = */ false,
+            /* segmentation_update_map = */ true,
+            /* segmentation_temporal_update = */ true,
+            /* seg_id_pre_skip = */ true,
+            /* predicted_segment_id = */ 0,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        let pos_before = dec.position();
+        let (sid, lossless) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut dec_cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                BLOCK_16X16,
+                /* pre_skip = */ true,
+                /* skip = */ 0,
+                /* seg_id_pre_skip = */ true,
+                /* segmentation_enabled = */ false,
+                /* segmentation_update_map = */ true,
+                /* segmentation_temporal_update = */ true,
+                /* predicted_segment_id = */ 0,
+                /* last_active_seg_id = */ 7,
+                &LOSSLESS_ALL_FALSE,
+            )
+            .unwrap();
+        assert_eq!(sid, 0);
+        assert!(!lossless);
+        assert_eq!(dec.position(), pos_before, "no S() read on disabled arm");
+    }
+
+    /// Arm 2: `!segmentation_update_map` — no bits; `segment_id ==
+    /// predicted_segment_id` on both sides.
+    #[test]
+    fn write_inter_segment_id_no_update_map_adopts_predicted() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_inter_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 4,
+            /* pred = */ 0,
+            /* seg_id_read_ctx = */ 0,
+            /* seg_pred_ctx = */ 0,
+            /* pre_skip = */ false,
+            /* skip = */ 0,
+            /* seg_id_predicted = */ 0,
+            /* segmentation_enabled = */ true,
+            /* segmentation_update_map = */ false,
+            /* segmentation_temporal_update = */ false,
+            /* seg_id_pre_skip = */ false,
+            /* predicted_segment_id = */ 4,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        let pos_before = dec.position();
+        let (sid, _) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* pre_skip = */ false,
+                /* skip = */ 0,
+                /* seg_id_pre_skip = */ false,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ false,
+                /* segmentation_temporal_update = */ false,
+                /* predicted_segment_id = */ 4,
+                7,
+                &LOSSLESS_ALL_FALSE,
+            )
+            .unwrap();
+        assert_eq!(sid, 4);
+        assert_eq!(dec.position(), pos_before, "no S() read on !update_map arm");
+    }
+
+    /// Arm 3: `pre_skip && !seg_id_pre_skip` early-exit — no bits;
+    /// `segment_id == 0` on both sides.
+    #[test]
+    fn write_inter_segment_id_pre_skip_early_exit_no_bits() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_inter_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 0,
+            /* pred = */ 0,
+            /* seg_id_read_ctx = */ 0,
+            /* seg_pred_ctx = */ 0,
+            /* pre_skip = */ true,
+            /* skip = */ 0,
+            /* seg_id_predicted = */ 0,
+            /* segmentation_enabled = */ true,
+            /* segmentation_update_map = */ true,
+            /* segmentation_temporal_update = */ false,
+            /* seg_id_pre_skip = */ false,
+            /* predicted_segment_id = */ 3,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        let pos_before = dec.position();
+        let (sid, _) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* pre_skip = */ true,
+                /* skip = */ 0,
+                /* seg_id_pre_skip = */ false,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ true,
+                /* segmentation_temporal_update = */ false,
+                /* predicted_segment_id = */ 3,
+                7,
+                &LOSSLESS_ALL_FALSE,
+            )
+            .unwrap();
+        assert_eq!(sid, 0);
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "no S() read on pre-skip early-exit"
+        );
+    }
+
+    /// Arm 4 (`!pre_skip && skip`): the inner `read_segment_id()`
+    /// fires with `skip = 1`, which §5.11.9 short-circuits to
+    /// `segment_id = pred` (no S() coded). Round-trip across the
+    /// 8-symbol alphabet of `pred` values at the frame origin (where
+    /// `pred = 0` because no neighbours), then with a stamped
+    /// neighbour where `pred != 0`.
+    #[test]
+    fn write_inter_segment_id_arm4_skip_branch_round_trip_at_origin() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        // At origin: all neighbours absent ⇒ §5.11.9 pred = 0.
+        write_inter_segment_id(
+            &mut writer,
+            &mut enc_cdfs,
+            /* segment_id = */ 0,
+            /* pred = */ 0,
+            /* seg_id_read_ctx = */ 0,
+            /* seg_pred_ctx = */ 0,
+            /* pre_skip = */ false,
+            /* skip = */ 1,
+            /* seg_id_predicted = */ 0,
+            /* segmentation_enabled = */ true,
+            /* segmentation_update_map = */ true,
+            /* segmentation_temporal_update = */ true,
+            /* seg_id_pre_skip = */ true,
+            /* predicted_segment_id = */ 0,
+            /* last_active_seg_id = */ 7,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        let pos_before = dec.position();
+        let (sid, _) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* pre_skip = */ false,
+                /* skip = */ 1,
+                /* seg_id_pre_skip = */ true,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ true,
+                /* segmentation_temporal_update = */ true,
+                /* predicted_segment_id = */ 0,
+                7,
+                &LOSSLESS_ALL_FALSE,
+            )
+            .unwrap();
+        assert_eq!(sid, 0);
+        assert_eq!(
+            dec.position(),
+            pos_before,
+            "Arm 4: no S() read (inner write_segment_id short-circuits on skip=1)"
+        );
+    }
+
+    /// Arm 5 with `seg_id_predicted == 1` — emits exactly one S()
+    /// (`seg_id_predicted` against `TileSegmentIdPredictedCdf`); the
+    /// id itself is the adopted `predicted_segment_id`, no further
+    /// bits. Round-trip across the alphabet of `predicted_segment_id`
+    /// values via the temporal-update arm at the frame origin
+    /// (`seg_pred_ctx = 0` because both neighbour ctx arrays are 0).
+    #[test]
+    fn write_inter_segment_id_temporal_update_adopt_round_trip() {
+        for predicted in 0..8u8 {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_inter_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ predicted,
+                /* pred = */ 0, // unused on the adopt branch
+                /* seg_id_read_ctx = */ 0,
+                /* seg_pred_ctx = */ 0,
+                /* pre_skip = */ false,
+                /* skip = */ 0,
+                /* seg_id_predicted = */ 1,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ true,
+                /* segmentation_temporal_update = */ true,
+                /* seg_id_pre_skip = */ true,
+                /* predicted_segment_id = */ predicted,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let (sid, _) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    /* pre_skip = */ false,
+                    /* skip = */ 0,
+                    /* seg_id_pre_skip = */ true,
+                    /* segmentation_enabled = */ true,
+                    /* segmentation_update_map = */ true,
+                    /* segmentation_temporal_update = */ true,
+                    /* predicted_segment_id = */ predicted,
+                    7,
+                    &LOSSLESS_ALL_FALSE,
+                )
+                .unwrap();
+            assert_eq!(
+                sid, predicted,
+                "adopt round trip failed at predicted = {}",
+                predicted
+            );
+        }
+    }
+
+    /// Arm 5 with `seg_id_predicted == 0` — emits two S() values:
+    /// `seg_id_predicted = 0` against `TileSegmentIdPredictedCdf` then
+    /// the §5.11.9 `S()` against `TileSegmentIdCdf` for the literal
+    /// id. Round-trip across the alphabet of `segment_id` values at
+    /// the frame origin (where the §5.11.9 pred = 0).
+    #[test]
+    fn write_inter_segment_id_temporal_update_literal_round_trip() {
+        for sid_in in 0..8u8 {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_inter_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ sid_in,
+                /* pred = */ 0,
+                /* seg_id_read_ctx = */ 0,
+                /* seg_pred_ctx = */ 0,
+                /* pre_skip = */ false,
+                /* skip = */ 0,
+                /* seg_id_predicted = */ 0,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ true,
+                /* segmentation_temporal_update = */ true,
+                /* seg_id_pre_skip = */ true,
+                /* predicted_segment_id = */ 0,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let (sid_out, _) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    /* pre_skip = */ false,
+                    /* skip = */ 0,
+                    /* seg_id_pre_skip = */ true,
+                    /* segmentation_enabled = */ true,
+                    /* segmentation_update_map = */ true,
+                    /* segmentation_temporal_update = */ true,
+                    /* predicted_segment_id = */ 0,
+                    7,
+                    &LOSSLESS_ALL_FALSE,
+                )
+                .unwrap();
+            assert_eq!(
+                sid_out, sid_in,
+                "literal round trip failed at sid = {}",
+                sid_in
+            );
+        }
+    }
+
+    /// Arm 6 (`segmentation_temporal_update == 0`, fall-through) —
+    /// single §5.11.9 S() for the literal id; no `seg_id_predicted`
+    /// symbol. Round-trip across the alphabet at the frame origin.
+    #[test]
+    fn write_inter_segment_id_fallthrough_round_trip() {
+        for sid_in in 0..8u8 {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_inter_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ sid_in,
+                /* pred = */ 0,
+                /* seg_id_read_ctx = */ 0,
+                /* seg_pred_ctx = */ 0,
+                /* pre_skip = */ false,
+                /* skip = */ 0,
+                /* seg_id_predicted = */ 0,
+                /* segmentation_enabled = */ true,
+                /* segmentation_update_map = */ true,
+                /* segmentation_temporal_update = */ false,
+                /* seg_id_pre_skip = */ true,
+                /* predicted_segment_id = */ 0,
+                /* last_active_seg_id = */ 7,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let (sid_out, _) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    BLOCK_16X16,
+                    /* pre_skip = */ false,
+                    /* skip = */ 0,
+                    /* seg_id_pre_skip = */ true,
+                    /* segmentation_enabled = */ true,
+                    /* segmentation_update_map = */ true,
+                    /* segmentation_temporal_update = */ false,
+                    /* predicted_segment_id = */ 0,
+                    7,
+                    &LOSSLESS_ALL_FALSE,
+                )
+                .unwrap();
+            assert_eq!(
+                sid_out, sid_in,
+                "arm 6 fall-through round trip failed at sid = {}",
+                sid_in
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.19 caller-bug shapes — every mismatch surfaces as
+    // PartitionWalkOutOfRange.
+    // -----------------------------------------------------------------
+
+    /// Arm 1 rejection: `!segmentation_enabled` forces `segment_id =
+    /// 0`; a non-zero caller value is a bug.
+    #[test]
+    fn write_inter_segment_id_arm1_rejects_nonzero_segment_id() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            /* segment_id = */ 3,
+            0,
+            0,
+            0,
+            true,
+            0,
+            0,
+            /* segmentation_enabled = */ false,
+            true,
+            true,
+            true,
+            0,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 2 rejection: `!segmentation_update_map` forces
+    /// `segment_id = predicted_segment_id`.
+    #[test]
+    fn write_inter_segment_id_arm2_rejects_segment_id_mismatch() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            /* segment_id = */ 2,
+            0,
+            0,
+            0,
+            false,
+            0,
+            0,
+            true,
+            /* segmentation_update_map = */ false,
+            false,
+            false,
+            /* predicted_segment_id = */ 5,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 3 rejection: `pre_skip && !seg_id_pre_skip` forces
+    /// `segment_id = 0`.
+    #[test]
+    fn write_inter_segment_id_arm3_rejects_nonzero_segment_id() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            /* segment_id = */ 3,
+            0,
+            0,
+            0,
+            /* pre_skip = */ true,
+            0,
+            0,
+            true,
+            true,
+            false,
+            /* seg_id_pre_skip = */ false,
+            3,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 4 rejection: `!pre_skip && skip` delegates to
+    /// `write_segment_id` with `skip = 1`, which requires
+    /// `segment_id == pred`. A mismatch surfaces from the inner
+    /// writer.
+    #[test]
+    fn write_inter_segment_id_arm4_rejects_pred_mismatch() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            /* segment_id = */ 3,
+            /* pred = */ 1, // mismatched — must equal segment_id on skip arm
+            0,
+            0,
+            /* pre_skip = */ false,
+            /* skip = */ 1,
+            0,
+            true,
+            true,
+            true,
+            true,
+            0,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 5 (`seg_id_predicted == 1`) rejection: adoption requires
+    /// `segment_id == predicted_segment_id`.
+    #[test]
+    fn write_inter_segment_id_arm5_adopt_rejects_predicted_mismatch() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            /* segment_id = */ 4,
+            0,
+            0,
+            0,
+            false,
+            0,
+            /* seg_id_predicted = */ 1,
+            true,
+            true,
+            true,
+            true,
+            /* predicted_segment_id = */ 2,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 5 rejection: `seg_id_predicted > 1` is outside the binary
+    /// alphabet.
+    #[test]
+    fn write_inter_segment_id_arm5_rejects_out_of_range_seg_id_predicted() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            0,
+            0,
+            false,
+            0,
+            /* seg_id_predicted = */ 2,
+            true,
+            true,
+            true,
+            true,
+            0,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 5 rejection: `seg_pred_ctx >= SEGMENT_ID_PREDICTED_CONTEXTS
+    /// = 3`.
+    #[test]
+    fn write_inter_segment_id_arm5_rejects_out_of_range_seg_pred_ctx() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            0,
+            /* seg_pred_ctx = */ SEGMENT_ID_PREDICTED_CONTEXTS,
+            false,
+            0,
+            0,
+            true,
+            true,
+            true,
+            true,
+            0,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Up-front rejection: `last_active_seg_id >= MAX_SEGMENTS`.
+    #[test]
+    fn write_inter_segment_id_rejects_out_of_range_last_active() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            0,
+            0,
+            false,
+            0,
+            0,
+            true,
+            true,
+            false,
+            true,
+            0,
+            /* last_active_seg_id = */ MAX_SEGMENTS as u8,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Up-front rejection: `segment_id > last_active_seg_id` (outside
+    /// the alphabet).
+    #[test]
+    fn write_inter_segment_id_rejects_segment_id_out_of_alphabet() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            /* segment_id = */ 5,
+            0,
+            0,
+            0,
+            false,
+            0,
+            0,
+            true,
+            true,
+            false,
+            true,
+            0,
+            /* last_active_seg_id = */ 3,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Up-front rejection: `pred > last_active_seg_id`.
+    #[test]
+    fn write_inter_segment_id_rejects_pred_out_of_alphabet() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            0,
+            /* pred = */ 5,
+            0,
+            0,
+            false,
+            0,
+            0,
+            true,
+            true,
+            false,
+            true,
+            0,
+            /* last_active_seg_id = */ 3,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Up-front rejection: `predicted_segment_id > last_active_seg_id`.
+    #[test]
+    fn write_inter_segment_id_rejects_predicted_segment_id_out_of_alphabet() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_segment_id(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            0,
+            0,
+            false,
+            0,
+            0,
+            true,
+            true,
+            false,
+            true,
+            /* predicted_segment_id = */ 5,
+            /* last_active_seg_id = */ 3,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 5 admissibility across every §8.3.2 `seg_pred_ctx` ∈
+    /// `0..SEGMENT_ID_PREDICTED_CONTEXTS = 3`. Round-trips the
+    /// `seg_id_predicted == 1` branch (cheapest — one S() in, no inner
+    /// `write_segment_id`).
+    #[test]
+    fn write_inter_segment_id_accepts_every_seg_pred_ctx() {
+        for ctx in 0..SEGMENT_ID_PREDICTED_CONTEXTS {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_inter_segment_id(
+                &mut writer,
+                &mut enc_cdfs,
+                /* segment_id = */ 3,
+                0,
+                0,
+                /* seg_pred_ctx = */ ctx,
+                false,
+                0,
+                /* seg_id_predicted = */ 1,
+                true,
+                true,
+                true,
+                true,
+                /* predicted_segment_id = */ 3,
+                7,
+            )
+            .unwrap();
+            let _bytes = writer.finish();
+        }
     }
 }

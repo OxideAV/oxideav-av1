@@ -4,6 +4,74 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r256 (2026-06-08): add
+  `encoder::block_mode_info::write_inter_segment_id` — the §5.11.19
+  `inter_segment_id( preSkip )` syntax-element writer (av1-spec
+  p.71). The encoder mirror of
+  [`crate::cdf::PartitionWalker::decode_inter_segment_id`]; lands as
+  the natural caller of r255's `write_segment_id` (§5.11.9) and
+  composes it on the three arms that descend into
+  `read_segment_id()`.
+
+  Transcribes the §5.11.19 six-arm dispatch verbatim:
+
+  1. `!segmentation_enabled` ⇒ `segment_id = 0`, no bits.
+  2. `!segmentation_update_map` ⇒ `segment_id =
+     predictedSegmentId`, no bits.
+  3. `preSkip && !SegIdPreSkip` ⇒ `segment_id = 0`, no bits (the
+     pre-skip caller defers to the post-skip call).
+  4. `!preSkip && skip` (post-skip arm's skip-block branch) ⇒
+     descends to `write_segment_id` with `skip = 1`, which §5.11.9
+     short-circuits to `segment_id = pred` with no `S()`. The
+     forced `seg_id_predicted = 0` grid stamp is the caller's job
+     (the writer is stateless — no encoder-side
+     `AboveSegPredContext` / `LeftSegPredContext` arrays).
+  5. `segmentation_temporal_update == 1` ⇒ emits one §8.2.6 `S()`
+     `seg_id_predicted` symbol against
+     `TileSegmentIdPredictedCdf[ ctx ]` where `ctx` is the §8.3.2
+     `seg_pred_ctx` (`LeftSegPredContext[ MiRow ] +
+     AboveSegPredContext[ MiCol ]`, caller-derived in
+     `0..SEGMENT_ID_PREDICTED_CONTEXTS = 3`). Then either adopt
+     `predictedSegmentId` (no further bits, `segment_id` MUST equal
+     `predicted_segment_id`) or fall through to `write_segment_id`
+     with `skip = 0` for the literal id read. The §6.10.9 spec-note
+     permits `seg_id_predicted == 0` even when
+     `segment_id == predictedSegmentId`; the caller chooses the
+     flag.
+  6. Fall-through (`segmentation_temporal_update == 0`) ⇒ delegate
+     to `write_segment_id` with `skip = 0` for the literal id
+     read.
+
+  Stateless on purpose (mirrors the rest of
+  `encoder::block_mode_info`) — every §8.3.2 context (`seg_pred_ctx`
+  for arm 5, `seg_id_read_ctx` for the inner `write_segment_id`
+  `S()` arm) is passed in, and the caller threads its own
+  `PartitionWalker` (or equivalent neighbour-array state) for grid
+  stamps.
+
+  Range / mismatch guards (all surface as
+  `Error::PartitionWalkOutOfRange`):
+  `last_active_seg_id >= MAX_SEGMENTS = 8`,
+  `segment_id > last_active_seg_id`, `pred > last_active_seg_id`,
+  `predicted_segment_id > last_active_seg_id`,
+  `seg_pred_ctx >= SEGMENT_ID_PREDICTED_CONTEXTS = 3` on arm 5,
+  `seg_id_predicted > 1` on arm 5, and per-arm preconditions
+  (`segment_id != 0` on arms 1 and 3,
+  `segment_id != predicted_segment_id` on arm 2 and the adopt
+  branch of arm 5, `segment_id != pred` on arm 4 via the inner
+  `write_segment_id`).
+
+  +19 unit tests: six arm round-trips against
+  `PartitionWalker::decode_inter_segment_id` (disabled / no-update-
+  map / pre-skip-early-exit no-bits arms, the arm 4 `skip` branch,
+  the arm 5 adopt branch exhaustive over `predicted_segment_id
+  ∈ 0..8`, the arm 5 literal branch exhaustive over `segment_id
+  ∈ 0..8`, the arm 6 fall-through exhaustive over `segment_id ∈
+  0..8`), eleven range / arm-mismatch rejections (one per arm plus
+  the up-front guards), and one §8.3.2 admissibility sweep across
+  every `seg_pred_ctx ∈ 0..SEGMENT_ID_PREDICTED_CONTEXTS = 3`.
+  Full library test count moves to 1676 (was 1657).
+
 - encoder r255 (2026-06-08): add
   `encoder::block_mode_info::write_segment_id` — the §5.11.9
   `read_segment_id()` syntax-element writer (av1-spec p.66). This

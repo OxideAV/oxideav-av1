@@ -2,6 +2,113 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 256)
+
+Round 256 lands **`encoder::block_mode_info::write_inter_segment_id`**
+— the §5.11.19 `inter_segment_id( preSkip )` syntax-element writer
+(av1-spec p.71). This is the natural caller of r255's
+`write_segment_id` (§5.11.9) and the encoder mirror of
+[`crate::cdf::PartitionWalker::decode_inter_segment_id`]. Lands the
+post-skip / pre-skip inter-frame per-block segment-id dispatch
+that the §5.11.18 `inter_frame_mode_info` chain consumes twice
+(once before `read_skip()`, once after, per the §5.9.14
+`SegIdPreSkip` derivation).
+
+The writer transcribes §5.11.19's six-arm dispatch verbatim:
+
+1. `!segmentation_enabled` ⇒ `segment_id = 0`, no bits written.
+2. `!segmentation_update_map` ⇒ `segment_id =
+   predictedSegmentId`, no bits written.
+3. `preSkip && !SegIdPreSkip` ⇒ `segment_id = 0`, no bits (the
+   pre-skip caller defers to the post-skip call per the §5.9.14
+   gating).
+4. `!preSkip && skip` (post-skip arm's skip-block branch) ⇒
+   delegates to `write_segment_id` with `skip = 1`, which
+   §5.11.9 short-circuits to `segment_id = pred` with no `S()`.
+5. `segmentation_temporal_update == 1` ⇒ emits one §8.2.6 `S()`
+   `seg_id_predicted` symbol against
+   `TileSegmentIdPredictedCdf[ ctx ]` (where `ctx` is the §8.3.2
+   `seg_pred_ctx = LeftSegPredContext[ MiRow ] +
+   AboveSegPredContext[ MiCol ]` ∈ 0..3); then either adopts
+   `predictedSegmentId` (no further bits) or falls through to
+   `write_segment_id` for the literal id read.
+6. Fall-through (`segmentation_temporal_update == 0`) ⇒
+   delegates to `write_segment_id` with `skip = 0` for the
+   literal id read.
+
+Stateless mirror of the rest of `encoder::block_mode_info` — no
+encoder-side `AboveSegPredContext` / `LeftSegPredContext` /
+`SegmentIds` arrays. Every §8.3.2 context (`seg_pred_ctx` for arm
+5, `seg_id_read_ctx` for the inner `write_segment_id` `S()` arm)
+is passed in. Per the §6.10.9 spec-note, the caller chooses
+`seg_id_predicted ∈ {0, 1}` on arm 5 even when
+`segment_id == predictedSegmentId` (adopting saves bits;
+literal-coding is still legal).
+
+Range / mismatch guards (`Error::PartitionWalkOutOfRange`):
+`last_active_seg_id >= MAX_SEGMENTS = 8`,
+`segment_id > last_active_seg_id`,
+`pred > last_active_seg_id`,
+`predicted_segment_id > last_active_seg_id`,
+`seg_pred_ctx >= SEGMENT_ID_PREDICTED_CONTEXTS = 3` on arm 5,
+`seg_id_predicted > 1` on arm 5, plus per-arm preconditions
+(`segment_id != 0` on arms 1 and 3,
+`segment_id != predicted_segment_id` on arm 2 and the adopt
+branch of arm 5, `segment_id != pred` on arm 4 via the inner
+`write_segment_id`).
+
+### Round 256 test summary
+
++19 unit tests:
+
+* `write_inter_segment_id_disabled_no_bits` — arm 1
+  (`!segmentation_enabled`): no bits emitted / no bits read,
+  `segment_id = 0` recovered, decoder bit position unchanged.
+* `write_inter_segment_id_no_update_map_adopts_predicted` —
+  arm 2 (`!segmentation_update_map`): no bits, `segment_id =
+  predictedSegmentId` recovered.
+* `write_inter_segment_id_pre_skip_early_exit_no_bits` —
+  arm 3 (`preSkip && !SegIdPreSkip`): no bits, `segment_id = 0`
+  recovered.
+* `write_inter_segment_id_arm4_skip_branch_round_trip_at_origin`
+  — arm 4 (`!preSkip && skip`): inner `write_segment_id`
+  short-circuits on `skip = 1`, no `S()` coded.
+* `write_inter_segment_id_temporal_update_adopt_round_trip` —
+  arm 5 with `seg_id_predicted = 1`: exhaust
+  `predicted_segment_id ∈ 0..8`, one `S()` for the binary flag,
+  no literal `S()` after.
+* `write_inter_segment_id_temporal_update_literal_round_trip` —
+  arm 5 with `seg_id_predicted = 0`: exhaust `segment_id ∈ 0..8`,
+  two `S()`s (binary then literal).
+* `write_inter_segment_id_fallthrough_round_trip` — arm 6
+  (`segmentation_temporal_update == 0`): exhaust `segment_id ∈
+  0..8`, one `S()` for the literal id.
+* Eleven rejections — the four per-arm precondition
+  rejections, the three arm-5 sub-rejections (predicted
+  mismatch, out-of-range `seg_id_predicted`, out-of-range
+  `seg_pred_ctx`), and the four up-front guards
+  (`last_active_seg_id`, `segment_id`, `pred`,
+  `predicted_segment_id` each `> last_active_seg_id`).
+* `write_inter_segment_id_accepts_every_seg_pred_ctx` — §8.3.2
+  admissibility across every `seg_pred_ctx ∈
+  0..SEGMENT_ID_PREDICTED_CONTEXTS = 3` via the cheap arm-5
+  adopt branch (one `S()` each).
+
+Full library test count moves to 1676 (was 1657).
+
+### Out of scope for round 256 / pending follow-ups
+
+* §5.11.18 `inter_frame_mode_info` dispatcher — the writer that
+  composes `write_inter_segment_id` twice (pre-skip + post-skip)
+  around `write_skip_mode` / `write_skip` / `write_is_inter`,
+  and routes to the §5.11.21 intra / §5.11.23 inter chain.
+* §5.11.23 `inter_block_mode_info` chain (ref-frame pair,
+  inter-mode, MV writers, interintra / motion-mode /
+  compound-type + interpolation filter) — the bulk of the
+  §5.11.18 inter cascade remains decoder-only.
+* §7.10 inter-prediction primitive driver, §7.14 loop-filter,
+  §7.15 CDEF bring-up — the three near-term encoder milestones.
+
 ## Status — 2026-06-08 (round 255)
 
 Round 255 lands **`encoder::block_mode_info::write_segment_id`**
