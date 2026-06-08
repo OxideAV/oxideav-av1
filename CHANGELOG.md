@@ -4,6 +4,63 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r258 (2026-06-08): add three §5.11.18 lines 18-20 leaf
+  writers — `encoder::block_mode_info::write_cdef` (§5.11.56
+  inverse, av1-spec p.104), `encoder::block_mode_info::write_delta_qindex`
+  (§5.11.12 inverse, p.68), and `encoder::block_mode_info::write_delta_lf`
+  (§5.11.13 inverse, p.68). These are the three syntax elements
+  the r257 `write_inter_frame_mode_info_prefix` dispatcher leaves
+  out (between the post-skip segment_id arm and the `read_is_inter`
+  call); next round will compose them into the dispatcher's body.
+
+  Each writer mirrors its decoder counterpart on
+  [`crate::cdf::PartitionWalker`] exactly: same arm structure,
+  same short-circuit set, same escape-ladder reach. `write_cdef`
+  is the cleanest pure-literal writer (`L(cdef_bits)` on the
+  first-leaf-in-anchor arm, no bits otherwise); `write_delta_qindex`
+  and `write_delta_lf` share the §5.11.12 / §5.11.13 `S() +
+  L(3) + L(n) + L(1)` escape-ladder shape (the analytic inverse
+  of the spec's `delta_q_abs = abs_bits + (1 << n) + 1` is
+  `n = FloorLog2(abs_value - 1)` for `abs_value >= 3`).
+
+  Stateless on grid state: `write_cdef` does not maintain an
+  encoder-side `cdef_idx[]` grid (caller threads its own — or
+  uses a parallel `PartitionWalker`, the round-trip-test pattern);
+  `write_delta_qindex` / `write_delta_lf` consume the *signed*
+  `reducedDeltaQIndex` / `reducedDeltaLfLevel` intermediate so
+  the running `CurrentQIndex` / `DeltaLF[ i ]` accumulators stay
+  caller-owned (decoder-symmetric — the decoder returns the
+  post-`Clip3` value the caller already had to fold in).
+
+  +17 tests covering every arm: short-circuit set (`skip /
+  coded_lossless / !enable_cdef / allow_intrabc` for cdef;
+  `MiSize == sbSize && skip` + `!ReadDeltas` + `!delta_lf_present`
+  for the deltas), first-leaf vs anchor-already-stamped for cdef
+  (with prior-stamp verification), literal vs escape branches
+  (including the boundary value 3, mid-range 17, and the
+  near-max ±511 with `Clip3` clamping), single-LF vs multi-LF
+  vs mono_chrome two-lane variants for `write_delta_lf`, plus
+  range-guard batteries on every writer (`cdef_bits > 3`,
+  `cdef_idx >= (1 << cdef_bits)`, `delta_q_res > 3`, `|reduced|
+  > 511`, non-zero on short-circuit arm, non-zero past
+  frame_lf_count). Each round-trip test replays the writer's byte
+  run through the matching decoder call and asserts every decoded
+  scalar (or row) matches the writer's input.
+
+  Library test count moves to 1701 (was 1684).
+
+  Followups for r259+:
+  * Bring r257's `write_inter_frame_mode_info_prefix` to a full
+    §5.11.18 dispatcher by composing the three writers landed here
+    into its body between the post-skip segment_id arm and the
+    `read_is_inter` call.
+  * §5.11.18 line 23 `if ( is_inter )` terminal arms — §5.11.22
+    `intra_block_mode_info` writer (the `else` arm) and §5.11.23
+    `inter_block_mode_info` writer (the `if` arm), the latter
+    composing §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+    §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode`
+    + §5.11.29 `read_compound_type` writers.
+
 - encoder r257 (2026-06-08): add
   `encoder::block_mode_info::write_inter_frame_mode_info_prefix` —
   the §5.11.18 `inter_frame_mode_info()` dispatcher (av1-spec p.71)

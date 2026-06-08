@@ -49,10 +49,10 @@
 
 use crate::cdf::{
     block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_interleave, TileCdfContext,
-    BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, INTRA_MODES,
-    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_SEGMENTS, SEGMENT_ID_CONTEXTS,
-    SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED,
-    UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    BLOCK_128X128, BLOCK_64X64, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS,
+    DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_MODES, INTRA_MODE_CONTEXTS,
+    IS_INTER_CONTEXTS, MAX_SEGMENTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
+    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -1261,6 +1261,481 @@ pub fn write_inter_frame_mode_info_prefix(
         is_inter,
         lossless,
     })
+}
+
+/// `read_cdef()` inverse per §5.11.56 (av1-spec p.104) — the per-leaf
+/// CDEF-index writer that mirrors
+/// [`crate::cdf::PartitionWalker::decode_cdef`].
+///
+/// Spec body (av1-spec p.104):
+///
+/// ```text
+///   read_cdef( ) {
+///       if ( skip || CodedLossless || !enable_cdef || allow_intrabc) {
+///           return
+///       }
+///       cdefSize4 = Num_4x4_Blocks_Wide[ BLOCK_64X64 ]
+///       cdefMask4 = ~(cdefSize4 - 1)
+///       r = MiRow & cdefMask4
+///       c = MiCol & cdefMask4
+///       if ( cdef_idx[ r ][ c ] == -1 ) {
+///           cdef_idx[ r ][ c ]                          L(cdef_bits)
+///           w4 = Num_4x4_Blocks_Wide[ MiSize ]
+///           h4 = Num_4x4_Blocks_High[ MiSize ]
+///           for ( i = r; i < r + h4 ; i += cdefSize4 ) {
+///               for ( j = c; j < c + w4 ; j += cdefSize4 ) {
+///                   cdef_idx[ i ][ j ] = cdef_idx[ r ][ c ]
+///               }
+///           }
+///       }
+///   }
+/// ```
+///
+/// ## Arms (mirrors the decoder branch-by-branch)
+///
+/// * **Short-circuit set** — when *any* of `skip`, `coded_lossless`,
+///   `!enable_cdef`, `allow_intrabc` is true the §5.11.56 outer
+///   `if` fires and the function returns without consuming a bit.
+///   The writer emits no symbol and returns `Ok(None)`.
+/// * **Anchor already stamped** — `anchor_already_stamped == true`
+///   indicates an earlier leaf in the same 64×64 anchor already
+///   committed the `cdef_idx` literal (the decoder side reads zero
+///   bits and observes the prior stamp). The writer emits no symbol
+///   and returns `Ok(None)`. The caller must ensure `cdef_idx`
+///   matches the prior stamp; mismatch is surfaced as
+///   [`Error::PartitionWalkOutOfRange`].
+/// * **First leaf in anchor** — emits one `L(cdef_bits)` literal
+///   carrying `cdef_idx`. `cdef_bits` is the §5.9.19 frame-header
+///   field clamped to `0..=3` by `f(2)`. `cdef_idx` MUST be in
+///   `0..(1 << cdef_bits)`. Returns `Ok(Some(cdef_idx))` so the
+///   caller can stamp its own encoder-side grid if it maintains one.
+///
+/// ## Parameter contract
+///
+/// `cdef_idx_prior_stamp` is the value the decoder side would read
+/// from `cdef_idx[ r ][ c ]` before this call — supplied so the
+/// writer's `anchor_already_stamped == true` arm can verify the
+/// caller passes the same value (otherwise the decoder will diverge
+/// at the matching `decode_cdef` call). Pass `-1` when
+/// `anchor_already_stamped == false` (the §5.11.55 sentinel) — the
+/// writer ignores the value on that arm anyway, but accepting an
+/// explicit argument keeps the call sites uniform.
+///
+/// `cdef_idx` is the value the writer commits when the inner `if`
+/// fires. It MUST fit in `cdef_bits` bits (`0..(1 << cdef_bits)`);
+/// `cdef_bits == 0` accepts only `cdef_idx == 0` and emits zero
+/// bits (the §8.2.5 `L(0)` literal). When `anchor_already_stamped
+/// == true`, `cdef_idx` MUST equal `cdef_idx_prior_stamp`.
+///
+/// ## Range guards
+///
+/// All surfaced as [`Error::PartitionWalkOutOfRange`]:
+///
+/// * `cdef_bits > 3` (caller bug — §5.9.19 `f(2)` cap).
+/// * `cdef_idx >= (1 << cdef_bits)` (caller bug — exceeds the L()
+///   field width).
+/// * `anchor_already_stamped == true` and `cdef_idx_prior_stamp !=
+///   cdef_idx` (caller bug — would diverge from the decoder).
+///
+/// ## Stateless on grid-fill
+///
+/// Mirrors the rest of `encoder::block_mode_info`: the writer does
+/// not maintain an encoder-side `cdef_idx[]` grid. The caller threads
+/// its own (or uses a parallel [`crate::cdf::PartitionWalker`] —
+/// the round-trip tests below use that exact pattern). The decoder
+/// side stamps `cdef_idx[]` on the matching `decode_cdef` call
+/// against its own walker.
+#[allow(clippy::too_many_arguments)]
+pub fn write_cdef(
+    writer: &mut SymbolWriter,
+    cdef_idx: i8,
+    cdef_idx_prior_stamp: i8,
+    cdef_bits: u32,
+    skip: u8,
+    coded_lossless: bool,
+    enable_cdef: bool,
+    allow_intrabc: bool,
+    anchor_already_stamped: bool,
+) -> Result<Option<i8>, Error> {
+    // §5.9.19: cdef_bits is f(2) ⇒ 0..=3. Larger is a caller bug.
+    if cdef_bits > 3 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.56 short-circuit set: any-true ⇒ no bits emitted.
+    if skip != 0 || coded_lossless || !enable_cdef || allow_intrabc {
+        return Ok(None);
+    }
+
+    // §5.11.56 outer `if`: anchor already stamped ⇒ no bits emitted.
+    // The caller's `cdef_idx` MUST match the prior stamp; otherwise
+    // the decoder will observe a different value than the writer
+    // expects (caller bug — mid-anchor leaves carry the same value).
+    if anchor_already_stamped {
+        if cdef_idx_prior_stamp != cdef_idx {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(None);
+    }
+
+    // §5.11.56 inner branch: first leaf in this anchor ⇒ `L(cdef_bits)`.
+    // §8.2.5 `L(n)` requires `value < (1 << n)`; `cdef_bits == 0`
+    // accepts only `cdef_idx == 0` (an empty literal).
+    if cdef_idx < 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let value = cdef_idx as u32;
+    if cdef_bits == 0 {
+        if value != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // §8.2.5 L(0) — no bits emitted.
+        return Ok(Some(cdef_idx));
+    }
+    if value >= (1u32 << cdef_bits) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    writer.write_literal(cdef_bits, value)?;
+    Ok(Some(cdef_idx))
+}
+
+/// `read_delta_qindex()` inverse per §5.11.12 (av1-spec p.68) — the
+/// per-block `CurrentQIndex` delta writer that mirrors
+/// [`crate::cdf::PartitionWalker::decode_delta_qindex`].
+///
+/// Spec body (av1-spec p.68):
+///
+/// ```text
+///   read_delta_qindex( ) {
+///       sbSize = use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64
+///       if ( MiSize == sbSize && skip )
+///           return
+///       if ( ReadDeltas ) {
+///           delta_q_abs                                            S()
+///           if ( delta_q_abs == DELTA_Q_SMALL ) {
+///               delta_q_rem_bits                                   L(3)
+///               delta_q_rem_bits++
+///               delta_q_abs_bits                          L(delta_q_rem_bits)
+///               delta_q_abs = delta_q_abs_bits + (1 << delta_q_rem_bits) + 1
+///           }
+///           if ( delta_q_abs ) {
+///               delta_q_sign_bit                                   L(1)
+///               reducedDeltaQIndex = delta_q_sign_bit ? -delta_q_abs : delta_q_abs
+///               CurrentQIndex = Clip3(1, 255,
+///                   CurrentQIndex + (reducedDeltaQIndex << delta_q_res))
+///           }
+///       }
+///   }
+/// ```
+///
+/// ## Caller-supplied `reduced_delta_q_index`
+///
+/// The writer's per-call deliverable is the §5.11.12 *signed*
+/// `reducedDeltaQIndex` value (the same intermediate the decoder
+/// computes between the `delta_q_sign_bit` read and the `Clip3`
+/// update). The Clip3 update itself is the caller's job: it operates
+/// on the running `CurrentQIndex` accumulator, which the encoder
+/// owns in its frame-walk state (mirroring the
+/// [`crate::cdf::PartitionWalker::set_current_q_index`] / `decode_delta_qindex`
+/// return-value pattern). This keeps the writer pure on grid-state.
+///
+/// `delta_q_abs` is derived as `reduced_delta_q_index.unsigned_abs() as u32`.
+///
+/// ## Arms
+///
+/// * **Superblock-skip short-circuit** — when `sub_size == sbSize &&
+///   skip != 0` the §5.11.12 outer `if` returns without reading.
+///   The writer emits no bits. `reduced_delta_q_index` MUST be `0`
+///   (caller bug otherwise).
+/// * **`!read_deltas` short-circuit** — outer `if (ReadDeltas)` is
+///   false ⇒ no bits emitted. `reduced_delta_q_index` MUST be `0`.
+/// * **Literal branch** — `delta_q_abs ∈ 0..DELTA_Q_SMALL` ⇒ one
+///   `S()` over `TileDeltaQCdf` carrying `delta_q_abs`. If
+///   `delta_q_abs != 0`, follow with `L(1)` for the sign bit.
+/// * **Escape branch** — `delta_q_abs >= DELTA_Q_SMALL` ⇒ one
+///   `S()` carrying `DELTA_Q_SMALL`, then the escape ladder:
+///   `delta_q_rem_bits = L(3)` carrying `n - 1` (where `n` is
+///   `FloorLog2(delta_q_abs - 1) - 1` such that the spec's
+///   `delta_q_abs = abs_bits + (1 << n) + 1` reconstructs the input),
+///   then `delta_q_abs_bits = L(n)` carrying `delta_q_abs - (1 << n) - 1`,
+///   then `L(1)` for the sign bit.
+///
+/// ## Range guards
+///
+/// All surfaced as [`Error::PartitionWalkOutOfRange`]:
+///
+/// * `sub_size >= BLOCK_SIZES` (caller bug — invalid block-size ordinal).
+/// * `delta_q_res > 3` (caller bug — §5.9.17 `f(2)` cap).
+/// * Short-circuit arms with non-zero `reduced_delta_q_index` (caller bug —
+///   the decoder won't read the bits, so the writer mustn't emit them
+///   either).
+/// * `delta_q_abs > 511` — exceeds the §5.11.12 escape-ladder reach
+///   (`delta_q_rem_bits ∈ 0..=7` ⇒ `n ∈ 1..=8` ⇒ `delta_q_abs ∈
+///   3..=511` on the escape arm; combined with `0..=DELTA_Q_SMALL =
+///   0..=3` on the literal arm the full range is `0..=511`).
+#[allow(clippy::too_many_arguments)]
+pub fn write_delta_qindex(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    sub_size: usize,
+    reduced_delta_q_index: i32,
+    skip: u8,
+    read_deltas: bool,
+    use_128x128_superblock: bool,
+    delta_q_res: u8,
+) -> Result<(), Error> {
+    if sub_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if delta_q_res > 3 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.12 superblock-skip short-circuit.
+    let sb_size = if use_128x128_superblock {
+        BLOCK_128X128
+    } else {
+        BLOCK_64X64
+    };
+    if sub_size == sb_size && skip != 0 {
+        if reduced_delta_q_index != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.12 outer gate.
+    if !read_deltas {
+        if reduced_delta_q_index != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.12 |delta_q_abs| derivation. The spec's range is `0..=511`
+    // (literal arm covers `0..=3`, escape arm covers `3..=511`).
+    let abs_value: u32 = reduced_delta_q_index.unsigned_abs();
+    if abs_value > 511 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    let cdf = cdfs.delta_q_cdf();
+    if (abs_value as usize) < DELTA_Q_SMALL {
+        // §5.11.12 literal branch: `delta_q_abs S()` carries the value directly.
+        writer.write_symbol(abs_value, cdf)?;
+    } else {
+        // §5.11.12 escape branch: `delta_q_abs S()` carries
+        // DELTA_Q_SMALL, then the rem_bits / abs_bits ladder.
+        writer.write_symbol(DELTA_Q_SMALL as u32, cdf)?;
+        // Solve `abs_value = abs_bits + (1 << n) + 1` for the smallest
+        // `n >= 1` such that `abs_bits = abs_value - (1 << n) - 1 <
+        // (1 << n)` (i.e. `abs_value < 2 * (1 << n) + 1`). The
+        // equivalent unbiased rephrase: `n = FloorLog2(abs_value - 1)`,
+        // valid for `abs_value >= 3` (which the literal-branch guard
+        // above already ensures — `DELTA_Q_SMALL == 3`).
+        debug_assert!(abs_value >= 3);
+        let n = floor_log2(abs_value - 1);
+        debug_assert!((1..=8).contains(&n));
+        // Spec writes `delta_q_rem_bits = L(3) + 1` ⇒ `rem_bits + 1 = n`
+        // ⇒ encode `rem_bits = n - 1`.
+        let rem_bits_field = n - 1;
+        debug_assert!(rem_bits_field <= 7, "L(3) field width");
+        writer.write_literal(3, rem_bits_field)?;
+        // `delta_q_abs_bits = abs_value - (1 << n) - 1`, encoded in `L(n)`.
+        let abs_bits = abs_value - (1u32 << n) - 1;
+        debug_assert!(abs_bits < (1u32 << n));
+        writer.write_literal(n, abs_bits)?;
+    }
+
+    // §5.11.12 sign bit only when `delta_q_abs != 0`.
+    if abs_value != 0 {
+        let sign: u32 = if reduced_delta_q_index < 0 { 1 } else { 0 };
+        writer.write_literal(1, sign)?;
+    }
+
+    Ok(())
+}
+
+/// `read_delta_lf()` inverse per §5.11.13 (av1-spec p.68) — the
+/// per-block per-loop-filter-strength delta writer that mirrors
+/// [`crate::cdf::PartitionWalker::decode_delta_lf`].
+///
+/// Spec body (av1-spec p.68):
+///
+/// ```text
+///   read_delta_lf( ) {
+///       sbSize = use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64
+///       if ( MiSize == sbSize && skip )
+///           return
+///       if ( ReadDeltas && delta_lf_present ) {
+///           frameLfCount = 1
+///           if ( delta_lf_multi )
+///               frameLfCount = ( NumPlanes > 1 ) ? FRAME_LF_COUNT
+///                                                : ( FRAME_LF_COUNT - 2 )
+///           for ( i = 0; i < frameLfCount; i++ ) {
+///               delta_lf_abs                                        S()
+///               if ( delta_lf_abs == DELTA_LF_SMALL ) {
+///                   delta_lf_rem_bits                              L(3)
+///                   n = delta_lf_rem_bits + 1
+///                   delta_lf_abs_bits                              L(n)
+///                   deltaLfAbs = delta_lf_abs_bits + (1 << n) + 1
+///               } else {
+///                   deltaLfAbs = delta_lf_abs
+///               }
+///               if ( deltaLfAbs ) {
+///                   delta_lf_sign_bit                              L(1)
+///                   reducedDeltaLfLevel = delta_lf_sign_bit ?
+///                                            -deltaLfAbs : deltaLfAbs
+///                   DeltaLF[ i ] = Clip3( -MAX_LOOP_FILTER, MAX_LOOP_FILTER,
+///                       DeltaLF[ i ] + (reducedDeltaLfLevel << delta_lf_res) )
+///               }
+///           }
+///       }
+///   }
+/// ```
+///
+/// ## Caller-supplied `reduced_delta_lf` row
+///
+/// The writer's per-iteration deliverable is the §5.11.13 *signed*
+/// `reducedDeltaLfLevel[ i ]` value (the intermediate the decoder
+/// computes between the `delta_lf_sign_bit` read and the `Clip3`
+/// update). The Clip3 update is the caller's job; it operates on the
+/// running `DeltaLF[ i ]` accumulator that the encoder owns in its
+/// frame-walk state (mirroring the
+/// [`crate::cdf::PartitionWalker::current_delta_lf`] /
+/// `decode_delta_lf` return-value pattern).
+///
+/// `reduced_delta_lf` is fixed-length [`FRAME_LF_COUNT`]. The writer
+/// reads only the first `frameLfCount` entries (`1` on the
+/// `!delta_lf_multi` branch; either `FRAME_LF_COUNT` or
+/// `FRAME_LF_COUNT - 2` on the multi branch per `mono_chrome`).
+/// Entries beyond `frameLfCount` MUST be `0` (caller bug otherwise —
+/// the decoder won't observe them).
+///
+/// ## Arms
+///
+/// Per-iteration shape mirrors `write_delta_qindex` exactly except
+/// for the CDF source: `delta_lf_cdf()` (single-LF) or
+/// `delta_lf_multi_cdf(i)` (multi-LF). The escape ladder, literal
+/// branch, and sign bit are identical to §5.11.12.
+///
+/// ## Range guards
+///
+/// All surfaced as [`Error::PartitionWalkOutOfRange`]:
+///
+/// * `sub_size >= BLOCK_SIZES`.
+/// * `delta_lf_res > 3` (caller bug — §5.9.18 `f(2)` cap).
+/// * Short-circuit arms with any non-zero `reduced_delta_lf` entry.
+/// * Any `reduced_delta_lf[ i ].unsigned_abs() > 511` (exceeds the
+///   escape-ladder reach).
+/// * Entries beyond `frameLfCount` being non-zero.
+#[allow(clippy::too_many_arguments)]
+pub fn write_delta_lf(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    sub_size: usize,
+    reduced_delta_lf: &[i32; FRAME_LF_COUNT],
+    skip: u8,
+    read_deltas: bool,
+    delta_lf_present: bool,
+    delta_lf_multi: bool,
+    mono_chrome: bool,
+    use_128x128_superblock: bool,
+    delta_lf_res: u8,
+) -> Result<(), Error> {
+    if sub_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if delta_lf_res > 3 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.13 superblock-skip short-circuit (identical to §5.11.12).
+    let sb_size = if use_128x128_superblock {
+        BLOCK_128X128
+    } else {
+        BLOCK_64X64
+    };
+    let sb_short_circuit = sub_size == sb_size && skip != 0;
+    let read_gate = read_deltas && delta_lf_present;
+
+    if sb_short_circuit || !read_gate {
+        if reduced_delta_lf.iter().any(|&v| v != 0) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.13 frameLfCount derivation.
+    let frame_lf_count: usize = if delta_lf_multi {
+        if mono_chrome {
+            FRAME_LF_COUNT - 2
+        } else {
+            FRAME_LF_COUNT
+        }
+    } else {
+        1
+    };
+
+    // Entries beyond frameLfCount must be 0 (decoder won't read them).
+    for &v in reduced_delta_lf.iter().skip(frame_lf_count) {
+        if v != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+
+    for (i, &reduced) in reduced_delta_lf.iter().take(frame_lf_count).enumerate() {
+        let abs_value: u32 = reduced.unsigned_abs();
+        if abs_value > 511 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+
+        let cdf: &mut [u16] = if delta_lf_multi {
+            cdfs.delta_lf_multi_cdf(i)
+        } else {
+            cdfs.delta_lf_cdf()
+        };
+        if (abs_value as usize) < DELTA_LF_SMALL {
+            // §5.11.13 literal branch.
+            writer.write_symbol(abs_value, cdf)?;
+        } else {
+            // §5.11.13 escape branch — same shape as §5.11.12.
+            writer.write_symbol(DELTA_LF_SMALL as u32, cdf)?;
+            debug_assert!(abs_value >= 3);
+            let n = floor_log2(abs_value - 1);
+            debug_assert!((1..=8).contains(&n));
+            let rem_bits_field = n - 1;
+            debug_assert!(rem_bits_field <= 7);
+            writer.write_literal(3, rem_bits_field)?;
+            let abs_bits = abs_value - (1u32 << n) - 1;
+            debug_assert!(abs_bits < (1u32 << n));
+            writer.write_literal(n, abs_bits)?;
+        }
+
+        if abs_value != 0 {
+            let sign: u32 = if reduced < 0 { 1 } else { 0 };
+            writer.write_literal(1, sign)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
+/// 0) { x >>= 1; s++; } return s - 1;`. Local helper because the
+/// public surface lives in `cdf` / `symbol_decoder`; pulled inline
+/// to avoid widening this module's import surface. Mirrors
+/// [`crate::encoder::symbol_writer`]'s private helper of the same
+/// name.
+#[inline]
+fn floor_log2(mut x: u32) -> u32 {
+    debug_assert!(x != 0, "§4.7 FloorLog2 requires x != 0");
+    let mut s: u32 = 0;
+    while x != 0 {
+        x >>= 1;
+        s += 1;
+    }
+    s - 1
 }
 
 #[cfg(test)]
@@ -4138,5 +4613,752 @@ mod tests {
             prefix.lossless,
             "LosslessArray[3] == true ⇒ lossless = true"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.56 read_cdef — write_cdef round-trips through decode_cdef.
+    // -----------------------------------------------------------------
+
+    /// Each §5.11.56 short-circuit (`skip != 0`, `coded_lossless`,
+    /// `!enable_cdef`, `allow_intrabc`) emits no bits and returns
+    /// `Ok(None)`. We then confirm the decoder also reads zero bits
+    /// and reports the §5.11.55 `-1` sentinel.
+    #[test]
+    fn write_cdef_short_circuits_emit_no_bits() {
+        // Four (label, skip, coded_lossless, enable_cdef, allow_intrabc)
+        // arms, one per short-circuit condition.
+        let arms: [(&str, u8, bool, bool, bool); 4] = [
+            ("skip", 1, false, true, false),
+            ("coded_lossless", 0, true, true, false),
+            ("disabled", 0, false, false, false),
+            ("allow_intrabc", 0, false, true, true),
+        ];
+        for (label, skip, coded_lossless, enable_cdef, allow_intrabc) in arms {
+            let mut writer = SymbolWriter::new(true);
+            let stamped = write_cdef(
+                &mut writer,
+                /* cdef_idx = */ 5, // ignored on short-circuit
+                /* cdef_idx_prior_stamp = */ -1,
+                /* cdef_bits = */ 3,
+                skip,
+                coded_lossless,
+                enable_cdef,
+                allow_intrabc,
+                /* anchor_already_stamped = */ false,
+            )
+            .unwrap();
+            assert!(stamped.is_none(), "{label} short-circuit ⇒ no stamp");
+
+            // Bytes emitted: only the writer's initial state. Replaying
+            // through decode_cdef MUST consume zero symbol bits.
+            let bytes = pad_no_symbol(writer.finish());
+            let (mut walker, _) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+            let pos_before = dec.position();
+            let value = walker
+                .decode_cdef(
+                    &mut dec,
+                    /* mi_row = */ 0,
+                    /* mi_col = */ 0,
+                    BLOCK_16X16,
+                    skip,
+                    coded_lossless,
+                    enable_cdef,
+                    allow_intrabc,
+                    /* cdef_bits = */ 3,
+                )
+                .unwrap();
+            assert_eq!(value, -1, "{label}: §5.11.55 sentinel survives");
+            assert_eq!(
+                dec.position(),
+                pos_before,
+                "{label}: no bit consumed by decoder"
+            );
+        }
+    }
+
+    /// First-leaf-in-anchor branch: `cdef_bits = 3` ⇒ `L(3)`
+    /// literal. Round-trip a few values through `decode_cdef`.
+    #[test]
+    fn write_cdef_first_leaf_round_trip_l3() {
+        for cdef_value in [0i8, 1, 3, 5, 7] {
+            let mut writer = SymbolWriter::new(true);
+            let stamped = write_cdef(
+                &mut writer,
+                cdef_value,
+                -1,
+                /* cdef_bits = */ 3,
+                /* skip = */ 0,
+                /* coded_lossless = */ false,
+                /* enable_cdef = */ true,
+                /* allow_intrabc = */ false,
+                /* anchor_already_stamped = */ false,
+            )
+            .unwrap();
+            assert_eq!(stamped, Some(cdef_value));
+
+            let bytes = writer.finish();
+            let (mut walker, _) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+            let decoded = walker
+                .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 3)
+                .unwrap();
+            assert_eq!(decoded, cdef_value);
+        }
+    }
+
+    /// `cdef_bits = 0` ⇒ the §8.2.5 `L(0)` empty literal: `cdef_idx
+    /// = 0` only, no bits emitted. The decoder side mirrors via its
+    /// `cdef_bits == 0` shortcut.
+    #[test]
+    fn write_cdef_first_leaf_cdef_bits_zero_no_bits() {
+        let mut writer = SymbolWriter::new(true);
+        let stamped = write_cdef(
+            &mut writer,
+            /* cdef_idx = */ 0,
+            -1,
+            /* cdef_bits = */ 0,
+            0,
+            false,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(stamped, Some(0));
+        let bytes = pad_no_symbol(writer.finish());
+        let (mut walker, _) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+        let pos_before = dec.position();
+        let decoded = walker
+            .decode_cdef(&mut dec, 0, 0, BLOCK_16X16, 0, false, true, false, 0)
+            .unwrap();
+        assert_eq!(decoded, 0);
+        assert_eq!(dec.position(), pos_before, "L(0) emits zero bits");
+    }
+
+    /// Baseline: the bytes a fresh writer produces on `finish()`
+    /// without any write_* call. Short-circuit arms must match this
+    /// exactly (no symbol writes ⇒ no extra bits beyond the 15-bit
+    /// §8.2.2 init prefix).
+    fn baseline_writer_bytes() -> Vec<u8> {
+        SymbolWriter::new(true).finish()
+    }
+
+    /// Anchor-already-stamped branch: no bits emitted; the caller's
+    /// `cdef_idx` MUST equal the prior stamp.
+    #[test]
+    fn write_cdef_anchor_already_stamped_no_bits() {
+        let mut writer = SymbolWriter::new(true);
+        let stamped = write_cdef(
+            &mut writer,
+            /* cdef_idx = */ 4,
+            /* cdef_idx_prior_stamp = */ 4,
+            /* cdef_bits = */ 3,
+            0,
+            false,
+            true,
+            false,
+            /* anchor_already_stamped = */ true,
+        )
+        .unwrap();
+        assert!(stamped.is_none(), "no new stamp on second leaf");
+        assert_eq!(
+            writer.finish(),
+            baseline_writer_bytes(),
+            "no bits emitted on second leaf"
+        );
+    }
+
+    /// Range guards: `cdef_bits > 3`, `cdef_idx >= (1 << cdef_bits)`,
+    /// prior-stamp mismatch, `cdef_bits == 0 && cdef_idx != 0`, negative
+    /// `cdef_idx`.
+    #[test]
+    fn write_cdef_rejects_out_of_range() {
+        let mut writer = SymbolWriter::new(true);
+        let err = write_cdef(&mut writer, 0, -1, 4, 0, false, true, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_cdef(&mut writer, 8, -1, 3, 0, false, true, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_cdef(
+            &mut writer,
+            5,
+            /*prior=*/ 4,
+            3,
+            0,
+            false,
+            true,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_cdef(&mut writer, 1, -1, 0, 0, false, true, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_cdef(&mut writer, -2, -1, 3, 0, false, true, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.12 read_delta_qindex — write_delta_qindex round-trips
+    // through decode_delta_qindex.
+    // -----------------------------------------------------------------
+
+    /// Helper: round-trip a `(reduced, base_q, delta_q_res)` through
+    /// the §5.11.12 writer + decoder pair and return the decoder's
+    /// resulting `CurrentQIndex`.
+    fn round_trip_delta_q(
+        reduced: i32,
+        base_q: i32,
+        delta_q_res: u8,
+        sub_size: usize,
+    ) -> (i32, Vec<u8>) {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            sub_size,
+            reduced,
+            /* skip = */ 0,
+            /* read_deltas = */ true,
+            /* use_128x128_superblock = */ false,
+            delta_q_res,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        walker.set_current_q_index(base_q);
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let q = walker
+            .decode_delta_qindex(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                sub_size,
+                0,
+                true,
+                false,
+                delta_q_res,
+            )
+            .unwrap();
+        (q, bytes)
+    }
+
+    /// Literal branch round-trips: `|reduced| < DELTA_Q_SMALL`. Cover
+    /// positive, negative, and zero.
+    #[test]
+    fn write_delta_qindex_literal_branch_round_trip() {
+        // delta_q_res = 0 ⇒ `Clip3(1, 255, base + reduced)`.
+        for (reduced, base, expected) in [
+            (0i32, 100i32, 100i32),
+            (1, 100, 101),
+            (2, 100, 102),
+            (-1, 100, 99),
+            (-2, 100, 98),
+        ] {
+            let (q, _bytes) = round_trip_delta_q(reduced, base, 0, BLOCK_16X16);
+            assert_eq!(q, expected, "reduced={reduced} base={base}");
+        }
+    }
+
+    /// Literal branch with `delta_q_res != 0` ⇒ shift before clip.
+    #[test]
+    fn write_delta_qindex_literal_branch_with_shift() {
+        // delta_q_res = 2 ⇒ `Clip3(1, 255, base + (reduced << 2))`.
+        let (q, _) = round_trip_delta_q(1, 50, 2, BLOCK_16X16);
+        assert_eq!(q, 54, "50 + (1 << 2)");
+        let (q, _) = round_trip_delta_q(-1, 200, 2, BLOCK_16X16);
+        assert_eq!(q, 196, "200 + (-1 << 2)");
+    }
+
+    /// Escape branch round-trips: `|reduced| >= DELTA_Q_SMALL`. Cover
+    /// the boundary value, a mid-range value, and a near-max value.
+    #[test]
+    fn write_delta_qindex_escape_branch_round_trip() {
+        // DELTA_Q_SMALL = 3 ⇒ n = FloorLog2(3 - 1) = 1, abs_bits = 3 -
+        // 2 - 1 = 0. Encoded: S(DELTA_Q_SMALL), L(3)=0, L(1)=0, L(1)=0 sign.
+        for (reduced, base, expected_q) in [
+            (3i32, 100, 103),
+            (-3i32, 100, 97),
+            (17i32, 100, 117),
+            (-17i32, 100, 83),
+            (511i32, 100, 255), // clipped to 255
+            (-511i32, 100, 1),  // clipped to 1
+        ] {
+            let (q, _) = round_trip_delta_q(reduced, base, 0, BLOCK_16X16);
+            assert_eq!(q, expected_q, "reduced={reduced} base={base}");
+        }
+    }
+
+    /// Superblock-skip short-circuit: `MiSize == sbSize && skip` ⇒ no
+    /// bits emitted, decoder reads zero bits.
+    #[test]
+    fn write_delta_qindex_sb_skip_short_circuit() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_64X64,
+            /* reduced = */ 0,
+            /* skip = */ 1,
+            true,
+            /* use_128x128_superblock = */ false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.finish(), baseline_writer_bytes());
+    }
+
+    /// `!read_deltas` outer-gate short-circuit: no bits emitted.
+    #[test]
+    fn write_delta_qindex_read_deltas_false_short_circuit() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            0,
+            0,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.finish(), baseline_writer_bytes());
+    }
+
+    /// Range guards: `sub_size >= BLOCK_SIZES`, `delta_q_res > 3`,
+    /// `|reduced| > 511`, non-zero on short-circuit arm.
+    #[test]
+    fn write_delta_qindex_rejects_out_of_range() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_SIZES,
+            0,
+            0,
+            true,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            0,
+            0,
+            true,
+            false,
+            4,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            512,
+            0,
+            true,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            5,
+            0,
+            false,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_qindex(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_64X64,
+            5,
+            /* skip = */ 1,
+            true,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.13 read_delta_lf — write_delta_lf round-trips through
+    // decode_delta_lf.
+    // -----------------------------------------------------------------
+
+    /// Single-LF branch (`delta_lf_multi == false`): one iteration,
+    /// writes `DeltaLF[0]` only. Round-trip a literal value through
+    /// `decode_delta_lf`.
+    #[test]
+    fn write_delta_lf_single_round_trip() {
+        let reduced = [2i32, 0, 0, 0];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &reduced,
+            0,
+            true,
+            true,
+            /* delta_lf_multi = */ false,
+            false,
+            false,
+            /* delta_lf_res = */ 0,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                /* delta_lf_multi = */ false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        // §5.11.13 Clip3(-MAX_LOOP_FILTER, MAX_LOOP_FILTER, 0 + (2 << 0)) = 2.
+        assert_eq!(row[0], 2);
+        assert_eq!(&row[1..], &[0; 3]);
+    }
+
+    /// Multi-LF branch with NumPlanes > 1: four iterations, four
+    /// distinct values + signs round-trip.
+    #[test]
+    fn write_delta_lf_multi_round_trip_4_lanes() {
+        let reduced = [1i32, -2, 3, -1];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &reduced,
+            0,
+            true,
+            true,
+            /* delta_lf_multi = */ true,
+            /* mono_chrome = */ false,
+            false,
+            /* delta_lf_res = */ 0,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                true,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row, [1, -2, 3, -1]);
+    }
+
+    /// Multi-LF branch with mono_chrome: only first 2 entries
+    /// (`FRAME_LF_COUNT - 2 = 2`) read. Entries beyond must be 0.
+    #[test]
+    fn write_delta_lf_multi_mono_chrome_two_lanes() {
+        let reduced = [1i32, -1, 0, 0];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &reduced,
+            0,
+            true,
+            true,
+            true,
+            /* mono_chrome = */ true,
+            false,
+            0,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                true,
+                true,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row[0], 1);
+        assert_eq!(row[1], -1);
+        // Lanes 2 + 3 stayed at the zero accumulator (no read).
+        assert_eq!(row[2], 0);
+        assert_eq!(row[3], 0);
+    }
+
+    /// Escape-branch round-trip through the §5.11.13 ladder.
+    #[test]
+    fn write_delta_lf_escape_branch_round_trip() {
+        let reduced = [50i32, 0, 0, 0];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &reduced,
+            0,
+            true,
+            true,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        let bytes = pad_no_symbol(writer.finish());
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        // 0 + 50 = 50, clipped to [-MAX_LOOP_FILTER, MAX_LOOP_FILTER] = [-63, 63] ⇒ 50.
+        assert_eq!(row[0], 50);
+    }
+
+    /// Outer gates short-circuit (no bits): `sub_size == sb_size && skip`,
+    /// `!read_deltas`, `!delta_lf_present`.
+    #[test]
+    fn write_delta_lf_short_circuits_emit_no_bits() {
+        let zeros = [0i32; FRAME_LF_COUNT];
+        let baseline = baseline_writer_bytes();
+
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_64X64,
+            &zeros,
+            /* skip = */ 1,
+            true,
+            true,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.finish(), baseline);
+
+        let mut writer = SymbolWriter::new(true);
+        write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &zeros,
+            0,
+            /* read_deltas = */ false,
+            true,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.finish(), baseline);
+
+        let mut writer = SymbolWriter::new(true);
+        write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &zeros,
+            0,
+            true,
+            /* delta_lf_present = */ false,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.finish(), baseline);
+    }
+
+    /// Range guards: `sub_size`, `delta_lf_res`, |reduced| > 511,
+    /// non-zero short-circuit entry, non-zero entry past frame_lf_count.
+    #[test]
+    fn write_delta_lf_rejects_out_of_range() {
+        let zeros = [0i32; FRAME_LF_COUNT];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_SIZES,
+            &zeros,
+            0,
+            true,
+            true,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &zeros,
+            0,
+            true,
+            true,
+            false,
+            false,
+            false,
+            /* delta_lf_res = */ 4,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let oversize = [600i32, 0, 0, 0];
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &oversize,
+            0,
+            true,
+            true,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // Non-zero on the !read_deltas short-circuit arm.
+        let nonzero = [3i32, 0, 0, 0];
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &nonzero,
+            0,
+            false,
+            true,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // Non-zero past frame_lf_count (single-LF ⇒ frame_lf_count = 1).
+        let tail_nonzero = [0i32, 1, 0, 0];
+        let mut writer = SymbolWriter::new(true);
+        let err = write_delta_lf(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            &tail_nonzero,
+            0,
+            true,
+            true,
+            /* delta_lf_multi = */ false,
+            false,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

@@ -2,6 +2,100 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 258)
+
+Round 258 lands the three §5.11.18 lines 18-20 leaf writers that the
+r257 `write_inter_frame_mode_info_prefix` dispatcher will compose
+into its body in the next round:
+
+* `encoder::block_mode_info::write_cdef` — §5.11.56 `read_cdef()`
+  inverse (av1-spec p.104). Mirrors
+  [`crate::cdf::PartitionWalker::decode_cdef`]; emits `L(cdef_bits)`
+  on the first-leaf-in-anchor branch, no bits on the §5.11.56
+  short-circuit set (`skip || coded_lossless || !enable_cdef ||
+  allow_intrabc`) or when the anchor was stamped by an earlier leaf
+  (caller passes `anchor_already_stamped == true` and the prior
+  stamp value for verification). Returns `Ok(Some(cdef_idx))` only
+  on the inner-`if` arm so the caller knows when an encoder-side
+  grid stamp is needed.
+
+* `encoder::block_mode_info::write_delta_qindex` — §5.11.12
+  `read_delta_qindex()` inverse (av1-spec p.68). Mirrors
+  [`crate::cdf::PartitionWalker::decode_delta_qindex`]; takes the
+  signed `reduced_delta_q_index` (the §5.11.12 intermediate between
+  the sign-bit read and the `Clip3` update) and emits the
+  `delta_q_abs S()` + escape-ladder + sign-bit byte sequence. The
+  caller owns the running `CurrentQIndex` accumulator
+  (decoder-symmetric — `decode_delta_qindex` returns the
+  post-`Clip3` value the caller already had to fold in).
+
+* `encoder::block_mode_info::write_delta_lf` — §5.11.13
+  `read_delta_lf()` inverse (av1-spec p.68). Mirrors
+  [`crate::cdf::PartitionWalker::decode_delta_lf`]; the per-iteration
+  shape is identical to `write_delta_qindex` (same escape ladder,
+  same sign bit), only the CDF source differs (`delta_lf_cdf()` for
+  single-LF, `delta_lf_multi_cdf(i)` for multi-LF). Takes a
+  `[i32; FRAME_LF_COUNT]` row of `reducedDeltaLfLevel[ i ]`
+  intermediates and writes the first `frameLfCount` entries
+  (`1` / `2` / `4` per the §5.11.13 derivation).
+
+### Escape-ladder inverse
+
+The §5.11.12 / §5.11.13 escape arm reconstructs `delta_q_abs =
+abs_bits + (1 << n) + 1` where `n = delta_q_rem_bits + 1`. The
+writer solves it analytically: for an input `abs_value >=
+DELTA_Q_SMALL = 3`, `n = FloorLog2(abs_value - 1)` is the unique
+`n >= 1` such that `abs_bits = abs_value - (1 << n) - 1 < (1 <<
+n)`. Then `delta_q_rem_bits = n - 1` is written in the `L(3)` field
+and `abs_bits` in the `L(n)` field. Coverage range: `abs_value ∈
+0..=511` (`0..=3` literal + `3..=511` escape).
+
+### Round 258 test summary
+
++17 unit tests:
+
+* `write_cdef` — five tests: four short-circuit arms (skip /
+  coded_lossless / disabled / allow_intrabc), first-leaf-in-anchor
+  `L(3)` round-trip across five values, `cdef_bits == 0` empty
+  literal, anchor-already-stamped no-bits arm, and a five-case
+  range-guard battery.
+* `write_delta_qindex` — six tests: literal-branch round-trip
+  across five reduced values, literal branch with `delta_q_res !=
+  0`, escape branch including boundary (3) / mid-range (17) /
+  near-max (±511 ⇒ clipped), superblock-skip short-circuit,
+  `!read_deltas` outer-gate short-circuit, and a four-case range
+  battery.
+* `write_delta_lf` — six tests: single-LF literal round-trip,
+  multi-LF four-lane round-trip with mixed signs, multi-LF
+  mono_chrome two-lane round-trip (third/fourth lanes confirmed
+  unchanged), escape-branch round-trip, three-arm short-circuit
+  set (superblock-skip / !read_deltas / !delta_lf_present), and a
+  five-case range battery.
+
+Each round-trip test replays the writer's byte run through the
+matching `decode_cdef` / `decode_delta_qindex` / `decode_delta_lf`
+calls and asserts the decoded scalar or row matches the writer's
+input (or, for the delta-q/lf cases, the expected post-`Clip3`
+accumulator value).
+
+Full library test count moves to 1701 (was 1684).
+
+### Out of scope for round 258 / pending follow-ups
+
+* Bring r257's `write_inter_frame_mode_info_prefix` to a full
+  §5.11.18 dispatcher by composing the three writers landed here
+  (`write_cdef`, `write_delta_qindex`, `write_delta_lf`) into its
+  body between the post-skip segment_id arm and the `read_is_inter`
+  call.
+* §5.11.18 line 23 `if ( is_inter )` terminal arms — §5.11.22
+  `intra_block_mode_info` writer (the `else` arm) and §5.11.23
+  `inter_block_mode_info` writer (the `if` arm), the latter
+  composing §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+  §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode` +
+  §5.11.29 `read_compound_type` writers.
+* §7.10 inter-prediction primitive driver, §7.14 loop-filter,
+  §7.15 CDEF bring-up — the three near-term encoder milestones.
+
 ## Status — 2026-06-08 (round 257)
 
 Round 257 lands
