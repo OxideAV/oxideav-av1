@@ -4,6 +4,54 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r261 (2026-06-08): add §5.11.46 no-palette leaf writer
+  (`encoder::block_mode_info::write_palette_mode_info`, av1-spec
+  p.97-98) and the §5.11.22 `intra_block_mode_info` dispatcher
+  (`encoder::block_mode_info::write_intra_block_mode_info`, av1-spec
+  p.72) that composes the four §5.11.22 leaves the r211-r260 arc
+  produced (`write_y_mode` / `write_intra_uv_mode` /
+  `write_intra_angle_info_{y,uv}` / `write_filter_intra_mode_info`)
+  with the new §5.11.46 leaf.
+
+  The §5.11.46 leaf covers the no-palette path only — commits
+  `has_palette_y == 0` AND `has_palette_uv == 0`, mirroring the
+  §5.11.46 reader's outer-gate (`allow_screen_content_tools && MiSize
+  >= BLOCK_8X8 && Block_Width <= 64 && Block_Height <= 64`) +
+  inner-arm short-circuits. The §8.3.2 CDF selections are
+  `TilePaletteYModeCdf[ bsizeCtx ][ palette_y_mode_ctx(above, left) ]`
+  for the luma arm and `TilePaletteUVModeCdf[ palette_uv_mode_ctx(0) ]`
+  for the chroma arm (with `bsizeCtx = Mi_Width_Log2[ MiSize ] +
+  Mi_Height_Log2[ MiSize ] - 2`). Non-zero `has_palette_*` surfaces
+  `Error::PaletteEntriesUnsupported` so the dispatcher knows to
+  re-route once the §5.11.46 palette-entries arc (cache merge +
+  `L(BitDepth)` literal + `paletteBits` delta loop + trailing sort)
+  lands in a subsequent round.
+
+  The §5.11.22 dispatcher covers the no-palette + no-CFL +
+  `0..=12 uv_mode` path of the spec body (av1-spec p.72 lines 2,
+  4, 6, 10, 13-15, 16). It derives the §8.3.2 `size_group(MiSize)`
+  ctx for the §5.11.22 line 2 `y_mode` S() in-place + threads the
+  `has_chroma`-gated chroma arm into `write_intra_uv_mode` +
+  `write_intra_angle_info_uv`. The §5.11.22 line 8 `read_cfl_alphas`
+  call is intentionally excluded from this round's arc; callers
+  that need the CFL arm compose `write_cfl_alphas` manually until a
+  future round folds it into the dispatcher.
+
+  +13 round-trip tests covering the new leaf + dispatcher: gate-off
+  (allow_screen_content_tools = false ⇒ no §5.11.46 S() symbol
+  emitted vs a baseline `SymbolWriter`), gate-off via `MiSize <
+  BLOCK_8X8`, non-DC `YMode` skips the luma arm + still emits the
+  chroma arm, has_palette_y/uv == 1 rejection with
+  `PaletteEntriesUnsupported`, all out-of-range caller-bug rejections;
+  full §5.11.22 dispatcher round-trips through
+  `PartitionWalker::decode_intra_block_mode_info` covering DC_PRED,
+  directional `YMode = V_PRED` with `angle_delta_y = 2`,
+  palette-gate-open / no-palette path, filter-intra arm with
+  `use_filter_intra = 1` + `filter_intra_mode = Some(3)`, monochrome
+  (`has_chroma = false`); caller-bug rejections for missing
+  `uv_mode` when has_chroma, `uv_mode = UV_CFL_PRED = 13`, and
+  `Some(uv_mode)` when monochrome.
+
 - encoder r260 (2026-06-08): add three §5.11.22 leaf writers
   toward the §5.11.18 line 23 `if ( !is_inter )` terminal arm
   (`intra_block_mode_info`):

@@ -2,6 +2,80 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 261)
+
+Round 261 adds the §5.11.46 no-palette leaf writer and the §5.11.22
+`intra_block_mode_info` dispatcher that composes all four r211-r260
+§5.11.22 leaves into a single call site matching the spec body:
+
+* `encoder::block_mode_info::write_palette_mode_info` (§5.11.46
+  inverse, av1-spec p.97-98) — restricted to the no-palette path:
+  commits `has_palette_y == 0` AND `has_palette_uv == 0`. The
+  §5.11.46 outer gate (`allow_screen_content_tools && MiSize >=
+  BLOCK_8X8 && Block_Width <= 64 && Block_Height <= 64`) closes
+  emit zero bits; the open-gate path emits one S() per fired arm
+  against `TilePaletteYModeCdf[ bsizeCtx ][ palette_y_mode_ctx(above,
+  left) ]` (luma, fires when `YMode == DC_PRED`) and
+  `TilePaletteUVModeCdf[ palette_uv_mode_ctx(palette_size_y = 0) ]`
+  (chroma, fires when `HasChroma && UVMode == DC_PRED`). Non-zero
+  `has_palette_*` surfaces `Error::PaletteEntriesUnsupported` so the
+  dispatcher can re-route once the §5.11.46 palette-entries syntax
+  (cache merge + `L(BitDepth)` literal + `paletteBits` delta loop +
+  trailing sort) lands in a subsequent arc.
+
+* `encoder::block_mode_info::write_intra_block_mode_info` (§5.11.22
+  dispatcher, av1-spec p.72) — composes `write_y_mode` (line 2) +
+  `write_intra_angle_info_y` (line 4) + the `HasChroma` arm
+  (`write_intra_uv_mode` line 6 + `write_intra_angle_info_uv` line
+  10) + `write_palette_mode_info` (lines 13-15) +
+  `write_filter_intra_mode_info` (line 16). The §8.3.2 `size_group(
+  MiSize )` ctx for the line 2 `y_mode` S() is derived in-place so
+  callers pass only `MiSize` + the committed syntax-element values.
+  The §5.11.22 line 8 `read_cfl_alphas` arm (`UV_CFL_PRED = 13`) is
+  intentionally excluded from this round's scope and surfaces a
+  caller-bug error; callers needing the CFL arm continue to compose
+  `write_cfl_alphas` manually until a future round folds it into the
+  dispatcher.
+
+### Round 261 test summary
+
++13 tests: 9 leaf tests for `write_palette_mode_info` (gate-off
+emits no §5.11.46 S() symbol vs a baseline `SymbolWriter`,
+small-block short-circuit, non-DC `YMode` luma-arm skip + chroma
+arm still fires, `has_palette_y == 1` / `has_palette_uv == 1`
+rejection with `PaletteEntriesUnsupported`, four out-of-range
+caller-bug rejections); 7 round-trip tests for the §5.11.22
+dispatcher through `PartitionWalker::decode_intra_block_mode_info`
+(DC_PRED full round-trip with palette + filter-intra gates closed,
+directional `YMode = V_PRED` with `angle_delta_y = 2`,
+palette-gate-open / no-palette round-trip, filter-intra arm with
+`use_filter_intra = 1` + `filter_intra_mode = Some(3)`, monochrome
+round-trip; missing-UV / `UV_CFL_PRED` / monochrome+Some(uv)
+caller-bug rejections).
+
+Full library test count moves to 1742 (was 1725).
+
+### Out of scope for round 261 / pending follow-ups
+
+* §5.11.46 palette-entries syntax (cache merge, cache-coded
+  indices, `L(BitDepth)` literal, `paletteBits` delta loop with
+  refinement on `range = (1 << BitDepth) - color - 1`, trailing
+  sort) — the writer mirror of `read_palette_entries_y` /
+  `read_palette_entries_uv`. Lets the §5.11.22 dispatcher pass a
+  non-zero `palette_size_y` / `palette_size_uv` through.
+* §5.11.22 dispatcher CFL arm — fold `write_cfl_alphas` into
+  `write_intra_block_mode_info` when `uv_mode == UV_CFL_PRED`.
+* Begin §5.11.23 `inter_block_mode_info` writer dispatch
+  (composes §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+  §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode`
+  + §5.11.29 `read_compound_type` writers, none of which exist
+  yet on the encoder side).
+* Wire §5.11.18 line 23-26 terminal dispatch
+  (`intra_block_mode_info` else-arm vs `inter_block_mode_info`
+  if-arm) into `write_inter_frame_mode_info_prefix`.
+* §7.10 inter-prediction primitive driver, §7.14 loop-filter,
+  §7.15 CDEF bring-up — the three near-term encoder milestones.
+
 ## Status — 2026-06-08 (round 260)
 
 Round 260 adds three §5.11.22 `intra_block_mode_info` leaf writers

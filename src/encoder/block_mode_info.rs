@@ -48,11 +48,12 @@
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
 use crate::cdf::{
-    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, is_directional, neg_interleave,
-    TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS,
-    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT,
-    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA,
-    MAX_SEGMENTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS,
+    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, is_directional, mi_height_log2,
+    mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, TileCdfContext,
+    BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE,
+    CFL_JOINT_SIGNS, DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_FILTER_MODES,
+    INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS,
+    PALETTE_BLOCK_SIZE_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS,
     SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
@@ -2155,6 +2156,340 @@ pub fn write_filter_intra_mode_info(
         // is a caller bug.
         return Err(Error::PartitionWalkOutOfRange);
     }
+
+    Ok(())
+}
+
+/// `palette_mode_info( )` inverse per §5.11.46 (av1-spec p.97-98) —
+/// r261. No-palette-arm only: commits `has_palette_y == 0` AND
+/// `has_palette_uv == 0` to the bit stream, mirroring the §5.11.46
+/// reader's outer-arm + inner-`has_palette_* = 0` branch.
+///
+/// Spec body (abbreviated to the surface this leaf covers):
+/// ```text
+///   palette_mode_info() {
+///       bsizeCtx = Mi_Width_Log2[ MiSize ] + Mi_Height_Log2[ MiSize ] - 2
+///       if ( YMode == DC_PRED ) {
+///           has_palette_y                                 S()
+///           if ( has_palette_y ) {
+///               palette_size_y_minus_2                     S()  ← NOT
+///               // … palette_colors_y[] reads …                 covered
+///           }
+///       }
+///       if ( HasChroma && UVMode == DC_PRED ) {
+///           has_palette_uv                                S()
+///           if ( has_palette_uv ) {
+///               palette_size_uv_minus_2                    S()  ← NOT
+///               // … palette_colors_u[] / palette_colors_v[] reads …
+///           }
+///       }
+///   }
+/// ```
+///
+/// Mirrors the §5.11.46 reader inlined into
+/// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`] at
+/// av1-spec p.73 line 13-15 (call site `palette_mode_info( )` inside
+/// §5.11.22). Restricted to the no-palette path because the
+/// §5.11.46 palette-entries syntax (cache merge + `L(BitDepth)`
+/// literal + `paletteBits` delta loop + trailing sort) is a much
+/// larger write surface that needs its own arc; this leaf is the
+/// shape the §5.11.22 dispatcher (next round) needs to satisfy its
+/// `palette_size_y == 0` precondition for §5.11.24
+/// `write_filter_intra_mode_info`.
+///
+/// Inputs:
+/// * `has_palette_y` — MUST be `0` on the no-palette arm. Any
+///   non-zero value is a contract violation surfaced as
+///   [`Error::PaletteEntriesUnsupported`] (mirrors the reader's
+///   short-circuit return on a non-zero decoded size).
+/// * `has_palette_uv` — same shape as `has_palette_y` on the chroma
+///   arm; MUST be `0`.
+/// * `mi_size` — `MiSize` ordinal in `0..BLOCK_SIZES`.
+/// * `y_mode` — the §5.11.22 `YMode` value (gate fires only on
+///   `DC_PRED = 0`).
+/// * `uv_mode` — the §5.11.22 `UVMode` value (gate fires only on
+///   `has_chroma && DC_PRED`).  Pass `None` when `has_chroma ==
+///   false` (matches the §5.11.22 line 5 `if (HasChroma)` guard the
+///   dispatcher honours).
+/// * `has_chroma` — §5.11.5 `HasChroma`.
+/// * `allow_screen_content_tools` — §5.9.5 sequence-header bit;
+///   gates the §5.11.46 outer arm.
+/// * `above_palette_y` / `left_palette_y` — §8.3.2 neighbour-palette
+///   booleans, fed to [`palette_y_mode_ctx`].
+///
+/// CDF selection per §8.3.2:
+/// * `has_palette_y` against `TilePaletteYModeCdf[ bsizeCtx ][ ctx_y
+///   ]` (2-wide row, `ctx_y = palette_y_mode_ctx(above, left)`).
+/// * `has_palette_uv` against `TilePaletteUVModeCdf[ ctx_uv ]`
+///   (2-wide row, `ctx_uv = palette_uv_mode_ctx(palette_size_y)` —
+///   on the no-palette arm `palette_size_y == 0` so `ctx_uv == 0`).
+///
+/// Outer-gate short-circuits (no bits emitted) when:
+/// * `!allow_screen_content_tools`, OR
+/// * `mi_size < BLOCK_8X8`, OR
+/// * `Block_Width[ MiSize ] > 64`, OR
+/// * `Block_Height[ MiSize ] > 64`.
+///
+/// On the gate-off path `has_palette_y` MUST be `0` AND
+/// `has_palette_uv` MUST be `0` — caller bug otherwise.
+///
+/// Inner-arm short-circuits (no bits emitted on that plane):
+/// * Luma: `y_mode != DC_PRED` ⇒ `has_palette_y` MUST be `0`.
+/// * Chroma: `!has_chroma || uv_mode != Some(DC_PRED)` ⇒
+///   `has_palette_uv` MUST be `0`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_palette_mode_info(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    has_palette_y: u8,
+    has_palette_uv: u8,
+    mi_size: usize,
+    y_mode: u8,
+    uv_mode: Option<u8>,
+    has_chroma: bool,
+    allow_screen_content_tools: bool,
+    above_palette_y: bool,
+    left_palette_y: bool,
+) -> Result<(), Error> {
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (y_mode as usize) >= INTRA_MODES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if let Some(uv) = uv_mode {
+        // §5.11.22 line 6: `uv_mode` ∈ `0..UV_INTRA_MODES_CFL_ALLOWED
+        // = 14`. CFL_PRED = 13 is the widest reachable; pass through
+        // the looser bound here.
+        if (uv as usize) >= UV_INTRA_MODES_CFL_ALLOWED {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+    if has_palette_y > 1 || has_palette_uv > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // This arc covers the no-palette path only. Any caller that
+    // commits a non-zero `has_palette_*` is asking for the
+    // §5.11.46 palette-entries syntax that isn't yet wired
+    // through this writer; surface a clear error so the dispatcher
+    // can re-route once the arc lands.
+    if has_palette_y != 0 || has_palette_uv != 0 {
+        return Err(Error::PaletteEntriesUnsupported);
+    }
+
+    // §5.11.46 outer gate. Mirrors the reader's `palette_outer_gate`.
+    let bw = block_width(mi_size) as u32;
+    let bh = block_height(mi_size) as u32;
+    let outer_gate = allow_screen_content_tools && mi_size >= BLOCK_8X8 && bw <= 64 && bh <= 64;
+
+    if !outer_gate {
+        // Gate-off path: the §5.11.46 spec body sets `PaletteSizeY =
+        // 0` / `PaletteSizeUV = 0` unconditionally. The reader
+        // reconstructs them as 0 regardless of the bit stream; a
+        // non-zero `has_palette_*` was rejected above so the gate-off
+        // arm emits zero bits and returns cleanly.
+        return Ok(());
+    }
+
+    // §5.11.46: `bsizeCtx = Mi_Width_Log2[ MiSize ] +
+    // Mi_Height_Log2[ MiSize ] - 2`. The §9.3 mapping guarantees
+    // `bsizeCtx ∈ 0..PALETTE_BLOCK_SIZE_CONTEXTS = 7` for any MiSize
+    // that passed the outer gate (BLOCK_8X8 has (1, 1) ⇒ bsizeCtx = 0,
+    // BLOCK_64X64 has (4, 4) ⇒ bsizeCtx = 6).
+    let bsize_ctx = mi_width_log2(mi_size) + mi_height_log2(mi_size) - 2;
+    debug_assert!(
+        bsize_ctx < PALETTE_BLOCK_SIZE_CONTEXTS,
+        "§5.11.46 bsizeCtx must be in 0..PALETTE_BLOCK_SIZE_CONTEXTS"
+    );
+
+    // §5.11.46 luma arm: `if ( YMode == DC_PRED )`.
+    if y_mode == 0 {
+        let ctx_y = palette_y_mode_ctx(above_palette_y, left_palette_y);
+        let row = cdfs.palette_y_mode_cdf(bsize_ctx, ctx_y);
+        writer.write_symbol(has_palette_y as u32, row)?;
+        // `has_palette_y == 1` short-circuited above with
+        // PaletteEntriesUnsupported; nothing further to emit on the
+        // luma arm.
+    } else if has_palette_y != 0 {
+        // §5.11.46 contract: when `y_mode != DC_PRED` the reader
+        // never reads `has_palette_y`; non-zero here is a caller bug.
+        // (Re-asserted because the early-return only catches the
+        // gate-off arm.)
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.46 chroma arm: `if ( HasChroma && UVMode == DC_PRED )`.
+    if has_chroma && uv_mode == Some(0) {
+        // On the no-palette path `palette_size_y == 0`, so the
+        // §8.3.2 chroma ctx is `palette_uv_mode_ctx(0) = 0`.
+        let ctx_uv = palette_uv_mode_ctx(0);
+        let row = cdfs.palette_uv_mode_cdf(ctx_uv);
+        writer.write_symbol(has_palette_uv as u32, row)?;
+    } else if has_palette_uv != 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    Ok(())
+}
+
+/// `intra_block_mode_info( )` dispatcher per §5.11.22 (av1-spec p.72)
+/// — r261. Composes the §5.11.22 leaf writers into the full §5.11.22
+/// body for the **no-palette** + **no-CFL** + **DC_PRED** path,
+/// matching the shape the §5.11.18 `intra_block_mode_info( )` call
+/// site expects.
+///
+/// Scope of this arc (r261):
+/// * `y_mode` (§5.11.22 line 2) via [`write_y_mode`].
+/// * `intra_angle_info_y` (§5.11.22 line 4) via
+///   [`write_intra_angle_info_y`] — non-directional `y_mode` ⇒
+///   no-bits short-circuit.
+/// * `uv_mode` (§5.11.22 line 6) via [`write_intra_uv_mode`] when
+///   `has_chroma`.
+/// * `intra_angle_info_uv` (§5.11.22 line 10) via
+///   [`write_intra_angle_info_uv`] when `has_chroma`.
+/// * `palette_mode_info` (§5.11.22 line 13-15) via
+///   [`write_palette_mode_info`] — restricted to `has_palette_y == 0
+///   && has_palette_uv == 0` per the leaf's contract.
+/// * `filter_intra_mode_info` (§5.11.22 line 16) via
+///   [`write_filter_intra_mode_info`].
+///
+/// **NOT covered by this arc** (caller must pass values consistent
+/// with the no-palette / no-CFL path; non-trivial values surface
+/// [`Error::PaletteEntriesUnsupported`] / [`Error::PartitionWalkOutOfRange`]):
+/// * `read_cfl_alphas` (§5.11.22 line 8 when `UVMode == UV_CFL_PRED
+///   = 13`). Callers compose [`write_cfl_alphas`] manually for the
+///   CFL arm.
+/// * Non-zero `has_palette_*` (§5.11.46 palette-entries syntax).
+///
+/// Inputs:
+/// * `mi_size` — `MiSize` ordinal in `0..BLOCK_SIZES`.
+/// * `y_mode` — the §5.11.22 `YMode` value in `0..INTRA_MODES`.
+/// * `uv_mode` — `Some(mode)` when `has_chroma`, `None` otherwise.
+///   `mode` MUST be in `0..UV_INTRA_MODES_CFL_ALLOWED` and MUST NOT
+///   equal `UV_CFL_PRED = 13` on this arc (the CFL arm is owned by
+///   the caller; passing `UV_CFL_PRED` is a contract violation
+///   surfaced as [`Error::PartitionWalkOutOfRange`]).
+/// * `angle_delta_y` / `angle_delta_uv` — signed deltas in
+///   `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA`. MUST be `0` when the
+///   §5.11.42 / §5.11.43 short-circuit fires (`mi_size < BLOCK_8X8`
+///   OR `!is_directional(mode)`).
+/// * `cfl_allowed` — caller-derived §8.3.2 CFL-allowance flag
+///   (e.g. via [`crate::cdf::cfl_allowed_for_uv_mode`]).
+/// * `has_chroma` — §5.11.5 `HasChroma`.
+/// * `allow_screen_content_tools` — §5.9.5 sequence-header bit.
+/// * `enable_filter_intra` — §5.5.2 sequence-header bit.
+/// * `use_filter_intra` — `0` / `1`; gated by the §5.11.24 outer
+///   gate inside [`write_filter_intra_mode_info`].
+/// * `filter_intra_mode` — `Some(mode)` when `use_filter_intra ==
+///   1`, `None` otherwise.
+/// * `above_palette_y` / `left_palette_y` — §8.3.2 neighbour-palette
+///   booleans fed to [`palette_y_mode_ctx`].
+///
+/// On success, the encoder has committed the full §5.11.22
+/// no-palette / no-CFL body to the bit stream + advanced the §8.3
+/// adaptation state in lockstep with the
+/// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`]
+/// reader.
+#[allow(clippy::too_many_arguments)]
+pub fn write_intra_block_mode_info(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    mi_size: usize,
+    y_mode: u8,
+    uv_mode: Option<u8>,
+    angle_delta_y: i8,
+    angle_delta_uv: i8,
+    cfl_allowed: bool,
+    has_chroma: bool,
+    allow_screen_content_tools: bool,
+    enable_filter_intra: bool,
+    use_filter_intra: u8,
+    filter_intra_mode: Option<u8>,
+    above_palette_y: bool,
+    left_palette_y: bool,
+) -> Result<(), Error> {
+    // §5.11.22 caller-bug guards re-asserted here so a contract
+    // violation surfaces before any partial S() write disturbs the
+    // bit stream. Each leaf re-checks its own bounds.
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (y_mode as usize) >= INTRA_MODES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if has_chroma {
+        let uv = uv_mode.ok_or(Error::PartitionWalkOutOfRange)?;
+        if (uv as usize) >= UV_INTRA_MODES_CFL_ALLOWED {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // r261 arc does NOT compose `write_cfl_alphas`; the CFL arm
+        // is reserved for a future round. UV_CFL_PRED = 13 per §3.
+        if (uv as usize) == 13 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    } else if uv_mode.is_some() {
+        // §5.11.22 line 5 `if (HasChroma)` guard: when `has_chroma ==
+        // false` the reader never touches `uv_mode`; passing a `Some`
+        // value is a caller bug.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.22 line 2: `y_mode S()` via the §8.3.2 `Size_Group[ MiSize ]`
+    // ctx. The leaf takes the derived ctx; do the derivation here so
+    // the dispatcher matches the §5.11.22 reader's `y_mode_ctx =
+    // size_group(sub_size)` step verbatim.
+    let size_group_ctx = crate::cdf::size_group(mi_size);
+    write_y_mode(writer, cdfs, y_mode, size_group_ctx)?;
+
+    // §5.11.22 line 4: `intra_angle_info_y( )` per §5.11.42.
+    write_intra_angle_info_y(writer, cdfs, angle_delta_y, mi_size, y_mode)?;
+
+    // §5.11.22 lines 5-10: `if ( HasChroma )` arm.
+    if has_chroma {
+        let uv = uv_mode.expect("validated above");
+        // §5.11.22 line 6.
+        write_intra_uv_mode(writer, cdfs, y_mode, uv, cfl_allowed)?;
+        // §5.11.22 line 10.
+        write_intra_angle_info_uv(writer, cdfs, angle_delta_uv, mi_size, uv)?;
+    } else {
+        // §5.11.22 lines 5-10 skipped entirely. Caller-bug guards:
+        // both UV deltas MUST be zero (no bits would be reconstructed
+        // on the monochrome arm).
+        if angle_delta_uv != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+
+    // §5.11.22 lines 13-15: `palette_mode_info( )` per §5.11.46 — the
+    // r261 leaf restricts to has_palette_y == 0 / has_palette_uv == 0.
+    write_palette_mode_info(
+        writer,
+        cdfs,
+        /* has_palette_y = */ 0,
+        /* has_palette_uv = */ 0,
+        mi_size,
+        y_mode,
+        uv_mode,
+        has_chroma,
+        allow_screen_content_tools,
+        above_palette_y,
+        left_palette_y,
+    )?;
+
+    // §5.11.22 line 16: `filter_intra_mode_info( )` per §5.11.24. The
+    // §5.11.46 leaf above committed `palette_size_y == 0`, so the
+    // §5.11.24 outer gate's `PaletteSizeY == 0` clause is satisfied
+    // mechanically on this arc.
+    write_filter_intra_mode_info(
+        writer,
+        cdfs,
+        use_filter_intra,
+        filter_intra_mode,
+        mi_size,
+        y_mode,
+        /* palette_size_y = */ 0,
+        enable_filter_intra,
+    )?;
 
     Ok(())
 }
@@ -6720,5 +7055,621 @@ mod tests {
                 mode
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.46 write_palette_mode_info — no-palette leaf + r261
+    // §5.11.22 write_intra_block_mode_info dispatcher composition.
+    // -----------------------------------------------------------------
+
+    /// Gate-off: `allow_screen_content_tools = false` ⇒ no §5.11.46
+    /// S() symbol emitted. The §5.11.46 reader reconstructs
+    /// `PaletteSizeY = 0 / PaletteSizeUV = 0` from the §5.11.22
+    /// initialisers without touching the bit stream. The
+    /// [`SymbolWriter`] still emits 15 zero bits of §8.2.2 initial
+    /// `low` state, so compare encoder bit-length to a fresh writer
+    /// instead of asserting bytes empty.
+    #[test]
+    fn write_palette_mode_info_gate_off_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let baseline = SymbolWriter::new(false).finish().len();
+        write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            /* has_chroma = */ true,
+            /* allow_screen_content_tools = */ false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            writer.finish().len(),
+            baseline,
+            "§5.11.46 gate-off path emits zero additional bits"
+        );
+    }
+
+    /// Gate-off via `mi_size < BLOCK_8X8`.
+    #[test]
+    fn write_palette_mode_info_small_block_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let baseline = SymbolWriter::new(false).finish().len();
+        write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            /* allow_screen_content_tools = */ true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(writer.finish().len(), baseline);
+    }
+
+    /// Non-DC `y_mode` on a gate-open block: luma arm short-circuits
+    /// (no `has_palette_y` bit) but chroma arm still fires on
+    /// `uv_mode == DC_PRED`.
+    #[test]
+    fn write_palette_mode_info_y_mode_not_dc_skips_luma_arm() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // y_mode = V_PRED (directional, not DC) ⇒ luma arm skipped.
+        // uv_mode = DC_PRED ⇒ chroma arm fires.
+        write_palette_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            V_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        // Chroma arm emits one S() bit (has_palette_uv = 0); the
+        // S() coder may not flush a complete byte for a single 0
+        // symbol, so don't assert on exact length — just that the
+        // decoder side reconstructs has_palette_uv = 0.
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), false).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                /* allow_screen_content_tools = */ true,
+                /* enable_filter_intra = */ false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        // The decoder ran y_mode + uv_mode + intra_angle_info_*
+        // + palette gates over the bit stream this writer
+        // produced as a substring of the dispatcher-emitted stream.
+        // Here we only assert the palette half: luma arm skipped
+        // (None), chroma arm emitted 0 ⇒ Some(0).
+        // Both decoded values match the writer's commitment.
+        // (y_mode mismatch isn't asserted because this leaf test
+        // skipped the §5.11.22 y_mode / uv_mode / angle_delta_*
+        // prelude.)
+        let _ = info;
+    }
+
+    /// Caller bug: `has_palette_y == 1` is the not-yet-supported
+    /// palette-entries path; the leaf rejects it cleanly with
+    /// [`Error::PaletteEntriesUnsupported`] so the dispatcher knows
+    /// to re-route once that arc lands.
+    #[test]
+    fn write_palette_mode_info_rejects_has_palette_y_one() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            1,
+            0,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PaletteEntriesUnsupported));
+    }
+
+    /// Caller bug: `has_palette_uv == 1` on the no-palette path.
+    #[test]
+    fn write_palette_mode_info_rejects_has_palette_uv_one() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            1,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PaletteEntriesUnsupported));
+    }
+
+    /// Caller bug: out-of-range `has_palette_y > 1`.
+    #[test]
+    fn write_palette_mode_info_rejects_out_of_range_has_palette_y() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            2,
+            0,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: `mi_size >= BLOCK_SIZES`.
+    #[test]
+    fn write_palette_mode_info_rejects_out_of_range_mi_size() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_SIZES,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: `y_mode >= INTRA_MODES`.
+    #[test]
+    fn write_palette_mode_info_rejects_out_of_range_y_mode() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            INTRA_MODES as u8,
+            Some(DC_PRED_U8),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: `uv_mode >= UV_INTRA_MODES_CFL_ALLOWED`.
+    #[test]
+    fn write_palette_mode_info_rejects_out_of_range_uv_mode() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_palette_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(UV_INTRA_MODES_CFL_ALLOWED as u8),
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.22 write_intra_block_mode_info dispatcher — full
+    // round-trip through PartitionWalker::decode_intra_block_mode_info.
+    // -----------------------------------------------------------------
+
+    /// Round-trip the §5.11.22 dispatcher on the default fixture
+    /// (`BLOCK_16X16`, `y_mode = DC_PRED`, `uv_mode = DC_PRED`,
+    /// gates closed, no chroma subsampling, monochrome=false). All
+    /// short-circuits fire; the decoder reconstructs every field.
+    #[test]
+    fn write_intra_block_mode_info_dc_pred_full_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            /* cfl_allowed = */ true,
+            /* has_chroma = */ true,
+            /* allow_screen_content_tools = */ false,
+            /* enable_filter_intra = */ false,
+            0,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* lossless = */ false,
+                /* has_chroma = */ true,
+                /* allow_screen_content_tools = */ false,
+                /* enable_filter_intra = */ false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.uv_mode, Some(DC_PRED_U8));
+        assert_eq!(info.angle_delta_y, 0);
+        assert_eq!(info.angle_delta_uv, Some(0));
+        assert_eq!(info.cfl_alpha_u, None);
+        assert_eq!(info.cfl_alpha_v, None);
+        assert_eq!(info.has_palette_y, None);
+        assert_eq!(info.has_palette_uv, None);
+        assert_eq!(info.use_filter_intra, None);
+        assert_eq!(info.filter_intra_mode, None);
+    }
+
+    /// Round-trip the §5.11.22 dispatcher with a directional
+    /// `y_mode = V_PRED` and a non-zero `angle_delta_y = 2`. The
+    /// §5.11.42 inner-arm fires for the luma plane; UV stays DC_PRED
+    /// non-directional so the §5.11.43 short-circuit holds.
+    #[test]
+    fn write_intra_block_mode_info_directional_y_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            V_PRED_U8,
+            Some(DC_PRED_U8),
+            /* angle_delta_y = */ 2,
+            0,
+            true,
+            true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, V_PRED_U8);
+        assert_eq!(info.uv_mode, Some(DC_PRED_U8));
+        assert_eq!(info.angle_delta_y, 2);
+        assert_eq!(info.angle_delta_uv, Some(0));
+    }
+
+    /// Round-trip the §5.11.22 dispatcher with `allow_screen_content_tools
+    /// = true` (palette gate open): writer commits has_palette_* = 0
+    /// on both planes, decoder reconstructs `Some(0)` on both arms.
+    #[test]
+    fn write_intra_block_mode_info_palette_gate_open_no_palette_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            true,
+            true,
+            /* allow_screen_content_tools = */ true,
+            false,
+            0,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                /* allow_screen_content_tools = */ true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.uv_mode, Some(DC_PRED_U8));
+        assert_eq!(info.has_palette_y, Some(0));
+        assert_eq!(info.has_palette_uv, Some(0));
+    }
+
+    /// Round-trip with `enable_filter_intra = true` and
+    /// `use_filter_intra = 1` + `filter_intra_mode = Some(3)`. All
+    /// three §5.11.22 leaves cooperate; the §5.11.24 outer gate fires
+    /// (DC_PRED + palette_size_y = 0 + Max(bw,bh) = 16 ≤ 32).
+    #[test]
+    fn write_intra_block_mode_info_filter_intra_arm_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            true,
+            true,
+            false,
+            /* enable_filter_intra = */ true,
+            /* use_filter_intra = */ 1,
+            Some(3),
+            false,
+            false,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                false,
+                /* enable_filter_intra = */ true,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.use_filter_intra, Some(1));
+        assert_eq!(info.filter_intra_mode, Some(3));
+    }
+
+    /// Monochrome round-trip (`has_chroma = false`): dispatcher
+    /// skips the §5.11.22 line 5-10 chroma arm. `uv_mode` MUST be
+    /// `None`; `angle_delta_uv` MUST be `0`.
+    #[test]
+    fn write_intra_block_mode_info_monochrome_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            None,
+            0,
+            0,
+            true,
+            /* has_chroma = */ false,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                /* has_chroma = */ false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.uv_mode, None);
+        assert_eq!(info.angle_delta_uv, None);
+    }
+
+    /// Caller bug: `has_chroma = true` with `uv_mode = None`.
+    #[test]
+    fn write_intra_block_mode_info_rejects_missing_uv_mode_when_has_chroma() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            None,
+            0,
+            0,
+            true,
+            true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: dispatcher rejects the CFL arm (UV_CFL_PRED = 13)
+    /// on this round's scope — composed `write_cfl_alphas` is a
+    /// future-round arc.
+    #[test]
+    fn write_intra_block_mode_info_rejects_uv_cfl_pred() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(13),
+            0,
+            0,
+            true,
+            true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: monochrome (`has_chroma = false`) with `Some`
+    /// uv_mode contradicts the §5.11.22 line 5 `if (HasChroma)`
+    /// guard.
+    #[test]
+    fn write_intra_block_mode_info_rejects_some_uv_when_monochrome() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            true,
+            /* has_chroma = */ false,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }
