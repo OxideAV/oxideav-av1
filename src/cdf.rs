@@ -15772,6 +15772,37 @@ impl PartitionWalker {
         &self.palette_colors
     }
 
+    /// `#[cfg(test)]` helper — stamp a §5.11.46 palette into a
+    /// single (`plane`, `mi_row`, `mi_col`) cell so cross-module
+    /// tests can prime the §5.11.49 cache state without rerunning
+    /// the full `decode_intra_block_mode_info` walker. Tests-only.
+    ///
+    /// Out-of-grid coordinates or `entries.len() > PALETTE_COLORS`
+    /// return `Err(())` without mutating the walker.
+    #[cfg(test)]
+    pub(crate) fn stamp_palette_for_test(
+        &mut self,
+        plane: usize,
+        mi_row: u32,
+        mi_col: u32,
+        entries: &[u16],
+    ) -> Result<(), ()> {
+        if plane >= 3 || entries.len() > PALETTE_COLORS {
+            return Err(());
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(());
+        }
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        let cell = plane * area + (mi_row as usize) * (self.mi_cols as usize) + (mi_col as usize);
+        self.palette_sizes[cell] = entries.len() as u8;
+        let base = cell * PALETTE_COLORS;
+        for (i, &v) in entries.iter().enumerate() {
+            self.palette_colors[base + i] = v;
+        }
+        Ok(())
+    }
+
     /// Helper to read `PaletteSizes[ plane ][ r ][ c ]` for the
     /// §5.11.49 `get_palette_cache` neighbour-walk. Returns `0` for
     /// out-of-grid coordinates (the §5.11.49 `aboveN = 0` / `leftN = 0`
@@ -27597,7 +27628,7 @@ pub(crate) fn read_palette_entries_uv(
 
 /// `Clip1( x )` per §4.7 — clamp `x` to `[0, (1 << BitDepth) - 1]`.
 #[inline]
-fn clip1_to_bit_depth(x: u32, bit_depth: u32) -> u32 {
+pub(crate) fn clip1_to_bit_depth(x: u32, bit_depth: u32) -> u32 {
     let max_val: u32 = (1u32 << bit_depth) - 1;
     if x > max_val {
         max_val
@@ -27612,7 +27643,7 @@ fn clip1_to_bit_depth(x: u32, bit_depth: u32) -> u32 {
 /// smallest integer `i` such that `2.pow(i) >= x` (i.e. the number of
 /// bits needed to code a value in `0..x`).
 #[inline]
-fn ceil_log2_av1(x: u32) -> u32 {
+pub(crate) fn ceil_log2_av1(x: u32) -> u32 {
     if x < 2 {
         return 0;
     }

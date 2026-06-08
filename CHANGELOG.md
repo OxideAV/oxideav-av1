@@ -4,6 +4,56 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r262 (2026-06-09): add §5.11.46 luma-plane palette-entries
+  writer (`encoder::block_mode_info::write_palette_entries_y`,
+  av1-spec p.97-98) — the inverse of
+  `crate::cdf::read_palette_entries_y`. This closes one of the two
+  arcs the r261 `write_palette_mode_info` leaf flagged with
+  `PaletteEntriesUnsupported`: once the §5.11.22 dispatcher learns
+  to thread `has_palette_y = 1`, the §5.11.46 luma palette syntax
+  is now expressible on the encoder side.
+
+  The writer mirrors the §5.11.49 cache + L(BitDepth) literal +
+  L(2) `palette_num_extra_bits_y` + L(paletteBits) delta loop the
+  reader inverts. For each cache slot it emits L(1)=1 iff the next
+  palette entry equals the cache value, advancing the entry pointer
+  on a hit. After cache exhaustion, the first new entry rides
+  L(BitDepth). The L(2) extra-bits choice is derived by simulating
+  the reader's per-step `paletteBits = Min(paletteBits,
+  CeilLog2(range))` refinement and picking the smallest `extra ∈
+  {0, 1, 2, 3}` such that every remaining `(color[idx] - color[idx
+  - 1]) - 1` raw value fits in the current `paletteBits` — strictly
+  ascending input in `[0, 2^BitDepth)` (the reader's post-sort +
+  post-Clip1 invariant) guarantees `extra ≤ 3` always works.
+
+  +13 round-trip tests through `read_palette_entries_y`: size 2 at
+  8/10/12 bit-depth, size 3 with non-trivial ascending deltas,
+  full PALETTE_COLORS=8 max-size palette exercising the paletteBits
+  refinement, full §5.11.49 cache-hit round-trip (both entries
+  adopted from a hand-stamped left-neighbour palette via the
+  new `#[cfg(test)] PartitionWalker::stamp_palette_for_test`
+  helper), partial-cache hit (one cache slot adopted + one new
+  literal entry); caller-bug rejections for descending pair,
+  duplicate pair, entry above 2^BitDepth, size below 2, size
+  above PALETTE_COLORS, and invalid `bit_depth`.
+
+  Followups for r263+:
+  * §5.11.46 UV-plane palette-entries writer
+    (`write_palette_entries_uv`) — U-plane (no `delta++`, `range`
+    without `- 1`) + V-plane two-arm
+    (`delta_encode_palette_colors_v == 1` signed-delta with
+    L(1) sign bit + modular wrap; `== 0` direct-literal arm; no
+    trailing sort).
+  * Lift the §5.11.22 dispatcher's `has_palette_y == 0 /
+    has_palette_uv == 0` precondition once the UV writer lands and
+    the dispatcher can thread the `palette_size_*_minus_2` S() +
+    `write_palette_entries_*` invocations.
+
+  Helpers exposed `pub(crate)`: `crate::cdf::clip1_to_bit_depth`
+  and `crate::cdf::ceil_log2_av1` — both previously private to
+  `cdf.rs` (used by `read_palette_entries_y` and friends), now
+  reachable from the encoder module's matching writer logic.
+
 - encoder r261 (2026-06-08): add §5.11.46 no-palette leaf writer
   (`encoder::block_mode_info::write_palette_mode_info`, av1-spec
   p.97-98) and the §5.11.22 `intra_block_mode_info` dispatcher

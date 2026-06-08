@@ -2,6 +2,50 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-09 (round 262)
+
+Round 262 lands the §5.11.46 luma-plane palette-entries writer —
+the encoder-side inverse of `crate::cdf::read_palette_entries_y`.
+This closes one of the two arcs r261's `write_palette_mode_info`
+flagged with `PaletteEntriesUnsupported`: once the §5.11.22
+dispatcher learns to thread `has_palette_y = 1`, the §5.11.46 luma
+palette syntax is now expressible on the encoder side.
+
+* `encoder::block_mode_info::write_palette_entries_y` (§5.11.46
+  inverse, av1-spec p.97-98) — mirrors the §5.11.49 cache merge
+  (per-cache-slot L(1) decide-and-emit) + first-new-entry
+  L(BitDepth) literal + L(2) `palette_num_extra_bits_y` + the
+  L(paletteBits) delta loop with per-step `paletteBits =
+  Min(paletteBits, CeilLog2(range))` refinement. The L(2)
+  extra-bits choice is derived by simulating the reader's
+  refinement and picking the smallest `extra ∈ {0, 1, 2, 3}` such
+  that every remaining `(color[idx] - color[idx - 1]) - 1` raw
+  value fits in the current `paletteBits` — strictly-ascending
+  input in `[0, 2^BitDepth)` guarantees a valid `extra` always
+  exists.
+
++13 round-trip tests through `read_palette_entries_y`: size 2 at
+8 / 10 / 12 bit-depth, size 3 with non-trivial deltas, full
+PALETTE_COLORS=8 max-size palette exercising the refinement, full
+§5.11.49 cache-hit + partial-cache round-trips (priming via a new
+`#[cfg(test)] PartitionWalker::stamp_palette_for_test` helper),
+plus caller-bug rejections for descending pair, duplicate pair,
+out-of-range entry, size below 2, size above PALETTE_COLORS, and
+invalid bit_depth.
+
+Full library test count moves to 1755 (was 1742).
+
+### Pending follow-ups for round 263+
+
+* §5.11.46 UV-plane palette-entries writer (`write_palette_entries_uv`)
+  — U-plane (no `delta++`, `range` without `- 1`) + V-plane two-arm
+  (`delta_encode_palette_colors_v == 1` signed-delta with L(1) sign
+  bit + modular wrap; `== 0` direct-literal arm; no trailing sort).
+* Lift the §5.11.22 dispatcher's `has_palette_y == 0` /
+  `has_palette_uv == 0` precondition once the UV writer lands.
+
+---
+
 ## Status — 2026-06-08 (round 261)
 
 Round 261 adds the §5.11.46 no-palette leaf writer and the §5.11.22
