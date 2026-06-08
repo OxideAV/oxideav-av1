@@ -4,6 +4,72 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r260 (2026-06-08): add three §5.11.22 leaf writers
+  toward the §5.11.18 line 23 `if ( !is_inter )` terminal arm
+  (`intra_block_mode_info`):
+  `encoder::block_mode_info::write_intra_angle_info_y` (§5.11.42
+  inverse, av1-spec p.95),
+  `encoder::block_mode_info::write_intra_angle_info_uv` (§5.11.43
+  inverse, p.95), and
+  `encoder::block_mode_info::write_filter_intra_mode_info` (§5.11.24
+  inverse, p.74).
+
+  These are the §5.11.22 `intra_block_mode_info` syntax elements
+  inlined into [`PartitionWalker::decode_intra_block_mode_info`] at
+  the corresponding §5.11.22 call sites (line 4 luma angle delta,
+  line 10 chroma angle delta, line 16 filter-intra mode info).
+  Each writer is stateless on grid: callers feed the §5.5.2 /
+  §5.11.46 frame-header / per-block scalars (`mi_size`, `y_mode` /
+  `uv_mode`, `palette_size_y`, `enable_filter_intra`) plus the
+  committed §5.11.42 / §5.11.43 / §5.11.24 syntax-element values
+  (`angle_delta_y` / `angle_delta_uv` in
+  `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA = -3..=3`; `use_filter_intra`
+  in `0..=1` with `filter_intra_mode: Option<u8>` in
+  `0..INTRA_FILTER_MODES = 5` on the `use == 1` arm).
+
+  Each writer implements the §5.11.42 / §5.11.43 / §5.11.24
+  short-circuits (no §8.2.6 S() symbols emitted on the
+  short-circuit arms — verified vs a pristine `SymbolWriter` in
+  the unit tests) and the §8.3.2 CDF selections
+  (`TileAngleDeltaCdf[ YMode - V_PRED ]` /
+  `TileAngleDeltaCdf[ UVMode - V_PRED ]` for the angle deltas;
+  `TileFilterIntraCdf[ MiSize ]` + `TileFilterIntraModeCdf` for
+  the §5.11.24 inner arm).
+
+  +20 round-trip tests covering the three new writers: (1)
+  §5.11.42 round-trip across all seven `AngleDeltaY` values on
+  `V_PRED`; (2) §5.11.43 round-trip across all seven `AngleDeltaUV`
+  values on `V_PRED`; (3) combined §5.11.42 + §5.11.43 round-trip
+  with independent non-zero deltas; (4) §5.11.24 round-trip with
+  `use_filter_intra = 0` and `use_filter_intra = 1` across all
+  five `INTRA_FILTER_MODES = 5` mode values; plus six
+  short-circuit tests (non-directional `YMode`/`UVMode`, `MiSize
+  < BLOCK_8X8`, `UV_CFL_PRED`, `!enable_filter_intra`, `y_mode !=
+  DC_PRED`, `palette_size_y != 0`, `Max(BW, BH) > 32`) and six
+  caller-bug guards (non-zero delta on short-circuit,
+  out-of-range delta, non-zero `use_filter_intra` on gate-off,
+  `use_filter_intra == 1` without mode, `use_filter_intra == 0`
+  with mode, out-of-range mode).
+
+  Library test count moves to 1725 (was 1705).
+
+  Followups for r261+:
+  * Compose the three r260 leaf writers into a §5.11.22
+    `intra_block_mode_info` dispatcher writer (the §5.11.18 line
+    23 `if ( !is_inter )` terminal arm), threading the §5.11.22
+    line 5-12 `if ( HasChroma )` arm + the §5.11.45
+    `write_cfl_alphas` + a future §5.11.46
+    `write_palette_mode_info` leaf writer.
+  * Begin §5.11.23 `inter_block_mode_info` writer dispatch
+    (composes §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+    §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode`
+    + §5.11.29 `read_compound_type` writers, none of which exist
+    yet on the encoder side).
+  * Then wire the §5.11.18 line 23-26 `if ( is_inter )` terminal
+    dispatch (§5.11.22 vs §5.11.23) into the r257
+    `write_inter_frame_mode_info_prefix` dispatcher, closing the
+    §5.11.18 inter_frame_mode_info() body end-to-end.
+
 - encoder r259 (2026-06-08): compose the r258 §5.11.18 lines 18-20
   leaf writers (`write_cdef` / `write_delta_qindex` / `write_delta_lf`)
   into `encoder::block_mode_info::write_inter_frame_mode_info_prefix`,

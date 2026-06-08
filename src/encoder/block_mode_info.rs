@@ -48,11 +48,12 @@
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
 use crate::cdf::{
-    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, neg_interleave, TileCdfContext,
-    BLOCK_128X128, BLOCK_64X64, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS,
-    DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_MODES, INTRA_MODE_CONTEXTS,
-    IS_INTER_CONTEXTS, MAX_SEGMENTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
-    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, is_directional, neg_interleave,
+    TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS,
+    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT,
+    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA,
+    MAX_SEGMENTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS,
+    SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -1894,6 +1895,265 @@ pub fn write_delta_lf(
             let sign: u32 = if reduced < 0 { 1 } else { 0 };
             writer.write_literal(1, sign)?;
         }
+    }
+
+    Ok(())
+}
+
+/// `intra_angle_info_y( )` inverse per §5.11.42 (av1-spec p.95) — r260.
+///
+/// Spec body:
+/// ```text
+///   intra_angle_info_y() {
+///       AngleDeltaY = 0
+///       if ( MiSize >= BLOCK_8X8 ) {
+///           if ( is_directional_mode( YMode ) ) {
+///               angle_delta_y                                  S()
+///               AngleDeltaY = angle_delta_y - MAX_ANGLE_DELTA
+///           }
+///       }
+///   }
+/// ```
+///
+/// Mirrors the §5.11.42 reader inlined into
+/// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`] at
+/// av1-spec p.72 line 4 (call site `intra_angle_info_y( )` inside
+/// §5.11.22).
+///
+/// Inputs:
+/// * `angle_delta_y` — the signed `AngleDeltaY` value the encoder
+///   committed to (in `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA = -3..=3`
+///   per §3 / §5.11.42).
+/// * `mi_size` — the §5.11.5 `MiSize` ordinal in `0..BLOCK_SIZES`.
+/// * `y_mode` — the §5.11.22 `YMode` value in `0..INTRA_MODES = 13`
+///   per §3, used for the §5.11.44 `is_directional_mode` short-circuit.
+///
+/// CDF selection per §8.3.2: `TileAngleDeltaCdf[ YMode - V_PRED ]`
+/// when the §5.11.42 reader fires; the row is 8-wide (7 symbols +
+/// the §8.2.6 counter). The reader writes `angle_delta_y = AngleDeltaY
+/// + MAX_ANGLE_DELTA` (the inverse of the spec's
+/// `AngleDeltaY = angle_delta_y - MAX_ANGLE_DELTA` recovery).
+///
+/// Short-circuits (no bits emitted) when:
+/// * `mi_size < BLOCK_8X8`, OR
+/// * `!is_directional_mode( YMode )` (§5.11.44: directional modes are
+///   `V_PRED = 1 <= YMode <= D67_PRED = 8`).
+///
+/// In both short-circuit arms `angle_delta_y` MUST be `0` — caller
+/// bug otherwise, surfaced as [`Error::PartitionWalkOutOfRange`].
+pub fn write_intra_angle_info_y(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    angle_delta_y: i8,
+    mi_size: usize,
+    y_mode: u8,
+) -> Result<(), Error> {
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (y_mode as usize) >= INTRA_MODES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let max = MAX_ANGLE_DELTA as i8;
+    if !(-max..=max).contains(&angle_delta_y) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    let reads = mi_size >= BLOCK_8X8 && is_directional(y_mode);
+    if !reads {
+        // §5.11.42 short-circuit arm — `AngleDeltaY = 0`. Caller-bug
+        // guard: any non-zero `angle_delta_y` here is a contract
+        // violation (the decoder would reconstruct `0` regardless).
+        if angle_delta_y != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.42 reader: `angle_delta_y S()` against
+    // `TileAngleDeltaCdf[ YMode - V_PRED ]`. The raw S() value is
+    // `AngleDeltaY + MAX_ANGLE_DELTA`, in `0..(2 * MAX_ANGLE_DELTA + 1) = 7`.
+    let raw: u32 = (angle_delta_y as i32 + MAX_ANGLE_DELTA as i32) as u32;
+    let cdf = cdfs
+        .angle_delta_cdf(y_mode as usize)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(raw, cdf)
+}
+
+/// `intra_angle_info_uv( )` inverse per §5.11.43 (av1-spec p.95) — r260.
+///
+/// Spec body (mirror of §5.11.42 with `UVMode` in place of `YMode`):
+/// ```text
+///   intra_angle_info_uv() {
+///       AngleDeltaUV = 0
+///       if ( MiSize >= BLOCK_8X8 ) {
+///           if ( is_directional_mode( UVMode ) ) {
+///               angle_delta_uv                                 S()
+///               AngleDeltaUV = angle_delta_uv - MAX_ANGLE_DELTA
+///           }
+///       }
+///   }
+/// ```
+///
+/// Mirrors the §5.11.43 reader inlined into
+/// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`] at
+/// av1-spec p.73 line 10 (call site `intra_angle_info_uv( )` inside
+/// the §5.11.22 `if ( HasChroma )` arm).
+///
+/// Inputs / CDF selection / short-circuits are the §5.11.42 mirror
+/// with `uv_mode` in place of `y_mode` (the §3 directional-mode range
+/// is the same: `V_PRED = 1..=D67_PRED = 8` for both planes since
+/// `UVMode` shares the §3 intra-mode enumeration). `uv_mode` MUST be
+/// in `0..UV_INTRA_MODES_CFL_ALLOWED = 14`; non-directional values
+/// (including `UV_CFL_PRED = 13`) take the short-circuit arm.
+pub fn write_intra_angle_info_uv(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    angle_delta_uv: i8,
+    mi_size: usize,
+    uv_mode: u8,
+) -> Result<(), Error> {
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (uv_mode as usize) >= UV_INTRA_MODES_CFL_ALLOWED {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let max = MAX_ANGLE_DELTA as i8;
+    if !(-max..=max).contains(&angle_delta_uv) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.43 / §5.11.44: the directional range is `V_PRED..=D67_PRED`
+    // on both planes (the U-plane CFL signalling at `UV_CFL_PRED = 13`
+    // is non-directional). `is_directional` returns `false` for
+    // `UV_CFL_PRED` since `is_directional` checks the same §3 range.
+    let reads = mi_size >= BLOCK_8X8 && is_directional(uv_mode);
+    if !reads {
+        if angle_delta_uv != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    let raw: u32 = (angle_delta_uv as i32 + MAX_ANGLE_DELTA as i32) as u32;
+    let cdf = cdfs
+        .angle_delta_cdf(uv_mode as usize)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(raw, cdf)
+}
+
+/// `filter_intra_mode_info( )` inverse per §5.11.24 (av1-spec p.74) — r260.
+///
+/// Spec body:
+/// ```text
+///   filter_intra_mode_info() {
+///       use_filter_intra = 0
+///       if ( enable_filter_intra &&
+///            YMode == DC_PRED && PaletteSizeY == 0 &&
+///            Max( Block_Width[ MiSize ], Block_Height[ MiSize ] ) <= 32 ) {
+///           use_filter_intra                                   S()
+///           if ( use_filter_intra ) {
+///               filter_intra_mode                              S()
+///           }
+///       }
+///   }
+/// ```
+///
+/// Mirrors the §5.11.24 reader inlined into
+/// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`] at
+/// av1-spec p.73 line 16 (call site `filter_intra_mode_info( )` at
+/// the tail of §5.11.22).
+///
+/// Inputs:
+/// * `use_filter_intra` — `0` / `1`. When the outer gate is closed
+///   MUST be `0`; otherwise the encoder's committed §5.11.24
+///   `use_filter_intra` symbol.
+/// * `filter_intra_mode` — `Some(mode)` when `use_filter_intra == 1`
+///   (`mode` in `0..INTRA_FILTER_MODES = 5`), `None` otherwise.
+/// * `mi_size` — `MiSize` ordinal in `0..BLOCK_SIZES`.
+/// * `y_mode` — the §5.11.22 `YMode` value (gate fires only on
+///   `DC_PRED = 0`).
+/// * `palette_size_y` — the §5.11.46 `PaletteSizeY` derivation (gate
+///   fires only on `PaletteSizeY == 0`). `u32` to match the
+///   walker's grid-side type.
+/// * `enable_filter_intra` — §5.5.2 sequence-header bit gating the
+///   §5.11.24 outer arm.
+///
+/// CDF selection per §8.3.2: `TileFilterIntraCdf[ MiSize ]` for the
+/// outer `use_filter_intra` S(); `TileFilterIntraModeCdf` (a single
+/// context-free row over `INTRA_FILTER_MODES = 5` modes) for the
+/// inner `filter_intra_mode` S().
+///
+/// Outer-gate short-circuits (no bits emitted, must satisfy
+/// `use_filter_intra == 0 && filter_intra_mode == None`):
+/// * `!enable_filter_intra`
+/// * `y_mode != DC_PRED` (DC_PRED = 0)
+/// * `palette_size_y != 0`
+/// * `Max( Block_Width[ MiSize ], Block_Height[ MiSize ] ) > 32`
+///
+/// Inner-arm contract: when the outer gate fires, `use_filter_intra
+/// == 1` requires `filter_intra_mode == Some(mode)` with `mode in
+/// 0..INTRA_FILTER_MODES`; `use_filter_intra == 0` requires
+/// `filter_intra_mode == None`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_filter_intra_mode_info(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    use_filter_intra: u8,
+    filter_intra_mode: Option<u8>,
+    mi_size: usize,
+    y_mode: u8,
+    palette_size_y: u32,
+    enable_filter_intra: bool,
+) -> Result<(), Error> {
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (y_mode as usize) >= INTRA_MODES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if use_filter_intra > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.24 outer gate. DC_PRED = 0 per §3.
+    let bw = block_width(mi_size);
+    let bh = block_height(mi_size);
+    let outer_gate = enable_filter_intra && y_mode == 0 && palette_size_y == 0 && bw.max(bh) <= 32;
+
+    if !outer_gate {
+        // Caller-bug guard — the §5.11.24 body sets `use_filter_intra
+        // = 0` unconditionally on the gate-closed arm; the decoder
+        // reconstructs `use_filter_intra = 0` regardless of the
+        // bitstream so a non-zero caller value is a contract
+        // violation.
+        if use_filter_intra != 0 || filter_intra_mode.is_some() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.24: `use_filter_intra S()` against
+    // `TileFilterIntraCdf[ MiSize ]` (2-wide, no §8.3.2 ctx beyond
+    // `MiSize`).
+    let cdf = cdfs.filter_intra_cdf(mi_size);
+    writer.write_symbol(use_filter_intra as u32, cdf)?;
+
+    if use_filter_intra == 1 {
+        // §5.11.24 inner arm: `filter_intra_mode S()` against
+        // `TileFilterIntraModeCdf` (no §8.3.2 ctx, single row).
+        let mode = filter_intra_mode.ok_or(Error::PartitionWalkOutOfRange)?;
+        if (mode as usize) >= INTRA_FILTER_MODES {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let row = cdfs.filter_intra_mode_cdf();
+        writer.write_symbol(mode as u32, row)?;
+    } else if filter_intra_mode.is_some() {
+        // §5.11.24 contract: when `use_filter_intra == 0` the spec
+        // body never reads `filter_intra_mode`; a `Some` value here
+        // is a caller bug.
+        return Err(Error::PartitionWalkOutOfRange);
     }
 
     Ok(())
@@ -5947,5 +6207,518 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.42 `write_intra_angle_info_y` / §5.11.43
+    // `write_intra_angle_info_uv` / §5.11.24
+    // `write_filter_intra_mode_info` round-trips through
+    // `decode_intra_block_mode_info`. r260.
+    // -----------------------------------------------------------------
+
+    /// Helper: emit the §5.11.7 / §5.11.11 / §5.11.22 prefix at
+    /// frame origin (`y_mode` and caller-driven `AngleDeltaY` /
+    /// `UVMode` / `AngleDeltaUV`; no `UV_CFL_PRED` arm so no
+    /// `read_cfl_alphas` involvement), then walk the bitstream back
+    /// through `decode_intra_block_mode_info` and return the
+    /// recovered `(angle_delta_y, angle_delta_uv)`.
+    ///
+    /// Both planes share `BLOCK_16X16` (>= BLOCK_8X8) so the §5.11.42 /
+    /// §5.11.43 readers fire on directional modes. `has_chroma = true`
+    /// activates the §5.11.22 line 5-12 chroma arm.
+    fn round_trip_angle_info(
+        y_mode: u8,
+        angle_delta_y: i8,
+        uv_mode: u8,
+        angle_delta_uv: i8,
+    ) -> (i8, Option<i8>) {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_skip(&mut writer, &mut enc_cdfs, 0, skip_ctx(0, 0), false).unwrap();
+        write_intra_segment_id(&mut writer, &mut enc_cdfs, 0, 0, 0, 0, false, 0).unwrap();
+        let y_ctx = size_group(BLOCK_16X16);
+        write_y_mode(&mut writer, &mut enc_cdfs, y_mode, y_ctx).unwrap();
+        write_intra_angle_info_y(
+            &mut writer,
+            &mut enc_cdfs,
+            angle_delta_y,
+            BLOCK_16X16,
+            y_mode,
+        )
+        .unwrap();
+        let cfl_allowed = cfl_allowed_for_uv_mode(false, BLOCK_16X16, false, false);
+        write_intra_uv_mode(&mut writer, &mut enc_cdfs, y_mode, uv_mode, cfl_allowed).unwrap();
+        write_intra_angle_info_uv(
+            &mut writer,
+            &mut enc_cdfs,
+            angle_delta_uv,
+            BLOCK_16X16,
+            uv_mode,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let _skip = walker
+            .decode_skip(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false)
+            .unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* lossless = */ false,
+                /* has_chroma = */ true,
+                /* allow_screen_content_tools = */ false,
+                /* enable_filter_intra = */ false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, y_mode);
+        assert_eq!(info.uv_mode, Some(uv_mode));
+        (info.angle_delta_y, info.angle_delta_uv)
+    }
+
+    /// §5.11.42 short-circuit: `MiSize >= BLOCK_8X8` but `YMode` is
+    /// non-directional (`DC_PRED = 0`) ⇒ no §8.2.6 S() symbol written.
+    /// Verified by comparing the writer's `finish()` output against a
+    /// pristine writer's output (the §8.2.2 init produces 2 bytes of
+    /// `0x00`; a §5.11.42 short-circuit must leave that untouched).
+    #[test]
+    fn write_intra_angle_info_y_non_directional_writes_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_intra_angle_info_y(&mut writer, &mut cdfs, 0, BLOCK_16X16, DC_PRED_U8).unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(
+            bytes, pristine,
+            "non-directional ⇒ §5.11.42 must emit no symbols"
+        );
+    }
+
+    /// §5.11.42 short-circuit: `MiSize < BLOCK_8X8` (BLOCK_4X4) on a
+    /// directional `YMode` (V_PRED) ⇒ no §8.2.6 S() symbol written.
+    #[test]
+    fn write_intra_angle_info_y_small_block_writes_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_intra_angle_info_y(&mut writer, &mut cdfs, 0, BLOCK_4X4, V_PRED_U8).unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(
+            bytes, pristine,
+            "MiSize < BLOCK_8X8 ⇒ §5.11.42 must emit no symbols"
+        );
+    }
+
+    /// §5.11.42 contract: non-zero `angle_delta_y` on the
+    /// short-circuit arm is a caller bug.
+    #[test]
+    fn write_intra_angle_info_y_rejects_nonzero_on_short_circuit() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_angle_info_y(&mut writer, &mut cdfs, 1, BLOCK_16X16, DC_PRED_U8)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.42 out-of-range `angle_delta_y` (outside
+    /// `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA = -3..=3`).
+    #[test]
+    fn write_intra_angle_info_y_rejects_out_of_range_delta() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_angle_info_y(&mut writer, &mut cdfs, 4, BLOCK_16X16, V_PRED_U8)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_angle_info_y(&mut writer, &mut cdfs, -4, BLOCK_16X16, V_PRED_U8)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.42 round-trip: directional `YMode = V_PRED` with each of
+    /// the seven `AngleDeltaY` values; `UVMode = DC_PRED` (non-
+    /// directional, so the §5.11.43 reader takes the short-circuit
+    /// arm and emits no bits) carries `AngleDeltaUV = 0`.
+    #[test]
+    fn write_intra_angle_info_y_round_trip_all_deltas() {
+        for delta in -3i8..=3 {
+            let (dy, duv) = round_trip_angle_info(V_PRED_U8, delta, DC_PRED_U8, 0);
+            assert_eq!(dy, delta, "§5.11.42 round-trip mismatch at delta={}", delta);
+            assert_eq!(
+                duv,
+                Some(0),
+                "§5.11.43 short-circuit must reconstruct AngleDeltaUV = 0"
+            );
+        }
+    }
+
+    /// §5.11.43 short-circuit: `UVMode = DC_PRED` (non-directional)
+    /// ⇒ no §8.2.6 S() symbol written.
+    #[test]
+    fn write_intra_angle_info_uv_non_directional_writes_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_intra_angle_info_uv(&mut writer, &mut cdfs, 0, BLOCK_16X16, DC_PRED_U8).unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(bytes, pristine);
+    }
+
+    /// §5.11.43 short-circuit: `UVMode = UV_CFL_PRED` (= 13, non-
+    /// directional per §5.11.44).
+    #[test]
+    fn write_intra_angle_info_uv_cfl_pred_writes_no_bits() {
+        use crate::cdf::UV_CFL_PRED;
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_intra_angle_info_uv(&mut writer, &mut cdfs, 0, BLOCK_16X16, UV_CFL_PRED as u8)
+            .unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(bytes, pristine);
+    }
+
+    /// §5.11.43 out-of-range guards.
+    #[test]
+    fn write_intra_angle_info_uv_rejects_invalid_inputs() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_angle_info_uv(&mut writer, &mut cdfs, 1, BLOCK_16X16, DC_PRED_U8)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_intra_angle_info_uv(&mut writer, &mut cdfs, 4, BLOCK_16X16, V_PRED_U8)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        // uv_mode = 14 is past UV_INTRA_MODES_CFL_ALLOWED = 14.
+        let err =
+            write_intra_angle_info_uv(&mut writer, &mut cdfs, 0, BLOCK_16X16, 14).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.43 round-trip: directional `YMode = V_PRED` with
+    /// `AngleDeltaY = 0`; directional `UVMode = V_PRED` with each of
+    /// the seven `AngleDeltaUV` values.
+    #[test]
+    fn write_intra_angle_info_uv_round_trip_all_deltas() {
+        for delta in -3i8..=3 {
+            let (dy, duv) = round_trip_angle_info(V_PRED_U8, 0, V_PRED_U8, delta);
+            assert_eq!(dy, 0);
+            assert_eq!(
+                duv,
+                Some(delta),
+                "§5.11.43 round-trip mismatch at delta={}",
+                delta
+            );
+        }
+    }
+
+    /// §5.11.42 + §5.11.43 combined round-trip: both planes
+    /// directional with independent non-zero deltas.
+    #[test]
+    fn write_intra_angle_info_y_and_uv_round_trip_independent_deltas() {
+        let cases: &[(i8, i8)] = &[(1, -2), (-3, 3), (2, 0), (0, -1)];
+        for &(y_delta, uv_delta) in cases {
+            let (dy, duv) = round_trip_angle_info(V_PRED_U8, y_delta, V_PRED_U8, uv_delta);
+            assert_eq!(dy, y_delta);
+            assert_eq!(duv, Some(uv_delta));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.24 `write_filter_intra_mode_info` short-circuit + inner
+    // arm coverage + round-trip through `decode_intra_block_mode_info`.
+    // -----------------------------------------------------------------
+
+    /// §5.11.24 outer gate closed: `!enable_filter_intra` ⇒ no S()
+    /// symbol written (verified vs a pristine writer).
+    #[test]
+    fn write_filter_intra_mode_info_gate_off_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            None,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            0,
+            /* enable_filter_intra = */ false,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(bytes, pristine);
+    }
+
+    /// §5.11.24 outer gate closed: `YMode != DC_PRED` ⇒ no S() symbol.
+    #[test]
+    fn write_filter_intra_mode_info_y_mode_not_dc_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            None,
+            BLOCK_16X16,
+            V_PRED_U8,
+            0,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(bytes, pristine);
+    }
+
+    /// §5.11.24 outer gate closed: `PaletteSizeY != 0` ⇒ no S() symbol.
+    #[test]
+    fn write_filter_intra_mode_info_palette_active_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            None,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            2,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(bytes, pristine);
+    }
+
+    /// §5.11.24 outer gate closed: Max(BW, BH) > 32 ⇒ no S() symbol.
+    /// The §9.3 mapping: BLOCK_64X64 has bw = bh = 64.
+    #[test]
+    fn write_filter_intra_mode_info_large_block_no_bits() {
+        use crate::cdf::BLOCK_64X64;
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            None,
+            BLOCK_64X64,
+            DC_PRED_U8,
+            0,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        let pristine = SymbolWriter::new(true).finish();
+        assert_eq!(bytes, pristine);
+    }
+
+    /// §5.11.24 contract: non-zero `use_filter_intra` or `Some` mode
+    /// on the gate-off arm is a caller bug.
+    #[test]
+    fn write_filter_intra_mode_info_rejects_nonzero_on_gate_off() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            1,
+            Some(0),
+            BLOCK_16X16,
+            DC_PRED_U8,
+            0,
+            /* enable_filter_intra = */ false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        let mut writer = SymbolWriter::new(true);
+        let err = write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            Some(0),
+            BLOCK_16X16,
+            DC_PRED_U8,
+            0,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.24 contract: `use_filter_intra == 1` without a `Some`
+    /// mode is a caller bug.
+    #[test]
+    fn write_filter_intra_mode_info_rejects_use_without_mode() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            1,
+            None,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            0,
+            /* enable_filter_intra = */ true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.24 contract: `use_filter_intra == 0` with a `Some` mode
+    /// is a caller bug (the spec body never reads the mode on the
+    /// `use == 0` arm).
+    #[test]
+    fn write_filter_intra_mode_info_rejects_mode_without_use() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            0,
+            Some(0),
+            BLOCK_16X16,
+            DC_PRED_U8,
+            0,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §5.11.24 out-of-range mode (>= INTRA_FILTER_MODES = 5).
+    #[test]
+    fn write_filter_intra_mode_info_rejects_out_of_range_mode() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_filter_intra_mode_info(
+            &mut writer,
+            &mut cdfs,
+            1,
+            Some(5),
+            BLOCK_16X16,
+            DC_PRED_U8,
+            0,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Helper: emit the §5.11.7 / §5.11.11 / §5.11.22 prefix at frame
+    /// origin with `y_mode = DC_PRED` + `uv_mode = DC_PRED` (no chroma
+    /// CFL, no angle-info bits) + the §5.11.24 filter-intra block,
+    /// then walk the bitstream back through
+    /// `decode_intra_block_mode_info` and return the recovered
+    /// `(use_filter_intra, filter_intra_mode)`.
+    fn round_trip_filter_intra_mode_info(
+        use_filter_intra: u8,
+        filter_intra_mode: Option<u8>,
+    ) -> (Option<u8>, Option<u8>) {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_skip(&mut writer, &mut enc_cdfs, 0, skip_ctx(0, 0), false).unwrap();
+        write_intra_segment_id(&mut writer, &mut enc_cdfs, 0, 0, 0, 0, false, 0).unwrap();
+        let y_ctx = size_group(BLOCK_16X16);
+        write_y_mode(&mut writer, &mut enc_cdfs, DC_PRED_U8, y_ctx).unwrap();
+        // No angle info bits (DC_PRED is non-directional ⇒ §5.11.42
+        // short-circuits).
+        write_intra_angle_info_y(&mut writer, &mut enc_cdfs, 0, BLOCK_16X16, DC_PRED_U8).unwrap();
+        let cfl_allowed = cfl_allowed_for_uv_mode(false, BLOCK_16X16, false, false);
+        write_intra_uv_mode(
+            &mut writer,
+            &mut enc_cdfs,
+            DC_PRED_U8,
+            DC_PRED_U8,
+            cfl_allowed,
+        )
+        .unwrap();
+        write_intra_angle_info_uv(&mut writer, &mut enc_cdfs, 0, BLOCK_16X16, DC_PRED_U8).unwrap();
+        // §5.11.24 outer gate satisfied: enable_filter_intra = true,
+        // YMode = DC_PRED, PaletteSizeY = 0, Max(BW, BH) = 16 <= 32.
+        write_filter_intra_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            use_filter_intra,
+            filter_intra_mode,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            0,
+            /* enable_filter_intra = */ true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let _skip = walker
+            .decode_skip(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_16X16, false)
+            .unwrap();
+        let info = walker
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* lossless = */ false,
+                /* has_chroma = */ true,
+                /* allow_screen_content_tools = */ false,
+                /* enable_filter_intra = */ true,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.uv_mode, Some(DC_PRED_U8));
+        (info.use_filter_intra, info.filter_intra_mode)
+    }
+
+    /// §5.11.24 round-trip: outer gate open, `use_filter_intra = 0`
+    /// ⇒ one S() bit + the decoder reconstructs `(Some(0), None)`.
+    #[test]
+    fn write_filter_intra_mode_info_round_trip_use_zero() {
+        let (use_fi, mode) = round_trip_filter_intra_mode_info(0, None);
+        assert_eq!(use_fi, Some(0));
+        assert_eq!(mode, None);
+    }
+
+    /// §5.11.24 round-trip: outer gate open, `use_filter_intra = 1`
+    /// ⇒ the inner S() reads the mode; loop over all five
+    /// `INTRA_FILTER_MODES` values.
+    #[test]
+    fn write_filter_intra_mode_info_round_trip_use_one_all_modes() {
+        for mode in 0u8..(INTRA_FILTER_MODES as u8) {
+            let (use_fi, recovered) = round_trip_filter_intra_mode_info(1, Some(mode));
+            assert_eq!(use_fi, Some(1));
+            assert_eq!(
+                recovered,
+                Some(mode),
+                "§5.11.24 round-trip mismatch at mode={}",
+                mode
+            );
+        }
     }
 }

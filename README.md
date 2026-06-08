@@ -2,6 +2,70 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 260)
+
+Round 260 adds three §5.11.22 `intra_block_mode_info` leaf writers
+toward the §5.11.18 line 23 `if ( !is_inter )` terminal arm:
+
+* `encoder::block_mode_info::write_intra_angle_info_y` (§5.11.42
+  inverse, av1-spec p.95) — the line 4 `intra_angle_info_y( )`
+  call in §5.11.22. Codes `angle_delta_y` against
+  `TileAngleDeltaCdf[ YMode - V_PRED ]` (8-wide) when `MiSize >=
+  BLOCK_8X8` AND `YMode` is directional; short-circuits to no
+  bits otherwise.
+* `encoder::block_mode_info::write_intra_angle_info_uv` (§5.11.43
+  inverse, p.95) — the line 10 `intra_angle_info_uv( )` call in
+  the §5.11.22 `if ( HasChroma )` arm. Mirror of the luma reader
+  against `TileAngleDeltaCdf[ UVMode - V_PRED ]`; takes the
+  short-circuit on the U-plane CFL signal (`UV_CFL_PRED = 13`)
+  and on non-directional `UVMode`.
+* `encoder::block_mode_info::write_filter_intra_mode_info`
+  (§5.11.24 inverse, p.74) — the line 16
+  `filter_intra_mode_info( )` call at the tail of §5.11.22. Outer
+  gate `enable_filter_intra && YMode == DC_PRED && PaletteSizeY
+  == 0 && Max(BW, BH) <= 32` writes `use_filter_intra` against
+  `TileFilterIntraCdf[ MiSize ]`; the `use == 1` inner arm writes
+  `filter_intra_mode` against `TileFilterIntraModeCdf`.
+
+Each writer is stateless on grid (per the §5.11.5 §8.3.2 walker
+contract): callers feed the §5.5.2 sequence-header /
+§5.11.46 frame-header / per-block scalars and the committed
+syntax-element value(s). The decoder side already inlines these
+three blocks into `PartitionWalker::decode_intra_block_mode_info`;
+the r260 writers mirror each block's short-circuit logic and CDF
+selection exactly so the prefix-prologue + new-writer pair
+round-trips against the decoder.
+
+### Round 260 test summary
+
++20 tests: 7 round-trips covering all `AngleDeltaY` values on
+`V_PRED`; 7 round-trips covering all `AngleDeltaUV` values on
+`V_PRED`; 4 combined-deltas round-trips with independent
+non-zero values; 5 round-trips for `filter_intra_mode_info`
+covering `use_filter_intra ∈ {0, 1}` × all five
+`INTRA_FILTER_MODES`; plus 12 short-circuit / caller-bug guard
+batteries (non-directional luma + chroma, `MiSize <
+BLOCK_8X8`, `UV_CFL_PRED`, gate-off variants for §5.11.24, plus
+out-of-range / contract-violation guards).
+
+Full library test count moves to 1725 (was 1705).
+
+### Out of scope for round 260 / pending follow-ups
+
+* Compose the three r260 leaf writers into a §5.11.22
+  `intra_block_mode_info` dispatcher writer (`write_y_mode` +
+  `write_intra_angle_info_y` + the `HasChroma` arm with
+  `write_intra_uv_mode` + `write_cfl_alphas` +
+  `write_intra_angle_info_uv` + a future §5.11.46
+  `write_palette_mode_info` + `write_filter_intra_mode_info`).
+* Begin §5.11.23 `inter_block_mode_info` writer dispatch
+  (composes §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+  §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode`
+  + §5.11.29 `read_compound_type` writers, none of which exist
+  yet on the encoder side).
+* §7.10 inter-prediction primitive driver, §7.14 loop-filter,
+  §7.15 CDEF bring-up — the three near-term encoder milestones.
+
 ## Status — 2026-06-08 (round 259)
 
 Round 259 composes the r258 §5.11.18 lines 18-20 leaf writers
