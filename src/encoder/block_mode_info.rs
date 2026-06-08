@@ -959,6 +959,310 @@ pub fn write_inter_segment_id(
     )
 }
 
+/// Aggregate the §5.11.18 `inter_frame_mode_info` writer prefix produces.
+///
+/// The struct mirrors the decoder-side
+/// [`crate::cdf::DecodedInterFrameModeInfo`] for the
+/// *pre-cdef / pre-delta / pre-`if(is_inter)`* portion of §5.11.18 — i.e.
+/// every value the writer commits to the bitstream before reaching the
+/// §5.11.18 line 18 `read_cdef( )` call. The §5.11.18 lines 17-26
+/// (`Lossless = LosslessArray[ segment_id ]`, `read_cdef`,
+/// `read_delta_qindex`, `read_delta_lf`, `ReadDeltas = 0`, `read_is_inter`,
+/// the `if ( is_inter ) inter_block_mode_info( ) else intra_block_mode_info( )`
+/// terminal dispatch) are next-round targets — we surface `is_inter` and
+/// `lossless` because `write_is_inter` *is* in scope and `LosslessArray[]`
+/// is a pure caller-supplied lookup with no bits emitted.
+///
+/// Fields:
+/// * `segment_id` — final `segment_id ∈ 0..=last_active_seg_id` after the
+///   §5.11.18 pre-skip and (when `!seg_id_pre_skip`) post-skip
+///   `inter_segment_id` writes.
+/// * `skip_mode` — the §5.11.10 result (`0` on every short-circuit arm,
+///   `0` or `1` on the fall-through S() arm).
+/// * `skip` — `1` if `skip_mode == 1` (§5.11.18 lines 13-14 force);
+///   otherwise the §5.11.11 `read_skip` result.
+/// * `is_inter` — the §5.11.20 result the §5.11.18 line 22 read produces.
+/// * `lossless` — `LosslessArray[ segment_id ]`, the §5.11.18 line 17
+///   derivation against the caller-supplied lossless array. Mirrors the
+///   decoder's same field on [`crate::cdf::DecodedInterFrameModeInfo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterFrameModeInfoPrefix {
+    /// §5.11.18 lines 11 + 15-16 result. `0..=last_active_seg_id`.
+    pub segment_id: u8,
+    /// §5.11.18 line 12 result.
+    pub skip_mode: u8,
+    /// §5.11.18 line 10 + lines 13-14 result.
+    pub skip: u8,
+    /// §5.11.18 line 22 result.
+    pub is_inter: u8,
+    /// §5.11.18 line 17 result.
+    pub lossless: bool,
+}
+
+/// `inter_frame_mode_info()` writer prefix per §5.11.18 (av1-spec p.71) —
+/// the per-block syntax dispatcher for an inter-frame leaf. Composes
+/// every leaf writer landed across r253-r256:
+///
+/// * §5.11.19 `inter_segment_id( 1 )` — pre-skip arm via
+///   [`write_inter_segment_id`].
+/// * §5.11.10 `read_skip_mode()` — via [`write_skip_mode`].
+/// * §5.11.11 `read_skip()` (when `skip_mode == 0`) — via [`write_skip`].
+/// * §5.11.19 `inter_segment_id( 0 )` (when `!seg_id_pre_skip`) —
+///   post-skip arm via [`write_inter_segment_id`].
+/// * §5.11.20 `read_is_inter()` — via [`write_is_inter`].
+///
+/// The spec body (av1-spec p.71) reads:
+///
+/// ```text
+///   inter_frame_mode_info( ) {
+///       use_intrabc = 0
+///       LeftRefFrame[..]  = ...
+///       AboveRefFrame[..] = ...
+///       LeftIntra / AboveIntra / LeftSingle / AboveSingle = ...
+///       skip = 0
+///       inter_segment_id( 1 )                                 ← writer
+///       read_skip_mode( )                                     ← writer
+///       if ( skip_mode )
+///           skip = 1
+///       else
+///           read_skip( )                                      ← writer
+///       if ( !SegIdPreSkip )
+///           inter_segment_id( 0 )                             ← writer
+///       Lossless = LosslessArray[ segment_id ]
+///       read_cdef( )                                          (next round)
+///       read_delta_qindex( )                                  (next round)
+///       read_delta_lf( )                                      (next round)
+///       ReadDeltas = 0
+///       read_is_inter( )                                      ← writer
+///       if ( is_inter )
+///           inter_block_mode_info( )                          (next round)
+///       else
+///           intra_block_mode_info( )                          (next round)
+///   }
+/// ```
+///
+/// ## Scope of this writer
+///
+/// The dispatcher writes the §5.11.18 *prefix*: the five S()-emitting
+/// sub-writers above. The §5.11.18 line 18 `read_cdef`, line 19
+/// `read_delta_qindex`, line 20 `read_delta_lf`, and the line 23-26
+/// terminal `if ( is_inter )` dispatch into §5.11.22 / §5.11.23 are
+/// next-round encoder-side targets — none have writer counterparts yet.
+///
+/// The writer's return value is an [`InterFrameModeInfoPrefix`]
+/// aggregate covering every value committed to the bitstream so far,
+/// including the `segment_id`-indexed `lossless` lookup (no bits) so
+/// the caller can chain the §5.11.18 line 17 derivation without
+/// re-fetching it.
+///
+/// ## Parameter surface
+///
+/// Mirrors the union of every composed sub-writer. The `is_inter_ctx`
+/// argument is the §8.3.2 `is_inter` ctx the caller pre-computes via
+/// [`crate::cdf::is_inter_ctx`]; the other ctx values (`skip_ctx`,
+/// `skip_mode_ctx`, `seg_id_read_ctx`, `seg_pred_ctx`) are caller-supplied
+/// just like the per-sub-writer entry points. The `sub_size`, segmentation
+/// scalars, and pred values mirror their per-sub-writer counterparts
+/// one-to-one.
+///
+/// ## Out-of-range / mismatch cases
+///
+/// All [`Error::PartitionWalkOutOfRange`] guards from the composed
+/// sub-writers fire here unchanged (the dispatcher delegates without
+/// short-circuiting). One extra guard is added up-front:
+///
+/// * `last_active_seg_id >= MAX_SEGMENTS` — invalid §6.10.8 derivation.
+///   Caught up-front so the lossless lookup below is well-defined.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// As with every sub-writer in this module, the dispatcher is stateless:
+/// caller threads any encoder-side §8.3.2 ctx derivations / parallel
+/// [`crate::cdf::PartitionWalker`] grid-fill themselves. The round-trip
+/// tests below drive the byte run through
+/// [`crate::cdf::PartitionWalker::decode_inter_frame_mode_info`]'s prefix
+/// (i.e. through the same five composed `decode_*` calls in the same
+/// order) and verify the segment_id / skip_mode / skip / is_inter values
+/// match.
+#[allow(clippy::too_many_arguments)]
+pub fn write_inter_frame_mode_info_prefix(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    // Per-block grid coordinates (caller-side state only — the writer
+    // is stateless on grid-fill; the parameters are kept symmetric
+    // with the decoder for ergonomic call-site mirroring).
+    sub_size: usize,
+    // §5.11.18 leaf scalars to commit:
+    segment_id: u8,
+    skip_mode: u8,
+    skip: u8,
+    is_inter: u8,
+    // §5.11.19 segment-id neighbour cascade (caller-precomputed):
+    seg_pred: u8,
+    seg_id_predicted: u8,
+    // §8.3.2 ctx values (caller-precomputed):
+    skip_mode_ctx_val: usize,
+    skip_ctx_val: usize,
+    seg_id_read_ctx: usize,
+    seg_pred_ctx: usize,
+    is_inter_ctx_val: usize,
+    // §5.11.10 / §5.11.11 / §5.11.20 segmentation-feature collapsed flags:
+    seg_skip_mode_off: bool,
+    seg_skip_active: bool,
+    seg_ref_frame_active: bool,
+    seg_ref_frame_is_inter: bool,
+    seg_globalmv_active: bool,
+    // §5.9.14 segmentation scalars:
+    segmentation_enabled: bool,
+    segmentation_update_map: bool,
+    segmentation_temporal_update: bool,
+    seg_id_pre_skip: bool,
+    predicted_segment_id: u8,
+    last_active_seg_id: u8,
+    // §5.9.21 frame-header scalar:
+    skip_mode_present: bool,
+    // §5.11.18 line 17 lookup:
+    lossless_array: &[bool; MAX_SEGMENTS],
+) -> Result<InterFrameModeInfoPrefix, Error> {
+    if (last_active_seg_id as usize) >= MAX_SEGMENTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.18 line 11: `inter_segment_id( 1 )` — pre-skip arm. The
+    // §5.11.19 spec body short-circuits when `segmentation_enabled == 0`
+    // (writes `segment_id = 0`, no bits), when `segmentation_update_map
+    // == 0` (adopts `predictedSegmentId`, no bits), or on the
+    // `preSkip && !SegIdPreSkip` early-return (sets `segment_id = 0`,
+    // no bits — the post-skip call services the real read).
+    //
+    // When `seg_id_pre_skip == true` the pre-skip call services the
+    // actual segment_id read — pass caller's `segment_id`. When
+    // `seg_id_pre_skip == false` the pre-skip call MUST go through
+    // §5.11.19 Arm 1 / Arm 2 / Arm 3 short-circuits (one of them MUST
+    // fire because Arm 4 / 5 / 6 only run with `pre_skip == true &&
+    // seg_id_pre_skip == true` or `pre_skip == false`):
+    //   * `!segmentation_enabled` ⇒ pass 0 (Arm 1's invariant).
+    //   * `!segmentation_update_map` ⇒ pass `predicted_segment_id`
+    //     (Arm 2's invariant).
+    //   * else (Arm 3 fires because `pre_skip && !seg_id_pre_skip`) ⇒
+    //     pass 0 (Arm 3's invariant).
+    // The final value committed by the post-skip call below is the
+    // caller's `segment_id`.
+    let pre_skip_segment_id = if seg_id_pre_skip {
+        segment_id
+    } else if !segmentation_enabled {
+        0
+    } else if !segmentation_update_map {
+        predicted_segment_id
+    } else {
+        0
+    };
+    write_inter_segment_id(
+        writer,
+        cdfs,
+        pre_skip_segment_id,
+        seg_pred,
+        seg_id_read_ctx,
+        seg_pred_ctx,
+        /* pre_skip = */ true,
+        /* skip = */ 0,
+        seg_id_predicted,
+        segmentation_enabled,
+        segmentation_update_map,
+        segmentation_temporal_update,
+        seg_id_pre_skip,
+        predicted_segment_id,
+        last_active_seg_id,
+    )?;
+
+    // §5.11.18 line 12: `read_skip_mode( )`.
+    write_skip_mode(
+        writer,
+        cdfs,
+        skip_mode,
+        skip_mode_ctx_val,
+        sub_size,
+        seg_skip_mode_off,
+        skip_mode_present,
+    )?;
+
+    // §5.11.18 lines 13-14: `if ( skip_mode ) skip = 1 else read_skip( )`.
+    // The compound-reference shortcut forces `skip = 1` without reading
+    // the §5.11.11 bit. Validate the caller-supplied `skip` matches the
+    // spec's invariant either way.
+    if skip > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let final_skip: u8 = if skip_mode != 0 {
+        if skip != 1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        1
+    } else {
+        write_skip(writer, cdfs, skip, skip_ctx_val, seg_skip_active)?;
+        skip
+    };
+
+    // §5.11.18 lines 15-16: `if ( !SegIdPreSkip ) inter_segment_id( 0 )`.
+    // The post-skip arm fires only when the §5.9.14 SegIdPreSkip
+    // derivation is false; otherwise the pre-skip call already committed
+    // the segment_id.
+    if !seg_id_pre_skip {
+        write_inter_segment_id(
+            writer,
+            cdfs,
+            segment_id,
+            seg_pred,
+            seg_id_read_ctx,
+            seg_pred_ctx,
+            /* pre_skip = */ false,
+            final_skip,
+            seg_id_predicted,
+            segmentation_enabled,
+            segmentation_update_map,
+            segmentation_temporal_update,
+            seg_id_pre_skip,
+            predicted_segment_id,
+            last_active_seg_id,
+        )?;
+    }
+
+    // §5.11.18 line 17: `Lossless = LosslessArray[ segment_id ]`. Pure
+    // caller-supplied lookup; segment_id has been range-checked inside
+    // the §5.11.19 writers (each call rejects `segment_id >
+    // last_active_seg_id`), and `last_active_seg_id < MAX_SEGMENTS`
+    // was checked up-front, so the index is always in bounds.
+    debug_assert!(
+        (segment_id as usize) < MAX_SEGMENTS,
+        "segment_id range-checked by write_inter_segment_id"
+    );
+    let lossless = lossless_array[segment_id as usize];
+
+    // §5.11.18 lines 18-21: `read_cdef( ) / read_delta_qindex( ) /
+    // read_delta_lf( ) / ReadDeltas = 0` — next-round writer targets;
+    // skipped here.
+
+    // §5.11.18 line 22: `read_is_inter( )`.
+    write_is_inter(
+        writer,
+        cdfs,
+        is_inter,
+        is_inter_ctx_val,
+        skip_mode,
+        seg_ref_frame_active,
+        seg_ref_frame_is_inter,
+        seg_globalmv_active,
+    )?;
+
+    Ok(InterFrameModeInfoPrefix {
+        segment_id,
+        skip_mode,
+        skip: final_skip,
+        is_inter,
+        lossless,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3275,5 +3579,564 @@ mod tests {
             .unwrap();
             let _bytes = writer.finish();
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.18 inter_frame_mode_info — write_inter_frame_mode_info_prefix
+    // round-trips through the decoder's matching composed call sequence:
+    //   decode_inter_segment_id(pre_skip=true)
+    //   decode_skip_mode
+    //   if skip_mode==0 → decode_skip; else force skip=1
+    //   if !seg_id_pre_skip → decode_inter_segment_id(pre_skip=false)
+    //   decode_is_inter
+    // Each test verifies (a) the writer's per-element committed values
+    // match the decoder's sequential reads in the same order, and
+    // (b) the writer's aggregate `InterFrameModeInfoPrefix` matches the
+    // expected per-arm scalars.
+    // -----------------------------------------------------------------
+
+    /// Replay the writer's byte run through the same composed
+    /// decoder-side call sequence the §5.11.18 spec body specifies, and
+    /// return the four decoded scalars `(segment_id_after_post, skip_mode,
+    /// skip, is_inter)` for the caller to assert against.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_inter_frame_mode_info_prefix(
+        bytes: Vec<u8>,
+        cdf_disable_update: bool,
+        sub_size: usize,
+        seg_id_pre_skip: bool,
+        segmentation_enabled: bool,
+        segmentation_update_map: bool,
+        segmentation_temporal_update: bool,
+        predicted_segment_id: u8,
+        last_active_seg_id: u8,
+        skip_mode_present: bool,
+        seg_skip_mode_off: bool,
+        seg_skip_active: bool,
+        seg_ref_frame_active: bool,
+        seg_ref_frame_is_inter: bool,
+        seg_globalmv_active: bool,
+    ) -> (u8, u8, u8, u8) {
+        let pad = pad_no_symbol(bytes);
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), cdf_disable_update).unwrap();
+        // §5.11.18 line 11.
+        let (mut segment_id, _) = walker
+            .decode_inter_segment_id(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                sub_size,
+                /* pre_skip = */ true,
+                /* skip = */ 0,
+                seg_id_pre_skip,
+                segmentation_enabled,
+                segmentation_update_map,
+                segmentation_temporal_update,
+                predicted_segment_id,
+                last_active_seg_id,
+                &LOSSLESS_ALL_FALSE,
+            )
+            .unwrap();
+        // §5.11.18 line 12.
+        let skip_mode = walker
+            .decode_skip_mode(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                sub_size,
+                seg_skip_mode_off,
+                skip_mode_present,
+            )
+            .unwrap();
+        // §5.11.18 lines 13-14.
+        let skip: u8 = if skip_mode != 0 {
+            1
+        } else {
+            walker
+                .decode_skip(&mut dec, &mut dec_cdfs, 0, 0, sub_size, seg_skip_active)
+                .unwrap()
+        };
+        // §5.11.18 lines 15-16.
+        if !seg_id_pre_skip {
+            let (sid, _) = walker
+                .decode_inter_segment_id(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    0,
+                    0,
+                    sub_size,
+                    /* pre_skip = */ false,
+                    skip,
+                    seg_id_pre_skip,
+                    segmentation_enabled,
+                    segmentation_update_map,
+                    segmentation_temporal_update,
+                    predicted_segment_id,
+                    last_active_seg_id,
+                    &LOSSLESS_ALL_FALSE,
+                )
+                .unwrap();
+            segment_id = sid;
+        }
+        // §5.11.18 line 22.
+        let is_inter = walker
+            .decode_is_inter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                sub_size,
+                skip_mode,
+                seg_ref_frame_active,
+                seg_ref_frame_is_inter,
+                seg_globalmv_active,
+            )
+            .unwrap();
+        (segment_id, skip_mode, skip, is_inter)
+    }
+
+    /// `segmentation_enabled = false` short-circuit on every segment_id
+    /// arm: pre-skip and post-skip §5.11.19 writes emit no bits;
+    /// `skip_mode_present = false` short-circuits §5.11.10 (no bits);
+    /// `read_skip` fires; `read_is_inter` fires. Sub_size = BLOCK_16X16
+    /// (above the 8×8 §5.11.10 small-block threshold).
+    #[test]
+    fn write_inter_frame_mode_info_prefix_segless_round_trip() {
+        for (skip_in, is_inter_in) in [(0u8, 0u8), (0u8, 1u8), (1u8, 0u8), (1u8, 1u8)]
+            .iter()
+            .copied()
+        {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let prefix = write_inter_frame_mode_info_prefix(
+                &mut writer,
+                &mut enc_cdfs,
+                BLOCK_16X16,
+                /* segment_id = */ 0,
+                /* skip_mode = */ 0,
+                /* skip = */ skip_in,
+                /* is_inter = */ is_inter_in,
+                /* seg_pred = */ 0,
+                /* seg_id_predicted = */ 0,
+                /* skip_mode_ctx = */ 0,
+                /* skip_ctx = */ skip_ctx(0, 0),
+                /* seg_id_read_ctx = */ 0,
+                /* seg_pred_ctx = */ 0,
+                /* is_inter_ctx = */ is_inter_ctx(None, None),
+                /* seg_skip_mode_off = */ false,
+                /* seg_skip_active = */ false,
+                /* seg_ref_frame_active = */ false,
+                /* seg_ref_frame_is_inter = */ false,
+                /* seg_globalmv_active = */ false,
+                /* segmentation_enabled = */ false,
+                /* segmentation_update_map = */ false,
+                /* segmentation_temporal_update = */ false,
+                /* seg_id_pre_skip = */ true,
+                /* predicted_segment_id = */ 0,
+                /* last_active_seg_id = */ 7,
+                /* skip_mode_present = */ false,
+                &LOSSLESS_ALL_FALSE,
+            )
+            .unwrap();
+            assert_eq!(prefix.segment_id, 0);
+            assert_eq!(prefix.skip_mode, 0);
+            assert_eq!(prefix.skip, skip_in);
+            assert_eq!(prefix.is_inter, is_inter_in);
+            assert!(!prefix.lossless);
+
+            let (sid, skip_mode, skip, is_inter) = replay_inter_frame_mode_info_prefix(
+                writer.finish(),
+                false,
+                BLOCK_16X16,
+                true,
+                false,
+                false,
+                false,
+                0,
+                7,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            );
+            assert_eq!(sid, 0);
+            assert_eq!(skip_mode, 0);
+            assert_eq!(skip, skip_in);
+            assert_eq!(is_inter, is_inter_in);
+        }
+    }
+
+    /// `skip_mode == 1` arm: §5.11.10 emits one S(), §5.11.11 `read_skip`
+    /// is skipped (skip forced to 1), §5.11.20 `read_is_inter` is forced
+    /// to 1 (no bits). The pre-skip segment_id write emits no bits when
+    /// segmentation is disabled.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_skip_mode_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let prefix = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            /* segment_id = */ 0,
+            /* skip_mode = */ 1,
+            /* skip = */ 1,
+            /* is_inter = */ 1,
+            /* seg_pred = */ 0,
+            /* seg_id_predicted = */ 0,
+            /* skip_mode_ctx = */ 0,
+            /* skip_ctx = */ 0,
+            /* seg_id_read_ctx = */ 0,
+            /* seg_pred_ctx = */ 0,
+            /* is_inter_ctx = */ 0,
+            /* seg_skip_mode_off = */ false,
+            /* seg_skip_active = */ false,
+            /* seg_ref_frame_active = */ false,
+            /* seg_ref_frame_is_inter = */ false,
+            /* seg_globalmv_active = */ false,
+            /* segmentation_enabled = */ false,
+            /* segmentation_update_map = */ false,
+            /* segmentation_temporal_update = */ false,
+            /* seg_id_pre_skip = */ true,
+            /* predicted_segment_id = */ 0,
+            /* last_active_seg_id = */ 7,
+            /* skip_mode_present = */ true,
+            &LOSSLESS_ALL_FALSE,
+        )
+        .unwrap();
+        assert_eq!(prefix.segment_id, 0);
+        assert_eq!(prefix.skip_mode, 1);
+        assert_eq!(prefix.skip, 1);
+        assert_eq!(prefix.is_inter, 1);
+
+        let (sid, skip_mode, skip, is_inter) = replay_inter_frame_mode_info_prefix(
+            writer.finish(),
+            false,
+            BLOCK_16X16,
+            true,
+            false,
+            false,
+            false,
+            0,
+            7,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(sid, 0);
+        assert_eq!(skip_mode, 1);
+        assert_eq!(skip, 1);
+        assert_eq!(is_inter, 1);
+    }
+
+    /// `!seg_id_pre_skip` arm: both §5.11.19 calls fire. The post-skip
+    /// call services the actual segment_id read (here through the
+    /// `segmentation_temporal_update` adopt branch, no inner literal id
+    /// read). `skip = 0` ⇒ the post-skip arm's "skip-block" branch
+    /// (Arm 4 of write_inter_segment_id) does NOT fire.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_post_skip_arm_round_trip() {
+        // Pre-skip side runs through Arm 3 (`pre_skip && !seg_id_pre_skip`)
+        // ⇒ no bits. Post-skip side hits the temporal-update adopt arm.
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let prefix = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            /* segment_id = */ 3,
+            /* skip_mode = */ 0,
+            /* skip = */ 0,
+            /* is_inter = */ 1,
+            /* seg_pred = */ 0,
+            /* seg_id_predicted = */ 1,
+            /* skip_mode_ctx = */ 0,
+            /* skip_ctx = */ 0,
+            /* seg_id_read_ctx = */ 0,
+            /* seg_pred_ctx = */ 0,
+            /* is_inter_ctx = */ 0,
+            /* seg_skip_mode_off = */ false,
+            /* seg_skip_active = */ false,
+            /* seg_ref_frame_active = */ false,
+            /* seg_ref_frame_is_inter = */ false,
+            /* seg_globalmv_active = */ false,
+            /* segmentation_enabled = */ true,
+            /* segmentation_update_map = */ true,
+            /* segmentation_temporal_update = */ true,
+            /* seg_id_pre_skip = */ false,
+            /* predicted_segment_id = */ 3,
+            /* last_active_seg_id = */ 7,
+            /* skip_mode_present = */ true,
+            &LOSSLESS_ALL_FALSE,
+        )
+        .unwrap();
+        assert_eq!(prefix.segment_id, 3);
+        assert_eq!(prefix.skip_mode, 0);
+        assert_eq!(prefix.skip, 0);
+        assert_eq!(prefix.is_inter, 1);
+
+        let (sid, skip_mode, skip, is_inter) = replay_inter_frame_mode_info_prefix(
+            writer.finish(),
+            false,
+            BLOCK_16X16,
+            false,
+            true,
+            true,
+            true,
+            3,
+            7,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(sid, 3);
+        assert_eq!(skip_mode, 0);
+        assert_eq!(skip, 0);
+        assert_eq!(is_inter, 1);
+    }
+
+    /// SEG_LVL_REF_FRAME active arm: `seg_skip_mode_off = true` forces
+    /// skip_mode = 0 (no bits); `seg_skip_active = true` forces
+    /// `decode_skip` to short-circuit to skip = 1 (no bits);
+    /// `seg_ref_frame_active = true` forces is_inter to match
+    /// `seg_ref_frame_is_inter` (no bits). The only S() in the byte run
+    /// is the pre-skip segment_id under the temporal-update adopt arm.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_seg_ref_frame_round_trip() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // segmentation enabled + temporal_update so the pre-skip call
+        // emits one S() (seg_id_predicted = 1 adopts the predicted id).
+        let prefix = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            /* segment_id = */ 2,
+            /* skip_mode = */ 0,
+            /* skip = */ 1,
+            /* is_inter = */ 1, // SEG_LVL_REF_FRAME = inter
+            /* seg_pred = */ 0,
+            /* seg_id_predicted = */ 1,
+            /* skip_mode_ctx = */ 0,
+            /* skip_ctx = */ 0,
+            /* seg_id_read_ctx = */ 0,
+            /* seg_pred_ctx = */ 0,
+            /* is_inter_ctx = */ 0,
+            /* seg_skip_mode_off = */ true,
+            /* seg_skip_active = */ true,
+            /* seg_ref_frame_active = */ true,
+            /* seg_ref_frame_is_inter = */ true,
+            /* seg_globalmv_active = */ false,
+            /* segmentation_enabled = */ true,
+            /* segmentation_update_map = */ true,
+            /* segmentation_temporal_update = */ true,
+            /* seg_id_pre_skip = */ true,
+            /* predicted_segment_id = */ 2,
+            /* last_active_seg_id = */ 7,
+            /* skip_mode_present = */ true,
+            &LOSSLESS_ALL_FALSE,
+        )
+        .unwrap();
+        assert_eq!(prefix.segment_id, 2);
+        assert_eq!(prefix.skip_mode, 0);
+        assert_eq!(prefix.skip, 1);
+        assert_eq!(prefix.is_inter, 1);
+
+        let (sid, skip_mode, skip, is_inter) = replay_inter_frame_mode_info_prefix(
+            writer.finish(),
+            false,
+            BLOCK_16X16,
+            true,
+            true,
+            true,
+            true,
+            2,
+            7,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(sid, 2);
+        assert_eq!(skip_mode, 0);
+        assert_eq!(skip, 1);
+        assert_eq!(is_inter, 1);
+    }
+
+    /// Up-front rejection: `last_active_seg_id >= MAX_SEGMENTS`.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_rejects_out_of_range_last_active() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut cdfs,
+            BLOCK_16X16,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            0,
+            /* last_active_seg_id = */ MAX_SEGMENTS as u8,
+            false,
+            &LOSSLESS_ALL_FALSE,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `skip > 1` is outside the §3 binary alphabet — caller bug.
+    /// (Caught after the §5.11.10 write, since the dispatcher checks
+    /// `skip` after `write_skip_mode`. The pre-skip and skip_mode writes
+    /// commit but the bytes are discarded by the caller on the err.)
+    #[test]
+    fn write_inter_frame_mode_info_prefix_rejects_out_of_range_skip() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut cdfs,
+            BLOCK_16X16,
+            0,
+            0,
+            /* skip = */ 2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            0,
+            7,
+            false,
+            &LOSSLESS_ALL_FALSE,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `skip_mode == 1` but `skip != 1` is a caller bug — §5.11.18
+    /// forces `skip = 1` on the skip_mode arm.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_rejects_skip_mode_mismatch() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let err = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut cdfs,
+            BLOCK_16X16,
+            0,
+            /* skip_mode = */ 1,
+            /* skip = */ 0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            0,
+            7,
+            true,
+            &LOSSLESS_ALL_FALSE,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `Lossless = LosslessArray[ segment_id ]` is returned in the
+    /// aggregate. Verify the dispatcher passes the lookup through
+    /// unchanged for both true and false entries.
+    #[test]
+    fn write_inter_frame_mode_info_prefix_surfaces_lossless_lookup() {
+        let mut lossless = [false; MAX_SEGMENTS];
+        lossless[3] = true;
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let prefix = write_inter_frame_mode_info_prefix(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            /* segment_id = */ 3,
+            0,
+            0,
+            0,
+            0,
+            1, // seg_id_predicted = 1, adopt predicted_segment_id
+            0,
+            skip_ctx(0, 0),
+            0,
+            0,
+            is_inter_ctx(None, None),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true, // segmentation_enabled
+            true, // segmentation_update_map
+            true, // segmentation_temporal_update
+            true, // seg_id_pre_skip
+            /* predicted_segment_id = */ 3,
+            7,
+            false, // skip_mode_present
+            &lossless,
+        )
+        .unwrap();
+        assert_eq!(prefix.segment_id, 3);
+        assert!(
+            prefix.lossless,
+            "LosslessArray[3] == true ⇒ lossless = true"
+        );
     }
 }

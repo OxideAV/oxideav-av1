@@ -4,6 +4,59 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r257 (2026-06-08): add
+  `encoder::block_mode_info::write_inter_frame_mode_info_prefix` —
+  the §5.11.18 `inter_frame_mode_info()` dispatcher (av1-spec p.71)
+  that composes the five sub-writers landed across r253-r256
+  (§5.11.19 `inter_segment_id` pre-skip + §5.11.10 `read_skip_mode`
+  + §5.11.11 `read_skip` + §5.11.19 `inter_segment_id` post-skip +
+  §5.11.20 `read_is_inter`) in the spec body order.
+
+  Scope is the §5.11.18 *prefix* — every value the writer commits
+  before the §5.11.18 line 18 `read_cdef( )` call. The line 18-21
+  `read_cdef` / `read_delta_qindex` / `read_delta_lf` writers and
+  the line 23-26 `if ( is_inter )` terminal dispatch into §5.11.22
+  / §5.11.23 are next-round encoder-side targets. The writer
+  returns a `InterFrameModeInfoPrefix` aggregate carrying
+  `segment_id`, `skip_mode`, `skip`, `is_inter`, and the §5.11.18
+  line 17 `Lossless = LosslessArray[ segment_id ]` lookup (no bits)
+  so the caller can chain.
+
+  Stateless on purpose (mirrors the rest of
+  `encoder::block_mode_info`) — every §8.3.2 context is
+  caller-supplied and grid-fill stays decoder-side. The §5.11.18
+  pre-skip vs post-skip dispatch handles the segment_id mapping
+  internally: when `seg_id_pre_skip == false` the pre-skip call's
+  segment_id is forced through the §5.11.19 Arm 1 / Arm 2 / Arm 3
+  short-circuit (`0` / `predicted_segment_id` / `0` per arm) so the
+  caller need only pass the *final* segment_id once.
+
+  Round-trip coverage: 8 tests covering (a) segmentation disabled
+  every (skip × is_inter) combination, (b) `skip_mode == 1`
+  compound-reference shortcut, (c) `!seg_id_pre_skip` post-skip
+  arm via temporal-update adopt, (d) SEG_LVL_REF_FRAME +
+  SEG_LVL_SKIP combined override, plus four range-guard rejection
+  cases (`last_active_seg_id >= MAX_SEGMENTS`, `skip > 1`,
+  `skip_mode == 1 && skip != 1`, and the `LosslessArray[]` lookup
+  surfacing test). Each round-trip test replays the writer's byte
+  run through the matching composed `decode_*` calls in the same
+  order the §5.11.18 spec body specifies, and asserts every
+  decoded scalar matches the writer's input.
+
+  Followups for r258+:
+  * §5.11.18 line 18 `read_cdef` writer — composes the §5.11.56
+    `cdef_idx` `L(cdef_bits)` bit-fixed read with the §5.11.56
+    `skip || coded_lossless || !enable_cdef || allow_intrabc`
+    short-circuit set.
+  * §5.11.18 lines 19-20 `read_delta_qindex` / `read_delta_lf`
+    writers.
+  * §5.11.18 line 23 `if ( is_inter )` terminal arms — §5.11.22
+    `intra_block_mode_info` writer (the `else` arm) and §5.11.23
+    `inter_block_mode_info` writer (the `if` arm), the latter
+    composing §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+    §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode`
+    + §5.11.29 `read_compound_type` writers.
+
 - encoder r256 (2026-06-08): add
   `encoder::block_mode_info::write_inter_segment_id` — the §5.11.19
   `inter_segment_id( preSkip )` syntax-element writer (av1-spec

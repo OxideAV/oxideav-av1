@@ -2,6 +2,90 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-08 (round 257)
+
+Round 257 lands
+**`encoder::block_mode_info::write_inter_frame_mode_info_prefix`** —
+the §5.11.18 `inter_frame_mode_info()` dispatcher (av1-spec p.71)
+that composes the five sub-writers landed across r253-r256 in the
+spec body order:
+
+1. §5.11.19 `inter_segment_id( 1 )` — pre-skip arm (r256).
+2. §5.11.10 `read_skip_mode( )` (r254).
+3. §5.11.18 lines 13-14: `if ( skip_mode ) skip = 1 else
+   read_skip( )` — calls §5.11.11 `read_skip` (r211 / `write_skip`)
+   on the else arm; the skip_mode arm forces `skip = 1` with no
+   bits.
+4. §5.11.18 lines 15-16: `if ( !SegIdPreSkip ) inter_segment_id(
+   0 )` — post-skip arm via r256's `write_inter_segment_id`.
+5. §5.11.20 `read_is_inter( )` (r253).
+
+Scope is the §5.11.18 *prefix* — every value the writer commits
+before the §5.11.18 line 18 `read_cdef( )` call. The writer
+returns a `InterFrameModeInfoPrefix` aggregate carrying
+`segment_id`, `skip_mode`, `skip`, `is_inter`, and the §5.11.18
+line 17 `Lossless = LosslessArray[ segment_id ]` lookup so the
+caller can chain.
+
+Pre-skip vs post-skip dispatch handles the segment_id mapping
+internally: when `seg_id_pre_skip == false` the pre-skip call's
+segment_id is forced through the §5.11.19 Arm 1 / Arm 2 / Arm 3
+short-circuit (`0` / `predicted_segment_id` / `0` per arm) so the
+caller need only pass the *final* segment_id once.
+
+Stateless mirror of the rest of `encoder::block_mode_info` — every
+§8.3.2 ctx (`skip_mode_ctx`, `skip_ctx`, `seg_id_read_ctx`,
+`seg_pred_ctx`, `is_inter_ctx`) is caller-supplied; grid-fill
+stays decoder-side.
+
+### Round 257 test summary
+
++8 unit tests:
+
+* `write_inter_frame_mode_info_prefix_segless_round_trip` —
+  segmentation disabled, every (skip × is_inter) combination
+  through the §5.11.10 / §5.11.11 / §5.11.20 short-circuit set.
+* `write_inter_frame_mode_info_prefix_skip_mode_round_trip` —
+  `skip_mode == 1` compound-reference shortcut: §5.11.11 `read_skip`
+  bypassed, §5.11.20 `read_is_inter` forced to 1.
+* `write_inter_frame_mode_info_prefix_post_skip_arm_round_trip` —
+  `!seg_id_pre_skip` arm: pre-skip Arm 3 (no bits) +
+  segmentation_temporal_update post-skip adopt branch (one `S()`).
+* `write_inter_frame_mode_info_prefix_seg_ref_frame_round_trip` —
+  SEG_LVL_REF_FRAME + SEG_LVL_SKIP combined override: §5.11.10
+  short-circuits skip_mode = 0, §5.11.11 short-circuits skip = 1,
+  §5.11.20 forces is_inter to match `seg_ref_frame_is_inter`; only
+  S() is the pre-skip segment_id under the adopt branch.
+* Four rejections — `last_active_seg_id >= MAX_SEGMENTS`,
+  `skip > 1`, `skip_mode == 1 && skip != 1`, and a positive
+  `LosslessArray[]` lookup surfacing test (`segment_id = 3` with
+  `LosslessArray[3] = true` ⇒ `prefix.lossless == true`).
+
+Each round-trip test replays the writer's byte run through the
+matching composed `decode_*` calls in the same order the §5.11.18
+spec body specifies, and asserts every decoded scalar
+(segment_id / skip_mode / skip / is_inter) matches the writer's
+input.
+
+Full library test count moves to 1684 (was 1676).
+
+### Out of scope for round 257 / pending follow-ups
+
+* §5.11.18 line 18 `read_cdef` writer — the §5.11.56 `cdef_idx`
+  `L(cdef_bits)` bit-fixed read with the `skip || coded_lossless ||
+  !enable_cdef || allow_intrabc` short-circuit set.
+* §5.11.18 lines 19-20 `read_delta_qindex` / `read_delta_lf`
+  writers.
+* §5.11.18 line 23 `if ( is_inter )` terminal arms — §5.11.22
+  `intra_block_mode_info` writer (the `else` arm, composing the
+  existing r211-r235 writers into the §5.11.22 syntax body) and
+  §5.11.23 `inter_block_mode_info` writer (the `if` arm,
+  composing §5.11.25 `read_ref_frames` + §5.11.26 `assign_mv` +
+  §5.11.27 `read_motion_mode` + §5.11.28 `read_interintra_mode` +
+  §5.11.29 `read_compound_type` writers).
+* §7.10 inter-prediction primitive driver, §7.14 loop-filter,
+  §7.15 CDEF bring-up — the three near-term encoder milestones.
+
 ## Status — 2026-06-08 (round 256)
 
 Round 256 lands **`encoder::block_mode_info::write_inter_segment_id`**
