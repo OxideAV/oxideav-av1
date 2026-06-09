@@ -4,6 +4,41 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r266 (2026-06-09): bootstrap the §5.11.23
+  `inter_block_mode_info()` writer with the three no-bit arms of the
+  §5.11.25 `read_ref_frames()` dispatcher
+  (`encoder::block_mode_info::write_inter_block_mode_info_bootstrap`,
+  av1-spec p.74 + p.76). Returns the derived
+  `(RefFrame[ 0 ], RefFrame[ 1 ])` pair from inputs `skip_mode`,
+  `skip_mode_frame`, `seg_ref_frame_active`, `seg_ref_frame_data`,
+  `seg_skip_active`, `seg_globalmv_active` — no symbols emitted, no
+  CDF accesses, no `SymbolWriter` required. The §5.11.23 lines 2-3
+  `PaletteSizeY = 0` / `PaletteSizeUV = 0` resets are documented in
+  the contract as caller-implicit (the bootstrap's downstream readers
+  thread the zero values forward).
+  Arm 1 (`skip_mode == 1`) propagates `SkipModeFrame[ 0..2 ]` verbatim;
+  arm 2 (`SEG_LVL_REF_FRAME`) stamps `(seg_ref_frame_data, NONE = -1)`;
+  arm 3 (`SEG_LVL_SKIP || SEG_LVL_GLOBALMV`) stamps `(LAST_FRAME = 1,
+  NONE = -1)`. The fall-through `else` arm (the four-arm
+  `comp_mode` / `comp_ref_type` / `single_ref_p?` / `comp_bwdref_p?` /
+  `comp_ref_p?` / `uni_comp_ref` dispatcher with S() payload) is
+  deferred to a follow-up arc and rejected as a caller-bug so callers
+  do not silently fall through to an unset pair. Caller-bug surfaces:
+  `skip_mode > 1`, `skip_mode == 1` with either `SkipModeFrame` slot
+  outside `INTRA_FRAME..=ALTREF_FRAME` (the §5.9.22 invariant), and
+  `seg_ref_frame_data` outside that range on arm 2 (the §6.4.1
+  segmentation-feature alphabet).
+
+  +16 tests covering arm-1 / arm-2 / arm-3 stamps, arm-priority
+  ordering (arm 1 over arms 2 + 3, arm 2 over arm 3), the arm-4
+  caller-bug reject, the six caller-bug input rejects, and an
+  `isCompound = RefFrame[ 1 ] > INTRA_FRAME` derivation per-arm sanity
+  check.
+
+  Library tests: 1783 → 1799. This is the first §5.11.23 surface in
+  the encoder; the r257..r265 §5.11.18 intra-arm dispatcher remains
+  unchanged.
+
 - encoder r265 (2026-06-09): fold the §5.11.22 line-8 CFL arm into
   the entries-aware `intra_block_mode_info` dispatcher
   (`encoder::block_mode_info::write_intra_block_mode_info_with_palette`,

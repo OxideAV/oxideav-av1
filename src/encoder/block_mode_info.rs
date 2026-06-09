@@ -3578,6 +3578,157 @@ pub fn write_intra_block_mode_info_with_palette(
     Ok(())
 }
 
+/// `inter_block_mode_info( )` bootstrap per §5.11.23 (av1-spec p.74)
+/// — r266. Lands the first three lines of the §5.11.23 body that emit
+/// **zero S() symbols**: the `PaletteSizeY = 0` / `PaletteSizeUV = 0`
+/// resets (§5.11.23 lines 2-3) and the §5.11.25 `read_ref_frames( )`
+/// no-bit arms — arm 1 (`skip_mode`), arm 2 (`seg_feature_active(
+/// SEG_LVL_REF_FRAME )`), and arm 3 (`seg_feature_active( SEG_LVL_SKIP
+/// ) || seg_feature_active( SEG_LVL_GLOBALMV )`). The fall-through
+/// `else` arm of §5.11.25 (the `comp_mode` / `comp_ref_type` /
+/// `single_ref_p?` / `comp_bwdref_p?` / `comp_ref_p?` / `uni_comp_ref`
+/// dispatcher — every read with `S()` payload) is **deferred** to a
+/// follow-up dispatcher arc and rejected by this bootstrap as a
+/// caller-bug.
+///
+/// ## Spec body (§5.11.23 lines 2-5 + §5.11.25 arms 1-3)
+///
+/// ```text
+///   inter_block_mode_info( ) {
+///       PaletteSizeY = 0                                 // §5.11.23 line 2
+///       PaletteSizeUV = 0                                // §5.11.23 line 3
+///       read_ref_frames( )                               // §5.11.25 dispatcher
+///       isCompound = RefFrame[ 1 ] > INTRA_FRAME         // §5.11.23 line 5
+///       ...                                              // (further reads — out of scope)
+///   }
+///
+///   read_ref_frames( ) {
+///       if ( skip_mode ) {                               // arm 1 — no bits
+///           RefFrame[ 0 ] = SkipModeFrame[ 0 ]
+///           RefFrame[ 1 ] = SkipModeFrame[ 1 ]
+///       } else if ( seg_feature_active( SEG_LVL_REF_FRAME ) ) {   // arm 2 — no bits
+///           RefFrame[ 0 ] = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]
+///           RefFrame[ 1 ] = NONE
+///       } else if ( seg_feature_active( SEG_LVL_SKIP ) ||         // arm 3 — no bits
+///                   seg_feature_active( SEG_LVL_GLOBALMV ) ) {
+///           RefFrame[ 0 ] = LAST_FRAME
+///           RefFrame[ 1 ] = NONE
+///       } else {
+///           // arm 4 — `comp_mode` etc. — deferred follow-up arc.
+///       }
+///   }
+/// ```
+///
+/// ## Inputs (mirrors §5.11.10 / §5.11.20 caller surface)
+///
+/// * `skip_mode` — `1` if the §5.11.10 `read_skip_mode()` writer
+///   committed `skip_mode == 1` for this block (i.e. the §5.11.18
+///   line 12 result). Arm 1 selector.
+/// * `skip_mode_frame` — the frame-level `SkipModeFrame[ 0..2 ]`
+///   pair from §5.9.22 (`FrameRefs[ 0..NUM_REF_FRAMES - 1 ]` after
+///   the §6.8.20 `set_frame_refs( )` walk). Only consulted on arm 1.
+///   Each entry MUST be in `INTRA_FRAME..=ALTREF_FRAME` (`0..=7`,
+///   i.e. an §3 ref-frame index — `NONE = -1` is **not** valid
+///   for `SkipModeFrame`).
+/// * `seg_ref_frame_active` — `seg_feature_active( SEG_LVL_REF_FRAME
+///   )` per §6.4.2. Arm 2 selector (fires only when `skip_mode == 0`).
+/// * `seg_ref_frame_data` — `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME
+///   ]` per §5.9.14. The §6.4.1 segmentation-feature alphabet bounds
+///   this to `0..=ALTREF_FRAME = 7` (a positive §3 ref-frame index).
+///   Only consulted on arm 2.
+/// * `seg_skip_active` — `seg_feature_active( SEG_LVL_SKIP )` per
+///   §6.4.2. Arm 3 selector (fires only when both arm-1 and arm-2
+///   selectors are false).
+/// * `seg_globalmv_active` — `seg_feature_active( SEG_LVL_GLOBALMV )`
+///   per §6.4.2. Combined with `seg_skip_active` for arm 3.
+///
+/// ## Output
+///
+/// Returns the `(RefFrame[ 0 ], RefFrame[ 1 ])` pair as `(i8, i8)`
+/// with the §3 `NONE = -1` sentinel reachable on slot 1 (arms 2 + 3
+/// stamp `RefFrame[ 1 ] = NONE`; arm 1 propagates whatever
+/// `skip_mode_frame[ 1 ]` carries, which is a positive index per
+/// §5.9.22 spec). `PaletteSizeY` / `PaletteSizeUV` are implicit
+/// (`0` per the §5.11.23 lines 2-3 resets) — the caller threads
+/// them into any downstream §5.11.46 / §5.11.49 reads as
+/// appropriate.
+///
+/// ## Out-of-range / mismatch cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * `skip_mode > 1` — outside the §3 binary alphabet.
+/// * `skip_mode == 1` and either `skip_mode_frame[ 0 ]` or
+///   `skip_mode_frame[ 1 ]` outside `INTRA_FRAME..=ALTREF_FRAME` —
+///   §5.9.22 invariant violation.
+/// * `seg_ref_frame_active == true` (with `skip_mode == 0`) and
+///   `seg_ref_frame_data` outside `INTRA_FRAME..=ALTREF_FRAME` —
+///   §6.4.1 segmentation-feature alphabet violation.
+/// * All four arm selectors false — the `else` arm 4 (`comp_mode`
+///   dispatcher) is deferred and rejected as caller-bug for this
+///   bootstrap. Follow-up arc.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless: this is a pure derivation (no symbols emitted, no
+/// CDF accesses). The caller stamps the resulting `RefFrame[ 0..2
+/// ]` pair onto the `bh4 * bw4` block footprint inside the
+/// encoder-side `RefFrames[][][..]` grid (per §5.11.23 the same
+/// stamp the decoder's [`crate::cdf::PartitionWalker`] performs
+/// after `read_ref_frames` returns). No [`SymbolWriter`] reference
+/// is needed because the bootstrap never writes a bit.
+pub fn write_inter_block_mode_info_bootstrap(
+    skip_mode: u8,
+    skip_mode_frame: [i8; 2],
+    seg_ref_frame_active: bool,
+    seg_ref_frame_data: i8,
+    seg_skip_active: bool,
+    seg_globalmv_active: bool,
+) -> Result<(i8, i8), Error> {
+    // §3 binary alphabet bound on `skip_mode`.
+    if skip_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §3 ref-frame index range — `INTRA_FRAME = 0..=ALTREF_FRAME = 7`.
+    // Helper closure for the validity checks below; an `i8` slot is
+    // valid iff it lies in `0..=7`.
+    let in_ref_range = |v: i8| (0..=7).contains(&v);
+
+    // §5.11.25 arm 1: `if ( skip_mode ) RefFrame[ 0..2 ] = SkipModeFrame[ 0..2 ]`.
+    // No bits emitted. §5.9.22 fills `SkipModeFrame[ 0..2 ]` with two
+    // positive ref-frame indices (`NONE = -1` is invalid here per the
+    // §5.9.22 derivation).
+    if skip_mode == 1 {
+        if !in_ref_range(skip_mode_frame[0]) || !in_ref_range(skip_mode_frame[1]) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok((skip_mode_frame[0], skip_mode_frame[1]));
+    }
+
+    // §5.11.25 arm 2: `else if ( seg_feature_active( SEG_LVL_REF_FRAME ) )`.
+    // No bits emitted. `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]`
+    // is a positive §3 ref-frame index per §6.4.1; `RefFrame[ 1 ] = NONE`.
+    if seg_ref_frame_active {
+        if !in_ref_range(seg_ref_frame_data) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok((seg_ref_frame_data, -1));
+    }
+
+    // §5.11.25 arm 3: `else if ( seg_feature_active( SEG_LVL_SKIP ) ||
+    //                            seg_feature_active( SEG_LVL_GLOBALMV ) )`.
+    // No bits emitted. `RefFrame[ 0 ] = LAST_FRAME = 1`, `RefFrame[ 1 ] = NONE`.
+    if seg_skip_active || seg_globalmv_active {
+        return Ok((1, -1));
+    }
+
+    // §5.11.25 arm 4 (fall-through `else`): `comp_mode` / `comp_ref_type`
+    // / `single_ref_p?` / `comp_bwdref_p?` / `comp_ref_p?` /
+    // `uni_comp_ref` dispatcher. Out of scope for r266 — rejected as a
+    // caller-bug so callers don't silently fall into a "RefFrame stays
+    // unset" hole. Follow-up arc lands the four-arm S()-emitting body.
+    Err(Error::PartitionWalkOutOfRange)
+}
+
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
 /// 0) { x >>= 1; s++; } return s - 1;`. Local helper because the
 /// public surface lives in `cdf` / `symbol_decoder`; pulled inline
@@ -10182,5 +10333,187 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.23 / §5.11.25 — write_inter_block_mode_info_bootstrap.
+    // -----------------------------------------------------------------
+
+    /// Arm 1 (`skip_mode == 1`) propagates `SkipModeFrame[ 0..2 ]`
+    /// verbatim. No bits, no CDF accesses — the call site is a pure
+    /// derivation.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_skip_mode_arm_propagates_skip_mode_frame() {
+        // §5.9.22 yields a positive pair for `SkipModeFrame`. Pick
+        // LAST_FRAME / GOLDEN_FRAME so the result is unambiguously
+        // not an arm-3 fallback (which would force `[1, -1]`).
+        let last_frame: i8 = 1; // LAST_FRAME per §3.
+        let golden_frame: i8 = 4; // GOLDEN_FRAME per §3.
+        let pair = write_inter_block_mode_info_bootstrap(
+            1,
+            [last_frame, golden_frame],
+            // seg_ref_frame_active — ignored on arm 1.
+            true,
+            7,
+            // seg_skip / seg_globalmv — ignored on arm 1.
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pair, (last_frame, golden_frame));
+    }
+
+    /// Arm 2 (`SEG_LVL_REF_FRAME`) stamps `FeatureData[..][..]` into
+    /// slot 0 and `NONE = -1` into slot 1.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_seg_ref_frame_arm_stamps_feature_data_and_none() {
+        // ALTREF2_FRAME = 6 per §3.
+        let seg_data: i8 = 6;
+        let pair = write_inter_block_mode_info_bootstrap(
+            0,
+            // Arm-1 inputs ignored on arm 2.
+            [0, 0],
+            true,
+            seg_data,
+            // Arm-3 inputs ignored on arm 2.
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pair, (seg_data, -1));
+    }
+
+    /// Arm 3 (`SEG_LVL_SKIP || SEG_LVL_GLOBALMV` with the earlier two
+    /// selectors false) stamps `LAST_FRAME = 1` into slot 0 and
+    /// `NONE = -1` into slot 1. Verify both selectors trigger the
+    /// arm independently.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_seg_skip_only_arm_stamps_last_and_none() {
+        let pair = write_inter_block_mode_info_bootstrap(0, [0, 0], false, 0, true, false).unwrap();
+        assert_eq!(pair, (1, -1));
+    }
+
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_seg_globalmv_only_arm_stamps_last_and_none() {
+        let pair = write_inter_block_mode_info_bootstrap(0, [0, 0], false, 0, false, true).unwrap();
+        assert_eq!(pair, (1, -1));
+    }
+
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_seg_skip_and_globalmv_arm_stamps_last_and_none() {
+        let pair = write_inter_block_mode_info_bootstrap(0, [0, 0], false, 0, true, true).unwrap();
+        assert_eq!(pair, (1, -1));
+    }
+
+    /// Arm 1 takes priority over arms 2 + 3 — even when the
+    /// segmentation selectors are also active, `skip_mode == 1`
+    /// must short-circuit to `SkipModeFrame`.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_skip_mode_priority_over_seg_arms() {
+        let pair = write_inter_block_mode_info_bootstrap(1, [2, 3], true, 4, true, true).unwrap();
+        assert_eq!(pair, (2, 3));
+    }
+
+    /// Arm 2 takes priority over arm 3 — even when `SEG_LVL_SKIP` is
+    /// active, the `SEG_LVL_REF_FRAME` arm fires first.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_seg_ref_frame_priority_over_seg_skip() {
+        let pair = write_inter_block_mode_info_bootstrap(0, [0, 0], true, 5, true, true).unwrap();
+        // ALTREF2_FRAME = 6? No — `5` is BWDREF_FRAME per §3. Pair must
+        // be (5, -1) regardless.
+        assert_eq!(pair, (5, -1));
+    }
+
+    /// Fall-through `else` (arm 4) — all four selectors false — is
+    /// deferred to a follow-up arc and rejected as caller-bug.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_fall_through_else_rejected() {
+        let err =
+            write_inter_block_mode_info_bootstrap(0, [0, 0], false, 0, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `skip_mode > 1` violates the §3 binary alphabet.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_rejects_out_of_range_skip_mode() {
+        let err =
+            write_inter_block_mode_info_bootstrap(2, [1, 2], false, 0, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `skip_mode == 1` with `SkipModeFrame[ 0 ] = NONE = -1` violates
+    /// the §5.9.22 invariant — caller-bug.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_rejects_skip_mode_frame_with_none_slot0() {
+        let err =
+            write_inter_block_mode_info_bootstrap(1, [-1, 2], true, 0, true, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `skip_mode == 1` with `SkipModeFrame[ 1 ] = NONE = -1` violates
+    /// the §5.9.22 invariant — caller-bug.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_rejects_skip_mode_frame_with_none_slot1() {
+        let err =
+            write_inter_block_mode_info_bootstrap(1, [1, -1], true, 0, true, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `skip_mode == 1` with `SkipModeFrame[ 0 ]` past ALTREF_FRAME =
+    /// 7 violates §3.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_rejects_skip_mode_frame_above_altref() {
+        let err =
+            write_inter_block_mode_info_bootstrap(1, [8, 2], false, 0, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 2 with `seg_ref_frame_data = NONE = -1` violates the §6.4.1
+    /// segmentation-feature alphabet for `SEG_LVL_REF_FRAME`.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_rejects_seg_ref_frame_none() {
+        let err =
+            write_inter_block_mode_info_bootstrap(0, [0, 0], true, -1, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm 2 with `seg_ref_frame_data > ALTREF_FRAME = 7` violates §3.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_rejects_seg_ref_frame_above_altref() {
+        let err =
+            write_inter_block_mode_info_bootstrap(0, [0, 0], true, 8, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arms 2 / 3 with `INTRA_FRAME = 0` for `seg_ref_frame_data` is
+    /// **valid** — the §6.4.1 alphabet includes `0..=ALTREF_FRAME = 7`,
+    /// and a segmented `INTRA_FRAME` ref drives the `isCompound = 0`
+    /// (intra-only) downstream branch. The pair is `(0, -1)`.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_seg_ref_frame_intra_frame_is_valid() {
+        let pair = write_inter_block_mode_info_bootstrap(0, [0, 0], true, 0, false, false).unwrap();
+        assert_eq!(pair, (0, -1));
+    }
+
+    /// `isCompound = RefFrame[ 1 ] > INTRA_FRAME` per §5.11.23 line 5:
+    /// the caller's downstream derivation MUST observe the bootstrap's
+    /// returned pair. Sanity-check the predicate for each arm.
+    #[test]
+    fn write_inter_block_mode_info_bootstrap_is_compound_derivation_per_arm() {
+        // Arm 1 with a positive `SkipModeFrame[ 1 ]` ⇒ isCompound = 1.
+        let (_, slot1) =
+            write_inter_block_mode_info_bootstrap(1, [1, 4], false, 0, false, false).unwrap();
+        // INTRA_FRAME = 0; `1` and `4` both exceed 0.
+        assert!(slot1 > 0);
+
+        // Arm 2 stamps NONE = -1 in slot 1 ⇒ isCompound = 0.
+        let (_, slot1) =
+            write_inter_block_mode_info_bootstrap(0, [0, 0], true, 3, false, false).unwrap();
+        assert!(slot1 <= 0);
+
+        // Arm 3 stamps NONE = -1 in slot 1 ⇒ isCompound = 0.
+        let (_, slot1) =
+            write_inter_block_mode_info_bootstrap(0, [0, 0], false, 0, true, false).unwrap();
+        assert!(slot1 <= 0);
     }
 }

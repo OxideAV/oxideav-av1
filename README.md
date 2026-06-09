@@ -2,6 +2,63 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-09 (round 266)
+
+Round 266 bootstraps the §5.11.23 `inter_block_mode_info()` writer
+with the three no-bit arms of the §5.11.25 `read_ref_frames()`
+dispatcher. This is the first §5.11.23 surface on the encoder side —
+a pure derivation (no S() symbols, no CDF accesses, no
+`SymbolWriter` required) that returns the
+`(RefFrame[ 0 ], RefFrame[ 1 ])` pair from the six caller inputs
+(`skip_mode`, `skip_mode_frame`, the four segmentation predicates +
+`seg_ref_frame_data`).
+
+* `encoder::block_mode_info::write_inter_block_mode_info_bootstrap`
+  (§5.11.23 lines 2-5 + §5.11.25 arms 1-3, av1-spec p.74 + p.76).
+  Arm 1 (`skip_mode == 1`) propagates `SkipModeFrame[ 0..2 ]`
+  verbatim. Arm 2 (`SEG_LVL_REF_FRAME`) stamps
+  `(seg_ref_frame_data, NONE = -1)`. Arm 3 (`SEG_LVL_SKIP ||
+  SEG_LVL_GLOBALMV`) stamps `(LAST_FRAME = 1, NONE = -1)`. The
+  fall-through `else` arm 4 — the four-arm `comp_mode` /
+  `comp_ref_type` / `single_ref_p?` / `comp_bwdref_p?` /
+  `comp_ref_p?` / `uni_comp_ref` dispatcher with S() payload — is
+  deferred to a follow-up arc and rejected as a caller-bug so
+  callers do not silently fall through to an unset pair. The
+  §5.11.23 lines 2-3 `PaletteSizeY = 0` / `PaletteSizeUV = 0`
+  resets are documented in the contract as caller-implicit.
+* Caller-bug rejects: `skip_mode > 1` (§3 binary alphabet),
+  `skip_mode == 1` with either `SkipModeFrame` slot outside
+  `INTRA_FRAME..=ALTREF_FRAME` (§5.9.22 invariant), and
+  `seg_ref_frame_data` outside that range on arm 2 (§6.4.1
+  segmentation-feature alphabet).
+
++16 tests covering arm-1 / arm-2 / arm-3 stamps, arm-priority
+ordering (arm 1 over arms 2 + 3, arm 2 over arm 3), the arm-4
+caller-bug reject, the six caller-bug input rejects, and an
+`isCompound = RefFrame[ 1 ] > INTRA_FRAME` derivation per-arm
+sanity check.
+
+Full library test count moves to 1799 (was 1783).
+
+### Pending follow-ups for round 267+
+
+* §5.11.25 arm 4 (the four-arm `comp_mode` / `comp_ref_type` /
+  `single_ref_p?` / `comp_bwdref_p?` / `comp_ref_p?` /
+  `uni_comp_ref` dispatcher) — every read with S() payload. The
+  bootstrap rejects the fall-through `else` arm 4 as caller-bug
+  pending this arc.
+* §5.11.23 lines 6-8 (`isCompound = RefFrame[ 1 ] > INTRA_FRAME` is
+  caller-derivable from the bootstrap output, but
+  `find_mv_stack( isCompound )` is the next non-trivial surface).
+* §5.11.23 lines 9-22 `compound_mode` / `new_mv` / `zero_mv` /
+  `ref_mv` / `drl_mode` S() writers (and the `YMode` derivation
+  ladder for inter blocks).
+* Wire the entries-aware §5.11.22 dispatcher into the §5.11.18
+  inter/intra frame-mode-info caller so the palette-bearing path
+  reaches the tile-group encoder.
+
+---
+
 ## Status — 2026-06-09 (round 265)
 
 Round 265 folds the §5.11.22 line-8 CFL arm into the entries-aware
