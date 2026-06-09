@@ -4,6 +4,44 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r264 (2026-06-09): lift the §5.11.22 `intra_block_mode_info`
+  dispatcher's `has_palette_y == 0 && has_palette_uv == 0`
+  precondition by threading the §5.11.46 `palette_size_*_minus_2`
+  S() writes + the r262 / r263 palette-entries writers into a new
+  entries-aware leaf
+  (`encoder::block_mode_info::write_palette_mode_info_with_entries`)
+  and a matching entries-aware dispatcher
+  (`encoder::block_mode_info::write_intra_block_mode_info_with_palette`,
+  av1-spec p.72 / p.97-98). The r261 leaf and dispatcher remain
+  available for the no-palette path with their original signatures.
+
+  The new leaf delegates the cache-merge / L(BitDepth) literal /
+  L(2) extra-bits / L(paletteBits) delta loop to the r262 / r263
+  writers; the new dispatcher routes through the new leaf and
+  passes the just-committed `PaletteSizeY` into the §5.11.24
+  `write_filter_intra_mode_info` outer gate so that
+  `enable_filter_intra && YMode == DC_PRED && PaletteSizeY == 0 &&
+  Max(BW, BH) <= 32` closes mechanically when `has_palette_y == 1`,
+  matching the reader's `decode_intra_block_mode_info` outer gate.
+  The §8.3.2 chroma-mode ctx tracks the just-committed
+  `PaletteSizeY` via `palette_uv_mode_ctx` per the §5.11.46 spec
+  body.
+
+  +8 round-trip tests through
+  `PartitionWalker::decode_intra_block_mode_info` +
+  `read_palette_entries_y/uv`: gate-off no-bits via the new leaf,
+  gate-off rejecting `has_palette_y == 1`, small-block gate-off,
+  caller-bug rejection for `palette_size_y` outside
+  `2..=PALETTE_COLORS`, luma-arm `has_palette_y = 1` with `[0, 1]`,
+  chroma-arm `has_palette_uv = 1` with U `[0, 1]` + V `[5, 7]` on
+  the direct-literal V arm, both arms firing with `has_palette_y = 1`
+  + `has_palette_uv = 1` and the V delta-encoded arm `[10, 12]`,
+  and the §5.11.24 filter-intra outer gate closing mechanically
+  when `PaletteSizeY != 0`.
+
+  Library tests: 1770 → 1778. No public-API changes to the r261
+  leaf or dispatcher.
+
 - encoder r263 (2026-06-09): add §5.11.46 UV-plane palette-entries
   writer (`encoder::block_mode_info::write_palette_entries_uv`,
   av1-spec p.97-98) — the inverse of

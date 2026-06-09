@@ -3149,6 +3149,401 @@ pub fn write_intra_block_mode_info(
     Ok(())
 }
 
+/// `palette_mode_info( )` writer per §5.11.46 (av1-spec p.97-98) —
+/// r264. Superset of [`write_palette_mode_info`]: lifts the
+/// no-palette precondition by threading the `palette_size_y_minus_2`
+/// / `palette_size_uv_minus_2` S() symbols + the §5.11.46
+/// palette-entries writers ([`write_palette_entries_y`] /
+/// [`write_palette_entries_uv`]) into a single leaf.
+///
+/// Spec body (lifted to cover both arms):
+/// ```text
+///   if ( outer_gate ) {
+///       bsizeCtx = Mi_Width_Log2[ MiSize ] + Mi_Height_Log2[ MiSize ] - 2
+///       if ( YMode == DC_PRED ) {
+///           has_palette_y                                 S()
+///           if ( has_palette_y ) {
+///               palette_size_y_minus_2                    S()
+///               palette_colors_y[ 0 .. PaletteSizeY ]     (§5.11.46)
+///           }
+///       }
+///       if ( HasChroma && UVMode == DC_PRED ) {
+///           has_palette_uv                                S()
+///           if ( has_palette_uv ) {
+///               palette_size_uv_minus_2                   S()
+///               palette_colors_u[ 0 .. PaletteSizeUV ]    (§5.11.46)
+///               palette_colors_v[ 0 .. PaletteSizeUV ]    (§5.11.46)
+///           }
+///       }
+///   }
+/// ```
+///
+/// Mirrors the reader path inlined at the §5.11.46 sub-block of
+/// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`] +
+/// [`crate::cdf::read_palette_entries_y`] +
+/// [`crate::cdf::read_palette_entries_uv`].
+///
+/// Inputs:
+/// * `has_palette_y` — `0` or `1`; `1` triggers the
+///   `palette_size_y_minus_2` S() + [`write_palette_entries_y`] call.
+/// * `has_palette_uv` — `0` or `1`; `1` triggers the
+///   `palette_size_uv_minus_2` S() + [`write_palette_entries_uv`]
+///   call.
+/// * `mi_size` — `MiSize` ordinal in `0..BLOCK_SIZES`.
+/// * `y_mode` — the §5.11.22 `YMode` value; the luma arm fires only
+///   on `YMode == DC_PRED = 0`.
+/// * `uv_mode` — `Some(mode)` when `has_chroma`, `None` otherwise.
+///   The chroma arm fires only on `UVMode == DC_PRED = 0`.
+/// * `has_chroma` — §5.11.5 `HasChroma`.
+/// * `allow_screen_content_tools` — §5.9.5 sequence-header bit that
+///   gates the §5.11.46 outer arm.
+/// * `above_palette_y` / `left_palette_y` — §8.3.2 neighbour-palette
+///   booleans fed to [`palette_y_mode_ctx`].
+/// * `bit_depth` — §6.7.2 `BitDepth` (8 / 10 / 12). Consumed only on
+///   the entries-bearing arms (passed straight through to the
+///   palette-entries writers).
+/// * `palette_size_y` — `PaletteSizeY` in `2..=PALETTE_COLORS` when
+///   `has_palette_y == 1`; ignored otherwise.
+/// * `palette_colors_y` — sorted-ascending palette entries for the Y
+///   plane (see [`write_palette_entries_y`] contract). Ignored when
+///   `has_palette_y == 0`.
+/// * `palette_size_uv` — `PaletteSizeUV` in `2..=PALETTE_COLORS` when
+///   `has_palette_uv == 1`; ignored otherwise.
+/// * `palette_colors_u` / `palette_colors_v` — see
+///   [`write_palette_entries_uv`] contract. Ignored when
+///   `has_palette_uv == 0`.
+/// * `delta_encode_v` — §5.11.46 V-plane arm selector. Ignored when
+///   `has_palette_uv == 0`.
+/// * `walker` — the same [`PartitionWalker`] the dispatcher walks for
+///   §5.11.49 `get_palette_cache` neighbour reads.
+/// * `mi_row` / `mi_col` — the §5.11.49 block-origin coordinates fed
+///   to the palette-cache accessor.
+///
+/// Caller-bug guards (in addition to the per-leaf re-checks):
+/// * `palette_size_y` / `palette_size_uv` ∈ `2..=PALETTE_COLORS`
+///   when the corresponding `has_palette_*` is `1`.
+/// * `palette_size_y` / `palette_size_uv` ignored when `has_palette_*
+///   == 0` (no entries syntax fires).
+/// * `has_palette_y == 1` requires `YMode == DC_PRED`; reader never
+///   reads `has_palette_y` otherwise.
+/// * `has_palette_uv == 1` requires `has_chroma && uv_mode ==
+///   Some(DC_PRED)`; reader never reads `has_palette_uv` otherwise.
+/// * `has_palette_y == 1` or `has_palette_uv == 1` requires the
+///   §5.11.46 outer gate (`allow_screen_content_tools && MiSize >=
+///   BLOCK_8X8 && Block_W <= 64 && Block_H <= 64`).
+///
+/// On success, the encoder has committed the full §5.11.46
+/// palette-mode-info body to the bit stream + advanced the §8.3 CDF
+/// adaptation state in lockstep with the reader.
+#[allow(clippy::too_many_arguments)]
+pub fn write_palette_mode_info_with_entries(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    has_palette_y: u8,
+    has_palette_uv: u8,
+    mi_size: usize,
+    y_mode: u8,
+    uv_mode: Option<u8>,
+    has_chroma: bool,
+    allow_screen_content_tools: bool,
+    above_palette_y: bool,
+    left_palette_y: bool,
+    bit_depth: u8,
+    palette_size_y: usize,
+    palette_colors_y: &[u16],
+    palette_size_uv: usize,
+    palette_colors_u: &[u16],
+    palette_colors_v: &[u16],
+    delta_encode_v: bool,
+    walker: &PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<(), Error> {
+    // §5.11.22 / §5.11.46 caller-bug guards. Re-asserted up-front so a
+    // contract violation surfaces before any partial S() write
+    // disturbs the bit stream. Each leaf re-checks its own bounds.
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (y_mode as usize) >= INTRA_MODES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if let Some(uv) = uv_mode {
+        if (uv as usize) >= UV_INTRA_MODES_CFL_ALLOWED {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+    if has_palette_y > 1 || has_palette_uv > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.46 outer gate. Mirrors the reader's `palette_outer_gate`.
+    let bw = block_width(mi_size) as u32;
+    let bh = block_height(mi_size) as u32;
+    let outer_gate = allow_screen_content_tools && mi_size >= BLOCK_8X8 && bw <= 64 && bh <= 64;
+
+    if !outer_gate {
+        // Gate-off path: the §5.11.46 spec body sets `PaletteSizeY =
+        // 0` / `PaletteSizeUV = 0` unconditionally. The reader
+        // reconstructs them as 0 regardless of the bit stream; any
+        // non-zero `has_palette_*` is a caller bug because the
+        // reader never reads the symbol on this arm.
+        if has_palette_y != 0 || has_palette_uv != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.46: `bsizeCtx = Mi_Width_Log2[ MiSize ] +
+    // Mi_Height_Log2[ MiSize ] - 2`. The §9.3 mapping guarantees
+    // `bsizeCtx ∈ 0..PALETTE_BLOCK_SIZE_CONTEXTS = 7` for any MiSize
+    // that passed the outer gate (BLOCK_8X8 has (1, 1) ⇒ bsizeCtx = 0,
+    // BLOCK_64X64 has (4, 4) ⇒ bsizeCtx = 6).
+    let bsize_ctx = mi_width_log2(mi_size) + mi_height_log2(mi_size) - 2;
+    debug_assert!(
+        bsize_ctx < PALETTE_BLOCK_SIZE_CONTEXTS,
+        "§5.11.46 bsizeCtx must be in 0..PALETTE_BLOCK_SIZE_CONTEXTS"
+    );
+
+    // §5.11.46 luma arm: `if ( YMode == DC_PRED )`. DC_PRED = 0.
+    if y_mode == 0 {
+        let ctx_y = palette_y_mode_ctx(above_palette_y, left_palette_y);
+        let row = cdfs.palette_y_mode_cdf(bsize_ctx, ctx_y);
+        writer.write_symbol(has_palette_y as u32, row)?;
+        if has_palette_y == 1 {
+            // §5.11.46 caller-bug: when the luma arm fires, the
+            // §5.11.46 contract pins `PaletteSizeY ∈ 2..=PALETTE_COLORS`.
+            if !(2..=PALETTE_COLORS).contains(&palette_size_y) {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            // §5.11.46: `palette_size_y_minus_2 S()` against
+            // `TilePaletteYSizeCdf[ bsizeCtx ]`. Encoded value in
+            // `0..PALETTE_SIZES = 7`; PaletteSizeY = encoded + 2 is in
+            // `2..=PALETTE_COLORS = 8`.
+            let row_sz = cdfs.palette_y_size_cdf(bsize_ctx);
+            let minus_2 = (palette_size_y - 2) as u32;
+            writer.write_symbol(minus_2, row_sz)?;
+            // §5.11.46 palette_colors_y[]: cache merge + cache-coded
+            // indices + first-new L(BitDepth) + delta loop. Delegates
+            // to the r262 leaf, threading the same walker the reader
+            // walks for §5.11.49 `get_palette_cache(0, …)`.
+            write_palette_entries_y(
+                writer,
+                bit_depth,
+                palette_size_y,
+                palette_colors_y,
+                walker,
+                mi_row,
+                mi_col,
+            )?;
+        }
+    } else if has_palette_y != 0 {
+        // §5.11.46 contract: when `y_mode != DC_PRED` the reader
+        // never reads `has_palette_y`; non-zero here is a caller bug.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.46 chroma arm: `if ( HasChroma && UVMode == DC_PRED )`.
+    if has_chroma && uv_mode == Some(0) {
+        // §8.3.2 chroma ctx is `palette_uv_mode_ctx(PaletteSizeY)`. On
+        // the luma-arm-not-fired or `has_palette_y == 0` arm the spec
+        // sets `PaletteSizeY = 0` (the reader's `palette_size_y` local
+        // stays at its 0 initialiser); on the `has_palette_y == 1`
+        // arm `PaletteSizeY` is the value just committed.
+        let ps_y = if y_mode == 0 && has_palette_y == 1 {
+            palette_size_y
+        } else {
+            0
+        };
+        let ctx_uv = palette_uv_mode_ctx(ps_y);
+        let row = cdfs.palette_uv_mode_cdf(ctx_uv);
+        writer.write_symbol(has_palette_uv as u32, row)?;
+        if has_palette_uv == 1 {
+            if !(2..=PALETTE_COLORS).contains(&palette_size_uv) {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            // §5.11.46: `palette_size_uv_minus_2 S()` against
+            // `TilePaletteUVSizeCdf[ bsizeCtx ]`.
+            let row_sz = cdfs.palette_uv_size_cdf(bsize_ctx);
+            let minus_2 = (palette_size_uv - 2) as u32;
+            writer.write_symbol(minus_2, row_sz)?;
+            // §5.11.46 palette_colors_u[] + palette_colors_v[] writer.
+            write_palette_entries_uv(
+                writer,
+                bit_depth,
+                palette_size_uv,
+                palette_colors_u,
+                palette_colors_v,
+                delta_encode_v,
+                walker,
+                mi_row,
+                mi_col,
+            )?;
+        }
+    } else if has_palette_uv != 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    Ok(())
+}
+
+/// `intra_block_mode_info( )` dispatcher per §5.11.22 (av1-spec p.72)
+/// — r264. Superset of [`write_intra_block_mode_info`]: lifts the
+/// `has_palette_y == 0 && has_palette_uv == 0` precondition by
+/// routing through [`write_palette_mode_info_with_entries`] for the
+/// §5.11.46 palette-entries arm.
+///
+/// Scope of this arc (r264): identical to r261's
+/// [`write_intra_block_mode_info`] except the §5.11.22 lines 13-15
+/// `palette_mode_info( )` call now accepts non-zero `has_palette_*`
+/// and the §5.11.46 entries syntax. The §5.11.24
+/// `filter_intra_mode_info` outer gate's `PaletteSizeY == 0` clause
+/// is still enforced (the gate closes mechanically when
+/// `has_palette_y == 1`).
+///
+/// **NOT covered by this arc** (caller passes values consistent with
+/// the no-CFL path; non-trivial values surface
+/// [`Error::PartitionWalkOutOfRange`]):
+/// * `read_cfl_alphas` (§5.11.22 line 8 when `UVMode == UV_CFL_PRED
+///   = 13`). Callers compose [`write_cfl_alphas`] manually for the
+///   CFL arm.
+///
+/// Inputs: identical to [`write_intra_block_mode_info`] plus the
+/// §5.11.46 palette-entries parameters surfaced by
+/// [`write_palette_mode_info_with_entries`].
+///
+/// On success, the encoder has committed the full §5.11.22 no-CFL
+/// body — including any §5.11.46 palette-entries syntax — to the bit
+/// stream + advanced the §8.3 CDF adaptation state in lockstep with
+/// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_intra_block_mode_info_with_palette(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    mi_size: usize,
+    y_mode: u8,
+    uv_mode: Option<u8>,
+    angle_delta_y: i8,
+    angle_delta_uv: i8,
+    cfl_allowed: bool,
+    has_chroma: bool,
+    allow_screen_content_tools: bool,
+    enable_filter_intra: bool,
+    use_filter_intra: u8,
+    filter_intra_mode: Option<u8>,
+    above_palette_y: bool,
+    left_palette_y: bool,
+    bit_depth: u8,
+    has_palette_y: u8,
+    palette_size_y: usize,
+    palette_colors_y: &[u16],
+    has_palette_uv: u8,
+    palette_size_uv: usize,
+    palette_colors_u: &[u16],
+    palette_colors_v: &[u16],
+    delta_encode_v: bool,
+    walker: &PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<(), Error> {
+    // §5.11.22 caller-bug guards re-asserted here so a contract
+    // violation surfaces before any partial S() write disturbs the
+    // bit stream. Each leaf re-checks its own bounds.
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (y_mode as usize) >= INTRA_MODES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if has_chroma {
+        let uv = uv_mode.ok_or(Error::PartitionWalkOutOfRange)?;
+        if (uv as usize) >= UV_INTRA_MODES_CFL_ALLOWED {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // r264 arc does NOT compose `write_cfl_alphas`; the CFL arm
+        // is reserved for a future round. UV_CFL_PRED = 13 per §3.
+        if (uv as usize) == 13 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    } else if uv_mode.is_some() {
+        // §5.11.22 line 5 `if (HasChroma)` guard: when `has_chroma ==
+        // false` the reader never touches `uv_mode`; passing a `Some`
+        // value is a caller bug.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.22 line 2: `y_mode S()` via the §8.3.2 `Size_Group[ MiSize ]`
+    // ctx.
+    let size_group_ctx = crate::cdf::size_group(mi_size);
+    write_y_mode(writer, cdfs, y_mode, size_group_ctx)?;
+
+    // §5.11.22 line 4: `intra_angle_info_y( )` per §5.11.42.
+    write_intra_angle_info_y(writer, cdfs, angle_delta_y, mi_size, y_mode)?;
+
+    // §5.11.22 lines 5-10: `if ( HasChroma )` arm.
+    if has_chroma {
+        let uv = uv_mode.expect("validated above");
+        // §5.11.22 line 6.
+        write_intra_uv_mode(writer, cdfs, y_mode, uv, cfl_allowed)?;
+        // §5.11.22 line 10.
+        write_intra_angle_info_uv(writer, cdfs, angle_delta_uv, mi_size, uv)?;
+    } else if angle_delta_uv != 0 {
+        // §5.11.22 lines 5-10 skipped entirely. Caller-bug guards:
+        // both UV deltas MUST be zero (no bits would be reconstructed
+        // on the monochrome arm).
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.22 lines 13-15: `palette_mode_info( )` per §5.11.46 — the
+    // r264 leaf accepts non-zero `has_palette_*` and the entries
+    // syntax.
+    write_palette_mode_info_with_entries(
+        writer,
+        cdfs,
+        has_palette_y,
+        has_palette_uv,
+        mi_size,
+        y_mode,
+        uv_mode,
+        has_chroma,
+        allow_screen_content_tools,
+        above_palette_y,
+        left_palette_y,
+        bit_depth,
+        palette_size_y,
+        palette_colors_y,
+        palette_size_uv,
+        palette_colors_u,
+        palette_colors_v,
+        delta_encode_v,
+        walker,
+        mi_row,
+        mi_col,
+    )?;
+
+    // §5.11.22 line 16: `filter_intra_mode_info( )` per §5.11.24. The
+    // §5.11.24 outer gate's `PaletteSizeY == 0` clause closes
+    // mechanically when `has_palette_y == 1`. Pass `PaletteSizeY` as
+    // committed above so the writer matches the reader's gate.
+    let palette_size_y_for_filter = if y_mode == 0 && has_palette_y == 1 {
+        palette_size_y as u32
+    } else {
+        0
+    };
+    write_filter_intra_mode_info(
+        writer,
+        cdfs,
+        use_filter_intra,
+        filter_intra_mode,
+        mi_size,
+        y_mode,
+        palette_size_y_for_filter,
+        enable_filter_intra,
+    )?;
+
+    Ok(())
+}
+
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
 /// 0) { x >>= 1; s++; } return s - 1;`. Local helper because the
 /// public surface lives in `cdf` / `symbol_decoder`; pulled inline
@@ -8984,5 +9379,481 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.46 write_palette_mode_info_with_entries — round-trip the
+    // lifted leaf through the reader's full §5.11.46 sub-block via
+    // decode_intra_block_mode_info.
+    // -----------------------------------------------------------------
+
+    /// Gate-off: `allow_screen_content_tools = false` ⇒ no §5.11.46
+    /// S() symbol emitted. Same shape as the legacy leaf's gate-off
+    /// test, but exercised through the r264 entries-aware leaf with
+    /// dummy entry slots.
+    #[test]
+    fn write_palette_mode_info_with_entries_gate_off_no_bits() {
+        let walker = fresh_palette_walker();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let baseline = SymbolWriter::new(false).finish().len();
+        let dummy = [0u16; PALETTE_COLORS];
+        write_palette_mode_info_with_entries(
+            &mut writer,
+            &mut cdfs,
+            /* has_palette_y = */ 0,
+            /* has_palette_uv = */ 0,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            /* has_chroma = */ true,
+            /* allow_screen_content_tools = */ false,
+            false,
+            false,
+            8,
+            /* palette_size_y = */ 0,
+            &dummy,
+            /* palette_size_uv = */ 0,
+            &dummy,
+            &dummy,
+            false,
+            &walker,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            writer.finish().len(),
+            baseline,
+            "§5.11.46 gate-off path emits zero additional bits via the r264 leaf"
+        );
+    }
+
+    /// Gate-off via `mi_size < BLOCK_8X8` while
+    /// `allow_screen_content_tools = true`. Mirrors the legacy leaf's
+    /// `write_palette_mode_info_small_block_no_bits`.
+    #[test]
+    fn write_palette_mode_info_with_entries_small_block_no_bits() {
+        let walker = fresh_palette_walker();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let baseline = SymbolWriter::new(false).finish().len();
+        let dummy = [0u16; PALETTE_COLORS];
+        write_palette_mode_info_with_entries(
+            &mut writer,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_4X4,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            /* allow_screen_content_tools = */ true,
+            false,
+            false,
+            8,
+            0,
+            &dummy,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            &walker,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.finish().len(), baseline);
+    }
+
+    /// Gate-off rejects non-zero `has_palette_y` (caller bug: the
+    /// reader never reads the symbol on the gate-off arm).
+    #[test]
+    fn write_palette_mode_info_with_entries_gate_off_rejects_has_palette_y_one() {
+        let walker = fresh_palette_walker();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let mut entries = [0u16; PALETTE_COLORS];
+        entries[0] = 0;
+        entries[1] = 1;
+        let err = write_palette_mode_info_with_entries(
+            &mut writer,
+            &mut cdfs,
+            1,
+            0,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            /* allow_screen_content_tools = */ false,
+            false,
+            false,
+            8,
+            2,
+            &entries,
+            0,
+            &entries,
+            &entries,
+            false,
+            &walker,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller bug: `has_palette_y == 1` with `palette_size_y` outside
+    /// `2..=PALETTE_COLORS`.
+    #[test]
+    fn write_palette_mode_info_with_entries_rejects_palette_size_y_out_of_range() {
+        let walker = fresh_palette_walker();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(true);
+        let entries = [0u16; PALETTE_COLORS];
+        let err = write_palette_mode_info_with_entries(
+            &mut writer,
+            &mut cdfs,
+            1,
+            0,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            true,
+            true,
+            false,
+            false,
+            8,
+            /* palette_size_y = */ 1,
+            &entries,
+            0,
+            &entries,
+            &entries,
+            false,
+            &walker,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Luma arm fires: `has_palette_y = 1`, `palette_size_y = 2`,
+    /// entries `[0, 1]`. Round-trip through the reader's full
+    /// §5.11.46 sub-block via decode_intra_block_mode_info — exposes
+    /// the writer's `palette_size_y_minus_2 S()` + the §5.11.46
+    /// palette-entries syntax committed by [`write_palette_entries_y`].
+    ///
+    /// Embedded in a dispatcher-shaped bit stream so the decoder's
+    /// upstream `y_mode` / angle_delta steps consume the same prefix
+    /// the writer emitted.
+    #[test]
+    fn write_palette_mode_info_with_entries_luma_arm_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let mut entries_y = [0u16; PALETTE_COLORS];
+        entries_y[0] = 0;
+        entries_y[1] = 1;
+        let dummy = [0u16; PALETTE_COLORS];
+
+        // Use the r264 full dispatcher so the bit stream a decoder
+        // walks is well-formed: y_mode + angle_delta + uv_mode +
+        // angle_delta_uv + the §5.11.46 palette body + the §5.11.24
+        // filter_intra closer (gate closes mechanically when
+        // PaletteSizeY != 0).
+        write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            /* cfl_allowed = */ true,
+            /* has_chroma = */ true,
+            /* allow_screen_content_tools = */ true,
+            /* enable_filter_intra = */ false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            /* has_palette_y = */ 1,
+            /* palette_size_y = */ 2,
+            &entries_y,
+            /* has_palette_uv = */ 0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                /* allow_screen_content_tools = */ true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.has_palette_y, Some(1));
+        assert_eq!(info.palette_size_y, Some(2));
+        let pal_y = info.palette_colors_y.expect("luma arm fired");
+        assert_eq!(pal_y[0], 0);
+        assert_eq!(pal_y[1], 1);
+        // Chroma arm closed (has_palette_uv = 0). The §5.11.46 reader
+        // commits Some(0) on a fired chroma S() even on the off-arm.
+        assert_eq!(info.has_palette_uv, Some(0));
+    }
+
+    /// Chroma arm fires: `has_palette_y = 0`, `has_palette_uv = 1`,
+    /// `palette_size_uv = 2`, U `[0, 1]`, V `[5, 7]`, V-direct arm.
+    /// Round-trip through the dispatcher into the reader.
+    #[test]
+    fn write_palette_mode_info_with_entries_chroma_direct_v_arm_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let mut entries_u = [0u16; PALETTE_COLORS];
+        entries_u[0] = 0;
+        entries_u[1] = 1;
+        let mut entries_v = [0u16; PALETTE_COLORS];
+        entries_v[0] = 5;
+        entries_v[1] = 7;
+        write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            true,
+            true,
+            /* allow_screen_content_tools = */ true,
+            false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            /* has_palette_y = */ 0,
+            0,
+            &dummy,
+            /* has_palette_uv = */ 1,
+            /* palette_size_uv = */ 2,
+            &entries_u,
+            &entries_v,
+            /* delta_encode_v = */ false,
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.has_palette_y, Some(0));
+        assert_eq!(info.has_palette_uv, Some(1));
+        assert_eq!(info.palette_size_uv, Some(2));
+        let pal_u = info.palette_colors_u.expect("chroma arm fired");
+        assert_eq!(pal_u[0], 0);
+        assert_eq!(pal_u[1], 1);
+        let pal_v = info.palette_colors_v.expect("chroma arm fired");
+        assert_eq!(pal_v[0], 5);
+        assert_eq!(pal_v[1], 7);
+    }
+
+    /// Both arms fire: luma `[0, 3]` size 2, chroma U `[0, 1]` + V
+    /// `[10, 12]` size 2 with the V delta-encoded arm. Round-trip the
+    /// full §5.11.46 body via the r264 dispatcher into the reader.
+    #[test]
+    fn write_palette_mode_info_with_entries_both_arms_delta_v_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let mut entries_y = [0u16; PALETTE_COLORS];
+        entries_y[0] = 0;
+        entries_y[1] = 3;
+        let mut entries_u = [0u16; PALETTE_COLORS];
+        entries_u[0] = 0;
+        entries_u[1] = 1;
+        let mut entries_v = [0u16; PALETTE_COLORS];
+        entries_v[0] = 10;
+        entries_v[1] = 12;
+        write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            true,
+            true,
+            /* allow_screen_content_tools = */ true,
+            false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            /* has_palette_y = */ 1,
+            2,
+            &entries_y,
+            /* has_palette_uv = */ 1,
+            2,
+            &entries_u,
+            &entries_v,
+            /* delta_encode_v = */ true,
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.has_palette_y, Some(1));
+        assert_eq!(info.palette_size_y, Some(2));
+        let pal_y = info.palette_colors_y.expect("luma arm fired");
+        assert_eq!(pal_y[0], 0);
+        assert_eq!(pal_y[1], 3);
+        assert_eq!(info.has_palette_uv, Some(1));
+        assert_eq!(info.palette_size_uv, Some(2));
+        let pal_u = info.palette_colors_u.expect("chroma arm fired");
+        assert_eq!(pal_u[0], 0);
+        assert_eq!(pal_u[1], 1);
+        let pal_v = info.palette_colors_v.expect("chroma arm fired");
+        assert_eq!(pal_v[0], 10);
+        assert_eq!(pal_v[1], 12);
+    }
+
+    /// The §5.11.24 filter_intra outer gate closes when `PaletteSizeY
+    /// != 0` — even with `enable_filter_intra = true` + `use_filter_intra
+    /// = 0`, the gate closes mechanically. Round-trip confirms the
+    /// reader observes `use_filter_intra == None`.
+    #[test]
+    fn write_intra_block_mode_info_with_palette_filter_intra_closed_by_palette() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let mut entries_y = [0u16; PALETTE_COLORS];
+        entries_y[0] = 0;
+        entries_y[1] = 1;
+        let dummy = [0u16; PALETTE_COLORS];
+        write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            true,
+            true,
+            /* allow_screen_content_tools = */ true,
+            /* enable_filter_intra = */ true,
+            0,
+            None,
+            false,
+            false,
+            8,
+            /* has_palette_y = */ 1,
+            2,
+            &entries_y,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                true,
+                /* enable_filter_intra = */ true,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.has_palette_y, Some(1));
+        assert_eq!(info.use_filter_intra, None);
+        assert_eq!(info.filter_intra_mode, None);
     }
 }

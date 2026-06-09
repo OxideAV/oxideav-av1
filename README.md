@@ -2,6 +2,59 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-09 (round 264)
+
+Round 264 lifts the §5.11.22 `intra_block_mode_info` dispatcher's
+`has_palette_y == 0 && has_palette_uv == 0` precondition. With r262
+(luma palette-entries writer) and r263 (chroma palette-entries
+writer) both arms of §5.11.46 in hand, the r264 leaf threads them
+into a single entries-aware `palette_mode_info( )` writer + a
+matching entries-aware `intra_block_mode_info( )` dispatcher.
+
+* `encoder::block_mode_info::write_palette_mode_info_with_entries`
+  (§5.11.46, av1-spec p.97-98) — superset of r261's leaf. Accepts
+  non-zero `has_palette_y` / `has_palette_uv`; on the luma arm
+  emits `palette_size_y_minus_2` S() against
+  `TilePaletteYSizeCdf[ bsizeCtx ]` then delegates to
+  `write_palette_entries_y`; on the chroma arm emits
+  `palette_size_uv_minus_2` S() against `TilePaletteUVSizeCdf[
+  bsizeCtx ]` then delegates to `write_palette_entries_uv`. The
+  §8.3.2 chroma-mode ctx tracks the just-committed `PaletteSizeY`
+  via `palette_uv_mode_ctx`. Gate-off + non-DC arms remain
+  caller-bug rejections (same as r261).
+* `encoder::block_mode_info::write_intra_block_mode_info_with_palette`
+  (§5.11.22, av1-spec p.72) — superset of r261's dispatcher.
+  Routes through the new entries-aware leaf and passes the
+  just-committed `PaletteSizeY` into the §5.11.24
+  `write_filter_intra_mode_info` outer gate so the gate closes
+  mechanically when `has_palette_y == 1` (matching the reader's
+  `PaletteSizeY == 0` clause).
+
++8 round-trip tests through
+`PartitionWalker::decode_intra_block_mode_info` +
+`read_palette_entries_y/uv`: gate-off no-bits via the new leaf,
+small-block gate-off, luma-arm `has_palette_y = 1` with `[0, 1]`,
+chroma direct-V arm with U `[0, 1]` + V `[5, 7]`, both arms firing
+with V delta-encoded `[10, 12]`, and the §5.11.24 filter-intra gate
+closing mechanically when `PaletteSizeY != 0`. Plus caller-bug
+rejections for gate-off `has_palette_y == 1` and `palette_size_y`
+outside `2..=PALETTE_COLORS`.
+
+Full library test count moves to 1778 (was 1770).
+
+### Pending follow-ups for round 265+
+
+* §5.11.22 line-8 CFL arm fold (currently both dispatchers reject
+  `uv_mode = UV_CFL_PRED = 13` as caller bug; lift once
+  `write_cfl_alphas` composition lands).
+* §5.11.23 inter_block_mode_info scaffold (ref-frame / inter-mode /
+  MV writers — none on encoder side yet).
+* Wire the entries-aware dispatcher into the §5.11.18 inter/intra
+  frame-mode-info caller so the palette-bearing path reaches the
+  tile-group encoder.
+
+---
+
 ## Status — 2026-06-09 (round 263)
 
 Round 263 lands the §5.11.46 UV-plane palette-entries writer —
