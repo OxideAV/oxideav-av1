@@ -3388,33 +3388,33 @@ pub fn write_palette_mode_info_with_entries(
 }
 
 /// `intra_block_mode_info( )` dispatcher per §5.11.22 (av1-spec p.72)
-/// — r264. Superset of [`write_intra_block_mode_info`]: lifts the
-/// `has_palette_y == 0 && has_palette_uv == 0` precondition by
-/// routing through [`write_palette_mode_info_with_entries`] for the
-/// §5.11.46 palette-entries arm.
+/// — r265. Superset of [`write_intra_block_mode_info`] and r264's
+/// no-CFL variant: composes [`write_palette_mode_info_with_entries`]
+/// for the §5.11.46 palette-entries arm AND composes
+/// [`write_cfl_alphas`] for the §5.11.22 line-8 `UVMode ==
+/// UV_CFL_PRED` arm.
 ///
-/// Scope of this arc (r264): identical to r261's
-/// [`write_intra_block_mode_info`] except the §5.11.22 lines 13-15
-/// `palette_mode_info( )` call now accepts non-zero `has_palette_*`
-/// and the §5.11.46 entries syntax. The §5.11.24
-/// `filter_intra_mode_info` outer gate's `PaletteSizeY == 0` clause
-/// is still enforced (the gate closes mechanically when
+/// Scope of this arc (r265): identical to r264 except the §5.11.22
+/// line-8 `if ( UVMode == UV_CFL_PRED ) read_cfl_alphas( )` clause
+/// is now folded in. When `has_chroma && uv == UV_CFL_PRED = 13` the
+/// dispatcher requires `cfl_alpha_u` / `cfl_alpha_v` to be `Some`
+/// and threads them through [`write_cfl_alphas`] between
+/// [`write_intra_uv_mode`] and [`write_intra_angle_info_uv`]. The
+/// §5.11.24 `filter_intra_mode_info` outer gate's `PaletteSizeY ==
+/// 0` clause is still enforced (the gate closes mechanically when
 /// `has_palette_y == 1`).
-///
-/// **NOT covered by this arc** (caller passes values consistent with
-/// the no-CFL path; non-trivial values surface
-/// [`Error::PartitionWalkOutOfRange`]):
-/// * `read_cfl_alphas` (§5.11.22 line 8 when `UVMode == UV_CFL_PRED
-///   = 13`). Callers compose [`write_cfl_alphas`] manually for the
-///   CFL arm.
 ///
 /// Inputs: identical to [`write_intra_block_mode_info`] plus the
 /// §5.11.46 palette-entries parameters surfaced by
-/// [`write_palette_mode_info_with_entries`].
+/// [`write_palette_mode_info_with_entries`] plus the §5.11.45 CFL
+/// alphas `cfl_alpha_u` / `cfl_alpha_v` — both `None` on the non-CFL
+/// chroma arm, both `Some` (with at least one non-zero per §6.10.36
+/// joint-sign constraint) on the CFL arm.
 ///
-/// On success, the encoder has committed the full §5.11.22 no-CFL
-/// body — including any §5.11.46 palette-entries syntax — to the bit
-/// stream + advanced the §8.3 CDF adaptation state in lockstep with
+/// On success, the encoder has committed the full §5.11.22 body —
+/// including any §5.11.46 palette-entries syntax and any §5.11.45
+/// CFL syntax — to the bit stream + advanced the §8.3 CDF adaptation
+/// state in lockstep with
 /// [`crate::cdf::PartitionWalker::decode_intra_block_mode_info`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_intra_block_mode_info_with_palette(
@@ -3442,6 +3442,8 @@ pub fn write_intra_block_mode_info_with_palette(
     palette_colors_u: &[u16],
     palette_colors_v: &[u16],
     delta_encode_v: bool,
+    cfl_alpha_u: Option<i8>,
+    cfl_alpha_v: Option<i8>,
     walker: &PartitionWalker,
     mi_row: u32,
     mi_col: u32,
@@ -3460,15 +3462,36 @@ pub fn write_intra_block_mode_info_with_palette(
         if (uv as usize) >= UV_INTRA_MODES_CFL_ALLOWED {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        // r264 arc does NOT compose `write_cfl_alphas`; the CFL arm
-        // is reserved for a future round. UV_CFL_PRED = 13 per §3.
+        // §5.11.22 line 8: `UV_CFL_PRED = 13` per §3. On the
+        // non-CFL chroma arm the caller MUST pass both alphas as
+        // `None`; on the CFL arm both MUST be `Some`. The further
+        // §5.11.45 magnitude / joint-sign guards live inside
+        // [`write_cfl_alphas`] itself.
         if (uv as usize) == 13 {
+            if cfl_alpha_u.is_none() || cfl_alpha_v.is_none() {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            // §5.11.22 line 6 / §8.3.2: the CFL-allowed UV CDF row
+            // is the only one that carries `UV_CFL_PRED` (width 14);
+            // the CFL-not-allowed row is width 13 and excludes it.
+            // Rejecting `uv == UV_CFL_PRED` with `cfl_allowed ==
+            // false` keeps the writer in lockstep with the reader's
+            // CDF-row selection.
+            if !cfl_allowed {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+        } else if cfl_alpha_u.is_some() || cfl_alpha_v.is_some() {
             return Err(Error::PartitionWalkOutOfRange);
         }
     } else if uv_mode.is_some() {
         // §5.11.22 line 5 `if (HasChroma)` guard: when `has_chroma ==
         // false` the reader never touches `uv_mode`; passing a `Some`
         // value is a caller bug.
+        return Err(Error::PartitionWalkOutOfRange);
+    } else if cfl_alpha_u.is_some() || cfl_alpha_v.is_some() {
+        // §5.11.22 line 5 closes the chroma arm entirely on
+        // `has_chroma == false`; passing CFL alphas through is a
+        // caller bug.
         return Err(Error::PartitionWalkOutOfRange);
     }
 
@@ -3485,6 +3508,17 @@ pub fn write_intra_block_mode_info_with_palette(
         let uv = uv_mode.expect("validated above");
         // §5.11.22 line 6.
         write_intra_uv_mode(writer, cdfs, y_mode, uv, cfl_allowed)?;
+        // §5.11.22 line 8: `if ( UVMode == UV_CFL_PRED )
+        // read_cfl_alphas( )` per §5.11.45. UV_CFL_PRED = 13 per §3.
+        // The reader's `read_cfl_alphas` body sits between
+        // `uv_mode S()` and `intra_angle_info_uv( )`; mirror that
+        // ordering here so the bit positions of every following
+        // symbol line up.
+        if (uv as usize) == 13 {
+            let alpha_u = cfl_alpha_u.expect("validated above");
+            let alpha_v = cfl_alpha_v.expect("validated above");
+            write_cfl_alphas(writer, cdfs, alpha_u, alpha_v)?;
+        }
         // §5.11.22 line 10.
         write_intra_angle_info_uv(writer, cdfs, angle_delta_uv, mi_size, uv)?;
     } else if angle_delta_uv != 0 {
@@ -9587,6 +9621,8 @@ mod tests {
             &dummy,
             &dummy,
             false,
+            /* cfl_alpha_u = */ None,
+            /* cfl_alpha_v = */ None,
             &walker_w,
             0,
             0,
@@ -9665,6 +9701,8 @@ mod tests {
             &entries_u,
             &entries_v,
             /* delta_encode_v = */ false,
+            /* cfl_alpha_u = */ None,
+            /* cfl_alpha_v = */ None,
             &walker_w,
             0,
             0,
@@ -9746,6 +9784,8 @@ mod tests {
             &entries_u,
             &entries_v,
             /* delta_encode_v = */ true,
+            /* cfl_alpha_u = */ None,
+            /* cfl_alpha_v = */ None,
             &walker_w,
             0,
             0,
@@ -9826,6 +9866,8 @@ mod tests {
             &dummy,
             &dummy,
             false,
+            /* cfl_alpha_u = */ None,
+            /* cfl_alpha_v = */ None,
             &walker_w,
             0,
             0,
@@ -9855,5 +9897,290 @@ mod tests {
         assert_eq!(info.has_palette_y, Some(1));
         assert_eq!(info.use_filter_intra, None);
         assert_eq!(info.filter_intra_mode, None);
+    }
+
+    // -----------------------------------------------------------------
+    // r265: §5.11.22 line-8 CFL arm — write_cfl_alphas composition.
+    // -----------------------------------------------------------------
+
+    /// CFL arm round-trip with both alphas positive (`alpha_u = +1`,
+    /// `alpha_v = +2`): exercises the §5.11.45 `signU == CFL_SIGN_POS
+    /// && signV == CFL_SIGN_POS` joint-sign slot (`joint = 3*2 + 2 - 1
+    /// = 7`), both per-plane CFL alpha S() emissions, and the
+    /// dispatcher's CFL-arm threading between `write_intra_uv_mode`
+    /// and `write_intra_angle_info_uv`.
+    #[test]
+    fn write_intra_block_mode_info_with_palette_cfl_arm_both_pos_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        // UV_CFL_PRED = 13 per §3.
+        let uv_cfl_pred: u8 = 13;
+        write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(uv_cfl_pred),
+            0,
+            0,
+            /* cfl_allowed = */ true,
+            /* has_chroma = */ true,
+            /* allow_screen_content_tools = */ false,
+            /* enable_filter_intra = */ false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            /* has_palette_y = */ 0,
+            0,
+            &dummy,
+            /* has_palette_uv = */ 0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            /* cfl_alpha_u = */ Some(1),
+            /* cfl_alpha_v = */ Some(2),
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* lossless = */ false,
+                /* has_chroma = */ true,
+                /* allow_screen_content_tools = */ false,
+                /* enable_filter_intra = */ false,
+                /* subsampling_x = */ false,
+                /* subsampling_y = */ false,
+                /* above_palette_y = */ false,
+                /* left_palette_y = */ false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.uv_mode, Some(uv_cfl_pred));
+        assert_eq!(info.cfl_alpha_u, Some(1));
+        assert_eq!(info.cfl_alpha_v, Some(2));
+    }
+
+    /// CFL arm round-trip with one zero / one negative alpha
+    /// (`alpha_u = 0`, `alpha_v = -3`): exercises the §5.11.45
+    /// `signU == CFL_SIGN_ZERO && signV == CFL_SIGN_NEG` joint-sign
+    /// slot (`joint = 3*0 + 1 - 1 = 0`) — the no-bits U arm + the
+    /// `signed = -(1 + raw)` V arm.
+    #[test]
+    fn write_intra_block_mode_info_with_palette_cfl_arm_zero_neg_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let uv_cfl_pred: u8 = 13;
+        write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(uv_cfl_pred),
+            0,
+            0,
+            true,
+            true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            0,
+            0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            Some(0),
+            Some(-3),
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_block_mode_info(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.uv_mode, Some(uv_cfl_pred));
+        assert_eq!(info.cfl_alpha_u, Some(0));
+        assert_eq!(info.cfl_alpha_v, Some(-3));
+    }
+
+    /// Caller-bug rejection: `uv_mode == UV_CFL_PRED` with
+    /// `cfl_alpha_u == None`. The §5.11.22 CFL arm requires both
+    /// alphas to be `Some`; passing `None` is a caller bug and the
+    /// dispatcher MUST surface it before touching the bit stream.
+    #[test]
+    fn write_intra_block_mode_info_with_palette_cfl_arm_missing_alpha_rejected() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let uv_cfl_pred: u8 = 13;
+        let err = write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(uv_cfl_pred),
+            0,
+            0,
+            true,
+            true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            0,
+            0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            /* cfl_alpha_u = */ None,
+            /* cfl_alpha_v = */ Some(1),
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller-bug rejection: non-CFL `uv_mode` with `cfl_alpha_u ==
+    /// Some(_)`. On the non-CFL chroma arm the §5.11.22 reader never
+    /// touches `read_cfl_alphas`; passing `Some` is a caller bug.
+    #[test]
+    fn write_intra_block_mode_info_with_palette_non_cfl_with_alpha_rejected() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let err = write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            true,
+            true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            0,
+            0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            /* cfl_alpha_u = */ Some(1),
+            /* cfl_alpha_v = */ None,
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Caller-bug rejection: `uv_mode == UV_CFL_PRED` with
+    /// `cfl_allowed == false`. The §8.3.2 CDF-row selector excludes
+    /// `UV_CFL_PRED` on the CFL-not-allowed row (width 13 vs 14), so
+    /// the writer MUST stay in lockstep with the reader's row choice.
+    #[test]
+    fn write_intra_block_mode_info_with_palette_cfl_arm_cfl_not_allowed_rejected() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let uv_cfl_pred: u8 = 13;
+        let err = write_intra_block_mode_info_with_palette(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(uv_cfl_pred),
+            0,
+            0,
+            /* cfl_allowed = */ false,
+            true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            0,
+            0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            Some(1),
+            Some(1),
+            &walker_w,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

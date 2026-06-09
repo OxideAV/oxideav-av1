@@ -4,6 +4,35 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r265 (2026-06-09): fold the §5.11.22 line-8 CFL arm into
+  the entries-aware `intra_block_mode_info` dispatcher
+  (`encoder::block_mode_info::write_intra_block_mode_info_with_palette`,
+  av1-spec p.72). The r264 dispatcher rejected `uv_mode ==
+  UV_CFL_PRED = 13` as a caller bug; r265 lifts that precondition
+  by accepting two new `cfl_alpha_u: Option<i8>` /
+  `cfl_alpha_v: Option<i8>` parameters and threading the §5.11.45
+  `write_cfl_alphas` composition between `write_intra_uv_mode` and
+  `write_intra_angle_info_uv` exactly as the §5.11.22 reader does.
+  Caller-bug surfaces (re-asserted before any partial S() write):
+  `uv_mode == UV_CFL_PRED` with one alpha `None`, non-CFL `uv_mode`
+  with either alpha `Some`, and `uv_mode == UV_CFL_PRED` with
+  `cfl_allowed == false` (the §8.3.2 CDF-row selector excludes
+  `UV_CFL_PRED` on the CFL-not-allowed row, so a writer entry there
+  would desync the reader).
+
+  +5 tests through `PartitionWalker::decode_intra_block_mode_info`:
+  CFL arm round-trip with both alphas positive (`+1` / `+2`,
+  `signU == SIGN_POS && signV == SIGN_POS`, joint-sign slot 7),
+  CFL arm round-trip with `alpha_u = 0` / `alpha_v = -3`
+  (`signU == SIGN_ZERO && signV == SIGN_NEG`, joint-sign slot 0,
+  no-bits U arm + `signed = -(1 + raw)` V arm), plus caller-bug
+  rejections for missing alpha on the CFL arm, surplus alpha on the
+  non-CFL arm, and `UV_CFL_PRED` with `cfl_allowed == false`.
+
+  Library tests: 1778 → 1783. The r261
+  `write_intra_block_mode_info` no-palette dispatcher remains
+  unchanged.
+
 - encoder r264 (2026-06-09): lift the §5.11.22 `intra_block_mode_info`
   dispatcher's `has_palette_y == 0 && has_palette_uv == 0`
   precondition by threading the §5.11.46 `palette_size_*_minus_2`

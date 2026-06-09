@@ -2,6 +2,49 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-09 (round 265)
+
+Round 265 folds the §5.11.22 line-8 CFL arm into the entries-aware
+`intra_block_mode_info` dispatcher. The r264 dispatcher rejected
+`uv_mode == UV_CFL_PRED = 13` as a caller bug; r265 lifts that
+precondition by accepting two new optional CFL-alpha parameters
+and threading the §5.11.45 `write_cfl_alphas` composition between
+`write_intra_uv_mode` and `write_intra_angle_info_uv` exactly as
+the §5.11.22 reader does.
+
+* `encoder::block_mode_info::write_intra_block_mode_info_with_palette`
+  (§5.11.22, av1-spec p.72) — superset of the r264 signature.
+  Accepts `cfl_alpha_u: Option<i8>` and `cfl_alpha_v: Option<i8>`.
+  On the chroma arm when `uv_mode == UV_CFL_PRED = 13`, both alphas
+  MUST be `Some` and `cfl_allowed` MUST be `true` (the §8.3.2
+  CDF-row selector excludes `UV_CFL_PRED` on the CFL-not-allowed
+  row), and `write_cfl_alphas` is invoked between
+  `write_intra_uv_mode` and `write_intra_angle_info_uv`. On the
+  non-CFL chroma arm both MUST be `None`. The further §5.11.45
+  magnitude / joint-sign guards (`|alpha| <= CFL_ALPHABET_SIZE` +
+  the §6.10.36 `(0, 0)` prohibition) remain inside
+  `write_cfl_alphas` itself.
+
++5 round-trip / caller-bug tests through
+`PartitionWalker::decode_intra_block_mode_info`: CFL arm both alphas
+positive `+1` / `+2` (joint-sign slot 7, `SIGN_POS / SIGN_POS`),
+CFL arm `0` / `-3` (joint-sign slot 0, `SIGN_ZERO / SIGN_NEG`,
+no-bits U arm + `signed = -(1 + raw)` V arm), missing-alpha
+rejection on the CFL arm, surplus-alpha rejection on the non-CFL
+arm, and `UV_CFL_PRED` with `cfl_allowed == false` rejection.
+
+Full library test count moves to 1783 (was 1778).
+
+### Pending follow-ups for round 266+
+
+* §5.11.23 `inter_block_mode_info` scaffold (ref-frame / inter-mode
+  / MV writers — none on encoder side yet).
+* Wire the entries-aware dispatcher into the §5.11.18 inter/intra
+  frame-mode-info caller so the palette-bearing path reaches the
+  tile-group encoder.
+
+---
+
 ## Status — 2026-06-09 (round 264)
 
 Round 264 lifts the §5.11.22 `intra_block_mode_info` dispatcher's
@@ -46,7 +89,7 @@ Full library test count moves to 1778 (was 1770).
 
 * §5.11.22 line-8 CFL arm fold (currently both dispatchers reject
   `uv_mode = UV_CFL_PRED = 13` as caller bug; lift once
-  `write_cfl_alphas` composition lands).
+  `write_cfl_alphas` composition lands). — landed r265.
 * §5.11.23 inter_block_mode_info scaffold (ref-frame / inter-mode /
   MV writers — none on encoder side yet).
 * Wire the entries-aware dispatcher into the §5.11.18 inter/intra
