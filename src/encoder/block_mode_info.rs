@@ -52,13 +52,14 @@ use crate::cdf::{
     comp_ref_type_ctx, count_refs, is_directional, is_samedir_ref_pair, mi_height_log2,
     mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx,
     PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL,
-    DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS,
-    IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEARMV,
-    MODE_NEWMV, NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
-    PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS,
-    SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED,
-    UV_INTRA_MODES_CFL_NOT_ALLOWED, ZERO_MV_CONTEXTS,
+    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS,
+    COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_FILTER_MODES,
+    INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS,
+    MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEWMV, MODE_NEW_NEWMV,
+    NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
+    PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
+    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    ZERO_MV_CONTEXTS,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -4600,6 +4601,93 @@ pub fn write_inter_single_mode(
     Ok(())
 }
 
+/// `compound_mode` S() inverse per §5.11.23 (av1-spec p.74, lines 6-8
+/// arm 3).
+///
+/// The compound sibling of [`write_inter_single_mode`]. When the
+/// §5.11.23 inter-mode dispatch reaches its `is_compound` arm — block
+/// is compound (`RefFrame[ 1 ] > INTRA_FRAME`), not `skip_mode`, and
+/// neither `SEG_LVL_SKIP` nor `SEG_LVL_GLOBALMV` is active — the
+/// reader codes a single §8.2.6 `S()` symbol over
+/// `TileCompoundModeCdf[ ctx ]` and sets
+///
+/// ```text
+///   YMode = NEAREST_NEARESTMV + compound_mode
+/// ```
+///
+/// (§5.11.23 line 8, av1-spec p.74). `compound_mode` ranges over
+/// `0..COMPOUND_MODES = 8`, so `YMode` ranges over the eight
+/// compound-prediction modes `NEAREST_NEARESTMV = 18 ..= NEW_NEWMV =
+/// 25` (§6.10.22). This writer is the exact algebraic inverse:
+///
+/// ```text
+///   compound_mode = YMode - NEAREST_NEARESTMV
+/// ```
+///
+/// One §8.2.6 `S()` is emitted unconditionally (the arm always codes a
+/// symbol; there is no short-circuit leaf as in the single-prediction
+/// cascade).
+///
+/// ## Inputs
+///
+/// * `y_mode` — the §5.11.23 compound-prediction `YMode` the encoder
+///   chose: one of the eight compound modes
+///   `MODE_NEAREST_NEARESTMV = 18 ..= MODE_NEW_NEWMV = 25`
+///   (§6.10.22). Any other value is a caller bug — the single-pred /
+///   intra / forced-mode arms never reach this writer.
+/// * `compound_mode_context` — §8.3.2 `compound_mode` context, the
+///   `TileCompoundModeCdf` row index in `0..COMPOUND_MODE_CONTEXTS =
+///   8`. Produced by [`crate::cdf::compound_mode_ctx`] from the
+///   §7.10.2 `RefMvContext` / `NewMvContext` outputs; like every
+///   writer in this module the resolved ctx is caller-supplied, so
+///   the encoder threads the same §8.3.2 mapping the decoder side
+///   applies.
+///
+/// ## Out-of-range cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * `y_mode` not in `MODE_NEAREST_NEARESTMV ..= MODE_NEW_NEWMV`.
+/// * `compound_mode_context >= COMPOUND_MODE_CONTEXTS` (the symbol is
+///   always emitted, so the ctx is always validated — unlike the
+///   single-prediction writer's consulted-only checks).
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless (mirrors [`write_inter_single_mode`]): one §8.2.6 `S()`
+/// is written. The caller stamps the resulting `YMode` onto the block
+/// footprint through its own [`crate::cdf::PartitionWalker`] so
+/// subsequent blocks' §8.3.2 neighbour walks observe it.
+pub fn write_compound_mode(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    y_mode: u8,
+    compound_mode_context: usize,
+) -> Result<(), Error> {
+    // §6.10.22 compound-prediction mode bound — the eight `YMode`
+    // values the §5.11.23 `is_compound` arm can produce, contiguous
+    // from `NEAREST_NEARESTMV = 18` through `NEW_NEWMV = 25`.
+    if !(MODE_NEAREST_NEARESTMV..=MODE_NEW_NEWMV).contains(&y_mode) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if compound_mode_context >= COMPOUND_MODE_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.23 line 8 inverse: `compound_mode = YMode -
+    // NEAREST_NEARESTMV`, in `0..COMPOUND_MODES = 8`.
+    let compound_mode = (y_mode - MODE_NEAREST_NEARESTMV) as u32;
+    debug_assert!(
+        (compound_mode as usize) < COMPOUND_MODES,
+        "§5.11.23 compound_mode in 0..COMPOUND_MODES"
+    );
+
+    // §5.11.23: single `compound_mode` S() over
+    // `TileCompoundModeCdf[ ctx ]` (§8.3.2 p.378).
+    let row = cdfs.compound_mode_cdf(compound_mode_context);
+    writer.write_symbol(compound_mode, row)?;
+
+    Ok(())
+}
+
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
 /// 0) { x >>= 1; s++; } return s - 1;`. Local helper because the
 /// public surface lives in `cdf` / `symbol_decoder`; pulled inline
@@ -4623,7 +4711,8 @@ mod tests {
     use crate::cdf::{
         cfl_allowed_for_uv_mode, comp_mode_ctx, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx,
         skip_mode_ctx, PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_4X8, BLOCK_8X4,
-        BLOCK_8X8, DC_PRED, MODE_NEAREST_NEARESTMV, V_PRED,
+        BLOCK_8X8, DC_PRED, MODE_GLOBAL_GLOBALMV, MODE_NEAREST_NEWMV, MODE_NEAR_NEARMV,
+        MODE_NEAR_NEWMV, MODE_NEW_NEARESTMV, MODE_NEW_NEARMV, V_PRED,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -12988,5 +13077,165 @@ mod tests {
         assert_eq!(enc_cdfs.new_mv_cdf(2), dec_cdfs.new_mv_cdf(2));
         assert_eq!(enc_cdfs.zero_mv_cdf(1), dec_cdfs.zero_mv_cdf(1));
         assert_eq!(enc_cdfs.ref_mv_cdf(3), dec_cdfs.ref_mv_cdf(3));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.23 compound-prediction inter mode — write_compound_mode
+    // round-trips through a mirror of the decoder's single
+    // `compound_mode` S() read (av1-spec p.74, arm 3). The full decoder
+    // path needs a find_mv_stack (§7.10.2), not yet implemented; this
+    // mirror runs exactly the one §5.11.23 S() read against the same
+    // CDF row, recovering YMode as `NEAREST_NEARESTMV + compound_mode`.
+    // -----------------------------------------------------------------
+
+    /// Replays the §5.11.23 compound-prediction `YMode` derivation from
+    /// a decoder over `bytes`, consuming the same `compound_mode`
+    /// symbol the writer emitted. Returns the recovered `YMode`.
+    fn decode_compound_mode_mirror(
+        bytes: &[u8],
+        cdfs: &mut TileCdfContext,
+        disable_cdf_update: bool,
+        compound_mode_context: usize,
+    ) -> u8 {
+        let pad = if bytes.is_empty() {
+            vec![0u8]
+        } else {
+            bytes.to_vec()
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), disable_cdf_update).unwrap();
+        // §5.11.23 line 8: YMode = NEAREST_NEARESTMV + compound_mode.
+        let row = cdfs.compound_mode_cdf(compound_mode_context);
+        let cm = dec.read_symbol(row).unwrap() as u8;
+        MODE_NEAREST_NEARESTMV + cm
+    }
+
+    /// Every compound `YMode` (`NEAREST_NEARESTMV = 18 ..= NEW_NEWMV =
+    /// 25`) round-trips through the decoder mirror at
+    /// `compound_mode_context = 0`, with §8.3 CDF adaptation engaged on
+    /// both sides (so the encode-side and decode-side rows step
+    /// identically).
+    #[test]
+    fn write_compound_mode_all_modes_round_trip_at_origin() {
+        for y_mode in MODE_NEAREST_NEARESTMV..=MODE_NEW_NEWMV {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_compound_mode(&mut writer, &mut enc_cdfs, y_mode, 0).unwrap();
+            let bytes = writer.finish();
+
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let recovered = decode_compound_mode_mirror(&bytes, &mut dec_cdfs, false, 0);
+            assert_eq!(recovered, y_mode, "YMode {y_mode} round-trips at origin");
+            // The encode-side and decode-side CDFs must have adapted
+            // identically — assert the consulted row matches.
+            assert_eq!(enc_cdfs.compound_mode_cdf(0), dec_cdfs.compound_mode_cdf(0));
+        }
+    }
+
+    /// Round-trip every compound mode under each non-zero §8.3.2
+    /// context `1..COMPOUND_MODE_CONTEXTS`, proving the writer selects
+    /// the same `TileCompoundModeCdf` row the reader does.
+    #[test]
+    fn write_compound_mode_all_modes_round_trip_each_ctx() {
+        for ctx in 1..COMPOUND_MODE_CONTEXTS {
+            for y_mode in MODE_NEAREST_NEARESTMV..=MODE_NEW_NEWMV {
+                let mut enc_cdfs = TileCdfContext::new_from_defaults();
+                let mut writer = SymbolWriter::new(false);
+                write_compound_mode(&mut writer, &mut enc_cdfs, y_mode, ctx).unwrap();
+                let bytes = writer.finish();
+
+                let mut dec_cdfs = TileCdfContext::new_from_defaults();
+                let recovered = decode_compound_mode_mirror(&bytes, &mut dec_cdfs, false, ctx);
+                assert_eq!(recovered, y_mode, "YMode {y_mode} round-trips at ctx {ctx}");
+            }
+        }
+    }
+
+    /// Symbol-count leaf check: each compound mode emits exactly one
+    /// `compound_mode` symbol equal to `YMode - NEAREST_NEARESTMV`.
+    /// Verified by comparing the emitted byte stream against an
+    /// independent re-encode of only that single symbol over a pristine
+    /// CDF copy, proving no extra symbol is written.
+    #[test]
+    fn write_compound_mode_emits_exactly_one_symbol() {
+        for y_mode in MODE_NEAREST_NEARESTMV..=MODE_NEW_NEWMV {
+            let mut a = TileCdfContext::new_from_defaults();
+            let mut wa = SymbolWriter::new(false);
+            write_compound_mode(&mut wa, &mut a, y_mode, 0).unwrap();
+            let got = wa.finish();
+
+            let mut b = TileCdfContext::new_from_defaults();
+            let mut wb = SymbolWriter::new(false);
+            let cm = (y_mode - MODE_NEAREST_NEARESTMV) as u32;
+            let row = b.compound_mode_cdf(0);
+            wb.write_symbol(cm, row).unwrap();
+            let want = wb.finish();
+            assert_eq!(
+                got, want,
+                "YMode {y_mode} emits exactly one compound_mode symbol"
+            );
+        }
+    }
+
+    /// A `YMode` outside the eight compound modes (single-prediction
+    /// `NEWMV = 17`, intra `DC_PRED = 0`, just past `NEW_NEWMV` at 26,
+    /// and `255`) is a caller bug.
+    #[test]
+    fn write_compound_mode_rejects_invalid_y_mode() {
+        for y_mode in [0u8, 13, MODE_NEWMV, MODE_NEW_NEWMV + 1, 255] {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_compound_mode(&mut writer, &mut cdfs, y_mode, 0).unwrap_err();
+            assert!(
+                matches!(err, Error::PartitionWalkOutOfRange),
+                "y_mode {y_mode} rejected"
+            );
+        }
+    }
+
+    /// The `compound_mode` symbol is always emitted, so the ctx is
+    /// always validated: an out-of-range context is a caller bug even
+    /// on the first mode.
+    #[test]
+    fn write_compound_mode_rejects_bad_ctx() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_compound_mode(
+            &mut writer,
+            &mut cdfs,
+            MODE_NEAREST_NEARESTMV,
+            COMPOUND_MODE_CONTEXTS,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// A sequential run of distinct compound modes round-trips with
+    /// §8.3 CDF adaptation engaged across blocks: each write mutates the
+    /// shared encode-side CDFs, each mirror read mutates the decode-side
+    /// CDFs, and the two stay in lockstep over the whole sequence.
+    #[test]
+    fn write_compound_mode_sequential_cdf_adaptation_lockstep() {
+        let modes = [
+            MODE_NEAREST_NEARESTMV,
+            MODE_NEW_NEWMV,
+            MODE_NEAR_NEARMV,
+            MODE_GLOBAL_GLOBALMV,
+            MODE_NEAREST_NEWMV,
+            MODE_NEW_NEARMV,
+            MODE_NEW_NEARESTMV,
+            MODE_NEAR_NEWMV,
+        ];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        for &y_mode in &modes {
+            let mut writer = SymbolWriter::new(false);
+            write_compound_mode(&mut writer, &mut enc_cdfs, y_mode, 4).unwrap();
+            let bytes = writer.finish();
+            let recovered = decode_compound_mode_mirror(&bytes, &mut dec_cdfs, false, 4);
+            assert_eq!(recovered, y_mode);
+        }
+        // After the run the consulted row must be identical on both
+        // sides (proves the per-symbol adaptation matched throughout).
+        assert_eq!(enc_cdfs.compound_mode_cdf(4), dec_cdfs.compound_mode_cdf(4));
     }
 }

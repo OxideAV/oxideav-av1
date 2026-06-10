@@ -4,6 +4,28 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r271 (2026-06-10): land the §5.11.23 compound-prediction
+  inter-mode writer — `encoder::block_mode_info::write_compound_mode`
+  (§5.11.23 `inter_block_mode_info( )` arm 3, av1-spec p.74). The
+  compound sibling of `write_inter_single_mode`. Exact algebraic
+  inverse of the reader's single `compound_mode` S() read: a §8.2.6
+  `S()` over `TileCompoundModeCdf[ ctx ]` recovers
+  `YMode = NEAREST_NEARESTMV + compound_mode`, so the writer derives
+  `compound_mode = YMode - NEAREST_NEARESTMV` (in `0..COMPOUND_MODES =
+  8`) and emits exactly one symbol. The §8.3.2 `compound_mode` context
+  (the `TileCompoundModeCdf` row index in `0..COMPOUND_MODE_CONTEXTS =
+  8`, produced by `compound_mode_ctx` from the §7.10.2 `RefMvContext` /
+  `NewMvContext` outputs) is caller-supplied. The symbol is always
+  emitted, so the ctx is always validated (unlike the
+  single-prediction writer's consulted-only checks). Caller-bug
+  rejects: `YMode` outside `NEAREST_NEARESTMV ..= NEW_NEWMV`
+  (`18..=25`), and an out-of-range context. +6 tests (all eight
+  compound modes round-trip through a mirror of the decoder's
+  §5.11.23 `compound_mode` read at the origin and under every non-zero
+  context with CDF-row equality asserted, the exactly-one-symbol leaf
+  check via independent re-encode, the invalid-`YMode` reject, the
+  out-of-range-ctx reject, and an 8-mode sequential CDF-adaptation
+  lockstep round-trip). Library test count 1839 → 1845.
 - encoder r270 (2026-06-10): land the §5.11.23 single-prediction
   inter-mode writer — `encoder::block_mode_info::write_inter_single_mode`
   (§5.11.23 `inter_block_mode_info( )` lines 9-22, av1-spec p.74). Exact

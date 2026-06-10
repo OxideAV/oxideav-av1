@@ -2,6 +2,53 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-10 (round 271)
+
+Round 271 lands the **§5.11.23 compound-prediction inter-mode writer** —
+the `compound_mode` symbol that derives `YMode` on a compound inter
+block, the sibling of r270's single-prediction cascade.
+
+* `encoder::block_mode_info::write_compound_mode`
+  (§5.11.23 `inter_block_mode_info( )` arm 3, av1-spec p.74). Exact
+  algebraic inverse of the reader's single `compound_mode` read (the
+  `is_compound` arm taken when the block is compound, non-`skip_mode`,
+  and neither `SEG_LVL_SKIP` nor `SEG_LVL_GLOBALMV` active): a §8.2.6
+  `S()` over `TileCompoundModeCdf[ ctx ]` recovers
+  `YMode = NEAREST_NEARESTMV + compound_mode`, so the writer derives
+  `compound_mode = YMode - NEAREST_NEARESTMV` (in `0..COMPOUND_MODES =
+  8`) and emits exactly one symbol — there is no short-circuit leaf as
+  in the single-prediction cascade. The §8.3.2 `compound_mode` context
+  (the `TileCompoundModeCdf` row in `0..COMPOUND_MODE_CONTEXTS = 8`,
+  produced by `compound_mode_ctx` from the §7.10.2 `RefMvContext` /
+  `NewMvContext` outputs, still pending) is caller-supplied. Because the
+  symbol is always emitted, the ctx is always validated (unlike the
+  single-prediction writer's consulted-only checks). Caller-bug
+  rejects: `YMode` outside `NEAREST_NEARESTMV ..= NEW_NEWMV` (`18..=25`),
+  and an out-of-range context.
+
++6 tests: all eight compound modes round-trip through a mirror of the
+decoder's §5.11.23 `compound_mode` read at the frame origin AND under
+every non-zero context (with CDF-row equality asserted), the
+exactly-one-symbol leaf check via independent re-encode, the
+invalid-`YMode` reject, the out-of-range-ctx reject, and an 8-mode
+sequential CDF-adaptation lockstep round-trip.
+
+Full library test count moves to 1845 (was 1839).
+
+### Pending follow-ups for round 272+
+
+* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2) — the
+  process that produces the `NewMvContext` / `ZeroMvContext` /
+  `RefMvContext` / `compound_mode` ctx the line 9-22 writers consume.
+* §5.11.23 lines 23-46 `drl_mode` S() writer (per-`RefMvIdx` loop,
+  `TileDrlModeCdf[ DrlCtxStack[ idx ] ]`).
+* Fold `write_ref_frames` + `write_inter_single_mode` +
+  `write_compound_mode` into `write_inter_block_mode_info_bootstrap`'s
+  caller surface once the §5.11.23 line 6 `find_mv_stack` ctx surface
+  exists.
+
+---
+
 ## Status — 2026-06-10 (round 270)
 
 Round 270 lands the **§5.11.23 single-prediction inter-mode writer** —
