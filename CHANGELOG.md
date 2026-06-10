@@ -4,6 +4,29 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r274 (2026-06-11): land the §5.11.26 `assign_mv` `PredMv`
+  derivation — `encoder::block_mode_info::assign_mv_pred_mv`
+  (av1-spec p.77-78). This is the encoder-side predictor-selection step
+  that turns a chosen inter `YMode` + running `RefMvIdx` + the §7.10.2
+  `find_mv_stack` outputs (`GlobalMvs` / `RefStackMv` / `NumMvFound`)
+  into the `PredMv[ refList ]` value `write_read_mv` subtracts from the
+  target MV. Per the §5.11.26 non-intrabc arm: the `GLOBALMV` list draws
+  `GlobalMvs[ i ]`; otherwise `pos = (compMode == NEARESTMV) ? 0 :
+  RefMvIdx`, forced to `0` when `compMode == NEWMV && NumMvFound <= 1`,
+  and `PredMv[ i ] = RefStackMv[ pos ][ i ]`. The per-list `compMode`
+  is resolved through the shared decode-side `crate::cdf::get_mode`
+  §get_mode mapping, so encode and decode agree on the joint-mode
+  decomposition by construction. Caller-bug rejects: a non-inter
+  `y_mode` (outside `MODE_NEARESTMV..=MODE_NEW_NEWMV`), a `ref_list >
+  1`, and a `pos` at or beyond `NumMvFound` (an unreachable `RefMvIdx`
+  at the derived stack depth). This is the last predictor-derivation
+  piece the §5.11.23 `assign_mv` caller needs before wiring
+  `write_read_mv` into the inter-block bootstrap. +8 tests (GLOBALMV /
+  NEARESTMV / NEARMV / NEWMV arm selection; the `NumMvFound <= 1` NEWMV
+  collapse; compound per-list selection; the unreachable-pos and
+  bad-mode/ref-list rejects; and an end-to-end round-trip feeding the
+  derived `PredMv` to `write_read_mv` and recovering the target MV
+  through a §5.11.31 reader mirror). Library test count 1865 → 1873.
 - encoder r273 (2026-06-10): land the §5.11.31 / §5.11.32 `read_mv` /
   `read_mv_component` write side (the `assign_mv` line-33 motion-vector
   difference writer) — `encoder::block_mode_info::write_read_mv`

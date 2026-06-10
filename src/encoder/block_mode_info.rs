@@ -51,13 +51,13 @@ use crate::cdf::{
     block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_mode_ctx,
     comp_ref_type_ctx, count_refs, is_directional, is_samedir_ref_pair, mi_height_log2,
     mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx,
-    PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_MODES,
-    COMPOUND_MODE_CONTEXTS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS,
-    FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
-    MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV, MODE_NEARESTMV,
-    MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
-    MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
+    FindMvStackResult, PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8,
+    BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE,
+    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL,
+    DRL_MODE_CONTEXTS, FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS,
+    IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV,
+    MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV,
+    MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
     MV_INTRABC_CONTEXT, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO,
     NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
     PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
@@ -5192,6 +5192,77 @@ pub fn write_read_mv(
     }
 
     Ok(())
+}
+
+/// `PredMv[ refList ]` derivation per the §5.11.26 `assign_mv` non-intrabc
+/// inter arm (av1-spec p.77-78) — selects the motion-vector predictor a
+/// chosen inter mode draws from the §7.10.2 `find_mv_stack` outputs,
+/// feeding it to [`write_read_mv`] as the `pred_mv` argument.
+///
+/// Spec body (av1-spec p.77-78, the `else if`/`else` arms of `assign_mv`
+/// reached when `use_intrabc == 0`):
+/// ```text
+///   compMode = get_mode( i )
+///   if ( compMode == GLOBALMV ) {
+///     PredMv[ i ] = GlobalMvs[ i ]
+///   } else {
+///     pos = ( compMode == NEARESTMV ) ? 0 : RefMvIdx
+///     if ( compMode == NEWMV && NumMvFound <= 1 )
+///       pos = 0
+///     PredMv[ i ] = RefStackMv[ pos ][ i ]
+///   }
+/// ```
+///
+/// The `RefMvIdx` here is the §5.11.23 `inter_block_mode_info` running
+/// index after the `drl_mode` loop (`RefMvIdx = 1 + (has_nearmv ? …)`)
+/// — i.e. the same value the caller hands [`write_drl_mode`]. For a
+/// `NEARESTMV` list the predictor is always the top stack slot; for
+/// `NEWMV` it collapses to slot 0 whenever the stack is short
+/// (`NumMvFound <= 1`).
+///
+/// The `GlobalMvs` / `RefStackMv` arrays come straight from a
+/// [`FindMvStackResult`]; `ref_list` is `0` on single-prediction blocks
+/// and `0`/`1` on compound blocks.
+///
+/// The per-list `compMode` is resolved through the shared
+/// [`crate::cdf::get_mode`] §get_mode mapping (the same decode-side
+/// helper the reader uses), so encode and decode agree on the mode
+/// decomposition by construction.
+///
+/// Caller-bug rejects (`Err(PartitionWalkOutOfRange)`):
+/// * `y_mode` outside `MODE_NEARESTMV..=MODE_NEW_NEWMV` or `ref_list > 1`.
+/// * a `RefStackMv` index (`pos`) at or beyond `NumMvFound` — the chosen
+///   `RefMvIdx` is unreachable at the derived stack depth, so reading
+///   `RefStackMv[ pos ]` would consume an undefined slot.
+pub fn assign_mv_pred_mv(
+    mv_stack: &FindMvStackResult,
+    y_mode: u8,
+    ref_list: u8,
+    ref_mv_idx: u32,
+) -> Result<[i32; 2], Error> {
+    if !(MODE_NEARESTMV..=MODE_NEW_NEWMV).contains(&y_mode) || ref_list > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let comp_mode = crate::cdf::get_mode(y_mode, ref_list as usize);
+    if comp_mode == MODE_GLOBALMV {
+        return Ok(mv_stack.global_mvs[ref_list as usize]);
+    }
+    let mut pos: u32 = if comp_mode == MODE_NEARESTMV {
+        0
+    } else {
+        ref_mv_idx
+    };
+    if comp_mode == MODE_NEWMV && mv_stack.num_mv_found <= 1 {
+        pos = 0;
+    }
+    // §5.11.26: `RefStackMv[ pos ]` must be a populated slot. The
+    // §7.10.2.12 extra-search guarantees `NumMvFound >= 2` for any
+    // reachable `RefMvIdx > 0`, but a caller that hands a `RefMvIdx`
+    // beyond the stack depth would read an undefined slot — reject it.
+    if pos >= mv_stack.num_mv_found || pos as usize >= MAX_REF_MV_STACK_SIZE {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    Ok(mv_stack.ref_stack_mv[pos as usize][ref_list as usize])
 }
 
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
@@ -14415,5 +14486,188 @@ mod tests {
         let err =
             write_read_mv_component(&mut writer, &mut cdfs, 0, 0, 16385, false, true).unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.26 assign_mv PredMv derivation — get_mode + assign_mv_pred_mv
+    // -----------------------------------------------------------------
+
+    /// Build a `FindMvStackResult` with caller-chosen `num_mv_found`,
+    /// distinct per-slot `RefStackMv` (so a wrong `pos` is observable),
+    /// and per-list `GlobalMvs`. Single-pred slots fill list 0; compound
+    /// fills both lists. Every other field is the spatial-only default.
+    fn mk_mv_stack(num_mv_found: u32) -> FindMvStackResult {
+        let mut ref_stack_mv = [[[0i32; 2]; 2]; MAX_REF_MV_STACK_SIZE];
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..MAX_REF_MV_STACK_SIZE {
+            // List 0: encode the slot index into the value so a mis-pick
+            // is caught. List 1: a distinct offset so list selection is
+            // also observable.
+            ref_stack_mv[idx][0] = [100 + idx as i32 * 10, 200 + idx as i32 * 10];
+            ref_stack_mv[idx][1] = [300 + idx as i32 * 10, 400 + idx as i32 * 10];
+        }
+        FindMvStackResult {
+            num_mv_found,
+            new_mv_count: 0,
+            ref_stack_mv,
+            weight_stack: [0; MAX_REF_MV_STACK_SIZE],
+            global_mvs: [[7, 9], [11, 13]],
+            new_mv_context: 0,
+            ref_mv_context: 0,
+            zero_mv_context: 0,
+            drl_ctx_stack: [0; MAX_REF_MV_STACK_SIZE],
+            close_matches: 0,
+            total_matches: 0,
+            num_nearest: 0,
+            num_new: 0,
+        }
+    }
+
+    /// §5.11.26 GLOBALMV arm — `PredMv[i] = GlobalMvs[i]` regardless of
+    /// `RefMvIdx` or stack depth, on both lists.
+    #[test]
+    fn assign_mv_pred_mv_globalmv_uses_global() {
+        let s = mk_mv_stack(0);
+        assert_eq!(assign_mv_pred_mv(&s, MODE_GLOBALMV, 0, 2).unwrap(), [7, 9]);
+        // Compound list 1 via GLOBAL_GLOBALMV.
+        assert_eq!(
+            assign_mv_pred_mv(&s, MODE_GLOBAL_GLOBALMV, 1, 0).unwrap(),
+            [11, 13]
+        );
+    }
+
+    /// §5.11.26 NEARESTMV arm — `pos = 0` always, so the top stack slot
+    /// is selected irrespective of `RefMvIdx`.
+    #[test]
+    fn assign_mv_pred_mv_nearestmv_uses_slot0() {
+        let s = mk_mv_stack(4);
+        for ref_mv_idx in 0..=3 {
+            assert_eq!(
+                assign_mv_pred_mv(&s, MODE_NEARESTMV, 0, ref_mv_idx).unwrap(),
+                [100, 200],
+                "NEARESTMV ignores RefMvIdx {ref_mv_idx}"
+            );
+        }
+    }
+
+    /// §5.11.26 NEARMV arm — `pos = RefMvIdx`, selecting the indexed slot.
+    #[test]
+    fn assign_mv_pred_mv_nearmv_uses_ref_mv_idx() {
+        let s = mk_mv_stack(4);
+        assert_eq!(
+            assign_mv_pred_mv(&s, MODE_NEARMV, 0, 1).unwrap(),
+            [110, 210]
+        );
+        assert_eq!(
+            assign_mv_pred_mv(&s, MODE_NEARMV, 0, 2).unwrap(),
+            [120, 220]
+        );
+        assert_eq!(
+            assign_mv_pred_mv(&s, MODE_NEARMV, 0, 3).unwrap(),
+            [130, 230]
+        );
+    }
+
+    /// §5.11.26 NEWMV arm — `pos = RefMvIdx` when `NumMvFound > 1`, but
+    /// collapses to `pos = 0` whenever `NumMvFound <= 1`.
+    #[test]
+    fn assign_mv_pred_mv_newmv_collapses_on_short_stack() {
+        // NumMvFound = 2 ⇒ pos = RefMvIdx honoured.
+        let deep = mk_mv_stack(2);
+        assert_eq!(
+            assign_mv_pred_mv(&deep, MODE_NEWMV, 0, 1).unwrap(),
+            [110, 210]
+        );
+        // NumMvFound = 1 ⇒ pos forced to 0 even though RefMvIdx = 0 here;
+        // and NumMvFound = 1 with RefMvIdx = 0 still reads slot 0.
+        let shallow = mk_mv_stack(1);
+        assert_eq!(
+            assign_mv_pred_mv(&shallow, MODE_NEWMV, 0, 0).unwrap(),
+            [100, 200]
+        );
+    }
+
+    /// §5.11.26 compound NEW_NEARMV — list 0 (`NEWMV`) draws from the
+    /// stack at `RefMvIdx`; list 1 (`NEARMV`) draws from list-1 slots.
+    #[test]
+    fn assign_mv_pred_mv_compound_per_list() {
+        let s = mk_mv_stack(4);
+        // list 0 = NEWMV @ RefMvIdx 1 ⇒ ref_stack_mv[1][0].
+        assert_eq!(
+            assign_mv_pred_mv(&s, MODE_NEW_NEARMV, 0, 1).unwrap(),
+            [110, 210]
+        );
+        // list 1 = NEARMV @ RefMvIdx 1 ⇒ ref_stack_mv[1][1].
+        assert_eq!(
+            assign_mv_pred_mv(&s, MODE_NEW_NEARMV, 1, 1).unwrap(),
+            [310, 410]
+        );
+    }
+
+    /// §5.11.26 reachability reject — a `pos` at or beyond `NumMvFound`
+    /// would read an undefined `RefStackMv` slot.
+    #[test]
+    fn assign_mv_pred_mv_rejects_unreachable_pos() {
+        let s = mk_mv_stack(2);
+        // NEARMV @ RefMvIdx 2 needs slot 2, but NumMvFound = 2 ⇒ reject.
+        assert!(matches!(
+            assign_mv_pred_mv(&s, MODE_NEARMV, 0, 2).unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+        // NEARESTMV on an empty stack (pos = 0 >= 0) ⇒ reject.
+        let empty = mk_mv_stack(0);
+        assert!(matches!(
+            assign_mv_pred_mv(&empty, MODE_NEARESTMV, 0, 0).unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+    }
+
+    /// §5.11.26 caller-bug rejects on the mode / ref-list guard — a
+    /// non-inter `y_mode` or a `ref_list > 1`.
+    #[test]
+    fn assign_mv_pred_mv_rejects_bad_mode_or_ref_list() {
+        let s = mk_mv_stack(4);
+        assert!(matches!(
+            assign_mv_pred_mv(&s, DC_PRED_U8, 0, 0).unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+        assert!(matches!(
+            assign_mv_pred_mv(&s, MODE_NEW_NEWMV + 1, 0, 0).unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+        assert!(matches!(
+            assign_mv_pred_mv(&s, MODE_NEARMV, 2, 0).unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+    }
+
+    /// The PredMv this helper derives is exactly the predictor
+    /// [`write_read_mv`] subtracts: a NEWMV target minus its derived
+    /// `PredMv` round-trips through a §5.11.31 reader mirror.
+    #[test]
+    fn assign_mv_pred_mv_feeds_write_read_mv() {
+        let s = mk_mv_stack(2);
+        let pred = assign_mv_pred_mv(&s, MODE_NEWMV, 0, 1).unwrap();
+        assert_eq!(pred, [110, 210]);
+        let target_mv = [pred[0] + 5, pred[1] - 9];
+
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_read_mv(
+            &mut writer,
+            &mut enc_cdfs,
+            target_mv,
+            pred,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        // §5.11.31 reader mirror reconstructs Mv = PredMv + diffMv.
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let recovered = decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, false, false, true);
+        assert_eq!(recovered, target_mv, "PredMv + diffMv reconstructs Mv");
     }
 }

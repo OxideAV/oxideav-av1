@@ -2,6 +2,63 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-11 (round 274)
+
+Round 274 lands the **§5.11.26 `assign_mv` `PredMv` derivation** — the
+encoder-side predictor-selection step that resolves which §7.10.2
+`find_mv_stack` candidate a chosen inter mode draws its motion-vector
+predictor from, feeding it to `write_read_mv`.
+
+* `encoder::block_mode_info::assign_mv_pred_mv` (§5.11.26 `assign_mv( )`
+  non-intrabc inter arm, av1-spec p.77-78). The reader's `assign_mv`
+  body, for each reference list `i`, sets `compMode = get_mode( i )`
+  then derives the predictor: `compMode == GLOBALMV` ⇒
+  `PredMv[ i ] = GlobalMvs[ i ]`; otherwise `pos = (compMode ==
+  NEARESTMV) ? 0 : RefMvIdx`, forced to `0` when `compMode == NEWMV &&
+  NumMvFound <= 1`, and `PredMv[ i ] = RefStackMv[ pos ][ i ]`. This
+  writer reproduces that selection from a `FindMvStackResult` (the
+  §7.10.2 aggregate carrying `GlobalMvs` / `RefStackMv` / `NumMvFound`)
+  plus the chosen `YMode` + running `RefMvIdx`, returning the exact
+  `PredMv[ refList ]` the `NEWMV` arm subtracts from the target MV. The
+  per-list `compMode` is resolved through the shared decode-side
+  `crate::cdf::get_mode` §get_mode mapping (no second copy of the
+  joint-mode decomposition), so encode and decode agree by
+  construction. The `RefMvIdx` here is the §5.11.23 running index after
+  the `drl_mode` loop — the same value handed to `write_drl_mode`.
+  Caller-bug rejects: a non-inter `y_mode` (outside
+  `MODE_NEARESTMV..=MODE_NEW_NEWMV`), a `ref_list > 1`, and a `pos` at
+  or beyond `NumMvFound` (an unreachable `RefMvIdx` at the derived stack
+  depth, which would read an undefined `RefStackMv` slot).
+
++8 tests: GLOBALMV-arm `GlobalMvs` selection on both lists;
+NEARESTMV-always-slot-0; NEARMV-uses-`RefMvIdx`; NEWMV
+`NumMvFound <= 1` collapse to slot 0; compound NEW_NEARMV per-list
+selection (list 0 stack vs list 1 stack); unreachable-pos and
+empty-stack rejects; bad-mode / bad-ref-list rejects; and an end-to-end
+round-trip that feeds the derived `PredMv` to `write_read_mv` and
+recovers the target MV through a §5.11.31 reader mirror.
+
+Full library test count moves to 1873 (was 1865).
+
+### Pending follow-ups for round 275+
+
+* Fold `write_ref_frames` + `write_inter_single_mode` +
+  `write_compound_mode` + `write_drl_mode` + `assign_mv_pred_mv` +
+  `write_read_mv` into `write_inter_block_mode_info_bootstrap`'s caller
+  surface. The §7.10.2 `find_mv_stack` ctx surface (decode-side, on
+  `PartitionWalker`) and the §5.11.26 `PredMv` derivation now both
+  exist; the remaining work is the bootstrap orchestration that calls
+  `find_mv_stack`, derives the inter-mode contexts, writes the mode
+  cascade, then for each `NEWMV` list derives `PredMv` via
+  `assign_mv_pred_mv` and emits `write_read_mv`.
+* The §5.11.26 intra-block-copy `PredMv` arm (`use_intrabc`, av1-spec
+  p.77 — the `RefStackMv[0]` / `RefStackMv[1]` fallback chain ending in
+  the superblock-relative default) is not yet surfaced by
+  `assign_mv_pred_mv`; it is reached only on the intra-frame
+  intra-block-copy path.
+
+---
+
 ## Status — 2026-06-10 (round 273)
 
 Round 273 lands the **§5.11.31 / §5.11.32 `read_mv` / `read_mv_component`
@@ -46,19 +103,6 @@ zero-diff / bad-index / non-integer / non-half-pel / overlarge-magnitude
 rejects.
 
 Full library test count moves to 1865 (was 1854).
-
-### Pending follow-ups for round 274+
-
-* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2) — the
-  process that produces the `NewMvContext` / `ZeroMvContext` /
-  `RefMvContext` / `compound_mode` ctx + the `NumMvFound` / `DrlCtxStack`
-  the line 9-22 writers and the `drl_mode` writer consume. This is now
-  the last gating piece before the §5.11.23 `assign_mv` caller can wire
-  `PredMv` (from `RefStackMv` / `GlobalMvs`) into the new `write_read_mv`.
-* Fold `write_ref_frames` + `write_inter_single_mode` +
-  `write_compound_mode` + `write_drl_mode` + `write_read_mv` into
-  `write_inter_block_mode_info_bootstrap`'s caller surface once the
-  §5.11.23 line 6 `find_mv_stack` ctx surface exists.
 
 ---
 
