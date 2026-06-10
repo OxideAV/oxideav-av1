@@ -4,6 +4,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r269 (2026-06-10): land the SINGLE_REFERENCE body of the
+  §5.11.25 `read_ref_frames()` arm-4 dispatcher and compose the full
+  arm-4 dispatcher. `encoder::block_mode_info::write_single_ref_frames`
+  (§5.11.25 SINGLE_REFERENCE arm, av1-spec p.77) is the exact
+  algebraic inverse of the reader's `single_ref_p1` / `single_ref_p2`
+  / `single_ref_p6` / `single_ref_p3` / `single_ref_p5` /
+  `single_ref_p4` cascade: every branch bit is derived from the
+  target `RefFrame[ 0 ]` (`p1 = ref >= BWDREF` per the §6.10.24
+  forward/backward group split, then the per-leaf equality inverses).
+  Emits three §8.2.6 `S()` symbols (two on the `ALTREF_FRAME` leaf)
+  over `TileSingleRefCdf[ ctx ][ 0..6 ]` with every §8.3.2
+  p.366-368 `count_refs` / `ref_count_ctx` selection derived
+  internally. Caller-bug rejects: slot 0 outside
+  `LAST_FRAME..=ALTREF_FRAME`, slot 1 not `NONE = -1`.
+  `encoder::block_mode_info::write_ref_frames` (§5.11.25 p.76-77)
+  composes the full four-arm dispatcher: arms 1-3 verify the target
+  pair against the r266 bootstrap's forced derivation (no symbols);
+  arm 4 derives `comp_mode` from the target pair (the §5.11.23 p.74
+  `isCompound = RefFrame[ 1 ] > INTRA_FRAME` reading), runs r267's
+  `write_comp_mode` over an internally-derived §8.3.2 `comp_mode_ctx`,
+  then the r268 COMPOUND or r269 SINGLE body. Rejects mismatched
+  arm-1/2/3 pairs, slot-1 values outside `{ NONE } ∪
+  LAST_FRAME..=ALTREF_FRAME`, and compound targets on the
+  suppressed-`comp_mode` path. +12 tests (all 7 single refs
+  round-trip through a mirror of the decoder's §5.11.25 symbol reads
+  at the origin and under two neighbour-engaged ctx octets with full
+  `TileSingleRefCdf` table equality asserted, pristine-row
+  symbol-count leaf checks, the reject family, a 9-ref sequential
+  CDF-adaptation lockstep round-trip, and dispatcher coverage:
+  arm-1/2/3 verify + mismatch rejects, all 23 arm-4 targets through
+  the composed mirror, the suppressed-`comp_mode` path, invalid
+  slot-1 rejects). Library test count 1819 → 1831.
+
 - encoder r268 (2026-06-10): land the COMPOUND_REFERENCE body of the
   §5.11.25 `read_ref_frames()` arm-4 dispatcher —
   `encoder::block_mode_info::write_compound_ref_frames` (§5.11.25

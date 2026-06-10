@@ -2,6 +2,60 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-10 (round 269)
+
+Round 269 lands the **SINGLE_REFERENCE body** of the §5.11.25
+`read_ref_frames()` arm-4 dispatcher and composes the **full arm-4
+`write_ref_frames` dispatcher** over the r266/r267/r268 pieces.
+
+* `encoder::block_mode_info::write_single_ref_frames`
+  (§5.11.25 SINGLE_REFERENCE arm, av1-spec p.77). Exact algebraic
+  inverse of the reader's `single_ref_p1` / `single_ref_p2` /
+  `single_ref_p6` / `single_ref_p3` / `single_ref_p5` /
+  `single_ref_p4` cascade: each branch bit is derived from the target
+  `RefFrame[ 0 ]` (`p1 = ref >= BWDREF`, `p2 = ref == ALTREF`,
+  `p6 = ref == ALTREF2`, `p3 = ref >= LAST3`, `p5 = ref == GOLDEN`,
+  `p4 = ref == LAST2`). Emits three §8.2.6 `S()` symbols (two on the
+  `ALTREF_FRAME` leaf) over `TileSingleRefCdf[ ctx ][ 0..6 ]`, with
+  every §8.3.2 p.366-368 `count_refs` / `ref_count_ctx` selection
+  derived internally from the `count_refs` subset of the §5.11.18
+  neighbour state. Caller-bug rejects: slot 0 outside
+  `LAST_FRAME..=ALTREF_FRAME`, slot 1 not `NONE = -1`.
+* `encoder::block_mode_info::write_ref_frames`
+  (§5.11.25 p.76-77, full four-arm dispatcher). Arms 1-3 delegate the
+  forced-pair derivation to r266's bootstrap and *verify* the
+  caller's target pair against it (no symbols); arm 4 derives
+  `comp_mode` from the target (`RefFrame[ 1 ] == NONE` vs
+  `LAST_FRAME..=ALTREF_FRAME`, the §5.11.23 `isCompound` reading),
+  emits/suppresses the selector via r267's `write_comp_mode` over an
+  internally-derived `comp_mode_ctx`, then runs the r268 COMPOUND or
+  r269 SINGLE body. Rejects mismatched arm-1/2/3 pairs, slot-1 values
+  outside `{ NONE } ∪ LAST..=ALTREF`, and compound targets on the
+  suppressed-`comp_mode` path.
+
++12 tests: all 7 single refs round-trip through a mirror of the
+decoder's symbol reads at the frame origin AND under two
+neighbour-engaged ctx octets (full `TileSingleRefCdf` table equality
+asserted), symbol-count leaf checks via pristine-row comparison
+(2-symbol ALTREF, p6-coding BWDREF arm, backward-rows-skipped LAST
+arm), the reject family, a 9-ref sequential CDF-adaptation lockstep
+round-trip, and dispatcher coverage (arm-1/2/3 verify + mismatch
+rejects, all 23 arm-4 targets through the composed `comp_mode` + body
+mirror, the suppressed-`comp_mode` path, invalid slot-1 rejects).
+
+Full library test count moves to 1831 (was 1819).
+
+### Pending follow-ups for round 270+
+
+* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2).
+* §5.11.23 lines 9-22 `compound_mode` / `new_mv` / `zero_mv` /
+  `ref_mv` / `drl_mode` S() writers.
+* Fold `write_ref_frames` into
+  `write_inter_block_mode_info_bootstrap`'s caller surface once the
+  §5.11.23 line 6+ writers exist to consume the pair.
+
+---
+
 ## Status — 2026-06-10 (round 268)
 
 Round 268 lands the **COMPOUND_REFERENCE body** of the §5.11.25
