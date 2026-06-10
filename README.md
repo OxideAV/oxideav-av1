@@ -2,6 +2,60 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-11 (round 275)
+
+Round 275 **composes the §5.11.23 `inter_block_mode_info( )` body** —
+folding the r266-r274 leaf writers into a single encode-side inverse of
+the decoder's `decode_inter_block_mode_info`, from `read_ref_frames( )`
+through `assign_mv( )` (the motion-vector cascade).
+
+* `encoder::block_mode_info::write_inter_block_mode_info` (§5.11.23
+  `inter_block_mode_info( )`, av1-spec p.73-75). Drives, in spec order:
+  1. `read_ref_frames( )` via `write_ref_frames` (§5.11.25 four-arm
+     reference cascade).
+  2. `isCompound = RefFrame[ 1 ] > INTRA_FRAME`.
+  3. the four-arm `YMode` dispatch — arm 1 (`skip_mode`) and arm 2
+     (`SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV`) emit no mode symbol; arm 3
+     (compound) emits `compound_mode` over the internally-derived
+     `compound_mode_ctx`; arm 4 (single-pred) emits the
+     `new_mv` / `zero_mv` / `ref_mv` cascade via `write_inter_single_mode`.
+  4. the `RefMvIdx` `drl_mode` loop via `write_drl_mode`.
+  5. `assign_mv( )` — for each reference list, an MV difference is
+     emitted via `write_read_mv` **only** on the NEWMV lists (with
+     `PredMv[ i ]` derived through `assign_mv_pred_mv`); the others
+     inherit their predictor with no bits.
+
+  The §7.10.2 `find_mv_stack` outputs are caller-supplied as a
+  `FindMvStackResult` (the same aggregate the decoder builds internally),
+  carrying every §8.3.2 ctx the mode / drl / mv writers consume. `YMode`
+  is cross-checked against the active arm; an inconsistent mode is a
+  caller bug. The §5.11.23 tail after `assign_mv`
+  (`read_interintra_mode` / `read_motion_mode` / `read_compound_type` /
+  `interp_filter`) has no writer yet and is the next composition step.
+
++6 tests: single-pred NEWMV (ref_frames + new_mv + drl_mode + MV diff),
+NEARMV (`has_nearmv()` drl arm, no MV bits), NEARESTMV (no drl/MV bits),
+arm-1 skip_mode (zero symbols), arm-2 seg_globalmv (zero symbols,
+`Mv = GlobalMvs`), and an arm-inconsistent-`y_mode` reject — each
+round-tripped through an inline §5.11.23 reader mirror (ref_frames →
+mode → drl → assign_mv) with per-row CDF-adaptation equality asserted.
+
+Full library test count moves to 1879 (was 1873).
+
+### Pending follow-ups for round 276+
+
+* The §5.11.23 tail after `assign_mv`: `read_motion_mode` (§5.11.27),
+  `read_interintra_mode` (§5.11.28), `read_compound_type` (§5.11.29),
+  and the `interp_filter` loop write sides — none have an encoder writer
+  yet. `write_inter_block_mode_info` stops at `assign_mv`; the next arc
+  extends it through the motion-mode / inter-intra / compound-type /
+  interpolation-filter leaves.
+* The §5.11.26 intra-block-copy `PredMv` arm is still not surfaced by
+  `assign_mv_pred_mv` (reached only on the intra-frame intra-block-copy
+  path).
+
+---
+
 ## Status — 2026-06-11 (round 274)
 
 Round 274 lands the **§5.11.26 `assign_mv` `PredMv` derivation** — the

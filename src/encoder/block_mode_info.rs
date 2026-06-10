@@ -49,10 +49,10 @@
 
 use crate::cdf::{
     block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_mode_ctx,
-    comp_ref_type_ctx, count_refs, is_directional, is_samedir_ref_pair, mi_height_log2,
-    mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx,
-    FindMvStackResult, PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8,
-    BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE,
+    comp_ref_type_ctx, compound_mode_ctx, count_refs, is_directional, is_samedir_ref_pair,
+    mi_height_log2, mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx,
+    ref_count_ctx, FindMvStackResult, PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64,
+    BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE,
     COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL,
     DRL_MODE_CONTEXTS, FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS,
     IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV,
@@ -5263,6 +5263,228 @@ pub fn assign_mv_pred_mv(
         return Err(Error::PartitionWalkOutOfRange);
     }
     Ok(mv_stack.ref_stack_mv[pos as usize][ref_list as usize])
+}
+
+/// `inter_block_mode_info( )` composition writer per §5.11.23 (av1-spec
+/// p.73-75) — r275. Folds the r266-r274 leaf writers
+/// ([`write_ref_frames`], [`write_compound_mode`] /
+/// [`write_inter_single_mode`], [`write_drl_mode`], [`assign_mv_pred_mv`]
+/// and [`write_read_mv`]) into the single §5.11.23 body the
+/// `inter_frame_mode_info` chain reaches on an inter block. It is the
+/// exact encode-side inverse of the decode-side
+/// [`crate::cdf::PartitionWalker::decode_inter_block_mode_info`] from
+/// `read_ref_frames( )` (line 4618) through `assign_mv( )` (line 4675),
+/// the motion-vector cascade.
+///
+/// ## Scope
+///
+/// Covers the §5.11.23 body up to and including `assign_mv( )`:
+///
+/// 1. `read_ref_frames( )` (§5.11.25) via [`write_ref_frames`].
+/// 2. `isCompound = RefFrame[ 1 ] > INTRA_FRAME`.
+/// 3. `find_mv_stack( isCompound )` (§7.10.2) — **not** re-run here; the
+///    encoder hands the already-computed [`FindMvStackResult`] (the same
+///    aggregate the decoder builds internally), carrying every §8.3.2
+///    ctx the mode / drl / mv writers consume (`NewMvContext`,
+///    `ZeroMvContext`, `RefMvContext`, `NumMvFound`, `DrlCtxStack`,
+///    `RefStackMv`, `GlobalMvs`).
+/// 4. The four-arm `YMode` dispatch: arm 1 (`skip_mode`) and arm 2
+///    (`SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV`) emit no mode symbol; arm 3
+///    (`isCompound`) emits `compound_mode` via [`write_compound_mode`]
+///    over the internally-derived [`crate::cdf::compound_mode_ctx`]; arm
+///    4 (single-pred) emits the `new_mv` / `zero_mv` / `ref_mv` cascade
+///    via [`write_inter_single_mode`] over the stack's three contexts.
+/// 5. The `RefMvIdx` `drl_mode` loop via [`write_drl_mode`].
+/// 6. `assign_mv( isCompound )`: for each reference list
+///    `i in 0..1 + isCompound`, resolve `compMode = get_mode( YMode, i )`
+///    and, **only when `compMode == NEWMV`**, derive `PredMv[ i ]` via
+///    [`assign_mv_pred_mv`] and emit the MV difference via
+///    [`write_read_mv`]. Non-NEWMV lists set `Mv[ i ] = PredMv[ i ]`
+///    with no bits (§5.11.31 line `else Mv[ i ] = PredMv[ i ]`).
+///
+/// The §5.11.23 tail after `assign_mv` (`read_interintra_mode`,
+/// `read_motion_mode`, `read_compound_type`, the `interp_filter` loop)
+/// has no writer yet and is a follow-up arc.
+///
+/// ## `YMode` consistency
+///
+/// `YMode` is caller-chosen but cross-checked against the active arm:
+/// arm 1 forces `NEAREST_NEARESTMV`, arm 2 forces `GLOBALMV`, arm 3
+/// admits only the eight compound modes
+/// (`NEAREST_NEARESTMV..=NEW_NEWMV`), arm 4 only the four single-pred
+/// modes (`NEWMV` / `GLOBALMV` / `NEARESTMV` / `NEARMV`). A `YMode`
+/// inconsistent with the arm is a caller bug — the reader could never
+/// produce it on that arm.
+///
+/// ## Inputs
+///
+/// * `ref_frame` — target `( RefFrame[ 0 ], RefFrame[ 1 ] )`; drives
+///   `isCompound` and the §5.11.25 reference cascade.
+/// * `y_mode` — the §5.11.23 `YMode` chosen by the encoder.
+/// * `mv` — `Mv[ list ][ comp ]` for each active list; only the NEWMV
+///   lists' values are consulted (the others are derived predictors).
+/// * `ref_mv_idx` — the `RefMvIdx` the encoder selected, threaded to
+///   both [`write_drl_mode`] and [`assign_mv_pred_mv`].
+/// * `mv_stack` — the §7.10.2 [`FindMvStackResult`].
+/// * `mi_size` — `MiSize` (§9.3 table index for the `comp_mode`
+///   precondition).
+/// * the arm-selection sextet + `reference_select` of
+///   [`write_ref_frames`] / [`write_inter_block_mode_info_bootstrap`].
+/// * the §5.11.18 neighbour-state octet from which [`write_ref_frames`]
+///   derives every §8.3.2 reference ctx internally.
+/// * `force_integer_mv` / `allow_high_precision_mv` — frame-level MV
+///   precision flags forwarded to [`write_read_mv`].
+///
+/// ## Out-of-range / mismatch cases (`Err(PartitionWalkOutOfRange)`)
+///
+/// All of the composed writers' rejects, plus a `y_mode` inconsistent
+/// with the active arm.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless like every piece it composes. The caller stamps the
+/// resulting `RefFrame` / `YMode` / `Mv` onto the block footprint
+/// through its own [`crate::cdf::PartitionWalker`] so subsequent blocks'
+/// §8.3.2 neighbour walks observe them.
+#[allow(clippy::too_many_arguments)]
+pub fn write_inter_block_mode_info(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    ref_frame: [i32; 2],
+    y_mode: u8,
+    mv: [[i32; 2]; 2],
+    ref_mv_idx: u32,
+    mv_stack: &FindMvStackResult,
+    mi_size: usize,
+    skip_mode: u8,
+    skip_mode_frame: [i8; 2],
+    seg_ref_frame_active: bool,
+    seg_ref_frame_data: i8,
+    seg_skip_active: bool,
+    seg_globalmv_active: bool,
+    reference_select: bool,
+    avail_u: bool,
+    avail_l: bool,
+    above_single: bool,
+    left_single: bool,
+    above_intra: bool,
+    left_intra: bool,
+    above_ref_frame: [i32; 2],
+    left_ref_frame: [i32; 2],
+    force_integer_mv: bool,
+    allow_high_precision_mv: bool,
+) -> Result<(), Error> {
+    // §3 binary alphabet bound on `skip_mode` (mirrors the bootstrap).
+    if skip_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.23 line 4618: `read_ref_frames( )`. Drives the §5.11.25
+    // four-arm reference cascade (zero to six S() depending on arm /
+    // leaf) and verifies the target pair is reachable.
+    write_ref_frames(
+        writer,
+        cdfs,
+        ref_frame,
+        mi_size,
+        skip_mode,
+        skip_mode_frame,
+        seg_ref_frame_active,
+        seg_ref_frame_data,
+        seg_skip_active,
+        seg_globalmv_active,
+        reference_select,
+        avail_u,
+        avail_l,
+        above_single,
+        left_single,
+        above_intra,
+        left_intra,
+        above_ref_frame,
+        left_ref_frame,
+    )?;
+
+    // §5.11.23 line 4619: `isCompound = RefFrame[ 1 ] > INTRA_FRAME`.
+    // INTRA_FRAME = 0; NONE = -1. Any slot-1 in LAST_FRAME..=ALTREF_FRAME
+    // (1..=7) makes the block compound.
+    let is_compound = ref_frame[1] > 0;
+
+    // §5.11.23 lines 4621-4642: the four-arm `YMode` dispatch. The arm
+    // is selected exactly as the reader selects it (spec order: skip_mode
+    // first, then segmentation, then compound, then single-pred). The
+    // caller-supplied `y_mode` is cross-checked against the active arm —
+    // the reader could never emit a different mode on that arm.
+    if skip_mode != 0 {
+        // Arm 1: no S(); `YMode` is forced to NEAREST_NEARESTMV.
+        if y_mode != MODE_NEAREST_NEARESTMV {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    } else if seg_skip_active || seg_globalmv_active {
+        // Arm 2: no S(); `YMode` is forced to GLOBALMV.
+        if y_mode != MODE_GLOBALMV {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    } else if is_compound {
+        // Arm 3: `compound_mode` S() over `TileCompoundModeCdf[ ctx ]`,
+        // then `YMode = NEAREST_NEARESTMV + compound_mode`. The §8.3.2
+        // ctx is derived internally from the stack's RefMvContext /
+        // NewMvContext (the same `compound_mode_ctx` mapping the reader
+        // applies), so encode and decode agree by construction.
+        let cm_ctx = compound_mode_ctx(
+            mv_stack.ref_mv_context as usize,
+            mv_stack.new_mv_context as usize,
+        );
+        write_compound_mode(writer, cdfs, y_mode, cm_ctx)?;
+    } else {
+        // Arm 4: single-pred `new_mv` / `zero_mv` / `ref_mv` cascade
+        // over the stack's three contexts (§7.10.2.14).
+        write_inter_single_mode(
+            writer,
+            cdfs,
+            y_mode,
+            mv_stack.new_mv_context as usize,
+            mv_stack.zero_mv_context as usize,
+            mv_stack.ref_mv_context as usize,
+        )?;
+    }
+
+    // §5.11.23 lines 4643-4674: `RefMvIdx` `drl_mode` loop. A silent
+    // no-op for every mode outside the NEWMV / NEW_NEWMV and
+    // `has_nearmv( )` arms (matching the reader's `RefMvIdx = 0`).
+    write_drl_mode(
+        writer,
+        cdfs,
+        y_mode,
+        ref_mv_idx,
+        mv_stack.num_mv_found,
+        &mv_stack.drl_ctx_stack,
+    )?;
+
+    // §5.11.23 line 4675: `assign_mv( isCompound )` per §5.11.31. The
+    // inter path always has `use_intrabc == 0`, so for each reference
+    // list the §5.11.31 body resolves `compMode = get_mode( i )` and
+    // reads an MV difference only on the NEWMV lists; the others inherit
+    // `PredMv[ i ]` with no bits emitted.
+    let list_count: u8 = if is_compound { 2 } else { 1 };
+    for i in 0..list_count {
+        if crate::cdf::get_mode(y_mode, i as usize) == MODE_NEWMV {
+            // §5.11.31: `if ( compMode == NEWMV ) read_mv( i )`. Derive
+            // `PredMv[ i ]` from the stack and emit the difference.
+            let pred_mv = assign_mv_pred_mv(mv_stack, y_mode, i, ref_mv_idx)?;
+            write_read_mv(
+                writer,
+                cdfs,
+                mv[i as usize],
+                pred_mv,
+                /* use_intrabc = */ false,
+                force_integer_mv,
+                allow_high_precision_mv,
+            )?;
+        }
+        // Non-NEWMV lists: `Mv[ i ] = PredMv[ i ]`, no symbols.
+    }
+
+    Ok(())
 }
 
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
@@ -14669,5 +14891,571 @@ mod tests {
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let recovered = decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, false, false, true);
         assert_eq!(recovered, target_mv, "PredMv + diffMv reconstructs Mv");
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.23 inter_block_mode_info composition — write_inter_block_mode_info
+    // round-trips through a full §5.11.23 reader mirror (ref_frames →
+    // mode → drl_mode → assign_mv), reproduced inline. The mirror is
+    // exercised on the no-neighbour octet (avail_u = avail_l = false),
+    // so every §8.3.2 `count_refs` is 0 and every `ref_count_ctx(0,0)`
+    // is 1 (Equal), making the SINGLE_REFERENCE ref-frame reads
+    // deterministic.
+    // -----------------------------------------------------------------
+
+    /// Full §5.11.23 reader mirror, restricted to the SINGLE_REFERENCE /
+    /// compound-via-target subset the round-trip tests drive. Reads
+    /// `read_ref_frames` (single arm), the §5.11.23 mode dispatch, the
+    /// `drl_mode` loop, and `assign_mv` from a single live decoder, on
+    /// the all-empty neighbour octet. Returns `(ref_frame, y_mode,
+    /// ref_mv_idx, mv)`.
+    #[allow(clippy::too_many_arguments)]
+    fn mirror_inter_block_mode_info(
+        bytes: &[u8],
+        cdfs: &mut TileCdfContext,
+        mv_stack: &FindMvStackResult,
+        skip_mode: u8,
+        skip_mode_frame: [i32; 2],
+        seg_skip_active: bool,
+        seg_globalmv_active: bool,
+        force_integer_mv: bool,
+        allow_high_precision_mv: bool,
+    ) -> ([i32; 2], u8, u32, [[i32; 2]; 2]) {
+        let pad = if bytes.is_empty() {
+            vec![0u8]
+        } else {
+            bytes.to_vec()
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), false).unwrap();
+
+        // §5.11.25 read_ref_frames (no-bit arms first, then the
+        // SINGLE_REFERENCE arm-4 reader on the empty neighbour octet).
+        let ref_frame: [i32; 2] = if skip_mode != 0 {
+            [skip_mode_frame[0], skip_mode_frame[1]]
+        } else if seg_skip_active || seg_globalmv_active {
+            [1, -1]
+        } else {
+            // Arm 4, SINGLE_REFERENCE (no reference_select ⇒ comp_mode =
+            // SINGLE). All count_refs are 0 ⇒ ref_count_ctx = 1 (Equal).
+            let p1_ctx = ref_count_ctx(0, 0);
+            let single_ref_p1 = dec.read_symbol(cdfs.single_ref_cdf(p1_ctx, 0)).unwrap() as u8;
+            let r0: i32 = if single_ref_p1 != 0 {
+                let single_ref_p2 = dec
+                    .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 1))
+                    .unwrap() as u8;
+                if single_ref_p2 == 0 {
+                    let single_ref_p6 = dec
+                        .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 5))
+                        .unwrap() as u8;
+                    if single_ref_p6 != 0 {
+                        6
+                    } else {
+                        5
+                    }
+                } else {
+                    7
+                }
+            } else {
+                let single_ref_p3 = dec
+                    .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 2))
+                    .unwrap() as u8;
+                if single_ref_p3 != 0 {
+                    let single_ref_p5 = dec
+                        .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 4))
+                        .unwrap() as u8;
+                    if single_ref_p5 != 0 {
+                        4
+                    } else {
+                        3
+                    }
+                } else {
+                    let single_ref_p4 = dec
+                        .read_symbol(cdfs.single_ref_cdf(ref_count_ctx(0, 0), 3))
+                        .unwrap() as u8;
+                    if single_ref_p4 != 0 {
+                        2
+                    } else {
+                        1
+                    }
+                }
+            };
+            [r0, -1]
+        };
+
+        let is_compound = ref_frame[1] > 0;
+
+        // §5.11.23 mode dispatch.
+        let y_mode: u8 = if skip_mode != 0 {
+            MODE_NEAREST_NEARESTMV
+        } else if seg_skip_active || seg_globalmv_active {
+            MODE_GLOBALMV
+        } else if is_compound {
+            let cm_ctx = compound_mode_ctx(
+                mv_stack.ref_mv_context as usize,
+                mv_stack.new_mv_context as usize,
+            );
+            let cm = dec.read_symbol(cdfs.compound_mode_cdf(cm_ctx)).unwrap() as u8;
+            MODE_NEAREST_NEARESTMV + cm
+        } else {
+            let new_mv = dec
+                .read_symbol(cdfs.new_mv_cdf(mv_stack.new_mv_context as usize))
+                .unwrap();
+            if new_mv == 0 {
+                MODE_NEWMV
+            } else {
+                let zero_mv = dec
+                    .read_symbol(cdfs.zero_mv_cdf(mv_stack.zero_mv_context as usize))
+                    .unwrap();
+                if zero_mv == 0 {
+                    MODE_GLOBALMV
+                } else {
+                    let ref_mv = dec
+                        .read_symbol(cdfs.ref_mv_cdf(mv_stack.ref_mv_context as usize))
+                        .unwrap();
+                    if ref_mv == 0 {
+                        MODE_NEARESTMV
+                    } else {
+                        MODE_NEARMV
+                    }
+                }
+            }
+        };
+
+        // §5.11.23 drl_mode loop.
+        let mut ref_mv_idx: u32 = 0;
+        if y_mode == MODE_NEWMV || y_mode == MODE_NEW_NEWMV {
+            for idx in 0u32..2 {
+                if mv_stack.num_mv_found > idx + 1 {
+                    let drl_ctx = mv_stack.drl_ctx_stack[idx as usize] as usize;
+                    let drl = dec.read_symbol(cdfs.drl_mode_cdf(drl_ctx)).unwrap();
+                    if drl == 0 {
+                        ref_mv_idx = idx;
+                        break;
+                    }
+                    ref_mv_idx = idx + 1;
+                }
+            }
+        } else if has_nearmv(y_mode) {
+            ref_mv_idx = 1;
+            for idx in 1u32..3 {
+                if mv_stack.num_mv_found > idx + 1 {
+                    let drl_ctx = mv_stack.drl_ctx_stack[idx as usize] as usize;
+                    let drl = dec.read_symbol(cdfs.drl_mode_cdf(drl_ctx)).unwrap();
+                    if drl == 0 {
+                        ref_mv_idx = idx;
+                        break;
+                    }
+                    ref_mv_idx = idx + 1;
+                }
+            }
+        }
+
+        // §5.11.31 assign_mv (use_intrabc = 0): NEWMV lists read a diff.
+        let list_count: u8 = if is_compound { 2 } else { 1 };
+        let mut mv: [[i32; 2]; 2] = [[0, 0], [0, 0]];
+        for i in 0..list_count {
+            let pred = assign_mv_pred_mv(mv_stack, y_mode, i, ref_mv_idx).unwrap();
+            if crate::cdf::get_mode(y_mode, i as usize) == MODE_NEWMV {
+                let mv_ctx = 0usize;
+                let mv_joint = dec.read_symbol(cdfs.mv_joint_cdf(mv_ctx)).unwrap() as u8;
+                let mut diff = [0i32; 2];
+                if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
+                    diff[0] = decode_read_mv_component_mirror(
+                        &mut dec,
+                        cdfs,
+                        mv_ctx,
+                        0,
+                        force_integer_mv,
+                        allow_high_precision_mv,
+                    );
+                }
+                if mv_joint == MV_JOINT_HNZVZ || mv_joint == MV_JOINT_HNZVNZ {
+                    diff[1] = decode_read_mv_component_mirror(
+                        &mut dec,
+                        cdfs,
+                        mv_ctx,
+                        1,
+                        force_integer_mv,
+                        allow_high_precision_mv,
+                    );
+                }
+                mv[i as usize] = [pred[0] + diff[0], pred[1] + diff[1]];
+            } else {
+                mv[i as usize] = pred;
+            }
+        }
+
+        (ref_frame, y_mode, ref_mv_idx, mv)
+    }
+
+    /// Build the no-neighbour arm-selection / octet inputs shared by the
+    /// round-trip tests: empty neighbour octet, no segmentation, no
+    /// reference_select (forces the §5.11.25 SINGLE_REFERENCE arm).
+    #[allow(clippy::type_complexity)]
+    fn empty_neighbour_inputs() -> (bool, bool, bool, bool, bool, bool, [i32; 2], [i32; 2]) {
+        (
+            false,
+            false, // avail_u, avail_l
+            true,
+            true, // above_single, left_single
+            false,
+            false, // above_intra, left_intra
+            [-1, -1],
+            [-1, -1], // above_ref_frame, left_ref_frame
+        )
+    }
+
+    /// §5.11.23 single-pred NEWMV round-trip: ref_frames (single arm) +
+    /// new_mv S() + drl_mode loop + assign_mv NEWMV read all chain
+    /// through the §5.11.23 reader mirror, recovering RefFrame / YMode /
+    /// RefMvIdx / Mv exactly.
+    #[test]
+    fn write_inter_block_mode_info_single_newmv_round_trip() {
+        let stack = mk_mv_stack(3); // NumMvFound = 3 ⇒ drl loop codes bits.
+        let pred = assign_mv_pred_mv(&stack, MODE_NEWMV, 0, 1).unwrap();
+        let target_mv = [pred[0] + 7, pred[1] - 5];
+        let mv = [target_mv, [0, 0]];
+        let ref_frame = [4i32, -1]; // GOLDEN_FRAME, single.
+        let (au, al, asg, lsg, ai, li, arf, lrf) = empty_neighbour_inputs();
+
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_inter_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            ref_frame,
+            MODE_NEWMV,
+            mv,
+            /* ref_mv_idx = */ 1,
+            &stack,
+            BLOCK_8X8,
+            /* skip_mode = */ 0,
+            [0, 0],
+            false,
+            0,
+            false,
+            false,
+            /* reference_select = */ false,
+            au,
+            al,
+            asg,
+            lsg,
+            ai,
+            li,
+            arf,
+            lrf,
+            /* force_integer_mv = */ false,
+            /* allow_high_precision_mv = */ true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let (rf, ym, rmi, dmv) = mirror_inter_block_mode_info(
+            &bytes,
+            &mut dec_cdfs,
+            &stack,
+            0,
+            [0, 0],
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(rf, ref_frame, "RefFrame round-trips");
+        assert_eq!(ym, MODE_NEWMV, "YMode round-trips");
+        assert_eq!(rmi, 1, "RefMvIdx round-trips");
+        assert_eq!(dmv[0], target_mv, "list-0 NEWMV Mv round-trips");
+        // CDFs adapted in lockstep on the consulted rows.
+        assert_eq!(enc_cdfs.new_mv_cdf(0), dec_cdfs.new_mv_cdf(0));
+        assert_eq!(enc_cdfs.mv_joint_cdf(0), dec_cdfs.mv_joint_cdf(0));
+    }
+
+    /// §5.11.23 single-pred NEARMV round-trip: the `has_nearmv()` drl arm
+    /// codes a `drl_mode` bit, and assign_mv emits NO MV bits (NEARMV is
+    /// not NEWMV ⇒ Mv = PredMv).
+    #[test]
+    fn write_inter_block_mode_info_single_nearmv_round_trip() {
+        let stack = mk_mv_stack(4); // deep enough for the has_nearmv loop.
+                                    // NEARMV @ RefMvIdx 2 ⇒ PredMv = ref_stack_mv[2][0].
+        let pred = assign_mv_pred_mv(&stack, MODE_NEARMV, 0, 2).unwrap();
+        let mv = [pred, [0, 0]]; // Mv inherits PredMv (no NEWMV read).
+        let ref_frame = [2i32, -1]; // LAST2_FRAME, single.
+        let (au, al, asg, lsg, ai, li, arf, lrf) = empty_neighbour_inputs();
+
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_inter_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            ref_frame,
+            MODE_NEARMV,
+            mv,
+            /* ref_mv_idx = */ 2,
+            &stack,
+            BLOCK_8X8,
+            0,
+            [0, 0],
+            false,
+            0,
+            false,
+            false,
+            false,
+            au,
+            al,
+            asg,
+            lsg,
+            ai,
+            li,
+            arf,
+            lrf,
+            false,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let (rf, ym, rmi, dmv) = mirror_inter_block_mode_info(
+            &bytes,
+            &mut dec_cdfs,
+            &stack,
+            0,
+            [0, 0],
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(rf, ref_frame);
+        assert_eq!(ym, MODE_NEARMV);
+        assert_eq!(rmi, 2, "RefMvIdx from has_nearmv drl arm");
+        assert_eq!(dmv[0], pred, "NEARMV Mv = PredMv (no diff bits)");
+    }
+
+    /// §5.11.23 single-pred NEARESTMV round-trip: no drl bits (NEARESTMV
+    /// is neither a NEWMV arm nor has_nearmv), no MV bits.
+    #[test]
+    fn write_inter_block_mode_info_single_nearestmv_round_trip() {
+        let stack = mk_mv_stack(4);
+        let pred = assign_mv_pred_mv(&stack, MODE_NEARESTMV, 0, 0).unwrap();
+        let mv = [pred, [0, 0]];
+        let ref_frame = [1i32, -1]; // LAST_FRAME.
+        let (au, al, asg, lsg, ai, li, arf, lrf) = empty_neighbour_inputs();
+
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_inter_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            ref_frame,
+            MODE_NEARESTMV,
+            mv,
+            0,
+            &stack,
+            BLOCK_8X8,
+            0,
+            [0, 0],
+            false,
+            0,
+            false,
+            false,
+            false,
+            au,
+            al,
+            asg,
+            lsg,
+            ai,
+            li,
+            arf,
+            lrf,
+            false,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let (rf, ym, rmi, dmv) = mirror_inter_block_mode_info(
+            &bytes,
+            &mut dec_cdfs,
+            &stack,
+            0,
+            [0, 0],
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(rf, ref_frame);
+        assert_eq!(ym, MODE_NEARESTMV);
+        assert_eq!(rmi, 0);
+        assert_eq!(dmv[0], pred);
+    }
+
+    /// §5.11.23 arm-1 skip_mode round-trip: ref_frames forced to
+    /// SkipModeFrame (no bits), YMode = NEAREST_NEARESTMV (no mode bits),
+    /// both lists NEARESTMV ⇒ no MV bits. The whole composition emits
+    /// zero symbols.
+    #[test]
+    fn write_inter_block_mode_info_skip_mode_emits_no_bits() {
+        let stack = mk_mv_stack(2);
+        // skip_mode forces a compound NEAREST_NEARESTMV pair.
+        let skip_frame = [1i8, 5i8]; // LAST + BWDREF.
+        let pred0 = assign_mv_pred_mv(&stack, MODE_NEAREST_NEARESTMV, 0, 0).unwrap();
+        let pred1 = assign_mv_pred_mv(&stack, MODE_NEAREST_NEARESTMV, 1, 0).unwrap();
+        let mv = [pred0, pred1];
+        let ref_frame = [1i32, 5];
+        let (au, al, asg, lsg, ai, li, arf, lrf) = empty_neighbour_inputs();
+
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_inter_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            ref_frame,
+            MODE_NEAREST_NEARESTMV,
+            mv,
+            0,
+            &stack,
+            BLOCK_8X8,
+            /* skip_mode = */ 1,
+            skip_frame,
+            false,
+            0,
+            false,
+            false,
+            false,
+            au,
+            al,
+            asg,
+            lsg,
+            ai,
+            li,
+            arf,
+            lrf,
+            false,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        // No symbols emitted ⇒ an empty (or trivially-flushed) payload.
+        // The decode mirror recovers the forced pair / mode with no reads.
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let (rf, ym, rmi, dmv) = mirror_inter_block_mode_info(
+            &bytes,
+            &mut dec_cdfs,
+            &stack,
+            1,
+            [1, 5],
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(rf, ref_frame);
+        assert_eq!(ym, MODE_NEAREST_NEARESTMV);
+        assert_eq!(rmi, 0);
+        assert_eq!(dmv[0], pred0);
+        assert_eq!(dmv[1], pred1);
+    }
+
+    /// §5.11.23 arm-2 seg_globalmv round-trip: ref_frames = (LAST, NONE)
+    /// (no bits), YMode = GLOBALMV (no mode bits), single GLOBALMV list
+    /// ⇒ Mv = GlobalMvs[0], no MV bits.
+    #[test]
+    fn write_inter_block_mode_info_seg_globalmv_emits_no_bits() {
+        let stack = mk_mv_stack(2);
+        let mv = [stack.global_mvs[0], [0, 0]];
+        let ref_frame = [1i32, -1];
+        let (au, al, asg, lsg, ai, li, arf, lrf) = empty_neighbour_inputs();
+
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_inter_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            ref_frame,
+            MODE_GLOBALMV,
+            mv,
+            0,
+            &stack,
+            BLOCK_8X8,
+            0,
+            [0, 0],
+            false,
+            0,
+            /* seg_skip_active = */ false,
+            /* seg_globalmv_active = */ true,
+            false,
+            au,
+            al,
+            asg,
+            lsg,
+            ai,
+            li,
+            arf,
+            lrf,
+            false,
+            true,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let (rf, ym, _rmi, dmv) = mirror_inter_block_mode_info(
+            &bytes,
+            &mut dec_cdfs,
+            &stack,
+            0,
+            [0, 0],
+            false,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(rf, ref_frame);
+        assert_eq!(ym, MODE_GLOBALMV);
+        assert_eq!(dmv[0], stack.global_mvs[0]);
+    }
+
+    /// §5.11.23 arm-consistency reject: a `y_mode` that doesn't match the
+    /// active arm (here arm 2 forces GLOBALMV, but NEWMV is handed) is a
+    /// caller bug.
+    #[test]
+    fn write_inter_block_mode_info_rejects_arm_inconsistent_y_mode() {
+        let stack = mk_mv_stack(2);
+        let (au, al, asg, lsg, ai, li, arf, lrf) = empty_neighbour_inputs();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_inter_block_mode_info(
+            &mut writer,
+            &mut enc_cdfs,
+            [1, -1],
+            MODE_NEWMV, // inconsistent with the seg_globalmv arm.
+            [[0, 0], [0, 0]],
+            0,
+            &stack,
+            BLOCK_8X8,
+            0,
+            [0, 0],
+            false,
+            0,
+            false,
+            true,
+            false,
+            au,
+            al,
+            asg,
+            lsg,
+            ai,
+            li,
+            arf,
+            lrf,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

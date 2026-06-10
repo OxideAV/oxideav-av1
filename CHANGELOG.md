@@ -4,6 +4,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r275 (2026-06-11): compose the §5.11.23 `inter_block_mode_info( )`
+  body — `encoder::block_mode_info::write_inter_block_mode_info`
+  (av1-spec p.73-75). Folds the r266-r274 leaf writers
+  (`write_ref_frames` + `write_compound_mode` / `write_inter_single_mode`
+  + `write_drl_mode` + `assign_mv_pred_mv` + `write_read_mv`) into the
+  single §5.11.23 body, the exact encode-side inverse of
+  `decode_inter_block_mode_info` from `read_ref_frames( )` (line 4618)
+  through `assign_mv( )` (line 4675). Drives, in spec order:
+  `read_ref_frames`, `isCompound = RefFrame[ 1 ] > INTRA_FRAME`, the
+  four-arm `YMode` dispatch (arm 1 `skip_mode` / arm 2 segmentation emit
+  no mode symbol; arm 3 compound emits `compound_mode` over the
+  internally-derived `compound_mode_ctx`; arm 4 single-pred emits the
+  `new_mv` / `zero_mv` / `ref_mv` cascade), the `RefMvIdx` `drl_mode`
+  loop, and `assign_mv` — for each reference list, an MV difference is
+  emitted only on the NEWMV lists (`PredMv[ i ]` derived via
+  `assign_mv_pred_mv`), the others inheriting their predictor with no
+  bits. The §7.10.2 `find_mv_stack` outputs are caller-supplied as a
+  `FindMvStackResult` (the same aggregate the decoder builds internally),
+  carrying every §8.3.2 ctx the mode / drl / mv writers consume. `YMode`
+  is cross-checked against the active arm; an inconsistent mode is a
+  caller bug. The §5.11.23 tail after `assign_mv` (`read_interintra_mode`
+  / `read_motion_mode` / `read_compound_type` / `interp_filter`) has no
+  writer yet and is a follow-up. +6 tests: single-pred NEWMV (ref_frames
+  + new_mv + drl_mode + MV diff), NEARMV (has_nearmv drl arm, no MV
+  bits), NEARESTMV (no drl/MV bits), arm-1 skip_mode (zero symbols),
+  arm-2 seg_globalmv (zero symbols, Mv = GlobalMvs), and an
+  arm-inconsistent-`y_mode` reject — each round-tripped through an inline
+  §5.11.23 reader mirror (ref_frames → mode → drl → assign_mv) with
+  per-row CDF-adaptation equality asserted. Library test count
+  1873 → 1879.
 - encoder r274 (2026-06-11): land the §5.11.26 `assign_mv` `PredMv`
   derivation — `encoder::block_mode_info::assign_mv_pred_mv`
   (av1-spec p.77-78). This is the encoder-side predictor-selection step
