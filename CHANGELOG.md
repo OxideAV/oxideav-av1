@@ -4,6 +4,26 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r267 (2026-06-10): land the first `S()` symbol of the
+  §5.11.25 `read_ref_frames()` arm-4 dispatcher —
+  `encoder::block_mode_info::write_comp_mode` (§5.11.25 arm 4
+  lines 1-5, av1-spec p.76). Folds the
+  `bw4 = Num_4x4_Blocks_Wide[ MiSize ]` /
+  `bh4 = Num_4x4_Blocks_High[ MiSize ]` derivations (§9.3 tables)
+  from the `MiSize` index and mirrors the spec precondition
+  `if ( reference_select && Min( bw4, bh4 ) >= 2 ) comp_mode S()
+  else comp_mode = SINGLE_REFERENCE`. The explicit path emits one
+  §8.2.6 `S()` over `TileCompModeCdf[ ctx ]` (ctx via the existing
+  public `cdf::comp_mode_ctx`); the suppressed path emits no bit and
+  forces `SINGLE_REFERENCE`. Caller-bug rejects: `comp_mode > 1`,
+  `mi_size >= BLOCK_SIZES`, `ctx >= COMP_INTER_CONTEXTS` on the
+  explicit path, and a non-`SINGLE_REFERENCE` value on the
+  suppressed path. +10 tests (both-value round-trips through the
+  decoder's `comp_mode` symbol read, full `0..COMP_INTER_CONTEXTS`
+  ctx coverage, the two suppressed-bit paths, and the caller-bug
+  rejects). The COMPOUND/SINGLE reference-frame bodies remain a
+  follow-up arc. Library test count 1799 → 1809.
+
 - encoder r266 (2026-06-09): bootstrap the §5.11.23
   `inter_block_mode_info()` writer with the three no-bit arms of the
   §5.11.25 `read_ref_frames()` dispatcher

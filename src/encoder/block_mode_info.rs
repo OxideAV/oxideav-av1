@@ -51,11 +51,12 @@ use crate::cdf::{
     block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, is_directional,
     mi_height_log2, mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx,
     PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, DELTA_LF_SMALL, DELTA_Q_SMALL,
-    FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
-    MAX_ANGLE_DELTA, MAX_SEGMENTS, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS,
-    SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS,
-    UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL,
+    DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS,
+    IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
+    PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, SEGMENT_ID_CONTEXTS,
+    SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED,
+    UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -3729,6 +3730,108 @@ pub fn write_inter_block_mode_info_bootstrap(
     Err(Error::PartitionWalkOutOfRange)
 }
 
+/// `comp_mode` writer per §5.11.25 `read_ref_frames( )` arm 4 (the
+/// fall-through `else`) — av1-spec p.76. This is the **first** `S()`
+/// of the four-arm reference-selection dispatcher that
+/// [`write_inter_block_mode_info_bootstrap`] defers. It encodes
+/// whether the block uses single- or compound-reference prediction.
+///
+/// ## Spec body (§5.11.25 arm 4, lines 1-5 — av1-spec p.76)
+///
+/// ```text
+///   } else {                                            // arm 4
+///       bw4 = Num_4x4_Blocks_Wide[ MiSize ]
+///       bh4 = Num_4x4_Blocks_High[ MiSize ]
+///       if ( reference_select && ( Min( bw4, bh4 ) >= 2 ) )
+///            comp_mode                                              S()
+///       else
+///            comp_mode = SINGLE_REFERENCE
+///       ...                                             // (COMPOUND/SINGLE bodies — follow-up)
+///   }
+/// ```
+///
+/// The `bw4 = Num_4x4_Blocks_Wide[ MiSize ]` / `bh4 =
+/// Num_4x4_Blocks_High[ MiSize ]` derivations are folded in from the
+/// public [`crate::cdf::NUM_4X4_BLOCKS_WIDE`] /
+/// [`crate::cdf::NUM_4X4_BLOCKS_HIGH`] tables (§9.3 p.400) so the
+/// caller only threads the `MiSize` index. The COMPOUND/SINGLE
+/// reference-frame bodies (`comp_ref_type` / `single_ref_p?` /
+/// `comp_bwdref_p?` / `uni_comp_ref` reads) are a deferred follow-up
+/// arc — this writer only emits the `comp_mode` selector itself.
+///
+/// ## Inputs
+///
+/// * `comp_mode` — the §3 `CompMode` value the encoder chose for this
+///   block: `SINGLE_REFERENCE = 0` or `COMPOUND_REFERENCE = 1`. MUST
+///   be `0` or `1` (the §3 binary alphabet).
+/// * `mi_size` — the block's `MiSize` (§3 block-size index), in
+///   `0..BLOCK_SIZES = 22`. Indexes the §9.3 4×4-block-count tables to
+///   derive `Min( bw4, bh4 )`.
+/// * `reference_select` — frame-level `reference_select` (§5.9.23
+///   `frame_reference_mode( )`). When `false`, the precondition fails
+///   and `comp_mode` is forced to `SINGLE_REFERENCE` with no bit.
+/// * `ctx` — the §8.3.2 `comp_mode` context computed via
+///   [`crate::cdf::comp_mode_ctx`] from the neighbour single/intra
+///   predicates. MUST be in `0..COMP_INTER_CONTEXTS = 5`. Only
+///   consulted when the precondition holds (a symbol is emitted).
+///
+/// ## Out-of-range / mismatch cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * `comp_mode > 1` — outside the §3 binary `CompMode` alphabet.
+/// * `mi_size >= BLOCK_SIZES` — invalid §3 block-size index.
+/// * Precondition false (`!reference_select` or `Min( bw4, bh4 ) < 2`)
+///   and `comp_mode != SINGLE_REFERENCE` — the spec forces
+///   `comp_mode = SINGLE_REFERENCE` with no bit, so any other value is
+///   a caller bug.
+/// * Precondition true and `ctx >= COMP_INTER_CONTEXTS` — invalid
+///   §8.3.2 ctx.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless (mirrors [`write_is_inter`]): on the suppressed-bit path
+/// no symbol is emitted; on the explicit path exactly one §8.2.6
+/// `S()` over `TileCompModeCdf[ ctx ]` is written. The caller stamps
+/// the resulting `comp_mode`-derived `RefFrame[ 0..2 ]` pair onto the
+/// block footprint through its own [`crate::cdf::PartitionWalker`].
+pub fn write_comp_mode(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    comp_mode: u8,
+    mi_size: usize,
+    reference_select: bool,
+    ctx: usize,
+) -> Result<(), Error> {
+    // §3 binary alphabet bound on `CompMode`.
+    if comp_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §3 block-size index bound — needed to index the §9.3 tables.
+    if mi_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.25 arm 4: `bw4 = Num_4x4_Blocks_Wide[ MiSize ]`,
+    // `bh4 = Num_4x4_Blocks_High[ MiSize ]`.
+    let bw4 = NUM_4X4_BLOCKS_WIDE[mi_size];
+    let bh4 = NUM_4X4_BLOCKS_HIGH[mi_size];
+
+    // `if ( reference_select && ( Min( bw4, bh4 ) >= 2 ) ) comp_mode S()
+    //  else comp_mode = SINGLE_REFERENCE`.
+    if reference_select && bw4.min(bh4) >= 2 {
+        if ctx >= COMP_INTER_CONTEXTS {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let cdf = cdfs.comp_mode_cdf(ctx);
+        writer.write_symbol(comp_mode as u32, cdf)
+    } else {
+        // No bit: the spec forces `comp_mode = SINGLE_REFERENCE = 0`.
+        if comp_mode != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        Ok(())
+    }
+}
+
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
 /// 0) { x >>= 1; s++; } return s - 1;`. Local helper because the
 /// public surface lives in `cdf` / `symbol_decoder`; pulled inline
@@ -3750,9 +3853,9 @@ fn floor_log2(mut x: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::cdf::{
-        cfl_allowed_for_uv_mode, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx, skip_mode_ctx,
-        PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_4X8, BLOCK_8X4, BLOCK_8X8,
-        DC_PRED, V_PRED,
+        cfl_allowed_for_uv_mode, comp_mode_ctx, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx,
+        skip_mode_ctx, PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_4X8, BLOCK_8X4,
+        BLOCK_8X8, DC_PRED, V_PRED,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -10515,5 +10618,179 @@ mod tests {
         let (_, slot1) =
             write_inter_block_mode_info_bootstrap(0, [0, 0], false, 0, true, false).unwrap();
         assert!(slot1 <= 0);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.25 arm 4 first symbol — write_comp_mode.
+    // -----------------------------------------------------------------
+
+    /// §8.3.2 `comp_mode` ctx at the frame origin: both neighbours
+    /// unavailable (`AvailU == AvailL == false`) ⇒ the `else` branch
+    /// `ctx = 1`. The neighbour single/intra/ref-frame inputs are
+    /// irrelevant when neither neighbour is available, so we pass the
+    /// no-neighbour shape.
+    fn comp_mode_ctx_at_origin() -> usize {
+        comp_mode_ctx(false, false, true, true, false, false, [-1, -1], [-1, -1])
+    }
+
+    /// §5.11.25 arm 4 explicit path: `reference_select == true` and
+    /// `Min( bw4, bh4 ) >= 2` (BLOCK_8X8 ⇒ bw4 = bh4 = 2) ⇒ one `S()`
+    /// emitted. Round-trip `comp_mode = SINGLE_REFERENCE = 0` through
+    /// the decoder's `comp_mode` symbol read with the §8.3 CDF
+    /// adaptation engaged on both sides.
+    #[test]
+    fn write_comp_mode_single_reference_round_trip_at_origin() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = comp_mode_ctx_at_origin();
+        write_comp_mode(&mut writer, &mut enc_cdfs, 0, BLOCK_8X8, true, ctx).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let row = dec_cdfs.comp_mode_cdf(ctx);
+        let comp_mode = dec.read_symbol(row).unwrap();
+        assert_eq!(comp_mode, 0, "SINGLE_REFERENCE");
+    }
+
+    /// §5.11.25 arm 4 explicit path: `comp_mode = COMPOUND_REFERENCE = 1`
+    /// round-trips through the decoder's `comp_mode` symbol read at the
+    /// frame origin. CDF row chosen by the encoder MUST match the
+    /// decoder's `ctx` or the read would diverge.
+    #[test]
+    fn write_comp_mode_compound_reference_round_trip_at_origin() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = comp_mode_ctx_at_origin();
+        write_comp_mode(&mut writer, &mut enc_cdfs, 1, BLOCK_8X8, true, ctx).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let row = dec_cdfs.comp_mode_cdf(ctx);
+        let comp_mode = dec.read_symbol(row).unwrap();
+        assert_eq!(comp_mode, 1, "COMPOUND_REFERENCE");
+    }
+
+    /// §5.11.25 arm 4 suppressed-bit path: `reference_select == false`
+    /// ⇒ no `S()` emitted (the spec forces `comp_mode = SINGLE_REFERENCE`
+    /// with no bit). The finished symbol stream is empty of payload.
+    #[test]
+    fn write_comp_mode_reference_select_false_emits_no_bit() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = comp_mode_ctx_at_origin();
+        write_comp_mode(&mut writer, &mut enc_cdfs, 0, BLOCK_8X8, false, ctx).unwrap();
+        let bytes = writer.finish();
+        // The CDF row MUST be untouched — no symbol was coded.
+        let mut pristine = TileCdfContext::new_from_defaults();
+        let expected: Vec<u16> = pristine.comp_mode_cdf(ctx).to_vec();
+        let actual: Vec<u16> = enc_cdfs.comp_mode_cdf(ctx).to_vec();
+        assert_eq!(actual, expected, "no S() emitted ⇒ comp_mode CDF unchanged");
+        // An empty payload finishes to the minimal symbol-stream tail.
+        assert!(bytes.len() <= 2, "no payload bits coded");
+    }
+
+    /// §5.11.25 arm 4 suppressed-bit path via the size precondition:
+    /// `Min( bw4, bh4 ) < 2` (BLOCK_4X4 ⇒ bw4 = bh4 = 1) forces
+    /// `comp_mode = SINGLE_REFERENCE` even with `reference_select == true`.
+    #[test]
+    fn write_comp_mode_small_block_emits_no_bit() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let ctx = comp_mode_ctx_at_origin();
+        write_comp_mode(&mut writer, &mut enc_cdfs, 0, BLOCK_4X4, true, ctx).unwrap();
+        let bytes = writer.finish();
+        assert!(bytes.len() <= 2, "no payload bits coded for a sub-8 block");
+    }
+
+    /// §5.11.25 arm 4: BLOCK_4X8 / BLOCK_8X4 have `Min( bw4, bh4 ) = 1`
+    /// ⇒ suppressed-bit even with `reference_select == true`. The
+    /// rectangular sub-8 shapes exercise the `Min` (not `Max`) bound.
+    #[test]
+    fn write_comp_mode_rectangular_sub8_blocks_suppress_bit() {
+        for &mi_size in &[BLOCK_4X8, BLOCK_8X4] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let ctx = comp_mode_ctx_at_origin();
+            // comp_mode MUST be SINGLE_REFERENCE on the suppressed path.
+            write_comp_mode(&mut writer, &mut enc_cdfs, 0, mi_size, true, ctx).unwrap();
+            let bytes = writer.finish();
+            assert!(bytes.len() <= 2, "Min(bw4,bh4) = 1 ⇒ no bit");
+        }
+    }
+
+    /// §3 binary alphabet: `comp_mode > 1` is rejected.
+    #[test]
+    fn write_comp_mode_rejects_out_of_range_value() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_comp_mode(&mut writer, &mut cdfs, 2, BLOCK_8X8, true, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Invalid §3 block-size index is rejected.
+    #[test]
+    fn write_comp_mode_rejects_out_of_range_mi_size() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_comp_mode(&mut writer, &mut cdfs, 0, BLOCK_SIZES, true, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Suppressed-bit path with `comp_mode != SINGLE_REFERENCE` is a
+    /// caller bug — the spec forces `SINGLE_REFERENCE` with no bit, so
+    /// any other value cannot be represented.
+    #[test]
+    fn write_comp_mode_rejects_compound_on_suppressed_path() {
+        // reference_select == false suppresses the bit.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_comp_mode(&mut writer, &mut cdfs, 1, BLOCK_8X8, false, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // Min(bw4,bh4) < 2 suppresses the bit too.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_comp_mode(&mut writer, &mut cdfs, 1, BLOCK_4X4, true, 0).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Explicit path with `ctx >= COMP_INTER_CONTEXTS` is rejected.
+    #[test]
+    fn write_comp_mode_rejects_out_of_range_ctx_on_explicit_path() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_comp_mode(
+            &mut writer,
+            &mut cdfs,
+            0,
+            BLOCK_8X8,
+            true,
+            COMP_INTER_CONTEXTS,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// §8.3.2 ctx coverage: every `ctx` in `0..COMP_INTER_CONTEXTS`
+    /// round-trips both `comp_mode` values through the decoder. The
+    /// CDF row the encoder writes MUST be the row the decoder reads.
+    #[test]
+    fn write_comp_mode_all_ctx_round_trip() {
+        for ctx in 0..COMP_INTER_CONTEXTS {
+            for value in 0u8..=1 {
+                let mut enc_cdfs = TileCdfContext::new_from_defaults();
+                let mut writer = SymbolWriter::new(false);
+                write_comp_mode(&mut writer, &mut enc_cdfs, value, BLOCK_8X8, true, ctx).unwrap();
+                let bytes = writer.finish();
+
+                let mut dec_cdfs = TileCdfContext::new_from_defaults();
+                let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+                let row = dec_cdfs.comp_mode_cdf(ctx);
+                let got = dec.read_symbol(row).unwrap() as u8;
+                assert_eq!(got, value, "ctx {ctx} value {value} round-trip");
+            }
+        }
     }
 }

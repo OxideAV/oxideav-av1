@@ -2,6 +2,51 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-10 (round 267)
+
+Round 267 lands the **first `S()` symbol** of the §5.11.25
+`read_ref_frames()` arm-4 dispatcher that r266's bootstrap deferred:
+the `comp_mode` selector (`SINGLE_REFERENCE` vs `COMPOUND_REFERENCE`).
+
+* `encoder::block_mode_info::write_comp_mode`
+  (§5.11.25 arm 4 lines 1-5, av1-spec p.76). Folds the
+  `bw4 = Num_4x4_Blocks_Wide[ MiSize ]` /
+  `bh4 = Num_4x4_Blocks_High[ MiSize ]` derivations (§9.3 tables)
+  from the `MiSize` index, then mirrors the spec precondition
+  `if ( reference_select && Min( bw4, bh4 ) >= 2 ) comp_mode S()
+  else comp_mode = SINGLE_REFERENCE`. On the explicit path it emits
+  exactly one §8.2.6 `S()` over `TileCompModeCdf[ ctx ]`
+  (`ctx` via the existing public `cdf::comp_mode_ctx`); on the
+  suppressed path it emits no bit and forces `SINGLE_REFERENCE`.
+* Caller-bug rejects: `comp_mode > 1` (§3 binary alphabet),
+  `mi_size >= BLOCK_SIZES`, `ctx >= COMP_INTER_CONTEXTS` on the
+  explicit path, and a non-`SINGLE_REFERENCE` value on the
+  suppressed-bit path (the spec admits no other value with no bit).
+
+The COMPOUND/SINGLE reference-frame bodies (`comp_ref_type` /
+`single_ref_p?` / `comp_bwdref_p?` / `uni_comp_ref` reads) remain a
+follow-up arc — this round lands only the `comp_mode` selector.
+
++10 tests: round-trip of both `comp_mode` values through the
+decoder's `comp_mode` symbol read at the frame origin, full
+`0..COMP_INTER_CONTEXTS` ctx coverage, the two suppressed-bit paths
+(`reference_select == false` and sub-8 / rectangular-sub-8 blocks
+via the `Min` bound), and the four caller-bug rejects.
+
+Full library test count moves to 1809 (was 1799).
+
+### Pending follow-ups for round 268+
+
+* §5.11.25 arm 4 COMPOUND_REFERENCE body — `comp_ref_type` (`S()`),
+  then the `uni_comp_ref` / `comp_ref` / `comp_bwdref` sub-trees.
+* §5.11.25 arm 4 SINGLE_REFERENCE body — the `single_ref_p1..6`
+  sub-tree.
+* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2).
+* §5.11.23 lines 9-22 `compound_mode` / `new_mv` / `zero_mv` /
+  `ref_mv` / `drl_mode` S() writers.
+
+---
+
 ## Status — 2026-06-09 (round 266)
 
 Round 266 bootstraps the §5.11.23 `inter_block_mode_info()` writer
