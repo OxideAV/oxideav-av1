@@ -2,6 +2,65 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-11 (round 276)
+
+Round 276 lands the **§5.11.23 tail leaf writers after `assign_mv( )`**
+— the write sides of all three post-MV per-block readers, each the
+exact encode-side inverse of its `PartitionWalker` decode twin:
+
+* `encoder::block_mode_info::write_interintra_mode` (§5.11.28
+  `read_interintra_mode( )`, av1-spec p.79-80). Re-derives the outer
+  gate (`!skip_mode && enable_interintra_compound && !isCompound &&
+  BLOCK_8X8 <= MiSize <= BLOCK_32X32`) and emits the `interintra` →
+  `interintra_mode` → `wedge_interintra` → optional `wedge_index` S()
+  cascade from a target `InterIntraReadout`; §8.3.2 ctx
+  `Size_Group[ MiSize ] - 1` for the first two, straight `MiSize` for
+  the wedge pair. A readout shape the reader could never produce on the
+  gate configuration is rejected.
+* `encoder::block_mode_info::write_motion_mode` (§5.11.27
+  `read_motion_mode( )`, av1-spec p.79). Re-derives every SIMPLE
+  short-circuit (skip_mode, `!is_motion_mode_switchable`,
+  sub-8 blocks, beyond-TRANSLATION global model on the GLOBALMV modes,
+  compound / slot-1-INTRA / no overlappable candidates), then
+  dispatches arm A (`use_obmc` S() over `TileUseObmcCdf[ MiSize ]`,
+  WARPED_CAUSAL unreachable) vs arm B (`motion_mode` S() over
+  `TileMotionModeCdf[ MiSize ]`) on `force_integer_mv || NumSamples ==
+  0 || !allow_warped_motion || is_scaled( RefFrame[ 0 ] )`. The two
+  walker-derived quantities (`has_overlappable_candidates()`,
+  `NumSamples`) arrive precomputed per the stateless-writer doctrine.
+* `encoder::block_mode_info::write_compound_type` (§5.11.29
+  `read_compound_type( )`, av1-spec p.80-81). Covers the skip_mode and
+  single-pred no-bit arms (type derived from the §5.11.28 outcome), the
+  `comp_group_idx` S() (ctx via `comp_group_idx_ctx`), the group-0
+  `compound_idx` S() (ctx via `compound_idx_ctx`, `dist_equal` seed),
+  the group-1 `compound_type` S() with the `Wedge_Bits[ MiSize ] == 0`
+  DIFFWTD force, and the wedge (`wedge_index` S() + `wedge_sign` L(1))
+  / diffwtd (`mask_type` L(1)) sub-branches — every derived field of
+  the target `CompoundTypeReadout` is cross-checked against the active
+  arm.
+
++18 tests: all three writers round-trip through their actual
+`PartitionWalker` decode twins (every `interintra_mode` × band size,
+wedge-index extremes, motion-mode arms A and B incl. the scaled-ref
+A-route, compound group-0 jnt both `dist_equal` seeds, group-1 wedge /
+diffwtd / n==0-forced paths, single-pred shapes) with per-row
+CDF-adaptation equality asserted, plus no-bit byte-equality checks on
+every short-circuit arm and reject batteries for reader-unreachable
+readout shapes. Full library test count moves to 1897 (was 1879).
+
+### Pending follow-ups for round 277+
+
+* The §5.11.x `interp_filter` loop write side (the last §5.11.23 tail
+  reader without a writer), then folding the four tail writers into
+  `write_inter_block_mode_info` (their gating scalars — sequence-header
+  flags, warp-sample counts, neighbour grids — widen the composition's
+  input surface).
+* The §5.11.26 intra-block-copy `PredMv` arm is still not surfaced by
+  `assign_mv_pred_mv` (reached only on the intra-frame intra-block-copy
+  path).
+
+---
+
 ## Status — 2026-06-11 (round 275)
 
 Round 275 **composes the §5.11.23 `inter_block_mode_info( )` body** —

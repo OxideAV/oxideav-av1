@@ -48,21 +48,25 @@
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
 use crate::cdf::{
-    block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_mode_ctx,
-    comp_ref_type_ctx, compound_mode_ctx, count_refs, is_directional, is_samedir_ref_pair,
-    mi_height_log2, mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx,
-    ref_count_ctx, FindMvStackResult, PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64,
-    BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE,
-    COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL,
-    DRL_MODE_CONTEXTS, FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS,
-    IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV,
-    MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV,
-    MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
+    block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_group_idx_ctx,
+    comp_mode_ctx, comp_ref_type_ctx, compound_idx_ctx, compound_mode_ctx, count_refs,
+    interintra_ctx, is_directional, is_samedir_ref_pair, mi_height_log2, mi_width_log2,
+    neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx, wedge_bits,
+    CompoundTypeReadout, FindMvStackResult, InterIntraReadout, PartitionWalker, TileCdfContext,
+    BLOCK_128X128, BLOCK_32X32, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS,
+    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_AVERAGE, COMPOUND_DIFFWTD,
+    COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES,
+    COMPOUND_WEDGE, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS,
+    FRAME_LF_COUNT, GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTRA_FILTER_MODES, INTRA_MODES,
+    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS,
+    MODE_GLOBALMV, MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV,
+    MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MOTION_MODES,
+    MOTION_MODE_OBMC, MOTION_MODE_SIMPLE, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
     MV_INTRABC_CONTEXT, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO,
     NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
     PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
     SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
-    ZERO_MV_CONTEXTS,
+    WEDGE_TYPES, ZERO_MV_CONTEXTS,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -5302,9 +5306,13 @@ pub fn assign_mv_pred_mv(
 ///    [`write_read_mv`]. Non-NEWMV lists set `Mv[ i ] = PredMv[ i ]`
 ///    with no bits (§5.11.31 line `else Mv[ i ] = PredMv[ i ]`).
 ///
-/// The §5.11.23 tail after `assign_mv` (`read_interintra_mode`,
-/// `read_motion_mode`, `read_compound_type`, the `interp_filter` loop)
-/// has no writer yet and is a follow-up arc.
+/// The §5.11.23 tail after `assign_mv` now has standalone leaf writers
+/// — [`write_interintra_mode`] (§5.11.28), [`write_motion_mode`]
+/// (§5.11.27) and [`write_compound_type`] (§5.11.29), landed r276 —
+/// but they are not yet folded into this composition (their gating
+/// scalars — sequence-header flags, warp-sample counts, neighbour
+/// grids — widen the input surface considerably). The `interp_filter`
+/// loop writer and the tail composition are the follow-up arc.
 ///
 /// ## `YMode` consistency
 ///
@@ -5482,6 +5490,573 @@ pub fn write_inter_block_mode_info(
             )?;
         }
         // Non-NEWMV lists: `Mv[ i ] = PredMv[ i ]`, no symbols.
+    }
+
+    Ok(())
+}
+
+/// `read_interintra_mode( isCompound )` writer per §5.11.28 (av1-spec
+/// p.79-80) — r276. First piece of the §5.11.23 tail after
+/// `assign_mv( )` (the spec order is `read_interintra_mode` →
+/// `read_motion_mode` → `read_compound_type`). Exact encode-side
+/// inverse of [`crate::cdf::PartitionWalker::read_interintra_mode`]:
+/// the caller hands the target [`InterIntraReadout`] (the same
+/// aggregate the decoder returns) and the writer re-emits the S()
+/// sequence the reader would consume to reproduce it.
+///
+/// ## Spec body (§5.11.28 — av1-spec p.79-80)
+///
+/// ```text
+///   if ( !skip_mode && enable_interintra_compound && !isCompound &&
+///        MiSize >= BLOCK_8X8 && MiSize <= BLOCK_32X32 ) {
+///       interintra                                          S()
+///       if ( interintra ) {
+///           interintra_mode                                 S()
+///           RefFrame[ 1 ] = INTRA_FRAME
+///           AngleDeltaY = 0
+///           AngleDeltaUV = 0
+///           use_filter_intra = 0
+///           wedge_interintra                                S()
+///           if ( wedge_interintra ) {
+///               wedge_index                                 S()
+///               wedge_sign = 0
+///           }
+///       }
+///   } else {
+///       interintra = 0
+///   }
+/// ```
+///
+/// ## §8.3.2 CDF selections
+///
+/// * `interintra` / `interintra_mode`: `ctx = Size_Group[ MiSize ] - 1`
+///   via [`interintra_ctx`] (the outer gate confines `MiSize` to
+///   `BLOCK_8X8..=BLOCK_32X32` where `Size_Group ∈ {1, 2, 3}`).
+/// * `wedge_interintra` / `wedge_index`: straight `MiSize` index.
+///
+/// ## Readout consistency
+///
+/// The target `readout` must be exactly producible by the reader on
+/// this gate configuration:
+///
+/// * gate closed ⇒ `interintra == 0` with all three option fields
+///   `None` (the spec's `else interintra = 0` arm reads no bits);
+/// * gate open, `interintra == 0` ⇒ all three option fields `None`;
+/// * gate open, `interintra == 1` ⇒ `interintra_mode ==
+///   Some(< INTERINTRA_MODES)` and `wedge_interintra ∈ {Some(0),
+///   Some(1)}`; `wedge_index == Some(< WEDGE_TYPES)` iff
+///   `wedge_interintra == Some(1)`, `None` otherwise.
+///
+/// Any other shape is a caller bug surfaced as
+/// `Err(PartitionWalkOutOfRange)` (the reader could never decode it).
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless: between zero and four §8.2.6 `S()` symbols. The spec
+/// body's imperative overrides (`RefFrame[ 1 ] = INTRA_FRAME`,
+/// `AngleDeltaY = AngleDeltaUV = 0`, `use_filter_intra = 0`,
+/// `wedge_sign = 0`) are derivations the caller applies to its own
+/// state, exactly as the decode-side dispatcher applies them from the
+/// returned readout.
+pub fn write_interintra_mode(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    readout: &InterIntraReadout,
+    mi_size: usize,
+    skip_mode: u8,
+    is_compound: bool,
+    enable_interintra_compound: bool,
+) -> Result<(), Error> {
+    // §3 binary alphabet bound on `skip_mode`.
+    if skip_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.28 outer gate: every clause must hold for the `interintra`
+    // S() to fire (mirrors the reader's `gate_open`).
+    let gate_open = skip_mode == 0
+        && enable_interintra_compound
+        && !is_compound
+        && (BLOCK_8X8..=BLOCK_32X32).contains(&mi_size);
+
+    if !gate_open {
+        // `else interintra = 0` — no bits; the readout must carry the
+        // exact no-read shape.
+        if readout.interintra != 0
+            || readout.interintra_mode.is_some()
+            || readout.wedge_interintra.is_some()
+            || readout.wedge_index.is_some()
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §3 binary alphabet bound on `interintra`.
+    if readout.interintra > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.28 `interintra` S() over `TileInterIntraCdf[ ctx ]`,
+    // `ctx = Size_Group[ MiSize ] - 1`. The gate confines `MiSize` to
+    // the band where `interintra_ctx` is `Some(_)`.
+    let ctx = interintra_ctx(mi_size).ok_or(Error::PartitionWalkOutOfRange)?;
+    let row = cdfs
+        .inter_intra_cdf(ctx)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(readout.interintra as u32, row)?;
+
+    if readout.interintra == 0 {
+        // Inner arm closed: the reader leaves every option field `None`.
+        if readout.interintra_mode.is_some()
+            || readout.wedge_interintra.is_some()
+            || readout.wedge_index.is_some()
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // Inner arm: `interintra_mode` S() over
+    // `TileInterIntraModeCdf[ ctx ]` (same ctx).
+    let ii_mode = readout
+        .interintra_mode
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    if (ii_mode as usize) >= INTERINTRA_MODES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // `wedge_interintra` S() over `TileWedgeInterIntraCdf[ MiSize ]`
+    // (straight `MiSize` index).
+    let wedge_ii = readout
+        .wedge_interintra
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    if wedge_ii > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // `wedge_index` presence must match the `wedge_interintra` arm
+    // before any symbol is committed.
+    if (wedge_ii == 1) != readout.wedge_index.is_some() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if let Some(wi) = readout.wedge_index {
+        if (wi as usize) >= WEDGE_TYPES {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+
+    let row = cdfs
+        .inter_intra_mode_cdf(ctx)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(ii_mode as u32, row)?;
+
+    let row = cdfs
+        .wedge_inter_intra_cdf(mi_size)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    writer.write_symbol(wedge_ii as u32, row)?;
+
+    if let Some(wi) = readout.wedge_index {
+        // `wedge_index` S() over `TileWedgeIndexCdf[ MiSize ]` — the
+        // same default CDF the §5.11.29 COMPOUND_WEDGE branch selects.
+        let row = cdfs
+            .wedge_index_cdf(mi_size)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        writer.write_symbol(wi as u32, row)?;
+    }
+
+    Ok(())
+}
+
+/// `read_motion_mode( isCompound )` writer per §5.11.27 (av1-spec
+/// p.79) — r276. Second piece of the §5.11.23 tail after
+/// `assign_mv( )`. Exact encode-side inverse of
+/// [`crate::cdf::PartitionWalker::read_motion_mode`]: the caller hands
+/// the target §6.10.26 `motion_mode` ordinal (`SIMPLE = 0` / `OBMC = 1`
+/// / `WARPED_CAUSAL = 2`) and the same gating scalars the decode side
+/// consumes; the writer re-derives the active arm and emits zero or one
+/// §8.2.6 `S()`.
+///
+/// ## Spec body (§5.11.27 — av1-spec p.79)
+///
+/// The body short-circuits to `motion_mode = SIMPLE` (no bits) on:
+///
+/// * `skip_mode == 1`;
+/// * `!is_motion_mode_switchable`;
+/// * `Min( Block_Width[ MiSize ], Block_Height[ MiSize ] ) < 8`;
+/// * `!force_integer_mv && YMode ∈ { GLOBALMV, GLOBAL_GLOBALMV } &&
+///   GmType[ RefFrame[ 0 ] ] > TRANSLATION`;
+/// * `isCompound || RefFrame[ 1 ] == INTRA_FRAME ||
+///   !has_overlappable_candidates( )`.
+///
+/// Otherwise it runs `find_warp_samples( )` (§7.10.4) and dispatches:
+///
+/// * `force_integer_mv || NumSamples == 0 || !allow_warped_motion ||
+///   is_scaled( RefFrame[ 0 ] )` ⇒ **arm A**: `use_obmc` S() over
+///   `TileUseObmcCdf[ MiSize ]`; `motion_mode = use_obmc ? OBMC :
+///   SIMPLE` (WARPED_CAUSAL unreachable on this arm);
+/// * otherwise ⇒ **arm B**: `motion_mode` S() over
+///   `TileMotionModeCdf[ MiSize ]` (all three ordinals reachable).
+///
+/// ## Inputs
+///
+/// Mirrors the decode-side scalar surface; the two walker-derived
+/// quantities arrive precomputed (the stateless-writer doctrine of
+/// this module):
+///
+/// * `has_overlappable` — the §5.11.27 `has_overlappable_candidates()`
+///   outcome over the encoder's own grid state.
+/// * `num_samples` — `NumSamples` from §7.10.4 `find_warp_samples()`.
+/// * `gm_type` — `GmType[ 0..8 ]` (§5.9.24), consulted on the
+///   GLOBALMV arm for `RefFrame[ 0 ] ∈ 0..8`.
+/// * `is_scaled_per_ref` — the §5.11.27 `is_scaled( refFrame )`
+///   outcome per `refFrame - LAST_FRAME ∈ 0..7`.
+///
+/// ## Target consistency
+///
+/// A `motion_mode` the reader could never produce on the active arm is
+/// a caller bug (`Err(PartitionWalkOutOfRange)`): the short-circuit
+/// arms force `SIMPLE`; arm A admits only `SIMPLE` / `OBMC`; arm B
+/// admits `0..MOTION_MODES`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_motion_mode(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    motion_mode: u8,
+    mi_size: usize,
+    skip_mode: u8,
+    is_compound: bool,
+    ref_frame: [i32; 2],
+    y_mode: u8,
+    num_samples: u32,
+    is_motion_mode_switchable: bool,
+    allow_warped_motion: bool,
+    force_integer_mv: bool,
+    gm_type: [i32; 8],
+    is_scaled_per_ref: [bool; 7],
+    has_overlappable: bool,
+) -> Result<(), Error> {
+    // §3 binary alphabet bound on `skip_mode`.
+    if skip_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.27 short-circuit arms — each forces SIMPLE with no bits.
+    let forced_simple = skip_mode != 0
+        || !is_motion_mode_switchable
+        || core::cmp::min(block_width(mi_size), block_height(mi_size)) < 8
+        || (!force_integer_mv
+            && (y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV)
+            && (0..8).contains(&ref_frame[0])
+            && gm_type[ref_frame[0] as usize] > GM_TYPE_TRANSLATION)
+        // `RefFrame[ 1 ] == INTRA_FRAME` — INTRA_FRAME = 0.
+        || is_compound
+        || ref_frame[1] == 0
+        || !has_overlappable;
+
+    if forced_simple {
+        if motion_mode != MOTION_MODE_SIMPLE {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.27 post-`find_warp_samples` arm dispatch. `is_scaled(
+    // RefFrame[ 0 ] )` is only meaningful for `RefFrame[ 0 ] ∈
+    // LAST_FRAME..=ALTREF_FRAME = 1..=7` (single-pred with a non-INTRA
+    // slot 0 — guaranteed past the short-circuits above).
+    let ref0 = ref_frame[0];
+    let scaled = if (1..=7).contains(&ref0) {
+        is_scaled_per_ref[(ref0 - 1) as usize]
+    } else {
+        false
+    };
+
+    if force_integer_mv || num_samples == 0 || !allow_warped_motion || scaled {
+        // Arm A: `use_obmc` S() over `TileUseObmcCdf[ MiSize ]`.
+        // WARPED_CAUSAL is unreachable here.
+        let use_obmc: u32 = match motion_mode {
+            MOTION_MODE_SIMPLE => 0,
+            MOTION_MODE_OBMC => 1,
+            _ => return Err(Error::PartitionWalkOutOfRange),
+        };
+        let row = cdfs
+            .use_obmc_cdf(mi_size)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        writer.write_symbol(use_obmc, row)?;
+    } else {
+        // Arm B: `motion_mode` S() over `TileMotionModeCdf[ MiSize ]`.
+        if (motion_mode as usize) >= MOTION_MODES {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let row = cdfs
+            .motion_mode_cdf(mi_size)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        writer.write_symbol(motion_mode as u32, row)?;
+    }
+
+    Ok(())
+}
+
+/// `read_compound_type( isCompound )` writer per §5.11.29 (av1-spec
+/// p.80-81) — r276. Third piece of the §5.11.23 tail after
+/// `assign_mv( )`. Exact encode-side inverse of
+/// [`crate::cdf::PartitionWalker::read_compound_type`]: the caller
+/// hands the target [`CompoundTypeReadout`] (the same aggregate the
+/// decoder returns) plus the gating scalars; the writer re-derives the
+/// active arms and emits the matching S() / L(1) sequence.
+///
+/// ## Spec body (§5.11.29 — av1-spec p.80-81)
+///
+/// ```text
+///   comp_group_idx = 0
+///   compound_idx = 1
+///   if ( skip_mode ) { compound_type = COMPOUND_AVERAGE; return }
+///   if ( isCompound ) {
+///       n = Wedge_Bits[ MiSize ]
+///       if ( enable_masked_compound )
+///           comp_group_idx                                   S()
+///       if ( comp_group_idx == 0 ) {
+///           if ( enable_jnt_comp ) {
+///               compound_idx                                 S()
+///               compound_type = compound_idx ? COMPOUND_AVERAGE
+///                                            : COMPOUND_DISTANCE
+///           } else {
+///               compound_type = COMPOUND_AVERAGE
+///           }
+///       } else {
+///           if ( n == 0 ) compound_type = COMPOUND_DIFFWTD
+///           else          compound_type                      S()
+///       }
+///       if ( compound_type == COMPOUND_WEDGE ) {
+///           wedge_index                                      S()
+///           wedge_sign                                       L(1)
+///       } else if ( compound_type == COMPOUND_DIFFWTD ) {
+///           mask_type                                        L(1)
+///       }
+///   } else {
+///       if ( interintra )
+///           compound_type = wedge_interintra ? COMPOUND_WEDGE
+///                                            : COMPOUND_INTRA
+///       else
+///           compound_type = COMPOUND_AVERAGE
+///   }
+/// ```
+///
+/// ## §8.3.2 CDF selections
+///
+/// * `comp_group_idx`: `TileCompGroupIdxCdf[ ctx ]` via
+///   [`comp_group_idx_ctx`];
+/// * `compound_idx`: `TileCompoundIdxCdf[ ctx ]` via
+///   [`compound_idx_ctx`] (seeded with `dist_equal ? 3 : 0`);
+/// * `compound_type`: `TileCompoundTypeCdf[ MiSize ]` (straight
+///   index);
+/// * `wedge_index`: `TileWedgeIndexCdf[ MiSize ]`;
+/// * `wedge_sign` / `mask_type`: literal `L(1)`, no CDF.
+///
+/// ## Inputs
+///
+/// The scalar surface mirrors the decode side; the two neighbour grid
+/// reads arrive precomputed (the stateless-writer doctrine of this
+/// module): `above_comp_group_idx` / `left_comp_group_idx` carry the
+/// `CompGroupIdxs[ MiRow - 1 ][ MiCol ]` / `CompGroupIdxs[ MiRow ][
+/// MiCol - 1 ]` values (identity `0` when the neighbour is
+/// unavailable) and `above_compound_idx` / `left_compound_idx` the
+/// `CompoundIdxs` twins (identity `1`). Both ctx walks only consult
+/// them on the `!AboveSingle` / `!LeftSingle` arms, exactly as the
+/// reader does.
+///
+/// ## Readout consistency
+///
+/// The target `readout` must be exactly producible by the reader on
+/// this gate configuration — the derived fields (`compound_type` on
+/// every non-S() arm, `comp_group_idx` / `compound_idx` pre-sets, the
+/// option-field presence pattern) are cross-checked and any mismatch
+/// is a caller bug surfaced as `Err(PartitionWalkOutOfRange)`.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless: between zero and two `S()` plus at most one `S()` + one
+/// `L(1)` sub-branch. The caller stamps `comp_group_idx` /
+/// `compound_idx` onto its own grids so subsequent blocks' §8.3.2
+/// neighbour walks observe them.
+#[allow(clippy::too_many_arguments)]
+pub fn write_compound_type(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    readout: &CompoundTypeReadout,
+    mi_size: usize,
+    skip_mode: u8,
+    is_compound: bool,
+    interintra: u8,
+    wedge_interintra: u8,
+    enable_masked_compound: bool,
+    enable_jnt_comp: bool,
+    dist_equal: bool,
+    avail_u: bool,
+    avail_l: bool,
+    above_single: bool,
+    left_single: bool,
+    above_ref_0_altref: bool,
+    left_ref_0_altref: bool,
+    above_comp_group_idx: u8,
+    left_comp_group_idx: u8,
+    above_compound_idx: u8,
+    left_compound_idx: u8,
+) -> Result<(), Error> {
+    // §3 binary alphabet bounds.
+    if skip_mode > 1
+        || above_comp_group_idx > 1
+        || left_comp_group_idx > 1
+        || above_compound_idx > 1
+        || left_compound_idx > 1
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.29 lines 3-6: `if ( skip_mode )` short-circuit — the
+    // readout must carry the exact line-1/2 pre-sets, no bits.
+    if skip_mode != 0 {
+        if readout.comp_group_idx != 0
+            || readout.compound_idx != 1
+            || readout.compound_type != COMPOUND_AVERAGE
+            || readout.wedge_index.is_some()
+            || readout.wedge_sign.is_some()
+            || readout.mask_type.is_some()
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    if !is_compound {
+        // §5.11.29 else-arm: no bits; the §5.11.28 outcome alone
+        // selects the type.
+        let expected = if interintra != 0 {
+            if wedge_interintra != 0 {
+                COMPOUND_WEDGE
+            } else {
+                COMPOUND_INTRA
+            }
+        } else {
+            COMPOUND_AVERAGE
+        };
+        if readout.comp_group_idx != 0
+            || readout.compound_idx != 1
+            || readout.compound_type != expected
+            || readout.wedge_index.is_some()
+            || readout.wedge_sign.is_some()
+            || readout.mask_type.is_some()
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // §5.11.29 `n = Wedge_Bits[ MiSize ]`.
+    let n = wedge_bits(mi_size);
+
+    // §5.11.29 `if ( enable_masked_compound )` ⇒ `comp_group_idx S()`;
+    // otherwise the line-1 pre-set `0` must survive.
+    if enable_masked_compound {
+        if readout.comp_group_idx > 1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let ctx = comp_group_idx_ctx(
+            avail_u,
+            above_single,
+            above_comp_group_idx,
+            above_ref_0_altref,
+            avail_l,
+            left_single,
+            left_comp_group_idx,
+            left_ref_0_altref,
+        );
+        let row = cdfs.comp_group_idx_cdf(ctx);
+        writer.write_symbol(readout.comp_group_idx as u32, row)?;
+    } else if readout.comp_group_idx != 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    if readout.comp_group_idx == 0 {
+        if enable_jnt_comp {
+            // `compound_idx S()` ⇒ `compound_type = compound_idx ?
+            // COMPOUND_AVERAGE : COMPOUND_DISTANCE`.
+            if readout.compound_idx > 1 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            let expected = if readout.compound_idx != 0 {
+                COMPOUND_AVERAGE
+            } else {
+                COMPOUND_DISTANCE
+            };
+            if readout.compound_type != expected {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            let ctx = compound_idx_ctx(
+                dist_equal,
+                avail_u,
+                above_single,
+                above_compound_idx,
+                above_ref_0_altref,
+                avail_l,
+                left_single,
+                left_compound_idx,
+                left_ref_0_altref,
+            );
+            let row = cdfs.compound_idx_cdf(ctx);
+            writer.write_symbol(readout.compound_idx as u32, row)?;
+        } else if readout.compound_idx != 1 || readout.compound_type != COMPOUND_AVERAGE {
+            // Line-2 pre-set survives; type forced to AVERAGE.
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    } else {
+        // `comp_group_idx == 1`: the `compound_idx` pre-set survives.
+        if readout.compound_idx != 1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if n == 0 {
+            if readout.compound_type != COMPOUND_DIFFWTD {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+        } else {
+            // `compound_type S()` over `TileCompoundTypeCdf[ MiSize ]`
+            // — only the two §6.10.24 signalled ordinals
+            // (COMPOUND_WEDGE / COMPOUND_DIFFWTD) are codeable.
+            if (readout.compound_type as usize) >= COMPOUND_TYPES {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            let row = cdfs
+                .compound_type_cdf(mi_size)
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+            writer.write_symbol(readout.compound_type as u32, row)?;
+        }
+    }
+
+    // §5.11.29 wedge / diffwtd sub-branches — validate the option-field
+    // presence pattern before committing any further symbol.
+    if readout.compound_type == COMPOUND_WEDGE {
+        let wi = readout.wedge_index.ok_or(Error::PartitionWalkOutOfRange)?;
+        let ws = readout.wedge_sign.ok_or(Error::PartitionWalkOutOfRange)?;
+        if (wi as usize) >= WEDGE_TYPES || ws > 1 || readout.mask_type.is_some() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let row = cdfs
+            .wedge_index_cdf(mi_size)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        writer.write_symbol(wi as u32, row)?;
+        // `wedge_sign L(1)`.
+        writer.write_literal(1, ws as u32)?;
+    } else if readout.compound_type == COMPOUND_DIFFWTD {
+        let mt = readout.mask_type.ok_or(Error::PartitionWalkOutOfRange)?;
+        if mt > 1 || readout.wedge_index.is_some() || readout.wedge_sign.is_some() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // `mask_type L(1)`.
+        writer.write_literal(1, mt as u32)?;
+    } else if readout.wedge_index.is_some()
+        || readout.wedge_sign.is_some()
+        || readout.mask_type.is_some()
+    {
+        return Err(Error::PartitionWalkOutOfRange);
     }
 
     Ok(())
@@ -15457,5 +16032,1016 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.28 read_interintra_mode — write_interintra_mode round-trips
+    // through PartitionWalker::read_interintra_mode (r276).
+    // -----------------------------------------------------------------
+
+    /// Zero-read readout shape (`interintra = 0`, every option `None`).
+    fn ii_zero() -> InterIntraReadout {
+        InterIntraReadout {
+            interintra: 0,
+            interintra_mode: None,
+            wedge_interintra: None,
+            wedge_index: None,
+        }
+    }
+
+    /// Encode `readout` then decode it back through the §5.11.28
+    /// reader on a fresh walker; returns the recovered readout.
+    fn roundtrip_interintra(
+        readout: InterIntraReadout,
+        mi_size: usize,
+        skip_mode: u8,
+        is_compound: bool,
+        enable: bool,
+    ) -> InterIntraReadout {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_interintra_mode(
+            &mut writer,
+            &mut enc_cdfs,
+            &readout,
+            mi_size,
+            skip_mode,
+            is_compound,
+            enable,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), false).unwrap();
+        let got = walker
+            .read_interintra_mode(
+                &mut dec,
+                &mut dec_cdfs,
+                mi_size,
+                skip_mode,
+                is_compound,
+                enable,
+            )
+            .unwrap();
+        // Both sides must have adapted the shared rows identically.
+        if let Some(ctx) = crate::cdf::interintra_ctx(mi_size) {
+            assert_eq!(enc_cdfs.inter_intra.get(ctx), dec_cdfs.inter_intra.get(ctx));
+            assert_eq!(
+                enc_cdfs.inter_intra_mode.get(ctx),
+                dec_cdfs.inter_intra_mode.get(ctx)
+            );
+        }
+        if mi_size < BLOCK_SIZES {
+            assert_eq!(
+                enc_cdfs.wedge_inter_intra[mi_size],
+                dec_cdfs.wedge_inter_intra[mi_size]
+            );
+            assert_eq!(enc_cdfs.wedge_index[mi_size], dec_cdfs.wedge_index[mi_size]);
+        }
+        got
+    }
+
+    /// Every §5.11.28 gate-closing clause (skip_mode, sequence flag,
+    /// compound, block-size band) writes no bits for the zero readout —
+    /// the emitted stream equals an untouched writer's.
+    #[test]
+    fn write_interintra_mode_gate_closed_writes_no_bits() {
+        // (mi_size, skip_mode, is_compound, enable)
+        let configs = [
+            (BLOCK_8X8, 1u8, false, true),
+            (BLOCK_8X8, 0u8, false, false),
+            (BLOCK_8X8, 0u8, true, true),
+            (BLOCK_4X4, 0u8, false, true),
+            (BLOCK_64X64, 0u8, false, true),
+        ];
+        for (mi_size, skip_mode, is_compound, enable) in configs {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_interintra_mode(
+                &mut writer,
+                &mut cdfs,
+                &ii_zero(),
+                mi_size,
+                skip_mode,
+                is_compound,
+                enable,
+            )
+            .unwrap();
+            let got = writer.finish();
+            let want = SymbolWriter::new(false).finish();
+            assert_eq!(got, want, "gate-closed config writes no symbols");
+        }
+    }
+
+    /// Gate closed but the readout claims a coded shape — caller bug.
+    #[test]
+    fn write_interintra_mode_gate_closed_rejects_nonzero_readout() {
+        let bad = InterIntraReadout {
+            interintra: 1,
+            interintra_mode: Some(0),
+            wedge_interintra: Some(0),
+            wedge_index: None,
+        };
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_interintra_mode(&mut writer, &mut cdfs, &bad, BLOCK_8X8, 1, false, true)
+            .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Gate open: `interintra = 0` plus all four inner-arm shapes
+    /// (every `interintra_mode`, wedge off) round-trip at every band
+    /// size.
+    #[test]
+    fn write_interintra_mode_round_trips_inner_arm_no_wedge() {
+        for mi_size in [BLOCK_8X8, BLOCK_16X16, BLOCK_32X32] {
+            let got = roundtrip_interintra(ii_zero(), mi_size, 0, false, true);
+            assert_eq!(got, ii_zero(), "interintra = 0 at mi_size {mi_size}");
+            for ii_mode in 0..INTERINTRA_MODES as u8 {
+                let readout = InterIntraReadout {
+                    interintra: 1,
+                    interintra_mode: Some(ii_mode),
+                    wedge_interintra: Some(0),
+                    wedge_index: None,
+                };
+                let got = roundtrip_interintra(readout, mi_size, 0, false, true);
+                assert_eq!(got, readout, "mode {ii_mode} at mi_size {mi_size}");
+            }
+        }
+    }
+
+    /// Gate open, wedge sub-branch: `wedge_index` extremes round-trip.
+    #[test]
+    fn write_interintra_mode_round_trips_wedge_indices() {
+        for wi in [0u8, 7, 15] {
+            let readout = InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(1),
+                wedge_interintra: Some(1),
+                wedge_index: Some(wi),
+            };
+            let got = roundtrip_interintra(readout, BLOCK_8X8, 0, false, true);
+            assert_eq!(got, readout, "wedge_index {wi}");
+        }
+    }
+
+    /// Readout shapes the §5.11.28 reader can never produce on an open
+    /// gate are rejected before any symbol decodes wrong.
+    #[test]
+    fn write_interintra_mode_rejects_inconsistent_readouts() {
+        let cases = [
+            // interintra out of the binary alphabet.
+            InterIntraReadout {
+                interintra: 2,
+                interintra_mode: None,
+                wedge_interintra: None,
+                wedge_index: None,
+            },
+            // interintra = 0 with a populated inner field.
+            InterIntraReadout {
+                interintra: 0,
+                interintra_mode: Some(0),
+                wedge_interintra: None,
+                wedge_index: None,
+            },
+            // interintra = 1 missing interintra_mode.
+            InterIntraReadout {
+                interintra: 1,
+                interintra_mode: None,
+                wedge_interintra: Some(0),
+                wedge_index: None,
+            },
+            // interintra_mode out of range.
+            InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(INTERINTRA_MODES as u8),
+                wedge_interintra: Some(0),
+                wedge_index: None,
+            },
+            // wedge_interintra = 1 missing wedge_index.
+            InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(0),
+                wedge_interintra: Some(1),
+                wedge_index: None,
+            },
+            // wedge_interintra = 0 with a stray wedge_index.
+            InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(0),
+                wedge_interintra: Some(0),
+                wedge_index: Some(0),
+            },
+            // wedge_index out of range.
+            InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(0),
+                wedge_interintra: Some(1),
+                wedge_index: Some(WEDGE_TYPES as u8),
+            },
+        ];
+        for bad in cases {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err =
+                write_interintra_mode(&mut writer, &mut cdfs, &bad, BLOCK_8X8, 0, false, true)
+                    .unwrap_err();
+            assert!(
+                matches!(err, Error::PartitionWalkOutOfRange),
+                "rejected {bad:?}"
+            );
+        }
+    }
+
+    /// `interintra = 0` on an open gate emits exactly one symbol —
+    /// byte-equal to an independent single-S() encode over the same row.
+    #[test]
+    fn write_interintra_mode_interintra_zero_emits_one_symbol() {
+        let mut a = TileCdfContext::new_from_defaults();
+        let mut wa = SymbolWriter::new(false);
+        write_interintra_mode(&mut wa, &mut a, &ii_zero(), BLOCK_16X16, 0, false, true).unwrap();
+        let got = wa.finish();
+
+        let mut b = TileCdfContext::new_from_defaults();
+        let mut wb = SymbolWriter::new(false);
+        let ctx = crate::cdf::interintra_ctx(BLOCK_16X16).unwrap();
+        let row = b.inter_intra_cdf(ctx).unwrap();
+        wb.write_symbol(0, row).unwrap();
+        let want = wb.finish();
+        assert_eq!(got, want, "open gate + interintra = 0 is one S()");
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.27 read_motion_mode — write_motion_mode round-trips through
+    // PartitionWalker::read_motion_mode (r276).
+    // -----------------------------------------------------------------
+
+    /// Build a 16×16 mi walker with one stamped inter neighbour above
+    /// `(2, 0)` so `has_overlappable_candidates()` is true for a
+    /// BLOCK_8X8 block at that position (the same fixture the decode
+    /// tests use).
+    fn walker_with_overlappable_above() -> PartitionWalker {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        walker.stamp_inter_neighbour(1, 0, BLOCK_8X8, [1, -1], MODE_NEARESTMV, [[0, 0], [0, 0]]);
+        walker
+    }
+
+    /// Every §5.11.27 short-circuit arm forces SIMPLE with no bits;
+    /// a non-SIMPLE target on those arms is a caller bug.
+    #[test]
+    fn write_motion_mode_short_circuit_arms_write_no_bits_and_reject_non_simple() {
+        // (mi_size, skip_mode, is_compound, ref_frame, y_mode,
+        //  switchable, force_integer_mv, gm_type_ref0, has_overlappable)
+        struct Arm {
+            mi_size: usize,
+            skip_mode: u8,
+            is_compound: bool,
+            ref_frame: [i32; 2],
+            y_mode: u8,
+            switchable: bool,
+            force_integer_mv: bool,
+            gm_type_ref0: i32,
+            has_overlappable: bool,
+        }
+        let base = Arm {
+            mi_size: BLOCK_16X16,
+            skip_mode: 0,
+            is_compound: false,
+            ref_frame: [1, -1],
+            y_mode: MODE_NEARESTMV,
+            switchable: true,
+            force_integer_mv: false,
+            gm_type_ref0: 0,
+            has_overlappable: true,
+        };
+        let arms = [
+            Arm {
+                skip_mode: 1,
+                ..base
+            },
+            Arm {
+                switchable: false,
+                ..base
+            },
+            // Min(Block_Width, Block_Height) < 8.
+            Arm {
+                mi_size: BLOCK_4X8,
+                ..base
+            },
+            // GLOBALMV with a beyond-TRANSLATION global model.
+            Arm {
+                y_mode: MODE_GLOBALMV,
+                gm_type_ref0: GM_TYPE_TRANSLATION + 1,
+                ..base
+            },
+            Arm {
+                is_compound: true,
+                ref_frame: [1, 4],
+                ..base
+            },
+            // RefFrame[1] == INTRA_FRAME = 0.
+            Arm {
+                ref_frame: [1, 0],
+                ..base
+            },
+            Arm {
+                has_overlappable: false,
+                ..base
+            },
+        ];
+        for (i, arm) in arms.iter().enumerate() {
+            let mut gm_type = [0i32; 8];
+            gm_type[arm.ref_frame[0] as usize] = arm.gm_type_ref0;
+            let run = |motion_mode: u8| {
+                let mut cdfs = TileCdfContext::new_from_defaults();
+                let mut writer = SymbolWriter::new(false);
+                let r = write_motion_mode(
+                    &mut writer,
+                    &mut cdfs,
+                    motion_mode,
+                    arm.mi_size,
+                    arm.skip_mode,
+                    arm.is_compound,
+                    arm.ref_frame,
+                    arm.y_mode,
+                    0,
+                    arm.switchable,
+                    true,
+                    arm.force_integer_mv,
+                    gm_type,
+                    [false; 7],
+                    arm.has_overlappable,
+                );
+                (r, writer.finish())
+            };
+            let (ok, bytes) = run(MOTION_MODE_SIMPLE);
+            ok.unwrap();
+            assert_eq!(
+                bytes,
+                SymbolWriter::new(false).finish(),
+                "short-circuit arm {i} writes no symbols"
+            );
+            let (err, _) = run(MOTION_MODE_OBMC);
+            assert!(
+                matches!(err.unwrap_err(), Error::PartitionWalkOutOfRange),
+                "short-circuit arm {i} rejects OBMC"
+            );
+        }
+    }
+
+    /// Arm A (`use_obmc` S(), forced via `force_integer_mv = true`):
+    /// SIMPLE and OBMC round-trip; WARPED_CAUSAL is unreachable.
+    #[test]
+    fn write_motion_mode_arm_a_round_trips() {
+        for target in [MOTION_MODE_SIMPLE, MOTION_MODE_OBMC] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_motion_mode(
+                &mut writer,
+                &mut enc_cdfs,
+                target,
+                BLOCK_8X8,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                0,
+                true,
+                true,
+                /* force_integer_mv = */ true,
+                [0; 8],
+                [false; 7],
+                true,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let walker = walker_with_overlappable_above();
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let got = walker
+                .read_motion_mode(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    2,
+                    0,
+                    BLOCK_8X8,
+                    0,
+                    false,
+                    [1, -1],
+                    MODE_NEARESTMV,
+                    0,
+                    true,
+                    true,
+                    true,
+                    [0; 8],
+                    [false; 7],
+                )
+                .unwrap();
+            assert_eq!(got, target, "arm A target {target} round-trips");
+            assert_eq!(enc_cdfs.use_obmc[BLOCK_8X8], dec_cdfs.use_obmc[BLOCK_8X8]);
+        }
+        // WARPED_CAUSAL on arm A is a caller bug.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_motion_mode(
+            &mut writer,
+            &mut cdfs,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            BLOCK_8X8,
+            0,
+            false,
+            [1, -1],
+            MODE_NEARESTMV,
+            0,
+            true,
+            true,
+            true,
+            [0; 8],
+            [false; 7],
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Arm B (`motion_mode` S(): `num_samples > 0`, warped motion
+    /// allowed, unscaled, fractional MVs): all three ordinals
+    /// round-trip.
+    #[test]
+    fn write_motion_mode_arm_b_round_trips() {
+        for target in 0..MOTION_MODES as u8 {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_motion_mode(
+                &mut writer,
+                &mut enc_cdfs,
+                target,
+                BLOCK_8X8,
+                0,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                /* num_samples = */ 2,
+                true,
+                true,
+                false,
+                [0; 8],
+                [false; 7],
+                true,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let walker = walker_with_overlappable_above();
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let got = walker
+                .read_motion_mode(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    2,
+                    0,
+                    BLOCK_8X8,
+                    0,
+                    false,
+                    [1, -1],
+                    MODE_NEARESTMV,
+                    2,
+                    true,
+                    true,
+                    false,
+                    [0; 8],
+                    [false; 7],
+                )
+                .unwrap();
+            assert_eq!(got, target, "arm B target {target} round-trips");
+            assert_eq!(
+                enc_cdfs.motion_mode[BLOCK_8X8],
+                dec_cdfs.motion_mode[BLOCK_8X8]
+            );
+        }
+    }
+
+    /// A scaled `RefFrame[ 0 ]` routes to arm A even with warp samples
+    /// available — WARPED_CAUSAL must be rejected and the `use_obmc`
+    /// row (not the `motion_mode` row) adapts.
+    #[test]
+    fn write_motion_mode_scaled_ref_routes_to_arm_a() {
+        let mut scaled = [false; 7];
+        scaled[0] = true; // LAST_FRAME.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let use_obmc_before = cdfs.use_obmc[BLOCK_8X8];
+        let motion_mode_before = cdfs.motion_mode[BLOCK_8X8];
+        let mut writer = SymbolWriter::new(false);
+        write_motion_mode(
+            &mut writer,
+            &mut cdfs,
+            MOTION_MODE_OBMC,
+            BLOCK_8X8,
+            0,
+            false,
+            [1, -1],
+            MODE_NEARESTMV,
+            2,
+            true,
+            true,
+            false,
+            [0; 8],
+            scaled,
+            true,
+        )
+        .unwrap();
+        assert_ne!(cdfs.use_obmc[BLOCK_8X8], use_obmc_before);
+        assert_eq!(cdfs.motion_mode[BLOCK_8X8], motion_mode_before);
+
+        let mut writer = SymbolWriter::new(false);
+        let err = write_motion_mode(
+            &mut writer,
+            &mut cdfs,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            BLOCK_8X8,
+            0,
+            false,
+            [1, -1],
+            MODE_NEARESTMV,
+            2,
+            true,
+            true,
+            false,
+            [0; 8],
+            scaled,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.29 read_compound_type — write_compound_type round-trips
+    // through PartitionWalker::read_compound_type (r276).
+    // -----------------------------------------------------------------
+
+    /// The §5.11.29 line-1/2 pre-set readout with `compound_type = ty`.
+    fn ct_preset(ty: u8) -> crate::cdf::CompoundTypeReadout {
+        crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: ty,
+            wedge_index: None,
+            wedge_sign: None,
+            mask_type: None,
+        }
+    }
+
+    /// Encode `readout` then decode it back through the §5.11.29 reader
+    /// on a fresh walker at `(2, 2)` with both neighbours available and
+    /// compound-coded (`!AboveSingle` / `!LeftSingle` — the grid
+    /// pre-fill identities 0 / 1 feed both ctx walks on both sides).
+    #[allow(clippy::too_many_arguments)]
+    fn roundtrip_compound_type(
+        readout: crate::cdf::CompoundTypeReadout,
+        mi_size: usize,
+        skip_mode: u8,
+        is_compound: bool,
+        interintra: u8,
+        wedge_interintra: u8,
+        enable_masked_compound: bool,
+        enable_jnt_comp: bool,
+        dist_equal: bool,
+    ) -> crate::cdf::CompoundTypeReadout {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_compound_type(
+            &mut writer,
+            &mut enc_cdfs,
+            &readout,
+            mi_size,
+            skip_mode,
+            is_compound,
+            interintra,
+            wedge_interintra,
+            enable_masked_compound,
+            enable_jnt_comp,
+            dist_equal,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            // Grid pre-fill identities for a fresh walker.
+            0,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), false).unwrap();
+        walker
+            .read_compound_type(
+                &mut dec,
+                &mut dec_cdfs,
+                2,
+                2,
+                mi_size,
+                skip_mode,
+                is_compound,
+                interintra,
+                wedge_interintra,
+                enable_masked_compound,
+                enable_jnt_comp,
+                dist_equal,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap()
+    }
+
+    /// `skip_mode` short-circuit: the pre-set readout writes no bits;
+    /// anything else on that arm is a caller bug.
+    #[test]
+    fn write_compound_type_skip_mode_writes_no_bits() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_compound_type(
+            &mut writer,
+            &mut cdfs,
+            &ct_preset(COMPOUND_AVERAGE),
+            BLOCK_8X8,
+            1,
+            true,
+            0,
+            0,
+            true,
+            true,
+            false,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            0,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(writer.finish(), SymbolWriter::new(false).finish());
+
+        let mut writer = SymbolWriter::new(false);
+        let err = write_compound_type(
+            &mut writer,
+            &mut cdfs,
+            &ct_preset(COMPOUND_DISTANCE),
+            BLOCK_8X8,
+            1,
+            true,
+            0,
+            0,
+            true,
+            true,
+            false,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            0,
+            0,
+            1,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Single-pred else-arm: the §5.11.28 outcome alone selects the
+    /// type, no bits on any of the three shapes; a mismatched type is
+    /// rejected.
+    #[test]
+    fn write_compound_type_single_pred_arms_write_no_bits() {
+        // (interintra, wedge_interintra, expected type)
+        let shapes = [
+            (0u8, 0u8, COMPOUND_AVERAGE),
+            (1, 0, COMPOUND_INTRA),
+            (1, 1, COMPOUND_WEDGE),
+        ];
+        for (ii, wii, expected) in shapes {
+            let got = roundtrip_compound_type(
+                ct_preset(expected),
+                BLOCK_8X8,
+                0,
+                false,
+                ii,
+                wii,
+                true,
+                true,
+                false,
+            );
+            assert_eq!(got, ct_preset(expected), "shape ({ii}, {wii})");
+
+            // Mismatched type — pick a type the arm can't produce.
+            let bad = if expected == COMPOUND_AVERAGE {
+                COMPOUND_INTRA
+            } else {
+                COMPOUND_AVERAGE
+            };
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_compound_type(
+                &mut writer,
+                &mut cdfs,
+                &ct_preset(bad),
+                BLOCK_8X8,
+                0,
+                false,
+                ii,
+                wii,
+                true,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                0,
+                0,
+                1,
+                1,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+    }
+
+    /// Compound group-1 wedge path: `comp_group_idx = 1`,
+    /// `compound_type = COMPOUND_WEDGE`, `wedge_index` S() +
+    /// `wedge_sign` L(1) all round-trip.
+    #[test]
+    fn write_compound_type_group1_wedge_round_trips() {
+        for (wi, ws) in [(0u8, 0u8), (5, 1), (15, 0)] {
+            let readout = crate::cdf::CompoundTypeReadout {
+                comp_group_idx: 1,
+                compound_idx: 1,
+                compound_type: COMPOUND_WEDGE,
+                wedge_index: Some(wi),
+                wedge_sign: Some(ws),
+                mask_type: None,
+            };
+            let got = roundtrip_compound_type(readout, BLOCK_8X8, 0, true, 0, 0, true, true, false);
+            assert_eq!(got, readout, "wedge ({wi}, {ws})");
+        }
+    }
+
+    /// Compound group-1 diffwtd path (`Wedge_Bits > 0` so the type is
+    /// S()-coded): `mask_type` L(1) round-trips both ways.
+    #[test]
+    fn write_compound_type_group1_diffwtd_round_trips() {
+        for mt in [0u8, 1] {
+            let readout = crate::cdf::CompoundTypeReadout {
+                comp_group_idx: 1,
+                compound_idx: 1,
+                compound_type: COMPOUND_DIFFWTD,
+                wedge_index: None,
+                wedge_sign: None,
+                mask_type: Some(mt),
+            };
+            let got = roundtrip_compound_type(readout, BLOCK_8X8, 0, true, 0, 0, true, true, false);
+            assert_eq!(got, readout, "diffwtd mask_type {mt}");
+        }
+    }
+
+    /// Compound group-1 with `Wedge_Bits[ MiSize ] == 0` (BLOCK_64X64):
+    /// the type is forced to COMPOUND_DIFFWTD with no `compound_type`
+    /// S(); claiming COMPOUND_WEDGE there is a caller bug.
+    #[test]
+    fn write_compound_type_group1_n_zero_forces_diffwtd() {
+        let readout = crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 1,
+            compound_idx: 1,
+            compound_type: COMPOUND_DIFFWTD,
+            wedge_index: None,
+            wedge_sign: None,
+            mask_type: Some(1),
+        };
+        let got = roundtrip_compound_type(readout, BLOCK_64X64, 0, true, 0, 0, true, true, false);
+        assert_eq!(got, readout);
+
+        let bad = crate::cdf::CompoundTypeReadout {
+            compound_type: COMPOUND_WEDGE,
+            wedge_index: Some(0),
+            wedge_sign: Some(0),
+            mask_type: None,
+            ..readout
+        };
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_compound_type(
+            &mut writer,
+            &mut cdfs,
+            &bad,
+            BLOCK_64X64,
+            0,
+            true,
+            0,
+            0,
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            0,
+            0,
+            1,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Compound group-0 jnt path: `compound_idx = 1 ⇒ AVERAGE` and
+    /// `compound_idx = 0 ⇒ DISTANCE` round-trip under both `dist_equal`
+    /// seeds (ctx 0 + 2 vs ctx 3 + 2).
+    #[test]
+    fn write_compound_type_group0_jnt_round_trips() {
+        for dist_equal in [false, true] {
+            for (ci, ty) in [(1u8, COMPOUND_AVERAGE), (0, COMPOUND_DISTANCE)] {
+                let readout = crate::cdf::CompoundTypeReadout {
+                    comp_group_idx: 0,
+                    compound_idx: ci,
+                    compound_type: ty,
+                    wedge_index: None,
+                    wedge_sign: None,
+                    mask_type: None,
+                };
+                let got = roundtrip_compound_type(
+                    readout, BLOCK_8X8, 0, true, 0, 0, true, true, dist_equal,
+                );
+                assert_eq!(got, readout, "jnt ({ci}, dist_equal {dist_equal})");
+            }
+        }
+    }
+
+    /// Compound group-0 without jnt: only the `comp_group_idx` S() is
+    /// coded — byte-equal to an independent single-symbol encode.
+    #[test]
+    fn write_compound_type_group0_no_jnt_emits_one_symbol() {
+        let mut a = TileCdfContext::new_from_defaults();
+        let mut wa = SymbolWriter::new(false);
+        write_compound_type(
+            &mut wa,
+            &mut a,
+            &ct_preset(COMPOUND_AVERAGE),
+            BLOCK_8X8,
+            0,
+            true,
+            0,
+            0,
+            true,
+            /* enable_jnt_comp = */ false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            0,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
+        let got = wa.finish();
+
+        let mut b = TileCdfContext::new_from_defaults();
+        let mut wb = SymbolWriter::new(false);
+        let ctx = crate::cdf::comp_group_idx_ctx(true, false, 0, false, true, false, 0, false);
+        let row = b.comp_group_idx_cdf(ctx);
+        wb.write_symbol(0, row).unwrap();
+        let want = wb.finish();
+        assert_eq!(
+            got, want,
+            "group-0 no-jnt is exactly one comp_group_idx S()"
+        );
+    }
+
+    /// Readout shapes the §5.11.29 reader can never produce are
+    /// rejected.
+    #[test]
+    fn write_compound_type_rejects_inconsistent_readouts() {
+        let run =
+            |readout: &crate::cdf::CompoundTypeReadout, enable_masked: bool, enable_jnt: bool| {
+                let mut cdfs = TileCdfContext::new_from_defaults();
+                let mut writer = SymbolWriter::new(false);
+                write_compound_type(
+                    &mut writer,
+                    &mut cdfs,
+                    readout,
+                    BLOCK_8X8,
+                    0,
+                    true,
+                    0,
+                    0,
+                    enable_masked,
+                    enable_jnt,
+                    false,
+                    true,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    0,
+                    1,
+                    1,
+                )
+            };
+        // comp_group_idx = 1 with masked compound disabled.
+        let bad = crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 1,
+            compound_idx: 1,
+            compound_type: COMPOUND_DIFFWTD,
+            wedge_index: None,
+            wedge_sign: None,
+            mask_type: Some(0),
+        };
+        assert!(run(&bad, false, true).is_err());
+        // jnt arm with a type inconsistent with compound_idx.
+        let bad = crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: COMPOUND_DISTANCE,
+            wedge_index: None,
+            wedge_sign: None,
+            mask_type: None,
+        };
+        assert!(run(&bad, true, true).is_err());
+        // wedge type missing its sub-branch fields.
+        let bad = crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 1,
+            compound_idx: 1,
+            compound_type: COMPOUND_WEDGE,
+            wedge_index: None,
+            wedge_sign: None,
+            mask_type: None,
+        };
+        assert!(run(&bad, true, true).is_err());
+        // diffwtd type with stray wedge fields.
+        let bad = crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 1,
+            compound_idx: 1,
+            compound_type: COMPOUND_DIFFWTD,
+            wedge_index: Some(0),
+            wedge_sign: None,
+            mask_type: Some(0),
+        };
+        assert!(run(&bad, true, true).is_err());
+        // wedge_index out of range.
+        let bad = crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 1,
+            compound_idx: 1,
+            compound_type: COMPOUND_WEDGE,
+            wedge_index: Some(WEDGE_TYPES as u8),
+            wedge_sign: Some(0),
+            mask_type: None,
+        };
+        assert!(run(&bad, true, true).is_err());
+        // group-0 no-jnt arm with a non-preset compound_idx.
+        let bad = crate::cdf::CompoundTypeReadout {
+            comp_group_idx: 0,
+            compound_idx: 0,
+            compound_type: COMPOUND_AVERAGE,
+            wedge_index: None,
+            wedge_sign: None,
+            mask_type: None,
+        };
+        assert!(run(&bad, true, false).is_err());
     }
 }

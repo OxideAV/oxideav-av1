@@ -4,6 +4,37 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r276 (2026-06-11): land the §5.11.23 tail leaf writers after
+  `assign_mv( )` — the write sides of all three post-MV per-block
+  readers, each the exact encode-side inverse of its `PartitionWalker`
+  decode twin. `encoder::block_mode_info::write_interintra_mode`
+  (§5.11.28, av1-spec p.79-80): outer gate re-derivation + the
+  `interintra` / `interintra_mode` / `wedge_interintra` / optional
+  `wedge_index` S() cascade from a target `InterIntraReadout` (§8.3.2
+  ctx `Size_Group[ MiSize ] - 1` for the first pair, straight `MiSize`
+  for the wedge pair). `encoder::block_mode_info::write_motion_mode`
+  (§5.11.27, av1-spec p.79): every SIMPLE short-circuit (skip_mode /
+  not-switchable / sub-8 block / beyond-TRANSLATION global model /
+  compound / slot-1-INTRA / no overlappable candidates) plus the arm-A
+  `use_obmc` S() vs arm-B `motion_mode` S() dispatch on
+  `force_integer_mv || NumSamples == 0 || !allow_warped_motion ||
+  is_scaled( RefFrame[ 0 ] )`; the walker-derived
+  `has_overlappable_candidates()` / `NumSamples` arrive precomputed per
+  the stateless-writer doctrine.
+  `encoder::block_mode_info::write_compound_type` (§5.11.29, av1-spec
+  p.80-81): skip_mode + single-pred no-bit arms, `comp_group_idx` S()
+  (ctx via `comp_group_idx_ctx`), group-0 `compound_idx` S() (ctx via
+  `compound_idx_ctx` with the `dist_equal` seed), group-1
+  `compound_type` S() with the `Wedge_Bits[ MiSize ] == 0` DIFFWTD
+  force, and the wedge (`wedge_index` S() + `wedge_sign` L(1)) /
+  diffwtd (`mask_type` L(1)) sub-branches. Every derived field of the
+  target readouts is cross-checked against the active arm; a shape the
+  reader could never produce is rejected. +18 tests round-tripping
+  through the actual decode twins with per-row CDF-adaptation equality,
+  no-bit byte-equality on every short-circuit arm, and reject batteries
+  for reader-unreachable readout shapes. Library test count
+  1879 → 1897. The `interp_filter` loop write side and the tail
+  composition into `write_inter_block_mode_info` are the follow-up.
 - encoder r275 (2026-06-11): compose the §5.11.23 `inter_block_mode_info( )`
   body — `encoder::block_mode_info::write_inter_block_mode_info`
   (av1-spec p.73-75). Folds the r266-r274 leaf writers
