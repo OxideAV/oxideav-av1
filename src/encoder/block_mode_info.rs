@@ -48,15 +48,15 @@
 //! [`segment_id_ctx`]: crate::cdf::segment_id_ctx
 
 use crate::cdf::{
-    block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, is_directional,
-    mi_height_log2, mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx,
-    PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL,
-    DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS,
-    IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
-    PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, SEGMENT_ID_CONTEXTS,
-    SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED,
-    UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_ref_type_ctx,
+    count_refs, is_directional, is_samedir_ref_pair, mi_height_log2, mi_width_log2, neg_interleave,
+    palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx, PartitionWalker, TileCdfContext,
+    BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE,
+    CFL_JOINT_SIGNS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT,
+    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA,
+    MAX_SEGMENTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
+    PALETTE_COLORS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS,
+    SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -3830,6 +3830,278 @@ pub fn write_comp_mode(
         }
         Ok(())
     }
+}
+
+/// COMPOUND_REFERENCE body writer per §5.11.25 `read_ref_frames( )`
+/// arm 4 (av1-spec p.76-77) — r268. Encodes the `comp_ref_type` /
+/// `uni_comp_ref` / `uni_comp_ref_p1` / `uni_comp_ref_p2` /
+/// `comp_ref` / `comp_ref_p1` / `comp_ref_p2` / `comp_bwdref` /
+/// `comp_bwdref_p1` cascade that follows a
+/// `comp_mode == COMPOUND_REFERENCE` outcome of [`write_comp_mode`].
+/// This is the exact algebraic inverse of the §5.11.25
+/// `if ( comp_mode == COMPOUND_REFERENCE )` body: each branch
+/// condition the reader evaluates on a decoded bit becomes a bit
+/// derived here from the target `RefFrame[ 0..2 ]` pair.
+///
+/// ## Spec body (§5.11.25 COMPOUND_REFERENCE arm — av1-spec p.76-77)
+///
+/// ```text
+///   if ( comp_mode == COMPOUND_REFERENCE ) {
+///       comp_ref_type                                              S()
+///       if ( comp_ref_type == UNIDIR_COMP_REFERENCE ) {
+///            uni_comp_ref                                          S()
+///            if ( uni_comp_ref ) {
+///                RefFrame[0] = BWDREF_FRAME; RefFrame[1] = ALTREF_FRAME
+///            } else {
+///                uni_comp_ref_p1                                   S()
+///                if ( uni_comp_ref_p1 ) {
+///                     uni_comp_ref_p2                              S()
+///                     if ( uni_comp_ref_p2 ) {
+///                       RefFrame[0] = LAST_FRAME; RefFrame[1] = GOLDEN_FRAME
+///                     } else {
+///                       RefFrame[0] = LAST_FRAME; RefFrame[1] = LAST3_FRAME
+///                     }
+///                } else {
+///                     RefFrame[0] = LAST_FRAME; RefFrame[1] = LAST2_FRAME
+///                }
+///            }
+///       } else {
+///            comp_ref                                              S()
+///            if ( comp_ref == 0 ) {
+///                comp_ref_p1                                       S()
+///                RefFrame[ 0 ] = comp_ref_p1 ? LAST2_FRAME : LAST_FRAME
+///            } else {
+///                comp_ref_p2                                       S()
+///                RefFrame[ 0 ] = comp_ref_p2 ? GOLDEN_FRAME : LAST3_FRAME
+///            }
+///            comp_bwdref                                           S()
+///            if ( comp_bwdref == 0 ) {
+///                comp_bwdref_p1                                    S()
+///                RefFrame[ 1 ] = comp_bwdref_p1 ? ALTREF2_FRAME : BWDREF_FRAME
+///            } else {
+///                RefFrame[ 1 ] = ALTREF_FRAME
+///            }
+///       }
+///   }
+/// ```
+///
+/// ## Inverse derivations
+///
+/// `comp_ref_type` itself is derived, not caller-chosen: §6.10.24
+/// defines `UNIDIR_COMP_REFERENCE = 0` as "both reference frames from
+/// the same group" and `BIDIR_COMP_REFERENCE = 1` as "one from Group 1
+/// and one from Group 2", which is exactly the §8.3.2
+/// `is_samedir_ref_pair( ref0, ref1 )` predicate (av1-spec p.383):
+/// `comp_ref_type = is_samedir_ref_pair( .. ) ? UNIDIR : BIDIR`. The
+/// per-bit inverses then read off the §5.11.25 leaf assignments:
+///
+/// * `uni_comp_ref = ( pair == ( BWDREF_FRAME, ALTREF_FRAME ) )`
+/// * `uni_comp_ref_p1 = ( RefFrame[ 1 ] != LAST2_FRAME )`
+/// * `uni_comp_ref_p2 = ( RefFrame[ 1 ] == GOLDEN_FRAME )`
+/// * `comp_ref = ( RefFrame[ 0 ] >= LAST3_FRAME )`
+/// * `comp_ref_p1 = ( RefFrame[ 0 ] == LAST2_FRAME )`
+/// * `comp_ref_p2 = ( RefFrame[ 0 ] == GOLDEN_FRAME )`
+/// * `comp_bwdref = ( RefFrame[ 1 ] == ALTREF_FRAME )`
+/// * `comp_bwdref_p1 = ( RefFrame[ 1 ] == ALTREF2_FRAME )`
+///
+/// ## Inputs
+///
+/// * `ref_frame` — the target `( RefFrame[ 0 ], RefFrame[ 1 ] )`
+///   compound pair. The §5.11.25 tree reaches exactly sixteen pairs:
+///   the four UNIDIR leaves `( BWDREF = 5, ALTREF = 7 )`,
+///   `( LAST = 1, LAST2 = 2 )`, `( LAST = 1, LAST3 = 3 )`,
+///   `( LAST = 1, GOLDEN = 4 )`, and the twelve BIDIR products of
+///   `RefFrame[ 0 ] ∈ { LAST, LAST2, LAST3, GOLDEN } = Group 1` with
+///   `RefFrame[ 1 ] ∈ { BWDREF, ALTREF2, ALTREF } = Group 2`
+///   (§6.10.24). Any other pair is a caller bug.
+/// * `avail_u` / `avail_l` / `above_single` / `left_single` /
+///   `above_intra` / `left_intra` / `above_ref_frame` /
+///   `left_ref_frame` — the §5.11.18 prologue neighbour-state octet,
+///   identical to the surface
+///   [`crate::cdf::PartitionWalker::decode_inter_block_mode_info`]
+///   consumes. **Deviation from this module's caller-supplied-ctx
+///   convention:** the COMPOUND body selects up to five distinct
+///   §8.3.2 ctx values (`comp_ref_type` p.382 plus four
+///   `ref_count_ctx` selections, one per emitted bit), all derived
+///   from this one octet via the public [`comp_ref_type_ctx`] /
+///   [`count_refs`] / [`ref_count_ctx`] helpers. Passing them
+///   severally would invite mismatched-row bugs between sibling
+///   symbols, so the writer derives every ctx internally — exactly
+///   the lines the decoder's §5.11.25 reader executes.
+///
+/// ## Out-of-range / mismatch cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * Either `ref_frame` slot outside `LAST_FRAME..=ALTREF_FRAME`
+///   (`1..=7`) — a compound pair never carries `INTRA_FRAME = 0` or
+///   `NONE = -1` (§6.10.24).
+/// * A same-group pair that is not one of the four UNIDIR leaves
+///   (e.g. `( LAST2, LAST3 )` or `( BWDREF, ALTREF2 )`) — the
+///   §5.11.25 UNIDIR sub-tree cannot express it.
+/// * A different-group pair with `RefFrame[ 0 ]` from Group 2 (e.g.
+///   `( BWDREF, LAST )`) — the §5.11.25 BIDIR sub-tree always puts
+///   the Group-1 frame in slot 0 (§6.10.24).
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless (mirrors [`write_comp_mode`]): between two and five
+/// §8.2.6 `S()` symbols are written depending on the leaf. The caller
+/// stamps the pair onto the block footprint through its own
+/// [`crate::cdf::PartitionWalker`] so subsequent blocks' §8.3.2
+/// neighbour walks observe it.
+#[allow(clippy::too_many_arguments)]
+pub fn write_compound_ref_frames(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    ref_frame: [i32; 2],
+    avail_u: bool,
+    avail_l: bool,
+    above_single: bool,
+    left_single: bool,
+    above_intra: bool,
+    left_intra: bool,
+    above_ref_frame: [i32; 2],
+    left_ref_frame: [i32; 2],
+) -> Result<(), Error> {
+    let ref0 = ref_frame[0];
+    let ref1 = ref_frame[1];
+
+    // §6.10.24: compound pairs carry two LAST_FRAME..=ALTREF_FRAME
+    // (1..=7) indices — INTRA_FRAME = 0 and NONE = -1 are invalid.
+    if !(1..=7).contains(&ref0) || !(1..=7).contains(&ref1) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §6.10.24 / §8.3.2 p.383: UNIDIR_COMP_REFERENCE = 0 ⇔ both refs
+    // in the same direction group ⇔ `is_samedir_ref_pair( ref0, ref1 )`.
+    let unidir = is_samedir_ref_pair(ref0, ref1);
+
+    if unidir {
+        // §5.11.25 UNIDIR leaves: (BWDREF = 5, ALTREF = 7),
+        // (LAST = 1, LAST2 = 2), (LAST = 1, LAST3 = 3),
+        // (LAST = 1, GOLDEN = 4). Any other same-group pair is
+        // unreachable by the sub-tree.
+        if !matches!((ref0, ref1), (5, 7) | (1, 2) | (1, 3) | (1, 4)) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    } else if ref0 > 4 {
+        // §6.10.24 BIDIR: slot 0 is the Group-1 (forward) frame
+        // (LAST..=GOLDEN = 1..=4); slot 1 the Group-2 (backward)
+        // frame. With `!is_samedir_ref_pair` and both slots in 1..=7,
+        // `ref0 <= 4` forces `ref1 >= 5`; a Group-2 slot 0 cannot be
+        // expressed.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §8.3.2 `count_refs( frameType )` against the fixed neighbour
+    // octet (av1-spec p.366) — every per-bit `ref_count_ctx` selection
+    // below consumes these counts.
+    let cnt = |frame_type: i32| {
+        count_refs(
+            frame_type,
+            avail_u,
+            above_ref_frame,
+            avail_l,
+            left_ref_frame,
+        )
+    };
+
+    // §5.11.25: `comp_ref_type` S() over `TileCompRefTypeCdf[ ctx ]`
+    // (§8.3.2 p.382).
+    let crt_ctx = comp_ref_type_ctx(
+        avail_u,
+        avail_l,
+        above_single,
+        left_single,
+        above_intra,
+        left_intra,
+        above_ref_frame,
+        left_ref_frame,
+    );
+    let row = cdfs.comp_ref_type_cdf(crt_ctx);
+    writer.write_symbol(!unidir as u32, row)?;
+
+    if unidir {
+        // §5.11.25: `uni_comp_ref` S() over `TileUniCompRefCdf[ ctx ][ 0 ]`.
+        // §8.3.2 p.383: ctx as in the `single_ref_p1` selection (p.368)
+        // — `fwdCount` (LAST + LAST2 + LAST3 + GOLDEN) vs `bwdCount`
+        // (BWDREF + ALTREF2 + ALTREF).
+        let ucr_ctx = ref_count_ctx(cnt(1) + cnt(2) + cnt(3) + cnt(4), cnt(5) + cnt(6) + cnt(7));
+        // Inverse of `if ( uni_comp_ref ) { RefFrame = (BWDREF, ALTREF) }`.
+        let uni_comp_ref = ((ref0, ref1) == (5, 7)) as u32;
+        let row = cdfs.uni_comp_ref_cdf(ucr_ctx, 0);
+        writer.write_symbol(uni_comp_ref, row)?;
+
+        if uni_comp_ref == 0 {
+            // §5.11.25: `uni_comp_ref_p1` S() over
+            // `TileUniCompRefCdf[ ctx ][ 1 ]`. §8.3.2 p.383 ctx:
+            // `last2Count` vs `last3GoldCount`.
+            let p1_ctx = ref_count_ctx(cnt(2), cnt(3) + cnt(4));
+            // Inverse: p1 == 0 ⇒ (LAST, LAST2); p1 == 1 ⇒ p2 leaf.
+            let uni_comp_ref_p1 = (ref1 != 2) as u32;
+            let row = cdfs.uni_comp_ref_cdf(p1_ctx, 1);
+            writer.write_symbol(uni_comp_ref_p1, row)?;
+
+            if uni_comp_ref_p1 == 1 {
+                // §5.11.25: `uni_comp_ref_p2` S() over
+                // `TileUniCompRefCdf[ ctx ][ 2 ]`. §8.3.2 p.383 ctx:
+                // as in `comp_ref_p2` (p.367) — `last3Count` vs
+                // `goldCount`.
+                let p2_ctx = ref_count_ctx(cnt(3), cnt(4));
+                // Inverse: p2 ⇒ (LAST, GOLDEN), else (LAST, LAST3).
+                let uni_comp_ref_p2 = (ref1 == 4) as u32;
+                let row = cdfs.uni_comp_ref_cdf(p2_ctx, 2);
+                writer.write_symbol(uni_comp_ref_p2, row)?;
+            }
+        }
+    } else {
+        // §5.11.25: `comp_ref` S() over `TileCompRefCdf[ ctx ][ 0 ]`.
+        // §8.3.2 p.366 ctx: `last12Count` vs `last3GoldCount`.
+        let cr_ctx = ref_count_ctx(cnt(1) + cnt(2), cnt(3) + cnt(4));
+        // Inverse of the two `RefFrame[ 0 ]` leaf groups:
+        // comp_ref == 0 ⇒ { LAST, LAST2 }, == 1 ⇒ { LAST3, GOLDEN }.
+        let comp_ref = (ref0 >= 3) as u32;
+        let row = cdfs.comp_ref_cdf(cr_ctx, 0);
+        writer.write_symbol(comp_ref, row)?;
+
+        if comp_ref == 0 {
+            // §5.11.25: `comp_ref_p1` S() over `TileCompRefCdf[ ctx ][ 1 ]`.
+            // §8.3.2 p.367 ctx: `lastCount` vs `last2Count`. Inverse of
+            // `RefFrame[ 0 ] = comp_ref_p1 ? LAST2_FRAME : LAST_FRAME`.
+            let p1_ctx = ref_count_ctx(cnt(1), cnt(2));
+            let comp_ref_p1 = (ref0 == 2) as u32;
+            let row = cdfs.comp_ref_cdf(p1_ctx, 1);
+            writer.write_symbol(comp_ref_p1, row)?;
+        } else {
+            // §5.11.25: `comp_ref_p2` S() over `TileCompRefCdf[ ctx ][ 2 ]`.
+            // §8.3.2 p.367 ctx: `last3Count` vs `goldCount`. Inverse of
+            // `RefFrame[ 0 ] = comp_ref_p2 ? GOLDEN_FRAME : LAST3_FRAME`.
+            let p2_ctx = ref_count_ctx(cnt(3), cnt(4));
+            let comp_ref_p2 = (ref0 == 4) as u32;
+            let row = cdfs.comp_ref_cdf(p2_ctx, 2);
+            writer.write_symbol(comp_ref_p2, row)?;
+        }
+
+        // §5.11.25: `comp_bwdref` S() over `TileCompBwdRefCdf[ ctx ][ 0 ]`.
+        // §8.3.2 p.367 ctx: `brfarf2Count` vs `arfCount`. Inverse of
+        // `if ( comp_bwdref == 0 ) .. else RefFrame[ 1 ] = ALTREF_FRAME`.
+        let bw_ctx = ref_count_ctx(cnt(5) + cnt(6), cnt(7));
+        let comp_bwdref = (ref1 == 7) as u32;
+        let row = cdfs.comp_bwd_ref_cdf(bw_ctx, 0);
+        writer.write_symbol(comp_bwdref, row)?;
+
+        if comp_bwdref == 0 {
+            // §5.11.25: `comp_bwdref_p1` S() over
+            // `TileCompBwdRefCdf[ ctx ][ 1 ]`. §8.3.2 p.367 ctx:
+            // `brfCount` vs `arf2Count`. Inverse of `RefFrame[ 1 ] =
+            // comp_bwdref_p1 ? ALTREF2_FRAME : BWDREF_FRAME`.
+            let p1_ctx = ref_count_ctx(cnt(5), cnt(6));
+            let comp_bwdref_p1 = (ref1 == 6) as u32;
+            let row = cdfs.comp_bwd_ref_cdf(p1_ctx, 1);
+            writer.write_symbol(comp_bwdref_p1, row)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
@@ -10792,5 +11064,499 @@ mod tests {
                 assert_eq!(got, value, "ctx {ctx} value {value} round-trip");
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.25 arm 4 COMPOUND_REFERENCE body — write_compound_ref_frames.
+    // -----------------------------------------------------------------
+
+    /// The §5.11.18 prologue neighbour-state octet the writer and the
+    /// mirror reader both consume. Bundled so a test cannot
+    /// accidentally hand the two sides different neighbour state.
+    #[derive(Clone, Copy)]
+    struct NeighbourOctet {
+        avail_u: bool,
+        avail_l: bool,
+        above_single: bool,
+        left_single: bool,
+        above_intra: bool,
+        left_intra: bool,
+        above_ref_frame: [i32; 2],
+        left_ref_frame: [i32; 2],
+    }
+
+    /// Frame-origin octet: both neighbours unavailable. Every
+    /// `count_refs` is 0 ⇒ every `ref_count_ctx` selection is 1, and
+    /// the §8.3.2 p.382 `comp_ref_type` ctx falls to the final `else`
+    /// arm (`ctx = 2`).
+    const ORIGIN: NeighbourOctet = NeighbourOctet {
+        avail_u: false,
+        avail_l: false,
+        above_single: true,
+        left_single: true,
+        above_intra: false,
+        left_intra: false,
+        above_ref_frame: [-1, -1],
+        left_ref_frame: [-1, -1],
+    };
+
+    /// The sixteen compound pairs the §5.11.25 COMPOUND_REFERENCE
+    /// sub-tree reaches: four UNIDIR leaves + the 4 × 3 BIDIR product
+    /// (§6.10.24 Group 1 × Group 2).
+    const UNIDIR_PAIRS: [[i32; 2]; 4] = [[5, 7], [1, 2], [1, 3], [1, 4]];
+    const BIDIR_PAIRS: [[i32; 2]; 12] = [
+        [1, 5],
+        [1, 6],
+        [1, 7],
+        [2, 5],
+        [2, 6],
+        [2, 7],
+        [3, 5],
+        [3, 6],
+        [3, 7],
+        [4, 5],
+        [4, 6],
+        [4, 7],
+    ];
+
+    /// Mirror of the decoder's §5.11.25 COMPOUND_REFERENCE symbol
+    /// reads: `comp_ref_type` then the UNIDIR / BIDIR cascade, each
+    /// `S()` against the same §8.3.2 CDF row selection the writer
+    /// derives. Returns the decoded `RefFrame[ 0..2 ]` pair.
+    fn read_compound_ref_frames_mirror(
+        dec: &mut SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        n: NeighbourOctet,
+    ) -> [i32; 2] {
+        let cnt = |ft: i32| {
+            count_refs(
+                ft,
+                n.avail_u,
+                n.above_ref_frame,
+                n.avail_l,
+                n.left_ref_frame,
+            )
+        };
+        // `comp_ref_type` S() (§8.3.2 p.382).
+        let crt_ctx = comp_ref_type_ctx(
+            n.avail_u,
+            n.avail_l,
+            n.above_single,
+            n.left_single,
+            n.above_intra,
+            n.left_intra,
+            n.above_ref_frame,
+            n.left_ref_frame,
+        );
+        let comp_ref_type = dec.read_symbol(cdfs.comp_ref_type_cdf(crt_ctx)).unwrap();
+        if comp_ref_type == 0 {
+            // UNIDIR_COMP_REFERENCE: `uni_comp_ref` cascade.
+            let ucr_ctx =
+                ref_count_ctx(cnt(1) + cnt(2) + cnt(3) + cnt(4), cnt(5) + cnt(6) + cnt(7));
+            let uni = dec.read_symbol(cdfs.uni_comp_ref_cdf(ucr_ctx, 0)).unwrap();
+            if uni != 0 {
+                return [5, 7]; // (BWDREF_FRAME, ALTREF_FRAME)
+            }
+            let p1_ctx = ref_count_ctx(cnt(2), cnt(3) + cnt(4));
+            let p1 = dec.read_symbol(cdfs.uni_comp_ref_cdf(p1_ctx, 1)).unwrap();
+            if p1 == 0 {
+                return [1, 2]; // (LAST_FRAME, LAST2_FRAME)
+            }
+            let p2_ctx = ref_count_ctx(cnt(3), cnt(4));
+            let p2 = dec.read_symbol(cdfs.uni_comp_ref_cdf(p2_ctx, 2)).unwrap();
+            if p2 != 0 {
+                [1, 4] // (LAST_FRAME, GOLDEN_FRAME)
+            } else {
+                [1, 3] // (LAST_FRAME, LAST3_FRAME)
+            }
+        } else {
+            // BIDIR_COMP_REFERENCE: `comp_ref` then `comp_bwdref`.
+            let cr_ctx = ref_count_ctx(cnt(1) + cnt(2), cnt(3) + cnt(4));
+            let comp_ref = dec.read_symbol(cdfs.comp_ref_cdf(cr_ctx, 0)).unwrap();
+            let ref0 = if comp_ref == 0 {
+                let p1_ctx = ref_count_ctx(cnt(1), cnt(2));
+                let p1 = dec.read_symbol(cdfs.comp_ref_cdf(p1_ctx, 1)).unwrap();
+                if p1 != 0 {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                let p2_ctx = ref_count_ctx(cnt(3), cnt(4));
+                let p2 = dec.read_symbol(cdfs.comp_ref_cdf(p2_ctx, 2)).unwrap();
+                if p2 != 0 {
+                    4
+                } else {
+                    3
+                }
+            };
+            let bw_ctx = ref_count_ctx(cnt(5) + cnt(6), cnt(7));
+            let bwdref = dec.read_symbol(cdfs.comp_bwd_ref_cdf(bw_ctx, 0)).unwrap();
+            let ref1 = if bwdref == 0 {
+                let p1_ctx = ref_count_ctx(cnt(5), cnt(6));
+                let p1 = dec.read_symbol(cdfs.comp_bwd_ref_cdf(p1_ctx, 1)).unwrap();
+                if p1 != 0 {
+                    6
+                } else {
+                    5
+                }
+            } else {
+                7
+            };
+            [ref0, ref1]
+        }
+    }
+
+    /// Encode one compound pair with `write_compound_ref_frames`, then
+    /// decode it back through the mirror reader with an independent
+    /// CDF context. Asserts the pair survives and that BOTH sides'
+    /// adapted CDF tables are identical afterwards — if the writer
+    /// selected a different §8.3.2 row than the reader for any symbol,
+    /// the adapted-row sets would diverge.
+    fn round_trip_pair(pair: [i32; 2], n: NeighbourOctet) {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_compound_ref_frames(
+            &mut writer,
+            &mut enc_cdfs,
+            pair,
+            n.avail_u,
+            n.avail_l,
+            n.above_single,
+            n.left_single,
+            n.above_intra,
+            n.left_intra,
+            n.above_ref_frame,
+            n.left_ref_frame,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let got = read_compound_ref_frames_mirror(&mut dec, &mut dec_cdfs, n);
+        assert_eq!(got, pair, "pair {pair:?} round-trip");
+        assert_ref_tables_eq(&mut enc_cdfs, &mut dec_cdfs);
+    }
+
+    /// Compare every §8.3.2 ref-frame CDF row (`comp_ref_type` /
+    /// `uni_comp_ref` / `comp_ref` / `comp_bwdref`, all ctx × p slots)
+    /// between two contexts.
+    fn assert_ref_tables_eq(a: &mut TileCdfContext, b: &mut TileCdfContext) {
+        for ctx in 0..crate::cdf::COMP_REF_TYPE_CONTEXTS {
+            assert_eq!(
+                a.comp_ref_type_cdf(ctx).to_vec(),
+                b.comp_ref_type_cdf(ctx).to_vec(),
+                "comp_ref_type ctx {ctx}"
+            );
+        }
+        for ctx in 0..crate::cdf::REF_CONTEXTS {
+            for p in 0..3 {
+                assert_eq!(
+                    a.uni_comp_ref_cdf(ctx, p).to_vec(),
+                    b.uni_comp_ref_cdf(ctx, p).to_vec(),
+                    "uni_comp_ref ctx {ctx} p {p}"
+                );
+                assert_eq!(
+                    a.comp_ref_cdf(ctx, p).to_vec(),
+                    b.comp_ref_cdf(ctx, p).to_vec(),
+                    "comp_ref ctx {ctx} p {p}"
+                );
+            }
+            for p in 0..2 {
+                assert_eq!(
+                    a.comp_bwd_ref_cdf(ctx, p).to_vec(),
+                    b.comp_bwd_ref_cdf(ctx, p).to_vec(),
+                    "comp_bwdref ctx {ctx} p {p}"
+                );
+            }
+        }
+    }
+
+    /// All four §5.11.25 UNIDIR leaves round-trip at the frame origin.
+    #[test]
+    fn write_compound_ref_frames_unidir_pairs_round_trip_at_origin() {
+        for pair in UNIDIR_PAIRS {
+            round_trip_pair(pair, ORIGIN);
+        }
+    }
+
+    /// All twelve §6.10.24 Group-1 × Group-2 BIDIR pairs round-trip at
+    /// the frame origin.
+    #[test]
+    fn write_compound_ref_frames_bidir_pairs_round_trip_at_origin() {
+        for pair in BIDIR_PAIRS {
+            round_trip_pair(pair, ORIGIN);
+        }
+    }
+
+    /// Neighbour-engaged ctx selection: all sixteen pairs round-trip
+    /// with non-trivial §8.3.2 contexts. Octet A puts a BIDIR compound
+    /// neighbour above + a single-ref neighbour left; octet B puts a
+    /// UNIDIR compound neighbour above + an intra neighbour left. The
+    /// table-equality check inside `round_trip_pair` proves the writer
+    /// derived the same per-symbol rows as the reader.
+    #[test]
+    fn write_compound_ref_frames_round_trip_with_neighbour_ctx() {
+        let octet_a = NeighbourOctet {
+            avail_u: true,
+            avail_l: true,
+            above_single: false,
+            left_single: true,
+            above_intra: false,
+            left_intra: false,
+            above_ref_frame: [1, 5],
+            left_ref_frame: [3, -1],
+        };
+        let octet_b = NeighbourOctet {
+            avail_u: true,
+            avail_l: true,
+            above_single: false,
+            left_single: true,
+            above_intra: false,
+            left_intra: true,
+            above_ref_frame: [5, 7],
+            left_ref_frame: [0, -1],
+        };
+        for n in [octet_a, octet_b] {
+            for pair in UNIDIR_PAIRS.iter().chain(BIDIR_PAIRS.iter()) {
+                round_trip_pair(*pair, n);
+            }
+        }
+    }
+
+    /// `( BWDREF, ALTREF )` is the two-symbol UNIDIR leaf:
+    /// `comp_ref_type` + `uni_comp_ref` only. The `uni_comp_ref_p1` /
+    /// `uni_comp_ref_p2` rows and the entire BIDIR table set MUST stay
+    /// pristine — extra symbols would adapt them.
+    #[test]
+    fn write_compound_ref_frames_bwdref_altref_emits_two_symbols() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_compound_ref_frames(
+            &mut writer,
+            &mut enc_cdfs,
+            [5, 7],
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            [-1, -1],
+            [-1, -1],
+        )
+        .unwrap();
+        let mut pristine = TileCdfContext::new_from_defaults();
+        // ref_count_ctx(0, 0) = 1 at the origin; §8.3.2 p.382 ctx = 2.
+        assert_ne!(
+            enc_cdfs.comp_ref_type_cdf(2).to_vec(),
+            pristine.comp_ref_type_cdf(2).to_vec(),
+            "comp_ref_type coded"
+        );
+        assert_ne!(
+            enc_cdfs.uni_comp_ref_cdf(1, 0).to_vec(),
+            pristine.uni_comp_ref_cdf(1, 0).to_vec(),
+            "uni_comp_ref coded"
+        );
+        for p in 1..3 {
+            assert_eq!(
+                enc_cdfs.uni_comp_ref_cdf(1, p).to_vec(),
+                pristine.uni_comp_ref_cdf(1, p).to_vec(),
+                "uni_comp_ref p{p} NOT coded"
+            );
+        }
+        for p in 0..3 {
+            assert_eq!(
+                enc_cdfs.comp_ref_cdf(1, p).to_vec(),
+                pristine.comp_ref_cdf(1, p).to_vec(),
+                "comp_ref p{p} NOT coded"
+            );
+        }
+    }
+
+    /// `( LAST, LAST2 )` stops after `uni_comp_ref_p1 = 0`: the
+    /// `uni_comp_ref_p2` row stays pristine.
+    #[test]
+    fn write_compound_ref_frames_last_last2_leaves_p2_untouched() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_compound_ref_frames(
+            &mut writer,
+            &mut enc_cdfs,
+            [1, 2],
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            [-1, -1],
+            [-1, -1],
+        )
+        .unwrap();
+        let mut pristine = TileCdfContext::new_from_defaults();
+        assert_ne!(
+            enc_cdfs.uni_comp_ref_cdf(1, 1).to_vec(),
+            pristine.uni_comp_ref_cdf(1, 1).to_vec(),
+            "uni_comp_ref_p1 coded"
+        );
+        assert_eq!(
+            enc_cdfs.uni_comp_ref_cdf(1, 2).to_vec(),
+            pristine.uni_comp_ref_cdf(1, 2).to_vec(),
+            "uni_comp_ref_p2 NOT coded"
+        );
+    }
+
+    /// A BIDIR pair with `RefFrame[ 1 ] = ALTREF_FRAME` takes the
+    /// `comp_bwdref = 1` arm: the `comp_bwdref_p1` row stays pristine.
+    #[test]
+    fn write_compound_ref_frames_altref_arm_skips_bwdref_p1() {
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_compound_ref_frames(
+            &mut writer,
+            &mut enc_cdfs,
+            [1, 7],
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            [-1, -1],
+            [-1, -1],
+        )
+        .unwrap();
+        let mut pristine = TileCdfContext::new_from_defaults();
+        assert_ne!(
+            enc_cdfs.comp_bwd_ref_cdf(1, 0).to_vec(),
+            pristine.comp_bwd_ref_cdf(1, 0).to_vec(),
+            "comp_bwdref coded"
+        );
+        assert_eq!(
+            enc_cdfs.comp_bwd_ref_cdf(1, 1).to_vec(),
+            pristine.comp_bwd_ref_cdf(1, 1).to_vec(),
+            "comp_bwdref_p1 NOT coded"
+        );
+    }
+
+    /// §6.10.24: a compound pair never carries `INTRA_FRAME = 0` or
+    /// `NONE = -1` in either slot, nor an index past `ALTREF_FRAME = 7`.
+    #[test]
+    fn write_compound_ref_frames_rejects_out_of_range_slots() {
+        for pair in [[0, 5], [-1, 5], [8, 5], [1, 0], [1, -1], [1, 8]] {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_compound_ref_frames(
+                &mut writer,
+                &mut cdfs,
+                pair,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                [-1, -1],
+                [-1, -1],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::PartitionWalkOutOfRange),
+                "pair {pair:?} rejected"
+            );
+        }
+    }
+
+    /// Same-group pairs outside the four §5.11.25 UNIDIR leaves are
+    /// unreachable by the sub-tree and rejected.
+    #[test]
+    fn write_compound_ref_frames_rejects_unreachable_samedir_pairs() {
+        for pair in [[2, 3], [2, 4], [3, 4], [5, 6], [6, 7], [1, 1], [7, 5]] {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_compound_ref_frames(
+                &mut writer,
+                &mut cdfs,
+                pair,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                [-1, -1],
+                [-1, -1],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::PartitionWalkOutOfRange),
+                "pair {pair:?} rejected"
+            );
+        }
+    }
+
+    /// Different-group pairs with the Group-2 (backward) frame in slot
+    /// 0 cannot be expressed by the §5.11.25 BIDIR sub-tree.
+    #[test]
+    fn write_compound_ref_frames_rejects_reversed_bidir_pairs() {
+        for pair in [[5, 1], [6, 2], [7, 4]] {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_compound_ref_frames(
+                &mut writer,
+                &mut cdfs,
+                pair,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                [-1, -1],
+                [-1, -1],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::PartitionWalkOutOfRange),
+                "pair {pair:?} rejected"
+            );
+        }
+    }
+
+    /// Sequential pairs through ONE encoder CDF context decode back
+    /// through ONE decoder CDF context — the §8.2.6 per-symbol CDF
+    /// adaptation stays in lockstep across the whole sequence.
+    #[test]
+    fn write_compound_ref_frames_sequential_adaptation_round_trip() {
+        let sequence = [[1, 4], [5, 7], [3, 6], [1, 2], [4, 7], [1, 3], [2, 5]];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        for pair in sequence {
+            write_compound_ref_frames(
+                &mut writer,
+                &mut enc_cdfs,
+                pair,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                [-1, -1],
+                [-1, -1],
+            )
+            .unwrap();
+        }
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        for pair in sequence {
+            let got = read_compound_ref_frames_mirror(&mut dec, &mut dec_cdfs, ORIGIN);
+            assert_eq!(got, pair, "sequential pair {pair:?}");
+        }
+        assert_ref_tables_eq(&mut enc_cdfs, &mut dec_cdfs);
     }
 }

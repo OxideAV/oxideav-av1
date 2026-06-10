@@ -4,6 +4,33 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r268 (2026-06-10): land the COMPOUND_REFERENCE body of the
+  §5.11.25 `read_ref_frames()` arm-4 dispatcher —
+  `encoder::block_mode_info::write_compound_ref_frames` (§5.11.25
+  COMPOUND_REFERENCE arm, av1-spec p.76-77). Exact algebraic inverse
+  of the reader's `comp_ref_type` / `uni_comp_ref` / `uni_comp_ref_p1`
+  / `uni_comp_ref_p2` / `comp_ref` / `comp_ref_p1` / `comp_ref_p2` /
+  `comp_bwdref` / `comp_bwdref_p1` cascade: every branch bit is
+  derived from the target `RefFrame[ 0..2 ]` pair — `comp_ref_type`
+  itself via the §8.3.2 p.383 `is_samedir_ref_pair` predicate (the
+  §6.10.24 "same group" semantics), then the per-bit leaf inverses
+  (`uni_comp_ref = (pair == (BWDREF, ALTREF))`, `comp_ref =
+  (RefFrame[0] >= LAST3)`, `comp_bwdref = (RefFrame[1] == ALTREF)`,
+  etc.). Emits two to five §8.2.6 `S()` symbols depending on the
+  leaf. Takes the §5.11.18 neighbour-state octet and derives all
+  per-symbol §8.3.2 ctx selections internally (`comp_ref_type_ctx`
+  p.382 plus the `count_refs` / `ref_count_ctx` selections
+  p.366-368/383) so sibling symbols can never disagree on CDF rows.
+  Caller-bug rejects: either slot outside `LAST_FRAME..=ALTREF_FRAME`
+  (§6.10.24), same-group pairs outside the four §5.11.25 UNIDIR
+  leaves, and reversed BIDIR pairs (Group-2 frame in slot 0). +10
+  tests (all 16 reachable compound pairs round-trip through a mirror
+  of the decoder's §5.11.25 symbol reads at the origin and under two
+  neighbour-engaged ctx octets with full CDF-table equality asserted,
+  pristine-row symbol-count leaf checks, the three reject families,
+  and a 7-pair sequential CDF-adaptation lockstep round-trip).
+  Library test count 1809 → 1819.
+
 - encoder r267 (2026-06-10): land the first `S()` symbol of the
   §5.11.25 `read_ref_frames()` arm-4 dispatcher —
   `encoder::block_mode_info::write_comp_mode` (§5.11.25 arm 4

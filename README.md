@@ -2,6 +2,53 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-10 (round 268)
+
+Round 268 lands the **COMPOUND_REFERENCE body** of the §5.11.25
+`read_ref_frames()` arm-4 dispatcher — the sub-tree that follows a
+`comp_mode == COMPOUND_REFERENCE` outcome of r267's `write_comp_mode`.
+
+* `encoder::block_mode_info::write_compound_ref_frames`
+  (§5.11.25 COMPOUND_REFERENCE arm, av1-spec p.76-77). Exact algebraic
+  inverse of the reader's `comp_ref_type` / `uni_comp_ref` /
+  `uni_comp_ref_p1` / `uni_comp_ref_p2` / `comp_ref` / `comp_ref_p1` /
+  `comp_ref_p2` / `comp_bwdref` / `comp_bwdref_p1` cascade: each branch
+  bit is derived from the target `RefFrame[ 0..2 ]` pair
+  (`comp_ref_type` itself via the §8.3.2 p.383
+  `is_samedir_ref_pair` predicate, per the §6.10.24 group semantics).
+  Emits two to five §8.2.6 `S()` symbols depending on the leaf. Takes
+  the §5.11.18 neighbour-state octet and derives all per-symbol §8.3.2
+  ctx selections internally (`comp_ref_type_ctx` p.382 + the four
+  `count_refs` / `ref_count_ctx` selections p.366-368/383) so sibling
+  symbols can never disagree on rows.
+* Caller-bug rejects: either slot outside
+  `LAST_FRAME..=ALTREF_FRAME` (§6.10.24), same-group pairs outside the
+  four UNIDIR leaves (`(BWDREF, ALTREF)`, `(LAST, LAST2/LAST3/GOLDEN)`),
+  and reversed BIDIR pairs (Group-2 frame in slot 0).
+
++10 tests: all 16 reachable compound pairs round-trip through a mirror
+of the decoder's symbol reads at the frame origin AND under two
+neighbour-engaged ctx octets (with full CDF-table equality asserted on
+both sides), symbol-count leaf checks via pristine-row comparison
+(2-symbol `(BWDREF, ALTREF)`, p2-skip `(LAST, LAST2)`, bwdref_p1-skip
+ALTREF arm), the three caller-bug reject families, and a 7-pair
+sequential CDF-adaptation lockstep round-trip.
+
+Full library test count moves to 1819 (was 1809).
+
+### Pending follow-ups for round 269+
+
+* §5.11.25 arm 4 SINGLE_REFERENCE body — the `single_ref_p1..6`
+  S() tree (`TileSingleRefCdf[ ctx ][ 0..6 ]`).
+* Compose `write_comp_mode` + both reference bodies into a full arm-4
+  `write_ref_frames` dispatcher folded into
+  `write_inter_block_mode_info_bootstrap`.
+* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2).
+* §5.11.23 lines 9-22 `compound_mode` / `new_mv` / `zero_mv` /
+  `ref_mv` / `drl_mode` S() writers.
+
+---
+
 ## Status — 2026-06-10 (round 267)
 
 Round 267 lands the **first `S()` symbol** of the §5.11.25
