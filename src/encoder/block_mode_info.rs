@@ -53,9 +53,10 @@ use crate::cdf::{
     mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx,
     PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES,
     BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS,
-    COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_FILTER_MODES,
-    INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS,
-    MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEWMV, MODE_NEW_NEWMV,
+    COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, FRAME_LF_COUNT,
+    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA,
+    MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV,
+    MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV,
     NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
     PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
     SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
@@ -4684,6 +4685,215 @@ pub fn write_compound_mode(
     // `TileCompoundModeCdf[ ctx ]` (§8.3.2 p.378).
     let row = cdfs.compound_mode_cdf(compound_mode_context);
     writer.write_symbol(compound_mode, row)?;
+
+    Ok(())
+}
+
+/// `has_nearmv()` per §5.11.23 (av1-spec p.75 — the helper definition
+/// immediately following the `inter_block_mode_info` body). Returns
+/// whether `y_mode` is one of the four NEARMV-bearing inter Y modes —
+/// the modes whose §5.11.23 `RefMvIdx` loop iterates from `idx = 1`
+/// through `idx < 3` rather than the `idx ∈ {0, 1}` window used by the
+/// NEWMV / NEW_NEWMV arm.
+///
+/// Spec body:
+///
+/// ```text
+///   has_nearmv( ) {
+///       return (YMode == NEARMV || YMode == NEAR_NEARMV
+///               || YMode == NEAR_NEWMV || YMode == NEW_NEARMV)
+///   }
+/// ```
+///
+/// Local twin of the decoder-side helper of the same name — the writer
+/// module mirrors the reader's dispatch without widening the `cdf`
+/// public surface.
+#[inline]
+fn has_nearmv(y_mode: u8) -> bool {
+    matches!(
+        y_mode,
+        MODE_NEARMV | MODE_NEAR_NEARMV | MODE_NEAR_NEWMV | MODE_NEW_NEARMV
+    )
+}
+
+/// `drl_mode` writer per §5.11.23 (av1-spec p.73-74, the `RefMvIdx`
+/// loops following `assign_mv`'s `compound_mode` / single-mode
+/// dispatch) — r272.
+///
+/// The dynamic-reference-list (DRL) index `RefMvIdx` selects which
+/// candidate of the §7.10.2 `RefStackMv` the chosen motion-vector mode
+/// draws its predictor from. The reader does **not** code `RefMvIdx`
+/// directly: it walks the stack one slot at a time, coding a single
+/// binary `drl_mode` symbol per reachable slot, where `drl_mode == 0`
+/// means "stop here, use this slot" and `drl_mode == 1` means "continue
+/// to the next slot". This writer is the exact algebraic inverse — it
+/// re-derives that same bit sequence from the `RefMvIdx` the encoder
+/// chose and emits one §8.2.6 `S()` per coded slot.
+///
+/// ## Spec body (§5.11.23 — av1-spec p.73-74)
+///
+/// ```text
+///   RefMvIdx = 0
+///   if ( YMode == NEWMV || YMode == NEW_NEWMV ) {
+///       for ( idx = 0; idx < 2; idx++ ) {
+///           if ( NumMvFound > idx + 1 ) {
+///               drl_mode                                       S()
+///               if ( drl_mode == 0 ) { RefMvIdx = idx; break }
+///               RefMvIdx = idx + 1
+///           }
+///       }
+///   } else if ( has_nearmv( ) ) {
+///       RefMvIdx = 1
+///       for ( idx = 1; idx < 3; idx++ ) {
+///           if ( NumMvFound > idx + 1 ) {
+///               drl_mode                                       S()
+///               if ( drl_mode == 0 ) { RefMvIdx = idx; break }
+///               RefMvIdx = idx + 1
+///           }
+///       }
+///   }
+/// ```
+///
+/// Both arms share one loop body parameterised only by the start index
+/// (`0` for the NEWMV / NEW_NEWMV arm, `1` for the `has_nearmv( )`
+/// arm). On the start iteration `RefMvIdx` already holds the start
+/// value (`0` or `1`), so a `RefMvIdx` equal to the start with the
+/// terminating slot unreachable emits no symbols at all. Any Y mode
+/// outside the two arms (`GLOBALMV`, `NEARESTMV`, the compound
+/// `GLOBAL_GLOBALMV` / `NEAREST_NEARESTMV` modes, …) codes no
+/// `drl_mode` and is handled by the no-op fast path.
+///
+/// ## Inversion
+///
+/// For an arm starting at `start`, the decoder visits slots `start,
+/// start+1, …` while `NumMvFound > idx + 1`, emitting `drl_mode = 1`
+/// at every visited slot below the chosen `ref_mv_idx` and `drl_mode =
+/// 0` at slot `ref_mv_idx` itself — unless `ref_mv_idx` is reached
+/// only because the previous iteration's `RefMvIdx = idx + 1`
+/// assignment ran off the end of the reachable window (`NumMvFound ==
+/// ref_mv_idx + 1`), in which case no terminating `0` is coded. The
+/// writer reproduces exactly this: walk `idx` from `start` upward,
+/// emit `1` for each `idx < ref_mv_idx` that is reachable, then a
+/// single `0` at `idx == ref_mv_idx` iff that slot is reachable.
+///
+/// ## Inputs
+///
+/// * `y_mode` — the §5.11.23 inter `YMode` the encoder chose. Only the
+///   NEWMV / NEW_NEWMV and `has_nearmv( )` modes code `drl_mode`; every
+///   other inter mode is a silent no-op (no symbol written), matching
+///   the reader's `RefMvIdx = 0` / unconditioned arms.
+/// * `ref_mv_idx` — the `RefMvIdx` the encoder selected, in
+///   `0..MAX_REF_MV_STACK_SIZE`. Must be consistent with the arm: the
+///   NEWMV / NEW_NEWMV arm admits `0..=2`, the `has_nearmv( )` arm
+///   admits `1..=3` (the reader can never leave `RefMvIdx` outside
+///   those windows for the respective arm).
+/// * `num_mv_found` — `NumMvFound`, the §7.10.2 stack depth, in
+///   `0..=MAX_REF_MV_STACK_SIZE`. Governs which slots are reachable.
+/// * `drl_ctx_stack` — `DrlCtxStack[ idx ]` per §7.10.2.14, the §8.3.2
+///   `TileDrlModeCdf` row index for each visited slot, each in
+///   `0..DRL_MODE_CONTEXTS`. Must hold at least one entry per slot the
+///   loop can visit (`ref_mv_idx` at most).
+///
+/// ## Out-of-range cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * `ref_mv_idx >= MAX_REF_MV_STACK_SIZE`.
+/// * `num_mv_found > MAX_REF_MV_STACK_SIZE`.
+/// * `ref_mv_idx` outside the arm's admissible window
+///   (`> 2` for the NEWMV / NEW_NEWMV arm, `< 1` or `> 3` for the
+///   `has_nearmv( )` arm) — a caller bug, since the reader cannot
+///   produce such a value.
+/// * a coded slot's `drl_ctx_stack[ idx ] >= DRL_MODE_CONTEXTS`, or
+///   `drl_ctx_stack` shorter than the highest visited slot index.
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless: between zero and two §8.2.6 `S()` symbols are emitted.
+/// The caller threads the resulting `RefMvIdx` onto its own
+/// motion-vector assignment per §5.11.31.
+pub fn write_drl_mode(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    y_mode: u8,
+    ref_mv_idx: u32,
+    num_mv_found: u32,
+    drl_ctx_stack: &[u32],
+) -> Result<(), Error> {
+    // §7.10.2 invariants the reader can never violate.
+    if (ref_mv_idx as usize) >= MAX_REF_MV_STACK_SIZE {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (num_mv_found as usize) > MAX_REF_MV_STACK_SIZE {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.23 arm selection. `start` is the first `idx` the reader's
+    // loop visits; the loop runs while `idx < start + 2`.
+    let start: u32 = if y_mode == MODE_NEWMV || y_mode == MODE_NEW_NEWMV {
+        // NEWMV / NEW_NEWMV arm: `RefMvIdx = 0`, `idx ∈ {0, 1}`, so
+        // the reachable `RefMvIdx` window is `{0, 1, 2}`.
+        if ref_mv_idx > 2 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        0
+    } else if has_nearmv(y_mode) {
+        // `has_nearmv( )` arm: `RefMvIdx = 1`, `idx ∈ {1, 2}`, so the
+        // reachable `RefMvIdx` window is `{1, 2, 3}`.
+        if !(1..=3).contains(&ref_mv_idx) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        1
+    } else {
+        // Every other inter mode codes no `drl_mode`. The reader's
+        // `RefMvIdx` stays `0` in this case; reject any other claimed
+        // index as a caller bug rather than silently dropping it.
+        if ref_mv_idx != 0 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    };
+
+    // Walk `idx` from `start` while the slot is reachable
+    // (`NumMvFound > idx + 1`) and `idx < start + 2`. Emit `1` for each
+    // slot strictly below `ref_mv_idx`, then a terminating `0` at
+    // `idx == ref_mv_idx` iff that slot is itself reachable.
+    // `reconstructed` mirrors the reader's running `RefMvIdx` so a
+    // caller-supplied `ref_mv_idx` that the reader could never decode
+    // from this `num_mv_found` (e.g. a deep index with a shallow stack)
+    // is rejected rather than silently mis-encoded.
+    let mut reconstructed = start;
+    let mut idx = start;
+    while idx < start + 2 {
+        if num_mv_found > idx + 1 {
+            let slot = idx as usize;
+            let &ctx = drl_ctx_stack
+                .get(slot)
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+            if ctx as usize >= DRL_MODE_CONTEXTS {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            // `drl_mode == 0` stops at this slot; `drl_mode == 1`
+            // continues. Inverse of the reader: emit `0` exactly when
+            // `idx == ref_mv_idx`.
+            let drl_mode: u32 = (idx != ref_mv_idx) as u32;
+            let row = cdfs.drl_mode_cdf(ctx as usize);
+            writer.write_symbol(drl_mode, row)?;
+            if drl_mode == 0 {
+                // RefMvIdx = idx; break.
+                reconstructed = idx;
+                break;
+            }
+            // RefMvIdx = idx + 1; continue.
+            reconstructed = idx + 1;
+        }
+        idx += 1;
+    }
+
+    // The bit sequence we just wrote must decode back to the same
+    // `RefMvIdx`. If not, the caller asked for an index unreachable at
+    // this stack depth — a caller bug, not a representable bitstream.
+    if reconstructed != ref_mv_idx {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
 
     Ok(())
 }
@@ -13237,5 +13447,370 @@ mod tests {
         // After the run the consulted row must be identical on both
         // sides (proves the per-symbol adaptation matched throughout).
         assert_eq!(enc_cdfs.compound_mode_cdf(4), dec_cdfs.compound_mode_cdf(4));
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.23 drl_mode — write_drl_mode round-trips through a decoder
+    // mirror of the exact §5.11.23 RefMvIdx loop.
+    // -----------------------------------------------------------------
+
+    /// Decoder mirror of the §5.11.23 `drl_mode` `RefMvIdx` loop for the
+    /// two coding arms (NEWMV / NEW_NEWMV start at idx 0, `has_nearmv( )`
+    /// start at idx 1). Reads the `drl_mode` symbols the writer emitted
+    /// and reconstructs `RefMvIdx` exactly as the spec body does. Modes
+    /// outside the two arms code no symbols and return `RefMvIdx = 0`.
+    fn decode_drl_mode_mirror(
+        bytes: &[u8],
+        cdfs: &mut TileCdfContext,
+        disable_cdf_update: bool,
+        y_mode: u8,
+        num_mv_found: u32,
+        drl_ctx_stack: &[u32],
+    ) -> u32 {
+        let pad = if bytes.is_empty() {
+            vec![0u8]
+        } else {
+            bytes.to_vec()
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), disable_cdf_update).unwrap();
+        let mut ref_mv_idx: u32 = 0;
+        let start = if y_mode == MODE_NEWMV || y_mode == MODE_NEW_NEWMV {
+            0
+        } else if matches!(
+            y_mode,
+            MODE_NEARMV | MODE_NEAR_NEARMV | MODE_NEAR_NEWMV | MODE_NEW_NEARMV
+        ) {
+            ref_mv_idx = 1;
+            1
+        } else {
+            return 0;
+        };
+        let mut idx = start;
+        while idx < start + 2 {
+            if num_mv_found > idx + 1 {
+                let row = cdfs.drl_mode_cdf(drl_ctx_stack[idx as usize] as usize);
+                let drl = dec.read_symbol(row).unwrap();
+                if drl == 0 {
+                    ref_mv_idx = idx;
+                    break;
+                }
+                ref_mv_idx = idx + 1;
+            }
+            idx += 1;
+        }
+        ref_mv_idx
+    }
+
+    /// The NEWMV / NEW_NEWMV arm round-trips every reachable `RefMvIdx`
+    /// for every stack depth `NumMvFound = 1..=3`, with §8.3 CDF
+    /// adaptation engaged on both sides. The reachable index set is
+    /// exactly `0 ..= min(2, NumMvFound - 1)`.
+    #[test]
+    fn write_drl_mode_newmv_arm_round_trips_all_depths() {
+        let ctx_stack = [2u32, 0, 1, 0, 0, 0, 0, 0];
+        for y_mode in [MODE_NEWMV, MODE_NEW_NEWMV] {
+            for num_mv_found in 1u32..=3 {
+                let max_idx = (num_mv_found - 1).min(2);
+                for ref_mv_idx in 0..=max_idx {
+                    let mut enc_cdfs = TileCdfContext::new_from_defaults();
+                    let mut writer = SymbolWriter::new(false);
+                    write_drl_mode(
+                        &mut writer,
+                        &mut enc_cdfs,
+                        y_mode,
+                        ref_mv_idx,
+                        num_mv_found,
+                        &ctx_stack,
+                    )
+                    .unwrap();
+                    let bytes = writer.finish();
+
+                    let mut dec_cdfs = TileCdfContext::new_from_defaults();
+                    let recovered = decode_drl_mode_mirror(
+                        &bytes,
+                        &mut dec_cdfs,
+                        false,
+                        y_mode,
+                        num_mv_found,
+                        &ctx_stack,
+                    );
+                    assert_eq!(
+                        recovered, ref_mv_idx,
+                        "NEWMV-arm YMode {y_mode} RefMvIdx {ref_mv_idx} @ NumMvFound {num_mv_found}"
+                    );
+                    // Every consulted DRL CDF row stepped identically.
+                    for c in 0..DRL_MODE_CONTEXTS {
+                        assert_eq!(enc_cdfs.drl_mode_cdf(c), dec_cdfs.drl_mode_cdf(c));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `has_nearmv( )` arm round-trips every reachable `RefMvIdx`
+    /// for every stack depth `NumMvFound = 1..=4`. The arm seeds
+    /// `RefMvIdx = 1` and iterates `idx ∈ {1, 2}`, so the reachable set
+    /// is `1 ..= max(1, min(3, NumMvFound - 1))`.
+    #[test]
+    fn write_drl_mode_nearmv_arm_round_trips_all_depths() {
+        let ctx_stack = [0u32, 1, 2, 0, 0, 0, 0, 0];
+        for y_mode in [
+            MODE_NEARMV,
+            MODE_NEAR_NEARMV,
+            MODE_NEAR_NEWMV,
+            MODE_NEW_NEARMV,
+        ] {
+            for num_mv_found in 1u32..=4 {
+                let max_idx = (num_mv_found - 1).clamp(1, 3);
+                for ref_mv_idx in 1..=max_idx {
+                    let mut enc_cdfs = TileCdfContext::new_from_defaults();
+                    let mut writer = SymbolWriter::new(false);
+                    write_drl_mode(
+                        &mut writer,
+                        &mut enc_cdfs,
+                        y_mode,
+                        ref_mv_idx,
+                        num_mv_found,
+                        &ctx_stack,
+                    )
+                    .unwrap();
+                    let bytes = writer.finish();
+
+                    let mut dec_cdfs = TileCdfContext::new_from_defaults();
+                    let recovered = decode_drl_mode_mirror(
+                        &bytes,
+                        &mut dec_cdfs,
+                        false,
+                        y_mode,
+                        num_mv_found,
+                        &ctx_stack,
+                    );
+                    assert_eq!(
+                        recovered, ref_mv_idx,
+                        "NEAR-arm YMode {y_mode} RefMvIdx {ref_mv_idx} @ NumMvFound {num_mv_found}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Modes outside the two coding arms (GLOBALMV, NEARESTMV, and the
+    /// compound NEAREST_NEARESTMV / GLOBAL_GLOBALMV) code **no**
+    /// `drl_mode` symbols: the writer emits an empty (or terminator-only)
+    /// stream and the decoder mirror reconstructs `RefMvIdx = 0` without
+    /// touching the buffer.
+    #[test]
+    fn write_drl_mode_non_coding_modes_emit_no_symbols() {
+        let ctx_stack = [0u32; MAX_REF_MV_STACK_SIZE];
+        for y_mode in [
+            MODE_GLOBALMV,
+            MODE_NEARESTMV,
+            MODE_NEAREST_NEARESTMV,
+            MODE_GLOBAL_GLOBALMV,
+        ] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_drl_mode(&mut writer, &mut enc_cdfs, y_mode, 0, 4, &ctx_stack).unwrap();
+            let bytes = writer.finish();
+            // No DRL CDF row may have adapted (no symbol coded).
+            for c in 0..DRL_MODE_CONTEXTS {
+                assert_eq!(
+                    enc_cdfs.drl_mode_cdf(c),
+                    TileCdfContext::new_from_defaults().drl_mode_cdf(c),
+                    "non-coding mode {y_mode} left DRL ctx {c} pristine"
+                );
+            }
+            // And the mirror reconstructs RefMvIdx = 0.
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let recovered =
+                decode_drl_mode_mirror(&bytes, &mut dec_cdfs, false, y_mode, 4, &ctx_stack);
+            assert_eq!(recovered, 0);
+        }
+    }
+
+    /// A shallow stack (`NumMvFound <= 1`) makes slot 0 unreachable, so
+    /// even a NEWMV block codes no `drl_mode` symbol and `RefMvIdx`
+    /// stays at the arm seed (`0`).
+    #[test]
+    fn write_drl_mode_shallow_stack_codes_nothing() {
+        let ctx_stack = [0u32; MAX_REF_MV_STACK_SIZE];
+        for num_mv_found in 0u32..=1 {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_drl_mode(
+                &mut writer,
+                &mut enc_cdfs,
+                MODE_NEWMV,
+                0,
+                num_mv_found,
+                &ctx_stack,
+            )
+            .unwrap();
+            for c in 0..DRL_MODE_CONTEXTS {
+                assert_eq!(
+                    enc_cdfs.drl_mode_cdf(c),
+                    TileCdfContext::new_from_defaults().drl_mode_cdf(c)
+                );
+            }
+        }
+    }
+
+    /// Distinct per-slot DRL contexts are honoured: with
+    /// `DrlCtxStack = [0, 1, …]` a NEWMV block selecting `RefMvIdx = 1`
+    /// over `NumMvFound = 3` codes `drl_mode = 1` at slot-0 ctx 0 and
+    /// `drl_mode = 0` at slot-1 ctx 1. Verified against an independent
+    /// re-encode of exactly those two symbols.
+    #[test]
+    fn write_drl_mode_uses_per_slot_context() {
+        let ctx_stack = [0u32, 1, 2, 0, 0, 0, 0, 0];
+        let mut a = TileCdfContext::new_from_defaults();
+        let mut wa = SymbolWriter::new(false);
+        write_drl_mode(&mut wa, &mut a, MODE_NEWMV, 1, 3, &ctx_stack).unwrap();
+        let got = wa.finish();
+
+        let mut b = TileCdfContext::new_from_defaults();
+        let mut wb = SymbolWriter::new(false);
+        // slot 0: drl_mode = 1 over ctx 0.
+        let row0 = b.drl_mode_cdf(0);
+        wb.write_symbol(1, row0).unwrap();
+        // slot 1: drl_mode = 0 over ctx 1.
+        let row1 = b.drl_mode_cdf(1);
+        wb.write_symbol(0, row1).unwrap();
+        let want = wb.finish();
+        assert_eq!(got, want, "per-slot DRL contexts honoured");
+    }
+
+    /// A `RefMvIdx` unreachable at the given stack depth (NEWMV arm,
+    /// `RefMvIdx = 2` but `NumMvFound = 2` so slot 1 is unreachable) is
+    /// a caller bug — the reader could never decode it.
+    #[test]
+    fn write_drl_mode_rejects_unreachable_index() {
+        let ctx_stack = [0u32; MAX_REF_MV_STACK_SIZE];
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_drl_mode(&mut writer, &mut cdfs, MODE_NEWMV, 2, 2, &ctx_stack).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Out-of-window `RefMvIdx` for each arm is a caller bug: `> 2` for
+    /// the NEWMV arm, `0` or `> 3` for the `has_nearmv( )` arm.
+    #[test]
+    fn write_drl_mode_rejects_out_of_window_index() {
+        let ctx_stack = [0u32; MAX_REF_MV_STACK_SIZE];
+        // NEWMV arm: 3 is past the {0,1,2} window.
+        {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err =
+                write_drl_mode(&mut writer, &mut cdfs, MODE_NEWMV, 3, 5, &ctx_stack).unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+        // has_nearmv arm: 0 is below the {1,2,3} window.
+        {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err =
+                write_drl_mode(&mut writer, &mut cdfs, MODE_NEARMV, 0, 5, &ctx_stack).unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+        // has_nearmv arm: 4 is past the {1,2,3} window.
+        {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err =
+                write_drl_mode(&mut writer, &mut cdfs, MODE_NEARMV, 4, 5, &ctx_stack).unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+    }
+
+    /// Range guards: `ref_mv_idx >= MAX_REF_MV_STACK_SIZE`,
+    /// `num_mv_found > MAX_REF_MV_STACK_SIZE`, and a bad per-slot DRL
+    /// context (`>= DRL_MODE_CONTEXTS`) are each caller bugs.
+    #[test]
+    fn write_drl_mode_range_guards() {
+        // ref_mv_idx out of stack range.
+        {
+            let ctx_stack = [0u32; MAX_REF_MV_STACK_SIZE];
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_drl_mode(
+                &mut writer,
+                &mut cdfs,
+                MODE_NEWMV,
+                MAX_REF_MV_STACK_SIZE as u32,
+                3,
+                &ctx_stack,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+        // num_mv_found past the stack cap.
+        {
+            let ctx_stack = [0u32; MAX_REF_MV_STACK_SIZE];
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_drl_mode(
+                &mut writer,
+                &mut cdfs,
+                MODE_NEWMV,
+                0,
+                MAX_REF_MV_STACK_SIZE as u32 + 1,
+                &ctx_stack,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+        // Bad per-slot DRL context on a coded slot.
+        {
+            let mut ctx_stack = [0u32; MAX_REF_MV_STACK_SIZE];
+            ctx_stack[0] = DRL_MODE_CONTEXTS as u32;
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err =
+                write_drl_mode(&mut writer, &mut cdfs, MODE_NEWMV, 0, 3, &ctx_stack).unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+    }
+
+    /// A sequential run of NEWMV-arm DRL writes round-trips with §8.3
+    /// CDF adaptation engaged across blocks, the encode-side and
+    /// decode-side DRL CDFs staying in lockstep over the whole run.
+    #[test]
+    fn write_drl_mode_sequential_cdf_adaptation_lockstep() {
+        let ctx_stack = [0u32, 1, 2, 0, 0, 0, 0, 0];
+        let cases = [
+            (MODE_NEWMV, 0u32, 3u32),
+            (MODE_NEW_NEWMV, 1, 3),
+            (MODE_NEWMV, 2, 3),
+            (MODE_NEW_NEWMV, 0, 2),
+            (MODE_NEWMV, 1, 2),
+        ];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        for &(y_mode, ref_mv_idx, num_mv_found) in &cases {
+            let mut writer = SymbolWriter::new(false);
+            write_drl_mode(
+                &mut writer,
+                &mut enc_cdfs,
+                y_mode,
+                ref_mv_idx,
+                num_mv_found,
+                &ctx_stack,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+            let recovered = decode_drl_mode_mirror(
+                &bytes,
+                &mut dec_cdfs,
+                false,
+                y_mode,
+                num_mv_found,
+                &ctx_stack,
+            );
+            assert_eq!(recovered, ref_mv_idx);
+        }
+        for c in 0..DRL_MODE_CONTEXTS {
+            assert_eq!(enc_cdfs.drl_mode_cdf(c), dec_cdfs.drl_mode_cdf(c));
+        }
     }
 }

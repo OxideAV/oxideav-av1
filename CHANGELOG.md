@@ -4,6 +4,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r272 (2026-06-10): land the §5.11.23 `drl_mode`
+  dynamic-reference-list (DRL) index writer —
+  `encoder::block_mode_info::write_drl_mode` (§5.11.23
+  `inter_block_mode_info( )` `RefMvIdx` loops, av1-spec p.73-74). The
+  reader does not code `RefMvIdx` directly: it walks the §7.10.2
+  `RefStackMv` one slot at a time, coding a single binary `drl_mode`
+  S() per reachable slot (`drl_mode == 0` ⇒ "stop, use this slot";
+  `drl_mode == 1` ⇒ "continue"). This writer is the exact inverse —
+  it re-derives that bit sequence from the chosen `RefMvIdx` and emits
+  one §8.2.6 `S()` over `TileDrlModeCdf[ DrlCtxStack[ idx ] ]` per
+  coded slot. Both spec arms share one loop body parameterised by the
+  start index: `0` for the NEWMV / NEW_NEWMV arm (`idx ∈ {0,1}`, window
+  `{0,1,2}`) and `1` for the `has_nearmv( )` arm (NEARMV /
+  NEAR_NEARMV / NEAR_NEWMV / NEW_NEARMV; `idx ∈ {1,2}`, window
+  `{1,2,3}`). Every other inter mode codes no `drl_mode` (silent
+  no-op). The writer mirrors the reader's running `RefMvIdx`, so a
+  caller-supplied index unreachable at the given `NumMvFound` is
+  rejected rather than silently mis-encoded. A local `has_nearmv`
+  twin keeps the `cdf` public surface unchanged. Caller-bug rejects:
+  `ref_mv_idx >= MAX_REF_MV_STACK_SIZE`, `num_mv_found >
+  MAX_REF_MV_STACK_SIZE`, out-of-window `ref_mv_idx` per arm, an
+  unreachable `ref_mv_idx` at the stack depth, a bad per-slot
+  `DrlCtxStack[ idx ] >= DRL_MODE_CONTEXTS`, and a too-short
+  `drl_ctx_stack`. +9 tests (both arms round-trip every reachable
+  `RefMvIdx` over every stack depth through a mirror of the §5.11.23
+  reader loop with per-context CDF-row equality asserted; non-coding
+  modes and shallow stacks emit no symbols leaving DRL CDFs pristine;
+  per-slot-context honoured via independent re-encode; unreachable /
+  out-of-window / range-guard rejects; a sequential CDF-adaptation
+  lockstep run). Library test count 1845 → 1854.
 - encoder r271 (2026-06-10): land the §5.11.23 compound-prediction
   inter-mode writer — `encoder::block_mode_info::write_compound_mode`
   (§5.11.23 `inter_block_mode_info( )` arm 3, av1-spec p.74). The
