@@ -2,6 +2,68 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-11 (round 277)
+
+Round 277 **closes the §5.11.23 `inter_block_mode_info( )` write side**
+— the last tail leaf gets its writer, the four tail leaves fold into
+the composition, and a latent decode-side tail-ordering bug falls out
+of the round-trip proof:
+
+* `encoder::block_mode_info::write_interpolation_filter` (the §5.11.x
+  interpolation-filter loop closing §5.11.23, av1-spec p.74-75) — the
+  exact encode-side inverse of
+  `PartitionWalker::read_interpolation_filter`. Covers the
+  non-SWITCHABLE forced arm (no bits), the per-direction
+  `needs_interp_filter( )` re-derivation (skip_mode / LOCALWARP /
+  large-GLOBALMV-and-GLOBAL_GLOBALMV-vs-`GmType` gates), the 3-way
+  `interp_filter` S() against `TileInterpFilterCdf[ ctx ]` with the
+  §8.3.2 neighbour walk (a neighbour's `InterpFilters[ dir ]` is
+  accepted only when one of its reference slots equals
+  `RefFrame[ 0 ]`, else the `3` sentinel) from precomputed neighbour
+  scalars, and the `!enable_dual_filter` slot-1 mirror. Readout shapes
+  the reader could never produce are rejected.
+* `write_inter_block_mode_info` now drives the **full §5.11.23 body**:
+  the four tail leaves are folded in **spec order** —
+  `read_interintra_mode` (§5.11.28) → `read_motion_mode` (§5.11.27) →
+  `read_compound_type` (§5.11.29) → the interpolation-filter loop —
+  with the §5.11.28 `RefFrame[ 1 ] = INTRA_FRAME` override applied
+  between the first two (it is the §5.11.27 short-circuit that
+  silences `motion_mode` on interintra blocks, and the only way slot 1
+  ever becomes INTRA_FRAME). Tail inputs arrive grouped in the new
+  `InterBlockModeInfoTail`; its `bit_silent()` baseline (every tail
+  gate shut) reproduces the pre-fold head-only bit pattern.
+* **Decoder fix**: `decode_inter_block_mode_info` consumed the tail as
+  `read_motion_mode` → `read_interintra_mode` — swapped relative to
+  §5.11.23. On interintra-coded streams the dispatcher would read a
+  `use_obmc` / `motion_mode` symbol the encoder never wrote (the
+  §5.11.27 slot-1-INTRA guard could never fire on the stale pair).
+  Reordered to spec; the override is now threaded into the §5.11.27 /
+  §5.11.x readers and surfaced through
+  `DecodedInterBlockModeInfo::ref_frame`.
+
++8 tests: `write_interpolation_filter` round-trips through the decode
+twin on every arm (dual-filter two-S(), single-dir mirror, forced
+non-SWITCHABLE, all three `needs_interp_filter` gates plus the
+TRANSLATION re-open, §8.3.2 neighbour-ctx selection with
+match-vs-sentinel row-adaptation asserts, and a 9-shape reject
+battery), plus a three-block composed-writer → decode-dispatcher
+round-trip (GLOBALMV silent-tail / interintra-wedge /
+interintra-open-OBMC blocks sharing one symbol stream and adapting
+CDFs in lockstep) that desyncs under the pre-fix dispatcher ordering.
+Full library test count moves to 1905 (was 1897).
+
+### Pending follow-ups for round 278+
+
+* The §5.11.26 intra-block-copy `PredMv` arm is still not surfaced by
+  `assign_mv_pred_mv` (reached only on the intra-frame intra-block-copy
+  path).
+* Wiring `write_inter_block_mode_info` into a frame-level inter encode
+  driver (the §5.11.18 `inter_frame_mode_info` prefix writer exists;
+  the partition/pixel drivers are intra-only so far), including the
+  walker-side grid stamping the tail's neighbour scalars come from.
+
+---
+
 ## Status — 2026-06-11 (round 276)
 
 Round 276 lands the **§5.11.23 tail leaf writers after `assign_mv( )`**

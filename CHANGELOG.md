@@ -4,6 +4,38 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r277 (2026-06-11): close the §5.11.23 inter-mode-info write
+  side. (1) `encoder::block_mode_info::write_interpolation_filter` —
+  the §5.11.x interpolation-filter loop writer (av1-spec p.74-75),
+  exact inverse of `PartitionWalker::read_interpolation_filter`:
+  non-SWITCHABLE forced arm, per-direction
+  `needs_interp_filter( )` re-derivation (skip_mode / LOCALWARP /
+  large-GLOBALMV-vs-`GmType` gates), the 3-way `interp_filter` S()
+  against `TileInterpFilterCdf[ ctx ]` with the §8.3.2 neighbour walk
+  (matching-reference acceptance, `3` sentinel) from precomputed
+  neighbour scalars, and the `!enable_dual_filter` slot-1 mirror.
+  (2) Fold the four tail leaf writers into
+  `write_inter_block_mode_info` in **spec order** — §5.11.28
+  `read_interintra_mode` → §5.11.27 `read_motion_mode` → §5.11.29
+  `read_compound_type` → §5.11.x interp loop — applying the §5.11.28
+  `RefFrame[ 1 ] = INTRA_FRAME` override between the first two (the
+  §5.11.27 short-circuit that silences `motion_mode` on interintra
+  blocks); tail inputs grouped in the new `InterBlockModeInfoTail`
+  (`bit_silent()` baseline reproduces the pre-fold head-only bit
+  pattern). (3) Decoder fix: `decode_inter_block_mode_info` consumed
+  the tail as `read_motion_mode` → `read_interintra_mode`, swapped
+  relative to §5.11.23 — on interintra-coded streams the dispatcher
+  would read a `use_obmc` / `motion_mode` symbol the encoder never
+  wrote (slot-1 INTRA_FRAME only ever arises from §5.11.28, so the
+  §5.11.27 guard never fired). Reordered to spec, with the override
+  now also threaded into the §5.11.27 / §5.11.x readers and surfaced
+  through `DecodedInterBlockModeInfo::ref_frame`. +8 tests: interp
+  round-trips through the decode twin on every arm (dual / single-dir
+  / forced / all three `needs` gates / neighbour-ctx selection +
+  reject battery), and a three-block composed-writer →
+  decode-dispatcher round-trip (GLOBALMV + interintra-wedge +
+  interintra-open/OBMC blocks) that desyncs under the pre-fix
+  ordering. Library test count 1897 → 1905.
 - encoder r276 (2026-06-11): land the §5.11.23 tail leaf writers after
   `assign_mv( )` — the write sides of all three post-MV per-block
   readers, each the exact encode-side inverse of its `PartitionWalker`

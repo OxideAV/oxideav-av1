@@ -19896,13 +19896,63 @@ impl PartitionWalker {
             }
         }
 
+        // §5.11.23 line 33: `read_interintra_mode( isCompound )` per
+        // §5.11.28 (av1-spec p.79-80). Reads the inter-intra blending
+        // triple gated on `enable_interintra_compound && !isCompound &&
+        // BLOCK_8X8 <= MiSize <= BLOCK_32X32`.
+        //
+        // ORDER MATTERS: §5.11.23 (av1-spec p.74) lists
+        // `read_interintra_mode( )` BEFORE `read_motion_mode( )` —
+        // the inner `if ( interintra )` arm overrides `RefFrame[ 1 ] =
+        // INTRA_FRAME`, and the §5.11.27 body's `RefFrame[ 1 ] ==
+        // INTRA_FRAME` short-circuit consumes that override (it is the
+        // ONLY way slot 1 ever becomes INTRA_FRAME — the §5.11.25
+        // reader produces `NONE = -1` or `1..=7`). Reading motion mode
+        // first would consume a `use_obmc` / `motion_mode` symbol the
+        // encoder never coded on interintra blocks. (r277 fix; the
+        // r175-r178 wiring had the two calls swapped.)
+        let interintra = self.read_interintra_mode(
+            decoder,
+            cdfs,
+            sub_size,
+            skip_mode,
+            is_compound,
+            enable_interintra_compound,
+        )?;
+
+        let ref_frame = if interintra.interintra == 1 {
+            // §5.11.28: `RefFrame[ 1 ] = INTRA_FRAME = 0`. Restamp the
+            // grid's slot-1 entry over the block footprint so the next
+            // block's `RefFrames[ ..][ ..][ 1 ]` reads observe the
+            // override, and shadow the local pair so the §5.11.27 /
+            // §5.11.x readers below see the post-override state
+            // exactly as the spec's imperative assignment implies.
+            // Slot 0 is unchanged.
+            for dr in 0..bh4 {
+                let rr = mi_row + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    let cell = ((rr * self.mi_cols + cc) as usize) * 2;
+                    self.ref_frames[cell + 1] = 0; // INTRA_FRAME
+                }
+            }
+            [ref_frame[0], 0]
+        } else {
+            ref_frame
+        };
+
         // §5.11.23 line 34: `read_motion_mode( isCompound )` per §5.11.27
         // (av1-spec p.79). r175 wires the §5.11.27 body and its
         // §7.10.3 `has_overlappable_candidates` + §7.10.4
         // `find_warp_samples` helpers; post-r178 the full
-        // post-`read_motion_mode` cascade (`read_interintra_mode` per
-        // §5.11.28, `read_compound_type` per §5.11.29,
-        // `read_interpolation_filter` per §5.11.x) is wired.
+        // post-`read_motion_mode` cascade (`read_compound_type` per
+        // §5.11.29, `read_interpolation_filter` per §5.11.x) is wired.
         let num_samples = self.find_warp_samples(mi_row, mi_col, sub_size, ref_frame[0], mv);
         let motion_mode = self.read_motion_mode(
             decoder,
@@ -19921,51 +19971,6 @@ impl PartitionWalker {
             gm_type,
             is_scaled_per_ref,
         )?;
-
-        // §5.11.23 line 35: `read_interintra_mode( isCompound )` per
-        // §5.11.28 (av1-spec p.79-80). Reads the inter-intra blending
-        // triple gated on `enable_interintra_compound && !isCompound &&
-        // BLOCK_8X8 <= MiSize <= BLOCK_32X32`. When the inner
-        // `if ( interintra )` arm fires the spec body overrides
-        // `RefFrame[ 1 ] = INTRA_FRAME`; restamp the walker grid's
-        // slot-1 entry over the bh4 * bw4 footprint so the next block's
-        // §5.11.18 prologue / §8.3.2 ref-frame ctx walks observe the
-        // override. Post-r178 the §5.11.29 `read_compound_type` and
-        // §5.11.x `read_interpolation_filter` leaves that follow are
-        // both wired.
-        let interintra = self.read_interintra_mode(
-            decoder,
-            cdfs,
-            sub_size,
-            skip_mode,
-            is_compound,
-            enable_interintra_compound,
-        )?;
-
-        if interintra.interintra == 1 {
-            // §5.11.28: `RefFrame[ 1 ] = INTRA_FRAME = 0`. Restamp the
-            // grid's slot-1 entry over the block footprint so the next
-            // block's `RefFrames[ ..][ ..][ 1 ]` reads observe the
-            // override. Slot 0 is unchanged. The §7.10.3 / §7.10.4
-            // walkers covered in r175 read only slot 0, so the
-            // override does not perturb r175 testing; the §5.11.29
-            // `read_compound_type` reader (next arc) will look at
-            // slot 1 explicitly per the §8.3.2 `comp_group_idx` ctx.
-            for dr in 0..bh4 {
-                let rr = mi_row + dr;
-                if rr >= self.mi_rows {
-                    break;
-                }
-                for dc in 0..bw4 {
-                    let cc = mi_col + dc;
-                    if cc >= self.mi_cols {
-                        break;
-                    }
-                    let cell = ((rr * self.mi_cols + cc) as usize) * 2;
-                    self.ref_frames[cell + 1] = 0; // INTRA_FRAME
-                }
-            }
-        }
 
         // §5.11.23 line 36: `read_compound_type( isCompound )` per
         // §5.11.29 (av1-spec p.80-81). Reads the inter-inter compound
@@ -28138,15 +28143,11 @@ pub struct DecodedIntraBlockModeInfo {
 /// §5.11.23 per-block aggregate surfaced by
 /// [`PartitionWalker::decode_inter_block_mode_info`]. Carries the
 /// §5.11.23 prologue + §7.10.2 stack-summary + YMode + RefMvIdx + the
-/// §5.11.31 `assign_mv` outcome + the §5.11.27 `read_motion_mode`
-/// outcome. r175 lifted the §5.11.27 reader (with its §7.10.3
-/// `has_overlappable_candidates` and §7.10.4 `find_warp_samples`
-/// helpers), so the new `motion_mode` + `num_warp_samples` fields
-/// below are populated on the `Ok` path. The post-`read_motion_mode`
-/// cascade (`read_interintra_mode` / `read_compound_type` /
-/// `read_interpolation_filter`) is the next-arc target; the §5.11.18
-/// dispatcher currently surfaces an `InterBlockModeInfoUnsupported`
-/// Err on its `Ok(_)` arm until that cascade lands.
+/// §5.11.31 `assign_mv` outcome + the full §5.11.23 tail
+/// (`read_interintra_mode` per §5.11.28, `read_motion_mode` per
+/// §5.11.27, `read_compound_type` per §5.11.29, and the §5.11.x
+/// interpolation-filter loop — consumed in that spec order as of
+/// r277). Every field below is populated on the `Ok` path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedInterBlockModeInfo {
     /// §5.11.23 caller-passed mi-unit row of the block.
@@ -28155,15 +28156,16 @@ pub struct DecodedInterBlockModeInfo {
     pub mi_col: u32,
     /// §5.11.23 caller-passed `MiSize` ordinal.
     pub mi_size: usize,
-    /// §5.11.25 `read_ref_frames( )` output. Slot 0 in
+    /// §5.11.25 `read_ref_frames( )` output, post the §5.11.28
+    /// `RefFrame[ 1 ] = INTRA_FRAME` override (r277). Slot 0 in
     /// `INTRA_FRAME = 0..=ALTREF_FRAME = 7`; slot 1 in
     /// `NONE = -1 | INTRA_FRAME = 0 | LAST_FRAME = 1..=ALTREF_FRAME = 7`.
     /// `(ref_frame[0], ref_frame[1])` pairs are constrained by §5.11.25
     /// — single-prediction always has slot 1 = `NONE`; compound
-    /// prediction has both slots in `1..=7`; the spec excludes
-    /// `slot 1 = INTRA_FRAME` (the inter-intra encoding) from
-    /// §5.11.25 entirely (it's surfaced later via the §5.11.23
-    /// `read_interintra_mode` reader, which is a subsequent arc).
+    /// prediction has both slots in `1..=7`. `slot 1 = INTRA_FRAME`
+    /// appears exactly when the §5.11.28 `interintra` arm fired (the
+    /// §5.11.25 reader itself never produces it); the same override is
+    /// stamped onto the walker's `RefFrames` grid.
     pub ref_frame: [i32; 2],
     /// §5.11.23 line 4: `isCompound = RefFrame[ 1 ] > INTRA_FRAME`.
     /// True ⇔ the block uses compound prediction (slot 1 in

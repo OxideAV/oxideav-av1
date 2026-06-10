@@ -50,22 +50,24 @@
 use crate::cdf::{
     block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_group_idx_ctx,
     comp_mode_ctx, comp_ref_type_ctx, compound_idx_ctx, compound_mode_ctx, count_refs,
-    interintra_ctx, is_directional, is_samedir_ref_pair, mi_height_log2, mi_width_log2,
-    neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx, wedge_bits,
-    CompoundTypeReadout, FindMvStackResult, InterIntraReadout, PartitionWalker, TileCdfContext,
-    BLOCK_128X128, BLOCK_32X32, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS,
-    CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_AVERAGE, COMPOUND_DIFFWTD,
-    COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES,
-    COMPOUND_WEDGE, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS,
-    FRAME_LF_COUNT, GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTRA_FILTER_MODES, INTRA_MODES,
-    INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS,
-    MODE_GLOBALMV, MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV,
-    MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MOTION_MODES,
-    MOTION_MODE_OBMC, MOTION_MODE_SIMPLE, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
-    MV_INTRABC_CONTEXT, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO,
-    NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
-    PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
-    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    interintra_ctx, interp_filter_ctx, is_directional, is_samedir_ref_pair, mi_height_log2,
+    mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx,
+    wedge_bits, CompoundTypeReadout, FindMvStackResult, InterIntraReadout,
+    InterpolationFilterReadout, PartitionWalker, TileCdfContext, BILINEAR, BLOCK_128X128,
+    BLOCK_32X32, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE,
+    CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE,
+    COMPOUND_INTRA, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES, COMPOUND_WEDGE,
+    COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, EIGHTTAP,
+    FRAME_LF_COUNT, GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_NONE,
+    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA,
+    MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV, MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV,
+    MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
+    MODE_NEW_NEARMV, MODE_NEW_NEWMV, MOTION_MODES, MOTION_MODE_OBMC, MOTION_MODE_SIMPLE,
+    MOTION_MODE_WARPED_CAUSAL, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT,
+    MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO, NEW_MV_CONTEXTS,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS,
+    REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS,
+    SKIP_MODE_CONTEXTS, SWITCHABLE, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
     WEDGE_TYPES, ZERO_MV_CONTEXTS,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
@@ -5269,20 +5271,154 @@ pub fn assign_mv_pred_mv(
     Ok(mv_stack.ref_stack_mv[pos as usize][ref_list as usize])
 }
 
+/// §5.11.23 tail inputs for [`write_inter_block_mode_info`] — r277.
+/// Groups the readouts + gating scalars the four post-`assign_mv( )`
+/// leaf writers consume ([`write_interintra_mode`] §5.11.28,
+/// [`write_motion_mode`] §5.11.27, [`write_compound_type`] §5.11.29,
+/// [`write_interpolation_filter`] §5.11.x), so the composition's
+/// parameter surface stays readable. Every field maps 1:1 onto a leaf
+/// writer's input of the same name; see the leaf docs for the spec
+/// semantics and reject conditions.
+///
+/// The two walker-derived §5.11.27 quantities (`has_overlappable` —
+/// §7.10.3 `has_overlappable_candidates( )` — and `num_samples` —
+/// §7.10.4 `find_warp_samples( )` `NumSamples`) arrive precomputed
+/// per the stateless-writer doctrine of this module; the §8.3.2
+/// neighbour grid reads (`above_comp_group_idx` / `left_comp_group_idx`
+/// — identity `0` when unavailable — `above_compound_idx` /
+/// `left_compound_idx` — identity `1` — and `above_interp_filters` /
+/// `left_interp_filters`) likewise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterBlockModeInfoTail {
+    /// §5.11.28 target [`InterIntraReadout`].
+    pub interintra: InterIntraReadout,
+    /// §5.5.2 sequence-header `enable_interintra_compound` bit.
+    pub enable_interintra_compound: bool,
+    /// §5.11.27 target `motion_mode` ordinal.
+    pub motion_mode: u8,
+    /// §7.10.4 `NumSamples` from `find_warp_samples( )`.
+    pub num_samples: u32,
+    /// §5.9.2 frame-header `is_motion_mode_switchable` bit.
+    pub is_motion_mode_switchable: bool,
+    /// §5.9.2 frame-header `allow_warped_motion` bit.
+    pub allow_warped_motion: bool,
+    /// §5.11.27 `is_scaled( refFrame )` per `refFrame - LAST_FRAME`.
+    pub is_scaled_per_ref: [bool; 7],
+    /// §7.10.3 `has_overlappable_candidates( )` outcome.
+    pub has_overlappable: bool,
+    /// §5.11.29 target [`CompoundTypeReadout`].
+    pub compound_type: CompoundTypeReadout,
+    /// §5.5.2 sequence-header `enable_masked_compound` bit.
+    pub enable_masked_compound: bool,
+    /// §5.5.2 sequence-header `enable_jnt_comp` bit.
+    pub enable_jnt_comp: bool,
+    /// §7.8.1 equal-relative-distance outcome seeding the §8.3.2
+    /// `compound_idx` ctx.
+    pub dist_equal: bool,
+    /// §8.3.2 `CompGroupIdxs[ MiRow - 1 ][ MiCol ]` (identity `0`).
+    pub above_comp_group_idx: u8,
+    /// §8.3.2 `CompGroupIdxs[ MiRow ][ MiCol - 1 ]` (identity `0`).
+    pub left_comp_group_idx: u8,
+    /// §8.3.2 `CompoundIdxs[ MiRow - 1 ][ MiCol ]` (identity `1`).
+    pub above_compound_idx: u8,
+    /// §8.3.2 `CompoundIdxs[ MiRow ][ MiCol - 1 ]` (identity `1`).
+    pub left_compound_idx: u8,
+    /// §5.11.x target [`InterpolationFilterReadout`].
+    pub interp_filter: InterpolationFilterReadout,
+    /// §5.9.10 frame-header `interpolation_filter` in
+    /// `EIGHTTAP..=SWITCHABLE = 0..=4`.
+    pub interpolation_filter: u8,
+    /// §5.5.2 sequence-header `enable_dual_filter` bit.
+    pub enable_dual_filter: bool,
+    /// §8.3.2 `InterpFilters[ MiRow - 1 ][ MiCol ][ 0..2 ]`.
+    pub above_interp_filters: [u8; 2],
+    /// §8.3.2 `InterpFilters[ MiRow ][ MiCol - 1 ][ 0..2 ]`.
+    pub left_interp_filters: [u8; 2],
+    /// §5.9.24 `GmType[ 0..8 ]` — shared by the §5.11.27 GLOBALMV
+    /// short-circuit and the §5.11.x `needs_interp_filter( )` gate.
+    pub gm_type: [i32; 8],
+}
+
+impl InterBlockModeInfoTail {
+    /// The everything-gated-shut tail: every §5.11.23 tail leaf is
+    /// bit-silent on this configuration regardless of the head's arm.
+    ///
+    /// * §5.11.28 gate closed (`enable_interintra_compound == false`)
+    ///   ⇒ `interintra = 0`, no bits;
+    /// * §5.11.27 short-circuit (`is_motion_mode_switchable == false`)
+    ///   ⇒ `motion_mode = SIMPLE`, no bits;
+    /// * §5.11.29 with `enable_masked_compound == false` AND
+    ///   `enable_jnt_comp == false` ⇒ the line-1/2 pre-sets survive on
+    ///   every arm (`comp_group_idx = 0`, `compound_idx = 1`,
+    ///   `compound_type = COMPOUND_AVERAGE`), no bits;
+    /// * §5.11.x with `interpolation_filter = EIGHTTAP` (non-
+    ///   SWITCHABLE) ⇒ both slots forced to `EIGHTTAP`, no bits.
+    ///
+    /// Useful as a baseline the caller patches per block, and as the
+    /// regression fixture proving the composed writer's head bits are
+    /// unchanged by the r277 tail fold.
+    pub fn bit_silent() -> Self {
+        Self {
+            interintra: InterIntraReadout {
+                interintra: 0,
+                interintra_mode: None,
+                wedge_interintra: None,
+                wedge_index: None,
+            },
+            enable_interintra_compound: false,
+            motion_mode: MOTION_MODE_SIMPLE,
+            num_samples: 0,
+            is_motion_mode_switchable: false,
+            allow_warped_motion: false,
+            is_scaled_per_ref: [false; 7],
+            has_overlappable: false,
+            compound_type: CompoundTypeReadout {
+                comp_group_idx: 0,
+                compound_idx: 1,
+                compound_type: COMPOUND_AVERAGE,
+                wedge_index: None,
+                wedge_sign: None,
+                mask_type: None,
+            },
+            enable_masked_compound: false,
+            enable_jnt_comp: false,
+            dist_equal: false,
+            above_comp_group_idx: 0,
+            left_comp_group_idx: 0,
+            above_compound_idx: 1,
+            left_compound_idx: 1,
+            interp_filter: InterpolationFilterReadout {
+                interp_filter: [EIGHTTAP, EIGHTTAP],
+                read_from_bitstream: [false, false],
+            },
+            interpolation_filter: EIGHTTAP,
+            enable_dual_filter: false,
+            above_interp_filters: [EIGHTTAP, EIGHTTAP],
+            left_interp_filters: [EIGHTTAP, EIGHTTAP],
+            gm_type: [0; 8],
+        }
+    }
+}
+
+impl Default for InterBlockModeInfoTail {
+    fn default() -> Self {
+        Self::bit_silent()
+    }
+}
+
 /// `inter_block_mode_info( )` composition writer per §5.11.23 (av1-spec
-/// p.73-75) — r275. Folds the r266-r274 leaf writers
+/// p.73-75) — r275, tail folded r277. Folds the r266-r274 leaf writers
 /// ([`write_ref_frames`], [`write_compound_mode`] /
 /// [`write_inter_single_mode`], [`write_drl_mode`], [`assign_mv_pred_mv`]
 /// and [`write_read_mv`]) into the single §5.11.23 body the
 /// `inter_frame_mode_info` chain reaches on an inter block. It is the
 /// exact encode-side inverse of the decode-side
 /// [`crate::cdf::PartitionWalker::decode_inter_block_mode_info`] from
-/// `read_ref_frames( )` (line 4618) through `assign_mv( )` (line 4675),
-/// the motion-vector cascade.
+/// `read_ref_frames( )` through the closing interpolation-filter loop.
 ///
 /// ## Scope
 ///
-/// Covers the §5.11.23 body up to and including `assign_mv( )`:
+/// Covers the full §5.11.23 body:
 ///
 /// 1. `read_ref_frames( )` (§5.11.25) via [`write_ref_frames`].
 /// 2. `isCompound = RefFrame[ 1 ] > INTRA_FRAME`.
@@ -5305,14 +5441,19 @@ pub fn assign_mv_pred_mv(
 ///    [`assign_mv_pred_mv`] and emit the MV difference via
 ///    [`write_read_mv`]. Non-NEWMV lists set `Mv[ i ] = PredMv[ i ]`
 ///    with no bits (§5.11.31 line `else Mv[ i ] = PredMv[ i ]`).
-///
-/// The §5.11.23 tail after `assign_mv` now has standalone leaf writers
-/// — [`write_interintra_mode`] (§5.11.28), [`write_motion_mode`]
-/// (§5.11.27) and [`write_compound_type`] (§5.11.29), landed r276 —
-/// but they are not yet folded into this composition (their gating
-/// scalars — sequence-header flags, warp-sample counts, neighbour
-/// grids — widen the input surface considerably). The `interp_filter`
-/// loop writer and the tail composition are the follow-up arc.
+/// 7. The §5.11.23 tail in **spec order** (folded r277):
+///    `read_interintra_mode( )` via [`write_interintra_mode`]
+///    (§5.11.28), then `read_motion_mode( )` via [`write_motion_mode`]
+///    (§5.11.27), then `read_compound_type( )` via
+///    [`write_compound_type`] (§5.11.29), then the interpolation-
+///    filter loop via [`write_interpolation_filter`] (§5.11.x). The
+///    §5.11.28 inner-arm `RefFrame[ 1 ] = INTRA_FRAME` override is
+///    applied between the first two — it is the §5.11.27 short-circuit
+///    that silences `motion_mode` on interintra blocks, and the
+///    §5.11.x writer also observes the post-override pair. Tail inputs
+///    arrive grouped in [`InterBlockModeInfoTail`];
+///    [`InterBlockModeInfoTail::bit_silent`] reproduces the pre-r277
+///    head-only bit pattern (every tail leaf gated shut).
 ///
 /// ## `YMode` consistency
 ///
@@ -5381,6 +5522,7 @@ pub fn write_inter_block_mode_info(
     left_ref_frame: [i32; 2],
     force_integer_mv: bool,
     allow_high_precision_mv: bool,
+    tail: &InterBlockModeInfoTail,
 ) -> Result<(), Error> {
     // §3 binary alphabet bound on `skip_mode` (mirrors the bootstrap).
     if skip_mode > 1 {
@@ -5491,6 +5633,102 @@ pub fn write_inter_block_mode_info(
         }
         // Non-NEWMV lists: `Mv[ i ] = PredMv[ i ]`, no symbols.
     }
+
+    // ------- §5.11.23 tail (folded r277) — spec order: §5.11.28 →
+    // §5.11.27 → §5.11.29 → §5.11.x interpolation-filter loop. -------
+
+    // `read_interintra_mode( isCompound )` per §5.11.28.
+    write_interintra_mode(
+        writer,
+        cdfs,
+        &tail.interintra,
+        mi_size,
+        skip_mode,
+        is_compound,
+        tail.enable_interintra_compound,
+    )?;
+
+    // §5.11.28 inner-arm override: `RefFrame[ 1 ] = INTRA_FRAME = 0`.
+    // The §5.11.27 / §5.11.x writers below observe the post-override
+    // pair — slot-1 INTRA_FRAME is the §5.11.27 short-circuit that
+    // silences `motion_mode` on interintra blocks (and the only way
+    // slot 1 ever becomes INTRA_FRAME). `is_compound` is unaffected
+    // (the §5.11.28 gate already required `!isCompound`).
+    let ref_frame = if tail.interintra.interintra == 1 {
+        [ref_frame[0], 0]
+    } else {
+        ref_frame
+    };
+
+    // `read_motion_mode( isCompound )` per §5.11.27.
+    write_motion_mode(
+        writer,
+        cdfs,
+        tail.motion_mode,
+        mi_size,
+        skip_mode,
+        is_compound,
+        ref_frame,
+        y_mode,
+        tail.num_samples,
+        tail.is_motion_mode_switchable,
+        tail.allow_warped_motion,
+        force_integer_mv,
+        tail.gm_type,
+        tail.is_scaled_per_ref,
+        tail.has_overlappable,
+    )?;
+
+    // `read_compound_type( isCompound )` per §5.11.29. The §8.3.2
+    // `comp_group_idx` / `compound_idx` ctx walks consult
+    // `AboveRefFrame[ 0 ] == ALTREF_FRAME` / `LeftRefFrame[ 0 ] ==
+    // ALTREF_FRAME` on their `!AboveSingle` / `!LeftSingle` arms;
+    // ALTREF_FRAME = 7 per §6.10.x.
+    write_compound_type(
+        writer,
+        cdfs,
+        &tail.compound_type,
+        mi_size,
+        skip_mode,
+        is_compound,
+        tail.interintra.interintra,
+        tail.interintra.wedge_interintra.unwrap_or(0),
+        tail.enable_masked_compound,
+        tail.enable_jnt_comp,
+        tail.dist_equal,
+        avail_u,
+        avail_l,
+        above_single,
+        left_single,
+        above_ref_frame[0] == 7,
+        left_ref_frame[0] == 7,
+        tail.above_comp_group_idx,
+        tail.left_comp_group_idx,
+        tail.above_compound_idx,
+        tail.left_compound_idx,
+    )?;
+
+    // The closing §5.11.x interpolation-filter loop.
+    write_interpolation_filter(
+        writer,
+        cdfs,
+        &tail.interp_filter,
+        mi_size,
+        skip_mode,
+        is_compound,
+        ref_frame,
+        y_mode,
+        tail.motion_mode,
+        tail.interpolation_filter,
+        tail.enable_dual_filter,
+        tail.gm_type,
+        avail_u,
+        avail_l,
+        above_ref_frame,
+        left_ref_frame,
+        tail.above_interp_filters,
+        tail.left_interp_filters,
+    )?;
 
     Ok(())
 }
@@ -6055,6 +6293,223 @@ pub fn write_compound_type(
     } else if readout.wedge_index.is_some()
         || readout.wedge_sign.is_some()
         || readout.mask_type.is_some()
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    Ok(())
+}
+
+/// §5.11.x interpolation-filter loop writer (av1-spec p.74, the
+/// `if ( interpolation_filter == SWITCHABLE )` block closing
+/// `inter_block_mode_info`) — r277. Fourth and last piece of the
+/// §5.11.23 tail. Exact encode-side inverse of
+/// [`crate::cdf::PartitionWalker::read_interpolation_filter`]: the
+/// caller hands the target [`InterpolationFilterReadout`] (the same
+/// aggregate the decoder returns) plus the gating scalars; the writer
+/// re-derives the active arms and emits the matching S() sequence.
+///
+/// ## Spec body (av1-spec p.74)
+///
+/// ```text
+///   if ( interpolation_filter == SWITCHABLE ) {
+///       for ( dir = 0; dir < ( enable_dual_filter ? 2 : 1 ); dir++ ) {
+///           if ( needs_interp_filter( ) ) {
+///               interp_filter[ dir ]                          S()
+///           } else {
+///               interp_filter[ dir ] = EIGHTTAP
+///           }
+///       }
+///       if ( !enable_dual_filter )
+///           interp_filter[ 1 ] = interp_filter[ 0 ]
+///   } else {
+///       for ( dir = 0; dir < 2; dir++ )
+///           interp_filter[ dir ] = interpolation_filter
+///   }
+/// ```
+///
+/// with `needs_interp_filter( )` per av1-spec p.75:
+///
+/// ```text
+///   needs_interp_filter( ) {
+///       large = ( Min( Block_Width[ MiSize ], Block_Height[ MiSize ] ) >= 8 )
+///       if ( skip_mode || motion_mode == LOCALWARP )           return 0
+///       else if ( large && YMode == GLOBALMV )
+///           return GmType[ RefFrame[ 0 ] ] == TRANSLATION
+///       else if ( large && YMode == GLOBAL_GLOBALMV )
+///           return GmType[ RefFrame[ 0 ] ] == TRANSLATION ||
+///                  GmType[ RefFrame[ 1 ] ] == TRANSLATION
+///       else                                                   return 1
+///   }
+/// ```
+///
+/// ## §8.3.2 CDF selection
+///
+/// `interp_filter` codes against `TileInterpFilterCdf[ ctx ]` with
+/// `ctx` from the §8.3.2 walk (av1-spec p.369) via
+/// [`interp_filter_ctx`]. Per the stateless-writer doctrine of this
+/// module the two neighbour grid reads arrive precomputed:
+/// `above_ref_frame` / `left_ref_frame` carry the neighbours'
+/// `RefFrames[ .. ][ 0..2 ]` pairs and `above_interp_filters` /
+/// `left_interp_filters` their `InterpFilters[ .. ][ dir ]` pairs.
+/// The walk accepts a neighbour's filter only when the neighbour is
+/// available AND one of its two reference slots equals
+/// `RefFrame[ 0 ]`; otherwise the spec's `3` sentinel
+/// ([`INTERP_FILTER_NONE`]) stands in — exactly the reader's grid
+/// resolution.
+///
+/// ## Readout consistency
+///
+/// The target `readout` must be exactly producible by the reader on
+/// this gate configuration:
+///
+/// * `interpolation_filter != SWITCHABLE` ⇒ both slots equal the
+///   frame-header value, both `read_from_bitstream == false`, no
+///   bits;
+/// * `SWITCHABLE && !needs_interp_filter( )` ⇒ the coded dir carries
+///   `EIGHTTAP` with `read_from_bitstream == false`, no bits;
+/// * `SWITCHABLE && needs_interp_filter( )` ⇒ the coded dir carries
+///   an ordinal in `0..INTERP_FILTERS` (the 3-way S() alphabet —
+///   `BILINEAR` is frame-level-only) with `read_from_bitstream ==
+///   true`;
+/// * `!enable_dual_filter` ⇒ slot 1 mirrors slot 0 with
+///   `read_from_bitstream[ 1 ] == false` (the spec's post-loop
+///   mirror reads no second symbol).
+///
+/// Any other shape is a caller bug surfaced as
+/// `Err(PartitionWalkOutOfRange)` (the reader could never decode it).
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless: between zero and two §8.2.6 `S()` symbols. The caller
+/// stamps `InterpFilters[ r + y ][ c + x ][ dir ] =
+/// interp_filter[ dir ]` onto the block footprint through its own
+/// [`crate::cdf::PartitionWalker`] so subsequent blocks' §8.3.2 ctx
+/// walks observe the values.
+#[allow(clippy::too_many_arguments)]
+pub fn write_interpolation_filter(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    readout: &InterpolationFilterReadout,
+    mi_size: usize,
+    skip_mode: u8,
+    is_compound: bool,
+    ref_frame: [i32; 2],
+    y_mode: u8,
+    motion_mode: u8,
+    interpolation_filter: u8,
+    enable_dual_filter: bool,
+    gm_type: [i32; 8],
+    avail_u: bool,
+    avail_l: bool,
+    above_ref_frame: [i32; 2],
+    left_ref_frame: [i32; 2],
+    above_interp_filters: [u8; 2],
+    left_interp_filters: [u8; 2],
+) -> Result<(), Error> {
+    // §5.11.x caller-bug guards — mirror the reader's bounds:
+    // `interpolation_filter` in `EIGHTTAP..=SWITCHABLE = 0..=4` per
+    // §6.8.9; `mi_size` per the §3 BLOCK_* enumeration; `ref_frame[0]`
+    // in `INTRA_FRAME = 0..=ALTREF_FRAME = 7`; `ref_frame[1]` in
+    // `NONE = -1..=ALTREF_FRAME = 7`; `skip_mode` binary; the
+    // neighbour `InterpFilters` entries in `0..=BILINEAR = 0..=3`
+    // (every value the §5.11.x reader can stamp).
+    if skip_mode > 1 || mi_size >= BLOCK_SIZES || interpolation_filter > SWITCHABLE {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if !(0..=7).contains(&ref_frame[0]) || !(-1..=7).contains(&ref_frame[1]) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if above_interp_filters.iter().any(|&f| f > BILINEAR)
+        || left_interp_filters.iter().any(|&f| f > BILINEAR)
+    {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.x `else`-arm: `interp_filter[ dir ] = interpolation_filter`
+    // for both dirs, no bits. The readout must carry the exact forced
+    // shape.
+    if interpolation_filter != SWITCHABLE {
+        if readout.interp_filter != [interpolation_filter, interpolation_filter]
+            || readout.read_from_bitstream != [false, false]
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        return Ok(());
+    }
+
+    // `needs_interp_filter( )` per av1-spec p.75 — dir-invariant, so
+    // hoisted out of the per-direction loop (the reader evaluates it
+    // per iteration with identical inputs).
+    let large = core::cmp::min(block_width(mi_size), block_height(mi_size)) >= 8;
+    let needs = if skip_mode != 0 || motion_mode == MOTION_MODE_WARPED_CAUSAL {
+        false
+    } else if large && y_mode == MODE_GLOBALMV {
+        let r0 = ref_frame[0];
+        (0..8).contains(&r0) && gm_type[r0 as usize] == GM_TYPE_TRANSLATION
+    } else if large && y_mode == MODE_GLOBAL_GLOBALMV {
+        let r0 = ref_frame[0];
+        let r1 = ref_frame[1];
+        let t0 = (0..8).contains(&r0) && gm_type[r0 as usize] == GM_TYPE_TRANSLATION;
+        let t1 = (0..8).contains(&r1) && gm_type[r1 as usize] == GM_TYPE_TRANSLATION;
+        t0 || t1
+    } else {
+        true
+    };
+
+    // §5.11.x `if`-arm: per-direction loop over `enable_dual_filter ?
+    // 2 : 1` dirs.
+    let dir_count = if enable_dual_filter { 2usize } else { 1 };
+    for dir in 0..dir_count {
+        if !needs {
+            // `interp_filter[ dir ] = EIGHTTAP` — no bits; the readout
+            // must carry the exact fallback shape.
+            if readout.interp_filter[dir] != EIGHTTAP || readout.read_from_bitstream[dir] {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            continue;
+        }
+
+        // `interp_filter[ dir ] S()` — the 3-way alphabet covers
+        // `EIGHTTAP..=EIGHTTAP_SHARP` only (`BILINEAR` is reachable
+        // solely through the frame-level f(2) path above).
+        if !readout.read_from_bitstream[dir]
+            || (readout.interp_filter[dir] as usize) >= INTERP_FILTERS
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+
+        // §8.3.2 neighbour resolution: take the neighbour's
+        // `InterpFilters[ .. ][ dir ]` only when it is available and
+        // one of its `RefFrames[ .. ][ 0..2 ]` equals `RefFrame[ 0 ]`;
+        // else the `3` sentinel.
+        let above_type = if avail_u
+            && (above_ref_frame[0] == ref_frame[0] || above_ref_frame[1] == ref_frame[0])
+        {
+            above_interp_filters[dir] as usize
+        } else {
+            INTERP_FILTER_NONE
+        };
+        let left_type = if avail_l
+            && (left_ref_frame[0] == ref_frame[0] || left_ref_frame[1] == ref_frame[0])
+        {
+            left_interp_filters[dir] as usize
+        } else {
+            INTERP_FILTER_NONE
+        };
+        let ctx = interp_filter_ctx(above_type, left_type, dir as u32, is_compound)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        let row = cdfs
+            .interp_filter_cdf(ctx)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        writer.write_symbol(readout.interp_filter[dir] as u32, row)?;
+    }
+
+    // §5.11.x post-loop mirror: `if ( !enable_dual_filter )
+    // interp_filter[ 1 ] = interp_filter[ 0 ]` — no second symbol, so
+    // slot 1 must mirror slot 0 with its read flag clear.
+    if !enable_dual_filter
+        && (readout.interp_filter[1] != readout.interp_filter[0] || readout.read_from_bitstream[1])
     {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -15721,6 +16176,7 @@ mod tests {
             lrf,
             /* force_integer_mv = */ false,
             /* allow_high_precision_mv = */ true,
+            &InterBlockModeInfoTail::bit_silent(),
         )
         .unwrap();
         let bytes = writer.finish();
@@ -15786,6 +16242,7 @@ mod tests {
             lrf,
             false,
             true,
+            &InterBlockModeInfoTail::bit_silent(),
         )
         .unwrap();
         let bytes = writer.finish();
@@ -15846,6 +16303,7 @@ mod tests {
             lrf,
             false,
             true,
+            &InterBlockModeInfoTail::bit_silent(),
         )
         .unwrap();
         let bytes = writer.finish();
@@ -15911,6 +16369,7 @@ mod tests {
             lrf,
             false,
             true,
+            &InterBlockModeInfoTail::bit_silent(),
         )
         .unwrap();
         let bytes = writer.finish();
@@ -15973,6 +16432,7 @@ mod tests {
             lrf,
             false,
             true,
+            &InterBlockModeInfoTail::bit_silent(),
         )
         .unwrap();
         let bytes = writer.finish();
@@ -16029,6 +16489,7 @@ mod tests {
             lrf,
             false,
             true,
+            &InterBlockModeInfoTail::bit_silent(),
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
@@ -17043,5 +17504,822 @@ mod tests {
             mask_type: None,
         };
         assert!(run(&bad, true, false).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.x interpolation-filter loop — write_interpolation_filter
+    // round-trips through PartitionWalker::read_interpolation_filter
+    // (r277).
+    // -----------------------------------------------------------------
+
+    /// §5.9.24 identity warp parameters (diagonal `1 <<
+    /// WARPEDMODEL_PREC_BITS = 1 << 16`) for the §7.10.2.1 global-mv
+    /// setup in the dispatcher round-trip below.
+    fn identity_gm_params() -> [[i32; 6]; 8] {
+        let mut params = [[0i32; 6]; 8];
+        for p in &mut params {
+            p[2] = 1 << 16;
+            p[5] = 1 << 16;
+        }
+        params
+    }
+
+    /// Encode `readout` then decode it back through the §5.11.x reader
+    /// on a fresh walker at `(0, 0)` (no neighbours on either side);
+    /// returns the recovered readout after asserting CDF lockstep.
+    #[allow(clippy::too_many_arguments)]
+    fn roundtrip_interp_filter(
+        readout: InterpolationFilterReadout,
+        mi_size: usize,
+        skip_mode: u8,
+        y_mode: u8,
+        motion_mode: u8,
+        interpolation_filter: u8,
+        enable_dual_filter: bool,
+        gm_type: [i32; 8],
+    ) -> InterpolationFilterReadout {
+        let ref_frame = [1i32, -1];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_interpolation_filter(
+            &mut writer,
+            &mut enc_cdfs,
+            &readout,
+            mi_size,
+            skip_mode,
+            /* is_compound = */ false,
+            ref_frame,
+            y_mode,
+            motion_mode,
+            interpolation_filter,
+            enable_dual_filter,
+            gm_type,
+            /* avail_u = */ false,
+            /* avail_l = */ false,
+            [-1, -1],
+            [-1, -1],
+            [EIGHTTAP, EIGHTTAP],
+            [EIGHTTAP, EIGHTTAP],
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        let pad = if bytes.is_empty() { vec![0u8] } else { bytes };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), false).unwrap();
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let got = walker
+            .read_interpolation_filter(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                mi_size,
+                skip_mode,
+                false,
+                ref_frame,
+                y_mode,
+                motion_mode,
+                interpolation_filter,
+                enable_dual_filter,
+                gm_type,
+            )
+            .unwrap();
+        // Writer and reader adapted the same TileInterpFilterCdf rows.
+        assert_eq!(enc_cdfs.interp_filter, dec_cdfs.interp_filter);
+        got
+    }
+
+    /// SWITCHABLE + `needs_interp_filter() == 1` + dual filter: two
+    /// independent S() symbols, one per direction, round-trip exactly.
+    #[test]
+    fn write_interpolation_filter_switchable_dual_round_trips() {
+        let target = InterpolationFilterReadout {
+            interp_filter: [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SMOOTH],
+            read_from_bitstream: [true, true],
+        };
+        let got = roundtrip_interp_filter(
+            target,
+            BLOCK_16X16,
+            0,
+            MODE_NEARESTMV,
+            MOTION_MODE_SIMPLE,
+            SWITCHABLE,
+            /* enable_dual_filter = */ true,
+            [0; 8],
+        );
+        assert_eq!(got, target);
+    }
+
+    /// SWITCHABLE + needs + single-dir loop: one S(); slot 1 mirrors
+    /// slot 0 with its read flag clear per the §5.11.x post-loop line.
+    #[test]
+    fn write_interpolation_filter_switchable_single_dir_round_trips() {
+        let target = InterpolationFilterReadout {
+            interp_filter: [crate::cdf::EIGHTTAP_SMOOTH, crate::cdf::EIGHTTAP_SMOOTH],
+            read_from_bitstream: [true, false],
+        };
+        let got = roundtrip_interp_filter(
+            target,
+            BLOCK_8X8,
+            0,
+            MODE_NEARESTMV,
+            MOTION_MODE_SIMPLE,
+            SWITCHABLE,
+            /* enable_dual_filter = */ false,
+            [0; 8],
+        );
+        assert_eq!(got, target);
+    }
+
+    /// Non-SWITCHABLE frame header: both slots forced, zero bits; the
+    /// reader recovers the same forced shape from an untouched stream.
+    #[test]
+    fn write_interpolation_filter_non_switchable_writes_no_bits() {
+        let target = InterpolationFilterReadout {
+            interp_filter: [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SHARP],
+            read_from_bitstream: [false, false],
+        };
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_interpolation_filter(
+            &mut writer,
+            &mut cdfs,
+            &target,
+            BLOCK_8X8,
+            0,
+            false,
+            [1, -1],
+            MODE_NEARESTMV,
+            MOTION_MODE_SIMPLE,
+            crate::cdf::EIGHTTAP_SHARP,
+            true,
+            [0; 8],
+            false,
+            false,
+            [-1, -1],
+            [-1, -1],
+            [EIGHTTAP, EIGHTTAP],
+            [EIGHTTAP, EIGHTTAP],
+        )
+        .unwrap();
+        assert_eq!(writer.finish(), SymbolWriter::new(false).finish());
+        let got = roundtrip_interp_filter(
+            target,
+            BLOCK_8X8,
+            0,
+            MODE_NEARESTMV,
+            MOTION_MODE_SIMPLE,
+            crate::cdf::EIGHTTAP_SHARP,
+            true,
+            [0; 8],
+        );
+        assert_eq!(got, target);
+    }
+
+    /// `needs_interp_filter() == 0` arms — skip_mode, LOCALWARP motion
+    /// mode, and large-GLOBALMV-with-non-TRANSLATION gm — all force
+    /// EIGHTTAP with zero bits; the GLOBALMV-with-TRANSLATION twin
+    /// re-opens the S().
+    #[test]
+    fn write_interpolation_filter_needs_gate_arms() {
+        let forced = InterpolationFilterReadout {
+            interp_filter: [EIGHTTAP, EIGHTTAP],
+            read_from_bitstream: [false, false],
+        };
+        // skip_mode.
+        let got = roundtrip_interp_filter(
+            forced,
+            BLOCK_8X8,
+            1,
+            MODE_NEAREST_NEARESTMV,
+            MOTION_MODE_SIMPLE,
+            SWITCHABLE,
+            false,
+            [0; 8],
+        );
+        assert_eq!(got, forced);
+        // motion_mode == LOCALWARP (WARPED_CAUSAL).
+        let got = roundtrip_interp_filter(
+            forced,
+            BLOCK_16X16,
+            0,
+            MODE_NEARESTMV,
+            MOTION_MODE_WARPED_CAUSAL,
+            SWITCHABLE,
+            true,
+            [0; 8],
+        );
+        assert_eq!(got, forced);
+        // large GLOBALMV with non-TRANSLATION gm_type.
+        let mut gm = [0i32; 8];
+        gm[1] = GM_TYPE_TRANSLATION + 1; // ROTZOOM
+        let got = roundtrip_interp_filter(
+            forced,
+            BLOCK_16X16,
+            0,
+            MODE_GLOBALMV,
+            MOTION_MODE_SIMPLE,
+            SWITCHABLE,
+            true,
+            gm,
+        );
+        assert_eq!(got, forced);
+        // … and with gm_type == TRANSLATION the gate re-opens (S()
+        // fires).
+        let mut gm = [0i32; 8];
+        gm[1] = GM_TYPE_TRANSLATION;
+        let coded = InterpolationFilterReadout {
+            interp_filter: [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SHARP],
+            read_from_bitstream: [true, false],
+        };
+        let got = roundtrip_interp_filter(
+            coded,
+            BLOCK_16X16,
+            0,
+            MODE_GLOBALMV,
+            MOTION_MODE_SIMPLE,
+            SWITCHABLE,
+            false,
+            gm,
+        );
+        assert_eq!(got, coded);
+    }
+
+    /// §8.3.2 neighbour ctx: a matching above neighbour moves the ctx
+    /// off the `3` sentinel band. Hand-mirror the single S() with the
+    /// exact ctx the writer must have used and verify both the symbol
+    /// and that only that row adapted.
+    #[test]
+    fn write_interpolation_filter_neighbour_ctx_selection() {
+        let target = InterpolationFilterReadout {
+            interp_filter: [crate::cdf::EIGHTTAP_SMOOTH, crate::cdf::EIGHTTAP_SMOOTH],
+            read_from_bitstream: [true, false],
+        };
+        let ref_frame = [1i32, -1];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_interpolation_filter(
+            &mut writer,
+            &mut enc_cdfs,
+            &target,
+            BLOCK_8X8,
+            0,
+            false,
+            ref_frame,
+            MODE_NEARESTMV,
+            MOTION_MODE_SIMPLE,
+            SWITCHABLE,
+            false,
+            [0; 8],
+            /* avail_u = */ true,
+            /* avail_l = */ false,
+            /* above_ref_frame = */ [1, -1], // matches RefFrame[0]
+            [-1, -1],
+            /* above_interp_filters = */
+            [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SHARP],
+            [EIGHTTAP, EIGHTTAP],
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        // Hand mirror: aboveType = SHARP (match), leftType = NONE ⇒
+        // ctx = (0 * 2 + 0) * 4 + SHARP = 2.
+        let expected_ctx = interp_filter_ctx(
+            crate::cdf::EIGHTTAP_SHARP as usize,
+            INTERP_FILTER_NONE,
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(expected_ctx, 2);
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let sym = dec
+            .read_symbol(dec_cdfs.interp_filter_cdf(expected_ctx).unwrap())
+            .unwrap();
+        assert_eq!(sym as u8, crate::cdf::EIGHTTAP_SMOOTH);
+        assert_eq!(enc_cdfs.interp_filter, dec_cdfs.interp_filter);
+        // A mismatched above reference falls back to the sentinel band:
+        // same target re-encoded with above_ref_frame = GOLDEN must
+        // consult ctx 3 instead (different row ⇒ different CDF state).
+        let mut enc_cdfs2 = TileCdfContext::new_from_defaults();
+        let mut writer2 = SymbolWriter::new(false);
+        write_interpolation_filter(
+            &mut writer2,
+            &mut enc_cdfs2,
+            &target,
+            BLOCK_8X8,
+            0,
+            false,
+            ref_frame,
+            MODE_NEARESTMV,
+            MOTION_MODE_SIMPLE,
+            SWITCHABLE,
+            false,
+            [0; 8],
+            true,
+            false,
+            [4, -1], // GOLDEN ≠ RefFrame[0] ⇒ sentinel
+            [-1, -1],
+            [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SHARP],
+            [EIGHTTAP, EIGHTTAP],
+        )
+        .unwrap();
+        let _ = writer2.finish();
+        assert_ne!(
+            enc_cdfs2.interp_filter[2], enc_cdfs.interp_filter[2],
+            "ctx-2 row adapted only on the matching-neighbour encode"
+        );
+        let sentinel_ctx =
+            interp_filter_ctx(INTERP_FILTER_NONE, INTERP_FILTER_NONE, 0, false).unwrap();
+        assert_eq!(sentinel_ctx, 3);
+        assert_ne!(
+            enc_cdfs2.interp_filter[3],
+            TileCdfContext::new_from_defaults().interp_filter[3],
+            "ctx-3 row adapted on the mismatched-neighbour encode"
+        );
+    }
+
+    /// Caller-bug rejects: shapes the §5.11.x reader could never
+    /// produce on the given gate configuration.
+    #[test]
+    fn write_interpolation_filter_rejects_inconsistent_readouts() {
+        let run = |readout: InterpolationFilterReadout,
+                   skip_mode: u8,
+                   interpolation_filter: u8,
+                   enable_dual_filter: bool|
+         -> Result<(), Error> {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_interpolation_filter(
+                &mut writer,
+                &mut cdfs,
+                &readout,
+                BLOCK_8X8,
+                skip_mode,
+                false,
+                [1, -1],
+                MODE_NEARESTMV,
+                MOTION_MODE_SIMPLE,
+                interpolation_filter,
+                enable_dual_filter,
+                [0; 8],
+                false,
+                false,
+                [-1, -1],
+                [-1, -1],
+                [EIGHTTAP, EIGHTTAP],
+                [EIGHTTAP, EIGHTTAP],
+            )
+        };
+        let forced = |f: u8| InterpolationFilterReadout {
+            interp_filter: [f, f],
+            read_from_bitstream: [false, false],
+        };
+        // Non-SWITCHABLE with a slot off the frame-header value.
+        assert!(run(forced(EIGHTTAP), 0, crate::cdf::EIGHTTAP_SHARP, false).is_err());
+        // Non-SWITCHABLE with a stray read flag.
+        assert!(run(
+            InterpolationFilterReadout {
+                interp_filter: [EIGHTTAP, EIGHTTAP],
+                read_from_bitstream: [true, false],
+            },
+            0,
+            EIGHTTAP,
+            false,
+        )
+        .is_err());
+        // SWITCHABLE + !needs (skip_mode) but a non-EIGHTTAP slot.
+        assert!(run(forced(crate::cdf::EIGHTTAP_SMOOTH), 1, SWITCHABLE, false).is_err());
+        // SWITCHABLE + !needs with a stray read flag.
+        assert!(run(
+            InterpolationFilterReadout {
+                interp_filter: [EIGHTTAP, EIGHTTAP],
+                read_from_bitstream: [true, false],
+            },
+            1,
+            SWITCHABLE,
+            false,
+        )
+        .is_err());
+        // SWITCHABLE + needs but the read flag is clear.
+        assert!(run(forced(crate::cdf::EIGHTTAP_SMOOTH), 0, SWITCHABLE, false).is_err());
+        // BILINEAR is not codeable through the 3-way S().
+        assert!(run(
+            InterpolationFilterReadout {
+                interp_filter: [BILINEAR, BILINEAR],
+                read_from_bitstream: [true, false],
+            },
+            0,
+            SWITCHABLE,
+            false,
+        )
+        .is_err());
+        // !enable_dual_filter mirror violation (slot 1 differs).
+        assert!(run(
+            InterpolationFilterReadout {
+                interp_filter: [EIGHTTAP, crate::cdf::EIGHTTAP_SMOOTH],
+                read_from_bitstream: [true, false],
+            },
+            0,
+            SWITCHABLE,
+            false,
+        )
+        .is_err());
+        // !enable_dual_filter with a stray slot-1 read flag.
+        assert!(run(
+            InterpolationFilterReadout {
+                interp_filter: [EIGHTTAP, EIGHTTAP],
+                read_from_bitstream: [true, true],
+            },
+            0,
+            SWITCHABLE,
+            false,
+        )
+        .is_err());
+        // interpolation_filter out of the §6.8.9 range.
+        assert!(run(forced(EIGHTTAP), 0, SWITCHABLE + 1, false).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.23 composed tail (r277) — write_inter_block_mode_info
+    // with the four tail leaves folded, round-tripped through the
+    // decode-side dispatcher (which consumes the tail in the same
+    // spec order as of the r277 ordering fix).
+    // -----------------------------------------------------------------
+
+    /// Per-block encode parameters shared by the three-block dispatcher
+    /// round-trip below. Blocks sit at rows 0 / 2 / 4 of column 0 on an
+    /// 8x8-mi walker, each BLOCK_8X8, each single-pred NEARESTMV on
+    /// LAST_FRAME.
+    ///
+    /// * Block A — every tail leaf silent (gates shut except the
+    ///   SWITCHABLE interp S()).
+    /// * Block B — `interintra = 1` (wedge arm): four §5.11.28 S()s,
+    ///   then the `RefFrame[ 1 ] = INTRA_FRAME` override SILENCES
+    ///   §5.11.27 motion_mode even though `has_overlappable_candidates`
+    ///   is true (block A sits above) — the §5.11.23 spec-order proof.
+    /// * Block C — `interintra` gate open but 0 (one S()), then the
+    ///   §5.11.27 arm-A `use_obmc` S() fires (OBMC), then the interp
+    ///   S(). Genuine §5.11.28→§5.11.27 interleaving.
+    const RT_REF: [i32; 2] = [1, -1];
+
+    /// Tail for block A: fully silent. Block A is GLOBALMV on an empty
+    /// stack (a fresh tile has no MV candidates for NEAREST/NEAR), and
+    /// large-GLOBALMV with IDENTITY gm closes `needs_interp_filter()`
+    /// — the SWITCHABLE loop forces EIGHTTAP with no S().
+    fn rt_tail_a() -> InterBlockModeInfoTail {
+        InterBlockModeInfoTail {
+            interpolation_filter: SWITCHABLE,
+            interp_filter: InterpolationFilterReadout {
+                interp_filter: [EIGHTTAP, EIGHTTAP],
+                read_from_bitstream: [false, false],
+            },
+            ..InterBlockModeInfoTail::bit_silent()
+        }
+    }
+
+    /// Tail for block B: interintra wedge arm; motion silenced by the
+    /// §5.11.28 slot-1 override despite the open motion gates.
+    fn rt_tail_b(has_overlappable: bool) -> InterBlockModeInfoTail {
+        InterBlockModeInfoTail {
+            interintra: InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(crate::cdf::II_SMOOTH_PRED),
+                wedge_interintra: Some(1),
+                wedge_index: Some(5),
+            },
+            enable_interintra_compound: true,
+            is_motion_mode_switchable: true,
+            allow_warped_motion: true,
+            has_overlappable,
+            compound_type: crate::cdf::CompoundTypeReadout {
+                comp_group_idx: 0,
+                compound_idx: 1,
+                compound_type: COMPOUND_WEDGE,
+                wedge_index: None,
+                wedge_sign: None,
+                mask_type: None,
+            },
+            interpolation_filter: SWITCHABLE,
+            interp_filter: InterpolationFilterReadout {
+                interp_filter: [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SHARP],
+                read_from_bitstream: [true, false],
+            },
+            above_interp_filters: [EIGHTTAP, EIGHTTAP],
+            ..InterBlockModeInfoTail::bit_silent()
+        }
+    }
+
+    /// Tail for block C: interintra gate open / flag 0, §5.11.27 arm A
+    /// (`!allow_warped_motion`) coding `use_obmc = 1`.
+    fn rt_tail_c(has_overlappable: bool, num_samples: u32) -> InterBlockModeInfoTail {
+        InterBlockModeInfoTail {
+            enable_interintra_compound: true,
+            motion_mode: MOTION_MODE_OBMC,
+            num_samples,
+            is_motion_mode_switchable: true,
+            allow_warped_motion: false,
+            has_overlappable,
+            interpolation_filter: SWITCHABLE,
+            interp_filter: InterpolationFilterReadout {
+                interp_filter: [crate::cdf::EIGHTTAP_SMOOTH, crate::cdf::EIGHTTAP_SMOOTH],
+                read_from_bitstream: [true, false],
+            },
+            above_interp_filters: [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SHARP],
+            ..InterBlockModeInfoTail::bit_silent()
+        }
+    }
+
+    /// Decode `n_blocks` of the three-block stream through the
+    /// §5.11.23 dispatcher, returning the stamped walker plus the
+    /// decoded aggregates.
+    fn rt_decode_blocks(
+        bytes: &[u8],
+        n_blocks: usize,
+    ) -> (PartitionWalker, Vec<crate::cdf::DecodedInterBlockModeInfo>) {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(bytes, bytes.len(), false).unwrap();
+        let mfmvs = crate::cdf::MotionFieldMvs::new_invalid(8, 8);
+        let mut infos = Vec::new();
+        for blk in 0..n_blocks {
+            let mi_row = (blk as u32) * 2;
+            let avail_u = blk > 0;
+            // Above-neighbour scalars: block B's slot 1 is overridden
+            // to INTRA_FRAME by its §5.11.28 arm, so block C observes
+            // [1, 0]; block B observes A's plain [1, -1].
+            let above_ref_frame = if blk == 2 { [1, 0] } else { RT_REF };
+            let (eic, imms, awm) = match blk {
+                0 => (false, false, false),
+                1 => (true, true, true),
+                _ => (true, true, false),
+            };
+            let info = walker
+                .decode_inter_block_mode_info(
+                    &mut dec,
+                    &mut cdfs,
+                    mi_row,
+                    0,
+                    BLOCK_8X8,
+                    /* skip_mode = */ 0,
+                    avail_u,
+                    /* avail_l = */ false,
+                    above_ref_frame,
+                    [-1, -1],
+                    /* above_intra = */ false,
+                    /* left_intra = */ false,
+                    /* above_single = */ true,
+                    /* left_single = */ true,
+                    /* skip_mode_frame = */ [1, -1],
+                    /* seg_ref_frame_active = */ false,
+                    /* seg_ref_frame_data = */ 0,
+                    /* seg_skip_active = */ false,
+                    /* seg_globalmv_active = */ false,
+                    /* reference_select = */ false,
+                    [0; 8],
+                    identity_gm_params(),
+                    [0; 8],
+                    /* allow_high_precision_mv = */ false,
+                    /* force_integer_mv = */ false,
+                    /* use_ref_frame_mvs = */ false,
+                    imms,
+                    awm,
+                    [false; 7],
+                    eic,
+                    /* enable_masked_compound = */ false,
+                    /* enable_jnt_comp = */ false,
+                    /* dist_equal = */ false,
+                    SWITCHABLE,
+                    /* enable_dual_filter = */ false,
+                    &mfmvs,
+                )
+                .unwrap();
+            infos.push(info);
+        }
+        (walker, infos)
+    }
+
+    /// Encode the first `n_blocks` of the three-block stream with the
+    /// composed writer. Per-block §7.10 inputs (mv stack, warp samples,
+    /// overlappable flag) come from an encoder-side walker stamped by
+    /// decoding the previously-encoded prefix — the same state the
+    /// decode dispatcher rebuilds.
+    fn rt_encode_blocks(n_blocks: usize) -> Vec<u8> {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mfmvs = crate::cdf::MotionFieldMvs::new_invalid(8, 8);
+        let mut writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        for blk in 0..n_blocks {
+            // Encoder-side mirror walker carrying the prefix stamps.
+            let walker = if blk == 0 {
+                PartitionWalker::new(8, 8, geom).unwrap()
+            } else {
+                rt_decode_blocks(&rt_encode_blocks(blk), blk).0
+            };
+            let mi_row = (blk as u32) * 2;
+            let stack = walker
+                .find_mv_stack(
+                    mi_row,
+                    0,
+                    BLOCK_8X8,
+                    RT_REF,
+                    false,
+                    false,
+                    [0; 8],
+                    identity_gm_params(),
+                    [0; 8],
+                    false,
+                    false,
+                    &mfmvs,
+                )
+                .unwrap();
+            // Block A codes GLOBALMV (the fresh tile has an empty MV
+            // stack, so the NEAREST family has no §5.11.31 source
+            // slot); B and C code NEARESTMV off the stack the A / B
+            // stamps populate.
+            let y_mode = if blk == 0 {
+                MODE_GLOBALMV
+            } else {
+                MODE_NEARESTMV
+            };
+            let mv0 = if blk == 0 {
+                stack.global_mvs[0]
+            } else {
+                assert!(stack.num_mv_found > 0, "above stamps must feed the stack");
+                assign_mv_pred_mv(&stack, MODE_NEARESTMV, 0, 0).unwrap()
+            };
+            let has_ov = walker.has_overlappable_candidates(mi_row, 0, BLOCK_8X8);
+            let tail = match blk {
+                0 => rt_tail_a(),
+                1 => {
+                    // The order proof: the motion gates ARE open
+                    // (above block A is an overlappable inter
+                    // neighbour) — only the §5.11.28 slot-1 override
+                    // silences §5.11.27.
+                    assert!(has_ov, "block A above must be overlappable");
+                    rt_tail_b(has_ov)
+                }
+                _ => {
+                    assert!(has_ov, "block B above must be overlappable");
+                    let ns =
+                        walker.find_warp_samples(mi_row, 0, BLOCK_8X8, RT_REF[0], [mv0, [0, 0]]);
+                    rt_tail_c(has_ov, ns)
+                }
+            };
+            let above_ref_frame = if blk == 2 { [1, 0] } else { RT_REF };
+            write_inter_block_mode_info(
+                &mut writer,
+                &mut cdfs,
+                RT_REF,
+                y_mode,
+                [mv0, [0, 0]],
+                /* ref_mv_idx = */ 0,
+                &stack,
+                BLOCK_8X8,
+                /* skip_mode = */ 0,
+                [1, -1],
+                false,
+                0,
+                false,
+                false,
+                /* reference_select = */ false,
+                /* avail_u = */ blk > 0,
+                /* avail_l = */ false,
+                /* above_single = */ true,
+                /* left_single = */ true,
+                /* above_intra = */ false,
+                /* left_intra = */ false,
+                above_ref_frame,
+                [-1, -1],
+                /* force_integer_mv = */ false,
+                /* allow_high_precision_mv = */ false,
+                &tail,
+            )
+            .unwrap();
+        }
+        writer.finish()
+    }
+
+    /// Three-block composed-writer → decode-dispatcher round-trip.
+    /// Proves (1) the r277 tail fold emits the §5.11.23 leaves in spec
+    /// order (§5.11.28 → §5.11.27 → §5.11.29 → interp loop), (2) the
+    /// §5.11.28 `RefFrame[ 1 ] = INTRA_FRAME` override silences the
+    /// §5.11.27 writer/reader pair on interintra blocks even with
+    /// overlappable neighbours, and (3) the dispatcher (post r277
+    /// ordering fix) rebuilds every aggregate bit-exactly.
+    #[test]
+    fn write_inter_block_mode_info_tail_round_trips_through_dispatcher() {
+        let bytes = rt_encode_blocks(3);
+        let (walker, infos) = rt_decode_blocks(&bytes, 3);
+        assert_eq!(infos.len(), 3);
+
+        // Block A: silent tail; large-GLOBALMV + IDENTITY gm closes
+        // `needs_interp_filter()` ⇒ forced EIGHTTAP under SWITCHABLE.
+        assert_eq!(infos[0].ref_frame, RT_REF);
+        assert_eq!(infos[0].y_mode, MODE_GLOBALMV);
+        assert_eq!(infos[0].interintra.interintra, 0);
+        assert_eq!(infos[0].motion_mode, MOTION_MODE_SIMPLE);
+        assert_eq!(infos[0].compound_type.compound_type, COMPOUND_AVERAGE);
+        assert_eq!(infos[0].interp_filter.interp_filter, [EIGHTTAP, EIGHTTAP]);
+        assert_eq!(infos[0].interp_filter.read_from_bitstream, [false, false]);
+
+        // Block B: the interintra wedge arm + the slot-1 override.
+        assert_eq!(
+            infos[1].ref_frame,
+            [1, 0],
+            "§5.11.28 RefFrame[1] = INTRA_FRAME override surfaces"
+        );
+        assert_eq!(infos[1].interintra.interintra, 1);
+        assert_eq!(
+            infos[1].interintra.interintra_mode,
+            Some(crate::cdf::II_SMOOTH_PRED)
+        );
+        assert_eq!(infos[1].interintra.wedge_interintra, Some(1));
+        assert_eq!(infos[1].interintra.wedge_index, Some(5));
+        assert_eq!(
+            infos[1].motion_mode, MOTION_MODE_SIMPLE,
+            "slot-1 INTRA_FRAME silences §5.11.27 despite overlappable neighbours"
+        );
+        assert_eq!(infos[1].compound_type.compound_type, COMPOUND_WEDGE);
+        assert_eq!(
+            infos[1].interp_filter.interp_filter,
+            [crate::cdf::EIGHTTAP_SHARP, crate::cdf::EIGHTTAP_SHARP]
+        );
+
+        // Block C: interintra-open/0 followed by the arm-A use_obmc S().
+        assert_eq!(infos[2].ref_frame, RT_REF);
+        assert_eq!(infos[2].interintra.interintra, 0);
+        assert_eq!(infos[2].motion_mode, MOTION_MODE_OBMC);
+        assert_eq!(infos[2].compound_type.compound_type, COMPOUND_AVERAGE);
+        assert_eq!(
+            infos[2].interp_filter.interp_filter,
+            [crate::cdf::EIGHTTAP_SMOOTH, crate::cdf::EIGHTTAP_SMOOTH]
+        );
+
+        // Grid stamps: B's slot-1 override landed on the walker.
+        let cell = (2 * 8) as usize; // (row 2, col 0)
+        assert_eq!(walker.ref_frames()[cell * 2 + 1], 0);
+    }
+
+    /// Composed-writer tail consistency reject: a `motion_mode` the
+    /// reader could never produce after the §5.11.28 override (OBMC on
+    /// an interintra block) is a caller bug.
+    #[test]
+    fn write_inter_block_mode_info_tail_rejects_motion_on_interintra() {
+        let stack = mk_mv_stack(2);
+        let pred = assign_mv_pred_mv(&stack, MODE_NEARESTMV, 0, 0).unwrap();
+        let (au, al, asg, lsg, ai, li, arf, lrf) = empty_neighbour_inputs();
+        let mut tail = rt_tail_b(true);
+        tail.motion_mode = MOTION_MODE_OBMC; // unreachable: slot-1 override forces SIMPLE
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_inter_block_mode_info(
+            &mut writer,
+            &mut cdfs,
+            [1, -1],
+            MODE_NEARESTMV,
+            [pred, [0, 0]],
+            0,
+            &stack,
+            BLOCK_8X8,
+            0,
+            [0, 0],
+            false,
+            0,
+            false,
+            false,
+            false,
+            au,
+            al,
+            asg,
+            lsg,
+            ai,
+            li,
+            arf,
+            lrf,
+            false,
+            true,
+            &tail,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }
