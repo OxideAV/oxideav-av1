@@ -4,6 +4,32 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-av1/compare/v0.1.10...v0.1.11) - 2026-06-10
+
+### Other
+
+- encoder r269: §5.11.25 arm-4 SINGLE_REFERENCE body + full write_ref_frames dispatcher
+- §5.11.25 arm-4 COMPOUND_REFERENCE body writer (r268)
+- encoder r267: land §5.11.25 arm-4 first symbol — write_comp_mode
+- encoder r266: bootstrap §5.11.23 inter_block_mode_info with §5.11.25 no-bit arms
+- encoder r265: fold §5.11.22 line-8 CFL arm into entries-aware dispatcher
+- encoder r264: lift §5.11.22 dispatcher's no-palette precondition
+- encoder r263: add §5.11.46 write_palette_entries_uv UV-plane writer
+- encoder r262: add §5.11.46 write_palette_entries_y luma writer
+- encoder r261: add §5.11.46 no-palette leaf writer + §5.11.22 dispatcher
+- encoder r260: add §5.11.22 leaf writers — intra angle info y/uv + filter intra mode info
+- encoder r259: compose §5.11.18 lines 18-20 leaf writers into write_inter_frame_mode_info_prefix
+- encoder r258: add §5.11.18 lines 18-20 leaf writers (write_cdef / write_delta_qindex / write_delta_lf)
+- encoder r257: add §5.11.18 write_inter_frame_mode_info_prefix dispatcher
+- encoder r256: add §5.11.19 write_inter_segment_id writer
+- encoder r255: add §5.11.9 read_segment_id writer + neg_interleave inverse
+- encoder r254: add §5.11.10 read_skip_mode writer (gates §5.11.20 Arm 1)
+- encoder r253: add §5.11.20 read_is_inter writer (first inter-arm mode_info scalar)
+- encoder r252: close rectangular TX_SIZE family with TX_8X32 / TX_32X8
+- encoder r251: extend rectangular TX_SIZE arc by TX_4X16 / TX_16X4
+- encoder r250: extend rectangular TX_SIZE arc by TX_16X64 / TX_64X16
+- graduate dyn-driver 4:2:0 YUV codepath into public encode_av1
+
 - encoder r269 (2026-06-10): land the SINGLE_REFERENCE body of the
   §5.11.25 `read_ref_frames()` arm-4 dispatcher and compose the full
   arm-4 dispatcher. `encoder::block_mode_info::write_single_ref_frames`
