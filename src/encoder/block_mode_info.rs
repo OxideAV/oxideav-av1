@@ -54,10 +54,11 @@ use crate::cdf::{
     PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES,
     BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL,
     DELTA_Q_SMALL, FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS,
-    IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
-    PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, SEGMENT_ID_CONTEXTS,
+    IS_INTER_CONTEXTS, MAX_ANGLE_DELTA, MAX_SEGMENTS, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEARMV,
+    MODE_NEWMV, NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
+    PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS,
     SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED,
-    UV_INTRA_MODES_CFL_NOT_ALLOWED,
+    UV_INTRA_MODES_CFL_NOT_ALLOWED, ZERO_MV_CONTEXTS,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -4464,6 +4465,141 @@ pub fn write_ref_frames(
     }
 }
 
+/// Single-prediction inter-mode writer per §5.11.23
+/// `inter_block_mode_info( )` lines 9-22 (av1-spec p.74) — the
+/// `else` arm of the §5.11.23 `YMode` derivation that fires when the
+/// block is **not** compound, **not** `skip_mode`, and neither
+/// `SEG_LVL_SKIP` nor `SEG_LVL_GLOBALMV` is active. This is the exact
+/// algebraic inverse of the reader's `new_mv` / `zero_mv` / `ref_mv`
+/// cascade.
+///
+/// ## Spec body (§5.11.23 single-prediction arm — av1-spec p.74)
+///
+/// ```text
+///   new_mv                                                  S()
+///   if ( new_mv == 0 ) {
+///        YMode = NEWMV
+///   } else {
+///        zero_mv                                            S()
+///        if ( zero_mv == 0 ) {
+///            YMode = GLOBALMV
+///        } else {
+///            ref_mv                                         S()
+///            YMode = (ref_mv == 0) ? NEARESTMV : NEARMV
+///        }
+///   }
+/// ```
+///
+/// ## Inverse derivations
+///
+/// Each branch condition the reader evaluates on a decoded bit becomes
+/// a bit derived here from the target `YMode`:
+///
+/// * `new_mv  = ( YMode != NEWMV )` — `new_mv == 0` ⇒ `NEWMV`.
+/// * `zero_mv = ( YMode != GLOBALMV )` — only emitted when
+///   `new_mv == 1`; `zero_mv == 0` ⇒ `GLOBALMV`.
+/// * `ref_mv  = ( YMode == NEARMV )` — only emitted when
+///   `new_mv == 1 && zero_mv == 1`; `ref_mv == 0` ⇒ `NEARESTMV`,
+///   `ref_mv == 1` ⇒ `NEARMV`.
+///
+/// So `NEWMV` emits one symbol, `GLOBALMV` two, and `NEARESTMV` /
+/// `NEARMV` three.
+///
+/// ## Inputs
+///
+/// * `y_mode` — the §5.11.23 single-prediction `YMode` the encoder
+///   chose: one of `MODE_NEWMV = 17`, `MODE_GLOBALMV = 16`,
+///   `MODE_NEARESTMV = 14`, `MODE_NEARMV = 15` (§6.10.22). Any other
+///   value is a caller bug — the four compound / intra / GLOBALMV-by-
+///   segment modes never reach this writer (the caller's earlier
+///   §5.11.23 arms handle them).
+/// * `new_mv_context` — §8.3.2 `NewMvContext` (`TileNewMvCdf[
+///   NewMvContext ]`), in `0..NEW_MV_CONTEXTS = 6`. Always consulted
+///   (every leaf emits `new_mv`).
+/// * `zero_mv_context` — §8.3.2 `ZeroMvContext` (`TileZeroMvCdf[
+///   ZeroMvContext ]`), in `0..ZERO_MV_CONTEXTS = 2`. Consulted only
+///   when `new_mv == 1`.
+/// * `ref_mv_context` — §8.3.2 `RefMvContext` (`TileRefMvCdf[
+///   RefMvContext ]`), in `0..REF_MV_CONTEXTS = 6`. Consulted only
+///   when `new_mv == 1 && zero_mv == 1`.
+///
+/// All three contexts are produced by the §7.10.2 `find_mv_stack( )`
+/// process (`NewMvContext` / `ZeroMvContext` / `RefMvContext`). Like
+/// every writer in this module the ctx is caller-supplied: the
+/// encoder threads the same §7.10.2 outputs the decoder side derives.
+///
+/// ## Out-of-range / mismatch cases (surfaced as `Error::PartitionWalkOutOfRange`)
+///
+/// * `y_mode` not in `{ NEWMV, GLOBALMV, NEARESTMV, NEARMV }`.
+/// * A context that would be **consulted** is out of range. Contexts
+///   on un-taken branches are not validated (the symbol is never
+///   emitted, mirroring the reader never reaching the corresponding
+///   CDF row).
+///
+/// ## §5.11.5 grid-fill is on the caller
+///
+/// Stateless (mirrors [`write_comp_mode`]): one to three §8.2.6 `S()`
+/// symbols are written depending on the mode. The caller stamps the
+/// resulting `YMode` onto the block footprint through its own
+/// [`crate::cdf::PartitionWalker`] so subsequent blocks' §8.3.2
+/// neighbour walks observe it.
+pub fn write_inter_single_mode(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    y_mode: u8,
+    new_mv_context: usize,
+    zero_mv_context: usize,
+    ref_mv_context: usize,
+) -> Result<(), Error> {
+    // §6.10.22 single-prediction mode bound — the only four `YMode`
+    // values the §5.11.23 single-prediction cascade can produce.
+    if !matches!(
+        y_mode,
+        MODE_NEWMV | MODE_GLOBALMV | MODE_NEARESTMV | MODE_NEARMV
+    ) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.23: `new_mv` S() over `TileNewMvCdf[ NewMvContext ]`.
+    // Inverse of `if ( new_mv == 0 ) YMode = NEWMV else …`.
+    if new_mv_context >= NEW_MV_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let new_mv = (y_mode != MODE_NEWMV) as u32;
+    let row = cdfs.new_mv_cdf(new_mv_context);
+    writer.write_symbol(new_mv, row)?;
+
+    if new_mv == 0 {
+        // YMode == NEWMV — no further symbols.
+        return Ok(());
+    }
+
+    // §5.11.23: `zero_mv` S() over `TileZeroMvCdf[ ZeroMvContext ]`.
+    // Inverse of `if ( zero_mv == 0 ) YMode = GLOBALMV else …`.
+    if zero_mv_context >= ZERO_MV_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let zero_mv = (y_mode != MODE_GLOBALMV) as u32;
+    let row = cdfs.zero_mv_cdf(zero_mv_context);
+    writer.write_symbol(zero_mv, row)?;
+
+    if zero_mv == 0 {
+        // YMode == GLOBALMV — no further symbols.
+        return Ok(());
+    }
+
+    // §5.11.23: `ref_mv` S() over `TileRefMvCdf[ RefMvContext ]`.
+    // Inverse of `YMode = (ref_mv == 0) ? NEARESTMV : NEARMV`.
+    if ref_mv_context >= REF_MV_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let ref_mv = (y_mode == MODE_NEARMV) as u32;
+    let row = cdfs.ref_mv_cdf(ref_mv_context);
+    writer.write_symbol(ref_mv, row)?;
+
+    Ok(())
+}
+
 /// `FloorLog2(x)` per §4.7 (av1-spec p.21) — `s = 0; while (x !=
 /// 0) { x >>= 1; s++; } return s - 1;`. Local helper because the
 /// public surface lives in `cdf` / `symbol_decoder`; pulled inline
@@ -4487,7 +4623,7 @@ mod tests {
     use crate::cdf::{
         cfl_allowed_for_uv_mode, comp_mode_ctx, intra_mode_ctx, is_inter_ctx, size_group, skip_ctx,
         skip_mode_ctx, PartitionWalker, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_4X8, BLOCK_8X4,
-        BLOCK_8X8, DC_PRED, V_PRED,
+        BLOCK_8X8, DC_PRED, MODE_NEAREST_NEARESTMV, V_PRED,
     };
     use crate::symbol_decoder::SymbolDecoder;
 
@@ -12592,5 +12728,265 @@ mod tests {
                 "slot1 {slot1} rejected"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.23 single-prediction inter mode — write_inter_single_mode
+    // round-trips through a mirror of the decoder's new_mv / zero_mv /
+    // ref_mv reads (av1-spec p.74). The full decoder path needs a
+    // find_mv_stack (§7.10.2), not yet implemented; this mirror runs
+    // exactly the three §5.11.23 S() reads in order against the same
+    // CDF rows, recovering YMode the way the reader does.
+    // -----------------------------------------------------------------
+
+    /// Replays the §5.11.23 single-prediction `YMode` derivation from a
+    /// decoder over `bytes`, consuming the same `new_mv` / `zero_mv` /
+    /// `ref_mv` symbols the writer emitted. Returns the recovered
+    /// `YMode`.
+    fn decode_inter_single_mode_mirror(
+        bytes: &[u8],
+        cdfs: &mut TileCdfContext,
+        disable_cdf_update: bool,
+        new_mv_context: usize,
+        zero_mv_context: usize,
+        ref_mv_context: usize,
+    ) -> u8 {
+        let pad = if bytes.is_empty() {
+            vec![0u8]
+        } else {
+            bytes.to_vec()
+        };
+        let mut dec = SymbolDecoder::init_symbol(&pad, pad.len(), disable_cdf_update).unwrap();
+        // §5.11.23: new_mv S(); new_mv == 0 ⇒ NEWMV.
+        let new_mv_row = cdfs.new_mv_cdf(new_mv_context);
+        let new_mv = dec.read_symbol(new_mv_row).unwrap();
+        if new_mv == 0 {
+            return MODE_NEWMV;
+        }
+        // zero_mv S(); zero_mv == 0 ⇒ GLOBALMV.
+        let zero_mv_row = cdfs.zero_mv_cdf(zero_mv_context);
+        let zero_mv = dec.read_symbol(zero_mv_row).unwrap();
+        if zero_mv == 0 {
+            return MODE_GLOBALMV;
+        }
+        // ref_mv S(); (ref_mv == 0) ? NEARESTMV : NEARMV.
+        let ref_mv_row = cdfs.ref_mv_cdf(ref_mv_context);
+        let ref_mv = dec.read_symbol(ref_mv_row).unwrap();
+        if ref_mv == 0 {
+            MODE_NEARESTMV
+        } else {
+            MODE_NEARMV
+        }
+    }
+
+    /// Each single-prediction `YMode` round-trips through the decoder
+    /// mirror at `NewMvContext = ZeroMvContext = RefMvContext = 0`, with
+    /// §8.3 CDF adaptation engaged on both sides (so the encode-side and
+    /// decode-side rows step identically).
+    #[test]
+    fn write_inter_single_mode_all_modes_round_trip_at_origin() {
+        for y_mode in [MODE_NEWMV, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEARMV] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_inter_single_mode(&mut writer, &mut enc_cdfs, y_mode, 0, 0, 0).unwrap();
+            let bytes = writer.finish();
+
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let recovered = decode_inter_single_mode_mirror(&bytes, &mut dec_cdfs, false, 0, 0, 0);
+            assert_eq!(recovered, y_mode, "YMode {y_mode} round-trips at origin");
+            // The encode-side and decode-side CDFs must have adapted
+            // identically — assert the consulted rows match.
+            assert_eq!(enc_cdfs.new_mv_cdf(0), dec_cdfs.new_mv_cdf(0));
+            if y_mode != MODE_NEWMV {
+                assert_eq!(enc_cdfs.zero_mv_cdf(0), dec_cdfs.zero_mv_cdf(0));
+            }
+            if matches!(y_mode, MODE_NEARESTMV | MODE_NEARMV) {
+                assert_eq!(enc_cdfs.ref_mv_cdf(0), dec_cdfs.ref_mv_cdf(0));
+            }
+        }
+    }
+
+    /// Round-trip every mode under non-zero, distinct §8.3.2 contexts
+    /// (`NewMvContext = 5`, `ZeroMvContext = 1`, `RefMvContext = 4`) to
+    /// prove the writer selects the same CDF rows the reader does.
+    #[test]
+    fn write_inter_single_mode_all_modes_round_trip_nonzero_ctx() {
+        for y_mode in [MODE_NEWMV, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEARMV] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_inter_single_mode(&mut writer, &mut enc_cdfs, y_mode, 5, 1, 4).unwrap();
+            let bytes = writer.finish();
+
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let recovered = decode_inter_single_mode_mirror(&bytes, &mut dec_cdfs, false, 5, 1, 4);
+            assert_eq!(
+                recovered, y_mode,
+                "YMode {y_mode} round-trips at ctx (5,1,4)"
+            );
+        }
+    }
+
+    /// Symbol-count leaf checks: `NEWMV` emits exactly one symbol,
+    /// `GLOBALMV` two, `NEARESTMV` / `NEARMV` three. Verified by
+    /// comparing each leaf's emitted byte stream against an independent
+    /// re-encode of only the symbols that leaf should produce (over a
+    /// pristine CDF copy), proving no extra symbol is written.
+    #[test]
+    fn write_inter_single_mode_emits_expected_symbol_counts() {
+        // NEWMV: only new_mv = 0.
+        {
+            let mut a = TileCdfContext::new_from_defaults();
+            let mut wa = SymbolWriter::new(false);
+            write_inter_single_mode(&mut wa, &mut a, MODE_NEWMV, 0, 0, 0).unwrap();
+            let got = wa.finish();
+
+            let mut b = TileCdfContext::new_from_defaults();
+            let mut wb = SymbolWriter::new(false);
+            let row = b.new_mv_cdf(0);
+            wb.write_symbol(0, row).unwrap();
+            let want = wb.finish();
+            assert_eq!(got, want, "NEWMV emits exactly one (new_mv = 0) symbol");
+        }
+        // GLOBALMV: new_mv = 1, zero_mv = 0.
+        {
+            let mut a = TileCdfContext::new_from_defaults();
+            let mut wa = SymbolWriter::new(false);
+            write_inter_single_mode(&mut wa, &mut a, MODE_GLOBALMV, 0, 0, 0).unwrap();
+            let got = wa.finish();
+
+            let mut b = TileCdfContext::new_from_defaults();
+            let mut wb = SymbolWriter::new(false);
+            let row = b.new_mv_cdf(0);
+            wb.write_symbol(1, row).unwrap();
+            let row = b.zero_mv_cdf(0);
+            wb.write_symbol(0, row).unwrap();
+            let want = wb.finish();
+            assert_eq!(got, want, "GLOBALMV emits new_mv = 1, zero_mv = 0");
+        }
+        // NEARMV: new_mv = 1, zero_mv = 1, ref_mv = 1.
+        {
+            let mut a = TileCdfContext::new_from_defaults();
+            let mut wa = SymbolWriter::new(false);
+            write_inter_single_mode(&mut wa, &mut a, MODE_NEARMV, 0, 0, 0).unwrap();
+            let got = wa.finish();
+
+            let mut b = TileCdfContext::new_from_defaults();
+            let mut wb = SymbolWriter::new(false);
+            let row = b.new_mv_cdf(0);
+            wb.write_symbol(1, row).unwrap();
+            let row = b.zero_mv_cdf(0);
+            wb.write_symbol(1, row).unwrap();
+            let row = b.ref_mv_cdf(0);
+            wb.write_symbol(1, row).unwrap();
+            let want = wb.finish();
+            assert_eq!(
+                got, want,
+                "NEARMV emits new_mv = 1, zero_mv = 1, ref_mv = 1"
+            );
+        }
+    }
+
+    /// A `YMode` outside the four single-prediction modes (e.g.
+    /// `DC_PRED = 0`, `MODE_NEAREST_NEARESTMV = 18`) is a caller bug.
+    #[test]
+    fn write_inter_single_mode_rejects_invalid_y_mode() {
+        for y_mode in [0u8, 13, MODE_NEAREST_NEARESTMV, 25, 255] {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_inter_single_mode(&mut writer, &mut cdfs, y_mode, 0, 0, 0).unwrap_err();
+            assert!(
+                matches!(err, Error::PartitionWalkOutOfRange),
+                "y_mode {y_mode} rejected"
+            );
+        }
+    }
+
+    /// An out-of-range `NewMvContext` (always consulted) is rejected.
+    #[test]
+    fn write_inter_single_mode_rejects_bad_new_mv_ctx() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err =
+            write_inter_single_mode(&mut writer, &mut cdfs, MODE_NEWMV, NEW_MV_CONTEXTS, 0, 0)
+                .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `ZeroMvContext` is only consulted past the `new_mv == 1` branch:
+    /// a bad value is tolerated for `NEWMV` (never reached) but rejected
+    /// for `GLOBALMV` (consulted).
+    #[test]
+    fn write_inter_single_mode_zero_mv_ctx_only_validated_when_consulted() {
+        // NEWMV never reads zero_mv ⇒ bad zero_mv ctx is fine.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_inter_single_mode(&mut writer, &mut cdfs, MODE_NEWMV, 0, ZERO_MV_CONTEXTS, 0)
+            .unwrap();
+
+        // GLOBALMV reads zero_mv ⇒ bad zero_mv ctx is a caller bug.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err = write_inter_single_mode(
+            &mut writer,
+            &mut cdfs,
+            MODE_GLOBALMV,
+            0,
+            ZERO_MV_CONTEXTS,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// `RefMvContext` is only consulted on the NEARESTMV / NEARMV leaf:
+    /// a bad value is tolerated for `GLOBALMV` (never reached) but
+    /// rejected for `NEARMV` (consulted).
+    #[test]
+    fn write_inter_single_mode_ref_mv_ctx_only_validated_when_consulted() {
+        // GLOBALMV never reads ref_mv ⇒ bad ref_mv ctx is fine.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_inter_single_mode(&mut writer, &mut cdfs, MODE_GLOBALMV, 0, 0, REF_MV_CONTEXTS)
+            .unwrap();
+
+        // NEARMV reads ref_mv ⇒ bad ref_mv ctx is a caller bug.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err =
+            write_inter_single_mode(&mut writer, &mut cdfs, MODE_NEARMV, 0, 0, REF_MV_CONTEXTS)
+                .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// A sequential run of distinct modes round-trips with §8.3 CDF
+    /// adaptation engaged across blocks: each write mutates the shared
+    /// encode-side CDFs, each mirror read mutates the decode-side CDFs,
+    /// and the two stay in lockstep over the whole sequence.
+    #[test]
+    fn write_inter_single_mode_sequential_cdf_adaptation_lockstep() {
+        let modes = [
+            MODE_NEWMV,
+            MODE_NEARMV,
+            MODE_GLOBALMV,
+            MODE_NEARESTMV,
+            MODE_NEWMV,
+            MODE_NEARMV,
+            MODE_NEARESTMV,
+            MODE_GLOBALMV,
+        ];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        for &y_mode in &modes {
+            let mut writer = SymbolWriter::new(false);
+            write_inter_single_mode(&mut writer, &mut enc_cdfs, y_mode, 2, 1, 3).unwrap();
+            let bytes = writer.finish();
+            let recovered = decode_inter_single_mode_mirror(&bytes, &mut dec_cdfs, false, 2, 1, 3);
+            assert_eq!(recovered, y_mode);
+        }
+        // After the run the consulted rows must be identical on both
+        // sides (proves the per-symbol adaptation matched throughout).
+        assert_eq!(enc_cdfs.new_mv_cdf(2), dec_cdfs.new_mv_cdf(2));
+        assert_eq!(enc_cdfs.zero_mv_cdf(1), dec_cdfs.zero_mv_cdf(1));
+        assert_eq!(enc_cdfs.ref_mv_cdf(3), dec_cdfs.ref_mv_cdf(3));
     }
 }

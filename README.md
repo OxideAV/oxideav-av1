@@ -2,6 +2,55 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-10 (round 270)
+
+Round 270 lands the **§5.11.23 single-prediction inter-mode writer** —
+the `new_mv` / `zero_mv` / `ref_mv` cascade that derives `YMode` on a
+non-compound inter block.
+
+* `encoder::block_mode_info::write_inter_single_mode`
+  (§5.11.23 `inter_block_mode_info( )` lines 9-22, av1-spec p.74). Exact
+  algebraic inverse of the reader's `new_mv` / `zero_mv` / `ref_mv`
+  reads (the `else` arm taken when the block is non-compound,
+  non-`skip_mode`, and neither `SEG_LVL_SKIP` nor `SEG_LVL_GLOBALMV`
+  active): each branch bit is derived from the target `YMode` —
+  `new_mv = (YMode != NEWMV)`, `zero_mv = (YMode != GLOBALMV)`,
+  `ref_mv = (YMode == NEARMV)`. Emits one §8.2.6 `S()` for `NEWMV`,
+  two for `GLOBALMV`, three for `NEARESTMV` / `NEARMV` over
+  `TileNewMvCdf` / `TileZeroMvCdf` / `TileRefMvCdf` (§8.3.2 p.364). The
+  three contexts (`NewMvContext` / `ZeroMvContext` / `RefMvContext`) are
+  caller-supplied — they come from the §7.10.2 `find_mv_stack( )`
+  process, still pending — and a context is range-checked only on the
+  branch that consults it, mirroring the reader never reaching an
+  un-taken CDF row. Caller-bug rejects: `YMode` outside
+  `{ NEWMV, GLOBALMV, NEARESTMV, NEARMV }`, and an out-of-range
+  consulted context.
+
++8 tests: all four modes round-trip through a mirror of the decoder's
+§5.11.23 symbol reads at the frame origin AND under non-zero distinct
+contexts (with CDF-row equality asserted), per-leaf symbol-count checks
+via independent re-encode (1/2/3 symbols), the invalid-`YMode` reject,
+the consulted-only context validation for `zero_mv` / `ref_mv`, the bad
+`new_mv` ctx reject, and an 8-mode sequential CDF-adaptation lockstep
+round-trip.
+
+Full library test count moves to 1839 (was 1831).
+
+### Pending follow-ups for round 271+
+
+* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2) — the
+  process that produces the `NewMvContext` / `ZeroMvContext` /
+  `RefMvContext` / `compound_mode` ctx the line 9-22 writers consume.
+* §5.11.23 `compound_mode` S() writer (the compound sibling of
+  [`write_inter_single_mode`], over `TileCompoundModeCdf[ ctx ]`).
+* §5.11.23 lines 23-46 `drl_mode` S() writer (per-`RefMvIdx` loop,
+  `TileDrlModeCdf[ DrlCtxStack[ idx ] ]`).
+* Fold `write_ref_frames` + `write_inter_single_mode` into
+  `write_inter_block_mode_info_bootstrap`'s caller surface once the
+  §5.11.23 line 6 `find_mv_stack` ctx surface exists.
+
+---
+
 ## Status — 2026-06-10 (round 269)
 
 Round 269 lands the **SINGLE_REFERENCE body** of the §5.11.25
