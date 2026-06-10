@@ -2,6 +2,66 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-10 (round 273)
+
+Round 273 lands the **§5.11.31 / §5.11.32 `read_mv` / `read_mv_component`
+write side** — the `assign_mv` line-33 motion-vector difference writer
+that encodes the per-component `mv_joint` + magnitude ladder.
+
+* `encoder::block_mode_info::write_read_mv` (§5.11.31 `read_mv( ref )`,
+  av1-spec p.81) and `write_read_mv_component` (§5.11.32
+  `read_mv_component( comp )`, av1-spec p.81-82). The reader
+  reconstructs `Mv[ ref ][ c ] = PredMv[ ref ][ c ] + diffMv[ c ]`; the
+  writer is handed the target `Mv[ ref ]` and the §7.10.2 `PredMv[ ref ]`
+  predictor and emits the exact inverse. `mv_joint` records which of the
+  two components are non-zero (`MV_JOINT_ZERO` / `HNZVZ` / `HZVNZ` /
+  `HNZVNZ`), then each non-zero component is decomposed into
+  `mv_sign` + `mv_class` (`MV_CLASS_0` for `offset ∈ 0..=15`, otherwise
+  `FloorLog2(offset) - 3`) + the class-0 `mv_class0_bit` / `mv_class0_fr`
+  / `mv_class0_hp` triple or the higher-class `mv_bit` integer ladder +
+  `mv_fr` / `mv_hp` fractional/half-pel bits. `MvCtx` is
+  `MV_INTRABC_CONTEXT` under `use_intrabc`, else `0`. The §8.3.2 CDF
+  rows (`TileMvJointCdf[ MvCtx ]`, `TileMvSignCdf` /
+  `TileMvClassCdf` / `TileMvClass0BitCdf` /
+  `TileMvClass0FrCdf[ … ][ mv_class0_bit ]` / `TileMvClass0HpCdf` /
+  `TileMvBitCdf[ … ][ i ]` / `TileMvFrCdf` / `TileMvHpCdf` indexed by
+  `[ MvCtx ][ comp ]`) are all selected exactly as the reader's §8.3.2
+  paragraph specifies. The precision flags mirror the reader's `else`
+  arms: under `force_integer_mv` the fractional field must already be
+  `3` (the reader synthesises it, never reads it) and under
+  `!allow_high_precision_mv` the half-pel bit must be `1`; an
+  inconsistent target is rejected as a caller bug rather than
+  mis-encoded. Other caller-bug rejects: a zero component handed to the
+  component writer, out-of-range `mv_ctx` / `comp`, and a magnitude
+  whose class would exceed `MV_CLASSES`.
+
++11 tests: high-precision round-trip over a mixed MV sweep (zero joint,
+single-axis, both-axis, class-0 and higher-class, both signs) through a
+literal §5.11.31/§5.11.32 reader mirror with per-row CDF-adaptation
+equality asserted; intra-block-copy `MvCtx` round-trip; `force_integer_mv`
++ `!allow_high_precision_mv` integer-MV round-trip; exhaustive
+`mv_joint`-quadrant selection; zero-joint single-symbol emission; the
+class-0/class-1 magnitude boundary (`mag = 16` vs `17`); and the
+zero-diff / bad-index / non-integer / non-half-pel / overlarge-magnitude
+rejects.
+
+Full library test count moves to 1865 (was 1854).
+
+### Pending follow-ups for round 274+
+
+* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2) — the
+  process that produces the `NewMvContext` / `ZeroMvContext` /
+  `RefMvContext` / `compound_mode` ctx + the `NumMvFound` / `DrlCtxStack`
+  the line 9-22 writers and the `drl_mode` writer consume. This is now
+  the last gating piece before the §5.11.23 `assign_mv` caller can wire
+  `PredMv` (from `RefStackMv` / `GlobalMvs`) into the new `write_read_mv`.
+* Fold `write_ref_frames` + `write_inter_single_mode` +
+  `write_compound_mode` + `write_drl_mode` + `write_read_mv` into
+  `write_inter_block_mode_info_bootstrap`'s caller surface once the
+  §5.11.23 line 6 `find_mv_stack` ctx surface exists.
+
+---
+
 ## Status — 2026-06-10 (round 272)
 
 Round 272 lands the **§5.11.23 `drl_mode` dynamic-reference-list (DRL)
@@ -39,19 +99,6 @@ honoured via independent re-encode; unreachable / out-of-window /
 range-guard rejects; and a sequential CDF-adaptation lockstep run.
 
 Full library test count moves to 1854 (was 1845).
-
-### Pending follow-ups for round 273+
-
-* §5.11.23 line 6 `find_mv_stack( isCompound )` surface (§7.10.2) — the
-  process that produces the `NewMvContext` / `ZeroMvContext` /
-  `RefMvContext` / `compound_mode` ctx + the `NumMvFound` / `DrlCtxStack`
-  the line 9-22 writers and the new `drl_mode` writer consume.
-* §5.11.23 line 33 `assign_mv( isCompound )` write side (§5.11.31 /
-  §5.11.32 `read_mv` / `read_mv_component` inverse).
-* Fold `write_ref_frames` + `write_inter_single_mode` +
-  `write_compound_mode` + `write_drl_mode` into
-  `write_inter_block_mode_info_bootstrap`'s caller surface once the
-  §5.11.23 line 6 `find_mv_stack` ctx surface exists.
 
 ---
 

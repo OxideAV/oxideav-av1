@@ -52,11 +52,13 @@ use crate::cdf::{
     comp_ref_type_ctx, count_refs, is_directional, is_samedir_ref_pair, mi_height_log2,
     mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx,
     PartitionWalker, TileCdfContext, BLOCK_128X128, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES,
-    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS,
-    COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, FRAME_LF_COUNT,
-    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA,
-    MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV,
-    MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV,
+    BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_MODES,
+    COMPOUND_MODE_CONTEXTS, COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS,
+    FRAME_LF_COUNT, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
+    MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV, MODE_NEARESTMV,
+    MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
+    MODE_NEW_NEARMV, MODE_NEW_NEWMV, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
+    MV_INTRABC_CONTEXT, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO,
     NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
     PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
     SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
@@ -4893,6 +4895,300 @@ pub fn write_drl_mode(
     // this stack depth — a caller bug, not a representable bitstream.
     if reconstructed != ref_mv_idx {
         return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    Ok(())
+}
+
+/// MV-component writer per §5.11.32 `read_mv_component( comp )`
+/// (av1-spec p.81-82) — the exact algebraic inverse of the reader's
+/// `mv_sign` / `mv_class` / `mv_class0_*` / `mv_bit` / `mv_fr` /
+/// `mv_hp` cascade for a single signed difference component.
+///
+/// ## Spec body (§5.11.32 — av1-spec p.81-82)
+///
+/// ```text
+///   mv_sign                                                  S()
+///   mv_class                                                 S()
+///   if ( mv_class == MV_CLASS_0 ) {
+///       mv_class0_bit                                        S()
+///       if ( force_integer_mv ) mv_class0_fr = 3
+///       else                    mv_class0_fr                S()
+///       if ( allow_high_precision_mv ) mv_class0_hp         S()
+///       else                           mv_class0_hp = 1
+///       mag = ( ( mv_class0_bit << 3 ) |
+///               ( mv_class0_fr  << 1 ) |
+///                 mv_class0_hp ) + 1
+///   } else {
+///       d = 0
+///       for ( i = 0; i < mv_class; i++ ) {
+///           mv_bit                                          S()
+///           d |= mv_bit << i
+///       }
+///       mag = CLASS0_SIZE << ( mv_class + 2 )
+///       if ( force_integer_mv ) mv_fr = 3
+///       else                    mv_fr                       S()
+///       if ( allow_high_precision_mv ) mv_hp                S()
+///       else                           mv_hp = 1
+///       mag += ( ( d << 3 ) | ( mv_fr << 1 ) | mv_hp ) + 1
+///   }
+///   return mv_sign ? -mag : mag
+/// ```
+///
+/// ## Inverse derivation
+///
+/// The reader returns a signed `diff` for the component. The encoder
+/// is handed that `diff` and must reproduce the bitstream:
+///
+/// * `mv_sign = ( diff < 0 )`, `mag = |diff|`. The reader never
+///   returns `0` from this function (a zero component is signalled by
+///   `mv_joint` and skips the call), so `mag >= 1` is required.
+/// * `offset = mag - 1`. For `MV_CLASS_0`, `offset` ∈ `0..=15` and
+///   decomposes directly as `offset = (bit << 3) | (fr << 1) | hp`.
+///   For class `c >= 1`, `mag = (CLASS0_SIZE << (c + 2)) + X + 1` with
+///   `X = (d << 3) | (fr << 1) | hp` and `X ∈ 0..(2^(c+3) - 1)`, so
+///   `offset = 2^(c+3) + X`. Hence `FloorLog2(offset) = c + 3`, giving
+///   `c = FloorLog2(offset) - 3` for `offset >= 16`, and `c = 0`
+///   otherwise.
+/// * `mv_class0_fr` / `mv_fr` carry the two fractional bits, `mv_*_hp`
+///   the half-pel bit, `mv_class0_bit` / the `mv_bit` ladder the
+///   integer magnitude.
+///
+/// ## Precision gates
+///
+/// When `force_integer_mv == 1` the reader synthesises `fr = 3` rather
+/// than reading it, so the encoder MUST be handed a `diff` whose
+/// fractional field is exactly `3`; any other value is unrepresentable
+/// and is rejected. Likewise `allow_high_precision_mv == 0` forces
+/// `hp = 1`, so the half-pel bit must be `1`. These mirror the
+/// reader's `else` arms and keep the writer a true inverse.
+///
+/// ## CDF selection (§8.3.2 — av1-spec p.493)
+///
+/// `mv_sign` → `TileMvSignCdf[ MvCtx ][ comp ]`, `mv_class` →
+/// `TileMvClassCdf[ MvCtx ][ comp ]`, `mv_class0_bit` →
+/// `TileMvClass0BitCdf[ MvCtx ][ comp ]`, `mv_class0_fr` →
+/// `TileMvClass0FrCdf[ MvCtx ][ comp ][ mv_class0_bit ]`,
+/// `mv_class0_hp` → `TileMvClass0HpCdf[ MvCtx ][ comp ]`, `mv_bit` →
+/// `TileMvBitCdf[ MvCtx ][ comp ][ i ]`, `mv_fr` →
+/// `TileMvFrCdf[ MvCtx ][ comp ]`, `mv_hp` → `TileMvHpCdf[ MvCtx ][ comp ]`.
+///
+/// ## Inputs
+///
+/// * `mv_ctx` — the §5.11.31 `MvCtx` (`0` for normal blocks,
+///   `MV_INTRABC_CONTEXT = 1` for intra block copy).
+/// * `comp` — the component index (`0` = horizontal, `1` = vertical).
+/// * `diff` — the signed difference `Mv[ ref ][ comp ] - PredMv[ ref ][ comp ]`.
+///   Must be non-zero (the caller only invokes this for components the
+///   `mv_joint` marks non-zero).
+/// * `force_integer_mv` / `allow_high_precision_mv` — the frame-level
+///   precision flags the reader consults.
+#[allow(clippy::too_many_arguments)]
+pub fn write_read_mv_component(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    mv_ctx: usize,
+    comp: usize,
+    diff: i32,
+    force_integer_mv: bool,
+    allow_high_precision_mv: bool,
+) -> Result<(), Error> {
+    if mv_ctx >= MV_CONTEXTS || comp >= MV_COMPS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // The reader never returns 0 from this function — a zero component
+    // is encoded by `mv_joint` and skips the call entirely.
+    if diff == 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    let mv_sign: u32 = (diff < 0) as u32;
+    let mag: u32 = diff.unsigned_abs();
+    let offset: u32 = mag - 1;
+
+    // mv_sign — emitted first.
+    let sign_row = cdfs.mv_sign_cdf(mv_ctx, comp);
+    writer.write_symbol(mv_sign, sign_row)?;
+
+    // Class derivation: offset ∈ 0..=15 ⇒ MV_CLASS_0; otherwise
+    // FloorLog2(offset) = mv_class + 3.
+    let mv_class: u32 = if offset < (1 << 4) {
+        MV_CLASS_0 as u32
+    } else {
+        floor_log2(offset) - 3
+    };
+    if mv_class as usize >= MV_CLASSES {
+        // offset too large to encode (mag exceeds the MV range).
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // mv_class — symbol over the 11-ary alphabet.
+    let class_row = cdfs.mv_class_cdf(mv_ctx, comp);
+    writer.write_symbol(mv_class, class_row)?;
+
+    if mv_class == MV_CLASS_0 as u32 {
+        // offset = (mv_class0_bit << 3) | (mv_class0_fr << 1) | mv_class0_hp
+        let mv_class0_bit: u32 = (offset >> 3) & 0x1;
+        let mv_class0_fr: u32 = (offset >> 1) & 0x3;
+        let mv_class0_hp: u32 = offset & 0x1;
+
+        let bit_row = cdfs.mv_class0_bit_cdf(mv_ctx, comp);
+        writer.write_symbol(mv_class0_bit, bit_row)?;
+
+        if force_integer_mv {
+            // Reader synthesises mv_class0_fr = 3 — the field must
+            // already be 3, otherwise the value is unrepresentable.
+            if mv_class0_fr != 3 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+        } else {
+            let fr_row = cdfs.mv_class0_fr_cdf(mv_ctx, comp, mv_class0_bit as usize);
+            writer.write_symbol(mv_class0_fr, fr_row)?;
+        }
+
+        if allow_high_precision_mv {
+            let hp_row = cdfs.mv_class0_hp_cdf(mv_ctx, comp);
+            writer.write_symbol(mv_class0_hp, hp_row)?;
+        } else if mv_class0_hp != 1 {
+            // Reader forces mv_class0_hp = 1.
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    } else {
+        // mag = (CLASS0_SIZE << (mv_class + 2)) + X + 1 with
+        // X = (d << 3) | (mv_fr << 1) | mv_hp, so X = offset - 2^(c+3).
+        let base: u32 = (CLASS0_SIZE as u32) << (mv_class + 2);
+        let x: u32 = offset - base;
+        let d: u32 = x >> 3;
+        let mv_fr: u32 = (x >> 1) & 0x3;
+        let mv_hp: u32 = x & 0x1;
+
+        // mv_bit ladder: i = 0..mv_class-1, d |= mv_bit << i.
+        for i in 0..(mv_class as usize) {
+            let mv_bit: u32 = (d >> i) & 0x1;
+            let bit_row = cdfs.mv_bit_cdf(mv_ctx, comp, i);
+            writer.write_symbol(mv_bit, bit_row)?;
+        }
+
+        if force_integer_mv {
+            if mv_fr != 3 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+        } else {
+            let fr_row = cdfs.mv_fr_cdf(mv_ctx, comp);
+            writer.write_symbol(mv_fr, fr_row)?;
+        }
+
+        if allow_high_precision_mv {
+            let hp_row = cdfs.mv_hp_cdf(mv_ctx, comp);
+            writer.write_symbol(mv_hp, hp_row)?;
+        } else if mv_hp != 1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+    }
+
+    Ok(())
+}
+
+/// MV writer per §5.11.31 `read_mv( ref )` (av1-spec p.81) — the
+/// algebraic inverse of the reader's `mv_joint` + per-component
+/// `read_mv_component( )` dispatch.
+///
+/// ## Spec body (§5.11.31 — av1-spec p.81)
+///
+/// ```text
+///   diffMv[ 0 ] = 0
+///   diffMv[ 1 ] = 0
+///   if ( use_intrabc ) MvCtx = MV_INTRABC_CONTEXT
+///   else               MvCtx = 0
+///   mv_joint                                                 S()
+///   if ( mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ )
+///       diffMv[ 0 ] = read_mv_component( 0 )
+///   if ( mv_joint == MV_JOINT_HNZVZ || mv_joint == MV_JOINT_HNZVNZ )
+///       diffMv[ 1 ] = read_mv_component( 1 )
+///   Mv[ ref ][ 0 ] = PredMv[ ref ][ 0 ] + diffMv[ 0 ]
+///   Mv[ ref ][ 1 ] = PredMv[ ref ][ 1 ] + diffMv[ 1 ]
+/// ```
+///
+/// ## Inverse derivation
+///
+/// The encoder holds the target `Mv[ ref ]` and the §7.10.2-derived
+/// `PredMv[ ref ]`. The difference vector is
+/// `diff[ c ] = Mv[ ref ][ c ] - PredMv[ ref ][ c ]` for each
+/// component. The `mv_joint` symbol records which components are
+/// non-zero:
+///
+/// | `diff[0]` | `diff[1]` | `mv_joint`        |
+/// |-----------|-----------|-------------------|
+/// | `== 0`    | `== 0`    | `MV_JOINT_ZERO`   |
+/// | `== 0`    | `!= 0`    | `MV_JOINT_HNZVZ`  |
+/// | `!= 0`    | `== 0`    | `MV_JOINT_HZVNZ`  |
+/// | `!= 0`    | `!= 0`    | `MV_JOINT_HNZVNZ` |
+///
+/// Note the reader's component indexing: `read_mv_component( 0 )` (the
+/// horizontal component, `diff[0]`) fires for `MV_JOINT_HZVNZ` /
+/// `MV_JOINT_HNZVNZ`, and `read_mv_component( 1 )` (vertical,
+/// `diff[1]`) for `MV_JOINT_HNZVZ` / `MV_JOINT_HNZVNZ`. The encoder
+/// follows the same call order: component `0` then component `1`.
+///
+/// ## CDF selection (§8.3.2 — av1-spec p.493)
+///
+/// `mv_joint` → `TileMvJointCdf[ MvCtx ]`. The component reads select
+/// their CDFs as documented on [`write_read_mv_component`].
+///
+/// ## Inputs
+///
+/// * `mv` — the target `Mv[ ref ]` as `[horizontal, vertical]`.
+/// * `pred_mv` — the §7.10.2 `PredMv[ ref ]` predictor.
+/// * `use_intrabc` — selects `MvCtx = MV_INTRABC_CONTEXT` when set.
+/// * `force_integer_mv` / `allow_high_precision_mv` — frame-level
+///   precision flags forwarded to each component write.
+pub fn write_read_mv(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    mv: [i32; 2],
+    pred_mv: [i32; 2],
+    use_intrabc: bool,
+    force_integer_mv: bool,
+    allow_high_precision_mv: bool,
+) -> Result<(), Error> {
+    let mv_ctx: usize = if use_intrabc { MV_INTRABC_CONTEXT } else { 0 };
+
+    let diff0: i32 = mv[0].wrapping_sub(pred_mv[0]);
+    let diff1: i32 = mv[1].wrapping_sub(pred_mv[1]);
+
+    let mv_joint: u32 = match (diff0 != 0, diff1 != 0) {
+        (false, false) => MV_JOINT_ZERO as u32,
+        (false, true) => MV_JOINT_HNZVZ as u32,
+        (true, false) => MV_JOINT_HZVNZ as u32,
+        (true, true) => MV_JOINT_HNZVNZ as u32,
+    };
+
+    let joint_row = cdfs.mv_joint_cdf(mv_ctx);
+    writer.write_symbol(mv_joint, joint_row)?;
+
+    // Component 0 (horizontal) fires for MV_JOINT_HZVNZ / MV_JOINT_HNZVNZ.
+    if diff0 != 0 {
+        write_read_mv_component(
+            writer,
+            cdfs,
+            mv_ctx,
+            0,
+            diff0,
+            force_integer_mv,
+            allow_high_precision_mv,
+        )?;
+    }
+    // Component 1 (vertical) fires for MV_JOINT_HNZVZ / MV_JOINT_HNZVNZ.
+    if diff1 != 0 {
+        write_read_mv_component(
+            writer,
+            cdfs,
+            mv_ctx,
+            1,
+            diff1,
+            force_integer_mv,
+            allow_high_precision_mv,
+        )?;
     }
 
     Ok(())
@@ -13812,5 +14108,312 @@ mod tests {
         for c in 0..DRL_MODE_CONTEXTS {
             assert_eq!(enc_cdfs.drl_mode_cdf(c), dec_cdfs.drl_mode_cdf(c));
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.31 / §5.11.32 — write_read_mv / write_read_mv_component.
+    // -----------------------------------------------------------------
+
+    /// Decode mirror of §5.11.32 `read_mv_component( comp )` — the
+    /// literal reader pseudocode, used to round-trip the writer. Returns
+    /// the signed difference the reader would reconstruct.
+    fn decode_read_mv_component_mirror(
+        dec: &mut SymbolDecoder,
+        cdfs: &mut TileCdfContext,
+        mv_ctx: usize,
+        comp: usize,
+        force_integer_mv: bool,
+        allow_high_precision_mv: bool,
+    ) -> i32 {
+        let mv_sign = dec.read_symbol(cdfs.mv_sign_cdf(mv_ctx, comp)).unwrap();
+        let mv_class = dec.read_symbol(cdfs.mv_class_cdf(mv_ctx, comp)).unwrap();
+        let mag: u32 = if mv_class == MV_CLASS_0 as u32 {
+            let mv_class0_bit = dec
+                .read_symbol(cdfs.mv_class0_bit_cdf(mv_ctx, comp))
+                .unwrap();
+            let mv_class0_fr = if force_integer_mv {
+                3
+            } else {
+                dec.read_symbol(cdfs.mv_class0_fr_cdf(mv_ctx, comp, mv_class0_bit as usize))
+                    .unwrap()
+            };
+            let mv_class0_hp = if allow_high_precision_mv {
+                dec.read_symbol(cdfs.mv_class0_hp_cdf(mv_ctx, comp))
+                    .unwrap()
+            } else {
+                1
+            };
+            ((mv_class0_bit << 3) | (mv_class0_fr << 1) | mv_class0_hp) + 1
+        } else {
+            let mut d: u32 = 0;
+            for i in 0..(mv_class as usize) {
+                let mv_bit = dec.read_symbol(cdfs.mv_bit_cdf(mv_ctx, comp, i)).unwrap();
+                d |= mv_bit << i;
+            }
+            let mut mag = (CLASS0_SIZE as u32) << (mv_class + 2);
+            let mv_fr = if force_integer_mv {
+                3
+            } else {
+                dec.read_symbol(cdfs.mv_fr_cdf(mv_ctx, comp)).unwrap()
+            };
+            let mv_hp = if allow_high_precision_mv {
+                dec.read_symbol(cdfs.mv_hp_cdf(mv_ctx, comp)).unwrap()
+            } else {
+                1
+            };
+            mag += ((d << 3) | (mv_fr << 1) | mv_hp) + 1;
+            mag
+        };
+        if mv_sign != 0 {
+            -(mag as i32)
+        } else {
+            mag as i32
+        }
+    }
+
+    /// Decode mirror of §5.11.31 `read_mv( ref )` — reconstructs the
+    /// `Mv[ ref ]` the reader would produce from `pred_mv` and the
+    /// emitted symbols.
+    fn decode_read_mv_mirror(
+        bytes: &[u8],
+        cdfs: &mut TileCdfContext,
+        pred_mv: [i32; 2],
+        use_intrabc: bool,
+        force_integer_mv: bool,
+        allow_high_precision_mv: bool,
+    ) -> [i32; 2] {
+        let mv_ctx = if use_intrabc { MV_INTRABC_CONTEXT } else { 0 };
+        let mut dec = SymbolDecoder::init_symbol(bytes, bytes.len(), false).unwrap();
+        let mv_joint = dec.read_symbol(cdfs.mv_joint_cdf(mv_ctx)).unwrap() as u8;
+        let mut diff = [0i32; 2];
+        if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
+            diff[0] = decode_read_mv_component_mirror(
+                &mut dec,
+                cdfs,
+                mv_ctx,
+                0,
+                force_integer_mv,
+                allow_high_precision_mv,
+            );
+        }
+        if mv_joint == MV_JOINT_HNZVZ || mv_joint == MV_JOINT_HNZVNZ {
+            diff[1] = decode_read_mv_component_mirror(
+                &mut dec,
+                cdfs,
+                mv_ctx,
+                1,
+                force_integer_mv,
+                allow_high_precision_mv,
+            );
+        }
+        [pred_mv[0] + diff[0], pred_mv[1] + diff[1]]
+    }
+
+    /// Full round-trip of `write_read_mv` over a sweep of target MVs at
+    /// high precision (every symbol read), at the frame origin
+    /// (`MvCtx = 0`), with §8.3 CDF adaptation engaged on both sides.
+    #[test]
+    fn write_read_mv_round_trips_high_precision() {
+        let pred = [100, -50];
+        // Mix of: zero joint, single-axis, both-axis, class-0 and
+        // higher-class magnitudes, and both signs.
+        let targets = [
+            [100, -50],    // diff (0,0)   — MV_JOINT_ZERO
+            [100, -49],    // diff (0,+1)  — HNZVZ, class 0
+            [101, -50],    // diff (+1,0)  — HZVNZ, class 0
+            [101, -49],    // diff (+1,+1) — HNZVNZ
+            [84, -50],     // diff (-16,0) — class 1
+            [100, 30],     // diff (0,+80) — bigger class
+            [1100, -1050], // diff (+1000,-1000) — high class both axes
+            [50, -200],    // diff (-50,-150)
+        ];
+        for tgt in targets {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_read_mv(&mut writer, &mut enc_cdfs, tgt, pred, false, false, true).unwrap();
+            let bytes = writer.finish();
+
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let recovered = decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, false, false, true);
+            assert_eq!(recovered, tgt, "MV {tgt:?} round-trips at high precision");
+            // CDF adaptation must have stepped identically on both sides.
+            assert_eq!(enc_cdfs.mv_joint_cdf(0), dec_cdfs.mv_joint_cdf(0));
+        }
+    }
+
+    /// Round-trip under the intra-block-copy context (`use_intrabc`),
+    /// proving the writer selects `MvCtx = MV_INTRABC_CONTEXT = 1`.
+    #[test]
+    fn write_read_mv_round_trips_intrabc_context() {
+        let pred = [0, 0];
+        // intra block copy is integer-only, so each component magnitude
+        // must be a multiple of 8 (low 3 bits = `(fr<<1)|hp` = `(3<<1)|1`).
+        let tgt = [-40, 64];
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // intra block copy is always integer + non-high-precision.
+        write_read_mv(&mut writer, &mut enc_cdfs, tgt, pred, true, true, false).unwrap();
+        let bytes = writer.finish();
+
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let recovered = decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, true, true, false);
+        assert_eq!(
+            recovered, tgt,
+            "MV round-trips under MvCtx = MV_INTRABC_CONTEXT"
+        );
+        // The intrabc context row must have adapted, not the ctx-0 row.
+        assert_eq!(
+            enc_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT),
+            dec_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT)
+        );
+    }
+
+    /// Round-trip under `force_integer_mv` (fractional field synthesised
+    /// to 3, never read) and `!allow_high_precision_mv` (hp forced to 1).
+    /// Only integer-aligned MVs with `fr == 3, hp == 1` are
+    /// representable — i.e. magnitudes of the form `8k`.
+    #[test]
+    fn write_read_mv_round_trips_force_integer() {
+        let pred = [0, 0];
+        // diff components are multiples of 8 (their low 3 bits = `(fr<<1)|hp`
+        // = (3<<1)|1 = 7 ⇒ offset & 7 == 7, i.e. mag in {8, 16, 24, ...}).
+        for &d0 in &[0i32, 8, -8, 64, -128] {
+            for &d1 in &[0i32, 8, 256, -512] {
+                let tgt = [d0, d1];
+                let mut enc_cdfs = TileCdfContext::new_from_defaults();
+                let mut writer = SymbolWriter::new(false);
+                write_read_mv(&mut writer, &mut enc_cdfs, tgt, pred, false, true, false).unwrap();
+                let bytes = writer.finish();
+
+                let mut dec_cdfs = TileCdfContext::new_from_defaults();
+                let recovered =
+                    decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, false, true, false);
+                assert_eq!(recovered, tgt, "integer MV {tgt:?} round-trips");
+            }
+        }
+    }
+
+    /// `mv_joint` selection covers all four quadrants exactly.
+    #[test]
+    fn write_read_mv_joint_selection_is_exhaustive() {
+        let pred = [10, 20];
+        let cases = [
+            ([10, 20], MV_JOINT_ZERO),
+            ([10, 21], MV_JOINT_HNZVZ),
+            ([11, 20], MV_JOINT_HZVNZ),
+            ([11, 21], MV_JOINT_HNZVNZ),
+        ];
+        for (tgt, want_joint) in cases {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_read_mv(&mut writer, &mut enc_cdfs, tgt, pred, false, false, true).unwrap();
+            let bytes = writer.finish();
+
+            // Read just the leading mv_joint symbol to confirm the quadrant.
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let joint = dec.read_symbol(dec_cdfs.mv_joint_cdf(0)).unwrap() as u8;
+            assert_eq!(joint, want_joint, "MV {tgt:?} ⇒ joint {want_joint}");
+        }
+    }
+
+    /// `MV_JOINT_ZERO` emits exactly one symbol (the joint) and no
+    /// component reads — verified by re-encoding only that symbol.
+    #[test]
+    fn write_read_mv_zero_joint_emits_only_joint_symbol() {
+        let pred = [7, -3];
+        let mut a = TileCdfContext::new_from_defaults();
+        let mut wa = SymbolWriter::new(false);
+        write_read_mv(&mut wa, &mut a, pred, pred, false, false, true).unwrap();
+        let got = wa.finish();
+
+        let mut b = TileCdfContext::new_from_defaults();
+        let mut wb = SymbolWriter::new(false);
+        let row = b.mv_joint_cdf(0);
+        wb.write_symbol(MV_JOINT_ZERO as u32, row).unwrap();
+        let want = wb.finish();
+        assert_eq!(got, want, "MV_JOINT_ZERO writes a single joint symbol");
+    }
+
+    /// The class derivation boundary: `mag == 16` (offset 15) is the
+    /// last `MV_CLASS_0` magnitude, `mag == 17` (offset 16) is the first
+    /// `MV_CLASS_1` magnitude. Both round-trip.
+    #[test]
+    fn write_read_mv_class_boundary_round_trips() {
+        let pred = [0, 0];
+        for d in [16i32, 17, -16, -17] {
+            let tgt = [d, 0];
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_read_mv(&mut writer, &mut enc_cdfs, tgt, pred, false, false, true).unwrap();
+            let bytes = writer.finish();
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let recovered = decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, false, false, true);
+            assert_eq!(recovered, tgt, "class-boundary diff {d} round-trips");
+        }
+    }
+
+    /// A zero component handed to `write_read_mv_component` directly is a
+    /// caller bug (the reader signals zero via `mv_joint`, never a
+    /// component read).
+    #[test]
+    fn write_read_mv_component_rejects_zero_diff() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let err =
+            write_read_mv_component(&mut writer, &mut cdfs, 0, 0, 0, false, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Out-of-range `mv_ctx` / `comp` are caller bugs.
+    #[test]
+    fn write_read_mv_component_rejects_bad_indices() {
+        for (ctx, comp) in [(MV_CONTEXTS, 0), (0, MV_COMPS)] {
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let err = write_read_mv_component(&mut writer, &mut cdfs, ctx, comp, 5, false, true)
+                .unwrap_err();
+            assert!(matches!(err, Error::PartitionWalkOutOfRange));
+        }
+    }
+
+    /// Under `force_integer_mv`, a diff whose fractional field is not 3
+    /// is unrepresentable (the reader would synthesise `fr = 3`, not the
+    /// caller's value) and must be rejected rather than mis-encoded.
+    #[test]
+    fn write_read_mv_component_rejects_non_integer_under_force_integer() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // diff = 1 ⇒ offset 0 ⇒ class0, fr = 0 ≠ 3 under force_integer.
+        let err = write_read_mv_component(&mut writer, &mut cdfs, 0, 0, 1, true, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// Under `!allow_high_precision_mv`, a diff whose half-pel bit is not
+    /// 1 is unrepresentable (the reader forces `hp = 1`).
+    #[test]
+    fn write_read_mv_component_rejects_non_hp_when_disallowed() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // diff = 2 ⇒ offset 1 ⇒ class0, hp = 1, fr = 0. That's fine.
+        // diff = 3 ⇒ offset 2 ⇒ hp = 0 ≠ 1 under no-high-precision ⇒ reject.
+        let err =
+            write_read_mv_component(&mut writer, &mut cdfs, 0, 0, 3, false, false).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// A magnitude beyond the encodable MV range (`mv_class >= MV_CLASSES`)
+    /// is rejected. The maximum encodable offset is `2^(MV_CLASSES+3) - 1`;
+    /// one past it overflows the class alphabet.
+    #[test]
+    fn write_read_mv_component_rejects_overlarge_magnitude() {
+        // mv_class = FloorLog2(offset) - 3 must be < MV_CLASSES = 11, so
+        // FloorLog2(offset) < 14, i.e. offset < 2^14 = 16384 ⇒ mag <= 16384.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        // mag = 16385 ⇒ offset 16384 ⇒ FloorLog2 = 14 ⇒ class 11 ⇒ reject.
+        let err =
+            write_read_mv_component(&mut writer, &mut cdfs, 0, 0, 16385, false, true).unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

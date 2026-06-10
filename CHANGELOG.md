@@ -4,6 +4,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r273 (2026-06-10): land the §5.11.31 / §5.11.32 `read_mv` /
+  `read_mv_component` write side (the `assign_mv` line-33 motion-vector
+  difference writer) — `encoder::block_mode_info::write_read_mv`
+  (§5.11.31 `read_mv( ref )`, av1-spec p.81) and `write_read_mv_component`
+  (§5.11.32 `read_mv_component( comp )`, av1-spec p.81-82). The reader
+  reconstructs `Mv[ ref ][ c ] = PredMv[ ref ][ c ] + diffMv[ c ]`; the
+  writer takes the target `Mv[ ref ]` and the §7.10.2 `PredMv[ ref ]`
+  predictor and emits the exact inverse. `mv_joint` records which of the
+  two components are non-zero (`MV_JOINT_ZERO` / `HNZVZ` / `HZVNZ` /
+  `HNZVNZ`); each non-zero component decomposes into `mv_sign` +
+  `mv_class` (`MV_CLASS_0` for `offset = mag - 1 ∈ 0..=15`, otherwise
+  `FloorLog2(offset) - 3`) + the class-0 `mv_class0_bit` / `mv_class0_fr`
+  / `mv_class0_hp` triple or the higher-class `mv_bit` integer ladder +
+  `mv_fr` / `mv_hp`. `MvCtx = MV_INTRABC_CONTEXT` under `use_intrabc`,
+  else `0`. §8.3.2 CDF rows (`TileMvJointCdf[ MvCtx ]`,
+  `TileMvSignCdf` / `TileMvClassCdf` / `TileMvClass0BitCdf` /
+  `TileMvClass0FrCdf[ … ][ mv_class0_bit ]` / `TileMvClass0HpCdf` /
+  `TileMvBitCdf[ … ][ i ]` / `TileMvFrCdf` / `TileMvHpCdf` indexed by
+  `[ MvCtx ][ comp ]`) selected exactly as the reader specifies.
+  Precision flags mirror the reader's `else` arms: under
+  `force_integer_mv` the fractional field must already be `3`, under
+  `!allow_high_precision_mv` the half-pel bit must be `1`; an
+  inconsistent target is a caller-bug reject, as are a zero component,
+  out-of-range `mv_ctx` / `comp`, and a magnitude exceeding
+  `MV_CLASSES`. +11 tests (high-precision mixed-MV round-trip through a
+  literal reader mirror with per-row CDF-adaptation equality;
+  intra-block-copy `MvCtx`; integer-MV round-trip; exhaustive
+  `mv_joint`-quadrant selection; zero-joint single-symbol emission;
+  class-0/class-1 magnitude boundary; and the five caller-bug rejects).
+  Library test count 1854 → 1865.
 - encoder r272 (2026-06-10): land the §5.11.23 `drl_mode`
   dynamic-reference-list (DRL) index writer —
   `encoder::block_mode_info::write_drl_mode` (§5.11.23
