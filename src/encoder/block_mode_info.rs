@@ -59,16 +59,16 @@ use crate::cdf::{
     COMPOUND_INTRA, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES, COMPOUND_WEDGE,
     COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, EIGHTTAP,
     FRAME_LF_COUNT, GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_NONE,
-    INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS, MAX_ANGLE_DELTA,
-    MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MODE_GLOBALMV, MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV,
-    MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV, MODE_NEAR_NEWMV, MODE_NEWMV,
-    MODE_NEW_NEARMV, MODE_NEW_NEWMV, MOTION_MODES, MOTION_MODE_OBMC, MOTION_MODE_SIMPLE,
-    MOTION_MODE_WARPED_CAUSAL, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS, MV_INTRABC_CONTEXT,
-    MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO, NEW_MV_CONTEXTS,
-    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS, PALETTE_COLORS,
-    REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS, SKIP_CONTEXTS,
-    SKIP_MODE_CONTEXTS, SWITCHABLE, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
-    WEDGE_TYPES, ZERO_MV_CONTEXTS,
+    INTRABC_DELAY_PIXELS, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
+    MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MI_SIZE, MODE_GLOBALMV,
+    MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV,
+    MODE_NEAR_NEWMV, MODE_NEWMV, MODE_NEW_NEARMV, MODE_NEW_NEWMV, MOTION_MODES, MOTION_MODE_OBMC,
+    MOTION_MODE_SIMPLE, MOTION_MODE_WARPED_CAUSAL, MV_CLASSES, MV_CLASS_0, MV_COMPS, MV_CONTEXTS,
+    MV_INTRABC_CONTEXT, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_ZERO,
+    NEW_MV_CONTEXTS, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_BLOCK_SIZE_CONTEXTS,
+    PALETTE_COLORS, REF_MV_CONTEXTS, SEGMENT_ID_CONTEXTS, SEGMENT_ID_PREDICTED_CONTEXTS,
+    SKIP_CONTEXTS, SKIP_MODE_CONTEXTS, SWITCHABLE, UV_INTRA_MODES_CFL_ALLOWED,
+    UV_INTRA_MODES_CFL_NOT_ALLOWED, WEDGE_TYPES, ZERO_MV_CONTEXTS,
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::Error;
@@ -5269,6 +5269,95 @@ pub fn assign_mv_pred_mv(
         return Err(Error::PartitionWalkOutOfRange);
     }
     Ok(mv_stack.ref_stack_mv[pos as usize][ref_list as usize])
+}
+
+/// `PredMv[ 0 ]` derivation per the §5.11.26 `assign_mv`
+/// **intra-block-copy** arm (av1-spec p.77-78) — the predictor the
+/// §5.11.7 `intra_frame_mode_info( )` `use_intrabc` path feeds to
+/// `read_mv( 0 )`. On this arm `compMode` is forced to `NEWMV`, so an
+/// MV difference is *always* coded: the caller passes the returned
+/// predictor to [`write_read_mv`] with `use_intrabc = true` (selecting
+/// `MvCtx = MV_INTRABC_CONTEXT`), `force_integer_mv = true` and
+/// `allow_high_precision_mv = false` (intra block copy is
+/// integer-only per §5.11.32).
+///
+/// Spec body (av1-spec p.77-78, the `if ( use_intrabc )` arm of
+/// `assign_mv`):
+/// ```text
+///   PredMv[ 0 ] = RefStackMv[ 0 ][ 0 ]
+///   if ( PredMv[ 0 ][ 0 ] == 0 && PredMv[ 0 ][ 1 ] == 0 ) {
+///       PredMv[ 0 ] = RefStackMv[ 1 ][ 0 ]
+///   }
+///   if ( PredMv[ 0 ][ 0 ] == 0 && PredMv[ 0 ][ 1 ] == 0 ) {
+///       sbSize = use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64
+///       sbSize4 = Num_4x4_Blocks_High[ sbSize ]
+///       if ( MiRow - sbSize4 < MiRowStart ) {
+///           PredMv[ 0 ][ 0 ] = 0
+///           PredMv[ 0 ][ 1 ] = -(sbSize4 * MI_SIZE + INTRABC_DELAY_PIXELS) * 8
+///       } else {
+///           PredMv[ 0 ][ 0 ] = -(sbSize4 * MI_SIZE * 8)
+///           PredMv[ 0 ][ 1 ] = 0
+///       }
+///   }
+/// ```
+///
+/// Unlike the inter arm ([`assign_mv_pred_mv`]), no `NumMvFound` bound
+/// applies to the two `RefStackMv` reads: the §7.10.2.12 extra-search
+/// single-prediction tail pads `RefStackMv[ idx ][ 0 ]` for `idx <
+/// 2` with `GlobalMvs[ 0 ]` **without** incrementing `NumMvFound`
+/// ("for single prediction, NumMvFound is not incremented by the
+/// addition of global motion candidates"), so both slots are always
+/// written before `assign_mv` reads them — and on an intra-block-copy
+/// block `GlobalMvs[ 0 ]` is the zero vector (§7.10.2.1: `ref ==
+/// INTRA_FRAME ⇒ mv = 0`), which is exactly what the zero-fallback
+/// chain absorbs.
+///
+/// The zero-MV fallback points at the most recent column of
+/// already-reconstructed superblocks: one superblock up
+/// (`-(sbSize4 * MI_SIZE * 8)` in row component) when the block is not
+/// in the tile's top superblock row, else `sbSize4 * MI_SIZE +
+/// INTRABC_DELAY_PIXELS` luma samples to the left (the §3
+/// `INTRABC_DELAY_PIXELS = 256` wave-front delay) in column component.
+/// Components are `[ row, col ]` in 1/8-luma-sample units throughout
+/// (`Mv[ ][ 0 ]` = vertical, `Mv[ ][ 1 ]` = horizontal).
+///
+/// `mi_row` / `mi_row_start` are the block's mode-info row and the
+/// enclosing tile's `MiRowStart` (§6.10.4). A `mi_row < mi_row_start`
+/// pair is rejected as a caller bug (`Err(PartitionWalkOutOfRange)`)
+/// — a block cannot sit above its own tile.
+pub fn assign_mv_pred_mv_intrabc(
+    mv_stack: &FindMvStackResult,
+    use_128x128_superblock: bool,
+    mi_row: u32,
+    mi_row_start: u32,
+) -> Result<[i32; 2], Error> {
+    if mi_row < mi_row_start {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let mut pred_mv = mv_stack.ref_stack_mv[0][0];
+    if pred_mv == [0, 0] {
+        pred_mv = mv_stack.ref_stack_mv[1][0];
+    }
+    if pred_mv == [0, 0] {
+        let sb_size = if use_128x128_superblock {
+            BLOCK_128X128
+        } else {
+            BLOCK_64X64
+        };
+        let sb_size4 = NUM_4X4_BLOCKS_HIGH[sb_size] as u32;
+        // `MiRow - sbSize4 < MiRowStart` on spec (unbounded) integers —
+        // rearranged as `MiRow < MiRowStart + sbSize4` so the unsigned
+        // subtraction cannot wrap.
+        if mi_row < mi_row_start + sb_size4 {
+            pred_mv = [
+                0,
+                -((sb_size4 as i32 * MI_SIZE as i32 + INTRABC_DELAY_PIXELS as i32) * 8),
+            ];
+        } else {
+            pred_mv = [-(sb_size4 as i32 * MI_SIZE as i32 * 8), 0];
+        }
+    }
+    Ok(pred_mv)
 }
 
 /// §5.11.23 tail inputs for [`write_inter_block_mode_info`] — r277.
@@ -15921,6 +16010,171 @@ mod tests {
         let mut dec_cdfs = TileCdfContext::new_from_defaults();
         let recovered = decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, false, false, true);
         assert_eq!(recovered, target_mv, "PredMv + diffMv reconstructs Mv");
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.26 assign_mv intra-block-copy arm — assign_mv_pred_mv_intrabc
+    // -----------------------------------------------------------------
+
+    /// Build a `FindMvStackResult` shaped like the §7.10.2 output on an
+    /// intra-block-copy block: `GlobalMvs[ 0 ]` is the zero vector
+    /// (§7.10.2.1 `ref == INTRA_FRAME`), and the caller chooses the two
+    /// `RefStackMv[ idx ][ 0 ]` slots the §5.11.26 intrabc arm reads
+    /// (the §7.10.2.12 single-pred tail pads unwritten slots with
+    /// `GlobalMvs[ 0 ] = [0, 0]` without incrementing `NumMvFound`).
+    fn mk_intrabc_mv_stack(
+        slot0: [i32; 2],
+        slot1: [i32; 2],
+        num_mv_found: u32,
+    ) -> FindMvStackResult {
+        let mut s = mk_mv_stack(num_mv_found);
+        s.global_mvs = [[0, 0], [0, 0]];
+        s.ref_stack_mv = [[[0i32; 2]; 2]; MAX_REF_MV_STACK_SIZE];
+        s.ref_stack_mv[0][0] = slot0;
+        s.ref_stack_mv[1][0] = slot1;
+        s
+    }
+
+    /// §5.11.26 intrabc — a non-zero `RefStackMv[ 0 ][ 0 ]` is the
+    /// predictor; slot 1 and the superblock fallback are never reached.
+    #[test]
+    fn assign_mv_pred_mv_intrabc_uses_slot0_when_nonzero() {
+        let s = mk_intrabc_mv_stack([-64, 8], [16, -24], 2);
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, false, 16, 0).unwrap(),
+            [-64, 8]
+        );
+        // A half-zero slot 0 is still "non-zero" — the fallback tests
+        // both components.
+        let row_only = mk_intrabc_mv_stack([-8, 0], [16, -24], 2);
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&row_only, false, 16, 0).unwrap(),
+            [-8, 0]
+        );
+    }
+
+    /// §5.11.26 intrabc — a zero slot 0 falls through to
+    /// `RefStackMv[ 1 ][ 0 ]`.
+    #[test]
+    fn assign_mv_pred_mv_intrabc_falls_to_slot1() {
+        let s = mk_intrabc_mv_stack([0, 0], [16, -24], 2);
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, false, 16, 0).unwrap(),
+            [16, -24]
+        );
+    }
+
+    /// §5.11.26 intrabc — both slots zero (the §7.10.2.12 global-MV
+    /// padding outcome on the first intrabc block) and the block in the
+    /// tile's top superblock row (`MiRow - sbSize4 < MiRowStart`):
+    /// the predictor points left by `sbSize4 * MI_SIZE +
+    /// INTRABC_DELAY_PIXELS` luma samples, in the **column** component,
+    /// in 1/8-sample units.
+    #[test]
+    fn assign_mv_pred_mv_intrabc_top_row_fallback() {
+        let s = mk_intrabc_mv_stack([0, 0], [0, 0], 0);
+        // 64x64 superblocks: sbSize4 = 16 ⇒ [0, -(16*4 + 256)*8].
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, false, 0, 0).unwrap(),
+            [0, -2560]
+        );
+        // mi_row 15 with MiRowStart 0 is still inside the first
+        // superblock row (15 - 16 < 0).
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, false, 15, 0).unwrap(),
+            [0, -2560]
+        );
+        // 128x128 superblocks: sbSize4 = 32 ⇒ [0, -(32*4 + 256)*8];
+        // rows 0..=31 of the tile are all "top superblock row".
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, true, 31, 0).unwrap(),
+            [0, -3072]
+        );
+        // A non-zero MiRowStart shifts the boundary: mi_row 40 in a
+        // tile starting at mi_row 32 is in that tile's top superblock
+        // row (40 - 16 < 32).
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, false, 40, 32).unwrap(),
+            [0, -2560]
+        );
+    }
+
+    /// §5.11.26 intrabc — both slots zero below the top superblock row:
+    /// the predictor points one superblock **up** (`-(sbSize4 * MI_SIZE
+    /// * 8)` in the row component).
+    #[test]
+    fn assign_mv_pred_mv_intrabc_up_fallback() {
+        let s = mk_intrabc_mv_stack([0, 0], [0, 0], 0);
+        // 64x64: mi_row 16 is exactly one superblock down (16 - 16 = 0
+        // is NOT < 0) ⇒ [-16*4*8, 0].
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, false, 16, 0).unwrap(),
+            [-512, 0]
+        );
+        // 128x128: sbSize4 = 32 ⇒ [-1024, 0] from row 32.
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, true, 32, 0).unwrap(),
+            [-1024, 0]
+        );
+        // Tile-relative: mi_row 48 with MiRowStart 32 (48 - 16 >= 32).
+        assert_eq!(
+            assign_mv_pred_mv_intrabc(&s, false, 48, 32).unwrap(),
+            [-512, 0]
+        );
+    }
+
+    /// §5.11.26 intrabc caller-bug reject — a block above its own tile
+    /// (`mi_row < mi_row_start`).
+    #[test]
+    fn assign_mv_pred_mv_intrabc_rejects_row_above_tile() {
+        let s = mk_intrabc_mv_stack([0, 0], [0, 0], 0);
+        assert!(matches!(
+            assign_mv_pred_mv_intrabc(&s, false, 31, 32).unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+    }
+
+    /// End-to-end: the §5.11.26 intrabc predictor feeds
+    /// [`write_read_mv`] under the intra-block-copy MV regime
+    /// (`MvCtx = MV_INTRABC_CONTEXT`, integer-only, no high precision)
+    /// and the §5.11.31 reader mirror reconstructs the target block
+    /// vector — on both the slot-0 path and the top-row fallback.
+    #[test]
+    fn assign_mv_pred_mv_intrabc_feeds_write_read_mv() {
+        for (s, mi_row, target_mv) in [
+            // Slot-0 predictor (integer-aligned: multiples of 8).
+            (
+                mk_intrabc_mv_stack([-64, 8], [0, 0], 2),
+                16,
+                [-64 + 16, 8 - 40],
+            ),
+            // Zero stack ⇒ top-row fallback predictor [0, -2560].
+            (mk_intrabc_mv_stack([0, 0], [0, 0], 0), 0, [0, -2560 + 64]),
+        ] {
+            let pred = assign_mv_pred_mv_intrabc(&s, false, mi_row, 0).unwrap();
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_read_mv(
+                &mut writer,
+                &mut enc_cdfs,
+                target_mv,
+                pred,
+                /* use_intrabc = */ true,
+                /* force_integer_mv = */ true,
+                /* allow_high_precision_mv = */ false,
+            )
+            .unwrap();
+            let bytes = writer.finish();
+
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let recovered = decode_read_mv_mirror(&bytes, &mut dec_cdfs, pred, true, true, false);
+            assert_eq!(recovered, target_mv, "intrabc Mv reconstructs");
+            // The intrabc context row adapted identically on both sides.
+            assert_eq!(
+                enc_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT),
+                dec_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT)
+            );
+        }
     }
 
     // -----------------------------------------------------------------

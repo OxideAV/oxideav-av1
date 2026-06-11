@@ -966,6 +966,14 @@ pub const MI_SIZE: usize = 4;
 /// grid units (e.g. §7.11.3.3 `row = startY >> MI_SIZE_LOG2`).
 pub const MI_SIZE_LOG2: usize = 2;
 
+/// `INTRABC_DELAY_PIXELS` (§3 constant table, av1-spec p.7) — number of
+/// horizontal luma samples before intra block copy can be used. Equal
+/// to `256`. Consumed by the §5.11.26 `assign_mv` intra-block-copy
+/// fallback predictor (`PredMv[ 0 ][ 1 ] = -(sbSize4 * MI_SIZE +
+/// INTRABC_DELAY_PIXELS) * 8` on the top superblock row) and by the
+/// §7.10.x intra-block-copy wave-front validity checks.
+pub const INTRABC_DELAY_PIXELS: usize = 256;
+
 /// `Mi_Width_Log2[ BLOCK_SIZES ]` (§9.3, av1-spec p.400) — base-2
 /// logarithm of the block width in units of `4` luma samples. Indexed
 /// by `MiSize`, returning a value in `0..=5`. Used by §5.11.46

@@ -4,6 +4,35 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r278 (2026-06-11): land the §5.11.26 `assign_mv`
+  **intra-block-copy** `PredMv` arm —
+  `encoder::block_mode_info::assign_mv_pred_mv_intrabc` (av1-spec
+  p.77-78), the predictor derivation the §5.11.7
+  `intra_frame_mode_info( )` `use_intrabc` path feeds to
+  `read_mv( 0 )` (where `compMode` is forced to `NEWMV`, so an MV
+  difference is always coded under `MvCtx = MV_INTRABC_CONTEXT`,
+  integer-only, no high precision). Three-stage fallback chain per
+  spec: `RefStackMv[ 0 ][ 0 ]` → (if zero) `RefStackMv[ 1 ][ 0 ]` →
+  (if still zero) the superblock-offset synthetic predictor — one
+  superblock up (`-(sbSize4 * MI_SIZE * 8)`, row component) below the
+  tile's top superblock row, else `sbSize4 * MI_SIZE +
+  INTRABC_DELAY_PIXELS` luma samples left (column component), with
+  `sbSize4 = Num_4x4_Blocks_High[ use_128x128_superblock ?
+  BLOCK_128X128 : BLOCK_64X64 ]` and the `MiRow - sbSize4 <
+  MiRowStart` test rearranged onto wrap-free unsigned arithmetic.
+  Unlike the inter arm, no `NumMvFound` bound applies to the two
+  stack reads — the §7.10.2.12 single-pred tail pads both slots with
+  `GlobalMvs[ 0 ]` (zero on intrabc blocks per §7.10.2.1) without
+  incrementing `NumMvFound`. `mi_row < mi_row_start` is rejected as a
+  caller bug. New §3 constant `INTRABC_DELAY_PIXELS = 256` (av1-spec
+  p.7) exported alongside the other §3 constants. +6 tests: slot-0 /
+  slot-1 selection (incl. half-zero slot-0 non-fallthrough), top-row
+  and up fallbacks across both superblock sizes with zero / non-zero
+  `MiRowStart` and exact-boundary rows, the above-tile reject, and an
+  end-to-end predictor → `write_read_mv` → §5.11.31 reader-mirror
+  round-trip under `MvCtx = MV_INTRABC_CONTEXT` on both the slot-0
+  and fallback paths with intrabc-row CDF-adaptation equality.
+  Library test count 1905 → 1911.
 - encoder r277 (2026-06-11): close the §5.11.23 inter-mode-info write
   side. (1) `encoder::block_mode_info::write_interpolation_filter` —
   the §5.11.x interpolation-filter loop writer (av1-spec p.74-75),

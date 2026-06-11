@@ -2,6 +2,59 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-11 (round 278)
+
+Round 278 lands the **§5.11.26 `assign_mv` intra-block-copy `PredMv`
+arm** — the last unexposed branch of the §5.11.26 predictor
+derivation, reached from the §5.11.7 `intra_frame_mode_info( )`
+`use_intrabc` path:
+
+* `encoder::block_mode_info::assign_mv_pred_mv_intrabc` (av1-spec
+  p.77-78). Implements the spec's three-stage fallback chain:
+  `RefStackMv[ 0 ][ 0 ]`, then (if zero) `RefStackMv[ 1 ][ 0 ]`, then
+  (if still zero) the superblock-offset synthetic predictor — one
+  superblock **up** (`-(sbSize4 * MI_SIZE * 8)` in the row component)
+  below the tile's top superblock row, else `sbSize4 * MI_SIZE +
+  INTRABC_DELAY_PIXELS` luma samples **left** (the §3 wave-front
+  delay) in the column component, with `sbSize4 =
+  Num_4x4_Blocks_High[ use_128x128_superblock ? BLOCK_128X128 :
+  BLOCK_64X64 ]`. The `MiRow - sbSize4 < MiRowStart` boundary test is
+  carried out on unbounded integers per spec (rearranged so the
+  unsigned subtraction cannot wrap). Unlike the inter arm, no
+  `NumMvFound` bound applies — the §7.10.2.12 single-pred tail pads
+  both slots with `GlobalMvs[ 0 ]` (the zero vector on intrabc blocks
+  per §7.10.2.1) without incrementing `NumMvFound`, so they are
+  always written before §5.11.26 reads them. A `mi_row <
+  mi_row_start` pair is rejected as a caller bug.
+* New §3 constant `INTRABC_DELAY_PIXELS = 256` (av1-spec p.7),
+  exported alongside the other §3 constants.
+
+On this arm `compMode` is forced to `NEWMV`, so the predictor always
+feeds `write_read_mv` under the intra-block-copy MV regime (`MvCtx =
+MV_INTRABC_CONTEXT`, integer-only, no high precision).
+
++6 tests: slot-0 / slot-1 selection (incl. a half-zero slot-0 vector
+that must NOT fall through), top-row fallback (64×64 + 128×128
+superblocks, zero and non-zero `MiRowStart`, the `sbSize4 - 1`
+boundary row), up fallback (both superblock sizes, tile-relative
+boundary at exactly `MiRowStart + sbSize4`), the above-tile reject,
+and an end-to-end predictor → `write_read_mv` → §5.11.31
+reader-mirror round-trip under `MvCtx = MV_INTRABC_CONTEXT` on both
+the slot-0 and fallback paths with intrabc-row CDF-adaptation
+equality. Full library test count moves to 1911 (was 1905).
+
+### Pending follow-ups for round 279+
+
+* Composing the §5.11.7 `use_intrabc` arm write side (the
+  `use_intrabc` S() + fixed assignments + `assign_mv_pred_mv_intrabc`
+  + `write_read_mv` sequence) into the intra-frame block writer.
+* Wiring `write_inter_block_mode_info` into a frame-level inter encode
+  driver (the §5.11.18 `inter_frame_mode_info` prefix writer exists;
+  the partition/pixel drivers are intra-only so far), including the
+  walker-side grid stamping the tail's neighbour scalars come from.
+
+---
+
 ## Status — 2026-06-11 (round 277)
 
 Round 277 **closes the §5.11.23 `inter_block_mode_info( )` write side**
