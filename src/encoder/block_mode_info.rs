@@ -3464,6 +3464,70 @@ pub fn write_intra_block_mode_info_with_palette(
     // §5.11.22 caller-bug guards re-asserted here so a contract
     // violation surfaces before any partial S() write disturbs the
     // bit stream. Each leaf re-checks its own bounds.
+    check_intra_mode_info_inputs(
+        mi_size,
+        y_mode,
+        uv_mode,
+        cfl_allowed,
+        has_chroma,
+        cfl_alpha_u,
+        cfl_alpha_v,
+    )?;
+
+    // §5.11.22 line 2: `y_mode S()` via the §8.3.2 `Size_Group[ MiSize ]`
+    // ctx.
+    let size_group_ctx = crate::cdf::size_group(mi_size);
+    write_y_mode(writer, cdfs, y_mode, size_group_ctx)?;
+
+    // §5.11.22 lines 4-16: shared with the §5.11.7 `else` arm.
+    write_intra_mode_info_tail(
+        writer,
+        cdfs,
+        mi_size,
+        y_mode,
+        uv_mode,
+        angle_delta_y,
+        angle_delta_uv,
+        cfl_allowed,
+        has_chroma,
+        allow_screen_content_tools,
+        enable_filter_intra,
+        use_filter_intra,
+        filter_intra_mode,
+        above_palette_y,
+        left_palette_y,
+        bit_depth,
+        has_palette_y,
+        palette_size_y,
+        palette_colors_y,
+        has_palette_uv,
+        palette_size_uv,
+        palette_colors_u,
+        palette_colors_v,
+        delta_encode_v,
+        cfl_alpha_u,
+        cfl_alpha_v,
+        walker,
+        mi_row,
+        mi_col,
+    )
+}
+
+/// Caller-bug guard block shared by
+/// [`write_intra_block_mode_info_with_palette`] (§5.11.22) and
+/// [`write_intra_frame_else_arm`] (§5.11.7 `else` arm) — both bodies
+/// share the same `uv_mode` / CFL / chroma input contract, so the
+/// guards are asserted once at the dispatcher boundary, BEFORE any
+/// S() write touches the bit stream.
+fn check_intra_mode_info_inputs(
+    mi_size: usize,
+    y_mode: u8,
+    uv_mode: Option<u8>,
+    cfl_allowed: bool,
+    has_chroma: bool,
+    cfl_alpha_u: Option<i8>,
+    cfl_alpha_v: Option<i8>,
+) -> Result<(), Error> {
     if mi_size >= BLOCK_SIZES {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -3507,12 +3571,49 @@ pub fn write_intra_block_mode_info_with_palette(
         // caller bug.
         return Err(Error::PartitionWalkOutOfRange);
     }
+    Ok(())
+}
 
-    // §5.11.22 line 2: `y_mode S()` via the §8.3.2 `Size_Group[ MiSize ]`
-    // ctx.
-    let size_group_ctx = crate::cdf::size_group(mi_size);
-    write_y_mode(writer, cdfs, y_mode, size_group_ctx)?;
-
+/// Shared §5.11.22 / §5.11.7-`else`-arm tail writer — everything after
+/// the per-arm Y-mode S() (`y_mode` with the `Size_Group[ MiSize ]`
+/// ctx on §5.11.22, `intra_frame_y_mode` with the §8.3.2
+/// neighbour-mode ctx pair on §5.11.7). Both spec bodies continue
+/// identically from `intra_angle_info_y( )` onward (same syntax
+/// elements, same CDF rows), so the tail is factored once and called
+/// by both dispatchers. Caller guarantees
+/// [`check_intra_mode_info_inputs`] has already passed.
+#[allow(clippy::too_many_arguments)]
+fn write_intra_mode_info_tail(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    mi_size: usize,
+    y_mode: u8,
+    uv_mode: Option<u8>,
+    angle_delta_y: i8,
+    angle_delta_uv: i8,
+    cfl_allowed: bool,
+    has_chroma: bool,
+    allow_screen_content_tools: bool,
+    enable_filter_intra: bool,
+    use_filter_intra: u8,
+    filter_intra_mode: Option<u8>,
+    above_palette_y: bool,
+    left_palette_y: bool,
+    bit_depth: u8,
+    has_palette_y: u8,
+    palette_size_y: usize,
+    palette_colors_y: &[u16],
+    has_palette_uv: u8,
+    palette_size_uv: usize,
+    palette_colors_u: &[u16],
+    palette_colors_v: &[u16],
+    delta_encode_v: bool,
+    cfl_alpha_u: Option<i8>,
+    cfl_alpha_v: Option<i8>,
+    walker: &PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<(), Error> {
     // §5.11.22 line 4: `intra_angle_info_y( )` per §5.11.42.
     write_intra_angle_info_y(writer, cdfs, angle_delta_y, mi_size, y_mode)?;
 
@@ -3589,6 +3690,162 @@ pub fn write_intra_block_mode_info_with_palette(
     )?;
 
     Ok(())
+}
+
+/// §5.11.7 `intra_frame_mode_info( )` `else` (non-intrabc) arm writer
+/// (av1-spec p.65) — r280. Composes, in spec order, the write side of:
+///
+/// ```text
+///   } else {
+///       is_inter = 0
+///       intra_frame_y_mode                                S()
+///       YMode = intra_frame_y_mode
+///       intra_angle_info_y( )
+///       if ( HasChroma ) {
+///           uv_mode                                       S()
+///           UVMode = uv_mode
+///           if ( UVMode == UV_CFL_PRED ) {
+///               read_cfl_alphas( )
+///           }
+///           intra_angle_info_uv( )
+///       }
+///       PaletteSizeY = 0
+///       PaletteSizeUV = 0
+///       if ( MiSize >= BLOCK_8X8 &&
+///              Block_Width[ MiSize ] <= 64 &&
+///              Block_Height[ MiSize ] <= 64 &&
+///              allow_screen_content_tools ) {
+///           palette_mode_info( )
+///       }
+///       filter_intra_mode_info( )
+///   }
+/// ```
+///
+/// This is the keyframe / intra-only-frame sibling of the §5.11.22
+/// [`write_intra_block_mode_info_with_palette`] dispatcher: the two
+/// spec bodies are identical from `intra_angle_info_y( )` onward
+/// (shared via the factored tail writer), and differ ONLY in the
+/// leading Y-mode element — §5.11.7 codes `intra_frame_y_mode`
+/// against `TileIntraFrameYModeCdf[ abovemode ][ leftmode ]` (the
+/// §8.3.2 neighbour-mode ctx pair) where §5.11.22 codes `y_mode`
+/// against `TileYModeCdf[ Size_Group[ MiSize ] ]`. The `is_inter = 0`
+/// assignment is a no-bit fixed value (the caller stamps the
+/// §5.11.5 `IsInters[][]` grid with `0` exactly as the reader does).
+///
+/// `abovemode_ctx` / `leftmode_ctx` are the §8.3.2 derivations
+/// (av1-spec p.361):
+///
+/// ```text
+///   abovemode = Intra_Mode_Context[ AvailU ? YModes[ MiRow - 1 ][ MiCol ] : DC_PRED ]
+///   leftmode  = Intra_Mode_Context[ AvailL ? YModes[ MiRow ][ MiCol - 1 ] : DC_PRED ]
+/// ```
+///
+/// computed by the caller from its own §5.11.5 `YModes[][]` grid via
+/// [`crate::cdf::intra_mode_ctx`] (per the stateless-writer doctrine
+/// of this module; the unavailable-neighbour identity is
+/// `intra_mode_ctx(DC_PRED) = 0`). Both MUST be in
+/// `0..INTRA_MODE_CONTEXTS = 5`.
+///
+/// Every other input maps 1:1 onto the
+/// [`write_intra_block_mode_info_with_palette`] parameter of the same
+/// name — including the §5.11.46 palette-entries surface and the
+/// §5.11.45 CFL alphas (`None`/`None` on the non-CFL chroma arm,
+/// `Some`/`Some` on the `uv_mode == UV_CFL_PRED` arm).
+///
+/// Mirrors
+/// [`crate::cdf::PartitionWalker::decode_intra_frame_mode_info_else_arm`]
+/// — on success the encoder has committed the full §5.11.7 `else`-arm
+/// body to the bit stream + advanced the §8.3 CDF adaptation state in
+/// lockstep with that reader. Caller-bug rejects
+/// ([`Error::PartitionWalkOutOfRange`]) are the
+/// [`write_intra_block_mode_info_with_palette`] set plus
+/// out-of-range `abovemode_ctx` / `leftmode_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_intra_frame_else_arm(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    mi_size: usize,
+    y_mode: u8,
+    uv_mode: Option<u8>,
+    angle_delta_y: i8,
+    angle_delta_uv: i8,
+    cfl_allowed: bool,
+    has_chroma: bool,
+    allow_screen_content_tools: bool,
+    enable_filter_intra: bool,
+    use_filter_intra: u8,
+    filter_intra_mode: Option<u8>,
+    above_palette_y: bool,
+    left_palette_y: bool,
+    bit_depth: u8,
+    has_palette_y: u8,
+    palette_size_y: usize,
+    palette_colors_y: &[u16],
+    has_palette_uv: u8,
+    palette_size_uv: usize,
+    palette_colors_u: &[u16],
+    palette_colors_v: &[u16],
+    delta_encode_v: bool,
+    cfl_alpha_u: Option<i8>,
+    cfl_alpha_v: Option<i8>,
+    walker: &PartitionWalker,
+    mi_row: u32,
+    mi_col: u32,
+    abovemode_ctx: usize,
+    leftmode_ctx: usize,
+) -> Result<(), Error> {
+    // §5.11.7 caller-bug guards (shared §5.11.22-shaped input
+    // contract), asserted before any partial S() write disturbs the
+    // bit stream. The ctx-pair bounds are re-checked inside the
+    // `write_intra_frame_y_mode` leaf before its write fires, so the
+    // whole guard set still precedes the first emitted symbol.
+    check_intra_mode_info_inputs(
+        mi_size,
+        y_mode,
+        uv_mode,
+        cfl_allowed,
+        has_chroma,
+        cfl_alpha_u,
+        cfl_alpha_v,
+    )?;
+
+    // §5.11.7: `intra_frame_y_mode S()` against
+    // `TileIntraFrameYModeCdf[ abovemode ][ leftmode ]` per §8.3.2.
+    write_intra_frame_y_mode(writer, cdfs, y_mode, abovemode_ctx, leftmode_ctx)?;
+
+    // §5.11.7 body from `intra_angle_info_y( )` onward — identical to
+    // the §5.11.22 tail element-for-element.
+    write_intra_mode_info_tail(
+        writer,
+        cdfs,
+        mi_size,
+        y_mode,
+        uv_mode,
+        angle_delta_y,
+        angle_delta_uv,
+        cfl_allowed,
+        has_chroma,
+        allow_screen_content_tools,
+        enable_filter_intra,
+        use_filter_intra,
+        filter_intra_mode,
+        above_palette_y,
+        left_palette_y,
+        bit_depth,
+        has_palette_y,
+        palette_size_y,
+        palette_colors_y,
+        has_palette_uv,
+        palette_size_uv,
+        palette_colors_u,
+        palette_colors_v,
+        delta_encode_v,
+        cfl_alpha_u,
+        cfl_alpha_v,
+        walker,
+        mi_row,
+        mi_col,
+    )
 }
 
 /// `inter_block_mode_info( )` bootstrap per §5.11.23 (av1-spec p.74)
@@ -13415,6 +13672,478 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // r280: §5.11.7 `else` (non-intrabc) arm — write_intra_frame_else_arm
+    // round-trips through decode_intra_frame_mode_info_else_arm.
+    // -----------------------------------------------------------------
+
+    /// Directional luma + chroma round-trip at the frame origin
+    /// (`AvailU = AvailL = false` ⇒ both §8.3.2 ctx values are the
+    /// `intra_mode_ctx(DC_PRED) = 0` identity): `YMode = V_PRED` with
+    /// `AngleDeltaY = +2`, `UVMode = V_PRED` with `AngleDeltaUV = -1`.
+    /// Exercises the `intra_frame_y_mode` S() (the element that
+    /// distinguishes §5.11.7 from §5.11.22) plus both §5.11.42/§5.11.43
+    /// angle reads, and asserts the `TileIntraFrameYModeCdf[0][0]`
+    /// adaptation rows match on both sides.
+    #[test]
+    fn write_intra_frame_else_arm_directional_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let cfl_allowed = cfl_allowed_for_uv_mode(false, BLOCK_16X16, false, false);
+        write_intra_frame_else_arm(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            V_PRED_U8,
+            Some(V_PRED_U8),
+            /* angle_delta_y = */ 2,
+            /* angle_delta_uv = */ -1,
+            cfl_allowed,
+            /* has_chroma = */ true,
+            /* allow_screen_content_tools = */ false,
+            /* enable_filter_intra = */ false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            0,
+            0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            None,
+            None,
+            &walker_w,
+            0,
+            0,
+            /* abovemode_ctx = */ 0,
+            /* leftmode_ctx = */ 0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_frame_mode_info_else_arm(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                /* lossless = */ false,
+                /* has_chroma = */ true,
+                /* allow_screen_content_tools = */ false,
+                /* enable_filter_intra = */ false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, V_PRED_U8);
+        assert_eq!(info.angle_delta_y, 2);
+        assert_eq!(info.uv_mode, Some(V_PRED_U8));
+        assert_eq!(info.angle_delta_uv, Some(-1));
+        assert_eq!(info.ref_frame, [0, -1], "§5.11.7 prefix RefFrame pair");
+        // §8.3 adaptation lockstep on the arm-distinguishing CDF row.
+        assert_eq!(
+            enc_cdfs.intra_frame_y_mode_cdf(0, 0).to_vec(),
+            dec_cdfs.intra_frame_y_mode_cdf(0, 0).to_vec(),
+            "TileIntraFrameYModeCdf[0][0] adaptation must match"
+        );
+    }
+
+    /// Two adjacent BLOCK_8X8 blocks sharing one stream + one decode
+    /// walker: block A at (0, 0) codes `V_PRED` with the (0, 0) ctx
+    /// identity; block B at (0, 2) has `AvailL = true` so the writer
+    /// passes `leftmode_ctx = intra_mode_ctx(V_PRED)` (mirroring its
+    /// own §5.11.5 `YModes[][]` bookkeeping) and the reader must
+    /// derive the same pair from the grid its block-A decode stamped.
+    /// A ctx mismatch desynchronises the arithmetic coder and fails
+    /// the block-B assertions.
+    #[test]
+    fn write_intra_frame_else_arm_neighbour_ctx_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let write_block = |writer: &mut SymbolWriter,
+                           cdfs: &mut TileCdfContext,
+                           y_mode: u8,
+                           mi_col: u32,
+                           leftmode_ctx: usize|
+         -> Result<(), Error> {
+            write_intra_frame_else_arm(
+                writer,
+                cdfs,
+                BLOCK_8X8,
+                y_mode,
+                /* uv_mode = */ None,
+                0,
+                0,
+                false,
+                /* has_chroma = */ false,
+                false,
+                false,
+                0,
+                None,
+                false,
+                false,
+                8,
+                0,
+                0,
+                &dummy,
+                0,
+                0,
+                &dummy,
+                &dummy,
+                false,
+                None,
+                None,
+                &walker_w,
+                0,
+                mi_col,
+                /* abovemode_ctx = */ 0,
+                leftmode_ctx,
+            )
+        };
+        // Block A at (0, 0): both neighbours unavailable.
+        write_block(&mut writer, &mut enc_cdfs, V_PRED_U8, 0, 0).unwrap();
+        // Block B at (0, 2): left neighbour is block A (`YMode =
+        // V_PRED`), above row is outside the tile.
+        write_block(
+            &mut writer,
+            &mut enc_cdfs,
+            DC_PRED_U8,
+            2,
+            intra_mode_ctx(V_PRED),
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let decode_block = |walker_r: &mut PartitionWalker,
+                            dec: &mut SymbolDecoder<'_>,
+                            dec_cdfs: &mut TileCdfContext,
+                            mi_col: u32| {
+            walker_r
+                .decode_intra_frame_mode_info_else_arm(
+                    dec, dec_cdfs, 0, mi_col, BLOCK_8X8, false, false, false, false, false, false,
+                    false, false, 8,
+                )
+                .unwrap()
+        };
+        let info_a = decode_block(&mut walker_r, &mut dec, &mut dec_cdfs, 0);
+        assert_eq!(info_a.y_mode, V_PRED_U8);
+        let info_b = decode_block(&mut walker_r, &mut dec, &mut dec_cdfs, 2);
+        assert_eq!(info_b.y_mode, DC_PRED_U8);
+        // Monochrome arm: no chroma fields decoded.
+        assert_eq!(info_b.uv_mode, None);
+        assert_eq!(info_b.angle_delta_uv, None);
+        // The block-B row is the one keyed by the stamped neighbour.
+        let ctx = intra_mode_ctx(V_PRED);
+        assert_eq!(
+            enc_cdfs.intra_frame_y_mode_cdf(0, ctx).to_vec(),
+            dec_cdfs.intra_frame_y_mode_cdf(0, ctx).to_vec(),
+            "neighbour-keyed TileIntraFrameYModeCdf row adaptation must match"
+        );
+    }
+
+    /// §5.11.45 CFL arm round-trip on the §5.11.7 composition:
+    /// `UVMode = UV_CFL_PRED` with `CflAlphaU = -2` / `CflAlphaV = +1`
+    /// (joint-sign slot `signU = NEG`, `signV = POS`).
+    #[test]
+    fn write_intra_frame_else_arm_cfl_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        let uv_cfl_pred: u8 = 13;
+        write_intra_frame_else_arm(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(uv_cfl_pred),
+            0,
+            0,
+            /* cfl_allowed = */ true,
+            /* has_chroma = */ true,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            8,
+            0,
+            0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            /* cfl_alpha_u = */ Some(-2),
+            /* cfl_alpha_v = */ Some(1),
+            &walker_w,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_frame_mode_info_else_arm(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.uv_mode, Some(uv_cfl_pred));
+        assert_eq!(info.cfl_alpha_u, Some(-2));
+        assert_eq!(info.cfl_alpha_v, Some(1));
+    }
+
+    /// §5.11.46 palette arm round-trip on the §5.11.7 composition:
+    /// `has_palette_y = 1` with the 2-entry `[0, 1]` fixture; the
+    /// §5.11.24 filter-intra gate must close mechanically
+    /// (`PaletteSizeY != 0`) even with `enable_filter_intra = true`.
+    #[test]
+    fn write_intra_frame_else_arm_palette_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let mut entries_y = [0u16; PALETTE_COLORS];
+        entries_y[0] = 0;
+        entries_y[1] = 1;
+        let dummy = [0u16; PALETTE_COLORS];
+        write_intra_frame_else_arm(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_16X16,
+            DC_PRED_U8,
+            Some(DC_PRED_U8),
+            0,
+            0,
+            /* cfl_allowed = */ true,
+            /* has_chroma = */ true,
+            /* allow_screen_content_tools = */ true,
+            /* enable_filter_intra = */ true,
+            0,
+            None,
+            false,
+            false,
+            8,
+            /* has_palette_y = */ 1,
+            2,
+            &entries_y,
+            /* has_palette_uv = */ 0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            None,
+            None,
+            &walker_w,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_frame_mode_info_else_arm(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_16X16,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.has_palette_y, Some(1));
+        assert_eq!(info.palette_size_y, Some(2));
+        let colors = info.palette_colors_y.expect("entries decoded");
+        assert_eq!(&colors[..2], &[0, 1]);
+        assert_eq!(info.has_palette_uv, Some(0));
+        assert_eq!(info.use_filter_intra, None, "§5.11.24 gate closed");
+        assert_eq!(info.filter_intra_mode, None);
+    }
+
+    /// Monochrome (`HasChroma = false`) + §5.11.24 filter-intra arm:
+    /// `use_filter_intra = 1` with `filter_intra_mode = 3`. The chroma
+    /// reads are skipped entirely (no `uv_mode` / CFL / UV-angle
+    /// symbols on the wire).
+    #[test]
+    fn write_intra_frame_else_arm_monochrome_filter_intra_round_trip() {
+        let walker_w = fresh_palette_walker();
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let dummy = [0u16; PALETTE_COLORS];
+        write_intra_frame_else_arm(
+            &mut writer,
+            &mut enc_cdfs,
+            BLOCK_8X8,
+            DC_PRED_U8,
+            None,
+            0,
+            0,
+            false,
+            /* has_chroma = */ false,
+            false,
+            /* enable_filter_intra = */ true,
+            /* use_filter_intra = */ 1,
+            /* filter_intra_mode = */ Some(3),
+            false,
+            false,
+            8,
+            0,
+            0,
+            &dummy,
+            0,
+            0,
+            &dummy,
+            &dummy,
+            false,
+            None,
+            None,
+            &walker_w,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let (mut walker_r, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let info = walker_r
+            .decode_intra_frame_mode_info_else_arm(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                BLOCK_8X8,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                8,
+            )
+            .unwrap();
+        assert_eq!(info.y_mode, DC_PRED_U8);
+        assert_eq!(info.uv_mode, None);
+        assert_eq!(info.use_filter_intra, Some(1));
+        assert_eq!(info.filter_intra_mode, Some(3));
+    }
+
+    /// Caller-bug battery: out-of-range `y_mode` (= INTRA_MODES),
+    /// out-of-range `abovemode_ctx` (= INTRA_MODE_CONTEXTS), and a
+    /// `Some` `uv_mode` on the monochrome arm. All three must surface
+    /// BEFORE any symbol write.
+    #[test]
+    fn write_intra_frame_else_arm_rejects_caller_bugs() {
+        let walker_w = fresh_palette_walker();
+        let dummy = [0u16; PALETTE_COLORS];
+        let run = |y_mode: u8, uv_mode: Option<u8>, has_chroma: bool, above_ctx: usize| {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_intra_frame_else_arm(
+                &mut writer,
+                &mut enc_cdfs,
+                BLOCK_16X16,
+                y_mode,
+                uv_mode,
+                0,
+                0,
+                true,
+                has_chroma,
+                false,
+                false,
+                0,
+                None,
+                false,
+                false,
+                8,
+                0,
+                0,
+                &dummy,
+                0,
+                0,
+                &dummy,
+                &dummy,
+                false,
+                None,
+                None,
+                &walker_w,
+                0,
+                0,
+                above_ctx,
+                0,
+            )
+            .unwrap_err()
+        };
+        // §3: y_mode must be < INTRA_MODES = 13.
+        assert!(matches!(
+            run(13, Some(DC_PRED_U8), true, 0),
+            Error::PartitionWalkOutOfRange
+        ));
+        // §8.3.2: ctx pair must be < INTRA_MODE_CONTEXTS = 5.
+        assert!(matches!(
+            run(DC_PRED_U8, Some(DC_PRED_U8), true, 5),
+            Error::PartitionWalkOutOfRange
+        ));
+        // §5.11.7 `if ( HasChroma )` guard: `Some` uv_mode on the
+        // monochrome arm is a caller bug.
+        assert!(matches!(
+            run(DC_PRED_U8, Some(DC_PRED_U8), false, 0),
+            Error::PartitionWalkOutOfRange
+        ));
     }
 
     // -----------------------------------------------------------------

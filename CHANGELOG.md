@@ -4,6 +4,41 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder+decoder r280 (2026-06-12): compose the §5.11.7
+  `intra_frame_mode_info( )` **`else` (non-intrabc) arm** on BOTH
+  sides (av1-spec p.65).
+  `encoder::block_mode_info::write_intra_frame_else_arm` — the
+  §5.11.7 body writer next to `write_intra_frame_intrabc_arm`: the
+  `intra_frame_y_mode` S() against
+  `TileIntraFrameYModeCdf[ abovemode ][ leftmode ]` (the §8.3.2
+  neighbour-mode ctx pair, caller-derived via `intra_mode_ctx` per
+  the stateless-writer doctrine), then the body shared
+  element-for-element with §5.11.22 — `intra_angle_info_y`, the
+  `HasChroma` arm (`uv_mode` + §5.11.45 `read_cfl_alphas` on
+  `UV_CFL_PRED` + `intra_angle_info_uv`), §5.11.46
+  `palette_mode_info` with entries, §5.11.24
+  `filter_intra_mode_info` — factored out of
+  `write_intra_block_mode_info_with_palette` into a shared tail
+  writer (plus a shared caller-bug guard block) so the two
+  dispatchers differ only in their leading Y-mode element.
+  `PartitionWalker::decode_intra_frame_mode_info_else_arm` — the
+  decode twin, obtained the same way: the §5.11.22 composite's
+  post-`y_mode` body moves verbatim into a shared
+  `decode_intra_mode_info_tail`, and the new §5.11.7 composite is
+  `decode_intra_frame_y_mode` (grid-stamping, ctx-deriving leaf) +
+  that tail, returning the same `DecodedIntraBlockModeInfo`
+  aggregate (its `ref_frame` carries the §5.11.7-prefix
+  `INTRA_FRAME`/`NONE` pair). The `is_inter = 0` fixed assignment is
+  no-bit on both sides. +6 tests: directional luma+chroma round-trip
+  with `TileIntraFrameYModeCdf[0][0]` adaptation equality;
+  two-adjacent-block round-trip where the writer's caller-tracked
+  `leftmode_ctx` must agree with the ctx the reader re-derives from
+  the grid its first decode stamped; CFL-arm round-trip
+  (`CflAlphaU = -2` / `CflAlphaV = +1`); §5.11.46 palette-entries
+  round-trip with the §5.11.24 gate mechanically closed; monochrome
+  + filter-intra round-trip; and the caller-bug battery
+  (out-of-range `y_mode`, out-of-range ctx, `Some` uv_mode on the
+  monochrome arm). Library test count 1916 → 1922.
 - encoder r279 (2026-06-11): compose the §5.11.7
   `intra_frame_mode_info( )` **`use_intrabc` arm write side**
   (av1-spec p.65). `encoder::block_mode_info::write_use_intrabc` —

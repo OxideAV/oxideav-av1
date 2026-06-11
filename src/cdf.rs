@@ -18173,7 +18173,8 @@ impl PartitionWalker {
     /// neighbour-mode-based one selected here. The §5.11.7 follow-on
     /// elements (`intra_angle_info_y`, `uv_mode`, `read_cfl_alphas`,
     /// `intra_angle_info_uv`, `palette_mode_info`,
-    /// `filter_intra_mode_info`) remain the next round's targets.
+    /// `filter_intra_mode_info`) are composed — together with this
+    /// leaf — by [`Self::decode_intra_frame_mode_info_else_arm`].
     ///
     /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
     /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
@@ -19027,10 +19028,6 @@ impl PartitionWalker {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
-        // §5.11.22 line 1: `RefFrame[ 0 ] = INTRA_FRAME, RefFrame[ 1 ]
-        // = NONE`. INTRA_FRAME = 0 per §6.10.1, NONE = -1 per §3.
-        let ref_frame: [i32; 2] = [0, -1];
-
         // §5.11.22 line 2: `y_mode S()`. The §8.3.2 selection is
         // `TileYModeCdf[ ctx = Size_Group[ MiSize ] ]`; the row is
         // `INTRA_MODES + 1 = 14` wide (13 symbol slots + the §8.2.6
@@ -19067,6 +19064,172 @@ impl PartitionWalker {
                 self.y_modes[(rr * self.mi_cols + cc) as usize] = y_mode;
             }
         }
+
+        // §5.11.22 lines 4-16: shared with the §5.11.7 `else` arm.
+        self.decode_intra_mode_info_tail(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            y_mode,
+            lossless,
+            has_chroma,
+            allow_screen_content_tools,
+            enable_filter_intra,
+            subsampling_x,
+            subsampling_y,
+            above_palette_y,
+            left_palette_y,
+            bit_depth,
+        )
+    }
+
+    /// `intra_frame_mode_info( )` `else` (non-intrabc) arm per §5.11.7
+    /// (av1-spec p.65) — r280. Reached when the §5.11.7
+    /// [`Self::decode_use_intrabc`] read (or its `allow_intrabc ==
+    /// false` fall-through) yields `use_intrabc == 0`:
+    ///
+    /// ```text
+    ///   } else {
+    ///       is_inter = 0
+    ///       intra_frame_y_mode                                S()
+    ///       YMode = intra_frame_y_mode
+    ///       intra_angle_info_y( )
+    ///       if ( HasChroma ) {
+    ///           uv_mode                                       S()
+    ///           UVMode = uv_mode
+    ///           if ( UVMode == UV_CFL_PRED ) {
+    ///               read_cfl_alphas( )
+    ///           }
+    ///           intra_angle_info_uv( )
+    ///       }
+    ///       PaletteSizeY = 0
+    ///       PaletteSizeUV = 0
+    ///       if ( MiSize >= BLOCK_8X8 &&
+    ///              Block_Width[ MiSize ] <= 64 &&
+    ///              Block_Height[ MiSize ] <= 64 &&
+    ///              allow_screen_content_tools ) {
+    ///           palette_mode_info( )
+    ///       }
+    ///       filter_intra_mode_info( )
+    ///   }
+    /// ```
+    ///
+    /// The body is identical to the §5.11.22
+    /// [`Self::decode_intra_block_mode_info`] composite from
+    /// `intra_angle_info_y( )` onward (same syntax elements, same CDF
+    /// rows — shared via the factored tail reader); the two differ
+    /// ONLY in the leading Y-mode element. §5.11.7 codes
+    /// `intra_frame_y_mode` against
+    /// `TileIntraFrameYModeCdf[ abovemode ][ leftmode ]` — the
+    /// §8.3.2 neighbour-mode ctx pair the [`Self::decode_intra_frame_y_mode`]
+    /// leaf derives from the walker's own `YModes[][]` grid — where
+    /// §5.11.22 codes `y_mode` against
+    /// `TileYModeCdf[ Size_Group[ MiSize ] ]`. The `is_inter = 0`
+    /// assignment is a no-bit fixed value (callers stamp the §5.11.5
+    /// `IsInters[][]` grid with `0`; the leaf's `YModes[][]` stamp
+    /// happens inside [`Self::decode_intra_frame_y_mode`]).
+    ///
+    /// Caller-passed arguments are exactly the
+    /// [`Self::decode_intra_block_mode_info`] set (see that method's
+    /// documentation for the per-argument §5.11.x semantics); the
+    /// returned [`DecodedIntraBlockModeInfo`] aggregate is likewise
+    /// shared (its `ref_frame` carries the §5.11.7-prefix
+    /// `RefFrame[ 0 ] = INTRA_FRAME` / `RefFrame[ 1 ] = NONE` pair,
+    /// which the prefix sets on both §5.11.7 arms before the
+    /// `use_intrabc` element).
+    ///
+    /// Mirrored by the encoder's
+    /// [`crate::encoder::block_mode_info::write_intra_frame_else_arm`].
+    /// Error surface matches [`Self::decode_intra_block_mode_info`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_intra_frame_mode_info_else_arm(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        lossless: bool,
+        has_chroma: bool,
+        allow_screen_content_tools: bool,
+        enable_filter_intra: bool,
+        subsampling_x: bool,
+        subsampling_y: bool,
+        above_palette_y: bool,
+        left_palette_y: bool,
+        bit_depth: u8,
+    ) -> Result<DecodedIntraBlockModeInfo, crate::Error> {
+        // §5.11.46 caller-bug guard on `bit_depth` (mirrors the
+        // §5.11.22 dispatcher: fail fast BEFORE the first S() read so
+        // the bit stream stays untouched on a caller bug). The
+        // `sub_size` / `mi_row` / `mi_col` bounds are guarded inside
+        // [`Self::decode_intra_frame_y_mode`] before its read fires.
+        if !matches!(bit_depth, 8 | 10 | 12) {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.7: `intra_frame_y_mode S()` — the leaf derives the
+        // §8.3.2 `abovemode` / `leftmode` ctx pair from the walker's
+        // `YModes[][]` grid + tile geometry and stamps the decoded
+        // `YMode` over the block's footprint.
+        let y_mode = self.decode_intra_frame_y_mode(decoder, cdfs, mi_row, mi_col, sub_size)?;
+
+        // §5.11.7 body from `intra_angle_info_y( )` onward — identical
+        // to the §5.11.22 tail element-for-element.
+        self.decode_intra_mode_info_tail(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            y_mode,
+            lossless,
+            has_chroma,
+            allow_screen_content_tools,
+            enable_filter_intra,
+            subsampling_x,
+            subsampling_y,
+            above_palette_y,
+            left_palette_y,
+            bit_depth,
+        )
+    }
+
+    /// Shared §5.11.22 / §5.11.7-`else`-arm tail reader — everything
+    /// after the per-arm Y-mode S() (`y_mode` with the
+    /// `Size_Group[ MiSize ]` ctx on §5.11.22, `intra_frame_y_mode`
+    /// with the §8.3.2 neighbour-mode ctx pair on §5.11.7). Both spec
+    /// bodies continue identically from `intra_angle_info_y( )`
+    /// onward, so the tail is factored once and called by both
+    /// composites. The caller has already decoded `y_mode`, stamped
+    /// the `YModes[][]` grid, and validated `sub_size` / `mi_row` /
+    /// `mi_col` / `bit_depth`.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_intra_mode_info_tail(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        y_mode: u8,
+        lossless: bool,
+        has_chroma: bool,
+        allow_screen_content_tools: bool,
+        enable_filter_intra: bool,
+        subsampling_x: bool,
+        subsampling_y: bool,
+        above_palette_y: bool,
+        left_palette_y: bool,
+        bit_depth: u8,
+    ) -> Result<DecodedIntraBlockModeInfo, crate::Error> {
+        // §5.11.22 line 1 / §5.11.7 prefix: `RefFrame[ 0 ] =
+        // INTRA_FRAME, RefFrame[ 1 ] = NONE`. INTRA_FRAME = 0 per
+        // §6.10.1, NONE = -1 per §3. Both composites stamp the same
+        // pair, so the assignment lives in the shared tail.
+        let ref_frame: [i32; 2] = [0, -1];
 
         // §5.11.22 line 4: `intra_angle_info_y( )` per §5.11.42.
         // Short-circuits to `AngleDeltaY = 0` when `MiSize < BLOCK_8X8`

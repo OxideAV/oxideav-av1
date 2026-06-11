@@ -2,6 +2,62 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-12 (round 280)
+
+Round 280 composes the **§5.11.7 `intra_frame_mode_info( )` `else`
+(non-intrabc) arm** on BOTH sides — the keyframe / intra-only-frame
+per-block intra-mode body, which is identical to the §5.11.22
+`intra_block_mode_info( )` body from `intra_angle_info_y( )` onward
+and differs only in the leading Y-mode element:
+
+* `encoder::block_mode_info::write_intra_frame_else_arm` (av1-spec
+  p.65) — the `intra_frame_y_mode` S() against
+  `TileIntraFrameYModeCdf[ abovemode ][ leftmode ]` (the §8.3.2
+  neighbour-mode ctx pair, caller-derived via `intra_mode_ctx` per
+  the stateless-writer doctrine; §5.11.22 instead codes `y_mode`
+  against `TileYModeCdf[ Size_Group[ MiSize ] ]`), then the shared
+  tail — `intra_angle_info_y`, the `HasChroma` arm (`uv_mode` +
+  §5.11.45 `read_cfl_alphas` on `UV_CFL_PRED` + `intra_angle_info_uv`),
+  §5.11.46 `palette_mode_info` with entries, §5.11.24
+  `filter_intra_mode_info` — factored out of
+  `write_intra_block_mode_info_with_palette` (plus a shared
+  caller-bug guard block) so the two dispatchers stay in lockstep by
+  construction. The `is_inter = 0` fixed assignment is no-bit on
+  both sides.
+* `PartitionWalker::decode_intra_frame_mode_info_else_arm` — the
+  decode twin: the §5.11.22 composite's post-`y_mode` body moves
+  verbatim into a shared `decode_intra_mode_info_tail`, and the new
+  §5.11.7 composite is the `decode_intra_frame_y_mode` leaf
+  (grid-stamping, ctx-deriving) + that tail, returning the same
+  `DecodedIntraBlockModeInfo` aggregate. This closes the previously
+  documented walker gap where the §5.11.7 follow-on body
+  (`intra_angle_info_y` … `filter_intra_mode_info`) had no reader
+  composition.
+
++6 tests: directional luma+chroma round-trip with
+`TileIntraFrameYModeCdf[0][0]` adaptation equality; a
+two-adjacent-block round-trip where the writer's caller-tracked
+`leftmode_ctx` must agree with the ctx the reader re-derives from the
+`YModes[][]` grid its first decode stamped (a mismatch desyncs the
+arithmetic coder); the CFL arm (`CflAlphaU = -2` / `CflAlphaV = +1`);
+the §5.11.46 palette-entries arm with the §5.11.24 gate mechanically
+closed; monochrome + filter-intra; and the caller-bug battery
+(out-of-range `y_mode`, out-of-range ctx, `Some` uv_mode on the
+monochrome arm). Full library test count moves to 1922 (was 1916).
+
+### Pending follow-ups for round 281+
+
+* Thread the full §5.11.7 composition (prefix → `use_intrabc`
+  dispatch → intrabc arm / `else` arm) into `decode_block_syntax`
+  (whose intra path still stops after `intra_frame_y_mode`) and into
+  the partition-tree block writer on the encoder side.
+* Wiring `write_inter_block_mode_info` into a frame-level inter encode
+  driver (the §5.11.18 `inter_frame_mode_info` prefix writer exists;
+  the partition/pixel drivers are intra-only so far), including the
+  walker-side grid stamping the tail's neighbour scalars come from.
+
+---
+
 ## Status — 2026-06-11 (round 279)
 
 Round 279 composes the **§5.11.7 `intra_frame_mode_info( )`
