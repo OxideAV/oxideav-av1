@@ -266,8 +266,10 @@ pub mod transform_tree;
 
 pub use bitwriter::BitWriter;
 pub use block_mode_info::{
-    write_inter_block_mode_info, write_inter_block_mode_info_bootstrap, write_intra_frame_y_mode,
-    write_intra_segment_id, write_intra_uv_mode, write_skip, write_y_mode,
+    write_inter_block_mode_info, write_inter_block_mode_info_bootstrap,
+    write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
+    write_intra_uv_mode, write_skip, write_use_intrabc, write_y_mode, IntrabcArmInputs,
+    IntrabcBlockInfo,
 };
 pub use coefficients::{
     write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,

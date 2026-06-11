@@ -57,7 +57,7 @@ use crate::cdf::{
     BLOCK_32X32, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE,
     CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE,
     COMPOUND_INTRA, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES, COMPOUND_WEDGE,
-    COMP_INTER_CONTEXTS, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, EIGHTTAP,
+    COMP_INTER_CONTEXTS, DC_PRED, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, EIGHTTAP,
     FRAME_LF_COUNT, GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_NONE,
     INTRABC_DELAY_PIXELS, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
     MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MI_SIZE, MODE_GLOBALMV,
@@ -5358,6 +5358,210 @@ pub fn assign_mv_pred_mv_intrabc(
         }
     }
     Ok(pred_mv)
+}
+
+/// `use_intrabc` S() inverse per §5.11.7 (av1-spec p.65) — r279. The
+/// exact encode-side twin of
+/// [`crate::cdf::PartitionWalker::decode_use_intrabc`].
+///
+/// Spec body (av1-spec p.65):
+/// ```text
+///   if ( allow_intrabc ) {
+///       use_intrabc                                          S()
+///   } else {
+///       use_intrabc = 0
+///   }
+/// ```
+///
+/// * When `allow_intrabc == true`: emits one §8.2.6 `S()` over
+///   `TileIntrabcCdf` (the §8.3.2 selection is contextless — "the cdf
+///   for use_intrabc is given by TileIntrabcCdf", no `[ctx]`
+///   subscript).
+/// * When `allow_intrabc == false`: the reader's fall-through assigns
+///   `use_intrabc = 0` with no bit consumed, so no symbol is emitted.
+///   `use_intrabc` MUST be `0` — caller bug otherwise
+///   ([`Error::PartitionWalkOutOfRange`]), as the reader could never
+///   reconstruct a `1`.
+///
+/// `allow_intrabc` is the §5.9.20 frame-header bit (itself reachable
+/// only on intra frames whose §5.9.5 `allow_screen_content_tools` is
+/// set); `use_intrabc` is the §3 binary alphabet value (`> 1` is
+/// rejected as a caller bug).
+pub fn write_use_intrabc(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    use_intrabc: u8,
+    allow_intrabc: bool,
+) -> Result<(), Error> {
+    if use_intrabc > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if allow_intrabc {
+        let row = cdfs.intrabc_cdf();
+        writer.write_symbol(u32::from(use_intrabc), row)?;
+    } else if use_intrabc != 0 {
+        // §5.11.7 fall-through arm: the reader forces `use_intrabc = 0`
+        // without a bit read; a `1` is unreachable.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    Ok(())
+}
+
+/// Per-list inputs to the §5.11.7 `use_intrabc` arm of
+/// [`write_intra_frame_intrabc_arm`] — the target block vector plus the
+/// §7.10.2 `find_mv_stack( 0 )` outputs and tile/superblock scalars the
+/// §5.11.26 intrabc `PredMv` derivation
+/// ([`assign_mv_pred_mv_intrabc`]) consumes.
+#[derive(Debug, Clone, Copy)]
+pub struct IntrabcArmInputs<'a> {
+    /// The target `Mv[ 0 ]` as `[ row, col ]` in 1/8-luma-sample
+    /// units. Intra block copy is integer-only, so each component's
+    /// difference against the derived `PredMv[ 0 ]` must be a multiple
+    /// of 8 (rejected by the §5.11.32 component writer otherwise).
+    pub mv: [i32; 2],
+    /// §7.10.2 `find_mv_stack( 0 )` outputs (`RefStackMv` slots 0/1 are
+    /// the only fields the intrabc arm reads; the §7.10.2.12
+    /// single-pred tail guarantees both are written).
+    pub mv_stack: &'a FindMvStackResult,
+    /// §5.5.2 sequence-header `use_128x128_superblock` bit (selects
+    /// `sbSize4` in the §5.11.26 zero-MV fallback).
+    pub use_128x128_superblock: bool,
+    /// The block's `MiRow`.
+    pub mi_row: u32,
+    /// The enclosing tile's `MiRowStart` (§6.10.4).
+    pub mi_row_start: u32,
+}
+
+/// Fixed §5.11.7 `use_intrabc`-arm assignments (av1-spec p.65) — the
+/// no-bit mode-info state [`write_intra_frame_intrabc_arm`] returns so
+/// the caller can stamp the §5.11.5 neighbour grids exactly as the
+/// reader would:
+///
+/// ```text
+///   is_inter = 1
+///   YMode = DC_PRED
+///   UVMode = DC_PRED
+///   motion_mode = SIMPLE
+///   compound_type = COMPOUND_AVERAGE
+///   PaletteSizeY = 0
+///   PaletteSizeUV = 0
+///   interp_filter[ 0 ] = BILINEAR
+///   interp_filter[ 1 ] = BILINEAR
+/// ```
+///
+/// (`RefFrame[ 0 ] = INTRA_FRAME` / `RefFrame[ 1 ] = NONE` are set by
+/// the §5.11.7 body *before* the `use_intrabc` read, on both arms, so
+/// they are not part of this readout.) `mv` / `pred_mv` carry the
+/// coded `Mv[ 0 ]` and the §5.11.26-derived `PredMv[ 0 ]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntrabcBlockInfo {
+    /// §5.11.7 `is_inter = 1`.
+    pub is_inter: u8,
+    /// §5.11.7 `YMode = DC_PRED`.
+    pub y_mode: u8,
+    /// §5.11.7 `UVMode = DC_PRED`.
+    pub uv_mode: u8,
+    /// §5.11.7 `motion_mode = SIMPLE`.
+    pub motion_mode: u8,
+    /// §5.11.7 `compound_type = COMPOUND_AVERAGE`.
+    pub compound_type: u8,
+    /// §5.11.7 `PaletteSizeY = 0`.
+    pub palette_size_y: u8,
+    /// §5.11.7 `PaletteSizeUV = 0`.
+    pub palette_size_uv: u8,
+    /// §5.11.7 `interp_filter[ 0..2 ] = BILINEAR`.
+    pub interp_filter: [u8; 2],
+    /// The coded `Mv[ 0 ]` (`[ row, col ]`, 1/8-luma-sample units).
+    pub mv: [i32; 2],
+    /// The §5.11.26 `PredMv[ 0 ]` the MV difference was coded against.
+    pub pred_mv: [i32; 2],
+}
+
+/// §5.11.7 `use_intrabc` region writer (av1-spec p.65) — r279.
+/// Composes, in spec order, the write side of:
+///
+/// ```text
+///   if ( allow_intrabc ) {
+///       use_intrabc                                          S()
+///   } else {
+///       use_intrabc = 0
+///   }
+///   if ( use_intrabc ) {
+///       is_inter = 1
+///       YMode = DC_PRED
+///       UVMode = DC_PRED
+///       motion_mode = SIMPLE
+///       compound_type = COMPOUND_AVERAGE
+///       PaletteSizeY = 0
+///       PaletteSizeUV = 0
+///       interp_filter[ 0 ] = BILINEAR
+///       interp_filter[ 1 ] = BILINEAR
+///       find_mv_stack( 0 )
+///       assign_mv( 0 )
+///   }
+/// ```
+///
+/// `use_intrabc` is derived from `intrabc.is_some()` and emitted via
+/// [`write_use_intrabc`]. On the `Some` arm the §5.11.26
+/// `assign_mv( 0 )` body forces `compMode = NEWMV`, so an MV
+/// difference is *always* coded: `PredMv[ 0 ]` is derived via
+/// [`assign_mv_pred_mv_intrabc`] from the caller-supplied §7.10.2
+/// `find_mv_stack( 0 )` outputs, then [`write_read_mv`] emits the
+/// difference under the intra-block-copy MV regime (`MvCtx =
+/// MV_INTRABC_CONTEXT`, `force_integer_mv = 1` — §5.9.2 forces it on
+/// every intra frame, and `allow_intrabc` requires an intra frame —
+/// hence `allow_high_precision_mv = 0`).
+///
+/// Returns `Some(IntrabcBlockInfo)` carrying the arm's fixed no-bit
+/// assignments (for §5.11.5 grid stamping) when the intrabc arm fired,
+/// `None` when `use_intrabc == 0` (the caller continues with the
+/// §5.11.7 `else` arm — `intra_frame_y_mode` etc.).
+///
+/// Caller-bug rejects ([`Error::PartitionWalkOutOfRange`]):
+/// * `intrabc.is_some()` with `allow_intrabc == false` (the reader's
+///   fall-through forces `use_intrabc = 0`).
+/// * `mi_row < mi_row_start` (via [`assign_mv_pred_mv_intrabc`]).
+/// * An `mv` whose difference against the derived predictor is not
+///   integer-aligned (via the §5.11.32 component writer's
+///   `force_integer_mv` check).
+pub fn write_intra_frame_intrabc_arm(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    allow_intrabc: bool,
+    intrabc: Option<&IntrabcArmInputs<'_>>,
+) -> Result<Option<IntrabcBlockInfo>, Error> {
+    let use_intrabc = u8::from(intrabc.is_some());
+    write_use_intrabc(writer, cdfs, use_intrabc, allow_intrabc)?;
+    let Some(inputs) = intrabc else {
+        return Ok(None);
+    };
+
+    // §5.11.26 `assign_mv( 0 )` intrabc arm: `compMode = NEWMV` (forced),
+    // so `read_mv( 0 )` always fires — derive `PredMv[ 0 ]` and emit
+    // the difference.
+    let pred_mv = assign_mv_pred_mv_intrabc(
+        inputs.mv_stack,
+        inputs.use_128x128_superblock,
+        inputs.mi_row,
+        inputs.mi_row_start,
+    )?;
+    write_read_mv(
+        writer, cdfs, inputs.mv, pred_mv, /* use_intrabc = */ true,
+        /* force_integer_mv = */ true, /* allow_high_precision_mv = */ false,
+    )?;
+
+    Ok(Some(IntrabcBlockInfo {
+        is_inter: 1,
+        y_mode: DC_PRED as u8,
+        uv_mode: DC_PRED as u8,
+        motion_mode: MOTION_MODE_SIMPLE,
+        compound_type: COMPOUND_AVERAGE,
+        palette_size_y: 0,
+        palette_size_uv: 0,
+        interp_filter: [BILINEAR, BILINEAR],
+        mv: inputs.mv,
+        pred_mv,
+    }))
 }
 
 /// §5.11.23 tail inputs for [`write_inter_block_mode_info`] — r277.
@@ -16175,6 +16379,243 @@ mod tests {
                 dec_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT)
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §5.11.7 use_intrabc — write_use_intrabc round-trips through
+    // PartitionWalker::decode_use_intrabc; write_intra_frame_intrabc_arm
+    // composes the full §5.11.7 intrabc arm (r279).
+    // -----------------------------------------------------------------
+
+    /// `write_use_intrabc` round-trips both values through the decode
+    /// twin with §8.3 CDF adaptation in lockstep.
+    #[test]
+    fn write_use_intrabc_round_trips_through_decode_twin() {
+        for target in [0u8, 1u8] {
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            write_use_intrabc(&mut writer, &mut enc_cdfs, target, true).unwrap();
+            let bytes = writer.finish();
+
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let got = walker
+                .decode_use_intrabc(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_8X8, true)
+                .unwrap();
+            assert_eq!(got, target, "use_intrabc = {target} round-trips");
+            // The contextless TileIntrabcCdf row adapted identically.
+            assert_eq!(enc_cdfs.intrabc_cdf(), dec_cdfs.intrabc_cdf());
+        }
+    }
+
+    /// §5.11.7 fall-through arm (`allow_intrabc == 0`): no bits, the
+    /// reader forces `use_intrabc = 0` — a `1` is a caller bug, as is
+    /// any value outside the §3 binary alphabet.
+    #[test]
+    fn write_use_intrabc_fall_through_no_bits_and_rejects() {
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        write_use_intrabc(&mut writer, &mut cdfs, 0, false).unwrap();
+        assert_eq!(
+            writer.finish(),
+            SymbolWriter::new(false).finish(),
+            "fall-through arm emits no bits"
+        );
+        // The CDF row must be untouched on the no-bit arm.
+        assert_eq!(
+            cdfs.intrabc_cdf(),
+            TileCdfContext::new_from_defaults().intrabc_cdf()
+        );
+
+        let mut writer = SymbolWriter::new(false);
+        assert!(matches!(
+            write_use_intrabc(&mut writer, &mut cdfs, 1, false).unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+        for allow in [false, true] {
+            let mut writer = SymbolWriter::new(false);
+            assert!(matches!(
+                write_use_intrabc(&mut writer, &mut cdfs, 2, allow).unwrap_err(),
+                Error::PartitionWalkOutOfRange
+            ));
+        }
+    }
+
+    /// Full §5.11.7 intrabc-arm composition: `use_intrabc` S() +
+    /// §5.11.26 `assign_mv( 0 )` (forced-NEWMV `read_mv`) round-trip
+    /// through `decode_use_intrabc` + a §5.11.31 reader mirror sharing
+    /// one decoder, on both the slot-0 predictor and the zero-stack
+    /// top-row fallback. The returned readout carries the spec's fixed
+    /// no-bit assignments.
+    #[test]
+    fn write_intra_frame_intrabc_arm_round_trips() {
+        for (stack, mi_row, target_mv) in [
+            // Slot-0 predictor [-64, 8]; integer-aligned diff (+16, -48).
+            (mk_intrabc_mv_stack([-64, 8], [0, 0], 2), 16u32, [-48, -40]),
+            // Zero stack ⇒ top-row fallback predictor [0, -2560].
+            (
+                mk_intrabc_mv_stack([0, 0], [0, 0], 0),
+                0u32,
+                [0, -2560 + 64],
+            ),
+        ] {
+            let inputs = IntrabcArmInputs {
+                mv: target_mv,
+                mv_stack: &stack,
+                use_128x128_superblock: false,
+                mi_row,
+                mi_row_start: 0,
+            };
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            let mut writer = SymbolWriter::new(false);
+            let info =
+                write_intra_frame_intrabc_arm(&mut writer, &mut enc_cdfs, true, Some(&inputs))
+                    .unwrap()
+                    .expect("intrabc arm fired");
+            let bytes = writer.finish();
+
+            // §5.11.7 fixed assignments surface in the readout.
+            let want_pred = assign_mv_pred_mv_intrabc(&stack, false, mi_row, 0).unwrap();
+            assert_eq!(
+                info,
+                IntrabcBlockInfo {
+                    is_inter: 1,
+                    y_mode: DC_PRED_U8,
+                    uv_mode: DC_PRED_U8,
+                    motion_mode: MOTION_MODE_SIMPLE,
+                    compound_type: COMPOUND_AVERAGE,
+                    palette_size_y: 0,
+                    palette_size_uv: 0,
+                    interp_filter: [BILINEAR, BILINEAR],
+                    mv: target_mv,
+                    pred_mv: want_pred,
+                }
+            );
+
+            // Reader side: decode_use_intrabc + the §5.11.31 read_mv
+            // mirror from the same live decoder.
+            let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let use_intrabc = walker
+                .decode_use_intrabc(&mut dec, &mut dec_cdfs, mi_row, 0, BLOCK_16X16, true)
+                .unwrap();
+            assert_eq!(use_intrabc, 1);
+            let mv_joint = dec
+                .read_symbol(dec_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT))
+                .unwrap() as u8;
+            let mut diff = [0i32; 2];
+            if mv_joint == MV_JOINT_HZVNZ || mv_joint == MV_JOINT_HNZVNZ {
+                diff[0] = decode_read_mv_component_mirror(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    MV_INTRABC_CONTEXT,
+                    0,
+                    true,
+                    false,
+                );
+            }
+            if mv_joint == MV_JOINT_HNZVZ || mv_joint == MV_JOINT_HNZVNZ {
+                diff[1] = decode_read_mv_component_mirror(
+                    &mut dec,
+                    &mut dec_cdfs,
+                    MV_INTRABC_CONTEXT,
+                    1,
+                    true,
+                    false,
+                );
+            }
+            let recovered = [want_pred[0] + diff[0], want_pred[1] + diff[1]];
+            assert_eq!(recovered, target_mv, "intrabc Mv reconstructs");
+            // Both adapted rows stepped identically.
+            assert_eq!(enc_cdfs.intrabc_cdf(), dec_cdfs.intrabc_cdf());
+            assert_eq!(
+                enc_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT),
+                dec_cdfs.mv_joint_cdf(MV_INTRABC_CONTEXT)
+            );
+        }
+    }
+
+    /// `intrabc = None`: a single `use_intrabc = 0` S() (byte-equal to
+    /// the leaf) when allowed, no bits on the fall-through arm —
+    /// `None` returned either way so the caller proceeds to the
+    /// §5.11.7 `else` (intra) arm.
+    #[test]
+    fn write_intra_frame_intrabc_arm_none_matches_leaf() {
+        // allow_intrabc = true: one S() carrying 0.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let info = write_intra_frame_intrabc_arm(&mut writer, &mut cdfs, true, None).unwrap();
+        assert!(info.is_none());
+        let bytes = writer.finish();
+
+        let mut leaf_cdfs = TileCdfContext::new_from_defaults();
+        let mut leaf_writer = SymbolWriter::new(false);
+        write_use_intrabc(&mut leaf_writer, &mut leaf_cdfs, 0, true).unwrap();
+        assert_eq!(bytes, leaf_writer.finish(), "byte-equal to the leaf");
+
+        let (mut walker, mut dec_cdfs) = fresh_walker_and_cdfs();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let got = walker
+            .decode_use_intrabc(&mut dec, &mut dec_cdfs, 0, 0, BLOCK_8X8, true)
+            .unwrap();
+        assert_eq!(got, 0);
+
+        // allow_intrabc = false: no bits at all.
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        let info = write_intra_frame_intrabc_arm(&mut writer, &mut cdfs, false, None).unwrap();
+        assert!(info.is_none());
+        assert_eq!(writer.finish(), SymbolWriter::new(false).finish());
+    }
+
+    /// Caller-bug rejects: an intrabc block on a frame whose header
+    /// never allowed it, a block above its own tile, and a target MV
+    /// whose difference is not integer-aligned (intra block copy is
+    /// integer-only per §5.11.32).
+    #[test]
+    fn write_intra_frame_intrabc_arm_rejects() {
+        let stack = mk_intrabc_mv_stack([-64, 8], [0, 0], 2);
+        let inputs = IntrabcArmInputs {
+            mv: [-48, -40],
+            mv_stack: &stack,
+            use_128x128_superblock: false,
+            mi_row: 16,
+            mi_row_start: 0,
+        };
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut writer = SymbolWriter::new(false);
+        assert!(matches!(
+            write_intra_frame_intrabc_arm(&mut writer, &mut cdfs, false, Some(&inputs))
+                .unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+
+        // mi_row above the tile's MiRowStart — propagated from the
+        // §5.11.26 predictor derivation.
+        let above_tile = IntrabcArmInputs {
+            mi_row: 31,
+            mi_row_start: 32,
+            ..inputs
+        };
+        let mut writer = SymbolWriter::new(false);
+        assert!(matches!(
+            write_intra_frame_intrabc_arm(&mut writer, &mut cdfs, true, Some(&above_tile))
+                .unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
+
+        // Non-integer-aligned difference (diff col = +4, not a multiple
+        // of 8) — propagated from the §5.11.32 component writer.
+        let fractional = IntrabcArmInputs {
+            mv: [-64, 12],
+            ..inputs
+        };
+        let mut writer = SymbolWriter::new(false);
+        assert!(matches!(
+            write_intra_frame_intrabc_arm(&mut writer, &mut cdfs, true, Some(&fractional))
+                .unwrap_err(),
+            Error::PartitionWalkOutOfRange
+        ));
     }
 
     // -----------------------------------------------------------------

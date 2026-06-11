@@ -2,6 +2,68 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-11 (round 279)
+
+Round 279 composes the **§5.11.7 `intra_frame_mode_info( )`
+`use_intrabc` arm write side** — the encode-side path that turns a
+key-frame block into an intra-block-copy block:
+
+* `encoder::block_mode_info::write_use_intrabc` (av1-spec p.65) — the
+  `use_intrabc` S() leaf, exact inverse of
+  `PartitionWalker::decode_use_intrabc`: one contextless S() against
+  `TileIntrabcCdf` when the §5.9.20 frame-header `allow_intrabc` bit
+  is set, the no-bit fall-through (`use_intrabc = 0` forced) when it
+  is not — a `1` on the fall-through arm is rejected as a caller bug,
+  as the reader could never reconstruct it.
+* `encoder::block_mode_info::write_intra_frame_intrabc_arm` — the
+  §5.11.7 region composition: `use_intrabc` S() (derived from the
+  `Option<&IntrabcArmInputs>` arm selector), then on the intrabc arm
+  the §5.11.26 `assign_mv( 0 )` write side — `compMode` forced to
+  `NEWMV`, `PredMv[ 0 ]` derived via the r278
+  `assign_mv_pred_mv_intrabc` three-stage fallback chain from the
+  caller-supplied §7.10.2 `find_mv_stack( 0 )` outputs, and
+  `write_read_mv` emitting the MV difference under the
+  intra-block-copy regime (`MvCtx = MV_INTRABC_CONTEXT`,
+  `force_integer_mv = 1` — §5.9.2 forces it on every intra frame and
+  `allow_intrabc` requires one — hence no high precision). The arm's
+  fixed no-bit assignments (`is_inter = 1`, `YMode = UVMode =
+  DC_PRED`, `motion_mode = SIMPLE`, `compound_type =
+  COMPOUND_AVERAGE`, `PaletteSizeY = PaletteSizeUV = 0`,
+  `interp_filter[ 0..2 ] = BILINEAR`) come back in the new
+  `IntrabcBlockInfo` readout so the caller can stamp the §5.11.5
+  neighbour grids exactly as the reader would; `None` is returned on
+  the `use_intrabc = 0` arm (the caller continues with the §5.11.7
+  `else` arm — `intra_frame_y_mode` etc.).
+
++5 tests: the leaf round-trips both values through the decode twin
+with `TileIntrabcCdf` adaptation equality; the fall-through arm's
+no-bit byte-equality + untouched-CDF assert + reject battery; the
+full composition round-trip through `decode_use_intrabc` + a §5.11.31
+reader mirror sharing one live decoder on both the slot-0 predictor
+and the zero-stack top-row fallback (fixed-assignment readout
+asserted field-for-field, both adapted rows compared); the `None` arm
+byte-equal to the leaf on both `allow_intrabc` values; and the
+three-way reject battery (intrabc-on-disallowing-frame, above-tile
+row, non-integer-aligned MV difference). Full library test count
+moves to 1916 (was 1911).
+
+### Pending follow-ups for round 280+
+
+* The §5.11.7 `else` (non-intrabc) arm composition — fold
+  `intra_frame_y_mode` + `intra_angle_info_y` + the `HasChroma` arm +
+  `palette_mode_info` + `filter_intra_mode_info` (all leaves landed)
+  into a single §5.11.7 body writer next to
+  `write_intra_frame_intrabc_arm`, then thread both arms plus the
+  prefix (`read_skip` / `intra_segment_id` / `read_cdef` /
+  `read_delta_qindex` / `read_delta_lf`) into the partition-tree
+  block writer.
+* Wiring `write_inter_block_mode_info` into a frame-level inter encode
+  driver (the §5.11.18 `inter_frame_mode_info` prefix writer exists;
+  the partition/pixel drivers are intra-only so far), including the
+  walker-side grid stamping the tail's neighbour scalars come from.
+
+---
+
 ## Status — 2026-06-11 (round 278)
 
 Round 278 lands the **§5.11.26 `assign_mv` intra-block-copy `PredMv`

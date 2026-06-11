@@ -4,6 +4,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r279 (2026-06-11): compose the §5.11.7
+  `intra_frame_mode_info( )` **`use_intrabc` arm write side**
+  (av1-spec p.65). `encoder::block_mode_info::write_use_intrabc` —
+  the `use_intrabc` S() leaf, exact inverse of
+  `PartitionWalker::decode_use_intrabc`: one contextless S() against
+  `TileIntrabcCdf` when the §5.9.20 `allow_intrabc` frame-header bit
+  is set, the no-bit fall-through (`use_intrabc = 0` forced) when it
+  is not (a `1` there is rejected — the reader could never
+  reconstruct it). `encoder::block_mode_info::write_intra_frame_intrabc_arm`
+  — the §5.11.7 region composition: the `use_intrabc` S() (arm
+  selected by `Option<&IntrabcArmInputs>`), then on the intrabc arm
+  the §5.11.26 `assign_mv( 0 )` write side — `compMode` forced to
+  `NEWMV`, `PredMv[ 0 ]` via the r278 `assign_mv_pred_mv_intrabc`
+  fallback chain from the caller-supplied §7.10.2
+  `find_mv_stack( 0 )` outputs, and `write_read_mv` under the
+  intra-block-copy regime (`MvCtx = MV_INTRABC_CONTEXT`,
+  `force_integer_mv = 1` per the §5.9.2 intra-frame force, no high
+  precision). The arm's fixed no-bit assignments (`is_inter = 1`,
+  `YMode = UVMode = DC_PRED`, `motion_mode = SIMPLE`,
+  `compound_type = COMPOUND_AVERAGE`, `PaletteSizeY = PaletteSizeUV
+  = 0`, `interp_filter[ 0..2 ] = BILINEAR`) are returned in the new
+  `IntrabcBlockInfo` readout for §5.11.5 grid stamping; the
+  `use_intrabc = 0` arm returns `None` and hands control back to the
+  §5.11.7 `else` (intra) path. +5 tests: leaf round-trip through the
+  decode twin (both values, `TileIntrabcCdf` adaptation equality),
+  fall-through no-bit byte-equality + untouched-CDF + reject battery,
+  composed-arm round-trip through `decode_use_intrabc` + a §5.11.31
+  reader mirror on one live decoder (slot-0 predictor and zero-stack
+  top-row fallback, readout asserted field-for-field), `None`-arm
+  byte-equality with the leaf on both `allow_intrabc` values, and the
+  three-way reject battery (intrabc-on-disallowing-frame, above-tile
+  row, non-integer-aligned MV difference). Library test count
+  1911 → 1916.
 - encoder r278 (2026-06-11): land the §5.11.26 `assign_mv`
   **intra-block-copy** `PredMv` arm —
   `encoder::block_mode_info::assign_mv_pred_mv_intrabc` (av1-spec
