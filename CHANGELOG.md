@@ -4,6 +4,34 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r281 (2026-06-12): thread the FULL §5.11.7
+  `intra_frame_mode_info( )` composition into the §5.11.5
+  `decode_block_syntax` walker (av1-spec p.62-65) — prefix →
+  `use_intrabc` dispatch → both arms → §5.11.49 `palette_tokens( )`.
+  The `else` arm now runs the r280
+  `decode_intra_frame_mode_info_else_arm` composite (the walker
+  previously stopped after `intra_frame_y_mode`), with the §8.3.2
+  `has_palette_y` neighbour ctx derived from the walker's own
+  `PaletteSizes[ 0 ]` grid and the decoded `UVMode` feeding the
+  §5.11.33 chroma tasks + §5.11.34 residual context. The
+  `use_intrabc == 1` arm runs §7.10.2 `find_mv_stack( 0 )` + the
+  §5.11.26 `assign_mv( 0 )` intra-block-copy body (`PredMv[ 0 ]`
+  fallback chain + `read_mv( 0 )` under `MvCtx = MV_INTRABC_CONTEXT`
+  / `force_integer_mv = 1` per §5.9.2) and stamps the §5.11.5 footer
+  grids (`YModes` / `IsInters` / `RefFrames` / `Mvs` /
+  `InterpFilters = BILINEAR`) — previously the MV bits were never
+  consumed (bitstream desync on intrabc blocks). §5.11.49
+  `palette_tokens( )` reads the `color_index_map_{y,uv}`
+  `NS(PaletteSize)` literal + anti-diagonal `palette_color_idx_{y,uv}`
+  S() walk via `palette_tokens_plane` on palette blocks.
+  `decode_block_syntax` / `decode_partition_syntax` grow
+  `allow_screen_content_tools` / `enable_filter_intra` / `bit_depth`
+  parameters; `DecodedBlock` surfaces `uv_mode`, angle deltas, CFL
+  alphas, palette sizes, the filter-intra pair and `Mv[ 0..2 ]`.
+  +3 walker integration tests (sync-sentinel proofs for the else-arm
+  composition, the intrabc MV chain, and a `PaletteSizeY = 2` token
+  walk mirrored symbol-for-symbol on the write side).
+
 - encoder+decoder r280 (2026-06-12): compose the §5.11.7
   `intra_frame_mode_info( )` **`else` (non-intrabc) arm** on BOTH
   sides (av1-spec p.65).

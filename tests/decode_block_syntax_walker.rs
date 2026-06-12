@@ -60,6 +60,11 @@
 //!   invokes `decode_block_syntax` at every leaf and propagates the
 //!   stub through the recursion.
 
+use oxideav_av1::encoder::block_mode_info::{
+    write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_skip, IntrabcArmInputs,
+};
+use oxideav_av1::encoder::symbol_writer::SymbolWriter;
+use oxideav_av1::{get_palette_color_context, palette_color_ctx, BILINEAR, PALETTE_COLORS, V_PRED};
 use oxideav_av1::{
     DecodedBlock, DecodedInterFrameModeInfo, Error, InterFrameContext, MotionFieldMvs,
     PartitionWalker, SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16, BLOCK_4X4,
@@ -152,7 +157,8 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
         /* use_128x128_superblock = */ false, /* delta_q_res = */ 0,
         /* delta_lf_present = */ false, /* delta_lf_multi = */ false,
         /* mono_chrome = */ false, /* delta_lf_res = */ 0,
-        /* tx_mode_select = */ false, /* inter_ctx = */ None,
+        /* allow_screen_content_tools = */ false, /* enable_filter_intra = */ false,
+        /* bit_depth = */ 8, /* tx_mode_select = */ false, /* inter_ctx = */ None,
     );
     let pos_after = dec.position();
 
@@ -247,7 +253,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, true, /* subsampling_x = */ 0,
             /* subsampling_y = */ 1, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
-            /* inter_ctx = */ None,
+            false, 8, false, /* inter_ctx = */ None,
         );
         // r182: §5.11.34 cleanly returns Ok after §7.13 inverse transform.
         assert!(result.is_ok(), "arm 1 must return Ok(DecodedBlock)");
@@ -264,7 +270,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
             &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, true, /* subsampling_x = */ 1,
             /* subsampling_y = */ 0, /* num_planes = */ 3, false, false, false, 0,
             &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
-            /* inter_ctx = */ None,
+            false, 8, false, /* inter_ctx = */ None,
         );
         assert!(result.is_ok(), "arm 2 must return Ok(DecodedBlock)");
     }
@@ -279,7 +285,7 @@ fn decode_block_syntax_prologue_has_chroma_three_arm_dispatch() {
         let result = walker.decode_block_syntax(
             &mut dec, &mut cdfs, 0, 0, BLOCK_4X4, true, 0, 0, /* num_planes = */ 1, false,
             false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, true,
-            0, false, /* inter_ctx = */ None,
+            0, false, false, 8, false, /* inter_ctx = */ None,
         );
         assert!(result.is_ok(), "arm 3 must return Ok(DecodedBlock)");
     }
@@ -300,7 +306,7 @@ fn decode_block_syntax_inter_frame_arm_returns_stub() {
     let result = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* frame_is_intra = */ false, 0, 0, 3, false,
         false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0,
-        false, /* inter_ctx = */ None,
+        false, false, 8, false, /* inter_ctx = */ None,
     );
     let pos_after = dec.position();
 
@@ -340,8 +346,8 @@ fn decode_block_syntax_intra_pre_skip_arm_reaches_stub() {
     let result = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, true, 0, 0, 3, /* seg_id_pre_skip = */ true,
         /* segmentation_enabled = */ true, false, /* last_active_seg_id = */ 7,
-        &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
-        /* inter_ctx = */ None,
+        &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false, false, 8,
+        false, /* inter_ctx = */ None,
     );
 
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
@@ -367,7 +373,7 @@ fn decode_block_syntax_rejects_out_of_range() {
     // Out-of-range mi_row.
     let r = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 8, 0, BLOCK_8X8, true, 0, 0, 3, false, false, false, 0, &lossless,
-        false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        false, true, false, 0, false, false, 0, false, false, false, 0, false, false, 8, false,
         /* inter_ctx = */ None,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
@@ -375,7 +381,7 @@ fn decode_block_syntax_rejects_out_of_range() {
     // Out-of-range mi_col.
     let r = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 8, BLOCK_8X8, true, 0, 0, 3, false, false, false, 0, &lossless,
-        false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        false, true, false, 0, false, false, 0, false, false, false, 0, false, false, 8, false,
         /* inter_ctx = */ None,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
@@ -383,8 +389,8 @@ fn decode_block_syntax_rejects_out_of_range() {
     // Out-of-range sub_size.
     let r = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, /* sub_size = */ 999, true, 0, 0, 3, false, false, false,
-        0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false,
-        /* inter_ctx = */ None,
+        0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0, false, false,
+        8, false, /* inter_ctx = */ None,
     );
     assert_eq!(r, Err(Error::PartitionWalkOutOfRange));
 }
@@ -415,7 +421,8 @@ fn decode_partition_syntax_routes_leaf_through_decode_block_syntax() {
     let result = walker.decode_partition_syntax(
         &mut dec, &mut cdfs, /* r = */ 0, /* c = */ 0, /* b_size = */ BLOCK_4X4,
         /* frame_is_intra = */ true, 0, 0, 3, false, false, false, 0, &lossless, false, true,
-        false, 0, false, false, 0, false, false, false, 0, false, /* inter_ctx = */ None,
+        false, 0, false, false, 0, false, false, false, 0, false, false, 8, false,
+        /* inter_ctx = */ None,
     );
 
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
@@ -449,7 +456,7 @@ fn decode_partition_syntax_out_of_grid_short_circuits() {
     let result = walker.decode_partition_syntax(
         &mut dec, &mut cdfs, /* r = */ 4, /* c = */ 0, BLOCK_8X8, true, 0, 0, 3, false,
         false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0,
-        false, /* inter_ctx = */ None,
+        false, false, 8, false, /* inter_ctx = */ None,
     );
 
     assert_eq!(
@@ -493,6 +500,16 @@ fn decoded_block_struct_public_api_smoke() {
         use_intrabc: 0,
         is_inter: 0,
         y_mode: 0,
+        uv_mode: None,
+        angle_delta_y: 0,
+        angle_delta_uv: None,
+        cfl_alpha_u: None,
+        cfl_alpha_v: None,
+        palette_size_y: 0,
+        palette_size_uv: 0,
+        use_filter_intra: None,
+        filter_intra_mode: None,
+        mv: [[0, 0], [0, 0]],
         is_compound: false,
         tx_size: TX_4X4 as u8,
     };
@@ -516,7 +533,7 @@ fn decode_block_syntax_block_8x16_grid_fill_footprint() {
 
     let result = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X16, true, 0, 0, 3, false, false, false, 0, &lossless,
-        false, true, false, 0, false, false, 0, false, false, false, 0, false,
+        false, true, false, 0, false, false, 0, false, false, false, 0, false, false, 8, false,
         /* inter_ctx = */ None,
     );
     // r182: §5.11.34 returns Ok after §7.13 inverse transform fires.
@@ -584,6 +601,9 @@ fn decode_block_syntax_cdef_bits_two_reaches_stub() {
         false,
         false,
         0,
+        false,
+        false,
+        8,
         /* tx_mode_select = */ false,
         /* inter_ctx = */ None,
     );
@@ -1018,6 +1038,9 @@ fn decode_block_syntax_with_tx_mode_select_reaches_compute_prediction() {
         false,
         false,
         0,
+        false,
+        false,
+        8,
         /* tx_mode_select = */ true,
         /* inter_ctx = */ None,
     );
@@ -2482,6 +2505,9 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
         /* delta_lf_multi = */ false,
         /* mono_chrome = */ false,
         /* delta_lf_res = */ 0,
+        /* allow_screen_content_tools = */ false,
+        /* enable_filter_intra = */ false,
+        /* bit_depth = */ 8,
         /* tx_mode_select = */ false,
         /* inter_ctx = */ Some(&ctx),
     );
@@ -2580,6 +2606,9 @@ fn r190_decode_partition_syntax_with_inter_ctx_routes_through_inter_arm() {
         false,
         0,
         false,
+        false,
+        8,
+        false,
         /* inter_ctx = */ Some(&ctx),
     );
     assert_eq!(
@@ -2611,7 +2640,7 @@ fn r190_decode_block_syntax_inter_arm_without_ctx_keeps_legacy_stub() {
     let result = walker.decode_block_syntax(
         &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* frame_is_intra = */ false, 0, 0, 3, false,
         false, false, 0, &lossless, false, true, false, 0, false, false, 0, false, false, false, 0,
-        false, /* inter_ctx = */ None,
+        false, false, 8, false, /* inter_ctx = */ None,
     );
     assert_eq!(
         result,
@@ -2710,11 +2739,363 @@ fn r190_decoded_inter_frame_mode_info_intra_arm_still_stubs() {
         false,
         0,
         false,
+        false,
+        8,
+        false,
         /* inter_ctx = */ Some(&ctx),
     );
     assert_eq!(
         result,
         Err(Error::IntraBlockModeInfoUnsupported),
         "r190: §5.11.18 `is_inter == 0` arm still stubs at §5.11.22 (next-arc target)"
+    );
+}
+
+// ===================================================================
+// r281 — full §5.11.7 composition threaded into decode_block_syntax:
+// the `else` arm runs the r280 composite (intra_frame_y_mode +
+// intra_angle_info_y + the HasChroma arm + §5.11.46 palette_mode_info
+// + §5.11.24 filter_intra_mode_info), the `use_intrabc == 1` arm runs
+// §7.10.2 find_mv_stack(0) + the §5.11.26 assign_mv(0) intra-block-
+// copy body, and §5.11.49 palette_tokens() consumes its NS() + S()
+// reads on palette blocks. Each test writes the block with the
+// encoder-side §5.11.7 writers, appends an 8-bit sync sentinel, and
+// asserts the walker leaves the decoder positioned exactly at the
+// sentinel (a missing or extra read desynchronises the arithmetic
+// coder and fails the literal assertion).
+// ===================================================================
+
+/// r281: §5.11.7 `else` arm full composition — directional luma +
+/// chroma (V_PRED + AngleDeltaY = +2, UVMode = V_PRED + AngleDeltaUV
+/// = -1) round-trips through `decode_block_syntax`, which previously
+/// stopped after `intra_frame_y_mode`.
+#[test]
+fn r281_decode_block_syntax_runs_full_else_arm_composition() {
+    // Write side: §5.11.11 skip = 1 (origin ctx 0), then the §5.11.7
+    // else-arm body, then the sentinel.
+    let walker_w = walker_n(16);
+    let mut enc_cdfs = TileCdfContext::new_from_defaults();
+    let mut writer = SymbolWriter::new(false);
+    let dummy = [0u16; PALETTE_COLORS];
+    write_skip(&mut writer, &mut enc_cdfs, 1, 0, false).unwrap();
+    write_intra_frame_else_arm(
+        &mut writer,
+        &mut enc_cdfs,
+        BLOCK_8X8,
+        V_PRED as u8,
+        Some(V_PRED as u8),
+        /* angle_delta_y = */ 2,
+        /* angle_delta_uv = */ -1,
+        // §8.3.2 CFL allowance: !Lossless && Max(Block_Width,
+        // Block_Height) = 8 <= 32 ⇒ allowed.
+        /* cfl_allowed = */
+        true,
+        /* has_chroma = */ true,
+        /* allow_screen_content_tools = */ false,
+        /* enable_filter_intra = */ false,
+        0,
+        None,
+        false,
+        false,
+        8,
+        0,
+        0,
+        &dummy,
+        0,
+        0,
+        &dummy,
+        &dummy,
+        false,
+        None,
+        None,
+        &walker_w,
+        0,
+        0,
+        /* abovemode_ctx = */ 0,
+        /* leftmode_ctx = */ 0,
+    )
+    .unwrap();
+    writer.write_literal(8, 0xA5).unwrap();
+    let bytes = writer.finish();
+
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+    let db = walker
+        .decode_block_syntax(
+            &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* frame_is_intra = */ true, 0, 0, 3, false,
+            false, false, 0, &lossless, false, /* enable_cdef = */ true,
+            /* allow_intrabc = */ false, 0, false, false, 0, false, false, false, 0,
+            /* allow_screen_content_tools = */ false, /* enable_filter_intra = */ false,
+            /* bit_depth = */ 8, /* tx_mode_select = */ false,
+            /* inter_ctx = */ None,
+        )
+        .expect("r281: the full §5.11.7 else-arm composition must run to completion");
+
+    assert_eq!(db.skip, 1, "§5.11.11 skip = 1");
+    assert_eq!(db.use_intrabc, 0, "§5.11.7 use_intrabc = 0 on the else arm");
+    assert_eq!(db.is_inter, 0, "§5.11.7 else arm: is_inter = 0");
+    assert_eq!(db.y_mode, V_PRED as u8, "§5.11.7 intra_frame_y_mode");
+    assert_eq!(db.angle_delta_y, 2, "§5.11.42 AngleDeltaY");
+    assert_eq!(db.uv_mode, Some(V_PRED as u8), "§5.11.22 uv_mode");
+    assert_eq!(db.angle_delta_uv, Some(-1), "§5.11.43 AngleDeltaUV");
+    assert_eq!(db.palette_size_y, 0, "§5.11.22 line 11: PaletteSizeY = 0");
+    assert_eq!(db.palette_size_uv, 0, "§5.11.22 line 12: PaletteSizeUV = 0");
+    assert_eq!(db.use_filter_intra, None, "§5.11.24 outer gate closed");
+    assert_eq!(db.mv, [[0, 0], [0, 0]], "no MV coded on the else arm");
+
+    // §8.3 adaptation lockstep on the arm-distinguishing CDF row.
+    assert_eq!(
+        enc_cdfs.intra_frame_y_mode_cdf(0, 0).to_vec(),
+        cdfs.intra_frame_y_mode_cdf(0, 0).to_vec(),
+        "TileIntraFrameYModeCdf[0][0] adaptation must match"
+    );
+
+    // Sync sentinel: the walker consumed exactly the §5.11.5 reads.
+    assert_eq!(
+        dec.read_literal(8).unwrap(),
+        0xA5,
+        "decoder must be positioned at the sentinel after the block"
+    );
+}
+
+/// r281: §5.11.7 `use_intrabc == 1` arm — `decode_block_syntax` now
+/// runs §7.10.2 `find_mv_stack( 0 )` + the §5.11.26 `assign_mv( 0 )`
+/// intra-block-copy body (previously the MV bits were not consumed).
+/// At the frame origin the MV stack is empty, so the §5.11.26
+/// fallback chain yields `PredMv[ 0 ] = [ 0, -(sbSize4 * MI_SIZE +
+/// INTRABC_DELAY_PIXELS) * 8 ] = [ 0, -2560 ]` (64×64 superblocks);
+/// the coded block vector equals the predictor (`MV_JOINT_ZERO`).
+#[test]
+fn r281_decode_block_syntax_intrabc_arm_runs_mv_chain() {
+    // Write side mirrors the §5.11.7 region: skip = 1, then
+    // `use_intrabc` S() + the §5.11.26 / §5.11.31 MV write.
+    let walker_w = walker_n(16);
+    let mfmvs = MotionFieldMvs::new_invalid(16, 16);
+    let stack = walker_w
+        .find_mv_stack(
+            0,
+            0,
+            BLOCK_8X8,
+            /* ref_frame = */ [0, -1],
+            /* is_compound = */ false,
+            /* use_ref_frame_mvs = */ false,
+            [GM_TYPE_IDENTITY; 8],
+            identity_gm_params(),
+            [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ true,
+            &mfmvs,
+        )
+        .unwrap();
+    let mv = [0, -2560];
+    let mut enc_cdfs = TileCdfContext::new_from_defaults();
+    let mut writer = SymbolWriter::new(false);
+    write_skip(&mut writer, &mut enc_cdfs, 1, 0, false).unwrap();
+    let inputs = IntrabcArmInputs {
+        mv,
+        mv_stack: &stack,
+        use_128x128_superblock: false,
+        mi_row: 0,
+        mi_row_start: 0,
+    };
+    let info = write_intra_frame_intrabc_arm(&mut writer, &mut enc_cdfs, true, Some(&inputs))
+        .unwrap()
+        .expect("intrabc arm must fire");
+    assert_eq!(info.pred_mv, [0, -2560], "§5.11.26 fallback predictor");
+    writer.write_literal(8, 0x5A).unwrap();
+    let bytes = writer.finish();
+
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+    let db = walker
+        .decode_block_syntax(
+            &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* frame_is_intra = */ true, 0, 0, 3, false,
+            false, false, 0, &lossless, false, /* enable_cdef = */ true,
+            /* allow_intrabc = */ true, 0, false, false, 0, false, false, false, 0, false,
+            false, 8, /* tx_mode_select = */ false, /* inter_ctx = */ None,
+        )
+        .expect("r281: the §5.11.7 intrabc arm must run to completion");
+
+    assert_eq!(db.use_intrabc, 1, "§5.11.7 use_intrabc = 1");
+    assert_eq!(db.is_inter, 1, "§5.11.7 intrabc arm: is_inter = 1");
+    assert_eq!(db.y_mode, 0, "§5.11.7 intrabc arm: YMode = DC_PRED");
+    assert_eq!(db.uv_mode, Some(0), "§5.11.7 intrabc arm: UVMode = DC_PRED");
+    assert_eq!(
+        db.mv[0],
+        [0, -2560],
+        "§5.11.26 Mv[0] = PredMv[0] + zero diff"
+    );
+    assert_eq!(db.ref_frame, [0, -1], "RefFrame = [INTRA_FRAME, NONE]");
+    assert!(!db.is_compound, "slot 1 = NONE ⇒ !isCompound");
+
+    // §5.11.5 grid stamps over the 2×2 footprint.
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..2usize {
+        for c in 0..2usize {
+            let cell = r * mi_cols + c;
+            assert_eq!(walker.is_inters()[cell], 1, "IsInters stamp");
+            assert_eq!(walker.y_modes()[cell], 0, "YModes = DC_PRED stamp");
+            assert_eq!(walker.ref_frames()[cell * 2], 0, "RefFrames[0] stamp");
+            assert_eq!(walker.ref_frames()[cell * 2 + 1], -1, "RefFrames[1] stamp");
+            assert_eq!(
+                walker.interp_filters()[cell * 2],
+                BILINEAR,
+                "InterpFilters[0] = BILINEAR stamp"
+            );
+            assert_eq!(
+                walker.interp_filters()[cell * 2 + 1],
+                BILINEAR,
+                "InterpFilters[1] = BILINEAR stamp"
+            );
+            assert_eq!(walker.mvs()[(cell * 2) * 2], 0, "Mvs row component");
+            assert_eq!(walker.mvs()[(cell * 2) * 2 + 1], -2560, "Mvs col component");
+        }
+    }
+
+    assert_eq!(
+        dec.read_literal(8).unwrap(),
+        0x5A,
+        "decoder must be positioned at the sentinel after the block"
+    );
+}
+
+/// r281: §5.11.49 `palette_tokens()` wiring — a DC_PRED luma-palette
+/// block (`PaletteSizeY = 2`, entries `[10, 200]`) makes
+/// `decode_block_syntax` consume the `color_index_map_y`
+/// `NS(PaletteSizeY)` literal plus the 63 anti-diagonal
+/// `palette_color_idx_y` S() reads of the 8×8 block. The write side
+/// mirrors the §5.11.49 walk with the same §5.11.50 colour-context
+/// derivation.
+#[test]
+fn r281_decode_block_syntax_palette_block_consumes_palette_tokens() {
+    let walker_w = walker_n(16);
+    let mut enc_cdfs = TileCdfContext::new_from_defaults();
+    let mut writer = SymbolWriter::new(false);
+    let mut colors_y = [0u16; PALETTE_COLORS];
+    colors_y[0] = 10;
+    colors_y[1] = 200;
+    let dummy = [0u16; PALETTE_COLORS];
+    write_skip(&mut writer, &mut enc_cdfs, 1, 0, false).unwrap();
+    write_intra_frame_else_arm(
+        &mut writer,
+        &mut enc_cdfs,
+        BLOCK_8X8,
+        /* y_mode = DC_PRED */ 0,
+        /* uv_mode = DC_PRED */ Some(0),
+        0,
+        0,
+        /* cfl_allowed = */ true,
+        /* has_chroma = */ true,
+        /* allow_screen_content_tools = */ true,
+        /* enable_filter_intra = */ false,
+        0,
+        None,
+        /* above_palette_y = */ false,
+        /* left_palette_y = */ false,
+        /* bit_depth = */ 8,
+        /* has_palette_y = */ 1,
+        /* palette_size_y = */ 2,
+        &colors_y,
+        /* has_palette_uv = */ 0,
+        0,
+        &dummy,
+        &dummy,
+        false,
+        None,
+        None,
+        &walker_w,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
+
+    // §5.11.49 palette_tokens mirror: `color_index_map_y NS(2) = 1`,
+    // then the anti-diagonal walk with every other sample = palette
+    // index 0. The write side maintains the same ColorMapY the reader
+    // reconstructs and derives the identical §5.11.50 colour context
+    // per position.
+    writer.write_ns(2, 1).unwrap();
+    let (bw, bh) = (8usize, 8usize);
+    let mut color_map = vec![0u8; bw * bh];
+    color_map[0] = 1;
+    for i in 1..(bh + bw - 1) {
+        let j_hi = i.min(bw - 1);
+        let j_lo = i.saturating_sub(bh - 1);
+        let mut j = j_hi;
+        loop {
+            let (r, c) = (i - j, j);
+            let pcc = get_palette_color_context(&color_map, bw, r, c, 2).unwrap();
+            let ctx = palette_color_ctx(pcc.color_context_hash).unwrap();
+            let desired = 0u8;
+            let idx = pcc
+                .color_order
+                .iter()
+                .take(2)
+                .position(|&v| v == desired)
+                .expect("desired index must appear in ColorOrder");
+            let row = enc_cdfs.palette_y_color_cdf(2, ctx).unwrap();
+            writer.write_symbol(idx as u32, row).unwrap();
+            color_map[r * bw + c] = desired;
+            if j == j_lo {
+                break;
+            }
+            j -= 1;
+        }
+    }
+    writer.write_literal(8, 0xC3).unwrap();
+    let bytes = writer.finish();
+
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+    let db = walker
+        .decode_block_syntax(
+            &mut dec, &mut cdfs, 0, 0, BLOCK_8X8, /* frame_is_intra = */ true, 0, 0, 3, false,
+            false, false, 0, &lossless, false, /* enable_cdef = */ true,
+            /* allow_intrabc = */ false, 0, false, false, 0, false, false, false, 0,
+            /* allow_screen_content_tools = */ true, /* enable_filter_intra = */ false,
+            /* bit_depth = */ 8, /* tx_mode_select = */ false,
+            /* inter_ctx = */ None,
+        )
+        .expect("r281: the palette block must run §5.11.49 palette_tokens to completion");
+
+    assert_eq!(db.y_mode, 0, "DC_PRED luma");
+    assert_eq!(db.palette_size_y, 2, "§5.11.46 PaletteSizeY = 2");
+    assert_eq!(db.palette_size_uv, 0, "§5.11.46 has_palette_uv = 0 arm");
+    assert_eq!(
+        db.use_filter_intra, None,
+        "§5.11.24 outer gate closed by PaletteSizeY > 0 (and the disabled sequence bit)"
+    );
+
+    // §5.11.46 / §5.11.49 grid stamps over the 2×2 footprint.
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..2usize {
+        for c in 0..2usize {
+            let cell = r * mi_cols + c;
+            assert_eq!(walker.palette_sizes()[cell], 2, "PaletteSizes[0] stamp");
+            assert_eq!(
+                walker.palette_colors()[cell * PALETTE_COLORS],
+                10,
+                "PaletteColors[0][..][0] stamp"
+            );
+            assert_eq!(
+                walker.palette_colors()[cell * PALETTE_COLORS + 1],
+                200,
+                "PaletteColors[0][..][1] stamp"
+            );
+        }
+    }
+
+    assert_eq!(
+        dec.read_literal(8).unwrap(),
+        0xC3,
+        "decoder must be positioned at the sentinel after the palette walk"
     );
 }

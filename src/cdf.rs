@@ -23240,27 +23240,33 @@ impl PartitionWalker {
     ///   `AvailLChroma` from the chroma fix-up arm (`subsampling_y &&
     ///   bh4 == 1` ⇒ `is_inside( r - 2, c )`, etc.).
     /// * §5.11.6 **`mode_info()`** — `FrameIsIntra == 1` (key /
-    ///   intra-only frames) routes through
+    ///   intra-only frames) routes through the FULL §5.11.7
+    ///   composition (r281):
     ///   [`Self::decode_intra_frame_mode_info_prefix`] (§5.11.7
-    ///   `intra_frame_mode_info`, lines 1-10) +
-    ///   [`Self::decode_use_intrabc`] (§5.11.7 `use_intrabc` element) +
-    ///   [`Self::decode_intra_frame_y_mode`] (§5.11.7 `else` arm
-    ///   `intra_frame_y_mode` element). The §5.11.7 follow-on body
-    ///   (`intra_angle_info_y`, `uv_mode`, `intra_angle_info_uv`,
-    ///   `palette_mode_info`, `filter_intra_mode_info`, plus the
-    ///   `use_intrabc == 1` arm body) and the §5.11.18
-    ///   `inter_frame_mode_info()` inter arm are next-round targets;
-    ///   the walker fast-paths past them on the keyframe + non-screen-
-    ///   content + non-intrabc case used by this round's test fixture
-    ///   and returns [`crate::Error::DecodeBlockInterFrameUnsupported`]
-    ///   on a `frame_is_intra = false` call.
+    ///   lines 1-10) + [`Self::decode_use_intrabc`] (the §5.11.7
+    ///   `use_intrabc` element), then on the `use_intrabc == 1` arm
+    ///   the fixed no-bit assignments + §7.10.2
+    ///   [`Self::find_mv_stack`]`( 0 )` + the §5.11.26
+    ///   `assign_mv( 0 )` intra-block-copy body (`compMode = NEWMV`
+    ///   forced, `PredMv[ 0 ]` via the three-stage fallback chain,
+    ///   `read_mv( 0 )` under `MvCtx = MV_INTRABC_CONTEXT` /
+    ///   `force_integer_mv = 1`), and on the `else` arm the r280
+    ///   [`Self::decode_intra_frame_mode_info_else_arm`] composite
+    ///   (`intra_frame_y_mode`, `intra_angle_info_y`, the
+    ///   `HasChroma` arm, §5.11.46 `palette_mode_info` with entries,
+    ///   and §5.11.24 `filter_intra_mode_info`). The §8.3.2
+    ///   `has_palette_y` neighbour ctx is derived from the walker's
+    ///   own `PaletteSizes[ 0 ]` grid. The §5.11.18
+    ///   `inter_frame_mode_info()` inter arm runs through the r190
+    ///   inter-arm helper when `inter_ctx` is supplied and returns
+    ///   [`crate::Error::DecodeBlockInterFrameUnsupported`] otherwise.
     /// * §5.11.5 **`palette_tokens()`** — gated by the §5.11.49
-    ///   `if ( PaletteSize{Y,UV} )` guard. On the no-palette path
-    ///   (`PaletteSize{Y,UV} == 0`, which is the only path reachable
-    ///   while `palette_mode_info()` remains unimplemented) the call
-    ///   is a no-op per the spec's outer guard. The §5.11.49
-    ///   [`palette_tokens_plane`] machinery itself already exists; it
-    ///   is exposed for once `palette_mode_info()` lands.
+    ///   `if ( PaletteSize{Y,UV} )` guard. On a palette block each
+    ///   plane's `color_index_map_{y,uv}` `NS(PaletteSize)` literal +
+    ///   anti-diagonal `palette_color_idx_{y,uv}` S() walk run via
+    ///   [`palette_tokens_plane`] (r281); the decoded
+    ///   `ColorMap{Y,UV}` contents are consumed for arithmetic-coder
+    ///   sync (per-sample map tracking on the walker is a follow-up).
     /// * §5.11.16 **`read_block_tx_size()`** — landed in r167 via
     ///   [`Self::read_block_tx_size`]. On the implemented intra arm
     ///   (`is_inter == 0`, which forces the §5.11.16 `else` arm
@@ -23271,10 +23277,9 @@ impl PartitionWalker {
     ///   stamps the resulting `TxSize` into both `TxSizes[]` and
     ///   `InterTxSizes[]` over the block's `bh4 * bw4` footprint. The
     ///   §5.11.16 inter `TX_MODE_SELECT && !skip && !Lossless` arm
-    ///   (the §5.11.17 `read_var_tx_size` recursion) is the next
-    ///   round's target — unreachable from this walker because the
-    ///   inter arm is stubbed upstream at
-    ///   [`crate::Error::DecodeBlockInterFrameUnsupported`].
+    ///   (the §5.11.17 `read_var_tx_size` recursion) is a follow-up
+    ///   target (the `is_inter == 1` paths — intrabc + inter-frame —
+    ///   use the §5.11.15 `else` arm meanwhile).
     /// * §5.11.5 grid-fill **for the writes the walker computed** —
     ///   `YModes[][]`, `RefFrames[][][0..2]`, `IsInters[][]`,
     ///   `SkipModes[][]`, `Skips[][]`, `MiSizes[][]`, `SegmentIds[][]`,
@@ -23285,38 +23290,29 @@ impl PartitionWalker {
     ///   `IsCompound = RefFrame[1] > INTRA_FRAME` derivation (always
     ///   `false` on the intra arm because `RefFrame[1] = NONE`).
     ///
-    /// STUBBED in this round (each becomes the next round's target):
+    /// Remaining follow-up targets on this path:
     ///
     /// * §5.11.18 [`crate::Error::DecodeBlockInterFrameUnsupported`]
-    ///   — `inter_frame_mode_info()` for `FrameIsIntra == 0`.
-    /// * §5.11.30 [`crate::Error::DecodeBlockComputePredictionUnsupported`]
-    ///   — `compute_prediction()` (intra / inter prediction sample
-    ///   generation). The walker now hits this stub after
-    ///   `read_block_tx_size` completes on the intra arm.
-    /// * §5.11.34 [`crate::Error::DecodeBlockResidualUnsupported`] —
-    ///   `residual()` (transform-coefficient read + inverse-transform
-    ///   + reconstruction). Reachable once §5.11.30 lands.
-    ///
-    /// On the implemented prologue + intra mode-info path the walker
-    /// runs the same §8.3.2 / §5.11.x bitstream reads a conforming
-    /// decoder performs, then short-circuits at the first §5.11.5
-    /// post-mode-info stub. Successive landings of
-    /// `read_block_tx_size()` → `compute_prediction()` → `residual()`
-    /// extend the walker further into §5.11.5 without changing the
-    /// implemented surface or the §5.11.5 prologue / §5.11.6 dispatch
-    /// behaviour.
+    ///   — `inter_frame_mode_info()` for `FrameIsIntra == 0` when the
+    ///   caller passes `inter_ctx = None` (legacy intra-only callers).
+    /// * §5.11.17 `read_var_tx_size` — the §5.11.16 inter var-tx
+    ///   recursion (the `is_inter == 1` paths use the §5.11.15
+    ///   `else` arm meanwhile).
+    /// * Per-sample `ColorMapY` / `ColorMapUV` + `UVModes[][]` walker
+    ///   grids (the §5.11.49 reads run; the decoded maps are not yet
+    ///   retained for §7.11.4 palette prediction).
     ///
     /// ## Caller contract
     ///
-    /// The §5.11.5 grid stamps that already happen in the composed
-    /// leaves (Skips / SkipModes / SegmentIds / MiSizes / YModes /
-    /// IsInters / cdef_idx) are observable on the walker's grid
-    /// accessors after a successful call. The §5.11.5 per-block
-    /// grid stamps that this round does NOT cover (`UVModes` /
-    /// `RefFrames` / `CompGroupIdxs` / `CompoundIdxs` /
-    /// `InterpFilters` / `Mvs` / `TxSizes` / `PaletteSizes` /
-    /// `PaletteColors` / `DeltaLFs`) need their own walker fields and
-    /// land in the round that implements their writers.
+    /// The §5.11.5 grid stamps that happen in the composed leaves
+    /// (Skips / SkipModes / SegmentIds / MiSizes / YModes / IsInters /
+    /// cdef_idx / TxSizes / InterTxSizes / PaletteSizes /
+    /// PaletteColors, plus RefFrames / Mvs / InterpFilters on the
+    /// `is_inter == 1` arms) are observable on the walker's grid
+    /// accessors after a successful call. The §5.11.5 stamps not yet
+    /// covered (`UVModes` / intra-arm `RefFrames` / `DeltaLFs`) need
+    /// their own walker fields and land in the round that implements
+    /// their consumers.
     ///
     /// On the stub paths the walker still emits a
     /// [`DecodedBlockRecord`] leaf (the same one
@@ -23326,10 +23322,10 @@ impl PartitionWalker {
     ///
     /// Returns the §5.11.5 per-block derived state ([`DecodedBlock`])
     /// on the no-stub path. Returns a §5.11.5 stub variant of
-    /// [`crate::Error`] when the walker reaches a next-round target,
+    /// [`crate::Error`] when the walker reaches a follow-up target,
     /// or [`crate::Error::PartitionWalkOutOfRange`] for caller bugs
     /// (out-of-range `sub_size`, `mi_row` / `mi_col` outside the
-    /// frame's mi extent).
+    /// frame's mi extent, invalid `bit_depth`).
     #[allow(clippy::too_many_arguments)]
     pub fn decode_block_syntax(
         &mut self,
@@ -23366,6 +23362,17 @@ impl PartitionWalker {
         delta_lf_multi: bool,
         mono_chrome: bool,
         delta_lf_res: u8,
+        // §5.9.5 frame-header `allow_screen_content_tools` — the
+        // §5.11.7 / §5.11.22 `palette_mode_info( )` outer gate.
+        allow_screen_content_tools: bool,
+        // §5.5.2 sequence-header `enable_filter_intra` — the §5.11.24
+        // `filter_intra_mode_info( )` outer gate.
+        enable_filter_intra: bool,
+        // §5.5.2 `color_config( )` `BitDepth` (8 / 10 / 12) — the
+        // §5.11.46 palette-entry `L(BitDepth)` literals + `minBits`
+        // derivations. Callers without palette-eligible content still
+        // pass a valid value (8 is the conventional identity).
+        bit_depth: u8,
         // §5.9.21 / §6.8.21 `TxMode == TX_MODE_SELECT`. Threaded
         // through to `read_block_tx_size` per §5.11.16. Source: the
         // §5.9.21 frame-header `TxMode` derivation
@@ -23389,6 +23396,13 @@ impl PartitionWalker {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
         if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.5.2 `color_config( )` constrains `BitDepth` to 8 / 10 /
+        // 12. Guard at the dispatcher level (mirroring the §5.11.22 /
+        // §5.11.7-else composites) so the bit stream stays untouched
+        // on a caller bug regardless of which arm fires.
+        if !matches!(bit_depth, 8 | 10 | 12) {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
@@ -23566,39 +23580,239 @@ impl PartitionWalker {
         )?;
         let use_intrabc =
             self.decode_use_intrabc(decoder, cdfs, mi_row_b, mi_col_b, sub_size, allow_intrabc)?;
-        let (y_mode, is_inter) = if use_intrabc != 0 {
-            // §5.11.7 `use_intrabc == 1` body — sets `is_inter = 1`,
-            // `YMode = DC_PRED`, `UVMode = DC_PRED`, `PaletteSize{Y,UV}
-            // = 0`, `interp_filter[0..2] = BILINEAR`, and calls
-            // `find_mv_stack(0)` + `assign_mv(0)`. The MV stack /
-            // assign-mv path is a separate next-round target — for
-            // now we record the fixed `YMode = DC_PRED` /
-            // `is_inter = 1` assignments and surface them in the
-            // returned `DecodedBlock`. The MV stamps over
-            // `Mvs[][][0]` / `InterpFilters[][][0..2]` aren't yet
-            // tracked on the walker; they land with the MV-stack
-            // round.
-            (0u8 /* DC_PRED */, 1u8)
-        } else {
-            // §5.11.7 `else` arm — reads `intra_frame_y_mode` (the
-            // r165 `decode_intra_frame_y_mode` leaf). The `is_inter
-            // = 0` assignment is implicit in the `else` arm
-            // (`intra_frame_mode_info` line `is_inter = 0`).
-            let y_mode =
-                self.decode_intra_frame_y_mode(decoder, cdfs, mi_row_b, mi_col_b, sub_size)?;
-            (y_mode, 0u8)
-        };
 
-        // §5.11.5 line `palette_tokens( )` — §5.11.49 outer guard is
-        // `if ( PaletteSizeY ) ... if ( PaletteSizeUV ) ...`. On the
-        // currently-reachable path `palette_mode_info()` is not yet
-        // wired, so `PaletteSize{Y,UV} == 0` and the spec's outer
-        // guard short-circuits palette_tokens to a no-op. The
-        // [`palette_tokens_plane`] machinery is the standalone leaf
-        // ready for the round that lands `palette_mode_info()`.
-        //
-        // (No work here on the no-palette path — the spec body
-        // doesn't gate `read_block_tx_size()` on the palette result.)
+        // §5.11.7 post-`use_intrabc` dispatch — r281 threads BOTH
+        // arms to completion. Per-block mode-info state surfaced via
+        // the returned [`DecodedBlock`].
+        let y_mode: u8;
+        let is_inter: u8;
+        let uv_mode: Option<u8>;
+        let mut angle_delta_y: i8 = 0;
+        let mut angle_delta_uv: Option<i8> = None;
+        let mut cfl_alpha_u: Option<i8> = None;
+        let mut cfl_alpha_v: Option<i8> = None;
+        let mut palette_size_y: u8 = 0;
+        let mut palette_size_uv: u8 = 0;
+        let mut use_filter_intra: Option<u8> = None;
+        let mut filter_intra_mode: Option<u8> = None;
+        let mut mv: [[i32; 2]; 2] = [[0, 0], [0, 0]];
+        if use_intrabc != 0 {
+            // §5.11.7 `use_intrabc == 1` body (av1-spec p.65) — the
+            // fixed no-bit assignments (`is_inter = 1`, `YMode =
+            // UVMode = DC_PRED`, `motion_mode = SIMPLE`,
+            // `compound_type = COMPOUND_AVERAGE`, `PaletteSize{Y,UV} =
+            // 0`, `interp_filter[ 0..2 ] = BILINEAR`) followed by
+            // `find_mv_stack( 0 )` + `assign_mv( 0 )`.
+            y_mode = 0; // DC_PRED
+            is_inter = 1;
+            uv_mode = Some(0); // DC_PRED — §5.11.7 fixed assignment.
+
+            // §7.10.2 `find_mv_stack( 0 )` with `RefFrame =
+            // [ INTRA_FRAME, NONE ]`. `GlobalMvs[ 0 ]` is the zero
+            // vector on intra-block-copy blocks (§7.10.2.1: `ref ==
+            // INTRA_FRAME ⇒ mv = 0`), so identity global-motion
+            // tables are supplied; the §7.10.2.5 temporal scan is
+            // gated off (`use_ref_frame_mvs = 0` — temporal MV
+            // projection is an inter-frame feature, and §5.9.20
+            // `allow_intrabc` is reachable only on intra frames), so
+            // an all-invalid `MotionFieldMvs` grid is observably
+            // equivalent to a projected one.
+            let mut gm_params = [[0i32; 6]; 8];
+            for row in gm_params.iter_mut() {
+                row[2] = 1 << WARPEDMODEL_PREC_BITS;
+                row[5] = 1 << WARPEDMODEL_PREC_BITS;
+            }
+            let mfmv = MotionFieldMvs::new_invalid(self.mi_rows, self.mi_cols);
+            let stack = self.find_mv_stack(
+                mi_row_b,
+                mi_col_b,
+                sub_size,
+                /* ref_frame = */ [0, -1],
+                /* is_compound = */ false,
+                /* use_ref_frame_mvs = */ false,
+                [GM_TYPE_IDENTITY; 8],
+                gm_params,
+                [0; 8],
+                /* allow_high_precision_mv = */ false,
+                /* force_integer_mv = */ true,
+                &mfmv,
+            )?;
+
+            // §5.11.26 `assign_mv( 0 )` intra-block-copy arm:
+            // `compMode` is forced to `NEWMV`, so `read_mv( 0 )`
+            // always fires. `PredMv[ 0 ]` comes from the three-stage
+            // fallback chain (`RefStackMv[ 0 ][ 0 ]` →
+            // `RefStackMv[ 1 ][ 0 ]` → the superblock-offset
+            // synthetic predictor); the §5.11.31 read runs under
+            // `MvCtx = MV_INTRABC_CONTEXT` with `force_integer_mv =
+            // 1` (§5.9.2 forces it on every intra frame) and no high
+            // precision.
+            let pred_mv = crate::encoder::block_mode_info::assign_mv_pred_mv_intrabc(
+                &stack,
+                use_128x128_superblock,
+                mi_row_b,
+                self.geometry.mi_row_start,
+            )?;
+            mv[0] = self.read_mv(
+                decoder,
+                cdfs,
+                mv_ctx(true),
+                pred_mv,
+                /* allow_high_precision_mv = */ false,
+                /* force_integer_mv = */ true,
+            )?;
+
+            // §5.11.5 grid-fill for the intra-block-copy block:
+            // `YModes = DC_PRED`, `RefFrames = [ INTRA_FRAME, NONE ]`,
+            // `IsInters = 1`, `InterpFilters[ 0..2 ] = BILINEAR`,
+            // `Mvs[ 0 ] = Mv[ 0 ]` over the `bh4 * bw4` footprint
+            // (the §5.11.5 `CompGroupIdxs` / `CompoundIdxs` stamps
+            // are explicitly skipped on `use_intrabc` blocks per the
+            // §5.11.5 `if ( !use_intrabc )` gate). Subsequent
+            // intra-block-copy blocks' §7.10.2 neighbour scans read
+            // these cells.
+            for dr in 0..bh4 {
+                let rr = mi_row_b + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col_b + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    let cell = (rr * self.mi_cols + cc) as usize;
+                    self.y_modes[cell] = 0; // DC_PRED
+                    self.is_inters[cell] = 1;
+                    self.ref_frames[cell * 2] = 0; // INTRA_FRAME
+                    self.ref_frames[cell * 2 + 1] = -1; // NONE
+                    self.interp_filters[cell * 2] = crate::inter_pred::BILINEAR;
+                    self.interp_filters[cell * 2 + 1] = crate::inter_pred::BILINEAR;
+                    // §6.10.27 conformance bound `Abs( Mv ) < (1 <<
+                    // 14)` keeps the i32 → i16 cast lossless.
+                    self.mvs[(cell * 2) * 2] = mv[0][0] as i16;
+                    self.mvs[(cell * 2) * 2 + 1] = mv[0][1] as i16;
+                    self.mvs[(cell * 2 + 1) * 2] = 0;
+                    self.mvs[(cell * 2 + 1) * 2 + 1] = 0;
+                }
+            }
+        } else {
+            // §5.11.7 `else` arm — the full r280 composition:
+            // `intra_frame_y_mode` + `intra_angle_info_y` + the
+            // `HasChroma` arm (`uv_mode` / §5.11.45 `read_cfl_alphas`
+            // / `intra_angle_info_uv`) + §5.11.46 `palette_mode_info`
+            // + §5.11.24 `filter_intra_mode_info`. The `is_inter = 0`
+            // assignment is the arm's first no-bit line.
+            //
+            // §8.3.2 `has_palette_y` neighbour ctx (av1-spec p.378):
+            //   ctx = ( AvailU && PaletteSizes[ 0 ][ MiRow - 1 ][
+            //   MiCol ] > 0 ) + ( AvailL && PaletteSizes[ 0 ][ MiRow
+            //   ][ MiCol - 1 ] > 0 )
+            // derived from the walker's own `PaletteSizes[ 0 ]` grid
+            // (stamped by previous blocks' §5.11.46 reads).
+            let above_palette_y = avail_u
+                && mi_row_b > 0
+                && self.palette_sizes[((mi_row_b - 1) * self.mi_cols + mi_col_b) as usize] > 0;
+            let left_palette_y = avail_l
+                && mi_col_b > 0
+                && self.palette_sizes[(mi_row_b * self.mi_cols + mi_col_b - 1) as usize] > 0;
+            let info = self.decode_intra_frame_mode_info_else_arm(
+                decoder,
+                cdfs,
+                mi_row_b,
+                mi_col_b,
+                sub_size,
+                prefix.lossless,
+                has_chroma,
+                allow_screen_content_tools,
+                enable_filter_intra,
+                subsampling_x != 0,
+                subsampling_y != 0,
+                above_palette_y,
+                left_palette_y,
+                bit_depth,
+            )?;
+            y_mode = info.y_mode;
+            is_inter = 0;
+            uv_mode = info.uv_mode;
+            angle_delta_y = info.angle_delta_y;
+            angle_delta_uv = info.angle_delta_uv;
+            cfl_alpha_u = info.cfl_alpha_u;
+            cfl_alpha_v = info.cfl_alpha_v;
+            palette_size_y = info.palette_size_y.unwrap_or(0);
+            palette_size_uv = info.palette_size_uv.unwrap_or(0);
+            use_filter_intra = info.use_filter_intra;
+            filter_intra_mode = info.filter_intra_mode;
+        }
+
+        // §5.11.5 line `palette_tokens( )` — §5.11.49. The outer
+        // guard is `if ( PaletteSizeY ) ... if ( PaletteSizeUV ) ...`
+        // (zero on every non-palette block, so the call collapses to
+        // a no-op there). On a palette block each plane reads its
+        // `color_index_map_{y,uv}` `NS(PaletteSize)` literal followed
+        // by the §5.11.49 anti-diagonal `palette_color_idx_{y,uv}`
+        // S() walk via [`palette_tokens_plane`]. The decoded
+        // `ColorMap{Y,UV}` contents feed the §7.11.4 palette
+        // prediction process, which the walker does not yet track —
+        // the reads above keep the arithmetic decoder in sync.
+        if palette_size_y > 0 {
+            let args = palette_tokens_args(
+                sub_size,
+                mi_row_b as usize,
+                mi_col_b as usize,
+                self.mi_rows as usize,
+                self.mi_cols as usize,
+                PalettePlane::Y,
+                0,
+                0,
+            )
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            // §5.11.49: `color_index_map_y NS(PaletteSizeY)`.
+            let color_index_map = decoder.read_ns(palette_size_y as u32)? as u8;
+            let mut color_map = vec![0u8; args.block_h * args.block_w];
+            palette_tokens_plane(
+                decoder,
+                cdfs,
+                PalettePlane::Y,
+                palette_size_y as usize,
+                args.block_w,
+                args.block_h,
+                args.onscreen_w,
+                args.onscreen_h,
+                color_index_map,
+                &mut color_map,
+                args.block_w,
+            )?;
+        }
+        if palette_size_uv > 0 {
+            let args = palette_tokens_args(
+                sub_size,
+                mi_row_b as usize,
+                mi_col_b as usize,
+                self.mi_rows as usize,
+                self.mi_cols as usize,
+                PalettePlane::Uv,
+                subsampling_x as usize,
+                subsampling_y as usize,
+            )
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            // §5.11.49: `color_index_map_uv NS(PaletteSizeUV)`.
+            let color_index_map = decoder.read_ns(palette_size_uv as u32)? as u8;
+            let mut color_map = vec![0u8; args.block_h * args.block_w];
+            palette_tokens_plane(
+                decoder,
+                cdfs,
+                PalettePlane::Uv,
+                palette_size_uv as usize,
+                args.block_w,
+                args.block_h,
+                args.onscreen_w,
+                args.onscreen_h,
+                color_index_map,
+                &mut color_map,
+                args.block_w,
+            )?;
+        }
 
         // §5.11.5 line `read_block_tx_size( )` — §5.11.16 reader. The
         // walker has completed the §5.11.5 prologue + §5.11.6
@@ -23671,6 +23885,16 @@ impl PartitionWalker {
             use_intrabc,
             is_inter,
             y_mode,
+            uv_mode,
+            angle_delta_y,
+            angle_delta_uv,
+            cfl_alpha_u,
+            cfl_alpha_v,
+            palette_size_y,
+            palette_size_uv,
+            use_filter_intra,
+            filter_intra_mode,
+            mv,
             is_compound,
             tx_size,
         };
@@ -23690,24 +23914,18 @@ impl PartitionWalker {
         // `Ok(_)` (one DC_PRED intra task per visited plane), and the
         // walker advances to the §5.11.34 `residual()` stub.
         //
-        // On the `is_inter == 1` path (unreachable from `decode_block_
-        // syntax` today — the intra arm forces `is_inter = 0` except
-        // on the `use_intrabc == 1` arm which lands a separate next-arc
-        // §7.11.5 inter+intra sub-arc) the dispatcher would surface
-        // [`crate::Error::ComputePredictionInterUnsupported`]; the
-        // §5.11.5 walker propagates that error directly. (The §5.11.18
-        // inter-frame dispatcher is itself still stubbed at
-        // [`crate::Error::DecodeBlockInterFrameUnsupported`] upstream,
-        // so the `is_inter == 1` arm of compute_prediction isn't yet
-        // reachable from `decode_block_syntax`.)
+        // On the `is_inter == 1` path (the `use_intrabc == 1` arm —
+        // §5.11.7 sets `is_inter = 1` there) the dispatcher takes the
+        // §5.11.33 inter arm: the §5.11.5 grid stamps above committed
+        // `RefFrames[ .. ][ 0 ] = INTRA_FRAME` over the footprint, so
+        // the §5.11.33 `someUseIntra` scan fires and the per-4x4
+        // tasks carry the intra-block-copy candidate anchoring.
+        // `IsInterIntra` stays false (`RefFrame[ 1 ] = NONE ≠
+        // INTRA_FRAME`).
         //
-        // For the §5.11.30 / §5.11.33 dispatcher arguments we use:
-        //   `y_mode_uv` — we do NOT yet have a decoded UVMode (§5.11.7
-        //                 follow-on is next-arc); the §5.11.33 chroma
-        //                 plane currently uses the §5.11.7 default
-        //                 `UVMode = DC_PRED` (the read_intra_frame_y_mode
-        //                 reader's intra-mode-info `else` arm sets the
-        //                 grid default to 0 = DC_PRED).
+        // `uv_mode` carries the §5.11.7 / §5.11.22 decoded `UVMode`
+        // (or `DC_PRED` when the `HasChroma` arm did not run — the
+        // §5.11.33 chroma planes are not visited in that case).
         let _readout = self.compute_prediction(
             mi_row_b,
             mi_col_b,
@@ -23721,7 +23939,7 @@ impl PartitionWalker {
             subsampling_y,
             is_inter != 0,
             /* y_mode = */ y_mode,
-            /* uv_mode = */ 0u8, /* DC_PRED — §5.11.7 default until UVMode lands */
+            /* uv_mode = */ uv_mode.unwrap_or(0),
             /* ref_frame_1_is_intra = */ false,
         )?;
 
@@ -23773,7 +23991,7 @@ impl PartitionWalker {
             intra_dir: y_mode as usize,
             segment_id: 0,
             seg_qm_level: [15, 15, 15],
-            uv_mode: 0,
+            uv_mode: uv_mode.unwrap_or(0),
         };
         let _residual = self.residual(
             decoder,
@@ -24047,6 +24265,23 @@ impl PartitionWalker {
             use_intrabc: info.use_intrabc,
             is_inter: 1,
             y_mode: inter_block.y_mode,
+            // §5.11.23 inter blocks carry no chroma intra mode-info
+            // (the §5.11.28 interintra sub-arc's `UVMode = DC_PRED`
+            // is surfaced through the [`DecodedInterBlockModeInfo`]
+            // aggregate, not here) and no palette / filter-intra
+            // state (§5.11.23 lines 2-3 force `PaletteSize{Y,UV} =
+            // 0`).
+            uv_mode: None,
+            angle_delta_y: 0,
+            angle_delta_uv: None,
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
+            palette_size_y: 0,
+            palette_size_uv: 0,
+            use_filter_intra: None,
+            filter_intra_mode: None,
+            // §5.11.31 `Mv[ 0..2 ]` from the §5.11.23 aggregate.
+            mv: inter_block.mv,
             is_compound,
             tx_size,
         })
@@ -25349,6 +25584,12 @@ impl PartitionWalker {
         delta_lf_multi: bool,
         mono_chrome: bool,
         delta_lf_res: u8,
+        // r281: §5.11.7 / §5.11.22 / §5.11.24 / §5.11.46 gates. See
+        // [`Self::decode_block_syntax`]'s parameters of the same
+        // names for the contracts.
+        allow_screen_content_tools: bool,
+        enable_filter_intra: bool,
+        bit_depth: u8,
         tx_mode_select: bool,
         // r190: optional inter-arm context. See
         // [`Self::decode_block_syntax`]'s `inter_ctx` parameter for
@@ -25443,6 +25684,9 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    allow_screen_content_tools,
+                    enable_filter_intra,
+                    bit_depth,
                     tx_mode_select,
                     inter_ctx,
                 )?
@@ -25492,6 +25736,9 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    allow_screen_content_tools,
+                    enable_filter_intra,
+                    bit_depth,
                     tx_mode_select,
                     inter_ctx,
                 )?;
@@ -25521,6 +25768,9 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    allow_screen_content_tools,
+                    enable_filter_intra,
+                    bit_depth,
                     tx_mode_select,
                     inter_ctx,
                 )?;
@@ -25550,6 +25800,9 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    allow_screen_content_tools,
+                    enable_filter_intra,
+                    bit_depth,
                     tx_mode_select,
                     inter_ctx,
                 )?;
@@ -25579,6 +25832,9 @@ impl PartitionWalker {
                     delta_lf_multi,
                     mono_chrome,
                     delta_lf_res,
+                    allow_screen_content_tools,
+                    enable_filter_intra,
+                    bit_depth,
                     tx_mode_select,
                     inter_ctx,
                 )?;
@@ -27901,15 +28157,14 @@ pub struct IntraFrameModeInfoPrefix {
 /// `bw4 * bh4` footprint of the walker's grid arrays by each composed
 /// leaf as it fires.
 ///
-/// Out of scope this round (next round's targets, surfaced here as
-/// the stub's caller-bug-free no-stub-path baseline):
-/// `palette_tokens()` output (`PaletteSize{Y,UV}` always `0` on the
-/// reachable path), `read_block_tx_size()` output (`TxSize` / the
-/// transform tree), `compute_prediction()` outputs (prediction
-/// samples), `residual()` outputs (transform coefficients +
-/// reconstructed samples), the inter arm's `RefFrame[0..2]` / `Mv[0..2]`
-/// / `InterpFilters[0..2]` / `CompGroupIdx` / `CompoundIdx` (these
-/// land with §5.11.18 inter_frame_mode_info).
+/// Out of scope (surfaced through dedicated readouts rather than
+/// this aggregate): `palette_tokens()` per-sample `ColorMap{Y,UV}`
+/// contents (the §5.11.49 reads are performed for arithmetic-coder
+/// sync; the maps themselves are not yet tracked on the walker),
+/// `compute_prediction()` outputs (prediction samples), `residual()`
+/// outputs (transform coefficients + reconstructed samples), the
+/// inter arm's `CompGroupIdx` / `CompoundIdx` / interpolation-filter
+/// detail (see [`DecodedInterBlockModeInfo`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedBlock {
     /// §5.11.5 `MiRow = r` — mi-unit row of the block.
@@ -27959,9 +28214,10 @@ pub struct DecodedBlock {
     /// §5.11.7 `RefFrame[0..2]` after the intra arm =
     /// `[INTRA_FRAME, NONE]` = `[0, -1]`.
     pub ref_frame: [i8; 2],
-    /// §5.11.7 `use_intrabc`. `0` for the implemented `allow_intrabc
-    /// = false` path; `1` is consumable but the `use_intrabc == 1`
-    /// MV-stack / assign-mv body is a next-round target.
+    /// §5.11.7 `use_intrabc`. `0` on the `allow_intrabc = false`
+    /// fall-through and the `else` arm; `1` on the intra-block-copy
+    /// arm (whose §7.10.2 `find_mv_stack( 0 )` + §5.11.26
+    /// `assign_mv( 0 )` body runs to completion — see [`Self::mv`]).
     pub use_intrabc: u8,
     /// §5.11.5 / §5.11.7 `is_inter`. `0` on the `else` arm, `1` on
     /// the `use_intrabc == 1` arm. The walker stamps this into
@@ -27970,6 +28226,45 @@ pub struct DecodedBlock {
     /// §5.11.7 `YMode = intra_frame_y_mode` (or `DC_PRED` on the
     /// `use_intrabc == 1` arm).
     pub y_mode: u8,
+    /// §5.11.7 / §5.11.22 `UVMode`. `Some(uv_mode)` when the
+    /// `HasChroma` arm of the `else` body read the element;
+    /// `Some(DC_PRED)` on the `use_intrabc == 1` arm (the §5.11.7
+    /// fixed assignment); `None` when `!HasChroma` on the `else`
+    /// arm and on the §5.11.6 inter arm (no chroma intra mode).
+    pub uv_mode: Option<u8>,
+    /// §5.11.42 `AngleDeltaY` from `intra_angle_info_y( )`. `0` on
+    /// the §5.11.42 short-circuit, the intrabc arm and the inter arm.
+    pub angle_delta_y: i8,
+    /// §5.11.43 `AngleDeltaUV` from `intra_angle_info_uv( )`. `None`
+    /// when the `HasChroma` arm did not run.
+    pub angle_delta_uv: Option<i8>,
+    /// §5.11.45 `CflAlphaU`. `None` unless `UVMode == UV_CFL_PRED`.
+    pub cfl_alpha_u: Option<i8>,
+    /// §5.11.45 `CflAlphaV`. `None` unless `UVMode == UV_CFL_PRED`.
+    pub cfl_alpha_v: Option<i8>,
+    /// §5.11.46 `PaletteSizeY`. `0` when no luma palette was coded
+    /// (the §5.11.22 line-11 initialiser); `2..=PALETTE_COLORS`
+    /// otherwise. Non-zero implies the §5.11.49 `palette_tokens()`
+    /// luma walk consumed its `color_index_map_y` NS() +
+    /// `palette_color_idx_y` S() reads.
+    pub palette_size_y: u8,
+    /// §5.11.46 `PaletteSizeUV` — chroma twin of
+    /// [`Self::palette_size_y`].
+    pub palette_size_uv: u8,
+    /// §5.11.24 `use_filter_intra`. `None` when the §5.11.24 outer
+    /// gate was closed (the spec body's `use_filter_intra = 0`
+    /// initialiser).
+    pub use_filter_intra: Option<u8>,
+    /// §5.11.24 `filter_intra_mode`. `None` unless
+    /// `use_filter_intra == 1`.
+    pub filter_intra_mode: Option<u8>,
+    /// §5.11.26 / §5.11.31 `Mv[ 0..2 ]` (`[ row, col ]` per list,
+    /// 1/8-luma-sample units). `[[0, 0], [0, 0]]` on the intra
+    /// `else` arm (no MV is coded); list 0 carries the
+    /// intra-block-copy block vector on the `use_intrabc == 1` arm;
+    /// both lists are populated per the §5.11.23 aggregate on the
+    /// inter arm.
+    pub mv: [[i32; 2]; 2],
     /// §5.11.5 `IsCompound = RefFrame[1] > INTRA_FRAME`. Always
     /// `false` on the intra arm (where `RefFrame[1] = NONE = -1 <
     /// INTRA_FRAME = 0`).

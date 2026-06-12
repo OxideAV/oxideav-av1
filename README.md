@@ -2,6 +2,86 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-12 (round 281)
+
+Round 281 threads the **full §5.11.7 `intra_frame_mode_info( )`
+composition into the §5.11.5 `decode_block_syntax` walker** — the
+intra path previously stopped after `intra_frame_y_mode`; it now runs
+prefix → `use_intrabc` dispatch → BOTH arms → §5.11.49
+`palette_tokens( )`:
+
+* **`else` arm** — `decode_block_syntax` calls the r280
+  `decode_intra_frame_mode_info_else_arm` composite
+  (`intra_frame_y_mode`, `intra_angle_info_y`, the `HasChroma` arm
+  with `uv_mode` / §5.11.45 CFL alphas / `intra_angle_info_uv`,
+  §5.11.46 `palette_mode_info` with entry reads, §5.11.24
+  `filter_intra_mode_info`). The §8.3.2 `has_palette_y` neighbour ctx
+  (av1-spec p.378: `( AvailU && PaletteSizes[ 0 ][ MiRow - 1 ][ MiCol
+  ] > 0 ) + ( AvailL && … )`) is derived from the walker's own
+  `PaletteSizes[ 0 ]` grid, and the decoded `UVMode` now feeds the
+  §5.11.33 chroma `predict_intra` tasks plus the §5.11.34 residual
+  context (both previously pinned to `DC_PRED`).
+* **`use_intrabc == 1` arm** — the fixed no-bit assignments, then
+  §7.10.2 `find_mv_stack( 0 )` against `RefFrame = [ INTRA_FRAME,
+  NONE ]` (identity global-motion tables — §7.10.2.1 zeroes
+  `GlobalMvs[ 0 ]` on `INTRA_FRAME`; temporal scan gated off, an
+  inter-frame feature) and the §5.11.26 `assign_mv( 0 )`
+  intra-block-copy body: `PredMv[ 0 ]` via the r278 three-stage
+  fallback chain (`MiRowStart` from the walker's own tile geometry)
+  and `read_mv( 0 )` under `MvCtx = MV_INTRABC_CONTEXT` /
+  `force_integer_mv = 1` (§5.9.2 forces it on every intra frame).
+  Previously the walker recorded the fixed assignments but never
+  consumed the MV bits — a bitstream desync on any intrabc block.
+  The §5.11.5 footer stamps land on the walker grids (`YModes` /
+  `IsInters` / `RefFrames` / `Mvs` slot 0 / `InterpFilters =
+  BILINEAR`; `CompGroupIdxs` / `CompoundIdxs` skipped per the
+  §5.11.5 `if ( !use_intrabc )` gate) so subsequent intrabc blocks'
+  §7.10.2 neighbour scans observe them.
+* **§5.11.49 `palette_tokens( )`** — on `PaletteSize{Y,UV} > 0` the
+  walker reads the `color_index_map_{y,uv}` `NS(PaletteSize)` literal
+  and runs the anti-diagonal `palette_color_idx_{y,uv}` S() walk via
+  the pre-existing `palette_tokens_plane` leaf (Y at luma geometry,
+  UV at the §5.11.49 subsampled-plus-bump geometry via
+  `palette_tokens_args`). Decoded `ColorMap{Y,UV}` contents keep the
+  arithmetic decoder in sync; per-sample map retention for §7.11.4
+  palette prediction is a follow-up.
+
+`decode_block_syntax` / `decode_partition_syntax` grow three
+threaded gates (`allow_screen_content_tools`, `enable_filter_intra`,
+`bit_depth`); `DecodedBlock` surfaces the new per-block state
+(`uv_mode`, angle deltas, CFL alphas, palette sizes, filter-intra
+pair, `Mv[ 0..2 ]`).
+
++3 walker integration tests (each writes the block with the encoder's
+§5.11.7 writers and asserts the decoder lands exactly on an 8-bit
+sync sentinel): the full else-arm composition (directional luma +
+chroma with `TileIntraFrameYModeCdf[0][0]` adaptation equality); the
+intrabc arm consuming the §5.11.26/§5.11.31 MV bits at the
+origin-block fallback predictor `[ 0, -2560 ]` with all five grid
+stamps asserted; and a `PaletteSizeY = 2` block whose §5.11.49 NS()
++ 63-sample anti-diagonal walk is mirrored symbol-for-symbol on the
+write side. Walker integration suite moves to 62 (was 59); library
+test count stays 1922.
+
+### Pending follow-ups for round 282+
+
+* Thread the §5.11.7 composition into the **encoder-side
+  partition-tree block writer** (`encoder::partition_tree` leaves
+  still write the §5.11.22 `y_mode` path with origin-default ctx and
+  no prefix / `use_intrabc` dispatch).
+* Retain the §5.11.49 `ColorMap{Y,UV}` per-sample maps + a `UVModes`
+  walker grid (feeds §7.11.4 `predict_palette` and the §5.11.5
+  footer's `UVModes` stamp).
+* §5.11.17 `read_var_tx_size` wiring for the `is_inter == 1` paths of
+  `read_block_tx_size` under `TX_MODE_SELECT` (intrabc + inter-frame
+  blocks currently use the §5.11.15 `else` arm).
+* Wiring `write_inter_block_mode_info` into a frame-level inter encode
+  driver (the §5.11.18 `inter_frame_mode_info` prefix writer exists;
+  the partition/pixel drivers are intra-only so far), including the
+  walker-side grid stamping the tail's neighbour scalars come from.
+
+---
+
 ## Status — 2026-06-12 (round 280)
 
 Round 280 composes the **§5.11.7 `intra_frame_mode_info( )` `else`
