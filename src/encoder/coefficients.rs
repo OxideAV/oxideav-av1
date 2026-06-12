@@ -833,6 +833,13 @@ pub fn write_golomb(writer: &mut SymbolWriter, value: u32) -> Result<(), Error> 
 ///
 /// ## Returns
 ///
+/// A [`crate::cdf::CoefficientsReadout`] mirroring what the §5.11.39
+/// reader would return for the just-written TU (`all_zero` / `eob` /
+/// `cul_level` / `dc_category`) — the `cul_level` / `dc_category`
+/// pair feeds the §5.11.39 tail stamps into the §6.10.2
+/// `Above{Level,Dc}Context` / `Left{Level,Dc}Context` arrays the
+/// §8.3.2 `all_zero` / `dc_sign` ctx walks consult on neighbour TUs.
+///
 /// [`Error::PartitionWalkOutOfRange`] for any out-of-range index or
 /// quant-buffer / scan-buffer length shortfall. Propagates
 /// [`SymbolWriter::write_symbol`] / `write_literal` / `write_golomb`
@@ -855,7 +862,7 @@ pub fn write_coefficients(
     dc_sign_ctx: usize,
     scan: &[u16],
     quant_in: &[i32],
-) -> Result<u32, Error> {
+) -> Result<crate::cdf::CoefficientsReadout, Error> {
     // ---------------- caller-bug guards (mirror the reader's) ---------
     if tx_size >= TX_SIZES_ALL {
         return Err(Error::PartitionWalkOutOfRange);
@@ -923,8 +930,15 @@ pub fn write_coefficients(
     write_txb_skip(writer, cdfs, all_zero, tx_sz_ctx, txb_skip_ctx)?;
     if eob == 0 {
         // §5.11.39 line 14: short-circuit. No further reads on the
-        // reader side ⇒ no further writes here.
-        return Ok(0);
+        // reader side ⇒ no further writes here. `culLevel` /
+        // `dcCategory` keep their line-11/12 zero initialisers (the
+        // §5.11.39 tail stamps still fire on the gate-closed arm).
+        return Ok(crate::cdf::CoefficientsReadout {
+            all_zero: true,
+            eob: 0,
+            cul_level: 0,
+            dc_category: 0,
+        });
     }
 
     // §5.11.39 lines 19-55: eob_pt + eob_extra + eob_extra_bit loop.
@@ -1013,12 +1027,16 @@ pub fn write_coefficients(
     }
 
     // ---------------- §5.11.39 forward-scan: signs + golomb ----------
+    // `culLevel` / `dcCategory` mirror the reader's §5.11.39 lines
+    // 94-102 derivations from the same forward walk.
+    let mut cul_level: u32 = 0;
+    let mut dc_category: u8 = 0;
     for (c, &pos_u16) in scan.iter().enumerate().take(eob as usize) {
         let pos = pos_u16 as usize;
         let target = quant_in[pos];
         let target_abs: u32 = target.unsigned_abs();
+        let sign: u8 = if target < 0 { 1 } else { 0 };
         if target_abs != 0 {
-            let sign: u8 = if target < 0 { 1 } else { 0 };
             if c == 0 {
                 write_dc_sign(writer, cdfs, sign, plane, dc_sign_ctx)?;
             } else {
@@ -1031,9 +1049,25 @@ pub fn write_coefficients(
         if target_abs > threshold_golomb {
             write_golomb(writer, target_abs)?;
         }
+        // §5.11.39 lines 94-96: `dcCategory` derive on pos == 0 (the
+        // reader's pre-clip `Quant[pos] > 0` gate is `target_abs > 0`
+        // here — the writer's input is the reader's output).
+        if pos == 0 && target_abs > 0 {
+            dc_category = if sign != 0 { 1 } else { 2 };
+        }
+        // §5.11.39 lines 97-98: `Quant[pos] &= 0xFFFFF; culLevel +=
+        // Quant[pos]`.
+        cul_level = cul_level.saturating_add(target_abs & 0xFFFFF);
     }
+    // §5.11.39 line 102: `culLevel = Min( 63, culLevel )`.
+    let cul_level: u8 = core::cmp::min(63, cul_level) as u8;
 
-    Ok(eob)
+    Ok(crate::cdf::CoefficientsReadout {
+        all_zero: false,
+        eob,
+        cul_level,
+        dc_category,
+    })
 }
 
 #[cfg(test)]
@@ -2003,7 +2037,7 @@ mod tests {
         // ----- encode -----
         let mut enc_cdfs = TileCdfContext::new_from_defaults();
         let mut writer = SymbolWriter::new(false);
-        let eob = write_coefficients(
+        let wout = write_coefficients(
             &mut writer,
             &mut enc_cdfs,
             plane,
@@ -2039,15 +2073,21 @@ mod tests {
             .expect("reader decode succeeded");
 
         // §5.11.39 line-13 short-circuit: all_zero path returns eob = 0;
-        // matches the driver's `Ok(0)` short-circuit return.
+        // matches the driver's gate-closed short-circuit return. The
+        // writer's mirrored readout (`all_zero` / `eob` / `cul_level` /
+        // `dc_category`) must equal the reader's on every path — the
+        // §5.11.39 tail stamps both sides perform are fed from it.
         if quant_in.iter().all(|&q| q == 0) {
-            assert_eq!(eob, 0, "encoder eob == 0 for all-zero input");
+            assert_eq!(wout.eob, 0, "encoder eob == 0 for all-zero input");
             assert!(readout.all_zero, "decoder all_zero == true");
             assert_eq!(readout.eob, 0);
         } else {
             assert!(!readout.all_zero, "non-empty block must clear all_zero");
-            assert_eq!(eob, readout.eob, "encoder eob matches decoder eob");
         }
+        assert_eq!(
+            wout, readout,
+            "writer readout mirror must equal reader readout"
+        );
         (readout, quant_out)
     }
 

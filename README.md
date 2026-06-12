@@ -2,6 +2,71 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-12 (round 284)
+
+Round 284 lands the **§8.3.2 coefficient level-context machinery on
+both sides** plus the **§5.11.36 inter-arm `transform_tree` write
+side**:
+
+* **§6.10.2 context arrays on `PartitionWalker`** —
+  `AboveLevelContext` / `AboveDcContext` (per-plane, per 4-sample
+  column) and `LeftLevelContext` / `LeftDcContext` (per 4-sample
+  row), zeroed at construction per §5.11.2 `clear_above_context( )`
+  (`clear_txb_left_context( )` surfaces the per-superblock-row
+  `clear_left_context( )` reset, §6.10.2-complete including
+  `LeftSegPredContext`).
+* **§8.3.2 derivations** — `txb_skip_ctx( )` (the `all_zero` ctx:
+  luma Max-scan ladder 0..=6 with the `bw == w && bh == h`
+  short-circuit against the §5.11.38 plane-residual size of
+  `MiSize`; chroma OR-census 7..=12 with the `bw * bh > w * h`
+  `+= 3` adjustment) and `dc_sign_ctx( )` (±census of the DC
+  arrays, 1 ⇒ −1 / 2 ⇒ +1, reduced to 0/1/2), both clipping at
+  `maxX4 = MiCols >> subsampling_x` / `maxY4`.
+* **Decode-walker wiring** — the §5.11.35 `transform_block` path
+  derives both contexts live (replacing the pinned zeros), stamps
+  each TU's §5.11.39 `culLevel` / `dcCategory` tail via
+  `stamp_txb_level_context( )` (gate-open and gate-closed alike),
+  and the §5.11.5 `if ( skip ) reset_block_context( bw4, bh4 )`
+  §5.11.42 footprint reset is wired in `decode_block_syntax`.
+* **Encoder mirrors** — `write_coefficients` now returns the same
+  `CoefficientsReadout` the §5.11.39 reader produces (`all_zero` /
+  `eob` / `cul_level` / `dc_category`, mirroring the lines-94-102
+  forward-scan derivations); `write_transform_block` derives both
+  contexts from the mirror walker and stamps in lockstep; both
+  `write_block_syntax` skip arms (else-arm + intrabc) perform the
+  §5.11.42 reset.
+* **§5.11.36 write side** — `skip == 0` intra-block-copy leaves
+  (previously rejected) route their luma plane through the new
+  `write_transform_tree` recursion (mirror-`InterTxSizes[]` lookup
+  anchored at the chunk-offset base, `find_tx_size` leaf emit,
+  per-direction halving in decode order) and every §5.11.39 writer
+  takes the `is_inter = 1` CDF axes (`eob_pt_*[ 1 ]`, §5.11.48
+  inter tx-set admission) end-to-end.
+
+The round-trip harness now asserts cell-for-cell parity on all four
+context arrays after every tree — write↔decode `all_zero` /
+`dc_sign` ctx agreement is pinned per TU across the whole
+r282/r283/r284 battery. New tests: §8.3.2 luma-ladder /
+chroma-census / dc-sign-census / reset+clear unit pins (every spec
+arm), the stamp-vs-skip-reset choreography split (end-state array
+asserts), the lossless 4:2:0 chroma-`bsize` (`+= 3`) arm, and the
+intrabc `skip == 0` §5.11.36 round-trip. Library tests 1935 → 1942.
+
+### Pending follow-ups for round 285+
+
+* **Quantizer-params threading** — the decode walker pins the
+  per-block `ResidualContext` at `base_q_idx = 0`, which silences
+  the §5.11.47 `transform_type` S(); threading real §5.9.12
+  quantizer state through `decode_block_syntax` and the write side
+  (including a `write_transform_type`) is one paired arc.
+* **Pixel-driver ctx upgrade** — the matched encoder/decoder pixel
+  drivers still exchange coefficients with explicit
+  `txb_skip_ctx = dc_sign_ctx = 0`; migrating them onto the §8.3.2
+  derivations is an isolated paired change now that both helpers
+  exist.
+* **§5.11.16 `tx_depth` write threading** (`TX_MODE_SELECT`) and
+  the CFL `compute_prediction` decode gap carry over from r282.
+
 ## Status — 2026-06-12 (round 283)
 
 Round 283 threads the **§5.11.34 `residual( )` write side into

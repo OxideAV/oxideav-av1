@@ -14691,6 +14691,30 @@ pub struct PartitionWalker {
     /// initial-zero state matches the §8.3.1 tile-entry initialisation
     /// (`LeftSegPredContext[ i ] = 0` for every row at tile start).
     left_seg_pred_context: Vec<u8>,
+    /// `AboveLevelContext[ plane ][ x4 ]` (§6.10.2 / §8.3.2) — the
+    /// per-plane cumulative-magnitude column array the §8.3.2
+    /// `all_zero` ctx walk consults at a 4-sample granularity. Flat
+    /// plane-major layout: slot `plane * mi_cols + x4`. Entries are
+    /// `0` at tile entry (§5.11.2 `clear_above_context()` — the
+    /// walker is one-per-tile, so the construction-time zero-fill is
+    /// the tile-entry reset) and carry the §5.11.39 `culLevel`
+    /// (`0..=63`) of the most recent TU covering the column.
+    above_level_context: Vec<u8>,
+    /// `AboveDcContext[ plane ][ x4 ]` (§6.10.2 / §8.3.2) — the
+    /// per-plane DC-sign column array (`0` = no DC coded, `1` =
+    /// negative DC, `2` = positive DC) the §8.3.2 `dc_sign` /
+    /// chroma-`all_zero` ctx walks consult. Same layout / reset
+    /// story as [`Self::above_level_context`].
+    above_dc_context: Vec<u8>,
+    /// `LeftLevelContext[ plane ][ y4 ]` (§6.10.2 / §8.3.2) — the
+    /// per-plane row twin of [`Self::above_level_context`]. Flat
+    /// plane-major layout: slot `plane * mi_rows + y4`. §5.11.2
+    /// resets it per superblock row via `clear_left_context()`
+    /// (surfaced as [`Self::clear_txb_left_context`]).
+    left_level_context: Vec<u8>,
+    /// `LeftDcContext[ plane ][ y4 ]` (§6.10.2 / §8.3.2) — the
+    /// per-plane row twin of [`Self::above_dc_context`].
+    left_dc_context: Vec<u8>,
     /// `YModes[ row ][ col ]` packed into a row-major `mi_rows *
     /// mi_cols` flat buffer (av1-spec p.378 / §5.11.5 line
     /// `YModes[ r + y ][ c + x ] = YMode`). Entries are `0`
@@ -15000,6 +15024,27 @@ impl PartitionWalker {
             .try_reserve_exact(mi_rows as usize)
             .ok()?;
         left_seg_pred_context.resize(mi_rows as usize, 0);
+        // §6.10.2 / §8.3.2: `AboveLevelContext[ plane ][ i ] = 0` /
+        // `AboveDcContext[ plane ][ i ] = 0` for every column at tile
+        // entry (§5.11.2 `clear_above_context()`), and the `Left*`
+        // twins at superblock-row entry (`clear_left_context()` —
+        // the construction-time zero-fill covers the first row;
+        // [`Self::clear_txb_left_context`] covers subsequent rows).
+        // Three planes per axis, flat plane-major layout.
+        let cols3 = (mi_cols as usize).checked_mul(3)?;
+        let mut above_level_context: Vec<u8> = Vec::new();
+        above_level_context.try_reserve_exact(cols3).ok()?;
+        above_level_context.resize(cols3, 0);
+        let mut above_dc_context: Vec<u8> = Vec::new();
+        above_dc_context.try_reserve_exact(cols3).ok()?;
+        above_dc_context.resize(cols3, 0);
+        let rows3 = (mi_rows as usize).checked_mul(3)?;
+        let mut left_level_context: Vec<u8> = Vec::new();
+        left_level_context.try_reserve_exact(rows3).ok()?;
+        left_level_context.resize(rows3, 0);
+        let mut left_dc_context: Vec<u8> = Vec::new();
+        left_dc_context.try_reserve_exact(rows3).ok()?;
+        left_dc_context.resize(rows3, 0);
         // §5.11.5 / §8.3.2: pre-fill `YModes[]` with `DC_PRED == 0`,
         // the §3 intra-mode enumeration ordinal. An unavailable
         // neighbour contributes the same `Intra_Mode_Context[ DC_PRED
@@ -15110,6 +15155,10 @@ impl PartitionWalker {
             segment_ids,
             above_seg_pred_context,
             left_seg_pred_context,
+            above_level_context,
+            above_dc_context,
+            left_level_context,
+            left_dc_context,
             y_modes,
             tx_sizes,
             inter_tx_sizes,
@@ -16208,6 +16257,306 @@ impl PartitionWalker {
     #[must_use]
     pub fn left_seg_pred_context(&self) -> &[u8] {
         &self.left_seg_pred_context
+    }
+
+    /// View of the §6.10.2 / §8.3.2 `AboveLevelContext[ plane ][ x4 ]`
+    /// array — flat plane-major (`plane * mi_cols + x4`). Encoder
+    /// write↔decode lockstep tests compare this against the mirror's.
+    #[must_use]
+    pub fn above_level_context(&self) -> &[u8] {
+        &self.above_level_context
+    }
+
+    /// View of `AboveDcContext[ plane ][ x4 ]` —
+    /// see [`Self::above_level_context`].
+    #[must_use]
+    pub fn above_dc_context(&self) -> &[u8] {
+        &self.above_dc_context
+    }
+
+    /// View of `LeftLevelContext[ plane ][ y4 ]` — flat plane-major
+    /// (`plane * mi_rows + y4`).
+    #[must_use]
+    pub fn left_level_context(&self) -> &[u8] {
+        &self.left_level_context
+    }
+
+    /// View of `LeftDcContext[ plane ][ y4 ]` —
+    /// see [`Self::left_level_context`].
+    #[must_use]
+    pub fn left_dc_context(&self) -> &[u8] {
+        &self.left_dc_context
+    }
+
+    /// §5.11.2 `clear_left_context()` (the §6.10.2 semantics) — zeroes
+    /// `LeftLevelContext` / `LeftDcContext` for every plane and row.
+    /// The §5.11.2 `decode_tile()` loop invokes this at the start of
+    /// every superblock row; the walker's constructor covers the first
+    /// row, so a multi-superblock-row driver calls this between rows.
+    /// (`LeftSegPredContext` shares the §6.10.2 reset; it is zeroed
+    /// here too.)
+    pub fn clear_txb_left_context(&mut self) {
+        self.left_level_context.fill(0);
+        self.left_dc_context.fill(0);
+        self.left_seg_pred_context.fill(0);
+    }
+
+    /// §8.3.2 `all_zero` ctx (av1-spec p.370-371) — the
+    /// `TileTxbSkipCdf[ txSzCtx ][ ctx ]` second axis, derived from
+    /// the `AboveLevelContext` / `LeftLevelContext` (luma) or those
+    /// plus `AboveDcContext` / `LeftDcContext` (chroma) neighbour
+    /// scans over the TU's 4-sample columns / rows.
+    ///
+    /// * `plane` — `0..=2`; `tx_sz` — the TU's `TX_SIZES_ALL` ordinal.
+    /// * `mi_size` — the block's `MiSize` (the §8.3.2 body derives
+    ///   `bsize = get_plane_residual_size( MiSize, plane )` from the
+    ///   *block* size, not the §5.11.34 chunk size).
+    /// * `x4` / `y4` — the TU top-left in the plane's own 4-sample
+    ///   units (`startX >> 2` / `startY >> 2` of §5.11.39).
+    /// * `sub_x` / `sub_y` — the plane's subsampling (0 for luma; the
+    ///   §5.5.2 `subsampling_x` / `subsampling_y` for chroma), used
+    ///   for the `maxX4 = MiCols >> subsampling_x` clip.
+    ///
+    /// Returns `None` for out-of-range `plane` / `tx_sz` / `mi_size`
+    /// or a `BLOCK_INVALID` plane-residual size (caller bugs).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn txb_skip_ctx(
+        &self,
+        plane: u8,
+        tx_sz: usize,
+        mi_size: usize,
+        x4: u32,
+        y4: u32,
+        sub_x: u8,
+        sub_y: u8,
+    ) -> Option<usize> {
+        if plane > 2 || tx_sz >= TX_SIZES_ALL || mi_size >= BLOCK_SIZES {
+            return None;
+        }
+        // §8.3.2: `maxX4 = MiCols` / `maxY4 = MiRows`, halved per
+        // axis for chroma.
+        let (max_x4, max_y4) = if plane > 0 {
+            (
+                (self.mi_cols >> sub_x) as usize,
+                (self.mi_rows >> sub_y) as usize,
+            )
+        } else {
+            (self.mi_cols as usize, self.mi_rows as usize)
+        };
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        let w4 = w >> 2;
+        let h4 = h >> 2;
+        let bsize = get_plane_residual_size(mi_size, plane, sub_x, sub_y)?;
+        let bw = block_width(bsize);
+        let bh = block_height(bsize);
+        let p = plane as usize;
+        let above_base = p * self.mi_cols as usize;
+        let left_base = p * self.mi_rows as usize;
+        let x4 = x4 as usize;
+        let y4 = y4 as usize;
+        let ctx = if plane == 0 {
+            // §8.3.2 luma arm: Max-scan of the level arrays only.
+            let mut top: u32 = 0;
+            let mut left: u32 = 0;
+            for k in 0..w4 {
+                if x4 + k < max_x4 {
+                    top = core::cmp::max(top, self.above_level_context[above_base + x4 + k] as u32);
+                }
+            }
+            for k in 0..h4 {
+                if y4 + k < max_y4 {
+                    left = core::cmp::max(left, self.left_level_context[left_base + y4 + k] as u32);
+                }
+            }
+            // §8.3.2 `top = Min( top, 255 )` / `left = Min( left, 255
+            // )` — vacuous for the u8-backed arrays, kept for spec
+            // parity.
+            let top = core::cmp::min(top, 255);
+            let left = core::cmp::min(left, 255);
+            if bw == w && bh == h {
+                0
+            } else if top == 0 && left == 0 {
+                1
+            } else if top == 0 || left == 0 {
+                2 + usize::from(core::cmp::max(top, left) > 3)
+            } else if core::cmp::max(top, left) <= 3 {
+                4
+            } else if core::cmp::min(top, left) <= 3 {
+                5
+            } else {
+                6
+            }
+        } else {
+            // §8.3.2 chroma arm: OR-fold of level + dc arrays.
+            let mut above: u32 = 0;
+            let mut left: u32 = 0;
+            for i in 0..w4 {
+                if x4 + i < max_x4 {
+                    above |= self.above_level_context[above_base + x4 + i] as u32;
+                    above |= self.above_dc_context[above_base + x4 + i] as u32;
+                }
+            }
+            for i in 0..h4 {
+                if y4 + i < max_y4 {
+                    left |= self.left_level_context[left_base + y4 + i] as u32;
+                    left |= self.left_dc_context[left_base + y4 + i] as u32;
+                }
+            }
+            let mut ctx = usize::from(above != 0) + usize::from(left != 0) + 7;
+            if bw * bh > w * h {
+                ctx += 3;
+            }
+            ctx
+        };
+        debug_assert!(ctx < TXB_SKIP_CONTEXTS);
+        Some(ctx)
+    }
+
+    /// §8.3.2 `dc_sign` ctx (av1-spec p.377) — the
+    /// `TileDcSignCdf[ ptype ][ ctx ]` second axis: the signed census
+    /// of `AboveDcContext` / `LeftDcContext` over the TU's footprint
+    /// (`1` decrements, `2` increments), reduced to `1` (negative
+    /// majority) / `2` (positive majority) / `0` (tie).
+    ///
+    /// Parameter semantics mirror [`Self::txb_skip_ctx`] (no
+    /// `mi_size` — the `dc_sign` body never consults the block size).
+    /// Out-of-range `plane` / `tx_sz` return `0` rather than `None`
+    /// (the downstream CDF lookup re-guards), keeping the happy-path
+    /// call sites unwrap-free.
+    #[must_use]
+    pub fn dc_sign_ctx(
+        &self,
+        plane: u8,
+        tx_sz: usize,
+        x4: u32,
+        y4: u32,
+        sub_x: u8,
+        sub_y: u8,
+    ) -> usize {
+        if plane > 2 || tx_sz >= TX_SIZES_ALL {
+            return 0;
+        }
+        let (max_x4, max_y4) = if plane > 0 {
+            (
+                (self.mi_cols >> sub_x) as usize,
+                (self.mi_rows >> sub_y) as usize,
+            )
+        } else {
+            (self.mi_cols as usize, self.mi_rows as usize)
+        };
+        let w4 = TX_WIDTH[tx_sz] >> 2;
+        let h4 = TX_HEIGHT[tx_sz] >> 2;
+        let p = plane as usize;
+        let above_base = p * self.mi_cols as usize;
+        let left_base = p * self.mi_rows as usize;
+        let x4 = x4 as usize;
+        let y4 = y4 as usize;
+        let mut dc_sign: i32 = 0;
+        for k in 0..w4 {
+            if x4 + k < max_x4 {
+                match self.above_dc_context[above_base + x4 + k] {
+                    1 => dc_sign -= 1,
+                    2 => dc_sign += 1,
+                    _ => {}
+                }
+            }
+        }
+        for k in 0..h4 {
+            if y4 + k < max_y4 {
+                match self.left_dc_context[left_base + y4 + k] {
+                    1 => dc_sign -= 1,
+                    2 => dc_sign += 1,
+                    _ => {}
+                }
+            }
+        }
+        match dc_sign.cmp(&0) {
+            core::cmp::Ordering::Less => 1,
+            core::cmp::Ordering::Greater => 2,
+            core::cmp::Ordering::Equal => 0,
+        }
+    }
+
+    /// §5.11.39 tail stamps (av1-spec p.91) — after every `coeffs()`
+    /// call (gate-open or gate-closed) the per-TU `culLevel` /
+    /// `dcCategory` overwrite the `Above*Context[ plane ][ x4 + i ]`
+    /// columns (`i in 0..w4`) and `Left*Context[ plane ][ y4 + i ]`
+    /// rows (`i in 0..h4`). Stamps past the per-plane array extent
+    /// are clipped (the §8.3.2 readers never consult cells at or
+    /// beyond `maxX4` / `maxY4`).
+    pub fn stamp_txb_level_context(
+        &mut self,
+        plane: u8,
+        tx_sz: usize,
+        x4: u32,
+        y4: u32,
+        cul_level: u8,
+        dc_category: u8,
+    ) {
+        if plane > 2 || tx_sz >= TX_SIZES_ALL {
+            return;
+        }
+        let w4 = TX_WIDTH[tx_sz] >> 2;
+        let h4 = TX_HEIGHT[tx_sz] >> 2;
+        let p = plane as usize;
+        let above_base = p * self.mi_cols as usize;
+        let left_base = p * self.mi_rows as usize;
+        let x4 = x4 as usize;
+        let y4 = y4 as usize;
+        for i in 0..w4 {
+            if x4 + i < self.mi_cols as usize {
+                self.above_level_context[above_base + x4 + i] = cul_level;
+                self.above_dc_context[above_base + x4 + i] = dc_category;
+            }
+        }
+        for i in 0..h4 {
+            if y4 + i < self.mi_rows as usize {
+                self.left_level_context[left_base + y4 + i] = cul_level;
+                self.left_dc_context[left_base + y4 + i] = dc_category;
+            }
+        }
+    }
+
+    /// §5.11.42 `reset_block_context( bw4, bh4 )` (av1-spec p.92) —
+    /// zeroes the `Above{Level,Dc}Context` columns and
+    /// `Left{Level,Dc}Context` rows covering a `skip == 1` block's
+    /// footprint, per plane (`1 + 2 * HasChroma` planes; chroma
+    /// indices halved per the plane's subsampling). The §5.11.5
+    /// `decode_block()` body invokes this right after
+    /// `read_block_tx_size()` when `skip` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reset_txb_block_context(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        bw4: u32,
+        bh4: u32,
+        has_chroma: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) {
+        let num_planes: u8 = if has_chroma { 3 } else { 1 };
+        for plane in 0..num_planes {
+            let sub_x = if plane > 0 { subsampling_x } else { 0 };
+            let sub_y = if plane > 0 { subsampling_y } else { 0 };
+            let above_base = plane as usize * self.mi_cols as usize;
+            let left_base = plane as usize * self.mi_rows as usize;
+            // §5.11.42: `for i = MiCol >> subX .. (MiCol + bw4) >> subX`.
+            for i in ((mi_col >> sub_x) as usize)..(((mi_col + bw4) >> sub_x) as usize) {
+                if i < self.mi_cols as usize {
+                    self.above_level_context[above_base + i] = 0;
+                    self.above_dc_context[above_base + i] = 0;
+                }
+            }
+            for i in ((mi_row >> sub_y) as usize)..(((mi_row + bh4) >> sub_y) as usize) {
+                if i < self.mi_rows as usize {
+                    self.left_level_context[left_base + i] = 0;
+                    self.left_dc_context[left_base + i] = 0;
+                }
+            }
+        }
     }
 
     /// Helper to read `MiSizes[ r ][ c ]`. Returns [`BLOCK_INVALID`]
@@ -24036,13 +24385,22 @@ impl PartitionWalker {
 
         // §5.11.5 line `if ( skip ) reset_block_context( bw4, bh4 )`.
         // `reset_block_context` per §5.11.42 (av1-spec p.92) zeroes
-        // per-superblock palette / above / left context arrays for
-        // the block's footprint. None of those arrays are tracked on
-        // the walker yet (the §5.11.42 context arrays are
-        // out-of-scope until the §5.11.34 residual reader lands), so
-        // this is a no-op on the current grid surface — the call
-        // site is preserved as a code-doc comment for the round that
-        // wires the §5.11.42 arrays.
+        // the `Above{Level,Dc}Context` / `Left{Level,Dc}Context`
+        // §6.10.2 arrays over the block's footprint (r284 — wired
+        // through [`Self::reset_txb_block_context`]; the encoder's
+        // `write_block_syntax` skip arm performs the same reset on
+        // its mirror walker).
+        if prefix.skip != 0 {
+            self.reset_txb_block_context(
+                mi_row_b,
+                mi_col_b,
+                bw4,
+                bh4,
+                has_chroma,
+                subsampling_x,
+                subsampling_y,
+            );
+        }
 
         // §5.11.5 line `isCompound = RefFrame[ 1 ] > INTRA_FRAME`.
         // On the intra arm `RefFrame[ 1 ] = NONE = -1 < INTRA_FRAME =
@@ -25146,6 +25504,7 @@ impl PartitionWalker {
                             lossless,
                             mi_row,
                             mi_col,
+                            mi_size,
                             ctx,
                             &mut readout,
                         )?;
@@ -25181,6 +25540,7 @@ impl PartitionWalker {
                                     lossless,
                                     mi_row,
                                     mi_col,
+                                    mi_size,
                                     ctx,
                                     &mut readout,
                                 )?;
@@ -25237,6 +25597,7 @@ impl PartitionWalker {
         lossless: bool,
         mi_row: u32,
         mi_col: u32,
+        mi_size: usize,
         ctx: &ResidualContext,
         readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
@@ -25274,7 +25635,7 @@ impl PartitionWalker {
                 /* base_y = */ start_y, tx_sz, /* x = */ 0, /* y = */ 0,
                 /* sub_x = */ 0, /* sub_y = */ 0, chunk_x, chunk_y,
                 /* from_transform_tree = */ true, skip, is_inter, lossless, mi_row, mi_col,
-                ctx, readout,
+                mi_size, ctx, readout,
             );
         }
         // §5.11.36 lines 12-25: per-direction split.
@@ -25293,6 +25654,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25310,6 +25672,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25328,6 +25691,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25345,6 +25709,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25363,6 +25728,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25380,6 +25746,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25397,6 +25764,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25414,6 +25782,7 @@ impl PartitionWalker {
                 lossless,
                 mi_row,
                 mi_col,
+                mi_size,
                 ctx,
                 readout,
             )?;
@@ -25477,6 +25846,7 @@ impl PartitionWalker {
         lossless: bool,
         mi_row: u32,
         mi_col: u32,
+        mi_size: usize,
         ctx: &ResidualContext,
         readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
@@ -25637,6 +26007,15 @@ impl PartitionWalker {
             // bounds check.
             let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
             let mut quant = vec![0i32; tx_w * tx_h];
+            // §8.3.2 `all_zero` / `dc_sign` ctx — the neighbour-array
+            // walks over `Above{Level,Dc}Context` /
+            // `Left{Level,Dc}Context` (r284; the encoder's
+            // `write_transform_block_intra` derives the same pair from
+            // its mirror walker).
+            let txb_skip_ctx = self
+                .txb_skip_ctx(plane, tx_sz, mi_size, x4, y4, sub_x, sub_y)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let dc_sign_ctx = self.dc_sign_ctx(plane, tx_sz, x4, y4, sub_x, sub_y);
             let coeffs = self.coefficients(
                 decoder,
                 cdfs,
@@ -25644,11 +26023,22 @@ impl PartitionWalker {
                 is_inter as u8,
                 tx_sz,
                 tx_class,
-                /* txb_skip_ctx = */ 0,
-                /* dc_sign_ctx = */ 0,
+                txb_skip_ctx,
+                dc_sign_ctx,
                 scan,
                 &mut quant,
             )?;
+            // §5.11.39 tail — stamp the TU's `culLevel` / `dcCategory`
+            // into the §6.10.2 context arrays (gate-open and
+            // gate-closed alike).
+            self.stamp_txb_level_context(
+                plane,
+                tx_sz,
+                x4,
+                y4,
+                coeffs.cul_level,
+                coeffs.dc_category,
+            );
             readout.coeffs.push(coeffs);
             // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
             // §7.12.3 dequantization (step 1, r183 LANDED) + §7.13
@@ -52501,5 +52891,173 @@ mod tests {
             intra_edge_upsample(4, 8, &mut tiny),
             Err(crate::Error::PartitionWalkOutOfRange)
         );
+    }
+
+    // -----------------------------------------------------------------
+    // r284 — §8.3.2 `all_zero` / `dc_sign` ctx derivations + the
+    // §5.11.39 tail stamps / §5.11.42 reset / §6.10.2 clears over the
+    // `Above{Level,Dc}Context` / `Left{Level,Dc}Context` arrays.
+    // -----------------------------------------------------------------
+
+    fn txb_ctx_walker(mi_rows: u32, mi_cols: u32) -> PartitionWalker {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: mi_rows,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+        };
+        PartitionWalker::new(mi_rows, mi_cols, geom).unwrap()
+    }
+
+    /// §8.3.2 luma `all_zero` ladder (av1-spec p.370-371) — every arm,
+    /// driven by stamping controlled `culLevel` values around a TX_8X8
+    /// TU inside a BLOCK_16X16 (so `bw != w` keeps the ladder live).
+    #[test]
+    fn txb_skip_ctx_luma_ladder_all_arms() {
+        let mut w = txb_ctx_walker(8, 8);
+        // Arm 1: TU == plane residual size ⇒ ctx 0 even with stamped
+        // neighbours.
+        w.stamp_txb_level_context(0, TX_8X8, 0, 0, 60, 2);
+        assert_eq!(
+            w.txb_skip_ctx(0, TX_16X16, BLOCK_16X16, 2, 2, 0, 0),
+            Some(0),
+            "bw == w && bh == h arm ignores neighbours"
+        );
+        // Reset to a fresh walker for the neighbour arms; the probe TU
+        // is TX_8X8 at (x4, y4) = (2, 2) inside BLOCK_16X16.
+        let probe = |w: &PartitionWalker| w.txb_skip_ctx(0, TX_8X8, BLOCK_16X16, 2, 2, 0, 0);
+        let mut w = txb_ctx_walker(8, 8);
+        // Arm 2: top == 0 && left == 0 ⇒ 1.
+        assert_eq!(probe(&w), Some(1));
+        // Arm 3a: one side zero, max <= 3 ⇒ 2. Stamp a culLevel = 2
+        // TX_8X8 column band covering x4 = 2..3.
+        w.stamp_txb_level_context(0, TX_8X8, 2, 0, 2, 0);
+        // The stamp also wrote Left rows 0..1 — the probe at y4 = 2
+        // reads rows 2..3, still zero.
+        assert_eq!(probe(&w), Some(2));
+        // Arm 3b: one side zero, max > 3 ⇒ 3.
+        w.stamp_txb_level_context(0, TX_8X8, 2, 0, 9, 0);
+        assert_eq!(probe(&w), Some(3));
+        // Arm 4: both non-zero, max <= 3 ⇒ 4.
+        let mut w = txb_ctx_walker(8, 8);
+        w.stamp_txb_level_context(0, TX_8X8, 2, 0, 3, 0); // above cols 2..3
+        w.stamp_txb_level_context(0, TX_8X8, 0, 2, 1, 0); // left rows 2..3
+        assert_eq!(probe(&w), Some(4));
+        // Arm 5: min <= 3 < max ⇒ 5.
+        w.stamp_txb_level_context(0, TX_8X8, 2, 0, 30, 0);
+        assert_eq!(probe(&w), Some(5));
+        // Arm 6: both > 3 ⇒ 6.
+        w.stamp_txb_level_context(0, TX_8X8, 0, 2, 12, 0);
+        assert_eq!(probe(&w), Some(6));
+    }
+
+    /// §8.3.2 chroma `all_zero` arm: base 7 + OR-census of level|dc
+    /// per side + the `bw * bh > w * h` `+= 3` adjustment.
+    #[test]
+    fn txb_skip_ctx_chroma_census_and_bsize_adjustment() {
+        // 4:2:0 BLOCK_16X16 ⇒ chroma residual BLOCK_8X8 (bw = bh = 8).
+        // A chroma TX_8X8 TU matches it ⇒ no +3; both sides clear ⇒ 7.
+        let mut w = txb_ctx_walker(8, 8);
+        assert_eq!(w.txb_skip_ctx(1, TX_8X8, BLOCK_16X16, 0, 0, 1, 1), Some(7));
+        // Above census fires through the DC array alone (level still
+        // 0): ctx 8.
+        w.stamp_txb_level_context(1, TX_8X8, 0, 4, 0, 2);
+        assert_eq!(w.txb_skip_ctx(1, TX_8X8, BLOCK_16X16, 0, 0, 1, 1), Some(8));
+        // Left census too (level path): ctx 9.
+        w.stamp_txb_level_context(1, TX_8X8, 4, 0, 5, 0);
+        assert_eq!(w.txb_skip_ctx(1, TX_8X8, BLOCK_16X16, 0, 0, 1, 1), Some(9));
+        // TX_4X4 against the BLOCK_8X8 chroma residual size: 64 > 16
+        // ⇒ += 3 on top of the census ⇒ 12.
+        assert_eq!(w.txb_skip_ctx(1, TX_4X4, BLOCK_16X16, 0, 0, 1, 1), Some(12));
+        // Caller bugs ⇒ None.
+        assert_eq!(w.txb_skip_ctx(3, TX_4X4, BLOCK_16X16, 0, 0, 1, 1), None);
+        assert_eq!(
+            w.txb_skip_ctx(0, TX_SIZES_ALL, BLOCK_16X16, 0, 0, 0, 0),
+            None
+        );
+        assert_eq!(w.txb_skip_ctx(0, TX_4X4, BLOCK_SIZES, 0, 0, 0, 0), None);
+    }
+
+    /// §8.3.2 `dc_sign` ctx (av1-spec p.377): the ±census over
+    /// `AboveDcContext` / `LeftDcContext` (1 ⇒ −1, 2 ⇒ +1), reduced to
+    /// 0 (tie) / 1 (negative) / 2 (positive); cells at or past
+    /// `maxX4` / `maxY4` never vote.
+    #[test]
+    fn dc_sign_ctx_census_and_frame_edge_clip() {
+        let mut w = txb_ctx_walker(4, 4);
+        assert_eq!(w.dc_sign_ctx(0, TX_8X8, 0, 0, 0, 0), 0, "clean state ties");
+        // One negative above vote.
+        w.stamp_txb_level_context(0, TX_4X4, 0, 2, 1, 1);
+        assert_eq!(w.dc_sign_ctx(0, TX_8X8, 0, 0, 0, 0), 1);
+        // Two positive left votes outweigh it.
+        w.stamp_txb_level_context(0, TX_8X8, 2, 0, 1, 2);
+        assert_eq!(w.dc_sign_ctx(0, TX_8X8, 0, 0, 0, 0), 2);
+        // Balanced (one −1 above + one +1 above) + clean left ⇒ tie.
+        let mut w = txb_ctx_walker(4, 4);
+        w.stamp_txb_level_context(0, TX_4X4, 0, 2, 1, 1);
+        w.stamp_txb_level_context(0, TX_4X4, 1, 2, 1, 2);
+        assert_eq!(w.dc_sign_ctx(0, TX_8X8, 0, 0, 0, 0), 0);
+        // Chroma maxX4 clip: a 4:2:0 chroma TX_8X8 at x4 = 1 spans
+        // columns 1..2, but maxX4 = 4 >> 1 = 2 — column 2 (stamped
+        // positive) must not vote.
+        let mut w = txb_ctx_walker(4, 4);
+        w.stamp_txb_level_context(1, TX_4X4, 2, 3, 1, 2);
+        assert_eq!(w.dc_sign_ctx(1, TX_8X8, 1, 0, 1, 1), 0);
+    }
+
+    /// §5.11.42 `reset_block_context` zeroes exactly the footprint
+    /// (per plane, chroma-halved), and §6.10.2
+    /// `clear_txb_left_context` zeroes the whole Left pair.
+    #[test]
+    fn reset_txb_block_context_footprint_and_left_clear() {
+        let mut w = txb_ctx_walker(8, 8);
+        // Stamp every plane's full extent.
+        for plane in 0..3u8 {
+            for x4 in 0..8 {
+                w.stamp_txb_level_context(plane, TX_4X4, x4, x4, 21, 2);
+            }
+        }
+        // Reset a bw4 = bh4 = 4 footprint at (mi_row, mi_col) = (4, 4)
+        // with 4:2:0 chroma.
+        w.reset_txb_block_context(4, 4, 4, 4, true, 1, 1);
+        let alc = w.above_level_context();
+        let adc = w.above_dc_context();
+        let llc = w.left_level_context();
+        // Luma: columns 4..8 zeroed, 0..4 retained.
+        assert!(alc[0..4].iter().all(|&v| v == 21));
+        assert!(alc[4..8].iter().all(|&v| v == 0));
+        assert!(adc[4..8].iter().all(|&v| v == 0));
+        // Left luma rows (plane base 0): 4..8 zeroed, 0..4 retained.
+        let llc0 = &llc[0..8];
+        assert!(llc0[0..4].iter().all(|&v| v == 21));
+        assert!(llc0[4..8].iter().all(|&v| v == 0));
+        // Chroma plane 1: subsampled footprint 2..4 zeroed, 0..2
+        // retained.
+        let alc1 = &w.above_level_context()[8..16];
+        assert!(alc1[0..2].iter().all(|&v| v == 21));
+        assert!(alc1[2..4].iter().all(|&v| v == 0));
+        assert!(
+            alc1[4..8].iter().all(|&v| v == 21),
+            "past footprint retained"
+        );
+        // mono-chrome reset leaves chroma planes alone.
+        let mut w2 = txb_ctx_walker(8, 8);
+        for plane in 0..3u8 {
+            w2.stamp_txb_level_context(plane, TX_4X4, 0, 0, 5, 1);
+        }
+        w2.reset_txb_block_context(0, 0, 8, 8, false, 1, 1);
+        assert_eq!(w2.above_level_context()[0], 0, "luma reset");
+        assert_eq!(w2.above_level_context()[8], 5, "chroma retained");
+        // §6.10.2 clear_left_context: Left pair + LeftSegPredContext
+        // zeroed, Above pair retained.
+        let mut w3 = txb_ctx_walker(8, 8);
+        for plane in 0..3u8 {
+            w3.stamp_txb_level_context(plane, TX_4X4, 3, 3, 9, 2);
+        }
+        w3.clear_txb_left_context();
+        assert!(w3.left_level_context().iter().all(|&v| v == 0));
+        assert!(w3.left_dc_context().iter().all(|&v| v == 0));
+        assert_eq!(w3.above_level_context()[3], 9, "above retained");
+        assert_eq!(w3.above_dc_context()[3], 2, "above retained");
     }
 }

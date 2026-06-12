@@ -106,15 +106,16 @@
 //! [`crate::cdf::PartitionWalker::decode_block`]: crate::cdf::PartitionWalker
 
 use crate::cdf::{
-    cfl_allowed_for_uv_mode, compute_tx_type, get_plane_residual_size, get_tx_size, intra_mode_ctx,
-    intra_tx_type_set, palette_tokens_args, partition_ctx, partition_subsize, segment_id_ctx,
-    size_group, skip_ctx, EncoderBlockSyntaxStamp, MotionFieldMvs, PalettePlane, PartitionWalker,
-    TileCdfContext, TileGeometry, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT,
-    DC_PRED, FRAME_LF_COUNT, GM_TYPE_IDENTITY, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS,
-    MAX_TX_SIZE_RECT, MI_HEIGHT_LOG2, MI_SIZE, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH,
-    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, TX_4X4, TX_CLASS_2D,
-    TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT,
-    V_FLIPADST, WARPEDMODEL_PREC_BITS,
+    cfl_allowed_for_uv_mode, compute_tx_type, find_tx_size, get_plane_residual_size, get_tx_size,
+    inter_tx_type_set, intra_mode_ctx, intra_tx_type_set, palette_tokens_args, partition_ctx,
+    partition_subsize, segment_id_ctx, size_group, skip_ctx, EncoderBlockSyntaxStamp,
+    MotionFieldMvs, PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_64X64,
+    BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
+    H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT, MI_HEIGHT_LOG2, MI_SIZE,
+    MI_SIZE_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS,
+    PARTITION_NONE, PARTITION_SPLIT, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT,
+    TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
+    WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
     write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_intra_frame_else_arm,
@@ -1120,11 +1121,6 @@ pub fn write_block_syntax(
     if block.skip > 1 {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    if block.intrabc_mv.is_some() && block.skip != 1 {
-        // §5.11.34 inter-luma `transform_tree` write threading
-        // (the `is_inter && !Lossless && !plane` arm) — follow-up arc.
-        return Err(Error::PartitionWalkOutOfRange);
-    }
     if block.skip == 1 && !block.residual_quant.is_empty() {
         // §5.11.35 `!skip` never fires on a skip leaf — supplying TU
         // coefficient arrays there is a caller bug (they would be
@@ -1330,17 +1326,51 @@ pub fn write_block_syntax(
             });
         // §5.11.49 `palette_tokens( )` — `PaletteSize{Y,UV} = 0` on
         // the intrabc arm ⇒ no-op.
-        //
-        // §5.11.34 `residual()` skip-arm mirror (r283): the decode
-        // walker still walks the per-TU §5.11.36 / §5.11.34 dispatch
-        // bit-silently on `skip == 1` and pre-stamps `TxTypes[] =
-        // DCT_DCT` over every luma TU footprint (the §5.11.39
-        // gate-closed invariant the §5.11.40 chroma lookup relies on).
-        // The TU footprints tile the block's luma extent, so a single
-        // clipped block-footprint stamp is observably identical.
-        state
-            .mirror
-            .stamp_tx_type(mi_col, mi_row, bw4, bh4, DCT_DCT as u8);
+
+        if block.skip == 0 {
+            // §5.11.34 `residual()` — the intra-block-copy arm has
+            // `is_inter = 1`, so the luma plane routes through the
+            // §5.11.36 `transform_tree` recursion (r284) and the
+            // §5.11.39 writers take the `is_inter` CDF axes.
+            write_residual(
+                writer,
+                cdfs,
+                state,
+                block,
+                mi_row,
+                mi_col,
+                sub_size,
+                params,
+                has_chroma,
+                lossless,
+                tx_size_blk,
+                /* is_inter = */ true,
+            )?;
+        } else {
+            // §5.11.34 `residual()` skip-arm mirror (r283): the decode
+            // walker still walks the per-TU §5.11.36 / §5.11.34
+            // dispatch bit-silently on `skip == 1` and pre-stamps
+            // `TxTypes[] = DCT_DCT` over every luma TU footprint (the
+            // §5.11.39 gate-closed invariant the §5.11.40 chroma
+            // lookup relies on). The TU footprints tile the block's
+            // luma extent, so a single clipped block-footprint stamp
+            // is observably identical.
+            state
+                .mirror
+                .stamp_tx_type(mi_col, mi_row, bw4, bh4, DCT_DCT as u8);
+            // §5.11.5 `if ( skip ) reset_block_context( bw4, bh4 )` —
+            // the decode walker resets on the common path, intrabc
+            // arm included (r284).
+            state.mirror.reset_txb_block_context(
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                has_chroma,
+                params.subsampling_x,
+                params.subsampling_y,
+            );
+        }
         return Ok(());
     }
 
@@ -1501,7 +1531,7 @@ pub fn write_block_syntax(
     // one clipped block-footprint stamp. On `skip == 0` the full
     // per-TU §5.11.39 coefficient write composition runs.
     if block.skip == 0 {
-        write_residual_intra(
+        write_residual(
             writer,
             cdfs,
             state,
@@ -1513,11 +1543,27 @@ pub fn write_block_syntax(
             has_chroma,
             lossless,
             tx_size_blk,
+            /* is_inter = */ false,
         )?;
     } else {
         state
             .mirror
             .stamp_tx_type(mi_col, mi_row, bw4, bh4, DCT_DCT as u8);
+        // §5.11.5 line `if ( skip ) reset_block_context( bw4, bh4 )`
+        // — §5.11.42 zeroes the §6.10.2 `Above{Level,Dc}Context` /
+        // `Left{Level,Dc}Context` arrays over the footprint; the
+        // decode walker performs the same reset, so the mirror must
+        // track it for the §8.3.2 `all_zero` / `dc_sign` ctx walks of
+        // subsequent leaves to stay in lockstep.
+        state.mirror.reset_txb_block_context(
+            mi_row,
+            mi_col,
+            bw4,
+            bh4,
+            has_chroma,
+            params.subsampling_x,
+            params.subsampling_y,
+        );
     }
     Ok(())
 }
@@ -1546,16 +1592,17 @@ pub fn write_block_syntax(
 ///       }
 /// ```
 ///
-/// (The `is_inter && !Lossless && !plane` §5.11.36 `transform_tree`
-/// arm is unreachable here — [`write_block_syntax`] rejects `skip ==
-/// 0` intra-block-copy leaves, and the §5.11.7 else arm always has
-/// `is_inter == 0`.)
+/// On `is_inter == 1` (the §5.11.7 `use_intrabc == 1` arm) the
+/// `is_inter && !Lossless && !plane` branch routes the luma plane
+/// through the §5.11.36 `transform_tree` recursion
+/// ([`write_transform_tree`], r284) instead of the direct `stepX` /
+/// `stepY` iteration; chroma planes always take the direct loop.
 ///
 /// Each visited TU consumes the next [`SyntaxBlock::residual_quant`]
 /// entry; a count mismatch in either direction is a caller bug
 /// ([`Error::PartitionWalkOutOfRange`]).
 #[allow(clippy::too_many_arguments)]
-fn write_residual_intra(
+fn write_residual(
     writer: &mut SymbolWriter,
     cdfs: &mut TileCdfContext,
     state: &mut PartitionSyntaxWriter,
@@ -1567,6 +1614,7 @@ fn write_residual_intra(
     has_chroma: bool,
     lossless: bool,
     tx_size_blk: usize,
+    is_inter: bool,
 ) -> Result<(), Error> {
     // Caller-bug guards (mirror `PartitionWalker::residual`).
     if params.subsampling_x > 1 || params.subsampling_y > 1 {
@@ -1631,6 +1679,32 @@ fn write_residual_intra(
                 let num4x4_h = NUM_4X4_BLOCKS_HIGH[plane_sz];
                 let sub_x = if plane > 0 { params.subsampling_x } else { 0 };
                 let sub_y = if plane > 0 { params.subsampling_y } else { 0 };
+                // §5.11.34 lines 23-24: the inter-luma plane routes
+                // through the §5.11.36 `transform_tree` recursion
+                // anchored at the CHUNK-offset base (the write twin of
+                // the decode walker's `residual_transform_tree`).
+                if is_inter && !lossless && plane == 0 {
+                    let mi_row_chunk = mi_row + ((chunk_y as u32) << 4);
+                    let mi_col_chunk = mi_col + ((chunk_x as u32) << 4);
+                    let base_x = (mi_col_chunk >> sub_x) * (MI_SIZE as u32);
+                    let base_y = (mi_row_chunk >> sub_y) * (MI_SIZE as u32);
+                    write_transform_tree(
+                        writer,
+                        cdfs,
+                        state,
+                        block,
+                        base_x,
+                        base_y,
+                        (num4x4_w * 4) as u32,
+                        (num4x4_h * 4) as u32,
+                        mi_row,
+                        mi_col,
+                        sub_size,
+                        lossless,
+                        &mut tu_idx,
+                    )?;
+                    continue;
+                }
                 // §5.11.34 lines 26-27: `baseXBlock` / `baseYBlock`
                 // (the original `MiCol` / `MiRow`, NOT the
                 // chunk-offset ones).
@@ -1643,7 +1717,7 @@ fn write_residual_intra(
                     while x < num4x4_w {
                         let x_arg = (x as u32) + (((chunk_x as u32) << 4) >> sub_x);
                         let y_arg = (y as u32) + (((chunk_y as u32) << 4) >> sub_y);
-                        write_transform_block_intra(
+                        write_transform_block(
                             writer,
                             cdfs,
                             state,
@@ -1658,7 +1732,9 @@ fn write_residual_intra(
                             sub_y,
                             mi_row,
                             mi_col,
+                            sub_size,
                             lossless,
+                            is_inter,
                             &mut tu_idx,
                         )?;
                         x += step_x;
@@ -1697,13 +1773,16 @@ fn write_residual_intra(
 ///    `Mode_To_Txfm[ UVMode ]` filtered by the §5.11.48 set
 ///    admission) → §8.3.2 `get_tx_class` reduction → §7.5
 ///    [`crate::scan::get_scan`] selection.
-/// 4. The §5.11.39 [`write_coefficients`] emission with the decode
-///    walker's `txb_skip_ctx = 0` / `dc_sign_ctx = 0` (the §8.3.2
-///    `AboveLevelContext` / `LeftLevelContext` neighbour walks are
-///    not yet threaded on the decode side either — they land on both
-///    sides in the same follow-up arc).
+/// 4. The §5.11.39 [`write_coefficients`] emission with the §8.3.2
+///    `all_zero` / `dc_sign` contexts derived from the mirror
+///    walker's §6.10.2 `Above{Level,Dc}Context` /
+///    `Left{Level,Dc}Context` arrays (r284) — the same
+///    [`PartitionWalker::txb_skip_ctx`] / [`PartitionWalker::dc_sign_ctx`]
+///    derivations the decode walker performs — followed by the
+///    §5.11.39 tail stamps of the TU's `culLevel` / `dcCategory`
+///    into the mirror.
 #[allow(clippy::too_many_arguments)]
-fn write_transform_block_intra(
+fn write_transform_block(
     writer: &mut SymbolWriter,
     cdfs: &mut TileCdfContext,
     state: &mut PartitionSyntaxWriter,
@@ -1718,7 +1797,9 @@ fn write_transform_block_intra(
     sub_y: u8,
     mi_row: u32,
     mi_col: u32,
+    mi_size: usize,
     lossless: bool,
+    is_inter: bool,
     tu_idx: &mut usize,
 ) -> Result<(), Error> {
     // §5.11.35 lines 1-2 + 10-13.
@@ -1754,11 +1835,19 @@ fn write_transform_block_intra(
         let side = core::cmp::min(tx_w, tx_h);
         (side.trailing_zeros() as usize) - 2
     };
-    let tx_set = intra_tx_type_set(
-        tx_sz_sqr as u32,
-        TX_SIZE_SQR_UP[tx_sz] as u32,
-        /* reduced_tx_set = */ false,
-    );
+    let tx_set = if is_inter {
+        inter_tx_type_set(
+            tx_sz_sqr as u32,
+            TX_SIZE_SQR_UP[tx_sz] as u32,
+            /* reduced_tx_set = */ false,
+        )
+    } else {
+        intra_tx_type_set(
+            tx_sz_sqr as u32,
+            TX_SIZE_SQR_UP[tx_sz] as u32,
+            /* reduced_tx_set = */ false,
+        )
+    };
 
     // §5.11.40 `compute_tx_type( plane, txSz, x4, y4 )` against the
     // mirror's `TxTypes[]` grid — same closure shape as the decode
@@ -1771,7 +1860,7 @@ fn write_transform_block_intra(
             plane as usize,
             tx_sz,
             lossless,
-            /* is_inter = */ false,
+            is_inter,
             tx_set,
             mi_row,
             mi_col,
@@ -1812,10 +1901,132 @@ fn write_transform_block_intra(
     if quant.len() != tx_w * tx_h {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    write_coefficients(
-        writer, cdfs, plane, /* is_inter = */ 0, tx_sz, tx_class, /* txb_skip_ctx = */ 0,
-        /* dc_sign_ctx = */ 0, scan, quant,
+    // §8.3.2 `all_zero` / `dc_sign` ctx — the same neighbour-array
+    // derivations the decode walker's `transform_block_emit` performs,
+    // computed against the mirror's §6.10.2 context arrays (r284).
+    let txb_skip_ctx = state
+        .mirror
+        .txb_skip_ctx(plane, tx_sz, mi_size, x4, y4, sub_x, sub_y)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let dc_sign_ctx = state.mirror.dc_sign_ctx(plane, tx_sz, x4, y4, sub_x, sub_y);
+    let wout = write_coefficients(
+        writer,
+        cdfs,
+        plane,
+        u8::from(is_inter),
+        tx_sz,
+        tx_class,
+        txb_skip_ctx,
+        dc_sign_ctx,
+        scan,
+        quant,
     )?;
+    // §5.11.39 tail — stamp the TU's `culLevel` / `dcCategory` into
+    // the mirror so the next TU's ctx walk sees what the decode
+    // walker's will.
+    state
+        .mirror
+        .stamp_txb_level_context(plane, tx_sz, x4, y4, wout.cul_level, wout.dc_category);
+    Ok(())
+}
+
+/// §5.11.36 `transform_tree( startX, startY, w, h )` write twin — the
+/// bit-emitting mirror of the decode walker's §5.11.36 recursion
+/// (`residual_transform_tree`), invoked from [`write_residual`] on the
+/// `is_inter && !Lossless && plane == 0` arm (reachable through the
+/// §5.11.7 `use_intrabc == 1` + `skip == 0` leaf):
+///
+/// ```text
+///   transform_tree( startX, startY, w, h ) {
+///       maxX = MiCols * MI_SIZE ; maxY = MiRows * MI_SIZE
+///       if ( startX >= maxX || startY >= maxY ) return
+///       row = startY >> MI_SIZE_LOG2 ; col = startX >> MI_SIZE_LOG2
+///       lumaTxSz = InterTxSizes[ row ][ col ]
+///       lumaW = Tx_Width[ lumaTxSz ] ; lumaH = Tx_Height[ lumaTxSz ]
+///       if ( w <= lumaW && h <= lumaH ) {
+///           txSz = find_tx_size( w, h )
+///           transform_block( 0, startX, startY, txSz, 0, 0 )
+///       } else { ... per-direction halving recursion ... }
+///   }
+/// ```
+///
+/// The `InterTxSizes[]` lookup reads the encoder mirror's grid — the
+/// §5.11.16 stamp in [`write_block_syntax`]'s
+/// `stamp_encoder_block_syntax` call mirrors the decode walker's
+/// `read_block_tx_size` else-arm fill, so the recursion shape agrees
+/// on both sides by construction.
+#[allow(clippy::too_many_arguments)]
+fn write_transform_tree(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    block: &SyntaxBlock,
+    start_x: u32,
+    start_y: u32,
+    w: u32,
+    h: u32,
+    mi_row: u32,
+    mi_col: u32,
+    mi_size: usize,
+    lossless: bool,
+    tu_idx: &mut usize,
+) -> Result<(), Error> {
+    // §5.11.36 lines 1-3: frame-extent early return.
+    let max_x = state.mi_cols * (MI_SIZE as u32);
+    let max_y = state.mi_rows * (MI_SIZE as u32);
+    if start_x >= max_x || start_y >= max_y {
+        return Ok(());
+    }
+    // §5.11.36 lines 4-6: `InterTxSizes[ row ][ col ]` via the mirror
+    // (in-grid by the early return above).
+    let row = (start_y >> (MI_SIZE_LOG2 as u32)) as usize;
+    let col = (start_x >> (MI_SIZE_LOG2 as u32)) as usize;
+    let luma_tx_sz = state.mirror.inter_tx_sizes()[row * state.mi_cols as usize + col] as usize;
+    if luma_tx_sz >= TX_SIZES_ALL {
+        return Err(Error::ResidualTransformTreeUnsupported);
+    }
+    let luma_w = TX_WIDTH[luma_tx_sz] as u32;
+    let luma_h = TX_HEIGHT[luma_tx_sz] as u32;
+
+    // §5.11.36 lines 7-10: leaf emit.
+    if w <= luma_w && h <= luma_h {
+        let tx_sz =
+            find_tx_size(w as usize, h as usize).ok_or(Error::ResidualTransformTreeUnsupported)?;
+        return write_transform_block(
+            writer, cdfs, state, block, /* plane = */ 0, /* base_x = */ start_x,
+            /* base_y = */ start_y, tx_sz, /* x = */ 0, /* y = */ 0,
+            /* sub_x = */ 0, /* sub_y = */ 0, mi_row, mi_col, mi_size, lossless,
+            /* is_inter = */ true, tu_idx,
+        );
+    }
+    // §5.11.36 lines 12-25: per-direction halving recursion (the same
+    // visit order as the decode twin).
+    let halves: &[(u32, u32, u32, u32)] = if w > h {
+        &[(0, 0, 1, 0), (1, 0, 1, 0)]
+    } else if w < h {
+        &[(0, 0, 0, 1), (0, 1, 0, 1)]
+    } else {
+        &[(0, 0, 1, 1), (1, 0, 1, 1), (0, 1, 1, 1), (1, 1, 1, 1)]
+    };
+    for &(ox, oy, hw, hh) in halves {
+        let sub_w = if hw != 0 { w / 2 } else { w };
+        let sub_h = if hh != 0 { h / 2 } else { h };
+        write_transform_tree(
+            writer,
+            cdfs,
+            state,
+            block,
+            start_x + ox * (w / 2),
+            start_y + oy * (h / 2),
+            sub_w,
+            sub_h,
+            mi_row,
+            mi_col,
+            mi_size,
+            lossless,
+            tu_idx,
+        )?;
+    }
     Ok(())
 }
 
@@ -2646,6 +2857,30 @@ mod tests {
             "InterTxSizes parity"
         );
         assert_eq!(m.tx_types(), walker.tx_types(), "TxTypes parity");
+        // r284 — §6.10.2 / §8.3.2 coefficient-level context arrays:
+        // the per-TU §5.11.39 tail stamps (and §5.11.42 skip resets)
+        // must agree cell-for-cell, pinning write↔decode `all_zero` /
+        // `dc_sign` ctx-derivation lockstep for every TU in the tree.
+        assert_eq!(
+            m.above_level_context(),
+            walker.above_level_context(),
+            "AboveLevelContext parity"
+        );
+        assert_eq!(
+            m.above_dc_context(),
+            walker.above_dc_context(),
+            "AboveDcContext parity"
+        );
+        assert_eq!(
+            m.left_level_context(),
+            walker.left_level_context(),
+            "LeftLevelContext parity"
+        );
+        assert_eq!(
+            m.left_dc_context(),
+            walker.left_dc_context(),
+            "LeftDcContext parity"
+        );
         (enc_state, walker)
     }
 
@@ -2914,11 +3149,11 @@ mod tests {
         assert_eq!(walker.current_delta_lf()[0], -2, "DeltaLF[0] accumulation");
     }
 
-    /// r283 scope guards: §5.11.16 (`tx_mode_select`) write threading
-    /// and the `skip == 0` intra-block-copy §5.11.36 transform-tree
-    /// arm are follow-up arcs; an intrabc leaf without `allow_intrabc`
-    /// and every `residual_quant` count/length mismatch are caller
-    /// bugs.
+    /// r283/r284 scope guards: §5.11.16 (`tx_mode_select`) write
+    /// threading is a follow-up arc; an intrabc leaf without
+    /// `allow_intrabc` and every `residual_quant` count/length
+    /// mismatch (including on the now-live `skip == 0` intra-block-
+    /// copy §5.11.36 arm) are caller bugs.
     #[test]
     fn r283_write_block_syntax_scope_rejects() {
         let params = SyntaxFrameParams::intra_8bit_baseline();
@@ -3031,8 +3266,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
 
-        // skip = 0 on the intra-block-copy arm ⇒ §5.11.36 inter-luma
-        // transform-tree write threading follow-up.
+        // skip = 0 on the intra-block-copy arm (r284: the §5.11.36
+        // inter-luma transform-tree write threading is LIVE) with a
+        // TU-count shortfall (no residual_quant arrays supplied for
+        // the 3 visited TUs) ⇒ caller bug.
         let mut params_bc = params.clone();
         params_bc.allow_intrabc = true;
         let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
@@ -3237,5 +3474,203 @@ mod tests {
         ];
         let node = SyntaxNode::Leaf(Box::new(leaf));
         let _ = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x78);
+    }
+
+    // -----------------------------------------------------------------
+    // r284 — §8.3.2 `all_zero` / `dc_sign` ctx derivation lockstep.
+    // The harness now asserts the four §6.10.2 context arrays
+    // (`Above{Level,Dc}Context` / `Left{Level,Dc}Context`) cell-for-
+    // cell after every tree, so each round-trip below pins that every
+    // TU's coefficient symbols used the same neighbour-derived CDF
+    // rows on both sides.
+    // -----------------------------------------------------------------
+
+    /// SPLIT into four BLOCK_8X8 leaves where the §5.11.39 tail stamps
+    /// and §5.11.42 skip resets interleave:
+    ///
+    /// * NW (`skip = 0`, negative Y DC) stamps `culLevel`/`dcCategory`
+    ///   over its columns/rows — NE's and SW's ctx walks observe them.
+    /// * NE (`skip = 1`) §5.11.42-resets its columns AND rows 0..1
+    ///   (wiping NW's left stamps).
+    /// * SW (`skip = 0`) derives its luma `all_zero` ctx from NW's
+    ///   above stamps (`top != 0` arm) and its `dc_sign` ctx from
+    ///   NW's `dcCategory = 1` (negative census ⇒ ctx 1), then
+    ///   overwrites columns 0..1.
+    /// * SE (`skip = 0`, positive Y DC) sees NE's reset above (0) and
+    ///   SW's left stamps — the asymmetric `top == 0 || left == 0`
+    ///   luma arm.
+    ///
+    /// The end-state array asserts pin the §5.11.39 stamp / §5.11.42
+    /// reset choreography beyond the harness parity check.
+    #[test]
+    fn r284_syntax_round_trip_txb_level_context_stamps_and_skip_reset() {
+        let params = SyntaxFrameParams::intra_8bit_baseline();
+
+        // NW: negative Y DC (dcCategory = 1), culLevel = 3 + 1 = 4.
+        let mut nw = SyntaxBlock::skip_leaf(V_PRED as u8, Some(DC_PRED as u8));
+        nw.skip = 0;
+        nw.residual_quant = vec![
+            quant_with(64, &[(0, -3), (1, 1)]),
+            quant_with(64, &[(0, -1)]),
+            quant_with(64, &[(8, 2)]),
+        ];
+        // NE: skip ⇒ §5.11.42 reset over columns 2..3 + rows 0..1.
+        let ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        // SW: negative Y DC (dcCategory = 1), culLevel = 5 + 2 + 1 = 8.
+        let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        sw.skip = 0;
+        sw.residual_quant = vec![
+            quant_with(64, &[(0, -5), (1, 2), (8, 1)]),
+            vec![0i32; 64],
+            quant_with(64, &[(0, 4)]),
+        ];
+        // SE: positive Y DC (dcCategory = 2), culLevel = 6 + 1 = 7.
+        let mut se = SyntaxBlock::skip_leaf(2, Some(DC_PRED as u8));
+        se.skip = 0;
+        se.residual_quant = vec![
+            quant_with(64, &[(0, 6), (2, 1)]),
+            vec![0i32; 64],
+            vec![0i32; 64],
+        ];
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x5D);
+
+        // Luma plane (flat base 0; 4 columns / 4 rows). Decode order
+        // NW → NE → SW → SE leaves:
+        //   above cols 0..1 = SW's stamps (culLevel 8, dcCategory 1),
+        //   above cols 2..3 = SE's stamps (culLevel 7, dcCategory 2),
+        //   left rows 0..1 = 0 (NE's §5.11.42 reset wiped NW's),
+        //   left rows 2..3 = SE's stamps (overwriting SW's).
+        let alc = walker.above_level_context();
+        let adc = walker.above_dc_context();
+        let llc = walker.left_level_context();
+        let ldc = walker.left_dc_context();
+        assert_eq!(&alc[0..4], &[8, 8, 7, 7], "luma AboveLevelContext");
+        assert_eq!(&adc[0..4], &[1, 1, 2, 2], "luma AboveDcContext");
+        assert_eq!(&llc[0..4], &[0, 0, 7, 7], "luma LeftLevelContext");
+        assert_eq!(&ldc[0..4], &[0, 0, 2, 2], "luma LeftDcContext");
+    }
+
+    /// Lossless 4:2:0 BLOCK_16X16 leaf — 16 luma TX_4X4 TUs + 4 TUs
+    /// per chroma plane over the BLOCK_8X8 chroma residual size. The
+    /// chroma TUs take the §8.3.2 chroma `all_zero` arm with
+    /// `bw * bh = 64 > w * h = 16` (the `ctx += 3` adjustment, rows
+    /// 10..=12 of `TileTxbSkipCdf`), and the second/later TUs of every
+    /// plane fold the earlier TUs' stamps through the OR-census
+    /// (`above != 0` / `left != 0`) arms.
+    #[test]
+    fn r284_syntax_round_trip_txb_ctx_lossless_420_chroma_bsize_arm() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.subsampling_x = 1;
+        params.subsampling_y = 1;
+        params.lossless_array = [true; MAX_SEGMENTS];
+        params.coded_lossless = true;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.skip = 0;
+        // 24 TUs in §5.11.34 dispatch order: 16 luma (4×4 grid of
+        // TX_4X4), then 4 per chroma plane (2×2 grid). Alternate
+        // signed DCs + an AC tap so the running census flips arms.
+        let mut tus = Vec::new();
+        for tu in 0..16 {
+            tus.push(match tu % 3 {
+                0 => quant_with(16, &[(0, 2)]),
+                1 => quant_with(16, &[(0, -1), (1, 1)]),
+                _ => vec![0i32; 16],
+            });
+        }
+        for plane in 0..2 {
+            for tu in 0..4 {
+                tus.push(if (tu + plane) % 2 == 0 {
+                    quant_with(16, &[(0, if plane == 0 { -4 } else { 4 })])
+                } else {
+                    vec![0i32; 16]
+                });
+            }
+        }
+        leaf.residual_quant = tus;
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x9E);
+
+        // The chroma planes stamped their 4-sample columns: plane 1
+        // base = mi_cols = 4, plane 2 base = 8 (subsampled x4 ∈ 0..2).
+        let alc = walker.above_level_context();
+        let adc = walker.above_dc_context();
+        // Plane 1 row of chroma TUs decoded last for each column:
+        // TU (y=1, x=0) all-zero (tu=2 ⇒ (2+0)%2=0? — see commitment
+        // map below); pin the exact stamps instead of recomputing:
+        // plane 1 TUs in order (y0x0, y0x1, y1x0, y1x1) carry DCs
+        // (-4, 0, -4, 0) ⇒ final column stamps (4, 0) levels with
+        // dcCategory (1, 0). Plane 2 TUs carry (0, 4, 0, 4) ⇒ final
+        // column stamps (0, 4) / (0, 2).
+        assert_eq!(&alc[4..6], &[4, 0], "plane-1 AboveLevelContext");
+        assert_eq!(&adc[4..6], &[1, 0], "plane-1 AboveDcContext");
+        assert_eq!(&alc[8..10], &[0, 4], "plane-2 AboveLevelContext");
+        assert_eq!(&adc[8..10], &[0, 2], "plane-2 AboveDcContext");
+    }
+
+    /// r284 — §5.11.36 inter-arm `transform_tree` write side: a
+    /// `skip == 0` intra-block-copy leaf (`is_inter = 1`) routes its
+    /// luma plane through the [`write_transform_tree`] recursion (one
+    /// TX_8X8 leaf here — `InterTxSizes` carries the §5.11.16
+    /// else-arm `Max_Tx_Size_Rect` stamp) while chroma takes the
+    /// direct §5.11.34 loop, and every §5.11.39 writer call takes the
+    /// `is_inter = 1` CDF axes (`eob_pt_*[ 1 ]`). The decode walker
+    /// consumes the same TUs through its §5.11.36 recursion — the
+    /// sentinel + whole-CDF + context-array parity pin the lockstep.
+    #[test]
+    fn r284_syntax_round_trip_intrabc_skip0_transform_tree() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.allow_intrabc = true;
+
+        // NW: intra-block-copy leaf with residual — negative luma DC
+        // + chroma taps so the §8.3.2 stamps engage on the inter arm.
+        let mut nw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        nw.intrabc_mv = Some([0, -2560]);
+        nw.skip = 0;
+        nw.residual_quant = vec![
+            quant_with(64, &[(0, -3), (1, 2)]),
+            quant_with(64, &[(0, 4)]),
+            quant_with(64, &[(2, 1)]),
+        ];
+        // NE: skip intrabc leaf (the r282 shape — §5.11.42 reset).
+        let mut ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        ne.intrabc_mv = Some([-8, -2560]);
+        // SW: plain else-arm non-skip leaf — its `all_zero` /
+        // `dc_sign` ctx walks read NW's inter-arm stamps from above.
+        let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        sw.skip = 0;
+        sw.residual_quant = vec![
+            quant_with(64, &[(0, 7)]),
+            vec![0i32; 64],
+            quant_with(64, &[(0, -2)]),
+        ];
+        // SE: plain skip leaf.
+        let se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xB6);
+
+        // NW decoded as an inter (intrabc) block with residual.
+        assert_eq!(walker.is_inters()[0], 1, "NW IsInters");
+        assert_eq!(walker.skips()[0], 0, "NW skip = 0");
+        // Final luma context arrays: NW's TX_8X8 stamps on columns
+        // 0..1 were overwritten by SW (culLevel 7, positive DC ⇒
+        // dcCategory 2); NE + SE skip resets keep columns 2..3 at 0.
+        let alc = walker.above_level_context();
+        let adc = walker.above_dc_context();
+        assert_eq!(&alc[0..4], &[7, 7, 0, 0], "luma AboveLevelContext");
+        assert_eq!(&adc[0..4], &[2, 2, 0, 0], "luma AboveDcContext");
     }
 }

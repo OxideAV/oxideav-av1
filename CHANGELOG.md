@@ -4,6 +4,44 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder+decoder r284 (2026-06-12): land the §8.3.2 coefficient
+  level-context machinery on BOTH sides of the §5.11.39 surface. The
+  `PartitionWalker` now tracks the §6.10.2 `AboveLevelContext` /
+  `AboveDcContext` / `LeftLevelContext` / `LeftDcContext` arrays
+  (per-plane, 4-sample granularity; zeroed at construction per
+  §5.11.2 `clear_above_context( )`, with `clear_txb_left_context( )`
+  surfacing the per-superblock-row `clear_left_context( )` reset) and
+  exposes the §8.3.2 derivations built on them: `txb_skip_ctx( )`
+  (the `all_zero` ctx — luma Max-scan ladder 0..=6 with the
+  `bw == w && bh == h` short-circuit, chroma OR-census 7..=12 with
+  the `bw * bh > w * h` `+= 3` adjustment) and `dc_sign_ctx( )` (the
+  ±census of the DC arrays → 0/1/2). The decode walker's §5.11.35
+  `transform_block` per-TU path now derives both contexts live
+  (replacing the pinned `txb_skip_ctx = dc_sign_ctx = 0`), stamps
+  each TU's §5.11.39 `culLevel` / `dcCategory` tail into the arrays
+  via `stamp_txb_level_context( )`, and wires the §5.11.5
+  `if ( skip ) reset_block_context( bw4, bh4 )` §5.11.42 footprint
+  reset. The encoder mirrors all of it through its mirror walker:
+  `write_coefficients` now returns the same `CoefficientsReadout`
+  the reader produces (`all_zero` / `eob` / `cul_level` /
+  `dc_category`, mirroring the §5.11.39 lines 94-102 forward-scan
+  derivations) so `write_transform_block` can stamp in lockstep,
+  and both `write_block_syntax` skip arms (else-arm + intrabc)
+  perform the §5.11.42 reset. ALSO: the §5.11.36 inter-arm
+  `transform_tree` write side lands — `skip == 0` intra-block-copy
+  leaves (previously rejected) route their luma plane through the
+  new `write_transform_tree` recursion (mirror-`InterTxSizes[]`
+  lookup + `find_tx_size` leaf emit + per-direction halving) and
+  take the `is_inter = 1` CDF axes (`eob_pt_*`, §5.11.48
+  `inter` tx-set admission) end-to-end. The round-trip harness now
+  asserts cell-for-cell parity on all four context arrays after
+  every tree, pinning write↔decode ctx agreement per TU across the
+  whole r282/r283/r284 battery. New tests: §8.3.2 luma-ladder /
+  chroma-census / dc-sign-census / reset+clear unit pins, the
+  stamp-vs-skip-reset choreography split, the lossless 4:2:0
+  chroma-`bsize` arm, and the intrabc `skip == 0` §5.11.36
+  round-trip; library tests 1935 → 1942.
+
 - encoder r283 (2026-06-12): thread the §5.11.34 `residual( )` write
   side into `write_block_syntax` — non-skip (`skip == 0`) intra
   leaves now emit per-TU residuals the §5.11.5 decode walker consumes
