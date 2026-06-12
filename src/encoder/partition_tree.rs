@@ -109,13 +109,13 @@ use crate::cdf::{
     cfl_allowed_for_uv_mode, compute_tx_type, find_tx_size, get_plane_residual_size, get_tx_size,
     inter_tx_type_set, intra_mode_ctx, intra_tx_type_set, palette_tokens_args, partition_ctx,
     partition_subsize, segment_id_ctx, size_group, skip_ctx, EncoderBlockSyntaxStamp,
-    MotionFieldMvs, PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_64X64,
-    BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
-    H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT, MI_HEIGHT_LOG2, MI_SIZE,
-    MI_SIZE_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS,
-    PARTITION_NONE, PARTITION_SPLIT, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT,
-    TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
-    WARPEDMODEL_PREC_BITS,
+    MotionFieldMvs, PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4,
+    BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, FRAME_LF_COUNT,
+    GM_TYPE_IDENTITY, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH,
+    MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
+    PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, SPLIT_TX_SIZE, TX_4X4, TX_CLASS_2D,
+    TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED,
+    V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
     write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_intra_frame_else_arm,
@@ -125,6 +125,7 @@ use crate::encoder::block_mode_info::{
 use crate::encoder::coefficients::write_coefficients;
 use crate::encoder::partition::write_partition;
 use crate::encoder::symbol_writer::SymbolWriter;
+use crate::encoder::transform_tree::write_block_tx_size;
 use crate::Error;
 
 /// Per-plane §5.11.39 `coefficients()` input the driver hands to
@@ -682,6 +683,53 @@ pub struct SyntaxBlock {
     /// are caller bugs ([`crate::Error::PartitionWalkOutOfRange`]).
     /// Added r283.
     pub residual_quant: Vec<Vec<i32>>,
+    /// §5.11.15 `TxSize` commitment for the §5.11.16 `else` arm
+    /// (r285). `None` ⇒ the spec-forced default (`TX_4X4` when the
+    /// segment is lossless, `Max_Tx_Size_Rect[ MiSize ]` otherwise).
+    /// `Some(t)` selects `t` when the §5.11.15 `tx_depth` S() fires
+    /// (`TxMode == TX_MODE_SELECT && MiSize > BLOCK_4X4 &&
+    /// allowSelect && !Lossless`); `t` must be reachable from
+    /// `Max_Tx_Size_Rect[ MiSize ]` within `MAX_TX_DEPTH = 2`
+    /// `Split_Tx_Size` steps. On a bit-silent arm a `Some(t)` that
+    /// differs from the spec-forced value is a caller bug. MUST be
+    /// `None` when the §5.11.16 var-tx arm fires (the recursion's
+    /// last terminal-else `txSz` is the block's `TxSize` there).
+    pub tx_size: Option<u8>,
+    /// §5.11.17 variable-transform split-decision trees for the
+    /// §5.11.16 var-tx arm (`TxMode == TX_MODE_SELECT && MiSize >
+    /// BLOCK_4X4 && is_inter && !skip && !Lossless`), one
+    /// [`VarTxSyntaxTree`] per `(txH4, txW4)` sub-rectangle of the
+    /// block footprint in §5.11.16 loop order (row-major). Every
+    /// loop position gets an entry, including positions clipped by
+    /// the §5.11.17 `row >= MiRows || col >= MiCols` early return
+    /// (those must be [`VarTxSyntaxTree::Leaf`] — the reader emits
+    /// no symbol and stamps nothing there). MUST be empty when the
+    /// arm does not fire. Added r285.
+    pub var_tx_trees: Vec<VarTxSyntaxTree>,
+}
+
+/// One node of a §5.11.17 `read_var_tx_size` split-decision tree on
+/// the write side (r285). Unlike
+/// [`crate::encoder::transform_tree::VarTxNode`] (the stateless
+/// caller-supplies-ctx surface), this shape carries no ctx — the
+/// [`write_block_syntax`] driver derives every node's §8.3.2
+/// `txfm_split` ctx live from its mirror walker (the ctx is a
+/// function of the running `InterTxSizes[]` state, which earlier
+/// leaves of the same recursion feed) and stamps the mirror in
+/// §5.11.17 visit order, exactly like the decode walker.
+#[derive(Debug, Clone)]
+pub enum VarTxSyntaxTree {
+    /// §5.11.17 terminal `else` arm: `txfm_split = 0` (the S() is
+    /// emitted only when the node is not at the spec-forced terminal
+    /// `txSz == TX_4X4 || depth == MAX_VARTX_DEPTH`), then
+    /// `InterTxSizes[..] = txSz` over the node's footprint.
+    Leaf,
+    /// §5.11.17 `if ( txfm_split )` arm: `txfm_split = 1` plus the
+    /// `Split_Tx_Size[ txSz ]` recursion. The child count must match
+    /// the spec loop's `(h4 / stepH) * (w4 / stepW)` visit count
+    /// (4 for square ordinals, 2 for rectangular ones), in row-major
+    /// `(i, j)` order.
+    Split(Vec<VarTxSyntaxTree>),
 }
 
 impl SyntaxBlock {
@@ -707,6 +755,8 @@ impl SyntaxBlock {
             filter_intra_mode: None,
             palette: SyntaxPalette::default(),
             residual_quant: Vec::new(),
+            tx_size: None,
+            var_tx_trees: Vec::new(),
         }
     }
 }
@@ -784,12 +834,13 @@ pub struct SyntaxFrameParams {
     pub enable_filter_intra: bool,
     /// §5.5.2 `BitDepth` (8 / 10 / 12).
     pub bit_depth: u8,
-    /// §5.9.21 `TxMode == TX_MODE_SELECT`. MUST be `false` for r282 —
-    /// the §5.11.16 `tx_depth` write threading (the
-    /// [`crate::encoder::transform_tree::write_block_tx_size`] leaf
-    /// plus the `TxSizes[]` mirror grids its §8.3.2 ctx walk reads)
-    /// is the follow-up arc. With `TX_MODE_SELECT` off the §5.11.16
-    /// call is bit-silent on both sides.
+    /// §5.9.21 `TxMode == TX_MODE_SELECT`. Threaded into the
+    /// §5.11.16 write driver (r285): on the intra / `skip == 1` arms
+    /// it opens the §5.11.15 `tx_depth` S() (committed via
+    /// [`SyntaxBlock::tx_size`]); on the inter `skip == 0` arm it
+    /// opens the §5.11.17 `txfm_split` recursion (committed via
+    /// [`SyntaxBlock::var_tx_trees`]). With `TX_MODE_SELECT` off the
+    /// §5.11.16 call is bit-silent on both sides.
     pub tx_mode_select: bool,
 }
 
@@ -1114,10 +1165,6 @@ pub fn write_block_syntax(
     if !matches!(params.bit_depth, 8 | 10 | 12) {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    if params.tx_mode_select {
-        // §5.11.16 write threading — follow-up arc (see method docs).
-        return Err(Error::PartitionWalkOutOfRange);
-    }
     if block.skip > 1 {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -1249,13 +1296,12 @@ pub fn write_block_syntax(
         params.delta_lf_res,
     )?;
 
-    // §6.8.2 per-segment `Lossless` + the §5.11.15 / §5.11.16
-    // `read_block_tx_size()` else-arm derivation. With the supported
-    // `TxMode != TX_MODE_SELECT` configuration the §5.11.15 body is
-    // bit-silent on BOTH sides: `TxSize = Lossless ? TX_4X4 :
-    // Max_Tx_Size_Rect[ MiSize ]` (no `tx_depth` symbol). The value
-    // feeds the §5.11.34 residual dispatch below and the mirror's
-    // `TxSizes[]` / `InterTxSizes[]` grid stamps.
+    // §6.8.2 per-segment `Lossless` + the §5.11.15 spec-forced
+    // default `TxSize = Lossless ? TX_4X4 : Max_Tx_Size_Rect[ MiSize ]`.
+    // This pre-fills the footer stamp's `TxSizes[]` / `InterTxSizes[]`
+    // grids; the §5.11.16 write driver (r285) re-stamps both grids
+    // with the committed value at the spec's `read_block_tx_size( )`
+    // position before any grid read can observe the pre-fill.
     let lossless = params.lossless_array[block.segment_id as usize];
     let tx_size_blk = if lossless {
         TX_4X4
@@ -1327,11 +1373,28 @@ pub fn write_block_syntax(
         // §5.11.49 `palette_tokens( )` — `PaletteSize{Y,UV} = 0` on
         // the intrabc arm ⇒ no-op.
 
+        // §5.11.5 line `read_block_tx_size( )` — §5.11.16 write
+        // driver (r285). The intrabc arm has `is_inter = 1`: with
+        // `skip == 0 && TxMode == TX_MODE_SELECT && MiSize >
+        // BLOCK_4X4 && !Lossless` the §5.11.17 `txfm_split` var-tx
+        // recursion fires ([`SyntaxBlock::var_tx_trees`]); otherwise
+        // the §5.11.15 else arm is bit-silent (`allowSelect = !skip
+        // || !is_inter` is false on a `skip == 1` inter leaf).
+        let tx_size_committed = write_block_tx_size_syntax(
+            writer, cdfs, state, block, mi_row, mi_col, sub_size, lossless,
+            /* is_inter = */ true, params,
+        )?;
+
         if block.skip == 0 {
             // §5.11.34 `residual()` — the intra-block-copy arm has
             // `is_inter = 1`, so the luma plane routes through the
-            // §5.11.36 `transform_tree` recursion (r284) and the
-            // §5.11.39 writers take the `is_inter` CDF axes.
+            // §5.11.36 `transform_tree` recursion (r284, var-tx-aware
+            // since r285: the mirror's `InterTxSizes[]` now carries
+            // the per-leaf §5.11.17 stamps) and the §5.11.39 writers
+            // take the `is_inter` CDF axes. Chroma sizing follows the
+            // §5.11.16-committed `TxSize` (the recursion's last
+            // terminal-else `txSz`), matching the decode walker's
+            // `residual( tx_size = read_block_tx_size( ) )`.
             write_residual(
                 writer,
                 cdfs,
@@ -1343,7 +1406,7 @@ pub fn write_block_syntax(
                 params,
                 has_chroma,
                 lossless,
-                tx_size_blk,
+                tx_size_committed,
                 /* is_inter = */ true,
             )?;
         } else {
@@ -1522,14 +1585,26 @@ pub fn write_block_syntax(
             tx_size: tx_size_blk as u8,
         });
 
+    // §5.11.5 line `read_block_tx_size( )` — §5.11.16 write driver
+    // (r285). The intra arm always takes the §5.11.15 else arm
+    // (`is_inter = 0` ⇒ `allowSelect = 1`): one `tx_depth` S() when
+    // `TxMode == TX_MODE_SELECT && MiSize > BLOCK_4X4 && !Lossless`
+    // (committed via [`SyntaxBlock::tx_size`]), bit-silent
+    // otherwise.
+    let tx_size_committed = write_block_tx_size_syntax(
+        writer, cdfs, state, block, mi_row, mi_col, sub_size, lossless,
+        /* is_inter = */ false, params,
+    )?;
+
     // §5.11.5 line `residual( )` — §5.11.34 write dispatcher (r283).
-    // Follows the (bit-silent) §5.11.16 `read_block_tx_size( )` +
+    // Follows the §5.11.16 `read_block_tx_size( )` +
     // §5.11.33 `compute_prediction( )` call sites in §5.11.5 order. On
     // `skip == 1` the decode walker's per-TU walk reads no bits and
     // only pre-stamps `TxTypes[] = DCT_DCT` over the luma TU
     // footprints (which tile the block's luma extent) — mirror with
     // one clipped block-footprint stamp. On `skip == 0` the full
-    // per-TU §5.11.39 coefficient write composition runs.
+    // per-TU §5.11.39 coefficient write composition runs against the
+    // §5.11.16-committed `TxSize` (r285).
     if block.skip == 0 {
         write_residual(
             writer,
@@ -1542,7 +1617,7 @@ pub fn write_block_syntax(
             params,
             has_chroma,
             lossless,
-            tx_size_blk,
+            tx_size_committed,
             /* is_inter = */ false,
         )?;
     } else {
@@ -1566,6 +1641,254 @@ pub fn write_block_syntax(
         );
     }
     Ok(())
+}
+
+/// §5.11.16 `read_block_tx_size( )` write driver (r285) — the write
+/// twin of [`PartitionWalker::read_block_tx_size`], invoked from
+/// [`write_block_syntax`] at the §5.11.5 `read_block_tx_size( )`
+/// position (after `palette_tokens( )`, before `residual( )`).
+///
+/// Mirrors the §5.11.16 dispatch line-for-line:
+///
+/// * **Var-tx arm** (`TxMode == TX_MODE_SELECT && MiSize > BLOCK_4X4
+///   && is_inter && !skip && !Lossless`) — walks the `(txH4, txW4)`
+///   sub-rectangles of the block footprint in spec loop order,
+///   consuming one [`VarTxSyntaxTree`] from
+///   [`SyntaxBlock::var_tx_trees`] per position and emitting its
+///   §5.11.17 recursion via [`write_var_tx_size_syntax`]; then the
+///   §5.11.5 outer `TxSizes[]` footprint fill with the last
+///   terminal-else `txSz` (the same
+///   [`PartitionWalker::stamp_tx_sizes_footprint`] the reader runs).
+///   [`SyntaxBlock::tx_size`] must be `None` (the block's `TxSize`
+///   is the recursion's last terminal-else `txSz`).
+///
+/// * **`else` arm** — `read_tx_size( !skip || !is_inter )` per
+///   §5.11.15. The committed `TxSize` is [`SyntaxBlock::tx_size`]
+///   (or the spec-forced default when `None`); the §8.3.2 `tx_depth`
+///   ctx comes from the mirror's
+///   [`PartitionWalker::tx_depth_block_ctx`] (the identical
+///   derivation the reader runs), the symbol from the stateless
+///   [`write_block_tx_size`] (which also validates the spec-forced
+///   values on every bit-silent sub-arm), and the grid fill from
+///   [`PartitionWalker::stamp_block_tx_size_grids`].
+///   [`SyntaxBlock::var_tx_trees`] must be empty.
+///
+/// Returns the committed `TxSize` ordinal — the value the decode
+/// walker's `read_block_tx_size` returns and threads into §5.11.34
+/// `residual( )`.
+#[allow(clippy::too_many_arguments)]
+fn write_block_tx_size_syntax(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    block: &SyntaxBlock,
+    mi_row: u32,
+    mi_col: u32,
+    sub_size: usize,
+    lossless: bool,
+    is_inter: bool,
+    params: &SyntaxFrameParams,
+) -> Result<usize, Error> {
+    // §5.11.16 lines 1-2: `bw4` / `bh4`.
+    let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+    let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+    let skip = block.skip != 0;
+
+    // §5.11.16 outer dispatch — the var-tx arm.
+    if params.tx_mode_select && sub_size > BLOCK_4X4 && is_inter && !skip && !lossless {
+        if block.tx_size.is_some() {
+            // The block's `TxSize` on this arm is the §5.11.17
+            // recursion's last terminal-else `txSz` — a scalar
+            // commitment alongside the trees is a caller bug.
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.16 lines 5-7: `maxTxSz` / `txW4` / `txH4`.
+        let max_tx_sz = MAX_TX_SIZE_RECT[sub_size];
+        let tx_w4 = (TX_WIDTH[max_tx_sz] / MI_SIZE) as u32;
+        let tx_h4 = (TX_HEIGHT[max_tx_sz] / MI_SIZE) as u32;
+        // §5.11.16 inner loops — one caller-supplied tree per
+        // `read_var_tx_size( row, col, maxTxSz, 0 )` position.
+        let mut tree_idx = 0usize;
+        let mut last_tx_size = max_tx_sz as u8;
+        let mut row = mi_row;
+        while row < mi_row + bh4 {
+            let mut col = mi_col;
+            while col < mi_col + bw4 {
+                let tree = block
+                    .var_tx_trees
+                    .get(tree_idx)
+                    .ok_or(Error::PartitionWalkOutOfRange)?;
+                tree_idx += 1;
+                last_tx_size = write_var_tx_size_syntax(
+                    writer, cdfs, state, tree, mi_row, mi_col, sub_size, row, col, max_tx_sz,
+                    /* depth = */ 0,
+                )?;
+                col += tx_w4;
+            }
+            row += tx_h4;
+        }
+        // A surplus tree is the same caller bug as a shortfall.
+        if tree_idx != block.var_tx_trees.len() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.5 outer `TxSizes[]` fill with the last terminal-else
+        // `txSz` (same helper as the reader).
+        state
+            .mirror
+            .stamp_tx_sizes_footprint(mi_row, mi_col, sub_size, last_tx_size);
+        return Ok(last_tx_size as usize);
+    }
+
+    // §5.11.16 `else` arm: `read_tx_size( !skip || !is_inter )`.
+    if !block.var_tx_trees.is_empty() {
+        // Var-tx trees on a non-var-tx arm are a caller bug.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let allow_select = !skip || !is_inter;
+    // §5.11.15 committed `TxSize`: the caller's choice where the
+    // `tx_depth` S() fires, the spec-forced default otherwise. The
+    // stateless writer below validates both (a `Some(t)` differing
+    // from the forced value on a bit-silent arm rejects there).
+    let default_tx = if lossless {
+        TX_4X4
+    } else {
+        MAX_TX_SIZE_RECT[sub_size]
+    };
+    let tx_size = block.tx_size.map_or(default_tx, |t| t as usize);
+    // §8.3.2 `tx_depth` ctx from the mirror walker — the identical
+    // derivation `read_block_tx_size` performs. Side-effect free, so
+    // deriving it on the bit-silent arms is harmless.
+    let ctx = state.mirror.tx_depth_block_ctx(mi_row, mi_col, sub_size);
+    write_block_tx_size(
+        writer,
+        cdfs,
+        tx_size,
+        sub_size,
+        lossless,
+        allow_select,
+        params.tx_mode_select,
+        ctx,
+    )?;
+    // §5.11.16 `else`-arm grid fill (same helper as the reader).
+    state
+        .mirror
+        .stamp_block_tx_size_grids(mi_row, mi_col, sub_size, tx_size as u8);
+    Ok(tx_size)
+}
+
+/// §5.11.17 `read_var_tx_size( row, col, txSz, depth )` write driver
+/// (r285) — the write twin of [`PartitionWalker::read_var_tx_size`],
+/// driven by a caller-supplied [`VarTxSyntaxTree`] split-decision
+/// tree instead of decoded `txfm_split` symbols. Every other line
+/// mirrors the reader:
+///
+/// * the `row >= MiRows || col >= MiCols` early return (no symbol,
+///   no stamp — the supplied node must be a [`VarTxSyntaxTree::Leaf`]);
+/// * the `txSz == TX_4X4 || depth == MAX_VARTX_DEPTH` terminal
+///   conditions (forced `txfm_split = 0`, no S() on either side; a
+///   [`VarTxSyntaxTree::Split`] there is a caller bug);
+/// * the §8.3.2 ctx via the mirror's
+///   [`PartitionWalker::txfm_split_node_ctx`] — derived live in
+///   §5.11.17 visit order, because earlier leaves' `InterTxSizes[]`
+///   stamps feed later nodes' `get_above_tx_width` /
+///   `get_left_tx_height` walks on BOTH sides;
+/// * the terminal-else [`PartitionWalker::stamp_var_tx_leaf`] stamp;
+/// * the `Split_Tx_Size` recursion in row-major `(i, j)` order with
+///   the last terminal-else `txSz` propagated upward.
+#[allow(clippy::too_many_arguments)]
+fn write_var_tx_size_syntax(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    tree: &VarTxSyntaxTree,
+    mi_row_b: u32,
+    mi_col_b: u32,
+    sub_size: usize,
+    row: u32,
+    col: u32,
+    tx_sz: usize,
+    depth: u32,
+) -> Result<u8, Error> {
+    // §5.11.17 lines 1-2: frame-edge early return — the reader emits
+    // nothing and stamps nothing.
+    if row >= state.mi_rows || col >= state.mi_cols {
+        return match tree {
+            VarTxSyntaxTree::Leaf => Ok(tx_sz as u8),
+            // A Split here would describe symbols the reader never
+            // reads — caller bug.
+            VarTxSyntaxTree::Split(_) => Err(Error::PartitionWalkOutOfRange),
+        };
+    }
+    // §5.11.17 lines 3-7: the two terminal conditions force
+    // `txfm_split = 0` with no S() on either side.
+    let terminal = tx_sz == TX_4X4 || depth == MAX_VARTX_DEPTH;
+    match tree {
+        VarTxSyntaxTree::Leaf => {
+            if !terminal {
+                // `txfm_split = 0` S() against the §8.3.2 ctx.
+                let ctx = state
+                    .mirror
+                    .txfm_split_node_ctx(mi_row_b, mi_col_b, sub_size, row, col, tx_sz)?;
+                let cdf = cdfs.txfm_split_cdf(ctx);
+                writer.write_symbol(0, cdf)?;
+            }
+            // §5.11.17 terminal-else `InterTxSizes[]` stamp (same
+            // helper as the reader).
+            state.mirror.stamp_var_tx_leaf(row, col, tx_sz);
+            Ok(tx_sz as u8)
+        }
+        VarTxSyntaxTree::Split(children) => {
+            if terminal {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            // `txfm_split = 1` S().
+            let ctx = state
+                .mirror
+                .txfm_split_node_ctx(mi_row_b, mi_col_b, sub_size, row, col, tx_sz)?;
+            let cdf = cdfs.txfm_split_cdf(ctx);
+            writer.write_symbol(1, cdf)?;
+            // §5.11.17 lines 11-16: the `Split_Tx_Size` recursion.
+            let sub_tx_sz = SPLIT_TX_SIZE[tx_sz];
+            let w4 = (TX_WIDTH[tx_sz] / MI_SIZE) as u32;
+            let h4 = (TX_HEIGHT[tx_sz] / MI_SIZE) as u32;
+            let step_w = (TX_WIDTH[sub_tx_sz] / MI_SIZE) as u32;
+            let step_h = (TX_HEIGHT[sub_tx_sz] / MI_SIZE) as u32;
+            debug_assert!(
+                step_w > 0 && step_h > 0,
+                "Split_Tx_Size step must advance the §5.11.17 loop"
+            );
+            // One child per spec loop visit, row-major.
+            let expected = ((h4 / step_h) * (w4 / step_w)) as usize;
+            if children.len() != expected {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            let mut last_tx_sz = sub_tx_sz as u8;
+            let mut k = 0usize;
+            let mut i = 0u32;
+            while i < h4 {
+                let mut j = 0u32;
+                while j < w4 {
+                    last_tx_sz = write_var_tx_size_syntax(
+                        writer,
+                        cdfs,
+                        state,
+                        &children[k],
+                        mi_row_b,
+                        mi_col_b,
+                        sub_size,
+                        row + i,
+                        col + j,
+                        sub_tx_sz,
+                        depth + 1,
+                    )?;
+                    k += 1;
+                    j += step_w;
+                }
+                i += step_h;
+            }
+            Ok(last_tx_sz)
+        }
+    }
 }
 
 /// §5.11.34 `residual()` write dispatcher — the write twin of
@@ -1951,10 +2274,11 @@ fn write_transform_block(
 /// ```
 ///
 /// The `InterTxSizes[]` lookup reads the encoder mirror's grid — the
-/// §5.11.16 stamp in [`write_block_syntax`]'s
-/// `stamp_encoder_block_syntax` call mirrors the decode walker's
-/// `read_block_tx_size` else-arm fill, so the recursion shape agrees
-/// on both sides by construction.
+/// §5.11.16 write driver ([`write_block_tx_size_syntax`], r285)
+/// mirrors the decode walker's `read_block_tx_size` fills on both
+/// arms (the else-arm uniform stamp AND the §5.11.17 per-leaf var-tx
+/// stamps), so the recursion shape agrees on both sides by
+/// construction — including genuinely variable trees.
 #[allow(clippy::too_many_arguments)]
 fn write_transform_tree(
     writer: &mut SymbolWriter,
@@ -2036,7 +2360,7 @@ mod tests {
     use crate::cdf::{
         get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, CoefficientsReadout,
         PartitionWalker, TileGeometry as G, BLOCK_16X16, BLOCK_32X32, BLOCK_64X64, BLOCK_8X8,
-        DC_PRED, MAX_SEGMENTS, TX_4X4, TX_CLASS_2D, V_PRED,
+        DC_PRED, MAX_SEGMENTS, TX_16X16, TX_4X4, TX_8X8, TX_CLASS_2D, V_PRED,
     };
     use crate::scan::get_default_scan;
     use crate::symbol_decoder::SymbolDecoder;
@@ -3232,10 +3556,15 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
 
-        // tx_mode_select ⇒ §5.11.16 follow-up.
-        let block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
-        let mut params_tx = params.clone();
-        params_tx.tx_mode_select = true;
+        // `tx_size = Some(t)` differing from the §5.11.15 spec-forced
+        // value on a bit-silent arm (`TxMode != TX_MODE_SELECT` ⇒ no
+        // `tx_depth` symbol ⇒ TxSize must be `Max_Tx_Size_Rect[
+        // BLOCK_8X8 ] = TX_8X8`) is a caller bug (r285 — this
+        // sub-case previously asserted the pre-r285 wholesale
+        // `tx_mode_select` reject, whose premise the §5.11.16 write
+        // threading retired).
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.tx_size = Some(TX_4X4 as u8);
         let err = super::write_block_syntax(
             &mut writer,
             &mut cdfs,
@@ -3244,7 +3573,7 @@ mod tests {
             0,
             0,
             BLOCK_8X8,
-            &params_tx,
+            &params,
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
@@ -3672,5 +4001,411 @@ mod tests {
         let adc = walker.above_dc_context();
         assert_eq!(&alc[0..4], &[7, 7, 0, 0], "luma AboveLevelContext");
         assert_eq!(&adc[0..4], &[2, 2, 0, 0], "luma AboveDcContext");
+    }
+
+    /// §5.11.15 `tx_depth` write threading under `TX_MODE_SELECT`
+    /// (r285): a single BLOCK_16X16 non-skip intra leaf commits
+    /// `TxSize = TX_8X8` (`tx_depth = 1`), fanning the §5.11.34 luma
+    /// plane into four TX_8X8 TUs while 4:4:4 chroma keeps its
+    /// §5.11.37 TX_16X16 sizing (chroma ignores the luma `TxSize`).
+    #[test]
+    fn r285_syntax_round_trip_tx_depth_intra_16x16() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.tx_mode_select = true;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.skip = 0;
+        leaf.tx_size = Some(TX_8X8 as u8);
+        leaf.residual_quant = vec![
+            // Y: four TX_8X8 TUs in row-major §5.11.34 step order.
+            quant_with(64, &[(0, 5), (1, -2)]),
+            quant_with(64, &[(0, 1)]),
+            quant_with(64, &[(3, -4)]),
+            quant_with(64, &[(0, 2), (8, 1)]),
+            // U / V: one TX_16X16 TU each.
+            quant_with(256, &[(0, -7)]),
+            quant_with(256, &[(0, 40), (2, 3)]),
+        ];
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xC1);
+        assert!(
+            walker.tx_sizes().iter().all(|&t| t as usize == TX_8X8),
+            "committed TxSize = TX_8X8 over the leaf footprint"
+        );
+        assert!(
+            walker
+                .inter_tx_sizes()
+                .iter()
+                .all(|&t| t as usize == TX_8X8),
+            "§5.11.16 else-arm InterTxSizes fill follows the committed TxSize"
+        );
+    }
+
+    /// SPLIT into four BLOCK_8X8 leaves under `TX_MODE_SELECT`: mixed
+    /// `tx_depth` commitments (0 / 1 / 1 / silent), so later leaves'
+    /// §8.3.2 `tx_depth` ctx reads the earlier leaves' `InterTxSizes`
+    /// stamps on BOTH sides and the `Tx8x8Cdf` rows adapt across the
+    /// tree. The SE leaf is an intra-block-copy skip leaf —
+    /// `allowSelect = !skip || !is_inter = 0` keeps its §5.11.15 body
+    /// bit-silent (the explicit `Some(TX_8X8)` commitment must match
+    /// the spec-forced `Max_Tx_Size_Rect[ BLOCK_8X8 ]`).
+    #[test]
+    fn r285_syntax_round_trip_tx_depth_split_neighbour_ctx_and_silent_arm() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.tx_mode_select = true;
+        params.allow_intrabc = true;
+
+        // NW: `tx_size = None` ⇒ maxRect default (tx_depth = 0).
+        let nw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        // NE: tx_depth = 1 (TX_8X8 → TX_4X4).
+        let mut ne = SyntaxBlock::skip_leaf(V_PRED as u8, Some(DC_PRED as u8));
+        ne.tx_size = Some(TX_4X4 as u8);
+        // SW: tx_depth = 1 — its above-ctx reads NW's stamps.
+        let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        sw.tx_size = Some(TX_4X4 as u8);
+        // SE: intrabc skip leaf — bit-silent §5.11.15.
+        let mut se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        se.intrabc_mv = Some([-8, -2560]);
+        se.tx_size = Some(TX_8X8 as u8);
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xC2);
+        for r in 0..4usize {
+            for c in 0..4usize {
+                let want = match (r >= 2, c >= 2) {
+                    (false, false) | (true, true) => TX_8X8,
+                    _ => TX_4X4,
+                };
+                assert_eq!(
+                    walker.inter_tx_sizes()[r * 4 + c] as usize,
+                    want,
+                    "InterTxSizes[{r}][{c}]"
+                );
+            }
+        }
+    }
+
+    /// §5.11.16 var-tx arm round-trip (r285): a BLOCK_32X32
+    /// intra-block-copy `skip == 0` leaf under `TX_MODE_SELECT`
+    /// commits a genuinely variable §5.11.17 tree — the TX_32X32 root
+    /// splits into four TX_16X16, and the NE quadrant splits again
+    /// into four TX_8X8 (depth 2 = MAX_VARTX_DEPTH ⇒ spec-forced
+    /// terminals, no S() on either side). The §5.11.36 write
+    /// recursion then follows the per-leaf `InterTxSizes[]` stamps
+    /// (one 16×16 TU, four 8×8 TUs, two more 16×16 TUs), pinning the
+    /// transform-tree write side beyond uniform grids; chroma sizes
+    /// off the §5.11.37 derivation (one TX_32X32 TU per plane).
+    #[test]
+    fn r285_syntax_round_trip_var_tx_intrabc_32x32() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.tx_mode_select = true;
+        params.allow_intrabc = true;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.intrabc_mv = Some([0, -2560]);
+        leaf.skip = 0;
+        leaf.var_tx_trees = vec![VarTxSyntaxTree::Split(vec![
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Split(vec![
+                VarTxSyntaxTree::Leaf,
+                VarTxSyntaxTree::Leaf,
+                VarTxSyntaxTree::Leaf,
+                VarTxSyntaxTree::Leaf,
+            ]),
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Leaf,
+        ])];
+        leaf.residual_quant = vec![
+            // Y, §5.11.36 visit order: NW 16×16 leaf, NE quad of 8×8
+            // leaves, SW 16×16, SE 16×16.
+            quant_with(256, &[(0, 9), (1, -1)]),
+            quant_with(64, &[(0, -3)]),
+            quant_with(64, &[(1, 2)]),
+            quant_with(64, &[(0, 1)]),
+            vec![0i32; 64], // all_zero NE-SE 8×8 TU
+            quant_with(256, &[(0, -5)]),
+            quant_with(256, &[(2, 4)]),
+            // U / V: one TX_32X32 TU each.
+            quant_with(1024, &[(0, 6)]),
+            quant_with(1024, &[(0, -2), (1, 1)]),
+        ];
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 8, 8, BLOCK_32X32, &params, 0xC3);
+
+        // Per-leaf §5.11.17 InterTxSizes stamps: TX_8X8 over the NE
+        // quadrant, TX_16X16 elsewhere.
+        for r in 0..8usize {
+            for c in 0..8usize {
+                let want = if r < 4 && c >= 4 { TX_8X8 } else { TX_16X16 };
+                assert_eq!(
+                    walker.inter_tx_sizes()[r * 8 + c] as usize,
+                    want,
+                    "InterTxSizes[{r}][{c}]"
+                );
+            }
+        }
+        // §5.11.5 outer TxSizes fill = the recursion's LAST
+        // terminal-else txSz (the SE TX_16X16 leaf).
+        assert!(
+            walker.tx_sizes().iter().all(|&t| t as usize == TX_16X16),
+            "TxSizes[] = last terminal-else txSz over the footprint"
+        );
+        assert_eq!(walker.is_inters()[0], 1, "intrabc leaf is inter");
+        assert_eq!(walker.skips()[0], 0, "skip = 0");
+    }
+
+    /// §5.11.17 frame-edge clip (r285): a BLOCK_32X32 var-tx leaf on
+    /// a 6-mi-row frame. The SW TX_16X16 quadrant splits into four
+    /// TX_8X8 children whose bottom pair sits at `row = 6 >= MiRows`
+    /// — the §5.11.17 early return emits nothing and stamps nothing
+    /// for them on either side (they are spec-forced terminals at
+    /// depth 2, and their footprints are entirely off-frame). The
+    /// §5.11.36 luma walk clips the matching TUs via the §5.11.35
+    /// `startY >= maxY` early return, so they consume no
+    /// `residual_quant` entries.
+    #[test]
+    fn r285_syntax_round_trip_var_tx_frame_edge_clip() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.tx_mode_select = true;
+        params.allow_intrabc = true;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.intrabc_mv = Some([0, -2560]);
+        leaf.skip = 0;
+        leaf.var_tx_trees = vec![VarTxSyntaxTree::Split(vec![
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Split(vec![
+                VarTxSyntaxTree::Leaf,
+                VarTxSyntaxTree::Leaf,
+                // (6, 0) / (6, 2): off-frame — no symbol, no stamp.
+                VarTxSyntaxTree::Leaf,
+                VarTxSyntaxTree::Leaf,
+            ]),
+            VarTxSyntaxTree::Leaf,
+        ])];
+        leaf.residual_quant = vec![
+            // Y: NW 16×16, NE 16×16, SW 8×8 ×2 (bottom pair clipped),
+            // SE 16×16.
+            quant_with(256, &[(0, 3)]),
+            quant_with(256, &[(1, -2)]),
+            quant_with(64, &[(0, 4)]),
+            quant_with(64, &[(0, -1)]),
+            quant_with(256, &[(0, 2)]),
+            // U / V: one TX_32X32 TU each.
+            quant_with(1024, &[(0, -6)]),
+            quant_with(1024, &[(0, 1)]),
+        ];
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 6, 8, BLOCK_32X32, &params, 0xC5);
+
+        // InterTxSizes: TX_8X8 over the on-frame SW band (rows 4-5,
+        // cols 0-3), TX_16X16 elsewhere.
+        for r in 0..6usize {
+            for c in 0..8usize {
+                let want = if r >= 4 && c < 4 { TX_8X8 } else { TX_16X16 };
+                assert_eq!(
+                    walker.inter_tx_sizes()[r * 8 + c] as usize,
+                    want,
+                    "InterTxSizes[{r}][{c}]"
+                );
+            }
+        }
+        assert!(
+            walker.tx_sizes().iter().all(|&t| t as usize == TX_16X16),
+            "TxSizes[] = last terminal-else txSz"
+        );
+    }
+
+    /// Lossless segment under `TX_MODE_SELECT` (r285): the §5.11.15
+    /// `Lossless` short-circuit forces `TxSize = TX_4X4` with no
+    /// symbol on either side.
+    #[test]
+    fn r285_syntax_round_trip_tx_mode_select_lossless_silent() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.tx_mode_select = true;
+        params.lossless_array[0] = true;
+        let leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 2, 2, BLOCK_8X8, &params, 0xC4);
+        assert!(
+            walker.tx_sizes().iter().all(|&t| t as usize == TX_4X4),
+            "Lossless forces TX_4X4 with no tx_depth symbol"
+        );
+    }
+
+    /// §5.11.16 write-driver caller-bug battery (r285).
+    #[test]
+    fn r285_write_block_tx_size_scope_rejects() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.tx_mode_select = true;
+        params.allow_intrabc = true;
+        let mut writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+
+        // (1) intra leaf: `tx_size` unreachable from maxRectTxSize
+        // within MAX_TX_DEPTH = 2 splits (TX_64X64 → TX_4X4 needs 4).
+        let mut state = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.tx_size = Some(TX_4X4 as u8);
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_64X64,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (2) var_tx_trees supplied on the intra (else) arm.
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.var_tx_trees = vec![VarTxSyntaxTree::Leaf];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_16X16,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (3) scalar `tx_size` commitment on the var-tx arm.
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        block.skip = 0;
+        block.tx_size = Some(TX_16X16 as u8);
+        block.var_tx_trees = vec![VarTxSyntaxTree::Leaf];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_16X16,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (4) var-tx arm tree shortfall (no trees supplied).
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        block.skip = 0;
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_16X16,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (5) var-tx arm tree surplus (two trees on a one-position
+        // BLOCK_16X16 footprint).
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        block.skip = 0;
+        block.var_tx_trees = vec![VarTxSyntaxTree::Leaf, VarTxSyntaxTree::Leaf];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_16X16,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (6) Split at a spec-forced terminal (`txSz == TX_4X4`).
+        let mut state = PartitionSyntaxWriter::new(2, 2, single_tile(2, 2)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        block.skip = 0;
+        block.var_tx_trees = vec![VarTxSyntaxTree::Split(vec![
+            VarTxSyntaxTree::Split(Vec::new()),
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Leaf,
+        ])];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (7) Split child-count mismatch (3 children on a square
+        // quad decomposition).
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        block.skip = 0;
+        block.var_tx_trees = vec![VarTxSyntaxTree::Split(vec![
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Leaf,
+            VarTxSyntaxTree::Leaf,
+        ])];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_16X16,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (8) var_tx_trees on the intrabc `skip == 1` leaf — the
+        // §5.11.16 else arm (`allowSelect = 0`) takes no trees.
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        block.var_tx_trees = vec![VarTxSyntaxTree::Leaf];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_16X16,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

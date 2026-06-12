@@ -301,7 +301,7 @@ pub use partition::{partition_none_only, partition_split_only, write_partition};
 pub use partition_tree::{
     write_block_syntax, write_partition_tree, write_partition_tree_syntax, EncodeBlock, EncodeNode,
     PartitionSyntaxWriter, PartitionTreeWriter, PlaneCoefficients, SyntaxBlock, SyntaxFrameParams,
-    SyntaxNode, SyntaxPalette,
+    SyntaxNode, SyntaxPalette, VarTxSyntaxTree,
 };
 pub use pixel_driver::{
     dispatch_order_cells, encode_intra_frame_y, encode_intra_frame_yuv, CellCoord, EncodedFrame,

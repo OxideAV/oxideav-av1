@@ -22771,20 +22771,10 @@ impl PartitionWalker {
             // TxSize` write still fires across the full block
             // footprint. The §5.11.17 spec body sets `TxSize = txSz`
             // each time the terminal `else` arm fires, so the
-            // last-write semantics match.
-            for dr in 0..bh4 {
-                let rr = mi_row + dr;
-                if rr >= self.mi_rows {
-                    break;
-                }
-                for dc in 0..bw4 {
-                    let cc = mi_col + dc;
-                    if cc >= self.mi_cols {
-                        break;
-                    }
-                    self.tx_sizes[(rr * self.mi_cols + cc) as usize] = last_tx_size;
-                }
-            }
+            // last-write semantics match (r285 — via
+            // [`Self::stamp_tx_sizes_footprint`], shared with the
+            // §5.11.16 write driver's mirror).
+            self.stamp_tx_sizes_footprint(mi_row, mi_col, sub_size, last_tx_size);
             return Ok(last_tx_size);
         }
 
@@ -22816,64 +22806,11 @@ impl PartitionWalker {
             // every `max_tx_depth == 0` row of [`MAX_TX_DEPTH_TABLE`]
             // — only `BLOCK_4X4` has `max_tx_depth == 0`).
             if sub_size > BLOCK_4X4 && allow_select && tx_mode_select {
-                // §8.3.2 `tx_depth` ctx derivation (av1-spec p.363):
-                //   maxTxWidth = Tx_Width[ maxRectTxSize ]
-                //   maxTxHeight = Tx_Height[ maxRectTxSize ]
-                let max_tx_width = TX_WIDTH[max_rect_tx_size] as u32;
-                let max_tx_height = TX_HEIGHT[max_rect_tx_size] as u32;
-                // The §8.3.2 `aboveW` ladder. For our walker
-                // `MiRow == row` always (the §8.3.2 helpers are
-                // written generically over `row` but only invoked at
-                // the block's top-left).
-                let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
-                let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
-                let above_w: u32 = if avail_u {
-                    let above_is_inter = self.is_inter_at(mi_row as i32 - 1, mi_col as i32);
-                    if above_is_inter != 0 {
-                        // `IsInters[ above ] == 1` ⇒ `aboveW =
-                        // Block_Width[ MiSizes[ above ] ]`.
-                        let nb = self.mi_size_at(mi_row as i32 - 1, mi_col as i32);
-                        if nb < BLOCK_SIZES {
-                            block_width(nb) as u32
-                        } else {
-                            // Unfilled cell (still BLOCK_INVALID) —
-                            // treat the same as the
-                            // `get_above_tx_width` fall-through
-                            // `Tx_Width[ InterTxSizes ]` lookup with
-                            // the initial-zero TX_4X4 ⇒ 4.
-                            TX_WIDTH[TX_4X4] as u32
-                        }
-                    } else {
-                        // `else if ( AvailU )` arm:
-                        //   aboveW = get_above_tx_width( MiRow, MiCol )
-                        // For `row == MiRow && AvailU` and the
-                        // `Skips[above] && IsInters[above]` condition
-                        // false (we already established `IsInters ==
-                        // 0`), the fall-through returns
-                        // `Tx_Width[ InterTxSizes[ row - 1 ][ col ] ]`.
-                        let nb_tx = self.inter_tx_size_at(mi_row as i32 - 1, mi_col as i32);
-                        TX_WIDTH[nb_tx as usize] as u32
-                    }
-                } else {
-                    0
-                };
-                let left_h: u32 = if avail_l {
-                    let left_is_inter = self.is_inter_at(mi_row as i32, mi_col as i32 - 1);
-                    if left_is_inter != 0 {
-                        let nb = self.mi_size_at(mi_row as i32, mi_col as i32 - 1);
-                        if nb < BLOCK_SIZES {
-                            block_height(nb) as u32
-                        } else {
-                            TX_HEIGHT[TX_4X4] as u32
-                        }
-                    } else {
-                        let nb_tx = self.inter_tx_size_at(mi_row as i32, mi_col as i32 - 1);
-                        TX_HEIGHT[nb_tx as usize] as u32
-                    }
-                } else {
-                    0
-                };
-                let ctx = tx_depth_ctx(above_w, left_h, max_tx_width, max_tx_height);
+                // §8.3.2 `tx_depth` ctx derivation (av1-spec p.363) —
+                // factored into [`Self::tx_depth_block_ctx`] (r285) so
+                // the §5.11.16 write driver derives the identical
+                // value from its mirror walker.
+                let ctx = self.tx_depth_block_ctx(mi_row, mi_col, sub_size);
                 debug_assert!(
                     ctx < TX_SIZE_CONTEXTS,
                     "§8.3.2 tx_depth ctx is bounded by 0..TX_SIZE_CONTEXTS"
@@ -22913,7 +22850,109 @@ impl PartitionWalker {
         // Plus the §5.11.5 outer `TxSizes[ r + y ][ c + x ] = TxSize`
         // grid-fill (which `decode_block` applies after
         // `read_block_tx_size` returns). We perform both stamps here
-        // so the walker's grid invariants stay in sync.
+        // so the walker's grid invariants stay in sync (r285 — via
+        // [`Self::stamp_block_tx_size_grids`], shared with the
+        // §5.11.16 write driver's mirror).
+        self.stamp_block_tx_size_grids(mi_row, mi_col, sub_size, tx_size);
+
+        Ok(tx_size)
+    }
+
+    /// §8.3.2 `tx_depth` ctx derivation (av1-spec p.363) for the
+    /// §5.11.15 `tx_depth` S() read of the block anchored at
+    /// `(mi_row, mi_col)` with `MiSize = sub_size`:
+    ///
+    /// ```text
+    ///   maxTxWidth = Tx_Width[ maxRectTxSize ]
+    ///   maxTxHeight = Tx_Height[ maxRectTxSize ]
+    ///   if ( AvailU && IsInters[ MiRow - 1 ][ MiCol ] )
+    ///       aboveW = Block_Width[ MiSizes[ MiRow - 1 ][ MiCol ] ]
+    ///   else if ( AvailU )
+    ///       aboveW = get_above_tx_width( MiRow, MiCol )
+    ///   else
+    ///       aboveW = 0
+    ///   ... mirror for leftH via get_left_tx_height ...
+    ///   ctx = ( aboveW >= maxTxWidth ) + ( leftH >= maxTxHeight )
+    /// ```
+    ///
+    /// Factored out of [`Self::read_block_tx_size`] (r285) so the
+    /// encoder's §5.11.16 write driver derives the identical ctx from
+    /// its mirror walker. Side-effect free; the caller is responsible
+    /// for the `sub_size < BLOCK_SIZES` guard (the §5.11.16 reader and
+    /// the write driver both validate it before calling).
+    #[must_use]
+    pub fn tx_depth_block_ctx(&self, mi_row: u32, mi_col: u32, sub_size: usize) -> usize {
+        let max_rect_tx_size = MAX_TX_SIZE_RECT[sub_size];
+        let max_tx_width = TX_WIDTH[max_rect_tx_size] as u32;
+        let max_tx_height = TX_HEIGHT[max_rect_tx_size] as u32;
+        // The §8.3.2 `aboveW` ladder. For our walker `MiRow == row`
+        // always (the §8.3.2 helpers are written generically over
+        // `row` but only invoked at the block's top-left).
+        let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+        let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+        let above_w: u32 = if avail_u {
+            let above_is_inter = self.is_inter_at(mi_row as i32 - 1, mi_col as i32);
+            if above_is_inter != 0 {
+                // `IsInters[ above ] == 1` ⇒ `aboveW =
+                // Block_Width[ MiSizes[ above ] ]`.
+                let nb = self.mi_size_at(mi_row as i32 - 1, mi_col as i32);
+                if nb < BLOCK_SIZES {
+                    block_width(nb) as u32
+                } else {
+                    // Unfilled cell (still BLOCK_INVALID) — treat the
+                    // same as the `get_above_tx_width` fall-through
+                    // `Tx_Width[ InterTxSizes ]` lookup with the
+                    // initial-zero TX_4X4 ⇒ 4.
+                    TX_WIDTH[TX_4X4] as u32
+                }
+            } else {
+                // `else if ( AvailU )` arm:
+                //   aboveW = get_above_tx_width( MiRow, MiCol )
+                // For `row == MiRow && AvailU` and the
+                // `Skips[above] && IsInters[above]` condition false
+                // (we already established `IsInters == 0`), the
+                // fall-through returns
+                // `Tx_Width[ InterTxSizes[ row - 1 ][ col ] ]`.
+                let nb_tx = self.inter_tx_size_at(mi_row as i32 - 1, mi_col as i32);
+                TX_WIDTH[nb_tx as usize] as u32
+            }
+        } else {
+            0
+        };
+        let left_h: u32 = if avail_l {
+            let left_is_inter = self.is_inter_at(mi_row as i32, mi_col as i32 - 1);
+            if left_is_inter != 0 {
+                let nb = self.mi_size_at(mi_row as i32, mi_col as i32 - 1);
+                if nb < BLOCK_SIZES {
+                    block_height(nb) as u32
+                } else {
+                    TX_HEIGHT[TX_4X4] as u32
+                }
+            } else {
+                let nb_tx = self.inter_tx_size_at(mi_row as i32, mi_col as i32 - 1);
+                TX_HEIGHT[nb_tx as usize] as u32
+            }
+        } else {
+            0
+        };
+        tx_depth_ctx(above_w, left_h, max_tx_width, max_tx_height)
+    }
+
+    /// §5.11.16 `else`-arm grid-fill + the §5.11.5 outer `TxSizes[]`
+    /// fill — stamps `tx_size` into BOTH [`Self::inter_tx_sizes`] and
+    /// [`Self::tx_sizes`] across the `bh4 × bw4` footprint of the
+    /// block anchored at `(mi_row, mi_col)`, clipped at the frame's
+    /// mi extent. Shared by [`Self::read_block_tx_size`] and the
+    /// encoder's §5.11.16 write-driver mirror (r285).
+    pub fn stamp_block_tx_size_grids(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        tx_size: u8,
+    ) {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
         for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
@@ -22929,8 +22968,37 @@ impl PartitionWalker {
                 self.tx_sizes[idx] = tx_size;
             }
         }
+    }
 
-        Ok(tx_size)
+    /// §5.11.16 var-tx-arm outer `TxSizes[]` fill — after the
+    /// §5.11.17 recursion stamps `InterTxSizes[]` per leaf, the
+    /// §5.11.5 outer `TxSizes[ r + y ][ c + x ] = TxSize` write still
+    /// fires across the full block footprint using the LAST
+    /// terminal-else's `txSz` (the §5.11.17 `TxSize = txSz`
+    /// last-write semantics). Shared by [`Self::read_block_tx_size`]
+    /// and the encoder's §5.11.16 write-driver mirror (r285).
+    pub fn stamp_tx_sizes_footprint(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        tx_size: u8,
+    ) {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.tx_sizes[(rr * self.mi_cols + cc) as usize] = tx_size;
+            }
+        }
     }
 
     /// `read_var_tx_size( row, col, txSz, depth )` per §5.11.17
@@ -23051,30 +23119,11 @@ impl PartitionWalker {
         let txfm_split: u8 = if tx_sz == TX_4X4 || depth == MAX_VARTX_DEPTH {
             0
         } else {
-            // §8.3.2 ctx derivation. The §8.3.2 helpers
-            // `get_above_tx_width` and `get_left_tx_height` are
-            // inlined here against the walker's grids.
-            let above_w = self.get_above_tx_width(mi_row_b, row, col);
-            let left_h = self.get_left_tx_height(mi_col_b, row, col);
-            let above = above_w < TX_WIDTH[tx_sz] as u32;
-            let left = left_h < TX_HEIGHT[tx_sz] as u32;
-            // §8.3.2 `size = Min( 64, Max( Block_Width[ MiSize ],
-            // Block_Height[ MiSize ] ) )`.
-            let bw = block_width(sub_size);
-            let bh = block_height(sub_size);
-            let size = core::cmp::min(64, core::cmp::max(bw, bh));
-            // §8.3.2 `maxTxSz = find_tx_size( size, size )`. `size` is
-            // always a power-of-two in `4..=64` for any `MiSize`, so
-            // the lookup always hits a square `TX_NxN` ordinal.
-            let max_tx_sz =
-                find_tx_size(size, size).ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            // §8.3.2 `txSzSqrUp = Tx_Size_Sqr_Up[ txSz ]`. The §8.3.2
-            // ctx formula consumes `(txSzSqrUp != maxTxSz)` as a
-            // 0/1 multiplier, and `(TX_SIZES - 1 - maxTxSz)` as a 6×
-            // size-class term; both feed [`txfm_split_ctx`] in u32.
-            let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_sz] as u32;
-            let ctx = txfm_split_ctx(above, left, tx_sz_sqr_up, max_tx_sz as u32)
-                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            // §8.3.2 ctx derivation — factored into
+            // [`Self::txfm_split_node_ctx`] (r285) so the encoder's
+            // §5.11.17 write driver derives the identical value from
+            // its mirror walker.
+            let ctx = self.txfm_split_node_ctx(mi_row_b, mi_col_b, sub_size, row, col, tx_sz)?;
             let cdf = cdfs.txfm_split_cdf(ctx);
             // §8.2.6 S(): a 2-symbol read against
             // `Default_Txfm_Split_Cdf` (length 3 including the counter
@@ -23129,25 +23178,98 @@ impl PartitionWalker {
             // §5.11.17 lines 17-21: terminal else arm. Stamp
             // `InterTxSizes[ row + i ][ col + j ] = txSz` over the
             // `(h4, w4)` footprint of this sub-tree's leaf, clipped at
-            // the frame's `MiRows` / `MiCols` extent.
-            for i in 0..h4 {
-                let rr = row + i;
-                if rr >= self.mi_rows {
-                    break;
-                }
-                for j in 0..w4 {
-                    let cc = col + j;
-                    if cc >= self.mi_cols {
-                        break;
-                    }
-                    self.inter_tx_sizes[(rr * self.mi_cols + cc) as usize] = tx_sz as u8;
-                }
-            }
+            // the frame's `MiRows` / `MiCols` extent (r285 — via
+            // [`Self::stamp_var_tx_leaf`], shared with the §5.11.17
+            // write driver's mirror).
+            self.stamp_var_tx_leaf(row, col, tx_sz);
             // §5.11.17 line 21: `TxSize = txSz`. The §5.11.5 outer
             // loop's TxSize identity is the last terminal-else's
             // `txSz` — surfaced to the §5.11.16 caller via the
             // return value.
             Ok(tx_sz as u8)
+        }
+    }
+
+    /// §8.3.2 `txfm_split` ctx derivation (av1-spec p.363-364) for
+    /// one §5.11.17 `read_var_tx_size` node at `(row, col)` with the
+    /// node's `txSz`, inside the block anchored at
+    /// `(mi_row_b, mi_col_b)` with `MiSize = sub_size`:
+    ///
+    /// ```text
+    ///   above   = get_above_tx_width( row, col ) < Tx_Width[ txSz ]
+    ///   left    = get_left_tx_height( row, col ) < Tx_Height[ txSz ]
+    ///   size    = Min( 64, Max( Block_Width[ MiSize ], Block_Height[ MiSize ] ) )
+    ///   maxTxSz = find_tx_size( size, size )
+    ///   txSzSqrUp = Tx_Size_Sqr_Up[ txSz ]
+    ///   ctx = (txSzSqrUp != maxTxSz) * 3
+    ///       + (TX_SIZES - 1 - maxTxSz) * 6
+    ///       + above + left
+    /// ```
+    ///
+    /// Factored out of [`Self::read_var_tx_size`] (r285) so the
+    /// encoder's §5.11.17 write driver derives the identical ctx from
+    /// its mirror walker. Side-effect free. The ctx is a function of
+    /// the RUNNING `InterTxSizes[]` state — earlier leaves of the same
+    /// block's recursion feed later nodes' ctx on both sides, so the
+    /// caller must interleave this derivation with
+    /// [`Self::stamp_var_tx_leaf`] in §5.11.17 visit order.
+    pub fn txfm_split_node_ctx(
+        &self,
+        mi_row_b: u32,
+        mi_col_b: u32,
+        sub_size: usize,
+        row: u32,
+        col: u32,
+        tx_sz: usize,
+    ) -> Result<usize, crate::Error> {
+        if sub_size >= BLOCK_SIZES || tx_sz >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §8.3.2 helpers `get_above_tx_width` / `get_left_tx_height`
+        // against the walker's grids.
+        let above_w = self.get_above_tx_width(mi_row_b, row, col);
+        let left_h = self.get_left_tx_height(mi_col_b, row, col);
+        let above = above_w < TX_WIDTH[tx_sz] as u32;
+        let left = left_h < TX_HEIGHT[tx_sz] as u32;
+        // §8.3.2 `size = Min( 64, Max( Block_Width[ MiSize ],
+        // Block_Height[ MiSize ] ) )`.
+        let bw = block_width(sub_size);
+        let bh = block_height(sub_size);
+        let size = core::cmp::min(64, core::cmp::max(bw, bh));
+        // §8.3.2 `maxTxSz = find_tx_size( size, size )`. `size` is
+        // always a power-of-two in `4..=64` for any `MiSize`, so the
+        // lookup always hits a square `TX_NxN` ordinal.
+        let max_tx_sz = find_tx_size(size, size).ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        // §8.3.2 `txSzSqrUp = Tx_Size_Sqr_Up[ txSz ]`. The §8.3.2 ctx
+        // formula consumes `(txSzSqrUp != maxTxSz)` as a 0/1
+        // multiplier, and `(TX_SIZES - 1 - maxTxSz)` as a 6×
+        // size-class term; both feed [`txfm_split_ctx`] in u32.
+        let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_sz] as u32;
+        txfm_split_ctx(above, left, tx_sz_sqr_up, max_tx_sz as u32)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)
+    }
+
+    /// §5.11.17 terminal-else `InterTxSizes[]` stamp — fills the
+    /// `(h4, w4)` footprint of one variable-transform leaf at
+    /// `(row, col)` with `tx_sz`, clipped at the frame's mi extent.
+    /// Shared by [`Self::read_var_tx_size`] and the encoder's
+    /// §5.11.17 write-driver mirror (r285).
+    pub fn stamp_var_tx_leaf(&mut self, row: u32, col: u32, tx_sz: usize) {
+        debug_assert!(tx_sz < TX_SIZES_ALL, "tx_sz bounded by TX_SIZES_ALL");
+        let w4 = (TX_WIDTH[tx_sz] / MI_SIZE) as u32;
+        let h4 = (TX_HEIGHT[tx_sz] / MI_SIZE) as u32;
+        for i in 0..h4 {
+            let rr = row + i;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for j in 0..w4 {
+                let cc = col + j;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                self.inter_tx_sizes[(rr * self.mi_cols + cc) as usize] = tx_sz as u8;
+            }
         }
     }
 

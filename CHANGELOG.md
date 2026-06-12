@@ -4,6 +4,46 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r285 (2026-06-12): thread the §5.11.15 / §5.11.16 /
+  §5.11.17 transform-size write side into `write_block_syntax` —
+  `TxMode == TX_MODE_SELECT` (previously rejected wholesale by the
+  syntax write driver) is now supported on every arm, in
+  decode-walker lockstep. New `write_block_tx_size_syntax` mirrors
+  the §5.11.16 dispatch at the §5.11.5 `read_block_tx_size( )`
+  position: the `else` arm commits `SyntaxBlock::tx_size` (or the
+  spec-forced `Lossless ? TX_4X4 : Max_Tx_Size_Rect[ MiSize ]`
+  default) through the stateless r218 `write_block_tx_size`
+  `tx_depth` emitter with the §8.3.2 ctx from the mirror walker,
+  then performs the dual-grid fill; the var-tx arm (`is_inter &&
+  !skip && !Lossless`) walks the `(txH4, txW4)` sub-rectangles
+  consuming one `SyntaxBlock::var_tx_trees` split-decision tree per
+  position and emitting the §5.11.17 `txfm_split` recursion via the
+  new `write_var_tx_size_syntax` (live §8.3.2 ctx per node — earlier
+  leaves' `InterTxSizes[]` stamps feed later nodes' ctx on BOTH
+  sides — frame-edge early returns, spec-forced terminals at
+  `TX_4X4` / `MAX_VARTX_DEPTH`, per-leaf stamps, last terminal-else
+  `TxSize` propagation + outer `TxSizes[]` fill). The §5.11.36
+  `transform_tree` write recursion now follows genuinely VARIABLE
+  `InterTxSizes[]` grids (mixed per-leaf TU sizes within one block),
+  and §5.11.34 chroma sizing tracks the §5.11.16-committed `TxSize`
+  exactly like the decode walker's `residual( )` threading. To keep
+  the two sides on one derivation, the walker's §8.3.2 ctx walks
+  and grid fills are factored into shared pub methods —
+  `tx_depth_block_ctx( )`, `txfm_split_node_ctx( )`,
+  `stamp_block_tx_size_grids( )`, `stamp_tx_sizes_footprint( )`,
+  `stamp_var_tx_leaf( )` — which `read_block_tx_size` /
+  `read_var_tx_size` now call (no behavioural change; the existing
+  decode battery pins it). New round-trips: BLOCK_16X16 intra
+  `tx_depth = 1` (four TX_8X8 luma TUs + TX_16X16 chroma), the
+  4-leaf split with mixed depths + the intrabc `allowSelect = 0`
+  silent arm, the BLOCK_32X32 intrabc var-tx tree (TX_16X16 quad
+  with one TX_8X8 sub-quad at MAX_VARTX_DEPTH, 7 luma TUs), the
+  6-mi-row frame-edge clip (off-frame §5.11.17 children + clipped
+  §5.11.35 TUs), the lossless-segment silent arm, and an 8-case
+  caller-bug battery (unreachable `tx_size`, trees on non-var-tx
+  arms, shortfall / surplus / terminal-split / child-count
+  malformations). Library tests 1942 → 1948.
+
 - encoder+decoder r284 (2026-06-12): land the §8.3.2 coefficient
   level-context machinery on BOTH sides of the §5.11.39 surface. The
   `PartitionWalker` now tracks the §6.10.2 `AboveLevelContext` /

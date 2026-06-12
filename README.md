@@ -2,6 +2,71 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-12 (round 285)
+
+Round 285 threads the **§5.11.15 / §5.11.16 / §5.11.17
+transform-size write side** into `write_block_syntax` —
+`TxMode == TX_MODE_SELECT` is now supported on every arm of the
+full-syntax write driver, in decode-walker lockstep:
+
+* **§5.11.16 write dispatch (`write_block_tx_size_syntax`)** — at
+  the §5.11.5 `read_block_tx_size( )` position (after
+  `palette_tokens( )`, before `residual( )`). The `else` arm
+  commits `SyntaxBlock::tx_size` (spec-forced `Lossless ? TX_4X4 :
+  Max_Tx_Size_Rect[ MiSize ]` default when `None`) through the
+  stateless r218 `tx_depth` emitter and performs the reader's
+  dual-grid fill; the var-tx arm consumes one
+  `SyntaxBlock::var_tx_trees` split-decision tree per `(txH4,
+  txW4)` sub-rectangle in §5.11.16 loop order.
+* **§5.11.17 write recursion (`write_var_tx_size_syntax`)** —
+  `txfm_split` S() per non-terminal node with the §8.3.2 ctx
+  derived LIVE from the mirror walker (earlier leaves'
+  `InterTxSizes[]` stamps feed later nodes' `get_above_tx_width` /
+  `get_left_tx_height` walks on both sides), frame-edge early
+  returns (no symbol, no stamp; off-frame nodes must be `Leaf`),
+  spec-forced terminals at `TX_4X4` / `MAX_VARTX_DEPTH`, per-leaf
+  `InterTxSizes[]` stamps in visit order, and the last
+  terminal-else `TxSize` propagated into the §5.11.5 outer
+  `TxSizes[]` fill.
+* **Shared derivations** — the walker's §8.3.2 ctx walks and grid
+  fills are factored into pub methods (`tx_depth_block_ctx`,
+  `txfm_split_node_ctx`, `stamp_block_tx_size_grids`,
+  `stamp_tx_sizes_footprint`, `stamp_var_tx_leaf`) that
+  `read_block_tx_size` / `read_var_tx_size` and the write driver
+  now BOTH call — one derivation, two directions.
+* **§5.11.36 / §5.11.34 follow-through** — the inter-arm
+  `transform_tree` write recursion now follows genuinely variable
+  `InterTxSizes[]` grids (mixed per-leaf TU sizes inside one
+  block), intra leaves fan §5.11.34 luma into committed-`TxSize`
+  TUs (`tx_depth > 0`), and chroma sizing tracks the
+  §5.11.16-committed `TxSize` exactly like the decode walker's
+  `residual( )` threading — with the r284 §8.3.2 level-context
+  machinery asserting per-TU `all_zero` / `dc_sign` ctx parity
+  across all of it.
+
+New round-trips: BLOCK_16X16 intra `tx_depth = 1` (4 × TX_8X8 luma
+TUs + TX_16X16 chroma); the 4-leaf split mixing depths 0/1 with the
+intrabc `allowSelect = 0` silent arm (later leaves' `tx_depth` ctx
+reads earlier stamps); the BLOCK_32X32 intrabc var-tx tree
+(TX_16X16 quad, one quadrant re-split to TX_8X8 at
+`MAX_VARTX_DEPTH` ⇒ 7 luma TUs of two sizes); the 6-mi-row
+frame-edge clip (off-frame §5.11.17 children + clipped §5.11.35
+TUs); the lossless-segment silent arm; and an 8-case caller-bug
+battery. Library tests 1942 → 1948.
+
+### Pending follow-ups for round 286+
+
+* **Quantizer-params threading** — the decode walker still pins the
+  per-block `ResidualContext` at `base_q_idx = 0`, which silences
+  the §5.11.47 `transform_type` S(); threading real §5.9.12
+  quantizer state through `decode_block_syntax` and the write side
+  (including a `write_transform_type`) is one paired arc.
+* **Pixel-driver ctx upgrade** — the matched encoder/decoder pixel
+  drivers still exchange coefficients with explicit
+  `txb_skip_ctx = dc_sign_ctx = 0`; migrating them onto the §8.3.2
+  derivations is an isolated paired change.
+* **CFL `compute_prediction` decode gap** carries over from r282.
+
 ## Status — 2026-06-12 (round 284)
 
 Round 284 lands the **§8.3.2 coefficient level-context machinery on
