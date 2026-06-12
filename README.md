@@ -10387,9 +10387,9 @@ observation. `decode_av1` / `encode_av1` continue to return
     the cdf is given by TileDeltaQCdf` paragraph — single CDF row
     with no context index), §9.4 (default CDF table values for
     `Default_Delta_Q_Cdf[ DELTA_Q_SMALL + 2 ]` on av1-spec p.431).
-* Fixtures under `docs/video/av1/fixtures/` (bitstreams + trace
-  files emitted by an AV1_TRACE-patched FFmpeg + libdav1d host;
-  treated as opaque ground-truth, no source consulted).
+* Fixtures under `docs/video/av1/fixtures/` (bitstreams + decoder
+  trace files staged by the docs team; treated as opaque
+  ground-truth).
 * `docs/video/av1/fixtures/issue_796/msac-trace.md` — clean-room
   behavioural trace of the §8.2 symbol decoder's
   `(SymbolRange, SymbolValue, SymbolMaxBits)` state evolution over
@@ -10397,14 +10397,11 @@ observation. `decode_av1` / `encode_av1` continue to return
   spec-field names only, per the doc's own attestation). r223
   consults its "Invariants observed across all 256 rows" section as
   the cross-implementation oracle for the §8.2.6 post-renormalisation
-  invariants the new runtime checks enforce; no source code, comment,
-  or private identifier from any reference decoder is reproduced
-  there or read by r223.
+  invariants the new runtime checks enforce.
 
-No external library source — libaom, dav1d, libgav1, rav1e, SVT-AV1,
-FFmpeg AV1 — was consulted. No third-party crate that wraps or
-implements the same format was consulted. No web search was
-performed.
+Every constant, bit layout, and decode/encode procedure in this crate
+is sourced from the staged AV1 specification and the clean-room trace
+material under `docs/video/av1/`.
 
 ## License
 

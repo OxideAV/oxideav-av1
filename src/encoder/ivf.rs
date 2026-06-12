@@ -29,8 +29,7 @@
 //! `tiny-i-only-16x16-prof0/input.ivf` decodes byte-for-byte to
 //! the table above with `version=0`, `header_length=32`,
 //! `codec=AV01`, `16x16` dimensions, `fps_num=25`, `fps_den=1`,
-//! `frame_count=1`. No external library source consulted — the
-//! byte layout itself is the spec.
+//! `frame_count=1`. The byte layout itself is the spec.
 //!
 //! The writer wraps any `std::io::Write` sink. Frame count is
 //! tracked in-memory as `frames_written()`; callers that need the
