@@ -2,6 +2,73 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-12 (round 283)
+
+Round 283 threads the **§5.11.34 `residual( )` write side into
+`write_block_syntax`** — the r282 driver previously rejected
+`skip == 0` leaves; non-skip intra leaves now emit per-TU residuals
+the §5.11.5 decode walker consumes in sentinel-lockstep:
+
+* **§5.11.34 dispatch mirror (`write_residual_intra`)** — the
+  chunk loop (`widthChunks` / `heightChunks` / `miSizeChunk`), the
+  `1 + HasChroma * 2` plane loop, the §5.11.37 `get_tx_size` /
+  §5.11.38 `get_plane_residual_size` per-plane sizing (chroma `None`
+  ⇒ continue, luma `None` ⇒ caller bug), and the `stepX` / `stepY`
+  per-TU iteration with the `(chunkX << 4) >> subX` offsets —
+  line-for-line against `PartitionWalker::residual`'s intra arm.
+* **§5.11.35 per-TU write (`write_transform_block_intra`)** — the
+  line-13 `startX >= maxX` clip (clipped TUs consume no input), the
+  §5.11.47 `transform_type( )` mirror (bit-silent under the decode
+  walker's neutral per-block `ResidualContext` `base_q_idx = 0`
+  guard; `TxType = DCT_DCT` stamped over the TU footprint into the
+  mirror's `TxTypes[]`), the §5.11.40 `compute_tx_type( )`
+  derivation (luma reads the stamped grid; intra chroma reads
+  `Mode_To_Txfm[ UVMode ]` under the §5.11.48 set admission), the
+  §8.3.2 `get_tx_class` reduction, §7.5 `get_scan` selection, and
+  the §5.11.39 `write_coefficients` emission with the decode
+  walker's `txb_skip_ctx = 0` / `dc_sign_ctx = 0`.
+* **§5.11.15 / §5.11.16 tx-size derivation** — `TxSize = Lossless ?
+  TX_4X4 : Max_Tx_Size_Rect[ MiSize ]` (bit-silent on the supported
+  `TxMode != TX_MODE_SELECT` configuration), stamped into the
+  mirror's `TxSizes[]` / `InterTxSizes[]` via the extended
+  `stamp_encoder_block_syntax` so the encoder's grids stay in
+  decode-walker parity; `skip == 1` leaves (both arms) mirror the
+  walker's bit-silent `TxTypes[] = DCT_DCT` pre-stamp.
+* **Input surface** — `SyntaxBlock::residual_quant: Vec<Vec<i32>>`,
+  one row-major `Quant[]` array per visited TU in §5.11.34 dispatch
+  order; count or length mismatches are rejected without
+  desyncing (`PartitionWalkOutOfRange`).
+
++6 round-trips through the r282 sentinel + whole-`TileCdfContext` +
+grid-parity harness (now also asserting `TxSizes` / `InterTxSizes`
+/ `TxTypes` parity): a single 16×16 leaf with DC/AC/golomb-tail
+coefficients on all three planes; a 4-leaf split mixing skip,
+all-zero (`all_zero = 1`), and non-zero leaves (later leaves' skip
+ctx + coefficient CDFs adapt off the earlier ones); a lossless leaf
+fanning into 12 TX_4X4 TUs; a 4:2:0 leaf (TX_16X16 luma + TX_8X8
+chroma sizing); a monochrome leaf; and a `UVMode = V_PRED` leaf
+(`Mode_To_Txfm` chroma tx-type departure). The scope-reject battery
+covers TU shortfall/surplus/length, `skip == 1` with supplied TUs,
+and `skip == 0` intrabc. Library tests 1929 → 1935.
+
+### Pending follow-ups for round 284+
+
+* **§8.3.2 level-context mirrors** — the decode walker's §5.11.39
+  reader runs with `txb_skip_ctx = 0` / `dc_sign_ctx = 0` (no
+  `AboveLevelContext` / `LeftLevelContext` grids yet); the
+  neighbour-aware ctx walk must land on BOTH sides in one arc.
+* **§5.11.36 inter-luma `transform_tree` write arm** —
+  `write_block_syntax` still rejects `skip == 0` on the
+  intra-block-copy arm (the `is_inter && !Lossless && !plane`
+  recursion over `InterTxSizes[]`; the read side exists).
+* **Quantizer-params threading** — the decode walker pins the
+  per-block `ResidualContext` at `base_q_idx = 0`, which silences
+  the §5.11.47 `transform_type` S(); threading real §5.9.12
+  quantizer state through `decode_block_syntax` and the write side
+  (including a `write_transform_type`) is one paired arc.
+* **§5.11.16 `tx_depth` write threading** (`TX_MODE_SELECT`) and
+  the CFL `compute_prediction` decode gap carry over from r282.
+
 ## Status — 2026-06-12 (round 282)
 
 Round 282 threads the **full §5.11.7 `intra_frame_mode_info( )`

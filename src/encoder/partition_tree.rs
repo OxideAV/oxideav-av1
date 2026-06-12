@@ -106,12 +106,15 @@
 //! [`crate::cdf::PartitionWalker::decode_block`]: crate::cdf::PartitionWalker
 
 use crate::cdf::{
-    cfl_allowed_for_uv_mode, intra_mode_ctx, palette_tokens_args, partition_ctx, partition_subsize,
-    segment_id_ctx, size_group, skip_ctx, EncoderBlockSyntaxStamp, MotionFieldMvs, PalettePlane,
-    PartitionWalker, TileCdfContext, TileGeometry, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID,
-    BLOCK_SIZES, DC_PRED, FRAME_LF_COUNT, GM_TYPE_IDENTITY, MAX_SEGMENTS, MI_HEIGHT_LOG2,
-    MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE,
-    PARTITION_SPLIT, UV_CFL_PRED, WARPEDMODEL_PREC_BITS,
+    cfl_allowed_for_uv_mode, compute_tx_type, get_plane_residual_size, get_tx_size, intra_mode_ctx,
+    intra_tx_type_set, palette_tokens_args, partition_ctx, partition_subsize, segment_id_ctx,
+    size_group, skip_ctx, EncoderBlockSyntaxStamp, MotionFieldMvs, PalettePlane, PartitionWalker,
+    TileCdfContext, TileGeometry, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT,
+    DC_PRED, FRAME_LF_COUNT, GM_TYPE_IDENTITY, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS,
+    MAX_TX_SIZE_RECT, MI_HEIGHT_LOG2, MI_SIZE, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH,
+    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, TX_4X4, TX_CLASS_2D,
+    TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT,
+    V_FLIPADST, WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
     write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_intra_frame_else_arm,
@@ -608,19 +611,23 @@ pub struct SyntaxPalette {
 /// §5.11.7 scalars the encoder committed and the
 /// [`write_partition_tree_syntax`] driver replays bit-for-bit.
 ///
-/// ## Scope (r282)
+/// ## Scope (r283)
 ///
-/// * `skip` MUST be `1` — the §5.11.34 `residual()` write-side
-///   threading (per-TU §5.11.39 coefficient emission inside the
-///   §5.11.36 transform-tree order) is the follow-up arc; a `skip = 0`
-///   leaf would desynchronise against the decode walker's residual
-///   reads and is rejected as out-of-scope.
+/// * `skip == 0` is supported on the §5.11.7 `else` (intra) arm as of
+///   r283: the §5.11.34 `residual()` write side threads the per-TU
+///   §5.11.39 coefficient emission (with the §5.11.47 / §5.11.40
+///   tx-type mirror) in decode-walker dispatch order, consuming
+///   [`Self::residual_quant`]. The intra-block-copy arm
+///   ([`Self::intrabc_mv`]` == Some`) still requires `skip == 1` —
+///   the §5.11.36 inter-luma `transform_tree` write recursion is the
+///   follow-up arc.
 /// * The §5.11.16 `read_block_tx_size()` call is bit-silent on the
 ///   supported configuration (`tx_mode_select == false`); see
 ///   [`SyntaxFrameParams::tx_mode_select`].
 #[derive(Debug, Clone)]
 pub struct SyntaxBlock {
-    /// §5.11.11 `skip`. MUST be `1` for r282 (see scope note).
+    /// §5.11.11 `skip`. `0` or `1` (`0` requires the intra `else` arm
+    /// + [`Self::residual_quant`]; see scope note).
     pub skip: u8,
     /// §5.11.8 `segment_id` in `0..=last_active_seg_id` (and `0` when
     /// segmentation is disabled). On the post-skip arm (`SegIdPreSkip
@@ -662,6 +669,18 @@ pub struct SyntaxBlock {
     pub filter_intra_mode: Option<u8>,
     /// §5.11.46 / §5.11.49 palette commitments.
     pub palette: SyntaxPalette,
+    /// §5.11.34 `residual()` per-TU quantized-coefficient commitments
+    /// — one `Quant[]` array (row-major, length `Tx_Width[txSz] *
+    /// Tx_Height[txSz]`) per §5.11.35 `transform_block` the §5.11.34
+    /// dispatch visits, in dispatch order (chunk-row → chunk-col →
+    /// plane → TU-row → TU-col). TUs clipped by the §5.11.35
+    /// `startX >= maxX || startY >= maxY` early return are NOT
+    /// represented (the reader never visits them). MUST be empty when
+    /// `skip == 1` (the §5.11.35 `!skip` gate never fires) and have
+    /// exactly the visited-TU count when `skip == 0` — both mismatches
+    /// are caller bugs ([`crate::Error::PartitionWalkOutOfRange`]).
+    /// Added r283.
+    pub residual_quant: Vec<Vec<i32>>,
 }
 
 impl SyntaxBlock {
@@ -686,6 +705,7 @@ impl SyntaxBlock {
             use_filter_intra: 0,
             filter_intra_mode: None,
             palette: SyntaxPalette::default(),
+            residual_quant: Vec::new(),
         }
     }
 }
@@ -1049,14 +1069,25 @@ pub fn write_partition_tree_syntax(
 /// 5. The mirror grid stamps
 ///    ([`PartitionWalker::stamp_encoder_block_syntax`]) so subsequent
 ///    leaves derive their contexts from the same state the decode
-///    walker observes.
+///    walker observes — including the §5.11.16 else-arm `TxSizes[]` /
+///    `InterTxSizes[]` fill (bit-silent on the supported
+///    `TxMode != TX_MODE_SELECT` configuration).
+/// 6. §5.11.34 `residual()` via `write_residual_intra` (r283) —
+///    on `skip == 0` the per-TU §5.11.35 / §5.11.39 coefficient write
+///    composition (with the §5.11.47 / §5.11.40 tx-type mirror +
+///    §5.11.38 per-plane residual sizing) runs in decode-walker
+///    dispatch order, consuming [`SyntaxBlock::residual_quant`]; on
+///    `skip == 1` only the decode walker's bit-silent
+///    `TxTypes[] = DCT_DCT` pre-stamp is mirrored.
 ///
-/// ## r282 scope rejects (all [`Error::PartitionWalkOutOfRange`])
+/// ## r283 scope rejects (all [`Error::PartitionWalkOutOfRange`])
 ///
-/// * `skip != 1` — §5.11.34 `residual()` write threading is the
-///   follow-up arc.
+/// * `skip == 0` on the intra-block-copy arm — the §5.11.36
+///   inter-luma `transform_tree` write recursion is the follow-up arc.
 /// * `params.tx_mode_select == true` — §5.11.16 `tx_depth` write
 ///   threading is the follow-up arc.
+/// * [`SyntaxBlock::residual_quant`] count/length mismatches against
+///   the §5.11.34 visited-TU enumeration.
 /// * The leaf-writer caller-bug surface of the composed writers
 ///   (shape mismatches between `uv_mode` and `HasChroma`, CFL alphas,
 ///   palette bounds, non-integer intrabc MV difference, …).
@@ -1086,8 +1117,18 @@ pub fn write_block_syntax(
         // §5.11.16 write threading — follow-up arc (see method docs).
         return Err(Error::PartitionWalkOutOfRange);
     }
-    if block.skip != 1 {
-        // §5.11.34 residual write threading — follow-up arc.
+    if block.skip > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if block.intrabc_mv.is_some() && block.skip != 1 {
+        // §5.11.34 inter-luma `transform_tree` write threading
+        // (the `is_inter && !Lossless && !plane` arm) — follow-up arc.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if block.skip == 1 && !block.residual_quant.is_empty() {
+        // §5.11.35 `!skip` never fires on a skip leaf — supplying TU
+        // coefficient arrays there is a caller bug (they would be
+        // silently dropped otherwise).
         return Err(Error::PartitionWalkOutOfRange);
     }
     if (block.segment_id as usize) >= MAX_SEGMENTS {
@@ -1212,6 +1253,20 @@ pub fn write_block_syntax(
         params.delta_lf_res,
     )?;
 
+    // §6.8.2 per-segment `Lossless` + the §5.11.15 / §5.11.16
+    // `read_block_tx_size()` else-arm derivation. With the supported
+    // `TxMode != TX_MODE_SELECT` configuration the §5.11.15 body is
+    // bit-silent on BOTH sides: `TxSize = Lossless ? TX_4X4 :
+    // Max_Tx_Size_Rect[ MiSize ]` (no `tx_depth` symbol). The value
+    // feeds the §5.11.34 residual dispatch below and the mirror's
+    // `TxSizes[]` / `InterTxSizes[]` grid stamps.
+    let lossless = params.lossless_array[block.segment_id as usize];
+    let tx_size_blk = if lossless {
+        TX_4X4
+    } else {
+        MAX_TX_SIZE_RECT[sub_size]
+    };
+
     // §5.11.7 `use_intrabc` dispatch + `use_intrabc == 1` arm.
     if let Some(mv) = block.intrabc_mv {
         // §7.10.2 `find_mv_stack( 0 )` with `RefFrame = [ INTRA_FRAME,
@@ -1271,9 +1326,21 @@ pub fn write_block_syntax(
                 palette_colors_u: &[],
                 palette_colors_v: &[],
                 cdef: cdef_committed,
+                tx_size: tx_size_blk as u8,
             });
         // §5.11.49 `palette_tokens( )` — `PaletteSize{Y,UV} = 0` on
         // the intrabc arm ⇒ no-op.
+        //
+        // §5.11.34 `residual()` skip-arm mirror (r283): the decode
+        // walker still walks the per-TU §5.11.36 / §5.11.34 dispatch
+        // bit-silently on `skip == 1` and pre-stamps `TxTypes[] =
+        // DCT_DCT` over every luma TU footprint (the §5.11.39
+        // gate-closed invariant the §5.11.40 chroma lookup relies on).
+        // The TU footprints tile the block's luma extent, so a single
+        // clipped block-footprint stamp is observably identical.
+        state
+            .mirror
+            .stamp_tx_type(mi_col, mi_row, bw4, bh4, DCT_DCT as u8);
         return Ok(());
     }
 
@@ -1281,7 +1348,6 @@ pub fn write_block_syntax(
     // silent otherwise), then the `else` arm composite.
     write_intra_frame_intrabc_arm(writer, cdfs, params.allow_intrabc, None)?;
 
-    let lossless = params.lossless_array[block.segment_id as usize];
     // §8.3.2 `intra_frame_y_mode` neighbour-mode ctx pair from the
     // mirror's `YModes[]` grid (`DC_PRED` fallback when unavailable).
     let above_mode = if avail_u {
@@ -1423,7 +1489,333 @@ pub fn write_block_syntax(
             palette_colors_u: &pal.colors_u,
             palette_colors_v: &pal.colors_v,
             cdef: cdef_committed,
+            tx_size: tx_size_blk as u8,
         });
+
+    // §5.11.5 line `residual( )` — §5.11.34 write dispatcher (r283).
+    // Follows the (bit-silent) §5.11.16 `read_block_tx_size( )` +
+    // §5.11.33 `compute_prediction( )` call sites in §5.11.5 order. On
+    // `skip == 1` the decode walker's per-TU walk reads no bits and
+    // only pre-stamps `TxTypes[] = DCT_DCT` over the luma TU
+    // footprints (which tile the block's luma extent) — mirror with
+    // one clipped block-footprint stamp. On `skip == 0` the full
+    // per-TU §5.11.39 coefficient write composition runs.
+    if block.skip == 0 {
+        write_residual_intra(
+            writer,
+            cdfs,
+            state,
+            block,
+            mi_row,
+            mi_col,
+            sub_size,
+            params,
+            has_chroma,
+            lossless,
+            tx_size_blk,
+        )?;
+    } else {
+        state
+            .mirror
+            .stamp_tx_type(mi_col, mi_row, bw4, bh4, DCT_DCT as u8);
+    }
+    Ok(())
+}
+
+/// §5.11.34 `residual()` write dispatcher — the write twin of
+/// [`PartitionWalker::residual`]'s intra (`is_inter == 0`) arm,
+/// invoked from [`write_block_syntax`] on a `skip == 0` else-arm leaf.
+///
+/// Mirrors the §5.11.34 body line-for-line on the reachable path:
+///
+/// ```text
+///   widthChunks  = Max( 1, Block_Width[ MiSize ] >> 6 )
+///   heightChunks = Max( 1, Block_Height[ MiSize ] >> 6 )
+///   miSizeChunk  = ( widthChunks > 1 || heightChunks > 1 )
+///                      ? BLOCK_64X64 : MiSize
+///   for ( chunkY ... ) for ( chunkX ... )
+///       for ( plane = 0; plane < 1 + HasChroma * 2; plane++ ) {
+///           txSz    = Lossless ? TX_4X4 : get_tx_size( plane, TxSize )
+///           stepX/Y = Tx_Width/Height[ txSz ] >> 2
+///           planeSz = get_plane_residual_size( miSizeChunk, plane )
+///           num4x4W/H, subX/Y, baseXBlock/baseYBlock
+///           for ( y ... += stepY ) for ( x ... += stepX )
+///               transform_block( plane, baseXBlock, baseYBlock, txSz,
+///                                x + ((chunkX << 4) >> subX),
+///                                y + ((chunkY << 4) >> subY) )
+///       }
+/// ```
+///
+/// (The `is_inter && !Lossless && !plane` §5.11.36 `transform_tree`
+/// arm is unreachable here — [`write_block_syntax`] rejects `skip ==
+/// 0` intra-block-copy leaves, and the §5.11.7 else arm always has
+/// `is_inter == 0`.)
+///
+/// Each visited TU consumes the next [`SyntaxBlock::residual_quant`]
+/// entry; a count mismatch in either direction is a caller bug
+/// ([`Error::PartitionWalkOutOfRange`]).
+#[allow(clippy::too_many_arguments)]
+fn write_residual_intra(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    block: &SyntaxBlock,
+    mi_row: u32,
+    mi_col: u32,
+    sub_size: usize,
+    params: &SyntaxFrameParams,
+    has_chroma: bool,
+    lossless: bool,
+    tx_size_blk: usize,
+) -> Result<(), Error> {
+    // Caller-bug guards (mirror `PartitionWalker::residual`).
+    if params.subsampling_x > 1 || params.subsampling_y > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.34 lines 3-5: `widthChunks` / `heightChunks` /
+    // `miSizeChunk`. `Block_Width = Num_4x4_Blocks_Wide * 4`.
+    let block_w = NUM_4X4_BLOCKS_WIDE[sub_size] * 4;
+    let block_h = NUM_4X4_BLOCKS_HIGH[sub_size] * 4;
+    let width_chunks = core::cmp::max(1, block_w >> 6);
+    let height_chunks = core::cmp::max(1, block_h >> 6);
+    let mi_size_chunk = if width_chunks > 1 || height_chunks > 1 {
+        BLOCK_64X64
+    } else {
+        sub_size
+    };
+
+    // §5.11.34: `1 + HasChroma * 2` planes.
+    let num_planes: u8 = if has_chroma { 3 } else { 1 };
+
+    let mut tu_idx = 0usize;
+    for chunk_y in 0..height_chunks {
+        for chunk_x in 0..width_chunks {
+            for plane in 0..num_planes {
+                // §5.11.34 line 12: `txSz`.
+                let tx_sz = if lossless {
+                    TX_4X4
+                } else {
+                    get_tx_size(
+                        plane,
+                        tx_size_blk,
+                        sub_size,
+                        params.subsampling_x,
+                        params.subsampling_y,
+                    )
+                    .ok_or(Error::PartitionWalkOutOfRange)?
+                };
+                // §5.11.34 lines 13-14: `stepX` / `stepY` (≥ 1 — the
+                // smallest §6.10.16 transform side is 4).
+                let step_x = TX_WIDTH[tx_sz] >> 2;
+                let step_y = TX_HEIGHT[tx_sz] >> 2;
+                // §5.11.34 line 15: `planeSz` — a `None` for chroma is
+                // the implicit "no chroma residual" path; caller-bug
+                // for luma (same split as the decode walker).
+                let plane_sz = match get_plane_residual_size(
+                    mi_size_chunk,
+                    plane,
+                    params.subsampling_x,
+                    params.subsampling_y,
+                ) {
+                    Some(s) => s,
+                    None => {
+                        if plane == 0 {
+                            return Err(Error::PartitionWalkOutOfRange);
+                        }
+                        continue;
+                    }
+                };
+                // §5.11.34 lines 16-19.
+                let num4x4_w = NUM_4X4_BLOCKS_WIDE[plane_sz];
+                let num4x4_h = NUM_4X4_BLOCKS_HIGH[plane_sz];
+                let sub_x = if plane > 0 { params.subsampling_x } else { 0 };
+                let sub_y = if plane > 0 { params.subsampling_y } else { 0 };
+                // §5.11.34 lines 26-27: `baseXBlock` / `baseYBlock`
+                // (the original `MiCol` / `MiRow`, NOT the
+                // chunk-offset ones).
+                let base_x_block = (mi_col >> sub_x) * (MI_SIZE as u32);
+                let base_y_block = (mi_row >> sub_y) * (MI_SIZE as u32);
+                // §5.11.34 lines 28-30: per-TU iteration.
+                let mut y = 0usize;
+                while y < num4x4_h {
+                    let mut x = 0usize;
+                    while x < num4x4_w {
+                        let x_arg = (x as u32) + (((chunk_x as u32) << 4) >> sub_x);
+                        let y_arg = (y as u32) + (((chunk_y as u32) << 4) >> sub_y);
+                        write_transform_block_intra(
+                            writer,
+                            cdfs,
+                            state,
+                            block,
+                            plane,
+                            base_x_block,
+                            base_y_block,
+                            tx_sz,
+                            x_arg,
+                            y_arg,
+                            sub_x,
+                            sub_y,
+                            mi_row,
+                            mi_col,
+                            lossless,
+                            &mut tu_idx,
+                        )?;
+                        x += step_x;
+                    }
+                    y += step_y;
+                }
+            }
+        }
+    }
+    // Every supplied TU array must have been consumed — a surplus is
+    // the same caller bug as a shortfall (caught inside the per-TU
+    // writer).
+    if tu_idx != block.residual_quant.len() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    Ok(())
+}
+
+/// §5.11.35 `transform_block()` write twin — the bit-emitting subset
+/// of the decode walker's per-TU dispatch
+/// (`PartitionWalker::transform_block_emit`) on the intra `!skip` arm:
+///
+/// 1. The §5.11.35 line-13 `startX >= maxX || startY >= maxY`
+///    early return (clipped TUs consume no `residual_quant` entry —
+///    the reader never visits them).
+/// 2. The §5.11.47 `transform_type()` mirror on luma. The decode
+///    walker invokes its reader against the neutral per-block
+///    [`crate::cdf::ResidualContext`] (`base_q_idx = 0`, segmentation
+///    off), so the §5.11.47 `set > 0 && qIdx > 0` guard is always
+///    false there: no S() symbol on either side and
+///    `TxType = DCT_DCT`, stamped over the TU's 4×4 footprint into
+///    the mirror's `TxTypes[]`. (The richer caller-supplied-quantiser
+///    variant lands with the §5.9.12 quantizer-params threading arc.)
+/// 3. The §5.11.40 `compute_tx_type()` derivation (luma reads the
+///    just-stamped `TxTypes[]`; intra chroma reads
+///    `Mode_To_Txfm[ UVMode ]` filtered by the §5.11.48 set
+///    admission) → §8.3.2 `get_tx_class` reduction → §7.5
+///    [`crate::scan::get_scan`] selection.
+/// 4. The §5.11.39 [`write_coefficients`] emission with the decode
+///    walker's `txb_skip_ctx = 0` / `dc_sign_ctx = 0` (the §8.3.2
+///    `AboveLevelContext` / `LeftLevelContext` neighbour walks are
+///    not yet threaded on the decode side either — they land on both
+///    sides in the same follow-up arc).
+#[allow(clippy::too_many_arguments)]
+fn write_transform_block_intra(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    block: &SyntaxBlock,
+    plane: u8,
+    base_x: u32,
+    base_y: u32,
+    tx_sz: usize,
+    x: u32,
+    y: u32,
+    sub_x: u8,
+    sub_y: u8,
+    mi_row: u32,
+    mi_col: u32,
+    lossless: bool,
+    tu_idx: &mut usize,
+) -> Result<(), Error> {
+    // §5.11.35 lines 1-2 + 10-13.
+    let start_x = base_x + 4 * x;
+    let start_y = base_y + 4 * y;
+    let max_x = (state.mi_cols * (MI_SIZE as u32)) >> sub_x;
+    let max_y = (state.mi_rows * (MI_SIZE as u32)) >> sub_y;
+    if start_x >= max_x || start_y >= max_y {
+        return Ok(());
+    }
+
+    let tx_w = TX_WIDTH[tx_sz];
+    let tx_h = TX_HEIGHT[tx_sz];
+    let x4 = start_x >> 2;
+    let y4 = start_y >> 2;
+
+    // §5.11.47 `transform_type()` mirror — luma only (see fn docs:
+    // bit-silent under the decode walker's neutral quantiser guard;
+    // `TxType = DCT_DCT` stamped over the TU footprint).
+    if plane == 0 {
+        state.mirror.stamp_tx_type(
+            x4,
+            y4,
+            (tx_w >> 2) as u32,
+            (tx_h >> 2) as u32,
+            DCT_DCT as u8,
+        );
+    }
+
+    // §5.11.48 `get_tx_set( txSz )` for the §5.11.40 admission filter
+    // (intra arm — `reduced_tx_set = false` on the neutral context).
+    let tx_sz_sqr = {
+        let side = core::cmp::min(tx_w, tx_h);
+        (side.trailing_zeros() as usize) - 2
+    };
+    let tx_set = intra_tx_type_set(
+        tx_sz_sqr as u32,
+        TX_SIZE_SQR_UP[tx_sz] as u32,
+        /* reduced_tx_set = */ false,
+    );
+
+    // §5.11.40 `compute_tx_type( plane, txSz, x4, y4 )` against the
+    // mirror's `TxTypes[]` grid — same closure shape as the decode
+    // walker's.
+    let plane_tx_type = {
+        let tx_types_grid = state.mirror.tx_types();
+        let mi_rows = state.mi_rows;
+        let mi_cols = state.mi_cols;
+        compute_tx_type(
+            plane as usize,
+            tx_sz,
+            lossless,
+            /* is_inter = */ false,
+            tx_set,
+            mi_row,
+            mi_col,
+            x4,
+            y4,
+            sub_x as u32,
+            sub_y as u32,
+            block.uv_mode.unwrap_or(0) as usize,
+            |yy, xx| {
+                if yy >= mi_rows || xx >= mi_cols {
+                    DCT_DCT
+                } else {
+                    tx_types_grid[(yy * mi_cols + xx) as usize] as usize
+                }
+            },
+        )
+    };
+
+    // §8.3.2 `get_tx_class` reduction.
+    let tx_class = match plane_tx_type {
+        V_DCT | V_ADST | V_FLIPADST => TX_CLASS_VERT,
+        H_DCT | H_ADST | H_FLIPADST => TX_CLASS_HORIZ,
+        _ => TX_CLASS_2D,
+    };
+
+    // §7.5 / §5.11.41 scan selection.
+    let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
+
+    // §5.11.39 `coeffs( plane, startX, startY, txSz )` — consume the
+    // next caller-committed `Quant[]` array. Exact-length check keeps
+    // a transposed/mis-sized commitment from silently encoding
+    // garbage.
+    let quant = block
+        .residual_quant
+        .get(*tu_idx)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    *tu_idx += 1;
+    if quant.len() != tx_w * tx_h {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    write_coefficients(
+        writer, cdfs, plane, /* is_inter = */ 0, tx_sz, tx_class, /* txb_skip_ctx = */ 0,
+        /* dc_sign_ctx = */ 0, scan, quant,
+    )?;
     Ok(())
 }
 
@@ -2244,6 +2636,16 @@ mod tests {
             "PaletteColors parity"
         );
         assert_eq!(m.cdef_idx(), walker.cdef_idx(), "cdef_idx parity");
+        // r283 — §5.11.16 / §5.11.47 mirror grids: the residual write
+        // threading keeps the encoder's TxSizes / InterTxSizes /
+        // TxTypes stamps in decode-walker parity.
+        assert_eq!(m.tx_sizes(), walker.tx_sizes(), "TxSizes parity");
+        assert_eq!(
+            m.inter_tx_sizes(),
+            walker.inter_tx_sizes(),
+            "InterTxSizes parity"
+        );
+        assert_eq!(m.tx_types(), walker.tx_types(), "TxTypes parity");
         (enc_state, walker)
     }
 
@@ -2512,19 +2914,76 @@ mod tests {
         assert_eq!(walker.current_delta_lf()[0], -2, "DeltaLF[0] accumulation");
     }
 
-    /// r282 scope guards: residual (`skip == 0`) and §5.11.16
-    /// (`tx_mode_select`) write threading are follow-up arcs; an
-    /// intrabc leaf without `allow_intrabc` is a §5.11.7 caller bug.
+    /// r283 scope guards: §5.11.16 (`tx_mode_select`) write threading
+    /// and the `skip == 0` intra-block-copy §5.11.36 transform-tree
+    /// arm are follow-up arcs; an intrabc leaf without `allow_intrabc`
+    /// and every `residual_quant` count/length mismatch are caller
+    /// bugs.
     #[test]
-    fn r282_write_block_syntax_scope_rejects() {
+    fn r283_write_block_syntax_scope_rejects() {
         let params = SyntaxFrameParams::intra_8bit_baseline();
         let mut writer = SymbolWriter::new(true);
         let mut cdfs = TileCdfContext::new_from_defaults();
         let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
 
-        // skip = 0 ⇒ §5.11.34 residual follow-up.
+        // skip = 0 with NO residual_quant arrays ⇒ §5.11.34 TU
+        // shortfall (BLOCK_8X8 4:4:4 visits 3 TUs).
         let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         block.skip = 0;
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // skip = 0 with a wrong-length Quant[] array (TX_8X8 needs 64).
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.skip = 0;
+        block.residual_quant = vec![vec![0i32; 16], vec![0i32; 64], vec![0i32; 64]];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // skip = 0 with SURPLUS arrays (4 supplied, 3 visited).
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.skip = 0;
+        block.residual_quant = vec![vec![0i32; 64]; 4];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // skip = 1 with residual_quant arrays ⇒ caller bug (the
+        // §5.11.35 `!skip` gate never consumes them).
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.residual_quant = vec![vec![0i32; 64]; 3];
         let err = super::write_block_syntax(
             &mut writer,
             &mut cdfs,
@@ -2571,5 +3030,212 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // skip = 0 on the intra-block-copy arm ⇒ §5.11.36 inter-luma
+        // transform-tree write threading follow-up.
+        let mut params_bc = params.clone();
+        params_bc.allow_intrabc = true;
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        block.skip = 0;
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params_bc,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // r283 — §5.11.34 residual() write threading round-trips. Same
+    // sentinel + whole-CDF + grid-parity harness as the r282 tests;
+    // every tree below contains `skip == 0` leaves whose per-TU
+    // §5.11.39 coefficient writes the §5.11.5 decode walker consumes
+    // through its §5.11.34 dispatcher.
+    // -----------------------------------------------------------------
+
+    /// Build a `Quant[]` array of `len` zeros with `(pos, val)`
+    /// overrides.
+    fn quant_with(len: usize, entries: &[(usize, i32)]) -> Vec<i32> {
+        let mut q = vec![0i32; len];
+        for &(pos, val) in entries {
+            q[pos] = val;
+        }
+        q
+    }
+
+    /// Single BLOCK_16X16 leaf, 4:4:4: three TX_16X16 TUs (Y/U/V) with
+    /// distinct DC + AC commitments (positive, negative, and a
+    /// larger-magnitude value through the §5.11.39 coeff_br + golomb
+    /// tail).
+    #[test]
+    fn r283_syntax_round_trip_residual_single_16x16_leaf() {
+        let params = SyntaxFrameParams::intra_8bit_baseline();
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.skip = 0;
+        leaf.residual_quant = vec![
+            // Y: DC + two low-scan AC taps.
+            quant_with(256, &[(0, 5), (1, -2), (16, 1)]),
+            // U: negative DC only.
+            quant_with(256, &[(0, -7)]),
+            // V: a magnitude past the §5.11.39 base-range cap (golomb
+            // tail) at DC plus a mid-scan tap.
+            quant_with(256, &[(0, 40), (2, 3)]),
+        ];
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xA7);
+        assert!(
+            walker.skips().iter().all(|&s| s == 0),
+            "decoded Skips[] = 0 over the leaf footprint"
+        );
+        // §5.11.16 else-arm TxSizes stamp: TX_16X16 over the block.
+        assert!(
+            walker
+                .tx_sizes()
+                .iter()
+                .all(|&t| t as usize == crate::cdf::TX_16X16),
+            "TxSizes[] = TX_16X16 over the 16×16 leaf"
+        );
+    }
+
+    /// SPLIT into four BLOCK_8X8 leaves mixing skip / non-skip and
+    /// all-zero / non-zero commitments: the later leaves' §8.3.2
+    /// `skip` ctx comes from the earlier leaves' `Skips[]` stamps on
+    /// BOTH sides, and the §8.3 coefficient-CDF adaptation from the
+    /// earlier TUs feeds the later TUs' writes.
+    #[test]
+    fn r283_syntax_round_trip_residual_split_mixed_skip() {
+        let params = SyntaxFrameParams::intra_8bit_baseline();
+
+        // NW: non-zero coefficients on all three TX_8X8 TUs.
+        let mut nw = SyntaxBlock::skip_leaf(V_PRED as u8, Some(DC_PRED as u8));
+        nw.skip = 0;
+        nw.residual_quant = vec![
+            quant_with(64, &[(0, 3), (1, 1)]),
+            quant_with(64, &[(0, -1)]),
+            quant_with(64, &[(8, 2)]),
+        ];
+        // NE: skip leaf (no TUs).
+        let ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        // SW: non-skip with ALL-ZERO commitments — every plane writes
+        // `all_zero = 1`.
+        let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        sw.skip = 0;
+        sw.residual_quant = vec![vec![0i32; 64]; 3];
+        // SE: single negative DC on luma, zeros on chroma.
+        let mut se = SyntaxBlock::skip_leaf(2, Some(DC_PRED as u8));
+        se.skip = 0;
+        se.residual_quant = vec![quant_with(64, &[(0, -4)]), vec![0i32; 64], vec![0i32; 64]];
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x3C);
+
+        let cols = 4usize;
+        for (r0, c0, want) in [(0usize, 0usize, 0u8), (0, 2, 1), (2, 0, 0), (2, 2, 0)] {
+            assert_eq!(
+                walker.skips()[r0 * cols + c0],
+                want,
+                "Skips stamp at ({r0}, {c0})"
+            );
+        }
+    }
+
+    /// Lossless leaf: the §5.11.15 `Lossless ⇒ TX_4X4` short-circuit
+    /// fans a BLOCK_8X8 4:4:4 leaf into 12 TX_4X4 TUs (4 per plane),
+    /// exercising the §5.11.34 stepX/stepY iteration order across
+    /// multiple TUs per plane.
+    #[test]
+    fn r283_syntax_round_trip_residual_lossless_tx4x4_fan_out() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.lossless_array = [true; MAX_SEGMENTS];
+        params.coded_lossless = true;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.skip = 0;
+        // 12 TUs in dispatch order: plane 0 rows (y=0: x=0,1; y=1:
+        // x=0,1) then planes 1, 2. Give the first TU of each plane a
+        // distinct DC; leave the rest all-zero.
+        let mut tus = Vec::new();
+        for plane in 0..3 {
+            for tu in 0..4 {
+                tus.push(if tu == 0 {
+                    quant_with(16, &[(0, plane + 1)])
+                } else {
+                    vec![0i32; 16]
+                });
+            }
+        }
+        leaf.residual_quant = tus;
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 2, 2, BLOCK_8X8, &params, 0xE1);
+        assert!(
+            walker.tx_sizes().iter().all(|&t| t as usize == TX_4X4),
+            "lossless TxSizes[] = TX_4X4"
+        );
+    }
+
+    /// 4:2:0 subsampled leaf: BLOCK_16X16 luma TX_16X16 + two TX_8X8
+    /// chroma TUs through the §5.11.37 / §5.11.38 chroma-size
+    /// derivations (`get_tx_size` / `get_plane_residual_size` with
+    /// `subX = subY = 1`).
+    #[test]
+    fn r283_syntax_round_trip_residual_420_chroma_sizing() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.subsampling_x = 1;
+        params.subsampling_y = 1;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.skip = 0;
+        leaf.residual_quant = vec![
+            quant_with(256, &[(0, 2), (1, 1)]),
+            quant_with(64, &[(0, -3)]),
+            quant_with(64, &[(0, 6), (8, -1)]),
+        ];
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let _ = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x4B);
+    }
+
+    /// Monochrome leaf: `NumPlanes == 1` ⇒ the §5.11.34 plane loop
+    /// visits luma only (one TX_16X16 TU).
+    #[test]
+    fn r283_syntax_round_trip_residual_monochrome_luma_only() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.num_planes = 1;
+        params.mono_chrome = true;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+        leaf.skip = 0;
+        leaf.residual_quant = vec![quant_with(256, &[(0, 9), (3, -2)])];
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let _ = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xD2);
+    }
+
+    /// Directional chroma mode (`UVMode = V_PRED`): the §5.11.40
+    /// `Mode_To_Txfm[ UVMode ]` chroma derivation departs from
+    /// DCT_DCT, changing the chroma TUs' §7.5 scan + §8.3.2 tx-class
+    /// axes on both sides.
+    #[test]
+    fn r283_syntax_round_trip_residual_chroma_mode_to_txfm() {
+        let params = SyntaxFrameParams::intra_8bit_baseline();
+        let mut leaf = SyntaxBlock::skip_leaf(V_PRED as u8, Some(V_PRED as u8));
+        leaf.skip = 0;
+        leaf.residual_quant = vec![
+            quant_with(256, &[(0, 1)]),
+            quant_with(256, &[(0, 2), (16, 1)]),
+            quant_with(256, &[(0, -2)]),
+        ];
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let _ = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x78);
     }
 }

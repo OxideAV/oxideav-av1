@@ -4,6 +4,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r283 (2026-06-12): thread the §5.11.34 `residual( )` write
+  side into `write_block_syntax` — non-skip (`skip == 0`) intra
+  leaves now emit per-TU residuals the §5.11.5 decode walker consumes
+  in sentinel-lockstep. New `write_residual_intra` mirrors the
+  §5.11.34 chunk / plane / TU dispatch (§5.11.37 `get_tx_size` +
+  §5.11.38 `get_plane_residual_size` sizing, `stepX` / `stepY`
+  iteration with chunk offsets) and `write_transform_block_intra`
+  mirrors the §5.11.35 per-TU body: the line-13 frame clip, the
+  §5.11.47 `transform_type( )` mirror (bit-silent under the decode
+  walker's neutral `base_q_idx = 0` guard, `TxType = DCT_DCT`
+  stamped into the mirror's `TxTypes[]`), §5.11.40
+  `compute_tx_type( )` (intra chroma via `Mode_To_Txfm[ UVMode ]`
+  under the §5.11.48 set admission), the §8.3.2 `get_tx_class`
+  reduction, §7.5 `get_scan`, and the §5.11.39 `write_coefficients`
+  emission. The §5.11.15 / §5.11.16 `TxSize = Lossless ? TX_4X4 :
+  Max_Tx_Size_Rect[ MiSize ]` derivation is stamped into the
+  mirror's `TxSizes[]` / `InterTxSizes[]` (extended
+  `stamp_encoder_block_syntax`), and `skip == 1` leaves mirror the
+  walker's bit-silent `TxTypes[] = DCT_DCT` pre-stamp — the
+  round-trip harness now asserts parity on all three tx grids. Input
+  surface: `SyntaxBlock::residual_quant` (one row-major `Quant[]`
+  per visited TU in dispatch order; count/length mismatches
+  rejected). 6 new round-trips (DC/AC/golomb-tail coefficients,
+  mixed skip / all-zero split, lossless 12-TU TX_4X4 fan-out, 4:2:0
+  chroma sizing, monochrome, `UVMode = V_PRED` chroma tx-type) plus
+  the extended scope-reject battery; library tests 1929 → 1935.
+  Remaining §5.11.34 write-side scope: the §8.3.2
+  `AboveLevelContext` / `LeftLevelContext` mirrors (decode side
+  also pins `txb_skip_ctx = dc_sign_ctx = 0`), the inter-luma
+  §5.11.36 `transform_tree` write arm (`skip == 0` intrabc still
+  rejected), and real quantizer-params threading (which would
+  un-silence the §5.11.47 S() on both sides).
+
 - encoder r282 (2026-06-12): thread the FULL §5.11.7
   `intra_frame_mode_info( )` composition into the encoder's
   partition-tree write side — the write twin of the r281

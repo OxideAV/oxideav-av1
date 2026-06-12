@@ -14933,6 +14933,14 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     /// §5.11.56 anchor value — `Some(v)` only when the matching
     /// writer emitted the `L(cdef_bits)` literal for this leaf.
     pub cdef: Option<i8>,
+    /// §5.11.15 / §5.11.16 `TxSize` — the per-block transform size the
+    /// (bit-silent on `TxMode != TX_MODE_SELECT`) §5.11.16
+    /// `read_block_tx_size()` else-arm derives. Stamped into BOTH
+    /// `TxSizes[]` and `InterTxSizes[]` over the block footprint,
+    /// mirroring [`PartitionWalker::read_block_tx_size`]'s else-arm
+    /// grid-fill. Added r283 (the §5.11.34 residual write threading
+    /// keeps the mirror's tx grids in decode-walker parity).
+    pub tx_size: u8,
 }
 
 impl PartitionWalker {
@@ -15887,6 +15895,9 @@ impl PartitionWalker {
     ///   reader's "only stamp non-zero entries" identity on the
     ///   zero-initialised grids). The UV size stamps planes 1 and 2
     ///   with `palette_colors_u` / `palette_colors_v` respectively.
+    /// * `TxSizes` / `InterTxSizes` — the §5.11.16 else-arm grid-fill
+    ///   (always stamped; on the supported `TxMode != TX_MODE_SELECT`
+    ///   configuration the reader's stamp is unconditional too).
     /// * `cdef_idx` — the §5.11.56 anchor walk, performed only when
     ///   `cdef` is `Some` (i.e. the writer emitted the `L(cdef_bits)`
     ///   literal for this leaf; the short-circuit and
@@ -15916,6 +15927,11 @@ impl PartitionWalker {
                 self.segment_ids[cell] = s.segment_id as i32;
                 self.y_modes[cell] = s.y_mode;
                 self.is_inters[cell] = s.is_inter;
+                // §5.11.16 else-arm grid-fill mirror (r283): the decode
+                // walker's `read_block_tx_size` stamps both grids over
+                // the footprint on its (bit-silent here) else arm.
+                self.tx_sizes[cell] = s.tx_size;
+                self.inter_tx_sizes[cell] = s.tx_size;
                 if s.is_inter != 0 {
                     // §5.11.7 `use_intrabc == 1` footer stamps (mirrors
                     // the `decode_block_syntax` intrabc-arm grid-fill).
