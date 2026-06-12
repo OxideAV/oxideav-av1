@@ -2,6 +2,95 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-12 (round 282)
+
+Round 282 threads the **full §5.11.7 `intra_frame_mode_info( )`
+composition into the encoder's partition-tree write side** — the
+write twin of r281's `decode_block_syntax` threading. The new
+`encoder::partition_tree::write_partition_tree_syntax` recursion
+(driven by a `SyntaxNode` tree of per-leaf `SyntaxBlock` bundles +
+a `SyntaxFrameParams` scalar set mirroring `decode_block_syntax`'s
+parameter list) emits, at every §5.11.4 leaf via
+`write_block_syntax`, the COMPLETE §5.11.7 body in spec order:
+
+* **Prefix (§5.11.7 lines 1-10)** — `intra_segment_id( )` on both
+  the `SegIdPreSkip` pre-skip arm (spec's `skip = 0` initialiser)
+  and the post-skip arm, with the §5.11.9 neighbour cascade +
+  §8.3.2 ctx derived from the driver's mirror `SegmentIds[]` grid;
+  `read_skip( )` with the §8.3.2 `Skips[]` neighbour ctx;
+  `read_cdef( )` with §5.11.56 anchor tracking on the mirror's
+  `cdef_idx[]` grid; `read_delta_qindex( )` / `read_delta_lf( )`
+  per §5.11.12 / §5.11.13.
+* **`use_intrabc` dispatch** — `write_intra_frame_intrabc_arm`
+  (r279); on the intrabc arm the §7.10.2 `find_mv_stack( 0 )` runs
+  against the mirror's `RefFrames` / `Mvs` / `IsInters` grids
+  (identity global motion + all-invalid `MotionFieldMvs`, matching
+  the decode walker's setup), then the §5.11.26 `assign_mv( 0 )`
+  `PredMv[ 0 ]` fallback chain + the §5.11.31 `read_mv( 0 )` write
+  under `MvCtx = MV_INTRABC_CONTEXT` / `force_integer_mv = 1`.
+* **`else` arm** — the r280 `write_intra_frame_else_arm` composite
+  (`intra_frame_y_mode` with the §8.3.2 neighbour-mode ctx pair
+  from the mirror's `YModes[]`, angle deltas, the `HasChroma` arm
+  incl. §5.11.45 CFL, §5.11.46 `palette_mode_info` with entries —
+  `has_palette_y` ctx + §5.11.49 cache from the mirror's
+  `PaletteSizes[]` / `PaletteColors[]` — and §5.11.24
+  `filter_intra_mode_info`).
+* **§5.11.49 `palette_tokens( )`** — the new
+  `encoder::block_mode_info::write_palette_tokens_plane`, the exact
+  write twin of `palette_tokens_plane`: `color_index_map
+  NS(PaletteSize)` + the anti-diagonal `palette_color_idx` S() walk,
+  rebuilding the reader's working `ColorMap` sample-by-sample so
+  every §5.11.50 colour context matches. Y at luma geometry, UV at
+  the §5.11.49 subsampled-plus-bump geometry via
+  `palette_tokens_args`.
+
+The `PartitionSyntaxWriter` driver owns a `PartitionWalker` mirror
+stamped after every leaf (new crate-internal
+`stamp_encoder_block_syntax`: `MiSizes` / `Skips` / `SegmentIds` /
+`YModes` / `IsInters` / `RefFrames` / `Mvs` / `InterpFilters` /
+`PaletteSizes` / `PaletteColors` / §5.11.56 `cdef_idx` anchors) so
+the encoder derives every neighbour context from exactly the state
+the decode walker observes.
+
++8 tests. Five partition-tree round-trips drive
+`write_partition_tree_syntax` bytes through
+`decode_partition_syntax` and assert (a) an 8-bit sync sentinel,
+(b) whole-`TileCdfContext` equality (total §8.3 adaptation
+lockstep), and (c) mirror-vs-walker parity across all eleven grids:
+a 4-leaf else-arm split whose 2nd/3rd/4th leaves' Y-mode ctx pairs
+come from stamped neighbours; an intra-block-copy pair where the
+2nd block's `PredMv` is the 1st block's stamped MV on both sides;
+three adjacent palette leaves sharing the §5.11.49 cache (cache-hit
++ new-literal entry coding) plus a UV palette with its UV token
+walk; and a `SegIdPreSkip` segmentation + delta-q / delta-lf
+battery (accumulators verified on the decode walker). Two
+`write_palette_tokens_plane` unit tests cover the
+frame-edge-straddling `onscreen < block` case (border-fill derived,
+not coded) and the caller-bug reject set. Library tests 1922 → 1929;
+walker integration suite stays 62.
+
+### Pending follow-ups for round 283+
+
+* **§5.11.34 residual write threading** — `write_block_syntax`
+  rejects `skip == 0` leaves; emitting the per-TU §5.11.39
+  coefficient writes in §5.11.36 transform-tree order (with the
+  `AboveLevelContext` / `LeftLevelContext` mirrors) is the next
+  encoder arc. The leaf coefficient writers (`write_coefficients`)
+  already exist.
+* **§5.11.16 `tx_depth` write threading** — `write_block_syntax`
+  rejects `TX_MODE_SELECT`; needs `write_block_tx_size` composed
+  with `TxSizes[]` / `InterTxSizes[]` mirror grids for the §8.3.2
+  ctx walk.
+* CFL leaves round-trip the §5.11.45 bits but cannot yet be proven
+  through `decode_partition_syntax` — the decode walker's §5.11.33
+  `compute_prediction` surfaces
+  `ComputePredictionIntraModeUnsupported` for `UV_CFL_PRED` (the
+  §7.11.5 CFL prediction process is not yet decoded there); the CFL
+  write path stays covered by the r280/r265 else-arm writer tests.
+* Migrate the legacy arc-11 `write_partition_tree` intra leaf
+  (§5.11.22 `y_mode` path with origin-default ctx) onto the
+  full-syntax driver once residual threading lands.
+
 ## Status — 2026-06-12 (round 281)
 
 Round 281 threads the **full §5.11.7 `intra_frame_mode_info( )`

@@ -268,8 +268,8 @@ pub use bitwriter::BitWriter;
 pub use block_mode_info::{
     write_inter_block_mode_info, write_inter_block_mode_info_bootstrap,
     write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
-    write_intra_uv_mode, write_skip, write_use_intrabc, write_y_mode, IntrabcArmInputs,
-    IntrabcBlockInfo,
+    write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_use_intrabc, write_y_mode,
+    IntrabcArmInputs, IntrabcBlockInfo,
 };
 pub use coefficients::{
     write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,
@@ -299,7 +299,9 @@ pub use obu::{
 };
 pub use partition::{partition_none_only, partition_split_only, write_partition};
 pub use partition_tree::{
-    write_partition_tree, EncodeBlock, EncodeNode, PartitionTreeWriter, PlaneCoefficients,
+    write_block_syntax, write_partition_tree, write_partition_tree_syntax, EncodeBlock, EncodeNode,
+    PartitionSyntaxWriter, PartitionTreeWriter, PlaneCoefficients, SyntaxBlock, SyntaxFrameParams,
+    SyntaxNode, SyntaxPalette,
 };
 pub use pixel_driver::{
     dispatch_order_cells, encode_intra_frame_y, encode_intra_frame_yuv, CellCoord, EncodedFrame,

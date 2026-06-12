@@ -50,15 +50,16 @@
 use crate::cdf::{
     block_height, block_width, ceil_log2_av1, cfl_alpha_u_ctx, cfl_alpha_v_ctx, comp_group_idx_ctx,
     comp_mode_ctx, comp_ref_type_ctx, compound_idx_ctx, compound_mode_ctx, count_refs,
-    interintra_ctx, interp_filter_ctx, is_directional, is_samedir_ref_pair, mi_height_log2,
-    mi_width_log2, neg_interleave, palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx,
-    wedge_bits, CompoundTypeReadout, FindMvStackResult, InterIntraReadout,
-    InterpolationFilterReadout, PartitionWalker, TileCdfContext, BILINEAR, BLOCK_128X128,
-    BLOCK_32X32, BLOCK_64X64, BLOCK_8X8, BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE,
-    CFL_JOINT_SIGNS, CLASS0_SIZE, COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE,
-    COMPOUND_INTRA, COMPOUND_MODES, COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES, COMPOUND_WEDGE,
-    COMP_INTER_CONTEXTS, DC_PRED, DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, EIGHTTAP,
-    FRAME_LF_COUNT, GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_NONE,
+    get_palette_color_context, interintra_ctx, interp_filter_ctx, is_directional,
+    is_samedir_ref_pair, mi_height_log2, mi_width_log2, neg_interleave, palette_color_ctx,
+    palette_uv_mode_ctx, palette_y_mode_ctx, ref_count_ctx, wedge_bits, CompoundTypeReadout,
+    FindMvStackResult, InterIntraReadout, InterpolationFilterReadout, PalettePlane,
+    PartitionWalker, TileCdfContext, BILINEAR, BLOCK_128X128, BLOCK_32X32, BLOCK_64X64, BLOCK_8X8,
+    BLOCK_SIZES, BLOCK_SIZE_GROUPS, CFL_ALPHABET_SIZE, CFL_JOINT_SIGNS, CLASS0_SIZE,
+    COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_INTRA, COMPOUND_MODES,
+    COMPOUND_MODE_CONTEXTS, COMPOUND_TYPES, COMPOUND_WEDGE, COMP_INTER_CONTEXTS, DC_PRED,
+    DELTA_LF_SMALL, DELTA_Q_SMALL, DRL_MODE_CONTEXTS, EIGHTTAP, FRAME_LF_COUNT,
+    GM_TYPE_TRANSLATION, INTERINTRA_MODES, INTERP_FILTERS, INTERP_FILTER_NONE,
     INTRABC_DELAY_PIXELS, INTRA_FILTER_MODES, INTRA_MODES, INTRA_MODE_CONTEXTS, IS_INTER_CONTEXTS,
     MAX_ANGLE_DELTA, MAX_REF_MV_STACK_SIZE, MAX_SEGMENTS, MI_SIZE, MODE_GLOBALMV,
     MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV,
@@ -2854,6 +2855,141 @@ pub fn write_palette_entries_uv(
         // §5.11.46 V direct-literal arm: each entry as L(BitDepth).
         for &c in palette_colors_v.iter().take(palette_size_uv) {
             writer.write_literal(bd, c as u32)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// §5.11.49 `palette_tokens( )` per-plane writer — r282. The exact
+/// encode-side twin of [`crate::cdf::palette_tokens_plane`]: emits the
+/// `color_index_map_{y,uv} NS(PaletteSize)` literal followed by the
+/// anti-diagonal `palette_color_idx_{y,uv}` `S()` walk over the
+/// on-screen rectangle, deriving the §5.11.50 colour context per
+/// position from the same incrementally-reconstructed `ColorMap` the
+/// reader maintains.
+///
+/// Parameters mirror the reader's, with `color_map` flipped from an
+/// output to an input:
+///
+/// * `plane` — see [`PalettePlane`]. Selects the
+///   [`TileCdfContext::palette_y_color_cdf`] /
+///   [`TileCdfContext::palette_uv_color_cdf`] family.
+/// * `palette_size` — `PaletteSize{Y,UV}` in `2..=PALETTE_COLORS`.
+/// * `block_width` / `block_height` / `onscreen_width` /
+///   `onscreen_height` — the §5.11.49 dimensions
+///   ([`crate::cdf::palette_tokens_args`] computes them, including
+///   the UV subsampling + `<4`-bump adjustment).
+/// * `color_map` — the target `ColorMap{Y,UV}` palette-index plane,
+///   row-major with row stride `stride`. Only the on-screen rectangle
+///   is read (`0..onscreen_height` × `0..onscreen_width`); every read
+///   sample MUST be `< palette_size` (the reader can only reconstruct
+///   indices the `ColorOrder` permutation reaches).
+/// * `stride` — row stride of `color_map`; `>= block_width`.
+///
+/// Internally the writer rebuilds the reader's working map sample by
+/// sample (each §5.11.50 context reads only already-walked
+/// neighbours), so the emitted symbol sequence — and the §8.3 CDF
+/// adaptation it drives — is identical to what
+/// [`crate::cdf::palette_tokens_plane`] consumes. The reader's
+/// §5.11.49 border-fill writes are not mirrored: they happen after
+/// every context-relevant sample has been walked and are therefore
+/// unobservable on the bit stream.
+///
+/// Errors mirror the reader: [`crate::Error::InvalidPaletteWalkArgs`]
+/// for caller bugs (`palette_size` out of `2..=PALETTE_COLORS`,
+/// zero / oversize on-screen dims, `stride < block_width`,
+/// `color_map` shorter than `block_height * stride`, an on-screen
+/// sample `>= palette_size`), and
+/// [`crate::Error::PaletteColorContextUnmapped`] when the §5.11.50
+/// `ColorContextHash` lands on an unmapped `Palette_Color_Context[]`
+/// entry (unreachable for realisable neighbour combinations).
+#[allow(clippy::too_many_arguments)]
+pub fn write_palette_tokens_plane(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    plane: PalettePlane,
+    palette_size: usize,
+    block_width: usize,
+    block_height: usize,
+    onscreen_width: usize,
+    onscreen_height: usize,
+    color_map: &[u8],
+    stride: usize,
+) -> Result<(), Error> {
+    // Caller-bug guards — identical set to the reader's.
+    if !(2..=PALETTE_COLORS).contains(&palette_size) {
+        return Err(Error::InvalidPaletteWalkArgs);
+    }
+    if onscreen_width == 0 || onscreen_height == 0 {
+        return Err(Error::InvalidPaletteWalkArgs);
+    }
+    if onscreen_width > block_width || onscreen_height > block_height {
+        return Err(Error::InvalidPaletteWalkArgs);
+    }
+    if stride < block_width {
+        return Err(Error::InvalidPaletteWalkArgs);
+    }
+    if color_map.len() < block_height.saturating_mul(stride) {
+        return Err(Error::InvalidPaletteWalkArgs);
+    }
+    if (color_map[0] as usize) >= palette_size {
+        return Err(Error::InvalidPaletteWalkArgs);
+    }
+
+    // §5.11.49: `color_index_map_{y,uv} NS(PaletteSize)` — the
+    // top-left sample is coded as a non-symmetric literal.
+    writer.write_ns(palette_size as u32, color_map[0] as u32)?;
+
+    // Working map — the reader's `ColorMap` reconstruction, rebuilt
+    // sample by sample so each §5.11.50 context derivation observes
+    // exactly the state the reader's derivation observes (unwalked
+    // cells hold the same `0` pre-fill the reader's buffer holds).
+    let mut work = vec![0u8; block_height * stride];
+    work[0] = color_map[0];
+
+    // §5.11.49 anti-diagonal walk over the on-screen rectangle.
+    for i in 1..(onscreen_height + onscreen_width - 1) {
+        let j_hi = core::cmp::min(i, onscreen_width - 1);
+        let j_lo = i.saturating_sub(onscreen_height - 1);
+        let mut j = j_hi;
+        loop {
+            let r = i - j;
+            let c = j;
+
+            let desired = color_map[r * stride + c];
+            if (desired as usize) >= palette_size {
+                return Err(Error::InvalidPaletteWalkArgs);
+            }
+
+            // §5.11.50 colour context + `ColorOrder` permutation from
+            // the working map (already-walked neighbours only).
+            let pcc = get_palette_color_context(&work, stride, r, c, palette_size)
+                .ok_or(Error::InvalidPaletteWalkArgs)?;
+            let ctx = palette_color_ctx(pcc.color_context_hash)
+                .ok_or(Error::PaletteColorContextUnmapped)?;
+
+            // §5.11.49: the reader maps `palette_color_idx` through
+            // `ColorOrder`; the writer inverts the permutation.
+            let idx = pcc
+                .color_order
+                .iter()
+                .take(palette_size)
+                .position(|&v| v == desired)
+                .ok_or(Error::InvalidPaletteWalkArgs)?;
+
+            let cdf = match plane {
+                PalettePlane::Y => cdfs.palette_y_color_cdf(palette_size, ctx),
+                PalettePlane::Uv => cdfs.palette_uv_color_cdf(palette_size, ctx),
+            }
+            .ok_or(Error::InvalidPaletteWalkArgs)?;
+            writer.write_symbol(idx as u32, cdf)?;
+            work[r * stride + c] = desired;
+
+            if j == j_lo {
+                break;
+            }
+            j -= 1;
         }
     }
 
@@ -19745,5 +19881,183 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // r282 — §5.11.49 write_palette_tokens_plane round-trips.
+    // -----------------------------------------------------------------
+
+    /// Round-trip one §5.11.49 plane walk through
+    /// [`crate::cdf::palette_tokens_plane`], including the
+    /// frame-edge-straddling case (`onscreen < block`): the writer
+    /// only consumes the on-screen samples and the reader's
+    /// border-fill is derived, not coded.
+    #[test]
+    fn r282_write_palette_tokens_plane_round_trip_with_offscreen_border() {
+        use crate::cdf::palette_tokens_plane;
+        use crate::symbol_decoder::SymbolDecoder;
+
+        let (block_w, block_h) = (8usize, 8usize);
+        let (onscreen_w, onscreen_h) = (6usize, 5usize);
+        let palette_size = 3usize;
+        // Diagonal bands over {0, 1, 2} on the on-screen rectangle.
+        let mut target = vec![0u8; block_w * block_h];
+        for r in 0..onscreen_h {
+            for c in 0..onscreen_w {
+                target[r * block_w + c] = ((r + c) % palette_size) as u8;
+            }
+        }
+
+        for plane in [PalettePlane::Y, PalettePlane::Uv] {
+            let mut writer = SymbolWriter::new(false);
+            let mut enc_cdfs = TileCdfContext::new_from_defaults();
+            write_palette_tokens_plane(
+                &mut writer,
+                &mut enc_cdfs,
+                plane,
+                palette_size,
+                block_w,
+                block_h,
+                onscreen_w,
+                onscreen_h,
+                &target,
+                block_w,
+            )
+            .unwrap();
+            writer.write_literal(8, 0x3C).unwrap();
+            let bytes = writer.finish();
+
+            let mut dec_cdfs = TileCdfContext::new_from_defaults();
+            let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            // §5.11.49: `color_index_map NS(PaletteSize)` first.
+            let color_index_map = dec.read_ns(palette_size as u32).unwrap() as u8;
+            assert_eq!(color_index_map, target[0], "NS top-left sample");
+            let mut color_map = vec![0u8; block_w * block_h];
+            palette_tokens_plane(
+                &mut dec,
+                &mut dec_cdfs,
+                plane,
+                palette_size,
+                block_w,
+                block_h,
+                onscreen_w,
+                onscreen_h,
+                color_index_map,
+                &mut color_map,
+                block_w,
+            )
+            .unwrap();
+            // On-screen reconstruction matches the committed map.
+            for r in 0..onscreen_h {
+                for c in 0..onscreen_w {
+                    assert_eq!(
+                        color_map[r * block_w + c],
+                        target[r * block_w + c],
+                        "on-screen ColorMap sample ({r}, {c})"
+                    );
+                }
+            }
+            // §5.11.49 border-fill: right edge replicates column
+            // `onscreenWidth - 1`, bottom rows replicate row
+            // `onscreenHeight - 1`.
+            for r in 0..onscreen_h {
+                for c in onscreen_w..block_w {
+                    assert_eq!(
+                        color_map[r * block_w + c],
+                        color_map[r * block_w + onscreen_w - 1],
+                        "horizontal border-fill ({r}, {c})"
+                    );
+                }
+            }
+            for r in onscreen_h..block_h {
+                for c in 0..block_w {
+                    assert_eq!(
+                        color_map[r * block_w + c],
+                        color_map[(onscreen_h - 1) * block_w + c],
+                        "vertical border-fill ({r}, {c})"
+                    );
+                }
+            }
+            // §8.3 adaptation lockstep + sentinel.
+            assert_eq!(enc_cdfs, dec_cdfs, "CDF adaptation lockstep");
+            assert_eq!(dec.read_literal(8).unwrap(), 0x3C, "sync sentinel");
+        }
+    }
+
+    /// Caller-bug guards on the §5.11.49 writer: out-of-range palette
+    /// size, on-screen sample outside the palette alphabet, undersized
+    /// map, zero on-screen dims.
+    #[test]
+    fn r282_write_palette_tokens_plane_rejects_caller_bugs() {
+        let mut writer = SymbolWriter::new(true);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let map = vec![0u8; 64];
+
+        // palette_size outside 2..=PALETTE_COLORS.
+        for bad_size in [0usize, 1, PALETTE_COLORS + 1] {
+            let err = write_palette_tokens_plane(
+                &mut writer,
+                &mut cdfs,
+                PalettePlane::Y,
+                bad_size,
+                8,
+                8,
+                8,
+                8,
+                &map,
+                8,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::InvalidPaletteWalkArgs));
+        }
+        // On-screen sample >= palette_size.
+        let mut bad_map = map.clone();
+        bad_map[10] = 5;
+        let err = write_palette_tokens_plane(
+            &mut writer,
+            &mut cdfs,
+            PalettePlane::Y,
+            2,
+            8,
+            8,
+            8,
+            8,
+            &bad_map,
+            8,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidPaletteWalkArgs));
+        // Map shorter than block_height * stride.
+        let err = write_palette_tokens_plane(
+            &mut writer,
+            &mut cdfs,
+            PalettePlane::Y,
+            2,
+            8,
+            8,
+            8,
+            8,
+            &map[..32],
+            8,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidPaletteWalkArgs));
+        // Zero / oversize on-screen dims.
+        for (ow, oh) in [(0usize, 8usize), (8, 0), (9, 8), (8, 9)] {
+            let err = write_palette_tokens_plane(
+                &mut writer,
+                &mut cdfs,
+                PalettePlane::Y,
+                2,
+                8,
+                8,
+                ow,
+                oh,
+                &map,
+                8,
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::InvalidPaletteWalkArgs));
+        }
     }
 }

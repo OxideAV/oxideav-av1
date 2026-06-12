@@ -106,14 +106,17 @@
 //! [`crate::cdf::PartitionWalker::decode_block`]: crate::cdf::PartitionWalker
 
 use crate::cdf::{
-    cfl_allowed_for_uv_mode, intra_mode_ctx, partition_ctx, partition_subsize, size_group,
-    skip_ctx, TileCdfContext, TileGeometry, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DC_PRED,
-    MI_HEIGHT_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PARTITION_NONE,
-    PARTITION_SPLIT, UV_CFL_PRED,
+    cfl_allowed_for_uv_mode, intra_mode_ctx, palette_tokens_args, partition_ctx, partition_subsize,
+    segment_id_ctx, size_group, skip_ctx, EncoderBlockSyntaxStamp, MotionFieldMvs, PalettePlane,
+    PartitionWalker, TileCdfContext, TileGeometry, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID,
+    BLOCK_SIZES, DC_PRED, FRAME_LF_COUNT, GM_TYPE_IDENTITY, MAX_SEGMENTS, MI_HEIGHT_LOG2,
+    MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE,
+    PARTITION_SPLIT, UV_CFL_PRED, WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
-    write_cfl_alphas, write_intra_frame_y_mode, write_intra_segment_id, write_intra_uv_mode,
-    write_skip, write_y_mode,
+    write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_intra_frame_else_arm,
+    write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
+    write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_y_mode, IntrabcArmInputs,
 };
 use crate::encoder::coefficients::write_coefficients;
 use crate::encoder::partition::write_partition;
@@ -554,6 +557,873 @@ fn write_encode_block_leaf(
             &plane_in.quant,
         )?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// r282 — full §5.11.7 block-syntax threading. The write twin of the
+// r281 decode-side composition: the §5.11.4 partition recursion below
+// emits, at every leaf, the complete §5.11.7 `intra_frame_mode_info()`
+// body (prefix → `use_intrabc` dispatch → both arms → §5.11.49
+// `palette_tokens()`), deriving every §8.3.2 neighbour context from a
+// [`PartitionWalker`] mirror it stamps in lockstep with the
+// [`crate::cdf::PartitionWalker::decode_block_syntax`] walker's own
+// grid-fill. Feeding the produced bytes into
+// [`crate::cdf::PartitionWalker::decode_partition_syntax`] consumes
+// exactly the emitted bits (sync-sentinel lockstep).
+// ---------------------------------------------------------------------
+
+/// §5.11.46 / §5.11.49 palette inputs for one [`SyntaxBlock`] leaf —
+/// the encoder commitments the §5.11.7 else-arm writer and the
+/// §5.11.49 `palette_tokens()` writer replay.
+///
+/// `size_y == 0` / `size_uv == 0` mean "no palette on that plane"
+/// (the §5.11.46 `has_palette_{y,uv} = 0` arms); the corresponding
+/// colour / map fields are then ignored.
+#[derive(Debug, Clone, Default)]
+pub struct SyntaxPalette {
+    /// §5.11.46 `PaletteSizeY` — `0` or `2..=PALETTE_COLORS`.
+    pub size_y: u8,
+    /// §5.11.46 `palette_colors_y[ 0..PaletteSizeY ]` (sorted
+    /// ascending per the §5.11.46 cache-merge invariant).
+    pub colors_y: [u16; PALETTE_COLORS],
+    /// §5.11.49 target `ColorMapY` — row-major, stride
+    /// `Block_Width[ MiSize ]`, on-screen samples `< size_y`.
+    pub color_map_y: Vec<u8>,
+    /// §5.11.46 `PaletteSizeUV` — `0` or `2..=PALETTE_COLORS`.
+    pub size_uv: u8,
+    /// §5.11.46 `palette_colors_u[ 0..PaletteSizeUV ]`.
+    pub colors_u: [u16; PALETTE_COLORS],
+    /// §5.11.46 `palette_colors_v[ 0..PaletteSizeUV ]`.
+    pub colors_v: [u16; PALETTE_COLORS],
+    /// §5.11.46 `delta_encode_palette_colors_v` arm selector.
+    pub delta_encode_v: bool,
+    /// §5.11.49 target `ColorMapUV` — row-major with the §5.11.49
+    /// subsampled (+`<4`-bumped) stride; see
+    /// [`crate::cdf::palette_tokens_args`].
+    pub color_map_uv: Vec<u8>,
+}
+
+/// One §5.11.5 leaf of the full-syntax write tree — the per-block
+/// §5.11.7 scalars the encoder committed and the
+/// [`write_partition_tree_syntax`] driver replays bit-for-bit.
+///
+/// ## Scope (r282)
+///
+/// * `skip` MUST be `1` — the §5.11.34 `residual()` write-side
+///   threading (per-TU §5.11.39 coefficient emission inside the
+///   §5.11.36 transform-tree order) is the follow-up arc; a `skip = 0`
+///   leaf would desynchronise against the decode walker's residual
+///   reads and is rejected as out-of-scope.
+/// * The §5.11.16 `read_block_tx_size()` call is bit-silent on the
+///   supported configuration (`tx_mode_select == false`); see
+///   [`SyntaxFrameParams::tx_mode_select`].
+#[derive(Debug, Clone)]
+pub struct SyntaxBlock {
+    /// §5.11.11 `skip`. MUST be `1` for r282 (see scope note).
+    pub skip: u8,
+    /// §5.11.8 `segment_id` in `0..=last_active_seg_id` (and `0` when
+    /// segmentation is disabled). On the post-skip arm (`SegIdPreSkip
+    /// == 0`) the §5.11.9 skip short-circuit forces `segment_id ==
+    /// pred` (the writer's mirror derives `pred`; a mismatch is a
+    /// caller bug).
+    pub segment_id: u8,
+    /// §5.11.56 `cdef_idx` to commit when this leaf opens a 64×64
+    /// anchor. Unreachable while `skip == 1` (the §5.11.56
+    /// short-circuit) — kept for parameter-surface completeness.
+    pub cdef_idx: i8,
+    /// §5.11.12 signed `reducedDeltaQIndex` (`0` ⇒ no delta coded).
+    pub reduced_delta_q_index: i32,
+    /// §5.11.13 signed `reducedDeltaLfLevel` per LF index.
+    pub reduced_delta_lf: [i32; FRAME_LF_COUNT],
+    /// §5.11.7 `use_intrabc` arm: `Some(Mv[ 0 ])` (`[ row, col ]`,
+    /// 1/8-luma-sample units, integer-aligned per `force_integer_mv`)
+    /// selects the intra-block-copy arm; `None` the `else` arm.
+    /// Requires [`SyntaxFrameParams::allow_intrabc`].
+    pub intrabc_mv: Option<[i32; 2]>,
+    /// §5.11.7 `intra_frame_y_mode` (`0..INTRA_MODES`). Ignored on the
+    /// intrabc arm (forced `DC_PRED`).
+    pub y_mode: u8,
+    /// §5.11.22-shaped `uv_mode` — `Some` exactly when the §5.11.5
+    /// prologue derives `HasChroma` for this leaf, `None` otherwise.
+    pub uv_mode: Option<u8>,
+    /// §5.11.42 `AngleDeltaY` (`-3..=3`; `0` for non-directional).
+    pub angle_delta_y: i8,
+    /// §5.11.43 `AngleDeltaUV`.
+    pub angle_delta_uv: i8,
+    /// §5.11.45 `CflAlphaU` — `Some` iff `uv_mode == UV_CFL_PRED`.
+    pub cfl_alpha_u: Option<i8>,
+    /// §5.11.45 `CflAlphaV` — `Some` iff `uv_mode == UV_CFL_PRED`.
+    pub cfl_alpha_v: Option<i8>,
+    /// §5.11.24 `use_filter_intra` (only consulted when the §5.11.24
+    /// outer gate opens).
+    pub use_filter_intra: u8,
+    /// §5.11.24 `filter_intra_mode` — `Some` iff `use_filter_intra == 1`.
+    pub filter_intra_mode: Option<u8>,
+    /// §5.11.46 / §5.11.49 palette commitments.
+    pub palette: SyntaxPalette,
+}
+
+impl SyntaxBlock {
+    /// Baseline leaf: `skip = 1`, segment 0, the §5.11.7 `else` arm
+    /// with the given Y/UV modes, no angle deltas, no CFL, no
+    /// filter-intra, no palette, no deltas.
+    #[must_use]
+    pub fn skip_leaf(y_mode: u8, uv_mode: Option<u8>) -> Self {
+        SyntaxBlock {
+            skip: 1,
+            segment_id: 0,
+            cdef_idx: 0,
+            reduced_delta_q_index: 0,
+            reduced_delta_lf: [0; FRAME_LF_COUNT],
+            intrabc_mv: None,
+            y_mode,
+            uv_mode,
+            angle_delta_y: 0,
+            angle_delta_uv: 0,
+            cfl_alpha_u: None,
+            cfl_alpha_v: None,
+            use_filter_intra: 0,
+            filter_intra_mode: None,
+            palette: SyntaxPalette::default(),
+        }
+    }
+}
+
+/// One node of the full-syntax §5.11.4 write tree. Same recursive
+/// shape as [`EncodeNode`] (PARTITION_NONE leaves + PARTITION_SPLIT
+/// quadrants; the asymmetric partitions remain the [`write_partition`]
+/// alphabet's follow-up dispatch work).
+#[derive(Debug, Clone)]
+pub enum SyntaxNode {
+    /// Single §5.11.5 block at this node's `bSize`.
+    Leaf(Box<SyntaxBlock>),
+    /// Four §5.11.4 quadrants at `Partition_Subsize[PARTITION_SPLIT][bSize]`
+    /// in `[NW, NE, SW, SE]` order.
+    Split([Box<SyntaxNode>; 4]),
+}
+
+impl SyntaxNode {
+    /// Sentinel for an out-of-frame quadrant (`r >= MiRows || c >=
+    /// MiCols`) — short-circuited per §5.11.4 line 1 before
+    /// inspection.
+    #[must_use]
+    pub fn dummy_oob() -> Self {
+        SyntaxNode::Leaf(Box::new(SyntaxBlock::skip_leaf(DC_PRED as u8, None)))
+    }
+}
+
+/// Frame- / sequence-level scalars the §5.11.5 syntax walk threads
+/// into every leaf — the write-side bundle of
+/// [`crate::cdf::PartitionWalker::decode_block_syntax`]'s parameter
+/// list (field names and contracts match one-to-one).
+#[derive(Debug, Clone)]
+pub struct SyntaxFrameParams {
+    /// §5.5.2 `subsampling_x` (0 or 1).
+    pub subsampling_x: u8,
+    /// §5.5.2 `subsampling_y` (0 or 1).
+    pub subsampling_y: u8,
+    /// §5.5.2 `NumPlanes` (1 or 3).
+    pub num_planes: u8,
+    /// §5.9.14 `SegIdPreSkip`.
+    pub seg_id_pre_skip: bool,
+    /// §5.9.14 `segmentation_enabled`.
+    pub segmentation_enabled: bool,
+    /// §5.11.11 `SegIdPreSkip && seg_feature_active( SEG_LVL_SKIP )`.
+    pub seg_skip_active: bool,
+    /// §5.9.14 `LastActiveSegId`.
+    pub last_active_seg_id: u8,
+    /// §6.8.2 per-segment `LosslessArray[]`.
+    pub lossless_array: [bool; MAX_SEGMENTS],
+    /// §6.8.2 `CodedLossless`.
+    pub coded_lossless: bool,
+    /// §5.5.2 `enable_cdef`.
+    pub enable_cdef: bool,
+    /// §5.9.20 `allow_intrabc`.
+    pub allow_intrabc: bool,
+    /// §5.9.19 `cdef_bits` (`0..=3`).
+    pub cdef_bits: u32,
+    /// §6.10.4 `ReadDeltas`.
+    pub read_deltas: bool,
+    /// §5.5.1 `use_128x128_superblock`.
+    pub use_128x128_superblock: bool,
+    /// §5.9.17 `delta_q_res` (`0..=3`).
+    pub delta_q_res: u8,
+    /// §5.9.18 `delta_lf_present`.
+    pub delta_lf_present: bool,
+    /// §5.9.18 `delta_lf_multi`.
+    pub delta_lf_multi: bool,
+    /// §5.5.2 `mono_chrome`.
+    pub mono_chrome: bool,
+    /// §5.9.18 `delta_lf_res` (`0..=3`).
+    pub delta_lf_res: u8,
+    /// §5.9.5 `allow_screen_content_tools` — the §5.11.46 outer gate.
+    pub allow_screen_content_tools: bool,
+    /// §5.5.2 `enable_filter_intra` — the §5.11.24 outer gate.
+    pub enable_filter_intra: bool,
+    /// §5.5.2 `BitDepth` (8 / 10 / 12).
+    pub bit_depth: u8,
+    /// §5.9.21 `TxMode == TX_MODE_SELECT`. MUST be `false` for r282 —
+    /// the §5.11.16 `tx_depth` write threading (the
+    /// [`crate::encoder::transform_tree::write_block_tx_size`] leaf
+    /// plus the `TxSizes[]` mirror grids its §8.3.2 ctx walk reads)
+    /// is the follow-up arc. With `TX_MODE_SELECT` off the §5.11.16
+    /// call is bit-silent on both sides.
+    pub tx_mode_select: bool,
+}
+
+impl SyntaxFrameParams {
+    /// 8-bit 4:4:4 intra-only baseline: 3 planes, no subsampling,
+    /// segmentation / deltas / intrabc / screen-content / filter-intra
+    /// off, CDEF formally enabled with `cdef_bits = 0`.
+    #[must_use]
+    pub fn intra_8bit_baseline() -> Self {
+        SyntaxFrameParams {
+            subsampling_x: 0,
+            subsampling_y: 0,
+            num_planes: 3,
+            seg_id_pre_skip: false,
+            segmentation_enabled: false,
+            seg_skip_active: false,
+            last_active_seg_id: 0,
+            lossless_array: [false; MAX_SEGMENTS],
+            coded_lossless: false,
+            enable_cdef: true,
+            allow_intrabc: false,
+            cdef_bits: 0,
+            read_deltas: false,
+            use_128x128_superblock: false,
+            delta_q_res: 0,
+            delta_lf_present: false,
+            delta_lf_multi: false,
+            mono_chrome: false,
+            delta_lf_res: 0,
+            allow_screen_content_tools: false,
+            enable_filter_intra: false,
+            bit_depth: 8,
+            tx_mode_select: false,
+        }
+    }
+}
+
+/// Full-syntax driver state — frame geometry plus the
+/// [`PartitionWalker`] neighbour-grid mirror every §8.3.2 context is
+/// derived from. One driver per tile, mirroring the decode side's
+/// one-walker-per-tile shape.
+#[derive(Debug)]
+pub struct PartitionSyntaxWriter {
+    mi_rows: u32,
+    mi_cols: u32,
+    geometry: TileGeometry,
+    mirror: PartitionWalker,
+}
+
+impl PartitionSyntaxWriter {
+    /// Construct a driver for a frame of `mi_rows × mi_cols` mi units
+    /// scoped to `geometry`. `None` on a zero/inverted/oversize
+    /// geometry (the [`PartitionWalker::new`] guards).
+    #[must_use]
+    pub fn new(mi_rows: u32, mi_cols: u32, geometry: TileGeometry) -> Option<Self> {
+        if geometry.mi_row_end > mi_rows || geometry.mi_col_end > mi_cols {
+            return None;
+        }
+        let mirror = PartitionWalker::new(mi_rows, mi_cols, geometry)?;
+        Some(Self {
+            mi_rows,
+            mi_cols,
+            geometry,
+            mirror,
+        })
+    }
+
+    /// The encoder-side neighbour-grid mirror (read-only view, e.g.
+    /// for asserting stamp parity in tests).
+    #[must_use]
+    pub fn mirror(&self) -> &PartitionWalker {
+        &self.mirror
+    }
+
+    /// §8.3.2 `partition` ctx from the mirror's `MiSizes[]` grid —
+    /// the same derivation
+    /// [`crate::cdf::PartitionWalker::decode_partition_syntax`]
+    /// performs on the decode side.
+    fn partition_ctx_for(&self, r: u32, c: u32, bsl: u32) -> usize {
+        let sizes = self.mirror.mi_sizes();
+        let avail_u = self.geometry.is_inside(r as i32 - 1, c as i32);
+        let avail_l = self.geometry.is_inside(r as i32, c as i32 - 1);
+        let above = avail_u && {
+            let nb = sizes[((r - 1) * self.mi_cols + c) as usize];
+            nb < BLOCK_SIZES && (MI_WIDTH_LOG2[nb] as u32) < bsl
+        };
+        let left = avail_l && {
+            let nb = sizes[(r * self.mi_cols + c - 1) as usize];
+            nb < BLOCK_SIZES && (MI_HEIGHT_LOG2[nb] as u32) < bsl
+        };
+        partition_ctx(above, left)
+    }
+
+    /// §5.11.9 neighbour cascade + §8.3.2 `segment_id` ctx from the
+    /// mirror's `SegmentIds[]` grid — the write-side twin of
+    /// [`crate::cdf::PartitionWalker::decode_segment_id`]'s
+    /// derivation (out-of-grid / unvisited cells carry the `-1`
+    /// sentinel).
+    fn segment_pred_ctx(&self, mi_row: u32, mi_col: u32) -> (u8, usize) {
+        let avail_u = self.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+        let avail_l = self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+        let at = |r: i32, c: i32| -> i32 {
+            if r < 0 || c < 0 {
+                return -1;
+            }
+            let (r, c) = (r as u32, c as u32);
+            if r >= self.mi_rows || c >= self.mi_cols {
+                return -1;
+            }
+            self.mirror.segment_ids()[(r * self.mi_cols + c) as usize]
+        };
+        let prev_ul = if avail_u && avail_l {
+            at(mi_row as i32 - 1, mi_col as i32 - 1)
+        } else {
+            -1
+        };
+        let prev_u = if avail_u {
+            at(mi_row as i32 - 1, mi_col as i32)
+        } else {
+            -1
+        };
+        let prev_l = if avail_l {
+            at(mi_row as i32, mi_col as i32 - 1)
+        } else {
+            -1
+        };
+        // §5.11.9 `pred` cascade — transcribed branch-for-branch (two
+        // arms intentionally return `prev_u`; see the decode twin).
+        #[allow(clippy::if_same_then_else)]
+        let pred: i32 = if prev_u == -1 {
+            if prev_l == -1 {
+                0
+            } else {
+                prev_l
+            }
+        } else if prev_l == -1 {
+            prev_u
+        } else if prev_ul == prev_u {
+            prev_u
+        } else {
+            prev_l
+        };
+        let to_opt = |v: i32| if v < 0 { None } else { Some(v) };
+        let ctx = segment_id_ctx(to_opt(prev_ul), to_opt(prev_u), to_opt(prev_l));
+        (pred as u8, ctx)
+    }
+}
+
+/// Recursive §5.11.4 full-syntax driver — the write twin of
+/// [`crate::cdf::PartitionWalker::decode_partition_syntax`]. Emits the
+/// partition tree rooted at `(r, c, b_size)` with the COMPLETE
+/// §5.11.7 `intra_frame_mode_info()` body (+ §5.11.49
+/// `palette_tokens()`) at every leaf, via [`write_block_syntax`].
+///
+/// Same dispatch contract as [`write_partition_tree`]
+/// (PARTITION_NONE leaves / PARTITION_SPLIT quadrants / forced arms /
+/// out-of-frame short-circuit); same
+/// [`Error::PartitionWalkOutOfRange`] caller-bug surface plus the
+/// [`write_block_syntax`] scope rejects.
+#[allow(clippy::too_many_arguments)]
+pub fn write_partition_tree_syntax(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    node: &SyntaxNode,
+    r: u32,
+    c: u32,
+    b_size: usize,
+    params: &SyntaxFrameParams,
+) -> Result<(), Error> {
+    // §5.11.4 line 1 — out-of-frame quadrant short-circuit.
+    if r >= state.mi_rows || c >= state.mi_cols {
+        return Ok(());
+    }
+    if b_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    let num4x4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+    let half_block4x4 = num4x4 >> 1;
+    let has_rows = (r + half_block4x4) < state.mi_rows;
+    let has_cols = (c + half_block4x4) < state.mi_cols;
+
+    let partition = match node {
+        SyntaxNode::Leaf(_) => {
+            if b_size >= BLOCK_8X8 && !has_rows && !has_cols {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            PARTITION_NONE
+        }
+        SyntaxNode::Split(_) => {
+            if b_size < BLOCK_8X8 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            PARTITION_SPLIT
+        }
+    };
+
+    let pctx = if b_size >= BLOCK_8X8 {
+        let bsl = MI_WIDTH_LOG2[b_size] as u32;
+        state.partition_ctx_for(r, c, bsl)
+    } else {
+        0
+    };
+    write_partition(writer, cdfs, partition, b_size, has_rows, has_cols, pctx)?;
+
+    let sub_size = partition_subsize(partition, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+
+    match (node, partition) {
+        (SyntaxNode::Leaf(block), PARTITION_NONE) => {
+            write_block_syntax(writer, cdfs, state, block, r, c, sub_size, params)?;
+        }
+        (SyntaxNode::Split(children), PARTITION_SPLIT) => {
+            let [nw, ne, sw, se] = children;
+            write_partition_tree_syntax(writer, cdfs, state, nw, r, c, sub_size, params)?;
+            write_partition_tree_syntax(
+                writer,
+                cdfs,
+                state,
+                ne,
+                r,
+                c + half_block4x4,
+                sub_size,
+                params,
+            )?;
+            write_partition_tree_syntax(
+                writer,
+                cdfs,
+                state,
+                sw,
+                r + half_block4x4,
+                c,
+                sub_size,
+                params,
+            )?;
+            write_partition_tree_syntax(
+                writer,
+                cdfs,
+                state,
+                se,
+                r + half_block4x4,
+                c + half_block4x4,
+                sub_size,
+                params,
+            )?;
+        }
+        _ => return Err(Error::PartitionWalkOutOfRange),
+    }
+    Ok(())
+}
+
+/// Full §5.11.5 / §5.11.7 leaf emission — the write twin of
+/// [`crate::cdf::PartitionWalker::decode_block_syntax`]'s intra-frame
+/// arm. Writes, in spec order:
+///
+/// 1. §5.11.7 lines 1-10 (the prefix): `intra_segment_id()` on the
+///    `SegIdPreSkip` arm, `read_skip()`, `intra_segment_id()` on the
+///    post-skip arm, `read_cdef()`, `read_delta_qindex()`,
+///    `read_delta_lf()` — every §8.3.2 ctx (`skip`, the §5.11.9
+///    cascade) derived from the driver's mirror grids.
+/// 2. The §5.11.7 `use_intrabc` dispatch via
+///    [`write_intra_frame_intrabc_arm`] — on the `Some` arm the
+///    §7.10.2 `find_mv_stack( 0 )` runs against the mirror (identity
+///    global motion + all-invalid `MotionFieldMvs`, per the §7.10.2.1
+///    `ref == INTRA_FRAME ⇒ mv = 0` identity) and the §5.11.26
+///    `assign_mv( 0 )` `PredMv` chain + §5.11.31 `read_mv( 0 )` write
+///    fire under `MvCtx = MV_INTRABC_CONTEXT` / `force_integer_mv = 1`.
+/// 3. The §5.11.7 `else` arm via [`write_intra_frame_else_arm`] —
+///    `intra_frame_y_mode` (neighbour-mode ctx pair from the mirror's
+///    `YModes[]`), `intra_angle_info_y()`, the `HasChroma` arm
+///    (`uv_mode` / §5.11.45 `read_cfl_alphas()` /
+///    `intra_angle_info_uv()`), §5.11.46 `palette_mode_info()` with
+///    entries (the `has_palette_y` ctx + §5.11.49 cache from the
+///    mirror's `PaletteSizes[]` / `PaletteColors[]`), and §5.11.24
+///    `filter_intra_mode_info()`.
+/// 4. §5.11.49 `palette_tokens()` via [`write_palette_tokens_plane`]
+///    (per plane with `PaletteSize{Y,UV} > 0`).
+/// 5. The mirror grid stamps
+///    ([`PartitionWalker::stamp_encoder_block_syntax`]) so subsequent
+///    leaves derive their contexts from the same state the decode
+///    walker observes.
+///
+/// ## r282 scope rejects (all [`Error::PartitionWalkOutOfRange`])
+///
+/// * `skip != 1` — §5.11.34 `residual()` write threading is the
+///   follow-up arc.
+/// * `params.tx_mode_select == true` — §5.11.16 `tx_depth` write
+///   threading is the follow-up arc.
+/// * The leaf-writer caller-bug surface of the composed writers
+///   (shape mismatches between `uv_mode` and `HasChroma`, CFL alphas,
+///   palette bounds, non-integer intrabc MV difference, …).
+#[allow(clippy::too_many_arguments)]
+pub fn write_block_syntax(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    block: &SyntaxBlock,
+    mi_row: u32,
+    mi_col: u32,
+    sub_size: usize,
+    params: &SyntaxFrameParams,
+) -> Result<(), Error> {
+    // §5.11.5 / §5.5.2 caller-bug + scope guards (no bits before any
+    // reject below this group fires).
+    if sub_size >= BLOCK_SIZES {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if mi_row >= state.mi_rows || mi_col >= state.mi_cols {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if !matches!(params.bit_depth, 8 | 10 | 12) {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if params.tx_mode_select {
+        // §5.11.16 write threading — follow-up arc (see method docs).
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if block.skip != 1 {
+        // §5.11.34 residual write threading — follow-up arc.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if (block.segment_id as usize) >= MAX_SEGMENTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.5 prologue — `bw4` / `bh4` / `HasChroma` / `AvailU` /
+    // `AvailL` (the chroma-availability fix-ups feed only the
+    // §5.11.33 prediction pass, not any syntax write).
+    let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+    let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+    let chroma_y_edge_case = bh4 == 1 && params.subsampling_y != 0 && (mi_row & 1) == 0;
+    let chroma_x_edge_case = bw4 == 1 && params.subsampling_x != 0 && (mi_col & 1) == 0;
+    let has_chroma = if chroma_y_edge_case || chroma_x_edge_case {
+        false
+    } else {
+        params.num_planes > 1
+    };
+    let avail_u = state.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+    let avail_l = state.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+
+    // §5.11.7 lines 2-3: `if ( SegIdPreSkip ) intra_segment_id( )` —
+    // called with the spec's `skip = 0` initialiser.
+    let (seg_pred, seg_ctx) = state.segment_pred_ctx(mi_row, mi_col);
+    if params.seg_id_pre_skip {
+        write_intra_segment_id(
+            writer,
+            cdfs,
+            block.segment_id,
+            /* skip = */ 0,
+            seg_pred,
+            seg_ctx,
+            params.segmentation_enabled,
+            params.last_active_seg_id,
+        )?;
+    }
+
+    // §5.11.7 line 5: `read_skip( )` — §8.3.2 ctx from the mirror's
+    // `Skips[]` neighbours.
+    let above_skip = if avail_u {
+        state.mirror.skips()[((mi_row - 1) * state.mi_cols + mi_col) as usize]
+    } else {
+        0
+    };
+    let left_skip = if avail_l {
+        state.mirror.skips()[(mi_row * state.mi_cols + mi_col - 1) as usize]
+    } else {
+        0
+    };
+    write_skip(
+        writer,
+        cdfs,
+        block.skip,
+        skip_ctx(above_skip, left_skip),
+        params.seg_skip_active,
+    )?;
+
+    // §5.11.7 lines 6-7: `if ( !SegIdPreSkip ) intra_segment_id( )` —
+    // post-skip arm sees the committed `skip`.
+    if !params.seg_id_pre_skip {
+        write_intra_segment_id(
+            writer,
+            cdfs,
+            block.segment_id,
+            block.skip,
+            seg_pred,
+            seg_ctx,
+            params.segmentation_enabled,
+            params.last_active_seg_id,
+        )?;
+    }
+
+    // §5.11.7 line 8: `read_cdef( )` — anchor state from the mirror's
+    // `cdef_idx[]` grid. (Bit-silent while `skip == 1`, but composed
+    // for §5.11.56 ordering fidelity.)
+    let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
+    let cdef_mask: u32 = !(cdef_size4 - 1);
+    let anchor_cell = ((mi_row & cdef_mask) * state.mi_cols + (mi_col & cdef_mask)) as usize;
+    let anchor_prior = state.mirror.cdef_idx()[anchor_cell];
+    let anchor_already_stamped = anchor_prior != -1;
+    let cdef_value = if anchor_already_stamped {
+        anchor_prior
+    } else {
+        block.cdef_idx
+    };
+    let cdef_committed = write_cdef(
+        writer,
+        cdef_value,
+        anchor_prior,
+        params.cdef_bits,
+        block.skip,
+        params.coded_lossless,
+        params.enable_cdef,
+        params.allow_intrabc,
+        anchor_already_stamped,
+    )?;
+
+    // §5.11.7 line 9: `read_delta_qindex( )`.
+    write_delta_qindex(
+        writer,
+        cdfs,
+        sub_size,
+        block.reduced_delta_q_index,
+        block.skip,
+        params.read_deltas,
+        params.use_128x128_superblock,
+        params.delta_q_res,
+    )?;
+
+    // §5.11.7 line 10: `read_delta_lf( )`.
+    write_delta_lf(
+        writer,
+        cdfs,
+        sub_size,
+        &block.reduced_delta_lf,
+        block.skip,
+        params.read_deltas,
+        params.delta_lf_present,
+        params.delta_lf_multi,
+        params.mono_chrome,
+        params.use_128x128_superblock,
+        params.delta_lf_res,
+    )?;
+
+    // §5.11.7 `use_intrabc` dispatch + `use_intrabc == 1` arm.
+    if let Some(mv) = block.intrabc_mv {
+        // §7.10.2 `find_mv_stack( 0 )` with `RefFrame = [ INTRA_FRAME,
+        // NONE ]` against the mirror grids — identity global motion
+        // (§7.10.2.1: `ref == INTRA_FRAME ⇒ mv = 0`) and an
+        // all-invalid `MotionFieldMvs` (temporal projection is gated
+        // off on intra frames), matching the decode walker's intrabc
+        // arm setup verbatim.
+        let mut gm_params = [[0i32; 6]; 8];
+        for row in gm_params.iter_mut() {
+            row[2] = 1 << WARPEDMODEL_PREC_BITS;
+            row[5] = 1 << WARPEDMODEL_PREC_BITS;
+        }
+        let mfmv = MotionFieldMvs::new_invalid(state.mi_rows, state.mi_cols);
+        let stack = state.mirror.find_mv_stack(
+            mi_row,
+            mi_col,
+            sub_size,
+            /* ref_frame = */ [0, -1],
+            /* is_compound = */ false,
+            /* use_ref_frame_mvs = */ false,
+            [GM_TYPE_IDENTITY; 8],
+            gm_params,
+            [0; 8],
+            /* allow_high_precision_mv = */ false,
+            /* force_integer_mv = */ true,
+            &mfmv,
+        )?;
+        let inputs = IntrabcArmInputs {
+            mv,
+            mv_stack: &stack,
+            use_128x128_superblock: params.use_128x128_superblock,
+            mi_row,
+            mi_row_start: state.geometry.mi_row_start,
+        };
+        let info =
+            write_intra_frame_intrabc_arm(writer, cdfs, params.allow_intrabc, Some(&inputs))?
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+
+        // §5.11.5 footer stamps for the intra-block-copy block.
+        state
+            .mirror
+            .stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+                mi_row,
+                mi_col,
+                sub_size,
+                skip: block.skip,
+                segment_id: block.segment_id,
+                is_inter: 1,
+                y_mode: info.y_mode,
+                ref_frame: [0, -1],
+                mv: info.mv,
+                interp_filter: info.interp_filter,
+                palette_size_y: 0,
+                palette_colors_y: &[],
+                palette_size_uv: 0,
+                palette_colors_u: &[],
+                palette_colors_v: &[],
+                cdef: cdef_committed,
+            });
+        // §5.11.49 `palette_tokens( )` — `PaletteSize{Y,UV} = 0` on
+        // the intrabc arm ⇒ no-op.
+        return Ok(());
+    }
+
+    // §5.11.7 `use_intrabc = 0` element (S() when `allow_intrabc`,
+    // silent otherwise), then the `else` arm composite.
+    write_intra_frame_intrabc_arm(writer, cdfs, params.allow_intrabc, None)?;
+
+    let lossless = params.lossless_array[block.segment_id as usize];
+    // §8.3.2 `intra_frame_y_mode` neighbour-mode ctx pair from the
+    // mirror's `YModes[]` grid (`DC_PRED` fallback when unavailable).
+    let above_mode = if avail_u {
+        state.mirror.y_modes()[((mi_row - 1) * state.mi_cols + mi_col) as usize] as usize
+    } else {
+        DC_PRED
+    };
+    let left_mode = if avail_l {
+        state.mirror.y_modes()[(mi_row * state.mi_cols + mi_col - 1) as usize] as usize
+    } else {
+        DC_PRED
+    };
+    let abovemode_ctx = intra_mode_ctx(above_mode);
+    let leftmode_ctx = intra_mode_ctx(left_mode);
+
+    // §8.3.2 `has_palette_y` neighbour ctx from the mirror's
+    // `PaletteSizes[ 0 ]` grid (mirrors `decode_block_syntax`).
+    let above_palette_y = avail_u
+        && mi_row > 0
+        && state.mirror.palette_sizes()[((mi_row - 1) * state.mi_cols + mi_col) as usize] > 0;
+    let left_palette_y = avail_l
+        && mi_col > 0
+        && state.mirror.palette_sizes()[(mi_row * state.mi_cols + mi_col - 1) as usize] > 0;
+
+    let cfl_allowed = cfl_allowed_for_uv_mode(
+        lossless,
+        sub_size,
+        params.subsampling_x != 0,
+        params.subsampling_y != 0,
+    );
+    let pal = &block.palette;
+    let has_palette_y = u8::from(pal.size_y > 0);
+    let has_palette_uv = u8::from(pal.size_uv > 0);
+
+    write_intra_frame_else_arm(
+        writer,
+        cdfs,
+        sub_size,
+        block.y_mode,
+        block.uv_mode,
+        block.angle_delta_y,
+        block.angle_delta_uv,
+        cfl_allowed,
+        has_chroma,
+        params.allow_screen_content_tools,
+        params.enable_filter_intra,
+        block.use_filter_intra,
+        block.filter_intra_mode,
+        above_palette_y,
+        left_palette_y,
+        params.bit_depth,
+        has_palette_y,
+        pal.size_y as usize,
+        &pal.colors_y,
+        has_palette_uv,
+        pal.size_uv as usize,
+        &pal.colors_u,
+        &pal.colors_v,
+        pal.delta_encode_v,
+        block.cfl_alpha_u,
+        block.cfl_alpha_v,
+        &state.mirror,
+        mi_row,
+        mi_col,
+        abovemode_ctx,
+        leftmode_ctx,
+    )?;
+
+    // §5.11.5 line `palette_tokens( )` — §5.11.49 per-plane writes,
+    // gated by `PaletteSize{Y,UV} > 0` exactly like the reader.
+    if pal.size_y > 0 {
+        let args = palette_tokens_args(
+            sub_size,
+            mi_row as usize,
+            mi_col as usize,
+            state.mi_rows as usize,
+            state.mi_cols as usize,
+            PalettePlane::Y,
+            0,
+            0,
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        write_palette_tokens_plane(
+            writer,
+            cdfs,
+            PalettePlane::Y,
+            pal.size_y as usize,
+            args.block_w,
+            args.block_h,
+            args.onscreen_w,
+            args.onscreen_h,
+            &pal.color_map_y,
+            args.block_w,
+        )?;
+    }
+    if pal.size_uv > 0 {
+        let args = palette_tokens_args(
+            sub_size,
+            mi_row as usize,
+            mi_col as usize,
+            state.mi_rows as usize,
+            state.mi_cols as usize,
+            PalettePlane::Uv,
+            params.subsampling_x as usize,
+            params.subsampling_y as usize,
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        write_palette_tokens_plane(
+            writer,
+            cdfs,
+            PalettePlane::Uv,
+            pal.size_uv as usize,
+            args.block_w,
+            args.block_h,
+            args.onscreen_w,
+            args.onscreen_h,
+            &pal.color_map_uv,
+            args.block_w,
+        )?;
+    }
+
+    // §5.11.5 footer stamps for the `else`-arm block.
+    state
+        .mirror
+        .stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+            mi_row,
+            mi_col,
+            sub_size,
+            skip: block.skip,
+            segment_id: block.segment_id,
+            is_inter: 0,
+            y_mode: block.y_mode,
+            ref_frame: [0, -1],
+            mv: [0, 0],
+            interp_filter: [0, 0],
+            palette_size_y: pal.size_y,
+            palette_colors_y: &pal.colors_y,
+            palette_size_uv: pal.size_uv,
+            palette_colors_u: &pal.colors_u,
+            palette_colors_v: &pal.colors_v,
+            cdef: cdef_committed,
+        });
     Ok(())
 }
 
@@ -1244,5 +2114,462 @@ mod tests {
             get_br_ctx,
             MAX_SEGMENTS,
         );
+    }
+
+    // -----------------------------------------------------------------
+    // r282 — full §5.11.7 block-syntax threading round-trips. Every
+    // test below encodes a partition tree through
+    // `write_partition_tree_syntax`, appends an 8-bit sync sentinel,
+    // and decodes the bytes through the §5.11.4
+    // `PartitionWalker::decode_partition_syntax` walker with the SAME
+    // frame params. The sentinel landing intact proves the encoder
+    // emitted exactly the bits the §5.11.5 walker consumes; the
+    // whole-`TileCdfContext` equality proves §8.3 adaptation lockstep
+    // symbol-for-symbol; the mirror-vs-walker grid parity proves the
+    // encoder's neighbour-context state matches the decoder's.
+    // -----------------------------------------------------------------
+
+    use crate::cdf::PALETTE_COLORS;
+    use crate::encoder::partition_tree::{
+        write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams,
+        SyntaxNode, SyntaxPalette,
+    };
+
+    /// Encode `node`, append `sentinel`, decode through
+    /// `decode_partition_syntax`, assert the sentinel + full-CDF
+    /// lockstep + grid parity, and return the pieces for per-test
+    /// asserts.
+    fn syntax_round_trip(
+        node: &SyntaxNode,
+        mi_rows: u32,
+        mi_cols: u32,
+        b_size: usize,
+        params: &SyntaxFrameParams,
+        sentinel: u8,
+    ) -> (PartitionSyntaxWriter, PartitionWalker) {
+        // ----- encode -----
+        let mut writer = SymbolWriter::new(false);
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut enc_state =
+            PartitionSyntaxWriter::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols))
+                .expect("syntax writer construction");
+        write_partition_tree_syntax(
+            &mut writer,
+            &mut enc_cdfs,
+            &mut enc_state,
+            node,
+            0,
+            0,
+            b_size,
+            params,
+        )
+        .expect("write_partition_tree_syntax");
+        writer.write_literal(8, u32::from(sentinel)).unwrap();
+        let bytes = writer.finish();
+
+        // ----- decode (the §5.11.4 / §5.11.5 syntax walker) -----
+        let mut walker =
+            PartitionWalker::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        walker
+            .decode_partition_syntax(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                b_size,
+                /* frame_is_intra = */ true,
+                params.subsampling_x,
+                params.subsampling_y,
+                params.num_planes,
+                params.seg_id_pre_skip,
+                params.segmentation_enabled,
+                params.seg_skip_active,
+                params.last_active_seg_id,
+                &params.lossless_array,
+                params.coded_lossless,
+                params.enable_cdef,
+                params.allow_intrabc,
+                params.cdef_bits,
+                params.read_deltas,
+                params.use_128x128_superblock,
+                params.delta_q_res,
+                params.delta_lf_present,
+                params.delta_lf_multi,
+                params.mono_chrome,
+                params.delta_lf_res,
+                params.allow_screen_content_tools,
+                params.enable_filter_intra,
+                params.bit_depth,
+                params.tx_mode_select,
+                /* inter_ctx = */ None,
+            )
+            .expect("decode_partition_syntax must consume the full tree");
+
+        // Sync sentinel — the walker consumed exactly the emitted bits.
+        assert_eq!(
+            dec.read_literal(8).unwrap(),
+            u32::from(sentinel),
+            "decoder must be positioned at the sentinel after the tree"
+        );
+        // §8.3 adaptation lockstep over the ENTIRE working context.
+        assert_eq!(
+            enc_cdfs, dec_cdfs,
+            "encoder and decoder CDF contexts must adapt identically"
+        );
+        // Mirror-vs-walker grid parity — the encoder derives the next
+        // block's contexts from the same state the decoder observes.
+        let m = enc_state.mirror();
+        assert_eq!(m.mi_sizes(), walker.mi_sizes(), "MiSizes parity");
+        assert_eq!(m.skips(), walker.skips(), "Skips parity");
+        assert_eq!(m.segment_ids(), walker.segment_ids(), "SegmentIds parity");
+        assert_eq!(m.y_modes(), walker.y_modes(), "YModes parity");
+        assert_eq!(m.is_inters(), walker.is_inters(), "IsInters parity");
+        assert_eq!(m.ref_frames(), walker.ref_frames(), "RefFrames parity");
+        assert_eq!(m.mvs(), walker.mvs(), "Mvs parity");
+        assert_eq!(
+            m.interp_filters(),
+            walker.interp_filters(),
+            "InterpFilters parity"
+        );
+        assert_eq!(
+            m.palette_sizes(),
+            walker.palette_sizes(),
+            "PaletteSizes parity"
+        );
+        assert_eq!(
+            m.palette_colors(),
+            walker.palette_colors(),
+            "PaletteColors parity"
+        );
+        assert_eq!(m.cdef_idx(), walker.cdef_idx(), "cdef_idx parity");
+        (enc_state, walker)
+    }
+
+    /// Four §5.11.7 else-arm leaves under one SPLIT — the 2nd/3rd/4th
+    /// leaves' `intra_frame_y_mode` ctx pairs come from the previously
+    /// stamped `YModes[]` neighbours, so the sentinel landing proves
+    /// the encoder's mirror threading, not just per-leaf writers.
+    /// Covers directional modes + angle deltas + the §5.11.24
+    /// filter-intra pair.
+    #[test]
+    fn r282_syntax_round_trip_split_else_arm_neighbour_ctx() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.enable_filter_intra = true;
+
+        // NW: V_PRED with angle deltas on both planes.
+        let mut nw = SyntaxBlock::skip_leaf(V_PRED as u8, Some(V_PRED as u8));
+        nw.angle_delta_y = 2;
+        nw.angle_delta_uv = -1;
+        // NE: DC_PRED with the §5.11.24 filter-intra pair.
+        let mut ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        ne.use_filter_intra = 1;
+        ne.filter_intra_mode = Some(2);
+        // SW: H_PRED (mode 2) with a negative luma angle delta.
+        let mut sw = SyntaxBlock::skip_leaf(2, Some(DC_PRED as u8));
+        sw.angle_delta_y = -2;
+        // SE: plain DC.
+        let se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xA5);
+
+        // Decoded YModes[] footprints match the committed modes.
+        let cols = 4usize;
+        for (r0, c0, want) in [(0, 0, V_PRED as u8), (0, 2, 0u8), (2, 0, 2u8), (2, 2, 0u8)] {
+            for dr in 0..2usize {
+                for dc in 0..2usize {
+                    assert_eq!(
+                        walker.y_modes()[(r0 + dr) * cols + (c0 + dc)],
+                        want,
+                        "YModes stamp at ({}, {})",
+                        r0 + dr,
+                        c0 + dc
+                    );
+                }
+            }
+        }
+        assert!(
+            walker.skips().iter().all(|&s| s == 1),
+            "every leaf committed skip = 1"
+        );
+    }
+
+    /// Two intra-block-copy leaves in one SPLIT: the NE leaf's §5.11.26
+    /// `PredMv[ 0 ]` comes from the NW leaf's `Mvs[]` stamps via the
+    /// §7.10.2 `find_mv_stack` neighbour scan — on BOTH sides. A mirror
+    /// divergence would change the coded MV difference and break the
+    /// sentinel.
+    #[test]
+    fn r282_syntax_round_trip_intrabc_pair_threads_mv_stack() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.allow_intrabc = true;
+
+        // NW at the origin: empty stack ⇒ §5.11.26 fallback predictor
+        // [ 0, -(sbSize4 * MI_SIZE + INTRABC_DELAY_PIXELS) * 8 ] =
+        // [ 0, -2560 ] (64×64 superblocks); code the predictor itself.
+        let mut nw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        nw.intrabc_mv = Some([0, -2560]);
+        // NE at (0, 2): the left-neighbour scan finds NW's stamped
+        // [0, -2560]; code a different block vector ⇒ non-zero MV
+        // difference bits.
+        let mut ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        ne.intrabc_mv = Some([-8, -2560]);
+        // SW / SE: plain else-arm leaves after the intrabc pair.
+        let sw = SyntaxBlock::skip_leaf(V_PRED as u8, Some(DC_PRED as u8));
+        let se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x5A);
+
+        let cols = 4usize;
+        for (r0, c0, want) in [(0usize, 0usize, [0i16, -2560]), (0, 2, [-8, -2560])] {
+            for dr in 0..2usize {
+                for dc in 0..2usize {
+                    let cell = (r0 + dr) * cols + (c0 + dc);
+                    assert_eq!(walker.is_inters()[cell], 1, "intrabc IsInters stamp");
+                    assert_eq!(
+                        [
+                            walker.mvs()[(cell * 2) * 2],
+                            walker.mvs()[(cell * 2) * 2 + 1]
+                        ],
+                        want,
+                        "decoded Mv[0] at ({}, {})",
+                        r0 + dr,
+                        c0 + dc
+                    );
+                }
+            }
+        }
+        // The else-arm leaves stayed intra.
+        assert_eq!(walker.is_inters()[2 * cols], 0, "SW else-arm IsInters");
+    }
+
+    /// Three palette leaves whose §5.11.46 entries + §8.3.2
+    /// `has_palette_y` ctx + §5.11.49 palette cache all come from
+    /// neighbour state: NE merges the cache from NW (left neighbour),
+    /// SW from NW (above neighbour). Each leaf then runs the full
+    /// §5.11.49 `palette_tokens()` colour-index walk; NW additionally
+    /// carries a UV palette (entries + UV token walk).
+    #[test]
+    fn r282_syntax_round_trip_palette_neighbours_share_cache() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.allow_screen_content_tools = true;
+
+        // 8×8 checkerboard over palette indices {0, 1}.
+        let checker: Vec<u8> = (0..64).map(|i| (((i / 8) + (i % 8)) & 1) as u8).collect();
+        // Vertical stripes over {0, 1}.
+        let stripes: Vec<u8> = (0..64).map(|i| u8::from((i % 8) >= 4)).collect();
+        // Three-colour diagonal bands over {0, 1, 2}.
+        let bands: Vec<u8> = (0..64).map(|i| (((i / 8) + (i % 8)) % 3) as u8).collect();
+
+        let colors = |vals: &[u16]| {
+            let mut a = [0u16; PALETTE_COLORS];
+            a[..vals.len()].copy_from_slice(vals);
+            a
+        };
+
+        // NW: luma palette [10, 200] + chroma palette ([20, 30] /
+        // [40, 50], direct-literal V arm).
+        let mut nw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        nw.palette = SyntaxPalette {
+            size_y: 2,
+            colors_y: colors(&[10, 200]),
+            color_map_y: checker.clone(),
+            size_uv: 2,
+            colors_u: colors(&[20, 30]),
+            colors_v: colors(&[40, 50]),
+            delta_encode_v: false,
+            color_map_uv: stripes.clone(),
+        };
+        // NE: luma palette [10, 100] — `10` is a §5.11.49 cache hit
+        // against NW's left-neighbour palette, `100` a new literal.
+        let mut ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        ne.palette = SyntaxPalette {
+            size_y: 2,
+            colors_y: colors(&[10, 100]),
+            color_map_y: stripes.clone(),
+            ..SyntaxPalette::default()
+        };
+        // SW: luma palette [5, 60, 200] — `200` hits NW's
+        // above-neighbour cache.
+        let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        sw.palette = SyntaxPalette {
+            size_y: 3,
+            colors_y: colors(&[5, 60, 200]),
+            color_map_y: bands.clone(),
+            ..SyntaxPalette::default()
+        };
+        // SE: no palette (its `has_palette_y` ctx sees both palette
+        // neighbours).
+        let se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0xC3);
+
+        let cols = 4usize;
+        let area = 16usize;
+        // Luma PaletteSizes / PaletteColors stamps.
+        for (r0, c0, size, first_two) in [
+            (0usize, 0usize, 2u8, [10u16, 200]),
+            (0, 2, 2, [10, 100]),
+            (2, 0, 3, [5, 60]),
+            (2, 2, 0, [0, 0]),
+        ] {
+            let cell = r0 * cols + c0;
+            assert_eq!(walker.palette_sizes()[cell], size, "PaletteSizes[0] stamp");
+            if size > 0 {
+                assert_eq!(
+                    walker.palette_colors()[cell * PALETTE_COLORS],
+                    first_two[0],
+                    "PaletteColors[0][..][0]"
+                );
+                assert_eq!(
+                    walker.palette_colors()[cell * PALETTE_COLORS + 1],
+                    first_two[1],
+                    "PaletteColors[0][..][1]"
+                );
+            }
+        }
+        // Chroma palette stamps for NW (planes 1 + 2).
+        assert_eq!(walker.palette_sizes()[area], 2, "PaletteSizes[1] NW");
+        assert_eq!(walker.palette_sizes()[2 * area], 2, "PaletteSizes[2] NW");
+        assert_eq!(
+            walker.palette_colors()[area * PALETTE_COLORS],
+            20,
+            "PaletteColors[1][NW][0]"
+        );
+        assert_eq!(
+            walker.palette_colors()[2 * area * PALETTE_COLORS],
+            40,
+            "PaletteColors[2][NW][0]"
+        );
+    }
+
+    /// §5.11.7 prefix threading: the `SegIdPreSkip` segment-id arm
+    /// (S() per leaf with the §5.11.9 neighbour cascade from the
+    /// mirror) plus §5.11.12 / §5.11.13 delta-q / delta-lf writes,
+    /// accumulated by the decode walker.
+    #[test]
+    fn r282_syntax_round_trip_segmentation_and_deltas() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.segmentation_enabled = true;
+        params.seg_id_pre_skip = true;
+        params.last_active_seg_id = 3;
+        params.read_deltas = true;
+        params.delta_q_res = 2;
+        params.delta_lf_present = true;
+        params.delta_lf_res = 1;
+
+        let mut nw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        nw.segment_id = 2;
+        nw.reduced_delta_q_index = 3;
+        nw.reduced_delta_lf = [1, 0, 0, 0];
+        let mut ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        ne.segment_id = 1;
+        ne.reduced_delta_q_index = -2;
+        let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        sw.segment_id = 0;
+        let mut se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        se.segment_id = 3;
+        se.reduced_delta_lf = [-2, 0, 0, 0];
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x96);
+
+        let cols = 4usize;
+        for (r0, c0, want) in [(0usize, 0usize, 2i32), (0, 2, 1), (2, 0, 0), (2, 2, 3)] {
+            assert_eq!(
+                walker.segment_ids()[r0 * cols + c0],
+                want,
+                "SegmentIds stamp at ({r0}, {c0})"
+            );
+        }
+        // §5.11.12 accumulator: 0 +12 -8 ⇒ Clip3(1, 255, ..) = 4.
+        assert_eq!(walker.current_q_index(), 4, "CurrentQIndex accumulation");
+        // §5.11.13 accumulator: 0 +2 -4 = -2 on LF index 0.
+        assert_eq!(walker.current_delta_lf()[0], -2, "DeltaLF[0] accumulation");
+    }
+
+    /// r282 scope guards: residual (`skip == 0`) and §5.11.16
+    /// (`tx_mode_select`) write threading are follow-up arcs; an
+    /// intrabc leaf without `allow_intrabc` is a §5.11.7 caller bug.
+    #[test]
+    fn r282_write_block_syntax_scope_rejects() {
+        let params = SyntaxFrameParams::intra_8bit_baseline();
+        let mut writer = SymbolWriter::new(true);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut state = PartitionSyntaxWriter::new(4, 4, single_tile(4, 4)).unwrap();
+
+        // skip = 0 ⇒ §5.11.34 residual follow-up.
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.skip = 0;
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // tx_mode_select ⇒ §5.11.16 follow-up.
+        let block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        let mut params_tx = params.clone();
+        params_tx.tx_mode_select = true;
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params_tx,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // intrabc leaf with allow_intrabc = false ⇒ caller bug (the
+        // reader's §5.11.7 fall-through forces use_intrabc = 0).
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.intrabc_mv = Some([0, -2560]);
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_8X8,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
     }
 }

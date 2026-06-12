@@ -4,6 +4,45 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder r282 (2026-06-12): thread the FULL §5.11.7
+  `intra_frame_mode_info( )` composition into the encoder's
+  partition-tree write side — the write twin of the r281
+  `decode_block_syntax` threading.
+  `encoder::partition_tree::write_partition_tree_syntax` /
+  `write_block_syntax` emit, at every §5.11.4 leaf, the complete
+  §5.11.7 body in spec order: the prefix (`intra_segment_id( )` on
+  both `SegIdPreSkip` arms with the §5.11.9 neighbour cascade,
+  `read_skip( )` with the §8.3.2 `Skips[]` ctx, `read_cdef( )`
+  anchor handling, `read_delta_qindex( )` / `read_delta_lf( )`),
+  the `use_intrabc` dispatch (the `Some` arm runs §7.10.2
+  `find_mv_stack( 0 )` + the §5.11.26 `assign_mv( 0 )` `PredMv`
+  chain + the §5.11.31 `read_mv( 0 )` write under
+  `MvCtx = MV_INTRABC_CONTEXT`), the r280
+  `write_intra_frame_else_arm` composite (angle deltas / CFL /
+  §5.11.46 palette entries / §5.11.24 filter-intra), and the
+  §5.11.49 `palette_tokens( )` write via the new
+  `encoder::block_mode_info::write_palette_tokens_plane` (the
+  `color_index_map NS(PaletteSize)` literal + anti-diagonal
+  `palette_color_idx` S() walk with the §5.11.50 colour-context
+  derivation — exact twin of `palette_tokens_plane`). Every §8.3.2
+  neighbour context comes from a `PartitionWalker` mirror the new
+  `PartitionSyntaxWriter` driver stamps in lockstep with the decode
+  walker's grid-fill (`MiSizes` / `Skips` / `SegmentIds` / `YModes`
+  / `IsInters` / `RefFrames` / `Mvs` / `InterpFilters` /
+  `PaletteSizes` / `PaletteColors` / `cdef_idx`). Round-trip proofs
+  drive `write_partition_tree_syntax` output through
+  `decode_partition_syntax` and assert the 8-bit sync sentinel,
+  whole-`TileCdfContext` adaptation equality, and full
+  mirror-vs-walker grid parity across: a 4-leaf else-arm split
+  (neighbour Y-mode ctx threading), an intra-block-copy pair (the
+  2nd block's `PredMv` comes from the 1st block's stamped `Mvs[]`
+  on both sides), 3 adjacent palette leaves sharing the §5.11.49
+  cache + a UV palette, and a `SegIdPreSkip` segmentation +
+  delta-q / delta-lf battery. Scope rejects (follow-up arcs):
+  `skip == 0` leaves (§5.11.34 residual write threading) and
+  `TX_MODE_SELECT` (§5.11.16 `tx_depth` write threading +
+  `TxSizes[]` mirror). Lib tests 1922 → 1929.
+
 - decoder r281 (2026-06-12): thread the FULL §5.11.7
   `intra_frame_mode_info( )` composition into the §5.11.5
   `decode_block_syntax` walker (av1-spec p.62-65) — prefix →

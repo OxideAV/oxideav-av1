@@ -14892,6 +14892,49 @@ struct CurrFramePlane {
     samples: Vec<i32>,
 }
 
+/// r282 — per-leaf grid-stamp bundle for
+/// [`PartitionWalker::stamp_encoder_block_syntax`]. Field semantics
+/// mirror the §5.11.5 grid-fill variables of the same names; see the
+/// stamp method's docs for the per-grid gating rules.
+pub(crate) struct EncoderBlockSyntaxStamp<'a> {
+    /// §5.11.5 `MiRow`.
+    pub mi_row: u32,
+    /// §5.11.5 `MiCol`.
+    pub mi_col: u32,
+    /// §5.11.5 `MiSize`.
+    pub sub_size: usize,
+    /// §5.11.11 `skip`.
+    pub skip: u8,
+    /// §5.11.8 `segment_id`.
+    pub segment_id: u8,
+    /// §5.11.7 `is_inter` (1 on the `use_intrabc` arm, else 0).
+    pub is_inter: u8,
+    /// §5.11.7 `YMode`.
+    pub y_mode: u8,
+    /// §5.11.7 `RefFrame[ 0..2 ]` — `[ INTRA_FRAME, NONE ] = [0, -1]`
+    /// on every intra-frame block. Stamped only when `is_inter != 0`.
+    pub ref_frame: [i8; 2],
+    /// §5.11.26 `Mv[ 0 ]` (`[ row, col ]`, 1/8-luma-sample units).
+    /// Stamped only when `is_inter != 0`.
+    pub mv: [i32; 2],
+    /// §5.11.7 `interp_filter[ 0..2 ]` (`BILINEAR` on the intrabc
+    /// arm). Stamped only when `is_inter != 0`.
+    pub interp_filter: [u8; 2],
+    /// §5.11.46 `PaletteSizeY` (0 = no luma palette).
+    pub palette_size_y: u8,
+    /// §5.11.46 `palette_colors_y[ 0..PaletteSizeY ]`.
+    pub palette_colors_y: &'a [u16],
+    /// §5.11.46 `PaletteSizeUV` (0 = no chroma palette).
+    pub palette_size_uv: u8,
+    /// §5.11.46 `palette_colors_u[ 0..PaletteSizeUV ]`.
+    pub palette_colors_u: &'a [u16],
+    /// §5.11.46 `palette_colors_v[ 0..PaletteSizeUV ]`.
+    pub palette_colors_v: &'a [u16],
+    /// §5.11.56 anchor value — `Some(v)` only when the matching
+    /// writer emitted the `L(cdef_bits)` literal for this leaf.
+    pub cdef: Option<i8>,
+}
+
 impl PartitionWalker {
     /// Construct a fresh walker for a frame with the given mi-unit
     /// extent and tile bounds. Every `MiSizes[]` cell starts at
@@ -15809,6 +15852,138 @@ impl PartitionWalker {
             self.palette_colors[base + i] = v;
         }
         Ok(())
+    }
+
+    /// r282 — encoder-mirror grid stamp. The §5.11.4 write-side driver
+    /// ([`crate::encoder::partition_tree::write_partition_tree_syntax`])
+    /// keeps a `PartitionWalker` as its neighbour-state mirror: every
+    /// §8.3.2 context the matching reader derives from the walker's
+    /// grids (`Skips[]` for `skip`, `SegmentIds[]` for the §5.11.9
+    /// cascade, `YModes[]` for `intra_frame_y_mode`, `PaletteSizes[]` /
+    /// `PaletteColors[]` for `has_palette_y` + the §5.11.49 cache,
+    /// `cdef_idx[]` anchors for §5.11.56, and the `IsInters[]` /
+    /// `RefFrames[]` / `Mvs[]` / `InterpFilters[]` cells the §7.10.2
+    /// `find_mv_stack` scan reads) must be derivable on the write side
+    /// from identically-stamped grids — that is what keeps the encoder
+    /// and the §5.11.5 [`Self::decode_block_syntax`] walker in
+    /// sync-sentinel lockstep.
+    ///
+    /// The stamp set mirrors the reader's per-leaf grid writes
+    /// one-to-one:
+    ///
+    /// * `MiSizes` / `Skips` / `SegmentIds` / `YModes` — always
+    ///   stamped over the `bh4 * bw4` footprint (the §5.11.5 grid-fill
+    ///   loops + the per-element stamps inside `decode_skip` /
+    ///   `decode_segment_id` / `decode_intra_frame_y_mode`).
+    /// * `IsInters` / `RefFrames` / `InterpFilters` / `Mvs` — the
+    ///   `is_inter != 0` (§5.11.7 `use_intrabc == 1`) arm's stamps;
+    ///   gated exactly as the reader gates them (the intra `else` arm
+    ///   leaves these grids untouched on the decode walker too —
+    ///   `IsInters` is stamped `0` unconditionally because the reader's
+    ///   pre-fill is `0` and re-stamping the identity keeps the loop
+    ///   total).
+    /// * `PaletteSizes` / `PaletteColors` — the §5.11.46 / §5.11.49
+    ///   stamps; only non-zero sizes are written (matching the
+    ///   reader's "only stamp non-zero entries" identity on the
+    ///   zero-initialised grids). The UV size stamps planes 1 and 2
+    ///   with `palette_colors_u` / `palette_colors_v` respectively.
+    /// * `cdef_idx` — the §5.11.56 anchor walk, performed only when
+    ///   `cdef` is `Some` (i.e. the writer emitted the `L(cdef_bits)`
+    ///   literal for this leaf; the short-circuit and
+    ///   anchor-already-stamped arms leave the grid untouched, exactly
+    ///   like [`Self::decode_cdef`]).
+    ///
+    /// Coordinates past the frame extent are clipped exactly like the
+    /// reader's grid-fill loops. Not exposed publicly: the stamp is an
+    /// encoder-internal mirror primitive, not a decoded-state surface.
+    pub(crate) fn stamp_encoder_block_syntax(&mut self, s: &EncoderBlockSyntaxStamp<'_>) {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[s.sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[s.sub_size] as u32;
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        for dr in 0..bh4 {
+            let rr = s.mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = s.mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                let cell = (rr * self.mi_cols + cc) as usize;
+                self.mi_sizes[cell] = s.sub_size;
+                self.skips[cell] = s.skip;
+                self.segment_ids[cell] = s.segment_id as i32;
+                self.y_modes[cell] = s.y_mode;
+                self.is_inters[cell] = s.is_inter;
+                if s.is_inter != 0 {
+                    // §5.11.7 `use_intrabc == 1` footer stamps (mirrors
+                    // the `decode_block_syntax` intrabc-arm grid-fill).
+                    self.ref_frames[cell * 2] = s.ref_frame[0];
+                    self.ref_frames[cell * 2 + 1] = s.ref_frame[1];
+                    self.interp_filters[cell * 2] = s.interp_filter[0];
+                    self.interp_filters[cell * 2 + 1] = s.interp_filter[1];
+                    // §6.10.27 conformance bound `Abs( Mv ) < (1 << 14)`
+                    // keeps the i32 → i16 cast lossless.
+                    self.mvs[(cell * 2) * 2] = s.mv[0] as i16;
+                    self.mvs[(cell * 2) * 2 + 1] = s.mv[1] as i16;
+                    self.mvs[(cell * 2 + 1) * 2] = 0;
+                    self.mvs[(cell * 2 + 1) * 2 + 1] = 0;
+                }
+                if s.palette_size_y > 0 {
+                    self.palette_sizes[cell] = s.palette_size_y;
+                    let base = cell * PALETTE_COLORS;
+                    for (i, &v) in s
+                        .palette_colors_y
+                        .iter()
+                        .enumerate()
+                        .take(PALETTE_COLORS.min(s.palette_size_y as usize))
+                    {
+                        self.palette_colors[base + i] = v;
+                    }
+                }
+                if s.palette_size_uv > 0 {
+                    for (plane, colors) in
+                        [(1usize, s.palette_colors_u), (2usize, s.palette_colors_v)]
+                    {
+                        let plane_cell = plane * area + cell;
+                        self.palette_sizes[plane_cell] = s.palette_size_uv;
+                        let base = plane_cell * PALETTE_COLORS;
+                        for (i, &v) in colors
+                            .iter()
+                            .enumerate()
+                            .take(PALETTE_COLORS.min(s.palette_size_uv as usize))
+                        {
+                            self.palette_colors[base + i] = v;
+                        }
+                    }
+                }
+            }
+        }
+        // §5.11.56 anchor stamp — only when the leaf emitted the
+        // `L(cdef_bits)` literal (mirrors `decode_cdef`'s inner-branch
+        // grid-fill: stride `cdefSize4 = 16` over the footprint).
+        if let Some(v) = s.cdef {
+            let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
+            let mask: u32 = !(cdef_size4 - 1);
+            let r = s.mi_row & mask;
+            let c = s.mi_col & mask;
+            let mut i = r;
+            while i < r + bh4 {
+                if i >= self.mi_rows {
+                    break;
+                }
+                let mut j = c;
+                while j < c + bw4 {
+                    if j >= self.mi_cols {
+                        break;
+                    }
+                    self.cdef_idx[(i * self.mi_cols + j) as usize] = v;
+                    j += cdef_size4;
+                }
+                i += cdef_size4;
+            }
+        }
     }
 
     /// Helper to read `PaletteSizes[ plane ][ r ][ c ]` for the
