@@ -2,6 +2,39 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 292)
+
+Round 292 **wires a single forward-reference translational inter block
+from decoded mode-info into a reconstructed `CurrFrame` plane** — the
+r291 follow-up. Where r291 proved the `predict_inter` *arithmetic* in
+isolation (scratch-buffer in, scratch-buffer out), this round closes the
+two §7.11.3 invocation-context pieces the leaf left to "the walker":
+
+* **§7.11.3.1 step-5 / §7.11.3.3 ref-buffer resolution.** Decoded
+  mode-info carries `RefFrame[0]` as a small index
+  (`LAST_FRAME..=ALTREF_FRAME`); the real sample plane lives in the
+  decoder's frame store, reached only through `refIdx =
+  ref_frame_idx[ RefFrame − LAST_FRAME ]` ⇒ `FrameStore[ refIdx ]`
+  (av1-spec p.252 line 4942 / p.274 line 14812).
+* **§7.11.3.1 final `CurrFrame` stitch.** `CurrFrame[plane][y+i][x+j] =
+  Clip1(preds[0][i][j])` (p.258 line 14402) — copying the predicted
+  block into the reconstructed plane at its plane coordinates.
+
+New `reconstruct_inter_block` composes both around `predict_inter` for
+the SIMPLE single-ref translational arm (no warp / OBMC / compound /
+inter-intra), taking `InterModeInfo { ref_frame, mv }`, the
+`ref_frame_idx[]` map, and a `RefFrameStoreEntry[]` frame store.
+
++2 lib tests (1972 → 1974): an end-to-end arc parking the real
+reference plane at frame-store slot 3 (every other slot a decoy) and
+asserting the `RefFrame=LAST_FRAME`, `mv=[0,4]` block resolves through
+`ref_frame_idx[0]=3`, predicts the same independent r291 hand-built 4×4
+oracle, and stitches it at plane offset `(4,4)` of an 8×8 plane with the
+surrounding sentinel samples untouched; plus a caller-bug matrix
+(`INTRA_FRAME`, out-of-range `ref_frame`, out-of-range resolved
+`refIdx`, undersized `CurrFrame`) each surfacing
+`PartitionWalkOutOfRange`.
+
 ## Status — 2026-06-14 (round 291)
 
 Round 291 **proves the public §7.11.3.1 `predict_inter` entry performs a

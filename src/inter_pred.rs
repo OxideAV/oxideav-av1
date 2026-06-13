@@ -4434,6 +4434,224 @@ pub fn overlap_neighbour_predict_blend(
     )
 }
 
+// =====================================================================
+// §7.11.3.1 — mode-info → CurrFrame reconstruction driver.
+// =====================================================================
+//
+// `predict_inter` (above) closes the §7.11.3.1 prediction *arithmetic*:
+// given a fully-resolved `PredictInterRef` (the spec's `RefFrames[
+// candRow][candCol][refList]` already mapped to a per-plane sample
+// buffer) it produces the `w × h` motion-compensated block into a
+// caller-supplied scratch buffer. Two pieces of the §7.11.3 invocation
+// context were left to "the walker" (see the module note at the head
+// of this file, av1-spec p.258 line 14402):
+//
+//   1. §7.11.3.1 step 5 / §7.11.3.3 ref resolution — `refIdx =
+//      ref_frame_idx[ refFrame - LAST_FRAME ]`, `ref = FrameStore[
+//      refIdx ]` (av1-spec p.252 line 4942 / p.274 line 14812). The
+//      decoded mode-info carries `RefFrame[refList]` as a small index
+//      (`LAST_FRAME`..`ALTREF_FRAME`); the actual sample buffer lives
+//      in the per-`refIdx` frame store.
+//   2. The §7.11.3.1 final step `CurrFrame[plane][y+i][x+j] =
+//      Clip1(preds[0][i][j])` (av1-spec p.258 line 14402) — stitching
+//      the predicted block into the reconstructed plane at its plane
+//      coordinates.
+//
+// `reconstruct_inter_block` composes both around `predict_inter` for
+// the single forward-reference translational SIMPLE arm, so a caller
+// holding decoded mode-info (`ref_frame` + `mv`) plus a frame store
+// can drive an end-to-end block reconstruction without re-deriving the
+// ref-buffer indirection or the CurrFrame merge by hand.
+
+/// §7.11.3.1 single forward-reference mode-info descriptor — the
+/// decoded `(RefFrame[0], Mvs[..][0])` pair the §7.11.3 inter
+/// prediction process consumes for a translational SIMPLE block.
+///
+/// `ref_frame` is the spec's `RefFrame[ 0 ]` index in
+/// `LAST_FRAME..=ALTREF_FRAME` (1..=7); `INTRA_FRAME` (0) is rejected
+/// by [`reconstruct_inter_block`] since this driver is the inter arm.
+/// `mv` is `Mvs[ candRow ][ candCol ][ 0 ]` in 1/8-luma-sample units,
+/// laid out `[mv_row, mv_col]` per §5.11.
+#[derive(Debug, Clone, Copy)]
+pub struct InterModeInfo {
+    /// §7.11.3.1 step 5 `RefFrame[ 0 ]` (1..=7, i.e.
+    /// `LAST_FRAME..=ALTREF_FRAME`).
+    pub ref_frame: u8,
+    /// §7.11.3.1 step 8 `Mvs[ candRow ][ candCol ][ 0 ]` in
+    /// 1/8-luma-sample units, `[mv_row, mv_col]`.
+    pub mv: [i16; 2],
+}
+
+/// §7.11.3.3 per-`refIdx` reference-frame entry — one slot of the
+/// decoder's `FrameStore`, with its dimensions already resolved to the
+/// `(plane, subsampling_*)` the [`reconstruct_inter_block`] call is
+/// being run for (the caller does the per-plane `>> subX` / `>> subY`
+/// the same way [`PredictInterRef`] documents).
+#[derive(Debug, Clone, Copy)]
+pub struct RefFrameStoreEntry<'a> {
+    /// `FrameStore[ refIdx ]` plane samples (row-major, `stride`
+    /// columns).
+    pub plane: &'a [u16],
+    /// Column stride of `plane` (`>= width`).
+    pub stride: usize,
+    /// §7.11.3.3 `RefUpscaledWidth[ refIdx ]` (per-plane samples).
+    pub upscaled_width: u32,
+    /// §7.11.3.3 `RefFrameWidth[ refIdx ]` (per-plane samples).
+    pub width: u32,
+    /// §7.11.3.3 `RefFrameHeight[ refIdx ]` (per-plane samples).
+    pub height: u32,
+}
+
+/// §7.11.3.1 single forward-reference translational reconstruction —
+/// drives one decoded inter block from mode-info into a `CurrFrame`
+/// plane.
+///
+/// This is the smallest end-to-end mode-info → reconstructed-plane
+/// arc: it performs the §7.11.3.1 step-5 / §7.11.3.3 ref-buffer
+/// resolution (`refIdx = ref_frame_idx[ ref_frame - LAST_FRAME ]`,
+/// `ref = FrameStore[ refIdx ]`), runs [`predict_inter`] for the
+/// SIMPLE single-ref translational arm (no warp / OBMC / compound /
+/// inter-intra), then performs the §7.11.3.1 final step
+/// `CurrFrame[plane][y+i][x+j] = Clip1(preds[0][i][j])` by copying the
+/// predicted block into `curr_plane` at plane coordinates `(x, y)`.
+///
+/// Inputs (all from av1-spec §7.11.3):
+///   * `mode_info` — decoded `(RefFrame[0], Mvs[..][0])`.
+///   * `ref_frame_idx` — §6.8.2 `ref_frame_idx[ 0..REFS_PER_FRAME ]`
+///     mapping each `RefFrame - LAST_FRAME` to a `FrameStore` slot.
+///   * `frame_store` — the decoder's frame store, indexed by the
+///     resolved `refIdx` (per-plane resolved, see
+///     [`RefFrameStoreEntry`]).
+///   * `(x, y, w, h)` — the §7.11.3.1 prediction region top-left and
+///     size in `curr_plane` samples.
+///   * `(plane, subsampling_x, subsampling_y, bit_depth, frame_width,
+///     frame_height, interp_filter_x, interp_filter_y)` — the same
+///     [`predict_inter`] context arguments.
+///   * `curr_plane` / `curr_stride` — the `CurrFrame[plane]` buffer
+///     and its column stride the predicted block is stitched into.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments: an `INTRA_FRAME` (0) or out-of-range `ref_frame`, an
+/// out-of-range resolved `refIdx`, a `curr_plane` too small for the
+/// `(x, y, w, h)` write region, or anything [`predict_inter`] itself
+/// rejects.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block(
+    mode_info: InterModeInfo,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
+    //
+    // This driver is the inter arm: `RefFrame[0]` must be a real
+    // inter reference (`LAST_FRAME..=ALTREF_FRAME`, i.e. 1..=7).
+    // INTRA_FRAME (0) and any value past ALTREF_FRAME is a caller bug.
+    let ref_frame = mode_info.ref_frame as usize;
+    if !(crate::uncompressed_header_tail::LAST_FRAME
+        ..=crate::uncompressed_header_tail::ALTREF_FRAME)
+        .contains(&ref_frame)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.3 — refIdx = ref_frame_idx[ ref - LAST ] ---
+    //
+    // av1-spec p.252 line 4942 / p.274 line 14812: the small
+    // `RefFrame` index selects a `ref_frame_idx[]` slot which in turn
+    // names a `FrameStore[]` entry.
+    let slot = ref_frame - crate::uncompressed_header_tail::LAST_FRAME;
+    let ref_idx = *ref_frame_idx
+        .get(slot)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
+    let entry = frame_store
+        .get(ref_idx)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+
+    // ---------- §7.11.3.1 step 5 → PredictInterRef bundle ----------
+    let refs = [PredictInterRef {
+        ref_plane: entry.plane,
+        ref_stride: entry.stride,
+        ref_upscaled_width: entry.upscaled_width,
+        ref_width: entry.width,
+        ref_height: entry.height,
+        mv: mode_info.mv,
+    }];
+
+    // ---------- §7.11.3.1 steps 1-13 — prediction into scratch -----
+    let mut pred_out = vec![0u16; w * h];
+    predict_inter(
+        plane,
+        x,
+        y,
+        w,
+        h,
+        crate::cdf::MOTION_MODE_SIMPLE,
+        /* is_compound */ false,
+        /* is_inter_intra */ false,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        &refs,
+        /* compound */ None,
+        /* warp */ None,
+        /* obmc */ None,
+        &mut pred_out,
+    )?;
+
+    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
+    //
+    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
+    // Clip1(preds[0][i][j])`. `predict_inter` already applied the
+    // `Clip1` (single-ref final-clip arm); here we copy the resulting
+    // `w × h` block into the plane buffer at plane coords `(x, y)`.
+    if x < 0 || y < 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let (px, py) = (x as usize, y as usize);
+    // The write region must fit the supplied plane buffer.
+    let last_row = py
+        .checked_add(h)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let last_col = px
+        .checked_add(w)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_stride < last_col {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed = (last_row - 1)
+        .checked_mul(curr_stride)
+        .and_then(|v| v.checked_add(last_col))
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_plane.len() < needed {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    for i in 0..h {
+        let dst = (py + i) * curr_stride + px;
+        let src = i * w;
+        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6489,6 +6707,254 @@ mod tests {
         assert!(
             differs,
             "half-sample MV must interpolate, not copy the integer grid"
+        );
+    }
+
+    // ---------- r292 §7.11.3.1 mode-info → CurrFrame driver ----------
+
+    /// §7.11.3.1 end-to-end single-forward-reference translational
+    /// reconstruction — drives one decoded inter block from mode-info
+    /// (`RefFrame[0] = LAST_FRAME`, `mv = [0, 4]`) through the
+    /// §7.11.3.3 `ref_frame_idx → FrameStore` resolution into
+    /// `predict_inter` and stitches the result into a `CurrFrame`
+    /// plane at plane coordinates `(x, y)`.
+    ///
+    /// This proves the mi-grid → `predict_inter` wiring closes both
+    /// pieces the leaf left to "the walker": the §7.11.3.1 step-5 /
+    /// §7.11.3.3 ref-buffer indirection (a small `RefFrame` index does
+    /// **not** name a buffer directly — it must be routed through
+    /// `ref_frame_idx[]` to a `FrameStore` slot) and the §7.11.3.1
+    /// final `CurrFrame[plane][y+i][x+j] = Clip1(preds[0][i][j])`
+    /// merge.
+    ///
+    /// The reference samples + MV reuse the r291 hand-built oracle
+    /// (16×16 `ref[r][c] = r*16+c`, region `4×4` rooted at `(4, 4)`,
+    /// `mv = [0, 4]` ⇒ +0.5 sample horizontally), so the predicted
+    /// 4×4 block is the same independent `EXPECTED` literal — here
+    /// asserted at its *plane offset* inside a larger 8×8 CurrFrame
+    /// buffer, with the surrounding samples left untouched.
+    #[test]
+    fn r292_reconstruct_inter_block_drives_modeinfo_through_predict_inter() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (r * 16 + c) as u16;
+            }
+        }
+
+        // FrameStore with the LAST_FRAME plane parked at slot 3, every
+        // other slot a distinct decoy. `ref_frame_idx[LAST_FRAME -
+        // LAST_FRAME] = ref_frame_idx[0] = 3` is the only route that
+        // selects the real plane, so a passing test proves the
+        // indirection is honoured (not a direct `RefFrame`-as-index
+        // shortcut).
+        let decoy = vec![0u16; ref_h * stride];
+        let frame_store = [
+            RefFrameStoreEntry {
+                plane: &decoy,
+                stride,
+                upscaled_width: ref_w as u32,
+                width: ref_w as u32,
+                height: ref_h as u32,
+            },
+            RefFrameStoreEntry {
+                plane: &decoy,
+                stride,
+                upscaled_width: ref_w as u32,
+                width: ref_w as u32,
+                height: ref_h as u32,
+            },
+            RefFrameStoreEntry {
+                plane: &decoy,
+                stride,
+                upscaled_width: ref_w as u32,
+                width: ref_w as u32,
+                height: ref_h as u32,
+            },
+            RefFrameStoreEntry {
+                plane: &refp,
+                stride,
+                upscaled_width: ref_w as u32,
+                width: ref_w as u32,
+                height: ref_h as u32,
+            },
+        ];
+        // ref_frame_idx[ RefFrame - LAST_FRAME ] for the 7 inter refs.
+        let ref_frame_idx: [u8; 7] = [3, 0, 1, 2, 0, 1, 2];
+
+        let w = 4;
+        let h = 4;
+        // 8×8 CurrFrame plane pre-filled with a sentinel so we can
+        // prove the surrounding region is untouched.
+        let curr_w = 8;
+        let curr_h = 8;
+        let sentinel = 999u16;
+        let mut curr = vec![sentinel; curr_w * curr_h];
+
+        let mode_info = InterModeInfo {
+            ref_frame: crate::uncompressed_header_tail::LAST_FRAME as u8,
+            mv: [0, 4],
+        };
+        reconstruct_inter_block(
+            mode_info,
+            &ref_frame_idx,
+            &frame_store,
+            /* plane */ 0,
+            /* x */ 4,
+            /* y */ 4,
+            w,
+            h,
+            /* bit_depth */ 8,
+            /* subsampling_x */ 0,
+            /* subsampling_y */ 0,
+            /* frame_width */ ref_w as u32,
+            /* frame_height */ ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut curr,
+            /* curr_stride */ curr_w,
+        )
+        .expect("reconstruct_inter_block SIMPLE single-ref half-sample");
+
+        // The same independent hand-built 4×4 oracle from r291 — the
+        // +0.5-sample horizontal shift of `ref[r][c] = r*16+c` over the
+        // region rooted at reference (row=4, col=4).
+        #[rustfmt::skip]
+        let expected: [u16; 16] = [
+            69,  70,  71,  72,
+            85,  86,  87,  88,
+            101, 102, 103, 104,
+            117, 118, 119, 120,
+        ];
+        // Block stitched at plane coords (x=4, y=4) of the 8×8 plane.
+        for i in 0..h {
+            for j in 0..w {
+                assert_eq!(
+                    curr[(4 + i) * curr_w + (4 + j)],
+                    expected[i * w + j],
+                    "reconstructed sample ({}, {}) must match the oracle",
+                    4 + j,
+                    4 + i,
+                );
+            }
+        }
+        // Every sample outside the 4×4 write region is still the
+        // sentinel — the stitch wrote exactly the prediction region.
+        for r in 0..curr_h {
+            for c in 0..curr_w {
+                let inside = (4..8).contains(&r) && (4..8).contains(&c);
+                if !inside {
+                    assert_eq!(
+                        curr[r * curr_w + c],
+                        sentinel,
+                        "sample ({c}, {r}) outside the write region must be untouched"
+                    );
+                }
+            }
+        }
+    }
+
+    /// §7.11.3.1 reconstruction driver caller-bug matrix — the
+    /// mode-info → CurrFrame driver rejects an `INTRA_FRAME` ref, an
+    /// out-of-range `ref_frame`, an out-of-range resolved `refIdx`,
+    /// and a `CurrFrame` plane too small for the write region, each
+    /// with `PartitionWalkOutOfRange`.
+    #[test]
+    fn r292_reconstruct_inter_block_rejects_caller_bugs() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let refp = vec![0u16; ref_w * ref_h];
+        let store = [RefFrameStoreEntry {
+            plane: &refp,
+            stride: ref_w,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        }];
+        let ref_frame_idx: [u8; 7] = [0, 0, 0, 0, 0, 0, 0];
+        let w = 4;
+        let h = 4;
+        let mut curr = vec![0u16; ref_w * ref_h];
+
+        let call = |ref_frame: u8,
+                    rfi: &[u8],
+                    fs: &[RefFrameStoreEntry<'_>],
+                    curr: &mut [u16],
+                    curr_stride: usize| {
+            reconstruct_inter_block(
+                InterModeInfo {
+                    ref_frame,
+                    mv: [0, 0],
+                },
+                rfi,
+                fs,
+                0,
+                0,
+                0,
+                w,
+                h,
+                8,
+                0,
+                0,
+                ref_w as u32,
+                ref_h as u32,
+                EIGHTTAP,
+                EIGHTTAP,
+                curr,
+                curr_stride,
+            )
+        };
+
+        // INTRA_FRAME (0) is not an inter reference.
+        assert_eq!(
+            call(
+                crate::uncompressed_header_tail::INTRA_FRAME as u8,
+                &ref_frame_idx,
+                &store,
+                &mut curr,
+                ref_w
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+
+        // ref_frame past ALTREF_FRAME (7) is out of range.
+        assert_eq!(
+            call(8, &ref_frame_idx, &store, &mut curr, ref_w).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+
+        // ref_frame_idx routes to a FrameStore slot that doesn't exist
+        // (slot 5 into a 1-entry store).
+        let bad_idx: [u8; 7] = [5, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            call(
+                crate::uncompressed_header_tail::LAST_FRAME as u8,
+                &bad_idx,
+                &store,
+                &mut curr,
+                ref_w
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+
+        // CurrFrame plane too small for the (x=0, y=0, 4×4) write
+        // region (stride 2 < 4 columns).
+        let mut tiny = vec![0u16; 4];
+        assert_eq!(
+            call(
+                crate::uncompressed_header_tail::LAST_FRAME as u8,
+                &ref_frame_idx,
+                &store,
+                &mut tiny,
+                2
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
         );
     }
 

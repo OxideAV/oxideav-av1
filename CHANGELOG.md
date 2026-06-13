@@ -4,6 +4,30 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r292 (2026-06-14): wire a single forward-reference
+  translational inter block from decoded mode-info into a reconstructed
+  `CurrFrame` plane (the r291 follow-up). New `reconstruct_inter_block`
+  driver + `InterModeInfo` / `RefFrameStoreEntry` types close the two
+  §7.11.3 invocation-context pieces `predict_inter` itself left to the
+  walker: the §7.11.3.1 step-5 / §7.11.3.3 ref-buffer resolution
+  (`refIdx = ref_frame_idx[ RefFrame − LAST_FRAME ]` ⇒
+  `FrameStore[ refIdx ]`, av1-spec p.252 line 4942 / p.274 line 14812)
+  and the §7.11.3.1 final `CurrFrame[plane][y+i][x+j] =
+  Clip1(preds[0][i][j])` stitch (p.258 line 14402). The driver routes a
+  decoded `(RefFrame[0], Mvs[..][0])` pair through `predict_inter`
+  (SIMPLE motion mode, single forward ref, no warp/OBMC/compound/
+  inter-intra) and copies the predicted block into the reconstructed
+  plane at its plane coordinates. +2 lib tests (1972 → 1974): an
+  end-to-end arc parking the real reference at frame-store slot 3 (every
+  other slot a decoy) to prove the `ref_frame_idx` indirection is
+  honoured — `RefFrame=LAST_FRAME`, `mv=[0,4]` resolves through
+  `ref_frame_idx[0]=3`, predicts the same independent r291 hand-built
+  4×4 oracle, and stitches it at plane offset `(4,4)` of an 8×8 plane
+  with surrounding sentinels untouched — plus a caller-bug matrix
+  (`INTRA_FRAME`, out-of-range `ref_frame`, out-of-range resolved
+  `refIdx`, undersized `CurrFrame`) each surfacing
+  `PartitionWalkOutOfRange`.
+
 - decoder r291 (2026-06-14): prove the public §7.11.3.1 `predict_inter`
   entry performs a real sub-pel motion-compensated interpolation. New
   test `r291_predict_inter_half_sample_mv_matches_hand_built_reference`
