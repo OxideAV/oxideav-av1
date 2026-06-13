@@ -468,6 +468,139 @@ mod tests {
     }
 
     #[test]
+    fn read_lr_persists_unit_into_grid() {
+        // §7.17 bridge: after read_lr decodes a unit it must be readable
+        // back through lr_unit(plane, unitRow, unitCol).
+        let params = single_plane_params(64, RESTORE_WIENER);
+        let unit = LrUnit {
+            restoration_type: RESTORE_WIENER,
+            wiener: [[5, -8, 11], [-2, 6, 9]],
+            sgr_set: 0,
+            sgr_xqd: [0; 2],
+        };
+        let units = vec![((0usize, 0u32, 0u32), unit)];
+
+        let mut writer = SymbolWriter::new(false);
+        let mut wcdfs = TileCdfContext::new_from_defaults();
+        let mut wstate = LrWriteState::new();
+        write_lr(
+            &mut writer,
+            &mut wcdfs,
+            &mut wstate,
+            0,
+            0,
+            BLOCK_64X64,
+            &params,
+            &units,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut dcdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        // frame 64x64, unit 64 => exactly one unit row and col.
+        assert_eq!(walker.lr_unit_grid_dims(0), None);
+        walker
+            .read_lr(&mut dec, &mut dcdfs, 0, 0, BLOCK_64X64, &params)
+            .unwrap();
+        assert_eq!(walker.lr_unit_grid_dims(0), Some((1, 1)));
+        assert_eq!(walker.lr_unit(0, 0, 0), unit);
+        // Out-of-grid / unallocated-plane reads return the §7.17 identity.
+        assert_eq!(walker.lr_unit(0, 1, 0), LrUnit::NONE);
+        assert_eq!(walker.lr_unit(0, 0, 1), LrUnit::NONE);
+        assert_eq!(walker.lr_unit(1, 0, 0), LrUnit::NONE);
+        assert_eq!(walker.lr_unit(3, 0, 0), LrUnit::NONE);
+        assert_eq!(walker.lr_unit_grid_dims(1), None);
+        assert_eq!(walker.lr_unit_grid_dims(3), None);
+    }
+
+    #[test]
+    fn read_lr_multi_unit_grid_indices() {
+        // unit_size 32 over a 64x64 superblock => a 2x2 unit grid; each
+        // cell must persist its own distinct unit.
+        let params = single_plane_params(32, RESTORE_WIENER);
+        let mk = |a: i32, b: i32, c: i32| LrUnit {
+            restoration_type: RESTORE_WIENER,
+            wiener: [[a, b, c], [-a, -b, -c]],
+            sgr_set: 0,
+            sgr_xqd: [0; 2],
+        };
+        let units = vec![
+            ((0usize, 0u32, 0u32), mk(1, -2, 3)),
+            ((0usize, 0u32, 1u32), mk(2, -3, 4)),
+            ((0usize, 1u32, 0u32), mk(3, -4, 5)),
+            ((0usize, 1u32, 1u32), mk(4, -5, 6)),
+        ];
+
+        let mut writer = SymbolWriter::new(false);
+        let mut wcdfs = TileCdfContext::new_from_defaults();
+        let mut wstate = LrWriteState::new();
+        write_lr(
+            &mut writer,
+            &mut wcdfs,
+            &mut wstate,
+            0,
+            0,
+            BLOCK_64X64,
+            &params,
+            &units,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut dcdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        let got = walker
+            .read_lr(&mut dec, &mut dcdfs, 0, 0, BLOCK_64X64, &params)
+            .unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(walker.lr_unit_grid_dims(0), Some((2, 2)));
+        for ((plane, ur, uc), unit) in &units {
+            assert_eq!(walker.lr_unit(*plane, *ur, *uc), *unit);
+        }
+    }
+
+    #[test]
+    fn read_lr_intrabc_leaves_grid_unallocated() {
+        let mut params = single_plane_params(64, RESTORE_WIENER);
+        params.allow_intrabc = true;
+        let mut writer = SymbolWriter::new(false);
+        let mut wcdfs = TileCdfContext::new_from_defaults();
+        let mut wstate = LrWriteState::new();
+        write_lr(
+            &mut writer,
+            &mut wcdfs,
+            &mut wstate,
+            0,
+            0,
+            BLOCK_64X64,
+            &params,
+            &[],
+        )
+        .unwrap();
+        let bytes = writer.finish();
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut dcdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        walker
+            .read_lr(&mut dec, &mut dcdfs, 0, 0, BLOCK_64X64, &params)
+            .unwrap();
+        // allow_intrabc short-circuits before any grid allocation.
+        assert_eq!(walker.lr_unit_grid_dims(0), None);
+        assert_eq!(walker.lr_unit(0, 0, 0), LrUnit::NONE);
+    }
+
+    #[test]
+    fn lr_unit_none_is_restore_none_identity() {
+        assert_eq!(LrUnit::NONE.restoration_type, RESTORE_NONE);
+        assert_eq!(LrUnit::NONE.wiener, [[0; WIENER_COEFFS]; 2]);
+        assert_eq!(LrUnit::NONE.sgr_set, 0);
+        assert_eq!(LrUnit::NONE.sgr_xqd, [0; 2]);
+    }
+
+    #[test]
     fn allow_intrabc_emits_nothing() {
         let mut params = single_plane_params(64, RESTORE_WIENER);
         params.allow_intrabc = true;

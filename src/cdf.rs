@@ -14736,6 +14736,22 @@ pub struct LrUnit {
     pub sgr_xqd: [i32; 2],
 }
 
+impl LrUnit {
+    /// The §5.11.58 "no restoration" payload — `RESTORE_NONE` with every
+    /// coefficient field zero. This is the value an unwritten cell of the
+    /// per-plane §7.17 loop-restoration grid carries (the §5.11.57
+    /// `read_lr` unit-window only fires `read_lr_unit` for the units a
+    /// superblock actually covers; cells outside every superblock's
+    /// window in a partial-tile walk stay `RESTORE_NONE`, which §7.17
+    /// treats as an identity pass-through).
+    pub const NONE: Self = Self {
+        restoration_type: RESTORE_NONE,
+        wiener: [[0; crate::loop_restoration::WIENER_COEFFS]; 2],
+        sgr_set: 0,
+        sgr_xqd: [0; 2],
+    };
+}
+
 /// A §5.11.57 `read_lr` unit decode result, tagged with its grid
 /// coordinates (`plane`, `unit_row`, `unit_col`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15142,6 +15158,14 @@ pub struct PartitionWalker {
     /// `Sgrproj_Xqd_Mid[ i ]` at tile entry; each §5.11.58 unit that
     /// decodes a `RESTORE_SGRPROJ` `xqd` overwrites the matching slot.
     ref_sgr_xqd: [[i32; 2]; 3],
+    /// `LrType` / `LrWiener` / `LrSgrSet` / `LrSgrXqd` per-plane grids
+    /// (§5.11.58 — av1-spec p.106), the §7.17 loop-restoration input.
+    /// Slot `plane` is `None` until the first §5.11.57
+    /// [`Self::read_lr`] call decodes a unit for that plane; thereafter
+    /// it holds the row-major `unit_rows * unit_cols` grid of
+    /// [`LrUnit`] payloads. Surfaced via [`Self::lr_unit`] /
+    /// [`Self::lr_unit_grid_dims`].
+    lr_units: [Option<LrUnitGrid>; 3],
 }
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
@@ -15152,6 +15176,29 @@ struct CurrFramePlane {
     rows: u32,
     cols: u32,
     samples: Vec<i32>,
+}
+
+/// Per-plane §7.17 loop-restoration unit grid — the persistent home for
+/// the §5.11.58 `LrType` / `LrWiener` / `LrSgrSet` / `LrSgrXqd` arrays
+/// that §5.11.57 `read_lr` fills as it walks each superblock's
+/// unit-window. Indexed row-major over the `unit_rows * unit_cols`
+/// frame-level grid (`units[ unitRow * unit_cols + unitCol ]`); a cell no
+/// superblock covered carries [`LrUnit::NONE`] (the §7.17 identity).
+///
+/// Lazily allocated on the first §5.11.57 [`PartitionWalker::read_lr`]
+/// call that decodes a unit for the plane — the unit-grid extents
+/// (`unitRows` / `unitCols`) come from the per-frame [`LrParams`] the
+/// caller passes at decode time, not from the walker constructor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LrUnitGrid {
+    /// `unitRows` per §5.11.57 (`count_units_in_frame(unitSize,
+    /// Round2(FrameHeight, subY))`).
+    unit_rows: u32,
+    /// `unitCols` per §5.11.57 (`count_units_in_frame(unitSize,
+    /// Round2(UpscaledWidth, subX))`).
+    unit_cols: u32,
+    /// Row-major `unit_rows * unit_cols` flat grid of §5.11.58 payloads.
+    units: Vec<LrUnit>,
 }
 
 /// r282 — per-leaf grid-stamp bundle for
@@ -15421,6 +15468,11 @@ impl PartitionWalker {
             // [`Self::reset_lr_refs`].
             ref_lr_wiener: [[crate::loop_restoration::WIENER_TAPS_MID; 2]; 3],
             ref_sgr_xqd: [crate::loop_restoration::SGRPROJ_XQD_MID; 3],
+            // §5.11.58 LrType/LrWiener/LrSgrSet/LrSgrXqd grids — lazily
+            // allocated on the first §5.11.57 [`Self::read_lr`] unit
+            // decode per plane (extents come from the per-frame
+            // [`LrParams`] at decode time).
+            lr_units: [None, None, None],
         })
     }
 
@@ -16187,6 +16239,29 @@ impl PartitionWalker {
             // §5.11.57 unit-grid extents.
             let unit_rows = count_units_in_frame(unit_size, round2(params.frame_height, sub_y));
             let unit_cols = count_units_in_frame(unit_size, round2(params.upscaled_width, sub_x));
+            // Lazily allocate the per-plane §5.11.58 LrType/LrWiener/
+            // LrSgrSet/LrSgrXqd grid the §7.17 loop-restoration process
+            // consumes. A re-used walker whose stored extents disagree
+            // with this frame's is re-allocated fresh.
+            let needs_alloc = match self.lr_units.get(plane).and_then(Option::as_ref) {
+                Some(g) => g.unit_rows != unit_rows || g.unit_cols != unit_cols,
+                None => true,
+            };
+            if needs_alloc {
+                let area = (unit_rows as usize)
+                    .checked_mul(unit_cols as usize)
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let mut units: Vec<LrUnit> = Vec::new();
+                units
+                    .try_reserve_exact(area)
+                    .map_err(|_| crate::Error::PartitionWalkOutOfRange)?;
+                units.resize(area, LrUnit::NONE);
+                self.lr_units[plane] = Some(LrUnitGrid {
+                    unit_rows,
+                    unit_cols,
+                    units,
+                });
+            }
             let mi_size_shift_y = (MI_SIZE as u32) >> sub_y;
             let unit_row_start = (r * mi_size_shift_y).div_ceil(unit_size);
             let unit_row_end =
@@ -16208,6 +16283,20 @@ impl PartitionWalker {
                 let mut unit_col = unit_col_start;
                 while unit_col < unit_col_end {
                     let unit = self.decode_lr_unit(decoder, cdfs, plane, frt)?;
+                    // §5.11.58: persist the decoded unit into the
+                    // per-plane §7.17 grid at (unitRow, unitCol). The
+                    // grid was allocated above with these exact extents,
+                    // and the §5.11.57 unit-window arithmetic clamps
+                    // unitRow / unitCol below unitRows / unitCols, so the
+                    // index is always in range.
+                    if let Some(grid) = self.lr_units[plane].as_mut() {
+                        let idx = (unit_row as usize)
+                            .wrapping_mul(grid.unit_cols as usize)
+                            .wrapping_add(unit_col as usize);
+                        if let Some(cell) = grid.units.get_mut(idx) {
+                            *cell = unit;
+                        }
+                    }
                     out.push(DecodedLrUnit {
                         plane,
                         unit_row,
@@ -16220,6 +16309,43 @@ impl PartitionWalker {
             }
         }
         Ok(out)
+    }
+
+    /// `(unitRows, unitCols)` extents of the §5.11.58 loop-restoration
+    /// unit grid stored for `plane`, or `None` if no §5.11.57
+    /// [`Self::read_lr`] call has yet decoded a unit for that plane
+    /// (the grid is allocated lazily on first use). `plane >= 3` also
+    /// returns `None`.
+    #[must_use]
+    pub fn lr_unit_grid_dims(&self, plane: usize) -> Option<(u32, u32)> {
+        self.lr_units
+            .get(plane)?
+            .as_ref()
+            .map(|g| (g.unit_rows, g.unit_cols))
+    }
+
+    /// §7.17 loop-restoration grid lookup — the persisted §5.11.58
+    /// `LrType` / `LrWiener` / `LrSgrSet` / `LrSgrXqd` payload at
+    /// `(plane, unitRow, unitCol)`. Returns [`LrUnit::NONE`] (the §7.17
+    /// identity pass-through) when the plane's grid is unallocated, the
+    /// coordinates are out of the unit-grid extents, or the cell was
+    /// never covered by a superblock's §5.11.57 unit-window. `plane >=
+    /// 3` likewise returns [`LrUnit::NONE`].
+    ///
+    /// This is the bridge the §7.17 loop-restoration process reads —
+    /// `rType = LrType[ plane ][ unitRow ][ unitCol ]` and the Wiener /
+    /// self-guided coefficient processes (§7.17.2 / §7.17.4) consume the
+    /// matching `LrWiener` / `LrSgrSet` / `LrSgrXqd` from the same cell.
+    #[must_use]
+    pub fn lr_unit(&self, plane: usize, unit_row: u32, unit_col: u32) -> LrUnit {
+        let Some(Some(grid)) = self.lr_units.get(plane) else {
+            return LrUnit::NONE;
+        };
+        if unit_row >= grid.unit_rows || unit_col >= grid.unit_cols {
+            return LrUnit::NONE;
+        }
+        let idx = (unit_row as usize) * (grid.unit_cols as usize) + (unit_col as usize);
+        grid.units.get(idx).copied().unwrap_or(LrUnit::NONE)
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for

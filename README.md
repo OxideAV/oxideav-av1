@@ -2,6 +2,40 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-13 (round 288)
+
+Round 288 **routes the §5.11.58 loop-restoration unit taps
+end-to-end into the §7.17 grid** — the bridge r287's followup
+named. `PartitionWalker::read_lr` already decoded each unit's
+`restoration_type` / Wiener taps / sgr-xqd; now it **persists**
+them into a lazily-allocated per-plane `LrType` / `LrWiener` /
+`LrSgrSet` / `LrSgrXqd` grid (row-major over the
+`unitRows * unitCols` frame-level extents derived from `LrParams`),
+so the §7.17 restoration filter can read the per-unit selection
+back by `(plane, unitRow, unitCol)` instead of consuming a
+discarded `Vec`:
+
+* **`lr_unit(plane, unitRow, unitCol)`** — returns the persisted
+  §5.11.58 payload, or the new `LrUnit::NONE` (`RESTORE_NONE`,
+  all-zero coefficients — the §7.17 identity pass-through) for an
+  unallocated plane, an out-of-grid coordinate, or a cell no
+  superblock's unit-window covered.
+* **`lr_unit_grid_dims(plane)`** — the `(unitRows, unitCols)`
+  extents, or `None` before the first `read_lr` unit decode on
+  that plane (the grid is allocated lazily because the extents come
+  from the per-frame `LrParams`, not the walker constructor).
+* The §5.11.57 `allow_intrabc` short-circuit returns before any
+  allocation, so an intra-block-copy frame leaves every plane's
+  grid `None` (and `lr_unit` reads as `NONE`).
+
++4 lib tests (1960 → 1964): grid persistence + out-of-grid /
+unallocated `NONE` reads, a 2×2 multi-unit grid (`unit_size 32`
+over a 64×64 superblock indexing all four cells distinctly),
+intrabc leaving the grid unallocated, and the `LrUnit::NONE`
+identity invariant. This closes the decode-side wiring between the
+§5.11.58 bitstream reader and the existing
+`src/loop_restoration.rs` §7.17 filter.
+
 ## Status — 2026-06-13 (round 287)
 
 Round 287 lands the **§5.11.57 `read_lr()` / §5.11.58

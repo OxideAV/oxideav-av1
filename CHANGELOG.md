@@ -4,6 +4,24 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r288 (2026-06-13): route the §5.11.58 loop-restoration unit
+  taps end-to-end into the §7.17 grid. `PartitionWalker::read_lr` now
+  persists every decoded unit into a lazily-allocated per-plane
+  `LrType` / `LrWiener` / `LrSgrSet` / `LrSgrXqd` grid (indexed
+  row-major over the `unitRows * unitCols` frame-level extents from
+  `LrParams`), in addition to the existing `Vec<DecodedLrUnit>` return.
+  Two new accessors surface the grid the §7.17 loop-restoration process
+  reads: `lr_unit(plane, unitRow, unitCol)` (returns the persisted
+  payload, or the new `LrUnit::NONE` §7.17 identity for an unallocated
+  plane / out-of-grid / never-covered cell) and `lr_unit_grid_dims`
+  (the `(unitRows, unitCols)` extents, or `None` before first use).
+  `LrUnit::NONE` const added. The §5.11.57 `allow_intrabc`
+  short-circuit leaves the grid unallocated. +4 lib tests
+  (1960 → 1964): grid persistence + out-of-grid/unallocated `NONE`
+  reads, a 2×2 multi-unit grid (`unit_size 32` over a 64×64
+  superblock), intrabc leaving the grid unallocated, and the
+  `LrUnit::NONE` identity invariant.
+
 - encoder+decoder r287 (2026-06-13): land the §5.11.57 `read_lr()` /
   §5.11.58 `read_lr_unit()` loop-restoration unit syntax on both the
   decode walker and the encode write side, in lockstep. New decode
