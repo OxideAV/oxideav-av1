@@ -2,6 +2,61 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-13 (round 286)
+
+Round 286 lands the **§5.11.47 `transform_type()` write side** —
+the per-luma-TU `intra_tx_type` / `inter_tx_type` S() that the
+r285 follow-up named — by threading the **§5.9.12 quantizer
+state** through both the write driver and the decode walker, in
+lockstep:
+
+* **Write side (`write_transform_block`)** — replaces the prior
+  hard-coded `DCT_DCT` `TxTypes[]` stamp with the real §5.11.47
+  path. It computes the §5.11.48 `get_tx_set()` (now
+  `reduced_tx_set`-aware via the new `SyntaxFrameParams::reduced_tx_set`),
+  evaluates the §5.11.47 `set > 0 && (segmentation_enabled ?
+  get_qindex(1, segment_id) : base_q_idx) > 0` guard against the
+  new `SyntaxFrameParams::quant`, and on the open arm maps the
+  caller-committed `SyntaxBlock::residual_tx_type` entry to its
+  per-set symbol ordinal and emits it on the §8.3.2
+  `intra_dir`-keyed CDF, then stamps the value into the mirror's
+  `TxTypes[]`.
+* **Forward map (`tx_type_to_symbol`)** — the exact inverse of the
+  read path's `Tx_Type_*_Inv_Set{1,2,3}` tables: `(set, is_inter,
+  TxType) → symbol`, `None` when the `TxType` is inadmissible in
+  the set (a write-side caller bug) or on `TX_SET_DCTONLY`.
+* **Decode lockstep** — `decode_block_syntax` /
+  `decode_partition_syntax` now thread `quant` + `reduced_tx_set`
+  into the §5.11.34 `ResidualContext` (replacing the hard-coded
+  neutral `base_q_idx = 0`), with `intra_dir` from the §8.3.2
+  `intra_dir()` derivation and `segment_id` from the decoded
+  prefix, so the per-TU `transform_type()` read matches the write
+  side bit-for-bit.
+
+Guard-closed paths (`base_q_idx == 0` neutral default,
+`TX_SET_DCTONLY`) stay bit-silent at `DCT_DCT` exactly as before,
+so every prior fixture is unaffected. New round-trips: BLOCK_8X8
+intra TX_8X8 `ADST_ADST` (`base_q_idx = 64`, `TX_SET_INTRA_1`);
+the BLOCK_16X16 `tx_depth = 1` four-TU mixed-`TxType` fan-out with
+CDF adaptation across the reads (`V_PRED` intra-dir axis); the two
+guard-closed silent paths (neutral + TX_32X32 DCTONLY); an
+exhaustive `tx_type_to_symbol` forward/inverse table test; and a
+write-side caller-bug battery. Library tests 1948 → 1953.
+
+### Pending follow-ups for round 287+
+
+* **Inter `transform_type`** — the write side handles the inter
+  arm (`inter_tx_type` CDF via `inter_tx_type_set`), but no
+  round-trip yet exercises it through a real inter `residual( )`
+  (the inter write path remains intrabc-only); add an inter-frame
+  `transform_type` fixture once the inter residual write arc
+  widens.
+* **Pixel-driver ctx upgrade** — the matched encoder/decoder pixel
+  drivers still exchange coefficients with explicit
+  `txb_skip_ctx = dc_sign_ctx = 0`; migrating them onto the §8.3.2
+  derivations is an isolated paired change.
+* **CFL `compute_prediction` decode gap** carries over from r282.
+
 ## Status — 2026-06-12 (round 285)
 
 Round 285 threads the **§5.11.15 / §5.11.16 / §5.11.17
@@ -56,11 +111,10 @@ battery. Library tests 1942 → 1948.
 
 ### Pending follow-ups for round 286+
 
-* **Quantizer-params threading** — the decode walker still pins the
-  per-block `ResidualContext` at `base_q_idx = 0`, which silences
-  the §5.11.47 `transform_type` S(); threading real §5.9.12
-  quantizer state through `decode_block_syntax` and the write side
-  (including a `write_transform_type`) is one paired arc.
+* **Quantizer-params threading** — LANDED r286: `decode_block_syntax`
+  / `decode_partition_syntax` + the write side now thread §5.9.12
+  `quant` + §5.9.21 `reduced_tx_set`, and the §5.11.47
+  `transform_type` S() codes on both sides under the open guard.
 * **Pixel-driver ctx upgrade** — the matched encoder/decoder pixel
   drivers still exchange coefficients with explicit
   `txb_skip_ctx = dc_sign_ctx = 0`; migrating them onto the §8.3.2

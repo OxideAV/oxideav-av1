@@ -13267,6 +13267,39 @@ pub const TX_TYPE_INTER_INV_SET2: [usize; 12] = [
 /// `inter_tx_type` when `set == TX_SET_INTER_3`.
 pub const TX_TYPE_INTER_INV_SET3: [usize; 2] = [IDTX, DCT_DCT];
 
+/// §5.11.47 forward (encode-side) `TxType -> intra_tx_type` /
+/// `inter_tx_type` ordinal lookup — the inverse of the §5.11.47 read
+/// path's `Tx_Type_*_Inv_Set{1,2,3}[ symbol ] -> TxType` inversion
+/// tables ([`TX_TYPE_INTRA_INV_SET1`] etc.). Given the resolved
+/// §5.11.48 `set` (`TX_SET_INTRA_{1,2}` / `TX_SET_INTER_{1,2,3}`) and a
+/// §3 `TxType`, returns the per-set symbol ordinal the
+/// `intra_tx_type` / `inter_tx_type` S() carries, or `None` when the
+/// `TxType` is not admissible in `set` (the `is_tx_type_in_set`
+/// predicate fails — a caller bug on the write side, since a conformant
+/// encoder only commits a `TxType` the chosen `set` admits).
+///
+/// On `set == TX_SET_DCTONLY` no symbol is coded (the §5.11.47 `set >
+/// 0` guard short-circuits to `DCT_DCT`), so this helper returns `None`
+/// there: callers gate the S() on `set > 0` before consulting it.
+#[must_use]
+pub fn tx_type_to_symbol(set: u32, is_inter: bool, tx_type: usize) -> Option<u32> {
+    let table: &[usize] = if is_inter {
+        match set {
+            TX_SET_INTER_1 => &TX_TYPE_INTER_INV_SET1,
+            TX_SET_INTER_2 => &TX_TYPE_INTER_INV_SET2,
+            TX_SET_INTER_3 => &TX_TYPE_INTER_INV_SET3,
+            _ => return None,
+        }
+    } else {
+        match set {
+            TX_SET_INTRA_1 => &TX_TYPE_INTRA_INV_SET1,
+            TX_SET_INTRA_2 => &TX_TYPE_INTRA_INV_SET2,
+            _ => return None,
+        }
+    };
+    table.iter().position(|&t| t == tx_type).map(|p| p as u32)
+}
+
 /// Per-block §5.11.34 `residual()` quantiser / tx-type context — the
 /// fields the §5.11.47 `transform_type` reader, §5.11.40
 /// `compute_tx_type` derivation, and §7.12.3 step-1 dequant loop need
@@ -13339,7 +13372,7 @@ pub struct TransformTypeReadout {
 /// `Tx_Size_Sqr` ordinal index. Used to look up the §8.3.2
 /// `intra_tx_type` / `inter_tx_type` CDF row.
 #[inline]
-fn tx_size_sqr_index(tx_size: usize) -> usize {
+pub fn tx_size_sqr_index(tx_size: usize) -> usize {
     // `Tx_Size_Sqr` per §3 maps each `TX_SIZES_ALL` ordinal to a
     // square `TX_4X4..TX_64X64` ordinal (matching
     // `Min( Tx_Width, Tx_Height )` with the log2(side) - 2 rule).
@@ -24052,6 +24085,21 @@ impl PartitionWalker {
         // [`Self::residual`], and the walker advances past the
         // historical r189 stub site.
         inter_ctx: Option<&InterFrameContext>,
+        // r286: §5.9.12 per-frame quantiser state + §5.9.21
+        // `reduced_tx_set`. Threaded into the §5.11.34 `residual()`
+        // dispatch's [`ResidualContext`] so the §5.11.47
+        // `transform_type()` reader's `(segmentation_enabled ?
+        // get_qindex(1, segment_id) : base_q_idx) > 0` guard and its
+        // §5.11.48 `get_tx_set()` reduction match whatever quantiser
+        // the bitstream was written under. With the `base_q_idx == 0`
+        // neutral default the guard is always false and the §5.11.47
+        // path stays bit-silent (`TxType == DCT_DCT`) — the historical
+        // behaviour. The encoder mirror's
+        // [`crate::encoder::partition_tree`] write side reads the same
+        // `quant` / `reduced_tx_set` so the per-luma-TU `intra_tx_type`
+        // / `inter_tx_type` S() agrees bit-for-bit.
+        quant: &QuantizerParams,
+        reduced_tx_set: bool,
     ) -> Result<DecodedBlock, crate::Error> {
         // §5.11.5 prologue — range guards (caller-bug detection).
         if sub_size >= BLOCK_SIZES {
@@ -24646,21 +24694,28 @@ impl PartitionWalker {
         // (`all_zero == 1` for every TU) path the dispatcher returns
         // [`ResidualReadout`] cleanly and the §5.11.5 walker advances
         // past the §5.11.34 call site.
-        // r183 — neutral `ResidualContext` for the §5.11.5 walker's
-        // reachable intra-only path. The §5.11.5 dispatcher's signature
-        // doesn't yet plumb the §5.9.12 `base_q_idx` / segmentation
-        // tables (every fixture in this corpus uses `base_q_idx = 0`
-        // through the `decode_block_syntax_reaches_compute_prediction_
-        // stub_after_intra_mode_info` test rigging, which forces the
-        // §5.11.47 `transform_type` reader into its
-        // `q_for_guard == 0 ⇒ DCT_DCT` short-circuit). The richer
-        // caller-context-aware variant is [`Self::residual`] taking a
-        // caller-supplied [`ResidualContext`].
+        // r286 — `ResidualContext` now carries the caller-threaded
+        // §5.9.12 `quant` + §5.9.21 `reduced_tx_set` so the §5.11.47
+        // `transform_type` reader's `set > 0 && qIdx > 0` guard +
+        // §5.11.48 `get_tx_set()` reduction reflect the real frame
+        // quantiser (the encoder mirror's write side reads the same
+        // pair). With the `base_q_idx == 0` neutral default the guard
+        // is always false and the reader stays on its `DCT_DCT`
+        // short-circuit — the historical behaviour every prior fixture
+        // relied on. `intra_dir` uses the §8.3.2 [`intra_dir`]
+        // derivation (the §5.11.42 `use_filter_intra` →
+        // `Filter_Intra_Mode_To_Intra_Dir` remap) so the
+        // `intra_tx_type` CDF axis agrees with the write side.
         let neutral_ctx = ResidualContext {
-            quant: QuantizerParams::neutral(0, 8),
-            reduced_tx_set: false,
-            intra_dir: y_mode as usize,
-            segment_id: 0,
+            quant: *quant,
+            reduced_tx_set,
+            intra_dir: intra_dir(
+                use_filter_intra == Some(1),
+                y_mode as usize,
+                filter_intra_mode.unwrap_or(0) as usize,
+            )
+            .unwrap_or(0),
+            segment_id: prefix.segment_id,
             seg_qm_level: [15, 15, 15],
             uv_mode: uv_mode.unwrap_or(0),
         };
@@ -26298,6 +26353,13 @@ impl PartitionWalker {
         // [`Self::decode_block_syntax`]'s `inter_ctx` parameter for
         // the contract.
         inter_ctx: Option<&InterFrameContext>,
+        // r286: §5.9.12 quantiser state + §5.9.21 `reduced_tx_set`. See
+        // [`Self::decode_block_syntax`]'s `quant` / `reduced_tx_set`
+        // parameters for the contract — threaded unchanged into every
+        // leaf so the §5.11.47 `transform_type()` guard reflects the
+        // real frame quantiser.
+        quant: &QuantizerParams,
+        reduced_tx_set: bool,
     ) -> Result<(), crate::Error> {
         // §5.11.4 line 1: `if ( r >= MiRows || c >= MiCols ) return 0`.
         if r >= self.mi_rows || c >= self.mi_cols {
@@ -26392,6 +26454,8 @@ impl PartitionWalker {
                     bit_depth,
                     tx_mode_select,
                     inter_ctx,
+                    quant,
+                    reduced_tx_set,
                 )?
             };
         }
@@ -26444,6 +26508,8 @@ impl PartitionWalker {
                     bit_depth,
                     tx_mode_select,
                     inter_ctx,
+                    quant,
+                    reduced_tx_set,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -26476,6 +26542,8 @@ impl PartitionWalker {
                     bit_depth,
                     tx_mode_select,
                     inter_ctx,
+                    quant,
+                    reduced_tx_set,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -26508,6 +26576,8 @@ impl PartitionWalker {
                     bit_depth,
                     tx_mode_select,
                     inter_ctx,
+                    quant,
+                    reduced_tx_set,
                 )?;
                 self.decode_partition_syntax(
                     decoder,
@@ -26540,6 +26610,8 @@ impl PartitionWalker {
                     bit_depth,
                     tx_mode_select,
                     inter_ctx,
+                    quant,
+                    reduced_tx_set,
                 )?;
             }
             PARTITION_HORZ_A => {
@@ -51938,6 +52010,51 @@ mod tests {
             .unwrap();
         // `TX_TYPE_INTRA_INV_SET1[0] = IDTX`.
         assert_eq!(r.tx_type as usize, IDTX);
+    }
+
+    /// r286 — `tx_type_to_symbol` (the §5.11.47 encode-side forward
+    /// map) is the exact inverse of the read-path `Tx_Type_*_Inv_Set*`
+    /// lookup: for every symbol ordinal in every set, mapping the
+    /// inverted `TxType` back yields the same ordinal; a `TxType` not in
+    /// the set returns `None`; `TX_SET_DCTONLY` returns `None`.
+    #[test]
+    fn tx_type_to_symbol_inverts_read_path_tables() {
+        let intra_sets: &[(u32, &[usize])] = &[
+            (TX_SET_INTRA_1, &TX_TYPE_INTRA_INV_SET1),
+            (TX_SET_INTRA_2, &TX_TYPE_INTRA_INV_SET2),
+        ];
+        for &(set, table) in intra_sets {
+            for (sym, &tx_type) in table.iter().enumerate() {
+                assert_eq!(
+                    tx_type_to_symbol(set, false, tx_type),
+                    Some(sym as u32),
+                    "intra set {set} symbol {sym} round-trips"
+                );
+            }
+        }
+        let inter_sets: &[(u32, &[usize])] = &[
+            (TX_SET_INTER_1, &TX_TYPE_INTER_INV_SET1),
+            (TX_SET_INTER_2, &TX_TYPE_INTER_INV_SET2),
+            (TX_SET_INTER_3, &TX_TYPE_INTER_INV_SET3),
+        ];
+        for &(set, table) in inter_sets {
+            for (sym, &tx_type) in table.iter().enumerate() {
+                assert_eq!(
+                    tx_type_to_symbol(set, true, tx_type),
+                    Some(sym as u32),
+                    "inter set {set} symbol {sym} round-trips"
+                );
+            }
+        }
+        // FLIPADST_DCT is in the inter sets but never the intra ones.
+        assert_eq!(tx_type_to_symbol(TX_SET_INTRA_1, false, FLIPADST_DCT), None);
+        assert_eq!(tx_type_to_symbol(TX_SET_INTRA_2, false, FLIPADST_DCT), None);
+        // V_DCT is in TX_SET_INTRA_1 but NOT TX_SET_INTRA_2.
+        assert!(tx_type_to_symbol(TX_SET_INTRA_1, false, V_DCT).is_some());
+        assert_eq!(tx_type_to_symbol(TX_SET_INTRA_2, false, V_DCT), None);
+        // TX_SET_DCTONLY codes no symbol on either path.
+        assert_eq!(tx_type_to_symbol(TX_SET_DCTONLY, false, DCT_DCT), None);
+        assert_eq!(tx_type_to_symbol(TX_SET_DCTONLY, true, DCT_DCT), None);
     }
 
     /// `stamp_tx_type` writes the `TxTypes[][]` grid over a `(w4, h4)`

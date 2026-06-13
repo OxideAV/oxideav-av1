@@ -108,14 +108,14 @@
 use crate::cdf::{
     cfl_allowed_for_uv_mode, compute_tx_type, find_tx_size, get_plane_residual_size, get_tx_size,
     inter_tx_type_set, intra_mode_ctx, intra_tx_type_set, palette_tokens_args, partition_ctx,
-    partition_subsize, segment_id_ctx, size_group, skip_ctx, EncoderBlockSyntaxStamp,
-    MotionFieldMvs, PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4,
-    BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, FRAME_LF_COUNT,
-    GM_TYPE_IDENTITY, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH,
-    MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
-    PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, SPLIT_TX_SIZE, TX_4X4, TX_CLASS_2D,
-    TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED,
-    V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
+    partition_subsize, segment_id_ctx, size_group, skip_ctx, tx_size_sqr_index,
+    EncoderBlockSyntaxStamp, MotionFieldMvs, PalettePlane, PartitionWalker, TileCdfContext,
+    TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED,
+    FRAME_LF_COUNT, GM_TYPE_IDENTITY, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
+    MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH,
+    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, SPLIT_TX_SIZE, TX_4X4,
+    TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH,
+    UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
     write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_intra_frame_else_arm,
@@ -695,6 +695,25 @@ pub struct SyntaxBlock {
     /// `None` when the §5.11.16 var-tx arm fires (the recursion's
     /// last terminal-else `txSz` is the block's `TxSize` there).
     pub tx_size: Option<u8>,
+    /// §5.11.47 per-luma-TU `TxType` commitment (r286) — one §3 `TxType`
+    /// ordinal per §5.11.35 luma (`plane == 0`) `transform_block` the
+    /// §5.11.34 dispatch visits on the `!skip` arm, in dispatch order
+    /// (the SAME visit order + clipping rules as [`Self::residual_quant`],
+    /// but **luma TUs only** — chroma derives its `PlaneTxType` from the
+    /// §5.11.40 `Mode_To_Txfm[UVMode]` / `TxTypes[]` fallback without a
+    /// per-TU symbol). The §5.11.47 write side emits the
+    /// `intra_tx_type` / `inter_tx_type` S() for this `TxType` when the
+    /// `set > 0 && qIdx > 0` guard opens, and stamps it into the
+    /// mirror's `TxTypes[]`. When the guard is closed (the §5.11.48
+    /// `TX_SET_DCTONLY` set, or `base_q_idx == 0`) the committed value
+    /// MUST be `DCT_DCT` — a mismatch is a caller bug
+    /// ([`Error::PartitionWalkOutOfRange`]). The committed `TxType` MUST
+    /// be admissible in the resolved §5.11.48 `set` (the
+    /// `is_tx_type_in_set` predicate) on the guard-open arm. MUST be
+    /// empty when `skip == 1`. Empty also leaves every luma TU at
+    /// `DCT_DCT` (the back-compat default before per-TU tx-type
+    /// commitments existed).
+    pub residual_tx_type: Vec<u8>,
     /// §5.11.17 variable-transform split-decision trees for the
     /// §5.11.16 var-tx arm (`TxMode == TX_MODE_SELECT && MiSize >
     /// BLOCK_4X4 && is_inter && !skip && !Lossless`), one
@@ -756,6 +775,7 @@ impl SyntaxBlock {
             palette: SyntaxPalette::default(),
             residual_quant: Vec::new(),
             tx_size: None,
+            residual_tx_type: Vec::new(),
             var_tx_trees: Vec::new(),
         }
     }
@@ -842,6 +862,22 @@ pub struct SyntaxFrameParams {
     /// [`SyntaxBlock::var_tx_trees`]). With `TX_MODE_SELECT` off the
     /// §5.11.16 call is bit-silent on both sides.
     pub tx_mode_select: bool,
+    /// §5.9.12 per-frame quantiser state — the §7.12.2 `get_qindex`
+    /// driver the §5.11.47 `transform_type()` write side reads for its
+    /// `(segmentation_enabled ? get_qindex(1, segment_id) : base_q_idx)
+    /// > 0` symbol-coding guard (r286). With the `base_q_idx == 0`
+    /// neutral default the guard is always false and the §5.11.47 path
+    /// stays bit-silent (`TxType == DCT_DCT`), matching the prior
+    /// hard-coded behaviour exactly. Threading a non-zero `base_q_idx`
+    /// opens the per-luma-TU `intra_tx_type` / `inter_tx_type` S().
+    pub quant: crate::cdf::QuantizerParams,
+    /// §5.9.21 `reduced_tx_set` — the §5.11.48 `get_tx_set()` reduction
+    /// flag (`reducedTxSet`) the §5.11.47 write side feeds into
+    /// [`crate::cdf::intra_tx_type_set`] / [`crate::cdf::inter_tx_type_set`]
+    /// so the chosen `set` (and therefore the `intra_tx_type` /
+    /// `inter_tx_type` symbol alphabet) agrees with the decode walker.
+    /// Added r286.
+    pub reduced_tx_set: bool,
 }
 
 impl SyntaxFrameParams {
@@ -874,6 +910,8 @@ impl SyntaxFrameParams {
             enable_filter_intra: false,
             bit_depth: 8,
             tx_mode_select: false,
+            quant: crate::cdf::QuantizerParams::neutral(0, 8),
+            reduced_tx_set: false,
         }
     }
 }
@@ -1960,6 +1998,11 @@ fn write_residual(
     let num_planes: u8 = if has_chroma { 3 } else { 1 };
 
     let mut tu_idx = 0usize;
+    // §5.11.47 per-luma-TU `TxType` commitment cursor (r286) — advanced
+    // once per luma (`plane == 0`) `transform_block` the §5.11.34
+    // dispatch visits, independent of the `tu_idx` `residual_quant`
+    // cursor (which counts every plane's TUs).
+    let mut luma_tx_idx = 0usize;
     for chunk_y in 0..height_chunks {
         for chunk_x in 0..width_chunks {
             for plane in 0..num_planes {
@@ -2016,6 +2059,7 @@ fn write_residual(
                         cdfs,
                         state,
                         block,
+                        params,
                         base_x,
                         base_y,
                         (num4x4_w * 4) as u32,
@@ -2025,6 +2069,7 @@ fn write_residual(
                         sub_size,
                         lossless,
                         &mut tu_idx,
+                        &mut luma_tx_idx,
                     )?;
                     continue;
                 }
@@ -2045,6 +2090,7 @@ fn write_residual(
                             cdfs,
                             state,
                             block,
+                            params,
                             plane,
                             base_x_block,
                             base_y_block,
@@ -2059,6 +2105,7 @@ fn write_residual(
                             lossless,
                             is_inter,
                             &mut tu_idx,
+                            &mut luma_tx_idx,
                         )?;
                         x += step_x;
                     }
@@ -2110,6 +2157,7 @@ fn write_transform_block(
     cdfs: &mut TileCdfContext,
     state: &mut PartitionSyntaxWriter,
     block: &SyntaxBlock,
+    params: &SyntaxFrameParams,
     plane: u8,
     base_x: u32,
     base_y: u32,
@@ -2124,6 +2172,7 @@ fn write_transform_block(
     lossless: bool,
     is_inter: bool,
     tu_idx: &mut usize,
+    luma_tx_idx: &mut usize,
 ) -> Result<(), Error> {
     // §5.11.35 lines 1-2 + 10-13.
     let start_x = base_x + 4 * x;
@@ -2139,38 +2188,96 @@ fn write_transform_block(
     let x4 = start_x >> 2;
     let y4 = start_y >> 2;
 
-    // §5.11.47 `transform_type()` mirror — luma only (see fn docs:
-    // bit-silent under the decode walker's neutral quantiser guard;
-    // `TxType = DCT_DCT` stamped over the TU footprint).
-    if plane == 0 {
-        state.mirror.stamp_tx_type(
-            x4,
-            y4,
-            (tx_w >> 2) as u32,
-            (tx_h >> 2) as u32,
-            DCT_DCT as u8,
-        );
-    }
-
-    // §5.11.48 `get_tx_set( txSz )` for the §5.11.40 admission filter
-    // (intra arm — `reduced_tx_set = false` on the neutral context).
-    let tx_sz_sqr = {
-        let side = core::cmp::min(tx_w, tx_h);
-        (side.trailing_zeros() as usize) - 2
-    };
+    // §5.11.48 `get_tx_set( txSz )` — the per-set transform-type
+    // alphabet. `reduced_tx_set` now flows from the frame params
+    // (r286), matching the decode walker's `ctx.reduced_tx_set` exactly.
+    let tx_sz_sqr = tx_size_sqr_index(tx_sz);
     let tx_set = if is_inter {
         inter_tx_type_set(
             tx_sz_sqr as u32,
             TX_SIZE_SQR_UP[tx_sz] as u32,
-            /* reduced_tx_set = */ false,
+            params.reduced_tx_set,
         )
     } else {
         intra_tx_type_set(
             tx_sz_sqr as u32,
             TX_SIZE_SQR_UP[tx_sz] as u32,
-            /* reduced_tx_set = */ false,
+            params.reduced_tx_set,
         )
     };
+
+    // §5.11.47 `transform_type()` write side — luma only (r286). The
+    // decode walker invokes its `transform_type()` reader on every luma
+    // (`plane == 0`) `!skip` TU; the §5.11.47 `set > 0 &&
+    // (segmentation_enabled ? get_qindex(1, segment_id) : base_q_idx) >
+    // 0` guard decides whether an `intra_tx_type` / `inter_tx_type` S()
+    // is coded. When closed the stamp is `DCT_DCT` (no symbol); when
+    // open we emit the symbol for the caller-committed `TxType` and
+    // stamp it. Both sides then stamp the TU's 4×4 footprint into the
+    // `TxTypes[]` grid, so the §5.11.40 `compute_tx_type` derivation
+    // below (and on the decode side) reads the same value.
+    if plane == 0 {
+        // §5.11.47 `(segmentation_enabled ? get_qindex(1, segment_id) :
+        // base_q_idx) > 0` guard (`ignoreDeltaQ = 1` in the §7.12.2
+        // lookup — delta-q is intentionally ignored here).
+        let q_for_guard = if params.quant.segmentation_enabled {
+            crate::cdf::get_qindex(&params.quant, true, block.segment_id)
+        } else {
+            params.quant.base_q_idx as i32
+        };
+        let codes_symbol = tx_set > 0 && q_for_guard > 0;
+
+        // Caller-committed `TxType` for this luma TU (in §5.11.34
+        // dispatch order). When the commitment vector is exhausted /
+        // empty the value defaults to `DCT_DCT` (back-compat).
+        let committed = block
+            .residual_tx_type
+            .get(*luma_tx_idx)
+            .copied()
+            .unwrap_or(DCT_DCT as u8);
+        *luma_tx_idx += 1;
+
+        let tx_type: u8 = if codes_symbol {
+            // §8.3.2 `intra_dir` axis for the `intra_tx_type` CDF (the
+            // §5.11.42 `use_filter_intra` → `Filter_Intra_Mode_To_Intra_Dir`
+            // remap; unused on the inter path).
+            let intra_dir = crate::cdf::intra_dir(
+                block.use_filter_intra == 1,
+                block.y_mode as usize,
+                block.filter_intra_mode.unwrap_or(0) as usize,
+            )
+            .unwrap_or(0);
+            // §5.11.47 forward symbol map — the inverse of the read
+            // path's `Tx_Type_*_Inv_Set*[ symbol ]` lookup. A committed
+            // `TxType` not admissible in `set` is a caller bug.
+            let symbol = crate::cdf::tx_type_to_symbol(tx_set, is_inter, committed as usize)
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+            if is_inter {
+                let cdf = cdfs
+                    .inter_tx_type_cdf(tx_set, tx_sz_sqr as u32)
+                    .ok_or(Error::PartitionWalkOutOfRange)?;
+                writer.write_symbol(symbol, cdf)?;
+            } else {
+                let cdf = cdfs
+                    .intra_tx_type_cdf(tx_set, tx_sz_sqr as u32, intra_dir)
+                    .ok_or(Error::PartitionWalkOutOfRange)?;
+                writer.write_symbol(symbol, cdf)?;
+            }
+            committed
+        } else {
+            // Guard closed: no S(), `TxType == DCT_DCT`. A non-DCT_DCT
+            // commitment here is a caller bug (the decode walker would
+            // read `DCT_DCT` regardless).
+            if committed != DCT_DCT as u8 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            DCT_DCT as u8
+        };
+
+        state
+            .mirror
+            .stamp_tx_type(x4, y4, (tx_w >> 2) as u32, (tx_h >> 2) as u32, tx_type);
+    }
 
     // §5.11.40 `compute_tx_type( plane, txSz, x4, y4 )` against the
     // mirror's `TxTypes[]` grid — same closure shape as the decode
@@ -2285,6 +2392,7 @@ fn write_transform_tree(
     cdfs: &mut TileCdfContext,
     state: &mut PartitionSyntaxWriter,
     block: &SyntaxBlock,
+    params: &SyntaxFrameParams,
     start_x: u32,
     start_y: u32,
     w: u32,
@@ -2294,6 +2402,7 @@ fn write_transform_tree(
     mi_size: usize,
     lossless: bool,
     tu_idx: &mut usize,
+    luma_tx_idx: &mut usize,
 ) -> Result<(), Error> {
     // §5.11.36 lines 1-3: frame-extent early return.
     let max_x = state.mi_cols * (MI_SIZE as u32);
@@ -2317,10 +2426,26 @@ fn write_transform_tree(
         let tx_sz =
             find_tx_size(w as usize, h as usize).ok_or(Error::ResidualTransformTreeUnsupported)?;
         return write_transform_block(
-            writer, cdfs, state, block, /* plane = */ 0, /* base_x = */ start_x,
-            /* base_y = */ start_y, tx_sz, /* x = */ 0, /* y = */ 0,
-            /* sub_x = */ 0, /* sub_y = */ 0, mi_row, mi_col, mi_size, lossless,
-            /* is_inter = */ true, tu_idx,
+            writer,
+            cdfs,
+            state,
+            block,
+            params,
+            /* plane = */ 0,
+            /* base_x = */ start_x,
+            /* base_y = */ start_y,
+            tx_sz,
+            /* x = */ 0,
+            /* y = */ 0,
+            /* sub_x = */ 0,
+            /* sub_y = */ 0,
+            mi_row,
+            mi_col,
+            mi_size,
+            lossless,
+            /* is_inter = */ true,
+            tu_idx,
+            luma_tx_idx,
         );
     }
     // §5.11.36 lines 12-25: per-direction halving recursion (the same
@@ -2340,6 +2465,7 @@ fn write_transform_tree(
             cdfs,
             state,
             block,
+            params,
             start_x + ox * (w / 2),
             start_y + oy * (h / 2),
             sub_w,
@@ -2349,6 +2475,7 @@ fn write_transform_tree(
             mi_size,
             lossless,
             tu_idx,
+            luma_tx_idx,
         )?;
     }
     Ok(())
@@ -3131,6 +3258,8 @@ mod tests {
                 params.bit_depth,
                 params.tx_mode_select,
                 /* inter_ctx = */ None,
+                &params.quant,
+                params.reduced_tx_set,
             )
             .expect("decode_partition_syntax must consume the full tree");
 
@@ -4407,5 +4536,195 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::PartitionWalkOutOfRange));
+    }
+
+    /// r286 — §5.11.47 `transform_type` write side with a non-zero
+    /// `base_q_idx`: a single BLOCK_8X8 4:4:4 leaf whose TX_8X8 luma TU
+    /// commits `ADST_ADST`. With `base_q_idx > 0` the §5.11.47 `set > 0
+    /// && qIdx > 0` guard opens, so the encoder emits an `intra_tx_type`
+    /// S() (TX_8X8 intra → `TX_SET_INTRA_1`, 7 symbols) and the decoder
+    /// reads it back, stamping the same `ADST_ADST` over the luma TU's
+    /// `TxTypes[]` footprint. The `syntax_round_trip` `TxTypes parity`
+    /// assertion + sentinel sync pin the write↔read lockstep.
+    #[test]
+    fn r286_syntax_round_trip_transform_type_intra_8x8_adst() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.quant.base_q_idx = 64;
+        params.quant.current_q_index = 64;
+
+        let mut leaf = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf.skip = 0;
+        // One luma TX_8X8 TU + two chroma TX_8X8 TUs (4:4:4).
+        leaf.residual_quant = vec![
+            quant_with(64, &[(0, 5), (1, -2), (8, 1)]),
+            quant_with(64, &[(0, -3)]),
+            quant_with(64, &[(0, 4), (2, 1)]),
+        ];
+        // §5.11.47 luma-only `TxType` commitment — ADST_ADST is in
+        // `Tx_Type_Intra_Inv_Set1`.
+        leaf.residual_tx_type = vec![crate::cdf::ADST_ADST as u8];
+
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, walker) = syntax_round_trip(&node, 2, 2, BLOCK_8X8, &params, 0xD5);
+        // The decoded `TxTypes[]` carries ADST_ADST over the luma TU's
+        // 2×2 (8×8 ⇒ 2 mi) footprint.
+        assert!(
+            walker
+                .tx_types()
+                .iter()
+                .all(|&t| t as usize == crate::cdf::ADST_ADST),
+            "decoded TxTypes[] = ADST_ADST over the 8×8 luma footprint"
+        );
+    }
+
+    /// r286 — §5.11.47 mixed-set fan-out: a BLOCK_16X16 leaf under
+    /// `TX_MODE_SELECT` committed to TX_8X8 luma TUs (four of them) with
+    /// distinct per-TU `TxType`s drawn from `TX_SET_INTRA_1`. Each
+    /// luma TU codes its own `intra_tx_type` S(); the
+    /// CDF adapts across the four reads on both sides, and the
+    /// `TxTypes parity` assertion checks every TU stamped the committed
+    /// value. The `V_PRED` Y-mode exercises a non-`DC_PRED` §8.3.2
+    /// `intra_dir` CDF axis.
+    #[test]
+    fn r286_syntax_round_trip_transform_type_per_tu_fanout() {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.tx_mode_select = true;
+        params.quant.base_q_idx = 110;
+        params.quant.current_q_index = 110;
+
+        let mut leaf = SyntaxBlock::skip_leaf(V_PRED as u8, Some(DC_PRED as u8));
+        leaf.skip = 0;
+        leaf.tx_size = Some(TX_8X8 as u8); // tx_depth = 1: 16×16 → four TX_8X8
+        leaf.residual_quant = vec![
+            // Y: four TX_8X8 TUs.
+            quant_with(64, &[(0, 3), (1, 1)]),
+            quant_with(64, &[(0, -2)]),
+            quant_with(64, &[(0, 1), (8, 2)]),
+            quant_with(64, &[(2, -1)]),
+            // U / V: one TX_16X16 each (TX_SET routing differs but no
+            // luma S()).
+            quant_with(256, &[(0, -4)]),
+            quant_with(256, &[(0, 6)]),
+        ];
+        // Four luma `TxType`s, all admissible in `TX_SET_INTRA_1`.
+        leaf.residual_tx_type = vec![
+            crate::cdf::ADST_DCT as u8,
+            crate::cdf::DCT_ADST as u8,
+            crate::cdf::ADST_ADST as u8,
+            DCT_DCT as u8,
+        ];
+
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let (_enc, _walker) = syntax_round_trip(&node, 4, 4, BLOCK_16X16, &params, 0x9E);
+    }
+
+    /// r286 — §5.11.47 guard-closed paths stay bit-silent: (a)
+    /// `base_q_idx == 0` (neutral default) forces every luma TU to
+    /// `DCT_DCT` with no symbol; (b) a TX_32X32 luma TU routes to
+    /// `TX_SET_DCTONLY` (`set == 0`) so no `intra_tx_type` symbol is
+    /// coded even with `base_q_idx > 0`. An empty `residual_tx_type`
+    /// leaves every luma TU at the `DCT_DCT` default.
+    #[test]
+    fn r286_syntax_round_trip_transform_type_dctonly_silent_paths() {
+        // (a) base_q_idx = 0 — guard closed regardless of commitment.
+        let params0 = SyntaxFrameParams::intra_8bit_baseline();
+        let mut leaf0 = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf0.skip = 0;
+        leaf0.residual_quant = vec![quant_with(256, &[(0, 2)]); 3];
+        // Empty commitment ⇒ DCT_DCT default; bit-silent.
+        let node0 = SyntaxNode::Leaf(Box::new(leaf0));
+        let (_e0, w0) = syntax_round_trip(&node0, 4, 4, BLOCK_16X16, &params0, 0x11);
+        assert!(
+            w0.tx_types().iter().all(|&t| t as usize == DCT_DCT),
+            "base_q_idx = 0 ⇒ TxTypes[] all DCT_DCT"
+        );
+
+        // (b) base_q_idx > 0 but TX_32X32 luma ⇒ TX_SET_DCTONLY (set ==
+        // 0): the §5.11.48 reduction short-circuits the symbol. A
+        // BLOCK_32X32 leaf with the default TxSize is one TX_32X32 luma
+        // TU.
+        let mut params1 = SyntaxFrameParams::intra_8bit_baseline();
+        params1.quant.base_q_idx = 200;
+        params1.quant.current_q_index = 200;
+        let mut leaf1 = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        leaf1.skip = 0;
+        leaf1.residual_quant = vec![
+            quant_with(1024, &[(0, 3)]),
+            quant_with(1024, &[(0, -1)]),
+            quant_with(1024, &[(0, 2)]),
+        ];
+        // Commitment MUST be DCT_DCT on the DCTONLY path (a non-DCT_DCT
+        // value here is a caller bug — exercised in the reject battery).
+        leaf1.residual_tx_type = vec![DCT_DCT as u8];
+        let node1 = SyntaxNode::Leaf(Box::new(leaf1));
+        let (_e1, w1) = syntax_round_trip(&node1, 8, 8, BLOCK_32X32, &params1, 0x22);
+        assert!(
+            w1.tx_types().iter().all(|&t| t as usize == DCT_DCT),
+            "TX_32X32 ⇒ TX_SET_DCTONLY ⇒ TxTypes[] all DCT_DCT"
+        );
+    }
+
+    /// r286 — §5.11.47 write-side caller-bug battery: a non-`DCT_DCT`
+    /// `TxType` committed on a guard-closed (`TX_SET_DCTONLY`) luma TU,
+    /// and a `TxType` not admissible in the resolved `set`, both reject
+    /// with [`Error::PartitionWalkOutOfRange`] before any bit is
+    /// committed past the point of detection.
+    #[test]
+    fn r286_transform_type_scope_rejects() {
+        // (1) Guard closed (TX_32X32 ⇒ DCTONLY) but commitment is
+        // non-DCT_DCT.
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.quant.base_q_idx = 200;
+        params.quant.current_q_index = 200;
+        let mut writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut state = PartitionSyntaxWriter::new(8, 8, single_tile(8, 8)).unwrap();
+        let mut block = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block.skip = 0;
+        block.residual_quant = vec![
+            quant_with(1024, &[(0, 3)]),
+            quant_with(1024, &[(0, -1)]),
+            quant_with(1024, &[(0, 2)]),
+        ];
+        block.residual_tx_type = vec![crate::cdf::ADST_ADST as u8];
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_32X32,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (2) Guard open (TX_8X8, base_q_idx > 0) but the committed
+        // `TxType` is V_DCT — admissible in `TX_SET_INTRA_1`, so swap to
+        // a value that ISN'T in any intra set: `FLIPADST_DCT` only
+        // appears in the inter sets, never the intra ones.
+        let mut params2 = SyntaxFrameParams::intra_8bit_baseline();
+        params2.quant.base_q_idx = 64;
+        params2.quant.current_q_index = 64;
+        let mut writer2 = SymbolWriter::new(false);
+        let mut cdfs2 = TileCdfContext::new_from_defaults();
+        let mut state2 = PartitionSyntaxWriter::new(2, 2, single_tile(2, 2)).unwrap();
+        let mut block2 = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block2.skip = 0;
+        block2.residual_quant = vec![quant_with(64, &[(0, 1)]); 3];
+        block2.residual_tx_type = vec![crate::cdf::FLIPADST_DCT as u8];
+        let err2 = super::write_block_syntax(
+            &mut writer2,
+            &mut cdfs2,
+            &mut state2,
+            &block2,
+            0,
+            0,
+            BLOCK_8X8,
+            &params2,
+        )
+        .unwrap_err();
+        assert!(matches!(err2, Error::PartitionWalkOutOfRange));
     }
 }

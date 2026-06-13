@@ -4,6 +4,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder+decoder r286 (2026-06-13): land the §5.11.47
+  `transform_type()` write side, replacing the prior hard-coded
+  `DCT_DCT` stamp in `write_transform_block` with the real per-luma-TU
+  `intra_tx_type` / `inter_tx_type` S(), threaded through the §5.9.12
+  quantizer state, in decode-walker lockstep. `SyntaxFrameParams` grows
+  `quant: QuantizerParams` (§5.9.12) + `reduced_tx_set` (§5.9.21);
+  `SyntaxBlock` grows `residual_tx_type: Vec<u8>` — one §3 `TxType`
+  ordinal per luma `transform_block` the §5.11.34 dispatch visits on the
+  `!skip` arm (chroma derives via the §5.11.40 `Mode_To_Txfm[UVMode]` /
+  `TxTypes[]` fallback, no per-TU symbol). The write side computes the
+  §5.11.48 `get_tx_set()` (now `reduced_tx_set`-aware), evaluates the
+  §5.11.47 `set > 0 && (segmentation_enabled ? get_qindex(1,
+  segment_id) : base_q_idx) > 0` guard, and on the open arm maps the
+  committed `TxType` to its per-set symbol via the new
+  `tx_type_to_symbol()` (the inverse of the read path's
+  `Tx_Type_*_Inv_Set*` tables) and emits it on the §8.3.2
+  `intra_dir`-keyed CDF, stamping the value into the mirror's
+  `TxTypes[]`. Guard-closed paths (`base_q_idx == 0` neutral default,
+  `TX_SET_DCTONLY`) stay bit-silent at `DCT_DCT` exactly as before. The
+  decode walker's `decode_block_syntax` / `decode_partition_syntax` now
+  thread the same `quant` / `reduced_tx_set` into the §5.11.34
+  `ResidualContext` (replacing the hard-coded neutral `base_q_idx = 0`),
+  with `intra_dir` from the §8.3.2 `intra_dir()` derivation and
+  `segment_id` from the decoded prefix, so the per-TU `transform_type()`
+  read agrees bit-for-bit. New round-trips: BLOCK_8X8 intra TX_8X8
+  `ADST_ADST` (`base_q_idx = 64`, `TX_SET_INTRA_1`), the BLOCK_16X16
+  `tx_depth = 1` four-TU mixed-`TxType` fan-out with CDF adaptation
+  across reads (`base_q_idx = 110`, `V_PRED` intra-dir axis), the two
+  guard-closed silent paths (neutral + TX_32X32 DCTONLY), a
+  forward/inverse `tx_type_to_symbol` exhaustive table test, and a
+  write-side caller-bug battery (non-`DCT_DCT` on a DCTONLY TU; a
+  `TxType` outside the resolved set). Library tests 1948 → 1953.
+
 - encoder r285 (2026-06-12): thread the §5.11.15 / §5.11.16 /
   §5.11.17 transform-size write side into `write_block_syntax` —
   `TxMode == TX_MODE_SELECT` (previously rejected wholesale by the
