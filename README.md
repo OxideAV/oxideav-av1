@@ -2,6 +2,46 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 293)
+
+Round 293 **drives single-reference translational inter reconstruction
+across the whole decoded mode-info grid** — the r292 follow-up. Where
+r292 reconstructed *one* block from a mode-info descriptor, this round
+implements the §5.11.33 `predict()` body (av1-spec p.82-83, lines
+5127-5191) restricted to the SIMPLE single-forward-reference arm: a
+loop that drives `reconstruct_inter_block` over every decoded inter
+leaf in a frame.
+
+New `reconstruct_inter_frame` walks the persisted `PartitionWalker`
+grids — surfaced as `InterModeInfoGrid { mi_sizes, is_inters,
+ref_frames, mvs, interp_filters, … }` — plus a slice of
+`PlaneReconContext` reconstruction targets (one per plane, each its own
+`CurrFrame[plane]` buffer + `FrameStore`). For each grid cell:
+
+* **Leaf-origin detection.** The §5.11.5 walker stamps each leaf's
+  `MiSize` over its whole `bh4 × bw4` footprint, so in row-major order
+  the top-left of any rectangle is the first not-yet-consumed cell
+  reached; the walk marks each footprint consumed on first sight and
+  processes a cell only once.
+* **Per-plane prediction.** On the inter, single-ref arm
+  (`RefFrame[1] == NONE`) it runs one `predict_inter` per plane with
+  `baseX = (MiCol >> subX) * MI_SIZE`, `baseY = (MiRow >> subY) *
+  MI_SIZE`, `predW = Block_Width[MiSize] >> subX`, `predH =
+  Block_Height[MiSize] >> subY` (lines 5135-5136 / 5166-5167) — the
+  reduced form, since on this arm `someUseIntra` / `IsInterIntra` are
+  both false.
+* **Skips.** Intra (`IsInters == 0`), compound (`RefFrame[1] >=
+  LAST_FRAME`) and inter-intra (`RefFrame[1] == INTRA_FRAME`) leaves
+  are left untouched for a later driver.
+
++2 lib tests (1974 → 1976): a 2×4 mixed-leaf grid (BLOCK_4X4 inter,
+BLOCK_4X4 intra, a four-cell BLOCK_8X8 inter, plus skipped
+intra/compound leaves) whose reconstructed `CurrFrame[0]` is
+cross-checked byte-for-byte against direct `reconstruct_inter_block`
+calls, with every skipped-leaf region asserted still the sentinel; plus
+a caller-bug matrix (each grid slice too short, out-of-range `MiSize`)
+each surfacing `PartitionWalkOutOfRange`.
+
 ## Status — 2026-06-14 (round 292)
 
 Round 292 **wires a single forward-reference translational inter block

@@ -4,6 +4,32 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r293 (2026-06-14): drive single-reference translational
+  inter reconstruction across the whole decoded mode-info grid — the
+  §5.11.33 `predict()` body (av1-spec p.82-83, lines 5127-5191)
+  restricted to the SIMPLE single-forward-reference arm. New
+  `reconstruct_inter_frame` walker + `InterModeInfoGrid` /
+  `PlaneReconContext` types iterate the persisted `PartitionWalker`
+  grids (`MiSizes[]` / `IsInters[]` / `RefFrames[][][0..2]` /
+  `Mvs[][][0..2][0..2]` / `InterpFilters[][][0..2]`), detect each
+  leaf's origin (the first not-yet-consumed cell of its stamped
+  rectangle in row-major order), and for every inter leaf whose
+  `RefFrame[1] == NONE` run the per-plane prediction loop —
+  `baseX = (MiCol >> subX) * MI_SIZE`, `baseY = (MiRow >> subY) *
+  MI_SIZE`, `predW = Block_Width[MiSize] >> subX`,
+  `predH = Block_Height[MiSize] >> subY` (lines 5135-5136 / 5166-5167)
+  — into the supplied `CurrFrame[plane]` buffers via
+  `reconstruct_inter_block`. Intra (`IsInters == 0`), compound
+  (`RefFrame[1] >= LAST_FRAME`) and inter-intra (`RefFrame[1] ==
+  INTRA_FRAME`) leaves are skipped, leaving their regions for a later
+  driver. +2 lib tests (1974 → 1976): a 2×4 mixed-leaf grid
+  (BLOCK_4X4 inter, BLOCK_4X4 intra, BLOCK_8X8 inter spanning four
+  cells, plus skipped intra/compound leaves) cross-checked
+  byte-for-byte against direct `reconstruct_inter_block` calls with
+  every skipped region asserted still the sentinel, plus a caller-bug
+  matrix (each grid slice too short, out-of-range `MiSize`) each
+  surfacing `PartitionWalkOutOfRange`.
+
 - decoder r292 (2026-06-14): wire a single forward-reference
   translational inter block from decoded mode-info into a reconstructed
   `CurrFrame` plane (the r291 follow-up). New `reconstruct_inter_block`

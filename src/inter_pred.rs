@@ -4652,6 +4652,288 @@ pub fn reconstruct_inter_block(
     Ok(())
 }
 
+// =====================================================================
+// r293 §5.11.33 predict() / §7.11.3 frame-level inter reconstruction
+// =====================================================================
+//
+// `reconstruct_inter_block` (above) closes the per-block arc: one
+// decoded `(RefFrame[0], Mvs[..][0])` pair through `predict_inter`
+// into one `CurrFrame[plane]` write region. The §5.11.33 `predict()`
+// body (av1-spec p.82-83, lines 5127-5191) is the loop that drives
+// that arithmetic across the whole decoded mode-info grid: for every
+// decoded leaf block it iterates the planes and, on the inter arm,
+// runs `predict_inter` for each prediction sub-block.
+//
+//   for ( plane = 0; plane < 1 + HasChroma * 2; plane++ ) {
+//       ...
+//       baseX = (MiCol >> subX) * MI_SIZE
+//       baseY = (MiRow >> subY) * MI_SIZE
+//       if ( is_inter ) {
+//           predW = Block_Width[ MiSize ] >> subX
+//           predH = Block_Height[ MiSize ] >> subY
+//           ...                                  // someUseIntra arm
+//           for ( y = 0; y < num4x4H * 4; y += predH )
+//               for ( x = 0; x < num4x4W * 4; x += predW )
+//                   predict_inter( plane, baseX + x, baseY + y,
+//                                  predW, predH, candRow + r, candCol + c )
+//       }
+//   }
+//
+// `reconstruct_inter_frame` walks the persisted mode-info grids the
+// §5.11.5 decode walker stamps (`MiSizes[]` / `IsInters[]` /
+// `RefFrames[][][0]` / `Mvs[][][0]` / `InterpFilters[][][0..2]`,
+// exposed via the `PartitionWalker` accessors) and, for every inter
+// leaf whose `RefFrame[1] == NONE` (single forward reference, the
+// SIMPLE translational arm), runs the §5.11.33 per-plane `predict_inter`
+// loop into the supplied `CurrFrame[plane]` buffers via
+// `reconstruct_inter_block`.
+//
+// Scope (single-ref translational SIMPLE arm only — the same arm
+// `reconstruct_inter_block` / `predict_inter` already cover):
+//   * `RefFrame[1] == NONE` (no compound second reference); a
+//     compound leaf (`RefFrame[1] >= LAST_FRAME`) is skipped, leaving
+//     its CurrFrame region untouched for a later compound driver.
+//   * `RefFrame[1] == INTRA_FRAME` (inter-intra) is likewise skipped.
+//   * Intra leaves (`IsInters[origin] == 0`) are skipped — they are
+//     the §7.11.2 intra-reconstruction arm's responsibility.
+// On the single-ref arm `IsInterIntra` is false and `someUseIntra`
+// is false (a single inter reference is never `INTRA_FRAME`), so the
+// §5.11.33 inner loop reduces to one `predict_inter` per plane with
+// `predW = Block_Width[MiSize] >> subX`, `predH = Block_Height[MiSize]
+// >> subY` and the block origin `(baseX, baseY)` — exactly the
+// `reconstruct_inter_block` write region.
+
+/// §7.11.3 per-plane `CurrFrame[plane]` reconstruction target — one
+/// plane's output buffer plus the §7.11.3.3 reference-frame store the
+/// [`reconstruct_inter_frame`] walk resolves `RefFrame[0]` against for
+/// this plane.
+///
+/// Every field is the per-plane resolution of a §7.11.3 quantity (the
+/// caller applies the `>> subsampling_*` plane down-shift the same way
+/// [`PredictInterRef`] / [`RefFrameStoreEntry`] document): the
+/// `frame_store` planes, the `curr` buffer, and `(frame_width,
+/// frame_height)` are all in this plane's sample units.
+#[derive(Debug)]
+pub struct PlaneReconContext<'a> {
+    /// `0` (Y), `1` (Cb), `2` (Cr).
+    pub plane: u8,
+    /// §6.4.2 `subsampling_x` for this plane's chroma down-shift
+    /// (`0` for plane `0`, the sequence value for `1` / `2`).
+    pub subsampling_x: u8,
+    /// §6.4.2 `subsampling_y`.
+    pub subsampling_y: u8,
+    /// This plane's §7.11.3.3 `FrameStore` slice (indexed by the
+    /// resolved `refIdx`); per-plane resolved like
+    /// [`RefFrameStoreEntry`].
+    pub frame_store: &'a [RefFrameStoreEntry<'a>],
+    /// §7.11.3 `FrameWidth` resolved to this plane (samples).
+    pub frame_width: u32,
+    /// §7.11.3 `FrameHeight` resolved to this plane (samples).
+    pub frame_height: u32,
+    /// `CurrFrame[plane]` output buffer (row-major, `curr_stride`
+    /// columns), large enough for `frame_height` rows.
+    pub curr: &'a mut [u16],
+    /// Column stride of `curr` (`>= frame_width`).
+    pub curr_stride: usize,
+}
+
+/// §7.11.3 decoded mode-info grid view — the persisted
+/// `PartitionWalker` grids [`reconstruct_inter_frame`] walks. Each
+/// slice is row-major over the `mi_rows × mi_cols` mode-info grid; the
+/// per-cell layout matches the `PartitionWalker` accessors
+/// (`MiSizes[]` one `usize` per cell; `IsInters[]` one `u8`;
+/// `RefFrames[][][0..2]` and `Mvs[][][0..2][0..2]` two slots per cell;
+/// `InterpFilters[][][0..2]` two slots per cell).
+#[derive(Debug)]
+pub struct InterModeInfoGrid<'a> {
+    /// `MiSizes[ r ][ c ]` — `mi_sizes()[ r * mi_cols + c ]`.
+    pub mi_sizes: &'a [usize],
+    /// `IsInters[ r ][ c ]` — `is_inters()[ r * mi_cols + c ]`.
+    pub is_inters: &'a [u8],
+    /// `RefFrames[ r ][ c ][ slot ]` — `ref_frames()[ (r * mi_cols +
+    /// c) * 2 + slot ]`.
+    pub ref_frames: &'a [i8],
+    /// `Mvs[ r ][ c ][ list ][ comp ]` — `mvs()[ ((r * mi_cols + c) *
+    /// 2 + list) * 2 + comp ]`.
+    pub mvs: &'a [i16],
+    /// `InterpFilters[ r ][ c ][ dir ]` — `interp_filters()[ (r *
+    /// mi_cols + c) * 2 + dir ]`.
+    pub interp_filters: &'a [u8],
+    /// `MiRows`.
+    pub mi_rows: u32,
+    /// `MiCols`.
+    pub mi_cols: u32,
+    /// §7.11.3 `BitDepth`.
+    pub bit_depth: u8,
+}
+
+/// §5.11.33 `predict()` frame-level inter reconstruction — walks the
+/// decoded mode-info grid and reconstructs every single-reference
+/// translational inter leaf into its `CurrFrame[plane]` buffers.
+///
+/// This is the §5.11.33 `predict()` body (av1-spec p.82-83, lines
+/// 5127-5191) restricted to the SIMPLE single-forward-reference
+/// translational arm: for each decoded leaf block (top-left of its
+/// `MiSize` footprint) whose `IsInters == 1` and `RefFrame[1] == NONE`,
+/// it iterates the supplied planes and runs the §7.11.3 per-plane
+/// prediction (one `predict_inter` per plane, since on this arm
+/// `someUseIntra` / `IsInterIntra` are both false) via
+/// [`reconstruct_inter_block`]:
+///
+///   * `baseX = (MiCol >> subX) * MI_SIZE`,
+///     `baseY = (MiRow >> subY) * MI_SIZE` (the plane-space block
+///     origin, av1-spec lines 5135-5136).
+///   * `predW = Block_Width[MiSize] >> subX`,
+///     `predH = Block_Height[MiSize] >> subY` (lines 5166-5167) — the
+///     write region size.
+///
+/// **Leaf detection.** The §5.11.5 walker stamps each leaf's `MiSize`
+/// over its whole `bh4 × bw4` footprint, so a block origin is the
+/// top-left cell of its rectangle. Walking the grid row-major, the
+/// top-left of any rectangle is the first not-yet-consumed cell of
+/// that rectangle reached — so this walk marks each leaf's footprint
+/// consumed on first sight and processes a cell only the once. Cells
+/// carrying [`crate::cdf::BLOCK_INVALID`] (no leaf covered them) are
+/// skipped.
+///
+/// **Scope / skips (untouched CurrFrame regions, for a later driver):**
+///   * intra leaves (`IsInters == 0`);
+///   * compound leaves (`RefFrame[1] >= LAST_FRAME`);
+///   * inter-intra leaves (`RefFrame[1] == INTRA_FRAME`).
+///
+/// The §7.11.3.1 horizontal / vertical interpolation filters are read
+/// per leaf from `InterpFilters[origin][0..2]` (the §5.11.x decoded
+/// `interp_filter[dir]` the walker stamped).
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] if a grid slice
+/// is too short for `mi_rows * mi_cols`, if a leaf carries an
+/// out-of-range `MiSize`, or for anything [`reconstruct_inter_block`]
+/// itself rejects (out-of-range `ref_frame` / resolved `refIdx`, a
+/// `CurrFrame` plane too small for the write region, …).
+pub fn reconstruct_inter_frame(
+    grid: &InterModeInfoGrid<'_>,
+    ref_frame_idx: &[u8],
+    planes: &mut [PlaneReconContext<'_>],
+) -> Result<(), crate::Error> {
+    let mi_rows = grid.mi_rows as usize;
+    let mi_cols = grid.mi_cols as usize;
+    let cells = mi_rows
+        .checked_mul(mi_cols)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+
+    // Grid-slice length guards: every accessor below indexes within
+    // `cells` (×2 / ×4 for the multi-slot grids), so a short slice is
+    // a caller bug.
+    if grid.mi_sizes.len() < cells
+        || grid.is_inters.len() < cells
+        || grid.ref_frames.len() < cells * 2
+        || grid.mvs.len() < cells * 4
+        || grid.interp_filters.len() < cells * 2
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.5 leaf-origin detection: a leaf's `MiSize` is stamped over
+    // its whole rectangle, so in row-major order the first unconsumed
+    // cell of any rectangle is its top-left. `consumed[cell]` marks
+    // cells already claimed by a processed leaf.
+    let mut consumed = vec![false; cells];
+
+    for mi_row in 0..mi_rows {
+        for mi_col in 0..mi_cols {
+            let origin = mi_row * mi_cols + mi_col;
+            if consumed[origin] {
+                continue;
+            }
+            let mi_size = grid.mi_sizes[origin];
+            if mi_size == crate::cdf::BLOCK_INVALID {
+                // No leaf covered this cell; nothing to consume. (A
+                // BLOCK_INVALID hole is a single cell — a real leaf
+                // always has a valid MiSize at its origin.)
+                continue;
+            }
+            if mi_size >= crate::cdf::BLOCK_SIZES {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            let bw4 = crate::cdf::num_4x4_blocks_wide(mi_size);
+            let bh4 = crate::cdf::num_4x4_blocks_high(mi_size);
+
+            // Claim the whole `bh4 × bw4` footprint (clipped to the
+            // grid extent, exactly like the §5.11.5 grid-fill loops),
+            // so its non-origin cells are not re-processed.
+            for dr in 0..bh4 {
+                let rr = mi_row + dr;
+                if rr >= mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col + dc;
+                    if cc >= mi_cols {
+                        break;
+                    }
+                    consumed[rr * mi_cols + cc] = true;
+                }
+            }
+
+            // --- §5.11.33 leaf gating: inter, single forward ref. ---
+            if grid.is_inters[origin] == 0 {
+                continue; // intra leaf — §7.11.2 arm's responsibility.
+            }
+            let ref_frame0 = grid.ref_frames[origin * 2];
+            let ref_frame1 = grid.ref_frames[origin * 2 + 1];
+            // `RefFrame[1] == NONE` (the `-1` sentinel the §5.11.18
+            // grid pre-fill stamps into slot 1) is the single-reference
+            // arm. Any other value is compound (`>= LAST_FRAME`) or
+            // inter-intra (`INTRA_FRAME == 0`) — out of this driver's
+            // scope, leave the region untouched.
+            const NONE_REF_FRAME: i8 = -1;
+            if ref_frame1 != NONE_REF_FRAME {
+                continue;
+            }
+
+            let mode_info = InterModeInfo {
+                ref_frame: ref_frame0 as u8,
+                mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
+            };
+            let interp_x = grid.interp_filters[origin * 2];
+            let interp_y = grid.interp_filters[origin * 2 + 1];
+
+            // --- §5.11.33 per-plane predict_inter loop. ---
+            for ctx in planes.iter_mut() {
+                let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
+                let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
+                // av1-spec lines 5135-5136 / 5166-5167.
+                let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+                let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+                let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
+                let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+
+                reconstruct_inter_block(
+                    mode_info,
+                    ref_frame_idx,
+                    ctx.frame_store,
+                    ctx.plane,
+                    base_x,
+                    base_y,
+                    pred_w,
+                    pred_h,
+                    grid.bit_depth,
+                    ctx.subsampling_x,
+                    ctx.subsampling_y,
+                    ctx.frame_width,
+                    ctx.frame_height,
+                    interp_x,
+                    interp_y,
+                    ctx.curr,
+                    ctx.curr_stride,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6954,6 +7236,397 @@ mod tests {
                 2
             )
             .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+    }
+
+    /// §5.11.33 `predict()` frame-level walk — drives a small decoded
+    /// mode-info grid of mixed leaves through
+    /// [`reconstruct_inter_frame`] and proves the §7.11.3 per-plane
+    /// loop reconstructs every single-reference translational inter
+    /// leaf into `CurrFrame[0]` at its plane origin while leaving the
+    /// intra / compound / inter-intra leaves untouched.
+    ///
+    /// The 2×4 mi-grid (luma, no subsampling, `MI_SIZE = 4` ⇒ an 8×16
+    /// luma plane) carries:
+    /// * (0,0) BLOCK_4X4 single-ref inter (`LAST_FRAME`, mv=[0,4]) ⇒ a
+    ///   4×4 prediction at plane origin (0,0);
+    /// * (0,1) BLOCK_4X4 intra ⇒ skipped;
+    /// * (0,2) BLOCK_8X8 single-ref inter (`LAST_FRAME`, mv=[0,4]) ⇒ an
+    ///   8×8 prediction at plane origin (8,0), exercising multi-cell
+    ///   footprint origin detection;
+    /// * (1,0) BLOCK_4X4 intra ⇒ skipped;
+    /// * (1,1) BLOCK_4X4 inter with `RefFrame[1] == LAST_FRAME`
+    ///   (compound) ⇒ skipped.
+    ///
+    /// The two inter leaves' outputs are cross-checked against direct
+    /// [`reconstruct_inter_block`] calls (same ref store / mv /
+    /// origins), proving the walk dispatches identically to the
+    /// per-block driver; every skipped-leaf plane region stays the
+    /// pre-fill sentinel.
+    #[test]
+    fn r293_reconstruct_inter_frame_walks_grid_single_ref_translational() {
+        // Shared 16×16 reference plane `ref[r][c] = r*16+c`, parked at
+        // FrameStore slot 3 (the r292 indirection oracle).
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (r * 16 + c) as u16;
+            }
+        }
+        let decoy = vec![0u16; ref_h * stride];
+        let decoy_entry = || RefFrameStoreEntry {
+            plane: &decoy[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let real_entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        // LAST_FRAME plane at slot 3; every other slot a decoy.
+        let store = [decoy_entry(), decoy_entry(), decoy_entry(), real_entry];
+        // `RefFrameStoreEntry` is `Copy`, so the same store backs both
+        // the frame walk and the per-block oracle below.
+        let store2 = store;
+        let ref_frame_idx: [u8; 7] = [3, 0, 1, 2, 0, 1, 2];
+
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 4;
+        let cells = (mi_rows * mi_cols) as usize;
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+
+        // --- Build the persisted mode-info grids. ---
+        use crate::cdf::{BLOCK_4X4, BLOCK_8X8, BLOCK_INVALID};
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        let mut is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        // Slot 1 pre-fill = NONE (-1), as the §5.11.18 walker stamps.
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        let mut mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+
+        let set_cell = |mi_sizes: &mut [usize], r: usize, c: usize, sz: usize| {
+            mi_sizes[r * mi_cols as usize + c] = sz;
+        };
+        let stamp_inter = |is_inters: &mut [u8],
+                           ref_frames: &mut [i8],
+                           mvs: &mut [i16],
+                           r: usize,
+                           c: usize,
+                           rf0: i8,
+                           rf1: i8,
+                           mv: [i16; 2]| {
+            let cell = r * mi_cols as usize + c;
+            is_inters[cell] = 1;
+            ref_frames[cell * 2] = rf0;
+            ref_frames[cell * 2 + 1] = rf1;
+            mvs[cell * 4] = mv[0];
+            mvs[cell * 4 + 1] = mv[1];
+        };
+
+        // (0,0) BLOCK_4X4 single-ref inter.
+        set_cell(&mut mi_sizes, 0, 0, BLOCK_4X4);
+        stamp_inter(
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            0,
+            0,
+            last,
+            -1,
+            [0, 4],
+        );
+        // (0,1) BLOCK_4X4 intra (is_inter stays 0).
+        set_cell(&mut mi_sizes, 0, 1, BLOCK_4X4);
+        // (0,2) BLOCK_8X8 single-ref inter — fills (0,2),(0,3),(1,2),(1,3).
+        for (r, c) in [(0usize, 2usize), (0, 3), (1, 2), (1, 3)] {
+            set_cell(&mut mi_sizes, r, c, BLOCK_8X8);
+        }
+        // §5.11.5 stamps the same MiSize + inter state over the whole
+        // footprint; the origin (0,2) is what the walk reads.
+        for (r, c) in [(0usize, 2usize), (0, 3), (1, 2), (1, 3)] {
+            stamp_inter(
+                &mut is_inters,
+                &mut ref_frames,
+                &mut mvs,
+                r,
+                c,
+                last,
+                -1,
+                [0, 4],
+            );
+        }
+        // (1,0) BLOCK_4X4 intra.
+        set_cell(&mut mi_sizes, 1, 0, BLOCK_4X4);
+        // (1,1) BLOCK_4X4 compound inter (RefFrame[1] = LAST_FRAME).
+        set_cell(&mut mi_sizes, 1, 1, BLOCK_4X4);
+        stamp_inter(
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            1,
+            1,
+            last,
+            last,
+            [0, 4],
+        );
+
+        // CurrFrame[0]: 8 rows × 16 cols, sentinel pre-fill.
+        let curr_w = (mi_cols * 4) as usize; // 16
+        let curr_h = (mi_rows * 4) as usize; // 8
+        let sentinel = 7000u16;
+        let mut curr = vec![sentinel; curr_w * curr_h];
+
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+        };
+        {
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("frame-level inter reconstruction");
+        }
+
+        // --- Independent per-block oracle: drive the two inter leaves
+        // through `reconstruct_inter_block` directly into a fresh
+        // CurrFrame and assert the frame walk produced the same bytes. ---
+        let mut oracle = vec![sentinel; curr_w * curr_h];
+        // (0,0) 4×4 at plane origin (0,0).
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last as u8,
+                mv: [0, 4],
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            0,
+            0,
+            4,
+            4,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+        // (0,2) 8×8 at plane origin (baseX=8, baseY=0).
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last as u8,
+                mv: [0, 4],
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            8,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        assert_eq!(
+            curr, oracle,
+            "frame-level walk must dispatch identically to the per-block driver"
+        );
+
+        // The two inter write regions overwrote their plane cells; the
+        // skipped-leaf regions are still the sentinel. (0,1) intra is
+        // luma cols 4..8, rows 0..4; (1,0) intra cols 0..4 rows 4..8;
+        // (1,1) compound cols 4..8 rows 4..8.
+        for &(x0, y0, x1, y1) in &[(4usize, 0usize, 8usize, 4usize), (0, 4, 4, 8), (4, 4, 8, 8)] {
+            for r in y0..y1 {
+                for c in x0..x1 {
+                    assert_eq!(
+                        curr[r * curr_w + c],
+                        sentinel,
+                        "skipped-leaf plane sample ({c}, {r}) must stay the sentinel"
+                    );
+                }
+            }
+        }
+        // Spot-check one inter sample is no longer the sentinel.
+        assert_ne!(
+            curr[0], sentinel,
+            "the (0,0) inter leaf must have been reconstructed"
+        );
+        assert_ne!(
+            curr[8], sentinel,
+            "the (0,2) inter leaf must have been reconstructed"
+        );
+    }
+
+    /// [`reconstruct_inter_frame`] caller-bug matrix — a grid slice
+    /// too short for `mi_rows * mi_cols` (each of the five grids in
+    /// turn) and an out-of-range `MiSize` at a leaf origin each
+    /// surface `PartitionWalkOutOfRange`.
+    #[test]
+    fn r293_reconstruct_inter_frame_rejects_caller_bugs() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let refp = vec![0u16; ref_w * ref_h];
+        let store = [RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: ref_w,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        }];
+        let ref_frame_idx: [u8; 7] = [0; 7];
+        let mi_rows: u32 = 1;
+        let mi_cols: u32 = 1;
+        let cells = 1usize;
+
+        let mut curr = vec![0u16; ref_w * ref_h];
+        let run = |mi_sizes: &[usize],
+                   is_inters: &[u8],
+                   ref_frames: &[i8],
+                   mvs: &[i16],
+                   interp_filters: &[u8],
+                   curr: &mut [u16]| {
+            let grid = InterModeInfoGrid {
+                mi_sizes,
+                is_inters,
+                ref_frames,
+                mvs,
+                interp_filters,
+                mi_rows,
+                mi_cols,
+                bit_depth: 8,
+            };
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr,
+                curr_stride: ref_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+        };
+
+        let good_sizes = vec![crate::cdf::BLOCK_4X4; cells];
+        let good_is = vec![0u8; cells];
+        let good_rf = {
+            let mut v = vec![0i8; cells * 2];
+            v[1] = -1;
+            v
+        };
+        let good_mv = vec![0i16; cells * 4];
+        let good_if = vec![EIGHTTAP; cells * 2];
+
+        // Each grid in turn too short by one slot.
+        assert_eq!(
+            run(
+                &good_sizes[..0],
+                &good_is,
+                &good_rf,
+                &good_mv,
+                &good_if,
+                &mut curr
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        assert_eq!(
+            run(
+                &good_sizes,
+                &good_is[..0],
+                &good_rf,
+                &good_mv,
+                &good_if,
+                &mut curr
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        assert_eq!(
+            run(
+                &good_sizes,
+                &good_is,
+                &good_rf[..1],
+                &good_mv,
+                &good_if,
+                &mut curr
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        assert_eq!(
+            run(
+                &good_sizes,
+                &good_is,
+                &good_rf,
+                &good_mv[..3],
+                &good_if,
+                &mut curr
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        assert_eq!(
+            run(
+                &good_sizes,
+                &good_is,
+                &good_rf,
+                &good_mv,
+                &good_if[..1],
+                &mut curr
+            )
+            .unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+
+        // Out-of-range MiSize at a leaf origin (BLOCK_SIZES is the
+        // first invalid ordinal past BLOCK_INVALID's hole; use a value
+        // strictly greater than BLOCK_INVALID so it is not the
+        // skip-this-hole sentinel).
+        let bad_sizes = vec![crate::cdf::BLOCK_SIZES + 5; cells];
+        assert_eq!(
+            run(&bad_sizes, &good_is, &good_rf, &good_mv, &good_if, &mut curr).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
         );
     }
