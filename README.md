@@ -2,6 +2,34 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-13 (round 290)
+
+Round 290 **produces a real post-CDEF `CdefFrame` from the persisted
+§5.11.56 `cdef_idx` grid** — so the r289 §7.17 loop-restoration bridge
+consumes a genuinely-filtered frame instead of a caller-assumed one. New
+decode-walker method `PartitionWalker::cdef_frame_from_idx` bridges the
+decode state into the existing §7.15 `src/cdef.rs` sample-filter driver:
+
+* It builds a `cdef::CdefFrameContext` whose two per-block closures
+  resolve through the walker's own grids — the §5.11.56 `cdef_idx[]`
+  selection (`-1` ⇒ the §7.15.1 copy-only path) and the §5.11.11
+  `Skips[]` flag (the §7.15.1 four-cell skip conjunction) — then runs
+  `cdef::cdef_frame` over the post-deblock `CurrFrame[ plane ]` planes to
+  write `CdefFrame[ plane ]`.
+* An anchor that no §5.11.56 call stamped reads back as `-1` (the
+  §5.11.55 `clear_cdef` sentinel ⇒ pure copy); an untouched 4×4 cell
+  reads `skip = 0`. CDEF runs before §7.16 superres per the §7.4 decode
+  order, so the buffers stay at the un-upscaled
+  `(MiRows·MI_SIZE)>>subY × (MiCols·MI_SIZE)>>subX` extent — the
+  `CdefFrame` the §7.16 upscaler then lifts to `UpscaledCdefFrame`.
+
++4 lib tests (1967 → 1971): a sentinel-grid pure-copy, an equivalence
+test that a stamped non-skip anchor reproduces a hand-built
+`CdefFrameContext` byte-for-byte (and differs from the copy — the
+§7.15.3 de-ringing filter actually fired on low-amplitude ringing), a
+fully-skipped 8×8 block staying a copy, and a 4:2:0 chroma sentinel copy
+respecting the per-plane subsampling shift.
+
 ## Status — 2026-06-13 (round 289)
 
 Round 289 **runs the §7.17 loop-restoration reconstruction from the

@@ -16348,6 +16348,78 @@ impl PartitionWalker {
         grid.units.get(idx).copied().unwrap_or(LrUnit::NONE)
     }
 
+    /// §7.15 CDEF reconstruction over the persisted §5.11.56 `cdef_idx`
+    /// grid — av1-spec p.319-324.
+    ///
+    /// Bridges this walker's decode state — the per-anchor
+    /// [`Self::cdef_idx`] grid (the §5.11.56 selection, `-1` for "no
+    /// CDEF") and the [`Self::skips`] grid (the §5.11.11 per-4×4 skip
+    /// flag) — into the §7.15.1 [`crate::cdef::cdef_frame`] sample-filter
+    /// driver. The driver copies each 8×8 `CurrFrame[ plane ]` block from
+    /// `src_planes` into `dst_planes` (the `CdefFrame`), then — for any
+    /// anchor whose `cdef_idx != -1` with at least one non-skip 4×4 cell
+    /// — runs the §7.15.2 direction search and the §7.15.3 primary +
+    /// secondary filter per plane with the `cdef_params` strength
+    /// schedule selected by the anchor's index.
+    ///
+    /// The two grids resolve through closures over the walker's
+    /// `cdef_idx[]` / `skips[]` storage, so an anchor that no §5.11.56
+    /// call stamped reads back as `-1` (the §5.11.55 `clear_cdef`
+    /// sentinel) and a cell no §5.11.11 writer touched reads back as
+    /// `skip = 0` (its initial state). When `cdef_params.cdef_bits == 0`
+    /// and every strength entry is `0` the filter is a pure copy, which
+    /// matches the §7.15.1 `idx == -1` early return after the block copy.
+    ///
+    /// `cdef_params` is the §5.9.19 frame-level
+    /// [`crate::uncompressed_header_tail::CdefParams`]
+    /// (`cdef_damping` / `cdef_bits` / the per-index `cdef_y_*` /
+    /// `cdef_uv_*` strength arrays); `num_planes` / `bit_depth` /
+    /// `subsampling_x` / `subsampling_y` are the §5.5.2 frame geometry the
+    /// §7.15.2 / §7.15.3 sample loops index. `src_planes` is the
+    /// post-deblock `CurrFrame[ plane ]`; `dst_planes` receives the
+    /// `CdefFrame[ plane ]` the §7.17 bridge then consumes (via
+    /// [`Self::loop_restore_frame_from_grid`]'s `cdef_planes` argument).
+    ///
+    /// CDEF runs before §7.16 superres upscaling per the §7.4 decode
+    /// order, so the buffers here are at the un-upscaled
+    /// `(MiRows * MI_SIZE) >> subY` × `(MiCols * MI_SIZE) >> subX` extent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cdef_frame_from_idx(
+        &self,
+        cdef_params: &crate::uncompressed_header_tail::CdefParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        src_planes: &[crate::loop_filter::PlaneBuffer<'_>],
+        dst_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+    ) {
+        use crate::cdef::{cdef_frame, CdefFrameContext};
+        let ctx = CdefFrameContext {
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            cdef_params,
+            // §7.15.1 reads `cdef_idx[ baseR ][ baseC ]` at the 64×64
+            // anchor; the persisted grid carries `-1` for any untouched
+            // anchor, which the driver treats as "copy only".
+            cdef_idx: &|r, c| {
+                if r >= self.mi_rows || c >= self.mi_cols {
+                    return -1;
+                }
+                self.cdef_idx[(r * self.mi_cols + c) as usize]
+            },
+            // §7.15.1 `skip` is the conjunction over the four 4×4 cells
+            // of the 8×8 block; the driver evaluates each cell, so this
+            // closure answers the per-cell `Skips[ r ][ c ]`.
+            skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
+        };
+        cdef_frame(&ctx, src_planes, dst_planes);
+    }
+
     /// §7.17 loop-restoration reconstruction over the persisted §5.11.58
     /// unit grid — av1-spec p.327-335.
     ///
@@ -41074,6 +41146,240 @@ mod tests {
         assert_eq!(walker.cdef_idx()[0], 3);
         walker.clear_cdef(0, 0, false);
         assert_eq!(walker.cdef_idx()[0], -1);
+    }
+
+    /// §7.15 bridge: build a 16×16-mi (64×64-luma) walker, stamp a
+    /// uniform `cdef_idx = -1` (the §5.11.55 sentinel everywhere), and
+    /// drive [`PartitionWalker::cdef_frame_from_idx`]. With every anchor
+    /// reading `-1`, the §7.15.1 driver only performs the block copy, so
+    /// `CdefFrame[ plane ]` must equal `CurrFrame[ plane ]` byte-for-byte.
+    #[test]
+    fn cdef_frame_from_idx_sentinel_grid_is_pure_copy() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        // CurrFrame: a 64×64 luma ramp so a real filter would visibly
+        // change it; the sentinel grid must leave it untouched.
+        let (rows, cols) = (64u32, 64u32);
+        let src: Vec<i32> = (0..(rows * cols)).map(|i| (i % 256) as i32).collect();
+        let mut dst = vec![0i32; (rows * cols) as usize];
+        let src_pb = [crate::loop_filter::PlaneBuffer {
+            rows,
+            cols,
+            samples: &mut src.clone(),
+        }];
+        let mut dst_pb = [crate::loop_filter::PlaneBuffer {
+            rows,
+            cols,
+            samples: &mut dst,
+        }];
+        let params = crate::uncompressed_header_tail::CdefParams::short_circuit();
+        walker.cdef_frame_from_idx(&params, 1, 8, 0, 0, &src_pb, &mut dst_pb);
+        assert_eq!(
+            dst_pb[0].samples,
+            &src[..],
+            "sentinel grid copies CurrFrame"
+        );
+    }
+
+    /// §7.15 bridge equivalence: a stamped anchor with a non-zero
+    /// primary strength and a non-skip block must produce exactly what a
+    /// hand-built [`CdefFrameContext`] over the same grids produces — and
+    /// must differ from the pure copy (the filter actually fired).
+    #[test]
+    fn cdef_frame_from_idx_matches_direct_context_and_filters() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        // Stamp the (0,0) 64×64 anchor with cdef_idx = 0 and leave the
+        // whole 8×8 block non-skip (skips already 0 from construction).
+        walker.cdef_idx[0] = 0;
+        // CdefParams with a real primary luma strength so §7.15.3 fires.
+        let mut params = crate::uncompressed_header_tail::CdefParams::short_circuit();
+        params.short_circuited = false;
+        params.cdef_damping = 5;
+        params.cdef_bits = 0;
+        params.cdef_y_pri_strength[0] = 15;
+        params.cdef_y_sec_strength[0] = 3;
+        // CurrFrame: a flat 100-field with low-amplitude (±2) ringing
+        // noise in an INTERIOR 8×8 block (luma 16..24, every §7.15.3
+        // neighbour tap lands inside the frame — no edge clamping). The
+        // constrain damping engages on small diffs (CDEF de-rings small
+        // perturbations; strong edges damp to identity), so this block
+        // is provably changed. The anchor still shares the (0,0) 64×64
+        // cdef_idx cell.
+        let (rows, cols) = (64u32, 64u32);
+        let mut samples = vec![100i32; (rows * cols) as usize];
+        for y in 14..26usize {
+            for x in 14..26usize {
+                let n = (((x * 7 + y * 13) % 5) as i32) - 2;
+                samples[y * cols as usize + x] = 100 + n;
+            }
+        }
+        let base = samples.clone();
+        // Direct CdefFrameContext over the same idx/skip semantics.
+        let mut direct_dst = base.clone();
+        {
+            let src_pb = [crate::loop_filter::PlaneBuffer {
+                rows,
+                cols,
+                samples: &mut base.clone(),
+            }];
+            let mut dst_pb = [crate::loop_filter::PlaneBuffer {
+                rows,
+                cols,
+                samples: &mut direct_dst,
+            }];
+            let ctx = crate::cdef::CdefFrameContext {
+                mi_rows: 16,
+                mi_cols: 16,
+                num_planes: 1,
+                bit_depth: 8,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                cdef_params: &params,
+                cdef_idx: &|r, c| {
+                    if r == 0 && c == 0 {
+                        0
+                    } else {
+                        -1
+                    }
+                },
+                skip: &|_, _| false,
+            };
+            crate::cdef::cdef_frame(&ctx, &src_pb, &mut dst_pb);
+        }
+        // Bridge path.
+        let mut bridge_dst = base.clone();
+        {
+            let src_pb = [crate::loop_filter::PlaneBuffer {
+                rows,
+                cols,
+                samples: &mut base.clone(),
+            }];
+            let mut dst_pb = [crate::loop_filter::PlaneBuffer {
+                rows,
+                cols,
+                samples: &mut bridge_dst,
+            }];
+            walker.cdef_frame_from_idx(&params, 1, 8, 0, 0, &src_pb, &mut dst_pb);
+        }
+        assert_eq!(bridge_dst, direct_dst, "bridge == direct CdefFrameContext");
+        assert_ne!(bridge_dst, base, "the §7.15.3 filter actually fired");
+    }
+
+    /// §7.15 bridge: a non-`-1` anchor whose whole 8×8 block is skipped
+    /// (`Skips[r][c] && Skips[r+1][c] && Skips[r][c+1] && Skips[r+1][c+1]`)
+    /// must NOT filter — the §7.15.1 `skip` conjunction returns the copy.
+    #[test]
+    fn cdef_frame_from_idx_full_skip_block_is_copy() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        walker.cdef_idx[0] = 0;
+        // Mark every 4×4 cell of the top-left 8×8 anchor as skip.
+        for &(r, c) in &[(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+            walker.skips[(r * 16 + c) as usize] = 1;
+        }
+        let mut params = crate::uncompressed_header_tail::CdefParams::short_circuit();
+        params.short_circuited = false;
+        params.cdef_y_pri_strength[0] = 4;
+        params.cdef_y_sec_strength[0] = 2;
+        let (rows, cols) = (64u32, 64u32);
+        let mut samples = vec![100i32; (rows * cols) as usize];
+        for y in 0..8usize {
+            for x in 0..8usize {
+                samples[y * cols as usize + x] = if x < 4 { 40 } else { 200 };
+            }
+        }
+        let base = samples.clone();
+        let mut dst = base.clone();
+        let src_pb = [crate::loop_filter::PlaneBuffer {
+            rows,
+            cols,
+            samples: &mut base.clone(),
+        }];
+        let mut dst_pb = [crate::loop_filter::PlaneBuffer {
+            rows,
+            cols,
+            samples: &mut dst,
+        }];
+        walker.cdef_frame_from_idx(&params, 1, 8, 0, 0, &src_pb, &mut dst_pb);
+        assert_eq!(dst, base, "fully-skipped block is a pure copy");
+    }
+
+    /// §7.15 bridge with chroma: the §7.15.1 copy loop must respect the
+    /// per-plane subsampling shift when writing `CdefFrame[ 1 ]` /
+    /// `CdefFrame[ 2 ]`. A sentinel grid over a 4:2:0 frame leaves both
+    /// chroma planes equal to their `CurrFrame` source.
+    #[test]
+    fn cdef_frame_from_idx_chroma_copy_respects_subsampling() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let (y_rows, y_cols) = (64u32, 64u32);
+        let (c_rows, c_cols) = (32u32, 32u32); // 4:2:0
+        let y_src: Vec<i32> = (0..(y_rows * y_cols)).map(|i| (i % 200) as i32).collect();
+        let u_src: Vec<i32> = (0..(c_rows * c_cols)).map(|i| (i % 150) as i32).collect();
+        let v_src: Vec<i32> = (0..(c_rows * c_cols)).map(|i| (i % 130) as i32).collect();
+        let mut y_dst = vec![0i32; y_src.len()];
+        let mut u_dst = vec![0i32; u_src.len()];
+        let mut v_dst = vec![0i32; v_src.len()];
+        let src_pb = [
+            crate::loop_filter::PlaneBuffer {
+                rows: y_rows,
+                cols: y_cols,
+                samples: &mut y_src.clone(),
+            },
+            crate::loop_filter::PlaneBuffer {
+                rows: c_rows,
+                cols: c_cols,
+                samples: &mut u_src.clone(),
+            },
+            crate::loop_filter::PlaneBuffer {
+                rows: c_rows,
+                cols: c_cols,
+                samples: &mut v_src.clone(),
+            },
+        ];
+        let mut dst_pb = [
+            crate::loop_filter::PlaneBuffer {
+                rows: y_rows,
+                cols: y_cols,
+                samples: &mut y_dst,
+            },
+            crate::loop_filter::PlaneBuffer {
+                rows: c_rows,
+                cols: c_cols,
+                samples: &mut u_dst,
+            },
+            crate::loop_filter::PlaneBuffer {
+                rows: c_rows,
+                cols: c_cols,
+                samples: &mut v_dst,
+            },
+        ];
+        let params = crate::uncompressed_header_tail::CdefParams::short_circuit();
+        walker.cdef_frame_from_idx(&params, 3, 8, 1, 1, &src_pb, &mut dst_pb);
+        assert_eq!(dst_pb[0].samples, &y_src[..], "Y copied");
+        assert_eq!(dst_pb[1].samples, &u_src[..], "U copied (4:2:0)");
+        assert_eq!(dst_pb[2].samples, &v_src[..], "V copied (4:2:0)");
     }
 
     /// §5.11.56 caller-bug guards: `mi_row` past frame extent,
