@@ -2,6 +2,36 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-13 (round 289)
+
+Round 289 **runs the §7.17 loop-restoration reconstruction from the
+persisted §5.11.58 grid** — closing the last gap between the r287/r288
+syntax decode and the long-standing `src/loop_restoration.rs`
+sample-filter primitives. New decode-walker method
+`PartitionWalker::loop_restore_frame_from_grid` builds a
+`LoopRestorationFrameContext` whose four per-unit closures
+(`lr_type` / `lr_wiener` / `lr_sgr_set` / `lr_sgr_xqd`) resolve through
+`lr_unit(plane, unitRow, unitCol)`, then invokes `loop_restoration_frame`
+over the pre-CDEF (`UpscaledCurrFrame`) and post-CDEF
+(`UpscaledCdefFrame`) planes to write the restored `LrFrame`:
+
+* The §7.17 prelude copies `cdef_planes` into `lr_planes`;
+  `UsesLr == 0` returns after the copy; each covered unit applies its
+  Wiener (§7.17.4) or self-guided (§7.17.2/§7.17.3) arm by its
+  `rType = LrType[plane][unitRow][unitCol]`.
+* The persisted `restoration_type` ordinal
+  (`0=NONE`/`1=WIENER`/`2=SGRPROJ`) maps straight onto the
+  `FrameRestorationType` discriminants; any uncovered cell reads
+  `LrUnit::NONE` and passes the CDEF copy through.
+
++3 lib tests (1964 → 1967): a full §5.11.57 write→read round-trip
+feeding a Wiener-identity reconstruction of a uniform 64×64 frame
+(bit-exact recovery to the input), a `RESTORE_NONE` frame keeping the
+CDEF copy, and a non-identity self-guided unit whose bridge output
+matches a hand-built `LoopRestorationFrameContext` reading the same grid
+cells byte-for-byte — and differs from the CDEF copy, confirming the SGR
+pass actually fired.
+
 ## Status — 2026-06-13 (round 288)
 
 Round 288 **routes the §5.11.58 loop-restoration unit taps

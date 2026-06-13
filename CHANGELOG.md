@@ -4,6 +4,30 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r289 (2026-06-13): route the persisted §5.11.58 loop-restoration
+  grid into the §7.17 reconstruction process. New decode-walker method
+  `PartitionWalker::loop_restore_frame_from_grid` builds a
+  `LoopRestorationFrameContext` whose four per-unit closures
+  (`lr_type` / `lr_wiener` / `lr_sgr_set` / `lr_sgr_xqd`) resolve through
+  `lr_unit(plane, unitRow, unitCol)`, then runs `loop_restoration_frame`
+  over the pre-CDEF (`UpscaledCurrFrame`) and post-CDEF
+  (`UpscaledCdefFrame`) planes to produce the restored `LrFrame`. The
+  §7.17 prelude copies `cdef_planes` into `lr_planes`; `UsesLr == 0`
+  returns after the copy; every covered unit applies its Wiener
+  (§7.17.4) or self-guided (§7.17.2/§7.17.3) arm. The persisted
+  `restoration_type` ordinal (`0=NONE`/`1=WIENER`/`2=SGRPROJ`) maps
+  straight onto the `FrameRestorationType` discriminants; an uncovered
+  cell reads `LrUnit::NONE` and passes through. This wires the r287/r288
+  syntax decode into the long-standing sample-filter primitives — the
+  §7.17 process now runs from genuinely decoded units rather than only
+  test closures. +3 lib tests (1964 → 1967): a full §5.11.57 write→read
+  round-trip feeding a Wiener-identity reconstruction of a uniform 64×64
+  frame (bit-exact recovery), a `RESTORE_NONE` frame keeping the CDEF
+  copy, and a non-identity self-guided unit whose bridge output matches a
+  hand-built `LoopRestorationFrameContext` reading the same grid cells
+  byte-for-byte (and differs from the CDEF copy, confirming the SGR pass
+  fired).
+
 - decoder r288 (2026-06-13): route the §5.11.58 loop-restoration unit
   taps end-to-end into the §7.17 grid. `PartitionWalker::read_lr` now
   persists every decoded unit into a lazily-allocated per-plane

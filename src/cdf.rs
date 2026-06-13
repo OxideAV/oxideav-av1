@@ -16348,6 +16348,90 @@ impl PartitionWalker {
         grid.units.get(idx).copied().unwrap_or(LrUnit::NONE)
     }
 
+    /// §7.17 loop-restoration reconstruction over the persisted §5.11.58
+    /// unit grid — av1-spec p.327-335.
+    ///
+    /// Bridges the §5.11.57/§5.11.58 [`Self::read_lr`] decode result
+    /// (the per-plane `LrType` / `LrWiener` / `LrSgrSet` / `LrSgrXqd`
+    /// grid this walker stores) into the §7.17
+    /// [`crate::loop_restoration::loop_restoration_frame`] sample-filter
+    /// driver. The §7.17 prelude copies `cdef_planes` (the
+    /// `UpscaledCdefFrame`) into `lr_planes` (the `LrFrame`), then — when
+    /// `UsesLr` — walks the frame in `MI_SIZE` steps and applies the
+    /// Wiener (§7.17.4) / self-guided (§7.17.2/§7.17.3) arm selected by
+    /// each unit's `rType = LrType[ plane ][ unitRow ][ unitCol ]`.
+    ///
+    /// The four per-unit closures the driver reads resolve through
+    /// [`Self::lr_unit`], so any cell the §5.11.57 unit-window never
+    /// covered (or any plane whose grid was never allocated — e.g. the
+    /// §5.11.57 `allow_intrabc` short-circuit) reads back as
+    /// [`LrUnit::NONE`], which §7.17 treats as a `RESTORE_NONE`
+    /// identity pass-through (the `cdef_planes` copy survives).
+    ///
+    /// `lr_params` is the §5.9.20 frame-level
+    /// [`crate::uncompressed_header_tail::LrParams`] (`UsesLr`,
+    /// `FrameRestorationType[ plane ]`, `LoopRestorationSize[ plane ]`);
+    /// the remaining arguments are the §5.5.2 / §5.9.5 / §5.9.8 frame
+    /// geometry the driver indexes. `curr_planes` is the pre-CDEF
+    /// `UpscaledCurrFrame`, consulted by §7.17.6 for the cropped
+    /// above/below-stripe neighbour lines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn loop_restore_frame_from_grid(
+        &self,
+        lr_params: &crate::uncompressed_header_tail::LrParams,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        mi_rows: u32,
+        mi_cols: u32,
+        frame_height: u32,
+        upscaled_width: u32,
+        curr_planes: &[crate::loop_filter::PlaneBuffer<'_>],
+        cdef_planes: &[crate::loop_filter::PlaneBuffer<'_>],
+        lr_planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+    ) {
+        use crate::loop_restoration::{loop_restoration_frame, LoopRestorationFrameContext};
+        let ctx = LoopRestorationFrameContext {
+            mi_rows,
+            mi_cols,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_height,
+            upscaled_width,
+            lr_params,
+            // §7.17.1 `rType = LrType[ plane ][ unitRow ][ unitCol ]`.
+            // The persisted §5.11.58 `restoration_type` carries the same
+            // 0=NONE/1=WIENER/2=SGRPROJ ordinal as the
+            // FrameRestorationType discriminants, so the dispatch maps
+            // straight through; any other value (only the unreachable
+            // RESTORE_SWITCHABLE=3) folds to the None identity arm.
+            lr_type: &|plane, unit_row, unit_col| match self
+                .lr_unit(plane as usize, unit_row, unit_col)
+                .restoration_type
+            {
+                RESTORE_WIENER => crate::uncompressed_header_tail::FrameRestorationType::Wiener,
+                RESTORE_SGRPROJ => crate::uncompressed_header_tail::FrameRestorationType::SgrProj,
+                _ => crate::uncompressed_header_tail::FrameRestorationType::None,
+            },
+            // §7.17.4 `LrWiener[ plane ][ unitRow ][ unitCol ][ pass ][ i ]`.
+            lr_wiener: &|plane, unit_row, unit_col, pass, i| {
+                self.lr_unit(plane as usize, unit_row, unit_col).wiener[pass as usize][i]
+            },
+            // §7.17.2 `LrSgrSet[ plane ][ unitRow ][ unitCol ]`.
+            lr_sgr_set: &|plane, unit_row, unit_col| {
+                self.lr_unit(plane as usize, unit_row, unit_col).sgr_set as u8
+            },
+            // §7.17.2 `LrSgrXqd[ plane ][ unitRow ][ unitCol ][ i ]`.
+            lr_sgr_xqd: &|plane, unit_row, unit_col, i| {
+                self.lr_unit(plane as usize, unit_row, unit_col).sgr_xqd[i]
+            },
+        };
+        loop_restoration_frame(&ctx, curr_planes, cdef_planes, lr_planes);
+    }
+
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for
     /// out-of-grid coordinates (the §8.3.2 skip-mode ctx walk already
     /// gates on `AvailU` / `AvailL`, so an unavailable neighbour's

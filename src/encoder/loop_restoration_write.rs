@@ -629,4 +629,289 @@ mod tests {
             .unwrap();
         assert!(got.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // §7.17 reconstruction bridge — the persisted §5.11.58 unit grid is
+    // routed into the loop_restoration_frame sample filter through
+    // PartitionWalker::loop_restore_frame_from_grid.
+    // -----------------------------------------------------------------
+
+    use crate::loop_filter::PlaneBuffer;
+    use crate::uncompressed_header_tail::{FrameRestorationType, LrParams as FrameLrParams};
+
+    /// Frame-level §5.9.20 LrParams (the loop_restoration.rs flavor) for
+    /// a single luma plane with a unit large enough that the §7.17
+    /// geometry derives a single covering unit over a 64x64 frame.
+    fn frame_lr_params(frt: FrameRestorationType) -> FrameLrParams {
+        FrameLrParams {
+            frame_restoration_type: [frt, FrameRestorationType::None, FrameRestorationType::None],
+            uses_lr: frt != FrameRestorationType::None,
+            uses_chroma_lr: false,
+            lr_unit_shift: 2,
+            lr_uv_shift: 0,
+            loop_restoration_size: [256, 256, 256],
+            short_circuited: false,
+        }
+    }
+
+    /// Decode one luma `RESTORE_WIENER` unit through the full §5.11.57
+    /// write→read round-trip so the grid is genuinely populated from the
+    /// syntax path, then reconstruct a uniform 64x64 frame through the
+    /// §7.17 bridge. With zero transmitted taps the §7.17.5 symmetric
+    /// 7-tap filter is the identity (`filter[3] = 128`, others zero), so
+    /// a flat plane reconstructs to itself bit-exactly. The taps still
+    /// travel the full S() write/read path.
+    #[test]
+    fn bridge_wiener_identity_recovers_uniform_frame() {
+        let unit = LrUnit {
+            restoration_type: RESTORE_WIENER,
+            wiener: [[0, 0, 0], [0, 0, 0]],
+            sgr_set: 0,
+            sgr_xqd: [0; 2],
+        };
+        let syntax_params = single_plane_params(64, RESTORE_WIENER);
+        let units = vec![((0usize, 0u32, 0u32), unit)];
+
+        let mut writer = SymbolWriter::new(false);
+        let mut wcdfs = TileCdfContext::new_from_defaults();
+        let mut wstate = LrWriteState::new();
+        write_lr(
+            &mut writer,
+            &mut wcdfs,
+            &mut wstate,
+            0,
+            0,
+            BLOCK_64X64,
+            &syntax_params,
+            &units,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut dcdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        walker
+            .read_lr(&mut dec, &mut dcdfs, 0, 0, BLOCK_64X64, &syntax_params)
+            .unwrap();
+        assert_eq!(walker.lr_unit(0, 0, 0), unit);
+
+        let mut curr = vec![100i32; 64 * 64];
+        let mut cdef = vec![100i32; 64 * 64];
+        let mut lr = vec![0i32; 64 * 64];
+        let curr_buf = PlaneBuffer {
+            rows: 64,
+            cols: 64,
+            samples: &mut curr,
+        };
+        let cdef_buf = PlaneBuffer {
+            rows: 64,
+            cols: 64,
+            samples: &mut cdef,
+        };
+        let mut lr_buf = PlaneBuffer {
+            rows: 64,
+            cols: 64,
+            samples: &mut lr,
+        };
+        walker.loop_restore_frame_from_grid(
+            &frame_lr_params(FrameRestorationType::Wiener),
+            1,
+            8,
+            0,
+            0,
+            16,
+            16,
+            64,
+            64,
+            std::slice::from_ref(&curr_buf),
+            std::slice::from_ref(&cdef_buf),
+            std::slice::from_mut(&mut lr_buf),
+        );
+        for &v in lr_buf.samples.iter() {
+            assert_eq!(v, 100);
+        }
+    }
+
+    /// A `RESTORE_NONE` frame (`UsesLr == 0`) leaves `LrFrame ==
+    /// UpscaledCdefFrame`: the bridge's prelude copies `cdef_planes`
+    /// into `lr_planes` and the `!uses_lr` short-circuit returns before
+    /// any unit walk, so the distinct pre-CDEF `curr` value never leaks.
+    #[test]
+    fn bridge_restore_none_keeps_cdef_copy() {
+        let walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut curr = vec![50i32; 32 * 32];
+        let mut cdef = vec![175i32; 32 * 32];
+        let mut lr = vec![0i32; 32 * 32];
+        let curr_buf = PlaneBuffer {
+            rows: 32,
+            cols: 32,
+            samples: &mut curr,
+        };
+        let cdef_buf = PlaneBuffer {
+            rows: 32,
+            cols: 32,
+            samples: &mut cdef,
+        };
+        let mut lr_buf = PlaneBuffer {
+            rows: 32,
+            cols: 32,
+            samples: &mut lr,
+        };
+        walker.loop_restore_frame_from_grid(
+            &frame_lr_params(FrameRestorationType::None),
+            1,
+            8,
+            0,
+            0,
+            8,
+            8,
+            32,
+            32,
+            std::slice::from_ref(&curr_buf),
+            std::slice::from_ref(&cdef_buf),
+            std::slice::from_mut(&mut lr_buf),
+        );
+        assert!(lr_buf.samples.iter().all(|&v| v == 175));
+    }
+
+    /// The bridge's per-unit closures must thread the grid faithfully:
+    /// reconstructing through `loop_restore_frame_from_grid` yields the
+    /// exact same bytes as a hand-built `LoopRestorationFrameContext`
+    /// whose closures read the same `walker.lr_unit(...)` cells directly.
+    /// Uses a genuine non-identity self-guided unit so every closure
+    /// (`lr_type` / `lr_sgr_set` / `lr_sgr_xqd`) is exercised.
+    #[test]
+    fn bridge_matches_direct_context_sgr() {
+        let set = SGR_PARAMS
+            .iter()
+            .position(|p| p[0] != 0 && p[2] != 0)
+            .unwrap_or(0);
+        let unit = LrUnit {
+            restoration_type: RESTORE_SGRPROJ,
+            wiener: [[0; WIENER_COEFFS]; 2],
+            sgr_set: set,
+            sgr_xqd: [-10, 40],
+        };
+        let syntax_params = single_plane_params(64, RESTORE_SGRPROJ);
+        let units = vec![((0usize, 0u32, 0u32), unit)];
+
+        let mut writer = SymbolWriter::new(false);
+        let mut wcdfs = TileCdfContext::new_from_defaults();
+        let mut wstate = LrWriteState::new();
+        write_lr(
+            &mut writer,
+            &mut wcdfs,
+            &mut wstate,
+            0,
+            0,
+            BLOCK_64X64,
+            &syntax_params,
+            &units,
+        )
+        .unwrap();
+        let bytes = writer.finish();
+
+        let mut walker = PartitionWalker::new(16, 16, rt_geometry(16, 16)).unwrap();
+        let mut dcdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        walker
+            .read_lr(&mut dec, &mut dcdfs, 0, 0, BLOCK_64X64, &syntax_params)
+            .unwrap();
+        assert_eq!(walker.lr_unit(0, 0, 0), unit);
+
+        let mk_grad = || {
+            (0..64 * 64i32)
+                .map(|i| ((i % 64) * 3 + (i / 64)) % 256)
+                .collect::<Vec<i32>>()
+        };
+        let params = frame_lr_params(FrameRestorationType::SgrProj);
+
+        let mut curr_a = mk_grad();
+        let mut cdef_a = mk_grad();
+        let mut lr_a = vec![0i32; 64 * 64];
+        {
+            let curr_buf = PlaneBuffer {
+                rows: 64,
+                cols: 64,
+                samples: &mut curr_a,
+            };
+            let cdef_buf = PlaneBuffer {
+                rows: 64,
+                cols: 64,
+                samples: &mut cdef_a,
+            };
+            let mut lr_buf = PlaneBuffer {
+                rows: 64,
+                cols: 64,
+                samples: &mut lr_a,
+            };
+            walker.loop_restore_frame_from_grid(
+                &params,
+                1,
+                8,
+                0,
+                0,
+                16,
+                16,
+                64,
+                64,
+                std::slice::from_ref(&curr_buf),
+                std::slice::from_ref(&cdef_buf),
+                std::slice::from_mut(&mut lr_buf),
+            );
+        }
+
+        let mut curr_b = mk_grad();
+        let mut cdef_b = mk_grad();
+        let mut lr_b = vec![0i32; 64 * 64];
+        {
+            use crate::loop_restoration::{loop_restoration_frame, LoopRestorationFrameContext};
+            let curr_buf = PlaneBuffer {
+                rows: 64,
+                cols: 64,
+                samples: &mut curr_b,
+            };
+            let cdef_buf = PlaneBuffer {
+                rows: 64,
+                cols: 64,
+                samples: &mut cdef_b,
+            };
+            let mut lr_buf = PlaneBuffer {
+                rows: 64,
+                cols: 64,
+                samples: &mut lr_b,
+            };
+            let ctx = LoopRestorationFrameContext {
+                mi_rows: 16,
+                mi_cols: 16,
+                num_planes: 1,
+                bit_depth: 8,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_height: 64,
+                upscaled_width: 64,
+                lr_params: &params,
+                lr_type: &|p, ur, uc| match walker.lr_unit(p as usize, ur, uc).restoration_type {
+                    RESTORE_WIENER => FrameRestorationType::Wiener,
+                    RESTORE_SGRPROJ => FrameRestorationType::SgrProj,
+                    _ => FrameRestorationType::None,
+                },
+                lr_wiener: &|p, ur, uc, pass, i| {
+                    walker.lr_unit(p as usize, ur, uc).wiener[pass as usize][i]
+                },
+                lr_sgr_set: &|p, ur, uc| walker.lr_unit(p as usize, ur, uc).sgr_set as u8,
+                lr_sgr_xqd: &|p, ur, uc, i| walker.lr_unit(p as usize, ur, uc).sgr_xqd[i],
+            };
+            loop_restoration_frame(
+                &ctx,
+                std::slice::from_ref(&curr_buf),
+                std::slice::from_ref(&cdef_buf),
+                std::slice::from_mut(&mut lr_buf),
+            );
+        }
+
+        assert_eq!(lr_a, lr_b);
+        assert_ne!(lr_a, mk_grad());
+    }
 }
