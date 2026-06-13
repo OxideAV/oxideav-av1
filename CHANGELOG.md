@@ -4,6 +4,33 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- encoder+decoder r287 (2026-06-13): land the §5.11.57 `read_lr()` /
+  §5.11.58 `read_lr_unit()` loop-restoration unit syntax on both the
+  decode walker and the encode write side, in lockstep. New decode
+  walker methods `PartitionWalker::read_lr` (per-superblock unit-window
+  driver — `count_units_in_frame` / `Round2` grid arithmetic, the
+  `use_superres` numerator/denominator split, the §5.11.57
+  `allow_intrabc` short-circuit) and `decode_lr_unit` (the §5.11.58
+  filter-selection S() — `use_wiener` / `use_sgrproj` / 3-symbol
+  `restoration_type` — plus `RESTORE_WIENER` tap and `RESTORE_SGRPROJ`
+  `lr_sgr_set` + `xqd` reads). New `SymbolDecoder` helpers
+  `decode_signed_subexp_with_ref_bool` /
+  `decode_unsigned_subexp_with_ref_bool` (the arithmetic-coded twins of
+  the §5.9.26/§5.9.27 header recentred reads). Three new §8.3.1
+  `TileCdfContext` CDFs (`use_wiener` / `use_sgrproj` /
+  `restoration_type`) seeded from `Default_Use_Wiener_Cdf` /
+  `Default_Use_Sgrproj_Cdf` / `Default_Restoration_Type_Cdf` (§9.4).
+  Walker `RefLrWiener` / `RefSgrXqd` running references with a
+  `reset_lr_refs` §5.11.2 tile-entry reset. Write side
+  (`encoder::loop_restoration_write`): `write_lr` / `write_lr_unit` +
+  `LrWriteState`, built on the new `SymbolWriter`
+  `write_signed_subexp_with_ref_bool` /
+  `write_unsigned_subexp_with_ref_bool` and the `recenter` forward of
+  §5.9.29 `inverse_recenter`. +7 lib tests (1953 → 1960): Wiener /
+  sgrproj / switchable-NONE / superblock-window / intrabc-no-emit
+  round-trips plus exhaustive `recenter` and `signed_subexp_with_ref_bool`
+  range coverage.
+
 - encoder+decoder r286 (2026-06-13): land the §5.11.47
   `transform_type()` write side, replacing the prior hard-coded
   `DCT_DCT` stamp in `write_transform_block` with the real per-luma-TU

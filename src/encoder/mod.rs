@@ -253,6 +253,7 @@ pub mod forward_transform_2d;
 pub mod forward_wht;
 pub mod frame_obu;
 pub mod ivf;
+pub mod loop_restoration_write;
 pub mod obu;
 pub mod partition;
 pub mod partition_tree;
@@ -293,6 +294,7 @@ pub use forward_transform_2d::forward_transform_2d;
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
+pub use loop_restoration_write::{write_lr, write_lr_unit, LrWriteState};
 pub use obu::{
     build_temporal_unit, obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,
     ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,

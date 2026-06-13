@@ -87,6 +87,28 @@ fn floor_log2(x: u32) -> u32 {
     }
 }
 
+/// `recenter( r, v )` — forward of §5.9.29 `inverse_recenter`. Given the
+/// actual value `v` and reference `r`, produce the recentred code the
+/// `decode_*_subexp_with_ref_bool` reader recovers via
+/// `inverse_recenter(r, code) == v`. Derived by inverting the three
+/// `inverse_recenter` branches:
+///
+/// * `inverse_recenter` returns `code` unchanged for `code > 2r`, so a
+///   value `v > 2r` codes as itself.
+/// * the even branch maps `code -> r + code/2`, so `v >= r` codes as
+///   `2 * (v - r)`.
+/// * the odd branch maps `code -> r - (code+1)/2`, so `v < r` codes as
+///   `2 * (r - v) - 1`.
+pub(crate) fn recenter(r: i64, v: i64) -> i64 {
+    if v > 2 * r {
+        v
+    } else if v >= r {
+        2 * (v - r)
+    } else {
+        2 * (r - v) - 1
+    }
+}
+
 /// The AV1 symbol (arithmetic) **encoder** — inverse of
 /// [`crate::symbol_decoder::SymbolDecoder`].
 ///
@@ -346,6 +368,52 @@ impl SymbolWriter {
                 return self.write_literal(b2, value - mk);
             }
         }
+    }
+
+    /// `write_unsigned_subexp_with_ref_bool( mx, k, r, value )` — inverse
+    /// of [`crate::symbol_decoder::SymbolDecoder::decode_unsigned_subexp_with_ref_bool`].
+    ///
+    /// The decoder is
+    /// ```text
+    ///   v = decode_subexp_bool(mx, k)
+    ///   if ( (r << 1) <= mx ) return inverse_recenter(r, v)
+    ///   else return mx - 1 - inverse_recenter(mx - 1 - r, v)
+    /// ```
+    /// so the encoder recenters `value` back to `v` (via [`recenter`],
+    /// the forward of §5.9.29 `inverse_recenter`) and writes it through
+    /// [`Self::write_subexp_bool`].
+    pub fn write_unsigned_subexp_with_ref_bool(
+        &mut self,
+        mx: i64,
+        k: u32,
+        r: i64,
+        value: i64,
+    ) -> Result<(), Error> {
+        let v = if (r << 1) <= mx {
+            recenter(r, value)
+        } else {
+            recenter(mx - 1 - r, mx - 1 - value)
+        };
+        debug_assert!(v >= 0 && v < mx, "recentred subexp value in 0..mx");
+        self.write_subexp_bool(mx as u32, k, v as u32)
+    }
+
+    /// `write_signed_subexp_with_ref_bool( low, high, k, r, value )` —
+    /// inverse of [`crate::symbol_decoder::SymbolDecoder::decode_signed_subexp_with_ref_bool`].
+    ///
+    /// ```text
+    ///   x = decode_unsigned_subexp_with_ref_bool(high - low, k, r - low)
+    ///   return x + low
+    /// ```
+    pub fn write_signed_subexp_with_ref_bool(
+        &mut self,
+        low: i64,
+        high: i64,
+        k: u32,
+        r: i64,
+        value: i64,
+    ) -> Result<(), Error> {
+        self.write_unsigned_subexp_with_ref_bool(high - low, k, r - low, value - low)
     }
 
     /// Compute the decoder's `cur(s)` for the symbol-search step at the
@@ -749,6 +817,67 @@ mod tests {
         let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
         for &(num_syms, k, v) in triples {
             assert_eq!(d.decode_subexp_bool(num_syms, k).unwrap(), v);
+        }
+    }
+
+    /// `recenter` is the exact forward of §5.9.29 `inverse_recenter`
+    /// over the whole `0..=2r` plus escape range.
+    #[test]
+    fn recenter_inverts_inverse_recenter() {
+        fn inverse_recenter(r: i64, v: i64) -> i64 {
+            if v > 2 * r {
+                v
+            } else if v & 1 != 0 {
+                r - ((v + 1) >> 1)
+            } else {
+                r + (v >> 1)
+            }
+        }
+        for r in 0..40i64 {
+            for v in 0..(2 * r + 8) {
+                let code = recenter(r, v);
+                assert!(code >= 0, "recenter({r},{v}) = {code} negative");
+                assert_eq!(
+                    inverse_recenter(r, code),
+                    v,
+                    "recenter/inverse_recenter mismatch r={r} v={v} code={code}"
+                );
+            }
+        }
+    }
+
+    /// `write_signed_subexp_with_ref_bool` round-trips against
+    /// `decode_signed_subexp_with_ref_bool` across the §5.11.58
+    /// Wiener-tap / sgr-xqd ranges, references, and k values.
+    #[test]
+    fn signed_subexp_with_ref_bool_round_trip() {
+        // (low, high, k, ref, values)
+        let cases: &[(i64, i64, u32, i64, &[i64])] = &[
+            // Wiener_Taps[0]: min=-5 max=10 k=1, mid ref=3.
+            (-5, 11, 1, 3, &[-5, -2, 0, 3, 7, 10]),
+            // Wiener_Taps[1]: min=-23 max=8 k=2, mid ref=-7.
+            (-23, 9, 2, -7, &[-23, -10, -7, 0, 8]),
+            // Wiener_Taps[2]: min=-17 max=46 k=3, mid ref=15.
+            (-17, 47, 3, 15, &[-17, 0, 15, 30, 46]),
+            // Sgr xqd[0]: min=-96 max=31 k=4, mid ref=-32.
+            (-96, 32, 4, -32, &[-96, -50, -32, 0, 31]),
+            // Sgr xqd[1]: min=-32 max=95 k=4, mid ref=31.
+            (-32, 96, 4, 31, &[-32, 0, 31, 60, 95]),
+        ];
+        for &(low, high, k, r, values) in cases {
+            for &v in values {
+                let mut w = SymbolWriter::new(true);
+                w.write_signed_subexp_with_ref_bool(low, high, k, r, v)
+                    .unwrap();
+                let bytes = w.finish();
+                let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), true).unwrap();
+                assert_eq!(
+                    d.decode_signed_subexp_with_ref_bool(low, high, k, r)
+                        .unwrap(),
+                    v,
+                    "signed_subexp(low={low},high={high},k={k},r={r}) mismatch for {v}"
+                );
+            }
         }
     }
 

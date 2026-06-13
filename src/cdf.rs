@@ -3508,6 +3508,29 @@ pub const DEFAULT_PARTITION_W128_CDF: [[u16; 9]; PARTITION_CONTEXTS] = [
 pub const DEFAULT_SKIP_CDF: [[u16; 3]; SKIP_CONTEXTS] =
     [[31671, 32768, 0], [16515, 32768, 0], [4576, 32768, 0]];
 
+/// `Default_Use_Wiener_Cdf[ 2 + 1 ]` (§9.4 — av1-spec p.438). Binary
+/// symbol `use_wiener` (§5.11.58 `read_lr_unit`, the
+/// `FrameRestorationType[ plane ] == RESTORE_WIENER` arm) — `1` means
+/// the unit uses the Wiener filter, `0` means `RESTORE_NONE`. Not
+/// context-indexed (§8.3.1 sets `UseWienerCdf` to a single copy of this
+/// default). The trailing `0` is the §8.3.1 adaptation counter slot.
+pub const DEFAULT_USE_WIENER_CDF: [u16; 3] = [11570, 32768, 0];
+
+/// `Default_Use_Sgrproj_Cdf[ 2 + 1 ]` (§9.4 — av1-spec p.438). Binary
+/// symbol `use_sgrproj` (§5.11.58 `read_lr_unit`, the
+/// `FrameRestorationType[ plane ] == RESTORE_SGRPROJ` arm) — `1` means
+/// the unit uses the self-guided projection filter, `0` means
+/// `RESTORE_NONE`. Not context-indexed.
+pub const DEFAULT_USE_SGRPROJ_CDF: [u16; 3] = [16855, 32768, 0];
+
+/// `Default_Restoration_Type_Cdf[ RESTORE_SWITCHABLE + 1 ]` (§9.4 —
+/// av1-spec p.438). 3-symbol `restoration_type` (§5.11.58 `read_lr_unit`,
+/// the `FrameRestorationType[ plane ] == RESTORE_SWITCHABLE` arm) coding
+/// `RESTORE_NONE` (0) / `RESTORE_WIENER` (1) / `RESTORE_SGRPROJ` (2). The
+/// CDF length is `RESTORE_SWITCHABLE + 1 == 4` (three symbols plus the
+/// §8.3.1 counter slot). Not context-indexed.
+pub const DEFAULT_RESTORATION_TYPE_CDF: [u16; 4] = [9413, 22581, 32768, 0];
+
 /// `Default_Segment_Id_Cdf[ SEGMENT_ID_CONTEXTS ][ MAX_SEGMENTS + 1 ]`
 /// (§9.4). Codes the `segment_id` (`MAX_SEGMENTS == 8` values).
 pub const DEFAULT_SEGMENT_ID_CDF: [[u16; MAX_SEGMENTS + 1]; SEGMENT_ID_CONTEXTS] = [
@@ -9376,6 +9399,22 @@ pub struct TileCdfContext {
     /// inter-inter `COMPOUND_WEDGE` branch). Selected by `MiSize` per
     /// the §8.3.2 selection (`TileWedgeIndexCdf[ MiSize ]`).
     pub wedge_index: [[u16; WEDGE_TYPES + 1]; BLOCK_SIZES],
+
+    // -----------------------------------------------------------------
+    // Round 287 — loop-restoration unit CDFs. §8.3.1 enumerates each as
+    // "`UseWienerCdf` is set to a copy of `Default_Use_Wiener_Cdf`"
+    // (and likewise for `UseSgrprojCdf` / `RestorationTypeCdf`). None of
+    // the three is context-indexed — a single CDF row per symbol.
+    // -----------------------------------------------------------------
+    /// `TileUseWienerCdf` (§8.3.1 — av1-spec p.156). Binary `use_wiener`
+    /// (§5.11.58 `read_lr_unit`).
+    pub use_wiener: [u16; 3],
+    /// `TileUseSgrprojCdf` (§8.3.1 — av1-spec p.156). Binary
+    /// `use_sgrproj` (§5.11.58 `read_lr_unit`).
+    pub use_sgrproj: [u16; 3],
+    /// `TileRestorationTypeCdf` (§8.3.1 — av1-spec p.156). 3-symbol
+    /// `restoration_type` (§5.11.58 `read_lr_unit`, switchable arm).
+    pub restoration_type: [u16; 4],
 }
 
 impl TileCdfContext {
@@ -9535,6 +9574,9 @@ impl TileCdfContext {
 
             // Round 144 — wedge-index CDF.
             wedge_index: DEFAULT_WEDGE_INDEX_CDF,
+            use_wiener: DEFAULT_USE_WIENER_CDF,
+            use_sgrproj: DEFAULT_USE_SGRPROJ_CDF,
+            restoration_type: DEFAULT_RESTORATION_TYPE_CDF,
         }
     }
 
@@ -9579,6 +9621,24 @@ impl TileCdfContext {
     /// `0..SKIP_CONTEXTS`).
     pub fn skip_cdf(&mut self, ctx: usize) -> &mut [u16] {
         &mut self.skip[ctx]
+    }
+
+    /// §8.3.2 `use_wiener`: the cdf is `TileUseWienerCdf` (not
+    /// context-indexed). §5.11.58 `read_lr_unit`.
+    pub fn use_wiener_cdf(&mut self) -> &mut [u16] {
+        &mut self.use_wiener
+    }
+
+    /// §8.3.2 `use_sgrproj`: the cdf is `TileUseSgrprojCdf` (not
+    /// context-indexed). §5.11.58 `read_lr_unit`.
+    pub fn use_sgrproj_cdf(&mut self) -> &mut [u16] {
+        &mut self.use_sgrproj
+    }
+
+    /// §8.3.2 `restoration_type`: the cdf is `TileRestorationTypeCdf`
+    /// (not context-indexed). §5.11.58 `read_lr_unit`, switchable arm.
+    pub fn restoration_type_cdf(&mut self) -> &mut [u16] {
+        &mut self.restoration_type
     }
 
     /// §8.3.2 `segment_id`: the cdf is `TileSegmentIdCdf[ ctx ]` where
@@ -14587,6 +14647,136 @@ impl TileGeometry {
     }
 }
 
+/// `RESTORE_NONE` (§3 / §6.10.15) — no loop restoration on the unit.
+pub const RESTORE_NONE: u8 = 0;
+/// `RESTORE_WIENER` (§3) — Wiener filter restoration.
+pub const RESTORE_WIENER: u8 = 1;
+/// `RESTORE_SGRPROJ` (§3) — self-guided projection restoration.
+pub const RESTORE_SGRPROJ: u8 = 2;
+/// `RESTORE_SWITCHABLE` (§3) — per-unit switchable restoration; the
+/// §5.11.58 `restoration_type` S() then picks NONE / WIENER / SGRPROJ.
+pub const RESTORE_SWITCHABLE: u8 = 3;
+
+/// `SUPERRES_NUM` (§3) — numerator of the super-resolution ratio.
+/// Re-exported locally for the §5.11.57 unit-window arithmetic (the
+/// canonical definition lives in [`crate::frame_header::SUPERRES_NUM`]).
+const SUPERRES_NUM: u32 = crate::frame_header::SUPERRES_NUM;
+
+/// §3 `Round2( x, n )` — `(x + (1 << (n - 1))) >> n` for `n > 0`,
+/// identity for `n == 0`. Used by the §5.11.57 unit-grid extents
+/// (`Round2(FrameHeight, subY)` / `Round2(UpscaledWidth, subX)`).
+#[inline]
+fn round2(x: u32, n: u8) -> u32 {
+    if n == 0 {
+        x
+    } else {
+        (x + (1u32 << (n - 1))) >> n
+    }
+}
+
+/// `count_units_in_frame( unitSize, frameSize )` per §5.11.57 (av1-spec
+/// p.105): `Max((frameSize + (unitSize >> 1)) / unitSize, 1)`.
+#[inline]
+fn count_units_in_frame(unit_size: u32, frame_size: u32) -> u32 {
+    core::cmp::max((frame_size + (unit_size >> 1)) / unit_size, 1)
+}
+
+/// Public wrapper over the §5.11.57 [`count_units_in_frame`] helper so
+/// the encoder's [`crate::encoder::loop_restoration_write::write_lr`]
+/// driver computes the identical unit-grid extent the decode-walker does.
+#[inline]
+#[must_use]
+pub fn count_units_in_frame_pub(unit_size: u32, frame_size: u32) -> u32 {
+    count_units_in_frame(unit_size, frame_size)
+}
+
+/// Public wrapper over the §3 [`round2`] helper for the encoder's
+/// §5.11.57 write side.
+#[inline]
+#[must_use]
+pub fn round2_pub(x: u32, n: u8) -> u32 {
+    round2(x, n)
+}
+
+/// Public accessor for `Num_4x4_Blocks_Wide[ bSize ]` (§3) — used by the
+/// encoder's §5.11.57 write driver. Returns `0` for an out-of-range
+/// `b_size` (caller validates against `BLOCK_SIZES` first).
+#[inline]
+#[must_use]
+pub fn num_4x4_blocks_wide_pub(b_size: usize) -> u32 {
+    NUM_4X4_BLOCKS_WIDE.get(b_size).copied().unwrap_or(0) as u32
+}
+
+/// Public accessor for `Num_4x4_Blocks_High[ bSize ]` (§3) — used by the
+/// encoder's §5.11.57 write driver.
+#[inline]
+#[must_use]
+pub fn num_4x4_blocks_high_pub(b_size: usize) -> u32 {
+    NUM_4X4_BLOCKS_HIGH.get(b_size).copied().unwrap_or(0) as u32
+}
+
+/// One decoded §5.11.58 loop-restoration unit's payload — the
+/// `restoration_type` selection plus the Wiener taps (`RESTORE_WIENER`)
+/// or self-guided set / `xqd` (`RESTORE_SGRPROJ`). For `RESTORE_NONE`
+/// the coefficient fields stay zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LrUnit {
+    /// §5.11.58 `LrType[ plane ][ unitRow ][ unitCol ]` — one of
+    /// [`RESTORE_NONE`] / [`RESTORE_WIENER`] / [`RESTORE_SGRPROJ`].
+    pub restoration_type: u8,
+    /// §5.11.58 `LrWiener[ plane ][ unitRow ][ unitCol ][ pass ][ j ]`
+    /// for `pass ∈ 0..2`, `j ∈ 0..WIENER_COEFFS`. Chroma planes force
+    /// `[pass][0] = 0`. Zero unless `restoration_type == RESTORE_WIENER`.
+    pub wiener: [[i32; crate::loop_restoration::WIENER_COEFFS]; 2],
+    /// §5.11.58 `LrSgrSet[ plane ][ unitRow ][ unitCol ]` (`lr_sgr_set`,
+    /// `0..16`). Meaningful only for `RESTORE_SGRPROJ`.
+    pub sgr_set: usize,
+    /// §5.11.58 `LrSgrXqd[ plane ][ unitRow ][ unitCol ][ i ]` for
+    /// `i ∈ 0..2`. Zero unless `restoration_type == RESTORE_SGRPROJ`.
+    pub sgr_xqd: [i32; 2],
+}
+
+/// A §5.11.57 `read_lr` unit decode result, tagged with its grid
+/// coordinates (`plane`, `unit_row`, `unit_col`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedLrUnit {
+    /// Plane index (`0` luma, `1`/`2` chroma).
+    pub plane: usize,
+    /// `unitRow` per §5.11.57.
+    pub unit_row: u32,
+    /// `unitCol` per §5.11.57.
+    pub unit_col: u32,
+    /// The decoded unit payload.
+    pub unit: LrUnit,
+}
+
+/// Frame-level geometry the §5.11.57 `read_lr` unit-window arithmetic
+/// consumes (the §5.9.x quantities the spec references as globals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LrParams {
+    /// `NumPlanes` (§5.9.4).
+    pub num_planes: usize,
+    /// `FrameRestorationType[ plane ]` (§5.9.20) for each of three
+    /// planes — `RESTORE_NONE` for any unused plane.
+    pub frame_restoration_type: [u8; 3],
+    /// `LoopRestorationSize[ plane ]` (§5.9.20) for each of three planes.
+    pub loop_restoration_size: [u32; 3],
+    /// `subsampling_x` (§5.5.2).
+    pub subsampling_x: u8,
+    /// `subsampling_y` (§5.5.2).
+    pub subsampling_y: u8,
+    /// `FrameHeight` (§5.9.5).
+    pub frame_height: u32,
+    /// `UpscaledWidth` (§5.9.5 / §5.9.8).
+    pub upscaled_width: u32,
+    /// `use_superres` (§5.9.8).
+    pub use_superres: bool,
+    /// `SuperresDenom` (§5.9.8).
+    pub superres_denom: u32,
+    /// `allow_intrabc` (§5.9.20) — §5.11.57 returns immediately when set.
+    pub allow_intrabc: bool,
+}
+
 /// `DecodedBlockRecord` — one `decode_block( r, c, subSize )` invocation
 /// emitted by [`PartitionWalker::decode_partition`], in §5.11.4 syntax
 /// order.
@@ -14937,6 +15127,21 @@ pub struct PartitionWalker {
     /// pre-`Clip1` `prediction + Residual[i][j]` sum fits without
     /// truncation across all `BitDepth ∈ {8, 10, 12}` modes.
     curr_frame: [Option<CurrFramePlane>; 3],
+    /// `RefLrWiener[ plane ][ pass ][ WIENER_COEFFS ]` (§5.11.2 /
+    /// §5.11.58 — av1-spec p.60 / p.106). The per-plane, per-pass
+    /// running reference for the §5.11.58 `decode_signed_subexp_with_ref_bool`
+    /// Wiener-tap reads. §5.11.2 `decode_tile()` resets every slot to
+    /// `Wiener_Taps_Mid[ j ]` at tile entry; each §5.11.58 unit that
+    /// decodes a `RESTORE_WIENER` tap overwrites the matching slot with
+    /// the decoded value (so the next unit's subexp read references it).
+    /// Surfaced via [`Self::reset_lr_refs`].
+    ref_lr_wiener: [[[i32; crate::loop_restoration::WIENER_COEFFS]; 2]; 3],
+    /// `RefSgrXqd[ plane ][ 2 ]` (§5.11.2 / §5.11.58 — av1-spec p.60 /
+    /// p.106). The per-plane running reference for the §5.11.58
+    /// self-guided `xqd` subexp reads. §5.11.2 resets every slot to
+    /// `Sgrproj_Xqd_Mid[ i ]` at tile entry; each §5.11.58 unit that
+    /// decodes a `RESTORE_SGRPROJ` `xqd` overwrites the matching slot.
+    ref_sgr_xqd: [[i32; 2]; 3],
 }
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
@@ -15208,7 +15413,27 @@ impl PartitionWalker {
             // lazily on the first per-plane merge call (see
             // [`Self::ensure_curr_frame_plane`]).
             curr_frame: [None, None, None],
+            // §5.11.2 tile-entry reset: RefLrWiener[plane][pass][j] =
+            // Wiener_Taps_Mid[j], RefSgrXqd[plane][pass] =
+            // Sgrproj_Xqd_Mid[pass]. The fresh-walker pre-fill matches
+            // the spec's `decode_tile()` initialisation; the
+            // per-superblock-row reset is surfaced via
+            // [`Self::reset_lr_refs`].
+            ref_lr_wiener: [[crate::loop_restoration::WIENER_TAPS_MID; 2]; 3],
+            ref_sgr_xqd: [crate::loop_restoration::SGRPROJ_XQD_MID; 3],
         })
+    }
+
+    /// §5.11.2 `decode_tile()` loop-restoration reference reset — sets
+    /// `RefLrWiener[ plane ][ pass ][ j ] = Wiener_Taps_Mid[ j ]` and
+    /// `RefSgrXqd[ plane ][ pass ] = Sgrproj_Xqd_Mid[ pass ]` for every
+    /// plane / pass. The walker pre-fills these at construction, so a
+    /// single-tile decode never needs to call this; multi-tile decodes
+    /// (or a re-used walker) call it at each tile's entry to reset the
+    /// running subexp references the §5.11.58 `read_lr_unit` reads.
+    pub fn reset_lr_refs(&mut self) {
+        self.ref_lr_wiener = [[crate::loop_restoration::WIENER_TAPS_MID; 2]; 3];
+        self.ref_sgr_xqd = [crate::loop_restoration::SGRPROJ_XQD_MID; 3];
     }
 
     /// `CompGroupIdxs[ r ][ c ]` accessor — returns the flat grid the
@@ -15724,6 +15949,277 @@ impl PartitionWalker {
         }
 
         Ok(value)
+    }
+
+    /// `read_lr_unit(plane, unitRow, unitCol)` per §5.11.58 (av1-spec
+    /// p.106) — decode one loop-restoration unit's filter selection plus
+    /// (when the unit is `RESTORE_WIENER` / `RESTORE_SGRPROJ`) its filter
+    /// coefficients.
+    ///
+    /// The spec body (av1-spec p.106):
+    ///
+    /// ```text
+    ///   read_lr_unit(plane, unitRow, unitCol) {
+    ///     if ( FrameRestorationType[plane] == RESTORE_WIENER ) {
+    ///       use_wiener                                  S()
+    ///       restoration_type = use_wiener ? RESTORE_WIENER : RESTORE_NONE
+    ///     } else if ( FrameRestorationType[plane] == RESTORE_SGRPROJ ) {
+    ///       use_sgrproj                                 S()
+    ///       restoration_type = use_sgrproj ? RESTORE_SGRPROJ : RESTORE_NONE
+    ///     } else {
+    ///       restoration_type                            S()
+    ///     }
+    ///     LrType[plane][unitRow][unitCol] = restoration_type
+    ///     if ( restoration_type == RESTORE_WIENER ) {
+    ///       for ( pass = 0; pass < 2; pass++ ) {
+    ///         firstCoeff = plane ? 1 : 0      // LrWiener[..][..][pass][0]=0 for chroma
+    ///         for ( j = firstCoeff; j < 3; j++ ) {
+    ///           v = decode_signed_subexp_with_ref_bool(
+    ///                 Wiener_Taps_Min[j], Wiener_Taps_Max[j] + 1,
+    ///                 Wiener_Taps_K[j], RefLrWiener[plane][pass][j])
+    ///           LrWiener[plane][unitRow][unitCol][pass][j] = v
+    ///           RefLrWiener[plane][pass][j] = v
+    ///         }
+    ///       }
+    ///     } else if ( restoration_type == RESTORE_SGRPROJ ) {
+    ///       lr_sgr_set                          L(SGRPROJ_PARAMS_BITS)
+    ///       for ( i = 0; i < 2; i++ ) {
+    ///         radius = Sgr_Params[lr_sgr_set][i*2]
+    ///         min = Sgrproj_Xqd_Min[i]; max = Sgrproj_Xqd_Max[i]
+    ///         if ( radius ) {
+    ///           v = decode_signed_subexp_with_ref_bool(
+    ///                 min, max + 1, SGRPROJ_PRJ_SUBEXP_K, RefSgrXqd[plane][i])
+    ///         } else {
+    ///           v = 0
+    ///           if ( i == 1 ) v = Clip3(min, max,
+    ///                  (1 << SGRPROJ_PRJ_BITS) - RefSgrXqd[plane][0])
+    ///         }
+    ///         LrSgrXqd[plane][unitRow][unitCol][i] = v
+    ///         RefSgrXqd[plane][i] = v
+    ///       }
+    ///     }
+    ///   }
+    /// ```
+    ///
+    /// `frame_restoration_type` is the §5.9.20 `FrameRestorationType[
+    /// plane ]` ordinal (`0..=3`). The running `RefLrWiener` /
+    /// `RefSgrXqd` walker state advances exactly as the spec dictates so
+    /// successive units in the tile reference the previous unit's taps.
+    ///
+    /// Returns the decoded [`LrUnit`] (the `restoration_type`, plus the
+    /// Wiener taps or sgr set / xqd payload). [`Error::PartitionWalkOutOfRange`]
+    /// for a `plane >= 3` or `frame_restoration_type > 3` caller bug;
+    /// [`Error::UnexpectedEnd`] for underlying bitstream errors.
+    ///
+    /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
+    pub fn decode_lr_unit(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        plane: usize,
+        frame_restoration_type: u8,
+    ) -> Result<LrUnit, crate::Error> {
+        use crate::loop_restoration::{
+            SGRPROJ_PARAMS_BITS, SGRPROJ_PRJ_BITS, SGRPROJ_PRJ_SUBEXP_K, SGRPROJ_XQD_MAX,
+            SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX,
+            WIENER_TAPS_MIN,
+        };
+        if plane >= 3 || frame_restoration_type > RESTORE_SWITCHABLE {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.58 filter-selection S(): the read CDF + decode-to-
+        // restoration_type mapping depends on the plane's
+        // FrameRestorationType.
+        let restoration_type = match frame_restoration_type {
+            RESTORE_WIENER => {
+                // `use_wiener` — binary S() over TileUseWienerCdf.
+                let sym = decoder.read_symbol(cdfs.use_wiener_cdf())?;
+                debug_assert!(sym <= 1, "use_wiener S() yields 0 or 1");
+                if sym != 0 {
+                    RESTORE_WIENER
+                } else {
+                    RESTORE_NONE
+                }
+            }
+            RESTORE_SGRPROJ => {
+                // `use_sgrproj` — binary S() over TileUseSgrprojCdf.
+                let sym = decoder.read_symbol(cdfs.use_sgrproj_cdf())?;
+                debug_assert!(sym <= 1, "use_sgrproj S() yields 0 or 1");
+                if sym != 0 {
+                    RESTORE_SGRPROJ
+                } else {
+                    RESTORE_NONE
+                }
+            }
+            RESTORE_SWITCHABLE => {
+                // `restoration_type` — 3-symbol S() over
+                // TileRestorationTypeCdf (RESTORE_NONE / WIENER / SGRPROJ).
+                let sym = decoder.read_symbol(cdfs.restoration_type_cdf())?;
+                debug_assert!(sym <= 2, "restoration_type S() yields 0..=2");
+                sym as u8
+            }
+            // RESTORE_NONE: read_lr never calls read_lr_unit for a
+            // RESTORE_NONE plane (the §5.11.57 guard skips it), so this
+            // arm is unreachable in spec-faithful callers; treat it as a
+            // no-op selection rather than panicking.
+            _ => RESTORE_NONE,
+        };
+
+        match restoration_type {
+            RESTORE_WIENER => {
+                let mut wiener = [[0i32; WIENER_COEFFS]; 2];
+                let ref_wiener = &mut self.ref_lr_wiener[plane];
+                for (out_pass, ref_pass) in wiener.iter_mut().zip(ref_wiener.iter_mut()) {
+                    // §5.11.58: chroma planes force LrWiener[..][pass][0]
+                    // = 0 and start the subexp read at j = 1.
+                    let first_coeff = if plane != 0 { 1 } else { 0 };
+                    for j in first_coeff..WIENER_COEFFS {
+                        let min = i64::from(WIENER_TAPS_MIN[j]);
+                        let max = i64::from(WIENER_TAPS_MAX[j]);
+                        let k = WIENER_TAPS_K[j];
+                        let r = i64::from(ref_pass[j]);
+                        let v = decoder.decode_signed_subexp_with_ref_bool(min, max + 1, k, r)?;
+                        let v = v as i32;
+                        out_pass[j] = v;
+                        ref_pass[j] = v;
+                    }
+                }
+                Ok(LrUnit {
+                    restoration_type,
+                    wiener,
+                    sgr_set: 0,
+                    sgr_xqd: [0; 2],
+                })
+            }
+            RESTORE_SGRPROJ => {
+                // `lr_sgr_set` — L(SGRPROJ_PARAMS_BITS).
+                let sgr_set = decoder.read_literal(SGRPROJ_PARAMS_BITS)? as usize;
+                debug_assert!(sgr_set < SGR_PARAMS.len(), "lr_sgr_set < 16");
+                let mut sgr_xqd = [0i32; 2];
+                for i in 0..2 {
+                    let radius = SGR_PARAMS[sgr_set][i * 2];
+                    let min = i64::from(SGRPROJ_XQD_MIN[i]);
+                    let max = i64::from(SGRPROJ_XQD_MAX[i]);
+                    let v: i32 = if radius != 0 {
+                        let r = i64::from(self.ref_sgr_xqd[plane][i]);
+                        decoder.decode_signed_subexp_with_ref_bool(
+                            min,
+                            max + 1,
+                            SGRPROJ_PRJ_SUBEXP_K,
+                            r,
+                        )? as i32
+                    } else if i == 1 {
+                        // §5.11.58 derived value when radius == 0 on i==1.
+                        let derived = (1i32 << SGRPROJ_PRJ_BITS) - self.ref_sgr_xqd[plane][0];
+                        derived.clamp(min as i32, max as i32)
+                    } else {
+                        0
+                    };
+                    sgr_xqd[i] = v;
+                    self.ref_sgr_xqd[plane][i] = v;
+                }
+                Ok(LrUnit {
+                    restoration_type,
+                    wiener: [[0; WIENER_COEFFS]; 2],
+                    sgr_set,
+                    sgr_xqd,
+                })
+            }
+            // RESTORE_NONE: no filter coefficients follow.
+            _ => Ok(LrUnit {
+                restoration_type,
+                wiener: [[0; WIENER_COEFFS]; 2],
+                sgr_set: 0,
+                sgr_xqd: [0; 2],
+            }),
+        }
+    }
+
+    /// `read_lr(r, c, bSize)` per §5.11.57 (av1-spec p.105) — the
+    /// per-superblock loop-restoration unit driver. For each plane that
+    /// uses restoration, computes the unit-grid window the superblock
+    /// `(r, c)` of size `bSize` covers and calls
+    /// [`Self::decode_lr_unit`] for every `(unitRow, unitCol)` inside it.
+    ///
+    /// `params` carries the §5.9.x frame-level geometry the unit-window
+    /// arithmetic needs (frame/upscaled dimensions, per-plane
+    /// `LoopRestorationSize`, subsampling, the §5.11.57 `allow_intrabc`
+    /// short-circuit and the superres parameters). The returned vector
+    /// lists every decoded unit in §5.11.57 raster order
+    /// (`(plane, unitRow, unitCol, LrUnit)`), so the caller can route the
+    /// taps into the §7.17 restoration grid.
+    ///
+    /// Returns an empty vector when `allow_intrabc` is set (§5.11.57
+    /// returns immediately) or every plane is `RESTORE_NONE`.
+    /// [`Error::PartitionWalkOutOfRange`] for a caller-bug `bSize`.
+    pub fn read_lr(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        r: u32,
+        c: u32,
+        b_size: usize,
+        params: &LrParams,
+    ) -> Result<Vec<DecodedLrUnit>, crate::Error> {
+        if b_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.57: intra-block-copy frames carry no loop restoration.
+        if params.allow_intrabc {
+            return Ok(Vec::new());
+        }
+        let w = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+        let h = NUM_4X4_BLOCKS_HIGH[b_size] as u32;
+        let mut out: Vec<DecodedLrUnit> = Vec::new();
+        for plane in 0..params.num_planes {
+            let frt = params.frame_restoration_type[plane];
+            if frt == RESTORE_NONE {
+                continue;
+            }
+            let sub_x = if plane == 0 { 0 } else { params.subsampling_x };
+            let sub_y = if plane == 0 { 0 } else { params.subsampling_y };
+            let unit_size = params.loop_restoration_size[plane];
+            if unit_size == 0 {
+                continue;
+            }
+            // §5.11.57 unit-grid extents.
+            let unit_rows = count_units_in_frame(unit_size, round2(params.frame_height, sub_y));
+            let unit_cols = count_units_in_frame(unit_size, round2(params.upscaled_width, sub_x));
+            let mi_size_shift_y = (MI_SIZE as u32) >> sub_y;
+            let unit_row_start = (r * mi_size_shift_y).div_ceil(unit_size);
+            let unit_row_end =
+                core::cmp::min(unit_rows, ((r + h) * mi_size_shift_y).div_ceil(unit_size));
+            let mi_size_shift_x = (MI_SIZE as u32) >> sub_x;
+            let (numerator, denominator) = if params.use_superres {
+                (
+                    mi_size_shift_x * params.superres_denom,
+                    unit_size * SUPERRES_NUM,
+                )
+            } else {
+                (mi_size_shift_x, unit_size)
+            };
+            let unit_col_start = (c * numerator).div_ceil(denominator);
+            let unit_col_end =
+                core::cmp::min(unit_cols, ((c + w) * numerator).div_ceil(denominator));
+            let mut unit_row = unit_row_start;
+            while unit_row < unit_row_end {
+                let mut unit_col = unit_col_start;
+                while unit_col < unit_col_end {
+                    let unit = self.decode_lr_unit(decoder, cdfs, plane, frt)?;
+                    out.push(DecodedLrUnit {
+                        plane,
+                        unit_row,
+                        unit_col,
+                        unit,
+                    });
+                    unit_col += 1;
+                }
+                unit_row += 1;
+            }
+        }
+        Ok(out)
     }
 
     /// Helper to read `SkipModes[ r ][ c ]`. Returns `0` for

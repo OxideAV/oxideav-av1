@@ -2,6 +2,47 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-13 (round 287)
+
+Round 287 lands the **§5.11.57 `read_lr()` / §5.11.58
+`read_lr_unit()` loop-restoration unit syntax** on BOTH the decode
+walker and the encode write side, in lockstep — the next §5.11
+syntax element beyond r286's §5.11.47 `transform_type()`:
+
+* **Decode walker (`PartitionWalker::read_lr` /
+  `decode_lr_unit`)** — the per-superblock §5.11.57 unit-window
+  driver (per-plane `count_units_in_frame` / `Round2` grid
+  arithmetic, the `use_superres` numerator/denominator split, the
+  `allow_intrabc` short-circuit) calling the §5.11.58 per-unit
+  reader: the filter-selection S() (`use_wiener` /
+  `use_sgrproj` / 3-symbol `restoration_type`) plus the
+  `RESTORE_WIENER` tap reads and `RESTORE_SGRPROJ`
+  `lr_sgr_set` + `xqd` reads via the new
+  `decode_signed_subexp_with_ref_bool` arithmetic-coded
+  recentred-subexponential path. Advances the running
+  `RefLrWiener` / `RefSgrXqd` references exactly as §5.11.2
+  dictates (`reset_lr_refs` surfaces the tile-entry mid-value
+  reset).
+* **Write side (`encoder::loop_restoration_write::write_lr` /
+  `write_lr_unit`)** — the byte-exact inverse: the same
+  unit-window geometry, the three §8.3.2 CDFs
+  (`TileUseWienerCdf` / `TileUseSgrprojCdf` /
+  `TileRestorationTypeCdf` seeded from their §9.4 defaults), and
+  the new `write_signed_subexp_with_ref_bool` (built on the
+  `recenter` forward of §5.9.29 `inverse_recenter`). An
+  `LrWriteState` mirrors the decoder's running references.
+* **Round-trip tests** — Wiener / sgrproj / switchable-NONE units,
+  a full `read_lr` superblock window, the `allow_intrabc`
+  no-emit path, plus exhaustive `recenter`/`inverse_recenter` and
+  `signed_subexp_with_ref_bool` round-trips across every §5.11.58
+  Wiener-tap and sgr-xqd range.
+
+The three new CDFs are not context-indexed (§8.3.1 seeds a single
+copy each); the §7.17 restoration filter that consumes the decoded
+taps was already implemented (`src/loop_restoration.rs`), so this
+round closes the *bitstream* gap between the frame-header
+`FrameRestorationType` (§5.9.20) and the post-decode filter.
+
 ## Status — 2026-06-13 (round 286)
 
 Round 286 lands the **§5.11.47 `transform_type()` write side** —

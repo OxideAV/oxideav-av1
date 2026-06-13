@@ -51,6 +51,19 @@ fn floor_log2(x: u32) -> u32 {
     }
 }
 
+/// `inverse_recenter(r, v)` per §5.9.29. Shared by the
+/// `decode_*_subexp_with_ref_bool` helpers (the arithmetic-coded twins
+/// of the §5.9.26/§5.9.27 header-bitstream recentred reads).
+fn inverse_recenter(r: i64, v: i64) -> i64 {
+    if v > 2 * r {
+        v
+    } else if v & 1 != 0 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
+}
+
 /// The AV1 symbol (arithmetic) decoder, §8.2.
 ///
 /// Wraps the crate's MSB-first `BitReader` positioned at the
@@ -363,6 +376,52 @@ impl<'a> SymbolDecoder<'a> {
                 return Ok(subexp_bools + mk);
             }
         }
+    }
+
+    /// `decode_unsigned_subexp_with_ref_bool( mx, k, r )` — av1-spec
+    /// p.108. The arithmetic-coded twin of §5.9.27
+    /// `decode_unsigned_subexp_with_ref` (which reads `decode_subexp`
+    /// directly from the header bitstream). Returns a value in `0..mx`.
+    ///
+    /// ```text
+    ///   v = decode_subexp_bool(mx, k)
+    ///   if ( (r << 1) <= mx ) return inverse_recenter(r, v)
+    ///   else return mx - 1 - inverse_recenter(mx - 1 - r, v)
+    /// ```
+    pub fn decode_unsigned_subexp_with_ref_bool(
+        &mut self,
+        mx: i64,
+        k: u32,
+        r: i64,
+    ) -> Result<i64, Error> {
+        // `mx` for the §5.11.58 callers is `Wiener_Taps_Max[j] + 1 -
+        // Wiener_Taps_Min[j]` (<= 64) or `Sgrproj_Xqd_Max[i] + 1 -
+        // Sgrproj_Xqd_Min[i]` (<= 128), well within u32.
+        let v = i64::from(self.decode_subexp_bool(mx as u32, k)?);
+        if (r << 1) <= mx {
+            Ok(inverse_recenter(r, v))
+        } else {
+            Ok(mx - 1 - inverse_recenter(mx - 1 - r, v))
+        }
+    }
+
+    /// `decode_signed_subexp_with_ref_bool( low, high, k, r )` —
+    /// av1-spec p.108. The arithmetic-coded twin of §5.9.26
+    /// `decode_signed_subexp_with_ref`. Returns a value in `low..high`.
+    ///
+    /// ```text
+    ///   x = decode_unsigned_subexp_with_ref_bool(high - low, k, r - low)
+    ///   return x + low
+    /// ```
+    pub fn decode_signed_subexp_with_ref_bool(
+        &mut self,
+        low: i64,
+        high: i64,
+        k: u32,
+        r: i64,
+    ) -> Result<i64, Error> {
+        let x = self.decode_unsigned_subexp_with_ref_bool(high - low, k, r - low)?;
+        Ok(x + low)
     }
 
     /// `exit_symbol()` — §8.2.4.
