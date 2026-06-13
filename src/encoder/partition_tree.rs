@@ -2120,6 +2120,14 @@ fn write_residual(
     if tu_idx != block.residual_quant.len() {
         return Err(Error::PartitionWalkOutOfRange);
     }
+    // r286 — the §5.11.47 per-luma-TU `TxType` commitment vector, when
+    // supplied, must be EXACTLY the visited luma-TU count (a shortfall
+    // silently defaults the tail to `DCT_DCT`; a surplus is a caller
+    // bug). An empty vector is the explicit `all-DCT_DCT` opt-out and
+    // is always allowed.
+    if !block.residual_tx_type.is_empty() && luma_tx_idx != block.residual_tx_type.len() {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
     Ok(())
 }
 
@@ -4726,5 +4734,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err2, Error::PartitionWalkOutOfRange));
+
+        // (3) A non-empty `residual_tx_type` with a surplus entry (more
+        // committed luma `TxType`s than the block has luma TUs) is the
+        // same caller bug as a `residual_quant` surplus. BLOCK_8X8
+        // 4:4:4 with base_q_idx = 0 has one TX_16X16... no — one TX_8X8
+        // luma TU; supplying two commitments is a surplus.
+        let mut params3 = SyntaxFrameParams::intra_8bit_baseline();
+        params3.quant.base_q_idx = 64;
+        params3.quant.current_q_index = 64;
+        let mut writer3 = SymbolWriter::new(false);
+        let mut cdfs3 = TileCdfContext::new_from_defaults();
+        let mut state3 = PartitionSyntaxWriter::new(2, 2, single_tile(2, 2)).unwrap();
+        let mut block3 = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+        block3.skip = 0;
+        block3.residual_quant = vec![quant_with(64, &[(0, 1)]); 3];
+        block3.residual_tx_type = vec![DCT_DCT as u8, DCT_DCT as u8];
+        let err3 = super::write_block_syntax(
+            &mut writer3,
+            &mut cdfs3,
+            &mut state3,
+            &block3,
+            0,
+            0,
+            BLOCK_8X8,
+            &params3,
+        )
+        .unwrap_err();
+        assert!(matches!(err3, Error::PartitionWalkOutOfRange));
     }
 }
