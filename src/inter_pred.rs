@@ -6359,6 +6359,139 @@ mod tests {
         );
     }
 
+    /// §7.11.3.1 SIMPLE single-ref translational MC against a fully
+    /// **independent hand-built reference** — the proof that the
+    /// public `predict_inter` entry performs a real §7.11.3.2
+    /// sub-pel (fractional-MV) EIGHTTAP interpolation, not just the
+    /// integer-aligned copy that the zero-MV test above exercises.
+    ///
+    /// Setup (all derived directly from av1-spec §7.11.3.3/.4, no
+    /// dependence on this crate's own `motion_vector_scaling` /
+    /// `block_inter_prediction` outputs):
+    ///
+    /// * Non-scaled 16×16 reference (`RefUpscaledWidth ==
+    ///   FrameWidth == 16`), synthetic samples `ref[r][c] = r*16+c`.
+    /// * Prediction origin `(x, y) = (4, 4)`, region `4×4`, luma.
+    /// * `mv = [mv_row, mv_col] = [0, 4]` in 1/8-luma-sample units
+    ///   — `mv_col = 4` is exactly +0.5 sample horizontally,
+    ///   `mv_row = 0` is integer-aligned vertically.
+    ///
+    /// Walking §7.11.3.3 by hand for the non-scaled case
+    /// (`xScale = yScale = 1<<REF_SCALE_SHIFT = 16384`,
+    /// `stepX = stepY = 1024`):
+    ///
+    /// ```text
+    ///   origX = (4<<4) + 2*4   + 8 = 64 + 8 + 8 = 80
+    ///   baseX = 80*16384 - (8<<14)        = 1179648
+    ///   startX = Round2Signed(1179648, 8) + 32 = 4608 + 32 = 4640
+    ///   origY = (4<<4) + 2*0   + 8 = 72
+    ///   baseY = 72*16384 - (8<<14)        = 1048576
+    ///   startY = Round2Signed(1048576, 8) + 32 = 4096 + 32 = 4128
+    /// ```
+    ///
+    /// so the horizontal phase is `(4640>>6)&15 = 8` (the symmetric
+    /// half-sample EIGHTTAP row `[0,2,-14,76,76,-14,2,0]`) and the
+    /// vertical phase is `((4128&1023)>>6)&15 = 0` (the unit-copy
+    /// row `[0,0,0,128,0,0,0,0]`). The integer column origin is
+    /// `4640>>10 = 4`, the integer row origin `4128>>10 = 4`.
+    ///
+    /// Because the vertical filter is the phase-0 unit copy, the
+    /// §7.11.3.4 two-pass convolution degenerates to: for each
+    /// output row `i` (mapped to reference row `4+i`), the
+    /// half-sample horizontal EIGHTTAP applied to `ref[4+i][1..=8]`,
+    /// `Round2`'d by `InterRound0 = 3` then by `InterRound1 = 11`
+    /// against the `*128` vertical unit tap. Worked for row 0:
+    ///
+    /// ```text
+    ///   s = 2*66 -14*67 +76*68 +76*69 -14*70 +2*71 = 8768
+    ///   h = Round2(8768, 3) = 1096
+    ///   pred = Round2(128*1096, 11) = Round2(140288, 11) = 69
+    /// ```
+    ///
+    /// The full hand-computed 4×4 oracle (samples stay in 8-bit
+    /// range so `Clip1` is a no-op) is the `EXPECTED` literal below.
+    #[test]
+    fn r291_predict_inter_half_sample_mv_matches_hand_built_reference() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (r * 16 + c) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 4], // [mv_row, mv_col] — +0.5 sample horizontally
+        }];
+        let w = 4;
+        let h = 4;
+        let mut pred_out = vec![0u16; w * h];
+        predict_inter(
+            /* plane */ 0,
+            /* x */ 4,
+            /* y */ 4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            /* is_compound */ false,
+            /* is_inter_intra */ false,
+            /* bit_depth */ 8,
+            /* subsampling_x */ 0,
+            /* subsampling_y */ 0,
+            /* frame_width */ ref_w as u32,
+            /* frame_height */ ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            /* compound */ None,
+            /* warp */ None,
+            /* obmc */ None,
+            &mut pred_out,
+        )
+        .expect("predict_inter SIMPLE single-ref half-sample MC");
+
+        // Hand-built reference (see doc comment for the §7.11.3.4
+        // derivation): a +0.5-sample horizontal shift of the
+        // synthetic `ref[r][c] = r*16+c` plane over the 4×4 region
+        // rooted at reference (row=4, col=4).
+        #[rustfmt::skip]
+        let expected: [u16; 16] = [
+            69,  70,  71,  72,
+            85,  86,  87,  88,
+            101, 102, 103, 104,
+            117, 118, 119, 120,
+        ];
+        assert_eq!(
+            pred_out, expected,
+            "predict_inter half-sample MV must match the hand-built \
+             §7.11.3.4 EIGHTTAP oracle"
+        );
+
+        // Sanity: the half-sample shift genuinely interpolated —
+        // the output must differ from the integer-aligned copy of
+        // the same region (`ref[4+i][4+j]`), confirming a real
+        // sub-pel filter ran rather than a passthrough.
+        let mut differs = false;
+        for i in 0..h {
+            for j in 0..w {
+                let integer = refp[(4 + i) * stride + (4 + j)];
+                if pred_out[i * w + j] != integer {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "half-sample MV must interpolate, not copy the integer grid"
+        );
+    }
+
     /// §7.11.3.1 caller-bug matrix (post-r203) — all four motion
     /// modes now have driver-side wiring; what remain are the
     /// caller-bug guards that surface `PartitionWalkOutOfRange` when

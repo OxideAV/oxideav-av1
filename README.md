@@ -2,6 +2,34 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 291)
+
+Round 291 **proves the public §7.11.3.1 `predict_inter` entry performs a
+real sub-pel motion-compensated interpolation** — closing the gap where
+the only end-to-end `predict_inter` translational test exercised a
+zero-MV (integer-aligned) copy and validated the driver only against its
+own leaf composition (self-consistency, not an independent oracle).
+
+The new `r291_predict_inter_half_sample_mv_matches_hand_built_reference`
+test drives `predict_inter` (SIMPLE motion mode, single forward ref, no
+warp/OBMC/compound) over a synthetic 16×16 reference (`ref[r][c] =
+r*16+c`) with `mv = [0, 4]` — exactly +0.5 sample horizontally,
+integer-aligned vertically — and asserts the 4×4 output equals a
+fully **hand-derived §7.11.3.3/.4 oracle**. The MV-scaling walk
+(`xScale = 16384`, `startX = 4640` ⇒ horizontal phase 8, the symmetric
+half-sample EIGHTTAP row `[0,2,-14,76,76,-14,2,0]`; `startY = 4128` ⇒
+vertical phase 0 unit copy) and the two-pass `Round2` convolution are
+computed by hand in the test's doc comment (row-0 worked example:
+`s = 8768 → h = 1096 → pred = 69`). A second assertion confirms the
+output genuinely differs from the integer-grid copy of the same region,
+so a real sub-pel filter ran rather than a passthrough.
+
++1 lib test (1971 → 1972). No production code changed — the
+§7.11.3.2–.4 chain (`rounding_variables` / `motion_vector_scaling` /
+`SUBPEL_FILTERS` / `block_inter_prediction` / `clip1_single_ref`) was
+already in place; this round upgrades its provenance from
+self-consistency to an independent hand-built reference.
+
 ## Status — 2026-06-13 (round 290)
 
 Round 290 **produces a real post-CDEF `CdefFrame` from the persisted

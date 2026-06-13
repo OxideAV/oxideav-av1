@@ -4,6 +4,25 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r291 (2026-06-14): prove the public §7.11.3.1 `predict_inter`
+  entry performs a real sub-pel motion-compensated interpolation. New
+  test `r291_predict_inter_half_sample_mv_matches_hand_built_reference`
+  drives `predict_inter` (SIMPLE motion mode, single forward ref, no
+  warp/OBMC/compound) over a synthetic 16×16 reference with
+  `mv = [0, 4]` (exactly +0.5 sample horizontally, integer-aligned
+  vertically) and asserts the 4×4 output equals a fully hand-derived
+  §7.11.3.3/.4 oracle: `startX = 4640` ⇒ horizontal phase 8 (the
+  symmetric half-sample EIGHTTAP row `[0,2,-14,76,76,-14,2,0]`),
+  `startY = 4128` ⇒ vertical phase 0 (unit copy), with the two-pass
+  `Round2` convolution computed by hand (row-0 worked: `s = 8768 →
+  h = 1096 → pred = 69`). A second assertion confirms the output
+  genuinely differs from the integer-grid copy, so a real sub-pel
+  filter ran rather than a passthrough. This upgrades the
+  translational-MC chain's provenance from self-consistency (the prior
+  zero-MV test validated the driver only against its own leaf
+  composition) to an independent hand-built reference. No production
+  code changed. +1 lib test (1971 → 1972).
+
 - decoder r290 (2026-06-13): produce a real `CdefFrame` from the persisted
   §5.11.56 `cdef_idx` grid so the §7.17 loop-restoration bridge (r289)
   consumes a genuinely-filtered post-CDEF frame rather than a
