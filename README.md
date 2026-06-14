@@ -2,6 +2,45 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 299)
+
+Round 299 **wires the §5.11.33 frame-walk inter-intra leaf into
+`reconstruct_inter_frame`** — lifting the r294-r298 walker's
+`RefFrame[1] == INTRA_FRAME` skip. New
+`reconstruct_inter_block_interintra` is the inter-intra sibling of the
+single-ref `reconstruct_inter_block` and the compound
+`reconstruct_inter_block_compound` drivers.
+
+* **In-place intra second operand.** Unlike the compound arms, the
+  second blend operand is **not** another inter prediction: it is the
+  §7.11.2 intra prediction already present in `CurrFrame[plane]` at the
+  leaf's `(baseX, baseY)`. The spec runs `predict_intra` *before*
+  `predict_inter` on this arm (av1-spec p.83 lines 5141-5163) and reads
+  it back as `pred1 = CurrFrame[plane][y+dstY][x+dstX]` (p.284 line
+  15786). The driver seeds a `w × h` scratch from `curr`, runs
+  `predict_inter` with `is_inter_intra == true`, and stitches the
+  §7.11.3.14-blended result back. **The caller must therefore write the
+  §7.11.2 intra prediction into each plane's `curr` buffer for every
+  inter-intra leaf before the walk** — this walk supplies only the inter
+  half of the blend.
+* **Both sub-arms driven.** The §7.11.3.13 non-wedge intra-variant mask
+  (`wedge_interintra == 0`) and the §7.11.3.11 luma-grid wedge mask
+  (`wedge_interintra == 1`, `wedge_sign == 0` fixed by §5.11.28, built
+  once at `plane == 0` per p.258 line 14386 into a persistent buffer
+  reused for chroma). The walk reads `interintra_modes` /
+  `wedge_interintras` / `interintra_wedge_indices` (three new
+  `InterModeInfoGrid` slices) at each inter-intra leaf's origin.
+* **Scope.** This advances the §5.11.33 `reconstruct_inter_frame`
+  driver. The separate §5.11.30 task-emitting `compute_prediction`
+  dispatcher in `cdf.rs` still gates its inter-intra arm — its inter
+  path is not yet wired end-to-end; OBMC / warp inter-intra interactions
+  remain out of scope.
+
++3 lib tests net (1987 → 1990): a per-block inter-intra driver
+cross-checked against the direct `predict_inter` composition, a
+frame-walk leaf driven byte-for-byte identically to the per-block
+driver, and a wedge-vs-non-wedge frame-walk divergence test.
+
 ## Status — 2026-06-14 (round 298)
 
 Round 298 **adds the `wedge_interintra == 1` sub-arm to the §7.11.3.1

@@ -4,6 +4,36 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r299 (2026-06-14): wire the §5.11.33 frame-walk **inter-intra
+  leaf** into `reconstruct_inter_frame`. New
+  `reconstruct_inter_block_interintra` is the inter-intra sibling of
+  `reconstruct_inter_block` / `reconstruct_inter_block_compound`: it
+  resolves the single inter `RefFrame[0]` through the §7.11.3.3
+  indirection, seeds a `w × h` scratch with the §7.11.2 intra prediction
+  read in place from `CurrFrame[plane]` at `(x, y)` (av1-spec p.83 lines
+  5141-5163 run `predict_intra` before `predict_inter` on this arm; p.284
+  line 15786 reads it as `pred1 = CurrFrame[plane][..]`), runs
+  `predict_inter` with `is_inter_intra == true`, and stitches the
+  §7.11.3.14-blended block back. Both sub-arms are driven: the §7.11.3.13
+  non-wedge intra-variant mask (`wedge_interintra == 0`) and the
+  §7.11.3.11 luma-grid wedge mask (`wedge_interintra == 1`, `wedge_sign ==
+  0` fixed by §5.11.28 p.79 line 4965, regenerated once at `plane == 0`
+  per p.258 line 14386 into a persistent buffer reused for chroma). The
+  `reconstruct_inter_frame` walk's `RefFrame[1] == INTRA_FRAME` cells —
+  previously skipped — now drive the new leaf, reading
+  `interintra_modes` / `wedge_interintras` / `interintra_wedge_indices`
+  at each leaf origin (three new `InterModeInfoGrid` slices). The caller
+  must have written the §7.11.2 intra prediction into each plane's `curr`
+  buffer for every inter-intra leaf's footprint before the walk (this walk
+  supplies only the inter half of the blend). New public types
+  `InterIntraModeInfo` / `InterIntraWedgeModeInfo`. +3 lib tests net
+  (1987 → 1990): a per-block inter-intra driver cross-checked against the
+  direct `predict_inter` composition, a frame-walk leaf driven identically
+  to the per-block driver, and a wedge-vs-non-wedge frame-walk divergence
+  test. (Out of scope: the separate §5.11.30 task-emitting
+  `compute_prediction` dispatcher in `cdf.rs` still gates its inter-intra
+  arm — its inter path is not yet wired end-to-end; this round advances
+  the §5.11.33 `reconstruct_inter_frame` driver, not that dispatcher.)
 - decoder r298 (2026-06-14): add the `wedge_interintra == 1` sub-arm to
   the §7.11.3.1 inter-intra blend. When `wedge_interintra == 1` the spec
   sets `compound_type == COMPOUND_WEDGE` (av1-spec p.80 line 5017), so

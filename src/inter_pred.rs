@@ -5319,6 +5319,290 @@ pub fn reconstruct_inter_block_compound(
     Ok(())
 }
 
+/// §7.11.3.1 inter-intra mode-info descriptor — the decoded
+/// `(RefFrame[0], Mvs[..][0])` pair for an inter-intra block
+/// (`RefFrame[1] == INTRA_FRAME`, so `isCompound == 0`) plus the
+/// §5.11.28 `interintra_mode` and the optional `wedge_interintra == 1`
+/// sub-arm selectors.
+///
+/// `ref_frame_0` is the single inter reference (`LAST_FRAME..=ALTREF_FRAME`,
+/// 1..=7) — the inter-intra block forms exactly one inter prediction from
+/// it; the second operand of the §7.11.3.14 blend is the §7.11.2 intra
+/// prediction the caller already wrote into `CurrFrame[plane]` (av1-spec
+/// p.83 lines 5141-5163: `predict_intra` runs *before* `predict_inter`
+/// on the `IsInterIntra` arm, and p.284 line 15786: `pred1 =
+/// CurrFrame[plane][y+dstY][x+dstX]`).
+///
+/// `interintra_mode` is the §5.11.28 ordinal (`II_DC_PRED` / `II_V_PRED`
+/// / `II_H_PRED` / `II_SMOOTH_PRED`, 0..=3) that selects the §7.11.3.13
+/// [`intra_mode_variant_mask`] variant on the non-wedge sub-arm. When
+/// [`wedge`] is `None` the §7.11.3.13 mask is used directly at
+/// `Mask[y][x]` (the non-wedge `COMPOUND_INTRA` arm); when `Some(_)` the
+/// §7.11.3.11 luma-grid wedge mask is used instead (`wedge_interintra ==
+/// 1` ⇒ `compound_type == COMPOUND_WEDGE`, av1-spec p.80 line 5017), with
+/// [`reconstruct_inter_block_interintra`] regenerating it from the decoded
+/// `(MiSize, wedge_index)` (and `wedge_sign == 0`, fixed by §5.11.28
+/// p.79 line 4965).
+///
+/// [`wedge`]: InterIntraModeInfo::wedge
+#[derive(Debug, Clone, Copy)]
+pub struct InterIntraModeInfo {
+    /// §7.11.3.1 step 5 `RefFrame[ 0 ]` (1..=7) — the single inter
+    /// reference.
+    pub ref_frame: u8,
+    /// §7.11.3.1 step 8 `Mvs[ candRow ][ candCol ][ 0 ]`, `[mv_row,
+    /// mv_col]` in 1/8-luma-sample units.
+    pub mv: [i16; 2],
+    /// §5.11.28 `interintra_mode` (0..=3).
+    pub interintra_mode: u8,
+    /// §7.11.3.11 wedge selectors — `Some(_)` selects the
+    /// `wedge_interintra == 1` sub-arm (the §7.11.3.11 luma-grid wedge
+    /// mask, regenerated from `(MiSize, wedge_index)` with `wedge_sign ==
+    /// 0`); `None` selects the §7.11.3.13 intra-variant sub-arm
+    /// (`wedge_interintra == 0`).
+    pub wedge: Option<InterIntraWedgeModeInfo>,
+}
+
+/// §7.11.3.11 wedge selectors for an inter-intra `wedge_interintra == 1`
+/// leaf — the decoded `(MiSize, wedge_index)` from which
+/// [`reconstruct_inter_block_interintra`] regenerates the luma-grid mask
+/// via [`wedge_mask`].
+///
+/// `wedge_sign` is **not** carried: §5.11.28 (av1-spec p.79 line 4965)
+/// fixes `wedge_sign = 0` for the interintra arm, so the driver always
+/// passes `0`. The `mi_size` is the *luma* block size (the §7.11.3.11
+/// `WedgeMasks[MiSize]` index); the mask is luma-grid and reused for
+/// chroma via the persistent buffer the driver fills at `plane == 0`.
+#[derive(Debug, Clone, Copy)]
+pub struct InterIntraWedgeModeInfo {
+    /// `MiSize` — the luma `BLOCK_SIZES` index; must have
+    /// `WEDGE_BITS[mi_size] > 0`.
+    pub mi_size: usize,
+    /// §5.11.28 `wedge_index` — codebook ordinal in `0..16`.
+    pub wedge_index: u8,
+}
+
+/// §7.11.3.1 inter-intra reconstruction — drives one decoded inter-intra
+/// block (`RefFrame[1] == INTRA_FRAME`, `isCompound == 0`) from mode-info
+/// into a `CurrFrame` plane.
+///
+/// This is the inter-intra sibling of [`reconstruct_inter_block`] /
+/// [`reconstruct_inter_block_compound`]. Unlike those two, the second
+/// blend operand is **not** another inter prediction: it is the §7.11.2
+/// intra prediction already present in `curr_plane` at plane coordinates
+/// `(x, y)` (av1-spec p.83 lines 5141-5163 run `predict_intra` first;
+/// p.284 line 15786 reads it as `pred1 = CurrFrame[plane][y+dstY]
+/// [x+dstX]`). The caller is therefore responsible for having written the
+/// intra prediction into `curr_plane` for this leaf *before* invoking this
+/// driver — the §5.11.33 ordering [`reconstruct_inter_frame`] documents.
+///
+/// The driver:
+///   * resolves the single inter `RefFrame[0]` through the §7.11.3.3
+///     `refIdx = ref_frame_idx[ RefFrame − LAST_FRAME ]` ⇒
+///     `FrameStore[ refIdx ]` indirection (identical to
+///     [`reconstruct_inter_block`]);
+///   * seeds a `w × h` scratch buffer with the in-place intra prediction
+///     read from `curr_plane` at `(x, y)`;
+///   * runs [`predict_inter`] with `is_inter_intra == true`, which forms
+///     `preds[0]` from `refs[0]` and blends it into the scratch buffer
+///     through the §7.11.3.14 inter-intra body — the §7.11.3.13
+///     intra-variant mask on the non-wedge arm (`wedge == None`), or the
+///     §7.11.3.11 luma-grid wedge mask on the `wedge_interintra == 1` arm;
+///   * stitches the blended `w × h` block back into `curr_plane` at
+///     `(x, y)`.
+///
+/// On the wedge arm the §7.11.3.11 mask is luma-grid (built once at
+/// `plane == 0` per av1-spec p.258 line 14386); the caller passes a
+/// persistent `wedge_mask_buf` buffer (length `>= Block_Width[MiSize] *
+/// Block_Height[MiSize]`) so it survives the per-plane invocations for one
+/// block — the driver fills it on the `plane == 0` call and reuses it for
+/// chroma (with `mask_blend_interintra`'s `(sub_x, sub_y)` downsampling).
+/// `wedge_mask_buf` is ignored on the non-wedge arm.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments: an `INTRA_FRAME` (0) or out-of-range `ref_frame`, an
+/// out-of-range resolved `refIdx`, an out-of-range `interintra_mode`, a
+/// wedge leaf with `wedge == Some(_)` but `wedge_mask_buf == None` (or a
+/// buffer too small for the luma grid) or wedge selectors [`wedge_mask`]
+/// rejects, a `curr_plane` too small for the `(x, y, w, h)` write region,
+/// or anything [`predict_inter`] itself rejects.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_interintra(
+    mode_info: InterIntraModeInfo,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    wedge_mask_buf: Option<&mut [u8]>,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
+    //
+    // Like the single-ref arm, `RefFrame[0]` must be a real inter
+    // reference (`LAST_FRAME..=ALTREF_FRAME`). The inter-intra block's
+    // second reference is `INTRA_FRAME`, supplied as the in-place intra
+    // prediction rather than a `RefFrame` index, so it never appears here.
+    let ref_frame = mode_info.ref_frame as usize;
+    if !(crate::uncompressed_header_tail::LAST_FRAME
+        ..=crate::uncompressed_header_tail::ALTREF_FRAME)
+        .contains(&ref_frame)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.3 — refIdx = ref_frame_idx[ ref - LAST ] ----
+    let slot = ref_frame - crate::uncompressed_header_tail::LAST_FRAME;
+    let ref_idx = *ref_frame_idx
+        .get(slot)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
+    let entry = frame_store
+        .get(ref_idx)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+
+    let refs = [PredictInterRef {
+        ref_plane: entry.plane,
+        ref_stride: entry.stride,
+        ref_upscaled_width: entry.upscaled_width,
+        ref_width: entry.width,
+        ref_height: entry.height,
+        mv: mode_info.mv,
+    }];
+
+    // ---------- §7.11.3.1 final-write region bounds ----------
+    //
+    // Validate the `(x, y, w, h)` write region against `curr_plane`
+    // *before* reading the intra seed out of it (the read and the
+    // write-back share the region).
+    if x < 0 || y < 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let (px, py) = (x as usize, y as usize);
+    let last_row = py
+        .checked_add(h)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let last_col = px
+        .checked_add(w)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_stride < last_col {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed = (last_row - 1)
+        .checked_mul(curr_stride)
+        .and_then(|v| v.checked_add(last_col))
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_plane.len() < needed {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.14 step — seed scratch with intra pred -------
+    //
+    // av1-spec p.284 line 15786: `pred1 = CurrFrame[plane][y+dstY]
+    // [x+dstX]` — the §7.11.3.14 body reads the in-place intra prediction
+    // as the second blend operand. We copy that `w × h` window out of
+    // `curr_plane` into the scratch buffer `predict_inter` consumes (it
+    // overwrites the scratch with the blended sample in place).
+    let mut pred_out = vec![0u16; w * h];
+    for i in 0..h {
+        let src = (py + i) * curr_stride + px;
+        let dst = i * w;
+        pred_out[dst..dst + w].copy_from_slice(&curr_plane[src..src + w]);
+    }
+
+    // ---------- §7.11.3.11 wedge-mask regeneration (wedge arm) -------
+    //
+    // av1-spec p.258 line 14386: the §7.11.3.11 wedge mask is built only
+    // at `plane == 0`, then reused (downsampled) for chroma. The caller
+    // owns the persistent `wedge_mask_buf` across the per-plane calls; we
+    // fill it on the luma call and read it (unchanged) on the chroma
+    // calls. `wedge_sign == 0` is fixed by §5.11.28 (p.79 line 4965).
+    let wedge_params: Option<InterIntraParams<'_>> = match mode_info.wedge {
+        None => Some(InterIntraParams {
+            interintra_mode: mode_info.interintra_mode,
+            wedge: None,
+        }),
+        Some(wi) => {
+            let buf = wedge_mask_buf.ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            if wi.mi_size >= crate::cdf::BLOCK_SIZES {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            let luma_w = crate::cdf::block_width(wi.mi_size);
+            let luma_h = crate::cdf::block_height(wi.mi_size);
+            if buf.len() < luma_w * luma_h {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            // Fill the luma-grid mask only at `plane == 0`; the chroma
+            // planes reuse the buffer the caller carried over.
+            if plane == 0 {
+                let n4w = crate::cdf::num_4x4_blocks_wide(wi.mi_size) as u32;
+                let n4h = crate::cdf::num_4x4_blocks_high(wi.mi_size) as u32;
+                wedge_mask(
+                    wi.mi_size,
+                    n4w,
+                    n4h,
+                    wi.wedge_index,
+                    /* wedge_sign */ 0,
+                    &mut buf[..luma_w * luma_h],
+                )?;
+            }
+            Some(InterIntraParams {
+                interintra_mode: mode_info.interintra_mode,
+                wedge: Some(WedgeInterIntraInfo {
+                    mask: &buf[..luma_w * luma_h],
+                    mask_stride: luma_w,
+                }),
+            })
+        }
+    };
+
+    // ---------- §7.11.3.1 steps 1-13 + §7.11.3.14 blend ----------
+    predict_inter(
+        plane,
+        x,
+        y,
+        w,
+        h,
+        crate::cdf::MOTION_MODE_SIMPLE,
+        /* is_compound */ false,
+        /* is_inter_intra */ true,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        &refs,
+        /* compound */ None,
+        wedge_params,
+        /* warp */ None,
+        /* obmc */ None,
+        &mut pred_out,
+    )?;
+
+    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
+    //
+    // The §7.11.3.14 body wrote the blended `w × h` result into
+    // `pred_out`; copy it back into `curr_plane` at `(x, y)`.
+    for i in 0..h {
+        let dst = (py + i) * curr_stride + px;
+        let src = i * w;
+        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+    }
+
+    Ok(())
+}
+
 // =====================================================================
 // r293 §5.11.33 predict() / §7.11.3 frame-level inter reconstruction
 // =====================================================================
@@ -5452,6 +5736,24 @@ pub struct InterModeInfoGrid<'a> {
     /// `DIFFWTD_38`, `1` = `DIFFWTD_38_INV`); ignored on every other
     /// cell. Length must be at least `mi_rows * mi_cols`.
     pub mask_types: &'a [u8],
+    /// §5.11.28 `interintra_mode` per cell — `interintra_mode()[ r *
+    /// mi_cols + c ]`. Read only at an inter-intra leaf's origin
+    /// (`RefFrame[1] == INTRA_FRAME`, `0..=3`); ignored on every other
+    /// cell. Length must be at least `mi_rows * mi_cols`.
+    pub interintra_modes: &'a [u8],
+    /// §5.11.28 `wedge_interintra` per cell — `wedge_interintra()[ r *
+    /// mi_cols + c ]` (`0` = non-wedge §7.11.3.13 intra-variant mask, `1`
+    /// = §7.11.3.11 luma-grid wedge mask). Read only at an inter-intra
+    /// leaf's origin; ignored elsewhere. Length must be at least
+    /// `mi_rows * mi_cols`.
+    pub wedge_interintras: &'a [u8],
+    /// §5.11.28 inter-intra `wedge_index` per cell —
+    /// `wedge_index()[ r * mi_cols + c ]`. Read only at an inter-intra
+    /// leaf's origin whose `wedge_interintras` cell is `1` (the
+    /// `wedge_sign` is fixed at `0` for the interintra arm per §5.11.28,
+    /// so it is not carried). Length must be at least `mi_rows *
+    /// mi_cols`. (Distinct from the compound `wedge_indices` slice.)
+    pub interintra_wedge_indices: &'a [u8],
     /// §7.11.3.15 order-hint context the [`COMPOUND_DISTANCE`] arm
     /// derives `(FwdWeight, BckWeight)` from. The `order_hint_ref0` /
     /// `order_hint_ref1` fields are re-resolved per compound leaf from
@@ -5519,11 +5821,27 @@ pub struct InterModeInfoGrid<'a> {
 /// for the chroma planes — then `predict_inter` forms the two-reference
 /// combine.
 ///
+/// Inter-intra leaves (`RefFrame[1] == INTRA_FRAME`, `isCompound == 0`)
+/// are driven through [`reconstruct_inter_block_interintra`]: one inter
+/// prediction is formed from `RefFrame[0]` and blended (§7.11.3.14)
+/// against the §7.11.2 intra prediction **already present in the plane's
+/// `curr` buffer** (av1-spec p.83 lines 5141-5163 run `predict_intra`
+/// before `predict_inter` on this arm; p.284 line 15786 reads it as
+/// `pred1 = CurrFrame[plane][..]`). The walk reads
+/// `interintra_modes[origin]` (§5.11.28 mode), `wedge_interintras[origin]`
+/// (the §7.11.3.13 intra-variant vs §7.11.3.11 luma-grid wedge sub-arm
+/// selector), and `interintra_wedge_indices[origin]` (the wedge codebook
+/// ordinal, with `wedge_sign` fixed at `0` per §5.11.28). **The caller
+/// must have written the §7.11.2 intra prediction into each plane's `curr`
+/// buffer for every inter-intra leaf's footprint before calling this
+/// function** — this walk supplies only the inter half of the blend.
+///
 /// **Scope / skips (untouched CurrFrame regions, for a later driver):**
 ///   * intra leaves (`IsInters == 0`);
-///   * inter-intra leaves (`RefFrame[1] == INTRA_FRAME`);
-///   * compound leaves carrying [`COMPOUND_INTRA`] — its §7.11.3.13
-///     intra-variant mask belongs to the interintra driver.
+///   * compound leaves carrying [`COMPOUND_INTRA`] — a *two-inter-ref*
+///     `COMPOUND_INTRA` `compound_type` is never produced by the spec
+///     (the intra-variant mask only arises on the inter-intra arm), so a
+///     compound leaf so tagged is rejected.
 ///
 /// The §7.11.3.1 horizontal / vertical interpolation filters are read
 /// per leaf from `InterpFilters[origin][0..2]` (the §5.11.x decoded
@@ -5557,6 +5875,9 @@ pub fn reconstruct_inter_frame(
         || grid.wedge_indices.len() < cells
         || grid.wedge_signs.len() < cells
         || grid.mask_types.len() < cells
+        || grid.interintra_modes.len() < cells
+        || grid.wedge_interintras.len() < cells
+        || grid.interintra_wedge_indices.len() < cells
     {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
@@ -5618,17 +5939,86 @@ pub fn reconstruct_inter_frame(
             //   * `NONE` (the `-1` sentinel the §5.11.18 grid pre-fill
             //     stamps into slot 1) ⇒ single forward reference.
             //   * `>= LAST_FRAME` (1..=7) ⇒ compound two-reference.
-            //   * `INTRA_FRAME` (0) ⇒ inter-intra — skipped (the
-            //     interintra blend driver is a later arc).
+            //   * `INTRA_FRAME` (0) ⇒ inter-intra — blended against the
+            //     §7.11.2 intra prediction already in `CurrFrame[plane]`.
             const NONE_REF_FRAME: i8 = -1;
             const INTRA_FRAME_REF: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
             let is_compound_leaf = ref_frame1 >= crate::uncompressed_header_tail::LAST_FRAME as i8;
-            if ref_frame1 == INTRA_FRAME_REF {
-                continue; // inter-intra leaf — out of scope.
-            }
 
             let interp_x = grid.interp_filters[origin * 2];
             let interp_y = grid.interp_filters[origin * 2 + 1];
+
+            if ref_frame1 == INTRA_FRAME_REF {
+                // --- inter-intra arm (§7.11.3.14 blend). ---
+                //
+                // av1-spec p.83 lines 5141-5163 run `predict_intra` on
+                // this leaf *before* `predict_inter`, leaving the intra
+                // prediction in `CurrFrame[plane]`; the §7.11.3.14 body
+                // then reads it as `pred1 = CurrFrame[plane][y+dstY]
+                // [x+dstX]` (p.284 line 15786). This walk consumes that
+                // in-place intra prediction, so the caller MUST have
+                // written it into each plane's `curr` buffer for this
+                // leaf's footprint before invoking `reconstruct_inter_frame`.
+                let ii_mode = grid.interintra_modes[origin];
+                let wedge_on = grid.wedge_interintras[origin] != 0;
+                let mode_info = InterIntraModeInfo {
+                    ref_frame: ref_frame0 as u8,
+                    mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
+                    interintra_mode: ii_mode,
+                    wedge: if wedge_on {
+                        Some(InterIntraWedgeModeInfo {
+                            mi_size,
+                            wedge_index: grid.interintra_wedge_indices[origin],
+                        })
+                    } else {
+                        None
+                    },
+                };
+                // §7.11.3.11 persistent luma-grid wedge mask — filled by
+                // the driver at `plane == 0` and reused for chroma
+                // (av1-spec p.258 line 14386). Sized to the *luma* block;
+                // `None` on the non-wedge arm.
+                let mut wedge_buf: Option<Vec<u8>> = if wedge_on {
+                    Some(vec![
+                        0u8;
+                        crate::cdf::block_width(mi_size)
+                            * crate::cdf::block_height(mi_size)
+                    ])
+                } else {
+                    None
+                };
+
+                for ctx in planes.iter_mut() {
+                    let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
+                    let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
+                    let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+                    let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+                    let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
+                    let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+
+                    reconstruct_inter_block_interintra(
+                        mode_info,
+                        ref_frame_idx,
+                        ctx.frame_store,
+                        ctx.plane,
+                        base_x,
+                        base_y,
+                        pred_w,
+                        pred_h,
+                        grid.bit_depth,
+                        ctx.subsampling_x,
+                        ctx.subsampling_y,
+                        ctx.frame_width,
+                        ctx.frame_height,
+                        interp_x,
+                        interp_y,
+                        wedge_buf.as_deref_mut(),
+                        ctx.curr,
+                        ctx.curr_stride,
+                    )?;
+                }
+                continue;
+            }
 
             if is_compound_leaf {
                 // --- compound two-reference arm
@@ -8791,6 +9181,9 @@ mod tests {
             wedge_indices: &wedge_zeros,
             wedge_signs: &wedge_zeros,
             mask_types: &wedge_zeros,
+            interintra_modes: &wedge_zeros,
+            wedge_interintras: &wedge_zeros,
+            interintra_wedge_indices: &wedge_zeros,
             order_hint_bits: 7,
             current_order_hint: 0,
             order_hints_by_ref: &order_hints_by_ref,
@@ -8938,6 +9331,9 @@ mod tests {
                 wedge_indices: &wedge_zeros,
                 wedge_signs: &wedge_zeros,
                 mask_types: &wedge_zeros,
+                interintra_modes: &wedge_zeros,
+                wedge_interintras: &wedge_zeros,
+                interintra_wedge_indices: &wedge_zeros,
                 order_hint_bits: 7,
                 current_order_hint: 0,
                 order_hints_by_ref: &order_hints_by_ref,
@@ -9475,13 +9871,16 @@ mod tests {
         stamp(0, last + 1, COMPOUND_AVERAGE, [0, 4], [8, 0]);
         // col 1: COMPOUND_DISTANCE (RefFrame[1] = LAST+2).
         stamp(1, last + 2, COMPOUND_DISTANCE, [4, 0], [0, 8]);
-        // col 2: COMPOUND_INTRA (the §7.11.3.13 intra-variant mask is
-        // owned by the interintra driver) — must be skipped by this walk.
+        // col 2: COMPOUND_INTRA (a two-inter-ref leaf so tagged is never
+        // produced by the spec; the §7.11.3.13 intra-variant mask only
+        // arises on the inter-intra arm) — must be skipped by this walk.
         stamp(2, last + 1, COMPOUND_INTRA, [0, 4], [8, 0]);
-        // col 3: inter-intra (RefFrame[1] = INTRA_FRAME) — skipped.
-        is_inters[3] = 1;
-        ref_frames[3 * 2] = last;
-        ref_frames[3 * 2 + 1] = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+        // col 3: pure intra leaf (`is_inters == 0`) — the §7.11.2 intra
+        // arm's responsibility, skipped by this inter walk. (The
+        // inter-intra arm, `is_inter && RefFrame[1] == INTRA_FRAME`, is
+        // now *driven* — see `r299_frame_walk_drives_interintra_leaf_*`;
+        // it is exercised there, not here.)
+        is_inters[3] = 0;
 
         // OrderHints: ref LAST=ref1 idx → hints chosen so DISTANCE has
         // asymmetric weights. RefFrame indices used: LAST(1), LAST+1(2),
@@ -9508,6 +9907,9 @@ mod tests {
             wedge_indices: &wedge_zeros,
             wedge_signs: &wedge_zeros,
             mask_types: &wedge_zeros,
+            interintra_modes: &wedge_zeros,
+            wedge_interintras: &wedge_zeros,
+            interintra_wedge_indices: &wedge_zeros,
             order_hint_bits: 7,
             current_order_hint,
             order_hints_by_ref: &order_hints_by_ref,
@@ -9845,6 +10247,7 @@ mod tests {
         let mut wedge_signs = vec![0u8; cells];
         wedge_signs[0] = wedge_sign;
         let mask_types = vec![0u8; cells];
+        let zeros_ii = vec![0u8; cells];
 
         let order_hints_by_ref = [0i32; 8];
         let curr_w = (mi_cols * 4) as usize; // 8
@@ -9862,6 +10265,9 @@ mod tests {
             wedge_indices: &wedge_indices,
             wedge_signs: &wedge_signs,
             mask_types: &mask_types,
+            interintra_modes: &zeros_ii,
+            wedge_interintras: &zeros_ii,
+            interintra_wedge_indices: &zeros_ii,
             order_hint_bits: 7,
             current_order_hint: 0,
             order_hints_by_ref: &order_hints_by_ref,
@@ -9994,6 +10400,7 @@ mod tests {
         let mut mask_types = vec![0u8; cells];
         mask_types[0] = mask_type;
         let zeros = vec![0u8; cells];
+        let zeros_ii = vec![0u8; cells];
 
         let order_hints_by_ref = [0i32; 8];
         let curr_w = (mi_cols * 4) as usize; // 8
@@ -10011,6 +10418,9 @@ mod tests {
             wedge_indices: &zeros,
             wedge_signs: &zeros,
             mask_types: &mask_types,
+            interintra_modes: &zeros_ii,
+            wedge_interintras: &zeros_ii,
+            interintra_wedge_indices: &zeros_ii,
             order_hint_bits: 7,
             current_order_hint: 0,
             order_hints_by_ref: &order_hints_by_ref,
@@ -12684,5 +13094,434 @@ mod tests {
 
         // Both neighbours produce identity blends ⇒ output equals SIMPLE.
         assert_eq!(simple_out, obmc_out);
+    }
+
+    // ---------- r299 §5.11.33 inter-intra frame-walk leaf ----------
+
+    /// §7.11.3.1 inter-intra per-block driver
+    /// ([`reconstruct_inter_block_interintra`], non-wedge arm): the driver
+    /// must reproduce exactly the `predict_inter` (`is_inter_intra ==
+    /// true`) composition over the same in-place intra seed. We seed
+    /// `curr` with a ramp (the §7.11.2 intra prediction the dispatcher
+    /// already wrote), drive the per-block leaf, and cross-check against a
+    /// direct `predict_inter` call on a copy of that seed.
+    #[test]
+    fn r299_reconstruct_inter_block_interintra_matches_predict_inter() {
+        let ref_w: usize = 24;
+        let ref_h: usize = 24;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 9 + c * 5) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let w = 8usize;
+        let h = 8usize;
+        let bit_depth = 8u8;
+        let mv = [4i16, 2];
+        let ii_mode = II_SMOOTH_PRED;
+
+        // CurrFrame already holds the §7.11.2 intra prediction; the block
+        // sits at plane coords (4, 4) inside a larger plane buffer.
+        let curr_w = 16usize;
+        let curr_h = 16usize;
+        let (px, py) = (4usize, 4usize);
+        let mut curr = vec![0u16; curr_w * curr_h];
+        for i in 0..h {
+            for j in 0..w {
+                curr[(py + i) * curr_w + (px + j)] = ((i * 7 + j * 3 + 11) & 0xFF) as u16;
+            }
+        }
+        let intra_window: Vec<u16> = (0..h)
+            .flat_map(|i| (0..w).map(move |j| ((i * 7 + j * 3 + 11) & 0xFF) as u16))
+            .collect();
+
+        reconstruct_inter_block_interintra(
+            InterIntraModeInfo {
+                ref_frame: last,
+                mv,
+                interintra_mode: ii_mode,
+                wedge: None,
+            },
+            &ref_frame_idx,
+            &store,
+            /* plane */ 0,
+            px as i32,
+            py as i32,
+            w,
+            h,
+            bit_depth,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            /* wedge_mask_buf */ None,
+            &mut curr,
+            curr_w,
+        )
+        .expect("inter-intra per-block driver");
+
+        // Oracle: `predict_inter` over a copy of the intra window.
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv,
+        }];
+        let mut oracle = intra_window.clone();
+        predict_inter(
+            0,
+            px as i32,
+            py as i32,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            /* is_inter_intra */ true,
+            bit_depth,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(InterIntraParams {
+                interintra_mode: ii_mode,
+                wedge: None,
+            }),
+            None,
+            None,
+            &mut oracle,
+        )
+        .unwrap();
+
+        // Stitch the oracle window back and compare the whole plane.
+        let mut expected = vec![0u16; curr_w * curr_h];
+        for i in 0..h {
+            for j in 0..w {
+                expected[(py + i) * curr_w + (px + j)] = ((i * 7 + j * 3 + 11) & 0xFF) as u16;
+            }
+        }
+        for i in 0..h {
+            for j in 0..w {
+                expected[(py + i) * curr_w + (px + j)] = oracle[i * w + j];
+            }
+        }
+        assert_eq!(curr, expected);
+        // The blend actually moved the buffer off the intra seed.
+        assert_ne!(
+            &curr[(py) * curr_w + px..(py) * curr_w + px + w],
+            &intra_window[..w]
+        );
+    }
+
+    /// §5.11.33 frame walk: one inter-intra `BLOCK_8X8` leaf
+    /// (`RefFrame[1] == INTRA_FRAME`) must be driven identically to the
+    /// per-block [`reconstruct_inter_block_interintra`] driver. The intra
+    /// prediction is pre-seeded into `curr` (the §7.11.3.14 body reads it
+    /// in place); both the walk and the oracle start from the same seed.
+    #[test]
+    fn r299_frame_walk_drives_interintra_leaf_like_per_block() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 13 + c * 7) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let store2 = store;
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+        let intra_frame = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        const BLOCK_8X8: usize = 3;
+        use crate::cdf::BLOCK_INVALID;
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        mi_sizes[0] = BLOCK_8X8;
+        let mut is_inters = vec![0u8; cells];
+        is_inters[0] = 1;
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        ref_frames[0] = last;
+        ref_frames[1] = intra_frame; // RefFrame[1] == INTRA_FRAME.
+        let mv = [4i16, 6];
+        let mut mvs = vec![0i16; cells * 4];
+        mvs[0] = mv[0];
+        mvs[1] = mv[1];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let compound_types = vec![COMPOUND_AVERAGE; cells];
+        let zeros = vec![0u8; cells];
+        let ii_mode = II_H_PRED;
+        let mut interintra_modes = vec![0u8; cells];
+        interintra_modes[0] = ii_mode;
+
+        let curr_w = (mi_cols * 4) as usize; // 8
+        let curr_h = (mi_rows * 4) as usize; // 8
+                                             // Pre-seed the §7.11.2 intra prediction for the leaf footprint.
+        let mut curr = vec![0u16; curr_w * curr_h];
+        for i in 0..8usize {
+            for j in 0..8usize {
+                curr[i * curr_w + j] = ((i * 5 + j * 11 + 3) & 0xFF) as u16;
+            }
+        }
+        let seed = curr.clone();
+        let order_hints_by_ref = [0i32; 8];
+
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &compound_types,
+            wedge_indices: &zeros,
+            wedge_signs: &zeros,
+            mask_types: &zeros,
+            interintra_modes: &interintra_modes,
+            wedge_interintras: &zeros,
+            interintra_wedge_indices: &zeros,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+        };
+        {
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("frame-level inter-intra reconstruction");
+        }
+
+        // Oracle: per-block driver on the same seed.
+        let mut oracle = seed.clone();
+        reconstruct_inter_block_interintra(
+            InterIntraModeInfo {
+                ref_frame: last as u8,
+                mv,
+                interintra_mode: ii_mode,
+                wedge: None,
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            None,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        assert_eq!(
+            curr, oracle,
+            "frame walk must drive the inter-intra leaf identically to the per-block driver"
+        );
+        assert_ne!(curr, seed, "the inter-intra blend must modify the plane");
+    }
+
+    /// §5.11.33 frame walk: a `wedge_interintra == 1` inter-intra leaf
+    /// regenerates the §7.11.3.11 luma-grid wedge mask (with `wedge_sign
+    /// == 0`) and must differ from the non-wedge intra-variant blend on
+    /// the same seed.
+    #[test]
+    fn r299_frame_walk_interintra_wedge_differs_from_non_wedge() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 11 + c * 5) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+        let intra_frame = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        const BLOCK_8X8: usize = 3;
+        use crate::cdf::BLOCK_INVALID;
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        mi_sizes[0] = BLOCK_8X8;
+        let mut is_inters = vec![0u8; cells];
+        is_inters[0] = 1;
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        ref_frames[0] = last;
+        ref_frames[1] = intra_frame;
+        let mv = [2i16, 2];
+        let mut mvs = vec![0i16; cells * 4];
+        mvs[0] = mv[0];
+        mvs[1] = mv[1];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let compound_types = vec![COMPOUND_AVERAGE; cells];
+        let zeros = vec![0u8; cells];
+        let ii_mode = II_DC_PRED;
+        let mut interintra_modes = vec![0u8; cells];
+        interintra_modes[0] = ii_mode;
+        let mut wedge_interintras = vec![0u8; cells];
+        let mut interintra_wedge_indices = vec![0u8; cells];
+        interintra_wedge_indices[0] = 5;
+
+        let curr_w = (mi_cols * 4) as usize;
+        let curr_h = (mi_rows * 4) as usize;
+        let mut seed = vec![0u16; curr_w * curr_h];
+        for i in 0..8usize {
+            for j in 0..8usize {
+                seed[i * curr_w + j] = ((i * 5 + j * 11 + 3) & 0xFF) as u16;
+            }
+        }
+        let order_hints_by_ref = [0i32; 8];
+        // `wedge_interintras` already declared as all-zero; the wedge run
+        // flips cell 0 to 1.
+        let wii_non_wedge = wedge_interintras.clone();
+        wedge_interintras[0] = 1;
+        let wii_wedge = wedge_interintras.clone();
+
+        // Non-wedge run.
+        let mut non_wedge = seed.clone();
+        {
+            let grid = InterModeInfoGrid {
+                mi_sizes: &mi_sizes,
+                is_inters: &is_inters,
+                ref_frames: &ref_frames,
+                mvs: &mvs,
+                interp_filters: &interp_filters,
+                compound_types: &compound_types,
+                wedge_indices: &zeros,
+                wedge_signs: &zeros,
+                mask_types: &zeros,
+                interintra_modes: &interintra_modes,
+                wedge_interintras: &wii_non_wedge,
+                interintra_wedge_indices: &interintra_wedge_indices,
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hints_by_ref: &order_hints_by_ref,
+                mi_rows,
+                mi_cols,
+                bit_depth: 8,
+            };
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut non_wedge,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap();
+        }
+
+        // Wedge run (same seed, wedge_interintra == 1).
+        let mut wedge = seed.clone();
+        {
+            let grid = InterModeInfoGrid {
+                mi_sizes: &mi_sizes,
+                is_inters: &is_inters,
+                ref_frames: &ref_frames,
+                mvs: &mvs,
+                interp_filters: &interp_filters,
+                compound_types: &compound_types,
+                wedge_indices: &zeros,
+                wedge_signs: &zeros,
+                mask_types: &zeros,
+                interintra_modes: &interintra_modes,
+                wedge_interintras: &wii_wedge,
+                interintra_wedge_indices: &interintra_wedge_indices,
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hints_by_ref: &order_hints_by_ref,
+                mi_rows,
+                mi_cols,
+                bit_depth: 8,
+            };
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut wedge,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap();
+        }
+
+        assert_ne!(
+            non_wedge, seed,
+            "non-wedge interintra blend must modify the plane"
+        );
+        assert_ne!(wedge, seed, "wedge interintra blend must modify the plane");
+        assert_ne!(
+            wedge, non_wedge,
+            "the §7.11.3.11 wedge mask must produce a different blend from the §7.11.3.13 mask"
+        );
     }
 }
