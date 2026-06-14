@@ -4,6 +4,32 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r296 (2026-06-14): wire the `COMPOUND_DIFFWTD` mask compound
+  arm end-to-end across the §5.11.33 frame walk. Unlike `COMPOUND_WEDGE`
+  (regenerable side-data mask), the §7.11.3.12 difference-weight mask is
+  a function of the two `preds[]` the driver forms, so it cannot be
+  supplied by the caller ahead of motion compensation — `predict_inter`
+  now derives it *internally* from the actual `pred0` / `pred1` at
+  `plane == 0` only (av1-spec p.258 line 14392) and persists the
+  luma-grid `Mask` array for the chroma planes, which reuse it through
+  `mask_blend`'s `(sub_x, sub_y)` downsampling. `CompoundParams::Diffwtd`
+  now carries the §5.11.29 `mask_type` toggle plus a `&mut [u8]`
+  persistent luma-grid mask buffer (`CompoundParams` is no longer `Copy`)
+  instead of a pre-built mask. `CompoundInterModeInfo` gains a
+  `mask_type` field; `reconstruct_inter_block_compound` gains a
+  `diffwtd_mask: Option<&mut [u8]>` parameter and now accepts DIFFWTD;
+  `InterModeInfoGrid` gains a per-cell `mask_types` slice the frame walk
+  reads at each DIFFWTD leaf's origin, allocating one luma-grid scratch
+  buffer per leaf reused across its planes. `COMPOUND_INTRA` remains
+  skipped (its §7.11.3.13 intra-variant mask belongs to the interintra
+  driver). +1 lib test net (1982 → 1983): a driver-level test proving
+  the mask is derived from the real per-ref §7.11.3.4 leaf predictions
+  (not a fabricated mask) with the persistent buffer cross-checked, and
+  a frame-walk test driving one BLOCK_8X8 DIFFWTD leaf identically to the
+  per-block driver and asserting it differs from a plain AVERAGE blend;
+  the prior r201 DIFFWTD test (which fed a fabricated mask) was rewritten
+  to the new contract.
+
 - decoder r295 (2026-06-14): drive the `COMPOUND_WEDGE` mask compound
   arm across the §5.11.33 frame walk — the only mask compound type whose
   §7.11.3.11 mask is a pure function of decoded side-data (`MiSize`,

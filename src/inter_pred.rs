@@ -957,7 +957,14 @@ pub struct PredictInterRef<'a> {
 /// caller is responsible for computing the mask once at `plane == 0`
 /// and passing the same buffer on subsequent `plane == 1` / `plane == 2`
 /// invocations — the driver does not cache it across calls.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Copy` / `Clone` are intentionally *not* derived: the
+/// [`CompoundParams::Diffwtd`] arm carries a `&mut [u8]` persistent
+/// luma-grid mask buffer (the §7.11.3.12 mask the driver derives from
+/// the two `preds[]` at `plane == 0` and reuses verbatim for the chroma
+/// planes per av1-spec p.258 line 14392's `plane == 0` guard), which is
+/// not copyable. The value is consumed once per [`predict_inter`] call.
+#[derive(Debug)]
 pub enum CompoundParams<'a> {
     /// `COMPOUND_AVERAGE` (av1-spec p.258 line 14405) — `Clip1(Round2(
     /// preds[0] + preds[1], 1 + InterPostRound))` per pixel. No mask /
@@ -981,15 +988,29 @@ pub enum CompoundParams<'a> {
         mask_stride: usize,
     },
     /// `COMPOUND_DIFFWTD` (av1-spec p.258 line 14412 via §7.11.3.12 +
-    /// §7.11.3.14) — difference-weight mask blend. Mask is computed by
-    /// [`difference_weight_mask`] from `(preds[0], preds[1])`, so it is
-    /// inherently luma-grid (plane == 0) sized.
+    /// §7.11.3.14) — difference-weight mask blend. Unlike the wedge /
+    /// intra arms, the §7.11.3.12 mask is a function of the two
+    /// `preds[]` themselves, so it cannot be supplied by the caller
+    /// ahead of motion compensation. The driver derives it *internally*
+    /// from the actual `pred0` / `pred1` it forms, at `plane == 0` only
+    /// (av1-spec p.258 line 14392: "Otherwise if compound_type is equal
+    /// to COMPOUND_DIFFWTD and plane is equal to 0, the difference
+    /// weight mask process … is invoked"). The luma-grid mask then
+    /// persists for the chroma planes, which reuse it through
+    /// [`mask_blend`]'s `(sub_x, sub_y)` downsampling.
     Diffwtd {
-        /// Luma-grid difference-weight mask (filled by
-        /// [`difference_weight_mask`]).
-        mask: &'a [u8],
-        /// Row stride of `mask` in `u8`s; `0` selects the default.
-        mask_stride: usize,
+        /// §5.11.29 `mask_type` bit (`0` = `DIFFWTD_38`, `1` =
+        /// `DIFFWTD_38_INV`) — the §7.11.3.12 `mask_type` toggle that
+        /// inverts the per-pixel weight (`Mask = 64 - m`).
+        mask_type: u8,
+        /// Persistent luma-grid mask buffer, length `>= block_w *
+        /// block_h` (the *luma* block extent). The driver writes the
+        /// §7.11.3.12 result here on the `plane == 0` call and reads it
+        /// back on the chroma calls. The caller owns this buffer across
+        /// the per-plane [`predict_inter`] invocations for one block and
+        /// must pass the *same* buffer each time so the chroma planes see
+        /// the luma-derived mask (the driver does not cache it).
+        mask: &'a mut [u8],
     },
     /// `COMPOUND_INTRA` (av1-spec p.258 line 14412 via §7.11.3.13 +
     /// §7.11.3.14) — inter-intra-variant mask blend (also reached on
@@ -1175,6 +1196,7 @@ fn predict_inter_per_ref(
 ///   [`mask_blend`] with the caller-supplied luma-grid mask.
 #[allow(clippy::too_many_arguments)]
 fn predict_inter_compound_blend(
+    plane: u8,
     bit_depth: u8,
     inter_post_round: u32,
     subsampling_x: u8,
@@ -1214,7 +1236,6 @@ fn predict_inter_compound_blend(
             pred_out,
         ),
         CompoundParams::Wedge { mask, mask_stride }
-        | CompoundParams::Diffwtd { mask, mask_stride }
         | CompoundParams::Intra { mask, mask_stride } => mask_blend(
             bit_depth,
             inter_post_round,
@@ -1228,6 +1249,52 @@ fn predict_inter_compound_blend(
             mask_stride,
             pred_out,
         ),
+        CompoundParams::Diffwtd { mask_type, mask } => {
+            // av1-spec p.258 lines 14392-14393: the §7.11.3.12 mask is
+            // derived from the two `preds[]` at `plane == 0` only and
+            // then reused verbatim for the chroma planes (the `Mask`
+            // array persists across the per-plane invocations). The
+            // luma grid is `(w << sub_x) × (h << sub_y)`; on the luma
+            // plane that is exactly `w × h` so the §7.11.3.12 output
+            // sizing matches `pred0` / `pred1` directly.
+            let luma_w = w << subsampling_x;
+            let luma_h = h << subsampling_y;
+            if plane == 0 {
+                // The §7.11.3.12 process consumes the *luma* `preds[]`
+                // (here `pred0` / `pred1`, which are luma-grid on the
+                // `plane == 0` call) and fills the persistent `Mask`
+                // array on the luma grid.
+                if mask.len() < luma_w * luma_h {
+                    return Err(crate::Error::PartitionWalkOutOfRange);
+                }
+                difference_weight_mask(
+                    bit_depth,
+                    inter_post_round,
+                    mask_type,
+                    pred0,
+                    pred1,
+                    luma_w,
+                    luma_h,
+                    mask,
+                )?;
+            }
+            // §7.11.3.14: blend the current plane's `preds[]` through
+            // the (luma-grid) `Mask`, downsampling for chroma via the
+            // `(sub_x, sub_y)` arm. The luma-grid row stride is `luma_w`.
+            mask_blend(
+                bit_depth,
+                inter_post_round,
+                subsampling_x,
+                subsampling_y,
+                pred0,
+                pred1,
+                w,
+                h,
+                mask,
+                luma_w,
+                pred_out,
+            )
+        }
     }
 }
 
@@ -2105,6 +2172,7 @@ pub fn predict_inter(
         // above, so `unwrap` cannot panic.
         let cp = compound.expect("compound checked above");
         predict_inter_compound_blend(
+            plane,
             bit_depth,
             rv.inter_post_round,
             subsampling_x,
@@ -4665,8 +4733,8 @@ pub fn reconstruct_inter_block(
 /// [`reconstruct_inter_block`] / the intra path instead.
 ///
 /// `compound_type` is the §5.11.x decoded ordinal restricted here to the
-/// three side-data-free / wedge-mask combine arms [`COMPOUND_AVERAGE`] /
-/// [`COMPOUND_DISTANCE`] / [`COMPOUND_WEDGE`]. `COMPOUND_AVERAGE` /
+/// four combine arms [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`] /
+/// [`COMPOUND_WEDGE`] / [`COMPOUND_DIFFWTD`]. `COMPOUND_AVERAGE` /
 /// `COMPOUND_DISTANCE` need no mask; their output is fully derivable from
 /// the two MVs, the two references, and (for `COMPOUND_DISTANCE`) the
 /// §7.11.3.15 order-hint distance weights. `COMPOUND_WEDGE` additionally
@@ -4674,12 +4742,15 @@ pub fn reconstruct_inter_block(
 /// from which [`reconstruct_inter_block_compound`] regenerates the
 /// §7.11.3.11 luma-grid wedge mask deterministically (the mask is a pure
 /// function of `(MiSize, wedge_index, wedge_sign)`, with no
-/// prediction-dependent side-data). The two prediction-derived mask arms
-/// [`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`] — whose mask is a function of
-/// the two `preds[]` and so cannot be regenerated before prediction
-/// runs — remain rejected.
+/// prediction-dependent side-data). `COMPOUND_DIFFWTD` carries only the
+/// §5.11.29 [`mask_type`] toggle; its §7.11.3.12 mask is derived inside
+/// the driver from the two formed `preds[]` (at `plane == 0`) into the
+/// caller-supplied persistent luma-grid `diffwtd_mask` buffer. The
+/// remaining prediction-derived mask arm [`COMPOUND_INTRA`] — whose
+/// §7.11.3.13 mask the interintra driver owns — is still rejected.
 ///
 /// [`wedge`]: CompoundInterModeInfo::wedge
+/// [`mask_type`]: CompoundInterModeInfo::mask_type
 #[derive(Debug, Clone, Copy)]
 pub struct CompoundInterModeInfo {
     /// §7.11.3.1 step 5 `RefFrame[ 0 ]` (1..=7).
@@ -4701,6 +4772,11 @@ pub struct CompoundInterModeInfo {
     /// selectors. A `COMPOUND_WEDGE` leaf with `wedge == None` is a
     /// caller bug ([`crate::Error::PartitionWalkOutOfRange`]).
     pub wedge: Option<WedgeModeInfo>,
+    /// §5.11.29 `mask_type` bit — meaningful only on the
+    /// [`COMPOUND_DIFFWTD`] arm (`0` = `DIFFWTD_38`, `1` =
+    /// `DIFFWTD_38_INV`); ignored on every other `compound_type`. Drives
+    /// the §7.11.3.12 per-pixel weight inversion.
+    pub mask_type: u8,
 }
 
 /// §7.11.3.11 wedge-mask side data for a [`COMPOUND_WEDGE`] compound
@@ -4747,8 +4823,18 @@ pub struct CompoundOrderHintContext {
 /// §7.11.3.1 compound two-reference reconstruction — drives one decoded
 /// compound inter block (`RefFrame[1] >= LAST_FRAME`) from mode-info
 /// into a `CurrFrame` plane, for the [`COMPOUND_AVERAGE`] /
-/// [`COMPOUND_DISTANCE`] mask-free arms and the [`COMPOUND_WEDGE`]
-/// regenerable-mask arm.
+/// [`COMPOUND_DISTANCE`] mask-free arms, the [`COMPOUND_WEDGE`]
+/// regenerable-mask arm, and the [`COMPOUND_DIFFWTD`] arm (whose
+/// §7.11.3.12 mask is derived inside [`predict_inter`] from the two
+/// formed `preds[]`).
+///
+/// The [`COMPOUND_DIFFWTD`] arm requires the caller to pass a persistent
+/// luma-grid `diffwtd_mask` buffer (length `>= Block_Width[MiSize] *
+/// Block_Height[MiSize]`): the driver fills it from the §7.11.3.12 mask
+/// process on the `plane == 0` call and reuses it on the chroma calls
+/// (av1-spec p.258 line 14392). The caller therefore owns this buffer
+/// across the per-plane invocations for one block and passes the *same*
+/// buffer each time. `diffwtd_mask` is ignored on the other arms.
 ///
 /// This is the compound sibling of [`reconstruct_inter_block`]: it
 /// resolves *both* references through the §7.11.3.3 `refIdx =
@@ -4772,11 +4858,12 @@ pub struct CompoundOrderHintContext {
 /// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
 /// arguments: either `RefFrame` `INTRA_FRAME` (0) or out of range, an
 /// out-of-range resolved `refIdx`, a `compound_type` other than
-/// `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE` / `COMPOUND_WEDGE`, a
-/// `COMPOUND_WEDGE` leaf with `wedge == None` or wedge selectors
-/// [`wedge_mask`] rejects, a `curr_plane` too small for the
-/// `(x, y, w, h)` write region, or anything [`predict_inter`] itself
-/// rejects.
+/// `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE` / `COMPOUND_WEDGE` /
+/// `COMPOUND_DIFFWTD`, a `COMPOUND_WEDGE` leaf with `wedge == None` or
+/// wedge selectors [`wedge_mask`] rejects, a `COMPOUND_DIFFWTD` leaf
+/// without a `diffwtd_mask` buffer (or one too small for the luma grid),
+/// a `curr_plane` too small for the `(x, y, w, h)` write region, or
+/// anything [`predict_inter`] itself rejects.
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_inter_block_compound(
     mode_info: CompoundInterModeInfo,
@@ -4795,22 +4882,32 @@ pub fn reconstruct_inter_block_compound(
     frame_height: u32,
     interp_filter_x: u8,
     interp_filter_y: u8,
+    diffwtd_mask: Option<&mut [u8]>,
     curr_plane: &mut [u16],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
     // ---------- compound_type gate ----------
     //
-    // This driver covers the two mask-free combine arms plus the
-    // wedge arm (whose mask is a pure function of the decoded
-    // `(MiSize, wedge_index, wedge_sign)` carried in `mode_info.wedge`,
-    // so it can be regenerated here before prediction). The diff-weight
-    // and intra-variant masks are functions of the two `preds[]`
-    // themselves — they cannot be regenerated before prediction runs —
-    // and are left to a later driver (caller bug to route them here).
+    // This driver covers the two mask-free combine arms, the wedge arm
+    // (whose mask is a pure function of the decoded `(MiSize,
+    // wedge_index, wedge_sign)` carried in `mode_info.wedge`, so it can
+    // be regenerated here before prediction), and the diff-weight arm
+    // (whose §7.11.3.12 mask the §7.11.3.1 driver derives internally from
+    // the two `preds[]` at `plane == 0` and persists for chroma via the
+    // caller-supplied `diffwtd_mask` buffer). The intra-variant mask arm
+    // is left to a later driver (caller bug to route it here).
     if !matches!(
         mode_info.compound_type,
-        COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE
+        COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE | COMPOUND_DIFFWTD
     ) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // The DIFFWTD arm needs a persistent luma-grid mask buffer to carry
+    // the §7.11.3.12 mask from the `plane == 0` derivation to the chroma
+    // planes (av1-spec p.258 line 14392). A DIFFWTD leaf routed here
+    // without one is a caller bug; conversely a `diffwtd_mask` supplied
+    // on a non-DIFFWTD arm is harmlessly ignored.
+    if mode_info.compound_type == COMPOUND_DIFFWTD && diffwtd_mask.is_none() {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
@@ -4916,6 +5013,17 @@ pub fn reconstruct_inter_block_compound(
             CompoundParams::Wedge {
                 mask,
                 mask_stride: *luma_w,
+            }
+        }
+        COMPOUND_DIFFWTD => {
+            // The §7.11.3.12 mask is derived by the driver from the two
+            // `preds[]` (at `plane == 0`); we only forward the §5.11.29
+            // `mask_type` toggle plus the persistent luma-grid buffer the
+            // gate above guaranteed is `Some(_)`.
+            let mask = diffwtd_mask.expect("DIFFWTD arm requires diffwtd_mask (gated above)");
+            CompoundParams::Diffwtd {
+                mask_type: mode_info.mask_type,
+                mask,
             }
         }
         // COMPOUND_AVERAGE (the gate above rejected every other type).
@@ -5094,11 +5202,12 @@ pub struct InterModeInfoGrid<'a> {
     /// `comp_types()[ r * mi_cols + c ]`. Read only at a compound
     /// leaf's origin (`RefFrame[1] >= LAST_FRAME`); ignored on
     /// single-ref / inter-intra / intra cells. The [`COMPOUND_AVERAGE`]
-    /// / [`COMPOUND_DISTANCE`] mask-free arms and the [`COMPOUND_WEDGE`]
-    /// regenerable-mask arm are driven; the prediction-derived mask arms
-    /// ([`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`]) are skipped (their
-    /// masks depend on the two `preds[]` and cannot be regenerated from
-    /// grid side-data before prediction).
+    /// / [`COMPOUND_DISTANCE`] mask-free arms, the [`COMPOUND_WEDGE`]
+    /// regenerable-mask arm, and the [`COMPOUND_DIFFWTD`] arm (whose
+    /// §7.11.3.12 mask the driver derives internally from the two
+    /// `preds[]` at `plane == 0` and persists for chroma) are all driven.
+    /// The [`COMPOUND_INTRA`] arm is skipped (its §7.11.3.13
+    /// intra-variant mask belongs to the interintra driver).
     pub compound_types: &'a [u8],
     /// §5.11.29 `wedge_index` per cell — `wedge_index()[ r * mi_cols +
     /// c ]`. Read only at a [`COMPOUND_WEDGE`] compound leaf's origin
@@ -5110,6 +5219,11 @@ pub struct InterModeInfoGrid<'a> {
     /// (paired with `wedge_indices`); ignored on every other cell.
     /// Length must be at least `mi_rows * mi_cols`.
     pub wedge_signs: &'a [u8],
+    /// §5.11.29 `mask_type` per cell — `mask_type()[ r * mi_cols + c ]`.
+    /// Read only at a [`COMPOUND_DIFFWTD`] compound leaf's origin (`0` =
+    /// `DIFFWTD_38`, `1` = `DIFFWTD_38_INV`); ignored on every other
+    /// cell. Length must be at least `mi_rows * mi_cols`.
+    pub mask_types: &'a [u8],
     /// §7.11.3.15 order-hint context the [`COMPOUND_DISTANCE`] arm
     /// derives `(FwdWeight, BckWeight)` from. The `order_hint_ref0` /
     /// `order_hint_ref1` fields are re-resolved per compound leaf from
@@ -5164,22 +5278,24 @@ pub struct InterModeInfoGrid<'a> {
 /// skipped.
 ///
 /// Compound leaves (`RefFrame[1] >= LAST_FRAME`) carrying the mask-free
-/// [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`] combine types or the
-/// regenerable-mask [`COMPOUND_WEDGE`] type are driven through
-/// [`reconstruct_inter_block_compound`]: both references are resolved,
-/// the §7.11.3.15 distance weights are derived per leaf from
-/// `order_hints_by_ref[ RefFrame[0/1] ]` (DISTANCE), the §7.11.3.11
-/// wedge mask is regenerated per leaf from `wedge_indices[origin]` /
-/// `wedge_signs[origin]` (WEDGE), and `predict_inter` forms the
-/// two-reference combine.
+/// [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`] combine types, the
+/// regenerable-mask [`COMPOUND_WEDGE`] type, or the [`COMPOUND_DIFFWTD`]
+/// type are driven through [`reconstruct_inter_block_compound`]: both
+/// references are resolved, the §7.11.3.15 distance weights are derived
+/// per leaf from `order_hints_by_ref[ RefFrame[0/1] ]` (DISTANCE), the
+/// §7.11.3.11 wedge mask is regenerated per leaf from
+/// `wedge_indices[origin]` / `wedge_signs[origin]` (WEDGE), and for
+/// DIFFWTD the §7.11.3.12 mask is derived inside the driver from the two
+/// `preds[]` at `plane == 0` (the `mask_type` toggle comes from
+/// `mask_types[origin]`) into a per-leaf luma-grid scratch buffer reused
+/// for the chroma planes — then `predict_inter` forms the two-reference
+/// combine.
 ///
 /// **Scope / skips (untouched CurrFrame regions, for a later driver):**
 ///   * intra leaves (`IsInters == 0`);
 ///   * inter-intra leaves (`RefFrame[1] == INTRA_FRAME`);
-///   * compound leaves whose `compound_type` is a *prediction-derived*
-///     mask arm ([`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`]) — their mask
-///     is a function of the two `preds[]`, so it cannot be regenerated
-///     from grid side-data before prediction runs.
+///   * compound leaves carrying [`COMPOUND_INTRA`] — its §7.11.3.13
+///     intra-variant mask belongs to the interintra driver.
 ///
 /// The §7.11.3.1 horizontal / vertical interpolation filters are read
 /// per leaf from `InterpFilters[origin][0..2]` (the §5.11.x decoded
@@ -5212,6 +5328,7 @@ pub fn reconstruct_inter_frame(
         || grid.compound_types.len() < cells
         || grid.wedge_indices.len() < cells
         || grid.wedge_signs.len() < cells
+        || grid.mask_types.len() < cells
     {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
@@ -5289,16 +5406,18 @@ pub fn reconstruct_inter_frame(
                 // --- compound two-reference arm
                 //     (AVERAGE / DISTANCE / WEDGE). ---
                 let comp_type = grid.compound_types[origin];
-                // The prediction-derived mask arms (DIFFWTD / INTRA)
-                // need a mask computed from the two preds[]; that mask
-                // cannot be regenerated from grid side-data here, so
-                // leave their regions for a later driver. AVERAGE /
-                // DISTANCE need no mask and WEDGE's mask is a pure
-                // function of the decoded (MiSize, wedge_index,
-                // wedge_sign) — all three are driven.
+                // The intra-variant mask arm (COMPOUND_INTRA) needs a
+                // §7.11.3.13 mask that the interintra driver owns; leave
+                // its region for that later arc. AVERAGE / DISTANCE need
+                // no mask, WEDGE's mask is a pure function of the decoded
+                // (MiSize, wedge_index, wedge_sign), and DIFFWTD's
+                // §7.11.3.12 mask is derived by the driver from the two
+                // `preds[]` at `plane == 0` and persisted across planes
+                // via the per-block luma-grid buffer allocated below —
+                // all four are driven.
                 if !matches!(
                     comp_type,
-                    COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE
+                    COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE | COMPOUND_DIFFWTD
                 ) {
                     continue;
                 }
@@ -5321,6 +5440,21 @@ pub fn reconstruct_inter_frame(
                     mv1: [grid.mvs[origin * 4 + 2], grid.mvs[origin * 4 + 3]],
                     compound_type: comp_type,
                     wedge,
+                    mask_type: grid.mask_types[origin],
+                };
+                // §7.11.3.12 persistent luma-grid `Mask` array — the
+                // DIFFWTD driver fills it on the `plane == 0` call and
+                // reuses it for chroma (av1-spec p.258 line 14392). Sized
+                // to the *luma* block extent; `None` on the non-DIFFWTD
+                // arms (the wrapper ignores it there).
+                let mut diffwtd_mask: Option<Vec<u8>> = if comp_type == COMPOUND_DIFFWTD {
+                    Some(vec![
+                        0u8;
+                        crate::cdf::block_width(mi_size)
+                            * crate::cdf::block_height(mi_size)
+                    ])
+                } else {
+                    None
                 };
                 // §7.11.3.15 order-hint context — resolve each ref's
                 // `OrderHints[]` from the per-RefFrame table. The two
@@ -5359,6 +5493,7 @@ pub fn reconstruct_inter_frame(
                         ctx.frame_height,
                         interp_x,
                         interp_y,
+                        diffwtd_mask.as_deref_mut(),
                         ctx.curr,
                         ctx.curr_stride,
                     )?;
@@ -7850,9 +7985,9 @@ mod tests {
         // (1,0) BLOCK_4X4 intra.
         set_cell(&mut mi_sizes, 1, 0, BLOCK_4X4);
         // (1,1) BLOCK_4X4 compound inter (RefFrame[1] = LAST_FRAME),
-        // marked COMPOUND_DIFFWTD so the walk skips it (its mask is a
-        // function of the two preds[], unregenerable from grid
-        // side-data — unlike COMPOUND_WEDGE which is now driven).
+        // marked COMPOUND_INTRA so the walk skips it (the §7.11.3.13
+        // intra-variant mask is owned by the interintra driver — unlike
+        // COMPOUND_WEDGE / COMPOUND_DIFFWTD which are now driven).
         set_cell(&mut mi_sizes, 1, 1, BLOCK_4X4);
         stamp_inter(
             &mut is_inters,
@@ -7864,7 +7999,7 @@ mod tests {
             last,
             [0, 4],
         );
-        compound_types[mi_cols as usize + 1] = COMPOUND_DIFFWTD;
+        compound_types[mi_cols as usize + 1] = COMPOUND_INTRA;
 
         // CurrFrame[0]: 8 rows × 16 cols, sentinel pre-fill.
         let curr_w = (mi_cols * 4) as usize; // 16
@@ -7883,6 +8018,7 @@ mod tests {
             compound_types: &compound_types,
             wedge_indices: &wedge_zeros,
             wedge_signs: &wedge_zeros,
+            mask_types: &wedge_zeros,
             order_hint_bits: 7,
             current_order_hint: 0,
             order_hints_by_ref: &order_hints_by_ref,
@@ -8029,6 +8165,7 @@ mod tests {
                 compound_types: &comp_types,
                 wedge_indices: &wedge_zeros,
                 wedge_signs: &wedge_zeros,
+                mask_types: &wedge_zeros,
                 order_hint_bits: 7,
                 current_order_hint: 0,
                 order_hints_by_ref: &order_hints_by_ref,
@@ -8191,6 +8328,7 @@ mod tests {
             mv1: [8, 0],
             compound_type: COMPOUND_AVERAGE,
             wedge: None,
+            mask_type: 0,
         };
         // Driver output, stitched into an 8×8 plane at (2, 2).
         let curr_w = 8;
@@ -8219,6 +8357,7 @@ mod tests {
             ref_h as u32,
             EIGHTTAP,
             EIGHTTAP,
+            None,
             &mut curr,
             curr_w,
         )
@@ -8338,6 +8477,7 @@ mod tests {
                 mv1: [8, 0],
                 compound_type: COMPOUND_DISTANCE,
                 wedge: None,
+                mask_type: 0,
             },
             ohc,
             &ref_frame_idx,
@@ -8354,6 +8494,7 @@ mod tests {
             ref_h as u32,
             EIGHTTAP,
             EIGHTTAP,
+            None,
             &mut curr,
             w,
         )
@@ -8445,6 +8586,7 @@ mod tests {
                     // `wedge: None` — exercises both the non-wedge arms
                     // and the "WEDGE without wedge side-data" caller bug.
                     wedge: None,
+                    mask_type: 0,
                 },
                 ohc,
                 &ref_frame_idx,
@@ -8461,6 +8603,7 @@ mod tests {
                 ref_h as u32,
                 EIGHTTAP,
                 EIGHTTAP,
+                None,
                 curr,
                 stride,
             )
@@ -8471,8 +8614,9 @@ mod tests {
             mk(last, last + 1, COMPOUND_WEDGE, &mut curr, w).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
         );
-        // COMPOUND_DIFFWTD — prediction-derived mask, out of this
-        // driver's scope.
+        // COMPOUND_DIFFWTD routed without the persistent luma-grid mask
+        // buffer (the `mk` closure passes `diffwtd_mask = None`) — caller
+        // bug per the §7.11.3.12 persistence gate.
         assert_eq!(
             mk(last, last + 1, COMPOUND_DIFFWTD, &mut curr, w).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
@@ -8557,10 +8701,9 @@ mod tests {
         stamp(0, last + 1, COMPOUND_AVERAGE, [0, 4], [8, 0]);
         // col 1: COMPOUND_DISTANCE (RefFrame[1] = LAST+2).
         stamp(1, last + 2, COMPOUND_DISTANCE, [4, 0], [0, 8]);
-        // col 2: COMPOUND_DIFFWTD (prediction-derived mask) — must be
-        // skipped (its mask is a function of preds[], unregenerable
-        // from grid side-data).
-        stamp(2, last + 1, COMPOUND_DIFFWTD, [0, 4], [8, 0]);
+        // col 2: COMPOUND_INTRA (the §7.11.3.13 intra-variant mask is
+        // owned by the interintra driver) — must be skipped by this walk.
+        stamp(2, last + 1, COMPOUND_INTRA, [0, 4], [8, 0]);
         // col 3: inter-intra (RefFrame[1] = INTRA_FRAME) — skipped.
         is_inters[3] = 1;
         ref_frames[3 * 2] = last;
@@ -8590,6 +8733,7 @@ mod tests {
             compound_types: &compound_types,
             wedge_indices: &wedge_zeros,
             wedge_signs: &wedge_zeros,
+            mask_types: &wedge_zeros,
             order_hint_bits: 7,
             current_order_hint,
             order_hints_by_ref: &order_hints_by_ref,
@@ -8623,6 +8767,7 @@ mod tests {
                 mv1: [8, 0],
                 compound_type: COMPOUND_AVERAGE,
                 wedge: None,
+                mask_type: 0,
             },
             CompoundOrderHintContext {
                 order_hint_bits: 7,
@@ -8644,6 +8789,7 @@ mod tests {
             ref_h as u32,
             EIGHTTAP,
             EIGHTTAP,
+            None,
             &mut oracle,
             curr_w,
         )
@@ -8657,6 +8803,7 @@ mod tests {
                 mv1: [0, 8],
                 compound_type: COMPOUND_DISTANCE,
                 wedge: None,
+                mask_type: 0,
             },
             CompoundOrderHintContext {
                 order_hint_bits: 7,
@@ -8678,6 +8825,7 @@ mod tests {
             ref_h as u32,
             EIGHTTAP,
             EIGHTTAP,
+            None,
             &mut oracle,
             curr_w,
         )
@@ -8687,7 +8835,7 @@ mod tests {
             curr, oracle,
             "frame walk must dispatch compound leaves identically to the per-block driver"
         );
-        // The DIFFWTD (col 2) and inter-intra (col 3) leaves are
+        // The COMPOUND_INTRA (col 2) and inter-intra (col 3) leaves are
         // skipped → still the sentinel (cols 8..16 in plane samples).
         for c in 8..16 {
             for r in 0..curr_h {
@@ -8749,6 +8897,7 @@ mod tests {
                 wedge_index,
                 wedge_sign,
             }),
+            mask_type: 0,
         };
 
         // Pre-build the luma-grid wedge mask once for the oracle.
@@ -8795,6 +8944,7 @@ mod tests {
                 ref_h as u32,
                 EIGHTTAP,
                 EIGHTTAP,
+                None,
                 &mut got,
                 curr_w,
             )
@@ -8919,6 +9069,7 @@ mod tests {
         wedge_indices[0] = wedge_index;
         let mut wedge_signs = vec![0u8; cells];
         wedge_signs[0] = wedge_sign;
+        let mask_types = vec![0u8; cells];
 
         let order_hints_by_ref = [0i32; 8];
         let curr_w = (mi_cols * 4) as usize; // 8
@@ -8935,6 +9086,7 @@ mod tests {
             compound_types: &compound_types,
             wedge_indices: &wedge_indices,
             wedge_signs: &wedge_signs,
+            mask_types: &mask_types,
             order_hint_bits: 7,
             current_order_hint: 0,
             order_hints_by_ref: &order_hints_by_ref,
@@ -8971,6 +9123,7 @@ mod tests {
                     wedge_index,
                     wedge_sign,
                 }),
+                mask_type: 0,
             },
             CompoundOrderHintContext {
                 order_hint_bits: 7,
@@ -8992,6 +9145,7 @@ mod tests {
             ref_h as u32,
             EIGHTTAP,
             EIGHTTAP,
+            None,
             &mut oracle,
             curr_w,
         )
@@ -9005,6 +9159,195 @@ mod tests {
         assert!(
             curr.iter().all(|&s| s != sentinel),
             "all WEDGE samples reconstructed"
+        );
+    }
+
+    /// §5.11.33 frame walk — a `COMPOUND_DIFFWTD` leaf (BLOCK_8X8) must
+    /// be driven through [`reconstruct_inter_block_compound`] with a
+    /// per-block persistent luma-grid mask buffer. The §7.11.3.12 mask
+    /// is derived *internally* from the two `preds[]` (av1-spec p.258
+    /// line 14392), so the walk must match a per-block driver invoked
+    /// with the same `mask_type` and its own scratch buffer, and the
+    /// result must differ from a plain `COMPOUND_AVERAGE` blend (proving
+    /// the diff-weight mask actually shapes the output).
+    #[test]
+    fn r296_reconstruct_inter_frame_drives_diffwtd_compound() {
+        const BLOCK_8X8: usize = 3;
+        let ref_w = 16usize;
+        let ref_h = 16usize;
+        let stride = ref_w;
+        let refp = r294_ref_plane(ref_w, ref_h);
+        let real = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [real, real, real, real];
+        let store2 = store;
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        use crate::cdf::BLOCK_INVALID;
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        mi_sizes[0] = BLOCK_8X8;
+        let mut is_inters = vec![0u8; cells];
+        is_inters[0] = 1;
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        ref_frames[0] = last;
+        ref_frames[1] = last + 1;
+        // Two distinct MVs so preds[0] != preds[1] and the §7.11.3.12
+        // difference is non-trivial across the block.
+        let mv0 = [0i16, 4];
+        let mv1 = [8i16, 0];
+        let mut mvs = vec![0i16; cells * 4];
+        mvs[0] = mv0[0];
+        mvs[1] = mv0[1];
+        mvs[2] = mv1[0];
+        mvs[3] = mv1[1];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let mut compound_types = vec![COMPOUND_AVERAGE; cells];
+        compound_types[0] = COMPOUND_DIFFWTD;
+        let mask_type = 1u8; // DIFFWTD_38_INV.
+        let mut mask_types = vec![0u8; cells];
+        mask_types[0] = mask_type;
+        let zeros = vec![0u8; cells];
+
+        let order_hints_by_ref = [0i32; 8];
+        let curr_w = (mi_cols * 4) as usize; // 8
+        let curr_h = (mi_rows * 4) as usize; // 8
+        let sentinel = 5000u16;
+        let mut curr = vec![sentinel; curr_w * curr_h];
+
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &compound_types,
+            wedge_indices: &zeros,
+            wedge_signs: &zeros,
+            mask_types: &mask_types,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+        };
+        {
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("frame-level DIFFWTD reconstruction");
+        }
+
+        // Oracle: drive the single DIFFWTD leaf directly with its own
+        // persistent luma-grid mask buffer.
+        let mut oracle = vec![sentinel; curr_w * curr_h];
+        let mut oracle_mask = vec![0u8; 8 * 8];
+        reconstruct_inter_block_compound(
+            CompoundInterModeInfo {
+                ref_frame_0: last as u8,
+                ref_frame_1: (last + 1) as u8,
+                mv0,
+                mv1,
+                compound_type: COMPOUND_DIFFWTD,
+                wedge: None,
+                mask_type,
+            },
+            CompoundOrderHintContext {
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hint_ref0: 0,
+                order_hint_ref1: 0,
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            Some(&mut oracle_mask),
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        assert_eq!(
+            curr, oracle,
+            "frame walk must drive the DIFFWTD leaf identically to the per-block driver"
+        );
+        assert!(
+            curr.iter().all(|&s| s != sentinel),
+            "all DIFFWTD samples reconstructed"
+        );
+
+        // A plain AVERAGE blend of the same two preds must differ — the
+        // diff-weight mask genuinely shapes the output.
+        let mut avg = vec![sentinel; curr_w * curr_h];
+        reconstruct_inter_block_compound(
+            CompoundInterModeInfo {
+                ref_frame_0: last as u8,
+                ref_frame_1: (last + 1) as u8,
+                mv0,
+                mv1,
+                compound_type: COMPOUND_AVERAGE,
+                wedge: None,
+                mask_type: 0,
+            },
+            CompoundOrderHintContext {
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hint_ref0: 0,
+                order_hint_ref1: 0,
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            None,
+            &mut avg,
+            curr_w,
+        )
+        .unwrap();
+        assert_ne!(
+            curr, avg,
+            "DIFFWTD mask blend must differ from a plain AVERAGE blend"
         );
     }
 
@@ -9554,22 +9897,32 @@ mod tests {
         assert_eq!(pred_out, expected, "WEDGE arm pixel mismatch");
     }
 
-    /// §7.11.3.1 step-14 + line 14412 — `COMPOUND_DIFFWTD` driver path
-    /// (mask buffer supplied by caller via §7.11.3.12).
+    /// §7.11.3.1 step-14 + line 14412 — `COMPOUND_DIFFWTD` driver path:
+    /// the §7.11.3.12 mask is derived *internally* from the two actual
+    /// `preds[]` the driver forms (the caller supplies only `mask_type`
+    /// plus a persistent luma-grid scratch buffer per av1-spec p.258
+    /// line 14392), then blended via §7.11.3.14. The oracle re-derives
+    /// the mask from the *same* per-ref §7.11.3.4 leaf predictions and
+    /// blends them, so a match proves the driver consumes real preds
+    /// rather than a fabricated mask.
     #[test]
-    fn r201_predict_inter_compound_diffwtd_routes_to_mask_blend() {
+    fn r296_predict_inter_compound_diffwtd_derives_mask_from_preds() {
         let ref_w: usize = 16;
         let ref_h: usize = 16;
         let stride = ref_w;
-        let mut refp = vec![0u16; ref_h * stride];
+        // Two *distinct* reference planes so the per-pixel difference —
+        // and therefore the §7.11.3.12 mask — varies across the block.
+        let mut refp0 = vec![0u16; ref_h * stride];
+        let mut refp1 = vec![0u16; ref_h * stride];
         for r in 0..ref_h {
             for c in 0..ref_w {
-                refp[r * stride + c] = ((r * 9 + c) & 0xFF) as u16;
+                refp0[r * stride + c] = ((r * 9 + c) & 0xFF) as u16;
+                refp1[r * stride + c] = ((r * 3 + c * 5 + 17) & 0xFF) as u16;
             }
         }
         let refs = [
             PredictInterRef {
-                ref_plane: &refp,
+                ref_plane: &refp0,
                 ref_stride: stride,
                 ref_upscaled_width: ref_w as u32,
                 ref_width: ref_w as u32,
@@ -9577,7 +9930,7 @@ mod tests {
                 mv: [0, 0],
             },
             PredictInterRef {
-                ref_plane: &refp,
+                ref_plane: &refp1,
                 ref_stride: stride,
                 ref_upscaled_width: ref_w as u32,
                 ref_width: ref_w as u32,
@@ -9587,26 +9940,11 @@ mod tests {
         ];
         let w = 8;
         let h = 8;
-        // Build the §7.11.3.12 difference-weight mask from two
-        // deliberately-different fake preds so the mask values are
-        // varied (preds for the driver itself still use ref0==ref1).
-        let preds_diff_a = vec![100i32; w * h];
-        let preds_diff_b = (0..(w * h)).map(|i| (i * 8) as i32).collect::<Vec<_>>();
-        let mut mask = vec![0u8; w * h];
         let rv = rounding_variables(8, true).unwrap();
-        difference_weight_mask(
-            8,
-            rv.inter_post_round,
-            0,
-            &preds_diff_a,
-            &preds_diff_b,
-            w,
-            h,
-            &mut mask,
-        )
-        .unwrap();
+        let mask_type = 1u8; // exercise the DIFFWTD_38_INV inversion.
 
         let mut pred_out = vec![0u16; w * h];
+        let mut persistent_mask = vec![0u8; w * h];
         predict_inter(
             0,
             0,
@@ -9625,8 +9963,8 @@ mod tests {
             EIGHTTAP,
             &refs,
             Some(CompoundParams::Diffwtd {
-                mask: &mask,
-                mask_stride: 0,
+                mask_type,
+                mask: &mut persistent_mask,
             }),
             /* warp */ None,
             /* obmc */ None,
@@ -9634,8 +9972,8 @@ mod tests {
         )
         .expect("compound DIFFWTD arm");
 
-        // Same self-blend identity as WEDGE: preds[0]==preds[1] makes
-        // the mask weights cancel.
+        // Oracle: form the two per-ref §7.11.3.4 leaf predictions,
+        // derive the §7.11.3.12 mask from them, then §7.11.3.14 blend.
         let mvs = motion_vector_scaling(
             0,
             0,
@@ -9649,44 +9987,73 @@ mod tests {
             [0, 0],
         )
         .unwrap();
-        let mut leaf = vec![0i32; w * h];
-        block_inter_prediction(
-            0,
-            0,
-            0,
-            &refp,
-            stride,
-            ref_w as u32,
-            ref_h as u32,
-            mvs.start_x,
-            mvs.start_y,
-            mvs.step_x,
-            mvs.step_y,
+        let leaf = |rp: &[u16]| -> Vec<i32> {
+            let mut out = vec![0i32; w * h];
+            block_inter_prediction(
+                0,
+                0,
+                0,
+                rp,
+                stride,
+                ref_w as u32,
+                ref_h as u32,
+                mvs.start_x,
+                mvs.start_y,
+                mvs.step_x,
+                mvs.step_y,
+                w,
+                h,
+                EIGHTTAP,
+                EIGHTTAP,
+                rv.inter_round0,
+                rv.inter_round1,
+                &mut out,
+            )
+            .unwrap();
+            out
+        };
+        let leaf0 = leaf(&refp0);
+        let leaf1 = leaf(&refp1);
+        let mut oracle_mask = vec![0u8; w * h];
+        difference_weight_mask(
+            8,
+            rv.inter_post_round,
+            mask_type,
+            &leaf0,
+            &leaf1,
             w,
             h,
-            EIGHTTAP,
-            EIGHTTAP,
-            rv.inter_round0,
-            rv.inter_round1,
-            &mut leaf,
+            &mut oracle_mask,
         )
         .unwrap();
+        // The driver must have written the same mask into the persistent
+        // luma-grid buffer.
+        assert_eq!(
+            persistent_mask, oracle_mask,
+            "DIFFWTD persistent mask mismatch"
+        );
         let mut expected = vec![0u16; w * h];
         mask_blend(
             8,
             rv.inter_post_round,
             0,
             0,
-            &leaf,
-            &leaf,
+            &leaf0,
+            &leaf1,
             w,
             h,
-            &mask,
+            &oracle_mask,
             0,
             &mut expected,
         )
         .unwrap();
         assert_eq!(pred_out, expected, "DIFFWTD arm pixel mismatch");
+        // The mask must genuinely vary (proves real-pred derivation, not
+        // a constant fallback).
+        assert!(
+            oracle_mask.iter().any(|&m| m != oracle_mask[0]),
+            "DIFFWTD mask should vary across the block"
+        );
     }
 
     /// §7.11.3.1 step-14 + line 14412 — `COMPOUND_INTRA` driver path

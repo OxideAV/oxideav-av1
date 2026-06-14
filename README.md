@@ -2,6 +2,38 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 296)
+
+Round 296 **wires the `COMPOUND_DIFFWTD` mask compound arm end-to-end
+across the frame walk** — the r295 follow-up. Where r295 added the
+wedge arm (a mask that is a pure function of decoded side-data),
+DIFFWTD's §7.11.3.12 difference-weight mask is a **function of the two
+`preds[]`** the driver forms, so it cannot be supplied by the caller
+ahead of motion compensation.
+
+* **Internally-derived mask.** `predict_inter` now derives the
+  §7.11.3.12 mask from the actual `pred0` / `pred1` it forms, at
+  `plane == 0` only (av1-spec p.258 line 14392), and persists the
+  luma-grid `Mask` array for the chroma planes, which reuse it through
+  `mask_blend`'s `(sub_x, sub_y)` downsampling. The `mask_type` toggle
+  (`DIFFWTD_38` / `DIFFWTD_38_INV`) inverts the per-pixel weight.
+* **API shape.** `CompoundParams::Diffwtd` now carries the §5.11.29
+  `mask_type` plus a `&mut [u8]` persistent luma-grid mask buffer
+  (`CompoundParams` is no longer `Copy`) instead of a pre-built mask.
+  `reconstruct_inter_block_compound` gains a `diffwtd_mask:
+  Option<&mut [u8]>` parameter; `CompoundInterModeInfo` gains
+  `mask_type`; `InterModeInfoGrid` gains a per-cell `mask_types` slice
+  the frame walk reads at each DIFFWTD leaf's origin (one luma-grid
+  scratch buffer per leaf, reused across its planes).
+* **Still deferred.** `COMPOUND_INTRA` remains skipped — its
+  §7.11.3.13 intra-variant mask belongs to the interintra driver.
+
++1 lib test net (1982 → 1983): a driver-level test proving the mask is
+derived from the real per-ref §7.11.3.4 leaf predictions (not a
+fabricated mask), and a frame-walk test driving one BLOCK_8X8 DIFFWTD
+leaf identically to the per-block driver and asserting it differs from
+a plain AVERAGE blend.
+
 ## Status — 2026-06-14 (round 295)
 
 Round 295 **drives the `COMPOUND_WEDGE` mask compound arm across the
