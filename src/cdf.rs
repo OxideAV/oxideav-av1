@@ -25393,6 +25393,10 @@ impl PartitionWalker {
             filter_intra_mode,
             mv,
             is_compound,
+            // §5.11.33 `IsInterIntra` is always false on the §5.11.7
+            // intra arm: `RefFrame[1] = NONE = -1 ≠ INTRA_FRAME`, so
+            // the §5.11.33 gate cannot fire regardless of `is_inter`.
+            is_inter_intra: false,
             tx_size,
         };
 
@@ -25698,8 +25702,10 @@ impl PartitionWalker {
 
         // §5.11.5 line `compute_prediction( )` — §5.11.33 dispatcher.
         // r189 emits one inter [`PlanePredictionTask`] per
-        // (plane, 4x4-cell) on the `is_inter == 1` arm.
-        let _readout = self.compute_prediction(
+        // (plane, 4x4-cell) on the `is_inter == 1` arm; on the
+        // §5.11.28 inter-intra arm (`ref_frame_1_is_intra == true`)
+        // it prepends one intra-half task per plane (r301).
+        let readout = self.compute_prediction(
             mi_row,
             mi_col,
             sub_size,
@@ -25721,6 +25727,32 @@ impl PartitionWalker {
             /* interintra_mode = */
             inter_block.interintra.interintra_mode.unwrap_or(II_DC_PRED),
         )?;
+
+        // §5.11.33 `IsInterIntra` end-to-end propagation. The walker
+        // tracks no `CurrFrame[plane]` sample buffers, so it cannot
+        // invoke the §7.11.3.11 / §7.11.3.14 pixel-level blend inline;
+        // instead it reads the §5.11.33 dispatcher's per-block
+        // `is_inter_intra` verdict back out of the
+        // [`ComputePredictionReadout`] and surfaces it on the returned
+        // [`DecodedBlock`]. A stream consumer that maintains the
+        // per-plane buffers routes an `is_inter_intra == true` block —
+        // together with the §5.11.23 `RefFrame[0]` / `Mvs[..][0]` /
+        // §5.11.28 `interintra_mode` + optional wedge selectors carried
+        // on `inter_block` — through the shared
+        // [`crate::reconstruct_inter_intra_block`] driver (or, when it
+        // drives the §5.11.33 task list directly, through
+        // [`crate::reconstruct_inter_intra_from_dispatch`]).
+        //
+        // Defense-in-depth: the dispatcher derives its verdict from the
+        // same `(is_inter, ref_frame_1_is_intra)` pair this arm passed
+        // it, so the readout flag MUST agree with the locally-derived
+        // condition. A mismatch is a §5.11.33 dispatcher contract
+        // breach (a future spec/reader edit drifting the two apart),
+        // surfaced as a caller-bug guard rather than silently trusted.
+        let is_inter_intra = readout.is_inter_intra;
+        if is_inter_intra != ref_frame_1_is_intra {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
 
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
         // The §5.11.34 `is_inter && !Lossless && !plane`
@@ -25798,6 +25830,9 @@ impl PartitionWalker {
             // §5.11.31 `Mv[ 0..2 ]` from the §5.11.23 aggregate.
             mv: inter_block.mv,
             is_compound,
+            // §5.11.33 `IsInterIntra`, read back from the
+            // `compute_prediction()` readout above.
+            is_inter_intra,
             tx_size,
         })
     }
@@ -29895,6 +29930,21 @@ pub struct DecodedBlock {
     /// `false` on the intra arm (where `RefFrame[1] = NONE = -1 <
     /// INTRA_FRAME = 0`).
     pub is_compound: bool,
+    /// §5.11.33 `IsInterIntra = ( is_inter && RefFrame[ 1 ] ==
+    /// INTRA_FRAME )` (av1-spec p.82 line 5140), captured from the
+    /// per-block [`ComputePredictionReadout`] the §5.11.5 walker
+    /// runs at the `compute_prediction()` call site. Always `false`
+    /// on the §5.11.7 intra arm (`RefFrame[1] = NONE = -1 ≠
+    /// INTRA_FRAME = 0`) and on the §5.11.6 inter arm's
+    /// non-inter-intra blocks; `true` exactly when the §5.11.28
+    /// `interintra` arm stamped `RefFrame[1] = INTRA_FRAME` over the
+    /// block. A stream consumer that maintains `CurrFrame[plane]`
+    /// buffers routes `true` blocks through the shared
+    /// [`crate::reconstruct_inter_intra_block`] /
+    /// [`crate::reconstruct_inter_intra_from_dispatch`] driver; the
+    /// §5.11.5 walker itself tracks no per-plane sample buffers so it
+    /// surfaces the flag rather than reconstructing inline.
+    pub is_inter_intra: bool,
     /// §5.11.5 / §5.11.16 `TxSize`. On the implemented intra arm the
     /// value is `read_tx_size`'s return: `TX_4X4` when `Lossless`,
     /// otherwise `maxRectTxSize` further split `tx_depth` times via

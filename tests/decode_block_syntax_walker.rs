@@ -64,7 +64,10 @@ use oxideav_av1::encoder::block_mode_info::{
     write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_skip, IntrabcArmInputs,
 };
 use oxideav_av1::encoder::symbol_writer::SymbolWriter;
-use oxideav_av1::{get_palette_color_context, palette_color_ctx, BILINEAR, PALETTE_COLORS, V_PRED};
+use oxideav_av1::{
+    get_palette_color_context, interintra_ctx, palette_color_ctx, BILINEAR, INTERINTRA_MODES,
+    PALETTE_COLORS, V_PRED,
+};
 use oxideav_av1::{
     DecodedBlock, DecodedInterFrameModeInfo, Error, InterFrameContext, MotionFieldMvs,
     PartitionWalker, SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16, BLOCK_4X4,
@@ -818,6 +821,7 @@ fn decoded_block_struct_public_api_smoke() {
         filter_intra_mode: None,
         mv: [[0, 0], [0, 0]],
         is_compound: false,
+        is_inter_intra: false,
         tx_size: TX_4X4 as u8,
     };
 }
@@ -2985,6 +2989,15 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
         "r190: §5.11.25 globalmv arm sets RefFrame = [LAST_FRAME, NONE]"
     );
     assert!(!db.is_compound, "single-ref: slot 1 = NONE ⇒ !isCompound");
+    // §5.11.33 `IsInterIntra = ( is_inter && RefFrame[1] ==
+    // INTRA_FRAME )`. On the globalmv arm `RefFrame[1] = NONE = -1 ≠
+    // INTRA_FRAME = 0`, so the §5.11.33 gate stays closed even though
+    // `is_inter == 1`. The flag is now read back out of the
+    // `compute_prediction()` readout and surfaced on `DecodedBlock`.
+    assert!(
+        !db.is_inter_intra,
+        "globalmv block: RefFrame[1] = NONE ⇒ IsInterIntra == false"
+    );
     assert_eq!(
         db.mi_row, 0,
         "r190: §5.11.5 prologue records the per-block coordinates"
@@ -3017,6 +3030,121 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
             assert_eq!(walker.is_inters()[r * mi_cols + c], 1);
         }
     }
+}
+
+/// Helper: force an `N`-symbol CDF (length `N + 1`, last slot = adapt
+/// count) to deterministically decode symbol `0`. The §8.2.6 search
+/// breaks at the first `symbol` whose `cur` falls at/below
+/// `SymbolValue`; setting `cdf[0] = 1 << 15` (so `f = (1<<15) -
+/// cdf[0] = 0` ⇒ `cur` collapses to the `EC_MIN_PROB` tail) makes
+/// symbol 0 the break point regardless of the arithmetic state.
+fn force_cdf_symbol_zero<const N1: usize>() -> [u16; N1] {
+    let mut row = [1u16 << 15; N1];
+    // Last slot is the §8.3 adaptation counter, initialised to 0.
+    row[N1 - 1] = 0;
+    row
+}
+
+/// r302 wire-up: `decode_block_syntax(frame_is_intra = false,
+/// Some(&ctx))` surfaces the §5.11.33 `IsInterIntra` verdict on the
+/// returned [`DecodedBlock`]. This test rigs the §5.11.28
+/// `read_interintra_mode` inner arm to fire so the §5.11.5 inter
+/// walker produces a real inter-intra block end-to-end and the new
+/// `db.is_inter_intra` flag reads `true`.
+///
+/// Fixture: `BLOCK_8X8` (inside the §5.11.28 `BLOCK_8X8..=BLOCK_32X32`
+/// band) single-ref inter block on the same `seg_globalmv_active`
+/// no-S() cascade as the previous test (so `RefFrame = [LAST_FRAME,
+/// NONE]`, `!isCompound`, motion-mode SIMPLE). `enable_interintra_
+/// compound = true` opens the §5.11.28 outer gate; the three §5.11.28
+/// CDF rows are rigged so `interintra → 1`, `interintra_mode →
+/// II_DC_PRED` and `wedge_interintra → 0` (no wedge-index read). The
+/// §5.11.28 inner arm then stamps `RefFrame[1] = INTRA_FRAME = 0`,
+/// the §5.11.33 `IsInterIntra = ( is_inter && RefFrame[1] ==
+/// INTRA_FRAME )` gate fires, and the inter walker reads the verdict
+/// back out of the `compute_prediction()` readout.
+#[test]
+fn r302_decode_block_syntax_inter_intra_block_surfaces_is_inter_intra_flag() {
+    let mut walker = walker_n(16);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    cdfs.skip = [force_binary_cdf(0); SKIP_CONTEXTS];
+
+    // §5.11.28 CDF rigging. `interintra_ctx(BLOCK_8X8)` selects the
+    // Size_Group-1 row consumed by the `interintra` / `interintra_mode`
+    // S(); `wedge_inter_intra` / nothing else is indexed straight by
+    // MiSize.
+    let ii_ctx = interintra_ctx(BLOCK_8X8).expect("BLOCK_8X8 is in the §5.11.28 band");
+    cdfs.inter_intra[ii_ctx] = force_binary_cdf(1);
+    cdfs.inter_intra_mode[ii_ctx] = force_cdf_symbol_zero::<{ INTERINTRA_MODES + 1 }>();
+    cdfs.wedge_inter_intra[BLOCK_8X8] = force_binary_cdf(0);
+
+    let bytes = [0xffu8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+    let mut ctx = InterFrameContext::identity_default(&mfmvs);
+    ctx.seg_globalmv_active = true;
+    // §5.5.2 sequence-header bit — opens the §5.11.28 outer gate.
+    ctx.enable_interintra_compound = true;
+
+    let db = walker
+        .decode_block_syntax(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_8X8,
+            /* frame_is_intra = */ false,
+            /* subsampling_x = */ 0,
+            /* subsampling_y = */ 0,
+            /* num_planes = */ 3,
+            /* seg_id_pre_skip = */ false,
+            /* segmentation_enabled = */ false,
+            /* seg_skip_active = */ false,
+            /* last_active_seg_id = */ 0,
+            &lossless,
+            /* coded_lossless = */ false,
+            /* enable_cdef = */ true,
+            /* allow_intrabc = */ false,
+            /* cdef_bits = */ 0,
+            /* read_deltas = */ false,
+            /* use_128x128_superblock = */ false,
+            /* delta_q_res = */ 0,
+            /* delta_lf_present = */ false,
+            /* delta_lf_multi = */ false,
+            /* mono_chrome = */ false,
+            /* delta_lf_res = */ 0,
+            /* allow_screen_content_tools = */ false,
+            /* enable_filter_intra = */ false,
+            /* bit_depth = */ 8,
+            /* tx_mode_select = */ false,
+            /* inter_ctx = */ Some(&ctx),
+            /* quant = */ &oxideav_av1::QuantizerParams::neutral(0, 8),
+            /* reduced_tx_set = */ false,
+        )
+        .expect("§5.11.28 inner arm + §5.11.33 inter-intra gate must run to completion");
+
+    assert_eq!(db.is_inter, 1, "seg_globalmv_active ⇒ is_inter == 1");
+    // §5.11.28 inner arm overrode the §5.11.25 slot-1 NONE to
+    // INTRA_FRAME = 0, so the per-block aggregate now carries
+    // RefFrame[1] = INTRA_FRAME.
+    assert_eq!(
+        db.ref_frame,
+        [1, 0],
+        "§5.11.28 inner arm sets RefFrame = [LAST_FRAME, INTRA_FRAME]"
+    );
+    // §5.11.5 `IsCompound = RefFrame[1] > INTRA_FRAME` — INTRA_FRAME
+    // (0) is NOT > INTRA_FRAME, so inter-intra is single-pred.
+    assert!(
+        !db.is_compound,
+        "inter-intra: RefFrame[1] = INTRA_FRAME ⇒ !isCompound"
+    );
+    // The r302 payload: the §5.11.33 verdict is surfaced.
+    assert!(
+        db.is_inter_intra,
+        "RefFrame[1] = INTRA_FRAME && is_inter ⇒ IsInterIntra == true (surfaced on DecodedBlock)"
+    );
 }
 
 /// r190 wire-up: `decode_partition_syntax(frame_is_intra = false,

@@ -4,6 +4,35 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r302 (2026-06-14): **§5.11.5 inter walker surfaces the
+  §5.11.33 `IsInterIntra` verdict end-to-end**. The §5.11.6 inter arm
+  (`decode_block_syntax_inter_arm`) previously discarded its
+  `compute_prediction()` readout; it now reads the §5.11.33
+  `IsInterIntra = ( is_inter && RefFrame[1] == INTRA_FRAME )` verdict
+  back out of the `ComputePredictionReadout` and surfaces it on the new
+  `DecodedBlock::is_inter_intra` field, so a real inter stream that
+  decodes a §5.11.28 inter-intra block (where the inner arm stamped
+  `RefFrame[1] = INTRA_FRAME`) now carries the flag a buffer-tracking
+  consumer needs to route the block — together with the §5.11.23
+  `RefFrame[0]` / `Mvs[..][0]` / §5.11.28 `interintra_mode` + wedge
+  selectors on the inter aggregate — through the shared
+  `reconstruct_inter_intra_block` /
+  `reconstruct_inter_intra_from_dispatch` driver landed in r301. The
+  inter arm also gains a defense-in-depth guard: the dispatcher's
+  readout flag MUST agree with the locally-derived
+  `(is_inter && ref_frame_1_is_intra)` condition (a mismatch surfaces
+  as a caller-bug `PartitionWalkOutOfRange` rather than being silently
+  trusted). The §5.11.7 intra arm sets `is_inter_intra = false`
+  unconditionally (`RefFrame[1] = NONE ≠ INTRA_FRAME`). The §5.11.5
+  walker still tracks no `CurrFrame[plane]` sample buffers, so it
+  surfaces the verdict rather than reconstructing inline. +1 walker
+  test: `BLOCK_8X8` single-ref globalmv inter block with the §5.11.28
+  outer gate opened (`enable_interintra_compound`) and the inner arm
+  rigged to fire — the walker produces a real inter-intra block
+  (`RefFrame = [LAST_FRAME, INTRA_FRAME]`, `!isCompound`) and
+  `db.is_inter_intra == true`; the existing globalmv test gains an
+  `is_inter_intra == false` assertion for the non-inter-intra path.
+
 - decoder r301 (2026-06-14): **unify the §5.11.33 inter-intra
   reconstruction onto one per-block driver**. New
   `reconstruct_inter_intra_block` takes one `InterIntraLeaf` (the

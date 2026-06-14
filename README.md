@@ -2,6 +2,46 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 302)
+
+Round 302 **wires the §5.11.5 inter walker to surface the §5.11.33
+`IsInterIntra` verdict end-to-end** — the r301 followup's named arc.
+The §5.11.6 inter arm (`decode_block_syntax_inter_arm`) previously
+discarded the readout from its `compute_prediction()` call; it now
+reads the §5.11.33 verdict back out and propagates it so a real inter
+stream that decodes a §5.11.28 inter-intra block reaches the shared
+r301 driver through a buffer-tracking consumer.
+
+* **Readout propagation.** The inter arm captures the
+  `ComputePredictionReadout` and lifts its
+  `IsInterIntra = ( is_inter && RefFrame[1] == INTRA_FRAME )` verdict
+  onto the new `DecodedBlock::is_inter_intra` field. A consumer that
+  maintains `CurrFrame[plane]` buffers routes an `is_inter_intra ==
+  true` block — with the §5.11.23 `RefFrame[0]` / `Mvs[..][0]` /
+  §5.11.28 `interintra_mode` + wedge selectors on the inter aggregate
+  — through `reconstruct_inter_intra_block` /
+  `reconstruct_inter_intra_from_dispatch`.
+* **Consistency guard.** The dispatcher derives its verdict from the
+  same `(is_inter, ref_frame_1_is_intra)` pair this arm passed it, so
+  the readout flag MUST agree with the locally-derived condition; a
+  mismatch surfaces as a caller-bug `PartitionWalkOutOfRange` rather
+  than being silently trusted.
+* **Intra arm.** The §5.11.7 intra arm sets `is_inter_intra = false`
+  unconditionally — `RefFrame[1] = NONE ≠ INTRA_FRAME`, so the
+  §5.11.33 gate cannot fire there.
+* **Scope.** The §5.11.5 walker still tracks no `CurrFrame[plane]`
+  sample buffers, so it surfaces the verdict rather than
+  reconstructing inline; OBMC / warp inter-intra interactions remain
+  out of scope.
+
++1 walker test (lib unchanged at 1992): a `BLOCK_8X8` single-ref
+globalmv inter block with the §5.11.28 outer gate opened
+(`enable_interintra_compound`) and the inner arm rigged to fire — the
+walker produces a real inter-intra block (`RefFrame = [LAST_FRAME,
+INTRA_FRAME]`, `!isCompound`) and `db.is_inter_intra == true`; the
+existing globalmv test gains an `is_inter_intra == false` assertion for
+the non-inter-intra path.
+
 ## Status — 2026-06-14 (round 301)
 
 Round 301 **unifies the §5.11.33 inter-intra reconstruction onto one
