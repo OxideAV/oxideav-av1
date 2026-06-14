@@ -4,6 +4,29 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r303 (2026-06-14): **§5.11.5 walker reconstructs one
+  inter-intra block's pixels inline**. The r302 surface
+  (`DecodedBlock::is_inter_intra`) was verdict-only; the walker now
+  reconstructs the §7.11.3.14 inter-intra blend against its own tracked
+  per-plane `CurrFrame[plane]` buffers via the new
+  `PartitionWalker::reconstruct_inter_intra_into_curr_frame`. The
+  walker already stamps the §7.11.2 intra half into those buffers via
+  the §7.12.3 step-3 merge (the blend's `pred1 = CurrFrame[plane]`,
+  av1-spec p.284 line 15786); this bridge threads those buffers, the
+  §5.11.33 dispatcher readout, the decoded `InterIntraLeaf`, and the
+  caller-supplied §7.11.3.3 reference state (new `PlaneRefSpec` — the
+  parser does not own the decoded-picture buffer) through the shared
+  `reconstruct_inter_intra_from_dispatch` driver, then writes the
+  blended result back into `CurrFrame[plane]`. The walker's `i32`
+  buffers are mirrored to the driver's `u16` working space and copied
+  back (post-`Clip1`, lossless). Guards: empty `plane_refs`, a
+  `plane >= 3`, and a plane whose buffer is unallocated (intra half not
+  yet written) all return `PartitionWalkOutOfRange`. +2 lib tests
+  (1992 → 1994): an 8×8 single-ref luma inter-intra block reconstructed
+  through the walker bridge byte-identically to the per-block
+  `reconstruct_inter_block_interintra` oracle, and the three bridge
+  guards.
+
 - decoder r302 (2026-06-14): **§5.11.5 inter walker surfaces the
   §5.11.33 `IsInterIntra` verdict end-to-end**. The §5.11.6 inter arm
   (`decode_block_syntax_inter_arm`) previously discarded its

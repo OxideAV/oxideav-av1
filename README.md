@@ -2,6 +2,47 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 303)
+
+Round 303 **lands inline §5.11.33 inter-intra pixel reconstruction in
+the §5.11.5 walker** — the r302 followup's named arc. The r302 surface
+was verdict-only (`DecodedBlock::is_inter_intra`); the walker now
+reconstructs one inter-intra block's pixels end-to-end against its own
+tracked `CurrFrame[plane]` buffers.
+
+* **Walker bridge.** New
+  `PartitionWalker::reconstruct_inter_intra_into_curr_frame` threads the
+  walker's per-plane `curr_frame` buffers (which already hold the §7.11.2
+  intra half via the §7.12.3 step-3 merge — the §7.11.3.14 blend's
+  `pred1 = CurrFrame[plane]`, av1-spec p.284 line 15786), the §5.11.33
+  dispatcher readout, the decoded `InterIntraLeaf`, and the
+  caller-supplied §7.11.3.3 reference state through the shared
+  `reconstruct_inter_intra_from_dispatch` driver, then writes the
+  §7.11.3.14-blended result back into `CurrFrame[plane]`. The r302
+  verdict surface now has an inline pixel-producing partner.
+* **Reference state stays caller-owned.** The new `PlaneRefSpec`
+  descriptor carries, per plane, the resolved §7.11.3.3 `FrameStore`
+  slice + plane-space dims + subsampling. The §5.11.5 parser does not
+  own the decoded-picture buffer (that is decoder-level state one layer
+  up), so the inter half of the blend is supplied by the caller; the
+  walker contributes only the `CurrFrame[plane]` intra-half buffers it
+  already tracks.
+* **Buffer narrowing.** The walker buffers are `i32` (post-`Clip1`,
+  in-range); the driver works in `u16`. The bridge mirrors each plane to
+  `u16`, drives the blend, and copies the (in-range) result back as
+  `i32` — lossless in both directions.
+* **Guards.** Empty `plane_refs`, a `plane >= 3`, and a plane whose
+  buffer is unallocated (intra half not yet written) all return
+  `PartitionWalkOutOfRange`.
+* **Scope.** Single inter-intra leaf at a known origin; the full
+  §5.11.33 frame-walk wiring into the parser's superblock loop, and OBMC
+  / warp inter-intra interactions, remain out of scope.
+
++2 lib tests (1992 → 1994): an 8×8 single-ref luma inter-intra block
+reconstructed through the walker bridge byte-identically to the
+per-block `reconstruct_inter_block_interintra` oracle, and the three
+bridge guards.
+
 ## Status — 2026-06-14 (round 302)
 
 Round 302 **wires the §5.11.5 inter walker to surface the §5.11.33

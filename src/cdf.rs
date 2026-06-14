@@ -15699,6 +15699,130 @@ impl PartitionWalker {
         }
     }
 
+    /// §5.11.33 inter-intra end-to-end pixel reconstruction against the
+    /// walker's own tracked `CurrFrame[plane]` buffers (av1-spec p.82-83
+    /// `predict()` inter-intra arm + §7.11.3.14 blend on p.284).
+    ///
+    /// This closes the §5.11.33 inter-intra arc inside the parser: the
+    /// walker already stamps the §7.11.2 intra prediction into its
+    /// per-plane `curr_frame` buffers via the §7.12.3 step-3 merge
+    /// ([`Self::curr_frame_step3_merge`]) — the intra half of the
+    /// §7.11.3.14 blend (`pred1 = CurrFrame[plane][y+dstY][x+dstX]`,
+    /// av1-spec p.284 line 15786). This method threads those buffers,
+    /// together with the §5.11.33 dispatcher's emitted `readout`, the
+    /// decoded per-block inter side (`leaf`), and the caller-supplied
+    /// §7.11.3.3 reference state (`plane_refs`, since the parser does not
+    /// own the decoded-picture buffer), through the shared
+    /// [`crate::reconstruct_inter_intra_from_dispatch`] driver, then
+    /// writes the §7.11.3.14-blended result back into the walker's
+    /// `curr_frame` buffers. The walker's verdict-only r302 surface
+    /// (`DecodedBlock::is_inter_intra`) therefore now has an inline
+    /// pixel-producing partner: a consumer that has the §7.11.3.3 frame
+    /// store can reconstruct one inter-intra block end-to-end without
+    /// owning a separate `CurrFrame` mirror.
+    ///
+    /// `plane_refs` lists, per plane being reconstructed, the resolved
+    /// `FrameStore` slice + plane-space dims + subsampling (the §7.11.3
+    /// quantities the parser doesn't track). Each `plane_refs[k].plane`
+    /// must have a tracked `curr_frame` buffer; a plane whose buffer has
+    /// not been allocated yet (no step-3 merge has fired on it) is a
+    /// caller bug ([`crate::Error::PartitionWalkOutOfRange`]) — the intra
+    /// half of the blend must already be present.
+    ///
+    /// The walker buffers are `i32` (post-`Clip1`, always in
+    /// `0..=(1 << BitDepth) - 1`); the §7.11.3.14 driver works in `u16`,
+    /// so this bridge materialises a `u16` mirror of each plane buffer,
+    /// drives the blend, and copies the (post-`Clip1`, in-range) result
+    /// back as `i32`. The mirror is the whole plane buffer (the driver
+    /// addresses it at the leaf's plane-space `(baseX, baseY)` origin via
+    /// `curr_stride`).
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an empty
+    /// `plane_refs`, a `plane >= 3`, a plane with no tracked buffer, or
+    /// anything [`crate::reconstruct_inter_intra_from_dispatch`] itself
+    /// rejects (non-inter-intra readout, plane-coverage mismatch,
+    /// intra-half mode disagreement).
+    pub fn reconstruct_inter_intra_into_curr_frame(
+        &mut self,
+        readout: &ComputePredictionReadout,
+        leaf: &crate::InterIntraLeaf,
+        ref_frame_idx: &[u8],
+        bit_depth: u8,
+        plane_refs: &[crate::PlaneRefSpec<'_>],
+    ) -> Result<(), crate::Error> {
+        if plane_refs.is_empty() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // Materialise a `u16` mirror of each plane's `i32` `curr_frame`
+        // buffer (the intra half of the §7.11.3.14 blend the step-3
+        // merge already wrote). Each `plane_refs[k].plane` must have an
+        // allocated buffer; samples are post-`Clip1` so the `i32 → u16`
+        // narrowing is lossless.
+        let mut mirrors: Vec<(u8, Vec<u16>, usize, usize)> = Vec::new();
+        if mirrors.try_reserve(plane_refs.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        for spec in plane_refs {
+            let p = spec.plane as usize;
+            if p >= 3 {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            let Some(cp) = self.curr_frame[p].as_ref() else {
+                // No tracked buffer — the intra half of the blend has
+                // not been written yet (caller-bug ordering).
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let cols = cp.cols as usize;
+            let rows = cp.rows as usize;
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirrors.push((spec.plane, mirror, cols, rows));
+        }
+        // Build the per-plane reconstruction contexts over the mirrors.
+        // The mirror borrow and the `plane_refs` borrow are disjoint
+        // (the frame store lives in `plane_refs`, the curr buffer in the
+        // mirror), so the contexts can hold both.
+        {
+            let mut planes: Vec<crate::PlaneReconContext<'_>> = Vec::new();
+            if planes.try_reserve(plane_refs.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            for ((p, mirror, cols, _rows), spec) in mirrors.iter_mut().zip(plane_refs.iter()) {
+                planes.push(crate::PlaneReconContext {
+                    plane: *p,
+                    subsampling_x: spec.subsampling_x,
+                    subsampling_y: spec.subsampling_y,
+                    frame_store: spec.frame_store,
+                    frame_width: spec.frame_width,
+                    frame_height: spec.frame_height,
+                    curr: mirror.as_mut_slice(),
+                    curr_stride: *cols,
+                });
+            }
+            crate::reconstruct_inter_intra_from_dispatch(
+                readout,
+                leaf,
+                ref_frame_idx,
+                bit_depth,
+                &mut planes,
+            )?;
+        }
+        // §7.11.3.1 final step writes the blended samples in place; copy
+        // the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffers.
+        for (p, mirror, _cols, _rows) in &mirrors {
+            if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src as i32;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
     /// row-major: `skips()[ r * MiCols + c ]`. Cells that no leaf
     /// covered carry `0` (the §5.11.11 [`Self::decode_skip`] writer
@@ -54433,5 +54557,276 @@ mod tests {
         assert!(w3.left_dc_context().iter().all(|&v| v == 0));
         assert_eq!(w3.above_level_context()[3], 9, "above retained");
         assert_eq!(w3.above_dc_context()[3], 2, "above retained");
+    }
+
+    /// r303 §5.11.33 inter-intra end-to-end: the walker bridge
+    /// [`PartitionWalker::reconstruct_inter_intra_into_curr_frame`]
+    /// must drive the §7.11.3.14 blend against the walker's own tracked
+    /// `CurrFrame[plane]` buffers byte-for-byte identically to the
+    /// per-block [`crate::reconstruct_inter_block_interintra`] driver —
+    /// i.e. the walker now reconstructs one inter-intra block's pixels
+    /// inline, not just surfacing the `is_inter_intra` verdict.
+    #[test]
+    fn r303_walker_reconstructs_inter_intra_block_pixels() {
+        use crate::inter_pred::{EIGHTTAP, II_H_PRED};
+        use crate::{
+            reconstruct_inter_block_interintra, InterIntraLeaf, InterIntraModeInfo, PlaneRefSpec,
+            RefFrameStoreEntry,
+        };
+
+        // §7.11.3.3 reference frame (one plane, 16×16) — caller-owned
+        // decoder state the parser doesn't track.
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 13 + c * 7) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        const BLOCK_8X8: usize = 3;
+        let ii_mode = II_H_PRED;
+        let mv = [4i16, 6];
+        let curr_w = 8usize;
+        let curr_h = 8usize;
+
+        // The §7.11.2 intra half the §7.12.3 step-3 merge would have
+        // written into CurrFrame[0] before the §7.11.3.14 blend.
+        let mut seed = vec![0u16; curr_w * curr_h];
+        for i in 0..curr_h {
+            for j in 0..curr_w {
+                seed[i * curr_w + j] = ((i * 5 + j * 11 + 3) & 0xFF) as u16;
+            }
+        }
+
+        let leaf = InterIntraLeaf {
+            mode_info: InterIntraModeInfo {
+                ref_frame: last,
+                mv,
+                interintra_mode: ii_mode,
+                wedge: None,
+            },
+            mi_size: BLOCK_8X8,
+            mi_row: 0,
+            mi_col: 0,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+        };
+
+        // Oracle: the per-block driver on the seed (the proven path).
+        let mut oracle = seed.clone();
+        reconstruct_inter_block_interintra(
+            leaf.mode_info,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            None,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        // The §5.11.33 dispatcher readout for the same luma-only block:
+        // one intra-half task (mode II_H_PRED → H_PRED) ahead of the
+        // inter tasks.
+        let readout = ComputePredictionReadout {
+            is_inter_intra: true,
+            is_inter: true,
+            num_planes_visited: 1,
+            tasks: vec![PlanePredictionTask {
+                plane: 0,
+                start_x: 0,
+                start_y: 0,
+                log2_w: 3,
+                log2_h: 3,
+                mode: H_PRED as u8, // II_H_PRED → H_PRED
+                have_left: false,
+                have_above: false,
+            }],
+        };
+
+        // Walker with an 8×8 luma frame (2 mi rows/cols × MI_SIZE). The
+        // walker's curr_frame buffer is the inter-intra blend target.
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        // Seed CurrFrame[0] with the intra half (what the §7.12.3
+        // step-3 merge writes before the blend). Buffer is i32.
+        walker.ensure_curr_frame_plane(0, curr_h as u32, curr_w as u32);
+        {
+            let cp = walker.curr_frame[0].as_mut().unwrap();
+            assert_eq!(cp.samples.len(), curr_w * curr_h);
+            for (dst, &src) in cp.samples.iter_mut().zip(seed.iter()) {
+                *dst = src as i32;
+            }
+        }
+
+        let plane_refs = [PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        }];
+
+        walker
+            .reconstruct_inter_intra_into_curr_frame(
+                &readout,
+                &leaf,
+                &ref_frame_idx,
+                8,
+                &plane_refs,
+            )
+            .expect("walker inter-intra reconstruction");
+
+        // The walker's CurrFrame[0] now holds the §7.11.3.14-blended
+        // result, matching the per-block oracle, and differing from the
+        // seed (the blend actually modified the plane).
+        let got: Vec<u16> = walker
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(
+            got, oracle,
+            "the walker bridge must reconstruct inter-intra pixels identically to the per-block driver"
+        );
+        assert_ne!(got, seed, "the inter-intra blend must modify CurrFrame");
+    }
+
+    /// r303 bridge guards: empty `plane_refs`, an out-of-range plane,
+    /// and a plane whose `curr_frame` buffer has not been allocated
+    /// (intra half not yet written) are all caller bugs.
+    #[test]
+    fn r303_walker_inter_intra_bridge_guards() {
+        use crate::inter_pred::{EIGHTTAP, II_H_PRED};
+        use crate::{InterIntraLeaf, InterIntraModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+
+        let refp = vec![0u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let leaf = InterIntraLeaf {
+            mode_info: InterIntraModeInfo {
+                ref_frame: last,
+                mv: [0, 0],
+                interintra_mode: II_H_PRED,
+                wedge: None,
+            },
+            mi_size: 3, // BLOCK_8X8
+            mi_row: 0,
+            mi_col: 0,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+        };
+        let readout = ComputePredictionReadout {
+            is_inter_intra: true,
+            is_inter: true,
+            num_planes_visited: 1,
+            tasks: vec![PlanePredictionTask {
+                plane: 0,
+                start_x: 0,
+                start_y: 0,
+                log2_w: 3,
+                log2_h: 3,
+                mode: H_PRED as u8,
+                have_left: false,
+                have_above: false,
+            }],
+        };
+
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+
+        // Empty plane_refs.
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        w.ensure_curr_frame_plane(0, 8, 8);
+        assert!(matches!(
+            w.reconstruct_inter_intra_into_curr_frame(&readout, &leaf, &ref_frame_idx, 8, &[]),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Out-of-range plane.
+        let bad_plane = [PlaneRefSpec {
+            plane: 3,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        }];
+        assert!(matches!(
+            w.reconstruct_inter_intra_into_curr_frame(
+                &readout,
+                &leaf,
+                &ref_frame_idx,
+                8,
+                &bad_plane
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Plane with no tracked buffer (intra half not written): a
+        // fresh walker has no allocated curr_frame[0].
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let plane_refs = [PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        }];
+        assert!(matches!(
+            w2.reconstruct_inter_intra_into_curr_frame(
+                &readout,
+                &leaf,
+                &ref_frame_idx,
+                8,
+                &plane_refs
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
     }
 }

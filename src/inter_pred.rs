@@ -5842,6 +5842,40 @@ pub fn reconstruct_inter_intra_from_dispatch(
 // >> subY` and the block origin `(baseX, baseY)` — exactly the
 // `reconstruct_inter_block` write region.
 
+/// Per-plane §7.11.3.3 reference state a [`crate::PartitionWalker`]
+/// bridge needs to drive one inter-intra block's pixel reconstruction
+/// against its own tracked `CurrFrame[plane]` buffers.
+///
+/// The §5.11.5 syntax walker owns the `CurrFrame[plane]` sample buffers
+/// (it stamps the §7.11.2 intra prediction into them via the §7.12.3
+/// step-3 merge), but it does **not** own the §7.11.3.3 frame store —
+/// the per-reference decoded-picture buffer is decoder-level state one
+/// layer above the per-tile parser. So the inter half of the
+/// §7.11.3.14 inter-intra blend is supplied to the walker bridge
+/// ([`crate::PartitionWalker::reconstruct_inter_intra_into_curr_frame`])
+/// through this descriptor: per plane, the resolved `FrameStore` slice
+/// plus the plane-space `(frame_width, frame_height)` and subsampling
+/// the inter prediction reads. Every field is the per-plane resolution
+/// of a §7.11.3 quantity, matching [`PlaneReconContext`].
+#[derive(Debug, Clone, Copy)]
+pub struct PlaneRefSpec<'a> {
+    /// `0` (Y), `1` (Cb), `2` (Cr). Must match a plane the walker has
+    /// a tracked `CurrFrame[plane]` buffer for.
+    pub plane: u8,
+    /// §6.4.2 `subsampling_x` for this plane (`0` for plane `0`).
+    pub subsampling_x: u8,
+    /// §6.4.2 `subsampling_y`.
+    pub subsampling_y: u8,
+    /// This plane's §7.11.3.3 `FrameStore` slice (indexed by the
+    /// resolved `refIdx`), per-plane resolved like
+    /// [`RefFrameStoreEntry`].
+    pub frame_store: &'a [RefFrameStoreEntry<'a>],
+    /// §7.11.3 `FrameWidth` resolved to this plane (samples).
+    pub frame_width: u32,
+    /// §7.11.3 `FrameHeight` resolved to this plane (samples).
+    pub frame_height: u32,
+}
+
 /// §7.11.3 per-plane `CurrFrame[plane]` reconstruction target — one
 /// plane's output buffer plus the §7.11.3.3 reference-frame store the
 /// [`reconstruct_inter_frame`] walk resolves `RefFrame[0]` against for
