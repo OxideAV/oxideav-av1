@@ -15968,9 +15968,12 @@ impl PartitionWalker {
     /// inside the driver from the two formed `preds[]` at `plane == 0`. For
     /// a single (luma) bridge call the bridge materializes the persistent
     /// luma-grid mask buffer locally (sized `w × h`, the luma block extent
-    /// at `plane == 0`); a multi-plane caller threading one block's chroma
-    /// planes through the per-block driver directly owns the cross-plane
-    /// buffer instead (this bridge reconstructs one plane per call).
+    /// at `plane == 0`). To reconstruct chroma planes that **share** the
+    /// luma-derived mask (the spec-mandated `plane == 0`-only derivation),
+    /// use
+    /// [`Self::reconstruct_inter_block_compound_multiplane_into_curr_frame`],
+    /// which drives the §5.11.34 per-plane loop with one shared mask
+    /// buffer; this single-plane bridge reconstructs one plane per call.
     ///
     /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
     /// samples; `w` / `h` are its plane-space size. The walker buffer is
@@ -16068,6 +16071,180 @@ impl PartitionWalker {
         if let Some(cp) = self.curr_frame[p].as_mut() {
             for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
                 *dst = src as i32;
+            }
+        }
+        Ok(())
+    }
+
+    /// §7.11.3.1 compound (≥2-ref) inter pixel reconstruction across all
+    /// of a block's planes (Y, Cb, Cr) with **one shared §7.11.3.12
+    /// `Mask`** (av1-spec p.258 lines 14386-14393: the
+    /// [`crate::COMPOUND_DIFFWTD`] / [`crate::COMPOUND_WEDGE`] mask is
+    /// derived at `plane == 0` only and reused verbatim for the chroma
+    /// planes via [`mask_blend`]'s `(sub_x, sub_y)` downsampling).
+    ///
+    /// This is the multi-plane companion to
+    /// [`Self::reconstruct_inter_block_compound_into_curr_frame`]: rather
+    /// than one plane per call (which materializes a fresh `w × h` mask),
+    /// it drives the §5.11.34 per-plane loop
+    /// (`for plane in 0..1 + 2*has_chroma`) for a single decoded block,
+    /// allocating the §7.11.3.12 persistent mask once at the **luma**
+    /// extent (`Block_Width[MiSize] × Block_Height[MiSize]`) and threading
+    /// that same buffer into every plane's driver call. The `plane == 0`
+    /// call fills the mask from the luma `preds[]`; the chroma calls read
+    /// the already-filled luma-grid mask, downsampled. The
+    /// [`crate::COMPOUND_DIFFWTD`] arm is the one that *needs* the shared
+    /// buffer (its mask is data-dependent on the formed predictions); the
+    /// mask-free arms ([`crate::COMPOUND_AVERAGE`] /
+    /// [`crate::COMPOUND_DISTANCE`]) and the regenerable
+    /// [`crate::COMPOUND_WEDGE`] arm (mask is a pure function of the
+    /// decoded `(MiSize, wedge_index, wedge_sign)`) ignore it, so they
+    /// reconstruct identically whether driven one-plane-at-a-time or
+    /// through this multi-plane bridge.
+    ///
+    /// Per-plane geometry follows the §5.11.34 `predict()` loop
+    /// (av1-spec p.83): for `subX = (plane > 0) ? subsampling_x : 0` (and
+    /// `subY` likewise), `baseX = (mi_col >> subX) * MI_SIZE`,
+    /// `baseY = (mi_row >> subY) * MI_SIZE`,
+    /// `predW = Block_Width[MiSize] >> subX`,
+    /// `predH = Block_Height[MiSize] >> subY`. The bridge handles the
+    /// common `someUseIntra == 0` shape (one `predict_inter` call per
+    /// plane covering the whole plane footprint); the §5.11.34
+    /// intra-neighbour sub-block split (`someUseIntra == 1`) is a separate
+    /// per-block concern (a block flagged for it would route each 4×4
+    /// chunk through the single-plane bridge instead).
+    ///
+    /// `mode_info` / `order_hints` / `ref_frame_idx` are the decoded
+    /// §7.11.3.1 step-5/-8/-14 side-data (shared by every plane);
+    /// `plane_specs[plane]` carries the per-plane §7.11.3.3 reference
+    /// state (`subsampling_*`, `frame_store`, plane-resolved
+    /// `(frame_width, frame_height)`) — the `plane` field of each entry is
+    /// ignored (the loop index drives it). `num_planes` is `1` (luma-only)
+    /// or `3` (Y/Cb/Cr); chroma planes are skipped when `num_planes == 1`.
+    ///
+    /// Like the single-plane bridges, the walker buffer is `i32`
+    /// (post-`Clip1`); the driver works in `u16`, so each plane is
+    /// mirrored, driven, and copied back (lossless). Each plane's buffer
+    /// is allocated if untouched (compound overwrites — no intra-half
+    /// prerequisite), sized from `MiRows × MiCols × MI_SIZE >>
+    /// subsampling_*` so a later §7.12.3 step-3 merge is a no-op.
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for
+    /// `num_planes` not in `{1, 3}`, an out-of-range `mi_size`, a
+    /// `plane_specs` slice shorter than `num_planes`, or anything
+    /// [`crate::inter_pred::reconstruct_inter_block_compound`] itself
+    /// rejects on any plane (an `INTRA_FRAME`/out-of-range
+    /// `RefFrame[0]`/`RefFrame[1]`, an out-of-range resolved `refIdx`, an
+    /// unsupported `compound_type`, a `COMPOUND_WEDGE` leaf with
+    /// `wedge == None`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_inter_block_compound_multiplane_into_curr_frame(
+        &mut self,
+        mode_info: crate::inter_pred::CompoundInterModeInfo,
+        order_hints: crate::inter_pred::CompoundOrderHintContext,
+        ref_frame_idx: &[u8],
+        plane_specs: &[crate::PlaneRefSpec<'_>],
+        mi_col: u32,
+        mi_row: u32,
+        mi_size: usize,
+        num_planes: usize,
+        bit_depth: u8,
+        interp_filter_x: u8,
+        interp_filter_y: u8,
+    ) -> Result<(), crate::Error> {
+        if num_planes != 1 && num_planes != 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if plane_specs.len() < num_planes {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §7.11.3.12 persistent `Mask`, allocated once at the *luma*
+        // extent (`Block_Width[MiSize] × Block_Height[MiSize]`) and shared
+        // across the plane loop. Only the DIFFWTD arm reads/writes it; the
+        // mask-free + (internally-regenerated) WEDGE arms leave it
+        // untouched, so it is allocated only when DIFFWTD is in play.
+        let luma_w = block_width(mi_size);
+        let luma_h = block_height(mi_size);
+        let mut diffwtd_mask: Vec<u8> = Vec::new();
+        let needs_mask = mode_info.compound_type == crate::COMPOUND_DIFFWTD;
+        if needs_mask {
+            if diffwtd_mask.try_reserve_exact(luma_w * luma_h).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            diffwtd_mask.resize(luma_w * luma_h, 0);
+        }
+
+        for (plane, spec) in plane_specs.iter().enumerate().take(num_planes) {
+            // §5.11.34 `subX/subY = (plane > 0) ? subsampling_* : 0`.
+            let (sub_x, sub_y) = if plane == 0 {
+                (0u8, 0u8)
+            } else {
+                (spec.subsampling_x, spec.subsampling_y)
+            };
+            // §5.11.34 per-plane origin + footprint (someUseIntra == 0
+            // shape: one predict_inter call covering the whole plane
+            // block).
+            let base_x = ((mi_col >> sub_x) * (MI_SIZE as u32)) as i32;
+            let base_y = ((mi_row >> sub_y) * (MI_SIZE as u32)) as i32;
+            let pred_w = luma_w >> sub_x;
+            let pred_h = luma_h >> sub_y;
+
+            // Allocate this plane's buffer if untouched (compound
+            // overwrites — no intra-half prerequisite).
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+            let Some(cp) = self.curr_frame[plane].as_ref() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let buf_cols = cp.cols as usize;
+            // `u16` mirror of the whole `i32` plane buffer (samples are
+            // post-`Clip1`, so the narrowing is lossless).
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+
+            // The DIFFWTD arm receives the *shared* luma-grid mask; the
+            // `plane == 0` call fills it, the chroma calls read it
+            // (downsampled). Non-DIFFWTD arms get `None`.
+            let diffwtd_arg: Option<&mut [u8]> = if needs_mask {
+                Some(diffwtd_mask.as_mut_slice())
+            } else {
+                None
+            };
+
+            crate::inter_pred::reconstruct_inter_block_compound(
+                mode_info,
+                order_hints,
+                ref_frame_idx,
+                spec.frame_store,
+                plane as u8,
+                base_x,
+                base_y,
+                pred_w,
+                pred_h,
+                bit_depth,
+                sub_x,
+                sub_y,
+                spec.frame_width,
+                spec.frame_height,
+                interp_filter_x,
+                interp_filter_y,
+                diffwtd_arg,
+                mirror.as_mut_slice(),
+                buf_cols,
+            )?;
+
+            if let Some(cp) = self.curr_frame[plane].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src as i32;
+                }
             }
         }
         Ok(())
@@ -55582,6 +55759,432 @@ mod tests {
                 0,
                 8,
                 8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r306 multi-plane compound bridge: a `COMPOUND_DIFFWTD` block driven
+    /// through
+    /// [`PartitionWalker::reconstruct_inter_block_compound_multiplane_into_curr_frame`]
+    /// must reconstruct all three planes (Y, Cb, Cr) byte-identically to
+    /// the per-block [`crate::inter_pred::reconstruct_inter_block_compound`]
+    /// driver invoked once per plane with **one shared luma-grid
+    /// §7.11.3.12 `Mask` buffer** (the `plane == 0` call fills it; the
+    /// chroma calls read it downsampled, per av1-spec p.258 lines
+    /// 14392-14393). DIFFWTD is the arm that genuinely depends on the
+    /// shared mask, so it is the discriminating case.
+    #[test]
+    fn r306_walker_reconstructs_diffwtd_compound_block_multiplane() {
+        use crate::inter_pred::{
+            reconstruct_inter_block_compound, CompoundInterModeInfo, CompoundOrderHintContext,
+            EIGHTTAP,
+        };
+        use crate::{
+            block_height, block_width, PlaneRefSpec, RefFrameStoreEntry, COMPOUND_DIFFWTD,
+        };
+
+        // 4:2:0 reference planes: luma 16×16, chroma 8×8. Two distinct
+        // references per plane so the DIFFWTD mask is non-degenerate.
+        let build_plane = |w: usize, h: usize, a: usize, b: usize, c: usize| -> Vec<u16> {
+            let mut p = vec![0u16; w * h];
+            for r in 0..h {
+                for col in 0..w {
+                    p[r * w + col] = ((r * a + col * b + c) & 0xFF) as u16;
+                }
+            }
+            p
+        };
+        let ly_w = 16usize;
+        let ly_h = 16usize;
+        let lc_w = 8usize;
+        let lc_h = 8usize;
+        // Luma refs.
+        let ry0 = build_plane(ly_w, ly_h, 9, 5, 1);
+        let ry1 = build_plane(ly_w, ly_h, 3, 11, 7);
+        // Cb refs.
+        let rcb0 = build_plane(lc_w, lc_h, 7, 2, 3);
+        let rcb1 = build_plane(lc_w, lc_h, 2, 13, 5);
+        // Cr refs.
+        let rcr0 = build_plane(lc_w, lc_h, 4, 6, 9);
+        let rcr1 = build_plane(lc_w, lc_h, 11, 1, 2);
+
+        fn mk<'a>(p: &'a [u16], w: usize, h: usize) -> RefFrameStoreEntry<'a> {
+            RefFrameStoreEntry {
+                plane: p,
+                stride: w,
+                upscaled_width: w as u32,
+                width: w as u32,
+                height: h as u32,
+            }
+        }
+        // Per-plane store: ref0 at slot 0, ref1 at slot 3 (LAST→0,
+        // ALTREF→3 via ref_frame_idx below).
+        let ey0 = mk(&ry0, ly_w, ly_h);
+        let ey1 = mk(&ry1, ly_w, ly_h);
+        let ecb0 = mk(&rcb0, lc_w, lc_h);
+        let ecb1 = mk(&rcb1, lc_w, lc_h);
+        let ecr0 = mk(&rcr0, lc_w, lc_h);
+        let ecr1 = mk(&rcr1, lc_w, lc_h);
+        let store_y = [ey0, ey0, ey0, ey1];
+        let store_cb = [ecb0, ecb0, ecb0, ecb1];
+        let store_cr = [ecr0, ecr0, ecr0, ecr1];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 3];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let altref = crate::uncompressed_header_tail::ALTREF_FRAME as u8;
+
+        let mode_info = CompoundInterModeInfo {
+            ref_frame_0: last,
+            ref_frame_1: altref,
+            mv0: [0, 4],
+            mv1: [8, 0],
+            compound_type: COMPOUND_DIFFWTD,
+            wedge: None,
+            mask_type: 0,
+        };
+        let order_hints = CompoundOrderHintContext {
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hint_ref0: 0,
+            order_hint_ref1: 0,
+        };
+
+        // BLOCK_8X8: luma 8×8, chroma 4×4 (4:2:0). Block at the
+        // top-left (mi_col = mi_row = 0) so per-plane base_x/base_y = 0.
+        let mi_size = BLOCK_8X8;
+        let lw = block_width(mi_size); // 8
+        let lh = block_height(mi_size); // 8
+        let cw = lw >> 1; // 4
+        let ch = lh >> 1; // 4
+
+        // ---- Oracle: per-block driver, three planes, ONE shared
+        // luma-grid mask (lw × lh). plane 0 fills it; chroma read it. ----
+        let mut shared_mask = vec![0u8; lw * lh];
+        let mut oy = vec![0u16; lw * lh];
+        let mut ocb = vec![0u16; cw * ch];
+        let mut ocr = vec![0u16; cw * ch];
+
+        reconstruct_inter_block_compound(
+            mode_info,
+            order_hints,
+            &ref_frame_idx,
+            &store_y,
+            0,
+            0,
+            0,
+            lw,
+            lh,
+            8,
+            0,
+            0,
+            ly_w as u32,
+            ly_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            Some(shared_mask.as_mut_slice()),
+            &mut oy,
+            lw,
+        )
+        .unwrap();
+        reconstruct_inter_block_compound(
+            mode_info,
+            order_hints,
+            &ref_frame_idx,
+            &store_cb,
+            1,
+            0,
+            0,
+            cw,
+            ch,
+            8,
+            1,
+            1,
+            lc_w as u32,
+            lc_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            Some(shared_mask.as_mut_slice()),
+            &mut ocb,
+            cw,
+        )
+        .unwrap();
+        reconstruct_inter_block_compound(
+            mode_info,
+            order_hints,
+            &ref_frame_idx,
+            &store_cr,
+            2,
+            0,
+            0,
+            cw,
+            ch,
+            8,
+            1,
+            1,
+            lc_w as u32,
+            lc_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            Some(shared_mask.as_mut_slice()),
+            &mut ocr,
+            cw,
+        )
+        .unwrap();
+
+        // ---- Walker multi-plane bridge ----
+        // 2×2 mi grid → luma 8×8, chroma 4×4 buffers.
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(walker.curr_frame(0).is_none());
+
+        let spec_y = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store_y,
+            frame_width: ly_w as u32,
+            frame_height: ly_h as u32,
+        };
+        let spec_cb = PlaneRefSpec {
+            plane: 1,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            frame_store: &store_cb,
+            frame_width: lc_w as u32,
+            frame_height: lc_h as u32,
+        };
+        let spec_cr = PlaneRefSpec {
+            plane: 2,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            frame_store: &store_cr,
+            frame_width: lc_w as u32,
+            frame_height: lc_h as u32,
+        };
+        let specs = [spec_y, spec_cb, spec_cr];
+
+        walker
+            .reconstruct_inter_block_compound_multiplane_into_curr_frame(
+                mode_info,
+                order_hints,
+                &ref_frame_idx,
+                &specs,
+                0,
+                0,
+                mi_size,
+                3,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("walker multi-plane compound reconstruction");
+
+        let got_y: Vec<u16> = walker
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        let got_cb: Vec<u16> = walker
+            .curr_frame(1)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        let got_cr: Vec<u16> = walker
+            .curr_frame(2)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(got_y, oy, "Y plane must match the shared-mask oracle");
+        assert_eq!(got_cb, ocb, "Cb plane must match the shared-mask oracle");
+        assert_eq!(got_cr, ocr, "Cr plane must match the shared-mask oracle");
+
+        // Discriminating control: re-deriving a fresh per-plane mask for
+        // Cb (the single-plane-bridge behaviour) generally yields a
+        // DIFFERENT chroma plane — proving the shared luma mask is the
+        // load-bearing detail. (DIFFWTD's mask is derived from the
+        // chroma-resolution preds when computed per-plane, which differs
+        // from the downsampled luma-grid mask the spec mandates.)
+        let mut fresh_mask = vec![0u8; cw * ch];
+        let mut cb_wrong = vec![0u16; cw * ch];
+        reconstruct_inter_block_compound(
+            mode_info,
+            order_hints,
+            &ref_frame_idx,
+            &store_cb,
+            0, // plane 0 → forces a fresh full-extent mask derivation
+            0,
+            0,
+            cw,
+            ch,
+            8,
+            0,
+            0,
+            lc_w as u32,
+            lc_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            Some(fresh_mask.as_mut_slice()),
+            &mut cb_wrong,
+            cw,
+        )
+        .unwrap();
+        assert_ne!(
+            cb_wrong, ocb,
+            "a fresh per-plane DIFFWTD mask must differ from the shared luma-grid mask"
+        );
+    }
+
+    /// r306 multi-plane compound bridge guards: an invalid `num_planes`,
+    /// an out-of-range `mi_size`, a too-short `plane_specs` slice, and an
+    /// `INTRA_FRAME` `RefFrame[1]` (rejected per-plane by the driver) are
+    /// all surfaced as [`crate::Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn r306_walker_compound_multiplane_bridge_guards() {
+        use crate::inter_pred::{CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP};
+        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+
+        let refp = vec![0u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 3];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let altref = crate::uncompressed_header_tail::ALTREF_FRAME as u8;
+        let order_hints = CompoundOrderHintContext {
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hint_ref0: 0,
+            order_hint_ref1: 0,
+        };
+        let good_mode = CompoundInterModeInfo {
+            ref_frame_0: last,
+            ref_frame_1: altref,
+            mv0: [0, 0],
+            mv1: [0, 0],
+            compound_type: COMPOUND_AVERAGE,
+            wedge: None,
+            mask_type: 0,
+        };
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        let specs3 = [
+            PlaneRefSpec { plane: 0, ..spec },
+            PlaneRefSpec {
+                plane: 1,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                ..spec
+            },
+            PlaneRefSpec {
+                plane: 2,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                ..spec
+            },
+        ];
+
+        // Invalid num_planes (2).
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(matches!(
+            w.reconstruct_inter_block_compound_multiplane_into_curr_frame(
+                good_mode,
+                order_hints,
+                &ref_frame_idx,
+                &specs3,
+                0,
+                0,
+                BLOCK_8X8,
+                2,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Out-of-range mi_size.
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(matches!(
+            w2.reconstruct_inter_block_compound_multiplane_into_curr_frame(
+                good_mode,
+                order_hints,
+                &ref_frame_idx,
+                &specs3,
+                0,
+                0,
+                BLOCK_SIZES,
+                3,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // plane_specs too short for num_planes (1 spec, num_planes 3).
+        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
+        let one_spec = [PlaneRefSpec { plane: 0, ..spec }];
+        assert!(matches!(
+            w3.reconstruct_inter_block_compound_multiplane_into_curr_frame(
+                good_mode,
+                order_hints,
+                &ref_frame_idx,
+                &one_spec,
+                0,
+                0,
+                BLOCK_8X8,
+                3,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // INTRA_FRAME RefFrame[1] (driver rejects on the first plane).
+        let mut w4 = PartitionWalker::new(2, 2, geom).unwrap();
+        let intra_ref1 = CompoundInterModeInfo {
+            ref_frame_1: 0,
+            ..good_mode
+        };
+        assert!(matches!(
+            w4.reconstruct_inter_block_compound_multiplane_into_curr_frame(
+                intra_ref1,
+                order_hints,
+                &ref_frame_idx,
+                &specs3,
+                0,
+                0,
+                BLOCK_8X8,
+                3,
                 8,
                 EIGHTTAP,
                 EIGHTTAP,

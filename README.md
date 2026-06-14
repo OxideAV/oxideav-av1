@@ -2,6 +2,54 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-15 (round 306)
+
+Round 306 **extends the inline compound reconstruction to all planes
+with one shared §7.11.3.12 `Mask`** — the multi-plane companion to
+r305's single-plane compound bridge. The walker now reconstructs one
+compound inter block's Y/Cb/Cr pixels end-to-end with the chroma planes
+correctly reusing the luma-grid mask.
+
+* **Walker bridge.** New
+  `PartitionWalker::reconstruct_inter_block_compound_multiplane_into_curr_frame`
+  drives the §5.11.34 `predict()` per-plane loop
+  (`for plane in 0..1 + 2*has_chroma`) for one decoded block, threading
+  the shared decoded `CompoundInterModeInfo` / `CompoundOrderHintContext`
+  / `ref_frame_idx` plus a per-plane `PlaneRefSpec` array through the
+  `crate::inter_pred::reconstruct_inter_block_compound` driver once per
+  plane.
+* **Shared mask.** Per av1-spec p.258 lines 14386-14393 the
+  `COMPOUND_DIFFWTD` (and `COMPOUND_WEDGE`) `Mask` is derived at
+  `plane == 0` only and reused verbatim for chroma (downsampled by
+  §7.11.3.14 `mask_blend`'s `(sub_x, sub_y)` arm). The bridge allocates
+  the §7.11.3.12 persistent mask **once** at the luma extent
+  (`Block_Width[MiSize] × Block_Height[MiSize]`) and passes that **same
+  buffer** to every plane: the `plane == 0` call fills it from the luma
+  `preds[]`; the chroma calls read it. The mask-free arms
+  (`COMPOUND_AVERAGE` / `COMPOUND_DISTANCE`) and the
+  internally-regenerated `COMPOUND_WEDGE` arm ignore it.
+* **Per-plane geometry.** Follows §5.11.34
+  (`subX = (plane > 0) ? subsampling_x : 0`,
+  `baseX = (mi_col >> subX) * MI_SIZE`,
+  `predW = Block_Width[MiSize] >> subX`, etc.) for the common
+  `someUseIntra == 0` shape (one `predict_inter` call per plane).
+* **Allocation + narrowing.** Each plane's `i32` `CurrFrame` buffer is
+  allocated if untouched (compound overwrites — no intra-half
+  prerequisite) and round-tripped through a `u16` mirror (lossless).
+* **Guards.** `num_planes ∉ {1, 3}`, an out-of-range `mi_size`, a
+  `plane_specs` slice shorter than `num_planes`, and an `INTRA_FRAME`
+  `RefFrame[1]` all return `PartitionWalkOutOfRange`.
+* **Scope.** One compound leaf at a known mi-origin; the §5.11.34
+  `someUseIntra == 1` intra-neighbour sub-block split, the full
+  §5.11.33 frame-walk wiring into the parser's superblock loop, and
+  OBMC / warp interactions remain out of scope.
+
++2 lib tests (1998 → 2000): a `BLOCK_8X8` 4:2:0 `COMPOUND_DIFFWTD` block
+reconstructed through the multi-plane bridge byte-identically to the
+per-block driver invoked once per plane with one shared luma-grid mask
+(plus a discriminating control proving a fresh per-plane mask would
+differ), and the four bridge guards.
+
 ## Status — 2026-06-15 (round 305)
 
 Round 305 **lands inline §7.11.3.1 compound (≥2-ref) pixel

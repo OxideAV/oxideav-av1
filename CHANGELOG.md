@@ -4,6 +4,39 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r306 (2026-06-15): **§5.11.5 walker reconstructs a compound
+  inter block across all planes (Y/Cb/Cr) sharing one §7.11.3.12
+  `Mask`**. r305 added the single-plane compound bridge (which
+  materializes a fresh `w × h` mask per call); r306 adds its multi-plane
+  companion
+  (`PartitionWalker::reconstruct_inter_block_compound_multiplane_into_curr_frame`)
+  driving the §5.11.34 per-plane loop for one decoded block. Per
+  av1-spec p.258 lines 14386-14393 the `COMPOUND_DIFFWTD` (and
+  `COMPOUND_WEDGE`) `Mask` is derived at `plane == 0` only and reused
+  verbatim for the chroma planes (downsampled by §7.11.3.14
+  `mask_blend`'s `(sub_x, sub_y)` arm). The bridge allocates the
+  §7.11.3.12 persistent mask **once** at the luma extent
+  (`Block_Width[MiSize] × Block_Height[MiSize]`) and threads that **same
+  buffer** into every plane's `reconstruct_inter_block_compound` call:
+  the `plane == 0` call fills it from the luma `preds[]`; the chroma
+  calls read it. Per-plane geometry follows §5.11.34 `predict()`
+  (`baseX = (mi_col >> subX) * MI_SIZE`,
+  `predW = Block_Width[MiSize] >> subX`, etc.) for the common
+  `someUseIntra == 0` shape. The mask-free arms (`COMPOUND_AVERAGE` /
+  `COMPOUND_DISTANCE`) and the internally-regenerated `COMPOUND_WEDGE`
+  arm ignore the buffer, so they reconstruct identically whether driven
+  one-plane-at-a-time or through the multi-plane bridge. Each plane's
+  `i32` `CurrFrame` buffer is allocated if untouched (compound
+  overwrites — no intra-half prerequisite) and round-tripped through a
+  `u16` mirror (lossless). Guards: `num_planes ∉ {1, 3}`, an
+  out-of-range `mi_size`, a `plane_specs` slice shorter than
+  `num_planes`, and an `INTRA_FRAME` `RefFrame[1]` all return
+  `PartitionWalkOutOfRange`. +2 lib tests (1998 → 2000): a `BLOCK_8X8`
+  4:2:0 `COMPOUND_DIFFWTD` block reconstructed through the multi-plane
+  bridge byte-identically to the per-block driver invoked once per plane
+  with one shared luma-grid mask (plus a discriminating control proving
+  a fresh per-plane mask would differ), and the four bridge guards.
+
 - decoder r305 (2026-06-15): **§5.11.5 walker reconstructs one
   compound (≥2-ref) inter block's pixels inline**. r304 added the
   plain single-ref bridge; r305 adds its two-reference companion
