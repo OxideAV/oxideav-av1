@@ -1025,6 +1025,34 @@ pub enum CompoundParams<'a> {
     },
 }
 
+/// §7.11.3.1 inter-intra blend descriptor (av1-spec p.258 lines
+/// 14384-14412 + §7.11.3.14) — the `IsInterIntra == 1` arm's side data.
+///
+/// On an inter-intra block `isCompound == 0` (`RefFrame[1] ==
+/// INTRA_FRAME`): the §7.11.3.1 driver forms a *single* inter prediction
+/// `preds[0]` from `refs[0]`, then blends it against the intra prediction
+/// the §7.11.2 process already wrote into the destination buffer
+/// (`pred1 = CurrFrame[plane][y+dstY][x+dstX]` per av1-spec p.284 line
+/// 15786) through the §7.11.3.14 inter-intra blend body
+/// ([`mask_blend_interintra`]).
+///
+/// This descriptor carries the §5.11.28 `interintra_mode` that selects
+/// the §7.11.3.13 [`intra_mode_variant_mask`] variant. The
+/// `wedge_interintra == 1` sub-arm (whose mask is the §7.11.3.11
+/// wedge mask, with chroma subsampling per av1-spec p.284 line 15773)
+/// is **not** carried here: this round wires only the non-wedge
+/// (`COMPOUND_INTRA`) interintra path, where §7.11.3.14 reads the mask
+/// directly at `Mask[y][x]` (the `(interintra && !wedge_interintra)`
+/// branch) so the §7.11.3.13 per-plane mask needs no downsampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterIntraParams {
+    /// §5.11.28 `interintra_mode` (`II_DC_PRED` / `II_V_PRED` /
+    /// `II_H_PRED` / `II_SMOOTH_PRED`, i.e. `0..=3`) — selects the
+    /// §7.11.3.13 [`intra_mode_variant_mask`] variant whose per-plane
+    /// `w × h` `Mask` the §7.11.3.14 body blends with.
+    pub interintra_mode: u8,
+}
+
 /// §7.11.3.1 driver — translational single-reference MC arm.
 ///
 /// Composes [`rounding_variables`] (§7.11.3.2),
@@ -1080,10 +1108,17 @@ pub enum CompoundParams<'a> {
 ///   `MOTION_MODE_WARPED_CAUSAL`). r194 supports `SIMPLE` only.
 /// * `is_compound` — §7.11.3.1 `isCompound`. When `true`, `refs` must
 ///   contain at least 2 entries and `compound` must be `Some(_)`.
-/// * `is_inter_intra` — §5.11.33 `IsInterIntra`. r194 requires
-///   `false` (the interintra final-blend body is wired through
-///   [`mask_blend_interintra`] but its driver invocation site is
-///   next-arc).
+/// * `is_inter_intra` — §5.11.33 `IsInterIntra` (`RefFrame[1] ==
+///   INTRA_FRAME`). When `true`, `is_compound` must be `false` and
+///   `inter_intra` must be `Some(_)`; the driver forms a single inter
+///   prediction from `refs[0]` and blends it with the §7.11.2 intra
+///   prediction the caller already wrote into `pred_out` (the §7.11.3.14
+///   inter-intra body, [`mask_blend_interintra`]). Only the non-wedge
+///   (`COMPOUND_INTRA`, §7.11.3.13) sub-arm is wired; `wedge_interintra`
+///   is a later arc.
+/// * `inter_intra` — `Some(InterIntraParams)` on the inter-intra arm
+///   (`is_inter_intra == true`); must be `None` otherwise. Carries the
+///   §5.11.28 `interintra_mode`.
 /// * `bit_depth` — §5.5.2 frame `BitDepth` (8 / 10 / 12).
 /// * `subsampling_x` / `subsampling_y` — §5.5.2 chroma subsampling.
 /// * `frame_width` / `frame_height` — §5.9.5 current-frame
@@ -1111,10 +1146,13 @@ pub enum CompoundParams<'a> {
 /// `plane > 2`, `subsampling_{x,y} > 1`, `bit_depth ∉ {8, 10, 12}`,
 /// `frame_{width,height} == 0`, `w == 0 || h == 0 || w > 256 ||
 /// h > 256`, `refs.is_empty()`, `refs.len() < 2` on the compound
-/// path, missing/spurious `compound` argument, `pred_out.len() <
+/// path, missing/spurious `compound` argument, missing/spurious
+/// `inter_intra` argument, `is_compound && is_inter_intra`, an
+/// out-of-range `interintra_mode`, `pred_out.len() <
 /// w * h`, missing `warp` on the WARPED_CAUSAL arm, missing `obmc`
 /// on the OBMC arm, or any sub-condition the `motion_vector_scaling` /
 /// `block_inter_prediction` / `clip1_single_ref` / `mask_blend` /
+/// `mask_blend_interintra` / `intra_mode_variant_mask` /
 /// `compound_distance_blend` leaves reject.
 /// §7.11.3.1 step 5-13 per-`refList` body (av1-spec p.257 lines
 /// 14315-14374) — produce the `preds[refList][i][j]` `i32` prediction
@@ -2000,6 +2038,7 @@ pub fn predict_inter(
     interp_filter_y: u8,
     refs: &[PredictInterRef<'_>],
     compound: Option<CompoundParams<'_>>,
+    inter_intra: Option<InterIntraParams>,
     warp: Option<&WarpDriverParams>,
     obmc: Option<&ObmcParams<'_, '_>>,
     pred_out: &mut [u16],
@@ -2039,14 +2078,37 @@ pub fn predict_inter(
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
-    // ---------- §7.11.3.1 IsInterIntra short-circuit ----------
+    // ---------- §7.11.3.1 IsInterIntra contract ----------
     //
-    // The §5.11.33 dispatcher's IsInterIntra arm currently surfaces
-    // `Error::ComputePredictionInterIntraUnsupported` at the
-    // dispatcher gate, so a conformant caller never reaches this
-    // driver with `is_inter_intra == true`. Defensive guard.
+    // av1-spec p.258 line 14301: `isCompound = RefFrames[..][1] >
+    // INTRA_FRAME`. An inter-intra block has `RefFrame[1] ==
+    // INTRA_FRAME`, so `isCompound == 0` — the two arms are mutually
+    // exclusive. The inter-intra arm forms a single inter prediction
+    // (`refs[0]`) and blends it with the in-place intra prediction, so
+    // it requires `is_compound == false` and the [`InterIntraParams`]
+    // side data; a caller that signals one without the other is a bug.
+    //
+    // The `wedge_interintra == 1` sub-arm (§7.11.3.11 wedge mask with
+    // chroma subsampling) is not yet wired: this round drives only the
+    // non-wedge `COMPOUND_INTRA` interintra path. `InterIntraParams`
+    // does not carry a wedge flag, so reaching the driver with
+    // `is_inter_intra == true` always selects the §7.11.3.13
+    // intra-variant mask.
     if is_inter_intra {
-        return Err(crate::Error::ComputePredictionInterIntraUnsupported);
+        if is_compound {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if inter_intra.is_none() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if inter_intra
+            .map(|ii| ii.interintra_mode > II_SMOOTH_PRED)
+            .unwrap_or(false)
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+    } else if inter_intra.is_some() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
     // ---------- §7.11.3.1 step 2/3/6/7 — WARP context plumbing ----
@@ -2143,10 +2205,35 @@ pub fn predict_inter(
     //   * `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` ⇒
     //     `mask_blend(preds, plane, x, y, w, h)`.
     //
-    // The interintra branch (`IsInterIntra == 1`) is gated by the
-    // earlier `Error::ComputePredictionInterIntraUnsupported` short-
-    // circuit, so it never reaches here.
-    if is_compound {
+    // The inter-intra branch (`IsInterIntra == 1`, `isCompound == 0`)
+    // takes the §7.11.3.14 inter-intra body instead: `preds[0]` is the
+    // single inter prediction (pre-clip), `pred1` is the in-place intra
+    // prediction already in `pred_out`, the mask is the §7.11.3.13
+    // intra-variant mask. It is handled below the compound/single-ref
+    // split because it consumes `pred_out` on entry.
+    if is_inter_intra {
+        // av1-spec p.258 line 14389-14390 + p.284 lines 15784-15787:
+        // the non-wedge interintra mask is the §7.11.3.13 per-plane
+        // `w × h` intra-variant mask; the §7.11.3.14 body reads it at
+        // `Mask[y][x]` directly (no chroma downsampling on this arm).
+        // SAFETY: the `is_inter_intra` guards above returned
+        // `PartitionWalkOutOfRange` unless `inter_intra.is_some()`.
+        let ii = inter_intra.expect("inter_intra checked above");
+        let mut mask = vec![0u8; w * h];
+        intra_mode_variant_mask(ii.interintra_mode, w, h, &mut mask)?;
+        // `pred_out` holds the §7.11.2 intra prediction on entry
+        // (`pred1 = CurrFrame[plane][y+dstY][x+dstX]`); the blend reads
+        // it as `pred1` and overwrites it with the blended sample.
+        mask_blend_interintra(
+            bit_depth,
+            rv.inter_post_round,
+            &pred0,
+            w,
+            h,
+            &mask,
+            pred_out,
+        )?;
+    } else if is_compound {
         // step 14: build preds[1] from refs[1] with the same pipeline.
         let pred1 = predict_inter_one_ref(
             &refs[1],
@@ -4679,6 +4766,7 @@ pub fn reconstruct_inter_block(
         interp_filter_y,
         &refs,
         /* compound */ None,
+        /* inter_intra */ None,
         /* warp */ None,
         /* obmc */ None,
         &mut pred_out,
@@ -5050,6 +5138,7 @@ pub fn reconstruct_inter_block_compound(
         interp_filter_y,
         &refs,
         Some(compound),
+        /* inter_intra */ None,
         /* warp */ None,
         /* obmc */ None,
         &mut pred_out,
@@ -6429,6 +6518,232 @@ mod tests {
         );
     }
 
+    // ---------- r297 §7.11.3.1 IsInterIntra driver arm ----------
+
+    /// §7.11.3.1 `IsInterIntra == 1` (`isCompound == 0`) arm: the driver
+    /// forms a single inter prediction from `refs[0]`, then blends it
+    /// with the in-place intra prediction already in `pred_out` through
+    /// the §7.11.3.14 inter-intra body, using the §7.11.3.13
+    /// intra-variant mask. We drive `predict_inter` and then reproduce
+    /// the exact composition standalone — `predict_inter_one_ref`
+    /// (refList 0) → `intra_mode_variant_mask` → `mask_blend_interintra`
+    /// over the same intra seed — and assert byte-equality.
+    #[test]
+    fn r297_predict_inter_interintra_matches_standalone_composition() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 13 + c * 7) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let w = 8;
+        let h = 8;
+        let bit_depth = 8u8;
+        // The §7.11.2 intra prediction the dispatcher already wrote into
+        // CurrFrame (here a non-uniform ramp so the blend is observable).
+        let intra_seed: Vec<u16> = (0..w * h).map(|k| ((k * 3) & 0xFF) as u16).collect();
+
+        let ii_mode = II_SMOOTH_PRED;
+
+        let mut driver_out = intra_seed.clone();
+        predict_inter(
+            /* plane */ 0,
+            /* x */ 4,
+            /* y */ 4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            /* is_compound */ false,
+            /* is_inter_intra */ true,
+            bit_depth,
+            /* subsampling_x */ 0,
+            /* subsampling_y */ 0,
+            /* frame_width */ ref_w as u32,
+            /* frame_height */ ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            /* compound */ None,
+            Some(InterIntraParams {
+                interintra_mode: ii_mode,
+            }),
+            /* warp */ None,
+            /* obmc */ None,
+            &mut driver_out,
+        )
+        .expect("predict_inter interintra arm");
+
+        // Standalone composition: form preds[0] (pre-clip) exactly like
+        // the driver's refList-0 body, build the §7.11.3.13 mask, blend.
+        let rv = rounding_variables(bit_depth, /* is_compound */ false).unwrap();
+        let pred0 = predict_inter_one_ref(
+            &refs[0],
+            /* ref_list */ 0,
+            /* plane */ 0,
+            /* x */ 4,
+            /* y */ 4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            /* warp */ None,
+            /* effective_local_valid */ false,
+        )
+        .unwrap();
+        let mut mask = vec![0u8; w * h];
+        intra_mode_variant_mask(ii_mode, w, h, &mut mask).unwrap();
+        let mut standalone = intra_seed.clone();
+        mask_blend_interintra(
+            bit_depth,
+            rv.inter_post_round,
+            &pred0,
+            w,
+            h,
+            &mask,
+            &mut standalone,
+        )
+        .unwrap();
+
+        assert_eq!(driver_out, standalone);
+        // Sanity: the blend actually moved the buffer off the intra seed
+        // (the inter prediction is non-trivial here).
+        assert_ne!(driver_out, intra_seed);
+    }
+
+    /// §7.11.3.1 IsInterIntra arm — caller-bug rejections at the driver
+    /// contract: `is_inter_intra` requires `InterIntraParams`, forbids
+    /// `is_compound`, and rejects an out-of-range `interintra_mode`; a
+    /// spurious `inter_intra = Some(_)` on a non-interintra call is also
+    /// rejected.
+    #[test]
+    fn r297_predict_inter_interintra_caller_bug_rejections() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let refp = vec![7u16; ref_h * ref_w];
+        let one = PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        };
+        let refs1 = [one];
+        let refs2 = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: ref_w,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: ref_w,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 0],
+            },
+        ];
+        let w = 8;
+        let h = 8;
+        let call = |is_compound: bool,
+                    is_ii: bool,
+                    refs: &[PredictInterRef<'_>],
+                    compound: Option<CompoundParams<'_>>,
+                    ii: Option<InterIntraParams>| {
+            let mut out = vec![0u16; w * h];
+            predict_inter(
+                0,
+                2,
+                2,
+                w,
+                h,
+                crate::cdf::MOTION_MODE_SIMPLE,
+                is_compound,
+                is_ii,
+                8,
+                0,
+                0,
+                ref_w as u32,
+                ref_h as u32,
+                EIGHTTAP,
+                EIGHTTAP,
+                refs,
+                compound,
+                ii,
+                None,
+                None,
+                &mut out,
+            )
+        };
+        // is_inter_intra without InterIntraParams.
+        assert!(call(false, true, &refs1, None, None).is_err());
+        // is_inter_intra with out-of-range interintra_mode (> 3).
+        assert!(call(
+            false,
+            true,
+            &refs1,
+            None,
+            Some(InterIntraParams { interintra_mode: 4 })
+        )
+        .is_err());
+        // is_compound && is_inter_intra is contradictory (RefFrame[1]
+        // cannot be both > INTRA_FRAME and == INTRA_FRAME).
+        assert!(call(
+            true,
+            true,
+            &refs2,
+            Some(CompoundParams::Average),
+            Some(InterIntraParams {
+                interintra_mode: II_DC_PRED
+            })
+        )
+        .is_err());
+        // Spurious inter_intra on a plain single-ref call.
+        assert!(call(
+            false,
+            false,
+            &refs1,
+            None,
+            Some(InterIntraParams {
+                interintra_mode: II_DC_PRED
+            })
+        )
+        .is_err());
+        // Valid interintra call succeeds.
+        assert!(call(
+            false,
+            true,
+            &refs1,
+            None,
+            Some(InterIntraParams {
+                interintra_mode: II_DC_PRED
+            })
+        )
+        .is_ok());
+    }
+
     // ---------- §7.11.3.15 distance_weights ----------
 
     /// §5.9.3 `get_relative_dist` — basic sign-extension truth table.
@@ -7415,6 +7730,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             /* compound */ None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -7560,6 +7876,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             /* compound */ None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -8402,6 +8719,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             Some(CompoundParams::Average),
+            /* inter_intra */ None,
             None,
             None,
             &mut expected,
@@ -8537,6 +8855,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             Some(CompoundParams::Distance(weights)),
+            /* inter_intra */ None,
             None,
             None,
             &mut expected,
@@ -8991,6 +9310,7 @@ mod tests {
                     mask: &mask,
                     mask_stride: luma_w,
                 }),
+                /* inter_intra */ None,
                 None,
                 None,
                 &mut pred,
@@ -9402,6 +9722,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out_8x8,
@@ -9433,6 +9754,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -9480,6 +9802,7 @@ mod tests {
             EIGHTTAP,
             &empty_refs,
             None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -9507,6 +9830,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut small,
@@ -9533,6 +9857,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -9600,6 +9925,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             Some(CompoundParams::Average),
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -9715,6 +10041,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             Some(CompoundParams::Distance(weights)),
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -9834,6 +10161,7 @@ mod tests {
                 mask: &mask,
                 mask_stride: 0,
             }),
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -9966,6 +10294,7 @@ mod tests {
                 mask_type,
                 mask: &mut persistent_mask,
             }),
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -10115,6 +10444,7 @@ mod tests {
                 mask: &mask,
                 mask_stride: 0,
             }),
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -10214,6 +10544,7 @@ mod tests {
             EIGHTTAP,
             &single,
             Some(CompoundParams::Average),
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -10240,6 +10571,7 @@ mod tests {
             EIGHTTAP,
             &double,
             None,
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -10266,6 +10598,7 @@ mod tests {
             EIGHTTAP,
             &single,
             Some(CompoundParams::Average),
+            /* inter_intra */ None,
             /* warp */ None,
             /* obmc */ None,
             &mut pred_out,
@@ -10340,6 +10673,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             /* compound */ None,
+            /* inter_intra */ None,
             /* warp */ Some(&warp),
             /* obmc */ None,
             &mut pred_out,
@@ -10441,6 +10775,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             Some(&warp),
             /* obmc */ None,
             &mut pred_out,
@@ -10534,6 +10869,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             Some(&warp),
             /* obmc */ None,
             &mut warp_out,
@@ -10560,6 +10896,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -10625,6 +10962,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             Some(&warp_force_int),
             /* obmc */ None,
             &mut force_int_out,
@@ -10650,6 +10988,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -10718,6 +11057,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             Some(&warp),
             /* obmc */ None,
             &mut warp_out,
@@ -10743,6 +11083,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -10807,6 +11148,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             Some(&warp),
             /* obmc */ None,
             &mut warp_out,
@@ -10832,6 +11174,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -10898,6 +11241,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             Some(&warp),
             /* obmc */ None,
             &mut warp_out,
@@ -11071,6 +11415,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11112,6 +11457,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,
@@ -11165,6 +11511,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11210,6 +11557,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,
@@ -11264,6 +11612,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11309,6 +11658,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,
@@ -11363,6 +11713,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11405,6 +11756,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,
@@ -11463,6 +11815,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11517,6 +11870,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,
@@ -11590,6 +11944,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11643,6 +11998,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,
@@ -11704,6 +12060,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11757,6 +12114,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,
@@ -11815,6 +12173,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             /* obmc */ None,
             &mut simple_out,
@@ -11861,6 +12220,7 @@ mod tests {
             EIGHTTAP,
             &refs,
             None,
+            /* inter_intra */ None,
             None,
             Some(&obmc),
             &mut obmc_out,

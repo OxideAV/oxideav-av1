@@ -2,6 +2,43 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 297)
+
+Round 297 **wires the §7.11.3.1 `IsInterIntra == 1` arm into the
+`predict_inter` driver** — the inter-intra blend, distinct from the
+two-reference compound arms r294-r296 built. An inter-intra block has
+`RefFrame[1] == INTRA_FRAME`, so `isCompound == 0`: only one inter
+prediction is formed, and the second operand is the §7.11.2 intra
+prediction.
+
+* **Single inter pred + in-place intra blend.** The driver forms
+  `preds[0]` from `refs[0]`, then blends it against the intra prediction
+  the caller already wrote into `pred_out` (`pred1 =
+  CurrFrame[plane][y+dstY][x+dstX]`, av1-spec p.284 line 15786) through
+  the §7.11.3.14 inter-intra body (`mask_blend_interintra`), masked by
+  the §7.11.3.13 intra-variant mask (`intra_mode_variant_mask`). The
+  prior defensive `ComputePredictionInterIntraUnsupported` short-circuit
+  is replaced by the real composition.
+* **API shape.** `predict_inter` gains an
+  `inter_intra: Option<InterIntraParams>` argument (mutually exclusive
+  with `compound`; required when `is_inter_intra == true`). The new
+  `InterIntraParams` carries the §5.11.28 `interintra_mode`.
+* **Scope / still deferred.** Only the non-wedge (`COMPOUND_INTRA`)
+  sub-arm is wired — its mask is read directly at `Mask[y][x]` (the
+  `(interintra && !wedge_interintra)` branch, p.284 line 15773), so no
+  chroma downsampling is needed. `wedge_interintra` (downsampled
+  §7.11.3.11 mask) is a later arc, as is the §5.11.33 frame-walk
+  inter-intra leaf — the walker still skips `RefFrame[1] == INTRA_FRAME`
+  cells and the §5.11.30 dispatcher gate still surfaces
+  `ComputePredictionInterIntraUnsupported`.
+
++2 lib tests net (1983 → 1985): a driver-level test proving the
+inter-intra blend reproduces a standalone `predict_inter_one_ref` →
+`intra_mode_variant_mask` → `mask_blend_interintra` composition over the
+same intra seed byte-for-byte, plus a caller-bug-rejection test (missing/
+spurious `inter_intra`, `is_compound && is_inter_intra`, out-of-range
+`interintra_mode`).
+
 ## Status — 2026-06-14 (round 296)
 
 Round 296 **wires the `COMPOUND_DIFFWTD` mask compound arm end-to-end

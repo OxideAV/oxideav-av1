@@ -4,6 +4,37 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r297 (2026-06-14): wire the §7.11.3.1 `IsInterIntra == 1`
+  (`isCompound == 0`) arm into the `predict_inter` driver. An
+  inter-intra block has `RefFrame[1] == INTRA_FRAME`, so `isCompound`
+  is `0` (the two arms are mutually exclusive): the driver forms a
+  *single* inter prediction from `refs[0]`, then blends it against the
+  §7.11.2 intra prediction the caller already wrote into `pred_out`
+  (`pred1 = CurrFrame[plane][y+dstY][x+dstX]`, av1-spec p.284 line 15786)
+  through the §7.11.3.14 inter-intra body (`mask_blend_interintra`),
+  using the §7.11.3.13 intra-variant mask (`intra_mode_variant_mask`).
+  The prior defensive short-circuit
+  (`Error::ComputePredictionInterIntraUnsupported`) is replaced by the
+  real composition. `predict_inter` gains an
+  `inter_intra: Option<InterIntraParams>` argument (mutually exclusive
+  with `compound`, required when `is_inter_intra == true`); the new
+  `InterIntraParams` carries the §5.11.28 `interintra_mode`. Only the
+  non-wedge (`COMPOUND_INTRA`, §7.11.3.13) sub-arm is wired — the mask
+  is read directly at `Mask[y][x]` (the `(interintra && !wedge_interintra)`
+  branch, av1-spec p.284 line 15773), so the per-plane §7.11.3.13 mask
+  needs no chroma downsampling; `wedge_interintra` (whose §7.11.3.11
+  mask is downsampled per p.284 lines 15776-15782) is a later arc, as is
+  the §5.11.33 frame-walk inter-intra leaf (the walker still skips
+  `RefFrame[1] == INTRA_FRAME` cells and the §5.11.30 dispatcher gate
+  still surfaces `ComputePredictionInterIntraUnsupported`). +2 lib tests
+  net (1983 → 1985): a driver-level test proving the inter-intra blend
+  reproduces a standalone `predict_inter_one_ref` →
+  `intra_mode_variant_mask` → `mask_blend_interintra` composition over
+  the same intra seed byte-for-byte (and moves the buffer off the seed),
+  plus a caller-bug-rejection test covering the missing/spurious
+  `inter_intra` argument, `is_compound && is_inter_intra`, and an
+  out-of-range `interintra_mode`.
+
 - decoder r296 (2026-06-14): wire the `COMPOUND_DIFFWTD` mask compound
   arm end-to-end across the §5.11.33 frame walk. Unlike `COMPOUND_WEDGE`
   (regenerable side-data mask), the §7.11.3.12 difference-weight mask is
