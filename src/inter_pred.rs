@@ -4665,13 +4665,21 @@ pub fn reconstruct_inter_block(
 /// [`reconstruct_inter_block`] / the intra path instead.
 ///
 /// `compound_type` is the §5.11.x decoded ordinal restricted here to the
-/// two mask-free combine arms [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`]
-/// — the arms whose output is fully derivable from the two MVs, the two
-/// references, and (for `COMPOUND_DISTANCE`) the §7.11.3.15 order-hint
-/// distance weights, with no decoded wedge / diff-weight / intra mask
-/// side-data. `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA`
-/// are rejected by [`reconstruct_inter_block_compound`] (their masks are
-/// not yet surfaced on the mode-info grid).
+/// three side-data-free / wedge-mask combine arms [`COMPOUND_AVERAGE`] /
+/// [`COMPOUND_DISTANCE`] / [`COMPOUND_WEDGE`]. `COMPOUND_AVERAGE` /
+/// `COMPOUND_DISTANCE` need no mask; their output is fully derivable from
+/// the two MVs, the two references, and (for `COMPOUND_DISTANCE`) the
+/// §7.11.3.15 order-hint distance weights. `COMPOUND_WEDGE` additionally
+/// reads the §5.11.29 `(wedge_index, wedge_sign)` carried in [`wedge`],
+/// from which [`reconstruct_inter_block_compound`] regenerates the
+/// §7.11.3.11 luma-grid wedge mask deterministically (the mask is a pure
+/// function of `(MiSize, wedge_index, wedge_sign)`, with no
+/// prediction-dependent side-data). The two prediction-derived mask arms
+/// [`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`] — whose mask is a function of
+/// the two `preds[]` and so cannot be regenerated before prediction
+/// runs — remain rejected.
+///
+/// [`wedge`]: CompoundInterModeInfo::wedge
 #[derive(Debug, Clone, Copy)]
 pub struct CompoundInterModeInfo {
     /// §7.11.3.1 step 5 `RefFrame[ 0 ]` (1..=7).
@@ -4684,8 +4692,37 @@ pub struct CompoundInterModeInfo {
     /// §7.11.3.1 step 8 `Mvs[ candRow ][ candCol ][ 1 ]`.
     pub mv1: [i16; 2],
     /// §5.11.x decoded `compound_type` ordinal — must be
-    /// [`COMPOUND_AVERAGE`] or [`COMPOUND_DISTANCE`].
+    /// [`COMPOUND_AVERAGE`], [`COMPOUND_DISTANCE`], or [`COMPOUND_WEDGE`].
     pub compound_type: u8,
+    /// §7.11.3.11 wedge-mask side data — `Some(_)` **required** when
+    /// `compound_type == COMPOUND_WEDGE`, ignored otherwise. Carries the
+    /// `MiSize` (luma block size — the §7.11.3.11 `WedgeMasks[MiSize]`
+    /// index) plus the §5.11.29 `(wedge_index, wedge_sign)` codebook
+    /// selectors. A `COMPOUND_WEDGE` leaf with `wedge == None` is a
+    /// caller bug ([`crate::Error::PartitionWalkOutOfRange`]).
+    pub wedge: Option<WedgeModeInfo>,
+}
+
+/// §7.11.3.11 wedge-mask side data for a [`COMPOUND_WEDGE`] compound
+/// leaf — the decoded selectors [`reconstruct_inter_block_compound`]
+/// hands to [`wedge_mask`] to regenerate the luma-grid mask.
+///
+/// The mask is computed once on the luma grid (`MiSize`-sized) and
+/// reused across chroma planes via [`mask_blend`]'s `(sub_x, sub_y)`
+/// downsampling (av1-spec p.258 line 14386: the §7.11.3.11 process runs
+/// only `if plane == 0`). The `mi_size` here is the **luma** block size,
+/// so the wedge mask is always luma-sized regardless of which plane the
+/// reconstruction driver is currently filling.
+#[derive(Debug, Clone, Copy)]
+pub struct WedgeModeInfo {
+    /// `MiSize` — the luma `BLOCK_SIZES` index of the compound leaf;
+    /// must have `WEDGE_BITS[mi_size] > 0` (one of the 9 wedge-eligible
+    /// block sizes).
+    pub mi_size: usize,
+    /// §5.11.29 `wedge_index` — codebook ordinal in `0..16`.
+    pub wedge_index: u8,
+    /// §5.11.29 `wedge_sign` — `0` or `1`.
+    pub wedge_sign: u8,
 }
 
 /// §7.11.3.15 order-hint context the [`COMPOUND_DISTANCE`] combine arm
@@ -4709,8 +4746,9 @@ pub struct CompoundOrderHintContext {
 
 /// §7.11.3.1 compound two-reference reconstruction — drives one decoded
 /// compound inter block (`RefFrame[1] >= LAST_FRAME`) from mode-info
-/// into a `CurrFrame` plane, for the mask-free [`COMPOUND_AVERAGE`] /
-/// [`COMPOUND_DISTANCE`] combine arms.
+/// into a `CurrFrame` plane, for the [`COMPOUND_AVERAGE`] /
+/// [`COMPOUND_DISTANCE`] mask-free arms and the [`COMPOUND_WEDGE`]
+/// regenerable-mask arm.
 ///
 /// This is the compound sibling of [`reconstruct_inter_block`]: it
 /// resolves *both* references through the §7.11.3.3 `refIdx =
@@ -4723,14 +4761,22 @@ pub struct CompoundOrderHintContext {
 ///
 /// For [`COMPOUND_DISTANCE`] the §7.11.3.15 `(FwdWeight, BckWeight)` are
 /// derived from `order_hints` via [`distance_weights`]; for
-/// [`COMPOUND_AVERAGE`] `order_hints` is unused.
+/// [`COMPOUND_AVERAGE`] `order_hints` is unused. For [`COMPOUND_WEDGE`]
+/// the §7.11.3.11 luma-grid mask is regenerated once via [`wedge_mask`]
+/// from `mode_info.wedge` (the decoded `(MiSize, wedge_index,
+/// wedge_sign)`), then handed to [`predict_inter`] as
+/// [`CompoundParams::Wedge`] with `mask_stride` set to the luma block
+/// width so the per-plane `(sub_x, sub_y)` downsampling inside
+/// [`mask_blend`] addresses it correctly on chroma planes.
 ///
 /// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
 /// arguments: either `RefFrame` `INTRA_FRAME` (0) or out of range, an
 /// out-of-range resolved `refIdx`, a `compound_type` other than
-/// `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE`, a `curr_plane` too small
-/// for the `(x, y, w, h)` write region, or anything [`predict_inter`]
-/// itself rejects.
+/// `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE` / `COMPOUND_WEDGE`, a
+/// `COMPOUND_WEDGE` leaf with `wedge == None` or wedge selectors
+/// [`wedge_mask`] rejects, a `curr_plane` too small for the
+/// `(x, y, w, h)` write region, or anything [`predict_inter`] itself
+/// rejects.
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_inter_block_compound(
     mode_info: CompoundInterModeInfo,
@@ -4754,13 +4800,16 @@ pub fn reconstruct_inter_block_compound(
 ) -> Result<(), crate::Error> {
     // ---------- compound_type gate ----------
     //
-    // This driver covers only the two mask-free combine arms; the
-    // wedge / diff-weight / intra masks are not yet surfaced on the
-    // mode-info grid, so a leaf carrying one of those types is left to
-    // a later driver (caller bug to route it here).
+    // This driver covers the two mask-free combine arms plus the
+    // wedge arm (whose mask is a pure function of the decoded
+    // `(MiSize, wedge_index, wedge_sign)` carried in `mode_info.wedge`,
+    // so it can be regenerated here before prediction). The diff-weight
+    // and intra-variant masks are functions of the two `preds[]`
+    // themselves — they cannot be regenerated before prediction runs —
+    // and are left to a later driver (caller bug to route them here).
     if !matches!(
         mode_info.compound_type,
-        COMPOUND_AVERAGE | COMPOUND_DISTANCE
+        COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE
     ) {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
@@ -4813,17 +4862,64 @@ pub fn reconstruct_inter_block_compound(
     // ---------- §7.11.3.1 step-14 combine descriptor ----------
     //
     // `COMPOUND_DISTANCE` derives `(FwdWeight, BckWeight)` from the
-    // §7.11.3.15 order-hint distances; `COMPOUND_AVERAGE` needs none.
-    let compound = if mode_info.compound_type == COMPOUND_DISTANCE {
-        let weights = distance_weights(
-            order_hints.order_hint_bits,
-            order_hints.current_order_hint,
-            order_hints.order_hint_ref0,
-            order_hints.order_hint_ref1,
-        );
-        CompoundParams::Distance(weights)
+    // §7.11.3.15 order-hint distances; `COMPOUND_AVERAGE` needs none;
+    // `COMPOUND_WEDGE` regenerates the §7.11.3.11 luma-grid mask from
+    // the decoded `(MiSize, wedge_index, wedge_sign)`.
+    //
+    // The wedge mask buffer must outlive the `predict_inter` call, so
+    // it is materialized here (`None` / unused on the non-wedge arms).
+    // The §7.11.3.11 mask lives on the *luma* grid: its width / height
+    // are `Block_Width[MiSize]` / `Block_Height[MiSize]` regardless of
+    // which plane is being filled; `mask_blend`'s `(sub_x, sub_y)`
+    // downsampling addresses it for chroma, with the luma block width as
+    // the row stride.
+    let wedge_mask_buf: Option<(Vec<u8>, usize)> = if mode_info.compound_type == COMPOUND_WEDGE {
+        let wedge = mode_info
+            .wedge
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        if wedge.mi_size >= crate::cdf::BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let n4w = crate::cdf::num_4x4_blocks_wide(wedge.mi_size) as u32;
+        let n4h = crate::cdf::num_4x4_blocks_high(wedge.mi_size) as u32;
+        let luma_w = crate::cdf::block_width(wedge.mi_size);
+        let luma_h = crate::cdf::block_height(wedge.mi_size);
+        let mut buf = vec![0u8; luma_w * luma_h];
+        wedge_mask(
+            wedge.mi_size,
+            n4w,
+            n4h,
+            wedge.wedge_index,
+            wedge.wedge_sign,
+            &mut buf,
+        )?;
+        Some((buf, luma_w))
     } else {
-        CompoundParams::Average
+        None
+    };
+    let compound = match mode_info.compound_type {
+        COMPOUND_DISTANCE => {
+            let weights = distance_weights(
+                order_hints.order_hint_bits,
+                order_hints.current_order_hint,
+                order_hints.order_hint_ref0,
+                order_hints.order_hint_ref1,
+            );
+            CompoundParams::Distance(weights)
+        }
+        COMPOUND_WEDGE => {
+            // SAFETY: the WEDGE branch above populated `wedge_mask_buf`
+            // (or already returned the caller-bug error).
+            let (mask, luma_w) = wedge_mask_buf
+                .as_ref()
+                .expect("WEDGE arm materialized the mask above");
+            CompoundParams::Wedge {
+                mask,
+                mask_stride: *luma_w,
+            }
+        }
+        // COMPOUND_AVERAGE (the gate above rejected every other type).
+        _ => CompoundParams::Average,
     };
 
     // ---------- §7.11.3.1 steps 1-14 — compound prediction ----------
@@ -4998,10 +5094,22 @@ pub struct InterModeInfoGrid<'a> {
     /// `comp_types()[ r * mi_cols + c ]`. Read only at a compound
     /// leaf's origin (`RefFrame[1] >= LAST_FRAME`); ignored on
     /// single-ref / inter-intra / intra cells. The [`COMPOUND_AVERAGE`]
-    /// / [`COMPOUND_DISTANCE`] arms are driven; the mask arms
-    /// ([`COMPOUND_WEDGE`] / [`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`])
-    /// are skipped (their masks are not yet on the grid).
+    /// / [`COMPOUND_DISTANCE`] mask-free arms and the [`COMPOUND_WEDGE`]
+    /// regenerable-mask arm are driven; the prediction-derived mask arms
+    /// ([`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`]) are skipped (their
+    /// masks depend on the two `preds[]` and cannot be regenerated from
+    /// grid side-data before prediction).
     pub compound_types: &'a [u8],
+    /// §5.11.29 `wedge_index` per cell — `wedge_index()[ r * mi_cols +
+    /// c ]`. Read only at a [`COMPOUND_WEDGE`] compound leaf's origin
+    /// (paired with `wedge_signs`); ignored on every other cell. Length
+    /// must be at least `mi_rows * mi_cols`.
+    pub wedge_indices: &'a [u8],
+    /// §5.11.29 `wedge_sign` per cell — `wedge_sign()[ r * mi_cols +
+    /// c ]`. Read only at a [`COMPOUND_WEDGE`] compound leaf's origin
+    /// (paired with `wedge_indices`); ignored on every other cell.
+    /// Length must be at least `mi_rows * mi_cols`.
+    pub wedge_signs: &'a [u8],
     /// §7.11.3.15 order-hint context the [`COMPOUND_DISTANCE`] arm
     /// derives `(FwdWeight, BckWeight)` from. The `order_hint_ref0` /
     /// `order_hint_ref1` fields are re-resolved per compound leaf from
@@ -5056,18 +5164,22 @@ pub struct InterModeInfoGrid<'a> {
 /// skipped.
 ///
 /// Compound leaves (`RefFrame[1] >= LAST_FRAME`) carrying the mask-free
-/// [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`] combine types are driven
-/// through [`reconstruct_inter_block_compound`]: both references are
-/// resolved, the §7.11.3.15 distance weights are derived per leaf from
-/// `order_hints_by_ref[ RefFrame[0/1] ]`, and `predict_inter` forms the
+/// [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`] combine types or the
+/// regenerable-mask [`COMPOUND_WEDGE`] type are driven through
+/// [`reconstruct_inter_block_compound`]: both references are resolved,
+/// the §7.11.3.15 distance weights are derived per leaf from
+/// `order_hints_by_ref[ RefFrame[0/1] ]` (DISTANCE), the §7.11.3.11
+/// wedge mask is regenerated per leaf from `wedge_indices[origin]` /
+/// `wedge_signs[origin]` (WEDGE), and `predict_inter` forms the
 /// two-reference combine.
 ///
 /// **Scope / skips (untouched CurrFrame regions, for a later driver):**
 ///   * intra leaves (`IsInters == 0`);
 ///   * inter-intra leaves (`RefFrame[1] == INTRA_FRAME`);
-///   * compound leaves whose `compound_type` is a *mask* arm
-///     ([`COMPOUND_WEDGE`] / [`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`]) —
-///     their decoded masks are not yet surfaced on the grid.
+///   * compound leaves whose `compound_type` is a *prediction-derived*
+///     mask arm ([`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`]) — their mask
+///     is a function of the two `preds[]`, so it cannot be regenerated
+///     from grid side-data before prediction runs.
 ///
 /// The §7.11.3.1 horizontal / vertical interpolation filters are read
 /// per leaf from `InterpFilters[origin][0..2]` (the §5.11.x decoded
@@ -5098,6 +5210,8 @@ pub fn reconstruct_inter_frame(
         || grid.mvs.len() < cells * 4
         || grid.interp_filters.len() < cells * 2
         || grid.compound_types.len() < cells
+        || grid.wedge_indices.len() < cells
+        || grid.wedge_signs.len() < cells
     {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
@@ -5172,20 +5286,41 @@ pub fn reconstruct_inter_frame(
             let interp_y = grid.interp_filters[origin * 2 + 1];
 
             if is_compound_leaf {
-                // --- compound two-reference arm (AVERAGE / DISTANCE). ---
+                // --- compound two-reference arm
+                //     (AVERAGE / DISTANCE / WEDGE). ---
                 let comp_type = grid.compound_types[origin];
-                // The mask combine arms (WEDGE / DIFFWTD / INTRA) carry
-                // decoded mask side-data not yet surfaced on the grid;
-                // leave their regions for a later driver.
-                if !matches!(comp_type, COMPOUND_AVERAGE | COMPOUND_DISTANCE) {
+                // The prediction-derived mask arms (DIFFWTD / INTRA)
+                // need a mask computed from the two preds[]; that mask
+                // cannot be regenerated from grid side-data here, so
+                // leave their regions for a later driver. AVERAGE /
+                // DISTANCE need no mask and WEDGE's mask is a pure
+                // function of the decoded (MiSize, wedge_index,
+                // wedge_sign) — all three are driven.
+                if !matches!(
+                    comp_type,
+                    COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE
+                ) {
                     continue;
                 }
+                // §7.11.3.11 wedge side-data — only meaningful on the
+                // WEDGE arm. `MiSize` is the luma block size at this
+                // leaf's origin, so the regenerated mask is luma-grid.
+                let wedge = if comp_type == COMPOUND_WEDGE {
+                    Some(WedgeModeInfo {
+                        mi_size,
+                        wedge_index: grid.wedge_indices[origin],
+                        wedge_sign: grid.wedge_signs[origin],
+                    })
+                } else {
+                    None
+                };
                 let mode_info = CompoundInterModeInfo {
                     ref_frame_0: ref_frame0 as u8,
                     ref_frame_1: ref_frame1 as u8,
                     mv0: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
                     mv1: [grid.mvs[origin * 4 + 2], grid.mvs[origin * 4 + 3]],
                     compound_type: comp_type,
+                    wedge,
                 };
                 // §7.11.3.15 order-hint context — resolve each ref's
                 // `OrderHints[]` from the per-RefFrame table. The two
@@ -7715,7 +7850,9 @@ mod tests {
         // (1,0) BLOCK_4X4 intra.
         set_cell(&mut mi_sizes, 1, 0, BLOCK_4X4);
         // (1,1) BLOCK_4X4 compound inter (RefFrame[1] = LAST_FRAME),
-        // marked COMPOUND_WEDGE so the walk skips it (mask arm).
+        // marked COMPOUND_DIFFWTD so the walk skips it (its mask is a
+        // function of the two preds[], unregenerable from grid
+        // side-data — unlike COMPOUND_WEDGE which is now driven).
         set_cell(&mut mi_sizes, 1, 1, BLOCK_4X4);
         stamp_inter(
             &mut is_inters,
@@ -7727,7 +7864,7 @@ mod tests {
             last,
             [0, 4],
         );
-        compound_types[mi_cols as usize + 1] = COMPOUND_WEDGE;
+        compound_types[mi_cols as usize + 1] = COMPOUND_DIFFWTD;
 
         // CurrFrame[0]: 8 rows × 16 cols, sentinel pre-fill.
         let curr_w = (mi_cols * 4) as usize; // 16
@@ -7736,6 +7873,7 @@ mod tests {
         let mut curr = vec![sentinel; curr_w * curr_h];
 
         let order_hints_by_ref = [0i32; 8];
+        let wedge_zeros = vec![0u8; cells];
         let grid = InterModeInfoGrid {
             mi_sizes: &mi_sizes,
             is_inters: &is_inters,
@@ -7743,6 +7881,8 @@ mod tests {
             mvs: &mvs,
             interp_filters: &interp_filters,
             compound_types: &compound_types,
+            wedge_indices: &wedge_zeros,
+            wedge_signs: &wedge_zeros,
             order_hint_bits: 7,
             current_order_hint: 0,
             order_hints_by_ref: &order_hints_by_ref,
@@ -7872,6 +8012,7 @@ mod tests {
 
         let mut curr = vec![0u16; ref_w * ref_h];
         let comp_types = vec![COMPOUND_AVERAGE; cells];
+        let wedge_zeros = vec![0u8; cells];
         let order_hints_by_ref = [0i32; 8];
         let run = |mi_sizes: &[usize],
                    is_inters: &[u8],
@@ -7886,6 +8027,8 @@ mod tests {
                 mvs,
                 interp_filters,
                 compound_types: &comp_types,
+                wedge_indices: &wedge_zeros,
+                wedge_signs: &wedge_zeros,
                 order_hint_bits: 7,
                 current_order_hint: 0,
                 order_hints_by_ref: &order_hints_by_ref,
@@ -8047,6 +8190,7 @@ mod tests {
             mv0: [0, 4],
             mv1: [8, 0],
             compound_type: COMPOUND_AVERAGE,
+            wedge: None,
         };
         // Driver output, stitched into an 8×8 plane at (2, 2).
         let curr_w = 8;
@@ -8193,6 +8337,7 @@ mod tests {
                 mv0: [0, 4],
                 mv1: [8, 0],
                 compound_type: COMPOUND_DISTANCE,
+                wedge: None,
             },
             ohc,
             &ref_frame_idx,
@@ -8297,6 +8442,9 @@ mod tests {
                     mv0: [0, 0],
                     mv1: [0, 0],
                     compound_type: ct,
+                    // `wedge: None` — exercises both the non-wedge arms
+                    // and the "WEDGE without wedge side-data" caller bug.
+                    wedge: None,
                 },
                 ohc,
                 &ref_frame_idx,
@@ -8318,11 +8466,13 @@ mod tests {
             )
         };
         let mut curr = vec![0u16; w * h];
-        // Mask compound type — out of this driver's scope.
+        // COMPOUND_WEDGE without `wedge` side-data — caller bug.
         assert_eq!(
             mk(last, last + 1, COMPOUND_WEDGE, &mut curr, w).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
         );
+        // COMPOUND_DIFFWTD — prediction-derived mask, out of this
+        // driver's scope.
         assert_eq!(
             mk(last, last + 1, COMPOUND_DIFFWTD, &mut curr, w).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
@@ -8352,8 +8502,9 @@ mod tests {
     /// §5.11.33 frame walk — a grid carrying one `COMPOUND_AVERAGE` and
     /// one `COMPOUND_DISTANCE` compound leaf must dispatch each through
     /// [`reconstruct_inter_block_compound`] identically to a direct
-    /// per-block call, while a `COMPOUND_WEDGE` (mask) compound leaf and
-    /// an inter-intra leaf are left as the sentinel.
+    /// per-block call, while a `COMPOUND_DIFFWTD` (prediction-derived
+    /// mask) compound leaf and an inter-intra leaf are left as the
+    /// sentinel.
     #[test]
     fn r294_reconstruct_inter_frame_drives_average_and_distance_compound() {
         let ref_w = 16usize;
@@ -8406,8 +8557,10 @@ mod tests {
         stamp(0, last + 1, COMPOUND_AVERAGE, [0, 4], [8, 0]);
         // col 1: COMPOUND_DISTANCE (RefFrame[1] = LAST+2).
         stamp(1, last + 2, COMPOUND_DISTANCE, [4, 0], [0, 8]);
-        // col 2: COMPOUND_WEDGE (mask) — must be skipped.
-        stamp(2, last + 1, COMPOUND_WEDGE, [0, 4], [8, 0]);
+        // col 2: COMPOUND_DIFFWTD (prediction-derived mask) — must be
+        // skipped (its mask is a function of preds[], unregenerable
+        // from grid side-data).
+        stamp(2, last + 1, COMPOUND_DIFFWTD, [0, 4], [8, 0]);
         // col 3: inter-intra (RefFrame[1] = INTRA_FRAME) — skipped.
         is_inters[3] = 1;
         ref_frames[3 * 2] = last;
@@ -8427,6 +8580,7 @@ mod tests {
         let sentinel = 5000u16;
         let mut curr = vec![sentinel; curr_w * curr_h];
 
+        let wedge_zeros = vec![0u8; cells];
         let grid = InterModeInfoGrid {
             mi_sizes: &mi_sizes,
             is_inters: &is_inters,
@@ -8434,6 +8588,8 @@ mod tests {
             mvs: &mvs,
             interp_filters: &interp_filters,
             compound_types: &compound_types,
+            wedge_indices: &wedge_zeros,
+            wedge_signs: &wedge_zeros,
             order_hint_bits: 7,
             current_order_hint,
             order_hints_by_ref: &order_hints_by_ref,
@@ -8466,6 +8622,7 @@ mod tests {
                 mv0: [0, 4],
                 mv1: [8, 0],
                 compound_type: COMPOUND_AVERAGE,
+                wedge: None,
             },
             CompoundOrderHintContext {
                 order_hint_bits: 7,
@@ -8499,6 +8656,7 @@ mod tests {
                 mv0: [4, 0],
                 mv1: [0, 8],
                 compound_type: COMPOUND_DISTANCE,
+                wedge: None,
             },
             CompoundOrderHintContext {
                 order_hint_bits: 7,
@@ -8529,8 +8687,8 @@ mod tests {
             curr, oracle,
             "frame walk must dispatch compound leaves identically to the per-block driver"
         );
-        // The WEDGE (cols 8..12) and inter-intra (cols 12..16) leaves
-        // are skipped → still the sentinel.
+        // The DIFFWTD (col 2) and inter-intra (col 3) leaves are
+        // skipped → still the sentinel (cols 8..16 in plane samples).
         for c in 8..16 {
             for r in 0..curr_h {
                 assert_eq!(
@@ -8543,6 +8701,311 @@ mod tests {
         // The two driven leaves were reconstructed.
         assert_ne!(curr[0], sentinel, "AVERAGE leaf reconstructed");
         assert_ne!(curr[4], sentinel, "DISTANCE leaf reconstructed");
+    }
+
+    /// §7.11.3.1 step-14 + line 14386 `COMPOUND_WEDGE` block driver —
+    /// [`reconstruct_inter_block_compound`] must regenerate the
+    /// §7.11.3.11 luma-grid wedge mask from `(MiSize, wedge_index,
+    /// wedge_sign)` and produce the same samples as a direct
+    /// [`predict_inter`] + [`wedge_mask`] oracle, on the luma plane and
+    /// on a `(sub_x, sub_y) == (1, 1)` chroma plane (where the luma mask
+    /// is reused with downsampling).
+    #[test]
+    fn r295_reconstruct_inter_block_compound_wedge_matches_predict_inter() {
+        // BLOCK_8X8 is wedge-eligible (WEDGE_BITS[3] == 4); luma 8×8.
+        const BLOCK_8X8: usize = 3;
+        let ref_w = 24usize;
+        let ref_h = 24usize;
+        let stride = ref_w;
+        let refp = r294_ref_plane(ref_w, ref_h);
+        let real = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        // Two distinct refs (slots resolve to the same plane but the two
+        // MVs make preds[0] != preds[1], so the wedge mask matters).
+        let store = [real, real, real, real];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let ohc = CompoundOrderHintContext {
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hint_ref0: 0,
+            order_hint_ref1: 0,
+        };
+        let wedge_index = 5u8;
+        let wedge_sign = 1u8;
+        let mode_info = CompoundInterModeInfo {
+            ref_frame_0: last,
+            ref_frame_1: last + 1,
+            mv0: [0, 4],
+            mv1: [8, 0],
+            compound_type: COMPOUND_WEDGE,
+            wedge: Some(WedgeModeInfo {
+                mi_size: BLOCK_8X8,
+                wedge_index,
+                wedge_sign,
+            }),
+        };
+
+        // Pre-build the luma-grid wedge mask once for the oracle.
+        let luma_w = crate::cdf::block_width(BLOCK_8X8);
+        let luma_h = crate::cdf::block_height(BLOCK_8X8);
+        let mut mask = vec![0u8; luma_w * luma_h];
+        wedge_mask(
+            BLOCK_8X8,
+            crate::cdf::num_4x4_blocks_wide(BLOCK_8X8) as u32,
+            crate::cdf::num_4x4_blocks_high(BLOCK_8X8) as u32,
+            wedge_index,
+            wedge_sign,
+            &mut mask,
+        )
+        .unwrap();
+        // A wedge mask is non-trivial: it must contain a 0..64 gradient,
+        // not a constant, or the test would not exercise the blend.
+        assert!(
+            mask.iter().any(|&m| m != mask[0]),
+            "test premise: wedge mask must be non-constant"
+        );
+
+        // Per (plane, sub_x, sub_y, x, y, w, h) oracle: run predict_inter
+        // with the same two refs and the pre-built mask, then stitch.
+        let drive = |plane: u8, sub_x: u8, sub_y: u8, x: i32, y: i32, w: usize, h: usize| {
+            // Driver output.
+            let curr_w = ref_w;
+            let curr_h = ref_h;
+            let mut got = vec![0u16; curr_w * curr_h];
+            reconstruct_inter_block_compound(
+                mode_info,
+                ohc,
+                &ref_frame_idx,
+                &store,
+                plane,
+                x,
+                y,
+                w,
+                h,
+                8,
+                sub_x,
+                sub_y,
+                ref_w as u32,
+                ref_h as u32,
+                EIGHTTAP,
+                EIGHTTAP,
+                &mut got,
+                curr_w,
+            )
+            .expect("WEDGE block driver");
+
+            // Oracle: predict_inter into a w×h buffer, then stitch.
+            let refs = [
+                PredictInterRef {
+                    ref_plane: &refp,
+                    ref_stride: stride,
+                    ref_upscaled_width: ref_w as u32,
+                    ref_width: ref_w as u32,
+                    ref_height: ref_h as u32,
+                    mv: [0, 4],
+                },
+                PredictInterRef {
+                    ref_plane: &refp,
+                    ref_stride: stride,
+                    ref_upscaled_width: ref_w as u32,
+                    ref_width: ref_w as u32,
+                    ref_height: ref_h as u32,
+                    mv: [8, 0],
+                },
+            ];
+            let mut pred = vec![0u16; w * h];
+            predict_inter(
+                plane,
+                x,
+                y,
+                w,
+                h,
+                crate::cdf::MOTION_MODE_SIMPLE,
+                true,
+                false,
+                8,
+                sub_x,
+                sub_y,
+                ref_w as u32,
+                ref_h as u32,
+                EIGHTTAP,
+                EIGHTTAP,
+                &refs,
+                Some(CompoundParams::Wedge {
+                    mask: &mask,
+                    mask_stride: luma_w,
+                }),
+                None,
+                None,
+                &mut pred,
+            )
+            .expect("WEDGE oracle predict_inter");
+            // Compare the driver's stitched region against the oracle.
+            for i in 0..h {
+                for j in 0..w {
+                    let dst = (y as usize + i) * curr_w + (x as usize + j);
+                    assert_eq!(
+                        got[dst],
+                        pred[i * w + j],
+                        "WEDGE mismatch plane={plane} at ({j},{i})"
+                    );
+                }
+            }
+        };
+
+        // Luma plane: full 8×8 at (0, 0).
+        drive(0, 0, 0, 0, 0, luma_w, luma_h);
+        // Chroma plane with 4:2:0 subsampling: 4×4 region, same luma mask
+        // reused via mask_blend's (1, 1) downsampling.
+        drive(1, 1, 1, 0, 0, luma_w / 2, luma_h / 2);
+    }
+
+    /// §5.11.33 frame walk — a `COMPOUND_WEDGE` leaf (BLOCK_8X8,
+    /// wedge-eligible) must be driven through
+    /// [`reconstruct_inter_block_compound`] with the per-leaf
+    /// `wedge_indices` / `wedge_signs`, producing the same samples as a
+    /// direct per-block WEDGE call.
+    #[test]
+    fn r295_reconstruct_inter_frame_drives_wedge_compound() {
+        const BLOCK_8X8: usize = 3;
+        let ref_w = 16usize;
+        let ref_h = 16usize;
+        let stride = ref_w;
+        let refp = r294_ref_plane(ref_w, ref_h);
+        let real = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [real, real, real, real];
+        let store2 = store;
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+
+        // One BLOCK_8X8 leaf (2×2 mi cells) at the grid origin.
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        use crate::cdf::BLOCK_INVALID;
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        mi_sizes[0] = BLOCK_8X8; // origin; walk stamps the 2×2 footprint.
+        let mut is_inters = vec![0u8; cells];
+        is_inters[0] = 1;
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        ref_frames[0] = last; // RefFrame[0] = LAST.
+        ref_frames[1] = last + 1; // RefFrame[1] = LAST+1 (compound).
+        let mut mvs = vec![0i16; cells * 4];
+        mvs[0] = 0;
+        mvs[1] = 4;
+        mvs[2] = 8;
+        mvs[3] = 0;
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let mut compound_types = vec![COMPOUND_AVERAGE; cells];
+        compound_types[0] = COMPOUND_WEDGE;
+        let wedge_index = 7u8;
+        let wedge_sign = 0u8;
+        let mut wedge_indices = vec![0u8; cells];
+        wedge_indices[0] = wedge_index;
+        let mut wedge_signs = vec![0u8; cells];
+        wedge_signs[0] = wedge_sign;
+
+        let order_hints_by_ref = [0i32; 8];
+        let curr_w = (mi_cols * 4) as usize; // 8
+        let curr_h = (mi_rows * 4) as usize; // 8
+        let sentinel = 5000u16;
+        let mut curr = vec![sentinel; curr_w * curr_h];
+
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &compound_types,
+            wedge_indices: &wedge_indices,
+            wedge_signs: &wedge_signs,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+        };
+        {
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("frame-level WEDGE reconstruction");
+        }
+
+        // Oracle: drive the single WEDGE leaf directly.
+        let mut oracle = vec![sentinel; curr_w * curr_h];
+        reconstruct_inter_block_compound(
+            CompoundInterModeInfo {
+                ref_frame_0: last as u8,
+                ref_frame_1: (last + 1) as u8,
+                mv0: [0, 4],
+                mv1: [8, 0],
+                compound_type: COMPOUND_WEDGE,
+                wedge: Some(WedgeModeInfo {
+                    mi_size: BLOCK_8X8,
+                    wedge_index,
+                    wedge_sign,
+                }),
+            },
+            CompoundOrderHintContext {
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hint_ref0: 0,
+                order_hint_ref1: 0,
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        assert_eq!(
+            curr, oracle,
+            "frame walk must drive the WEDGE leaf identically to the per-block driver"
+        );
+        // The 8×8 region was reconstructed (no sentinel left).
+        assert!(
+            curr.iter().all(|&s| s != sentinel),
+            "all WEDGE samples reconstructed"
+        );
     }
 
     /// §7.11.3.1 caller-bug matrix (post-r203) — all four motion

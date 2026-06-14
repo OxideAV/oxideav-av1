@@ -2,6 +2,39 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 295)
+
+Round 295 **drives the `COMPOUND_WEDGE` mask compound arm across the
+frame walk** — the r294 follow-up. Where r294 reconstructed the
+mask-free `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE` bidirectional leaves
+(skipping every *mask* compound type), this round adds the wedge arm:
+the only mask compound type whose §7.11.3.11 mask is a **pure function
+of decoded side-data** (`MiSize`, `wedge_index`, `wedge_sign`) and so
+can be regenerated before prediction runs, with no dependence on the
+two `preds[]`.
+
+* **Regenerable mask.** `reconstruct_inter_block_compound` now accepts
+  `COMPOUND_WEDGE`: it rebuilds the §7.11.3.11 luma-grid `WedgeMasks[
+  MiSize ][ wedge_sign ][ wedge_index ]` slice once via `wedge_mask`,
+  then hands it to `predict_inter` as `CompoundParams::Wedge`. The mask
+  is luma-grid (av1-spec p.258 line 14386: the wedge mask process runs
+  only `if plane == 0`); `mask_blend`'s `(sub_x, sub_y)` downsampling
+  reuses it for chroma, with the luma block width as the row stride.
+* **Mode-info plumbing.** `CompoundInterModeInfo` gains a `wedge:
+  Option<WedgeModeInfo>` field (`Some(_)` required on the WEDGE arm),
+  and `InterModeInfoGrid` gains per-cell `wedge_indices` / `wedge_signs`
+  slices the frame walk reads at each WEDGE leaf's origin.
+* **Still deferred.** `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` remain
+  skipped — their mask is a function of the two `preds[]` themselves, so
+  it cannot be regenerated from grid side-data before prediction; the
+  per-block driver rejects them.
+
++2 lib tests (1980 → 1982): a `COMPOUND_WEDGE` block driver
+cross-checked against a direct `predict_inter` + `wedge_mask` oracle on
+both the luma plane and a 4:2:0 chroma plane (reusing the luma mask via
+`(1, 1)` downsampling); and a frame walk driving one BLOCK_8X8 WEDGE
+leaf identically to the per-block driver.
+
 ## Status — 2026-06-14 (round 294)
 
 Round 294 **drives the mask-free compound two-reference inter

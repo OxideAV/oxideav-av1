@@ -4,6 +4,29 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r295 (2026-06-14): drive the `COMPOUND_WEDGE` mask compound
+  arm across the §5.11.33 frame walk — the only mask compound type whose
+  §7.11.3.11 mask is a pure function of decoded side-data (`MiSize`,
+  `wedge_index`, `wedge_sign`) and so can be regenerated before
+  prediction (unlike `COMPOUND_DIFFWTD` / `COMPOUND_INTRA`, whose mask is
+  a function of the two `preds[]`). `reconstruct_inter_block_compound`
+  now accepts `COMPOUND_WEDGE`: it rebuilds the §7.11.3.11 luma-grid
+  `WedgeMasks[ MiSize ][ wedge_sign ][ wedge_index ]` slice once via
+  `wedge_mask` and hands it to `predict_inter` as
+  `CompoundParams::Wedge` with the luma block width as the mask row
+  stride, so `mask_blend`'s `(sub_x, sub_y)` downsampling reuses the
+  luma mask on chroma planes (av1-spec p.258 line 14386: the wedge mask
+  process runs only `if plane == 0`). `CompoundInterModeInfo` gains a
+  `wedge: Option<WedgeModeInfo>` field (required on the WEDGE arm) and
+  `InterModeInfoGrid` gains per-cell `wedge_indices` / `wedge_signs`
+  slices the frame walk reads at each WEDGE leaf's origin.
+  `COMPOUND_DIFFWTD` / `COMPOUND_INTRA` remain skipped (prediction-
+  derived masks). +2 lib tests (1980 → 1982): a `COMPOUND_WEDGE` block
+  driver cross-checked against a direct `predict_inter` + `wedge_mask`
+  oracle on both the luma plane and a 4:2:0 chroma plane (luma mask
+  reused via `(1, 1)` downsampling), and a frame walk driving one
+  BLOCK_8X8 WEDGE leaf identically to the per-block driver.
+
 - decoder r294 (2026-06-14): drive the mask-free compound two-reference
   inter reconstruction arms across the §5.11.33 frame walk. New
   `reconstruct_inter_block_compound` resolves *both* `RefFrame[refList]`
