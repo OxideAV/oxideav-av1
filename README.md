@@ -2,6 +2,47 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 300)
+
+Round 300 **lifts the §5.11.30 / §5.11.33 task-dispatcher inter-intra
+gate** in `PartitionWalker::compute_prediction` — the r299 followup's
+named candidate. The dispatcher previously returned
+`ComputePredictionInterIntraUnsupported` the moment `IsInterIntra =
+is_inter && RefFrame[1] == INTRA_FRAME` fired; it now emits the
+§5.11.33 task list for the arm.
+
+* **Both guards fire.** av1-spec p.82-83 lines 5141-5190 make the
+  `IsInterIntra` `if` and the `is_inter` `if` sibling, non-exclusive
+  guards — an inter-intra block runs `predict_intra` (the intra half of
+  the §7.11.3.1 blend) and then `predict_inter` (which overwrites it
+  with the §7.11.3.14-blended result). The dispatcher mirrors that
+  ordering: per plane it emits **one intra** `PlanePredictionTask` at
+  `(baseX, baseY)` covering the whole `(log2W, log2H)` region (line
+  5146) AHEAD of the `is_inter` arm's per-4x4 `COMPUTE_PRED_MODE_INTER`
+  tasks.
+* **Mode translation.** The intra-half task's `mode` is the §5.11.33
+  `interintra_mode → mode` map (lines 5142-5145): `II_DC_PRED →
+  DC_PRED`, `II_V_PRED → V_PRED`, `II_H_PRED → H_PRED`, and the
+  catch-all `II_SMOOTH_PRED → SMOOTH_PRED`.
+* **API.** `compute_prediction` gains a trailing `interintra_mode: u8`
+  argument (the §5.11.28 `read_interintra_mode` ordinal), consumed only
+  on the inter-intra arm; an out-of-range value there is a caller-bug
+  `PartitionWalkOutOfRange`. The internal inter caller threads it from
+  `inter_block.interintra.interintra_mode`.
+* **Scope.** This wires the *task-emitting* §5.11.30 / §5.11.33
+  dispatcher. The §7.11.3.1 blend that consumes the emitted tasks is the
+  r299 frame-walk's `reconstruct_inter_block_interintra`.
+  `ComputePredictionInterIntraUnsupported` is retained for `Error`-enum
+  source-compatibility but is no longer constructed. Threading the
+  dispatcher's emitted inter-intra tasks into the frame-walk's
+  reconstruction (so the two paths share one driver) + OBMC / warp
+  inter-intra interactions remain out of scope.
+
++4 walker integration tests (61 → 65): the intra-half-then-inter task
+ordering, the four-way `interintra_mode` translation, a 3-plane (420)
+inter-intra task layout, and the out-of-range `interintra_mode`
+caller-bug guard.
+
 ## Status — 2026-06-14 (round 299)
 
 Round 299 **wires the §5.11.33 frame-walk inter-intra leaf into

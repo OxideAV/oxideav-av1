@@ -4,6 +4,33 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r300 (2026-06-14): lift the §5.11.30 / §5.11.33
+  task-dispatcher **inter-intra gate** in `PartitionWalker::
+  compute_prediction`. The dispatcher previously returned
+  `ComputePredictionInterIntraUnsupported` whenever `IsInterIntra =
+  is_inter && RefFrame[1] == INTRA_FRAME` fired; it now emits the
+  §5.11.33 task list for the arm. Per av1-spec p.82-83 lines 5141-5190
+  the `IsInterIntra` `if` and the `is_inter` `if` are sibling,
+  non-exclusive guards, so an inter-intra block fires BOTH: the
+  dispatcher emits, per plane, one **intra** `PlanePredictionTask` (the
+  §7.11.3.1 inter-intra blend's intra half, at `(baseX, baseY)` covering
+  the whole `(log2W, log2H)` region — av1-spec line 5146) carrying the
+  `interintra_mode → mode` translation (`II_DC_PRED → DC_PRED`,
+  `II_V_PRED → V_PRED`, `II_H_PRED → H_PRED`, else `SMOOTH_PRED`; lines
+  5142-5145), AHEAD of the `is_inter` arm's per-4x4
+  `COMPUTE_PRED_MODE_INTER` tasks. `compute_prediction` gains a trailing
+  `interintra_mode: u8` parameter (the §5.11.28 `read_interintra_mode`
+  ordinal; consumed only on the inter-intra arm, an out-of-range value
+  there is a caller-bug `PartitionWalkOutOfRange`). The internal inter
+  caller threads it from `inter_block.interintra.interintra_mode`. The
+  blend that consumes these tasks is the r299 frame-walk's
+  `reconstruct_inter_block_interintra`. `ComputePredictionInterIntra
+  Unsupported` is retained for `Error`-enum source-compatibility but is
+  no longer constructed. +4 walker integration tests (61 → 65): the
+  intra-half-then-inter task ordering, the four-way `interintra_mode`
+  translation, a 3-plane (420) inter-intra task layout, and the
+  out-of-range `interintra_mode` caller-bug guard.
+
 - decoder r299 (2026-06-14): wire the §5.11.33 frame-walk **inter-intra
   leaf** into `reconstruct_inter_frame`. New
   `reconstruct_inter_block_interintra` is the inter-intra sibling of

@@ -25438,6 +25438,11 @@ impl PartitionWalker {
             /* y_mode = */ y_mode,
             /* uv_mode = */ uv_mode.unwrap_or(0),
             /* ref_frame_1_is_intra = */ false,
+            // §5.11.28 `interintra_mode` — the §5.11.5 walker emits no
+            // inter-intra blocks (`ref_frame_1_is_intra == false`), so
+            // this is unread; pass `II_DC_PRED` as the inert default.
+            /* interintra_mode = */
+            II_DC_PRED,
         )?;
 
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
@@ -25709,6 +25714,12 @@ impl PartitionWalker {
             /* y_mode = */ inter_block.y_mode,
             /* uv_mode = */ uv_mode_for_compute,
             ref_frame_1_is_intra,
+            // §5.11.28 `interintra_mode` — present (`Some`) on the
+            // inter-intra arm (`ref_frame_1_is_intra == true`); the
+            // §5.11.33 dispatcher reads it only there. `None` (the
+            // non-interintra path) maps to the inert `II_DC_PRED`.
+            /* interintra_mode = */
+            inter_block.interintra.interintra_mode.unwrap_or(II_DC_PRED),
         )?;
 
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
@@ -25860,8 +25871,13 @@ impl PartitionWalker {
     /// * §5.11.38 `get_plane_residual_size` — derived per-plane
     ///   `planeSz`, then `num4x4W` / `num4x4H` / `log2W` / `log2H` /
     ///   `subX` / `subY` / `baseX` / `baseY`.
-    /// * §5.11.33 `IsInterIntra` arm — gated; surfaces
-    ///   [`crate::Error::ComputePredictionInterIntraUnsupported`].
+    /// * §5.11.33 `IsInterIntra` arm — emits, per plane, one intra
+    ///   [`PlanePredictionTask`] (the §7.11.3.1 inter-intra blend's
+    ///   intra half) carrying the `interintra_mode → mode` translation
+    ///   (`II_DC_PRED → DC_PRED`, `II_V_PRED → V_PRED`, `II_H_PRED →
+    ///   H_PRED`, else `SMOOTH_PRED`; av1-spec p.82 lines 5142-5145),
+    ///   ahead of the `is_inter` arm's per-4x4 inter tasks. The two
+    ///   guards are non-exclusive: an inter-intra block fires BOTH.
     /// * §5.11.33 `is_inter` arm — emits one [`PlanePredictionTask`]
     ///   per `(plane, i4, j4)` 4x4 sub-block carrying the §7.11.3.1
     ///   `predict_inter` arguments (`start_x = baseX + j4*4`, `start_y
@@ -25914,6 +25930,13 @@ impl PartitionWalker {
     /// * `ref_frame_1_is_intra` — caller-supplied flag for the
     ///   §5.11.33 `IsInterIntra = is_inter && RefFrame[1] ==
     ///   INTRA_FRAME` gate. `false` on the intra arm.
+    /// * `interintra_mode` — §5.11.28 `read_interintra_mode` ordinal
+    ///   (`0..INTERINTRA_MODES`: `II_DC_PRED` / `II_V_PRED` /
+    ///   `II_H_PRED` / `II_SMOOTH_PRED`). Consumed only when
+    ///   `is_inter_intra` is true (translated to the intra-half task's
+    ///   `mode`); ignored otherwise. An out-of-range value on the
+    ///   inter-intra arm is a caller bug
+    ///   ([`crate::Error::PartitionWalkOutOfRange`]).
     ///
     /// ## Returns
     ///
@@ -25940,6 +25963,7 @@ impl PartitionWalker {
         y_mode: u8,
         uv_mode: u8,
         ref_frame_1_is_intra: bool,
+        interintra_mode: u8,
     ) -> Result<ComputePredictionReadout, crate::Error> {
         // ---------- caller-bug guards ----------
         if mi_size >= BLOCK_SIZES {
@@ -25953,18 +25977,34 @@ impl PartitionWalker {
         }
 
         // §5.11.33 `IsInterIntra = is_inter && RefFrame[ 1 ] ==
-        // INTRA_FRAME`. Today the §5.11.5 walker emits intra-only
-        // blocks (`is_inter == 0`), so this evaluates to `false`. The
-        // §5.11.28 `read_interintra_mode == 1` block class would
-        // produce `is_inter == 1 && RefFrame[1] == INTRA_FRAME` (the
-        // §5.11.28 inner arm imperatively sets `RefFrame[1] =
-        // INTRA_FRAME`); when that path is wired through `decode_block
-        // _syntax` the caller passes `ref_frame_1_is_intra = true` and
-        // the gate fires.
+        // INTRA_FRAME`. The §5.11.28 `read_interintra_mode == 1` block
+        // class produces `is_inter == 1 && RefFrame[1] == INTRA_FRAME`
+        // (the §5.11.28 inner arm imperatively sets `RefFrame[1] =
+        // INTRA_FRAME`); when that path is wired through
+        // `decode_block_syntax` the caller passes
+        // `ref_frame_1_is_intra = true` and the gate fires.
         let is_inter_intra = is_inter && ref_frame_1_is_intra;
-        if is_inter_intra {
-            return Err(crate::Error::ComputePredictionInterIntraUnsupported);
+
+        // §5.11.33 inner `IsInterIntra` arm `interintra_mode → mode`
+        // translation (av1-spec p.82 lines 5142-5145): `II_DC_PRED →
+        // DC_PRED`, `II_V_PRED → V_PRED`, `II_H_PRED → H_PRED`, and the
+        // catch-all (`II_SMOOTH_PRED`) → `SMOOTH_PRED`. Computed once;
+        // only consumed on the `is_inter_intra` arm below. A
+        // `interintra_mode` outside `0..INTERINTRA_MODES` is a caller
+        // bug — the §5.11.28 `read_interintra_mode` reader caps its S()
+        // at `INTERINTRA_MODES = 4` cumulative frequencies.
+        if is_inter_intra && (interintra_mode as usize) >= INTERINTRA_MODES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
         }
+        let interintra_intra_mode = match interintra_mode {
+            II_V_PRED => V_PRED as u8,
+            II_H_PRED => H_PRED as u8,
+            // `II_DC_PRED` (the lead arm) plus the catch-all
+            // `II_SMOOTH_PRED` (av1-spec p.82 line 5145 `else mode =
+            // SMOOTH_PRED`).
+            II_DC_PRED => DC_PRED as u8,
+            _ => SMOOTH_PRED as u8,
+        };
 
         // §5.11.33 outer loop bound: `1 + HasChroma * 2`. `HasChroma`
         // is `1` (3 planes) or `0` (1 plane / luma-only). The
@@ -26000,6 +26040,39 @@ impl PartitionWalker {
             // `baseY = (MiRow >> subY) * MI_SIZE`.
             let base_x = (mi_col >> sub_x) * (MI_SIZE as u32);
             let base_y = (mi_row >> sub_y) * (MI_SIZE as u32);
+
+            // §5.11.33 inner `IsInterIntra` arm (av1-spec p.82-83
+            // lines 5141-5163). On an inter-intra block BOTH the
+            // `IsInterIntra` `if` AND the `is_inter` `if` fire (they
+            // are two sibling, non-exclusive guards): the spec runs
+            // `predict_intra` first (the intra half of the §7.11.3.1
+            // inter-intra blend, written into `CurrFrame[plane]`), then
+            // `predict_inter` overwrites it with the §7.11.3.14-blended
+            // result. We mirror that ordering by emitting, per plane,
+            // one intra `PlanePredictionTask` (carrying the translated
+            // `interintra_mode → mode`) ahead of the `is_inter` arm's
+            // per-4x4 inter tasks. The intra half always covers the
+            // whole plane region in one `predict_intra` call (av1-spec
+            // line 5146: `predict_intra( plane, baseX, baseY, …, log2W,
+            // log2H )`), so it is a single `(log2_w, log2_h)` task at
+            // `(baseX, baseY)` regardless of `num4x4{W,H}`.
+            if is_inter_intra {
+                let (have_above_ii, have_left_ii) = if plane == 0 {
+                    (avail_u, avail_l)
+                } else {
+                    (avail_u_chroma, avail_l_chroma)
+                };
+                tasks.push(PlanePredictionTask {
+                    plane,
+                    start_x: base_x,
+                    start_y: base_y,
+                    log2_w,
+                    log2_h,
+                    mode: interintra_intra_mode,
+                    have_left: have_left_ii,
+                    have_above: have_above_ii,
+                });
+            }
 
             // §5.11.33 per-plane `is_inter` branch.
             if is_inter {

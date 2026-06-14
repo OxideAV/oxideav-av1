@@ -2346,7 +2346,7 @@ fn compute_prediction_intra_dc_pred_3_plane_path() {
         /* subsampling_x = */ 1, /* subsampling_y = */ 1, /* is_inter = */ false,
         /* y_mode = */ 0, // DC_PRED
         /* uv_mode = */ 0, // DC_PRED
-        /* ref_frame_1_is_intra = */ false,
+        /* ref_frame_1_is_intra = */ false, /* interintra_mode = */ 0,
     );
     let r = result.expect("3-plane intra DC dispatch must succeed");
     assert!(!r.is_inter);
@@ -2388,7 +2388,7 @@ fn compute_prediction_luma_only_one_task() {
     let mut walker = walker_n(16);
     let r = walker
         .compute_prediction(
-            0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, 0, 0, false,
+            0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, 0, 0, false, 0,
         )
         .unwrap();
     assert_eq!(r.num_planes_visited, 1);
@@ -2411,7 +2411,7 @@ fn compute_prediction_inter_arm_emits_per_subblock_tasks() {
     let r = walker
         .compute_prediction(
             0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ true,
-            0, 0, false,
+            0, 0, false, 0,
         )
         .unwrap();
     assert!(r.is_inter);
@@ -2430,15 +2430,133 @@ fn compute_prediction_inter_arm_emits_per_subblock_tasks() {
     }
 }
 
-/// §5.11.33 inter-intra arm currently surfaces the next-arc stub.
+/// r300: §5.11.33 inter-intra arm — the dispatcher now emits, per
+/// plane, one intra `PlanePredictionTask` (the §7.11.3.1 inter-intra
+/// blend's intra half) AHEAD of the `is_inter` arm's per-4x4 inter
+/// tasks. For a luma-only `BLOCK_8X8` inter-intra block this gives
+/// `1` intra task at `(0, 0)` (`log2_w == log2_h == 3`, mode derived
+/// from `interintra_mode`) followed by `4` inter tasks (the `2 × 2`
+/// 4x4 sub-block grid carrying `COMPUTE_PRED_MODE_INTER`).
 #[test]
-fn compute_prediction_inter_intra_arm_surfaces_stub() {
+fn compute_prediction_inter_intra_arm_emits_intra_then_inter_tasks() {
+    use oxideav_av1::COMPUTE_PRED_MODE_INTER;
     let mut walker = walker_n(16);
-    let result = walker.compute_prediction(
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ true,
+            0, 0, /* ref_frame_1_is_intra = */ true,
+            /* interintra_mode = II_DC_PRED */ 0,
+        )
+        .expect("inter-intra dispatch must now succeed");
+    assert!(r.is_inter);
+    assert!(r.is_inter_intra);
+    assert_eq!(r.num_planes_visited, 1);
+    // 1 intra half-task + 4 inter sub-block tasks.
+    assert_eq!(r.tasks.len(), 5);
+
+    // The §5.11.33 `IsInterIntra` arm emits FIRST: the intra half.
+    let intra = &r.tasks[0];
+    assert_eq!(intra.plane, 0);
+    assert_eq!(intra.start_x, 0);
+    assert_eq!(intra.start_y, 0);
+    assert_eq!(intra.log2_w, 3); // whole BLOCK_8X8 region in one call
+    assert_eq!(intra.log2_h, 3);
+    assert_eq!(intra.mode, 0); // II_DC_PRED → DC_PRED == 0
+
+    // Then the four §7.11.3.1 inter sub-block tasks.
+    let expected_starts: [(u32, u32); 4] = [(0, 0), (4, 0), (0, 4), (4, 4)];
+    for (task, (ex, ey)) in r.tasks[1..].iter().zip(expected_starts.iter()) {
+        assert_eq!(task.plane, 0);
+        assert_eq!(task.mode, COMPUTE_PRED_MODE_INTER);
+        assert_eq!(task.log2_w, 2);
+        assert_eq!(task.log2_h, 2);
+        assert_eq!(task.start_x, *ex);
+        assert_eq!(task.start_y, *ey);
+    }
+}
+
+/// r300: §5.11.33 inter-intra `interintra_mode → mode` translation
+/// (av1-spec p.82 lines 5142-5145): `II_V_PRED → V_PRED`,
+/// `II_H_PRED → H_PRED`, `II_SMOOTH_PRED → SMOOTH_PRED`. The intra
+/// half-task's `mode` reflects the translation; the inter tasks are
+/// unaffected.
+#[test]
+fn compute_prediction_inter_intra_mode_translation() {
+    // (interintra_mode ordinal, expected intra-half mode ordinal).
+    // II_DC_PRED=0→DC_PRED=0, II_V_PRED=1→V_PRED=1, II_H_PRED=2→
+    // H_PRED=2, II_SMOOTH_PRED=3→SMOOTH_PRED=9.
+    let cases: [(u8, u8); 4] = [(0, 0), (1, 1), (2, 2), (3, 9)];
+    for (ii_mode, expected) in cases {
+        let mut walker = walker_n(16);
+        let r = walker
+            .compute_prediction(
+                0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0,
+                /* is_inter = */ true, 0, 0, /* ref_frame_1_is_intra = */ true, ii_mode,
+            )
+            .expect("inter-intra dispatch must succeed");
+        assert!(r.is_inter_intra);
+        assert_eq!(
+            r.tasks[0].mode, expected,
+            "interintra_mode {ii_mode} must translate to intra mode {expected}",
+        );
+    }
+}
+
+/// r300: §5.11.33 inter-intra arm with chroma — the `IsInterIntra`
+/// intra half emits one task per plane (plane 0/1/2), each ahead of
+/// that plane's inter sub-block tasks. For a `BLOCK_8X8` 420 block
+/// (chroma residual `BLOCK_4X4`): plane 0 = 1 intra + 4 inter,
+/// planes 1/2 = 1 intra + 1 inter each.
+#[test]
+fn compute_prediction_inter_intra_3_plane() {
+    use oxideav_av1::COMPUTE_PRED_MODE_INTER;
+    let mut walker = walker_n(16);
+    let r = walker
+        .compute_prediction(
+            0, 0, BLOCK_8X8, /* has_chroma = */ true, false, false, false, false,
+            /* subsampling = */ 1, 1, /* is_inter = */ true, 0, 0,
+            /* ref_frame_1_is_intra = */ true, /* II_DC_PRED */ 0,
+        )
+        .expect("3-plane inter-intra dispatch must succeed");
+    assert!(r.is_inter_intra);
+    assert_eq!(r.num_planes_visited, 3);
+    // plane0: 1 intra + 4 inter = 5; plane1: 1 + 1; plane2: 1 + 1 = 9.
+    assert_eq!(r.tasks.len(), 9);
+    // First task of each plane is the intra half.
+    assert_eq!(r.tasks[0].plane, 0);
+    assert_eq!(r.tasks[0].mode, 0);
+    assert_eq!(r.tasks[0].log2_w, 3);
+    assert_eq!(r.tasks[5].plane, 1);
+    assert_eq!(r.tasks[5].mode, 0);
+    assert_eq!(r.tasks[5].log2_w, 2); // chroma BLOCK_4X4
+    assert_eq!(r.tasks[6].plane, 1);
+    assert_eq!(r.tasks[6].mode, COMPUTE_PRED_MODE_INTER);
+    assert_eq!(r.tasks[7].plane, 2);
+    assert_eq!(r.tasks[7].mode, 0);
+    assert_eq!(r.tasks[8].plane, 2);
+    assert_eq!(r.tasks[8].mode, COMPUTE_PRED_MODE_INTER);
+}
+
+/// r300: §5.11.33 caller-bug guard — an `interintra_mode` outside
+/// `0..INTERINTRA_MODES` on the inter-intra arm surfaces
+/// `PartitionWalkOutOfRange`. The same out-of-range value on the
+/// non-inter-intra arm is ignored (the mode is unread there).
+#[test]
+fn compute_prediction_inter_intra_mode_out_of_range_guard() {
+    let mut walker = walker_n(16);
+    let bad = walker.compute_prediction(
         0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ true, 0, 0,
-        /* ref_frame_1_is_intra = */ true,
+        /* ref_frame_1_is_intra = */ true, /* interintra_mode = */ 4,
     );
-    assert_eq!(result, Err(Error::ComputePredictionInterIntraUnsupported));
+    assert_eq!(bad, Err(Error::PartitionWalkOutOfRange));
+
+    // Non-inter-intra: out-of-range interintra_mode is inert.
+    let mut walker2 = walker_n(16);
+    let ok = walker2.compute_prediction(
+        0, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, /* is_inter = */ false, 0,
+        0, /* ref_frame_1_is_intra = */ false, /* interintra_mode = */ 99,
+    );
+    assert!(ok.is_ok());
 }
 
 /// r186: §5.11.33 V_PRED admitted on the dispatcher's intra arm —
@@ -2455,7 +2573,7 @@ fn compute_prediction_v_pred_dispatches_one_task_per_plane() {
             0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
             /* y_mode = */ 1, // V_PRED
             /* uv_mode = */ 1, // V_PRED
-            false,
+            false, 0,
         )
         .expect("V_PRED intra arm must dispatch post-r186");
     assert_eq!(r.num_planes_visited, 3);
@@ -2475,7 +2593,7 @@ fn compute_prediction_h_pred_dispatches_one_task_per_plane() {
             0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
             /* y_mode = */ 2, // H_PRED
             /* uv_mode = */ 2, // H_PRED
-            false,
+            false, 0,
         )
         .expect("H_PRED intra arm must dispatch post-r186");
     assert_eq!(r.num_planes_visited, 3);
@@ -2496,7 +2614,7 @@ fn compute_prediction_d_mode_intra_modes_dispatch_one_task_per_plane() {
     for &mode in &[3u8, 4, 5, 6, 7, 8] {
         let r = walker
             .compute_prediction(
-                0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false, mode, mode, false,
+                0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false, mode, mode, false, 0,
             )
             .unwrap_or_else(|e| panic!("D-mode {mode} must dispatch post-r188 (got {e:?})"));
         assert_eq!(r.num_planes_visited, 3);
@@ -2521,7 +2639,7 @@ fn compute_prediction_uv_cfl_on_luma_rejected() {
     let mut walker = walker_n(16);
     let result = walker.compute_prediction(
         0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 13, 0,
-        false,
+        false, 0,
     );
     assert_eq!(result, Err(Error::ComputePredictionIntraModeUnsupported));
 }
@@ -2537,7 +2655,7 @@ fn compute_prediction_above_uv_cfl_rejected_as_caller_bug() {
     // §5.11.7 / §5.11.22 reader emission.
     let result = walker.compute_prediction(
         0, 0, BLOCK_8X8, false, true, true, false, false, 0, 0, false, /* y_mode = */ 14, 0,
-        false,
+        false, 0,
     );
     assert_eq!(result, Err(Error::PartitionWalkOutOfRange));
 }
@@ -2552,7 +2670,7 @@ fn compute_prediction_smooth_pred_dispatches_one_task_per_plane() {
         .compute_prediction(
             0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
             /* y_mode = */ 9, // SMOOTH_PRED
-            /* uv_mode = */ 9, false,
+            /* uv_mode = */ 9, false, 0,
         )
         .expect("SMOOTH_PRED intra arm must dispatch post-r187");
     assert_eq!(r.num_planes_visited, 3);
@@ -2571,7 +2689,7 @@ fn compute_prediction_smooth_v_pred_dispatches_one_task_per_plane() {
         .compute_prediction(
             0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
             /* y_mode = */ 10, // SMOOTH_V_PRED
-            /* uv_mode = */ 10, false,
+            /* uv_mode = */ 10, false, 0,
         )
         .expect("SMOOTH_V_PRED intra arm must dispatch post-r187");
     assert_eq!(r.num_planes_visited, 3);
@@ -2587,7 +2705,7 @@ fn compute_prediction_smooth_h_pred_dispatches_one_task_per_plane() {
         .compute_prediction(
             0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
             /* y_mode = */ 11, // SMOOTH_H_PRED
-            /* uv_mode = */ 11, false,
+            /* uv_mode = */ 11, false, 0,
         )
         .expect("SMOOTH_H_PRED intra arm must dispatch post-r187");
     assert_eq!(r.num_planes_visited, 3);
@@ -2603,7 +2721,7 @@ fn compute_prediction_paeth_pred_dispatches_one_task_per_plane() {
         .compute_prediction(
             0, 0, BLOCK_8X8, true, true, true, true, true, 1, 1, false,
             /* y_mode = */ 12, // PAETH_PRED
-            /* uv_mode = */ 12, false,
+            /* uv_mode = */ 12, false, 0,
         )
         .expect("PAETH_PRED intra arm must dispatch post-r187");
     assert_eq!(r.num_planes_visited, 3);
@@ -2617,28 +2735,28 @@ fn compute_prediction_caller_bug_guards() {
     // mi_row out of range.
     assert_eq!(
         walker.compute_prediction(
-            999, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, false, 0, 0, false,
+            999, 0, BLOCK_8X8, false, false, false, false, false, 0, 0, false, 0, 0, false, 0,
         ),
         Err(Error::PartitionWalkOutOfRange)
     );
     // mi_col out of range.
     assert_eq!(
         walker.compute_prediction(
-            0, 999, BLOCK_8X8, false, false, false, false, false, 0, 0, false, 0, 0, false,
+            0, 999, BLOCK_8X8, false, false, false, false, false, 0, 0, false, 0, 0, false, 0,
         ),
         Err(Error::PartitionWalkOutOfRange)
     );
     // mi_size out of range.
     assert_eq!(
         walker.compute_prediction(
-            0, 0, 99, false, false, false, false, false, 0, 0, false, 0, 0, false,
+            0, 0, 99, false, false, false, false, false, 0, 0, false, 0, 0, false, 0,
         ),
         Err(Error::PartitionWalkOutOfRange)
     );
     // subsampling out of range.
     assert_eq!(
         walker.compute_prediction(
-            0, 0, BLOCK_8X8, false, false, false, false, false, 2, 0, false, 0, 0, false,
+            0, 0, BLOCK_8X8, false, false, false, false, false, 2, 0, false, 0, 0, false, 0,
         ),
         Err(Error::PartitionWalkOutOfRange)
     );

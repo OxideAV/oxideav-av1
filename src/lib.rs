@@ -2029,17 +2029,22 @@ pub enum Error {
     /// instead). A future caller-side enforcement (e.g. a per-task
     /// "warp requested" check) may re-arm it.
     ComputePredictionInterUnsupported,
-    /// The §5.11.33 dispatcher visited a plane whose `IsInterIntra ==
-    /// 1` arm fires (`is_inter && RefFrame[1] == INTRA_FRAME` —
-    /// the inter+intra blend). The §5.11.33 inner `predict_intra`
-    /// arm here calls §7.11.2.x sample-generation against the
-    /// `CurrFrame` neighbour samples, then the outer `is_inter`
-    /// `predict_inter` body blends the inter prediction in via
-    /// §7.11.5 — both bodies are next-arc targets. Reachable only on
-    /// the §5.11.28 `interintra == 1` block class (the §5.11.5
-    /// walker doesn't yet emit those — they need the §5.11.18 inter
-    /// dispatcher to be wired through `decode_block_syntax`, which
-    /// itself remains stubbed at [`Self::DecodeBlockInterFrameUnsupported`]).
+    /// **r300 LIFTED — retained for API stability, no longer surfaced
+    /// by the dispatcher.** Formerly returned when the §5.11.33
+    /// dispatcher visited a plane whose `IsInterIntra == 1` arm fired
+    /// (`is_inter && RefFrame[1] == INTRA_FRAME` — the inter+intra
+    /// blend). As of r300
+    /// [`crate::PartitionWalker::compute_prediction`] emits, per plane,
+    /// one intra [`crate::PlanePredictionTask`] (the §7.11.3.1
+    /// inter-intra blend's intra half, carrying the
+    /// `interintra_mode → mode` translation per av1-spec p.82 lines
+    /// 5142-5145) AHEAD of the `is_inter` arm's per-4x4
+    /// `COMPUTE_PRED_MODE_INTER` tasks — both §5.11.33 guards are
+    /// non-exclusive and fire together on an inter-intra block. The
+    /// §7.11.3.1 blend that consumes these tasks is driven by the
+    /// §5.11.33 frame-walk's `reconstruct_inter_block_interintra` (r299).
+    /// This variant is no longer constructed; it is kept so the public
+    /// [`Error`] enum stays source-compatible.
     ComputePredictionInterIntraUnsupported,
     /// The §5.11.33 dispatcher visited an intra-mode plane whose
     /// `mode` (the §5.11.33 `predict_intra` `mode` argument) is not
@@ -2389,7 +2394,7 @@ impl core::fmt::Display for Error {
             ),
             Self::ComputePredictionInterIntraUnsupported => write!(
                 f,
-                "oxideav-av1: §5.11.33 compute_prediction reached IsInterIntra arm — §7.11.5 inter+intra blend pending next-arc"
+                "oxideav-av1: §5.11.33 compute_prediction IsInterIntra arm — LIFTED r300 (dispatcher now emits the intra-half + inter tasks); variant retained for API stability, no longer constructed"
             ),
             Self::ComputePredictionIntraModeUnsupported => write!(
                 f,
