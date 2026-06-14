@@ -15935,6 +15935,144 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// §7.11.3.1 compound (≥2-ref) inter pixel reconstruction against the
+    /// walker's own tracked `CurrFrame[plane]` buffer (av1-spec p.258 line
+    /// 14402 final stitch: `isCompound == 1 ⇒ CurrFrame[plane][y+i][x+j] =
+    /// <step-14 combine>`).
+    ///
+    /// This is the two-reference companion to
+    /// [`Self::reconstruct_inter_block_into_curr_frame`]: rather than the
+    /// single `preds[0]` overwrite, the §7.11.3.1 step-14 combine merges
+    /// `preds[0]` and `preds[1]` through the decoded `compound_type` arm
+    /// ([`crate::COMPOUND_AVERAGE`] / [`crate::COMPOUND_DISTANCE`] /
+    /// [`crate::COMPOUND_WEDGE`] / [`crate::COMPOUND_DIFFWTD`]) and
+    /// **overwrites** the `w × h` footprint with the combined, `Clip1`-ed
+    /// result. As with single-ref there is no intra-half prerequisite, so
+    /// the bridge **allocates** the plane buffer if it has not been touched
+    /// yet (the full-frame extent the §7.12.3 step-3 merge would otherwise
+    /// lazily allocate, sized from `MiRows × MiCols × MI_SIZE >>
+    /// subsampling_*`).
+    ///
+    /// The bridge threads the decoded compound mode-info (`mode_info` = the
+    /// §7.11.3.1 step-5/-8 `(RefFrame[0], RefFrame[1], Mvs[..][0],
+    /// Mvs[..][1])` quad plus the `compound_type` and its side-data), the
+    /// §7.11.3.15 order-hint context (`order_hints` — used only by the
+    /// [`crate::COMPOUND_DISTANCE`] arm), the caller-supplied §7.11.3.3
+    /// reference state (`ref_spec`), and the §7.11.3.2 interpolation-filter
+    /// pair through the shared
+    /// [`crate::inter_pred::reconstruct_inter_block_compound`] driver, then
+    /// writes the (post-`Clip1`, in-range) result back into the walker's
+    /// `i32` `curr_frame` buffer.
+    ///
+    /// The [`crate::COMPOUND_DIFFWTD`] arm's §7.11.3.12 mask is derived
+    /// inside the driver from the two formed `preds[]` at `plane == 0`. For
+    /// a single (luma) bridge call the bridge materializes the persistent
+    /// luma-grid mask buffer locally (sized `w × h`, the luma block extent
+    /// at `plane == 0`); a multi-plane caller threading one block's chroma
+    /// planes through the per-block driver directly owns the cross-plane
+    /// buffer instead (this bridge reconstructs one plane per call).
+    ///
+    /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
+    /// samples; `w` / `h` are its plane-space size. The walker buffer is
+    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
+    /// mirrors the plane buffer to `u16`, drives the block, and copies the
+    /// result back as `i32` (lossless both directions). Only the `w × h`
+    /// write footprint changes.
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
+    /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
+    /// that would overflow the (allocated) plane buffer, or anything
+    /// [`crate::inter_pred::reconstruct_inter_block_compound`] itself
+    /// rejects (an `INTRA_FRAME`/out-of-range `RefFrame[0]`/`RefFrame[1]`,
+    /// an out-of-range resolved `refIdx`, an unsupported `compound_type`, a
+    /// `COMPOUND_WEDGE` leaf with `wedge == None`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_inter_block_compound_into_curr_frame(
+        &mut self,
+        mode_info: crate::inter_pred::CompoundInterModeInfo,
+        order_hints: crate::inter_pred::CompoundOrderHintContext,
+        ref_frame_idx: &[u8],
+        ref_spec: &crate::PlaneRefSpec<'_>,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+        bit_depth: u8,
+        interp_filter_x: u8,
+        interp_filter_y: u8,
+    ) -> Result<(), crate::Error> {
+        let p = ref_spec.plane as usize;
+        if p >= 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // Allocate the plane buffer if this compound block is the first
+        // writer on the plane (compound overwrites the `w × h` footprint —
+        // no intra-half prerequisite, identical to the single-ref bridge).
+        let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
+        let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
+        self.ensure_curr_frame_plane(p, rows, cols);
+        let Some(cp) = self.curr_frame[p].as_ref() else {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        };
+        let buf_cols = cp.cols as usize;
+        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
+        // samples are post-`Clip1` so the `i32 → u16` narrowing is
+        // lossless.
+        let mut mirror: Vec<u16> = Vec::new();
+        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+
+        // §7.11.3.12 DIFFWTD persistent luma-grid mask — for a single
+        // (luma) bridge call the mask buffer is `w × h`. The driver fills
+        // it at `plane == 0`; on the non-DIFFWTD arms it is unused, so it
+        // is only allocated when needed.
+        let mut diffwtd_mask: Vec<u8> = Vec::new();
+        let diffwtd_arg: Option<&mut [u8]> = if mode_info.compound_type == crate::COMPOUND_DIFFWTD {
+            if diffwtd_mask.try_reserve_exact(w * h).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            diffwtd_mask.resize(w * h, 0);
+            Some(diffwtd_mask.as_mut_slice())
+        } else {
+            None
+        };
+
+        // Drive the compound reconstruction; the step-14 combine + final
+        // stitch overwrites the `w × h` footprint at `(x, y)`.
+        crate::inter_pred::reconstruct_inter_block_compound(
+            mode_info,
+            order_hints,
+            ref_frame_idx,
+            ref_spec.frame_store,
+            ref_spec.plane,
+            x,
+            y,
+            w,
+            h,
+            bit_depth,
+            ref_spec.subsampling_x,
+            ref_spec.subsampling_y,
+            ref_spec.frame_width,
+            ref_spec.frame_height,
+            interp_filter_x,
+            interp_filter_y,
+            diffwtd_arg,
+            mirror.as_mut_slice(),
+            buf_cols,
+        )?;
+
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffer.
+        if let Some(cp) = self.curr_frame[p].as_mut() {
+            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                *dst = src as i32;
+            }
+        }
+        Ok(())
+    }
+
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
     /// row-major: `skips()[ r * MiCols + c ]`. Cells that no leaf
     /// covered carry `0` (the §5.11.11 [`Self::decode_skip`] writer
@@ -55164,6 +55302,280 @@ mod tests {
         assert!(matches!(
             w3.reconstruct_inter_block_into_curr_frame(
                 intra_mode,
+                &ref_frame_idx,
+                &good_spec,
+                0,
+                0,
+                8,
+                8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r305 §7.11.3.1 compound end-to-end: the walker bridge
+    /// [`PartitionWalker::reconstruct_inter_block_compound_into_curr_frame`]
+    /// must drive the two-reference `COMPOUND_AVERAGE` step-14 combine
+    /// (`CurrFrame[plane][y+i][x+j] = Clip1(Round2(preds[0] + preds[1],
+    /// 1))`) into the walker's own tracked `CurrFrame[plane]` buffer
+    /// byte-for-byte identically to the per-block
+    /// [`crate::inter_pred::reconstruct_inter_block_compound`] driver — i.e.
+    /// the walker now reconstructs one compound inter block's pixels inline.
+    /// The plane buffer is allocated by the bridge (compound overwrites; no
+    /// intra-half prerequisite).
+    #[test]
+    fn r305_walker_reconstructs_compound_average_inter_block_pixels() {
+        use crate::inter_pred::{
+            reconstruct_inter_block_compound, CompoundInterModeInfo, CompoundOrderHintContext,
+            EIGHTTAP,
+        };
+        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+
+        // Two §7.11.3.3 reference frames (one plane each, 16×16) with
+        // distinct content so the two predictions genuinely differ.
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp0 = vec![0u16; ref_h * stride];
+        let mut refp1 = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp0[r * stride + c] = ((r * 9 + c * 5 + 1) & 0xFF) as u16;
+                refp1[r * stride + c] = ((r * 3 + c * 11 + 7) & 0xFF) as u16;
+            }
+        }
+        let e0 = RefFrameStoreEntry {
+            plane: &refp0[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let e1 = RefFrameStoreEntry {
+            plane: &refp1[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        // refp0 at slot 0, refp1 at slot 3; LAST→0, ALTREF→3.
+        let store = [e0, e0, e0, e1];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 3];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let altref = crate::uncompressed_header_tail::ALTREF_FRAME as u8;
+
+        let mode_info = CompoundInterModeInfo {
+            ref_frame_0: last,
+            ref_frame_1: altref,
+            mv0: [0, 4],
+            mv1: [8, 0],
+            compound_type: COMPOUND_AVERAGE,
+            wedge: None,
+            mask_type: 0,
+        };
+        let order_hints = CompoundOrderHintContext {
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hint_ref0: 0,
+            order_hint_ref1: 0,
+        };
+        let curr_w = 8usize;
+        let curr_h = 8usize;
+
+        // Per-block oracle into a fresh 8×8 buffer at origin (0, 0) with
+        // the SAME stride the walker buffer will have (8 columns).
+        let mut oracle = vec![0u16; curr_w * curr_h];
+        reconstruct_inter_block_compound(
+            mode_info,
+            order_hints,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            None,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        // Fresh walker: curr_frame[0] is unallocated. The compound bridge
+        // must allocate it (no intra-half prerequisite).
+        assert!(walker.curr_frame(0).is_none());
+
+        let ref_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        };
+
+        walker
+            .reconstruct_inter_block_compound_into_curr_frame(
+                mode_info,
+                order_hints,
+                &ref_frame_idx,
+                &ref_spec,
+                0,
+                0,
+                curr_w,
+                curr_h,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("walker compound reconstruction");
+
+        let (rows, cols) = walker.curr_frame_dims(0).unwrap();
+        assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
+        let got: Vec<u16> = walker
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(
+            got, oracle,
+            "the walker bridge must reconstruct compound pixels identically to the per-block driver"
+        );
+        assert!(got.iter().any(|&s| s != 0), "compound MC must write pixels");
+    }
+
+    /// r305 compound bridge guards: an out-of-range plane, a negative
+    /// origin, and an `INTRA_FRAME` `RefFrame[1]` (rejected by
+    /// [`crate::inter_pred::reconstruct_inter_block_compound`]) are all
+    /// caller bugs surfaced as [`crate::Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn r305_walker_compound_bridge_guards() {
+        use crate::inter_pred::{CompoundInterModeInfo, CompoundOrderHintContext, EIGHTTAP};
+        use crate::{PlaneRefSpec, RefFrameStoreEntry, COMPOUND_AVERAGE};
+
+        let refp = vec![0u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let altref = crate::uncompressed_header_tail::ALTREF_FRAME as u8;
+
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let order_hints = CompoundOrderHintContext {
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hint_ref0: 0,
+            order_hint_ref1: 0,
+        };
+        let good_mode = CompoundInterModeInfo {
+            ref_frame_0: last,
+            ref_frame_1: altref,
+            mv0: [0, 0],
+            mv1: [0, 0],
+            compound_type: COMPOUND_AVERAGE,
+            wedge: None,
+            mask_type: 0,
+        };
+
+        // Out-of-range plane.
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let bad_plane = PlaneRefSpec {
+            plane: 3,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        assert!(matches!(
+            w.reconstruct_inter_block_compound_into_curr_frame(
+                good_mode,
+                order_hints,
+                &ref_frame_idx,
+                &bad_plane,
+                0,
+                0,
+                8,
+                8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        let good_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+
+        // Negative origin (rejected by reconstruct_inter_block_compound).
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(matches!(
+            w2.reconstruct_inter_block_compound_into_curr_frame(
+                good_mode,
+                order_hints,
+                &ref_frame_idx,
+                &good_spec,
+                -1,
+                0,
+                8,
+                8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // INTRA_FRAME RefFrame[1] (0): not a compound inter reference.
+        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
+        let intra_ref1 = CompoundInterModeInfo {
+            ref_frame_0: last,
+            ref_frame_1: 0,
+            mv0: [0, 0],
+            mv1: [0, 0],
+            compound_type: COMPOUND_AVERAGE,
+            wedge: None,
+            mask_type: 0,
+        };
+        assert!(matches!(
+            w3.reconstruct_inter_block_compound_into_curr_frame(
+                intra_ref1,
+                order_hints,
                 &ref_frame_idx,
                 &good_spec,
                 0,

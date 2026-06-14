@@ -4,6 +4,37 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r305 (2026-06-15): **§5.11.5 walker reconstructs one
+  compound (≥2-ref) inter block's pixels inline**. r304 added the
+  plain single-ref bridge; r305 adds its two-reference companion
+  (`PartitionWalker::reconstruct_inter_block_compound_into_curr_frame`)
+  for the §7.11.3.1 final-stitch `isCompound == 1` arm — the step-14
+  combine merges `preds[0]` and `preds[1]` through the decoded
+  `compound_type` (`COMPOUND_AVERAGE` / `COMPOUND_DISTANCE` /
+  `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD`) and **overwrites** the `w × h`
+  footprint with the combined, `Clip1`-ed result (av1-spec p.258 line
+  14402). Like single-ref there is no intra-half prerequisite, so the
+  bridge **allocates** the plane buffer if untouched (mirroring the
+  §7.12.3 step-3 merge's `MiRows × MiCols × MI_SIZE >> subsampling_*`
+  extent). The bridge threads the decoded `CompoundInterModeInfo`
+  (§7.11.3.1 step-5/-8 `(RefFrame[0], RefFrame[1], Mvs[..][0],
+  Mvs[..][1])` + `compound_type` side-data), the §7.11.3.15
+  `CompoundOrderHintContext` (used only by `COMPOUND_DISTANCE`), the
+  caller-supplied §7.11.3.3 `PlaneRefSpec`, and the §7.11.3.2 filter
+  pair through the shared
+  `crate::inter_pred::reconstruct_inter_block_compound` driver, mirrors
+  the `i32` plane buffer to `u16`, drives the block, and copies the
+  (post-`Clip1`, in-range) result back as `i32` (lossless). For a
+  single (luma) bridge call the §7.11.3.12 `COMPOUND_DIFFWTD` mask
+  buffer is materialized locally (`w × h`, the luma extent at
+  `plane == 0`). Guards: a `plane >= 3`, a negative origin, and an
+  `INTRA_FRAME`/out-of-range `RefFrame[1]` all return
+  `PartitionWalkOutOfRange`. +2 lib tests (1996 → 1998): an 8×8
+  `COMPOUND_AVERAGE` luma block reconstructed through the walker bridge
+  byte-identically to the per-block
+  `reconstruct_inter_block_compound` oracle, plus the three bridge
+  guards.
+
 - decoder r304 (2026-06-14): **§5.11.5 walker reconstructs one
   plain single-ref inter block's pixels inline**. The r303 bridge
   reconstructs the §7.11.3.14 inter-intra *blend*; r304 adds its

@@ -2,6 +2,53 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-15 (round 305)
+
+Round 305 **lands inline §7.11.3.1 compound (≥2-ref) pixel
+reconstruction in the §5.11.5 walker** — the two-reference companion to
+r304's single-ref bridge. The walker now reconstructs one compound
+inter block's pixels end-to-end into its own tracked `CurrFrame[plane]`
+buffers.
+
+* **Walker bridge.** New
+  `PartitionWalker::reconstruct_inter_block_compound_into_curr_frame`
+  threads the decoded `CompoundInterModeInfo` (§7.11.3.1 step-5/-8
+  `(RefFrame[0], RefFrame[1], Mvs[..][0], Mvs[..][1])` + the
+  `compound_type` side-data), the §7.11.3.15 `CompoundOrderHintContext`
+  (used only by the `COMPOUND_DISTANCE` arm), the caller-supplied
+  §7.11.3.3 `PlaneRefSpec`, and the §7.11.3.2 interpolation-filter pair
+  through the shared
+  `crate::inter_pred::reconstruct_inter_block_compound` driver, then
+  writes the §7.11.3.1 final-stitch result (`isCompound == 1 ⇒
+  CurrFrame[plane][y+i][x+j] = <step-14 combine>`, av1-spec p.258 line
+  14402) back into the walker's `curr_frame` buffer.
+* **Step-14 combine.** The combine merges `preds[0]` and `preds[1]`
+  through the decoded `compound_type` (`COMPOUND_AVERAGE` /
+  `COMPOUND_DISTANCE` / `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD`) and
+  **overwrites** the `w × h` footprint with the combined, `Clip1`-ed
+  result. Like single-ref there is no intra-half prerequisite, so the
+  bridge **allocates** the plane buffer if untouched (mirroring the
+  §7.12.3 step-3 merge's `MiRows × MiCols × MI_SIZE >> subsampling_*`
+  extent).
+* **DIFFWTD mask.** For a single (luma) bridge call the §7.11.3.12
+  `COMPOUND_DIFFWTD` persistent luma-grid mask is materialized locally
+  (`w × h`, the luma extent at `plane == 0`); the driver fills it at
+  `plane == 0` and (in a multi-plane caller) reuses it for chroma.
+* **Buffer narrowing.** Same `i32 ⇄ u16` mirror round-trip as the
+  single-ref bridge — lossless both directions; only the `w × h`
+  footprint changes.
+* **Guards.** A `plane >= 3`, a negative origin, and an
+  `INTRA_FRAME`/out-of-range `RefFrame[1]` all return
+  `PartitionWalkOutOfRange`.
+* **Scope.** Single compound leaf at a known origin, one plane per
+  call; the full §5.11.33 frame-walk wiring into the parser's
+  superblock loop, and OBMC / warp interactions, remain out of scope.
+
++2 lib tests (1996 → 1998): an 8×8 `COMPOUND_AVERAGE` luma inter block
+reconstructed through the walker bridge byte-identically to the
+per-block `reconstruct_inter_block_compound` oracle, and the three
+bridge guards.
+
 ## Status — 2026-06-14 (round 304)
 
 Round 304 **lands inline §7.11.3.1 single-ref pixel reconstruction in
