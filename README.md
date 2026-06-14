@@ -2,6 +2,44 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 298)
+
+Round 298 **adds the `wedge_interintra == 1` sub-arm to the §7.11.3.1
+inter-intra blend** — the wedge variant of the r297 single-ref
+inter-intra path. When `wedge_interintra == 1` the spec sets
+`compound_type == COMPOUND_WEDGE` (av1-spec p.80 line 5017), so the
+§7.11.3.14 mask is the §7.11.3.11 *luma-grid* wedge mask (with
+`wedge_sign == 0` fixed by §5.11.28, p.79 line 4965) rather than the
+§7.11.3.13 intra-variant mask.
+
+* **Luma-grid wedge mask + chroma downsampling.** The wedge mask is
+  built once at `plane == 0` (av1-spec p.258 line 14386), then read by
+  `mask_blend_interintra` with the current plane's `(subX, subY)`
+  averaging. Unlike the non-wedge interintra arm, the §7.11.3.14
+  `(interintra && !wedge_interintra)` short-circuit (p.284 line 15773)
+  does **not** fire here, so chroma planes apply the same 1-D / 2-D
+  `Round2` mask averaging the inter-inter masks use.
+* **API shape.** `InterIntraParams` gains a `wedge:
+  Option<WedgeInterIntraInfo>` field — `None` selects the §7.11.3.13
+  non-wedge path (unchanged), `Some(_)` carries the caller-built
+  luma-grid wedge `mask` + `mask_stride`. `mask_blend_interintra` gains
+  `(sub_x, sub_y, mask_stride)` so it can downsample the luma-grid mask
+  for chroma; the non-wedge call passes `(0, 0, 0)` (bit-identical to
+  r297).
+* **Still deferred.** The §5.11.33 frame-walk inter-intra leaf — the
+  walker still skips `RefFrame[1] == INTRA_FRAME` cells and the
+  §5.11.30 dispatcher gate still surfaces
+  `ComputePredictionInterIntraUnsupported`. OBMC / warp inter-intra
+  interactions are out of scope here.
+
++2 lib tests net (1985 → 1987): a luma-plane wedge inter-intra driver
+test cross-checked against a standalone `predict_inter_one_ref` →
+`wedge_mask` → `mask_blend_interintra` composition (and shown to differ
+from the non-wedge blend on the same seed), plus a 4:2:0 chroma-plane
+test proving the luma-grid mask is downsampled with `(subX, subY) ==
+(1, 1)` 4-tap averaging (cross-checked against a hand-downsampled
+non-subsampled blend).
+
 ## Status — 2026-06-14 (round 297)
 
 Round 297 **wires the §7.11.3.1 `IsInterIntra == 1` arm into the

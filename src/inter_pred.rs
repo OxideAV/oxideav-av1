@@ -1037,20 +1037,55 @@ pub enum CompoundParams<'a> {
 /// ([`mask_blend_interintra`]).
 ///
 /// This descriptor carries the §5.11.28 `interintra_mode` that selects
-/// the §7.11.3.13 [`intra_mode_variant_mask`] variant. The
-/// `wedge_interintra == 1` sub-arm (whose mask is the §7.11.3.11
-/// wedge mask, with chroma subsampling per av1-spec p.284 line 15773)
-/// is **not** carried here: this round wires only the non-wedge
-/// (`COMPOUND_INTRA`) interintra path, where §7.11.3.14 reads the mask
-/// directly at `Mask[y][x]` (the `(interintra && !wedge_interintra)`
-/// branch) so the §7.11.3.13 per-plane mask needs no downsampling.
+/// the §7.11.3.13 [`intra_mode_variant_mask`] variant, plus the optional
+/// `wedge_interintra == 1` sub-arm payload:
+///
+/// * **Non-wedge** (`wedge == None`, `wedge_interintra == 0`). The mask
+///   is the §7.11.3.13 [`intra_mode_variant_mask`] output for
+///   `interintra_mode`; §7.11.3.14 reads it directly at `Mask[y][x]`
+///   (the `(interintra && !wedge_interintra)` branch, av1-spec p.284
+///   line 15773) so no chroma downsampling is needed.
+/// * **Wedge** (`wedge == Some(_)`, `wedge_interintra == 1`). The mask
+///   is the §7.11.3.11 luma-grid wedge mask (`wedge_index`, `wedge_sign
+///   == 0` per av1-spec p.79 line 4965), built once at `plane == 0` and
+///   read with `(subX, subY)` averaging for the chroma planes
+///   (av1-spec p.284 line 15773's predicate does **not** short-circuit
+///   when `wedge_interintra == 1`). `interintra_mode` still selects the
+///   §7.11.2 *intra* prediction the caller writes into `dst`, but the
+///   §7.11.3.13 mask is not used on this arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InterIntraParams {
+pub struct InterIntraParams<'a> {
     /// §5.11.28 `interintra_mode` (`II_DC_PRED` / `II_V_PRED` /
     /// `II_H_PRED` / `II_SMOOTH_PRED`, i.e. `0..=3`) — selects the
     /// §7.11.3.13 [`intra_mode_variant_mask`] variant whose per-plane
-    /// `w × h` `Mask` the §7.11.3.14 body blends with.
+    /// `w × h` `Mask` the §7.11.3.14 body blends with on the non-wedge
+    /// arm. (On the wedge arm the §7.11.3.13 mask is unused; only the
+    /// §7.11.2 intra prediction it ultimately drives matters.)
     pub interintra_mode: u8,
+    /// `Some(_)` selects the §7.11.3.11 wedge sub-arm
+    /// (`wedge_interintra == 1`); `None` selects the §7.11.3.13
+    /// intra-variant sub-arm (`wedge_interintra == 0`).
+    pub wedge: Option<WedgeInterIntraInfo<'a>>,
+}
+
+/// §7.11.3.11 wedge sub-arm payload for [`InterIntraParams`]
+/// (`wedge_interintra == 1`).
+///
+/// The §7.11.3.1 mask-prep step builds the §7.11.3.11 wedge mask only at
+/// `plane == 0` (av1-spec p.258 line 14386), so the caller fills a single
+/// *luma-grid* mask via [`wedge_mask`] and reuses it across the per-plane
+/// [`predict_inter`] calls for one block; the chroma planes read it
+/// through [`mask_blend_interintra`]'s `(sub_x, sub_y)` averaging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WedgeInterIntraInfo<'a> {
+    /// Luma-grid wedge mask (filled by [`wedge_mask`] with
+    /// `wedge_sign == 0`, the value §5.11.28 fixes for the interintra
+    /// arm). Native extent is the *luma* block `block_w × block_h`.
+    pub mask: &'a [u8],
+    /// Row stride of `mask` in `u8`s; `0` selects the natural stride
+    /// (`block_w` at the luma plane, `2*w` at a `sub_x == 1` chroma
+    /// plane).
+    pub mask_stride: usize,
 }
 
 /// §7.11.3.1 driver — translational single-reference MC arm.
@@ -1113,12 +1148,13 @@ pub struct InterIntraParams {
 ///   `inter_intra` must be `Some(_)`; the driver forms a single inter
 ///   prediction from `refs[0]` and blends it with the §7.11.2 intra
 ///   prediction the caller already wrote into `pred_out` (the §7.11.3.14
-///   inter-intra body, [`mask_blend_interintra`]). Only the non-wedge
-///   (`COMPOUND_INTRA`, §7.11.3.13) sub-arm is wired; `wedge_interintra`
-///   is a later arc.
+///   inter-intra body, [`mask_blend_interintra`]). Both interintra
+///   sub-arms are wired: `InterIntraParams.wedge == None` selects the
+///   non-wedge (`COMPOUND_INTRA`, §7.11.3.13) mask; `Some(_)` selects
+///   the `wedge_interintra == 1` (`COMPOUND_WEDGE`, §7.11.3.11) mask.
 /// * `inter_intra` — `Some(InterIntraParams)` on the inter-intra arm
 ///   (`is_inter_intra == true`); must be `None` otherwise. Carries the
-///   §5.11.28 `interintra_mode`.
+///   §5.11.28 `interintra_mode` and the optional `wedge` sub-arm mask.
 /// * `bit_depth` — §5.5.2 frame `BitDepth` (8 / 10 / 12).
 /// * `subsampling_x` / `subsampling_y` — §5.5.2 chroma subsampling.
 /// * `frame_width` / `frame_height` — §5.9.5 current-frame
@@ -2038,7 +2074,7 @@ pub fn predict_inter(
     interp_filter_y: u8,
     refs: &[PredictInterRef<'_>],
     compound: Option<CompoundParams<'_>>,
-    inter_intra: Option<InterIntraParams>,
+    inter_intra: Option<InterIntraParams<'_>>,
     warp: Option<&WarpDriverParams>,
     obmc: Option<&ObmcParams<'_, '_>>,
     pred_out: &mut [u16],
@@ -2088,12 +2124,11 @@ pub fn predict_inter(
     // it requires `is_compound == false` and the [`InterIntraParams`]
     // side data; a caller that signals one without the other is a bug.
     //
-    // The `wedge_interintra == 1` sub-arm (§7.11.3.11 wedge mask with
-    // chroma subsampling) is not yet wired: this round drives only the
-    // non-wedge `COMPOUND_INTRA` interintra path. `InterIntraParams`
-    // does not carry a wedge flag, so reaching the driver with
-    // `is_inter_intra == true` always selects the §7.11.3.13
-    // intra-variant mask.
+    // Both interintra sub-arms are wired. `InterIntraParams.wedge`
+    // selects: `None` ⇒ the non-wedge `COMPOUND_INTRA` path (§7.11.3.13
+    // intra-variant mask, read directly at `Mask[y][x]`); `Some(_)` ⇒
+    // the `wedge_interintra == 1` path (§7.11.3.11 luma-grid wedge mask,
+    // read with `(subX, subY)` averaging for the chroma planes).
     if is_inter_intra {
         if is_compound {
             return Err(crate::Error::PartitionWalkOutOfRange);
@@ -2208,31 +2243,66 @@ pub fn predict_inter(
     // The inter-intra branch (`IsInterIntra == 1`, `isCompound == 0`)
     // takes the §7.11.3.14 inter-intra body instead: `preds[0]` is the
     // single inter prediction (pre-clip), `pred1` is the in-place intra
-    // prediction already in `pred_out`, the mask is the §7.11.3.13
-    // intra-variant mask. It is handled below the compound/single-ref
-    // split because it consumes `pred_out` on entry.
+    // prediction already in `pred_out`. The mask is the §7.11.3.13
+    // intra-variant mask on the non-wedge arm, or the §7.11.3.11
+    // luma-grid wedge mask on the `wedge_interintra == 1` arm. It is
+    // handled below the compound/single-ref split because it consumes
+    // `pred_out` on entry.
+    //
+    // SAFETY: the `is_inter_intra` guards above returned
+    // `PartitionWalkOutOfRange` unless `inter_intra.is_some()`.
     if is_inter_intra {
-        // av1-spec p.258 line 14389-14390 + p.284 lines 15784-15787:
-        // the non-wedge interintra mask is the §7.11.3.13 per-plane
-        // `w × h` intra-variant mask; the §7.11.3.14 body reads it at
-        // `Mask[y][x]` directly (no chroma downsampling on this arm).
-        // SAFETY: the `is_inter_intra` guards above returned
-        // `PartitionWalkOutOfRange` unless `inter_intra.is_some()`.
         let ii = inter_intra.expect("inter_intra checked above");
-        let mut mask = vec![0u8; w * h];
-        intra_mode_variant_mask(ii.interintra_mode, w, h, &mut mask)?;
         // `pred_out` holds the §7.11.2 intra prediction on entry
         // (`pred1 = CurrFrame[plane][y+dstY][x+dstX]`); the blend reads
         // it as `pred1` and overwrites it with the blended sample.
-        mask_blend_interintra(
-            bit_depth,
-            rv.inter_post_round,
-            &pred0,
-            w,
-            h,
-            &mask,
-            pred_out,
-        )?;
+        match ii.wedge {
+            None => {
+                // av1-spec p.258 line 14389-14390 + p.284 lines
+                // 15772-15787: the non-wedge interintra mask is the
+                // §7.11.3.13 per-plane `w × h` intra-variant mask; the
+                // §7.11.3.14 body reads it at `Mask[y][x]` directly via
+                // the `(interintra && !wedge_interintra)` predicate, so
+                // no chroma downsampling is applied (`sub_x = sub_y = 0`).
+                let mut mask = vec![0u8; w * h];
+                intra_mode_variant_mask(ii.interintra_mode, w, h, &mut mask)?;
+                mask_blend_interintra(
+                    bit_depth,
+                    rv.inter_post_round,
+                    /* sub_x */ 0,
+                    /* sub_y */ 0,
+                    &pred0,
+                    w,
+                    h,
+                    &mask,
+                    /* mask_stride */ 0,
+                    pred_out,
+                )?;
+            }
+            Some(wi) => {
+                // av1-spec p.258 line 14386 + p.80 line 5017: the
+                // wedge interintra arm sets `compound_type ==
+                // COMPOUND_WEDGE`, so the mask is the §7.11.3.11
+                // luma-grid wedge mask the caller built once at
+                // `plane == 0`. The §7.11.3.14 body reads it with the
+                // current plane's `(subX, subY)` averaging (av1-spec
+                // p.284 line 15772-15781) — the
+                // `(interintra && !wedge_interintra)` short-circuit does
+                // not fire here.
+                mask_blend_interintra(
+                    bit_depth,
+                    rv.inter_post_round,
+                    subsampling_x,
+                    subsampling_y,
+                    &pred0,
+                    w,
+                    h,
+                    wi.mask,
+                    wi.mask_stride,
+                    pred_out,
+                )?;
+            }
+        }
     } else if is_compound {
         // step 14: build preds[1] from refs[1] with the same pipeline.
         let pred1 = predict_inter_one_ref(
@@ -3114,19 +3184,44 @@ pub fn mask_blend(
 ///       Round2( m * pred1 + (64 - m) * pred0, 6 )
 /// ```
 ///
-/// Per the spec's `(!subX && !subY) || (interintra && !wedge_interintra)`
-/// branch (av1-spec p.284 line 15773), the mask is read directly at
-/// `Mask[y][x]` on the interintra path — there is no chroma
-/// subsampling averaging because the §7.11.3.13 driver produces a
-/// per-plane mask sized to the chroma plane already.
+/// Two §7.11.3.14 interintra sub-arms are distinguished by the mask's
+/// downsampling regime (av1-spec p.284 line 15773's
+/// `(!subX && !subY) || (interintra && !wedge_interintra)` predicate):
+///
+/// * **Non-wedge** (`COMPOUND_INTRA`, `wedge_interintra == 0`). The
+///   §7.11.3.13 driver produces a per-plane mask sized to the current
+///   plane already, so the `(interintra && !wedge_interintra)` clause
+///   forces `m = Mask[y][x]` on every plane — no chroma averaging.
+///   Reached with `sub_x == 0 && sub_y == 0` (the natural call shape).
+/// * **Wedge** (`wedge_interintra == 1`, which sets `compound_type ==
+///   COMPOUND_WEDGE` per av1-spec p.80 line 5017). The §7.11.3.11 wedge
+///   mask is built once on the *luma* grid (the §7.11.3.1 mask-prep step
+///   invokes it only at `plane == 0`, av1-spec p.258 line 14386), so the
+///   chroma planes read it through the same subsampling-average branches
+///   the inter-inter masks use. The `(interintra && !wedge_interintra)`
+///   exception does **not** fire here, so `(subX, subY)` selects the
+///   1-D / 2-D `Round2` averaging.
+///
+/// This function realises both: a non-subsampled call (`sub_x == 0 &&
+/// sub_y == 0`) reads `Mask[y][x]` directly (covering the non-wedge arm
+/// and the luma plane of the wedge arm); a subsampled call applies the
+/// matching §7.11.3.14 averaging over the luma-grid mask (covering the
+/// chroma planes of the wedge arm).
 ///
 /// ## Arguments
 ///
 /// * `bit_depth` — `8`, `10`, or `12`.
 /// * `inter_post_round` — `RoundingVars::inter_post_round`.
+/// * `sub_x` / `sub_y` — `0` / `1` chroma subsampling of the current
+///   plane (always `0` on the non-wedge arm and on the luma plane).
 /// * `preds0` — the inter prediction (pre-Clip), length `>= w * h`.
-/// * `w` / `h` — output region width / height in samples.
-/// * `mask` — the §7.11.3.13-produced mask, length `>= w * h`.
+/// * `w` / `h` — output region width / height in current-plane samples.
+/// * `mask` — the blending mask. On the non-subsampled call it is the
+///   per-plane `w × h` grid; on the subsampled call it is the luma-grid
+///   wedge mask whose native extent is `2*w` × `h` (`sub_x == 1`),
+///   `w` × `2*h` (`sub_y == 1`), or `2*w` × `2*h` (both).
+/// * `mask_stride` — row stride of `mask` in `u8`s; `0` selects the
+///   natural stride (`2*w` when `sub_x == 1`, else `w`).
 /// * `dst` — the in-place destination; on entry holds the §7.11.2
 ///   intra prediction (i.e. `CurrFrame[plane][y+dstY][x+dstX]`); on
 ///   exit holds the blended sample.
@@ -3134,31 +3229,75 @@ pub fn mask_blend(
 /// ## Returns
 ///
 /// `Ok(())` on success. [`crate::Error::PartitionWalkOutOfRange`] for
-/// caller-bug arguments.
+/// caller-bug arguments (invalid `bit_depth`, `sub_* > 1`, zero extent,
+/// slice-length / stride undershoot).
 #[allow(clippy::too_many_arguments)]
 pub fn mask_blend_interintra(
     bit_depth: u8,
     inter_post_round: u32,
+    sub_x: u8,
+    sub_y: u8,
     preds0: &[i32],
     w: usize,
     h: usize,
     mask: &[u8],
+    mask_stride: usize,
     dst: &mut [u16],
 ) -> Result<(), crate::Error> {
     if !matches!(bit_depth, 8 | 10 | 12) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if sub_x > 1 || sub_y > 1 {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     if w == 0 || h == 0 {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let n = w * h;
-    if preds0.len() < n || mask.len() < n || dst.len() < n {
+    if preds0.len() < n || dst.len() < n {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // The luma-grid mask's native extent depends on the current plane's
+    // subsampling; `mask_stride == 0` selects the natural row stride.
+    let mask_w = if sub_x == 1 { 2 * w } else { w };
+    let mask_h = if sub_y == 1 { 2 * h } else { h };
+    let stride = if mask_stride == 0 {
+        mask_w
+    } else {
+        mask_stride
+    };
+    if stride < mask_w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if mask.len() < stride * (mask_h - 1) + mask_w {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let max: i32 = (1i32 << bit_depth) - 1;
     for y in 0..h {
         for x in 0..w {
-            let m: i64 = mask[y * w + x] as i64;
+            // av1-spec p.284 lines 15772-15781: the wedge interintra
+            // mask is the luma-grid wedge mask, so `(subX, subY)`
+            // selects the same 1-D / 2-D `Round2` averaging the
+            // inter-inter masks use; the non-wedge arm always reaches
+            // the `m = Mask[y][x]` branch via `sub_x == 0 && sub_y == 0`.
+            let m: i64 = match (sub_x, sub_y) {
+                (0, 0) => mask[y * stride + x] as i64,
+                (1, 0) => round2(
+                    mask[y * stride + 2 * x] as i64 + mask[y * stride + 2 * x + 1] as i64,
+                    1,
+                ),
+                (0, 1) => round2(
+                    mask[2 * y * stride + x] as i64 + mask[(2 * y + 1) * stride + x] as i64,
+                    1,
+                ),
+                _ => round2(
+                    mask[2 * y * stride + 2 * x] as i64
+                        + mask[2 * y * stride + 2 * x + 1] as i64
+                        + mask[(2 * y + 1) * stride + 2 * x] as i64
+                        + mask[(2 * y + 1) * stride + 2 * x + 1] as i64,
+                    2,
+                ),
+            };
             let raw_pred0 = preds0[y * w + x] as i64;
             // pred0 = Clip1( Round2( preds[0][y][x], InterPostRound ) )
             let clipped = clip3_i32(0, max, round2(raw_pred0, inter_post_round) as i32) as i64;
@@ -6452,10 +6591,13 @@ mod tests {
         mask_blend_interintra(
             8,
             rv.inter_post_round,
+            0,
+            0,
             &preds0,
             4,
             4,
             &mask_full,
+            0,
             &mut dst_full,
         )
         .unwrap();
@@ -6468,10 +6610,13 @@ mod tests {
         mask_blend_interintra(
             8,
             rv.inter_post_round,
+            0,
+            0,
             &preds0,
             4,
             4,
             &mask_zero,
+            0,
             &mut dst_zero,
         )
         .unwrap();
@@ -6577,6 +6722,7 @@ mod tests {
             /* compound */ None,
             Some(InterIntraParams {
                 interintra_mode: ii_mode,
+                wedge: None,
             }),
             /* warp */ None,
             /* obmc */ None,
@@ -6614,10 +6760,13 @@ mod tests {
         mask_blend_interintra(
             bit_depth,
             rv.inter_post_round,
+            0,
+            0,
             &pred0,
             w,
             h,
             &mask,
+            0,
             &mut standalone,
         )
         .unwrap();
@@ -6671,7 +6820,7 @@ mod tests {
                     is_ii: bool,
                     refs: &[PredictInterRef<'_>],
                     compound: Option<CompoundParams<'_>>,
-                    ii: Option<InterIntraParams>| {
+                    ii: Option<InterIntraParams<'_>>| {
             let mut out = vec![0u16; w * h];
             predict_inter(
                 0,
@@ -6705,7 +6854,10 @@ mod tests {
             true,
             &refs1,
             None,
-            Some(InterIntraParams { interintra_mode: 4 })
+            Some(InterIntraParams {
+                interintra_mode: 4,
+                wedge: None,
+            })
         )
         .is_err());
         // is_compound && is_inter_intra is contradictory (RefFrame[1]
@@ -6716,7 +6868,8 @@ mod tests {
             &refs2,
             Some(CompoundParams::Average),
             Some(InterIntraParams {
-                interintra_mode: II_DC_PRED
+                interintra_mode: II_DC_PRED,
+                wedge: None,
             })
         )
         .is_err());
@@ -6727,7 +6880,8 @@ mod tests {
             &refs1,
             None,
             Some(InterIntraParams {
-                interintra_mode: II_DC_PRED
+                interintra_mode: II_DC_PRED,
+                wedge: None,
             })
         )
         .is_err());
@@ -6738,10 +6892,311 @@ mod tests {
             &refs1,
             None,
             Some(InterIntraParams {
-                interintra_mode: II_DC_PRED
+                interintra_mode: II_DC_PRED,
+                wedge: None,
             })
         )
         .is_ok());
+    }
+
+    // ---------- r298 §7.11.3.1 wedge inter-intra driver arm ----------
+
+    /// §7.11.3.1 `IsInterIntra == 1` wedge sub-arm (`wedge_interintra ==
+    /// 1` ⇒ `compound_type == COMPOUND_WEDGE`, av1-spec p.80 line 5017):
+    /// the driver forms a single inter prediction from `refs[0]`, then
+    /// blends it with the in-place intra prediction through the
+    /// §7.11.3.14 inter-intra body using the §7.11.3.11 luma-grid wedge
+    /// mask. At the *luma* plane (`sub_x == sub_y == 0`) the mask is read
+    /// directly at `Mask[y][x]`. We drive `predict_inter` and reproduce
+    /// the exact composition standalone, asserting byte-equality, and
+    /// confirm the wedge mask makes the result differ from the non-wedge
+    /// (`wedge == None`) interintra blend on the same seed.
+    #[test]
+    fn r298_predict_inter_wedge_interintra_luma_matches_standalone() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 11 + c * 5) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let w = 8;
+        let h = 8;
+        let bit_depth = 8u8;
+        let intra_seed: Vec<u16> = (0..w * h).map(|k| ((k * 3) & 0xFF) as u16).collect();
+
+        // §7.11.3.11 luma-grid wedge mask for BLOCK_8X8 (mi_size 3,
+        // 2×2 4×4-units), wedge_index 5, wedge_sign 0 (the value
+        // §5.11.28 fixes for the interintra arm, av1-spec p.79 line 4965).
+        let mut wmask = vec![0u8; w * h];
+        wedge_mask(3, 2, 2, 5, 0, &mut wmask).unwrap();
+
+        // interintra_mode still selects the §7.11.2 intra prediction the
+        // caller already wrote into pred_out; the §7.11.3.13 mask is
+        // unused on the wedge arm.
+        let ii_mode = II_DC_PRED;
+
+        let mut driver_out = intra_seed.clone();
+        predict_inter(
+            /* plane */ 0,
+            /* x */ 4,
+            /* y */ 4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            /* is_compound */ false,
+            /* is_inter_intra */ true,
+            bit_depth,
+            /* subsampling_x */ 0,
+            /* subsampling_y */ 0,
+            /* frame_width */ ref_w as u32,
+            /* frame_height */ ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            /* compound */ None,
+            Some(InterIntraParams {
+                interintra_mode: ii_mode,
+                wedge: Some(WedgeInterIntraInfo {
+                    mask: &wmask,
+                    mask_stride: 0,
+                }),
+            }),
+            /* warp */ None,
+            /* obmc */ None,
+            &mut driver_out,
+        )
+        .expect("predict_inter wedge interintra arm");
+
+        // Standalone composition: refList-0 inter prediction → wedge
+        // mask → §7.11.3.14 blend over the same seed.
+        let rv = rounding_variables(bit_depth, /* is_compound */ false).unwrap();
+        let pred0 = predict_inter_one_ref(
+            &refs[0],
+            /* ref_list */ 0,
+            /* plane */ 0,
+            /* x */ 4,
+            /* y */ 4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            /* warp */ None,
+            /* effective_local_valid */ false,
+        )
+        .unwrap();
+        let mut standalone = intra_seed.clone();
+        mask_blend_interintra(
+            bit_depth,
+            rv.inter_post_round,
+            0,
+            0,
+            &pred0,
+            w,
+            h,
+            &wmask,
+            0,
+            &mut standalone,
+        )
+        .unwrap();
+        assert_eq!(driver_out, standalone);
+        assert_ne!(driver_out, intra_seed);
+
+        // The wedge mask genuinely shapes the output: a non-wedge
+        // (§7.11.3.13) interintra blend on the same seed differs.
+        let mut nonwedge = intra_seed.clone();
+        predict_inter(
+            0,
+            4,
+            4,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            false,
+            true,
+            bit_depth,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            Some(InterIntraParams {
+                interintra_mode: ii_mode,
+                wedge: None,
+            }),
+            None,
+            None,
+            &mut nonwedge,
+        )
+        .unwrap();
+        assert_ne!(
+            driver_out, nonwedge,
+            "wedge mask must shape the blend differently from the §7.11.3.13 mask"
+        );
+    }
+
+    /// §7.11.3.1 wedge inter-intra at a 4:2:0 *chroma* plane: the
+    /// §7.11.3.11 wedge mask is built once on the luma grid, then read
+    /// with the `(subX, subY) == (1, 1)` 4-tap averaging the §7.11.3.14
+    /// body applies (av1-spec p.284 lines 15778-15781 — the
+    /// `(interintra && !wedge_interintra)` short-circuit does NOT fire
+    /// on the wedge arm). We drive the chroma `predict_inter` call and
+    /// reproduce the downsampled blend standalone.
+    #[test]
+    fn r298_predict_inter_wedge_interintra_chroma_downsamples_mask() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 9 + c * 17) & 0xFF) as u16;
+            }
+        }
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        // Chroma prediction region 4×4; the luma block is 8×8, so the
+        // luma-grid wedge mask is 8×8 and the chroma plane reads it with
+        // 4-tap averaging.
+        let cw = 4;
+        let ch = 4;
+        let luma_w = 8;
+        let luma_h = 8;
+        let bit_depth = 8u8;
+        let intra_seed: Vec<u16> = (0..cw * ch).map(|k| ((k * 7 + 11) & 0xFF) as u16).collect();
+
+        let mut wmask = vec![0u8; luma_w * luma_h];
+        wedge_mask(3, 2, 2, 5, 0, &mut wmask).unwrap();
+
+        let mut driver_out = intra_seed.clone();
+        predict_inter(
+            /* plane */ 1,
+            /* x */ 0,
+            /* y */ 0,
+            cw,
+            ch,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            /* is_compound */ false,
+            /* is_inter_intra */ true,
+            bit_depth,
+            /* subsampling_x */ 1,
+            /* subsampling_y */ 1,
+            /* frame_width */ ref_w as u32,
+            /* frame_height */ ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            /* compound */ None,
+            Some(InterIntraParams {
+                interintra_mode: II_DC_PRED,
+                wedge: Some(WedgeInterIntraInfo {
+                    mask: &wmask,
+                    mask_stride: 0,
+                }),
+            }),
+            /* warp */ None,
+            /* obmc */ None,
+            &mut driver_out,
+        )
+        .expect("predict_inter wedge interintra chroma arm");
+
+        // Standalone: chroma refList-0 inter prediction, then the
+        // §7.11.3.14 `(1,1)` averaging over the luma-grid wedge mask.
+        let rv = rounding_variables(bit_depth, false).unwrap();
+        let pred0 = predict_inter_one_ref(
+            &refs[0],
+            0,
+            /* plane */ 1,
+            0,
+            0,
+            cw,
+            ch,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            1,
+            1,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            rv.inter_round0,
+            rv.inter_round1,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut standalone = intra_seed.clone();
+        mask_blend_interintra(
+            bit_depth,
+            rv.inter_post_round,
+            /* sub_x */ 1,
+            /* sub_y */ 1,
+            &pred0,
+            cw,
+            ch,
+            &wmask,
+            0,
+            &mut standalone,
+        )
+        .unwrap();
+        assert_eq!(driver_out, standalone);
+
+        // Independent oracle for the averaging: build the 4×4 chroma mask
+        // by hand (4-tap Round2 average of each 2×2 luma-mask quad) and
+        // run the non-subsampled blend over it; the two must agree.
+        let mut chroma_mask = vec![0u8; cw * ch];
+        for y in 0..ch {
+            for x in 0..cw {
+                let s = wmask[2 * y * luma_w + 2 * x] as i64
+                    + wmask[2 * y * luma_w + 2 * x + 1] as i64
+                    + wmask[(2 * y + 1) * luma_w + 2 * x] as i64
+                    + wmask[(2 * y + 1) * luma_w + 2 * x + 1] as i64;
+                chroma_mask[y * cw + x] = round2(s, 2) as u8;
+            }
+        }
+        let mut oracle = intra_seed.clone();
+        mask_blend_interintra(
+            bit_depth,
+            rv.inter_post_round,
+            0,
+            0,
+            &pred0,
+            cw,
+            ch,
+            &chroma_mask,
+            0,
+            &mut oracle,
+        )
+        .unwrap();
+        assert_eq!(
+            driver_out, oracle,
+            "chroma wedge interintra must equal a hand-downsampled non-subsampled blend"
+        );
     }
 
     // ---------- §7.11.3.15 distance_weights ----------
