@@ -2,6 +2,46 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 304)
+
+Round 304 **lands inline §7.11.3.1 single-ref pixel reconstruction in
+the §5.11.5 walker** — the plain single-ref companion to r303's
+inter-intra blend bridge. The walker now reconstructs one ordinary
+single-reference inter block's pixels end-to-end into its own tracked
+`CurrFrame[plane]` buffers.
+
+* **Walker bridge.** New
+  `PartitionWalker::reconstruct_inter_block_into_curr_frame` threads the
+  decoded `InterModeInfo` (§7.11.3.1 step-5/-8 `(RefFrame[0],
+  Mvs[..][0])`), the caller-supplied §7.11.3.3 reference state
+  (`PlaneRefSpec`), and the §7.11.3.2 interpolation-filter pair through
+  the shared `reconstruct_inter_block` driver, then writes the
+  §7.11.3.1 final-stitch result (`isCompound == 0 && IsInterIntra == 0
+  ⇒ CurrFrame[plane][y+i][x+j] = Clip1(preds[0][i][j])`, av1-spec p.258
+  line 14402) back into the walker's `curr_frame` buffer.
+* **Overwrite, not blend.** Unlike the r303 inter-intra bridge (which
+  reads an intra half already present in `CurrFrame[plane]`), the
+  single-ref final step **overwrites** the `w × h` footprint — there is
+  no intra-half prerequisite, so the bridge **allocates** the plane
+  buffer if untouched (mirroring the §7.12.3 step-3 merge's
+  `MiRows × MiCols × MI_SIZE >> subsampling_*` extent, so a later merge
+  on the same plane is a no-op).
+* **Buffer narrowing.** The walker buffers are `i32` (post-`Clip1`,
+  in-range); the driver works in `u16`. The bridge mirrors the plane to
+  `u16`, drives the block, and copies the (in-range) result back as
+  `i32` — lossless in both directions; only the `w × h` footprint
+  changes.
+* **Guards.** A `plane >= 3`, a negative origin, and an
+  `INTRA_FRAME`/out-of-range `RefFrame[0]` all return
+  `PartitionWalkOutOfRange`.
+* **Scope.** Single single-ref leaf at a known origin; the full
+  §5.11.33 frame-walk wiring into the parser's superblock loop, and
+  compound / OBMC / warp interactions, remain out of scope.
+
++2 lib tests (1994 → 1996): an 8×8 single-ref luma inter block
+reconstructed through the walker bridge byte-identically to the
+per-block `reconstruct_inter_block` oracle, and the three bridge guards.
+
 ## Status — 2026-06-14 (round 303)
 
 Round 303 **lands inline §5.11.33 inter-intra pixel reconstruction in

@@ -4,6 +4,31 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r304 (2026-06-14): **§5.11.5 walker reconstructs one
+  plain single-ref inter block's pixels inline**. The r303 bridge
+  reconstructs the §7.11.3.14 inter-intra *blend*; r304 adds its
+  plain single-ref companion
+  (`PartitionWalker::reconstruct_inter_block_into_curr_frame`) for the
+  §7.11.3.1 final-stitch arm `isCompound == 0 && IsInterIntra == 0 ⇒
+  CurrFrame[plane][y+i][x+j] = Clip1(preds[0][i][j])` (av1-spec p.258
+  line 14402). Unlike the blend (which reads an intra half already in
+  `CurrFrame[plane]`), the single-ref final step **overwrites** the
+  `w × h` footprint — so there is no intra-half prerequisite and the
+  bridge **allocates** the plane buffer if untouched (mirroring the
+  §7.12.3 step-3 merge's `MiRows × MiCols × MI_SIZE >> subsampling_*`
+  extent, so a later merge is a no-op). The bridge threads the decoded
+  `InterModeInfo` (§7.11.3.1 step-5/-8 `(RefFrame[0], Mvs[..][0])`), the
+  caller-supplied §7.11.3.3 reference state (`PlaneRefSpec` — the parser
+  does not own the decoded-picture buffer), and the §7.11.3.2 filter
+  pair through the shared `reconstruct_inter_block` driver, mirrors the
+  `i32` plane buffer to `u16`, drives the block, and copies the
+  (post-`Clip1`, in-range) result back as `i32` (lossless). Guards: a
+  `plane >= 3`, a negative origin, and an `INTRA_FRAME`/out-of-range
+  `RefFrame[0]` all return `PartitionWalkOutOfRange`. +2 lib tests
+  (1994 → 1996): an 8×8 single-ref luma inter block reconstructed
+  through the walker bridge byte-identically to the per-block
+  `reconstruct_inter_block` oracle, plus the three bridge guards.
+
 - decoder r303 (2026-06-14): **§5.11.5 walker reconstructs one
   inter-intra block's pixels inline**. The r302 surface
   (`DecodedBlock::is_inter_intra`) was verdict-only; the walker now
