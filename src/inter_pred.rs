@@ -5603,6 +5603,194 @@ pub fn reconstruct_inter_block_interintra(
     Ok(())
 }
 
+/// One decoded §5.11.33 inter-intra leaf (`RefFrame[1] == INTRA_FRAME`,
+/// `isCompound == 0`) at a known `(MiRow, MiCol)` origin — the per-block
+/// state a single inter-intra reconstruction needs, independent of how it
+/// was assembled.
+///
+/// This is the shared input to [`reconstruct_inter_intra_block`]: the
+/// §5.11.33 frame-walk ([`reconstruct_inter_frame`]) builds it by reading
+/// its `InterModeInfoGrid` slices at a leaf origin, while the §5.11.33
+/// task-dispatcher path ([`reconstruct_inter_intra_from_dispatch`]) builds
+/// it from the per-block mode-info the §5.11.23 reader already decoded.
+/// Both then drive the one [`reconstruct_inter_block_interintra`] leaf —
+/// so the two paths share a single reconstruction driver rather than each
+/// re-deriving the per-plane invocation.
+#[derive(Debug, Clone, Copy)]
+pub struct InterIntraLeaf {
+    /// §7.11.3.1 step 5 / step 8 inter side (`RefFrame[0]`, `Mvs[..][0]`)
+    /// plus the §5.11.28 `interintra_mode` and optional wedge selectors.
+    pub mode_info: InterIntraModeInfo,
+    /// `MiSize` — the luma `BLOCK_SIZES` index. Drives the per-plane write
+    /// region (`Block_Width/Height[MiSize] >> sub`) and the §7.11.3.11
+    /// luma-grid wedge mask sizing.
+    pub mi_size: usize,
+    /// §7.11.3.1 leaf origin `MiRow` (mode-info units, luma grid).
+    pub mi_row: u32,
+    /// §7.11.3.1 leaf origin `MiCol` (mode-info units, luma grid).
+    pub mi_col: u32,
+    /// §7.11.3.2 horizontal interpolation filter ordinal
+    /// (`InterpFilters[..][0]`).
+    pub interp_filter_x: u8,
+    /// §7.11.3.2 vertical interpolation filter ordinal
+    /// (`InterpFilters[..][1]`).
+    pub interp_filter_y: u8,
+}
+
+/// §5.11.33 inter-intra per-block reconstruction driver — runs the
+/// §7.11.3.14 inter-intra blend for one decoded leaf across every plane.
+///
+/// This is the single per-block inter-intra driver the §5.11.33
+/// frame-walk ([`reconstruct_inter_frame`]) and the §5.11.33
+/// task-dispatcher bridge ([`reconstruct_inter_intra_from_dispatch`]) both
+/// call. It mirrors the §5.11.33 plane loop exactly: for each plane it
+/// derives `baseX = (MiCol >> subX) * MI_SIZE`, `baseY = (MiRow >> subY) *
+/// MI_SIZE` (av1-spec p.82 lines 5135-5136), the write region `predW =
+/// Block_Width[MiSize] >> subX`, `predH = Block_Height[MiSize] >> subY`
+/// (lines 5166-5167), and invokes [`reconstruct_inter_block_interintra`]
+/// to blend the §7.11.3.14 inter half against the §7.11.2 intra
+/// prediction already present in that plane's `curr` buffer.
+///
+/// On the `wedge_interintra == 1` sub-arm the §7.11.3.11 luma-grid wedge
+/// mask is regenerated once at `plane == 0` into a per-block scratch
+/// buffer (sized to `Block_Width[MiSize] * Block_Height[MiSize]`, av1-spec
+/// p.258 line 14386) and reused for the chroma planes.
+///
+/// **The caller must have written the §7.11.2 intra prediction into each
+/// plane's `curr` buffer for this leaf's footprint before calling this
+/// driver** (av1-spec p.83 lines 5141-5163 run `predict_intra` before
+/// `predict_inter` on the `IsInterIntra` arm; p.284 line 15786 reads it
+/// back as `pred1`). This driver supplies only the inter half of the
+/// blend.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for an out-of-range
+/// `MiSize`, or for anything [`reconstruct_inter_block_interintra`] itself
+/// rejects.
+pub fn reconstruct_inter_intra_block(
+    leaf: &InterIntraLeaf,
+    ref_frame_idx: &[u8],
+    bit_depth: u8,
+    planes: &mut [PlaneReconContext<'_>],
+) -> Result<(), crate::Error> {
+    if leaf.mi_size >= crate::cdf::BLOCK_SIZES {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // §7.11.3.11 persistent luma-grid wedge mask — filled by the driver at
+    // `plane == 0` and reused for chroma (av1-spec p.258 line 14386).
+    // Sized to the *luma* block; `None` on the non-wedge arm.
+    let mut wedge_buf: Option<Vec<u8>> = if leaf.mode_info.wedge.is_some() {
+        Some(vec![
+            0u8;
+            crate::cdf::block_width(leaf.mi_size)
+                * crate::cdf::block_height(leaf.mi_size)
+        ])
+    } else {
+        None
+    };
+
+    for ctx in planes.iter_mut() {
+        let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
+        let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
+        let base_x = ((leaf.mi_col >> sub_x) * crate::cdf::MI_SIZE as u32) as i32;
+        let base_y = ((leaf.mi_row >> sub_y) * crate::cdf::MI_SIZE as u32) as i32;
+        let pred_w = crate::cdf::block_width(leaf.mi_size) >> sub_x;
+        let pred_h = crate::cdf::block_height(leaf.mi_size) >> sub_y;
+
+        reconstruct_inter_block_interintra(
+            leaf.mode_info,
+            ref_frame_idx,
+            ctx.frame_store,
+            ctx.plane,
+            base_x,
+            base_y,
+            pred_w,
+            pred_h,
+            bit_depth,
+            ctx.subsampling_x,
+            ctx.subsampling_y,
+            ctx.frame_width,
+            ctx.frame_height,
+            leaf.interp_filter_x,
+            leaf.interp_filter_y,
+            wedge_buf.as_deref_mut(),
+            ctx.curr,
+            ctx.curr_stride,
+        )?;
+    }
+    Ok(())
+}
+
+/// §5.11.33 task-dispatcher → inter-intra reconstruction bridge — threads
+/// the [`crate::cdf::PartitionWalker::compute_prediction`] dispatcher's
+/// emitted inter-intra task list into the shared
+/// [`reconstruct_inter_intra_block`] driver.
+///
+/// The §5.11.33 dispatcher emits a [`crate::cdf::ComputePredictionReadout`]
+/// whose `is_inter_intra == true` arm carries, per plane, the intra-half
+/// [`crate::cdf::PlanePredictionTask`] (the §7.11.3.14 blend's intra
+/// operand) ahead of that plane's inter tasks (av1-spec p.82-83 lines
+/// 5140-5190 — the `IsInterIntra` and `is_inter` guards are sibling and
+/// non-exclusive). The dispatcher works against the parser's running
+/// mode-info state and has no `CurrFrame[plane]` buffers; this bridge
+/// pairs that emitted readout with the pixel-level [`PlaneReconContext`]s
+/// and the per-block inter side (`RefFrame[0]`, `Mvs[..][0]`, the §5.11.28
+/// wedge selectors) the §5.11.23 reader decoded, then drives the **same**
+/// per-block [`reconstruct_inter_intra_block`] leaf the §5.11.33 frame-walk
+/// drives. The two paths therefore converge on one reconstruction driver.
+///
+/// `readout` is validated as a genuine inter-intra readout: its
+/// `is_inter_intra` flag must be set and it must carry at least one task
+/// per plane in `planes`. A readout that is not inter-intra, or whose plane
+/// coverage does not match `planes`, is a caller bug
+/// ([`crate::Error::PartitionWalkOutOfRange`]).
+///
+/// As with [`reconstruct_inter_intra_block`], the caller must already have
+/// written the §7.11.2 intra prediction (the readout's intra-half tasks)
+/// into each plane's `curr` buffer before calling this bridge.
+pub fn reconstruct_inter_intra_from_dispatch(
+    readout: &crate::cdf::ComputePredictionReadout,
+    leaf: &InterIntraLeaf,
+    ref_frame_idx: &[u8],
+    bit_depth: u8,
+    planes: &mut [PlaneReconContext<'_>],
+) -> Result<(), crate::Error> {
+    // The dispatcher must have taken the §5.11.33 `IsInterIntra` arm.
+    if !readout.is_inter_intra {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // The readout must cover at least the planes we are reconstructing: the
+    // §5.11.33 inter-intra arm emits one intra-half task per visited plane,
+    // so `num_planes_visited` is the plane count the dispatcher saw. A
+    // shorter coverage than the supplied `planes` is a caller bug (the two
+    // paths disagree on `HasChroma`).
+    if (readout.num_planes_visited as usize) < planes.len() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // Every plane we drive must carry its intra-half task in the readout
+    // (the §7.11.3.14 blend's intra operand the caller wrote into `curr`).
+    // The intra-half task's `mode` is the §5.11.33 `interintra_mode → mode`
+    // translation; the leaf's `interintra_mode` must agree with it so the
+    // dispatcher's emitted intra half and this bridge's inter half describe
+    // the same block.
+    let expected_intra_mode = match leaf.mode_info.interintra_mode {
+        II_V_PRED => crate::cdf::V_PRED as u8,
+        II_H_PRED => crate::cdf::H_PRED as u8,
+        II_DC_PRED => crate::cdf::DC_PRED as u8,
+        _ => crate::cdf::SMOOTH_PRED as u8,
+    };
+    for ctx in planes.iter() {
+        let intra_half = readout
+            .tasks
+            .iter()
+            .find(|t| t.plane == ctx.plane && t.mode == expected_intra_mode);
+        if intra_half.is_none() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+    }
+
+    reconstruct_inter_intra_block(leaf, ref_frame_idx, bit_depth, planes)
+}
+
 // =====================================================================
 // r293 §5.11.33 predict() / §7.11.3 frame-level inter reconstruction
 // =====================================================================
@@ -5961,62 +6149,29 @@ pub fn reconstruct_inter_frame(
                 // leaf's footprint before invoking `reconstruct_inter_frame`.
                 let ii_mode = grid.interintra_modes[origin];
                 let wedge_on = grid.wedge_interintras[origin] != 0;
-                let mode_info = InterIntraModeInfo {
-                    ref_frame: ref_frame0 as u8,
-                    mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
-                    interintra_mode: ii_mode,
-                    wedge: if wedge_on {
-                        Some(InterIntraWedgeModeInfo {
-                            mi_size,
-                            wedge_index: grid.interintra_wedge_indices[origin],
-                        })
-                    } else {
-                        None
+                let leaf = InterIntraLeaf {
+                    mode_info: InterIntraModeInfo {
+                        ref_frame: ref_frame0 as u8,
+                        mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
+                        interintra_mode: ii_mode,
+                        wedge: if wedge_on {
+                            Some(InterIntraWedgeModeInfo {
+                                mi_size,
+                                wedge_index: grid.interintra_wedge_indices[origin],
+                            })
+                        } else {
+                            None
+                        },
                     },
+                    mi_size,
+                    mi_row: mi_row as u32,
+                    mi_col: mi_col as u32,
+                    interp_filter_x: interp_x,
+                    interp_filter_y: interp_y,
                 };
-                // §7.11.3.11 persistent luma-grid wedge mask — filled by
-                // the driver at `plane == 0` and reused for chroma
-                // (av1-spec p.258 line 14386). Sized to the *luma* block;
-                // `None` on the non-wedge arm.
-                let mut wedge_buf: Option<Vec<u8>> = if wedge_on {
-                    Some(vec![
-                        0u8;
-                        crate::cdf::block_width(mi_size)
-                            * crate::cdf::block_height(mi_size)
-                    ])
-                } else {
-                    None
-                };
-
-                for ctx in planes.iter_mut() {
-                    let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
-                    let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
-                    let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
-                    let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
-                    let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
-                    let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
-
-                    reconstruct_inter_block_interintra(
-                        mode_info,
-                        ref_frame_idx,
-                        ctx.frame_store,
-                        ctx.plane,
-                        base_x,
-                        base_y,
-                        pred_w,
-                        pred_h,
-                        grid.bit_depth,
-                        ctx.subsampling_x,
-                        ctx.subsampling_y,
-                        ctx.frame_width,
-                        ctx.frame_height,
-                        interp_x,
-                        interp_y,
-                        wedge_buf.as_deref_mut(),
-                        ctx.curr,
-                        ctx.curr_stride,
-                    )?;
-                }
+                // The §5.11.33 frame-walk and the §5.11.33 task-dispatcher
+                // bridge share this one per-block inter-intra driver.
+                reconstruct_inter_intra_block(&leaf, ref_frame_idx, grid.bit_depth, planes)?;
                 continue;
             }
 
@@ -13523,5 +13678,214 @@ mod tests {
             wedge, non_wedge,
             "the §7.11.3.11 wedge mask must produce a different blend from the §7.11.3.13 mask"
         );
+    }
+
+    /// r301 §5.11.33 task-dispatcher → reconstruction bridge: a dispatcher
+    /// readout (`is_inter_intra == true`, one intra-half task per plane)
+    /// threaded through [`reconstruct_inter_intra_from_dispatch`] must drive
+    /// the §7.11.3.14 blend byte-for-byte identically to both the
+    /// per-block [`reconstruct_inter_block_interintra`] driver and the
+    /// §5.11.33 frame-walk — proving the two paths share one driver.
+    #[test]
+    fn r301_dispatch_bridge_drives_interintra_like_frame_walk() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 13 + c * 7) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        const BLOCK_8X8: usize = 3;
+        let ii_mode = II_H_PRED;
+        let mv = [4i16, 6];
+        let curr_w = 8usize;
+        let curr_h = 8usize;
+        let mut seed = vec![0u16; curr_w * curr_h];
+        for i in 0..curr_h {
+            for j in 0..curr_w {
+                seed[i * curr_w + j] = ((i * 5 + j * 11 + 3) & 0xFF) as u16;
+            }
+        }
+
+        let leaf = InterIntraLeaf {
+            mode_info: InterIntraModeInfo {
+                ref_frame: last,
+                mv,
+                interintra_mode: ii_mode,
+                wedge: None,
+            },
+            mi_size: BLOCK_8X8,
+            mi_row: 0,
+            mi_col: 0,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+        };
+
+        // Oracle: the per-block driver on the seed.
+        let mut oracle = seed.clone();
+        reconstruct_inter_block_interintra(
+            leaf.mode_info,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            None,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        // The dispatcher's emitted readout for the same block: the
+        // §5.11.33 `IsInterIntra` arm emits one intra-half task per plane
+        // (mode == II_H_PRED → H_PRED) ahead of the inter tasks. Here the
+        // block is luma-only (one plane). `start_*` / `log2_*` mirror the
+        // §5.11.33 plane-0 geometry.
+        let readout = crate::cdf::ComputePredictionReadout {
+            is_inter_intra: true,
+            is_inter: true,
+            num_planes_visited: 1,
+            tasks: vec![crate::cdf::PlanePredictionTask {
+                plane: 0,
+                start_x: 0,
+                start_y: 0,
+                log2_w: 3,
+                log2_h: 3,
+                mode: crate::cdf::H_PRED as u8, // II_H_PRED → H_PRED
+                have_left: false,
+                have_above: false,
+            }],
+        };
+
+        let mut bridged = seed.clone();
+        {
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut bridged,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_intra_from_dispatch(&readout, &leaf, &ref_frame_idx, 8, &mut planes)
+                .expect("dispatch-bridge inter-intra reconstruction");
+        }
+
+        assert_eq!(
+            bridged, oracle,
+            "the dispatch bridge must drive the shared inter-intra driver identically to the per-block driver"
+        );
+        assert_ne!(bridged, seed, "the inter-intra blend must modify the plane");
+    }
+
+    /// r301 dispatch-bridge guards: a non-inter-intra readout, a plane
+    /// coverage shorter than the supplied planes, and a readout whose
+    /// intra-half mode disagrees with the leaf's `interintra_mode` are all
+    /// caller bugs.
+    #[test]
+    fn r301_dispatch_bridge_rejects_inconsistent_readout() {
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let refp = vec![7u16; ref_h * ref_w];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: ref_w,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        const BLOCK_8X8: usize = 3;
+
+        let leaf = InterIntraLeaf {
+            mode_info: InterIntraModeInfo {
+                ref_frame: last,
+                mv: [0, 0],
+                interintra_mode: II_DC_PRED,
+                wedge: None,
+            },
+            mi_size: BLOCK_8X8,
+            mi_row: 0,
+            mi_col: 0,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+        };
+        let mk_task = |mode: u8| crate::cdf::PlanePredictionTask {
+            plane: 0,
+            start_x: 0,
+            start_y: 0,
+            log2_w: 3,
+            log2_h: 3,
+            mode,
+            have_left: false,
+            have_above: false,
+        };
+
+        // (1) `is_inter_intra == false`.
+        let not_ii = crate::cdf::ComputePredictionReadout {
+            is_inter_intra: false,
+            is_inter: true,
+            num_planes_visited: 1,
+            tasks: vec![mk_task(crate::cdf::DC_PRED as u8)],
+        };
+        // (2) plane coverage shorter than the supplied planes.
+        let short_cov = crate::cdf::ComputePredictionReadout {
+            is_inter_intra: true,
+            is_inter: true,
+            num_planes_visited: 0,
+            tasks: vec![],
+        };
+        // (3) intra-half mode disagrees with the leaf's interintra_mode
+        // (leaf says II_DC_PRED → DC_PRED, readout carries H_PRED).
+        let mode_mismatch = crate::cdf::ComputePredictionReadout {
+            is_inter_intra: true,
+            is_inter: true,
+            num_planes_visited: 1,
+            tasks: vec![mk_task(crate::cdf::H_PRED as u8)],
+        };
+
+        for bad in [&not_ii, &short_cov, &mode_mismatch] {
+            let mut curr = vec![0u16; 8 * 8];
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr,
+                curr_stride: 8,
+            }];
+            assert!(matches!(
+                reconstruct_inter_intra_from_dispatch(bad, &leaf, &ref_frame_idx, 8, &mut planes),
+                Err(crate::Error::PartitionWalkOutOfRange)
+            ));
+        }
     }
 }

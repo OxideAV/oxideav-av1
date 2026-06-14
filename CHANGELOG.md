@@ -4,6 +4,37 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r301 (2026-06-14): **unify the §5.11.33 inter-intra
+  reconstruction onto one per-block driver**. New
+  `reconstruct_inter_intra_block` takes one `InterIntraLeaf` (the
+  per-block `RefFrame[0]` / `Mvs[..][0]` / §5.11.28 `interintra_mode`
+  + optional wedge selectors, the `MiSize`, the `(MiRow, MiCol)` leaf
+  origin, and the two interp filters) and runs the §5.11.33 plane loop
+  (`baseX = (MiCol >> subX) * MI_SIZE`, `predW = Block_Width[MiSize] >>
+  subX`, av1-spec p.82-83 lines 5135-5167), regenerating the §7.11.3.11
+  luma-grid wedge mask once at `plane == 0`. `reconstruct_inter_frame`'s
+  inter-intra arm is refactored to build an `InterIntraLeaf` and call
+  this shared driver — its duplicated per-plane loop is removed. New
+  `reconstruct_inter_intra_from_dispatch` threads the §5.11.33
+  task-dispatcher's emitted `ComputePredictionReadout`
+  (`is_inter_intra == true`, one intra-half task per plane) into the same
+  shared driver: it validates the readout against the supplied planes
+  (inter-intra flag set, plane coverage ≥ planes, each plane's intra-half
+  task `mode` agreeing with the leaf's `interintra_mode → mode`
+  translation) before invoking `reconstruct_inter_intra_block`. The
+  task-dispatcher path and the frame-walk path now converge on one
+  reconstruction driver. `InterIntraLeaf`,
+  `reconstruct_inter_intra_block`, `reconstruct_inter_intra_from_dispatch`,
+  `reconstruct_inter_block_interintra`, `InterIntraModeInfo`, and
+  `InterIntraWedgeModeInfo` are re-exported at the crate root. The
+  §5.11.5 syntax walker tracks no `CurrFrame[plane]` buffers, so the
+  parser cannot yet invoke the pixel-level bridge inline
+  (`decode_block_syntax_inter_arm` still discards the readout); OBMC /
+  warp inter-intra interactions remain out of scope. +2 lib tests
+  (1990 → 1992): the dispatch bridge driving the shared driver
+  byte-identically to the per-block driver, and the bridge's three
+  caller-bug guards.
+
 - decoder r300 (2026-06-14): lift the §5.11.30 / §5.11.33
   task-dispatcher **inter-intra gate** in `PartitionWalker::
   compute_prediction`. The dispatcher previously returned

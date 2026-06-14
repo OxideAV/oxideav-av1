@@ -2,6 +2,44 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 301)
+
+Round 301 **unifies the §5.11.33 inter-intra reconstruction onto one
+per-block driver** — the r300 followup's named candidate. The r299
+frame-walk and the r300 task-dispatcher previously each owned their own
+per-plane invocation of `reconstruct_inter_block_interintra`; they now
+both reach it through the single `reconstruct_inter_intra_block` leaf.
+
+* **Shared per-block driver.** `reconstruct_inter_intra_block` takes one
+  `InterIntraLeaf` (the per-block `RefFrame[0]` / `Mvs[..][0]` / §5.11.28
+  `interintra_mode` + optional wedge selectors, the `MiSize`, the leaf
+  `(MiRow, MiCol)` origin, and the two interp filters) and runs the
+  §5.11.33 plane loop (`baseX = (MiCol >> subX) * MI_SIZE`, `predW =
+  Block_Width[MiSize] >> subX`, av1-spec p.82-83 lines 5135-5167),
+  regenerating the §7.11.3.11 luma-grid wedge mask once at `plane == 0`.
+  `reconstruct_inter_frame`'s inter-intra arm is refactored to build an
+  `InterIntraLeaf` and call it — the duplicated per-plane loop is gone.
+* **Dispatcher bridge.** `reconstruct_inter_intra_from_dispatch` threads
+  the §5.11.33 task-dispatcher's emitted `ComputePredictionReadout`
+  (`is_inter_intra == true`, one intra-half task per plane) into that
+  same shared driver: it validates the readout against the supplied
+  planes (inter-intra flag set, plane coverage ≥ planes, each plane's
+  intra-half task's `mode` agreeing with the leaf's `interintra_mode →
+  mode` translation) and then drives `reconstruct_inter_intra_block`.
+  The dispatcher path and the frame-walk path now converge on one
+  reconstruction driver.
+* **Scope.** The §5.11.5 syntax walker still tracks no `CurrFrame[plane]`
+  buffers, so the parser cannot yet invoke the pixel-level bridge inline
+  — `decode_block_syntax_inter_arm` still discards the dispatcher readout.
+  Once the walker grows frame buffers, the dispatcher's emitted readout
+  feeds `reconstruct_inter_intra_from_dispatch` directly. OBMC / warp
+  inter-intra interactions remain out of scope.
+
++2 lib tests (1990 → 1992): the dispatch bridge driving the shared
+driver byte-identically to the per-block driver, and the bridge's
+three caller-bug guards (non-inter-intra readout, short plane coverage,
+intra-half mode disagreement).
+
 ## Status — 2026-06-14 (round 300)
 
 Round 300 **lifts the §5.11.30 / §5.11.33 task-dispatcher inter-intra
