@@ -4652,6 +4652,241 @@ pub fn reconstruct_inter_block(
     Ok(())
 }
 
+/// §7.11.3.1 compound two-reference mode-info descriptor — the decoded
+/// `(RefFrame[0], RefFrame[1], Mvs[..][0], Mvs[..][1])` quad plus the
+/// `compound_type` that selects the §7.11.3.1 step-14 combine arm
+/// (av1-spec p.258 lines 14400-14412).
+///
+/// Both `ref_frame_0` and `ref_frame_1` are spec `RefFrame[ refList ]`
+/// indices in `LAST_FRAME..=ALTREF_FRAME` (1..=7) — i.e. a real
+/// bidirectional compound block (`RefFrame[1] >= LAST_FRAME`). The
+/// inter-intra arm (`RefFrame[1] == INTRA_FRAME`) and the single-ref
+/// arm (`RefFrame[1] == NONE`) are *not* compound and use
+/// [`reconstruct_inter_block`] / the intra path instead.
+///
+/// `compound_type` is the §5.11.x decoded ordinal restricted here to the
+/// two mask-free combine arms [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`]
+/// — the arms whose output is fully derivable from the two MVs, the two
+/// references, and (for `COMPOUND_DISTANCE`) the §7.11.3.15 order-hint
+/// distance weights, with no decoded wedge / diff-weight / intra mask
+/// side-data. `COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA`
+/// are rejected by [`reconstruct_inter_block_compound`] (their masks are
+/// not yet surfaced on the mode-info grid).
+#[derive(Debug, Clone, Copy)]
+pub struct CompoundInterModeInfo {
+    /// §7.11.3.1 step 5 `RefFrame[ 0 ]` (1..=7).
+    pub ref_frame_0: u8,
+    /// §7.11.3.1 step 5 `RefFrame[ 1 ]` (1..=7 — compound second ref).
+    pub ref_frame_1: u8,
+    /// §7.11.3.1 step 8 `Mvs[ candRow ][ candCol ][ 0 ]`, `[mv_row,
+    /// mv_col]` in 1/8-luma-sample units.
+    pub mv0: [i16; 2],
+    /// §7.11.3.1 step 8 `Mvs[ candRow ][ candCol ][ 1 ]`.
+    pub mv1: [i16; 2],
+    /// §5.11.x decoded `compound_type` ordinal — must be
+    /// [`COMPOUND_AVERAGE`] or [`COMPOUND_DISTANCE`].
+    pub compound_type: u8,
+}
+
+/// §7.11.3.15 order-hint context the [`COMPOUND_DISTANCE`] combine arm
+/// derives `(FwdWeight, BckWeight)` from. Carries the current frame's
+/// `OrderHint`, the `OrderHints[]` of the two references, and
+/// `OrderHintBits` — the exact [`distance_weights`] inputs.
+///
+/// Ignored on the [`COMPOUND_AVERAGE`] arm (which needs no weights), so
+/// a caller driving only `COMPOUND_AVERAGE` leaves may pass any value.
+#[derive(Debug, Clone, Copy)]
+pub struct CompoundOrderHintContext {
+    /// §5.5.1 `OrderHintBits`.
+    pub order_hint_bits: u32,
+    /// §5.9.2 `OrderHint` of the frame being decoded.
+    pub current_order_hint: i32,
+    /// `OrderHints[ RefFrame[ 0 ] ]`.
+    pub order_hint_ref0: i32,
+    /// `OrderHints[ RefFrame[ 1 ] ]`.
+    pub order_hint_ref1: i32,
+}
+
+/// §7.11.3.1 compound two-reference reconstruction — drives one decoded
+/// compound inter block (`RefFrame[1] >= LAST_FRAME`) from mode-info
+/// into a `CurrFrame` plane, for the mask-free [`COMPOUND_AVERAGE`] /
+/// [`COMPOUND_DISTANCE`] combine arms.
+///
+/// This is the compound sibling of [`reconstruct_inter_block`]: it
+/// resolves *both* references through the §7.11.3.3 `refIdx =
+/// ref_frame_idx[ RefFrame − LAST_FRAME ]` ⇒ `FrameStore[ refIdx ]`
+/// indirection, runs [`predict_inter`] with `is_compound == true` (which
+/// forms `preds[0]` / `preds[1]` and applies the step-14 combine +
+/// final `Clip1` into the scratch buffer), then stitches the result
+/// into `curr_plane` at plane coordinates `(x, y)` (av1-spec p.258 line
+/// 14402, identical to the single-ref stitch).
+///
+/// For [`COMPOUND_DISTANCE`] the §7.11.3.15 `(FwdWeight, BckWeight)` are
+/// derived from `order_hints` via [`distance_weights`]; for
+/// [`COMPOUND_AVERAGE`] `order_hints` is unused.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments: either `RefFrame` `INTRA_FRAME` (0) or out of range, an
+/// out-of-range resolved `refIdx`, a `compound_type` other than
+/// `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE`, a `curr_plane` too small
+/// for the `(x, y, w, h)` write region, or anything [`predict_inter`]
+/// itself rejects.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_compound(
+    mode_info: CompoundInterModeInfo,
+    order_hints: CompoundOrderHintContext,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    // ---------- compound_type gate ----------
+    //
+    // This driver covers only the two mask-free combine arms; the
+    // wedge / diff-weight / intra masks are not yet surfaced on the
+    // mode-info grid, so a leaf carrying one of those types is left to
+    // a later driver (caller bug to route it here).
+    if !matches!(
+        mode_info.compound_type,
+        COMPOUND_AVERAGE | COMPOUND_DISTANCE
+    ) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.3 — resolve each RefFrame[refList] -----------
+    //
+    // av1-spec p.252 line 4942 / p.274 line 14812: each small
+    // `RefFrame` index selects a `ref_frame_idx[]` slot naming a
+    // `FrameStore[]` entry. Both list-0 and list-1 references must be
+    // real inter references (`LAST_FRAME..=ALTREF_FRAME`).
+    let resolve = |rf: u8| -> Result<&RefFrameStoreEntry<'_>, crate::Error> {
+        let rf = rf as usize;
+        if !(crate::uncompressed_header_tail::LAST_FRAME
+            ..=crate::uncompressed_header_tail::ALTREF_FRAME)
+            .contains(&rf)
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let slot = rf - crate::uncompressed_header_tail::LAST_FRAME;
+        let ref_idx = *ref_frame_idx
+            .get(slot)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
+        frame_store
+            .get(ref_idx)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)
+    };
+    let entry0 = resolve(mode_info.ref_frame_0)?;
+    let entry1 = resolve(mode_info.ref_frame_1)?;
+
+    // ---------- §7.11.3.1 step 5 / step 14 → two-ref bundle ----------
+    let refs = [
+        PredictInterRef {
+            ref_plane: entry0.plane,
+            ref_stride: entry0.stride,
+            ref_upscaled_width: entry0.upscaled_width,
+            ref_width: entry0.width,
+            ref_height: entry0.height,
+            mv: mode_info.mv0,
+        },
+        PredictInterRef {
+            ref_plane: entry1.plane,
+            ref_stride: entry1.stride,
+            ref_upscaled_width: entry1.upscaled_width,
+            ref_width: entry1.width,
+            ref_height: entry1.height,
+            mv: mode_info.mv1,
+        },
+    ];
+
+    // ---------- §7.11.3.1 step-14 combine descriptor ----------
+    //
+    // `COMPOUND_DISTANCE` derives `(FwdWeight, BckWeight)` from the
+    // §7.11.3.15 order-hint distances; `COMPOUND_AVERAGE` needs none.
+    let compound = if mode_info.compound_type == COMPOUND_DISTANCE {
+        let weights = distance_weights(
+            order_hints.order_hint_bits,
+            order_hints.current_order_hint,
+            order_hints.order_hint_ref0,
+            order_hints.order_hint_ref1,
+        );
+        CompoundParams::Distance(weights)
+    } else {
+        CompoundParams::Average
+    };
+
+    // ---------- §7.11.3.1 steps 1-14 — compound prediction ----------
+    let mut pred_out = vec![0u16; w * h];
+    predict_inter(
+        plane,
+        x,
+        y,
+        w,
+        h,
+        crate::cdf::MOTION_MODE_SIMPLE,
+        /* is_compound */ true,
+        /* is_inter_intra */ false,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        &refs,
+        Some(compound),
+        /* warp */ None,
+        /* obmc */ None,
+        &mut pred_out,
+    )?;
+
+    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -------
+    //
+    // av1-spec p.258 line 14402: `CurrFrame[plane][y + i][x + j] =
+    // <combined>`. `predict_inter` already applied the step-14 combine
+    // + `Clip1` into `pred_out`; here we copy the `w × h` block into the
+    // plane buffer at plane coords `(x, y)` (same stitch as the
+    // single-ref arm).
+    if x < 0 || y < 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let (px, py) = (x as usize, y as usize);
+    let last_row = py
+        .checked_add(h)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let last_col = px
+        .checked_add(w)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_stride < last_col {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed = (last_row - 1)
+        .checked_mul(curr_stride)
+        .and_then(|v| v.checked_add(last_col))
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_plane.len() < needed {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    for i in 0..h {
+        let dst = (py + i) * curr_stride + px;
+        let src = i * w;
+        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+    }
+
+    Ok(())
+}
+
 // =====================================================================
 // r293 §5.11.33 predict() / §7.11.3 frame-level inter reconstruction
 // =====================================================================
@@ -4759,6 +4994,30 @@ pub struct InterModeInfoGrid<'a> {
     /// `InterpFilters[ r ][ c ][ dir ]` — `interp_filters()[ (r *
     /// mi_cols + c) * 2 + dir ]`.
     pub interp_filters: &'a [u8],
+    /// §5.11.x decoded `compound_type` ordinal per cell —
+    /// `comp_types()[ r * mi_cols + c ]`. Read only at a compound
+    /// leaf's origin (`RefFrame[1] >= LAST_FRAME`); ignored on
+    /// single-ref / inter-intra / intra cells. The [`COMPOUND_AVERAGE`]
+    /// / [`COMPOUND_DISTANCE`] arms are driven; the mask arms
+    /// ([`COMPOUND_WEDGE`] / [`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`])
+    /// are skipped (their masks are not yet on the grid).
+    pub compound_types: &'a [u8],
+    /// §7.11.3.15 order-hint context the [`COMPOUND_DISTANCE`] arm
+    /// derives `(FwdWeight, BckWeight)` from. The `order_hint_ref0` /
+    /// `order_hint_ref1` fields are re-resolved per compound leaf from
+    /// the cell's two `RefFrames[]` against this grid's
+    /// `order_hints_by_ref` table (so the single
+    /// [`CompoundOrderHintContext`] value here is filled per leaf — see
+    /// [`reconstruct_inter_frame`]).
+    pub order_hint_bits: u32,
+    /// §5.9.2 `OrderHint` of the frame being decoded.
+    pub current_order_hint: i32,
+    /// `OrderHints[ ref ]` for `ref` in `LAST_FRAME..=ALTREF_FRAME`
+    /// (1..=7) — the per-reference output order hints the
+    /// [`COMPOUND_DISTANCE`] arm reads via each compound leaf's
+    /// `RefFrame[ refList ]`. Indexed by the raw `RefFrame` value
+    /// (slot 0 unused); length must be at least `ALTREF_FRAME + 1`.
+    pub order_hints_by_ref: &'a [i32],
     /// `MiRows`.
     pub mi_rows: u32,
     /// `MiCols`.
@@ -4796,10 +5055,19 @@ pub struct InterModeInfoGrid<'a> {
 /// carrying [`crate::cdf::BLOCK_INVALID`] (no leaf covered them) are
 /// skipped.
 ///
+/// Compound leaves (`RefFrame[1] >= LAST_FRAME`) carrying the mask-free
+/// [`COMPOUND_AVERAGE`] / [`COMPOUND_DISTANCE`] combine types are driven
+/// through [`reconstruct_inter_block_compound`]: both references are
+/// resolved, the §7.11.3.15 distance weights are derived per leaf from
+/// `order_hints_by_ref[ RefFrame[0/1] ]`, and `predict_inter` forms the
+/// two-reference combine.
+///
 /// **Scope / skips (untouched CurrFrame regions, for a later driver):**
 ///   * intra leaves (`IsInters == 0`);
-///   * compound leaves (`RefFrame[1] >= LAST_FRAME`);
-///   * inter-intra leaves (`RefFrame[1] == INTRA_FRAME`).
+///   * inter-intra leaves (`RefFrame[1] == INTRA_FRAME`);
+///   * compound leaves whose `compound_type` is a *mask* arm
+///     ([`COMPOUND_WEDGE`] / [`COMPOUND_DIFFWTD`] / [`COMPOUND_INTRA`]) —
+///     their decoded masks are not yet surfaced on the grid.
 ///
 /// The §7.11.3.1 horizontal / vertical interpolation filters are read
 /// per leaf from `InterpFilters[origin][0..2]` (the §5.11.x decoded
@@ -4829,7 +5097,13 @@ pub fn reconstruct_inter_frame(
         || grid.ref_frames.len() < cells * 2
         || grid.mvs.len() < cells * 4
         || grid.interp_filters.len() < cells * 2
+        || grid.compound_types.len() < cells
     {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // The compound-distance arm reads `order_hints_by_ref[ RefFrame ]`
+    // for `RefFrame` up to `ALTREF_FRAME`; a short table is a caller bug.
+    if grid.order_hints_by_ref.len() <= crate::uncompressed_header_tail::ALTREF_FRAME {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
 
@@ -4875,28 +5149,94 @@ pub fn reconstruct_inter_frame(
                 }
             }
 
-            // --- §5.11.33 leaf gating: inter, single forward ref. ---
+            // --- §5.11.33 leaf gating: inter arm. ---
             if grid.is_inters[origin] == 0 {
                 continue; // intra leaf — §7.11.2 arm's responsibility.
             }
             let ref_frame0 = grid.ref_frames[origin * 2];
             let ref_frame1 = grid.ref_frames[origin * 2 + 1];
-            // `RefFrame[1] == NONE` (the `-1` sentinel the §5.11.18
-            // grid pre-fill stamps into slot 1) is the single-reference
-            // arm. Any other value is compound (`>= LAST_FRAME`) or
-            // inter-intra (`INTRA_FRAME == 0`) — out of this driver's
-            // scope, leave the region untouched.
+            // `RefFrame[1]` selects the §7.11.3.1 combine arm:
+            //   * `NONE` (the `-1` sentinel the §5.11.18 grid pre-fill
+            //     stamps into slot 1) ⇒ single forward reference.
+            //   * `>= LAST_FRAME` (1..=7) ⇒ compound two-reference.
+            //   * `INTRA_FRAME` (0) ⇒ inter-intra — skipped (the
+            //     interintra blend driver is a later arc).
             const NONE_REF_FRAME: i8 = -1;
-            if ref_frame1 != NONE_REF_FRAME {
+            const INTRA_FRAME_REF: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+            let is_compound_leaf = ref_frame1 >= crate::uncompressed_header_tail::LAST_FRAME as i8;
+            if ref_frame1 == INTRA_FRAME_REF {
+                continue; // inter-intra leaf — out of scope.
+            }
+
+            let interp_x = grid.interp_filters[origin * 2];
+            let interp_y = grid.interp_filters[origin * 2 + 1];
+
+            if is_compound_leaf {
+                // --- compound two-reference arm (AVERAGE / DISTANCE). ---
+                let comp_type = grid.compound_types[origin];
+                // The mask combine arms (WEDGE / DIFFWTD / INTRA) carry
+                // decoded mask side-data not yet surfaced on the grid;
+                // leave their regions for a later driver.
+                if !matches!(comp_type, COMPOUND_AVERAGE | COMPOUND_DISTANCE) {
+                    continue;
+                }
+                let mode_info = CompoundInterModeInfo {
+                    ref_frame_0: ref_frame0 as u8,
+                    ref_frame_1: ref_frame1 as u8,
+                    mv0: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
+                    mv1: [grid.mvs[origin * 4 + 2], grid.mvs[origin * 4 + 3]],
+                    compound_type: comp_type,
+                };
+                // §7.11.3.15 order-hint context — resolve each ref's
+                // `OrderHints[]` from the per-RefFrame table. The two
+                // `ref_frame*` values are in `LAST_FRAME..=ALTREF_FRAME`
+                // (the grid-slice guard bounded the table at
+                // `ALTREF_FRAME`), so the indexing is in range.
+                let order_hints = CompoundOrderHintContext {
+                    order_hint_bits: grid.order_hint_bits,
+                    current_order_hint: grid.current_order_hint,
+                    order_hint_ref0: grid.order_hints_by_ref[ref_frame0 as usize],
+                    order_hint_ref1: grid.order_hints_by_ref[ref_frame1 as usize],
+                };
+
+                for ctx in planes.iter_mut() {
+                    let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
+                    let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
+                    let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+                    let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+                    let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
+                    let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+
+                    reconstruct_inter_block_compound(
+                        mode_info,
+                        order_hints,
+                        ref_frame_idx,
+                        ctx.frame_store,
+                        ctx.plane,
+                        base_x,
+                        base_y,
+                        pred_w,
+                        pred_h,
+                        grid.bit_depth,
+                        ctx.subsampling_x,
+                        ctx.subsampling_y,
+                        ctx.frame_width,
+                        ctx.frame_height,
+                        interp_x,
+                        interp_y,
+                        ctx.curr,
+                        ctx.curr_stride,
+                    )?;
+                }
                 continue;
             }
 
+            debug_assert_eq!(ref_frame1, NONE_REF_FRAME);
+            // --- single forward-reference translational arm. ---
             let mode_info = InterModeInfo {
                 ref_frame: ref_frame0 as u8,
                 mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
             };
-            let interp_x = grid.interp_filters[origin * 2];
-            let interp_y = grid.interp_filters[origin * 2 + 1];
 
             // --- §5.11.33 per-plane predict_inter loop. ---
             for ctx in planes.iter_mut() {
@@ -7315,6 +7655,11 @@ mod tests {
         }
         let mut mvs = vec![0i16; cells * 4];
         let interp_filters = vec![EIGHTTAP; cells * 2];
+        // The compound leaf in this grid is a WEDGE-mask type so it
+        // stays skipped (this test exercises the single-ref dispatch
+        // identity; the AVERAGE/DISTANCE compound walk is covered
+        // separately below).
+        let mut compound_types = vec![COMPOUND_AVERAGE; cells];
 
         let set_cell = |mi_sizes: &mut [usize], r: usize, c: usize, sz: usize| {
             mi_sizes[r * mi_cols as usize + c] = sz;
@@ -7369,7 +7714,8 @@ mod tests {
         }
         // (1,0) BLOCK_4X4 intra.
         set_cell(&mut mi_sizes, 1, 0, BLOCK_4X4);
-        // (1,1) BLOCK_4X4 compound inter (RefFrame[1] = LAST_FRAME).
+        // (1,1) BLOCK_4X4 compound inter (RefFrame[1] = LAST_FRAME),
+        // marked COMPOUND_WEDGE so the walk skips it (mask arm).
         set_cell(&mut mi_sizes, 1, 1, BLOCK_4X4);
         stamp_inter(
             &mut is_inters,
@@ -7381,6 +7727,7 @@ mod tests {
             last,
             [0, 4],
         );
+        compound_types[mi_cols as usize + 1] = COMPOUND_WEDGE;
 
         // CurrFrame[0]: 8 rows × 16 cols, sentinel pre-fill.
         let curr_w = (mi_cols * 4) as usize; // 16
@@ -7388,12 +7735,17 @@ mod tests {
         let sentinel = 7000u16;
         let mut curr = vec![sentinel; curr_w * curr_h];
 
+        let order_hints_by_ref = [0i32; 8];
         let grid = InterModeInfoGrid {
             mi_sizes: &mi_sizes,
             is_inters: &is_inters,
             ref_frames: &ref_frames,
             mvs: &mvs,
             interp_filters: &interp_filters,
+            compound_types: &compound_types,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
             mi_rows,
             mi_cols,
             bit_depth: 8,
@@ -7519,6 +7871,8 @@ mod tests {
         let cells = 1usize;
 
         let mut curr = vec![0u16; ref_w * ref_h];
+        let comp_types = vec![COMPOUND_AVERAGE; cells];
+        let order_hints_by_ref = [0i32; 8];
         let run = |mi_sizes: &[usize],
                    is_inters: &[u8],
                    ref_frames: &[i8],
@@ -7531,6 +7885,10 @@ mod tests {
                 ref_frames,
                 mvs,
                 interp_filters,
+                compound_types: &comp_types,
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hints_by_ref: &order_hints_by_ref,
                 mi_rows,
                 mi_cols,
                 bit_depth: 8,
@@ -7629,6 +7987,562 @@ mod tests {
             run(&bad_sizes, &good_is, &good_rf, &good_mv, &good_if, &mut curr).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
         );
+    }
+
+    // ---------- r294 §7.11.3.1 compound block driver ----------
+
+    /// Build a deterministic `16×16` reference plane (`r*16 + c`) and a
+    /// frame store with the real plane parked at slot `real_slot` (every
+    /// other slot a distinct decoy), plus a `ref_frame_idx` mapping
+    /// `LAST_FRAME` / `ALTREF_FRAME` both onto `real_slot`. Returns
+    /// `(refp, ref_frame_idx)` for the caller to build the store from.
+    fn r294_ref_plane(ref_w: usize, ref_h: usize) -> Vec<u16> {
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * ref_w + c] = (r * 16 + c) as u16;
+            }
+        }
+        refp
+    }
+
+    /// §7.11.3.1 compound `COMPOUND_AVERAGE` block driver —
+    /// [`reconstruct_inter_block_compound`] must resolve both references
+    /// through `ref_frame_idx` / `frame_store` and produce the same
+    /// bytes as a direct [`predict_inter`] compound call, stitched at
+    /// the plane origin.
+    #[test]
+    fn r294_reconstruct_inter_block_compound_average_matches_predict_inter() {
+        let ref_w = 16usize;
+        let ref_h = 16usize;
+        let stride = ref_w;
+        let refp = r294_ref_plane(ref_w, ref_h);
+        let decoy = vec![0u16; ref_w * ref_h];
+        let real = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let dec = RefFrameStoreEntry {
+            plane: &decoy[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        // Real plane at slot 2; ref_frame_idx maps LAST→2 and ALTREF→2.
+        let store = [dec, dec, real, dec];
+        let ref_frame_idx: [u8; 7] = [2, 0, 1, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let altref = crate::uncompressed_header_tail::ALTREF_FRAME as u8;
+
+        let w = 4;
+        let h = 4;
+        // Distinct MVs per list so the two predictions differ.
+        let mode_info = CompoundInterModeInfo {
+            ref_frame_0: last,
+            ref_frame_1: altref,
+            mv0: [0, 4],
+            mv1: [8, 0],
+            compound_type: COMPOUND_AVERAGE,
+        };
+        // Driver output, stitched into an 8×8 plane at (2, 2).
+        let curr_w = 8;
+        let curr_h = 8;
+        let sentinel = 6000u16;
+        let mut curr = vec![sentinel; curr_w * curr_h];
+        reconstruct_inter_block_compound(
+            mode_info,
+            CompoundOrderHintContext {
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hint_ref0: 0,
+                order_hint_ref1: 0,
+            },
+            &ref_frame_idx,
+            &store,
+            0,
+            2,
+            2,
+            w,
+            h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut curr,
+            curr_w,
+        )
+        .expect("compound AVERAGE block driver");
+
+        // Oracle: the same two refs (both resolve to `refp`) through a
+        // direct predict_inter compound AVERAGE call.
+        let refs = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 4],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [8, 0],
+            },
+        ];
+        let mut expected = vec![0u16; w * h];
+        predict_inter(
+            0,
+            2,
+            2,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            Some(CompoundParams::Average),
+            None,
+            None,
+            &mut expected,
+        )
+        .unwrap();
+
+        for i in 0..h {
+            for j in 0..w {
+                assert_eq!(
+                    curr[(2 + i) * curr_w + (2 + j)],
+                    expected[i * w + j],
+                    "compound AVERAGE stitch mismatch at ({j}, {i})"
+                );
+            }
+        }
+        // The block's border outside the 4×4 write region is untouched.
+        assert_eq!(curr[0], sentinel);
+        assert_eq!(curr[curr_w * curr_h - 1], sentinel);
+    }
+
+    /// §7.11.3.1 compound `COMPOUND_DISTANCE` block driver — the
+    /// driver must derive `(FwdWeight, BckWeight)` from the supplied
+    /// order-hint context via [`distance_weights`] and produce the same
+    /// bytes as a direct [`predict_inter`] call given those same
+    /// weights.
+    #[test]
+    fn r294_reconstruct_inter_block_compound_distance_derives_weights() {
+        let ref_w = 16usize;
+        let ref_h = 16usize;
+        let stride = ref_w;
+        let refp = r294_ref_plane(ref_w, ref_h);
+        let real = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [real, real];
+        let ref_frame_idx: [u8; 7] = [0, 1, 0, 0, 0, 0, 0];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        // RefFrame[1] = LAST_FRAME + 1 → ref_frame_idx slot 1 → store[1].
+        let ref1 = last + 1;
+
+        // Asymmetric order hints so FwdWeight != BckWeight.
+        let ohc = CompoundOrderHintContext {
+            order_hint_bits: 7,
+            current_order_hint: 8,
+            order_hint_ref0: 4, // dist 4
+            order_hint_ref1: 2, // dist 6
+        };
+        let weights = distance_weights(
+            ohc.order_hint_bits,
+            ohc.current_order_hint,
+            ohc.order_hint_ref0,
+            ohc.order_hint_ref1,
+        );
+        // Guard the test's premise: the two weights actually differ, so
+        // this exercises a non-degenerate DISTANCE blend.
+        assert_ne!(
+            weights.fwd_weight, weights.bck_weight,
+            "test premise: order hints chosen for asymmetric weights"
+        );
+
+        let w = 4;
+        let h = 4;
+        let mut curr = vec![0u16; w * h];
+        reconstruct_inter_block_compound(
+            CompoundInterModeInfo {
+                ref_frame_0: last,
+                ref_frame_1: ref1,
+                mv0: [0, 4],
+                mv1: [8, 0],
+                compound_type: COMPOUND_DISTANCE,
+            },
+            ohc,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            w,
+            h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut curr,
+            w,
+        )
+        .expect("compound DISTANCE block driver");
+
+        let refs = [
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [0, 4],
+            },
+            PredictInterRef {
+                ref_plane: &refp,
+                ref_stride: stride,
+                ref_upscaled_width: ref_w as u32,
+                ref_width: ref_w as u32,
+                ref_height: ref_h as u32,
+                mv: [8, 0],
+            },
+        ];
+        let mut expected = vec![0u16; w * h];
+        predict_inter(
+            0,
+            0,
+            0,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_SIMPLE,
+            true,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            Some(CompoundParams::Distance(weights)),
+            None,
+            None,
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(
+            curr, expected,
+            "compound DISTANCE driver must derive the same weights and blend"
+        );
+    }
+
+    /// [`reconstruct_inter_block_compound`] caller-bug matrix: a mask
+    /// `compound_type` (WEDGE / DIFFWTD / INTRA), an INTRA_FRAME /
+    /// out-of-range `RefFrame`, an out-of-range resolved `refIdx`, and
+    /// a `curr_plane` too small each surface `PartitionWalkOutOfRange`.
+    #[test]
+    fn r294_reconstruct_inter_block_compound_rejects_caller_bugs() {
+        let ref_w = 16usize;
+        let ref_h = 16usize;
+        let refp = r294_ref_plane(ref_w, ref_h);
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: ref_w,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 0, 0, 0, 0, 0];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let ohc = CompoundOrderHintContext {
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hint_ref0: 0,
+            order_hint_ref1: 0,
+        };
+        let w = 4;
+        let h = 4;
+        let mk = |rf0: u8, rf1: u8, ct: u8, curr: &mut [u16], stride: usize| {
+            reconstruct_inter_block_compound(
+                CompoundInterModeInfo {
+                    ref_frame_0: rf0,
+                    ref_frame_1: rf1,
+                    mv0: [0, 0],
+                    mv1: [0, 0],
+                    compound_type: ct,
+                },
+                ohc,
+                &ref_frame_idx,
+                &store,
+                0,
+                0,
+                0,
+                w,
+                h,
+                8,
+                0,
+                0,
+                ref_w as u32,
+                ref_h as u32,
+                EIGHTTAP,
+                EIGHTTAP,
+                curr,
+                stride,
+            )
+        };
+        let mut curr = vec![0u16; w * h];
+        // Mask compound type — out of this driver's scope.
+        assert_eq!(
+            mk(last, last + 1, COMPOUND_WEDGE, &mut curr, w).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        assert_eq!(
+            mk(last, last + 1, COMPOUND_DIFFWTD, &mut curr, w).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        // INTRA_FRAME (0) as either ref.
+        assert_eq!(
+            mk(0, last + 1, COMPOUND_AVERAGE, &mut curr, w).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        assert_eq!(
+            mk(last, 0, COMPOUND_AVERAGE, &mut curr, w).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        // Out-of-range RefFrame (> ALTREF_FRAME).
+        assert_eq!(
+            mk(last, 99, COMPOUND_AVERAGE, &mut curr, w).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+        // curr_plane too small (stride OK but buffer short).
+        let mut tiny = vec![0u16; w * h - 1];
+        assert_eq!(
+            mk(last, last + 1, COMPOUND_AVERAGE, &mut tiny, w).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+    }
+
+    /// §5.11.33 frame walk — a grid carrying one `COMPOUND_AVERAGE` and
+    /// one `COMPOUND_DISTANCE` compound leaf must dispatch each through
+    /// [`reconstruct_inter_block_compound`] identically to a direct
+    /// per-block call, while a `COMPOUND_WEDGE` (mask) compound leaf and
+    /// an inter-intra leaf are left as the sentinel.
+    #[test]
+    fn r294_reconstruct_inter_frame_drives_average_and_distance_compound() {
+        let ref_w = 16usize;
+        let ref_h = 16usize;
+        let stride = ref_w;
+        let refp = r294_ref_plane(ref_w, ref_h);
+        let real = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [real, real, real, real];
+        let store2 = store;
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+
+        let mi_rows: u32 = 1;
+        let mi_cols: u32 = 4;
+        let cells = (mi_rows * mi_cols) as usize;
+
+        use crate::cdf::{BLOCK_4X4, BLOCK_INVALID};
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        let mut is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        let mut mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let mut compound_types = vec![COMPOUND_AVERAGE; cells];
+
+        // Each cell its own BLOCK_4X4 leaf.
+        for sz in mi_sizes.iter_mut() {
+            *sz = BLOCK_4X4;
+        }
+        // Helper to stamp a compound leaf at column `c`.
+        let mut stamp = |c: usize, rf1: i8, ct: u8, mv0: [i16; 2], mv1: [i16; 2]| {
+            is_inters[c] = 1;
+            ref_frames[c * 2] = last;
+            ref_frames[c * 2 + 1] = rf1;
+            mvs[c * 4] = mv0[0];
+            mvs[c * 4 + 1] = mv0[1];
+            mvs[c * 4 + 2] = mv1[0];
+            mvs[c * 4 + 3] = mv1[1];
+            compound_types[c] = ct;
+        };
+        // col 0: COMPOUND_AVERAGE (RefFrame[1] = LAST+1).
+        stamp(0, last + 1, COMPOUND_AVERAGE, [0, 4], [8, 0]);
+        // col 1: COMPOUND_DISTANCE (RefFrame[1] = LAST+2).
+        stamp(1, last + 2, COMPOUND_DISTANCE, [4, 0], [0, 8]);
+        // col 2: COMPOUND_WEDGE (mask) — must be skipped.
+        stamp(2, last + 1, COMPOUND_WEDGE, [0, 4], [8, 0]);
+        // col 3: inter-intra (RefFrame[1] = INTRA_FRAME) — skipped.
+        is_inters[3] = 1;
+        ref_frames[3 * 2] = last;
+        ref_frames[3 * 2 + 1] = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+
+        // OrderHints: ref LAST=ref1 idx → hints chosen so DISTANCE has
+        // asymmetric weights. RefFrame indices used: LAST(1), LAST+1(2),
+        // LAST+2(3).
+        let mut order_hints_by_ref = [0i32; 8];
+        order_hints_by_ref[last as usize] = 4; // LAST
+        order_hints_by_ref[(last + 1) as usize] = 6;
+        order_hints_by_ref[(last + 2) as usize] = 2;
+        let current_order_hint = 8;
+
+        let curr_w = (mi_cols * 4) as usize; // 16
+        let curr_h = 4usize;
+        let sentinel = 5000u16;
+        let mut curr = vec![sentinel; curr_w * curr_h];
+
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &compound_types,
+            order_hint_bits: 7,
+            current_order_hint,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+        };
+        {
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("frame-level compound reconstruction");
+        }
+
+        // Oracle: drive the two mask-free compound leaves directly.
+        let mut oracle = vec![sentinel; curr_w * curr_h];
+        // col 0 AVERAGE at (baseX=0, baseY=0).
+        reconstruct_inter_block_compound(
+            CompoundInterModeInfo {
+                ref_frame_0: last as u8,
+                ref_frame_1: (last + 1) as u8,
+                mv0: [0, 4],
+                mv1: [8, 0],
+                compound_type: COMPOUND_AVERAGE,
+            },
+            CompoundOrderHintContext {
+                order_hint_bits: 7,
+                current_order_hint,
+                order_hint_ref0: order_hints_by_ref[last as usize],
+                order_hint_ref1: order_hints_by_ref[(last + 1) as usize],
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            0,
+            0,
+            4,
+            4,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+        // col 1 DISTANCE at (baseX=4, baseY=0).
+        reconstruct_inter_block_compound(
+            CompoundInterModeInfo {
+                ref_frame_0: last as u8,
+                ref_frame_1: (last + 2) as u8,
+                mv0: [4, 0],
+                mv1: [0, 8],
+                compound_type: COMPOUND_DISTANCE,
+            },
+            CompoundOrderHintContext {
+                order_hint_bits: 7,
+                current_order_hint,
+                order_hint_ref0: order_hints_by_ref[last as usize],
+                order_hint_ref1: order_hints_by_ref[(last + 2) as usize],
+            },
+            &ref_frame_idx,
+            &store2,
+            0,
+            4,
+            0,
+            4,
+            4,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        assert_eq!(
+            curr, oracle,
+            "frame walk must dispatch compound leaves identically to the per-block driver"
+        );
+        // The WEDGE (cols 8..12) and inter-intra (cols 12..16) leaves
+        // are skipped → still the sentinel.
+        for c in 8..16 {
+            for r in 0..curr_h {
+                assert_eq!(
+                    curr[r * curr_w + c],
+                    sentinel,
+                    "skipped compound/inter-intra sample ({c}, {r}) must stay sentinel"
+                );
+            }
+        }
+        // The two driven leaves were reconstructed.
+        assert_ne!(curr[0], sentinel, "AVERAGE leaf reconstructed");
+        assert_ne!(curr[4], sentinel, "DISTANCE leaf reconstructed");
     }
 
     /// §7.11.3.1 caller-bug matrix (post-r203) — all four motion

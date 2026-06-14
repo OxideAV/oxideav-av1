@@ -2,6 +2,50 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-14 (round 294)
+
+Round 294 **drives the mask-free compound two-reference inter
+reconstruction arms across the frame walk** — the r293 follow-up. Where
+r293 walked the §5.11.33 grid for the single-forward-reference arm only
+(skipping every `RefFrame[1] >= LAST_FRAME` leaf), this round
+reconstructs the bidirectional `COMPOUND_AVERAGE` / `COMPOUND_DISTANCE`
+compound leaves end-to-end.
+
+New `reconstruct_inter_block_compound` is the compound sibling of
+`reconstruct_inter_block`:
+
+* **Two-reference resolution.** Both `RefFrame[0]` and `RefFrame[1]`
+  (each `LAST_FRAME..=ALTREF_FRAME`) are resolved through the §7.11.3.3
+  `refIdx = ref_frame_idx[ RefFrame − LAST_FRAME ]` ⇒ `FrameStore[ refIdx ]`
+  indirection, then bundled as the two `PredictInterRef` entries the
+  §7.11.3.1 step-14 compound path consumes.
+* **Step-14 combine.** `predict_inter` runs with `is_compound == true`,
+  forming `preds[0]` / `preds[1]` and applying the combine + final
+  `Clip1` into the scratch buffer, which is stitched into
+  `CurrFrame[plane]` at plane coords `(x, y)` (av1-spec p.258 line 14402,
+  identical to the single-ref stitch).
+* **Distance weights.** `COMPOUND_DISTANCE` derives `(FwdWeight,
+  BckWeight)` from the new `CompoundOrderHintContext` via the §7.11.3.15
+  `distance_weights` body; `COMPOUND_AVERAGE` needs no weights.
+
+`reconstruct_inter_frame` now splits its `RefFrame[1]` gate three ways:
+`NONE` ⇒ single-ref (unchanged); `>= LAST_FRAME` with a
+`COMPOUND_AVERAGE` / `COMPOUND_DISTANCE` `compound_type` ⇒ the new
+compound driver; `INTRA_FRAME` or a *mask* `compound_type`
+(`COMPOUND_WEDGE` / `COMPOUND_DIFFWTD` / `COMPOUND_INTRA`) ⇒ skipped for
+a later driver (their decoded masks are not yet surfaced on the grid).
+`InterModeInfoGrid` gains a `compound_types` slice plus the
+`order_hint_bits` / `current_order_hint` / `order_hints_by_ref`
+order-hint context.
+
++4 lib tests (1976 → 1980): a `COMPOUND_AVERAGE` and a
+`COMPOUND_DISTANCE` block driver each cross-checked against a direct
+`predict_inter` compound call (DISTANCE with asymmetric order hints so
+`FwdWeight != BckWeight`); a compound caller-bug matrix (mask type /
+`INTRA_FRAME` ref / out-of-range ref / short `CurrFrame`); and a frame
+walk driving one AVERAGE + one DISTANCE leaf identically to the
+per-block driver while a WEDGE and an inter-intra leaf stay sentinel.
+
 ## Status — 2026-06-14 (round 293)
 
 Round 293 **drives single-reference translational inter reconstruction

@@ -4,6 +4,32 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r294 (2026-06-14): drive the mask-free compound two-reference
+  inter reconstruction arms across the §5.11.33 frame walk. New
+  `reconstruct_inter_block_compound` resolves *both* `RefFrame[refList]`
+  references through the §7.11.3.3 `ref_frame_idx[] → FrameStore[]`
+  indirection, runs `predict_inter` with `is_compound == true` (forming
+  `preds[0]` / `preds[1]` and applying the §7.11.3.1 step-14 combine +
+  final `Clip1`), and stitches the result into `CurrFrame[plane]`. The
+  `COMPOUND_DISTANCE` arm derives `(FwdWeight, BckWeight)` from the new
+  `CompoundOrderHintContext` via the §7.11.3.15 `distance_weights` body;
+  `COMPOUND_AVERAGE` needs no weights. `reconstruct_inter_frame` now
+  splits its `RefFrame[1]` gate three ways — `NONE` ⇒ single-ref
+  (unchanged), `>= LAST_FRAME` with a `COMPOUND_AVERAGE` /
+  `COMPOUND_DISTANCE` `compound_type` ⇒ the new compound driver,
+  `INTRA_FRAME` or a mask `compound_type` (`COMPOUND_WEDGE` /
+  `COMPOUND_DIFFWTD` / `COMPOUND_INTRA`) ⇒ skipped for a later driver
+  (their decoded masks are not yet surfaced on the grid).
+  `InterModeInfoGrid` gains `compound_types` + the `order_hint_bits` /
+  `current_order_hint` / `order_hints_by_ref` order-hint context.
+  +4 lib tests (1976 → 1980): a `COMPOUND_AVERAGE` and a
+  `COMPOUND_DISTANCE` block driver each cross-checked against a direct
+  `predict_inter` compound call (DISTANCE with asymmetric order hints so
+  `FwdWeight != BckWeight`), a compound caller-bug matrix (mask type /
+  `INTRA_FRAME` ref / out-of-range ref / short `CurrFrame`), and a
+  frame walk driving one AVERAGE + one DISTANCE leaf identically to the
+  per-block driver while a WEDGE and an inter-intra leaf stay sentinel.
+
 - decoder r293 (2026-06-14): drive single-reference translational
   inter reconstruction across the whole decoded mode-info grid — the
   §5.11.33 `predict()` body (av1-spec p.82-83, lines 5127-5191)
