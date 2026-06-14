@@ -16250,6 +16250,145 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// §7.11.3.1 single-reference translational inter pixel
+    /// reconstruction across all of a block's planes (Y, Cb, Cr) in one
+    /// call (av1-spec p.258 line 14402 final stitch: `isCompound == 0 &&
+    /// IsInterIntra == 0 ⇒ CurrFrame[plane][y+i][x+j] =
+    /// Clip1(preds[0][i][j])`).
+    ///
+    /// This is the single-ref companion to
+    /// [`Self::reconstruct_inter_block_compound_multiplane_into_curr_frame`]
+    /// and the multi-plane companion to
+    /// [`Self::reconstruct_inter_block_into_curr_frame`]: rather than one
+    /// plane per call, it drives the §5.11.34 `predict()` per-plane loop
+    /// (`for plane in 0..1 + 2*has_chroma`) for a single decoded block,
+    /// overwriting each plane's `predW × predH` footprint with
+    /// `Clip1(preds[0])`. There is no compound `Mask` (single-ref forms a
+    /// single prediction), so — unlike the compound multi-plane bridge —
+    /// no shared mask buffer is threaded; each plane is independent.
+    ///
+    /// Per-plane geometry follows the §5.11.34 `predict()` loop
+    /// (av1-spec p.83 lines 5165-5190) in the common `someUseIntra == 0`
+    /// shape (one `predict_inter` call per plane covering the whole plane
+    /// footprint): for `subX = (plane > 0) ? subsampling_x : 0` (and
+    /// `subY` likewise), `baseX = (mi_col >> subX) * MI_SIZE`,
+    /// `baseY = (mi_row >> subY) * MI_SIZE`,
+    /// `predW = Block_Width[MiSize] >> subX`,
+    /// `predH = Block_Height[MiSize] >> subY`. The §5.11.34
+    /// intra-neighbour sub-block split (`someUseIntra == 1`) is a
+    /// separate per-block concern (a block flagged for it would route
+    /// each 4×4 chunk through the single-plane bridge instead).
+    ///
+    /// `mode_info` / `ref_frame_idx` are the decoded §7.11.3.1
+    /// step-5/-8 side-data (the `(RefFrame[0], Mvs[..][0])` pair, shared
+    /// by every plane); `plane_specs[plane]` carries the per-plane
+    /// §7.11.3.3 reference state (`subsampling_*`, `frame_store`,
+    /// plane-resolved `(frame_width, frame_height)`) — the `plane` field
+    /// of each entry is ignored (the loop index drives it). `num_planes`
+    /// is `1` (luma-only) or `3` (Y/Cb/Cr); chroma planes are skipped
+    /// when `num_planes == 1`.
+    ///
+    /// Like the single-plane bridges, the walker buffer is `i32`
+    /// (post-`Clip1`); the driver works in `u16`, so each plane is
+    /// mirrored, driven, and copied back (lossless). Each plane's buffer
+    /// is allocated if untouched (single-ref overwrites — no intra-half
+    /// prerequisite), sized from `MiRows × MiCols × MI_SIZE >>
+    /// subsampling_*` so a later §7.12.3 step-3 merge is a no-op.
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for
+    /// `num_planes` not in `{1, 3}`, an out-of-range `mi_size`, a
+    /// `plane_specs` slice shorter than `num_planes`, or anything
+    /// [`crate::reconstruct_inter_block`] itself rejects on any plane (an
+    /// `INTRA_FRAME`/out-of-range `RefFrame[0]`, an out-of-range resolved
+    /// `refIdx`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_inter_block_multiplane_into_curr_frame(
+        &mut self,
+        mode_info: crate::InterModeInfo,
+        ref_frame_idx: &[u8],
+        plane_specs: &[crate::PlaneRefSpec<'_>],
+        mi_col: u32,
+        mi_row: u32,
+        mi_size: usize,
+        num_planes: usize,
+        bit_depth: u8,
+        interp_filter_x: u8,
+        interp_filter_y: u8,
+    ) -> Result<(), crate::Error> {
+        if num_planes != 1 && num_planes != 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if plane_specs.len() < num_planes {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        let luma_w = block_width(mi_size);
+        let luma_h = block_height(mi_size);
+
+        for (plane, spec) in plane_specs.iter().enumerate().take(num_planes) {
+            // §5.11.34 `subX/subY = (plane > 0) ? subsampling_* : 0`.
+            let (sub_x, sub_y) = if plane == 0 {
+                (0u8, 0u8)
+            } else {
+                (spec.subsampling_x, spec.subsampling_y)
+            };
+            // §5.11.34 per-plane origin + footprint (someUseIntra == 0
+            // shape: one predict_inter call covering the whole plane
+            // block).
+            let base_x = ((mi_col >> sub_x) * (MI_SIZE as u32)) as i32;
+            let base_y = ((mi_row >> sub_y) * (MI_SIZE as u32)) as i32;
+            let pred_w = luma_w >> sub_x;
+            let pred_h = luma_h >> sub_y;
+
+            // Allocate this plane's buffer if untouched (single-ref
+            // overwrites — no intra-half prerequisite).
+            let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+            let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+            self.ensure_curr_frame_plane(plane, rows, cols);
+            let Some(cp) = self.curr_frame[plane].as_ref() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let buf_cols = cp.cols as usize;
+            // `u16` mirror of the whole `i32` plane buffer (samples are
+            // post-`Clip1`, so the narrowing is lossless).
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+
+            crate::reconstruct_inter_block(
+                mode_info,
+                ref_frame_idx,
+                spec.frame_store,
+                plane as u8,
+                base_x,
+                base_y,
+                pred_w,
+                pred_h,
+                bit_depth,
+                sub_x,
+                sub_y,
+                spec.frame_width,
+                spec.frame_height,
+                interp_filter_x,
+                interp_filter_y,
+                mirror.as_mut_slice(),
+                buf_cols,
+            )?;
+
+            if let Some(cp) = self.curr_frame[plane].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src as i32;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
     /// row-major: `skips()[ r * MiCols + c ]`. Cells that no leaf
     /// covered carry `0` (the §5.11.11 [`Self::decode_skip`] writer
@@ -56179,6 +56318,362 @@ mod tests {
             w4.reconstruct_inter_block_compound_multiplane_into_curr_frame(
                 intra_ref1,
                 order_hints,
+                &ref_frame_idx,
+                &specs3,
+                0,
+                0,
+                BLOCK_8X8,
+                3,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r307 multi-plane single-ref bridge: a plain single-reference block
+    /// driven through
+    /// [`PartitionWalker::reconstruct_inter_block_multiplane_into_curr_frame`]
+    /// must reconstruct all three planes (Y, Cb, Cr) byte-identically to
+    /// the per-block [`crate::reconstruct_inter_block`] driver invoked
+    /// once per plane with the §5.11.34 `predict()` per-plane geometry
+    /// (`subX/subY`, `baseX/baseY`, `predW/predH`).
+    #[test]
+    fn r307_walker_reconstructs_single_ref_block_multiplane() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{block_height, block_width, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+
+        // 4:2:0 reference planes: luma 16×16, chroma 8×8.
+        let build_plane = |w: usize, h: usize, a: usize, b: usize, c: usize| -> Vec<u16> {
+            let mut p = vec![0u16; w * h];
+            for r in 0..h {
+                for col in 0..w {
+                    p[r * w + col] = ((r * a + col * b + c) & 0xFF) as u16;
+                }
+            }
+            p
+        };
+        let ly_w = 16usize;
+        let ly_h = 16usize;
+        let lc_w = 8usize;
+        let lc_h = 8usize;
+        let ry = build_plane(ly_w, ly_h, 9, 5, 1);
+        let rcb = build_plane(lc_w, lc_h, 7, 2, 3);
+        let rcr = build_plane(lc_w, lc_h, 4, 6, 9);
+
+        fn mk(p: &[u16], w: usize, h: usize) -> RefFrameStoreEntry<'_> {
+            RefFrameStoreEntry {
+                plane: p,
+                stride: w,
+                upscaled_width: w as u32,
+                width: w as u32,
+                height: h as u32,
+            }
+        }
+        let store_y = [mk(&ry, ly_w, ly_h); 1].repeat(4);
+        let store_cb = [mk(&rcb, lc_w, lc_h); 1].repeat(4);
+        let store_cr = [mk(&rcr, lc_w, lc_h); 1].repeat(4);
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 3];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let mode_info = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 4],
+        };
+
+        // BLOCK_8X8: luma 8×8, chroma 4×4 (4:2:0). Block at top-left.
+        let mi_size = BLOCK_8X8;
+        let lw = block_width(mi_size); // 8
+        let lh = block_height(mi_size); // 8
+        let cw = lw >> 1; // 4
+        let ch = lh >> 1; // 4
+
+        // ---- Oracle: per-block driver, three planes. ----
+        let mut oy = vec![0u16; lw * lh];
+        let mut ocb = vec![0u16; cw * ch];
+        let mut ocr = vec![0u16; cw * ch];
+        crate::reconstruct_inter_block(
+            mode_info,
+            &ref_frame_idx,
+            &store_y,
+            0,
+            0,
+            0,
+            lw,
+            lh,
+            8,
+            0,
+            0,
+            ly_w as u32,
+            ly_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oy,
+            lw,
+        )
+        .unwrap();
+        crate::reconstruct_inter_block(
+            mode_info,
+            &ref_frame_idx,
+            &store_cb,
+            1,
+            0,
+            0,
+            cw,
+            ch,
+            8,
+            1,
+            1,
+            lc_w as u32,
+            lc_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut ocb,
+            cw,
+        )
+        .unwrap();
+        crate::reconstruct_inter_block(
+            mode_info,
+            &ref_frame_idx,
+            &store_cr,
+            2,
+            0,
+            0,
+            cw,
+            ch,
+            8,
+            1,
+            1,
+            lc_w as u32,
+            lc_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut ocr,
+            cw,
+        )
+        .unwrap();
+
+        // ---- Walker multi-plane bridge ----
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(walker.curr_frame(0).is_none());
+
+        let spec_y = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store_y,
+            frame_width: ly_w as u32,
+            frame_height: ly_h as u32,
+        };
+        let spec_cb = PlaneRefSpec {
+            plane: 1,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            frame_store: &store_cb,
+            frame_width: lc_w as u32,
+            frame_height: lc_h as u32,
+        };
+        let spec_cr = PlaneRefSpec {
+            plane: 2,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            frame_store: &store_cr,
+            frame_width: lc_w as u32,
+            frame_height: lc_h as u32,
+        };
+        let specs = [spec_y, spec_cb, spec_cr];
+
+        walker
+            .reconstruct_inter_block_multiplane_into_curr_frame(
+                mode_info,
+                &ref_frame_idx,
+                &specs,
+                0,
+                0,
+                mi_size,
+                3,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("walker multi-plane single-ref reconstruction");
+
+        let got_y: Vec<u16> = walker
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        let got_cb: Vec<u16> = walker
+            .curr_frame(1)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        let got_cr: Vec<u16> = walker
+            .curr_frame(2)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(got_y, oy, "Y plane must match the per-block oracle");
+        assert_eq!(got_cb, ocb, "Cb plane must match the per-block oracle");
+        assert_eq!(got_cr, ocr, "Cr plane must match the per-block oracle");
+
+        // num_planes == 1 reconstructs only luma; chroma untouched.
+        let mut wluma = PartitionWalker::new(2, 2, geom).unwrap();
+        wluma
+            .reconstruct_inter_block_multiplane_into_curr_frame(
+                mode_info,
+                &ref_frame_idx,
+                &specs,
+                0,
+                0,
+                mi_size,
+                1,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("luma-only multi-plane single-ref reconstruction");
+        let luma_only: Vec<u16> = wluma
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(luma_only, oy, "luma-only Y plane must match the oracle");
+        assert!(
+            wluma.curr_frame(1).is_none(),
+            "num_planes == 1 must leave the chroma planes untouched"
+        );
+    }
+
+    /// r307 multi-plane single-ref bridge guards: an invalid `num_planes`,
+    /// an out-of-range `mi_size`, a too-short `plane_specs` slice, and an
+    /// `INTRA_FRAME` `RefFrame[0]` (rejected per-plane by the driver) are
+    /// all surfaced as [`crate::Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn r307_walker_single_ref_multiplane_bridge_guards() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+
+        let refp = vec![0u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 3];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let good_mode = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        let specs3 = [
+            PlaneRefSpec { plane: 0, ..spec },
+            PlaneRefSpec {
+                plane: 1,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                ..spec
+            },
+            PlaneRefSpec {
+                plane: 2,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                ..spec
+            },
+        ];
+
+        // Invalid num_planes (2).
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(matches!(
+            w.reconstruct_inter_block_multiplane_into_curr_frame(
+                good_mode,
+                &ref_frame_idx,
+                &specs3,
+                0,
+                0,
+                BLOCK_8X8,
+                2,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Out-of-range mi_size.
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(matches!(
+            w2.reconstruct_inter_block_multiplane_into_curr_frame(
+                good_mode,
+                &ref_frame_idx,
+                &specs3,
+                0,
+                0,
+                BLOCK_SIZES,
+                3,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // plane_specs too short for num_planes (1 spec, num_planes 3).
+        let mut w3 = PartitionWalker::new(2, 2, geom).unwrap();
+        let one_spec = [PlaneRefSpec { plane: 0, ..spec }];
+        assert!(matches!(
+            w3.reconstruct_inter_block_multiplane_into_curr_frame(
+                good_mode,
+                &ref_frame_idx,
+                &one_spec,
+                0,
+                0,
+                BLOCK_8X8,
+                3,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // INTRA_FRAME RefFrame[0] (driver rejects on the first plane).
+        let mut w4 = PartitionWalker::new(2, 2, geom).unwrap();
+        let intra_ref0 = InterModeInfo {
+            ref_frame: 0,
+            ..good_mode
+        };
+        assert!(matches!(
+            w4.reconstruct_inter_block_multiplane_into_curr_frame(
+                intra_ref0,
                 &ref_frame_idx,
                 &specs3,
                 0,

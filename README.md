@@ -2,6 +2,45 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-15 (round 307)
+
+Round 307 **lands the single-reference multi-plane inter bridge** — the
+plain single-ref companion to r306's compound multi-plane bridge. The
+walker now reconstructs one single-ref inter block's Y/Cb/Cr pixels
+end-to-end in a single call.
+
+* **Walker bridge.** New
+  `PartitionWalker::reconstruct_inter_block_multiplane_into_curr_frame`
+  drives the §5.11.34 `predict()` per-plane loop
+  (`for plane in 0..1 + 2*has_chroma`) for one decoded block, threading
+  the shared decoded `InterModeInfo` / `ref_frame_idx` plus a per-plane
+  `PlaneRefSpec` array through the `crate::reconstruct_inter_block`
+  driver once per plane. The §7.11.3.1 final stitch
+  (`isCompound == 0 && IsInterIntra == 0`) **overwrites** each plane's
+  `predW × predH` footprint with `Clip1(preds[0])` — single-ref forms a
+  single prediction, so (unlike the compound bridge) there is no shared
+  `Mask` to thread.
+* **Per-plane geometry.** Follows §5.11.34 (av1-spec p.83 lines
+  5165-5190): `subX = (plane > 0) ? subsampling_x : 0`,
+  `baseX = (mi_col >> subX) * MI_SIZE`,
+  `predW = Block_Width[MiSize] >> subX`, etc., for the common
+  `someUseIntra == 0` shape (one `predict_inter` call per plane).
+* **Allocation + narrowing.** Each plane's `i32` `CurrFrame` buffer is
+  allocated if untouched (single-ref overwrites — no intra-half
+  prerequisite) and round-tripped through a `u16` mirror (lossless).
+* **Guards.** `num_planes ∉ {1, 3}`, an out-of-range `mi_size`, a
+  `plane_specs` slice shorter than `num_planes`, and an `INTRA_FRAME`
+  `RefFrame[0]` all return `PartitionWalkOutOfRange`.
+* **Scope.** One single-ref leaf at a known mi-origin; the §5.11.34
+  `someUseIntra == 1` intra-neighbour sub-block split, the full
+  §5.11.33 frame-walk wiring into the parser's superblock loop, and
+  OBMC / warp interactions remain out of scope.
+
++2 lib tests (2000 → 2002): a `BLOCK_8X8` 4:2:0 single-ref block
+reconstructed through the multi-plane bridge byte-identically to the
+per-block driver invoked once per plane (plus a `num_planes == 1`
+luma-only control), and the four bridge guards.
+
 ## Status — 2026-06-15 (round 306)
 
 Round 306 **extends the inline compound reconstruction to all planes

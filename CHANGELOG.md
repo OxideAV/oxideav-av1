@@ -4,6 +4,34 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r307 (2026-06-15): **§5.11.5 walker reconstructs a single-ref
+  inter block across all planes (Y/Cb/Cr) in one call** — the plain
+  single-reference companion to r306's compound multi-plane bridge. New
+  `PartitionWalker::reconstruct_inter_block_multiplane_into_curr_frame`
+  drives the §5.11.34 `predict()` per-plane loop
+  (`for plane in 0..1 + 2*has_chroma`) for one decoded block, threading
+  the shared decoded `InterModeInfo` / `ref_frame_idx` plus a per-plane
+  `PlaneRefSpec` array through the `crate::reconstruct_inter_block`
+  driver once per plane. The §7.11.3.1 final stitch
+  (`isCompound == 0 && IsInterIntra == 0`, av1-spec p.258 line 14402)
+  **overwrites** each plane's `predW × predH` footprint with
+  `Clip1(preds[0])`; single-ref forms a single prediction, so (unlike
+  the compound bridge) there is no shared `Mask` to thread. Per-plane
+  geometry follows §5.11.34 `predict()` (av1-spec p.83 lines 5165-5190:
+  `subX = (plane > 0) ? subsampling_x : 0`,
+  `baseX = (mi_col >> subX) * MI_SIZE`,
+  `predW = Block_Width[MiSize] >> subX`, etc.) for the common
+  `someUseIntra == 0` shape. Each plane's `i32` `CurrFrame` buffer is
+  allocated if untouched (single-ref overwrites — no intra-half
+  prerequisite) and round-tripped through a `u16` mirror (lossless).
+  Guards: `num_planes ∉ {1, 3}`, an out-of-range `mi_size`, a
+  `plane_specs` slice shorter than `num_planes`, and an `INTRA_FRAME`
+  `RefFrame[0]` all return `PartitionWalkOutOfRange`. +2 lib tests
+  (2000 → 2002): a `BLOCK_8X8` 4:2:0 single-ref block reconstructed
+  through the multi-plane bridge byte-identically to the per-block
+  driver invoked once per plane (plus a `num_planes == 1` luma-only
+  control), and the four bridge guards.
+
 - decoder r306 (2026-06-15): **§5.11.5 walker reconstructs a compound
   inter block across all planes (Y/Cb/Cr) sharing one §7.11.3.12
   `Mask`**. r305 added the single-plane compound bridge (which
