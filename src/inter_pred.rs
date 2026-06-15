@@ -6005,20 +6005,39 @@ pub struct InterModeInfoGrid<'a> {
 /// translational inter leaf into its `CurrFrame[plane]` buffers.
 ///
 /// This is the §5.11.33 `predict()` body (av1-spec p.82-83, lines
-/// 5127-5191) restricted to the SIMPLE single-forward-reference
-/// translational arm: for each decoded leaf block (top-left of its
-/// `MiSize` footprint) whose `IsInters == 1` and `RefFrame[1] == NONE`,
-/// it iterates the supplied planes and runs the §7.11.3 per-plane
-/// prediction (one `predict_inter` per plane, since on this arm
-/// `someUseIntra` / `IsInterIntra` are both false) via
-/// [`reconstruct_inter_block`]:
+/// 5127-5191) on the single-forward-reference translational arm: for
+/// each decoded leaf block (top-left of its `MiSize` footprint) whose
+/// `IsInters == 1` and `RefFrame[1] == NONE`, it iterates the supplied
+/// planes and runs the §7.11.3 per-plane prediction via
+/// [`reconstruct_inter_block`], including the full §5.11.33 inner
+/// `predict_inter` tiling loop with the `someUseIntra` scan:
 ///
 ///   * `baseX = (MiCol >> subX) * MI_SIZE`,
 ///     `baseY = (MiRow >> subY) * MI_SIZE` (the plane-space block
 ///     origin, av1-spec lines 5135-5136).
-///   * `predW = Block_Width[MiSize] >> subX`,
-///     `predH = Block_Height[MiSize] >> subY` (lines 5166-5167) — the
-///     write region size.
+///   * `candRow = (MiRow >> subY) << subY`,
+///     `candCol = (MiCol >> subX) << subX` (the chroma-collocated
+///     candidate anchor, lines 5137-5138).
+///   * `someUseIntra` scan (lines 5168-5172): the
+///     `(num4x4H << subY) × (num4x4W << subX)` luma cells the plane
+///     block collocates with are tested for
+///     `RefFrames[candRow+r][candCol+c][0] == INTRA_FRAME`. On a hit
+///     (lines 5173-5178) the prediction splits into `num4x4{W,H}`
+///     4-sample sub-blocks re-anchored at the unsubsampled
+///     `(MiRow, MiCol)`, so each chroma sub-block reads its own
+///     collocated luma candidate's MV (the §7.11.3.1 `predict_inter`
+///     step-5/-8 read `RefFrames[cand][0]` / `Mvs[cand][0]`). Off the
+///     split, `predW = Block_Width[MiSize] >> subX`,
+///     `predH = Block_Height[MiSize] >> subY` and the candidate stays
+///     the subsampled anchor (lines 5166-5167). On luma
+///     (`subX = subY = 0`) the anchor already equals `(MiRow, MiCol)`,
+///     so the two paths coincide. The canonical `someUseIntra == 1`
+///     case is a sub-8×8 chroma block under 4:2:0 whose bottom-right
+///     `HasChroma` leaf collocates with sibling intra leaves: it then
+///     correctly predicts from the bottom-right block's MV.
+///   * the inner `for y/x` loop (lines 5179-5189) tiles the
+///     `num4x4H*4 × num4x4W*4` plane region with `predW × predH`
+///     sub-blocks.
 ///
 /// **Leaf detection.** The §5.11.5 walker stamps each leaf's `MiSize`
 /// over its whole `bh4 × bw4` footprint, so a block origin is the
@@ -6310,40 +6329,136 @@ pub fn reconstruct_inter_frame(
 
             debug_assert_eq!(ref_frame1, NONE_REF_FRAME);
             // --- single forward-reference translational arm. ---
-            let mode_info = InterModeInfo {
-                ref_frame: ref_frame0 as u8,
-                mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
-            };
+            //
+            // §5.11.33 `predict()` per-plane body (av1-spec p.82-83 lines
+            // 5127-5190) in full, including the `someUseIntra` scan and
+            // the resulting `predict_inter` sub-block tiling.
 
-            // --- §5.11.33 per-plane predict_inter loop. ---
             for ctx in planes.iter_mut() {
                 let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
                 let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
-                // av1-spec lines 5135-5136 / 5166-5167.
+
+                // §5.11.33 lines 5128-5130: per-plane residual size →
+                // `num4x4W` / `num4x4H`. `get_plane_residual_size` is
+                // guaranteed non-`BLOCK_INVALID` for plane 1 by §6.4.1
+                // conformance, and for plane 0 it is the identity; a
+                // `None` is a caller bug (non-conformant grid).
+                let plane_sz =
+                    crate::cdf::get_plane_residual_size(mi_size, ctx.plane, sub_x, sub_y)
+                        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                let num4x4_w = crate::cdf::num_4x4_blocks_wide(plane_sz);
+                let num4x4_h = crate::cdf::num_4x4_blocks_high(plane_sz);
+
+                // §5.11.33 lines 5135-5138: plane-space block origin and
+                // the chroma-collocated candidate anchor `candRow` /
+                // `candCol` (`(MiRow >> subY) << subY` etc.).
                 let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
                 let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
-                let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
-                let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+                let mut cand_row = (mi_row >> sub_y) << sub_y;
+                let mut cand_col = (mi_col >> sub_x) << sub_x;
 
-                reconstruct_inter_block(
-                    mode_info,
-                    ref_frame_idx,
-                    ctx.frame_store,
-                    ctx.plane,
-                    base_x,
-                    base_y,
-                    pred_w,
-                    pred_h,
-                    grid.bit_depth,
-                    ctx.subsampling_x,
-                    ctx.subsampling_y,
-                    ctx.frame_width,
-                    ctx.frame_height,
-                    interp_x,
-                    interp_y,
-                    ctx.curr,
-                    ctx.curr_stride,
-                )?;
+                // §5.11.33 lines 5166-5167: default (`someUseIntra == 0`)
+                // prediction footprint.
+                let mut pred_w = crate::cdf::block_width(mi_size) >> sub_x;
+                let mut pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+
+                // §5.11.33 lines 5168-5172: `someUseIntra` scan over the
+                // `(num4x4H << subY) × (num4x4W << subX)` luma cells the
+                // chroma block collocates with. A cell whose
+                // `RefFrames[ candRow + r ][ candCol + c ][ 0 ] ==
+                // INTRA_FRAME` flags the split. Cells off the grid edge
+                // are not stamped (treated as non-intra), matching the
+                // §5.11.5 grid-fill clip.
+                const INTRA_FRAME_REF0: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+                let mut some_use_intra = false;
+                'scan: for r in 0..(num4x4_h << sub_y) {
+                    let rr = cand_row + r;
+                    if rr >= mi_rows {
+                        break;
+                    }
+                    for c in 0..(num4x4_w << sub_x) {
+                        let cc = cand_col + c;
+                        if cc >= mi_cols {
+                            break;
+                        }
+                        if grid.ref_frames[(rr * mi_cols + cc) * 2] == INTRA_FRAME_REF0 {
+                            some_use_intra = true;
+                            break 'scan;
+                        }
+                    }
+                }
+
+                // §5.11.33 lines 5173-5178: on `someUseIntra` the
+                // prediction is split into `num4x4{W,H}` sub-blocks of
+                // 4 samples each, anchored at the unsubsampled
+                // `(MiRow, MiCol)` so each sub-block reads its own
+                // collocated luma candidate.
+                if some_use_intra {
+                    pred_w = num4x4_w * 4;
+                    pred_h = num4x4_h * 4;
+                    cand_row = mi_row;
+                    cand_col = mi_col;
+                }
+
+                // §5.11.33 lines 5179-5189: tile the
+                // `num4x4H*4 × num4x4W*4` plane region with
+                // `predW × predH` sub-blocks, advancing the candidate
+                // `(candRow + r, candCol + c)` per sub-block. Each
+                // sub-block's `predict_inter` reads `Mvs[cand][0]` /
+                // `RefFrames[cand][0]` at its own candidate cell (all
+                // cells of one leaf carry the leaf's stamped MV/ref, so
+                // on `someUseIntra == 0` this collapses to the single
+                // origin call the prior arm performed).
+                let region_w = num4x4_w * 4;
+                let region_h = num4x4_h * 4;
+                let mut r_idx = 0usize;
+                let mut y = 0usize;
+                while y < region_h {
+                    let mut c_idx = 0usize;
+                    let mut x = 0usize;
+                    while x < region_w {
+                        let cr = cand_row + r_idx;
+                        let cc = cand_col + c_idx;
+                        // Clamp the candidate to the grid; the leaf
+                        // stamped its MV/ref over the whole footprint,
+                        // so an off-edge candidate (only reachable when
+                        // the leaf is clipped at the frame boundary)
+                        // re-reads the nearest in-grid cell of the same
+                        // leaf.
+                        let cr = cr.min(mi_rows.saturating_sub(1));
+                        let cc = cc.min(mi_cols.saturating_sub(1));
+                        let cand = cr * mi_cols + cc;
+                        let mode_info = InterModeInfo {
+                            ref_frame: grid.ref_frames[cand * 2] as u8,
+                            mv: [grid.mvs[cand * 4], grid.mvs[cand * 4 + 1]],
+                        };
+
+                        reconstruct_inter_block(
+                            mode_info,
+                            ref_frame_idx,
+                            ctx.frame_store,
+                            ctx.plane,
+                            base_x + x as i32,
+                            base_y + y as i32,
+                            pred_w,
+                            pred_h,
+                            grid.bit_depth,
+                            ctx.subsampling_x,
+                            ctx.subsampling_y,
+                            ctx.frame_width,
+                            ctx.frame_height,
+                            interp_x,
+                            interp_y,
+                            ctx.curr,
+                            ctx.curr_stride,
+                        )?;
+
+                        c_idx += 1;
+                        x += pred_w;
+                    }
+                    r_idx += 1;
+                    y += pred_h;
+                }
             }
         }
     }
@@ -9476,6 +9591,238 @@ mod tests {
         assert_ne!(
             curr[8], sentinel,
             "the (0,2) inter leaf must have been reconstructed"
+        );
+    }
+
+    /// §5.11.33 `predict()` `someUseIntra == 1` chroma sub-block split
+    /// (av1-spec p.83 lines 5168-5189) on the single-reference frame
+    /// walk.
+    ///
+    /// The canonical trigger is a sub-8×8 luma partition under 4:2:0:
+    /// four `BLOCK_4X4` mi-cells where the bottom-right cell (mi 1,1)
+    /// is the `HasChroma` block and the partition mixes inter and intra
+    /// leaves. For that chroma block:
+    ///   * `planeSz = get_plane_residual_size(BLOCK_4X4, 1) = BLOCK_4X4`
+    ///     ⇒ `num4x4W = num4x4H = 1`;
+    ///   * `candRow = (1 >> 1) << 1 = 0`, `candCol = 0` initially;
+    ///   * the `(num4x4H<<subY)×(num4x4W<<subX) = 2×2` scan visits cells
+    ///     (0,0),(0,1),(1,0),(1,1); cells (0,1) and (1,0) carry
+    ///     `RefFrames[..][0] == INTRA_FRAME` ⇒ `someUseIntra = 1`;
+    ///   * the split re-anchors `candRow = MiRow = 1`, `candCol = MiCol
+    ///     = 1`, so the single chroma `predict_inter` reads the
+    ///     **bottom-right** block's MV (`Mvs[1][1]`), not the
+    ///     top-left's (`Mvs[0][0]`).
+    ///
+    /// The grid stamps DIFFERENT MVs on (0,0) and (1,1), so the chroma
+    /// output is MV-distinguishable: it must equal an oracle
+    /// `reconstruct_inter_block` driven with the (1,1) MV at the chroma
+    /// origin, and must NOT equal the same oracle driven with the (0,0)
+    /// MV (the pre-split behaviour). The luma plane is unaffected
+    /// (`subX = subY = 0` ⇒ `candRow/candCol == MiRow/MiCol` already,
+    /// and each `BLOCK_4X4` luma leaf predicts its own cell).
+    #[test]
+    fn r308_reconstruct_inter_frame_chroma_some_use_intra_uses_bottom_right_mv() {
+        // 16×16 reference plane `ref[r][c] = r*16 + c`, slot 0.
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (r * 16 + c) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry];
+        let store2 = store;
+        let ref_frame_idx: [u8; 7] = [0; 7];
+
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+
+        use crate::cdf::{BLOCK_4X4, BLOCK_INVALID};
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        let mut is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1; // slot-1 NONE pre-fill
+        }
+        let mut mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let comp_types = vec![COMPOUND_AVERAGE; cells];
+        let wedge_zeros = vec![0u8; cells];
+        let order_hints_by_ref = [0i32; 8];
+
+        let idx = |r: usize, c: usize| r * mi_cols as usize + c;
+
+        // Two distinct integer-sample MVs (in 1/8-luma units: +8 == one
+        // full sample). MV-A on (0,0); MV-B on (1,1).
+        let mv_a: [i16; 2] = [0, 8]; // shift ref col by +1
+        let mv_b: [i16; 2] = [8, 0]; // shift ref row by +1
+
+        // (0,0) inter, MV-A.
+        mi_sizes[idx(0, 0)] = BLOCK_4X4;
+        is_inters[idx(0, 0)] = 1;
+        ref_frames[idx(0, 0) * 2] = last;
+        mvs[idx(0, 0) * 4] = mv_a[0];
+        mvs[idx(0, 0) * 4 + 1] = mv_a[1];
+
+        // (0,1) intra, (1,0) intra (RefFrames[..][0] = INTRA_FRAME = 0,
+        // which is the array's zero pre-fill; is_inter stays 0).
+        mi_sizes[idx(0, 1)] = BLOCK_4X4;
+        mi_sizes[idx(1, 0)] = BLOCK_4X4;
+
+        // (1,1) inter, MV-B — the HasChroma bottom-right block.
+        mi_sizes[idx(1, 1)] = BLOCK_4X4;
+        is_inters[idx(1, 1)] = 1;
+        ref_frames[idx(1, 1) * 2] = last;
+        mvs[idx(1, 1) * 4] = mv_b[0];
+        mvs[idx(1, 1) * 4 + 1] = mv_b[1];
+
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &comp_types,
+            wedge_indices: &wedge_zeros,
+            wedge_signs: &wedge_zeros,
+            mask_types: &wedge_zeros,
+            interintra_modes: &wedge_zeros,
+            wedge_interintras: &wedge_zeros,
+            interintra_wedge_indices: &wedge_zeros,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+        };
+
+        // Chroma plane (4:2:0): 4 rows × 4 cols (mi_rows*4>>1 ×
+        // mi_cols*4>>1). The chroma reference is sub-sampled width too.
+        let chroma_w = ((mi_cols * 4) >> 1) as usize; // 4
+        let chroma_h = ((mi_rows * 4) >> 1) as usize; // 4
+        let sentinel = 5000u16;
+        let mut chroma = vec![sentinel; chroma_w * chroma_h];
+
+        // Luma plane (8×8) just to satisfy the 3-plane loop; its
+        // contents are not asserted here.
+        let luma_w = (mi_cols * 4) as usize;
+        let luma_h = (mi_rows * 4) as usize;
+        let mut luma = vec![sentinel; luma_w * luma_h];
+        let mut cr = vec![sentinel; chroma_w * chroma_h];
+
+        {
+            let mut planes = [
+                PlaneReconContext {
+                    plane: 0,
+                    subsampling_x: 0,
+                    subsampling_y: 0,
+                    frame_store: &store,
+                    frame_width: ref_w as u32,
+                    frame_height: ref_h as u32,
+                    curr: &mut luma,
+                    curr_stride: luma_w,
+                },
+                PlaneReconContext {
+                    plane: 1,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store,
+                    frame_width: (ref_w as u32) >> 1,
+                    frame_height: (ref_h as u32) >> 1,
+                    curr: &mut chroma,
+                    curr_stride: chroma_w,
+                },
+                PlaneReconContext {
+                    plane: 2,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store,
+                    frame_width: (ref_w as u32) >> 1,
+                    frame_height: (ref_h as u32) >> 1,
+                    curr: &mut cr,
+                    curr_stride: chroma_w,
+                },
+            ];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("frame-level inter reconstruction (3-plane 420)");
+        }
+
+        // Oracle: the §5.11.33 someUseIntra split drives the (1,1) chroma
+        // block as one `predict_inter` at chroma origin (baseX = (MiCol
+        // >> 1) * 4 = 0, baseY = 0), predW = predH = num4x4*4 = 4, using
+        // the bottom-right candidate's MV (MV-B).
+        let mut oracle_b = vec![sentinel; chroma_w * chroma_h];
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last as u8,
+                mv: mv_b,
+            },
+            &ref_frame_idx,
+            &store2,
+            1,
+            0,
+            0,
+            4,
+            4,
+            8,
+            1,
+            1,
+            (ref_w as u32) >> 1,
+            (ref_h as u32) >> 1,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle_b,
+            chroma_w,
+        )
+        .unwrap();
+
+        assert_eq!(
+            chroma, oracle_b,
+            "someUseIntra chroma split must predict from the bottom-right block's MV"
+        );
+
+        // The pre-split (wrong) behaviour would read the subsampled
+        // top-left candidate's MV (MV-A). Prove the split actually
+        // changed the bytes.
+        let mut oracle_a = vec![sentinel; chroma_w * chroma_h];
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last as u8,
+                mv: mv_a,
+            },
+            &ref_frame_idx,
+            &store2,
+            1,
+            0,
+            0,
+            4,
+            4,
+            8,
+            1,
+            1,
+            (ref_w as u32) >> 1,
+            (ref_h as u32) >> 1,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle_a,
+            chroma_w,
+        )
+        .unwrap();
+        assert_ne!(
+            chroma, oracle_a,
+            "someUseIntra split must NOT use the top-left subsampled candidate's MV"
         );
     }
 

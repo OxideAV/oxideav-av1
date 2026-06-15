@@ -2,6 +2,42 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-15 (round 308)
+
+Round 308 **wires the §5.11.33 `someUseIntra` chroma sub-block split
+into the single-ref frame walk.** `reconstruct_inter_frame`'s
+single-forward-reference arm now runs the full §5.11.33 `predict()`
+inner loop (av1-spec p.82-83 lines 5127-5190) in place of the prior
+`someUseIntra == 0` shortcut.
+
+* **`someUseIntra` scan.** Per plane the walk derives
+  `planeSz = get_plane_residual_size(MiSize, plane)` → `num4x4{W,H}`,
+  anchors the candidate at `candRow = (MiRow >> subY) << subY` /
+  `candCol = (MiCol >> subX) << subX`, and scans the
+  `(num4x4H << subY) × (num4x4W << subX)` collocated luma cells for
+  `RefFrames[candRow+r][candCol+c][0] == INTRA_FRAME` (lines 5168-5172).
+* **Split geometry.** On a hit (lines 5173-5178) the prediction splits
+  into `num4x4{W,H}` 4-sample sub-blocks re-anchored at the unsubsampled
+  `(MiRow, MiCol)`; each chroma sub-block reads its own collocated luma
+  candidate's `Mvs[cand][0]` / `RefFrames[cand][0]` (the §7.11.3.1
+  `predict_inter` step-5/-8 reads). The inner `for y/x` loop (lines
+  5179-5189) tiles the `num4x4H*4 × num4x4W*4` region with `predW ×
+  predH` sub-blocks.
+* **Luma unchanged.** On luma (`subX = subY = 0`) the anchor already
+  equals `(MiRow, MiCol)`, so the path collapses to the prior single
+  origin call — no behaviour change. The canonical `someUseIntra == 1`
+  case is a sub-8×8 chroma block under 4:2:0 whose bottom-right
+  `HasChroma` leaf collocates with sibling intra leaves: it now
+  correctly predicts from the **bottom-right** block's MV rather than
+  the subsampled top-left's.
+* **Scope.** The full §5.11.33 frame-walk wiring into the parser's
+  superblock loop, and OBMC / warp interactions, remain out of scope.
+
++1 lib test (2002 → 2003): a 2×2 mi-grid 4:2:0 sub-8×8 partition
+(inter / intra / intra / inter) drives the chroma plane through the
+split and asserts the output equals an oracle `reconstruct_inter_block`
+keyed to the (1,1) MV and differs from one keyed to the (0,0) MV.
+
 ## Status — 2026-06-15 (round 307)
 
 Round 307 **lands the single-reference multi-plane inter bridge** — the

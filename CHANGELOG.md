@@ -4,6 +4,34 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- decoder r308 (2026-06-15): **§5.11.33 `predict()` `someUseIntra`
+  chroma sub-block split wired into the single-ref frame walk** —
+  `reconstruct_inter_frame`'s single-forward-reference arm now runs the
+  full §5.11.33 `predict()` inner loop (av1-spec p.82-83 lines
+  5127-5190) instead of the prior `someUseIntra == 0` shortcut. Per
+  plane it derives `planeSz = get_plane_residual_size(MiSize, plane)` →
+  `num4x4{W,H}`, anchors the candidate at
+  `candRow = (MiRow >> subY) << subY` / `candCol = (MiCol >> subX) <<
+  subX`, and scans the `(num4x4H << subY) × (num4x4W << subX)`
+  collocated luma cells for `RefFrames[candRow+r][candCol+c][0] ==
+  INTRA_FRAME` (lines 5168-5172). On a hit (lines 5173-5178) the
+  prediction splits into `num4x4{W,H}` 4-sample sub-blocks re-anchored
+  at the unsubsampled `(MiRow, MiCol)`, so each chroma sub-block reads
+  its own collocated luma candidate's `Mvs[cand][0]` / `RefFrames[cand]
+  [0]` (the §7.11.3.1 `predict_inter` step-5/-8 reads). The inner
+  `for y/x` loop (lines 5179-5189) then tiles the `num4x4H*4 ×
+  num4x4W*4` region with `predW × predH` sub-blocks. On luma
+  (`subX = subY = 0`) the anchor already equals `(MiRow, MiCol)` and the
+  path collapses to the prior single origin call (no behaviour change);
+  the canonical `someUseIntra == 1` case — a sub-8×8 chroma block under
+  4:2:0 whose bottom-right `HasChroma` leaf collocates with sibling
+  intra leaves — now correctly predicts from the **bottom-right**
+  block's MV rather than the subsampled top-left's. +1 lib test
+  (2002 → 2003): a 2×2 mi-grid 4:2:0 sub-8×8 partition (inter / intra /
+  intra / inter) drives the chroma plane through the split and asserts
+  the output equals an oracle `reconstruct_inter_block` keyed to the
+  (1,1) MV and differs from one keyed to the (0,0) MV.
+
 - decoder r307 (2026-06-15): **§5.11.5 walker reconstructs a single-ref
   inter block across all planes (Y/Cb/Cr) in one call** — the plain
   single-reference companion to r306's compound multi-plane bridge. New
