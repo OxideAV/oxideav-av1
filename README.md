@@ -2,6 +2,34 @@
 
 Pure-Rust AV1 (AOMedia Video 1) codec.
 
+## Status — 2026-06-15 (round 311)
+
+Round 311 **adds the cargo-fuzz harness and turns the scheduled `Fuzz`
+job green.** The `.github/workflows/fuzz.yml` workflow discovers
+`fuzz/fuzz_targets/*.rs`, but no `fuzz/` directory had ever been
+committed, so every scheduled run failed at setup with `cwd: …/fuzz
+does not exist`. This lands a self-contained cargo-fuzz workspace under
+`fuzz/` with three libFuzzer targets, each driving **only this crate's
+public Rust API** (no external decoder / library / oracle linked):
+
+* **`decode`** — attacker bytes through the top-level `decode_av1`
+  entry: IVF parse → §5.2/§5.3 OBU walk → §5.5/§5.9 sequence + frame
+  headers → §5.11 tile / partition / reconstruction. Contract:
+  panic-freedom; malformed input must surface a typed `Error`.
+* **`obu`** — the framing layer in isolation: `parse_leb128` (§4.10.5),
+  `parse_obu` (§5.3.2/§5.3.3), `ObuIter` (§5.2), plus
+  `parse_sequence_header` (§5.5) on every surfaced sequence-header OBU.
+* **`roundtrip`** — derives in-range multiples-of-8 dimensions from the
+  first two bytes, feeds a length-matched YUV 4:2:0 blob through
+  `encode_av1` (§5.9.2 CodedLossless arm), then re-decodes the IVF
+  output via `decode_av1` (encoder validation + decode-of-own-output).
+
+`fuzz/.gitignore` excludes `Cargo.lock` / `target` / `corpus` /
+`artifacts`; the `[workspace]` block keeps the umbrella `crates/*` glob
+from pulling the harness in. No `src/` change — the decoder / encoder
+surface is unchanged; this is pure CI-health + attacker-surface
+coverage.
+
 ## Status — 2026-06-15 (round 308)
 
 Round 308 **wires the §5.11.33 `someUseIntra` chroma sub-block split

@@ -4,6 +4,30 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- infra r311 (2026-06-15): **cargo-fuzz harness added — turns the
+  9-day-red scheduled `Fuzz` job green**. The `.github/workflows/fuzz.yml`
+  workflow discovers `fuzz/fuzz_targets/*.rs`, but no `fuzz/` directory
+  had ever been committed, so every scheduled run since 2026-06-06 (and
+  earlier) failed at setup with `cwd: …/fuzz does not exist`. This adds a
+  self-contained cargo-fuzz workspace under `fuzz/` with three libFuzzer
+  targets, all driving only this crate's public Rust API (no external
+  decoder/library/oracle linked — clean-room):
+  - `decode` — attacker bytes through the top-level `decode_av1` entry
+    (IVF parse → §5.2/§5.3 OBU walk → §5.5/§5.9 headers → §5.11 tile /
+    partition / reconstruction). Contract: panic-freedom; malformed
+    input must surface a typed `Error`.
+  - `obu` — the framing layer in isolation: `parse_leb128` (§4.10.5),
+    `parse_obu` (§5.3.2/§5.3.3), `ObuIter` (§5.2), and
+    `parse_sequence_header` (§5.5) on each surfaced sequence-header OBU.
+  - `roundtrip` — derives in-range multiples-of-8 dimensions from the
+    first two bytes, feeds a length-matched YUV 4:2:0 blob through
+    `encode_av1` (§5.9.2 CodedLossless arm), then re-decodes the IVF
+    output via `decode_av1` (encoder validation + decode-of-own-output).
+  `fuzz/.gitignore` excludes `Cargo.lock` / `target` / `corpus` /
+  `artifacts` per the workspace fuzz convention; the `[workspace]` block
+  keeps the umbrella `crates/*` glob from pulling the harness in. No
+  `src/` change — the decoder/encoder surface is unchanged.
+
 - decoder r308 (2026-06-15): **§5.11.33 `predict()` `someUseIntra`
   chroma sub-block split wired into the single-ref frame walk** —
   `reconstruct_inter_frame`'s single-forward-reference arm now runs the

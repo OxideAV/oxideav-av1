@@ -1,0 +1,94 @@
+# cargo-fuzz manifest for the oxideav-av1 DECODE / framing attacker
+# surface.
+#
+# The scheduled `Fuzz` workflow (`.github/workflows/fuzz.yml`) discovers
+# every `fuzz/fuzz_targets/*.rs` here and runs each under libFuzzer with
+# the AddressSanitizer for a slice of the daily time budget. The harness
+# drives attacker-supplied bytes through the crate's own public decode
+# and framing entry points; the contract under test is panic-freedom on
+# every entry, irrespective of input shape (no out-of-bounds index, no
+# arithmetic overflow in a debug build, no unwrap on a None / Err that
+# attacker input can force).
+#
+# Spec basis for the targets:
+#   * AV1 §5.2 (OBU low-overhead framing), §5.3.2/§5.3.3 (OBU header +
+#     extension header), the §4.10.5 leb128() primitive — exercised by
+#     the `obu` target.
+#   * §5.5 (sequence_header_obu), §5.9 (frame header), §5.11 (tile
+#     group / partition walk / reconstruction) reached top-to-bottom
+#     through the IVF-wrapped `decode_av1` entry — exercised by the
+#     `decode` target.
+#   * The intra encode path (§5.9.2 CodedLossless arm) feeding its IVF
+#     output straight back into `decode_av1` — exercised by the
+#     `roundtrip` target, which stresses the encoder's dimension /
+#     plane-length validation and the decode-of-own-output path.
+#
+# Clean-room: every target calls only this crate's public Rust API. No
+# external decoder, library, or oracle is linked.
+
+[package]
+name = "oxideav-av1-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-av1]
+path = ".."
+
+# Self-contained workspace so the umbrella's `crates/*` member glob
+# (one level deep — this manifest is two levels deep and would not
+# match anyway) cannot pull this package in.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1 — `decode`. Drives attacker-controlled bytes through the
+# top-level `decode_av1` entry, which parses the IVF wrapper (§ container
+# framing), walks every temporal unit's OBUs (§5.2 / §5.3), parses the
+# sequence + frame headers (§5.5 / §5.9), and runs the §5.11 tile /
+# partition / reconstruction pipeline. Every field on every layer is
+# attacker-chosen; the contract is that no input shape panics — malformed
+# streams must surface a typed `Error`, never an unwrap / index fault.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+# Target 2 — `obu`. Structured fuzzer for the framing layer in
+# isolation: `ObuIter` (low-overhead OBU concatenation, §5.2),
+# `parse_obu` (§5.3.2 header + §5.3.3 extension header), and
+# `parse_leb128` (§4.10.5). Attacker bytes drive the size-field /
+# extension-flag / forbidden-bit decoding and the descriptor's payload
+# slicing; the contract is panic-freedom on every prefix shape, plus a
+# parse of every sequence-header payload the iterator surfaces.
+[[bin]]
+name = "obu"
+path = "fuzz_targets/obu.rs"
+test = false
+doc = false
+
+# Target 3 — `roundtrip`. Splits the attacker bytes into width / height
+# nibbles plus a YUV 4:2:0 plane blob, drives them through `encode_av1`
+# (intra CodedLossless arm), and feeds any resulting IVF bytes straight
+# back into `decode_av1`. Stresses the encoder's dimension / plane-length
+# validation, the partition-tree + coefficient writer, and the
+# decode-of-own-output path under attacker-chosen dimensions.
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
