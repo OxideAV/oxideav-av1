@@ -12,9 +12,17 @@ are broadly complete (OBU framing, sequence header, full
 uncompressed-frame-header syntax tree, tile info), and an intra-only
 decode/encode pixel pipeline is wired end-to-end for a constrained
 parameter set. Inter prediction and full-feature reconstruction are
-not yet covered, and the crate does not register a working
-decoder/encoder into the runtime codec registry yet (`register` is a
-no-op).
+not yet covered.
+
+The intra-only decoder is now reachable through the runtime codec
+registry: `register` installs an `oxideav_core::Decoder` factory for
+codec id `av1` and claims the container identifiers an AV1 elementary
+stream is carried under — the ISOBMFF sample entry `av01` / IVF FourCC
+`AV01` and the Matroska / WebM Codec ID `V_AV1`. The wrapper bridges the
+existing `decode_av1` driver onto the packet-to-frame trait surface; its
+coverage equals that driver's (single-tile intra keyframes), so the
+registered surface is partial but resolvable. The historical direct API
+(`decode_av1` / `encode_av1`) is unchanged.
 
 ### What parses
 

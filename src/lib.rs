@@ -1531,6 +1531,7 @@ pub mod loop_filter;
 pub mod loop_restoration;
 pub mod obu;
 pub mod qmatrix;
+pub mod registry;
 pub mod scan;
 pub mod sequence_header;
 pub mod superres;
@@ -2577,8 +2578,18 @@ pub fn encode_av1(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Err
     Ok(encoded.ivf_bytes)
 }
 
-/// No-op codec registration — the clean-room scaffold does not yet
-/// register a working decoder or encoder.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Codec registration entry point.
+///
+/// Installs the intra-only [`registry::Av1Decoder`] factory and claims
+/// the ISOBMFF `av01` / IVF `AV01` FourCC and Matroska `V_AV1` container
+/// identifiers, making the AV1 decoder reachable through the
+/// `RuntimeContext` / `oxideav-meta::register_all` path. See
+/// [`registry`] for the bridge details and the registered scope.
+///
+/// The historical direct API ([`decode_av1`] / [`encode_av1`]) is
+/// unaffected and remains the primary surface for in-crate callers.
+pub fn register(ctx: &mut RuntimeContext) {
+    registry::register(ctx);
+}
 
 oxideav_core::register!("av1", register);
