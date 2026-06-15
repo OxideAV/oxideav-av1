@@ -156,6 +156,20 @@ pub(crate) fn read_tile_info(
     } else {
         ((mi_cols + 15) >> 4, (mi_rows + 15) >> 4, 4u32)
     };
+
+    // §5.9.15 presupposes a conformant frame size: §5.9.5 frame_size()
+    // requires FrameWidth/FrameHeight >= 1, so MiCols/MiRows >= 1 and
+    // therefore sbCols/sbRows >= 1. The non-uniform branch leans on this
+    // — `widestTileSb` is seeded to 0 and only raised inside the
+    // `for (startSb = 0; startSb < sbCols; ...)` loop (spec lines
+    // 3239-3253), then used as the divisor of `maxTileAreaSb /
+    // widestTileSb` (line 3262). A malformed header that yields a zero
+    // superblock dimension would skip the loop, leave widestTileSb == 0,
+    // and divide by zero. Such a frame is not decodable, so reject it
+    // with a typed error rather than allowing the panic.
+    if sb_cols == 0 || sb_rows == 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
     let sb_size = sb_shift + 2;
     let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size;
     let max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size);
@@ -470,5 +484,24 @@ mod tests {
     fn truncated_payload_returns_unexpected_end() {
         let err = parse_tile_info(&[], 4, 4, false).expect_err("empty payload");
         assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    #[test]
+    fn zero_frame_dimensions_rejected_not_divide_by_zero() {
+        // §5.9.15 presupposes a conformant frame size (MiCols/MiRows >=
+        // 1). A malformed header carrying a zero dimension yields a zero
+        // superblock count, which previously divided by zero at
+        // `maxTileAreaSb / widestTileSb` (spec line 3262) in the
+        // non-uniform branch. It must now surface a typed error. The
+        // single `0` byte selects `uniform_tile_spacing_flag = 0` so the
+        // non-uniform branch is the one under test; the guard fires
+        // before any branch, so the dimension check is what's exercised.
+        for (mi_cols, mi_rows) in [(0u32, 4u32), (4, 0), (0, 0)] {
+            for sb128 in [false, true] {
+                let err = parse_tile_info(&[0x00], mi_cols, mi_rows, sb128)
+                    .expect_err("zero-dimension frame must be rejected");
+                assert_eq!(err, Error::PartitionWalkOutOfRange);
+            }
+        }
     }
 }

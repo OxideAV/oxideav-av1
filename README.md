@@ -26,9 +26,19 @@ public Rust API** (no external decoder / library / oracle linked):
 
 `fuzz/.gitignore` excludes `Cargo.lock` / `target` / `corpus` /
 `artifacts`; the `[workspace]` block keeps the umbrella `crates/*` glob
-from pulling the harness in. No `src/` change — the decoder / encoder
-surface is unchanged; this is pure CI-health + attacker-surface
-coverage.
+from pulling the harness in.
+
+The `decode` target immediately paid off: it found a **§5.9.15
+`tile_info()` divide-by-zero** reachable from attacker bytes. A
+malformed frame header yielding `MiCols == 0` / `MiRows == 0` produces a
+zero superblock count; the non-uniform branch seeds `widestTileSb = 0`
+and only raises it inside the `for (startSb = 0; startSb < sbCols; …)`
+loop (spec lines 3239-3253), so a zero `sbCols` left it `0` as the
+divisor of `maxTileAreaSb / widestTileSb` (spec line 3262). §5.9.5
+`frame_size()` requires `FrameWidth` / `FrameHeight >= 1` for a
+conformant stream, so `read_tile_info` now rejects a zero superblock
+dimension up front with `Error::PartitionWalkOutOfRange`. +1 regression
+test (2003 → 2004), verified against the exact fuzz-found crash input.
 
 ## Status — 2026-06-15 (round 308)
 

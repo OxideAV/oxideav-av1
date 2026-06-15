@@ -25,8 +25,25 @@ All notable changes to `oxideav-av1` are recorded here.
     output via `decode_av1` (encoder validation + decode-of-own-output).
   `fuzz/.gitignore` excludes `Cargo.lock` / `target` / `corpus` /
   `artifacts` per the workspace fuzz convention; the `[workspace]` block
-  keeps the umbrella `crates/*` glob from pulling the harness in. No
-  `src/` change — the decoder/encoder surface is unchanged.
+  keeps the umbrella `crates/*` glob from pulling the harness in.
+
+- fix r311 (2026-06-15): **§5.9.15 `tile_info()` divide-by-zero on a
+  zero-dimension frame** — the new `decode` fuzz target found a panic
+  (`panic_const_div_by_zero` at `tile_info.rs`) reachable from attacker
+  bytes. A malformed frame header yielding `MiCols == 0` or
+  `MiRows == 0` produces a zero superblock count; the §5.9.15
+  non-uniform branch seeds `widestTileSb = 0` and only raises it inside
+  the `for (startSb = 0; startSb < sbCols; …)` loop (spec lines
+  3239-3253), so a zero `sbCols` skipped the loop and left
+  `widestTileSb == 0` as the divisor of `maxTileAreaSb / widestTileSb`
+  (spec line 3262). §5.9.5 `frame_size()` requires `FrameWidth` /
+  `FrameHeight >= 1` (hence `sbCols` / `sbRows >= 1`) for a conformant
+  stream, so `read_tile_info` now rejects a zero superblock dimension up
+  front with `Error::PartitionWalkOutOfRange` rather than panicking. +1
+  regression test (`zero_frame_dimensions_rejected_not_divide_by_zero`,
+  2003 → 2004) covering `(0,4) / (4,0) / (0,0)` × {64×64, 128×128 SB};
+  verified against the exact fuzz-found crash input, which now returns a
+  typed error instead of aborting.
 
 - decoder r308 (2026-06-15): **§5.11.33 `predict()` `someUseIntra`
   chroma sub-block split wired into the single-ref frame walk** —
