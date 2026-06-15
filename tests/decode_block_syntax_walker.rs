@@ -3800,3 +3800,195 @@ fn r281_decode_block_syntax_palette_block_consumes_palette_tokens() {
         "decoder must be positioned at the sentinel after the palette walk"
     );
 }
+
+// ===========================================================================
+// §5.11.3 clear_block_decoded_flags / §6.10.3 BlockDecoded queries
+// ===========================================================================
+//
+// `BlockDecoded[ plane ][ y ][ x ]` (av1-spec p.60 / p.85 / p.405) is the
+// per-superblock availability grid the §5.11.35 `predict_intra` invocation
+// reads for above-right / below-left reference-sample selection. r318 wires
+// the §5.11.3 reset + §5.11.35 per-TU stamp into the walker; these tests
+// pin the reset's border-vs-interior pattern across the SB-size /
+// num-planes / subsampling / frame-edge axes that drive the §5.11.3 body.
+
+/// §5.11.3 base case: a 64×64 superblock (`sbSize4 = 16`) at the frame
+/// origin with three planes, no subsampling, the SB strictly inside the
+/// tile. The top border (`y == -1`) and left border (`x == -1`) are `1`
+/// over the SB span; the interior and the off-SB tails are `0`; the
+/// below-left corner (`[sbSize4][-1]`) is forced back to `0`.
+#[test]
+fn clear_block_decoded_flags_64x64_three_plane_no_subsampling() {
+    // 32×32 mi tile (two 64×64 superblocks per axis) so the origin SB is
+    // strictly interior (sbWidth4 / sbHeight4 both 32 > sbSize4 = 16).
+    let mut walker = walker_n(32);
+    let sb_size4 = 16u32;
+    walker.clear_block_decoded_flags(0, 0, sb_size4, /* num_planes = */ 3, 0, 0);
+
+    for plane in 0..3usize {
+        // Top border (y == -1): `1` for x in 0..sbWidth4 (= 32 here), so
+        // every in-SB column 0..=15 is available.
+        for x in 0..=15i32 {
+            assert!(
+                walker.block_decoded(plane, -1, x),
+                "plane {plane}: top border [-1][{x}] must be 1"
+            );
+        }
+        // Left border (x == -1): `1` for y in 0..sbHeight4.
+        for y in 0..=15i32 {
+            assert!(
+                walker.block_decoded(plane, y, -1),
+                "plane {plane}: left border [{y}][-1] must be 1"
+            );
+        }
+        // Top-left corner [-1][-1]: y < 0 && x (= -1) < sbWidth4 ⇒ 1.
+        assert!(
+            walker.block_decoded(plane, -1, -1),
+            "plane {plane}: corner [-1][-1] must be 1"
+        );
+        // Interior must be 0 (nothing decoded yet).
+        for y in 0..=15i32 {
+            for x in 0..=15i32 {
+                assert!(
+                    !walker.block_decoded(plane, y, x),
+                    "plane {plane}: interior [{y}][{x}] must be 0"
+                );
+            }
+        }
+        // §5.11.3 final line: below-left corner [sbSize4][-1] forced 0.
+        assert!(
+            !walker.block_decoded(plane, sb_size4 as i32, -1),
+            "plane {plane}: below-left corner [{sb_size4}][-1] must be 0"
+        );
+        // The bottom border row [sbSize4][x] for x >= 0 is also 0.
+        assert!(
+            !walker.block_decoded(plane, sb_size4 as i32, 0),
+            "plane {plane}: bottom border [{sb_size4}][0] must be 0"
+        );
+    }
+}
+
+/// §5.11.3 monochrome: `num_planes = 1` ⇒ only plane 0 is reset. Planes 1
+/// and 2 are never touched (stay at their construction-time `0`).
+#[test]
+fn clear_block_decoded_flags_monochrome_only_luma() {
+    let mut walker = walker_n(32);
+    walker.clear_block_decoded_flags(0, 0, 16, /* num_planes = */ 1, 0, 0);
+    // Plane 0 border set.
+    assert!(walker.block_decoded(0, -1, 0), "luma top border must be 1");
+    // Planes 1 / 2 untouched (the §5.11.3 loop bound `NumPlanes = 1`
+    // never enters the chroma iterations).
+    assert!(
+        !walker.block_decoded(1, -1, 0),
+        "chroma plane 1 must stay 0 in monochrome"
+    );
+    assert!(
+        !walker.block_decoded(2, -1, 0),
+        "chroma plane 2 must stay 0 in monochrome"
+    );
+}
+
+/// §5.11.3 chroma subsampling: with `subsampling_x = subsampling_y = 1`
+/// (4:2:0) the chroma planes' `y_max` / `x_max` are `sbSize4 >> 1 = 8`
+/// and their border extents (`sbWidth4 >> 1` / `sbHeight4 >> 1`) shrink
+/// accordingly. Luma (plane 0) is unaffected by subsampling.
+#[test]
+fn clear_block_decoded_flags_420_chroma_subsampled_extent() {
+    let mut walker = walker_n(32);
+    walker.clear_block_decoded_flags(0, 0, 16, 3, /* sub_x = */ 1, /* sub_y = */ 1);
+
+    // Luma border spans 0..=15 (subX = 0 on plane 0).
+    assert!(walker.block_decoded(0, -1, 15), "luma top border [-1][15]");
+    // Chroma top border spans only 0..=7 (the SB is 8 chroma-4x4 wide).
+    for x in 0..=7i32 {
+        assert!(
+            walker.block_decoded(1, -1, x),
+            "chroma top border [-1][{x}] must be 1"
+        );
+    }
+    // Chroma below-left corner [sbSize4 >> subY = 8][-1] forced 0.
+    assert!(
+        !walker.block_decoded(1, 8, -1),
+        "chroma below-left corner [8][-1] must be 0"
+    );
+    // Chroma left border spans 0..=7.
+    assert!(walker.block_decoded(2, 7, -1), "chroma left border [7][-1]");
+}
+
+/// §5.11.3 128×128 superblock: `sbSize4 = 32`. The luma grid spans the
+/// full SB (border at -1, interior 0..=31, below-left corner forced 0).
+/// Exercises the upper bound of the fixed `BD_STRIDE = 34` storage.
+#[test]
+fn clear_block_decoded_flags_128x128_full_span() {
+    // 64×64 mi tile (one 128×128 superblock per axis edge plus room).
+    let mut walker = walker_n(64);
+    let sb_size4 = 32u32;
+    walker.clear_block_decoded_flags(0, 0, sb_size4, 3, 0, 0);
+
+    assert!(walker.block_decoded(0, -1, 31), "luma top border [-1][31]");
+    assert!(walker.block_decoded(0, 31, -1), "luma left border [31][-1]");
+    assert!(
+        !walker.block_decoded(0, 31, 31),
+        "luma interior far corner [31][31] must be 0"
+    );
+    assert!(
+        !walker.block_decoded(0, sb_size4 as i32, -1),
+        "luma below-left corner [32][-1] must be 0"
+    );
+}
+
+/// §5.11.3 partial superblock at the frame's bottom-right edge: when the
+/// SB straddles `MiColEnd` / `MiRowEnd`, `sbWidth4` / `sbHeight4` are
+/// smaller than `sbSize4`, so the top / left border `1`-run is truncated
+/// to the in-frame extent. With a 24×24 tile and a 64×64 SB at (0,0),
+/// `sbWidth4 = sbHeight4 = 24` but `sbSize4 = 16`, so the border still
+/// fully covers the SB (24 > 16) — instead place the SB so only part of
+/// the row is in-tile by using an 8×8 tile (sbWidth4 = 8 < sbSize4 = 16).
+#[test]
+fn clear_block_decoded_flags_partial_sb_truncates_border() {
+    // 8×8 mi tile, 64×64 superblock (sbSize4 = 16) at the origin: the SB
+    // is larger than the tile, so sbWidth4 = sbHeight4 = 8.
+    let mut walker = walker_n(8);
+    walker.clear_block_decoded_flags(0, 0, 16, 3, 0, 0);
+
+    // Top border `1` only for x in 0..sbWidth4 = 0..8.
+    for x in 0..=7i32 {
+        assert!(
+            walker.block_decoded(0, -1, x),
+            "in-tile top border [-1][{x}] must be 1"
+        );
+    }
+    // Beyond sbWidth4 the top border falls to the `else` arm ⇒ 0.
+    for x in 8..=15i32 {
+        assert!(
+            !walker.block_decoded(0, -1, x),
+            "off-tile top border [-1][{x}] must be 0"
+        );
+    }
+    // Left border `1` only for y in 0..sbHeight4 = 0..8.
+    for y in 0..=7i32 {
+        assert!(
+            walker.block_decoded(0, y, -1),
+            "in-tile left border [{y}][-1] must be 1"
+        );
+    }
+    for y in 8..=15i32 {
+        assert!(
+            !walker.block_decoded(0, y, -1),
+            "off-tile left border [{y}][-1] must be 0"
+        );
+    }
+}
+
+/// §6.10.3 query bounds: an out-of-range `(plane, y, x)` returns `false`
+/// rather than panicking (the §5.11.35 derivation never queries outside
+/// the SB + one-cell border, but the accessor is defensive).
+#[test]
+fn block_decoded_out_of_range_returns_false() {
+    let walker = walker_n(16);
+    assert!(!walker.block_decoded(3, 0, 0), "plane 3 out of range");
+    assert!(!walker.block_decoded(0, -2, 0), "y = -2 below border");
+    assert!(!walker.block_decoded(0, 0, -2), "x = -2 below border");
+    assert!(!walker.block_decoded(0, 33, 0), "y = 33 past BD_STRIDE");
+    assert!(!walker.block_decoded(0, 0, 33), "x = 33 past BD_STRIDE");
+}

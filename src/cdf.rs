@@ -14832,6 +14832,18 @@ pub struct DecodedBlockRecord {
 ///
 /// Out-of-tile children (`r >= MiRows || c >= MiCols`) short-circuit
 /// per the §5.11.4 `return 0` line.
+///
+/// `MAX_SB4` is the maximum superblock side in 4×4-block (mi) units —
+/// `Num_4x4_Blocks_Wide[ BLOCK_128X128 ] = 32` (av1-spec §5.11.2
+/// `sbSize4`). `BD_STRIDE` is the per-axis length of the §6.10.3
+/// `BlockDecoded[ plane ]` storage: a superblock spans at most
+/// `MAX_SB4` cells, plus the §5.11.3 one-cell border on each side, so
+/// `MAX_SB4 + 2 = 34`. The SB-local index `(y, x)` with `y, x ∈
+/// -1..=(sbSize4 >> sub)` maps to `(y + 1, x + 1) ∈ 0..=33`, which
+/// fits `BD_STRIDE = 34`.
+const MAX_SB4: usize = 32;
+const BD_STRIDE: usize = MAX_SB4 + 2;
+
 #[derive(Debug)]
 pub struct PartitionWalker {
     mi_rows: u32,
@@ -15166,6 +15178,32 @@ pub struct PartitionWalker {
     /// [`LrUnit`] payloads. Surfaced via [`Self::lr_unit`] /
     /// [`Self::lr_unit_grid_dims`].
     lr_units: [Option<LrUnitGrid>; 3],
+    /// `BlockDecoded[ plane ][ y ][ x ]` (av1-spec §5.11.3 / §5.11.35 /
+    /// §6.10.3 — av1-spec p.60 / p.85 / p.405). One boolean per 4×4
+    /// sample block per plane within the **current superblock**, plus a
+    /// one-cell border on every side. The indices are superblock-local:
+    /// the §5.11.35 `subBlockMiRow = (row & sbMask)` /
+    /// `subBlockMiCol = (col & sbMask)` derivation reduces the absolute
+    /// mi position modulo the superblock side, and the §5.11.3
+    /// `clear_block_decoded_flags` reset walks SB-local `y, x ∈
+    /// -1..=(sbSize4 >> sub)`. The flat slot for plane-`plane`,
+    /// SB-local `(y, x)` is `plane * BD_STRIDE * BD_STRIDE + (y + 1) *
+    /// BD_STRIDE + (x + 1)` (the `+1` shift folds the `-1` border into
+    /// index 0).
+    ///
+    /// Per §6.10.3: a `1` away from the border means the matching 4×4
+    /// block has been decoded; the border row/column (SB-local `-1`)
+    /// encodes the above-right / below-left availability the §5.11.35
+    /// `predict_intra` invocation reads. The grid is reset once per
+    /// superblock by [`Self::clear_block_decoded_flags`] (the §5.11.2
+    /// tile walk calls it immediately before
+    /// [`Self::decode_partition`]) and stamped per transform unit by the
+    /// §5.11.35 tail loop inside [`Self::transform_block_emit`].
+    ///
+    /// Stored as `u8` (`0` / `1`) with a fixed `3 * BD_STRIDE *
+    /// BD_STRIDE` length — the superblock-local scope bounds it to a
+    /// constant size regardless of frame extent.
+    block_decoded: Vec<u8>,
 }
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
@@ -15426,6 +15464,15 @@ impl PartitionWalker {
         let mut interp_filters: Vec<u8> = Vec::new();
         interp_filters.try_reserve_exact(area2).ok()?;
         interp_filters.resize(area2, EIGHTTAP);
+        // §6.10.3 `BlockDecoded[ plane ][ y ][ x ]` — a constant-size
+        // superblock-local grid (`3 * BD_STRIDE * BD_STRIDE`). The
+        // fresh-walker fill is `0`; the §5.11.3
+        // [`Self::clear_block_decoded_flags`] reset stamps the spec's
+        // border-vs-interior pattern before each superblock decodes.
+        let bd_len = 3 * BD_STRIDE * BD_STRIDE;
+        let mut block_decoded: Vec<u8> = Vec::new();
+        block_decoded.try_reserve_exact(bd_len).ok()?;
+        block_decoded.resize(bd_len, 0);
         Some(Self {
             mi_rows,
             mi_cols,
@@ -15473,6 +15520,10 @@ impl PartitionWalker {
             // decode per plane (extents come from the per-frame
             // [`LrParams`] at decode time).
             lr_units: [None, None, None],
+            // §6.10.3 `BlockDecoded[]` — fresh-walker zero fill; the
+            // §5.11.3 [`Self::clear_block_decoded_flags`] reset stamps
+            // the border-vs-interior pattern per superblock.
+            block_decoded,
         })
     }
 
@@ -16527,6 +16578,134 @@ impl PartitionWalker {
                 self.cdef_idx[(rr * self.mi_cols + cc) as usize] = -1;
             }
         }
+    }
+
+    /// Flat slot for the §6.10.3 `BlockDecoded[ plane ][ y ][ x ]`
+    /// superblock-local cell. The SB-local indices `(y, x)` range over
+    /// `-1..=(sbSize4 >> sub)`; the `+1` shift folds the `-1` border
+    /// into index `0` so every valid `(plane, y, x)` maps inside the
+    /// fixed `3 * BD_STRIDE * BD_STRIDE` buffer. Returns `None` for an
+    /// out-of-range index (defensive — the §5.11.3 / §5.11.35 callers
+    /// stay within `-1..=MAX_SB4`).
+    #[inline]
+    fn block_decoded_slot(plane: usize, y: i32, x: i32) -> Option<usize> {
+        if plane >= 3 {
+            return None;
+        }
+        let yi = y + 1;
+        let xi = x + 1;
+        if yi < 0 || xi < 0 {
+            return None;
+        }
+        let (yi, xi) = (yi as usize, xi as usize);
+        if yi >= BD_STRIDE || xi >= BD_STRIDE {
+            return None;
+        }
+        Some(plane * BD_STRIDE * BD_STRIDE + yi * BD_STRIDE + xi)
+    }
+
+    /// `clear_block_decoded_flags( r, c, sbSize4 )` per §5.11.3
+    /// (av1-spec p.60) — the per-superblock `BlockDecoded[]` reset the
+    /// §5.11.2 tile walk runs immediately before
+    /// [`Self::decode_partition`].
+    ///
+    /// ```text
+    ///   clear_block_decoded_flags( r, c, sbSize4 ) {
+    ///       for ( plane = 0; plane < NumPlanes; plane++ ) {
+    ///           subX = (plane > 0) ? subsampling_x : 0
+    ///           subY = (plane > 0) ? subsampling_y : 0
+    ///           sbWidth4 = ( MiColEnd - c ) >> subX
+    ///           sbHeight4 = ( MiRowEnd - r ) >> subY
+    ///           for ( y = -1; y <= ( sbSize4 >> subY ); y++ )
+    ///               for ( x = -1; x <= ( sbSize4 >> subX ); x++ ) {
+    ///                   if ( y < 0 && x < sbWidth4 )
+    ///                        BlockDecoded[ plane ][ y ][ x ] = 1
+    ///                   else if ( x < 0 && y < sbHeight4 )
+    ///                        BlockDecoded[ plane ][ y ][ x ] = 1
+    ///                   else
+    ///                        BlockDecoded[ plane ][ y ][ x ] = 0
+    ///               }
+    ///           BlockDecoded[ plane ][ sbSize4 >> subY ][ -1 ] = 0
+    ///       }
+    ///   }
+    /// ```
+    ///
+    /// The top border (`y < 0`) is set to `1` for SB-local columns
+    /// `x < sbWidth4` (the part of the row above the superblock that
+    /// overlaps already-decoded blocks); the left border (`x < 0`) is
+    /// set to `1` for rows `y < sbHeight4`. Everything else — the
+    /// interior and the off-frame border tails — starts at `0`. The
+    /// final line forces the below-left corner cell back to `0` (the
+    /// `sbSize4 >> subY` row at `x == -1`); per §6.10.3 the below-left
+    /// of the bottom edge is never available.
+    ///
+    /// ## Argument contract
+    ///
+    /// * `r` / `c` — the superblock's top-left mi position (the §5.11.2
+    ///   tile-walk loop induction variables).
+    /// * `sb_size4` — `Num_4x4_Blocks_Wide[ sbSize ]` (`16` for the
+    ///   64×64 superblock, `32` for 128×128). Clamped to `MAX_SB4` so a
+    ///   caller-bug oversize value cannot index past the fixed buffer.
+    /// * `num_planes` — §5.5.2 `NumPlanes` (`1` for monochrome, `3`
+    ///   otherwise). Clamped to `3`.
+    /// * `subsampling_x` / `subsampling_y` — §5.5.2 chroma subsampling
+    ///   (`0` / `1`); applied only on the chroma planes (`plane > 0`).
+    pub fn clear_block_decoded_flags(
+        &mut self,
+        r: u32,
+        c: u32,
+        sb_size4: u32,
+        num_planes: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) {
+        let sb_size4 = core::cmp::min(sb_size4, MAX_SB4 as u32) as i32;
+        let num_planes = core::cmp::min(num_planes, 3);
+        let mi_col_end = self.geometry.mi_col_end as i32;
+        let mi_row_end = self.geometry.mi_row_end as i32;
+        for plane in 0..num_planes as usize {
+            let (sub_x, sub_y) = if plane > 0 {
+                (subsampling_x as i32, subsampling_y as i32)
+            } else {
+                (0, 0)
+            };
+            // §5.11.3 `sbWidth4 = ( MiColEnd - c ) >> subX`,
+            // `sbHeight4 = ( MiRowEnd - r ) >> subY`.
+            let sb_width4 = (mi_col_end - c as i32) >> sub_x;
+            let sb_height4 = (mi_row_end - r as i32) >> sub_y;
+            let y_max = sb_size4 >> sub_y;
+            let x_max = sb_size4 >> sub_x;
+            for y in -1..=y_max {
+                for x in -1..=x_max {
+                    // §5.11.3 lines: the top border (`y < 0`) within the
+                    // in-frame column span and the left border (`x < 0`)
+                    // within the in-frame row span are `1`; everything
+                    // else (interior + off-frame border tails) is `0`.
+                    // The two `1` arms in the spec collapse to a single
+                    // boolean `or` (both yield the same value).
+                    let val = u8::from((y < 0 && x < sb_width4) || (x < 0 && y < sb_height4));
+                    if let Some(slot) = Self::block_decoded_slot(plane, y, x) {
+                        self.block_decoded[slot] = val;
+                    }
+                }
+            }
+            // §5.11.3 final line: `BlockDecoded[ plane ][ sbSize4 >>
+            // subY ][ -1 ] = 0`.
+            if let Some(slot) = Self::block_decoded_slot(plane, y_max, -1) {
+                self.block_decoded[slot] = 0;
+            }
+        }
+    }
+
+    /// `BlockDecoded[ plane ][ y ][ x ]` query — returns the §6.10.3
+    /// boolean for a superblock-local `(y, x)` cell (`y, x ∈
+    /// -1..=MAX_SB4`). Out-of-range indices return `false` (the
+    /// §5.11.35 caller derivation never queries outside the SB +
+    /// one-cell border). Used by the §5.11.35 above-right / below-left
+    /// availability derivation and by tests.
+    #[must_use]
+    pub fn block_decoded(&self, plane: usize, y: i32, x: i32) -> bool {
+        Self::block_decoded_slot(plane, y, x).is_some_and(|slot| self.block_decoded[slot] != 0)
     }
 
     /// `read_cdef()` per §5.11.56 (av1-spec p.104) — the per-leaf
@@ -27139,7 +27318,7 @@ impl PartitionWalker {
         lossless: bool,
         skip: bool,
         tx_size: usize,
-        _use_128x128_superblock: bool,
+        use_128x128_superblock: bool,
         ctx: &ResidualContext,
     ) -> Result<ResidualReadout, crate::Error> {
         // ---------- caller-bug guards ----------
@@ -27258,6 +27437,7 @@ impl PartitionWalker {
                             mi_row,
                             mi_col,
                             mi_size,
+                            use_128x128_superblock,
                             ctx,
                             &mut readout,
                         )?;
@@ -27294,6 +27474,7 @@ impl PartitionWalker {
                                     mi_row,
                                     mi_col,
                                     mi_size,
+                                    use_128x128_superblock,
                                     ctx,
                                     &mut readout,
                                 )?;
@@ -27351,6 +27532,7 @@ impl PartitionWalker {
         mi_row: u32,
         mi_col: u32,
         mi_size: usize,
+        use_128x128_superblock: bool,
         ctx: &ResidualContext,
         readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
@@ -27384,11 +27566,28 @@ impl PartitionWalker {
             // is the whole tx region — `startX` / `startY` already at
             // the leaf's top-left).
             return self.transform_block_emit(
-                decoder, cdfs, /* plane = */ 0, /* base_x = */ start_x,
-                /* base_y = */ start_y, tx_sz, /* x = */ 0, /* y = */ 0,
-                /* sub_x = */ 0, /* sub_y = */ 0, chunk_x, chunk_y,
-                /* from_transform_tree = */ true, skip, is_inter, lossless, mi_row, mi_col,
-                mi_size, ctx, readout,
+                decoder,
+                cdfs,
+                /* plane = */ 0,
+                /* base_x = */ start_x,
+                /* base_y = */ start_y,
+                tx_sz,
+                /* x = */ 0,
+                /* y = */ 0,
+                /* sub_x = */ 0,
+                /* sub_y = */ 0,
+                chunk_x,
+                chunk_y,
+                /* from_transform_tree = */ true,
+                skip,
+                is_inter,
+                lossless,
+                mi_row,
+                mi_col,
+                mi_size,
+                use_128x128_superblock,
+                ctx,
+                readout,
             );
         }
         // §5.11.36 lines 12-25: per-direction split.
@@ -27408,6 +27607,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27426,6 +27626,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27445,6 +27646,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27463,6 +27665,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27482,6 +27685,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27500,6 +27704,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27518,6 +27723,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27536,6 +27742,7 @@ impl PartitionWalker {
                 mi_row,
                 mi_col,
                 mi_size,
+                use_128x128_superblock,
                 ctx,
                 readout,
             )?;
@@ -27600,6 +27807,7 @@ impl PartitionWalker {
         mi_row: u32,
         mi_col: u32,
         mi_size: usize,
+        use_128x128_superblock: bool,
         ctx: &ResidualContext,
         readout: &mut ResidualReadout,
     ) -> Result<(), crate::Error> {
@@ -27865,9 +28073,45 @@ impl PartitionWalker {
         }
 
         // §5.11.35 lines 35-43: `LoopfilterTxSizes[ plane ][ ... ]` /
-        // `BlockDecoded[ plane ][ ... ]` per-TU stamps. Deferred —
-        // the walker doesn't yet allocate the per-plane LF /
-        // BlockDecoded grids. No-op here is the consistent placeholder.
+        // `BlockDecoded[ plane ][ ... ]` per-TU stamps.
+        //
+        // The `LoopfilterTxSizes[]` half is still deferred (the walker
+        // doesn't allocate the per-plane LF grid yet). The
+        // `BlockDecoded[]` half (§6.10.3) lands here: the per-TU stamp
+        // marks every 4×4 cell the transform unit covers as decoded so
+        // the §5.11.35 `predict_intra` above-right / below-left
+        // availability derivation on subsequent TUs reads the correct
+        // border state.
+        //
+        // §5.11.35 lines 5-9 derive the superblock-local anchor:
+        //   row = ( startY << subY ) >> MI_SIZE_LOG2
+        //   col = ( startX << subX ) >> MI_SIZE_LOG2
+        //   sbMask = use_128x128_superblock ? 31 : 15
+        //   subBlockMiRow = row & sbMask
+        //   subBlockMiCol = col & sbMask
+        //   stepX = Tx_Width[ txSz ] >> MI_SIZE_LOG2
+        //   stepY = Tx_Height[ txSz ] >> MI_SIZE_LOG2
+        let row = (start_y << sub_y) >> MI_SIZE_LOG2;
+        let col = (start_x << sub_x) >> MI_SIZE_LOG2;
+        let sb_mask: u32 = if use_128x128_superblock { 31 } else { 15 };
+        let sub_block_mi_row = (row & sb_mask) as i32;
+        let sub_block_mi_col = (col & sb_mask) as i32;
+        let step_x = (TX_WIDTH[tx_sz] >> MI_SIZE_LOG2) as i32;
+        let step_y = (TX_HEIGHT[tx_sz] >> MI_SIZE_LOG2) as i32;
+        // §5.11.35 lines 40-43: `BlockDecoded[ plane ][
+        // ( subBlockMiRow >> subY ) + i ][ ( subBlockMiCol >> subX ) +
+        // j ] = 1` for `i ∈ 0..stepY`, `j ∈ 0..stepX`.
+        let base_row = sub_block_mi_row >> sub_y;
+        let base_col = sub_block_mi_col >> sub_x;
+        for i in 0..step_y {
+            for j in 0..step_x {
+                if let Some(slot) =
+                    Self::block_decoded_slot(plane as usize, base_row + i, base_col + j)
+                {
+                    self.block_decoded[slot] = 1;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -52980,6 +53224,113 @@ mod tests {
         for t in &r.tasks {
             assert!(!t.from_transform_tree);
         }
+    }
+
+    /// §5.11.35 `BlockDecoded[]` per-TU stamp through `residual()`: a
+    /// BLOCK_8X8 / TX_8X8 luma TU at the SB origin stamps the 2×2
+    /// (`stepX = stepY = 2`) footprint as decoded. The tail stamp runs
+    /// on both the skip and non-skip arms (it is after the §5.11.39
+    /// gate), so the gate-closed skip path still marks the footprint.
+    #[test]
+    fn residual_stamps_block_decoded_over_tu_footprint() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        // §5.11.3 reset first (the tile walk runs this before the SB).
+        walker.clear_block_decoded_flags(0, 0, 16, 3, 0, 0);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .residual(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 0,
+                /* mi_col = */ 0,
+                /* mi_size = */ BLOCK_8X8,
+                /* has_chroma = */ false,
+                /* subsampling_x = */ 0,
+                /* subsampling_y = */ 0,
+                /* is_inter = */ false,
+                /* lossless = */ false,
+                /* skip = */ true,
+                /* tx_size = */ TX_8X8,
+                /* use_128x128_superblock = */ false,
+                &ResidualContext::neutral(0, 8),
+            )
+            .unwrap();
+        // §5.11.35: TX_8X8 ⇒ stepX = stepY = 2; SB-local anchor (0, 0).
+        // The 2×2 footprint [0..2][0..2] is now decoded.
+        for y in 0..2i32 {
+            for x in 0..2i32 {
+                assert!(
+                    walker.block_decoded(0, y, x),
+                    "TU footprint [{y}][{x}] must be marked decoded"
+                );
+            }
+        }
+        // Cells outside the footprint stay 0 (interior reset value).
+        assert!(
+            !walker.block_decoded(0, 2, 0),
+            "cell below the TU footprint stays 0"
+        );
+        assert!(
+            !walker.block_decoded(0, 0, 2),
+            "cell right of the TU footprint stays 0"
+        );
+        // The left/top borders set by §5.11.3 are untouched by the stamp.
+        assert!(walker.block_decoded(0, -1, 0), "top border preserved");
+        assert!(walker.block_decoded(0, 0, -1), "left border preserved");
+    }
+
+    /// §5.11.35 stamp at a non-origin superblock-local position: a TU
+    /// at `(mi_row, mi_col) = (4, 4)` inside a 64×64 SB stamps SB-local
+    /// `(4, 4)` (the `subBlockMiRow / subBlockMiCol = row & 15` mask
+    /// keeps the position SB-local).
+    #[test]
+    fn residual_stamps_block_decoded_at_sb_local_offset() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        walker.clear_block_decoded_flags(0, 0, 16, 3, 0, 0);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        walker
+            .residual(
+                &mut dec,
+                &mut cdfs,
+                /* mi_row = */ 4,
+                /* mi_col = */ 4,
+                /* mi_size = */ BLOCK_4X4,
+                /* has_chroma = */ false,
+                0,
+                0,
+                /* is_inter = */ false,
+                /* lossless = */ false,
+                /* skip = */ true,
+                /* tx_size = */ TX_4X4,
+                /* use_128x128_superblock = */ false,
+                &ResidualContext::neutral(0, 8),
+            )
+            .unwrap();
+        // TX_4X4 ⇒ stepX = stepY = 1; SB-local anchor (4, 4).
+        assert!(
+            walker.block_decoded(0, 4, 4),
+            "SB-local [4][4] must be decoded"
+        );
+        assert!(
+            !walker.block_decoded(0, 4, 5),
+            "adjacent SB-local [4][5] stays 0 (1×1 footprint)"
+        );
     }
 
     /// `residual()` gate-open `!skip` arm with `all_zero == 1` forced
