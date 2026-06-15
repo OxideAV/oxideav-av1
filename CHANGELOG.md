@@ -4,7 +4,7 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/OxideAV/oxideav-av1/compare/v0.1.11...v0.2.0) - 2026-06-15
+## [0.1.12](https://github.com/OxideAV/oxideav-av1/compare/v0.1.11...v0.1.12) - 2026-06-15
 
 ### Other
 
