@@ -4,6 +4,54 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/OxideAV/oxideav-av1/compare/v0.1.11...v0.1.12) - 2026-06-15
+
+### Other
+
+- av1 r311: fix §5.9.15 tile_info() divide-by-zero on zero-dimension frame
+- av1 r311: add cargo-fuzz harness — fix scheduled Fuzz red ([#1696](https://github.com/OxideAV/oxideav-av1/pull/1696))
+- av1 decoder r308: §5.11.33 someUseIntra chroma sub-block split in frame walk
+- av1 decoder r307: §5.11.5 walker reconstructs single-ref block across all planes
+- av1 decoder r306: §5.11.5 walker reconstructs compound block across all planes sharing one DIFFWTD mask
+- av1 decoder r305: §5.11.5 walker reconstructs compound inter pixels inline
+- av1 decoder r304: §5.11.5 walker reconstructs single-ref inter pixels inline
+- av1 decoder r303: §5.11.5 walker reconstructs inter-intra pixels inline
+- av1 decoder r302: §5.11.5 inter walker surfaces §5.11.33 IsInterIntra end-to-end
+- av1 decoder r301: unify §5.11.33 inter-intra onto one per-block driver
+- decoder r300: lift §5.11.30/§5.11.33 task-dispatcher inter-intra gate
+- av1 decoder r299: §5.11.33 frame-walk inter-intra leaf
+- av1 decoder r298: §7.11.3.1 wedge inter-intra sub-arm (wedge_interintra==1)
+- av1 r297: §7.11.3.1 IsInterIntra arm — wire single-ref inter + in-place intra blend into predict_inter
+- §5.11.33 r296 — wire COMPOUND_DIFFWTD mask compound end-to-end
+- av1 r295: §7.11.3.1 COMPOUND_WEDGE frame walk — drive the regenerable-mask compound arm across §5.11.33 predict()
+- av1 r294: §7.11.3.1 compound two-reference frame walk — drive COMPOUND_AVERAGE / COMPOUND_DISTANCE inter reconstruction
+- av1 r293: §5.11.33 predict() frame-level inter walk — drive single-ref translational reconstruction across the decoded mode-info grid
+- av1 r292: wire decoded mode-info → predict_inter → CurrFrame reconstruction (single forward ref, SIMPLE)
+- av1 r291: prove §7.11.3.1 predict_inter half-sample MC against a hand-built §7.11.3.4 EIGHTTAP oracle
+- av1 r290: §7.15 cdef_frame_from_idx bridge — produce real CdefFrame from persisted §5.11.56 cdef_idx grid
+- decoder r289: run §7.17 loop-restoration reconstruction from the persisted §5.11.58 grid
+- decoder r288: persist §5.11.58 read_lr_unit taps into the §7.17 per-plane LrType/LrWiener/LrSgrSet/LrSgrXqd grid
+- encoder+decoder r287: §5.11.57 read_lr / §5.11.58 read_lr_unit loop-restoration unit syntax on both sides in lockstep
+- encoder r286 follow-up: enforce §5.11.47 residual_tx_type exact-count contract
+- encoder+decoder r286: §5.11.47 transform_type write side (per-luma-TU intra_tx_type/inter_tx_type S() under the §5.9.12 quantizer guard) + decode-walker quant/reduced_tx_set threading in lockstep
+- encoder r285: §5.11.15/§5.11.16/§5.11.17 transform-size write side (TX_MODE_SELECT on every write_block_syntax arm — tx_depth commitment, var-tx txfm_split trees with live §8.3.2 ctx from the mirror, genuinely variable §5.11.36 transform_tree write recursion) + shared ctx/stamp pub methods on the walker
+- state fixture and crate provenance positively (closes the r223 README surface)
+- encoder+decoder r284: §8.3.2 coefficient level-context machinery (Above/Left Level+Dc context arrays, txb_skip_ctx + dc_sign_ctx derivations, §5.11.39 tail stamps, §5.11.42 skip resets) on both sides + §5.11.36 inter-arm transform_tree write side (skip==0 intrabc leaves)
+- encoder r283: thread §5.11.34 residual() write side into write_block_syntax (write_residual_intra + write_transform_block_intra; non-skip intra leaves emit per-TU §5.11.39 coefficients in decode-walker lockstep)
+- encoder r282: thread full §5.11.7 composition into the partition-tree write side (write_partition_tree_syntax + write_block_syntax + §5.11.49 write_palette_tokens_plane)
+- decoder r281: thread full §5.11.7 composition into decode_block_syntax (use_intrabc MV chain + else-arm composite + §5.11.49 palette_tokens)
+- encoder+decoder r280: §5.11.7 else (non-intrabc) arm composition (write_intra_frame_else_arm + decode_intra_frame_mode_info_else_arm via shared §5.11.22 tail)
+- encoder r279: §5.11.7 use_intrabc arm write side (write_use_intrabc + write_intra_frame_intrabc_arm)
+- encoder r278: §5.11.26 assign_mv intra-block-copy PredMv arm (assign_mv_pred_mv_intrabc)
+- encoder r277: §5.11.x interp_filter loop writer + §5.11.23 tail fold into write_inter_block_mode_info; fix decode-side §5.11.23 tail ordering
+- encoder r276: §5.11.27/§5.11.28/§5.11.29 tail leaf writers (write_motion_mode / write_interintra_mode / write_compound_type)
+- encoder r275: §5.11.23 inter_block_mode_info composition (write_inter_block_mode_info)
+- §5.11.26 assign_mv PredMv derivation (assign_mv_pred_mv)
+- encoder r273: §5.11.31/§5.11.32 read_mv / read_mv_component write side
+- §5.11.23 drl_mode DRL-index writer (write_drl_mode) — r272
+- encoder r271: §5.11.23 compound_mode S() writer
+- encoder r270: §5.11.23 single-prediction inter-mode writer (new_mv/zero_mv/ref_mv)
+
 - infra r311 (2026-06-15): **cargo-fuzz harness added — turns the
   9-day-red scheduled `Fuzz` job green**. The `.github/workflows/fuzz.yml`
   workflow discovers `fuzz/fuzz_targets/*.rs`, but no `fuzz/` directory
