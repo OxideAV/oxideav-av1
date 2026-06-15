@@ -4,6 +4,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Other
+
+- av1 r313: enforce §6.8.14 `context_update_tile_id < TileCols * TileRows` conformance constraint in §5.9.15 `tile_info()` — rejects an attacker-coded out-of-range tile id (the field's `f(TileRowsLog2 + TileColsLog2)` bit width overshoots the realised tile count on small frames) before it can index a non-existent tile in the §5.11 tile-group walk
+
 ## [0.1.12](https://github.com/OxideAV/oxideav-av1/compare/v0.1.11...v0.1.12) - 2026-06-15
 
 ### Other

@@ -284,6 +284,23 @@ pub(crate) fn read_tile_info(
     let (context_update_tile_id, tile_size_bytes) = if tile_cols_log2 > 0 || tile_rows_log2 > 0 {
         let n = tile_rows_log2 + tile_cols_log2;
         let id = br.f(n)? as u32;
+        // §6.8.14 (av1-spec p. ~378, semantic text): "It is a
+        // requirement of bitstream conformance that
+        // context_update_tile_id is less than TileCols * TileRows."
+        // The field is coded with `f(TileRowsLog2 + TileColsLog2)`
+        // bits, but `TileColsLog2` / `TileRowsLog2` are the *desired*
+        // (ceil-log2) counts and may overshoot the realised
+        // `TileCols` / `TileRows` (§6.8.14 note: small frames round
+        // the tile size up to a whole superblock, so the actual tile
+        // count can be smaller than `1 << TileColsLog2`). A malformed
+        // header can therefore code an `id` in
+        // `[TileCols * TileRows, 1 << n)` — a value that the §5.11
+        // tile-group walk would later use to index a non-existent
+        // tile. Reject it here with a typed error rather than carrying
+        // an out-of-range tile id downstream.
+        if id >= tile_cols * tile_rows {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
         let tsb_minus_1 = br.f(2)? as u8;
         (id, tsb_minus_1 + 1)
     } else {
@@ -484,6 +501,57 @@ mod tests {
     fn truncated_payload_returns_unexpected_end() {
         let err = parse_tile_info(&[], 4, 4, false).expect_err("empty payload");
         assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    /// §6.8.14: `context_update_tile_id` must be `< TileCols *
+    /// TileRows`. The field is coded with `f(TileRowsLog2 +
+    /// TileColsLog2)` bits, and `TileColsLog2` can overshoot the
+    /// realised `TileCols` (§6.8.14 small-frame note), so an attacker
+    /// can code an id in `[TileCols * TileRows, 1 << n)`. Such a value
+    /// must be rejected before it can index a non-existent tile in the
+    /// §5.11 tile-group walk.
+    ///
+    /// Construct the overshoot: a 48×16-MI frame
+    /// (`use_128x128_superblock = 0`) has `sbCols = (48+15)>>4 = 3`,
+    /// `sbRows = (16+15)>>4 = 1`, `sb_size = 6`, `maxTileWidthSb =
+    /// 4096>>6 = 64`. `minLog2TileCols = tile_log2(64, 3) = 0`,
+    /// `maxLog2TileCols = tile_log2(1, 3) = 2`, `maxLog2TileRows =
+    /// tile_log2(1, 1) = 0`. Driving `TileColsLog2` up to 2
+    /// (`increment = 1, 1`) gives `tileWidthSb = ceil(3 / 4) = 1`, so
+    /// the column loop realises `TileCols = 3` while `TileColsLog2 =
+    /// 2`. `TileRows = 1`, `TileRowsLog2 = 0`, so the trailing field
+    /// is `f(2)` — id `3` (binary `11`) is `>= TileCols * TileRows =
+    /// 3` and must be rejected; id `2` is the largest legal value.
+    #[test]
+    fn context_update_tile_id_out_of_range_rejected() {
+        // Bits: uniform=1, inc_col=1, inc_col=1 (log2 saturates at 2),
+        // no row reads, context_update_tile_id = f(2) = 11 = 3.
+        // = 1 1 1 11 = 0b1111_1000 = 0xF8. The fifth bit completes the
+        // illegal id read; the conformance guard fires before the
+        // tile_size_bytes_minus_1 read, so no further bits are needed.
+        let payload = [0b1111_1000u8];
+        let err = parse_tile_info(&payload, 48, 16, false)
+            .expect_err("context_update_tile_id == 3 must be rejected (TileCols*TileRows == 3)");
+        assert_eq!(err, Error::PartitionWalkOutOfRange);
+    }
+
+    /// Companion to [`context_update_tile_id_out_of_range_rejected`]:
+    /// the same layout with the largest *legal* id (`2 < 3`) parses
+    /// cleanly. Confirms the guard does not over-reject in-range ids.
+    #[test]
+    fn context_update_tile_id_max_in_range_accepted() {
+        // Bits: uniform=1, inc_col=1, inc_col=1, id = f(2) = 10 = 2,
+        // tile_size_bytes_minus_1 = f(2) = 00 (TileSizeBytes = 1).
+        // = 1 1 1 10 00 = 0b1111_0000 = 0xF0.
+        let payload = [0b1111_0000u8];
+        let (ti, bits) = parse_tile_info(&payload, 48, 16, false).expect("id == 2 < 3 parses");
+        assert_eq!(ti.tile_cols, 3);
+        assert_eq!(ti.tile_rows, 1);
+        assert_eq!(ti.tile_cols_log2, 2);
+        assert_eq!(ti.tile_rows_log2, 0);
+        assert_eq!(ti.context_update_tile_id, 2);
+        assert_eq!(ti.tile_size_bytes, 1);
+        assert_eq!(bits, 7);
     }
 
     #[test]
