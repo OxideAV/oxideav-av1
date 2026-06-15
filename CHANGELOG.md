@@ -4,6 +4,14 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/OxideAV/oxideav-av1/compare/v0.1.12...v0.1.13) - 2026-06-15
+
+### Other
+
+- av1 decoder r318: §5.11.3 clear_block_decoded_flags + §5.11.35 BlockDecoded[] per-TU stamp
+- av1 r313: enforce §6.8.14 context_update_tile_id conformance bound in §5.9.15 tile_info()
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - av1 decoder r318: §5.11.3 `clear_block_decoded_flags` + §5.11.35 per-TU `BlockDecoded[]` stamp — wires the §6.10.3 superblock-local availability grid (one boolean per 4×4 block per plane, plus a one-cell border) into the `PartitionWalker`. `clear_block_decoded_flags(r, c, sbSize4, num_planes, sub_x, sub_y)` stamps the spec's border-vs-interior pattern (top/left borders `1` over the in-frame span, interior `0`, below-left corner forced `0`) per superblock; `transform_block_emit`'s §5.11.35 tail loop now marks every 4×4 cell a transform unit covers as decoded; `block_decoded(plane, y, x)` exposes the SB-local query the §5.11.35 `predict_intra` above-right / below-left availability derivation consults. Threads `use_128x128_superblock` through `residual()` → `residual_transform_tree()` → `transform_block_emit()` for the §5.11.35 `sbMask` derivation. 9 new tests (6 integration covering 64×64 / 128×128 SB span, monochrome, 4:2:0 chroma extent, partial-SB edge truncation, out-of-range query; 3 lib covering the per-TU stamp through `residual()`).
