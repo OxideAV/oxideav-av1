@@ -69,10 +69,11 @@ use oxideav_av1::{
     PALETTE_COLORS, V_PRED,
 };
 use oxideav_av1::{
-    DecodedBlock, DecodedInterFrameModeInfo, Error, InterFrameContext, MotionFieldMvs,
-    PartitionWalker, SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16, BLOCK_4X4,
-    BLOCK_8X16, BLOCK_8X8, GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH,
-    SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
+    DecodedBlock, DecodedInterFrameModeInfo, DecodedPaletteMap, Error, InterFrameContext,
+    MotionFieldMvs, PartitionWalker, SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16,
+    BLOCK_4X4, BLOCK_8X16, BLOCK_8X8, GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH,
+    MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS,
+    WARPEDMODEL_PREC_BITS,
 };
 
 /// Helper for r173 `decode_inter_frame_mode_info` tests: builds the
@@ -191,8 +192,22 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
     // through [`oxideav_av1::inverse_transform_2d`] and produces a
     // `Residual[][]` buffer for every TU with `eob > 0`. The walker
     // returns `Ok(DecodedBlock)` on this path.
-    let _block = result.expect(
+    let block = result.expect(
         "post-r182 the §5.11.5 walker must return Ok(DecodedBlock) after running §5.11.34 residual() + per-TU §5.11.39 coefficients() reads + §7.13 inverse_transform_2d",
+    );
+
+    // r325: this non-palette intra block read no §5.11.49
+    // `palette_tokens()` (`PaletteSize{Y,UV} == 0`), so the surfaced
+    // colour-index maps must both be absent.
+    assert_eq!(block.palette_size_y, 0);
+    assert_eq!(block.palette_size_uv, 0);
+    assert!(
+        block.color_map_y.is_none(),
+        "no luma palette ⇒ ColorMapY must be None"
+    );
+    assert!(
+        block.color_map_uv.is_none(),
+        "no chroma palette ⇒ ColorMapUV must be None"
     );
 
     // The §5.11.5 prologue + §5.11.7 prefix consumed at least the
@@ -781,14 +796,13 @@ fn decode_partition_syntax_out_of_grid_short_circuits() {
 }
 
 /// `DecodedBlock` is the per-block aggregate returned on the no-stub
-/// path. We don't reach that path in this round (the §5.11.30 stub
-/// always fires after the read_block_tx_size pass), but the struct's
-/// constructibility check is a sanity-check on the public API
-/// surface — it should compile and be `Debug + Clone + Copy +
-/// PartialEq + Eq`.
+/// path. The struct's constructibility check is a sanity-check on the
+/// public API surface — it should compile and be `Debug + Clone +
+/// PartialEq + Eq` (r325 dropped `Copy` when the §5.11.49
+/// colour-index maps were surfaced as heap-allocated fields).
 #[test]
 fn decoded_block_struct_public_api_smoke() {
-    let _db = DecodedBlock {
+    let db = DecodedBlock {
         mi_row: 0,
         mi_col: 0,
         mi_size: BLOCK_8X8,
@@ -823,7 +837,39 @@ fn decoded_block_struct_public_api_smoke() {
         is_compound: false,
         is_inter_intra: false,
         tx_size: TX_4X4 as u8,
+        // §5.11.49 colour-index maps — `None` on a non-palette block.
+        color_map_y: None,
+        color_map_uv: None,
     };
+    // r325: `Clone` (no longer `Copy`) + `PartialEq` round-trip.
+    let cloned = db.clone();
+    assert_eq!(db, cloned);
+    assert!(db.color_map_y.is_none());
+    assert!(db.color_map_uv.is_none());
+}
+
+/// `DecodedPaletteMap` is the §5.11.49 colour-index aggregate the
+/// §5.11.5 walker surfaces on a palette block (r325). The struct must
+/// be constructible from the public API and round-trip through `Clone`
+/// / `PartialEq`; its geometry invariants (`data.len() == block_w *
+/// block_h`, `stride == block_w`, on-screen ⊆ full block) mirror the
+/// [`palette_tokens_args`] dimensions the reader consumed.
+#[test]
+fn decoded_palette_map_public_api_smoke() {
+    // A fully-on-screen 8×8 luma palette block (the §5.11.46 minimum
+    // palette-eligible size): block == on-screen, stride == width.
+    let map = DecodedPaletteMap {
+        data: vec![0u8; 8 * 8],
+        stride: 8,
+        block_w: 8,
+        block_h: 8,
+        onscreen_w: 8,
+        onscreen_h: 8,
+    };
+    assert_eq!(map.data.len(), map.block_w * map.block_h);
+    assert_eq!(map.stride, map.block_w);
+    assert!(map.onscreen_w <= map.block_w && map.onscreen_h <= map.block_h);
+    assert_eq!(map, map.clone());
 }
 
 /// §5.11.5 prologue: `BLOCK_8X16` at (0, 0) has bw4 = 2, bh4 = 4

@@ -4,6 +4,10 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+### Other
+
+- av1 decoder r325: surface §5.11.49 `ColorMapY` / `ColorMapUV` on the §5.11.5 walker's `DecodedBlock`. The `palette_tokens()` reader already decoded each palette block's per-sample colour-index map into a scratch buffer for arithmetic-coder sync, then discarded it. `decode_block_syntax` now retains the decoded maps and surfaces them through two new `DecodedBlock` fields (`color_map_y` / `color_map_uv`), each `Some(DecodedPaletteMap)` exactly when `PaletteSize{Y,UV} > 0` (`None` on every non-palette block and on every inter block, where §5.11.23 forces `PaletteSize{Y,UV} = 0`). The new public `DecodedPaletteMap` aggregate carries the row-major colour-index buffer plus its `block_w` / `block_h` / `stride` / `onscreen_w` / `onscreen_h` geometry (mirroring the `palette_tokens_args` dimensions), giving a stream consumer that maintains `CurrFrame[plane]` buffers the input the §7.11.4 palette prediction process needs. `DecodedBlock` is no longer `Copy` (the maps are heap-allocated); it remains `Clone + PartialEq + Eq`. 3 tests: public-API smoke for `DecodedPaletteMap`, updated `DecodedBlock` constructibility/clone round-trip, and a non-palette walker block asserting both maps are `None`.
+
 ## [0.1.13](https://github.com/OxideAV/oxideav-av1/compare/v0.1.12...v0.1.13) - 2026-06-15
 
 ### Other

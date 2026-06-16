@@ -26108,10 +26108,13 @@ impl PartitionWalker {
         // a no-op there). On a palette block each plane reads its
         // `color_index_map_{y,uv}` `NS(PaletteSize)` literal followed
         // by the §5.11.49 anti-diagonal `palette_color_idx_{y,uv}`
-        // S() walk via [`palette_tokens_plane`]. The decoded
-        // `ColorMap{Y,UV}` contents feed the §7.11.4 palette
-        // prediction process, which the walker does not yet track —
-        // the reads above keep the arithmetic decoder in sync.
+        // S() walk via [`palette_tokens_plane`]. r325: the decoded
+        // `ColorMap{Y,UV}` contents are now surfaced on the returned
+        // [`DecodedBlock`] (`color_map_{y,uv}`) so a consumer can drive
+        // the §7.11.4 palette prediction process; the §5.11.5 walker
+        // itself tracks no per-plane sample buffers.
+        let mut color_map_y: Option<DecodedPaletteMap> = None;
+        let mut color_map_uv: Option<DecodedPaletteMap> = None;
         if palette_size_y > 0 {
             let args = palette_tokens_args(
                 sub_size,
@@ -26140,6 +26143,14 @@ impl PartitionWalker {
                 &mut color_map,
                 args.block_w,
             )?;
+            color_map_y = Some(DecodedPaletteMap {
+                data: color_map,
+                stride: args.block_w,
+                block_w: args.block_w,
+                block_h: args.block_h,
+                onscreen_w: args.onscreen_w,
+                onscreen_h: args.onscreen_h,
+            });
         }
         if palette_size_uv > 0 {
             let args = palette_tokens_args(
@@ -26169,6 +26180,14 @@ impl PartitionWalker {
                 &mut color_map,
                 args.block_w,
             )?;
+            color_map_uv = Some(DecodedPaletteMap {
+                data: color_map,
+                stride: args.block_w,
+                block_w: args.block_w,
+                block_h: args.block_h,
+                onscreen_w: args.onscreen_w,
+                onscreen_h: args.onscreen_h,
+            });
         }
 
         // §5.11.5 line `read_block_tx_size( )` — §5.11.16 reader. The
@@ -26267,6 +26286,10 @@ impl PartitionWalker {
             // the §5.11.33 gate cannot fire regardless of `is_inter`.
             is_inter_intra: false,
             tx_size,
+            // §5.11.49 `ColorMap{Y,UV}` — populated above on a palette
+            // block (`PaletteSize{Y,UV} > 0`), `None` otherwise.
+            color_map_y,
+            color_map_uv,
         };
 
         // §5.11.5 line `compute_prediction( )` — §5.11.33 dispatcher.
@@ -26703,6 +26726,10 @@ impl PartitionWalker {
             // `compute_prediction()` readout above.
             is_inter_intra,
             tx_size,
+            // §5.11.23 lines 2-3 force `PaletteSize{Y,UV} = 0`, so an
+            // inter block never carries a §5.11.49 colour-index map.
+            color_map_y: None,
+            color_map_uv: None,
         })
     }
 
@@ -30753,14 +30780,24 @@ pub struct IntraFrameModeInfoPrefix {
 /// leaf as it fires.
 ///
 /// Out of scope (surfaced through dedicated readouts rather than
-/// this aggregate): `palette_tokens()` per-sample `ColorMap{Y,UV}`
-/// contents (the §5.11.49 reads are performed for arithmetic-coder
-/// sync; the maps themselves are not yet tracked on the walker),
-/// `compute_prediction()` outputs (prediction samples), `residual()`
-/// outputs (transform coefficients + reconstructed samples), the
-/// inter arm's `CompGroupIdx` / `CompoundIdx` / interpolation-filter
-/// detail (see [`DecodedInterBlockModeInfo`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// this aggregate): `compute_prediction()` outputs (prediction
+/// samples), `residual()` outputs (transform coefficients +
+/// reconstructed samples), the inter arm's `CompGroupIdx` /
+/// `CompoundIdx` / interpolation-filter detail (see
+/// [`DecodedInterBlockModeInfo`]).
+///
+/// The §5.11.49 `palette_tokens()` per-sample `ColorMap{Y,UV}`
+/// contents are surfaced here (r325) through [`Self::color_map_y`] /
+/// [`Self::color_map_uv`] so a stream consumer that maintains
+/// `CurrFrame[plane]` buffers can drive the §7.11.4 palette
+/// prediction process; the §5.11.5 walker itself tracks no per-plane
+/// sample buffers, so it surfaces the decoded maps rather than
+/// reconstructing inline.
+///
+/// Note: this struct is no longer `Copy` (r325) — the surfaced
+/// palette maps are heap-allocated [`DecodedPaletteMap`] aggregates.
+/// It remains `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedBlock {
     /// §5.11.5 `MiRow = r` — mi-unit row of the block.
     pub mi_row: u32,
@@ -30887,6 +30924,56 @@ pub struct DecodedBlock {
     /// into the walker's `TxSizes[]` and `InterTxSizes[]` grids over
     /// the block's `bh4 * bw4` footprint.
     pub tx_size: u8,
+    /// §5.11.49 `ColorMapY[ ][ ]` — the decoded luma palette colour
+    /// index map. `Some(map)` exactly when [`Self::palette_size_y`] is
+    /// non-zero (a luma palette block); `None` otherwise. The map's
+    /// `block_w × block_h` row-major contents are the §7.11.4 luma
+    /// palette-prediction indices (each in `0..PaletteSizeY`),
+    /// including the §5.11.49 bottom-row / right-column border-fill
+    /// applied past the on-screen region. See [`DecodedPaletteMap`].
+    pub color_map_y: Option<DecodedPaletteMap>,
+    /// §5.11.49 `ColorMapUV[ ][ ]` — the decoded chroma palette colour
+    /// index map. `Some(map)` exactly when [`Self::palette_size_uv`]
+    /// is non-zero; `None` otherwise. Dimensions are the chroma-plane
+    /// (post-subsampling, post-`<4`-bump) `block_w × block_h` per
+    /// §5.11.49. See [`DecodedPaletteMap`].
+    pub color_map_uv: Option<DecodedPaletteMap>,
+}
+
+/// §5.11.49 `ColorMap{Y,UV}[ ][ ]` — a decoded palette colour-index
+/// map surfaced on [`DecodedBlock`] (r325).
+///
+/// The map is the per-sample palette colour index the §5.11.49
+/// `palette_tokens()` reader produced: `data[row * stride + col]` is
+/// the index for sample `(row, col)` of the plane's palette block.
+/// Indices are in `0..palette_size` and select into the block's
+/// §5.11.46 `PaletteColors{Y,UV}[ ]` table (decoded separately and
+/// not carried here).
+///
+/// Geometry mirrors the [`PaletteTokensArgs`] the reader consumed:
+///
+/// * `block_w` / `block_h` — the full (post-subsampling,
+///   post-`<4`-bump) block extent; `data.len() == block_w * block_h`
+///   and `stride == block_w`.
+/// * `onscreen_w` / `onscreen_h` — the sub-region that received the
+///   §5.11.49 anti-diagonal `palette_color_idx` S() walk. Samples in
+///   `[onscreen_h..block_h]` rows and `[onscreen_w..block_w]` columns
+///   carry the spec's border-fill (the last on-screen value
+///   replicated rightward / downward).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPaletteMap {
+    /// Row-major colour-index buffer, length `block_w * block_h`.
+    pub data: Vec<u8>,
+    /// Row stride of [`Self::data`]; equal to [`Self::block_w`].
+    pub stride: usize,
+    /// Full block width (post-subsampling, post-`<4`-bump).
+    pub block_w: usize,
+    /// Full block height (post-subsampling, post-`<4`-bump).
+    pub block_h: usize,
+    /// On-screen sub-region width that received decoded S() reads.
+    pub onscreen_w: usize,
+    /// On-screen sub-region height that received decoded S() reads.
+    pub onscreen_h: usize,
 }
 
 /// §5.11.18 per-block aggregate surfaced by
