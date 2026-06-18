@@ -1663,6 +1663,11 @@ pub use cdf::{
 pub use cdf::{
     derive_above_row, derive_left_col, predict_intra_h_pred, predict_intra_v_pred, DC_PRED, H_PRED,
 };
+// r330: §7.11.4 palette prediction process — the per-transform-block
+// sample-generation leaf that consumes the §5.11.49 `ColorMap{Y,UV}`
+// index map (surfaced on `DecodedBlock` in r325) plus the §5.11.46
+// `PaletteColors{Y,U,V}[ ]` table to write palette-predicted samples.
+pub use cdf::predict_palette;
 // r187: §7.11.2.2 PAETH_PRED + §7.11.2.6 SMOOTH / SMOOTH_V /
 // SMOOTH_H_PRED sample-generation leaves admitted to the dispatcher
 // alongside {DC, V, H}_PRED — seven of thirteen intra modes now

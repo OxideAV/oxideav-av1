@@ -11558,6 +11558,105 @@ pub fn palette_tokens_plane(
     Ok(())
 }
 
+/// §7.11.4 palette prediction process (av1-spec p.286) — the per-
+/// transform-block sample-generation leaf for palette-coded intra
+/// blocks. Writes `pred[ i ][ j ] = palette[ map[ y*4 + i ][ x*4 + j ] ]`
+/// for `i = 0..h-1`, `j = 0..w-1`, where `w = Tx_Width[ txSz ]` and
+/// `h = Tx_Height[ txSz ]`.
+///
+/// This is the consumer of the §5.11.49 `ColorMap{Y,UV}` index map
+/// surfaced on [`DecodedBlock::color_map_y`] / [`DecodedBlock::color_map_uv`]
+/// (r325) together with the §5.11.46 `PaletteColors{Y,U,V}[ ]` colour
+/// table: each map entry is a palette index in `0..palette.len()` and
+/// each output sample is the corresponding palette colour. The spec
+/// invokes this process once per transform block of a palette block,
+/// passing the transform block's `(x, y)` position in 4×4 units
+/// relative to the top-left of the palette block (so the map window
+/// for this transform block starts at row `y*4`, column `x*4`).
+///
+/// ## Arguments
+///
+/// * `txsz` — the transform-block size ordinal (`0..TX_SIZES_ALL`).
+///   Selects `w = Tx_Width[ txSz ]`, `h = Tx_Height[ txSz ]`.
+/// * `x` / `y` — the transform block's location in 4×4 units relative
+///   to the top-left of the palette block (the spec's `x` / `y`). The
+///   map window begins at `(y*4, x*4)`.
+/// * `map` — the full §5.11.49 colour-index map for the plane (row-
+///   major, `block_h × stride` with `stride >= block_w`); for the
+///   crate's [`DecodedPaletteMap`] pass [`DecodedPaletteMap::data`] and
+///   its [`DecodedPaletteMap::stride`].
+/// * `stride` — the row stride of `map` (the `DecodedPaletteMap`
+///   `stride`, equal to its `block_w`).
+/// * `palette` — the §5.11.46 plane palette colour table
+///   (`palette_colors_{y,u,v}[ 0..PaletteSize ]`). Each map index must
+///   be `< palette.len()`.
+/// * `pred` — output buffer, row-major; length must be `>= h * w`.
+///   `pred[ i*w + j ]` receives the predicted sample for `(i, j)`.
+///
+/// ## Returns
+///
+/// `Ok(())` on success.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for caller-bug
+/// arguments: `txsz >= TX_SIZES_ALL`, `w > 64`, `h > 64`,
+/// `pred.len() < h * w`, an empty `palette`, the requested map window
+/// (`(y*4 + h - 1)` rows by `(x*4 + w - 1)` columns at the given
+/// `stride`) exceeding `map.len()`, or any map index `>= palette.len()`.
+pub fn predict_palette(
+    txsz: usize,
+    x: usize,
+    y: usize,
+    map: &[u8],
+    stride: usize,
+    palette: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if txsz >= TX_SIZES_ALL {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let w = TX_WIDTH[txsz];
+    let h = TX_HEIGHT[txsz];
+    if w > 64 || h > 64 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if palette.is_empty() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if stride < w {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    let base_row = y.saturating_mul(4);
+    let base_col = x.saturating_mul(4);
+    // The map window the spec reads is rows `base_row..base_row+h`,
+    // columns `base_col..base_col+w`. The deepest map element accessed
+    // is `(base_row + h - 1) * stride + (base_col + w - 1)`.
+    let last_row = base_row + h - 1;
+    let last_col = base_col + w - 1;
+    let max_idx = last_row.saturating_mul(stride).saturating_add(last_col);
+    if max_idx >= map.len() {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // §7.11.4: CurrFrame[ plane ][ startY + i ][ startX + j ] =
+    // palette[ map[ y*4 + i ][ x*4 + j ] ].
+    for i in 0..h {
+        let map_row = (base_row + i) * stride + base_col;
+        let pred_row = i * w;
+        for j in 0..w {
+            let idx = map[map_row + j] as usize;
+            if idx >= palette.len() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            pred[pred_row + j] = palette[idx];
+        }
+    }
+    Ok(())
+}
+
 /// §8.3.2 `cfl_alpha_u` context: `ctx = (signU - 1) * 3 + signV`, which
 /// the spec notes equals `cfl_alpha_signs - 2`. `sign_u` / `sign_v` are
 /// the §5.11.45 joint-sign components (`CFL_SIGN_ZERO == 0`,
@@ -57122,6 +57221,134 @@ mod tests {
                 EIGHTTAP,
                 EIGHTTAP,
             ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // §7.11.4 palette prediction process (av1-spec p.286).
+    // -----------------------------------------------------------------
+
+    /// §7.11.4: a single 4×4 transform block at `(x, y) = (0, 0)` of a
+    /// palette block maps each colour index straight through the
+    /// palette colour table.
+    #[test]
+    fn predict_palette_4x4_top_left_maps_indices_through_palette() {
+        // 4×4 index map (stride 4): a diagonal index pattern.
+        let map = [
+            0u8, 1, 2, 3, //
+            1, 2, 3, 0, //
+            2, 3, 0, 1, //
+            3, 0, 1, 2,
+        ];
+        let palette = [100u16, 110, 120, 130];
+        let mut pred = [0u16; 16];
+        predict_palette(TX_4X4, 0, 0, &map, 4, &palette, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                let idx = map[i * 4 + j] as usize;
+                assert_eq!(
+                    pred[i * 4 + j],
+                    palette[idx],
+                    "row {i} col {j} = palette[map[{i}][{j}]]"
+                );
+            }
+        }
+    }
+
+    /// §7.11.4: the `(x, y)` 4×4-unit offset windows into the map at
+    /// `(y*4, x*4)`. A 4×4 transform block at `(x, y) = (1, 1)` reads
+    /// the bottom-right 4×4 quadrant of an 8×8 map.
+    #[test]
+    fn predict_palette_offset_windows_into_map_at_y4_x4() {
+        // 8×8 map (stride 8): value = row*10 + col, all < palette.len().
+        let mut map = [0u8; 64];
+        for r in 0..8usize {
+            for c in 0..8usize {
+                map[r * 8 + c] = (r + c) as u8; // 0..=14, fits palette
+            }
+        }
+        // palette[k] = 1000 + k for k in 0..15.
+        let palette: Vec<u16> = (0..15u16).map(|k| 1000 + k).collect();
+        let mut pred = [0u16; 16];
+        // (x, y) = (1, 1) -> window starts at row 4, col 4.
+        predict_palette(TX_4X4, 1, 1, &map, 8, &palette, &mut pred).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                let map_v = map[(4 + i) * 8 + (4 + j)] as usize;
+                assert_eq!(
+                    pred[i * 4 + j],
+                    palette[map_v],
+                    "windowed (i={i}, j={j}) reads map[{}][{}]",
+                    4 + i,
+                    4 + j
+                );
+            }
+        }
+    }
+
+    /// §7.11.4: rectangular `TX_4X8` (w=4, h=8) honours `w`/`h` from the
+    /// `Tx_Width` / `Tx_Height` tables and row-major `pred` stride `w`.
+    #[test]
+    fn predict_palette_rectangular_4x8_uses_tx_tables() {
+        // Map at least 8 rows × 4 cols (stride 4).
+        let mut map = [0u8; 32];
+        for r in 0..8usize {
+            for c in 0..4usize {
+                map[r * 4 + c] = ((r + c) % 3) as u8;
+            }
+        }
+        let palette = [7u16, 8, 9];
+        let mut pred = [0u16; 32];
+        predict_palette(TX_4X8, 0, 0, &map, 4, &palette, &mut pred).unwrap();
+        // w=4, h=8.
+        for i in 0..8 {
+            for j in 0..4 {
+                let idx = map[i * 4 + j] as usize;
+                assert_eq!(pred[i * 4 + j], palette[idx], "row {i} col {j}");
+            }
+        }
+    }
+
+    /// §7.11.4: caller-bug argument guards all return
+    /// `PartitionWalkOutOfRange`.
+    #[test]
+    fn predict_palette_rejects_bad_arguments() {
+        let map = [0u8; 16];
+        let palette = [5u16, 6];
+        let mut pred = [0u16; 16];
+
+        // txsz out of range.
+        assert!(matches!(
+            predict_palette(TX_SIZES_ALL, 0, 0, &map, 4, &palette, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // empty palette.
+        assert!(matches!(
+            predict_palette(TX_4X4, 0, 0, &map, 4, &[], &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // pred too short.
+        let mut short_pred = [0u16; 15];
+        assert!(matches!(
+            predict_palette(TX_4X4, 0, 0, &map, 4, &palette, &mut short_pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // stride < w.
+        assert!(matches!(
+            predict_palette(TX_4X4, 0, 0, &map, 3, &palette, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // map window exceeds map.len() (offset (1,1) needs an 8×8 map
+        // but only a 4×4 is supplied at stride 4).
+        assert!(matches!(
+            predict_palette(TX_4X4, 1, 1, &map, 4, &palette, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // index >= palette.len(): map value 3 with a 2-colour palette.
+        let bad_map = [0u8, 1, 0, 3, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+        assert!(matches!(
+            predict_palette(TX_4X4, 0, 0, &bad_map, 4, &palette, &mut pred),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
     }
