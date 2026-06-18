@@ -6138,6 +6138,76 @@ pub struct InterModeInfoGrid<'a> {
     pub mi_cols: u32,
     /// §7.11.3 `BitDepth`.
     pub bit_depth: u8,
+    /// §5.11.27 warped-motion context — `Some(_)` enables the
+    /// `motion_mode == WARPED_CAUSAL` arm of the single-reference walk;
+    /// `None` (the default) drives every single-ref leaf translationally
+    /// (the pre-r338 behaviour). When `Some(_)`, the per-cell
+    /// `motion_modes` ordinal selects between the SIMPLE translational
+    /// path ([`reconstruct_inter_block`]) and the §7.11.3.5 warp path
+    /// ([`reconstruct_inter_block_warp`]). See [`GridWarpContext`].
+    pub warp: Option<GridWarpContext<'a>>,
+}
+
+/// §5.11.27 / §7.11.3.5-8 per-frame warped-motion context for
+/// [`InterModeInfoGrid`] — the slices [`reconstruct_inter_frame`]'s
+/// single-reference arm consults to dispatch a leaf's `motion_mode ==
+/// WARPED_CAUSAL` to [`reconstruct_inter_block_warp`].
+///
+/// Like the grid's compound side-data (`wedge_indices` / `mask_types` /
+/// …), the warp context carries the **already-resolved** decode output
+/// rather than re-running the §5.11.27 `read_motion_mode` cascade or the
+/// §7.10.4 `find_warp_samples` / §7.11.3.8 `warp_estimation` machinery
+/// (which the mode-info grid does not model). The caller (the
+/// `PartitionWalker` bridge) supplies the decoded `motion_mode` per cell
+/// plus the per-cell LOCALWARP fit and the per-RefFrame global-motion
+/// model; this walk assembles a [`WarpDriverParams`] per warped leaf and
+/// hands it to the §7.11.3.5 driver.
+#[derive(Debug, Clone, Copy)]
+pub struct GridWarpContext<'a> {
+    /// §5.11.27 decoded `motion_mode` ordinal per cell
+    /// ([`crate::cdf::MOTION_MODE_SIMPLE`] / `MOTION_MODE_OBMC` /
+    /// `MOTION_MODE_WARPED_CAUSAL`) — `motion_modes[ r * mi_cols + c ]`.
+    /// Read only at a single-reference inter leaf's origin. A
+    /// `WARPED_CAUSAL` value routes the leaf to
+    /// [`reconstruct_inter_block_warp`]; every other value (including
+    /// `OBMC`, whose §7.11.3.9 neighbour walk this single-ref arm does
+    /// not yet drive) takes the translational
+    /// [`reconstruct_inter_block`] path. Length must be at least
+    /// `mi_rows * mi_cols`.
+    pub motion_modes: &'a [u8],
+    /// §7.11.3.8 `LocalWarpParams[ 0..6 ]` per cell —
+    /// `local_warp_params[ (r * mi_cols + c) * 6 + k ]`. The least-squares
+    /// affine fit the §7.10.4 / §7.11.3.8 decode produced for this leaf's
+    /// LOCALWARP arm. Read only at a `WARPED_CAUSAL` single-ref leaf's
+    /// origin (`plane == 0`; the §5.11.27 LOCALWARP arm is luma-only).
+    /// Length must be at least `mi_rows * mi_cols * 6`.
+    pub local_warp_params: &'a [i32],
+    /// §7.11.3.8 `LocalValid` bit per cell —
+    /// `local_warp_valid[ r * mi_cols + c ]` (`0` / `1`). `false` flips
+    /// the §7.11.3.1 step-7 LOCALWARP arm to `useWarp = 0`
+    /// (translational fallback). Length must be at least
+    /// `mi_rows * mi_cols`.
+    pub local_warp_valid: &'a [u8],
+    /// §5.11.x decoded `YMode` per cell — `y_modes[ r * mi_cols + c ]`.
+    /// The §7.11.3.1 step-7 global-warp gate (`useWarp = 2`) requires
+    /// `YMode ∈ {GLOBALMV, GLOBAL_GLOBALMV}`. Read only at a single-ref
+    /// inter leaf's origin. Length must be at least `mi_rows * mi_cols`.
+    pub y_modes: &'a [u8],
+    /// §5.9.24 `GmType[ ref ]` for `ref` in `INTRA_FRAME..=ALTREF_FRAME`
+    /// — `gm_types[ ref ]`. The step-7 `useWarp = 2` gate requires
+    /// `GmType[ RefFrame[0] ] > TRANSLATION`. Indexed by the raw
+    /// `RefFrame` value; length must be at least `ALTREF_FRAME + 1`.
+    pub gm_types: &'a [u8],
+    /// §5.9.24 `gm_params[ ref ][ 0..6 ]` — `gm_params[ ref * 6 + k ]`.
+    /// The per-RefFrame global-motion affine matrix the GLOBAL_GLOBALMV
+    /// `useWarp == 2` arm feeds to §7.11.3.5 `block_warp`. Indexed by the
+    /// raw `RefFrame` value; length must be at least
+    /// `(ALTREF_FRAME + 1) * 6`.
+    pub gm_params: &'a [i32],
+    /// §5.9.5 `force_integer_mv` frame flag — when `true`, the §7.11.3.1
+    /// step-7 derivation forces `useWarp = 0` on every leaf regardless of
+    /// `motion_mode`.
+    pub force_integer_mv: bool,
 }
 
 /// §5.11.33 `predict()` frame-level inter reconstruction — walks the
@@ -6266,6 +6336,23 @@ pub fn reconstruct_inter_frame(
     // for `RefFrame` up to `ALTREF_FRAME`; a short table is a caller bug.
     if grid.order_hints_by_ref.len() <= crate::uncompressed_header_tail::ALTREF_FRAME {
         return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.27 warp-context slice guards (only when the WARPED_CAUSAL arm
+    // is enabled). The per-cell slices index within `cells` (×6 for the
+    // local-warp matrix); the per-RefFrame global-motion tables index up
+    // to `ALTREF_FRAME` (×6 for the matrix). A short slice is a caller
+    // bug.
+    if let Some(wc) = grid.warp.as_ref() {
+        let refs = crate::uncompressed_header_tail::ALTREF_FRAME + 1;
+        if wc.motion_modes.len() < cells
+            || wc.local_warp_params.len() < cells * 6
+            || wc.local_warp_valid.len() < cells
+            || wc.y_modes.len() < cells
+            || wc.gm_types.len() < refs
+            || wc.gm_params.len() < refs * 6
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
     }
 
     // §5.11.5 leaf-origin detection: a leaf's `MiSize` is stamped over
@@ -6468,11 +6555,76 @@ pub fn reconstruct_inter_frame(
             }
 
             debug_assert_eq!(ref_frame1, NONE_REF_FRAME);
-            // --- single forward-reference translational arm. ---
+            // --- single forward-reference arm (SIMPLE + WARPED_CAUSAL). ---
             //
             // §5.11.33 `predict()` per-plane body (av1-spec p.82-83 lines
             // 5127-5190) in full, including the `someUseIntra` scan and
             // the resulting `predict_inter` sub-block tiling.
+
+            // §5.11.27 motion-mode dispatch: a `WARPED_CAUSAL` leaf (the
+            // grid carries the decoded ordinal + the §7.11.3.8 local fit
+            // + the per-RefFrame global-motion model in `grid.warp`)
+            // routes each sub-block to `reconstruct_inter_block_warp`; on
+            // `None`/`SIMPLE`/`OBMC` the translational
+            // `reconstruct_inter_block` path runs unchanged. The warp
+            // context is read at the leaf origin (the §5.11.27 LOCALWARP
+            // arm is per-block and luma-only — `block_warp`'s step-7 gate
+            // already falls back to translational for chroma / sub-8×8 /
+            // invalid-fit windows, so a single per-leaf `WarpDriverParams`
+            // is bit-correct across the §5.11.33 sub-block tiling).
+            let leaf_warp: Option<WarpDriverParams> = grid.warp.as_ref().and_then(|wc| {
+                if wc.motion_modes.get(origin).copied()
+                    != Some(crate::cdf::MOTION_MODE_WARPED_CAUSAL)
+                {
+                    return None;
+                }
+                let lw_base = origin * 6;
+                let lwp: [i32; 6] = [
+                    wc.local_warp_params[lw_base],
+                    wc.local_warp_params[lw_base + 1],
+                    wc.local_warp_params[lw_base + 2],
+                    wc.local_warp_params[lw_base + 3],
+                    wc.local_warp_params[lw_base + 4],
+                    wc.local_warp_params[lw_base + 5],
+                ];
+                let rf0 = ref_frame0 as usize;
+                let gm_base = rf0 * 6;
+                let gmp: [i32; 6] = [
+                    wc.gm_params[gm_base],
+                    wc.gm_params[gm_base + 1],
+                    wc.gm_params[gm_base + 2],
+                    wc.gm_params[gm_base + 3],
+                    wc.gm_params[gm_base + 4],
+                    wc.gm_params[gm_base + 5],
+                ];
+                // §7.11.3.6 identity affine matrix for the unused
+                // refList-1 slot (never consulted on the single-ref
+                // path): `[0, 0, 1<<PREC, 0, 0, 1<<PREC]`.
+                const WARP_IDENTITY_MATRIX: [i32; 6] = [
+                    0,
+                    0,
+                    1 << WARP_WARPEDMODEL_PREC_BITS,
+                    0,
+                    0,
+                    1 << WARP_WARPEDMODEL_PREC_BITS,
+                ];
+                Some(WarpDriverParams {
+                    y_mode: [wc.y_modes[origin], 0],
+                    gm_type: [wc.gm_types[rf0], 0],
+                    gm_params: [gmp, WARP_IDENTITY_MATRIX],
+                    local_warp_params: lwp,
+                    local_valid: wc.local_warp_valid[origin] != 0,
+                    // §7.11.3.3: the single-ref translational arm already
+                    // assumes non-scaled references throughout this walk
+                    // (the §7.11.3.3 scaling is applied inside
+                    // `block_inter_prediction`); the step-7 `useWarp = 2`
+                    // global gate additionally requires `is_scaled ==
+                    // false`, which holds for the references this walk
+                    // reconstructs against.
+                    ref_is_scaled: [false, false],
+                    force_integer_mv: wc.force_integer_mv,
+                })
+            });
 
             for ctx in planes.iter_mut() {
                 let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
@@ -6573,25 +6725,51 @@ pub fn reconstruct_inter_frame(
                             mv: [grid.mvs[cand * 4], grid.mvs[cand * 4 + 1]],
                         };
 
-                        reconstruct_inter_block(
-                            mode_info,
-                            ref_frame_idx,
-                            ctx.frame_store,
-                            ctx.plane,
-                            base_x + x as i32,
-                            base_y + y as i32,
-                            pred_w,
-                            pred_h,
-                            grid.bit_depth,
-                            ctx.subsampling_x,
-                            ctx.subsampling_y,
-                            ctx.frame_width,
-                            ctx.frame_height,
-                            interp_x,
-                            interp_y,
-                            ctx.curr,
-                            ctx.curr_stride,
-                        )?;
+                        match leaf_warp.as_ref() {
+                            Some(warp) => {
+                                reconstruct_inter_block_warp(
+                                    mode_info,
+                                    warp,
+                                    ref_frame_idx,
+                                    ctx.frame_store,
+                                    ctx.plane,
+                                    base_x + x as i32,
+                                    base_y + y as i32,
+                                    pred_w,
+                                    pred_h,
+                                    grid.bit_depth,
+                                    ctx.subsampling_x,
+                                    ctx.subsampling_y,
+                                    ctx.frame_width,
+                                    ctx.frame_height,
+                                    interp_x,
+                                    interp_y,
+                                    ctx.curr,
+                                    ctx.curr_stride,
+                                )?;
+                            }
+                            None => {
+                                reconstruct_inter_block(
+                                    mode_info,
+                                    ref_frame_idx,
+                                    ctx.frame_store,
+                                    ctx.plane,
+                                    base_x + x as i32,
+                                    base_y + y as i32,
+                                    pred_w,
+                                    pred_h,
+                                    grid.bit_depth,
+                                    ctx.subsampling_x,
+                                    ctx.subsampling_y,
+                                    ctx.frame_width,
+                                    ctx.frame_height,
+                                    interp_x,
+                                    interp_y,
+                                    ctx.curr,
+                                    ctx.curr_stride,
+                                )?;
+                            }
+                        }
 
                         c_idx += 1;
                         x += pred_w;
@@ -9634,6 +9812,7 @@ mod tests {
             mi_rows,
             mi_cols,
             bit_depth: 8,
+            warp: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -9846,6 +10025,7 @@ mod tests {
             mi_rows,
             mi_cols,
             bit_depth: 8,
+            warp: None,
         };
 
         // Chroma plane (4:2:0): 4 rows × 4 cols (mi_rows*4>>1 ×
@@ -10016,6 +10196,7 @@ mod tests {
                 mi_rows,
                 mi_cols,
                 bit_depth: 8,
+                warp: None,
             };
             let mut planes = [PlaneReconContext {
                 plane: 0,
@@ -10109,6 +10290,346 @@ mod tests {
         let bad_sizes = vec![crate::cdf::BLOCK_SIZES + 5; cells];
         assert_eq!(
             run(&bad_sizes, &good_is, &good_rf, &good_mv, &good_if, &mut curr).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+    }
+
+    // ---------- r338 §5.11.33 warped-motion frame walk ----------
+
+    /// r338 §5.11.27 — the single-reference frame walk dispatches a
+    /// `motion_mode == WARPED_CAUSAL` leaf to `reconstruct_inter_block_warp`
+    /// (LOCALWARP arm). The grid carries one 8×8 warped leaf plus a
+    /// translational leaf; the walk output for the warped leaf must equal
+    /// the bytes the per-block warp driver produces, while the
+    /// translational leaf matches `reconstruct_inter_block`. A `grid.warp
+    /// == None` walk leaves the warped leaf translational (the pre-r338
+    /// behaviour) — proving the dispatch is opt-in.
+    #[test]
+    fn r338_reconstruct_inter_frame_drives_warped_causal_leaf() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                // A high-frequency, non-linear pattern so a sub-pel warp
+                // shift produces samples that genuinely differ from the
+                // integer-position translational copy (a smooth ramp would
+                // interpolate back to itself).
+                refp[r * stride + c] = (((r * 37) ^ (c * 53)) & 0xFF) as u16;
+            }
+        }
+        let real = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [real, real, real, real, real, real, real, real];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
+
+        // 4×4 mi grid (16×16 luma). One 8×8 WARPED_CAUSAL inter leaf at
+        // (0,0); one 8×8 SIMPLE inter leaf at (2,0). Rest BLOCK_INVALID.
+        let mi_rows: u32 = 4;
+        let mi_cols: u32 = 4;
+        let cells = (mi_rows * mi_cols) as usize;
+        let last = crate::uncompressed_header_tail::LAST_FRAME as i8;
+        use crate::cdf::{BLOCK_8X8, BLOCK_INVALID};
+
+        let mut mi_sizes = vec![BLOCK_INVALID; cells];
+        let mut is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        let mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let zeros = vec![0u8; cells];
+
+        let mc = mi_cols as usize;
+        // 8×8 leaf footprints: (0,0),(0,1),(1,0),(1,1) and
+        // (2,0),(2,1),(3,0),(3,1).
+        for (r, c) in [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+            (3, 0),
+            (3, 1),
+        ] {
+            let cell = r * mc + c;
+            mi_sizes[cell] = BLOCK_8X8;
+            is_inters[cell] = 1;
+            ref_frames[cell * 2] = last;
+        }
+
+        // Warp context: cell (0,0) is WARPED_CAUSAL, everything else
+        // SIMPLE.
+        let mut motion_modes = vec![crate::cdf::MOTION_MODE_SIMPLE; cells];
+        motion_modes[0] = crate::cdf::MOTION_MODE_WARPED_CAUSAL;
+        const WARP_ID: [i32; 6] = [0, 0, 1 << 16, 0, 0, 1 << 16];
+        // A small non-identity horizontal-shear affine matrix (`a2 = one +
+        // 256`) so the §7.11.3.5 warped convolution lands on genuine
+        // sub-pel positions — `setup_shear` accepts it as valid, so the
+        // LOCALWARP arm produces a result that *differs* from the
+        // translational fallback (proving the dispatch fired).
+        const WARP_SHEAR: [i32; 6] = [0, 0, (1 << 16) + 4096, 0, 0, 1 << 16];
+        let mut local_warp_params = vec![0i32; cells * 6];
+        for cell in 0..cells {
+            local_warp_params[cell * 6..cell * 6 + 6].copy_from_slice(&WARP_ID);
+        }
+        // The cell-(0,0) leaf carries the shear matrix.
+        local_warp_params[0..6].copy_from_slice(&WARP_SHEAR);
+        let local_warp_valid = vec![1u8; cells];
+        let y_modes = vec![crate::cdf::MODE_NEWMV; cells];
+        let gm_types = vec![crate::cdf::GM_TYPE_IDENTITY as u8; 8];
+        let mut gm_params = vec![0i32; 8 * 6];
+        for rf in 0..8 {
+            gm_params[rf * 6..rf * 6 + 6].copy_from_slice(&WARP_ID);
+        }
+        let order_hints_by_ref = [0i32; 8];
+
+        let warp_ctx = GridWarpContext {
+            motion_modes: &motion_modes,
+            local_warp_params: &local_warp_params,
+            local_warp_valid: &local_warp_valid,
+            y_modes: &y_modes,
+            gm_types: &gm_types,
+            gm_params: &gm_params,
+            force_integer_mv: false,
+        };
+        macro_rules! build_grid {
+            ($warp:expr) => {
+                InterModeInfoGrid {
+                    mi_sizes: &mi_sizes,
+                    is_inters: &is_inters,
+                    ref_frames: &ref_frames,
+                    mvs: &mvs,
+                    interp_filters: &interp_filters,
+                    compound_types: &zeros,
+                    wedge_indices: &zeros,
+                    wedge_signs: &zeros,
+                    mask_types: &zeros,
+                    interintra_modes: &zeros,
+                    wedge_interintras: &zeros,
+                    interintra_wedge_indices: &zeros,
+                    order_hint_bits: 7,
+                    current_order_hint: 0,
+                    order_hints_by_ref: &order_hints_by_ref,
+                    mi_rows,
+                    mi_cols,
+                    bit_depth: 8,
+                    warp: $warp,
+                }
+            };
+        }
+
+        let curr_w = (mi_cols * 4) as usize; // 16
+        let curr_h = (mi_rows * 4) as usize; // 16
+        let sentinel = 9000u16;
+
+        // Walk WITH warp enabled.
+        let mut curr_warp = vec![sentinel; curr_w * curr_h];
+        {
+            let grid = build_grid!(Some(warp_ctx));
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr_warp,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap();
+        }
+
+        // Walk WITHOUT warp (opt-in proof) — warped leaf goes translational.
+        let mut curr_simple = vec![sentinel; curr_w * curr_h];
+        {
+            let grid = build_grid!(None);
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr_simple,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap();
+        }
+
+        // Oracle: drive the (0,0) leaf through the per-block warp driver
+        // and the (2,0) leaf translationally.
+        let mut oracle = vec![sentinel; curr_w * curr_h];
+        let warp_params = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_NEWMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_IDENTITY as u8, 0],
+            gm_params: [WARP_ID, WARP_ID],
+            local_warp_params: WARP_SHEAR,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+        reconstruct_inter_block_warp(
+            InterModeInfo {
+                ref_frame: last as u8,
+                mv: [0, 0],
+            },
+            &warp_params,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last as u8,
+                mv: [0, 0],
+            },
+            &ref_frame_idx,
+            &store,
+            /* plane */ 0,
+            /* x */ 0,
+            /* y */ 8,
+            /* w */ 8,
+            /* h */ 8,
+            /* bit_depth */ 8,
+            /* sub_x */ 0,
+            /* sub_y */ 0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        // The warp-enabled walk equals the mixed oracle.
+        assert_eq!(
+            curr_warp, oracle,
+            "warp-enabled frame walk vs per-block oracle"
+        );
+        // The warped leaf's footprint differs between warp-on and
+        // warp-off walks (proves the dispatch actually fired), while the
+        // SIMPLE leaf footprint is identical in both.
+        let warp_block_differs = (0..8)
+            .any(|i| (0..8).any(|j| curr_warp[i * curr_w + j] != curr_simple[i * curr_w + j]));
+        assert!(
+            warp_block_differs,
+            "WARPED_CAUSAL leaf must differ from the translational fallback"
+        );
+        for i in 8..16 {
+            for j in 0..8 {
+                assert_eq!(
+                    curr_warp[i * curr_w + j],
+                    curr_simple[i * curr_w + j],
+                    "SIMPLE leaf must be identical regardless of warp ctx"
+                );
+            }
+        }
+    }
+
+    /// r338 — the warp-context slice guards reject a short per-cell or
+    /// per-RefFrame slice with `PartitionWalkOutOfRange`.
+    #[test]
+    fn r338_reconstruct_inter_frame_warp_ctx_slice_guards() {
+        let refp = vec![5u16; 32 * 32];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 32,
+            upscaled_width: 32,
+            width: 32,
+            height: 32,
+        };
+        let store = [entry; 8];
+        let ref_frame_idx = [0u8; 7];
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        let mi_sizes = vec![crate::cdf::BLOCK_INVALID; cells];
+        let is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        let mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let zeros = vec![0u8; cells];
+        let order_hints_by_ref = [0i32; 8];
+        let full_mm = vec![0u8; cells];
+        let full_lwp = vec![0i32; cells * 6];
+        let full_v = vec![0u8; cells];
+        let full_ym = vec![0u8; cells];
+        let full_gt = vec![0u8; 8];
+        let full_gp = vec![0i32; 8 * 6];
+
+        // A too-short `motion_modes` slice trips the guard.
+        let short_mm = vec![0u8; cells - 1];
+        let warp_short = GridWarpContext {
+            motion_modes: &short_mm,
+            local_warp_params: &full_lwp,
+            local_warp_valid: &full_v,
+            y_modes: &full_ym,
+            gm_types: &full_gt,
+            gm_params: &full_gp,
+            force_integer_mv: false,
+        };
+        let _ = &full_mm;
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &zeros,
+            wedge_indices: &zeros,
+            wedge_signs: &zeros,
+            mask_types: &zeros,
+            interintra_modes: &zeros,
+            wedge_interintras: &zeros,
+            interintra_wedge_indices: &zeros,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+            warp: Some(warp_short),
+        };
+        let mut curr = vec![0u16; 64];
+        let mut planes = [PlaneReconContext {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 32,
+            frame_height: 32,
+            curr: &mut curr,
+            curr_stride: 8,
+        }];
+        assert_eq!(
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
         );
     }
@@ -10592,6 +11113,7 @@ mod tests {
             mi_rows,
             mi_cols,
             bit_depth: 8,
+            warp: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -10950,6 +11472,7 @@ mod tests {
             mi_rows,
             mi_cols,
             bit_depth: 8,
+            warp: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -11103,6 +11626,7 @@ mod tests {
             mi_rows,
             mi_cols,
             bit_depth: 8,
+            warp: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -14219,6 +14743,7 @@ mod tests {
             mi_rows,
             mi_cols,
             bit_depth: 8,
+            warp: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -14364,6 +14889,7 @@ mod tests {
                 mi_rows,
                 mi_cols,
                 bit_depth: 8,
+                warp: None,
             };
             let mut planes = [PlaneReconContext {
                 plane: 0,
@@ -14400,6 +14926,7 @@ mod tests {
                 mi_rows,
                 mi_cols,
                 bit_depth: 8,
+                warp: None,
             };
             let mut planes = [PlaneReconContext {
                 plane: 0,
