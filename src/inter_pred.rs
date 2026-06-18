@@ -4947,6 +4947,146 @@ pub fn reconstruct_inter_block(
     Ok(())
 }
 
+/// §7.11.3.1 single forward-reference **warped-motion** reconstruction —
+/// drives one decoded `motion_mode == WARPED_CAUSAL` (LOCALWARP) /
+/// global-warp inter block from mode-info into a `CurrFrame` plane.
+///
+/// This is the warp counterpart of [`reconstruct_inter_block`]: it
+/// performs the same §7.11.3.1 step-5 / §7.11.3.3 ref-buffer resolution
+/// (`refIdx = ref_frame_idx[ ref_frame - LAST_FRAME ]`,
+/// `ref = FrameStore[ refIdx ]`), then runs [`predict_inter`] with
+/// `motion_mode == MOTION_MODE_WARPED_CAUSAL` and the caller-supplied
+/// [`WarpDriverParams`] so the §7.11.3.1 step-2/3/6/7 `useWarp`
+/// derivation picks between the LOCALWARP (`useWarp == 1`) and
+/// GLOBAL_GLOBALMV (`useWarp == 2`) §7.11.3.5 `block_warp` arms, and
+/// finally stitches the predicted block into `curr_plane` at plane
+/// coordinates `(x, y)` (`CurrFrame[plane][y+i][x+j] =
+/// Clip1(preds[0][i][j])`, av1-spec p.258 line 14402 single-ref arm —
+/// `predict_inter` applies the `Clip1`).
+///
+/// The `warp` bundle carries the §7.11.3.8 `LocalWarpParams` /
+/// `LocalValid` the caller fitted from the §7.10.4 `find_warp_samples`
+/// candidates (LOCALWARP arm), the per-ref `gm_type` / `gm_params`
+/// global-motion model (GLOBAL_GLOBALMV arm), and the step-7 gating
+/// flags (`y_mode`, `ref_is_scaled`, `force_integer_mv`). The
+/// `useWarp` decision and the per-8×8 `block_warp` tiling happen inside
+/// [`predict_inter`]; on `w < 8 || h < 8` or any step-7 fall-through to
+/// `useWarp == 0` the driver predicts translationally, so this entry is
+/// always safe to call for a `WARPED_CAUSAL` leaf even when the warp
+/// gate does not actually fire (e.g. a sub-8×8 luma block, an invalid
+/// local fit, or a chroma plane that the §5.11.27 LOCALWARP arm leaves
+/// translational).
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for the same
+/// caller-bug arguments [`reconstruct_inter_block`] rejects (an
+/// `INTRA_FRAME` / out-of-range `ref_frame`, an out-of-range resolved
+/// `refIdx`, a `curr_plane` too small for the `(x, y, w, h)` write
+/// region), plus anything [`predict_inter`]'s WARP arm itself rejects.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_warp(
+    mode_info: InterModeInfo,
+    warp: &WarpDriverParams,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
+    let ref_frame = mode_info.ref_frame as usize;
+    if !(crate::uncompressed_header_tail::LAST_FRAME
+        ..=crate::uncompressed_header_tail::ALTREF_FRAME)
+        .contains(&ref_frame)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.3 — refIdx = ref_frame_idx[ ref - LAST ] ---
+    let slot = ref_frame - crate::uncompressed_header_tail::LAST_FRAME;
+    let ref_idx = *ref_frame_idx
+        .get(slot)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
+    let entry = frame_store
+        .get(ref_idx)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+
+    // ---------- §7.11.3.1 step 5 → PredictInterRef bundle ----------
+    let refs = [PredictInterRef {
+        ref_plane: entry.plane,
+        ref_stride: entry.stride,
+        ref_upscaled_width: entry.upscaled_width,
+        ref_width: entry.width,
+        ref_height: entry.height,
+        mv: mode_info.mv,
+    }];
+
+    // ---------- §7.11.3.1 steps 1-13 — WARP prediction into scratch ---
+    let mut pred_out = vec![0u16; w * h];
+    predict_inter(
+        plane,
+        x,
+        y,
+        w,
+        h,
+        crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+        /* is_compound */ false,
+        /* is_inter_intra */ false,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        &refs,
+        /* compound */ None,
+        /* inter_intra */ None,
+        Some(warp),
+        /* obmc */ None,
+        &mut pred_out,
+    )?;
+
+    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
+    if x < 0 || y < 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let (px, py) = (x as usize, y as usize);
+    let last_row = py
+        .checked_add(h)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let last_col = px
+        .checked_add(w)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_stride < last_col {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed = (last_row - 1)
+        .checked_mul(curr_stride)
+        .and_then(|v| v.checked_add(last_col))
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_plane.len() < needed {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    for i in 0..h {
+        let dst = (py + i) * curr_stride + px;
+        let src = i * w;
+        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+    }
+
+    Ok(())
+}
+
 /// §7.11.3.1 compound two-reference mode-info descriptor — the decoded
 /// `(RefFrame[0], RefFrame[1], Mvs[..][0], Mvs[..][1])` quad plus the
 /// `compound_type` that selects the §7.11.3.1 step-14 combine arm
@@ -12213,6 +12353,230 @@ mod tests {
             pred_out, expected,
             "GLOBAL_WARP driver output must equal hand-composed block_warp"
         );
+    }
+
+    // ---------- r338 reconstruct_inter_block_warp bridge ----------
+
+    /// r338 §7.11.3.1 WARP reconstruction bridge — the `block_warp`
+    /// counterpart of `reconstruct_inter_block`. With a valid LOCALWARP
+    /// `WarpDriverParams` and an 8×8 leaf the bridge must stitch into
+    /// `curr_plane` exactly the `Clip1`-ed `predict_inter` WARP output.
+    #[test]
+    fn r338_reconstruct_inter_block_warp_localwarp_stitches_into_curr() {
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 23 + c * 5) & 0xFF) as u16;
+            }
+        }
+        let store = [RefFrameStoreEntry {
+            plane: &refp,
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        }];
+        // ref_frame_idx maps LAST_FRAME (1) -> slot 0 -> store[0].
+        let ref_frame_idx = [0u8; 7];
+        let warp = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_NEWMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_IDENTITY as u8, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+        let mode_info = InterModeInfo {
+            ref_frame: crate::uncompressed_header_tail::LAST_FRAME as u8,
+            mv: [0, 0],
+        };
+        let (w, h) = (8usize, 8usize);
+        // Curr plane is the whole 32×32 frame; the bridge overwrites the
+        // 8×8 footprint at (8, 8).
+        let mut curr = vec![0u16; ref_h * stride];
+        reconstruct_inter_block_warp(
+            mode_info,
+            &warp,
+            &ref_frame_idx,
+            &store,
+            /* plane */ 0,
+            /* x */ 8,
+            /* y */ 8,
+            w,
+            h,
+            /* bit_depth */ 8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut curr,
+            stride,
+        )
+        .expect("reconstruct_inter_block_warp LOCALWARP");
+
+        // Expected: predict_inter WARP arm into a w×h scratch, then the
+        // same (x, y) footprint copy.
+        let refs = [PredictInterRef {
+            ref_plane: &refp,
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let mut pred = vec![0u16; w * h];
+        predict_inter(
+            0,
+            8,
+            8,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_WARPED_CAUSAL,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &refs,
+            None,
+            None,
+            Some(&warp),
+            None,
+            &mut pred,
+        )
+        .unwrap();
+        for i in 0..h {
+            for j in 0..w {
+                assert_eq!(
+                    curr[(8 + i) * stride + (8 + j)],
+                    pred[i * w + j],
+                    "warp bridge sample ({i},{j}) must match predict_inter WARP arm"
+                );
+            }
+        }
+    }
+
+    /// r338 — the bridge mirrors `reconstruct_inter_block`'s caller-bug
+    /// guards: `INTRA_FRAME` ref, out-of-range `refIdx`, a too-small
+    /// `curr_plane`, and a negative origin all return
+    /// `PartitionWalkOutOfRange`.
+    #[test]
+    fn r338_reconstruct_inter_block_warp_arg_guards() {
+        let refp = vec![7u16; 32 * 32];
+        let store = [RefFrameStoreEntry {
+            plane: &refp,
+            stride: 32,
+            upscaled_width: 32,
+            width: 32,
+            height: 32,
+        }];
+        let ref_frame_idx = [0u8; 7];
+        let warp = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_NEWMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_IDENTITY as u8, 0],
+            gm_params: [WARP_IDENTITY, WARP_IDENTITY],
+            local_warp_params: WARP_IDENTITY,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+        let mut curr = vec![0u16; 32 * 32];
+
+        // INTRA_FRAME (0) ref.
+        let mi_intra = InterModeInfo {
+            ref_frame: crate::uncompressed_header_tail::INTRA_FRAME as u8,
+            mv: [0, 0],
+        };
+        assert!(reconstruct_inter_block_warp(
+            mi_intra,
+            &warp,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            32,
+            32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut curr,
+            32,
+        )
+        .is_err());
+
+        let mi = InterModeInfo {
+            ref_frame: crate::uncompressed_header_tail::LAST_FRAME as u8,
+            mv: [0, 0],
+        };
+        // Out-of-range resolved refIdx (slot 0 -> 9, store has 1 entry).
+        let bad_idx = [9u8; 7];
+        assert!(reconstruct_inter_block_warp(
+            mi, &warp, &bad_idx, &store, 0, 0, 0, 8, 8, 8, 0, 0, 32, 32, EIGHTTAP, EIGHTTAP,
+            &mut curr, 32,
+        )
+        .is_err());
+
+        // curr_plane too small for the (x, y, w, h) write region.
+        let mut tiny = vec![0u16; 8];
+        assert!(reconstruct_inter_block_warp(
+            mi,
+            &warp,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            32,
+            32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut tiny,
+            32,
+        )
+        .is_err());
+
+        // Negative origin.
+        assert!(reconstruct_inter_block_warp(
+            mi,
+            &warp,
+            &ref_frame_idx,
+            &store,
+            0,
+            -4,
+            0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            32,
+            32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut curr,
+            32,
+        )
+        .is_err());
     }
 
     /// §7.11.3.1 step-7 ◦ 1 — `w < 8 || h < 8` forces `useWarp = 0`
