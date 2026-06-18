@@ -48,6 +48,11 @@ profile:
 - Intra-only key frames, single tile per frame.
 - The 13-mode `INTRA_MODES` luma set plus chroma-from-luma
   (`UV_CFL_PRED`) on the chroma path.
+- Palette-coded intra blocks: the §5.11.46 palette-colour reads,
+  §5.11.49 `palette_tokens` colour-index map, §7.11.4 per-TU
+  `predict_palette` leaf, and the §5.11.35 per-block walker bridge
+  (`reconstruct_palette_block_into_curr_frame`) that drives the leaf
+  across a block's transform-block grid into `CurrFrame[plane]`.
 - Lossless arm (`base_q_idx == 0`, inverse WHT, bit-exact
   encode/decode round-trip) and a lossy inverse-DCT arm
   (`base_q_idx > 0`, encoder/decoder self-consistency).

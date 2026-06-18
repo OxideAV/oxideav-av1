@@ -16539,6 +16539,195 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// §7.11.4 palette prediction reconstruction into the walker's own
+    /// `CurrFrame[plane]` buffer (av1-spec p.286) — the per-block bridge
+    /// that drives the §7.11.4 [`crate::predict_palette`] leaf across
+    /// every transform block of one plane of a palette-coded intra block,
+    /// writing the predicted samples into the walker's tracked
+    /// `CurrFrame[plane]`.
+    ///
+    /// This is the palette-block companion to the
+    /// `reconstruct_*_inter_block_into_curr_frame` family: it consumes
+    /// the §5.11.49 `ColorMap{Y,UV}` index map surfaced on
+    /// [`DecodedBlock::color_map_y`] / [`DecodedBlock::color_map_uv`]
+    /// (r325) together with the §5.11.46 `PaletteColors{Y,U,V}[ ]` colour
+    /// table this walker stamped into its own grid (r-series
+    /// `palette_mode_info` reads), and produces the actual predicted
+    /// pixels the §5.11.35 `predict_palette( plane, startX, startY, x, y,
+    /// txSz )` call site writes.
+    ///
+    /// The §5.11.35 residual loop walks the block's transform-block grid
+    /// in `(x, y)` 4×4-unit coordinates stepping by `stepX =
+    /// Tx_Width[txSz] >> MI_SIZE_LOG2` / `stepY = Tx_Height[txSz] >>
+    /// MI_SIZE_LOG2`; at each step it computes `startX = baseX + 4 * x`,
+    /// `startY = baseY + 4 * y` and invokes §7.11.4 with that transform
+    /// block's `(x, y)` map window. This bridge reproduces that walk for
+    /// one plane:
+    ///
+    /// * `baseX = (MiCol >> subX) * MI_SIZE`, `baseY = (MiRow >> subY) *
+    ///   MI_SIZE` — the plane-space top-left of the block.
+    /// * the transform-block grid spans the §5.11.49 map's `block_w` ×
+    ///   `block_h` extent (the post-subsampling, post-`<4`-bump block
+    ///   size the `palette_tokens` reader used), tiled by `Tx_Width` ×
+    ///   `Tx_Height`.
+    /// * each transform block whose `startX`/`startY` is in-frame
+    ///   (§5.11.35 line 13 `startX < maxX && startY < maxY`, with `maxX =
+    ///   (MiCols * MI_SIZE) >> subX`, `maxY = (MiRows * MI_SIZE) >>
+    ///   subY`) invokes [`crate::predict_palette`]; the predicted `w × h`
+    ///   tile is stitched into `CurrFrame[plane]` at `(startX, startY)`.
+    ///
+    /// The `palette` colour table is read from the walker's own §5.11.46
+    /// `PaletteColors[plane][MiRow][MiCol][ 0..PaletteSize ]` grid (the
+    /// state `palette_mode_info` stamped at decode time); the caller does
+    /// not pass it. The plane buffer is lazily allocated at the full
+    /// `(MiRows × MI_SIZE) >> subY` × `(MiCols × MI_SIZE) >> subX`
+    /// extent (mirroring [`Self::ensure_curr_frame_plane`]) if this is the
+    /// first writer on the plane.
+    ///
+    /// ## Arguments
+    ///
+    /// * `plane` — `0` (luma, reads `ColorMapY` + `palette_colors_y`),
+    ///   `1` (U) or `2` (V); planes `1`/`2` both read `ColorMapUV` (the
+    ///   chroma planes share one index map) but their own
+    ///   `palette_colors_{u,v}` grid.
+    /// * `map` — the §5.11.49 [`DecodedPaletteMap`] for the plane
+    ///   (`color_map_y` for `plane == 0`, `color_map_uv` for `plane !=
+    ///   0`).
+    /// * `mi_row` / `mi_col` — the block's top-left in mi-units (the
+    ///   §5.11.5 `MiRow` / `MiCol`).
+    /// * `tx_sz` — the block's transform-block size ordinal
+    ///   (`0..TX_SIZES_ALL`); palette blocks use one uniform TX size, so
+    ///   the whole-block grid is tiled by `Tx_Width[tx_sz]` ×
+    ///   `Tx_Height[tx_sz]`.
+    /// * `sub_x` / `sub_y` — the §5.11.34 plane subsampling (`0` for
+    ///   `plane == 0`).
+    /// * `palette_size` — the §5.11.46 `PaletteSize{Y,UV}` (`2..=8`);
+    ///   only the first `palette_size` entries of the grid palette are
+    ///   used.
+    ///
+    /// ## Returns
+    ///
+    /// `Ok(())` on success. Returns [`crate::Error::PartitionWalkOutOfRange`]
+    /// for a caller-bug argument: `plane >= 3`, `tx_sz >= TX_SIZES_ALL`,
+    /// `palette_size` outside `1..=PALETTE_COLORS`, a `map` whose
+    /// `stride < block_w` or `data.len() < block_h * stride`, an
+    /// allocation failure, or anything [`crate::predict_palette`] itself
+    /// rejects (an out-of-window map index, a map too small for the
+    /// requested transform-block window).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_palette_block_into_curr_frame(
+        &mut self,
+        plane: usize,
+        map: &DecodedPaletteMap,
+        mi_row: u32,
+        mi_col: u32,
+        tx_sz: usize,
+        sub_x: u8,
+        sub_y: u8,
+        palette_size: usize,
+    ) -> Result<(), crate::Error> {
+        if plane >= 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if tx_sz >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if palette_size == 0 || palette_size > PALETTE_COLORS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if map.stride < map.block_w || map.data.len() < map.block_h.saturating_mul(map.stride) {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.46 `palette = palette_colors_{y,u,v}[ 0..PaletteSize ]`
+        // read from the walker's own grid at the block anchor.
+        let mut palette: [u16; PALETTE_COLORS] = [0; PALETTE_COLORS];
+        for (idx, slot) in palette.iter_mut().enumerate().take(palette_size) {
+            *slot = self.palette_color_at(plane, mi_row as i32, mi_col as i32, idx);
+        }
+        let palette = &palette[..palette_size];
+
+        // §5.11.35 `baseX = (MiCol >> subX) * MI_SIZE`,
+        // `baseY = (MiRow >> subY) * MI_SIZE`.
+        let base_x = (mi_col >> sub_x) * (MI_SIZE as u32);
+        let base_y = (mi_row >> sub_y) * (MI_SIZE as u32);
+        // §5.11.35 `maxX = (MiCols * MI_SIZE) >> subX`,
+        // `maxY = (MiRows * MI_SIZE) >> subY`.
+        let max_x = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+        let max_y = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+
+        // Lazily allocate the plane buffer at the full §7.12.3-step-3
+        // extent if untouched (palette is an intra writer; like the
+        // single-ref inter bridge there is no prior-writer prerequisite).
+        let rows = max_y;
+        let cols = max_x;
+        self.ensure_curr_frame_plane(plane, rows, cols);
+        let buf_cols = match self.curr_frame[plane].as_ref() {
+            Some(cp) => cp.cols as usize,
+            None => return Err(crate::Error::PartitionWalkOutOfRange),
+        };
+
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        // §5.11.35 `stepX = Tx_Width[txSz] >> MI_SIZE_LOG2`,
+        // `stepY = Tx_Height[txSz] >> MI_SIZE_LOG2` (in 4×4 units).
+        let step_x = (w >> MI_SIZE_LOG2).max(1);
+        let step_y = (h >> MI_SIZE_LOG2).max(1);
+        // The §5.11.49 map covers the block's `block_w × block_h` plane-
+        // space extent; the transform-block grid walks it in 4×4 units.
+        let units_w = map.block_w.div_ceil(4);
+        let units_h = map.block_h.div_ceil(4);
+
+        // Per-TU predict buffer.
+        let mut pred: [u16; 64 * 64] = [0; 64 * 64];
+
+        let mut y = 0usize;
+        while y < units_h {
+            let mut x = 0usize;
+            while x < units_w {
+                // §5.11.35 `startX = baseX + 4 * x`,
+                // `startY = baseY + 4 * y`.
+                let start_x = base_x + 4 * (x as u32);
+                let start_y = base_y + 4 * (y as u32);
+                // §5.11.35 line 13: skip transform blocks whose top-left
+                // is past the frame edge.
+                if start_x >= max_x || start_y >= max_y {
+                    x += step_x;
+                    continue;
+                }
+                // §7.11.4: predict this transform block's `w × h` tile.
+                crate::predict_palette(
+                    tx_sz,
+                    x,
+                    y,
+                    &map.data,
+                    map.stride,
+                    palette,
+                    &mut pred[..h * w],
+                )?;
+                // Stitch the predicted tile into CurrFrame[plane], clipping
+                // any overhang past the right / bottom frame edge (the
+                // §5.11.35 map window can extend past `maxX`/`maxY` at the
+                // block's frame-boundary TUs; only in-frame samples are
+                // written).
+                if let Some(cp) = self.curr_frame[plane].as_mut() {
+                    let copy_w = (max_x.saturating_sub(start_x) as usize).min(w);
+                    let copy_h = (max_y.saturating_sub(start_y) as usize).min(h);
+                    for i in 0..copy_h {
+                        let dst_row = (start_y as usize + i) * buf_cols + start_x as usize;
+                        let src_row = i * w;
+                        for j in 0..copy_w {
+                            cp.samples[dst_row + j] = pred[src_row + j] as i32;
+                        }
+                    }
+                }
+                x += step_x;
+            }
+            y += step_y;
+        }
+        Ok(())
+    }
+
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
     /// row-major: `skips()[ r * MiCols + c ]`. Cells that no leaf
     /// covered carry `0` (the §5.11.11 [`Self::decode_skip`] writer
@@ -57349,6 +57538,201 @@ mod tests {
         let bad_map = [0u8, 1, 0, 3, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
         assert!(matches!(
             predict_palette(TX_4X4, 0, 0, &bad_map, 4, &palette, &mut pred),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// §7.11.4 walker bridge: a single 4×4 palette block (TX_4X4, one
+    /// transform block) on luma reconstructs `CurrFrame[0][i][j] =
+    /// palette[ColorMapY[i][j]]` into the walker's own buffer.
+    #[test]
+    fn reconstruct_palette_block_single_tu_luma() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // §5.11.46 palette stamped at the block anchor (0, 0): 3 colours.
+        walker
+            .stamp_palette_for_test(0, 0, 0, &[11, 22, 33])
+            .unwrap();
+        // §5.11.49 4×4 colour-index map, indices into the 3-colour
+        // palette.
+        let map = DecodedPaletteMap {
+            data: vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0],
+            stride: 4,
+            block_w: 4,
+            block_h: 4,
+            onscreen_w: 4,
+            onscreen_h: 4,
+        };
+        walker
+            .reconstruct_palette_block_into_curr_frame(0, &map, 0, 0, TX_4X4, 0, 0, 3)
+            .expect("single-TU palette reconstruction");
+        let cf = walker.curr_frame(0).unwrap();
+        let cols = walker.curr_frame_dims(0).unwrap().1 as usize;
+        // Frame is 4 mi × MI_SIZE = 16 samples wide; the block occupies
+        // the top-left 4×4 only.
+        let pal = [11i32, 22, 33];
+        for i in 0..4usize {
+            for j in 0..4usize {
+                let idx = map.data[i * 4 + j] as usize;
+                assert_eq!(cf[i * cols + j], pal[idx], "({i},{j}) must be palette[map]");
+            }
+        }
+        // Samples outside the 4×4 block stay zero.
+        assert_eq!(cf[5], 0, "sample outside the block is untouched");
+    }
+
+    /// §7.11.4 walker bridge: an 8×8 palette block tiled by four TX_4X4
+    /// transform blocks reconstructs each transform block at its
+    /// `(startX, startY) = (4*x, 4*y)` offset, with each TU windowing
+    /// into its own 4×4 region of the 8×8 ColorMap.
+    #[test]
+    fn reconstruct_palette_block_multi_tu_tiling() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        walker
+            .stamp_palette_for_test(0, 0, 0, &[7, 70, 140])
+            .unwrap();
+        // 8×8 map (stride 8): increasing indices mod 3.
+        let mut data = vec![0u8; 64];
+        for (k, slot) in data.iter_mut().enumerate() {
+            *slot = (k % 3) as u8;
+        }
+        let map = DecodedPaletteMap {
+            data: data.clone(),
+            stride: 8,
+            block_w: 8,
+            block_h: 8,
+            onscreen_w: 8,
+            onscreen_h: 8,
+        };
+        walker
+            .reconstruct_palette_block_into_curr_frame(0, &map, 0, 0, TX_4X4, 0, 0, 3)
+            .expect("multi-TU palette reconstruction");
+        let cf = walker.curr_frame(0).unwrap();
+        let cols = walker.curr_frame_dims(0).unwrap().1 as usize;
+        let pal = [7i32, 70, 140];
+        // Every sample of the 8×8 block must equal palette[map[i][j]]:
+        // the four TX_4X4 tiles together cover the whole 8×8 map.
+        for i in 0..8usize {
+            for j in 0..8usize {
+                let idx = map.data[i * map.stride + j] as usize;
+                assert_eq!(
+                    cf[i * cols + j],
+                    pal[idx],
+                    "({i},{j}) palette sample after 2×2 TU tiling"
+                );
+            }
+        }
+    }
+
+    /// §7.11.4 walker bridge: a 4:2:0 chroma plane (sub_x = sub_y = 1)
+    /// reads ColorMapUV + its own palette_colors_v and writes at the
+    /// subsampled origin `(MiCol >> 1) * MI_SIZE`.
+    #[test]
+    fn reconstruct_palette_block_chroma_subsampled() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // V plane (plane 2) palette at (0, 0).
+        walker.stamp_palette_for_test(2, 0, 0, &[3, 9]).unwrap();
+        let map = DecodedPaletteMap {
+            data: vec![0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1],
+            stride: 4,
+            block_w: 4,
+            block_h: 4,
+            onscreen_w: 4,
+            onscreen_h: 4,
+        };
+        walker
+            .reconstruct_palette_block_into_curr_frame(2, &map, 0, 0, TX_4X4, 1, 1, 2)
+            .expect("chroma palette reconstruction");
+        let cf = walker.curr_frame(2).unwrap();
+        let (rows, cols) = walker.curr_frame_dims(2).unwrap();
+        // 4:2:0 ⇒ chroma plane is (4 mi * 4) >> 1 = 8 samples per axis.
+        assert_eq!((rows, cols), (8, 8));
+        let pal = [3i32, 9];
+        for i in 0..4usize {
+            for j in 0..4usize {
+                let idx = map.data[i * 4 + j] as usize;
+                assert_eq!(cf[i * cols as usize + j], pal[idx]);
+            }
+        }
+    }
+
+    /// §7.11.4 walker bridge guards: plane >= 3, tx_sz out of range,
+    /// palette_size outside 1..=PALETTE_COLORS, and a malformed map
+    /// (stride < block_w) all surface PartitionWalkOutOfRange.
+    #[test]
+    fn reconstruct_palette_block_guards() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let map = DecodedPaletteMap {
+            data: vec![0u8; 16],
+            stride: 4,
+            block_w: 4,
+            block_h: 4,
+            onscreen_w: 4,
+            onscreen_h: 4,
+        };
+        // plane >= 3.
+        assert!(matches!(
+            walker.reconstruct_palette_block_into_curr_frame(3, &map, 0, 0, TX_4X4, 0, 0, 2),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // tx_sz out of range.
+        assert!(matches!(
+            walker.reconstruct_palette_block_into_curr_frame(0, &map, 0, 0, TX_SIZES_ALL, 0, 0, 2),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // palette_size == 0.
+        assert!(matches!(
+            walker.reconstruct_palette_block_into_curr_frame(0, &map, 0, 0, TX_4X4, 0, 0, 0),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // palette_size > PALETTE_COLORS.
+        assert!(matches!(
+            walker.reconstruct_palette_block_into_curr_frame(
+                0,
+                &map,
+                0,
+                0,
+                TX_4X4,
+                0,
+                0,
+                PALETTE_COLORS + 1
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+        // malformed map: stride < block_w.
+        let bad_map = DecodedPaletteMap {
+            data: vec![0u8; 16],
+            stride: 3,
+            block_w: 4,
+            block_h: 4,
+            onscreen_w: 4,
+            onscreen_h: 4,
+        };
+        assert!(matches!(
+            walker.reconstruct_palette_block_into_curr_frame(0, &bad_map, 0, 0, TX_4X4, 0, 0, 2),
             Err(crate::Error::PartitionWalkOutOfRange)
         ));
     }
