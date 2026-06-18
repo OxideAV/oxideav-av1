@@ -16085,6 +16085,111 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// §7.11.3.1 single forward-reference **warped-motion** pixel
+    /// reconstruction against the walker's own tracked `CurrFrame[plane]`
+    /// buffer (av1-spec p.257-258, `motion_mode == WARPED_CAUSAL`) — the
+    /// warp counterpart of [`Self::reconstruct_inter_block_into_curr_frame`].
+    ///
+    /// Rather than the `MOTION_MODE_SIMPLE` translational driver, this
+    /// bridge invokes [`crate::reconstruct_inter_block_warp`] with the
+    /// caller-supplied [`crate::WarpDriverParams`] so the §7.11.3.1
+    /// step-2/3/6/7 `useWarp` derivation picks between the LOCALWARP
+    /// (`useWarp == 1`) and GLOBAL_GLOBALMV (`useWarp == 2`) §7.11.3.5
+    /// `block_warp` arms. As with the SIMPLE bridge there is no intra-half
+    /// prerequisite, so it **allocates** the plane buffer (sized
+    /// `MiRows × MiCols × MI_SIZE >> subsampling_*`) if the warped block is
+    /// the first writer on this plane.
+    ///
+    /// On a §7.11.3.1 step-7 fall-through to `useWarp == 0` (a sub-8×8
+    /// `w`/`h`, a chroma plane the §5.11.27 LOCALWARP arm leaves
+    /// translational, an invalid local fit, or `force_integer_mv`) the
+    /// underlying driver predicts translationally — so this entry is safe
+    /// to call for every `WARPED_CAUSAL` leaf and plane.
+    ///
+    /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
+    /// samples; `w` / `h` are its plane-space size. The walker buffer is
+    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
+    /// mirrors the plane buffer to `u16`, drives the block, and copies the
+    /// result back as `i32` (lossless in both directions). Only the
+    /// `w × h` write footprint changes.
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
+    /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
+    /// that would overflow the (allocated) plane buffer, or anything
+    /// [`crate::reconstruct_inter_block_warp`] itself rejects (an
+    /// `INTRA_FRAME`/out-of-range `RefFrame[0]`, an out-of-range resolved
+    /// `refIdx`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_inter_block_warp_into_curr_frame(
+        &mut self,
+        mode_info: crate::InterModeInfo,
+        warp: &crate::WarpDriverParams,
+        ref_frame_idx: &[u8],
+        ref_spec: &crate::PlaneRefSpec<'_>,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+        bit_depth: u8,
+        interp_filter_x: u8,
+        interp_filter_y: u8,
+    ) -> Result<(), crate::Error> {
+        let p = ref_spec.plane as usize;
+        if p >= 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // Allocate the plane buffer if the warped block is the first
+        // writer on this plane (mirror the §7.12.3 step-3 merge extent so
+        // a later merge on the same plane is a no-op).
+        let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
+        let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
+        self.ensure_curr_frame_plane(p, rows, cols);
+        let Some(cp) = self.curr_frame[p].as_ref() else {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        };
+        let buf_cols = cp.cols as usize;
+        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
+        // samples are post-`Clip1` so the `i32 → u16` narrowing is
+        // lossless.
+        let mut mirror: Vec<u16> = Vec::new();
+        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+
+        // Drive the single-ref warped reconstruction; the final stitch
+        // overwrites the `w × h` footprint at `(x, y)`.
+        crate::reconstruct_inter_block_warp(
+            mode_info,
+            warp,
+            ref_frame_idx,
+            ref_spec.frame_store,
+            ref_spec.plane,
+            x,
+            y,
+            w,
+            h,
+            bit_depth,
+            ref_spec.subsampling_x,
+            ref_spec.subsampling_y,
+            ref_spec.frame_width,
+            ref_spec.frame_height,
+            interp_filter_x,
+            interp_filter_y,
+            mirror.as_mut_slice(),
+            buf_cols,
+        )?;
+
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffer.
+        if let Some(cp) = self.curr_frame[p].as_mut() {
+            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                *dst = src as i32;
+            }
+        }
+        Ok(())
+    }
+
     /// §7.11.3.1 compound (≥2-ref) inter pixel reconstruction against the
     /// walker's own tracked `CurrFrame[plane]` buffer (av1-spec p.258 line
     /// 14402 final stitch: `isCompound == 1 ⇒ CurrFrame[plane][y+i][x+j] =
@@ -56347,6 +56452,258 @@ mod tests {
                 &ref_frame_idx,
                 &good_spec,
                 0,
+                0,
+                8,
+                8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r338 §7.11.3.1 WARP end-to-end: the walker bridge
+    /// [`PartitionWalker::reconstruct_inter_block_warp_into_curr_frame`]
+    /// drives a `motion_mode == WARPED_CAUSAL` LOCALWARP block into its
+    /// own allocated `CurrFrame[0]`, matching the per-block
+    /// [`crate::reconstruct_inter_block_warp`] driver byte-for-byte, and
+    /// differing from the translational SIMPLE bridge (the warp dispatch
+    /// actually fired).
+    #[test]
+    fn r338_walker_reconstructs_warped_causal_block_pixels() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{
+            reconstruct_inter_block, reconstruct_inter_block_warp, InterModeInfo, PlaneRefSpec,
+            RefFrameStoreEntry, WarpDriverParams,
+        };
+
+        // High-frequency reference so a sub-pel warp shift diverges from
+        // the integer-position translational copy.
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (((r * 37) ^ (c * 53)) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let mode_info = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+        // A small valid horizontal-shear affine matrix (`setup_shear`
+        // accepts it) so the §7.11.3.5 warped convolution produces a
+        // result distinct from the translational fallback.
+        const WARP_SHEAR: [i32; 6] = [0, 0, (1 << 16) + 4096, 0, 0, 1 << 16];
+        const WARP_ID: [i32; 6] = [0, 0, 1 << 16, 0, 0, 1 << 16];
+        let warp = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_NEWMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_IDENTITY as u8, 0],
+            gm_params: [WARP_ID, WARP_ID],
+            local_warp_params: WARP_SHEAR,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+
+        // 8×8 luma buffer (MiRows × MiCols × MI_SIZE = 2 × 4).
+        let (curr_w, curr_h) = (8usize, 8usize);
+
+        // Per-block warp oracle into a fresh zero buffer with the walker's
+        // 8-column stride.
+        let mut oracle = vec![0u16; curr_w * curr_h];
+        reconstruct_inter_block_warp(
+            mode_info,
+            &warp,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+        // Translational oracle (for the divergence check).
+        let mut simple = vec![0u16; curr_w * curr_h];
+        reconstruct_inter_block(
+            mode_info,
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut simple,
+            curr_w,
+        )
+        .unwrap();
+
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(walker.curr_frame(0).is_none());
+        let ref_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        };
+
+        walker
+            .reconstruct_inter_block_warp_into_curr_frame(
+                mode_info,
+                &warp,
+                &ref_frame_idx,
+                &ref_spec,
+                0,
+                0,
+                curr_w,
+                curr_h,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("walker warped reconstruction");
+
+        let (rows, cols) = walker.curr_frame_dims(0).unwrap();
+        assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
+        let got: Vec<u16> = walker
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(
+            got, oracle,
+            "the walker warp bridge must reconstruct warped pixels identically to the per-block driver"
+        );
+        assert_ne!(
+            got, simple,
+            "the WARPED_CAUSAL bridge must diverge from the translational fallback"
+        );
+    }
+
+    /// r338 walker warp-bridge guards: an out-of-range plane and a
+    /// negative origin are caller bugs surfaced as
+    /// [`crate::Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn r338_walker_warp_bridge_guards() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry, WarpDriverParams};
+
+        let refp = vec![3u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        const WARP_ID: [i32; 6] = [0, 0, 1 << 16, 0, 0, 1 << 16];
+        let warp = WarpDriverParams {
+            y_mode: [crate::cdf::MODE_NEWMV, 0],
+            gm_type: [crate::cdf::GM_TYPE_IDENTITY as u8, 0],
+            gm_params: [WARP_ID, WARP_ID],
+            local_warp_params: WARP_ID,
+            local_valid: true,
+            ref_is_scaled: [false, false],
+            force_integer_mv: false,
+        };
+        let good_mode = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+
+        // Out-of-range plane.
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let bad_plane = PlaneRefSpec {
+            plane: 3,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        assert!(matches!(
+            w.reconstruct_inter_block_warp_into_curr_frame(
+                good_mode,
+                &warp,
+                &ref_frame_idx,
+                &bad_plane,
+                0,
+                0,
+                8,
+                8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Negative origin.
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let good_plane = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        assert!(matches!(
+            w2.reconstruct_inter_block_warp_into_curr_frame(
+                good_mode,
+                &warp,
+                &ref_frame_idx,
+                &good_plane,
+                -4,
                 0,
                 8,
                 8,

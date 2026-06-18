@@ -60,6 +60,17 @@ profile:
   superres, film grain) are present as modules but disabled under this
   parameter set.
 
+The inter-prediction reconstruction layer covers the §7.11.3.1 single-
+reference translational (SIMPLE), compound (AVERAGE / DISTANCE / WEDGE /
+DIFFWTD), and inter-intra arms, plus the §7.11.3.5 **warped-motion**
+(LOCALWARP `useWarp == 1` / GLOBAL_GLOBALMV `useWarp == 2`) arm —
+`reconstruct_inter_block_warp` and its `PartitionWalker` bridge
+(`reconstruct_inter_block_warp_into_curr_frame`) drive `block_warp` into
+`CurrFrame[plane]`, and the §5.11.33 frame walk dispatches a decoded
+`motion_mode == WARPED_CAUSAL` leaf to the warp path (via the opt-in
+`InterModeInfoGrid.warp` context). §7.11.3.9-10 OBMC remains a leaf-only
+layer not yet wired into the frame walk.
+
 The public `encode_av1` entry takes the constrained
 `[8, 64]`-per-axis lossless case; wider extents, lossy quant, and
 monochrome are reachable through the crate-public `encoder::*` driver
