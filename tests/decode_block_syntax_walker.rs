@@ -70,10 +70,10 @@ use oxideav_av1::{
 };
 use oxideav_av1::{
     DecodedBlock, DecodedInterFrameModeInfo, DecodedPaletteMap, Error, InterFrameContext,
-    MotionFieldMvs, PartitionWalker, SymbolDecoder, TileCdfContext, TileGeometry, BLOCK_16X16,
-    BLOCK_4X4, BLOCK_8X16, BLOCK_8X8, GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH,
-    MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4, TX_8X8, TX_SIZE_CONTEXTS,
-    WARPEDMODEL_PREC_BITS,
+    MotionFieldMvs, PartitionWalker, QuantizerParams, SymbolDecoder, TileCdfContext,
+    TileDecodeParams, TileGeometry, BLOCK_16X16, BLOCK_4X4, BLOCK_8X16, BLOCK_8X8,
+    GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4,
+    TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
 };
 
 /// Helper for r173 `decode_inter_frame_mode_info` tests: builds the
@@ -793,6 +793,80 @@ fn decode_partition_syntax_out_of_grid_short_circuits() {
         walker.blocks().is_empty(),
         "no leaves emitted on the out-of-grid path"
     );
+}
+
+/// r342: `decode_tile_syntax` drives the §5.11.2 superblock loop across
+/// a whole tile, reconstructing every leaf's intra prediction + residual
+/// into `CurrFrame[plane]`. On a 16×16 intra keyframe (one 64×64
+/// superblock clipped to the 4×4 mi grid) with skip forced to 1 every
+/// block is a no-residual intra DC_PRED block, so the loop populates all
+/// three plane buffers with the §7.11.2.5 DC default (128, no
+/// neighbours at the frame origin, propagated rightward / downward by
+/// each block's prediction reading the reconstructed neighbours).
+#[test]
+fn decode_tile_syntax_reconstructs_intra_tile_into_curr_frame() {
+    let mut walker = walker_n(4);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    // Force §5.11.11 skip = 1 on every context so each leaf is a
+    // no-residual intra block (deterministic, no coeff reads).
+    cdfs.skip = [force_binary_cdf(1); SKIP_CONTEXTS];
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+    let quant = QuantizerParams::neutral(0, 8);
+    let params = TileDecodeParams {
+        frame_is_intra: true,
+        subsampling_x: 1,
+        subsampling_y: 1,
+        num_planes: 3,
+        seg_id_pre_skip: false,
+        segmentation_enabled: false,
+        seg_skip_active: false,
+        last_active_seg_id: 0,
+        lossless_array: &lossless,
+        coded_lossless: false,
+        enable_cdef: false,
+        allow_intrabc: false,
+        cdef_bits: 0,
+        use_128x128_superblock: false,
+        delta_q_res: 0,
+        delta_lf_present: false,
+        delta_lf_multi: false,
+        mono_chrome: false,
+        delta_lf_res: 0,
+        allow_screen_content_tools: false,
+        enable_filter_intra: false,
+        bit_depth: 8,
+        tx_mode_select: false,
+        reduced_tx_set: false,
+    };
+
+    let result = walker.decode_tile_syntax(
+        &mut dec, &mut cdfs, &params, /* inter_ctx = */ None, &quant,
+        /* read_deltas = */ false,
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "the §5.11.2 tile loop must reconstruct cleanly"
+    );
+
+    // Every plane buffer is allocated + reconstructed. The luma plane
+    // is 16×16 (4 mi * MI_SIZE), chroma planes 8×8 (>> subsampling).
+    assert_eq!(walker.curr_frame_dims(0), Some((16, 16)));
+    assert_eq!(walker.curr_frame_dims(1), Some((8, 8)));
+    assert_eq!(walker.curr_frame_dims(2), Some((8, 8)));
+    // The top-left luma sample is the §7.11.2.5 no-neighbour DC default.
+    let y = walker.curr_frame(0).unwrap();
+    assert_eq!(
+        y[0], 128,
+        "top-left luma is the DC_PRED no-neighbour default"
+    );
+    // Every reconstructed sample is in the valid 8-bit range (the
+    // §7.12.3 step-3 Clip1 envelope holds across the whole tile).
+    for &s in walker.curr_frame(0).unwrap() {
+        assert!((0..=255).contains(&s), "luma sample {s} in Clip1 range");
+    }
 }
 
 /// `DecodedBlock` is the per-block aggregate returned on the no-stub

@@ -15429,6 +15429,68 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     pub tx_size: u8,
 }
 
+/// Per-tile frame-constant parameters threaded into the §5.11.2
+/// `decode_tile()` superblock loop ([`PartitionWalker::decode_tile_syntax`])
+/// and forwarded unchanged to every §5.11.4
+/// [`PartitionWalker::decode_partition_syntax`] call.
+///
+/// These are the frame-header / sequence-header constants that do not
+/// change within a tile; bundling them keeps the tile-loop entry point
+/// from re-spelling `decode_partition_syntax`'s ~30-argument list at the
+/// call site. Field semantics mirror the same-named `decode_partition_syntax`
+/// parameters one-for-one.
+#[derive(Debug, Clone, Copy)]
+pub struct TileDecodeParams<'a> {
+    /// `FrameIsIntra` per §5.9.2 — `true` for KEY / INTRA_ONLY frames.
+    pub frame_is_intra: bool,
+    /// `subsampling_x` per §5.5.2.
+    pub subsampling_x: u8,
+    /// `subsampling_y` per §5.5.2.
+    pub subsampling_y: u8,
+    /// `NumPlanes` per §5.5.2 (`mono_chrome ? 1 : 3`).
+    pub num_planes: u8,
+    /// `SegIdPreSkip` per §5.9.14.
+    pub seg_id_pre_skip: bool,
+    /// `segmentation_enabled` per §5.9.14.
+    pub segmentation_enabled: bool,
+    /// `seg_skip_active` (any segment with `SEG_LVL_SKIP`).
+    pub seg_skip_active: bool,
+    /// `LastActiveSegId` per §5.9.14.
+    pub last_active_seg_id: u8,
+    /// `LosslessArray[ segment_id ]` per §5.9.2.
+    pub lossless_array: &'a [bool; MAX_SEGMENTS],
+    /// `CodedLossless` per §5.9.2.
+    pub coded_lossless: bool,
+    /// `enable_cdef` per §5.9.11.
+    pub enable_cdef: bool,
+    /// `allow_intrabc` per §5.9.2.
+    pub allow_intrabc: bool,
+    /// `cdef_bits` per §5.9.19.
+    pub cdef_bits: u32,
+    /// `use_128x128_superblock` per §5.5.1.
+    pub use_128x128_superblock: bool,
+    /// `delta_q_res` per §5.9.17.
+    pub delta_q_res: u8,
+    /// `delta_lf_present` per §5.9.18.
+    pub delta_lf_present: bool,
+    /// `delta_lf_multi` per §5.9.18.
+    pub delta_lf_multi: bool,
+    /// `mono_chrome` per §5.5.2.
+    pub mono_chrome: bool,
+    /// `delta_lf_res` per §5.9.18.
+    pub delta_lf_res: u8,
+    /// `allow_screen_content_tools` per §5.9.2.
+    pub allow_screen_content_tools: bool,
+    /// `enable_filter_intra` per §5.5.1.
+    pub enable_filter_intra: bool,
+    /// `BitDepth` per §5.5.2.
+    pub bit_depth: u8,
+    /// `TxMode == TX_MODE_SELECT` per §5.9.21.
+    pub tx_mode_select: bool,
+    /// `reduced_tx_set` per §5.9.21.
+    pub reduced_tx_set: bool,
+}
+
 impl PartitionWalker {
     /// Construct a fresh walker for a frame with the given mi-unit
     /// extent and tile bounds. Every `MiSizes[]` cell starts at
@@ -29266,6 +29328,144 @@ impl PartitionWalker {
             _ => return Err(crate::Error::PartitionWalkOutOfRange),
         }
 
+        Ok(())
+    }
+
+    /// `decode_tile()` per §5.11.2 (av1-spec p.59-60) — the superblock
+    /// loop that drives [`Self::decode_partition_syntax`] across an
+    /// entire tile, assembling the per-plane `CurrFrame[plane]`
+    /// reconstruction as it goes.
+    ///
+    /// ```text
+    ///   decode_tile() {
+    ///     clear_above_context()
+    ///     ... DeltaLF / RefSgrXqd / RefLrWiener init ...
+    ///     sbSize = use_128x128_superblock ? BLOCK_128X128 : BLOCK_64X64
+    ///     sbSize4 = Num_4x4_Blocks_Wide[ sbSize ]
+    ///     for ( r = MiRowStart; r < MiRowEnd; r += sbSize4 ) {
+    ///       clear_left_context()
+    ///       for ( c = MiColStart; c < MiColEnd; c += sbSize4 ) {
+    ///         ReadDeltas = delta_q_present
+    ///         clear_cdef( r, c )
+    ///         clear_block_decoded_flags( r, c, sbSize4 )
+    ///         read_lr( r, c, sbSize )
+    ///         decode_partition( r, c, sbSize )
+    ///       }
+    ///     }
+    ///   }
+    /// ```
+    ///
+    /// This entry covers the pixel-producing core of the loop: the
+    /// per-superblock §5.11.3 [`Self::clear_block_decoded_flags`] reset
+    /// followed by the §5.11.4 [`Self::decode_partition_syntax`] walk of
+    /// the superblock's partition tree at `(r, c)`. Each leaf
+    /// reconstructs its intra prediction + residual into
+    /// `CurrFrame[plane]` (via [`Self::predict_intra_into_curr_frame`] +
+    /// the §7.12.3 step-3 merge), so after the loop the walker's
+    /// per-plane buffers (read via [`Self::curr_frame`]) hold the
+    /// reconstructed tile samples (pre-§7.14 loop-filter / §7.15 CDEF /
+    /// §7.17 loop-restoration post passes).
+    ///
+    /// The §5.11.2 in-loop bookkeeping the spec interleaves —
+    /// `clear_above_context` / `clear_left_context` (§8.3.1 entropy
+    /// neighbour reset), `DeltaLF` / `RefSgrXqd` / `RefLrWiener`
+    /// initialisation, `clear_cdef`, `read_lr` — is **not** driven here:
+    /// the entropy neighbour arrays are the `TileCdfContext`'s
+    /// responsibility, `clear_cdef` is a no-op for the §7.15-disabled
+    /// path, and `read_lr` consumes loop-restoration syntax that the
+    /// post-pass owns. A frame that signals those tools active needs the
+    /// caller to interleave the corresponding per-SB reads; the partition
+    /// walk itself is faithful to §5.11.4 regardless.
+    ///
+    /// `read_deltas` is the §5.11.2 `ReadDeltas = delta_q_present`
+    /// initialisation applied at each superblock (the per-block
+    /// §5.11.37 `read_delta_qindex` consumes + clears it).
+    ///
+    /// Propagates any [`crate::Error`] the first failing partition /
+    /// block / coefficient read surfaces; the partition state stamped
+    /// before the short-circuit stays observable on the grid accessors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_tile_syntax(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        params: &TileDecodeParams<'_>,
+        inter_ctx: Option<&InterFrameContext>,
+        quant: &QuantizerParams,
+        read_deltas: bool,
+    ) -> Result<(), crate::Error> {
+        // §5.11.2: `sbSize = use_128x128_superblock ? BLOCK_128X128 :
+        // BLOCK_64X64`; `sbSize4 = Num_4x4_Blocks_Wide[ sbSize ]`.
+        let sb_size = if params.use_128x128_superblock {
+            BLOCK_128X128
+        } else {
+            BLOCK_64X64
+        };
+        let sb_size4 = NUM_4X4_BLOCKS_WIDE[sb_size] as u32;
+        if sb_size4 == 0 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        let mi_row_start = self.geometry.mi_row_start;
+        let mi_row_end = self.geometry.mi_row_end;
+        let mi_col_start = self.geometry.mi_col_start;
+        let mi_col_end = self.geometry.mi_col_end;
+
+        // §5.11.2 `for ( r = MiRowStart; r < MiRowEnd; r += sbSize4 )`.
+        let mut r = mi_row_start;
+        while r < mi_row_end {
+            // §5.11.2 `for ( c = MiColStart; c < MiColEnd; c += sbSize4 )`.
+            let mut c = mi_col_start;
+            while c < mi_col_end {
+                // §5.11.3 `clear_block_decoded_flags( r, c, sbSize4 )` —
+                // reset the §6.10.3 per-superblock availability grid.
+                self.clear_block_decoded_flags(
+                    r,
+                    c,
+                    sb_size4,
+                    params.num_planes,
+                    params.subsampling_x,
+                    params.subsampling_y,
+                );
+                // §5.11.4 `decode_partition( r, c, sbSize )`.
+                self.decode_partition_syntax(
+                    decoder,
+                    cdfs,
+                    r,
+                    c,
+                    sb_size,
+                    params.frame_is_intra,
+                    params.subsampling_x,
+                    params.subsampling_y,
+                    params.num_planes,
+                    params.seg_id_pre_skip,
+                    params.segmentation_enabled,
+                    params.seg_skip_active,
+                    params.last_active_seg_id,
+                    params.lossless_array,
+                    params.coded_lossless,
+                    params.enable_cdef,
+                    params.allow_intrabc,
+                    params.cdef_bits,
+                    read_deltas,
+                    params.use_128x128_superblock,
+                    params.delta_q_res,
+                    params.delta_lf_present,
+                    params.delta_lf_multi,
+                    params.mono_chrome,
+                    params.delta_lf_res,
+                    params.allow_screen_content_tools,
+                    params.enable_filter_intra,
+                    params.bit_depth,
+                    params.tx_mode_select,
+                    inter_ctx,
+                    quant,
+                    params.reduced_tx_set,
+                )?;
+                c += sb_size4;
+            }
+            r += sb_size4;
+        }
         Ok(())
     }
 
