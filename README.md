@@ -85,7 +85,7 @@ whole tile, so after the walk the per-plane `curr_frame` buffers hold
 the reconstructed intra tile (pre loop-filter / CDEF / loop-restoration
 post passes). Filter-intra / CfL-AC / IntraBC and the lossy-quant
 post-pass chain remain follow-ups before this path produces validated
-libaom-keyframe pixels.
+bit-exact keyframe pixels.
 
 The public `encode_av1` entry takes the constrained
 `[8, 64]`-per-axis lossless case; wider extents, lossy quant, and
