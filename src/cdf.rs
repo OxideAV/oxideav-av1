@@ -13493,6 +13493,38 @@ pub struct ResidualContext {
     /// on the chroma path. `DC_PRED = 0` for the walker's intra-only
     /// path until the §5.11.7 reader's chroma arm lands.
     pub uv_mode: u8,
+    /// `true` when the block is intra-predicted (`is_inter == 0` and
+    /// not `use_intrabc`). Gates the §7.11.2.1
+    /// [`PartitionWalker::predict_intra_into_curr_frame`] prediction
+    /// write that precedes the §7.12.3 step-3 residual merge — the
+    /// inter / IntraBC arms produce their prediction through the
+    /// §7.11.3 motion-compensation path instead.
+    pub is_intra: bool,
+    /// `YMode` per §5.11.7 / §5.11.22 — the luma intra-prediction mode
+    /// (`DC_PRED .. PAETH_PRED`). Distinct from `intra_dir`, which is
+    /// the §8.3.2 tx-type `intraDir` (filter-intra remapped). Drives
+    /// the luma-plane §7.11.2.1 prediction write.
+    pub y_mode: u8,
+    /// `AngleDeltaY` per §5.11.42 — the signed `[-3, 3]` directional
+    /// angle delta applied to a directional `YMode` (`D45_PRED ..
+    /// D67_PRED`). `0` for non-directional modes.
+    pub angle_delta_y: i8,
+    /// `AngleDeltaUV` per §5.11.42 — the signed `[-3, 3]` directional
+    /// angle delta applied to a directional `UVMode`. `0` for
+    /// non-directional modes / no chroma.
+    pub angle_delta_uv: i8,
+    /// `AvailL` per §5.11.5 — `true` if the block has a decoded
+    /// neighbour to its left. With the §5.11.34 chunk-local `x > 0`
+    /// it forms the §7.11.2.1 `haveLeft` input (`AvailL || x > 0`) for
+    /// the luma plane.
+    pub avail_l: bool,
+    /// `AvailU` per §5.11.5 — `true` if the block has a decoded
+    /// neighbour above. Forms `haveAbove` (`AvailU || y > 0`) for luma.
+    pub avail_u: bool,
+    /// `AvailLChroma` per §5.11.5 — the chroma-plane `haveLeft` base.
+    pub avail_l_chroma: bool,
+    /// `AvailUChroma` per §5.11.5 — the chroma-plane `haveAbove` base.
+    pub avail_u_chroma: bool,
 }
 
 impl ResidualContext {
@@ -13509,6 +13541,14 @@ impl ResidualContext {
             segment_id: 0,
             seg_qm_level: [15, 15, 15],
             uv_mode: 0,
+            is_intra: true,
+            y_mode: 0,
+            angle_delta_y: 0,
+            angle_delta_uv: 0,
+            avail_l: false,
+            avail_u: false,
+            avail_l_chroma: false,
+            avail_u_chroma: false,
         }
     }
 }
@@ -15751,6 +15791,235 @@ impl PartitionWalker {
             cols,
             samples,
         });
+    }
+
+    /// §7.11.2.1 general intra prediction (av1-spec p.241-243) — write
+    /// the per-TU prediction `pred[i][j]` into
+    /// `CurrFrame[plane][y + i][x + j]` for `(i, j) ∈ [0, h) × [0, w)`,
+    /// **before** the §7.12.3 step-3 residual merge
+    /// ([`Self::curr_frame_step3_merge`]) adds the inverse-transformed
+    /// residual on top. Together the two calls realise the §5.11.35
+    /// `reconstruct()` body for an intra transform block
+    /// (`CurrFrame = Clip1( pred + residual )`).
+    ///
+    /// The §7.11.2.1 `AboveRow[ i ]` / `LeftCol[ i ]` neighbour arrays
+    /// (and the `AboveRow[ -1 ]` / `LeftCol[ -1 ]` corner) are derived
+    /// from the **already-reconstructed** samples in `CurrFrame[plane]`
+    /// per the spec's four-arm `haveAbove` / `haveLeft` dispatch:
+    ///
+    /// * `haveAbove == 0 && haveLeft == 1` ⇒ `AboveRow[ i ] =
+    ///   CurrFrame[plane][y][x-1]` (the left edge).
+    /// * `haveAbove == 0 && haveLeft == 0` ⇒ `AboveRow[ i ] =
+    ///   (1 << (BitDepth-1)) - 1`; `LeftCol[ i ] = (1 << (BitDepth-1))
+    ///   + 1` (the mid-grey defaults).
+    /// * otherwise ⇒ `aboveLimit = Min( maxX, x + (haveAboveRight ?
+    ///   2*w : w) - 1 )`, `AboveRow[ i ] = CurrFrame[plane][y-1][
+    ///   Min(aboveLimit, x+i)]` (the `LeftCol` half mirrors with
+    ///   `leftLimit` / `haveBelowLeft`).
+    ///
+    /// Coordinates are in the per-plane sample space (post-subsampling
+    /// for chroma); `max_x` / `max_y` are `((MiCols * MI_SIZE) >> subX)
+    /// - 1` / `((MiRows * MI_SIZE) >> subY) - 1` per §7.11.2.1.
+    ///
+    /// `mode` is the §6.10.x intra-prediction mode (`DC_PRED ..
+    /// PAETH_PRED`). The §7.11.2.3 recursive (filter-intra) arm, the
+    /// §7.11.2.10-12 edge upsample / filter steps, and a non-zero
+    /// `angle_delta` are **not** applied here — the directional arm runs
+    /// with `upsampleAbove = upsampleLeft = 0` and the block's signalled
+    /// `angle_delta`, covering the no-edge-filter directional sub-arm.
+    /// The neighbour buffers are head-extended (`[corner, corner,
+    /// AboveRow[0..w+h]]`) so the existing §7.11.2.{2,4,5,6} kernels —
+    /// [`predict_intra_dc_pred`], [`predict_intra_v_pred`],
+    /// [`predict_intra_h_pred`], [`predict_intra_paeth_pred`], the three
+    /// SMOOTH variants, and [`predict_intra_d_mode`] — can be dispatched
+    /// uniformly.
+    ///
+    /// Lazily allocates the per-plane buffer (so a prediction-first TU
+    /// on a fresh plane initialises it). Out-of-buffer prediction writes
+    /// past the right / bottom frame edge are clipped silently. Returns
+    /// silently for `plane >= 3` or an out-of-range `mode`.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_intra_into_curr_frame(
+        &mut self,
+        plane: u8,
+        start_x: u32,
+        start_y: u32,
+        tx_sz: usize,
+        mode: usize,
+        angle_delta: i32,
+        bit_depth: u8,
+        sub_x: u8,
+        sub_y: u8,
+        have_above: bool,
+        have_left: bool,
+        have_above_right: bool,
+        have_below_left: bool,
+    ) {
+        if (plane as usize) >= 3 || mode >= INTRA_MODES {
+            return;
+        }
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        if w == 0 || h == 0 || w > 64 || h > 64 {
+            return;
+        }
+        let log2_w = w.trailing_zeros();
+        let log2_h = h.trailing_zeros();
+
+        // Per-plane buffer extent — `(MiRows * MI_SIZE) >> subY` rows by
+        // `(MiCols * MI_SIZE) >> subX` cols (§7.11.2.1 `maxX` / `maxY`
+        // are these minus one). Allocate on first touch so a
+        // prediction-first TU initialises the plane.
+        let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+        let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+        self.ensure_curr_frame_plane(plane as usize, rows, cols);
+        let Some(buf) = self.curr_frame[plane as usize].as_ref() else {
+            return;
+        };
+        let buf_rows = buf.rows;
+        let buf_cols = buf.cols;
+        let max_x = buf_cols.saturating_sub(1);
+        let max_y = buf_rows.saturating_sub(1);
+
+        // §7.11.2.1 availability (`haveAbove` / `haveLeft`) is supplied
+        // by the §5.11.35 caller as `(AvailU/AvailUChroma) || y > 0` /
+        // `(AvailL/AvailLChroma) || x > 0`; `haveAboveRight` /
+        // `haveBelowLeft` come from the §6.10.3 `BlockDecoded[]` border
+        // reads. Guard the corner reads against a TU that nominally has
+        // a neighbour but sits at the plane's `0` edge (defensive — the
+        // caller's gate should already exclude it).
+        let have_above = have_above && start_y > 0;
+        let have_left = have_left && start_x > 0;
+
+        let read = |yy: u32, xx: u32| -> u16 {
+            let cy = yy.min(max_y);
+            let cx = xx.min(max_x);
+            let idx = (cy as usize) * (buf_cols as usize) + (cx as usize);
+            buf.samples[idx] as u16
+        };
+
+        let half = 1u16 << (bit_depth - 1);
+        // §7.11.2.1 `AboveRow[ -1 ]` corner (offset `1` in the
+        // head-extended buffer; `LeftCol[ -1 ]` equals it).
+        let corner: u16 = if have_above && have_left {
+            read(start_y - 1, start_x - 1)
+        } else if have_above {
+            read(start_y - 1, start_x)
+        } else if have_left {
+            read(start_y, start_x - 1)
+        } else {
+            half
+        };
+
+        let span = w + h;
+        // Head-extended representation: index `-2` ⇒ offset 0, index
+        // `-1` ⇒ offset 1, index `k >= 0` ⇒ offset `k + 2`. The
+        // §7.11.2.4 directional kernel reads `above[ k + 2 ]`; offset 0
+        // is only consulted on the `upsampleAbove == 1` arm (not taken
+        // here), so seeding it with `corner` is safe.
+        let mut above_ext = vec![0u16; 2 + span];
+        above_ext[0] = corner;
+        above_ext[1] = corner;
+        if !have_above && have_left {
+            let v = read(start_y, start_x - 1);
+            for slot in above_ext.iter_mut().skip(2).take(span) {
+                *slot = v;
+            }
+        } else if !have_above && !have_left {
+            let v = ((1u32 << (bit_depth - 1)) - 1) as u16;
+            for slot in above_ext.iter_mut().skip(2).take(span) {
+                *slot = v;
+            }
+        } else {
+            let above_limit =
+                max_x.min(start_x + (if have_above_right { 2 * w } else { w }) as u32 - 1);
+            for (i, slot) in above_ext.iter_mut().skip(2).take(span).enumerate() {
+                *slot = read(start_y - 1, above_limit.min(start_x + i as u32));
+            }
+        }
+
+        let mut left_ext = vec![0u16; 2 + span];
+        left_ext[0] = corner;
+        left_ext[1] = corner;
+        if !have_left && have_above {
+            let v = read(start_y - 1, start_x);
+            for slot in left_ext.iter_mut().skip(2).take(span) {
+                *slot = v;
+            }
+        } else if !have_left && !have_above {
+            let v = ((1u32 << (bit_depth - 1)) + 1) as u16;
+            for slot in left_ext.iter_mut().skip(2).take(span) {
+                *slot = v;
+            }
+        } else {
+            let left_limit =
+                max_y.min(start_y + (if have_below_left { 2 * h } else { h }) as u32 - 1);
+            for (i, slot) in left_ext.iter_mut().skip(2).take(span).enumerate() {
+                *slot = read(left_limit.min(start_y + i as u32), start_x - 1);
+            }
+        }
+
+        let above_row = &above_ext[2..2 + span];
+        let left_col = &left_ext[2..2 + span];
+
+        let mut pred = vec![0u16; w * h];
+        let ok = match mode {
+            DC_PRED => predict_intra_dc_pred(
+                have_left as u8,
+                have_above as u8,
+                log2_w,
+                log2_h,
+                w,
+                h,
+                bit_depth,
+                above_row,
+                left_col,
+                &mut pred,
+            )
+            .is_ok(),
+            V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred).is_ok(),
+            H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred).is_ok(),
+            m if (D45_PRED..=D67_PRED).contains(&m) => {
+                predict_intra_d_mode(m, angle_delta, w, h, 0, 0, &above_ext, &left_ext, &mut pred)
+                    .is_ok()
+            }
+            SMOOTH_PRED => {
+                predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred)
+                    .is_ok()
+            }
+            SMOOTH_V_PRED => {
+                predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred).is_ok()
+            }
+            SMOOTH_H_PRED => {
+                predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred).is_ok()
+            }
+            PAETH_PRED => {
+                predict_intra_paeth_pred(w, h, above_row, left_col, corner, &mut pred).is_ok()
+            }
+            _ => false,
+        };
+        if !ok {
+            return;
+        }
+
+        let Some(buf) = self.curr_frame[plane as usize].as_mut() else {
+            return;
+        };
+        let cols_buf = buf.cols;
+        for i in 0..h as u32 {
+            let dst_y = start_y + i;
+            if dst_y >= buf.rows {
+                break;
+            }
+            for j in 0..w as u32 {
+                let dst_x = start_x + j;
+                if dst_x >= cols_buf {
+                    break;
+                }
+                let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
+                buf.samples[idx] = pred[(i as usize) * w + (j as usize)] as i32;
+            }
+        }
     }
 
     /// §7.12.3 step-3 frame-buffer merge (av1-spec p.295) — write
@@ -26790,6 +27059,20 @@ impl PartitionWalker {
             segment_id: prefix.segment_id,
             seg_qm_level: [15, 15, 15],
             uv_mode: uv_mode.unwrap_or(0),
+            // §7.11.2.1 prediction gate: the intra arm runs for a true
+            // intra block. `use_intrabc == 1` sets `is_inter = 1`
+            // (§5.11.7); the §7.11.3 IntraBC / motion-compensation path
+            // owns that block's prediction, so the §7.11.2.1 writer
+            // stays off it. `use_filter_intra` similarly routes to the
+            // §7.11.2.3 recursive arm not covered here.
+            is_intra: is_inter == 0 && use_filter_intra != Some(1),
+            y_mode,
+            angle_delta_y,
+            angle_delta_uv: angle_delta_uv.unwrap_or(0),
+            avail_l,
+            avail_u,
+            avail_l_chroma,
+            avail_u_chroma,
         };
         let _residual = self.residual(
             decoder,
@@ -27053,6 +27336,16 @@ impl PartitionWalker {
             segment_id: info.segment_id,
             seg_qm_level: [15, 15, 15],
             uv_mode: 0,
+            // Inter arm — the §7.11.3 motion-compensation path produces
+            // this block's prediction, not the §7.11.2.1 intra writer.
+            is_intra: false,
+            y_mode: 0,
+            angle_delta_y: 0,
+            angle_delta_uv: 0,
+            avail_l: false,
+            avail_u: false,
+            avail_l_chroma: false,
+            avail_u_chroma: false,
         };
         let _residual = self.residual(
             decoder,
@@ -28245,6 +28538,74 @@ impl PartitionWalker {
         }
         if tx_sz >= TX_SIZES_ALL {
             return Err(crate::Error::ResidualCoefficientsTxSizeUnsupported);
+        }
+
+        // §5.11.35 line `if ( !is_inter ) { ... predict_intra( ... ) }`
+        // (av1-spec p.85, line 5264) — the §7.11.2.1 intra prediction
+        // runs **before** the §5.11.39 coeff read + §7.13 reconstruct,
+        // writing `pred[i][j]` into `CurrFrame[plane][startY+i][startX+
+        // j]` so the subsequent §7.12.3 step-3 merge adds the residual
+        // on top. The non-palette / non-CfL / non-filter-intra arm is
+        // covered here; palette / CfL / filter-intra route elsewhere.
+        if !is_inter && ctx.is_intra {
+            // §5.11.35 lines 5-9 superblock-local anchor (mirrors the
+            // BlockDecoded stamp at the function tail).
+            let row_anchor = (start_y << sub_y) >> MI_SIZE_LOG2;
+            let col_anchor = (start_x << sub_x) >> MI_SIZE_LOG2;
+            let sb_mask: u32 = if use_128x128_superblock { 31 } else { 15 };
+            let sub_block_mi_row = (row_anchor & sb_mask) as i32;
+            let sub_block_mi_col = (col_anchor & sb_mask) as i32;
+            let step_x4 = (TX_WIDTH[tx_sz] >> MI_SIZE_LOG2) as i32;
+            let step_y4 = (TX_HEIGHT[tx_sz] >> MI_SIZE_LOG2) as i32;
+            let base_row = sub_block_mi_row >> sub_y;
+            let base_col = sub_block_mi_col >> sub_x;
+            // §7.11.2.1 `haveAboveRight` / `haveBelowLeft` reads
+            // (av1-spec p.85, lines 5287-5292).
+            let have_above_right =
+                Self::block_decoded_slot(plane as usize, base_row - 1, base_col + step_x4)
+                    .map(|s| self.block_decoded[s] != 0)
+                    .unwrap_or(false);
+            let have_below_left =
+                Self::block_decoded_slot(plane as usize, base_row + step_y4, base_col - 1)
+                    .map(|s| self.block_decoded[s] != 0)
+                    .unwrap_or(false);
+            // §5.11.35 `haveLeft` / `haveAbove` (lines 5285-5286):
+            // `(plane==0 ? AvailL : AvailLChroma) || x > 0`.
+            let (avail_l, avail_u) = if plane == 0 {
+                (ctx.avail_l, ctx.avail_u)
+            } else {
+                (ctx.avail_l_chroma, ctx.avail_u_chroma)
+            };
+            let have_left = avail_l || x > 0;
+            let have_above = avail_u || y > 0;
+            // §5.11.35 lines 5276-5280: `isCfl = (plane > 0 && UVMode ==
+            // UV_CFL_PRED)`; `mode = (plane == 0) ? YMode : (isCfl ?
+            // DC_PRED : UVMode)`. The CfL DC base lands here; the
+            // §7.11.4 `predict_chroma_from_luma` AC contribution is a
+            // separate (out-of-scope) leaf, so a CfL block reconstructs
+            // only its DC component for now.
+            let (mode, angle_delta) = if plane == 0 {
+                (ctx.y_mode as usize, ctx.angle_delta_y as i32)
+            } else if ctx.uv_mode as usize == UV_CFL_PRED {
+                (DC_PRED, 0)
+            } else {
+                (ctx.uv_mode as usize, ctx.angle_delta_uv as i32)
+            };
+            self.predict_intra_into_curr_frame(
+                plane,
+                start_x,
+                start_y,
+                tx_sz,
+                mode,
+                angle_delta,
+                ctx.quant.bit_depth,
+                sub_x,
+                sub_y,
+                have_above,
+                have_left,
+                have_above_right,
+                have_below_left,
+            );
         }
 
         // Record the per-TU task (spec-order emission). `plane_tx_type`
@@ -54800,6 +55161,14 @@ mod tests {
             segment_id: 0,
             seg_qm_level: [15, 15, 15],
             uv_mode: 0,
+            is_intra: true,
+            y_mode: 0,
+            angle_delta_y: 0,
+            angle_delta_uv: 0,
+            avail_l: false,
+            avail_u: false,
+            avail_l_chroma: false,
+            avail_u_chroma: false,
         };
         let r = walker
             .residual(
@@ -54942,6 +55311,169 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ============================================================
+    // r342 — §7.11.2.1 intra prediction into CurrFrame tests.
+    // ============================================================
+
+    /// `predict_intra_into_curr_frame` with `DC_PRED` and no
+    /// neighbours (`haveAbove == haveLeft == 0`) writes the §7.11.2.5
+    /// no-neighbour DC default `1 << (BitDepth - 1) = 128` across the
+    /// whole 4×4 TU.
+    #[test]
+    fn predict_intra_dc_no_neighbours_writes_128() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        walker.predict_intra_into_curr_frame(
+            /* plane */ 0, /* start_x */ 0, /* start_y */ 0, TX_4X4, DC_PRED,
+            /* angle_delta */ 0, /* bit_depth */ 8, /* sub_x */ 0,
+            /* sub_y */ 0, /* have_above */ false, /* have_left */ false,
+            /* have_above_right */ false, /* have_below_left */ false,
+        );
+        let buf = walker.curr_frame(0).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(buf[i * 16 + j], 128, "DC default at ({i}, {j})");
+            }
+        }
+    }
+
+    /// `V_PRED` copies the reconstructed above row down every column.
+    /// Seed the row above the TU (`start_y == 4`) with a ramp, then
+    /// predict the 4×4 TU at `(start_x = 0, start_y = 4)` and assert
+    /// each predicted row equals the seeded above row.
+    #[test]
+    fn predict_intra_v_pred_copies_above_row() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // Allocate the plane + seed row 3 (the row above start_y = 4)
+        // with samples 10, 20, 30, 40 in cols 0..4.
+        walker.ensure_curr_frame_plane(0, 16, 16);
+        {
+            let buf = walker.curr_frame[0].as_mut().unwrap();
+            for j in 0..4 {
+                buf.samples[3 * 16 + j] = (10 * (j + 1)) as i32;
+            }
+        }
+        walker.predict_intra_into_curr_frame(
+            0, 0, 4, TX_4X4, V_PRED, 0, 8, 0, 0, /* have_above */ true,
+            /* have_left */ false, false, false,
+        );
+        let buf = walker.curr_frame(0).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    buf[(4 + i) * 16 + j],
+                    (10 * (j + 1)) as i32,
+                    "V_PRED column copy at row {i} col {j}",
+                );
+            }
+        }
+    }
+
+    /// `H_PRED` copies the reconstructed left column across every row.
+    /// Seed the column left of the TU (`start_x == 4`) with a ramp,
+    /// predict the 4×4 TU at `(start_x = 4, start_y = 0)`, assert each
+    /// predicted column equals the seeded left column.
+    #[test]
+    fn predict_intra_h_pred_copies_left_col() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        walker.ensure_curr_frame_plane(0, 16, 16);
+        {
+            let buf = walker.curr_frame[0].as_mut().unwrap();
+            for i in 0..4 {
+                buf.samples[i * 16 + 3] = (10 * (i + 1)) as i32;
+            }
+        }
+        walker.predict_intra_into_curr_frame(
+            0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, /* have_above */ false,
+            /* have_left */ true, false, false,
+        );
+        let buf = walker.curr_frame(0).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    buf[i * 16 + (4 + j)],
+                    (10 * (i + 1)) as i32,
+                    "H_PRED row copy at row {i} col {j}",
+                );
+            }
+        }
+    }
+
+    /// Prediction-then-residual composition realises the §5.11.35
+    /// `reconstruct()` body: the §7.11.2.1 prediction writes the DC
+    /// base into CurrFrame, then the §7.12.3 step-3 merge adds the
+    /// residual on top with a single `Clip1`. DC default 128 + a +5
+    /// residual everywhere = 133.
+    #[test]
+    fn predict_then_residual_composes() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        walker.predict_intra_into_curr_frame(
+            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false,
+        );
+        let residual: Vec<i64> = vec![5; 16];
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
+        let buf = walker.curr_frame(0).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(buf[i * 16 + j], 133, "pred 128 + residual 5 at ({i}, {j})");
+            }
+        }
+    }
+
+    /// The inter / non-intra gate: `predict_intra_into_curr_frame`
+    /// returns without allocating a buffer for an out-of-range
+    /// `mode >= INTRA_MODES` (e.g. the `UV_CFL_PRED` sentinel before
+    /// the caller's DC_PRED collapse).
+    #[test]
+    fn predict_intra_out_of_range_mode_is_no_op() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        walker.predict_intra_into_curr_frame(
+            0,
+            0,
+            0,
+            TX_4X4,
+            UV_CFL_PRED,
+            0,
+            8,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(walker.curr_frame(0).is_none());
     }
 
     /// `Clip1` envelope at 8-bit (av1-spec §3 / line 16339): a
@@ -55308,19 +55840,28 @@ mod tests {
                 t.plane,
             );
         }
-        // Every TU is all-zero so the merge didn't fire; CurrFrame
-        // stays unallocated.
+        // r342: the §7.11.2.1 intra-prediction write now runs before
+        // the §5.11.39 coeff read on every intra TU. Every TU is
+        // all-zero so the §7.12.3 step-3 residual merge contributes
+        // nothing, but the DC_PRED prediction (no neighbours ⇒
+        // `1 << (BitDepth - 1) = 128`) has already populated CurrFrame.
+        // So each plane buffer is allocated and uniformly 128 over the
+        // predicted TU footprint.
         for plane in 0..3 {
-            assert!(
-                walker.curr_frame(plane).is_none(),
-                "no merge for all-zero TU on plane {plane}",
-            );
+            let buf = walker
+                .curr_frame(plane)
+                .unwrap_or_else(|| panic!("intra prediction allocates plane {plane}"));
+            assert_eq!(buf[0], 128, "DC_PRED no-neighbour default on plane {plane}");
         }
     }
 
     /// Skip-arm `ResidualTuTask` carries the DCT_DCT placeholder for
     /// `plane_tx_type` — the §5.11.34 `if ( !skip )` gate short-
-    /// circuits the §5.11.40 derivation. CurrFrame stays unallocated.
+    /// circuits the §5.11.40 derivation. The §5.11.35 `if ( !is_inter )`
+    /// intra-prediction write (r342) is **outside** the `!skip` gate, so
+    /// it still fires on a skipped intra block: CurrFrame is populated
+    /// with the DC_PRED no-neighbour default even though no residual is
+    /// read.
     #[test]
     fn residual_tu_task_skip_arm_plane_tx_type_is_dct_dct_placeholder() {
         let geom = TileGeometry {
@@ -55355,8 +55896,13 @@ mod tests {
         for t in &r.tasks {
             assert_eq!(t.plane_tx_type, DCT_DCT as u8);
         }
+        // r342: intra prediction runs ahead of the skip gate, so every
+        // plane is allocated and DC-filled (128, no neighbours).
         for plane in 0..3 {
-            assert!(walker.curr_frame(plane).is_none());
+            let buf = walker
+                .curr_frame(plane)
+                .unwrap_or_else(|| panic!("intra prediction allocates plane {plane}"));
+            assert_eq!(buf[0], 128, "DC_PRED default on skipped plane {plane}");
         }
     }
 
