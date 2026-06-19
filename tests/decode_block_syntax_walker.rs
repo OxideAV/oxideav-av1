@@ -3152,6 +3152,130 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
     }
 }
 
+/// r346 end-to-end two-pass inter flow: decode a real single-reference
+/// inter leaf through the §5.11 syntax walk
+/// ([`PartitionWalker::decode_block_syntax`], the seg_globalmv path that
+/// resolves `RefFrame = [LAST_FRAME, NONE]` + zero `GlobalMvs[0]`), then
+/// run the §5.11.33 frame-scope reconstruction bridge
+/// ([`PartitionWalker::reconstruct_inter_frame_into_curr_frame`]) to
+/// motion-compensate the decoded leaf's pixels into `CurrFrame[0]`. This
+/// exercises the whole inter arc end-to-end: bitstream syntax → grids →
+/// reconstructed inter pixels. With a zero MV (`GLOBALMV` identity) and
+/// `EIGHTTAP` filters at an integer position, the §7.11.3.1 MC copies the
+/// reference block verbatim, so the luma plane must equal the reference
+/// frame's top-left 8×8 window.
+#[test]
+fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
+    use oxideav_av1::{PlaneRefSpec, RefFrameStoreEntry, LAST_FRAME};
+
+    // 2×2 mi walker → an 8×8 luma frame; one BLOCK_8X8 inter leaf covers it.
+    let mut walker = walker_n(2);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    // §5.11.11 skip = 1 ⇒ no residual reads; CurrFrame[0] stays zero
+    // before the inter pass, so the bridge result is pure MC.
+    cdfs.skip = [force_binary_cdf(1); SKIP_CONTEXTS];
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+    let mut ctx = InterFrameContext::identity_default(&mfmvs);
+    // §5.11.20 third arm: seg_globalmv_active forces is_inter = 1 (no S()),
+    // §5.11.25 sets RefFrame = [LAST_FRAME, NONE], §5.11.23 YMode = GLOBALMV
+    // → §5.11.31 assign_mv adopts identity GlobalMvs[0] = [0, 0].
+    ctx.seg_globalmv_active = true;
+
+    let db = walker
+        .decode_block_syntax(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_8X8,
+            /* frame_is_intra = */ false,
+            /* subsampling_x = */ 0,
+            /* subsampling_y = */ 0,
+            /* num_planes = */ 3,
+            /* seg_id_pre_skip = */ false,
+            /* segmentation_enabled = */ false,
+            /* seg_skip_active = */ false,
+            /* last_active_seg_id = */ 0,
+            &lossless,
+            /* coded_lossless = */ false,
+            /* enable_cdef = */ true,
+            /* allow_intrabc = */ false,
+            /* cdef_bits = */ 0,
+            /* read_deltas = */ false,
+            /* use_128x128_superblock = */ false,
+            /* delta_q_res = */ 0,
+            /* delta_lf_present = */ false,
+            /* delta_lf_multi = */ false,
+            /* mono_chrome = */ false,
+            /* delta_lf_res = */ 0,
+            /* allow_screen_content_tools = */ false,
+            /* enable_filter_intra = */ false,
+            /* bit_depth = */ 8,
+            /* tx_mode_select = */ false,
+            /* inter_ctx = */ Some(&ctx),
+            /* quant = */ &QuantizerParams::neutral(0, 8),
+            /* reduced_tx_set = */ false,
+        )
+        .expect("§5.11 inter syntax walk should decode the globalmv leaf");
+    assert_eq!(db.is_inter, 1);
+    assert_eq!(db.ref_frame, [LAST_FRAME as i8, -1]);
+    assert_eq!(db.mv, [[0, 0], [0, 0]], "identity GLOBALMV ⇒ zero MV");
+
+    // §7.11.3.3 reference frame (8×8 luma minimum; the MC reads only the
+    // 8×8 window at the zero-MV integer position). A distinct per-sample
+    // ramp so the copy is observable.
+    let ref_w: usize = 8;
+    let ref_h: usize = 8;
+    let mut refp = vec![0u16; ref_w * ref_h];
+    for r in 0..ref_h {
+        for c in 0..ref_w {
+            refp[r * ref_w + c] = (10 + r * 8 + c) as u16;
+        }
+    }
+    let entry = RefFrameStoreEntry {
+        plane: &refp[..],
+        stride: ref_w,
+        upscaled_width: ref_w as u32,
+        width: ref_w as u32,
+        height: ref_h as u32,
+    };
+    // `ref_frame_idx[ LAST_FRAME - LAST_FRAME = 0 ]` = slot 0.
+    let store = [entry, entry, entry, entry, entry, entry, entry];
+    let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
+
+    let ref_spec = PlaneRefSpec {
+        plane: 0,
+        subsampling_x: 0,
+        subsampling_y: 0,
+        frame_store: &store,
+        frame_width: ref_w as u32,
+        frame_height: ref_h as u32,
+    };
+
+    walker
+        .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
+        .expect("frame-scope inter reconstruction from the decoded grids");
+
+    // Zero-MV EIGHTTAP MC at an integer position copies the reference 8×8
+    // window verbatim into CurrFrame[0].
+    let (rows, cols) = walker.curr_frame_dims(0).unwrap();
+    assert_eq!((rows, cols), (8, 8));
+    let got: Vec<u16> = walker
+        .curr_frame(0)
+        .unwrap()
+        .iter()
+        .map(|&s| s as u16)
+        .collect();
+    assert_eq!(
+        got, refp,
+        "two-pass inter decode: zero-MV MC must copy the reference 8×8 window into CurrFrame[0]"
+    );
+}
+
 /// Helper: force an `N`-symbol CDF (length `N + 1`, last slot = adapt
 /// count) to deterministically decode symbol `0`. The §8.2.6 search
 /// breaks at the first `symbol` whose `cur` falls at/below
