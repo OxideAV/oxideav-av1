@@ -71,6 +71,22 @@ DIFFWTD), and inter-intra arms, plus the §7.11.3.5 **warped-motion**
 `InterModeInfoGrid.warp` context). §7.11.3.9-10 OBMC remains a leaf-only
 layer not yet wired into the frame walk.
 
+The spec-faithful §5.11 syntax walker (`PartitionWalker`, separate from
+the encoder-mirror pixel driver above) now reconstructs **intra pixels**
+end-to-end from a real bitstream: every intra transform block runs the
+§7.11.2.1 general intra prediction (`predict_intra_into_curr_frame` —
+DC / V / H / PAETH / SMOOTH{,_V,_H} / directional, deriving the
+`AboveRow[]` / `LeftCol[]` neighbours from the already-reconstructed
+`CurrFrame[plane]`) ahead of the §5.11.39 coefficient read + §7.12.3
+dequant + §7.13 inverse transform + step-3 residual merge, realising the
+§5.11.35 `reconstruct()` body `CurrFrame = Clip1(pred + residual)`. The
+new §5.11.2 `decode_tile_syntax` superblock loop drives this across a
+whole tile, so after the walk the per-plane `curr_frame` buffers hold
+the reconstructed intra tile (pre loop-filter / CDEF / loop-restoration
+post passes). Filter-intra / CfL-AC / IntraBC and the lossy-quant
+post-pass chain remain follow-ups before this path produces validated
+libaom-keyframe pixels.
+
 The public `encode_av1` entry takes the constrained
 `[8, 64]`-per-axis lossless case; wider extents, lossy quant, and
 monochrome are reachable through the crate-public `encoder::*` driver
