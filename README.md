@@ -87,6 +87,27 @@ post passes). Filter-intra / CfL-AC / IntraBC and the lossy-quant
 post-pass chain remain follow-ups before this path produces validated
 bit-exact keyframe pixels.
 
+The §5.11 walker now also reconstructs **inter pixels** at frame scope:
+the §5.11.18 → §5.11.23 → §5.11.31 inter-syntax cascade stamps each
+single-reference leaf's `IsInters[]` / `RefFrames[]` / `Mvs[]` /
+`InterpFilters[]` / `MiSizes[]` grids during the syntax walk, and the new
+`reconstruct_inter_frame_into_curr_frame` `PartitionWalker` bridge reads
+those grids back out and drives every single-reference translational
+(SIMPLE, `RefFrame[1] == NONE`) leaf through the shared
+`reconstruct_inter_frame` walk, stitching each leaf's §7.11.3.1
+motion-compensated (8-tap sub-pel) prediction into `CurrFrame[plane]`
+against a caller-supplied §7.11.3.3 reference-frame store. This closes
+the §5.11.33 frame walk on the single-ref path — a real single-reference
+inter leaf decoded from a bitstream (the seg-globalmv `GLOBALMV` arm)
+reconstructs to validated pixels end-to-end, and multi-leaf frames with
+distinct per-leaf sub-pel MVs reconstruct leaf-by-leaf matching the
+per-block driver. Compound / inter-intra / warped leaves carry per-leaf
+side-data on the `DecodedBlockRecord` list rather than per-cell grids, so
+the frame bridge drives them translationally for now; threading their
+side-data into the frame walk (as the per-block compound / warp bridges
+already accept it) plus reference-frame buffer management remain the
+follow-ups toward a full inter AV1 frame.
+
 The public `encode_av1` entry takes the constrained
 `[8, 64]`-per-axis lossless case; wider extents, lossy quant, and
 monochrome are reachable through the crate-public `encoder::*` driver
@@ -95,7 +116,9 @@ functions. Streams outside the supported scope return a typed `Error`
 
 ### Not yet supported
 
-- Inter prediction / reference-frame management.
+- Frame-walk reconstruction of compound / inter-intra / warped inter
+  leaves (the single-reference translational arm is wired); reference-
+  frame buffer management across a GOP.
 - Multi-tile reconstruction beyond the single-tile decode path.
 - 10/12-bit and 4:2:2 / 4:4:4 reconstruction.
 - Registration as a live codec in the runtime registry.
