@@ -55676,6 +55676,45 @@ mod tests {
         assert!(walker.curr_frame(0).is_none());
     }
 
+    /// Neighbour propagation: a second TU's prediction reads the
+    /// already-reconstructed samples of the first. Reconstruct a 4×4
+    /// DC_PRED TU at the origin with a `+50` residual (→ 178 = 128 +
+    /// 50 everywhere), then predict an adjacent 4×4 TU at `(start_x =
+    /// 4, start_y = 0)` with H_PRED + `have_left`. H_PRED copies the
+    /// first TU's right column (all 178) across the second TU — proving
+    /// the §7.11.2.1 `LeftCol[]` derivation reads the live CurrFrame.
+    #[test]
+    fn predict_intra_reads_reconstructed_left_neighbour() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // First TU: DC_PRED (128) + residual +50 = 178 across the 4×4.
+        walker.predict_intra_into_curr_frame(
+            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false,
+        );
+        let residual: Vec<i64> = vec![50; 16];
+        walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
+        // Second TU at (4, 0): H_PRED with have_left reads the first
+        // TU's reconstructed right column (all 178).
+        walker.predict_intra_into_curr_frame(
+            0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, false, true, false, false,
+        );
+        let buf = walker.curr_frame(0).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    buf[i * 16 + (4 + j)],
+                    178,
+                    "H_PRED reads reconstructed left neighbour at ({i}, {j})",
+                );
+            }
+        }
+    }
+
     /// `Clip1` envelope at 8-bit (av1-spec §3 / line 16339): a
     /// residual that drives the sum past `(1 << BitDepth) - 1 = 255`
     /// clips to 255; a sum below `0` clips to `0`. The merge is
