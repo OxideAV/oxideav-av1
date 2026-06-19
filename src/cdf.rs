@@ -57486,6 +57486,156 @@ mod tests {
         );
     }
 
+    /// r346 §5.11.33 frame-scope **multi-leaf, sub-pel** single-ref
+    /// reconstruction: a 4×2 mi frame (16×8 luma) split into two
+    /// side-by-side BLOCK_8X8 inter leaves carrying **different non-zero**
+    /// MVs (one at a 1/2-pel position, one at a 1/4-pel position) must be
+    /// reconstructed leaf-by-leaf by
+    /// [`PartitionWalker::reconstruct_inter_frame_into_curr_frame`] — each
+    /// leaf's §7.11.3.1 sub-pel MC matching its own per-block
+    /// [`crate::reconstruct_inter_block`] oracle over the leaf's 8×8
+    /// footprint. This proves the bridge's grid-driven leaf-origin walk
+    /// dispatches each leaf with its own decoded MV / interp-filter (not a
+    /// single shared block) through the real sub-pel interpolation kernel.
+    #[test]
+    fn r346_walker_reconstructs_multi_leaf_subpel_inter_frame() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+
+        // Reference frame large enough for both leaves' sub-pel taps.
+        let ref_w: usize = 24;
+        let ref_h: usize = 24;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 11 + c * 13 + 5) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        // Frame: 16×8 luma (4 mi cols × 2 mi rows). Leaf A at mi (0,0),
+        // leaf B at mi (0,2), each BLOCK_8X8 (2×2 mi).
+        let frame_w = 16usize;
+        let frame_h = 8usize;
+        let mv_a = [4i16, 0]; // 1/2-pel vertical (4/8) — sub-pel.
+        let mv_b = [0i16, 2]; // 1/4-pel horizontal (2/8) — sub-pel.
+
+        // Per-block oracles into a shared 16-wide frame buffer (the walker
+        // buffer's stride), each at its plane-space origin.
+        let mut oracle = vec![0u16; frame_w * frame_h];
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last,
+                mv: mv_a,
+            },
+            &ref_frame_idx,
+            &store,
+            0,
+            /* x */ 0,
+            /* y */ 0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            frame_w,
+        )
+        .unwrap();
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last,
+                mv: mv_b,
+            },
+            &ref_frame_idx,
+            &store,
+            0,
+            /* x */ 8,
+            /* y */ 0,
+            8,
+            8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            frame_w,
+        )
+        .unwrap();
+
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(2, 4, geom).unwrap();
+        for (mi_col, mv) in [(0u32, mv_a), (2u32, mv_b)] {
+            walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+                mi_row: 0,
+                mi_col,
+                sub_size: BLOCK_8X8,
+                skip: 1,
+                segment_id: 0,
+                is_inter: 1,
+                y_mode: MODE_NEARESTMV,
+                ref_frame: [last as i8, -1],
+                mv: [mv[0] as i32, mv[1] as i32],
+                interp_filter: [EIGHTTAP, EIGHTTAP],
+                palette_size_y: 0,
+                palette_colors_y: &[],
+                palette_size_uv: 0,
+                palette_colors_u: &[],
+                palette_colors_v: &[],
+                cdef: None,
+                tx_size: 0,
+            });
+        }
+
+        let ref_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        };
+        walker
+            .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
+            .expect("multi-leaf sub-pel frame reconstruction");
+
+        let (rows, cols) = walker.curr_frame_dims(0).unwrap();
+        assert_eq!((rows, cols), (frame_h as u32, frame_w as u32));
+        let got: Vec<u16> = walker
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(
+            got, oracle,
+            "the frame bridge must reconstruct each leaf with its own decoded sub-pel MV, \
+             matching the per-block oracle across both leaves"
+        );
+    }
+
     /// r346 frame bridge guards: an empty `plane_refs`, an out-of-range
     /// plane, and an inter leaf whose `RefFrame[0]` is `INTRA_FRAME`
     /// (rejected downstream by [`crate::reconstruct_inter_block`]) are all
