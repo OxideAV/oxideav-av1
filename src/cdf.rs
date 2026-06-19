@@ -17164,6 +17164,216 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// §5.11.33 `predict()` **frame-scope** inter pixel reconstruction
+    /// against the walker's own tracked `CurrFrame[plane]` buffers, driven
+    /// from the grids the §5.11 syntax walk
+    /// ([`Self::decode_tile_syntax`]) already populated (av1-spec p.82-83).
+    ///
+    /// This is the frame-level counterpart of the per-block
+    /// [`Self::reconstruct_inter_block_into_curr_frame`] bridge: instead of
+    /// the caller threading one decoded block's `(RefFrame[0], Mvs[..][0],
+    /// InterpFilters)` quad, this method reads those quantities back out of
+    /// the walker's persisted `IsInters[]` / `RefFrames[]` / `Mvs[]` /
+    /// `InterpFilters[]` / `MiSizes[]` grids — the exact arrays the
+    /// §5.11.18 → §5.11.23 → §5.11.31 inter-syntax cascade stamped per
+    /// leaf — and drives every **single-reference translational** (`SIMPLE`
+    /// motion-mode, `RefFrame[1] == NONE`) inter leaf through the shared
+    /// frame walk [`crate::reconstruct_inter_frame`], stitching each leaf's
+    /// §7.11.3.1 motion-compensated prediction into `CurrFrame[plane]`.
+    ///
+    /// This closes the §5.11.33 frame-walk loop on the single-ref path: the
+    /// §5.11 syntax walk reads the inter mode-info + MVs into the grids,
+    /// and this bridge then reconstructs the inter pixels from those grids
+    /// (plus the caller's §7.11.3.3 reference-frame store), so after both
+    /// passes the per-plane `curr_frame` buffers hold the reconstructed inter tile
+    /// (pre-§7.14 loop-filter / §7.15 CDEF / §7.17 loop-restoration). The
+    /// residual half (§5.11.34 `transform_tree` coefficient adds) is merged
+    /// into `CurrFrame[plane]` by the §7.12.3 step-3 path during the syntax
+    /// walk; this bridge supplies the §7.11.3.1 prediction half on top of
+    /// whatever the merge already wrote, exactly as the per-block bridge
+    /// does for one leaf.
+    ///
+    /// ## Reference state (`plane_refs`)
+    ///
+    /// One [`crate::PlaneRefSpec`] per plane to reconstruct (`0` Y, `1` Cb,
+    /// `2` Cr), each carrying the plane's §7.11.3.3 `FrameStore` slice
+    /// (per-plane resolved), `subsampling_*`, and per-plane
+    /// `(FrameWidth, FrameHeight)`. `ref_frame_idx` is the §6.8.2
+    /// `ref_frame_idx[ 0..REFS_PER_FRAME ]` mapping each `RefFrame -
+    /// LAST_FRAME` to a `FrameStore` slot. `bit_depth` is §7.11.3
+    /// `BitDepth`. The parser does not own the decoded-picture buffer, so
+    /// the reference state is caller-supplied.
+    ///
+    /// ## Scope (single-reference translational arm)
+    ///
+    /// Compound (`RefFrame[1] >= LAST_FRAME`), inter-intra (`RefFrame[1]
+    /// == INTRA_FRAME`), and warped (`motion_mode == WARPED_CAUSAL`) leaves
+    /// carry per-leaf side-data (`compound_type` / wedge / mask /
+    /// `interintra_mode` / local-warp fit) that the walker records on the
+    /// emitted [`DecodedBlockRecord`] list rather than in dedicated
+    /// per-cell grids. This frame bridge supplies the
+    /// [`crate::reconstruct_inter_frame`] side-data slices as neutral
+    /// (all-zero) buffers and runs **without** the warp arm
+    /// ([`crate::InterModeInfoGrid::warp`] = `None`), so the walk drives
+    /// every single-ref leaf translationally. On a frame whose leaves are
+    /// all single-ref `SIMPLE` (the common P-frame case) the neutral
+    /// side-data is never read (the underlying walk reads the wedge / mask /
+    /// interintra slices only at a compound / inter-intra leaf origin).
+    /// Driving the compound / inter-intra / warp leaves at frame scope is a
+    /// follow-up that threads the per-leaf side-data grids the same way the
+    /// per-block compound / warp bridges already accept it.
+    ///
+    /// Each plane buffer is allocated (sized `MiRows × MiCols × MI_SIZE >>
+    /// subsampling_*`) if it has not been touched yet; the walker buffer is
+    /// `i32` (post-`Clip1`), the driver works in `u16`, so the bridge
+    /// mirrors each plane to `u16`, drives the frame, and copies the result
+    /// back as `i32` (lossless in both directions).
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for an empty
+    /// `plane_refs`, a `plane_refs[k].plane >= 3`, an allocation failure,
+    /// or anything [`crate::reconstruct_inter_frame`] itself rejects (an
+    /// out-of-range leaf `MiSize`, an `INTRA_FRAME`/out-of-range
+    /// `RefFrame[0]` on an inter leaf, an out-of-range resolved `refIdx`,
+    /// a `CurrFrame` plane too small for a write region).
+    pub fn reconstruct_inter_frame_into_curr_frame(
+        &mut self,
+        ref_frame_idx: &[u8],
+        bit_depth: u8,
+        plane_refs: &[crate::PlaneRefSpec<'_>],
+    ) -> Result<(), crate::Error> {
+        if plane_refs.is_empty() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        let mi_rows = self.mi_rows;
+        let mi_cols = self.mi_cols;
+        let cells = (mi_rows as usize)
+            .checked_mul(mi_cols as usize)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+
+        // Snapshot the grid slices into owned buffers. `reconstruct_inter_frame`
+        // borrows the grid (`&InterModeInfoGrid`) and the plane buffers
+        // (`&mut [PlaneReconContext]`) at once; the grid slices live in
+        // `&self` while the plane mirrors live in fresh allocations, so
+        // copying the grids out of `self` lets both borrows coexist.
+        let mut mi_sizes_snap: Vec<usize> = Vec::new();
+        let mut is_inters_snap: Vec<u8> = Vec::new();
+        let mut ref_frames_snap: Vec<i8> = Vec::new();
+        let mut mvs_snap: Vec<i16> = Vec::new();
+        let mut interp_filters_snap: Vec<u8> = Vec::new();
+        if mi_sizes_snap.try_reserve_exact(cells).is_err()
+            || is_inters_snap.try_reserve_exact(cells).is_err()
+            || ref_frames_snap.try_reserve_exact(cells * 2).is_err()
+            || mvs_snap.try_reserve_exact(cells * 4).is_err()
+            || interp_filters_snap.try_reserve_exact(cells * 2).is_err()
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mi_sizes_snap.extend_from_slice(&self.mi_sizes[..cells]);
+        is_inters_snap.extend_from_slice(&self.is_inters[..cells]);
+        ref_frames_snap.extend_from_slice(&self.ref_frames[..cells * 2]);
+        mvs_snap.extend_from_slice(&self.mvs[..cells * 4]);
+        interp_filters_snap.extend_from_slice(&self.interp_filters[..cells * 2]);
+
+        // Neutral (all-zero) side-data slices for the compound / inter-
+        // intra arms. On a single-ref `SIMPLE` frame these are never read
+        // (the walk reads them only at a compound / inter-intra leaf
+        // origin); the zeros are the §5.11.29 / §5.11.28 defaults regardless.
+        let mut zero_cells: Vec<u8> = Vec::new();
+        if zero_cells.try_reserve_exact(cells).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        zero_cells.resize(cells, 0);
+        // `order_hints_by_ref[ ref ]` for `ref` up to `ALTREF_FRAME`; the
+        // DISTANCE arm (compound-only) is the sole reader, so identity-zero
+        // suffices on the single-ref path. Length = `ALTREF_FRAME + 1`.
+        let order_hints_by_ref = [0i32; crate::uncompressed_header_tail::ALTREF_FRAME + 1];
+
+        // Mirror each plane's `i32` `curr_frame` buffer to `u16`,
+        // allocating the plane if the residual merge has not yet touched it
+        // (a skip-coded P-frame block has no residual writer, so its plane
+        // can be untouched at this point). Samples are post-`Clip1` so the
+        // `i32 → u16` narrowing is lossless.
+        let mut mirrors: Vec<(u8, Vec<u16>, usize)> = Vec::new();
+        if mirrors.try_reserve(plane_refs.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        for spec in plane_refs {
+            let p = spec.plane as usize;
+            if p >= 3 {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            let rows = (mi_rows * (MI_SIZE as u32)) >> spec.subsampling_y;
+            let cols = (mi_cols * (MI_SIZE as u32)) >> spec.subsampling_x;
+            self.ensure_curr_frame_plane(p, rows, cols);
+            let Some(cp) = self.curr_frame[p].as_ref() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let buf_cols = cp.cols as usize;
+            let mut mirror: Vec<u16> = Vec::new();
+            if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            mirror.extend(cp.samples.iter().map(|&s| s as u16));
+            mirrors.push((spec.plane, mirror, buf_cols));
+        }
+
+        // Drive the frame walk. The grid snapshots and plane mirrors are
+        // disjoint owned buffers, so the `&grid` / `&mut planes` borrows
+        // coexist.
+        {
+            let grid = crate::InterModeInfoGrid {
+                mi_sizes: &mi_sizes_snap,
+                is_inters: &is_inters_snap,
+                ref_frames: &ref_frames_snap,
+                mvs: &mvs_snap,
+                interp_filters: &interp_filters_snap,
+                compound_types: &zero_cells,
+                wedge_indices: &zero_cells,
+                wedge_signs: &zero_cells,
+                mask_types: &zero_cells,
+                interintra_modes: &zero_cells,
+                wedge_interintras: &zero_cells,
+                interintra_wedge_indices: &zero_cells,
+                order_hint_bits: 0,
+                current_order_hint: 0,
+                order_hints_by_ref: &order_hints_by_ref,
+                mi_rows,
+                mi_cols,
+                bit_depth,
+                warp: None,
+            };
+            let mut planes: Vec<crate::PlaneReconContext<'_>> = Vec::new();
+            if planes.try_reserve(plane_refs.len()).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            for ((p, mirror, cols), spec) in mirrors.iter_mut().zip(plane_refs.iter()) {
+                planes.push(crate::PlaneReconContext {
+                    plane: *p,
+                    subsampling_x: spec.subsampling_x,
+                    subsampling_y: spec.subsampling_y,
+                    frame_store: spec.frame_store,
+                    frame_width: spec.frame_width,
+                    frame_height: spec.frame_height,
+                    curr: mirror.as_mut_slice(),
+                    curr_stride: *cols,
+                });
+            }
+            crate::reconstruct_inter_frame(&grid, ref_frame_idx, &mut planes)?;
+        }
+
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffers.
+        for (p, mirror, _cols) in &mirrors {
+            if let Some(cp) = self.curr_frame[*p as usize].as_mut() {
+                for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                    *dst = src as i32;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
     /// row-major: `skips()[ r * MiCols + c ]`. Cells that no leaf
     /// covered carry `0` (the §5.11.11 [`Self::decode_skip`] writer
@@ -57138,6 +57348,227 @@ mod tests {
             got.iter().any(|&s| s != 0),
             "single-ref MC must write pixels"
         );
+    }
+
+    /// r346 §5.11.33 **frame-scope** single-ref end-to-end: after the
+    /// §5.11 syntax walk has stamped the walker's `IsInters[]` /
+    /// `RefFrames[]` / `Mvs[]` / `InterpFilters[]` / `MiSizes[]` grids for
+    /// a single-reference translational inter leaf, the frame bridge
+    /// [`PartitionWalker::reconstruct_inter_frame_into_curr_frame`] must
+    /// reconstruct that leaf's §7.11.3.1 motion-compensated pixels into the
+    /// walker's own `CurrFrame[plane]` buffer — byte-for-byte identically
+    /// to driving the per-block [`crate::reconstruct_inter_block`] oracle.
+    /// This closes the §5.11.33 frame walk on the single-ref path: the
+    /// walker reads inter mode-info into the grids and the bridge then
+    /// reconstructs the inter frame from those grids + a reference store.
+    #[test]
+    fn r346_walker_reconstructs_inter_frame_from_grids() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{reconstruct_inter_block, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+
+        // §7.11.3.3 reference frame (one plane, 16×16).
+        let ref_w: usize = 16;
+        let ref_h: usize = 16;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 7 + c * 3 + 2) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        // 2×2 mi walker → 8×8 luma frame. One BLOCK_8X8 inter leaf covers
+        // the whole frame.
+        let curr_w = 8usize;
+        let curr_h = 8usize;
+        let mv = [4i16, 6];
+
+        // Per-block oracle: drive the single leaf's MC into a fresh zero
+        // buffer with the walker's eventual 8-column stride.
+        let mut oracle = vec![0u16; curr_w * curr_h];
+        reconstruct_inter_block(
+            InterModeInfo {
+                ref_frame: last,
+                mv,
+            },
+            &ref_frame_idx,
+            &store,
+            0,
+            0,
+            0,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .unwrap();
+
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+        let mut walker = PartitionWalker::new(2, 2, geom).unwrap();
+        // Stamp the §5.11 grids as the inter-syntax cascade would for a
+        // single-ref translational BLOCK_8X8 leaf at (0, 0).
+        walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+            mi_row: 0,
+            mi_col: 0,
+            sub_size: BLOCK_8X8,
+            skip: 1,
+            segment_id: 0,
+            is_inter: 1,
+            y_mode: MODE_NEARESTMV,
+            // §5.11.25 single-ref: slot 0 = LAST_FRAME, slot 1 = NONE.
+            ref_frame: [last as i8, -1],
+            mv: [mv[0] as i32, mv[1] as i32],
+            interp_filter: [EIGHTTAP, EIGHTTAP],
+            palette_size_y: 0,
+            palette_colors_y: &[],
+            palette_size_uv: 0,
+            palette_colors_u: &[],
+            palette_colors_v: &[],
+            cdef: None,
+            tx_size: 0,
+        });
+
+        // Fresh walker: curr_frame[0] is unallocated; the frame bridge
+        // allocates it (skip-coded leaf — no residual writer).
+        assert!(walker.curr_frame(0).is_none());
+
+        let ref_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        };
+
+        walker
+            .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
+            .expect("frame-scope single-ref reconstruction");
+
+        let (rows, cols) = walker.curr_frame_dims(0).unwrap();
+        assert_eq!((rows, cols), (curr_h as u32, curr_w as u32));
+        let got: Vec<u16> = walker
+            .curr_frame(0)
+            .unwrap()
+            .iter()
+            .map(|&s| s as u16)
+            .collect();
+        assert_eq!(
+            got, oracle,
+            "the frame bridge must reconstruct the single-ref inter leaf's pixels \
+             identically to the per-block driver"
+        );
+        assert!(
+            got.iter().any(|&s| s != 0),
+            "frame-scope single-ref MC must write pixels"
+        );
+    }
+
+    /// r346 frame bridge guards: an empty `plane_refs`, an out-of-range
+    /// plane, and an inter leaf whose `RefFrame[0]` is `INTRA_FRAME`
+    /// (rejected downstream by [`crate::reconstruct_inter_block`]) are all
+    /// caller bugs surfaced as [`crate::Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn r346_walker_inter_frame_bridge_guards() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{PlaneRefSpec, RefFrameStoreEntry};
+
+        let refp = vec![0u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+
+        // Empty plane_refs.
+        let mut w0 = PartitionWalker::new(2, 2, geom).unwrap();
+        assert!(matches!(
+            w0.reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[]),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Out-of-range plane.
+        let mut w1 = PartitionWalker::new(2, 2, geom).unwrap();
+        let bad_plane = PlaneRefSpec {
+            plane: 3,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        assert!(matches!(
+            w1.reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[bad_plane]),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Inter leaf with INTRA_FRAME RefFrame[0] — rejected by the
+        // downstream §7.11.3.1 driver.
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        w2.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+            mi_row: 0,
+            mi_col: 0,
+            sub_size: BLOCK_8X8,
+            skip: 1,
+            segment_id: 0,
+            is_inter: 1,
+            y_mode: MODE_NEARESTMV,
+            // INTRA_FRAME (0) in slot 0 is a caller bug on the inter arm.
+            ref_frame: [crate::uncompressed_header_tail::INTRA_FRAME as i8, -1],
+            mv: [0, 0],
+            interp_filter: [EIGHTTAP, EIGHTTAP],
+            palette_size_y: 0,
+            palette_colors_y: &[],
+            palette_size_uv: 0,
+            palette_colors_u: &[],
+            palette_colors_v: &[],
+            cdef: None,
+            tx_size: 0,
+        });
+        let good_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        assert!(matches!(
+            w2.reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[good_spec]),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
     }
 
     /// r304 single-ref bridge guards: an out-of-range plane, a negative
