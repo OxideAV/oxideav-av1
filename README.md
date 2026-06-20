@@ -68,8 +68,17 @@ DIFFWTD), and inter-intra arms, plus the §7.11.3.5 **warped-motion**
 (`reconstruct_inter_block_warp_into_curr_frame`) drive `block_warp` into
 `CurrFrame[plane]`, and the §5.11.33 frame walk dispatches a decoded
 `motion_mode == WARPED_CAUSAL` leaf to the warp path (via the opt-in
-`InterModeInfoGrid.warp` context). §7.11.3.9-10 OBMC remains a leaf-only
-layer not yet wired into the frame walk.
+`InterModeInfoGrid.warp` context). §7.11.3.9-10 **OBMC** (overlapped
+block motion compensation) now also has a reconstruction-surface entry:
+`reconstruct_inter_block_obmc` and its `PartitionWalker` bridge
+(`reconstruct_inter_block_obmc_into_curr_frame`) drive a decoded
+`motion_mode == OBMC` leaf — the block's own §7.11.3.1 prediction plus
+the §7.11.3.9 above/left neighbour walk's §7.11.3.10 overlap-blend
+contributions — into `CurrFrame[plane]` from a caller-resolved
+`ObmcParams` neighbour bundle, the OBMC counterpart of the per-block warp
+bridge. Threading the OBMC neighbour lists from the frame-walk grids (so
+the §5.11.33 frame walk dispatches OBMC leaves automatically, as it
+already does for warp) remains the follow-up.
 
 The spec-faithful §5.11 syntax walker (`PartitionWalker`, separate from
 the encoder-mirror pixel driver above) now reconstructs **intra pixels**

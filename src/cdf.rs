@@ -16521,6 +16521,115 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// §7.11.3.1 single forward-reference **OBMC** (overlapped block
+    /// motion compensation) pixel reconstruction against the walker's own
+    /// tracked `CurrFrame[plane]` buffer (av1-spec p.258 line 14414,
+    /// `motion_mode == OBMC`) — the OBMC counterpart of
+    /// [`Self::reconstruct_inter_block_into_curr_frame`].
+    ///
+    /// Rather than the bare `MOTION_MODE_SIMPLE` translational driver, this
+    /// bridge invokes [`crate::reconstruct_inter_block_obmc`] with the
+    /// caller-supplied [`crate::ObmcParams`] so the §7.11.3.9 above-pass /
+    /// left-pass neighbour walk overlays each qualifying neighbour's
+    /// §7.11.3.10 `overlap_blending` contribution onto the block's own
+    /// §7.11.3.1 translational prediction before the final stitch. As with
+    /// the SIMPLE / WARP bridges there is no intra-half prerequisite, so it
+    /// **allocates** the plane buffer (sized `MiRows × MiCols × MI_SIZE >>
+    /// subsampling_*`) if the OBMC block is the first writer on this plane.
+    ///
+    /// The `obmc` bundle carries the §7.11.3.9 above / left neighbour
+    /// candidate lists the caller resolved from the §6.10.4 `RefFrames[]` /
+    /// `Mvs[]` / `MiSizes[]` mi-grid plus the block's `(MiRow, MiCol,
+    /// MiSize, AvailU, AvailL)` context. Empty neighbour lists (no
+    /// qualifying above / left neighbour) make the blend a no-op for that
+    /// axis, so this entry is always safe to call for an `OBMC` leaf even
+    /// when no neighbour actually overlaps (the result then equals the
+    /// plain translational prediction).
+    ///
+    /// `x` / `y` are the block's top-left in `ref_spec.plane`-space
+    /// samples; `w` / `h` are its plane-space size. The walker buffer is
+    /// `i32` (post-`Clip1`); the driver works in `u16`, so the bridge
+    /// mirrors the plane buffer to `u16`, drives the block, and copies the
+    /// result back as `i32` (lossless in both directions). Only the
+    /// `w × h` write footprint changes.
+    ///
+    /// Returns [`crate::Error::PartitionWalkOutOfRange`] for a
+    /// `ref_spec.plane >= 3`, negative `x` / `y`, a `w`/`h` write region
+    /// that would overflow the (allocated) plane buffer, or anything
+    /// [`crate::reconstruct_inter_block_obmc`] itself rejects (an
+    /// `INTRA_FRAME`/out-of-range `RefFrame[0]`, an out-of-range resolved
+    /// `refIdx`, an OBMC `ObmcParams` the §7.11.3.9 walk rejects).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_inter_block_obmc_into_curr_frame(
+        &mut self,
+        mode_info: crate::InterModeInfo,
+        obmc: &crate::ObmcParams<'_, '_>,
+        ref_frame_idx: &[u8],
+        ref_spec: &crate::PlaneRefSpec<'_>,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+        bit_depth: u8,
+        interp_filter_x: u8,
+        interp_filter_y: u8,
+    ) -> Result<(), crate::Error> {
+        let p = ref_spec.plane as usize;
+        if p >= 3 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // Allocate the plane buffer if the OBMC block is the first writer
+        // on this plane (mirror the §7.12.3 step-3 merge extent so a later
+        // merge on the same plane is a no-op).
+        let rows = (self.mi_rows * (MI_SIZE as u32)) >> ref_spec.subsampling_y;
+        let cols = (self.mi_cols * (MI_SIZE as u32)) >> ref_spec.subsampling_x;
+        self.ensure_curr_frame_plane(p, rows, cols);
+        let Some(cp) = self.curr_frame[p].as_ref() else {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        };
+        let buf_cols = cp.cols as usize;
+        // Materialise a `u16` mirror of the whole `i32` plane buffer; the
+        // samples are post-`Clip1` so the `i32 → u16` narrowing is
+        // lossless.
+        let mut mirror: Vec<u16> = Vec::new();
+        if mirror.try_reserve_exact(cp.samples.len()).is_err() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        mirror.extend(cp.samples.iter().map(|&s| s as u16));
+
+        // Drive the single-ref OBMC reconstruction; the final stitch
+        // overwrites the `w × h` footprint at `(x, y)`.
+        crate::reconstruct_inter_block_obmc(
+            mode_info,
+            obmc,
+            ref_frame_idx,
+            ref_spec.frame_store,
+            ref_spec.plane,
+            x,
+            y,
+            w,
+            h,
+            bit_depth,
+            ref_spec.subsampling_x,
+            ref_spec.subsampling_y,
+            ref_spec.frame_width,
+            ref_spec.frame_height,
+            interp_filter_x,
+            interp_filter_y,
+            mirror.as_mut_slice(),
+            buf_cols,
+        )?;
+
+        // Copy the (post-`Clip1`, in-range) `u16` result back into the
+        // walker's `i32` `curr_frame` buffer.
+        if let Some(cp) = self.curr_frame[p].as_mut() {
+            for (dst, &src) in cp.samples.iter_mut().zip(mirror.iter()) {
+                *dst = src as i32;
+            }
+        }
+        Ok(())
+    }
+
     /// §7.11.3.1 compound (≥2-ref) inter pixel reconstruction against the
     /// walker's own tracked `CurrFrame[plane]` buffer (av1-spec p.258 line
     /// 14402 final stitch: `isCompound == 1 ⇒ CurrFrame[plane][y+i][x+j] =
@@ -58285,6 +58394,297 @@ mod tests {
             w2.reconstruct_inter_block_warp_into_curr_frame(
                 good_mode,
                 &warp,
+                &ref_frame_idx,
+                &good_plane,
+                -4,
+                0,
+                8,
+                8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+    }
+
+    /// r355 §7.11.3.1 OBMC end-to-end: the walker bridge
+    /// [`PartitionWalker::reconstruct_inter_block_obmc_into_curr_frame`]
+    /// drives a `motion_mode == OBMC` block into its own allocated
+    /// `CurrFrame[0]`, matching the per-block
+    /// [`crate::reconstruct_inter_block_obmc`] driver byte-for-byte, and
+    /// — with a qualifying above-row neighbour carrying a **distinct** MV
+    /// — diverging from the translational SIMPLE bridge (the §7.11.3.9
+    /// overlap blend actually fired).
+    #[test]
+    fn r355_walker_reconstructs_obmc_block_pixels() {
+        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::{
+            reconstruct_inter_block, reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec,
+            RefFrameStoreEntry,
+        };
+
+        // High-frequency reference so a neighbour's shifted MV diverges
+        // from the block's own integer-position translational copy. Sized
+        // 48×48 so the §7.11.3.9 neighbour MC's 8-tap window at the
+        // shifted MV stays inside the reference (matching the proven-safe
+        // leaf-kernel setup).
+        let ref_w: usize = 48;
+        let ref_h: usize = 48;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (((r * 37) ^ (c * 53)) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        // Block at plane (8, 8) ⇒ MiRow = MiCol = 2 in the luma frame.
+        let mode_info = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+        let (curr_w, curr_h) = (8usize, 8usize);
+
+        // §7.11.3.9 above-row neighbour carrying a distinct MV (1 full
+        // luma sample down in 1/8-pel units) so its overlap contribution
+        // is not the block's own prediction.
+        let above_bundle = PredictInterRef {
+            ref_plane: &refp[..],
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [8, 0],
+        };
+        let above_nb = ObmcNeighbour {
+            bundle: above_bundle,
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 16,
+            mi_rows: 16,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: true,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[above_nb],
+            left_neighbours: &[],
+        };
+
+        // Per-block oracles into a fresh 16×16 plane (the walker's
+        // eventual extent) so the block writes at its plane-space origin
+        // (8, 8) — the §7.11.3.9 neighbour walk reads `(x, y)` as plane
+        // coordinates, so the oracle must share the block's position.
+        let oracle_stride = 16usize;
+        let mut oracle = vec![0u16; oracle_stride * 16];
+        reconstruct_inter_block_obmc(
+            mode_info,
+            &obmc,
+            &ref_frame_idx,
+            &store,
+            0,
+            8,
+            8,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            oracle_stride,
+        )
+        .unwrap();
+        // Translational oracle (for the divergence check).
+        let mut simple = vec![0u16; oracle_stride * 16];
+        reconstruct_inter_block(
+            mode_info,
+            &ref_frame_idx,
+            &store,
+            0,
+            8,
+            8,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut simple,
+            oracle_stride,
+        )
+        .unwrap();
+        // Extract the 8×8 footprint at (8, 8) from both oracle planes.
+        let mut oracle_blk = vec![0u16; curr_w * curr_h];
+        let mut simple_blk = vec![0u16; curr_w * curr_h];
+        for i in 0..curr_h {
+            for j in 0..curr_w {
+                oracle_blk[i * curr_w + j] = oracle[(8 + i) * oracle_stride + (8 + j)];
+                simple_blk[i * curr_w + j] = simple[(8 + i) * oracle_stride + (8 + j)];
+            }
+        }
+
+        // 4×4 mi walker → 16×16 luma frame; the block sits at mi (2, 2).
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        assert!(walker.curr_frame(0).is_none());
+        let ref_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        };
+
+        walker
+            .reconstruct_inter_block_obmc_into_curr_frame(
+                mode_info,
+                &obmc,
+                &ref_frame_idx,
+                &ref_spec,
+                8,
+                8,
+                curr_w,
+                curr_h,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("walker OBMC reconstruction");
+
+        // Read back the 8×8 footprint at plane (8, 8) out of the 16×16
+        // walker buffer.
+        let (rows, cols) = walker.curr_frame_dims(0).unwrap();
+        assert_eq!((rows, cols), (16, 16));
+        let plane = walker.curr_frame(0).unwrap();
+        let mut got = vec![0u16; curr_w * curr_h];
+        for i in 0..curr_h {
+            for j in 0..curr_w {
+                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)] as u16;
+            }
+        }
+        assert_eq!(
+            got, oracle_blk,
+            "the walker OBMC bridge must reconstruct overlapped pixels identically to the per-block driver"
+        );
+        assert_ne!(
+            got, simple_blk,
+            "the OBMC bridge with a distinct-MV neighbour must diverge from the translational fallback"
+        );
+    }
+
+    /// r355 walker OBMC-bridge guards: an out-of-range plane and a
+    /// negative origin are caller bugs surfaced as
+    /// [`crate::Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn r355_walker_obmc_bridge_guards() {
+        use crate::inter_pred::{ObmcParams, EIGHTTAP};
+        use crate::{InterModeInfo, PlaneRefSpec, RefFrameStoreEntry};
+
+        let refp = vec![3u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+        let good_mode = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+        // Empty-neighbour OBMC params (no overlap; the guard checks fire
+        // before the walk regardless).
+        let obmc = ObmcParams {
+            mi_row: 0,
+            mi_col: 0,
+            mi_cols: 4,
+            mi_rows: 4,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: false,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[],
+            left_neighbours: &[],
+        };
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 2,
+            mi_col_start: 0,
+            mi_col_end: 2,
+        };
+
+        // Out-of-range plane.
+        let mut w = PartitionWalker::new(2, 2, geom).unwrap();
+        let bad_plane = PlaneRefSpec {
+            plane: 3,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        assert!(matches!(
+            w.reconstruct_inter_block_obmc_into_curr_frame(
+                good_mode,
+                &obmc,
+                &ref_frame_idx,
+                &bad_plane,
+                0,
+                0,
+                8,
+                8,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
+
+        // Negative origin.
+        let mut w2 = PartitionWalker::new(2, 2, geom).unwrap();
+        let good_plane = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 16,
+            frame_height: 16,
+        };
+        assert!(matches!(
+            w2.reconstruct_inter_block_obmc_into_curr_frame(
+                good_mode,
+                &obmc,
                 &ref_frame_idx,
                 &good_plane,
                 -4,

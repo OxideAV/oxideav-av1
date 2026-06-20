@@ -5087,6 +5087,148 @@ pub fn reconstruct_inter_block_warp(
     Ok(())
 }
 
+/// §7.11.3.1 single forward-reference **OBMC** (overlapped block motion
+/// compensation) reconstruction — drives one decoded `motion_mode ==
+/// OBMC` inter block from mode-info into a `CurrFrame` plane
+/// (av1-spec p.258 line 14414 invokes §7.11.3.9 only on `motion_mode ==
+/// OBMC`).
+///
+/// This is the OBMC counterpart of [`reconstruct_inter_block`] /
+/// [`reconstruct_inter_block_warp`]: it performs the same §7.11.3.1
+/// step-5 / §7.11.3.3 ref-buffer resolution (`refIdx = ref_frame_idx[
+/// ref_frame - LAST_FRAME ]`, `ref = FrameStore[ refIdx ]`) for the
+/// block's own forward MV, then runs [`predict_inter`] with
+/// `motion_mode == MOTION_MODE_OBMC` and the caller-supplied
+/// [`ObmcParams`] bundle so the §7.11.3.9 above-pass / left-pass
+/// neighbour walk blends each qualifying neighbour's translational
+/// prediction (§7.11.3.10 `overlap_blending`) into the block's own
+/// prediction in place, and finally stitches the blended block into
+/// `curr_plane` at plane coordinates `(x, y)`
+/// (`CurrFrame[plane][y+i][x+j] = Clip1(preds[0][i][j])`, av1-spec
+/// p.258 line 14402 single-ref arm — [`predict_inter`] applies the
+/// `Clip1`).
+///
+/// The block's own §7.11.3.1 step-5/-8 prediction (the `MOTION_MODE_OBMC`
+/// block is single-reference and translational for its own MV) is formed
+/// first; the §7.11.3.9 post-step then overlays the neighbour
+/// contributions. The `obmc` bundle carries the §7.11.3.9 above/left
+/// neighbour candidate lists the caller resolved from the §6.10.4
+/// `RefFrames[]` / `Mvs[]` / `MiSizes[]` mi-grid plus the block's
+/// `(MiRow, MiCol, MiSize, AvailU, AvailL)` context (see [`ObmcParams`]).
+/// Empty neighbour lists (no qualifying above / left neighbour) make the
+/// blend a no-op for that axis, so this entry is always safe to call for
+/// an `OBMC` leaf even when no neighbour actually overlaps.
+///
+/// Returns [`crate::Error::PartitionWalkOutOfRange`] for the same
+/// caller-bug arguments [`reconstruct_inter_block`] rejects (an
+/// `INTRA_FRAME` / out-of-range `ref_frame`, an out-of-range resolved
+/// `refIdx`, a `curr_plane` too small for the `(x, y, w, h)` write
+/// region), plus anything [`predict_inter`]'s OBMC arm itself rejects.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_block_obmc(
+    mode_info: InterModeInfo,
+    obmc: &ObmcParams<'_, '_>,
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'_>],
+    plane: u8,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    frame_width: u32,
+    frame_height: u32,
+    interp_filter_x: u8,
+    interp_filter_y: u8,
+    curr_plane: &mut [u16],
+    curr_stride: usize,
+) -> Result<(), crate::Error> {
+    // ---------- §7.11.3.1 step 5 — RefFrame[0] validity ----------
+    let ref_frame = mode_info.ref_frame as usize;
+    if !(crate::uncompressed_header_tail::LAST_FRAME
+        ..=crate::uncompressed_header_tail::ALTREF_FRAME)
+        .contains(&ref_frame)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+
+    // ---------- §7.11.3.3 — refIdx = ref_frame_idx[ ref - LAST ] ---
+    let slot = ref_frame - crate::uncompressed_header_tail::LAST_FRAME;
+    let ref_idx = *ref_frame_idx
+        .get(slot)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
+    let entry = frame_store
+        .get(ref_idx)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+
+    // ---------- §7.11.3.1 step 5 → PredictInterRef bundle ----------
+    let refs = [PredictInterRef {
+        ref_plane: entry.plane,
+        ref_stride: entry.stride,
+        ref_upscaled_width: entry.upscaled_width,
+        ref_width: entry.width,
+        ref_height: entry.height,
+        mv: mode_info.mv,
+    }];
+
+    // ---------- §7.11.3.1 steps 1-13 + §7.11.3.9-10 OBMC post-step ---
+    let mut pred_out = vec![0u16; w * h];
+    predict_inter(
+        plane,
+        x,
+        y,
+        w,
+        h,
+        crate::cdf::MOTION_MODE_OBMC,
+        /* is_compound */ false,
+        /* is_inter_intra */ false,
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        frame_width,
+        frame_height,
+        interp_filter_x,
+        interp_filter_y,
+        &refs,
+        /* compound */ None,
+        /* inter_intra */ None,
+        /* warp */ None,
+        Some(obmc),
+        &mut pred_out,
+    )?;
+
+    // ---------- §7.11.3.1 final step — CurrFrame[plane] stitch -----
+    if x < 0 || y < 0 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let (px, py) = (x as usize, y as usize);
+    let last_row = py
+        .checked_add(h)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    let last_col = px
+        .checked_add(w)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_stride < last_col {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let needed = (last_row - 1)
+        .checked_mul(curr_stride)
+        .and_then(|v| v.checked_add(last_col))
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    if curr_plane.len() < needed {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    for i in 0..h {
+        let dst = (py + i) * curr_stride + px;
+        let src = i * w;
+        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+    }
+
+    Ok(())
+}
+
 /// §7.11.3.1 compound two-reference mode-info descriptor — the decoded
 /// `(RefFrame[0], RefFrame[1], Mvs[..][0], Mvs[..][1])` quad plus the
 /// `compound_type` that selects the §7.11.3.1 step-14 combine arm
@@ -14518,6 +14660,204 @@ mod tests {
 
         // Both neighbours produce identity blends ⇒ output equals SIMPLE.
         assert_eq!(simple_out, obmc_out);
+    }
+
+    // ---------- r355 §7.11.3.1 reconstruct_inter_block_obmc driver ----------
+
+    /// §7.11.3.1 OBMC per-block driver
+    /// ([`reconstruct_inter_block_obmc`]): the driver must resolve
+    /// `refIdx = ref_frame_idx[ RefFrame[0] - LAST_FRAME ]` →
+    /// `FrameStore[ refIdx ]`, run the §7.11.3.9-10 OBMC composition, and
+    /// stitch the `w × h` block into `curr_plane` at plane `(x, y)` —
+    /// byte-for-byte identical to a direct `predict_inter` OBMC call into a
+    /// scratch buffer copied to the same `(x, y)` window.
+    #[test]
+    fn r355_reconstruct_inter_block_obmc_matches_predict_inter() {
+        let ref_w: usize = 48;
+        let ref_h: usize = 48;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 9 + c * 5 + 1) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        // Map LAST_FRAME (RefFrame 1) → ref_frame_idx slot 0 → FrameStore 2
+        // so the driver's §7.11.3.3 indirection is actually exercised.
+        let ref_frame_idx: [u8; 7] = [2, 1, 3, 0, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let w = 8usize;
+        let h = 8usize;
+        let (bx, by) = (8i32, 8i32);
+        let mode_info = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+
+        // Build the same ObmcParams the driver consumes: one distinct-MV
+        // above neighbour resolved against the same FrameStore entry.
+        let nb_bundle = PredictInterRef {
+            ref_plane: &refp[..],
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [8, 0],
+        };
+        let above_nb = ObmcNeighbour {
+            bundle: nb_bundle,
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 16,
+            mi_rows: 16,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: true,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[above_nb],
+            left_neighbours: &[],
+        };
+
+        // Direct predict_inter OBMC oracle into a w×h scratch (the block's
+        // own ref is FrameStore[2] = same buffer, mv [0,0]).
+        let own = [PredictInterRef {
+            ref_plane: &refp[..],
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 0],
+        }];
+        let mut scratch = vec![0u16; w * h];
+        predict_inter(
+            0,
+            bx,
+            by,
+            w,
+            h,
+            crate::cdf::MOTION_MODE_OBMC,
+            false,
+            false,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &own,
+            None,
+            /* inter_intra */ None,
+            None,
+            Some(&obmc),
+            &mut scratch,
+        )
+        .unwrap();
+
+        // Driver into a 16×16 plane; the block stitches at (8, 8).
+        let plane_stride = 16usize;
+        let mut plane = vec![0u16; plane_stride * 16];
+        reconstruct_inter_block_obmc(
+            mode_info,
+            &obmc,
+            &ref_frame_idx,
+            &store,
+            0,
+            bx,
+            by,
+            w,
+            h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut plane,
+            plane_stride,
+        )
+        .unwrap();
+
+        for i in 0..h {
+            for j in 0..w {
+                assert_eq!(
+                    plane[(by as usize + i) * plane_stride + (bx as usize + j)],
+                    scratch[i * w + j],
+                    "driver row {i} col {j} must match the predict_inter OBMC oracle"
+                );
+            }
+        }
+    }
+
+    /// §7.11.3.1 OBMC driver guards: `RefFrame[0] == INTRA_FRAME` (0) is a
+    /// caller bug surfaced as [`crate::Error::PartitionWalkOutOfRange`].
+    #[test]
+    fn r355_reconstruct_inter_block_obmc_rejects_intra_ref() {
+        let refp = vec![5u16; 16 * 16];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 16,
+            upscaled_width: 16,
+            width: 16,
+            height: 16,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let obmc = ObmcParams {
+            mi_row: 0,
+            mi_col: 0,
+            mi_cols: 4,
+            mi_rows: 4,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: false,
+            avail_l: false,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[],
+            left_neighbours: &[],
+        };
+        let mut plane = vec![0u16; 16 * 16];
+        let intra_ref = crate::uncompressed_header_tail::INTRA_FRAME as u8; // 0
+        assert!(matches!(
+            reconstruct_inter_block_obmc(
+                InterModeInfo {
+                    ref_frame: intra_ref,
+                    mv: [0, 0],
+                },
+                &obmc,
+                &ref_frame_idx,
+                &store,
+                0,
+                0,
+                0,
+                8,
+                8,
+                8,
+                0,
+                0,
+                16,
+                16,
+                EIGHTTAP,
+                EIGHTTAP,
+                &mut plane,
+                16,
+            ),
+            Err(crate::Error::PartitionWalkOutOfRange)
+        ));
     }
 
     // ---------- r299 §5.11.33 inter-intra frame-walk leaf ----------
