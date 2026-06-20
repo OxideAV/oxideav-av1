@@ -1194,6 +1194,77 @@ fn in_loop_filter_chain_deblock_cdef_lr_identity_on_flat_frame() {
     }
 }
 
+/// §7.14.2 `isTxEdge` gating through the bridge: the skip-forced walk
+/// collapses the 16×16 tile into a single BLOCK_16X16 leaf with a single
+/// TX_16X16 luma transform (verified below), so the ONLY luma transform
+/// edges are the frame boundaries — every one of which the §7.14.2
+/// `onScreen` gate drops (`pass == 0` vetoes col 0, `pass == 1` vetoes
+/// row 0). Hence even a strong injected interior gradient must survive
+/// unfiltered: there is no interior tx edge for the §7.14.2 walk to act
+/// on. This pins the bridge's `LoopfilterTxSizes` lookup to the real
+/// per-mi transform grid (a buggy lookup that reported TX_4X4 would
+/// invent spurious 4-px tx edges and corrupt the interior).
+#[test]
+fn loop_filter_bridge_respects_single_transform_no_interior_edges() {
+    use oxideav_av1::loop_filter::PlaneBuffer;
+    use oxideav_av1::uncompressed_header_tail::{LoopFilterParams, SegmentationParams};
+
+    let walker = walk_flat_intra_16x16_tile();
+    // The walk produced exactly one BLOCK_16X16 leaf...
+    assert_eq!(
+        walker.blocks().len(),
+        1,
+        "skip-forced 16×16 walk is a single leaf"
+    );
+    // ...with a single 16×16 luma transform (no interior luma tx edges).
+    assert_eq!(
+        walker.tx_sizes()[0],
+        TX_16X16 as u8,
+        "the 16×16 leaf carries one TX_16X16 luma transform"
+    );
+
+    let mut planes = extract_curr_planes(&walker);
+    // Inject a strong vertical step at col 8 (the would-be edge if the
+    // transform were TX_8X8): cols 0..8 = 110, cols 8..16 = 150.
+    {
+        let (rows, cols, y) = &mut planes[0];
+        for r in 0..*rows as usize {
+            for c in 0..*cols as usize {
+                y[r * (*cols as usize) + c] = if c < 8 { 110 } else { 150 };
+            }
+        }
+    }
+    let before: Vec<i32> = planes[0].2.clone();
+
+    let mut bufs: Vec<PlaneBuffer<'_>> = planes
+        .iter_mut()
+        .map(|(rows, cols, s)| PlaneBuffer {
+            rows: *rows,
+            cols: *cols,
+            samples: s.as_mut_slice(),
+        })
+        .collect();
+    let lf = LoopFilterParams {
+        loop_filter_level: [32, 32, 32, 32],
+        loop_filter_sharpness: 0,
+        loop_filter_delta_enabled: false,
+        loop_filter_delta_update: false,
+        loop_filter_ref_deltas:
+            oxideav_av1::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT,
+        loop_filter_mode_deltas:
+            oxideav_av1::uncompressed_header_tail::LOOP_FILTER_MODE_DELTAS_DEFAULT,
+        short_circuited: false,
+    };
+    let seg = SegmentationParams::disabled();
+    walker.loop_filter_frame_from_grid(&lf, &seg, false, 3, 8, 1, 1, 16, 16, &mut bufs);
+
+    // No interior tx edge ⇒ the injected col-8 step is left untouched.
+    assert_eq!(
+        planes[0].2, before,
+        "a single 16×16 transform exposes no interior luma tx edge to the §7.14.2 walk"
+    );
+}
+
 /// `DecodedBlock` is the per-block aggregate returned on the no-stub
 /// path. The struct's constructibility check is a sanity-check on the
 /// public API surface — it should compile and be `Debug + Clone +
