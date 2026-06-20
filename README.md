@@ -108,6 +108,23 @@ side-data into the frame walk (as the per-block compound / warp bridges
 already accept it) plus reference-frame buffer management remain the
 follow-ups toward a full inter AV1 frame.
 
+The §5.11 walker also drives the **in-loop filter chain** at frame
+scope, in the §7.4 decode order, straight from its persisted decode
+grids — no separate filter-state mirror. `loop_filter_frame_from_grid`
+(§7.14 deblock) wires the per-mi `Skips[]` / `RefFrames[][][0]` /
+`YModes[]` / `SegmentIds[]` / `TxSizes[]` / `InterTxSizes[]` /
+`MiSizes[]` grids into the §7.14 edge driver, reconstructing the
+§7.14.2 `LoopfilterTxSizes` lookup on the fly (per-mi luma transform
+for plane 0, the §5.11.37 `get_tx_size` chroma mapping for planes 1/2);
+`cdef_frame_from_idx` (§7.15) and `loop_restore_frame_from_grid`
+(§7.17) follow on the `cdef_idx[]` / §5.11.58 unit grids. An
+integration test composes all three over one reconstructed
+`CurrFrame[plane]` in order (deblock → CDEF → loop-restoration),
+verifying the buffer plumbing and the identity case on a flat field.
+The §7.14.4 `DeltaLFs` term is bridged for `delta_lf_present == 0` (the
+running §5.11.13 accumulator only); a per-mi `DeltaLFs[][][]` snapshot
+for the `delta_lf_present == 1` path remains a follow-up.
+
 The public `encode_av1` entry takes the constrained
 `[8, 64]`-per-axis lossless case; wider extents, lossy quant, and
 monochrome are reachable through the crate-public `encoder::*` driver
