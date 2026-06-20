@@ -58699,6 +58699,324 @@ mod tests {
         ));
     }
 
+    /// r355 §7.11.3.9 **left-pass** OBMC through the walker bridge: a
+    /// qualifying left-column neighbour with a distinct MV exercises the
+    /// `mask[j]` (column) blend axis (vs the above-pass `mask[i]` row
+    /// axis), and the bridge result matches the per-block
+    /// [`crate::reconstruct_inter_block_obmc`] driver while diverging from
+    /// the translational SIMPLE fallback.
+    #[test]
+    fn r355_walker_obmc_left_pass_bridge() {
+        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::{
+            reconstruct_inter_block, reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec,
+            RefFrameStoreEntry,
+        };
+
+        let ref_w: usize = 48;
+        let ref_h: usize = 48;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = (((r * 29) ^ (c * 41)) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let mode_info = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+        let (curr_w, curr_h) = (8usize, 8usize);
+
+        // Left-column neighbour, distinct MV (1 sample right).
+        let left_bundle = PredictInterRef {
+            ref_plane: &refp[..],
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [0, 8],
+        };
+        let left_nb = ObmcNeighbour {
+            bundle: left_bundle,
+            step4: 2,
+        };
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 16,
+            mi_rows: 16,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: false,
+            avail_l: true,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &[],
+            left_neighbours: &[left_nb],
+        };
+
+        // Per-block oracles into a 16×16 plane (block writes at (8, 8)).
+        let st = 16usize;
+        let mut oracle = vec![0u16; st * 16];
+        reconstruct_inter_block_obmc(
+            mode_info,
+            &obmc,
+            &ref_frame_idx,
+            &store,
+            0,
+            8,
+            8,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            st,
+        )
+        .unwrap();
+        let mut simple = vec![0u16; st * 16];
+        reconstruct_inter_block(
+            mode_info,
+            &ref_frame_idx,
+            &store,
+            0,
+            8,
+            8,
+            curr_w,
+            curr_h,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut simple,
+            st,
+        )
+        .unwrap();
+        let mut oracle_blk = vec![0u16; curr_w * curr_h];
+        let mut simple_blk = vec![0u16; curr_w * curr_h];
+        for i in 0..curr_h {
+            for j in 0..curr_w {
+                oracle_blk[i * curr_w + j] = oracle[(8 + i) * st + (8 + j)];
+                simple_blk[i * curr_w + j] = simple[(8 + i) * st + (8 + j)];
+            }
+        }
+
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let ref_spec = PlaneRefSpec {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        };
+        walker
+            .reconstruct_inter_block_obmc_into_curr_frame(
+                mode_info,
+                &obmc,
+                &ref_frame_idx,
+                &ref_spec,
+                8,
+                8,
+                curr_w,
+                curr_h,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("walker OBMC left-pass reconstruction");
+
+        let (_, cols) = walker.curr_frame_dims(0).unwrap();
+        let plane = walker.curr_frame(0).unwrap();
+        let mut got = vec![0u16; curr_w * curr_h];
+        for i in 0..curr_h {
+            for j in 0..curr_w {
+                got[i * curr_w + j] = plane[(8 + i) * cols as usize + (8 + j)] as u16;
+            }
+        }
+        assert_eq!(
+            got, oracle_blk,
+            "left-pass bridge must match per-block driver"
+        );
+        assert_ne!(
+            got, simple_blk,
+            "left-pass OBMC must diverge from translational"
+        );
+    }
+
+    /// r355 §7.11.3.9 OBMC bridge on a **4:2:0 chroma** plane: the bridge
+    /// drives a `motion_mode == OBMC` chroma block (subsampling 1/1)
+    /// through the per-plane §7.11.3.3 ref resolution + §7.11.3.9 walk,
+    /// matching the per-block driver and writing into the correctly-sized
+    /// (half-extent) chroma `CurrFrame[1]` buffer.
+    #[test]
+    fn r355_walker_obmc_chroma_plane_bridge() {
+        use crate::inter_pred::{ObmcNeighbour, ObmcParams, PredictInterRef, EIGHTTAP};
+        use crate::{
+            reconstruct_inter_block_obmc, InterModeInfo, PlaneRefSpec, RefFrameStoreEntry,
+        };
+
+        // Chroma reference plane (already subsampled — the bundle carries
+        // the chroma-plane samples directly).
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((((r * 13) ^ (c * 19)) + 7) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let mode_info = InterModeInfo {
+            ref_frame: last,
+            mv: [0, 0],
+        };
+        // A 4×4 chroma block at plane (4, 4); above neighbour distinct MV.
+        let (cw, ch) = (4usize, 4usize);
+        let above_bundle = PredictInterRef {
+            ref_plane: &refp[..],
+            ref_stride: stride,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv: [8, 0],
+        };
+        let above_nb = ObmcNeighbour {
+            bundle: above_bundle,
+            step4: 2,
+        };
+        // plane_residual_size_ge_block_8x8 = false on this small chroma
+        // block → above-pass gated off; left-pass with one neighbour.
+        let left_nb = above_nb;
+        let obmc = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols: 16,
+            mi_rows: 16,
+            mi_width_log2: 1,
+            mi_height_log2: 1,
+            avail_u: true,
+            avail_l: true,
+            plane_residual_size_ge_block_8x8: false,
+            above_neighbours: &[above_nb],
+            left_neighbours: &[left_nb],
+        };
+
+        // Per-block chroma oracle into a 16×16 plane at (4, 4).
+        let st = 16usize;
+        let mut oracle = vec![0u16; st * 16];
+        reconstruct_inter_block_obmc(
+            mode_info,
+            &obmc,
+            &ref_frame_idx,
+            &store,
+            1,
+            4,
+            4,
+            cw,
+            ch,
+            8,
+            1,
+            1,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            st,
+        )
+        .unwrap();
+        let mut oracle_blk = vec![0u16; cw * ch];
+        for i in 0..ch {
+            for j in 0..cw {
+                oracle_blk[i * cw + j] = oracle[(4 + i) * st + (4 + j)];
+            }
+        }
+
+        // 4×4 mi walker (8×8 chroma half-extent). The chroma plane buffer
+        // is sized MiCols × MI_SIZE >> 1 = 8 wide.
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        let ref_spec = PlaneRefSpec {
+            plane: 1,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            frame_store: &store,
+            frame_width: ref_w as u32,
+            frame_height: ref_h as u32,
+        };
+        walker
+            .reconstruct_inter_block_obmc_into_curr_frame(
+                mode_info,
+                &obmc,
+                &ref_frame_idx,
+                &ref_spec,
+                4,
+                4,
+                cw,
+                ch,
+                8,
+                EIGHTTAP,
+                EIGHTTAP,
+            )
+            .expect("walker OBMC chroma reconstruction");
+
+        let (rows, cols) = walker.curr_frame_dims(1).unwrap();
+        assert_eq!((rows, cols), (8, 8), "4:2:0 chroma plane is half-extent");
+        let plane = walker.curr_frame(1).unwrap();
+        let mut got = vec![0u16; cw * ch];
+        for i in 0..ch {
+            for j in 0..cw {
+                got[i * cw + j] = plane[(4 + i) * cols as usize + (4 + j)] as u16;
+            }
+        }
+        assert_eq!(
+            got, oracle_blk,
+            "chroma OBMC bridge must match the per-block driver on the subsampled plane"
+        );
+    }
+
     /// r305 §7.11.3.1 compound end-to-end: the walker bridge
     /// [`PartitionWalker::reconstruct_inter_block_compound_into_curr_frame`]
     /// must drive the two-reference `COMPOUND_AVERAGE` step-14 combine
