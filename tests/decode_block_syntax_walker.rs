@@ -869,6 +869,192 @@ fn decode_tile_syntax_reconstructs_intra_tile_into_curr_frame() {
     }
 }
 
+/// Helper: walk one 16×16 intra keyframe tile (skip-forced, no
+/// residual) so the walker's §7.12.3 `CurrFrame[plane]` buffers + the
+/// §5.11 per-mi grids the §7.14 bridge reads are all populated. Returns
+/// the walker (with grids + CurrFrame) for the deblock-bridge tests
+/// below.
+fn walk_flat_intra_16x16_tile() -> PartitionWalker {
+    let mut walker = walker_n(4);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    cdfs.skip = [force_binary_cdf(1); SKIP_CONTEXTS];
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+    let quant = QuantizerParams::neutral(0, 8);
+    let params = TileDecodeParams {
+        frame_is_intra: true,
+        subsampling_x: 1,
+        subsampling_y: 1,
+        num_planes: 3,
+        seg_id_pre_skip: false,
+        segmentation_enabled: false,
+        seg_skip_active: false,
+        last_active_seg_id: 0,
+        lossless_array: &lossless,
+        coded_lossless: false,
+        enable_cdef: false,
+        allow_intrabc: false,
+        cdef_bits: 0,
+        use_128x128_superblock: false,
+        delta_q_res: 0,
+        delta_lf_present: false,
+        delta_lf_multi: false,
+        mono_chrome: false,
+        delta_lf_res: 0,
+        allow_screen_content_tools: false,
+        enable_filter_intra: false,
+        bit_depth: 8,
+        tx_mode_select: false,
+        reduced_tx_set: false,
+    };
+    walker
+        .decode_tile_syntax(&mut dec, &mut cdfs, &params, None, &quant, false)
+        .expect("§5.11.2 tile loop must reconstruct cleanly");
+    walker
+}
+
+/// Extract the walker's §7.12.3 `CurrFrame[plane]` buffers into owned
+/// `(rows, cols, Vec<i32>)` triples the §7.14 [`oxideav_av1::loop_filter::PlaneBuffer`]
+/// driver can borrow mutably.
+fn extract_curr_planes(walker: &PartitionWalker) -> Vec<(u32, u32, Vec<i32>)> {
+    (0..3)
+        .map(|p| {
+            let (rows, cols) = walker.curr_frame_dims(p).unwrap();
+            (rows, cols, walker.curr_frame(p).unwrap().to_vec())
+        })
+        .collect()
+}
+
+/// §7.14 deblock bridge — `loop_filter_level == 0` is a frame-scope
+/// identity (av1-spec p.307 line 16961 / line 11423 `If
+/// loop_filter_level[0] != 0 || loop_filter_level[1] != 0`). The bridge
+/// must leave every `CurrFrame[plane]` sample byte-for-byte unchanged.
+#[test]
+fn loop_filter_bridge_level_zero_is_identity() {
+    let walker = walk_flat_intra_16x16_tile();
+    let mut planes = extract_curr_planes(&walker);
+    let before: Vec<Vec<i32>> = planes.iter().map(|(_, _, s)| s.clone()).collect();
+
+    let mut bufs: Vec<oxideav_av1::loop_filter::PlaneBuffer<'_>> = planes
+        .iter_mut()
+        .map(|(rows, cols, s)| oxideav_av1::loop_filter::PlaneBuffer {
+            rows: *rows,
+            cols: *cols,
+            samples: s.as_mut_slice(),
+        })
+        .collect();
+
+    let lf = oxideav_av1::uncompressed_header_tail::LoopFilterParams::short_circuit();
+    let seg = oxideav_av1::uncompressed_header_tail::SegmentationParams::disabled();
+    walker.loop_filter_frame_from_grid(
+        &lf, &seg, /* delta_lf_present = */ false, 3, 8, 1, 1, 16, 16, &mut bufs,
+    );
+
+    for (p, (_, _, s)) in planes.iter().enumerate() {
+        assert_eq!(
+            s, &before[p],
+            "plane {p}: level-0 deblock must be a pure identity"
+        );
+    }
+}
+
+/// §7.14 deblock bridge on a flat (DC = 128 everywhere) frame — a
+/// non-zero `loop_filter_level` still produces no sample change because
+/// the §7.14.6 filter mask never fires when every neighbour pair is
+/// equal (the §7.14.6 `filterMask` derivation reads zero gradient).
+/// This exercises the full §7.14.1 `plane × pass × row × col` edge
+/// walk + the §7.14.4/§7.14.5 strength derivation off the walker's
+/// real grids, and proves the bridge keeps the flat field invariant.
+#[test]
+fn loop_filter_bridge_flat_frame_invariant_under_nonzero_level() {
+    let walker = walk_flat_intra_16x16_tile();
+    // Confirm the precondition: the reconstructed tile is flat DC.
+    for &s in walker.curr_frame(0).unwrap() {
+        assert_eq!(
+            s, 128,
+            "flat-tile precondition: every luma sample is DC 128"
+        );
+    }
+    let mut planes = extract_curr_planes(&walker);
+    let before: Vec<Vec<i32>> = planes.iter().map(|(_, _, s)| s.clone()).collect();
+
+    let mut bufs: Vec<oxideav_av1::loop_filter::PlaneBuffer<'_>> = planes
+        .iter_mut()
+        .map(|(rows, cols, s)| oxideav_av1::loop_filter::PlaneBuffer {
+            rows: *rows,
+            cols: *cols,
+            samples: s.as_mut_slice(),
+        })
+        .collect();
+
+    // A real, in-range §5.9.11 strength schedule (luma V/H + both
+    // chroma planes at level 32, sharpness 1).
+    let lf = oxideav_av1::uncompressed_header_tail::LoopFilterParams {
+        loop_filter_level: [32, 32, 32, 32],
+        loop_filter_sharpness: 1,
+        loop_filter_delta_enabled: false,
+        loop_filter_delta_update: false,
+        loop_filter_ref_deltas:
+            oxideav_av1::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT,
+        loop_filter_mode_deltas:
+            oxideav_av1::uncompressed_header_tail::LOOP_FILTER_MODE_DELTAS_DEFAULT,
+        short_circuited: false,
+    };
+    let seg = oxideav_av1::uncompressed_header_tail::SegmentationParams::disabled();
+    walker.loop_filter_frame_from_grid(&lf, &seg, false, 3, 8, 1, 1, 16, 16, &mut bufs);
+
+    for (p, (_, _, s)) in planes.iter().enumerate() {
+        assert_eq!(
+            s, &before[p],
+            "plane {p}: a flat field has no §7.14.6 edge gradient, so deblock is invariant"
+        );
+        for &v in s {
+            assert!(
+                (0..=255).contains(&v),
+                "plane {p} sample {v} stays in Clip1 range"
+            );
+        }
+    }
+}
+
+/// §7.14 deblock bridge `delta_lf_present == 1` guard — the walker does
+/// not persist a per-mi `DeltaLFs[][][]` snapshot (only the running
+/// §5.11.13 accumulator), so the bridge conservatively returns the
+/// pre-deblock `CurrFrame[plane]` unchanged rather than apply a wrong
+/// §7.14.4 strength. Verify it is a no-op even with a non-zero level.
+#[test]
+fn loop_filter_bridge_delta_lf_present_is_noop_guard() {
+    let walker = walk_flat_intra_16x16_tile();
+    let mut planes = extract_curr_planes(&walker);
+    let before: Vec<Vec<i32>> = planes.iter().map(|(_, _, s)| s.clone()).collect();
+
+    let mut bufs: Vec<oxideav_av1::loop_filter::PlaneBuffer<'_>> = planes
+        .iter_mut()
+        .map(|(rows, cols, s)| oxideav_av1::loop_filter::PlaneBuffer {
+            rows: *rows,
+            cols: *cols,
+            samples: s.as_mut_slice(),
+        })
+        .collect();
+
+    let lf = oxideav_av1::uncompressed_header_tail::LoopFilterParams {
+        loop_filter_level: [32, 32, 32, 32],
+        ..oxideav_av1::uncompressed_header_tail::LoopFilterParams::short_circuit()
+    };
+    let seg = oxideav_av1::uncompressed_header_tail::SegmentationParams::disabled();
+    walker.loop_filter_frame_from_grid(
+        &lf, &seg, /* delta_lf_present = */ true, 3, 8, 1, 1, 16, 16, &mut bufs,
+    );
+
+    for (p, (_, _, s)) in planes.iter().enumerate() {
+        assert_eq!(
+            s, &before[p],
+            "plane {p}: delta_lf_present guard must leave planes untouched"
+        );
+    }
+}
+
 /// `DecodedBlock` is the per-block aggregate returned on the no-stub
 /// path. The struct's constructibility check is a sanity-check on the
 /// public API surface — it should compile and be `Debug + Clone +

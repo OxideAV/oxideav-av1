@@ -18223,6 +18223,207 @@ impl PartitionWalker {
         cdef_frame(&ctx, src_planes, dst_planes);
     }
 
+    /// §7.14 in-loop deblocking filter over the persisted §5.11 decode
+    /// grids — av1-spec p.307-313.
+    ///
+    /// Bridges the per-mi grids this walker accumulates during the
+    /// §5.11.5 `decode_block` walk — `Skips[]`, `RefFrames[][][0]`,
+    /// `YModes[]`, `SegmentIds[]`, the §5.11.16/§5.11.17 luma
+    /// `TxSizes[]` / `InterTxSizes[]`, and `MiSizes[]` — into the §7.14
+    /// [`crate::loop_filter::loop_filter_frame`] sample-edge driver.
+    /// The driver visits every 4×4 luma (or subsampled chroma) edge in
+    /// the §7.14.1 `plane × pass × row × col` order, derives the
+    /// §7.14.4/§7.14.5 adaptive strength from these grids, and filters
+    /// the samples in place. Deblocking is the FIRST in-loop pass per
+    /// the §7.4 decode order, so `planes` here is the raw
+    /// post-reconstruction `CurrFrame[ plane ]`, and its filtered output
+    /// becomes the `src_planes` argument of
+    /// [`Self::cdef_frame_from_idx`].
+    ///
+    /// The §7.14.2 `LoopfilterTxSizes[ plane ][ row >> subY ][ col >>
+    /// subX ]` lookup is reconstructed on the fly: for luma the per-mi
+    /// `InterTxSizes[]` cell (inter blocks) or `TxSizes[]` cell (intra
+    /// blocks) is read directly; for chroma the §5.11.37 `get_tx_size(
+    /// plane, lumaTxSz )` derivation is applied to the co-located luma
+    /// mi's `MiSize` + luma transform size. This matches the §5.11.35
+    /// `transform_block` stamp `LoopfilterTxSizes[ plane ][ (row >>
+    /// subY) + i ][ (col >> subX) + j ] = txSz` without the walker
+    /// owning a separate per-plane `LoopfilterTxSizes` mirror.
+    ///
+    /// `lf_params` is the §5.9.11 frame-level
+    /// [`crate::uncompressed_header_tail::LoopFilterParams`]
+    /// (`loop_filter_level[]` / `loop_filter_sharpness` /
+    /// `loop_filter_delta_enabled` / the ref/mode delta arrays);
+    /// `seg_params` is the §5.9.14
+    /// [`crate::uncompressed_header_tail::SegmentationParams`] consulted
+    /// for the §7.14.5 `SEG_LVL_ALT_LF_*` per-segment offsets. The
+    /// remaining arguments are the §5.5.2 / §5.9.5 frame geometry the
+    /// driver indexes.
+    ///
+    /// ## Per-mi `DeltaLFs` scope
+    ///
+    /// The §7.14.4 `DeltaLFs[ row ][ col ][ idx ]` term is supplied as
+    /// `0` for every cell: the walker tracks only the running
+    /// [`Self::current_delta_lf`] accumulator from §5.11.13, not a
+    /// per-mi `DeltaLFs[][][]` snapshot. This is bit-exact whenever
+    /// `delta_lf_present == 0` (the common case, where every block's
+    /// `DeltaLF` stays at its §5.9.18 zero default). When
+    /// `delta_lf_present == 1` the caller must first materialise a
+    /// per-mi `DeltaLFs` grid and use the lower-level
+    /// [`crate::loop_filter::loop_filter_frame`] directly; this bridge
+    /// returns the un-deblocked planes unchanged in that case rather
+    /// than apply a wrong strength.
+    #[allow(clippy::too_many_arguments)]
+    pub fn loop_filter_frame_from_grid(
+        &self,
+        lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
+        seg_params: &crate::uncompressed_header_tail::SegmentationParams,
+        delta_lf_present: bool,
+        num_planes: u8,
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        frame_width: u32,
+        frame_height: u32,
+        planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
+    ) {
+        use crate::loop_filter::{loop_filter_frame, LoopFilterFrameContext};
+        // §5.9.18 `delta_lf_present == 1` needs a per-mi `DeltaLFs`
+        // snapshot the walker does not retain; refuse rather than
+        // deblock with a wrong §7.14.4 strength. The pre-deblock
+        // `planes` already hold the §7.12.3 step-3 reconstruction, so
+        // leaving them untouched is the conservative identity.
+        if delta_lf_present {
+            return;
+        }
+        let ctx = LoopFilterFrameContext {
+            loop_filter_level: lf_params.loop_filter_level,
+            loop_filter_sharpness: lf_params.loop_filter_sharpness,
+            loop_filter_delta_enabled: lf_params.loop_filter_delta_enabled,
+            loop_filter_ref_deltas: lf_params.loop_filter_ref_deltas,
+            loop_filter_mode_deltas: lf_params.loop_filter_mode_deltas,
+            // The §7.14.4 `DeltaLFs` term is held at `0` (the
+            // `delta_lf_present == 0` arm gated above).
+            delta_lf_multi: false,
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            num_planes,
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+            frame_width,
+            frame_height,
+            // §7.14.2 line 17073: `RefFrames[ row ][ col ][ 0 ] <=
+            // INTRA_FRAME`. The persisted grid carries `INTRA_FRAME = 0`
+            // for intra cells, so the `<= 0` compare folds to `== 0`.
+            is_intra: &|r, c| {
+                self.ref_frame_at(r as i32, c as i32, 0)
+                    <= crate::uncompressed_header_tail::INTRA_FRAME as i8
+            },
+            // §7.14.2 line 17071: `Skips[ row ][ col ]`.
+            skip: &|r, c| self.skip_at(r as i32, c as i32) != 0,
+            // §7.14.4 line 17181: `RefFrames[ row ][ col ][ 0 ]`. The
+            // grid stores `i8` (`NONE = -1` only ever lands in slot 1),
+            // so slot 0 is always in `0..=ALTREF_FRAME`.
+            ref_frame: &|r, c| self.ref_frame_at(r as i32, c as i32, 0).max(0) as u8,
+            // §7.14.4 line 17183: `YModes[ row ][ col ]`.
+            mode: &|r, c| self.y_mode_at(r as i32, c as i32),
+            // §7.14.4 line 17179: `SegmentIds[ row ][ col ]` (`-1`
+            // signalled as `u8::MAX` for cells with no segment id).
+            segment_id: &|r, c| {
+                let s = self.segment_id_at(r as i32, c as i32);
+                if s < 0 {
+                    u8::MAX
+                } else {
+                    s as u8
+                }
+            },
+            // §7.14.4 `DeltaLFs[ row ][ col ][ idx ] = 0` (gated arm).
+            delta_lf: &|_, _, _| 0i8,
+            // §7.14.5 line 17259: `seg_feature_active_idx( segment,
+            // feature )` with `feature ∈ {SEG_LVL_ALT_LF_Y_V ..= +V}`.
+            seg_feature_active: &|segment, feature| {
+                if segment as usize >= crate::uncompressed_header_tail::MAX_SEGMENTS
+                    || feature >= crate::uncompressed_header_tail::SEG_LVL_MAX
+                {
+                    return false;
+                }
+                seg_params.segment_feature_active[segment as usize][feature]
+            },
+            // §7.14.5 line 17266: `FeatureData[ segment ][ feature ]`.
+            seg_feature_data: &|segment, feature| {
+                if segment as usize >= crate::uncompressed_header_tail::MAX_SEGMENTS
+                    || feature >= crate::uncompressed_header_tail::SEG_LVL_MAX
+                {
+                    return 0;
+                }
+                seg_params.segment_feature_data[segment as usize][feature]
+            },
+            // §7.14.2 line 17067: `LoopfilterTxSizes[ plane ][ row >>
+            // subY ][ col >> subX ]`. Reconstructed from the per-mi
+            // luma transform grids + the §5.11.37 chroma derivation.
+            lf_tx_size: &|plane, sub_row, sub_col| {
+                self.loopfilter_tx_size_at(plane, sub_row, sub_col, subsampling_x, subsampling_y)
+            },
+            // §7.14.2 line 17065: `MiSizes[ row ][ col ]`.
+            mi_size: &|r, c| self.mi_size_at(r as i32, c as i32),
+        };
+        loop_filter_frame(&ctx, planes);
+    }
+
+    /// Reconstruct `LoopfilterTxSizes[ plane ][ subRow ][ subCol ]` from
+    /// the walker's per-mi luma transform grids — av1-spec §5.11.35 /
+    /// §5.11.37.
+    ///
+    /// `subRow` / `subCol` are already in the per-plane subsampled 4×4
+    /// grid the §7.14.2 caller passes (`row >> subY` / `col >> subX`).
+    /// For luma the co-located mi is `(subRow, subCol)` directly; for
+    /// chroma it is `(subRow << subY, subCol << subX)` — the luma mi
+    /// whose §5.11.35 transform_block stamped this chroma cell.
+    ///
+    /// The §5.11.35 stamp wrote `get_tx_size( plane, txSz )` for the
+    /// block's luma transform `txSz`; we recover that luma `txSz` from
+    /// `InterTxSizes[]` (inter cells) or `TxSizes[]` (intra cells) and
+    /// re-apply the §5.11.37 `get_tx_size` chroma mapping. Out-of-grid
+    /// or undecoded cells fall back to [`TX_4X4`] (the constructor
+    /// pre-fill).
+    fn loopfilter_tx_size_at(
+        &self,
+        plane: usize,
+        sub_row: u32,
+        sub_col: u32,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) -> usize {
+        let (luma_r, luma_c) = if plane == 0 {
+            (sub_row as i32, sub_col as i32)
+        } else {
+            (
+                (sub_row << subsampling_y) as i32,
+                (sub_col << subsampling_x) as i32,
+            )
+        };
+        // §5.11.16/§5.11.17: inter blocks carry their per-cell tx in
+        // InterTxSizes[]; intra blocks in TxSizes[]. The §5.11.35
+        // transform_block writes LoopfilterTxSizes from the same per-mi
+        // luma txSz the §5.11.37 chroma mapping consumes.
+        let luma_tx = if self.is_inter_at(luma_r, luma_c) != 0 {
+            self.inter_tx_size_at(luma_r, luma_c) as usize
+        } else {
+            self.tx_size_at(luma_r, luma_c) as usize
+        };
+        if plane == 0 {
+            return luma_tx;
+        }
+        // §5.11.37 get_tx_size( plane, lumaTx ) chroma mapping keyed by
+        // the co-located luma mi's MiSize.
+        let mi_size = self.mi_size_at(luma_r, luma_c);
+        if mi_size >= BLOCK_SIZES {
+            return TX_4X4;
+        }
+        get_tx_size(plane as u8, luma_tx, mi_size, subsampling_x, subsampling_y).unwrap_or(TX_4X4)
+    }
+
     /// §7.17 loop-restoration reconstruction over the persisted §5.11.58
     /// unit grid — av1-spec p.327-335.
     ///
@@ -25208,6 +25409,23 @@ impl PartitionWalker {
             return TX_4X4 as u8;
         }
         self.inter_tx_sizes[(r * self.mi_cols + c) as usize]
+    }
+
+    /// Helper to read the §5.11.5 / §5.11.16 `TxSizes[ r ][ c ]` per-mi
+    /// luma transform-size grid (the intra-path stamp). Returns
+    /// `TX_4X4 = 0` for out-of-grid coordinates (the constructor
+    /// pre-fill). Used by [`Self::loopfilter_tx_size_at`] to recover
+    /// `LoopfilterTxSizes` for intra cells.
+    #[inline]
+    fn tx_size_at(&self, r: i32, c: i32) -> u8 {
+        if r < 0 || c < 0 {
+            return TX_4X4 as u8;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return TX_4X4 as u8;
+        }
+        self.tx_sizes[(r * self.mi_cols + c) as usize]
     }
 
     /// `read_block_tx_size()` per §5.11.16 (av1-spec p.70) — the
