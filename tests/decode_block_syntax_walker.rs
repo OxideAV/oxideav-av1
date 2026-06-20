@@ -1055,6 +1055,145 @@ fn loop_filter_bridge_delta_lf_present_is_noop_guard() {
     }
 }
 
+/// End-to-end §7.4 in-loop filter ORDER: §7.14 deblock → §7.15 CDEF →
+/// §7.17 loop-restoration, driven entirely from one walker's persisted
+/// §5.11 grids through the three bridges
+/// ([`PartitionWalker::loop_filter_frame_from_grid`],
+/// [`PartitionWalker::cdef_frame_from_idx`],
+/// [`PartitionWalker::loop_restore_frame_from_grid`]).
+///
+/// With every §5.9.11/§5.9.19/§5.9.20 filter in its short-circuit
+/// (identity) configuration and a flat reconstructed field, the chained
+/// output must equal the input `CurrFrame[plane]` plane-for-plane — this
+/// proves the three bridges compose with the correct buffer plumbing
+/// (deblock in place → CDEF src→dst → LR curr+cdef→lr) and that the
+/// §7.16-skipped (no-superres) extents line up across all three stages.
+#[test]
+fn in_loop_filter_chain_deblock_cdef_lr_identity_on_flat_frame() {
+    use oxideav_av1::loop_filter::PlaneBuffer;
+    use oxideav_av1::uncompressed_header_tail::{
+        CdefParams, LoopFilterParams, LrParams, SegmentationParams,
+    };
+
+    let walker = walk_flat_intra_16x16_tile();
+    // The reconstructed CurrFrame is the §7.14 input (`CurrFrame`), kept
+    // for the §7.17 `curr_planes` (pre-CDEF) neighbour-stripe argument.
+    let mut curr = extract_curr_planes(&walker);
+    let original: Vec<Vec<i32>> = curr.iter().map(|(_, _, s)| s.clone()).collect();
+
+    // Stage 1 — §7.14 deblock in place on `curr`.
+    {
+        let mut bufs: Vec<PlaneBuffer<'_>> = curr
+            .iter_mut()
+            .map(|(rows, cols, s)| PlaneBuffer {
+                rows: *rows,
+                cols: *cols,
+                samples: s.as_mut_slice(),
+            })
+            .collect();
+        let lf = LoopFilterParams::short_circuit();
+        let seg = SegmentationParams::disabled();
+        walker.loop_filter_frame_from_grid(&lf, &seg, false, 3, 8, 1, 1, 16, 16, &mut bufs);
+    }
+
+    // Stage 2 — §7.15 CDEF: `curr` (post-deblock) → `cdef`. The driver
+    // takes `src` / `dst` as distinct buffer sets; clone the
+    // post-deblock samples into an owned read-only `src_owned` so both
+    // borrows are non-aliasing.
+    let mut src_owned: Vec<(u32, u32, Vec<i32>)> = curr.clone();
+    let mut cdef: Vec<(u32, u32, Vec<i32>)> = curr
+        .iter()
+        .map(|(r, c, _)| (*r, *c, vec![0i32; (r * c) as usize]))
+        .collect();
+    {
+        let src: Vec<PlaneBuffer<'_>> = src_owned
+            .iter_mut()
+            .map(|(rows, cols, s)| PlaneBuffer {
+                rows: *rows,
+                cols: *cols,
+                samples: s.as_mut_slice(),
+            })
+            .collect();
+        let mut dst: Vec<PlaneBuffer<'_>> = cdef
+            .iter_mut()
+            .map(|(rows, cols, s)| PlaneBuffer {
+                rows: *rows,
+                cols: *cols,
+                samples: s.as_mut_slice(),
+            })
+            .collect();
+        let cdef_params = CdefParams::short_circuit();
+        walker.cdef_frame_from_idx(&cdef_params, 3, 8, 1, 1, &src, &mut dst);
+    }
+
+    // Stage 3 — §7.17 LR: (`curr` = pre-CDEF stripes, `cdef` =
+    // UpscaledCdefFrame) → `lr`. `curr_owned` / `cdef_owned` are
+    // read-only clones so the `&[PlaneBuffer]` borrows never alias the
+    // mutable `lr` output.
+    let mut curr_owned: Vec<(u32, u32, Vec<i32>)> = curr.clone();
+    let mut cdef_owned: Vec<(u32, u32, Vec<i32>)> = cdef.clone();
+    let mut lr: Vec<(u32, u32, Vec<i32>)> = cdef
+        .iter()
+        .map(|(r, c, _)| (*r, *c, vec![0i32; (r * c) as usize]))
+        .collect();
+    {
+        let curr_bufs: Vec<PlaneBuffer<'_>> = curr_owned
+            .iter_mut()
+            .map(|(rows, cols, s)| PlaneBuffer {
+                rows: *rows,
+                cols: *cols,
+                samples: s.as_mut_slice(),
+            })
+            .collect();
+        let cdef_bufs: Vec<PlaneBuffer<'_>> = cdef_owned
+            .iter_mut()
+            .map(|(rows, cols, s)| PlaneBuffer {
+                rows: *rows,
+                cols: *cols,
+                samples: s.as_mut_slice(),
+            })
+            .collect();
+        let mut lr_bufs: Vec<PlaneBuffer<'_>> = lr
+            .iter_mut()
+            .map(|(rows, cols, s)| PlaneBuffer {
+                rows: *rows,
+                cols: *cols,
+                samples: s.as_mut_slice(),
+            })
+            .collect();
+        let lr_params = LrParams::short_circuit();
+        walker.loop_restore_frame_from_grid(
+            &lr_params,
+            3,
+            8,
+            1,
+            1,
+            /* mi_rows = */ 4,
+            /* mi_cols = */ 4,
+            /* frame_height = */ 16,
+            /* upscaled_width = */ 16,
+            &curr_bufs,
+            &cdef_bufs,
+            &mut lr_bufs,
+        );
+    }
+
+    // The fully-filtered output equals the original reconstruction:
+    // every stage was an identity on the flat field.
+    for (p, (_, _, s)) in lr.iter().enumerate() {
+        assert_eq!(
+            s, &original[p],
+            "plane {p}: deblock→CDEF→LR identity chain must preserve the flat field"
+        );
+        for &v in s {
+            assert!(
+                (0..=255).contains(&v),
+                "plane {p} sample {v} in Clip1 range"
+            );
+        }
+    }
+}
+
 /// `DecodedBlock` is the per-block aggregate returned on the no-stub
 /// path. The struct's constructibility check is a sanity-check on the
 /// public API surface — it should compile and be `Debug + Clone +
