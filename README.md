@@ -110,12 +110,23 @@ the §5.11.33 frame walk on the single-ref path — a real single-reference
 inter leaf decoded from a bitstream (the seg-globalmv `GLOBALMV` arm)
 reconstructs to validated pixels end-to-end, and multi-leaf frames with
 distinct per-leaf sub-pel MVs reconstruct leaf-by-leaf matching the
-per-block driver. Compound / inter-intra / warped leaves carry per-leaf
-side-data on the `DecodedBlockRecord` list rather than per-cell grids, so
-the frame bridge drives them translationally for now; threading their
-side-data into the frame walk (as the per-block compound / warp bridges
-already accept it) plus reference-frame buffer management remain the
-follow-ups toward a full inter AV1 frame.
+per-block driver. As of r359 the §5.11.23 inter cascade also stamps the
+§5.11.29 / §5.11.28 / §5.11.27 **side-data grids** (`compound_types`,
+`compound_wedge_{indices,signs}`, `compound_mask_types`,
+`interintra_modes`, `wedge_interintras`, `interintra_wedge_indices`,
+`motion_modes`) over each leaf's `bh4 × bw4` footprint, and the frame
+bridge feeds them into the `InterModeInfoGrid` — so the frame walk now
+dispatches **compound** (AVERAGE / DISTANCE / WEDGE / DIFFWTD) and
+**inter-intra** leaves automatically through their §7.11.3 combine arms,
+not translationally. The COMPOUND_DISTANCE (`enable_jnt_comp`) arm reads
+its §7.11.3.15 order-hint context through the new
+`reconstruct_inter_frame_into_curr_frame_with_order_hints` entry (the
+no-hint entry delegates with the identity-zero context, correct for
+frames with no distance-weighted compound leaves). Warped-causal leaves
+remain on the opt-in `InterModeInfoGrid.warp` per-block context; threading
+the LOCALWARP fit grid into the frame walk plus reference-frame buffer
+management across a GOP remain the follow-ups toward a full inter AV1
+frame.
 
 The §5.11 walker also drives the **in-loop filter chain** at frame
 scope, in the §7.4 decode order, straight from its persisted decode
@@ -142,9 +153,9 @@ functions. Streams outside the supported scope return a typed `Error`
 
 ### Not yet supported
 
-- Frame-walk reconstruction of compound / inter-intra / warped inter
-  leaves (the single-reference translational arm is wired); reference-
-  frame buffer management across a GOP.
+- Frame-walk reconstruction of warped-causal inter leaves (the
+  single-reference translational, compound, and inter-intra arms are
+  wired as of r359); reference-frame buffer management across a GOP.
 - Multi-tile reconstruction beyond the single-tile decode path.
 - 10/12-bit and 4:2:2 / 4:4:4 reconstruction.
 - Registration as a live codec in the runtime registry.
