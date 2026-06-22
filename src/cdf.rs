@@ -14950,6 +14950,45 @@ pub struct DecodedBlockRecord {
     pub sub_size: usize,
 }
 
+/// §7.11.3.15 frame-level order-hint context for the §5.11.33 inter
+/// frame walk
+/// ([`PartitionWalker::reconstruct_inter_frame_into_curr_frame_with_order_hints`]).
+/// The [`COMPOUND_DISTANCE`] (`enable_jnt_comp`) compound arm derives
+/// its `(FwdWeight, BckWeight)` blend weights per leaf from these
+/// frame-header scalars and the per-reference `OrderHints[ ref ]` table;
+/// every other arm ignores them. Carried as an owned value (not a
+/// borrowed slice) so the bridge can pass it by value through the grid
+/// snapshot without a lifetime entanglement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameInterOrderHints {
+    /// §5.5.1 `OrderHintBits` — `order_hint_bits_minus_1 + 1`, in
+    /// `1..=8`, or `0` when `enable_order_hint == 0` (the §7.4
+    /// `get_relative_dist` short-circuit returns `0` then, which the
+    /// DISTANCE arm reads as an equal-distance / averaging blend).
+    pub order_hint_bits: u32,
+    /// §5.9.2 `OrderHint` of the frame being decoded.
+    pub current_order_hint: i32,
+    /// `OrderHints[ ref ]` for `ref` in `INTRA_FRAME..=ALTREF_FRAME`
+    /// (`0..=7`) — the per-reference output order hints. Indexed by the
+    /// raw `RefFrame` value (slot 0 = `INTRA_FRAME` unused on the
+    /// compound path). Sized to `ALTREF_FRAME + 1`.
+    pub order_hints_by_ref: [i32; crate::uncompressed_header_tail::ALTREF_FRAME + 1],
+}
+
+impl FrameInterOrderHints {
+    /// Identity-zero context — `OrderHintBits = 0`, `OrderHint = 0`,
+    /// every `OrderHints[ ref ] = 0`. The §7.11.3.15 DISTANCE arm reads
+    /// this as an equal-distance averaging blend. Used by
+    /// [`PartitionWalker::reconstruct_inter_frame_into_curr_frame`] (the
+    /// no-order-hint convenience entry) — correct for frames with no
+    /// distance-weighted compound leaves.
+    pub const IDENTITY: Self = Self {
+        order_hint_bits: 0,
+        current_order_hint: 0,
+        order_hints_by_ref: [0; crate::uncompressed_header_tail::ALTREF_FRAME + 1],
+    };
+}
+
 /// `PartitionWalker` — the §5.11.4 decoder-side scaffold that walks
 /// the partition tree for one superblock.
 ///
@@ -15267,6 +15306,75 @@ pub struct PartitionWalker {
     /// block's, which the §8.3.2 walk rejects via the `aboveType = 3`
     /// / `leftType = 3` sentinel anyway).
     interp_filters: Vec<u8>,
+    /// §5.11.29 decoded `compound_type` per cell, packed row-major
+    /// `mi_rows * mi_cols`. The §5.11.23 inter cascade stamps the
+    /// §5.11.29 [`CompoundTypeReadout::compound_type`] over the block's
+    /// `bh4 * bw4` footprint; the §5.11.33 frame walk
+    /// ([`Self::reconstruct_inter_frame_into_curr_frame`]) reads the
+    /// leaf-origin cell to select the §7.11.3.1 step-14 combine arm.
+    /// Pre-fill is [`COMPOUND_AVERAGE`] (the mask-free §5.11.29 default —
+    /// also the value the §5.11.33 walk's `is_compound_leaf` gate
+    /// short-circuits to on a single-ref / intra cell it never reads).
+    /// Entries are one of the §6.10.24 [`COMPOUND_WEDGE`] /
+    /// [`COMPOUND_DIFFWTD`] / [`COMPOUND_AVERAGE`] / [`COMPOUND_INTRA`] /
+    /// [`COMPOUND_DISTANCE`] ordinals.
+    compound_types: Vec<u8>,
+    /// §5.11.29 decoded `wedge_index` per cell, packed row-major
+    /// `mi_rows * mi_cols`. Stamped from the §5.11.29
+    /// [`CompoundTypeReadout::wedge_index`] (`Some(_)` only on the
+    /// [`COMPOUND_WEDGE`] arm; the non-wedge arms leave the pre-fill
+    /// `0`). Read by the §5.11.33 frame walk only at a `COMPOUND_WEDGE`
+    /// leaf's origin (paired with [`Self::compound_wedge_signs`]).
+    /// Entries are in `0..WEDGE_TYPES = 0..16`.
+    compound_wedge_indices: Vec<u8>,
+    /// §5.11.29 decoded `wedge_sign` per cell, packed row-major
+    /// `mi_rows * mi_cols`. Stamped from the §5.11.29
+    /// [`CompoundTypeReadout::wedge_sign`] (`Some(_)` only on the
+    /// [`COMPOUND_WEDGE`] arm). Binary (`0` / `1`); pre-fill `0`. Read
+    /// by the §5.11.33 frame walk only at a `COMPOUND_WEDGE` leaf's
+    /// origin.
+    compound_wedge_signs: Vec<u8>,
+    /// §5.11.29 decoded `mask_type` per cell, packed row-major
+    /// `mi_rows * mi_cols`. Stamped from the §5.11.29
+    /// [`CompoundTypeReadout::mask_type`] (`Some(_)` only on the
+    /// [`COMPOUND_DIFFWTD`] arm; `0` = `DIFFWTD_38`, `1` =
+    /// `DIFFWTD_38_INV`). Pre-fill `0`. Read by the §5.11.33 frame walk
+    /// only at a `COMPOUND_DIFFWTD` leaf's origin.
+    compound_mask_types: Vec<u8>,
+    /// §5.11.28 decoded `interintra_mode` per cell, packed row-major
+    /// `mi_rows * mi_cols`. Stamped from the §5.11.28
+    /// [`InterIntraReadout::interintra_mode`] (`Some(_)` only when the
+    /// §5.11.28 inner arm fired). Pre-fill `0` (`II_DC_PRED`). Read by
+    /// the §5.11.33 frame walk only at an inter-intra leaf's origin
+    /// (`RefFrame[1] == INTRA_FRAME`). Entries are in
+    /// `0..INTERINTRA_MODES = 0..4`.
+    interintra_modes: Vec<u8>,
+    /// §5.11.28 decoded `wedge_interintra` per cell, packed row-major
+    /// `mi_rows * mi_cols`. Stamped from the §5.11.28
+    /// [`InterIntraReadout::wedge_interintra`]. Binary (`0` = non-wedge
+    /// §7.11.3.13 intra-variant mask, `1` = §7.11.3.11 luma-grid wedge
+    /// mask); pre-fill `0`. Read by the §5.11.33 frame walk only at an
+    /// inter-intra leaf's origin.
+    wedge_interintras: Vec<u8>,
+    /// §5.11.28 decoded inter-intra `wedge_index` per cell, packed
+    /// row-major `mi_rows * mi_cols`. Stamped from the §5.11.28
+    /// [`InterIntraReadout::wedge_index`] (`Some(_)` only when
+    /// `interintra == 1 && wedge_interintra == 1`). Pre-fill `0`. Read
+    /// by the §5.11.33 frame walk only at an inter-intra leaf's origin
+    /// whose [`Self::wedge_interintras`] cell is `1`. Distinct grid from
+    /// the compound [`Self::compound_wedge_indices`]; the inter-intra
+    /// `wedge_sign` is fixed at `0` per §5.11.28 so it is not carried.
+    interintra_wedge_indices: Vec<u8>,
+    /// §5.11.27 decoded `motion_mode` per cell, packed row-major
+    /// `mi_rows * mi_cols`. Stamped from the §5.11.27
+    /// [`DecodedInterBlockModeInfo::motion_mode`] over the block's
+    /// `bh4 * bw4` footprint. Pre-fill [`MOTION_MODE_SIMPLE`] (`0`, the
+    /// §5.11.27 short-circuit default). Entries are one of
+    /// [`MOTION_MODE_SIMPLE`] / [`MOTION_MODE_OBMC`] /
+    /// [`MOTION_MODE_WARPED_CAUSAL`]. Surfaced via
+    /// [`Self::motion_modes`] for callers driving the §7.11.3.5 warp /
+    /// §7.11.3.9 OBMC arms.
+    motion_modes: Vec<u8>,
     /// `DecodedBlockRecord` leaves emitted by [`Self::decode_partition`]
     /// in §5.11.4 syntax order.
     blocks: Vec<DecodedBlockRecord>,
@@ -15653,6 +15761,38 @@ impl PartitionWalker {
         let mut compound_idxs: Vec<u8> = Vec::new();
         compound_idxs.try_reserve_exact(area).ok()?;
         compound_idxs.resize(area, 1);
+        // §5.11.29 / §5.11.28 / §5.11.27 inter side-data grids — the
+        // already-resolved decode outputs the §5.11.33 frame walk
+        // dispatches compound / inter-intra / warped leaves from. Each
+        // is read only at a leaf-origin cell whose `RefFrames[]` /
+        // `motion_modes` gate selects the matching §7.11.3 arm; the
+        // pre-fill values are the §5.11.29 / §5.11.28 / §5.11.27
+        // short-circuit defaults (never read on a single-ref / intra
+        // cell). See the field docs for the per-grid semantics.
+        let mut compound_types: Vec<u8> = Vec::new();
+        compound_types.try_reserve_exact(area).ok()?;
+        compound_types.resize(area, crate::inter_pred::COMPOUND_AVERAGE);
+        let mut compound_wedge_indices: Vec<u8> = Vec::new();
+        compound_wedge_indices.try_reserve_exact(area).ok()?;
+        compound_wedge_indices.resize(area, 0);
+        let mut compound_wedge_signs: Vec<u8> = Vec::new();
+        compound_wedge_signs.try_reserve_exact(area).ok()?;
+        compound_wedge_signs.resize(area, 0);
+        let mut compound_mask_types: Vec<u8> = Vec::new();
+        compound_mask_types.try_reserve_exact(area).ok()?;
+        compound_mask_types.resize(area, 0);
+        let mut interintra_modes: Vec<u8> = Vec::new();
+        interintra_modes.try_reserve_exact(area).ok()?;
+        interintra_modes.resize(area, 0);
+        let mut wedge_interintras: Vec<u8> = Vec::new();
+        wedge_interintras.try_reserve_exact(area).ok()?;
+        wedge_interintras.resize(area, 0);
+        let mut interintra_wedge_indices: Vec<u8> = Vec::new();
+        interintra_wedge_indices.try_reserve_exact(area).ok()?;
+        interintra_wedge_indices.resize(area, 0);
+        let mut motion_modes: Vec<u8> = Vec::new();
+        motion_modes.try_reserve_exact(area).ok()?;
+        motion_modes.resize(area, MOTION_MODE_SIMPLE);
         // §5.11.x / §8.3.2: pre-fill `InterpFilters[r][c][0..2]` with
         // `EIGHTTAP = 0`, the spec's `interp_filter[ dir ] = EIGHTTAP`
         // fallback (set when `needs_interp_filter() == 0`). The §8.3.2
@@ -15703,6 +15843,14 @@ impl PartitionWalker {
             comp_group_idxs,
             compound_idxs,
             interp_filters,
+            compound_types,
+            compound_wedge_indices,
+            compound_wedge_signs,
+            compound_mask_types,
+            interintra_modes,
+            wedge_interintras,
+            interintra_wedge_indices,
+            motion_modes,
             blocks: Vec::new(),
             // §7.12.3 step-3 `CurrFrame[plane]` buffers — allocated
             // lazily on the first per-plane merge call (see
@@ -17350,6 +17498,37 @@ impl PartitionWalker {
         bit_depth: u8,
         plane_refs: &[crate::PlaneRefSpec<'_>],
     ) -> Result<(), crate::Error> {
+        // Delegate with identity-zero §7.11.3.15 order hints. The
+        // mask-free [`COMPOUND_AVERAGE`], the [`COMPOUND_WEDGE`], the
+        // [`COMPOUND_DIFFWTD`], and the inter-intra arms all reconstruct
+        // independently of the order-hint context; only the
+        // [`COMPOUND_DISTANCE`] (`enable_jnt_comp`) arm consumes it, so a
+        // frame carrying distance-weighted compound leaves should call
+        // [`Self::reconstruct_inter_frame_into_curr_frame_with_order_hints`]
+        // with the §5.9.2 `OrderHint` / §5.5.1 `OrderHintBits` /
+        // §7.4 `OrderHints[ ref ]` from the frame header instead.
+        self.reconstruct_inter_frame_into_curr_frame_with_order_hints(
+            ref_frame_idx,
+            bit_depth,
+            plane_refs,
+            FrameInterOrderHints::IDENTITY,
+        )
+    }
+
+    /// §5.11.33 frame-level inter reconstruction with the §7.11.3.15
+    /// order-hint context threaded through, so the [`COMPOUND_DISTANCE`]
+    /// (`enable_jnt_comp`) compound arm derives its `(FwdWeight,
+    /// BckWeight)` from the real per-reference output order hints rather
+    /// than the identity-zero fallback. Otherwise identical to
+    /// [`Self::reconstruct_inter_frame_into_curr_frame`]; see that
+    /// method's docs.
+    pub fn reconstruct_inter_frame_into_curr_frame_with_order_hints(
+        &mut self,
+        ref_frame_idx: &[u8],
+        bit_depth: u8,
+        plane_refs: &[crate::PlaneRefSpec<'_>],
+        order_hints: FrameInterOrderHints,
+    ) -> Result<(), crate::Error> {
         if plane_refs.is_empty() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
@@ -17384,19 +17563,42 @@ impl PartitionWalker {
         mvs_snap.extend_from_slice(&self.mvs[..cells * 4]);
         interp_filters_snap.extend_from_slice(&self.interp_filters[..cells * 2]);
 
-        // Neutral (all-zero) side-data slices for the compound / inter-
-        // intra arms. On a single-ref `SIMPLE` frame these are never read
-        // (the walk reads them only at a compound / inter-intra leaf
-        // origin); the zeros are the §5.11.29 / §5.11.28 defaults regardless.
-        let mut zero_cells: Vec<u8> = Vec::new();
-        if zero_cells.try_reserve_exact(cells).is_err() {
+        // Snapshot the §5.11.29 / §5.11.28 compound / inter-intra
+        // side-data grids the §5.11.23 inter cascade stamped, so the
+        // frame walk dispatches a decoded compound (AVERAGE / DISTANCE /
+        // WEDGE / DIFFWTD) or inter-intra leaf through the matching
+        // §7.11.3 arm instead of driving it translationally. Each is
+        // read only at the matching leaf-origin cell; the stamped values
+        // collapse to the §5.11.29 / §5.11.28 short-circuit defaults on
+        // single-ref / intra cells the walk never reads.
+        let mut compound_types_snap: Vec<u8> = Vec::new();
+        let mut compound_wedge_indices_snap: Vec<u8> = Vec::new();
+        let mut compound_wedge_signs_snap: Vec<u8> = Vec::new();
+        let mut compound_mask_types_snap: Vec<u8> = Vec::new();
+        let mut interintra_modes_snap: Vec<u8> = Vec::new();
+        let mut wedge_interintras_snap: Vec<u8> = Vec::new();
+        let mut interintra_wedge_indices_snap: Vec<u8> = Vec::new();
+        if compound_types_snap.try_reserve_exact(cells).is_err()
+            || compound_wedge_indices_snap
+                .try_reserve_exact(cells)
+                .is_err()
+            || compound_wedge_signs_snap.try_reserve_exact(cells).is_err()
+            || compound_mask_types_snap.try_reserve_exact(cells).is_err()
+            || interintra_modes_snap.try_reserve_exact(cells).is_err()
+            || wedge_interintras_snap.try_reserve_exact(cells).is_err()
+            || interintra_wedge_indices_snap
+                .try_reserve_exact(cells)
+                .is_err()
+        {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
-        zero_cells.resize(cells, 0);
-        // `order_hints_by_ref[ ref ]` for `ref` up to `ALTREF_FRAME`; the
-        // DISTANCE arm (compound-only) is the sole reader, so identity-zero
-        // suffices on the single-ref path. Length = `ALTREF_FRAME + 1`.
-        let order_hints_by_ref = [0i32; crate::uncompressed_header_tail::ALTREF_FRAME + 1];
+        compound_types_snap.extend_from_slice(&self.compound_types[..cells]);
+        compound_wedge_indices_snap.extend_from_slice(&self.compound_wedge_indices[..cells]);
+        compound_wedge_signs_snap.extend_from_slice(&self.compound_wedge_signs[..cells]);
+        compound_mask_types_snap.extend_from_slice(&self.compound_mask_types[..cells]);
+        interintra_modes_snap.extend_from_slice(&self.interintra_modes[..cells]);
+        wedge_interintras_snap.extend_from_slice(&self.wedge_interintras[..cells]);
+        interintra_wedge_indices_snap.extend_from_slice(&self.interintra_wedge_indices[..cells]);
 
         // Mirror each plane's `i32` `curr_frame` buffer to `u16`,
         // allocating the plane if the residual merge has not yet touched it
@@ -17437,16 +17639,16 @@ impl PartitionWalker {
                 ref_frames: &ref_frames_snap,
                 mvs: &mvs_snap,
                 interp_filters: &interp_filters_snap,
-                compound_types: &zero_cells,
-                wedge_indices: &zero_cells,
-                wedge_signs: &zero_cells,
-                mask_types: &zero_cells,
-                interintra_modes: &zero_cells,
-                wedge_interintras: &zero_cells,
-                interintra_wedge_indices: &zero_cells,
-                order_hint_bits: 0,
-                current_order_hint: 0,
-                order_hints_by_ref: &order_hints_by_ref,
+                compound_types: &compound_types_snap,
+                wedge_indices: &compound_wedge_indices_snap,
+                wedge_signs: &compound_wedge_signs_snap,
+                mask_types: &compound_mask_types_snap,
+                interintra_modes: &interintra_modes_snap,
+                wedge_interintras: &wedge_interintras_snap,
+                interintra_wedge_indices: &interintra_wedge_indices_snap,
+                order_hint_bits: order_hints.order_hint_bits,
+                current_order_hint: order_hints.current_order_hint,
+                order_hints_by_ref: &order_hints.order_hints_by_ref,
                 mi_rows,
                 mi_cols,
                 bit_depth,
@@ -17573,6 +17775,71 @@ impl PartitionWalker {
     #[must_use]
     pub fn cdef_idx(&self) -> &[i8] {
         &self.cdef_idx
+    }
+
+    /// View of the §5.11.27 `motion_modes[]` grid after the walk —
+    /// `motion_modes()[ r * MiCols + c ]`. Cells no inter leaf covered
+    /// carry [`MOTION_MODE_SIMPLE`] (`0`). See the field docs.
+    #[must_use]
+    pub fn motion_modes(&self) -> &[u8] {
+        &self.motion_modes
+    }
+
+    /// View of the §5.11.29 `compound_types[]` grid after the walk —
+    /// `compound_types()[ r * MiCols + c ]`. Cells no inter leaf
+    /// covered carry [`COMPOUND_AVERAGE`]. See the field docs.
+    #[must_use]
+    pub fn compound_types(&self) -> &[u8] {
+        &self.compound_types
+    }
+
+    /// View of the §5.11.29 compound `wedge_index` grid after the walk —
+    /// `compound_wedge_indices()[ r * MiCols + c ]`. Read only at a
+    /// [`COMPOUND_WEDGE`] leaf's origin. See the field docs.
+    #[must_use]
+    pub fn compound_wedge_indices(&self) -> &[u8] {
+        &self.compound_wedge_indices
+    }
+
+    /// View of the §5.11.29 compound `wedge_sign` grid after the walk —
+    /// `compound_wedge_signs()[ r * MiCols + c ]`. Read only at a
+    /// [`COMPOUND_WEDGE`] leaf's origin. See the field docs.
+    #[must_use]
+    pub fn compound_wedge_signs(&self) -> &[u8] {
+        &self.compound_wedge_signs
+    }
+
+    /// View of the §5.11.29 compound `mask_type` grid after the walk —
+    /// `compound_mask_types()[ r * MiCols + c ]`. Read only at a
+    /// [`COMPOUND_DIFFWTD`] leaf's origin. See the field docs.
+    #[must_use]
+    pub fn compound_mask_types(&self) -> &[u8] {
+        &self.compound_mask_types
+    }
+
+    /// View of the §5.11.28 `interintra_mode` grid after the walk —
+    /// `interintra_modes()[ r * MiCols + c ]`. Read only at an
+    /// inter-intra leaf's origin. See the field docs.
+    #[must_use]
+    pub fn interintra_modes(&self) -> &[u8] {
+        &self.interintra_modes
+    }
+
+    /// View of the §5.11.28 `wedge_interintra` grid after the walk —
+    /// `wedge_interintras()[ r * MiCols + c ]`. Read only at an
+    /// inter-intra leaf's origin. See the field docs.
+    #[must_use]
+    pub fn wedge_interintras(&self) -> &[u8] {
+        &self.wedge_interintras
+    }
+
+    /// View of the §5.11.28 inter-intra `wedge_index` grid after the
+    /// walk — `interintra_wedge_indices()[ r * MiCols + c ]`. Read only
+    /// at an inter-intra leaf's origin whose `wedge_interintras` cell is
+    /// `1`. See the field docs.
+    #[must_use]
+    pub fn interintra_wedge_indices(&self) -> &[u8] {
+        &self.interintra_wedge_indices
     }
 
     /// `clear_cdef( r, c )` per §5.11.55 (av1-spec p.104) — re-stamps
@@ -23713,6 +23980,47 @@ impl PartitionWalker {
                 let cell = (rr * self.mi_cols + cc) as usize;
                 self.interp_filters[cell * 2] = interp_filter.interp_filter[0];
                 self.interp_filters[cell * 2 + 1] = interp_filter.interp_filter[1];
+            }
+        }
+
+        // §5.11.27 / §5.11.28 / §5.11.29 side-data grid stamp: write the
+        // already-resolved `motion_mode` / inter-intra blend triple /
+        // compound combine descriptor over the block's `bh4 * bw4`
+        // footprint so the §5.11.33 frame walk
+        // ([`Self::reconstruct_inter_frame_into_curr_frame`]) can read
+        // each leaf's origin cell back out and dispatch the compound /
+        // inter-intra / warped arms automatically (the single-ref
+        // translational arm already reads `ref_frames` / `mvs` /
+        // `interp_filters`). The `Option` per-symbol fields collapse to
+        // the pre-fill default on their closed arms (`None` ⇒ `0`),
+        // which the §5.11.33 walk's leaf-gate never reads on a cell
+        // whose `compound_type` / `RefFrame[1]` selects a different arm.
+        let comp_type = compound_type.compound_type;
+        let comp_wedge_index = compound_type.wedge_index.unwrap_or(0);
+        let comp_wedge_sign = compound_type.wedge_sign.unwrap_or(0);
+        let comp_mask_type = compound_type.mask_type.unwrap_or(0);
+        let ii_mode = interintra.interintra_mode.unwrap_or(0);
+        let ii_wedge = interintra.wedge_interintra.unwrap_or(0);
+        let ii_wedge_index = interintra.wedge_index.unwrap_or(0);
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                let cell = (rr * self.mi_cols + cc) as usize;
+                self.motion_modes[cell] = motion_mode;
+                self.compound_types[cell] = comp_type;
+                self.compound_wedge_indices[cell] = comp_wedge_index;
+                self.compound_wedge_signs[cell] = comp_wedge_sign;
+                self.compound_mask_types[cell] = comp_mask_type;
+                self.interintra_modes[cell] = ii_mode;
+                self.wedge_interintras[cell] = ii_wedge;
+                self.interintra_wedge_indices[cell] = ii_wedge_index;
             }
         }
 
@@ -49109,6 +49417,115 @@ mod tests {
         assert!(
             r1 == -1 || (1..=7).contains(&(r1 as i32)),
             "RefFrame[1] must be NONE or a valid inter ref, got {r1}"
+        );
+    }
+
+    /// r359 §5.11.27 / §5.11.28 / §5.11.29 side-data grid stamp: after
+    /// `decode_inter_block_mode_info` returns, the `motion_modes` /
+    /// `compound_types` / inter-intra grids must carry the returned
+    /// `DecodedInterBlockModeInfo`'s already-resolved values over the
+    /// block's `bh4 * bw4` footprint, so the §5.11.33 frame walk can
+    /// read them back out per leaf-origin. The `!is_motion_mode_
+    /// switchable` / `!enable_interintra_compound` short-circuit arms
+    /// here resolve to `motion_mode == SIMPLE` and `interintra == 0`,
+    /// and the compound type to one of the §5.11.29 short-circuit
+    /// defaults — every grid cell of the footprint must match the
+    /// readout exactly (and cells outside it stay at their pre-fill).
+    #[test]
+    fn decode_inter_block_mode_info_stamps_side_data_grids() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+        let sub_size = BLOCK_8X8;
+        let info = walker
+            .decode_inter_block_mode_info(
+                &mut dec,
+                &mut cdfs,
+                0,
+                0,
+                sub_size,
+                0,
+                false,
+                false,
+                [0, -1],
+                [0, -1],
+                true,
+                true,
+                true,
+                true,
+                [0, -1],
+                false,
+                0,
+                false,
+                false,
+                /* reference_select = */ true,
+                /* gm_type = */ [GM_TYPE_IDENTITY; 8],
+                /* gm_params = */ identity_gm_params(),
+                /* ref_frame_sign_bias = */ [0; 8],
+                /* allow_high_precision_mv = */ false,
+                /* force_integer_mv = */ false,
+                /* use_ref_frame_mvs = */ false,
+                /* is_motion_mode_switchable = */ false,
+                /* allow_warped_motion = */ false,
+                /* is_scaled_per_ref = */ [false; 7],
+                /* enable_interintra_compound = */ false,
+                /* enable_masked_compound = */ false,
+                /* enable_jnt_comp = */ false,
+                /* dist_equal = */ false,
+                /* interpolation_filter = */ 0,
+                /* enable_dual_filter = */ false,
+                &mfmvs,
+            )
+            .expect("inter cascade short-circuits to SIMPLE/no-interintra");
+
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        let mi_cols = walker.mi_cols();
+        // Footprint cells carry the readout values.
+        for dr in 0..bh4 {
+            for dc in 0..bw4 {
+                let cell = ((dr * mi_cols) + dc) as usize;
+                assert_eq!(
+                    walker.motion_modes()[cell],
+                    info.motion_mode,
+                    "motion_modes[{dr}][{dc}] must equal the decoded motion_mode"
+                );
+                assert_eq!(
+                    walker.compound_types()[cell],
+                    info.compound_type.compound_type,
+                    "compound_types[{dr}][{dc}] must equal the decoded compound_type"
+                );
+                assert_eq!(
+                    walker.interintra_modes()[cell],
+                    info.interintra.interintra_mode.unwrap_or(0),
+                    "interintra_modes[{dr}][{dc}] must equal the decoded interintra_mode (0 default)"
+                );
+                assert_eq!(
+                    walker.wedge_interintras()[cell],
+                    info.interintra.wedge_interintra.unwrap_or(0),
+                    "wedge_interintras[{dr}][{dc}] must match the readout"
+                );
+            }
+        }
+        // A cell well outside the footprint keeps its pre-fill default.
+        let outside = ((10 * mi_cols) + 10) as usize;
+        assert_eq!(
+            walker.motion_modes()[outside],
+            MOTION_MODE_SIMPLE,
+            "out-of-footprint cell keeps the MOTION_MODE_SIMPLE pre-fill"
+        );
+        assert_eq!(
+            walker.compound_types()[outside],
+            crate::inter_pred::COMPOUND_AVERAGE,
+            "out-of-footprint cell keeps the COMPOUND_AVERAGE pre-fill"
         );
     }
 
