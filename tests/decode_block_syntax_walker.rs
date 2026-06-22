@@ -3685,6 +3685,24 @@ fn force_cdf_symbol_zero<const N1: usize>() -> [u16; N1] {
     row
 }
 
+/// Helper: force an `N`-symbol CDF (length `N + 1`, last slot = adapt
+/// count) to deterministically decode symbol `k` (in `0..N`). The
+/// §8.2.6 search walks `i = 0, 1, …` and breaks at the first `i` whose
+/// cumulative `cur` falls at/below `SymbolValue`. Setting `cdf[i] = 0`
+/// for `i < k` (so the early entries never break) and `cdf[i] = 1 <<
+/// 15` for `i >= k` (so entry `k` collapses to the `EC_MIN_PROB` tail
+/// and becomes the break point) selects symbol `k` regardless of the
+/// arithmetic state. `k == 0` reduces to [`force_cdf_symbol_zero`].
+fn force_cdf_symbol_value<const N1: usize>(k: usize) -> [u16; N1] {
+    let mut row = [0u16; N1];
+    for slot in row.iter_mut().take(N1 - 1).skip(k) {
+        *slot = 1u16 << 15;
+    }
+    // Last slot is the §8.3 adaptation counter, initialised to 0.
+    row[N1 - 1] = 0;
+    row
+}
+
 /// r302 wire-up: `decode_block_syntax(frame_is_intra = false,
 /// Some(&ctx))` surfaces the §5.11.33 `IsInterIntra` verdict on the
 /// returned [`DecodedBlock`]. This test rigs the §5.11.28
@@ -3784,6 +3802,159 @@ fn r302_decode_block_syntax_inter_intra_block_surfaces_is_inter_intra_flag() {
     assert!(
         db.is_inter_intra,
         "RefFrame[1] = INTRA_FRAME && is_inter ⇒ IsInterIntra == true (surfaced on DecodedBlock)"
+    );
+}
+
+/// r359 helper: decode one `BLOCK_8X8` inter-intra leaf from the
+/// bitstream with `interintra_mode` rigged to `ii_mode`, then run the
+/// §5.11.33 frame-walk bridge against a constant reference plane
+/// `ref_fill` and return the reconstructed 8×8 luma window. The §7.4
+/// decode order runs `predict_intra` before `predict_inter` on an
+/// inter-intra leaf, leaving the intra half in `CurrFrame[plane]`; here
+/// the §5.11.11 skip = 1 fixture writes no residual and the bridge's
+/// lazy `ensure_curr_frame_plane` allocation leaves `CurrFrame[0]` at
+/// the natural zero pre-fill, so the §7.11.3.14 intra half is the flat
+/// constant `0` and the blend runs between `0` (intra) and `ref_fill`
+/// (inter MC). The bridge dispatches the inter-intra arm purely from
+/// the per-cell side-data grids the §5.11.23 cascade stamped, so the
+/// returned pixels depend on `ii_mode` ONLY through the stamped
+/// `interintra_modes` grid.
+fn decode_inter_intra_then_frame_walk(ii_mode: usize, ref_fill: u16) -> Vec<u16> {
+    use oxideav_av1::{PlaneRefSpec, RefFrameStoreEntry};
+
+    let mut walker = walker_n(2);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    cdfs.skip = [force_binary_cdf(1); SKIP_CONTEXTS];
+
+    // §5.11.28 CDF rigging: open the `interintra` gate, select
+    // `interintra_mode = ii_mode`, and close `wedge_interintra` (no
+    // wedge-index read) so the leaf takes the §7.11.3.13 smooth
+    // intra-variant mask path keyed by `interintra_mode`.
+    let ii_ctx = interintra_ctx(BLOCK_8X8).expect("BLOCK_8X8 is in the §5.11.28 band");
+    cdfs.inter_intra[ii_ctx] = force_binary_cdf(1);
+    cdfs.inter_intra_mode[ii_ctx] = force_cdf_symbol_value::<{ INTERINTRA_MODES + 1 }>(ii_mode);
+    cdfs.wedge_inter_intra[BLOCK_8X8] = force_binary_cdf(0);
+
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+    let mut ctx = InterFrameContext::identity_default(&mfmvs);
+    ctx.seg_globalmv_active = true;
+    ctx.enable_interintra_compound = true;
+
+    let db = walker
+        .decode_block_syntax(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_8X8,
+            /* frame_is_intra = */ false,
+            0,
+            0,
+            3,
+            false,
+            false,
+            false,
+            0,
+            &lossless,
+            false,
+            true,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            8,
+            false,
+            /* inter_ctx = */ Some(&ctx),
+            /* quant = */ &oxideav_av1::QuantizerParams::neutral(0, 8),
+            /* reduced_tx_set = */ false,
+        )
+        .expect("§5.11.28 inner arm + §5.11.33 inter-intra gate must run to completion");
+    assert!(db.is_inter_intra, "fixture must decode an inter-intra leaf");
+
+    // The §5.11.28 inner arm stamped the chosen mode over the footprint.
+    assert_eq!(
+        walker.interintra_modes()[0],
+        ii_mode as u8,
+        "interintra_modes grid must carry the decoded mode at the leaf origin"
+    );
+
+    // §7.11.3.3 reference plane — flat constant, distinct from the intra
+    // half (zero) so the blend lands strictly between the two on the
+    // non-trivial mask cells.
+    let (rows, cols) = (8u32, 8u32);
+    let refp = vec![ref_fill; (rows * cols) as usize];
+    let entry = RefFrameStoreEntry {
+        plane: &refp[..],
+        stride: cols as usize,
+        upscaled_width: cols,
+        width: cols,
+        height: rows,
+    };
+    let store = [entry, entry, entry, entry, entry, entry, entry];
+    let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
+    let ref_spec = PlaneRefSpec {
+        plane: 0,
+        subsampling_x: 0,
+        subsampling_y: 0,
+        frame_store: &store,
+        frame_width: cols,
+        frame_height: rows,
+    };
+
+    walker
+        .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
+        .expect("frame-scope inter-intra reconstruction from the decoded grids");
+
+    walker
+        .curr_frame(0)
+        .unwrap()
+        .iter()
+        .map(|&s| s as u16)
+        .collect()
+}
+
+/// r359 end-to-end: the §5.11.33 frame-walk bridge dispatches a real
+/// inter-intra leaf decoded from the bitstream through the §7.11.3.14
+/// blend using the per-cell side-data grids the §5.11.23 cascade now
+/// stamps — NOT the zero-filled slices the bridge previously fed.
+///
+/// Decisive check: II_DC_PRED (mode 0) and II_V_PRED (mode 1) select
+/// different §7.11.3.13 intra-variant masks, so blending the same
+/// constant intra half against the same constant reference MC yields
+/// DIFFERENT pixels. Before r359 the bridge zero-filled the
+/// `interintra_modes` grid, so every inter-intra leaf was forced to
+/// II_DC_PRED regardless of the decoded mode; the two reconstructions
+/// would then be identical. They must now differ, proving the bridge
+/// reads the stamped mode.
+#[test]
+fn r359_frame_walk_inter_intra_dispatches_from_stamped_mode_grid() {
+    let ref_fill = 200u16;
+    let dc = decode_inter_intra_then_frame_walk(0, ref_fill);
+    let vp = decode_inter_intra_then_frame_walk(1, ref_fill);
+
+    // Both are §7.11.3.14 blends bounded by the two flat inputs (intra
+    // half = 0, inter MC = 200).
+    for (&d, &v) in dc.iter().zip(vp.iter()) {
+        assert!(
+            d <= 200 && v <= 200,
+            "each blended sample lies between the intra (0) and inter (200) constants"
+        );
+    }
+    // The mask differs by mode, so at least one sample diverges.
+    assert_ne!(
+        dc, vp,
+        "II_DC vs II_V select different §7.11.3.13 masks ⇒ the frame walk \
+         must produce different pixels, proving it read the stamped mode grid"
     );
 }
 
