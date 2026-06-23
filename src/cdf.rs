@@ -15177,6 +15177,15 @@ pub struct PartitionWalker {
     /// `Intra_Mode_Context[ DC_PRED ] = 0` weight as an unavailable
     /// neighbour.
     y_modes: Vec<u8>,
+    /// `UVModes[ row ][ col ]` packed into a row-major `mi_rows *
+    /// mi_cols` flat buffer (av1-spec §5.11.22 line 7 `UVModes[ r + y ][
+    /// c + x ] = UVMode`). Entries are `0` (= `DC_PRED`) for cells no
+    /// §5.11.22 chroma read has touched and the block's `UVMode`
+    /// (`0..UV_INTRA_MODES_CFL_ALLOWED`, including `UV_CFL_PRED = 13`)
+    /// for cells in a decoded block's `bh4 * bw4` footprint. Consulted
+    /// by the §7.11.2.8 chroma `get_filter_type( plane )` neighbour
+    /// smooth-mode check (the chroma counterpart of [`Self::y_modes`]).
+    uv_modes: Vec<u8>,
     /// `TxSizes[ row ][ col ]` packed into a row-major `mi_rows *
     /// mi_cols` flat buffer (av1-spec §5.11.5 / §5.11.16 — the
     /// per-block §5.11.5 grid-fill writes `TxSizes[ r + y ][ c + x ] =
@@ -15709,6 +15718,13 @@ impl PartitionWalker {
         let mut y_modes: Vec<u8> = Vec::new();
         y_modes.try_reserve_exact(area).ok()?;
         y_modes.resize(area, 0);
+        // §5.11.22 line 7: pre-fill `UVModes[]` with `DC_PRED == 0` (the
+        // §7.11.2.8 chroma `is_smooth` neighbour read treats a
+        // not-yet-decoded cell as non-smooth, matching the unavailable-
+        // neighbour fallback).
+        let mut uv_modes: Vec<u8> = Vec::new();
+        uv_modes.try_reserve_exact(area).ok()?;
+        uv_modes.resize(area, 0);
         // §5.11.16 / §5.11.5: pre-fill `TxSizes[]` and `InterTxSizes[]`
         // with `TX_4X4 = 0`. An unavailable neighbour contributes the
         // same `Tx_Width[ TX_4X4 ] = 4` / `Tx_Height[ TX_4X4 ] = 4`
@@ -15857,6 +15873,7 @@ impl PartitionWalker {
             left_level_context,
             left_dc_context,
             y_modes,
+            uv_modes,
             tx_sizes,
             inter_tx_sizes,
             tx_types,
@@ -19042,6 +19059,18 @@ impl PartitionWalker {
         &self.y_modes
     }
 
+    /// View of the §5.11.22 `UVModes[]` grid after the walk. Indexed
+    /// row-major: `uv_modes()[ r * MiCols + c ]`. Cells that no chroma
+    /// read covered carry `0` (= `DC_PRED`); cells in a decoded
+    /// has-chroma block's `bh4 * bw4` footprint carry the block's
+    /// `UVMode` (in `0..UV_INTRA_MODES_CFL_ALLOWED`, including
+    /// `UV_CFL_PRED = 13`). Consulted by the §7.11.2.8 chroma
+    /// `get_filter_type` neighbour smooth-mode check.
+    #[must_use]
+    pub fn uv_modes(&self) -> &[u8] {
+        &self.uv_modes
+    }
+
     /// Helper to read `YModes[ r ][ c ]` for the §8.3.2
     /// `intra_frame_y_mode` neighbour-lookup. Returns `0`
     /// (= `DC_PRED`) for out-of-grid coordinates, matching the
@@ -19069,6 +19098,23 @@ impl PartitionWalker {
         self.y_modes[(r * self.mi_cols + c) as usize]
     }
 
+    /// Helper to read `UVModes[ r ][ c ]` for the §7.11.2.8 chroma
+    /// `is_smooth` neighbour-lookup. Returns `0` (= `DC_PRED`) for
+    /// out-of-grid coordinates and for cells no §5.11.22 chroma read
+    /// has stamped (the constructor pre-fill), matching the spec's
+    /// unavailable-neighbour / non-smooth fallback.
+    #[inline]
+    fn uv_mode_at(&self, r: i32, c: i32) -> u8 {
+        if r < 0 || c < 0 {
+            return 0;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        self.uv_modes[(r * self.mi_cols + c) as usize]
+    }
+
     /// `get_filter_type( plane )` per §7.11.2.8 (av1-spec p.252) — the
     /// `filterType` input to the §7.11.2.9 intra edge filter strength
     /// selection and the §7.11.2.10 intra edge upsample selection.
@@ -19080,30 +19126,72 @@ impl PartitionWalker {
     /// coordinates; `avail_u` / `avail_l` are the §5.11.5 `AvailU` /
     /// `AvailL` (for `plane == 0`) or `AvailUChroma` / `AvailLChroma`
     /// (for `plane > 0`) availability flags the caller already derived.
+    /// `subsampling_x` / `subsampling_y` (0 / 1) drive the §7.11.2.8
+    /// chroma neighbour-coordinate adjustment.
     ///
-    /// The neighbour smooth-mode reads consult the §6.10.4 `YModes[]`
-    /// grid for the luma plane. The spec's chroma branch reads
-    /// `UVModes[]`; the walker does not yet stamp a `UVModes[]` grid, so
-    /// this helper is invoked with `plane == 0` only (the §7.11.2.4
-    /// step-4 luma directional pre-pass). The chroma directional path
-    /// stays on the un-filtered edges until the `UVModes[]` grid lands.
-    /// The spec's `is_smooth` also gates on `RefFrames[row][col][0] >
-    /// INTRA_FRAME` returning `0`; on the luma keyframe path every
-    /// neighbour is intra so the gate never fires, but we still honour
-    /// it via [`Self::ref_frame_at`] for the inter-frame intra-block
-    /// case.
-    fn get_filter_type(&self, mi_row: u32, mi_col: u32, avail_u: bool, avail_l: bool) -> u8 {
+    /// The luma branch (`plane == 0`) reads the §6.10.4 `YModes[]` grid
+    /// at `(MiRow - 1, MiCol)` / `(MiRow, MiCol - 1)`. The chroma branch
+    /// (`plane > 0`) reads `UVModes[]` at the §7.11.2.8 sub-sampled
+    /// neighbour coordinates: `c++` if `subsampling_x && !(MiCol & 1)` /
+    /// `r--` if `subsampling_y && (MiRow & 1)` for the above neighbour,
+    /// and `c--` if `subsampling_x && (MiCol & 1)` / `r++` if
+    /// `subsampling_y && !(MiRow & 1)` for the left neighbour. `is_smooth`
+    /// also gates on `RefFrames[row][col][0] > INTRA_FRAME` returning
+    /// `0` (an inter neighbour is never smooth) via
+    /// [`Self::ref_frame_at`].
+    #[allow(clippy::too_many_arguments)]
+    fn get_filter_type(
+        &self,
+        plane: u8,
+        mi_row: u32,
+        mi_col: u32,
+        avail_u: bool,
+        avail_l: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) -> u8 {
         let is_smooth = |r: i32, c: i32| -> bool {
-            // §7.11.2.8 `is_smooth`: inter neighbours are never smooth
-            // for the luma-plane lookup (RefFrame[0] > INTRA_FRAME == 0).
+            // §7.11.2.8 `is_smooth`: an inter neighbour
+            // (`RefFrame[0] > INTRA_FRAME`) is never smooth.
             if self.ref_frame_at(r, c, 0) > 0 {
                 return false;
             }
-            let mode = self.y_mode_at(r, c) as usize;
+            let mode = if plane == 0 {
+                self.y_mode_at(r, c) as usize
+            } else {
+                self.uv_mode_at(r, c) as usize
+            };
             mode == SMOOTH_PRED || mode == SMOOTH_V_PRED || mode == SMOOTH_H_PRED
         };
-        let above_smooth = avail_u && is_smooth(mi_row as i32 - 1, mi_col as i32);
-        let left_smooth = avail_l && is_smooth(mi_row as i32, mi_col as i32 - 1);
+        let sx = subsampling_x != 0;
+        let sy = subsampling_y != 0;
+
+        // §7.11.2.8 above-neighbour coordinates.
+        let mut ar = mi_row as i32 - 1;
+        let mut ac = mi_col as i32;
+        if plane > 0 {
+            if sx && (mi_col & 1) == 0 {
+                ac += 1;
+            }
+            if sy && (mi_row & 1) == 1 {
+                ar -= 1;
+            }
+        }
+        let above_smooth = avail_u && is_smooth(ar, ac);
+
+        // §7.11.2.8 left-neighbour coordinates.
+        let mut lr = mi_row as i32;
+        let mut lc = mi_col as i32 - 1;
+        if plane > 0 {
+            if sx && (mi_col & 1) == 1 {
+                lc -= 1;
+            }
+            if sy && (mi_row & 1) == 0 {
+                lr += 1;
+            }
+        }
+        let left_smooth = avail_l && is_smooth(lr, lc);
+
         u8::from(above_smooth || left_smooth)
     }
 
@@ -23158,6 +23246,26 @@ impl PartitionWalker {
                 "S() over Default_Uv_Mode_*_Cdf yields 0..width"
             );
             uv_mode_out = Some(uv_mode);
+
+            // §5.11.22 line 7: `UVModes[ r + y ][ c + x ] = UVMode` over
+            // the block's `bh4 * bw4` mi footprint (mirrors the §5.11.22
+            // `YModes[]` stamp). Feeds the §7.11.2.8 chroma
+            // `get_filter_type( plane )` neighbour smooth-mode check.
+            let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+            let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+            for dr in 0..bh4 {
+                let rr = mi_row + dr;
+                if rr >= self.mi_rows {
+                    break;
+                }
+                for dc in 0..bw4 {
+                    let cc = mi_col + dc;
+                    if cc >= self.mi_cols {
+                        break;
+                    }
+                    self.uv_modes[(rr * self.mi_cols + cc) as usize] = uv_mode;
+                }
+            }
 
             // §5.11.22 line 8: `if ( UVMode == UV_CFL_PRED )
             // read_cfl_alphas( )`. UV_CFL_PRED = 13 per §3.
@@ -29641,23 +29749,27 @@ impl PartitionWalker {
             // §7.11.2.4 step-4 inputs: `enable_intra_edge_filter` is
             // frame-scope (cached on `ctx`); `filterType` is the
             // §7.11.2.8 `get_filter_type( plane )` neighbour smooth-mode
-            // check. The walker stamps only the §6.10.4 `YModes[]` grid
-            // (no `UVModes[]` yet), so the chroma directional path can
-            // not yet derive a correct `filterType` — it stays on the
-            // un-filtered, un-upsampled edges (`enable = false`) until a
-            // `UVModes[]` grid lands. The luma path derives `filterType`
-            // exactly from the §7.11.2.8 `AvailU ? YModes[ MiRow - 1 ][
-            // MiCol ] : ...` / `AvailL ? YModes[ MiRow ][ MiCol - 1 ] :
-            // ...` neighbour reads (block-level availability, not the
-            // `|| x > 0` chunk-extended `haveAbove` / `haveLeft`).
-            let (eief, filter_type) = if plane == 0 {
-                (
-                    ctx.enable_intra_edge_filter,
-                    self.get_filter_type(mi_row, mi_col, ctx.avail_u, ctx.avail_l),
-                )
+            // check. Both planes are now covered: luma reads the §6.10.4
+            // `YModes[]` grid, chroma reads `UVModes[]` at the §7.11.2.8
+            // sub-sampled neighbour coordinates. The §7.11.2.8 lookup
+            // uses block-level availability (`AvailU` / `AvailL` for
+            // luma, `AvailUChroma` / `AvailLChroma` for chroma), not the
+            // `|| x > 0` chunk-extended `haveAbove` / `haveLeft`.
+            let (avail_u_block, avail_l_block) = if plane == 0 {
+                (ctx.avail_u, ctx.avail_l)
             } else {
-                (false, 0)
+                (ctx.avail_u_chroma, ctx.avail_l_chroma)
             };
+            let filter_type = self.get_filter_type(
+                plane,
+                mi_row,
+                mi_col,
+                avail_u_block,
+                avail_l_block,
+                sub_x,
+                sub_y,
+            );
+            let eief = ctx.enable_intra_edge_filter;
             self.predict_intra_into_curr_frame(
                 plane,
                 start_x,
@@ -56843,8 +56955,10 @@ mod tests {
 
     /// §7.11.2.8 `get_filter_type( plane )` — returns 1 iff the block
     /// immediately above OR to the left uses a smooth intra mode. Stamp
-    /// `SMOOTH_PRED` into the above-neighbour `YModes[]` cell and assert
-    /// the helper flips from 0 (no smooth neighbour) to 1.
+    /// `SMOOTH_PRED` into the above-neighbour `YModes[]` (luma) /
+    /// `UVModes[]` (chroma) cell and assert the helper flips from 0 (no
+    /// smooth neighbour) to 1, including the §7.11.2.8 chroma
+    /// sub-sampled neighbour-coordinate adjustment.
     #[test]
     fn get_filter_type_detects_smooth_neighbour() {
         let geom = TileGeometry {
@@ -56854,11 +56968,11 @@ mod tests {
             mi_col_end: 4,
         };
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
-        // Block at (MiRow = 1, MiCol = 1). Above neighbour is (0, 1),
-        // left neighbour is (1, 0). Both default to DC_PRED (= 0), so
-        // get_filter_type is 0 even with avail flags set.
+        // Luma block at (MiRow = 1, MiCol = 1). Above neighbour is
+        // (0, 1), left neighbour is (1, 0). Both default to DC_PRED
+        // (= 0), so get_filter_type is 0 even with avail flags set.
         assert_eq!(
-            walker.get_filter_type(1, 1, /* avail_u */ true, /* avail_l */ true),
+            walker.get_filter_type(0, 1, 1, /* avail_u */ true, /* avail_l */ true, 0, 0),
             0,
             "DC_PRED neighbours ⇒ filterType 0",
         );
@@ -56868,15 +56982,15 @@ mod tests {
         let left_cell = 4usize; // (1, 0) ⇒ 1 * mi_cols + 0
         walker.y_modes[above_cell] = SMOOTH_PRED as u8;
         assert_eq!(
-            walker.get_filter_type(1, 1, true, true),
+            walker.get_filter_type(0, 1, 1, true, true, 0, 0),
             1,
-            "smooth above neighbour ⇒ filterType 1",
+            "smooth above luma neighbour ⇒ filterType 1",
         );
         // When AvailU is false the above neighbour is ignored even
         // though its grid cell is smooth — get_filter_type falls back
         // to the (DC_PRED) left neighbour ⇒ 0.
         assert_eq!(
-            walker.get_filter_type(1, 1, /* avail_u */ false, /* avail_l */ true),
+            walker.get_filter_type(0, 1, 1, /* avail_u */ false, /* avail_l */ true, 0, 0),
             0,
             "AvailU == 0 masks the smooth above neighbour",
         );
@@ -56884,9 +56998,37 @@ mod tests {
         walker.y_modes[above_cell] = DC_PRED as u8;
         walker.y_modes[left_cell] = SMOOTH_H_PRED as u8;
         assert_eq!(
-            walker.get_filter_type(1, 1, true, true),
+            walker.get_filter_type(0, 1, 1, true, true, 0, 0),
             1,
-            "smooth left neighbour ⇒ filterType 1",
+            "smooth left luma neighbour ⇒ filterType 1",
+        );
+
+        // Chroma (`plane == 1`) reads UVModes[] at the §7.11.2.8
+        // sub-sampled coordinates. For block (MiRow = 2, MiCol = 2) with
+        // 4:2:0 (subX = subY = 1): above neighbour `r = MiRow - 1 = 1`,
+        // `c = MiCol = 2`; `subX && !(MiCol & 1)` is true (MiCol 2 even)
+        // so `c++` ⇒ (1, 3). Stamp SMOOTH_V_PRED there and assert the
+        // chroma filterType flips to 1.
+        let mut walker2 = PartitionWalker::new(4, 4, geom).unwrap();
+        // No smooth UV neighbour yet.
+        assert_eq!(
+            walker2.get_filter_type(1, 2, 2, true, true, 1, 1),
+            0,
+            "chroma: no smooth UV neighbour ⇒ filterType 0",
+        );
+        // (1, 3) ⇒ 1 * mi_cols + 3 = 7.
+        walker2.uv_modes[7] = SMOOTH_V_PRED as u8;
+        assert_eq!(
+            walker2.get_filter_type(1, 2, 2, true, true, 1, 1),
+            1,
+            "chroma: sub-sampled above UV neighbour smooth ⇒ filterType 1",
+        );
+        // The luma lookup at the same coordinates reads YModes[] (still
+        // DC_PRED everywhere) ⇒ 0, proving the plane axis is honoured.
+        assert_eq!(
+            walker2.get_filter_type(0, 2, 2, true, true, 1, 1),
+            0,
+            "luma lookup ignores the stamped UVModes cell",
         );
     }
 

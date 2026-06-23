@@ -98,11 +98,12 @@ post passes). As of r363 the **directional** modes additionally run the
 intra edge upsample — applied to `AboveRow[]` / `LeftCol[]` before the
 directional kernel projects them, gated on the frame's
 `enable_intra_edge_filter` and the §7.11.2.8 `get_filter_type`
-neighbour smooth-mode check (luma path spec-correct; the chroma
-directional path stays on the un-filtered edges until a `UVModes[]`
-grid is stamped). Filter-intra / CfL-AC / IntraBC and the lossy-quant
-post-pass chain remain follow-ups before this path produces validated
-bit-exact keyframe pixels.
+neighbour smooth-mode check. Both planes are covered: the luma check
+reads the §6.10.4 `YModes[]` grid; the chroma check reads the §5.11.22
+`UVModes[]` grid (now stamped per-block) at the §7.11.2.8 sub-sampled
+neighbour coordinates. Filter-intra / CfL-AC / IntraBC and the
+lossy-quant post-pass chain remain follow-ups before this path produces
+validated bit-exact keyframe pixels.
 
 The §5.11 walker now also reconstructs **inter pixels** at frame scope:
 the §5.11.18 → §5.11.23 → §5.11.31 inter-syntax cascade stamps each
