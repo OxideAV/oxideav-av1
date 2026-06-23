@@ -839,6 +839,7 @@ fn decode_tile_syntax_reconstructs_intra_tile_into_curr_frame() {
         bit_depth: 8,
         tx_mode_select: false,
         reduced_tx_set: false,
+        enable_intra_edge_filter: false,
     };
 
     let result = walker.decode_tile_syntax(
@@ -907,6 +908,7 @@ fn walk_flat_intra_16x16_tile() -> PartitionWalker {
         bit_depth: 8,
         tx_mode_select: false,
         reduced_tx_set: false,
+        enable_intra_edge_filter: false,
     };
     walker
         .decode_tile_syntax(&mut dec, &mut cdfs, &params, None, &quant, false)

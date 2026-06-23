@@ -13525,6 +13525,14 @@ pub struct ResidualContext {
     pub avail_l_chroma: bool,
     /// `AvailUChroma` per §5.11.5 — the chroma-plane `haveAbove` base.
     pub avail_u_chroma: bool,
+    /// `enable_intra_edge_filter` per §5.5.2 (sequence header). Gates
+    /// the §7.11.2.4 step-4 directional pre-pass: the §7.11.2.7 filter
+    /// corner, §7.11.2.9/§7.11.2.12 intra edge filter, and
+    /// §7.11.2.10/§7.11.2.11 intra edge upsample applied to `AboveRow[]`
+    /// / `LeftCol[]` before the directional kernel runs. When `false`
+    /// the directional prediction reads the unfiltered, un-upsampled
+    /// edges (`upsampleAbove = upsampleLeft = 0`, no filter).
+    pub enable_intra_edge_filter: bool,
 }
 
 impl ResidualContext {
@@ -13549,6 +13557,7 @@ impl ResidualContext {
             avail_u: false,
             avail_l_chroma: false,
             avail_u_chroma: false,
+            enable_intra_edge_filter: false,
         }
     }
 }
@@ -15027,6 +15036,15 @@ pub struct PartitionWalker {
     mi_rows: u32,
     mi_cols: u32,
     geometry: TileGeometry,
+    /// `enable_intra_edge_filter` per §5.5.2 (sequence header) — frame-
+    /// scope flag set at [`Self::decode_tile_syntax`] entry from
+    /// [`TileDecodeParams::enable_intra_edge_filter`]. Gates the
+    /// §7.11.2.4 step-4 directional intra pre-pass (filter corner +
+    /// intra edge filter + intra edge upsample) applied to `AboveRow[]`
+    /// / `LeftCol[]` before the directional kernel. Defaults to `false`
+    /// (the unfiltered/un-upsampled path) on a freshly constructed
+    /// walker.
+    enable_intra_edge_filter: bool,
     /// `MiSizes[ row ][ col ]` packed into a row-major `mi_rows *
     /// mi_cols` flat buffer. Entries are `BLOCK_INVALID` for
     /// not-yet-decoded cells and a `BLOCK_*` ordinal for decoded
@@ -15597,6 +15615,11 @@ pub struct TileDecodeParams<'a> {
     pub tx_mode_select: bool,
     /// `reduced_tx_set` per §5.9.21.
     pub reduced_tx_set: bool,
+    /// `enable_intra_edge_filter` per §5.5.2 — gates the §7.11.2.4
+    /// step-4 directional intra edge filter + upsample pre-pass.
+    /// Stored on the walker at [`PartitionWalker::decode_tile_syntax`]
+    /// entry and consulted by the §7.11.2.1 prediction write.
+    pub enable_intra_edge_filter: bool,
 }
 
 impl PartitionWalker {
@@ -15818,6 +15841,7 @@ impl PartitionWalker {
             mi_rows,
             mi_cols,
             geometry,
+            enable_intra_edge_filter: false,
             mi_sizes,
             skips,
             skip_modes,
@@ -16049,6 +16073,7 @@ impl PartitionWalker {
     /// past the right / bottom frame edge are clipped silently. Returns
     /// silently for `plane >= 3` or an out-of-range `mode`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn predict_intra_into_curr_frame(
         &mut self,
         plane: u8,
@@ -16064,6 +16089,13 @@ impl PartitionWalker {
         have_left: bool,
         have_above_right: bool,
         have_below_left: bool,
+        // §7.11.2.4 step-4 directional pre-pass inputs. `filter_type`
+        // is the §7.11.2.8 `get_filter_type( plane )` output the caller
+        // derived from the neighbour smooth-mode grids; it is only read
+        // when `enable_intra_edge_filter` is set and `mode` is one of
+        // the six directional D-modes.
+        enable_intra_edge_filter: bool,
+        filter_type: u8,
     ) {
         if (plane as usize) >= 3 || mode >= INTRA_MODES {
             return;
@@ -16125,9 +16157,13 @@ impl PartitionWalker {
         // Head-extended representation: index `-2` ⇒ offset 0, index
         // `-1` ⇒ offset 1, index `k >= 0` ⇒ offset `k + 2`. The
         // §7.11.2.4 directional kernel reads `above[ k + 2 ]`; offset 0
-        // is only consulted on the `upsampleAbove == 1` arm (not taken
-        // here), so seeding it with `corner` is safe.
-        let mut above_ext = vec![0u16; 2 + span];
+        // is consulted on the `upsampleAbove == 1` arm. The buffer is
+        // sized `2 * span + 2` so the §7.11.2.11 in-place 2x upsample
+        // (which needs `>= 2 * num_px + 2` cells, `num_px <= span`) has
+        // room. The un-upsampled directional / DC / smooth / PAETH
+        // arms only read offsets `1 .. span + 1`.
+        let ext_cap = 2 * span + 2;
+        let mut above_ext = vec![0u16; ext_cap];
         above_ext[0] = corner;
         above_ext[1] = corner;
         if !have_above && have_left {
@@ -16148,7 +16184,7 @@ impl PartitionWalker {
             }
         }
 
-        let mut left_ext = vec![0u16; 2 + span];
+        let mut left_ext = vec![0u16; ext_cap];
         left_ext[0] = corner;
         left_ext[1] = corner;
         if !have_left && have_above {
@@ -16166,6 +16202,62 @@ impl PartitionWalker {
                 max_y.min(start_y + (if have_below_left { 2 * h } else { h }) as u32 - 1);
             for (i, slot) in left_ext.iter_mut().skip(2).take(span).enumerate() {
                 *slot = read(left_limit.min(start_y + i as u32), start_x - 1);
+            }
+        }
+
+        // §7.11.2.4 step-4 directional pre-pass (filter corner + intra
+        // edge filter + intra edge upsample). Computes `upsampleAbove`
+        // / `upsampleLeft` (default `0`) and rewrites `above_ext` /
+        // `left_ext` in place. Only runs for the six directional
+        // D-modes (`D45_PRED..=D67_PRED`); the degenerate V_PRED /
+        // H_PRED (`pAngle == 90` / `180`) and the non-directional modes
+        // skip it. The walker derives `maxX` / `maxY` as the per-plane
+        // buffer extents (`max_x` / `max_y` above) — the spec's
+        // `( maxX - x + 1 )` / `( maxY - y + 1 )` numPx clamps map to
+        // those.
+        let mut upsample_above: u8 = 0;
+        let mut upsample_left: u8 = 0;
+        if (D45_PRED..=D67_PRED).contains(&mode) {
+            let p_angle = MODE_TO_ANGLE[mode] + angle_delta * ANGLE_STEP;
+            if enable_intra_edge_filter && p_angle != 90 && p_angle != 180 {
+                // §7.11.2.4 step-4 filter corner (only `90 < pAngle <
+                // 180 && w + h >= 24`). Replaces both `AboveRow[-1]` and
+                // `LeftCol[-1]` (offset 1 in both buffers).
+                if p_angle > 90 && p_angle < 180 && (w + h) >= 24 {
+                    let fc = filter_corner(left_ext[2], above_ext[1], above_ext[2]);
+                    above_ext[1] = fc;
+                    left_ext[1] = fc;
+                }
+                // §7.11.2.4 step-4 above-edge filter (haveAbove == 1).
+                if have_above {
+                    let strength =
+                        intra_edge_filter_strength_selection(w, h, filter_type, p_angle - 90);
+                    let num_px = (w.min((max_x - start_x + 1) as usize))
+                        + (if p_angle < 90 { h } else { 0 })
+                        + 1;
+                    let _ = intra_edge_filter(num_px, strength, &mut above_ext);
+                }
+                // §7.11.2.4 step-4 left-edge filter (haveLeft == 1).
+                if have_left {
+                    let strength =
+                        intra_edge_filter_strength_selection(w, h, filter_type, p_angle - 180);
+                    let num_px = (h.min((max_y - start_y + 1) as usize))
+                        + (if p_angle > 180 { w } else { 0 })
+                        + 1;
+                    let _ = intra_edge_filter(num_px, strength, &mut left_ext);
+                }
+                // §7.11.2.4 step-4 above-edge upsample selection + apply.
+                upsample_above = intra_edge_upsample_selection(w, h, filter_type, p_angle - 90);
+                if upsample_above == 1 {
+                    let num_px = w + (if p_angle < 90 { h } else { 0 });
+                    let _ = intra_edge_upsample(num_px, bit_depth, &mut above_ext);
+                }
+                // §7.11.2.4 step-4 left-edge upsample selection + apply.
+                upsample_left = intra_edge_upsample_selection(w, h, filter_type, p_angle - 180);
+                if upsample_left == 1 {
+                    let num_px = h + (if p_angle > 180 { w } else { 0 });
+                    let _ = intra_edge_upsample(num_px, bit_depth, &mut left_ext);
+                }
             }
         }
 
@@ -16189,10 +16281,18 @@ impl PartitionWalker {
             .is_ok(),
             V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred).is_ok(),
             H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred).is_ok(),
-            m if (D45_PRED..=D67_PRED).contains(&m) => {
-                predict_intra_d_mode(m, angle_delta, w, h, 0, 0, &above_ext, &left_ext, &mut pred)
-                    .is_ok()
-            }
+            m if (D45_PRED..=D67_PRED).contains(&m) => predict_intra_d_mode(
+                m,
+                angle_delta,
+                w,
+                h,
+                upsample_above,
+                upsample_left,
+                &above_ext,
+                &left_ext,
+                &mut pred,
+            )
+            .is_ok(),
             SMOOTH_PRED => {
                 predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred)
                     .is_ok()
@@ -18967,6 +19067,44 @@ impl PartitionWalker {
             return 0;
         }
         self.y_modes[(r * self.mi_cols + c) as usize]
+    }
+
+    /// `get_filter_type( plane )` per §7.11.2.8 (av1-spec p.252) — the
+    /// `filterType` input to the §7.11.2.9 intra edge filter strength
+    /// selection and the §7.11.2.10 intra edge upsample selection.
+    /// Returns `1` if the block immediately above OR immediately to the
+    /// left uses a smooth intra mode (`SMOOTH_PRED` / `SMOOTH_V_PRED` /
+    /// `SMOOTH_H_PRED`), else `0`.
+    ///
+    /// `mi_row` / `mi_col` are the current block's top-left mi-unit
+    /// coordinates; `avail_u` / `avail_l` are the §5.11.5 `AvailU` /
+    /// `AvailL` (for `plane == 0`) or `AvailUChroma` / `AvailLChroma`
+    /// (for `plane > 0`) availability flags the caller already derived.
+    ///
+    /// The neighbour smooth-mode reads consult the §6.10.4 `YModes[]`
+    /// grid for the luma plane. The spec's chroma branch reads
+    /// `UVModes[]`; the walker does not yet stamp a `UVModes[]` grid, so
+    /// this helper is invoked with `plane == 0` only (the §7.11.2.4
+    /// step-4 luma directional pre-pass). The chroma directional path
+    /// stays on the un-filtered edges until the `UVModes[]` grid lands.
+    /// The spec's `is_smooth` also gates on `RefFrames[row][col][0] >
+    /// INTRA_FRAME` returning `0`; on the luma keyframe path every
+    /// neighbour is intra so the gate never fires, but we still honour
+    /// it via [`Self::ref_frame_at`] for the inter-frame intra-block
+    /// case.
+    fn get_filter_type(&self, mi_row: u32, mi_col: u32, avail_u: bool, avail_l: bool) -> u8 {
+        let is_smooth = |r: i32, c: i32| -> bool {
+            // §7.11.2.8 `is_smooth`: inter neighbours are never smooth
+            // for the luma-plane lookup (RefFrame[0] > INTRA_FRAME == 0).
+            if self.ref_frame_at(r, c, 0) > 0 {
+                return false;
+            }
+            let mode = self.y_mode_at(r, c) as usize;
+            mode == SMOOTH_PRED || mode == SMOOTH_V_PRED || mode == SMOOTH_H_PRED
+        };
+        let above_smooth = avail_u && is_smooth(mi_row as i32 - 1, mi_col as i32);
+        let left_smooth = avail_l && is_smooth(mi_row as i32, mi_col as i32 - 1);
+        u8::from(above_smooth || left_smooth)
     }
 
     /// View of the §5.11.5 / §5.11.16 `TxSizes[]` grid after the walk.
@@ -27980,6 +28118,7 @@ impl PartitionWalker {
             avail_u,
             avail_l_chroma,
             avail_u_chroma,
+            enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
         let _residual = self.residual(
             decoder,
@@ -28253,6 +28392,7 @@ impl PartitionWalker {
             avail_u: false,
             avail_l_chroma: false,
             avail_u_chroma: false,
+            enable_intra_edge_filter: self.enable_intra_edge_filter,
         };
         let _residual = self.residual(
             decoder,
@@ -29498,6 +29638,26 @@ impl PartitionWalker {
             } else {
                 (ctx.uv_mode as usize, ctx.angle_delta_uv as i32)
             };
+            // §7.11.2.4 step-4 inputs: `enable_intra_edge_filter` is
+            // frame-scope (cached on `ctx`); `filterType` is the
+            // §7.11.2.8 `get_filter_type( plane )` neighbour smooth-mode
+            // check. The walker stamps only the §6.10.4 `YModes[]` grid
+            // (no `UVModes[]` yet), so the chroma directional path can
+            // not yet derive a correct `filterType` — it stays on the
+            // un-filtered, un-upsampled edges (`enable = false`) until a
+            // `UVModes[]` grid lands. The luma path derives `filterType`
+            // exactly from the §7.11.2.8 `AvailU ? YModes[ MiRow - 1 ][
+            // MiCol ] : ...` / `AvailL ? YModes[ MiRow ][ MiCol - 1 ] :
+            // ...` neighbour reads (block-level availability, not the
+            // `|| x > 0` chunk-extended `haveAbove` / `haveLeft`).
+            let (eief, filter_type) = if plane == 0 {
+                (
+                    ctx.enable_intra_edge_filter,
+                    self.get_filter_type(mi_row, mi_col, ctx.avail_u, ctx.avail_l),
+                )
+            } else {
+                (false, 0)
+            };
             self.predict_intra_into_curr_frame(
                 plane,
                 start_x,
@@ -29512,6 +29672,8 @@ impl PartitionWalker {
                 have_left,
                 have_above_right,
                 have_below_left,
+                eief,
+                filter_type,
             );
         }
 
@@ -30250,6 +30412,12 @@ impl PartitionWalker {
         if sb_size4 == 0 {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
+
+        // §5.5.2 `enable_intra_edge_filter` is frame-scope; cache it on
+        // the walker so the §7.11.2.1 prediction write (deep inside the
+        // §5.11.34 residual dispatch) can consult it without threading
+        // the bit through every layer of the §5.11.4/§5.11.5 walk.
+        self.enable_intra_edge_filter = params.enable_intra_edge_filter;
 
         let mi_row_start = self.geometry.mi_row_start;
         let mi_row_end = self.geometry.mi_row_end;
@@ -56323,6 +56491,7 @@ mod tests {
             avail_u: false,
             avail_l_chroma: false,
             avail_u_chroma: false,
+            enable_intra_edge_filter: false,
         };
         let r = walker
             .residual(
@@ -56489,6 +56658,7 @@ mod tests {
             /* angle_delta */ 0, /* bit_depth */ 8, /* sub_x */ 0,
             /* sub_y */ 0, /* have_above */ false, /* have_left */ false,
             /* have_above_right */ false, /* have_below_left */ false,
+            /* enable_intra_edge_filter */ false, /* filter_type */ 0,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -56522,7 +56692,7 @@ mod tests {
         }
         walker.predict_intra_into_curr_frame(
             0, 0, 4, TX_4X4, V_PRED, 0, 8, 0, 0, /* have_above */ true,
-            /* have_left */ false, false, false,
+            /* have_left */ false, false, false, false, 0,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -56558,7 +56728,7 @@ mod tests {
         }
         walker.predict_intra_into_curr_frame(
             0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, /* have_above */ false,
-            /* have_left */ true, false, false,
+            /* have_left */ true, false, false, false, 0,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -56587,7 +56757,7 @@ mod tests {
         };
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
-            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false,
+            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0,
         );
         let residual: Vec<i64> = vec![5; 16];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
@@ -56626,6 +56796,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            0,
         );
         assert!(walker.curr_frame(0).is_none());
     }
@@ -56648,14 +56820,14 @@ mod tests {
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // First TU: DC_PRED (128) + residual +50 = 178 across the 4×4.
         walker.predict_intra_into_curr_frame(
-            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false,
+            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0,
         );
         let residual: Vec<i64> = vec![50; 16];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
         // Second TU at (4, 0): H_PRED with have_left reads the first
         // TU's reconstructed right column (all 178).
         walker.predict_intra_into_curr_frame(
-            0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, false, true, false, false,
+            0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, false, true, false, false, false, 0,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -56665,6 +56837,132 @@ mod tests {
                     178,
                     "H_PRED reads reconstructed left neighbour at ({i}, {j})",
                 );
+            }
+        }
+    }
+
+    /// §7.11.2.8 `get_filter_type( plane )` — returns 1 iff the block
+    /// immediately above OR to the left uses a smooth intra mode. Stamp
+    /// `SMOOTH_PRED` into the above-neighbour `YModes[]` cell and assert
+    /// the helper flips from 0 (no smooth neighbour) to 1.
+    #[test]
+    fn get_filter_type_detects_smooth_neighbour() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // Block at (MiRow = 1, MiCol = 1). Above neighbour is (0, 1),
+        // left neighbour is (1, 0). Both default to DC_PRED (= 0), so
+        // get_filter_type is 0 even with avail flags set.
+        assert_eq!(
+            walker.get_filter_type(1, 1, /* avail_u */ true, /* avail_l */ true),
+            0,
+            "DC_PRED neighbours ⇒ filterType 0",
+        );
+        // Stamp SMOOTH_PRED into the above neighbour's YModes cell —
+        // `(MiRow 0, MiCol 1)` ⇒ flat index `0 * mi_cols + 1 = 1`.
+        let above_cell = 1usize; // (0, 1)
+        let left_cell = 4usize; // (1, 0) ⇒ 1 * mi_cols + 0
+        walker.y_modes[above_cell] = SMOOTH_PRED as u8;
+        assert_eq!(
+            walker.get_filter_type(1, 1, true, true),
+            1,
+            "smooth above neighbour ⇒ filterType 1",
+        );
+        // When AvailU is false the above neighbour is ignored even
+        // though its grid cell is smooth — get_filter_type falls back
+        // to the (DC_PRED) left neighbour ⇒ 0.
+        assert_eq!(
+            walker.get_filter_type(1, 1, /* avail_u */ false, /* avail_l */ true),
+            0,
+            "AvailU == 0 masks the smooth above neighbour",
+        );
+        // A smooth left neighbour (SMOOTH_H_PRED) also flips the flag.
+        walker.y_modes[above_cell] = DC_PRED as u8;
+        walker.y_modes[left_cell] = SMOOTH_H_PRED as u8;
+        assert_eq!(
+            walker.get_filter_type(1, 1, true, true),
+            1,
+            "smooth left neighbour ⇒ filterType 1",
+        );
+    }
+
+    /// §7.11.2.4 step-4 directional pre-pass — wiring check. A `D45_PRED`
+    /// 16×16 luma TU with a non-flat reconstructed above row produces a
+    /// **different** prediction when `enable_intra_edge_filter` is on
+    /// (the §7.11.2.9/§7.11.2.12 intra edge filter smooths the above
+    /// edge before the directional kernel projects it) than when it is
+    /// off. For `pAngle = 45` and `w + h = 32` with `filterType = 0` the
+    /// §7.11.2.9 strength selection picks strength 3 on the above edge
+    /// (`|pAngle - 90| = 45 >= 32`), and the §7.11.2.10 upsample
+    /// selection picks 0 (`|delta| >= 40`), so this isolates the edge
+    /// filter from the upsample path.
+    #[test]
+    fn predict_intra_d45_edge_filter_alters_output() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        // Build two identical walkers, seed an alternating (high-
+        // frequency) above row that the smoothing kernel will visibly
+        // change, then predict with the filter off vs on.
+        let seed_above = |walker: &mut PartitionWalker| {
+            walker.ensure_curr_frame_plane(0, 32, 32);
+            let buf = walker.curr_frame[0].as_mut().unwrap();
+            // Row 3 is the row above the TU at start_y = 4. Seed cols
+            // 0..32 (w + h = 32) with a 0 / 255 checkerboard — maximally
+            // sensitive to the 5-tap edge filter.
+            for j in 0..32usize {
+                buf.samples[3 * 32 + j] = if j % 2 == 0 { 0 } else { 255 };
+            }
+        };
+        let mut walker_off = PartitionWalker::new(8, 8, geom).unwrap();
+        seed_above(&mut walker_off);
+        walker_off.predict_intra_into_curr_frame(
+            0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
+            /* have_left */ false, /* have_above_right */ true,
+            /* have_below_left */ false, /* enable_intra_edge_filter */ false,
+            /* filter_type */ 0,
+        );
+
+        let mut walker_on = PartitionWalker::new(8, 8, geom).unwrap();
+        seed_above(&mut walker_on);
+        walker_on.predict_intra_into_curr_frame(
+            0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
+            /* have_left */ false, /* have_above_right */ true,
+            /* have_below_left */ false, /* enable_intra_edge_filter */ true,
+            /* filter_type */ 0,
+        );
+
+        let off = walker_off.curr_frame(0).unwrap();
+        let on = walker_on.curr_frame(0).unwrap();
+        // The 16×16 TU lives at rows 4..20, cols 0..16 of the 32-wide
+        // plane. At least one predicted sample must differ — proving the
+        // edge filter is applied on the `enable` path and skipped on the
+        // `!enable` path.
+        let mut differ = false;
+        for i in 0..16usize {
+            for j in 0..16usize {
+                let idx = (4 + i) * 32 + j;
+                if off[idx] != on[idx] {
+                    differ = true;
+                }
+            }
+        }
+        assert!(
+            differ,
+            "§7.11.2.4 step-4 edge filter must change at least one D45 sample",
+        );
+        // Sanity: every filtered sample stays in the 8-bit Clip1 range.
+        for i in 0..16usize {
+            for j in 0..16usize {
+                let v = on[(4 + i) * 32 + j];
+                assert!((0..=255).contains(&v), "filtered D45 sample {v} in range");
             }
         }
     }

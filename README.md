@@ -92,7 +92,15 @@ dequant + §7.13 inverse transform + step-3 residual merge, realising the
 new §5.11.2 `decode_tile_syntax` superblock loop drives this across a
 whole tile, so after the walk the per-plane `curr_frame` buffers hold
 the reconstructed intra tile (pre loop-filter / CDEF / loop-restoration
-post passes). Filter-intra / CfL-AC / IntraBC and the lossy-quant
+post passes). As of r363 the **directional** modes additionally run the
+§7.11.2.4 step-4 edge pre-pass — the §7.11.2.7 filter corner, the
+§7.11.2.9/§7.11.2.12 intra edge filter, and the §7.11.2.10/§7.11.2.11
+intra edge upsample — applied to `AboveRow[]` / `LeftCol[]` before the
+directional kernel projects them, gated on the frame's
+`enable_intra_edge_filter` and the §7.11.2.8 `get_filter_type`
+neighbour smooth-mode check (luma path spec-correct; the chroma
+directional path stays on the un-filtered edges until a `UVModes[]`
+grid is stamped). Filter-intra / CfL-AC / IntraBC and the lossy-quant
 post-pass chain remain follow-ups before this path produces validated
 bit-exact keyframe pixels.
 
