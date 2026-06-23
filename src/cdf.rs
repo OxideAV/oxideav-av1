@@ -57109,6 +57109,70 @@ mod tests {
         }
     }
 
+    /// §7.11.2.4 step-4 directional pre-pass — upsample-path wiring
+    /// check. A `D67_PRED` 4×4 luma TU (`pAngle = 67`, `w + h = 8`)
+    /// selects the §7.11.2.10 above-edge upsample (`|pAngle - 90| = 23 ∈
+    /// 1..40` and `w + h = 8 <= 16` with `filterType = 0`) while the
+    /// §7.11.2.9 strength selection picks 0 (`blk_wh <= 8` needs `d >=
+    /// 56`), so this isolates the §7.11.2.11 2x upsample from the edge
+    /// filter. Seeding a non-flat above row, the upsampled (enable-on)
+    /// prediction must differ from the un-upsampled (enable-off) one.
+    #[test]
+    fn predict_intra_d67_upsample_alters_output() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let seed_above = |walker: &mut PartitionWalker| {
+            walker.ensure_curr_frame_plane(0, 16, 16);
+            let buf = walker.curr_frame[0].as_mut().unwrap();
+            // Row 3 is the row above the TU at start_y = 4. Seed cols
+            // 0..8 (w + h = 8) with a rising ramp the 2x upsample's
+            // 4-tap interpolation visibly re-samples.
+            for j in 0..8usize {
+                buf.samples[3 * 16 + j] = (30 * j) as i32;
+            }
+        };
+        let mut walker_off = PartitionWalker::new(4, 4, geom).unwrap();
+        seed_above(&mut walker_off);
+        walker_off.predict_intra_into_curr_frame(
+            0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
+            /* have_left */ false, /* have_above_right */ true,
+            /* have_below_left */ false, /* enable_intra_edge_filter */ false,
+            /* filter_type */ 0,
+        );
+
+        let mut walker_on = PartitionWalker::new(4, 4, geom).unwrap();
+        seed_above(&mut walker_on);
+        walker_on.predict_intra_into_curr_frame(
+            0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
+            /* have_left */ false, /* have_above_right */ true,
+            /* have_below_left */ false, /* enable_intra_edge_filter */ true,
+            /* filter_type */ 0,
+        );
+
+        let off = walker_off.curr_frame(0).unwrap();
+        let on = walker_on.curr_frame(0).unwrap();
+        // The 4×4 TU lives at rows 4..8, cols 0..4 of the 16-wide plane.
+        let mut differ = false;
+        for i in 0..4usize {
+            for j in 0..4usize {
+                let idx = (4 + i) * 16 + j;
+                if off[idx] != on[idx] {
+                    differ = true;
+                }
+                let v = on[idx];
+                assert!((0..=255).contains(&v), "upsampled D67 sample {v} in range");
+            }
+        }
+        assert!(
+            differ,
+            "§7.11.2.4 step-4 above-edge upsample must change at least one D67 sample",
+        );
+    }
+
     /// `Clip1` envelope at 8-bit (av1-spec §3 / line 16339): a
     /// residual that drives the sum past `(1 << BitDepth) - 1 = 255`
     /// clips to 255; a sum below `0` clips to `0`. The merge is
