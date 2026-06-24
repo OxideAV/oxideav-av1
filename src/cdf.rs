@@ -785,6 +785,71 @@ pub const INTRA_TX_TYPE_SET2_SIZES: usize = 3;
 /// `V_PRED = 1`, `H_PRED = 2`, `D157_PRED = 6`).
 pub const FILTER_INTRA_MODE_TO_INTRA_DIR: [usize; INTRA_FILTER_MODES] = [0, 1, 2, 6, 0];
 
+/// `INTRA_FILTER_SCALE_BITS` (§3 constant table, av1-spec p.20) — the
+/// scaling shift `Round2Signed( pr, INTRA_FILTER_SCALE_BITS )` applies
+/// to each §7.11.2.3 recursive-intra filter accumulation. The spec
+/// value is `4`.
+pub const INTRA_FILTER_SCALE_BITS: u32 = 4;
+
+/// `Intra_Filter_Taps[ INTRA_FILTER_MODES ][ 8 ][ 7 ]` (additional
+/// tables, av1-spec p.406-407) — the §7.11.2.3 recursive-intra filter
+/// kernel. Indexed `[ filter_intra_mode ][ ( i1 << 2 ) + j1 ][ i ]`:
+/// the per-mode 8-position (2 rows × 4 cols of the 4×2 output block)
+/// 7-tap filters applied to the `p[ 0..6 ]` neighbour array. The taps
+/// are signed.
+pub const INTRA_FILTER_TAPS: [[[i32; 7]; 8]; INTRA_FILTER_MODES] = [
+    [
+        [-6, 10, 0, 0, 0, 12, 0],
+        [-5, 2, 10, 0, 0, 9, 0],
+        [-3, 1, 1, 10, 0, 7, 0],
+        [-3, 1, 1, 2, 10, 5, 0],
+        [-4, 6, 0, 0, 0, 2, 12],
+        [-3, 2, 6, 0, 0, 2, 9],
+        [-3, 2, 2, 6, 0, 2, 7],
+        [-3, 1, 2, 2, 6, 3, 5],
+    ],
+    [
+        [-10, 16, 0, 0, 0, 10, 0],
+        [-6, 0, 16, 0, 0, 6, 0],
+        [-4, 0, 0, 16, 0, 4, 0],
+        [-2, 0, 0, 0, 16, 2, 0],
+        [-10, 16, 0, 0, 0, 0, 10],
+        [-6, 0, 16, 0, 0, 0, 6],
+        [-4, 0, 0, 16, 0, 0, 4],
+        [-2, 0, 0, 0, 16, 0, 2],
+    ],
+    [
+        [-8, 8, 0, 0, 0, 16, 0],
+        [-8, 0, 8, 0, 0, 16, 0],
+        [-8, 0, 0, 8, 0, 16, 0],
+        [-8, 0, 0, 0, 8, 16, 0],
+        [-4, 4, 0, 0, 0, 0, 16],
+        [-4, 0, 4, 0, 0, 0, 16],
+        [-4, 0, 0, 4, 0, 0, 16],
+        [-4, 0, 0, 0, 4, 0, 16],
+    ],
+    [
+        [-2, 8, 0, 0, 0, 10, 0],
+        [-1, 3, 8, 0, 0, 6, 0],
+        [-1, 2, 3, 8, 0, 4, 0],
+        [0, 1, 2, 3, 8, 2, 0],
+        [-1, 4, 0, 0, 0, 3, 10],
+        [-1, 3, 4, 0, 0, 4, 6],
+        [-1, 2, 3, 4, 0, 4, 4],
+        [-1, 2, 2, 3, 4, 3, 3],
+    ],
+    [
+        [-12, 14, 0, 0, 0, 14, 0],
+        [-10, 0, 14, 0, 0, 12, 0],
+        [-9, 0, 0, 14, 0, 11, 0],
+        [-8, 0, 0, 0, 14, 10, 0],
+        [-10, 12, 0, 0, 0, 0, 14],
+        [-9, 1, 12, 0, 0, 0, 12],
+        [-8, 0, 0, 12, 0, 1, 11],
+        [-7, 0, 0, 1, 12, 1, 9],
+    ],
+];
+
 /// `INTERP_FILTERS` per §3. Number of values for `interp_filter` (the
 /// three switchable filters: `EIGHTTAP`, `EIGHTTAP_SMOOTH`,
 /// `EIGHTTAP_SHARP` — `BILINEAR` is reachable only when the frame
@@ -2052,6 +2117,112 @@ pub fn predict_intra_paeth_pred(
                 above_left
             };
             pred[i * w + j] = v;
+        }
+    }
+    Ok(())
+}
+
+/// §7.11.2.3 recursive intra prediction process (av1-spec p.243-244) —
+/// the `use_filter_intra == 1` luma arm of the §7.11.2.1 dispatch.
+/// Fills `pred[ 0..h*w ]` by walking each `4×2` output sub-block, building
+/// a 7-sample neighbour array `p`, and applying the per-mode
+/// [`INTRA_FILTER_TAPS`] kernel + `Round2Signed( ., INTRA_FILTER_SCALE_BITS )`
+/// + `Clip1`.
+///
+/// `above_ext` / `left_ext` are the head-extended edge buffers: offset
+/// `1` is the `AboveRow[-1]` / `LeftCol[-1]` corner (the two share a
+/// value per §7.11.2.1), and offset `2 + k` is `AboveRow[k]` /
+/// `LeftCol[k]` for `k >= 0`. This matches the buffer layout
+/// [`PartitionWalker::predict_intra_into_curr_frame`] already builds, so
+/// the caller reuses it without re-deriving the neighbours.
+///
+/// The spec's `AboveRow[ ( j4 << 2 ) + i - 1 ]` index runs from `-1`
+/// (the corner) upward; the `+ 2` head-extension offset maps `-1` to
+/// offset `1`. `pred` reads of `pred[ ( i2 << 1 ) - 1 ][ ... ]` (the
+/// row immediately above the current `4×2` block) read the
+/// already-filled `pred` rows for `i2 > 0`, and `LeftCol` for `i2 == 0`,
+/// exactly as the spec's branch structure specifies.
+fn predict_intra_recursive(
+    w: usize,
+    h: usize,
+    filter_intra_mode: usize,
+    bit_depth: u8,
+    above_ext: &[u16],
+    left_ext: &[u16],
+    pred: &mut [u16],
+) -> Result<(), crate::Error> {
+    if w > 64 || h > 64 || w < 4 || h < 2 {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if filter_intra_mode >= INTRA_FILTER_MODES {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    if pred.len() < h.saturating_mul(w) {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // Head-extended accessors: `AboveRow[k]` / `LeftCol[k]` for `k >= -1`.
+    // Offset `1` = corner (`k == -1`); offset `2 + k` = sample `k`. The
+    // §7.11.2.3 walk reads `AboveRow[ ( (w4-1) << 2 ) + 4 - 1 ] =
+    // AboveRow[w-1]` (offset `w + 1`) and `LeftCol[h-1]` (offset
+    // `h + 1`) at the far edge.
+    let need_above = w + 2;
+    let need_left = h + 2;
+    if above_ext.len() < need_above || left_ext.len() < need_left {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let above = |k: i32| -> i32 {
+        let off = (k + 2) as usize;
+        above_ext.get(off).copied().unwrap_or(0) as i32
+    };
+    let left = |k: i32| -> i32 {
+        let off = (k + 2) as usize;
+        left_ext.get(off).copied().unwrap_or(0) as i32
+    };
+
+    let taps = &INTRA_FILTER_TAPS[filter_intra_mode];
+    let w4 = w >> 2;
+    let h2 = h >> 1;
+    for i2 in 0..h2 {
+        for j4 in 0..w4 {
+            // §7.11.2.3: prepare the 7-sample neighbour array `p`.
+            let mut p = [0i32; 7];
+            for (i, pi) in p.iter_mut().enumerate() {
+                if i < 5 {
+                    if i2 == 0 {
+                        // AboveRow[ ( j4 << 2 ) + i - 1 ].
+                        *pi = above(((j4 << 2) + i) as i32 - 1);
+                    } else if j4 == 0 && i == 0 {
+                        // LeftCol[ ( i2 << 1 ) - 1 ].
+                        *pi = left(((i2 << 1) as i32) - 1);
+                    } else {
+                        // pred[ ( i2 << 1 ) - 1 ][ ( j4 << 2 ) + i - 1 ].
+                        let pr_row = (i2 << 1) - 1;
+                        let pr_col = ((j4 << 2) as i32) + (i as i32) - 1;
+                        *pi = pred[pr_row * w + pr_col as usize] as i32;
+                    }
+                } else if j4 == 0 {
+                    // LeftCol[ ( i2 << 1 ) + i - 5 ].
+                    *pi = left(((i2 << 1) as i32) + (i as i32) - 5);
+                } else {
+                    // pred[ ( i2 << 1 ) + i - 5 ][ ( j4 << 2 ) - 1 ].
+                    let pr_row = (i2 << 1) + i - 5;
+                    let pr_col = (j4 << 2) - 1;
+                    *pi = pred[pr_row * w + pr_col] as i32;
+                }
+            }
+            // §7.11.2.3: filter the 4×2 output block.
+            for i1 in 0..2usize {
+                for j1 in 0..4usize {
+                    let tap_row = &taps[(i1 << 2) + j1];
+                    let mut acc: i64 = 0;
+                    for i in 0..7usize {
+                        acc += (tap_row[i] as i64) * (p[i] as i64);
+                    }
+                    let v = round2_signed(acc, INTRA_FILTER_SCALE_BITS);
+                    let clipped = v.clamp(0, ((1u32 << bit_depth) - 1) as i64) as u16;
+                    pred[((i2 << 1) + i1) * w + (j4 << 2) + j1] = clipped;
+                }
+            }
         }
     }
     Ok(())
@@ -13525,6 +13696,13 @@ pub struct ResidualContext {
     /// plane 2 (`signV * (cfl_alpha_v + 1)`, in `[-16, 16]`). See
     /// [`Self::cfl_alpha_u`].
     pub cfl_alpha_v: i8,
+    /// `filter_intra_mode` per §5.11.24 (av1-spec p.92) — `Some(mode)`
+    /// (`mode ∈ 0..INTRA_FILTER_MODES`) when the block's luma plane uses
+    /// the §7.11.2.3 recursive intra prediction (`use_filter_intra ==
+    /// 1`); `None` otherwise. Gates the §7.11.2.1 first dispatch arm in
+    /// [`PartitionWalker::predict_intra_into_curr_frame`]. Luma-only —
+    /// the chroma planes never run filter-intra.
+    pub filter_intra_mode: Option<u8>,
     /// `AvailL` per §5.11.5 — `true` if the block has a decoded
     /// neighbour to its left. With the §5.11.34 chunk-local `x > 0`
     /// it forms the §7.11.2.1 `haveLeft` input (`AvailL || x > 0`) for
@@ -13567,6 +13745,7 @@ impl ResidualContext {
             angle_delta_uv: 0,
             cfl_alpha_u: 0,
             cfl_alpha_v: 0,
+            filter_intra_mode: None,
             avail_l: false,
             avail_u: false,
             avail_l_chroma: false,
@@ -16144,6 +16323,13 @@ impl PartitionWalker {
         // the six directional D-modes.
         enable_intra_edge_filter: bool,
         filter_type: u8,
+        // §7.11.2.1 first dispatch arm — `use_filter_intra` is luma-only
+        // (`plane == 0`); when `Some(mode)` the §7.11.2.3 recursive
+        // prediction process replaces the `mode`-driven dispatch (the
+        // §7.11.2.4 step-4 directional pre-pass is skipped, filter-intra
+        // not being a directional mode). `None` ⇒ the normal mode
+        // dispatch below runs.
+        filter_intra_mode: Option<usize>,
     ) {
         if (plane as usize) >= 3 || mode >= INTRA_MODES {
             return;
@@ -16313,48 +16499,61 @@ impl PartitionWalker {
         let left_col = &left_ext[2..2 + span];
 
         let mut pred = vec![0u16; w * h];
-        let ok = match mode {
-            DC_PRED => predict_intra_dc_pred(
-                have_left as u8,
-                have_above as u8,
-                log2_w,
-                log2_h,
-                w,
-                h,
-                bit_depth,
-                above_row,
-                left_col,
-                &mut pred,
-            )
-            .is_ok(),
-            V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred).is_ok(),
-            H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred).is_ok(),
-            m if (D45_PRED..=D67_PRED).contains(&m) => predict_intra_d_mode(
-                m,
-                angle_delta,
-                w,
-                h,
-                upsample_above,
-                upsample_left,
-                &above_ext,
-                &left_ext,
-                &mut pred,
-            )
-            .is_ok(),
-            SMOOTH_PRED => {
-                predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred)
-                    .is_ok()
+        // §7.11.2.1 first dispatch arm: `plane == 0 && use_filter_intra`
+        // ⇒ the §7.11.2.3 recursive intra prediction process, fed the
+        // head-extended `above_ext` / `left_ext` (corner at offset 1).
+        // Filter-intra is luma-only and is gated by the §5.11.24
+        // `Block_Width[MiSize] <= 32 && Block_Height[MiSize] <= 32`
+        // reader constraint, so `w`/`h` are always within the
+        // `[4, 32]` recursive-kernel domain (`w >= 4 && h >= 2`).
+        let ok = if let Some(fim) = filter_intra_mode.filter(|_| plane == 0) {
+            predict_intra_recursive(w, h, fim, bit_depth, &above_ext, &left_ext, &mut pred).is_ok()
+        } else {
+            match mode {
+                DC_PRED => predict_intra_dc_pred(
+                    have_left as u8,
+                    have_above as u8,
+                    log2_w,
+                    log2_h,
+                    w,
+                    h,
+                    bit_depth,
+                    above_row,
+                    left_col,
+                    &mut pred,
+                )
+                .is_ok(),
+                V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred).is_ok(),
+                H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred).is_ok(),
+                m if (D45_PRED..=D67_PRED).contains(&m) => predict_intra_d_mode(
+                    m,
+                    angle_delta,
+                    w,
+                    h,
+                    upsample_above,
+                    upsample_left,
+                    &above_ext,
+                    &left_ext,
+                    &mut pred,
+                )
+                .is_ok(),
+                SMOOTH_PRED => {
+                    predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred)
+                        .is_ok()
+                }
+                SMOOTH_V_PRED => {
+                    predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred)
+                        .is_ok()
+                }
+                SMOOTH_H_PRED => {
+                    predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred)
+                        .is_ok()
+                }
+                PAETH_PRED => {
+                    predict_intra_paeth_pred(w, h, above_row, left_col, corner, &mut pred).is_ok()
+                }
+                _ => false,
             }
-            SMOOTH_V_PRED => {
-                predict_intra_smooth_v_pred(log2_h, w, h, above_row, left_col, &mut pred).is_ok()
-            }
-            SMOOTH_H_PRED => {
-                predict_intra_smooth_h_pred(log2_w, w, h, above_row, left_col, &mut pred).is_ok()
-            }
-            PAETH_PRED => {
-                predict_intra_paeth_pred(w, h, above_row, left_col, corner, &mut pred).is_ok()
-            }
-            _ => false,
         };
         if !ok {
             return;
@@ -28375,9 +28574,12 @@ impl PartitionWalker {
             // intra block. `use_intrabc == 1` sets `is_inter = 1`
             // (§5.11.7); the §7.11.3 IntraBC / motion-compensation path
             // owns that block's prediction, so the §7.11.2.1 writer
-            // stays off it. `use_filter_intra` similarly routes to the
-            // §7.11.2.3 recursive arm not covered here.
-            is_intra: is_inter == 0 && use_filter_intra != Some(1),
+            // stays off it. A `use_filter_intra == 1` block IS still an
+            // intra block — its luma plane runs the §7.11.2.3 recursive
+            // arm (now wired below via `filter_intra_mode`), its chroma
+            // planes the usual UVMode dispatch — so it stays on the
+            // intra path.
+            is_intra: is_inter == 0,
             y_mode,
             angle_delta_y,
             angle_delta_uv: angle_delta_uv.unwrap_or(0),
@@ -28387,6 +28589,14 @@ impl PartitionWalker {
             // arm so the inert default is never read otherwise.
             cfl_alpha_u: cfl_alpha_u.unwrap_or(0),
             cfl_alpha_v: cfl_alpha_v.unwrap_or(0),
+            // §5.11.24 `filter_intra_mode` — `Some(mode)` only when the
+            // block decoded `use_filter_intra == 1`; gates the §7.11.2.3
+            // luma recursive-intra arm.
+            filter_intra_mode: if use_filter_intra == Some(1) {
+                filter_intra_mode
+            } else {
+                None
+            },
             avail_l,
             avail_u,
             avail_l_chroma,
@@ -28664,6 +28874,8 @@ impl PartitionWalker {
             // Inter arm — no CfL block; §7.11.5 is intra-only.
             cfl_alpha_u: 0,
             cfl_alpha_v: 0,
+            // Inter arm — no filter-intra (§7.11.2.3 is intra-only).
+            filter_intra_mode: None,
             avail_l: false,
             avail_u: false,
             avail_l_chroma: false,
@@ -29939,6 +30151,17 @@ impl PartitionWalker {
                 sub_y,
             );
             let eief = ctx.enable_intra_edge_filter;
+            // §7.11.2.1 first dispatch arm — `use_filter_intra` is
+            // luma-only (`plane == 0`). `ctx.filter_intra_mode` is
+            // `Some(mode)` only when the block decoded `use_filter_intra
+            // == 1`; pass it through for plane 0 so
+            // [`Self::predict_intra_into_curr_frame`] routes to the
+            // §7.11.2.3 recursive process, and `None` for chroma.
+            let fi_mode = if plane == 0 {
+                ctx.filter_intra_mode.map(|m| m as usize)
+            } else {
+                None
+            };
             self.predict_intra_into_curr_frame(
                 plane,
                 start_x,
@@ -29955,6 +30178,7 @@ impl PartitionWalker {
                 have_below_left,
                 eief,
                 filter_type,
+                fi_mode,
             );
 
             // §5.11.35 line `if ( isCfl ) predict_chroma_from_luma(...)`
@@ -36789,6 +37013,114 @@ mod tests {
             any_changed,
             "gradient luma must perturb at least one sample"
         );
+    }
+
+    /// §3 `INTRA_FILTER_SCALE_BITS` pins to 4 and the §7.11.2.3
+    /// `Intra_Filter_Taps` table is well-formed (5 modes × 8 positions ×
+    /// 7 taps), with a couple of anchor entries locked against the spec
+    /// listing.
+    #[test]
+    fn intra_filter_taps_table_well_formed() {
+        assert_eq!(INTRA_FILTER_SCALE_BITS, 4);
+        assert_eq!(INTRA_FILTER_TAPS.len(), INTRA_FILTER_MODES);
+        for mode in &INTRA_FILTER_TAPS {
+            assert_eq!(mode.len(), 8);
+            for pos in mode {
+                assert_eq!(pos.len(), 7);
+            }
+        }
+        // Mode 0, position 0 / mode 4, position 7 — spec anchors.
+        assert_eq!(INTRA_FILTER_TAPS[0][0], [-6, 10, 0, 0, 0, 12, 0]);
+        assert_eq!(INTRA_FILTER_TAPS[4][7], [-7, 0, 0, 1, 12, 1, 9]);
+    }
+
+    /// §7.11.2.3 recursive intra prediction — an independent
+    /// re-derivation of the per-`4×2` sub-block filter on an `8×8` block
+    /// must match `predict_intra_recursive` sample-for-sample, exercising
+    /// the `pred`-feedback paths (`i2 > 0` reads previously-filled rows,
+    /// `j4 > 0` reads the left column of `pred`).
+    #[test]
+    fn predict_intra_recursive_matches_spec_formula() {
+        let (w, h) = (8usize, 8usize);
+        let span = w + h;
+        // Head-extended edge buffers: offset 1 = corner, offset 2+k =
+        // AboveRow[k] / LeftCol[k].
+        let corner = 100u16;
+        let mut above_ext = vec![0u16; 2 * span + 2];
+        let mut left_ext = vec![0u16; 2 * span + 2];
+        above_ext[0] = corner;
+        above_ext[1] = corner;
+        left_ext[0] = corner;
+        left_ext[1] = corner;
+        for k in 0..span {
+            above_ext[2 + k] = (120 + k) as u16;
+            left_ext[2 + k] = (90 + 2 * k) as u16;
+        }
+        let mode = 3usize;
+        let bit_depth = 8u8;
+
+        let mut got = vec![0u16; w * h];
+        predict_intra_recursive(w, h, mode, bit_depth, &above_ext, &left_ext, &mut got).unwrap();
+
+        // Independent reference, directly from §7.11.2.3.
+        let above = |k: i32| -> i32 { above_ext[(k + 2) as usize] as i32 };
+        let left = |k: i32| -> i32 { left_ext[(k + 2) as usize] as i32 };
+        let taps = &INTRA_FILTER_TAPS[mode];
+        let mut want = vec![0u16; w * h];
+        let w4 = w >> 2;
+        let h2 = h >> 1;
+        for i2 in 0..h2 {
+            for j4 in 0..w4 {
+                let mut p = [0i32; 7];
+                for (i, pi) in p.iter_mut().enumerate() {
+                    if i < 5 {
+                        if i2 == 0 {
+                            *pi = above(((j4 << 2) + i) as i32 - 1);
+                        } else if j4 == 0 && i == 0 {
+                            *pi = left(((i2 << 1) as i32) - 1);
+                        } else {
+                            *pi = want[((i2 << 1) - 1) * w + ((j4 << 2) + i - 1)] as i32;
+                        }
+                    } else if j4 == 0 {
+                        *pi = left(((i2 << 1) as i32) + (i as i32) - 5);
+                    } else {
+                        *pi = want[((i2 << 1) + i - 5) * w + ((j4 << 2) - 1)] as i32;
+                    }
+                }
+                for i1 in 0..2usize {
+                    for j1 in 0..4usize {
+                        let mut pr = 0i64;
+                        for i in 0..7usize {
+                            pr += (taps[(i1 << 2) + j1][i] as i64) * (p[i] as i64);
+                        }
+                        let v = round2_signed(pr, INTRA_FILTER_SCALE_BITS).clamp(0, 255) as u16;
+                        want[((i2 << 1) + i1) * w + (j4 << 2) + j1] = v;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            got, want,
+            "recursive intra must match the §7.11.2.3 formula"
+        );
+    }
+
+    /// §7.11.2.3 recursive intra prediction caller-bug guards —
+    /// out-of-range mode / undersized `pred` / degenerate dimensions.
+    #[test]
+    fn predict_intra_recursive_caller_bug_guards() {
+        let above = vec![0u16; 64];
+        let left = vec![0u16; 64];
+        let mut pred = vec![0u16; 64];
+        // mode >= INTRA_FILTER_MODES.
+        assert!(
+            predict_intra_recursive(8, 8, INTRA_FILTER_MODES, 8, &above, &left, &mut pred).is_err()
+        );
+        // w < 4.
+        assert!(predict_intra_recursive(2, 8, 0, 8, &above, &left, &mut pred).is_err());
+        // undersized pred.
+        let mut short = vec![0u16; 8];
+        assert!(predict_intra_recursive(8, 8, 0, 8, &above, &left, &mut short).is_err());
     }
 
     // -----------------------------------------------------------------
@@ -56929,6 +57261,7 @@ mod tests {
             angle_delta_uv: 0,
             cfl_alpha_u: 0,
             cfl_alpha_v: 0,
+            filter_intra_mode: None,
             avail_l: false,
             avail_u: false,
             avail_l_chroma: false,
@@ -57101,6 +57434,7 @@ mod tests {
             /* sub_y */ 0, /* have_above */ false, /* have_left */ false,
             /* have_above_right */ false, /* have_below_left */ false,
             /* enable_intra_edge_filter */ false, /* filter_type */ 0,
+            /* filter_intra_mode */ None,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -57134,7 +57468,7 @@ mod tests {
         }
         walker.predict_intra_into_curr_frame(
             0, 0, 4, TX_4X4, V_PRED, 0, 8, 0, 0, /* have_above */ true,
-            /* have_left */ false, false, false, false, 0,
+            /* have_left */ false, false, false, false, 0, None,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -57170,7 +57504,7 @@ mod tests {
         }
         walker.predict_intra_into_curr_frame(
             0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, /* have_above */ false,
-            /* have_left */ true, false, false, false, 0,
+            /* have_left */ true, false, false, false, 0, None,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -57199,7 +57533,7 @@ mod tests {
         };
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         walker.predict_intra_into_curr_frame(
-            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0,
+            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0, None,
         );
         let residual: Vec<i64> = vec![5; 16];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
@@ -57240,6 +57574,7 @@ mod tests {
             false,
             false,
             0,
+            None,
         );
         assert!(walker.curr_frame(0).is_none());
     }
@@ -57262,14 +57597,14 @@ mod tests {
         let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
         // First TU: DC_PRED (128) + residual +50 = 178 across the 4×4.
         walker.predict_intra_into_curr_frame(
-            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0,
+            0, 0, 0, TX_4X4, DC_PRED, 0, 8, 0, 0, false, false, false, false, false, 0, None,
         );
         let residual: Vec<i64> = vec![50; 16];
         walker.curr_frame_step3_merge(0, 0, 0, TX_4X4, DCT_DCT, &residual, 8, 0, 0);
         // Second TU at (4, 0): H_PRED with have_left reads the first
         // TU's reconstructed right column (all 178).
         walker.predict_intra_into_curr_frame(
-            0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, false, true, false, false, false, 0,
+            0, 4, 0, TX_4X4, H_PRED, 0, 8, 0, 0, false, true, false, false, false, 0, None,
         );
         let buf = walker.curr_frame(0).unwrap();
         for i in 0..4 {
@@ -57399,7 +57734,7 @@ mod tests {
             0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
             /* have_left */ false, /* have_above_right */ true,
             /* have_below_left */ false, /* enable_intra_edge_filter */ false,
-            /* filter_type */ 0,
+            /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
         let mut walker_on = PartitionWalker::new(8, 8, geom).unwrap();
@@ -57408,7 +57743,7 @@ mod tests {
             0, 0, 4, TX_16X16, D45_PRED, 0, 8, 0, 0, /* have_above */ true,
             /* have_left */ false, /* have_above_right */ true,
             /* have_below_left */ false, /* enable_intra_edge_filter */ true,
-            /* filter_type */ 0,
+            /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
         let off = walker_off.curr_frame(0).unwrap();
@@ -57471,7 +57806,7 @@ mod tests {
             0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
             /* have_left */ false, /* have_above_right */ true,
             /* have_below_left */ false, /* enable_intra_edge_filter */ false,
-            /* filter_type */ 0,
+            /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
         let mut walker_on = PartitionWalker::new(4, 4, geom).unwrap();
@@ -57480,7 +57815,7 @@ mod tests {
             0, 0, 4, TX_4X4, D67_PRED, 0, 8, 0, 0, /* have_above */ true,
             /* have_left */ false, /* have_above_right */ true,
             /* have_below_left */ false, /* enable_intra_edge_filter */ true,
-            /* filter_type */ 0,
+            /* filter_type */ 0, /* filter_intra_mode */ None,
         );
 
         let off = walker_off.curr_frame(0).unwrap();

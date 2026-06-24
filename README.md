@@ -110,9 +110,16 @@ and rewriting each sample as `Clip1(dc + Round2Signed(CflAlpha{U,V} *
 (L - lumaAvg), 6))`, clamped to the §5.11.35 `MaxLumaW` / `MaxLumaH`
 per-luma-TU extent (now tracked on the walker). The §5.11.45-decoded
 signed alphas thread onto `ResidualContext`, so CfL blocks reconstruct
-their full DC + luma-AC prediction rather than DC-only. Filter-intra /
-IntraBC and the lossy-quant post-pass chain remain follow-ups before
-this path produces validated bit-exact keyframe pixels.
+their full DC + luma-AC prediction rather than DC-only. Also as of r367
+the §7.11.2.3 **recursive intra (filter-intra)** luma arm is wired: a
+`use_filter_intra == 1` block routes its luma plane through
+`predict_intra_recursive` (the §3 `Intra_Filter_Taps` 7-tap kernel + the
+`Round2Signed(.., INTRA_FILTER_SCALE_BITS)` per-`4×2`-sub-block walk) as
+the §7.11.2.1 first dispatch arm, reusing the head-extended edge
+buffers; such blocks now stay on the intra reconstruction path rather
+than being skipped. IntraBC and the lossy-quant post-pass chain remain
+follow-ups before this path produces validated bit-exact keyframe
+pixels.
 
 The §5.11 walker now also reconstructs **inter pixels** at frame scope:
 the §5.11.18 → §5.11.23 → §5.11.31 inter-syntax cascade stamps each
