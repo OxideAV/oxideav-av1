@@ -13513,6 +13513,18 @@ pub struct ResidualContext {
     /// angle delta applied to a directional `UVMode`. `0` for
     /// non-directional modes / no chroma.
     pub angle_delta_uv: i8,
+    /// `CflAlphaU` per §5.11.45 (av1-spec p.97) — the signed
+    /// chroma-from-luma alpha for plane 1 (`signU * (cfl_alpha_u +
+    /// 1)`, in `[-16, 16]`). Read by the §7.11.5
+    /// `predict_chroma_from_luma` scale (`Round2Signed(alpha * (L - lumaAvg),
+    /// 6)`). `0` when `UVMode != UV_CFL_PRED` (no CfL block) — the §7.11.5
+    /// process is only invoked on the `isCfl` arm, so the value is
+    /// inert otherwise.
+    pub cfl_alpha_u: i8,
+    /// `CflAlphaV` per §5.11.45 — the signed chroma-from-luma alpha for
+    /// plane 2 (`signV * (cfl_alpha_v + 1)`, in `[-16, 16]`). See
+    /// [`Self::cfl_alpha_u`].
+    pub cfl_alpha_v: i8,
     /// `AvailL` per §5.11.5 — `true` if the block has a decoded
     /// neighbour to its left. With the §5.11.34 chunk-local `x > 0`
     /// it forms the §7.11.2.1 `haveLeft` input (`AvailL || x > 0`) for
@@ -13553,6 +13565,8 @@ impl ResidualContext {
             y_mode: 0,
             angle_delta_y: 0,
             angle_delta_uv: 0,
+            cfl_alpha_u: 0,
+            cfl_alpha_v: 0,
             avail_l: false,
             avail_u: false,
             avail_l_chroma: false,
@@ -15478,6 +15492,19 @@ pub struct PartitionWalker {
     /// BD_STRIDE` length — the superblock-local scope bounds it to a
     /// constant size regardless of frame extent.
     block_decoded: Vec<u8>,
+    /// `MaxLumaW` / `MaxLumaH` (§5.11.35 lines `MaxLumaW = startX +
+    /// stepX * 4` / `MaxLumaH = startY + stepY * 4`, av1-spec p.85).
+    /// Set on every plane-0 (luma) transform-block emit and read back
+    /// by the §7.11.5 `predict_chroma_from_luma` luma-subsample clamp
+    /// (the spec's `Min( lumaX, MaxLumaW - (1 << subX) )` and
+    /// `Min( lumaY, MaxLumaH - (1 << subY) )` extent clamps). Because the
+    /// §5.11.34 plane loop walks the whole luma plane of a block before
+    /// its chroma planes, the value in flight when a CfL chroma TU runs
+    /// is the most-recent luma TU's extent — the right/bottom edge of
+    /// the co-located luma region. Held as `u32` in per-plane (luma)
+    /// sample units; `0` on a fresh walker (no luma TU emitted yet).
+    max_luma_w: u32,
+    max_luma_h: u32,
 }
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
@@ -15914,6 +15941,10 @@ impl PartitionWalker {
             // §5.11.3 [`Self::clear_block_decoded_flags`] reset stamps
             // the border-vs-interior pattern per superblock.
             block_decoded,
+            // §5.11.35 `MaxLumaW` / `MaxLumaH` — set per luma TU; `0`
+            // until the first plane-0 transform-block emit.
+            max_luma_w: 0,
+            max_luma_h: 0,
         })
     }
 
@@ -16345,6 +16376,134 @@ impl PartitionWalker {
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
                 buf.samples[idx] = pred[(i as usize) * w + (j as usize)] as i32;
+            }
+        }
+    }
+
+    /// §7.11.5 predict-chroma-from-luma process (av1-spec p.287) — the
+    /// CfL high-frequency contribution layered onto an already-written
+    /// `DC_PRED` chroma base. Invoked from [`Self::transform_block_emit`]
+    /// on the `isCfl` arm (`plane > 0 && UVMode == UV_CFL_PRED`),
+    /// immediately after the §7.11.2.1 `predict_intra` `DC_PRED` write
+    /// and before the §5.11.39 coeff read / §7.12.3 reconstruct.
+    ///
+    /// The process reads the already-reconstructed luma plane
+    /// (`CurrFrame[0]`, populated by the §5.11.34 plane loop which walks
+    /// luma before chroma), subsamples it into `L[i][j]` with 3
+    /// fractional bits of precision, derives `lumaAvg`, and rewrites
+    /// each chroma sample as `Clip1(dc + Round2Signed(alpha * (L -
+    /// lumaAvg), 6))`. `alpha` is `CflAlphaU` (plane 1) / `CflAlphaV`
+    /// (plane 2), the §5.11.45 signed magnitude.
+    ///
+    /// `MaxLumaW` / `MaxLumaH` (the §5.11.35 per-luma-TU extent tracked
+    /// on `self`) clamp the luma reads so a chroma TU that overhangs the
+    /// decoded luma region replicates the right/bottom luma edge rather
+    /// than reading undecoded samples. Both are in per-plane luma sample
+    /// units; the spec's `Min( lumaX, MaxLumaW - (1 << subX) )` /
+    /// `Min( lumaY, MaxLumaH - (1 << subY) )` clamps apply.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn predict_chroma_from_luma_into_curr_frame(
+        &mut self,
+        plane: u8,
+        start_x: u32,
+        start_y: u32,
+        tx_sz: usize,
+        sub_x: u8,
+        sub_y: u8,
+        alpha: i32,
+        bit_depth: u8,
+    ) {
+        if plane == 0 || (plane as usize) >= 3 {
+            return;
+        }
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        if w == 0 || h == 0 {
+            return;
+        }
+        // §7.11.5 `L` / `lumaAvg` — read the reconstructed luma plane
+        // (`CurrFrame[0]`). If luma was never written (defensive — the
+        // §5.11.34 plane loop always walks luma first) there is nothing
+        // to predict from; leave the DC base in place.
+        let Some(luma) = self.curr_frame[0].as_ref() else {
+            return;
+        };
+        let luma_rows = luma.rows;
+        let luma_cols = luma.cols;
+        if luma_rows == 0 || luma_cols == 0 {
+            return;
+        }
+        // §7.11.5 luma-extent clamps. `MaxLumaW` / `MaxLumaH` are the
+        // §5.11.35 per-luma-TU `startX + stepX*4` / `startY + stepY*4`;
+        // they also cannot exceed the allocated luma plane (the §5.11.35
+        // `maxX` / `maxY` frame bounds), so clamp to the buffer extent.
+        let max_luma_w = self.max_luma_w.min(luma_cols);
+        let max_luma_h = self.max_luma_h.min(luma_rows);
+        // `MaxLumaW - (1 << subX)` can underflow if a degenerate caller
+        // never set the luma extent; guard with a saturating sub.
+        let clamp_x = max_luma_w.saturating_sub(1u32 << sub_x);
+        let clamp_y = max_luma_h.saturating_sub(1u32 << sub_y);
+
+        let read_luma = |yy: u32, xx: u32| -> i64 {
+            let cy = yy.min(luma_rows.saturating_sub(1));
+            let cx = xx.min(luma_cols.saturating_sub(1));
+            luma.samples[(cy as usize) * (luma_cols as usize) + (cx as usize)] as i64
+        };
+
+        let mut l = vec![0i64; w * h];
+        let mut luma_avg: i64 = 0;
+        for i in 0..h as u32 {
+            let mut luma_y = (start_y + i) << sub_y;
+            luma_y = luma_y.min(clamp_y);
+            for j in 0..w as u32 {
+                let mut luma_x = (start_x + j) << sub_x;
+                luma_x = luma_x.min(clamp_x);
+                // §7.11.5 `t = sum over dy<=subY, dx<=subX of
+                // CurrFrame[0][lumaY+dy][lumaX+dx]`.
+                let mut t: i64 = 0;
+                for dy in 0..=(sub_y as u32) {
+                    for dx in 0..=(sub_x as u32) {
+                        t += read_luma(luma_y + dy, luma_x + dx);
+                    }
+                }
+                // §7.11.5 `v = t << (3 - subX - subY)`.
+                let v = t << (3 - (sub_x as u32) - (sub_y as u32));
+                l[(i as usize) * w + (j as usize)] = v;
+                luma_avg += v;
+            }
+        }
+        // §7.11.5 `lumaAvg = Round2( lumaAvg, Tx_Width_Log2 +
+        // Tx_Height_Log2 )` — the §3 `Round2` rounding-shift. Use the
+        // signed Round2 (lumaAvg is non-negative here, so it matches the
+        // unsigned `Round2`).
+        let log2_w = w.trailing_zeros();
+        let log2_h = h.trailing_zeros();
+        let luma_avg = round2_signed(luma_avg, log2_w + log2_h);
+
+        // §7.11.5 chroma rewrite — `CurrFrame[plane][..] = Clip1(dc +
+        // Round2Signed(alpha * (L - lumaAvg), 6))`. `Clip1` is `Clip3(0,
+        // (1 << BitDepth) - 1, x)`.
+        let max_val: i64 = (1i64 << bit_depth) - 1;
+        let Some(buf) = self.curr_frame[plane as usize].as_mut() else {
+            return;
+        };
+        let cols_buf = buf.cols;
+        for i in 0..h as u32 {
+            let dst_y = start_y + i;
+            if dst_y >= buf.rows {
+                break;
+            }
+            for j in 0..w as u32 {
+                let dst_x = start_x + j;
+                if dst_x >= cols_buf {
+                    break;
+                }
+                let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
+                let dc = buf.samples[idx] as i64;
+                let l_ij = l[(i as usize) * w + (j as usize)];
+                let scaled = round2_signed((alpha as i64) * (l_ij - luma_avg), 6);
+                buf.samples[idx] = (dc + scaled).clamp(0, max_val) as i32;
             }
         }
     }
@@ -28222,6 +28381,12 @@ impl PartitionWalker {
             y_mode,
             angle_delta_y,
             angle_delta_uv: angle_delta_uv.unwrap_or(0),
+            // §5.11.45 `read_cfl_alphas` outputs — `signX * (cfl_alpha_x
+            // + 1)` already folded by the reader. `None` (no CfL block)
+            // ⇒ `0`; the §7.11.5 process is only invoked on the `isCfl`
+            // arm so the inert default is never read otherwise.
+            cfl_alpha_u: cfl_alpha_u.unwrap_or(0),
+            cfl_alpha_v: cfl_alpha_v.unwrap_or(0),
             avail_l,
             avail_u,
             avail_l_chroma,
@@ -28496,6 +28661,9 @@ impl PartitionWalker {
             y_mode: 0,
             angle_delta_y: 0,
             angle_delta_uv: 0,
+            // Inter arm — no CfL block; §7.11.5 is intra-only.
+            cfl_alpha_u: 0,
+            cfl_alpha_v: 0,
             avail_l: false,
             avail_u: false,
             avail_l_chroma: false,
@@ -29735,13 +29903,14 @@ impl PartitionWalker {
             let have_above = avail_u || y > 0;
             // §5.11.35 lines 5276-5280: `isCfl = (plane > 0 && UVMode ==
             // UV_CFL_PRED)`; `mode = (plane == 0) ? YMode : (isCfl ?
-            // DC_PRED : UVMode)`. The CfL DC base lands here; the
-            // §7.11.4 `predict_chroma_from_luma` AC contribution is a
-            // separate (out-of-scope) leaf, so a CfL block reconstructs
-            // only its DC component for now.
+            // DC_PRED : UVMode)`. The CfL chroma block first runs the
+            // §7.11.2 `DC_PRED` base here, then the §7.11.5
+            // `predict_chroma_from_luma` AC contribution (below) layers
+            // the reconstructed-luma high frequencies on top.
+            let is_cfl = plane > 0 && ctx.uv_mode as usize == UV_CFL_PRED;
             let (mode, angle_delta) = if plane == 0 {
                 (ctx.y_mode as usize, ctx.angle_delta_y as i32)
-            } else if ctx.uv_mode as usize == UV_CFL_PRED {
+            } else if is_cfl {
                 (DC_PRED, 0)
             } else {
                 (ctx.uv_mode as usize, ctx.angle_delta_uv as i32)
@@ -29787,6 +29956,44 @@ impl PartitionWalker {
                 eief,
                 filter_type,
             );
+
+            // §5.11.35 line `if ( isCfl ) predict_chroma_from_luma(...)`
+            // (av1-spec p.85, line 5296) — the §7.11.5 chroma-from-luma
+            // process runs **after** the chroma DC base above, reading
+            // the already-reconstructed luma plane (which was walked
+            // first by the §5.11.34 plane loop) and adding the
+            // alpha-scaled luma high frequencies on top of `DC_PRED`.
+            // `CflAlphaU` / `CflAlphaV` are the §5.11.45-decoded signed
+            // magnitudes carried on `ctx`.
+            if is_cfl {
+                let alpha = if plane == 1 {
+                    ctx.cfl_alpha_u as i32
+                } else {
+                    ctx.cfl_alpha_v as i32
+                };
+                self.predict_chroma_from_luma_into_curr_frame(
+                    plane,
+                    start_x,
+                    start_y,
+                    tx_sz,
+                    sub_x,
+                    sub_y,
+                    alpha,
+                    ctx.quant.bit_depth,
+                );
+            }
+
+            // §5.11.35 lines 5300-5302: `if ( plane == 0 ) { MaxLumaW =
+            // startX + stepX * 4; MaxLumaH = startY + stepY * 4 }`. The
+            // §7.11.5 luma-subsample clamp reads these back on the
+            // co-located chroma TUs that follow in the same block's
+            // plane loop.
+            if plane == 0 {
+                let step_x4 = (TX_WIDTH[tx_sz] >> MI_SIZE_LOG2) as u32;
+                let step_y4 = (TX_HEIGHT[tx_sz] >> MI_SIZE_LOG2) as u32;
+                self.max_luma_w = start_x + step_x4 * 4;
+                self.max_luma_h = start_y + step_y4 * 4;
+            }
         }
 
         // Record the per-TU task (spec-order emission). `plane_tx_type`
@@ -36461,6 +36668,127 @@ mod tests {
         // but the §9.4 source is immutable.
         assert_ne!(ctx.cfl_alpha, before, "read_symbol must adapt the CDF");
         assert_eq!(DEFAULT_CFL_ALPHA_CDF[0][0], 7637);
+    }
+
+    /// §7.11.5 predict-chroma-from-luma — flat luma (or `alpha == 0`)
+    /// leaves the chroma `DC_PRED` base unchanged, because every
+    /// `L[i][j]` equals `lumaAvg` ⇒ the scaled high-frequency term is
+    /// zero. Exercises the walker method directly with a hand-seeded
+    /// `CurrFrame[0]` (luma) and `CurrFrame[1]` (chroma DC base).
+    #[test]
+    fn predict_chroma_from_luma_flat_luma_is_identity() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        // 4:2:0: luma plane 16×16, chroma plane 8×8.
+        walker.ensure_curr_frame_plane(0, 16, 16);
+        walker.ensure_curr_frame_plane(1, 8, 8);
+        // Flat luma == 100.
+        if let Some(p) = walker.curr_frame[0].as_mut() {
+            p.samples.iter_mut().for_each(|s| *s = 100);
+        }
+        // Chroma DC base == 64.
+        if let Some(p) = walker.curr_frame[1].as_mut() {
+            p.samples.iter_mut().for_each(|s| *s = 64);
+        }
+        walker.max_luma_w = 16;
+        walker.max_luma_h = 16;
+        // Non-zero alpha; flat luma ⇒ still identity.
+        walker.predict_chroma_from_luma_into_curr_frame(1, 0, 0, TX_4X4, 1, 1, 8, 8);
+        let chroma = walker.curr_frame(1).unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    chroma[i * 8 + j],
+                    64,
+                    "flat luma keeps DC base at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// §7.11.5 predict-chroma-from-luma — a non-flat luma gradient with
+    /// a non-zero alpha rewrites each chroma sample as `Clip1(dc +
+    /// Round2Signed(alpha * (L[i][j] - lumaAvg), 6))`. The test mirrors
+    /// the spec formula independently and asserts the walker output
+    /// matches sample-for-sample, including the `alpha`-sign flip.
+    #[test]
+    fn predict_chroma_from_luma_gradient_matches_spec_formula() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+        walker.ensure_curr_frame_plane(0, 16, 16);
+        walker.ensure_curr_frame_plane(1, 8, 8);
+        // Luma gradient: sample(y, x) = 10 * y + x (in 0..255).
+        if let Some(p) = walker.curr_frame[0].as_mut() {
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    p.samples[(y * 16 + x) as usize] = (10 * y + x) as i32;
+                }
+            }
+        }
+        let dc_base = 70i32;
+        if let Some(p) = walker.curr_frame[1].as_mut() {
+            p.samples.iter_mut().for_each(|s| *s = dc_base);
+        }
+        walker.max_luma_w = 16;
+        walker.max_luma_h = 16;
+        let alpha = -3i32;
+        let (sub_x, sub_y) = (1u8, 1u8);
+        let (w, h) = (4usize, 4usize);
+
+        // Independent reference: §7.11.5 `L` / `lumaAvg`.
+        let luma_at = |y: u32, x: u32| -> i64 { (10 * (y.min(15)) + x.min(15)) as i64 };
+        let mut l = [[0i64; 4]; 4];
+        let mut luma_avg: i64 = 0;
+        for (i, lrow) in l.iter_mut().enumerate() {
+            let luma_y = ((i as u32) << sub_y).min(16 - (1 << sub_y));
+            for (j, lij) in lrow.iter_mut().enumerate() {
+                let luma_x = ((j as u32) << sub_x).min(16 - (1 << sub_x));
+                let mut t = 0i64;
+                for dy in 0..=(sub_y as u32) {
+                    for dx in 0..=(sub_x as u32) {
+                        t += luma_at(luma_y + dy, luma_x + dx);
+                    }
+                }
+                let v = t << (3 - (sub_x as u32) - (sub_y as u32));
+                *lij = v;
+                luma_avg += v;
+            }
+        }
+        // Round2(luma_avg, log2_w + log2_h) = Round2(.., 4).
+        let luma_avg = round2_signed(luma_avg, 4);
+
+        walker.predict_chroma_from_luma_into_curr_frame(1, 0, 0, TX_4X4, sub_x, sub_y, alpha, 8);
+        let chroma = walker.curr_frame(1).unwrap();
+
+        let mut any_changed = false;
+        for i in 0..h {
+            for j in 0..w {
+                let scaled = round2_signed((alpha as i64) * (l[i][j] - luma_avg), 6);
+                let expected = ((dc_base as i64) + scaled).clamp(0, 255) as i32;
+                assert_eq!(
+                    chroma[i * 8 + j],
+                    expected,
+                    "CfL sample ({i},{j}) must match the §7.11.5 formula"
+                );
+                if expected != dc_base {
+                    any_changed = true;
+                }
+            }
+        }
+        assert!(
+            any_changed,
+            "gradient luma must perturb at least one sample"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -56599,6 +56927,8 @@ mod tests {
             y_mode: 0,
             angle_delta_y: 0,
             angle_delta_uv: 0,
+            cfl_alpha_u: 0,
+            cfl_alpha_v: 0,
             avail_l: false,
             avail_u: false,
             avail_l_chroma: false,

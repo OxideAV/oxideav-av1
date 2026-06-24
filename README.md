@@ -101,9 +101,18 @@ directional kernel projects them, gated on the frame's
 neighbour smooth-mode check. Both planes are covered: the luma check
 reads the §6.10.4 `YModes[]` grid; the chroma check reads the §5.11.22
 `UVModes[]` grid (now stamped per-block) at the §7.11.2.8 sub-sampled
-neighbour coordinates. Filter-intra / CfL-AC / IntraBC and the
-lossy-quant post-pass chain remain follow-ups before this path produces
-validated bit-exact keyframe pixels.
+neighbour coordinates. As of r367 the **chroma-from-luma (CfL)** AC
+contribution is also wired: a `UV_CFL_PRED` chroma TU writes the §7.11.2
+`DC_PRED` base, then `predict_chroma_from_luma_into_curr_frame` (§7.11.5)
+layers the reconstructed-luma high frequencies on top — subsampling
+`CurrFrame[0]` into `L[i][j]` with 3 fractional bits, deriving `lumaAvg`,
+and rewriting each sample as `Clip1(dc + Round2Signed(CflAlpha{U,V} *
+(L - lumaAvg), 6))`, clamped to the §5.11.35 `MaxLumaW` / `MaxLumaH`
+per-luma-TU extent (now tracked on the walker). The §5.11.45-decoded
+signed alphas thread onto `ResidualContext`, so CfL blocks reconstruct
+their full DC + luma-AC prediction rather than DC-only. Filter-intra /
+IntraBC and the lossy-quant post-pass chain remain follow-ups before
+this path produces validated bit-exact keyframe pixels.
 
 The §5.11 walker now also reconstructs **inter pixels** at frame scope:
 the §5.11.18 → §5.11.23 → §5.11.31 inter-syntax cascade stamps each
