@@ -51,12 +51,140 @@ use crate::encoder::pixel_driver_dyn::{
     root_super_block, sb_grid_origins, MAX_DIM, MAX_DIM_YUV_MULTI_SB, MAX_DIM_Y_MULTI_SB, MIN_DIM,
 };
 use crate::encoder::tile_group_obu::parse_tile_group_obu_body;
+use crate::film_grain::film_grain_synthesis;
 use crate::frame_header::FrameHeader;
+use crate::loop_filter::PlaneBuffer;
 use crate::scan::get_default_scan;
 use crate::sequence_header::SequenceHeader;
 use crate::symbol_decoder::SymbolDecoder;
 use crate::transform::inverse_transform_2d;
 use crate::Error;
+
+/// §7.18.3 film-grain synthesis post-processing pass for the dyn 4:2:0
+/// driver.
+///
+/// Runs after §5.11.33 reconstruction has filled the three `u8` plane
+/// buffers, mirroring the spec's "decode_frame() → film_grain_synthesis"
+/// ordering (av1-spec §7.4). The pass is gated on the parsed frame
+/// header's `film_grain_params.apply_grain`: when the flag is clear (the
+/// common case, and every prior-arc IVF fixture) the call is a verbatim
+/// no-op and the reconstructed bytes flow through unchanged, preserving
+/// byte-for-byte parity with the pre-r373 output.
+///
+/// When `apply_grain == 1`, the `u8` planes are promoted to the `i32`
+/// [`PlaneBuffer`] shape the §7.18.3 driver consumes, blended in place by
+/// [`film_grain_synthesis`], then `Clip1`-narrowed back to `u8`. The
+/// driver itself owns the §7.18.3.2 LFSR, §7.18.3.3 grain build,
+/// §7.18.3.4 scaling LUT, and §7.18.3.5 noise blend; this bridge only
+/// marshals plane shapes and reads the frame/sequence-header fields the
+/// driver needs (`bit_depth`, `num_planes`, `subsampling_*`,
+/// `matrix_coefficients` per §5.5.2).
+#[allow(clippy::too_many_arguments)]
+fn post_process_film_grain_420(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    width: u32,
+    height: u32,
+    chroma_width: usize,
+    chroma_height: usize,
+    recon_y: &mut [u8],
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
+) {
+    let fg = match fh.film_grain_params.as_ref() {
+        Some(fg) if fg.apply_grain => fg,
+        // No grain params, or apply_grain == 0 ⇒ §7.18.3 is a no-op.
+        _ => return,
+    };
+
+    let cc = &seq.color_config;
+    // Promote the u8 planes to the i32 PlaneBuffer shape the §7.18.3
+    // driver consumes.
+    let mut y_i32: Vec<i32> = recon_y.iter().map(|&v| i32::from(v)).collect();
+    let mut u_i32: Vec<i32> = recon_u.iter().map(|&v| i32::from(v)).collect();
+    let mut v_i32: Vec<i32> = recon_v.iter().map(|&v| i32::from(v)).collect();
+
+    {
+        let mut planes = [
+            PlaneBuffer {
+                rows: height,
+                cols: width,
+                samples: &mut y_i32,
+            },
+            PlaneBuffer {
+                rows: chroma_height as u32,
+                cols: chroma_width as u32,
+                samples: &mut u_i32,
+            },
+            PlaneBuffer {
+                rows: chroma_height as u32,
+                cols: chroma_width as u32,
+                samples: &mut v_i32,
+            },
+        ];
+        film_grain_synthesis(
+            fg,
+            cc.bit_depth,
+            cc.num_planes,
+            u8::from(cc.subsampling_x),
+            u8::from(cc.subsampling_y),
+            cc.matrix_coefficients,
+            &mut planes,
+        );
+    }
+
+    // Clip1-narrow back to u8 (bit_depth == 8 on this arc).
+    for (dst, src) in recon_y.iter_mut().zip(y_i32.iter()) {
+        *dst = (*src).clamp(0, 255) as u8;
+    }
+    for (dst, src) in recon_u.iter_mut().zip(u_i32.iter()) {
+        *dst = (*src).clamp(0, 255) as u8;
+    }
+    for (dst, src) in recon_v.iter_mut().zip(v_i32.iter()) {
+        *dst = (*src).clamp(0, 255) as u8;
+    }
+}
+
+/// §7.18.3 film-grain synthesis post-processing for the monochrome dyn-y
+/// driver.
+///
+/// Monochrome (`num_planes == 1`) blends grain into the single luma plane
+/// only; §7.18.3 suppresses chroma when `mono_chrome`. Gated identically
+/// to [`post_process_film_grain_420`] on `apply_grain`, so the mono path
+/// keeps byte-for-byte parity with prior arcs whenever grain is off.
+fn post_process_film_grain_mono(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    width: u32,
+    height: u32,
+    recon_y: &mut [u8],
+) {
+    let fg = match fh.film_grain_params.as_ref() {
+        Some(fg) if fg.apply_grain => fg,
+        _ => return,
+    };
+    let cc = &seq.color_config;
+    let mut y_i32: Vec<i32> = recon_y.iter().map(|&v| i32::from(v)).collect();
+    {
+        let mut planes = [PlaneBuffer {
+            rows: height,
+            cols: width,
+            samples: &mut y_i32,
+        }];
+        film_grain_synthesis(
+            fg,
+            cc.bit_depth,
+            cc.num_planes,
+            u8::from(cc.subsampling_x),
+            u8::from(cc.subsampling_y),
+            cc.matrix_coefficients,
+            &mut planes,
+        );
+    }
+    for (dst, src) in recon_y.iter_mut().zip(y_i32.iter()) {
+        *dst = (*src).clamp(0, 255) as u8;
+    }
+}
 
 /// Decode one dynamic-extent intra-only frame and surface it as
 /// [`Frame::Yuv420Dyn`]. Called from [`super::pixel_driver::decode_frame`]
@@ -110,7 +238,6 @@ pub(crate) fn decode_frame_dyn(
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
     let q_params = QuantizerParams::neutral(qp_fh.base_q_idx, 8);
-    let _ = seq;
 
     let parsed = parse_tile_group_obu_body(
         tile_group_body,
@@ -191,6 +318,20 @@ pub(crate) fn decode_frame_dyn(
             &mut recon_v,
         )?;
     }
+
+    // §7.18.3 film-grain synthesis post-processing (no-op when
+    // apply_grain == 0, which is every prior-arc fixture).
+    post_process_film_grain_420(
+        seq,
+        fh,
+        width,
+        height,
+        chroma_width,
+        chroma_height,
+        &mut recon_y,
+        &mut recon_u,
+        &mut recon_v,
+    );
 
     Ok(Frame::Yuv420Dyn {
         width,
@@ -973,7 +1114,6 @@ pub(crate) fn decode_frame_dyn_y(
     fh: &FrameHeader,
     tile_group_body: &[u8],
 ) -> Result<Frame, Error> {
-    let _ = seq;
     let fs = fh
         .frame_size
         .as_ref()
@@ -1073,6 +1213,10 @@ pub(crate) fn decode_frame_dyn_y(
             &mut recon_y,
         )?;
     }
+
+    // §7.18.3 film-grain synthesis post-processing (mono / luma-only;
+    // no-op when apply_grain == 0).
+    post_process_film_grain_mono(seq, fh, width, height, &mut recon_y);
 
     Ok(Frame::YDyn {
         width,
@@ -1310,7 +1454,112 @@ fn decode_block_leaf_y(
 mod tests {
     use super::*;
     use crate::decode_av1;
+    use crate::encoder::ivf::IvfReader;
     use crate::encoder::pixel_driver_dyn::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    use crate::frame_header::parse_frame_header;
+    use crate::obu::{ObuIter, ObuType};
+    use crate::sequence_header::parse_sequence_header;
+    use crate::uncompressed_header_tail::FilmGrainParams;
+
+    /// Parse the first temporal unit of an encoded IVF stream into its
+    /// (SequenceHeader, FrameHeader, tile-group body) triple — the exact
+    /// inputs `decode_frame_dyn` consumes. Mirrors the §7.5 TU walk in
+    /// `decode_temporal_unit` so the film-grain wiring can be exercised
+    /// against a real parsed header pair.
+    fn parse_first_tu(ivf_bytes: &[u8]) -> (SequenceHeader, FrameHeader, Vec<u8>) {
+        let reader = IvfReader::new(ivf_bytes).expect("ivf header");
+        let frames = reader.read_all().expect("ivf frames");
+        let payload = &frames[0].payload;
+        let mut seq: Option<SequenceHeader> = None;
+        let mut fh: Option<FrameHeader> = None;
+        let mut tg: Option<Vec<u8>> = None;
+        for desc in ObuIter::new(payload) {
+            let desc = desc.expect("obu");
+            match desc.obu_type {
+                ObuType::SequenceHeader => {
+                    seq = Some(parse_sequence_header(desc.payload).expect("sh"));
+                }
+                ObuType::FrameHeader => {
+                    let s = seq.as_ref().expect("sh before fh");
+                    fh = Some(parse_frame_header(desc.payload, s).expect("fh"));
+                }
+                ObuType::TileGroup => {
+                    tg = Some(desc.payload.to_vec());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (seq.unwrap(), fh.unwrap(), tg.unwrap())
+    }
+
+    /// A §5.9.30 film-grain block with `apply_grain == 1` and a single
+    /// non-trivial luma scaling point, enough that §7.18.3.5 blends a
+    /// non-zero noise field into the reconstructed luma plane.
+    fn active_grain_params() -> FilmGrainParams {
+        let mut fg = FilmGrainParams::reset();
+        fg.apply_grain = true;
+        fg.grain_seed = 0x1234;
+        fg.num_y_points = 2;
+        fg.point_y_value[0] = 0;
+        fg.point_y_scaling[0] = 255;
+        fg.point_y_value[1] = 255;
+        fg.point_y_scaling[1] = 255;
+        fg.grain_scaling = 8;
+        fg.ar_coeff_lag = 0;
+        fg.ar_coeff_shift = 6;
+        fg.grain_scale_shift = 0;
+        fg
+    }
+
+    #[test]
+    fn dyn_film_grain_apply_grain_off_is_noop() {
+        // grain off (every encoder-produced fixture) ⇒ post-process is a
+        // verbatim no-op; the §7.18.3 pass must not perturb the bytes.
+        let input = Yuv420Frame::filled(32, 32, 100);
+        let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode");
+        let (seq, fh, tg) = parse_first_tu(&encoded.ivf_bytes);
+        // The encoder's FH carries apply_grain == 0 (or None grain).
+        if let Some(fg) = fh.film_grain_params.as_ref() {
+            assert!(!fg.apply_grain, "encoder fixture must have grain off");
+        }
+        let frame = decode_frame_dyn(&seq, &fh, &tg).expect("decode");
+        match frame {
+            Frame::Yuv420Dyn { y, u, v, .. } => {
+                assert_eq!(y, input.y);
+                assert_eq!(u, input.u);
+                assert_eq!(v, input.v);
+            }
+            _ => panic!("expected Yuv420Dyn"),
+        }
+    }
+
+    #[test]
+    fn dyn_film_grain_apply_grain_on_perturbs_luma() {
+        // Same stream, but flip the FH's grain block to apply_grain == 1
+        // with a non-trivial scaling point. The §7.18.3 pass must now
+        // change the reconstructed luma vs the grain-off decode.
+        let input = Yuv420Frame::filled(32, 32, 100);
+        let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode");
+        let (seq, fh_off, tg) = parse_first_tu(&encoded.ivf_bytes);
+
+        let baseline = decode_frame_dyn(&seq, &fh_off, &tg).expect("decode off");
+
+        let mut fh_on = fh_off.clone();
+        fh_on.film_grain_params = Some(active_grain_params());
+        let grained = decode_frame_dyn(&seq, &fh_on, &tg).expect("decode on");
+
+        let (by, gy) = match (&baseline, &grained) {
+            (Frame::Yuv420Dyn { y: by, .. }, Frame::Yuv420Dyn { y: gy, .. }) => (by, gy),
+            _ => panic!("expected Yuv420Dyn"),
+        };
+        assert_eq!(by.len(), gy.len());
+        // Grain must have changed at least one luma sample.
+        assert!(
+            by.iter().zip(gy.iter()).any(|(a, b)| a != b),
+            "apply_grain == 1 must perturb the luma plane",
+        );
+    }
 
     #[test]
     fn dyn_decode_flat_grey_16x16_via_dyn_driver_roundtrip() {
