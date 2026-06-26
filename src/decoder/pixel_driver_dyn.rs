@@ -56,6 +56,7 @@ use crate::frame_header::FrameHeader;
 use crate::loop_filter::PlaneBuffer;
 use crate::scan::get_default_scan;
 use crate::sequence_header::SequenceHeader;
+use crate::superres::{upscale_frame, SuperresFrameContext};
 use crate::symbol_decoder::SymbolDecoder;
 use crate::transform::inverse_transform_2d;
 use crate::Error;
@@ -184,6 +185,134 @@ fn post_process_film_grain_mono(
     for (dst, src) in recon_y.iter_mut().zip(y_i32.iter()) {
         *dst = (*src).clamp(0, 255) as u8;
     }
+}
+
+/// Result of [`post_process_superres_420`]: the (possibly widened) output
+/// luma width and the three upscaled 4:2:0 plane buffers.
+struct SuperresOutput {
+    width: u32,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+/// §7.16 horizontal superres upscaling post-processing for the dyn 4:2:0
+/// driver.
+///
+/// In §7.4 decode order superres runs **before** film-grain synthesis
+/// (deblock → CDEF → superres → loop-restoration → film-grain). On the
+/// lossless intra dyn arc deblock / CDEF / LR are no-ops, so this pass
+/// sits directly before [`post_process_film_grain_420`].
+///
+/// When `use_superres == 0` (or `frame_width == upscaled_width`) the §7.16
+/// driver short-circuits to a verbatim copy, so the function returns the
+/// reconstructed planes unchanged and the output width stays `frame_width`
+/// — byte-for-byte parity with every prior-arc fixture.
+///
+/// When `use_superres == 1`, each plane is upscaled horizontally from its
+/// `frame_width`-derived width to its `upscaled_width`-derived width via
+/// [`upscale_frame`]; heights are unchanged (superres is horizontal only).
+/// The returned tuple is `(upscaled_luma_width, [y, u, v])` with the
+/// chroma planes at `(upscaled_width + 1) >> 1` columns.
+fn post_process_superres_420(
+    seq: &SequenceHeader,
+    fs: &crate::frame_header::FrameSize,
+    recon_y: Vec<u8>,
+    recon_u: Vec<u8>,
+    recon_v: Vec<u8>,
+) -> Result<SuperresOutput, Error> {
+    let frame_width = fs.frame_width;
+    let upscaled_width = fs.upscaled_width;
+    let height = fs.frame_height;
+
+    // §7.16 short-circuit — no upscale required.
+    if !fs.use_superres || frame_width == upscaled_width {
+        return Ok(SuperresOutput {
+            width: frame_width,
+            y: recon_y,
+            u: recon_u,
+            v: recon_v,
+        });
+    }
+    if upscaled_width <= frame_width {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    let cc = &seq.color_config;
+    // 4:2:0 chroma widths: Round2(width, subX) with subX == 1.
+    let in_cw = ((frame_width + 1) >> 1) as usize;
+    let out_cw = ((upscaled_width + 1) >> 1) as usize;
+    let ch = ((height + 1) >> 1) as usize;
+
+    // Promote inputs to the i32 PlaneBuffer shape the §7.16 driver
+    // consumes.
+    let mut y_in: Vec<i32> = recon_y.iter().map(|&v| i32::from(v)).collect();
+    let mut u_in: Vec<i32> = recon_u.iter().map(|&v| i32::from(v)).collect();
+    let mut v_in: Vec<i32> = recon_v.iter().map(|&v| i32::from(v)).collect();
+
+    let mut y_out = vec![0i32; (upscaled_width as usize) * (height as usize)];
+    let mut u_out = vec![0i32; out_cw * ch];
+    let mut v_out = vec![0i32; out_cw * ch];
+
+    let ctx = SuperresFrameContext {
+        use_superres: true,
+        frame_width,
+        upscaled_width,
+        frame_height: height,
+        mi_cols: fs.mi_cols,
+        num_planes: cc.num_planes,
+        bit_depth: cc.bit_depth,
+        subsampling_x: u8::from(cc.subsampling_x),
+        subsampling_y: u8::from(cc.subsampling_y),
+    };
+
+    {
+        let inputs = [
+            PlaneBuffer {
+                rows: height,
+                cols: frame_width,
+                samples: &mut y_in,
+            },
+            PlaneBuffer {
+                rows: ch as u32,
+                cols: in_cw as u32,
+                samples: &mut u_in,
+            },
+            PlaneBuffer {
+                rows: ch as u32,
+                cols: in_cw as u32,
+                samples: &mut v_in,
+            },
+        ];
+        let mut outputs = [
+            PlaneBuffer {
+                rows: height,
+                cols: upscaled_width,
+                samples: &mut y_out,
+            },
+            PlaneBuffer {
+                rows: ch as u32,
+                cols: out_cw as u32,
+                samples: &mut u_out,
+            },
+            PlaneBuffer {
+                rows: ch as u32,
+                cols: out_cw as u32,
+                samples: &mut v_out,
+            },
+        ];
+        upscale_frame(&ctx, &inputs, &mut outputs).map_err(|_| Error::PartitionWalkOutOfRange)?;
+    }
+
+    let y = y_out.iter().map(|&v| v.clamp(0, 255) as u8).collect();
+    let u = u_out.iter().map(|&v| v.clamp(0, 255) as u8).collect();
+    let v = v_out.iter().map(|&v| v.clamp(0, 255) as u8).collect();
+    Ok(SuperresOutput {
+        width: upscaled_width,
+        y,
+        u,
+        v,
+    })
 }
 
 /// Decode one dynamic-extent intra-only frame and surface it as
@@ -319,14 +448,22 @@ pub(crate) fn decode_frame_dyn(
         )?;
     }
 
+    // §7.16 superres upscaling (no-op when use_superres == 0). Runs
+    // before film grain per §7.4 decode order. May widen the planes from
+    // `frame_width` to `upscaled_width`.
+    let sr = post_process_superres_420(seq, fs, recon_y, recon_u, recon_v)?;
+    let out_width = sr.width;
+    let (mut recon_y, mut recon_u, mut recon_v) = (sr.y, sr.u, sr.v);
+    let out_chroma_width = ((out_width + 1) >> 1) as usize;
+
     // §7.18.3 film-grain synthesis post-processing (no-op when
     // apply_grain == 0, which is every prior-arc fixture).
     post_process_film_grain_420(
         seq,
         fh,
-        width,
+        out_width,
         height,
-        chroma_width,
+        out_chroma_width,
         chroma_height,
         &mut recon_y,
         &mut recon_u,
@@ -334,7 +471,7 @@ pub(crate) fn decode_frame_dyn(
     );
 
     Ok(Frame::Yuv420Dyn {
-        width,
+        width: out_width,
         height,
         y: recon_y,
         u: recon_u,
@@ -1559,6 +1696,93 @@ mod tests {
             by.iter().zip(gy.iter()).any(|(a, b)| a != b),
             "apply_grain == 1 must perturb the luma plane",
         );
+    }
+
+    #[test]
+    fn dyn_superres_off_is_noop() {
+        // use_superres == 0 ⇒ §7.16 short-circuit: planes + width
+        // unchanged, byte-for-byte.
+        let input = Yuv420Frame::filled(32, 32, 100);
+        let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode");
+        let (seq, fh, _tg) = parse_first_tu(&encoded.ivf_bytes);
+        let fs = fh.frame_size.expect("frame size");
+        assert!(!fs.use_superres);
+        let y = input.y.clone();
+        let u = input.u.clone();
+        let v = input.v.clone();
+        let sr = post_process_superres_420(&seq, &fs, y.clone(), u.clone(), v.clone())
+            .expect("superres");
+        assert_eq!(sr.width, fs.frame_width);
+        assert_eq!(sr.y, y);
+        assert_eq!(sr.u, u);
+        assert_eq!(sr.v, v);
+    }
+
+    #[test]
+    fn dyn_superres_on_widens_and_preserves_flat_plane() {
+        // use_superres == 1 with upscaled_width > frame_width: a flat
+        // constant plane upscales (8-tap polyphase, taps sum to a
+        // normalised unit) to a flat constant plane at the new width,
+        // and the output luma plane carries `upscaled_width` columns.
+        let input = Yuv420Frame::filled(32, 32, 137);
+        let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode");
+        let (seq, fh, _tg) = parse_first_tu(&encoded.ivf_bytes);
+        let mut fs = fh.frame_size.expect("frame size");
+        // Synthesise a superres frame: keep frame_width = 32 (the coded /
+        // downscaled width the recon walk used) and widen the upscaled
+        // target to 48.
+        fs.use_superres = true;
+        fs.upscaled_width = 48;
+
+        let sr =
+            post_process_superres_420(&seq, &fs, input.y.clone(), input.u.clone(), input.v.clone())
+                .expect("superres");
+
+        assert_eq!(sr.width, 48);
+        // Luma: 48 × 32, all 137 (flat in ⇒ flat out).
+        assert_eq!(sr.y.len(), 48 * 32);
+        assert!(sr.y.iter().all(|&v| v == 137), "flat luma must stay flat");
+        // Chroma: 24 × 16, all 137.
+        assert_eq!(sr.u.len(), 24 * 16);
+        assert_eq!(sr.v.len(), 24 * 16);
+        assert!(sr.u.iter().all(|&v| v == 137));
+        assert!(sr.v.iter().all(|&v| v == 137));
+    }
+
+    #[test]
+    fn dyn_superres_end_to_end_through_decode_frame_dyn_widens_output() {
+        // Full decode path: a flat 32×32 frame with the FH's FrameSize
+        // mutated to use_superres == 1 / upscaled_width == 48 reconstructs
+        // through decode_frame_dyn and surfaces a Yuv420Dyn whose width is
+        // the upscaled 48 (proving the §7.16 pass is wired into the public
+        // dyn driver, not just callable in isolation).
+        let input = Yuv420Frame::filled(32, 32, 80);
+        let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode");
+        let (seq, mut fh, tg) = parse_first_tu(&encoded.ivf_bytes);
+        let mut fs = fh.frame_size.expect("frame size");
+        fs.use_superres = true;
+        fs.upscaled_width = 48;
+        fh.frame_size = Some(fs);
+
+        let frame = decode_frame_dyn(&seq, &fh, &tg).expect("decode");
+        match frame {
+            Frame::Yuv420Dyn {
+                width,
+                height,
+                y,
+                u,
+                v,
+            } => {
+                assert_eq!(width, 48);
+                assert_eq!(height, 32);
+                assert_eq!(y.len(), 48 * 32);
+                assert_eq!(u.len(), 24 * 16);
+                assert_eq!(v.len(), 24 * 16);
+                // Flat reconstruction upscales to a flat plane.
+                assert!(y.iter().all(|&p| p == 80));
+            }
+            _ => panic!("expected Yuv420Dyn"),
+        }
     }
 
     #[test]
