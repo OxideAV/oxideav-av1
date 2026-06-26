@@ -1786,6 +1786,64 @@ mod tests {
     }
 
     #[test]
+    fn dyn_superres_rejects_upscaled_not_larger() {
+        // use_superres == 1 but upscaled_width <= frame_width is a
+        // §7.16 conformance violation; the bridge rejects it rather than
+        // silently producing a narrower / equal-width frame.
+        let input = Yuv420Frame::filled(32, 32, 100);
+        let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode");
+        let (seq, fh, _tg) = parse_first_tu(&encoded.ivf_bytes);
+        let mut fs = fh.frame_size.expect("frame size");
+        fs.use_superres = true;
+        fs.upscaled_width = 24; // < frame_width (32) — invalid.
+        let r =
+            post_process_superres_420(&seq, &fs, input.y.clone(), input.u.clone(), input.v.clone());
+        assert!(matches!(r, Err(Error::PartitionWalkOutOfRange)));
+    }
+
+    #[test]
+    fn dyn_superres_then_film_grain_compose_in_decode_order() {
+        // §7.4 decode order: superres precedes film grain. With both
+        // active, the output must be (a) at the upscaled width AND (b)
+        // perturbed by grain — proving grain runs on the upscaled planes,
+        // not the pre-superres ones.
+        let input = Yuv420Frame::filled(32, 32, 100);
+        let encoded = encode_intra_frame_yuv_dyn(&input).expect("encode");
+        let (seq, mut fh, tg) = parse_first_tu(&encoded.ivf_bytes);
+        let mut fs = fh.frame_size.expect("frame size");
+        fs.use_superres = true;
+        fs.upscaled_width = 48;
+        fh.frame_size = Some(fs);
+
+        // Baseline: superres only (grain off).
+        let baseline = decode_frame_dyn(&seq, &fh, &tg).expect("decode superres-only");
+
+        // Now flip grain on as well.
+        let mut fh_grain = fh.clone();
+        fh_grain.film_grain_params = Some(active_grain_params());
+        let composed = decode_frame_dyn(&seq, &fh_grain, &tg).expect("decode superres+grain");
+
+        let (bw, by) = match &baseline {
+            Frame::Yuv420Dyn { width, y, .. } => (*width, y),
+            _ => panic!("expected Yuv420Dyn"),
+        };
+        let (cw, cy) = match &composed {
+            Frame::Yuv420Dyn { width, y, .. } => (*width, y),
+            _ => panic!("expected Yuv420Dyn"),
+        };
+        // Both at the upscaled width.
+        assert_eq!(bw, 48);
+        assert_eq!(cw, 48);
+        assert_eq!(by.len(), 48 * 32);
+        assert_eq!(cy.len(), 48 * 32);
+        // Grain perturbed the upscaled luma.
+        assert!(
+            by.iter().zip(cy.iter()).any(|(a, b)| a != b),
+            "film grain must perturb the post-superres luma plane",
+        );
+    }
+
+    #[test]
     fn dyn_decode_flat_grey_16x16_via_dyn_driver_roundtrip() {
         // 16×16 still goes through the fixed-size driver, but the
         // r230 dyn encoder synthesises its own (different) SH/FH that

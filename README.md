@@ -56,9 +56,18 @@ profile:
 - Lossless arm (`base_q_idx == 0`, inverse WHT, bit-exact
   encode/decode round-trip) and a lossy inverse-DCT arm
   (`base_q_idx > 0`, encoder/decoder self-consistency).
-- In-loop / post passes (loop filter, CDEF, loop restoration,
-  superres, film grain) are present as modules but disabled under this
-  parameter set.
+- In-loop / post passes (loop filter, CDEF, loop restoration) are
+  present as modules; on the lossless intra dyn parameter set they are
+  no-ops (`loop_filter_level = 0`, `enable_cdef = 0`,
+  `enable_restoration = 0`).
+- §7.16 **superres** and §7.18.3 **film-grain synthesis** are wired into
+  the public dynamic-extent decode path (`decode_frame_dyn` /
+  `decode_frame_dyn_y`), running in §7.4 decode order (superres before
+  film grain). Both gate on the parsed frame header: `use_superres == 0`
+  / `apply_grain == 0` (every encoder-produced fixture) make the passes
+  verbatim no-ops, preserving byte-for-byte parity; when active, superres
+  upscales each plane horizontally to `upscaled_width` and film grain
+  blends §7.18.3 noise into the (post-superres) planes in place.
 
 The inter-prediction reconstruction layer covers the §7.11.3.1 single-
 reference translational (SIMPLE), compound (AVERAGE / DISTANCE / WEDGE /
