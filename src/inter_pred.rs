@@ -11503,6 +11503,333 @@ mod tests {
         );
     }
 
+    /// r378 — the OBMC frame-walk dispatch is per-plane: a 4:2:0
+    /// three-plane (Y/Cb/Cr) frame with an 8×8 OBMC leaf reconstructs each
+    /// plane through `reconstruct_inter_block_obmc` with the §7.11.3.9
+    /// neighbour lists resolved at that plane's `(subsampling_x,
+    /// subsampling_y)`. The chroma planes (4×4 OBMC block, where
+    /// `get_plane_residual_size(BLOCK_8X8, plane) == BLOCK_4X4 <
+    /// BLOCK_8X8`) exercise the §7.11.3.9 above-pass small-block carve-out
+    /// (only the left-pass runs). The frame walk must match a hand-resolved
+    /// per-block OBMC oracle on every plane.
+    #[test]
+    fn r378_reconstruct_inter_frame_obmc_dispatch_multiplane_420() {
+        let ref_w = 32usize;
+        let ref_h = 32usize;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * ref_w + c] = ((r * 32 + c) & 0xff) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: ref_w,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry; 8];
+        let ref_frame_idx = [0u8; 7];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        let mi_rows: u32 = 4;
+        let mi_cols: u32 = 4;
+        let cells = (mi_rows * mi_cols) as usize;
+        let bw8x8 = crate::cdf::BLOCK_8X8;
+        let mut mi_sizes = vec![crate::cdf::BLOCK_INVALID; cells];
+        let mut is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        let mut mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let stamp = |mi_sizes: &mut [usize],
+                     is_inters: &mut [u8],
+                     ref_frames: &mut [i8],
+                     mvs: &mut [i16],
+                     r0: usize,
+                     c0: usize,
+                     mv: [i16; 2]| {
+            for dr in 0..2 {
+                for dc in 0..2 {
+                    let cell = (r0 + dr) * mi_cols as usize + (c0 + dc);
+                    mi_sizes[cell] = bw8x8;
+                    is_inters[cell] = 1;
+                    ref_frames[cell * 2] = last as i8;
+                    ref_frames[cell * 2 + 1] = -1;
+                    mvs[cell * 4] = mv[0];
+                    mvs[cell * 4 + 1] = mv[1];
+                }
+            }
+        };
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            0,
+            2,
+            [0, 8],
+        );
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            2,
+            0,
+            [8, 0],
+        );
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            0,
+            0,
+            [4, 4],
+        );
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            2,
+            2,
+            [2, 6],
+        );
+
+        let zeros = vec![0u8; cells];
+        let order_hints_by_ref = [0i32; 8];
+        let mut motion_modes = vec![crate::cdf::MOTION_MODE_SIMPLE; cells];
+        motion_modes[2 * mi_cols as usize + 2] = crate::cdf::MOTION_MODE_OBMC;
+        let mut avail_u = vec![0u8; cells];
+        let mut avail_l = vec![0u8; cells];
+        for r in 0..mi_rows as usize {
+            for c in 0..mi_cols as usize {
+                avail_u[r * mi_cols as usize + c] = (r > 0) as u8;
+                avail_l[r * mi_cols as usize + c] = (c > 0) as u8;
+            }
+        }
+
+        // Plane geometry: luma 16×16, chroma 8×8 (4:2:0).
+        let luma_w = 16usize;
+        let chroma_w = 8usize;
+        let mut y = vec![0u16; luma_w * luma_w];
+        let mut u = vec![0u16; chroma_w * chroma_w];
+        let mut v = vec![0u16; chroma_w * chroma_w];
+        let mut y_or = vec![0u16; luma_w * luma_w];
+        let mut u_or = vec![0u16; chroma_w * chroma_w];
+        let mut v_or = vec![0u16; chroma_w * chroma_w];
+
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &zeros,
+            wedge_indices: &zeros,
+            wedge_signs: &zeros,
+            mask_types: &zeros,
+            interintra_modes: &zeros,
+            wedge_interintras: &zeros,
+            interintra_wedge_indices: &zeros,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+            warp: None,
+            obmc: Some(GridObmcContext {
+                motion_modes: &motion_modes,
+                avail_u: &avail_u,
+                avail_l: &avail_l,
+            }),
+        };
+        {
+            let mut planes = [
+                PlaneReconContext {
+                    plane: 0,
+                    subsampling_x: 0,
+                    subsampling_y: 0,
+                    frame_store: &store,
+                    frame_width: ref_w as u32,
+                    frame_height: ref_h as u32,
+                    curr: &mut y,
+                    curr_stride: luma_w,
+                },
+                PlaneReconContext {
+                    plane: 1,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store,
+                    frame_width: ref_w as u32,
+                    frame_height: ref_h as u32,
+                    curr: &mut u,
+                    curr_stride: chroma_w,
+                },
+                PlaneReconContext {
+                    plane: 2,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store,
+                    frame_width: ref_w as u32,
+                    frame_height: ref_h as u32,
+                    curr: &mut v,
+                    curr_stride: chroma_w,
+                },
+            ];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("multiplane OBMC frame walk");
+        }
+
+        // Oracle: drive only the (2,2) OBMC leaf per plane via the per-block
+        // driver; the three SIMPLE leaves are reconstructed identically by
+        // an `obmc: None` walk into the *_or buffers first.
+        {
+            let grid_simple = InterModeInfoGrid {
+                mi_sizes: &mi_sizes,
+                is_inters: &is_inters,
+                ref_frames: &ref_frames,
+                mvs: &mvs,
+                interp_filters: &interp_filters,
+                compound_types: &zeros,
+                wedge_indices: &zeros,
+                wedge_signs: &zeros,
+                mask_types: &zeros,
+                interintra_modes: &zeros,
+                wedge_interintras: &zeros,
+                interintra_wedge_indices: &zeros,
+                order_hint_bits: 7,
+                current_order_hint: 0,
+                order_hints_by_ref: &order_hints_by_ref,
+                mi_rows,
+                mi_cols,
+                bit_depth: 8,
+                warp: None,
+                obmc: None,
+            };
+            let mut planes = [
+                PlaneReconContext {
+                    plane: 0,
+                    subsampling_x: 0,
+                    subsampling_y: 0,
+                    frame_store: &store,
+                    frame_width: ref_w as u32,
+                    frame_height: ref_h as u32,
+                    curr: &mut y_or,
+                    curr_stride: luma_w,
+                },
+                PlaneReconContext {
+                    plane: 1,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store,
+                    frame_width: ref_w as u32,
+                    frame_height: ref_h as u32,
+                    curr: &mut u_or,
+                    curr_stride: chroma_w,
+                },
+                PlaneReconContext {
+                    plane: 2,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store,
+                    frame_width: ref_w as u32,
+                    frame_height: ref_h as u32,
+                    curr: &mut v_or,
+                    curr_stride: chroma_w,
+                },
+            ];
+            reconstruct_inter_frame(&grid_simple, &ref_frame_idx, &mut planes)
+                .expect("simple oracle walk");
+        }
+        // Overlay the per-block OBMC leaf on each oracle plane. Neighbours:
+        // above (mi 1,3) MV from the (0,2) leaf; left (mi 3,1) MV from the
+        // (2,0) leaf — both 8×8 ⇒ step4 = 2.
+        let above_mv = [
+            mvs[(mi_cols as usize + 3) * 4],
+            mvs[(mi_cols as usize + 3) * 4 + 1],
+        ];
+        let left_mv = [
+            mvs[(3 * mi_cols as usize + 1) * 4],
+            mvs[(3 * mi_cols as usize + 1) * 4 + 1],
+        ];
+        let nb = |mv: [i16; 2]| PredictInterRef {
+            ref_plane: &refp[..],
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv,
+        };
+        for (plane, (orc, cstride)) in [
+            (&mut y_or, luma_w),
+            (&mut u_or, chroma_w),
+            (&mut v_or, chroma_w),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sub = if plane > 0 { 1u8 } else { 0 };
+            let above_gate = sub == 0; // BLOCK_8X8>=8x8 luma; chroma 4×4<8×8
+            let above_nb = [ObmcNeighbour {
+                bundle: nb(above_mv),
+                step4: 2,
+            }];
+            let left_nb = [ObmcNeighbour {
+                bundle: nb(left_mv),
+                step4: 2,
+            }];
+            let op = ObmcParams {
+                mi_row: 2,
+                mi_col: 2,
+                mi_cols,
+                mi_rows,
+                mi_width_log2: crate::cdf::mi_width_log2(bw8x8) as u8,
+                mi_height_log2: crate::cdf::mi_height_log2(bw8x8) as u8,
+                avail_u: true,
+                avail_l: true,
+                plane_residual_size_ge_block_8x8: above_gate,
+                above_neighbours: if above_gate { &above_nb } else { &[] },
+                left_neighbours: &left_nb,
+            };
+            let w = 8usize >> sub;
+            let h = 8usize >> sub;
+            let x = 8i32 >> sub;
+            let yy = 8i32 >> sub;
+            reconstruct_inter_block_obmc(
+                InterModeInfo {
+                    ref_frame: last,
+                    mv: [2, 6],
+                },
+                &op,
+                &ref_frame_idx,
+                &store,
+                plane as u8,
+                x,
+                yy,
+                w,
+                h,
+                8,
+                sub,
+                sub,
+                ref_w as u32,
+                ref_h as u32,
+                EIGHTTAP,
+                EIGHTTAP,
+                orc.as_mut_slice(),
+                cstride,
+            )
+            .expect("per-block OBMC oracle plane");
+        }
+
+        assert_eq!(y, y_or, "luma OBMC frame walk vs per-block oracle");
+        assert_eq!(u, u_or, "Cb OBMC frame walk vs per-block oracle");
+        assert_eq!(v, v_or, "Cr OBMC frame walk vs per-block oracle");
+    }
+
     // ---------- r294 §7.11.3.1 compound block driver ----------
 
     /// Build a deterministic `16×16` reference plane (`r*16 + c`) and a
