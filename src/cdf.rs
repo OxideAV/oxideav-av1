@@ -15747,6 +15747,15 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     /// §5.11.7 `interp_filter[ 0..2 ]` (`BILINEAR` on the intrabc
     /// arm). Stamped only when `is_inter != 0`.
     pub interp_filter: [u8; 2],
+    /// §5.11.27 decoded `motion_mode` ordinal
+    /// ([`MOTION_MODE_SIMPLE`] / [`MOTION_MODE_OBMC`] /
+    /// [`MOTION_MODE_WARPED_CAUSAL`]). Stamped into the
+    /// [`PartitionWalker::motion_modes`] grid over the block footprint
+    /// (mirroring the §5.11.5 decode-walker grid-fill) only when
+    /// `is_inter != 0`; intra blocks leave the grid at its
+    /// `MOTION_MODE_SIMPLE` initial-zero state. Read by the §5.11.33
+    /// frame walk's OBMC / warp dispatch.
+    pub motion_mode: u8,
     /// §5.11.46 `PaletteSizeY` (0 = no luma palette).
     pub palette_size_y: u8,
     /// §5.11.46 `palette_colors_y[ 0..PaletteSizeY ]`.
@@ -18075,6 +18084,31 @@ impl PartitionWalker {
         wedge_interintras_snap.extend_from_slice(&self.wedge_interintras[..cells]);
         interintra_wedge_indices_snap.extend_from_slice(&self.interintra_wedge_indices[..cells]);
 
+        // §5.11.27 / §7.11.3.9 OBMC context: snapshot the per-cell
+        // `motion_modes` grid the §5.11.27 read stamped, and derive the
+        // §5.11.18 `AvailU` / `AvailL` per-cell availability grids from the
+        // walker's tile geometry (`AvailU = is_inside(MiRow - 1, MiCol)`,
+        // `AvailL = is_inside(MiRow, MiCol - 1)` — av1-spec lines
+        // 3915-3916). The frame walk then dispatches a decoded
+        // `motion_mode == OBMC` single-ref leaf to the §7.11.3.9-10 overlap
+        // path, resolving its neighbour lists internally from the grid.
+        let mut motion_modes_snap: Vec<u8> = Vec::new();
+        let mut avail_u_snap: Vec<u8> = Vec::new();
+        let mut avail_l_snap: Vec<u8> = Vec::new();
+        if motion_modes_snap.try_reserve_exact(cells).is_err()
+            || avail_u_snap.try_reserve_exact(cells).is_err()
+            || avail_l_snap.try_reserve_exact(cells).is_err()
+        {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        motion_modes_snap.extend_from_slice(&self.motion_modes[..cells]);
+        for r in 0..(mi_rows as usize) {
+            for c in 0..(mi_cols as usize) {
+                avail_u_snap.push(self.geometry.is_inside(r as i32 - 1, c as i32) as u8);
+                avail_l_snap.push(self.geometry.is_inside(r as i32, c as i32 - 1) as u8);
+            }
+        }
+
         // Mirror each plane's `i32` `curr_frame` buffer to `u16`,
         // allocating the plane if the residual merge has not yet touched it
         // (a skip-coded P-frame block has no residual writer, so its plane
@@ -18128,6 +18162,11 @@ impl PartitionWalker {
                 mi_cols,
                 bit_depth,
                 warp: None,
+                obmc: Some(crate::GridObmcContext {
+                    motion_modes: &motion_modes_snap,
+                    avail_u: &avail_u_snap,
+                    avail_l: &avail_l_snap,
+                }),
             };
             let mut planes: Vec<crate::PlaneReconContext<'_>> = Vec::new();
             if planes.try_reserve(plane_refs.len()).is_err() {
@@ -19769,6 +19808,10 @@ impl PartitionWalker {
                     self.mvs[(cell * 2) * 2 + 1] = s.mv[1] as i16;
                     self.mvs[(cell * 2 + 1) * 2] = 0;
                     self.mvs[(cell * 2 + 1) * 2 + 1] = 0;
+                    // §5.11.27 `motion_mode` grid-fill (mirrors the
+                    // decode walker's per-footprint stamp). Drives the
+                    // §5.11.33 frame walk's OBMC / warp dispatch.
+                    self.motion_modes[cell] = s.motion_mode;
                 }
                 if s.palette_size_y > 0 {
                     self.palette_sizes[cell] = s.palette_size_y;
@@ -59354,6 +59397,7 @@ mod tests {
             ref_frame: [last as i8, -1],
             mv: [mv[0] as i32, mv[1] as i32],
             interp_filter: [EIGHTTAP, EIGHTTAP],
+            motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: 0,
             palette_colors_y: &[],
             palette_size_uv: 0,
@@ -59512,6 +59556,7 @@ mod tests {
                 ref_frame: [last as i8, -1],
                 mv: [mv[0] as i32, mv[1] as i32],
                 interp_filter: [EIGHTTAP, EIGHTTAP],
+                motion_mode: MOTION_MODE_SIMPLE,
                 palette_size_y: 0,
                 palette_colors_y: &[],
                 palette_size_uv: 0,
@@ -59546,6 +59591,130 @@ mod tests {
             got, oracle,
             "the frame bridge must reconstruct each leaf with its own decoded sub-pel MV, \
              matching the per-block oracle across both leaves"
+        );
+    }
+
+    /// r378 §5.11.33 frame-scope **OBMC** dispatch through the walker
+    /// bridge: a 4×4 mi frame (16×16 luma) with an 8×8 `motion_mode ==
+    /// OBMC` leaf at mi (2,2) plus inter neighbours above (mi 0,2) and left
+    /// (mi 2,0) must be reconstructed by
+    /// [`PartitionWalker::reconstruct_inter_frame_into_curr_frame`] through
+    /// the §7.11.3.9-10 overlap path — the OBMC leaf footprint differing
+    /// from the same frame decoded with every leaf forced to SIMPLE (which
+    /// proves the bridge's OBMC context threaded the neighbour blend), while
+    /// the three non-OBMC leaves stay byte-identical.
+    #[test]
+    fn r378_walker_reconstructs_obmc_inter_frame() {
+        use crate::inter_pred::EIGHTTAP;
+        use crate::{PlaneRefSpec, RefFrameStoreEntry};
+
+        let ref_w: usize = 32;
+        let ref_h: usize = 32;
+        let stride = ref_w;
+        let mut refp = vec![0u16; ref_h * stride];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * stride + c] = ((r * 13 + c * 5 + 1) & 0xFF) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry, entry, entry, entry];
+        let ref_frame_idx: [u8; 7] = [0, 1, 2, 3, 0, 1, 2];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        // Build a walker and stamp four 8×8 inter leaves; the (2,2) leaf is
+        // OBMC, the rest SIMPLE. `motion_mode` controls whether the bridge's
+        // OBMC arm fires.
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 4,
+            mi_col_start: 0,
+            mi_col_end: 4,
+        };
+        let leaves: [(u32, u32, [i32; 2], u8); 4] = [
+            (0, 2, [0, 8], MOTION_MODE_SIMPLE), // above neighbour
+            (2, 0, [8, 0], MOTION_MODE_SIMPLE), // left neighbour
+            (0, 0, [4, 4], MOTION_MODE_SIMPLE), // filler
+            (2, 2, [2, 6], MOTION_MODE_OBMC),   // OBMC target
+        ];
+
+        let build = |force_simple: bool| -> Vec<u16> {
+            let mut walker = PartitionWalker::new(4, 4, geom).unwrap();
+            for &(mr, mc, mv, mm) in &leaves {
+                let mode = if force_simple { MOTION_MODE_SIMPLE } else { mm };
+                walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+                    mi_row: mr,
+                    mi_col: mc,
+                    sub_size: BLOCK_8X8,
+                    skip: 1,
+                    segment_id: 0,
+                    is_inter: 1,
+                    y_mode: MODE_NEARESTMV,
+                    ref_frame: [last as i8, -1],
+                    mv,
+                    interp_filter: [EIGHTTAP, EIGHTTAP],
+                    motion_mode: mode,
+                    palette_size_y: 0,
+                    palette_colors_y: &[],
+                    palette_size_uv: 0,
+                    palette_colors_u: &[],
+                    palette_colors_v: &[],
+                    cdef: None,
+                    tx_size: 0,
+                });
+            }
+            let ref_spec = PlaneRefSpec {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+            };
+            walker
+                .reconstruct_inter_frame_into_curr_frame(&ref_frame_idx, 8, &[ref_spec])
+                .expect("frame-scope OBMC reconstruction");
+            walker
+                .curr_frame(0)
+                .unwrap()
+                .iter()
+                .map(|&s| s as u16)
+                .collect()
+        };
+
+        let got_obmc = build(false);
+        let got_simple = build(true);
+
+        let curr_w = 16usize;
+        // The OBMC leaf footprint (luma rows 8..16, cols 8..16) must differ
+        // from the all-SIMPLE walk; every other sample must be identical.
+        let mut obmc_differs = false;
+        for r in 0..16 {
+            for c in 0..16 {
+                let in_obmc = (8..16).contains(&r) && (8..16).contains(&c);
+                if in_obmc {
+                    if got_obmc[r * curr_w + c] != got_simple[r * curr_w + c] {
+                        obmc_differs = true;
+                    }
+                } else {
+                    assert_eq!(
+                        got_obmc[r * curr_w + c],
+                        got_simple[r * curr_w + c],
+                        "non-OBMC sample ({c},{r}) must be identical with/without OBMC"
+                    );
+                }
+            }
+        }
+        assert!(
+            obmc_differs,
+            "the OBMC leaf must reconstruct differently from the SIMPLE fallback \
+             (the §7.11.3.9 overlap blend must have fired through the bridge)"
         );
     }
 
@@ -59612,6 +59781,7 @@ mod tests {
             ref_frame: [crate::uncompressed_header_tail::INTRA_FRAME as i8, -1],
             mv: [0, 0],
             interp_filter: [EIGHTTAP, EIGHTTAP],
+            motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: 0,
             palette_colors_y: &[],
             palette_size_uv: 0,

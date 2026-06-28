@@ -85,9 +85,21 @@ block motion compensation) now also has a reconstruction-surface entry:
 the §7.11.3.9 above/left neighbour walk's §7.11.3.10 overlap-blend
 contributions — into `CurrFrame[plane]` from a caller-resolved
 `ObmcParams` neighbour bundle, the OBMC counterpart of the per-block warp
-bridge. Threading the OBMC neighbour lists from the frame-walk grids (so
-the §5.11.33 frame walk dispatches OBMC leaves automatically, as it
-already does for warp) remains the follow-up.
+bridge. As of r378 the §5.11.33 frame walk **dispatches OBMC leaves
+automatically**, as it already does for warp: `InterModeInfoGrid` carries
+an opt-in `obmc` context (`GridObmcContext`), and `reconstruct_inter_frame`'s
+single-reference arm routes a leaf whose per-cell `motion_modes` ordinal is
+`OBMC` through a frame-walk `obmc_dispatch_leaf` helper. That helper runs
+the §7.11.3.9 outer `(x4, y4, step4, nLimit)` neighbour scan against the
+grid's own `mi_sizes` / `ref_frames` / `mvs` slices (above candidate
+`(MiRow - 1, x4 | 1)`, left candidate `(y4 | 1, MiCol - 1)`, keeping
+`RefFrames[cand][0] > INTRA_FRAME` candidates), resolves each kept
+neighbour's MV + per-plane reference buffer into an `ObmcNeighbour`, and
+drives `reconstruct_inter_block_obmc` per plane — so a real OBMC leaf
+decoded from a bitstream reconstructs its overlap blend end-to-end. The
+walker bridge (`reconstruct_inter_frame_into_curr_frame`) threads the
+`obmc` context from the walker's persisted `motion_modes` grid plus per-cell
+`AvailU` / `AvailL` derived from the tile geometry.
 
 The spec-faithful §5.11 syntax walker (`PartitionWalker`, separate from
 the encoder-mirror pixel driver above) now reconstructs **intra pixels**
@@ -188,8 +200,9 @@ functions. Streams outside the supported scope return a typed `Error`
 ### Not yet supported
 
 - Frame-walk reconstruction of warped-causal inter leaves (the
-  single-reference translational, compound, and inter-intra arms are
-  wired as of r359); reference-frame buffer management across a GOP.
+  single-reference translational, compound, inter-intra, and **OBMC**
+  arms are wired as of r378); reference-frame buffer management across a
+  GOP.
 - Multi-tile reconstruction beyond the single-tile decode path.
 - 10/12-bit and 4:2:2 / 4:4:4 reconstruction.
 - Registration as a live codec in the runtime registry.

@@ -6288,6 +6288,19 @@ pub struct InterModeInfoGrid<'a> {
     /// path ([`reconstruct_inter_block`]) and the §7.11.3.5 warp path
     /// ([`reconstruct_inter_block_warp`]). See [`GridWarpContext`].
     pub warp: Option<GridWarpContext<'a>>,
+    /// §5.11.27 OBMC context — `Some(_)` enables the `motion_mode ==
+    /// OBMC` arm of the single-reference walk; `None` (the default)
+    /// drives every non-warp single-ref leaf translationally (the
+    /// pre-r378 behaviour). When `Some(_)`, a single-ref leaf whose
+    /// per-cell `motion_modes` ordinal is `OBMC` is dispatched to
+    /// [`reconstruct_inter_block_obmc`] with the §7.11.3.9 above / left
+    /// neighbour lists resolved from this grid's own `mi_sizes` /
+    /// `ref_frames` / `mvs` slices. See [`GridObmcContext`]. The warp arm
+    /// is consulted first: a `WARPED_CAUSAL` leaf takes the warp path even
+    /// when `obmc` is `Some(_)` (the two `motion_mode` ordinals are
+    /// mutually exclusive at one cell, so the precedence is moot in
+    /// practice).
+    pub obmc: Option<GridObmcContext<'a>>,
 }
 
 /// §5.11.27 / §7.11.3.5-8 per-frame warped-motion context for
@@ -6350,6 +6363,300 @@ pub struct GridWarpContext<'a> {
     /// step-7 derivation forces `useWarp = 0` on every leaf regardless of
     /// `motion_mode`.
     pub force_integer_mv: bool,
+}
+
+/// §5.11.27 / §7.11.3.9-10 per-frame OBMC context for
+/// [`InterModeInfoGrid`] — `Some(_)` enables the `motion_mode == OBMC`
+/// arm of the single-reference frame walk, dispatching a decoded OBMC
+/// leaf to [`reconstruct_inter_block_obmc`] with the §7.11.3.9 above /
+/// left neighbour lists [`reconstruct_inter_frame`] resolves internally
+/// from the grid's own `mi_sizes` / `ref_frames` / `mvs` slices.
+///
+/// Unlike the per-block [`ObmcParams`] bundle (which carries the
+/// caller-resolved neighbour lists ready-made), this grid context carries
+/// only the decoded `motion_mode` ordinal per cell plus the §5.11.18
+/// `AvailU` / `AvailL` availability bits the frame walk needs to gate the
+/// two §7.11.3.9 passes. The frame walk itself runs the §7.11.3.9 outer
+/// `(x4, y4, step4)` neighbour scan against the grid (candidate cell
+/// `(MiRow - 1, x4 | 1)` for the above-pass, `(y4 | 1, MiCol - 1)` for
+/// the left-pass), filters on `RefFrames[cand][0] > INTRA_FRAME`, and
+/// resolves each qualifying neighbour's per-plane reference buffer through
+/// the same `ref_frame_idx[..]` → `frame_store` indirection the leaf's own
+/// prediction uses — so the caller supplies decode output, not §7
+/// mi-grid state.
+#[derive(Debug, Clone, Copy)]
+pub struct GridObmcContext<'a> {
+    /// §5.11.27 decoded `motion_mode` ordinal per cell
+    /// ([`crate::cdf::MOTION_MODE_SIMPLE`] / `MOTION_MODE_OBMC` /
+    /// `MOTION_MODE_WARPED_CAUSAL`) — `motion_modes[ r * mi_cols + c ]`.
+    /// Read only at a single-reference inter leaf's origin. An `OBMC`
+    /// value routes the leaf to [`reconstruct_inter_block_obmc`]; every
+    /// other value takes the translational [`reconstruct_inter_block`] /
+    /// warp path. Length must be at least `mi_rows * mi_cols`. (This is
+    /// the same `motion_modes` grid [`GridWarpContext`] reads; the two
+    /// contexts may share one backing slice — a `WARPED_CAUSAL` cell is
+    /// claimed by the warp arm first, an `OBMC` cell by this arm.)
+    pub motion_modes: &'a [u8],
+    /// §5.11.18 `AvailU[ r * mi_cols + c ]` per cell — the above-neighbour
+    /// availability bit (`0` / `1`) the §7.11.3.9 above-pass is gated on
+    /// (av1-spec p.275 line 15301). Read at the leaf origin. A leaf on the
+    /// frame's top edge has `AvailU == 0` (no above-pass). Length must be
+    /// at least `mi_rows * mi_cols`.
+    pub avail_u: &'a [u8],
+    /// §5.11.18 `AvailL[ r * mi_cols + c ]` per cell — the left-neighbour
+    /// availability bit (`0` / `1`) the §7.11.3.9 left-pass is gated on
+    /// (av1-spec p.275 line 15325). Read at the leaf origin. A leaf on the
+    /// frame's left edge has `AvailL == 0` (no left-pass). Length must be
+    /// at least `mi_rows * mi_cols`.
+    pub avail_l: &'a [u8],
+}
+
+/// §7.11.3.9 OBMC frame-walk dispatch for one decoded `motion_mode ==
+/// OBMC` single-reference leaf at grid origin `(mi_row, mi_col)` of size
+/// `mi_size` with forward reference `ref_frame0`.
+///
+/// For each plane the helper resolves the §7.11.3.9 above-pass and
+/// left-pass neighbour candidate lists from the grid's own
+/// `mi_sizes` / `ref_frames` / `mvs` slices — running the spec's outer
+/// `(x4, y4, step4, nLimit)` scan (av1-spec p.275 lines 15301-15346):
+///
+///   * above-pass: `x4` from `MiCol`, candidate `(MiRow - 1, x4 | 1)`,
+///     `step4 = Clip3(2, 16, Num_4x4_Blocks_Wide[ candSz ])`, gated by
+///     `AvailU && get_plane_residual_size(MiSize, plane) >= BLOCK_8X8`
+///     and `nLimit = Min(4, Mi_Width_Log2[ MiSize ])`;
+///   * left-pass: `y4` from `MiRow`, candidate `(y4 | 1, MiCol - 1)`,
+///     `step4 = Clip3(2, 16, Num_4x4_Blocks_High[ candSz ])`, gated by
+///     `AvailL` and `nLimit = Min(4, Mi_Height_Log2[ MiSize ])`,
+///
+/// keeping only candidates whose `RefFrames[cand][0] > INTRA_FRAME`. Each
+/// kept candidate's `Mvs[cand][0]` motion vector and its
+/// `ref_frame_idx[ candRefFrame - LAST_FRAME ]` → `frame_store[refIdx]`
+/// per-plane reference buffer are bundled into an [`ObmcNeighbour`]; the
+/// assembled [`ObmcParams`] is handed to [`reconstruct_inter_block_obmc`]
+/// for that plane (which runs the §7.11.3.9-10 overlap blend over the
+/// leaf's own §7.11.3.1 prediction).
+///
+/// The neighbour lists are resolved per plane because the
+/// [`ObmcNeighbour::bundle`] is plane-specific (the `(plane,
+/// subsampling_*)` reference buffer differs between luma and chroma); the
+/// `step4` advances and the `RefFrames[cand][0] > INTRA_FRAME` gate are
+/// plane-invariant (driven off the luma mi-grid), so the candidate
+/// *sequence* is identical across planes — only the bundle resolution
+/// changes.
+#[allow(clippy::too_many_arguments)]
+fn obmc_dispatch_leaf(
+    grid: &InterModeInfoGrid<'_>,
+    oc: &GridObmcContext<'_>,
+    ref_frame_idx: &[u8],
+    planes: &mut [PlaneReconContext<'_>],
+    mi_row: usize,
+    mi_col: usize,
+    mi_size: usize,
+    ref_frame0: i8,
+) -> Result<(), crate::Error> {
+    let mi_rows = grid.mi_rows as usize;
+    let mi_cols = grid.mi_cols as usize;
+    let origin = mi_row * mi_cols + mi_col;
+
+    // The OBMC leaf's own block is single-reference translational for its
+    // own MV; `ref_frame0` / `Mvs[origin][0]` drive the base prediction.
+    let block_ref_frame = ref_frame0;
+    if !(crate::uncompressed_header_tail::LAST_FRAME as i8
+        ..=crate::uncompressed_header_tail::ALTREF_FRAME as i8)
+        .contains(&block_ref_frame)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let block_mode_info = InterModeInfo {
+        ref_frame: block_ref_frame as u8,
+        mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
+    };
+
+    let avail_u = oc.avail_u[origin] != 0;
+    let avail_l = oc.avail_l[origin] != 0;
+
+    let interp_x = grid.interp_filters[origin * 2];
+    let interp_y = grid.interp_filters[origin * 2 + 1];
+
+    const INTRA_FRAME_REF0: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+
+    // §7.11.3.9 `step4 = Clip3(2, 16, Num_4x4_Blocks_{Wide,High}[candSz])`.
+    let clip4 = |n: usize| -> usize { n.clamp(2, 16) };
+
+    for ctx in planes.iter_mut() {
+        let p = ctx.plane;
+        let sub_x = if p > 0 { ctx.subsampling_x } else { 0 };
+        let sub_y = if p > 0 { ctx.subsampling_y } else { 0 };
+
+        // §7.11.3.9 above-pass gate (line 15302): only fires when
+        // `get_plane_residual_size(MiSize, plane) >= BLOCK_8X8`.
+        let plane_sz = crate::cdf::get_plane_residual_size(mi_size, p, sub_x, sub_y)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let above_gate = avail_u && plane_sz >= crate::cdf::BLOCK_8X8;
+
+        // ----- above-pass neighbour list (line 15301-15324) -----
+        let mut above: Vec<ObmcNeighbour<'_>> = Vec::new();
+        if above_gate {
+            let w4 = crate::cdf::num_4x4_blocks_wide(mi_size);
+            let n_limit = core::cmp::min(4, crate::cdf::mi_width_log2(mi_size));
+            let x_end = core::cmp::min(mi_cols, mi_col + w4);
+            let cand_row = mi_row.wrapping_sub(1); // MiRow - 1 (AvailU ⇒ MiRow >= 1)
+            let mut x4 = mi_col;
+            let mut n_count = 0usize;
+            while n_count < n_limit && x4 < x_end {
+                let cand_col = x4 | 1;
+                // `candCol` may round up past the leaf; clamp into the grid
+                // (the §5.11.5 fill stamped a valid leaf there).
+                let cc = cand_col.min(mi_cols.saturating_sub(1));
+                let cand = cand_row * mi_cols + cc;
+                let cand_sz = grid.mi_sizes[cand];
+                let step4 = if cand_sz < crate::cdf::BLOCK_SIZES {
+                    clip4(crate::cdf::num_4x4_blocks_wide(cand_sz))
+                } else {
+                    2
+                };
+                if grid.ref_frames[cand * 2] > INTRA_FRAME_REF0 {
+                    n_count += 1;
+                    let bundle = resolve_obmc_neighbour_bundle(
+                        grid.ref_frames[cand * 2],
+                        [grid.mvs[cand * 4], grid.mvs[cand * 4 + 1]],
+                        ref_frame_idx,
+                        ctx.frame_store,
+                    )?;
+                    above.push(ObmcNeighbour {
+                        bundle,
+                        step4: step4 as u8,
+                    });
+                }
+                x4 += step4;
+            }
+        }
+
+        // ----- left-pass neighbour list (line 15325-15346) -----
+        // The left-pass is unconditional on the §7.11.3.9 "small blocks →
+        // left neighbour only" carve-out; only `AvailL` gates it.
+        let mut left: Vec<ObmcNeighbour<'_>> = Vec::new();
+        if avail_l {
+            let h4 = crate::cdf::num_4x4_blocks_high(mi_size);
+            let n_limit = core::cmp::min(4, crate::cdf::mi_height_log2(mi_size));
+            let y_end = core::cmp::min(mi_rows, mi_row + h4);
+            let cand_col = mi_col.wrapping_sub(1); // MiCol - 1 (AvailL ⇒ MiCol >= 1)
+            let mut y4 = mi_row;
+            let mut n_count = 0usize;
+            while n_count < n_limit && y4 < y_end {
+                let cand_row = y4 | 1;
+                let cr = cand_row.min(mi_rows.saturating_sub(1));
+                let cand = cr * mi_cols + cand_col;
+                let cand_sz = grid.mi_sizes[cand];
+                let step4 = if cand_sz < crate::cdf::BLOCK_SIZES {
+                    clip4(crate::cdf::num_4x4_blocks_high(cand_sz))
+                } else {
+                    2
+                };
+                if grid.ref_frames[cand * 2] > INTRA_FRAME_REF0 {
+                    n_count += 1;
+                    let bundle = resolve_obmc_neighbour_bundle(
+                        grid.ref_frames[cand * 2],
+                        [grid.mvs[cand * 4], grid.mvs[cand * 4 + 1]],
+                        ref_frame_idx,
+                        ctx.frame_store,
+                    )?;
+                    left.push(ObmcNeighbour {
+                        bundle,
+                        step4: step4 as u8,
+                    });
+                }
+                y4 += step4;
+            }
+        }
+
+        let obmc = ObmcParams {
+            mi_row: mi_row as u32,
+            mi_col: mi_col as u32,
+            mi_cols: grid.mi_cols,
+            mi_rows: grid.mi_rows,
+            mi_width_log2: crate::cdf::mi_width_log2(mi_size) as u8,
+            mi_height_log2: crate::cdf::mi_height_log2(mi_size) as u8,
+            avail_u,
+            avail_l,
+            plane_residual_size_ge_block_8x8: above_gate,
+            above_neighbours: &above,
+            left_neighbours: &left,
+        };
+
+        // Plane-space block origin + size (§5.11.33 lines 5135-5136 / the
+        // §7.11.3.1 `(x, y, w, h)` write region — OBMC has no
+        // `someUseIntra` split, so one call covers the whole plane block).
+        let x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+        let y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+        let w = crate::cdf::block_width(mi_size) >> sub_x;
+        let h = crate::cdf::block_height(mi_size) >> sub_y;
+
+        reconstruct_inter_block_obmc(
+            block_mode_info,
+            &obmc,
+            ref_frame_idx,
+            ctx.frame_store,
+            p,
+            x,
+            y,
+            w,
+            h,
+            grid.bit_depth,
+            ctx.subsampling_x,
+            ctx.subsampling_y,
+            ctx.frame_width,
+            ctx.frame_height,
+            interp_x,
+            interp_y,
+            ctx.curr,
+            ctx.curr_stride,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// §7.11.3.9 step 2 / 5: resolve one OBMC neighbour candidate's
+/// `RefFrames[cand][0]` + `Mvs[cand][0]` into the plane-resolved
+/// [`PredictInterRef`] bundle the driver's overlap walk consumes —
+/// `refIdx = ref_frame_idx[ candRefFrame - LAST_FRAME ]`, then
+/// `frame_store[refIdx]` (already the per-plane store for the plane being
+/// reconstructed).
+///
+/// The caller has already confirmed `cand_ref_frame > INTRA_FRAME`; this
+/// helper additionally bounds it at `ALTREF_FRAME` and validates the
+/// resolved `refIdx` against `frame_store`, returning
+/// [`crate::Error::PartitionWalkOutOfRange`] for an out-of-range value
+/// (caller-bug grid).
+fn resolve_obmc_neighbour_bundle<'a>(
+    cand_ref_frame: i8,
+    mv: [i16; 2],
+    ref_frame_idx: &[u8],
+    frame_store: &[RefFrameStoreEntry<'a>],
+) -> Result<PredictInterRef<'a>, crate::Error> {
+    let rf = cand_ref_frame as usize;
+    if !(crate::uncompressed_header_tail::LAST_FRAME
+        ..=crate::uncompressed_header_tail::ALTREF_FRAME)
+        .contains(&rf)
+    {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    let slot = rf - crate::uncompressed_header_tail::LAST_FRAME;
+    let ref_idx = *ref_frame_idx
+        .get(slot)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)? as usize;
+    let entry = frame_store
+        .get(ref_idx)
+        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+    Ok(PredictInterRef {
+        ref_plane: entry.plane,
+        ref_stride: entry.stride,
+        ref_upscaled_width: entry.upscaled_width,
+        ref_width: entry.width,
+        ref_height: entry.height,
+        mv,
+    })
 }
 
 /// §5.11.33 `predict()` frame-level inter reconstruction — walks the
@@ -6493,6 +6800,14 @@ pub fn reconstruct_inter_frame(
             || wc.gm_types.len() < refs
             || wc.gm_params.len() < refs * 6
         {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+    }
+    // §7.11.3.9 OBMC-context slice guards (only when the OBMC arm is
+    // enabled). The per-cell slices index within `cells`. A short slice
+    // is a caller bug.
+    if let Some(oc) = grid.obmc.as_ref() {
+        if oc.motion_modes.len() < cells || oc.avail_u.len() < cells || oc.avail_l.len() < cells {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
     }
@@ -6767,6 +7082,36 @@ pub fn reconstruct_inter_frame(
                     force_integer_mv: wc.force_integer_mv,
                 })
             });
+
+            // §5.11.27 OBMC dispatch: an `OBMC` single-ref leaf (and not a
+            // `WARPED_CAUSAL` leaf, which the warp arm above already
+            // claimed) routes each plane to `reconstruct_inter_block_obmc`
+            // with the §7.11.3.9 above / left neighbour lists resolved from
+            // this grid. The whole leaf (all planes) is reconstructed here;
+            // the SIMPLE translational loop below is skipped via `continue`.
+            // The leaf's own MV/ref is single-reference and translational
+            // (the §7.11.3.9 post-step overlays the neighbour
+            // contributions), so the leaf gates exactly like SIMPLE: it has
+            // no `someUseIntra` sub-block split (OBMC blocks are >= 8×8 luma
+            // by the §5.11.27 `use_obmc` eligibility, so the §5.11.33 chroma
+            // intra-neighbour split does not arise for them).
+            if leaf_warp.is_none() {
+                if let Some(oc) = grid.obmc.as_ref() {
+                    if oc.motion_modes[origin] == crate::cdf::MOTION_MODE_OBMC {
+                        obmc_dispatch_leaf(
+                            grid,
+                            oc,
+                            ref_frame_idx,
+                            planes,
+                            mi_row,
+                            mi_col,
+                            mi_size,
+                            ref_frame0,
+                        )?;
+                        continue;
+                    }
+                }
+            }
 
             for ctx in planes.iter_mut() {
                 let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
@@ -9955,6 +10300,7 @@ mod tests {
             mi_cols,
             bit_depth: 8,
             warp: None,
+            obmc: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -10168,6 +10514,7 @@ mod tests {
             mi_cols,
             bit_depth: 8,
             warp: None,
+            obmc: None,
         };
 
         // Chroma plane (4:2:0): 4 rows × 4 cols (mi_rows*4>>1 ×
@@ -10339,6 +10686,7 @@ mod tests {
                 mi_cols,
                 bit_depth: 8,
                 warp: None,
+                obmc: None,
             };
             let mut planes = [PlaneReconContext {
                 plane: 0,
@@ -10565,6 +10913,7 @@ mod tests {
                     mi_cols,
                     bit_depth: 8,
                     warp: $warp,
+                    obmc: None,
                 }
             };
         }
@@ -10758,6 +11107,384 @@ mod tests {
             mi_cols,
             bit_depth: 8,
             warp: Some(warp_short),
+            obmc: None,
+        };
+        let mut curr = vec![0u16; 64];
+        let mut planes = [PlaneReconContext {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: 32,
+            frame_height: 32,
+            curr: &mut curr,
+            curr_stride: 8,
+        }];
+        assert_eq!(
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap_err(),
+            crate::Error::PartitionWalkOutOfRange
+        );
+    }
+
+    // ---------- r378 §7.11.3.9 OBMC frame-walk dispatch ----------
+
+    /// r378 — a `motion_mode == OBMC` single-reference leaf decoded into
+    /// the grid is dispatched by [`reconstruct_inter_frame`] to the
+    /// §7.11.3.9-10 overlap path (via `obmc: Some(_)`), and the
+    /// frame-walk-resolved neighbour blend reconstructs **identically** to
+    /// a direct [`reconstruct_inter_block_obmc`] call whose above/left
+    /// neighbour lists were resolved by hand. The OBMC leaf footprint also
+    /// **differs** from the translational fallback (`obmc: None`), proving
+    /// the overlap blend actually fired.
+    #[test]
+    fn r378_reconstruct_inter_frame_obmc_dispatch_matches_per_block() {
+        // 32×32 reference plane (`r*32 + c`) so motion-compensated samples
+        // vary across the block (the overlap blend then visibly changes
+        // the output vs the no-blend translational base).
+        let ref_w = 32usize;
+        let ref_h = 32usize;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * ref_w + c] = ((r * 32 + c) & 0xff) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: ref_w,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry; 8];
+        let ref_frame_idx = [0u8; 7];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        // 4×4 mi grid (16×16 luma). Layout:
+        //   row 0: two 8×8 inter leaves at (0,0) and (0,2) — above
+        //          neighbours of the OBMC leaf.
+        //   rows 2..4 cols 0..2: 8×8 inter leaf at (2,0) — left neighbour.
+        //   rows 2..4 cols 2..4: 8×8 OBMC leaf at (2,2) — the dispatch
+        //          target (has both an above and a left inter neighbour).
+        let mi_rows: u32 = 4;
+        let mi_cols: u32 = 4;
+        let cells = (mi_rows * mi_cols) as usize;
+        let bw8x8 = crate::cdf::BLOCK_8X8;
+        let mut mi_sizes = vec![crate::cdf::BLOCK_INVALID; cells];
+        let mut is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        let mut mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        // Stamp an 8×8 (2×2 mi) leaf at mi origin (r0,c0) with the given MV.
+        let stamp = |mi_sizes: &mut [usize],
+                     is_inters: &mut [u8],
+                     ref_frames: &mut [i8],
+                     mvs: &mut [i16],
+                     r0: usize,
+                     c0: usize,
+                     mv: [i16; 2]| {
+            for dr in 0..2 {
+                for dc in 0..2 {
+                    let cell = (r0 + dr) * mi_cols as usize + (c0 + dc);
+                    mi_sizes[cell] = bw8x8;
+                    is_inters[cell] = 1;
+                    ref_frames[cell * 2] = last as i8;
+                    ref_frames[cell * 2 + 1] = -1; // NONE
+                    mvs[cell * 4] = mv[0];
+                    mvs[cell * 4 + 1] = mv[1];
+                }
+            }
+        };
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            0,
+            0,
+            [0, 8],
+        );
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            0,
+            2,
+            [8, 0],
+        );
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            2,
+            0,
+            [4, 4],
+        );
+        // The OBMC leaf's own MV.
+        stamp(
+            &mut mi_sizes,
+            &mut is_inters,
+            &mut ref_frames,
+            &mut mvs,
+            2,
+            2,
+            [2, 6],
+        );
+
+        let zeros = vec![0u8; cells];
+        let order_hints_by_ref = [0i32; 8];
+
+        // motion_modes: OBMC at the (2,2) leaf origin; SIMPLE elsewhere.
+        let mut motion_modes = vec![crate::cdf::MOTION_MODE_SIMPLE; cells];
+        motion_modes[2 * mi_cols as usize + 2] = crate::cdf::MOTION_MODE_OBMC;
+        // AvailU / AvailL for a single-tile frame: avail iff not on the
+        // top / left frame edge.
+        let mut avail_u = vec![0u8; cells];
+        let mut avail_l = vec![0u8; cells];
+        for r in 0..mi_rows as usize {
+            for c in 0..mi_cols as usize {
+                avail_u[r * mi_cols as usize + c] = (r > 0) as u8;
+                avail_l[r * mi_cols as usize + c] = (c > 0) as u8;
+            }
+        }
+
+        macro_rules! make_grid {
+            ($obmc:expr) => {
+                InterModeInfoGrid {
+                    mi_sizes: &mi_sizes,
+                    is_inters: &is_inters,
+                    ref_frames: &ref_frames,
+                    mvs: &mvs,
+                    interp_filters: &interp_filters,
+                    compound_types: &zeros,
+                    wedge_indices: &zeros,
+                    wedge_signs: &zeros,
+                    mask_types: &zeros,
+                    interintra_modes: &zeros,
+                    wedge_interintras: &zeros,
+                    interintra_wedge_indices: &zeros,
+                    order_hint_bits: 7,
+                    current_order_hint: 0,
+                    order_hints_by_ref: &order_hints_by_ref,
+                    mi_rows,
+                    mi_cols,
+                    bit_depth: 8,
+                    warp: None,
+                    obmc: $obmc,
+                }
+            };
+        }
+
+        let curr_w = 16usize;
+        let curr_h = 16usize;
+
+        // --- (a) OBMC-enabled frame walk. ---
+        let mut curr_obmc = vec![0u16; curr_w * curr_h];
+        {
+            let grid = make_grid!(Some(GridObmcContext {
+                motion_modes: &motion_modes,
+                avail_u: &avail_u,
+                avail_l: &avail_l,
+            }));
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr_obmc,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("OBMC-enabled frame walk");
+        }
+
+        // --- (b) translational frame walk (obmc: None). ---
+        let mut curr_simple = vec![0u16; curr_w * curr_h];
+        {
+            let grid = make_grid!(None);
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr_simple,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes)
+                .expect("translational frame walk");
+        }
+
+        // --- (c) hand-resolved per-block OBMC oracle for the (2,2) leaf,
+        // overlaid on a copy of the translational walk (so the three
+        // non-OBMC leaves match by construction). ---
+        // The above-pass neighbour is the inter leaf at (0,2) collocated
+        // above (2,2): candRow = MiRow-1 = 1, candCol = x4|1 = 3 (for
+        // x4 = MiCol = 2). MiSizes[1][3] = BLOCK_8X8 ⇒ step4 = Clip3(2,16,2)
+        // = 2; one candidate then x4 = 4 >= Min(MiCols, MiCol+w4) = 4.
+        // The left-pass neighbour: candCol = MiCol-1 = 1, candRow = y4|1 =
+        // 3 (for y4 = MiRow = 2). MiSizes[3][1] = BLOCK_8X8 ⇒ step4 = 2.
+        // above candidate cell index (candRow=1, candCol=3).
+        let above_idx = mi_cols as usize + 3;
+        let above_ref_frame = ref_frames[above_idx * 2];
+        let above_mv = [mvs[above_idx * 4], mvs[above_idx * 4 + 1]];
+        let left_ref_frame = ref_frames[(3 * mi_cols as usize + 1) * 2];
+        let left_mv = [
+            mvs[(3 * mi_cols as usize + 1) * 4],
+            mvs[(3 * mi_cols as usize + 1) * 4 + 1],
+        ];
+        let nb_bundle = |_rf: i8, mv: [i16; 2]| PredictInterRef {
+            ref_plane: &refp[..],
+            ref_stride: ref_w,
+            ref_upscaled_width: ref_w as u32,
+            ref_width: ref_w as u32,
+            ref_height: ref_h as u32,
+            mv,
+        };
+        let _ = (above_ref_frame, left_ref_frame);
+        let above_nb = [ObmcNeighbour {
+            bundle: nb_bundle(above_ref_frame, above_mv),
+            step4: 2,
+        }];
+        let left_nb = [ObmcNeighbour {
+            bundle: nb_bundle(left_ref_frame, left_mv),
+            step4: 2,
+        }];
+        let obmc_params = ObmcParams {
+            mi_row: 2,
+            mi_col: 2,
+            mi_cols,
+            mi_rows,
+            mi_width_log2: crate::cdf::mi_width_log2(bw8x8) as u8,
+            mi_height_log2: crate::cdf::mi_height_log2(bw8x8) as u8,
+            avail_u: true,
+            avail_l: true,
+            plane_residual_size_ge_block_8x8: true,
+            above_neighbours: &above_nb,
+            left_neighbours: &left_nb,
+        };
+        let mut oracle = curr_simple.clone();
+        reconstruct_inter_block_obmc(
+            InterModeInfo {
+                ref_frame: last,
+                mv: [2, 6],
+            },
+            &obmc_params,
+            &ref_frame_idx,
+            &store,
+            0,
+            /* x */ 8,
+            /* y */ 8,
+            /* w */ 8,
+            /* h */ 8,
+            8,
+            0,
+            0,
+            ref_w as u32,
+            ref_h as u32,
+            EIGHTTAP,
+            EIGHTTAP,
+            &mut oracle,
+            curr_w,
+        )
+        .expect("per-block OBMC oracle");
+
+        assert_eq!(
+            curr_obmc, oracle,
+            "OBMC frame-walk dispatch must equal the hand-resolved per-block OBMC oracle"
+        );
+
+        // The OBMC leaf footprint (luma rows 8..16, cols 8..16) must differ
+        // from the translational walk (proves the overlap blend fired).
+        let mut obmc_differs = false;
+        for r in 8..16 {
+            for c in 8..16 {
+                if curr_obmc[r * curr_w + c] != curr_simple[r * curr_w + c] {
+                    obmc_differs = true;
+                }
+            }
+        }
+        assert!(
+            obmc_differs,
+            "OBMC leaf must differ from the translational fallback"
+        );
+        // The three non-OBMC leaves must be byte-identical between the two
+        // walks (the OBMC arm only touches its own footprint).
+        for r in 0..16 {
+            for c in 0..16 {
+                if (8..16).contains(&r) && (8..16).contains(&c) {
+                    continue;
+                }
+                assert_eq!(
+                    curr_obmc[r * curr_w + c],
+                    curr_simple[r * curr_w + c],
+                    "non-OBMC leaf sample ({c},{r}) must be identical regardless of OBMC ctx"
+                );
+            }
+        }
+    }
+
+    /// r378 — the OBMC-context slice guards reject a short per-cell slice
+    /// with `PartitionWalkOutOfRange`.
+    #[test]
+    fn r378_reconstruct_inter_frame_obmc_ctx_slice_guards() {
+        let refp = vec![5u16; 32 * 32];
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: 32,
+            upscaled_width: 32,
+            width: 32,
+            height: 32,
+        };
+        let store = [entry; 8];
+        let ref_frame_idx = [0u8; 7];
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        let mi_sizes = vec![crate::cdf::BLOCK_INVALID; cells];
+        let is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        for cell in 0..cells {
+            ref_frames[cell * 2 + 1] = -1;
+        }
+        let mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let zeros = vec![0u8; cells];
+        let order_hints_by_ref = [0i32; 8];
+        let full = vec![0u8; cells];
+        let short = vec![0u8; cells - 1];
+
+        // A too-short `avail_u` slice trips the guard.
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &zeros,
+            wedge_indices: &zeros,
+            wedge_signs: &zeros,
+            mask_types: &zeros,
+            interintra_modes: &zeros,
+            wedge_interintras: &zeros,
+            interintra_wedge_indices: &zeros,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows,
+            mi_cols,
+            bit_depth: 8,
+            warp: None,
+            obmc: Some(GridObmcContext {
+                motion_modes: &full,
+                avail_u: &short,
+                avail_l: &full,
+            }),
         };
         let mut curr = vec![0u16; 64];
         let mut planes = [PlaneReconContext {
@@ -11256,6 +11983,7 @@ mod tests {
             mi_cols,
             bit_depth: 8,
             warp: None,
+            obmc: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -11615,6 +12343,7 @@ mod tests {
             mi_cols,
             bit_depth: 8,
             warp: None,
+            obmc: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -11769,6 +12498,7 @@ mod tests {
             mi_cols,
             bit_depth: 8,
             warp: None,
+            obmc: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -15084,6 +15814,7 @@ mod tests {
             mi_cols,
             bit_depth: 8,
             warp: None,
+            obmc: None,
         };
         {
             let mut planes = [PlaneReconContext {
@@ -15230,6 +15961,7 @@ mod tests {
                 mi_cols,
                 bit_depth: 8,
                 warp: None,
+                obmc: None,
             };
             let mut planes = [PlaneReconContext {
                 plane: 0,
@@ -15267,6 +15999,7 @@ mod tests {
                 mi_cols,
                 bit_depth: 8,
                 warp: None,
+                obmc: None,
             };
             let mut planes = [PlaneReconContext {
                 plane: 0,

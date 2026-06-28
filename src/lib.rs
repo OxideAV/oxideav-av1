@@ -1819,7 +1819,7 @@ pub use inter_pred::{
     reconstruct_inter_block_warp, reconstruct_inter_frame, reconstruct_inter_intra_block,
     reconstruct_inter_intra_from_dispatch, resolve_divisor, rounding_variables,
     select_interp_filter_small_block, setup_shear, warp_estimation, wedge_mask, CompoundParams,
-    DistanceWeights, Divisor, GridWarpContext, InterIntraLeaf, InterIntraModeInfo,
+    DistanceWeights, Divisor, GridObmcContext, GridWarpContext, InterIntraLeaf, InterIntraModeInfo,
     InterIntraWedgeModeInfo, InterModeInfo, InterModeInfoGrid, LocalWarp, MvScale, ObmcNeighbour,
     ObmcParams, PlaneReconContext, PlaneRefSpec, PredictInterRef, RefFrameStoreEntry, RoundingVars,
     ShearParams, WarpDriverParams, WarpSampleCand, COMPOUND_AVERAGE, COMPOUND_DIFFWTD,
