@@ -173,7 +173,7 @@ fn decode_block_syntax_reaches_compute_prediction_stub_after_intra_mode_info() {
         /* read_deltas = */ false,
         /* use_128x128_superblock = */ false,
         /* delta_q_res = */ 0,
-        /* delta_lf_present = */ false,
+        /* delta_lf_multi = */ false,
         /* delta_lf_multi = */ false,
         /* mono_chrome = */ false,
         /* delta_lf_res = */ 0,
@@ -950,7 +950,7 @@ fn loop_filter_bridge_level_zero_is_identity() {
     let lf = oxideav_av1::uncompressed_header_tail::LoopFilterParams::short_circuit();
     let seg = oxideav_av1::uncompressed_header_tail::SegmentationParams::disabled();
     walker.loop_filter_frame_from_grid(
-        &lf, &seg, /* delta_lf_present = */ false, 3, 8, 1, 1, 16, 16, &mut bufs,
+        &lf, &seg, /* delta_lf_multi = */ false, 3, 8, 1, 1, 16, 16, &mut bufs,
     );
 
     for (p, (_, _, s)) in planes.iter().enumerate() {
@@ -1020,14 +1020,23 @@ fn loop_filter_bridge_flat_frame_invariant_under_nonzero_level() {
     }
 }
 
-/// §7.14 deblock bridge `delta_lf_present == 1` guard — the walker does
-/// not persist a per-mi `DeltaLFs[][][]` snapshot (only the running
-/// §5.11.13 accumulator), so the bridge conservatively returns the
-/// pre-deblock `CurrFrame[plane]` unchanged rather than apply a wrong
-/// §7.14.4 strength. Verify it is a no-op even with a non-zero level.
+/// r378 §7.14.4 `delta_lf_multi == 1` deblock now **runs** (no longer
+/// refused) reading the walker's per-mi `DeltaLFs[][][]` snapshot. On a
+/// flat reconstructed field the §7.14.6 filter mask never fires (every
+/// neighbour pair is equal ⇒ zero gradient), so the result is invariant —
+/// but the bridge no longer short-circuits the whole pass: it walks the
+/// edges with the multi-slot §7.14.4 indexing against the (all-zero,
+/// `delta_lf_present == 0` default) grid. Proves the r378 DeltaLFs wiring
+/// replaced the pre-r378 conservative refusal with a real §7.14.4 read.
 #[test]
-fn loop_filter_bridge_delta_lf_present_is_noop_guard() {
+fn loop_filter_bridge_delta_lf_multi_runs_invariant_on_flat_field() {
     let walker = walk_flat_intra_16x16_tile();
+    // The persisted DeltaLFs grid is all-zero on this intra tile (no
+    // §5.11.13 delta was signalled), so the §7.14.4 term is zero.
+    assert!(
+        walker.delta_lfs().iter().all(|&v| v == 0),
+        "flat intra tile signalled no delta_lf, so every DeltaLFs cell stays 0"
+    );
     let mut planes = extract_curr_planes(&walker);
     let before: Vec<Vec<i32>> = planes.iter().map(|(_, _, s)| s.clone()).collect();
 
@@ -1045,14 +1054,14 @@ fn loop_filter_bridge_delta_lf_present_is_noop_guard() {
         ..oxideav_av1::uncompressed_header_tail::LoopFilterParams::short_circuit()
     };
     let seg = oxideav_av1::uncompressed_header_tail::SegmentationParams::disabled();
-    walker.loop_filter_frame_from_grid(
-        &lf, &seg, /* delta_lf_present = */ true, 3, 8, 1, 1, 16, 16, &mut bufs,
-    );
+    // `delta_lf_multi = true` — the multi-slot §7.14.4 indexing path.
+    walker.loop_filter_frame_from_grid(&lf, &seg, true, 3, 8, 1, 1, 16, 16, &mut bufs);
 
     for (p, (_, _, s)) in planes.iter().enumerate() {
         assert_eq!(
             s, &before[p],
-            "plane {p}: delta_lf_present guard must leave planes untouched"
+            "plane {p}: a flat field has no §7.14.6 gradient, so the multi-slot \
+             §7.14.4 deblock is still invariant (but now actually runs)"
         );
     }
 }
@@ -2202,7 +2211,7 @@ fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
         /* read_deltas = */ false,
         /* use_128x128_superblock = */ false,
         /* delta_q_res = */ 0,
-        /* delta_lf_present = */ false,
+        /* delta_lf_multi = */ false,
         /* delta_lf_multi = */ false,
         /* mono_chrome = */ false,
         /* delta_lf_res = */ 0,
@@ -3481,7 +3490,7 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
         /* read_deltas = */ false,
         /* use_128x128_superblock = */ false,
         /* delta_q_res = */ 0,
-        /* delta_lf_present = */ false,
+        /* delta_lf_multi = */ false,
         /* delta_lf_multi = */ false,
         /* mono_chrome = */ false,
         /* delta_lf_res = */ 0,
@@ -3606,7 +3615,7 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
             /* read_deltas = */ false,
             /* use_128x128_superblock = */ false,
             /* delta_q_res = */ 0,
-            /* delta_lf_present = */ false,
+            /* delta_lf_multi = */ false,
             /* delta_lf_multi = */ false,
             /* mono_chrome = */ false,
             /* delta_lf_res = */ 0,
@@ -3771,7 +3780,7 @@ fn r302_decode_block_syntax_inter_intra_block_surfaces_is_inter_intra_flag() {
             /* read_deltas = */ false,
             /* use_128x128_superblock = */ false,
             /* delta_q_res = */ 0,
-            /* delta_lf_present = */ false,
+            /* delta_lf_multi = */ false,
             /* delta_lf_multi = */ false,
             /* mono_chrome = */ false,
             /* delta_lf_res = */ 0,

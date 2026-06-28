@@ -187,9 +187,14 @@ for plane 0, the §5.11.37 `get_tx_size` chroma mapping for planes 1/2);
 integration test composes all three over one reconstructed
 `CurrFrame[plane]` in order (deblock → CDEF → loop-restoration),
 verifying the buffer plumbing and the identity case on a flat field.
-The §7.14.4 `DeltaLFs` term is bridged for `delta_lf_present == 0` (the
-running §5.11.13 accumulator only); a per-mi `DeltaLFs[][][]` snapshot
-for the `delta_lf_present == 1` path remains a follow-up.
+As of r378 the §7.14.4 `DeltaLFs` term is bridged for **both**
+`delta_lf_present` cases: the walker persists a per-mi `DeltaLFs[][][]`
+grid (`delta_lfs`), stamped from the §5.11.13 accumulator over each
+decoded block's footprint at `decode_delta_lf` (and in the encoder-mirror
+`stamp_encoder_block_syntax`). `loop_filter_frame_from_grid` reads it via
+`delta_lf_at` with the §7.14.4 `delta_lf_multi` slot indexing, so the
+`delta_lf_present == 1` path now deblocks with the correct per-mi strength
+rather than refusing.
 
 The public `encode_av1` entry takes the constrained
 `[8, 64]`-per-axis lossless case; wider extents, lossy quant, and

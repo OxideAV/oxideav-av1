@@ -15278,6 +15278,18 @@ pub struct PartitionWalker {
     /// Stored as a fixed-length array because `FRAME_LF_COUNT` is a
     /// §3 spec constant.
     current_delta_lf: [i32; FRAME_LF_COUNT],
+    /// `DeltaLFs[row][col][i]` (the §5.11.5 grid-fill `DeltaLFs[r+y][c+x][i]
+    /// = DeltaLF[i]`, av1-spec p.59) packed into a row-major
+    /// `mi_rows * mi_cols * FRAME_LF_COUNT` flat buffer at slot
+    /// `(r * mi_cols + c) * FRAME_LF_COUNT + i`. Each block's §5.11.5
+    /// grid-fill stamps the §5.11.13 [`Self::current_delta_lf`] accumulator
+    /// value over its `bh4 * bw4` footprint; the §7.14.4 deblock then reads
+    /// the per-mi snapshot. Entries are `0` for not-yet-decoded cells (the
+    /// §5.9.18 zero default, which is also the whole grid when
+    /// `delta_lf_present == 0`). Held as `i32` because the §5.11.13
+    /// accumulator is signed and clamped to `-MAX_LOOP_FILTER ..=
+    /// MAX_LOOP_FILTER`.
+    delta_lfs: Vec<i32>,
     /// `cdef_idx[ row ][ col ]` packed into a row-major `mi_rows *
     /// mi_cols` flat buffer (av1-spec §5.11.55 / §5.11.56 / §6.10.40
     /// p.179, av1-spec p.104). Entries are `-1` for cells that no
@@ -16047,6 +16059,12 @@ impl PartitionWalker {
         let mut motion_modes: Vec<u8> = Vec::new();
         motion_modes.try_reserve_exact(area).ok()?;
         motion_modes.resize(area, MOTION_MODE_SIMPLE);
+        // §5.11.5 `DeltaLFs[ r ][ c ][ i ]` per-mi snapshot grid —
+        // `area * FRAME_LF_COUNT` slots, pre-filled `0` (the §5.9.18
+        // zero default). Stamped per block via `stamp_delta_lfs`.
+        let mut delta_lfs: Vec<i32> = Vec::new();
+        delta_lfs.try_reserve_exact(area * FRAME_LF_COUNT).ok()?;
+        delta_lfs.resize(area * FRAME_LF_COUNT, 0);
         // §5.11.x / §8.3.2: pre-fill `InterpFilters[r][c][0..2]` with
         // `EIGHTTAP = 0`, the spec's `interp_filter[ dir ] = EIGHTTAP`
         // fallback (set when `needs_interp_filter() == 0`). The §8.3.2
@@ -16078,6 +16096,7 @@ impl PartitionWalker {
             skip_modes,
             current_q_index: 0,
             current_delta_lf: [0; FRAME_LF_COUNT],
+            delta_lfs,
             cdef_idx,
             is_inters,
             segment_ids,
@@ -18271,6 +18290,61 @@ impl PartitionWalker {
         &self.current_delta_lf
     }
 
+    /// §5.11.5 `DeltaLFs[ r + y ][ c + x ][ i ] = DeltaLF[ i ]` grid-fill
+    /// (av1-spec p.59) — stamp the current §5.11.13
+    /// [`Self::current_delta_lf`] accumulator over a block's `bh4 * bw4`
+    /// mi footprint at origin `(mi_row, mi_col)` of size `sub_size`. Call
+    /// once per decoded block after its §5.11.13 `read_delta_lf` (the
+    /// accumulator the block carries into the §7.14.4 deblock). Out-of-grid
+    /// footprint cells (clipped at the frame edge, exactly like the other
+    /// §5.11.5 grid-fills) are skipped. An out-of-range `sub_size` is a
+    /// no-op (the caller validated it).
+    pub fn stamp_delta_lfs(&mut self, mi_row: u32, mi_col: u32, sub_size: usize) {
+        if sub_size >= BLOCK_SIZES {
+            return;
+        }
+        let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+        let acc = self.current_delta_lf;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                let base = ((rr * self.mi_cols + cc) as usize) * FRAME_LF_COUNT;
+                self.delta_lfs[base..base + FRAME_LF_COUNT].copy_from_slice(&acc);
+            }
+        }
+    }
+
+    /// Read `DeltaLFs[ r ][ c ][ idx ]` (§7.14.4). Returns `0` for
+    /// out-of-grid coordinates or an out-of-range `idx` (the §5.9.18 zero
+    /// default — an unstamped / off-edge cell contributes no §7.14.4 delta).
+    #[inline]
+    #[must_use]
+    pub fn delta_lf_at(&self, r: i32, c: i32, idx: usize) -> i32 {
+        if r < 0 || c < 0 || idx >= FRAME_LF_COUNT {
+            return 0;
+        }
+        let (r, c) = (r as u32, c as u32);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        self.delta_lfs[((r * self.mi_cols + c) as usize) * FRAME_LF_COUNT + idx]
+    }
+
+    /// View of the §5.11.5 `DeltaLFs[]` grid after the walk —
+    /// `delta_lfs()[ (r * MiCols + c) * FRAME_LF_COUNT + i ]`.
+    #[must_use]
+    pub fn delta_lfs(&self) -> &[i32] {
+        &self.delta_lfs
+    }
+
     /// Reset the `DeltaLF[ i ]` accumulator to all-zero. Callers
     /// should invoke this at tile entry per §5.11.2 (which mandates
     /// `DeltaLF[ i ] = 0` for `i = 0..FRAME_LF_COUNT-1` before the
@@ -19152,23 +19226,21 @@ impl PartitionWalker {
     ///
     /// ## Per-mi `DeltaLFs` scope
     ///
-    /// The §7.14.4 `DeltaLFs[ row ][ col ][ idx ]` term is supplied as
-    /// `0` for every cell: the walker tracks only the running
-    /// [`Self::current_delta_lf`] accumulator from §5.11.13, not a
-    /// per-mi `DeltaLFs[][][]` snapshot. This is bit-exact whenever
-    /// `delta_lf_present == 0` (the common case, where every block's
-    /// `DeltaLF` stays at its §5.9.18 zero default). When
-    /// `delta_lf_present == 1` the caller must first materialise a
-    /// per-mi `DeltaLFs` grid and use the lower-level
-    /// [`crate::loop_filter::loop_filter_frame`] directly; this bridge
-    /// returns the un-deblocked planes unchanged in that case rather
-    /// than apply a wrong strength.
+    /// The §7.14.4 `DeltaLFs[ row ][ col ][ idx ]` term is read from the
+    /// walker's persisted [`Self::delta_lfs`] grid — the per-mi snapshot
+    /// every decoded block's §5.11.5 grid-fill stamps from the §5.11.13
+    /// [`Self::current_delta_lf`] accumulator (via [`Self::stamp_delta_lfs`]).
+    /// When `delta_lf_present == 0` (the common case) the grid is all-zero
+    /// (the §5.9.18 default), so the §7.14.4 term contributes nothing; when
+    /// `delta_lf_present == 1` the per-mi deltas drive the §7.14.5 strength
+    /// selection. `delta_lf_multi` selects the §7.14.4 slot indexing (single
+    /// `DeltaLFs[..][0]` vs the per-`(plane, pass)` multi-slot read).
     #[allow(clippy::too_many_arguments)]
     pub fn loop_filter_frame_from_grid(
         &self,
         lf_params: &crate::uncompressed_header_tail::LoopFilterParams,
         seg_params: &crate::uncompressed_header_tail::SegmentationParams,
-        delta_lf_present: bool,
+        delta_lf_multi: bool,
         num_planes: u8,
         bit_depth: u8,
         subsampling_x: u8,
@@ -19178,23 +19250,16 @@ impl PartitionWalker {
         planes: &mut [crate::loop_filter::PlaneBuffer<'_>],
     ) {
         use crate::loop_filter::{loop_filter_frame, LoopFilterFrameContext};
-        // §5.9.18 `delta_lf_present == 1` needs a per-mi `DeltaLFs`
-        // snapshot the walker does not retain; refuse rather than
-        // deblock with a wrong §7.14.4 strength. The pre-deblock
-        // `planes` already hold the §7.12.3 step-3 reconstruction, so
-        // leaving them untouched is the conservative identity.
-        if delta_lf_present {
-            return;
-        }
         let ctx = LoopFilterFrameContext {
             loop_filter_level: lf_params.loop_filter_level,
             loop_filter_sharpness: lf_params.loop_filter_sharpness,
             loop_filter_delta_enabled: lf_params.loop_filter_delta_enabled,
             loop_filter_ref_deltas: lf_params.loop_filter_ref_deltas,
             loop_filter_mode_deltas: lf_params.loop_filter_mode_deltas,
-            // The §7.14.4 `DeltaLFs` term is held at `0` (the
-            // `delta_lf_present == 0` arm gated above).
-            delta_lf_multi: false,
+            // §7.14.4 `delta_lf_multi` selects single- vs multi-slot
+            // `DeltaLFs[..][idx]` indexing; the per-mi snapshot is read
+            // from the walker's `delta_lfs` grid via the `delta_lf` closure.
+            delta_lf_multi,
             mi_rows: self.mi_rows,
             mi_cols: self.mi_cols,
             num_planes,
@@ -19228,8 +19293,12 @@ impl PartitionWalker {
                     s as u8
                 }
             },
-            // §7.14.4 `DeltaLFs[ row ][ col ][ idx ] = 0` (gated arm).
-            delta_lf: &|_, _, _| 0i8,
+            // §7.14.4 `DeltaLFs[ row ][ col ][ idx ]` — the per-mi snapshot
+            // the §5.11.5 grid-fill stamped from the §5.11.13 accumulator.
+            // The value is clamped to `-MAX_LOOP_FILTER ..= MAX_LOOP_FILTER`
+            // (= -63..=63) by the §5.11.13 read, so the `i32 → i8` cast is
+            // lossless.
+            delta_lf: &|r, c, idx| self.delta_lf_at(r as i32, c as i32, idx) as i8,
             // §7.14.5 line 17259: `seg_feature_active_idx( segment,
             // feature )` with `feature ∈ {SEG_LVL_ALT_LF_Y_V ..= +V}`.
             seg_feature_active: &|segment, feature| {
@@ -19867,6 +19936,13 @@ impl PartitionWalker {
                 i += cdef_size4;
             }
         }
+        // §5.11.5 `DeltaLFs[ r + y ][ c + x ][ i ] = DeltaLF[ i ]`
+        // grid-fill — stamp the current §5.11.13 accumulator over the
+        // block footprint, keeping the encoder-mirror per-mi snapshot in
+        // decode-walker parity for the §7.14.4 deblock. When
+        // `delta_lf_present == 0` the accumulator stays at its all-zero
+        // §5.9.18 default, so this is a no-op write of zeros.
+        self.stamp_delta_lfs(s.mi_row, s.mi_col, s.sub_size);
     }
 
     /// Helper to read `PaletteSizes[ plane ][ r ][ c ]` for the
@@ -22357,6 +22433,12 @@ impl PartitionWalker {
             use_128x128_superblock,
             delta_lf_res,
         )?;
+        // §5.11.5 `DeltaLFs[ r + y ][ c + x ][ i ] = DeltaLF[ i ]`
+        // grid-fill — snapshot the (now-final) §5.11.13 accumulator over
+        // the block footprint so the §7.14.4 deblock reads the per-mi
+        // value. No-op on `delta_lf_present == 0` (the accumulator is the
+        // all-zero §5.9.18 default).
+        self.stamp_delta_lfs(mi_row, mi_col, sub_size);
 
         // §5.11.7 lines 11-13: `ReadDeltas = 0`, `RefFrame[ 0 ] =
         // INTRA_FRAME`, `RefFrame[ 1 ] = NONE`. `ReadDeltas` is
@@ -23027,6 +23109,9 @@ impl PartitionWalker {
             use_128x128_superblock,
             delta_lf_res,
         )?;
+        // §5.11.5 `DeltaLFs[][][]` per-mi snapshot grid-fill (see the
+        // intra-arm twin above). No-op on `delta_lf_present == 0`.
+        self.stamp_delta_lfs(mi_row, mi_col, sub_size);
 
         // §5.11.18 line 21: `ReadDeltas = 0`. Caller-owned per the
         // §6.10.4 derivation (`ReadDeltas = delta_q_present && (MiCol
@@ -44315,6 +44400,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, [1, 1, 1, 1], "all four edge categories incremented");
+    }
+
+    /// r378 §5.11.5 `DeltaLFs[ r + y ][ c + x ][ i ] = DeltaLF[ i ]`
+    /// per-mi grid-fill: after a §5.11.13 `decode_delta_lf` updates the
+    /// accumulator, `stamp_delta_lfs` writes that value over the block's
+    /// `bh4 * bw4` footprint, and `delta_lf_at` reads it back. Cells
+    /// outside the footprint stay at the §5.9.18 zero default.
+    #[test]
+    fn stamp_delta_lfs_writes_footprint_snapshot() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 32,
+            mi_col_start: 0,
+            mi_col_end: 32,
+        };
+        let mut walker = PartitionWalker::new(32, 32, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        for i in 0..FRAME_LF_COUNT {
+            cdfs.delta_lf_multi[i] = force_delta_lf_cdf(1);
+        }
+        let bytes = [0u8; 16];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 16, true).unwrap();
+        // Decode a multi-LF delta at a BLOCK_16X16 (4×4 mi) block origin
+        // (8, 4); every slot increments by 1.
+        let row = walker
+            .decode_delta_lf(
+                &mut dec,
+                &mut cdfs,
+                8,
+                4,
+                BLOCK_16X16,
+                0,
+                true,
+                true,
+                true,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(row, [1, 1, 1, 1]);
+
+        // §5.11.5 grid-fill over the 4×4-mi footprint at (8, 4).
+        walker.stamp_delta_lfs(8, 4, BLOCK_16X16);
+
+        // Every cell in rows 8..12, cols 4..8 carries [1,1,1,1].
+        for r in 8..12 {
+            for c in 4..8 {
+                for i in 0..FRAME_LF_COUNT {
+                    assert_eq!(
+                        walker.delta_lf_at(r, c, i),
+                        1,
+                        "DeltaLFs[{r}][{c}][{i}] must carry the stamped accumulator"
+                    );
+                }
+            }
+        }
+        // A cell outside the footprint stays at the §5.9.18 zero default.
+        assert_eq!(walker.delta_lf_at(0, 0, 0), 0);
+        assert_eq!(walker.delta_lf_at(12, 4, 0), 0, "row below the footprint");
+        assert_eq!(walker.delta_lf_at(8, 8, 0), 0, "col right of the footprint");
+        // Out-of-grid / out-of-range reads fold to 0.
+        assert_eq!(walker.delta_lf_at(-1, 0, 0), 0);
+        assert_eq!(walker.delta_lf_at(0, 0, FRAME_LF_COUNT), 0);
+        assert_eq!(walker.delta_lf_at(32, 0, 0), 0);
     }
 
     /// §5.11.13 multi-LF monochrome branch: `delta_lf_multi == 1`
