@@ -11503,6 +11503,131 @@ mod tests {
         );
     }
 
+    /// r378 — a **top-left** OBMC leaf (`AvailU == false && AvailL ==
+    /// false`) has no qualifying §7.11.3.9 neighbour on either axis, so the
+    /// overlap blend is a no-op and the OBMC dispatch reconstructs exactly
+    /// the leaf's own §7.11.3.1 translational prediction — i.e. identical
+    /// to the SIMPLE fallback. This exercises the `mi_row == 0` /
+    /// `mi_col == 0` edge of `obmc_dispatch_leaf` (the `wrapping_sub(1)`
+    /// candidate origins are never indexed because both passes gate off).
+    #[test]
+    fn r378_reconstruct_inter_frame_obmc_top_left_leaf_equals_simple() {
+        let ref_w = 32usize;
+        let ref_h = 32usize;
+        let mut refp = vec![0u16; ref_w * ref_h];
+        for r in 0..ref_h {
+            for c in 0..ref_w {
+                refp[r * ref_w + c] = ((r * 9 + c * 3) & 0xff) as u16;
+            }
+        }
+        let entry = RefFrameStoreEntry {
+            plane: &refp[..],
+            stride: ref_w,
+            upscaled_width: ref_w as u32,
+            width: ref_w as u32,
+            height: ref_h as u32,
+        };
+        let store = [entry; 8];
+        let ref_frame_idx = [0u8; 7];
+        let last = crate::uncompressed_header_tail::LAST_FRAME as u8;
+
+        // 2×2 mi grid (8×8 luma). One BLOCK_8X8 OBMC leaf at the top-left
+        // origin (0,0) — AvailU == AvailL == false.
+        let mi_rows: u32 = 2;
+        let mi_cols: u32 = 2;
+        let cells = (mi_rows * mi_cols) as usize;
+        let bw8x8 = crate::cdf::BLOCK_8X8;
+        let mut mi_sizes = vec![crate::cdf::BLOCK_INVALID; cells];
+        let mut is_inters = vec![0u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        let mut mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        for cell in 0..cells {
+            mi_sizes[cell] = bw8x8;
+            is_inters[cell] = 1;
+            ref_frames[cell * 2] = last as i8;
+            ref_frames[cell * 2 + 1] = -1;
+            mvs[cell * 4] = 2;
+            mvs[cell * 4 + 1] = 6;
+        }
+        let zeros = vec![0u8; cells];
+        let order_hints_by_ref = [0i32; 8];
+        let motion_modes = vec![crate::cdf::MOTION_MODE_OBMC; cells];
+        // Top-left leaf: no above / left neighbour available.
+        let avail_u = vec![0u8; cells];
+        let avail_l = vec![0u8; cells];
+
+        let curr_w = 8usize;
+        let mut curr_obmc = vec![0u16; curr_w * curr_w];
+        let mut curr_simple = vec![0u16; curr_w * curr_w];
+
+        macro_rules! grid {
+            ($obmc:expr) => {
+                InterModeInfoGrid {
+                    mi_sizes: &mi_sizes,
+                    is_inters: &is_inters,
+                    ref_frames: &ref_frames,
+                    mvs: &mvs,
+                    interp_filters: &interp_filters,
+                    compound_types: &zeros,
+                    wedge_indices: &zeros,
+                    wedge_signs: &zeros,
+                    mask_types: &zeros,
+                    interintra_modes: &zeros,
+                    wedge_interintras: &zeros,
+                    interintra_wedge_indices: &zeros,
+                    order_hint_bits: 7,
+                    current_order_hint: 0,
+                    order_hints_by_ref: &order_hints_by_ref,
+                    mi_rows,
+                    mi_cols,
+                    bit_depth: 8,
+                    warp: None,
+                    obmc: $obmc,
+                }
+            };
+        }
+        {
+            let g = grid!(Some(GridObmcContext {
+                motion_modes: &motion_modes,
+                avail_u: &avail_u,
+                avail_l: &avail_l,
+            }));
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr_obmc,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&g, &ref_frame_idx, &mut planes).expect("OBMC top-left walk");
+        }
+        {
+            let g = grid!(None);
+            let mut planes = [PlaneReconContext {
+                plane: 0,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                frame_store: &store,
+                frame_width: ref_w as u32,
+                frame_height: ref_h as u32,
+                curr: &mut curr_simple,
+                curr_stride: curr_w,
+            }];
+            reconstruct_inter_frame(&g, &ref_frame_idx, &mut planes).expect("SIMPLE walk");
+        }
+        assert_eq!(
+            curr_obmc, curr_simple,
+            "a top-left OBMC leaf has no §7.11.3.9 neighbour ⇒ the blend is a \
+             no-op ⇒ identical to the SIMPLE translational prediction"
+        );
+        // Sanity: the leaf actually reconstructed (not left zero).
+        assert!(curr_obmc.iter().any(|&s| s != 0));
+    }
+
     /// r378 — the OBMC frame-walk dispatch is per-plane: a 4:2:0
     /// three-plane (Y/Cb/Cr) frame with an 8×8 OBMC leaf reconstructs each
     /// plane through `reconstruct_inter_block_obmc` with the §7.11.3.9
