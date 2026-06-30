@@ -476,6 +476,132 @@ pub fn encode_inter_frame_y_opt(
     })
 }
 
+/// The encoded result of one single-reference 4:2:0 YUV P-frame.
+#[derive(Debug, Clone)]
+pub struct EncodedInterFrameYuv {
+    /// Luma frame width / height in samples (multiples of 8).
+    pub width: u32,
+    pub height: u32,
+    /// Per-`4 × 4`-luma-cell motion field (row-major over the luma
+    /// mi-grid), `[mv_row, mv_col]` in 1/8-luma-pel units. Chroma
+    /// prediction reuses the collocated luma MV (the §7.11.3.2 chroma
+    /// scaling is applied inside the prediction primitive).
+    pub mvs: Vec<[i16; 2]>,
+    /// Encoder reconstruction of the three planes (row-major).
+    pub recon_y: Vec<u8>,
+    pub recon_u: Vec<u8>,
+    pub recon_v: Vec<u8>,
+}
+
+/// Encode a 4:2:0 8-bit YUV plane triple as a single-reference P-frame
+/// against `ref_y` / `ref_u` / `ref_v`.
+///
+/// The luma plane is encoded exactly like [`encode_inter_frame_y_opt`],
+/// producing a per-`4 × 4`-luma-cell motion field. Each chroma `4 × 4`
+/// block (covering an `8 × 8` luma region under 4:2:0) reuses the
+/// **luma** MV of its collocated top-left even luma cell — the same
+/// candidate the decoder's §5.11.33 frame walk reads
+/// (`cand = (mi >> sub) << sub`) — and predicts through the chroma arm of
+/// the decoder primitive (`subsampling_x == subsampling_y == 1`), so the
+/// §7.11.3.2 chroma MV scaling is identical on both sides. Residuals are
+/// coded per plane, and the reconstruction is accumulated so a caller can
+/// round-trip the full motion field through
+/// [`crate::inter_pred::reconstruct_inter_frame`] with three
+/// `PlaneReconContext`s.
+///
+/// `width` / `height` must be multiples of 8. The reference planes must
+/// cover the luma / chroma extents.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_inter_frame_yuv(
+    input_y: &[u8],
+    input_u: &[u8],
+    input_v: &[u8],
+    width: u32,
+    height: u32,
+    ref_y: &EncRefPlane<'_>,
+    ref_u: &EncRefPlane<'_>,
+    ref_v: &EncRefPlane<'_>,
+    lossless: bool,
+    qp: &QuantizerParams,
+    search: i32,
+    subpel: bool,
+) -> Result<EncodedInterFrameYuv, Error> {
+    if width % 8 != 0 || height % 8 != 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // Luma pass — reuse the Y encoder for the motion field + recon.
+    let enc_y =
+        encode_inter_frame_y_opt(input_y, width, height, ref_y, lossless, qp, search, subpel)?;
+    let mi_cols = (width / 4) as usize;
+
+    let cw = (width / 2) as usize;
+    let ch = (height / 2) as usize;
+    if input_u.len() < cw * ch || input_v.len() < cw * ch {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let c_mi_cols = cw / 4;
+    let c_mi_rows = ch / 4;
+
+    let mut recon_u = vec![0u8; cw * ch];
+    let mut recon_v = vec![0u8; cw * ch];
+
+    for (plane, (input_c, recon_c, ref_c)) in [
+        (1u8, (input_u, &mut recon_u, ref_u)),
+        (2u8, (input_v, &mut recon_v, ref_v)),
+    ] {
+        for c_mi_r in 0..c_mi_rows {
+            for c_mi_c in 0..c_mi_cols {
+                let crow0 = c_mi_r * 4;
+                let ccol0 = c_mi_c * 4;
+                // §5.11.33 collocated candidate: chroma cell (cr, cc)
+                // reads the luma MV at luma cell (cr << 1, cc << 1).
+                let luma_cell = (c_mi_r * 2) * mi_cols + (c_mi_c * 2);
+                let mv = enc_y.mvs[luma_cell];
+                // Input chroma 4×4.
+                let mut blk = [0u8; 16];
+                for i in 0..4 {
+                    for j in 0..4 {
+                        blk[i * 4 + j] = input_c[(crow0 + i) * cw + (ccol0 + j)];
+                    }
+                }
+                // Chroma MC prediction (subsampling 1,1 ⇒ §7.11.3.2
+                // chroma MV scaling inside the primitive).
+                let mut pred16 = [0u16; 16];
+                predict_inter_block_single(
+                    ref_c,
+                    mv,
+                    plane,
+                    ccol0 as i32,
+                    crow0 as i32,
+                    4,
+                    4,
+                    qp.bit_depth,
+                    1,
+                    1,
+                    EIGHTTAP,
+                    &mut pred16,
+                )?;
+                let pred: [u8; 16] = std::array::from_fn(|k| pred16[k] as u8);
+                let leaf = encode_inter_block_residual_4x4(&blk, &pred, plane, lossless, qp)?;
+                for i in 0..4 {
+                    for j in 0..4 {
+                        recon_c[(crow0 + i) * cw + (ccol0 + j)] = leaf.recon[i * 4 + j];
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(EncodedInterFrameYuv {
+        width,
+        height,
+        mvs: enc_y.mvs,
+        recon_y: enc_y.recon,
+        recon_u,
+        recon_v,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +1079,273 @@ mod tests {
             enc.mvs.iter().any(|mv| mv[0] % 8 != 0 || mv[1] % 8 != 0),
             "sub-pel refinement produced a fractional MV"
         );
+    }
+
+    // Build the decoder's 3-plane frame-walk prediction from a luma
+    // motion field, returning (CurrFrame[0], CurrFrame[1], CurrFrame[2]).
+    #[allow(clippy::type_complexity)]
+    fn decoder_frame_prediction_yuv(
+        width: u32,
+        height: u32,
+        mvs: &[[i16; 2]],
+        ref_y: &EncRefPlane<'_>,
+        ref_u: &EncRefPlane<'_>,
+        ref_v: &EncRefPlane<'_>,
+    ) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let mi_cols = (width / 4) as usize;
+        let mi_rows = (height / 4) as usize;
+        let cells = mi_rows * mi_cols;
+        let last = crate::uncompressed_header_tail::LAST_FRAME;
+        let mi_sizes = vec![crate::cdf::BLOCK_4X4; cells];
+        let is_inters = vec![1u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        let mut grid_mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let zeros = vec![0u8; cells];
+        for cell in 0..cells {
+            ref_frames[cell * 2] = last as i8;
+            ref_frames[cell * 2 + 1] = -1;
+            grid_mvs[cell * 4] = mvs[cell][0];
+            grid_mvs[cell * 4 + 1] = mvs[cell][1];
+        }
+        let order_hints_by_ref = [0i32; 8];
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &grid_mvs,
+            interp_filters: &interp_filters,
+            compound_types: &zeros,
+            wedge_indices: &zeros,
+            wedge_signs: &zeros,
+            mask_types: &zeros,
+            interintra_modes: &zeros,
+            wedge_interintras: &zeros,
+            interintra_wedge_indices: &zeros,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows: mi_rows as u32,
+            mi_cols: mi_cols as u32,
+            bit_depth: 8,
+            warp: None,
+            obmc: None,
+        };
+        let ref_frame_idx = [0u8];
+        let store_y = [RefFrameStoreEntry {
+            plane: ref_y.plane,
+            stride: ref_y.stride,
+            upscaled_width: ref_y.width,
+            width: ref_y.width,
+            height: ref_y.height,
+        }];
+        let store_u = [RefFrameStoreEntry {
+            plane: ref_u.plane,
+            stride: ref_u.stride,
+            upscaled_width: ref_u.width,
+            width: ref_u.width,
+            height: ref_u.height,
+        }];
+        let store_v = [RefFrameStoreEntry {
+            plane: ref_v.plane,
+            stride: ref_v.stride,
+            upscaled_width: ref_v.width,
+            width: ref_v.width,
+            height: ref_v.height,
+        }];
+        let cw = (width / 2) as usize;
+        let ch = (height / 2) as usize;
+        let mut curr_y = vec![0u16; (width * height) as usize];
+        let mut curr_u = vec![0u16; cw * ch];
+        let mut curr_v = vec![0u16; cw * ch];
+        {
+            let mut planes = [
+                PlaneReconContext {
+                    plane: 0,
+                    subsampling_x: 0,
+                    subsampling_y: 0,
+                    frame_store: &store_y,
+                    frame_width: ref_y.width,
+                    frame_height: ref_y.height,
+                    curr: &mut curr_y,
+                    curr_stride: width as usize,
+                },
+                PlaneReconContext {
+                    plane: 1,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store_u,
+                    frame_width: ref_u.width,
+                    frame_height: ref_u.height,
+                    curr: &mut curr_u,
+                    curr_stride: cw,
+                },
+                PlaneReconContext {
+                    plane: 2,
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    frame_store: &store_v,
+                    frame_width: ref_v.width,
+                    frame_height: ref_v.height,
+                    curr: &mut curr_v,
+                    curr_stride: cw,
+                },
+            ];
+            reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap();
+        }
+        (curr_y, curr_u, curr_v)
+    }
+
+    #[test]
+    fn yuv_inter_frame_round_trips_chroma_through_decoder_frame_walk() {
+        // The encoder's chroma prediction (collocated luma MV + §7.11.3.2
+        // chroma scaling) must equal the decoder's 3-plane frame walk on
+        // the same luma motion field.
+        let w = 32u32;
+        let h = 24u32;
+        let rw = w + 16;
+        let rh = h + 16;
+        let cw = w / 2;
+        let chh = h / 2;
+        let crw = rw / 2;
+        let crh = rh / 2;
+        let plane_y = ref_plane(rw, rh, |r, c| (((r * 7) ^ (c * 3)) % 256) as u16);
+        let plane_u = ref_plane(crw, crh, |r, c| ((r * 5 + c * 9) % 256) as u16);
+        let plane_v = ref_plane(crw, crh, |r, c| ((r * 11 + c) % 256) as u16);
+        let ref_y = EncRefPlane {
+            plane: &plane_y,
+            stride: rw as usize,
+            width: rw,
+            height: rh,
+        };
+        let ref_u = EncRefPlane {
+            plane: &plane_u,
+            stride: crw as usize,
+            width: crw,
+            height: crh,
+        };
+        let ref_v = EncRefPlane {
+            plane: &plane_v,
+            stride: crw as usize,
+            width: crw,
+            height: crh,
+        };
+        // Inputs = shifted views (luma +2,+3; chroma a smooth view).
+        let mut in_y = vec![0u8; (w * h) as usize];
+        for r in 0..h as usize {
+            for c in 0..w as usize {
+                in_y[r * w as usize + c] = plane_y[(r + 2) * rw as usize + (c + 3)] as u8;
+            }
+        }
+        let mut in_u = vec![0u8; (cw * chh) as usize];
+        let mut in_v = vec![0u8; (cw * chh) as usize];
+        for r in 0..chh as usize {
+            for c in 0..cw as usize {
+                in_u[r * cw as usize + c] = plane_u[(r + 1) * crw as usize + (c + 1)] as u8;
+                in_v[r * cw as usize + c] = plane_v[(r + 1) * crw as usize + (c + 1)] as u8;
+            }
+        }
+        let qp = qp_lossy(48);
+        let enc = encode_inter_frame_yuv(
+            &in_y, &in_u, &in_v, w, h, &ref_y, &ref_u, &ref_v, false, &qp, 3, false,
+        )
+        .unwrap();
+
+        // Encoder chroma prediction per chroma 4×4.
+        let mi_cols = (w / 4) as usize;
+        let c_mi_cols = (cw / 4) as usize;
+        let c_mi_rows = (chh / 4) as usize;
+        let mut enc_pred_u = vec![0u16; (cw * chh) as usize];
+        let mut enc_pred_v = vec![0u16; (cw * chh) as usize];
+        for (plane, (ref_c, pred_c)) in [
+            (1u8, (&ref_u, &mut enc_pred_u)),
+            (2u8, (&ref_v, &mut enc_pred_v)),
+        ] {
+            for c_mi_r in 0..c_mi_rows {
+                for c_mi_c in 0..c_mi_cols {
+                    let mv = enc.mvs[(c_mi_r * 2) * mi_cols + (c_mi_c * 2)];
+                    let mut p = [0u16; 16];
+                    predict_inter_block_single(
+                        ref_c,
+                        mv,
+                        plane,
+                        (c_mi_c * 4) as i32,
+                        (c_mi_r * 4) as i32,
+                        4,
+                        4,
+                        8,
+                        1,
+                        1,
+                        EIGHTTAP,
+                        &mut p,
+                    )
+                    .unwrap();
+                    for i in 0..4 {
+                        for j in 0..4 {
+                            pred_c[(c_mi_r * 4 + i) * cw as usize + (c_mi_c * 4 + j)] =
+                                p[i * 4 + j];
+                        }
+                    }
+                }
+            }
+        }
+        let (_dy, du, dv) = decoder_frame_prediction_yuv(w, h, &enc.mvs, &ref_y, &ref_u, &ref_v);
+        assert_eq!(enc_pred_u, du, "U chroma prediction round-trips");
+        assert_eq!(enc_pred_v, dv, "V chroma prediction round-trips");
+    }
+
+    #[test]
+    fn lossless_yuv_inter_frame_reconstruction_is_bit_exact() {
+        let w = 16u32;
+        let h = 16u32;
+        let cw = w / 2;
+        let chh = h / 2;
+        let plane_y = ref_plane(w + 8, h + 8, |r, c| ((r * 5 + c * 3) % 256) as u16);
+        let plane_u = ref_plane(cw + 4, chh + 4, |r, c| ((r + c * 2) % 256) as u16);
+        let plane_v = ref_plane(cw + 4, chh + 4, |r, c| ((r * 2 + c) % 256) as u16);
+        let ref_y = EncRefPlane {
+            plane: &plane_y,
+            stride: (w + 8) as usize,
+            width: w + 8,
+            height: h + 8,
+        };
+        let ref_u = EncRefPlane {
+            plane: &plane_u,
+            stride: (cw + 4) as usize,
+            width: cw + 4,
+            height: chh + 4,
+        };
+        let ref_v = EncRefPlane {
+            plane: &plane_v,
+            stride: (cw + 4) as usize,
+            width: cw + 4,
+            height: chh + 4,
+        };
+        let in_y: Vec<u8> = (0..(w * h)).map(|k| ((k * 13 + 7) % 256) as u8).collect();
+        let in_u: Vec<u8> = (0..(cw * chh))
+            .map(|k| ((k * 19 + 1) % 256) as u8)
+            .collect();
+        let in_v: Vec<u8> = (0..(cw * chh))
+            .map(|k| ((k * 23 + 9) % 256) as u8)
+            .collect();
+        let enc = encode_inter_frame_yuv(
+            &in_y,
+            &in_u,
+            &in_v,
+            w,
+            h,
+            &ref_y,
+            &ref_u,
+            &ref_v,
+            true,
+            &qp_lossless(),
+            2,
+            false,
+        )
+        .unwrap();
+        assert_eq!(enc.recon_y, in_y, "lossless Y bit-exact");
+        assert_eq!(enc.recon_u, in_u, "lossless U bit-exact");
+        assert_eq!(enc.recon_v, in_v, "lossless V bit-exact");
     }
 
     #[test]
