@@ -258,6 +258,123 @@ pub fn estimate_motion_4x4_full_search(
     Ok(best_mv)
 }
 
+/// The encoded result of one single-reference luma P-frame: the
+/// per-block motion field, the running reconstruction, and the quantized
+/// coefficient blocks, in §5.11.5 raster (mi-grid) leaf order.
+#[derive(Debug, Clone)]
+pub struct EncodedInterFrameY {
+    /// Frame width / height in samples.
+    pub width: u32,
+    pub height: u32,
+    /// Per-`4 × 4`-cell motion vectors (row-major over the
+    /// `mi_rows × mi_cols` grid), `[mv_row, mv_col]` in 1/8-pel units.
+    pub mvs: Vec<[i16; 2]>,
+    /// The encoder's own reconstruction of the luma plane (row-major) —
+    /// `recon = Clip1(pred + Q^-1(Q(T(input - pred))))` per leaf. This is
+    /// the exact plane the decoder reconstructs from `mvs` + the per-leaf
+    /// `quant` against the same reference.
+    pub recon: Vec<u8>,
+    /// Per-cell §7.12.3 quantized coefficients (TX_4X4, 16 entries each),
+    /// in the same row-major leaf order as `mvs`.
+    pub quant: Vec<Vec<i32>>,
+}
+
+/// Encode a luma plane as a single-reference (P-frame) grid of TX_4X4
+/// inter leaves against `reference`.
+///
+/// For each `4 × 4` luma block in §5.11.5 raster order the encoder runs
+/// [`estimate_motion_4x4_full_search`] to pick an integer-pel MV, takes
+/// the §7.11.3.1 MC prediction at that MV from the decoder primitive,
+/// and codes the residual through [`encode_inter_block_residual_4x4`].
+/// The reconstruction is accumulated into `recon` so a caller can verify
+/// it against the decoder's independent [`crate::inter_pred::reconstruct_inter_frame`]
+/// frame walk driven by the returned `mvs`.
+///
+/// `width` / `height` must be multiples of 4. `lossless` selects the
+/// §5.9.2 arm (WHT vs DCT_DCT). The reference plane must be at least
+/// `width × height`.
+pub fn encode_inter_frame_y(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    reference: &EncRefPlane<'_>,
+    lossless: bool,
+    qp: &QuantizerParams,
+    search: i32,
+) -> Result<EncodedInterFrameY, Error> {
+    if width % 4 != 0 || height % 4 != 0 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if input.len() < w * h {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let mi_cols = (width / 4) as usize;
+    let mi_rows = (height / 4) as usize;
+    let mut mvs = vec![[0i16; 2]; mi_rows * mi_cols];
+    let mut quant = Vec::with_capacity(mi_rows * mi_cols);
+    let mut recon = vec![0u8; w * h];
+
+    for mi_r in 0..mi_rows {
+        for mi_c in 0..mi_cols {
+            let row0 = mi_r * 4;
+            let col0 = mi_c * 4;
+            // Gather the input 4×4 block.
+            let mut blk = [0u8; 16];
+            for i in 0..4 {
+                for j in 0..4 {
+                    blk[i * 4 + j] = input[(row0 + i) * w + (col0 + j)];
+                }
+            }
+            // Integer-pel MV search against the reference.
+            let mv = estimate_motion_4x4_full_search(
+                reference,
+                &blk,
+                col0 as i32,
+                row0 as i32,
+                qp.bit_depth,
+                search,
+            )?;
+            // MC prediction at the chosen MV (decoder primitive).
+            let mut pred16 = [0u16; 16];
+            predict_inter_block_single(
+                reference,
+                mv,
+                0,
+                col0 as i32,
+                row0 as i32,
+                4,
+                4,
+                qp.bit_depth,
+                0,
+                0,
+                EIGHTTAP,
+                &mut pred16,
+            )?;
+            let pred: [u8; 16] = std::array::from_fn(|k| pred16[k] as u8);
+            // Residual leaf.
+            let leaf = encode_inter_block_residual_4x4(&blk, &pred, 0, lossless, qp)?;
+            // Stitch reconstruction.
+            for i in 0..4 {
+                for j in 0..4 {
+                    recon[(row0 + i) * w + (col0 + j)] = leaf.recon[i * 4 + j];
+                }
+            }
+            mvs[mi_r * mi_cols + mi_c] = mv;
+            quant.push(leaf.quant);
+        }
+    }
+
+    Ok(EncodedInterFrameY {
+        width,
+        height,
+        mvs,
+        recon,
+        quant,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +569,200 @@ mod tests {
             &mut out,
         );
         assert!(r.is_err(), "short out buffer rejected");
+    }
+
+    use crate::inter_pred::{
+        reconstruct_inter_frame, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,
+    };
+
+    // Build the decoder's frame-walk prediction from an encoder motion
+    // field + the same reference, returning CurrFrame[0] (prediction
+    // only — no residual add-back, which the coefficient path supplies).
+    fn decoder_frame_prediction(enc: &EncodedInterFrameY, reference: &EncRefPlane<'_>) -> Vec<u16> {
+        let mi_cols = (enc.width / 4) as usize;
+        let mi_rows = (enc.height / 4) as usize;
+        let cells = mi_rows * mi_cols;
+        let last = crate::uncompressed_header_tail::LAST_FRAME;
+        let mi_sizes = vec![crate::cdf::BLOCK_4X4; cells];
+        let is_inters = vec![1u8; cells];
+        let mut ref_frames = vec![0i8; cells * 2];
+        let mut mvs = vec![0i16; cells * 4];
+        let interp_filters = vec![EIGHTTAP; cells * 2];
+        let zeros = vec![0u8; cells];
+        for cell in 0..cells {
+            ref_frames[cell * 2] = last as i8;
+            ref_frames[cell * 2 + 1] = -1; // NONE ⇒ single forward ref.
+            mvs[cell * 4] = enc.mvs[cell][0]; // list 0, row.
+            mvs[cell * 4 + 1] = enc.mvs[cell][1]; // list 0, col.
+        }
+        let order_hints_by_ref = [0i32; 8];
+        let grid = InterModeInfoGrid {
+            mi_sizes: &mi_sizes,
+            is_inters: &is_inters,
+            ref_frames: &ref_frames,
+            mvs: &mvs,
+            interp_filters: &interp_filters,
+            compound_types: &zeros,
+            wedge_indices: &zeros,
+            wedge_signs: &zeros,
+            mask_types: &zeros,
+            interintra_modes: &zeros,
+            wedge_interintras: &zeros,
+            interintra_wedge_indices: &zeros,
+            order_hint_bits: 7,
+            current_order_hint: 0,
+            order_hints_by_ref: &order_hints_by_ref,
+            mi_rows: mi_rows as u32,
+            mi_cols: mi_cols as u32,
+            bit_depth: 8,
+            warp: None,
+            obmc: None,
+        };
+        let store = [RefFrameStoreEntry {
+            plane: reference.plane,
+            stride: reference.stride,
+            upscaled_width: reference.width,
+            width: reference.width,
+            height: reference.height,
+        }];
+        let ref_frame_idx = [0u8];
+        let mut curr = vec![0u16; (enc.width * enc.height) as usize];
+        let mut planes = [PlaneReconContext {
+            plane: 0,
+            subsampling_x: 0,
+            subsampling_y: 0,
+            frame_store: &store,
+            frame_width: reference.width,
+            frame_height: reference.height,
+            curr: &mut curr,
+            curr_stride: enc.width as usize,
+        }];
+        reconstruct_inter_frame(&grid, &ref_frame_idx, &mut planes).unwrap();
+        curr
+    }
+
+    #[test]
+    fn encoder_motion_field_round_trips_through_decoder_frame_walk() {
+        // The encoder picks a per-4×4 motion field; the decoder's
+        // independent frame walk on that field must reproduce the exact
+        // MC prediction the encoder coded its residual against.
+        let w = 32u32;
+        let h = 24u32;
+        // Reference with structure (so the SAD search has a real minimum).
+        let plane = ref_plane(w + 16, h + 16, |r, c| {
+            (((r * 13) ^ (c * 7)).wrapping_add(r * c) % 256) as u16
+        });
+        let rw = w + 16;
+        let reference = EncRefPlane {
+            plane: &plane,
+            stride: rw as usize,
+            width: rw,
+            height: h + 16,
+        };
+        // Input: a globally shifted view of the reference top-left region.
+        let mut input = vec![0u8; (w * h) as usize];
+        for r in 0..h as usize {
+            for c in 0..w as usize {
+                // shift by (+2, +3) from reference origin.
+                input[r * w as usize + c] = plane[(r + 2) * rw as usize + (c + 3)] as u8;
+            }
+        }
+        let qp = qp_lossy(48);
+        let enc = encode_inter_frame_y(&input, w, h, &reference, false, &qp, 4).unwrap();
+
+        // Recompute the per-leaf MC prediction the encoder used and stitch
+        // it into a plane, then compare with the decoder frame walk.
+        let mut enc_pred = vec![0u16; (w * h) as usize];
+        let mi_cols = (w / 4) as usize;
+        for (cell, mv) in enc.mvs.iter().enumerate() {
+            let mi_r = cell / mi_cols;
+            let mi_c = cell % mi_cols;
+            let mut p = [0u16; 16];
+            predict_inter_block_single(
+                &reference,
+                *mv,
+                0,
+                (mi_c * 4) as i32,
+                (mi_r * 4) as i32,
+                4,
+                4,
+                8,
+                0,
+                0,
+                EIGHTTAP,
+                &mut p,
+            )
+            .unwrap();
+            for i in 0..4 {
+                for j in 0..4 {
+                    enc_pred[(mi_r * 4 + i) * w as usize + (mi_c * 4 + j)] = p[i * 4 + j];
+                }
+            }
+        }
+        let dec_pred = decoder_frame_prediction(&enc, &reference);
+        assert_eq!(
+            enc_pred, dec_pred,
+            "encoder MC prediction == decoder frame-walk prediction"
+        );
+    }
+
+    #[test]
+    fn lossless_inter_frame_reconstruction_is_bit_exact() {
+        // On the lossless WHT arm the residual is coded losslessly, so the
+        // encoder's reconstruction equals the input regardless of the
+        // motion field the estimator selects.
+        let w = 16u32;
+        let h = 16u32;
+        let plane = ref_plane(w + 8, h + 8, |r, c| ((r * 5 + c * 11) % 256) as u16);
+        let reference = EncRefPlane {
+            plane: &plane,
+            stride: (w + 8) as usize,
+            width: w + 8,
+            height: h + 8,
+        };
+        let input: Vec<u8> = (0..(w * h)).map(|k| ((k * 17 + 3) % 256) as u8).collect();
+        let enc = encode_inter_frame_y(&input, w, h, &reference, true, &qp_lossless(), 2).unwrap();
+        assert_eq!(enc.recon, input, "lossless inter frame recon is bit-exact");
+    }
+
+    #[test]
+    fn lossy_inter_frame_static_match_is_zero_residual() {
+        // Input identical to the reference's top-left region ⇒ zero-MV
+        // best match ⇒ zero residual ⇒ recon == input on the lossy arm.
+        let w = 16u32;
+        let h = 16u32;
+        let plane = ref_plane(w + 8, h + 8, |r, c| ((r * 3 + c) % 100 + 20) as u16);
+        let reference = EncRefPlane {
+            plane: &plane,
+            stride: (w + 8) as usize,
+            width: w + 8,
+            height: h + 8,
+        };
+        let mut input = vec![0u8; (w * h) as usize];
+        for r in 0..h as usize {
+            for c in 0..w as usize {
+                input[r * w as usize + c] = plane[r * (w + 8) as usize + c] as u8;
+            }
+        }
+        let enc = encode_inter_frame_y(&input, w, h, &reference, false, &qp_lossy(80), 2).unwrap();
+        assert!(
+            enc.mvs.iter().all(|mv| *mv == [0, 0]),
+            "static match ⇒ all zero MVs"
+        );
+        assert_eq!(enc.recon, input, "zero residual ⇒ recon == input");
+    }
+
+    #[test]
+    fn encode_inter_frame_rejects_misaligned_dims() {
+        let plane = vec![0u16; 64];
+        let reference = EncRefPlane {
+            plane: &plane,
+            stride: 8,
+            width: 8,
+            height: 8,
+        };
+        let input = vec![0u8; 30];
+        let r = encode_inter_frame_y(&input, 6, 5, &reference, true, &qp_lossless(), 1);
+        assert!(r.is_err(), "non-multiple-of-4 dims rejected");
     }
 }
