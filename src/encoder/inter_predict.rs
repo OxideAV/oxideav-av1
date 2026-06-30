@@ -236,17 +236,10 @@ pub fn estimate_motion_4x4_full_search(
     let mut best_mv = [0i16; 2];
     let mut best_sad = u32::MAX;
     let mut best_cost = i32::MAX; // magnitude tie-breaker
-    let mut pred = [0u16; 16];
     for dr in -search..=search {
         for dc in -search..=search {
             let mv = [(dr * 8) as i16, (dc * 8) as i16];
-            predict_inter_block_single(
-                reference, mv, 0, x, y, 4, 4, bit_depth, 0, 0, EIGHTTAP, &mut pred,
-            )?;
-            let mut sad = 0u32;
-            for k in 0..16 {
-                sad += (input[k] as i32 - pred[k] as i32).unsigned_abs();
-            }
+            let sad = block_sad_at_mv(reference, input, x, y, mv, bit_depth)?;
             let cost = dr.abs() + dc.abs();
             if sad < best_sad || (sad == best_sad && cost < best_cost) {
                 best_sad = sad;
@@ -256,6 +249,85 @@ pub fn estimate_motion_4x4_full_search(
         }
     }
     Ok(best_mv)
+}
+
+/// SAD between `input` and the §7.11.3.1 MC prediction at `mv` (1/8-pel)
+/// for one `4 × 4` luma block at plane coords `(x, y)`.
+fn block_sad_at_mv(
+    reference: &EncRefPlane<'_>,
+    input: &[u8; 16],
+    x: i32,
+    y: i32,
+    mv: [i16; 2],
+    bit_depth: u8,
+) -> Result<u32, Error> {
+    let mut pred = [0u16; 16];
+    predict_inter_block_single(
+        reference, mv, 0, x, y, 4, 4, bit_depth, 0, 0, EIGHTTAP, &mut pred,
+    )?;
+    let mut sad = 0u32;
+    for k in 0..16 {
+        sad += (input[k] as i32 - pred[k] as i32).unsigned_abs();
+    }
+    Ok(sad)
+}
+
+/// Integer-pel full search followed by §7.11.3.1 sub-pel refinement.
+///
+/// First runs [`estimate_motion_4x4_full_search`] for the best
+/// integer-pel MV, then refines it through the 1/8-luma-sample MV grid
+/// the interpolation filter supports: a half-pel (`±4`) pass over the 8
+/// neighbours of the integer optimum, then a quarter-pel (`±2`) pass over
+/// the 8 neighbours of the half-pel optimum, then an eighth-pel (`±1`)
+/// pass. Each candidate's prediction is taken from the decoder primitive,
+/// so the returned MV is one the decoder reconstructs identically.
+///
+/// The sub-pel passes are a local steepest-descent diamond: at every
+/// stage the centre is the running best, and a candidate is accepted only
+/// on a strict SAD improvement (ties keep the lower-magnitude MV), so the
+/// search is deterministic and never worse than the integer optimum.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_motion_4x4_subpel(
+    reference: &EncRefPlane<'_>,
+    input: &[u8; 16],
+    x: i32,
+    y: i32,
+    bit_depth: u8,
+    search: i32,
+) -> Result<[i16; 2], Error> {
+    let mut best = estimate_motion_4x4_full_search(reference, input, x, y, bit_depth, search)?;
+    let mut best_sad = block_sad_at_mv(reference, input, x, y, best, bit_depth)?;
+    // Refinement step sizes in 1/8-pel units: half, quarter, eighth.
+    for &step in &[4i16, 2, 1] {
+        loop {
+            let mut improved = false;
+            let centre = best;
+            for &(dr, dc) in &[
+                (-step, 0i16),
+                (step, 0),
+                (0, -step),
+                (0, step),
+                (-step, -step),
+                (-step, step),
+                (step, -step),
+                (step, step),
+            ] {
+                let cand = [centre[0] + dr, centre[1] + dc];
+                let sad = block_sad_at_mv(reference, input, x, y, cand, bit_depth)?;
+                let cand_cost = (cand[0].abs() as i32) + (cand[1].abs() as i32);
+                let best_cost = (best[0].abs() as i32) + (best[1].abs() as i32);
+                if sad < best_sad || (sad == best_sad && cand_cost < best_cost) {
+                    best_sad = sad;
+                    best = cand;
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+    Ok(best)
 }
 
 /// The encoded result of one single-reference luma P-frame: the
@@ -302,6 +374,23 @@ pub fn encode_inter_frame_y(
     qp: &QuantizerParams,
     search: i32,
 ) -> Result<EncodedInterFrameY, Error> {
+    encode_inter_frame_y_opt(input, width, height, reference, lossless, qp, search, false)
+}
+
+/// As [`encode_inter_frame_y`], with an explicit `subpel` flag selecting
+/// the §7.11.3.1 sub-pel-refined estimator ([`estimate_motion_4x4_subpel`])
+/// over the integer-pel full search.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_inter_frame_y_opt(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    reference: &EncRefPlane<'_>,
+    lossless: bool,
+    qp: &QuantizerParams,
+    search: i32,
+    subpel: bool,
+) -> Result<EncodedInterFrameY, Error> {
     if width % 4 != 0 || height % 4 != 0 {
         return Err(Error::PartitionWalkOutOfRange);
     }
@@ -327,15 +416,27 @@ pub fn encode_inter_frame_y(
                     blk[i * 4 + j] = input[(row0 + i) * w + (col0 + j)];
                 }
             }
-            // Integer-pel MV search against the reference.
-            let mv = estimate_motion_4x4_full_search(
-                reference,
-                &blk,
-                col0 as i32,
-                row0 as i32,
-                qp.bit_depth,
-                search,
-            )?;
+            // MV search against the reference (integer-pel, optionally
+            // refined to the §7.11.3.1 sub-pel grid).
+            let mv = if subpel {
+                estimate_motion_4x4_subpel(
+                    reference,
+                    &blk,
+                    col0 as i32,
+                    row0 as i32,
+                    qp.bit_depth,
+                    search,
+                )?
+            } else {
+                estimate_motion_4x4_full_search(
+                    reference,
+                    &blk,
+                    col0 as i32,
+                    row0 as i32,
+                    qp.bit_depth,
+                    search,
+                )?
+            };
             // MC prediction at the chosen MV (decoder primitive).
             let mut pred16 = [0u16; 16];
             predict_inter_block_single(
@@ -750,6 +851,108 @@ mod tests {
             "static match ⇒ all zero MVs"
         );
         assert_eq!(enc.recon, input, "zero residual ⇒ recon == input");
+    }
+
+    #[test]
+    fn subpel_estimate_never_worse_than_integer() {
+        // The sub-pel refinement starts from the integer optimum and only
+        // accepts strict improvements, so its SAD is <= the integer SAD.
+        let w = 40u32;
+        let h = 40u32;
+        let plane = ref_plane(w, h, |r, c| {
+            (((r * 3 + c * 2) as f32 * 1.7).sin().abs() * 200.0) as u16 + 10
+        });
+        let reference = EncRefPlane {
+            plane: &plane,
+            stride: w as usize,
+            width: w,
+            height: h,
+        };
+        let (bx, by) = (16usize, 16usize);
+        // Input = reference at a half-pel-ish offset (use a blurred mix).
+        let input: [u8; 16] = std::array::from_fn(|k| {
+            let i = k / 4;
+            let j = k % 4;
+            let a = plane[(by + i) * w as usize + (bx + j)] as u32;
+            let b = plane[(by + i) * w as usize + (bx + j + 1)] as u32;
+            ((a + b) / 2) as u8
+        });
+        let int_mv =
+            estimate_motion_4x4_full_search(&reference, &input, bx as i32, by as i32, 8, 3)
+                .unwrap();
+        let sub_mv =
+            estimate_motion_4x4_subpel(&reference, &input, bx as i32, by as i32, 8, 3).unwrap();
+        let int_sad = block_sad_at_mv(&reference, &input, bx as i32, by as i32, int_mv, 8).unwrap();
+        let sub_sad = block_sad_at_mv(&reference, &input, bx as i32, by as i32, sub_mv, 8).unwrap();
+        assert!(
+            sub_sad <= int_sad,
+            "sub-pel SAD {sub_sad} <= integer {int_sad}"
+        );
+    }
+
+    #[test]
+    fn subpel_frame_round_trips_through_decoder_frame_walk() {
+        // Sub-pel motion field must reconstruct identically through the
+        // decoder's independent frame walk (the sub-pel MVs drive the
+        // interpolation filter the same way on both sides).
+        let w = 24u32;
+        let h = 20u32;
+        let rw = w + 12;
+        let plane = ref_plane(rw, h + 12, |r, c| {
+            (((r * 11) ^ (c * 5)).wrapping_add(r + c) % 256) as u16
+        });
+        let reference = EncRefPlane {
+            plane: &plane,
+            stride: rw as usize,
+            width: rw,
+            height: h + 12,
+        };
+        let mut input = vec![0u8; (w * h) as usize];
+        for r in 0..h as usize {
+            for c in 0..w as usize {
+                let a = plane[(r + 1) * rw as usize + (c + 1)] as u32;
+                let b = plane[(r + 1) * rw as usize + (c + 2)] as u32;
+                input[r * w as usize + c] = ((a + b) / 2) as u8;
+            }
+        }
+        let qp = qp_lossy(40);
+        let enc = encode_inter_frame_y_opt(&input, w, h, &reference, false, &qp, 3, true).unwrap();
+        // Encoder MC prediction per leaf.
+        let mut enc_pred = vec![0u16; (w * h) as usize];
+        let mi_cols = (w / 4) as usize;
+        for (cell, mv) in enc.mvs.iter().enumerate() {
+            let mi_r = cell / mi_cols;
+            let mi_c = cell % mi_cols;
+            let mut p = [0u16; 16];
+            predict_inter_block_single(
+                &reference,
+                *mv,
+                0,
+                (mi_c * 4) as i32,
+                (mi_r * 4) as i32,
+                4,
+                4,
+                8,
+                0,
+                0,
+                EIGHTTAP,
+                &mut p,
+            )
+            .unwrap();
+            for i in 0..4 {
+                for j in 0..4 {
+                    enc_pred[(mi_r * 4 + i) * w as usize + (mi_c * 4 + j)] = p[i * 4 + j];
+                }
+            }
+        }
+        let dec_pred = decoder_frame_prediction(&enc, &reference);
+        assert_eq!(enc_pred, dec_pred, "sub-pel field round-trips");
+        // And at least one MV is genuinely sub-pel (not a multiple of 8),
+        // proving the sub-pel grid was exercised.
+        assert!(
+            enc.mvs.iter().any(|mv| mv[0] % 8 != 0 || mv[1] % 8 != 0),
+            "sub-pel refinement produced a fractional MV"
+        );
     }
 
     #[test]
