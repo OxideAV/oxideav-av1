@@ -252,6 +252,7 @@ pub mod forward_transform;
 pub mod forward_transform_2d;
 pub mod forward_wht;
 pub mod frame_obu;
+pub mod inter_predict;
 pub mod ivf;
 pub mod loop_restoration_write;
 pub mod obu;
@@ -293,6 +294,10 @@ pub use forward_transform::{
 pub use forward_transform_2d::forward_transform_2d;
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
+pub use inter_predict::{
+    encode_inter_block_residual_4x4, estimate_motion_4x4_full_search, predict_inter_block_single,
+    EncRefPlane, InterResidualLeaf,
+};
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
 pub use loop_restoration_write::{write_lr, write_lr_unit, LrWriteState};
 pub use obu::{
