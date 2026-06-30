@@ -4,6 +4,53 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-av1/compare/v0.1.13...v0.2.0) - 2026-06-30
+
+### Other
+
+- av1 r381: document the single-reference P-frame inter encoder (README + CHANGELOG)
+- av1 encoder r381: 4:2:0 YUV single-reference P-frame encode + chroma frame-walk round-trip
+- av1 encoder r381: §7.11.3.1 sub-pel motion refinement + sub-pel frame round-trip
+- av1 encoder r381: frame-scope single-reference P-frame luma encode + decoder frame-walk round-trip
+- av1 encoder r381: §7.11.3.1 single-reference inter MC + residual leaf + integer-pel motion estimate
+- av1 r378: OBMC frame-walk top-left no-neighbour edge test
+- av1 r378: 4:2:0 multiplane OBMC frame-walk dispatch test
+- av1 r378: §7.14.4 per-mi DeltaLFs snapshot for delta_lf_present == 1
+- av1 r378: §7.11.3.9-10 OBMC frame-walk dispatch (§5.11.33)
+- av1 decoder r373: superres post-processing hardening tests + README/CHANGELOG rollup
+- av1 decoder r373: wire §7.16 superres horizontal upscaling into the public dyn decode path
+- av1 decoder r373: wire §7.18.3 film-grain synthesis into the public dyn decode path
+- av1 decoder r367: wire §7.11.2.3 recursive intra (filter-intra) luma path
+- av1 decoder r367: wire §7.11.5 chroma-from-luma (CfL) AC into the walker
+- av1 decoder r363: test the §7.11.2.11 intra edge upsample path in the directional pre-pass
+- av1 decoder r363: stamp §5.11.22 UVModes[] grid for spec-correct §7.11.2.8 chroma get_filter_type
+- av1 decoder r363: wire §7.11.2.4 step-4 directional intra edge-filter + upsample pre-pass into the §5.11 walker
+- av1 README/CHANGELOG r359: document the §5.11.33 frame-walk compound + inter-intra side-data path
+- av1 decoder r359: end-to-end inter-intra frame-walk test driven by the stamped §5.11.28 mode grid
+- av1 decoder r359: stamp §5.11.27/28/29 inter side-data grids + thread them through the §5.11.33 frame walk
+- av1 decoder r355: broaden §7.11.3.9 OBMC walker-bridge test coverage
+- av1 decoder r355: wire §7.11.3.9-10 OBMC into the reconstruction surface
+- av1 README/CHANGELOG r349: document the §7.14 deblock bridge + in-loop filter trio
+- av1 decoder r349: §7.14.2 isTxEdge gating test through the deblock bridge
+- av1 decoder r349: end-to-end §7.4 in-loop filter chain test (deblock→CDEF→LR)
+- av1 decoder r349: §7.14 deblock bridge loop_filter_frame_from_grid from walker grids
+- av1 README r346: document the §5.11.33 frame-scope inter reconstruction path
+- av1 decoder r346: frame-scope multi-leaf sub-pel inter reconstruction test
+- av1 decoder r346: end-to-end two-pass inter decode integration test
+- av1 decoder r346: §5.11.33 frame-scope inter reconstruction bridge from walker grids
+- neutralise external-encoder naming in README intra-recon note
+- av1 README r342: document the §5.11 syntax-walker intra reconstruction path
+- av1 decoder r342: neighbour-propagation coverage for §7.11.2.1 intra reconstruction
+- av1 decoder r342: §5.11.2 decode_tile() superblock loop — drive the whole tile partition walk into CurrFrame
+- av1 decoder r342: §7.11.2.1 intra prediction into CurrFrame — wire predict_intra ahead of the §7.13 reconstruct in the §5.11.5 walker
+- av1 decoder r338: PartitionWalker warped-motion bridge reconstruct_inter_block_warp_into_curr_frame
+- av1 decoder r338: wire §7.11.3.5 warped-motion into the §5.11.33 single-ref frame walk
+- av1 decoder r338: §7.11.3.1 warped-motion reconstruction bridge reconstruct_inter_block_warp
+- av1 decoder r334: §5.11.35 walker bridge drives §7.11.4 predict_palette across a palette block into CurrFrame[plane]
+- av1 decoder r330: §7.11.4 palette prediction process predict_palette
+- av1 decoder r325: surface §5.11.49 ColorMapY/ColorMapUV on §5.11.5 walker DecodedBlock
+- av1 registry: wire RuntimeContext entry point (intra-only Decoder + container tags)
+
 ### Other
 
 - av1 encoder r381: add a **single-reference (P-frame) inter pixel pipeline** (`encoder::inter_predict`), the first encode-side motion-compensated path. The intra dyn driver builds a leaf's reconstruction as `recon = pred + Q^-1(Q(T(input - pred)))` where `pred` is the §7.11.2 intra prediction; the inter (§5.11.23 `is_inter == 1`) arm differs in exactly one place — `pred` is the §7.11.3.1 motion-compensated reference. The new module supplies that single difference and shares every downstream stage verbatim. `predict_inter_block_single` takes the prediction **straight from the decoder's** `reconstruct_inter_block` (single-ref translational SIMPLE arm), so the prediction the encoder codes its residual against is bit-identical to what the decoder reproduces from the same `(RefFrame[0], Mv)` — there is no second prediction implementation to keep in sync. `encode_inter_block_residual_4x4` is the §5.11.39 TX_4X4 residual leaf (residual against the MC prediction, forward transform + quantize on the lossless-WHT / lossy-DCT_DCT arm, the matching `dequantize_step1` + `inverse_transform_2d`, and the `recon = Clip1(pred + inv_residual)` stitch), returning the §7.12.3 quantized coefficients alongside the reconstructed block. Motion estimation is a deterministic SAD search: `estimate_motion_4x4_full_search` over an integer-pel window, then `estimate_motion_4x4_subpel` refines through the half/quarter/eighth-pel MV grid the interpolation filter supports (steepest-descent diamond, strict-improvement acceptance, ties to lower magnitude). Frame-scope entries `encode_inter_frame_y` / `encode_inter_frame_y_opt` (luma) + `encode_inter_frame_yuv` (4:2:0 — each chroma 4×4 reuses the collocated luma MV `cand = (mi >> sub) << sub` through the chroma arm of the primitive so the §7.11.3.2 chroma MV scaling matches the decoder) produce the per-cell motion field + running reconstruction (`EncodedInterFrameY` / `EncodedInterFrameYuv`). The round-trip is verified **end-to-end against the independent decoder**: feeding the encoder's motion field into `reconstruct_inter_frame` reproduces the exact MC prediction the encoder coded against — integer-pel, sub-pel (with a fractional-MV assertion proving the sub-pel grid fired), and 3-plane chroma — and the lossless arm reconstructs every plane byte-for-byte. 18 module tests. Lib unit tests 2058 -> 2076.
