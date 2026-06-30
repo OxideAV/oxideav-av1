@@ -101,6 +101,35 @@ walker bridge (`reconstruct_inter_frame_into_curr_frame`) threads the
 `obmc` context from the walker's persisted `motion_modes` grid plus per-cell
 `AvailU` / `AvailL` derived from the tile geometry.
 
+The **encoder** now has a single-reference (P-frame) inter pixel pipeline
+(`encoder::inter_predict`). The intra dyn driver builds a leaf's
+reconstruction as `recon = pred + Q^-1(Q(T(input - pred)))` where `pred`
+is the §7.11.2 intra prediction; the inter arm differs in exactly one
+place — `pred` is the §7.11.3.1 motion-compensated reference. The
+encode-side primitives supply that one difference and share every
+downstream stage verbatim: `predict_inter_block_single` takes the
+prediction straight from the **decoder's** `reconstruct_inter_block`, so
+the prediction the encoder codes its residual against is bit-identical to
+what the decoder reproduces from the same `(RefFrame[0], Mv)` — there is
+no second prediction implementation. `encode_inter_block_residual_4x4` is
+the §5.11.39 TX_4X4 residual leaf (forward transform + quantize on the
+lossless-WHT / lossy-DCT_DCT arm, the matching dequant + inverse, and the
+`recon = Clip1(pred + inv_residual)` stitch). Motion estimation is a
+deterministic SAD search: `estimate_motion_4x4_full_search` over an
+integer-pel window, then `estimate_motion_4x4_subpel` refines through the
+half/quarter/eighth-pel MV grid the interpolation filter supports
+(steepest-descent diamond, strict-improvement acceptance). Frame-scope
+entries `encode_inter_frame_y` / `encode_inter_frame_y_opt` (luma) and
+`encode_inter_frame_yuv` (4:2:0; each chroma 4×4 reuses the collocated
+luma MV `cand = (mi >> sub) << sub` through the chroma arm so the
+§7.11.3.2 chroma MV scaling matches the decoder) produce the per-cell
+motion field + running reconstruction. The round-trip is verified
+end-to-end against the decoder: feeding the encoder's motion field into
+the **independent** `reconstruct_inter_frame` frame walk reproduces the
+exact MC prediction the encoder coded against (integer-pel, sub-pel, and
+3-plane chroma), and the lossless arm reconstructs every plane
+byte-for-byte.
+
 The spec-faithful §5.11 syntax walker (`PartitionWalker`, separate from
 the encoder-mirror pixel driver above) now reconstructs **intra pixels**
 end-to-end from a real bitstream: every intra transform block runs the
