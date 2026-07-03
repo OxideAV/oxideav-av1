@@ -110,8 +110,8 @@ pub fn decode_frame_spec(
         .frame_size
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    if fs.use_superres {
-        // §7.16 superres is not wired into this driver yet.
+    if fs.use_superres && fs.upscaled_width <= fs.frame_width {
+        // §5.9.8 conformance: superres only ever widens.
         return Err(Error::PartitionWalkOutOfRange);
     }
     let ti = fh
@@ -283,13 +283,27 @@ pub fn decode_frame_spec(
         /* read_deltas = */ dq.delta_q_present,
     )?;
 
-    // ---- Crop `CurrFrame[ plane ]` to the §5.9.8 frame extents. ----
+    // ---- Take `CurrFrame[ plane ]` at its FULL mi-grid extent. ----
+    // The spec's CurrFrame covers the padded `MiRows x MiCols` grid
+    // (frames whose dimensions are not mi-aligned carry decoded padding
+    // columns/rows past the crop). The §7.4 in-loop passes read that
+    // padding — the §7.14 wide-filter taps, the §7.15 mi-bounded
+    // availability region, and especially the §7.16 upscaler's
+    // `Clip3(0, miW * MI_SIZE - 1, ..)` source clamp — so the whole
+    // chain runs at the padded extent and the §7.18.2 crop to the
+    // output extents happens at the very end.
     let sub_x = u8::from(cc.subsampling_x) as u32;
     let sub_y = u8::from(cc.subsampling_y) as u32;
     let num_planes = cc.num_planes as usize;
     let mut plane_bufs: Vec<Vec<i32>> = Vec::with_capacity(num_planes);
     let mut plane_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
     for plane in 0..num_planes {
+        let src = walker
+            .curr_frame(plane)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        let (rows, cols) = walker
+            .curr_frame_dims(plane)
+            .ok_or(Error::PartitionWalkOutOfRange)?;
         let (pw, ph) = if plane == 0 {
             (fs.frame_width, fs.frame_height)
         } else {
@@ -298,22 +312,11 @@ pub fn decode_frame_spec(
                 (fs.frame_height + sub_y) >> sub_y,
             )
         };
-        let src = walker
-            .curr_frame(plane)
-            .ok_or(Error::PartitionWalkOutOfRange)?;
-        let (rows, cols) = walker
-            .curr_frame_dims(plane)
-            .ok_or(Error::PartitionWalkOutOfRange)?;
         if rows < ph || cols < pw {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        let mut buf = vec![0i32; (pw as usize) * (ph as usize)];
-        for y in 0..ph as usize {
-            let src_row = &src[y * cols as usize..y * cols as usize + pw as usize];
-            buf[y * pw as usize..(y + 1) * pw as usize].copy_from_slice(src_row);
-        }
-        plane_bufs.push(buf);
-        plane_dims.push((pw, ph));
+        plane_bufs.push(src.to_vec());
+        plane_dims.push((cols, rows));
     }
 
     // ---- §7.4 in-loop passes: §7.14 deblock, then §7.15 CDEF. ----
@@ -391,6 +394,73 @@ pub fn decode_frame_spec(
             );
         }
     }
+    // §7.4 steps 3-4 / §7.16: horizontal superres upscaling of BOTH the
+    // CDEF output (`plane_bufs` → UpscaledCdefFrame) and the post-
+    // deblock copy (`deblocked` → UpscaledCurrFrame), ahead of loop
+    // restoration. No-op when `use_superres == 0`.
+    let mut deblocked = deblocked;
+    if fs.use_superres && fs.upscaled_width > fs.frame_width {
+        let sr_ctx = crate::superres::SuperresFrameContext {
+            use_superres: true,
+            frame_width: fs.frame_width,
+            upscaled_width: fs.upscaled_width,
+            frame_height: fs.frame_height,
+            mi_cols: fs.mi_cols,
+            num_planes: cc.num_planes,
+            bit_depth: cc.bit_depth,
+            subsampling_x: u8::from(cc.subsampling_x),
+            subsampling_y: u8::from(cc.subsampling_y),
+        };
+        // §7.16 output extents: `upscaledPlaneW x planeH` — exact
+        // (un-padded) per-plane dimensions.
+        let mut new_dims: Vec<(u32, u32)> = Vec::with_capacity(num_planes);
+        for plane in 0..num_planes {
+            let (out_w, out_h) = if plane == 0 {
+                (fs.upscaled_width, fs.frame_height)
+            } else {
+                (
+                    (fs.upscaled_width + sub_x) >> sub_x,
+                    (fs.frame_height + sub_y) >> sub_y,
+                )
+            };
+            new_dims.push((out_w, out_h));
+        }
+        let upscale_set = |bufs: &mut Vec<Vec<i32>>| -> Result<(), Error> {
+            let mut inputs_owned = std::mem::take(bufs);
+            let mut inputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+            for (buf, &(pw, ph)) in inputs_owned.iter_mut().zip(plane_dims.iter()) {
+                inputs.push(PlaneBuffer {
+                    rows: ph,
+                    cols: pw,
+                    samples: buf,
+                });
+            }
+            let mut outputs_owned: Vec<Vec<i32>> = new_dims
+                .iter()
+                .map(|&(pw, ph)| vec![0i32; (pw as usize) * (ph as usize)])
+                .collect();
+            {
+                let mut outputs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+                for (buf, &(pw, ph)) in outputs_owned.iter_mut().zip(new_dims.iter()) {
+                    outputs.push(PlaneBuffer {
+                        rows: ph,
+                        cols: pw,
+                        samples: buf,
+                    });
+                }
+                crate::superres::upscale_frame(&sr_ctx, &inputs, &mut outputs)
+                    .map_err(|_| Error::PartitionWalkOutOfRange)?;
+            }
+            *bufs = outputs_owned;
+            Ok(())
+        };
+        upscale_set(&mut plane_bufs)?;
+        if let Some(d) = deblocked.as_mut() {
+            upscale_set(d)?;
+        }
+        plane_dims = new_dims;
+    }
+
     // §7.4 step 5 / §7.17: loop restoration from (UpscaledCurrFrame,
     // UpscaledCdefFrame) into LrFrame. The §5.11.57 units were decoded
     // by the tile walk's `read_lr` interleave above.
@@ -436,6 +506,37 @@ pub fn decode_frame_spec(
         );
     }
 
+    // ---- §7.18.2 intermediate-output crop to the surfaced extents. ----
+    // On the superres path the buffers are already exact; otherwise
+    // trim the mi-grid padding down to `UpscaledWidth x FrameHeight`
+    // (per-plane subsampled). §7.18.3 film grain then applies to the
+    // cropped output planes.
+    for plane in 0..num_planes {
+        let (out_w, out_h) = if plane == 0 {
+            (fs.upscaled_width, fs.frame_height)
+        } else {
+            (
+                (fs.upscaled_width + sub_x) >> sub_x,
+                (fs.frame_height + sub_y) >> sub_y,
+            )
+        };
+        let (pw, ph) = plane_dims[plane];
+        if (pw, ph) == (out_w, out_h) {
+            continue;
+        }
+        if pw < out_w || ph < out_h {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        let src = &plane_bufs[plane];
+        let mut buf = vec![0i32; (out_w as usize) * (out_h as usize)];
+        for y in 0..out_h as usize {
+            let row = &src[y * pw as usize..y * pw as usize + out_w as usize];
+            buf[y * out_w as usize..(y + 1) * out_w as usize].copy_from_slice(row);
+        }
+        plane_bufs[plane] = buf;
+        plane_dims[plane] = (out_w, out_h);
+    }
+
     // ---- §7.18.3 film grain. ----
     if let Some(fg) = fh.film_grain_params.as_ref() {
         if fg.apply_grain {
@@ -466,7 +567,9 @@ pub fn decode_frame_spec(
         .collect();
 
     Ok(SpecFrame {
-        width: fs.frame_width,
+        // Post-§7.16 the surfaced luma width is `UpscaledWidth`
+        // (`== FrameWidth` when superres is off).
+        width: fs.upscaled_width,
         height: fs.frame_height,
         planes,
         plane_dims,

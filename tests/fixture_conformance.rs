@@ -952,3 +952,36 @@ fn superblocks_128_decodes_byte_exact() {
         1,
     );
 }
+
+const SUPER_RESOLUTION_IVF: &str = concat!(
+    "444b494600002000415630318000400019000000010000000100000000000000c30100000000",
+    "00000000000012000a0618197ffff80432b60356d000618720282baaa8ead7b3386552b69068",
+    "1f49946a1a2a761a7030acfd22c811273cb65dde9b95408b5096e5b4d9c34fca5a4442be6392",
+    "3b1a698c6adfc2c1974bfb2ef03aae1de7fc2818a3b8eaa51861eec59afcd241da31d57d39cc",
+    "dc64630cf5d376c309046f75be4cc154322a50a7bd267240ca6dbd5aa1ec2ae5837788806797",
+    "d5901f7da69aea5f9dfc7b193d53fad9604ebbffe392d643329667de5adc89b30fde56475075",
+    "9537b7e7e2bca5a0ec898d9f185be0f02792bc962dd3b5662a768c1efd32fd6336cc4f064740",
+    "e48b6efb9ed209710b1be93b5049c84c0b32dd873c8279ffdd75f082fe9f79129bb73a237338",
+    "2102b757219906de4496f5c77f517d83a73978b3037e5c671979fc2b5638035a5bc43701b3d5",
+    "4c67bc814126c1f91c58574a7c385262bf27f47be7a031b61b275b92a01afcb73ebf85a7a7a4",
+    "14f528a2f2db5a982a0d74de668cd5874a86c725aaa6661014ebbc4f3ee647db94c22184f071",
+    "6062a61fa3f6ed31394da7146848aff70c5d71eb908bc953925323494123fc3946cd4484e14b",
+    "90321fda60e78a92a53ce8f9d8cc5854f4cf8e01311f97daa84bc4d568cf3ad3494916087527",
+    "91",
+);
+
+/// `use_superres = 1`, `coded_denom = 3` (128 -> 85 coded width, a
+/// NON-mi-aligned frame): the §7.16 polyphase upscaler (including its
+/// `Clip3(0, miW * MI_SIZE - 1, ..)` clamp reading decoded mi-grid
+/// padding), real deblocking (levels 12/14/16), active CDEF, and
+/// SGRPROJ loop restoration on all three planes at the upscaled
+/// extent, composed in §7.4 order, decode byte-exact.
+#[test]
+fn super_resolution_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "super-resolution",
+        SUPER_RESOLUTION_IVF,
+        "3355d75e67a9000406bbb0592af1f790afc04fd19bb75867d1e505c769f0b636",
+        1,
+    );
+}

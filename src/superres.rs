@@ -337,8 +337,15 @@ pub fn upscale_plane(
     let upscaled_plane_w = round2(ctx.upscaled_width, sub_x);
     let plane_h = round2(ctx.frame_height, sub_y);
 
-    if input.rows != plane_h
-        || input.cols != downscaled_plane_w
+    // The input may be the CROPPED plane (`downscaledPlaneW` columns)
+    // or the full mi-grid-padded CurrFrame plane (more columns/rows):
+    // the §7.16 source clamp `Clip3(0, miW * MI_SIZE - 1, ..)` reads
+    // decoded padding columns past `downscaledPlaneW` when the frame
+    // width is not mi-aligned, so a padded input reproduces the spec
+    // exactly while a cropped input replicates the rightmost real
+    // sample (identical whenever the width IS mi-aligned).
+    if input.rows < plane_h
+        || input.cols < downscaled_plane_w
         || output.rows != plane_h
         || output.cols != upscaled_plane_w
     {
