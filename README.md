@@ -1,5 +1,7 @@
 # oxideav-av1
 
+[![CI](https://github.com/OxideAV/oxideav-av1/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-av1/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-av1.svg)](https://crates.io/crates/oxideav-av1) [![docs.rs](https://docs.rs/oxideav-av1/badge.svg)](https://docs.rs/oxideav-av1) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust AV1 (AOMedia Video 1) codec — a clean-room implementation
 built from the public AV1 Bitstream & Decoding Process Specification.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
