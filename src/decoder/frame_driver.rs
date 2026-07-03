@@ -118,9 +118,6 @@ pub fn decode_frame_spec(
         .tile_info
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    if ti.tile_cols != 1 || ti.tile_rows != 1 {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
     let qp = fh
         .quantization_params
         .as_ref()
@@ -237,25 +234,30 @@ pub fn decode_frame_spec(
         enable_intra_edge_filter: seq.enable_intra_edge_filter,
     };
 
-    // §5.11.1 tile-group body → single tile's bytes.
-    let parsed = parse_tile_group_obu_body(
-        tile_group_body,
-        /* num_tiles = */ 1,
-        /* tile_cols_log2 = */ 0,
-        /* tile_rows_log2 = */ 0,
-        u32::from(ti.tile_size_bytes),
-    )?;
-    if parsed.tiles.len() != 1 {
+    // §5.11.1 tile-group body → per-tile byte ranges.
+    let num_tiles = ti.tile_cols * ti.tile_rows;
+    let ceil_log2 = |v: u32| -> u32 {
+        if v <= 1 {
+            0
+        } else {
+            32 - (v - 1).leading_zeros()
+        }
+    };
+    if ti.mi_col_starts.len() != (ti.tile_cols as usize) + 1
+        || ti.mi_row_starts.len() != (ti.tile_rows as usize) + 1
+    {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    let tile_bytes = &parsed.tiles[0].bytes;
-
-    // §8.2.2 init_symbol + §8.3.1 CDF init (defaults + the q-context
-    // coefficient-CDF selection keyed by base_q_idx).
-    let mut decoder =
-        SymbolDecoder::init_symbol(tile_bytes, tile_bytes.len(), fh.disable_cdf_update)?;
-    let mut cdfs = TileCdfContext::new_from_defaults();
-    cdfs.init_coeff_cdfs(qp.base_q_idx);
+    let parsed = parse_tile_group_obu_body(
+        tile_group_body,
+        num_tiles,
+        ceil_log2(ti.tile_cols),
+        ceil_log2(ti.tile_rows),
+        u32::from(ti.tile_size_bytes),
+    )?;
+    if parsed.tiles.len() != num_tiles as usize {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
 
     let mi_rows = fs.mi_rows;
     let mi_cols = fs.mi_cols;
@@ -271,17 +273,36 @@ pub fn decode_frame_spec(
     )
     .ok_or(Error::PartitionWalkOutOfRange)?;
 
-    // §5.11.2 decode_tile() — with the §5.11.57 `read_lr` interleave
+    // §5.11.2 decode_tile() per tile, in tile order — each tile gets a
+    // fresh §8.2.2 symbol decoder and a fresh §8.3.1 CDF load
+    // (`primary_ref_frame == PRIMARY_REF_NONE` on the intra path, so
+    // every tile initialises from the defaults + the q-context
+    // coefficient slice), while the walker's frame-scope decode grids
+    // accumulate across tiles. The §5.11.57 `read_lr` interleave runs
     // when the frame signals loop restoration.
-    walker.decode_tile_syntax_with_lr(
-        &mut decoder,
-        &mut cdfs,
-        &params,
-        if lr.uses_lr { Some(&lr_walk) } else { None },
-        /* inter_ctx = */ None,
-        &quant,
-        /* read_deltas = */ dq.delta_q_present,
-    )?;
+    for (tile_num, tile) in parsed.tiles.iter().enumerate() {
+        let tile_row = (tile_num as u32) / ti.tile_cols;
+        let tile_col = (tile_num as u32) % ti.tile_cols;
+        walker.begin_tile(TileGeometry {
+            mi_row_start: ti.mi_row_starts[tile_row as usize],
+            mi_row_end: ti.mi_row_starts[tile_row as usize + 1],
+            mi_col_start: ti.mi_col_starts[tile_col as usize],
+            mi_col_end: ti.mi_col_starts[tile_col as usize + 1],
+        });
+        let mut decoder =
+            SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), fh.disable_cdf_update)?;
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        cdfs.init_coeff_cdfs(qp.base_q_idx);
+        walker.decode_tile_syntax_with_lr(
+            &mut decoder,
+            &mut cdfs,
+            &params,
+            if lr.uses_lr { Some(&lr_walk) } else { None },
+            /* inter_ctx = */ None,
+            &quant,
+            /* read_deltas = */ dq.delta_q_present,
+        )?;
+    }
 
     // ---- Take `CurrFrame[ plane ]` at its FULL mi-grid extent. ----
     // The spec's CurrFrame covers the padded `MiRows x MiCols` grid

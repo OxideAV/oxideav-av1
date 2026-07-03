@@ -20174,10 +20174,13 @@ impl PartitionWalker {
             0
         };
         // §5.11.49 `leftN = 0; if (AvailL) leftN = PaletteSizes[plane][MiRow][MiCol - 1]`.
-        // `AvailL` ⇔ `mi_col > 0` for a tile-start block; callers in
-        // mid-tile read 0 from out-of-grid coordinates here so the
-        // fallback is the spec-correct identity.
-        let left_n: usize = if mi_col > 0 {
+        // `AvailL` is the §5.11.51 TILE-scope predicate — a block at a
+        // mid-frame tile's first column has `mi_col > 0` but its left
+        // neighbour belongs to the previous tile, where `AvailL` is
+        // false (r384 multi-tile fix: the `mi_col > 0` shortcut let a
+        // later tile merge the previous tile's palette colours into
+        // its cache and desynchronise the arithmetic decoder).
+        let left_n: usize = if self.geometry.is_inside(mi_row as i32, mi_col as i32 - 1) {
             self.palette_size_at(plane, mi_row as i32, mi_col as i32 - 1) as usize
         } else {
             0
@@ -20321,6 +20324,28 @@ impl PartitionWalker {
         self.left_level_context.fill(0);
         self.left_dc_context.fill(0);
         self.left_seg_pred_context.fill(0);
+    }
+
+    /// §5.11.2 `decode_tile()` per-tile entry state — point the walker
+    /// at a new tile's [`TileGeometry`] and perform the tile-scope
+    /// resets the spec runs before the superblock loop: the row-indexed
+    /// left entropy contexts (`Left{Level,Dc}Context` /
+    /// `LeftSegPredContext` — shared across horizontally-adjacent
+    /// tiles, so a later tile must not observe an earlier tile's
+    /// state), the §5.11.13 `DeltaLF` accumulator, and the §5.11.58
+    /// running loop-restoration references (`RefLrWiener` /
+    /// `RefSgrXqd`). Column-indexed above contexts need no reset here:
+    /// tiles partition the columns, so a single-pass frame walk never
+    /// revisits another tile's columns.
+    ///
+    /// The frame-scope decode grids (`MiSizes[]`, `CurrFrame[]`, the
+    /// mode/skip/tx grids, decoded LR units) are deliberately retained
+    /// — they accumulate across every tile of the frame.
+    pub fn begin_tile(&mut self, geometry: TileGeometry) {
+        self.geometry = geometry;
+        self.clear_txb_left_context();
+        self.current_delta_lf = [0; FRAME_LF_COUNT];
+        self.reset_lr_refs();
     }
 
     /// §8.3.2 `all_zero` ctx (av1-spec p.370-371) — the
@@ -31428,6 +31453,11 @@ impl PartitionWalker {
         // §5.11.2 `for ( r = MiRowStart; r < MiRowEnd; r += sbSize4 )`.
         let mut r = mi_row_start;
         while r < mi_row_end {
+            // §5.11.2 `clear_left_context()` — the row-indexed left
+            // entropy contexts reset at every superblock-row entry (a
+            // no-op on the first row of a freshly constructed / freshly
+            // `begin_tile`-d walker, whose arrays are already zero).
+            self.clear_txb_left_context();
             // §5.11.2 `for ( c = MiColStart; c < MiColEnd; c += sbSize4 )`.
             let mut c = mi_col_start;
             while c < mi_col_end {
