@@ -15244,6 +15244,23 @@ pub struct PartitionWalker {
     /// (the unfiltered/un-upsampled path) on a freshly constructed
     /// walker.
     enable_intra_edge_filter: bool,
+    /// §5.11.18 per-cell `AvailU` (`is_inside( MiRow - 1, MiCol )`,
+    /// av1-spec line 3915) for the current tile geometry — rebuilt at
+    /// [`Self::begin_tile`] (and at construction) and consumed by the
+    /// in-walk §5.11.33 OBMC dispatch
+    /// ([`Self::predict_inter_leaf_from_walk`]'s
+    /// [`crate::GridObmcContext`] view).
+    walk_avail_u: Vec<u8>,
+    /// §5.11.18 per-cell `AvailL` (`is_inside( MiRow, MiCol - 1 )`,
+    /// av1-spec line 3916) — sibling of [`Self::walk_avail_u`].
+    walk_avail_l: Vec<u8>,
+    /// In-walk §5.11.33 `predict_inter` scratch — per-plane `u16`
+    /// mirrors of `CurrFrame[ plane ]` (the §7.11.3 drivers operate
+    /// on `u16` planes; the walker's buffers are post-`Clip1` `i32`,
+    /// so both directions of the mirror are lossless). Lazily sized
+    /// on first use; only the leaf's plane rect is synced per
+    /// prediction, so stale samples outside the rect are never read.
+    inter_pred_scratch: [Vec<u16>; 3],
     /// `MiSizes[ row ][ col ]` packed into a row-major `mi_rows *
     /// mi_cols` flat buffer. Entries are `BLOCK_INVALID` for
     /// not-yet-decoded cells and a `BLOCK_*` ordinal for decoded
@@ -16105,11 +16122,26 @@ impl PartitionWalker {
         let mut block_decoded: Vec<u8> = Vec::new();
         block_decoded.try_reserve_exact(bd_len).ok()?;
         block_decoded.resize(bd_len, 0);
+        // §5.11.18 per-cell `AvailU` / `AvailL` for the construction
+        // geometry (rebuilt on every [`Self::begin_tile`]).
+        let mut walk_avail_u: Vec<u8> = Vec::new();
+        walk_avail_u.try_reserve_exact(area).ok()?;
+        let mut walk_avail_l: Vec<u8> = Vec::new();
+        walk_avail_l.try_reserve_exact(area).ok()?;
+        for r in 0..mi_rows {
+            for c in 0..mi_cols {
+                walk_avail_u.push(u8::from(geometry.is_inside(r as i32 - 1, c as i32)));
+                walk_avail_l.push(u8::from(geometry.is_inside(r as i32, c as i32 - 1)));
+            }
+        }
         Some(Self {
             mi_rows,
             mi_cols,
             geometry,
             enable_intra_edge_filter: false,
+            walk_avail_u,
+            walk_avail_l,
+            inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
             mi_sizes,
             skips,
             skip_modes,
@@ -18346,6 +18378,199 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// In-walk §5.11.33 `predict_inter` — motion-compensate ONE inter
+    /// leaf into `CurrFrame[ plane ]` at its spec decode position (the
+    /// §5.11.5 `compute_prediction()` call site, between `mode_info()`
+    /// and `residual()`).
+    ///
+    /// The §5.11.5 inter arm invokes this when the caller supplies
+    /// [`InterFrameContext::pixels`]; the §7.12.3 step-3 residual merge
+    /// that follows in `residual()` then lands on the leaf's prediction
+    /// (the spec's `CurrFrame = Clip1( CurrFrame + Residual )`), and a
+    /// later intra block's §7.11.2 neighbour reads observe reconstructed
+    /// inter pixels.
+    ///
+    /// Dispatch mirrors the frame-scope bridge
+    /// ([`Self::reconstruct_inter_frame_into_curr_frame_with_order_hints`]):
+    /// single-ref SIMPLE / OBMC, compound (AVERAGE / DISTANCE / WEDGE /
+    /// DIFFWTD), and inter-intra leaves all run through the shared
+    /// [`crate::inter_pred`] per-leaf walk against the walker's own
+    /// §5.11.5 grids (already stamped for this leaf — the §5.11.5
+    /// grid-fill precedes `compute_prediction()`). For an inter-intra
+    /// leaf the caller must have written the §5.11.33 intra half into
+    /// `CurrFrame[ plane ]` first (the §5.11.5 inter arm does).
+    ///
+    /// A `WARPED_CAUSAL` leaf surfaces
+    /// [`crate::Error::InterBlockModeInfoUnsupported`] — the §7.11.3.8
+    /// local-warp fit is not yet derivable in-walk (the §7.10.4
+    /// sample list is not retained); wiring it is the warped-motion
+    /// follow-up.
+    ///
+    /// The §7.11.3 drivers operate on `u16` planes while the walker's
+    /// `CurrFrame` is post-`Clip1` `i32`; the leaf's plane rect is
+    /// mirrored through [`Self::inter_pred_scratch`] in both directions
+    /// (lossless).
+    pub fn predict_inter_leaf_from_walk(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        mi_size: usize,
+        pixels: &InterWalkPixels<'_>,
+    ) -> Result<(), crate::Error> {
+        if mi_size >= BLOCK_SIZES || mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let mi_rows = self.mi_rows;
+        let mi_cols = self.mi_cols;
+        let cells = (mi_rows as usize) * (mi_cols as usize);
+        let origin = (mi_row * mi_cols + mi_col) as usize;
+        if self.motion_modes[origin] == MOTION_MODE_WARPED_CAUSAL {
+            // §7.11.3.8 local-warp fit not derivable in-walk yet.
+            return Err(crate::Error::InterBlockModeInfoUnsupported);
+        }
+        if pixels.plane_refs.is_empty() {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+
+        // Per-plane leaf rect: `(base, w, h)` in plane samples, clipped
+        // to the plane's mi-grid extent — the §5.11.33 write region.
+        struct LeafRect {
+            plane: usize,
+            x0: usize,
+            y0: usize,
+            w: usize,
+            h: usize,
+            stride: usize,
+        }
+        let mut rects: Vec<LeafRect> = Vec::with_capacity(pixels.plane_refs.len());
+        for spec in pixels.plane_refs {
+            let p = spec.plane as usize;
+            if p >= 3 {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            let (sub_x, sub_y) = if spec.plane > 0 {
+                (spec.subsampling_x, spec.subsampling_y)
+            } else {
+                (0, 0)
+            };
+            let rows = ((mi_rows * (MI_SIZE as u32)) >> sub_y) as usize;
+            let cols = ((mi_cols * (MI_SIZE as u32)) >> sub_x) as usize;
+            self.ensure_curr_frame_plane(p, rows as u32, cols as u32);
+            // Size the scratch mirror once per plane (stale samples
+            // outside the synced rect are never read).
+            if self.inter_pred_scratch[p].len() != rows * cols {
+                self.inter_pred_scratch[p].resize(rows * cols, 0);
+            }
+            let plane_sz = get_plane_residual_size(mi_size, spec.plane, sub_x, sub_y)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            let x0 = ((mi_col >> sub_x) as usize) * MI_SIZE;
+            let y0 = ((mi_row >> sub_y) as usize) * MI_SIZE;
+            let w = (num_4x4_blocks_wide(plane_sz) * 4).min(cols.saturating_sub(x0));
+            let h = (num_4x4_blocks_high(plane_sz) * 4).min(rows.saturating_sub(y0));
+            rects.push(LeafRect {
+                plane: p,
+                x0,
+                y0,
+                w,
+                h,
+                stride: cols,
+            });
+        }
+
+        // Mirror the leaf rects `i32 → u16` into the scratch planes.
+        for r in &rects {
+            let Some(cp) = self.curr_frame[r.plane].as_ref() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let scratch = &mut self.inter_pred_scratch[r.plane];
+            for y in r.y0..r.y0 + r.h {
+                for x in r.x0..r.x0 + r.w {
+                    scratch[y * r.stride + x] = cp.samples[y * r.stride + x] as u16;
+                }
+            }
+        }
+
+        // Drive the shared per-leaf walk. Field-split borrows: the grid
+        // views borrow the walker's grid vectors immutably while the
+        // plane contexts borrow `inter_pred_scratch` mutably.
+        {
+            if self.walk_avail_u.len() < cells || self.walk_avail_l.len() < cells {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            let grid = crate::InterModeInfoGrid {
+                mi_sizes: &self.mi_sizes,
+                is_inters: &self.is_inters,
+                ref_frames: &self.ref_frames,
+                mvs: &self.mvs,
+                interp_filters: &self.interp_filters,
+                compound_types: &self.compound_types,
+                wedge_indices: &self.compound_wedge_indices,
+                wedge_signs: &self.compound_wedge_signs,
+                mask_types: &self.compound_mask_types,
+                interintra_modes: &self.interintra_modes,
+                wedge_interintras: &self.wedge_interintras,
+                interintra_wedge_indices: &self.interintra_wedge_indices,
+                order_hint_bits: pixels.order_hints.order_hint_bits,
+                current_order_hint: pixels.order_hints.current_order_hint,
+                order_hints_by_ref: &pixels.order_hints.order_hints_by_ref,
+                mi_rows,
+                mi_cols,
+                bit_depth: pixels.bit_depth,
+                warp: None,
+                obmc: Some(crate::GridObmcContext {
+                    motion_modes: &self.motion_modes,
+                    avail_u: &self.walk_avail_u,
+                    avail_l: &self.walk_avail_l,
+                }),
+            };
+            let mut scratch_iter = self.inter_pred_scratch.iter_mut();
+            let (s0, s1, s2) = (
+                scratch_iter.next().unwrap(),
+                scratch_iter.next().unwrap(),
+                scratch_iter.next().unwrap(),
+            );
+            let mut slots: [Option<&mut Vec<u16>>; 3] = [Some(s0), Some(s1), Some(s2)];
+            let mut planes: Vec<crate::PlaneReconContext<'_>> =
+                Vec::with_capacity(pixels.plane_refs.len());
+            for (spec, rect) in pixels.plane_refs.iter().zip(rects.iter()) {
+                let buf = slots[rect.plane]
+                    .take()
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                planes.push(crate::PlaneReconContext {
+                    plane: spec.plane,
+                    subsampling_x: spec.subsampling_x,
+                    subsampling_y: spec.subsampling_y,
+                    frame_store: spec.frame_store,
+                    frame_width: spec.frame_width,
+                    frame_height: spec.frame_height,
+                    curr: buf.as_mut_slice(),
+                    curr_stride: rect.stride,
+                });
+            }
+            crate::inter_pred::reconstruct_inter_leaf_at(
+                &grid,
+                &pixels.ref_frame_idx,
+                &mut planes,
+                mi_row as usize,
+                mi_col as usize,
+            )?;
+        }
+
+        // Mirror the leaf rects back `u16 → i32`.
+        for r in &rects {
+            let scratch = &self.inter_pred_scratch[r.plane];
+            let Some(cp) = self.curr_frame[r.plane].as_mut() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            for y in r.y0..r.y0 + r.h {
+                for x in r.x0..r.x0 + r.w {
+                    cp.samples[y * r.stride + x] = scratch[y * r.stride + x] as i32;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
     /// row-major: `skips()[ r * MiCols + c ]`. Cells that no leaf
     /// covered carry `0` (the §5.11.11 [`Self::decode_skip`] writer
@@ -20346,6 +20571,19 @@ impl PartitionWalker {
         self.clear_txb_left_context();
         self.current_delta_lf = [0; FRAME_LF_COUNT];
         self.reset_lr_refs();
+        // §5.11.18 per-cell `AvailU` / `AvailL` follow the tile
+        // geometry (`is_inside` is tile-relative) — rebuild for the
+        // in-walk §5.11.33 OBMC dispatch.
+        self.walk_avail_u.clear();
+        self.walk_avail_l.clear();
+        for r in 0..self.mi_rows {
+            for c in 0..self.mi_cols {
+                self.walk_avail_u
+                    .push(u8::from(self.geometry.is_inside(r as i32 - 1, c as i32)));
+                self.walk_avail_l
+                    .push(u8::from(self.geometry.is_inside(r as i32, c as i32 - 1)));
+            }
+        }
     }
 
     /// §8.3.2 `all_zero` ctx (av1-spec p.370-371) — the
@@ -23389,12 +23627,19 @@ impl PartitionWalker {
                 Err(e) => Err(e),
             }
         } else {
-            // We've populated `info` already but the §5.11.22 stub
-            // owns the return. The pre-stub state is observable on
-            // the walker's grids — callers verifying the §5.11.18
-            // pre-dispatch state read [`Self::skips`] / [`Self::skip_modes`]
-            // / [`Self::segment_ids`] / [`Self::is_inters`] / [`Self::cdef_idx`].
-            Err(crate::Error::IntraBlockModeInfoUnsupported)
+            // §5.11.18 `else intra_block_mode_info()` — r387: surface
+            // the prologue aggregate with `is_inter == 0` and
+            // `inter_block == None`; the §5.11.5 inter arm then runs
+            // the §5.11.22 composite
+            // ([`Self::decode_intra_block_mode_info`]) itself, since it
+            // owns the §5.11.22 argument set (`has_chroma` /
+            // `allow_screen_content_tools` / `enable_filter_intra` /
+            // `bit_depth` / the §8.3.2 palette neighbour ctx) that
+            // this dispatcher does not carry. No §5.11.22 bit is read
+            // here, so the caller's follow-on read continues at the
+            // exact §5.11.22 bit position. (Pre-r387 this arm was the
+            // `IntraBlockModeInfoUnsupported` stub.)
+            Ok(info)
         }
     }
 
@@ -28116,6 +28361,112 @@ impl PartitionWalker {
         })
     }
 
+    /// §5.11.5 `palette_tokens( )` (§5.11.49) — the per-plane
+    /// `color_index_map_{y,uv}` literal + anti-diagonal colour-index
+    /// walk, shared by the §5.11.7 intra-frame arm and the §5.11.22
+    /// intra-in-inter arm (the §5.11.5 body is arm-agnostic here).
+    /// No-op (returns `(None, None)`) when both palette sizes are 0.
+    #[allow(clippy::too_many_arguments)]
+    fn read_palette_token_maps(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        palette_size_y: u8,
+        palette_size_uv: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    ) -> Result<(Option<DecodedPaletteMap>, Option<DecodedPaletteMap>), crate::Error> {
+        // §5.11.5 line `palette_tokens( )` — §5.11.49. The outer guard
+        // is `if ( PaletteSizeY ) ... if ( PaletteSizeUV ) ...` (zero
+        // on every non-palette block, so the call collapses to a no-op
+        // there). On a palette block each plane reads its
+        // `color_index_map_{y,uv}` `NS(PaletteSize)` literal followed
+        // by the §5.11.49 anti-diagonal `palette_color_idx_{y,uv}` S()
+        // walk via [`palette_tokens_plane`]. Shared by the §5.11.7
+        // intra-frame arm and the §5.11.22 intra-in-inter arm (the
+        // §5.11.5 body is arm-agnostic here).
+        let mut color_map_y: Option<DecodedPaletteMap> = None;
+        let mut color_map_uv: Option<DecodedPaletteMap> = None;
+        if palette_size_y > 0 {
+            let args = palette_tokens_args(
+                sub_size,
+                mi_row as usize,
+                mi_col as usize,
+                self.mi_rows as usize,
+                self.mi_cols as usize,
+                PalettePlane::Y,
+                0,
+                0,
+            )
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            // §5.11.49: `color_index_map_y NS(PaletteSizeY)`.
+            let color_index_map = decoder.read_ns(palette_size_y as u32)? as u8;
+            let mut color_map = vec![0u8; args.block_h * args.block_w];
+            palette_tokens_plane(
+                decoder,
+                cdfs,
+                PalettePlane::Y,
+                palette_size_y as usize,
+                args.block_w,
+                args.block_h,
+                args.onscreen_w,
+                args.onscreen_h,
+                color_index_map,
+                &mut color_map,
+                args.block_w,
+            )?;
+            color_map_y = Some(DecodedPaletteMap {
+                data: color_map,
+                stride: args.block_w,
+                block_w: args.block_w,
+                block_h: args.block_h,
+                onscreen_w: args.onscreen_w,
+                onscreen_h: args.onscreen_h,
+            });
+        }
+        if palette_size_uv > 0 {
+            let args = palette_tokens_args(
+                sub_size,
+                mi_row as usize,
+                mi_col as usize,
+                self.mi_rows as usize,
+                self.mi_cols as usize,
+                PalettePlane::Uv,
+                subsampling_x as usize,
+                subsampling_y as usize,
+            )
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            // §5.11.49: `color_index_map_uv NS(PaletteSizeUV)`.
+            let color_index_map = decoder.read_ns(palette_size_uv as u32)? as u8;
+            let mut color_map = vec![0u8; args.block_h * args.block_w];
+            palette_tokens_plane(
+                decoder,
+                cdfs,
+                PalettePlane::Uv,
+                palette_size_uv as usize,
+                args.block_w,
+                args.block_h,
+                args.onscreen_w,
+                args.onscreen_h,
+                color_index_map,
+                &mut color_map,
+                args.block_w,
+            )?;
+            color_map_uv = Some(DecodedPaletteMap {
+                data: color_map,
+                stride: args.block_w,
+                block_w: args.block_w,
+                block_h: args.block_h,
+                onscreen_w: args.onscreen_w,
+                onscreen_h: args.onscreen_h,
+            });
+        }
+        Ok((color_map_y, color_map_uv))
+    }
+
     /// `decode_block( r, c, subSize )` per §5.11.5 (av1-spec p.63-64)
     /// — the per-block syntax-walker entry. This is the
     /// long-skeleton-with-stubs sibling of the leaf-only
@@ -28512,6 +28863,11 @@ impl PartitionWalker {
                 mono_chrome,
                 delta_lf_res,
                 tx_mode_select,
+                allow_screen_content_tools,
+                enable_filter_intra,
+                bit_depth,
+                quant,
+                reduced_tx_set,
                 ctx,
             );
         }
@@ -28705,93 +29061,22 @@ impl PartitionWalker {
             filter_intra_mode = info.filter_intra_mode;
         }
 
-        // §5.11.5 line `palette_tokens( )` — §5.11.49. The outer
-        // guard is `if ( PaletteSizeY ) ... if ( PaletteSizeUV ) ...`
-        // (zero on every non-palette block, so the call collapses to
-        // a no-op there). On a palette block each plane reads its
-        // `color_index_map_{y,uv}` `NS(PaletteSize)` literal followed
-        // by the §5.11.49 anti-diagonal `palette_color_idx_{y,uv}`
-        // S() walk via [`palette_tokens_plane`]. r325: the decoded
-        // `ColorMap{Y,UV}` contents are now surfaced on the returned
-        // [`DecodedBlock`] (`color_map_{y,uv}`) so a consumer can drive
-        // the §7.11.4 palette prediction process; the §5.11.5 walker
-        // itself tracks no per-plane sample buffers.
-        let mut color_map_y: Option<DecodedPaletteMap> = None;
-        let mut color_map_uv: Option<DecodedPaletteMap> = None;
-        if palette_size_y > 0 {
-            let args = palette_tokens_args(
-                sub_size,
-                mi_row_b as usize,
-                mi_col_b as usize,
-                self.mi_rows as usize,
-                self.mi_cols as usize,
-                PalettePlane::Y,
-                0,
-                0,
-            )
-            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            // §5.11.49: `color_index_map_y NS(PaletteSizeY)`.
-            let color_index_map = decoder.read_ns(palette_size_y as u32)? as u8;
-            let mut color_map = vec![0u8; args.block_h * args.block_w];
-            palette_tokens_plane(
-                decoder,
-                cdfs,
-                PalettePlane::Y,
-                palette_size_y as usize,
-                args.block_w,
-                args.block_h,
-                args.onscreen_w,
-                args.onscreen_h,
-                color_index_map,
-                &mut color_map,
-                args.block_w,
-            )?;
-            color_map_y = Some(DecodedPaletteMap {
-                data: color_map,
-                stride: args.block_w,
-                block_w: args.block_w,
-                block_h: args.block_h,
-                onscreen_w: args.onscreen_w,
-                onscreen_h: args.onscreen_h,
-            });
-        }
-        if palette_size_uv > 0 {
-            let args = palette_tokens_args(
-                sub_size,
-                mi_row_b as usize,
-                mi_col_b as usize,
-                self.mi_rows as usize,
-                self.mi_cols as usize,
-                PalettePlane::Uv,
-                subsampling_x as usize,
-                subsampling_y as usize,
-            )
-            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-            // §5.11.49: `color_index_map_uv NS(PaletteSizeUV)`.
-            let color_index_map = decoder.read_ns(palette_size_uv as u32)? as u8;
-            let mut color_map = vec![0u8; args.block_h * args.block_w];
-            palette_tokens_plane(
-                decoder,
-                cdfs,
-                PalettePlane::Uv,
-                palette_size_uv as usize,
-                args.block_w,
-                args.block_h,
-                args.onscreen_w,
-                args.onscreen_h,
-                color_index_map,
-                &mut color_map,
-                args.block_w,
-            )?;
-            color_map_uv = Some(DecodedPaletteMap {
-                data: color_map,
-                stride: args.block_w,
-                block_w: args.block_w,
-                block_h: args.block_h,
-                onscreen_w: args.onscreen_w,
-                onscreen_h: args.onscreen_h,
-            });
-        }
+        // §5.11.5 line `palette_tokens( )` — §5.11.49, via the shared
+        // [`Self::read_palette_token_maps`] helper (r325 surfaced the
+        // decoded `ColorMap{Y,UV}` on the returned [`DecodedBlock`];
+        // r387 factored the reader for the §5.11.22 intra-in-inter
+        // arm).
+        let (color_map_y, color_map_uv) = self.read_palette_token_maps(
+            decoder,
+            cdfs,
+            mi_row_b,
+            mi_col_b,
+            sub_size,
+            palette_size_y,
+            palette_size_uv,
+            subsampling_x,
+            subsampling_y,
+        )?;
 
         // Hand the palette sizes + decoded maps to the §5.11.34
         // `residual()` dispatch (below) so its per-TU §5.11.35
@@ -29132,6 +29417,17 @@ impl PartitionWalker {
         mono_chrome: bool,
         delta_lf_res: u8,
         tx_mode_select: bool,
+        // r387: §5.11.22 intra-in-inter argument set (mirrors the
+        // §5.11.7 arm) + the §5.9.12 quantiser pair for the §5.11.34
+        // `residual()` dispatch (pre-r387 the inter arm fed a neutral
+        // `QuantizerParams`, desynchronising the §5.11.47
+        // `transform_type()` guard + §7.12.3 dequant on any stream
+        // with `base_q_idx > 0`).
+        allow_screen_content_tools: bool,
+        enable_filter_intra: bool,
+        bit_depth: u8,
+        quant: &QuantizerParams,
+        reduced_tx_set: bool,
         ctx: &InterFrameContext,
     ) -> Result<DecodedBlock, crate::Error> {
         // §5.11.6 inter arm — full §5.11.18 cascade.
@@ -29186,16 +29482,38 @@ impl PartitionWalker {
             ctx.motion_field_mvs,
         )?;
 
-        // §5.11.18 `is_inter == 0` (intra inside an inter frame) is
-        // surfaced by the dispatcher as
-        // `Err(IntraBlockModeInfoUnsupported)`; the `Ok(_)` arm
-        // therefore guarantees `is_inter == 1`. Surface a
-        // defense-in-depth assert so a future spec/reader change is
-        // caught at the boundary.
-        debug_assert_eq!(
-            info.is_inter, 1,
-            "§5.11.18 Ok(_) arm implies inter (intra arm is stubbed at IntraBlockModeInfoUnsupported)"
-        );
+        // §5.11.18 lines 23-26 dispatch: `if ( is_inter )
+        // inter_block_mode_info() else intra_block_mode_info()`. The
+        // r387 §5.11.22 arm (intra block inside an inter frame) runs
+        // the same composite as the §5.11.7 else-arm from
+        // `intra_angle_info_y()` onward, with the `y_mode` S() against
+        // `TileYModeCdf[ Size_Group[ MiSize ] ]`.
+        if info.is_inter == 0 {
+            return self.decode_block_syntax_intra_in_inter_tail(
+                decoder,
+                cdfs,
+                mi_row,
+                mi_col,
+                sub_size,
+                bw4,
+                bh4,
+                has_chroma,
+                avail_u,
+                avail_l,
+                avail_u_chroma,
+                avail_l_chroma,
+                subsampling_x,
+                subsampling_y,
+                use_128x128_superblock,
+                allow_screen_content_tools,
+                enable_filter_intra,
+                bit_depth,
+                quant,
+                reduced_tx_set,
+                tx_mode_select,
+                &info,
+            );
+        }
         let inter_block = info
             .inter_block
             .ok_or(crate::Error::InterBlockModeInfoUnsupported)?;
@@ -29215,6 +29533,24 @@ impl PartitionWalker {
             /* skip = */ info.skip != 0,
             tx_mode_select,
         )?;
+
+        // §5.11.5 line `if ( skip ) reset_block_context( bw4, bh4 )` —
+        // §5.11.42 zeroes the §6.10.2 `Above{Level,Dc}Context` /
+        // `Left{Level,Dc}Context` arrays over the footprint (r387: the
+        // inter arm previously skipped this reset, desynchronising the
+        // §8.3.2 `all_zero` / `dc_sign` ctx walks of subsequent leaves
+        // after any skip-coded inter block).
+        if info.skip != 0 {
+            self.reset_txb_block_context(
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                has_chroma,
+                subsampling_x,
+                subsampling_y,
+            );
+        }
 
         // §5.11.5 `isCompound = RefFrame[1] > INTRA_FRAME` from the
         // §5.11.23 aggregate (slot 1 in `LAST_FRAME = 1..=ALTREF_FRAME
@@ -29291,16 +29627,121 @@ impl PartitionWalker {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
+        // r387 — in-walk §5.11.33 pixel prediction. When the caller
+        // supplies the reference-pixel state
+        // ([`InterFrameContext::pixels`]), motion-compensate this leaf
+        // into `CurrFrame[ plane ]` NOW (the spec's per-block
+        // `compute_prediction()` position), so the §5.11.34
+        // `residual()` §7.12.3 step-3 merge below lands on the
+        // prediction and later intra blocks read reconstructed
+        // neighbours.
+        if let Some(px) = ctx.pixels {
+            // §5.11.33 `IsInterIntra` arm: the spec runs
+            // `predict_intra` (the translated `interintra_mode`) into
+            // `CurrFrame[ plane ]` BEFORE `predict_inter` reads it back
+            // as the §7.11.3.14 blend's `pred1`. The §5.11.33
+            // dispatcher above emitted one intra task per plane
+            // (`mode != COMPUTE_PRED_MODE_INTER`); drive each through
+            // the §7.11.2 writer.
+            if is_inter_intra {
+                let sb_mask: u32 = if use_128x128_superblock { 31 } else { 15 };
+                for task in readout
+                    .tasks
+                    .iter()
+                    .filter(|t| t.mode != COMPUTE_PRED_MODE_INTER)
+                {
+                    let (sub_x, sub_y) = if task.plane > 0 {
+                        (subsampling_x, subsampling_y)
+                    } else {
+                        (0u8, 0u8)
+                    };
+                    let rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+                    let cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+                    self.ensure_curr_frame_plane(task.plane as usize, rows, cols);
+                    // §5.11.33 `predict_intra( plane, baseX, baseY, …,
+                    // log2W, log2H )` — the (w, h) pair maps onto the
+                    // §7.11.2 writer's TX_SIZES_ALL geometry (inter-intra
+                    // blocks span BLOCK_8X8..=BLOCK_32X32, all of whose
+                    // plane extents have a TX_* twin).
+                    let tx_sz = find_tx_size(1usize << task.log2_w, 1usize << task.log2_h)
+                        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                    // §5.11.33 `BlockDecoded[ plane ][ (subBlockMiRow >>
+                    // subY) - 1 ][ (subBlockMiCol >> subX) + num4x4W ]` /
+                    // `[ (subBlockMiRow >> subY) + num4x4H ][ (subBlockMiCol
+                    // >> subX) - 1 ]` — the above-right / below-left args.
+                    let sub_block_mi_row = (mi_row & sb_mask) as i32;
+                    let sub_block_mi_col = (mi_col & sb_mask) as i32;
+                    let num4x4_w = 1i32 << (task.log2_w.saturating_sub(2));
+                    let num4x4_h = 1i32 << (task.log2_h.saturating_sub(2));
+                    let base_row = sub_block_mi_row >> sub_y;
+                    let base_col = sub_block_mi_col >> sub_x;
+                    let have_above_right = Self::block_decoded_slot(
+                        task.plane as usize,
+                        base_row - 1,
+                        base_col + num4x4_w,
+                    )
+                    .map(|s| self.block_decoded[s] != 0)
+                    .unwrap_or(false);
+                    let have_below_left = Self::block_decoded_slot(
+                        task.plane as usize,
+                        base_row + num4x4_h,
+                        base_col - 1,
+                    )
+                    .map(|s| self.block_decoded[s] != 0)
+                    .unwrap_or(false);
+                    // §7.11.2.8 `get_filter_type( plane )` + the
+                    // frame-scope `enable_intra_edge_filter` — inert for
+                    // the II mode set (DC / V / H / SMOOTH at
+                    // `angle_delta == 0`), passed for §7.11.2 fidelity.
+                    let (avail_u_block, avail_l_block) = if task.plane == 0 {
+                        (avail_u, avail_l)
+                    } else {
+                        (avail_u_chroma, avail_l_chroma)
+                    };
+                    let filter_type = self.get_filter_type(
+                        task.plane,
+                        mi_row,
+                        mi_col,
+                        avail_u_block,
+                        avail_l_block,
+                        sub_x,
+                        sub_y,
+                    );
+                    let eief = self.enable_intra_edge_filter;
+                    self.predict_intra_into_curr_frame(
+                        task.plane,
+                        task.start_x,
+                        task.start_y,
+                        tx_sz,
+                        task.mode as usize,
+                        /* angle_delta = */ 0,
+                        px.bit_depth,
+                        sub_x,
+                        sub_y,
+                        task.have_above,
+                        task.have_left,
+                        have_above_right,
+                        have_below_left,
+                        eief,
+                        filter_type,
+                        /* filter_intra_mode = */ None,
+                    );
+                }
+            }
+            self.predict_inter_leaf_from_walk(mi_row, mi_col, sub_size, px)?;
+        }
+
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
         // The §5.11.34 `is_inter && !Lossless && !plane`
         // `transform_tree` arm fires on the luma plane; chroma
-        // falls through to the direct iteration path. As with the
-        // intra arm we feed a neutral `ResidualContext` until the
-        // §5.9.12 / §5.9.14 quantizer context is plumbed through
-        // the §5.11.5 walker signature.
+        // falls through to the direct iteration path. r387: the
+        // caller-threaded §5.9.12 `quant` + §5.9.21 `reduced_tx_set`
+        // replace the historical neutral pair, so the §5.11.47
+        // `transform_type()` guard + §5.11.48 `get_tx_set()` reduction
+        // + §7.12.3 dequant reflect the real frame quantiser.
         let neutral_ctx = ResidualContext {
-            quant: QuantizerParams::neutral(0, 8),
-            reduced_tx_set: false,
+            quant: *quant,
+            reduced_tx_set,
             intra_dir: 0,
             segment_id: info.segment_id,
             seg_qm_level: [15, 15, 15],
@@ -29391,6 +29832,251 @@ impl PartitionWalker {
             // inter block never carries a §5.11.49 colour-index map.
             color_map_y: None,
             color_map_uv: None,
+        })
+    }
+
+    /// r387 — §5.11.18 `else intra_block_mode_info()` completion: the
+    /// §5.11.5 tail for an **intra block inside an inter frame**. The
+    /// §5.11.18 prologue (skip-mode / skip / segment-id / cdef /
+    /// deltas / `read_is_inter`) has already run and surfaced `info`
+    /// with `is_inter == 0`; this method runs the §5.11.22 composite
+    /// ([`Self::decode_intra_block_mode_info`] — `y_mode` against
+    /// `TileYModeCdf[ Size_Group[ MiSize ] ]`, then the shared
+    /// `intra_angle_info_y` / `uv_mode` / palette / filter-intra
+    /// tail), the §5.11.49 `palette_tokens()`, the §5.11.16
+    /// `read_block_tx_size()` (intra ⇒ the §5.11.15 `else` arm), the
+    /// §5.11.42 skip reset, the §5.11.33 `compute_prediction()`
+    /// enumeration, and the §5.11.34 `residual()` (whose per-TU
+    /// §5.11.35 `predict_intra` writes this block's §7.11.2
+    /// prediction into `CurrFrame[ plane ]`, exactly like the
+    /// §5.11.7 intra-frame arm).
+    ///
+    /// The `RefFrames[ .. ] = [ INTRA_FRAME, NONE ]` / `Mvs[ .. ] = 0`
+    /// grid stamps collapse to the walker's pre-fill values (no other
+    /// leaf writes this footprint), so no explicit stamp is needed;
+    /// `IsInters[ .. ] = 0` was stamped by the §5.11.20 read.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_block_syntax_intra_in_inter_tail(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        bw4: u32,
+        bh4: u32,
+        has_chroma: bool,
+        avail_u: bool,
+        avail_l: bool,
+        avail_u_chroma: bool,
+        avail_l_chroma: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        use_128x128_superblock: bool,
+        allow_screen_content_tools: bool,
+        enable_filter_intra: bool,
+        bit_depth: u8,
+        quant: &QuantizerParams,
+        reduced_tx_set: bool,
+        tx_mode_select: bool,
+        info: &DecodedInterFrameModeInfo,
+    ) -> Result<DecodedBlock, crate::Error> {
+        // §8.3.2 `has_palette_y` neighbour ctx (av1-spec p.378) from
+        // the walker's own `PaletteSizes[ 0 ]` grid — mirrors the
+        // §5.11.7 else-arm derivation.
+        let above_palette_y = avail_u
+            && mi_row > 0
+            && self.palette_sizes[((mi_row - 1) * self.mi_cols + mi_col) as usize] > 0;
+        let left_palette_y = avail_l
+            && mi_col > 0
+            && self.palette_sizes[(mi_row * self.mi_cols + mi_col - 1) as usize] > 0;
+
+        // §5.11.22 composite.
+        let ib = self.decode_intra_block_mode_info(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            info.lossless,
+            has_chroma,
+            allow_screen_content_tools,
+            enable_filter_intra,
+            subsampling_x != 0,
+            subsampling_y != 0,
+            above_palette_y,
+            left_palette_y,
+            bit_depth,
+        )?;
+        let y_mode = ib.y_mode;
+        let uv_mode = ib.uv_mode;
+        let angle_delta_y = ib.angle_delta_y;
+        let angle_delta_uv = ib.angle_delta_uv;
+        let cfl_alpha_u = ib.cfl_alpha_u;
+        let cfl_alpha_v = ib.cfl_alpha_v;
+        let palette_size_y = ib.palette_size_y.unwrap_or(0);
+        let palette_size_uv = ib.palette_size_uv.unwrap_or(0);
+        let use_filter_intra = ib.use_filter_intra;
+        let filter_intra_mode = ib.filter_intra_mode;
+
+        // §5.11.5 line `palette_tokens( )` — §5.11.49.
+        let (color_map_y, color_map_uv) = self.read_palette_token_maps(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            palette_size_y,
+            palette_size_uv,
+            subsampling_x,
+            subsampling_y,
+        )?;
+        // Hand the palette sizes + decoded maps to the §5.11.34
+        // `residual()` dispatch so its per-TU §5.11.35 runs the
+        // `predict_palette` arm on this block's palette planes.
+        self.current_palette_size_y = palette_size_y;
+        self.current_palette_size_uv = palette_size_uv;
+        self.current_color_map_y = color_map_y.clone();
+        self.current_color_map_uv = color_map_uv.clone();
+
+        // §5.11.5 line `read_block_tx_size( )` — intra ⇒ the §5.11.15
+        // `else` arm (`read_tx_size( !skip || !is_inter )` = always).
+        self.decode_block(mi_row, mi_col, sub_size);
+        let tx_size = self.read_block_tx_size(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            info.lossless,
+            /* is_inter = */ false,
+            /* skip = */ info.skip != 0,
+            tx_mode_select,
+        )?;
+
+        // §5.11.5 line `if ( skip ) reset_block_context( bw4, bh4 )`.
+        if info.skip != 0 {
+            self.reset_txb_block_context(
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                has_chroma,
+                subsampling_x,
+                subsampling_y,
+            );
+        }
+
+        // §5.11.5 line `compute_prediction( )` — §5.11.33 enumeration
+        // (the §7.11.2 prediction itself happens per-TU inside the
+        // §5.11.34 `residual()` dispatch below, mirroring the §5.11.7
+        // intra-frame arm).
+        let _readout = self.compute_prediction(
+            mi_row,
+            mi_col,
+            sub_size,
+            has_chroma,
+            avail_u,
+            avail_l,
+            avail_u_chroma,
+            avail_l_chroma,
+            subsampling_x,
+            subsampling_y,
+            /* is_inter = */ false,
+            y_mode,
+            uv_mode.unwrap_or(0),
+            /* ref_frame_1_is_intra = */ false,
+            /* interintra_mode = */ II_DC_PRED,
+        )?;
+
+        // §5.11.5 line `residual( )` — the full intra `ResidualContext`
+        // (mode-info + the caller-threaded §5.9.12 quantiser pair).
+        let res_ctx = ResidualContext {
+            quant: *quant,
+            reduced_tx_set,
+            intra_dir: intra_dir(
+                use_filter_intra == Some(1),
+                y_mode as usize,
+                filter_intra_mode.unwrap_or(0) as usize,
+            )
+            .unwrap_or(0),
+            segment_id: info.segment_id,
+            seg_qm_level: [15, 15, 15],
+            uv_mode: uv_mode.unwrap_or(0),
+            is_intra: true,
+            y_mode,
+            angle_delta_y,
+            angle_delta_uv: angle_delta_uv.unwrap_or(0),
+            cfl_alpha_u: cfl_alpha_u.unwrap_or(0),
+            cfl_alpha_v: cfl_alpha_v.unwrap_or(0),
+            filter_intra_mode: if use_filter_intra == Some(1) {
+                filter_intra_mode
+            } else {
+                None
+            },
+            avail_l,
+            avail_u,
+            avail_l_chroma,
+            avail_u_chroma,
+            enable_intra_edge_filter: self.enable_intra_edge_filter,
+        };
+        let _residual = self.residual(
+            decoder,
+            cdfs,
+            mi_row,
+            mi_col,
+            sub_size,
+            has_chroma,
+            subsampling_x,
+            subsampling_y,
+            /* is_inter = */ false,
+            info.lossless,
+            info.skip != 0,
+            tx_size as usize,
+            use_128x128_superblock,
+            &res_ctx,
+        )?;
+
+        Ok(DecodedBlock {
+            mi_row,
+            mi_col,
+            mi_size: sub_size,
+            bw4,
+            bh4,
+            has_chroma,
+            avail_u,
+            avail_l,
+            avail_u_chroma,
+            avail_l_chroma,
+            skip: info.skip,
+            skip_mode: info.skip_mode,
+            segment_id: info.segment_id,
+            lossless: info.lossless,
+            cdef_idx: info.cdef_idx,
+            current_q_index: info.current_q_index,
+            current_delta_lf: info.current_delta_lf,
+            // §5.11.22 line 1: `RefFrame = [ INTRA_FRAME, NONE ]`.
+            ref_frame: [ib.ref_frame[0] as i8, ib.ref_frame[1] as i8],
+            use_intrabc: info.use_intrabc,
+            is_inter: 0,
+            y_mode,
+            uv_mode,
+            angle_delta_y,
+            angle_delta_uv,
+            cfl_alpha_u,
+            cfl_alpha_v,
+            palette_size_y,
+            palette_size_uv,
+            use_filter_intra,
+            filter_intra_mode,
+            // §5.11.22 blocks carry no MV (intra), and `RefFrame[1] =
+            // NONE` forces both derived flags off.
+            mv: [[0, 0], [0, 0]],
+            is_compound: false,
+            is_inter_intra: false,
+            tx_size,
+            color_map_y,
+            color_map_uv,
         })
     }
 
@@ -34157,6 +34843,39 @@ pub struct InterFrameContext<'a> {
     /// run §7.9 (the temporal-scan body short-circuits on the
     /// sentinel).
     pub motion_field_mvs: &'a MotionFieldMvs,
+    // ---- in-walk §5.11.33 `predict_inter` pixel state ----
+    /// §7.11.3 reference-pixel state for the in-walk §5.11.33
+    /// `compute_prediction()`. `Some(_)` ⇒ the §5.11.5 inter arm
+    /// motion-compensates every inter leaf into `CurrFrame[ plane ]`
+    /// **during** the walk (the spec's per-block `compute_prediction()`
+    /// → `residual()` ordering, so a later intra block's §7.11.2
+    /// neighbour reads observe reconstructed inter pixels and the
+    /// §7.12.3 step-3 residual merge lands on the leaf's prediction).
+    /// `None` ⇒ the historical syntax-only walk (callers reconstruct
+    /// post-walk via the frame-scope bridge, valid only when no intra
+    /// leaf reads an inter neighbour and no inter leaf codes a
+    /// residual).
+    pub pixels: Option<&'a InterWalkPixels<'a>>,
+}
+
+/// §7.11.3 reference-pixel state for the in-walk §5.11.33
+/// `compute_prediction()` — the decoded-picture-buffer view the
+/// §5.11.5 walker motion-compensates against. Carried on
+/// [`InterFrameContext::pixels`].
+#[derive(Debug)]
+pub struct InterWalkPixels<'a> {
+    /// §6.8.2 `ref_frame_idx[ 0..REFS_PER_FRAME ]` — the slot index
+    /// each of the seven inter references (`LAST_FRAME - LAST_FRAME =
+    /// 0` .. `ALTREF_FRAME - LAST_FRAME = 6`) resolves to.
+    pub ref_frame_idx: [u8; 7],
+    /// §5.5.2 `BitDepth` (8 / 10 / 12).
+    pub bit_depth: u8,
+    /// Per-decoded-plane reference specs — each carries the plane
+    /// ordinal, its subsampling, the per-slot §7.11.3.3 `FrameStore`
+    /// slices, and the current frame's plane-space dimensions.
+    pub plane_refs: &'a [crate::PlaneRefSpec<'a>],
+    /// §7.11.3.15 order-hint context (COMPOUND_DISTANCE weights).
+    pub order_hints: FrameInterOrderHints,
 }
 
 impl<'a> InterFrameContext<'a> {
@@ -34210,6 +34929,7 @@ impl<'a> InterFrameContext<'a> {
             interpolation_filter: crate::inter_pred::EIGHTTAP,
             enable_dual_filter: false,
             motion_field_mvs,
+            pixels: None,
         }
     }
 }

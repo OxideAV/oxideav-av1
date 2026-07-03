@@ -6854,417 +6854,450 @@ pub fn reconstruct_inter_frame(
                 }
             }
 
-            // --- §5.11.33 leaf gating: inter arm. ---
-            if grid.is_inters[origin] == 0 {
-                continue; // intra leaf — §7.11.2 arm's responsibility.
-            }
-            let ref_frame0 = grid.ref_frames[origin * 2];
-            let ref_frame1 = grid.ref_frames[origin * 2 + 1];
-            // `RefFrame[1]` selects the §7.11.3.1 combine arm:
-            //   * `NONE` (the `-1` sentinel the §5.11.18 grid pre-fill
-            //     stamps into slot 1) ⇒ single forward reference.
-            //   * `>= LAST_FRAME` (1..=7) ⇒ compound two-reference.
-            //   * `INTRA_FRAME` (0) ⇒ inter-intra — blended against the
-            //     §7.11.2 intra prediction already in `CurrFrame[plane]`.
-            const NONE_REF_FRAME: i8 = -1;
-            const INTRA_FRAME_REF: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
-            let is_compound_leaf = ref_frame1 >= crate::uncompressed_header_tail::LAST_FRAME as i8;
+            reconstruct_inter_leaf_at(grid, ref_frame_idx, planes, mi_row, mi_col)?;
+        }
+    }
 
-            let interp_x = grid.interp_filters[origin * 2];
-            let interp_y = grid.interp_filters[origin * 2 + 1];
+    Ok(())
+}
 
-            if ref_frame1 == INTRA_FRAME_REF {
-                // --- inter-intra arm (§7.11.3.14 blend). ---
-                //
-                // av1-spec p.83 lines 5141-5163 run `predict_intra` on
-                // this leaf *before* `predict_inter`, leaving the intra
-                // prediction in `CurrFrame[plane]`; the §7.11.3.14 body
-                // then reads it as `pred1 = CurrFrame[plane][y+dstY]
-                // [x+dstX]` (p.284 line 15786). This walk consumes that
-                // in-place intra prediction, so the caller MUST have
-                // written it into each plane's `curr` buffer for this
-                // leaf's footprint before invoking `reconstruct_inter_frame`.
-                let ii_mode = grid.interintra_modes[origin];
-                let wedge_on = grid.wedge_interintras[origin] != 0;
-                let leaf = InterIntraLeaf {
-                    mode_info: InterIntraModeInfo {
-                        ref_frame: ref_frame0 as u8,
-                        mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
-                        interintra_mode: ii_mode,
-                        wedge: if wedge_on {
-                            Some(InterIntraWedgeModeInfo {
-                                mi_size,
-                                wedge_index: grid.interintra_wedge_indices[origin],
-                            })
-                        } else {
-                            None
-                        },
-                    },
-                    mi_size,
-                    mi_row: mi_row as u32,
-                    mi_col: mi_col as u32,
-                    interp_filter_x: interp_x,
-                    interp_filter_y: interp_y,
-                };
-                // The §5.11.33 frame-walk and the §5.11.33 task-dispatcher
-                // bridge share this one per-block inter-intra driver.
-                reconstruct_inter_intra_block(&leaf, ref_frame_idx, grid.bit_depth, planes)?;
-                continue;
-            }
+/// §5.11.33 single-leaf inter reconstruction — the per-leaf body of
+/// [`reconstruct_inter_frame`], invocable at one leaf origin so the
+/// §5.11.5 syntax walker can run the spec's in-walk `compute_prediction()`
+/// (§5.11.5 orders it per block, between `mode_info()` and `residual()`,
+/// so a later intra block's §7.11.2 neighbour reads observe this leaf's
+/// motion-compensated pixels).
+///
+/// `(mi_row, mi_col)` is the leaf origin; the leaf's `MiSize` is read
+/// from `grid.mi_sizes` at the origin cell. Intra leaves (`IsInters ==
+/// 0`) return without touching the planes (the §7.11.2 arm owns them).
+/// The caller guarantees the grid slices cover `mi_rows * mi_cols`
+/// cells ([`reconstruct_inter_frame`] guards them once per frame; the
+/// in-walk caller sizes its walker grids at construction).
+///
+/// Error surface matches [`reconstruct_inter_frame`] (out-of-range
+/// `MiSize` / `RefFrame` / resolved `refIdx`, a too-small `curr`
+/// plane, …).
+pub(crate) fn reconstruct_inter_leaf_at(
+    grid: &InterModeInfoGrid<'_>,
+    ref_frame_idx: &[u8],
+    planes: &mut [PlaneReconContext<'_>],
+    mi_row: usize,
+    mi_col: usize,
+) -> Result<(), crate::Error> {
+    let mi_rows = grid.mi_rows as usize;
+    let mi_cols = grid.mi_cols as usize;
+    let origin = mi_row * mi_cols + mi_col;
+    let mi_size = grid.mi_sizes[origin];
+    if mi_size >= crate::cdf::BLOCK_SIZES {
+        return Err(crate::Error::PartitionWalkOutOfRange);
+    }
+    // --- §5.11.33 leaf gating: inter arm. ---
+    if grid.is_inters[origin] == 0 {
+        return Ok(()); // intra leaf — §7.11.2 arm's responsibility.
+    }
+    let ref_frame0 = grid.ref_frames[origin * 2];
+    let ref_frame1 = grid.ref_frames[origin * 2 + 1];
+    // `RefFrame[1]` selects the §7.11.3.1 combine arm:
+    //   * `NONE` (the `-1` sentinel the §5.11.18 grid pre-fill
+    //     stamps into slot 1) ⇒ single forward reference.
+    //   * `>= LAST_FRAME` (1..=7) ⇒ compound two-reference.
+    //   * `INTRA_FRAME` (0) ⇒ inter-intra — blended against the
+    //     §7.11.2 intra prediction already in `CurrFrame[plane]`.
+    const NONE_REF_FRAME: i8 = -1;
+    const INTRA_FRAME_REF: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+    let is_compound_leaf = ref_frame1 >= crate::uncompressed_header_tail::LAST_FRAME as i8;
 
-            if is_compound_leaf {
-                // --- compound two-reference arm
-                //     (AVERAGE / DISTANCE / WEDGE). ---
-                let comp_type = grid.compound_types[origin];
-                // The intra-variant mask arm (COMPOUND_INTRA) needs a
-                // §7.11.3.13 mask that the interintra driver owns; leave
-                // its region for that later arc. AVERAGE / DISTANCE need
-                // no mask, WEDGE's mask is a pure function of the decoded
-                // (MiSize, wedge_index, wedge_sign), and DIFFWTD's
-                // §7.11.3.12 mask is derived by the driver from the two
-                // `preds[]` at `plane == 0` and persisted across planes
-                // via the per-block luma-grid buffer allocated below —
-                // all four are driven.
-                if !matches!(
-                    comp_type,
-                    COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE | COMPOUND_DIFFWTD
-                ) {
-                    continue;
-                }
-                // §7.11.3.11 wedge side-data — only meaningful on the
-                // WEDGE arm. `MiSize` is the luma block size at this
-                // leaf's origin, so the regenerated mask is luma-grid.
-                let wedge = if comp_type == COMPOUND_WEDGE {
-                    Some(WedgeModeInfo {
+    let interp_x = grid.interp_filters[origin * 2];
+    let interp_y = grid.interp_filters[origin * 2 + 1];
+
+    if ref_frame1 == INTRA_FRAME_REF {
+        // --- inter-intra arm (§7.11.3.14 blend). ---
+        //
+        // av1-spec p.83 lines 5141-5163 run `predict_intra` on
+        // this leaf *before* `predict_inter`, leaving the intra
+        // prediction in `CurrFrame[plane]`; the §7.11.3.14 body
+        // then reads it as `pred1 = CurrFrame[plane][y+dstY]
+        // [x+dstX]` (p.284 line 15786). This walk consumes that
+        // in-place intra prediction, so the caller MUST have
+        // written it into each plane's `curr` buffer for this
+        // leaf's footprint before invoking `reconstruct_inter_frame`.
+        let ii_mode = grid.interintra_modes[origin];
+        let wedge_on = grid.wedge_interintras[origin] != 0;
+        let leaf = InterIntraLeaf {
+            mode_info: InterIntraModeInfo {
+                ref_frame: ref_frame0 as u8,
+                mv: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
+                interintra_mode: ii_mode,
+                wedge: if wedge_on {
+                    Some(InterIntraWedgeModeInfo {
                         mi_size,
-                        wedge_index: grid.wedge_indices[origin],
-                        wedge_sign: grid.wedge_signs[origin],
+                        wedge_index: grid.interintra_wedge_indices[origin],
                     })
                 } else {
                     None
-                };
-                let mode_info = CompoundInterModeInfo {
-                    ref_frame_0: ref_frame0 as u8,
-                    ref_frame_1: ref_frame1 as u8,
-                    mv0: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
-                    mv1: [grid.mvs[origin * 4 + 2], grid.mvs[origin * 4 + 3]],
-                    compound_type: comp_type,
-                    wedge,
-                    mask_type: grid.mask_types[origin],
-                };
-                // §7.11.3.12 persistent luma-grid `Mask` array — the
-                // DIFFWTD driver fills it on the `plane == 0` call and
-                // reuses it for chroma (av1-spec p.258 line 14392). Sized
-                // to the *luma* block extent; `None` on the non-DIFFWTD
-                // arms (the wrapper ignores it there).
-                let mut diffwtd_mask: Option<Vec<u8>> = if comp_type == COMPOUND_DIFFWTD {
-                    Some(vec![
-                        0u8;
-                        crate::cdf::block_width(mi_size)
-                            * crate::cdf::block_height(mi_size)
-                    ])
-                } else {
-                    None
-                };
-                // §7.11.3.15 order-hint context — resolve each ref's
-                // `OrderHints[]` from the per-RefFrame table. The two
-                // `ref_frame*` values are in `LAST_FRAME..=ALTREF_FRAME`
-                // (the grid-slice guard bounded the table at
-                // `ALTREF_FRAME`), so the indexing is in range.
-                let order_hints = CompoundOrderHintContext {
-                    order_hint_bits: grid.order_hint_bits,
-                    current_order_hint: grid.current_order_hint,
-                    order_hint_ref0: grid.order_hints_by_ref[ref_frame0 as usize],
-                    order_hint_ref1: grid.order_hints_by_ref[ref_frame1 as usize],
-                };
+                },
+            },
+            mi_size,
+            mi_row: mi_row as u32,
+            mi_col: mi_col as u32,
+            interp_filter_x: interp_x,
+            interp_filter_y: interp_y,
+        };
+        // The §5.11.33 frame-walk and the §5.11.33 task-dispatcher
+        // bridge share this one per-block inter-intra driver.
+        reconstruct_inter_intra_block(&leaf, ref_frame_idx, grid.bit_depth, planes)?;
+        return Ok(());
+    }
 
-                for ctx in planes.iter_mut() {
-                    let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
-                    let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
-                    let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
-                    let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
-                    let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
-                    let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+    if is_compound_leaf {
+        // --- compound two-reference arm
+        //     (AVERAGE / DISTANCE / WEDGE). ---
+        let comp_type = grid.compound_types[origin];
+        // The intra-variant mask arm (COMPOUND_INTRA) needs a
+        // §7.11.3.13 mask that the interintra driver owns; leave
+        // its region for that later arc. AVERAGE / DISTANCE need
+        // no mask, WEDGE's mask is a pure function of the decoded
+        // (MiSize, wedge_index, wedge_sign), and DIFFWTD's
+        // §7.11.3.12 mask is derived by the driver from the two
+        // `preds[]` at `plane == 0` and persisted across planes
+        // via the per-block luma-grid buffer allocated below —
+        // all four are driven.
+        if !matches!(
+            comp_type,
+            COMPOUND_AVERAGE | COMPOUND_DISTANCE | COMPOUND_WEDGE | COMPOUND_DIFFWTD
+        ) {
+            return Ok(());
+        }
+        // §7.11.3.11 wedge side-data — only meaningful on the
+        // WEDGE arm. `MiSize` is the luma block size at this
+        // leaf's origin, so the regenerated mask is luma-grid.
+        let wedge = if comp_type == COMPOUND_WEDGE {
+            Some(WedgeModeInfo {
+                mi_size,
+                wedge_index: grid.wedge_indices[origin],
+                wedge_sign: grid.wedge_signs[origin],
+            })
+        } else {
+            None
+        };
+        let mode_info = CompoundInterModeInfo {
+            ref_frame_0: ref_frame0 as u8,
+            ref_frame_1: ref_frame1 as u8,
+            mv0: [grid.mvs[origin * 4], grid.mvs[origin * 4 + 1]],
+            mv1: [grid.mvs[origin * 4 + 2], grid.mvs[origin * 4 + 3]],
+            compound_type: comp_type,
+            wedge,
+            mask_type: grid.mask_types[origin],
+        };
+        // §7.11.3.12 persistent luma-grid `Mask` array — the
+        // DIFFWTD driver fills it on the `plane == 0` call and
+        // reuses it for chroma (av1-spec p.258 line 14392). Sized
+        // to the *luma* block extent; `None` on the non-DIFFWTD
+        // arms (the wrapper ignores it there).
+        let mut diffwtd_mask: Option<Vec<u8>> = if comp_type == COMPOUND_DIFFWTD {
+            Some(vec![
+                0u8;
+                crate::cdf::block_width(mi_size)
+                    * crate::cdf::block_height(mi_size)
+            ])
+        } else {
+            None
+        };
+        // §7.11.3.15 order-hint context — resolve each ref's
+        // `OrderHints[]` from the per-RefFrame table. The two
+        // `ref_frame*` values are in `LAST_FRAME..=ALTREF_FRAME`
+        // (the grid-slice guard bounded the table at
+        // `ALTREF_FRAME`), so the indexing is in range.
+        let order_hints = CompoundOrderHintContext {
+            order_hint_bits: grid.order_hint_bits,
+            current_order_hint: grid.current_order_hint,
+            order_hint_ref0: grid.order_hints_by_ref[ref_frame0 as usize],
+            order_hint_ref1: grid.order_hints_by_ref[ref_frame1 as usize],
+        };
 
-                    reconstruct_inter_block_compound(
-                        mode_info,
-                        order_hints,
-                        ref_frame_idx,
-                        ctx.frame_store,
-                        ctx.plane,
-                        base_x,
-                        base_y,
-                        pred_w,
-                        pred_h,
-                        grid.bit_depth,
-                        ctx.subsampling_x,
-                        ctx.subsampling_y,
-                        ctx.frame_width,
-                        ctx.frame_height,
-                        interp_x,
-                        interp_y,
-                        diffwtd_mask.as_deref_mut(),
-                        ctx.curr,
-                        ctx.curr_stride,
-                    )?;
-                }
-                continue;
+        for ctx in planes.iter_mut() {
+            let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
+            let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
+            let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+            let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+            let pred_w = crate::cdf::block_width(mi_size) >> sub_x;
+            let pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+
+            reconstruct_inter_block_compound(
+                mode_info,
+                order_hints,
+                ref_frame_idx,
+                ctx.frame_store,
+                ctx.plane,
+                base_x,
+                base_y,
+                pred_w,
+                pred_h,
+                grid.bit_depth,
+                ctx.subsampling_x,
+                ctx.subsampling_y,
+                ctx.frame_width,
+                ctx.frame_height,
+                interp_x,
+                interp_y,
+                diffwtd_mask.as_deref_mut(),
+                ctx.curr,
+                ctx.curr_stride,
+            )?;
+        }
+        return Ok(());
+    }
+
+    debug_assert_eq!(ref_frame1, NONE_REF_FRAME);
+    // --- single forward-reference arm (SIMPLE + WARPED_CAUSAL). ---
+    //
+    // §5.11.33 `predict()` per-plane body (av1-spec p.82-83 lines
+    // 5127-5190) in full, including the `someUseIntra` scan and
+    // the resulting `predict_inter` sub-block tiling.
+
+    // §5.11.27 motion-mode dispatch: a `WARPED_CAUSAL` leaf (the
+    // grid carries the decoded ordinal + the §7.11.3.8 local fit
+    // + the per-RefFrame global-motion model in `grid.warp`)
+    // routes each sub-block to `reconstruct_inter_block_warp`; on
+    // `None`/`SIMPLE`/`OBMC` the translational
+    // `reconstruct_inter_block` path runs unchanged. The warp
+    // context is read at the leaf origin (the §5.11.27 LOCALWARP
+    // arm is per-block and luma-only — `block_warp`'s step-7 gate
+    // already falls back to translational for chroma / sub-8×8 /
+    // invalid-fit windows, so a single per-leaf `WarpDriverParams`
+    // is bit-correct across the §5.11.33 sub-block tiling).
+    let leaf_warp: Option<WarpDriverParams> = grid.warp.as_ref().and_then(|wc| {
+        if wc.motion_modes.get(origin).copied() != Some(crate::cdf::MOTION_MODE_WARPED_CAUSAL) {
+            return None;
+        }
+        let lw_base = origin * 6;
+        let lwp: [i32; 6] = [
+            wc.local_warp_params[lw_base],
+            wc.local_warp_params[lw_base + 1],
+            wc.local_warp_params[lw_base + 2],
+            wc.local_warp_params[lw_base + 3],
+            wc.local_warp_params[lw_base + 4],
+            wc.local_warp_params[lw_base + 5],
+        ];
+        let rf0 = ref_frame0 as usize;
+        let gm_base = rf0 * 6;
+        let gmp: [i32; 6] = [
+            wc.gm_params[gm_base],
+            wc.gm_params[gm_base + 1],
+            wc.gm_params[gm_base + 2],
+            wc.gm_params[gm_base + 3],
+            wc.gm_params[gm_base + 4],
+            wc.gm_params[gm_base + 5],
+        ];
+        // §7.11.3.6 identity affine matrix for the unused
+        // refList-1 slot (never consulted on the single-ref
+        // path): `[0, 0, 1<<PREC, 0, 0, 1<<PREC]`.
+        const WARP_IDENTITY_MATRIX: [i32; 6] = [
+            0,
+            0,
+            1 << WARP_WARPEDMODEL_PREC_BITS,
+            0,
+            0,
+            1 << WARP_WARPEDMODEL_PREC_BITS,
+        ];
+        Some(WarpDriverParams {
+            y_mode: [wc.y_modes[origin], 0],
+            gm_type: [wc.gm_types[rf0], 0],
+            gm_params: [gmp, WARP_IDENTITY_MATRIX],
+            local_warp_params: lwp,
+            local_valid: wc.local_warp_valid[origin] != 0,
+            // §7.11.3.3: the single-ref translational arm already
+            // assumes non-scaled references throughout this walk
+            // (the §7.11.3.3 scaling is applied inside
+            // `block_inter_prediction`); the step-7 `useWarp = 2`
+            // global gate additionally requires `is_scaled ==
+            // false`, which holds for the references this walk
+            // reconstructs against.
+            ref_is_scaled: [false, false],
+            force_integer_mv: wc.force_integer_mv,
+        })
+    });
+
+    // §5.11.27 OBMC dispatch: an `OBMC` single-ref leaf (and not a
+    // `WARPED_CAUSAL` leaf, which the warp arm above already
+    // claimed) routes each plane to `reconstruct_inter_block_obmc`
+    // with the §7.11.3.9 above / left neighbour lists resolved from
+    // this grid. The whole leaf (all planes) is reconstructed here;
+    // the SIMPLE translational loop below is skipped via `continue`.
+    // The leaf's own MV/ref is single-reference and translational
+    // (the §7.11.3.9 post-step overlays the neighbour
+    // contributions), so the leaf gates exactly like SIMPLE: it has
+    // no `someUseIntra` sub-block split (OBMC blocks are >= 8×8 luma
+    // by the §5.11.27 `use_obmc` eligibility, so the §5.11.33 chroma
+    // intra-neighbour split does not arise for them).
+    if leaf_warp.is_none() {
+        if let Some(oc) = grid.obmc.as_ref() {
+            if oc.motion_modes[origin] == crate::cdf::MOTION_MODE_OBMC {
+                obmc_dispatch_leaf(
+                    grid,
+                    oc,
+                    ref_frame_idx,
+                    planes,
+                    mi_row,
+                    mi_col,
+                    mi_size,
+                    ref_frame0,
+                )?;
+                return Ok(());
             }
+        }
+    }
 
-            debug_assert_eq!(ref_frame1, NONE_REF_FRAME);
-            // --- single forward-reference arm (SIMPLE + WARPED_CAUSAL). ---
-            //
-            // §5.11.33 `predict()` per-plane body (av1-spec p.82-83 lines
-            // 5127-5190) in full, including the `someUseIntra` scan and
-            // the resulting `predict_inter` sub-block tiling.
+    for ctx in planes.iter_mut() {
+        let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
+        let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
 
-            // §5.11.27 motion-mode dispatch: a `WARPED_CAUSAL` leaf (the
-            // grid carries the decoded ordinal + the §7.11.3.8 local fit
-            // + the per-RefFrame global-motion model in `grid.warp`)
-            // routes each sub-block to `reconstruct_inter_block_warp`; on
-            // `None`/`SIMPLE`/`OBMC` the translational
-            // `reconstruct_inter_block` path runs unchanged. The warp
-            // context is read at the leaf origin (the §5.11.27 LOCALWARP
-            // arm is per-block and luma-only — `block_warp`'s step-7 gate
-            // already falls back to translational for chroma / sub-8×8 /
-            // invalid-fit windows, so a single per-leaf `WarpDriverParams`
-            // is bit-correct across the §5.11.33 sub-block tiling).
-            let leaf_warp: Option<WarpDriverParams> = grid.warp.as_ref().and_then(|wc| {
-                if wc.motion_modes.get(origin).copied()
-                    != Some(crate::cdf::MOTION_MODE_WARPED_CAUSAL)
-                {
-                    return None;
+        // §5.11.33 lines 5128-5130: per-plane residual size →
+        // `num4x4W` / `num4x4H`. `get_plane_residual_size` is
+        // guaranteed non-`BLOCK_INVALID` for plane 1 by §6.4.1
+        // conformance, and for plane 0 it is the identity; a
+        // `None` is a caller bug (non-conformant grid).
+        let plane_sz = crate::cdf::get_plane_residual_size(mi_size, ctx.plane, sub_x, sub_y)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let num4x4_w = crate::cdf::num_4x4_blocks_wide(plane_sz);
+        let num4x4_h = crate::cdf::num_4x4_blocks_high(plane_sz);
+
+        // §5.11.33 lines 5135-5138: plane-space block origin and
+        // the chroma-collocated candidate anchor `candRow` /
+        // `candCol` (`(MiRow >> subY) << subY` etc.).
+        let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
+        let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
+        let mut cand_row = (mi_row >> sub_y) << sub_y;
+        let mut cand_col = (mi_col >> sub_x) << sub_x;
+
+        // §5.11.33 lines 5166-5167: default (`someUseIntra == 0`)
+        // prediction footprint.
+        let mut pred_w = crate::cdf::block_width(mi_size) >> sub_x;
+        let mut pred_h = crate::cdf::block_height(mi_size) >> sub_y;
+
+        // §5.11.33 lines 5168-5172: `someUseIntra` scan over the
+        // `(num4x4H << subY) × (num4x4W << subX)` luma cells the
+        // chroma block collocates with. A cell whose
+        // `RefFrames[ candRow + r ][ candCol + c ][ 0 ] ==
+        // INTRA_FRAME` flags the split. Cells off the grid edge
+        // are not stamped (treated as non-intra), matching the
+        // §5.11.5 grid-fill clip.
+        const INTRA_FRAME_REF0: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
+        let mut some_use_intra = false;
+        'scan: for r in 0..(num4x4_h << sub_y) {
+            let rr = cand_row + r;
+            if rr >= mi_rows {
+                break;
+            }
+            for c in 0..(num4x4_w << sub_x) {
+                let cc = cand_col + c;
+                if cc >= mi_cols {
+                    break;
                 }
-                let lw_base = origin * 6;
-                let lwp: [i32; 6] = [
-                    wc.local_warp_params[lw_base],
-                    wc.local_warp_params[lw_base + 1],
-                    wc.local_warp_params[lw_base + 2],
-                    wc.local_warp_params[lw_base + 3],
-                    wc.local_warp_params[lw_base + 4],
-                    wc.local_warp_params[lw_base + 5],
-                ];
-                let rf0 = ref_frame0 as usize;
-                let gm_base = rf0 * 6;
-                let gmp: [i32; 6] = [
-                    wc.gm_params[gm_base],
-                    wc.gm_params[gm_base + 1],
-                    wc.gm_params[gm_base + 2],
-                    wc.gm_params[gm_base + 3],
-                    wc.gm_params[gm_base + 4],
-                    wc.gm_params[gm_base + 5],
-                ];
-                // §7.11.3.6 identity affine matrix for the unused
-                // refList-1 slot (never consulted on the single-ref
-                // path): `[0, 0, 1<<PREC, 0, 0, 1<<PREC]`.
-                const WARP_IDENTITY_MATRIX: [i32; 6] = [
-                    0,
-                    0,
-                    1 << WARP_WARPEDMODEL_PREC_BITS,
-                    0,
-                    0,
-                    1 << WARP_WARPEDMODEL_PREC_BITS,
-                ];
-                Some(WarpDriverParams {
-                    y_mode: [wc.y_modes[origin], 0],
-                    gm_type: [wc.gm_types[rf0], 0],
-                    gm_params: [gmp, WARP_IDENTITY_MATRIX],
-                    local_warp_params: lwp,
-                    local_valid: wc.local_warp_valid[origin] != 0,
-                    // §7.11.3.3: the single-ref translational arm already
-                    // assumes non-scaled references throughout this walk
-                    // (the §7.11.3.3 scaling is applied inside
-                    // `block_inter_prediction`); the step-7 `useWarp = 2`
-                    // global gate additionally requires `is_scaled ==
-                    // false`, which holds for the references this walk
-                    // reconstructs against.
-                    ref_is_scaled: [false, false],
-                    force_integer_mv: wc.force_integer_mv,
-                })
-            });
+                if grid.ref_frames[(rr * mi_cols + cc) * 2] == INTRA_FRAME_REF0 {
+                    some_use_intra = true;
+                    break 'scan;
+                }
+            }
+        }
 
-            // §5.11.27 OBMC dispatch: an `OBMC` single-ref leaf (and not a
-            // `WARPED_CAUSAL` leaf, which the warp arm above already
-            // claimed) routes each plane to `reconstruct_inter_block_obmc`
-            // with the §7.11.3.9 above / left neighbour lists resolved from
-            // this grid. The whole leaf (all planes) is reconstructed here;
-            // the SIMPLE translational loop below is skipped via `continue`.
-            // The leaf's own MV/ref is single-reference and translational
-            // (the §7.11.3.9 post-step overlays the neighbour
-            // contributions), so the leaf gates exactly like SIMPLE: it has
-            // no `someUseIntra` sub-block split (OBMC blocks are >= 8×8 luma
-            // by the §5.11.27 `use_obmc` eligibility, so the §5.11.33 chroma
-            // intra-neighbour split does not arise for them).
-            if leaf_warp.is_none() {
-                if let Some(oc) = grid.obmc.as_ref() {
-                    if oc.motion_modes[origin] == crate::cdf::MOTION_MODE_OBMC {
-                        obmc_dispatch_leaf(
-                            grid,
-                            oc,
+        // §5.11.33 lines 5173-5178: on `someUseIntra` the
+        // prediction is split into `num4x4{W,H}` sub-blocks of
+        // 4 samples each, anchored at the unsubsampled
+        // `(MiRow, MiCol)` so each sub-block reads its own
+        // collocated luma candidate.
+        if some_use_intra {
+            pred_w = num4x4_w * 4;
+            pred_h = num4x4_h * 4;
+            cand_row = mi_row;
+            cand_col = mi_col;
+        }
+
+        // §5.11.33 lines 5179-5189: tile the
+        // `num4x4H*4 × num4x4W*4` plane region with
+        // `predW × predH` sub-blocks, advancing the candidate
+        // `(candRow + r, candCol + c)` per sub-block. Each
+        // sub-block's `predict_inter` reads `Mvs[cand][0]` /
+        // `RefFrames[cand][0]` at its own candidate cell (all
+        // cells of one leaf carry the leaf's stamped MV/ref, so
+        // on `someUseIntra == 0` this collapses to the single
+        // origin call the prior arm performed).
+        let region_w = num4x4_w * 4;
+        let region_h = num4x4_h * 4;
+        let mut r_idx = 0usize;
+        let mut y = 0usize;
+        while y < region_h {
+            let mut c_idx = 0usize;
+            let mut x = 0usize;
+            while x < region_w {
+                let cr = cand_row + r_idx;
+                let cc = cand_col + c_idx;
+                // Clamp the candidate to the grid; the leaf
+                // stamped its MV/ref over the whole footprint,
+                // so an off-edge candidate (only reachable when
+                // the leaf is clipped at the frame boundary)
+                // re-reads the nearest in-grid cell of the same
+                // leaf.
+                let cr = cr.min(mi_rows.saturating_sub(1));
+                let cc = cc.min(mi_cols.saturating_sub(1));
+                let cand = cr * mi_cols + cc;
+                let mode_info = InterModeInfo {
+                    ref_frame: grid.ref_frames[cand * 2] as u8,
+                    mv: [grid.mvs[cand * 4], grid.mvs[cand * 4 + 1]],
+                };
+
+                match leaf_warp.as_ref() {
+                    Some(warp) => {
+                        reconstruct_inter_block_warp(
+                            mode_info,
+                            warp,
                             ref_frame_idx,
-                            planes,
-                            mi_row,
-                            mi_col,
-                            mi_size,
-                            ref_frame0,
+                            ctx.frame_store,
+                            ctx.plane,
+                            base_x + x as i32,
+                            base_y + y as i32,
+                            pred_w,
+                            pred_h,
+                            grid.bit_depth,
+                            ctx.subsampling_x,
+                            ctx.subsampling_y,
+                            ctx.frame_width,
+                            ctx.frame_height,
+                            interp_x,
+                            interp_y,
+                            ctx.curr,
+                            ctx.curr_stride,
                         )?;
-                        continue;
+                    }
+                    None => {
+                        reconstruct_inter_block(
+                            mode_info,
+                            ref_frame_idx,
+                            ctx.frame_store,
+                            ctx.plane,
+                            base_x + x as i32,
+                            base_y + y as i32,
+                            pred_w,
+                            pred_h,
+                            grid.bit_depth,
+                            ctx.subsampling_x,
+                            ctx.subsampling_y,
+                            ctx.frame_width,
+                            ctx.frame_height,
+                            interp_x,
+                            interp_y,
+                            ctx.curr,
+                            ctx.curr_stride,
+                        )?;
                     }
                 }
+
+                c_idx += 1;
+                x += pred_w;
             }
-
-            for ctx in planes.iter_mut() {
-                let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
-                let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
-
-                // §5.11.33 lines 5128-5130: per-plane residual size →
-                // `num4x4W` / `num4x4H`. `get_plane_residual_size` is
-                // guaranteed non-`BLOCK_INVALID` for plane 1 by §6.4.1
-                // conformance, and for plane 0 it is the identity; a
-                // `None` is a caller bug (non-conformant grid).
-                let plane_sz =
-                    crate::cdf::get_plane_residual_size(mi_size, ctx.plane, sub_x, sub_y)
-                        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-                let num4x4_w = crate::cdf::num_4x4_blocks_wide(plane_sz);
-                let num4x4_h = crate::cdf::num_4x4_blocks_high(plane_sz);
-
-                // §5.11.33 lines 5135-5138: plane-space block origin and
-                // the chroma-collocated candidate anchor `candRow` /
-                // `candCol` (`(MiRow >> subY) << subY` etc.).
-                let base_x = ((mi_col >> sub_x) * crate::cdf::MI_SIZE) as i32;
-                let base_y = ((mi_row >> sub_y) * crate::cdf::MI_SIZE) as i32;
-                let mut cand_row = (mi_row >> sub_y) << sub_y;
-                let mut cand_col = (mi_col >> sub_x) << sub_x;
-
-                // §5.11.33 lines 5166-5167: default (`someUseIntra == 0`)
-                // prediction footprint.
-                let mut pred_w = crate::cdf::block_width(mi_size) >> sub_x;
-                let mut pred_h = crate::cdf::block_height(mi_size) >> sub_y;
-
-                // §5.11.33 lines 5168-5172: `someUseIntra` scan over the
-                // `(num4x4H << subY) × (num4x4W << subX)` luma cells the
-                // chroma block collocates with. A cell whose
-                // `RefFrames[ candRow + r ][ candCol + c ][ 0 ] ==
-                // INTRA_FRAME` flags the split. Cells off the grid edge
-                // are not stamped (treated as non-intra), matching the
-                // §5.11.5 grid-fill clip.
-                const INTRA_FRAME_REF0: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
-                let mut some_use_intra = false;
-                'scan: for r in 0..(num4x4_h << sub_y) {
-                    let rr = cand_row + r;
-                    if rr >= mi_rows {
-                        break;
-                    }
-                    for c in 0..(num4x4_w << sub_x) {
-                        let cc = cand_col + c;
-                        if cc >= mi_cols {
-                            break;
-                        }
-                        if grid.ref_frames[(rr * mi_cols + cc) * 2] == INTRA_FRAME_REF0 {
-                            some_use_intra = true;
-                            break 'scan;
-                        }
-                    }
-                }
-
-                // §5.11.33 lines 5173-5178: on `someUseIntra` the
-                // prediction is split into `num4x4{W,H}` sub-blocks of
-                // 4 samples each, anchored at the unsubsampled
-                // `(MiRow, MiCol)` so each sub-block reads its own
-                // collocated luma candidate.
-                if some_use_intra {
-                    pred_w = num4x4_w * 4;
-                    pred_h = num4x4_h * 4;
-                    cand_row = mi_row;
-                    cand_col = mi_col;
-                }
-
-                // §5.11.33 lines 5179-5189: tile the
-                // `num4x4H*4 × num4x4W*4` plane region with
-                // `predW × predH` sub-blocks, advancing the candidate
-                // `(candRow + r, candCol + c)` per sub-block. Each
-                // sub-block's `predict_inter` reads `Mvs[cand][0]` /
-                // `RefFrames[cand][0]` at its own candidate cell (all
-                // cells of one leaf carry the leaf's stamped MV/ref, so
-                // on `someUseIntra == 0` this collapses to the single
-                // origin call the prior arm performed).
-                let region_w = num4x4_w * 4;
-                let region_h = num4x4_h * 4;
-                let mut r_idx = 0usize;
-                let mut y = 0usize;
-                while y < region_h {
-                    let mut c_idx = 0usize;
-                    let mut x = 0usize;
-                    while x < region_w {
-                        let cr = cand_row + r_idx;
-                        let cc = cand_col + c_idx;
-                        // Clamp the candidate to the grid; the leaf
-                        // stamped its MV/ref over the whole footprint,
-                        // so an off-edge candidate (only reachable when
-                        // the leaf is clipped at the frame boundary)
-                        // re-reads the nearest in-grid cell of the same
-                        // leaf.
-                        let cr = cr.min(mi_rows.saturating_sub(1));
-                        let cc = cc.min(mi_cols.saturating_sub(1));
-                        let cand = cr * mi_cols + cc;
-                        let mode_info = InterModeInfo {
-                            ref_frame: grid.ref_frames[cand * 2] as u8,
-                            mv: [grid.mvs[cand * 4], grid.mvs[cand * 4 + 1]],
-                        };
-
-                        match leaf_warp.as_ref() {
-                            Some(warp) => {
-                                reconstruct_inter_block_warp(
-                                    mode_info,
-                                    warp,
-                                    ref_frame_idx,
-                                    ctx.frame_store,
-                                    ctx.plane,
-                                    base_x + x as i32,
-                                    base_y + y as i32,
-                                    pred_w,
-                                    pred_h,
-                                    grid.bit_depth,
-                                    ctx.subsampling_x,
-                                    ctx.subsampling_y,
-                                    ctx.frame_width,
-                                    ctx.frame_height,
-                                    interp_x,
-                                    interp_y,
-                                    ctx.curr,
-                                    ctx.curr_stride,
-                                )?;
-                            }
-                            None => {
-                                reconstruct_inter_block(
-                                    mode_info,
-                                    ref_frame_idx,
-                                    ctx.frame_store,
-                                    ctx.plane,
-                                    base_x + x as i32,
-                                    base_y + y as i32,
-                                    pred_w,
-                                    pred_h,
-                                    grid.bit_depth,
-                                    ctx.subsampling_x,
-                                    ctx.subsampling_y,
-                                    ctx.frame_width,
-                                    ctx.frame_height,
-                                    interp_x,
-                                    interp_y,
-                                    ctx.curr,
-                                    ctx.curr_stride,
-                                )?;
-                            }
-                        }
-
-                        c_idx += 1;
-                        x += pred_w;
-                    }
-                    r_idx += 1;
-                    y += pred_h;
-                }
-            }
+            r_idx += 1;
+            y += pred_h;
         }
     }
 

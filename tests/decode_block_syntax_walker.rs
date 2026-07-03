@@ -2168,10 +2168,13 @@ fn read_var_tx_size_rejects_out_of_range() {
 /// Baseline §5.11.18 path: segmentation off, skip_mode_present off,
 /// allow_intrabc off, cdef_bits = 0, read_deltas off, no segmentation
 /// overrides. With the skip CDF rigged to symbol 0 and the is_inter
-/// CDF rigged to symbol 0, the walker reaches the §5.11.22 intra
-/// stub.
+/// CDF rigged to symbol 0, the dispatcher surfaces the §5.11.18
+/// prologue aggregate with `is_inter == 0` / `inter_block == None`
+/// and reads NO §5.11.22 bit (r387: the §5.11.5 inter arm owns the
+/// §5.11.22 composite; pre-r387 this arm was the
+/// `IntraBlockModeInfoUnsupported` stub).
 #[test]
-fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
+fn decode_inter_frame_mode_info_surfaces_intra_arm_prologue() {
     let mut walker = walker_n(16);
     let mut cdfs = TileCdfContext::new_from_defaults();
     // Skip CDF forces symbol 0 (skip = 0).
@@ -2239,10 +2242,11 @@ fn decode_inter_frame_mode_info_reaches_intra_block_stub() {
         &mfmvs,
     );
     let pos_after = dec.position();
-    assert_eq!(
-        result,
-        Err(Error::IntraBlockModeInfoUnsupported),
-        "is_inter = 0 ⇒ §5.11.22 intra_block_mode_info stub"
+    let info = result.expect("r387: §5.11.18 `is_inter == 0` arm surfaces the prologue aggregate");
+    assert_eq!(info.is_inter, 0, "the rigged §5.11.20 read decodes intra");
+    assert!(
+        info.inter_block.is_none(),
+        "no §5.11.23 aggregate on the intra arm"
     );
     assert!(
         pos_after > pos_before,
@@ -3683,6 +3687,124 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
     );
 }
 
+/// r387 in-walk §5.11.33 `compute_prediction()`: the same
+/// single-reference GLOBALMV leaf as
+/// [`r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream`],
+/// but with the reference-pixel state supplied on
+/// [`InterFrameContext::pixels`] — the §5.11.5 inter arm
+/// motion-compensates the leaf into `CurrFrame[0]` DURING
+/// `decode_block_syntax` (the spec's per-block `compute_prediction()`
+/// → `residual()` ordering), with no post-walk bridge call. The
+/// decoded pixels must equal the two-pass bridge result (here: the
+/// zero-MV integer-position EIGHTTAP copy of the reference window).
+#[test]
+fn r387_in_walk_inter_prediction_reconstructs_during_decode_block_syntax() {
+    use oxideav_av1::{InterWalkPixels, PlaneRefSpec, RefFrameStoreEntry, LAST_FRAME};
+
+    let mut walker = walker_n(2);
+    let mut cdfs = TileCdfContext::new_from_defaults();
+    // §5.11.11 skip = 1 ⇒ no residual reads; the in-walk MC is the
+    // only `CurrFrame[0]` writer, so the output is pure prediction.
+    cdfs.skip = [force_binary_cdf(1); SKIP_CONTEXTS];
+    let bytes = [0u8; 64];
+    let mut dec = SymbolDecoder::init_symbol(&bytes, 64, true).unwrap();
+    let lossless = [false; MAX_SEGMENTS];
+
+    // §7.11.3.3 reference frame — a distinct ramp so the copy is
+    // observable.
+    let ref_w: usize = 8;
+    let ref_h: usize = 8;
+    let mut refp = vec![0u16; ref_w * ref_h];
+    for r in 0..ref_h {
+        for c in 0..ref_w {
+            refp[r * ref_w + c] = (10 + r * 8 + c) as u16;
+        }
+    }
+    let entry = RefFrameStoreEntry {
+        plane: &refp[..],
+        stride: ref_w,
+        upscaled_width: ref_w as u32,
+        width: ref_w as u32,
+        height: ref_h as u32,
+    };
+    let store = [entry, entry, entry, entry, entry, entry, entry];
+    let ref_spec = PlaneRefSpec {
+        plane: 0,
+        subsampling_x: 0,
+        subsampling_y: 0,
+        frame_store: &store,
+        frame_width: ref_w as u32,
+        frame_height: ref_h as u32,
+    };
+    let plane_refs = [ref_spec];
+    let pixels = InterWalkPixels {
+        ref_frame_idx: [0, 1, 2, 3, 4, 5, 6],
+        bit_depth: 8,
+        plane_refs: &plane_refs,
+        order_hints: oxideav_av1::FrameInterOrderHints::IDENTITY,
+    };
+
+    let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
+    let mut ctx = InterFrameContext::identity_default(&mfmvs);
+    ctx.seg_globalmv_active = true;
+    ctx.pixels = Some(&pixels);
+
+    let db = walker
+        .decode_block_syntax(
+            &mut dec,
+            &mut cdfs,
+            0,
+            0,
+            BLOCK_8X8,
+            /* frame_is_intra = */ false,
+            /* subsampling_x = */ 0,
+            /* subsampling_y = */ 0,
+            /* num_planes = */ 3,
+            /* seg_id_pre_skip = */ false,
+            /* segmentation_enabled = */ false,
+            /* seg_skip_active = */ false,
+            /* last_active_seg_id = */ 0,
+            &lossless,
+            /* coded_lossless = */ false,
+            /* enable_cdef = */ true,
+            /* allow_intrabc = */ false,
+            /* cdef_bits = */ 0,
+            /* read_deltas = */ false,
+            /* use_128x128_superblock = */ false,
+            /* delta_q_res = */ 0,
+            /* delta_lf_multi = */ false,
+            /* delta_lf_multi = */ false,
+            /* mono_chrome = */ false,
+            /* delta_lf_res = */ 0,
+            /* allow_screen_content_tools = */ false,
+            /* enable_filter_intra = */ false,
+            /* bit_depth = */ 8,
+            /* tx_mode_select = */ false,
+            /* inter_ctx = */ Some(&ctx),
+            /* quant = */ &QuantizerParams::neutral(0, 8),
+            /* reduced_tx_set = */ false,
+        )
+        .expect("§5.11 inter syntax walk with in-walk prediction");
+    assert_eq!(db.is_inter, 1);
+    assert_eq!(db.ref_frame, [LAST_FRAME as i8, -1]);
+    assert_eq!(db.mv, [[0, 0], [0, 0]], "identity GLOBALMV ⇒ zero MV");
+
+    // No bridge call — the §5.11.33 in-walk prediction already wrote
+    // the MC pixels.
+    let (rows, cols) = walker.curr_frame_dims(0).unwrap();
+    assert_eq!((rows, cols), (8, 8));
+    let got: Vec<u16> = walker
+        .curr_frame(0)
+        .unwrap()
+        .iter()
+        .map(|&s| s as u16)
+        .collect();
+    assert_eq!(
+        got, refp,
+        "in-walk §5.11.33 prediction: zero-MV MC must copy the reference window into CurrFrame[0]"
+    );
+}
+
 /// Helper: force an `N`-symbol CDF (length `N + 1`, last slot = adapt
 /// count) to deterministically decode symbol `0`. The §8.2.6 search
 /// breaks at the first `symbol` whose `cur` falls at/below
@@ -4130,13 +4252,17 @@ fn r190_inter_frame_context_identity_default_matches_spec_identity_warp() {
     assert_eq!(ctx.interpolation_filter, 0 /* EIGHTTAP */);
 }
 
-/// r190: `DecodedInterFrameModeInfo::inter_block` is `None` on the
-/// §5.11.22 intra-arm path (when `is_inter == 0` inside an inter
-/// frame). Test the §5.11.18 dispatcher returns
-/// `Err(IntraBlockModeInfoUnsupported)` on the `is_inter == 0` arm
-/// (unchanged by r190 since the §5.11.22 stub is still upstream).
+/// r387: the §5.11.18 `is_inter == 0` arm inside an inter frame runs
+/// the §5.11.22 `intra_block_mode_info()` composite to completion
+/// through `decode_block_syntax` — `y_mode` against
+/// `TileYModeCdf[ Size_Group[ MiSize ] ]`, then the shared
+/// `intra_angle_info_y` / `uv_mode` / palette / filter-intra tail,
+/// `read_block_tx_size` (intra arm), and the §5.11.34 `residual()`
+/// walk. The returned [`DecodedBlock`] carries the §5.11.22 line-1
+/// `RefFrame = [ INTRA_FRAME, NONE ]` pair and `is_inter == 0`.
+/// (Pre-r387 this path was the `IntraBlockModeInfoUnsupported` stub.)
 #[test]
-fn r190_decoded_inter_frame_mode_info_intra_arm_still_stubs() {
+fn r387_decode_block_syntax_runs_intra_in_inter_arm_to_completion() {
     let mut walker = walker_n(16);
     let mut cdfs = TileCdfContext::new_from_defaults();
     // Skip CDF off; segmentation off; is_inter forced to 0 via the
@@ -4187,11 +4313,23 @@ fn r190_decoded_inter_frame_mode_info_intra_arm_still_stubs() {
         /* quant = */ &oxideav_av1::QuantizerParams::neutral(0, 8),
         /* reduced_tx_set = */ false,
     );
+    let db = result.expect("r387: the §5.11.22 intra-in-inter arm decodes to completion");
+    assert_eq!(db.is_inter, 0, "the rigged §5.11.20 read decodes intra");
     assert_eq!(
-        result,
-        Err(Error::IntraBlockModeInfoUnsupported),
-        "r190: §5.11.18 `is_inter == 0` arm still stubs at §5.11.22 (next-arc target)"
+        db.ref_frame,
+        [0, -1],
+        "§5.11.22 line 1: RefFrame = [ INTRA_FRAME, NONE ]"
     );
+    assert!(!db.is_compound && !db.is_inter_intra);
+    // §5.11.5 grid stamps: the block's footprint carries is_inter = 0
+    // and the §5.11.22-decoded YMode.
+    let mi_cols = walker.mi_cols() as usize;
+    for r in 0..2 {
+        for c in 0..2 {
+            assert_eq!(walker.is_inters()[r * mi_cols + c], 0);
+            assert_eq!(walker.y_modes()[r * mi_cols + c], db.y_mode);
+        }
+    }
 }
 
 // ===================================================================
