@@ -4,6 +4,60 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/OxideAV/oxideav-av1/compare/v0.1.13...v0.1.14) - 2026-07-03
+
+### Other
+
+- av1 r384: document the conformance-validated intra decoder (README + CHANGELOG + driver doc)
+- av1 decoder r384: multi-tile decode + §5.11.49 palette-cache tile gate — every intra corpus stream byte-exact (10 of 13)
+- av1 decoder r384: §7.16 superres in the spec driver + mi-padded in-loop chain — super-resolution byte-exact (9 of 13 corpus streams)
+- av1 decoder r384: read_lr tile interleave + §7.17 LR pass + V/H angle-delta directional fix — 8 corpus streams byte-exact
+- av1 decoder r384: §7.12.3 compact-tw dequant layout + §7.4 deblock gate — CDEF-active fixtures byte-exact
+- av1 decoder r384: §5.11.35 in-walk palette prediction + chroma CfL dispatch — lossless + screen-content fixtures byte-exact
+- av1 decoder r384: fix §5.11.39 all_zero/transform_type order + spec frame driver — first byte-exact external-stream decode
+- av1 r381: document the single-reference P-frame inter encoder (README + CHANGELOG)
+- av1 encoder r381: 4:2:0 YUV single-reference P-frame encode + chroma frame-walk round-trip
+- av1 encoder r381: §7.11.3.1 sub-pel motion refinement + sub-pel frame round-trip
+- av1 encoder r381: frame-scope single-reference P-frame luma encode + decoder frame-walk round-trip
+- av1 encoder r381: §7.11.3.1 single-reference inter MC + residual leaf + integer-pel motion estimate
+- av1 r378: OBMC frame-walk top-left no-neighbour edge test
+- av1 r378: 4:2:0 multiplane OBMC frame-walk dispatch test
+- av1 r378: §7.14.4 per-mi DeltaLFs snapshot for delta_lf_present == 1
+- av1 r378: §7.11.3.9-10 OBMC frame-walk dispatch (§5.11.33)
+- av1 decoder r373: superres post-processing hardening tests + README/CHANGELOG rollup
+- av1 decoder r373: wire §7.16 superres horizontal upscaling into the public dyn decode path
+- av1 decoder r373: wire §7.18.3 film-grain synthesis into the public dyn decode path
+- av1 decoder r367: wire §7.11.2.3 recursive intra (filter-intra) luma path
+- av1 decoder r367: wire §7.11.5 chroma-from-luma (CfL) AC into the walker
+- av1 decoder r363: test the §7.11.2.11 intra edge upsample path in the directional pre-pass
+- av1 decoder r363: stamp §5.11.22 UVModes[] grid for spec-correct §7.11.2.8 chroma get_filter_type
+- av1 decoder r363: wire §7.11.2.4 step-4 directional intra edge-filter + upsample pre-pass into the §5.11 walker
+- av1 README/CHANGELOG r359: document the §5.11.33 frame-walk compound + inter-intra side-data path
+- av1 decoder r359: end-to-end inter-intra frame-walk test driven by the stamped §5.11.28 mode grid
+- av1 decoder r359: stamp §5.11.27/28/29 inter side-data grids + thread them through the §5.11.33 frame walk
+- av1 decoder r355: broaden §7.11.3.9 OBMC walker-bridge test coverage
+- av1 decoder r355: wire §7.11.3.9-10 OBMC into the reconstruction surface
+- av1 README/CHANGELOG r349: document the §7.14 deblock bridge + in-loop filter trio
+- av1 decoder r349: §7.14.2 isTxEdge gating test through the deblock bridge
+- av1 decoder r349: end-to-end §7.4 in-loop filter chain test (deblock→CDEF→LR)
+- av1 decoder r349: §7.14 deblock bridge loop_filter_frame_from_grid from walker grids
+- av1 README r346: document the §5.11.33 frame-scope inter reconstruction path
+- av1 decoder r346: frame-scope multi-leaf sub-pel inter reconstruction test
+- av1 decoder r346: end-to-end two-pass inter decode integration test
+- av1 decoder r346: §5.11.33 frame-scope inter reconstruction bridge from walker grids
+- neutralise external-encoder naming in README intra-recon note
+- av1 README r342: document the §5.11 syntax-walker intra reconstruction path
+- av1 decoder r342: neighbour-propagation coverage for §7.11.2.1 intra reconstruction
+- av1 decoder r342: §5.11.2 decode_tile() superblock loop — drive the whole tile partition walk into CurrFrame
+- av1 decoder r342: §7.11.2.1 intra prediction into CurrFrame — wire predict_intra ahead of the §7.13 reconstruct in the §5.11.5 walker
+- av1 decoder r338: PartitionWalker warped-motion bridge reconstruct_inter_block_warp_into_curr_frame
+- av1 decoder r338: wire §7.11.3.5 warped-motion into the §5.11.33 single-ref frame walk
+- av1 decoder r338: §7.11.3.1 warped-motion reconstruction bridge reconstruct_inter_block_warp
+- av1 decoder r334: §5.11.35 walker bridge drives §7.11.4 predict_palette across a palette block into CurrFrame[plane]
+- av1 decoder r330: §7.11.4 palette prediction process predict_palette
+- av1 decoder r325: surface §5.11.49 ColorMapY/ColorMapUV on §5.11.5 walker DecodedBlock
+- av1 registry: wire RuntimeContext entry point (intra-only Decoder + container tags)
+
 ### Other
 
 - av1 decoder r384: **conformance-validated intra decode** — the new spec-faithful frame driver (`decoder::decode_av1_spec` / `decode_frame_spec`, `src/decoder/frame_driver.rs`) decodes **every intra-only stream in the independent conformance corpus byte-identical to a third-party decoder's output** (10 of 13 streams under `docs/video/av1/fixtures/`, both external tools used strictly as opaque black boxes; the remaining 3 contain inter frames). The driver composes: IVF + §7.5 OBU walk (incl. the combined §5.10 `OBU_FRAME` split via `FrameHeader::bits_consumed`), §5.9 derived state (`CodedLossless`/`LosslessArray`, segmentation `SEG_LVL_ALT_Q`, delta-q/lf, cdef/lr/tx-mode), per-tile §8.2.2 `init_symbol` + §8.3.1 CDF init (defaults + the q-context coefficient slice via `init_coeff_cdfs`), the §5.11.2 tile walk with the new §5.11.57 `read_lr` interleave (`decode_tile_syntax_with_lr`) and per-tile `begin_tile` resets (geometry + left entropy contexts + DeltaLF + LR references) plus the §5.11.2 per-superblock-row `clear_left_context`, and the §7.4 post-pass chain on **mi-grid-padded** planes: §7.14 deblock (invoked only when a luma filter level is nonzero, per §7.4 step 1), §7.15 CDEF, §7.16 superres (upscaling both the CDEF output and the post-deblock frame; `upscale_plane` now accepts the padded input so the `Clip3(0, miW*MI_SIZE-1, ..)` clamp reads real decoded padding), §7.17 loop restoration at the upscaled extent, the §7.18.2 crop, and §7.18.3 film grain. `tests/fixture_conformance.rs` pins the 10 streams (inputs embedded as hex; expected planes embedded raw/RLE or pinned by the corpus SHA-256 via an in-test FIPS 180-4 implementation with self-check): tiny 16×16, lossless+palette, 256×128 screen-content, CDEF-active gradient, monochrome, two-frame film-grain, SGRPROJ-restoration, 128×128-superblock SWITCHABLE-restoration with real deblocking, superres at a non-mi-aligned width, and a two-tile frame.
