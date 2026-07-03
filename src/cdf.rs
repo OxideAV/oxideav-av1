@@ -28051,9 +28051,21 @@ impl PartitionWalker {
                 // golomb_length_bit L(1) loop: `length` = position of
                 // the first 1-bit (1-indexed). The first iteration is
                 // always entered (do-while), so length >= 1.
+                //
+                // Robustness cap: a corrupt / truncated payload leaves
+                // the §8.2.2 arithmetic decoder emitting zero bits
+                // forever, so an uncapped do-while never terminates
+                // (and `length` / the `x << 1` chain below overflow).
+                // 30 bits keeps every conformant magnitude reachable
+                // (`x < 1 << 30` still exceeds anything §7.12.2's
+                // dequant clamp can pass through) while bounding the
+                // walk.
                 let mut length: u32 = 0;
                 loop {
                     length += 1;
+                    if length > 30 {
+                        return Err(crate::Error::GolombLengthOverflow);
+                    }
                     let bit = decoder.read_literal(1)?;
                     if bit != 0 {
                         break;

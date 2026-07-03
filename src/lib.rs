@@ -2319,6 +2319,18 @@ pub enum Error {
     /// in `docs/video/av1/fixtures/issue_796/msac-trace.md` — the
     /// "Invariants observed across all 256 rows" section.
     SymbolStateInvariantBroken,
+    /// The §5.11.39 lines 84-93 golomb chain (`golomb_length_bit` /
+    /// `golomb_data_bit`) produced a `length` beyond 30 bits.
+    ///
+    /// A conformant stream's coefficient magnitudes are bounded far
+    /// below `1 << 30` (§7.12.2 clamps every dequantized value into
+    /// the signed pixel-domain range), so `length > 30` can only
+    /// arise from a corrupt / adversarial stream — typically one
+    /// whose payload ends mid-chain, leaving the §8.2.2 arithmetic
+    /// decoder reading the infinite zero-bit tail. Without this cap
+    /// the `do { length++ } while ( !golomb_length_bit )` loop of
+    /// §5.11.39 never terminates.
+    GolombLengthOverflow,
 }
 
 impl core::fmt::Display for Error {
@@ -2453,6 +2465,10 @@ impl core::fmt::Display for Error {
             Self::SymbolStateInvariantBroken => write!(
                 f,
                 "oxideav-av1: §8.2.6 post-renorm invariant broken (SymbolRange not in [32768, 65535], or SymbolValue >= SymbolRange)"
+            ),
+            Self::GolombLengthOverflow => write!(
+                f,
+                "oxideav-av1: §5.11.39 golomb_length_bit chain exceeded 30 bits — corrupt or truncated coefficient data"
             ),
         }
     }
