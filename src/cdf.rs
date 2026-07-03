@@ -15696,6 +15696,19 @@ pub struct PartitionWalker {
     /// sample units; `0` on a fresh walker (no luma TU emitted yet).
     max_luma_w: u32,
     max_luma_h: u32,
+    /// Per-block §5.11.35 palette-prediction state — `PaletteSizeY` /
+    /// `PaletteSizeUV` plus the §5.11.49 decoded `ColorMapY` /
+    /// `ColorMapUV` for the block currently being decoded. Set by
+    /// [`Self::decode_block_syntax`] between the §5.11.49
+    /// `palette_tokens()` read and the §5.11.34 `residual()` call so
+    /// the per-TU `transform_block` dispatch can run the §5.11.35
+    /// `predict_palette` arm; reset (`0` / `None`) at every block
+    /// entry. The maps are handed back to the block's
+    /// [`DecodedBlock`] after `residual()` returns.
+    current_palette_size_y: u8,
+    current_palette_size_uv: u8,
+    current_color_map_y: Option<DecodedPaletteMap>,
+    current_color_map_uv: Option<DecodedPaletteMap>,
 }
 
 /// Per-plane `CurrFrame[plane]` sample buffer — owned `(rows, cols,
@@ -16152,6 +16165,12 @@ impl PartitionWalker {
             // until the first plane-0 transform-block emit.
             max_luma_w: 0,
             max_luma_h: 0,
+            // §5.11.35 per-block palette-prediction state — reset at
+            // every `decode_block_syntax` entry.
+            current_palette_size_y: 0,
+            current_palette_size_uv: 0,
+            current_color_map_y: None,
+            current_color_map_uv: None,
         })
     }
 
@@ -17920,6 +17939,97 @@ impl PartitionWalker {
                 x += step_x;
             }
             y += step_y;
+        }
+        Ok(())
+    }
+
+    /// §5.11.35 `predict_palette( plane, startX, startY, x, y, txSz )`
+    /// for ONE transform block of the block currently being decoded —
+    /// the in-walk §7.11.4 palette-prediction arm the per-TU
+    /// [`Self::transform_block_emit`] dispatch runs when
+    /// `PaletteSize{Y,UV} > 0` (av1-spec p.85 lines 5273-5274).
+    ///
+    /// Reads the §5.11.46 colour table from the walker's stamped
+    /// `PaletteColors[plane][MiRow][MiCol]` grid and the §5.11.49
+    /// colour-index map from the per-block
+    /// [`Self::current_color_map_y`] / [`Self::current_color_map_uv`]
+    /// state [`Self::decode_block_syntax`] parked before invoking
+    /// `residual()`, then writes `palette[ map[ y*4 + i ][ x*4 + j ] ]`
+    /// over the TU's `Tx_Width × Tx_Height` footprint into
+    /// `CurrFrame[plane]` (clipping any right/bottom frame-edge
+    /// overhang). `(x, y)` are the §5.11.34 TU indices in 4×4 units
+    /// relative to the block origin — palette-coded blocks are capped
+    /// at `BLOCK_64X64` (§5.11.46), so the §5.11.34 chunk fold never
+    /// applies to them.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_palette_tu_into_curr_frame(
+        &mut self,
+        plane: u8,
+        start_x: u32,
+        start_y: u32,
+        x: u32,
+        y: u32,
+        tx_sz: usize,
+        mi_row: u32,
+        mi_col: u32,
+        sub_x: u8,
+        sub_y: u8,
+    ) -> Result<(), crate::Error> {
+        let plane_us = plane as usize;
+        if plane_us >= 3 || tx_sz >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let palette_size = if plane == 0 {
+            self.current_palette_size_y
+        } else {
+            self.current_palette_size_uv
+        } as usize;
+        if palette_size == 0 || palette_size > PALETTE_COLORS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.46 `palette = palette_colors_{y,u,v}[ 0..PaletteSize ]`
+        // from the walker's grid at the block anchor (plane 1 / plane 2
+        // read their own colour tables; both share `ColorMapUV`).
+        let mut palette: [u16; PALETTE_COLORS] = [0; PALETTE_COLORS];
+        for (idx, slot) in palette.iter_mut().enumerate().take(palette_size) {
+            *slot = self.palette_color_at(plane_us, mi_row as i32, mi_col as i32, idx);
+        }
+        let w = TX_WIDTH[tx_sz];
+        let h = TX_HEIGHT[tx_sz];
+        let mut pred = vec![0u16; w * h];
+        {
+            let map = if plane == 0 {
+                self.current_color_map_y.as_ref()
+            } else {
+                self.current_color_map_uv.as_ref()
+            }
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            crate::predict_palette(
+                tx_sz,
+                x as usize,
+                y as usize,
+                &map.data,
+                map.stride,
+                &palette[..palette_size],
+                &mut pred,
+            )?;
+        }
+        // Stitch into CurrFrame[plane], clipping frame-edge overhang.
+        let max_x = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+        let max_y = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+        self.ensure_curr_frame_plane(plane_us, max_y, max_x);
+        let Some(cp) = self.curr_frame[plane_us].as_mut() else {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        };
+        let buf_cols = cp.cols as usize;
+        let copy_w = (max_x.saturating_sub(start_x) as usize).min(w);
+        let copy_h = (max_y.saturating_sub(start_y) as usize).min(h);
+        for i in 0..copy_h {
+            let dst = (start_y as usize + i) * buf_cols + start_x as usize;
+            let src = i * w;
+            for j in 0..copy_w {
+                cp.samples[dst + j] = pred[src + j] as i32;
+            }
         }
         Ok(())
     }
@@ -28193,6 +28303,14 @@ impl PartitionWalker {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
 
+        // Reset the per-block §5.11.35 palette-prediction state — a
+        // previous palette block's sizes / maps must never leak into
+        // this block's `transform_block` dispatch.
+        self.current_palette_size_y = 0;
+        self.current_palette_size_uv = 0;
+        self.current_color_map_y = None;
+        self.current_color_map_uv = None;
+
         // §5.11.5 lines 1-3: `MiRow = r`, `MiCol = c`, `MiSize =
         // subSize`. We surface these as fields of the returned
         // `DecodedBlock` rather than mutating any shared state — the
@@ -28619,6 +28737,16 @@ impl PartitionWalker {
                 onscreen_h: args.onscreen_h,
             });
         }
+
+        // Hand the palette sizes + decoded maps to the §5.11.34
+        // `residual()` dispatch (below) so its per-TU §5.11.35
+        // `transform_block` runs the `predict_palette` arm on this
+        // block's palette planes. The maps are cloned — the originals
+        // ride the returned [`DecodedBlock`] unchanged.
+        self.current_palette_size_y = palette_size_y;
+        self.current_palette_size_uv = palette_size_uv;
+        self.current_color_map_y = color_map_y.clone();
+        self.current_color_map_uv = color_map_uv.clone();
 
         // §5.11.5 line `read_block_tx_size( )` — §5.11.16 reader. The
         // walker has completed the §5.11.5 prologue + §5.11.6
@@ -29572,13 +29700,20 @@ impl PartitionWalker {
             // (DC) + §7.11.2.4 (the two step-10/step-11 degenerate cases
             // V_PRED / H_PRED plus the six step-7/8/9 D-modes via
             // [`predict_intra_d_mode`]) + §7.11.2.6 (all three SMOOTH
-            // arms) + §7.11.2.2 (PAETH). With r188 the
-            // `ComputePredictionIntraModeUnsupported` error is reachable
-            // only on a caller-bug `plane_mode >= INTRA_MODES` (caught
-            // by the bounds guard above) — i.e. no intra mode legally
-            // emitted by the §5.11.7 / §5.11.22 readers should ever
-            // produce it.
-            let supported = (plane_mode as usize) < INTRA_MODES;
+            // arms) + §7.11.2.2 (PAETH).
+            //
+            // r384: `UV_CFL_PRED == 13` is additionally admitted on the
+            // CHROMA planes (`plane > 0`) — the §5.11.22 `uv_mode`
+            // reader legally emits it whenever CFL is allowed, and the
+            // §5.11.35 per-TU emitter reconstructs it as the §7.11.2
+            // `DC_PRED` base plus the §7.11.5 luma-AC contribution. The
+            // dispatcher forwards the `UV_CFL_PRED` ordinal on the task
+            // so a consumer can apply the same two-stage rendering. On
+            // the luma plane (`plane == 0`) the ordinal remains a caller
+            // bug (`ComputePredictionIntraModeUnsupported`) — the
+            // §5.11.7 y-mode alphabet caps at `INTRA_MODES`.
+            let supported = (plane_mode as usize) < INTRA_MODES
+                || (plane > 0 && plane_mode as usize == UV_CFL_PRED);
             if !supported {
                 return Err(crate::Error::ComputePredictionIntraModeUnsupported);
             }
@@ -30340,129 +30475,144 @@ impl PartitionWalker {
         // on top. The non-palette / non-CfL / non-filter-intra arm is
         // covered here; palette / CfL / filter-intra route elsewhere.
         if !is_inter && ctx.is_intra {
-            // §5.11.35 lines 5-9 superblock-local anchor (mirrors the
-            // BlockDecoded stamp at the function tail).
-            let row_anchor = (start_y << sub_y) >> MI_SIZE_LOG2;
-            let col_anchor = (start_x << sub_x) >> MI_SIZE_LOG2;
-            let sb_mask: u32 = if use_128x128_superblock { 31 } else { 15 };
-            let sub_block_mi_row = (row_anchor & sb_mask) as i32;
-            let sub_block_mi_col = (col_anchor & sb_mask) as i32;
-            let step_x4 = (TX_WIDTH[tx_sz] >> MI_SIZE_LOG2) as i32;
-            let step_y4 = (TX_HEIGHT[tx_sz] >> MI_SIZE_LOG2) as i32;
-            let base_row = sub_block_mi_row >> sub_y;
-            let base_col = sub_block_mi_col >> sub_x;
-            // §7.11.2.1 `haveAboveRight` / `haveBelowLeft` reads
-            // (av1-spec p.85, lines 5287-5292).
-            let have_above_right =
-                Self::block_decoded_slot(plane as usize, base_row - 1, base_col + step_x4)
-                    .map(|s| self.block_decoded[s] != 0)
-                    .unwrap_or(false);
-            let have_below_left =
-                Self::block_decoded_slot(plane as usize, base_row + step_y4, base_col - 1)
-                    .map(|s| self.block_decoded[s] != 0)
-                    .unwrap_or(false);
-            // §5.11.35 `haveLeft` / `haveAbove` (lines 5285-5286):
-            // `(plane==0 ? AvailL : AvailLChroma) || x > 0`.
-            let (avail_l, avail_u) = if plane == 0 {
-                (ctx.avail_l, ctx.avail_u)
+            // §5.11.35 palette arm: `if ( ( plane == 0 && PaletteSizeY )
+            // || ( plane != 0 && PaletteSizeUV ) ) predict_palette(...)`
+            // — a palette-coded plane takes the §7.11.4 sample write
+            // instead of the §7.11.2 intra prediction (av1-spec p.85).
+            let tu_palette_size = if plane == 0 {
+                self.current_palette_size_y
             } else {
-                (ctx.avail_l_chroma, ctx.avail_u_chroma)
+                self.current_palette_size_uv
             };
-            let have_left = avail_l || x > 0;
-            let have_above = avail_u || y > 0;
-            // §5.11.35 lines 5276-5280: `isCfl = (plane > 0 && UVMode ==
-            // UV_CFL_PRED)`; `mode = (plane == 0) ? YMode : (isCfl ?
-            // DC_PRED : UVMode)`. The CfL chroma block first runs the
-            // §7.11.2 `DC_PRED` base here, then the §7.11.5
-            // `predict_chroma_from_luma` AC contribution (below) layers
-            // the reconstructed-luma high frequencies on top.
-            let is_cfl = plane > 0 && ctx.uv_mode as usize == UV_CFL_PRED;
-            let (mode, angle_delta) = if plane == 0 {
-                (ctx.y_mode as usize, ctx.angle_delta_y as i32)
-            } else if is_cfl {
-                (DC_PRED, 0)
+            if tu_palette_size > 0 {
+                self.predict_palette_tu_into_curr_frame(
+                    plane, start_x, start_y, x, y, tx_sz, mi_row, mi_col, sub_x, sub_y,
+                )?;
             } else {
-                (ctx.uv_mode as usize, ctx.angle_delta_uv as i32)
-            };
-            // §7.11.2.4 step-4 inputs: `enable_intra_edge_filter` is
-            // frame-scope (cached on `ctx`); `filterType` is the
-            // §7.11.2.8 `get_filter_type( plane )` neighbour smooth-mode
-            // check. Both planes are now covered: luma reads the §6.10.4
-            // `YModes[]` grid, chroma reads `UVModes[]` at the §7.11.2.8
-            // sub-sampled neighbour coordinates. The §7.11.2.8 lookup
-            // uses block-level availability (`AvailU` / `AvailL` for
-            // luma, `AvailUChroma` / `AvailLChroma` for chroma), not the
-            // `|| x > 0` chunk-extended `haveAbove` / `haveLeft`.
-            let (avail_u_block, avail_l_block) = if plane == 0 {
-                (ctx.avail_u, ctx.avail_l)
-            } else {
-                (ctx.avail_u_chroma, ctx.avail_l_chroma)
-            };
-            let filter_type = self.get_filter_type(
-                plane,
-                mi_row,
-                mi_col,
-                avail_u_block,
-                avail_l_block,
-                sub_x,
-                sub_y,
-            );
-            let eief = ctx.enable_intra_edge_filter;
-            // §7.11.2.1 first dispatch arm — `use_filter_intra` is
-            // luma-only (`plane == 0`). `ctx.filter_intra_mode` is
-            // `Some(mode)` only when the block decoded `use_filter_intra
-            // == 1`; pass it through for plane 0 so
-            // [`Self::predict_intra_into_curr_frame`] routes to the
-            // §7.11.2.3 recursive process, and `None` for chroma.
-            let fi_mode = if plane == 0 {
-                ctx.filter_intra_mode.map(|m| m as usize)
-            } else {
-                None
-            };
-            self.predict_intra_into_curr_frame(
-                plane,
-                start_x,
-                start_y,
-                tx_sz,
-                mode,
-                angle_delta,
-                ctx.quant.bit_depth,
-                sub_x,
-                sub_y,
-                have_above,
-                have_left,
-                have_above_right,
-                have_below_left,
-                eief,
-                filter_type,
-                fi_mode,
-            );
-
-            // §5.11.35 line `if ( isCfl ) predict_chroma_from_luma(...)`
-            // (av1-spec p.85, line 5296) — the §7.11.5 chroma-from-luma
-            // process runs **after** the chroma DC base above, reading
-            // the already-reconstructed luma plane (which was walked
-            // first by the §5.11.34 plane loop) and adding the
-            // alpha-scaled luma high frequencies on top of `DC_PRED`.
-            // `CflAlphaU` / `CflAlphaV` are the §5.11.45-decoded signed
-            // magnitudes carried on `ctx`.
-            if is_cfl {
-                let alpha = if plane == 1 {
-                    ctx.cfl_alpha_u as i32
+                // §5.11.35 lines 5-9 superblock-local anchor (mirrors the
+                // BlockDecoded stamp at the function tail).
+                let row_anchor = (start_y << sub_y) >> MI_SIZE_LOG2;
+                let col_anchor = (start_x << sub_x) >> MI_SIZE_LOG2;
+                let sb_mask: u32 = if use_128x128_superblock { 31 } else { 15 };
+                let sub_block_mi_row = (row_anchor & sb_mask) as i32;
+                let sub_block_mi_col = (col_anchor & sb_mask) as i32;
+                let step_x4 = (TX_WIDTH[tx_sz] >> MI_SIZE_LOG2) as i32;
+                let step_y4 = (TX_HEIGHT[tx_sz] >> MI_SIZE_LOG2) as i32;
+                let base_row = sub_block_mi_row >> sub_y;
+                let base_col = sub_block_mi_col >> sub_x;
+                // §7.11.2.1 `haveAboveRight` / `haveBelowLeft` reads
+                // (av1-spec p.85, lines 5287-5292).
+                let have_above_right =
+                    Self::block_decoded_slot(plane as usize, base_row - 1, base_col + step_x4)
+                        .map(|s| self.block_decoded[s] != 0)
+                        .unwrap_or(false);
+                let have_below_left =
+                    Self::block_decoded_slot(plane as usize, base_row + step_y4, base_col - 1)
+                        .map(|s| self.block_decoded[s] != 0)
+                        .unwrap_or(false);
+                // §5.11.35 `haveLeft` / `haveAbove` (lines 5285-5286):
+                // `(plane==0 ? AvailL : AvailLChroma) || x > 0`.
+                let (avail_l, avail_u) = if plane == 0 {
+                    (ctx.avail_l, ctx.avail_u)
                 } else {
-                    ctx.cfl_alpha_v as i32
+                    (ctx.avail_l_chroma, ctx.avail_u_chroma)
                 };
-                self.predict_chroma_from_luma_into_curr_frame(
+                let have_left = avail_l || x > 0;
+                let have_above = avail_u || y > 0;
+                // §5.11.35 lines 5276-5280: `isCfl = (plane > 0 && UVMode ==
+                // UV_CFL_PRED)`; `mode = (plane == 0) ? YMode : (isCfl ?
+                // DC_PRED : UVMode)`. The CfL chroma block first runs the
+                // §7.11.2 `DC_PRED` base here, then the §7.11.5
+                // `predict_chroma_from_luma` AC contribution (below) layers
+                // the reconstructed-luma high frequencies on top.
+                let is_cfl = plane > 0 && ctx.uv_mode as usize == UV_CFL_PRED;
+                let (mode, angle_delta) = if plane == 0 {
+                    (ctx.y_mode as usize, ctx.angle_delta_y as i32)
+                } else if is_cfl {
+                    (DC_PRED, 0)
+                } else {
+                    (ctx.uv_mode as usize, ctx.angle_delta_uv as i32)
+                };
+                // §7.11.2.4 step-4 inputs: `enable_intra_edge_filter` is
+                // frame-scope (cached on `ctx`); `filterType` is the
+                // §7.11.2.8 `get_filter_type( plane )` neighbour smooth-mode
+                // check. Both planes are now covered: luma reads the §6.10.4
+                // `YModes[]` grid, chroma reads `UVModes[]` at the §7.11.2.8
+                // sub-sampled neighbour coordinates. The §7.11.2.8 lookup
+                // uses block-level availability (`AvailU` / `AvailL` for
+                // luma, `AvailUChroma` / `AvailLChroma` for chroma), not the
+                // `|| x > 0` chunk-extended `haveAbove` / `haveLeft`.
+                let (avail_u_block, avail_l_block) = if plane == 0 {
+                    (ctx.avail_u, ctx.avail_l)
+                } else {
+                    (ctx.avail_u_chroma, ctx.avail_l_chroma)
+                };
+                let filter_type = self.get_filter_type(
+                    plane,
+                    mi_row,
+                    mi_col,
+                    avail_u_block,
+                    avail_l_block,
+                    sub_x,
+                    sub_y,
+                );
+                let eief = ctx.enable_intra_edge_filter;
+                // §7.11.2.1 first dispatch arm — `use_filter_intra` is
+                // luma-only (`plane == 0`). `ctx.filter_intra_mode` is
+                // `Some(mode)` only when the block decoded `use_filter_intra
+                // == 1`; pass it through for plane 0 so
+                // [`Self::predict_intra_into_curr_frame`] routes to the
+                // §7.11.2.3 recursive process, and `None` for chroma.
+                let fi_mode = if plane == 0 {
+                    ctx.filter_intra_mode.map(|m| m as usize)
+                } else {
+                    None
+                };
+                self.predict_intra_into_curr_frame(
                     plane,
                     start_x,
                     start_y,
                     tx_sz,
+                    mode,
+                    angle_delta,
+                    ctx.quant.bit_depth,
                     sub_x,
                     sub_y,
-                    alpha,
-                    ctx.quant.bit_depth,
+                    have_above,
+                    have_left,
+                    have_above_right,
+                    have_below_left,
+                    eief,
+                    filter_type,
+                    fi_mode,
                 );
-            }
+
+                // §5.11.35 line `if ( isCfl ) predict_chroma_from_luma(...)`
+                // (av1-spec p.85, line 5296) — the §7.11.5 chroma-from-luma
+                // process runs **after** the chroma DC base above, reading
+                // the already-reconstructed luma plane (which was walked
+                // first by the §5.11.34 plane loop) and adding the
+                // alpha-scaled luma high frequencies on top of `DC_PRED`.
+                // `CflAlphaU` / `CflAlphaV` are the §5.11.45-decoded signed
+                // magnitudes carried on `ctx`.
+                if is_cfl {
+                    let alpha = if plane == 1 {
+                        ctx.cfl_alpha_u as i32
+                    } else {
+                        ctx.cfl_alpha_v as i32
+                    };
+                    self.predict_chroma_from_luma_into_curr_frame(
+                        plane,
+                        start_x,
+                        start_y,
+                        tx_sz,
+                        sub_x,
+                        sub_y,
+                        alpha,
+                        ctx.quant.bit_depth,
+                    );
+                }
+            } // end of the §5.11.35 non-palette (predict_intra) arm
 
             // §5.11.35 lines 5300-5302: `if ( plane == 0 ) { MaxLumaW =
             // startX + stepX * 4; MaxLumaH = startY + stepY * 4 }`. The
