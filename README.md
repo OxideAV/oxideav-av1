@@ -9,13 +9,24 @@ framework.
 
 Clean-room rebuild in progress. The bitstream-syntax and header layers
 are broadly complete (OBU framing, sequence header, full
-uncompressed-frame-header syntax tree, tile info), and — as of r384 —
-**every intra-only stream in the independent conformance corpus decodes
-to pixels byte-identical to a third-party decoder's output** (10 of the
-13 corpus streams; the remaining 3 contain inter frames). Inter-frame
-decode and reference-frame management are not yet covered.
+uncompressed-frame-header syntax tree, tile info), and — as of r387 —
+**11 of the 13 independent conformance-corpus streams decode to pixels
+byte-identical to a third-party decoder's output**, now including the
+first INTER (KEY + P) stream. The r387 inter-frame decode driver adds
+the §7.20 reference-frame store (per-slot pre-grain planes + saved
+MV/ref-frame grids + `RefInfo` bookkeeping), frame-header parsing
+against the live reference state, in-walk §5.11.33 `predict_inter`
+(each inter leaf motion-compensates into `CurrFrame` between
+`mode_info()` and `residual()`, per the spec's per-block
+`compute_prediction()` ordering), the §5.11.22 intra-in-inter arm, the
+§5.11.27 LOCALWARP in-walk fit (§7.10.4 CandList retention +
+§7.11.3.8 least-squares estimation), and `show_existing_frame` /
+show-frame output discipline. The 2 remaining streams need
+`primary_ref_frame` CDF forwarding + §7.9 temporal MV projection
+(`show-existing-frame`) and an inter-residual entropy divergence fix
+(`obu-with-extension-headers`, first non-skip var-tx inter leaf).
 
-### Conformance-validated decode (r384)
+### Conformance-validated decode (r384 intra, r387 inter)
 
 `decoder::decode_av1_spec(ivf_bytes) -> Vec<SpecFrame>` is the
 spec-faithful frame driver: IVF + §7.5 OBU walk (including the combined
