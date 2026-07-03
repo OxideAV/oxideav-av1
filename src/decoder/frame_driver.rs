@@ -302,8 +302,16 @@ pub fn decode_frame_spec(
     }
 
     // ---- §7.4 in-loop passes: §7.14 deblock, then §7.15 CDEF. ----
+    // §7.4 step 1: the loop filter is invoked ONLY when
+    // `loop_filter_level[ 0 ] != 0 || loop_filter_level[ 1 ] != 0` —
+    // with both luma levels zero the frame is NOT deblocked at all,
+    // even though the §7.14.4 `loop_filter_delta_enabled` ref-delta
+    // path could otherwise lift a per-edge strength above zero.
     if let Some(lf) = fh.loop_filter_params.as_ref() {
-        if !coded_lossless && !fh.allow_intrabc {
+        if (lf.loop_filter_level[0] != 0 || lf.loop_filter_level[1] != 0)
+            && !coded_lossless
+            && !fh.allow_intrabc
+        {
             let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
                 bufs.push(PlaneBuffer {

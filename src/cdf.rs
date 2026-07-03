@@ -13532,7 +13532,13 @@ pub fn dequantize_step1(
             } else {
                 q
             };
-            let dq = (quant_levels[i * w + j] as i64) * q2;
+            // §7.12.3 step 1c: `dq = Quant[ i * tw + j ] * q2` — the
+            // Quant array uses the COMPACT `tw`-stride layout (the §9.2
+            // scan tables for 64-dim transforms address a `Min(32, w) ×
+            // Min(32, h)` grid), while `Dequant[ i ][ j ]` is the full
+            // `w × h` array the §7.13.3 inverse transform consumes
+            // (cells past 32 stay zero per its i/j < 32 gate).
+            let dq = (quant_levels[i * tw + j] as i64) * q2;
             let sign: i64 = if dq < 0 { -1 } else { 1 };
             let dq2 = sign * ((dq.unsigned_abs() & 0xFF_FFFF) as i64) / dq_denom;
             dequant[i * w + j] = dq2.clamp(clip_min, clip_max);
