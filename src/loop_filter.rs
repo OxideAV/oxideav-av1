@@ -354,11 +354,16 @@ pub fn loop_filter_edge(
     // av1-spec p.308 line 17065-17075.
     let mi_size = (ctx.mi_size)(row, col);
     let tx_sz = (ctx.lf_tx_size)(plane as usize, row >> sub_y, col >> sub_x);
-    let plane_size = mi_size; // §7.14.2 line 17069 — the spec's
-                              // `get_plane_residual_size(MiSize, plane)` collapses to
-                              // `MiSize` for non-chroma-misaligned blocks; the
-                              // driver passes the §5.11.34 plane-residual size
-                              // here when wired against the full walker.
+    // §7.14.2 line 17069: `planeSize = get_plane_residual_size( MiSize,
+    // plane )`. On chroma planes the subsampled block size drives the
+    // `isBlockEdge` modulus — e.g. a BLOCK_32X8 luma leaf's 4:2:0
+    // chroma prediction block is 16×4, so its chroma `isBlockEdge`
+    // fires every 4 plane rows, NOT every 8 (r387 fix: `planeSize =
+    // MiSize` missed every chroma block edge whose subsampled extent no
+    // longer divided the luma extent — on a both-sides-skip inter edge,
+    // `applyFilter` then never fired).
+    let plane_size =
+        crate::cdf::get_plane_residual_size(mi_size, plane, sub_x, sub_y).unwrap_or(mi_size);
     let skip = (ctx.skip)(row, col);
     let is_intra = (ctx.is_intra)(row, col);
     let prev_tx_sz = (ctx.lf_tx_size)(plane as usize, prev_row >> sub_y, prev_col >> sub_x);

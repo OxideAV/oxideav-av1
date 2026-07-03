@@ -37,20 +37,25 @@
 //! §7.4, §7.12.2, §7.14, §7.15, §7.16, §7.17, §7.18.
 
 use crate::cdf::{
-    PartitionWalker, QuantizerParams, TileCdfContext, TileDecodeParams, TileGeometry,
+    FrameInterOrderHints, InterFrameContext, InterWalkPixels, MotionFieldMvs, PartitionWalker,
+    QuantizerParams, TileCdfContext, TileDecodeParams, TileGeometry,
 };
 use crate::encoder::ivf::IvfReader;
 use crate::encoder::tile_group_obu::parse_tile_group_obu_body;
 use crate::film_grain::film_grain_synthesis;
-use crate::frame_header::{parse_frame_header, FrameHeader};
+use crate::frame_header::{
+    parse_frame_header_with_refs, FrameHeader, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+};
+use crate::inter_pred::get_relative_dist;
 use crate::loop_filter::PlaneBuffer;
 use crate::obu::{ObuIter, ObuType};
 use crate::sequence_header::{parse_sequence_header, SequenceHeader};
 use crate::symbol_decoder::SymbolDecoder;
 use crate::uncompressed_header_tail::{
-    SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP,
+    SegmentationParams, ALTREF_FRAME, LAST_FRAME, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP,
 };
 use crate::Error;
+use crate::{PlaneRefSpec, RefFrameStoreEntry};
 
 /// One frame decoded by the spec-faithful driver. Planes are surfaced
 /// at their §5.9.8 cropped extents (`FrameWidth` × `FrameHeight` for
@@ -65,6 +70,73 @@ pub struct SpecFrame {
     pub planes: Vec<Vec<u8>>,
     /// `(width, height)` per surfaced plane.
     pub plane_dims: Vec<(u32, u32)>,
+}
+
+/// §7.20 per-slot reference store — the decoded frame a later inter
+/// frame motion-compensates against, plus the per-mi grids the §7.9
+/// temporal projection and the §7.21 `show_existing_frame` output
+/// path consume.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // `mvs` / `ref_frames` / mi extent feed the §7.9 temporal projection milestone.
+struct SpecRefSlot {
+    /// §7.20 `FrameStore[ i ][ plane ]` — the post-§7.17 (pre-§7.18.3
+    /// film-grain) planes at their §7.18.2 cropped extents
+    /// (`UpscaledWidth × FrameHeight`, per-plane subsampled), `u16`
+    /// (post-`Clip1`, so the widening from the walker's `i32` is
+    /// lossless).
+    planes: Vec<Vec<u16>>,
+    /// `(width, height)` per stored plane.
+    plane_dims: Vec<(u32, u32)>,
+    /// §7.20 `SavedMvs[ i ]` — the §5.11.5 `Mvs[ row ][ col ][ 0..2 ]`
+    /// grid snapshot (4 `i16` per cell), for §7.9.
+    mvs: Vec<i16>,
+    /// §7.20 `SavedRefFrames[ i ]` — the `RefFrames[ row ][ col ][ 0..2 ]`
+    /// grid snapshot (2 `i8` per cell), for §7.9.
+    ref_frames: Vec<i8>,
+    /// The stored frame's mi extent.
+    mi_rows: u32,
+    mi_cols: u32,
+    /// §7.20 `RefFrameType[ i ]` — `FrameIsIntra` of the stored frame
+    /// (a `show_existing_frame` pointing at a KEY frame triggers the
+    /// §7.21 key-frame load path, a follow-up gap this driver rejects
+    /// loudly).
+    frame_is_intra: bool,
+}
+
+/// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
+/// inter `uncompressed_header()` parse consumes plus the §7.20
+/// per-slot pixel/grid stores.
+#[derive(Debug, Clone)]
+struct SpecRefState {
+    info: RefInfo,
+    slots: [Option<SpecRefSlot>; NUM_REF_FRAMES as usize],
+}
+
+impl SpecRefState {
+    fn new() -> Self {
+        Self {
+            info: RefInfo::default(),
+            slots: Default::default(),
+        }
+    }
+}
+
+/// One frame decoded by [`decode_frame_spec_full`] — the surfaced
+/// [`SpecFrame`] plus the §7.20 reference-update payload.
+struct DecodedFrameInternal {
+    /// The §7.18 output frame (post-film-grain).
+    frame: SpecFrame,
+    /// The §7.20 store payload: pre-grain cropped planes (`u16`).
+    ref_planes: Vec<Vec<u16>>,
+    /// `(width, height)` per `ref_planes` entry.
+    ref_plane_dims: Vec<(u32, u32)>,
+    /// §5.11.5 `Mvs[]` grid snapshot (4 `i16` per mi cell).
+    mvs: Vec<i16>,
+    /// §5.11.5 `RefFrames[]` grid snapshot (2 `i8` per mi cell).
+    ref_frames: Vec<i8>,
+    /// The decoded frame's mi extent.
+    mi_rows: u32,
+    mi_cols: u32,
 }
 
 /// §5.9.2 `LosslessArray[ segmentId ]` — `get_qindex( 1, segmentId ) ==
@@ -100,8 +172,36 @@ pub fn decode_frame_spec(
     fh: &FrameHeader,
     tile_group_body: &[u8],
 ) -> Result<SpecFrame, Error> {
-    if fh.show_existing_frame || !fh.frame_is_intra {
+    // The historical intra-only entry: no cross-frame reference state,
+    // so inter frames are rejected inside the full driver.
+    Ok(decode_frame_spec_full(seq, fh, tile_group_body, None)?.frame)
+}
+
+/// [`decode_frame_spec`] with the cross-frame reference state — the
+/// full §5.11 + §7.4 decode for one KEY / INTRA_ONLY / INTER frame,
+/// returning both the output frame and the §7.20 reference-update
+/// payload.
+fn decode_frame_spec_full(
+    seq: &SequenceHeader,
+    fh: &FrameHeader,
+    tile_group_body: &[u8],
+    refs: Option<&SpecRefState>,
+) -> Result<DecodedFrameInternal, Error> {
+    if fh.show_existing_frame {
+        // §7.21 output-existing path is the caller's (no tile group).
         return Err(Error::PartitionWalkOutOfRange);
+    }
+    if !fh.frame_is_intra {
+        if refs.is_none() {
+            // Inter frames are undecodable without the §7.20 store.
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if fh.primary_ref_frame != PRIMARY_REF_NONE {
+            // §8.3.1 `load_cdfs( ref_frame_idx[ primary_ref_frame ] )`
+            // + §5.9.14 / §5.9.19 `load_previous()` forwarding is the
+            // next milestone (the CDF store is not yet kept per slot).
+            return Err(Error::PartitionWalkOutOfRange);
+        }
     }
     let cc = &seq.color_config;
     if cc.bit_depth != 8 {
@@ -274,6 +374,161 @@ pub fn decode_frame_spec(
     )
     .ok_or(Error::PartitionWalkOutOfRange)?;
 
+    // ---- Inter-frame state: §5.11.18 context + §7.11.3 ref pixels. ----
+    // Owned buffers first (the `InterFrameContext` borrows them), then
+    // the context itself. All of it is inert on intra frames.
+    let is_inter_frame = !fh.frame_is_intra;
+    let sub_x_u8 = u8::from(cc.subsampling_x);
+    let sub_y_u8 = u8::from(cc.subsampling_y);
+    let num_planes_usize = cc.num_planes as usize;
+    // §7.9 motion-field grid — the temporal-scan source. The corpus
+    // arc this driver covers references intra-only stores (a KEY
+    // frame saves no inter MVs), for which the §7.9 projection yields
+    // no valid entry — the all-invalid grid IS the §7.9 output. Real
+    // temporal projection from `SpecRefSlot::mvs` is the
+    // show-existing-frame milestone.
+    let mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
+    // Never-referenced placeholder for empty §7.20 slots (a conformant
+    // stream only references `RefValid` slots).
+    let dummy_plane: Vec<u16> = vec![0u16; 64];
+    let dummy_entry = || RefFrameStoreEntry {
+        plane: &dummy_plane,
+        stride: 8,
+        upscaled_width: 8,
+        width: 8,
+        height: 8,
+    };
+    // Per-plane `FrameStore[ slot ]` views over the §7.20 store.
+    let mut plane_stores: Vec<[RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize]> = Vec::new();
+    let mut ref_frame_idx = [0u8; 7];
+    let mut order_hints_by_ref = [0i32; ALTREF_FRAME + 1];
+    let mut sign_bias = [0i32; 8];
+    let mut is_scaled_per_ref = [false; 7];
+    if is_inter_frame {
+        let st = refs.ok_or(Error::PartitionWalkOutOfRange)?;
+        let ir = fh
+            .inter_refs
+            .as_ref()
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        // Loud follow-up gates for state this milestone does not
+        // forward yet (none fire on the corpus arc this lands for).
+        if sp.enabled {
+            // §5.9.14 segmentation feature state on the §5.11.18 ctx.
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if fh.skip_mode_present.unwrap_or(false) {
+            // §5.9.22 `SkipModeFrame[]` derivation.
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        for plane in 0..num_planes_usize {
+            let arr: [RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize] =
+                core::array::from_fn(|slot| match st.slots[slot].as_ref() {
+                    Some(s) if plane < s.planes.len() => {
+                        let (w, h) = s.plane_dims[plane];
+                        RefFrameStoreEntry {
+                            plane: &s.planes[plane],
+                            stride: w as usize,
+                            upscaled_width: w,
+                            width: w,
+                            height: h,
+                        }
+                    }
+                    _ => dummy_entry(),
+                });
+            plane_stores.push(arr);
+        }
+        for i in 0..7 {
+            let slot = ir.ref_frame_idx[i] as usize;
+            if slot >= NUM_REF_FRAMES as usize {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            ref_frame_idx[i] = slot as u8;
+            // §5.9.2 `OrderHints[ LAST_FRAME + i ] =
+            // RefOrderHint[ ref_frame_idx[ i ] ]`.
+            let hint = st.info.order_hint[slot] as i32;
+            order_hints_by_ref[LAST_FRAME + i] = hint;
+            // §7.8 `RefFrameSignBias[ refFrame ] =
+            // get_relative_dist( hint, OrderHint ) > 0`.
+            if seq.enable_order_hint {
+                sign_bias[LAST_FRAME + i] = i32::from(
+                    get_relative_dist(hint, fh.order_hint as i32, u32::from(seq.order_hint_bits))
+                        > 0,
+                );
+            }
+            // §5.11.27 `is_scaled( refFrame )`: the stored dims differ
+            // from the current frame's.
+            is_scaled_per_ref[i] = st.info.upscaled_width[slot] != fs.upscaled_width
+                || st.info.frame_height[slot] != fs.frame_height;
+        }
+    }
+    let order_hints = FrameInterOrderHints {
+        order_hint_bits: if seq.enable_order_hint {
+            u32::from(seq.order_hint_bits)
+        } else {
+            0
+        },
+        current_order_hint: fh.order_hint as i32,
+        order_hints_by_ref,
+    };
+    let plane_ref_specs: Vec<PlaneRefSpec<'_>> = (0..plane_stores.len())
+        .map(|p| PlaneRefSpec {
+            plane: p as u8,
+            subsampling_x: if p > 0 { sub_x_u8 } else { 0 },
+            subsampling_y: if p > 0 { sub_y_u8 } else { 0 },
+            frame_store: &plane_stores[p],
+            frame_width: if p == 0 {
+                fs.frame_width
+            } else {
+                (fs.frame_width + u32::from(sub_x_u8)) >> sub_x_u8
+            },
+            frame_height: if p == 0 {
+                fs.frame_height
+            } else {
+                (fs.frame_height + u32::from(sub_y_u8)) >> sub_y_u8
+            },
+        })
+        .collect();
+    let pixels = InterWalkPixels {
+        ref_frame_idx,
+        bit_depth: cc.bit_depth,
+        plane_refs: &plane_ref_specs,
+        order_hints,
+    };
+    let ictx: Option<InterFrameContext<'_>> = if is_inter_frame {
+        let ir = fh
+            .inter_refs
+            .as_ref()
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        let mut c = InterFrameContext::identity_default(&mfmvs);
+        c.skip_mode_present = false; // gated above
+        c.reference_select = fh.reference_select.unwrap_or(false);
+        if let Some(g) = fh.global_motion_params.as_ref() {
+            for r in 0..8 {
+                c.gm_type[r] = g.gm_type[r] as i32;
+                c.gm_params[r] = g.gm_params[r];
+            }
+        }
+        c.ref_frame_sign_bias = sign_bias;
+        c.allow_high_precision_mv = ir.allow_high_precision_mv;
+        c.force_integer_mv = fh.force_integer_mv;
+        c.use_ref_frame_mvs = ir.use_ref_frame_mvs;
+        c.is_motion_mode_switchable = ir.is_motion_mode_switchable;
+        c.allow_warped_motion = fh.allow_warped_motion.unwrap_or(false);
+        c.is_scaled_per_ref = is_scaled_per_ref;
+        c.enable_interintra_compound = seq.enable_interintra_compound;
+        c.enable_masked_compound = seq.enable_masked_compound;
+        c.enable_jnt_comp = seq.enable_jnt_comp;
+        // §8.3.2 compound-idx `dist_equal` is per-block (the two refs'
+        // relative distances); single-ref-only streams never read it.
+        c.dist_equal = false;
+        c.interpolation_filter = ir.interpolation_filter as u8;
+        c.enable_dual_filter = seq.enable_dual_filter;
+        c.pixels = Some(&pixels);
+        Some(c)
+    } else {
+        None
+    };
+
     // §5.11.2 decode_tile() per tile, in tile order — each tile gets a
     // fresh §8.2.2 symbol decoder and a fresh §8.3.1 CDF load
     // (`primary_ref_frame == PRIMARY_REF_NONE` on the intra path, so
@@ -299,7 +554,7 @@ pub fn decode_frame_spec(
             &mut cdfs,
             &params,
             if lr.uses_lr { Some(&lr_walk) } else { None },
-            /* inter_ctx = */ None,
+            /* inter_ctx = */ ictx.as_ref(),
             &quant,
             /* read_deltas = */ dq.delta_q_present,
         )?;
@@ -559,6 +814,16 @@ pub fn decode_frame_spec(
         plane_dims[plane] = (out_w, out_h);
     }
 
+    // ---- §7.20 store payload: pre-grain cropped planes (u16). ----
+    // §7.18.3 film grain applies to the OUTPUT copy only; the §7.20
+    // reference store keeps the grain-free frame (the samples later
+    // frames motion-compensate against).
+    let ref_planes: Vec<Vec<u16>> = plane_bufs
+        .iter()
+        .map(|buf| buf.iter().map(|&v| v.max(0) as u16).collect())
+        .collect();
+    let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
+
     // ---- §7.18.3 film grain. ----
     if let Some(fg) = fh.film_grain_params.as_ref() {
         if fg.apply_grain {
@@ -588,13 +853,23 @@ pub fn decode_frame_spec(
         .map(|buf| buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect())
         .collect();
 
-    Ok(SpecFrame {
-        // Post-§7.16 the surfaced luma width is `UpscaledWidth`
-        // (`== FrameWidth` when superres is off).
-        width: fs.upscaled_width,
-        height: fs.frame_height,
-        planes,
-        plane_dims,
+    Ok(DecodedFrameInternal {
+        frame: SpecFrame {
+            // Post-§7.16 the surfaced luma width is `UpscaledWidth`
+            // (`== FrameWidth` when superres is off).
+            width: fs.upscaled_width,
+            height: fs.frame_height,
+            planes,
+            plane_dims,
+        },
+        ref_planes,
+        ref_plane_dims,
+        // §7.20 `SavedMvs` / `SavedRefFrames` — the §5.11.5 grid
+        // snapshots the §7.9 temporal projection reads back.
+        mvs: walker.mvs().to_vec(),
+        ref_frames: walker.ref_frames().to_vec(),
+        mi_rows,
+        mi_cols,
     })
 }
 
@@ -611,17 +886,96 @@ pub fn decode_av1_spec(input: &[u8]) -> Result<Vec<SpecFrame>, Error> {
     let records = reader.read_all().map_err(|_| Error::UnexpectedEnd)?;
     let mut out = Vec::new();
     let mut seq: Option<SequenceHeader> = None;
+    let mut refs = SpecRefState::new();
     for record in records {
-        decode_temporal_unit_spec(&record.payload, &mut seq, &mut out)?;
+        decode_temporal_unit_spec(&record.payload, &mut seq, &mut refs, &mut out)?;
     }
     Ok(out)
 }
 
-/// Decode one §7.5 temporal-unit body, appending every decoded frame to
-/// `out` and updating the cached sequence header.
+/// §7.20 `reference_frame_update()` — store the just-decoded frame
+/// into every slot `refresh_frame_flags` selects, updating the
+/// §5.9.2 `RefInfo` arrays in lockstep.
+fn reference_frame_update(
+    refs: &mut SpecRefState,
+    fh: &FrameHeader,
+    decoded: &DecodedFrameInternal,
+) -> Result<(), Error> {
+    if fh.refresh_frame_flags == 0 {
+        return Ok(());
+    }
+    let fs = fh
+        .frame_size
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let payload = SpecRefSlot {
+        planes: decoded.ref_planes.clone(),
+        plane_dims: decoded.ref_plane_dims.clone(),
+        mvs: decoded.mvs.clone(),
+        ref_frames: decoded.ref_frames.clone(),
+        mi_rows: decoded.mi_rows,
+        mi_cols: decoded.mi_cols,
+        frame_is_intra: fh.frame_is_intra,
+    };
+    for i in 0..NUM_REF_FRAMES as usize {
+        if (fh.refresh_frame_flags >> i) & 1 != 0 {
+            refs.info.valid[i] = true;
+            refs.info.order_hint[i] = fh.order_hint;
+            refs.info.frame_id[i] = fh.current_frame_id;
+            refs.info.upscaled_width[i] = fs.upscaled_width;
+            refs.info.frame_height[i] = fs.frame_height;
+            refs.info.render_width[i] = fs.render_width;
+            refs.info.render_height[i] = fs.render_height;
+            refs.slots[i] = Some(payload.clone());
+        }
+    }
+    Ok(())
+}
+
+/// §7.21-adjacent `show_existing_frame` output: surface the stored
+/// slot's (grain-free) planes as a [`SpecFrame`].
+fn output_existing_frame(refs: &SpecRefState, fh: &FrameHeader) -> Result<SpecFrame, Error> {
+    let idx = fh
+        .frame_to_show_map_idx
+        .ok_or(Error::PartitionWalkOutOfRange)? as usize;
+    if idx >= NUM_REF_FRAMES as usize {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let slot = refs.slots[idx]
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    if slot.frame_is_intra {
+        // §7.21: showing a stored KEY frame re-triggers the
+        // key-frame reference refresh (`refresh_frame_flags =
+        // allFrames` + the decoder-state load) — a follow-up gap this
+        // driver rejects loudly rather than mis-decoding.
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let planes: Vec<Vec<u8>> = slot
+        .planes
+        .iter()
+        .map(|p| p.iter().map(|&v| v.min(255) as u8).collect())
+        .collect();
+    let (w, h) = *slot
+        .plane_dims
+        .first()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    Ok(SpecFrame {
+        width: w,
+        height: h,
+        planes,
+        plane_dims: slot.plane_dims.clone(),
+    })
+}
+
+/// Decode one §7.5 temporal-unit body, appending every SHOWN frame to
+/// `out` (`show_frame == 1` coded frames and `show_existing_frame`
+/// outputs — the §7.4 output discipline) and updating the cached
+/// sequence header + the §7.20 reference state.
 fn decode_temporal_unit_spec(
     payload: &[u8],
     seq: &mut Option<SequenceHeader>,
+    refs: &mut SpecRefState,
     out: &mut Vec<SpecFrame>,
 ) -> Result<(), Error> {
     let mut pending_fh: Option<FrameHeader> = None;
@@ -634,25 +988,39 @@ fn decode_temporal_unit_spec(
             }
             ObuType::FrameHeader => {
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
-                pending_fh = Some(parse_frame_header(desc.payload, s)?);
+                let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
+                if fh.show_existing_frame {
+                    out.push(output_existing_frame(refs, &fh)?);
+                    pending_fh = None;
+                } else {
+                    pending_fh = Some(fh);
+                }
             }
             ObuType::TileGroup => {
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
                 let fh = pending_fh.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
-                out.push(decode_frame_spec(s, fh, desc.payload)?);
+                let decoded = decode_frame_spec_full(s, fh, desc.payload, Some(refs))?;
+                reference_frame_update(refs, fh, &decoded)?;
+                if fh.show_frame {
+                    out.push(decoded.frame);
+                }
             }
             ObuType::Frame => {
                 // §5.10 frame_obu: frame_header_obu() + byte_alignment()
                 // + tile_group_obu(). The tile group starts at the next
                 // byte boundary after the frame header.
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
-                let fh = parse_frame_header(desc.payload, s)?;
+                let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
                 let tg_offset = fh.bits_consumed.div_ceil(8);
                 if tg_offset > desc.payload.len() {
                     return Err(Error::UnexpectedEnd);
                 }
                 let tg_body = &desc.payload[tg_offset..];
-                out.push(decode_frame_spec(s, &fh, tg_body)?);
+                let decoded = decode_frame_spec_full(s, &fh, tg_body, Some(refs))?;
+                reference_frame_update(refs, &fh, &decoded)?;
+                if fh.show_frame {
+                    out.push(decoded.frame);
+                }
             }
             _ => return Err(Error::PartitionWalkOutOfRange),
         }

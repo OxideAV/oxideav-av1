@@ -15261,6 +15261,15 @@ pub struct PartitionWalker {
     /// on first use; only the leaf's plane rect is synced per
     /// prediction, so stale samples outside the rect are never read.
     inter_pred_scratch: [Vec<u16>; 3],
+    /// §7.11.3.8 `LocalWarpParams[ 0..6 ]` per cell — stamped at a
+    /// `WARPED_CAUSAL` leaf's origin by the §5.11.5 inter arm (the
+    /// §7.10.4 sample list + §7.11.3.8 least-squares fit run at the
+    /// in-walk `compute_prediction()` position). Pre-fill `0`; read
+    /// only at `WARPED_CAUSAL` origins.
+    local_warp_params: Vec<i32>,
+    /// §7.11.3.8 `LocalValid` per cell — sibling of
+    /// [`Self::local_warp_params`]. Pre-fill `0`.
+    local_warp_valid: Vec<u8>,
     /// `MiSizes[ row ][ col ]` packed into a row-major `mi_rows *
     /// mi_cols` flat buffer. Entries are `BLOCK_INVALID` for
     /// not-yet-decoded cells and a `BLOCK_*` ordinal for decoded
@@ -16142,6 +16151,18 @@ impl PartitionWalker {
             walk_avail_u,
             walk_avail_l,
             inter_pred_scratch: [Vec::new(), Vec::new(), Vec::new()],
+            local_warp_params: {
+                let mut v: Vec<i32> = Vec::new();
+                v.try_reserve_exact(area * 6).ok()?;
+                v.resize(area * 6, 0);
+                v
+            },
+            local_warp_valid: {
+                let mut v: Vec<u8> = Vec::new();
+                v.try_reserve_exact(area).ok()?;
+                v.resize(area, 0);
+                v
+            },
             mi_sizes,
             skips,
             skip_modes,
@@ -18415,19 +18436,15 @@ impl PartitionWalker {
         mi_row: u32,
         mi_col: u32,
         mi_size: usize,
-        pixels: &InterWalkPixels<'_>,
+        ctx: &InterFrameContext<'_>,
     ) -> Result<(), crate::Error> {
         if mi_size >= BLOCK_SIZES || mi_row >= self.mi_rows || mi_col >= self.mi_cols {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
+        let pixels = ctx.pixels.ok_or(crate::Error::PartitionWalkOutOfRange)?;
         let mi_rows = self.mi_rows;
         let mi_cols = self.mi_cols;
         let cells = (mi_rows as usize) * (mi_cols as usize);
-        let origin = (mi_row * mi_cols + mi_col) as usize;
-        if self.motion_modes[origin] == MOTION_MODE_WARPED_CAUSAL {
-            // §7.11.3.8 local-warp fit not derivable in-walk yet.
-            return Err(crate::Error::InterBlockModeInfoUnsupported);
-        }
         if pixels.plane_refs.is_empty() {
             return Err(crate::Error::PartitionWalkOutOfRange);
         }
@@ -18490,6 +18507,16 @@ impl PartitionWalker {
             }
         }
 
+        // §5.9.24 global-motion tables in the [`crate::GridWarpContext`]
+        // shape (`GmType` as `u8` ordinals, the affine matrices
+        // flattened row-major by `RefFrame`).
+        let mut gm_types_u8 = [0u8; 8];
+        let mut gm_flat = [0i32; 48];
+        for r in 0..8usize {
+            gm_types_u8[r] = ctx.gm_type[r] as u8;
+            gm_flat[r * 6..r * 6 + 6].copy_from_slice(&ctx.gm_params[r]);
+        }
+
         // Drive the shared per-leaf walk. Field-split borrows: the grid
         // views borrow the walker's grid vectors immutably while the
         // plane contexts borrow `inter_pred_scratch` mutably.
@@ -18516,7 +18543,21 @@ impl PartitionWalker {
                 mi_rows,
                 mi_cols,
                 bit_depth: pixels.bit_depth,
-                warp: None,
+                // §7.11.3.1 step-6/7 warp context: the per-cell
+                // §7.11.3.8 fit the §5.11.5 inter arm stamped for
+                // WARPED_CAUSAL leaves, plus the §5.9.24 global-motion
+                // tables (the `useWarp == 2` GLOBALMV arm fires even on
+                // `motion_mode == SIMPLE` leaves when
+                // `GmType[ RefFrame[0] ] > TRANSLATION`).
+                warp: Some(crate::GridWarpContext {
+                    motion_modes: &self.motion_modes,
+                    local_warp_params: &self.local_warp_params,
+                    local_warp_valid: &self.local_warp_valid,
+                    y_modes: &self.y_modes,
+                    gm_types: &gm_types_u8,
+                    gm_params: &gm_flat,
+                    force_integer_mv: ctx.force_integer_mv,
+                }),
                 obmc: Some(crate::GridObmcContext {
                     motion_modes: &self.motion_modes,
                     avail_u: &self.walk_avail_u,
@@ -25272,6 +25313,42 @@ impl PartitionWalker {
         ref_frame_0: i32,
         mv: [[i32; 2]; 2],
     ) -> u32 {
+        self.find_warp_samples_impl(mi_row, mi_col, sub_size, ref_frame_0, mv, None)
+    }
+
+    /// [`Self::find_warp_samples`] with the §7.10.4.2 step-3
+    /// `CandList[ NumSamples ][ 0..4 ]` retained — the §7.11.3.8
+    /// `warp_estimation` input. `out` is cleared, filled in scan order
+    /// (each step-3 write lands at index `NumSamples`, so an invalid
+    /// first sample is overwritten by the next scan exactly like the
+    /// spec's array store), and truncated to the returned `NumSamples`
+    /// (which includes the §7.10.4.1 "first large MV is kept when no
+    /// small one matches" fixup).
+    pub fn find_warp_samples_list(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        ref_frame_0: i32,
+        mv: [[i32; 2]; 2],
+        out: &mut Vec<crate::inter_pred::WarpSampleCand>,
+    ) -> u32 {
+        out.clear();
+        let n = self.find_warp_samples_impl(mi_row, mi_col, sub_size, ref_frame_0, mv, Some(out));
+        out.truncate(n as usize);
+        n
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_warp_samples_impl(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        ref_frame_0: i32,
+        mv: [[i32; 2]; 2],
+        mut cand_out: Option<&mut Vec<crate::inter_pred::WarpSampleCand>>,
+    ) -> u32 {
         debug_assert!(sub_size < BLOCK_SIZES);
         debug_assert!((0..=7).contains(&ref_frame_0));
 
@@ -25320,6 +25397,7 @@ impl PartitionWalker {
                     0,
                     &mut num_samples,
                     &mut num_samples_scanned,
+                    cand_out.as_deref_mut(),
                 );
             } else {
                 let lim = core::cmp::min(w4, (self.mi_cols as i32) - (mi_col as i32));
@@ -25342,6 +25420,7 @@ impl PartitionWalker {
                         i,
                         &mut num_samples,
                         &mut num_samples_scanned,
+                        cand_out.as_deref_mut(),
                     );
                     if mi_step <= 0 {
                         break;
@@ -25374,6 +25453,7 @@ impl PartitionWalker {
                     -1,
                     &mut num_samples,
                     &mut num_samples_scanned,
+                    cand_out.as_deref_mut(),
                 );
             } else {
                 let lim = core::cmp::min(h4, (self.mi_rows as i32) - (mi_row as i32));
@@ -25396,6 +25476,7 @@ impl PartitionWalker {
                         -1,
                         &mut num_samples,
                         &mut num_samples_scanned,
+                        cand_out.as_deref_mut(),
                     );
                     if mi_step <= 0 {
                         break;
@@ -25417,6 +25498,7 @@ impl PartitionWalker {
                 -1,
                 &mut num_samples,
                 &mut num_samples_scanned,
+                cand_out.as_deref_mut(),
             );
         }
         if do_top_right && core::cmp::max(w4, h4) <= 16 {
@@ -25430,6 +25512,7 @@ impl PartitionWalker {
                 w4,
                 &mut num_samples,
                 &mut num_samples_scanned,
+                cand_out,
             );
         }
 
@@ -25452,6 +25535,7 @@ impl PartitionWalker {
     /// lives in a downstream arc and the data is recoverable from the
     /// walker grids).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn add_sample(
         &self,
         mi_row: u32,
@@ -25463,6 +25547,7 @@ impl PartitionWalker {
         delta_col: i32,
         num_samples: &mut u32,
         num_samples_scanned: &mut u32,
+        cand_out: Option<&mut Vec<crate::inter_pred::WarpSampleCand>>,
     ) {
         if (*num_samples_scanned as usize) >= LEAST_SQUARES_SAMPLES_MAX {
             return;
@@ -25515,10 +25600,30 @@ impl PartitionWalker {
         if !valid && *num_samples_scanned > 1 {
             return;
         }
-        // §7.10.4.2 step 3: CandList[NumSamples][j] = cand[j] — the
-        // `CandList` slot index is `NumSamples`; the function caps
-        // there. We elide the cand[] population per the
-        // documented-deferral above.
+        // §7.10.4.2 step 3: `CandList[ NumSamples ][ j ] = cand[ j ]`
+        // — `midY = candRow * 4 + candH4 * 2 - 1`, `midX = candCol * 4
+        // + candW4 * 2 - 1`; source = mid * 8, destination = source +
+        // `Mvs[ candRow ][ candCol ][ 0 ]`. The slot index is
+        // `NumSamples`, so an invalid (but recorded — step 2 only
+        // exits on `NumSamplesScanned > 1`) first sample is
+        // overwritten by the next scan unless the §7.10.4.1 fixup
+        // promotes it.
+        if let Some(out) = cand_out {
+            let mid_y = cand_row * 4 + cand_h4 * 2 - 1;
+            let mid_x = cand_col * 4 + cand_w4 * 2 - 1;
+            let cand = crate::inter_pred::WarpSampleCand {
+                sy: mid_y * 8,
+                sx: mid_x * 8,
+                dy: mid_y * 8 + nb_mv_row,
+                dx: mid_x * 8 + nb_mv_col,
+            };
+            let slot = *num_samples as usize;
+            if slot < out.len() {
+                out[slot] = cand;
+            } else {
+                out.push(cand);
+            }
+        }
         if valid {
             *num_samples += 1;
         }
@@ -29636,6 +29741,35 @@ impl PartitionWalker {
         // prediction and later intra blocks read reconstructed
         // neighbours.
         if let Some(px) = ctx.pixels {
+            // §5.11.27 LOCALWARP: a `WARPED_CAUSAL` leaf's §7.11.3.8
+            // least-squares fit runs at the in-walk
+            // `compute_prediction()` position. The §7.10.4 sample scan
+            // reads only already-decoded neighbour rows (never the
+            // current leaf's own cells), so re-running it here is
+            // bit-identical to the §5.11.27 read site.
+            if inter_block.motion_mode == MOTION_MODE_WARPED_CAUSAL {
+                let mut cands: Vec<crate::inter_pred::WarpSampleCand> = Vec::new();
+                self.find_warp_samples_list(
+                    mi_row,
+                    mi_col,
+                    sub_size,
+                    inter_block.ref_frame[0],
+                    inter_block.mv,
+                    &mut cands,
+                );
+                let lw = crate::inter_pred::warp_estimation(
+                    &cands,
+                    mi_row as i32,
+                    mi_col as i32,
+                    bw4 as i32,
+                    bh4 as i32,
+                    [inter_block.mv[0][0] as i16, inter_block.mv[0][1] as i16],
+                );
+                let origin = (mi_row * self.mi_cols + mi_col) as usize;
+                self.local_warp_params[origin * 6..origin * 6 + 6]
+                    .copy_from_slice(&lw.local_warp_params);
+                self.local_warp_valid[origin] = u8::from(lw.local_valid);
+            }
             // §5.11.33 `IsInterIntra` arm: the spec runs
             // `predict_intra` (the translated `interintra_mode`) into
             // `CurrFrame[ plane ]` BEFORE `predict_inter` reads it back
@@ -29728,7 +29862,8 @@ impl PartitionWalker {
                     );
                 }
             }
-            self.predict_inter_leaf_from_walk(mi_row, mi_col, sub_size, px)?;
+            let _ = px.bit_depth;
+            self.predict_inter_leaf_from_walk(mi_row, mi_col, sub_size, ctx)?;
         }
 
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.

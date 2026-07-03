@@ -970,6 +970,45 @@ const SUPER_RESOLUTION_IVF: &str = concat!(
     "91",
 );
 
+const I_FRAME_THEN_P_64X64_IVF: &str = concat!(
+    "444b494600002000415630314000400019000000010000000200000000000000c40100000000",
+    "00000000000012000a0a00000002afffbfff300832b30314002be000094209002c2ae3306dea",
+    "a663e815f2a46f7966185d3d3166537fff70eb8d8d007775419b7e1f5c93578ef2da07f4a1e2",
+    "0a44effeb51cb778bab9463a362e16ebb0f50fac519a0cbbef8972bc6ce63448f4b21ed3c1a9",
+    "a187f2d62f574dfd39d95bce8250e9f5091954b87f9bf3e10106db9a6dde506f691a7443a70b",
+    "c10820836d57ea8c0b91296deb2262dad2f6a1249f2f0b2e7b83f6d00d441198e0126e2a621f",
+    "82ebff8e9c0788a0ecfaba1b108672a99300f80f176dc6c5d0ca01e0ace38b251c3ef9e30192",
+    "fea8ddf08711f0807d2590d252ac011fcfb76aa025e6d1dc5dcb29b5e177e52b21c7c12b8c94",
+    "01fe8ed3cf16e12fc3d5bf272b8b5641612a46dcc42bc0c29e3633cde9101d95816607349124",
+    "4a19e7f8fd5f09cd45dbae1c1a1ba8cd5652cbacfdbe7f9770755baf050baaf675bab833f7c5",
+    "14a75d3d2471cf8d7157accffdfe810e67b0f4dc097fb705c54ad9454774e4535ae6d53aa81c",
+    "393648af1cc10cd7b71f35b33cee1b554e5be3ac29d8569665a7948136221d8a5753993fa731",
+    "c8a06bafe71783a032c396b4947303c544838065c23ca41e43476feb40645d38a76cf4b90ded",
+    "6b141a0000000100000000000000120032163201e0400000235e000012841200000400d00a2d",
+    "168b"
+);
+
+/// KEY + INTER: the r387 inter-frame decode driver end-to-end. The
+/// KEY frame (active chroma CDEF, `loop_filter_level = [0, 1, 10, 4]`)
+/// is stored via §7.20; the P frame (`primary_ref_frame ==
+/// PRIMARY_REF_NONE`, `use_ref_frame_mvs = 1` against an intra-only
+/// store, GLOBALMV + zero/sub-pel translational leaves,
+/// `refresh_frame_flags = 0x02`) is decoded through the in-walk
+/// §5.11.33 `predict_inter` (§7.11.3 MC against the §7.20 store) +
+/// §5.11.34 residual + the §7.4 post chain — including the r387
+/// §7.14.2 `planeSize = get_plane_residual_size( MiSize, plane )`
+/// chroma block-edge fix, which this stream's both-sides-skip
+/// MV-differing chroma edge exercises.
+#[test]
+fn i_frame_then_p_64x64_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "i-frame-then-p-64x64",
+        I_FRAME_THEN_P_64X64_IVF,
+        "e13ad037e6495dc7b6612690fe7fd2e6842997adbd88a70eea9cbb82f1203b1b",
+        2,
+    );
+}
+
 /// `use_superres = 1`, `coded_denom = 3` (128 -> 85 coded width, a
 /// NON-mi-aligned frame): the §7.16 polyphase upscaler (including its
 /// `Clip3(0, miW * MI_SIZE - 1, ..)` clamp reading decoded mi-grid
