@@ -41,3 +41,23 @@ fn golomb_length_chain_is_bounded_on_truncated_coefficients() {
         "decode of a 76-byte adversarial input must not take tens of seconds"
     );
 }
+
+/// 2026-07-03 dispatched-Fuzz crash `c055549e…` (surfaced once the
+/// golomb cap above unblocked deeper coverage): a §5.9.30
+/// `film_grain_params()` whose chroma point-count `f(4)` literal codes
+/// a value past the `MAX_NUM_CHROMA_POINTS = 10` conformance bound,
+/// indexing past the fixed-size point arrays (`index out of bounds:
+/// the len is 10 but the index is 10`). Fixed by the §5.9.30
+/// conformance checks surfacing
+/// [`oxideav_av1::Error::FilmGrainPointCountOverflow`].
+#[test]
+fn film_grain_point_counts_are_bounded() {
+    let bytes = hex(
+        "444b494600002000002900000000000000fff8cccc33cc23cccc0800000000002c\
+         000000cc28cccc4a61a04b0e4d095d1e00ff01823b00051f001c0a00003100000e\
+         2000f7ffa2a9b61f4400fffff8cce001000204ffff00",
+    );
+    // Success and every typed error are both acceptable; only a panic
+    // is a finding.
+    let _ = oxideav_av1::decode_av1(&bytes);
+}

@@ -2331,6 +2331,12 @@ pub enum Error {
     /// the `do { length++ } while ( !golomb_length_bit )` loop of
     /// §5.11.39 never terminates.
     GolombLengthOverflow,
+    /// A §5.9.30 `film_grain_params()` point count exceeded its
+    /// bitstream-conformance bound (`num_y_points <= 14`,
+    /// `num_cb_points <= 10`, `num_cr_points <= 10`). The `f(4)`
+    /// literals can code 15 on a corrupt / adversarial stream, which
+    /// would index past the fixed-size point arrays.
+    FilmGrainPointCountOverflow,
 }
 
 impl core::fmt::Display for Error {
@@ -2469,6 +2475,10 @@ impl core::fmt::Display for Error {
             Self::GolombLengthOverflow => write!(
                 f,
                 "oxideav-av1: §5.11.39 golomb_length_bit chain exceeded 30 bits — corrupt or truncated coefficient data"
+            ),
+            Self::FilmGrainPointCountOverflow => write!(
+                f,
+                "oxideav-av1: §5.9.30 film-grain point count exceeds its conformance bound (num_y_points <= 14, num_cb/cr_points <= 10)"
             ),
         }
     }

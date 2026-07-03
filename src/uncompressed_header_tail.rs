@@ -1914,6 +1914,12 @@ pub(crate) fn read_film_grain_params(
     }
 
     fg.num_y_points = br.f(4)? as u8;
+    // §5.9.30 conformance: `num_y_points <= 14`. The `f(4)` literal can
+    // code 15 on a corrupt / adversarial stream, which would index past
+    // the `[u8; MAX_NUM_Y_POINTS]` arrays — reject instead.
+    if usize::from(fg.num_y_points) > MAX_NUM_Y_POINTS {
+        return Err(Error::FilmGrainPointCountOverflow);
+    }
     for i in 0..usize::from(fg.num_y_points) {
         fg.point_y_value[i] = br.f(8)? as u8;
         fg.point_y_scaling[i] = br.f(8)? as u8;
@@ -1934,11 +1940,19 @@ pub(crate) fn read_film_grain_params(
         fg.num_cr_points = 0;
     } else {
         fg.num_cb_points = br.f(4)? as u8;
+        // §5.9.30 conformance: `num_cb_points <= 10`.
+        if usize::from(fg.num_cb_points) > MAX_NUM_CHROMA_POINTS {
+            return Err(Error::FilmGrainPointCountOverflow);
+        }
         for i in 0..usize::from(fg.num_cb_points) {
             fg.point_cb_value[i] = br.f(8)? as u8;
             fg.point_cb_scaling[i] = br.f(8)? as u8;
         }
         fg.num_cr_points = br.f(4)? as u8;
+        // §5.9.30 conformance: `num_cr_points <= 10`.
+        if usize::from(fg.num_cr_points) > MAX_NUM_CHROMA_POINTS {
+            return Err(Error::FilmGrainPointCountOverflow);
+        }
         for i in 0..usize::from(fg.num_cr_points) {
             fg.point_cr_value[i] = br.f(8)? as u8;
             fg.point_cr_scaling[i] = br.f(8)? as u8;
