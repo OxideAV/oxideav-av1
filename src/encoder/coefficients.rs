@@ -892,7 +892,6 @@ pub fn write_coefficients(
     };
     let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_size];
     let tx_sz_ctx = (tx_sz_sqr + tx_sz_sqr_up + 1) >> 1;
-    let ptype = (plane > 0) as usize;
     // §5.11.39 line 6: `segEob`.
     let seg_eob = if tx_size == crate::cdf::TX_16X64 || tx_size == crate::cdf::TX_64X16 {
         512usize
@@ -939,6 +938,102 @@ pub fn write_coefficients(
             cul_level: 0,
             dc_category: 0,
         });
+    }
+
+    write_coefficients_gate_open(
+        writer,
+        cdfs,
+        plane,
+        is_inter,
+        tx_size,
+        tx_class,
+        dc_sign_ctx,
+        scan,
+        quant_in,
+    )
+}
+
+/// §5.11.39 `coeffs()` write side — the gate-open body (everything
+/// **after** the `all_zero` S() write): the `eob_pt_*` / `eob_extra` /
+/// `eob_extra_bit` emission, the reverse-scan `coeff_base{_eob}` +
+/// `coeff_br` level loop, and the forward-scan `dc_sign` / `sign_bit` /
+/// golomb pass.
+///
+/// The write twin of [`PartitionWalker::coefficients_gate_open`]
+/// (`crate::cdf`): a caller honouring the §5.11.39 spec order writes
+/// `all_zero` via [`write_txb_skip`], performs the §5.11.47
+/// `transform_type()` emission on the `all_zero == 0` arm, derives
+/// `tx_class` / `scan` from the resulting `PlaneTxType`, then invokes
+/// this body. `quant_in` must contain at least one non-zero coefficient
+/// at a scan position (an all-zero commitment here is a caller bug —
+/// the matching reader would never reach this body).
+///
+/// [`PartitionWalker::coefficients_gate_open`]: crate::cdf::PartitionWalker::coefficients_gate_open
+#[allow(clippy::too_many_arguments)]
+pub fn write_coefficients_gate_open(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    plane: u8,
+    is_inter: u8,
+    tx_size: usize,
+    tx_class: usize,
+    dc_sign_ctx: usize,
+    scan: &[u16],
+    quant_in: &[i32],
+) -> Result<crate::cdf::CoefficientsReadout, Error> {
+    // ---------------- caller-bug guards (mirror the reader's) ---------
+    if tx_size >= TX_SIZES_ALL {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if tx_class > crate::cdf::TX_CLASS_VERT {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if plane > 2 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if is_inter > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if dc_sign_ctx >= DC_SIGN_CONTEXTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // §5.11.39 lines 1-7: derived sizes (mirror the reader).
+    let tx_w = TX_WIDTH[tx_size];
+    let tx_h = crate::cdf::TX_HEIGHT[tx_size];
+    let tx_sz_sqr = {
+        let side = core::cmp::min(tx_w, tx_h);
+        (side.trailing_zeros() as usize) - 2
+    };
+    let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_size];
+    let tx_sz_ctx = (tx_sz_sqr + tx_sz_sqr_up + 1) >> 1;
+    let ptype = (plane > 0) as usize;
+    let seg_eob = if tx_size == crate::cdf::TX_16X64 || tx_size == crate::cdf::TX_64X16 {
+        512usize
+    } else {
+        core::cmp::min(1024, tx_w * tx_h)
+    };
+    if scan.len() < seg_eob {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if quant_in.len() < tx_w * tx_h {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // Target eob from quant_in (§5.11.39 lines 56-71 reverse scan).
+    let mut eob: u32 = 0;
+    for c in (0..seg_eob).rev() {
+        let pos = scan[c] as usize;
+        if pos >= quant_in.len() {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if quant_in[pos] != 0 {
+            eob = (c as u32) + 1;
+            break;
+        }
+    }
+    if eob == 0 {
+        // All-zero commitments belong on the [`write_coefficients`] /
+        // `write_txb_skip(all_zero = 1)` short-circuit, never here.
+        return Err(Error::PartitionWalkOutOfRange);
     }
 
     // §5.11.39 lines 19-55: eob_pt + eob_extra + eob_extra_bit loop.

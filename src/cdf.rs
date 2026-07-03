@@ -27491,8 +27491,6 @@ impl PartitionWalker {
         };
         let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_size];
         let tx_sz_ctx = (tx_sz_sqr + tx_sz_sqr_up + 1) >> 1;
-        // §5.11.39 line 5: `ptype = plane > 0`.
-        let ptype = (plane > 0) as usize;
         // §5.11.39 line 6: `segEob = ( txSz == TX_16X64 || txSz ==
         // TX_64X16 ) ? 512 : Min( 1024, Tx_Width[ txSz ] *
         // Tx_Height[ txSz ] )`.
@@ -27546,6 +27544,137 @@ impl PartitionWalker {
                 cul_level: 0,
                 dc_category: 0,
             });
+        }
+
+        self.coefficients_gate_open(
+            decoder,
+            cdfs,
+            plane,
+            is_inter,
+            tx_size,
+            tx_class,
+            dc_sign_ctx,
+            scan,
+            quant,
+        )
+    }
+
+    /// §5.11.39 line 13: the standalone `all_zero` S() read against
+    /// `TileTxbSkipCdf[ txSzCtx ][ ctx ]` — for callers that must
+    /// interleave the §5.11.47 `transform_type()` read between
+    /// `all_zero` and the EOB read per the §5.11.39 spec order (see
+    /// [`Self::coefficients_gate_open`]). Returns the decoded
+    /// `all_zero` flag.
+    pub fn read_all_zero(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        tx_size: usize,
+        txb_skip_ctx: usize,
+    ) -> Result<bool, crate::Error> {
+        if tx_size >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if txb_skip_ctx >= TXB_SKIP_CONTEXTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.39 line 4: `txSzCtx = ( Tx_Size_Sqr[txSz] +
+        // Tx_Size_Sqr_Up[txSz] + 1 ) >> 1`.
+        let tx_sz_sqr = {
+            let side = core::cmp::min(TX_WIDTH[tx_size], TX_HEIGHT[tx_size]);
+            (side.trailing_zeros() as usize) - 2
+        };
+        let tx_sz_ctx = (tx_sz_sqr + TX_SIZE_SQR_UP[tx_size] + 1) >> 1;
+        let all_zero_cdf = cdfs
+            .txb_skip_cdf(tx_sz_ctx, txb_skip_ctx)
+            .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+        let all_zero = decoder.read_symbol(all_zero_cdf)?;
+        Ok(all_zero != 0)
+    }
+
+    /// §5.11.39 `coeffs()` — the gate-open body (everything **after**
+    /// the `all_zero` S() read, av1-spec p.89-93): the `eob_pt_*` /
+    /// `eob_extra` / `eob_extra_bit` EOB read, the reverse-scan
+    /// `coeff_base{_eob}` + `coeff_br` level loop, and the forward-scan
+    /// `dc_sign` / `sign_bit` / golomb pass.
+    ///
+    /// Split out of [`Self::coefficients`] because the §5.11.39 spec
+    /// order interleaves the caller-owned §5.11.47 `transform_type()`
+    /// read between `all_zero` and the EOB read on the luma plane:
+    ///
+    /// ```text
+    ///   all_zero  S()
+    ///   if ( all_zero ) { ... TxTypes[..] = DCT_DCT ... }
+    ///   else {
+    ///       if ( plane == 0 )
+    ///           transform_type( x4, y4, txSz )      // caller's read
+    ///       PlaneTxType = compute_tx_type( ... )    // caller derives
+    ///       scan = get_scan( txSz )                 //   tx_class/scan
+    ///       eob_pt_* S()  ...                       // THIS function
+    ///   }
+    /// ```
+    ///
+    /// A caller that must honour that order (the §5.11.35
+    /// `transform_block` dispatch) reads `all_zero` via
+    /// [`Self::read_all_zero`], performs its §5.11.47/§5.11.40
+    /// derivations, then invokes this body directly. Callers with a
+    /// pre-committed `tx_class`/`scan` (chroma, or the constrained
+    /// encoder-mirror drivers where §5.11.47 codes no symbol) can keep
+    /// using [`Self::coefficients`], whose behaviour is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coefficients_gate_open(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        plane: u8,
+        is_inter: u8,
+        tx_size: usize,
+        tx_class: usize,
+        dc_sign_ctx: usize,
+        scan: &[u16],
+        quant: &mut [i32],
+    ) -> Result<CoefficientsReadout, crate::Error> {
+        // ---------------- caller-bug guards ----------------
+        if tx_size >= TX_SIZES_ALL {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if tx_class > TX_CLASS_VERT {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if plane > 2 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if is_inter > 1 {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if dc_sign_ctx >= DC_SIGN_CONTEXTS {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.39 lines 1-7: derived sizes (see [`Self::coefficients`]).
+        let tx_w = TX_WIDTH[tx_size];
+        let tx_h = TX_HEIGHT[tx_size];
+        let tx_sz_sqr = {
+            let side = core::cmp::min(tx_w, tx_h);
+            (side.trailing_zeros() as usize) - 2
+        };
+        let tx_sz_sqr_up = TX_SIZE_SQR_UP[tx_size];
+        let tx_sz_ctx = (tx_sz_sqr + tx_sz_sqr_up + 1) >> 1;
+        let ptype = (plane > 0) as usize;
+        let seg_eob = if tx_size == TX_16X64 || tx_size == TX_64X16 {
+            512usize
+        } else {
+            core::cmp::min(1024, tx_w * tx_h)
+        };
+        if scan.len() < seg_eob {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if quant.len() < tx_w * tx_h {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §5.11.39 lines 8-9 zero-fill (idempotent when the caller came
+        // through [`Self::coefficients`], which already zeroed).
+        for cell in quant.iter_mut().take(seg_eob) {
+            *cell = 0;
         }
 
         // ---------------- §5.11.39 EOB read ----------------
@@ -30393,190 +30522,194 @@ impl PartitionWalker {
             let x4 = start_x >> 2;
             let y4 = start_y >> 2;
 
-            // §5.11.47 `transform_type` S() — luma-only on the
-            // !skip path. The spec calls `transform_type( x4, y4,
-            // txSz )` inside the §5.11.39 coeffs() prologue on the
-            // luma plane; the chroma plane uses
-            // `compute_tx_type`'s `Mode_To_Txfm[UVMode]` fallback
-            // without a per-TU S() read.
-            if plane == 0 {
-                let tt = self.transform_type(
-                    decoder,
-                    cdfs,
-                    tx_sz,
-                    is_inter,
-                    ctx.intra_dir,
-                    ctx.reduced_tx_set,
-                    ctx.segment_id,
-                    &ctx.quant,
-                )?;
-                self.stamp_tx_type(x4, y4, tt.w4 as u32, tt.h4 as u32, tt.tx_type);
-            }
-
-            // §5.11.40 `compute_tx_type( plane, txSz, x4, y4 )`.
-            // Derives the per-plane `PlaneTxType` after the §5.11.47
-            // stamp.
-            let tx_set = if is_inter {
-                inter_tx_type_set(
-                    tx_size_sqr_index(tx_sz) as u32,
-                    TX_SIZE_SQR_UP[tx_sz] as u32,
-                    ctx.reduced_tx_set,
-                )
-            } else {
-                intra_tx_type_set(
-                    tx_size_sqr_index(tx_sz) as u32,
-                    TX_SIZE_SQR_UP[tx_sz] as u32,
-                    ctx.reduced_tx_set,
-                )
-            };
-            let plane_tx_type = {
-                // Pull TxTypes[] reads through a closure that
-                // bypasses the borrow of `self`.
-                let tx_types_grid = self.tx_types.clone();
-                let mi_cols = self.mi_cols;
-                let mi_rows = self.mi_rows;
-                compute_tx_type(
-                    plane as usize,
-                    tx_sz,
-                    lossless,
-                    is_inter,
-                    tx_set,
-                    mi_row,
-                    mi_col,
-                    x4,
-                    y4,
-                    sub_x as u32,
-                    sub_y as u32,
-                    ctx.uv_mode as usize,
-                    |yy, xx| {
-                        if yy >= mi_rows || xx >= mi_cols {
-                            DCT_DCT
-                        } else {
-                            tx_types_grid[(yy * mi_cols + xx) as usize] as usize
-                        }
-                    },
-                )
-            };
-
-            // Back-fill the task's `plane_tx_type` with the §5.11.40
-            // derivation — the §7.12.3 step-3 merge below consults it
-            // for the `flipUD` / `flipLR` destination remap. The task
-            // was pushed above with the DCT_DCT placeholder; on this
-            // arm we replace it with the actual `PlaneTxType`.
-            if let Some(last) = readout.tasks.last_mut() {
-                last.plane_tx_type = plane_tx_type as u8;
-            }
-
-            // §8.3.2 tx_class derivation — fold the §3 `*_DCT` /
-            // `*_ADST` / `*_FLIPADST` constants into TX_CLASS_2D /
-            // TX_CLASS_HORIZ / TX_CLASS_VERT.
-            let tx_class = match plane_tx_type {
-                V_DCT | V_ADST | V_FLIPADST => TX_CLASS_VERT,
-                H_DCT | H_ADST | H_FLIPADST => TX_CLASS_HORIZ,
-                _ => TX_CLASS_2D,
-            };
-
-            // §7.5 / §5.11.41 `get_scan( txSz )` — routes per
-            // `(txSz, PlaneTxType)` to the per-size Default / Mrow /
-            // Mcol scan table the §5.11.39 reader walks. Replaces
-            // the r183 identity-ascending placeholder; the returned
-            // slice always has `len >= segEob` per the §7.5
-            // construction (`TX_16X64` / `TX_64X16` are 512 from
-            // Default_Scan_16x32 / Default_Scan_32x16, and the
-            // `Tx_Size_Sqr_Up == TX_64X64` arm yields 1024 from
-            // Default_Scan_32x32). The §5.11.39 reader re-derives
-            // `segEob` internally from `tx_sz` for its zero-fill +
-            // bounds check.
-            let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
-            let mut quant = vec![0i32; tx_w * tx_h];
             // §8.3.2 `all_zero` / `dc_sign` ctx — the neighbour-array
             // walks over `Above{Level,Dc}Context` /
             // `Left{Level,Dc}Context` (r284; the encoder's
             // `write_transform_block_intra` derives the same pair from
-            // its mirror walker).
+            // its mirror walker). Symbol-free derivations, so they may
+            // run ahead of the reads.
             let txb_skip_ctx = self
                 .txb_skip_ctx(plane, tx_sz, mi_size, x4, y4, sub_x, sub_y)
                 .ok_or(crate::Error::PartitionWalkOutOfRange)?;
             let dc_sign_ctx = self.dc_sign_ctx(plane, tx_sz, x4, y4, sub_x, sub_y);
-            let coeffs = self.coefficients(
-                decoder,
-                cdfs,
-                plane,
-                is_inter as u8,
-                tx_sz,
-                tx_class,
-                txb_skip_ctx,
-                dc_sign_ctx,
-                scan,
-                &mut quant,
-            )?;
-            // §5.11.39 tail — stamp the TU's `culLevel` / `dcCategory`
-            // into the §6.10.2 context arrays (gate-open and
-            // gate-closed alike).
-            self.stamp_txb_level_context(
-                plane,
-                tx_sz,
-                x4,
-                y4,
-                coeffs.cul_level,
-                coeffs.dc_category,
-            );
-            readout.coeffs.push(coeffs);
-            // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
-            // §7.12.3 dequantization (step 1, r183 LANDED) + §7.13
-            // inverse transform (r182 LANDED) + §7.12.3 step-3
-            // frame-buffer merge (r185 LANDED).
-            //
-            // r183: §7.12.3 step-1 dequantization wires in via
-            // [`dequantize_step1`].
-            // r182: §7.13 inverse transform wires in via
-            // [`crate::transform::inverse_transform_2d`].
-            // r185: §7.12.3 step-3 frame-buffer merge wires in via
-            // [`Self::curr_frame_step3_merge`]. The per-TU
-            // `CurrFrame[plane][y + yy][x + xx]` write (with
-            // `flipLR` / `flipUD` destination remap and `Clip1`
-            // envelope) lands directly into the per-plane sample
-            // buffer accessible via [`Self::curr_frame`]. The
-            // per-TU `Residual[][]` is still captured on
-            // [`ResidualReadout::residuals`] for caller inspection.
-            if coeffs.eob > 0 {
-                let dequant = dequantize_step1(
-                    &quant,
-                    tx_sz,
-                    plane,
-                    ctx.segment_id,
-                    plane_tx_type,
-                    ctx.seg_qm_level[plane as usize],
-                    &ctx.quant,
-                );
-                let residual = crate::transform::inverse_transform_2d(
-                    &dequant,
-                    tx_sz,
-                    plane_tx_type,
-                    ctx.quant.bit_depth as u32,
-                    lossless,
-                );
-                // §7.12.3 step-3 (av1-spec p.295) — merge the per-TU
-                // `Residual[i][j]` into `CurrFrame[plane][y + yy][x +
-                // xx]` with the `flipLR` / `flipUD` destination remap
-                // for the FLIPADST family and a `Clip1` envelope
-                // against `(1 << BitDepth) - 1`. The buffer is
-                // allocated lazily on the first per-plane merge call
-                // (see [`Self::ensure_curr_frame_plane`]).
-                self.curr_frame_step3_merge(
-                    plane,
-                    start_x,
-                    start_y,
-                    tx_sz,
-                    plane_tx_type,
-                    &residual,
-                    ctx.quant.bit_depth,
-                    sub_x,
-                    sub_y,
-                );
-                readout.residuals.push(Some(residual));
-            } else {
+
+            // §5.11.39 line 13: `all_zero S()` — the FIRST coefficient
+            // symbol. The §5.11.47 `transform_type()` read below is
+            // gated on `all_zero == 0` per the §5.11.39 else-arm
+            // ordering (r384 fix — the read previously ran ahead of
+            // `all_zero`, desynchronising real encoder-produced
+            // streams).
+            let all_zero = self.read_all_zero(decoder, cdfs, tx_sz, txb_skip_ctx)?;
+            if all_zero {
+                // §5.11.39 `if ( all_zero )` arm: the luma plane stamps
+                // `TxTypes[ y4 + j ][ x4 + i ] = DCT_DCT` over the TU
+                // footprint; no further reads for this TU.
+                if plane == 0 {
+                    let w4 = (tx_w >> 2) as u32;
+                    let h4 = (tx_h >> 2) as u32;
+                    self.stamp_tx_type(x4, y4, w4, h4, DCT_DCT as u8);
+                }
+                // §5.11.39 tail — culLevel = 0 / dcCategory = 0 stamps
+                // fire on the gate-closed arm too.
+                self.stamp_txb_level_context(plane, tx_sz, x4, y4, 0, 0);
+                readout.coeffs.push(CoefficientsReadout {
+                    all_zero: true,
+                    eob: 0,
+                    cul_level: 0,
+                    dc_category: 0,
+                });
                 readout.residuals.push(None);
+            } else {
+                // §5.11.47 `transform_type` S() — luma-only on the
+                // `all_zero == 0` arm. The chroma plane uses
+                // `compute_tx_type`'s `Mode_To_Txfm[UVMode]` fallback
+                // without a per-TU S() read.
+                if plane == 0 {
+                    let tt = self.transform_type(
+                        decoder,
+                        cdfs,
+                        tx_sz,
+                        is_inter,
+                        ctx.intra_dir,
+                        ctx.reduced_tx_set,
+                        ctx.segment_id,
+                        &ctx.quant,
+                    )?;
+                    self.stamp_tx_type(x4, y4, tt.w4 as u32, tt.h4 as u32, tt.tx_type);
+                }
+
+                // §5.11.40 `compute_tx_type( plane, txSz, x4, y4 )`.
+                // Derives the per-plane `PlaneTxType` after the §5.11.47
+                // stamp.
+                let tx_set = if is_inter {
+                    inter_tx_type_set(
+                        tx_size_sqr_index(tx_sz) as u32,
+                        TX_SIZE_SQR_UP[tx_sz] as u32,
+                        ctx.reduced_tx_set,
+                    )
+                } else {
+                    intra_tx_type_set(
+                        tx_size_sqr_index(tx_sz) as u32,
+                        TX_SIZE_SQR_UP[tx_sz] as u32,
+                        ctx.reduced_tx_set,
+                    )
+                };
+                let plane_tx_type = {
+                    // Pull TxTypes[] reads through a closure that
+                    // bypasses the borrow of `self`.
+                    let tx_types_grid = self.tx_types.clone();
+                    let mi_cols = self.mi_cols;
+                    let mi_rows = self.mi_rows;
+                    compute_tx_type(
+                        plane as usize,
+                        tx_sz,
+                        lossless,
+                        is_inter,
+                        tx_set,
+                        mi_row,
+                        mi_col,
+                        x4,
+                        y4,
+                        sub_x as u32,
+                        sub_y as u32,
+                        ctx.uv_mode as usize,
+                        |yy, xx| {
+                            if yy >= mi_rows || xx >= mi_cols {
+                                DCT_DCT
+                            } else {
+                                tx_types_grid[(yy * mi_cols + xx) as usize] as usize
+                            }
+                        },
+                    )
+                };
+
+                // Back-fill the task's `plane_tx_type` with the §5.11.40
+                // derivation — the §7.12.3 step-3 merge below consults it
+                // for the `flipUD` / `flipLR` destination remap. The task
+                // was pushed above with the DCT_DCT placeholder; on this
+                // arm we replace it with the actual `PlaneTxType`.
+                if let Some(last) = readout.tasks.last_mut() {
+                    last.plane_tx_type = plane_tx_type as u8;
+                }
+
+                // §8.3.2 tx_class derivation — fold the §3 `*_DCT` /
+                // `*_ADST` / `*_FLIPADST` constants into TX_CLASS_2D /
+                // TX_CLASS_HORIZ / TX_CLASS_VERT.
+                let tx_class = match plane_tx_type {
+                    V_DCT | V_ADST | V_FLIPADST => TX_CLASS_VERT,
+                    H_DCT | H_ADST | H_FLIPADST => TX_CLASS_HORIZ,
+                    _ => TX_CLASS_2D,
+                };
+
+                // §7.5 / §5.11.41 `get_scan( txSz )` — routes per
+                // `(txSz, PlaneTxType)` to the per-size Default / Mrow /
+                // Mcol scan table the §5.11.39 reader walks.
+                let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
+                let mut quant = vec![0i32; tx_w * tx_h];
+                let coeffs = self.coefficients_gate_open(
+                    decoder,
+                    cdfs,
+                    plane,
+                    is_inter as u8,
+                    tx_sz,
+                    tx_class,
+                    dc_sign_ctx,
+                    scan,
+                    &mut quant,
+                )?;
+                // §5.11.39 tail — stamp the TU's `culLevel` / `dcCategory`
+                // into the §6.10.2 context arrays.
+                self.stamp_txb_level_context(
+                    plane,
+                    tx_sz,
+                    x4,
+                    y4,
+                    coeffs.cul_level,
+                    coeffs.dc_category,
+                );
+                readout.coeffs.push(coeffs);
+                // §5.11.35 line 34: `if ( eob > 0 ) reconstruct(...)` —
+                // §7.12.3 dequantization (step 1) + §7.13 inverse
+                // transform + §7.12.3 step-3 frame-buffer merge.
+                if coeffs.eob > 0 {
+                    let dequant = dequantize_step1(
+                        &quant,
+                        tx_sz,
+                        plane,
+                        ctx.segment_id,
+                        plane_tx_type,
+                        ctx.seg_qm_level[plane as usize],
+                        &ctx.quant,
+                    );
+                    let residual = crate::transform::inverse_transform_2d(
+                        &dequant,
+                        tx_sz,
+                        plane_tx_type,
+                        ctx.quant.bit_depth as u32,
+                        lossless,
+                    );
+                    // §7.12.3 step-3 (av1-spec p.295) — merge the per-TU
+                    // `Residual[i][j]` into `CurrFrame[plane][y + yy][x +
+                    // xx]` with the `flipLR` / `flipUD` destination remap
+                    // for the FLIPADST family and a `Clip1` envelope
+                    // against `(1 << BitDepth) - 1`. The buffer is
+                    // allocated lazily on the first per-plane merge call
+                    // (see [`Self::ensure_curr_frame_plane`]).
+                    self.curr_frame_step3_merge(
+                        plane,
+                        start_x,
+                        start_y,
+                        tx_sz,
+                        plane_tx_type,
+                        &residual,
+                        ctx.quant.bit_depth,
+                        sub_x,
+                        sub_y,
+                    );
+                    readout.residuals.push(Some(residual));
+                } else {
+                    readout.residuals.push(None);
+                }
             }
         } else if plane == 0 {
             // §5.11.39 `all_zero == 1` luma stamp — the §5.11.39

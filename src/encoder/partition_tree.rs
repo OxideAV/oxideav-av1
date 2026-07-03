@@ -2216,9 +2216,80 @@ fn write_transform_block(
         )
     };
 
+    // §5.11.39 `coeffs()` — consume the next caller-committed `Quant[]`
+    // array up front: the §5.11.39 line-13 `all_zero` write must precede
+    // the §5.11.47 `transform_type()` emission (r384 fix — the spec's
+    // else-arm ordering), and `all_zero` is a property of the committed
+    // coefficients.
+    let quant = block
+        .residual_quant
+        .get(*tu_idx)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    *tu_idx += 1;
+    if quant.len() != tx_w * tx_h {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    let all_zero = quant.iter().all(|&q| q == 0);
+    // §8.3.2 `all_zero` / `dc_sign` ctx — the same neighbour-array
+    // derivations the decode walker's `transform_block_emit` performs,
+    // computed against the mirror's §6.10.2 context arrays (r284).
+    let txb_skip_ctx = state
+        .mirror
+        .txb_skip_ctx(plane, tx_sz, mi_size, x4, y4, sub_x, sub_y)
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let dc_sign_ctx = state.mirror.dc_sign_ctx(plane, tx_sz, x4, y4, sub_x, sub_y);
+    // §5.11.39 line 13: `all_zero` S() — the FIRST coefficient symbol,
+    // written ahead of the §5.11.47 `transform_type()` mirror below.
+    {
+        let tx_sz_sqr_min = {
+            let side = core::cmp::min(tx_w, tx_h);
+            (side.trailing_zeros() as usize) - 2
+        };
+        let tx_sz_ctx = (tx_sz_sqr_min + TX_SIZE_SQR_UP[tx_sz] + 1) >> 1;
+        crate::encoder::coefficients::write_txb_skip(
+            writer,
+            cdfs,
+            u8::from(all_zero),
+            tx_sz_ctx,
+            txb_skip_ctx,
+        )?;
+    }
+    if all_zero {
+        // §5.11.39 `if ( all_zero )` arm: no transform_type symbol, no
+        // further coefficient writes. The luma plane stamps DCT_DCT
+        // over the TU footprint; the commitment vector still advances
+        // (one committed TxType per luma TU), and a non-DCT_DCT
+        // commitment for an all-zero TU is a caller bug (the decode
+        // walker reads DCT_DCT regardless).
+        if plane == 0 {
+            let committed = block
+                .residual_tx_type
+                .get(*luma_tx_idx)
+                .copied()
+                .unwrap_or(DCT_DCT as u8);
+            *luma_tx_idx += 1;
+            if committed != DCT_DCT as u8 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            state.mirror.stamp_tx_type(
+                x4,
+                y4,
+                (tx_w >> 2) as u32,
+                (tx_h >> 2) as u32,
+                DCT_DCT as u8,
+            );
+        }
+        // §5.11.39 tail — culLevel = 0 / dcCategory = 0 stamps fire on
+        // the gate-closed arm too.
+        state
+            .mirror
+            .stamp_txb_level_context(plane, tx_sz, x4, y4, 0, 0);
+        return Ok(());
+    }
+
     // §5.11.47 `transform_type()` write side — luma only (r286). The
     // decode walker invokes its `transform_type()` reader on every luma
-    // (`plane == 0`) `!skip` TU; the §5.11.47 `set > 0 &&
+    // (`plane == 0`) `all_zero == 0` TU; the §5.11.47 `set > 0 &&
     // (segmentation_enabled ? get_qindex(1, segment_id) : base_q_idx) >
     // 0` guard decides whether an `intra_tx_type` / `inter_tx_type` S()
     // is coded. When closed the stamp is `DCT_DCT` (no symbol); when
@@ -2329,34 +2400,15 @@ fn write_transform_block(
     // §7.5 / §5.11.41 scan selection.
     let scan = crate::scan::get_scan(tx_sz, plane_tx_type);
 
-    // §5.11.39 `coeffs( plane, startX, startY, txSz )` — consume the
-    // next caller-committed `Quant[]` array. Exact-length check keeps
-    // a transposed/mis-sized commitment from silently encoding
-    // garbage.
-    let quant = block
-        .residual_quant
-        .get(*tu_idx)
-        .ok_or(Error::PartitionWalkOutOfRange)?;
-    *tu_idx += 1;
-    if quant.len() != tx_w * tx_h {
-        return Err(Error::PartitionWalkOutOfRange);
-    }
-    // §8.3.2 `all_zero` / `dc_sign` ctx — the same neighbour-array
-    // derivations the decode walker's `transform_block_emit` performs,
-    // computed against the mirror's §6.10.2 context arrays (r284).
-    let txb_skip_ctx = state
-        .mirror
-        .txb_skip_ctx(plane, tx_sz, mi_size, x4, y4, sub_x, sub_y)
-        .ok_or(Error::PartitionWalkOutOfRange)?;
-    let dc_sign_ctx = state.mirror.dc_sign_ctx(plane, tx_sz, x4, y4, sub_x, sub_y);
-    let wout = write_coefficients(
+    // §5.11.39 gate-open body — the `all_zero` symbol was already
+    // written above, ahead of the §5.11.47 emission.
+    let wout = crate::encoder::coefficients::write_coefficients_gate_open(
         writer,
         cdfs,
         plane,
         u8::from(is_inter),
         tx_sz,
         tx_class,
-        txb_skip_ctx,
         dc_sign_ctx,
         scan,
         quant,

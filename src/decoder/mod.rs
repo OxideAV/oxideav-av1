@@ -65,7 +65,9 @@
 //!   * §7.12.3 — `dequantize_step1`.
 //!   * §7.13 — Inverse transform.
 
+pub mod frame_driver;
 pub mod pixel_driver;
 pub mod pixel_driver_dyn;
 
+pub use frame_driver::{decode_av1_spec, decode_frame_spec, SpecFrame};
 pub use pixel_driver::{decode_av1, decode_temporal_unit, Frame, TemporalUnitResult};
