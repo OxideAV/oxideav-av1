@@ -18,22 +18,23 @@
 //!      superblock loop over §5.11.4 `decode_partition` → §5.11.5
 //!      `decode_block` → §5.11.34 `residual`, reconstructing every
 //!      intra transform block into `CurrFrame[ plane ]`.
-//!   4. §7.4 in-loop / post passes in decode order: §7.14 deblock →
-//!      §7.15 CDEF → §7.18.3 film grain. (§7.16 superres and §7.17
-//!      loop-restoration are follow-ups; frames signalling them are
-//!      rejected rather than decoded wrongly.)
+//!   4. The §7.4 in-loop / post passes in decode order over the
+//!      mi-grid-padded planes: §7.14 deblock (only when a luma filter
+//!      level is nonzero) → §7.15 CDEF → §7.16 superres (both the CDEF
+//!      output and the retained post-deblock frame) → §7.17 loop
+//!      restoration → the §7.18.2 crop → §7.18.3 film grain.
 //!
 //! ## Scope
 //!
-//! * Intra-only frames (KEY / INTRA_ONLY), 8-bit, single tile.
+//! * Intra-only frames (KEY / INTRA_ONLY), 8-bit output, single- and
+//!   multi-tile layouts.
 //! * 4:2:0 / 4:2:2 / 4:4:4 and monochrome layouts (the walker threads
 //!   `subsampling_x/y` + `mono_chrome`; only 8-bit output is surfaced).
-//! * Frames with `use_superres == 1` or an active §5.9.20 loop-
-//!   restoration type return [`Error::PartitionWalkOutOfRange`] until
-//!   those passes are wired here.
+//! * Inter frames, `show_existing_frame`, and quantizer-matrix streams
+//!   return [`Error::PartitionWalkOutOfRange`] (follow-ups).
 //!
-//! Spec provenance: `docs/video/av1/av1-spec.txt` §5.9, §5.11, §7.4,
-//! §7.12.2, §7.14, §7.15, §7.18.3.
+//! Spec provenance: `docs/video/av1/av1-spec.txt` §5.9, §5.10, §5.11,
+//! §7.4, §7.12.2, §7.14, §7.15, §7.16, §7.17, §7.18.
 
 use crate::cdf::{
     PartitionWalker, QuantizerParams, TileCdfContext, TileDecodeParams, TileGeometry,

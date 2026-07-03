@@ -9,10 +9,44 @@ framework.
 
 Clean-room rebuild in progress. The bitstream-syntax and header layers
 are broadly complete (OBU framing, sequence header, full
-uncompressed-frame-header syntax tree, tile info), and an intra-only
-decode/encode pixel pipeline is wired end-to-end for a constrained
-parameter set. Inter prediction and full-feature reconstruction are
-not yet covered.
+uncompressed-frame-header syntax tree, tile info), and — as of r384 —
+**every intra-only stream in the independent conformance corpus decodes
+to pixels byte-identical to a third-party decoder's output** (10 of the
+13 corpus streams; the remaining 3 contain inter frames). Inter-frame
+decode and reference-frame management are not yet covered.
+
+### Conformance-validated decode (r384)
+
+`decoder::decode_av1_spec(ivf_bytes) -> Vec<SpecFrame>` is the
+spec-faithful frame driver: IVF + §7.5 OBU walk (including the combined
+§5.10 `OBU_FRAME`), §5.9 header-derived state, per-tile §8.2.2/§8.3.1
+symbol-decoder + CDF init (with the q-context coefficient-CDF slice),
+the §5.11.2 `decode_tile` superblock loop (with the §5.11.57 `read_lr`
+interleave and per-tile `begin_tile` resets), and the full §7.4
+post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
+nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
+both the CDEF output and the post-deblock frame, §7.17 loop restoration
+(Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
+grain. `tests/fixture_conformance.rs` pins 10 streams byte-exact against
+independent-decoder output (fixture corpus under
+`docs/video/av1/fixtures/`, used as opaque black-box tools): the full
+intra feature surface — lossy quant at every coded TX size (including
+the 64-wide compact-`tw` dequant layout), lossless WHT, palette (luma +
+chroma, in-walk §5.11.35 `predict_palette`), CfL, filter-intra,
+directional prediction including V/H-with-angle-delta and the
+§7.11.2.9-12 edge filter + upsample pre-pass, monochrome, 128×128
+superblocks, multi-superblock and multi-tile frames, film grain, and
+superres on a non-mi-aligned width.
+
+The r384 conformance debugging also fixed five spec deviations that
+encoder-mirror round-trips could never catch (both sides shared the
+same deviation): the §5.11.39 `all_zero`-before-`transform_type` read
+order (encoder writer reordered in lockstep), the §7.12.3
+`Quant[i*tw+j]` compact layout for 64-wide transforms, the §7.4 rule
+that zero luma filter levels skip deblocking entirely, the
+§7.11.2.1 rule that V_PRED / H_PRED with a non-zero angle delta run the
+full directional process, and the §5.11.49 palette-cache left gate at a
+mid-frame tile's first column.
 
 The intra-only decoder is now reachable through the runtime codec
 registry: `register` installs an `oxideav_core::Decoder` factory for
@@ -233,13 +267,19 @@ functions. Streams outside the supported scope return a typed `Error`
 
 ### Not yet supported
 
-- Frame-walk reconstruction of warped-causal inter leaves (the
-  single-reference translational, compound, inter-intra, and **OBMC**
-  arms are wired as of r378); reference-frame buffer management across a
-  GOP.
-- Multi-tile reconstruction beyond the single-tile decode path.
-- 10/12-bit and 4:2:2 / 4:4:4 reconstruction.
-- Registration as a live codec in the runtime registry.
+- Inter FRAMES through the spec frame driver: reference-frame buffer
+  management across a GOP (§7.20/§7.21), the §5.11.18 inter cascade
+  driven from real P-frame headers (`InterFrameContext` construction,
+  temporal MVs), and `show_existing_frame` — the 3 remaining corpus
+  streams. (The §5.11.33 reconstruction arms themselves — single-ref,
+  compound, inter-intra, OBMC, warp — are wired at the walker level.)
+- Frame-walk reconstruction of warped-causal inter leaves stays on the
+  opt-in per-block warp context.
+- 10/12-bit and 4:2:2 / 4:4:4 pixel output from the spec driver (the
+  walker threads the subsampling; only 8-bit is surfaced).
+- Quantizer-matrix (`using_qmatrix == 1`) streams in the spec driver.
+- The runtime-registry wrapper still bridges the constrained
+  encoder-mirror `decode_av1`, not the spec driver.
 
 ## Module layout
 
