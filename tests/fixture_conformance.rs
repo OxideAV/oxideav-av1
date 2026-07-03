@@ -689,3 +689,266 @@ fn monochrome_grey_only_decodes_byte_exact() {
         1,
     );
 }
+
+// ---------------------------------------------------------------------
+// SHA-256 (FIPS 180-4) — used to pin the larger expected outputs whose
+// per-sample noise (film grain, mandelbrot texture) defeats the RLE
+// embedding. The digests below are the fixture corpus's pinned
+// `expected.yuv` SHA-256 values (docs/video/av1/fixtures/README.md).
+// ---------------------------------------------------------------------
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    h.iter().map(|v| format!("{v:08x}")).collect()
+}
+
+/// Decode `ivf_hex` and compare the concatenated output planes' SHA-256
+/// against the corpus-pinned digest.
+fn assert_decodes_to_digest(name: &str, ivf_hex: &str, digest: &str, frames_hint: usize) {
+    let ivf = unhex(ivf_hex);
+    let frames = decode_av1_spec(&ivf)
+        .unwrap_or_else(|e| panic!("{name}: spec driver rejected the fixture: {e:?}"));
+    assert_eq!(frames.len(), frames_hint, "{name}: frame count");
+    let mut got = Vec::new();
+    for f in &frames {
+        for p in &f.planes {
+            got.extend_from_slice(p);
+        }
+    }
+    assert_eq!(
+        sha256_hex(&got),
+        digest,
+        "{name}: decoded pixels differ from the independent decoder (SHA-256 mismatch over {} bytes)",
+        got.len()
+    );
+}
+
+/// SHA-256 self-check against the FIPS 180-4 "abc" test vector, so a
+/// digest mismatch above always implicates the decoder, not the hash.
+#[test]
+fn sha256_matches_fips_vector() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+const I_ONLY_64X64_IVF: &str = concat!(
+    "444b494600002000415630314000400019000000010000000100000000000000860100000000",
+    "00000000000012000a0a00000002afffbfff300832f50214002f000000903c42a0dde95cfb95",
+    "31f40af95237bcb30c2e9e98b329bfffb875988bee34bbe37d3bbfd7d0c3b500750c8211ccec",
+    "252544d979c0ae4ec2907300544c14b3864ed327630ef8a405bb392fc51df214ba0a57fee906",
+    "cced4e18c9a3eb7e8d96fb9467d31f121c17053cea837f697c734e9015fc8c59741f52f1a424",
+    "1b017badb84d05a9afa656d3dc54da76dad0e546ff349f82f7fe01f56d411f3fa447e14481b5",
+    "d168e7dd78f544a190a6eb578ac3d91ebd791cf931054bf3a0e403c5f0a3fe822a6accbe73e1",
+    "ce29f6416d2d139b73119a55c7ea7fa1116a3caa4bcd6216259d6c2a8ea5f576a80418786415",
+    "4b6bfb3fc6423fa5536e794f301ecaa5a84f0581e22fee9041a4aea98ffb6d482be920858d9e",
+    "ddbed2e4ec48d7e3ec44f98151d185d0d2572f79de2e2cd6bd025e63146e3005447dce73bc05",
+    "335083d94508dc8907f0e205a568f0501997d267cb9766e8692fff604d42c18b6fa95dd79a1c",
+    "ad4cad9a252c94c57e1858a203b68ce0",
+);
+
+const FILM_GRAIN_ON_IVF: &str = concat!(
+    "444b494600002000415630314000400019000000010000000200000000000000df0200000000",
+    "00000000000012000a0a00000002afff9b5f301832ce0514002f000821c58902880b615fc200",
+    "0331043205340615071108700a520c330e32101611f513d6165708100014401c583c685a8869",
+    "a086a8a8d0910001c603850426050686c607a708970a9b0e80804680808034e455804dd28080",
+    "4f8080805c9662805a87a7808051808080619f6780608d1c8f7c00972e00d9dddda39023c84a",
+    "71550ba8e115e97b9beba9a6fa4082af10b22196fb5bcc9b0b647259d39ba50bee3e3fd5b2c7",
+    "0ecc25f5ca7afa05f660417da99b0c484c9f13a0e4fd75e98efe83937cc594452811199ffaff",
+    "0ae73834aabc8bd1b061efbe927b335150e38847f22c3d7ad3556c582c340fc454811db1b37d",
+    "6d868683bed6f2601a4f12492923a2aea8949ffbd5cd414027622481f9b1d65f0bef0bd7f740",
+    "3fe1d5f10479a7405a1282fc22634e99fcb571770f651ace23e4489b9bb688987bb9fd37fff1",
+    "8b92fda307cac12bbb8744aabb526bf24d873f70588b6c0b0e668170d7a3d067854eabbe3172",
+    "fc15c5d564f66f86f63c1f3c04a8400f05bb5584d603367aef89657df35f5fc521254faf6279",
+    "c895cb8a26dcc575e1ef3d9113779accf3a1a74db1e98f76b58d206ff5a30ecb880a761b5803",
+    "af655273947edff2922fdf2e8c2bd9b89814bbe54cc04cc2a02fa7fcd332860213da53eed7e2",
+    "67b9229d20720c8610d2a61daaa0ed83c65127efb5fe5f615090b8eb0db2fb3de6a57eeba81c",
+    "d8f829fa8496a6896cf6fcbcfae218db3fe8315f58007c85e612daa0ee10c110069c105dcd03",
+    "0611dd2e135686439ac5bb42873e129a77420ab2be613d4b1c405bffa0d8676dbb0074009015",
+    "383ff324ac697ae4bf9edf5a57da3cf93543193f52a0c3671187272c4012a3074fce45cf1c62",
+    "16be09a67088b1b53191e37c87436c79fa92c03991f2fc17a37764535f5628ffb5c7a6221f7a",
+    "e8ca2e96ce4a9bd158922b437afcd3c8b059078f08b7d4751b137e66f73e84bf3866748155e3",
+    "0beb3e1fd96711ae051624ce20b6b7ecd0ec55d5020000010000000000000012000a0a000000",
+    "02afff9b5f301832c40514002f000411060902880b7bc9c2000331043205340615071108700a",
+    "520c330e32101611f513d6165708100014401c583c685a8869a086a8a8d0910001c603850426",
+    "050686c607a708970a9b0e80804680808034e455804dd280804f8080805c9662805a87a78080",
+    "51808080619f6780608d1c8f7c00972e00d9dda82aa7527539435957308746c415898ad3c7d4",
+    "fd30932e819ebea2aa58e606e11f67655bb4ba2b947c42441d1a41f5326361e1a84e5f628123",
+    "b49e83145ef123b7c2214fa8883b8031dafb765acd62a926d3adb15bf04f36831d4b4625488e",
+    "990a536bf77aaa0f7d45a6d4469949dd83efe30fba8a9cbb71c461b10d4853888a7ac8b8dc9b",
+    "0b8a5eeacbb7739211692fc224592249d8969c3b22126afb8a71a3d851c0c7fbcfc40f0a10ba",
+    "25c30373bdf87ba631be7e5f1f9db350695e20b22a63fb2366e6e2a9717dd9bf4826902d5914",
+    "e069af37345ce3bb7d8a29ea3541da33526ad94f4e7356dc3cdb02f0527af1c69d055677db4c",
+    "aeccb4f16cbfb05c83972a09d4258ce8ebac78e23a1ab9a149e8691b75e84a97a434ca7a66b0",
+    "0465e4c5ae419a5b9fcdd136127ba3134b0b8ec11ce6e5a0362bcfbee6952f319f56efa31347",
+    "eeb9d818227e9a38e3ed6d9738a4acdb1dab5b1d74a1fdaf0de56ceee0e13af26a1675d47035",
+    "4f9324b7f3e158e82851eefb65e5448d66f36aa5bfd9ef975c8aa03afd1759b34e24f5f76699",
+    "ddcebd4af6f07357b8de238fe41d66d7c2c1db2eb3dc277cf97c658ea0cf87f1f5adb3c1adde",
+    "64d2fe325f2cda1a897b3cfc14af5edd39fdb66fce6bd86b9048237432261054891b46e419de",
+    "ea408a7658a67625dba49b8395cc3d77797c21204ec372c581fc56c82dba6cfbe2984eb39772",
+    "e390a9cdd0f4fbde3f5aa480101a04a0e5078b44747a08d32c94406f0e702818e9ddd422706e",
+    "05bac4e25e5729c92107a00c761e10a003941b7bad47843ee8a7fb9d2a5935225ca0",
+);
+
+const SUPERBLOCKS_128_IVF: &str = concat!(
+    "444b494600002000415630318000800019000000010000000100000000000000500700000000",
+    "00000000000012000a0a0000000337ffefffcc0232bf0e1000c00069899c2961c1ccf280c4c9",
+    "c5a3c0cb90c5e4639cc39025fd8e14d99eb95deb3d3a8d5c2fd948267a1b4af7768207ae7c3d",
+    "dd39010494cfbd6a6060b46e04541b78958bd02ab6090147628731e0aa41be254ace23b4763a",
+    "a684c627dc72fe0e7d587335e3c54d72d1ea695c5e1453f688b635c8db571dad9a3431566306",
+    "88e0b91268be7bee7560991ed5671dc38e31edee6dd2efd98edcf6788ce72c242a0d182d216b",
+    "c04882a081704d136a47dac03778818dc8401f8daf53951dd259a1f2c143e65874e58f78359d",
+    "83a11da2d550a5e912148b0df5f7bea07f25d0afe401ddf80eb018ece5dbdf23f08a8bf35211",
+    "7a4e27b0fa4213bcaa18c3780c445b094e9b559cc7776a9531ead926129c37d2e9660e27bf89",
+    "eed47d0c8bef3fcda285784337c8a90f8ab5137ad47d59974de17e2c93a13ad8f525b33dc6d3",
+    "f21a8361b23984cc93c99504e6c04a2f754379075896310665e31e22af8be3525f68a9b992f8",
+    "530d03cf710f3a9c5472aebad3fd36c18340de68fe65154a75becc9fe7ab404d0fec7c620b18",
+    "ebed46a00f7bc1551fbc767343ff555c47f2652593bacb0de3a9bf640889fcfede19cdb79371",
+    "f150a32e08d1caff7609ad90c2b32d20f43d18c98144439e3722158cdebccbdeffa85ffe3d21",
+    "244402c5de9faf011569338134849b213399429cafba4fb830b82aaf159420dcd86c52a2a388",
+    "2670c0feaab68ff797bc9cf97e8df1524b60434377e96766448ace9c9c45931956ae9960f39e",
+    "df7922a6fc8eb6b76af1c2459f203864b76fd2b2e55c15b7888b52a52d1226812cfcd936fbfd",
+    "78a31154c024cbc16ac1ec26438c7b899f4a3830202611232a2578fccc6b5a9d109d11c70fbb",
+    "8cce2b86c8ed8bde650e172c32b1cef7bd37fda5719624fc9a01020da6da47567d615fd7a748",
+    "df2e5461f9c49ba9e30a6f0e82b0dd939034603c252d86c120f1893d98d9bb546559b13e8666",
+    "887d734a0e8fd4d40220404cccfe4553a277e5012ef4727c79c21152b5a34d31cbfeead6956b",
+    "904eae0467178b472050c02ba2454ed1b1e6c79328c15486488718e638674c2ff6dcb4e6243e",
+    "a37148828ce1e64165e523b177fa57b6a5716c811e5f6998ff6520df411093d81dc82504d245",
+    "b45f10ccafdcff15636f89dd3442b7eb3cd56e5bcb291f313ce8560f89596538c32f6578a2f3",
+    "337b9aa740b43017e4bfaf34e3c3891de614453a14791635bb5aeb6b691675d6b82d9b8d4dc3",
+    "d86cca230126417ca8e4dae4f39735ca8619467a30b901e7b26d92e21dea3c637ed9b920377b",
+    "fb15d689b39ef8a30a61a1dae9aed83e655402c33b8be10570661257941fb3eb61dab00873b8",
+    "d28526709a6c1c3292e2dded23ad9262e48607cfad488d85cb2942d587102ce4dbda7dc65fac",
+    "8843ff33a425d6171d27729843150df53e305dc2f9b17e5cbf1384a988334a11df9d24c38e1a",
+    "6ff2a9de0be54b8fd6ec705d361b5fa304efb1e0ed47d50b80af46f26b6814951ac8a85b8288",
+    "2d5c417c3399baabb063445dced0b991c341e85b1185cd05aaba78a6758ef7acf06dfa4f2c61",
+    "fa75066ad8bc47550bc374cf18a9a78f11ec80fa4e858d23457f50959027143c6790c9107947",
+    "cb1ed9a151154ac62ab4b12d7b7053b85625f79b020748597bfcba9522a2060a9efb4af4f284",
+    "aa2398f35c75dba6ec85c94b2184b4c49dc2088df2226c4b1414e5a9bc79b9211ea87e057e87",
+    "3634005e89b58e6398a5dc12b9adbc781ace06854018222cd68a237087944ae8932d8d7e3242",
+    "0389c36d839b2c0ae676f98b2171a3557fb19cf909d5d3b7fb83f07d1f796b2864d6ab316c67",
+    "d9c177186926f72834f08dd971222969713cb0fb66635882ab258208757d700d69eb55cde038",
+    "1c0b834d45f1fec2f87e30246abc25b12579e25191fd52ac924eb62d697871841820955fa3f8",
+    "74e6439e33971c5ba1e1cebbedad58582d38d942c1797412ee252083b2cc7b98f50047872b14",
+    "bad956101b87d97cc0b30d390a441e9c091b783fec7175601a94929f1df3a1b5ef42fa4fbd17",
+    "bfbe71e980460169383fdc95fd5f4d3860e42f820cf10b18c42c0aa3cb0dc478cb4c243db495",
+    "add5bca1b4eabc657865d1b53dc467c3c40e2ccc800524c478ba784c9ca11be7c7058e17df8b",
+    "c49ce9d6b7fef29113f85bfa87977a483a4e27b3311a68f94586a402e7c509d7a68ba2eced13",
+    "82ab78040b52f1785593640ad0660eb17e29f783104b0daeab3eeb39a6912930bea9bbac73c8",
+    "1757661dd1a5d309b5828f04a9349955f4276e22c5ddd852f9a81c806aa1f03827aba2c19be3",
+    "0a7de81cad01c6cd6fed9b3956db3b8380308a2ff136b7350f6ac3ab25ac396854ff5b0597c9",
+    "bb1f4e318e0054509169567a907b8b65e9a0b063e5e1486558d754707dcaaf969a51140d8231",
+    "ba50946a220a059e542de9e1b2530cf569588c24aca2dca42b3f5a2774dd78989d23b8999e2d",
+    "6fa389782a965c57df82ca1ccacbfd34a9e4dad2c66e1e13dc4d3d1dd62872e8f1bf8d043c5b",
+    "bb5d279c8d1cc5f41b990224268428e5a336398f81f053702df0a6225d8d755d99d68a85943f",
+    "30e5d4c1d145bd0c7b5c4604cd53a68a",
+);
+
+/// 64x64 keyframe with ACTIVE CDEF (uv_pri 12 / y_sec 4 / uv_sec 1)
+/// AND active §7.17 self-guided (SGRPROJ) loop restoration on the V
+/// plane — the §5.11.57 per-superblock `read_lr` interleave + the §7.4
+/// deblock→CDEF→LR chain, plus V_PRED/H_PRED-with-angle-delta
+/// directional prediction (with left-edge upsample), decode byte-exact.
+#[test]
+fn i_only_64x64_prof0_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "i-only-64x64-prof0",
+        I_ONLY_64X64_IVF,
+        "737d1f9f3868d70aa77728089e7b16ff83c0c6e02c31c245391f2c15448e43f3",
+        1,
+    );
+}
+
+/// Two-keyframe stream with `apply_grain = 1` and a full §5.9.30 film
+/// grain parameter set — the §7.18.3 grain synthesis (LFSR, grain
+/// build, scaling LUT, noise blend) runs on both frames and the output
+/// matches the independent decoder bit-for-bit.
+#[test]
+fn film_grain_on_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "film-grain-on",
+        FILM_GRAIN_ON_IVF,
+        "77aacbe1e1bd0b863512c0be7bf3020c4f59420266b6443a2e268d9e70479a14",
+        2,
+    );
+}
+
+/// 128x128 keyframe on a single 128x128 superblock with real §7.14
+/// deblocking (levels 13/19/14), active CDEF, and SWITCHABLE loop
+/// restoration on Y + U (per-unit Wiener / SgrProj / None selection
+/// through §5.11.58 `read_lr_unit`).
+#[test]
+fn superblocks_128_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "superblocks-128",
+        SUPERBLOCKS_128_IVF,
+        "d60e5ba7d6f1774c069d4a05bc835f6af33542b245df79163678b8bc3a327464",
+        1,
+    );
+}

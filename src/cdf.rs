@@ -16504,7 +16504,13 @@ impl PartitionWalker {
         // those.
         let mut upsample_above: u8 = 0;
         let mut upsample_left: u8 = 0;
-        if (D45_PRED..=D67_PRED).contains(&mode) {
+        // §7.11.2.1: `is_directional_mode` spans V_PRED..=D67_PRED — a
+        // V_PRED / H_PRED with a non-zero angle delta is directional
+        // (`pAngle = 90/180 ± 3 * delta`), runs the step-4 pre-pass,
+        // and projects through the §7.11.2.4 kernel like any D-mode.
+        // Only the exact `pAngle == 90` / `pAngle == 180` cases take
+        // the step-10/11 plain copies (with no pre-pass).
+        if (V_PRED..=D67_PRED).contains(&mode) {
             let p_angle = MODE_TO_ANGLE[mode] + angle_delta * ANGLE_STEP;
             if enable_intra_edge_filter && p_angle != 90 && p_angle != 180 {
                 // §7.11.2.4 step-4 filter corner (only `90 < pAngle <
@@ -16576,13 +16582,19 @@ impl PartitionWalker {
                     &mut pred,
                 )
                 .is_ok(),
-                V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred).is_ok(),
-                H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred).is_ok(),
-                m if (D45_PRED..=D67_PRED).contains(&m) => predict_intra_d_mode(
-                    m,
-                    angle_delta,
+                // §7.11.2.4 steps 10/11 — the exact-90/180 degenerate
+                // copies (angle_delta == 0). A non-zero delta makes
+                // V_PRED / H_PRED fully directional (see below).
+                V_PRED if angle_delta == 0 => {
+                    predict_intra_v_pred(w, h, above_row, &mut pred).is_ok()
+                }
+                H_PRED if angle_delta == 0 => {
+                    predict_intra_h_pred(w, h, left_col, &mut pred).is_ok()
+                }
+                m if (V_PRED..=D67_PRED).contains(&m) => predict_intra_directional(
                     w,
                     h,
+                    MODE_TO_ANGLE[m] + angle_delta * ANGLE_STEP,
                     upsample_above,
                     upsample_left,
                     &above_ext,
@@ -31361,6 +31373,35 @@ impl PartitionWalker {
         quant: &QuantizerParams,
         read_deltas: bool,
     ) -> Result<(), crate::Error> {
+        self.decode_tile_syntax_with_lr(decoder, cdfs, params, None, inter_ctx, quant, read_deltas)
+    }
+
+    /// [`Self::decode_tile_syntax`] with the §5.11.2 `read_lr( r, c,
+    /// sbSize )` per-superblock loop-restoration read interleaved.
+    ///
+    /// When `lr_params` is `Some(_)` and any plane's
+    /// `FrameRestorationType != RESTORE_NONE`, the §5.11.57 unit-window
+    /// walk consumes the per-unit §5.11.58 `read_lr_unit` syntax at
+    /// each superblock **before** the §5.11.4 partition walk — the
+    /// spec's `read_lr` / `decode_partition` ordering inside the
+    /// §5.11.2 superblock loop. Omitting the read on a frame that
+    /// signals restoration would desynchronise the arithmetic decoder;
+    /// passing `None` (or an all-`RESTORE_NONE` `lr_params`) preserves
+    /// the historical behaviour bit-for-bit. The decoded units land on
+    /// the walker's per-plane §7.17 `LrType` / `LrWiener` / `LrSgrSet`
+    /// / `LrSgrXqd` grids consumed by
+    /// [`Self::loop_restore_frame_from_grid`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_tile_syntax_with_lr(
+        &mut self,
+        decoder: &mut crate::symbol_decoder::SymbolDecoder<'_>,
+        cdfs: &mut TileCdfContext,
+        params: &TileDecodeParams<'_>,
+        lr_params: Option<&LrParams>,
+        inter_ctx: Option<&InterFrameContext>,
+        quant: &QuantizerParams,
+        read_deltas: bool,
+    ) -> Result<(), crate::Error> {
         // §5.11.2: `sbSize = use_128x128_superblock ? BLOCK_128X128 :
         // BLOCK_64X64`; `sbSize4 = Num_4x4_Blocks_Wide[ sbSize ]`.
         let sb_size = if params.use_128x128_superblock {
@@ -31400,6 +31441,14 @@ impl PartitionWalker {
                     params.subsampling_x,
                     params.subsampling_y,
                 );
+                // §5.11.2 `read_lr( r, c, sbSize )` — the §5.11.57
+                // per-superblock loop-restoration unit reads, ahead of
+                // the partition walk.
+                if let Some(lr) = lr_params {
+                    // `read_lr` itself skips RESTORE_NONE planes, so an
+                    // all-NONE `lr_params` consumes no symbols.
+                    self.read_lr(decoder, cdfs, r, c, sb_size, lr)?;
+                }
                 // §5.11.4 `decode_partition( r, c, sbSize )`.
                 self.decode_partition_syntax(
                     decoder,

@@ -47,7 +47,7 @@ use crate::obu::{ObuIter, ObuType};
 use crate::sequence_header::{parse_sequence_header, SequenceHeader};
 use crate::symbol_decoder::SymbolDecoder;
 use crate::uncompressed_header_tail::{
-    FrameRestorationType, SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP,
+    SegmentationParams, MAX_SEGMENTS, SEG_LVL_ALT_Q, SEG_LVL_SKIP,
 };
 use crate::Error;
 
@@ -137,11 +137,24 @@ pub fn decode_frame_spec(
         .lr_params
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    if lr.uses_lr {
-        // §5.11.57 read_lr is not interleaved into the tile walk yet;
-        // decoding such a frame would desynchronise the symbol decoder.
-        return Err(Error::PartitionWalkOutOfRange);
-    }
+    // §5.11.57 loop-restoration state for the per-superblock `read_lr`
+    // interleave (walker-facing shape).
+    let lr_walk = crate::cdf::LrParams {
+        num_planes: cc.num_planes as usize,
+        frame_restoration_type: [
+            lr.frame_restoration_type[0] as u8,
+            lr.frame_restoration_type[1] as u8,
+            lr.frame_restoration_type[2] as u8,
+        ],
+        loop_restoration_size: lr.loop_restoration_size,
+        subsampling_x: u8::from(cc.subsampling_x),
+        subsampling_y: u8::from(cc.subsampling_y),
+        frame_height: fs.frame_height,
+        upscaled_width: fs.upscaled_width,
+        use_superres: fs.use_superres,
+        superres_denom: fs.superres_denom,
+        allow_intrabc: fh.allow_intrabc,
+    };
 
     // §5.9.2 CodedLossless / LosslessArray.
     let lossless = lossless_array(qp, sp);
@@ -258,11 +271,13 @@ pub fn decode_frame_spec(
     )
     .ok_or(Error::PartitionWalkOutOfRange)?;
 
-    // §5.11.2 decode_tile().
-    walker.decode_tile_syntax(
+    // §5.11.2 decode_tile() — with the §5.11.57 `read_lr` interleave
+    // when the frame signals loop restoration.
+    walker.decode_tile_syntax_with_lr(
         &mut decoder,
         &mut cdfs,
         &params,
+        if lr.uses_lr { Some(&lr_walk) } else { None },
         /* inter_ctx = */ None,
         &quant,
         /* read_deltas = */ dq.delta_q_present,
@@ -334,6 +349,16 @@ pub fn decode_frame_spec(
             );
         }
     }
+    // §7.4 steps 2-5: CDEF, then loop restoration. `plane_bufs` holds
+    // the post-deblock CurrFrame here; §7.17 needs BOTH that frame (the
+    // `UpscaledCurrFrame` — no superres on this path) and the CDEF
+    // output (`UpscaledCdefFrame`), so keep the pre-CDEF copy around
+    // when restoration is active.
+    let deblocked: Option<Vec<Vec<i32>>> = if lr.uses_lr {
+        Some(plane_bufs.clone())
+    } else {
+        None
+    };
     if let Some(cdef) = fh.cdef_params.as_ref() {
         if !coded_lossless && !fh.allow_intrabc && seq.enable_cdef && !cdef.short_circuited {
             // §7.15 filters from the deblocked frame into a fresh copy.
@@ -366,16 +391,50 @@ pub fn decode_frame_spec(
             );
         }
     }
-    // §7.17 loop restoration: `uses_lr` was rejected above, so the pass
-    // is the identity here. §7.16 superres likewise.
-    debug_assert!(matches!(
-        lr.frame_restoration_type,
-        [
-            FrameRestorationType::None,
-            FrameRestorationType::None,
-            FrameRestorationType::None
-        ]
-    ));
+    // §7.4 step 5 / §7.17: loop restoration from (UpscaledCurrFrame,
+    // UpscaledCdefFrame) into LrFrame. The §5.11.57 units were decoded
+    // by the tile walk's `read_lr` interleave above.
+    if let Some(mut curr_owned) = deblocked {
+        let mut cdef_owned: Vec<Vec<i32>> = plane_bufs.clone();
+        let mut curr: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        for (buf, &(pw, ph)) in curr_owned.iter_mut().zip(plane_dims.iter()) {
+            curr.push(PlaneBuffer {
+                rows: ph,
+                cols: pw,
+                samples: buf,
+            });
+        }
+        let mut cdef_bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        for (buf, &(pw, ph)) in cdef_owned.iter_mut().zip(plane_dims.iter()) {
+            cdef_bufs.push(PlaneBuffer {
+                rows: ph,
+                cols: pw,
+                samples: buf,
+            });
+        }
+        let mut lr_out: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
+        for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
+            lr_out.push(PlaneBuffer {
+                rows: ph,
+                cols: pw,
+                samples: buf,
+            });
+        }
+        walker.loop_restore_frame_from_grid(
+            lr,
+            cc.num_planes,
+            cc.bit_depth,
+            sub_x as u8,
+            sub_y as u8,
+            mi_rows,
+            mi_cols,
+            fs.frame_height,
+            fs.upscaled_width,
+            &curr,
+            &cdef_bufs,
+            &mut lr_out,
+        );
+    }
 
     // ---- §7.18.3 film grain. ----
     if let Some(fg) = fh.film_grain_params.as_ref() {
