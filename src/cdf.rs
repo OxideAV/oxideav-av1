@@ -24966,6 +24966,20 @@ impl PartitionWalker {
                 self.mvs[(cell * 2) * 2 + 1] = mv[0][1] as i16;
                 self.mvs[(cell * 2 + 1) * 2] = mv[1][0] as i16;
                 self.mvs[(cell * 2 + 1) * 2 + 1] = mv[1][1] as i16;
+                // §5.11.5 `YModes[ r + y ][ c + x ] = YMode` — the
+                // inter-arm grid-fill. §7.10.2.8 reads it back as
+                // `candMode` (the `has_newmv( candMode )` NewMvCount
+                // increment driving the §7.10.2.14 `NewMvContext`
+                // derivation, and the GLOBALMV `candMv` special case),
+                // and the §7.14.4 deblock strength selection reads it
+                // as `mode` for the `Mode_Deltas` modeType split.
+                // (r390 fix: the inter arm previously left the grid at
+                // its DC_PRED prefill, so a NEWMV neighbour never
+                // advanced `NewMvCount` and every `new_mv` read after
+                // one used ctx `5` where §7.10.2.14 requires `4` —
+                // desynchronising the arithmetic decoder on the first
+                // inter frame with a NEWMV-coded neighbour.)
+                self.y_modes[cell] = y_mode;
             }
         }
 
@@ -32603,6 +32617,7 @@ impl PartitionWalker {
             is_compound,
             ref_frame,
             &global_mvs,
+            &gm_type,
             allow_high_precision_mv,
             force_integer_mv,
             &mut state,
@@ -32619,6 +32634,7 @@ impl PartitionWalker {
             is_compound,
             ref_frame,
             &global_mvs,
+            &gm_type,
             allow_high_precision_mv,
             force_integer_mv,
             &mut state,
@@ -32636,6 +32652,7 @@ impl PartitionWalker {
                 is_compound,
                 ref_frame,
                 &global_mvs,
+                &gm_type,
                 allow_high_precision_mv,
                 force_integer_mv,
                 &mut state,
@@ -32692,6 +32709,7 @@ impl PartitionWalker {
             is_compound,
             ref_frame,
             &global_mvs,
+            &gm_type,
             allow_high_precision_mv,
             force_integer_mv,
             &mut state,
@@ -32711,6 +32729,7 @@ impl PartitionWalker {
             is_compound,
             ref_frame,
             &global_mvs,
+            &gm_type,
             allow_high_precision_mv,
             force_integer_mv,
             &mut state,
@@ -32729,6 +32748,7 @@ impl PartitionWalker {
             is_compound,
             ref_frame,
             &global_mvs,
+            &gm_type,
             allow_high_precision_mv,
             force_integer_mv,
             &mut state,
@@ -32748,6 +32768,7 @@ impl PartitionWalker {
                 is_compound,
                 ref_frame,
                 &global_mvs,
+                &gm_type,
                 allow_high_precision_mv,
                 force_integer_mv,
                 &mut state,
@@ -32768,6 +32789,7 @@ impl PartitionWalker {
                 is_compound,
                 ref_frame,
                 &global_mvs,
+                &gm_type,
                 allow_high_precision_mv,
                 force_integer_mv,
                 &mut state,
@@ -32879,6 +32901,7 @@ impl PartitionWalker {
         is_compound: bool,
         ref_frame: [i32; 2],
         global_mvs: &[[i32; 2]; 2],
+        gm_type: &[i32; 8],
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
         state: &mut MvStackState,
@@ -32928,6 +32951,7 @@ impl PartitionWalker {
                 weight,
                 ref_frame,
                 global_mvs,
+                gm_type,
                 allow_high_precision_mv,
                 force_integer_mv,
                 state,
@@ -32948,6 +32972,7 @@ impl PartitionWalker {
         is_compound: bool,
         ref_frame: [i32; 2],
         global_mvs: &[[i32; 2]; 2],
+        gm_type: &[i32; 8],
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
         state: &mut MvStackState,
@@ -32990,6 +33015,7 @@ impl PartitionWalker {
                 weight,
                 ref_frame,
                 global_mvs,
+                gm_type,
                 allow_high_precision_mv,
                 force_integer_mv,
                 state,
@@ -33015,6 +33041,7 @@ impl PartitionWalker {
         is_compound: bool,
         ref_frame: [i32; 2],
         global_mvs: &[[i32; 2]; 2],
+        gm_type: &[i32; 8],
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
         state: &mut MvStackState,
@@ -33042,6 +33069,7 @@ impl PartitionWalker {
             weight,
             ref_frame,
             global_mvs,
+            gm_type,
             allow_high_precision_mv,
             force_integer_mv,
             state,
@@ -33062,6 +33090,7 @@ impl PartitionWalker {
         weight: u32,
         ref_frame: [i32; 2],
         global_mvs: &[[i32; 2]; 2],
+        gm_type: &[i32; 8],
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
         state: &mut MvStackState,
@@ -33083,6 +33112,7 @@ impl PartitionWalker {
                         weight,
                         ref_frame,
                         global_mvs,
+                        gm_type,
                         allow_high_precision_mv,
                         force_integer_mv,
                         state,
@@ -33121,30 +33151,39 @@ impl PartitionWalker {
         weight: u32,
         ref_frame: [i32; 2],
         global_mvs: &[[i32; 2]; 2],
+        gm_type: &[i32; 8],
         allow_high_precision_mv: bool,
         force_integer_mv: bool,
         state: &mut MvStackState,
     ) {
         let cand_mode = self.y_mode_at(mv_row as i32, mv_col as i32);
-        // §7.10.2.8 candMv derivation. The spec text reads:
+        // §7.10.2.8 candMv derivation:
         //   • If candMode in {GLOBALMV, GLOBAL_GLOBALMV} AND
         //     GmType[RefFrame[0]] > TRANSLATION AND large == 1,
         //     candMv = GlobalMvs[0].
         //   • Otherwise candMv = Mvs[mvRow][mvCol][candList].
         //
-        // On the conformant decode path the first arm is a no-op
-        // refinement: §5.11.31 `assign_mv` stamps
-        // `Mvs[mvRow][mvCol][refList] = GlobalMvs[refList]` for any
-        // block whose YMode is GLOBALMV / GLOBAL_GLOBALMV (the
-        // §5.11.31 driver computes the global MV and assigns it
-        // before the next block's §7.10.2.8 fires). The "use Mvs[..]"
-        // fall-through therefore produces the same bytes as the
-        // §7.10.2.8 special-case; we always take that path,
-        // sidestepping the need to plumb `gm_type` / `large` through
-        // the search-stack signature.
-        let _ = ref_frame;
-        let _ = global_mvs;
-        let cand_mv: [i32; 2] = {
+        // `large = Min(Block_Width[candSize], Block_Height[candSize])
+        // >= 8` — in 4x4-block units, `min(bw4, bh4) >= 2`. The
+        // GlobalMvs arm matters for warp-class global motion
+        // (ROTZOOM / AFFINE): §7.10.2.1 evaluates the model at the
+        // CURRENT block's centre, which differs from the neighbour's
+        // stamped `Mvs[]` (evaluated at the neighbour's centre). For
+        // IDENTITY / TRANSLATION models the two are byte-identical and
+        // the arm's `> TRANSLATION` gate skips it anyway.
+        let cand_size = self.mi_size_at(mv_row as i32, mv_col as i32);
+        let large = core::cmp::min(
+            NUM_4X4_BLOCKS_WIDE[cand_size],
+            NUM_4X4_BLOCKS_HIGH[cand_size],
+        ) >= 2;
+        let ref0 = ref_frame[0];
+        let use_global = (cand_mode == MODE_GLOBALMV || cand_mode == MODE_GLOBAL_GLOBALMV)
+            && (0..8).contains(&ref0)
+            && gm_type[ref0 as usize] > GM_TYPE_TRANSLATION
+            && large;
+        let cand_mv: [i32; 2] = if use_global {
+            global_mvs[0]
+        } else {
             let v = self.mv_at(mv_row as i32, mv_col as i32, cand_list, 0) as i32;
             let h = self.mv_at(mv_row as i32, mv_col as i32, cand_list, 1) as i32;
             [v, h]

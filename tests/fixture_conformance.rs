@@ -1009,6 +1009,59 @@ fn i_frame_then_p_64x64_decodes_byte_exact() {
     );
 }
 
+const OBU_WITH_EXTENSION_HEADERS_IVF: &str = concat!(
+    "444b494600002000415630314000400019000000010000000200000000000000a60200000000",
+    "00000000000012000a0a00000002afff9b5f300832950514002d400820a3890a8808db71c0fe",
+    "90488ba6120ccacc86c8d1f63d881a047d372f418479457e4288b02f2299af704f2f55bab873",
+    "1a7aba74740c1aca5ccd9717120df004fcddb4a0e38df1c770c22b01d2c579641d4952b28358",
+    "00f35ba46461e13ab37f0c76a954c9a0d329e8d3fc69b277b2b939a47b27aad1f8dea8ccf1b7",
+    "360f0e3266e8475ac47f32de421864117507d189624ec83cd6868b542a3905494e5f16757af3",
+    "75e2ecf7669c517a1893ff93f05214ae1a539bc28d1b9763dac01c79c78500c796a954aae313",
+    "247a0d942fd76b65ebcbd3639f840ab5d9c5904e5843111ea02e694e191d8fee1d3999b17fbd",
+    "a6cb874e05d79f12e5d5ded468221b91dc8857f8129588597f0e294381512bd27b5a59f41dcf",
+    "4413dc49153224bf4ff98887eafc4275aa98fb218114b566637bf3126df8764f50c10bb1700c",
+    "b91a9f9634ffe06305d8e32d1367b108010056ec1f2fe6438b7eceb2e05bfa36429db4d01372",
+    "55f30a2b23aa677b328e8b94938073dceac52c951160a02b3b35e1d5bee092f809e5ea6512eb",
+    "27d55cf23fa04558a85e04fe3b3e106f2d428b81e37317fb861cb8202cd7f32743b85015d6e5",
+    "f26ece1055d66942ee929aecf2cedef0b7a3c8df645c5c06edb337b6ff6f073022bc6b30646f",
+    "7d26e69f89c45bad03baa982cba7bfa1d07cd475649a57e073367be3154612b10b3ed6548596",
+    "a28e5d2323e3e9b664e77522351fc3cc960af7b1a6f62781207bf08db9ddf64ca57534e56de2",
+    "4e501ffe8063c2f4b7b8e99938bb75403a3c3b555a542501b55a2139e5dbd327189bd9ecf4a5",
+    "eecbd6e388ead052f2d064b1ab56ff95ed084239044c88bcae6d08f3cec94f0cffed04f4d081",
+    "d986234cf036efb65f9e7bc09890647550de43407ced36771e22ca1d5452a27e0d86e1ad7450",
+    "c70000000100000000000000120032c2013201e0400000235e0020834b1215d01400db3183df",
+    "2c10bf8fb2484bd871b2d47408bed6ada734a90c3367560ff367eec8117fd687c190d4e55f1e",
+    "7f8e6a3cd6ebd5440977043634844db3c00164aeac1ccec459d04e6faeabd59b2c9413cb5c09",
+    "70915507e27ba42151b8bfd5a0df281372c2d76d6c4777be213ec56a2d557ba29821b9e7c021",
+    "1a6e0ac7d57b0008a2571a9c175549ba2b1fbae3ef40f8b3a69bc868c45348acfad3fd457566",
+    "4441a9c615c3942982d3198c4857b5eec716dd55c0",
+);
+
+/// KEY + INTER with per-block motion coding: unlike the GLOBALMV-only
+/// P stream above, this stream's inter frame codes NEWMV leaves with
+/// real §7.10.2 mv-stack prediction (`new_mv` / `zero_mv` / `ref_mv`
+/// cascades, `drl_mode` against `DrlCtxStack`, §5.11.32 mv-component
+/// reads), §5.11.16/17 var-tx trees with non-skip inter residuals
+/// (`txfm_split` recursion, §5.11.47 `inter_tx_type` from both
+/// TX_SET_INTER_1 and TX_SET_INTER_3), and §5.11.27 `motion_mode`
+/// reads resolving to SIMPLE / OBMC / LOCALWARP (the §7.11.3.8
+/// least-squares warp fit + §7.11.3.5 warp filter run on real
+/// bitstream state). Byte-exactness required the r390 §5.11.5 inter
+/// `YModes[]` grid-fill: §7.10.2.8 reads the neighbour's Y mode as
+/// `candMode`, and `has_newmv( candMode )` drives the §7.10.2.14
+/// `NewMvContext` (a NEWMV neighbour selects ctx 4, not 5 — a
+/// one-row CDF difference that desynchronised the arithmetic decoder
+/// from the first NEWMV-adjacent block onward).
+#[test]
+fn obu_with_extension_headers_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "obu-with-extension-headers",
+        OBU_WITH_EXTENSION_HEADERS_IVF,
+        "0d8e27dfdc4ab7ceeaf1bfcb9e811c42b154e13b8ede212074c2b7ab2959f5a7",
+        2,
+    );
+}
+
 /// `use_superres = 1`, `coded_denom = 3` (128 -> 85 coded width, a
 /// NON-mi-aligned frame): the §7.16 polyphase upscaler (including its
 /// `Clip3(0, miW * MI_SIZE - 1, ..)` clamp reading decoded mi-grid
