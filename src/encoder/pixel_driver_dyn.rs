@@ -453,6 +453,7 @@ pub fn build_intra_only_yuv420_8bit_fh_with_q(
         }),
         reference_select: Some(false),
         skip_mode_present: Some(false),
+        skip_mode_frame: None,
         allow_warped_motion: Some(false),
         reduced_tx_set: Some(false),
         global_motion_params: Some(GlobalMotionParams::identity()),

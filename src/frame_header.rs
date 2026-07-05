@@ -353,6 +353,25 @@ pub struct RefInfo {
     pub render_width: [u32; NUM_REF_FRAMES as usize],
     /// `RefRenderHeight[i]` — the stored `RenderHeight` of slot `i`.
     pub render_height: [u32; NUM_REF_FRAMES as usize],
+    /// `RefFrameType[i] == KEY_FRAME` — the §5.9.2 `show_existing_frame`
+    /// arm reads it to set `frame_type = RefFrameType[
+    /// frame_to_show_map_idx ]` and force `refresh_frame_flags =
+    /// allFrames` for a shown KEY frame (the §7.21 load trigger).
+    pub frame_type_is_key: [bool; NUM_REF_FRAMES as usize],
+    /// §7.20 `SavedGmParams[i][ref][j]` — the stored `gm_params` of
+    /// slot `i`. §5.9.2 `load_previous()` copies the primary ref's
+    /// entry into `PrevGmParams`, the §5.9.24 per-parameter prediction
+    /// base.
+    pub saved_gm_params: [[[i32; 6]; crate::uncompressed_header_tail::TOTAL_REFS_PER_FRAME];
+        NUM_REF_FRAMES as usize],
+    /// §7.20 `save_loop_filter_params(i)` — the stored
+    /// `loop_filter_ref_deltas[]` of slot `i`, loaded back by §5.9.2
+    /// `load_previous()` as the §5.9.11 running deltas.
+    pub saved_lf_ref_deltas:
+        [[i8; crate::uncompressed_header_tail::TOTAL_REFS_PER_FRAME]; NUM_REF_FRAMES as usize],
+    /// §7.20 `save_loop_filter_params(i)` — the stored
+    /// `loop_filter_mode_deltas[]` of slot `i`.
+    pub saved_lf_mode_deltas: [[i8; 2]; NUM_REF_FRAMES as usize],
 }
 
 impl Default for RefInfo {
@@ -370,6 +389,12 @@ impl Default for RefInfo {
             frame_height: [0; NUM_REF_FRAMES as usize],
             render_width: [0; NUM_REF_FRAMES as usize],
             render_height: [0; NUM_REF_FRAMES as usize],
+            frame_type_is_key: [false; NUM_REF_FRAMES as usize],
+            saved_gm_params: [crate::uncompressed_header_tail::prev_gm_params_default();
+                NUM_REF_FRAMES as usize],
+            saved_lf_ref_deltas: [crate::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT;
+                NUM_REF_FRAMES as usize],
+            saved_lf_mode_deltas: [[0i8; 2]; NUM_REF_FRAMES as usize],
         }
     }
 }
@@ -578,6 +603,11 @@ pub struct FrameHeader {
     /// `FrameIsIntra` branch sets `skipModeAllowed = 0` so
     /// `skip_mode_present = 0` with no bits read.
     pub skip_mode_present: Option<bool>,
+    /// §5.9.22 `SkipModeFrame[ 0..2 ]` — the fixed compound reference
+    /// pair a `skip_mode == 1` block predicts from. `Some` only when
+    /// the §5.9.22 derivation found a usable pair (`skipModeAllowed`);
+    /// `None` for intra frames and when no pair exists.
+    pub skip_mode_frame: Option<[u8; 2]>,
     /// `allow_warped_motion` (§5.9.2). `Some` for intra frames; `None`
     /// otherwise. The §5.9.2 `FrameIsIntra || error_resilient_mode ||
     /// !enable_warped_motion` guard forces it to `0` (no bits read) for
@@ -772,6 +802,7 @@ fn parse_with(
             seq.color_config.num_planes,
             coded_lossless,
             allow_intrabc,
+            None,
         )?;
         // §5.9.2 spec order after loop_filter_params(): cdef_params()
         // (§5.9.19). The §5.9.19 short-circuit fires on `CodedLossless
@@ -846,6 +877,7 @@ fn parse_with(
             tx_mode: Some(tx_mode),
             reference_select: Some(reference_select),
             skip_mode_present: Some(skip_mode_present),
+            skip_mode_frame: None,
             allow_warped_motion: Some(allow_warped_motion),
             reduced_tx_set: Some(reduced_tx_set),
             global_motion_params: Some(global_motion_params),
@@ -870,23 +902,23 @@ fn parse_with(
         } else {
             None
         };
-        // We don't carry the RefFrameType state across calls in this
-        // round, so we can't actually look up RefFrameType[map_idx]
-        // to know whether it was KEY_FRAME — but the trace tells the
-        // decoder this from session state, not the bitstream. For
-        // the structural parser we return frame_type = INTER (the
-        // common case for replays); a downstream session-aware layer
-        // can correct it from its own RefFrameType array. We pick
-        // INTER here because §5.9.2 only forces refresh_frame_flags
-        // to allFrames if the replayed frame was KEY, and we leave
-        // refresh_frame_flags at 0 to match the trace's common
-        // "ref-frame-state-replay" reading.
+        // §5.9.2: `frame_type = RefFrameType[ frame_to_show_map_idx ]`
+        // — session state carried in [`RefInfo::frame_type_is_key`]
+        // (the bitstream codes only the slot index). A shown KEY frame
+        // forces `refresh_frame_flags = allFrames`, which is what
+        // triggers the §7.21 reference-frame loading + §7.20 re-store
+        // in the decode driver.
+        let shown_is_key = ref_info.frame_type_is_key[map_idx as usize];
         return Ok(FrameHeader {
             show_existing_frame: true,
             frame_to_show_map_idx: Some(map_idx),
             display_frame_id: display_id,
-            frame_type: FrameType::Inter,
-            frame_is_intra: false,
+            frame_type: if shown_is_key {
+                FrameType::Key
+            } else {
+                FrameType::Inter
+            },
+            frame_is_intra: shown_is_key,
             show_frame: true,
             showable_frame: false,
             error_resilient_mode: false,
@@ -897,7 +929,7 @@ fn parse_with(
             frame_size_override_flag: false,
             order_hint: 0,
             primary_ref_frame: PRIMARY_REF_NONE,
-            refresh_frame_flags: 0,
+            refresh_frame_flags: if shown_is_key { ALL_FRAMES } else { 0 },
             frame_size: None,
             allow_intrabc: false,
             disable_frame_end_update_cdf: false,
@@ -912,6 +944,7 @@ fn parse_with(
             tx_mode: None,
             reference_select: None,
             skip_mode_present: None,
+            skip_mode_frame: None,
             allow_warped_motion: None,
             reduced_tx_set: None,
             global_motion_params: None,
@@ -1039,6 +1072,8 @@ fn parse_with(
     // paths converge on `disable_frame_end_update_cdf` + the shared
     // tile/quant/segment/.../film-grain tail.
     let mut inter_refs: Option<InterFrameRefs> = None;
+    // §5.9.22 `SkipModeFrame[]` — captured out of the inter arm.
+    let mut skip_mode_frame_out: Option<[u8; 2]> = None;
     let (
         frame_size,
         allow_intrabc,
@@ -1095,7 +1130,8 @@ fn parse_with(
         // (§5.9.11). The §5.9.11 short-circuit fires on
         // CodedLossless || allow_intrabc.
         let coded_lossless = compute_coded_lossless(&qp, &sp);
-        let lf = read_loop_filter_params(br, seq.color_config.num_planes, coded_lossless, aib)?;
+        let lf =
+            read_loop_filter_params(br, seq.color_config.num_planes, coded_lossless, aib, None)?;
         // §5.9.2 spec order after loop_filter_params(): cdef_params()
         // (§5.9.19). The §5.9.19 short-circuit fires on `CodedLossless
         // || allow_intrabc || !enable_cdef`.
@@ -1258,7 +1294,25 @@ fn parse_with(
         let dq = read_delta_q_params(br, qp.base_q_idx)?;
         let dlf = read_delta_lf_params(br, dq.delta_q_present, aib)?;
         let coded_lossless = compute_coded_lossless(&qp, &sp);
-        let lf = read_loop_filter_params(br, seq.color_config.num_planes, coded_lossless, aib)?;
+        // §5.9.2 load_previous(): with a primary reference, the §5.9.11
+        // running deltas start from the primary ref's §7.20-saved
+        // values rather than the defaults.
+        let lf_prev = if primary_ref_frame == PRIMARY_REF_NONE {
+            None
+        } else {
+            let slot = ref_frame_idx[primary_ref_frame as usize] as usize;
+            Some((
+                &ref_info.saved_lf_ref_deltas[slot],
+                &ref_info.saved_lf_mode_deltas[slot],
+            ))
+        };
+        let lf = read_loop_filter_params(
+            br,
+            seq.color_config.num_planes,
+            coded_lossless,
+            aib,
+            lf_prev,
+        )?;
         let cdef = read_cdef_params(
             br,
             seq.color_config.num_planes,
@@ -1289,7 +1343,7 @@ fn parse_with(
         // reference_select == 0 so skipModeAllowed == 0 with no bit
         // read; the full derivation against arbitrary RefOrderHint[]
         // values is a followup.
-        let skip_mode_present = read_skip_mode_present(
+        let (skip_mode_present, skip_mode_frame) = read_skip_mode_present(
             br,
             reference_select,
             seq.enable_order_hint,
@@ -1298,6 +1352,11 @@ fn parse_with(
             &ref_frame_idx,
             ref_info,
         )?;
+        skip_mode_frame_out = if skip_mode_present {
+            skip_mode_frame
+        } else {
+            None
+        };
         // §5.9.2 allow_warped_motion guard: read `f(1)` only when
         // `!error_resilient_mode && enable_warped_motion` (FrameIsIntra
         // is false on this branch).
@@ -1308,13 +1367,17 @@ fn parse_with(
         };
         // §5.9.2 reduced_tx_set f(1).
         let reduced_tx_set = br.f(1)? == 1;
-        // §5.9.24 global_motion_params() — inter path reads.
-        let gm = read_global_motion_params(
-            br,
-            false,
-            allow_high_precision_mv,
-            &prev_gm_params_default(),
-        )?;
+        // §5.9.24 global_motion_params() — inter path reads. §5.9.2
+        // load_previous(): `PrevGmParams = SavedGmParams[ ref_frame_idx[
+        // primary_ref_frame ] ]` when a primary reference exists,
+        // otherwise the §7.13.1 identity defaults
+        // (setup_past_independence).
+        let prev_gm = if primary_ref_frame == PRIMARY_REF_NONE {
+            prev_gm_params_default()
+        } else {
+            ref_info.saved_gm_params[ref_frame_idx[primary_ref_frame as usize] as usize]
+        };
+        let gm = read_global_motion_params(br, false, allow_high_precision_mv, &prev_gm)?;
         // §5.9.30 film_grain_params().
         let fg = read_film_grain_params(
             br,
@@ -1393,6 +1456,7 @@ fn parse_with(
         tx_mode,
         reference_select,
         skip_mode_present,
+        skip_mode_frame: skip_mode_frame_out,
         allow_warped_motion,
         reduced_tx_set,
         global_motion_params,
@@ -1663,10 +1727,10 @@ fn read_skip_mode_present(
     order_hint_bits: u8,
     ref_frame_idx: &[u8; REFS_PER_FRAME],
     ref_info: &RefInfo,
-) -> Result<bool, Error> {
+) -> Result<(bool, Option<[u8; 2]>), Error> {
     // §5.9.22: FrameIsIntra is false on this branch (inter path).
     if !reference_select || !enable_order_hint {
-        return Ok(false);
+        return Ok((false, None));
     }
 
     let rel = |a: u32| -> i64 {
@@ -1700,10 +1764,15 @@ fn read_skip_mode_present(
         }
     }
 
-    let skip_mode_allowed = if forward_idx < 0 {
-        false
+    // §5.9.22: alongside `skipModeAllowed`, derive `SkipModeFrame[]`
+    // (`LAST_FRAME + Min/Max` of the selected reference indices) — the
+    // §5.11.23 skip-mode arm's fixed compound reference pair.
+    let (skip_mode_allowed, skip_mode_frame) = if forward_idx < 0 {
+        (false, None)
     } else if backward_idx >= 0 {
-        true
+        let lo = forward_idx.min(backward_idx) as u8;
+        let hi = forward_idx.max(backward_idx) as u8;
+        (true, Some([LAST_FRAME_U8 + lo, LAST_FRAME_U8 + hi]))
     } else {
         // Two-forward-reference fallback.
         let mut second_forward_idx: i32 = -1;
@@ -1723,15 +1792,25 @@ fn read_skip_mode_present(
                 second_forward_hint = ref_hint;
             }
         }
-        second_forward_idx >= 0
+        if second_forward_idx >= 0 {
+            let lo = forward_idx.min(second_forward_idx) as u8;
+            let hi = forward_idx.max(second_forward_idx) as u8;
+            (true, Some([LAST_FRAME_U8 + lo, LAST_FRAME_U8 + hi]))
+        } else {
+            (false, None)
+        }
     };
 
     if skip_mode_allowed {
-        Ok(br.f(1)? == 1)
+        let present = br.f(1)? == 1;
+        Ok((present, skip_mode_frame))
     } else {
-        Ok(false)
+        Ok((false, skip_mode_frame))
     }
 }
+
+/// `LAST_FRAME` as `u8` for the §5.9.22 `SkipModeFrame[]` derivation.
+const LAST_FRAME_U8: u8 = crate::uncompressed_header_tail::LAST_FRAME as u8;
 
 /// `get_relative_dist(a, b)` for two stored order hints (helper for
 /// `read_skip_mode_present`).

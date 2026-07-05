@@ -324,7 +324,7 @@ pub fn parse_loop_filter_params(
     allow_intrabc: bool,
 ) -> Result<(LoopFilterParams, usize), Error> {
     let mut br = BitReader::new(payload);
-    let lf = read_loop_filter_params(&mut br, num_planes, coded_lossless, allow_intrabc)?;
+    let lf = read_loop_filter_params(&mut br, num_planes, coded_lossless, allow_intrabc, None)?;
     Ok((lf, br.position()))
 }
 
@@ -333,6 +333,7 @@ pub(crate) fn read_loop_filter_params(
     num_planes: u8,
     coded_lossless: bool,
     allow_intrabc: bool,
+    prev_deltas: Option<(&[i8; TOTAL_REFS_PER_FRAME], &[i8; 2])>,
 ) -> Result<LoopFilterParams, Error> {
     if coded_lossless || allow_intrabc {
         return Ok(LoopFilterParams::short_circuit());
@@ -349,8 +350,17 @@ pub(crate) fn read_loop_filter_params(
     let loop_filter_sharpness = br.f(3)? as u8;
     let loop_filter_delta_enabled = br.f(1)? == 1;
 
-    let mut loop_filter_ref_deltas = LOOP_FILTER_REF_DELTAS_DEFAULT;
-    let mut loop_filter_mode_deltas = LOOP_FILTER_MODE_DELTAS_DEFAULT;
+    // §5.9.2 `load_previous()` vs `setup_past_independence()`: when
+    // `primary_ref_frame != PRIMARY_REF_NONE` the running deltas are
+    // the primary reference's §7.20-saved values; otherwise the §5.9.11
+    // defaults. `loop_filter_delta_update == 0` leaves them untouched.
+    let (mut loop_filter_ref_deltas, mut loop_filter_mode_deltas) = match prev_deltas {
+        Some((r, m)) => (*r, *m),
+        None => (
+            LOOP_FILTER_REF_DELTAS_DEFAULT,
+            LOOP_FILTER_MODE_DELTAS_DEFAULT,
+        ),
+    };
     let mut loop_filter_delta_update = false;
 
     if loop_filter_delta_enabled {
