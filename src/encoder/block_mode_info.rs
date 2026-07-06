@@ -19661,7 +19661,7 @@ mod tests {
                     eic,
                     /* enable_masked_compound = */ false,
                     /* enable_jnt_comp = */ false,
-                    /* dist_equal = */ false,
+                    /* order_hints = */ crate::cdf::FrameInterOrderHints::IDENTITY,
                     SWITCHABLE,
                     /* enable_dual_filter = */ false,
                     &mfmvs,

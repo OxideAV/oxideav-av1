@@ -567,9 +567,9 @@ fn decode_frame_spec_full(
         c.enable_interintra_compound = seq.enable_interintra_compound;
         c.enable_masked_compound = seq.enable_masked_compound;
         c.enable_jnt_comp = seq.enable_jnt_comp;
-        // §8.3.2 compound-idx `dist_equal` is per-block (the two refs'
-        // relative distances); single-ref-only streams never read it.
-        c.dist_equal = false;
+        // §8.3.2 compound-idx ctx + §7.11.3.15 DISTANCE weights both
+        // derive per block from the frame's OrderHint / OrderHints[].
+        c.order_hints = order_hints;
         c.interpolation_filter = ir.interpolation_filter as u8;
         c.enable_dual_filter = seq.enable_dual_filter;
         c.pixels = Some(&pixels);

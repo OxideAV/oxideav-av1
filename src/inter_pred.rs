@@ -1489,6 +1489,26 @@ pub struct ObmcNeighbour<'a> {
     /// `x4 += step4` (above-pass) or `y4 += step4` (left-pass) after
     /// consuming the neighbour.
     pub step4: u8,
+    /// The CANDIDATE cell's horizontal interpolation filter —
+    /// §7.11.3.9 step 6 invokes §7.11.3.4 with `candRow, candCol`, so
+    /// the overlap prediction reads `InterpFilters[ candRow ][
+    /// candCol ][ 1 ]` (the neighbour's own filter, not the OBMC
+    /// block's). r394 dual-filter fix.
+    pub interp_filter_x: u8,
+    /// The candidate cell's vertical filter — `InterpFilters[ candRow
+    /// ][ candCol ][ 0 ]` per §7.11.3.4.
+    pub interp_filter_y: u8,
+    /// The §7.11.3.9 axis position (`x4` on the above-pass, `y4` on
+    /// the left-pass, in mi units) at which this candidate's
+    /// `predict_overlap` fires — `predX = ( x4 * 4 ) >> subX` /
+    /// `predY = ( y4 * 4 ) >> subY` read it. The walk position is NOT
+    /// reconstructible from the qualifying list alone: a skipped
+    /// candidate (`RefFrames[ cand ][ 0 ] <= INTRA_FRAME`) still
+    /// advances `x4` / `y4` by ITS OWN `step4` without appearing here
+    /// (r394 fix — the driver previously re-walked positions assuming
+    /// every visited slot qualified, misplacing every overlap region
+    /// after a skipped intra candidate).
+    pub axis_pos4: u16,
 }
 
 /// §7.11.3.9 OBMC mi-grid context — caller-resolved neighbour lists
@@ -1895,8 +1915,6 @@ fn obmc_walk_axis(
     subsampling_y: u8,
     frame_width: u32,
     frame_height: u32,
-    interp_filter_x: u8,
-    interp_filter_y: u8,
     inter_round0: u32,
     inter_round1: u32,
     bit_depth: u8,
@@ -1942,18 +1960,20 @@ fn obmc_walk_axis(
     let n_limit: u32 = 4.min(axis_limit_log2 as u32);
 
     let mut n_count: u32 = 0;
-    let mut axis_pos: u32 = axis_start;
-    let mut neighbour_iter = neighbours.iter();
 
-    while n_count < n_limit && axis_pos < frame_limit {
-        let Some(cand) = neighbour_iter.next() else {
-            // The caller supplied fewer qualifying neighbours than
-            // the loop would visit; the spec's `if (RefFrames[..][0] >
-            // INTRA_FRAME)` gate would have skipped the missing
-            // slots. We treat exhausting the list as "no more
-            // qualifying candidates on this axis" and stop.
+    for cand in neighbours {
+        // The caller resolved the §7.11.3.9 walk (including skipped
+        // non-qualifying candidates, which advance the axis position
+        // without appearing in the list); each surfaced neighbour
+        // carries the `x4` / `y4` it fires at. The `nLimit` and
+        // frame-edge guards still bound a caller-bug oversupply.
+        if n_count >= n_limit {
             break;
-        };
+        }
+        let axis_pos: u32 = cand.axis_pos4 as u32;
+        if axis_pos < axis_start || axis_pos >= frame_limit {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
         // §7.11.3.9 step4 = Clip3(2, 16, Num_4x4_Blocks_{Wide,High}[
         // candSz]). The caller already applied the Clip3.
         let step4: u32 = cand.step4 as u32;
@@ -2003,7 +2023,6 @@ fn obmc_walk_axis(
         // edge), clamp pred_w/pred_h to what fits and skip if there's
         // no overlap left.
         if pred_w == 0 || pred_h == 0 {
-            axis_pos = axis_pos.saturating_add(step4);
             continue;
         }
         let off_x = (pred_x_plane as i64) - (block_x_plane as i64);
@@ -2019,13 +2038,15 @@ fn obmc_walk_axis(
         let fit_w = pred_w.min(block_w - off_x);
         let fit_h = pred_h.min(block_h - off_y);
         if fit_w == 0 || fit_h == 0 {
-            axis_pos = axis_pos.saturating_add(step4);
             continue;
         }
 
         // §7.11.3.9 steps 5/6 — run the translational MC kernel for
         // the neighbour MV / refIdx at this `(predX, predY)` against
         // a `pred_w × pred_h` (fitted) region.
+        // §7.11.3.9 step 6 → §7.11.3.4 with (candRow, candCol): the
+        // overlap MC uses the NEIGHBOUR's `InterpFilters[ cand ][ dir ]`
+        // pair, not the OBMC block's own (r394 dual-filter fix).
         let obmc_pred_i32 = predict_inter_per_ref(
             &cand.bundle,
             plane,
@@ -2037,8 +2058,8 @@ fn obmc_walk_axis(
             subsampling_y,
             frame_width,
             frame_height,
-            interp_filter_x,
-            interp_filter_y,
+            cand.interp_filter_x,
+            cand.interp_filter_y,
             inter_round0,
             inter_round1,
         )?;
@@ -2061,8 +2082,6 @@ fn obmc_walk_axis(
             /* obmc_stride */ fit_w,
             mask_length,
         )?;
-
-        axis_pos = axis_pos.saturating_add(step4);
     }
     Ok(())
 }
@@ -2410,8 +2429,6 @@ pub fn predict_inter(
                 subsampling_y,
                 frame_width,
                 frame_height,
-                interp_filter_x,
-                interp_filter_y,
                 rv.inter_round0,
                 rv.inter_round1,
                 bit_depth,
@@ -2442,8 +2459,6 @@ pub fn predict_inter(
                 subsampling_y,
                 frame_width,
                 frame_height,
-                interp_filter_x,
-                interp_filter_y,
                 rv.inter_round0,
                 rv.inter_round1,
                 bit_depth,
@@ -6487,8 +6502,14 @@ fn obmc_dispatch_leaf(
     let avail_u = oc.avail_u[origin] != 0;
     let avail_l = oc.avail_l[origin] != 0;
 
-    let interp_x = grid.interp_filters[origin * 2];
-    let interp_y = grid.interp_filters[origin * 2 + 1];
+    // §7.11.3.4: the HORIZONTAL (`intermediate[][]`) pass reads
+    // `InterpFilters[ candRow ][ candCol ][ 1 ]` (grid slot 1) and the
+    // VERTICAL (`pred[][]`) pass `InterpFilters[ .. ][ 0 ]` (slot 0).
+    // Distinguishable only on `enable_dual_filter` streams whose two
+    // per-direction filters differ (r394 dual-filter fix — every
+    // single-filter stream stamps both slots equal).
+    let interp_x = grid.interp_filters[origin * 2 + 1];
+    let interp_y = grid.interp_filters[origin * 2];
 
     const INTRA_FRAME_REF0: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
 
@@ -6538,6 +6559,11 @@ fn obmc_dispatch_leaf(
                     above.push(ObmcNeighbour {
                         bundle,
                         step4: step4 as u8,
+                        // §7.11.3.4 at (candRow, candCol): slot 1 =
+                        // horizontal, slot 0 = vertical.
+                        interp_filter_x: grid.interp_filters[cand * 2 + 1],
+                        interp_filter_y: grid.interp_filters[cand * 2],
+                        axis_pos4: x4 as u16,
                     });
                 }
                 x4 += step4;
@@ -6576,6 +6602,9 @@ fn obmc_dispatch_leaf(
                     left.push(ObmcNeighbour {
                         bundle,
                         step4: step4 as u8,
+                        interp_filter_x: grid.interp_filters[cand * 2 + 1],
+                        interp_filter_y: grid.interp_filters[cand * 2],
+                        axis_pos4: y4 as u16,
                     });
                 }
                 y4 += step4;
@@ -6920,8 +6949,14 @@ pub(crate) fn reconstruct_inter_leaf_at(
     const INTRA_FRAME_REF: i8 = crate::uncompressed_header_tail::INTRA_FRAME as i8;
     let is_compound_leaf = ref_frame1 >= crate::uncompressed_header_tail::LAST_FRAME as i8;
 
-    let interp_x = grid.interp_filters[origin * 2];
-    let interp_y = grid.interp_filters[origin * 2 + 1];
+    // §7.11.3.4: the HORIZONTAL (`intermediate[][]`) pass reads
+    // `InterpFilters[ candRow ][ candCol ][ 1 ]` (grid slot 1) and the
+    // VERTICAL (`pred[][]`) pass `InterpFilters[ .. ][ 0 ]` (slot 0).
+    // Distinguishable only on `enable_dual_filter` streams whose two
+    // per-direction filters differ (r394 dual-filter fix — every
+    // single-filter stream stamps both slots equal).
+    let interp_x = grid.interp_filters[origin * 2 + 1];
+    let interp_y = grid.interp_filters[origin * 2];
 
     if ref_frame1 == INTRA_FRAME_REF {
         // --- inter-intra arm (§7.11.3.14 blend). ---
@@ -7258,6 +7293,13 @@ pub(crate) fn reconstruct_inter_leaf_at(
                     ref_frame: grid.ref_frames[cand * 2] as u8,
                     mv: [grid.mvs[cand * 4], grid.mvs[cand * 4 + 1]],
                 };
+                // §7.11.3.4 runs with (candRow, candCol): the
+                // interpolation-filter pair is the CANDIDATE cell's,
+                // like the MV / ref — on the sub-8×8 chroma stitch the
+                // collocated luma leaves may have signalled different
+                // per-direction filters (r394 dual-filter fix).
+                let cand_fx = grid.interp_filters[cand * 2 + 1];
+                let cand_fy = grid.interp_filters[cand * 2];
 
                 match leaf_warp.as_ref() {
                     Some(warp) => {
@@ -7276,8 +7318,8 @@ pub(crate) fn reconstruct_inter_leaf_at(
                             ctx.subsampling_y,
                             ctx.frame_width,
                             ctx.frame_height,
-                            interp_x,
-                            interp_y,
+                            cand_fx,
+                            cand_fy,
                             ctx.curr,
                             ctx.curr_stride,
                         )?;
@@ -7297,8 +7339,8 @@ pub(crate) fn reconstruct_inter_leaf_at(
                             ctx.subsampling_y,
                             ctx.frame_width,
                             ctx.frame_height,
-                            interp_x,
-                            interp_y,
+                            cand_fx,
+                            cand_fy,
                             ctx.curr,
                             ctx.curr_stride,
                         )?;
@@ -11395,10 +11437,16 @@ mod tests {
         let above_nb = [ObmcNeighbour {
             bundle: nb_bundle(above_ref_frame, above_mv),
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         }];
         let left_nb = [ObmcNeighbour {
             bundle: nb_bundle(left_ref_frame, left_mv),
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         }];
         let obmc_params = ObmcParams {
             mi_row: 2,
@@ -11947,10 +11995,16 @@ mod tests {
             let above_nb = [ObmcNeighbour {
                 bundle: nb(above_mv),
                 step4: 2,
+                interp_filter_x: EIGHTTAP,
+                interp_filter_y: EIGHTTAP,
+                axis_pos4: 2,
             }];
             let left_nb = [ObmcNeighbour {
                 bundle: nb(left_mv),
                 step4: 2,
+                interp_filter_x: EIGHTTAP,
+                interp_filter_y: EIGHTTAP,
+                axis_pos4: 2,
             }];
             let op = ObmcParams {
                 mi_row: 2,
@@ -15182,6 +15236,9 @@ mod tests {
         let nb = ObmcNeighbour {
             bundle: refs[0],
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 1,
@@ -15283,6 +15340,9 @@ mod tests {
         let above_nb = ObmcNeighbour {
             bundle: refs[0],
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,
@@ -15381,6 +15441,9 @@ mod tests {
         let left_nb = ObmcNeighbour {
             bundle: refs[0],
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,
@@ -15495,6 +15558,9 @@ mod tests {
         let above_nb = ObmcNeighbour {
             bundle: nb_ref,
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,
@@ -15623,6 +15689,9 @@ mod tests {
         let above_nb = ObmcNeighbour {
             bundle: nb_ref,
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,
@@ -15738,6 +15807,9 @@ mod tests {
         let above_nb = ObmcNeighbour {
             bundle: nb_ref,
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,
@@ -15841,11 +15913,16 @@ mod tests {
         let nb = ObmcNeighbour {
             bundle: refs[0],
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
+        let nb2 = ObmcNeighbour { axis_pos4: 4, ..nb };
         // BLOCK_16X16: mi_width_log2 = 2 ⇒ w4 = 4, nLimit = Min(4, 2)
         // = 2. The walk visits x4 = MiCol (2), then x4 + 2 (4), then
         // stops because x4 + 2 = 6 == MiCol + w4 = 6 fails the
-        // strict-less-than bound (Min(MiCols, MiCol + w4) = 6).
+        // strict-less-than bound (Min(MiCols, MiCol + w4) = 6). The
+        // resolved list carries those positions per neighbour.
         let obmc = ObmcParams {
             mi_row: 2,
             mi_col: 2,
@@ -15856,7 +15933,7 @@ mod tests {
             avail_u: true,
             avail_l: false,
             plane_residual_size_ge_block_8x8: true,
-            above_neighbours: &[nb, nb],
+            above_neighbours: &[nb, nb2],
             left_neighbours: &[],
         };
         let mut obmc_out = vec![0u16; w * h];
@@ -15943,6 +16020,9 @@ mod tests {
         let above_nb = ObmcNeighbour {
             bundle: nb_bundle,
             step4: 2,
+            interp_filter_x: EIGHTTAP,
+            interp_filter_y: EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,

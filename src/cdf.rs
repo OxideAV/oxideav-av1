@@ -23448,9 +23448,13 @@ impl PartitionWalker {
         enable_interintra_compound: bool,
         // r177: §5.11.29 caller-supplied sequence-header / frame-header
         // scalars (see [`Self::decode_inter_block_mode_info`]).
+        // r394: `dist_equal` is no longer caller-threaded — the §8.3.2
+        // `compound_idx` ctx seed is per-BLOCK (it reads the block's
+        // own `RefFrame[0]` / `RefFrame[1]`), so the walker derives it
+        // at the §5.11.29 read from `order_hints`.
         enable_masked_compound: bool,
         enable_jnt_comp: bool,
-        dist_equal: bool,
+        order_hints: FrameInterOrderHints,
         // r178: §5.11.x caller-supplied frame-header / sequence-header
         // scalars (see [`Self::decode_inter_block_mode_info`]).
         interpolation_filter: u8,
@@ -23794,7 +23798,7 @@ impl PartitionWalker {
                 enable_interintra_compound,
                 enable_masked_compound,
                 enable_jnt_comp,
-                dist_equal,
+                order_hints,
                 interpolation_filter,
                 enable_dual_filter,
                 motion_field_mvs,
@@ -24832,16 +24836,18 @@ impl PartitionWalker {
         //   §5.11.29 `comp_group_idx == 0` arm short-circuits to
         //   `compound_type = COMPOUND_AVERAGE` (no `compound_idx`
         //   S() read).
-        // * `dist_equal` — the `Abs(get_relative_dist(OrderHints[
-        //   RefFrame[0]], OrderHint)) == Abs(get_relative_dist(
-        //   OrderHints[RefFrame[1]], OrderHint))` outcome from §7.8.1
-        //   that seeds the §8.3.2 `compound_idx` ctx (consumed only
-        //   on the `enable_jnt_comp` arm). For single-tile /
-        //   identity-frame-header callers, passing `false` is
+        // * `order_hints` — the §5.9.2 `OrderHint` / `OrderHints[]`
+        //   frame-header scalars. The §8.3.2 `compound_idx` ctx seed
+        //   (`fwd = Abs(get_relative_dist(OrderHints[RefFrame[0]],
+        //   OrderHint))`, `bck = ..RefFrame[1]..`, `ctx = (fwd == bck)
+        //   ? 3 : 0`) is derived per BLOCK from the block's own
+        //   reference pair at the §5.11.29 read (consumed only on the
+        //   `enable_jnt_comp` arm). For callers that never read
+        //   `compound_idx`, [`FrameInterOrderHints::IDENTITY`] is
         //   conformant.
         enable_masked_compound: bool,
         enable_jnt_comp: bool,
-        dist_equal: bool,
+        order_hints: FrameInterOrderHints,
         // r178 §5.11.x caller-supplied scalars.
         //
         // * `interpolation_filter` — §5.9.10 frame-header value in
@@ -25229,6 +25235,36 @@ impl PartitionWalker {
         // 7 per §6.10.x.
         let above_ref_0_altref = above_ref_frame[0] == 7;
         let left_ref_0_altref = left_ref_frame[0] == 7;
+        // §8.3.2 `compound_idx` ctx seed — per BLOCK, from the block's
+        // own reference pair (av1-spec p.384):
+        //   fwd = Abs( get_relative_dist( OrderHints[ RefFrame[ 0 ] ],
+        //              OrderHint ) )
+        //   bck = Abs( get_relative_dist( OrderHints[ RefFrame[ 1 ] ],
+        //              OrderHint ) )
+        //   ctx = ( fwd == bck ) ? 3 : 0
+        // Only the `isCompound && comp_group_idx == 0 &&
+        // enable_jnt_comp` arm ever reads the ctx; the non-compound
+        // clamp below (a non-compound `RefFrame[1] <= 0` indexes slot
+        // 0) is therefore never observed.
+        let dist_equal = {
+            let hint_of = |r: i32| -> i32 {
+                let idx = r.clamp(0, crate::uncompressed_header_tail::ALTREF_FRAME as i32);
+                order_hints.order_hints_by_ref[idx as usize]
+            };
+            let fwd = crate::inter_pred::get_relative_dist(
+                hint_of(ref_frame[0]),
+                order_hints.current_order_hint,
+                order_hints.order_hint_bits,
+            )
+            .abs();
+            let bck = crate::inter_pred::get_relative_dist(
+                hint_of(ref_frame[1]),
+                order_hints.current_order_hint,
+                order_hints.order_hint_bits,
+            )
+            .abs();
+            fwd == bck
+        };
         let compound_type = self.read_compound_type(
             decoder,
             cdfs,
@@ -29746,7 +29782,7 @@ impl PartitionWalker {
             ctx.enable_interintra_compound,
             ctx.enable_masked_compound,
             ctx.enable_jnt_comp,
-            ctx.dist_equal,
+            ctx.order_hints,
             ctx.interpolation_filter,
             ctx.enable_dual_filter,
             ctx.motion_field_mvs,
@@ -35150,10 +35186,13 @@ pub struct InterFrameContext<'a> {
     pub enable_masked_compound: bool,
     /// `enable_jnt_comp` (§5.5.2).
     pub enable_jnt_comp: bool,
-    /// `Abs(get_relative_dist(OrderHints[RefFrame[0]], OrderHint)) ==
-    /// Abs(get_relative_dist(OrderHints[RefFrame[1]], OrderHint))`
-    /// per §7.8.1.
-    pub dist_equal: bool,
+    /// §5.9.2 `OrderHint` / `OrderHints[]` frame-header scalars. The
+    /// §8.3.2 `compound_idx` ctx seed (`fwd == bck` over the block's
+    /// own `RefFrame[0]` / `RefFrame[1]` relative distances) is
+    /// derived per block from this at the §5.11.29 read; the
+    /// §7.11.3.15 DISTANCE blend weights read the same table through
+    /// [`InterWalkPixels::order_hints`].
+    pub order_hints: FrameInterOrderHints,
     // ---- §5.11.x interpolation-filter state ----
     /// `interpolation_filter` (§5.9.10) — one of `EIGHTTAP..=SWITCHABLE = 0..=4`.
     pub interpolation_filter: u8,
@@ -35250,7 +35289,7 @@ impl<'a> InterFrameContext<'a> {
             enable_interintra_compound: false,
             enable_masked_compound: false,
             enable_jnt_comp: false,
-            dist_equal: false,
+            order_hints: FrameInterOrderHints::IDENTITY,
             interpolation_filter: crate::inter_pred::EIGHTTAP,
             enable_dual_filter: false,
             motion_field_mvs,
@@ -51387,7 +51426,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51428,7 +51467,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51469,7 +51508,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51510,7 +51549,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51551,7 +51590,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51615,7 +51654,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51700,7 +51739,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51767,7 +51806,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51816,7 +51855,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51880,7 +51919,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -51957,7 +51996,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52037,7 +52076,7 @@ mod tests {
                 /* enable_interintra_compound = */ false,
                 /* enable_masked_compound = */ false,
                 /* enable_jnt_comp = */ false,
-                /* dist_equal = */ false,
+                /* order_hints = */ FrameInterOrderHints::IDENTITY,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
                 &mfmvs,
@@ -52138,7 +52177,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52335,7 +52374,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52400,7 +52439,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52484,7 +52523,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52564,7 +52603,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52641,7 +52680,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52714,7 +52753,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52789,7 +52828,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52876,7 +52915,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -52936,7 +52975,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -53075,7 +53114,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -53153,7 +53192,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -53248,7 +53287,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -53342,7 +53381,7 @@ mod tests {
             /* enable_interintra_compound = */ false,
             /* enable_masked_compound = */ false,
             /* enable_jnt_comp = */ false,
-            /* dist_equal = */ false,
+            /* order_hints = */ FrameInterOrderHints::IDENTITY,
             /* interpolation_filter = */ 0,
             /* enable_dual_filter = */ false,
             &mfmvs,
@@ -55260,7 +55299,7 @@ mod tests {
                 /* enable_interintra_compound = */ false,
                 /* enable_masked_compound = */ false,
                 /* enable_jnt_comp = */ false,
-                /* dist_equal = */ false,
+                /* order_hints = */ FrameInterOrderHints::IDENTITY,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
                 &mfmvs,
@@ -55673,7 +55712,7 @@ mod tests {
                 /* enable_interintra_compound = */ false,
                 /* enable_masked_compound = */ false,
                 /* enable_jnt_comp = */ false,
-                /* dist_equal = */ false,
+                /* order_hints = */ FrameInterOrderHints::IDENTITY,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
                 &mfmvs,
@@ -55756,7 +55795,7 @@ mod tests {
                 /* enable_interintra_compound = */ true,
                 /* enable_masked_compound = */ false,
                 /* enable_jnt_comp = */ false,
-                /* dist_equal = */ false,
+                /* order_hints = */ FrameInterOrderHints::IDENTITY,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
                 &mfmvs,
@@ -56649,7 +56688,7 @@ mod tests {
                 /* enable_interintra_compound = */ false,
                 /* enable_masked_compound = */ false,
                 /* enable_jnt_comp = */ false,
-                /* dist_equal = */ false,
+                /* order_hints = */ FrameInterOrderHints::IDENTITY,
                 /* interpolation_filter = */ 0,
                 /* enable_dual_filter = */ false,
                 &mfmvs,
@@ -57104,7 +57143,7 @@ mod tests {
                 /* enable_interintra_compound = */ false,
                 /* enable_masked_compound = */ false,
                 /* enable_jnt_comp = */ false,
-                /* dist_equal = */ false,
+                /* order_hints = */ FrameInterOrderHints::IDENTITY,
                 /* interpolation_filter = */ EIGHTTAP_SMOOTH,
                 /* enable_dual_filter = */ true,
                 &mfmvs,
@@ -57179,7 +57218,7 @@ mod tests {
                 /* enable_interintra_compound = */ false,
                 /* enable_masked_compound = */ false,
                 /* enable_jnt_comp = */ false,
-                /* dist_equal = */ false,
+                /* order_hints = */ FrameInterOrderHints::IDENTITY,
                 /* interpolation_filter = */ SWITCHABLE,
                 /* enable_dual_filter = */ true,
                 &mfmvs,
@@ -61801,6 +61840,9 @@ mod tests {
         let above_nb = ObmcNeighbour {
             bundle: above_bundle,
             step4: 2,
+            interp_filter_x: crate::inter_pred::EIGHTTAP,
+            interp_filter_y: crate::inter_pred::EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,
@@ -62082,6 +62124,9 @@ mod tests {
         let left_nb = ObmcNeighbour {
             bundle: left_bundle,
             step4: 2,
+            interp_filter_x: crate::inter_pred::EIGHTTAP,
+            interp_filter_y: crate::inter_pred::EIGHTTAP,
+            axis_pos4: 2,
         };
         let obmc = ObmcParams {
             mi_row: 2,
@@ -62251,6 +62296,9 @@ mod tests {
         let above_nb = ObmcNeighbour {
             bundle: above_bundle,
             step4: 2,
+            interp_filter_x: crate::inter_pred::EIGHTTAP,
+            interp_filter_y: crate::inter_pred::EIGHTTAP,
+            axis_pos4: 2,
         };
         // plane_residual_size_ge_block_8x8 = false on this small chroma
         // block → above-pass gated off; left-pass with one neighbour.
