@@ -11,24 +11,26 @@ framework.
 
 Clean-room rebuild in progress. The bitstream-syntax and header layers
 are broadly complete (OBU framing, sequence header, full
-uncompressed-frame-header syntax tree, tile info), and — as of r387 —
-**11 of the 13 independent conformance-corpus streams decode to pixels
-byte-identical to a third-party decoder's output**, now including the
-first INTER (KEY + P) stream. The r387 inter-frame decode driver adds
-the §7.20 reference-frame store (per-slot pre-grain planes + saved
-MV/ref-frame grids + `RefInfo` bookkeeping), frame-header parsing
-against the live reference state, in-walk §5.11.33 `predict_inter`
-(each inter leaf motion-compensates into `CurrFrame` between
-`mode_info()` and `residual()`, per the spec's per-block
-`compute_prediction()` ordering), the §5.11.22 intra-in-inter arm, the
-§5.11.27 LOCALWARP in-walk fit (§7.10.4 CandList retention +
-§7.11.3.8 least-squares estimation), and `show_existing_frame` /
-show-frame output discipline. The 2 remaining streams need
-`primary_ref_frame` CDF forwarding + §7.9 temporal MV projection
-(`show-existing-frame`) and an inter-residual entropy divergence fix
-(`obu-with-extension-headers`, first non-skip var-tx inter leaf).
+uncompressed-frame-header syntax tree, tile info), and — as of r390 —
+**every stream in the independent conformance corpus (16 of 16)
+decodes to pixels byte-identical to a third-party decoder's output**:
+the full intra surface, KEY + P inter, multi-frame GOPs with
+`show_existing_frame`, and 10/12-bit Professional-profile 4:2:2. On
+top of the r387 inter driver, r390 lands the cross-frame session
+state: §8.3.1 `load_cdfs` / §7.20 `save_cdfs` / §8.4
+`frame_end_update_cdf` forwarding with the §6.8.21 counter reset,
+§7.9 `motion_field_estimation` over §7.19/§7.20-stored motion fields,
+§5.9.2 `load_previous()` (loop-filter delta + `PrevGmParams`
+forwarding), §5.9.22 skip-mode (`SkipModeFrame[]` derivation +
+walker threading), the §7.21 KEY-frame `show_existing_frame` reload,
+and the 10/12-bit output surface. Three decode bugs fell out of the
+corpus work: the missing §5.11.5 inter `YModes[]` grid-fill (whose
+absence starved §7.10.2.8 `has_newmv` and desynchronised the
+arithmetic decoder on NEWMV-adjacent blocks), forwarding CDF symbol
+counts that §6.8.21 says restart at zero, and a double-subsampled
+§7.11.3.5 chroma-warp clamp.
 
-### Conformance-validated decode (r384 intra, r387 inter)
+### Conformance-validated decode (r384 intra, r387 inter, r390 session state)
 
 `decoder::decode_av1_spec(ivf_bytes) -> Vec<SpecFrame>` is the
 spec-faithful frame driver: IVF + §7.5 OBU walk (including the combined
@@ -40,7 +42,7 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 10 streams byte-exact against
+grain. `tests/fixture_conformance.rs` pins 16 streams byte-exact against
 independent-decoder output (fixture corpus under
 `docs/video/av1/fixtures/`, used as opaque black-box tools): the full
 intra feature surface — lossy quant at every coded TX size (including
@@ -48,8 +50,16 @@ the 64-wide compact-`tw` dequant layout), lossless WHT, palette (luma +
 chroma, in-walk §5.11.35 `predict_palette`), CfL, filter-intra,
 directional prediction including V/H-with-angle-delta and the
 §7.11.2.9-12 edge filter + upsample pre-pass, monochrome, 128×128
-superblocks, multi-superblock and multi-tile frames, film grain, and
-superres on a non-mi-aligned width.
+superblocks, multi-superblock and multi-tile frames, film grain,
+superres on a non-mi-aligned width — plus the inter surface: GLOBALMV
+and NEWMV motion (mv-stack prediction, `drl_mode`, §5.11.32 mv
+coding), var-tx trees with TX_SET_INTER_1/2/3 transform types,
+SIMPLE / OBMC / LOCALWARP motion modes (§7.11.3.8 least-squares fit +
+§7.11.3.5 warp filter on luma AND ≥8×8 chroma), compound references,
+skip-mode blocks, primary-ref CDF forwarding across a 29-header GOP,
+§7.9 temporal MV projection, `show_existing_frame` replays (including
+the §7.21 KEY reload), and 10/12-bit 4:2:2 output (`yuv422p1{0,2}le`
+little-endian packing).
 
 The r384 conformance debugging also fixed five spec deviations that
 encoder-mirror round-trips could never catch (both sides shared the
