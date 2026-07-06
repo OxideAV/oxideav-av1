@@ -13450,6 +13450,15 @@ pub struct QuantizerParams {
     /// signed delta added to `base_q_idx` (or `CurrentQIndex` on the
     /// `delta_q_present` arm) before `Clip3( 0, 255, _ )`.
     pub seg_alt_q_data: [i16; MAX_SEGMENTS],
+    /// §5.9.2 `SegQMLevel[ plane ][ segmentId ]` — the per-segment
+    /// quantizer-matrix level triple the §7.12.3 step-1b QM arm reads.
+    /// Derived in the §5.9.2 `uncompressed_header()` trailer: when
+    /// `using_qmatrix == 1` a non-lossless segment carries
+    /// `[ qm_y, qm_u, qm_v ]` and a lossless segment the no-QM
+    /// sentinel `15`; when `using_qmatrix == 0` the array is never
+    /// consulted (§7.12.3 gates on `using_qmatrix` first) and stays at
+    /// the all-`15` neutral fill.
+    pub seg_qm_level: [[u8; MAX_SEGMENTS]; 3],
 }
 
 impl QuantizerParams {
@@ -13472,7 +13481,22 @@ impl QuantizerParams {
             segmentation_enabled: false,
             seg_alt_q_active: [false; MAX_SEGMENTS],
             seg_alt_q_data: [0; MAX_SEGMENTS],
+            seg_qm_level: [[15; MAX_SEGMENTS]; 3],
         }
+    }
+
+    /// `SegQMLevel[ 0..3 ][ segment_id ]` — the per-plane QM-level
+    /// triple for one block's segment, in the `[u8; 3]` plane-indexed
+    /// shape [`ResidualContext::seg_qm_level`] carries into the
+    /// §7.12.3 step-1 dequantization loop.
+    #[must_use]
+    pub fn seg_qm_level_for(&self, segment_id: u8) -> [u8; 3] {
+        let seg = (segment_id as usize).min(MAX_SEGMENTS - 1);
+        [
+            self.seg_qm_level[0][seg],
+            self.seg_qm_level[1][seg],
+            self.seg_qm_level[2][seg],
+        ]
     }
 }
 
@@ -29539,7 +29563,7 @@ impl PartitionWalker {
             )
             .unwrap_or(0),
             segment_id: prefix.segment_id,
-            seg_qm_level: [15, 15, 15],
+            seg_qm_level: quant.seg_qm_level_for(prefix.segment_id),
             uv_mode: uv_mode.unwrap_or(0),
             // §7.11.2.1 prediction gate: the intra arm runs for a true
             // intra block. `use_intrabc == 1` sets `is_inter = 1`
@@ -30020,7 +30044,7 @@ impl PartitionWalker {
             reduced_tx_set,
             intra_dir: 0,
             segment_id: info.segment_id,
-            seg_qm_level: [15, 15, 15],
+            seg_qm_level: quant.seg_qm_level_for(info.segment_id),
             uv_mode: 0,
             // Inter arm — the §7.11.3 motion-compensation path produces
             // this block's prediction, not the §7.11.2.1 intra writer.
@@ -30277,7 +30301,7 @@ impl PartitionWalker {
             )
             .unwrap_or(0),
             segment_id: info.segment_id,
-            seg_qm_level: [15, 15, 15],
+            seg_qm_level: quant.seg_qm_level_for(info.segment_id),
             uv_mode: uv_mode.unwrap_or(0),
             is_intra: true,
             y_mode,

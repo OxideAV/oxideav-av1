@@ -244,10 +244,6 @@ fn decode_frame_spec_full(
         .quantization_params
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    if qp.using_qmatrix {
-        // §7.12.3 step-1 QM path not threaded through the walker driver.
-        return Err(Error::PartitionWalkOutOfRange);
-    }
     let default_seg = SegmentationParams::disabled();
     let sp = fh.segmentation_params.as_ref().unwrap_or(&default_seg);
     let dq = fh.delta_q_params.unwrap_or_default();
@@ -296,6 +292,20 @@ fn decode_frame_spec_full(
         }
         a
     };
+    // §5.9.2 `SegQMLevel[ plane ][ segmentId ]`: when `using_qmatrix`,
+    // a lossless segment takes the no-QM sentinel `15`, every other
+    // segment `[ qm_y, qm_u, qm_v ]`. With `using_qmatrix == 0` the
+    // §7.12.3 QM arm never fires and the neutral all-`15` fill stands.
+    let mut seg_qm_level = [[15u8; MAX_SEGMENTS]; 3];
+    if qp.using_qmatrix {
+        for segment_id in 0..MAX_SEGMENTS {
+            if !lossless[segment_id] {
+                seg_qm_level[0][segment_id] = qp.qm_y;
+                seg_qm_level[1][segment_id] = qp.qm_u;
+                seg_qm_level[2][segment_id] = qp.qm_v;
+            }
+        }
+    }
     let quant = QuantizerParams {
         base_q_idx: qp.base_q_idx,
         delta_q_y_dc: qp.delta_q_y_dc,
@@ -310,6 +320,7 @@ fn decode_frame_spec_full(
         segmentation_enabled: sp.enabled,
         seg_alt_q_active,
         seg_alt_q_data,
+        seg_qm_level,
     };
 
     // `seg_skip_active`: any segment with SEG_LVL_SKIP active.
