@@ -9589,6 +9589,133 @@ pub struct TileCdfContext {
 }
 
 impl TileCdfContext {
+    /// §6.8.21 `load_cdfs( ctx )` counter reset — "Once the CDF arrays
+    /// have been loaded, the last entry in each array, representing
+    /// the symbol count for that context, is set to 0." The §8.3
+    /// per-symbol update rate depends on that count (`4 + (count >
+    /// 15) + (count > 31) + ...`), so a loaded context must restart
+    /// its adaptation-rate schedule even though the probabilities
+    /// carry over.
+    pub fn zero_counts(&mut self) {
+        fn zero1<const N: usize>(row: &mut [u16; N]) {
+            row[N - 1] = 0;
+        }
+        fn zero2<const N: usize, const M: usize>(rows: &mut [[u16; N]; M]) {
+            for row in rows.iter_mut() {
+                zero1(row);
+            }
+        }
+        fn zero3<const N: usize, const M: usize, const L: usize>(rows: &mut [[[u16; N]; M]; L]) {
+            for row in rows.iter_mut() {
+                zero2(row);
+            }
+        }
+        fn zero4<const N: usize, const M: usize, const L: usize, const K: usize>(
+            rows: &mut [[[[u16; N]; M]; L]; K],
+        ) {
+            for row in rows.iter_mut() {
+                zero3(row);
+            }
+        }
+        zero3(&mut self.intra_frame_y_mode);
+        zero2(&mut self.partition_w8);
+        zero2(&mut self.partition_w16);
+        zero2(&mut self.partition_w32);
+        zero2(&mut self.partition_w64);
+        zero2(&mut self.partition_w128);
+        zero2(&mut self.skip);
+        zero2(&mut self.segment_id);
+        zero2(&mut self.segment_id_predicted);
+        zero2(&mut self.mv_joint);
+        zero3(&mut self.mv_sign);
+        zero3(&mut self.mv_class);
+        zero3(&mut self.mv_class0_bit);
+        zero4(&mut self.mv_class0_fr);
+        zero3(&mut self.mv_class0_hp);
+        zero4(&mut self.mv_bit);
+        zero3(&mut self.mv_fr);
+        zero3(&mut self.mv_hp);
+        zero2(&mut self.new_mv);
+        zero2(&mut self.zero_mv);
+        zero2(&mut self.ref_mv);
+        zero2(&mut self.drl_mode);
+        zero2(&mut self.is_inter);
+        zero2(&mut self.comp_mode);
+        zero2(&mut self.skip_mode);
+        zero1(&mut self.intrabc);
+        zero1(&mut self.delta_q);
+        zero1(&mut self.delta_lf);
+        zero2(&mut self.delta_lf_multi);
+        zero3(&mut self.comp_ref);
+        zero3(&mut self.comp_bwd_ref);
+        zero3(&mut self.single_ref);
+        zero2(&mut self.compound_mode);
+        zero2(&mut self.comp_ref_type);
+        zero3(&mut self.uni_comp_ref);
+        zero1(&mut self.filter_intra_mode);
+        zero2(&mut self.filter_intra);
+        zero3(&mut self.palette_y_mode);
+        zero2(&mut self.palette_uv_mode);
+        zero2(&mut self.palette_y_size);
+        zero2(&mut self.palette_uv_size);
+        zero2(&mut self.palette_size_2_y_color);
+        zero2(&mut self.palette_size_3_y_color);
+        zero2(&mut self.palette_size_4_y_color);
+        zero2(&mut self.palette_size_5_y_color);
+        zero2(&mut self.palette_size_6_y_color);
+        zero2(&mut self.palette_size_7_y_color);
+        zero2(&mut self.palette_size_8_y_color);
+        zero2(&mut self.palette_size_2_uv_color);
+        zero2(&mut self.palette_size_3_uv_color);
+        zero2(&mut self.palette_size_4_uv_color);
+        zero2(&mut self.palette_size_5_uv_color);
+        zero2(&mut self.palette_size_6_uv_color);
+        zero2(&mut self.palette_size_7_uv_color);
+        zero2(&mut self.palette_size_8_uv_color);
+        zero1(&mut self.cfl_sign);
+        zero2(&mut self.cfl_alpha);
+        zero2(&mut self.tx_8x8);
+        zero2(&mut self.tx_16x16);
+        zero2(&mut self.tx_32x32);
+        zero2(&mut self.tx_64x64);
+        zero2(&mut self.txfm_split);
+        zero2(&mut self.inter_tx_type_set1);
+        zero1(&mut self.inter_tx_type_set2);
+        zero2(&mut self.inter_tx_type_set3);
+        zero3(&mut self.intra_tx_type_set1);
+        zero3(&mut self.intra_tx_type_set2);
+        zero2(&mut self.interp_filter);
+        zero2(&mut self.motion_mode);
+        zero2(&mut self.use_obmc);
+        zero2(&mut self.comp_group_idx);
+        zero2(&mut self.compound_idx);
+        zero2(&mut self.compound_type);
+        zero2(&mut self.y_mode);
+        zero2(&mut self.uv_mode_cfl_not_allowed);
+        zero2(&mut self.uv_mode_cfl_allowed);
+        zero2(&mut self.angle_delta);
+        zero3(&mut self.txb_skip);
+        zero3(&mut self.eob_pt_16);
+        zero3(&mut self.eob_pt_32);
+        zero3(&mut self.eob_pt_64);
+        zero3(&mut self.eob_pt_128);
+        zero3(&mut self.eob_pt_256);
+        zero2(&mut self.eob_pt_512);
+        zero2(&mut self.eob_pt_1024);
+        zero4(&mut self.eob_extra);
+        zero3(&mut self.dc_sign);
+        zero4(&mut self.coeff_base_eob);
+        zero4(&mut self.coeff_base);
+        zero4(&mut self.coeff_br);
+        zero2(&mut self.inter_intra);
+        zero2(&mut self.inter_intra_mode);
+        zero2(&mut self.wedge_inter_intra);
+        zero2(&mut self.wedge_index);
+        zero1(&mut self.use_wiener);
+        zero1(&mut self.use_sgrproj);
+        zero1(&mut self.restoration_type);
+    }
+
     /// §8.3.1: initialise every `Tile*Cdf` array from its `Default_*`
     /// table. Called at the start of tile parsing (and again when
     /// `init_non_coeff_cdfs()` is invoked per §7.4 / §5.11.4).

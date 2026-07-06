@@ -578,7 +578,12 @@ fn decode_frame_spec_full(
             .get(slot)
             .and_then(|s| s.as_ref())
             .ok_or(Error::PartitionWalkOutOfRange)?;
-        slot_state.cdfs.clone()
+        let mut loaded = slot_state.cdfs.clone();
+        // §6.8.21 `load_cdfs`: the symbol counts restart at zero (the
+        // probabilities carry over) — the §8.3 adaptation rate depends
+        // on the per-row count.
+        loaded.zero_counts();
+        loaded
     } else {
         let mut c = TileCdfContext::new_from_defaults();
         c.init_coeff_cdfs(qp.base_q_idx);

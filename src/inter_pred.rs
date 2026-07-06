@@ -1668,6 +1668,18 @@ fn predict_inter_per_ref_warp(
     // loops run at least once.
     let i_blocks = h.div_ceil(8);
     let j_blocks = w.div_ceil(8);
+    // [`PredictInterRef`] carries PER-PLANE reference dimensions (the
+    // caller applied the chroma `>> subX` / `>> subY`), while
+    // §7.11.3.5 / [`block_warp`] takes the pre-sub-sample
+    // `RefUpscaledWidth[ refIdx ]` / `RefFrameHeight[ refIdx ]` and
+    // re-derives the per-plane `lastX` / `lastY` internally. Lift the
+    // per-plane dims back to luma scale — `(((w << s) + s) >> s) - 1
+    // == w - 1` for either luma-width parity, so the §7.11.3.5 clamp
+    // lands on the true per-plane edge. (r390 fix: chroma warp blocks
+    // previously double-subsampled the clamp, folding every read past
+    // the plane's horizontal midpoint back onto column `w/2 - 1`.)
+    let sub_x_p: u32 = if plane == 0 { 0 } else { subsampling_x as u32 };
+    let sub_y_p: u32 = if plane == 0 { 0 } else { subsampling_y as u32 };
     for i8b in 0..i_blocks {
         for j8b in 0..j_blocks {
             block_warp(
@@ -1683,8 +1695,8 @@ fn predict_inter_per_ref_warp(
                 h,
                 r.ref_plane,
                 r.ref_stride,
-                r.ref_upscaled_width,
-                r.ref_height,
+                r.ref_upscaled_width << sub_x_p,
+                r.ref_height << sub_y_p,
                 warp_params,
                 inter_round0,
                 inter_round1,
