@@ -77,7 +77,6 @@ pub struct SpecFrame {
 /// temporal projection and the §7.21 `show_existing_frame` output
 /// path consume.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `mvs` / `ref_frames` / mi extent feed the §7.9 temporal projection milestone.
 struct SpecRefSlot {
     /// §7.20 `FrameStore[ i ][ plane ]` — the post-§7.17 (pre-§7.18.3
     /// film-grain) planes at their §7.18.2 cropped extents
@@ -87,20 +86,37 @@ struct SpecRefSlot {
     planes: Vec<Vec<u16>>,
     /// `(width, height)` per stored plane.
     plane_dims: Vec<(u32, u32)>,
-    /// §7.20 `SavedMvs[ i ]` — the §5.11.5 `Mvs[ row ][ col ][ 0..2 ]`
-    /// grid snapshot (4 `i16` per cell), for §7.9.
-    mvs: Vec<i16>,
-    /// §7.20 `SavedRefFrames[ i ]` — the `RefFrames[ row ][ col ][ 0..2 ]`
-    /// grid snapshot (2 `i8` per cell), for §7.9.
-    ref_frames: Vec<i8>,
+    /// §7.20 `SavedMvs[ i ]` — the §7.19 `MfMvs[ row ][ col ][ 0..2 ]`
+    /// grid snapshot (2 `i16` per mi cell), the §7.9.2 projection
+    /// source.
+    mf_mvs: Vec<i16>,
+    /// §7.20 `SavedRefFrames[ i ]` — the §7.19 `MfRefFrames[ row ][
+    /// col ]` grid snapshot (1 `i8` per mi cell).
+    mf_ref_frames: Vec<i8>,
+    /// §7.20 `SavedOrderHints[ i ][ ref ]` — the stored frame's
+    /// `OrderHints[]` array (what ITS references' output order was),
+    /// consumed by the §7.9.1/§7.9.2 `SavedOrderHints[ srcIdx ][ .. ]`
+    /// reads.
+    saved_order_hints: [i32; ALTREF_FRAME + 1],
     /// The stored frame's mi extent.
     mi_rows: u32,
     mi_cols: u32,
     /// §7.20 `RefFrameType[ i ]` — `FrameIsIntra` of the stored frame
-    /// (a `show_existing_frame` pointing at a KEY frame triggers the
-    /// §7.21 key-frame load path, a follow-up gap this driver rejects
-    /// loudly).
+    /// (the §7.9.2 projection skips KEY / INTRA_ONLY sources).
     frame_is_intra: bool,
+    /// §7.20 `RefFrameType[ i ] == KEY_FRAME` — the §7.21 trigger.
+    frame_type_is_key: bool,
+    /// §7.20 `save_cdfs( i )` — the frame-end CDF state (§8.4
+    /// `frame_end_update_cdf`), loaded back by §8.3.1 `load_cdfs()`
+    /// when a later frame names this slot as its primary reference.
+    cdfs: Box<TileCdfContext>,
+    /// §7.20 `SavedGmParams[ i ]` — this frame's `gm_params`.
+    gm_params: [[i32; 6]; 8],
+    /// §7.20 `save_loop_filter_params( i )` — the §5.9.11 running
+    /// delta state at the end of this frame's header parse.
+    lf_ref_deltas: [i8; 8],
+    /// Mode-delta half of `save_loop_filter_params( i )`.
+    lf_mode_deltas: [i8; 2],
 }
 
 /// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
@@ -130,10 +146,17 @@ struct DecodedFrameInternal {
     ref_planes: Vec<Vec<u16>>,
     /// `(width, height)` per `ref_planes` entry.
     ref_plane_dims: Vec<(u32, u32)>,
-    /// §5.11.5 `Mvs[]` grid snapshot (4 `i16` per mi cell).
-    mvs: Vec<i16>,
-    /// §5.11.5 `RefFrames[]` grid snapshot (2 `i8` per mi cell).
-    ref_frames: Vec<i8>,
+    /// §7.19 `MfMvs[]` grid (2 `i16` per mi cell).
+    mf_mvs: Vec<i16>,
+    /// §7.19 `MfRefFrames[]` grid (1 `i8` per mi cell).
+    mf_ref_frames: Vec<i8>,
+    /// This frame's `OrderHints[]` array (§5.9.2), the §7.20
+    /// `SavedOrderHints` payload.
+    order_hints_by_ref: [i32; ALTREF_FRAME + 1],
+    /// §8.4 frame-end CDF state (`frame_end_update_cdf` output — the
+    /// `context_update_tile_id` tile's adapted CDFs, or the frame-start
+    /// state under `disable_frame_end_update_cdf == 1`).
+    end_cdfs: Box<TileCdfContext>,
     /// The decoded frame's mi extent.
     mi_rows: u32,
     mi_cols: u32,
@@ -191,17 +214,9 @@ fn decode_frame_spec_full(
         // §7.21 output-existing path is the caller's (no tile group).
         return Err(Error::PartitionWalkOutOfRange);
     }
-    if !fh.frame_is_intra {
-        if refs.is_none() {
-            // Inter frames are undecodable without the §7.20 store.
-            return Err(Error::PartitionWalkOutOfRange);
-        }
-        if fh.primary_ref_frame != PRIMARY_REF_NONE {
-            // §8.3.1 `load_cdfs( ref_frame_idx[ primary_ref_frame ] )`
-            // + §5.9.14 / §5.9.19 `load_previous()` forwarding is the
-            // next milestone (the CDF store is not yet kept per slot).
-            return Err(Error::PartitionWalkOutOfRange);
-        }
+    if !fh.frame_is_intra && refs.is_none() {
+        // Inter frames are undecodable without the §7.20 store.
+        return Err(Error::PartitionWalkOutOfRange);
     }
     let cc = &seq.color_config;
     if cc.bit_depth != 8 {
@@ -381,13 +396,28 @@ fn decode_frame_spec_full(
     let sub_x_u8 = u8::from(cc.subsampling_x);
     let sub_y_u8 = u8::from(cc.subsampling_y);
     let num_planes_usize = cc.num_planes as usize;
-    // §7.9 motion-field grid — the temporal-scan source. The corpus
-    // arc this driver covers references intra-only stores (a KEY
-    // frame saves no inter MVs), for which the §7.9 projection yields
-    // no valid entry — the all-invalid grid IS the §7.9 output. Real
-    // temporal projection from `SpecRefSlot::mvs` is the
-    // show-existing-frame milestone.
-    let mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
+    // §7.9 motion-field grid — the temporal-scan source. §5.9.2
+    // invokes `motion_field_estimation()` only when `use_ref_frame_mvs
+    // == 1`; the projection walks the §7.20-stored `SavedMvs` /
+    // `SavedRefFrames` / `SavedOrderHints` of up to four reference
+    // frames (LAST backwards, BWDREF / ALTREF2 / ALTREF forwards,
+    // LAST2 as the stack filler).
+    let mfmvs = if is_inter_frame
+        && fh
+            .inter_refs
+            .as_ref()
+            .is_some_and(|ir| ir.use_ref_frame_mvs)
+    {
+        motion_field_estimation(
+            refs.ok_or(Error::PartitionWalkOutOfRange)?,
+            fh,
+            seq,
+            mi_rows,
+            mi_cols,
+        )?
+    } else {
+        MotionFieldMvs::new_invalid(mi_rows, mi_cols)
+    };
     // Never-referenced placeholder for empty §7.20 slots (a conformant
     // stream only references `RefValid` slots).
     let dummy_plane: Vec<u16> = vec![0u16; 64];
@@ -414,10 +444,6 @@ fn decode_frame_spec_full(
         // forward yet (none fire on the corpus arc this lands for).
         if sp.enabled {
             // §5.9.14 segmentation feature state on the §5.11.18 ctx.
-            return Err(Error::PartitionWalkOutOfRange);
-        }
-        if fh.skip_mode_present.unwrap_or(false) {
-            // §5.9.22 `SkipModeFrame[]` derivation.
             return Err(Error::PartitionWalkOutOfRange);
         }
         for plane in 0..num_planes_usize {
@@ -500,7 +526,13 @@ fn decode_frame_spec_full(
             .as_ref()
             .ok_or(Error::PartitionWalkOutOfRange)?;
         let mut c = InterFrameContext::identity_default(&mfmvs);
-        c.skip_mode_present = false; // gated above
+        // §5.9.22 skip-mode state: the §5.11.10 `read_skip_mode` gate
+        // plus the fixed compound reference pair the skip-mode arm
+        // predicts from.
+        c.skip_mode_present = fh.skip_mode_present.unwrap_or(false);
+        if let Some(smf) = fh.skip_mode_frame {
+            c.skip_mode_frame = [i32::from(smf[0]), i32::from(smf[1])];
+        }
         c.reference_select = fh.reference_select.unwrap_or(false);
         if let Some(g) = fh.global_motion_params.as_ref() {
             for r in 0..8 {
@@ -529,13 +561,41 @@ fn decode_frame_spec_full(
         None
     };
 
+    // §8.3.1 frame-start CDF state: `load_cdfs( ref_frame_idx[
+    // primary_ref_frame ] )` when a primary reference exists (the
+    // §7.20-saved frame-end state of that slot, coefficient CDFs
+    // included), otherwise `init_non_coeff_cdfs()` (the §9.4 defaults)
+    // + the q-context-selected `init_coeff_cdfs( base_q_idx )`.
+    let frame_start_cdfs: Box<TileCdfContext> = if fh.primary_ref_frame != PRIMARY_REF_NONE {
+        let st = refs.ok_or(Error::PartitionWalkOutOfRange)?;
+        let ir = fh
+            .inter_refs
+            .as_ref()
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        let slot = ir.ref_frame_idx[fh.primary_ref_frame as usize] as usize;
+        let slot_state = st
+            .slots
+            .get(slot)
+            .and_then(|s| s.as_ref())
+            .ok_or(Error::PartitionWalkOutOfRange)?;
+        slot_state.cdfs.clone()
+    } else {
+        let mut c = TileCdfContext::new_from_defaults();
+        c.init_coeff_cdfs(qp.base_q_idx);
+        Box::new(c)
+    };
+
     // §5.11.2 decode_tile() per tile, in tile order — each tile gets a
-    // fresh §8.2.2 symbol decoder and a fresh §8.3.1 CDF load
-    // (`primary_ref_frame == PRIMARY_REF_NONE` on the intra path, so
-    // every tile initialises from the defaults + the q-context
-    // coefficient slice), while the walker's frame-scope decode grids
+    // fresh §8.2.2 symbol decoder and a fresh copy of the frame-start
+    // CDF state (§8.2.2 `clear_above_context` etc. are per-tile inside
+    // `begin_tile`), while the walker's frame-scope decode grids
     // accumulate across tiles. The §5.11.57 `read_lr` interleave runs
-    // when the frame signals loop restoration.
+    // when the frame signals loop restoration. Per §8.2.4
+    // `exit_symbol` / §8.4 `frame_end_update_cdf`, the tile numbered
+    // `context_update_tile_id` donates its adapted CDFs as the
+    // frame-end state (unless `disable_frame_end_update_cdf`, which
+    // keeps the frame-start state).
+    let mut end_cdfs: Option<Box<TileCdfContext>> = None;
     for (tile_num, tile) in parsed.tiles.iter().enumerate() {
         let tile_row = (tile_num as u32) / ti.tile_cols;
         let tile_col = (tile_num as u32) % ti.tile_cols;
@@ -547,8 +607,7 @@ fn decode_frame_spec_full(
         });
         let mut decoder =
             SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), fh.disable_cdf_update)?;
-        let mut cdfs = TileCdfContext::new_from_defaults();
-        cdfs.init_coeff_cdfs(qp.base_q_idx);
+        let mut cdfs = frame_start_cdfs.as_ref().clone();
         walker.decode_tile_syntax_with_lr(
             &mut decoder,
             &mut cdfs,
@@ -558,7 +617,11 @@ fn decode_frame_spec_full(
             &quant,
             /* read_deltas = */ dq.delta_q_present,
         )?;
+        if !fh.disable_frame_end_update_cdf && tile_num as u32 == ti.context_update_tile_id {
+            end_cdfs = Some(Box::new(cdfs));
+        }
     }
+    let end_cdfs = end_cdfs.unwrap_or(frame_start_cdfs);
 
     // ---- Take `CurrFrame[ plane ]` at its FULL mi-grid extent. ----
     // The spec's CurrFrame covers the padded `MiRows x MiCols` grid
@@ -853,6 +916,49 @@ fn decode_frame_spec_full(
         .map(|buf| buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect())
         .collect();
 
+    // ---- §7.19 motion field motion vector storage. ----
+    // Filter the §5.11.5 `Mvs[]` / `RefFrames[]` grids down to the
+    // `MfMvs[]` / `MfRefFrames[]` payload §7.20 stores: per cell, the
+    // LAST candidate list whose reference lies in the past
+    // (`get_relative_dist( RefOrderHint[ refIdx ], OrderHint ) < 0`)
+    // and whose MV components sit within `REFMVS_LIMIT`.
+    const REFMVS_LIMIT: i16 = (1 << 12) - 1;
+    let cells = (mi_rows as usize) * (mi_cols as usize);
+    let mut mf_ref_frames: Vec<i8> = vec![-1; cells];
+    let mut mf_mvs: Vec<i16> = vec![0; cells * 2];
+    if is_inter_frame {
+        let st = refs.ok_or(Error::PartitionWalkOutOfRange)?;
+        let raw_refs = walker.ref_frames();
+        let raw_mvs = walker.mvs();
+        let hint_bits = if seq.enable_order_hint {
+            u32::from(seq.order_hint_bits)
+        } else {
+            0
+        };
+        for cell in 0..cells {
+            for list in 0..2usize {
+                let r = raw_refs[cell * 2 + list];
+                if r > 0 {
+                    let slot = ref_frame_idx[(r - 1) as usize] as usize;
+                    let dist = get_relative_dist(
+                        st.info.order_hint[slot] as i32,
+                        fh.order_hint as i32,
+                        hint_bits,
+                    );
+                    if dist < 0 {
+                        let mv_row = raw_mvs[(cell * 2 + list) * 2];
+                        let mv_col = raw_mvs[(cell * 2 + list) * 2 + 1];
+                        if mv_row.abs() <= REFMVS_LIMIT && mv_col.abs() <= REFMVS_LIMIT {
+                            mf_ref_frames[cell] = r;
+                            mf_mvs[cell * 2] = mv_row;
+                            mf_mvs[cell * 2 + 1] = mv_col;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(DecodedFrameInternal {
         frame: SpecFrame {
             // Post-§7.16 the surfaced luma width is `UpscaledWidth`
@@ -864,13 +970,177 @@ fn decode_frame_spec_full(
         },
         ref_planes,
         ref_plane_dims,
-        // §7.20 `SavedMvs` / `SavedRefFrames` — the §5.11.5 grid
-        // snapshots the §7.9 temporal projection reads back.
-        mvs: walker.mvs().to_vec(),
-        ref_frames: walker.ref_frames().to_vec(),
+        mf_mvs,
+        mf_ref_frames,
+        order_hints_by_ref,
+        end_cdfs,
         mi_rows,
         mi_cols,
     })
+}
+
+/// §7.9 `motion_field_estimation()` — project the §7.20-saved motion
+/// vectors of up to four reference frames onto the current frame's
+/// 8×8 motion-field grid, one projected MV per (destination reference,
+/// cell).
+fn motion_field_estimation(
+    refs: &SpecRefState,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+    mi_rows: u32,
+    mi_cols: u32,
+) -> Result<MotionFieldMvs, Error> {
+    // §3 constants scoped to the §7.9 processes.
+    const MFMV_STACK_SIZE: i32 = 3;
+    const MAX_FRAME_DISTANCE: i32 = 31;
+    const MAX_OFFSET_WIDTH: i32 = 8;
+    const MAX_OFFSET_HEIGHT: i32 = 0;
+    /// §7.9.3 `Div_Mult[ 32 ]`.
+    const DIV_MULT: [i32; 32] = [
+        0, 16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638, 1489, 1365, 1260, 1170,
+        1092, 1024, 963, 910, 862, 819, 780, 744, 712, 682, 655, 630, 606, 585, 564, 546, 528,
+    ];
+    // Reference ordinals (§6.10.24): LAST=1, LAST2=2, BWDREF=5,
+    // ALTREF2=6, ALTREF=7; GOLDEN=4.
+    const LAST2_FRAME: usize = 2;
+    const GOLDEN_FRAME: usize = 4;
+    const BWDREF_FRAME: usize = 5;
+    const ALTREF2_FRAME: usize = 6;
+
+    let ir = fh
+        .inter_refs
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    let hint_bits = if seq.enable_order_hint {
+        u32::from(seq.order_hint_bits)
+    } else {
+        0
+    };
+    let order_hint = fh.order_hint as i32;
+    // §5.9.2 `OrderHints[ LAST_FRAME + i ]`.
+    let mut order_hints = [0i32; ALTREF_FRAME + 1];
+    for i in 0..7 {
+        order_hints[LAST_FRAME + i] = refs.info.order_hint[ir.ref_frame_idx[i] as usize] as i32;
+    }
+
+    let mut mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
+    let w8 = (mi_cols >> 1) as i32;
+    let h8 = (mi_rows >> 1) as i32;
+
+    // §7.9.2 projection for one source reference.
+    let project_ref = |src: usize, dst_sign: i32, mfmvs: &mut MotionFieldMvs| -> bool {
+        let src_idx = ir.ref_frame_idx[src - LAST_FRAME] as usize;
+        let Some(slot) = refs.slots[src_idx].as_ref() else {
+            return false;
+        };
+        if slot.mi_rows != mi_rows || slot.mi_cols != mi_cols || slot.frame_is_intra {
+            return false;
+        }
+        for y8 in 0..h8 {
+            for x8 in 0..w8 {
+                let row = (2 * y8 + 1) as usize;
+                let col = (2 * x8 + 1) as usize;
+                let cell = row * (mi_cols as usize) + col;
+                let src_ref = slot.mf_ref_frames[cell];
+                if src_ref <= 0 {
+                    continue;
+                }
+                let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
+                let ref_offset = get_relative_dist(
+                    order_hints[src],
+                    slot.saved_order_hints[src_ref as usize],
+                    hint_bits,
+                );
+                let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
+                    && ref_offset.abs() <= MAX_FRAME_DISTANCE
+                    && ref_offset > 0;
+                if !pos_valid {
+                    continue;
+                }
+                let mv = [
+                    i32::from(slot.mf_mvs[cell * 2]),
+                    i32::from(slot.mf_mvs[cell * 2 + 1]),
+                ];
+                // §7.9.3 get_mv_projection.
+                let mv_projection = |mv: [i32; 2], numerator: i32, denominator: i32| -> [i32; 2] {
+                    let clipped_den = denominator.min(MAX_FRAME_DISTANCE);
+                    let clipped_num = numerator.clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
+                    let mut out = [0i32; 2];
+                    for i in 0..2 {
+                        let v = mv[i] * clipped_num * DIV_MULT[clipped_den as usize];
+                        // Round2Signed(v, 14).
+                        let scaled = if v >= 0 {
+                            (v + (1 << 13)) >> 14
+                        } else {
+                            -((-v + (1 << 13)) >> 14)
+                        };
+                        out[i] = scaled.clamp(-(1 << 14) + 1, (1 << 14) - 1);
+                    }
+                    out
+                };
+                let proj_mv = mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
+                // §7.9.4 get_block_position.
+                let project = |v8: i32, delta: i32, max8: i32, max_off8: i32| -> (i32, bool) {
+                    let base8 = (v8 >> 3) << 3;
+                    let offset8 = if delta >= 0 {
+                        delta >> (3 + 1 + 2)
+                    } else {
+                        -((-delta) >> (3 + 1 + 2))
+                    };
+                    let v8 = v8 + dst_sign * offset8;
+                    let valid = !(v8 < 0
+                        || v8 >= max8
+                        || v8 < base8 - max_off8
+                        || v8 >= base8 + 8 + max_off8);
+                    (v8, valid)
+                };
+                let (pos_y8, vy) = project(y8, proj_mv[0], h8, MAX_OFFSET_HEIGHT);
+                let (pos_x8, vx) = project(x8, proj_mv[1], w8, MAX_OFFSET_WIDTH);
+                if !(vy && vx) {
+                    continue;
+                }
+                for dst in LAST_FRAME..=ALTREF_FRAME {
+                    let ref_to_dst = get_relative_dist(order_hint, order_hints[dst], hint_bits);
+                    let out = mv_projection(mv, ref_to_dst, ref_offset);
+                    mfmvs.set(
+                        dst,
+                        pos_y8 as u32,
+                        pos_x8 as u32,
+                        [out[0] as i16, out[1] as i16],
+                    );
+                }
+            }
+        }
+        true
+    };
+
+    // §7.9.1 source-selection order.
+    let last_idx = ir.ref_frame_idx[0] as usize;
+    let cur_gold_order_hint = order_hints[GOLDEN_FRAME];
+    let last_alt_order_hint = refs.slots[last_idx]
+        .as_ref()
+        .map_or(0, |s| s.saved_order_hints[ALTREF_FRAME]);
+    let use_last = last_alt_order_hint != cur_gold_order_hint;
+    if use_last {
+        project_ref(LAST_FRAME, -1, &mut mfmvs);
+    }
+    let mut ref_stamp = MFMV_STACK_SIZE - 2;
+    let use_bwd = get_relative_dist(order_hints[BWDREF_FRAME], order_hint, hint_bits) > 0;
+    if use_bwd && project_ref(BWDREF_FRAME, 1, &mut mfmvs) {
+        ref_stamp -= 1;
+    }
+    let use_alt2 = get_relative_dist(order_hints[ALTREF2_FRAME], order_hint, hint_bits) > 0;
+    if use_alt2 && project_ref(ALTREF2_FRAME, 1, &mut mfmvs) {
+        ref_stamp -= 1;
+    }
+    let use_alt = get_relative_dist(order_hints[ALTREF_FRAME], order_hint, hint_bits) > 0;
+    if use_alt && ref_stamp >= 0 && project_ref(ALTREF_FRAME, 1, &mut mfmvs) {
+        ref_stamp -= 1;
+    }
+    if ref_stamp >= 0 {
+        project_ref(LAST2_FRAME, -1, &mut mfmvs);
+    }
+    Ok(mfmvs)
 }
 
 /// Decode an AV1 IVF v0 buffer through the spec-faithful frame driver.
@@ -908,14 +1178,35 @@ fn reference_frame_update(
         .frame_size
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
+    // §7.20 per-slot payload: pixels + §7.19 motion-field grids +
+    // `SavedOrderHints` + `save_cdfs` + `SavedGmParams` +
+    // `save_loop_filter_params`.
+    let mut gm_params = crate::uncompressed_header_tail::prev_gm_params_default();
+    if let Some(g) = fh.global_motion_params.as_ref() {
+        gm_params = g.gm_params;
+    }
+    let (lf_ref_deltas, lf_mode_deltas) = fh
+        .loop_filter_params
+        .as_ref()
+        .map(|lf| (lf.loop_filter_ref_deltas, lf.loop_filter_mode_deltas))
+        .unwrap_or((
+            crate::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT,
+            [0i8; 2],
+        ));
     let payload = SpecRefSlot {
         planes: decoded.ref_planes.clone(),
         plane_dims: decoded.ref_plane_dims.clone(),
-        mvs: decoded.mvs.clone(),
-        ref_frames: decoded.ref_frames.clone(),
+        mf_mvs: decoded.mf_mvs.clone(),
+        mf_ref_frames: decoded.mf_ref_frames.clone(),
+        saved_order_hints: decoded.order_hints_by_ref,
         mi_rows: decoded.mi_rows,
         mi_cols: decoded.mi_cols,
         frame_is_intra: fh.frame_is_intra,
+        frame_type_is_key: matches!(fh.frame_type, crate::frame_header::FrameType::Key),
+        cdfs: decoded.end_cdfs.clone(),
+        gm_params,
+        lf_ref_deltas,
+        lf_mode_deltas,
     };
     for i in 0..NUM_REF_FRAMES as usize {
         if (fh.refresh_frame_flags >> i) & 1 != 0 {
@@ -926,6 +1217,10 @@ fn reference_frame_update(
             refs.info.frame_height[i] = fs.frame_height;
             refs.info.render_width[i] = fs.render_width;
             refs.info.render_height[i] = fs.render_height;
+            refs.info.frame_type_is_key[i] = payload.frame_type_is_key;
+            refs.info.saved_gm_params[i] = payload.gm_params;
+            refs.info.saved_lf_ref_deltas[i] = payload.lf_ref_deltas;
+            refs.info.saved_lf_mode_deltas[i] = payload.lf_mode_deltas;
             refs.slots[i] = Some(payload.clone());
         }
     }
@@ -944,13 +1239,6 @@ fn output_existing_frame(refs: &SpecRefState, fh: &FrameHeader) -> Result<SpecFr
     let slot = refs.slots[idx]
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    if slot.frame_is_intra {
-        // §7.21: showing a stored KEY frame re-triggers the
-        // key-frame reference refresh (`refresh_frame_flags =
-        // allFrames` + the decoder-state load) — a follow-up gap this
-        // driver rejects loudly rather than mis-decoding.
-        return Err(Error::PartitionWalkOutOfRange);
-    }
     let planes: Vec<Vec<u8>> = slot
         .planes
         .iter()
@@ -991,6 +1279,46 @@ fn decode_temporal_unit_spec(
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
                 if fh.show_existing_frame {
                     out.push(output_existing_frame(refs, &fh)?);
+                    // §7.4 / §7.21: a shown KEY frame re-loads the
+                    // stored frame state and re-stores it into every
+                    // slot (`refresh_frame_flags == allFrames` per the
+                    // §5.9.2 show_existing arm). The wholesale slot
+                    // clone IS the §7.21 load followed by the §7.20
+                    // store — pixels, §7.19 grids, `SavedOrderHints`,
+                    // CDFs, gm params and loop-filter deltas all ride
+                    // the payload.
+                    if fh.refresh_frame_flags != 0 {
+                        let idx = fh
+                            .frame_to_show_map_idx
+                            .ok_or(Error::PartitionWalkOutOfRange)?
+                            as usize;
+                        let payload = refs.slots[idx]
+                            .as_ref()
+                            .cloned()
+                            .ok_or(Error::PartitionWalkOutOfRange)?;
+                        let loaded_order_hint = refs.info.order_hint[idx];
+                        let loaded_frame_id = refs.info.frame_id[idx];
+                        let loaded_uw = refs.info.upscaled_width[idx];
+                        let loaded_fh = refs.info.frame_height[idx];
+                        let loaded_rw = refs.info.render_width[idx];
+                        let loaded_rh = refs.info.render_height[idx];
+                        for i in 0..NUM_REF_FRAMES as usize {
+                            if (fh.refresh_frame_flags >> i) & 1 != 0 {
+                                refs.info.valid[i] = true;
+                                refs.info.order_hint[i] = loaded_order_hint;
+                                refs.info.frame_id[i] = loaded_frame_id;
+                                refs.info.upscaled_width[i] = loaded_uw;
+                                refs.info.frame_height[i] = loaded_fh;
+                                refs.info.render_width[i] = loaded_rw;
+                                refs.info.render_height[i] = loaded_rh;
+                                refs.info.frame_type_is_key[i] = payload.frame_type_is_key;
+                                refs.info.saved_gm_params[i] = payload.gm_params;
+                                refs.info.saved_lf_ref_deltas[i] = payload.lf_ref_deltas;
+                                refs.info.saved_lf_mode_deltas[i] = payload.lf_mode_deltas;
+                                refs.slots[i] = Some(payload.clone());
+                            }
+                        }
+                    }
                     pending_fh = None;
                 } else {
                     pending_fh = Some(fh);
