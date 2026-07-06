@@ -66,10 +66,14 @@ pub struct SpecFrame {
     pub width: u32,
     /// Luma height in pixels (`FrameHeight`).
     pub height: u32,
-    /// Decoded planes: `[Y]` (monochrome) or `[Y, U, V]`.
+    /// Decoded planes: `[Y]` (monochrome) or `[Y, U, V]`. For
+    /// `bit_depth == 8` one byte per sample; for 10/12-bit output two
+    /// bytes per sample, little-endian (the `yuv4xxp1{0,2}le` layout).
     pub planes: Vec<Vec<u8>>,
-    /// `(width, height)` per surfaced plane.
+    /// `(width, height)` per surfaced plane (in samples).
     pub plane_dims: Vec<(u32, u32)>,
+    /// §5.5.2 `BitDepth` (8, 10 or 12).
+    pub bit_depth: u8,
 }
 
 /// §7.20 per-slot reference store — the decoded frame a later inter
@@ -106,6 +110,8 @@ struct SpecRefSlot {
     frame_is_intra: bool,
     /// §7.20 `RefFrameType[ i ] == KEY_FRAME` — the §7.21 trigger.
     frame_type_is_key: bool,
+    /// §7.20 `RefBitDepth[ i ]` — the stored frame's `BitDepth`.
+    bit_depth: u8,
     /// §7.20 `save_cdfs( i )` — the frame-end CDF state (§8.4
     /// `frame_end_update_cdf`), loaded back by §8.3.1 `load_cdfs()`
     /// when a later frame names this slot as its primary reference.
@@ -219,7 +225,7 @@ fn decode_frame_spec_full(
         return Err(Error::PartitionWalkOutOfRange);
     }
     let cc = &seq.color_config;
-    if cc.bit_depth != 8 {
+    if !matches!(cc.bit_depth, 8 | 10 | 12) {
         return Err(Error::PartitionWalkOutOfRange);
     }
     let fs = fh
@@ -915,10 +921,24 @@ fn decode_frame_spec_full(
         }
     }
 
-    // ---- Narrow to 8-bit output. ----
+    // ---- Narrow to the output layout: one byte per sample at
+    // 8-bit, packed little-endian `u16` at 10/12-bit (the
+    // `yuv4xxp1{0,2}le` layout), clamped to `(1 << BitDepth) - 1`. ----
+    let max_val: i32 = (1 << cc.bit_depth) - 1;
     let planes: Vec<Vec<u8>> = plane_bufs
         .into_iter()
-        .map(|buf| buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect())
+        .map(|buf| {
+            if cc.bit_depth == 8 {
+                buf.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
+            } else {
+                let mut out = Vec::with_capacity(buf.len() * 2);
+                for v in buf {
+                    let v = v.clamp(0, max_val) as u16;
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out
+            }
+        })
         .collect();
 
     // ---- §7.19 motion field motion vector storage. ----
@@ -972,6 +992,7 @@ fn decode_frame_spec_full(
             height: fs.frame_height,
             planes,
             plane_dims,
+            bit_depth: cc.bit_depth,
         },
         ref_planes,
         ref_plane_dims,
@@ -1213,6 +1234,7 @@ fn reference_frame_update(
         mi_cols: decoded.mi_cols,
         frame_is_intra: fh.frame_is_intra,
         frame_type_is_key: matches!(fh.frame_type, crate::frame_header::FrameType::Key),
+        bit_depth: decoded.frame.bit_depth,
         cdfs: decoded.end_cdfs.clone(),
         gm_params,
         lf_ref_deltas,
@@ -1252,7 +1274,17 @@ fn output_existing_frame(refs: &SpecRefState, fh: &FrameHeader) -> Result<SpecFr
     let planes: Vec<Vec<u8>> = slot
         .planes
         .iter()
-        .map(|p| p.iter().map(|&v| v.min(255) as u8).collect())
+        .map(|p| {
+            if slot.bit_depth == 8 {
+                p.iter().map(|&v| v.min(255) as u8).collect()
+            } else {
+                let mut out = Vec::with_capacity(p.len() * 2);
+                for &v in p {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out
+            }
+        })
         .collect();
     let (w, h) = *slot
         .plane_dims
@@ -1263,6 +1295,7 @@ fn output_existing_frame(refs: &SpecRefState, fh: &FrameHeader) -> Result<SpecFr
         height: h,
         planes,
         plane_dims: slot.plane_dims.clone(),
+        bit_depth: slot.bit_depth,
     })
 }
 

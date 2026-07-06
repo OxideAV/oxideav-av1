@@ -1135,6 +1135,46 @@ fn show_existing_frame_decodes_byte_exact() {
     );
 }
 
+const PROFILE_2_YUV422_10BIT_IVF: &str = concat!(
+    "444b494600002000415630314000400019000000010000000100000000000000420000000000",
+    "00000000000012000a0a40000002afffbfff381032321000bc0000820c24647020e8360a13fc",
+    "9e7759b7b454e143bb61fc194ddee677acc7f3debac6547cbf9de5d5dea878311460",
+);
+
+const PROFILE_2_YUV422_12BIT_IVF: &str = concat!(
+    "444b4946000020004156303140004000190000000100000001000000000000002b0000000000",
+    "00000000000012000a0a40000002afffbfff3c44321b14002f0000009051400032e182d847d8",
+    "15c2507eab0fd434549840",
+);
+
+/// Profile 2 (Professional), 4:2:2 10-bit: the first high-bitdepth
+/// output through the spec driver — the §5.11 walk / §7.12 dequant /
+/// §7.13 transforms already carried `BitDepth`; r390 adds the
+/// 10/12-bit output surface (`SpecFrame::planes` packs little-endian
+/// `u16`, the `yuv422p10le` layout, clamped to `(1 << BitDepth) - 1`).
+#[test]
+fn profile_2_yuv422_10bit_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "profile-2-yuv422-10bit",
+        PROFILE_2_YUV422_10BIT_IVF,
+        "d579107b688578ccee5505f5b826b75274f5c15fe9997969eb3e98e451fc3e00",
+        1,
+    );
+}
+
+/// Profile 2, 4:2:2 12-bit (`high_bitdepth = 1, twelve_bit = 1`) —
+/// the §7.11.3.2 12-bit rounding-variable arm and the 12-bit `Clip1`
+/// envelope, surfaced as `yuv422p12le`.
+#[test]
+fn profile_2_yuv422_12bit_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "profile-2-yuv422-12bit",
+        PROFILE_2_YUV422_12BIT_IVF,
+        "b42ee7686e0b9bae44132d0abef5354d386b517997d9cad7caac0cb3e1fe4c5b",
+        1,
+    );
+}
+
 /// `use_superres = 1`, `coded_denom = 3` (128 -> 85 coded width, a
 /// NON-mi-aligned frame): the §7.16 polyphase upscaler (including its
 /// `Clip3(0, miW * MI_SIZE - 1, ..)` clamp reading decoded mi-grid
