@@ -64,6 +64,7 @@ use oxideav_av1::encoder::block_mode_info::{
     write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_skip, IntrabcArmInputs,
 };
 use oxideav_av1::encoder::symbol_writer::SymbolWriter;
+use oxideav_av1::uncompressed_header_tail::{SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME};
 use oxideav_av1::{
     get_palette_color_context, interintra_ctx, palette_color_ctx, BILINEAR, INTERINTRA_MODES,
     PALETTE_COLORS, V_PRED,
@@ -75,6 +76,32 @@ use oxideav_av1::{
     GM_TYPE_IDENTITY, MAX_SEGMENTS, MAX_TX_DEPTH, MAX_VARTX_DEPTH, SKIP_CONTEXTS, TX_16X16, TX_4X4,
     TX_8X8, TX_SIZE_CONTEXTS, WARPEDMODEL_PREC_BITS,
 };
+
+/// §5.9.14 `FeatureEnabled` table with segment 0's `SEG_LVL_REF_FRAME`
+/// slot active — the r394 per-segment shape of the retired
+/// `seg_ref_frame_active = true` scalar the §5.11.20 / §5.11.25
+/// override tests below drive.
+fn seg_ref_frame_active_table() -> [[bool; SEG_LVL_MAX]; MAX_SEGMENTS] {
+    let mut t = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+    t[0][SEG_LVL_REF_FRAME] = true;
+    t
+}
+
+/// §5.9.14 `FeatureData` table with segment 0's `SEG_LVL_REF_FRAME`
+/// value set to `data` (a `RefFrame` ordinal; `1 = LAST_FRAME`).
+fn seg_ref_frame_data_table(data: i16) -> [[i16; SEG_LVL_MAX]; MAX_SEGMENTS] {
+    let mut t = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+    t[0][SEG_LVL_REF_FRAME] = data;
+    t
+}
+
+/// §5.9.14 `FeatureEnabled` table with segment 0's `SEG_LVL_GLOBALMV`
+/// slot active.
+fn seg_globalmv_active_table() -> [[bool; SEG_LVL_MAX]; MAX_SEGMENTS] {
+    let mut t = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+    t[0][SEG_LVL_GLOBALMV] = true;
+    t
+}
 
 /// Helper for r173 `decode_inter_frame_mode_info` tests: builds the
 /// §5.9.24 identity-default `gm_params` table
@@ -2202,10 +2229,8 @@ fn decode_inter_frame_mode_info_surfaces_intra_arm_prologue() {
         /* predicted_segment_id = */ 0,
         /* last_active_seg_id = */ 0,
         &lossless,
-        /* seg_skip_mode_off = */ false,
-        /* seg_ref_frame_active = */ false,
-        /* seg_ref_frame_is_inter = */ false,
-        /* seg_globalmv_active = */ false,
+        /* seg_feature_active = */ &[[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        /* seg_feature_data = */ &[[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
         /* skip_mode_present = */ false,
         /* coded_lossless = */ false,
         /* enable_cdef = */ true,
@@ -2221,8 +2246,6 @@ fn decode_inter_frame_mode_info_surfaces_intra_arm_prologue() {
         // r170 §5.11.25 args — the intra arm ignores them.
         /* skip_mode_frame = */
         [0, -1],
-        /* seg_skip_active = */ false,
-        /* seg_ref_frame_data = */ 0,
         /* reference_select = */ false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -2285,16 +2308,14 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
         0,
         BLOCK_8X8,
         false,
-        false,
+        /* segmentation_enabled = */ true,
         false,
         false,
         0,
         0,
         &lossless,
-        false,
-        /* seg_ref_frame_active = */ true,
-        /* seg_ref_frame_is_inter = */ true,
-        false,
+        /* seg_feature_active = */ &seg_ref_frame_active_table(),
+        /* seg_feature_data = */ &seg_ref_frame_data_table(1),
         false,
         false,
         true,
@@ -2315,8 +2336,6 @@ fn decode_inter_frame_mode_info_reaches_inter_block_stub() {
         // (LAST_FRAME) so the value is a conformant ref.
         /* skip_mode_frame = */
         [0, -1],
-        /* seg_skip_active = */ false,
-        /* seg_ref_frame_data = */ 1,
         /* reference_select = */ false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -2401,10 +2420,8 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
         0,
         0,
         &lossless,
-        /* seg_skip_mode_off = */ false,
-        false,
-        false,
-        false,
+        /* seg_feature_active = */ &[[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        /* seg_feature_data = */ &[[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
         /* skip_mode_present = */ true,
         false,
         true,
@@ -2423,8 +2440,6 @@ fn decode_inter_frame_mode_info_skip_mode_forces_skip_and_inter() {
         // compound pair (so the post-stamp grid view is non-trivial).
         /* skip_mode_frame = */
         [1, 7],
-        /* seg_skip_active = */ false,
-        /* seg_ref_frame_data = */ 0,
         /* reference_select = */ false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -2490,16 +2505,14 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
         0,
         BLOCK_8X8,
         false,
-        false,
+        /* segmentation_enabled = */ true,
         false,
         false,
         0,
         0,
         &lossless,
-        false,
-        false,
-        false,
-        /* seg_globalmv_active = */ true,
+        /* seg_feature_active = */ &seg_globalmv_active_table(),
+        /* seg_feature_data = */ &[[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
         false,
         false,
         true,
@@ -2517,8 +2530,6 @@ fn decode_inter_frame_mode_info_seg_globalmv_forces_inter() {
         // S() — then §7.10 stub.
         /* skip_mode_frame = */
         [0, -1],
-        /* seg_skip_active = */ false,
-        /* seg_ref_frame_data = */ 0,
         /* reference_select = */ false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -2580,10 +2591,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         0,
         0,
         &lossless,
-        false,
-        false,
-        false,
-        false,
+        &[[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        &[[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
         false,
         false,
         true,
@@ -2597,8 +2606,6 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         [0, -1],
-        false,
-        0,
         false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -2633,10 +2640,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         0,
         0,
         &lossless,
-        false,
-        false,
-        false,
-        false,
+        &[[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        &[[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
         false,
         false,
         true,
@@ -2650,8 +2655,6 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         [0, -1],
-        false,
-        0,
         false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -2686,10 +2689,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         0,
         0,
         &lossless,
-        false,
-        false,
-        false,
-        false,
+        &[[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        &[[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
         false,
         false,
         true,
@@ -2703,8 +2704,6 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         [0, -1],
-        false,
-        0,
         false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -2739,10 +2738,8 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         0,
         /* last_active_seg_id = */ MAX_SEGMENTS as u8,
         &lossless,
-        false,
-        false,
-        false,
-        false,
+        &[[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+        &[[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
         false,
         false,
         true,
@@ -2756,8 +2753,6 @@ fn decode_inter_frame_mode_info_rejects_out_of_range() {
         false,
         0,
         [0, -1],
-        false,
-        0,
         false,
         /* gm_type = */ [GM_TYPE_IDENTITY; 8],
         /* gm_params = */ identity_gm_params(),
@@ -3470,7 +3465,10 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
     let mut ctx = InterFrameContext::identity_default(&mfmvs);
     // §5.11.20 `read_is_inter` third arm: seg_globalmv_active forces
     // is_inter = 1 with no S() read.
-    ctx.seg_globalmv_active = true;
+    // r394: the per-segment table + `segmentation_enabled = true`
+    // replaces the retired frame-scope override flag (the §5.11.14
+    // `seg_feature_active` gate requires both).
+    ctx.seg_feature_active[0][SEG_LVL_GLOBALMV] = true;
 
     let result = walker.decode_block_syntax(
         &mut dec,
@@ -3483,7 +3481,7 @@ fn r190_decode_block_syntax_with_inter_ctx_runs_inter_arm_to_completion() {
         /* subsampling_y = */ 0,
         /* num_planes = */ 3,
         /* seg_id_pre_skip = */ false,
-        /* segmentation_enabled = */ false,
+        /* segmentation_enabled = */ true,
         /* seg_skip_active = */ false,
         /* last_active_seg_id = */ 0,
         &lossless,
@@ -3594,7 +3592,10 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
     // §5.11.20 third arm: seg_globalmv_active forces is_inter = 1 (no S()),
     // §5.11.25 sets RefFrame = [LAST_FRAME, NONE], §5.11.23 YMode = GLOBALMV
     // → §5.11.31 assign_mv adopts identity GlobalMvs[0] = [0, 0].
-    ctx.seg_globalmv_active = true;
+    // r394: the per-segment table + `segmentation_enabled = true`
+    // replaces the retired frame-scope override flag (the §5.11.14
+    // `seg_feature_active` gate requires both).
+    ctx.seg_feature_active[0][SEG_LVL_GLOBALMV] = true;
 
     let db = walker
         .decode_block_syntax(
@@ -3608,7 +3609,7 @@ fn r346_two_pass_inter_decode_reconstructs_pixels_from_bitstream() {
             /* subsampling_y = */ 0,
             /* num_planes = */ 3,
             /* seg_id_pre_skip = */ false,
-            /* segmentation_enabled = */ false,
+            /* segmentation_enabled = */ true,
             /* seg_skip_active = */ false,
             /* last_active_seg_id = */ 0,
             &lossless,
@@ -3746,7 +3747,10 @@ fn r387_in_walk_inter_prediction_reconstructs_during_decode_block_syntax() {
 
     let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let mut ctx = InterFrameContext::identity_default(&mfmvs);
-    ctx.seg_globalmv_active = true;
+    // r394: the per-segment table + `segmentation_enabled = true`
+    // replaces the retired frame-scope override flag (the §5.11.14
+    // `seg_feature_active` gate requires both).
+    ctx.seg_feature_active[0][SEG_LVL_GLOBALMV] = true;
     ctx.pixels = Some(&pixels);
 
     let db = walker
@@ -3761,7 +3765,7 @@ fn r387_in_walk_inter_prediction_reconstructs_during_decode_block_syntax() {
             /* subsampling_y = */ 0,
             /* num_planes = */ 3,
             /* seg_id_pre_skip = */ false,
-            /* segmentation_enabled = */ false,
+            /* segmentation_enabled = */ true,
             /* seg_skip_active = */ false,
             /* last_active_seg_id = */ 0,
             &lossless,
@@ -3875,7 +3879,10 @@ fn r302_decode_block_syntax_inter_intra_block_surfaces_is_inter_intra_flag() {
 
     let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let mut ctx = InterFrameContext::identity_default(&mfmvs);
-    ctx.seg_globalmv_active = true;
+    // r394: the per-segment table + `segmentation_enabled = true`
+    // replaces the retired frame-scope override flag (the §5.11.14
+    // `seg_feature_active` gate requires both).
+    ctx.seg_feature_active[0][SEG_LVL_GLOBALMV] = true;
     // §5.5.2 sequence-header bit — opens the §5.11.28 outer gate.
     ctx.enable_interintra_compound = true;
 
@@ -3891,7 +3898,7 @@ fn r302_decode_block_syntax_inter_intra_block_surfaces_is_inter_intra_flag() {
             /* subsampling_y = */ 0,
             /* num_planes = */ 3,
             /* seg_id_pre_skip = */ false,
-            /* segmentation_enabled = */ false,
+            /* segmentation_enabled = */ true,
             /* seg_skip_active = */ false,
             /* last_active_seg_id = */ 0,
             &lossless,
@@ -3973,7 +3980,10 @@ fn decode_inter_intra_then_frame_walk(ii_mode: usize, ref_fill: u16) -> Vec<u16>
     let lossless = [false; MAX_SEGMENTS];
     let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let mut ctx = InterFrameContext::identity_default(&mfmvs);
-    ctx.seg_globalmv_active = true;
+    // r394: the per-segment table + `segmentation_enabled = true`
+    // replaces the retired frame-scope override flag (the §5.11.14
+    // `seg_feature_active` gate requires both).
+    ctx.seg_feature_active[0][SEG_LVL_GLOBALMV] = true;
     ctx.enable_interintra_compound = true;
 
     let db = walker
@@ -3988,7 +3998,7 @@ fn decode_inter_intra_then_frame_walk(ii_mode: usize, ref_fill: u16) -> Vec<u16>
             0,
             3,
             false,
-            false,
+            /* segmentation_enabled = */ true,
             false,
             0,
             &lossless,
@@ -4109,7 +4119,10 @@ fn r190_decode_partition_syntax_with_inter_ctx_routes_through_inter_arm() {
 
     let mfmvs = MotionFieldMvs::new_invalid(walker.mi_rows(), walker.mi_cols());
     let mut ctx = InterFrameContext::identity_default(&mfmvs);
-    ctx.seg_globalmv_active = true;
+    // r394: the per-segment table + `segmentation_enabled = true`
+    // replaces the retired frame-scope override flag (the §5.11.14
+    // `seg_feature_active` gate requires both).
+    ctx.seg_feature_active[0][SEG_LVL_GLOBALMV] = true;
 
     let result = walker.decode_partition_syntax(
         &mut dec,
@@ -4244,8 +4257,13 @@ fn r190_inter_frame_context_identity_default_matches_spec_identity_warp() {
         assert_eq!(ctx.gm_type[ref_idx], GM_TYPE_IDENTITY);
     }
     assert!(!ctx.segmentation_update_map);
-    assert!(!ctx.seg_skip_mode_off);
-    assert!(!ctx.seg_globalmv_active);
+    assert!(
+        ctx.seg_feature_active
+            .iter()
+            .all(|row| row.iter().all(|&f| !f)),
+        "identity default: no active segmentation features"
+    );
+    assert!(ctx.prev_segment_ids.is_none());
     assert_eq!(ctx.skip_mode_frame, [0, -1]);
     assert!(!ctx.allow_high_precision_mv);
     assert!(!ctx.enable_interintra_compound);

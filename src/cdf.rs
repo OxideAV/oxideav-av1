@@ -23384,18 +23384,16 @@ impl PartitionWalker {
         predicted_segment_id: u8,
         last_active_seg_id: u8,
         lossless_array: &[bool; MAX_SEGMENTS],
-        // §5.9.14 per-segment-id feature override caches that the
-        // walker stays free of. Caller computes these from the
-        // §5.9.14 `FeatureData` table against the just-decoded
-        // `segment_id` value: the §5.11.18 spec gates `read_skip_mode`
-        // on `seg_feature_active( SEG_LVL_SKIP / REF_FRAME / GLOBALMV
-        // )`, and gates `read_is_inter` on the same three. We thread
-        // them through as four booleans + one i32 for the
-        // SEG_LVL_REF_FRAME != INTRA_FRAME comparison.
-        seg_skip_mode_off: bool,
-        seg_ref_frame_active: bool,
-        seg_ref_frame_is_inter: bool,
-        seg_globalmv_active: bool,
+        // §5.9.14 `FeatureEnabled[][]` / `FeatureData[][]` tables —
+        // r394: every `seg_feature_active( feature )` gate (§5.11.14
+        // — `read_skip_mode`, `read_skip`, `read_is_inter`, the
+        // §5.11.25 SEG_LVL_REF_FRAME override, the §5.11.24 / §5.11.26
+        // SEG_LVL_SKIP / SEG_LVL_GLOBALMV mode forcing) is derived
+        // HERE at the block's own just-decoded `segment_id`, replacing
+        // the caller-collapsed frame-scope booleans (wrong whenever
+        // two segments carried different feature sets).
+        seg_feature_active: &[[bool; crate::uncompressed_header_tail::SEG_LVL_MAX]; MAX_SEGMENTS],
+        seg_feature_data: &[[i16; crate::uncompressed_header_tail::SEG_LVL_MAX]; MAX_SEGMENTS],
         // §5.9.21 / §6.8.21 / §5.9.14 frame-header / sequence-header
         // scalars (mirroring [`Self::decode_intra_frame_mode_info_prefix`]):
         skip_mode_present: bool,
@@ -23419,8 +23417,6 @@ impl PartitionWalker {
         // wiring — the dispatcher only consults them when
         // `is_inter == 1`).
         skip_mode_frame: [i32; 2],
-        seg_skip_active: bool,
-        seg_ref_frame_data: i32,
         reference_select: bool,
         // r173 §7.10 caller-supplied frame-header scalars threaded
         // through to [`Self::find_mv_stack`] via
@@ -23555,11 +23551,25 @@ impl PartitionWalker {
             lossless_array,
         )?;
 
+        // §5.11.14 `seg_feature_active_idx( idx, feature ) =
+        // segmentation_enabled && FeatureEnabled[ idx ][ feature ]`,
+        // evaluated against the CURRENT segment_id (which the
+        // post-skip §5.11.19 read below may still change — the spec
+        // derives each gate at its own read point).
+        let feat_active = |sid: u8, feature: usize| -> bool {
+            segmentation_enabled
+                && seg_feature_active[(sid as usize).min(MAX_SEGMENTS - 1)][feature]
+        };
+        use crate::uncompressed_header_tail::{SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
+
         // §5.11.18 line 12: `read_skip_mode( )`. The §5.11.10 spec
         // body short-circuits on the three segmentation overrides +
         // !skip_mode_present + small-block (Block_Width/Height < 8)
         // gates; otherwise reads a binary symbol against
         // `TileSkipModeCdf[ctx]`.
+        let seg_skip_mode_off = feat_active(segment_id, SEG_LVL_SKIP)
+            || feat_active(segment_id, SEG_LVL_REF_FRAME)
+            || feat_active(segment_id, SEG_LVL_GLOBALMV);
         let skip_mode = self.decode_skip_mode(
             decoder,
             cdfs,
@@ -23597,25 +23607,21 @@ impl PartitionWalker {
             1
         } else {
             // §5.11.18 line 14: `read_skip( )`. The §5.11.11 spec body
-            // short-circuits on `seg_feature_active( SEG_LVL_SKIP )`
-            // (collapsed into `seg_skip_mode_off` here — the
-            // SEG_LVL_SKIP arm of that bundle); otherwise reads a
-            // binary `S()` against `TileSkipCdf[ctx]`. The §5.11.18
-            // spec body doesn't gate `read_skip()` on the
-            // segmentation feature directly — the §5.11.11 internal
-            // gate handles it. The caller-passed
-            // `seg_skip_mode_off` covers SEG_LVL_SKIP /
-            // SEG_LVL_REF_FRAME / SEG_LVL_GLOBALMV; for the §5.11.11
-            // gate we want SEG_LVL_SKIP alone, but treating all three
-            // as "skip = 1" matches the §5.11.18 caller's
-            // skip_mode-was-already-0 invariant.
+            // forces `skip = 1` on `SegIdPreSkip &&
+            // seg_feature_active( SEG_LVL_SKIP )` — SEG_LVL_SKIP
+            // ALONE, and only when the segment id was already read
+            // pre-skip (r394 fix: the previous code collapsed all
+            // three §5.11.10 features into the gate and ignored
+            // `SegIdPreSkip`, forcing skip on REF_FRAME/GLOBALMV-only
+            // segments and on `SegIdPreSkip == 0` frames).
             self.decode_skip(
                 decoder,
                 cdfs,
                 mi_row,
                 mi_col,
                 sub_size,
-                /* seg_skip_active = */ seg_skip_mode_off,
+                /* seg_skip_active = */
+                seg_id_pre_skip && feat_active(segment_id, SEG_LVL_SKIP),
             )?
         };
 
@@ -23709,7 +23715,17 @@ impl PartitionWalker {
 
         // §5.11.18 line 22: `read_is_inter( )`. The §5.11.20 spec body
         // has the four-arm dispatch (skip_mode forces is_inter = 1,
-        // segment overrides, else S()).
+        // segment overrides, else S()). The three feature gates are
+        // re-derived at the FINAL segment_id (the post-skip §5.11.19
+        // read above may have changed it).
+        let seg = (segment_id as usize).min(MAX_SEGMENTS - 1);
+        let seg_ref_frame_active = feat_active(segment_id, SEG_LVL_REF_FRAME);
+        let seg_globalmv_active = feat_active(segment_id, SEG_LVL_GLOBALMV);
+        let seg_skip_active = feat_active(segment_id, SEG_LVL_SKIP);
+        let seg_ref_frame_data = i32::from(seg_feature_data[seg][SEG_LVL_REF_FRAME]);
+        // `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] !=
+        // INTRA_FRAME` per §5.11.20 (INTRA_FRAME = 0).
+        let seg_ref_frame_is_inter = seg_ref_frame_data != 0;
         let is_inter = self.decode_is_inter(
             decoder,
             cdfs,
@@ -29736,6 +29752,35 @@ impl PartitionWalker {
         reduced_tx_set: bool,
         ctx: &InterFrameContext,
     ) -> Result<DecodedBlock, crate::Error> {
+        // §5.11.19 `predictedSegmentId = get_segment_id()` — the
+        // §5.11.21 min-scan over `PrevSegmentIds` at THIS block's
+        // footprint. `None` (no primary reference /
+        // `setup_past_independence()`) reads as the all-zero map.
+        let predicted_segment_id: u8 = if segmentation_enabled {
+            match ctx.prev_segment_ids {
+                Some(prev) => {
+                    let v = get_segment_id(
+                        prev,
+                        self.mi_rows,
+                        self.mi_cols,
+                        self.mi_rows,
+                        self.mi_cols,
+                        mi_row,
+                        mi_col,
+                        sub_size,
+                    )
+                    .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+                    // The `-1` unwritten-cell sentinel cannot appear in
+                    // a §7.20-stored map (the store clamps); clamp
+                    // defensively anyway.
+                    v.max(0) as u8
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
+        let _ = seg_skip_active;
         // §5.11.6 inter arm — full §5.11.18 cascade.
         let info = self.decode_inter_frame_mode_info(
             decoder,
@@ -29747,13 +29792,11 @@ impl PartitionWalker {
             segmentation_enabled,
             ctx.segmentation_update_map,
             ctx.segmentation_temporal_update,
-            ctx.predicted_segment_id,
+            predicted_segment_id,
             last_active_seg_id,
             lossless_array,
-            ctx.seg_skip_mode_off,
-            ctx.seg_ref_frame_active,
-            ctx.seg_ref_frame_is_inter,
-            ctx.seg_globalmv_active,
+            &ctx.seg_feature_active,
+            &ctx.seg_feature_data,
             ctx.skip_mode_present,
             coded_lossless,
             enable_cdef,
@@ -29767,8 +29810,6 @@ impl PartitionWalker {
             mono_chrome,
             delta_lf_res,
             ctx.skip_mode_frame,
-            seg_skip_active,
-            ctx.seg_ref_frame_data,
             ctx.reference_select,
             ctx.gm_type,
             ctx.gm_params,
@@ -35136,22 +35177,23 @@ pub struct InterFrameContext<'a> {
     pub segmentation_update_map: bool,
     /// `segmentation_temporal_update` (§5.9.14).
     pub segmentation_temporal_update: bool,
-    /// `predictedSegmentId` for the current block per §5.11.19.
-    pub predicted_segment_id: u8,
-    /// `seg_feature_active(SEG_LVL_SKIP) || seg_feature_active(SEG_LVL_REF_FRAME)
-    /// || seg_feature_active(SEG_LVL_GLOBALMV)`-collapsed flag the
-    /// §5.11.10 `read_skip_mode` short-circuit consumes.
-    pub seg_skip_mode_off: bool,
-    /// `seg_feature_active(SEG_LVL_REF_FRAME)` for the current block's
-    /// `segment_id`.
-    pub seg_ref_frame_active: bool,
-    /// `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME`.
-    pub seg_ref_frame_is_inter: bool,
-    /// `seg_feature_active(SEG_LVL_GLOBALMV)` for the current block's
-    /// `segment_id`.
-    pub seg_globalmv_active: bool,
-    /// `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]` in `0..=7`.
-    pub seg_ref_frame_data: i32,
+    /// §5.9.14 `FeatureEnabled[ segmentId ][ feature ]` — the walker
+    /// derives every per-block `seg_feature_active( feature )` gate
+    /// (`segmentation_enabled && FeatureEnabled[ segment_id ][ f ]`,
+    /// §5.11.14) from this table at the block's own `segment_id`,
+    /// which is only known mid-§5.11.18 (the pre-skip / post-skip
+    /// `inter_segment_id` reads). r394: replaces the frame-scope
+    /// pre-collapsed booleans, which were wrong whenever two segments
+    /// carried different feature sets.
+    pub seg_feature_active: [[bool; crate::uncompressed_header_tail::SEG_LVL_MAX]; MAX_SEGMENTS],
+    /// §5.9.14 `FeatureData[ segmentId ][ feature ]`.
+    pub seg_feature_data: [[i16; crate::uncompressed_header_tail::SEG_LVL_MAX]; MAX_SEGMENTS],
+    /// §5.9.2 `PrevSegmentIds[ row ][ col ]` (row-major over the
+    /// current frame's `MiRows × MiCols` grid) — the §5.11.21
+    /// `get_segment_id()` prediction source, loaded by
+    /// `load_previous_segment_ids()` from the primary reference (or
+    /// all-zero after `setup_past_independence()`). `None` ⇒ all-zero.
+    pub prev_segment_ids: Option<&'a [i32]>,
     /// `skip_mode_present` (§5.9.22).
     pub skip_mode_present: bool,
     /// `SkipModeFrame[ 0..2 ]` per §5.9.22.
@@ -35268,12 +35310,10 @@ impl<'a> InterFrameContext<'a> {
         Self {
             segmentation_update_map: false,
             segmentation_temporal_update: false,
-            predicted_segment_id: 0,
-            seg_skip_mode_off: false,
-            seg_ref_frame_active: false,
-            seg_ref_frame_is_inter: false,
-            seg_globalmv_active: false,
-            seg_ref_frame_data: 0,
+            seg_feature_active: [[false; crate::uncompressed_header_tail::SEG_LVL_MAX];
+                MAX_SEGMENTS],
+            seg_feature_data: [[0; crate::uncompressed_header_tail::SEG_LVL_MAX]; MAX_SEGMENTS],
+            prev_segment_ids: None,
             skip_mode_present: false,
             skip_mode_frame: [0, -1],
             reference_select: false,

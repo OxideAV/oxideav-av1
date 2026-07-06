@@ -123,6 +123,11 @@ struct SpecRefSlot {
     lf_ref_deltas: [i8; 8],
     /// Mode-delta half of `save_loop_filter_params( i )`.
     lf_mode_deltas: [i8; 2],
+    /// §7.20 `SavedSegmentIds[ i ]` — the decoded frame's
+    /// `SegmentIds[ row ][ col ]` grid (row-major, one `i32` per mi
+    /// cell), loaded back by `load_previous_segment_ids()` as the
+    /// §5.11.21 `PrevSegmentIds` prediction source.
+    segment_ids: Vec<i32>,
 }
 
 /// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
@@ -166,6 +171,9 @@ struct DecodedFrameInternal {
     /// The decoded frame's mi extent.
     mi_rows: u32,
     mi_cols: u32,
+    /// §7.20 `SegmentIds[][]` snapshot (unwritten `-1` cells clamped
+    /// to `0`, matching the spec's always-written map).
+    segment_ids: Vec<i32>,
 }
 
 /// §5.9.2 `LosslessArray[ segmentId ]` — `get_qindex( 1, segmentId ) ==
@@ -435,6 +443,33 @@ fn decode_frame_spec_full(
     } else {
         MotionFieldMvs::new_invalid(mi_rows, mi_cols)
     };
+    // §5.9.2 `load_previous_segment_ids()` — with a primary reference
+    // whose stored mi extent matches, `PrevSegmentIds` is that slot's
+    // §7.20 `SavedSegmentIds`; otherwise all-zero (also the
+    // `setup_past_independence()` state for PRIMARY_REF_NONE).
+    let prev_segment_ids: Option<Vec<i32>> =
+        if is_inter_frame && sp.enabled && fh.primary_ref_frame != PRIMARY_REF_NONE {
+            let st = refs.ok_or(Error::PartitionWalkOutOfRange)?;
+            let ir = fh
+                .inter_refs
+                .as_ref()
+                .ok_or(Error::PartitionWalkOutOfRange)?;
+            let slot = ir.ref_frame_idx[fh.primary_ref_frame as usize] as usize;
+            match st.slots.get(slot).and_then(|s| s.as_ref()) {
+                Some(prev)
+                    if prev.mi_rows == mi_rows
+                        && prev.mi_cols == mi_cols
+                        && prev.segment_ids.len() == (mi_rows as usize) * (mi_cols as usize) =>
+                {
+                    Some(prev.segment_ids.clone())
+                }
+                _ => Some(vec![0i32; (mi_rows as usize) * (mi_cols as usize)]),
+            }
+        } else if is_inter_frame && sp.enabled {
+            Some(vec![0i32; (mi_rows as usize) * (mi_cols as usize)])
+        } else {
+            None
+        };
     // Never-referenced placeholder for empty §7.20 slots (a conformant
     // stream only references `RefValid` slots).
     let dummy_plane: Vec<u16> = vec![0u16; 64];
@@ -457,12 +492,6 @@ fn decode_frame_spec_full(
             .inter_refs
             .as_ref()
             .ok_or(Error::PartitionWalkOutOfRange)?;
-        // Loud follow-up gates for state this milestone does not
-        // forward yet (none fire on the corpus arc this lands for).
-        if sp.enabled {
-            // §5.9.14 segmentation feature state on the §5.11.18 ctx.
-            return Err(Error::PartitionWalkOutOfRange);
-        }
         for plane in 0..num_planes_usize {
             let arr: [RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize] =
                 core::array::from_fn(|slot| match st.slots[slot].as_ref() {
@@ -543,6 +572,15 @@ fn decode_frame_spec_full(
             .as_ref()
             .ok_or(Error::PartitionWalkOutOfRange)?;
         let mut c = InterFrameContext::identity_default(&mfmvs);
+        // §5.9.14 segmentation state: the update flags, the
+        // FeatureEnabled/FeatureData tables (per-block
+        // `seg_feature_active` gates), and the §5.11.21
+        // `PrevSegmentIds` prediction source.
+        c.segmentation_update_map = sp.update_map;
+        c.segmentation_temporal_update = sp.temporal_update;
+        c.seg_feature_active = sp.segment_feature_active;
+        c.seg_feature_data = sp.segment_feature_data;
+        c.prev_segment_ids = prev_segment_ids.as_deref();
         // §5.9.22 skip-mode state: the §5.11.10 `read_skip_mode` gate
         // plus the fixed compound reference pair the skip-mode arm
         // predicts from.
@@ -995,6 +1033,12 @@ fn decode_frame_spec_full(
         }
     }
 
+    // §7.20 `SavedSegmentIds` payload — the walker's stamped
+    // `SegmentIds[][]` grid; unwritten `-1` cells clamp to `0` (the
+    // spec map is always written: `segment_id = 0` when segmentation
+    // is disabled).
+    let segment_ids: Vec<i32> = walker.segment_ids().iter().map(|&v| v.max(0)).collect();
+
     Ok(DecodedFrameInternal {
         frame: SpecFrame {
             // Post-§7.16 the surfaced luma width is `UpscaledWidth`
@@ -1013,6 +1057,7 @@ fn decode_frame_spec_full(
         end_cdfs,
         mi_rows,
         mi_cols,
+        segment_ids,
     })
 }
 
@@ -1235,6 +1280,20 @@ fn reference_frame_update(
             crate::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT,
             [0i8; 2],
         ));
+    // §7.20 `save_segmentation_params( i )` — the current frame's
+    // FeatureEnabled / FeatureData (post-§5.9.14, including the
+    // `segmentation_update_data == 0` loaded values).
+    let (seg_active, seg_data) = fh
+        .segmentation_params
+        .as_ref()
+        .map(|sp| (sp.segment_feature_active, sp.segment_feature_data))
+        .unwrap_or((
+            [[false; crate::uncompressed_header_tail::SEG_LVL_MAX]
+                as [bool; crate::uncompressed_header_tail::SEG_LVL_MAX];
+                crate::uncompressed_header_tail::MAX_SEGMENTS],
+            [[0i16; crate::uncompressed_header_tail::SEG_LVL_MAX];
+                crate::uncompressed_header_tail::MAX_SEGMENTS],
+        ));
     let payload = SpecRefSlot {
         planes: decoded.ref_planes.clone(),
         plane_dims: decoded.ref_plane_dims.clone(),
@@ -1250,6 +1309,7 @@ fn reference_frame_update(
         gm_params,
         lf_ref_deltas,
         lf_mode_deltas,
+        segment_ids: decoded.segment_ids.clone(),
     };
     for i in 0..NUM_REF_FRAMES as usize {
         if (fh.refresh_frame_flags >> i) & 1 != 0 {
@@ -1264,6 +1324,8 @@ fn reference_frame_update(
             refs.info.saved_gm_params[i] = payload.gm_params;
             refs.info.saved_lf_ref_deltas[i] = payload.lf_ref_deltas;
             refs.info.saved_lf_mode_deltas[i] = payload.lf_mode_deltas;
+            refs.info.saved_seg_feature_active[i] = seg_active;
+            refs.info.saved_seg_feature_data[i] = seg_data;
             refs.slots[i] = Some(payload.clone());
         }
     }
@@ -1369,6 +1431,13 @@ fn decode_temporal_unit_spec(
                                 refs.info.saved_gm_params[i] = payload.gm_params;
                                 refs.info.saved_lf_ref_deltas[i] = payload.lf_ref_deltas;
                                 refs.info.saved_lf_mode_deltas[i] = payload.lf_mode_deltas;
+                                // §7.21 load + §7.20 re-store: the
+                                // segmentation params ride the RefInfo
+                                // copy from the loaded slot.
+                                refs.info.saved_seg_feature_active[i] =
+                                    refs.info.saved_seg_feature_active[idx];
+                                refs.info.saved_seg_feature_data[i] =
+                                    refs.info.saved_seg_feature_data[idx];
                                 refs.slots[i] = Some(payload.clone());
                             }
                         }

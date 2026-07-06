@@ -372,6 +372,18 @@ pub struct RefInfo {
     /// §7.20 `save_loop_filter_params(i)` — the stored
     /// `loop_filter_mode_deltas[]` of slot `i`.
     pub saved_lf_mode_deltas: [[i8; 2]; NUM_REF_FRAMES as usize],
+    /// §7.20 `save_segmentation_params(i)` — the stored
+    /// `FeatureEnabled[][]` of slot `i`, loaded back by §5.9.2
+    /// `load_previous()` step 4 (`load_segmentation_params`) as the
+    /// §5.9.14 `segmentation_update_data == 0` baseline.
+    pub saved_seg_feature_active: [[[bool; crate::uncompressed_header_tail::SEG_LVL_MAX];
+        crate::uncompressed_header_tail::MAX_SEGMENTS];
+        NUM_REF_FRAMES as usize],
+    /// §7.20 `save_segmentation_params(i)` — the stored
+    /// `FeatureData[][]` of slot `i`.
+    pub saved_seg_feature_data: [[[i16; crate::uncompressed_header_tail::SEG_LVL_MAX];
+        crate::uncompressed_header_tail::MAX_SEGMENTS];
+        NUM_REF_FRAMES as usize],
 }
 
 impl Default for RefInfo {
@@ -395,6 +407,12 @@ impl Default for RefInfo {
             saved_lf_ref_deltas: [crate::uncompressed_header_tail::LOOP_FILTER_REF_DELTAS_DEFAULT;
                 NUM_REF_FRAMES as usize],
             saved_lf_mode_deltas: [[0i8; 2]; NUM_REF_FRAMES as usize],
+            saved_seg_feature_active: [[[false; crate::uncompressed_header_tail::SEG_LVL_MAX];
+                crate::uncompressed_header_tail::MAX_SEGMENTS];
+                NUM_REF_FRAMES as usize],
+            saved_seg_feature_data: [[[0i16; crate::uncompressed_header_tail::SEG_LVL_MAX];
+                crate::uncompressed_header_tail::MAX_SEGMENTS];
+                NUM_REF_FRAMES as usize],
         }
     }
 }
@@ -783,7 +801,7 @@ fn parse_with(
             seq.color_config.num_planes,
             seq.color_config.separate_uv_delta_q,
         )?;
-        let segmentation_params = read_segmentation_params(br, PRIMARY_REF_NONE)?;
+        let segmentation_params = read_segmentation_params(br, PRIMARY_REF_NONE, None)?;
         // §5.9.2 spec order after segmentation_params(): delta_q_params()
         // (§5.9.17) then delta_lf_params() (§5.9.18). delta_q_params reads
         // the `delta_q_present` `f(1)` slot only when `base_q_idx > 0`;
@@ -1116,7 +1134,11 @@ fn parse_with(
             seq.color_config.num_planes,
             seq.color_config.separate_uv_delta_q,
         )?;
-        let sp = read_segmentation_params(br, primary_ref_frame)?;
+        // Intra frames always carry `primary_ref_frame ==
+        // PRIMARY_REF_NONE` (§5.9.2 reads the slot only on the inter
+        // arm), so the §5.9.14 `segmentation_update_data == 0` loaded
+        // baseline can never be consulted here.
+        let sp = read_segmentation_params(br, primary_ref_frame, None)?;
         // §5.9.2 spec order after segmentation_params(): delta_q_params()
         // (§5.9.17) then delta_lf_params() (§5.9.18). delta_q reads its
         // `delta_q_present` slot only when `base_q_idx > 0`; delta_lf is
@@ -1290,7 +1312,20 @@ fn parse_with(
             seq.color_config.num_planes,
             seq.color_config.separate_uv_delta_q,
         )?;
-        let sp = read_segmentation_params(br, primary_ref_frame)?;
+        // §5.9.2 load_previous() step 4 / §7.21
+        // load_segmentation_params( prevFrame ): the §5.9.14
+        // `segmentation_update_data == 0` arm keeps the primary
+        // reference's saved FeatureEnabled / FeatureData.
+        let seg_loaded = if primary_ref_frame == PRIMARY_REF_NONE {
+            None
+        } else {
+            let slot = ref_frame_idx[primary_ref_frame as usize] as usize;
+            Some((
+                &ref_info.saved_seg_feature_active[slot],
+                &ref_info.saved_seg_feature_data[slot],
+            ))
+        };
+        let sp = read_segmentation_params(br, primary_ref_frame, seg_loaded)?;
         let dq = read_delta_q_params(br, qp.base_q_idx)?;
         let dlf = read_delta_lf_params(br, dq.delta_q_present, aib)?;
         let coded_lossless = compute_coded_lossless(&qp, &sp);

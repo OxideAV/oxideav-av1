@@ -611,13 +611,25 @@ pub fn parse_segmentation_params(
     primary_ref_frame: u8,
 ) -> Result<(SegmentationParams, usize), Error> {
     let mut br = BitReader::new(payload);
-    let s = read_segmentation_params(&mut br, primary_ref_frame)?;
+    let s = read_segmentation_params(&mut br, primary_ref_frame, None)?;
     Ok((s, br.position()))
 }
+
+/// The `FeatureEnabled[][]` / `FeatureData[][]` pair §5.9.2
+/// `load_previous()` step 4 (`load_segmentation_params( prevFrame )`,
+/// §7.21) loads from the primary reference — the §5.9.14
+/// `segmentation_update_data == 0` arm keeps these values instead of
+/// reading new ones ("the segmentation parameters should keep their
+/// existing values", §5.9.14 semantics).
+pub type LoadedSegFeatures<'a> = (
+    &'a [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
+    &'a [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+);
 
 pub(crate) fn read_segmentation_params(
     br: &mut BitReader<'_>,
     primary_ref_frame: u8,
+    loaded: Option<LoadedSegFeatures<'_>>,
 ) -> Result<SegmentationParams, Error> {
     let enabled = br.f(1)? == 1;
     if !enabled {
@@ -636,10 +648,20 @@ pub(crate) fn read_segmentation_params(
             (um, tu, ud)
         };
 
-    let mut feature_active = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
-    let mut feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
-
+    // §5.9.14: `segmentation_update_data == 0` keeps the values
+    // `load_previous()` loaded from the primary reference (the
+    // all-zero fallback only stands for callers with no loaded state,
+    // e.g. direct `parse_segmentation_params` fixture tests).
+    let (mut feature_active, mut feature_data) = match loaded {
+        Some((a, d)) => (*a, *d),
+        None => (
+            [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+        ),
+    };
     if update_data {
+        feature_active = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+        feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
         for i in 0..MAX_SEGMENTS {
             for j in 0..SEG_LVL_MAX {
                 let feature_enabled = br.f(1)? == 1;
