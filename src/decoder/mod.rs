@@ -69,5 +69,5 @@ pub mod frame_driver;
 pub mod pixel_driver;
 pub mod pixel_driver_dyn;
 
-pub use frame_driver::{decode_av1_spec, decode_frame_spec, SpecFrame};
+pub use frame_driver::{decode_av1_spec, decode_frame_spec, SpecDecodeSession, SpecFrame};
 pub use pixel_driver::{decode_av1, decode_temporal_unit, Frame, TemporalUnitResult};

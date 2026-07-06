@@ -1241,13 +1241,68 @@ fn motion_field_estimation(
 pub fn decode_av1_spec(input: &[u8]) -> Result<Vec<SpecFrame>, Error> {
     let reader = IvfReader::new(input).map_err(|_| Error::UnexpectedEnd)?;
     let records = reader.read_all().map_err(|_| Error::UnexpectedEnd)?;
+    let mut session = SpecDecodeSession::new();
     let mut out = Vec::new();
-    let mut seq: Option<SequenceHeader> = None;
-    let mut refs = SpecRefState::new();
     for record in records {
-        decode_temporal_unit_spec(&record.payload, &mut seq, &mut refs, &mut out)?;
+        out.extend(session.decode_temporal_unit(&record.payload)?);
     }
     Ok(out)
+}
+
+/// Cross-packet decode session — the §7.20 reference-frame store, the
+/// cached sequence header, and the per-slot CDF / motion-field /
+/// segment-id state, held across successive temporal units so a
+/// container demuxer can feed one §7.5 temporal unit (or one IVF
+/// record payload) per packet and decode whole GOPs.
+///
+/// [`decode_av1_spec`] is the one-shot IVF convenience wrapper over
+/// this type; the `oxideav-core` registry decoder drives it directly.
+#[derive(Debug)]
+pub struct SpecDecodeSession {
+    seq: Option<SequenceHeader>,
+    refs: SpecRefState,
+}
+
+impl Default for SpecDecodeSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpecDecodeSession {
+    /// Fresh session: no sequence header, every §7.20 slot empty.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            seq: None,
+            refs: SpecRefState::new(),
+        }
+    }
+
+    /// Decode one §7.5 temporal-unit body (a low-overhead OBU
+    /// bytestream: temporal delimiter / sequence header / frame
+    /// header / tile group / frame OBUs), returning every SHOWN frame
+    /// in output order and updating the session's reference state.
+    ///
+    /// ## Errors
+    ///
+    /// Every [`decode_av1_spec`] error surface — malformed OBUs, a
+    /// frame arriving before any sequence header, reference slots the
+    /// stream names but never filled, or feature shapes outside the
+    /// decoder's scope.
+    pub fn decode_temporal_unit(&mut self, payload: &[u8]) -> Result<Vec<SpecFrame>, Error> {
+        let mut out = Vec::new();
+        decode_temporal_unit_spec(payload, &mut self.seq, &mut self.refs, &mut out)?;
+        Ok(out)
+    }
+
+    /// Drop the §7.20 reference store (a seek discontinuity) while
+    /// keeping the cached sequence header — the next temporal unit
+    /// must start a new coded video sequence (a KEY frame), which
+    /// rebuilds every slot before anything can reference it.
+    pub fn reset_references(&mut self) {
+        self.refs = SpecRefState::new();
+    }
 }
 
 /// §7.20 `reference_frame_update()` — store the just-decoded frame

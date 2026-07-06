@@ -1,15 +1,29 @@
 //! `oxideav-core` framework integration: codec registration plus the
 //! [`oxideav_core::Decoder`] implementation that bridges the crate's
-//! existing intra-only IVF decode driver
-//! ([`crate::decode_av1`]) onto the packet-to-frame trait surface.
+//! spec-faithful frame decoder
+//! ([`crate::decoder::SpecDecodeSession`]) onto the packet-to-frame
+//! trait surface.
 //!
-//! The wrapper does not re-implement any decode logic: each [`Packet`]
-//! payload is handed verbatim to [`crate::decode_av1`] (an IVF v0 buffer
-//! per the §7.5 temporal-unit grammar the existing driver walks), the
-//! recovered [`crate::decoder::Frame`]s are queued, and successive
-//! `receive_frame` calls drain that queue one [`VideoFrame`] at a time —
-//! returning `Error::NeedMore` while empty and `Error::Eof` once the
-//! stream has been flushed and the queue is exhausted.
+//! The wrapper does not re-implement any decode logic. Each [`Packet`]
+//! payload is either
+//!
+//! * a complete IVF v0 buffer (`DKIF` magic — the elementary-stream
+//!   wrapper this crate's [`crate::encoder::ivf`] reader / writer
+//!   round-trips): every frame record's payload is fed to the session
+//!   in file order, or
+//! * one §7.5 temporal-unit body (the low-overhead OBU bytestream a
+//!   container demuxer extracts — the Matroska "Block contains one
+//!   Temporal Unit" / ISOBMFF sample framing): fed to the session
+//!   verbatim.
+//!
+//! The [`crate::decoder::SpecDecodeSession`] holds the §7.20
+//! reference-frame store, the cached sequence header, and the per-slot
+//! CDF / motion-field / segment-id state ACROSS packets, so a GOP
+//! split one-temporal-unit-per-packet decodes identically to the same
+//! bytes in one buffer. Recovered [`SpecFrame`]s are queued, and
+//! successive `receive_frame` calls drain that queue one [`VideoFrame`]
+//! at a time — returning `Error::NeedMore` while empty and `Error::Eof`
+//! once the stream has been flushed and the queue is exhausted.
 //!
 //! Registration claims the three container identifiers an AV1
 //! elementary stream is carried under:
@@ -17,21 +31,19 @@
 //! * the ISOBMFF / MP4 sample-entry type `av01` (AV1 ISOBMFF Binding
 //!   Specification §2.2, `class AV1SampleEntry extends
 //!   VisualSampleEntry('av01')`),
-//! * the IVF codec FourCC `AV01` (the `DKIF`-magic elementary-stream
-//!   wrapper this crate's [`crate::encoder::ivf`] reader / writer round-
-//!   trips; see `FOURCC_AV01`),
-//! * the Matroska / WebM Codec ID `V_AV1` (the `V_<NAME>` video Codec ID
-//!   convention WebM documents for `V_VP8` / `V_VP9`).
+//! * the IVF codec FourCC `AV01`,
+//! * the Matroska / WebM Codec ID `V_AV1` (the `V_<NAME>` video Codec
+//!   ID convention WebM documents for `V_VP8` / `V_VP9`).
 //!
 //! Because `CodecTag::fourcc` upper-cases alphabetic bytes, the ISOBMFF
 //! `av01` and IVF `AV01` sample-entry / FourCC identifiers collapse to a
 //! single [`CodecTag::Fourcc`] claim.
 //!
-//! The registered decoder is intra-only — it covers the same scope as
-//! the historical [`crate::decode_av1`] free function (single-tile
-//! keyframes, the 4:2:0 / monochrome extents the pixel driver accepts).
-//! The surface is therefore partial but reachable through the
-//! `RuntimeContext` path; out-of-scope streams surface the same
+//! The registered surface equals [`crate::decoder::decode_av1_spec`]'s:
+//! the full conformance-validated decoder — KEY / INTER GOPs with the
+//! cross-frame session state, `show_existing_frame`, segmentation,
+//! quantizer matrices, compound / OBMC / warped motion, film grain,
+//! superres, 8/10/12-bit output. Out-of-scope streams surface the same
 //! diagnosable [`crate::Error`] the direct API returns.
 
 use oxideav_core::{
@@ -40,7 +52,7 @@ use oxideav_core::{
     VideoFrame, VideoPlane,
 };
 
-use crate::decoder::Frame as Av1Frame;
+use crate::decoder::{SpecDecodeSession, SpecFrame};
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
 /// `crate::__oxideav_entry`, which delegates to [`register`].
@@ -48,9 +60,9 @@ pub const CODEC_ID_STR: &str = "av1";
 
 /// Register the AV1 codec into `reg`.
 ///
-/// Installs the intra-only decoder factory ([`make_decoder`]) and claims
-/// the three container identifiers (ISOBMFF `av01` / IVF `AV01` FourCC,
-/// Matroska `V_AV1`).
+/// Installs the spec-driver decoder factory ([`make_decoder`]) and
+/// claims the three container identifiers (ISOBMFF `av01` / IVF `AV01`
+/// FourCC, Matroska `V_AV1`).
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("av1_sw").with_decode();
     reg.register(
@@ -69,9 +81,9 @@ pub fn register(ctx: &mut RuntimeContext) {
 
 /// Decoder factory — the [`CodecInfo::decoder`] callback.
 ///
-/// The AV1 elementary-stream framing (IVF v0) is self-describing, so no
-/// per-stream setup is parsed from [`CodecParameters`] here; each packet
-/// carries its own file header. `params.codec_id` is threaded through so
+/// The AV1 elementary-stream framing is self-describing (the sequence
+/// header OBU arrives in-band), so no per-stream setup is parsed from
+/// [`CodecParameters`] here. `params.codec_id` is threaded through so
 /// [`Decoder::codec_id`] reports the resolved id.
 ///
 /// ## Errors
@@ -81,16 +93,19 @@ pub fn register(ctx: &mut RuntimeContext) {
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
     Ok(Box::new(Av1Decoder {
         codec_id: params.codec_id.clone(),
+        session: SpecDecodeSession::new(),
         queue: std::collections::VecDeque::new(),
         eof: false,
     }))
 }
 
-/// Packet-to-frame wrapper driving [`crate::decode_av1`].
+/// Packet-to-frame wrapper driving [`SpecDecodeSession`].
 struct Av1Decoder {
     codec_id: CodecId,
+    /// The cross-packet §7.20 session-state stack.
+    session: SpecDecodeSession,
     /// Frames recovered from already-decoded packets, awaiting drain by
-    /// `receive_frame`. Held as `(VideoFrame)` in stream order.
+    /// `receive_frame`. Held as `VideoFrame` in output order.
     queue: std::collections::VecDeque<VideoFrame>,
     eof: bool,
 }
@@ -105,20 +120,47 @@ impl std::fmt::Debug for Av1Decoder {
     }
 }
 
+/// The IVF file-header magic (`DKIF`) — distinguishes a whole-file IVF
+/// packet from a raw temporal-unit packet.
+const IVF_MAGIC: &[u8; 4] = b"DKIF";
+
 impl Decoder for Av1Decoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
-        // The packet payload is a complete IVF v0 buffer (file header +
-        // one or more frame records). Decode it whole and queue every
-        // recovered frame for drain by `receive_frame`.
-        let frames = crate::decode_av1(&packet.data)
-            .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
-        for frame in &frames {
-            self.queue
-                .push_back(av1_frame_to_video_frame(frame, packet.pts));
+        let mut push = |frames: Vec<SpecFrame>| {
+            for frame in &frames {
+                self.queue
+                    .push_back(spec_frame_to_video_frame(frame, packet.pts));
+            }
+        };
+        if packet.data.len() >= 4 && &packet.data[..4] == IVF_MAGIC {
+            // Whole IVF v0 buffer: walk the frame records in file
+            // order through the persistent session (identical to
+            // `decode_av1_spec`, but the reference state carries into
+            // subsequent packets).
+            let reader = crate::encoder::ivf::IvfReader::new(&packet.data)
+                .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e:?}")))?;
+            let records = reader
+                .read_all()
+                .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e:?}")))?;
+            for record in records {
+                let frames = self
+                    .session
+                    .decode_temporal_unit(&record.payload)
+                    .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
+                push(frames);
+            }
+        } else {
+            // One §7.5 temporal-unit body per packet (the container
+            // demuxer framing).
+            let frames = self
+                .session
+                .decode_temporal_unit(&packet.data)
+                .map_err(|e| CoreError::invalid(format!("oxideav-av1: {e}")))?;
+            push(frames);
         }
         Ok(())
     }
@@ -142,88 +184,37 @@ impl Decoder for Av1Decoder {
     }
 
     fn reset(&mut self) -> CoreResult<()> {
-        // No cross-packet carry on the intra-only path: each IVF buffer
-        // is self-contained. A seek just drops any undrained frames and
-        // clears EOF.
+        // A seek discontinuity: drop undrained frames and the §7.20
+        // reference store (the landing point must be a KEY frame,
+        // which rebuilds every slot); keep the cached sequence header
+        // (containers need not repeat it mid-stream).
         self.queue.clear();
+        self.session.reset_references();
         self.eof = false;
         Ok(())
     }
 }
 
-/// Convert a decoded [`crate::decoder::Frame`] into an `oxideav-core`
+/// Convert a decoded [`SpecFrame`] into an `oxideav-core`
 /// [`VideoFrame`].
 ///
-/// Each plane is packed into a tight row-major byte buffer (one byte per
-/// sample — every decoded extent on the intra-only path is 8-bit). Planes
-/// are emitted in plane-major order (luma, then the two chroma planes for
-/// the 4:2:0 variants; luma only for the monochrome variant).
-fn av1_frame_to_video_frame(frame: &Av1Frame, pts: Option<i64>) -> VideoFrame {
-    match frame {
-        Av1Frame::Yuv420_16x16 { y, u, v } => {
-            let planes = vec![
-                plane_from_rows_16x16(y),
-                plane_from_rows_chroma(u),
-                plane_from_rows_chroma(v),
-            ];
-            VideoFrame { pts, planes }
-        }
-        Av1Frame::Yuv420Dyn {
-            width,
-            height,
-            y,
-            u,
-            v,
-        } => {
-            let cw = (*width as usize) / 2;
-            let planes = vec![
-                VideoPlane {
-                    stride: *width as usize,
-                    data: y.clone(),
-                },
-                VideoPlane {
-                    stride: cw,
-                    data: u.clone(),
-                },
-                VideoPlane {
-                    stride: cw,
-                    data: v.clone(),
-                },
-            ];
-            let _ = height;
-            VideoFrame { pts, planes }
-        }
-        Av1Frame::YDyn { width, height, y } => {
-            let _ = height;
-            VideoFrame {
-                pts,
-                planes: vec![VideoPlane {
-                    stride: *width as usize,
-                    data: y.clone(),
-                }],
-            }
-        }
-    }
-}
-
-/// Flatten a fixed 16×16 luma plane (`[[u8; W]; H]`) into a row-major
-/// [`VideoPlane`].
-fn plane_from_rows_16x16<const W: usize, const H: usize>(rows: &[[u8; W]; H]) -> VideoPlane {
-    let mut data = Vec::with_capacity(W * H);
-    for row in rows {
-        data.extend_from_slice(row);
-    }
-    VideoPlane { stride: W, data }
-}
-
-/// Flatten a fixed chroma plane (`[[u8; W]; H]`) into a row-major
-/// [`VideoPlane`].
-fn plane_from_rows_chroma<const W: usize, const H: usize>(rows: &[[u8; W]; H]) -> VideoPlane {
-    let mut data = Vec::with_capacity(W * H);
-    for row in rows {
-        data.extend_from_slice(row);
-    }
-    VideoPlane { stride: W, data }
+/// Planes are emitted in the decoder's plane-major order (luma, then
+/// chroma when present). `SpecFrame::planes` already holds tight
+/// row-major bytes — one byte per sample at 8-bit, packed little-endian
+/// `u16` at 10/12-bit — so each plane moves verbatim with its byte
+/// stride (`width` samples × 1 or 2 bytes).
+fn spec_frame_to_video_frame(frame: &SpecFrame, pts: Option<i64>) -> VideoFrame {
+    let bytes_per_sample: usize = if frame.bit_depth > 8 { 2 } else { 1 };
+    let planes = frame
+        .planes
+        .iter()
+        .zip(frame.plane_dims.iter())
+        .map(|(data, &(w, _h))| VideoPlane {
+            stride: (w as usize) * bytes_per_sample,
+            data: data.clone(),
+        })
+        .collect();
+    VideoFrame { pts, planes }
 }
 
 #[cfg(test)]
