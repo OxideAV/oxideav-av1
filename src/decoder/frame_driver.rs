@@ -1099,8 +1099,13 @@ fn motion_field_estimation(
                 if !(vy && vx) {
                     continue;
                 }
-                for dst in LAST_FRAME..=ALTREF_FRAME {
-                    let ref_to_dst = get_relative_dist(order_hint, order_hints[dst], hint_bits);
+                for (dst, &dst_hint) in order_hints
+                    .iter()
+                    .enumerate()
+                    .take(ALTREF_FRAME + 1)
+                    .skip(LAST_FRAME)
+                {
+                    let ref_to_dst = get_relative_dist(order_hint, dst_hint, hint_bits);
                     let out = mv_projection(mv, ref_to_dst, ref_offset);
                     mfmvs.set(
                         dst,
