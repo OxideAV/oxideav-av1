@@ -30,7 +30,32 @@ arithmetic decoder on NEWMV-adjacent blocks), forwarding CDF symbol
 counts that §6.8.21 says restart at zero, and a double-subsampled
 §7.11.3.5 chroma-warp clamp.
 
-### Conformance-validated decode (r384 intra, r387 inter, r390 session state)
+r394 grows the corpus to **26 byte-exact streams** and closes four
+subsystems: (1) §7.12.3 **quantizer-matrix** dequantization — the
+§5.9.2 `SegQMLevel[ plane ][ segmentId ]` derivation feeds the
+long-landed §9.5.3 table arm on real streams (intra + inter GOPs at
+matrix levels 0/1/4); (2) **segmentation-enabled inter frames** — the
+§5.11.14 `seg_feature_active` gates are derived per block at the
+block's own `segment_id` from the FeatureEnabled/FeatureData tables,
+§5.11.19 `predictedSegmentId` is the real §5.11.21 `get_segment_id()`
+over `PrevSegmentIds` (§7.20 `SavedSegmentIds` per slot + §5.9.2
+`load_previous_segment_ids()`), and §5.9.14 `segmentation_update_data
+== 0` reloads the primary reference's saved feature tables
+(cyclic-refresh GOPs incl. a `segmentation_temporal_update` frame
+decode byte-exact); (3) the §8.3.2 `compound_idx` **distance context**
+is per block (`fwd == bck` over the block's own reference pair —
+`InterFrameContext` carries `order_hints`, retiring the frame-scope
+`dist_equal` bool); (4) four §7.11.3 fixes caught against
+highest-effort encoder streams — the frame walk's swapped
+per-direction interpolation-filter slots (§7.11.3.4 reads slot 1
+horizontally, slot 0 vertically), candidate-cell filters on the
+§5.11.33 sub-8×8 chroma stitch and §7.11.3.9 OBMC overlap bands,
+`ObmcNeighbour::axis_pos4` (a skipped intra candidate advances the
+§7.11.3.9 walk without producing an overlap, so band positions are
+not re-derivable from the qualifying list), and clipped `CurrFrame`
+stitches for §5.11.4 bottom/right-edge overhanging inter blocks.
+
+### Conformance-validated decode (r384 intra, r387 inter, r390 session state, r394 QM / segmentation / edge cases)
 
 `decoder::decode_av1_spec(ivf_bytes) -> Vec<SpecFrame>` is the
 spec-faithful frame driver: IVF + §7.5 OBU walk (including the combined
@@ -42,9 +67,12 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 16 streams byte-exact against
-independent-decoder output (fixture corpus under
-`docs/video/av1/fixtures/`, used as opaque black-box tools): the full
+grain. `tests/fixture_conformance.rs` pins 26 streams byte-exact against
+independent-decoder output (the 16-stream corpus staged under
+`docs/video/av1/fixtures/` plus 10 r394 validator-produced streams —
+QM intra/inter, dual-filter + OBMC, jnt-comp pyramids, cyclic-refresh
+segmentation, a segmentation+QM+jnt composition, bottom-edge
+overhang; encoder and decoder used as opaque black-box tools): the full
 intra feature surface — lossy quant at every coded TX size (including
 the 64-wide compact-`tw` dequant layout), lossless WHT, palette (luma +
 chroma, in-walk §5.11.35 `predict_palette`), CfL, filter-intra,
@@ -71,15 +99,19 @@ that zero luma filter levels skip deblocking entirely, the
 full directional process, and the §5.11.49 palette-cache left gate at a
 mid-frame tile's first column.
 
-The intra-only decoder is now reachable through the runtime codec
-registry: `register` installs an `oxideav_core::Decoder` factory for
-codec id `av1` and claims the container identifiers an AV1 elementary
-stream is carried under — the ISOBMFF sample entry `av01` / IVF FourCC
-`AV01` and the Matroska / WebM Codec ID `V_AV1`. The wrapper bridges the
-existing `decode_av1` driver onto the packet-to-frame trait surface; its
-coverage equals that driver's (single-tile intra keyframes), so the
-registered surface is partial but resolvable. The historical direct API
-(`decode_av1` / `encode_av1`) is unchanged.
+The **full inter decoder** is reachable through the runtime codec
+registry (r394): `register` installs an `oxideav_core::Decoder` factory
+for codec id `av1` and claims the container identifiers an AV1
+elementary stream is carried under — the ISOBMFF sample entry `av01` /
+IVF FourCC `AV01` and the Matroska / WebM Codec ID `V_AV1`. The wrapper
+bridges `decoder::SpecDecodeSession`, which owns the cross-packet
+session state (§7.20 reference store, cached sequence header, per-slot
+CDF / motion-field / segment-id state), and accepts BOTH packet
+framings: a whole IVF buffer (`DKIF` magic) or one §7.5 temporal unit
+per packet (the Matroska / ISOBMFF sample framing) — a KEY + INTER GOP
+split one-TU-per-packet decodes byte-identical to the same bytes in one
+buffer. The historical direct API (`decode_av1` / `encode_av1`) is
+unchanged.
 
 ### What parses
 
@@ -290,19 +322,22 @@ functions. Streams outside the supported scope return a typed `Error`
 
 ### Not yet supported
 
-- Inter FRAMES through the spec frame driver: reference-frame buffer
-  management across a GOP (§7.20/§7.21), the §5.11.18 inter cascade
-  driven from real P-frame headers (`InterFrameContext` construction,
-  temporal MVs), and `show_existing_frame` — the 3 remaining corpus
-  streams. (The §5.11.33 reconstruction arms themselves — single-ref,
-  compound, inter-intra, OBMC, warp — are wired at the walker level.)
-- Frame-walk reconstruction of warped-causal inter leaves stays on the
-  opt-in per-block warp context.
-- 10/12-bit and 4:2:2 / 4:4:4 pixel output from the spec driver (the
-  walker threads the subsampling; only 8-bit is surfaced).
-- Quantizer-matrix (`using_qmatrix == 1`) streams in the spec driver.
-- The runtime-registry wrapper still bridges the constrained
-  encoder-mirror `decode_av1`, not the spec driver.
+- **Scaled references** (`resize-mode` streams, and superres applied to
+  a reference a later frame predicts from): the §7.11.3.3 / §7.11.3.4
+  scaled motion-vector / prediction path (`xStep / yStep != 1`) is not
+  implemented; such streams surface a typed error.
+- `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
+  overrides are implemented per §5.11.14/§5.11.20/§5.11.25 and
+  unit-tested, but no conformance stream pins them — the black-box
+  encoder's CLI cannot signal those features (`SEG_LVL_ALT_Q` streams
+  are pinned byte-exact).
+- One known entropy divergence on a 176×144 highest-effort intra frame
+  with CDEF + self-guided restoration both active (palette-heavy
+  content; minimal repro in the r394 notes) — under investigation.
+- The historical fixed-16×16 intra `encode_av1` path emits streams
+  independent decoders reject (non-conformant); its self round-trip
+  through `decode_av1` still holds. Conformance-grade encoding is a
+  follow-up.
 
 ## Module layout
 
