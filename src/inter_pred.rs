@@ -4949,26 +4949,26 @@ pub fn reconstruct_inter_block(
     }
     let (px, py) = (x as usize, y as usize);
     // The write region must fit the supplied plane buffer.
-    let last_row = py
-        .checked_add(h)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    let last_col = px
-        .checked_add(w)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_stride < last_col {
+    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
+    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
+    // prediction still runs at the FULL block geometry — the wedge /
+    // OBMC-band / small-block-filter derivations depend on
+    // `Block_{Width,Height}` — but only the rows / columns inside the
+    // plane are stitched back (r394: the previous full-fit guard
+    // rejected every bottom-edge overhanging inter block).
+    if curr_stride == 0 || px >= curr_stride {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    let needed = (last_row - 1)
-        .checked_mul(curr_stride)
-        .and_then(|v| v.checked_add(last_col))
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_plane.len() < needed {
+    let plane_rows = curr_plane.len() / curr_stride;
+    if py >= plane_rows {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    for i in 0..h {
+    let fit_w = w.min(curr_stride - px);
+    let fit_h = h.min(plane_rows - py);
+    for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5089,26 +5089,26 @@ pub fn reconstruct_inter_block_warp(
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
-    let last_row = py
-        .checked_add(h)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    let last_col = px
-        .checked_add(w)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_stride < last_col {
+    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
+    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
+    // prediction still runs at the FULL block geometry — the wedge /
+    // OBMC-band / small-block-filter derivations depend on
+    // `Block_{Width,Height}` — but only the rows / columns inside the
+    // plane are stitched back (r394: the previous full-fit guard
+    // rejected every bottom-edge overhanging inter block).
+    if curr_stride == 0 || px >= curr_stride {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    let needed = (last_row - 1)
-        .checked_mul(curr_stride)
-        .and_then(|v| v.checked_add(last_col))
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_plane.len() < needed {
+    let plane_rows = curr_plane.len() / curr_stride;
+    if py >= plane_rows {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    for i in 0..h {
+    let fit_w = w.min(curr_stride - px);
+    let fit_h = h.min(plane_rows - py);
+    for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5231,26 +5231,26 @@ pub fn reconstruct_inter_block_obmc(
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
-    let last_row = py
-        .checked_add(h)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    let last_col = px
-        .checked_add(w)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_stride < last_col {
+    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
+    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
+    // prediction still runs at the FULL block geometry — the wedge /
+    // OBMC-band / small-block-filter derivations depend on
+    // `Block_{Width,Height}` — but only the rows / columns inside the
+    // plane are stitched back (r394: the previous full-fit guard
+    // rejected every bottom-edge overhanging inter block).
+    if curr_stride == 0 || px >= curr_stride {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    let needed = (last_row - 1)
-        .checked_mul(curr_stride)
-        .and_then(|v| v.checked_add(last_col))
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_plane.len() < needed {
+    let plane_rows = curr_plane.len() / curr_stride;
+    if py >= plane_rows {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    for i in 0..h {
+    let fit_w = w.min(curr_stride - px);
+    let fit_h = h.min(plane_rows - py);
+    for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5603,26 +5603,26 @@ pub fn reconstruct_inter_block_compound(
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
-    let last_row = py
-        .checked_add(h)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    let last_col = px
-        .checked_add(w)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_stride < last_col {
+    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
+    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
+    // prediction still runs at the FULL block geometry — the wedge /
+    // OBMC-band / small-block-filter derivations depend on
+    // `Block_{Width,Height}` — but only the rows / columns inside the
+    // plane are stitched back (r394: the previous full-fit guard
+    // rejected every bottom-edge overhanging inter block).
+    if curr_stride == 0 || px >= curr_stride {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    let needed = (last_row - 1)
-        .checked_mul(curr_stride)
-        .and_then(|v| v.checked_add(last_col))
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_plane.len() < needed {
+    let plane_rows = curr_plane.len() / curr_stride;
+    if py >= plane_rows {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    for i in 0..h {
+    let fit_w = w.min(curr_stride - px);
+    let fit_h = h.min(plane_rows - py);
+    for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -5797,22 +5797,22 @@ pub fn reconstruct_inter_block_interintra(
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     let (px, py) = (x as usize, y as usize);
-    let last_row = py
-        .checked_add(h)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    let last_col = px
-        .checked_add(w)
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_stride < last_col {
+    // §5.11.4 allows a leaf to OVERHANG the frame's bottom / right mi
+    // edge (only its on-frame cells are grid-stamped). The §7.11.3.1
+    // prediction still runs at the FULL block geometry — the wedge /
+    // OBMC-band / small-block-filter derivations depend on
+    // `Block_{Width,Height}` — but only the rows / columns inside the
+    // plane are stitched back (r394: the previous full-fit guard
+    // rejected every bottom-edge overhanging inter block).
+    if curr_stride == 0 || px >= curr_stride {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    let needed = (last_row - 1)
-        .checked_mul(curr_stride)
-        .and_then(|v| v.checked_add(last_col))
-        .ok_or(crate::Error::PartitionWalkOutOfRange)?;
-    if curr_plane.len() < needed {
+    let plane_rows = curr_plane.len() / curr_stride;
+    if py >= plane_rows {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
+    let fit_w = w.min(curr_stride - px);
+    let fit_h = h.min(plane_rows - py);
 
     // ---------- §7.11.3.14 step — seed scratch with intra pred -------
     //
@@ -5822,10 +5822,14 @@ pub fn reconstruct_inter_block_interintra(
     // `curr_plane` into the scratch buffer `predict_inter` consumes (it
     // overwrites the scratch with the blended sample in place).
     let mut pred_out = vec![0u16; w * h];
-    for i in 0..h {
+    // Seed only the in-plane window (an overhanging block's off-plane
+    // rows / columns have no intra prediction to read; the §7.11.3.14
+    // blend is pointwise, so the kept samples are unaffected by the
+    // zero padding).
+    for i in 0..fit_h {
         let src = (py + i) * curr_stride + px;
         let dst = i * w;
-        pred_out[dst..dst + w].copy_from_slice(&curr_plane[src..src + w]);
+        pred_out[dst..dst + fit_w].copy_from_slice(&curr_plane[src..src + fit_w]);
     }
 
     // ---------- §7.11.3.11 wedge-mask regeneration (wedge arm) -------
@@ -5903,10 +5907,10 @@ pub fn reconstruct_inter_block_interintra(
     //
     // The §7.11.3.14 body wrote the blended `w × h` result into
     // `pred_out`; copy it back into `curr_plane` at `(x, y)`.
-    for i in 0..h {
+    for i in 0..fit_h {
         let dst = (py + i) * curr_stride + px;
         let src = i * w;
-        curr_plane[dst..dst + w].copy_from_slice(&pred_out[src..src + w]);
+        curr_plane[dst..dst + fit_w].copy_from_slice(&pred_out[src..src + fit_w]);
     }
 
     Ok(())
@@ -10192,15 +10196,33 @@ mod tests {
             crate::Error::PartitionWalkOutOfRange
         );
 
-        // CurrFrame plane too small for the (x=0, y=0, 4×4) write
-        // region (stride 2 < 4 columns).
-        let mut tiny = vec![0u16; 4];
+        // r394 — a CurrFrame plane SMALLER than the block is the legal
+        // §5.11.4 bottom/right overhang shape, no longer a caller bug:
+        // the prediction runs at full block geometry and the stitch
+        // CLIPS to the plane (2×2 of the 4×4 written here).
+        let mut tiny = vec![9999u16; 4];
+        call(
+            crate::uncompressed_header_tail::LAST_FRAME as u8,
+            &ref_frame_idx,
+            &store,
+            &mut tiny,
+            2,
+        )
+        .expect("overhanging write clips instead of erroring");
+        assert!(
+            tiny.iter().all(|&v| v <= 255),
+            "the clipped 2×2 window (all four samples of the stride-2 plane) is written"
+        );
+
+        // A block whose ORIGIN is outside the plane is still a caller
+        // bug (nothing of it can be stitched).
+        let mut empty: Vec<u16> = Vec::new();
         assert_eq!(
             call(
                 crate::uncompressed_header_tail::LAST_FRAME as u8,
                 &ref_frame_idx,
                 &store,
-                &mut tiny,
+                &mut empty,
                 2
             )
             .unwrap_err(),
@@ -12422,12 +12444,13 @@ mod tests {
             mk(last, 99, COMPOUND_AVERAGE, &mut curr, w).unwrap_err(),
             crate::Error::PartitionWalkOutOfRange
         );
-        // curr_plane too small (stride OK but buffer short).
+        // r394 — a short curr_plane is the legal §5.11.4 bottom
+        // overhang shape: the compound blend runs at full block
+        // geometry and the stitch clips to the `h - 1` whole rows the
+        // plane holds.
         let mut tiny = vec![0u16; w * h - 1];
-        assert_eq!(
-            mk(last, last + 1, COMPOUND_AVERAGE, &mut tiny, w).unwrap_err(),
-            crate::Error::PartitionWalkOutOfRange
-        );
+        mk(last, last + 1, COMPOUND_AVERAGE, &mut tiny, w)
+            .expect("overhanging compound write clips instead of erroring");
     }
 
     /// §5.11.33 frame walk — a grid carrying one `COMPOUND_AVERAGE` and
