@@ -1896,3 +1896,196 @@ fn bottom_overhang_inter_decodes_byte_exact() {
         8,
     );
 }
+
+// ---------------------------------------------------------------------
+// r405 — §7.11.3 intra-block-copy conformance streams (allow_intrabc
+// still-picture KEY frames; validator-produced, expected output pinned
+// by the independent decoder's SHA-256).
+// ---------------------------------------------------------------------
+
+const INTRABC_STILL_176X144_IVF: &str = concat!(
+    "444b49460000200041563031b000900001000000010000000100000000000000c70200000000",
+    "00000000000012000a07181debe3fb008032b9054ca002f8a1c92a80fa5010f95112988eba3f",
+    "6ae361be4e4ac8526a56a7fb8798a35ecc80b052d3d747bc654dc587b5ee501681abfe8ef10f",
+    "4fea25463851363634aa4591f9f1417ef3af10ebf3e773415cce5a85010086a8681b786495ef",
+    "a6c9a5d7897f8087fbfd65ac1da6333380e3c9a7c5734218fa8d112c834dbf65ad19c48fff78",
+    "c593a5af301785c1ba09b3d4f662d4e988253f36af544eb93f9906fa5e0b83f594ad4588fb54",
+    "b4fb1ffeb415542ed9ce5f7599e9a39b0c895eda9b66bdd2c194fa15878cfb0e57c7962b60cf",
+    "90aa56876ba16625dcd172cdba4dc8947ee3a9daee4f0c3cf5165186d0392d3be6c071e08f6d",
+    "1022dd0b1be6405c9ddc44c9adc8c05e1f52261ffb1a793fba2a20a16c4b50a982f00c4ab7be",
+    "10ebf92a48183982440291aeaad976d9a22458dae2758b15532cea036ccdde32adbab8a5d88f",
+    "7a83d48b11d8aea1cd089e0a7e4ce1c9259f26cca6318d638801336334c165f38ac6ae1298ae",
+    "fbedde09d821626ceef72e9d94b452ffcfb15010fc0b431cf1fcc3e7313ff648cebb58586923",
+    "cca6cfd261702fb20bdda798a006dd9dfbe49f88cba738fa0af1fa65663d6db6e48167256cf5",
+    "93607e5991a9b2696799cd46b7db85a07690d3e5af357a3e6730680578ff25b113da7a176516",
+    "a7a716d75ddd4720639966b13570f31f9f4016683c4e3bde899cd3af0e122e0b5d69c109ffce",
+    "3ce9d1546a9bf761be5481f3f3272506b09ad151168483137aca4f66b36b8e4ab160d7da9cd9",
+    "dea6176f8157aa753164c5aa87db4598d9423e8b313677a26fd77d345ae41776ace5c6fdddfa",
+    "9c49a8254c7de62d57b0e033620691737f7fa290fdb7e946fe138cf614dec626b9bc7c20954f",
+    "8eb0096fde973efc19d4d253b97cce6b663eb124358caca87a3e488d74426a9f81bce5834062",
+    "9294ba8ee2ef745d859a4a1b576f4eff188c9043fbcba3705d757d4e782761ad2c",
+);
+
+const INTRABC_SCANPOINT_320X240_IVF: &str = concat!(
+    "444b494600002000415630314001f00001000000010000000100000000000000100500000000",
+    "00000000000012000a071821e7fdfd804032820a4ca002fa6489a51f23c6094e7a8b45743286",
+    "fd2e5129511ed067132ef4ce7a49ff7db5e9e315068dcd2fb15b3d19d4f975706548f15dc6b3",
+    "39690d1bad84f6282256fe3a6abe7a4d107bc21706d25ba4b37d6dbc3a8673e4aa078afb6a7a",
+    "c1f389f6330c380d7985e28c9d9bf3cbe964db67765024ba2b1cced3e9b83cbb9493efc74feb",
+    "13a6def007ec4935ad33f0484379c0e5524d8d6daf852892f0b68c61fcd9fac1cd467719ca6b",
+    "9d5e55fe9e32d1955d383eeeadc9fc7bd853ea8c4ae9bd1e31c7a32f7b2b436e751a9659f8ec",
+    "b21c9fff2ee277cac4bc2b294b748cf1f830b8a4b9d760569ecc3e40ba34065271b3f05d1f09",
+    "2df106706bec7ce8253e2f02efdbda19ce0b66bd9bfa268a3f528c4ecc4c4fdbf1c9595ed0f2",
+    "6bb1aa3dc95ca23c2b73387505d21f941500e4f1ffd0a6abd9ae27d8f5be35c28fea9a991b5b",
+    "eab0579805676e38b22411606839259c8fb01f4aef2a301ea9c26e8fdbf13a202631668d506a",
+    "a8b10a7ba29b2632b812f761c00df2f8ff15bca7891f751653ce06680075355e719729654297",
+    "e4bff8f5238f990fc79e530ea815c611748f613f011d2bbf84293af0d166e9df75cf90c93c7f",
+    "56c419117d5f1f7751d126598a65e4ca25e5fc61c608db2ba4ae167f5526abe779a59e956c85",
+    "f42e6c5104e0debb5c9bfa1589c4c2f80150eaee88c4082c1c4cac61d8fe0e0835747c98eefd",
+    "0d5feaf6945a66d2bb76d83400fdb81dba5d1854546cb04cfed5d1ec6b228ecd6ce24146ccb8",
+    "21694dc12a0692a4146c3058de619f27c46657bde892da51f86097cf8eacd2c7c41d93f3c414",
+    "151bd69b895b2428eba4aa49979b9fe6478a5742b7c7f94c9d2e7115d7e319a940a7272caf3d",
+    "844e1f2540c548ce8ef47827b7755f37e06f2e70c6518e539308f35a886841946cdf3f0d1d68",
+    "923afbbbfae569119bb0c1a41537182ea3d2ba451a8c732fe17e85b07879e929aa48593006f1",
+    "af3fc88fdf538f6b00eb4403586b421fa983355b777948e409ca01af65853ce51321f4a851f4",
+    "3d804de85505676de160da0b70dd15d662930929838999ea21d8207cd875ed520b7be4e5a0dc",
+    "3fc9c29528a2910343db791ebb2aaec467dfce9c3a04cdb63e97ca4ed4da95ac4e60c09e8a14",
+    "9150235dddef6acc47a3c0f624fa6952ad1bab19bde825ffc527f1f541f57c13f218088b8eaf",
+    "821d2d5d13dc44e968fd6fa0e7c12ae59b027901b12270eda94ccd4ecce1318996a6326f0c2c",
+    "53f53e480b3c3168843beb8a8e62d098cbc4dab744f8d51d507943f780ca2a6999a471890349",
+    "622150385ae0d2622b7b4c274327653791b9e03dca8fde15a6e41dd29bf7c1fd8145f50f8374",
+    "41aff7f2b511d8e145d1a1fd6ce2bc037df766d2008d7d08c5b054f4c669493d91f255cd0418",
+    "a9fd83f71a39274028dbf835811502ffb19ccd04271a5a810068e748b4e6942a8c33b7e105af",
+    "3a9dbe7fd61bd4552d6728b97a007f78d436e5697925eb424449701a781b1ff50a7ed7553243",
+    "35c86dd6688f350795132470f1bac7ade00a055ed1a7af3890e59ac69af18e96da30042a885f",
+    "b2bb0aafc55d63448f3c4c488a1c5076a363663d496ed4ad4437cb80c2dd3940db4da8c3ddf8",
+    "5f972496d392b6582fd3f16ed87c831a3f7b3959378f545da09268c77ec4f6b8b6fc03c1bda3",
+    "06ef341f0911ea2ad6fe1f853fc36ea1d4494aad2c23be0ce41952bc76aed82025e4218cc197",
+    "2dee684d8b17d9af09b6968f0530c1bd94180fc85233812b69cb6bdab94a593f9b0849c37fe0",
+    "65a55892b1a7d1ae2580",
+);
+
+const INTRABC_LOSSLESS_176X144_IVF: &str = concat!(
+    "444b49460000200041563031b0009000010000000100000001000000000000002b0900000000",
+    "00000000000012000a07181debe3db0080329d124c0000d4895a0f2a8d895e4e9b4bc53cc286",
+    "192c973d2b4f697dfa1d809753f70f3146bd990160a5a7ae8f78ca9b8b0f6bdca01b7dd510a9",
+    "8da8ae737ceb9c321561c874d62f1c101d9811b5ba4c7243274e092f74c7c9b0885d1a71560b",
+    "3b5b57e9fe5a57fc891132f71209ec0cb78f5a8ff871c580c802482f1624c04c0e6202f46156",
+    "bb38a64e10ced8db4eb7579e2129c274d266dd4e6d32f521e71cbe72f683cb83681519a906e4",
+    "089e6ead791ea87740579c3f144b50169e42ae274054a37b62c7c1421c1747136265f4be52ea",
+    "9a1f7759430c305b205d56da9b20872c0752e66b65144a58e0df1f467c0262a0185205607c00",
+    "4ac8b817d87c0d01a193fa22d6fe08aea1e71c66a7764f8c5cbe48efed47f6356b97921db489",
+    "77466445f672c7fd02e77c2d63c19cab5766d538564c645619164799927b52c76f407fbe371c",
+    "444252fdd18b10a355e1a18f7a0392031f152cec56ab7c995a00becef8c139b84007d05486da",
+    "2273c5a37dba2380724a166ac938ef85c39cafad7bab7176be6be61cb4af01d6a979b93bcdb4",
+    "5505e57c24383f38c36a10f33f5c56716e0e4c73502ff5e34c33e0c9dfef5b03ac7f379ba607",
+    "36e4053974eed469db2c72c3f731fceff870825744ad1512557ec617a16100eaa6bde788948c",
+    "36224112967d3fd1233700cb886edaeda853986059d9e211b813acb596d9baec9d422c340b9b",
+    "5efb1e412d965665b901c04aa421b1482db22e7eddfc4b3fd388874e4d0ea63609269d40678e",
+    "3455eef0ea85a2ca83bdc1375d9b5359df7729a70321d6292e68de40424a2dc3d13ee54d7a2b",
+    "5514d5b0b908d5de58fca416cdff4754076dbd3775eef7f2c837eb86c81cfe59a3bc49623644",
+    "e1ab414d24ab95b2ac062285673b22a779a56a93895bd967551d1999e21adabc51859e4e7e88",
+    "f9dfb7ccc0bad541baaf3921619032edec779737c611fcc8710588038bb0c7c22d9cf94e820d",
+    "4f5ee5095e979ee3f47e74806255718d981468a1222ace0e4490834e749537fbd2b55b6b2382",
+    "34e825d9499095185a0a930c6e0c8322ca19f6b3079f4288916b5a2a3c91850fd4cebdde5b93",
+    "6cbbfe74f273b4185a39659c41ca83befff8727403e5e10f1c8ffbb8c07896b9e1d5ca5b5a7b",
+    "2fa2256b34ee2dff12b4b11b3d520429134c40f8ef23416ee45884c9b59e55dd6cf4c5b8a264",
+    "a5c70dc613135ddc8c8533b558ea3cfd1435073efbe53ab1a9a36c4b6feef0ff71fdddc4ffbb",
+    "6b224f2909bb80daa1dee94bb838b45d1e3a46fcdd8618dbcc27785a8af9be99ef778a837d90",
+    "e7fd0649ff8fdd9600497c0c654353a80bf0de5f07af83cb3d12b83badec4df4f5d33f856de7",
+    "7db022d79046420098ba96bdfb6cebb06fabef0162ad9b3740a2ceefd12f67e75667e8d32781",
+    "81b8898e283126433862620eb2def0cc89748be6778bb3fd4c7f6fc77138a8f0b1674b3db9e5",
+    "d0e859ba045462736a9f849af19707865ecafae47f0062b5b1f5f8fb9841f11cc8c19d3d49b6",
+    "cb6fb4f1c05d47aad1d9a5ab5ed0e6d939edb87bf512d06438c4a5292076860883a4678da584",
+    "c62f7db7ac952098de0c39efef41cc583d829b3ef6c888aadf206f8cbe1a4839b78002348022",
+    "bf5869fd80368ae8d329472a9f8f12ecae14243079544e16381efac1e82129a27ffffd74f015",
+    "f70f0e38ab90727d9a9950a86ff806e8403645348d890feb9d06cabcca2356b19a4fc99fbff0",
+    "ec4fb16d018746974d46f683b106e4fad19ca12f7e09ae94fa5cb79570f5b409de730a831960",
+    "ddc459d236cb94c3dc714a3a34f65f9e2dda29c707fc9356c7ab37bd467b22db7189cc8f5722",
+    "4e03c67834aef497592f52d85fddfdb927d3769fd67e87e51848ba77ba4c36fa0e26be5719ce",
+    "1a9129c114b49fa745dff5a0ee69dac10ec7b65972bc49272c1584de6c6ceff8d43a97dff384",
+    "5d21031c9824a65c9f4a8eded95fcd6d1a9770cbca6dc0003045126337a04e02e2d78aec02c3",
+    "47ab3477a7081959c6f979de18dbb5e35c3b6ecc4380c45b7f6802d6d3afa7befe1e5d975173",
+    "5500b504eca1d7ffbc64572399d0973164116a3da3741dca51859956fb269e2ab93753011aa2",
+    "8d92d4415d6b646a5722cb458ad83213764fefbec87831f325c33165b3e58586c11a23b4e7cb",
+    "e92dddf1e92f28a6a38da4ed5e02b099aee05336c5d96092166b9f9bc79916c8d78f8bebaa86",
+    "8c26427f911a8033c327a2b62a6896b7f84cc42fef33b9acf3037afc4c5b07b9824b27f2acf1",
+    "e2998eff405314290a1b27f64c3c8bdb47d3fa51b7eaf599592055b3325a4b32e242c458a070",
+    "869c20475672448777eb95cd472be4ed5c7b7b0b89141c49c41c380a37f358dcf1b5d851307d",
+    "6c5ba39546d6dff050e42f8e024f8b6931f91c6c68106667fe2f4e05fdac5a6c07dbe490663c",
+    "85899f9c482a238bbfccf13a979d535ff5a83ea46c9f7c9788fceb4e3b309f20593e4a8e3f6c",
+    "092cbe30ad9b8cced0add16e377f17e87dc17b25aa90ec46b48f68ef41b41cf69d57c2584a50",
+    "b02a0832b20036a12e1390527e2dd6ee2d74f96b2d7988db5702ece77fa94251e7d7808f6d85",
+    "6776b7f3d4d13fd7f57ffb9f125f7d1ea80a04b69fbb0700e2cbc0e21e2716b527fa81a23c6e",
+    "861b5f3b6e34a960c0f619ef3c9e4f4eea72f14f76fde9f43c9982a122d990dd1d92481e5971",
+    "732ae2f24586992107e59106865638de245e78d65954528f73852354e6abf7075eae21671638",
+    "fd4a3255588758d71c590d67a86ff24104966ad6f650592cdd9825381d68ac6e026315167484",
+    "bf7d922d1df355db924c94c5d87d702185a1cd5c8031887acf7a5113eea0f2be43577e7fcb79",
+    "d4770d2fc8cdafb4fca62bbc0daac6c93750781517062426b926338824c02901692b7183a325",
+    "0e79a87d1d82b7c161415a172562815503ea3bf98d5736a864fa3535c66421a0637c5b13e0f7",
+    "a9b8311daa48f51ba8b96e0c396bde147a80f562dbda3b5f81782cb869a139fcc2ff57faa792",
+    "3cb417ec1c8083b27c77ccf5248ab021b49515e877a60b6d132efbf1895496403e39f5a7b4be",
+    "a89cce919373bb8a1a0cbc47e0115aaf7158d08ae0bdff2bd4d7d1e1df94975f5461d19d9b5c",
+    "fa8fb3795fbd59b5b5f6136a9adf0b25fa21b03a9e8493ca3dc14d3467b9a9c8e6642692f042",
+    "3db79482d218316520e6650a44312b2cefaa55bca5600242f1c2d5e2397adb76b7d011a512ca",
+    "cbe44a2da55461facfad3cf57a527e3f0eb3fd912e0e493a7ca41015c4c8bf2c1342a0",
+);
+/// 176×144 still-picture KEY frame (reduced sequence header,
+/// `allow_screen_content_tools = 1`, `allow_intrabc = 1`, 128×128
+/// superblocks, `base_q_idx = 160`) with ONE `use_intrabc == 1` leaf —
+/// an 8×16 block in the bottom-right superblock whose §5.11.26
+/// `PredMv[ 0 ]` comes from the empty-stack superblock-offset fallback
+/// and whose §7.11.3.4 copy reads `CurrFrame` at `refIdx == -1`
+/// (deltaRow −118, deltaCol −108). Pins the r405 fix that renders the
+/// §7.11.3 intra-block-copy prediction into `CurrFrame[ plane ]` on
+/// the §5.11.7 intra walker path — previously the leaf's prediction
+/// was never written (zeros), and the three following leaves predicted
+/// from the garbage neighbours (the long-standing "176×144
+/// highest-effort intra" divergence: the entropy decode was in sync
+/// all along; only the pixels were wrong).
+#[test]
+fn intrabc_still_picture_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "intrabc-still-176x144",
+        INTRABC_STILL_176X144_IVF,
+        "e0a700b7f470d0e633956d54ffd76178de64cc8e3823f82855b008f85a519b22",
+        1,
+    );
+}
+
+/// 320×240 still-picture KEY frame with 8 `use_intrabc == 1` leaves,
+/// one of which (an 8×8 with an empty close-neighbour scan) takes its
+/// §5.11.26 `PredMv[ 0 ]` from the §7.10.2 step-10 TOP-RIGHT
+/// `scan_point( -1, bw4 )` candidate — a decoded intra-block-copy
+/// neighbour whose `RefFrames[ .. ][ 0 ] == INTRA_FRAME`. Pins the
+/// r405 `scan_point` fix: the §7.10.2.4 "has been written for this
+/// frame" gate now reads decoded-ness off the `MiSizes[]` grid; the
+/// historical `RefFrames[ .. ][ 0 ] != INTRA_FRAME` proxy silently
+/// dropped every intra-block-copy corner candidate (wrong `PredMv`,
+/// wrong MV, one-column divergence — the coded MV-difference bits
+/// were identical).
+#[test]
+fn intrabc_scan_point_pred_mv_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "intrabc-scan-point-320x240",
+        INTRABC_SCANPOINT_320X240_IVF,
+        "1d09cba34956e74fb3e159297395a2bcf81508cf50bfd9d05984186b205e214c",
+        1,
+    );
+}
+
+/// 176×144 LOSSLESS still-picture KEY frame (`base_q_idx = 0`,
+/// `CodedLossless = 1`, screen-content tuning) composing intra block
+/// copy with the §7.7.4 WHT residual path — in lossless coding any
+/// prediction error survives to the output unchanged, so this stream
+/// pins the §7.11.3 intrabc copy (and its half-pel chroma BILINEAR
+/// arm) at exact-residual sensitivity.
+#[test]
+fn intrabc_lossless_decodes_byte_exact() {
+    assert_decodes_to_digest(
+        "intrabc-lossless-176x144",
+        INTRABC_LOSSLESS_176X144_IVF,
+        "1a9269bc2b26dd55a511f2dcf74d93566babecf501397ad95f56d0eee51f48c3",
+        1,
+    );
+}

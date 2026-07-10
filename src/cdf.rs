@@ -18763,6 +18763,197 @@ impl PartitionWalker {
         Ok(())
     }
 
+    /// §7.11.3 intra-block-copy prediction for one `use_intrabc == 1`
+    /// leaf — writes the §7.11.3.4 translational prediction for every
+    /// visited plane into `CurrFrame[ plane ]`, reading from the SAME
+    /// frame's already-reconstructed samples (§7.11.3.4: "If refIdx is
+    /// equal to -1, ref is set equal to CurrFrame").
+    ///
+    /// Mirrors the §5.11.33 `compute_prediction()` `is_inter` arm for
+    /// an intra-block-copy block. Every cell the §5.11.33
+    /// `someUseIntra` scan visits carries `RefFrames[ .. ][ 0 ] ==
+    /// INTRA_FRAME` (the §5.11.7 `use_intrabc == 1` stamp covers the
+    /// whole footprint, and on an intra frame every `is_inter` block
+    /// is an intra-block-copy block), so `someUseIntra == 1` always
+    /// fires: `predW = num4x4W * 4`, `predH = num4x4H * 4`, `candRow =
+    /// MiRow`, `candCol = MiCol` — ONE §7.11.3.1 `predict_inter`
+    /// invocation per plane at the full plane-block geometry, with the
+    /// block's own MV and the §5.11.7 fixed `interp_filter[ 0..2 ] =
+    /// BILINEAR` pair.
+    ///
+    /// §7.11.3.1 step 9 sets `RefFrameWidth[ -1 ] = FrameWidth`,
+    /// `RefFrameHeight[ -1 ] = FrameHeight` and `RefUpscaledWidth[ -1 ]
+    /// = UpscaledWidth` so the §7.11.3.3 scaling is the identity —
+    /// §5.9.20 reads `allow_intrabc` only when `UpscaledWidth ==
+    /// FrameWidth`, so both ratios are exactly `1 << REF_SCALE_SHIFT`
+    /// regardless of the dimension values, and the mi-padded extents
+    /// stand in for the real frame dimensions here. Step 11 then
+    /// overrides the reference extents to `MiCols * MI_SIZE` and
+    /// `MiRows * MI_SIZE` so the §7.11.3.4 edge clamp reaches the
+    /// mi-padded decoded extent ("to avoid intrabc prediction being cropped to
+    /// the frame boundaries") — exactly the walker's `CurrFrame[
+    /// plane ]` allocation.
+    ///
+    /// The §7.11.3.4 kernel reads a bounded window of `CurrFrame`
+    /// (rows `(startY >> 10) - 3 ..` for `intermediateHeight` rows,
+    /// cols `(startX >> 10) - 3 ..= ((startX + stepX * (w - 1)) >>
+    /// 10) + 4`, every access clamped to the plane edges). The window
+    /// between the clamped extremes is copied out first — clamping
+    /// against the window bounds is then sample-identical to clamping
+    /// against the plane bounds, because the clamp is monotone and the
+    /// window's edge rows / columns ARE the clamped extremes.
+    ///
+    /// The final write applies the §7.11.3.1 single-ref arm
+    /// (`CurrFrame[ plane ][ y + i ][ x + j ] = Clip1( preds[ 0 ][ i ][
+    /// j ] )`), clipped to the in-plane rows / columns for §5.11.4
+    /// bottom/right-edge overhanging leaves (the prediction still runs
+    /// at the full block geometry).
+    #[allow(clippy::too_many_arguments)]
+    fn predict_intrabc_leaf_into_curr_frame(
+        &mut self,
+        mi_row: u32,
+        mi_col: u32,
+        sub_size: usize,
+        has_chroma: bool,
+        subsampling_x: u8,
+        subsampling_y: u8,
+        bit_depth: u8,
+        mv: [i32; 2],
+    ) -> Result<(), crate::Error> {
+        if sub_size >= BLOCK_SIZES {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        // §6.10.27 conformance bound `Abs( Mv ) < (1 << 14)` keeps the
+        // i32 → i16 narrowing below lossless.
+        if mv[0].unsigned_abs() >= (1 << 14) || mv[1].unsigned_abs() >= (1 << 14) {
+            return Err(crate::Error::PartitionWalkOutOfRange);
+        }
+        let mv16 = [mv[0] as i16, mv[1] as i16];
+        // §7.11.3.2 with `isCompound = 0` (`RefFrame[ 1 ] = NONE` on
+        // the §5.11.7 intra-block-copy arm).
+        let rounding = crate::inter_pred::rounding_variables(bit_depth, false)?;
+        let clip_max: i32 = (1i32 << bit_depth) - 1;
+        let num_planes: u8 = 1 + if has_chroma { 2 } else { 0 };
+        for plane in 0..num_planes {
+            let (sub_x, sub_y) = if plane > 0 {
+                (subsampling_x, subsampling_y)
+            } else {
+                (0u8, 0u8)
+            };
+            let plane_sz = get_plane_residual_size(sub_size, plane, sub_x, sub_y)
+                .ok_or(crate::Error::PartitionWalkOutOfRange)?;
+            // §5.11.33 `someUseIntra` arm: `predW = num4x4W * 4`,
+            // `predH = num4x4H * 4` (the full plane-block extent).
+            let w = NUM_4X4_BLOCKS_WIDE[plane_sz] * MI_SIZE;
+            let h = NUM_4X4_BLOCKS_HIGH[plane_sz] * MI_SIZE;
+            // §5.11.33 `baseX = (MiCol >> subX) * MI_SIZE`, `baseY =
+            // (MiRow >> subY) * MI_SIZE`.
+            let base_x = ((mi_col >> sub_x) as i32) * (MI_SIZE as i32);
+            let base_y = ((mi_row >> sub_y) as i32) * (MI_SIZE as i32);
+            // §7.11.3.1 step 11 reference extent — the mi-padded plane.
+            let plane_rows = (self.mi_rows * (MI_SIZE as u32)) >> sub_y;
+            let plane_cols = (self.mi_cols * (MI_SIZE as u32)) >> sub_x;
+            if plane_rows == 0 || plane_cols == 0 {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            self.ensure_curr_frame_plane(plane as usize, plane_rows, plane_cols);
+            // §7.11.3.3 — identity scaling (see the doc comment): the
+            // mi-padded extents stand in for FrameWidth / FrameHeight
+            // AND the refIdx = -1 dimensions.
+            let scale = crate::inter_pred::motion_vector_scaling(
+                plane,
+                subsampling_x,
+                subsampling_y,
+                self.mi_cols * (MI_SIZE as u32),
+                self.mi_rows * (MI_SIZE as u32),
+                self.mi_cols * (MI_SIZE as u32),
+                self.mi_rows * (MI_SIZE as u32),
+                base_x,
+                base_y,
+                mv16,
+            )?;
+            // §7.11.3.4 read window between the clamped extremes.
+            let last_x = plane_cols as i32 - 1;
+            let last_y = plane_rows as i32 - 1;
+            let scale_one = 1i64 << crate::inter_pred::SCALE_SUBPEL_BITS;
+            let intermediate_height = ((((h as i64) - 1) * (scale.step_y as i64) + scale_one - 1)
+                >> crate::inter_pred::SCALE_SUBPEL_BITS)
+                as i32
+                + 8;
+            let y_raw0 = (scale.start_y >> crate::inter_pred::SCALE_SUBPEL_BITS) - 3;
+            let x_raw0 = (scale.start_x >> crate::inter_pred::SCALE_SUBPEL_BITS) - 3;
+            let x_raw1 = (((scale.start_x as i64 + (scale.step_x as i64) * ((w as i64) - 1))
+                >> crate::inter_pred::SCALE_SUBPEL_BITS) as i32)
+                + 4;
+            let y0 = y_raw0.clamp(0, last_y);
+            let y1 = (y_raw0 + intermediate_height - 1).clamp(0, last_y);
+            let x0 = x_raw0.clamp(0, last_x);
+            let x1 = x_raw1.clamp(0, last_x);
+            let win_w = (x1 - x0 + 1) as usize;
+            let win_h = (y1 - y0 + 1) as usize;
+            let Some(cp) = self.curr_frame[plane as usize].as_ref() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            let stride = cp.cols as usize;
+            let mut win: Vec<u16> = Vec::new();
+            if win.try_reserve_exact(win_w * win_h).is_err() {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            }
+            for yy in y0..=y1 {
+                let row = (yy as usize) * stride;
+                for xx in x0..=x1 {
+                    // `CurrFrame` samples are post-Clip1 (`0..=clip_max`),
+                    // so the u16 narrowing is lossless.
+                    win.push(cp.samples[row + xx as usize] as u16);
+                }
+            }
+            let mut pred = vec![0i32; w * h];
+            crate::inter_pred::block_inter_prediction(
+                plane,
+                subsampling_x,
+                subsampling_y,
+                &win,
+                win_w,
+                win_w as u32,
+                win_h as u32,
+                scale.start_x - (x0 << crate::inter_pred::SCALE_SUBPEL_BITS),
+                scale.start_y - (y0 << crate::inter_pred::SCALE_SUBPEL_BITS),
+                scale.step_x,
+                scale.step_y,
+                w,
+                h,
+                crate::inter_pred::BILINEAR,
+                crate::inter_pred::BILINEAR,
+                rounding.inter_round0,
+                rounding.inter_round1,
+                &mut pred,
+            )?;
+            // §7.11.3.1 single-ref final write, clipped to the
+            // in-plane rows / columns (§5.11.4 overhang leaves).
+            let Some(cp) = self.curr_frame[plane as usize].as_mut() else {
+                return Err(crate::Error::PartitionWalkOutOfRange);
+            };
+            for i in 0..h {
+                let ty = base_y + i as i32;
+                if ty < 0 || ty > last_y {
+                    continue;
+                }
+                let out_row = (ty as usize) * stride;
+                for j in 0..w {
+                    let tx = base_x + j as i32;
+                    if tx < 0 || tx > last_x {
+                        continue;
+                    }
+                    cp.samples[out_row + tx as usize] = pred[i * w + j].clamp(0, clip_max);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// View of the §6.10.4 `Skips[]` grid after the walk. Indexed
     /// row-major: `skips()[ r * MiCols + c ]`. Cells that no leaf
     /// covered carry `0` (the §5.11.11 [`Self::decode_skip`] writer
@@ -29561,6 +29752,27 @@ impl PartitionWalker {
             II_DC_PRED,
         )?;
 
+        // §5.11.33 `is_inter` arm, realised — on the §5.11.7 intra
+        // path the only `is_inter == 1` blocks are `use_intrabc == 1`
+        // blocks, whose §7.11.3 prediction reads the SAME frame's
+        // already-reconstructed samples (§7.11.3.4 `refIdx == -1 ⇒
+        // ref = CurrFrame`). Write it into `CurrFrame[ plane ]` here,
+        // between `compute_prediction( )` and `residual( )`, so the
+        // §7.12.3 step-3 merge lands on the real prediction and later
+        // blocks read reconstructed neighbours.
+        if use_intrabc != 0 {
+            self.predict_intrabc_leaf_into_curr_frame(
+                mi_row_b,
+                mi_col_b,
+                sub_size,
+                has_chroma,
+                subsampling_x,
+                subsampling_y,
+                bit_depth,
+                mv[0],
+            )?;
+        }
+
         // §5.11.5 line `residual( )` — §5.11.34 dispatcher.
         //
         // As of r181 the §5.11.34 outer dispatch + §5.11.36
@@ -33280,14 +33492,23 @@ impl PartitionWalker {
         if !self.geometry.is_inside(mv_row, mv_col) {
             return;
         }
-        // §7.10.2.4 "RefFrames[mvRow][mvCol][0] has been written" —
-        // pre-fill stamps INTRA_FRAME = 0 for unwritten cells; a
-        // decoded inter-block writes `LAST_FRAME..=ALTREF_FRAME` (=
-        // 1..=7); the spec gate `!= 0` matches "has been written" for
-        // inter blocks. (Intra-block neighbours retain `0` after
-        // §5.11.22 stamps the YMode, since the intra arm doesn't touch
-        // `RefFrames[]`.)
-        if self.ref_frame_at(mv_row, mv_col, 0) == 0 {
+        // §7.10.2.4 "RefFrames[ mvRow ][ mvCol ][ 0 ] has been written
+        // for this frame (this checks that the candidate location has
+        // been decoded)". Decoded-ness is tracked on the `MiSizes[]`
+        // grid — every §5.11.5 leaf stamps its footprint, unwritten
+        // cells carry the `BLOCK_INVALID` pre-fill. (The historical
+        // `RefFrames[ .. ][ 0 ] != INTRA_FRAME` proxy also rejected
+        // DECODED intra-block-copy candidates, whose §5.11.7
+        // `RefFrame[ 0 ] = INTRA_FRAME` stamp equals the pre-fill —
+        // dropping the §7.10.2 step-10 top-right / step-18 top-left
+        // candidate from the intrabc PredMv chain.)
+        if mv_row < 0 || mv_col < 0 {
+            return;
+        }
+        if (mv_row as u32) >= self.mi_rows || (mv_col as u32) >= self.mi_cols {
+            return;
+        }
+        if self.mi_sizes[(mv_row as u32 * self.mi_cols + mv_col as u32) as usize] == BLOCK_INVALID {
             return;
         }
         self.add_ref_mv_candidate(
