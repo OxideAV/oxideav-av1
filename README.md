@@ -381,10 +381,12 @@ with the neighbour-CDF `intra_frame_y_mode`, §5.11.22 `uv_mode` +
 §5.11.45 CFL alphas, §5.11.34 per-TU residual with live §8.3.2
 contexts), assembled as IVF → TD + SH + the combined §5.10 `OBU_FRAME`.
 Scope: 8-bit 4:2:0, dims multiples of 8 in [8, 512] per axis
-(multi-superblock beyond 64), BLOCK_4X4 leaves, SSD mode decision over
-the 7 exact-mirrorable intra modes + a chroma CFL alpha grid, lossless
-WHT arm (`q = 0`: decode == input bit-exact) and lossy DCT arm (decode
-== encoder reconstruction bit-exact). Validated three ways: the
+(multi-superblock beyond 64), BLOCK_8X8-level partition search (8×8
+leaf — four TX_4X4 luma TUs lossless / one TX_8X8 TU lossy — vs 4×4
+split, per-node rate-distortion trial), SSD mode decision over the 7
+exact-mirrorable intra modes + a chroma CFL alpha grid, lossless WHT
+arm (`q = 0`: decode == input bit-exact) and lossy DCT arm (decode ==
+encoder reconstruction bit-exact). Validated three ways: the
 in-tree spec driver, and TWO independent reference decoders (run as
 black-box binaries) all produce byte-identical output on every tested
 config; two self-encoded streams are pinned in the conformance corpus

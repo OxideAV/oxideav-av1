@@ -4,6 +4,8 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+- av1 encoder r409: **BLOCK_8X8 partition search in the conformance-grade keyframe driver** — every in-frame 8×8 node is trial-encoded both as one `BLOCK_8X8` leaf (four §5.11.35 TX_4X4 luma TUs on the lossless arm — each TU re-predicted from the running reconstruction with the block mode, exactly like the decode walk — or one TX_8X8 luma TU on the lossy `TX_MODE_LARGEST` arm) and as a PARTITION_SPLIT of four `BLOCK_4X4` leaves, keeping the lower `D + λ·R` score against a region snapshot/restore (λ q-scaled; R a v0 magnitude-aware coefficient/mode proxy — refining it toward true bit accounting is a follow-up). All 7 black-box validation configs remain byte-exact through both independent reference decoders and the in-tree spec driver with the mixed-shape trees.
+
 - av1 encoder r409: **public `encode_av1` graduates to the conformance-grade KEY-frame encoder** — the `(pixels, width, height)` entry now emits real §5.11 keyframe syntax (scope widens `[8, 64]` → `[8, 512]` per axis, still lossless / 4:2:0 / 8-bit; lossy on `encoder::encode_key_frame_yuv420_with_q`), and the matching `decode_av1` round-trip surfaces `Frame::Spec` through the spec-faithful path — the public encode/decode pair is conformant end-to-end. The historical non-conformant mirror encoders remain on the crate-public `encoder::*` entries.
 
 - av1 r409: **two self-encoded streams pinned in the conformance corpus (39 → 41)** — `self-kf-64x64-lossless` + `self-kf-176x144-q50` (multi-superblock lossy), digests pinned to the planar output an independent third-party decoder produced from the exact bytes; fixtures + generation notes staged under `docs/video/av1/fixtures/self-kf-*`.

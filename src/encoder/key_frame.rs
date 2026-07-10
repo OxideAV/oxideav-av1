@@ -35,8 +35,14 @@
 //!   lossy DCT_DCT arm (`TxMode = TX_MODE_LARGEST`, every leaf
 //!   `TX_4X4`): the decoded planes equal the encoder's own
 //!   reconstruction byte-for-byte.
-//! * `BLOCK_4X4` leaves everywhere (full PARTITION_SPLIT trees).
-//!   Per-leaf mode decision by residual SSD over the §6.10.x modes
+//! * Partition search at the `BLOCK_8X8` level: each in-frame 8×8
+//!   node is trial-encoded both as one `BLOCK_8X8` leaf (four §5.11.35
+//!   TX_4X4 luma TUs on the lossless arm, one TX_8X8 luma TU on the
+//!   lossy `TX_MODE_LARGEST` arm) and as a PARTITION_SPLIT of four
+//!   `BLOCK_4X4` leaves, keeping the lower rate-distortion score
+//!   (SSD over the node's pixels + a q-scaled coefficient/mode rate
+//!   proxy). Per-leaf mode decision by residual SSD over the §6.10.x
+//!   modes
 //!   that consume only the `w`-above / `h`-left neighbour samples
 //!   (`DC_PRED`, `V_PRED`, `H_PRED`, `SMOOTH_PRED`, `SMOOTH_V_PRED`,
 //!   `SMOOTH_H_PRED`, `PAETH_PRED`) — the directional D-modes read
@@ -73,8 +79,13 @@
 
 use crate::cdf::{
     dequantize_step1, intra_tx_type_set, is_tx_type_in_set, QuantizerParams, TileCdfContext,
-    TileGeometry, BLOCK_4X4, BLOCK_64X64, DCT_DCT, DC_PRED, H_PRED, MODE_TO_TXFM, PAETH_PRED,
-    SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4, UV_CFL_PRED, V_PRED,
+    TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT, DC_PRED, H_PRED, MODE_TO_TXFM,
+    PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4, TX_8X8, UV_CFL_PRED, V_PRED,
+};
+use crate::cdf::{
+    predict_intra_dc_pred, predict_intra_h_pred, predict_intra_paeth_pred,
+    predict_intra_smooth_h_pred, predict_intra_smooth_pred, predict_intra_smooth_v_pred,
+    predict_intra_v_pred,
 };
 use crate::encoder::forward_quantize::forward_quantize;
 use crate::encoder::forward_transform_2d::forward_transform_2d;
@@ -386,6 +397,13 @@ fn build_syntax_tree(
     if b_size == BLOCK_4X4 {
         return SyntaxNode::Leaf(Box::new(encode_leaf(r, c, input, recon)));
     }
+    if b_size == BLOCK_8X8 {
+        // Frame dims are multiples of 8, so every reached 8×8 node is
+        // fully in-frame — both the leaf and the split shape are legal
+        // §5.11.4 choices here; pick by rate-distortion trial.
+        debug_assert!(r + 1 < mi_rows && c + 1 < mi_cols);
+        return choose_8x8(r, c, input, recon);
+    }
     let half = (crate::cdf::NUM_4X4_BLOCKS_WIDE[b_size] as u32) >> 1;
     let sub = crate::cdf::partition_subsize(crate::cdf::PARTITION_SPLIT, b_size)
         .expect("PARTITION_SPLIT subsize exists for every b_size >= BLOCK_8X8");
@@ -419,6 +437,457 @@ fn build_syntax_tree(
             recon,
         )),
     ])
+}
+
+/// Snapshot of the pixel region one 8×8 luma node covers (8×8 luma +
+/// the collocated 4×4 chroma cells) — the working set the §5.11.4
+/// 8×8-level partition trial saves/restores.
+struct RegionSnapshot {
+    y: [u8; 64],
+    u: [u8; 16],
+    v: [u8; 16],
+}
+
+fn save_region(recon: &ReconState, r: u32, c: u32) -> RegionSnapshot {
+    let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
+    let (crow0, ccol0) = ((r as usize / 2) * 4, (c as usize / 2) * 4);
+    let mut snap = RegionSnapshot {
+        y: [0; 64],
+        u: [0; 16],
+        v: [0; 16],
+    };
+    for i in 0..8 {
+        for j in 0..8 {
+            snap.y[i * 8 + j] = recon.y[(row0 + i) * recon.width + (col0 + j)];
+        }
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            snap.u[i * 4 + j] = recon.u[(crow0 + i) * recon.chroma_w + (ccol0 + j)];
+            snap.v[i * 4 + j] = recon.v[(crow0 + i) * recon.chroma_w + (ccol0 + j)];
+        }
+    }
+    snap
+}
+
+fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &RegionSnapshot) {
+    let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
+    let (crow0, ccol0) = ((r as usize / 2) * 4, (c as usize / 2) * 4);
+    for i in 0..8 {
+        for j in 0..8 {
+            recon.y[(row0 + i) * recon.width + (col0 + j)] = snap.y[i * 8 + j];
+        }
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            recon.u[(crow0 + i) * recon.chroma_w + (ccol0 + j)] = snap.u[i * 4 + j];
+            recon.v[(crow0 + i) * recon.chroma_w + (ccol0 + j)] = snap.v[i * 4 + j];
+        }
+    }
+}
+
+/// Distortion (SSD, luma + both chroma cells) of the current
+/// reconstruction against the input over one 8×8 node's region.
+fn region_distortion(recon: &ReconState, input: &Yuv420Frame, r: u32, c: u32) -> u64 {
+    let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
+    let (crow0, ccol0) = ((r as usize / 2) * 4, (c as usize / 2) * 4);
+    let mut ssd = 0u64;
+    for i in 0..8 {
+        for j in 0..8 {
+            let idx = (row0 + i) * recon.width + (col0 + j);
+            let d = recon.y[idx] as i64 - input.y[idx] as i64;
+            ssd += (d * d) as u64;
+        }
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            let idx = (crow0 + i) * recon.chroma_w + (ccol0 + j);
+            let du = recon.u[idx] as i64 - input.u[idx] as i64;
+            let dv = recon.v[idx] as i64 - input.v[idx] as i64;
+            ssd += (du * du + dv * dv) as u64;
+        }
+    }
+    ssd
+}
+
+/// Crude rate proxy for a candidate shape: a fixed per-leaf mode/skip
+/// cost plus a magnitude-aware per-nonzero-coefficient cost
+/// (`3 + bitlength(|q|)` roughly tracks the §5.11.39 base + BR + golomb
+/// growth). Deliberately simple — it only has to ORDER the two §5.11.4
+/// candidates consistently.
+fn rate_proxy(blocks: &[&SyntaxBlock]) -> u64 {
+    let mut rate = 0u64;
+    for b in blocks {
+        rate += 24;
+        for tu in &b.residual_quant {
+            for &q in tu {
+                if q != 0 {
+                    rate += 3 + u64::from(32 - q.unsigned_abs().leading_zeros());
+                }
+            }
+        }
+    }
+    rate
+}
+
+/// §5.11.4 8×8-level partition decision: trial-encode the node both as
+/// one `BLOCK_8X8` leaf and as four `BLOCK_4X4` leaves against the
+/// same starting reconstruction, and keep the lower `D + λ·R` score
+/// (ties prefer the leaf — fewer symbols). The running reconstruction
+/// ends in the winning shape's state.
+fn choose_8x8(r: u32, c: u32, input: &Yuv420Frame, recon: &mut ReconState) -> SyntaxNode {
+    let lambda: u64 = 1 + (recon.qp.base_q_idx as u64 * recon.qp.base_q_idx as u64) / 32;
+    let before = save_region(recon, r, c);
+
+    // Candidate A: one BLOCK_8X8 leaf.
+    let leaf8 = encode_leaf_8x8(r, c, input, recon);
+    let d_a = region_distortion(recon, input, r, c);
+    let r_a = rate_proxy(&[&leaf8]);
+    let after_a = save_region(recon, r, c);
+    restore_region(recon, r, c, &before);
+
+    // Candidate B: PARTITION_SPLIT into four BLOCK_4X4 leaves
+    // (NW/NE/SW/SE dispatch order — the same order the writer emits).
+    let nw = encode_leaf(r, c, input, recon);
+    let ne = encode_leaf(r, c + 1, input, recon);
+    let sw = encode_leaf(r + 1, c, input, recon);
+    let se = encode_leaf(r + 1, c + 1, input, recon);
+    let d_b = region_distortion(recon, input, r, c);
+    let r_b = rate_proxy(&[&nw, &ne, &sw, &se]) + 4; // + the extra partition symbol weight
+    let score_a = d_a + lambda * r_a;
+    let score_b = d_b + lambda * r_b;
+    if score_a <= score_b {
+        restore_region(recon, r, c, &after_a);
+        SyntaxNode::Leaf(Box::new(leaf8))
+    } else {
+        SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ])
+    }
+}
+
+/// §7.11.2.1 neighbour arrays for one `size`×`size` cell (safe-mode
+/// subset: only `size` above + `size` left samples + the corner are
+/// consumed by [`SAFE_INTRA_MODES`] kernels; the arrays are still
+/// extended to `2·size` with the same clamp-replicate rule as the 4×4
+/// helper so the kernel signatures stay uniform).
+#[allow(clippy::type_complexity)]
+fn derive_intra_neighbours_sq(
+    plane: &[u8],
+    pw: usize,
+    ph: usize,
+    row0: usize,
+    col0: usize,
+    size: usize,
+) -> (u8, u8, Vec<u16>, Vec<u16>, u16) {
+    let have_above = (row0 > 0) as u8;
+    let have_left = (col0 > 0) as u8;
+    let px = |r: usize, c: usize| plane[r * pw + c] as u16;
+    let above_left: u16 = if have_above != 0 && have_left != 0 {
+        px(row0 - 1, col0 - 1)
+    } else if have_above != 0 {
+        px(row0 - 1, col0)
+    } else if have_left != 0 {
+        px(row0, col0 - 1)
+    } else {
+        1u16 << 7
+    };
+    let n = 2 * size;
+    let mut above = vec![0u16; n];
+    let mut left = vec![0u16; n];
+    if have_above != 0 {
+        for (k, slot) in above.iter_mut().enumerate() {
+            *slot = px(row0 - 1, (col0 + k).min(pw - 1));
+        }
+    } else if have_left != 0 {
+        above.fill(px(row0, col0 - 1));
+    } else {
+        above.fill((1u16 << 7) - 1);
+    }
+    if have_left != 0 {
+        for (k, slot) in left.iter_mut().enumerate() {
+            *slot = px((row0 + k).min(ph - 1), col0 - 1);
+        }
+    } else if have_above != 0 {
+        left.fill(px(row0 - 1, col0));
+    } else {
+        left.fill((1u16 << 7) + 1);
+    }
+    (have_above, have_left, above, left, above_left)
+}
+
+/// [`SAFE_INTRA_MODES`] prediction for one `size`×`size` cell (size ∈
+/// {4, 8}) — generic-square twin of the 4×4 mirror helper.
+fn predict_safe_mode_sq(
+    mode: usize,
+    have_above: u8,
+    have_left: u8,
+    above: &[u16],
+    left: &[u16],
+    above_left: u16,
+    size: usize,
+) -> Option<Vec<u8>> {
+    let log2 = size.trailing_zeros();
+    let mut pred16 = vec![0u16; size * size];
+    match mode {
+        m if m == DC_PRED => predict_intra_dc_pred(
+            have_left,
+            have_above,
+            log2,
+            log2,
+            size,
+            size,
+            8,
+            above,
+            left,
+            &mut pred16,
+        )
+        .ok()?,
+        m if m == V_PRED => predict_intra_v_pred(size, size, above, &mut pred16).ok()?,
+        m if m == H_PRED => predict_intra_h_pred(size, size, left, &mut pred16).ok()?,
+        m if m == SMOOTH_PRED => {
+            predict_intra_smooth_pred(log2, log2, size, size, above, left, &mut pred16).ok()?
+        }
+        m if m == SMOOTH_V_PRED => {
+            predict_intra_smooth_v_pred(log2, size, size, above, left, &mut pred16).ok()?
+        }
+        m if m == SMOOTH_H_PRED => {
+            predict_intra_smooth_h_pred(log2, size, size, above, left, &mut pred16).ok()?
+        }
+        m if m == PAETH_PRED => {
+            predict_intra_paeth_pred(size, size, above, left, above_left, &mut pred16).ok()?
+        }
+        _ => return None,
+    }
+    Some(pred16.into_iter().map(|v| v as u8).collect())
+}
+
+/// Fixed-mode `size`×`size` prediction from the running plane.
+fn predict_mode_sq(
+    plane: &[u8],
+    pw: usize,
+    ph: usize,
+    row0: usize,
+    col0: usize,
+    size: usize,
+    mode: usize,
+) -> Vec<u8> {
+    let (ha, hl, above, left, al) = derive_intra_neighbours_sq(plane, pw, ph, row0, col0, size);
+    predict_safe_mode_sq(mode, ha, hl, &above, &left, al, size)
+        .expect("SAFE_INTRA_MODES members always predict")
+}
+
+/// SSD-minimising [`SAFE_INTRA_MODES`] picker for one `size`×`size`
+/// luma cell.
+fn pick_safe_mode_sq(
+    recon_plane: &[u8],
+    input_plane: &[u8],
+    pw: usize,
+    ph: usize,
+    row0: usize,
+    col0: usize,
+    size: usize,
+) -> (u8, Vec<u8>) {
+    let (ha, hl, above, left, al) =
+        derive_intra_neighbours_sq(recon_plane, pw, ph, row0, col0, size);
+    let mut best_mode = DC_PRED as u8;
+    let mut best_pred: Vec<u8> = Vec::new();
+    let mut best_ssd = u64::MAX;
+    for &mode in &SAFE_INTRA_MODES {
+        let Some(pred) = predict_safe_mode_sq(mode, ha, hl, &above, &left, al, size) else {
+            continue;
+        };
+        let mut ssd = 0u64;
+        for i in 0..size {
+            for j in 0..size {
+                let d =
+                    input_plane[(row0 + i) * pw + (col0 + j)] as i64 - pred[i * size + j] as i64;
+                ssd += (d * d) as u64;
+            }
+        }
+        if ssd < best_ssd {
+            best_ssd = ssd;
+            best_mode = mode as u8;
+            best_pred = pred;
+        }
+    }
+    (best_mode, best_pred)
+}
+
+/// One TX_8X8 residual leg (lossy arm only — the lossless 8×8 leaf
+/// rides four §5.11.35 TX_4X4 TUs instead): forward DCT_DCT +
+/// quantize, decoder dequant + inverse, `Clip1(pred + res)` stitch.
+fn residual_8x8_lossy(
+    input_plane: &[u8],
+    recon_plane: &mut [u8],
+    pw: usize,
+    row0: usize,
+    col0: usize,
+    pred: &[u8],
+    qp: &QuantizerParams,
+) -> Vec<i32> {
+    let mut residual = [0i64; 64];
+    for i in 0..8 {
+        for j in 0..8 {
+            residual[i * 8 + j] =
+                input_plane[(row0 + i) * pw + (col0 + j)] as i64 - pred[i * 8 + j] as i64;
+        }
+    }
+    let coeffs = forward_transform_2d(&residual, TX_8X8, DCT_DCT, false);
+    let quant = forward_quantize(&coeffs, TX_8X8, 0, 0, DCT_DCT, 15, qp);
+    let dequant = dequantize_step1(&quant, TX_8X8, 0, 0, DCT_DCT, 15, qp);
+    let res_back = inverse_transform_2d(&dequant, TX_8X8, DCT_DCT, 8, false);
+    for i in 0..8 {
+        for j in 0..8 {
+            let p = pred[i * 8 + j] as i64 + res_back[i * 8 + j];
+            recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, 255) as u8;
+        }
+    }
+    quant
+}
+
+/// Encode one in-frame BLOCK_8X8 leaf. Luma: the block mode is picked
+/// on an 8×8 whole-block prediction; the lossless arm then codes the
+/// four §5.11.35 TX_4X4 TUs sequentially (each TU re-predicted from
+/// the running reconstruction with the block mode, exactly like the
+/// decode walk), while the lossy `TX_MODE_LARGEST` arm codes one
+/// TX_8X8 TU against the whole-block prediction. Chroma: identical to
+/// the 4×4 HasChroma arm (one TX_4X4 TU per plane at the collocated
+/// chroma cell), coded after the luma TUs per §5.11.34 plane order.
+fn encode_leaf_8x8(
+    mi_r: u32,
+    mi_c: u32,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+) -> SyntaxBlock {
+    let row0 = (mi_r as usize) * 4;
+    let col0 = (mi_c as usize) * 4;
+    let (width, height) = (recon.width, recon.height);
+    let lossless = recon.lossless;
+    let qp = recon.qp;
+
+    // --- Luma ---
+    let (y_mode, pred8) = pick_safe_mode_sq(&recon.y, &input.y, width, height, row0, col0, 8);
+    let mut luma_quant: Vec<Vec<i32>> = Vec::with_capacity(4);
+    if lossless {
+        // Four TX_4X4 TUs in §5.11.34 row-major order, re-predicted
+        // per TU from the running reconstruction.
+        for ty in 0..2 {
+            for tx in 0..2 {
+                let (tr, tc) = (row0 + ty * 4, col0 + tx * 4);
+                let pred_v = predict_mode_sq(&recon.y, width, height, tr, tc, 4, y_mode as usize);
+                let mut pred = [0u8; 16];
+                pred.copy_from_slice(&pred_v);
+                luma_quant.push(residual_4x4(
+                    &input.y,
+                    &mut recon.y,
+                    width,
+                    tr,
+                    tc,
+                    &pred,
+                    0,
+                    true,
+                    DCT_DCT,
+                    &qp,
+                ));
+            }
+        }
+    } else {
+        luma_quant.push(residual_8x8_lossy(
+            &input.y,
+            &mut recon.y,
+            width,
+            row0,
+            col0,
+            &pred8,
+            &qp,
+        ));
+    }
+
+    // --- Chroma (HasChroma always true at BLOCK_8X8 / 4:2:0) ---
+    let cr = (mi_r as usize) / 2;
+    let cc = (mi_c as usize) / 2;
+    let (crow0, ccol0) = (cr * 4, cc * 4);
+    let (m, pred_u, pred_v, alpha) = pick_safe_mode_4x4_chroma_joint(recon, input, crow0, ccol0);
+    let chroma_tx_type = if lossless {
+        DCT_DCT
+    } else {
+        let t = MODE_TO_TXFM.get(m as usize).copied().unwrap_or(DCT_DCT);
+        let set = intra_tx_type_set(0, 0, false);
+        if is_tx_type_in_set(false, set, t) {
+            t
+        } else {
+            DCT_DCT
+        }
+    };
+    let cw = recon.chroma_w;
+    let quant_u = residual_4x4(
+        &input.u,
+        &mut recon.u,
+        cw,
+        crow0,
+        ccol0,
+        &pred_u,
+        1,
+        lossless,
+        chroma_tx_type,
+        &qp,
+    );
+    let quant_v = residual_4x4(
+        &input.v,
+        &mut recon.v,
+        cw,
+        crow0,
+        ccol0,
+        &pred_v,
+        2,
+        lossless,
+        chroma_tx_type,
+        &qp,
+    );
+
+    // §5.11.11 skip.
+    let all_zero = luma_quant.iter().all(|tu| tu.iter().all(|&q| q == 0))
+        && quant_u.iter().all(|&q| q == 0)
+        && quant_v.iter().all(|&q| q == 0);
+    let skip = u8::from(all_zero);
+    let residual_quant: Vec<Vec<i32>> = if all_zero {
+        Vec::new()
+    } else {
+        let mut rq = luma_quant;
+        rq.push(quant_u);
+        rq.push(quant_v);
+        rq
+    };
+    let (cfl_alpha_u, cfl_alpha_v) = match alpha {
+        Some((au, av)) => (Some(au), Some(av)),
+        None => (None, None),
+    };
+
+    SyntaxBlock {
+        skip,
+        segment_id: 0,
+        cdef_idx: 0,
+        reduced_delta_q_index: 0,
+        reduced_delta_lf: [0; crate::cdf::FRAME_LF_COUNT],
+        intrabc_mv: None,
+        y_mode,
+        uv_mode: Some(m),
+        angle_delta_y: 0,
+        angle_delta_uv: 0,
+        cfl_alpha_u,
+        cfl_alpha_v,
+        use_filter_intra: 0,
+        filter_intra_mode: None,
+        palette: Default::default(),
+        residual_quant,
+        tx_size: None,
+        residual_tx_type: Vec::new(),
+        var_tx_trees: Vec::new(),
+    }
 }
 
 /// SSD-minimising picker over [`SAFE_INTRA_MODES`] for one 4×4 cell of
