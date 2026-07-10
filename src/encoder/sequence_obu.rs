@@ -22,11 +22,16 @@
 //! ObuType::SequenceHeader`. The writer does not emit the OBU header
 //! / `obu_size` itself — that's the framer's responsibility.
 //!
-//! This writer does **not** emit `trailing_bits` (§5.3.4): the field
-//! is part of the OBU payload but is owned by the OBU framing layer
-//! (a future arc will wire that in). For now the parser tests
-//! confirm the payload bytes alone round-trip, which is the gold
-//! standard for arc 1.
+//! As of r409 this writer emits the §5.3.4 `trailing_bits` itself,
+//! bit-precisely: the `trailing_one_bit` occupies the FIRST unused
+//! bit position after the last syntax element (§5.3.1 requires
+//! `trailing_bits( obu_size * 8 - payloadBits )` for
+//! `OBU_SEQUENCE_HEADER`). The previous split — zero-pad the body to
+//! a byte boundary in `BitWriter::finish`, then have the §5.3.1
+//! framer append a whole `0x80` byte — placed the trailing one-bit
+//! up to 7 bit positions late whenever the syntax ended mid-byte,
+//! which conformant decoders reject (this crate's parser ignores
+//! padding, so the bug was invisible to every internal round-trip).
 
 use crate::encoder::bitwriter::BitWriter;
 use crate::sequence_header::{
@@ -54,6 +59,10 @@ const MC_IDENTITY: u8 = 0;
 pub fn write_sequence_header_obu(sh: &SequenceHeader) -> Vec<u8> {
     let mut bw = BitWriter::new();
     encode_sequence_header(&mut bw, sh);
+    // §5.3.1 / §5.3.4: the trailing one-bit sits in the first unused
+    // bit position after the last syntax element (a full 0x80 byte
+    // when the syntax happens to end byte-aligned).
+    bw.trailing_bits_to_alignment();
     bw.finish()
 }
 

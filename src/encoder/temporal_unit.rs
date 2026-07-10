@@ -179,21 +179,23 @@ mod tests {
         assert_eq!(descs[0].obu_type, ObuType::TemporalDelimiter);
         assert_eq!(descs[0].payload_len, 0);
         assert_eq!(descs[1].obu_type, ObuType::SequenceHeader);
-        // SH body matches what `write_sequence_header_obu` emits, plus
-        // the 0x80 §5.3.4 trailer.
+        // r409: the body writers emit the §5.3.4 trailer themselves
+        // (bit-precise), so the framed payload IS the writer output.
         let expected_sh_body = write_sequence_header_obu(&seq);
-        assert_eq!(
-            &descs[1].payload[..expected_sh_body.len()],
-            &expected_sh_body[..]
+        assert_eq!(descs[1].payload, &expected_sh_body[..]);
+        assert_ne!(
+            *descs[1].payload.last().unwrap(),
+            0,
+            "SH body must end with its trailing_bits byte"
         );
-        assert_eq!(descs[1].payload[expected_sh_body.len()], 0x80);
         assert_eq!(descs[2].obu_type, ObuType::FrameHeader);
         let expected_fh_body = write_frame_header_obu(&fh, &seq);
-        assert_eq!(
-            &descs[2].payload[..expected_fh_body.len()],
-            &expected_fh_body[..]
+        assert_eq!(descs[2].payload, &expected_fh_body[..]);
+        assert_ne!(
+            *descs[2].payload.last().unwrap(),
+            0,
+            "FH body must end with its trailing_bits byte"
         );
-        assert_eq!(descs[2].payload[expected_fh_body.len()], 0x80);
     }
 
     #[test]

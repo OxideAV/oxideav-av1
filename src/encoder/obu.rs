@@ -126,11 +126,13 @@ pub fn obu_type_takes_trailing_bits(t: ObuType) -> bool {
 ///
 /// `body_bytes` is the byte-aligned payload the relevant body writer
 /// (`write_sequence_header_obu` / `write_frame_header_obu` / etc.)
-/// returned via `BitWriter::finish` — it must NOT already include the
-/// §5.3.4 trailer. The wrapper appends a one-byte `0x80` trailer
-/// (`trailing_one_bit = 1` followed by 7 zero pad bits) per §5.3.4
-/// when `obu_size > 0` and the §5.3.1 type-gate fires; the resulting
-/// `obu_size` is the trailer-inclusive byte count.
+/// returned — for the OBU types the §5.3.1 tail gives
+/// `trailing_bits`, the body MUST already carry its bit-precise
+/// §5.3.4 trailer (r409: the body writers emit it themselves via
+/// [`crate::encoder::bitwriter::BitWriter::trailing_bits_to_alignment`],
+/// so the trailing one-bit lands in the first unused bit after the
+/// last syntax element — the framer can no longer place it, because
+/// a byte-aligned buffer has lost the syntax-end bit position).
 ///
 /// Returns the number of bytes appended to `out`.
 pub fn write_obu_with_size(out: &mut Vec<u8>, header: &ObuHeader, body_bytes: &[u8]) -> usize {
@@ -138,19 +140,16 @@ pub fn write_obu_with_size(out: &mut Vec<u8>, header: &ObuHeader, body_bytes: &[
         header.has_size,
         "write_obu_with_size requires obu_has_size_field == 1 (§5.2 low-overhead)"
     );
-    let needs_trailer = !body_bytes.is_empty() && obu_type_takes_trailing_bits(header.obu_type);
+    // §5.3.4 sanity: a body ending in trailing_bits always has a
+    // non-zero final byte (the trailing one-bit lives in it).
+    debug_assert!(
+        body_bytes.is_empty()
+            || !obu_type_takes_trailing_bits(header.obu_type)
+            || body_bytes.last() != Some(&0),
+        "trailer-taking OBU body must end with its §5.3.4 trailing_bits (last byte nonzero)"
+    );
     let start_len = out.len();
-    if needs_trailer {
-        // §5.3.4 trailer on a byte-aligned body collapses to one byte
-        // `0x80` (`trailing_one_bit` + 7 zero pads). `obu_size` then
-        // accounts for body bytes plus this trailer byte.
-        let mut buf = Vec::with_capacity(body_bytes.len() + 1);
-        buf.extend_from_slice(body_bytes);
-        buf.push(0x80);
-        write_obu(out, header, &buf);
-    } else {
-        write_obu(out, header, body_bytes);
-    }
+    write_obu(out, header, body_bytes);
     out.len() - start_len
 }
 
@@ -398,17 +397,19 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn write_obu_with_size_appends_trailing_bits_for_sequence_header() {
-        // §5.3.1 gate fires (SH is not TG/TL/FRAME and obu_size > 0)
-        // ⇒ one 0x80 trailer byte appended; obu_size counts the trailer.
-        let body = vec![0x11, 0x22, 0x33];
+    fn write_obu_with_size_frames_pretrailered_body_verbatim() {
+        // r409: the §5.3.4 trailer is emitted bit-precisely by the
+        // BODY writer (the trailing one-bit sits in the first unused
+        // bit after the last syntax element), so the framer writes
+        // the body verbatim — no extra 0x80 byte. The body below ends
+        // with its own trailer byte.
+        let body = vec![0x11, 0x22, 0x33, 0x80];
         let mut out = Vec::new();
         write_obu_with_size(&mut out, &ObuHeader::new(ObuType::SequenceHeader), &body);
         let (desc, _consumed) = parse_obu(&out).unwrap();
         assert_eq!(desc.obu_type, ObuType::SequenceHeader);
-        assert_eq!(desc.payload_len, 4); // body + 1-byte trailer
-        assert_eq!(&desc.payload[..3], &body[..]);
-        assert_eq!(desc.payload[3], 0x80);
+        assert_eq!(desc.payload_len, 4); // body verbatim, trailer inside
+        assert_eq!(desc.payload, &body[..]);
     }
 
     #[test]
@@ -449,15 +450,15 @@ mod tests {
         // TD + SH + FH, all framed. Walk the result with ObuIter.
         let frames = vec![
             ObuFrame::new(ObuType::TemporalDelimiter, Vec::new()),
-            ObuFrame::new(ObuType::SequenceHeader, vec![0xAA, 0xBB]),
-            ObuFrame::new(ObuType::FrameHeader, vec![0x11]),
+            ObuFrame::new(ObuType::SequenceHeader, vec![0xAA, 0xBB, 0x80]),
+            ObuFrame::new(ObuType::FrameHeader, vec![0x11, 0x80]),
         ];
         let bytes = write_temporal_unit(&frames);
         let descs: Vec<_> = ObuIter::new(&bytes).collect::<Result<_, _>>().unwrap();
         assert_eq!(descs.len(), 3);
         assert_eq!(descs[0].obu_type, ObuType::TemporalDelimiter);
         assert_eq!(descs[1].obu_type, ObuType::SequenceHeader);
-        // SH body + 1-byte §5.3.4 trailer => payload_len = 3
+        // r409: bodies arrive pre-trailered; the framer is verbatim.
         assert_eq!(descs[1].payload_len, 3);
         assert_eq!(descs[2].obu_type, ObuType::FrameHeader);
         assert_eq!(descs[2].payload_len, 2);
@@ -465,20 +466,21 @@ mod tests {
 
     #[test]
     fn build_temporal_unit_emits_td_then_sh_then_frames() {
-        let sh_payload = [0xDE, 0xAD];
-        let fh = ObuFrame::new(ObuType::FrameHeader, vec![0xBE, 0xEF]);
+        // r409: bodies arrive pre-trailered (the body writers place
+        // the §5.3.4 trailing one-bit bit-precisely); the framer is
+        // verbatim.
+        let sh_payload = [0xDE, 0xAD, 0x80];
+        let fh = ObuFrame::new(ObuType::FrameHeader, vec![0xBE, 0xEF, 0x80]);
         let bytes = build_temporal_unit(Some(&sh_payload), &[fh]);
         let descs: Vec<_> = ObuIter::new(&bytes).collect::<Result<_, _>>().unwrap();
         assert_eq!(descs.len(), 3);
         assert_eq!(descs[0].obu_type, ObuType::TemporalDelimiter);
         assert_eq!(descs[0].payload_len, 0);
         assert_eq!(descs[1].obu_type, ObuType::SequenceHeader);
-        // SH body (2) + trailer (1) = 3.
         assert_eq!(descs[1].payload_len, 3);
-        assert_eq!(&descs[1].payload[..2], &sh_payload);
-        assert_eq!(descs[1].payload[2], 0x80);
+        assert_eq!(descs[1].payload, &sh_payload);
         assert_eq!(descs[2].obu_type, ObuType::FrameHeader);
-        assert_eq!(descs[2].payload_len, 3); // FH body + trailer
+        assert_eq!(descs[2].payload_len, 3);
     }
 
     #[test]

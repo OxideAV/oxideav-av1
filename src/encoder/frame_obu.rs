@@ -78,10 +78,21 @@ use crate::uncompressed_header_tail::{
 pub fn write_frame_header_obu(fh: &FrameHeader, seq: &SequenceHeader) -> Vec<u8> {
     let mut bw = BitWriter::new();
     encode_uncompressed_header(&mut bw, fh, seq);
+    // §5.3.1 / §5.3.4 (r409): `OBU_FRAME_HEADER` takes trailing_bits,
+    // and the trailing one-bit must occupy the FIRST unused bit after
+    // the last syntax element. A §5.10 `OBU_FRAME` composition must
+    // NOT use this entry (§5.10 pads with `byte_alignment()` zeros
+    // instead); it should drive [`encode_uncompressed_header`]
+    // directly.
+    bw.trailing_bits_to_alignment();
     bw.finish()
 }
 
-fn encode_uncompressed_header(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader) {
+pub(crate) fn encode_uncompressed_header(
+    bw: &mut BitWriter,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+) {
     // §5.9.2 idLen derivation (only meaningful when frame_id_numbers_present_flag).
     let id_len: u32 = if seq.frame_id_numbers_present_flag {
         u32::from(seq.additional_frame_id_length_minus_1)
