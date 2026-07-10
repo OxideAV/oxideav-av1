@@ -219,7 +219,12 @@ pub fn encode_key_frame_yuv420_with_q(
     let chroma_w = width / 2;
     let chroma_h = height / 2;
 
-    let seq = build_intra_only_yuv420_8bit_seq(input.width, input.height);
+    let mut seq = build_intra_only_yuv420_8bit_seq(input.width, input.height);
+    // r410: open the §5.11.24 filter-intra gate — the mode picker now
+    // evaluates the five §7.11.2.3 recursive modes on eligible luma
+    // blocks (the historical mirror drivers build their own sequence
+    // headers and stay unaffected).
+    seq.enable_filter_intra = true;
     let mut fh =
         build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
     // r410: the lossy arm codes §5.9.21 `TxMode = TX_MODE_SELECT` so
@@ -701,8 +706,25 @@ fn predict_mode_from_neighbours(
     Some(pred.into_iter().map(|v| v as u8).collect())
 }
 
+/// §7.11.2.3 recursive (filter-intra) prediction over pre-built
+/// head-extended neighbour arrays — the `use_filter_intra == 1` luma
+/// arm of the §7.11.2.1 dispatch (replaces the mode-driven kernels).
+fn predict_filter_intra_from_neighbours(
+    fim: usize,
+    w: usize,
+    h: usize,
+    above_ext: &[u16],
+    left_ext: &[u16],
+) -> Option<Vec<u8>> {
+    let mut pred = vec![0u16; w * h];
+    crate::cdf::predict_intra_recursive(w, h, fim, 8, above_ext, left_ext, &mut pred).ok()?;
+    Some(pred.into_iter().map(|v| v as u8).collect())
+}
+
 /// One-TU §7.11.2 prediction from the running plane: neighbour build
 /// (with real `BlockDecoded[]` corner availability) + kernel dispatch.
+/// `fim = Some(mode)` (luma only) routes through the §7.11.2.3
+/// recursive process instead of the mode-driven kernels.
 #[allow(clippy::too_many_arguments)]
 fn predict_tu(
     recon: &ReconState,
@@ -713,11 +735,16 @@ fn predict_tu(
     h: usize,
     mode: usize,
     angle_delta: i32,
+    fim: Option<usize>,
 ) -> Vec<u8> {
     let (buf, pw, ph) = recon.plane(plane);
     let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, plane, start_x, start_y, w, h);
     let (above_ext, left_ext, have_above, have_left) =
         build_tu_neighbours(buf, pw, ph, start_x, start_y, w, h, avail_ar, avail_bl);
+    if let Some(f) = fim.filter(|_| plane == 0) {
+        return predict_filter_intra_from_neighbours(f, w, h, &above_ext, &left_ext)
+            .expect("filter-intra kernel domain holds for coded TU sizes");
+    }
     predict_mode_from_neighbours(
         mode,
         angle_delta,
@@ -967,19 +994,21 @@ fn angle_delta_candidates(mode: usize, n: usize) -> core::ops::RangeInclusive<i3
     }
 }
 
-/// SSD-minimising luma (mode, angle_delta) pick over ALL 13 §6.10.x
-/// intra modes — the directional modes additionally search the
-/// §5.11.42 `-3..=3` angle-delta span (r410) — for one `n × n` block
-/// (recon-neighbour prediction at whole-block extent, input-target
-/// SSD). The neighbour build uses the same `BlockDecoded[]` state the
-/// block's first luma TU will observe.
+/// SSD-minimising luma (mode, angle_delta, filter_intra) pick — ALL
+/// 13 §6.10.x intra modes, the §5.11.42 `-3..=3` angle-delta span for
+/// the directional ones, and (r410) the five §7.11.2.3 filter-intra
+/// modes on §5.11.24-eligible blocks (`Max(w, h) <= 32`; a
+/// filter-intra win codes `y_mode = DC_PRED` + `use_filter_intra`) —
+/// for one `n × n` block (recon-neighbour prediction at whole-block
+/// extent, input-target SSD). The neighbour build uses the same
+/// `BlockDecoded[]` state the block's first luma TU will observe.
 fn pick_y_mode(
     recon: &ReconState,
     input: &Yuv420Frame,
     row0: usize,
     col0: usize,
     n: usize,
-) -> (u8, i8) {
+) -> (u8, i8, Option<u8>) {
     let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, 0, col0, row0, n, n);
     let (above_ext, left_ext, have_above, have_left) = build_tu_neighbours(
         &recon.y,
@@ -992,7 +1021,18 @@ fn pick_y_mode(
         avail_ar,
         avail_bl,
     );
-    let mut best = (DC_PRED as u8, 0i8);
+    let ssd_of = |pred: &[u8]| -> u64 {
+        let mut ssd = 0u64;
+        for i in 0..n {
+            for j in 0..n {
+                let d =
+                    input.y[(row0 + i) * recon.width + (col0 + j)] as i64 - pred[i * n + j] as i64;
+                ssd += (d * d) as u64;
+            }
+        }
+        ssd
+    };
+    let mut best = (DC_PRED as u8, 0i8, None);
     let mut best_ssd = u64::MAX;
     for mode in 0..INTRA_MODES {
         for delta in angle_delta_candidates(mode, n) {
@@ -1001,17 +1041,25 @@ fn pick_y_mode(
             ) else {
                 continue;
             };
-            let mut ssd = 0u64;
-            for i in 0..n {
-                for j in 0..n {
-                    let d = input.y[(row0 + i) * recon.width + (col0 + j)] as i64
-                        - pred[i * n + j] as i64;
-                    ssd += (d * d) as u64;
-                }
-            }
+            let ssd = ssd_of(&pred);
             if ssd < best_ssd {
                 best_ssd = ssd;
-                best = (mode as u8, delta as i8);
+                best = (mode as u8, delta as i8, None);
+            }
+        }
+    }
+    // §5.11.24 gate: Max(Block_Width, Block_Height) <= 32 (the coded
+    // y_mode is DC_PRED and this driver never codes palette).
+    if n <= 32 {
+        for fim in 0..crate::cdf::INTRA_FILTER_MODES {
+            let Some(pred) = predict_filter_intra_from_neighbours(fim, n, n, &above_ext, &left_ext)
+            else {
+                continue;
+            };
+            let ssd = ssd_of(&pred);
+            if ssd < best_ssd {
+                best_ssd = ssd;
+                best = (DC_PRED as u8, 0, Some(fim as u8));
             }
         }
     }
@@ -1252,7 +1300,7 @@ fn encode_leaf_with_tx(
     let qp = recon.qp;
 
     // --- Luma ---
-    let (y_mode, angle_delta_y) = pick_y_mode(recon, input, row0, col0, n);
+    let (y_mode, angle_delta_y, filter_intra_mode) = pick_y_mode(recon, input, row0, col0, n);
     let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
     let mut residual_quant: Vec<Vec<i32>> = Vec::new();
     let mut luma_tx_types: Vec<u8> = Vec::new();
@@ -1270,6 +1318,7 @@ fn encode_leaf_with_tx(
                 lth,
                 y_mode as usize,
                 angle_delta_y as i32,
+                filter_intra_mode.map(|f| f as usize),
             );
             let (q, tt) = if lossless {
                 (
@@ -1363,7 +1412,7 @@ fn encode_leaf_with_tx(
                     // §5.11.35: a CFL chroma TU writes the DC_PRED
                     // base, then §7.11.5 layers the luma AC on top.
                     let pred = if is_cfl {
-                        let dc = predict_tu(recon, plane, tc, tr, ctw, cth, DC_PRED, 0);
+                        let dc = predict_tu(recon, plane, tc, tr, ctw, cth, DC_PRED, 0, None);
                         cfl_layer(
                             &dc,
                             &recon.y,
@@ -1377,7 +1426,17 @@ fn encode_leaf_with_tx(
                             max_luma_h,
                         )
                     } else {
-                        predict_tu(recon, plane, tc, tr, ctw, cth, m as usize, delta_uv as i32)
+                        predict_tu(
+                            recon,
+                            plane,
+                            tc,
+                            tr,
+                            ctw,
+                            cth,
+                            m as usize,
+                            delta_uv as i32,
+                            None,
+                        )
                     };
                     let plane_buf = if plane == 1 {
                         &mut recon.u
@@ -1442,8 +1501,8 @@ fn encode_leaf_with_tx(
         angle_delta_uv,
         cfl_alpha_u,
         cfl_alpha_v,
-        use_filter_intra: 0,
-        filter_intra_mode: None,
+        use_filter_intra: u8::from(filter_intra_mode.is_some()),
+        filter_intra_mode,
         palette: Default::default(),
         residual_quant,
         // §5.11.15 TxSize commitment: on the lossy TX_MODE_SELECT arm

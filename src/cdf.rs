@@ -2142,7 +2142,7 @@ pub fn predict_intra_paeth_pred(
 /// row immediately above the current `4×2` block) read the
 /// already-filled `pred` rows for `i2 > 0`, and `LeftCol` for `i2 == 0`,
 /// exactly as the spec's branch structure specifies.
-fn predict_intra_recursive(
+pub(crate) fn predict_intra_recursive(
     w: usize,
     h: usize,
     filter_intra_mode: usize,

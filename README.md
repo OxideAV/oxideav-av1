@@ -391,17 +391,21 @@ availability off an encoder-side §6.10.3 `BlockDecoded[]` mirror, plus
 a full §5.11.42/§5.11.43 `-3..=3` angle-delta search), chroma CFL over
 an (αU, αV) grid at any TU size (general §7.11.5 kernel with the
 `MaxLumaW/H` clamps; the §8.3.2 lossless-arm `cfl_allowed` gate is
-honoured), and **TX_MODE_SELECT** on the lossy arm — each leaf's luma
+honoured), **TX_MODE_SELECT** on the lossy arm — each leaf's luma
 TU grid RD-searched down the §5.11.15 `Split_Tx_Size` ladder from
 `Max_Tx_Size_Rect` (TX_4X4…TX_64X64, the 64-wide sizes emitting the
 §7.12.3 compact-`tw` coefficient layout; chroma rides §5.11.38
-`get_tx_size`, TX_4X4…TX_32X32). Lossless WHT arm (`q = 0`: decode ==
+`get_tx_size`, TX_4X4…TX_32X32), a **§5.11.47 per-TU luma
+transform-type RD search** over the full §5.11.48 intra sets
+(ADST/IDTX/V_DCT/H_DCT arms live), and **§5.11.24 filter-intra** (the
+five §7.11.2.3 recursive modes on eligible ≤32×32 blocks). Lossless WHT arm (`q = 0`: decode ==
 input bit-exact) and lossy DCT arm at any `base_q_idx` in 1..=255
 (decode == encoder reconstruction bit-exact). Validated four ways: the
 in-tree spec driver and THREE independent reference decoders (run as
-black-box binaries) all produce byte-identical output on a 252-stream
-matrix (11 geometries incl. 512×8 / 8×512 extremes × q ∈ {0, 20, 50,
-100, 160, 255} × gradient / noise / mixed / diagonal-stripe content);
+black-box binaries) all produce byte-identical output on a 310-stream
+matrix (12 geometries incl. 512×8 / 8×512 extremes and 1280×720 × q ∈
+{0, 20, 50, 100, 160, 255} × gradient / noise / mixed /
+diagonal-stripe / sharp-stripe content; 1080p and 4K spot-validated);
 five self-encoded streams are pinned in the conformance corpus (44
 total). Encoder-side conformance root causes found across the two
 rounds: §5.3.4 `trailing_bits` placed bit-precisely by the OBU body
@@ -422,10 +426,9 @@ derivation (subsampled chroma residual must be 4×4 — the lossy
   streams (kept for their bit-exact self round-trip through
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv420`. Conformant encoding beyond the
-  r410 keyframe scope (palette/filter-intra/intrabc leaves, the
-  asymmetric HORZ/VERT partition shapes, non-DCT luma transform
-  types, true bit-accounting rate costs, inter P-frames) is the
-  follow-up ladder.
+  r410 keyframe scope (palette/intrabc leaves, the asymmetric
+  HORZ/VERT partition shapes, true bit-accounting rate costs, inter
+  P-frames) is the follow-up ladder.
 
 ## Module layout
 
