@@ -455,14 +455,58 @@ impl SymbolWriter {
         );
     }
 
-    /// Flush the encoder and return the encoded byte sequence.
+    /// Flush the encoder and return the encoded byte sequence, with
+    /// the §8.2.4-conformant termination (r409).
     ///
-    /// The accumulated `low_bits` are the MSB-first bits of the
-    /// bytestream. We pack them eight at a time into output bytes,
-    /// padding any partial trailing byte with §8.2.2 zero bits — the
-    /// decoder consumes these via its `numBits = Min(bits, Max(0,
-    /// SymbolMaxBits))` clamp.
-    pub fn finish(self) -> Vec<u8> {
+    /// §8.2.4 requires that the bit at `trailingBitPosition` — the
+    /// bitstream position right after the decoder's logically-consumed
+    /// symbol bits, i.e. exactly the encoder's accumulated renorm-bit
+    /// count — equals `1`, and that every bit from there to the padded
+    /// byte end equals `0` (the OBU trailing bits of a tile group /
+    /// frame OBU, consumed by `exit_symbol`). The final decode
+    /// interval `[low, low + range)` with `range >= 1 << 15` always
+    /// contains a value whose LAST 15 bits are exactly
+    /// `1000_0000_0000_000` (any residue mod `1 << 15` occurs in a
+    /// window that wide), so we adjust `low` upward to that value:
+    /// its top `len - 15` bits are the symbol payload, its bit at
+    /// `trailingBitPosition = len - 15` is the required `1`, and the
+    /// 14 zeros after it are droppable padding. Emitting the first
+    /// `len - 14` bits (zero-padded to a byte boundary) therefore
+    /// yields the minimal §8.2.4-conformant tile payload; the §8.2.2
+    /// decoder reads the same symbols (the value is still inside the
+    /// final interval; missing lookahead bits read as `0` through the
+    /// `Max(0, SymbolMaxBits)` clamp, matching the zeros we dropped).
+    ///
+    /// Before r409 this flush emitted the raw `low` bits with no
+    /// trailing one-bit — this crate's decoder accepted that (the
+    /// zero-fill clamp), but the §8.2.4 conformance check in
+    /// independent decoders rejects such tile data.
+    pub fn finish(mut self) -> Vec<u8> {
+        let n = self.low_bits.len();
+        debug_assert!(n >= 15, "init seeds 15 bits; finish sees at least those");
+        if n >= 15 {
+            // Value of the last 15 bits of `low`.
+            let mut r: u32 = 0;
+            for &b in &self.low_bits[n - 15..] {
+                r = (r << 1) | u32::from(b);
+            }
+            // Adjust to the unique in-interval value with last-15-bits
+            // == `1 << 14`. `offset = (2^14 - r) mod 2^15 < 2^15 <=
+            // range`, so `low + offset` stays inside `[low, low +
+            // range)` and never overflows the bit grid.
+            let offset = ((1u32 << 14).wrapping_sub(r)) & 0x7FFF;
+            debug_assert!(offset < self.range, "termination offset exceeds range");
+            if offset != 0 {
+                self.add_to_low(offset);
+            }
+            debug_assert!(
+                self.low_bits[n - 15] && self.low_bits[n - 14..].iter().all(|&b| !b),
+                "post-adjust low must end in the §8.2.4 trailing pattern"
+            );
+            // Drop the 14 trailing zeros — they are reconstituted by
+            // the decoder's zero-fill and by the byte padding below.
+            self.low_bits.truncate(n - 14);
+        }
         let mut out = Vec::with_capacity(self.low_bits.len().div_ceil(8));
         let mut cur: u8 = 0;
         let mut bits_in_cur: u32 = 0;
@@ -486,6 +530,47 @@ impl SymbolWriter {
 mod tests {
     use super::*;
     use crate::symbol_decoder::SymbolDecoder;
+
+    /// r409 §8.2.4 termination: the emitted tile payload ends with the
+    /// OBU trailing-bits pattern — scanning from the end, the padding
+    /// is all-zero bits up to a single `1` (the `trailingBitPosition`
+    /// bit), and the stream still round-trips through the decoder.
+    #[test]
+    fn finish_terminates_with_trailing_one_bit_pattern() {
+        for pattern_len in [1usize, 3, 17, 64, 200] {
+            let mut w = SymbolWriter::new(false);
+            let mut cdf_w: [u16; 4] = [12000, 20000, 1 << 15, 0];
+            for i in 0..pattern_len {
+                w.write_symbol((i % 3) as u32, &mut cdf_w).unwrap();
+            }
+            let bytes = w.finish();
+            // Trailing pattern: strip zero bits from the tail; the
+            // first set bit encountered is the §8.2.4 trailing bit.
+            let mut bit_idx = bytes.len() * 8;
+            let bit_at = |bytes: &[u8], i: usize| (bytes[i / 8] >> (7 - (i % 8))) & 1;
+            while bit_idx > 0 && bit_at(&bytes, bit_idx - 1) == 0 {
+                bit_idx -= 1;
+            }
+            assert!(bit_idx > 0, "len {pattern_len}: no trailing one-bit");
+            // Fewer than 8 + 14 zero bits of padding may follow it (14
+            // dropped zeros are reconstituted by the byte pad; the
+            // emission is minimal so at most 7 pad bits exist).
+            assert!(
+                bytes.len() * 8 - bit_idx < 8,
+                "len {pattern_len}: emission is not minimal"
+            );
+            // Round-trip.
+            let mut d = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+            let mut cdf_r: [u16; 4] = [12000, 20000, 1 << 15, 0];
+            for i in 0..pattern_len {
+                assert_eq!(
+                    d.read_symbol(&mut cdf_r).unwrap(),
+                    (i % 3) as u32,
+                    "len {pattern_len}: symbol {i} diverged"
+                );
+            }
+        }
+    }
 
     /// `write_bool` followed by `read_bool` recovers the original bit.
     #[test]
