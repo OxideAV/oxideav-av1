@@ -322,18 +322,20 @@ functions. Streams outside the supported scope return a typed `Error`
 
 ### Not yet supported
 
-- **Scaled references** (`resize-mode` streams, and superres applied to
-  a reference a later frame predicts from): the §7.11.3.3 / §7.11.3.4
-  scaled motion-vector / prediction path (`xStep / yStep != 1`) is not
-  implemented; such streams surface a typed error.
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
   overrides are implemented per §5.11.14/§5.11.20/§5.11.25 and
   unit-tested, but no conformance stream pins them — the black-box
   encoder's CLI cannot signal those features (`SEG_LVL_ALT_Q` streams
   are pinned byte-exact).
-- One known entropy divergence on a 176×144 highest-effort intra frame
-  with CDEF + self-guided restoration both active (palette-heavy
-  content; minimal repro in the r394 notes) — under investigation.
+- Loop restoration on RESIZED inter frames (LR units at the reduced
+  `FrameWidth`) diverges on textured content; CDEF on one resized
+  GOP differs by a single byte — both localised to the post-filter
+  chain, under investigation.
+- One multi-reference GOP entropy divergence: a late alt-ref-pyramid
+  inter frame (LAST+BWDREF compound with temporal MV projection
+  across 4+ stored references) diverges mid-frame on textured
+  content; the KEY + first alt-ref temporal unit of the same GOP is
+  byte-exact and pinned.
 - The historical fixed-16×16 intra `encode_av1` path emits streams
   independent decoders reject (non-conformant); its self round-trip
   through `decode_av1` still holds. Conformance-grade encoding is a

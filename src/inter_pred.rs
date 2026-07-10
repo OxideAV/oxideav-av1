@@ -291,11 +291,16 @@ pub(crate) fn round2_signed(x: i64, n: u32) -> i64 {
 /// * `subsampling_x` / `subsampling_y` — §5.5.2 chroma subsampling
 ///   (`0` for 4:4:4, `1` for 4:2:2 / 4:2:0).
 /// * `frame_width` / `frame_height` — current frame dimensions
-///   (`FrameWidth` / `FrameHeight` per §5.9.5).
+///   (`FrameWidth` / `FrameHeight` per §5.9.5), in LUMA samples for
+///   EVERY plane — §7.11.3.3 computes `xScale` / `yScale` from the
+///   luma extents regardless of `plane` (only the `mv` shift and the
+///   caller's `x` / `y` are per-plane). A chroma-subsampled pair
+///   silently skews the scale ratio whenever a luma extent is odd.
 /// * `ref_upscaled_width` — reference frame `RefUpscaledWidth[refIdx]`
-///   (the pre-superres width per §5.9.8). Must equal `FrameWidth` when
-///   no superres / resize is in effect.
-/// * `ref_frame_height` — reference frame `RefFrameHeight[refIdx]`.
+///   (the pre-superres width per §5.9.8), LUMA samples. Must equal
+///   `FrameWidth` when no superres / resize is in effect.
+/// * `ref_frame_height` — reference frame `RefFrameHeight[refIdx]`,
+///   LUMA samples.
 /// * `x` / `y` — current-frame top-left sample coordinate of the
 ///   prediction region.
 /// * `mv` — `[mv_row, mv_col]` motion vector in §5.11 1/8-sample
@@ -616,10 +621,14 @@ fn clip3_i32(low: i32, high: i32, v: i32) -> i32 {
 ///   `plane`, row-major (`ref_plane[ry * ref_stride + rx]`). Length
 ///   must be `>= ref_height * ref_stride`.
 /// * `ref_stride` — row stride in samples of `ref_plane`. Must be
-///   `>= ref_width`.
-/// * `ref_width` / `ref_height` — reference plane's per-plane width
-///   / height in samples. `(lastX, lastY) = (ref_width - 1,
-///   ref_height - 1)` per av1-spec p.262 lines 14575-14577.
+///   `>= lastX + 1` (the derived per-plane width).
+/// * `ref_width` / `ref_height` — §7.11.3.4 `RefUpscaledWidth[ refIdx ]`
+///   / `RefFrameHeight[ refIdx ]` in LUMA samples (pre-subsampling).
+///   The per-plane clamp derives inside per av1-spec p.262 lines
+///   14575-14577: `lastX = ((RefUpscaledWidth + subX) >> subX) - 1`,
+///   `lastY = ((RefFrameHeight + subY) >> subY) - 1` — the parity of
+///   an ODD luma extent is preserved, which a caller-side pre-folded
+///   per-plane width cannot represent.
 /// * `start_x` / `start_y` / `step_x` / `step_y` — §7.11.3.3 outputs.
 /// * `w` / `h` — prediction region width / height in current-frame
 ///   samples.
@@ -669,10 +678,17 @@ pub fn block_inter_prediction(
     if subsampling_x > 1 || subsampling_y > 1 {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    if ref_width == 0 || ref_height == 0 || ref_stride < ref_width as usize {
+    // Stride / length guards run against the DERIVED per-plane
+    // extents (`ref_width` / `ref_height` are luma-unit §7.11.3.4
+    // `RefUpscaledWidth` / `RefFrameHeight`; see below).
+    let guard_sub_x: u32 = if plane == 0 { 0 } else { subsampling_x as u32 };
+    let guard_sub_y: u32 = if plane == 0 { 0 } else { subsampling_y as u32 };
+    let plane_w = ((ref_width + guard_sub_x) >> guard_sub_x) as usize;
+    let plane_h = ((ref_height + guard_sub_y) >> guard_sub_y) as usize;
+    if ref_width == 0 || ref_height == 0 || ref_stride < plane_w {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
-    if ref_plane.len() < (ref_height as usize) * ref_stride {
+    if ref_plane.len() < plane_h * ref_stride {
         return Err(crate::Error::PartitionWalkOutOfRange);
     }
     if w == 0 || h == 0 || w > 256 || h > 256 {
@@ -694,16 +710,15 @@ pub fn block_inter_prediction(
     //   lastX = ((RefUpscaledWidth + subX) >> subX) - 1
     //   lastY = ((RefFrameHeight   + subY) >> subY) - 1
     //
-    // The caller passes `ref_width` / `ref_height` already
-    // sub-sampled to the per-plane grid (i.e. the per-plane
-    // RefUpscaledWidth >> subX value), so the formula degenerates to
-    // `last{X,Y} = ref_{width,height} - 1`. The (subX, subY)
-    // arguments are retained for the spec-level argument shape; the
-    // sub-sampling factor itself is already folded into ref_width /
-    // ref_height by the caller per §7.11.3.4 lines 14569-14577.
-    let _ = (subsampling_x, subsampling_y);
-    let last_x: i32 = (ref_width as i32) - 1;
-    let last_y: i32 = (ref_height as i32) - 1;
+    // `ref_width` / `ref_height` arrive in LUMA samples
+    // (`RefUpscaledWidth[ refIdx ]` / `RefFrameHeight[ refIdx ]`) and
+    // the per-plane clamp derives HERE, spec-verbatim — a caller-side
+    // pre-folded per-plane width loses the parity of an odd luma
+    // extent, which shifts the whole §7.11.3.3 scale ratio on scaled
+    // chroma (e.g. a 213-wide resized frame: chroma 107 could lift
+    // back to 213 OR 214).
+    let last_x: i32 = (plane_w as i32) - 1;
+    let last_y: i32 = (plane_h as i32) - 1;
 
     // §7.11.3.4 (av1-spec p.262 line 14581).
     //
@@ -927,16 +942,18 @@ pub struct PredictInterRef<'a> {
     /// Column stride of `ref_plane` (`>= ref_width`).
     pub ref_stride: usize,
     /// §7.11.3.3 `RefUpscaledWidth[refIdx]` — pre-superres ref
-    /// width in *per-plane* samples (caller has already applied the
-    /// chroma `>> subX`). Equal to `ref_width` when superres /
-    /// resize is not in effect.
+    /// width in LUMA samples (r405: NOT per-plane — §7.11.3.3 derives
+    /// `xScale` from the luma extents for every plane, and a
+    /// pre-folded chroma width loses the parity of an odd luma
+    /// extent). Equal to `ref_width` when superres / resize is not
+    /// in effect.
     pub ref_upscaled_width: u32,
-    /// §7.11.3.3 `RefFrameWidth[refIdx]` post-superres per-plane
-    /// width. The §7.11.3.4 boundary clamp uses this as `lastX +
-    /// 1`. Equal to `ref_upscaled_width` when superres is not in
-    /// effect.
+    /// §7.11.3.4 clamp width in LUMA samples (the §7.20 stores hold
+    /// planes at the upscaled extent, so this equals
+    /// `ref_upscaled_width` for stored references). The §7.11.3.4
+    /// leaf derives the per-plane `lastX` internally.
     pub ref_width: u32,
-    /// §7.11.3.3 `RefFrameHeight[refIdx]` per-plane height.
+    /// §7.11.3.3 `RefFrameHeight[refIdx]` in LUMA samples.
     pub ref_height: u32,
     /// §7.11.3.1 step 8 — `Mvs[candRow][candCol][refList]` in
     /// 1/8-luma-sample precision per §5.11 (the [`motion_vector_scaling`]
@@ -1688,18 +1705,11 @@ fn predict_inter_per_ref_warp(
     // loops run at least once.
     let i_blocks = h.div_ceil(8);
     let j_blocks = w.div_ceil(8);
-    // [`PredictInterRef`] carries PER-PLANE reference dimensions (the
-    // caller applied the chroma `>> subX` / `>> subY`), while
-    // §7.11.3.5 / [`block_warp`] takes the pre-sub-sample
-    // `RefUpscaledWidth[ refIdx ]` / `RefFrameHeight[ refIdx ]` and
-    // re-derives the per-plane `lastX` / `lastY` internally. Lift the
-    // per-plane dims back to luma scale — `(((w << s) + s) >> s) - 1
-    // == w - 1` for either luma-width parity, so the §7.11.3.5 clamp
-    // lands on the true per-plane edge. (r390 fix: chroma warp blocks
-    // previously double-subsampled the clamp, folding every read past
-    // the plane's horizontal midpoint back onto column `w/2 - 1`.)
-    let sub_x_p: u32 = if plane == 0 { 0 } else { subsampling_x as u32 };
-    let sub_y_p: u32 = if plane == 0 { 0 } else { subsampling_y as u32 };
+    // [`PredictInterRef`] carries LUMA-unit reference dimensions
+    // (r405 contract) — exactly what §7.11.3.5 / [`block_warp`] takes;
+    // it re-derives the per-plane `lastX` / `lastY` internally. (The
+    // r390 chroma-warp fix lifted the then-per-plane fields back to
+    // luma here; the lift is gone now that the fields ARE luma.)
     for i8b in 0..i_blocks {
         for j8b in 0..j_blocks {
             block_warp(
@@ -1715,8 +1725,8 @@ fn predict_inter_per_ref_warp(
                 h,
                 r.ref_plane,
                 r.ref_stride,
-                r.ref_upscaled_width << sub_x_p,
-                r.ref_height << sub_y_p,
+                r.ref_upscaled_width,
+                r.ref_height,
                 warp_params,
                 inter_round0,
                 inter_round1,
@@ -4813,13 +4823,16 @@ pub struct RefFrameStoreEntry<'a> {
     /// `FrameStore[ refIdx ]` plane samples (row-major, `stride`
     /// columns).
     pub plane: &'a [u16],
-    /// Column stride of `plane` (`>= width`).
+    /// Column stride of `plane` (`>=` the PER-PLANE width — the
+    /// stride stays in this plane's own sample units).
     pub stride: usize,
-    /// §7.11.3.3 `RefUpscaledWidth[ refIdx ]` (per-plane samples).
+    /// §7.11.3.3 `RefUpscaledWidth[ refIdx ]` (LUMA samples — r405:
+    /// the §7.11.3.3 scale ratio and the §7.11.3.4 / §7.11.3.5 clamps
+    /// all take the luma extents and derive per-plane internally).
     pub upscaled_width: u32,
-    /// §7.11.3.3 `RefFrameWidth[ refIdx ]` (per-plane samples).
+    /// §7.11.3.3 `RefFrameWidth[ refIdx ]` (LUMA samples).
     pub width: u32,
-    /// §7.11.3.3 `RefFrameHeight[ refIdx ]` (per-plane samples).
+    /// §7.11.3.3 `RefFrameHeight[ refIdx ]` (LUMA samples).
     pub height: u32,
 }
 
@@ -5419,6 +5432,13 @@ pub fn reconstruct_inter_block_compound(
     interp_filter_x: u8,
     interp_filter_y: u8,
     diffwtd_mask: Option<&mut [u8]>,
+    // §7.11.3.1 step-7 warp context for the GLOBAL_GLOBALMV /
+    // GLOBALMV-class compound arm (`useWarp = 2` fires per refList
+    // when `GmType[ RefFrame[ refList ] ] > TRANSLATION` — §5.11.27
+    // forces `motion_mode = SIMPLE` on this block class, so the
+    // compound driver is its only route). `None` keeps the
+    // translational-only path.
+    warp: Option<&WarpDriverParams>,
     curr_plane: &mut [u16],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
@@ -5587,7 +5607,7 @@ pub fn reconstruct_inter_block_compound(
         &refs,
         Some(compound),
         /* inter_intra */ None,
-        /* warp */ None,
+        warp,
         /* obmc */ None,
         &mut pred_out,
     )?;
@@ -6167,9 +6187,9 @@ pub fn reconstruct_inter_intra_from_dispatch(
 /// §7.11.3.14 inter-intra blend is supplied to the walker bridge
 /// ([`crate::PartitionWalker::reconstruct_inter_intra_into_curr_frame`])
 /// through this descriptor: per plane, the resolved `FrameStore` slice
-/// plus the plane-space `(frame_width, frame_height)` and subsampling
-/// the inter prediction reads. Every field is the per-plane resolution
-/// of a §7.11.3 quantity, matching [`PlaneReconContext`].
+/// plus the `(frame_width, frame_height)` extents (LUMA samples, r405)
+/// and subsampling the inter prediction reads, matching
+/// [`PlaneReconContext`].
 #[derive(Debug, Clone, Copy)]
 pub struct PlaneRefSpec<'a> {
     /// `0` (Y), `1` (Cb), `2` (Cr). Must match a plane the walker has
@@ -6183,9 +6203,11 @@ pub struct PlaneRefSpec<'a> {
     /// resolved `refIdx`), per-plane resolved like
     /// [`RefFrameStoreEntry`].
     pub frame_store: &'a [RefFrameStoreEntry<'a>],
-    /// §7.11.3 `FrameWidth` resolved to this plane (samples).
+    /// §7.11.3 `FrameWidth` in LUMA samples (r405: no longer
+    /// per-plane — it feeds only the §7.11.3.3 scale ratio, which is
+    /// luma-derived for every plane).
     pub frame_width: u32,
-    /// §7.11.3 `FrameHeight` resolved to this plane (samples).
+    /// §7.11.3 `FrameHeight` in LUMA samples.
     pub frame_height: u32,
 }
 
@@ -6194,11 +6216,11 @@ pub struct PlaneRefSpec<'a> {
 /// [`reconstruct_inter_frame`] walk resolves `RefFrame[0]` against for
 /// this plane.
 ///
-/// Every field is the per-plane resolution of a §7.11.3 quantity (the
-/// caller applies the `>> subsampling_*` plane down-shift the same way
-/// [`PredictInterRef`] / [`RefFrameStoreEntry`] document): the
-/// `frame_store` planes, the `curr` buffer, and `(frame_width,
-/// frame_height)` are all in this plane's sample units.
+/// The `frame_store` plane BUFFERS and the `curr` buffer are in this
+/// plane's own sample units; the DIMENSION fields (`frame_width` /
+/// `frame_height` and the [`RefFrameStoreEntry`] extents) are LUMA
+/// samples (r405) — the §7.11.3.3/.4/.5 leaves derive the per-plane
+/// values internally, preserving odd-luma-extent parity.
 #[derive(Debug)]
 pub struct PlaneReconContext<'a> {
     /// `0` (Y), `1` (Cb), `2` (Cr).
@@ -6212,9 +6234,11 @@ pub struct PlaneReconContext<'a> {
     /// resolved `refIdx`); per-plane resolved like
     /// [`RefFrameStoreEntry`].
     pub frame_store: &'a [RefFrameStoreEntry<'a>],
-    /// §7.11.3 `FrameWidth` resolved to this plane (samples).
+    /// §7.11.3 `FrameWidth` in LUMA samples (r405: no longer
+    /// per-plane — it feeds only the §7.11.3.3 scale ratio, which is
+    /// luma-derived for every plane).
     pub frame_width: u32,
-    /// §7.11.3 `FrameHeight` resolved to this plane (samples).
+    /// §7.11.3 `FrameHeight` in LUMA samples.
     pub frame_height: u32,
     /// `CurrFrame[plane]` output buffer (row-major, `curr_stride`
     /// columns), large enough for `frame_height` rows.
@@ -6394,6 +6418,11 @@ pub struct GridWarpContext<'a> {
     /// step-7 derivation forces `useWarp = 0` on every leaf regardless of
     /// `motion_mode`.
     pub force_integer_mv: bool,
+    /// §5.11.27 `is_scaled( refFrame )` per raw `RefFrame` value
+    /// (`is_scaled[ ref ]`, entry 0 unused) — the §7.11.3.1 step-7
+    /// `useWarp = 2` global gate requires `is_scaled( refFrame ) ==
+    /// 0`. Length must be at least `ALTREF_FRAME + 1`.
+    pub is_scaled: &'a [bool],
 }
 
 /// §5.11.27 / §7.11.3.9-10 per-frame OBMC context for
@@ -7067,6 +7096,66 @@ pub(crate) fn reconstruct_inter_leaf_at(
             order_hint_ref1: grid.order_hints_by_ref[ref_frame1 as usize],
         };
 
+        // §7.11.3.1 step-7 warp context for the GLOBALMV-class
+        // compound leaf — `useWarp = 2` fires PER refList when that
+        // list's `GmType > TRANSLATION` (and `!is_scaled`, w/h ≥ 8,
+        // !force_integer_mv, §7.11.3.6 `warpValid` — all re-checked
+        // by `derive_use_warp`).
+        let comp_warp: Option<WarpDriverParams> = grid.warp.as_ref().and_then(|wc| {
+            let y_mode = wc.y_modes.get(origin).copied().unwrap_or(0);
+            if !matches!(
+                y_mode,
+                crate::cdf::MODE_GLOBALMV | crate::cdf::MODE_GLOBAL_GLOBALMV
+            ) {
+                return None;
+            }
+            let t0 = wc.gm_types.get(ref_frame0 as usize).copied().unwrap_or(0);
+            let t1 = wc.gm_types.get(ref_frame1 as usize).copied().unwrap_or(0);
+            if (t0 as i32) <= crate::cdf::GM_TYPE_TRANSLATION
+                && (t1 as i32) <= crate::cdf::GM_TYPE_TRANSLATION
+            {
+                return None;
+            }
+            let gm_of = |rf: usize| -> [i32; 6] {
+                let b = rf * 6;
+                [
+                    wc.gm_params[b],
+                    wc.gm_params[b + 1],
+                    wc.gm_params[b + 2],
+                    wc.gm_params[b + 3],
+                    wc.gm_params[b + 4],
+                    wc.gm_params[b + 5],
+                ]
+            };
+            const WARP_IDENTITY_MATRIX: [i32; 6] = [
+                0,
+                0,
+                1 << WARP_WARPEDMODEL_PREC_BITS,
+                0,
+                0,
+                1 << WARP_WARPEDMODEL_PREC_BITS,
+            ];
+            Some(WarpDriverParams {
+                y_mode: [y_mode, y_mode],
+                gm_type: [t0, t1],
+                gm_params: [gm_of(ref_frame0 as usize), gm_of(ref_frame1 as usize)],
+                // §7.11.3.1 step-7 clause 3 cannot fire (SIMPLE leaf).
+                local_warp_params: WARP_IDENTITY_MATRIX,
+                local_valid: false,
+                ref_is_scaled: [
+                    wc.is_scaled
+                        .get(ref_frame0 as usize)
+                        .copied()
+                        .unwrap_or(false),
+                    wc.is_scaled
+                        .get(ref_frame1 as usize)
+                        .copied()
+                        .unwrap_or(false),
+                ],
+                force_integer_mv: wc.force_integer_mv,
+            })
+        });
+
         for ctx in planes.iter_mut() {
             let sub_x = if ctx.plane > 0 { ctx.subsampling_x } else { 0 };
             let sub_y = if ctx.plane > 0 { ctx.subsampling_y } else { 0 };
@@ -7093,6 +7182,7 @@ pub(crate) fn reconstruct_inter_leaf_at(
                 interp_x,
                 interp_y,
                 diffwtd_mask.as_deref_mut(),
+                comp_warp.as_ref(),
                 ctx.curr,
                 ctx.curr_stride,
             )?;
@@ -7119,7 +7209,27 @@ pub(crate) fn reconstruct_inter_leaf_at(
     // invalid-fit windows, so a single per-leaf `WarpDriverParams`
     // is bit-correct across the §5.11.33 sub-block tiling).
     let leaf_warp: Option<WarpDriverParams> = grid.warp.as_ref().and_then(|wc| {
-        if wc.motion_modes.get(origin).copied() != Some(crate::cdf::MOTION_MODE_WARPED_CAUSAL) {
+        let is_warped_causal =
+            wc.motion_modes.get(origin).copied() == Some(crate::cdf::MOTION_MODE_WARPED_CAUSAL);
+        // §7.11.3.1 step 7: the `useWarp = 2` global arm fires for a
+        // GLOBALMV-class leaf whose `GmType[ RefFrame[0] ] >
+        // TRANSLATION` REGARDLESS of `motion_mode` (§5.11.27
+        // `read_motion_mode` forces SIMPLE on exactly this block
+        // class, so such leaves never carry WARPED_CAUSAL). Supply
+        // the warp context for them too; `derive_use_warp` re-checks
+        // the full gate (w/h ≥ 8, `force_integer_mv`,
+        // `!is_scaled( refFrame )`, §7.11.3.6 `warpValid`) and falls
+        // back to the translational kernel when any term fails.
+        let y_is_global = matches!(
+            wc.y_modes.get(origin).copied(),
+            Some(crate::cdf::MODE_GLOBALMV) | Some(crate::cdf::MODE_GLOBAL_GLOBALMV)
+        );
+        let gm_is_warp = wc
+            .gm_types
+            .get(ref_frame0 as usize)
+            .map(|&t| (t as i32) > crate::cdf::GM_TYPE_TRANSLATION)
+            .unwrap_or(false);
+        if !(is_warped_causal || (y_is_global && gm_is_warp)) {
             return None;
         }
         let lw_base = origin * 6;
@@ -7157,15 +7267,22 @@ pub(crate) fn reconstruct_inter_leaf_at(
             gm_type: [wc.gm_types[rf0], 0],
             gm_params: [gmp, WARP_IDENTITY_MATRIX],
             local_warp_params: lwp,
-            local_valid: wc.local_warp_valid[origin] != 0,
-            // §7.11.3.3: the single-ref translational arm already
-            // assumes non-scaled references throughout this walk
-            // (the §7.11.3.3 scaling is applied inside
-            // `block_inter_prediction`); the step-7 `useWarp = 2`
-            // global gate additionally requires `is_scaled ==
-            // false`, which holds for the references this walk
-            // reconstructs against.
-            ref_is_scaled: [false, false],
+            // §7.11.3.1 step-7 clause 3 gates on `motion_mode ==
+            // LOCALWARP && LocalValid` — a SIMPLE GLOBALMV leaf
+            // reaches this driver with `local_valid = false` so only
+            // the global arm can fire for it.
+            local_valid: is_warped_causal && wc.local_warp_valid[origin] != 0,
+            // §5.11.27 `is_scaled( refFrame )` — the step-7
+            // `useWarp = 2` global gate turns the warp OFF against a
+            // scaled reference (§7.11.3.1 p.257: `is_scaled(
+            // refFrame ) is equal to 0`).
+            ref_is_scaled: [
+                wc.is_scaled
+                    .get(ref_frame0 as usize)
+                    .copied()
+                    .unwrap_or(false),
+                false,
+            ],
             force_integer_mv: wc.force_integer_mv,
         })
     });
@@ -10999,6 +11116,7 @@ mod tests {
             gm_types: &gm_types,
             gm_params: &gm_params,
             force_integer_mv: false,
+            is_scaled: &[false; 8],
         };
         macro_rules! build_grid {
             ($warp:expr) => {
@@ -11194,6 +11312,7 @@ mod tests {
             gm_types: &full_gt,
             gm_params: &full_gp,
             force_integer_mv: false,
+            is_scaled: &[false; 8],
         };
         let _ = &full_mm;
         let grid = InterModeInfoGrid {
@@ -12165,6 +12284,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut curr,
             curr_w,
         )
@@ -12303,6 +12423,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut curr,
             w,
         )
@@ -12413,6 +12534,7 @@ mod tests {
                 EIGHTTAP,
                 EIGHTTAP,
                 None,
+                /* warp */ None,
                 curr,
                 stride,
             )
@@ -12608,6 +12730,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )
@@ -12644,6 +12767,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )
@@ -12763,6 +12887,7 @@ mod tests {
                 EIGHTTAP,
                 EIGHTTAP,
                 None,
+                /* warp */ None,
                 &mut got,
                 curr_w,
             )
@@ -12971,6 +13096,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )
@@ -13124,6 +13250,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             Some(&mut oracle_mask),
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )
@@ -13172,6 +13299,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut avg,
             curr_w,
         )

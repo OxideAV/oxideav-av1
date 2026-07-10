@@ -926,6 +926,12 @@ pub struct PartitionSyntaxWriter {
     mi_cols: u32,
     geometry: TileGeometry,
     mirror: PartitionWalker,
+    /// §5.11.2 / §5.11.7 `ReadDeltas` lifecycle bit, write-side twin
+    /// of the decode walker's — only the FIRST block of a superblock
+    /// codes the §5.11.12 / §5.11.13 delta syntax (§5.11.7 line 11
+    /// `ReadDeltas = 0`). Re-armed via [`Self::arm_read_deltas`] at
+    /// every superblock entry.
+    write_deltas_pending: bool,
 }
 
 impl PartitionSyntaxWriter {
@@ -943,7 +949,16 @@ impl PartitionSyntaxWriter {
             mi_cols,
             geometry,
             mirror,
+            write_deltas_pending: true,
         })
+    }
+
+    /// §5.11.2 `ReadDeltas = delta_q_present` — re-arm the write-side
+    /// delta lifecycle at a superblock entry (the §5.11.7 line-11
+    /// clear happens inside [`write_block_syntax`] after the first
+    /// block's delta pair is coded).
+    pub fn arm_read_deltas(&mut self) {
+        self.write_deltas_pending = true;
     }
 
     /// The encoder-side neighbour-grid mirror (read-only view, e.g.
@@ -1307,14 +1322,17 @@ pub fn write_block_syntax(
         anchor_already_stamped,
     )?;
 
-    // §5.11.7 line 9: `read_delta_qindex( )`.
+    // §5.11.7 line 9: `read_delta_qindex( )` — gated by the §5.11.2
+    // per-superblock `ReadDeltas` lifecycle bit (only the FIRST block
+    // of a superblock codes deltas; §5.11.7 line 11 clears the bit).
+    let block_write_deltas = params.read_deltas && state.write_deltas_pending;
     write_delta_qindex(
         writer,
         cdfs,
         sub_size,
         block.reduced_delta_q_index,
         block.skip,
-        params.read_deltas,
+        block_write_deltas,
         params.use_128x128_superblock,
         params.delta_q_res,
     )?;
@@ -1326,13 +1344,15 @@ pub fn write_block_syntax(
         sub_size,
         &block.reduced_delta_lf,
         block.skip,
-        params.read_deltas,
+        block_write_deltas,
         params.delta_lf_present,
         params.delta_lf_multi,
         params.mono_chrome,
         params.use_128x128_superblock,
         params.delta_lf_res,
     )?;
+    // §5.11.7 line 11: `ReadDeltas = 0`.
+    state.write_deltas_pending = false;
 
     // §6.8.2 per-segment `Lossless` + the §5.11.15 spec-forced
     // default `TxSize = Lossless ? TX_4X4 : Max_Tx_Size_Rect[ MiSize ]`.
@@ -3629,18 +3649,20 @@ mod tests {
         params.delta_lf_present = true;
         params.delta_lf_res = 1;
 
+        // §5.11.7 line 11 `ReadDeltas = 0`: only the superblock's
+        // FIRST block codes the §5.11.12/§5.11.13 delta syntax — the
+        // later leaves MUST carry zero deltas (the write side rejects
+        // a non-zero delta it can no longer code).
         let mut nw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         nw.segment_id = 2;
         nw.reduced_delta_q_index = 3;
         nw.reduced_delta_lf = [1, 0, 0, 0];
         let mut ne = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         ne.segment_id = 1;
-        ne.reduced_delta_q_index = -2;
         let mut sw = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         sw.segment_id = 0;
         let mut se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
         se.segment_id = 3;
-        se.reduced_delta_lf = [-2, 0, 0, 0];
 
         let node = SyntaxNode::Split([
             Box::new(SyntaxNode::Leaf(Box::new(nw))),
@@ -3658,10 +3680,11 @@ mod tests {
                 "SegmentIds stamp at ({r0}, {c0})"
             );
         }
-        // §5.11.12 accumulator: 0 +12 -8 ⇒ Clip3(1, 255, ..) = 4.
-        assert_eq!(walker.current_q_index(), 4, "CurrentQIndex accumulation");
-        // §5.11.13 accumulator: 0 +2 -4 = -2 on LF index 0.
-        assert_eq!(walker.current_delta_lf()[0], -2, "DeltaLF[0] accumulation");
+        // §5.11.12 accumulator: 0 + (3 << 2) ⇒ Clip3(1, 255, 12) = 12
+        // (only the first leaf's delta is coded — §5.11.7 line 11).
+        assert_eq!(walker.current_q_index(), 12, "CurrentQIndex accumulation");
+        // §5.11.13 accumulator: 0 + (1 << 1) = 2 on LF index 0.
+        assert_eq!(walker.current_delta_lf()[0], 2, "DeltaLF[0] accumulation");
     }
 
     /// r283/r284 scope guards: §5.11.16 (`tx_mode_select`) write

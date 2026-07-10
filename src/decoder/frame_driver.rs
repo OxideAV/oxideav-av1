@@ -496,13 +496,19 @@ fn decode_frame_spec_full(
             let arr: [RefFrameStoreEntry<'_>; NUM_REF_FRAMES as usize] =
                 core::array::from_fn(|slot| match st.slots[slot].as_ref() {
                     Some(s) if plane < s.planes.len() => {
-                        let (w, h) = s.plane_dims[plane];
+                        let (w, _h) = s.plane_dims[plane];
+                        // r405: the dimension fields carry the stored
+                        // frame's LUMA extents (§7.11.3.3 scale ratio +
+                        // §7.11.3.4/.5 clamps derive per-plane
+                        // internally); only the buffer + stride are in
+                        // this plane's own sample units.
+                        let (lw, lh) = s.plane_dims[0];
                         RefFrameStoreEntry {
                             plane: &s.planes[plane],
                             stride: w as usize,
-                            upscaled_width: w,
-                            width: w,
-                            height: h,
+                            upscaled_width: lw,
+                            width: lw,
+                            height: lh,
                         }
                     }
                     _ => dummy_entry(),
@@ -548,16 +554,12 @@ fn decode_frame_spec_full(
             subsampling_x: if p > 0 { sub_x_u8 } else { 0 },
             subsampling_y: if p > 0 { sub_y_u8 } else { 0 },
             frame_store: &plane_stores[p],
-            frame_width: if p == 0 {
-                fs.frame_width
-            } else {
-                (fs.frame_width + u32::from(sub_x_u8)) >> sub_x_u8
-            },
-            frame_height: if p == 0 {
-                fs.frame_height
-            } else {
-                (fs.frame_height + u32::from(sub_y_u8)) >> sub_y_u8
-            },
+            // r405: LUMA extents for every plane — the §7.11.3.3
+            // scale ratio is luma-derived (an odd `FrameWidth` such
+            // as a 213-wide resized frame has no faithful per-plane
+            // representation).
+            frame_width: fs.frame_width,
+            frame_height: fs.frame_height,
         })
         .collect();
     let pixels = InterWalkPixels {
@@ -665,6 +667,13 @@ fn decode_frame_spec_full(
             mi_col_start: ti.mi_col_starts[tile_col as usize],
             mi_col_end: ti.mi_col_starts[tile_col as usize + 1],
         });
+        // §5.11.1 per-tile prologue: `CurrentQIndex = base_q_idx` —
+        // the §5.11.12 running delta-q accumulator restarts from the
+        // frame quantiser at every tile (r405: it previously started
+        // from the walker-construction zero, so every
+        // `delta_q_present` stream dequantised against a garbage
+        // base).
+        walker.set_current_q_index(i32::from(qp.base_q_idx));
         let mut decoder =
             SymbolDecoder::init_symbol(&tile.bytes, tile.bytes.len(), fh.disable_cdf_update)?;
         let mut cdfs = frame_start_cdfs.as_ref().clone();

@@ -15449,6 +15449,13 @@ pub struct PartitionWalker {
     /// pre-Clip3 sum is a signed quantity (the spec writes
     /// `CurrentQIndex + (reducedDeltaQIndex << delta_q_res)`).
     current_q_index: i32,
+    /// §5.11.2 / §5.11.7 / §5.11.18 `ReadDeltas` lifecycle bit — set
+    /// (to the frame's `delta_q_present`) at every superblock entry
+    /// by the §5.11.2 tile loop, cleared by the FIRST block's
+    /// §5.11.7/§5.11.18 `ReadDeltas = 0` line after its
+    /// `read_delta_qindex()` / `read_delta_lf()` pair, so exactly one
+    /// block per superblock consumes the delta symbols.
+    read_deltas_pending: bool,
     /// `DeltaLF[ i ]` (§5.11.2 / §5.11.13) — the four running
     /// loop-filter-strength deltas. §5.11.2 `decode_tile()` resets
     /// every slot to `0` at tile entry; §5.11.13 updates one (when
@@ -16318,6 +16325,10 @@ impl PartitionWalker {
             skips,
             skip_modes,
             current_q_index: 0,
+            // Callers that drive `decode_partition_syntax` directly
+            // (without the §5.11.2 tile loop) get the historical
+            // behaviour of their first leaf consuming the deltas.
+            read_deltas_pending: true,
             current_delta_lf: [0; FRAME_LF_COUNT],
             delta_lfs,
             cdef_idx,
@@ -17649,6 +17660,7 @@ impl PartitionWalker {
             interp_filter_x,
             interp_filter_y,
             diffwtd_arg,
+            /* warp */ None,
             mirror.as_mut_slice(),
             buf_cols,
         )?;
@@ -17824,6 +17836,7 @@ impl PartitionWalker {
                 interp_filter_x,
                 interp_filter_y,
                 diffwtd_arg,
+                /* warp */ None,
                 mirror.as_mut_slice(),
                 buf_cols,
             )?;
@@ -18667,6 +18680,12 @@ impl PartitionWalker {
             gm_types_u8[r] = ctx.gm_type[r] as u8;
             gm_flat[r * 6..r * 6 + 6].copy_from_slice(&ctx.gm_params[r]);
         }
+        // §5.11.27 `is_scaled( refFrame )` by raw RefFrame value —
+        // the §7.11.3.1 step-7 `useWarp = 2` global gate consumes it.
+        let mut is_scaled_by_ref = [false; 8];
+        for (i, s) in ctx.is_scaled_per_ref.iter().enumerate() {
+            is_scaled_by_ref[crate::uncompressed_header_tail::LAST_FRAME + i] = *s;
+        }
 
         // Drive the shared per-leaf walk. Field-split borrows: the grid
         // views borrow the walker's grid vectors immutably while the
@@ -18708,6 +18727,7 @@ impl PartitionWalker {
                     gm_types: &gm_types_u8,
                     gm_params: &gm_flat,
                     force_integer_mv: ctx.force_integer_mv,
+                    is_scaled: &is_scaled_by_ref,
                 }),
                 obmc: Some(crate::GridObmcContext {
                     motion_modes: &self.motion_modes,
@@ -18917,8 +18937,15 @@ impl PartitionWalker {
                 subsampling_y,
                 &win,
                 win_w,
-                win_w as u32,
-                win_h as u32,
+                // r405 contract: `block_inter_prediction` takes the
+                // clamp extents in LUMA samples and re-derives the
+                // per-plane `lastX`/`lastY`. The window is already a
+                // per-plane construct, so lift its extents back:
+                // `(((n << s) + s) >> s) - 1 == n - 1` for either
+                // parity, landing the clamp exactly on the window
+                // edge rows/cols (which ARE the plane-clamp extremes).
+                (win_w as u32) << sub_x,
+                (win_h as u32) << sub_y,
                 scale.start_x - (x0 << crate::inter_pred::SCALE_SUBPEL_BITS),
                 scale.start_y - (y0 << crate::inter_pred::SCALE_SUBPEL_BITS),
                 scale.step_x,
@@ -23174,7 +23201,11 @@ impl PartitionWalker {
 
         // §5.11.7 line 9: `read_delta_qindex( )`. Routes through r154
         // `decode_delta_qindex` with the caller-passed `ReadDeltas`
-        // flag. Updates `Self::current_q_index` in place.
+        // flag, additionally gated by the §5.11.2 per-superblock
+        // `ReadDeltas` lifecycle bit (only the superblock's FIRST
+        // block reads — §5.11.7 clears `ReadDeltas` right after).
+        // Updates `Self::current_q_index` in place.
+        let block_read_deltas = read_deltas && self.read_deltas_pending;
         let current_q_index = self.decode_delta_qindex(
             decoder,
             cdfs,
@@ -23182,7 +23213,7 @@ impl PartitionWalker {
             mi_col,
             sub_size,
             skip,
-            read_deltas,
+            block_read_deltas,
             use_128x128_superblock,
             delta_q_res,
         )?;
@@ -23200,13 +23231,16 @@ impl PartitionWalker {
             mi_col,
             sub_size,
             skip,
-            read_deltas,
+            block_read_deltas,
             delta_lf_present,
             delta_lf_multi,
             mono_chrome,
             use_128x128_superblock,
             delta_lf_res,
         )?;
+        // §5.11.7 line 11: `ReadDeltas = 0` — subsequent blocks of
+        // this superblock skip the §5.11.12/§5.11.13 reads.
+        self.read_deltas_pending = false;
         // §5.11.5 `DeltaLFs[ r + y ][ c + x ][ i ] = DeltaLF[ i ]`
         // grid-fill — snapshot the (now-final) §5.11.13 accumulator over
         // the block footprint so the §7.14.4 deblock reads the per-mi
@@ -23865,7 +23899,10 @@ impl PartitionWalker {
             cdef_bits,
         )?;
 
-        // §5.11.18 line 19: `read_delta_qindex( )`.
+        // §5.11.18 line 19: `read_delta_qindex( )` — gated by the
+        // §5.11.2 per-superblock `ReadDeltas` lifecycle bit (see the
+        // §5.11.7 twin site).
+        let block_read_deltas = read_deltas && self.read_deltas_pending;
         let current_q_index = self.decode_delta_qindex(
             decoder,
             cdfs,
@@ -23873,7 +23910,7 @@ impl PartitionWalker {
             mi_col,
             sub_size,
             skip,
-            read_deltas,
+            block_read_deltas,
             use_128x128_superblock,
             delta_q_res,
         )?;
@@ -23886,13 +23923,15 @@ impl PartitionWalker {
             mi_col,
             sub_size,
             skip,
-            read_deltas,
+            block_read_deltas,
             delta_lf_present,
             delta_lf_multi,
             mono_chrome,
             use_128x128_superblock,
             delta_lf_res,
         )?;
+        // §5.11.18 line 21: `ReadDeltas = 0`.
+        self.read_deltas_pending = false;
         // §5.11.5 `DeltaLFs[][][]` per-mi snapshot grid-fill (see the
         // intra-arm twin above). No-op on `delta_lf_present == 0`.
         self.stamp_delta_lfs(mi_row, mi_col, sub_size);
@@ -29817,8 +29856,14 @@ impl PartitionWalker {
         // derivation (the §5.11.42 `use_filter_intra` →
         // `Filter_Intra_Mode_To_Intra_Dir` remap) so the
         // `intra_tx_type` CDF axis agrees with the write side.
+        // §7.12.2 `get_qindex( 0, segment_id )` reads `CurrentQIndex`
+        // — the §5.11.12 per-superblock running value, NOT the frame
+        // `base_q_idx` (they differ exactly when `delta_q_present ==
+        // 1`; the r405 deltaq streams shift every block's dequant).
+        let mut block_quant = *quant;
+        block_quant.current_q_index = prefix.current_q_index.clamp(0, 255) as u8;
         let neutral_ctx = ResidualContext {
-            quant: *quant,
+            quant: block_quant,
             reduced_tx_set,
             intra_dir: intra_dir(
                 use_filter_intra == Some(1),
@@ -30328,8 +30373,12 @@ impl PartitionWalker {
         // replace the historical neutral pair, so the §5.11.47
         // `transform_type()` guard + §5.11.48 `get_tx_set()` reduction
         // + §7.12.3 dequant reflect the real frame quantiser.
+        // §7.12.2: dequant reads the §5.11.12 `CurrentQIndex` running
+        // value (r405 — see the intra arm's note).
+        let mut block_quant = *quant;
+        block_quant.current_q_index = info.current_q_index.clamp(0, 255) as u8;
         let neutral_ctx = ResidualContext {
-            quant: *quant,
+            quant: block_quant,
             reduced_tx_set,
             intra_dir: 0,
             segment_id: info.segment_id,
@@ -30580,8 +30629,12 @@ impl PartitionWalker {
 
         // §5.11.5 line `residual( )` — the full intra `ResidualContext`
         // (mode-info + the caller-threaded §5.9.12 quantiser pair).
+        // §7.12.2: dequant reads the §5.11.12 `CurrentQIndex` running
+        // value (r405 — see the intra arm's note).
+        let mut block_quant = *quant;
+        block_quant.current_q_index = info.current_q_index.clamp(0, 255) as u8;
         let res_ctx = ResidualContext {
-            quant: *quant,
+            quant: block_quant,
             reduced_tx_set,
             intra_dir: intra_dir(
                 use_filter_intra == Some(1),
@@ -32758,6 +32811,14 @@ impl PartitionWalker {
                     params.subsampling_x,
                     params.subsampling_y,
                 );
+                // §5.11.2 `ReadDeltas = delta_q_present` — re-armed at
+                // every superblock; the first block's §5.11.7/§5.11.18
+                // `ReadDeltas = 0` line disarms it (r405: the walker
+                // previously read the §5.11.12/§5.11.13 delta symbols
+                // at EVERY leaf, desynchronising the arithmetic
+                // decoder from the second leaf of the first
+                // delta-signalling superblock onwards).
+                self.read_deltas_pending = true;
                 // §5.11.2 `read_lr( r, c, sbSize )` — the §5.11.57
                 // per-superblock loop-restoration unit reads, ahead of
                 // the partition walk.
@@ -62747,6 +62808,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )
@@ -63049,6 +63111,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             Some(shared_mask.as_mut_slice()),
+            /* warp */ None,
             &mut oy,
             lw,
         )
@@ -63071,6 +63134,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             Some(shared_mask.as_mut_slice()),
+            /* warp */ None,
             &mut ocb,
             cw,
         )
@@ -63093,6 +63157,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             Some(shared_mask.as_mut_slice()),
+            /* warp */ None,
             &mut ocr,
             cw,
         )
@@ -63199,6 +63264,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             Some(fresh_mask.as_mut_slice()),
+            /* warp */ None,
             &mut cb_wrong,
             cw,
         )
