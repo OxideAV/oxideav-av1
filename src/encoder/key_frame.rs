@@ -92,15 +92,15 @@
 
 use crate::cdf::{
     dequantize_step1, get_tx_size, intra_tx_type_set, is_tx_type_in_set, tx_size_sqr_index,
-    QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, D45_PRED,
-    D67_PRED, DCT_DCT, DC_PRED, H_PRED, INTRA_MODES, MAX_TX_SIZE_RECT, MODE_TO_TXFM,
+    QuantizerParams, TileCdfContext, TileGeometry, ANGLE_STEP, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
+    D67_PRED, DCT_DCT, DC_PRED, H_PRED, INTRA_MODES, MAX_TX_SIZE_RECT, MODE_TO_ANGLE, MODE_TO_TXFM,
     NUM_4X4_BLOCKS_WIDE, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4, TX_HEIGHT,
     TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_PRED,
 };
 use crate::cdf::{
-    predict_intra_d_mode, predict_intra_dc_pred, predict_intra_h_pred, predict_intra_paeth_pred,
-    predict_intra_smooth_h_pred, predict_intra_smooth_pred, predict_intra_smooth_v_pred,
-    predict_intra_v_pred,
+    predict_intra_dc_pred, predict_intra_directional, predict_intra_h_pred,
+    predict_intra_paeth_pred, predict_intra_smooth_h_pred, predict_intra_smooth_pred,
+    predict_intra_smooth_v_pred, predict_intra_v_pred,
 };
 use crate::encoder::forward_quantize::forward_quantize;
 use crate::encoder::forward_transform_2d::forward_transform_2d;
@@ -616,10 +616,16 @@ fn build_tu_neighbours(
 /// §7.11.2 mode dispatch over pre-built head-extended neighbour
 /// arrays — the same kernel routing the decode walker performs for
 /// this driver's header set (`enable_intra_edge_filter = 0`,
-/// `use_filter_intra = 0`, `angle_delta = 0` ⇒ no §7.11.2.4 step-4
-/// pre-pass, `upsampleAbove = upsampleLeft = 0`).
+/// `use_filter_intra = 0` ⇒ no §7.11.2.4 step-4 pre-pass,
+/// `upsampleAbove = upsampleLeft = 0`). `angle_delta` (r410, in
+/// `-3..=3`) shifts the §7.11.2.4 projection angle by
+/// `ANGLE_STEP * delta` for the directional modes; a V_PRED / H_PRED
+/// with a non-zero delta becomes fully directional per §7.11.2.1
+/// (only the exact 90°/180° cases take the plain copies).
+#[allow(clippy::too_many_arguments)]
 fn predict_mode_from_neighbours(
     mode: usize,
+    angle_delta: i32,
     w: usize,
     h: usize,
     above_ext: &[u16],
@@ -648,11 +654,23 @@ fn predict_mode_from_neighbours(
             &mut pred,
         )
         .is_ok(),
-        m if m == V_PRED => predict_intra_v_pred(w, h, above_row, &mut pred).is_ok(),
-        m if m == H_PRED => predict_intra_h_pred(w, h, left_col, &mut pred).is_ok(),
-        m if (D45_PRED..=D67_PRED).contains(&m) => {
-            predict_intra_d_mode(m, 0, w, h, 0, 0, above_ext, left_ext, &mut pred).is_ok()
+        m if m == V_PRED && angle_delta == 0 => {
+            predict_intra_v_pred(w, h, above_row, &mut pred).is_ok()
         }
+        m if m == H_PRED && angle_delta == 0 => {
+            predict_intra_h_pred(w, h, left_col, &mut pred).is_ok()
+        }
+        m if (V_PRED..=D67_PRED).contains(&m) => predict_intra_directional(
+            w,
+            h,
+            MODE_TO_ANGLE[m] + angle_delta * ANGLE_STEP,
+            0,
+            0,
+            above_ext,
+            left_ext,
+            &mut pred,
+        )
+        .is_ok(),
         m if m == SMOOTH_PRED => {
             predict_intra_smooth_pred(log2_w, log2_h, w, h, above_row, left_col, &mut pred).is_ok()
         }
@@ -684,13 +702,23 @@ fn predict_tu(
     w: usize,
     h: usize,
     mode: usize,
+    angle_delta: i32,
 ) -> Vec<u8> {
     let (buf, pw, ph) = recon.plane(plane);
     let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, plane, start_x, start_y, w, h);
     let (above_ext, left_ext, have_above, have_left) =
         build_tu_neighbours(buf, pw, ph, start_x, start_y, w, h, avail_ar, avail_bl);
-    predict_mode_from_neighbours(mode, w, h, &above_ext, &left_ext, have_above, have_left)
-        .expect("supported intra mode always predicts")
+    predict_mode_from_neighbours(
+        mode,
+        angle_delta,
+        w,
+        h,
+        &above_ext,
+        &left_ext,
+        have_above,
+        have_left,
+    )
+    .expect("supported intra mode always predicts")
 }
 
 /// §3 `Round2Signed(x, n)`.
@@ -825,11 +853,31 @@ fn residual_tx(
 // Mode pickers.
 // ---------------------------------------------------------------------
 
-/// SSD-minimising luma mode pick over ALL 13 §6.10.x intra modes for
-/// one `n × n` block (recon-neighbour prediction at whole-block
-/// extent, input-target SSD). The neighbour build uses the same
-/// `BlockDecoded[]` state the block's first luma TU will observe.
-fn pick_y_mode(recon: &ReconState, input: &Yuv420Frame, row0: usize, col0: usize, n: usize) -> u8 {
+/// §5.11.42/§5.11.43 angle-delta candidate range for a mode: the
+/// directional modes (`V_PRED..=D67_PRED`) search the full `-3..=3`
+/// span when the block is `>= BLOCK_8X8` (below that no angle symbol
+/// is coded and the delta is spec-forced to 0); everything else is 0.
+fn angle_delta_candidates(mode: usize, n: usize) -> core::ops::RangeInclusive<i32> {
+    if (V_PRED..=D67_PRED).contains(&mode) && n >= 8 {
+        -3..=3
+    } else {
+        0..=0
+    }
+}
+
+/// SSD-minimising luma (mode, angle_delta) pick over ALL 13 §6.10.x
+/// intra modes — the directional modes additionally search the
+/// §5.11.42 `-3..=3` angle-delta span (r410) — for one `n × n` block
+/// (recon-neighbour prediction at whole-block extent, input-target
+/// SSD). The neighbour build uses the same `BlockDecoded[]` state the
+/// block's first luma TU will observe.
+fn pick_y_mode(
+    recon: &ReconState,
+    input: &Yuv420Frame,
+    row0: usize,
+    col0: usize,
+    n: usize,
+) -> (u8, i8) {
     let (avail_ar, avail_bl) = tu_corner_avail(&recon.bd, 0, col0, row0, n, n);
     let (above_ext, left_ext, have_above, have_left) = build_tu_neighbours(
         &recon.y,
@@ -842,28 +890,30 @@ fn pick_y_mode(recon: &ReconState, input: &Yuv420Frame, row0: usize, col0: usize
         avail_ar,
         avail_bl,
     );
-    let mut best_mode = DC_PRED as u8;
+    let mut best = (DC_PRED as u8, 0i8);
     let mut best_ssd = u64::MAX;
     for mode in 0..INTRA_MODES {
-        let Some(pred) =
-            predict_mode_from_neighbours(mode, n, n, &above_ext, &left_ext, have_above, have_left)
-        else {
-            continue;
-        };
-        let mut ssd = 0u64;
-        for i in 0..n {
-            for j in 0..n {
-                let d =
-                    input.y[(row0 + i) * recon.width + (col0 + j)] as i64 - pred[i * n + j] as i64;
-                ssd += (d * d) as u64;
+        for delta in angle_delta_candidates(mode, n) {
+            let Some(pred) = predict_mode_from_neighbours(
+                mode, delta, n, n, &above_ext, &left_ext, have_above, have_left,
+            ) else {
+                continue;
+            };
+            let mut ssd = 0u64;
+            for i in 0..n {
+                for j in 0..n {
+                    let d = input.y[(row0 + i) * recon.width + (col0 + j)] as i64
+                        - pred[i * n + j] as i64;
+                    ssd += (d * d) as u64;
+                }
+            }
+            if ssd < best_ssd {
+                best_ssd = ssd;
+                best = (mode as u8, delta as i8);
             }
         }
-        if ssd < best_ssd {
-            best_ssd = ssd;
-            best_mode = mode as u8;
-        }
     }
-    best_mode
+    best
 }
 
 /// Joint U+V picker over the 13 §6.10.x modes plus the §7.11.5.3
@@ -877,9 +927,13 @@ fn pick_uv_mode(
     ccol0: usize,
     cn: usize,
     cfl_allowed: bool,
+    // §5.11.43 gate operand: the block's LUMA extent (`Block_Width[
+    // MiSize ]`) — angle deltas are coded for `MiSize >= BLOCK_8X8`
+    // regardless of the subsampled chroma extent.
+    luma_n: usize,
     max_luma_w: usize,
     max_luma_h: usize,
-) -> (u8, Option<(i8, i8)>) {
+) -> (u8, i8, Option<(i8, i8)>) {
     let pw = recon.chroma_w;
     let (ar_u, bl_u) = tu_corner_avail(&recon.bd, 1, ccol0, crow0, cn, cn);
     let (above_u, left_u, ha_u, hl_u) = build_tu_neighbours(
@@ -918,30 +972,34 @@ fn pick_uv_mode(
         ssd
     };
     let mut best_mode = DC_PRED as u8;
+    let mut best_delta = 0i8;
     let mut best_alpha: Option<(i8, i8)> = None;
     let mut best_ssd = u64::MAX;
     let mut dc_pred_u: Vec<u8> = Vec::new();
     let mut dc_pred_v: Vec<u8> = Vec::new();
     for mode in 0..INTRA_MODES {
-        let Some(pred_u) =
-            predict_mode_from_neighbours(mode, cn, cn, &above_u, &left_u, ha_u, hl_u)
-        else {
-            continue;
-        };
-        let Some(pred_v) =
-            predict_mode_from_neighbours(mode, cn, cn, &above_v, &left_v, ha_v, hl_v)
-        else {
-            continue;
-        };
-        let ssd = ssd_uv(&pred_u, &pred_v);
-        if mode == DC_PRED {
-            dc_pred_u = pred_u;
-            dc_pred_v = pred_v;
-        }
-        if ssd < best_ssd {
-            best_ssd = ssd;
-            best_mode = mode as u8;
-            best_alpha = None;
+        for delta in angle_delta_candidates(mode, luma_n) {
+            let Some(pred_u) =
+                predict_mode_from_neighbours(mode, delta, cn, cn, &above_u, &left_u, ha_u, hl_u)
+            else {
+                continue;
+            };
+            let Some(pred_v) =
+                predict_mode_from_neighbours(mode, delta, cn, cn, &above_v, &left_v, ha_v, hl_v)
+            else {
+                continue;
+            };
+            let ssd = ssd_uv(&pred_u, &pred_v);
+            if mode == DC_PRED {
+                dc_pred_u = pred_u;
+                dc_pred_v = pred_v;
+            }
+            if ssd < best_ssd {
+                best_ssd = ssd;
+                best_mode = mode as u8;
+                best_delta = delta as i8;
+                best_alpha = None;
+            }
         }
     }
     if cfl_allowed {
@@ -974,11 +1032,12 @@ fn pick_uv_mode(
             if ssd < best_ssd {
                 best_ssd = ssd;
                 best_mode = UV_CFL_PRED as u8;
+                best_delta = 0;
                 best_alpha = Some((au, av));
             }
         }
     }
-    (best_mode, best_alpha)
+    (best_mode, best_delta, best_alpha)
 }
 
 // ---------------------------------------------------------------------
@@ -1037,7 +1096,7 @@ fn encode_leaf_sq(
     let qp = recon.qp;
 
     // --- Luma ---
-    let y_mode = pick_y_mode(recon, input, row0, col0, n);
+    let (y_mode, angle_delta_y) = pick_y_mode(recon, input, row0, col0, n);
     let luma_tx = if lossless {
         TX_4X4
     } else {
@@ -1050,7 +1109,16 @@ fn encode_leaf_sq(
         let mut tx = 0usize;
         while tx < n {
             let (tr, tc) = (row0 + ty, col0 + tx);
-            let pred = predict_tu(recon, 0, tc, tr, ltw, lth, y_mode as usize);
+            let pred = predict_tu(
+                recon,
+                0,
+                tc,
+                tr,
+                ltw,
+                lth,
+                y_mode as usize,
+                angle_delta_y as i32,
+            );
             let q = residual_tx(
                 &input.y,
                 &mut recon.y,
@@ -1080,6 +1148,7 @@ fn encode_leaf_sq(
         (mi_r & 1) != 0 && (mi_c & 1) != 0
     };
     let mut uv_mode: Option<u8> = None;
+    let mut angle_delta_uv = 0i8;
     let mut cfl_alpha: Option<(i8, i8)> = None;
     if has_chroma {
         let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
@@ -1101,17 +1170,19 @@ fn encode_leaf_sq(
         // Chroma extent of this leaf's residual grid (§5.11.38
         // subsampled plane size; BLOCK_4X4 leaves keep the full 4×4).
         let cn = if b_size >= BLOCK_8X8 { n / 2 } else { 4 };
-        let (m, alpha) = pick_uv_mode(
+        let (m, delta_uv, alpha) = pick_uv_mode(
             recon,
             input,
             crow0,
             ccol0,
             cn,
             cfl_allowed,
+            n,
             max_luma_w,
             max_luma_h,
         );
         uv_mode = Some(m);
+        angle_delta_uv = delta_uv;
         cfl_alpha = alpha;
         let is_cfl = m as usize == UV_CFL_PRED;
         let chroma_tx_type = chroma_tx_type_for(m, chroma_tx, lossless);
@@ -1130,7 +1201,7 @@ fn encode_leaf_sq(
                     // §5.11.35: a CFL chroma TU writes the DC_PRED
                     // base, then §7.11.5 layers the luma AC on top.
                     let pred = if is_cfl {
-                        let dc = predict_tu(recon, plane, tc, tr, ctw, cth, DC_PRED);
+                        let dc = predict_tu(recon, plane, tc, tr, ctw, cth, DC_PRED, 0);
                         cfl_layer(
                             &dc,
                             &recon.y,
@@ -1144,7 +1215,7 @@ fn encode_leaf_sq(
                             max_luma_h,
                         )
                     } else {
-                        predict_tu(recon, plane, tc, tr, ctw, cth, m as usize)
+                        predict_tu(recon, plane, tc, tr, ctw, cth, m as usize, delta_uv as i32)
                     };
                     let plane_buf = if plane == 1 {
                         &mut recon.u
@@ -1196,8 +1267,8 @@ fn encode_leaf_sq(
         intrabc_mv: None,
         y_mode,
         uv_mode,
-        angle_delta_y: 0,
-        angle_delta_uv: 0,
+        angle_delta_y,
+        angle_delta_uv,
         cfl_alpha_u,
         cfl_alpha_v,
         use_filter_intra: 0,

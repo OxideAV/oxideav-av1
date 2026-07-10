@@ -201,6 +201,42 @@ fn key_frame_extreme_aspect_ratios_round_trip() {
     assert_key_frame_round_trip(72, 56, 35);
 }
 
+/// r410: diagonal stripe fields at non-45° slopes make the mode picker
+/// select directional D-modes with non-zero §5.11.42/§5.11.43 angle
+/// deltas (verified during the round via a pick-probe); the streams
+/// must stay byte-exact through the spec driver.
+#[test]
+fn key_frame_directional_angle_delta_content_round_trips() {
+    let (w, h) = (96usize, 96usize);
+    let mut f = Yuv420Frame::filled(w as u32, h as u32, 0);
+    for i in 0..h {
+        for j in 0..w {
+            let a = (2 * i + j) % 23; // slope -1/2
+            let b = (i + 3 * j) % 31; // slope -3
+            f.y[i * w + j] = (40 + a * 6 + b * 2) as u8;
+        }
+    }
+    let (cw, ch) = (w / 2, h / 2);
+    for i in 0..ch {
+        for j in 0..cw {
+            f.u[i * cw + j] = (100 + (2 * i + j) % 40) as u8;
+            f.v[i * cw + j] = (90 + (i + 2 * j) % 50) as u8;
+        }
+    }
+    for q in [0u8, 35, 130, 255] {
+        let enc = encode_key_frame_yuv420_with_q(&f, q).unwrap();
+        let frames = decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(frames[0].planes[0], enc.recon_y, "diag q={q} luma");
+        assert_eq!(frames[0].planes[1], enc.recon_u, "diag q={q} U");
+        assert_eq!(frames[0].planes[2], enc.recon_v, "diag q={q} V");
+        if q == 0 {
+            assert_eq!(frames[0].planes[0], f.y, "diag lossless != input");
+            assert_eq!(frames[0].planes[1], f.u);
+            assert_eq!(frames[0].planes[2], f.v);
+        }
+    }
+}
+
 #[test]
 fn key_frame_flat_grey_is_all_skip_and_tiny() {
     // Flat mid-grey: DC prediction is exact at every leaf, so every
