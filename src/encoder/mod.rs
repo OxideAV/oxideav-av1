@@ -254,6 +254,7 @@ pub mod forward_wht;
 pub mod frame_obu;
 pub mod inter_predict;
 pub mod ivf;
+pub mod key_frame;
 pub mod loop_restoration_write;
 pub mod obu;
 pub mod partition;
@@ -301,6 +302,9 @@ pub use inter_predict::{
     InterResidualLeaf,
 };
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
+pub use key_frame::{
+    encode_key_frame_yuv420, encode_key_frame_yuv420_with_q, EncodedKeyFrame, KEY_FRAME_MAX_DIM,
+};
 pub use loop_restoration_write::{write_lr, write_lr_unit, LrWriteState};
 pub use obu::{
     build_temporal_unit, obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,

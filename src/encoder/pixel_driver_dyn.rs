@@ -476,7 +476,7 @@ fn pix(plane: &[u8], stride: usize, r: usize, c: usize) -> u16 {
     plane[r * stride + c] as u16
 }
 
-fn derive_intra_neighbours_4x4(
+pub(crate) fn derive_intra_neighbours_4x4(
     plane: &[u8],
     plane_width: usize,
     plane_height: usize,
@@ -561,7 +561,7 @@ const INTRA_MODE_CANDIDATES: [usize; 13] = [
     PAETH_PRED,
 ];
 
-fn predict_intra_mode_4x4(
+pub(crate) fn predict_intra_mode_4x4(
     mode: usize,
     have_above: u8,
     have_left: u8,
@@ -673,7 +673,7 @@ fn pick_best_intra_mode_4x4(
 /// window (= chroma origin × 2). `(luma_w, luma_h)` are the luma plane
 /// extents (used for the §7.11.5.3 `MaxLumaW - (1 << subX)` /
 /// `MaxLumaH - (1 << subY)` right/bottom clamps).
-fn cfl_subsampled_luma_4x4_420_dyn(
+pub(crate) fn cfl_subsampled_luma_4x4_420_dyn(
     recon_y: &[u8],
     luma_w: usize,
     luma_h: usize,
@@ -726,7 +726,7 @@ fn round2_signed(x: i64, n: u32) -> i64 {
 /// chroma-only arm; `l_arr` / `luma_avg` come from
 /// [`cfl_subsampled_luma_4x4_420_dyn`]. Identical in shape to the
 /// fixed-size driver's helper of the same name.
-fn cfl_predict_4x4_for_plane_dyn(
+pub(crate) fn cfl_predict_4x4_for_plane_dyn(
     dc_pred: &[u8; 16],
     l_arr: &[i32; 16],
     luma_avg: i32,
