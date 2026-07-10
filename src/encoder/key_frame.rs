@@ -93,9 +93,9 @@
 use crate::cdf::{
     dequantize_step1, get_tx_size, intra_tx_type_set, is_tx_type_in_set, tx_size_sqr_index,
     QuantizerParams, TileCdfContext, TileGeometry, ANGLE_STEP, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
-    D67_PRED, DCT_DCT, DC_PRED, H_PRED, INTRA_MODES, MAX_TX_SIZE_RECT, MODE_TO_ANGLE, MODE_TO_TXFM,
-    NUM_4X4_BLOCKS_WIDE, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4, TX_HEIGHT,
-    TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_PRED,
+    D67_PRED, DCT_DCT, DC_PRED, H_PRED, INTRA_MODES, MAX_TX_DEPTH, MAX_TX_SIZE_RECT, MODE_TO_ANGLE,
+    MODE_TO_TXFM, NUM_4X4_BLOCKS_WIDE, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED,
+    SPLIT_TX_SIZE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_PRED,
 };
 use crate::cdf::{
     predict_intra_dc_pred, predict_intra_directional, predict_intra_h_pred,
@@ -217,7 +217,14 @@ pub fn encode_key_frame_yuv420_with_q(
     let chroma_h = height / 2;
 
     let seq = build_intra_only_yuv420_8bit_seq(input.width, input.height);
-    let fh = build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    let mut fh =
+        build_intra_only_yuv420_8bit_fh_with_q(&seq, input.width, input.height, base_q_idx);
+    // r410: the lossy arm codes §5.9.21 `TxMode = TX_MODE_SELECT` so
+    // every leaf carries the §5.11.15 `tx_depth` choice the RD search
+    // makes (lossless stays on the §5.9.2 CodedLossless ONLY_4X4 arm).
+    if base_q_idx > 0 {
+        fh.tx_mode = Some(crate::uncompressed_header_tail::TxMode::TxModeSelect);
+    }
     let fs = fh
         .frame_size
         .as_ref()
@@ -252,7 +259,7 @@ pub fn encode_key_frame_yuv420_with_q(
         allow_screen_content_tools: fh.allow_screen_content_tools,
         enable_filter_intra: seq.enable_filter_intra,
         bit_depth: 8,
-        tx_mode_select: false,
+        tx_mode_select: !lossless,
         quant: qp,
         reduced_tx_set: fh.reduced_tx_set.unwrap_or(false),
     };
@@ -1087,6 +1094,60 @@ fn encode_leaf_sq(
     input: &Yuv420Frame,
     recon: &mut ReconState,
 ) -> SyntaxBlock {
+    if recon.lossless || b_size == BLOCK_4X4 {
+        // §5.11.15: lossless forces TX_4X4; a BLOCK_4X4 block has no
+        // tx_depth choice. One shape — no TX trial.
+        let luma_tx = if recon.lossless {
+            TX_4X4
+        } else {
+            MAX_TX_SIZE_RECT[b_size]
+        };
+        return encode_leaf_with_tx(mi_r, mi_c, b_size, luma_tx, input, recon);
+    }
+    // §5.11.15 tx_depth RD search (r410, TX_MODE_SELECT): step the
+    // luma TX down from `Max_Tx_Size_Rect[MiSize]` via `Split_Tx_Size`
+    // (one step for BLOCK_8X8 — its tx_depth alphabet is 2-valued —
+    // two for larger squares), trial-encode the leaf at each size
+    // against the same starting state, keep the lower `D + λ·R`.
+    let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let lambda = lambda_for(&recon.qp);
+    let max_steps = if b_size == BLOCK_8X8 { 1 } else { MAX_TX_DEPTH };
+    let mut cands = vec![MAX_TX_SIZE_RECT[b_size]];
+    for _ in 0..max_steps {
+        let next = SPLIT_TX_SIZE[*cands.last().expect("non-empty")];
+        cands.push(next);
+    }
+    let before = save_region(recon, mi_r, mi_c, n4);
+    let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
+    for (depth, &cand) in cands.iter().enumerate() {
+        let leaf = encode_leaf_with_tx(mi_r, mi_c, b_size, cand, input, recon);
+        let d = region_distortion(recon, input, mi_r, mi_c, n4);
+        let r = leaf_rate(&leaf) + 2 * depth as u64;
+        let score = d + lambda * r;
+        let improves = match best.as_ref() {
+            Some((_, _, s)) => score < *s,
+            None => true,
+        };
+        if improves {
+            best = Some((leaf, save_region(recon, mi_r, mi_c, n4), score));
+        }
+        restore_region(recon, mi_r, mi_c, &before);
+    }
+    let (leaf, after, _) = best.expect("at least one tx candidate");
+    restore_region(recon, mi_r, mi_c, &after);
+    leaf
+}
+
+/// One-shape leaf encode at a fixed luma TX size — see
+/// [`encode_leaf_sq`] for the §5.11.15 TX search wrapper.
+fn encode_leaf_with_tx(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    luma_tx: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+) -> SyntaxBlock {
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let n = n4 * 4;
     let row0 = (mi_r as usize) * 4;
@@ -1097,11 +1158,6 @@ fn encode_leaf_sq(
 
     // --- Luma ---
     let (y_mode, angle_delta_y) = pick_y_mode(recon, input, row0, col0, n);
-    let luma_tx = if lossless {
-        TX_4X4
-    } else {
-        MAX_TX_SIZE_RECT[b_size]
-    };
     let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
     let mut residual_quant: Vec<Vec<i32>> = Vec::new();
     let mut ty = 0usize;
@@ -1275,7 +1331,15 @@ fn encode_leaf_sq(
         filter_intra_mode: None,
         palette: Default::default(),
         residual_quant,
-        tx_size: None,
+        // §5.11.15 TxSize commitment: on the lossy TX_MODE_SELECT arm
+        // the tx_depth S() fires for every MiSize > BLOCK_4X4 block
+        // (intra ⇒ allowSelect); lossless / BLOCK_4X4 stay on the
+        // spec-forced default (`None`).
+        tx_size: if !lossless && b_size > BLOCK_4X4 {
+            Some(luma_tx as u8)
+        } else {
+            None
+        },
         residual_tx_type: Vec::new(),
         var_tx_trees: Vec::new(),
     }
@@ -1366,6 +1430,11 @@ fn region_distortion(recon: &ReconState, input: &Yuv420Frame, r: u32, c: u32, n4
     ssd
 }
 
+/// q-scaled Lagrange multiplier for the `D + λ·R` decisions.
+fn lambda_for(qp: &QuantizerParams) -> u64 {
+    1 + (qp.base_q_idx as u64 * qp.base_q_idx as u64) / 32
+}
+
 /// Crude rate proxy for one leaf: a fixed per-leaf mode/skip cost
 /// plus a magnitude-aware per-nonzero-coefficient cost
 /// (`3 + bitlength(|q|)` roughly tracks the §5.11.39 base + BR +
@@ -1436,7 +1505,7 @@ fn build_search_tree(
         return SyntaxNode::Split(split_children(input, recon));
     }
 
-    let lambda: u64 = 1 + (recon.qp.base_q_idx as u64 * recon.qp.base_q_idx as u64) / 32;
+    let lambda = lambda_for(&recon.qp);
     let before = save_region(recon, r, c, n4 as usize);
 
     // Candidate A: one PARTITION_NONE leaf.
