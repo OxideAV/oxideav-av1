@@ -30,13 +30,16 @@
 //!
 //! ## What this arc does NOT do
 //!
-//!   * Decode arbitrary AV1 streams. Frame sizes other than 16×16,
-//!     base_q_idx > 0, partition shapes other than the
-//!     BLOCK_16X16 → BLOCK_8X8 → BLOCK_4X4 split tree, inter
+//!   * Decode arbitrary AV1 streams on the MIRROR path. Frame sizes
+//!     other than 16×16, base_q_idx > 0, partition shapes other than
+//!     the BLOCK_16X16 → BLOCK_8X8 → BLOCK_4X4 split tree, inter
 //!     frames, multi-tile frames, and the in-loop filter stack are
-//!     out of scope. The public [`decode_av1`] entry returns
-//!     [`crate::Error::PartitionWalkOutOfRange`] for unsupported
-//!     shapes.
+//!     out of the mirror driver's scope. As of r409 the public
+//!     [`decode_av1`] entry no longer REJECTS such streams: it falls
+//!     back to the spec-faithful [`decode_av1_spec`] frame driver and
+//!     surfaces each shown frame as [`pixel_driver::Frame::Spec`] —
+//!     full public-API parity with the internal spec driver (see
+//!     [`pixel_driver::decode_av1`]'s path-ordering contract).
 //!   * In-loop post-processing. The §7.14 / §7.15 / §7.16 / §7.17 /
 //!     §7.18.3 passes are no-ops on the lossless arc-18 frame's
 //!     parameter set (`loop_filter_level = 0`, `enable_cdef = 0`,

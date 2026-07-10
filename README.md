@@ -151,8 +151,14 @@ CDF / motion-field / segment-id state), and accepts BOTH packet
 framings: a whole IVF buffer (`DKIF` magic) or one §7.5 temporal unit
 per packet (the Matroska / ISOBMFF sample framing) — a KEY + INTER GOP
 split one-TU-per-packet decodes byte-identical to the same bytes in one
-buffer. The historical direct API (`decode_av1` / `encode_av1`) is
-unchanged.
+buffer. As of r409 the historical direct API reaches **full parity
+with the spec driver**: `decode_av1` tries the encoder-mirror path
+first (this crate's own constrained non-conformant intra streams keep
+their bit-exact round-trip and historical `Frame` shapes), then falls
+back to `decoder::decode_av1_spec` for everything else, surfacing each
+shown frame as `Frame::Spec(SpecFrame)`. Per-fixture parity assertions
+pin public-API output == spec-driver output across the whole 39-stream
+conformance corpus.
 
 ### What parses
 
@@ -170,9 +176,10 @@ unchanged.
 
 ### What decodes / encodes (intra pixel pipeline)
 
-`decode_av1(bytes) -> Vec<Frame>` and `encode_av1(pixels, width,
-height) -> Vec<u8>` (IVF v0 output) cover a constrained intra-only
-profile:
+`encode_av1(pixels, width, height) -> Vec<u8>` (IVF v0 output) and the
+`decode_av1(bytes) -> Vec<Frame>` encoder-MIRROR path (the first of the
+public entry's two decode paths; the second is the spec-driver fallback
+described above) cover a constrained intra-only profile:
 
 - 4:2:0 8-bit YUV or 8-bit monochrome.
 - Intra-only key frames, single tile per frame.

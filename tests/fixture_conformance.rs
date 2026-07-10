@@ -17,7 +17,34 @@
 //! The fixture bytes are embedded as hex so the test runs in per-crate
 //! CI without the docs checkout.
 
-use oxideav_av1::decoder::decode_av1_spec;
+use oxideav_av1::decoder::{decode_av1_spec, Frame, SpecFrame};
+
+/// r409 public-API parity: every corpus stream the spec driver decodes
+/// must decode IDENTICALLY through the public [`oxideav_av1::decode_av1`]
+/// entry, surfacing one [`Frame::Spec`] per shown frame (the corpus
+/// streams are all external-encoder streams, so none may be claimed by
+/// the constrained encoder-mirror path).
+fn assert_public_api_parity(name: &str, ivf: &[u8], spec_frames: &[SpecFrame]) {
+    let pub_frames = oxideav_av1::decode_av1(ivf)
+        .unwrap_or_else(|e| panic!("{name}: public decode_av1 rejected the fixture: {e:?}"));
+    assert_eq!(
+        pub_frames.len(),
+        spec_frames.len(),
+        "{name}: public-API frame count differs from the spec driver"
+    );
+    for (i, (pf, sf)) in pub_frames.iter().zip(spec_frames.iter()).enumerate() {
+        match pf {
+            Frame::Spec(s) => assert_eq!(
+                s, sf,
+                "{name}: public-API frame {i} differs from the spec driver"
+            ),
+            other => panic!(
+                "{name}: public-API frame {i} rode the encoder-mirror path ({other:?}) — \
+                 an external stream must never be claimed by the mirror driver"
+            ),
+        }
+    }
+}
 
 fn unhex(s: &str) -> Vec<u8> {
     assert!(s.len() % 2 == 0, "hex literal must have even length");
@@ -34,6 +61,7 @@ fn assert_decodes_byte_exact(name: &str, ivf_hex: &str, expected_hex: &str, fram
     let frames = decode_av1_spec(&ivf)
         .unwrap_or_else(|e| panic!("{name}: spec driver rejected the fixture: {e:?}"));
     assert_eq!(frames.len(), frames_hint, "{name}: frame count");
+    assert_public_api_parity(name, &ivf, &frames);
     let mut got = Vec::with_capacity(expected.len());
     for f in &frames {
         for p in &f.planes {
@@ -774,6 +802,7 @@ fn assert_decodes_to_digest(name: &str, ivf_hex: &str, digest: &str, frames_hint
     let frames = decode_av1_spec(&ivf)
         .unwrap_or_else(|e| panic!("{name}: spec driver rejected the fixture: {e:?}"));
     assert_eq!(frames.len(), frames_hint, "{name}: frame count");
+    assert_public_api_parity(name, &ivf, &frames);
     let mut got = Vec::new();
     for f in &frames {
         for p in &f.planes {

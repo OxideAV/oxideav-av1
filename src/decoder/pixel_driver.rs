@@ -91,9 +91,11 @@ use crate::Error;
 ///
 /// Round 224 surfaced only the [`Self::Yuv420_16x16`] variant; round 230
 /// adds [`Self::Yuv420Dyn`] for the dynamic-extent encoder
-/// ([`crate::encoder::encode_intra_frame_yuv_dyn`]) output. The enum is
-/// `#[non_exhaustive]` so future extents (monochrome / 4:2:2 / 4:4:4 /
-/// 10-bit) can land without a SemVer bump.
+/// ([`crate::encoder::encode_intra_frame_yuv_dyn`]) output; round 409
+/// adds [`Self::Spec`] — every stream the spec-faithful driver
+/// ([`super::frame_driver::decode_av1_spec`]) accepts now decodes
+/// through the public entry too. The enum is `#[non_exhaustive]` so
+/// future shapes can land without a SemVer bump.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 // The fixed-size `Yuv420_16x16` variant inlines its three plane arrays
@@ -142,6 +144,15 @@ pub enum Frame {
         /// Luma plane, row-major, length `width * height`.
         y: Vec<u8>,
     },
+    /// A frame decoded through the spec-faithful driver
+    /// ([`super::frame_driver::decode_av1_spec`]) — the r409 parity
+    /// arm. Every stream outside the constrained encoder-mirror scope
+    /// (arbitrary extents, inter GOPs, `show_existing_frame`, 4:2:2 /
+    /// 4:4:4 / monochrome layouts, 10/12-bit output, multi-tile
+    /// frames, film grain, superres, …) surfaces one of these per
+    /// SHOWN frame; see [`super::frame_driver::SpecFrame`] for the
+    /// plane layout contract.
+    Spec(super::frame_driver::SpecFrame),
 }
 
 impl Frame {
@@ -157,26 +168,63 @@ impl Frame {
     }
 }
 
-/// Decode an AV1 IVF v0 buffer — the encoder's
-/// [`crate::encoder::encode_intra_frame_yuv`] /
-/// [`crate::encoder::encode_intra_frame_y`] output.
+/// Decode an AV1 IVF v0 buffer.
 ///
-/// Walks the IVF file header + per-frame records via [`IvfReader`],
-/// then routes each frame's payload through [`decode_temporal_unit`].
+/// Two decode paths compose the accepted scope, tried in order:
 ///
-/// Returns one [`Frame`] per IVF frame, in stream order. On the lossless
-/// arc-18 path the recovered pixels equal the encoder's input plane-by-
-/// plane, byte-for-byte.
+/// 1. **Encoder-mirror path** — streams produced by this crate's own
+///    historical constrained intra encoders
+///    ([`crate::encoder::encode_intra_frame_yuv`] /
+///    [`crate::encoder::encode_intra_frame_yuv_dyn`] /
+///    [`crate::encoder::encode_intra_frame_y_dyn`] and the multi-SB
+///    variants). These streams are NOT spec-conformant (their leaves
+///    code `y_mode` with the §5.11.22 non-keyframe CDFs on intra
+///    frames), so they must ride the mirror driver that inverts the
+///    writer exactly; they surface the historical
+///    [`Frame::Yuv420_16x16`] / [`Frame::Yuv420Dyn`] / [`Frame::YDyn`]
+///    variants, byte-identical to the pre-r409 behaviour.
+/// 2. **Spec-faithful path** — when the mirror path rejects (any
+///    error), the input is re-decoded through
+///    [`super::frame_driver::decode_av1_spec`], the full conformance-
+///    validated frame driver (intra + inter GOPs,
+///    `show_existing_frame`, every coded TX size, 4:2:0 / 4:2:2 /
+///    4:4:4 / monochrome, 8/10/12-bit, multi-tile, film grain,
+///    superres, …). Each SHOWN frame surfaces as [`Frame::Spec`].
+///
+/// The mirror path runs first because its streams are non-conformant:
+/// the spec driver decodes several of them without a syntax error but
+/// to different pixels (the CDF-table mismatch desynchronises the
+/// coefficient contexts, not the framing), so spec-first would
+/// silently break the historical round-trip guarantee. Conversely
+/// every stream in the conformance corpus is REJECTED by the mirror
+/// path with a typed error (verified across the staged fixture set),
+/// so real streams always reach the spec driver.
+///
+/// Returns one [`Frame`] per shown frame, in output order.
 ///
 /// ## Errors
 ///
 /// * Buffer ends mid-IVF-header or mid-frame — [`Error::UnexpectedEnd`].
-/// * Any §5.3.1 / §5.5.1 / §5.9.1 / §5.11.1 / §5.11 syntax violation
-///   surfaces as the relevant existing `Error` variant.
-/// * Out-of-arc-18-scope frames (`FrameWidth != 16`, base_q_idx > 0,
-///   inter frames, etc.) surface as
-///   [`Error::PartitionWalkOutOfRange`].
+/// * When BOTH paths reject, the spec driver's error is surfaced (the
+///   broader, conformance-validated surface).
 pub fn decode_av1(input: &[u8]) -> Result<Vec<Frame>, Error> {
+    match decode_av1_mirror(input) {
+        Ok(frames) => Ok(frames),
+        Err(_) => Ok(super::frame_driver::decode_av1_spec(input)?
+            .into_iter()
+            .map(Frame::Spec)
+            .collect()),
+    }
+}
+
+/// The pre-r409 encoder-mirror IVF walk — accepts only this crate's
+/// own constrained intra-encoder output (see [`decode_av1`] path 1).
+///
+/// Walks the IVF file header + per-frame records via [`IvfReader`],
+/// then routes each frame's payload through [`decode_temporal_unit`].
+/// On the lossless path the recovered pixels equal the encoder's input
+/// plane-by-plane, byte-for-byte.
+fn decode_av1_mirror(input: &[u8]) -> Result<Vec<Frame>, Error> {
     let reader = IvfReader::new(input).map_err(map_ivf_error)?;
     let frames = reader.read_all().map_err(map_ivf_error)?;
     let mut out: Vec<Frame> = Vec::with_capacity(frames.len());
@@ -1461,13 +1509,19 @@ mod tests {
         // that SH ⇒ a conformant decoder expects chroma coefficient
         // blocks the encoder never wrote.
         //
-        // The decoder's arc-18 driver mirrors the spec literally, so it
-        // surfaces [`Error::PartitionWalkOutOfRange`] (or the §5.11.39
-        // EOB-shape mismatch as `UnexpectedEnd`) on the missing-chroma-
-        // syntax leaves — exactly the right rejection for this
-        // intentionally-non-conformant path. The full 4:2:0 YUV
-        // roundtrip (`encode_intra_frame_yuv` ↔ `decode_av1`) is the
-        // milestone exercise — see `decode_av1_recovers_non_flat_yuv`.
+        // The decoder's arc-18 MIRROR driver mirrors the spec
+        // literally, so it surfaces [`Error::PartitionWalkOutOfRange`]
+        // (or the §5.11.39 EOB-shape mismatch as `UnexpectedEnd`) on
+        // the missing-chroma-syntax leaves — exactly the right
+        // rejection for this intentionally-non-conformant path.
+        //
+        // r409: the public entry now falls back to the spec-faithful
+        // driver after the mirror rejection. Whatever THAT driver does
+        // with these bytes (a typed error, or a syntactically-valid
+        // desync decode of the mismatched CDF streams), the invariant
+        // this test pins is that the MIRROR path never claims the
+        // stream: the public result is never a mirror-variant frame
+        // pretending the luma round-tripped.
         let seq = tiny_seq();
         let fh = tiny_fh(&seq);
         let mut luma = [[0u8; FRAME_WIDTH]; FRAME_HEIGHT];
@@ -1477,11 +1531,16 @@ mod tests {
             }
         }
         let encoded = encode_intra_frame_y(&luma, &seq, &fh).unwrap();
-        let res = decode_av1(&encoded.ivf_bytes);
         assert!(
-            res.is_err(),
-            "Y-only encode path skips chroma syntax under a YUV SH ⇒ decode must reject"
+            decode_av1_mirror(&encoded.ivf_bytes).is_err(),
+            "Y-only encode path skips chroma syntax under a YUV SH ⇒ the mirror driver must reject"
         );
+        if let Ok(frames) = decode_av1(&encoded.ivf_bytes) {
+            assert!(
+                frames.iter().all(|f| matches!(f, Frame::Spec(_))),
+                "the public fallback may only surface spec-driver frames for this stream"
+            );
+        }
     }
 
     #[test]

@@ -2488,59 +2488,44 @@ impl std::error::Error for Error {}
 
 /// Decode an AV1 IVF v0 buffer into a vector of decoded [`decoder::Frame`]s.
 ///
-/// Wires together the existing decoder modules — IVF demuxer, OBU
-/// walker, sequence-header parser, frame-header parser, tile-group-OBU
-/// parser, the §5.11.4 partition tree, §5.11.5 per-leaf decoder,
-/// §5.11.39 coefficient reader, §7.12.3 dequantizer, §7.13 inverse
-/// transform, and the §7.11.2 / §7.11.5.3 intra prediction set — into
-/// a single pixel-out entry that inverts the encoder pixel-driver
-/// family ([`crate::encoder::encode_intra_frame_yuv`] for the fixed
-/// 16×16 path, [`crate::encoder::encode_intra_frame_yuv_dyn`] /
-/// [`crate::encoder::encode_intra_frame_y_dyn`] /
-/// [`crate::encoder::encode_intra_frame_yuv_dyn_multi_sb`] /
-/// [`crate::encoder::encode_intra_frame_y_dyn_multi_sb`] for the
-/// dynamic-extent paths). Internally dispatches on the FrameHeader's
-/// `frame_width` / `frame_height` + the SH's `mono_chrome` flag.
+/// As of round 409 this entry is at **full parity with the internal
+/// spec-faithful frame driver** ([`decoder::decode_av1_spec`], the
+/// conformance-corpus-validated decoder): every stream that driver
+/// decodes byte-exact decodes identically here. Two paths compose the
+/// accepted scope, tried in order (see
+/// [`decoder::pixel_driver::decode_av1`] for the full contract):
 ///
-/// ## Accepted scope (as of round 249)
+/// 1. **Encoder-mirror path** — streams from this crate's own
+///    historical constrained intra encoders
+///    ([`crate::encoder::encode_intra_frame_yuv`] fixed 16×16,
+///    [`crate::encoder::encode_intra_frame_yuv_dyn`] /
+///    [`crate::encoder::encode_intra_frame_y_dyn`] and the multi-SB
+///    variants: 4:2:0 or monochrome 8-bit, `(w, h)` ∈ `[8, 128]`
+///    multiples of 8, `base_q_idx` 0 (lossless, bit-exact roundtrip)
+///    or `> 0` (lossy self-consistency), 13-mode intra + CfL,
+///    single tile, no in-loop filters). These streams are not
+///    spec-conformant, so they ride the exact writer-inverse driver
+///    and surface the historical [`decoder::Frame::Yuv420_16x16`] /
+///    [`decoder::Frame::Yuv420Dyn`] / [`decoder::Frame::YDyn`]
+///    variants — byte-identical to the pre-r409 behaviour.
+/// 2. **Spec-faithful path** — anything the mirror path rejects is
+///    re-decoded through [`decoder::decode_av1_spec`]: the full intra
+///    feature surface (lossy quant at every coded TX size, lossless,
+///    palette, CfL, filter-intra, directional prediction with edge
+///    filter/upsample, intra block copy), inter GOPs (single and
+///    compound references, warped motion, OBMC, jnt-comp, skip mode,
+///    segmentation, scaled references, global motion, temporal MV
+///    projection, `show_existing_frame` incl. the §7.21 KEY reload),
+///    4:2:0 / 4:2:2 / 4:4:4 / monochrome layouts, 8/10/12-bit output,
+///    multi-tile and 128×128-superblock frames, delta-q, quantizer
+///    matrices, and the whole §7.4 post chain (deblock, CDEF,
+///    superres, loop restoration, film grain). Each SHOWN frame
+///    surfaces as [`decoder::Frame::Spec`] carrying a
+///    [`decoder::SpecFrame`] (cropped extents, per-plane dims,
+///    10/12-bit as little-endian 2-byte samples).
 ///
-/// * **Frame extent** — `(frame_width, frame_height)` either exactly
-///   `(16, 16)` (the fixed-size [`decoder::Frame::Yuv420_16x16`]
-///   variant) or any `(w, h)` ∈ `[8, 128]` × `[8, 128]` both multiples
-///   of 8 (the [`decoder::Frame::Yuv420Dyn`] /
-///   [`decoder::Frame::YDyn`] variants). Rectangular extents
-///   independent per axis. Extents `> 64` per axis ride the §5.11.1
-///   multi-super-block grid walk; ≤ 64 per axis ride the single-root
-///   partition tree.
-/// * **Pixel format** — 4:2:0 YUV 8-bit (`subsampling_x =
-///   subsampling_y = 1`) or 8-bit monochrome
-///   (`mono_chrome = true`, `num_planes = 1`).
-/// * **Quantizer** — `base_q_idx ∈ 0..=255`. `== 0` selects the
-///   §5.9.2 `CodedLossless` arm (§7.13.2.10 inverse WHT, bit-exact
-///   roundtrip against the matching encoder); `> 0` selects the
-///   §7.13.3 inverse DCT_DCT lossy arm (encoder-decoder self-
-///   consistency: the recovered planes match the encoder's
-///   `reconstructed_*` byte-for-byte, with quantization error bounded
-///   by the §7.12.2 `dc_q_lookup` / `ac_q_lookup` tables).
-/// * **Intra mode set** — the 13-mode §3 `INTRA_MODES` set
-///   (`DC_PRED`, `V_PRED`, `H_PRED`, four D-modes
-///   {`D45_PRED`, `D135_PRED`, `D113_PRED`, `D157_PRED`, `D203_PRED`,
-///   `D67_PRED`}, `SMOOTH_PRED`, `SMOOTH_V_PRED`, `SMOOTH_H_PRED`,
-///   `PAETH_PRED`) on the luma path + the same set plus the §7.11.5.3
-///   `UV_CFL_PRED` (chroma-from-luma) arm on the HasChroma chroma
-///   path.
-/// * **Tile layout** — single tile per frame
-///   (`tile_cols_log2 = tile_rows_log2 = 0`).
-/// * **Partition + transform** — `BLOCK_4X4` leaves, `TX_4X4`,
-///   default scan, intra-only keyframes.
-/// * **In-loop / post-processing** — `loop_filter_level = 0`,
-///   `enable_cdef = 0`, `enable_restoration = 0`,
-///   `enable_superres = 0`, `apply_grain = 0` (the §7.14–§7.18.3
-///   passes are no-ops under this parameter set).
-///
-/// Streams outside that scope return
-/// [`Error::PartitionWalkOutOfRange`] (or another more-specific
-/// `Error` variant for syntax / framing violations).
+/// Streams both paths reject surface the spec driver's typed
+/// [`Error`].
 pub fn decode_av1(bytes: &[u8]) -> Result<Vec<decoder::Frame>, Error> {
     decoder::decode_av1(bytes)
 }

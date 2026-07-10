@@ -157,9 +157,12 @@ fn y_only_encode_path_does_not_roundtrip_under_yuv_sh() {
     // The Y-only `encode_intra_frame_y` path emits no chroma syntax
     // under the tiny fixture's `monochrome = false` SH. A spec-
     // conformant decoder expects chroma reads on the HasChroma cells,
-    // so the public `decode_av1` rejects the stream rather than
-    // hallucinating chroma samples. The full 4:2:0 YUV roundtrip is the
-    // arc-18 milestone — see the YUV tests above.
+    // so the encoder-MIRROR path rejects the stream rather than
+    // hallucinating chroma samples. r409: the public `decode_av1`
+    // then retries through the spec-faithful driver — whatever that
+    // fallback produces (a typed error, or a syntactically-valid
+    // desync decode), the stream must never surface a mirror-variant
+    // frame claiming the luma round-tripped.
     let (seq, fh) = tiny_descriptors();
     let mut luma = [[0u8; 16]; 16];
     for (i, row) in luma.iter_mut().enumerate() {
@@ -168,8 +171,12 @@ fn y_only_encode_path_does_not_roundtrip_under_yuv_sh() {
         }
     }
     let encoded = encode_intra_frame_y(&luma, &seq, &fh).unwrap();
-    let res = decode_av1(&encoded.ivf_bytes);
-    assert!(res.is_err());
+    if let Ok(frames) = decode_av1(&encoded.ivf_bytes) {
+        assert!(
+            frames.iter().all(|f| matches!(f, Frame::Spec(_))),
+            "non-conformant Y-only stream must never ride the mirror path"
+        );
+    }
 }
 
 // --------------------------------------------------------------------------
