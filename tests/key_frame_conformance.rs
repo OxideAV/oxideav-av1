@@ -107,6 +107,100 @@ fn key_frame_lossy_decodes_to_encoder_recon() {
     assert_key_frame_round_trip(8, 8, 200);
 }
 
+/// r410: the full quantiser range, both arms of the §8.3.1
+/// `init_coeff_cdfs` q-context boundaries (20/60/120) included.
+#[test]
+fn key_frame_wide_quantizer_range_round_trips() {
+    for q in [1u8, 20, 21, 60, 61, 120, 121, 255] {
+        assert_key_frame_round_trip(64, 64, q);
+    }
+    assert_key_frame_round_trip(96, 80, 255);
+    assert_key_frame_round_trip(176, 144, 1);
+}
+
+/// r410: pseudo-noise content forces deep splits + dense coefficients
+/// at every partition level; smooth content exercises the large-leaf
+/// arms (`BLOCK_16X16` / `BLOCK_32X32` / `BLOCK_64X64` with `TX_16X16`
+/// / `TX_32X32` / `TX_64X64` luma TUs on the lossy arm).
+#[test]
+fn key_frame_noise_and_smooth_content_round_trips() {
+    let mut state = 0x1234_5678u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut noise = Yuv420Frame::filled(96, 96, 0);
+    for p in noise.y.iter_mut() {
+        *p = (next() & 0xFF) as u8;
+    }
+    for p in noise.u.iter_mut() {
+        *p = (next() & 0xFF) as u8;
+    }
+    for p in noise.v.iter_mut() {
+        *p = (next() & 0xFF) as u8;
+    }
+    for q in [0u8, 50, 200] {
+        let enc = encode_key_frame_yuv420_with_q(&noise, q).unwrap();
+        let frames = decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(frames[0].planes[0], enc.recon_y, "noise q={q} luma");
+        assert_eq!(frames[0].planes[1], enc.recon_u, "noise q={q} U");
+        assert_eq!(frames[0].planes[2], enc.recon_v, "noise q={q} V");
+        if q == 0 {
+            assert_eq!(frames[0].planes[0], noise.y, "noise lossless != input");
+        }
+    }
+
+    let mut smooth = Yuv420Frame::filled(128, 128, 0);
+    for i in 0..128usize {
+        for j in 0..128usize {
+            smooth.y[i * 128 + j] = ((i + j) / 8) as u8;
+        }
+    }
+    for p in smooth.u.iter_mut() {
+        *p = 120;
+    }
+    for p in smooth.v.iter_mut() {
+        *p = 130;
+    }
+    for q in [0u8, 60, 160] {
+        let enc = encode_key_frame_yuv420_with_q(&smooth, q).unwrap();
+        let frames = decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(frames[0].planes[0], enc.recon_y, "smooth q={q} luma");
+        assert_eq!(frames[0].planes[1], enc.recon_u, "smooth q={q} U");
+        assert_eq!(frames[0].planes[2], enc.recon_v, "smooth q={q} V");
+    }
+}
+
+/// r410: the RD search actually selects large leaves — a flat frame
+/// codes every superblock as one BLOCK_64X64 skip leaf, so a 512×512
+/// (64-superblock) stream stays under 100 bytes.
+#[test]
+fn key_frame_flat_512_is_single_leaf_per_superblock() {
+    let input = Yuv420Frame::filled(512, 512, 128);
+    let enc = encode_key_frame_yuv420_with_q(&input, 50).unwrap();
+    assert!(
+        enc.ivf_bytes.len() < 100,
+        "flat 512x512 should code one 64x64 skip leaf per SB, got {} bytes",
+        enc.ivf_bytes.len()
+    );
+    let frames = decode_av1_spec(&enc.ivf_bytes).unwrap();
+    assert_eq!(frames[0].planes[0], enc.recon_y);
+    assert_eq!(frames[0].planes[1], enc.recon_u);
+    assert_eq!(frames[0].planes[2], enc.recon_v);
+}
+
+/// r410: extreme aspect ratios ride the forced-split §5.11.4 arms on
+/// one axis while keeping full-size leaves on the other.
+#[test]
+fn key_frame_extreme_aspect_ratios_round_trip() {
+    assert_key_frame_round_trip(512, 8, 0);
+    assert_key_frame_round_trip(8, 512, 90);
+    assert_key_frame_round_trip(24, 8, 255);
+    assert_key_frame_round_trip(72, 56, 35);
+}
+
 #[test]
 fn key_frame_flat_grey_is_all_skip_and_tiny() {
     // Flat mid-grey: DC prediction is exact at every leaf, so every
