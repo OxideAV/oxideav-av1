@@ -8,9 +8,10 @@
 //!
 //! This stresses three surfaces with attacker-chosen dimensions:
 //!
-//! * The encoder's dimension / plane-length validation
-//!   (`Yuv420Frame::validate`) — width / height in `[8, 64]`, both
-//!   multiples of 8, exact `Y || U || V` plane length.
+//! * The encoder's dimension / plane-length validation — width /
+//!   height multiples of 8 (r409: conformance-grade keyframe driver,
+//!   bound `[8, 512]`; the target picks from `[8, 64]`), exact
+//!   `Y || U || V` plane length.
 //! * The intra partition-tree + coefficient writer.
 //! * The decode-of-own-output path (`decode_av1` on the encoder's IVF).
 //!

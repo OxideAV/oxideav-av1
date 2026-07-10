@@ -2533,9 +2533,12 @@ pub fn decode_av1(bytes: &[u8]) -> Result<Vec<decoder::Frame>, Error> {
 /// Encode planar 4:2:0 8-bit YUV pixels into an intra-only AV1
 /// elementary stream (IVF v0 container).
 ///
-/// Round 249 graduates the dynamic-extent pixel driver
-/// ([`crate::encoder::encode_intra_frame_yuv_dyn`]) into the public
-/// entry point. The byte input is interpreted as three contiguous
+/// Round 409 graduates the **conformance-grade KEY-frame encoder**
+/// ([`crate::encoder::encode_key_frame_yuv420`]) into the public
+/// entry point: the produced stream carries real §5.11 keyframe
+/// syntax and decodes byte-identically in this crate's spec-faithful
+/// driver AND in independent AV1 decoders (validated as black-box
+/// binaries). The byte input is interpreted as three contiguous
 /// planes in `Y || U || V` order:
 ///
 /// * `pixels[0 .. width * height]` — Y (luma) plane, row-major.
@@ -2546,35 +2549,33 @@ pub fn decode_av1(bytes: &[u8]) -> Result<Vec<decoder::Frame>, Error> {
 ///
 /// where `chroma_size = (width / 2) * (height / 2)`.
 ///
-/// ## Accepted scope (round 249)
+/// ## Accepted scope (round 409)
 ///
-/// * `width`, `height` ∈ `[8, 64]` per axis, both multiples of 8.
-/// * 8-bit 4:2:0 YUV. Single-frame output (one IVF frame).
+/// * `width`, `height` ∈ `[8, 512]` per axis, both multiples of 8
+///   ([`crate::encoder::KEY_FRAME_MAX_DIM`]).
+/// * 8-bit 4:2:0 YUV. Single KEY frame per stream (one IVF frame).
 /// * `base_q_idx = 0` — the §5.9.2 `CodedLossless` arm. The matching
 ///   [`decode_av1`] invocation on the returned IVF bytes recovers
-///   the input planes byte-for-byte.
+///   the input planes byte-for-byte (surfaced as
+///   [`decoder::Frame::Spec`] — the stream rides the spec-faithful
+///   decode path, as any conformant stream does).
 ///
-/// Wider extents (multi-super-block) + lossy quant + monochrome are
-/// reachable through the per-driver crate-public entries
-/// ([`crate::encoder::encode_intra_frame_yuv_dyn_multi_sb`],
-/// [`crate::encoder::encode_intra_frame_yuv_dyn_with_q`],
-/// [`crate::encoder::encode_intra_frame_y_dyn`], etc.); a single
-/// `(pixels, width, height)` public signature would have to multiplex
-/// pixel-format + quantizer + multi-SB through extra parameters,
-/// so they stay on the per-driver entries until the public surface
-/// grows an explicit config struct in a later arc.
+/// Lossy quant is reachable through
+/// [`crate::encoder::encode_key_frame_yuv420_with_q`] (decode ==
+/// encoder reconstruction, bit-exact); monochrome + the historical
+/// non-conformant mirror drivers stay on the crate-public
+/// `encoder::*` entries.
 ///
 /// ## Errors
 ///
 /// * `pixels.len() != width * height + 2 * (width / 2) * (height / 2)`
 ///   ⇒ [`Error::PartitionWalkOutOfRange`].
-/// * Dimensions out of `[8, 64]` per axis or not multiples of 8 ⇒
-///   [`Error::PartitionWalkOutOfRange`] (surfaced via
-///   `encode_intra_frame_yuv_dyn`'s `Yuv420Frame::validate`).
+/// * Dimensions out of `[8, 512]` per axis or not multiples of 8 ⇒
+///   [`Error::PartitionWalkOutOfRange`].
 /// * Internal partition-tree / coefficient writer overflow — same
-///   `Error` variants the dyn driver surfaces.
+///   `Error` variants the driver surfaces.
 pub fn encode_av1(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
-    use crate::encoder::{encode_intra_frame_yuv_dyn, Yuv420Frame};
+    use crate::encoder::{encode_key_frame_yuv420, Yuv420Frame};
     let chroma_w = (width / 2) as usize;
     let chroma_h = (height / 2) as usize;
     let y_size = (width as usize) * (height as usize);
@@ -2592,7 +2593,7 @@ pub fn encode_av1(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Err
         u: u_bytes.to_vec(),
         v: v_bytes.to_vec(),
     };
-    let encoded = encode_intra_frame_yuv_dyn(&frame)?;
+    let encoded = encode_key_frame_yuv420(&frame)?;
     Ok(encoded.ivf_bytes)
 }
 

@@ -1942,29 +1942,23 @@ fn public_encode_av1_decode_av1_roundtrip_16x16_lossless() {
         *byte = (s >> 56) as u8;
     }
     let ivf = encode_av1(&pixels, w, h).expect("public encode_av1 succeeds at 16x16");
-    let decoded = decode_av1(&ivf).expect("public decode_av1 succeeds on dyn-emitted IVF");
+    let decoded = decode_av1(&ivf).expect("public decode_av1 succeeds on the conformant IVF");
     assert_eq!(decoded.len(), 1, "one IVF frame in, one Frame out");
     let expected_y = &pixels[..y_size];
     let expected_u = &pixels[y_size..y_size + uv_size];
     let expected_v = &pixels[y_size + uv_size..];
-    // At exactly 16x16 the decoder's `decode_frame` dispatcher routes
-    // to the fixed-size [`Frame::Yuv420_16x16`] arm (the §5.11.4 single-
-    // root BLOCK_16X16 walk), so the decoded variant is the fixed-shape
-    // one. The pixel bytes round-trip identically to the dyn variant at
-    // any other extent — the only difference is the carrier type.
+    // r409: `encode_av1` emits a CONFORMANT keyframe stream, so the
+    // public decoder routes it through the spec-faithful path and
+    // surfaces `Frame::Spec` (the encoder-mirror variants are reserved
+    // for the historical non-conformant mirror drivers).
     match &decoded[0] {
-        Frame::Yuv420_16x16 { y, u, v } => {
-            for (row, exp_chunk) in expected_y.chunks_exact(w as usize).enumerate() {
-                assert_eq!(&y[row][..], exp_chunk, "Y row {row} bit-exact");
-            }
-            for (row, exp_chunk) in expected_u.chunks_exact((w / 2) as usize).enumerate() {
-                assert_eq!(&u[row][..], exp_chunk, "U row {row} bit-exact");
-            }
-            for (row, exp_chunk) in expected_v.chunks_exact((w / 2) as usize).enumerate() {
-                assert_eq!(&v[row][..], exp_chunk, "V row {row} bit-exact");
-            }
+        Frame::Spec(f) => {
+            assert_eq!((f.width, f.height), (w, h));
+            assert_eq!(f.planes[0], expected_y, "Y bit-exact");
+            assert_eq!(f.planes[1], expected_u, "U bit-exact");
+            assert_eq!(f.planes[2], expected_v, "V bit-exact");
         }
-        other => panic!("expected Yuv420_16x16 at 16x16, got {other:?}"),
+        other => panic!("expected Frame::Spec for the conformant stream, got {other:?}"),
     }
 }
 
@@ -1988,20 +1982,13 @@ fn public_encode_av1_decode_av1_roundtrip_32x24_rectangular_lossless() {
     let ivf = encode_av1(&pixels, w, h).expect("public encode_av1 succeeds at 32x24");
     let decoded = decode_av1(&ivf).expect("public decode_av1 succeeds");
     match &decoded[0] {
-        Frame::Yuv420Dyn {
-            width,
-            height,
-            y,
-            u,
-            v,
-        } => {
-            assert_eq!(*width, w);
-            assert_eq!(*height, h);
-            assert_eq!(y.as_slice(), &pixels[..y_size]);
-            assert_eq!(u.as_slice(), &pixels[y_size..y_size + uv_size]);
-            assert_eq!(v.as_slice(), &pixels[y_size + uv_size..]);
+        Frame::Spec(f) => {
+            assert_eq!((f.width, f.height), (w, h));
+            assert_eq!(f.planes[0], &pixels[..y_size]);
+            assert_eq!(f.planes[1], &pixels[y_size..y_size + uv_size]);
+            assert_eq!(f.planes[2], &pixels[y_size + uv_size..]);
         }
-        other => panic!("expected Yuv420Dyn at 32x24, got {other:?}"),
+        other => panic!("expected Frame::Spec at 32x24, got {other:?}"),
     }
 }
 
@@ -2028,24 +2015,43 @@ fn public_encode_av1_rejects_non_multiple_of_8_dim() {
 }
 
 #[test]
-fn public_encode_av1_rejects_above_max_dim() {
-    use oxideav_av1::encode_av1;
-    // Above the single-SB MAX_DIM (64), the dyn driver's
-    // `Yuv420Frame::validate` surfaces refusal. Wider extents reach the
-    // multi-SB driver, which is not yet plumbed through the
-    // (pixels, width, height) public signature this arc.
+fn public_encode_av1_multi_superblock_and_max_dim_bounds() {
+    use oxideav_av1::{decode_av1, encode_av1};
+    // r409: the conformant keyframe driver accepts up to
+    // KEY_FRAME_MAX_DIM (512) per axis — 72x72 (a 2x2 superblock grid)
+    // round-trips losslessly through the public pair.
     let (w, h) = (72u32, 72u32);
     let y_size = (w * h) as usize;
     let uv_size = ((w / 2) * (h / 2)) as usize;
+    let mut pixels = vec![0u8; y_size + 2 * uv_size];
+    for (i, byte) in pixels.iter_mut().enumerate() {
+        *byte = ((i * 37) % 256) as u8;
+    }
+    let ivf = encode_av1(&pixels, w, h).expect("72x72 multi-SB encode succeeds as of r409");
+    let decoded = decode_av1(&ivf).expect("decode succeeds");
+    match &decoded[0] {
+        Frame::Spec(f) => {
+            assert_eq!(f.planes[0], &pixels[..y_size]);
+            assert_eq!(f.planes[1], &pixels[y_size..y_size + uv_size]);
+            assert_eq!(f.planes[2], &pixels[y_size + uv_size..]);
+        }
+        other => panic!("expected Frame::Spec, got {other:?}"),
+    }
+    // Beyond KEY_FRAME_MAX_DIM the driver still refuses.
+    let (w, h) = (520u32, 8u32);
+    let y_size = (w * h) as usize;
+    let uv_size = ((w / 2) * (h / 2)) as usize;
     let pixels = vec![0u8; y_size + 2 * uv_size];
-    let res = encode_av1(&pixels, w, h);
-    assert!(res.is_err(), "above MAX_DIM dim must fail at this arc");
+    assert!(
+        encode_av1(&pixels, w, h).is_err(),
+        "above KEY_FRAME_MAX_DIM must fail"
+    );
 }
 
 #[test]
 fn public_encode_av1_decode_av1_roundtrip_all_8x8_corner_lossless() {
     use oxideav_av1::{decode_av1, encode_av1};
-    // 8x8 — the minimum aligned extent the dyn driver accepts. The
+    // 8x8 — the minimum aligned extent the keyframe driver accepts. The
     // smallest viable through-the-public-API roundtrip; pins the
     // lower bound of the encode_av1 / decode_av1 envelope.
     let (w, h) = (8u32, 8u32);
@@ -2062,19 +2068,12 @@ fn public_encode_av1_decode_av1_roundtrip_all_8x8_corner_lossless() {
     let ivf = encode_av1(&pixels, w, h).expect("public encode_av1 succeeds at 8x8");
     let decoded = decode_av1(&ivf).expect("public decode_av1 succeeds");
     match &decoded[0] {
-        Frame::Yuv420Dyn {
-            width,
-            height,
-            y,
-            u,
-            v,
-        } => {
-            assert_eq!(*width, w);
-            assert_eq!(*height, h);
-            assert_eq!(y.as_slice(), &pixels[..y_size]);
-            assert_eq!(u.as_slice(), &pixels[y_size..y_size + uv_size]);
-            assert_eq!(v.as_slice(), &pixels[y_size + uv_size..]);
+        Frame::Spec(f) => {
+            assert_eq!((f.width, f.height), (w, h));
+            assert_eq!(f.planes[0], &pixels[..y_size]);
+            assert_eq!(f.planes[1], &pixels[y_size..y_size + uv_size]);
+            assert_eq!(f.planes[2], &pixels[y_size + uv_size..]);
         }
-        other => panic!("expected Yuv420Dyn at 8x8, got {other:?}"),
+        other => panic!("expected Frame::Spec at 8x8, got {other:?}"),
     }
 }

@@ -176,10 +176,12 @@ conformance corpus.
 
 ### What decodes / encodes (intra pixel pipeline)
 
-`encode_av1(pixels, width, height) -> Vec<u8>` (IVF v0 output) and the
-`decode_av1(bytes) -> Vec<Frame>` encoder-MIRROR path (the first of the
-public entry's two decode paths; the second is the spec-driver fallback
-described above) cover a constrained intra-only profile:
+The `decode_av1(bytes) -> Vec<Frame>` encoder-MIRROR path (the first
+of the public entry's two decode paths; the second is the spec-driver
+fallback described above) and the crate-public mirror encoders
+(`encoder::encode_intra_frame_yuv_dyn` and friends — NOT the public
+`encode_av1`, which is conformance-grade as of r409) cover a
+constrained intra-only profile:
 
 - 4:2:0 8-bit YUV or 8-bit monochrome.
 - Intra-only key frames, single tile per frame.
@@ -362,10 +364,12 @@ decoded block's footprint at `decode_delta_lf` (and in the encoder-mirror
 `delta_lf_present == 1` path now deblocks with the correct per-mi strength
 rather than refusing.
 
-The public `encode_av1` entry takes the constrained
-`[8, 64]`-per-axis lossless case; wider extents, lossy quant, and
-monochrome are reachable through the crate-public `encoder::*` driver
-functions. Streams outside the supported scope return a typed `Error`
+The public `encode_av1` entry is, as of r409, the conformance-grade
+KEY-frame encoder (`[8, 512]`-per-axis lossless; see the
+"Conformance-grade encoding" section above). Lossy quant is on
+`encoder::encode_key_frame_yuv420_with_q`; monochrome and the
+historical mirror drivers stay on the crate-public `encoder::*`
+entries. Streams outside the supported scope return a typed `Error`
 (commonly `Error::PartitionWalkOutOfRange`).
 
 ### Conformance-grade encoding (r409)
