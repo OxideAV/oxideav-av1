@@ -108,7 +108,7 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 39 streams byte-exact against
+grain. `tests/fixture_conformance.rs` pins 41 streams byte-exact against
 independent-decoder output (the 16-stream corpus staged under
 `docs/video/av1/fixtures/` plus 10 r394 validator-produced streams —
 QM intra/inter, dual-filter + OBMC, jnt-comp pyramids, cyclic-refresh
@@ -368,6 +368,30 @@ monochrome are reachable through the crate-public `encoder::*` driver
 functions. Streams outside the supported scope return a typed `Error`
 (commonly `Error::PartitionWalkOutOfRange`).
 
+### Conformance-grade encoding (r409)
+
+`encoder::encode_key_frame_yuv420{,_with_q}` is the first
+**conformance-grade** encode path: it emits real §5.11 keyframe syntax
+through the spec-faithful write side (§5.11.7 `intra_frame_mode_info`
+with the neighbour-CDF `intra_frame_y_mode`, §5.11.22 `uv_mode` +
+§5.11.45 CFL alphas, §5.11.34 per-TU residual with live §8.3.2
+contexts), assembled as IVF → TD + SH + the combined §5.10 `OBU_FRAME`.
+Scope: 8-bit 4:2:0, dims multiples of 8 in [8, 512] per axis
+(multi-superblock beyond 64), BLOCK_4X4 leaves, SSD mode decision over
+the 7 exact-mirrorable intra modes + a chroma CFL alpha grid, lossless
+WHT arm (`q = 0`: decode == input bit-exact) and lossy DCT arm (decode
+== encoder reconstruction bit-exact). Validated three ways: the
+in-tree spec driver, and TWO independent reference decoders (run as
+black-box binaries) all produce byte-identical output on every tested
+config; two self-encoded streams are pinned in the conformance corpus
+(41 total). Two encoder-side conformance root causes fell out of the
+work — §5.3.4 `trailing_bits` placed bit-precisely by the OBU body
+writers (the old framer-appended `0x80` landed the one-bit a byte late
+on mid-byte syntax ends), and the §8.2.4 arithmetic-coder termination
+(`SymbolWriter::finish` now lands the trailing one-bit exactly at
+`trailingBitPosition`; independent decoders enforce the check and
+rejected every prior tile).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -375,10 +399,13 @@ functions. Streams outside the supported scope return a typed `Error`
   unit-tested, but no conformance stream pins them — the black-box
   encoder's CLI cannot signal those features (`SEG_LVL_ALT_Q` streams
   are pinned byte-exact).
-- The historical fixed-16×16 intra `encode_av1` path emits streams
-  independent decoders reject (non-conformant); its self round-trip
-  through `decode_av1` still holds. Conformance-grade encoding is a
-  follow-up.
+- The historical intra `encode_av1` mirror paths emit non-conformant
+  streams (kept for their bit-exact self round-trip through
+  `decode_av1`'s mirror arm); conformance-grade encoding lives on
+  `encoder::encode_key_frame_yuv420`. Conformant encoding beyond the
+  keyframe scope above (D-mode/palette/filter-intra leaves, larger
+  partitions/TX sizes, RD-driven decisions, inter P-frames) is the
+  follow-up ladder.
 
 ## Module layout
 
