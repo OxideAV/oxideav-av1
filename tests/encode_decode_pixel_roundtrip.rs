@@ -2018,7 +2018,7 @@ fn public_encode_av1_rejects_non_multiple_of_8_dim() {
 fn public_encode_av1_multi_superblock_and_max_dim_bounds() {
     use oxideav_av1::{decode_av1, encode_av1};
     // r409: the conformant keyframe driver accepts up to
-    // KEY_FRAME_MAX_DIM (512) per axis — 72x72 (a 2x2 superblock grid)
+    // KEY_FRAME_MAX_DIM (4096 as of r410) per axis — 72x72 (a 2x2 SB grid)
     // round-trips losslessly through the public pair.
     let (w, h) = (72u32, 72u32);
     let y_size = (w * h) as usize;
@@ -2037,8 +2037,9 @@ fn public_encode_av1_multi_superblock_and_max_dim_bounds() {
         }
         other => panic!("expected Frame::Spec, got {other:?}"),
     }
-    // Beyond KEY_FRAME_MAX_DIM the driver still refuses.
-    let (w, h) = (520u32, 8u32);
+    // Beyond KEY_FRAME_MAX_DIM (4096 as of r410) the driver still
+    // refuses.
+    let (w, h) = (oxideav_av1::encoder::KEY_FRAME_MAX_DIM + 8, 8u32);
     let y_size = (w * h) as usize;
     let uv_size = ((w / 2) * (h / 2)) as usize;
     let pixels = vec![0u8; y_size + 2 * uv_size];

@@ -365,7 +365,7 @@ decoded block's footprint at `decode_delta_lf` (and in the encoder-mirror
 rather than refusing.
 
 The public `encode_av1` entry is, as of r409, the conformance-grade
-KEY-frame encoder (`[8, 512]`-per-axis lossless; see the
+KEY-frame encoder (`[8, 4096]`-per-axis lossless as of r410; see the
 "Conformance-grade encoding" section above). Lossy quant is on
 `encoder::encode_key_frame_yuv420_with_q`; monochrome and the
 historical mirror drivers stay on the crate-public `encoder::*`
@@ -380,7 +380,7 @@ through the spec-faithful write side (§5.11.7 `intra_frame_mode_info`
 with the neighbour-CDF `intra_frame_y_mode`, §5.11.22 `uv_mode` +
 §5.11.45 CFL alphas, §5.11.34 per-TU residual with live §8.3.2
 contexts), assembled as IVF → TD + SH + the combined §5.10 `OBU_FRAME`.
-Scope (r410): 8-bit 4:2:0, dims multiples of 8 in [8, 512] per axis
+Scope (r410): 8-bit 4:2:0, dims multiples of 8 in [8, 4096] per axis
 (multi-superblock beyond 64), **full square partition-tree RD search**
 — every in-frame node from BLOCK_64X64 down to BLOCK_8X8 trial-encoded
 leaf-vs-split with region/state snapshot-restore (frame-edge nodes take

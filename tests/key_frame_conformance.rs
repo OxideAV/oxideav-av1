@@ -201,6 +201,16 @@ fn key_frame_extreme_aspect_ratios_round_trip() {
     assert_key_frame_round_trip(72, 56, 35);
 }
 
+/// r410: the dimension cap rises 512 → 4096; a 640×360 frame (SD —
+/// kept moderate so the debug-profile suite stays fast) round-trips
+/// on both arms. 720p/1080p/4K extents were validated byte-exact
+/// against three independent black-box decoders during the round.
+#[test]
+fn key_frame_sd_extent_round_trips() {
+    assert_key_frame_round_trip(640, 360, 0);
+    assert_key_frame_round_trip(640, 360, 110);
+}
+
 /// r410: diagonal stripe fields at non-45° slopes make the mode picker
 /// select directional D-modes with non-zero §5.11.42/§5.11.43 angle
 /// deltas (verified during the round via a pick-probe); the streams

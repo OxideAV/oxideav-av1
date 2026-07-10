@@ -147,8 +147,11 @@ pub struct EncodedKeyFrame {
     pub fh: FrameHeader,
 }
 
-/// Per-axis extent bound (inclusive) for [`encode_key_frame_yuv420`].
-pub const KEY_FRAME_MAX_DIM: u32 = 512;
+/// Per-axis extent bound (inclusive) for [`encode_key_frame_yuv420`]
+/// — r410 raises the r409 `512` cap to `4096` (the RD search works
+/// superblock-by-superblock, so state stays flat; HD/UHD extents were
+/// validated against independent black-box decoders during the round).
+pub const KEY_FRAME_MAX_DIM: u32 = 4096;
 
 /// §5.11.45 (αU, αV) candidate grid for the chroma `UV_CFL_PRED` arm —
 /// the same compact set the dyn mirror driver enumerates.
