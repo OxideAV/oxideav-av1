@@ -33906,15 +33906,27 @@ impl PartitionWalker {
                 }
             }
         }
-        // For single-pred, the §7.10.2.12 note states NumMvFound is
-        // NOT incremented by the global-motion fill — only the
-        // RefStackMv[idx][0] slot is written for idx in
-        // [NumMvFound..2). The downstream §5.11.23 GLOBALMV arm
-        // consumes RefStackMv[*][0] regardless of NumMvFound.
-        // Surface the global fill in the dedicated `global_mvs` field
-        // of the result; the §7.10.2.12 single-pred RefStackMv
-        // global-tail extension is omitted because every downstream
-        // reader of that tail also has direct access to GlobalMvs.
+        // §7.10.2.12 single-pred tail: "the candidates have already
+        // been added to RefStackMv, and this process simply extends
+        // with global motion candidates":
+        //
+        //   for ( idx = NumMvFound; idx < 2; idx++ )
+        //       RefStackMv[ idx ][ 0 ] = GlobalMvs[ 0 ]
+        //
+        // NumMvFound is NOT incremented (spec note), and the
+        // §7.10.2.14 clamp loop (`idx < NumMvFound`) never touches
+        // these slots — but §5.11.26 `assign_mv` DOES read them: a
+        // NEARESTMV block with an empty stack takes
+        // `PredMv[ 0 ] = RefStackMv[ 0 ][ 0 ]`, and a NEARMV block
+        // with `NumMvFound == 1` takes `RefStackMv[ RefMvIdx = 1 ]`.
+        // Omitting the fill left those reads at the zero prefill,
+        // which diverges whenever GlobalMvs[ 0 ] is nonzero (any
+        // TRANSLATION/ROTZOOM/AFFINE global-motion reference).
+        if !is_compound {
+            for idx in (state.num_mv_found as usize)..2 {
+                state.ref_stack_mv[idx][0] = global_mvs[0];
+            }
+        }
     }
 
     /// §7.10.2.13 add_extra_mv_candidate. Populates `RefIdMvs[list]` /

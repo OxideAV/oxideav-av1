@@ -55,6 +55,36 @@ horizontally, slot 0 vertically), candidate-cell filters on the
 not re-derivable from the qualifying list), and clipped `CurrFrame`
 stitches for §5.11.4 bottom/right-edge overhanging inter blocks.
 
+r405 lands scaled-reference motion compensation (references of a
+DIFFERENT resolution through the §7.11.3.3 scaling process, luma-unit
+dimension contract), §7.11.3.1 intra-block-copy prediction, the
+§5.11.2/§5.11.7 `ReadDeltas` delta-q lifecycle, and the SIMPLE-GLOBALMV
+global-warp arm — 32 streams pinned. r408 closes three
+spec-conformance root causes found against textured (mandelbrot /
+testsrc) GOP sweeps: (1) the §7.10.2.12 extra-search single-pred tail —
+`RefStackMv[ idx ][ 0 ] = GlobalMvs[ 0 ]` for `idx = NumMvFound..2`
+without incrementing `NumMvFound` — was omitted entirely, so every
+NEARESTMV/NEARMV block with an empty ref-MV stack on a global-motion
+frame (top-edge blocks of zooming content) predicted a zero MV instead
+of the warp-projected global MV; (2) §7.11.3.5 block-warp rounding uses
+the §3 PLAIN `Round2` for `offs` / `intermediate` / `pred` — the
+previous `Round2Signed` picked the adjacent warp-filter phase whenever
+the shear walked `sx` negative, leaving isolated ±1 sample diffs on
+compound GLOBAL_GLOBALMV blocks that propagated through the reference
+chain; (3) §5.11.27 `is_scaled( refFrame )` divides by the CODED
+`FrameWidth`/`FrameHeight` per the spec body, so a superres inter
+frame's references are correctly "scaled" even though every upscaled
+extent matches — the upscaled-vs-upscaled shortcut desynchronised the
+arithmetic decoder (`motion_mode` read where the encoder wrote
+`use_obmc`) on the first superres inter frame. With all three fixed,
+full-superres GOPs (every frame coded at denominator 12 with loop
+restoration at the §7.17 upscaled extent), resize-mode GOPs, and
+default alt-ref-pyramid GOPs over textured content decode byte-exact —
+a 36-config black-box encoder sweep (superres fixed/random, resize
+fixed/random, global-motion on/off, order-hint off, cq 10-50, cpu-used
+2-6, extra tile columns, three lavfi sources) passes with zero
+mismatches. 35 streams pinned.
+
 ### Conformance-validated decode (r384 intra, r387 inter, r390 session state, r394 QM / segmentation / edge cases)
 
 `decoder::decode_av1_spec(ivf_bytes) -> Vec<SpecFrame>` is the
@@ -67,7 +97,7 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 26 streams byte-exact against
+grain. `tests/fixture_conformance.rs` pins 35 streams byte-exact against
 independent-decoder output (the 16-stream corpus staged under
 `docs/video/av1/fixtures/` plus 10 r394 validator-produced streams —
 QM intra/inter, dual-filter + OBMC, jnt-comp pyramids, cyclic-refresh
@@ -327,15 +357,6 @@ functions. Streams outside the supported scope return a typed `Error`
   unit-tested, but no conformance stream pins them — the black-box
   encoder's CLI cannot signal those features (`SEG_LVL_ALT_Q` streams
   are pinned byte-exact).
-- Loop restoration on RESIZED inter frames (LR units at the reduced
-  `FrameWidth`) diverges on textured content; CDEF on one resized
-  GOP differs by a single byte — both localised to the post-filter
-  chain, under investigation.
-- One multi-reference GOP entropy divergence: a late alt-ref-pyramid
-  inter frame (LAST+BWDREF compound with temporal MV projection
-  across 4+ stored references) diverges mid-frame on textured
-  content; the KEY + first alt-ref temporal unit of the same GOP is
-  byte-exact and pinned.
 - The historical fixed-16×16 intra `encode_av1` path emits streams
   independent decoders reject (non-conformant); its self round-trip
   through `decode_av1` still holds. Conformance-grade encoding is a

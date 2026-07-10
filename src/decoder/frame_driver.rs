@@ -533,10 +533,35 @@ fn decode_frame_spec_full(
                         > 0,
                 );
             }
-            // §5.11.27 `is_scaled( refFrame )`: the stored dims differ
-            // from the current frame's.
-            is_scaled_per_ref[i] = st.info.upscaled_width[slot] != fs.upscaled_width
-                || st.info.frame_height[slot] != fs.frame_height;
+            // §5.11.27 `is_scaled( refFrame )` — the literal spec body:
+            //
+            //   xScale = ( ( RefUpscaledWidth[ refIdx ] << REF_SCALE_SHIFT )
+            //              + ( FrameWidth / 2 ) ) / FrameWidth
+            //   yScale = ( ( RefFrameHeight[ refIdx ] << REF_SCALE_SHIFT )
+            //              + ( FrameHeight / 2 ) ) / FrameHeight
+            //   return xScale != noScale || yScale != noScale
+            //
+            // The divisor is the CODED `FrameWidth`/`FrameHeight`, NOT
+            // `UpscaledWidth` (r408 fix): a superres frame codes at
+            // `FrameWidth < UpscaledWidth` while its references store
+            // `RefUpscaledWidth == UpscaledWidth`, so every reference
+            // IS scaled even though the upscaled extents match. The
+            // pre-r408 upscaled-vs-upscaled shortcut read the §5.11.27
+            // `motion_mode` symbol where the encoder wrote `use_obmc`,
+            // desynchronising the arithmetic decoder on the first
+            // superres inter frame.
+            let no_scale = 1u64 << crate::inter_pred::REF_SCALE_SHIFT;
+            let fw = u64::from(fs.frame_width.max(1));
+            let fhh = u64::from(fs.frame_height.max(1));
+            let x_scale = ((u64::from(st.info.upscaled_width[slot])
+                << crate::inter_pred::REF_SCALE_SHIFT)
+                + fw / 2)
+                / fw;
+            let y_scale = ((u64::from(st.info.frame_height[slot])
+                << crate::inter_pred::REF_SCALE_SHIFT)
+                + fhh / 2)
+                / fhh;
+            is_scaled_per_ref[i] = x_scale != no_scale || y_scale != no_scale;
         }
     }
     let order_hints = FrameInterOrderHints {

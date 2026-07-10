@@ -4371,9 +4371,14 @@ pub fn block_warp(
     for i1 in -7i32..8 {
         for i2 in -4i32..4 {
             let sx: i64 = sx4 + alpha * (i2 as i64) + beta * (i1 as i64);
-            // Round2(sx, WARPEDDIFF_PREC_BITS) + WARPEDPIXEL_PREC_SHIFTS.
+            // §7.11.3.5 `offs = Round2(sx, WARPEDDIFF_PREC_BITS) +
+            // WARPEDPIXEL_PREC_SHIFTS` — plain Round2 (the §3
+            // arithmetic-shift form), NOT Round2Signed: for negative
+            // `sx` the two differ by one, selecting the adjacent
+            // filter phase (r408 fix — warp blocks whose shear walks
+            // `sx` negative produced isolated ±1 sample diffs).
             let offs_signed: i64 =
-                round2_signed(sx, WARPEDDIFF_PREC_BITS) + (WARPEDPIXEL_PREC_SHIFTS as i64);
+                round2(sx, WARPEDDIFF_PREC_BITS) + (WARPEDPIXEL_PREC_SHIFTS as i64);
             // §7.11.3.5 filter-table index is non-negative in
             // well-formed inputs but a buggy caller could produce
             // an out-of-range index; clamp to keep the indexing safe.
@@ -4389,8 +4394,9 @@ pub fn block_warp(
                 let rx = warp_clip3_i32(0, last_x, ix4 + i2 - 3 + (i3 as i32)) as usize;
                 s += (*coef as i64) * (ref_plane[base + rx] as i64);
             }
-            intermediate[(i1 + 7) as usize][(i2 + 4) as usize] =
-                round2_signed(s, inter_round0) as i32;
+            // §7.11.3.5 `intermediate[..] = Round2(s, InterRound0)` —
+            // plain Round2 (negative sums round toward -∞ + carry).
+            intermediate[(i1 + 7) as usize][(i2 + 4) as usize] = round2(s, inter_round0) as i32;
         }
     }
 
@@ -4404,8 +4410,9 @@ pub fn block_warp(
     for i1 in -4i32..i_limit {
         for i2 in -4i32..j_limit {
             let sy: i64 = sy4 + gamma * (i2 as i64) + delta * (i1 as i64);
+            // §7.11.3.5: plain Round2, as on the horizontal pass.
             let offs_signed: i64 =
-                round2_signed(sy, WARPEDDIFF_PREC_BITS) + (WARPEDPIXEL_PREC_SHIFTS as i64);
+                round2(sy, WARPEDDIFF_PREC_BITS) + (WARPEDPIXEL_PREC_SHIFTS as i64);
             let offs = warp_clip3_i32(
                 0,
                 (WARPEDPIXEL_PREC_SHIFTS * 3) as i32,
@@ -4421,7 +4428,8 @@ pub fn block_warp(
             }
             let row = (i8b as usize) * 8 + (i1 + 4) as usize;
             let col = (j8b as usize) * 8 + (i2 + 4) as usize;
-            pred[row * pred_stride + col] = round2_signed(s, inter_round1) as i32;
+            // §7.11.3.5 `pred[..] = Round2(s, InterRound1)` — plain Round2.
+            pred[row * pred_stride + col] = round2(s, inter_round1) as i32;
         }
     }
 
