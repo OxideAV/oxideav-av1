@@ -15824,6 +15824,10 @@ pub struct PartitionWalker {
     /// pre-`Clip1` `prediction + Residual[i][j]` sum fits without
     /// truncation across all `BitDepth ∈ {8, 10, 12}` modes.
     curr_frame: [Option<CurrFramePlane>; 3],
+    /// r408 — §7.11.5 luma TU-overhang side store (see
+    /// [`LumaOverhang`]). Lazily allocated on the first clipped
+    /// plane-0 write.
+    luma_overhang: Option<Box<LumaOverhang>>,
     /// `RefLrWiener[ plane ][ pass ][ WIENER_COEFFS ]` (§5.11.2 /
     /// §5.11.58 — av1-spec p.60 / p.106). The per-plane, per-pass
     /// running reference for the §5.11.58 `decode_signed_subexp_with_ref_bool`
@@ -15909,6 +15913,111 @@ struct CurrFramePlane {
     rows: u32,
     cols: u32,
     samples: Vec<i32>,
+}
+
+/// r408 — §7.11.5 luma TU-overhang store. The spec's `CurrFrame[ 0 ]`
+/// is conceptually unbounded: a §5.11.35 transform block whose
+/// `startX < maxX` is decoded at its FULL `Tx_Width × Tx_Height`
+/// extent, so its reconstruction can overhang the `MiCols * MI_SIZE`
+/// padded grid by up to `Tx_Width - MI_SIZE` samples. The ONLY reader
+/// of those beyond-grid samples is the §7.11.5 chroma-from-luma
+/// process (its `Min( lumaX, MaxLumaW - (1 << subX) )` clamp reaches
+/// the last luma TU's edge, which §7.11.2's own `maxX` clamp never
+/// does), so the walker keeps the overhang in three side strips
+/// instead of widening every plane buffer's stride: `right` covers
+/// `x ∈ [cols, cols + LUMA_OH)`, `bottom` covers `y ∈ [rows, rows +
+/// LUMA_OH)`, `corner` both. `LUMA_OH = 64` bounds the largest
+/// possible overhang (`Tx_Width ≤ 64`).
+#[derive(Debug)]
+struct LumaOverhang {
+    rows: u32,
+    cols: u32,
+    /// `rows × LUMA_OH`, row-major.
+    right: Vec<i32>,
+    /// `LUMA_OH × cols`, row-major.
+    bottom: Vec<i32>,
+    /// `LUMA_OH × LUMA_OH`, row-major.
+    corner: Vec<i32>,
+}
+
+/// Maximum §5.11.35 luma TU overhang past the mi-padded grid.
+const LUMA_OH: u32 = 64;
+
+impl LumaOverhang {
+    fn new(rows: u32, cols: u32) -> Option<Box<Self>> {
+        let r = (rows as usize).checked_mul(LUMA_OH as usize)?;
+        let b = (LUMA_OH as usize).checked_mul(cols as usize)?;
+        let mut right = Vec::new();
+        right.try_reserve_exact(r).ok()?;
+        right.resize(r, 0);
+        let mut bottom = Vec::new();
+        bottom.try_reserve_exact(b).ok()?;
+        bottom.resize(b, 0);
+        Some(Box::new(Self {
+            rows,
+            cols,
+            right,
+            bottom,
+            corner: vec![0i32; (LUMA_OH as usize) * (LUMA_OH as usize)],
+        }))
+    }
+
+    /// Sample at `(y, x)` in luma-plane coordinates; `0` for a cell
+    /// past the `LUMA_OH` headroom (unreachable for conformant TUs).
+    fn get(&self, y: u32, x: u32) -> i32 {
+        if y < self.rows && x < self.cols {
+            return 0; // main-buffer region — caller bug; inert.
+        }
+        if y < self.rows {
+            let ox = x - self.cols;
+            if ox >= LUMA_OH {
+                return 0;
+            }
+            return self.right[(y as usize) * (LUMA_OH as usize) + (ox as usize)];
+        }
+        let oy = y - self.rows;
+        if oy >= LUMA_OH {
+            return 0;
+        }
+        if x < self.cols {
+            return self.bottom[(oy as usize) * (self.cols as usize) + (x as usize)];
+        }
+        let ox = x - self.cols;
+        if ox >= LUMA_OH {
+            return 0;
+        }
+        self.corner[(oy as usize) * (LUMA_OH as usize) + (ox as usize)]
+    }
+
+    fn slot(&mut self, y: u32, x: u32) -> Option<&mut i32> {
+        if y < self.rows && x < self.cols {
+            return None;
+        }
+        if y < self.rows {
+            let ox = x.checked_sub(self.cols)?;
+            if ox >= LUMA_OH {
+                return None;
+            }
+            return self
+                .right
+                .get_mut((y as usize) * (LUMA_OH as usize) + (ox as usize));
+        }
+        let oy = y - self.rows;
+        if oy >= LUMA_OH {
+            return None;
+        }
+        if x < self.cols {
+            return self
+                .bottom
+                .get_mut((oy as usize) * (self.cols as usize) + (x as usize));
+        }
+        let ox = x - self.cols;
+        if ox >= LUMA_OH {
+            return None;
+        }
+        self.corner
+            .get_mut((oy as usize) * (LUMA_OH as usize) + (ox as usize))
+    }
 }
 
 /// Per-plane §7.17 loop-restoration unit grid — the persistent home for
@@ -16365,6 +16474,7 @@ impl PartitionWalker {
             // lazily on the first per-plane merge call (see
             // [`Self::ensure_curr_frame_plane`]).
             curr_frame: [None, None, None],
+            luma_overhang: None,
             // §5.11.2 tile-entry reset: RefLrWiener[plane][pass][j] =
             // Wiener_Taps_Mid[j], RefSgrXqd[plane][pass] =
             // Sgrproj_Xqd_Mid[pass]. The fresh-walker pre-fill matches
@@ -16502,6 +16612,28 @@ impl PartitionWalker {
     /// initial fill is `0` per the §7.12.3 step-3 additive-merge
     /// identity (`Clip1(0 + Residual[i][j])` before any §7.11.x
     /// prediction writer has fired).
+    /// r408 — route a clipped plane-0 write into the §7.11.5
+    /// [`LumaOverhang`] side store (lazily allocated / re-shaped to
+    /// the current luma extents). Returns `None` when `(y, x)` is
+    /// inside the main buffer or past the `LUMA_OH` headroom.
+    fn luma_overhang_slot(&mut self, y: u32, x: u32) -> Option<&mut i32> {
+        let (rows, cols) = {
+            let b = self.curr_frame[0].as_ref()?;
+            (b.rows, b.cols)
+        };
+        if y < rows && x < cols {
+            return None;
+        }
+        let needs_alloc = match self.luma_overhang.as_ref() {
+            Some(oh) => oh.rows != rows || oh.cols != cols,
+            None => true,
+        };
+        if needs_alloc {
+            self.luma_overhang = LumaOverhang::new(rows, cols);
+        }
+        self.luma_overhang.as_mut()?.slot(y, x)
+    }
+
     fn ensure_curr_frame_plane(&mut self, plane: usize, rows: u32, cols: u32) {
         if plane >= 3 {
             return;
@@ -16843,18 +16975,29 @@ impl PartitionWalker {
             return;
         };
         let cols_buf = buf.cols;
+        let rows_buf = buf.rows;
+        // r408: a §5.11.35 TU legally overhangs the mi-padded grid;
+        // §7.11.5 CfL reads the overhung luma samples back (spec
+        // CurrFrame is unbounded), so plane-0 out-of-buffer cells go
+        // to the [`LumaOverhang`] side store instead of being dropped.
+        let mut overhang: Vec<(u32, u32, i32)> = Vec::new();
         for i in 0..h as u32 {
             let dst_y = start_y + i;
-            if dst_y >= buf.rows {
-                break;
-            }
             for j in 0..w as u32 {
                 let dst_x = start_x + j;
-                if dst_x >= cols_buf {
-                    break;
+                if dst_y >= rows_buf || dst_x >= cols_buf {
+                    if plane == 0 {
+                        overhang.push((dst_y, dst_x, pred[(i as usize) * w + (j as usize)] as i32));
+                    }
+                    continue;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
                 buf.samples[idx] = pred[(i as usize) * w + (j as usize)] as i32;
+            }
+        }
+        for (y, x, v) in overhang {
+            if let Some(slot) = self.luma_overhang_slot(y, x) {
+                *slot = v;
             }
         }
     }
@@ -16914,20 +17057,29 @@ impl PartitionWalker {
             return;
         }
         // §7.11.5 luma-extent clamps. `MaxLumaW` / `MaxLumaH` are the
-        // §5.11.35 per-luma-TU `startX + stepX*4` / `startY + stepY*4`;
-        // they also cannot exceed the allocated luma plane (the §5.11.35
-        // `maxX` / `maxY` frame bounds), so clamp to the buffer extent.
-        let max_luma_w = self.max_luma_w.min(luma_cols);
-        let max_luma_h = self.max_luma_h.min(luma_rows);
+        // §5.11.35 per-luma-TU `startX + stepX*4` / `startY + stepY*4`.
+        // r408: they legally EXCEED the mi-padded plane when the last
+        // luma TU overhangs the grid (§5.11.35 decodes any TU with
+        // `startX < maxX` at its full extent); the overhung samples
+        // live in the [`LumaOverhang`] side store, so no buffer fold
+        // is applied here.
+        let max_luma_w = self.max_luma_w;
+        let max_luma_h = self.max_luma_h;
         // `MaxLumaW - (1 << subX)` can underflow if a degenerate caller
         // never set the luma extent; guard with a saturating sub.
         let clamp_x = max_luma_w.saturating_sub(1u32 << sub_x);
         let clamp_y = max_luma_h.saturating_sub(1u32 << sub_y);
 
+        // r408: the §7.11.5 `Min( lumaX, MaxLumaW - (1 << subX) )`
+        // clamp legally reaches PAST the mi-padded luma plane (the
+        // last luma TU's overhang — spec `CurrFrame` is unbounded);
+        // those samples live in the [`LumaOverhang`] side store.
+        let overhang = self.luma_overhang.as_deref();
         let read_luma = |yy: u32, xx: u32| -> i64 {
-            let cy = yy.min(luma_rows.saturating_sub(1));
-            let cx = xx.min(luma_cols.saturating_sub(1));
-            luma.samples[(cy as usize) * (luma_cols as usize) + (cx as usize)] as i64
+            if yy < luma_rows && xx < luma_cols {
+                return luma.samples[(yy as usize) * (luma_cols as usize) + (xx as usize)] as i64;
+            }
+            overhang.map_or(0, |oh| oh.get(yy, xx)) as i64
         };
 
         let mut l = vec![0i64; w * h];
@@ -17055,7 +17207,12 @@ impl PartitionWalker {
             return;
         };
         let cols_buf = buf.cols;
+        let rows_buf = buf.rows;
         let max = (1i32 << bit_depth) - 1;
+        // r408: plane-0 out-of-buffer cells merge into the §7.11.5
+        // [`LumaOverhang`] side store (`(dst_y, dst_x, residual)`
+        // gathered here, applied after the plane borrow ends).
+        let mut overhang: Vec<(u32, u32, i64)> = Vec::new();
         // §7.12.3 step-3 inner loop. `for i in 0..h for j in 0..w`.
         for i in 0..h {
             for j in 0..w {
@@ -17063,7 +17220,14 @@ impl PartitionWalker {
                 let xx = if flip_lr { w - j - 1 } else { j };
                 let dst_y = start_y + yy;
                 let dst_x = start_x + xx;
-                if dst_y >= buf.rows || dst_x >= cols_buf {
+                if dst_y >= rows_buf || dst_x >= cols_buf {
+                    if plane == 0 {
+                        overhang.push((
+                            dst_y,
+                            dst_x,
+                            residual[(i as usize) * (w as usize) + (j as usize)],
+                        ));
+                    }
                     continue;
                 }
                 let idx = (dst_y as usize) * (cols_buf as usize) + (dst_x as usize);
@@ -17079,6 +17243,12 @@ impl PartitionWalker {
                     sum as i32
                 };
                 buf.samples[idx] = clipped;
+            }
+        }
+        for (y, x, res) in overhang {
+            if let Some(slot) = self.luma_overhang_slot(y, x) {
+                let sum = (*slot as i64).saturating_add(res);
+                *slot = sum.clamp(0, max as i64) as i32;
             }
         }
     }
@@ -17191,6 +17361,11 @@ impl PartitionWalker {
                 leaf,
                 ref_frame_idx,
                 bit_depth,
+                // Translational inter half — this walker bridge
+                // carries no §5.9.24 global-motion context; the
+                // in-walk §5.11.33 route supplies the §7.11.3.1
+                // step-7 warp context for GLOBALMV-class leaves.
+                None,
                 &mut planes,
             )?;
         }
@@ -20963,21 +21138,30 @@ impl PartitionWalker {
 
     /// §5.11.2 `decode_tile()` per-tile entry state — point the walker
     /// at a new tile's [`TileGeometry`] and perform the tile-scope
-    /// resets the spec runs before the superblock loop: the row-indexed
-    /// left entropy contexts (`Left{Level,Dc}Context` /
+    /// resets the spec runs before the superblock loop: the
+    /// `clear_above_context()` column-indexed above entropy contexts
+    /// (`Above{Level,Dc}Context` / `AboveSegPredContext` — a tile in a
+    /// SECOND tile row would otherwise observe the tile above it;
+    /// r408 fix, the pre-r408 reset covered only the left arrays and
+    /// desynced every multi-tile-ROW frame), the row-indexed left
+    /// entropy contexts (`Left{Level,Dc}Context` /
     /// `LeftSegPredContext` — shared across horizontally-adjacent
     /// tiles, so a later tile must not observe an earlier tile's
     /// state), the §5.11.13 `DeltaLF` accumulator, and the §5.11.58
     /// running loop-restoration references (`RefLrWiener` /
-    /// `RefSgrXqd`). Column-indexed above contexts need no reset here:
-    /// tiles partition the columns, so a single-pass frame walk never
-    /// revisits another tile's columns.
+    /// `RefSgrXqd`).
     ///
     /// The frame-scope decode grids (`MiSizes[]`, `CurrFrame[]`, the
     /// mode/skip/tx grids, decoded LR units) are deliberately retained
     /// — they accumulate across every tile of the frame.
     pub fn begin_tile(&mut self, geometry: TileGeometry) {
         self.geometry = geometry;
+        // §5.11.2 `clear_above_context()` — zero `AboveLevelContext`,
+        // `AboveDcContext` and `AboveSegPredContext` over the full
+        // `MiCols` extent at every tile entry.
+        self.above_level_context.fill(0);
+        self.above_dc_context.fill(0);
+        self.above_seg_pred_context.fill(0);
         self.clear_txb_left_context();
         self.current_delta_lf = [0; FRAME_LF_COUNT];
         self.reset_lr_refs();
@@ -60940,6 +61124,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )

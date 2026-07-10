@@ -80,10 +80,21 @@ arithmetic decoder (`motion_mode` read where the encoder wrote
 full-superres GOPs (every frame coded at denominator 12 with loop
 restoration at the §7.17 upscaled extent), resize-mode GOPs, and
 default alt-ref-pyramid GOPs over textured content decode byte-exact —
-a 36-config black-box encoder sweep (superres fixed/random, resize
-fixed/random, global-motion on/off, order-hint off, cq 10-50, cpu-used
-2-6, extra tile columns, three lavfi sources) passes with zero
-mismatches. 35 streams pinned.
+a 54-config black-box encoder sweep (superres fixed/random, resize
+fixed/random, global-motion on/off, order-hint off, cq 0-50, cpu-used
+1-6, 10/12-bit, 4:4:4 / 4:2:2 / monochrome, screen content + intrabc,
+128×128 superblocks, 2×2 tiles, error-resilient, S-frames, film grain,
+arnr, three synthetic sources) passes with zero mismatches. The sweep
+uncovered and r408 fixed four more root causes: §5.11.2
+`clear_above_context()` at every tile entry (multi-tile-ROW frames
+desynced their second tile row's coefficient contexts), the
+§7.11.3.1 `useWarp = 2` arm on the INTER HALF of inter-intra blends
+(GLOBALMV interintra leaves translated where the spec warps), §7.20
+film-grain forwarding (`save_grain_params` / the §5.9.30
+`update_grain == 0` predicted load / grain on `show_existing_frame`
+outputs), and the §7.11.5 CfL luma TU-overhang store (spec
+`CurrFrame[ 0 ]` extends past the mi grid; the `MaxLumaW` clamp reads
+it). 39 streams pinned.
 
 ### Conformance-validated decode (r384 intra, r387 inter, r390 session state, r394 QM / segmentation / edge cases)
 
@@ -97,7 +108,7 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 35 streams byte-exact against
+grain. `tests/fixture_conformance.rs` pins 39 streams byte-exact against
 independent-decoder output (the 16-stream corpus staged under
 `docs/video/av1/fixtures/` plus 10 r394 validator-produced streams —
 QM intra/inter, dual-filter + OBMC, jnt-comp pyramids, cyclic-refresh

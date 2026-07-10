@@ -5781,6 +5781,7 @@ pub fn reconstruct_inter_block_interintra(
     interp_filter_x: u8,
     interp_filter_y: u8,
     wedge_mask_buf: Option<&mut [u8]>,
+    warp: Option<&WarpDriverParams>,
     curr_plane: &mut [u16],
     curr_stride: usize,
 ) -> Result<(), crate::Error> {
@@ -5926,7 +5927,7 @@ pub fn reconstruct_inter_block_interintra(
         &refs,
         /* compound */ None,
         wedge_params,
-        /* warp */ None,
+        warp,
         /* obmc */ None,
         &mut pred_out,
     )?;
@@ -6011,6 +6012,7 @@ pub fn reconstruct_inter_intra_block(
     leaf: &InterIntraLeaf,
     ref_frame_idx: &[u8],
     bit_depth: u8,
+    warp: Option<&WarpDriverParams>,
     planes: &mut [PlaneReconContext<'_>],
 ) -> Result<(), crate::Error> {
     if leaf.mi_size >= crate::cdf::BLOCK_SIZES {
@@ -6054,6 +6056,7 @@ pub fn reconstruct_inter_intra_block(
             leaf.interp_filter_x,
             leaf.interp_filter_y,
             wedge_buf.as_deref_mut(),
+            warp,
             ctx.curr,
             ctx.curr_stride,
         )?;
@@ -6093,6 +6096,7 @@ pub fn reconstruct_inter_intra_from_dispatch(
     leaf: &InterIntraLeaf,
     ref_frame_idx: &[u8],
     bit_depth: u8,
+    warp: Option<&WarpDriverParams>,
     planes: &mut [PlaneReconContext<'_>],
 ) -> Result<(), crate::Error> {
     // The dispatcher must have taken the §5.11.33 `IsInterIntra` arm.
@@ -6129,7 +6133,7 @@ pub fn reconstruct_inter_intra_from_dispatch(
         }
     }
 
-    reconstruct_inter_intra_block(leaf, ref_frame_idx, bit_depth, planes)
+    reconstruct_inter_intra_block(leaf, ref_frame_idx, bit_depth, warp, planes)
 }
 
 // =====================================================================
@@ -7032,9 +7036,71 @@ pub(crate) fn reconstruct_inter_leaf_at(
             interp_filter_x: interp_x,
             interp_filter_y: interp_y,
         };
+        // §7.11.3.1 step-7 warp context for a GLOBALMV-class
+        // inter-intra leaf: `useWarp = 2` fires on the single inter
+        // half exactly as on a plain SIMPLE leaf — the §7.11.3.14
+        // blend combines the WARPED inter prediction with the intra
+        // half (r408 fix; the pre-r408 inter half was always
+        // translational, leaving isolated ±1 diffs on global-motion
+        // interintra blocks). `derive_use_warp` re-checks the full
+        // gate (w/h ≥ 8, `force_integer_mv`, `!is_scaled`, §7.11.3.6
+        // `warpValid`).
+        let ii_warp: Option<WarpDriverParams> = grid.warp.as_ref().and_then(|wc| {
+            let y_mode = wc.y_modes.get(origin).copied().unwrap_or(0);
+            if !matches!(
+                y_mode,
+                crate::cdf::MODE_GLOBALMV | crate::cdf::MODE_GLOBAL_GLOBALMV
+            ) {
+                return None;
+            }
+            let t0 = wc.gm_types.get(ref_frame0 as usize).copied().unwrap_or(0);
+            if (t0 as i32) <= crate::cdf::GM_TYPE_TRANSLATION {
+                return None;
+            }
+            let b = (ref_frame0 as usize) * 6;
+            let gm0: [i32; 6] = [
+                wc.gm_params[b],
+                wc.gm_params[b + 1],
+                wc.gm_params[b + 2],
+                wc.gm_params[b + 3],
+                wc.gm_params[b + 4],
+                wc.gm_params[b + 5],
+            ];
+            const WARP_IDENTITY_MATRIX: [i32; 6] = [
+                0,
+                0,
+                1 << WARP_WARPEDMODEL_PREC_BITS,
+                0,
+                0,
+                1 << WARP_WARPEDMODEL_PREC_BITS,
+            ];
+            Some(WarpDriverParams {
+                y_mode: [y_mode, y_mode],
+                gm_type: [t0, t0],
+                gm_params: [gm0, gm0],
+                // §7.11.3.1 step-7 clause 3 cannot fire (§5.11.27
+                // forces SIMPLE on inter-intra blocks).
+                local_warp_params: WARP_IDENTITY_MATRIX,
+                local_valid: false,
+                ref_is_scaled: [
+                    wc.is_scaled
+                        .get(ref_frame0 as usize)
+                        .copied()
+                        .unwrap_or(false),
+                    false,
+                ],
+                force_integer_mv: wc.force_integer_mv,
+            })
+        });
         // The §5.11.33 frame-walk and the §5.11.33 task-dispatcher
         // bridge share this one per-block inter-intra driver.
-        reconstruct_inter_intra_block(&leaf, ref_frame_idx, grid.bit_depth, planes)?;
+        reconstruct_inter_intra_block(
+            &leaf,
+            ref_frame_idx,
+            grid.bit_depth,
+            ii_warp.as_ref(),
+            planes,
+        )?;
         return Ok(());
     }
 
@@ -16400,6 +16466,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             /* wedge_mask_buf */ None,
+            /* warp */ None,
             &mut curr,
             curr_w,
         )
@@ -16591,6 +16658,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )
@@ -16834,6 +16902,7 @@ mod tests {
             EIGHTTAP,
             EIGHTTAP,
             None,
+            /* warp */ None,
             &mut oracle,
             curr_w,
         )
@@ -16872,8 +16941,15 @@ mod tests {
                 curr: &mut bridged,
                 curr_stride: curr_w,
             }];
-            reconstruct_inter_intra_from_dispatch(&readout, &leaf, &ref_frame_idx, 8, &mut planes)
-                .expect("dispatch-bridge inter-intra reconstruction");
+            reconstruct_inter_intra_from_dispatch(
+                &readout,
+                &leaf,
+                &ref_frame_idx,
+                8,
+                None,
+                &mut planes,
+            )
+            .expect("dispatch-bridge inter-intra reconstruction");
         }
 
         assert_eq!(
@@ -16964,7 +17040,14 @@ mod tests {
                 curr_stride: 8,
             }];
             assert!(matches!(
-                reconstruct_inter_intra_from_dispatch(bad, &leaf, &ref_frame_idx, 8, &mut planes),
+                reconstruct_inter_intra_from_dispatch(
+                    bad,
+                    &leaf,
+                    &ref_frame_idx,
+                    8,
+                    None,
+                    &mut planes
+                ),
                 Err(crate::Error::PartitionWalkOutOfRange)
             ));
         }

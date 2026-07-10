@@ -128,6 +128,14 @@ struct SpecRefSlot {
     /// cell), loaded back by `load_previous_segment_ids()` as the
     /// §5.11.21 `PrevSegmentIds` prediction source.
     segment_ids: Vec<i32>,
+    /// §7.20 `save_grain_params( i )` — the frame's resolved §5.9.30
+    /// film-grain state (post-`load_grain_params` on the
+    /// `update_grain == 0` predicted path). `None` when the frame
+    /// carries no grain (`reset_grain_params()`). Loaded back by the
+    /// §5.9.30 `update_grain == 0` arm and by the §5.9.2
+    /// `show_existing_frame` `load_grain_params(
+    /// frame_to_show_map_idx )` output path.
+    grain_params: Option<crate::uncompressed_header_tail::FilmGrainParams>,
 }
 
 /// Cross-frame decoder session state: the §5.9.2 `RefInfo` arrays the
@@ -174,6 +182,11 @@ struct DecodedFrameInternal {
     /// §7.20 `SegmentIds[][]` snapshot (unwritten `-1` cells clamped
     /// to `0`, matching the spec's always-written map).
     segment_ids: Vec<i32>,
+    /// The frame's RESOLVED film-grain state (the §5.9.30
+    /// `update_grain == 0` predicted path replaced by the referenced
+    /// slot's saved params with this frame's `grain_seed`), the §7.20
+    /// `save_grain_params` payload.
+    grain_params: Option<crate::uncompressed_header_tail::FilmGrainParams>,
 }
 
 /// §5.9.2 `LosslessArray[ segmentId ]` — `get_qindex( 1, segmentId ) ==
@@ -982,7 +995,28 @@ fn decode_frame_spec_full(
     let ref_plane_dims: Vec<(u32, u32)> = plane_dims.clone();
 
     // ---- §7.18.3 film grain. ----
-    if let Some(fg) = fh.film_grain_params.as_ref() {
+    // §5.9.30 `update_grain == 0` predicted path: `load_grain_params(
+    // film_grain_params_ref_idx )` — every field except `grain_seed`
+    // comes from the referenced slot's §7.20-saved state (the
+    // `tempGrainSeed` dance keeps the newly-read seed). A slot with
+    // no saved grain state resolves to `reset_grain_params()`.
+    let effective_grain: Option<crate::uncompressed_header_tail::FilmGrainParams> =
+        match fh.film_grain_params.as_ref() {
+            Some(fg) if fg.apply_grain && fg.predicted => {
+                let slot = fg.film_grain_params_ref_idx as usize;
+                refs.and_then(|st| st.slots.get(slot))
+                    .and_then(|s| s.as_ref())
+                    .and_then(|s| s.grain_params.clone())
+                    .map(|mut g| {
+                        g.grain_seed = fg.grain_seed;
+                        g.apply_grain = true;
+                        g
+                    })
+            }
+            Some(fg) if fg.apply_grain => Some(fg.clone()),
+            _ => None,
+        };
+    if let Some(fg) = effective_grain.as_ref() {
         if fg.apply_grain {
             let mut bufs: Vec<PlaneBuffer<'_>> = Vec::with_capacity(num_planes);
             for (buf, &(pw, ph)) in plane_bufs.iter_mut().zip(plane_dims.iter()) {
@@ -1092,6 +1126,7 @@ fn decode_frame_spec_full(
         mi_rows,
         mi_cols,
         segment_ids,
+        grain_params: effective_grain,
     })
 }
 
@@ -1399,6 +1434,7 @@ fn reference_frame_update(
         lf_ref_deltas,
         lf_mode_deltas,
         segment_ids: decoded.segment_ids.clone(),
+        grain_params: decoded.grain_params.clone(),
     };
     for i in 0..NUM_REF_FRAMES as usize {
         if (fh.refresh_frame_flags >> i) & 1 != 0 {
@@ -1422,8 +1458,16 @@ fn reference_frame_update(
 }
 
 /// §7.21-adjacent `show_existing_frame` output: surface the stored
-/// slot's (grain-free) planes as a [`SpecFrame`].
-fn output_existing_frame(refs: &SpecRefState, fh: &FrameHeader) -> Result<SpecFrame, Error> {
+/// slot's planes as a [`SpecFrame`], applying §7.18.3 film grain from
+/// the slot's §7.20-saved grain state (§5.9.2 `show_existing_frame`
+/// runs `load_grain_params( frame_to_show_map_idx )` when
+/// `film_grain_params_present == 1`; the stored planes themselves stay
+/// grain-free).
+fn output_existing_frame(
+    refs: &SpecRefState,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+) -> Result<SpecFrame, Error> {
     let idx = fh
         .frame_to_show_map_idx
         .ok_or(Error::PartitionWalkOutOfRange)? as usize;
@@ -1433,21 +1477,70 @@ fn output_existing_frame(refs: &SpecRefState, fh: &FrameHeader) -> Result<SpecFr
     let slot = refs.slots[idx]
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
-    let planes: Vec<Vec<u8>> = slot
-        .planes
-        .iter()
-        .map(|p| {
-            if slot.bit_depth == 8 {
-                p.iter().map(|&v| v.min(255) as u8).collect()
-            } else {
-                let mut out = Vec::with_capacity(p.len() * 2);
-                for &v in p {
-                    out.extend_from_slice(&v.to_le_bytes());
+    // §7.18.3 on the OUTPUT copy only.
+    let mut grain_bufs: Option<Vec<Vec<i32>>> = None;
+    if seq.film_grain_params_present {
+        if let Some(fg) = slot.grain_params.as_ref() {
+            if fg.apply_grain {
+                let mut bufs: Vec<Vec<i32>> = slot
+                    .planes
+                    .iter()
+                    .map(|p| p.iter().map(|&v| v as i32).collect())
+                    .collect();
+                let cc = &seq.color_config;
+                let mut views: Vec<PlaneBuffer<'_>> = Vec::with_capacity(bufs.len());
+                for (buf, &(pw, ph)) in bufs.iter_mut().zip(slot.plane_dims.iter()) {
+                    views.push(PlaneBuffer {
+                        rows: ph,
+                        cols: pw,
+                        samples: buf,
+                    });
                 }
-                out
+                film_grain_synthesis(
+                    fg,
+                    slot.bit_depth,
+                    cc.num_planes,
+                    u8::from(cc.subsampling_x),
+                    u8::from(cc.subsampling_y),
+                    cc.matrix_coefficients,
+                    &mut views,
+                );
+                grain_bufs = Some(bufs);
             }
-        })
-        .collect();
+        }
+    }
+    let max_val: i32 = (1i32 << slot.bit_depth) - 1;
+    let planes: Vec<Vec<u8>> = match grain_bufs {
+        Some(bufs) => bufs
+            .into_iter()
+            .map(|p| {
+                if slot.bit_depth == 8 {
+                    p.into_iter().map(|v| v.clamp(0, 255) as u8).collect()
+                } else {
+                    let mut out = Vec::with_capacity(p.len() * 2);
+                    for v in p {
+                        out.extend_from_slice(&(v.clamp(0, max_val) as u16).to_le_bytes());
+                    }
+                    out
+                }
+            })
+            .collect(),
+        None => slot
+            .planes
+            .iter()
+            .map(|p| {
+                if slot.bit_depth == 8 {
+                    p.iter().map(|&v| v.min(255) as u8).collect()
+                } else {
+                    let mut out = Vec::with_capacity(p.len() * 2);
+                    for &v in p {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    out
+                }
+            })
+            .collect(),
+    };
     let (w, h) = *slot
         .plane_dims
         .first()
@@ -1483,7 +1576,7 @@ fn decode_temporal_unit_spec(
                 let s = seq.as_ref().ok_or(Error::PartitionWalkOutOfRange)?;
                 let fh = parse_frame_header_with_refs(desc.payload, s, &refs.info)?;
                 if fh.show_existing_frame {
-                    out.push(output_existing_frame(refs, &fh)?);
+                    out.push(output_existing_frame(refs, &fh, s)?);
                     // §7.4 / §7.21: a shown KEY frame re-loads the
                     // stored frame state and re-stores it into every
                     // slot (`refresh_frame_flags == allFrames` per the
