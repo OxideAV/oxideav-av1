@@ -790,6 +790,25 @@ fn cfl_layer(
 // Residual pipeline (any square TX size).
 // ---------------------------------------------------------------------
 
+/// §7.12.3 / §9.2: 64-dim transforms code only the top-left
+/// `Min(32, w) × Min(32, h)` coefficients, addressed with the COMPACT
+/// `tw`-stride layout. Repack the dense forward-quantize output; the
+/// padding tail stays zero (never scanned). Sizes ≤ 32 pass through.
+fn repack_compact(dense: Vec<i32>, w: usize, h: usize) -> Vec<i32> {
+    let tw = w.min(32);
+    let th = h.min(32);
+    if tw == w && th == h {
+        return dense;
+    }
+    let mut q = vec![0i32; w * h];
+    for i in 0..th {
+        for j in 0..tw {
+            q[i * tw + j] = dense[i * w + j];
+        }
+    }
+    q
+}
+
 /// One residual leg at `tx_sz`: forward (WHT for the lossless TX_4X4 /
 /// DCT-family otherwise) + quantize, then the decoder's dequant +
 /// inverse, stitching `Clip1(pred + res)` into the running plane.
@@ -828,23 +847,7 @@ fn residual_tx(
         forward_transform_2d(&residual, tx_sz, tx_type, false)
     };
     let dense = forward_quantize(&coeffs, tx_sz, plane, 0, tx_type, 15, qp);
-    // §7.12.3 / §9.2: 64-dim transforms code only the top-left
-    // `Min(32, w) × Min(32, h)` coefficients, addressed with the
-    // COMPACT `tw`-stride layout. Repack the dense forward-quantize
-    // output; the padding tail stays zero (never scanned).
-    let tw = w.min(32);
-    let th = h.min(32);
-    let quant: Vec<i32> = if tw != w || th != h {
-        let mut q = vec![0i32; w * h];
-        for i in 0..th {
-            for j in 0..tw {
-                q[i * tw + j] = dense[i * w + j];
-            }
-        }
-        q
-    } else {
-        dense
-    };
+    let quant = repack_compact(dense, w, h);
     let dequant = dequantize_step1(&quant, tx_sz, plane, 0, tx_type, 15, qp);
     let res_back = inverse_transform_2d(&dequant, tx_sz, tx_type, 8, lossless);
     for i in 0..h {
@@ -854,6 +857,95 @@ fn residual_tx(
         }
     }
     quant
+}
+
+/// r410 — §5.11.47 per-TU LUMA transform-type RD search (lossy arm).
+/// Trials every `TxType` admissible in the §5.11.48 intra set for
+/// `tx_sz` (`TX_SET_INTRA_1`'s 7 types at 4×4/8×8, `TX_SET_INTRA_2`'s
+/// 5 at 16×16, `DCT_DCT` alone at 32×32+), scoring each full
+/// quantise→dequantise→inverse chain by `D + λ·R` over the TU, then
+/// stitches the winner into the running plane. Returns the committed
+/// `Quant[]` plus the `TxType` label — forced to `DCT_DCT` when the
+/// winning TU quantises to all-zero (the §5.11.39 `all_zero` arm reads
+/// no `transform_type` symbol and the walker stamps `DCT_DCT`).
+#[allow(clippy::too_many_arguments)]
+fn residual_tx_search_luma(
+    input_plane: &[u8],
+    recon_plane: &mut [u8],
+    pw: usize,
+    row0: usize,
+    col0: usize,
+    tx_sz: usize,
+    pred: &[u8],
+    qp: &QuantizerParams,
+) -> (Vec<i32>, u8) {
+    let w = TX_WIDTH[tx_sz];
+    let h = TX_HEIGHT[tx_sz];
+    let mut residual = vec![0i64; w * h];
+    for i in 0..h {
+        for j in 0..w {
+            residual[i * w + j] =
+                input_plane[(row0 + i) * pw + (col0 + j)] as i64 - pred[i * w + j] as i64;
+        }
+    }
+    let set = intra_tx_type_set(
+        tx_size_sqr_index(tx_sz) as u32,
+        TX_SIZE_SQR_UP[tx_sz] as u32,
+        false,
+    );
+    let lambda = lambda_for(qp);
+    let mut best: Option<(Vec<i32>, Vec<i64>, u8, u64)> = None;
+    for t in 0..crate::cdf::TX_TYPES {
+        let admissible = t == DCT_DCT || (set > 0 && is_tx_type_in_set(false, set, t));
+        if !admissible {
+            continue;
+        }
+        let coeffs = forward_transform_2d(&residual, tx_sz, t, false);
+        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, 15, qp), w, h);
+        let all_zero = quant.iter().all(|&q| q == 0);
+        let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, 15, qp);
+        let res_back = inverse_transform_2d(&dequant, tx_sz, t, 8, false);
+        let mut d = 0u64;
+        for i in 0..h {
+            for j in 0..w {
+                let rec = (pred[i * w + j] as i64 + res_back[i * w + j]).clamp(0, 255);
+                let diff = input_plane[(row0 + i) * pw + (col0 + j)] as i64 - rec;
+                d += (diff * diff) as u64;
+            }
+        }
+        let mut rate = 0u64;
+        for &qv in &quant {
+            if qv != 0 {
+                rate += 3 + u64::from(32 - qv.unsigned_abs().leading_zeros());
+            }
+        }
+        let score = d + lambda * rate;
+        // §5.11.39: an all-zero TU codes no transform_type symbol and
+        // the walker stamps DCT_DCT — the label must follow.
+        let label = if all_zero { DCT_DCT as u8 } else { t as u8 };
+        let improves = match best.as_ref() {
+            Some((_, _, _, s)) => score < *s,
+            None => true,
+        };
+        if improves {
+            best = Some((quant, res_back, label, score));
+        }
+        // The DCT_DCT trial quantising to all-zero means the residual
+        // is below the quantisation floor — pred-exact reconstruction;
+        // skip the remaining types (they would commit the same
+        // all-zero DCT_DCT shape at best-marginal gains).
+        if t == DCT_DCT && all_zero {
+            break;
+        }
+    }
+    let (quant, res_back, label, _) = best.expect("DCT_DCT is always admissible");
+    for i in 0..h {
+        for j in 0..w {
+            let p = pred[i * w + j] as i64 + res_back[i * w + j];
+            recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, 255) as u8;
+        }
+    }
+    (quant, label)
 }
 
 // ---------------------------------------------------------------------
@@ -1160,6 +1252,7 @@ fn encode_leaf_with_tx(
     let (y_mode, angle_delta_y) = pick_y_mode(recon, input, row0, col0, n);
     let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
     let mut residual_quant: Vec<Vec<i32>> = Vec::new();
+    let mut luma_tx_types: Vec<u8> = Vec::new();
     let mut ty = 0usize;
     while ty < n {
         let mut tx = 0usize;
@@ -1175,21 +1268,31 @@ fn encode_leaf_with_tx(
                 y_mode as usize,
                 angle_delta_y as i32,
             );
-            let q = residual_tx(
-                &input.y,
-                &mut recon.y,
-                width,
-                tr,
-                tc,
-                luma_tx,
-                &pred,
-                0,
-                lossless,
-                DCT_DCT,
-                &qp,
-            );
+            let (q, tt) = if lossless {
+                (
+                    residual_tx(
+                        &input.y,
+                        &mut recon.y,
+                        width,
+                        tr,
+                        tc,
+                        luma_tx,
+                        &pred,
+                        0,
+                        lossless,
+                        DCT_DCT,
+                        &qp,
+                    ),
+                    DCT_DCT as u8,
+                )
+            } else {
+                // r410: §5.11.47 per-TU luma transform-type RD search
+                // over the §5.11.48 intra set for this TX size.
+                residual_tx_search_luma(&input.y, &mut recon.y, width, tr, tc, luma_tx, &pred, &qp)
+            };
             tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
             residual_quant.push(q);
+            luma_tx_types.push(tt);
             tx += ltw;
         }
         ty += lth;
@@ -1308,6 +1411,15 @@ fn encode_leaf_with_tx(
     let skip = u8::from(all_zero);
     if all_zero {
         residual_quant.clear();
+        // §5.11.47 commitments are per-visited-luma-TU on the `!skip`
+        // arm only — a skip leaf must commit none.
+        luma_tx_types.clear();
+    }
+    // An all-DCT_DCT vector is the writer's back-compat default —
+    // commit the compact empty form then (keeps the lossless arm's
+    // emitted bytes identical to r409).
+    if luma_tx_types.iter().all(|&t| t == DCT_DCT as u8) {
+        luma_tx_types.clear();
     }
     let (cfl_alpha_u, cfl_alpha_v) = match cfl_alpha {
         Some((au, av)) => (Some(au), Some(av)),
@@ -1340,7 +1452,7 @@ fn encode_leaf_with_tx(
         } else {
             None
         },
-        residual_tx_type: Vec::new(),
+        residual_tx_type: luma_tx_types,
         var_tx_trees: Vec::new(),
     }
 }
