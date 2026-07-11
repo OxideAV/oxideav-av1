@@ -707,6 +707,54 @@ fn motion_search_luma(
     [best.1[0] * 8, best.1[1] * 8]
 }
 
+/// Sub-pel MV refinement through the decoder's §7.11.3 leaf driver:
+/// a half-pel pass (±4 in 1/8 units) then a quarter-pel pass (±2)
+/// around the running best, scoring each candidate by luma SSD over
+/// the kernel's actual prediction plus a small magnitude bias.
+#[allow(clippy::too_many_arguments)]
+fn refine_mv_subpel(
+    input: &Yuv420Frame,
+    ictx: &mut PSearchCtx,
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    row0: usize,
+    col0: usize,
+    n: usize,
+    width: usize,
+    mv_int: [i32; 2],
+) -> Result<[i32; 2], Error> {
+    let score = |ictx: &mut PSearchCtx, mv: [i32; 2]| -> Result<u64, Error> {
+        ictx.predict_leaf(mi_r, mi_c, b_size, MODE_NEWMV, mv)?;
+        let mut ssd = 0u64;
+        for i in 0..n {
+            for j in 0..n {
+                let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                    - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                ssd += (d * d) as u64;
+            }
+        }
+        Ok(ssd + ((mv[0].unsigned_abs() + mv[1].unsigned_abs()) as u64) * (n as u64) / 8)
+    };
+    let mut best = (score(ictx, mv_int)?, mv_int);
+    for step in [4i32, 2] {
+        let center = best.1;
+        for dy in [-step, 0, step] {
+            for dx in [-step, 0, step] {
+                if dy == 0 && dx == 0 {
+                    continue;
+                }
+                let cand = [center[0] + dy, center[1] + dx];
+                let c = score(ictx, cand)?;
+                if c < best.0 {
+                    best = (c, cand);
+                }
+            }
+        }
+    }
+    Ok(best.1)
+}
+
 /// Encode one in-frame square INTER leaf at `b_size` (`BLOCK_8X8` …
 /// `BLOCK_64X64`): motion search, §7.11.3 prediction through the
 /// decoder's leaf driver, residual per TU (one
@@ -729,7 +777,7 @@ fn encode_inter_leaf(
     let lossless = recon.lossless;
     let qp = recon.qp;
 
-    let mv = motion_search_luma(
+    let mv_int = motion_search_luma(
         input,
         &ictx.ref_planes[0],
         width,
@@ -738,6 +786,14 @@ fn encode_inter_leaf(
         col0,
         n,
     );
+    // r411 sub-pel refinement: half-pel then quarter-pel deltas around
+    // the integer winner, each candidate evaluated through the REAL
+    // §7.11.3.4 kernel (so the search cost IS the coding cost).
+    // `allow_high_precision_mv = 0` restricts components to quarter-pel
+    // (multiples of 2 in 1/8-luma units).
+    let mv = refine_mv_subpel(
+        input, ictx, mi_r, mi_c, b_size, row0, col0, n, width, mv_int,
+    )?;
     // Zero vector ⇒ GLOBALMV (the identity-warp §7.10.2.1 derivation
     // is exactly [0, 0], so no MV bits and no PredMv dependence).
     let y_mode = if mv == [0, 0] {

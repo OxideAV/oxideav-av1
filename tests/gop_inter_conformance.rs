@@ -139,6 +139,35 @@ fn gop_lossy_multi_superblock_round_trips() {
     assert_gop_round_trip(&frames, 60);
 }
 
+/// Half-pel motion: frames sample a smooth 2x-resolution base pattern
+/// at a half-luma-sample shift per frame, so the §7.11.3.4 sub-pel
+/// taps beat every integer vector and the refined quarter-pel MVs
+/// carry real fractional phases.
+#[test]
+fn gop_lossy_halfpel_motion_round_trips() {
+    let base = |y: usize, x: usize| -> u8 { (((y % 97) * (x % 89)) / 31 + y / 2 + x / 3) as u8 };
+    let mut frames = Vec::new();
+    for k in 0..3usize {
+        let (w, h) = (64u32, 64u32);
+        let mut f = Yuv420Frame::filled(w, h, 0);
+        for i in 0..64 {
+            for j in 0..64 {
+                // 2x-resolution sample at a k-half-pel diagonal shift.
+                f.y[i * 64 + j] = base(2 * i + k, 2 * j + k);
+            }
+        }
+        for i in 0..32 {
+            for j in 0..32 {
+                f.u[i * 32 + j] = base(4 * i + k, 4 * j + k) / 2 + 64;
+                f.v[i * 32 + j] = base(4 * i + k + 7, 4 * j + k + 3) / 2 + 32;
+            }
+        }
+        frames.push(f);
+    }
+    assert_gop_round_trip(&frames, 50);
+    assert_gop_round_trip(&frames, 0);
+}
+
 /// Noise content at a mid quantiser: dense coefficients on the inter
 /// TUs and deep splits.
 #[test]
