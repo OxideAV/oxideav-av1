@@ -108,7 +108,7 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 44 streams byte-exact against
+grain. `tests/fixture_conformance.rs` pins 50 streams byte-exact against
 independent-decoder output (the 16-stream corpus staged under
 `docs/video/av1/fixtures/` plus 10 r394 validator-produced streams —
 QM intra/inter, dual-filter + OBMC, jnt-comp pyramids, cyclic-refresh
@@ -447,6 +447,40 @@ per-frame reconstruction — lossless GOPs equal the input exactly.
 Three self-encoded GOP streams are pinned in the conformance corpus
 (47 total).
 
+### Inter encoder: modes, filters, rect partitions, compound (r412)
+
+r412 works the r411 follow-up ladder to exhaustion. (1)
+**NEARESTMV / NEARMV mode selection** through a snapshotable
+driver-side §7.10.2 MV-prediction mirror: the RD search owns a
+`PartitionWalker` twin of the write-pass mirror (committed leaves
+stamped, trials rolled back via a rect snapshot of every stamped
+grid), so each leaf trials the full §5.11.24 candidate set — NEWMV at
+the searched vector with the `drl_mode` index minimising the §5.11.32
+difference bits, NEARESTMV / drl-reachable NEARMV slots straight from
+the stack (no MV bits), GLOBALMV at the §7.10.2.1 derivation. (2)
+**SWITCHABLE interpolation filters**: `is_filter_switchable = 1`
+headers, the per-leaf §5.11.x `interp_filter` S() against the §8.3.2
+neighbour ctx, and a per-leaf EIGHTTAP / SMOOTH / SHARP distortion
+search through the decoder's own §7.11.3.4 kernel. (3) **HORZ / VERT
+rectangular partitions**: `SyntaxNode::{Horz,Vert}` write dispatch +
+the whole inter leaf pipeline generalised to rectangular blocks (rect
+`Max_Tx_Size_Rect` transforms with the SPLIT-aware §5.11.36/§5.11.17
+recursion — 2 children per rect split). (4) **Two-slot reference
+rotation + per-block LAST/GOLDEN selection**: frame `k` refreshes
+§7.20 slot `(k-1) & 1` with explicit `ref_frame_idx[]`, and the
+candidate ladder runs per reference (a flash GOP provably selects
+GOLDEN). (5) **COMPOUND_AVERAGE two-reference prediction**:
+`reference_select = 1`, the §5.11.25 unidirectional { LAST, GOLDEN }
+cascade, compound modes NEAREST_NEARESTMV / NEAR_NEARMV /
+GLOBAL_GLOBALMV / NEW_NEWMV with both §5.11.31 MV lists
+§5.11.26-checked, and the bit-silent §5.11.29 COMPOUND_AVERAGE
+derivation. Validated four ways per feature: dedicated
+selection-proving unit tests, the decode-walker syntax round trips,
+a 66-config black-box sweep (moving / static / cut / noise / band /
+flash / blend content, 5 geometries, q 0-255) byte-exact in THREE
+independent reference decoders, and three more self-encoded streams
+pinned in the conformance corpus (50 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -459,11 +493,11 @@ Three self-encoded GOP streams are pinned in the conformance corpus
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q}`. Conformant encoding beyond
-  the r411 scope (NEARESTMV/NEARMV driver selection via a
-  driver-side §7.10.2 mirror, compound references, SWITCHABLE
-  filters, palette/intrabc leaves, the asymmetric HORZ/VERT partition
-  shapes, true bit-accounting rate costs, B-pyramids/order hints) is
-  the follow-up ladder.
+  the r412 scope (palette/intrabc leaves in inter frames, skip-mode
+  and segmentation-enabled P-frames, masked/jnt compound, the
+  HORZ_A/B/4 + VERT_A/B/4 T-shapes, sub-8×8 inter leaves, true
+  bit-accounting rate costs, order hints / B-pyramids /
+  `use_ref_frame_mvs`) is the follow-up ladder.
 
 ## Module layout
 
