@@ -114,18 +114,19 @@ use crate::cdf::{
     BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, EIGHTTAP, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
     GM_TYPE_TRANSLATION, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
     MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV,
-    MODE_NEARESTMV, MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH,
-    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT,
-    PARTITION_VERT, SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT,
-    TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
-    WARPEDMODEL_PREC_BITS,
+    MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEWMV,
+    MODE_NEW_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS,
+    PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT, SPLIT_TX_SIZE, SWITCHABLE,
+    TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP,
+    TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
-    write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_inter_block_mode_info,
-    write_inter_frame_mode_info_prefix, write_intra_block_mode_info_with_palette,
-    write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_intra_frame_y_mode,
-    write_intra_segment_id, write_intra_uv_mode, write_palette_tokens_plane, write_skip,
-    write_y_mode, InterBlockModeInfoTail, InterFrameDeltaSiteInputs, IntrabcArmInputs,
+    assign_mv_pred_mv, write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex,
+    write_inter_block_mode_info, write_inter_frame_mode_info_prefix,
+    write_intra_block_mode_info_with_palette, write_intra_frame_else_arm,
+    write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
+    write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_y_mode,
+    InterBlockModeInfoTail, InterFrameDeltaSiteInputs, IntrabcArmInputs,
 };
 use crate::encoder::coefficients::write_coefficients;
 use crate::encoder::partition::write_partition;
@@ -1634,6 +1635,7 @@ pub fn write_block_syntax(
                 y_mode: info.y_mode,
                 ref_frame: [0, -1],
                 mv: info.mv,
+                mv2: [0, 0],
                 interp_filter: info.interp_filter,
                 motion_mode: crate::cdf::MOTION_MODE_SIMPLE,
                 palette_size_y: 0,
@@ -1849,6 +1851,7 @@ pub fn write_block_syntax(
             y_mode: block.y_mode,
             ref_frame: [0, -1],
             mv: [0, 0],
+            mv2: [0, 0],
             interp_filter: [0, 0],
             motion_mode: crate::cdf::MOTION_MODE_SIMPLE,
             palette_size_y: pal.size_y,
@@ -1953,9 +1956,10 @@ pub fn write_block_syntax(
 ///   follow-up arc.
 /// * `ip.skip_mode_present` — the §5.11.10 skip-mode ctx walk is a
 ///   follow-up arc.
-/// * Compound references (`ref_frame[1] != NONE`) — follow-up arc.
-/// * A non-NEWMV leaf whose committed MV differs from the §5.11.26
-///   `PredMv` derivation (see [`SyntaxInterBlock`]).
+/// * A committed MV that differs from the §5.11.26 `PredMv`
+///   derivation on any non-NEWMV list (see [`SyntaxInterBlock`];
+///   r412 lands compound pairs — both lists are §5.11.26-checked
+///   through the shared `assign_mv_pred_mv`).
 /// * A committed `interp_filter` pair inconsistent with the §5.11.x
 ///   loop's gates (r412 lands the SWITCHABLE frame-filter arm: the
 ///   per-block filter S() with the §8.3.2 neighbour ctx from the
@@ -2103,19 +2107,34 @@ fn write_block_syntax_inter_frame(
 
     if let Some(ib) = block.inter.as_ref() {
         // ---- §5.11.18 `if ( is_inter ) inter_block_mode_info()`. ----
-        // r411 scope: single reference, non-SWITCHABLE frame filter.
-        if !(1..=7).contains(&ib.ref_frame[0]) || ib.ref_frame[1] != -1 {
+        // r412 scope: single reference OR a compound pair (the
+        // §5.11.25 cascade validates codable pairs); COMPOUND_AVERAGE
+        // only (`enable_masked_compound == enable_jnt_comp == false`
+        // keeps the §5.11.29 tail bit-silent).
+        let is_compound = ib.ref_frame[1] > 0;
+        if !(1..=7).contains(&ib.ref_frame[0])
+            || !(ib.ref_frame[1] == -1 || (1..=7).contains(&ib.ref_frame[1]))
+        {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        if !matches!(
-            ib.y_mode,
-            MODE_NEARESTMV | MODE_NEARMV | MODE_GLOBALMV | MODE_NEWMV
-        ) {
+        let mode_ok = if is_compound {
+            (MODE_NEAREST_NEARESTMV..=MODE_NEW_NEWMV).contains(&ib.y_mode)
+        } else {
+            matches!(
+                ib.y_mode,
+                MODE_NEARESTMV | MODE_NEARMV | MODE_GLOBALMV | MODE_NEWMV
+            )
+        };
+        if !mode_ok {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        // §6.10.27 conformance bound `Abs( Mv ) < (1 << 14)`.
-        if ib.mv[0][0].unsigned_abs() >= (1 << 14) || ib.mv[0][1].unsigned_abs() >= (1 << 14) {
-            return Err(Error::PartitionWalkOutOfRange);
+        // §6.10.27 conformance bound `Abs( Mv ) < (1 << 14)` on every
+        // consulted list.
+        let list_count: usize = if is_compound { 2 } else { 1 };
+        for i in 0..list_count {
+            if ib.mv[i][0].unsigned_abs() >= (1 << 14) || ib.mv[i][1].unsigned_abs() >= (1 << 14) {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
         }
         if ip.interpolation_filter > SWITCHABLE {
             return Err(Error::PartitionWalkOutOfRange);
@@ -2148,7 +2167,7 @@ fn write_block_syntax_inter_frame(
             mi_col,
             sub_size,
             [i32::from(ib.ref_frame[0]), i32::from(ib.ref_frame[1])],
-            /* is_compound = */ false,
+            is_compound,
             ip.use_ref_frame_mvs,
             ip.gm_type,
             ip.gm_params,
@@ -2158,19 +2177,16 @@ fn write_block_syntax_inter_frame(
             &ip.motion_field_mvs,
         )?;
 
-        // §5.11.26: non-NEWMV lists inherit `PredMv[0]` with no bits —
-        // the committed MV must equal the reader's derivation.
-        let derived: Option<[i32; 2]> = match ib.y_mode {
-            MODE_GLOBALMV => Some(stack.global_mvs[0]),
-            MODE_NEARESTMV | MODE_NEARMV => stack
-                .ref_stack_mv
-                .get(ib.ref_mv_idx as usize)
-                .map(|slot| slot[0]),
-            _ => None,
-        };
-        if let Some(d) = derived {
-            if d != ib.mv[0] {
-                return Err(Error::PartitionWalkOutOfRange);
+        // §5.11.26: non-NEWMV lists inherit `PredMv[ i ]` with no
+        // bits — every committed MV must equal the reader's
+        // derivation (the shared `assign_mv_pred_mv`, per list via
+        // §get_mode).
+        for i in 0..list_count {
+            if crate::cdf::get_mode(ib.y_mode, i) != MODE_NEWMV {
+                let d = assign_mv_pred_mv(&stack, ib.y_mode, i as u8, ib.ref_mv_idx)?;
+                if d != ib.mv[i] {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
             }
         }
 
@@ -2211,6 +2227,9 @@ fn write_block_syntax_inter_frame(
             ) >= 8;
             let needs = if large && ib.y_mode == MODE_GLOBALMV {
                 ip.gm_type[ib.ref_frame[0] as usize] == GM_TYPE_TRANSLATION
+            } else if large && ib.y_mode == MODE_GLOBAL_GLOBALMV {
+                ip.gm_type[ib.ref_frame[0] as usize] == GM_TYPE_TRANSLATION
+                    || ip.gm_type[ib.ref_frame[1] as usize] == GM_TYPE_TRANSLATION
             } else {
                 true
             };
@@ -2280,6 +2299,7 @@ fn write_block_syntax_inter_frame(
                 y_mode: ib.y_mode,
                 ref_frame: ib.ref_frame,
                 mv: ib.mv[0],
+                mv2: ib.mv[1],
                 interp_filter: committed_filters,
                 motion_mode: MOTION_MODE_SIMPLE,
                 palette_size_y: 0,
@@ -2448,6 +2468,7 @@ fn write_block_syntax_inter_frame(
             y_mode: block.y_mode,
             ref_frame: [0, -1],
             mv: [0, 0],
+            mv2: [0, 0],
             interp_filter: [0, 0],
             motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: pal.size_y,
@@ -6024,6 +6045,101 @@ mod tests {
         );
     }
 
+    /// r412 — COMPOUND_AVERAGE round trip: a SPLIT mixing a
+    /// NEW_NEWMV compound leaf (unidirectional { LAST, GOLDEN } pair,
+    /// two §5.11.31 MV differences), a NEAREST_NEARESTMV compound
+    /// leaf (both lists §5.11.26-derived from the compound §7.10.2
+    /// stack the previous leaf seeded), a GLOBAL_GLOBALMV leaf (the
+    /// forced-EIGHTTAP `needs_interp_filter( ) == 0` arm), and a
+    /// single-ref leaf (whose §5.11.25 cascade now codes the
+    /// `comp_mode` bit under `reference_select = 1`) — replayed
+    /// bit-for-bit by the decode walker with both MV lists checked
+    /// on the grids.
+    #[test]
+    fn r412_inter_syntax_round_trip_compound_average() {
+        let mut params = inter_params_420(16, 16, /* lossless = */ true);
+        {
+            let ipp = params.inter.as_mut().expect("inter params");
+            ipp.interpolation_filter = SWITCHABLE;
+            ipp.reference_select = true;
+        }
+        let comp_leaf = |y_mode: u8, mv: [[i32; 2]; 2], ref_mv_idx: u32| -> SyntaxBlock {
+            let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+            b.inter = Some(SyntaxInterBlock {
+                ref_frame: [1, 4],
+                y_mode,
+                mv,
+                ref_mv_idx,
+                interp_filter: [EIGHTTAP; 2],
+            });
+            b
+        };
+        // NW: NEW_NEWMV with two coded MV differences (filter coded
+        // under SWITCHABLE).
+        let mut nw = comp_leaf(MODE_NEW_NEWMV, [[8, 16], [-4, 24]], 0);
+        nw.inter.as_mut().unwrap().interp_filter = [crate::inter_pred::EIGHTTAP_SMOOTH; 2];
+        // NE: NEAREST_NEARESTMV — §5.11.26 derives both lists from
+        // the §7.10.2 stack; the NW neighbour seeds RefStackMv[0]
+        // with ([8, 16], [-4, 24]).
+        let ne = comp_leaf(MODE_NEAREST_NEARESTMV, [[8, 16], [-4, 24]], 0);
+        // SW: GLOBAL_GLOBALMV — identity warp ⇒ both lists [0, 0],
+        // needs_interp_filter() == 0 ⇒ EIGHTTAP, no filter bits.
+        let sw = comp_leaf(MODE_GLOBAL_GLOBALMV, [[0, 0], [0, 0]], 0);
+        // SE: single-ref GLOBALMV under reference_select = 1 (the
+        // §5.11.25 comp_mode bit fires on the SINGLE arm).
+        let se = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0xE4);
+
+        let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+        // NW grids: compound pair + both MV lists.
+        assert_eq!(walker.ref_frames()[cell(0, 0) * 2], 1);
+        assert_eq!(walker.ref_frames()[cell(0, 0) * 2 + 1], 4);
+        assert_eq!(
+            [
+                walker.mvs()[cell(0, 0) * 4],
+                walker.mvs()[cell(0, 0) * 4 + 1],
+                walker.mvs()[cell(0, 0) * 4 + 2],
+                walker.mvs()[cell(0, 0) * 4 + 3]
+            ],
+            [8i16, 16, -4, 24]
+        );
+        let f = walker.interp_filters();
+        assert_eq!(
+            [f[cell(0, 0) * 2], f[cell(0, 0) * 2 + 1]],
+            [crate::inter_pred::EIGHTTAP_SMOOTH; 2]
+        );
+        // NE: NEAREST_NEARESTMV derived pair equals NW's committed.
+        assert_eq!(
+            [
+                walker.mvs()[cell(0, 8) * 4],
+                walker.mvs()[cell(0, 8) * 4 + 1],
+                walker.mvs()[cell(0, 8) * 4 + 2],
+                walker.mvs()[cell(0, 8) * 4 + 3]
+            ],
+            [8i16, 16, -4, 24]
+        );
+        // SW: GLOBAL_GLOBALMV zero pair + forced EIGHTTAP.
+        assert_eq!(walker.ref_frames()[cell(8, 0) * 2 + 1], 4);
+        assert_eq!(
+            [
+                walker.mvs()[cell(8, 0) * 4],
+                walker.mvs()[cell(8, 0) * 4 + 2]
+            ],
+            [0i16, 0]
+        );
+        assert_eq!(f[cell(8, 0) * 2], EIGHTTAP);
+        // SE: single-ref under reference_select.
+        assert_eq!(walker.ref_frames()[cell(8, 8) * 2], 1);
+        assert_eq!(walker.ref_frames()[cell(8, 8) * 2 + 1], -1);
+    }
+
     /// r412 — a committed filter pair inconsistent with the §5.11.x
     /// gates is a caller bug: a GLOBALMV leaf claiming a coded SHARP
     /// filter on the identity-warp configuration must be rejected
@@ -6080,6 +6196,7 @@ mod tests {
             y_mode: MODE_NEWMV,
             ref_frame: [1, -1],
             mv: [16, 8],
+            mv2: [0, 0],
             interp_filter: [ipp.interpolation_filter; 2],
             motion_mode: crate::cdf::MOTION_MODE_SIMPLE,
             palette_size_y: 0,

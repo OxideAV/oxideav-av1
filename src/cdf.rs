@@ -16068,6 +16068,11 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     /// §5.11.26 `Mv[ 0 ]` (`[ row, col ]`, 1/8-luma-sample units).
     /// Stamped only when `is_inter != 0`.
     pub mv: [i32; 2],
+    /// r412 — §5.11.26 `Mv[ 1 ]` (the compound second-list vector;
+    /// `[ 0, 0 ]` on single-reference and intra blocks, matching the
+    /// decode walker's slot-1 stamp). Stamped only when
+    /// `is_inter != 0`.
+    pub mv2: [i32; 2],
     /// §5.11.7 `interp_filter[ 0..2 ]` (`BILINEAR` on the intrabc
     /// arm). Stamped only when `is_inter != 0`.
     pub interp_filter: [u8; 2],
@@ -20840,8 +20845,8 @@ impl PartitionWalker {
                     // keeps the i32 → i16 cast lossless.
                     self.mvs[(cell * 2) * 2] = s.mv[0] as i16;
                     self.mvs[(cell * 2) * 2 + 1] = s.mv[1] as i16;
-                    self.mvs[(cell * 2 + 1) * 2] = 0;
-                    self.mvs[(cell * 2 + 1) * 2 + 1] = 0;
+                    self.mvs[(cell * 2 + 1) * 2] = s.mv2[0] as i16;
+                    self.mvs[(cell * 2 + 1) * 2 + 1] = s.mv2[1] as i16;
                     // §5.11.27 `motion_mode` grid-fill (mirrors the
                     // decode walker's per-footprint stamp). Drives the
                     // §5.11.33 frame walk's OBMC / warp dispatch.
@@ -61681,6 +61686,7 @@ mod tests {
             // §5.11.25 single-ref: slot 0 = LAST_FRAME, slot 1 = NONE.
             ref_frame: [last as i8, -1],
             mv: [mv[0] as i32, mv[1] as i32],
+            mv2: [0, 0],
             interp_filter: [EIGHTTAP, EIGHTTAP],
             motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: 0,
@@ -61757,6 +61763,7 @@ mod tests {
             y_mode: MODE_NEWMV,
             ref_frame: [1, -1],
             mv: [16, -8],
+            mv2: [0, 0],
             interp_filter: [EIGHTTAP, EIGHTTAP],
             motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: 0,
@@ -61778,6 +61785,7 @@ mod tests {
             y_mode: MODE_NEARESTMV,
             ref_frame: [1, -1],
             mv: [8, 24],
+            mv2: [0, 0],
             interp_filter: [EIGHTTAP, EIGHTTAP],
             motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: 0,
@@ -61843,6 +61851,7 @@ mod tests {
             y_mode: 0,
             ref_frame: [0, -1],
             mv: [0, 0],
+            mv2: [0, 0],
             interp_filter: [EIGHTTAP, EIGHTTAP],
             motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: 2,
@@ -61998,6 +62007,7 @@ mod tests {
                 y_mode: MODE_NEARESTMV,
                 ref_frame: [last as i8, -1],
                 mv: [mv[0] as i32, mv[1] as i32],
+                mv2: [0, 0],
                 interp_filter: [EIGHTTAP, EIGHTTAP],
                 motion_mode: MOTION_MODE_SIMPLE,
                 palette_size_y: 0,
@@ -62101,6 +62111,7 @@ mod tests {
                     y_mode: MODE_NEARESTMV,
                     ref_frame: [last as i8, -1],
                     mv,
+                    mv2: [0, 0],
                     interp_filter: [EIGHTTAP, EIGHTTAP],
                     motion_mode: mode,
                     palette_size_y: 0,
@@ -62223,6 +62234,7 @@ mod tests {
             // INTRA_FRAME (0) in slot 0 is a caller bug on the inter arm.
             ref_frame: [crate::uncompressed_header_tail::INTRA_FRAME as i8, -1],
             mv: [0, 0],
+            mv2: [0, 0],
             interp_filter: [EIGHTTAP, EIGHTTAP],
             motion_mode: MOTION_MODE_SIMPLE,
             palette_size_y: 0,

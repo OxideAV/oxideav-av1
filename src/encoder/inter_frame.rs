@@ -59,8 +59,9 @@
 use crate::cdf::{
     get_tx_size, inter_tx_type_set, tx_size_sqr_index, FindMvStackResult, PartitionWalker,
     QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT,
-    EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV, MODE_NEARESTMV,
-    MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
+    EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV,
+    MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEAR_NEARMV,
+    MODE_NEWMV, MODE_NEW_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
     PARTITION_HORZ, PARTITION_VERT, SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP,
     TX_WIDTH,
 };
@@ -235,7 +236,9 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     } else {
         TxMode::TxModeSelect
     });
-    fh.reference_select = Some(false);
+    // r412: per-block single/compound choice (§5.9.23) — compound
+    // COMPOUND_AVERAGE leaves need the comp_mode dispatch open.
+    fh.reference_select = Some(true);
     fh.skip_mode_present = Some(false);
     fh.allow_warped_motion = Some(false);
     let last_slot = (p_index & 1) as u8;
@@ -311,6 +314,8 @@ fn encode_p_frame_yuv420(
     // own §5.11.x interp_filter (the header writer emits
     // `is_filter_switchable = 1`).
     ip.interpolation_filter = SWITCHABLE;
+    // r412: per-block single/compound reference choice (§5.9.23).
+    ip.reference_select = true;
 
     let params = SyntaxFrameParams {
         subsampling_x: 1,
@@ -477,6 +482,13 @@ struct PSearchCtx {
     /// Shared all-zero grid for the compound / inter-intra side-data
     /// slices (never read at a single-reference SIMPLE leaf's origin).
     zeros: Vec<u8>,
+    /// r412 — `CompoundTypes[ .. ]` grid pinned at
+    /// [`crate::cdf::COMPOUND_AVERAGE`]: the §5.11.29 derivation on
+    /// this configuration (`enable_masked_compound ==
+    /// enable_jnt_comp == false` ⇒ `comp_group_idx = 0`,
+    /// `compound_idx = 1` ⇒ COMPOUND_AVERAGE, no bits); read only at
+    /// compound leaf origins.
+    comp_avg: Vec<u8>,
     /// All-zero §7.11.3.8 per-cell warp-fit slice (never read on the
     /// all-SIMPLE configuration; sized per the [`crate::GridWarpContext`]
     /// contract).
@@ -554,6 +566,7 @@ impl PSearchCtx {
             motion_modes: vec![MOTION_MODE_SIMPLE; cells],
             y_modes: vec![0u8; cells],
             zeros: vec![0u8; cells],
+            comp_avg: vec![crate::cdf::COMPOUND_AVERAGE; cells],
             local_warp: vec![0i32; cells * 6],
             scratch: [
                 vec![0u16; width * height],
@@ -575,19 +588,19 @@ impl PSearchCtx {
     /// (`write_block_syntax_inter_frame` threads the same
     /// [`SyntaxInterFrameParams`] fields), so both scans agree by
     /// construction whenever the two mirrors hold the same grids.
-    fn find_stack_single(
+    fn find_stack(
         &self,
         mi_row: u32,
         mi_col: u32,
         b_size: usize,
-        ref_frame: i8,
+        ref_frame: [i8; 2],
     ) -> Result<FindMvStackResult, Error> {
         self.mirror.find_mv_stack(
             mi_row,
             mi_col,
             b_size,
-            [i32::from(ref_frame), -1],
-            /* is_compound = */ false,
+            [i32::from(ref_frame[0]), i32::from(ref_frame[1])],
+            /* is_compound = */ ref_frame[1] > 0,
             self.ip.use_ref_frame_mvs,
             self.ip.gm_type,
             self.ip.gm_params,
@@ -629,6 +642,7 @@ impl PSearchCtx {
                 y_mode: ib.y_mode,
                 ref_frame: ib.ref_frame,
                 mv: ib.mv[0],
+                mv2: ib.mv[1],
                 interp_filter: ib.interp_filter,
                 motion_mode: MOTION_MODE_SIMPLE,
                 palette_size_y: 0,
@@ -649,6 +663,7 @@ impl PSearchCtx {
                 y_mode: block.y_mode,
                 ref_frame: [0, -1],
                 mv: [0, 0],
+                mv2: [0, 0],
                 interp_filter: [0, 0],
                 motion_mode: MOTION_MODE_SIMPLE,
                 palette_size_y: block.palette.size_y,
@@ -672,9 +687,9 @@ impl PSearchCtx {
         mi_row: u32,
         mi_col: u32,
         b_size: usize,
-        ref_frame: i8,
+        ref_frame: [i8; 2],
         y_mode: u8,
-        mv: [i32; 2],
+        mv: [[i32; 2]; 2],
         filter: u8,
     ) -> Result<(), Error> {
         let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
@@ -692,12 +707,12 @@ impl PSearchCtx {
                 let cell = (rr * self.mi_cols + cc) as usize;
                 self.mi_sizes[cell] = b_size;
                 self.is_inters[cell] = 1;
-                self.ref_frames[cell * 2] = ref_frame;
-                self.ref_frames[cell * 2 + 1] = -1;
-                self.mvs[cell * 4] = mv[0] as i16;
-                self.mvs[cell * 4 + 1] = mv[1] as i16;
-                self.mvs[cell * 4 + 2] = 0;
-                self.mvs[cell * 4 + 3] = 0;
+                self.ref_frames[cell * 2] = ref_frame[0];
+                self.ref_frames[cell * 2 + 1] = ref_frame[1];
+                self.mvs[cell * 4] = mv[0][0] as i16;
+                self.mvs[cell * 4 + 1] = mv[0][1] as i16;
+                self.mvs[cell * 4 + 2] = mv[1][0] as i16;
+                self.mvs[cell * 4 + 3] = mv[1][1] as i16;
                 self.interp_filters[cell * 2] = filter;
                 self.interp_filters[cell * 2 + 1] = filter;
                 self.motion_modes[cell] = MOTION_MODE_SIMPLE;
@@ -714,6 +729,7 @@ impl PSearchCtx {
         let ref_frame_idx = self.ref_frame_idx;
         let PSearchCtx {
             ref_planes,
+            comp_avg,
             mi_sizes,
             is_inters,
             ref_frames,
@@ -768,7 +784,7 @@ impl PSearchCtx {
             ref_frames,
             mvs,
             interp_filters,
-            compound_types: zeros,
+            compound_types: comp_avg,
             wedge_indices: zeros,
             wedge_signs: zeros,
             mask_types: zeros,
@@ -947,7 +963,15 @@ fn refine_mv_subpel(
     mv_int: [i32; 2],
 ) -> Result<[i32; 2], Error> {
     let score = |ictx: &mut PSearchCtx, mv: [i32; 2]| -> Result<u64, Error> {
-        ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, MODE_NEWMV, mv, EIGHTTAP)?;
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            [ref_frame, -1],
+            MODE_NEWMV,
+            [mv, [0, 0]],
+            EIGHTTAP,
+        )?;
         let mut ssd = 0u64;
         for i in 0..bh {
             for j in 0..bw {
@@ -1025,9 +1049,9 @@ fn encode_inter_leaf(
     // bits + a one-bit §5.11.25 cascade surcharge on the non-LAST
     // reference), mirroring [`p_leaf_rate`]'s constants.
     struct ModeCand {
-        ref_frame: i8,
+        ref_frame: [i8; 2],
         y_mode: u8,
-        mv: [i32; 2],
+        mv: [[i32; 2]; 2],
         ref_mv_idx: u32,
         rate: u64,
     }
@@ -1035,10 +1059,11 @@ fn encode_inter_leaf(
         let b = |d: i32| u64::from(34 - d.unsigned_abs().leading_zeros());
         b(mv[0] - pred[0]) + b(mv[1] - pred[1])
     };
-    let mut cands: Vec<ModeCand> = Vec::with_capacity(12);
+    let mut cands: Vec<ModeCand> = Vec::with_capacity(18);
+    let mut searched_mv: [[i32; 2]; 2] = [[0, 0]; 2];
     for (ref_ord, rf) in [(0usize, 1i8), (1, 4)] {
         let ref_bias = ref_ord as u64;
-        let stack = ictx.find_stack_single(mi_r, mi_c, b_size, rf)?;
+        let stack = ictx.find_stack(mi_r, mi_c, b_size, [rf, -1])?;
         let mv_int = motion_search_luma(
             input,
             &ictx.ref_planes[ref_ord][0],
@@ -1057,6 +1082,7 @@ fn encode_inter_leaf(
         let mv_new = refine_mv_subpel(
             input, ictx, mi_r, mi_c, b_size, rf, row0, col0, bw, bh, width, mv_int,
         )?;
+        searched_mv[ref_ord] = mv_new;
         let nfound = stack.num_mv_found;
         {
             // NEWMV: pick the reachable drl slot with the cheapest
@@ -1077,17 +1103,17 @@ fn encode_inter_leaf(
             }
             let (rate, idx) = best.expect("slot 0 is always reachable");
             cands.push(ModeCand {
-                ref_frame: rf,
+                ref_frame: [rf, -1],
                 y_mode: MODE_NEWMV,
-                mv: mv_new,
+                mv: [mv_new, [0, 0]],
                 ref_mv_idx: idx,
                 rate,
             });
         }
         cands.push(ModeCand {
-            ref_frame: rf,
+            ref_frame: [rf, -1],
             y_mode: MODE_NEARESTMV,
-            mv: stack.ref_stack_mv[0][0],
+            mv: [stack.ref_stack_mv[0][0], [0, 0]],
             ref_mv_idx: 0,
             rate: 3 + ref_bias,
         });
@@ -1098,25 +1124,98 @@ fn encode_inter_leaf(
         };
         for idx in 1..=near_top {
             cands.push(ModeCand {
-                ref_frame: rf,
+                ref_frame: [rf, -1],
                 y_mode: MODE_NEARMV,
-                mv: stack.ref_stack_mv[idx as usize][0],
+                mv: [stack.ref_stack_mv[idx as usize][0], [0, 0]],
                 ref_mv_idx: idx,
                 rate: 4 + ref_bias + u64::from(idx - 1),
             });
         }
         cands.push(ModeCand {
-            ref_frame: rf,
+            ref_frame: [rf, -1],
             y_mode: MODE_GLOBALMV,
-            mv: stack.global_mvs[0],
+            mv: [stack.global_mvs[0], [0, 0]],
             ref_mv_idx: 0,
             rate: 4 + ref_bias,
         });
     }
+
+    // r412 — COMPOUND_AVERAGE candidates over the { LAST, GOLDEN }
+    // pair (§5.11.25 unidirectional compound; the §5.11.29 tail is
+    // bit-silent on this configuration and derives COMPOUND_AVERAGE):
+    // NEAREST_NEARESTMV / NEAR_NEARMV from the compound §7.10.2
+    // stack, GLOBAL_GLOBALMV at the identity derivation, and
+    // NEW_NEWMV re-using the two per-reference searched vectors.
+    {
+        let crf: [i8; 2] = [1, 4];
+        let stack = ictx.find_stack(mi_r, mi_c, b_size, crf)?;
+        let nfound = stack.num_mv_found;
+        cands.push(ModeCand {
+            ref_frame: crf,
+            y_mode: MODE_NEAREST_NEARESTMV,
+            mv: [stack.ref_stack_mv[0][0], stack.ref_stack_mv[0][1]],
+            ref_mv_idx: 0,
+            rate: 6,
+        });
+        let near_top: u32 = match nfound {
+            0..=2 => 1,
+            3 => 2,
+            _ => 3,
+        };
+        for idx in 1..=near_top {
+            cands.push(ModeCand {
+                ref_frame: crf,
+                y_mode: MODE_NEAR_NEARMV,
+                mv: [
+                    stack.ref_stack_mv[idx as usize][0],
+                    stack.ref_stack_mv[idx as usize][1],
+                ],
+                ref_mv_idx: idx,
+                rate: 7 + u64::from(idx - 1),
+            });
+        }
+        cands.push(ModeCand {
+            ref_frame: crf,
+            y_mode: MODE_GLOBAL_GLOBALMV,
+            mv: [stack.global_mvs[0], stack.global_mvs[1]],
+            ref_mv_idx: 0,
+            rate: 7,
+        });
+        {
+            let window: u32 = match nfound {
+                0 | 1 => 0,
+                2 => 1,
+                _ => 2,
+            };
+            let mut best: Option<(u64, u32)> = None;
+            for idx in 0..=window {
+                let pred0 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 0, idx)?;
+                let pred1 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 1, idx)?;
+                let rate = 8
+                    + u64::from(idx)
+                    + diff_bits(searched_mv[0], pred0)
+                    + diff_bits(searched_mv[1], pred1);
+                if best.map_or(true, |(r, _)| rate < r) {
+                    best = Some((rate, idx));
+                }
+            }
+            let (rate, idx) = best.expect("slot 0 is always reachable");
+            cands.push(ModeCand {
+                ref_frame: crf,
+                y_mode: MODE_NEW_NEWMV,
+                mv: searched_mv,
+                ref_mv_idx: idx,
+                rate,
+            });
+        }
+    }
     // §6.10.27 conformance bound — the writers reject any leaf beyond
     // it, so a (pathological) out-of-bound stack candidate is simply
     // not offered.
-    cands.retain(|c| c.mv[0].unsigned_abs() < (1 << 14) && c.mv[1].unsigned_abs() < (1 << 14));
+    cands.retain(|c| {
+        c.mv.iter()
+            .all(|m| m[0].unsigned_abs() < (1 << 14) && m[1].unsigned_abs() < (1 << 14))
+    });
 
     let lambda = lambda_for(&recon.qp);
     let mut best: Option<(u64, usize)> = None;
@@ -1157,11 +1256,12 @@ fn encode_inter_leaf(
     // (`EIGHTTAP` / `EIGHTTAP_SMOOTH` / `EIGHTTAP_SHARP`) through the
     // decoder's own §7.11.3.4 kernel and keep the lowest luma SSD
     // (the S() costs one ~equal-rate symbol whichever value is coded,
-    // so distortion decides; ties keep EIGHTTAP). GLOBALMV leaves are
-    // `needs_interp_filter( ) == 0` on the identity-warp frame
-    // configuration — the reader derives EIGHTTAP with no bits, so no
-    // search happens and the committed pair must be EIGHTTAP.
-    let filter = if y_mode == MODE_GLOBALMV {
+    // so distortion decides; ties keep EIGHTTAP). GLOBALMV /
+    // GLOBAL_GLOBALMV leaves are `needs_interp_filter( ) == 0` on the
+    // identity-warp frame configuration — the reader derives EIGHTTAP
+    // with no bits, so no search happens and the committed pair must
+    // be EIGHTTAP.
+    let filter = if y_mode == MODE_GLOBALMV || y_mode == MODE_GLOBAL_GLOBALMV {
         EIGHTTAP
     } else {
         use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
@@ -1381,9 +1481,9 @@ fn encode_inter_leaf_residual(
     input: &Yuv420Frame,
     recon: &mut ReconState,
     ictx: &PSearchCtx,
-    ref_frame: i8,
+    ref_frame: [i8; 2],
     y_mode: u8,
-    mv: [i32; 2],
+    mv: [[i32; 2]; 2],
     ref_mv_idx: u32,
     filter: u8,
     depth: u32,
@@ -1576,9 +1676,9 @@ fn encode_inter_leaf_residual(
         block.var_tx_trees = vec![uniform_var_tx_tree(MAX_TX_SIZE_RECT[b_size], depth)];
     }
     block.inter = Some(SyntaxInterBlock {
-        ref_frame: [ref_frame, -1],
+        ref_frame,
         y_mode,
-        mv: [mv, [0, 0]],
+        mv,
         ref_mv_idx,
         interp_filter: [filter; 2],
     });
@@ -1605,9 +1705,19 @@ fn p_leaf_rate(block: &SyntaxBlock) -> u64 {
                 }
                 MODE_NEARESTMV => rate += 3,
                 MODE_NEARMV => rate += 4 + u64::from(ib.ref_mv_idx.saturating_sub(1)),
-                // GLOBALMV — the §5.11.24 cascade's two context bits
-                // plus headroom.
-                _ => rate += 4,
+                MODE_NEAREST_NEARESTMV => rate += 6,
+                MODE_NEAR_NEARMV => rate += 7 + u64::from(ib.ref_mv_idx.saturating_sub(1)),
+                MODE_NEW_NEWMV => {
+                    let bits = |v: i32| u64::from(34 - v.unsigned_abs().leading_zeros());
+                    rate += 8
+                        + bits(ib.mv[0][0])
+                        + bits(ib.mv[0][1])
+                        + bits(ib.mv[1][0])
+                        + bits(ib.mv[1][1]);
+                }
+                // GLOBALMV / GLOBAL_GLOBALMV / the remaining compound
+                // modes — cascade context bits plus headroom.
+                _ => rate += 4 + 3 * u64::from(ib.ref_frame[1] > 0),
             }
         }
         None => rate += 16,
@@ -1946,7 +2056,15 @@ mod tests {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
             let mut probe = PSearchCtx::new(&reference, &reference, 16, 16, 64, 64, ip, 1).unwrap();
             probe
-                .predict_leaf(0, 0, BLOCK_64X64, 1, MODE_NEWMV, [0, 4], EIGHTTAP_SHARP)
+                .predict_leaf(
+                    0,
+                    0,
+                    BLOCK_64X64,
+                    [1, -1],
+                    MODE_NEWMV,
+                    [[0, 4], [0, 0]],
+                    EIGHTTAP_SHARP,
+                )
                 .unwrap();
             for (dst, &src) in f1.y.iter_mut().zip(probe.scratch[0].iter()) {
                 *dst = src as u8;
@@ -2217,6 +2335,111 @@ mod tests {
         }
     }
 
+    /// r412 — the COMPOUND_AVERAGE candidates must actually be
+    /// selected where the two-reference mean is the distortion
+    /// winner: the third frame is constructed as the PIXELWISE
+    /// AVERAGE of the first two frames' reconstructions (LAST and
+    /// GOLDEN under the two-slot rotation), so a
+    /// { LAST, GOLDEN } GLOBAL_GLOBALMV / NEAREST_NEARESTMV leaf
+    /// predicts it almost exactly while either single reference
+    /// misses by half the inter-frame delta — the search tree must
+    /// carry compound leaves, and the emitted GOP must round-trip
+    /// byte-exact through the spec driver.
+    #[test]
+    fn r412_p_search_selects_compound_average_on_blended_content() {
+        let f0 = moving_gradient(64, 64, 0, 0, 40);
+        let f1 = moving_gradient(64, 64, 0, 0, 140);
+        let base_q_idx = 60u8;
+        // Two-frame pre-pass to obtain the deterministic recons.
+        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+        let mut f2 = Yuv420Frame::filled(64, 64, 0);
+        let avg = |a: &[u8], b: &[u8], out: &mut [u8]| {
+            for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
+                *o = (u16::from(x) + u16::from(y)).div_ceil(2) as u8;
+            }
+        };
+        avg(&pre.recon[0].y, &pre.recon[1].y, &mut f2.y);
+        avg(&pre.recon[0].u, &pre.recon[1].u, &mut f2.u);
+        avg(&pre.recon[0].v, &pre.recon[1].v, &mut f2.v);
+
+        // Drive the P2 search directly (prev = f1 recon in LAST,
+        // prevprev = KEY recon in GOLDEN).
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 2);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[1],
+            &pre.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            2,
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
+        fn count_compound(node: &SyntaxNode, compound: &mut u32, single: &mut u32) {
+            let leafc = |b: &SyntaxBlock, compound: &mut u32, single: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.ref_frame[1] > 0 {
+                        *compound += 1;
+                    } else {
+                        *single += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, compound, single),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count_compound(ch, compound, single);
+                    }
+                }
+                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                    for b in blocks.iter() {
+                        leafc(b, compound, single);
+                    }
+                }
+            }
+        }
+        let (mut compound, mut single) = (0u32, 0u32);
+        count_compound(&tree, &mut compound, &mut single);
+        assert!(
+            compound > 0,
+            "average-blend content must select COMPOUND_AVERAGE leaves \
+             (got COMPOUND={compound} SINGLE={single})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f1, f2], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+    }
+
     /// r412 — [`PSearchCtx::predict_leaf`] must thread the trial
     /// filter into the §7.11.3.4 kernel: an isolated impulse column
     /// interpolated at a half-pel phase produces distinct samples per
@@ -2238,7 +2461,7 @@ mod tests {
         let mut ictx = PSearchCtx::new(&refr, &refr, 16, 16, 64, 64, ip, 1).unwrap();
         let mut outs = Vec::new();
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
-            ictx.predict_leaf(2, 2, BLOCK_8X8, 1, MODE_NEWMV, [0, 4], f)
+            ictx.predict_leaf(2, 2, BLOCK_8X8, [1, -1], MODE_NEWMV, [[0, 4], [0, 0]], f)
                 .unwrap();
             let mut v = Vec::new();
             for i in 8..16 {
