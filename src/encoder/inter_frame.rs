@@ -8,30 +8,34 @@
 //! syntax (the r411 [`super::partition_tree`] write arm, whose output
 //! the spec decode walker replays bit-for-bit).
 //!
-//! ## Scope (r411)
+//! ## Scope (r411, extended r412)
 //!
 //! * 8-bit 4:2:0 YUV input, dimensions per the KEY-frame rules
 //!   (multiples of 8 in `[8, KEY_FRAME_MAX_DIM]`).
 //! * P-frame header: `error_resilient_mode = 1` (forcing
 //!   `primary_ref_frame = PRIMARY_REF_NONE` — per-frame default CDFs),
-//!   `refresh_frame_flags = allFrames`, all seven `ref_frame_idx`
-//!   slots at 0, identity §5.9.24 global motion, `EIGHTTAP`
-//!   non-switchable filter, `force_integer_mv = 0` /
-//!   `allow_high_precision_mv = 0`, no order hints, no skip-mode, no
-//!   segmentation; `TxMode = ONLY_4X4` on the `CodedLossless` arm
-//!   (`base_q_idx == 0`) or `TX_MODE_SELECT` otherwise.
-//! * Per-node RD search (leaf-vs-split, `BLOCK_64X64` down to
-//!   `BLOCK_8X8` — inter frames stop above the sub-8×8 chroma
+//!   the r412 two-slot reference rotation (frame `k` refreshes slot
+//!   `(k - 1) & 1`; LAST reads the previous frame's slot, GOLDEN the
+//!   frame before it), identity §5.9.24 global motion, SWITCHABLE
+//!   frame filter (per-leaf §5.11.x `interp_filter` selection),
+//!   `force_integer_mv = 0` / `allow_high_precision_mv = 0`, no order
+//!   hints, no skip-mode, no segmentation; `TxMode = ONLY_4X4` on the
+//!   `CodedLossless` arm (`base_q_idx == 0`) or `TX_MODE_SELECT`
+//!   otherwise.
+//! * Per-node RD search (leaf vs HORZ vs VERT vs split, `BLOCK_64X64`
+//!   down to `BLOCK_8X8` — inter frames stop above the sub-8×8 chroma
 //!   `someUseIntra` stitching): every square node trials one INTER
-//!   leaf (integer motion search + half/quarter-pel refinement
-//!   through the real §7.11.3.4 kernel, coding `NEWMV`, or `GLOBALMV`
-//!   on the zero vector — the identity-warp derivation) against one
+//!   leaf (per-reference LAST/GOLDEN integer motion search +
+//!   half/quarter-pel refinement through the real §7.11.3.4 kernel,
+//!   §5.11.24 mode selection over NEWMV / NEARESTMV / NEARMV /
+//!   GLOBALMV via the r412 driver-side §7.10.2 mirror) against one
 //!   INTRA leaf (the §5.11.22 arm with the KEY driver's 13-mode +
-//!   §5.11.15 tx_depth pickers), then both against the recursive
-//!   split. Inter leaves additionally RD-select their §5.11.17
-//!   uniform `txfm_split` depth (`Max_Tx_Size_Rect` down to two
-//!   `Split_Tx_Size` steps), coding the recursion's TUs in §5.11.36
-//!   transform-tree order.
+//!   §5.11.15 tx_depth pickers), the §5.11.4 PARTITION_HORZ /
+//!   PARTITION_VERT pairs of rectangular inter halves, and the
+//!   recursive split. Inter leaves additionally RD-select their
+//!   §5.11.17 uniform `txfm_split` depth (`Max_Tx_Size_Rect` down to
+//!   two `Split_Tx_Size` steps), coding the recursion's TUs in
+//!   §5.11.36 transform-tree order.
 //! * `skip = 1` on leaves whose every TU quantises to zero.
 //!
 //! ## Why the reconstruction loop is exact
@@ -78,9 +82,7 @@ use crate::encoder::pixel_driver_dyn::{
 };
 use crate::encoder::symbol_writer::SymbolWriter;
 use crate::encoder::tile_group_obu::{write_tile_group_obu, TileGroupObu, TilePayload};
-use crate::frame_header::{
-    FrameHeader, FrameType, InterFrameRefs, ALL_FRAMES_PUB, PRIMARY_REF_NONE,
-};
+use crate::frame_header::{FrameHeader, FrameType, InterFrameRefs, PRIMARY_REF_NONE};
 use crate::inter_pred::{
     reconstruct_inter_leaf_at, InterModeInfoGrid, PlaneReconContext, RefFrameStoreEntry,
 };
@@ -164,13 +166,11 @@ pub fn encode_gop_yuv420_with_q(
         v: key.recon_v,
     }];
 
-    for input in &frames[1..] {
-        let (tu, rc) = encode_p_frame_yuv420(
-            input,
-            recon.last().expect("at least the KEY recon"),
-            &seq,
-            base_q_idx,
-        )?;
+    for (k, input) in frames[1..].iter().enumerate() {
+        let p_index = (k + 1) as u32;
+        let prev = recon.last().expect("at least the KEY recon");
+        let prevprev = &recon[recon.len().saturating_sub(2)];
+        let (tu, rc) = encode_p_frame_yuv420(input, prev, prevprev, &seq, base_q_idx, p_index)?;
         temporal_units.push(tu);
         recon.push(rc);
     }
@@ -197,14 +197,24 @@ pub fn encode_gop_yuv420_with_q(
     })
 }
 
-/// §5.9.2 INTER P-frame header for the r411 GOP configuration —
+/// §5.9.2 INTER P-frame header for the r412 GOP configuration —
 /// derived from the KEY builder with the inter-path fields set (see
 /// the module docs for the exact configuration).
+///
+/// r412 two-slot reference rotation (`p_index` is the 1-based
+/// P-frame index): frame `k` refreshes slot `(k - 1) & 1`, reads
+/// LAST (and every other reference except GOLDEN) from slot `k & 1`
+/// — the slot holding frame `k - 1` — and GOLDEN from slot
+/// `(k - 1) & 1`, which still holds frame `k - 2` when the header is
+/// read (§7.20 updates the store AFTER decoding; for `k <= 2` both
+/// slots reach back to the KEY frame, which every slot holds after
+/// the KEY's `allFrames` refresh).
 fn build_p_frame_yuv420_8bit_fh_with_q(
     seq: &SequenceHeader,
     width: u32,
     height: u32,
     base_q_idx: u8,
+    p_index: u32,
 ) -> FrameHeader {
     let mut fh = build_intra_only_yuv420_8bit_fh_with_q(seq, width, height, base_q_idx);
     fh.frame_type = FrameType::Inter;
@@ -215,7 +225,7 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     fh.error_resilient_mode = true;
     fh.force_integer_mv = false;
     fh.primary_ref_frame = PRIMARY_REF_NONE;
-    fh.refresh_frame_flags = ALL_FRAMES_PUB;
+    fh.refresh_frame_flags = 1 << ((p_index - 1) & 1);
     // §5.9.21: ONLY_4X4 rides the CodedLossless arm; the lossy arm
     // codes TX_MODE_SELECT — intra leaves carry the §5.11.15
     // `tx_depth` choice and inter leaves the §5.11.17 `txfm_split`
@@ -228,11 +238,16 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     fh.reference_select = Some(false);
     fh.skip_mode_present = Some(false);
     fh.allow_warped_motion = Some(false);
+    let last_slot = (p_index & 1) as u8;
+    let golden_slot = ((p_index - 1) & 1) as u8;
+    let mut ref_frame_idx = [last_slot; REFS_PER_FRAME];
+    // GOLDEN_FRAME = 4 → ref_frame_idx[ GOLDEN_FRAME - LAST_FRAME = 3 ].
+    ref_frame_idx[3] = golden_slot;
     fh.inter_refs = Some(InterFrameRefs {
         frame_refs_short_signaling: false,
         last_frame_idx: None,
         gold_frame_idx: None,
-        ref_frame_idx: [0; REFS_PER_FRAME],
+        ref_frame_idx,
         allow_high_precision_mv: false,
         interpolation_filter: InterpolationFilter::Switchable,
         is_motion_mode_switchable: false,
@@ -241,14 +256,18 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     fh
 }
 
-/// Encode one INTER P-frame against `reference` (the previous frame's
-/// reconstruction). Returns the §7.5 temporal unit (TD + `OBU_FRAME`)
-/// and this frame's reconstruction.
+/// Encode one INTER P-frame against `prev` (the previous frame's
+/// reconstruction, LAST_FRAME) and `prevprev` (the frame before it,
+/// GOLDEN_FRAME — the KEY recon again for the first two P-frames).
+/// Returns the §7.5 temporal unit (TD + `OBU_FRAME`) and this frame's
+/// reconstruction.
 fn encode_p_frame_yuv420(
     input: &Yuv420Frame,
-    reference: &GopFrameRecon,
+    prev: &GopFrameRecon,
+    prevprev: &GopFrameRecon,
     seq: &SequenceHeader,
     base_q_idx: u8,
+    p_index: u32,
 ) -> Result<(Vec<u8>, GopFrameRecon), Error> {
     if input.width < 8
         || input.height < 8
@@ -263,14 +282,17 @@ fn encode_p_frame_yuv420(
     let height = input.height as usize;
     let chroma_w = width / 2;
     let chroma_h = height / 2;
-    if reference.y.len() != width * height
-        || reference.u.len() != chroma_w * chroma_h
-        || reference.v.len() != chroma_w * chroma_h
-    {
-        return Err(Error::PartitionWalkOutOfRange);
+    for reference in [prev, prevprev] {
+        if reference.y.len() != width * height
+            || reference.u.len() != chroma_w * chroma_h
+            || reference.v.len() != chroma_w * chroma_h
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
     }
 
-    let fh = build_p_frame_yuv420_8bit_fh_with_q(seq, input.width, input.height, base_q_idx);
+    let fh =
+        build_p_frame_yuv420_8bit_fh_with_q(seq, input.width, input.height, base_q_idx, p_index);
     let fs = fh
         .frame_size
         .as_ref()
@@ -333,7 +355,7 @@ fn encode_p_frame_yuv420(
         qp,
         bd: BlockDecodedMirror::new(),
     };
-    let mut ictx = PSearchCtx::new(reference, mi_rows, mi_cols, width, height, ip)?;
+    let mut ictx = PSearchCtx::new(prev, prevprev, mi_rows, mi_cols, width, height, ip, p_index)?;
 
     let mut writer = SymbolWriter::new(fh.disable_cdf_update);
     let mut cdfs = TileCdfContext::new_from_defaults();
@@ -433,9 +455,17 @@ struct PSearchCtx {
     mi_cols: u32,
     luma_w: u32,
     luma_h: u32,
-    /// Previous frame's reconstruction, widened to the §7.11.3.4
-    /// sample type.
-    ref_planes: [Vec<u16>; 3],
+    /// The two reference reconstructions, widened to the §7.11.3.4
+    /// sample type: `ref_planes[ 0 ]` = the previous frame
+    /// (LAST_FRAME), `ref_planes[ 1 ]` = the frame before it
+    /// (GOLDEN_FRAME).
+    ref_planes: [[Vec<u16>; 3]; 2],
+    /// §7.20 slot each of the two references occupies this frame
+    /// (`[ last_slot, golden_slot ]` — the r412 two-slot rotation).
+    ref_slots: [usize; 2],
+    /// §5.9.2 `ref_frame_idx[ 0..7 ]` — the header's slot map, fed
+    /// verbatim to the decoder's leaf driver.
+    ref_frame_idx: [u8; 7],
     // §5.11.5 grids (per mi cell).
     mi_sizes: Vec<usize>,
     is_inters: Vec<u8>,
@@ -467,13 +497,16 @@ struct PSearchCtx {
 }
 
 impl PSearchCtx {
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        reference: &GopFrameRecon,
+        prev: &GopFrameRecon,
+        prevprev: &GopFrameRecon,
         mi_rows: u32,
         mi_cols: u32,
         width: usize,
         height: usize,
         ip: SyntaxInterFrameParams,
+        p_index: u32,
     ) -> Result<Self, Error> {
         let cells = (mi_rows as usize) * (mi_cols as usize);
         let widen = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
@@ -504,10 +537,15 @@ impl PSearchCtx {
             luma_w: width as u32,
             luma_h: height as u32,
             ref_planes: [
-                widen(&reference.y),
-                widen(&reference.u),
-                widen(&reference.v),
+                [widen(&prev.y), widen(&prev.u), widen(&prev.v)],
+                [widen(&prevprev.y), widen(&prevprev.u), widen(&prevprev.v)],
             ],
+            ref_slots: [(p_index & 1) as usize, ((p_index - 1) & 1) as usize],
+            ref_frame_idx: {
+                let mut idx = [(p_index & 1) as u8; 7];
+                idx[3] = ((p_index - 1) & 1) as u8;
+                idx
+            },
             mi_sizes: vec![BLOCK_4X4; cells],
             is_inters: vec![0u8; cells],
             ref_frames,
@@ -542,12 +580,13 @@ impl PSearchCtx {
         mi_row: u32,
         mi_col: u32,
         b_size: usize,
+        ref_frame: i8,
     ) -> Result<FindMvStackResult, Error> {
         self.mirror.find_mv_stack(
             mi_row,
             mi_col,
             b_size,
-            [1, -1],
+            [i32::from(ref_frame), -1],
             /* is_compound = */ false,
             self.ip.use_ref_frame_mvs,
             self.ip.gm_type,
@@ -627,11 +666,13 @@ impl PSearchCtx {
     /// Stamp the leaf's §5.11.5 grid footprint (the same values the
     /// write mirror / decode walker stamp), then run the decoder's
     /// §5.11.33 leaf driver into the scratch planes.
+    #[allow(clippy::too_many_arguments)]
     fn predict_leaf(
         &mut self,
         mi_row: u32,
         mi_col: u32,
         b_size: usize,
+        ref_frame: i8,
         y_mode: u8,
         mv: [i32; 2],
         filter: u8,
@@ -651,7 +692,7 @@ impl PSearchCtx {
                 let cell = (rr * self.mi_cols + cc) as usize;
                 self.mi_sizes[cell] = b_size;
                 self.is_inters[cell] = 1;
-                self.ref_frames[cell * 2] = 1; // LAST_FRAME
+                self.ref_frames[cell * 2] = ref_frame;
                 self.ref_frames[cell * 2 + 1] = -1;
                 self.mvs[cell * 4] = mv[0] as i16;
                 self.mvs[cell * 4 + 1] = mv[1] as i16;
@@ -669,6 +710,8 @@ impl PSearchCtx {
         // scratch planes mutably.
         let (luma_w, luma_h) = (self.luma_w, self.luma_h);
         let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
+        let ref_slots = self.ref_slots;
+        let ref_frame_idx = self.ref_frame_idx;
         let PSearchCtx {
             ref_planes,
             mi_sizes,
@@ -688,13 +731,36 @@ impl PSearchCtx {
             ..
         } = &mut *self;
 
-        // §7.20 `FrameStore` views — every slot holds the previous
-        // frame (refresh_frame_flags = allFrames), and `ref_frame_idx`
-        // resolves each reference to slot 0. Dimensions are LUMA
-        // extents per the r405 contract; strides are plane samples.
-        let store_y = make_store(&ref_planes[0], luma_w as usize, luma_w, luma_h);
-        let store_u = make_store(&ref_planes[1], (luma_w as usize) / 2, luma_w, luma_h);
-        let store_v = make_store(&ref_planes[2], (luma_w as usize) / 2, luma_w, luma_h);
+        // §7.20 `FrameStore` views — the r412 two-slot rotation:
+        // `golden_slot` holds the frame-before-previous, every other
+        // slot the previous frame (only the two rotated slots are
+        // ever referenced through `ref_frame_idx`). Dimensions are
+        // LUMA extents per the r405 contract; strides are plane
+        // samples.
+        let store_y = make_store(
+            &ref_planes[0][0],
+            &ref_planes[1][0],
+            ref_slots[1],
+            luma_w as usize,
+            luma_w,
+            luma_h,
+        );
+        let store_u = make_store(
+            &ref_planes[0][1],
+            &ref_planes[1][1],
+            ref_slots[1],
+            (luma_w as usize) / 2,
+            luma_w,
+            luma_h,
+        );
+        let store_v = make_store(
+            &ref_planes[0][2],
+            &ref_planes[1][2],
+            ref_slots[1],
+            (luma_w as usize) / 2,
+            luma_w,
+            luma_h,
+        );
 
         let grid = InterModeInfoGrid {
             mi_sizes,
@@ -765,7 +831,7 @@ impl PSearchCtx {
         ];
         reconstruct_inter_leaf_at(
             &grid,
-            &[0u8; 7],
+            &ref_frame_idx,
             &mut planes,
             mi_row as usize,
             mi_col as usize,
@@ -773,17 +839,22 @@ impl PSearchCtx {
     }
 }
 
-/// One plane's §7.20 `FrameStore` view (all eight slots at the same
-/// previous-frame plane; extents in LUMA samples per the r405
-/// contract, stride in this plane's own samples).
-fn make_store(
-    plane: &[u16],
+/// One plane's §7.20 `FrameStore` view for the r412 two-slot
+/// rotation: `golden_slot` holds the frame-before-previous plane,
+/// every other slot the previous frame (extents in LUMA samples per
+/// the r405 contract, stride in this plane's own samples). Slots
+/// outside the two rotated ones are never resolved through
+/// `ref_frame_idx`, so their content is immaterial.
+fn make_store<'a>(
+    prev: &'a [u16],
+    prevprev: &'a [u16],
+    golden_slot: usize,
     stride: usize,
     luma_w: u32,
     luma_h: u32,
-) -> [RefFrameStoreEntry<'_>; 8] {
-    core::array::from_fn(|_| RefFrameStoreEntry {
-        plane,
+) -> [RefFrameStoreEntry<'a>; 8] {
+    core::array::from_fn(|slot| RefFrameStoreEntry {
+        plane: if slot == golden_slot { prevprev } else { prev },
         stride,
         upscaled_width: luma_w,
         width: luma_w,
@@ -867,6 +938,7 @@ fn refine_mv_subpel(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
+    ref_frame: i8,
     row0: usize,
     col0: usize,
     bw: usize,
@@ -875,7 +947,7 @@ fn refine_mv_subpel(
     mv_int: [i32; 2],
 ) -> Result<[i32; 2], Error> {
     let score = |ictx: &mut PSearchCtx, mv: [i32; 2]| -> Result<u64, Error> {
-        ictx.predict_leaf(mi_r, mi_c, b_size, MODE_NEWMV, mv, EIGHTTAP)?;
+        ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, MODE_NEWMV, mv, EIGHTTAP)?;
         let mut ssd = 0u64;
         for i in 0..bh {
             for j in 0..bw {
@@ -928,32 +1000,13 @@ fn encode_inter_leaf(
     let width = recon.width;
     let lossless = recon.lossless;
 
-    // r412 — §7.10.2 MV prediction against the driver mirror: the
-    // same scan the write pass will run at this leaf (the mirror holds
-    // every previously COMMITTED leaf's stamps and nothing else).
-    let stack = ictx.find_stack_single(mi_r, mi_c, b_size)?;
-
-    let mv_int = motion_search_luma(
-        input,
-        &ictx.ref_planes[0],
-        width,
-        recon.height,
-        row0,
-        col0,
-        bw,
-        bh,
-    );
-    // r411 sub-pel refinement: half-pel then quarter-pel deltas around
-    // the integer winner, each candidate evaluated through the REAL
-    // §7.11.3.4 kernel (so the search cost IS the coding cost).
-    // `allow_high_precision_mv = 0` restricts components to quarter-pel
-    // (multiples of 2 in 1/8-luma units).
-    let mv_new = refine_mv_subpel(
-        input, ictx, mi_r, mi_c, b_size, row0, col0, bw, bh, width, mv_int,
-    )?;
-
-    // r412 — §5.11.24 single-pred mode selection over the full
-    // candidate set the syntax can express at this leaf:
+    // r412 — §5.11.24 single-pred mode + reference selection over the
+    // full candidate set the syntax can express at this leaf. For
+    // each codable reference (LAST_FRAME = the previous frame,
+    // GOLDEN_FRAME = the frame before it — the r412 two-slot
+    // rotation) the §7.10.2 `find_mv_stack` scan runs against the
+    // driver mirror (the same scan the write pass will re-derive),
+    // then:
     //
     // * `NEWMV` at the searched vector, with the §5.11.23 `drl_mode`
     //   index chosen to minimise the §5.11.32 difference bits against
@@ -969,8 +1022,10 @@ fn encode_inter_leaf(
     // Each candidate's prediction runs through the decoder's own
     // §7.11.3 leaf driver; the winner minimises luma SSD + λ · a
     // small per-mode rate proxy (mode cascade + drl + MV-difference
-    // bits), mirroring [`p_leaf_rate`]'s constants.
+    // bits + a one-bit §5.11.25 cascade surcharge on the non-LAST
+    // reference), mirroring [`p_leaf_rate`]'s constants.
     struct ModeCand {
+        ref_frame: i8,
         y_mode: u8,
         mv: [i32; 2],
         ref_mv_idx: u32,
@@ -980,57 +1035,84 @@ fn encode_inter_leaf(
         let b = |d: i32| u64::from(34 - d.unsigned_abs().leading_zeros());
         b(mv[0] - pred[0]) + b(mv[1] - pred[1])
     };
-    let nfound = stack.num_mv_found;
-    let mut cands: Vec<ModeCand> = Vec::with_capacity(6);
-    {
-        // NEWMV: pick the reachable drl slot with the cheapest
-        // §5.11.32 difference (each extra slot costs one drl_mode bit).
-        let window: u32 = match nfound {
-            0 | 1 => 0,
-            2 => 1,
-            _ => 2,
-        };
-        let mut best: Option<(u64, u32)> = None;
-        for idx in 0..=window {
-            let pred = assign_mv_pred_mv(&stack, MODE_NEWMV, 0, idx)?;
-            let rate = 5 + u64::from(idx) + diff_bits(mv_new, pred);
-            if best.map_or(true, |(r, _)| rate < r) {
-                best = Some((rate, idx));
+    let mut cands: Vec<ModeCand> = Vec::with_capacity(12);
+    for (ref_ord, rf) in [(0usize, 1i8), (1, 4)] {
+        let ref_bias = ref_ord as u64;
+        let stack = ictx.find_stack_single(mi_r, mi_c, b_size, rf)?;
+        let mv_int = motion_search_luma(
+            input,
+            &ictx.ref_planes[ref_ord][0],
+            width,
+            recon.height,
+            row0,
+            col0,
+            bw,
+            bh,
+        );
+        // r411 sub-pel refinement: half-pel then quarter-pel deltas
+        // around the integer winner, each candidate evaluated through
+        // the REAL §7.11.3.4 kernel (so the search cost IS the coding
+        // cost). `allow_high_precision_mv = 0` restricts components
+        // to quarter-pel (multiples of 2 in 1/8-luma units).
+        let mv_new = refine_mv_subpel(
+            input, ictx, mi_r, mi_c, b_size, rf, row0, col0, bw, bh, width, mv_int,
+        )?;
+        let nfound = stack.num_mv_found;
+        {
+            // NEWMV: pick the reachable drl slot with the cheapest
+            // §5.11.32 difference (each extra slot costs one
+            // drl_mode bit).
+            let window: u32 = match nfound {
+                0 | 1 => 0,
+                2 => 1,
+                _ => 2,
+            };
+            let mut best: Option<(u64, u32)> = None;
+            for idx in 0..=window {
+                let pred = assign_mv_pred_mv(&stack, MODE_NEWMV, 0, idx)?;
+                let rate = 5 + ref_bias + u64::from(idx) + diff_bits(mv_new, pred);
+                if best.map_or(true, |(r, _)| rate < r) {
+                    best = Some((rate, idx));
+                }
             }
+            let (rate, idx) = best.expect("slot 0 is always reachable");
+            cands.push(ModeCand {
+                ref_frame: rf,
+                y_mode: MODE_NEWMV,
+                mv: mv_new,
+                ref_mv_idx: idx,
+                rate,
+            });
         }
-        let (rate, idx) = best.expect("slot 0 is always reachable");
         cands.push(ModeCand {
-            y_mode: MODE_NEWMV,
-            mv: mv_new,
-            ref_mv_idx: idx,
-            rate,
+            ref_frame: rf,
+            y_mode: MODE_NEARESTMV,
+            mv: stack.ref_stack_mv[0][0],
+            ref_mv_idx: 0,
+            rate: 3 + ref_bias,
+        });
+        let near_top: u32 = match nfound {
+            0..=2 => 1,
+            3 => 2,
+            _ => 3,
+        };
+        for idx in 1..=near_top {
+            cands.push(ModeCand {
+                ref_frame: rf,
+                y_mode: MODE_NEARMV,
+                mv: stack.ref_stack_mv[idx as usize][0],
+                ref_mv_idx: idx,
+                rate: 4 + ref_bias + u64::from(idx - 1),
+            });
+        }
+        cands.push(ModeCand {
+            ref_frame: rf,
+            y_mode: MODE_GLOBALMV,
+            mv: stack.global_mvs[0],
+            ref_mv_idx: 0,
+            rate: 4 + ref_bias,
         });
     }
-    cands.push(ModeCand {
-        y_mode: MODE_NEARESTMV,
-        mv: stack.ref_stack_mv[0][0],
-        ref_mv_idx: 0,
-        rate: 3,
-    });
-    let near_top: u32 = match nfound {
-        0..=2 => 1,
-        3 => 2,
-        _ => 3,
-    };
-    for idx in 1..=near_top {
-        cands.push(ModeCand {
-            y_mode: MODE_NEARMV,
-            mv: stack.ref_stack_mv[idx as usize][0],
-            ref_mv_idx: idx,
-            rate: 4 + u64::from(idx - 1),
-        });
-    }
-    cands.push(ModeCand {
-        y_mode: MODE_GLOBALMV,
-        mv: stack.global_mvs[0],
-        ref_mv_idx: 0,
-        rate: 4,
-    });
     // §6.10.27 conformance bound — the writers reject any leaf beyond
     // it, so a (pathological) out-of-bound stack candidate is simply
     // not offered.
@@ -1039,7 +1121,15 @@ fn encode_inter_leaf(
     let lambda = lambda_for(&recon.qp);
     let mut best: Option<(u64, usize)> = None;
     for (ci, cand) in cands.iter().enumerate() {
-        ictx.predict_leaf(mi_r, mi_c, b_size, cand.y_mode, cand.mv, EIGHTTAP)?;
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            cand.ref_frame,
+            cand.y_mode,
+            cand.mv,
+            EIGHTTAP,
+        )?;
         let mut ssd = 0u64;
         for i in 0..bh {
             for j in 0..bw {
@@ -1055,6 +1145,7 @@ fn encode_inter_leaf(
     }
     let (_, best_ci) = best.ok_or(Error::PartitionWalkOutOfRange)?;
     let ModeCand {
+        ref_frame,
         y_mode,
         mv,
         ref_mv_idx,
@@ -1076,7 +1167,7 @@ fn encode_inter_leaf(
         use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
         let mut best_f = (u64::MAX, EIGHTTAP);
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
-            ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv, f)?;
+            ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, f)?;
             let mut ssd = 0u64;
             for i in 0..bh {
                 for j in 0..bw {
@@ -1091,12 +1182,12 @@ fn encode_inter_leaf(
         }
         best_f.1
     };
-    ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv, filter)?;
+    ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, filter)?;
 
     if lossless {
         // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
         return encode_inter_leaf_residual(
-            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, filter, 0,
+            mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter, 0,
         );
     }
 
@@ -1114,7 +1205,8 @@ fn encode_inter_leaf(
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
-            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, filter, depth,
+            mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
+            depth,
         )?;
         let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
@@ -1289,6 +1381,7 @@ fn encode_inter_leaf_residual(
     input: &Yuv420Frame,
     recon: &mut ReconState,
     ictx: &PSearchCtx,
+    ref_frame: i8,
     y_mode: u8,
     mv: [i32; 2],
     ref_mv_idx: u32,
@@ -1483,7 +1576,7 @@ fn encode_inter_leaf_residual(
         block.var_tx_trees = vec![uniform_var_tx_tree(MAX_TX_SIZE_RECT[b_size], depth)];
     }
     block.inter = Some(SyntaxInterBlock {
-        ref_frame: [1, -1],
+        ref_frame: [ref_frame, -1],
         y_mode,
         mv: [mv, [0, 0]],
         ref_mv_idx,
@@ -1499,17 +1592,24 @@ fn encode_inter_leaf_residual(
 fn p_leaf_rate(block: &SyntaxBlock) -> u64 {
     let mut rate = leaf_rate(block);
     match &block.inter {
-        Some(ib) => match ib.y_mode {
-            MODE_NEWMV => {
-                let bits = |v: i32| u64::from(34 - v.unsigned_abs().leading_zeros());
-                rate += 6 + bits(ib.mv[0][0]) + bits(ib.mv[0][1]);
+        Some(ib) => {
+            if ib.ref_frame[0] != 1 {
+                // §5.11.25 single-ref cascade surcharge on the
+                // non-LAST reference.
+                rate += 1;
             }
-            MODE_NEARESTMV => rate += 3,
-            MODE_NEARMV => rate += 4 + u64::from(ib.ref_mv_idx.saturating_sub(1)),
-            // GLOBALMV — the §5.11.24 cascade's two context bits plus
-            // headroom.
-            _ => rate += 4,
-        },
+            match ib.y_mode {
+                MODE_NEWMV => {
+                    let bits = |v: i32| u64::from(34 - v.unsigned_abs().leading_zeros());
+                    rate += 6 + bits(ib.mv[0][0]) + bits(ib.mv[0][1]);
+                }
+                MODE_NEARESTMV => rate += 3,
+                MODE_NEARMV => rate += 4 + u64::from(ib.ref_mv_idx.saturating_sub(1)),
+                // GLOBALMV — the §5.11.24 cascade's two context bits
+                // plus headroom.
+                _ => rate += 4,
+            }
+        }
         None => rate += 16,
     }
     rate
@@ -1777,7 +1877,7 @@ mod tests {
             u: key.recon_u,
             v: key.recon_v,
         };
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let qp = QuantizerParams::neutral(base_q_idx, 8);
@@ -1796,7 +1896,8 @@ mod tests {
             bd: BlockDecodedMirror::new(),
         };
         let ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
-        let mut ictx = PSearchCtx::new(&reference, mi_rows, mi_cols, 64, 64, ip).unwrap();
+        let mut ictx =
+            PSearchCtx::new(&reference, &reference, mi_rows, mi_cols, 64, 64, ip, 1).unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         let mut counts = [0u32; 4];
@@ -1843,9 +1944,9 @@ mod tests {
         let mut f1 = Yuv420Frame::filled(64, 64, 0);
         {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
-            let mut probe = PSearchCtx::new(&reference, 16, 16, 64, 64, ip).unwrap();
+            let mut probe = PSearchCtx::new(&reference, &reference, 16, 16, 64, 64, ip, 1).unwrap();
             probe
-                .predict_leaf(0, 0, BLOCK_64X64, MODE_NEWMV, [0, 4], EIGHTTAP_SHARP)
+                .predict_leaf(0, 0, BLOCK_64X64, 1, MODE_NEWMV, [0, 4], EIGHTTAP_SHARP)
                 .unwrap();
             for (dst, &src) in f1.y.iter_mut().zip(probe.scratch[0].iter()) {
                 *dst = src as u8;
@@ -1857,7 +1958,7 @@ mod tests {
                 *dst = src as u8;
             }
         }
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
@@ -1876,7 +1977,8 @@ mod tests {
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
-        let mut ictx = PSearchCtx::new(&reference, mi_rows, mi_cols, 64, 64, ip).unwrap();
+        let mut ictx =
+            PSearchCtx::new(&reference, &reference, mi_rows, mi_cols, 64, 64, ip, 1).unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         fn count_filters(node: &SyntaxNode, counts: &mut [u32; 3]) {
@@ -1964,7 +2066,7 @@ mod tests {
             u: key.recon_u.clone(),
             v: key.recon_v.clone(),
         };
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
@@ -1983,7 +2085,8 @@ mod tests {
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
-        let mut ictx = PSearchCtx::new(&reference, mi_rows, mi_cols, 64, 64, ip).unwrap();
+        let mut ictx =
+            PSearchCtx::new(&reference, &reference, mi_rows, mi_cols, 64, 64, ip, 1).unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
             build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
@@ -2018,6 +2121,102 @@ mod tests {
         }
     }
 
+    /// r412 — the per-block reference selection must actually reach
+    /// GOLDEN_FRAME where it wins: a flash GOP (frame 2 is unrelated
+    /// noise, frame 3 repeats frame 1's content) makes frame 3
+    /// predict far better from the frame-before-previous, so its
+    /// search tree must carry GOLDEN leaves — and the emitted GOP
+    /// must round-trip byte-exact through the spec driver (proving
+    /// the §5.9.2 two-slot refresh rotation + `ref_frame_idx` map
+    /// against the §7.20 store).
+    #[test]
+    fn r412_p_search_selects_golden_reference_across_flash() {
+        let calm = moving_gradient(64, 64, 0, 0, 5);
+        let mut flash = Yuv420Frame::filled(64, 64, 0);
+        let mut state = 0x1234_5678u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for v in flash.y.iter_mut() {
+            *v = (next() & 0xFF) as u8;
+        }
+        // frames: KEY(calm), P1(flash), P2(calm again).
+        let frames = vec![calm.clone(), flash, calm];
+        let base_q_idx = 90u8;
+
+        // Drive the P2 search directly: prev = P1 recon (flash),
+        // prevprev = P1's prev = KEY recon (calm).
+        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let prev = enc.recon[1].clone();
+        let prevprev = enc.recon[0].clone();
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&enc.seq, 64, 64, base_q_idx, 2);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        let mut ictx = PSearchCtx::new(&prev, &prevprev, mi_rows, mi_cols, 64, 64, ip, 2).unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree =
+            build_p_search_tree(0, 0, BLOCK_64X64, &frames[2], &mut recon, &mut ictx).unwrap();
+        fn count_refs(node: &SyntaxNode, golden: &mut u32, last: &mut u32) {
+            let leafs = |b: &SyntaxBlock, golden: &mut u32, last: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.ref_frame[0] == 4 {
+                        *golden += 1;
+                    } else {
+                        *last += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafs(b, golden, last),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count_refs(ch, golden, last);
+                    }
+                }
+                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                    for b in blocks.iter() {
+                        leafs(b, golden, last);
+                    }
+                }
+            }
+        }
+        let (mut golden, mut last) = (0u32, 0u32);
+        count_refs(&tree, &mut golden, &mut last);
+        assert!(
+            golden > 0,
+            "frame after a flash must select GOLDEN_FRAME leaves \
+             (got GOLDEN={golden} LAST={last})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), frames.len());
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+    }
+
     /// r412 — [`PSearchCtx::predict_leaf`] must thread the trial
     /// filter into the §7.11.3.4 kernel: an isolated impulse column
     /// interpolated at a half-pel phase produces distinct samples per
@@ -2036,10 +2235,10 @@ mod tests {
             }
         }
         let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
-        let mut ictx = PSearchCtx::new(&refr, 16, 16, 64, 64, ip).unwrap();
+        let mut ictx = PSearchCtx::new(&refr, &refr, 16, 16, 64, 64, ip, 1).unwrap();
         let mut outs = Vec::new();
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
-            ictx.predict_leaf(2, 2, BLOCK_8X8, MODE_NEWMV, [0, 4], f)
+            ictx.predict_leaf(2, 2, BLOCK_8X8, 1, MODE_NEWMV, [0, 4], f)
                 .unwrap();
             let mut v = Vec::new();
             for i in 8..16 {
