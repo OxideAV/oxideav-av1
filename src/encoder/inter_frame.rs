@@ -56,8 +56,8 @@ use crate::cdf::{
     get_tx_size, inter_tx_type_set, tx_size_sqr_index, FindMvStackResult, PartitionWalker,
     QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT,
     EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV, MODE_NEARESTMV,
-    MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, TX_4X4,
-    TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
+    MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, SWITCHABLE,
+    TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
 };
 use crate::encoder::block_mode_info::assign_mv_pred_mv;
 use crate::encoder::frame_obu::encode_uncompressed_header;
@@ -233,7 +233,7 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
         gold_frame_idx: None,
         ref_frame_idx: [0; REFS_PER_FRAME],
         allow_high_precision_mv: false,
-        interpolation_filter: InterpolationFilter::Eighttap,
+        interpolation_filter: InterpolationFilter::Switchable,
         is_motion_mode_switchable: false,
         use_ref_frame_mvs: false,
     });
@@ -281,9 +281,13 @@ fn encode_p_frame_yuv420(
     // ONE §5.9 inter-frame parameter bundle shared verbatim by the
     // driver-side §7.10.2 mirror and the write pass — the two
     // `find_mv_stack` runs at each leaf must see identical inputs.
-    let ip = SyntaxInterFrameParams::single_ref_baseline(
+    let mut ip = SyntaxInterFrameParams::single_ref_baseline(
         mi_rows, mi_cols, /* force_integer_mv = */ false,
     );
+    // r412: SWITCHABLE frame filter — each inter leaf RD-selects its
+    // own §5.11.x interp_filter (the header writer emits
+    // `is_filter_switchable = 1`).
+    ip.interpolation_filter = SWITCHABLE;
 
     let params = SyntaxFrameParams {
         subsampling_x: 1,
@@ -585,7 +589,7 @@ impl PSearchCtx {
                 y_mode: ib.y_mode,
                 ref_frame: ib.ref_frame,
                 mv: ib.mv[0],
-                interp_filter: [self.ip.interpolation_filter; 2],
+                interp_filter: ib.interp_filter,
                 motion_mode: MOTION_MODE_SIMPLE,
                 palette_size_y: 0,
                 palette_colors_y: &[],
@@ -629,6 +633,7 @@ impl PSearchCtx {
         b_size: usize,
         y_mode: u8,
         mv: [i32; 2],
+        filter: u8,
     ) -> Result<(), Error> {
         let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
         for dr in 0..n4 {
@@ -650,8 +655,8 @@ impl PSearchCtx {
                 self.mvs[cell * 4 + 1] = mv[1] as i16;
                 self.mvs[cell * 4 + 2] = 0;
                 self.mvs[cell * 4 + 3] = 0;
-                self.interp_filters[cell * 2] = EIGHTTAP;
-                self.interp_filters[cell * 2 + 1] = EIGHTTAP;
+                self.interp_filters[cell * 2] = filter;
+                self.interp_filters[cell * 2 + 1] = filter;
                 self.motion_modes[cell] = MOTION_MODE_SIMPLE;
                 self.y_modes[cell] = y_mode;
             }
@@ -863,7 +868,7 @@ fn refine_mv_subpel(
     mv_int: [i32; 2],
 ) -> Result<[i32; 2], Error> {
     let score = |ictx: &mut PSearchCtx, mv: [i32; 2]| -> Result<u64, Error> {
-        ictx.predict_leaf(mi_r, mi_c, b_size, MODE_NEWMV, mv)?;
+        ictx.predict_leaf(mi_r, mi_c, b_size, MODE_NEWMV, mv, EIGHTTAP)?;
         let mut ssd = 0u64;
         for i in 0..n {
             for j in 0..n {
@@ -1024,7 +1029,7 @@ fn encode_inter_leaf(
     let lambda = lambda_for(&recon.qp);
     let mut best: Option<(u64, usize)> = None;
     for (ci, cand) in cands.iter().enumerate() {
-        ictx.predict_leaf(mi_r, mi_c, b_size, cand.y_mode, cand.mv)?;
+        ictx.predict_leaf(mi_r, mi_c, b_size, cand.y_mode, cand.mv, EIGHTTAP)?;
         let mut ssd = 0u64;
         for i in 0..n {
             for j in 0..n {
@@ -1045,12 +1050,43 @@ fn encode_inter_leaf(
         ref_mv_idx,
         ..
     } = cands[best_ci];
-    ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv)?;
+
+    // r412 — §5.11.x SWITCHABLE interpolation-filter RD selection on
+    // the winning (mode, MV): trial the three codable filters
+    // (`EIGHTTAP` / `EIGHTTAP_SMOOTH` / `EIGHTTAP_SHARP`) through the
+    // decoder's own §7.11.3.4 kernel and keep the lowest luma SSD
+    // (the S() costs one ~equal-rate symbol whichever value is coded,
+    // so distortion decides; ties keep EIGHTTAP). GLOBALMV leaves are
+    // `needs_interp_filter( ) == 0` on the identity-warp frame
+    // configuration — the reader derives EIGHTTAP with no bits, so no
+    // search happens and the committed pair must be EIGHTTAP.
+    let filter = if y_mode == MODE_GLOBALMV {
+        EIGHTTAP
+    } else {
+        use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
+        let mut best_f = (u64::MAX, EIGHTTAP);
+        for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
+            ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv, f)?;
+            let mut ssd = 0u64;
+            for i in 0..n {
+                for j in 0..n {
+                    let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                        - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                    ssd += (d * d) as u64;
+                }
+            }
+            if ssd < best_f.0 {
+                best_f = (ssd, f);
+            }
+        }
+        best_f.1
+    };
+    ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv, filter)?;
 
     if lossless {
         // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
         return encode_inter_leaf_residual(
-            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, 0,
+            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, filter, 0,
         );
     }
 
@@ -1068,7 +1104,7 @@ fn encode_inter_leaf(
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
-            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, depth,
+            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, filter, depth,
         )?;
         let d = region_distortion(recon, input, mi_r, mi_c, n4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
@@ -1238,6 +1274,7 @@ fn encode_inter_leaf_residual(
     y_mode: u8,
     mv: [i32; 2],
     ref_mv_idx: u32,
+    filter: u8,
     depth: u32,
 ) -> Result<SyntaxBlock, Error> {
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
@@ -1429,6 +1466,7 @@ fn encode_inter_leaf_residual(
         y_mode,
         mv: [mv, [0, 0]],
         ref_mv_idx,
+        interp_filter: [filter; 2],
     });
     Ok(block)
 }
@@ -1692,6 +1730,131 @@ mod tests {
             "the first block of the shared-motion region still codes NEWMV \
              (its stack is empty); got NEW={}",
             counts[3]
+        );
+    }
+
+    /// r412 — the SWITCHABLE filter search must actually reach a
+    /// non-EIGHTTAP choice when it is the distortion winner: the
+    /// target P-frame is constructed as the reference's OWN
+    /// EIGHTTAP_SHARP half-pel interpolation (through
+    /// [`PSearchCtx::predict_leaf`], the same kernel the search
+    /// scores with), so a SHARP-filtered leaf predicts it exactly and
+    /// every committed inter leaf must carry EIGHTTAP_SHARP.
+    #[test]
+    fn r412_p_search_selects_sharp_filter_on_kernel_matched_content() {
+        use crate::inter_pred::EIGHTTAP_SHARP;
+        let f0 = moving_gradient(64, 64, 0, 0, 77);
+        let base_q_idx = 90u8;
+        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
+        let reference = GopFrameRecon {
+            y: key.recon_y,
+            u: key.recon_u,
+            v: key.recon_v,
+        };
+        // Target frame = SHARP half-pel interpolation of the reference.
+        let mut f1 = Yuv420Frame::filled(64, 64, 0);
+        {
+            let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
+            let mut probe = PSearchCtx::new(&reference, 16, 16, 64, 64, ip).unwrap();
+            probe
+                .predict_leaf(0, 0, BLOCK_64X64, MODE_NEWMV, [0, 4], EIGHTTAP_SHARP)
+                .unwrap();
+            for (dst, &src) in f1.y.iter_mut().zip(probe.scratch[0].iter()) {
+                *dst = src as u8;
+            }
+            for (dst, &src) in f1.u.iter_mut().zip(probe.scratch[1].iter()) {
+                *dst = src as u8;
+            }
+            for (dst, &src) in f1.v.iter_mut().zip(probe.scratch[2].iter()) {
+                *dst = src as u8;
+            }
+        }
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        let mut ictx = PSearchCtx::new(&reference, mi_rows, mi_cols, 64, 64, ip).unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        fn count_filters(node: &SyntaxNode, counts: &mut [u32; 3]) {
+            match node {
+                SyntaxNode::Leaf(b) => {
+                    if let Some(ib) = b.inter.as_ref() {
+                        counts[usize::from(ib.interp_filter[0].min(2))] += 1;
+                    }
+                }
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count_filters(ch, counts);
+                    }
+                }
+            }
+        }
+        let mut counts = [0u32; 3];
+        count_filters(&tree, &mut counts);
+        let sharp = counts[usize::from(EIGHTTAP_SHARP)];
+        assert!(
+            sharp > 0,
+            "kernel-matched half-pel content must commit EIGHTTAP_SHARP \
+             leaves (got EIGHTTAP={} SMOOTH={} SHARP={sharp})",
+            counts[0],
+            counts[1]
+        );
+    }
+
+    /// r412 — [`PSearchCtx::predict_leaf`] must thread the trial
+    /// filter into the §7.11.3.4 kernel: an isolated impulse column
+    /// interpolated at a half-pel phase produces distinct samples per
+    /// filter family.
+    #[test]
+    fn r412_predict_leaf_threads_interp_filter() {
+        use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
+        let mut refr = GopFrameRecon {
+            y: vec![0u8; 64 * 64],
+            u: vec![128u8; 32 * 32],
+            v: vec![128u8; 32 * 32],
+        };
+        for i in 0..64 {
+            for j in 0..64 {
+                refr.y[i * 64 + j] = if j == 10 { 255 } else { 0 };
+            }
+        }
+        let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
+        let mut ictx = PSearchCtx::new(&refr, 16, 16, 64, 64, ip).unwrap();
+        let mut outs = Vec::new();
+        for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
+            ictx.predict_leaf(2, 2, BLOCK_8X8, MODE_NEWMV, [0, 4], f)
+                .unwrap();
+            let mut v = Vec::new();
+            for i in 8..16 {
+                for j in 8..16 {
+                    v.push(ictx.scratch[0][i * 64 + j]);
+                }
+            }
+            outs.push(v);
+        }
+        assert_ne!(
+            outs[0], outs[1],
+            "EIGHTTAP vs SMOOTH must differ at half-pel"
+        );
+        assert_ne!(
+            outs[0], outs[2],
+            "EIGHTTAP vs SHARP must differ at half-pel"
         );
     }
 

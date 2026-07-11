@@ -112,12 +112,12 @@ use crate::cdf::{
     EncoderBlockSyntaxStamp, FrameInterOrderHints, InterpolationFilterReadout, MotionFieldMvs,
     PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
     BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, EIGHTTAP, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
-    H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MI_HEIGHT_LOG2,
-    MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEARMV, MODE_NEWMV,
-    MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE,
-    PARTITION_SPLIT, SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT,
-    TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
-    WARPEDMODEL_PREC_BITS,
+    GM_TYPE_TRANSLATION, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
+    MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV,
+    MODE_NEARESTMV, MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH,
+    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, SPLIT_TX_SIZE,
+    SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL,
+    TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
     write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_inter_block_mode_info,
@@ -769,6 +769,15 @@ pub struct SyntaxInterBlock {
     /// §5.11.23 `RefMvIdx` — threaded to `write_drl_mode` +
     /// `assign_mv_pred_mv`.
     pub ref_mv_idx: u32,
+    /// r412 — the committed §5.11.x `interp_filter[ 0..2 ]` pair AS
+    /// THE READER DERIVES IT: on a non-SWITCHABLE frame filter both
+    /// slots MUST equal the frame value; on SWITCHABLE with
+    /// `needs_interp_filter( )` false both slots MUST be `EIGHTTAP`;
+    /// otherwise slot 0 (and slot 1 iff `enable_dual_filter`) carries
+    /// the coded choice in `EIGHTTAP..=EIGHTTAP_SHARP` (with
+    /// `!enable_dual_filter` mirroring slot 0 into slot 1). Any other
+    /// shape is rejected by the §5.11.x writer.
+    pub interp_filter: [u8; 2],
 }
 
 /// Frame-scope inter state for a §5.11.18 write walk (r411) — the
@@ -1888,10 +1897,13 @@ pub fn write_block_syntax(
 ///   follow-up arc.
 /// * `ip.skip_mode_present` — the §5.11.10 skip-mode ctx walk is a
 ///   follow-up arc.
-/// * Compound references (`ref_frame[1] != NONE`) and the SWITCHABLE
-///   frame filter — follow-up arcs.
+/// * Compound references (`ref_frame[1] != NONE`) — follow-up arc.
 /// * A non-NEWMV leaf whose committed MV differs from the §5.11.26
 ///   `PredMv` derivation (see [`SyntaxInterBlock`]).
+/// * A committed `interp_filter` pair inconsistent with the §5.11.x
+///   loop's gates (r412 lands the SWITCHABLE frame-filter arm: the
+///   per-block filter S() with the §8.3.2 neighbour ctx from the
+///   mirror's `InterpFilters[]` / `RefFrames[]` grids).
 #[allow(clippy::too_many_arguments)]
 fn write_block_syntax_inter_frame(
     writer: &mut SymbolWriter,
@@ -2049,7 +2061,7 @@ fn write_block_syntax_inter_frame(
         if ib.mv[0][0].unsigned_abs() >= (1 << 14) || ib.mv[0][1].unsigned_abs() >= (1 << 14) {
             return Err(Error::PartitionWalkOutOfRange);
         }
-        if ip.interpolation_filter >= SWITCHABLE {
+        if ip.interpolation_filter > SWITCHABLE {
             return Err(Error::PartitionWalkOutOfRange);
         }
 
@@ -2108,8 +2120,10 @@ fn write_block_syntax_inter_frame(
 
         // §5.11.23 tail — every optional tool gated shut on the r411
         // frame configuration (the writers still validate the spec
-        // preconditions); the interpolation-filter loop reads the
-        // frame filter into both slots with no bits.
+        // preconditions); r412 adds the SWITCHABLE frame-filter arm:
+        // the §5.11.x loop codes `interp_filter[ 0 ]` (slot 1 mirrors
+        // it on `!enable_dual_filter`) whenever `needs_interp_filter()`
+        // holds, else derives EIGHTTAP with no bits.
         let mut tail = InterBlockModeInfoTail::bit_silent();
         tail.interpolation_filter = ip.interpolation_filter;
         tail.enable_dual_filter = ip.enable_dual_filter;
@@ -2120,9 +2134,41 @@ fn write_block_syntax_inter_frame(
         tail.enable_interintra_compound = ip.enable_interintra_compound;
         tail.enable_masked_compound = ip.enable_masked_compound;
         tail.enable_jnt_comp = ip.enable_jnt_comp;
-        tail.interp_filter = InterpolationFilterReadout {
-            interp_filter: [ip.interpolation_filter; 2],
-            read_from_bitstream: [false, false],
+        tail.interp_filter = if ip.interpolation_filter != SWITCHABLE {
+            // §5.11.x else-arm: both slots read the frame filter with
+            // no bits — the committed pair must carry exactly that.
+            if ib.interp_filter != [ip.interpolation_filter; 2] {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            InterpolationFilterReadout {
+                interp_filter: [ip.interpolation_filter; 2],
+                read_from_bitstream: [false, false],
+            }
+        } else {
+            // `needs_interp_filter( )` per av1-spec p.75 on this arm's
+            // fixed scalars (`skip_mode = 0`, SIMPLE motion mode —
+            // the r411 configuration): only the GLOBALMV-on-large
+            // branch can gate the read off.
+            let large = core::cmp::min(
+                NUM_4X4_BLOCKS_WIDE[sub_size] * MI_SIZE,
+                NUM_4X4_BLOCKS_HIGH[sub_size] * MI_SIZE,
+            ) >= 8;
+            let needs = if large && ib.y_mode == MODE_GLOBALMV {
+                ip.gm_type[ib.ref_frame[0] as usize] == GM_TYPE_TRANSLATION
+            } else {
+                true
+            };
+            let mut read = [false, false];
+            if needs {
+                read[0] = true;
+                if ip.enable_dual_filter {
+                    read[1] = true;
+                }
+            }
+            InterpolationFilterReadout {
+                interp_filter: ib.interp_filter,
+                read_from_bitstream: read,
+            }
         };
         if avail_u {
             let cell = (((mi_row - 1) * state.mi_cols + mi_col) as usize) * 2;
@@ -2134,6 +2180,7 @@ fn write_block_syntax_inter_frame(
             let f = state.mirror.interp_filters();
             tail.left_interp_filters = [f[cell], f[cell + 1]];
         }
+        let committed_filters = tail.interp_filter.interp_filter;
 
         write_inter_block_mode_info(
             writer,
@@ -2177,7 +2224,7 @@ fn write_block_syntax_inter_frame(
                 y_mode: ib.y_mode,
                 ref_frame: ib.ref_frame,
                 mv: ib.mv[0],
-                interp_filter: [ip.interpolation_filter; 2],
+                interp_filter: committed_filters,
                 motion_mode: MOTION_MODE_SIMPLE,
                 palette_size_y: 0,
                 palette_colors_y: &[],
@@ -5729,6 +5776,7 @@ mod tests {
             y_mode,
             mv: [mv, [0, 0]],
             ref_mv_idx: 0,
+            interp_filter: [EIGHTTAP; 2],
         });
         b
     }
@@ -5789,6 +5837,101 @@ mod tests {
         assert_eq!(walker.y_modes()[cell(8, 0)], V_PRED as u8);
         assert_eq!(walker.ref_frames()[cell(8, 8) * 2], 1);
         assert_eq!(walker.ref_frames()[cell(8, 8) * 2 + 1], -1);
+    }
+
+    /// r412 — SWITCHABLE frame-filter round trip: four leaves mixing
+    /// per-block `interp_filter` choices (EIGHTTAP / SMOOTH / SHARP on
+    /// coded-filter leaves, the forced no-bit EIGHTTAP derivation on a
+    /// GLOBALMV leaf), replayed bit-for-bit by the §5.11.18 decode
+    /// walker. The 4th leaf's §8.3.2 filter ctx walk reads the 2nd/3rd
+    /// leaves' stamped `InterpFilters[]` / `RefFrames[]` neighbours,
+    /// so the sentinel landing proves the ctx threading, and the
+    /// decoded grids prove the per-block filter values.
+    #[test]
+    fn r412_inter_syntax_round_trip_switchable_filters() {
+        let mut params = inter_params_420(16, 16, /* lossless = */ true);
+        params
+            .inter
+            .as_mut()
+            .expect("inter params")
+            .interpolation_filter = SWITCHABLE;
+
+        use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
+        // NW: NEWMV coded with EIGHTTAP_SMOOTH.
+        let mut nw = inter_skip_leaf(MODE_NEWMV, [10, -14]);
+        nw.inter.as_mut().unwrap().interp_filter = [EIGHTTAP_SMOOTH; 2];
+        // NE: GLOBALMV — needs_interp_filter() == 0 on the identity
+        // warp, so the pair MUST be the derived EIGHTTAP (no bits).
+        let ne = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        // SW: NEWMV coded with EIGHTTAP_SHARP.
+        let mut sw = inter_skip_leaf(MODE_NEWMV, [-8, 24]);
+        sw.inter.as_mut().unwrap().interp_filter = [EIGHTTAP_SHARP; 2];
+        // SE: NEWMV coded with EIGHTTAP — its §8.3.2 ctx sees the NE
+        // (above) and SW (left) neighbours' stamped filters.
+        let se = inter_skip_leaf(MODE_NEWMV, [2, 2]);
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0x5C);
+
+        let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+        let f = walker.interp_filters();
+        assert_eq!(
+            [f[cell(0, 0) * 2], f[cell(0, 0) * 2 + 1]],
+            [EIGHTTAP_SMOOTH; 2],
+            "NW leaf filter pair"
+        );
+        assert_eq!(
+            [f[cell(0, 8) * 2], f[cell(0, 8) * 2 + 1]],
+            [EIGHTTAP; 2],
+            "NE GLOBALMV leaf derives EIGHTTAP with no bits"
+        );
+        assert_eq!(
+            [f[cell(8, 0) * 2], f[cell(8, 0) * 2 + 1]],
+            [EIGHTTAP_SHARP; 2],
+            "SW leaf filter pair"
+        );
+        assert_eq!(
+            [f[cell(8, 8) * 2], f[cell(8, 8) * 2 + 1]],
+            [EIGHTTAP; 2],
+            "SE leaf filter pair"
+        );
+    }
+
+    /// r412 — a committed filter pair inconsistent with the §5.11.x
+    /// gates is a caller bug: a GLOBALMV leaf claiming a coded SHARP
+    /// filter on the identity-warp configuration must be rejected
+    /// (the reader can only derive EIGHTTAP there).
+    #[test]
+    fn r412_inter_syntax_rejects_filter_on_globalmv_identity_leaf() {
+        let mut params = inter_params_420(16, 16, /* lossless = */ true);
+        params
+            .inter
+            .as_mut()
+            .expect("inter params")
+            .interpolation_filter = SWITCHABLE;
+        let mut leaf = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        leaf.inter.as_mut().unwrap().interp_filter = [crate::inter_pred::EIGHTTAP_SHARP; 2];
+
+        let mut writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut state = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+        let node = SyntaxNode::Leaf(Box::new(leaf));
+        let err = write_partition_tree_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &node,
+            0,
+            0,
+            BLOCK_64X64,
+            &params,
+        );
+        assert!(matches!(err, Err(Error::PartitionWalkOutOfRange)));
     }
 
     /// NEARESTMV threading: the second leaf's no-bit MV must equal the
