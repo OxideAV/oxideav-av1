@@ -53,11 +53,13 @@
 //! §7.20 (reference frame update).
 
 use crate::cdf::{
-    get_tx_size, inter_tx_type_set, tx_size_sqr_index, QuantizerParams, TileCdfContext,
-    TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT, EIGHTTAP, GM_TYPE_IDENTITY,
-    MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV, MODE_NEWMV, MOTION_MODE_SIMPLE,
-    NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
+    get_tx_size, inter_tx_type_set, tx_size_sqr_index, FindMvStackResult, PartitionWalker,
+    QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT,
+    EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV, MODE_NEARESTMV,
+    MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, TX_4X4,
+    TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
 };
+use crate::encoder::block_mode_info::assign_mv_pred_mv;
 use crate::encoder::frame_obu::encode_uncompressed_header;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::{
@@ -276,6 +278,13 @@ fn encode_p_frame_yuv420(
     let lossless = base_q_idx == 0;
     let qp = QuantizerParams::neutral(base_q_idx, 8);
 
+    // ONE §5.9 inter-frame parameter bundle shared verbatim by the
+    // driver-side §7.10.2 mirror and the write pass — the two
+    // `find_mv_stack` runs at each leaf must see identical inputs.
+    let ip = SyntaxInterFrameParams::single_ref_baseline(
+        mi_rows, mi_cols, /* force_integer_mv = */ false,
+    );
+
     let params = SyntaxFrameParams {
         subsampling_x: 1,
         subsampling_y: 1,
@@ -302,9 +311,7 @@ fn encode_p_frame_yuv420(
         tx_mode_select: !lossless,
         quant: qp,
         reduced_tx_set: fh.reduced_tx_set.unwrap_or(false),
-        inter: Some(SyntaxInterFrameParams::single_ref_baseline(
-            mi_rows, mi_cols, /* force_integer_mv = */ false,
-        )),
+        inter: Some(ip.clone()),
     };
 
     let mut recon = ReconState {
@@ -321,7 +328,7 @@ fn encode_p_frame_yuv420(
         qp,
         bd: BlockDecodedMirror::new(),
     };
-    let mut ictx = PSearchCtx::new(reference, mi_rows, mi_cols, width, height);
+    let mut ictx = PSearchCtx::new(reference, mi_rows, mi_cols, width, height, ip)?;
 
     let mut writer = SymbolWriter::new(fh.disable_cdf_update);
     let mut cdfs = TileCdfContext::new_from_defaults();
@@ -404,6 +411,18 @@ fn encode_p_frame_yuv420(
 /// no sub-8×8 inter leaves), so trial rollbacks need not restore the
 /// grids — the winning candidate re-stamps its footprint before
 /// predicting.
+///
+/// r412 adds [`PSearchCtx::mirror`]: a full [`PartitionWalker`] the
+/// RD search stamps with each COMMITTED leaf (via
+/// [`PSearchCtx::stamp_leaf`], the same
+/// `stamp_encoder_block_syntax` values the write pass stamps) so the
+/// §7.10.2 `find_mv_stack` scan can run at SEARCH time with exactly
+/// the state the write-pass mirror will hold at that leaf — the
+/// NEARESTMV / NEARMV / drl mode selection depends on it. Trials are
+/// rolled back with the rect snapshot pair
+/// ([`PartitionWalker::snapshot_encoder_stamp_rect`] /
+/// [`PartitionWalker::restore_encoder_stamp_rect`]), mirroring the
+/// pixel-plane `save_region` / `restore_region` discipline.
 struct PSearchCtx {
     mi_rows: u32,
     mi_cols: u32,
@@ -434,6 +453,12 @@ struct PSearchCtx {
     gm_flat: [i32; 48],
     zero_hints: [i32; 8],
     no_scaled: [bool; 8],
+    /// r412 — driver-side write-mirror twin for §7.10.2 MV prediction
+    /// (see the struct docs).
+    mirror: PartitionWalker,
+    /// The §5.9 inter bundle shared with the write pass — the
+    /// `find_mv_stack` argument set.
+    ip: SyntaxInterFrameParams,
 }
 
 impl PSearchCtx {
@@ -443,7 +468,8 @@ impl PSearchCtx {
         mi_cols: u32,
         width: usize,
         height: usize,
-    ) -> Self {
+        ip: SyntaxInterFrameParams,
+    ) -> Result<Self, Error> {
         let cells = (mi_rows as usize) * (mi_cols as usize);
         let widen = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
         let mut gm_flat = [0i32; 48];
@@ -456,7 +482,18 @@ impl PSearchCtx {
             ref_frames[cell * 2] = 0; // INTRA_FRAME pre-fill
             ref_frames[cell * 2 + 1] = -1; // NONE
         }
-        PSearchCtx {
+        let mirror = PartitionWalker::new(
+            mi_rows,
+            mi_cols,
+            TileGeometry {
+                mi_row_start: 0,
+                mi_row_end: mi_rows,
+                mi_col_start: 0,
+                mi_col_end: mi_cols,
+            },
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        Ok(PSearchCtx {
             mi_rows,
             mi_cols,
             luma_w: width as u32,
@@ -484,7 +521,102 @@ impl PSearchCtx {
             gm_flat,
             zero_hints: [0i32; 8],
             no_scaled: [false; 8],
-        }
+            mirror,
+            ip,
+        })
+    }
+
+    /// §7.10.2 `find_mv_stack( 0 )` against the driver mirror for the
+    /// single-reference LAST_FRAME leaf at `(mi_row, mi_col)` — the
+    /// argument set is character-for-character the write arm's
+    /// (`write_block_syntax_inter_frame` threads the same
+    /// [`SyntaxInterFrameParams`] fields), so both scans agree by
+    /// construction whenever the two mirrors hold the same grids.
+    fn find_stack_single(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        b_size: usize,
+    ) -> Result<FindMvStackResult, Error> {
+        self.mirror.find_mv_stack(
+            mi_row,
+            mi_col,
+            b_size,
+            [1, -1],
+            /* is_compound = */ false,
+            self.ip.use_ref_frame_mvs,
+            self.ip.gm_type,
+            self.ip.gm_params,
+            self.ip.ref_frame_sign_bias,
+            self.ip.allow_high_precision_mv,
+            self.ip.force_integer_mv,
+            &self.ip.motion_field_mvs,
+        )
+    }
+
+    /// Stamp a COMMITTED leaf into the driver mirror with the same
+    /// `stamp_encoder_block_syntax` values the write pass stamps for
+    /// this leaf (`cdef: None` per the
+    /// [`PartitionWalker::snapshot_encoder_stamp_rect`] contract —
+    /// the §5.11.56 anchor can land outside the trial rect, and no
+    /// §7.10.2 / §8.3.2 read the search performs consults it).
+    fn stamp_leaf(
+        &mut self,
+        block: &SyntaxBlock,
+        mi_row: u32,
+        mi_col: u32,
+        b_size: usize,
+        lossless: bool,
+    ) {
+        use crate::cdf::EncoderBlockSyntaxStamp;
+        let tx_pre = if lossless {
+            TX_4X4 as u8
+        } else {
+            MAX_TX_SIZE_RECT[b_size] as u8
+        };
+        let stamp = match block.inter.as_ref() {
+            Some(ib) => EncoderBlockSyntaxStamp {
+                mi_row,
+                mi_col,
+                sub_size: b_size,
+                skip: block.skip,
+                segment_id: block.segment_id,
+                is_inter: 1,
+                y_mode: ib.y_mode,
+                ref_frame: ib.ref_frame,
+                mv: ib.mv[0],
+                interp_filter: [self.ip.interpolation_filter; 2],
+                motion_mode: MOTION_MODE_SIMPLE,
+                palette_size_y: 0,
+                palette_colors_y: &[],
+                palette_size_uv: 0,
+                palette_colors_u: &[],
+                palette_colors_v: &[],
+                cdef: None,
+                tx_size: tx_pre,
+            },
+            None => EncoderBlockSyntaxStamp {
+                mi_row,
+                mi_col,
+                sub_size: b_size,
+                skip: block.skip,
+                segment_id: block.segment_id,
+                is_inter: 0,
+                y_mode: block.y_mode,
+                ref_frame: [0, -1],
+                mv: [0, 0],
+                interp_filter: [0, 0],
+                motion_mode: MOTION_MODE_SIMPLE,
+                palette_size_y: block.palette.size_y,
+                palette_colors_y: &block.palette.colors_y,
+                palette_size_uv: block.palette.size_uv,
+                palette_colors_u: &block.palette.colors_u,
+                palette_colors_v: &block.palette.colors_v,
+                cdef: None,
+                tx_size: tx_pre,
+            },
+        };
+        self.mirror.stamp_encoder_block_syntax(&stamp);
     }
 
     /// Stamp the leaf's §5.11.5 grid footprint (the same values the
@@ -782,6 +914,11 @@ fn encode_inter_leaf(
     let width = recon.width;
     let lossless = recon.lossless;
 
+    // r412 — §7.10.2 MV prediction against the driver mirror: the
+    // same scan the write pass will run at this leaf (the mirror holds
+    // every previously COMMITTED leaf's stamps and nothing else).
+    let stack = ictx.find_stack_single(mi_r, mi_c, b_size)?;
+
     let mv_int = motion_search_luma(
         input,
         &ictx.ref_planes[0],
@@ -796,21 +933,125 @@ fn encode_inter_leaf(
     // §7.11.3.4 kernel (so the search cost IS the coding cost).
     // `allow_high_precision_mv = 0` restricts components to quarter-pel
     // (multiples of 2 in 1/8-luma units).
-    let mv = refine_mv_subpel(
+    let mv_new = refine_mv_subpel(
         input, ictx, mi_r, mi_c, b_size, row0, col0, n, width, mv_int,
     )?;
-    // Zero vector ⇒ GLOBALMV (the identity-warp §7.10.2.1 derivation
-    // is exactly [0, 0], so no MV bits and no PredMv dependence).
-    let y_mode = if mv == [0, 0] {
-        MODE_GLOBALMV
-    } else {
-        MODE_NEWMV
+
+    // r412 — §5.11.24 single-pred mode selection over the full
+    // candidate set the syntax can express at this leaf:
+    //
+    // * `NEWMV` at the searched vector, with the §5.11.23 `drl_mode`
+    //   index chosen to minimise the §5.11.32 difference bits against
+    //   the reachable `PredMv` slots (`{0}` for `NumMvFound <= 1`,
+    //   `{0, 1}` at 2, `{0, 1, 2}` beyond — the reader's loop bounds);
+    // * `NEARESTMV` at `RefStackMv[ 0 ][ 0 ]` (no MV bits);
+    // * `NEARMV` at every `RefStackMv[ idx ][ 0 ]` the drl loop can
+    //   reach (`idx = 1` always — the arm's silent start value — plus
+    //   `2` at `NumMvFound >= 3` and `3` at `NumMvFound >= 4`);
+    // * `GLOBALMV` at the §7.10.2.1 derivation (identity warp ⇒ the
+    //   zero vector on this frame configuration).
+    //
+    // Each candidate's prediction runs through the decoder's own
+    // §7.11.3 leaf driver; the winner minimises luma SSD + λ · a
+    // small per-mode rate proxy (mode cascade + drl + MV-difference
+    // bits), mirroring [`p_leaf_rate`]'s constants.
+    struct ModeCand {
+        y_mode: u8,
+        mv: [i32; 2],
+        ref_mv_idx: u32,
+        rate: u64,
+    }
+    let diff_bits = |mv: [i32; 2], pred: [i32; 2]| -> u64 {
+        let b = |d: i32| u64::from(34 - d.unsigned_abs().leading_zeros());
+        b(mv[0] - pred[0]) + b(mv[1] - pred[1])
     };
+    let nfound = stack.num_mv_found;
+    let mut cands: Vec<ModeCand> = Vec::with_capacity(6);
+    {
+        // NEWMV: pick the reachable drl slot with the cheapest
+        // §5.11.32 difference (each extra slot costs one drl_mode bit).
+        let window: u32 = match nfound {
+            0 | 1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        let mut best: Option<(u64, u32)> = None;
+        for idx in 0..=window {
+            let pred = assign_mv_pred_mv(&stack, MODE_NEWMV, 0, idx)?;
+            let rate = 5 + u64::from(idx) + diff_bits(mv_new, pred);
+            if best.map_or(true, |(r, _)| rate < r) {
+                best = Some((rate, idx));
+            }
+        }
+        let (rate, idx) = best.expect("slot 0 is always reachable");
+        cands.push(ModeCand {
+            y_mode: MODE_NEWMV,
+            mv: mv_new,
+            ref_mv_idx: idx,
+            rate,
+        });
+    }
+    cands.push(ModeCand {
+        y_mode: MODE_NEARESTMV,
+        mv: stack.ref_stack_mv[0][0],
+        ref_mv_idx: 0,
+        rate: 3,
+    });
+    let near_top: u32 = match nfound {
+        0..=2 => 1,
+        3 => 2,
+        _ => 3,
+    };
+    for idx in 1..=near_top {
+        cands.push(ModeCand {
+            y_mode: MODE_NEARMV,
+            mv: stack.ref_stack_mv[idx as usize][0],
+            ref_mv_idx: idx,
+            rate: 4 + u64::from(idx - 1),
+        });
+    }
+    cands.push(ModeCand {
+        y_mode: MODE_GLOBALMV,
+        mv: stack.global_mvs[0],
+        ref_mv_idx: 0,
+        rate: 4,
+    });
+    // §6.10.27 conformance bound — the writers reject any leaf beyond
+    // it, so a (pathological) out-of-bound stack candidate is simply
+    // not offered.
+    cands.retain(|c| c.mv[0].unsigned_abs() < (1 << 14) && c.mv[1].unsigned_abs() < (1 << 14));
+
+    let lambda = lambda_for(&recon.qp);
+    let mut best: Option<(u64, usize)> = None;
+    for (ci, cand) in cands.iter().enumerate() {
+        ictx.predict_leaf(mi_r, mi_c, b_size, cand.y_mode, cand.mv)?;
+        let mut ssd = 0u64;
+        for i in 0..n {
+            for j in 0..n {
+                let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                    - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                ssd += (d * d) as u64;
+            }
+        }
+        let score = ssd + lambda * cand.rate;
+        if best.map_or(true, |(s, _)| score < s) {
+            best = Some((score, ci));
+        }
+    }
+    let (_, best_ci) = best.ok_or(Error::PartitionWalkOutOfRange)?;
+    let ModeCand {
+        y_mode,
+        mv,
+        ref_mv_idx,
+        ..
+    } = cands[best_ci];
     ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv)?;
 
     if lossless {
         // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
-        return encode_inter_leaf_residual(mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, 0);
+        return encode_inter_leaf_residual(
+            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, 0,
+        );
     }
 
     // §5.11.17 uniform-depth RD trial (TX_MODE_SELECT): code the leaf
@@ -823,12 +1064,12 @@ fn encode_inter_leaf(
         t = SPLIT_TX_SIZE[t];
         max_depth += 1;
     }
-    let lambda = lambda_for(&recon.qp);
     let before = save_region(recon, mi_r, mi_c, n4);
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for depth in 0..=max_depth {
-        let leaf =
-            encode_inter_leaf_residual(mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, depth)?;
+        let leaf = encode_inter_leaf_residual(
+            mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, depth,
+        )?;
         let d = region_distortion(recon, input, mi_r, mi_c, n4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
         let improves = match best.as_ref() {
@@ -996,6 +1237,7 @@ fn encode_inter_leaf_residual(
     ictx: &PSearchCtx,
     y_mode: u8,
     mv: [i32; 2],
+    ref_mv_idx: u32,
     depth: u32,
 ) -> Result<SyntaxBlock, Error> {
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
@@ -1186,7 +1428,7 @@ fn encode_inter_leaf_residual(
         ref_frame: [1, -1],
         y_mode,
         mv: [mv, [0, 0]],
-        ref_mv_idx: 0,
+        ref_mv_idx,
     });
     Ok(block)
 }
@@ -1198,12 +1440,17 @@ fn encode_inter_leaf_residual(
 fn p_leaf_rate(block: &SyntaxBlock) -> u64 {
     let mut rate = leaf_rate(block);
     match &block.inter {
-        Some(ib) => {
-            if ib.y_mode == MODE_NEWMV {
+        Some(ib) => match ib.y_mode {
+            MODE_NEWMV => {
                 let bits = |v: i32| u64::from(34 - v.unsigned_abs().leading_zeros());
                 rate += 6 + bits(ib.mv[0][0]) + bits(ib.mv[0][1]);
             }
-        }
+            MODE_NEARESTMV => rate += 3,
+            MODE_NEARMV => rate += 4 + u64::from(ib.ref_mv_idx.saturating_sub(1)),
+            // GLOBALMV — the §5.11.24 cascade's two context bits plus
+            // headroom.
+            _ => rate += 4,
+        },
         None => rate += 16,
     }
     rate
@@ -1262,39 +1509,54 @@ fn build_p_search_tree(
 
     let lambda = lambda_for(&recon.qp);
     let before = save_region(recon, r, c, n4 as usize);
+    // r412: the driver mirror follows the same trial / rollback
+    // discipline as the pixel planes — every candidate leaves the
+    // mirror holding ITS committed stamps, and the loser's stamps are
+    // rolled back so subsequent §7.10.2 scans see only the winner.
+    let m_before = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
 
     // Candidate A: one INTER leaf.
     let inter_leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx)?;
+    ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
     let d_inter = region_distortion(recon, input, r, c, n4 as usize);
     let r_inter = p_leaf_rate(&inter_leaf);
     let score_inter = d_inter + lambda * r_inter;
     let after_inter = save_region(recon, r, c, n4 as usize);
+    let m_after_inter = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
     restore_region(recon, r, c, &before);
+    ictx.mirror.restore_encoder_stamp_rect(&m_before);
 
     // Candidate B: one INTRA leaf (§5.11.22 arm) with the KEY
     // driver's §5.11.15 tx_depth RD search (TX_MODE_SELECT on the
     // lossy arm; the lossless arm stays on the TX_4X4 grid).
     let intra_leaf = encode_leaf_sq(r, c, b_size, input, recon);
+    ictx.stamp_leaf(&intra_leaf, r, c, b_size, recon.lossless);
     let d_intra = region_distortion(recon, input, r, c, n4 as usize);
     let r_intra = p_leaf_rate(&intra_leaf);
     let score_intra = d_intra + lambda * r_intra;
     let after_intra = save_region(recon, r, c, n4 as usize);
+    let m_after_intra = ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4);
     restore_region(recon, r, c, &before);
+    ictx.mirror.restore_encoder_stamp_rect(&m_before);
 
-    let (leaf, after_leaf, score_leaf) = if score_inter <= score_intra {
-        (inter_leaf, after_inter, score_inter)
+    let (leaf, after_leaf, m_after_leaf, score_leaf) = if score_inter <= score_intra {
+        (inter_leaf, after_inter, m_after_inter, score_inter)
     } else {
-        (intra_leaf, after_intra, score_intra)
+        (intra_leaf, after_intra, m_after_intra, score_intra)
     };
 
     if b_size <= BLOCK_8X8 {
         // P-frame leaf floor — no split candidate.
         restore_region(recon, r, c, &after_leaf);
+        ictx.mirror.restore_encoder_stamp_rect(&m_after_leaf);
         return Ok(SyntaxNode::Leaf(Box::new(leaf)));
     }
 
     // Candidate C: PARTITION_SPLIT into four recursively-searched
-    // quadrants (NW/NE/SW/SE dispatch order).
+    // quadrants (NW/NE/SW/SE dispatch order — the mirror currently
+    // holds the pre-node state, so each child's §7.10.2 scan sees its
+    // earlier siblings' committed stamps exactly as the write pass
+    // will).
     let children = [
         Box::new(build_p_search_tree(r, c, sub, input, recon, ictx)?),
         Box::new(build_p_search_tree(r, c + half, sub, input, recon, ictx)?),
@@ -1314,8 +1576,143 @@ fn build_p_search_tree(
 
     if score_leaf <= score_split {
         restore_region(recon, r, c, &after_leaf);
+        ictx.mirror.restore_encoder_stamp_rect(&m_after_leaf);
         Ok(SyntaxNode::Leaf(Box::new(leaf)))
     } else {
         Ok(SyntaxNode::Split(children))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic textured frame with translation `(sy, sx)` — the
+    /// `gop_inter_conformance.rs` generator, duplicated here so the
+    /// module test can drive the search internals directly.
+    fn moving_gradient(w: u32, h: u32, shift_y: usize, shift_x: usize, seed: u32) -> Yuv420Frame {
+        let (wu, hu) = (w as usize, h as usize);
+        let s = seed as usize;
+        let mut f = Yuv420Frame::filled(w, h, 0);
+        for i in 0..hu {
+            for j in 0..wu {
+                let (si, sj) = (i + shift_y, j + shift_x);
+                f.y[i * wu + j] = ((si * 5 + sj * 3 + (si / 16) * (sj / 16) + s) % 256) as u8;
+            }
+        }
+        let (cw, ch) = (wu / 2, hu / 2);
+        for i in 0..ch {
+            for j in 0..cw {
+                let (si, sj) = (i + shift_y / 2, j + shift_x / 2);
+                f.u[i * cw + j] = ((128 + si * 2 + sj + s) % 256) as u8;
+                f.v[i * cw + j] = ((64 + si + sj * 2 + s) % 256) as u8;
+            }
+        }
+        f
+    }
+
+    fn count_modes(node: &SyntaxNode, counts: &mut [u32; 4]) {
+        match node {
+            SyntaxNode::Leaf(b) => {
+                if let Some(ib) = b.inter.as_ref() {
+                    match ib.y_mode {
+                        MODE_NEARESTMV => counts[0] += 1,
+                        MODE_NEARMV => counts[1] += 1,
+                        MODE_GLOBALMV => counts[2] += 1,
+                        MODE_NEWMV => counts[3] += 1,
+                        _ => {}
+                    }
+                }
+            }
+            SyntaxNode::Split(children) => {
+                for ch in children.iter() {
+                    count_modes(ch, counts);
+                }
+            }
+        }
+    }
+
+    /// r412 — on uniformly translating content the §5.11.24 mode
+    /// selection must actually REACH the stack-predicted modes: after
+    /// the first leaves code NEWMV, every later leaf's §7.10.2 stack
+    /// carries the shared vector, so NEARESTMV / NEARMV (no MV bits)
+    /// dominate. The search tree is inspected directly; the emitted
+    /// stream's conformance is covered by `gop_inter_conformance.rs`
+    /// (the write pass re-derives every stack and rejects any
+    /// driver / write mirror divergence).
+    #[test]
+    fn r412_p_search_selects_stack_predicted_modes_on_uniform_motion() {
+        let f0 = moving_gradient(64, 64, 0, 0, 7);
+        let f1 = moving_gradient(64, 64, 3, 5, 7);
+        let base_q_idx = 60u8;
+        let key = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
+        let reference = GopFrameRecon {
+            y: key.recon_y,
+            u: key.recon_u,
+            v: key.recon_v,
+        };
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let qp = QuantizerParams::neutral(base_q_idx, 8);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp,
+            bd: BlockDecodedMirror::new(),
+        };
+        let ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        let mut ictx = PSearchCtx::new(&reference, mi_rows, mi_cols, 64, 64, ip).unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
+        let mut counts = [0u32; 4];
+        count_modes(&tree, &mut counts);
+        let total: u32 = counts.iter().sum();
+        assert!(total > 0, "uniform motion must produce inter leaves");
+        assert!(
+            counts[0] + counts[1] > 0,
+            "at least one NEARESTMV / NEARMV leaf must be selected on \
+             uniformly translating content (got NEAREST={} NEAR={} \
+             GLOBAL={} NEW={})",
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3]
+        );
+        assert!(
+            counts[3] > 0,
+            "the first block of the shared-motion region still codes NEWMV \
+             (its stack is empty); got NEW={}",
+            counts[3]
+        );
+    }
+
+    /// r412 — the driver mirror must agree with the WRITE mirror leaf
+    /// for leaf: a full multi-superblock lossy GOP encode (which
+    /// re-runs §7.10.2 per leaf inside `write_partition_tree_syntax`
+    /// and hard-errors on any committed non-NEWMV MV that differs
+    /// from the write-side derivation) must succeed and self-decode
+    /// byte-exact through the spec driver.
+    #[test]
+    fn r412_gop_with_stack_modes_round_trips_through_spec_driver() {
+        let frames: Vec<Yuv420Frame> = (0..4)
+            .map(|k| moving_gradient(96, 80, 2 * k, 4 * k, 31))
+            .collect();
+        let enc = encode_gop_yuv420_with_q(&frames, 80).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), frames.len());
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
     }
 }

@@ -16103,6 +16103,33 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     pub tx_size: u8,
 }
 
+/// r412 — rect capture of the encoder-mirror mode-info grids, produced
+/// by [`PartitionWalker::snapshot_encoder_stamp_rect`] and consumed by
+/// [`PartitionWalker::restore_encoder_stamp_rect`]. Row-major over the
+/// clipped `rows × cols` rect; the multi-slot grids (`ref_frames` ×2,
+/// `interp_filters` ×2, `mvs` ×4, `delta_lfs` ×FRAME_LF_COUNT,
+/// palette grids ×3 planes) pack their per-cell slots contiguously.
+pub(crate) struct EncoderStampSnapshot {
+    mi_row: u32,
+    mi_col: u32,
+    rows: u32,
+    cols: u32,
+    mi_sizes: Vec<usize>,
+    skips: Vec<u8>,
+    segment_ids: Vec<i32>,
+    y_modes: Vec<u8>,
+    is_inters: Vec<u8>,
+    tx_sizes: Vec<u8>,
+    inter_tx_sizes: Vec<u8>,
+    motion_modes: Vec<u8>,
+    ref_frames: Vec<i8>,
+    interp_filters: Vec<u8>,
+    mvs: Vec<i16>,
+    delta_lfs: Vec<i32>,
+    palette_sizes: Vec<u8>,
+    palette_colors: Vec<u16>,
+}
+
 /// Per-tile frame-constant parameters threaded into the §5.11.2
 /// `decode_tile()` superblock loop ([`PartitionWalker::decode_tile_syntax`])
 /// and forwarded unchanged to every §5.11.4
@@ -20881,6 +20908,131 @@ impl PartitionWalker {
         // `delta_lf_present == 0` the accumulator stays at its all-zero
         // §5.9.18 default, so this is a no-op write of zeros.
         self.stamp_delta_lfs(s.mi_row, s.mi_col, s.sub_size);
+    }
+
+    /// r412 — rect snapshot of every mode-info grid
+    /// [`Self::stamp_encoder_block_syntax`] writes, over the (clipped)
+    /// `n4 × n4` mi footprint anchored at `(mi_row, mi_col)`.
+    ///
+    /// The encoder's rate-distortion search trial-stamps candidate
+    /// leaves into a driver-side mirror walker so the §7.10.2
+    /// `find_mv_stack` scan (and the §8.3.2 neighbour-ctx walks that
+    /// consult `RefFrames[]` / `InterpFilters[]` / `Mvs[]`) can be
+    /// evaluated at search time with exactly the state the write-pass
+    /// mirror will hold. Because every trial stamps only cells INSIDE
+    /// the node's own footprint, restoring that rect returns the
+    /// mirror to its pre-trial state — neighbour cells outside the
+    /// rect are never touched by a trial, so they need no capture
+    /// (the same region-locality argument the pixel-plane
+    /// `save_region` / `restore_region` pair rests on).
+    ///
+    /// NOT captured: `cdef_idx` (the §5.11.56 anchor stamp can land
+    /// OUTSIDE the rect at a 64×64-aligned origin, so a search driver
+    /// must stamp with `cdef: None`) and the txb level/DC context
+    /// arrays (not written by the stamp). Callers that trial-stamp
+    /// with `cdef: Some(..)` would corrupt out-of-rect state and are
+    /// a caller bug by this contract.
+    pub(crate) fn snapshot_encoder_stamp_rect(
+        &self,
+        mi_row: u32,
+        mi_col: u32,
+        n4: u32,
+    ) -> EncoderStampSnapshot {
+        let r1 = (mi_row + n4).min(self.mi_rows);
+        let c1 = (mi_col + n4).min(self.mi_cols);
+        let rows = r1.saturating_sub(mi_row);
+        let cols = c1.saturating_sub(mi_col);
+        let cells = (rows as usize) * (cols as usize);
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        let mut snap = EncoderStampSnapshot {
+            mi_row,
+            mi_col,
+            rows,
+            cols,
+            mi_sizes: Vec::with_capacity(cells),
+            skips: Vec::with_capacity(cells),
+            segment_ids: Vec::with_capacity(cells),
+            y_modes: Vec::with_capacity(cells),
+            is_inters: Vec::with_capacity(cells),
+            tx_sizes: Vec::with_capacity(cells),
+            inter_tx_sizes: Vec::with_capacity(cells),
+            motion_modes: Vec::with_capacity(cells),
+            ref_frames: Vec::with_capacity(cells * 2),
+            interp_filters: Vec::with_capacity(cells * 2),
+            mvs: Vec::with_capacity(cells * 4),
+            delta_lfs: Vec::with_capacity(cells * FRAME_LF_COUNT),
+            palette_sizes: Vec::with_capacity(cells * 3),
+            palette_colors: Vec::with_capacity(cells * 3 * PALETTE_COLORS),
+        };
+        for rr in mi_row..r1 {
+            for cc in mi_col..c1 {
+                let cell = (rr * self.mi_cols + cc) as usize;
+                snap.mi_sizes.push(self.mi_sizes[cell]);
+                snap.skips.push(self.skips[cell]);
+                snap.segment_ids.push(self.segment_ids[cell]);
+                snap.y_modes.push(self.y_modes[cell]);
+                snap.is_inters.push(self.is_inters[cell]);
+                snap.tx_sizes.push(self.tx_sizes[cell]);
+                snap.inter_tx_sizes.push(self.inter_tx_sizes[cell]);
+                snap.motion_modes.push(self.motion_modes[cell]);
+                snap.ref_frames
+                    .extend_from_slice(&self.ref_frames[cell * 2..cell * 2 + 2]);
+                snap.interp_filters
+                    .extend_from_slice(&self.interp_filters[cell * 2..cell * 2 + 2]);
+                snap.mvs
+                    .extend_from_slice(&self.mvs[cell * 4..cell * 4 + 4]);
+                snap.delta_lfs.extend_from_slice(
+                    &self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT],
+                );
+                for plane in 0..3usize {
+                    let pcell = plane * area + cell;
+                    snap.palette_sizes.push(self.palette_sizes[pcell]);
+                    snap.palette_colors.extend_from_slice(
+                        &self.palette_colors[pcell * PALETTE_COLORS..(pcell + 1) * PALETTE_COLORS],
+                    );
+                }
+            }
+        }
+        snap
+    }
+
+    /// r412 — restore a rect captured by
+    /// [`Self::snapshot_encoder_stamp_rect`]. Exact inverse: every
+    /// captured grid value is written back to its cell; nothing
+    /// outside the rect is touched.
+    pub(crate) fn restore_encoder_stamp_rect(&mut self, snap: &EncoderStampSnapshot) {
+        let area = (self.mi_rows as usize) * (self.mi_cols as usize);
+        let mut i = 0usize;
+        for dr in 0..snap.rows {
+            for dc in 0..snap.cols {
+                let cell = ((snap.mi_row + dr) * self.mi_cols + (snap.mi_col + dc)) as usize;
+                self.mi_sizes[cell] = snap.mi_sizes[i];
+                self.skips[cell] = snap.skips[i];
+                self.segment_ids[cell] = snap.segment_ids[i];
+                self.y_modes[cell] = snap.y_modes[i];
+                self.is_inters[cell] = snap.is_inters[i];
+                self.tx_sizes[cell] = snap.tx_sizes[i];
+                self.inter_tx_sizes[cell] = snap.inter_tx_sizes[i];
+                self.motion_modes[cell] = snap.motion_modes[i];
+                self.ref_frames[cell * 2..cell * 2 + 2]
+                    .copy_from_slice(&snap.ref_frames[i * 2..i * 2 + 2]);
+                self.interp_filters[cell * 2..cell * 2 + 2]
+                    .copy_from_slice(&snap.interp_filters[i * 2..i * 2 + 2]);
+                self.mvs[cell * 4..cell * 4 + 4].copy_from_slice(&snap.mvs[i * 4..i * 4 + 4]);
+                self.delta_lfs[cell * FRAME_LF_COUNT..(cell + 1) * FRAME_LF_COUNT]
+                    .copy_from_slice(&snap.delta_lfs[i * FRAME_LF_COUNT..(i + 1) * FRAME_LF_COUNT]);
+                for plane in 0..3usize {
+                    let pcell = plane * area + cell;
+                    self.palette_sizes[pcell] = snap.palette_sizes[i * 3 + plane];
+                    self.palette_colors[pcell * PALETTE_COLORS..(pcell + 1) * PALETTE_COLORS]
+                        .copy_from_slice(
+                            &snap.palette_colors[(i * 3 + plane) * PALETTE_COLORS
+                                ..(i * 3 + plane + 1) * PALETTE_COLORS],
+                        );
+                }
+                i += 1;
+            }
+        }
     }
 
     /// Helper to read `PaletteSizes[ plane ][ r ][ c ]` for the
@@ -61573,6 +61725,164 @@ mod tests {
         assert!(
             got.iter().any(|&s| s != 0),
             "frame-scope single-ref MC must write pixels"
+        );
+    }
+
+    /// r412 — [`PartitionWalker::snapshot_encoder_stamp_rect`] /
+    /// [`PartitionWalker::restore_encoder_stamp_rect`] must round-trip
+    /// every grid [`PartitionWalker::stamp_encoder_block_syntax`]
+    /// writes: after a trial stamp of a DIFFERENT leaf over the same
+    /// footprint, restoring the snapshot returns the mirror to a state
+    /// whose §7.10.2 `find_mv_stack` output (and raw grid reads) equal
+    /// the pre-trial ones exactly — the contract the r412 driver-side
+    /// MV-prediction mirror rests on.
+    #[test]
+    fn r412_encoder_stamp_rect_snapshot_restores_mv_mirror_state() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 8,
+            mi_col_start: 0,
+            mi_col_end: 8,
+        };
+        let mut walker = PartitionWalker::new(8, 8, geom).unwrap();
+        // A committed inter neighbour ABOVE the trial rect (row 0-1)
+        // so find_mv_stack has a real §7.10.2.2 row-scan candidate.
+        walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+            mi_row: 0,
+            mi_col: 2,
+            sub_size: BLOCK_8X8,
+            skip: 0,
+            segment_id: 0,
+            is_inter: 1,
+            y_mode: MODE_NEWMV,
+            ref_frame: [1, -1],
+            mv: [16, -8],
+            interp_filter: [EIGHTTAP, EIGHTTAP],
+            motion_mode: MOTION_MODE_SIMPLE,
+            palette_size_y: 0,
+            palette_colors_y: &[],
+            palette_size_uv: 0,
+            palette_colors_u: &[],
+            palette_colors_v: &[],
+            cdef: None,
+            tx_size: 0,
+        });
+        // Baseline stamp INSIDE the rect (the committed pre-trial leaf).
+        let base = EncoderBlockSyntaxStamp {
+            mi_row: 2,
+            mi_col: 2,
+            sub_size: BLOCK_8X8,
+            skip: 1,
+            segment_id: 0,
+            is_inter: 1,
+            y_mode: MODE_NEARESTMV,
+            ref_frame: [1, -1],
+            mv: [8, 24],
+            interp_filter: [EIGHTTAP, EIGHTTAP],
+            motion_mode: MOTION_MODE_SIMPLE,
+            palette_size_y: 0,
+            palette_colors_y: &[],
+            palette_size_uv: 0,
+            palette_colors_u: &[],
+            palette_colors_v: &[],
+            cdef: None,
+            tx_size: 0,
+        };
+        walker.stamp_encoder_block_syntax(&base);
+
+        let gm_params = {
+            let mut p = [[0i32; 6]; 8];
+            for row in p.iter_mut() {
+                row[2] = 1 << WARPEDMODEL_PREC_BITS;
+                row[5] = 1 << WARPEDMODEL_PREC_BITS;
+            }
+            p
+        };
+        let mfm = MotionFieldMvs::new_invalid(8, 8);
+        let stack_at = |w: &PartitionWalker| {
+            w.find_mv_stack(
+                4,
+                2,
+                BLOCK_8X8,
+                [1, -1],
+                false,
+                false,
+                [GM_TYPE_IDENTITY; 8],
+                gm_params,
+                [0; 8],
+                false,
+                false,
+                &mfm,
+            )
+            .unwrap()
+        };
+        let before = stack_at(&walker);
+        let grids_before = (
+            walker.mi_sizes().to_vec(),
+            walker.skips().to_vec(),
+            walker.is_inters().to_vec(),
+            walker.y_modes().to_vec(),
+            walker.ref_frames().to_vec(),
+            walker.mvs().to_vec(),
+            walker.interp_filters().to_vec(),
+            walker.motion_modes().to_vec(),
+            walker.palette_sizes().to_vec(),
+        );
+
+        // Snapshot the 4×4 rect at (2, 2), trial-stamp a different
+        // leaf shape over it (intra this time, plus a palette to
+        // exercise the plane-major grids), then restore.
+        let snap = walker.snapshot_encoder_stamp_rect(2, 2, 4);
+        walker.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+            mi_row: 2,
+            mi_col: 2,
+            sub_size: BLOCK_16X16,
+            skip: 0,
+            segment_id: 3,
+            is_inter: 0,
+            y_mode: 0,
+            ref_frame: [0, -1],
+            mv: [0, 0],
+            interp_filter: [EIGHTTAP, EIGHTTAP],
+            motion_mode: MOTION_MODE_SIMPLE,
+            palette_size_y: 2,
+            palette_colors_y: &[10, 20],
+            palette_size_uv: 2,
+            palette_colors_u: &[30, 40],
+            palette_colors_v: &[50, 60],
+            cdef: None,
+            tx_size: 4,
+        });
+        assert_ne!(
+            stack_at(&walker).ref_stack_mv,
+            before.ref_stack_mv,
+            "the trial stamp must actually perturb the §7.10.2 scan \
+             (otherwise this test proves nothing)"
+        );
+        walker.restore_encoder_stamp_rect(&snap);
+
+        let after = stack_at(&walker);
+        assert_eq!(after.num_mv_found, before.num_mv_found);
+        assert_eq!(after.ref_stack_mv, before.ref_stack_mv);
+        assert_eq!(after.weight_stack, before.weight_stack);
+        assert_eq!(after.new_mv_context, before.new_mv_context);
+        assert_eq!(after.ref_mv_context, before.ref_mv_context);
+        assert_eq!(after.zero_mv_context, before.zero_mv_context);
+        assert_eq!(after.drl_ctx_stack, before.drl_ctx_stack);
+        let grids_after = (
+            walker.mi_sizes().to_vec(),
+            walker.skips().to_vec(),
+            walker.is_inters().to_vec(),
+            walker.y_modes().to_vec(),
+            walker.ref_frames().to_vec(),
+            walker.mvs().to_vec(),
+            walker.interp_filters().to_vec(),
+            walker.motion_modes().to_vec(),
+            walker.palette_sizes().to_vec(),
+        );
+        assert_eq!(
+            grids_after, grids_before,
+            "restore must return every stamped grid to its pre-trial bytes"
         );
     }
 
