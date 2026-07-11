@@ -107,20 +107,24 @@
 
 use crate::cdf::{
     cfl_allowed_for_uv_mode, compute_tx_type, find_tx_size, get_plane_residual_size, get_tx_size,
-    inter_tx_type_set, intra_mode_ctx, intra_tx_type_set, palette_tokens_args, partition_ctx,
-    partition_subsize, segment_id_ctx, size_group, skip_ctx, tx_size_sqr_index,
-    EncoderBlockSyntaxStamp, MotionFieldMvs, PalettePlane, PartitionWalker, TileCdfContext,
-    TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED,
-    FRAME_LF_COUNT, GM_TYPE_IDENTITY, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
-    MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, NUM_4X4_BLOCKS_HIGH,
-    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, SPLIT_TX_SIZE, TX_4X4,
-    TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH,
-    UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
+    inter_tx_type_set, intra_mode_ctx, intra_tx_type_set, is_inter_ctx, palette_tokens_args,
+    partition_ctx, partition_subsize, segment_id_ctx, size_group, skip_ctx, tx_size_sqr_index,
+    EncoderBlockSyntaxStamp, FrameInterOrderHints, InterpolationFilterReadout, MotionFieldMvs,
+    PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
+    BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, EIGHTTAP, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
+    H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MI_HEIGHT_LOG2,
+    MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEARMV, MODE_NEWMV,
+    MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE,
+    PARTITION_SPLIT, SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT,
+    TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
+    WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
-    write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_intra_frame_else_arm,
-    write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
-    write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_y_mode, IntrabcArmInputs,
+    write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_inter_block_mode_info,
+    write_inter_frame_mode_info_prefix, write_intra_block_mode_info_with_palette,
+    write_intra_frame_else_arm, write_intra_frame_intrabc_arm, write_intra_frame_y_mode,
+    write_intra_segment_id, write_intra_uv_mode, write_palette_tokens_plane, write_skip,
+    write_y_mode, InterBlockModeInfoTail, InterFrameDeltaSiteInputs, IntrabcArmInputs,
 };
 use crate::encoder::coefficients::write_coefficients;
 use crate::encoder::partition::write_partition;
@@ -725,6 +729,133 @@ pub struct SyntaxBlock {
     /// no symbol and stamps nothing there). MUST be empty when the
     /// arm does not fire. Added r285.
     pub var_tx_trees: Vec<VarTxSyntaxTree>,
+    /// §5.11.23 inter-leaf commitments (r411). `Some` selects the
+    /// §5.11.18 `is_inter == 1` arm on an inter-frame walk
+    /// ([`SyntaxFrameParams::inter`]` == Some`); `None` there selects
+    /// the §5.11.22 `intra_block_mode_info()` arm (the intra fields
+    /// above are then consumed exactly like the §5.11.7 else arm,
+    /// with the `y_mode` S() against `TileYModeCdf[ Size_Group ]`).
+    /// MUST be `None` on an intra-frame walk.
+    pub inter: Option<SyntaxInterBlock>,
+}
+
+/// §5.11.23 / §5.11.31 commitments for one inter leaf of the write
+/// tree (r411) — the scalars the §5.11.18 `is_inter == 1` arm of
+/// [`write_block_syntax`] replays bit-for-bit.
+///
+/// ## r411 scope
+///
+/// Single-reference prediction only (`ref_frame[1] == NONE = -1`):
+/// the four §5.11.24 single-pred modes. Non-NEWMV modes carry no MV
+/// bits — the reader derives `Mv[0] = PredMv[0]` from the §7.10.2
+/// stack, and the writer cross-checks [`Self::mv`] against the same
+/// derivation (`GlobalMvs[0]` for `GLOBALMV`, `RefStackMv[RefMvIdx][0]`
+/// for `NEARESTMV` / `NEARMV`); a mismatch is a caller bug — the
+/// encoder would have reconstructed with a vector the decoder never
+/// sees.
+#[derive(Debug, Clone)]
+pub struct SyntaxInterBlock {
+    /// §5.11.25 target `RefFrame[0..2]` — slot 0 in
+    /// `LAST_FRAME..=ALTREF_FRAME = 1..=7`, slot 1 fixed at
+    /// `NONE = -1` (r411 single-reference scope).
+    pub ref_frame: [i8; 2],
+    /// §5.11.23 `YMode` — [`MODE_NEARESTMV`] / [`MODE_NEARMV`] /
+    /// [`MODE_GLOBALMV`] / [`MODE_NEWMV`].
+    pub y_mode: u8,
+    /// §5.11.31 `Mv[ list ][ 0..2 ]` (`[ row, col ]`, 1/8-luma-sample
+    /// units, `Abs < 1 << 14` per §6.10.27). Only list 0 is consulted
+    /// on the single-reference scope.
+    pub mv: [[i32; 2]; 2],
+    /// §5.11.23 `RefMvIdx` — threaded to `write_drl_mode` +
+    /// `assign_mv_pred_mv`.
+    pub ref_mv_idx: u32,
+}
+
+/// Frame-scope inter state for a §5.11.18 write walk (r411) — the
+/// write-side bundle of [`crate::cdf::InterFrameContext`]'s
+/// syntax-relevant scalars (field names and contracts match). `Some`
+/// on [`SyntaxFrameParams::inter`] switches [`write_block_syntax`]
+/// from the §5.11.7 `intra_frame_mode_info()` arm to the §5.11.18
+/// `inter_frame_mode_info()` arm.
+#[derive(Debug, Clone)]
+pub struct SyntaxInterFrameParams {
+    /// §5.9.22 `skip_mode_present`. r411 scope: MUST be `false`
+    /// (the §5.11.10 skip-mode ctx threading is a follow-up arc).
+    pub skip_mode_present: bool,
+    /// §5.9.22 `SkipModeFrame[ 0..2 ]`.
+    pub skip_mode_frame: [i8; 2],
+    /// §5.9.23 `reference_select`.
+    pub reference_select: bool,
+    /// §5.9.24 `GmType[ 0..8 ]`.
+    pub gm_type: [i32; 8],
+    /// §5.9.24 `gm_params[ 0..8 ][ 0..6 ]`.
+    pub gm_params: [[i32; 6]; 8],
+    /// §7.8 `RefFrameSignBias[ 0..8 ]`.
+    pub ref_frame_sign_bias: [i32; 8],
+    /// §5.9.2 `allow_high_precision_mv`.
+    pub allow_high_precision_mv: bool,
+    /// §5.9.2 `force_integer_mv` (post-override value).
+    pub force_integer_mv: bool,
+    /// §5.9.2 `use_ref_frame_mvs`.
+    pub use_ref_frame_mvs: bool,
+    /// §5.9.2 `is_motion_mode_switchable`.
+    pub is_motion_mode_switchable: bool,
+    /// §5.9.2 `allow_warped_motion`.
+    pub allow_warped_motion: bool,
+    /// §5.11.27 `is_scaled( LAST_FRAME + i )` per reference.
+    pub is_scaled_per_ref: [bool; 7],
+    /// §5.5.2 `enable_interintra_compound`.
+    pub enable_interintra_compound: bool,
+    /// §5.5.2 `enable_masked_compound`.
+    pub enable_masked_compound: bool,
+    /// §5.5.2 `enable_jnt_comp`.
+    pub enable_jnt_comp: bool,
+    /// §5.9.2 `OrderHint` / `OrderHints[]` bundle.
+    pub order_hints: FrameInterOrderHints,
+    /// §5.9.10 frame-header `interpolation_filter` in
+    /// `EIGHTTAP..=SWITCHABLE = 0..=4`. r411 scope: non-SWITCHABLE
+    /// only (the §5.11.x filter loop stays bit-silent).
+    pub interpolation_filter: u8,
+    /// §5.5.2 `enable_dual_filter`.
+    pub enable_dual_filter: bool,
+    /// §7.9 motion-field grid for the §7.10.2.5 temporal scan —
+    /// all-invalid when `use_ref_frame_mvs == false`.
+    pub motion_field_mvs: MotionFieldMvs,
+}
+
+impl SyntaxInterFrameParams {
+    /// r411 P-frame baseline: single reference, identity global
+    /// motion, every optional tool gated shut, `EIGHTTAP` frame
+    /// filter, no order hints, no temporal MVs.
+    #[must_use]
+    pub fn single_ref_baseline(mi_rows: u32, mi_cols: u32, force_integer_mv: bool) -> Self {
+        let mut gm_params = [[0i32; 6]; 8];
+        for row in gm_params.iter_mut() {
+            row[2] = 1 << WARPEDMODEL_PREC_BITS;
+            row[5] = 1 << WARPEDMODEL_PREC_BITS;
+        }
+        SyntaxInterFrameParams {
+            skip_mode_present: false,
+            skip_mode_frame: [0, 0],
+            reference_select: false,
+            gm_type: [GM_TYPE_IDENTITY; 8],
+            gm_params,
+            ref_frame_sign_bias: [0; 8],
+            allow_high_precision_mv: false,
+            force_integer_mv,
+            use_ref_frame_mvs: false,
+            is_motion_mode_switchable: false,
+            allow_warped_motion: false,
+            is_scaled_per_ref: [false; 7],
+            enable_interintra_compound: false,
+            enable_masked_compound: false,
+            enable_jnt_comp: false,
+            order_hints: FrameInterOrderHints::IDENTITY,
+            interpolation_filter: EIGHTTAP,
+            enable_dual_filter: false,
+            motion_field_mvs: MotionFieldMvs::new_invalid(mi_rows, mi_cols),
+        }
+    }
 }
 
 /// One node of a §5.11.17 `read_var_tx_size` split-decision tree on
@@ -777,6 +908,7 @@ impl SyntaxBlock {
             tx_size: None,
             residual_tx_type: Vec::new(),
             var_tx_trees: Vec::new(),
+            inter: None,
         }
     }
 }
@@ -878,6 +1010,11 @@ pub struct SyntaxFrameParams {
     /// `inter_tx_type` symbol alphabet) agrees with the decode walker.
     /// Added r286.
     pub reduced_tx_set: bool,
+    /// §5.9.4 `FrameIsIntra == 0` selector (r411): `Some` switches the
+    /// §5.11.6 `mode_info()` dispatch to the §5.11.18
+    /// `inter_frame_mode_info()` arm and carries the frame-scope inter
+    /// state; `None` keeps the §5.11.7 intra-frame arm.
+    pub inter: Option<SyntaxInterFrameParams>,
 }
 
 impl SyntaxFrameParams {
@@ -912,6 +1049,7 @@ impl SyntaxFrameParams {
             tx_mode_select: false,
             quant: crate::cdf::QuantizerParams::neutral(0, 8),
             reduced_tx_set: false,
+            inter: None,
         }
     }
 }
@@ -1228,6 +1366,18 @@ pub fn write_block_syntax(
         return Err(Error::PartitionWalkOutOfRange);
     }
     if (block.segment_id as usize) >= MAX_SEGMENTS {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.6 `mode_info()` dispatch (r411): an inter-frame walk
+    // (`FrameIsIntra == 0`) routes through the §5.11.18 arm.
+    if params.inter.is_some() {
+        return write_block_syntax_inter_frame(
+            writer, cdfs, state, block, mi_row, mi_col, sub_size, params,
+        );
+    }
+    // Inter commitments on an intra-frame walk are a caller bug.
+    if block.inter.is_some() {
         return Err(Error::PartitionWalkOutOfRange);
     }
 
@@ -1690,6 +1840,548 @@ pub fn write_block_syntax(
         // decode walker performs the same reset, so the mirror must
         // track it for the §8.3.2 `all_zero` / `dc_sign` ctx walks of
         // subsequent leaves to stay in lockstep.
+        state.mirror.reset_txb_block_context(
+            mi_row,
+            mi_col,
+            bw4,
+            bh4,
+            has_chroma,
+            params.subsampling_x,
+            params.subsampling_y,
+        );
+    }
+    Ok(())
+}
+
+/// §5.11.18 `inter_frame_mode_info()` full-syntax leaf emission (r411)
+/// — the write twin of the decode walker's
+/// [`crate::cdf::PartitionWalker::decode_block_syntax`] inter arm.
+/// Writes, in spec order:
+///
+/// 1. The §5.11.18 prologue via [`write_inter_frame_mode_info_prefix`]
+///    (`inter_segment_id(1)`, `read_skip_mode()`, `read_skip()`,
+///    `inter_segment_id(0)`, `read_cdef()`, `read_delta_qindex()`,
+///    `read_delta_lf()`, `read_is_inter()`) — every §8.3.2 ctx
+///    (`skip`, `is_inter`, the §5.11.9 cascade) derived from the
+///    driver's mirror grids.
+/// 2. On the `is_inter == 1` arm ([`SyntaxBlock::inter`]` == Some`):
+///    the §5.11.23 body via [`write_inter_block_mode_info`] — the
+///    §5.11.25 reference cascade, §7.10.2 `find_mv_stack` against the
+///    mirror, the §5.11.24 single-pred mode cascade, the `drl_mode`
+///    loop, the §5.11.31 `assign_mv` MV write on NEWMV, and the
+///    (bit-silent on the r411 frame configuration) §5.11.27-§5.11.x
+///    tail.
+/// 3. On the `is_inter == 0` arm: the §5.11.22
+///    `intra_block_mode_info()` composite via
+///    [`write_intra_block_mode_info_with_palette`] (the `y_mode` S()
+///    against `TileYModeCdf[ Size_Group[ MiSize ] ]`) plus §5.11.49
+///    `palette_tokens()`.
+/// 4. The §5.11.5 footer stamps, the §5.11.16 `read_block_tx_size()`
+///    write driver, and the §5.11.34 `residual()` dispatch (inter luma
+///    routes through the §5.11.36 `transform_tree` recursion) — or the
+///    `skip == 1` `TxTypes[] = DCT_DCT` pre-stamp + §5.11.42 reset.
+///
+/// ## r411 scope rejects (all [`Error::PartitionWalkOutOfRange`])
+///
+/// * `params.segmentation_enabled` — the §5.11.19 predicted-segment-id
+///   threading (§5.11.21 `get_segment_id` over `PrevSegmentIds`) is a
+///   follow-up arc.
+/// * `ip.skip_mode_present` — the §5.11.10 skip-mode ctx walk is a
+///   follow-up arc.
+/// * Compound references (`ref_frame[1] != NONE`) and the SWITCHABLE
+///   frame filter — follow-up arcs.
+/// * A non-NEWMV leaf whose committed MV differs from the §5.11.26
+///   `PredMv` derivation (see [`SyntaxInterBlock`]).
+#[allow(clippy::too_many_arguments)]
+fn write_block_syntax_inter_frame(
+    writer: &mut SymbolWriter,
+    cdfs: &mut TileCdfContext,
+    state: &mut PartitionSyntaxWriter,
+    block: &SyntaxBlock,
+    mi_row: u32,
+    mi_col: u32,
+    sub_size: usize,
+    params: &SyntaxFrameParams,
+) -> Result<(), Error> {
+    let ip = params
+        .inter
+        .as_ref()
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+    // §5.9.20: `allow_intrabc` is reachable only on intra frames.
+    if block.intrabc_mv.is_some() || params.allow_intrabc {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    // r411 scope rejects (see the doc comment).
+    if params.segmentation_enabled || ip.skip_mode_present {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+
+    // §5.11.5 prologue (mirrors the intra arm).
+    let bw4 = NUM_4X4_BLOCKS_WIDE[sub_size] as u32;
+    let bh4 = NUM_4X4_BLOCKS_HIGH[sub_size] as u32;
+    let chroma_y_edge_case = bh4 == 1 && params.subsampling_y != 0 && (mi_row & 1) == 0;
+    let chroma_x_edge_case = bw4 == 1 && params.subsampling_x != 0 && (mi_col & 1) == 0;
+    let has_chroma = if chroma_y_edge_case || chroma_x_edge_case {
+        false
+    } else {
+        params.num_planes > 1
+    };
+    let avail_u = state.geometry.is_inside(mi_row as i32 - 1, mi_col as i32);
+    let avail_l = state.geometry.is_inside(mi_row as i32, mi_col as i32 - 1);
+
+    // §5.11.19 neighbour cascade + §8.3.2 segment ctx (bit-silent with
+    // segmentation off — derived for surface completeness).
+    let (seg_pred, seg_ctx) = state.segment_pred_ctx(mi_row, mi_col);
+
+    // §8.3.2 `skip` ctx from the mirror's `Skips[]` neighbours.
+    let above_skip = if avail_u {
+        state.mirror.skips()[((mi_row - 1) * state.mi_cols + mi_col) as usize]
+    } else {
+        0
+    };
+    let left_skip = if avail_l {
+        state.mirror.skips()[(mi_row * state.mi_cols + mi_col - 1) as usize]
+    } else {
+        0
+    };
+    let skip_ctx_v = skip_ctx(above_skip, left_skip);
+
+    // §8.3.2 `is_inter` ctx from the mirror's `IsInters[]` neighbours
+    // (an unavailable neighbour reads as intra per §5.11.18).
+    let above_intra_opt: Option<bool> = if avail_u {
+        Some(state.mirror.is_inters()[((mi_row - 1) * state.mi_cols + mi_col) as usize] == 0)
+    } else {
+        None
+    };
+    let left_intra_opt: Option<bool> = if avail_l {
+        Some(state.mirror.is_inters()[(mi_row * state.mi_cols + mi_col - 1) as usize] == 0)
+    } else {
+        None
+    };
+    let is_inter_ctx_v = is_inter_ctx(above_intra_opt, left_intra_opt);
+
+    // §5.11.56 anchor state from the mirror's `cdef_idx[]` grid.
+    let cdef_size4 = NUM_4X4_BLOCKS_WIDE[BLOCK_64X64] as u32;
+    let cdef_mask: u32 = !(cdef_size4 - 1);
+    let anchor_cell = ((mi_row & cdef_mask) * state.mi_cols + (mi_col & cdef_mask)) as usize;
+    let anchor_prior = state.mirror.cdef_idx()[anchor_cell];
+    let anchor_already_stamped = anchor_prior != -1;
+    let cdef_value = if anchor_already_stamped {
+        anchor_prior
+    } else {
+        block.cdef_idx
+    };
+
+    // §5.11.18 lines 11-22 via the r253-r258 prefix composition.
+    let block_write_deltas = params.read_deltas && state.write_deltas_pending;
+    let delta_inputs = InterFrameDeltaSiteInputs {
+        cdef_idx: cdef_value,
+        cdef_idx_prior_stamp: anchor_prior,
+        cdef_bits: params.cdef_bits,
+        coded_lossless: params.coded_lossless,
+        enable_cdef: params.enable_cdef,
+        allow_intrabc: params.allow_intrabc,
+        anchor_already_stamped,
+        reduced_delta_q_index: block.reduced_delta_q_index,
+        reduced_delta_lf: block.reduced_delta_lf,
+        read_deltas: block_write_deltas,
+        use_128x128_superblock: params.use_128x128_superblock,
+        delta_q_res: params.delta_q_res,
+        delta_lf_present: params.delta_lf_present,
+        delta_lf_multi: params.delta_lf_multi,
+        mono_chrome: params.mono_chrome,
+        delta_lf_res: params.delta_lf_res,
+    };
+    let is_inter_flag = u8::from(block.inter.is_some());
+    let prefix = write_inter_frame_mode_info_prefix(
+        writer,
+        cdfs,
+        sub_size,
+        block.segment_id,
+        /* skip_mode = */ 0,
+        block.skip,
+        is_inter_flag,
+        seg_pred,
+        /* seg_id_predicted = */ 0,
+        /* skip_mode_ctx_val = */ 0,
+        skip_ctx_v,
+        /* seg_id_read_ctx = */ seg_ctx,
+        /* seg_pred_ctx = */ 0,
+        is_inter_ctx_v,
+        /* seg_skip_mode_off = */ false,
+        /* seg_skip_active = */ params.seg_skip_active,
+        /* seg_ref_frame_active = */ false,
+        /* seg_ref_frame_is_inter = */ false,
+        /* seg_globalmv_active = */ false,
+        params.segmentation_enabled,
+        /* segmentation_update_map = */ false,
+        /* segmentation_temporal_update = */ false,
+        params.seg_id_pre_skip,
+        /* predicted_segment_id = */ 0,
+        params.last_active_seg_id,
+        ip.skip_mode_present,
+        &params.lossless_array,
+        &delta_inputs,
+    )?;
+    // §5.11.18 line 21: `ReadDeltas = 0`.
+    state.write_deltas_pending = false;
+    let cdef_committed = prefix.cdef_idx;
+    let lossless = prefix.lossless;
+    let tx_pre = if lossless {
+        TX_4X4
+    } else {
+        MAX_TX_SIZE_RECT[sub_size]
+    };
+
+    if let Some(ib) = block.inter.as_ref() {
+        // ---- §5.11.18 `if ( is_inter ) inter_block_mode_info()`. ----
+        // r411 scope: single reference, non-SWITCHABLE frame filter.
+        if !(1..=7).contains(&ib.ref_frame[0]) || ib.ref_frame[1] != -1 {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if !matches!(
+            ib.y_mode,
+            MODE_NEARESTMV | MODE_NEARMV | MODE_GLOBALMV | MODE_NEWMV
+        ) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        // §6.10.27 conformance bound `Abs( Mv ) < (1 << 14)`.
+        if ib.mv[0][0].unsigned_abs() >= (1 << 14) || ib.mv[0][1].unsigned_abs() >= (1 << 14) {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        if ip.interpolation_filter >= SWITCHABLE {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+
+        // §5.11.18 lines 2-9 — neighbour ref-frame derivations from
+        // the mirror's `RefFrames[]` grid.
+        let rf = |r: u32, c: u32, slot: usize| -> i32 {
+            i32::from(state.mirror.ref_frames()[((r * state.mi_cols + c) as usize) * 2 + slot])
+        };
+        let left_ref_frame: [i32; 2] = if avail_l {
+            [rf(mi_row, mi_col - 1, 0), rf(mi_row, mi_col - 1, 1)]
+        } else {
+            [0, -1]
+        };
+        let above_ref_frame: [i32; 2] = if avail_u {
+            [rf(mi_row - 1, mi_col, 0), rf(mi_row - 1, mi_col, 1)]
+        } else {
+            [0, -1]
+        };
+        let left_intra = left_ref_frame[0] <= 0;
+        let above_intra = above_ref_frame[0] <= 0;
+        let left_single = left_ref_frame[1] <= 0;
+        let above_single = above_ref_frame[1] <= 0;
+
+        // §7.10.2 `find_mv_stack( 0 )` against the mirror grids —
+        // the identical scan the decode walker runs at this leaf.
+        let stack = state.mirror.find_mv_stack(
+            mi_row,
+            mi_col,
+            sub_size,
+            [i32::from(ib.ref_frame[0]), i32::from(ib.ref_frame[1])],
+            /* is_compound = */ false,
+            ip.use_ref_frame_mvs,
+            ip.gm_type,
+            ip.gm_params,
+            ip.ref_frame_sign_bias,
+            ip.allow_high_precision_mv,
+            ip.force_integer_mv,
+            &ip.motion_field_mvs,
+        )?;
+
+        // §5.11.26: non-NEWMV lists inherit `PredMv[0]` with no bits —
+        // the committed MV must equal the reader's derivation.
+        let derived: Option<[i32; 2]> = match ib.y_mode {
+            MODE_GLOBALMV => Some(stack.global_mvs[0]),
+            MODE_NEARESTMV | MODE_NEARMV => stack
+                .ref_stack_mv
+                .get(ib.ref_mv_idx as usize)
+                .map(|slot| slot[0]),
+            _ => None,
+        };
+        if let Some(d) = derived {
+            if d != ib.mv[0] {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+        }
+
+        // §5.11.23 tail — every optional tool gated shut on the r411
+        // frame configuration (the writers still validate the spec
+        // preconditions); the interpolation-filter loop reads the
+        // frame filter into both slots with no bits.
+        let mut tail = InterBlockModeInfoTail::bit_silent();
+        tail.interpolation_filter = ip.interpolation_filter;
+        tail.enable_dual_filter = ip.enable_dual_filter;
+        tail.gm_type = ip.gm_type;
+        tail.is_motion_mode_switchable = ip.is_motion_mode_switchable;
+        tail.allow_warped_motion = ip.allow_warped_motion;
+        tail.is_scaled_per_ref = ip.is_scaled_per_ref;
+        tail.enable_interintra_compound = ip.enable_interintra_compound;
+        tail.enable_masked_compound = ip.enable_masked_compound;
+        tail.enable_jnt_comp = ip.enable_jnt_comp;
+        tail.interp_filter = InterpolationFilterReadout {
+            interp_filter: [ip.interpolation_filter; 2],
+            read_from_bitstream: [false, false],
+        };
+        if avail_u {
+            let cell = (((mi_row - 1) * state.mi_cols + mi_col) as usize) * 2;
+            let f = state.mirror.interp_filters();
+            tail.above_interp_filters = [f[cell], f[cell + 1]];
+        }
+        if avail_l {
+            let cell = ((mi_row * state.mi_cols + mi_col - 1) as usize) * 2;
+            let f = state.mirror.interp_filters();
+            tail.left_interp_filters = [f[cell], f[cell + 1]];
+        }
+
+        write_inter_block_mode_info(
+            writer,
+            cdfs,
+            [i32::from(ib.ref_frame[0]), i32::from(ib.ref_frame[1])],
+            ib.y_mode,
+            ib.mv,
+            ib.ref_mv_idx,
+            &stack,
+            sub_size,
+            /* skip_mode = */ 0,
+            ip.skip_mode_frame,
+            /* seg_ref_frame_active = */ false,
+            /* seg_ref_frame_data = */ 0,
+            /* seg_skip_active = */ false,
+            /* seg_globalmv_active = */ false,
+            ip.reference_select,
+            avail_u,
+            avail_l,
+            above_single,
+            left_single,
+            above_intra,
+            left_intra,
+            above_ref_frame,
+            left_ref_frame,
+            ip.force_integer_mv,
+            ip.allow_high_precision_mv,
+            &tail,
+        )?;
+
+        // §5.11.5 footer stamps for the inter leaf.
+        state
+            .mirror
+            .stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+                mi_row,
+                mi_col,
+                sub_size,
+                skip: block.skip,
+                segment_id: block.segment_id,
+                is_inter: 1,
+                y_mode: ib.y_mode,
+                ref_frame: ib.ref_frame,
+                mv: ib.mv[0],
+                interp_filter: [ip.interpolation_filter; 2],
+                motion_mode: MOTION_MODE_SIMPLE,
+                palette_size_y: 0,
+                palette_colors_y: &[],
+                palette_size_uv: 0,
+                palette_colors_u: &[],
+                palette_colors_v: &[],
+                cdef: cdef_committed,
+                tx_size: tx_pre as u8,
+            });
+
+        // §5.11.16 + §5.11.34 (mirrors the intrabc arm: inter luma
+        // routes through the §5.11.36 `transform_tree` recursion).
+        let tx_size_committed = write_block_tx_size_syntax(
+            writer, cdfs, state, block, mi_row, mi_col, sub_size, lossless,
+            /* is_inter = */ true, params,
+        )?;
+        if block.skip == 0 {
+            write_residual(
+                writer,
+                cdfs,
+                state,
+                block,
+                mi_row,
+                mi_col,
+                sub_size,
+                params,
+                has_chroma,
+                lossless,
+                tx_size_committed,
+                /* is_inter = */ true,
+            )?;
+        } else {
+            state
+                .mirror
+                .stamp_tx_type(mi_col, mi_row, bw4, bh4, DCT_DCT as u8);
+            state.mirror.reset_txb_block_context(
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                has_chroma,
+                params.subsampling_x,
+                params.subsampling_y,
+            );
+        }
+        return Ok(());
+    }
+
+    // ---- §5.11.18 `else intra_block_mode_info()` — §5.11.22. ----
+    // §8.3.2 `has_palette_y` neighbour ctx from the mirror's
+    // `PaletteSizes[ 0 ]` grid (mirrors the decode walker's
+    // intra-in-inter tail).
+    let above_palette_y = avail_u
+        && mi_row > 0
+        && state.mirror.palette_sizes()[((mi_row - 1) * state.mi_cols + mi_col) as usize] > 0;
+    let left_palette_y = avail_l
+        && mi_col > 0
+        && state.mirror.palette_sizes()[(mi_row * state.mi_cols + mi_col - 1) as usize] > 0;
+    let cfl_allowed = cfl_allowed_for_uv_mode(
+        lossless,
+        sub_size,
+        params.subsampling_x != 0,
+        params.subsampling_y != 0,
+    );
+    let pal = &block.palette;
+    let has_palette_y = u8::from(pal.size_y > 0);
+    let has_palette_uv = u8::from(pal.size_uv > 0);
+    write_intra_block_mode_info_with_palette(
+        writer,
+        cdfs,
+        sub_size,
+        block.y_mode,
+        block.uv_mode,
+        block.angle_delta_y,
+        block.angle_delta_uv,
+        cfl_allowed,
+        has_chroma,
+        params.allow_screen_content_tools,
+        params.enable_filter_intra,
+        block.use_filter_intra,
+        block.filter_intra_mode,
+        above_palette_y,
+        left_palette_y,
+        params.bit_depth,
+        has_palette_y,
+        pal.size_y as usize,
+        &pal.colors_y,
+        has_palette_uv,
+        pal.size_uv as usize,
+        &pal.colors_u,
+        &pal.colors_v,
+        pal.delta_encode_v,
+        block.cfl_alpha_u,
+        block.cfl_alpha_v,
+        &state.mirror,
+        mi_row,
+        mi_col,
+    )?;
+
+    // §5.11.5 line `palette_tokens( )` — §5.11.49 per-plane writes.
+    if pal.size_y > 0 {
+        let args = palette_tokens_args(
+            sub_size,
+            mi_row as usize,
+            mi_col as usize,
+            state.mi_rows as usize,
+            state.mi_cols as usize,
+            PalettePlane::Y,
+            0,
+            0,
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        write_palette_tokens_plane(
+            writer,
+            cdfs,
+            PalettePlane::Y,
+            pal.size_y as usize,
+            args.block_w,
+            args.block_h,
+            args.onscreen_w,
+            args.onscreen_h,
+            &pal.color_map_y,
+            args.block_w,
+        )?;
+    }
+    if pal.size_uv > 0 {
+        let args = palette_tokens_args(
+            sub_size,
+            mi_row as usize,
+            mi_col as usize,
+            state.mi_rows as usize,
+            state.mi_cols as usize,
+            PalettePlane::Uv,
+            params.subsampling_x as usize,
+            params.subsampling_y as usize,
+        )
+        .ok_or(Error::PartitionWalkOutOfRange)?;
+        write_palette_tokens_plane(
+            writer,
+            cdfs,
+            PalettePlane::Uv,
+            pal.size_uv as usize,
+            args.block_w,
+            args.block_h,
+            args.onscreen_w,
+            args.onscreen_h,
+            &pal.color_map_uv,
+            args.block_w,
+        )?;
+    }
+
+    // §5.11.5 footer stamps — `RefFrames[ .. ] = [ INTRA_FRAME, NONE ]`
+    // / `Mvs[ .. ] = 0` collapse to the mirror's pre-fill (the decode
+    // walker relies on the same collapse); `IsInters[ .. ] = 0` rides
+    // the stamp.
+    state
+        .mirror
+        .stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+            mi_row,
+            mi_col,
+            sub_size,
+            skip: block.skip,
+            segment_id: block.segment_id,
+            is_inter: 0,
+            y_mode: block.y_mode,
+            ref_frame: [0, -1],
+            mv: [0, 0],
+            interp_filter: [0, 0],
+            motion_mode: MOTION_MODE_SIMPLE,
+            palette_size_y: pal.size_y,
+            palette_colors_y: &pal.colors_y,
+            palette_size_uv: pal.size_uv,
+            palette_colors_u: &pal.colors_u,
+            palette_colors_v: &pal.colors_v,
+            cdef: cdef_committed,
+            tx_size: tx_pre as u8,
+        });
+
+    // §5.11.16 — intra ⇒ the §5.11.15 else arm.
+    let tx_size_committed = write_block_tx_size_syntax(
+        writer, cdfs, state, block, mi_row, mi_col, sub_size, lossless,
+        /* is_inter = */ false, params,
+    )?;
+
+    // §5.11.34 `residual()` — intra dispatch.
+    if block.skip == 0 {
+        write_residual(
+            writer,
+            cdfs,
+            state,
+            block,
+            mi_row,
+            mi_col,
+            sub_size,
+            params,
+            has_chroma,
+            lossless,
+            tx_size_committed,
+            /* is_inter = */ false,
+        )?;
+    } else {
+        state
+            .mirror
+            .stamp_tx_type(mi_col, mi_row, bw4, bh4, DCT_DCT as u8);
         state.mirror.reset_txb_block_context(
             mi_row,
             mi_col,
@@ -4836,6 +5528,438 @@ mod tests {
             0,
             BLOCK_8X8,
             &params3,
+        )
+        .unwrap_err();
+        assert!(matches!(err3, Error::PartitionWalkOutOfRange));
+    }
+
+    // -----------------------------------------------------------------
+    // r411 — §5.11.18 inter-frame leaf round-trips. Same
+    // encode → sentinel → decode → CDF/grid-parity harness as the
+    // r282 intra tests, with `frame_is_intra = false` and a §5.11.18
+    // `InterFrameContext` mirroring the write-side
+    // `SyntaxInterFrameParams` field-for-field.
+    // -----------------------------------------------------------------
+
+    use crate::cdf::{InterFrameContext, MODE_GLOBALMV, MODE_NEARESTMV, MODE_NEWMV};
+    use crate::encoder::partition_tree::{SyntaxInterBlock, SyntaxInterFrameParams};
+
+    /// Decode-side twin of a [`SyntaxInterFrameParams`] bundle.
+    fn inter_ctx_for<'a>(ipp: &'a SyntaxInterFrameParams) -> InterFrameContext<'a> {
+        let mut c = InterFrameContext::identity_default(&ipp.motion_field_mvs);
+        c.skip_mode_present = ipp.skip_mode_present;
+        c.skip_mode_frame = [
+            i32::from(ipp.skip_mode_frame[0]),
+            i32::from(ipp.skip_mode_frame[1]),
+        ];
+        c.reference_select = ipp.reference_select;
+        c.gm_type = ipp.gm_type;
+        c.gm_params = ipp.gm_params;
+        c.ref_frame_sign_bias = ipp.ref_frame_sign_bias;
+        c.allow_high_precision_mv = ipp.allow_high_precision_mv;
+        c.force_integer_mv = ipp.force_integer_mv;
+        c.use_ref_frame_mvs = ipp.use_ref_frame_mvs;
+        c.is_motion_mode_switchable = ipp.is_motion_mode_switchable;
+        c.allow_warped_motion = ipp.allow_warped_motion;
+        c.is_scaled_per_ref = ipp.is_scaled_per_ref;
+        c.enable_interintra_compound = ipp.enable_interintra_compound;
+        c.enable_masked_compound = ipp.enable_masked_compound;
+        c.enable_jnt_comp = ipp.enable_jnt_comp;
+        c.order_hints = ipp.order_hints;
+        c.interpolation_filter = ipp.interpolation_filter;
+        c.enable_dual_filter = ipp.enable_dual_filter;
+        c
+    }
+
+    /// Inter-frame twin of [`syntax_round_trip`].
+    fn syntax_round_trip_inter(
+        node: &SyntaxNode,
+        mi_rows: u32,
+        mi_cols: u32,
+        b_size: usize,
+        params: &SyntaxFrameParams,
+        sentinel: u8,
+    ) -> (PartitionSyntaxWriter, PartitionWalker) {
+        let ipp = params.inter.as_ref().expect("inter params required");
+        // ----- encode -----
+        let mut writer = SymbolWriter::new(false);
+        let mut enc_cdfs = TileCdfContext::new_from_defaults();
+        let mut enc_state =
+            PartitionSyntaxWriter::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols))
+                .expect("syntax writer construction");
+        write_partition_tree_syntax(
+            &mut writer,
+            &mut enc_cdfs,
+            &mut enc_state,
+            node,
+            0,
+            0,
+            b_size,
+            params,
+        )
+        .expect("write_partition_tree_syntax (inter)");
+        writer.write_literal(8, u32::from(sentinel)).unwrap();
+        let bytes = writer.finish();
+
+        // ----- decode (the §5.11.4 / §5.11.5 / §5.11.18 walker) -----
+        let ictx = inter_ctx_for(ipp);
+        let mut walker =
+            PartitionWalker::new(mi_rows, mi_cols, single_tile(mi_rows, mi_cols)).unwrap();
+        let mut dec_cdfs = TileCdfContext::new_from_defaults();
+        let mut dec = SymbolDecoder::init_symbol(&bytes, bytes.len(), false).unwrap();
+        walker
+            .decode_partition_syntax(
+                &mut dec,
+                &mut dec_cdfs,
+                0,
+                0,
+                b_size,
+                /* frame_is_intra = */ false,
+                params.subsampling_x,
+                params.subsampling_y,
+                params.num_planes,
+                params.seg_id_pre_skip,
+                params.segmentation_enabled,
+                params.seg_skip_active,
+                params.last_active_seg_id,
+                &params.lossless_array,
+                params.coded_lossless,
+                params.enable_cdef,
+                params.allow_intrabc,
+                params.cdef_bits,
+                params.read_deltas,
+                params.use_128x128_superblock,
+                params.delta_q_res,
+                params.delta_lf_present,
+                params.delta_lf_multi,
+                params.mono_chrome,
+                params.delta_lf_res,
+                params.allow_screen_content_tools,
+                params.enable_filter_intra,
+                params.bit_depth,
+                params.tx_mode_select,
+                Some(&ictx),
+                &params.quant,
+                params.reduced_tx_set,
+            )
+            .expect("decode_partition_syntax must consume the full inter tree");
+
+        assert_eq!(
+            dec.read_literal(8).unwrap(),
+            u32::from(sentinel),
+            "decoder must be positioned at the sentinel after the inter tree"
+        );
+        assert_eq!(
+            enc_cdfs, dec_cdfs,
+            "encoder and decoder CDF contexts must adapt identically"
+        );
+        let m = enc_state.mirror();
+        assert_eq!(m.mi_sizes(), walker.mi_sizes(), "MiSizes parity");
+        assert_eq!(m.skips(), walker.skips(), "Skips parity");
+        assert_eq!(m.segment_ids(), walker.segment_ids(), "SegmentIds parity");
+        assert_eq!(m.y_modes(), walker.y_modes(), "YModes parity");
+        assert_eq!(m.is_inters(), walker.is_inters(), "IsInters parity");
+        assert_eq!(m.ref_frames(), walker.ref_frames(), "RefFrames parity");
+        assert_eq!(m.mvs(), walker.mvs(), "Mvs parity");
+        assert_eq!(
+            m.interp_filters(),
+            walker.interp_filters(),
+            "InterpFilters parity"
+        );
+        assert_eq!(
+            m.motion_modes(),
+            walker.motion_modes(),
+            "MotionModes parity"
+        );
+        assert_eq!(m.cdef_idx(), walker.cdef_idx(), "cdef_idx parity");
+        assert_eq!(m.tx_sizes(), walker.tx_sizes(), "TxSizes parity");
+        assert_eq!(
+            m.inter_tx_sizes(),
+            walker.inter_tx_sizes(),
+            "InterTxSizes parity"
+        );
+        assert_eq!(m.tx_types(), walker.tx_types(), "TxTypes parity");
+        assert_eq!(
+            m.above_level_context(),
+            walker.above_level_context(),
+            "AboveLevelContext parity"
+        );
+        assert_eq!(
+            m.above_dc_context(),
+            walker.above_dc_context(),
+            "AboveDcContext parity"
+        );
+        assert_eq!(
+            m.left_level_context(),
+            walker.left_level_context(),
+            "LeftLevelContext parity"
+        );
+        assert_eq!(
+            m.left_dc_context(),
+            walker.left_dc_context(),
+            "LeftDcContext parity"
+        );
+        (enc_state, walker)
+    }
+
+    /// Baseline inter-frame parameter bundle: 4:2:0 8-bit, single
+    /// reference, everything optional gated shut.
+    fn inter_params_420(mi_rows: u32, mi_cols: u32, lossless: bool) -> SyntaxFrameParams {
+        let mut params = SyntaxFrameParams::intra_8bit_baseline();
+        params.subsampling_x = 1;
+        params.subsampling_y = 1;
+        params.enable_cdef = false;
+        params.coded_lossless = lossless;
+        params.lossless_array = [lossless; MAX_SEGMENTS];
+        if !lossless {
+            params.quant = crate::cdf::QuantizerParams::neutral(100, 8);
+        }
+        params.inter = Some(SyntaxInterFrameParams::single_ref_baseline(
+            mi_rows, mi_cols, /* force_integer_mv = */ false,
+        ));
+        params
+    }
+
+    /// Inter skip leaf helper: LAST_FRAME single-ref with the given
+    /// mode / MV.
+    fn inter_skip_leaf(y_mode: u8, mv: [i32; 2]) -> SyntaxBlock {
+        let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+        b.inter = Some(SyntaxInterBlock {
+            ref_frame: [1, -1],
+            y_mode,
+            mv: [mv, [0, 0]],
+            ref_mv_idx: 0,
+        });
+        b
+    }
+
+    /// Four-leaf SPLIT mixing NEWMV / GLOBALMV / a §5.11.22 intra
+    /// block / a NEWMV residual leaf on the lossless arm. The 2nd-4th
+    /// leaves' §8.3.2 `is_inter` / ref-frame ctx walks and §7.10.2
+    /// stacks read the previously stamped mirror grids, so the
+    /// sentinel landing proves the full §5.11.18 mirror threading.
+    #[test]
+    fn r411_inter_syntax_round_trip_newmv_globalmv_intra_mix() {
+        let params = inter_params_420(16, 16, /* lossless = */ true);
+
+        // NW: NEWMV, quarter-pel MV, skip = 1.
+        let nw = inter_skip_leaf(MODE_NEWMV, [10, -14]);
+        // NE: GLOBALMV — identity global motion ⇒ Mv = [0, 0], no MV
+        // bits (the §5.11.26 PredMv cross-check must accept it).
+        let ne = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        // SW: §5.11.22 intra block inside the inter frame (V_PRED with
+        // an angle delta so the §5.11.42 arm fires on the y_mode CDF).
+        let mut sw = SyntaxBlock::skip_leaf(V_PRED as u8, Some(DC_PRED as u8));
+        sw.angle_delta_y = 1;
+        // SE: NEWMV with a coded (all-zero) residual — skip = 0 walks
+        // the §5.11.34 lossless TX_4X4 fan-out on the inter arm:
+        // 8×8 luma TUs + 4×4 chroma TUs per plane.
+        let mut se = inter_skip_leaf(MODE_NEWMV, [-8, 24]);
+        se.skip = 0;
+        se.residual_quant = vec![vec![0i32; 16]; 64 + 16 + 16];
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0xA7);
+
+        // Spot-check the decoded grids: NW footprint carries the NEWMV
+        // vector, NE the zero GLOBALMV, SW is intra.
+        let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+        assert_eq!(walker.is_inters()[cell(0, 0)], 1);
+        assert_eq!(
+            [
+                walker.mvs()[cell(0, 0) * 4],
+                walker.mvs()[cell(0, 0) * 4 + 1]
+            ],
+            [10i16, -14]
+        );
+        assert_eq!(walker.is_inters()[cell(0, 8)], 1);
+        assert_eq!(
+            [
+                walker.mvs()[cell(0, 8) * 4],
+                walker.mvs()[cell(0, 8) * 4 + 1]
+            ],
+            [0i16, 0]
+        );
+        assert_eq!(walker.is_inters()[cell(8, 0)], 0);
+        assert_eq!(walker.y_modes()[cell(8, 0)], V_PRED as u8);
+        assert_eq!(walker.ref_frames()[cell(8, 8) * 2], 1);
+        assert_eq!(walker.ref_frames()[cell(8, 8) * 2 + 1], -1);
+    }
+
+    /// NEARESTMV threading: the second leaf's no-bit MV must equal the
+    /// §7.10.2 stack head the decoder derives from the first leaf's
+    /// stamped grids. The expected vector is pre-computed on a scratch
+    /// walker stamped exactly like the write mirror.
+    #[test]
+    fn r411_inter_syntax_round_trip_nearestmv_from_neighbour_stack() {
+        let params = inter_params_420(16, 16, /* lossless = */ true);
+        let ipp = params.inter.as_ref().unwrap();
+
+        let nw = inter_skip_leaf(MODE_NEWMV, [16, 8]);
+
+        // Pre-compute NE's §7.10.2 stack against a scratch walker
+        // carrying NW's footer stamp.
+        let mut scratch = PartitionWalker::new(16, 16, single_tile(16, 16)).unwrap();
+        scratch.stamp_encoder_block_syntax(&EncoderBlockSyntaxStamp {
+            mi_row: 0,
+            mi_col: 0,
+            sub_size: BLOCK_32X32,
+            skip: 1,
+            segment_id: 0,
+            is_inter: 1,
+            y_mode: MODE_NEWMV,
+            ref_frame: [1, -1],
+            mv: [16, 8],
+            interp_filter: [ipp.interpolation_filter; 2],
+            motion_mode: crate::cdf::MOTION_MODE_SIMPLE,
+            palette_size_y: 0,
+            palette_colors_y: &[],
+            palette_size_uv: 0,
+            palette_colors_u: &[],
+            palette_colors_v: &[],
+            cdef: None,
+            tx_size: TX_4X4 as u8,
+        });
+        let stack = scratch
+            .find_mv_stack(
+                0,
+                8,
+                BLOCK_32X32,
+                [1, -1],
+                false,
+                ipp.use_ref_frame_mvs,
+                ipp.gm_type,
+                ipp.gm_params,
+                ipp.ref_frame_sign_bias,
+                ipp.allow_high_precision_mv,
+                ipp.force_integer_mv,
+                &ipp.motion_field_mvs,
+            )
+            .unwrap();
+        assert!(stack.num_mv_found >= 1, "NW must seed NE's stack");
+        let near_mv = stack.ref_stack_mv[0][0];
+
+        let ne = inter_skip_leaf(MODE_NEARESTMV, near_mv);
+        let sw = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        let se = inter_skip_leaf(MODE_NEWMV, [0, 0]); // zero-diff NEWMV
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0x5C);
+        let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+        assert_eq!(
+            [
+                i32::from(walker.mvs()[cell(0, 8) * 4]),
+                i32::from(walker.mvs()[cell(0, 8) * 4 + 1])
+            ],
+            near_mv,
+            "decoded NEARESTMV must equal the committed stack head"
+        );
+    }
+
+    /// Lossy `TX_MODE_LARGEST` inter residual: one 32×32 NEWMV leaf
+    /// with non-zero DC in every TU (TX_32X32 luma via the §5.11.36
+    /// transform-tree write, TX_16X16 chroma), plus a second leaf
+    /// whose coefficient ctx walks read the first leaf's §6.10.2
+    /// stamps.
+    #[test]
+    fn r411_inter_syntax_round_trip_lossy_largest_tx_residual() {
+        let params = inter_params_420(16, 16, /* lossless = */ false);
+
+        let mut nw = inter_skip_leaf(MODE_NEWMV, [4, 6]);
+        nw.skip = 0;
+        let mut luma = vec![0i32; 32 * 32];
+        luma[0] = 5;
+        luma[1] = -2;
+        let mut chroma = vec![0i32; 16 * 16];
+        chroma[0] = 3;
+        nw.residual_quant = vec![luma, chroma.clone(), chroma];
+
+        let mut ne = inter_skip_leaf(MODE_NEWMV, [-4, 2]);
+        ne.skip = 0;
+        let mut luma2 = vec![0i32; 32 * 32];
+        luma2[0] = 1;
+        ne.residual_quant = vec![luma2, vec![0i32; 16 * 16], vec![0i32; 16 * 16]];
+
+        let sw = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        let se = inter_skip_leaf(MODE_NEWMV, [8, 8]);
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0x3E);
+    }
+
+    /// Caller-bug surface: inter commitments on an intra walk, a
+    /// compound reference pair, and a GLOBALMV MV that contradicts the
+    /// identity global-motion derivation all reject without emitting.
+    #[test]
+    fn r411_inter_syntax_scope_rejects() {
+        // (1) inter leaf on an intra-frame walk.
+        let params_intra = SyntaxFrameParams::intra_8bit_baseline();
+        let mut writer = SymbolWriter::new(false);
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        let mut state = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+        let block = inter_skip_leaf(MODE_NEWMV, [0, 0]);
+        let err = super::write_block_syntax(
+            &mut writer,
+            &mut cdfs,
+            &mut state,
+            &block,
+            0,
+            0,
+            BLOCK_32X32,
+            &params_intra,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::PartitionWalkOutOfRange));
+
+        // (2) compound pair on the r411 single-ref scope.
+        let params = inter_params_420(16, 16, true);
+        let mut b2 = inter_skip_leaf(MODE_NEWMV, [0, 0]);
+        b2.inter.as_mut().unwrap().ref_frame = [1, 7];
+        let mut writer2 = SymbolWriter::new(false);
+        let mut cdfs2 = TileCdfContext::new_from_defaults();
+        let mut state2 = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+        let err2 = super::write_block_syntax(
+            &mut writer2,
+            &mut cdfs2,
+            &mut state2,
+            &b2,
+            0,
+            0,
+            BLOCK_32X32,
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err2, Error::PartitionWalkOutOfRange));
+
+        // (3) GLOBALMV whose committed MV contradicts the identity
+        // global-motion derivation (the reader would reconstruct with
+        // [0, 0]).
+        let b3 = inter_skip_leaf(MODE_GLOBALMV, [8, 0]);
+        let mut writer3 = SymbolWriter::new(false);
+        let mut cdfs3 = TileCdfContext::new_from_defaults();
+        let mut state3 = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+        let err3 = super::write_block_syntax(
+            &mut writer3,
+            &mut cdfs3,
+            &mut state3,
+            &b3,
+            0,
+            0,
+            BLOCK_32X32,
+            &params,
         )
         .unwrap_err();
         assert!(matches!(err3, Error::PartitionWalkOutOfRange));

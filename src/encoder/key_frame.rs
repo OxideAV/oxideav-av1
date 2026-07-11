@@ -270,6 +270,7 @@ pub fn encode_key_frame_yuv420_with_q(
         tx_mode_select: !lossless,
         quant: qp,
         reduced_tx_set: fh.reduced_tx_set.unwrap_or(false),
+        inter: None,
     };
 
     // Running reconstruction — tracks the decoder's `CurrFrame`
@@ -1516,6 +1517,7 @@ fn encode_leaf_with_tx(
         },
         residual_tx_type: luma_tx_types,
         var_tx_trees: Vec::new(),
+        inter: None,
     }
 }
 

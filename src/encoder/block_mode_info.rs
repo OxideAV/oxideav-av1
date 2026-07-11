@@ -5654,11 +5654,18 @@ pub fn assign_mv_pred_mv(
     if comp_mode == MODE_NEWMV && mv_stack.num_mv_found <= 1 {
         pos = 0;
     }
-    // §5.11.26: `RefStackMv[ pos ]` must be a populated slot. The
-    // §7.10.2.12 extra-search guarantees `NumMvFound >= 2` for any
-    // reachable `RefMvIdx > 0`, but a caller that hands a `RefMvIdx`
-    // beyond the stack depth would read an undefined slot — reject it.
-    if pos >= mv_stack.num_mv_found || pos as usize >= MAX_REF_MV_STACK_SIZE {
+    // §5.11.26: `RefStackMv[ pos ]` must be a populated slot. Slots 0
+    // and 1 are ALWAYS populated: the §7.10.2.12 extra-search pads
+    // `RefStackMv[ idx ]` for `idx = NumMvFound..2` with the global MV
+    // ("for single prediction, NumMvFound is not incremented by the
+    // addition of global motion candidates" — so `NumMvFound` may
+    // remain 0 while both head slots carry readable values, and a
+    // first-block NEWMV / NEARMV legitimately predicts from them;
+    // r411 fix — the previous `pos >= NumMvFound` reject refused every
+    // empty-neighbourhood NEWMV leaf). A `pos >= 2` is reachable only
+    // through the §5.11.23 `drl_mode` loop, which requires
+    // `NumMvFound > pos` — beyond that the slot is undefined; reject.
+    if (pos >= 2 && pos >= mv_stack.num_mv_found) || pos as usize >= MAX_REF_MV_STACK_SIZE {
         return Err(Error::PartitionWalkOutOfRange);
     }
     Ok(mv_stack.ref_stack_mv[pos as usize][ref_list as usize])
@@ -17024,10 +17031,24 @@ mod tests {
             assign_mv_pred_mv(&s, MODE_NEARMV, 0, 2).unwrap_err(),
             Error::PartitionWalkOutOfRange
         ));
-        // NEARESTMV on an empty stack (pos = 0 >= 0) ⇒ reject.
+        // NEARESTMV / NEWMV on an empty stack read slot 0 — ALWAYS
+        // populated per the §7.10.2.12 extra-search pad ("for single
+        // prediction, NumMvFound is not incremented by the addition of
+        // global motion candidates"), so an empty-neighbourhood block
+        // legitimately predicts from it (r411 contract fix).
         let empty = mk_mv_stack(0);
+        assert_eq!(
+            assign_mv_pred_mv(&empty, MODE_NEARESTMV, 0, 0).unwrap(),
+            empty.ref_stack_mv[0][0]
+        );
+        assert_eq!(
+            assign_mv_pred_mv(&empty, MODE_NEWMV, 0, 0).unwrap(),
+            empty.ref_stack_mv[0][0]
+        );
+        // A `pos >= 2` beyond `NumMvFound` stays a reject on the empty
+        // stack (unreachable through the §5.11.23 drl loop).
         assert!(matches!(
-            assign_mv_pred_mv(&empty, MODE_NEARESTMV, 0, 0).unwrap_err(),
+            assign_mv_pred_mv(&empty, MODE_NEARMV, 0, 2).unwrap_err(),
             Error::PartitionWalkOutOfRange
         ));
     }
