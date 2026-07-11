@@ -401,12 +401,12 @@ const BD_STRIDE: usize = 18;
 /// encoder's directional-mode neighbour extension is bit-identical
 /// to the decoder's.
 #[derive(Clone)]
-struct BlockDecodedMirror {
+pub(crate) struct BlockDecodedMirror {
     bd: Vec<u8>,
 }
 
 impl BlockDecodedMirror {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             bd: vec![0u8; 3 * BD_STRIDE * BD_STRIDE],
         }
@@ -432,7 +432,7 @@ impl BlockDecodedMirror {
     /// §5.11.3 `clear_block_decoded_flags( r, c, sbSize4 = 16 )` for a
     /// single-tile frame (`MiRowEnd = MiRows`, `MiColEnd = MiCols`),
     /// 4:2:0, 3 planes.
-    fn clear_for_sb(&mut self, sb_r: u32, sb_c: u32, mi_rows: u32, mi_cols: u32) {
+    pub(crate) fn clear_for_sb(&mut self, sb_r: u32, sb_c: u32, mi_rows: u32, mi_cols: u32) {
         const SB_SIZE4: i32 = 16;
         for plane in 0..3usize {
             let (sub_x, sub_y): (i32, i32) = if plane > 0 { (1, 1) } else { (0, 0) };
@@ -503,7 +503,7 @@ fn tu_corner_avail(
 
 /// §5.11.35 per-TU `BlockDecoded[]` stamp over the TU footprint.
 #[inline]
-fn tu_bd_stamp(
+pub(crate) fn tu_bd_stamp(
     bd: &mut BlockDecodedMirror,
     plane: usize,
     start_x: usize,
@@ -522,19 +522,19 @@ fn tu_bd_stamp(
 }
 
 /// Encoder-side running reconstruction + quantiser bundle.
-struct ReconState {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    width: usize,
-    height: usize,
-    chroma_w: usize,
-    chroma_h: usize,
-    mi_rows: u32,
-    mi_cols: u32,
-    lossless: bool,
-    qp: QuantizerParams,
-    bd: BlockDecodedMirror,
+pub(crate) struct ReconState {
+    pub(crate) y: Vec<u8>,
+    pub(crate) u: Vec<u8>,
+    pub(crate) v: Vec<u8>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) chroma_w: usize,
+    pub(crate) chroma_h: usize,
+    pub(crate) mi_rows: u32,
+    pub(crate) mi_cols: u32,
+    pub(crate) lossless: bool,
+    pub(crate) qp: QuantizerParams,
+    pub(crate) bd: BlockDecodedMirror,
 }
 
 impl ReconState {
@@ -847,7 +847,7 @@ fn repack_compact(dense: Vec<i32>, w: usize, h: usize) -> Vec<i32> {
 /// (the §7.12.3 compact-`tw` stride for 64-wide transforms, dense
 /// row-major otherwise), zero-padded to `Tx_Width * Tx_Height`.
 #[allow(clippy::too_many_arguments)]
-fn residual_tx(
+pub(crate) fn residual_tx(
     input_plane: &[u8],
     recon_plane: &mut [u8],
     pw: usize,
@@ -1284,7 +1284,7 @@ fn encode_leaf_sq(
 
 /// One-shape leaf encode at a fixed luma TX size — see
 /// [`encode_leaf_sq`] for the §5.11.15 TX search wrapper.
-fn encode_leaf_with_tx(
+pub(crate) fn encode_leaf_with_tx(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
@@ -1529,7 +1529,7 @@ fn encode_leaf_with_tx(
 /// square + the collocated chroma squares) plus the §6.10.3
 /// `BlockDecoded[]` mirror — the working set a §5.11.4 partition
 /// trial saves/restores.
-struct RegionSnapshot {
+pub(crate) struct RegionSnapshot {
     n: usize,
     y: Vec<u8>,
     u: Vec<u8>,
@@ -1537,7 +1537,7 @@ struct RegionSnapshot {
     bd: BlockDecodedMirror,
 }
 
-fn save_region(recon: &ReconState, r: u32, c: u32, n4: usize) -> RegionSnapshot {
+pub(crate) fn save_region(recon: &ReconState, r: u32, c: u32, n4: usize) -> RegionSnapshot {
     let n = n4 * 4;
     let cn = n / 2;
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
@@ -1563,7 +1563,7 @@ fn save_region(recon: &ReconState, r: u32, c: u32, n4: usize) -> RegionSnapshot 
     }
 }
 
-fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &RegionSnapshot) {
+pub(crate) fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &RegionSnapshot) {
     let n = snap.n;
     let cn = n / 2;
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
@@ -1582,7 +1582,13 @@ fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &RegionSnapshot)
 
 /// Distortion (SSD, luma + both chroma cells) of the current
 /// reconstruction against the input over one square node's region.
-fn region_distortion(recon: &ReconState, input: &Yuv420Frame, r: u32, c: u32, n4: usize) -> u64 {
+pub(crate) fn region_distortion(
+    recon: &ReconState,
+    input: &Yuv420Frame,
+    r: u32,
+    c: u32,
+    n4: usize,
+) -> u64 {
     let n = n4 * 4;
     let cn = n / 2;
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
@@ -1607,7 +1613,7 @@ fn region_distortion(recon: &ReconState, input: &Yuv420Frame, r: u32, c: u32, n4
 }
 
 /// q-scaled Lagrange multiplier for the `D + λ·R` decisions.
-fn lambda_for(qp: &QuantizerParams) -> u64 {
+pub(crate) fn lambda_for(qp: &QuantizerParams) -> u64 {
     1 + (qp.base_q_idx as u64 * qp.base_q_idx as u64) / 32
 }
 
@@ -1616,7 +1622,7 @@ fn lambda_for(qp: &QuantizerParams) -> u64 {
 /// (`3 + bitlength(|q|)` roughly tracks the §5.11.39 base + BR +
 /// golomb growth). Deliberately simple — it only has to ORDER the
 /// §5.11.4 candidates consistently.
-fn leaf_rate(block: &SyntaxBlock) -> u64 {
+pub(crate) fn leaf_rate(block: &SyntaxBlock) -> u64 {
     let mut rate = 24u64;
     for tu in &block.residual_quant {
         for &q in tu {
@@ -1630,7 +1636,7 @@ fn leaf_rate(block: &SyntaxBlock) -> u64 {
 
 /// Recursive rate proxy over a candidate subtree (each split node adds
 /// a small partition-symbol weight).
-fn tree_rate(node: &SyntaxNode) -> u64 {
+pub(crate) fn tree_rate(node: &SyntaxNode) -> u64 {
     match node {
         SyntaxNode::Leaf(b) => leaf_rate(b),
         SyntaxNode::Split(children) => 4 + children.iter().map(|c| tree_rate(c)).sum::<u64>(),
