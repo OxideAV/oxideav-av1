@@ -294,6 +294,15 @@ pub fn parse_tile_group_obu_body(
             let tile_bits = tile_cols_log2 + tile_rows_log2;
             let tg_start = br.f(tile_bits)? as u32;
             let tg_end = br.f(tile_bits)? as u32;
+            // §6.10.1 conformance: `tg_end >= tg_start` and every tile
+            // index is `< NumTiles`. A stream violating either is
+            // non-conformant — reject instead of underflowing the
+            // `tg_end - tg_start` span below (2026-07-11 scheduled
+            // fuzz finding: a crafted `tg_start > tg_end` panicked
+            // with `attempt to subtract with overflow`).
+            if tg_start > tg_end || tg_end >= num_tiles {
+                return Err(Error::UnexpectedEnd);
+            }
             (tg_start, tg_end, true)
         } else {
             (0, num_tiles - 1, false)

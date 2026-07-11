@@ -61,3 +61,20 @@ fn film_grain_point_counts_are_bounded() {
     // is a finding.
     let _ = oxideav_av1::decode_av1(&bytes);
 }
+
+/// 2026-07-11 scheduled-Fuzz crash `c25ecb93…`: a multi-tile frame
+/// header combined with a §5.11.1 tile-group prologue whose
+/// `tile_start_and_end_present_flag == 1` carries `tg_start > tg_end`.
+/// The §5.11.1 walk derived the tile span as `tg_end - tg_start` and
+/// panicked with `attempt to subtract with overflow`. Fixed by the
+/// §6.10.1 conformance reject (`tg_start <= tg_end < NumTiles`) in
+/// `parse_tile_group_obu_body`.
+#[test]
+fn tile_group_start_beyond_end_is_rejected_not_panicking() {
+    let bytes = hex(
+        "444b494600002000000020444b4946cc8ccccccccccccccccccccc4b49460000\
+         20000000282000025031364b0e460900000100c52a3c00613600870000000000\
+         0000d6364c00000000006a00",
+    );
+    let _ = oxideav_av1::decode_av1(&bytes);
+}
