@@ -1557,7 +1557,8 @@ pub(crate) fn encode_leaf_with_tx(
 /// `BlockDecoded[]` mirror — the working set a §5.11.4 partition
 /// trial saves/restores.
 pub(crate) struct RegionSnapshot {
-    n: usize,
+    w: usize,
+    h: usize,
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
@@ -1565,24 +1566,40 @@ pub(crate) struct RegionSnapshot {
 }
 
 pub(crate) fn save_region(recon: &ReconState, r: u32, c: u32, n4: usize) -> RegionSnapshot {
-    let n = n4 * 4;
-    let cn = n / 2;
+    save_region_wh(recon, r, c, n4, n4)
+}
+
+/// r412 — rectangular twin of [`save_region`] (`w4 × h4` mi units;
+/// the square helper delegates here). Chroma rides the same
+/// `(r >> 1, c >> 1)` origin derivation, so rect callers keep their
+/// mi origins even on both axes (the P-frame HORZ/VERT halves are
+/// BLOCK_16X8 and larger, whose half offsets are even).
+pub(crate) fn save_region_wh(
+    recon: &ReconState,
+    r: u32,
+    c: u32,
+    w4: usize,
+    h4: usize,
+) -> RegionSnapshot {
+    let (w, h) = (w4 * 4, h4 * 4);
+    let (cw, ch) = (w / 2, h / 2);
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
     let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
-    let mut y = vec![0u8; n * n];
-    let mut u = vec![0u8; cn * cn];
-    let mut v = vec![0u8; cn * cn];
-    for i in 0..n {
-        y[i * n..(i + 1) * n].copy_from_slice(&recon.y[(row0 + i) * recon.width + col0..][..n]);
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; cw * ch];
+    let mut v = vec![0u8; cw * ch];
+    for i in 0..h {
+        y[i * w..(i + 1) * w].copy_from_slice(&recon.y[(row0 + i) * recon.width + col0..][..w]);
     }
-    for i in 0..cn {
-        u[i * cn..(i + 1) * cn]
-            .copy_from_slice(&recon.u[(crow0 + i) * recon.chroma_w + ccol0..][..cn]);
-        v[i * cn..(i + 1) * cn]
-            .copy_from_slice(&recon.v[(crow0 + i) * recon.chroma_w + ccol0..][..cn]);
+    for i in 0..ch {
+        u[i * cw..(i + 1) * cw]
+            .copy_from_slice(&recon.u[(crow0 + i) * recon.chroma_w + ccol0..][..cw]);
+        v[i * cw..(i + 1) * cw]
+            .copy_from_slice(&recon.v[(crow0 + i) * recon.chroma_w + ccol0..][..cw]);
     }
     RegionSnapshot {
-        n,
+        w,
+        h,
         y,
         u,
         v,
@@ -1591,18 +1608,18 @@ pub(crate) fn save_region(recon: &ReconState, r: u32, c: u32, n4: usize) -> Regi
 }
 
 pub(crate) fn restore_region(recon: &mut ReconState, r: u32, c: u32, snap: &RegionSnapshot) {
-    let n = snap.n;
-    let cn = n / 2;
+    let (w, h) = (snap.w, snap.h);
+    let (cw, ch) = (w / 2, h / 2);
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
     let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
-    for i in 0..n {
-        recon.y[(row0 + i) * recon.width + col0..][..n].copy_from_slice(&snap.y[i * n..][..n]);
+    for i in 0..h {
+        recon.y[(row0 + i) * recon.width + col0..][..w].copy_from_slice(&snap.y[i * w..][..w]);
     }
-    for i in 0..cn {
-        recon.u[(crow0 + i) * recon.chroma_w + ccol0..][..cn]
-            .copy_from_slice(&snap.u[i * cn..][..cn]);
-        recon.v[(crow0 + i) * recon.chroma_w + ccol0..][..cn]
-            .copy_from_slice(&snap.v[i * cn..][..cn]);
+    for i in 0..ch {
+        recon.u[(crow0 + i) * recon.chroma_w + ccol0..][..cw]
+            .copy_from_slice(&snap.u[i * cw..][..cw]);
+        recon.v[(crow0 + i) * recon.chroma_w + ccol0..][..cw]
+            .copy_from_slice(&snap.v[i * cw..][..cw]);
     }
     recon.bd = snap.bd.clone();
 }
@@ -1616,20 +1633,32 @@ pub(crate) fn region_distortion(
     c: u32,
     n4: usize,
 ) -> u64 {
-    let n = n4 * 4;
-    let cn = n / 2;
+    region_distortion_wh(recon, input, r, c, n4, n4)
+}
+
+/// r412 — rectangular twin of [`region_distortion`].
+pub(crate) fn region_distortion_wh(
+    recon: &ReconState,
+    input: &Yuv420Frame,
+    r: u32,
+    c: u32,
+    w4: usize,
+    h4: usize,
+) -> u64 {
+    let (w, h) = (w4 * 4, h4 * 4);
+    let (cw, ch) = (w / 2, h / 2);
     let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
     let (crow0, ccol0) = ((r as usize >> 1) * 4, (c as usize >> 1) * 4);
     let mut ssd = 0u64;
-    for i in 0..n {
-        for j in 0..n {
+    for i in 0..h {
+        for j in 0..w {
             let idx = (row0 + i) * recon.width + (col0 + j);
             let d = recon.y[idx] as i64 - input.y[idx] as i64;
             ssd += (d * d) as u64;
         }
     }
-    for i in 0..cn {
-        for j in 0..cn {
+    for i in 0..ch {
+        for j in 0..cw {
             let idx = (crow0 + i) * recon.chroma_w + (ccol0 + j);
             let du = recon.u[idx] as i64 - input.u[idx] as i64;
             let dv = recon.v[idx] as i64 - input.v[idx] as i64;
@@ -1667,6 +1696,11 @@ pub(crate) fn tree_rate(node: &SyntaxNode) -> u64 {
     match node {
         SyntaxNode::Leaf(b) => leaf_rate(b),
         SyntaxNode::Split(children) => 4 + children.iter().map(|c| tree_rate(c)).sum::<u64>(),
+        // r412: rectangular partitions are P-frame-search territory —
+        // the KEY driver never builds them.
+        SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+            4 + blocks.iter().map(|b| leaf_rate(b)).sum::<u64>()
+        }
     }
 }
 

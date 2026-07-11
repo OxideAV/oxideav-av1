@@ -56,16 +56,17 @@ use crate::cdf::{
     get_tx_size, inter_tx_type_set, tx_size_sqr_index, FindMvStackResult, PartitionWalker,
     QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT,
     EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV, MODE_NEARESTMV,
-    MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, SWITCHABLE,
-    TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
+    MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
+    PARTITION_HORZ, PARTITION_VERT, SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP,
+    TX_WIDTH,
 };
 use crate::encoder::block_mode_info::assign_mv_pred_mv;
 use crate::encoder::frame_obu::encode_uncompressed_header;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::{
     encode_key_frame_yuv420_with_q, encode_leaf_sq, lambda_for, leaf_rate, region_distortion,
-    residual_tx, restore_region, save_region, tu_bd_stamp, BlockDecodedMirror, ReconState,
-    RegionSnapshot, KEY_FRAME_MAX_DIM,
+    region_distortion_wh, residual_tx, restore_region, save_region, save_region_wh, tu_bd_stamp,
+    BlockDecodedMirror, ReconState, RegionSnapshot, KEY_FRAME_MAX_DIM,
 };
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::partition_tree::{
@@ -635,13 +636,14 @@ impl PSearchCtx {
         mv: [i32; 2],
         filter: u8,
     ) -> Result<(), Error> {
-        let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
-        for dr in 0..n4 {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[b_size] as u32;
+        for dr in 0..bh4 {
             let rr = mi_row + dr;
             if rr >= self.mi_rows {
                 break;
             }
-            for dc in 0..n4 {
+            for dc in 0..bw4 {
                 let cc = mi_col + dc;
                 if cc >= self.mi_cols {
                     break;
@@ -798,6 +800,8 @@ fn make_store(
 /// edge-clamped reference (exactly the §7.11.3.4 phase-0 sample
 /// fetch), with a small magnitude bias so near-zero vectors win ties.
 /// Returns the best vector in 1/8-luma units (a multiple of 8).
+/// `bw × bh` are the (possibly rectangular) luma block dimensions.
+#[allow(clippy::too_many_arguments)]
 fn motion_search_luma(
     input: &Yuv420Frame,
     ref_y: &[u16],
@@ -805,20 +809,22 @@ fn motion_search_luma(
     height: usize,
     row0: usize,
     col0: usize,
-    n: usize,
+    bw: usize,
+    bh: usize,
 ) -> [i32; 2] {
+    let n = bw.max(bh) as u64;
     let cost_at = |dy: i32, dx: i32| -> u64 {
         let mut ssd = 0u64;
-        for i in 0..n {
+        for i in 0..bh {
             let sy = ((row0 + i) as i32 + dy).clamp(0, height as i32 - 1) as usize;
-            for j in 0..n {
+            for j in 0..bw {
                 let sx = ((col0 + j) as i32 + dx).clamp(0, width as i32 - 1) as usize;
                 let d = i64::from(input.y[(row0 + i) * width + col0 + j])
                     - i64::from(ref_y[sy * width + sx]);
                 ssd += (d * d) as u64;
             }
         }
-        ssd + (dy.unsigned_abs() as u64 + dx.unsigned_abs() as u64) * (n as u64)
+        ssd + (dy.unsigned_abs() as u64 + dx.unsigned_abs() as u64) * n
     };
     let mut best = (cost_at(0, 0), [0i32, 0]);
     let mut dy = -SEARCH_RANGE;
@@ -863,21 +869,22 @@ fn refine_mv_subpel(
     b_size: usize,
     row0: usize,
     col0: usize,
-    n: usize,
+    bw: usize,
+    bh: usize,
     width: usize,
     mv_int: [i32; 2],
 ) -> Result<[i32; 2], Error> {
     let score = |ictx: &mut PSearchCtx, mv: [i32; 2]| -> Result<u64, Error> {
         ictx.predict_leaf(mi_r, mi_c, b_size, MODE_NEWMV, mv, EIGHTTAP)?;
         let mut ssd = 0u64;
-        for i in 0..n {
-            for j in 0..n {
+        for i in 0..bh {
+            for j in 0..bw {
                 let d = i64::from(input.y[(row0 + i) * width + col0 + j])
                     - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
                 ssd += (d * d) as u64;
             }
         }
-        Ok(ssd + ((mv[0].unsigned_abs() + mv[1].unsigned_abs()) as u64) * (n as u64) / 8)
+        Ok(ssd + ((mv[0].unsigned_abs() + mv[1].unsigned_abs()) as u64) * (bw.max(bh) as u64) / 8)
     };
     let mut best = (score(ictx, mv_int)?, mv_int);
     for step in [4i32, 2] {
@@ -898,9 +905,10 @@ fn refine_mv_subpel(
     Ok(best.1)
 }
 
-/// Encode one in-frame square INTER leaf at `b_size` (`BLOCK_8X8` …
-/// `BLOCK_64X64`): motion search, §7.11.3 prediction through the
-/// decoder's leaf driver, residual per TU (one
+/// Encode one in-frame INTER leaf at `b_size` (`BLOCK_8X8` …
+/// `BLOCK_64X64`, plus the r412 rectangular HORZ/VERT halves —
+/// `BLOCK_16X8` and larger): motion search, §7.11.3 prediction
+/// through the decoder's leaf driver, residual per TU (one
 /// `Max_Tx_Size_Rect` luma TU on the lossy arm / the `TX_4X4` grid on
 /// the lossless arm; chroma at the §5.11.38 size), `skip = 1` when
 /// every TU quantises to zero.
@@ -912,8 +920,9 @@ fn encode_inter_leaf(
     recon: &mut ReconState,
     ictx: &mut PSearchCtx,
 ) -> Result<SyntaxBlock, Error> {
-    let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
-    let n = n4 * 4;
+    let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
+    let (bw, bh) = (bw4 * 4, bh4 * 4);
     let row0 = (mi_r as usize) * 4;
     let col0 = (mi_c as usize) * 4;
     let width = recon.width;
@@ -931,7 +940,8 @@ fn encode_inter_leaf(
         recon.height,
         row0,
         col0,
-        n,
+        bw,
+        bh,
     );
     // r411 sub-pel refinement: half-pel then quarter-pel deltas around
     // the integer winner, each candidate evaluated through the REAL
@@ -939,7 +949,7 @@ fn encode_inter_leaf(
     // `allow_high_precision_mv = 0` restricts components to quarter-pel
     // (multiples of 2 in 1/8-luma units).
     let mv_new = refine_mv_subpel(
-        input, ictx, mi_r, mi_c, b_size, row0, col0, n, width, mv_int,
+        input, ictx, mi_r, mi_c, b_size, row0, col0, bw, bh, width, mv_int,
     )?;
 
     // r412 — §5.11.24 single-pred mode selection over the full
@@ -1031,8 +1041,8 @@ fn encode_inter_leaf(
     for (ci, cand) in cands.iter().enumerate() {
         ictx.predict_leaf(mi_r, mi_c, b_size, cand.y_mode, cand.mv, EIGHTTAP)?;
         let mut ssd = 0u64;
-        for i in 0..n {
-            for j in 0..n {
+        for i in 0..bh {
+            for j in 0..bw {
                 let d = i64::from(input.y[(row0 + i) * width + col0 + j])
                     - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
                 ssd += (d * d) as u64;
@@ -1068,8 +1078,8 @@ fn encode_inter_leaf(
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
             ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv, f)?;
             let mut ssd = 0u64;
-            for i in 0..n {
-                for j in 0..n {
+            for i in 0..bh {
+                for j in 0..bw {
                     let d = i64::from(input.y[(row0 + i) * width + col0 + j])
                         - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
                     ssd += (d * d) as u64;
@@ -1100,20 +1110,20 @@ fn encode_inter_leaf(
         t = SPLIT_TX_SIZE[t];
         max_depth += 1;
     }
-    let before = save_region(recon, mi_r, mi_c, n4);
+    let before = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
             mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, ref_mv_idx, filter, depth,
         )?;
-        let d = region_distortion(recon, input, mi_r, mi_c, n4);
+        let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
         let improves = match best.as_ref() {
             Some((_, _, s)) => score < *s,
             None => true,
         };
         if improves {
-            best = Some((leaf, save_region(recon, mi_r, mi_c, n4), score));
+            best = Some((leaf, save_region_wh(recon, mi_r, mi_c, bw4, bh4), score));
         }
         restore_region(recon, mi_r, mi_c, &before);
     }
@@ -1122,25 +1132,30 @@ fn encode_inter_leaf(
     Ok(leaf)
 }
 
-/// §5.11.36 luma TU visit order for a uniform `tw × tw` TU grid over
-/// an `n × n` block — the quadtree halving recursion (NW / NE / SW /
-/// SE at every level), NOT row-major beyond a 2×2 grid.
+/// §5.11.36 / §5.11.17 luma TU visit order for a uniform-depth
+/// `read_var_tx_size` recursion rooted at `tx` (r412: rect-aware —
+/// each split level visits `(h4 / stepH) * (w4 / stepW)` children of
+/// `Split_Tx_Size[ tx ]` in row-major `(i, j)` order, which is 4 for
+/// square ordinals and 2 for rectangular ones; the pre-r412 square
+/// quadtree order falls out as the square special case).
 fn transform_tree_tu_order(
     x: usize,
     y: usize,
-    w: usize,
-    h: usize,
-    tw: usize,
+    tx: usize,
+    depth: u32,
     out: &mut Vec<(usize, usize)>,
 ) {
-    if w <= tw && h <= tw {
+    if depth == 0 {
         out.push((x, y));
         return;
     }
-    transform_tree_tu_order(x, y, w / 2, h / 2, tw, out);
-    transform_tree_tu_order(x + w / 2, y, w / 2, h / 2, tw, out);
-    transform_tree_tu_order(x, y + h / 2, w / 2, h / 2, tw, out);
-    transform_tree_tu_order(x + w / 2, y + h / 2, w / 2, h / 2, tw, out);
+    let sub = SPLIT_TX_SIZE[tx];
+    let (sw, sh) = (TX_WIDTH[sub], TX_HEIGHT[sub]);
+    for i in 0..TX_HEIGHT[tx] / sh {
+        for j in 0..TX_WIDTH[tx] / sw {
+            transform_tree_tu_order(x + j * sw, y + i * sh, sub, depth - 1, out);
+        }
+    }
 }
 
 /// r411 — §5.11.47 per-TU LUMA transform-type RD search on the INTER
@@ -1244,18 +1259,21 @@ fn residual_tx_search_luma_inter(
     (quant, label)
 }
 
-/// §5.11.17 uniform split-decision tree of the given depth (square
-/// transform ordinals ⇒ four children per split).
-fn uniform_var_tx_tree(depth: u32) -> VarTxSyntaxTree {
+/// §5.11.17 uniform split-decision tree of the given depth rooted at
+/// `tx` (r412: rect-aware — the per-split child count is
+/// `(h4 / stepH) * (w4 / stepW)`, 4 for square ordinals and 2 for
+/// rectangular ones, matching [`VarTxSyntaxTree::Split`]'s contract).
+fn uniform_var_tx_tree(tx: usize, depth: u32) -> VarTxSyntaxTree {
     if depth == 0 {
         VarTxSyntaxTree::Leaf
     } else {
-        VarTxSyntaxTree::Split(vec![
-            uniform_var_tx_tree(depth - 1),
-            uniform_var_tx_tree(depth - 1),
-            uniform_var_tx_tree(depth - 1),
-            uniform_var_tx_tree(depth - 1),
-        ])
+        let sub = SPLIT_TX_SIZE[tx];
+        let count = (TX_HEIGHT[tx] / TX_HEIGHT[sub]) * (TX_WIDTH[tx] / TX_WIDTH[sub]);
+        VarTxSyntaxTree::Split(
+            (0..count)
+                .map(|_| uniform_var_tx_tree(sub, depth - 1))
+                .collect(),
+        )
     }
 }
 
@@ -1277,8 +1295,9 @@ fn encode_inter_leaf_residual(
     filter: u8,
     depth: u32,
 ) -> Result<SyntaxBlock, Error> {
-    let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
-    let n = n4 * 4;
+    let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
+    let (bw, bh) = (bw4 * 4, bh4 * 4);
     let row0 = (mi_r as usize) * 4;
     let col0 = (mi_c as usize) * 4;
     let width = recon.width;
@@ -1301,24 +1320,26 @@ fn encode_inter_leaf_residual(
         // §5.11.34 direct row-major iteration (the `!is_inter ||
         // Lossless` arm).
         let mut ty = 0usize;
-        while ty < n {
+        while ty < bh {
             let mut tx = 0usize;
-            while tx < n {
+            while tx < bw {
                 tu_order.push((tx, ty));
                 tx += ltw;
             }
             ty += lth;
         }
     } else {
-        // §5.11.36 transform-tree quadtree order.
-        transform_tree_tu_order(0, 0, n, n, ltw, &mut tu_order);
+        // §5.11.36 transform-tree recursion order (`Max_Tx_Size_Rect`
+        // covers the whole block, so exactly one tree — its
+        // uniform-depth leaves in the §5.11.17 row-major visit).
+        transform_tree_tu_order(0, 0, MAX_TX_SIZE_RECT[b_size], depth, &mut tu_order);
     }
     let mut residual_quant: Vec<Vec<i32>> = Vec::new();
     let mut luma_tx_types: Vec<u8> = Vec::new();
     // Block-relative luma-TU-grid map of committed §5.11.47 types —
     // the §5.11.40 chroma-inheritance source (`TxTypes[ y4 ][ x4 ]`).
-    let tu_cols = n / ltw;
-    let mut tu_type_grid = vec![DCT_DCT as u8; tu_cols * (n / lth)];
+    let tu_cols = bw / ltw;
+    let mut tu_type_grid = vec![DCT_DCT as u8; tu_cols * (bh / lth)];
     for &(tx, ty) in &tu_order {
         let (tr, tc) = (row0 + ty, col0 + tx);
         let mut pred = vec![0u8; ltw * lth];
@@ -1369,7 +1390,7 @@ fn encode_inter_leaf_residual(
     // `TxSize` — on the §5.11.16 var-tx arm that is the recursion's
     // last terminal-else `txSz` (the uniform TU size here).
     let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
-    let cn = n / 2;
+    let (cbw, cbh) = (bw / 2, bh / 2);
     let chroma_tx = if lossless {
         TX_4X4
     } else {
@@ -1386,9 +1407,9 @@ fn encode_inter_leaf_residual(
     let cw = recon.chroma_w;
     for plane in 1..=2usize {
         let mut ty = 0usize;
-        while ty < cn {
+        while ty < cbh {
             let mut tx = 0usize;
-            while tx < cn {
+            while tx < cbw {
                 let (tr, tc) = (crow0 + ty, ccol0 + tx);
                 // §5.11.40 inter-chroma `TxType`: the luma cell at the
                 // subsampling-lifted position (block-internal here —
@@ -1459,7 +1480,7 @@ fn encode_inter_leaf_residual(
     if !lossless && skip == 0 {
         // §5.11.16 var-tx arm: one uniform tree per max-TU position
         // (square blocks ⇒ exactly one).
-        block.var_tx_trees = vec![uniform_var_tx_tree(depth)];
+        block.var_tx_trees = vec![uniform_var_tx_tree(MAX_TX_SIZE_RECT[b_size], depth)];
     }
     block.inter = Some(SyntaxInterBlock {
         ref_frame: [1, -1],
@@ -1499,6 +1520,9 @@ fn p_tree_rate(node: &SyntaxNode) -> u64 {
     match node {
         SyntaxNode::Leaf(b) => p_leaf_rate(b),
         SyntaxNode::Split(children) => 4 + children.iter().map(|c| p_tree_rate(c)).sum::<u64>(),
+        SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+            4 + blocks.iter().map(|b| p_leaf_rate(b)).sum::<u64>()
+        }
     }
 }
 
@@ -1590,6 +1614,57 @@ fn build_p_search_tree(
         return Ok(SyntaxNode::Leaf(Box::new(leaf)));
     }
 
+    // Running best over the non-split candidates: NONE-leaf first,
+    // then the r412 HORZ / VERT rectangular trials.
+    let mut best_node: (SyntaxNode, RegionSnapshot, _, u64) = (
+        SyntaxNode::Leaf(Box::new(leaf)),
+        after_leaf,
+        m_after_leaf,
+        score_leaf,
+    );
+
+    // Candidates D/E: §5.11.4 PARTITION_HORZ / PARTITION_VERT — two
+    // rectangular INTER halves (`Partition_Subsize[ p ][ bSize ]`,
+    // BLOCK_16X8 and larger; intra halves stay the NONE-leaf's and
+    // SPLIT's territory). The halves are encoded in §5.11.4 dispatch
+    // order, so the second half's §7.10.2 scan and prediction see the
+    // first half's stamps exactly as the decoder will.
+    for part in [PARTITION_HORZ, PARTITION_VERT] {
+        let sub = match crate::cdf::partition_subsize(part, b_size) {
+            Some(sz) => sz,
+            None => continue,
+        };
+        let (r1, c1) = if part == PARTITION_HORZ {
+            (r + half, c)
+        } else {
+            (r, c + half)
+        };
+        let first = encode_inter_leaf(r, c, sub, input, recon, ictx)?;
+        ictx.stamp_leaf(&first, r, c, sub, recon.lossless);
+        let second = encode_inter_leaf(r1, c1, sub, input, recon, ictx)?;
+        ictx.stamp_leaf(&second, r1, c1, sub, recon.lossless);
+        let d = region_distortion(recon, input, r, c, n4 as usize);
+        let rate = p_leaf_rate(&first) + p_leaf_rate(&second) + 4;
+        let score = d + lambda * rate;
+        if score < best_node.3 {
+            let blocks = [Box::new(first), Box::new(second)];
+            let node = if part == PARTITION_HORZ {
+                SyntaxNode::Horz(blocks)
+            } else {
+                SyntaxNode::Vert(blocks)
+            };
+            best_node = (
+                node,
+                save_region(recon, r, c, n4 as usize),
+                ictx.mirror.snapshot_encoder_stamp_rect(r, c, n4),
+                score,
+            );
+        }
+        restore_region(recon, r, c, &before);
+        ictx.mirror.restore_encoder_stamp_rect(&m_before);
+    }
+    let (node_leafish, after_leafish, m_after_leafish, score_leafish) = best_node;
+
     // Candidate C: PARTITION_SPLIT into four recursively-searched
     // quadrants (NW/NE/SW/SE dispatch order — the mirror currently
     // holds the pre-node state, so each child's §7.10.2 scan sees its
@@ -1612,10 +1687,10 @@ fn build_p_search_tree(
     let r_split = children.iter().map(|ch| p_tree_rate(ch)).sum::<u64>() + 4;
     let score_split = d_split + lambda * r_split;
 
-    if score_leaf <= score_split {
-        restore_region(recon, r, c, &after_leaf);
-        ictx.mirror.restore_encoder_stamp_rect(&m_after_leaf);
-        Ok(SyntaxNode::Leaf(Box::new(leaf)))
+    if score_leafish <= score_split {
+        restore_region(recon, r, c, &after_leafish);
+        ictx.mirror.restore_encoder_stamp_rect(&m_after_leafish);
+        Ok(node_leafish)
     } else {
         Ok(SyntaxNode::Split(children))
     }
@@ -1665,6 +1740,19 @@ mod tests {
             SyntaxNode::Split(children) => {
                 for ch in children.iter() {
                     count_modes(ch, counts);
+                }
+            }
+            SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                for b in blocks.iter() {
+                    if let Some(ib) = b.inter.as_ref() {
+                        match ib.y_mode {
+                            MODE_NEARESTMV => counts[0] += 1,
+                            MODE_NEARMV => counts[1] += 1,
+                            MODE_GLOBALMV => counts[2] += 1,
+                            MODE_NEWMV => counts[3] += 1,
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -1803,6 +1891,13 @@ mod tests {
                         count_filters(ch, counts);
                     }
                 }
+                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                    for b in blocks.iter() {
+                        if let Some(ib) = b.inter.as_ref() {
+                            counts[usize::from(ib.interp_filter[0].min(2))] += 1;
+                        }
+                    }
+                }
             }
         }
         let mut counts = [0u32; 3];
@@ -1815,6 +1910,112 @@ mod tests {
             counts[0],
             counts[1]
         );
+    }
+
+    /// r412 — the HORZ/VERT rectangular trials must actually be
+    /// selected where they beat NONE and SPLIT: content whose motion
+    /// boundary bisects a square node horizontally makes the two
+    /// 32x16 halves each uniform-motion (two MVs — NONE cannot code
+    /// that; SPLIT costs four leaves), so the tree must carry at
+    /// least one HORZ node — and the emitted GOP must round-trip
+    /// byte-exact through the spec driver.
+    #[test]
+    fn r412_p_search_selects_horz_partition_on_band_motion() {
+        // Frame k: rows [0, 16) shift right by 4k, rows [16, ..)
+        // shift left by 4k — the boundary bisects the top 32x32
+        // quadrants at their halfway row.
+        let band = |k: usize| -> Yuv420Frame {
+            let (w, h) = (64usize, 64usize);
+            let mut f = Yuv420Frame::filled(64, 64, 0);
+            let tex = |x: i64, y: i64| -> u8 {
+                let (xu, yu) = ((x + 512) as usize, (y + 512) as usize);
+                ((xu * 7 + yu * 3 + (xu / 8) * (yu / 8) * 5) % 256) as u8
+            };
+            for i in 0..h {
+                // The two bands slide in opposite directions over the
+                // same infinite texture (no wraparound seam).
+                let s: i64 = if i < 16 {
+                    4 * k as i64
+                } else {
+                    -4 * (k as i64)
+                };
+                for j in 0..w {
+                    f.y[i * w + j] = tex(j as i64 - s, i as i64);
+                }
+            }
+            let (cw, ch) = (w / 2, h / 2);
+            for i in 0..ch {
+                let s: i64 = if i < 8 { 2 * k as i64 } else { -2 * (k as i64) };
+                for j in 0..cw {
+                    let x = ((j as i64 - s) + 512) as usize;
+                    f.u[i * cw + j] = ((128 + x * 2 + i) % 256) as u8;
+                    f.v[i * cw + j] = ((64 + x + i * 2) % 256) as u8;
+                }
+            }
+            f
+        };
+        let frames: Vec<Yuv420Frame> = (0..3).map(band).collect();
+        let base_q_idx = 60u8;
+
+        // Tree inspection on the P-frame search.
+        let key = encode_key_frame_yuv420_with_q(&frames[0], base_q_idx).unwrap();
+        let reference = GopFrameRecon {
+            y: key.recon_y.clone(),
+            u: key.recon_u.clone(),
+            v: key.recon_v.clone(),
+        };
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        let mut ictx = PSearchCtx::new(&reference, mi_rows, mi_cols, 64, 64, ip).unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree =
+            build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
+        fn count_rect(node: &SyntaxNode, horz: &mut u32, vert: &mut u32) {
+            match node {
+                SyntaxNode::Leaf(_) => {}
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count_rect(ch, horz, vert);
+                    }
+                }
+                SyntaxNode::Horz(_) => *horz += 1,
+                SyntaxNode::Vert(_) => *vert += 1,
+            }
+        }
+        let (mut horz, mut vert) = (0u32, 0u32);
+        count_rect(&tree, &mut horz, &mut vert);
+        assert!(
+            horz > 0,
+            "band-split motion must select at least one PARTITION_HORZ node \
+             (got HORZ={horz} VERT={vert})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), frames.len());
+        for (idx, f) in decoded.iter().enumerate() {
+            assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
     }
 
     /// r412 — [`PSearchCtx::predict_leaf`] must thread the trial

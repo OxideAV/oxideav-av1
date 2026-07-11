@@ -115,9 +115,10 @@ use crate::cdf::{
     GM_TYPE_TRANSLATION, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
     MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV,
     MODE_NEARESTMV, MODE_NEARMV, MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH,
-    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_NONE, PARTITION_SPLIT, SPLIT_TX_SIZE,
-    SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL,
-    TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
+    NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT,
+    PARTITION_VERT, SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT,
+    TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
+    WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
     write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex, write_inter_block_mode_info,
@@ -933,6 +934,15 @@ pub enum SyntaxNode {
     /// Four §5.11.4 quadrants at `Partition_Subsize[PARTITION_SPLIT][bSize]`
     /// in `[NW, NE, SW, SE]` order.
     Split([Box<SyntaxNode>; 4]),
+    /// r412 — §5.11.4 `PARTITION_HORZ`: two `decode_block( )` leaves
+    /// at `Partition_Subsize[ PARTITION_HORZ ][ bSize ]` in
+    /// `[ top, bottom ]` order. Scope: fully-in-frame nodes only
+    /// (`hasRows && hasCols` — the `split_or_horz` edge arm remains
+    /// the forced-SPLIT driver's territory).
+    Horz([Box<SyntaxBlock>; 2]),
+    /// r412 — §5.11.4 `PARTITION_VERT`: two leaves in
+    /// `[ left, right ]` order (same scope as [`SyntaxNode::Horz`]).
+    Vert([Box<SyntaxBlock>; 2]),
 }
 
 impl SyntaxNode {
@@ -1237,6 +1247,19 @@ pub fn write_partition_tree_syntax(
             }
             PARTITION_SPLIT
         }
+        SyntaxNode::Horz(_) => {
+            // r412 scope: the general S() arm only (fully in frame).
+            if b_size < BLOCK_8X8 || !has_rows || !has_cols {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            PARTITION_HORZ
+        }
+        SyntaxNode::Vert(_) => {
+            if b_size < BLOCK_8X8 || !has_rows || !has_cols {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            PARTITION_VERT
+        }
     };
 
     let pctx = if b_size >= BLOCK_8X8 {
@@ -1252,6 +1275,39 @@ pub fn write_partition_tree_syntax(
     match (node, partition) {
         (SyntaxNode::Leaf(block), PARTITION_NONE) => {
             write_block_syntax(writer, cdfs, state, block, r, c, sub_size, params)?;
+        }
+        (SyntaxNode::Horz(blocks), PARTITION_HORZ) => {
+            // §5.11.4: `decode_block( r, c, subSize )` then
+            // `decode_block( r + halfBlock4x4, c, subSize )` (the
+            // `hasRows` gate held by the scope check above).
+            let [top, bottom] = blocks;
+            write_block_syntax(writer, cdfs, state, top, r, c, sub_size, params)?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                bottom,
+                r + half_block4x4,
+                c,
+                sub_size,
+                params,
+            )?;
+        }
+        (SyntaxNode::Vert(blocks), PARTITION_VERT) => {
+            // §5.11.4: `decode_block( r, c, subSize )` then
+            // `decode_block( r, c + halfBlock4x4, subSize )`.
+            let [left, right] = blocks;
+            write_block_syntax(writer, cdfs, state, left, r, c, sub_size, params)?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                right,
+                r,
+                c + half_block4x4,
+                sub_size,
+                params,
+            )?;
         }
         (SyntaxNode::Split(children), PARTITION_SPLIT) => {
             let [nw, ne, sw, se] = children;
@@ -3307,8 +3363,9 @@ mod tests {
     use super::*;
     use crate::cdf::{
         get_br_ctx, get_coeff_base_ctx, get_coeff_base_eob_ctx, CoefficientsReadout,
-        PartitionWalker, TileGeometry as G, BLOCK_16X16, BLOCK_32X32, BLOCK_64X64, BLOCK_8X8,
-        DC_PRED, MAX_SEGMENTS, TX_16X16, TX_4X4, TX_8X8, TX_CLASS_2D, V_PRED,
+        PartitionWalker, TileGeometry as G, BLOCK_16X16, BLOCK_16X32, BLOCK_32X16, BLOCK_32X32,
+        BLOCK_64X64, BLOCK_8X8, DC_PRED, MAX_SEGMENTS, TX_16X16, TX_4X4, TX_8X8, TX_CLASS_2D,
+        V_PRED,
     };
     use crate::scan::get_default_scan;
     use crate::symbol_decoder::SymbolDecoder;
@@ -5899,6 +5956,71 @@ mod tests {
             [f[cell(8, 8) * 2], f[cell(8, 8) * 2 + 1]],
             [EIGHTTAP; 2],
             "SE leaf filter pair"
+        );
+    }
+
+    /// r412 — §5.11.4 PARTITION_HORZ / PARTITION_VERT write dispatch:
+    /// a HORZ pair of BLOCK_32X16 inter leaves and a VERT pair of
+    /// BLOCK_16X32 leaves inside one SPLIT, replayed bit-for-bit by
+    /// the decode walker (rect `MiSizes[]` / `Mvs[]` grid stamps
+    /// checked; the second half's §7.10.2 stack and §8.3.2 ctx walks
+    /// consume the first half's stamps).
+    #[test]
+    fn r412_inter_syntax_round_trip_horz_vert_partitions() {
+        let params = inter_params_420(16, 16, /* lossless = */ true);
+
+        // NW 32x32 node: HORZ — two 32x16 halves with distinct MVs.
+        let top = inter_skip_leaf(MODE_NEWMV, [8, 16]);
+        let bottom = inter_skip_leaf(MODE_NEWMV, [-8, -16]);
+        // NE 32x32 node: VERT — two 16x32 halves.
+        let left = inter_skip_leaf(MODE_NEWMV, [4, -24]);
+        let right = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        // SW / SE: plain leaves.
+        let sw = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        let se = SyntaxBlock::skip_leaf(DC_PRED as u8, Some(DC_PRED as u8));
+
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Horz([Box::new(top), Box::new(bottom)])),
+            Box::new(SyntaxNode::Vert([Box::new(left), Box::new(right)])),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0x9D);
+
+        let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+        // HORZ: top half rows 0-3, bottom half rows 4-7 (mi units).
+        assert_eq!(walker.mi_sizes()[cell(0, 0)], BLOCK_32X16);
+        assert_eq!(walker.mi_sizes()[cell(4, 0)], BLOCK_32X16);
+        assert_eq!(
+            [
+                walker.mvs()[cell(0, 0) * 4],
+                walker.mvs()[cell(0, 0) * 4 + 1]
+            ],
+            [8i16, 16]
+        );
+        assert_eq!(
+            [
+                walker.mvs()[cell(4, 0) * 4],
+                walker.mvs()[cell(4, 0) * 4 + 1]
+            ],
+            [-8i16, -16]
+        );
+        // VERT: left half cols 8-11, right half cols 12-15.
+        assert_eq!(walker.mi_sizes()[cell(0, 8)], BLOCK_16X32);
+        assert_eq!(walker.mi_sizes()[cell(0, 12)], BLOCK_16X32);
+        assert_eq!(
+            [
+                walker.mvs()[cell(0, 8) * 4],
+                walker.mvs()[cell(0, 8) * 4 + 1]
+            ],
+            [4i16, -24]
+        );
+        assert_eq!(
+            [
+                walker.mvs()[cell(0, 12) * 4],
+                walker.mvs()[cell(0, 12) * 4 + 1]
+            ],
+            [0i16, 0]
         );
     }
 
