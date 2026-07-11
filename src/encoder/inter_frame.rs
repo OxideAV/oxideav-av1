@@ -19,15 +19,19 @@
 //!   non-switchable filter, `force_integer_mv = 0` /
 //!   `allow_high_precision_mv = 0`, no order hints, no skip-mode, no
 //!   segmentation; `TxMode = ONLY_4X4` on the `CodedLossless` arm
-//!   (`base_q_idx == 0`) or `TX_MODE_LARGEST` otherwise.
+//!   (`base_q_idx == 0`) or `TX_MODE_SELECT` otherwise.
 //! * Per-node RD search (leaf-vs-split, `BLOCK_64X64` down to
 //!   `BLOCK_8X8` — inter frames stop above the sub-8×8 chroma
 //!   `someUseIntra` stitching): every square node trials one INTER
-//!   leaf (integer-precision motion search, `NEWMV`, or `GLOBALMV`
-//!   when the best vector is zero — the identity-warp derivation)
-//!   against one INTRA leaf (the §5.11.22 arm, the KEY driver's
-//!   13-mode picker at the spec-forced `Max_Tx_Size_Rect` TX), then
-//!   both against the recursive split.
+//!   leaf (integer motion search + half/quarter-pel refinement
+//!   through the real §7.11.3.4 kernel, coding `NEWMV`, or `GLOBALMV`
+//!   on the zero vector — the identity-warp derivation) against one
+//!   INTRA leaf (the §5.11.22 arm with the KEY driver's 13-mode +
+//!   §5.11.15 tx_depth pickers), then both against the recursive
+//!   split. Inter leaves additionally RD-select their §5.11.17
+//!   uniform `txfm_split` depth (`Max_Tx_Size_Rect` down to two
+//!   `Split_Tx_Size` steps), coding the recursion's TUs in §5.11.36
+//!   transform-tree order.
 //! * `skip = 1` on leaves whose every TU quantises to zero.
 //!
 //! ## Why the reconstruction loop is exact
@@ -50,20 +54,21 @@
 
 use crate::cdf::{
     get_tx_size, QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
-    DCT_DCT, EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MODE_GLOBALMV, MODE_NEWMV,
-    MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_WIDE, TX_4X4, TX_HEIGHT, TX_WIDTH,
+    DCT_DCT, EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV,
+    MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, TX_4X4, TX_HEIGHT,
+    TX_WIDTH,
 };
 use crate::encoder::frame_obu::encode_uncompressed_header;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
 use crate::encoder::key_frame::{
-    encode_key_frame_yuv420_with_q, encode_leaf_with_tx, lambda_for, leaf_rate, region_distortion,
+    encode_key_frame_yuv420_with_q, encode_leaf_sq, lambda_for, leaf_rate, region_distortion,
     residual_tx, restore_region, save_region, tu_bd_stamp, BlockDecodedMirror, ReconState,
-    KEY_FRAME_MAX_DIM,
+    RegionSnapshot, KEY_FRAME_MAX_DIM,
 };
 use crate::encoder::obu::{build_temporal_unit, ObuFrame};
 use crate::encoder::partition_tree::{
     write_partition_tree_syntax, PartitionSyntaxWriter, SyntaxBlock, SyntaxFrameParams,
-    SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode,
+    SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode, VarTxSyntaxTree,
 };
 use crate::encoder::pixel_driver_dyn::{
     build_intra_only_yuv420_8bit_fh_with_q, sb_grid_origins, Yuv420Frame,
@@ -209,12 +214,13 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     fh.primary_ref_frame = PRIMARY_REF_NONE;
     fh.refresh_frame_flags = ALL_FRAMES_PUB;
     // §5.9.21: ONLY_4X4 rides the CodedLossless arm; the lossy arm
-    // codes `tx_mode_select = 0` ⇒ TX_MODE_LARGEST (the §5.11.16 read
-    // is bit-silent on every block).
+    // codes TX_MODE_SELECT — intra leaves carry the §5.11.15
+    // `tx_depth` choice and inter leaves the §5.11.17 `txfm_split`
+    // recursion.
     fh.tx_mode = Some(if base_q_idx == 0 {
         TxMode::Only4x4
     } else {
-        TxMode::TxModeLargest
+        TxMode::TxModeSelect
     });
     fh.reference_select = Some(false);
     fh.skip_mode_present = Some(false);
@@ -293,7 +299,7 @@ fn encode_p_frame_yuv420(
         allow_screen_content_tools: fh.allow_screen_content_tools,
         enable_filter_intra: seq.enable_filter_intra,
         bit_depth: 8,
-        tx_mode_select: false,
+        tx_mode_select: !lossless,
         quant: qp,
         reduced_tx_set: fh.reduced_tx_set.unwrap_or(false),
         inter: Some(SyntaxInterFrameParams::single_ref_baseline(
@@ -775,7 +781,6 @@ fn encode_inter_leaf(
     let col0 = (mi_c as usize) * 4;
     let width = recon.width;
     let lossless = recon.lossless;
-    let qp = recon.qp;
 
     let mv_int = motion_search_luma(
         input,
@@ -803,46 +808,161 @@ fn encode_inter_leaf(
     };
     ictx.predict_leaf(mi_r, mi_c, b_size, y_mode, mv)?;
 
-    // --- Luma residual over the TU grid. ---
+    if lossless {
+        // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
+        return encode_inter_leaf_residual(mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, 0);
+    }
+
+    // §5.11.17 uniform-depth RD trial (TX_MODE_SELECT): code the leaf
+    // at `Split_Tx_Size^depth[ Max_Tx_Size_Rect ]` for each reachable
+    // depth against the same starting state, keep the lower `D + λ·R`.
+    let max_tx = MAX_TX_SIZE_RECT[b_size];
+    let mut max_depth = 0u32;
+    let mut t = max_tx;
+    while max_depth < MAX_VARTX_DEPTH && t != TX_4X4 {
+        t = SPLIT_TX_SIZE[t];
+        max_depth += 1;
+    }
+    let lambda = lambda_for(&recon.qp);
+    let before = save_region(recon, mi_r, mi_c, n4);
+    let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
+    for depth in 0..=max_depth {
+        let leaf =
+            encode_inter_leaf_residual(mi_r, mi_c, b_size, input, recon, ictx, y_mode, mv, depth)?;
+        let d = region_distortion(recon, input, mi_r, mi_c, n4);
+        let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
+        let improves = match best.as_ref() {
+            Some((_, _, s)) => score < *s,
+            None => true,
+        };
+        if improves {
+            best = Some((leaf, save_region(recon, mi_r, mi_c, n4), score));
+        }
+        restore_region(recon, mi_r, mi_c, &before);
+    }
+    let (leaf, after, _) = best.expect("at least depth 0");
+    restore_region(recon, mi_r, mi_c, &after);
+    Ok(leaf)
+}
+
+/// §5.11.36 luma TU visit order for a uniform `tw × tw` TU grid over
+/// an `n × n` block — the quadtree halving recursion (NW / NE / SW /
+/// SE at every level), NOT row-major beyond a 2×2 grid.
+fn transform_tree_tu_order(
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    tw: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if w <= tw && h <= tw {
+        out.push((x, y));
+        return;
+    }
+    transform_tree_tu_order(x, y, w / 2, h / 2, tw, out);
+    transform_tree_tu_order(x + w / 2, y, w / 2, h / 2, tw, out);
+    transform_tree_tu_order(x, y + h / 2, w / 2, h / 2, tw, out);
+    transform_tree_tu_order(x + w / 2, y + h / 2, w / 2, h / 2, tw, out);
+}
+
+/// §5.11.17 uniform split-decision tree of the given depth (square
+/// transform ordinals ⇒ four children per split).
+fn uniform_var_tx_tree(depth: u32) -> VarTxSyntaxTree {
+    if depth == 0 {
+        VarTxSyntaxTree::Leaf
+    } else {
+        VarTxSyntaxTree::Split(vec![
+            uniform_var_tx_tree(depth - 1),
+            uniform_var_tx_tree(depth - 1),
+            uniform_var_tx_tree(depth - 1),
+            uniform_var_tx_tree(depth - 1),
+        ])
+    }
+}
+
+/// Residual-code one inter leaf at uniform §5.11.17 depth `depth`
+/// (`0` = one `Max_Tx_Size_Rect` TU; the lossless arm ignores `depth`
+/// and codes the `TX_4X4` grid). Consumes the prediction already in
+/// `ictx.scratch`.
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_leaf_residual(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+    ictx: &PSearchCtx,
+    y_mode: u8,
+    mv: [i32; 2],
+    depth: u32,
+) -> Result<SyntaxBlock, Error> {
+    let n4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let n = n4 * 4;
+    let row0 = (mi_r as usize) * 4;
+    let col0 = (mi_c as usize) * 4;
+    let width = recon.width;
+    let lossless = recon.lossless;
+    let qp = recon.qp;
+
+    // --- Luma residual over the §5.11.36 TU walk. ---
     let luma_tx = if lossless {
         TX_4X4
     } else {
-        MAX_TX_SIZE_RECT[b_size]
+        let mut t = MAX_TX_SIZE_RECT[b_size];
+        for _ in 0..depth {
+            t = SPLIT_TX_SIZE[t];
+        }
+        t
     };
     let (ltw, lth) = (TX_WIDTH[luma_tx], TX_HEIGHT[luma_tx]);
-    let mut residual_quant: Vec<Vec<i32>> = Vec::new();
-    let mut ty = 0usize;
-    while ty < n {
-        let mut tx = 0usize;
-        while tx < n {
-            let (tr, tc) = (row0 + ty, col0 + tx);
-            let mut pred = vec![0u8; ltw * lth];
-            for i in 0..lth {
-                for j in 0..ltw {
-                    pred[i * ltw + j] = ictx.scratch[0][(tr + i) * width + (tc + j)] as u8;
-                }
+    let mut tu_order: Vec<(usize, usize)> = Vec::new();
+    if lossless {
+        // §5.11.34 direct row-major iteration (the `!is_inter ||
+        // Lossless` arm).
+        let mut ty = 0usize;
+        while ty < n {
+            let mut tx = 0usize;
+            while tx < n {
+                tu_order.push((tx, ty));
+                tx += ltw;
             }
-            let q = residual_tx(
-                &input.y,
-                &mut recon.y,
-                width,
-                tr,
-                tc,
-                luma_tx,
-                &pred,
-                0,
-                lossless,
-                DCT_DCT,
-                &qp,
-            );
-            tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
-            residual_quant.push(q);
-            tx += ltw;
+            ty += lth;
         }
-        ty += lth;
+    } else {
+        // §5.11.36 transform-tree quadtree order.
+        transform_tree_tu_order(0, 0, n, n, ltw, &mut tu_order);
+    }
+    let mut residual_quant: Vec<Vec<i32>> = Vec::new();
+    for &(tx, ty) in &tu_order {
+        let (tr, tc) = (row0 + ty, col0 + tx);
+        let mut pred = vec![0u8; ltw * lth];
+        for i in 0..lth {
+            for j in 0..ltw {
+                pred[i * ltw + j] = ictx.scratch[0][(tr + i) * width + (tc + j)] as u8;
+            }
+        }
+        let q = residual_tx(
+            &input.y,
+            &mut recon.y,
+            width,
+            tr,
+            tc,
+            luma_tx,
+            &pred,
+            0,
+            lossless,
+            DCT_DCT,
+            &qp,
+        );
+        tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
+        residual_quant.push(q);
     }
 
     // --- Chroma (every BLOCK_8X8+ leaf has chroma at 4:2:0). ---
+    // §5.11.34: the chroma TU size derives from the block's committed
+    // `TxSize` — on the §5.11.16 var-tx arm that is the recursion's
+    // last terminal-else `txSz` (the uniform TU size here).
     let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
     let cn = n / 2;
     let chroma_tx = if lossless {
@@ -891,7 +1011,8 @@ fn encode_inter_leaf(
     }
 
     // §5.11.11 skip: 1 iff every TU quantised to zero (the recon then
-    // equals the bare prediction on every plane).
+    // equals the bare prediction on every plane). A skip leaf takes
+    // the §5.11.16 else arm — no §5.11.17 trees.
     let all_zero = residual_quant.iter().all(|tu| tu.iter().all(|&q| q == 0));
     let skip = u8::from(all_zero);
     if all_zero {
@@ -901,6 +1022,11 @@ fn encode_inter_leaf(
     let mut block = SyntaxBlock::skip_leaf(0, None);
     block.skip = skip;
     block.residual_quant = residual_quant;
+    if !lossless && skip == 0 {
+        // §5.11.16 var-tx arm: one uniform tree per max-TU position
+        // (square blocks ⇒ exactly one).
+        block.var_tx_trees = vec![uniform_var_tx_tree(depth)];
+    }
     block.inter = Some(SyntaxInterBlock {
         ref_frame: [1, -1],
         y_mode,
@@ -990,14 +1116,10 @@ fn build_p_search_tree(
     let after_inter = save_region(recon, r, c, n4 as usize);
     restore_region(recon, r, c, &before);
 
-    // Candidate B: one INTRA leaf (§5.11.22 arm) at the spec-forced
-    // TX (TX_MODE_LARGEST / ONLY_4X4 — no tx_depth choice exists).
-    let intra_tx = if recon.lossless {
-        TX_4X4
-    } else {
-        MAX_TX_SIZE_RECT[b_size]
-    };
-    let intra_leaf = encode_leaf_with_tx(r, c, b_size, intra_tx, input, recon);
+    // Candidate B: one INTRA leaf (§5.11.22 arm) with the KEY
+    // driver's §5.11.15 tx_depth RD search (TX_MODE_SELECT on the
+    // lossy arm; the lossless arm stays on the TX_4X4 grid).
+    let intra_leaf = encode_leaf_sq(r, c, b_size, input, recon);
     let d_intra = region_distortion(recon, input, r, c, n4 as usize);
     let r_intra = p_leaf_rate(&intra_leaf);
     let score_intra = d_intra + lambda * r_intra;

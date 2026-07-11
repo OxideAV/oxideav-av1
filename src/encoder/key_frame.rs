@@ -1231,7 +1231,7 @@ fn chroma_tx_type_for(uv_mode: u8, chroma_tx: usize, lossless: bool) -> usize {
 /// Chroma on §5.11.5 `HasChroma` leaves: same shape at the §5.11.38
 /// `get_tx_size` chroma TU size, coded after the luma TUs per
 /// §5.11.34 plane order (all U TUs, then all V TUs).
-fn encode_leaf_sq(
+pub(crate) fn encode_leaf_sq(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
