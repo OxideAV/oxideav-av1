@@ -415,6 +415,38 @@ writers, the §8.2.4 arithmetic-coder termination
 derivation (subsampled chroma residual must be 4×4 — the lossy
 `Max(w,h) <= 32` arm does not apply).
 
+### Conformance-grade inter P-frame GOPs (r411)
+
+`encoder::encode_gop_yuv420{,_with_q}` extends the keyframe driver
+into a **conformant KEY + P GOP encoder**: each INTER P-frame predicts
+from the previous frame's reconstruction (single reference LAST_FRAME,
+every §7.20 slot refreshed per frame) through the REAL §5.11.18
+`inter_frame_mode_info()` syntax — the new r411 write arm of
+`write_partition_tree_syntax` (§5.11.18 prologue with mirror-derived
+§8.3.2 contexts, the §5.11.25 reference cascade, §7.10.2
+`find_mv_stack` against the write mirror, the §5.11.24 single-pred
+mode cascade + drl loop + §5.11.31 MV write, and the §5.11.22
+intra-in-inter composite). P-frame headers ride §5.9.2
+`error_resilient_mode` (`PRIMARY_REF_NONE`, per-frame default CDFs),
+identity §5.9.24 global motion, `EIGHTTAP`, quarter-pel MVs and no
+order hints. The RD search (BLOCK_64X64 down to a BLOCK_8X8 P-frame
+leaf floor) trials an INTER leaf — integer motion search plus
+half/quarter-pel refinement scored through the decoder's OWN §7.11.3
+leaf driver, coding `NEWMV` or zero-vector `GLOBALMV` — against a
+§5.11.22 INTRA leaf and the recursive split; inter leaves RD-select a
+uniform §5.11.17 `txfm_split` depth (TUs coded in §5.11.36
+transform-tree quadtree order) and run the §5.11.47 transform-type
+search over the full §5.11.48 INTER sets (all 16 types at 4×4/8×8,
+FLIPADST family included via the §7.12.3 step-3 destination remap)
+with the §5.11.40 chroma inheritance; `skip = 1` on pred-exact leaves.
+Validated four ways: the spec driver and THREE independent reference
+decoders decode a 45-config GOP sweep (5 geometries × q ∈ {0, 30, 50,
+100, 160, 255} × moving / static / content-cut / noise / half-pel
+content + an 8-frame P-chain) byte-identical to the encoder's
+per-frame reconstruction — lossless GOPs equal the input exactly.
+Three self-encoded GOP streams are pinned in the conformance corpus
+(47 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -425,10 +457,13 @@ derivation (subsampled chroma residual must be 4×4 — the lossy
 - The historical intra `encode_av1` mirror paths emit non-conformant
   streams (kept for their bit-exact self round-trip through
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
-  `encoder::encode_key_frame_yuv420`. Conformant encoding beyond the
-  r410 keyframe scope (palette/intrabc leaves, the asymmetric
-  HORZ/VERT partition shapes, true bit-accounting rate costs, inter
-  P-frames) is the follow-up ladder.
+  `encoder::encode_key_frame_yuv420` /
+  `encoder::encode_gop_yuv420{,_with_q}`. Conformant encoding beyond
+  the r411 scope (NEARESTMV/NEARMV driver selection via a
+  driver-side §7.10.2 mirror, compound references, SWITCHABLE
+  filters, palette/intrabc leaves, the asymmetric HORZ/VERT partition
+  shapes, true bit-accounting rate costs, B-pyramids/order hints) is
+  the follow-up ladder.
 
 ## Module layout
 
