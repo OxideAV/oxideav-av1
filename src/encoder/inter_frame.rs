@@ -53,10 +53,10 @@
 //! §7.20 (reference frame update).
 
 use crate::cdf::{
-    get_tx_size, QuantizerParams, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
-    DCT_DCT, EIGHTTAP, GM_TYPE_IDENTITY, MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV,
-    MODE_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, TX_4X4, TX_HEIGHT,
-    TX_WIDTH,
+    get_tx_size, inter_tx_type_set, tx_size_sqr_index, QuantizerParams, TileCdfContext,
+    TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8, DCT_DCT, EIGHTTAP, GM_TYPE_IDENTITY,
+    MAX_TX_SIZE_RECT, MAX_VARTX_DEPTH, MODE_GLOBALMV, MODE_NEWMV, MOTION_MODE_SIMPLE,
+    NUM_4X4_BLOCKS_WIDE, SPLIT_TX_SIZE, TX_4X4, TX_HEIGHT, TX_SIZE_SQR_UP, TX_WIDTH,
 };
 use crate::encoder::frame_obu::encode_uncompressed_header;
 use crate::encoder::ivf::{IvfWriter, FOURCC_AV01};
@@ -866,6 +866,107 @@ fn transform_tree_tu_order(
     transform_tree_tu_order(x + w / 2, y + h / 2, w / 2, h / 2, tw, out);
 }
 
+/// r411 — §5.11.47 per-TU LUMA transform-type RD search on the INTER
+/// arm: trials every `TxType` admissible in the §5.11.48 inter set for
+/// `tx_sz` (all 16 at 4×4/8×8, 12 at 16×16, IDTX+DCT at 32×32, DCT
+/// alone above), scoring each full quantise→dequantise→inverse chain
+/// by `D + λ·R` over the TU, then stitches the winner into the running
+/// plane. The returned label is forced to `DCT_DCT` when the winning
+/// TU quantises to all-zero (the §5.11.39 `all_zero` arm reads no
+/// `inter_tx_type` symbol and the walker stamps `DCT_DCT`).
+#[allow(clippy::too_many_arguments)]
+fn residual_tx_search_luma_inter(
+    input_plane: &[u8],
+    recon_plane: &mut [u8],
+    pw: usize,
+    row0: usize,
+    col0: usize,
+    tx_sz: usize,
+    pred: &[u8],
+    qp: &QuantizerParams,
+) -> (Vec<i32>, u8) {
+    use crate::cdf::{dequantize_step1, is_tx_type_in_set, tx_size_sqr_index, TX_SIZE_SQR_UP};
+    use crate::encoder::forward_quantize::forward_quantize;
+    use crate::encoder::forward_transform_2d::forward_transform_2d;
+    use crate::encoder::key_frame::repack_compact;
+    use crate::transform::inverse_transform_2d;
+
+    let w = TX_WIDTH[tx_sz];
+    let h = TX_HEIGHT[tx_sz];
+    let mut residual = vec![0i64; w * h];
+    for i in 0..h {
+        for j in 0..w {
+            residual[i * w + j] =
+                i64::from(input_plane[(row0 + i) * pw + (col0 + j)]) - i64::from(pred[i * w + j]);
+        }
+    }
+    let set = inter_tx_type_set(
+        tx_size_sqr_index(tx_sz) as u32,
+        TX_SIZE_SQR_UP[tx_sz] as u32,
+        false,
+    );
+    let lambda = lambda_for(qp);
+    let mut best: Option<(Vec<i32>, Vec<i64>, u8, u64)> = None;
+    for t in 0..crate::cdf::TX_TYPES {
+        let admissible = t == DCT_DCT || (set > 0 && is_tx_type_in_set(true, set, t));
+        if !admissible {
+            continue;
+        }
+        let coeffs = forward_transform_2d(&residual, tx_sz, t, false);
+        let quant = repack_compact(forward_quantize(&coeffs, tx_sz, 0, 0, t, 15, qp), w, h);
+        let all_zero = quant.iter().all(|&q| q == 0);
+        let dequant = dequantize_step1(&quant, tx_sz, 0, 0, t, 15, qp);
+        let res_back = inverse_transform_2d(&dequant, tx_sz, t, 8, false);
+        // §7.12.3 step-3 destination remap (FLIPADST family).
+        let (flip_ud, flip_lr) = crate::encoder::key_frame::step3_flips(t);
+        let mut d = 0u64;
+        for i in 0..h {
+            let yy = if flip_ud { h - 1 - i } else { i };
+            for j in 0..w {
+                let xx = if flip_lr { w - 1 - j } else { j };
+                let rec = (i64::from(pred[yy * w + xx]) + res_back[i * w + j]).clamp(0, 255);
+                let diff = i64::from(input_plane[(row0 + yy) * pw + (col0 + xx)]) - rec;
+                d += (diff * diff) as u64;
+            }
+        }
+        let mut rate = 0u64;
+        for &qv in &quant {
+            if qv != 0 {
+                rate += 3 + u64::from(32 - qv.unsigned_abs().leading_zeros());
+            }
+        }
+        let score = d + lambda * rate;
+        let label = if all_zero { DCT_DCT as u8 } else { t as u8 };
+        let improves = match best.as_ref() {
+            Some((_, _, _, s)) => score < *s,
+            None => true,
+        };
+        if improves {
+            best = Some((quant, res_back, label, score));
+        }
+        // A below-floor residual at DCT_DCT is pred-exact — skip the
+        // remaining trials (they commit the same all-zero shape).
+        if t == DCT_DCT && all_zero {
+            break;
+        }
+    }
+    let (quant, res_back, label, _) = best.expect("DCT_DCT is always admissible");
+    // NOTE: the winning trial's `label` may be DCT_DCT (all-zero) even
+    // though `res_back` came from a FLIPADST trial — but an all-zero
+    // TU's residual is identically zero, so the remap is inert there;
+    // for coded TUs `label` IS the trial type.
+    let (flip_ud, flip_lr) = crate::encoder::key_frame::step3_flips(label as usize);
+    for i in 0..h {
+        let yy = if flip_ud { h - 1 - i } else { i };
+        for j in 0..w {
+            let xx = if flip_lr { w - 1 - j } else { j };
+            let p = i64::from(pred[yy * w + xx]) + res_back[i * w + j];
+            recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, 255) as u8;
+        }
+    }
+    (quant, label)
+}
+
 /// §5.11.17 uniform split-decision tree of the given depth (square
 /// transform ordinals ⇒ four children per split).
 fn uniform_var_tx_tree(depth: u32) -> VarTxSyntaxTree {
@@ -934,6 +1035,11 @@ fn encode_inter_leaf_residual(
         transform_tree_tu_order(0, 0, n, n, ltw, &mut tu_order);
     }
     let mut residual_quant: Vec<Vec<i32>> = Vec::new();
+    let mut luma_tx_types: Vec<u8> = Vec::new();
+    // Block-relative luma-TU-grid map of committed §5.11.47 types —
+    // the §5.11.40 chroma-inheritance source (`TxTypes[ y4 ][ x4 ]`).
+    let tu_cols = n / ltw;
+    let mut tu_type_grid = vec![DCT_DCT as u8; tu_cols * (n / lth)];
     for &(tx, ty) in &tu_order {
         let (tr, tc) = (row0 + ty, col0 + tx);
         let mut pred = vec![0u8; ltw * lth];
@@ -942,21 +1048,41 @@ fn encode_inter_leaf_residual(
                 pred[i * ltw + j] = ictx.scratch[0][(tr + i) * width + (tc + j)] as u8;
             }
         }
-        let q = residual_tx(
-            &input.y,
-            &mut recon.y,
-            width,
-            tr,
-            tc,
-            luma_tx,
-            &pred,
-            0,
-            lossless,
-            DCT_DCT,
-            &qp,
-        );
+        let (q, tt) = if lossless {
+            (
+                residual_tx(
+                    &input.y,
+                    &mut recon.y,
+                    width,
+                    tr,
+                    tc,
+                    luma_tx,
+                    &pred,
+                    0,
+                    lossless,
+                    DCT_DCT,
+                    &qp,
+                ),
+                DCT_DCT as u8,
+            )
+        } else {
+            // r411: §5.11.47 per-TU luma transform-type RD search over
+            // the §5.11.48 INTER set for this TX size.
+            residual_tx_search_luma_inter(
+                &input.y,
+                &mut recon.y,
+                width,
+                tr,
+                tc,
+                luma_tx,
+                &pred,
+                &qp,
+            )
+        };
         tu_bd_stamp(&mut recon.bd, 0, tc, tr, ltw, lth);
         residual_quant.push(q);
+        luma_tx_types.push(tt);
+        tu_type_grid[(ty / lth) * tu_cols + tx / ltw] = tt;
     }
 
     // --- Chroma (every BLOCK_8X8+ leaf has chroma at 4:2:0). ---
@@ -971,6 +1097,13 @@ fn encode_inter_leaf_residual(
         get_tx_size(1, luma_tx, b_size, 1, 1).unwrap_or(TX_4X4)
     };
     let (ctw, cth) = (TX_WIDTH[chroma_tx], TX_HEIGHT[chroma_tx]);
+    // §5.11.48 inter set at the CHROMA TX size — the §5.11.40
+    // inheritance filter.
+    let chroma_set = inter_tx_type_set(
+        tx_size_sqr_index(chroma_tx) as u32,
+        TX_SIZE_SQR_UP[chroma_tx] as u32,
+        false,
+    );
     let cw = recon.chroma_w;
     for plane in 1..=2usize {
         let mut ty = 0usize;
@@ -978,6 +1111,21 @@ fn encode_inter_leaf_residual(
             let mut tx = 0usize;
             while tx < cn {
                 let (tr, tc) = (crow0 + ty, ccol0 + tx);
+                // §5.11.40 inter-chroma `TxType`: the luma cell at the
+                // subsampling-lifted position (block-internal here —
+                // the `Max( MiCol, .. )` clip only binds at the grid
+                // origin), filtered by the chroma-size inter set.
+                let chroma_tt = if lossless || TX_SIZE_SQR_UP[chroma_tx] > crate::cdf::TX_32X32 {
+                    DCT_DCT
+                } else {
+                    let luma_tt =
+                        tu_type_grid[((ty * 2) / lth) * tu_cols + (tx * 2) / ltw] as usize;
+                    if crate::cdf::is_tx_type_in_set(true, chroma_set, luma_tt) {
+                        luma_tt
+                    } else {
+                        DCT_DCT
+                    }
+                };
                 let mut pred = vec![0u8; ctw * cth];
                 for i in 0..cth {
                     for j in 0..ctw {
@@ -999,7 +1147,7 @@ fn encode_inter_leaf_residual(
                     &pred,
                     plane as u8,
                     lossless,
-                    DCT_DCT,
+                    chroma_tt,
                     &qp,
                 );
                 tu_bd_stamp(&mut recon.bd, plane, tc, tr, ctw, cth);
@@ -1017,11 +1165,18 @@ fn encode_inter_leaf_residual(
     let skip = u8::from(all_zero);
     if all_zero {
         residual_quant.clear();
+        luma_tx_types.clear();
+    }
+    // An all-DCT_DCT vector is the writer's back-compat default —
+    // commit the compact empty form.
+    if luma_tx_types.iter().all(|&t| t == DCT_DCT as u8) {
+        luma_tx_types.clear();
     }
 
     let mut block = SyntaxBlock::skip_leaf(0, None);
     block.skip = skip;
     block.residual_quant = residual_quant;
+    block.residual_tx_type = luma_tx_types;
     if !lossless && skip == 0 {
         // §5.11.16 var-tx arm: one uniform tree per max-TU position
         // (square blocks ⇒ exactly one).

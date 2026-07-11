@@ -825,7 +825,7 @@ fn cfl_layer(
 /// `Min(32, w) × Min(32, h)` coefficients, addressed with the COMPACT
 /// `tw`-stride layout. Repack the dense forward-quantize output; the
 /// padding tail stays zero (never scanned). Sizes ≤ 32 pass through.
-fn repack_compact(dense: Vec<i32>, w: usize, h: usize) -> Vec<i32> {
+pub(crate) fn repack_compact(dense: Vec<i32>, w: usize, h: usize) -> Vec<i32> {
     let tw = w.min(32);
     let th = h.min(32);
     if tw == w && th == h {
@@ -840,9 +840,33 @@ fn repack_compact(dense: Vec<i32>, w: usize, h: usize) -> Vec<i32> {
     q
 }
 
+/// §7.12.3 step-3 `flipUD` / `flipLR` destination-remap pair for a
+/// `TxType` — the FLIPADST-family selectors (av1-spec lines
+/// 16292-16296). Both false for every non-FLIPADST type (the whole
+/// intra set — the remap below is then the identity).
+#[inline]
+pub(crate) fn step3_flips(tx_type: usize) -> (bool, bool) {
+    use crate::cdf::{
+        ADST_FLIPADST, DCT_FLIPADST, FLIPADST_ADST, FLIPADST_DCT, FLIPADST_FLIPADST, H_FLIPADST,
+        V_FLIPADST,
+    };
+    let flip_ud = matches!(
+        tx_type,
+        FLIPADST_DCT | FLIPADST_ADST | V_FLIPADST | FLIPADST_FLIPADST
+    );
+    let flip_lr = matches!(
+        tx_type,
+        DCT_FLIPADST | ADST_FLIPADST | H_FLIPADST | FLIPADST_FLIPADST
+    );
+    (flip_ud, flip_lr)
+}
+
 /// One residual leg at `tx_sz`: forward (WHT for the lossless TX_4X4 /
 /// DCT-family otherwise) + quantize, then the decoder's dequant +
-/// inverse, stitching `Clip1(pred + res)` into the running plane.
+/// inverse, stitching `Clip1(pred + res)` into the running plane with
+/// the §7.12.3 step-3 `flipUD` / `flipLR` destination remap (the
+/// FLIPADST family reaches this through the r411 inter chroma
+/// inheritance; every intra-set type remaps as the identity).
 /// Returns the committed `Quant[]` in the §5.11.39 coefficient layout
 /// (the §7.12.3 compact-`tw` stride for 64-wide transforms, dense
 /// row-major otherwise), zero-padded to `Tx_Width * Tx_Height`.
@@ -881,10 +905,13 @@ pub(crate) fn residual_tx(
     let quant = repack_compact(dense, w, h);
     let dequant = dequantize_step1(&quant, tx_sz, plane, 0, tx_type, 15, qp);
     let res_back = inverse_transform_2d(&dequant, tx_sz, tx_type, 8, lossless);
+    let (flip_ud, flip_lr) = step3_flips(tx_type);
     for i in 0..h {
+        let yy = if flip_ud { h - 1 - i } else { i };
         for j in 0..w {
-            let p = pred[i * w + j] as i64 + res_back[i * w + j];
-            recon_plane[(row0 + i) * pw + (col0 + j)] = p.clamp(0, 255) as u8;
+            let xx = if flip_lr { w - 1 - j } else { j };
+            let p = pred[yy * w + xx] as i64 + res_back[i * w + j];
+            recon_plane[(row0 + yy) * pw + (col0 + xx)] = p.clamp(0, 255) as u8;
         }
     }
     quant
