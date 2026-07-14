@@ -62,19 +62,15 @@
 //!    [`crate::encoder::partition::write_partition`] (re-using the same
 //!    §8.3.2 ctx the decoder derives), then dispatch.
 //!
-//! ## Scope: PARTITION_NONE + PARTITION_SPLIT only
+//! ## Scope
 //!
-//! For arc 11 the driver supports the two recursive shapes the §5.11.4
-//! walk uses for "pure" partition trees: [`EncodeNode::Leaf`] (one
-//! block at the node's `bSize`) and [`EncodeNode::Split`] (four
-//! `subSize` quadrants). The asymmetric partitions
-//! (`PARTITION_HORZ` / `PARTITION_VERT` / `PARTITION_HORZ_A` /
-//! `PARTITION_HORZ_B` / `PARTITION_VERT_A` / `PARTITION_VERT_B` /
-//! `PARTITION_HORZ_4` / `PARTITION_VERT_4`) are out of scope until a
-//! follow-up arc — the [`crate::encoder::partition::write_partition`]
-//! symbol writer already supports their alphabet, but the dispatch
-//! (which has 2-3 leaves per node with mixed `subSize` /
-//! `splitSize`) is a separate piece of work.
+//! The arc-11 [`EncodeNode`] driver supports the two recursive shapes
+//! ([`EncodeNode::Leaf`] / [`EncodeNode::Split`]); the full-syntax
+//! [`SyntaxNode`] driver additionally dispatches every asymmetric
+//! §5.11.4 partition — `PARTITION_HORZ` / `PARTITION_VERT` (r412) and
+//! `PARTITION_HORZ_A` / `PARTITION_HORZ_B` / `PARTITION_VERT_A` /
+//! `PARTITION_VERT_B` / `PARTITION_HORZ_4` / `PARTITION_VERT_4`
+//! (r413) — on fully-in-frame nodes.
 //!
 //! ## MiSizes neighbour-grid maintenance
 //!
@@ -117,9 +113,11 @@ use crate::cdf::{
     MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV,
     MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV, MODE_NEARMV, MODE_NEWMV,
     MODE_NEW_NEWMV, MOTION_MODE_SIMPLE, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, PALETTE_COLORS,
-    PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT, SPLIT_TX_SIZE, SWITCHABLE,
-    TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT, TX_SIZES_ALL, TX_SIZE_SQR_UP,
-    TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST, WARPEDMODEL_PREC_BITS,
+    PARTITION_HORZ, PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_NONE,
+    PARTITION_SPLIT, PARTITION_VERT, PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+    SPLIT_TX_SIZE, SWITCHABLE, TX_4X4, TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT, TX_HEIGHT,
+    TX_SIZES_ALL, TX_SIZE_SQR_UP, TX_WIDTH, UV_CFL_PRED, V_ADST, V_DCT, V_FLIPADST,
+    WARPEDMODEL_PREC_BITS,
 };
 use crate::encoder::block_mode_info::{
     assign_mv_pred_mv, write_cdef, write_cfl_alphas, write_delta_lf, write_delta_qindex,
@@ -970,6 +968,29 @@ pub enum SyntaxNode {
     /// r412 — §5.11.4 `PARTITION_VERT`: two leaves in
     /// `[ left, right ]` order (same scope as [`SyntaxNode::Horz`]).
     Vert([Box<SyntaxBlock>; 2]),
+    /// r413 — §5.11.4 `PARTITION_HORZ_A`: three leaves in spec
+    /// dispatch order `[ (r, c, splitSize), (r, c + half, splitSize),
+    /// (r + half, c, subSize) ]`. Scope: fully-in-frame nodes at
+    /// `BLOCK_16X16` and larger (the 10-symbol EXT alphabet).
+    HorzA([Box<SyntaxBlock>; 3]),
+    /// r413 — §5.11.4 `PARTITION_HORZ_B`: `[ (r, c, subSize),
+    /// (r + half, c, splitSize), (r + half, c + half, splitSize) ]`.
+    HorzB([Box<SyntaxBlock>; 3]),
+    /// r413 — §5.11.4 `PARTITION_VERT_A`: `[ (r, c, splitSize),
+    /// (r + half, c, splitSize), (r, c + half, subSize) ]`.
+    VertA([Box<SyntaxBlock>; 3]),
+    /// r413 — §5.11.4 `PARTITION_VERT_B`: `[ (r, c, subSize),
+    /// (r, c + half, splitSize), (r + half, c + half, splitSize) ]`.
+    VertB([Box<SyntaxBlock>; 3]),
+    /// r413 — §5.11.4 `PARTITION_HORZ_4`: four `subSize` strips at
+    /// `r + quarter * i`. Per spec the LAST strip is skipped when
+    /// `r + quarter * 3 >= MiRows` (its entry is then never coded).
+    /// Valid at `BLOCK_16X16..=BLOCK_64X64` plus `BLOCK_128X128`-less
+    /// sizes per `Partition_Subsize`.
+    Horz4([Box<SyntaxBlock>; 4]),
+    /// r413 — §5.11.4 `PARTITION_VERT_4`: four `subSize` strips at
+    /// `c + quarter * i` (same clipping rule on the last strip).
+    Vert4([Box<SyntaxBlock>; 4]),
 }
 
 impl SyntaxNode {
@@ -979,6 +1000,22 @@ impl SyntaxNode {
     #[must_use]
     pub fn dummy_oob() -> Self {
         SyntaxNode::Leaf(Box::new(SyntaxBlock::skip_leaf(DC_PRED as u8, None)))
+    }
+
+    /// r413 — the direct [`SyntaxBlock`] children of an asymmetric
+    /// node (2 for HORZ/VERT, 3 for the T-shapes, 4 for HORZ_4 /
+    /// VERT_4); empty for [`SyntaxNode::Leaf`] / [`SyntaxNode::Split`].
+    #[must_use]
+    pub fn asymmetric_blocks(&self) -> &[Box<SyntaxBlock>] {
+        match self {
+            SyntaxNode::Leaf(_) | SyntaxNode::Split(_) => &[],
+            SyntaxNode::Horz(b) | SyntaxNode::Vert(b) => b,
+            SyntaxNode::HorzA(b)
+            | SyntaxNode::HorzB(b)
+            | SyntaxNode::VertA(b)
+            | SyntaxNode::VertB(b) => b,
+            SyntaxNode::Horz4(b) | SyntaxNode::Vert4(b) => b,
+        }
     }
 }
 
@@ -1287,6 +1324,27 @@ pub fn write_partition_tree_syntax(
             }
             PARTITION_VERT
         }
+        // r413 — the EXT-alphabet shapes: fully-in-frame nodes above
+        // BLOCK_8X8 only ([`write_partition`] additionally validates
+        // the per-size alphabet, e.g. no `*_4` at `BLOCK_128X128`).
+        SyntaxNode::HorzA(_)
+        | SyntaxNode::HorzB(_)
+        | SyntaxNode::VertA(_)
+        | SyntaxNode::VertB(_)
+        | SyntaxNode::Horz4(_)
+        | SyntaxNode::Vert4(_) => {
+            if b_size <= BLOCK_8X8 || !has_rows || !has_cols {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            match node {
+                SyntaxNode::HorzA(_) => PARTITION_HORZ_A,
+                SyntaxNode::HorzB(_) => PARTITION_HORZ_B,
+                SyntaxNode::VertA(_) => PARTITION_VERT_A,
+                SyntaxNode::VertB(_) => PARTITION_VERT_B,
+                SyntaxNode::Horz4(_) => PARTITION_HORZ_4,
+                _ => PARTITION_VERT_4,
+            }
+        }
     };
 
     let pctx = if b_size >= BLOCK_8X8 {
@@ -1335,6 +1393,134 @@ pub fn write_partition_tree_syntax(
                 sub_size,
                 params,
             )?;
+        }
+        // r413 — §5.11.4 T-shape / four-way dispatch, transcribed
+        // block-for-block (splitSize = Partition_Subsize[ SPLIT ]).
+        (SyntaxNode::HorzA(blocks), PARTITION_HORZ_A) => {
+            let split_size =
+                partition_subsize(PARTITION_SPLIT, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+            let [a, b, cbl] = blocks;
+            write_block_syntax(writer, cdfs, state, a, r, c, split_size, params)?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                b,
+                r,
+                c + half_block4x4,
+                split_size,
+                params,
+            )?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                cbl,
+                r + half_block4x4,
+                c,
+                sub_size,
+                params,
+            )?;
+        }
+        (SyntaxNode::HorzB(blocks), PARTITION_HORZ_B) => {
+            let split_size =
+                partition_subsize(PARTITION_SPLIT, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+            let [a, b, cbl] = blocks;
+            write_block_syntax(writer, cdfs, state, a, r, c, sub_size, params)?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                b,
+                r + half_block4x4,
+                c,
+                split_size,
+                params,
+            )?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                cbl,
+                r + half_block4x4,
+                c + half_block4x4,
+                split_size,
+                params,
+            )?;
+        }
+        (SyntaxNode::VertA(blocks), PARTITION_VERT_A) => {
+            let split_size =
+                partition_subsize(PARTITION_SPLIT, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+            let [a, b, cbl] = blocks;
+            write_block_syntax(writer, cdfs, state, a, r, c, split_size, params)?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                b,
+                r + half_block4x4,
+                c,
+                split_size,
+                params,
+            )?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                cbl,
+                r,
+                c + half_block4x4,
+                sub_size,
+                params,
+            )?;
+        }
+        (SyntaxNode::VertB(blocks), PARTITION_VERT_B) => {
+            let split_size =
+                partition_subsize(PARTITION_SPLIT, b_size).ok_or(Error::PartitionWalkOutOfRange)?;
+            let [a, b, cbl] = blocks;
+            write_block_syntax(writer, cdfs, state, a, r, c, sub_size, params)?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                b,
+                r,
+                c + half_block4x4,
+                split_size,
+                params,
+            )?;
+            write_block_syntax(
+                writer,
+                cdfs,
+                state,
+                cbl,
+                r + half_block4x4,
+                c + half_block4x4,
+                split_size,
+                params,
+            )?;
+        }
+        (SyntaxNode::Horz4(blocks), PARTITION_HORZ_4) => {
+            let quarter = half_block4x4 >> 1;
+            for (i, blk) in blocks.iter().enumerate() {
+                let rr = r + quarter * (i as u32);
+                // §5.11.4: the last strip is skipped when it starts
+                // outside the frame (never coded by the reader).
+                if i == 3 && rr >= state.mi_rows {
+                    break;
+                }
+                write_block_syntax(writer, cdfs, state, blk, rr, c, sub_size, params)?;
+            }
+        }
+        (SyntaxNode::Vert4(blocks), PARTITION_VERT_4) => {
+            let quarter = half_block4x4 >> 1;
+            for (i, blk) in blocks.iter().enumerate() {
+                let cc = c + quarter * (i as u32);
+                if i == 3 && cc >= state.mi_cols {
+                    break;
+                }
+                write_block_syntax(writer, cdfs, state, blk, r, cc, sub_size, params)?;
+            }
         }
         (SyntaxNode::Split(children), PARTITION_SPLIT) => {
             let [nw, ne, sw, se] = children;

@@ -1696,10 +1696,17 @@ pub(crate) fn tree_rate(node: &SyntaxNode) -> u64 {
     match node {
         SyntaxNode::Leaf(b) => leaf_rate(b),
         SyntaxNode::Split(children) => 4 + children.iter().map(|c| tree_rate(c)).sum::<u64>(),
-        // r412: rectangular partitions are P-frame-search territory —
-        // the KEY driver never builds them.
+        // r412/r413: asymmetric partitions are P-frame-search
+        // territory — the KEY driver never builds them.
         SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
             4 + blocks.iter().map(|b| leaf_rate(b)).sum::<u64>()
+        }
+        SyntaxNode::HorzA(blocks)
+        | SyntaxNode::HorzB(blocks)
+        | SyntaxNode::VertA(blocks)
+        | SyntaxNode::VertB(blocks) => 5 + blocks.iter().map(|b| leaf_rate(b)).sum::<u64>(),
+        SyntaxNode::Horz4(blocks) | SyntaxNode::Vert4(blocks) => {
+            5 + blocks.iter().map(|b| leaf_rate(b)).sum::<u64>()
         }
     }
 }

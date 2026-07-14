@@ -2144,8 +2144,21 @@ fn p_tree_rate(node: &SyntaxNode) -> u64 {
     match node {
         SyntaxNode::Leaf(b) => p_leaf_rate(b),
         SyntaxNode::Split(children) => 4 + children.iter().map(|c| p_tree_rate(c)).sum::<u64>(),
-        SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
-            4 + blocks.iter().map(|b| p_leaf_rate(b)).sum::<u64>()
+        SyntaxNode::Horz(_) | SyntaxNode::Vert(_) => {
+            4 + node
+                .asymmetric_blocks()
+                .iter()
+                .map(|b| p_leaf_rate(b))
+                .sum::<u64>()
+        }
+        // r413 — the EXT-alphabet shapes carry a slightly larger
+        // partition-symbol weight.
+        _ => {
+            5 + node
+                .asymmetric_blocks()
+                .iter()
+                .map(|b| p_leaf_rate(b))
+                .sum::<u64>()
         }
     }
 }
@@ -2253,35 +2266,118 @@ fn build_p_search_tree(
         score_leaf,
     );
 
-    // Candidates D/E: §5.11.4 PARTITION_HORZ / PARTITION_VERT — two
-    // rectangular INTER halves (`Partition_Subsize[ p ][ bSize ]`,
-    // BLOCK_16X8 and larger; intra halves stay the NONE-leaf's and
-    // SPLIT's territory). The halves are encoded in §5.11.4 dispatch
-    // order, so the second half's §7.10.2 scan and prediction see the
-    // first half's stamps exactly as the decoder will.
-    for part in [PARTITION_HORZ, PARTITION_VERT] {
-        let sub = match crate::cdf::partition_subsize(part, b_size) {
+    // Candidates D..K: every asymmetric §5.11.4 partition — r412
+    // PARTITION_HORZ / PARTITION_VERT (two rectangular INTER halves)
+    // plus the r413 EXT-alphabet shapes (HORZ_A / HORZ_B / VERT_A /
+    // VERT_B T-shapes with mixed splitSize/subSize leaves, and the
+    // HORZ_4 / VERT_4 four-strip shapes at BLOCK_16X16..=BLOCK_64X64).
+    // Sub-blocks are encoded in §5.11.4 dispatch order, so each later
+    // block's §7.10.2 scan and prediction see the earlier blocks'
+    // stamps exactly as the decoder will. Intra sub-blocks stay the
+    // NONE-leaf's and SPLIT's territory.
+    let quarter = half >> 1;
+    let split_sz = sub;
+    for part in [
+        PARTITION_HORZ,
+        PARTITION_VERT,
+        crate::cdf::PARTITION_HORZ_A,
+        crate::cdf::PARTITION_HORZ_B,
+        crate::cdf::PARTITION_VERT_A,
+        crate::cdf::PARTITION_VERT_B,
+        crate::cdf::PARTITION_HORZ_4,
+        crate::cdf::PARTITION_VERT_4,
+    ] {
+        let psub = match crate::cdf::partition_subsize(part, b_size) {
             Some(sz) => sz,
             None => continue,
         };
-        let (r1, c1) = if part == PARTITION_HORZ {
-            (r + half, c)
-        } else {
-            (r, c + half)
+        // r413 scope: sub-8 inter leaves (the §5.11.33 someUseIntra
+        // chroma stitch) stay out of the search — skip shapes whose
+        // sub-blocks drop below 8 samples on either axis (HORZ_4 /
+        // VERT_4 at BLOCK_16X16 produce 16x4 / 4x16 strips).
+        if crate::cdf::block_width(psub) < 8 || crate::cdf::block_height(psub) < 8 {
+            continue;
+        }
+        // §5.11.4 sub-block geometry per partition, in dispatch order.
+        let cells: Vec<(u32, u32, usize)> = match part {
+            PARTITION_HORZ => vec![(r, c, psub), (r + half, c, psub)],
+            PARTITION_VERT => vec![(r, c, psub), (r, c + half, psub)],
+            crate::cdf::PARTITION_HORZ_A => vec![
+                (r, c, split_sz),
+                (r, c + half, split_sz),
+                (r + half, c, psub),
+            ],
+            crate::cdf::PARTITION_HORZ_B => vec![
+                (r, c, psub),
+                (r + half, c, split_sz),
+                (r + half, c + half, split_sz),
+            ],
+            crate::cdf::PARTITION_VERT_A => vec![
+                (r, c, split_sz),
+                (r + half, c, split_sz),
+                (r, c + half, psub),
+            ],
+            crate::cdf::PARTITION_VERT_B => vec![
+                (r, c, psub),
+                (r, c + half, split_sz),
+                (r + half, c + half, split_sz),
+            ],
+            crate::cdf::PARTITION_HORZ_4 => (0..4u32).map(|i| (r + quarter * i, c, psub)).collect(),
+            _ => (0..4u32).map(|i| (r, c + quarter * i, psub)).collect(),
         };
-        let first = encode_inter_leaf(r, c, sub, input, recon, ictx)?;
-        ictx.stamp_leaf(&first, r, c, sub, recon.lossless);
-        let second = encode_inter_leaf(r1, c1, sub, input, recon, ictx)?;
-        ictx.stamp_leaf(&second, r1, c1, sub, recon.lossless);
+        let mut blocks: Vec<SyntaxBlock> = Vec::with_capacity(cells.len());
+        let mut rate = if cells.len() == 2 { 4 } else { 5 };
+        for &(rr, cc, sz) in &cells {
+            let blk = encode_inter_leaf(rr, cc, sz, input, recon, ictx)?;
+            ictx.stamp_leaf(&blk, rr, cc, sz, recon.lossless);
+            rate += p_leaf_rate(&blk);
+            blocks.push(blk);
+        }
         let d = region_distortion(recon, input, r, c, n4 as usize);
-        let rate = p_leaf_rate(&first) + p_leaf_rate(&second) + 4;
         let score = d + lambda * rate;
         if score < best_node.3 {
-            let blocks = [Box::new(first), Box::new(second)];
-            let node = if part == PARTITION_HORZ {
-                SyntaxNode::Horz(blocks)
-            } else {
-                SyntaxNode::Vert(blocks)
+            let bx = |b: SyntaxBlock| Box::new(b);
+            let node = match part {
+                PARTITION_HORZ | PARTITION_VERT => {
+                    let mut it = blocks.into_iter();
+                    let pair = [bx(it.next().unwrap()), bx(it.next().unwrap())];
+                    if part == PARTITION_HORZ {
+                        SyntaxNode::Horz(pair)
+                    } else {
+                        SyntaxNode::Vert(pair)
+                    }
+                }
+                crate::cdf::PARTITION_HORZ_A
+                | crate::cdf::PARTITION_HORZ_B
+                | crate::cdf::PARTITION_VERT_A
+                | crate::cdf::PARTITION_VERT_B => {
+                    let mut it = blocks.into_iter();
+                    let trio = [
+                        bx(it.next().unwrap()),
+                        bx(it.next().unwrap()),
+                        bx(it.next().unwrap()),
+                    ];
+                    match part {
+                        crate::cdf::PARTITION_HORZ_A => SyntaxNode::HorzA(trio),
+                        crate::cdf::PARTITION_HORZ_B => SyntaxNode::HorzB(trio),
+                        crate::cdf::PARTITION_VERT_A => SyntaxNode::VertA(trio),
+                        _ => SyntaxNode::VertB(trio),
+                    }
+                }
+                _ => {
+                    let mut it = blocks.into_iter();
+                    let four = [
+                        bx(it.next().unwrap()),
+                        bx(it.next().unwrap()),
+                        bx(it.next().unwrap()),
+                        bx(it.next().unwrap()),
+                    ];
+                    if part == crate::cdf::PARTITION_HORZ_4 {
+                        SyntaxNode::Horz4(four)
+                    } else {
+                        SyntaxNode::Vert4(four)
+                    }
+                }
             };
             best_node = (
                 node,
@@ -2372,7 +2468,8 @@ mod tests {
                     count_modes(ch, counts);
                 }
             }
-            SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+            other => {
+                let blocks = other.asymmetric_blocks();
                 for b in blocks.iter() {
                     if let Some(ib) = b.inter.as_ref() {
                         match ib.y_mode {
@@ -2554,7 +2651,8 @@ mod tests {
                         count_filters(ch, counts);
                     }
                 }
-                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                other => {
+                    let blocks = other.asymmetric_blocks();
                     for b in blocks.iter() {
                         if let Some(ib) = b.inter.as_ref() {
                             counts[usize::from(ib.interp_filter[0].min(2))] += 1;
@@ -2672,6 +2770,9 @@ mod tests {
                 }
                 SyntaxNode::Horz(_) => *horz += 1,
                 SyntaxNode::Vert(_) => *vert += 1,
+                // r413 — the EXT shapes count as neither HORZ nor VERT
+                // for this witness.
+                _ => {}
             }
         }
         let (mut horz, mut vert) = (0u32, 0u32);
@@ -2765,7 +2866,8 @@ mod tests {
                         count_refs(ch, golden, last);
                     }
                 }
-                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                other => {
+                    let blocks = other.asymmetric_blocks();
                     for b in blocks.iter() {
                         leafs(b, golden, last);
                     }
@@ -2871,7 +2973,8 @@ mod tests {
                         count_compound(ch, compound, single);
                     }
                 }
-                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                other => {
+                    let blocks = other.asymmetric_blocks();
                     for b in blocks.iter() {
                         leafc(b, compound, single);
                     }
@@ -2965,8 +3068,8 @@ mod tests {
                         count_skip_mode(ch, sm, other);
                     }
                 }
-                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
-                    for b in blocks.iter() {
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
                         leafc(b, sm, other);
                     }
                 }
@@ -3087,7 +3190,8 @@ mod tests {
                         collect_segments(ch, seen);
                     }
                 }
-                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                other => {
+                    let blocks = other.asymmetric_blocks();
                     for b in blocks.iter() {
                         seen[b.segment_id as usize] += 1;
                     }
@@ -3107,6 +3211,119 @@ mod tests {
         assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0]).is_err());
         assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0, -60]).is_err());
         assert!(encode_gop_yuv420_with_q_seg(&frames, 0, &[0, 10]).is_err());
+    }
+
+    /// r413 — tri-motion content shaped exactly like a §5.11.4
+    /// T-shape (one clean half + two clean quarters) must select an
+    /// EXT-alphabet partition over HORZ/VERT/SPLIT (3 sub-blocks beat
+    /// 4 at equal distortion), and the emitted stream must stay
+    /// byte-exact through the spec driver.
+    #[test]
+    fn r413_p_search_selects_t_shape_partitions() {
+        // Frame k: top 64x32 band shifts by (0, 2k); bottom-left
+        // 32x32 by (2k, 0); bottom-right 32x32 by (2k, 2k) — the
+        // HORZ_B geometry at BLOCK_64X64.
+        let gen = |k: usize| -> Yuv420Frame {
+            let mut f = Yuv420Frame::filled(64, 64, 0);
+            let tex = |i: usize, j: usize| ((i * 7 + j * 13 + (i / 8) * (j / 8)) % 256) as u8;
+            for i in 0..64usize {
+                for j in 0..64usize {
+                    let (si, sj) = if i < 32 {
+                        (i, j + 2 * k)
+                    } else if j < 32 {
+                        (i + 2 * k, j)
+                    } else {
+                        (i + 2 * k, j + 2 * k)
+                    };
+                    f.y[i * 64 + j] = tex(si, sj);
+                }
+            }
+            for v in f.u.iter_mut() {
+                *v = 110;
+            }
+            for v in f.v.iter_mut() {
+                *v = 150;
+            }
+            f
+        };
+        let frames: Vec<Yuv420Frame> = (0..3).map(gen).collect();
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(&frames[..1], base_q_idx).unwrap();
+        let key_recon = GopFrameRecon {
+            y: pre.recon[0].y.clone(),
+            u: pre.recon[0].u.clone(),
+            v: pre.recon[0].v.clone(),
+        };
+
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 1, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.order_hints = gop_order_hints(1, pre.seq.order_hint_bits);
+        let mut ictx = PSearchCtx::new(
+            &key_recon,
+            &key_recon,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree =
+            build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
+        fn count_ext(node: &SyntaxNode, ext: &mut u32) {
+            match node {
+                SyntaxNode::HorzA(_)
+                | SyntaxNode::HorzB(_)
+                | SyntaxNode::VertA(_)
+                | SyntaxNode::VertB(_)
+                | SyntaxNode::Horz4(_)
+                | SyntaxNode::Vert4(_) => *ext += 1,
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count_ext(ch, ext);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut ext = 0u32;
+        count_ext(&tree, &mut ext);
+        assert!(
+            ext > 0,
+            "tri-motion content must select an EXT-alphabet partition (tree: {tree:?})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
     }
 
     /// r412 — [`PSearchCtx::predict_leaf`] must thread the trial
