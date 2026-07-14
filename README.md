@@ -108,7 +108,7 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 50 streams byte-exact against
+grain. `tests/fixture_conformance.rs` pins 53 streams byte-exact against
 independent-decoder output (the 16-stream corpus staged under
 `docs/video/av1/fixtures/` plus 10 r394 validator-produced streams —
 QM intra/inter, dual-filter + OBMC, jnt-comp pyramids, cyclic-refresh
@@ -481,6 +481,39 @@ flash / blend content, 5 geometries, q 0-255) byte-exact in THREE
 independent reference decoders, and three more self-encoded streams
 pinned in the conformance corpus (50 total).
 
+### Inter encoder: order hints, skip mode, segmentation, EXT partitions, temporal MVs (r413)
+
+r413 works the r412 follow-up ladder further down. (1) **Order
+hints**: every encoded sequence header carries `enable_order_hint`
+(`OrderHintBits = 7`); the §5.9.2 error-resilient `ref_order_hint[]`
+block round-trips the TRUE per-slot stored hints through the new
+`FrameHeader::ref_order_hints`. (2) **Skip-mode P-frames**: the
+§5.9.22 `skip_mode_params()` write twin derives `skipModeAllowed`
+from real reference state (also fixing a latent phantom-bit desync in
+the pre-r413 writer), and every >= 8×8 inter leaf RD-trials the
+§5.11.10 `skip_mode = 1` pure-derivation block — ONE S() coding a
+compound NEAREST_NEARESTMV over `SkipModeFrame[]` with no residual
+(static content provably selects it). (3) **SEG_LVL_ALT_Q
+segmentation** (`encode_gop_yuv420_with_q_seg`): §5.9.14 feature
+tables per P-frame header, the §5.11.19/§5.11.20 spatial segment map
+with the bit-silent skip-leaf `pred` inheritance, and per-segment
+residual quantisation through a deterministic luma-activity policy.
+(4) **EXT-alphabet partitions**: `SyntaxNode` + write dispatch +
+RD trials for HORZ_A / HORZ_B / VERT_A / VERT_B T-shapes and
+HORZ_4 / VERT_4 four-strip shapes (tri-motion content provably
+selects a T-shape). (5) **`use_ref_frame_mvs = 1` P-frames**: the
+§7.9 motion-field estimation moves into a shared core
+(`inter_pred::motion_field_estimation_core`) the decode driver and
+the encoder's write mirror both run — the encoder keeps its own §7.20
+motion-field store (§7.19-filtered committed mirror grids per
+rotation slot) so the §7.10.2.5 temporal scan sees identical
+candidates at search, write and decode time; headers drop error
+resilience (coded `primary_ref_frame = PRIMARY_REF_NONE`). Validated
+per feature by selection-proving unit tests, a 230-config black-box
+sweep (5 geometries × 6 q × 7 contents + 20 segmentation configs)
+byte-exact in THREE independent reference decoders, and three more
+self-encoded streams pinned in the conformance corpus (53 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -492,12 +525,13 @@ pinned in the conformance corpus (50 total).
   streams (kept for their bit-exact self round-trip through
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv420` /
-  `encoder::encode_gop_yuv420{,_with_q}`. Conformant encoding beyond
-  the r412 scope (palette/intrabc leaves in inter frames, skip-mode
-  and segmentation-enabled P-frames, masked/jnt compound, the
-  HORZ_A/B/4 + VERT_A/B/4 T-shapes, sub-8×8 inter leaves, true
-  bit-accounting rate costs, order hints / B-pyramids /
-  `use_ref_frame_mvs`) is the follow-up ladder.
+  `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}`. Conformant
+  encoding beyond the r413 scope (palette/intrabc leaves in inter
+  frames, masked/jnt compound, sub-8×8 inter leaves — which also gate
+  HORZ_4/VERT_4 at BLOCK_16X16 — §5.11.19 temporal segment-map
+  update, backward references / B-pyramid GOPs on top of the r413
+  order-hint + motion-field groundwork, true bit-accounting rate
+  costs, per-segment lossless mixing) is the follow-up ladder.
 
 ## Module layout
 
