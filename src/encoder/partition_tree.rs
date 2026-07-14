@@ -825,6 +825,16 @@ pub struct SyntaxInterFrameParams {
     pub use_ref_frame_mvs: bool,
     /// §5.9.2 `is_motion_mode_switchable`.
     pub is_motion_mode_switchable: bool,
+    /// §5.9.14 `segmentation_update_map` (r413) — with
+    /// [`SyntaxFrameParams::segmentation_enabled`] set, `true` codes
+    /// the per-block §5.11.20 `read_segment_id()` S() (the
+    /// `PRIMARY_REF_NONE` configuration forces it to 1); `false`
+    /// adopts `predictedSegmentId` with no bits.
+    pub segmentation_update_map: bool,
+    /// §5.9.14 `segmentation_temporal_update` (r413) — MUST be
+    /// `false` on the current scope (the §5.11.19 `seg_id_predicted`
+    /// S() + `PrevSegmentIds` threading is a follow-up arc).
+    pub segmentation_temporal_update: bool,
     /// §5.9.2 `allow_warped_motion`.
     pub allow_warped_motion: bool,
     /// §5.11.27 `is_scaled( LAST_FRAME + i )` per reference.
@@ -870,6 +880,8 @@ impl SyntaxInterFrameParams {
             force_integer_mv,
             use_ref_frame_mvs: false,
             is_motion_mode_switchable: false,
+            segmentation_update_map: false,
+            segmentation_temporal_update: false,
             allow_warped_motion: false,
             is_scaled_per_ref: [false; 7],
             enable_interintra_compound: false,
@@ -1965,11 +1977,13 @@ pub fn write_block_syntax(
 ///    routes through the §5.11.36 `transform_tree` recursion) — or the
 ///    `skip == 1` `TxTypes[] = DCT_DCT` pre-stamp + §5.11.42 reset.
 ///
-/// ## r411 scope rejects (all [`Error::PartitionWalkOutOfRange`])
+/// ## Scope rejects (all [`Error::PartitionWalkOutOfRange`])
 ///
-/// * `params.segmentation_enabled` — the §5.11.19 predicted-segment-id
-///   threading (§5.11.21 `get_segment_id` over `PrevSegmentIds`) is a
-///   follow-up arc.
+/// * (r413) spatial segmentation (`segmentation_update_map == 1`,
+///   `segmentation_temporal_update == 0`) is SUPPORTED — the
+///   §5.11.19/§5.11.20 spatial arms ride the mirror's `SegmentIds[]`
+///   cascade; the temporal-update arm (`seg_id_predicted` S() over
+///   `PrevSegmentIds`) remains a follow-up reject.
 /// * (r413) `ip.skip_mode_present` is SUPPORTED: the §5.11.10
 ///   `skip_mode` S() rides the §8.3.2 neighbour ctx from the mirror's
 ///   `SkipModes[]` grid, and a `skip_mode == 1` leaf must commit the
@@ -2002,8 +2016,13 @@ fn write_block_syntax_inter_frame(
     if block.intrabc_mv.is_some() || params.allow_intrabc {
         return Err(Error::PartitionWalkOutOfRange);
     }
-    // r411 scope rejects (see the doc comment).
-    if params.segmentation_enabled {
+    // r413 scope reject: the §5.11.19 temporal-update arm
+    // (`seg_id_predicted` S() + `PrevSegmentIds`) is a follow-up arc;
+    // spatial segmentation (`segmentation_update_map == 1`,
+    // `segmentation_temporal_update == 0`) is fully threaded.
+    if params.segmentation_enabled
+        && (ip.segmentation_temporal_update || !ip.segmentation_update_map)
+    {
         return Err(Error::PartitionWalkOutOfRange);
     }
     // r413 — §5.11.10 skip-mode commitments. `skip_mode == 1` is a
@@ -2143,8 +2162,8 @@ fn write_block_syntax_inter_frame(
         /* seg_ref_frame_is_inter = */ false,
         /* seg_globalmv_active = */ false,
         params.segmentation_enabled,
-        /* segmentation_update_map = */ false,
-        /* segmentation_temporal_update = */ false,
+        ip.segmentation_update_map,
+        ip.segmentation_temporal_update,
         params.seg_id_pre_skip,
         /* predicted_segment_id = */ 0,
         params.last_active_seg_id,

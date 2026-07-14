@@ -297,7 +297,8 @@ pub use forward_transform_2d::forward_transform_2d;
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
 pub use frame_obu::write_frame_header_obu;
 pub use inter_frame::{
-    encode_gop_yuv420, encode_gop_yuv420_with_q, EncodedGop, GopFrameRecon, GOP_MAX_FRAMES,
+    encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_seg, EncodedGop,
+    GopFrameRecon, GOP_MAX_FRAMES,
 };
 pub use inter_predict::{
     encode_inter_block_residual_4x4, encode_inter_frame_y, encode_inter_frame_y_opt,

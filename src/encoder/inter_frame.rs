@@ -18,8 +18,11 @@
 //!   `(k - 1) & 1`; LAST reads the previous frame's slot, GOLDEN the
 //!   frame before it), identity §5.9.24 global motion, SWITCHABLE
 //!   frame filter (per-leaf §5.11.x `interp_filter` selection),
-//!   `force_integer_mv = 0` / `allow_high_precision_mv = 0`, no order
-//!   hints, no skip-mode, no segmentation; `TxMode = ONLY_4X4` on the
+//!   `force_integer_mv = 0` / `allow_high_precision_mv = 0`; r413
+//!   adds 7-bit order hints (true §5.9.2 `ref_order_hint[]`
+//!   surfacing), §5.9.22 skip-mode from `p_index = 2` on, and
+//!   optional §5.9.14 `SEG_LVL_ALT_Q` spatial segmentation
+//!   ([`encode_gop_yuv420_with_q_seg`]); `TxMode = ONLY_4X4` on the
 //!   `CodedLossless` arm (`base_q_idx == 0`) or `TX_MODE_SELECT`
 //!   otherwise.
 //! * Per-node RD search (leaf vs HORZ vs VERT vs split, `BLOCK_64X64`
@@ -145,8 +148,53 @@ pub fn encode_gop_yuv420_with_q(
     frames: &[Yuv420Frame],
     base_q_idx: u8,
 ) -> Result<EncodedGop, Error> {
+    encode_gop_yuv420_with_q_seg(frames, base_q_idx, &[])
+}
+
+/// r413 — GOP encode with §5.9.14 `SEG_LVL_ALT_Q` segmentation on the
+/// P-frames: `alt_q[ s ]` is segment `s`'s signed quantiser delta
+/// (`get_qindex( s ) = Clip3( 0, 255, base_q_idx + alt_q[ s ] )`).
+/// The encoder assigns segments per leaf by luma activity (flat
+/// blocks take the higher-index segments), codes the spatial
+/// §5.11.19/§5.11.20 segment map (skip leaves inherit the §5.11.20
+/// `pred` cascade with no bits, per spec), and quantises each leaf's
+/// residual at its segment's q-index. An empty `alt_q` disables
+/// segmentation (the pre-r413 configuration). The KEY frame stays
+/// unsegmented (its `segmentation_enabled = 0` header is unchanged;
+/// every P-frame header re-codes the full feature table under the
+/// `PRIMARY_REF_NONE` forced `update_data = 1`).
+///
+/// ## Errors
+///
+/// [`Error::PartitionWalkOutOfRange`] on the
+/// [`encode_gop_yuv420_with_q`] conditions, plus:
+///
+/// * `alt_q.len() > MAX_SEGMENTS = 8` or `alt_q.len() == 1`;
+/// * `alt_q[ 0 ] != 0` (intra leaves code segment 0 at the frame
+///   quantiser — the residual chain requires the identity delta);
+/// * any segment's `base_q_idx + alt_q[ s ]` outside `1..=255`
+///   (per-segment lossless mixing is a follow-up arc).
+pub fn encode_gop_yuv420_with_q_seg(
+    frames: &[Yuv420Frame],
+    base_q_idx: u8,
+    alt_q: &[i16],
+) -> Result<EncodedGop, Error> {
     if frames.is_empty() || frames.len() > GOP_MAX_FRAMES {
         return Err(Error::PartitionWalkOutOfRange);
+    }
+    if !alt_q.is_empty() {
+        if alt_q.len() == 1
+            || alt_q.len() > crate::uncompressed_header_tail::MAX_SEGMENTS
+            || alt_q[0] != 0
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
+        for &d in alt_q {
+            let q = i32::from(base_q_idx) + i32::from(d);
+            if !(1..=255).contains(&q) {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+        }
     }
     let (width, height) = (frames[0].width, frames[0].height);
     if frames
@@ -171,7 +219,8 @@ pub fn encode_gop_yuv420_with_q(
         let p_index = (k + 1) as u32;
         let prev = recon.last().expect("at least the KEY recon");
         let prevprev = &recon[recon.len().saturating_sub(2)];
-        let (tu, rc) = encode_p_frame_yuv420(input, prev, prevprev, &seq, base_q_idx, p_index)?;
+        let (tu, rc) =
+            encode_p_frame_yuv420(input, prev, prevprev, &seq, base_q_idx, p_index, alt_q)?;
         temporal_units.push(tu);
         recon.push(rc);
     }
@@ -244,6 +293,7 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     height: u32,
     base_q_idx: u8,
     p_index: u32,
+    alt_q: &[i16],
 ) -> FrameHeader {
     let mut fh = build_intra_only_yuv420_8bit_fh_with_q(seq, width, height, base_q_idx);
     fh.frame_type = FrameType::Inter;
@@ -303,6 +353,27 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
         is_motion_mode_switchable: false,
         use_ref_frame_mvs: false,
     });
+    // r413: §5.9.14 SEG_LVL_ALT_Q segmentation — `PRIMARY_REF_NONE`
+    // forces `update_map = 1`, `temporal_update = 0`,
+    // `update_data = 1` (no bits for the three flags); the feature
+    // table codes one active ALT_Q slot per segment (`su(1+8)` each).
+    // `SegIdPreSkip = 0` (no feature at `j >= SEG_LVL_REF_FRAME`);
+    // `LastActiveSegId = alt_q.len() - 1`.
+    if !alt_q.is_empty() {
+        use crate::uncompressed_header_tail::{SegmentationParams, SEG_LVL_ALT_Q};
+        let mut sp = SegmentationParams::disabled();
+        sp.enabled = true;
+        sp.update_map = true;
+        sp.temporal_update = false;
+        sp.update_data = true;
+        for (seg, &d) in alt_q.iter().enumerate() {
+            sp.segment_feature_active[seg][SEG_LVL_ALT_Q] = true;
+            sp.segment_feature_data[seg][SEG_LVL_ALT_Q] = d;
+        }
+        sp.seg_id_pre_skip = false;
+        sp.last_active_seg_id = (alt_q.len() - 1) as u8;
+        fh.segmentation_params = Some(sp);
+    }
     fh
 }
 
@@ -311,6 +382,7 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
 /// GOLDEN_FRAME — the KEY recon again for the first two P-frames).
 /// Returns the §7.5 temporal unit (TD + `OBU_FRAME`) and this frame's
 /// reconstruction.
+#[allow(clippy::too_many_arguments)]
 fn encode_p_frame_yuv420(
     input: &Yuv420Frame,
     prev: &GopFrameRecon,
@@ -318,6 +390,7 @@ fn encode_p_frame_yuv420(
     seq: &SequenceHeader,
     base_q_idx: u8,
     p_index: u32,
+    alt_q: &[i16],
 ) -> Result<(Vec<u8>, GopFrameRecon), Error> {
     if input.width < 8
         || input.height < 8
@@ -341,15 +414,30 @@ fn encode_p_frame_yuv420(
         }
     }
 
-    let fh =
-        build_p_frame_yuv420_8bit_fh_with_q(seq, input.width, input.height, base_q_idx, p_index);
+    let fh = build_p_frame_yuv420_8bit_fh_with_q(
+        seq,
+        input.width,
+        input.height,
+        base_q_idx,
+        p_index,
+        alt_q,
+    );
     let fs = fh
         .frame_size
         .as_ref()
         .ok_or(Error::PartitionWalkOutOfRange)?;
     let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
     let lossless = base_q_idx == 0;
-    let qp = QuantizerParams::neutral(base_q_idx, 8);
+    let mut qp = QuantizerParams::neutral(base_q_idx, 8);
+    if !alt_q.is_empty() {
+        // §7.12.2 get_qindex inputs — the write-side §5.11.47 guard
+        // and the §5.11.39 quantiser chain both key off these.
+        qp.segmentation_enabled = true;
+        for (seg, &d) in alt_q.iter().enumerate() {
+            qp.seg_alt_q_active[seg] = true;
+            qp.seg_alt_q_data[seg] = d;
+        }
+    }
 
     // ONE §5.9 inter-frame parameter bundle shared verbatim by the
     // driver-side §7.10.2 mirror and the write pass — the two
@@ -379,15 +467,21 @@ fn encode_p_frame_yuv420(
         ip.skip_mode_present = last_hint != golden_hint;
         ip.skip_mode_frame = [1, 4];
     }
+    // r413: spatial segmentation (PRIMARY_REF_NONE forces the map
+    // update; the temporal arm stays out of scope).
+    if !alt_q.is_empty() {
+        ip.segmentation_update_map = true;
+        ip.segmentation_temporal_update = false;
+    }
 
     let params = SyntaxFrameParams {
         subsampling_x: 1,
         subsampling_y: 1,
         num_planes: 3,
         seg_id_pre_skip: false,
-        segmentation_enabled: false,
+        segmentation_enabled: !alt_q.is_empty(),
         seg_skip_active: false,
-        last_active_seg_id: 0,
+        last_active_seg_id: alt_q.len().saturating_sub(1) as u8,
         lossless_array: [lossless; crate::uncompressed_header_tail::MAX_SEGMENTS],
         coded_lossless: lossless,
         enable_cdef: seq.enable_cdef,
@@ -423,7 +517,9 @@ fn encode_p_frame_yuv420(
         qp,
         bd: BlockDecodedMirror::new(),
     };
-    let mut ictx = PSearchCtx::new(prev, prevprev, mi_rows, mi_cols, width, height, ip, p_index)?;
+    let mut ictx = PSearchCtx::new(
+        prev, prevprev, mi_rows, mi_cols, width, height, ip, p_index, base_q_idx, alt_q,
+    )?;
 
     let mut writer = SymbolWriter::new(fh.disable_cdf_update);
     let mut cdfs = TileCdfContext::new_from_defaults();
@@ -571,6 +667,13 @@ struct PSearchCtx {
     hint_bits: u32,
     current_hint: i32,
     no_scaled: [bool; 8],
+    /// r413 — §5.9.14 SEG_LVL_ALT_Q deltas per segment (empty =
+    /// segmentation disabled). Drives the per-leaf segment policy,
+    /// the per-segment residual quantiser, and the §5.11.20 `pred`
+    /// inheritance on skip leaves.
+    seg_alt_q: Vec<i16>,
+    /// §5.9.12 `base_q_idx` (the segment-0 quantiser).
+    base_q_idx: u8,
     /// r412 — driver-side write-mirror twin for §7.10.2 MV prediction
     /// (see the struct docs).
     mirror: PartitionWalker,
@@ -590,6 +693,8 @@ impl PSearchCtx {
         height: usize,
         ip: SyntaxInterFrameParams,
         p_index: u32,
+        base_q_idx: u8,
+        seg_alt_q: &[i16],
     ) -> Result<Self, Error> {
         let cells = (mi_rows as usize) * (mi_cols as usize);
         let widen = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
@@ -653,10 +758,100 @@ impl PSearchCtx {
             },
             hint_bits: ip.order_hints.order_hint_bits,
             current_hint: ip.order_hints.current_order_hint,
+            seg_alt_q: seg_alt_q.to_vec(),
+            base_q_idx,
             no_scaled: [false; 8],
             mirror,
             ip,
         })
+    }
+
+    /// r413 — per-leaf segment policy: map the input block's luma
+    /// mean-absolute-deviation to a segment index (flat blocks take
+    /// segment 0, increasingly textured blocks the higher segments).
+    /// Any deterministic rule is conformant — the map is simply what
+    /// the encoder codes; this one makes every segment reachable on
+    /// textured content.
+    fn segment_for_block(
+        &self,
+        input: &Yuv420Frame,
+        mi_row: u32,
+        mi_col: u32,
+        b_size: usize,
+    ) -> u8 {
+        if self.seg_alt_q.is_empty() {
+            return 0;
+        }
+        let (bw, bh) = (
+            NUM_4X4_BLOCKS_WIDE[b_size] * 4,
+            NUM_4X4_BLOCKS_HIGH[b_size] * 4,
+        );
+        let (row0, col0) = ((mi_row as usize) * 4, (mi_col as usize) * 4);
+        let w = input.width as usize;
+        let mut sum = 0u64;
+        for i in 0..bh {
+            for j in 0..bw {
+                sum += u64::from(input.y[(row0 + i) * w + (col0 + j)]);
+            }
+        }
+        let n = (bw * bh) as u64;
+        let mean = sum / n;
+        let mut mad = 0u64;
+        for i in 0..bh {
+            for j in 0..bw {
+                let v = u64::from(input.y[(row0 + i) * w + (col0 + j)]);
+                mad += v.abs_diff(mean);
+            }
+        }
+        let act = mad / n;
+        let top = (self.seg_alt_q.len() - 1) as u64;
+        (act / 6).min(top) as u8
+    }
+
+    /// r413 — the quantiser bundle for one segment: §7.12.2
+    /// `get_qindex( seg ) = Clip3( 0, 255, base_q_idx + alt_q[ seg ] )`
+    /// with the frame's zero per-plane deltas (the encode-side
+    /// residual chain quantises at exactly the q-index the §5.11.39
+    /// reader will dequantise with).
+    fn seg_qp(&self, frame_qp: &QuantizerParams, segment_id: u8) -> QuantizerParams {
+        if self.seg_alt_q.is_empty() || segment_id == 0 {
+            return *frame_qp;
+        }
+        let q = (i32::from(self.base_q_idx) + i32::from(self.seg_alt_q[segment_id as usize]))
+            .clamp(0, 255) as u8;
+        QuantizerParams::neutral(q, 8)
+    }
+
+    /// r413 — the §5.11.20 `pred` cascade over the mirror's
+    /// `SegmentIds[]` (the value a `skip == 1` leaf inherits with no
+    /// bits; must be derived at SEARCH time from exactly the state
+    /// the write pass will hold).
+    fn segment_pred(&self, mi_row: u32, mi_col: u32) -> u8 {
+        let at = |r: i64, c: i64| -> i32 {
+            if r < 0 || c < 0 || r >= i64::from(self.mi_rows) || c >= i64::from(self.mi_cols) {
+                return -1;
+            }
+            self.mirror.segment_ids()[(r as u32 * self.mi_cols + c as u32) as usize]
+        };
+        let (r, c) = (i64::from(mi_row), i64::from(mi_col));
+        let prev_ul = if r > 0 && c > 0 { at(r - 1, c - 1) } else { -1 };
+        let prev_u = if r > 0 { at(r - 1, c) } else { -1 };
+        let prev_l = if c > 0 { at(r, c - 1) } else { -1 };
+        #[allow(clippy::if_same_then_else)]
+        let pred: i32 = if prev_u == -1 {
+            if prev_l == -1 {
+                0
+            } else {
+                prev_l
+            }
+        } else if prev_l == -1 {
+            prev_u
+        } else if prev_ul == prev_u {
+            prev_u
+        } else {
+            prev_l
+        };
+        pred as u8
     }
 
     /// §7.10.2 `find_mv_stack( 0 )` against the driver mirror for the
@@ -1165,6 +1360,8 @@ fn encode_inter_leaf(
     tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
 
     let mut sm_leaf = SyntaxBlock::skip_leaf(0, None);
+    // §5.11.19/§5.11.20: skip leaves inherit the segment pred cascade.
+    sm_leaf.segment_id = ictx.segment_pred(mi_r, mi_c);
     sm_leaf.inter = Some(SyntaxInterBlock {
         ref_frame: sm_ref,
         y_mode: MODE_NEAREST_NEARESTMV,
@@ -1476,10 +1673,18 @@ fn encode_inter_leaf_modes(
     };
     ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, filter)?;
 
+    // r413 — per-leaf segment (deterministic activity policy) and its
+    // quantiser; a leaf that quantises to all-zero commits `skip = 1`
+    // and inherits the §5.11.20 `pred` instead (inside
+    // `encode_inter_leaf_residual`).
+    let segment_id = ictx.segment_for_block(input, mi_r, mi_c, b_size);
+    let seg_qp = ictx.seg_qp(&recon.qp, segment_id);
+
     if lossless {
         // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
         return encode_inter_leaf_residual(
             mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter, 0,
+            segment_id, &seg_qp,
         );
     }
 
@@ -1498,7 +1703,7 @@ fn encode_inter_leaf_modes(
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
             mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
-            depth,
+            depth, segment_id, &seg_qp,
         )?;
         let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
@@ -1679,6 +1884,8 @@ fn encode_inter_leaf_residual(
     ref_mv_idx: u32,
     filter: u8,
     depth: u32,
+    segment_id: u8,
+    seg_qp: &QuantizerParams,
 ) -> Result<SyntaxBlock, Error> {
     let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
     let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
@@ -1687,7 +1894,7 @@ fn encode_inter_leaf_residual(
     let col0 = (mi_c as usize) * 4;
     let width = recon.width;
     let lossless = recon.lossless;
-    let qp = recon.qp;
+    let qp = *seg_qp;
 
     // --- Luma residual over the §5.11.36 TU walk. ---
     let luma_tx = if lossless {
@@ -1860,6 +2067,14 @@ fn encode_inter_leaf_residual(
 
     let mut block = SyntaxBlock::skip_leaf(0, None);
     block.skip = skip;
+    // r413 — §5.11.19/§5.11.20: a `skip == 1` leaf's segment_id is the
+    // bit-silent `pred` cascade; a coded leaf commits the segment its
+    // residual was quantised at.
+    block.segment_id = if skip == 1 {
+        ictx.segment_pred(mi_r, mi_c)
+    } else {
+        segment_id
+    };
     block.residual_quant = residual_quant;
     block.residual_tx_type = luma_tx_types;
     if !lossless && skip == 0 {
@@ -2000,7 +2215,13 @@ fn build_p_search_tree(
     // Candidate B: one INTRA leaf (§5.11.22 arm) with the KEY
     // driver's §5.11.15 tx_depth RD search (TX_MODE_SELECT on the
     // lossy arm; the lossless arm stays on the TX_4X4 grid).
-    let intra_leaf = encode_leaf_sq(r, c, b_size, input, recon);
+    let mut intra_leaf = encode_leaf_sq(r, c, b_size, input, recon);
+    // r413 — segmentation: a skip intra leaf inherits the §5.11.20
+    // `pred` (bit-silent); a coded intra leaf keeps segment 0 (its
+    // residual ran at the frame quantiser — `alt_q[ 0 ] == 0`).
+    if !ictx.seg_alt_q.is_empty() && intra_leaf.skip == 1 {
+        intra_leaf.segment_id = ictx.segment_pred(r, c);
+    }
     ictx.stamp_leaf(&intra_leaf, r, c, b_size, recon.lossless);
     let d_intra = region_distortion(recon, input, r, c, n4 as usize);
     let r_intra = p_leaf_rate(&intra_leaf);
@@ -2186,7 +2407,7 @@ mod tests {
             u: key.recon_u,
             v: key.recon_v,
         };
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let qp = QuantizerParams::neutral(base_q_idx, 8);
@@ -2205,8 +2426,19 @@ mod tests {
             bd: BlockDecodedMirror::new(),
         };
         let ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
-        let mut ictx =
-            PSearchCtx::new(&reference, &reference, mi_rows, mi_cols, 64, 64, ip, 1).unwrap();
+        let mut ictx = PSearchCtx::new(
+            &reference,
+            &reference,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            0,
+            &[],
+        )
+        .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         let mut counts = [0u32; 4];
@@ -2253,7 +2485,8 @@ mod tests {
         let mut f1 = Yuv420Frame::filled(64, 64, 0);
         {
             let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
-            let mut probe = PSearchCtx::new(&reference, &reference, 16, 16, 64, 64, ip, 1).unwrap();
+            let mut probe =
+                PSearchCtx::new(&reference, &reference, 16, 16, 64, 64, ip, 1, 0, &[]).unwrap();
             probe
                 .predict_leaf(
                     0,
@@ -2275,7 +2508,7 @@ mod tests {
                 *dst = src as u8;
             }
         }
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
@@ -2294,8 +2527,19 @@ mod tests {
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
-        let mut ictx =
-            PSearchCtx::new(&reference, &reference, mi_rows, mi_cols, 64, 64, ip, 1).unwrap();
+        let mut ictx = PSearchCtx::new(
+            &reference,
+            &reference,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            0,
+            &[],
+        )
+        .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f1, &mut recon, &mut ictx).unwrap();
         fn count_filters(node: &SyntaxNode, counts: &mut [u32; 3]) {
@@ -2383,7 +2627,7 @@ mod tests {
             u: key.recon_u.clone(),
             v: key.recon_v.clone(),
         };
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&key.seq, 64, 64, base_q_idx, 1, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
@@ -2402,8 +2646,19 @@ mod tests {
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
-        let mut ictx =
-            PSearchCtx::new(&reference, &reference, mi_rows, mi_cols, 64, 64, ip, 1).unwrap();
+        let mut ictx = PSearchCtx::new(
+            &reference,
+            &reference,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            0,
+            &[],
+        )
+        .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
             build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
@@ -2469,7 +2724,7 @@ mod tests {
         let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
         let prev = enc.recon[1].clone();
         let prevprev = enc.recon[0].clone();
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&enc.seq, 64, 64, base_q_idx, 2);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&enc.seq, 64, 64, base_q_idx, 2, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
@@ -2488,7 +2743,8 @@ mod tests {
         };
         let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
         ip.interpolation_filter = SWITCHABLE;
-        let mut ictx = PSearchCtx::new(&prev, &prevprev, mi_rows, mi_cols, 64, 64, ip, 2).unwrap();
+        let mut ictx =
+            PSearchCtx::new(&prev, &prevprev, mi_rows, mi_cols, 64, 64, ip, 2, 0, &[]).unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
         let tree =
             build_p_search_tree(0, 0, BLOCK_64X64, &frames[2], &mut recon, &mut ictx).unwrap();
@@ -2563,7 +2819,7 @@ mod tests {
 
         // Drive the P2 search directly (prev = f1 recon in LAST,
         // prevprev = KEY recon in GOLDEN).
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 2);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 2, &[]);
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
         let mut recon = ReconState {
@@ -2592,6 +2848,8 @@ mod tests {
             64,
             ip,
             2,
+            base_q_idx,
+            &[],
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
@@ -2653,7 +2911,7 @@ mod tests {
 
         // Drive the P3 search directly (LAST = P2 recon, GOLDEN = P1
         // recon; `p_index = 3` ⇒ skip_mode_present per §5.9.22).
-        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 3);
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 3, &[]);
         assert_eq!(fh.skip_mode_present, Some(true), "P3 header presence");
         let fs = fh.frame_size.as_ref().unwrap();
         let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
@@ -2686,6 +2944,8 @@ mod tests {
             64,
             ip,
             3,
+            base_q_idx,
+            &[],
         )
         .unwrap();
         recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
@@ -2731,6 +2991,124 @@ mod tests {
         }
     }
 
+    /// r413 — SEG_LVL_ALT_Q P-frames: the activity policy must code
+    /// MULTIPLE segments on mixed flat/textured content, coded leaves
+    /// must quantise at their segment's q-index (byte-exact spec-driver
+    /// decode proves the whole chain), and invalid configurations are
+    /// rejected.
+    #[test]
+    fn r413_segmentation_alt_q_gop_round_trips() {
+        // Mixed content: flat left half, textured right half — the
+        // MAD policy assigns different segments per leaf.
+        let mut frames: Vec<Yuv420Frame> = Vec::new();
+        for k in 0..3u32 {
+            let mut f = Yuv420Frame::filled(64, 64, 100);
+            for i in 0..64usize {
+                for j in 32..64usize {
+                    f.y[i * 64 + j] = ((i * 17 + j * 31 + (k as usize) * 5) % 256) as u8;
+                }
+            }
+            for v in f.u.iter_mut() {
+                *v = 90;
+            }
+            for v in f.v.iter_mut() {
+                *v = 160;
+            }
+            frames.push(f);
+        }
+        let base_q_idx = 60u8;
+        let alt_q: [i16; 3] = [0, 24, 48];
+
+        let enc = encode_gop_yuv420_with_q_seg(&frames, base_q_idx, &alt_q).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+
+        // Segment-diversity witness: drive the P1 search directly and
+        // count distinct committed segment ids.
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&enc.seq, 64, 64, base_q_idx, 1, &alt_q);
+        let sp = fh.segmentation_params.as_ref().unwrap();
+        assert!(sp.enabled && sp.update_map && !sp.temporal_update && sp.update_data);
+        assert_eq!(sp.last_active_seg_id, 2);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp: {
+                let mut q = QuantizerParams::neutral(base_q_idx, 8);
+                q.segmentation_enabled = true;
+                for (seg, &d) in alt_q.iter().enumerate() {
+                    q.seg_alt_q_active[seg] = true;
+                    q.seg_alt_q_data[seg] = d;
+                }
+                q
+            },
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.order_hints = gop_order_hints(1, enc.seq.order_hint_bits);
+        ip.segmentation_update_map = true;
+        let mut ictx = PSearchCtx::new(
+            &enc.recon[0],
+            &enc.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            base_q_idx,
+            &alt_q,
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree =
+            build_p_search_tree(0, 0, BLOCK_64X64, &frames[1], &mut recon, &mut ictx).unwrap();
+        fn collect_segments(node: &SyntaxNode, seen: &mut [u32; 8]) {
+            match node {
+                SyntaxNode::Leaf(b) => seen[b.segment_id as usize] += 1,
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        collect_segments(ch, seen);
+                    }
+                }
+                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                    for b in blocks.iter() {
+                        seen[b.segment_id as usize] += 1;
+                    }
+                }
+            }
+        }
+        let mut seen = [0u32; 8];
+        collect_segments(&tree, &mut seen);
+        let distinct = seen.iter().filter(|&&n| n > 0).count();
+        assert!(
+            distinct >= 2,
+            "mixed content must code multiple segments (histogram: {seen:?})"
+        );
+
+        // Invalid configurations reject.
+        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[1, 2]).is_err());
+        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0]).is_err());
+        assert!(encode_gop_yuv420_with_q_seg(&frames, 60, &[0, -60]).is_err());
+        assert!(encode_gop_yuv420_with_q_seg(&frames, 0, &[0, 10]).is_err());
+    }
+
     /// r412 — [`PSearchCtx::predict_leaf`] must thread the trial
     /// filter into the §7.11.3.4 kernel: an isolated impulse column
     /// interpolated at a half-pel phase produces distinct samples per
@@ -2749,7 +3127,7 @@ mod tests {
             }
         }
         let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
-        let mut ictx = PSearchCtx::new(&refr, &refr, 16, 16, 64, 64, ip, 1).unwrap();
+        let mut ictx = PSearchCtx::new(&refr, &refr, 16, 16, 64, 64, ip, 1, 0, &[]).unwrap();
         let mut outs = Vec::new();
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
             ictx.predict_leaf(2, 2, BLOCK_8X8, [1, -1], MODE_NEWMV, [[0, 4], [0, 0]], f)
