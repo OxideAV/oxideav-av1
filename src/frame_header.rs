@@ -522,6 +522,15 @@ pub struct FrameHeader {
     /// `(KEY_FRAME && show_frame)`; `0` when show-existing-frame
     /// replays a non-KEY frame; otherwise read.
     pub refresh_frame_flags: u8,
+    /// §5.9.2 `ref_order_hint[ i ]` block (r413) — `Some` exactly when
+    /// the `( !FrameIsIntra || refresh_frame_flags != allFrames ) &&
+    /// error_resilient_mode && enable_order_hint` gate fires and
+    /// `NUM_REF_FRAMES` order hints of `OrderHintBits` each are coded.
+    /// Conformance requires each value to equal the decoder's stored
+    /// `RefOrderHint[ i ]` (a mismatch invalidates the slot), so the
+    /// encode side must surface the true per-slot hints — zeros would
+    /// desynchronise an independent decoder's reference state.
+    pub ref_order_hints: Option<[u32; NUM_REF_FRAMES as usize]>,
     /// `frame_size()` (§5.9.5) + `render_size()` (§5.9.6) +
     /// `superres_params()` (§5.9.8) + `compute_image_size()`
     /// (§5.9.9) result.
@@ -881,6 +890,7 @@ fn parse_with(
             order_hint: 0,
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: ALL_FRAMES,
+            ref_order_hints: None,
             frame_size: Some(frame_size),
             allow_intrabc,
             disable_frame_end_update_cdf,
@@ -948,6 +958,7 @@ fn parse_with(
             order_hint: 0,
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: if shown_is_key { ALL_FRAMES } else { 0 },
+            ref_order_hints: None,
             frame_size: None,
             allow_intrabc: false,
             disable_frame_end_update_cdf: false,
@@ -1070,13 +1081,16 @@ fn parse_with(
     // (§7.8 `set_frame_refs()` keys off `RefOrderHint[]`, not
     // `RefValid[]`), so we read the bits and leave the session's
     // `ref_info` untouched here.
+    let mut ref_order_hints: Option<[u32; NUM_REF_FRAMES as usize]> = None;
     if (!frame_is_intra || refresh_frame_flags != ALL_FRAMES)
         && error_resilient_mode
         && seq.enable_order_hint
     {
-        for _ in 0..NUM_REF_FRAMES as usize {
-            let _ref_order_hint = br.f(u32::from(seq.order_hint_bits))?;
+        let mut hints = [0u32; NUM_REF_FRAMES as usize];
+        for hint in hints.iter_mut() {
+            *hint = br.f(u32::from(seq.order_hint_bits))? as u32;
         }
+        ref_order_hints = Some(hints);
     }
 
     // §5.9.2: the size block. For intra frames we always go through
@@ -1477,6 +1491,7 @@ fn parse_with(
         order_hint,
         primary_ref_frame,
         refresh_frame_flags,
+        ref_order_hints,
         frame_size,
         allow_intrabc,
         disable_frame_end_update_cdf,

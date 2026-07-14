@@ -247,6 +247,13 @@ pub struct EncodedFrameDyn {
 /// [`crate::encoder::sequence_obu`] tests (the same conformant minimal
 /// shape the parser round-trips byte-for-byte) but with the requested
 /// `max_frame_*` derived from the caller's dimensions.
+/// §5.5.1 `OrderHintBits` every encoder-built sequence header carries
+/// (r413): `order_hint_bits_minus_1 = 6`. Seven bits give a modulus of
+/// 128 — [`crate::encoder::inter_frame::GOP_MAX_FRAMES`] = 64 output
+/// hints per GOP never wrap, so §7.4 `get_relative_dist` orders every
+/// in-GOP pair correctly.
+pub const ENCODER_ORDER_HINT_BITS: u8 = 7;
+
 #[must_use]
 pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> SequenceHeader {
     debug_assert!((1..=0xFFFF).contains(&max_width));
@@ -301,12 +308,17 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         enable_masked_compound: false,
         enable_warped_motion: false,
         enable_dual_filter: false,
-        enable_order_hint: false,
+        // r413: §5.5.1 order hints ride every stream this builder
+        // seeds (KEY-only and GOP alike) — the §5.9.22
+        // `skip_mode_params()` derivation and the §7.9 motion-field
+        // groundwork both key off `OrderHintBits > 0`. Intra-only
+        // frames simply carry `order_hint = 0`.
+        enable_order_hint: true,
         enable_jnt_comp: false,
         enable_ref_frame_mvs: false,
         seq_force_screen_content_tools: SELECT_SCREEN_CONTENT_TOOLS,
         seq_force_integer_mv: SELECT_INTEGER_MV,
-        order_hint_bits: 0,
+        order_hint_bits: ENCODER_ORDER_HINT_BITS,
         enable_superres: false,
         enable_cdef: false,
         enable_restoration: false,
@@ -418,6 +430,7 @@ pub fn build_intra_only_yuv420_8bit_fh_with_q(
         order_hint: 0,
         primary_ref_frame: PRIMARY_REF_NONE,
         refresh_frame_flags: ALL_FRAMES_PUB,
+        ref_order_hints: None,
         frame_size: Some(fs),
         allow_intrabc: false,
         disable_frame_end_update_cdf: false,

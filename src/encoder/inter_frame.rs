@@ -210,6 +210,34 @@ pub fn encode_gop_yuv420_with_q(
 /// read (§7.20 updates the store AFTER decoding; for `k <= 2` both
 /// slots reach back to the KEY frame, which every slot holds after
 /// the KEY's `allFrames` refresh).
+/// Output order hints of the two rotated references at P-frame
+/// `p_index = k` (1-based): LAST holds frame `k - 1`, GOLDEN frame
+/// `k - 2`, clamped at the KEY frame (hint 0).
+fn gop_ref_hints(p_index: u32) -> (u32, u32) {
+    (p_index - 1, p_index.saturating_sub(2))
+}
+
+/// §5.9.2-derived [`FrameInterOrderHints`] for P-frame `p_index` —
+/// `OrderHints[ ref ]` per raw `RefFrame` value (`LAST_FRAME..=
+/// ALTREF_FRAME` read the LAST slot except `GOLDEN_FRAME`).
+fn gop_order_hints(p_index: u32, order_hint_bits: u8) -> crate::cdf::FrameInterOrderHints {
+    let (last_hint, golden_hint) = gop_ref_hints(p_index);
+    let mut by_ref = [0i32; crate::uncompressed_header_tail::ALTREF_FRAME + 1];
+    for (r, hint) in by_ref.iter_mut().enumerate().skip(1) {
+        // GOLDEN_FRAME = 4; every other reference maps to the LAST slot.
+        *hint = if r == 4 {
+            golden_hint as i32
+        } else {
+            last_hint as i32
+        };
+    }
+    crate::cdf::FrameInterOrderHints {
+        order_hint_bits: u32::from(order_hint_bits),
+        current_order_hint: p_index as i32,
+        order_hints_by_ref: by_ref,
+    }
+}
+
 fn build_p_frame_yuv420_8bit_fh_with_q(
     seq: &SequenceHeader,
     width: u32,
@@ -227,6 +255,20 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     fh.force_integer_mv = false;
     fh.primary_ref_frame = PRIMARY_REF_NONE;
     fh.refresh_frame_flags = 1 << ((p_index - 1) & 1);
+    // r413: §5.9.2 `order_hint` — the GOP output order (KEY = 0, this
+    // P-frame = `p_index`), `< GOP_MAX_FRAMES = 64` so the 7-bit
+    // modulus never wraps in-GOP.
+    fh.order_hint = p_index & ((1 << u32::from(seq.order_hint_bits)) - 1);
+    // r413: §5.9.2 `ref_order_hint[ i ]` (the error-resilient block
+    // fires on every P-frame) — the true stored hints under the
+    // two-slot rotation: `last_slot` holds frame `k - 1`, `golden_slot`
+    // frame `k - 2` (KEY for `k <= 2`), every other slot still the KEY
+    // frame (hint 0) from its `allFrames` refresh.
+    let (last_hint, golden_hint) = gop_ref_hints(p_index);
+    let mut hints = [0u32; 8];
+    hints[(p_index & 1) as usize] = last_hint;
+    hints[((p_index - 1) & 1) as usize] = golden_hint;
+    fh.ref_order_hints = Some(hints);
     // §5.9.21: ONLY_4X4 rides the CodedLossless arm; the lossy arm
     // codes TX_MODE_SELECT — intra leaves carry the §5.11.15
     // `tx_depth` choice and inter leaves the §5.11.17 `txfm_split`
@@ -316,6 +358,12 @@ fn encode_p_frame_yuv420(
     ip.interpolation_filter = SWITCHABLE;
     // r412: per-block single/compound reference choice (§5.9.23).
     ip.reference_select = true;
+    // r413: §5.9.2 order hints — `OrderHints[ ref ]` =
+    // `RefOrderHint[ ref_frame_idx[ ref - LAST_FRAME ] ]` under the
+    // two-slot rotation (every reference reads the LAST slot except
+    // GOLDEN). All references are forward (`get_relative_dist < 0`),
+    // so `RefFrameSignBias[]` stays all-zero (§7.8).
+    ip.order_hints = gop_order_hints(p_index, seq.order_hint_bits);
 
     let params = SyntaxFrameParams {
         subsampling_x: 1,
@@ -498,7 +546,15 @@ struct PSearchCtx {
     scratch: [Vec<u16>; 3],
     gm_types: [u8; 8],
     gm_flat: [i32; 48],
-    zero_hints: [i32; 8],
+    /// r413 — `OrderHints[ ref ]` per raw `RefFrame` value (feeds the
+    /// §7.11.3.15 order-hint context of the decoder's leaf driver;
+    /// only the DISTANCE compound arm reads it, but the values track
+    /// the real frame hints so the mirror stays derivation-exact).
+    ref_hints: [i32; 8],
+    /// r413 — `OrderHintBits` / current-frame `OrderHint` twins of
+    /// [`Self::ref_hints`] for the leaf driver's order-hint context.
+    hint_bits: u32,
+    current_hint: i32,
     no_scaled: [bool; 8],
     /// r412 — driver-side write-mirror twin for §7.10.2 MV prediction
     /// (see the struct docs).
@@ -575,7 +631,13 @@ impl PSearchCtx {
             ],
             gm_types: [GM_TYPE_IDENTITY as u8; 8],
             gm_flat,
-            zero_hints: [0i32; 8],
+            ref_hints: {
+                let mut h = [0i32; 8];
+                h.copy_from_slice(&ip.order_hints.order_hints_by_ref);
+                h
+            },
+            hint_bits: ip.order_hints.order_hint_bits,
+            current_hint: ip.order_hints.current_order_hint,
             no_scaled: [false; 8],
             mirror,
             ip,
@@ -742,7 +804,9 @@ impl PSearchCtx {
             scratch,
             gm_types,
             gm_flat,
-            zero_hints,
+            ref_hints,
+            hint_bits,
+            current_hint,
             no_scaled,
             ..
         } = &mut *self;
@@ -791,9 +855,9 @@ impl PSearchCtx {
             interintra_modes: zeros,
             wedge_interintras: zeros,
             interintra_wedge_indices: zeros,
-            order_hint_bits: 0,
-            current_order_hint: 0,
-            order_hints_by_ref: zero_hints,
+            order_hint_bits: *hint_bits,
+            current_order_hint: *current_hint,
+            order_hints_by_ref: ref_hints,
             mi_rows,
             mi_cols,
             bit_depth: 8,

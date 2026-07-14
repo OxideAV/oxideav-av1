@@ -297,18 +297,19 @@ pub(crate) fn encode_uncompressed_header(
     // §5.9.2 ref_order_hint block: only fires when
     //   (!FrameIsIntra || refresh_frame_flags != allFrames) &&
     //   error_resilient_mode && enable_order_hint.
-    // The FrameHeader struct doesn't surface the per-slot ref_order_hint
-    // values (they're conformance-only — the parser reads but doesn't
-    // store them). For round-trip purposes we re-emit zeros; if the
-    // session-state walk ever needs to preserve specific values, the
-    // FrameHeader struct will grow a `ref_order_hints: Option<[u32; 8]>`
-    // field and this writer will pick it up.
+    // r413: the per-slot values come from `fh.ref_order_hints` — the
+    // spec requires each coded hint to equal the decoder's stored
+    // `RefOrderHint[ i ]` (a mismatch marks the slot `RefValid = 0`),
+    // so the caller must surface the true slot hints whenever the gate
+    // fires. `None` falls back to zeros (the pre-r413 shape, valid only
+    // while every stored hint is genuinely zero).
     if (!fh.frame_is_intra || fh.refresh_frame_flags != ALL_FRAMES_PUB)
         && fh.error_resilient_mode
         && seq.enable_order_hint
     {
-        for _ in 0..crate::frame_header::NUM_REF_FRAMES as usize {
-            bw.write_bits(u32::from(seq.order_hint_bits), 0);
+        let hints = fh.ref_order_hints.unwrap_or([0; 8]);
+        for &hint in hints.iter() {
+            bw.write_bits(u32::from(seq.order_hint_bits), u64::from(hint));
         }
     }
 
@@ -1445,6 +1446,7 @@ mod tests {
             order_hint: 0,
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: ALL_FRAMES_PUB,
+            ref_order_hints: None,
             frame_size: Some(fs),
             allow_intrabc: false,
             disable_frame_end_update_cdf: false,
@@ -1715,6 +1717,7 @@ mod tests {
             order_hint: 0,
             primary_ref_frame: PRIMARY_REF_NONE,
             refresh_frame_flags: 0,
+            ref_order_hints: None,
             frame_size: None,
             allow_intrabc: false,
             disable_frame_end_update_cdf: false,
