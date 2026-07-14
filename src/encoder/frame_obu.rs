@@ -543,20 +543,32 @@ fn encode_inter_tail(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader,
     // §5.9.23 inter reference_select read.
     let rs = fh.reference_select.expect("inter has reference_select");
     bw.write_bits(1, u64::from(rs));
-    // §5.9.22 skip_mode_present — when skipModeAllowed; we mirror back
-    // the parser's value when the gate would have fired, otherwise the
-    // bit is omitted. skipModeAllowed requires reference_select &&
-    // enable_order_hint && a valid forward/backward pair. The
-    // FrameHeader carries the result; we only round-trip the simple
-    // `skipModeAllowed == 0 ⇒ no bit` case (reference_select == 0).
+    // §5.9.22 skip_mode_params() — the write twin of the parser's
+    // read_skip_mode_present(): when skipModeAllowed, ONE
+    // skip_mode_present bit is coded (r413; the pre-r413 writer never
+    // emitted it, which the reader survived only because the phantom
+    // read landed on the all-zero reduced_tx_set / identity-gm tail
+    // and the byte_alignment() padding absorbed the shift).
+    // skipModeAllowed needs the per-slot RefOrderHint[] state — on
+    // the error-resilient configuration that is exactly
+    // `fh.ref_order_hints` (conformance requires the coded hints to
+    // equal the stored ones); `None` falls back to all-zero hints,
+    // whose duplicate forward hints derive skipModeAllowed = 0.
     if rs && seq.enable_order_hint {
-        debug_assert!(
-            !fh.skip_mode_present.unwrap_or(false),
-            "skip_mode round-trip requires ref_info plumbing (next arc)"
-        );
-        // Without per-ref RefOrderHint state we conservatively don't
-        // emit the bit on this path — the parser-side
-        // read_skip_mode_present() returned false here too.
+        let hints = fh.ref_order_hints.unwrap_or([0; 8]);
+        let ref_frame_idx = fh
+            .inter_refs
+            .as_ref()
+            .map(|ir| ir.ref_frame_idx)
+            .unwrap_or([0; 7]);
+        if skip_mode_allowed(&hints, &ref_frame_idx, fh.order_hint, seq.order_hint_bits) {
+            bw.write_bits(1, u64::from(fh.skip_mode_present.unwrap_or(false)));
+        } else {
+            debug_assert!(
+                !fh.skip_mode_present.unwrap_or(false),
+                "skip_mode_present = 1 requires skipModeAllowed"
+            );
+        }
     }
     if !fh.error_resilient_mode && seq.enable_warped_motion {
         bw.write_bits(1, u64::from(fh.allow_warped_motion.unwrap_or(false)));
@@ -581,6 +593,64 @@ fn encode_inter_tail(bw: &mut BitWriter, fh: &FrameHeader, seq: &SequenceHeader,
         fh.showable_frame,
         matches!(fh.frame_type, FrameType::Inter),
     );
+}
+
+/// §5.9.3 `get_relative_dist( a, b )` over `order_hint_bits`-wide
+/// hints (the enable gate is on the caller — this module only calls it
+/// under `seq.enable_order_hint`).
+fn relative_dist(a: u32, b: u32, order_hint_bits: u8) -> i32 {
+    let mut diff = a as i32 - b as i32;
+    let m = 1i32 << (i32::from(order_hint_bits) - 1);
+    diff = (diff & (m - 1)) - (diff & m);
+    diff
+}
+
+/// §5.9.22 `skipModeAllowed` derivation — the write twin of the
+/// parser's `read_skip_mode_present()`: find the closest forward and
+/// backward references (by `get_relative_dist` against the current
+/// `OrderHint`); a forward/backward pair allows skip mode, else the
+/// two closest DISTINCT forward hints do. `FrameIsIntra == 0`,
+/// `reference_select == 1` and `enable_order_hint == 1` are the
+/// caller's gates.
+pub(crate) fn skip_mode_allowed(
+    ref_order_hints: &[u32; 8],
+    ref_frame_idx: &[u8; 7],
+    order_hint: u32,
+    order_hint_bits: u8,
+) -> bool {
+    let mut forward_idx: i32 = -1;
+    let mut backward_idx: i32 = -1;
+    let mut forward_hint: u32 = 0;
+    let mut backward_hint: u32 = 0;
+    for (i, &slot) in ref_frame_idx.iter().enumerate() {
+        let ref_hint = ref_order_hints[slot as usize];
+        if relative_dist(ref_hint, order_hint, order_hint_bits) < 0 {
+            if forward_idx < 0 || relative_dist(ref_hint, forward_hint, order_hint_bits) > 0 {
+                forward_idx = i as i32;
+                forward_hint = ref_hint;
+            }
+        } else if relative_dist(ref_hint, order_hint, order_hint_bits) > 0
+            && (backward_idx < 0 || relative_dist(ref_hint, backward_hint, order_hint_bits) < 0)
+        {
+            backward_idx = i as i32;
+            backward_hint = ref_hint;
+        }
+    }
+    if forward_idx < 0 {
+        return false;
+    }
+    if backward_idx >= 0 {
+        return true;
+    }
+    // Two-forward-reference fallback: a second forward hint strictly
+    // older than `forwardHint`.
+    ref_frame_idx.iter().any(|&slot| {
+        relative_dist(
+            ref_order_hints[slot as usize],
+            forward_hint,
+            order_hint_bits,
+        ) < 0
+    })
 }
 
 fn encode_inter_global_motion_identity_only(bw: &mut BitWriter, gm: &GlobalMotionParams) {

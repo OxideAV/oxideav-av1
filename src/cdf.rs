@@ -16056,6 +16056,12 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     pub sub_size: usize,
     /// §5.11.11 `skip`.
     pub skip: u8,
+    /// §5.11.10 `skip_mode` (r413) — `0` on every intra-frame block
+    /// and on every inter-frame block whose §5.11.10 read
+    /// short-circuits; mirrors the decode walker's `SkipModes[]`
+    /// grid-fill so the write mirror's §8.3.2 `skip_mode` ctx tracks
+    /// the decode walker's.
+    pub skip_mode: u8,
     /// §5.11.8 `segment_id`.
     pub segment_id: u8,
     /// §5.11.7 `is_inter` (1 on the `use_intrabc` arm, else 0).
@@ -16121,6 +16127,7 @@ pub(crate) struct EncoderStampSnapshot {
     cols: u32,
     mi_sizes: Vec<usize>,
     skips: Vec<u8>,
+    skip_modes: Vec<u8>,
     segment_ids: Vec<i32>,
     y_modes: Vec<u8>,
     is_inters: Vec<u8>,
@@ -20826,6 +20833,7 @@ impl PartitionWalker {
                 let cell = (rr * self.mi_cols + cc) as usize;
                 self.mi_sizes[cell] = s.sub_size;
                 self.skips[cell] = s.skip;
+                self.skip_modes[cell] = s.skip_mode;
                 self.segment_ids[cell] = s.segment_id as i32;
                 self.y_modes[cell] = s.y_mode;
                 self.is_inters[cell] = s.is_inter;
@@ -20956,6 +20964,7 @@ impl PartitionWalker {
             cols,
             mi_sizes: Vec::with_capacity(cells),
             skips: Vec::with_capacity(cells),
+            skip_modes: Vec::with_capacity(cells),
             segment_ids: Vec::with_capacity(cells),
             y_modes: Vec::with_capacity(cells),
             is_inters: Vec::with_capacity(cells),
@@ -20974,6 +20983,7 @@ impl PartitionWalker {
                 let cell = (rr * self.mi_cols + cc) as usize;
                 snap.mi_sizes.push(self.mi_sizes[cell]);
                 snap.skips.push(self.skips[cell]);
+                snap.skip_modes.push(self.skip_modes[cell]);
                 snap.segment_ids.push(self.segment_ids[cell]);
                 snap.y_modes.push(self.y_modes[cell]);
                 snap.is_inters.push(self.is_inters[cell]);
@@ -21013,6 +21023,7 @@ impl PartitionWalker {
                 let cell = ((snap.mi_row + dr) * self.mi_cols + (snap.mi_col + dc)) as usize;
                 self.mi_sizes[cell] = snap.mi_sizes[i];
                 self.skips[cell] = snap.skips[i];
+                self.skip_modes[cell] = snap.skip_modes[i];
                 self.segment_ids[cell] = snap.segment_ids[i];
                 self.y_modes[cell] = snap.y_modes[i];
                 self.is_inters[cell] = snap.is_inters[i];
@@ -61680,6 +61691,7 @@ mod tests {
             mi_col: 0,
             sub_size: BLOCK_8X8,
             skip: 1,
+            skip_mode: 0,
             segment_id: 0,
             is_inter: 1,
             y_mode: MODE_NEARESTMV,
@@ -61758,6 +61770,7 @@ mod tests {
             mi_col: 2,
             sub_size: BLOCK_8X8,
             skip: 0,
+            skip_mode: 0,
             segment_id: 0,
             is_inter: 1,
             y_mode: MODE_NEWMV,
@@ -61780,6 +61793,7 @@ mod tests {
             mi_col: 2,
             sub_size: BLOCK_8X8,
             skip: 1,
+            skip_mode: 0,
             segment_id: 0,
             is_inter: 1,
             y_mode: MODE_NEARESTMV,
@@ -61846,6 +61860,7 @@ mod tests {
             mi_col: 2,
             sub_size: BLOCK_16X16,
             skip: 0,
+            skip_mode: 0,
             segment_id: 3,
             is_inter: 0,
             y_mode: 0,
@@ -62002,6 +62017,7 @@ mod tests {
                 mi_col,
                 sub_size: BLOCK_8X8,
                 skip: 1,
+                skip_mode: 0,
                 segment_id: 0,
                 is_inter: 1,
                 y_mode: MODE_NEARESTMV,
@@ -62106,6 +62122,7 @@ mod tests {
                     mi_col: mc,
                     sub_size: BLOCK_8X8,
                     skip: 1,
+                    skip_mode: 0,
                     segment_id: 0,
                     is_inter: 1,
                     y_mode: MODE_NEARESTMV,
@@ -62228,6 +62245,7 @@ mod tests {
             mi_col: 0,
             sub_size: BLOCK_8X8,
             skip: 1,
+            skip_mode: 0,
             segment_id: 0,
             is_inter: 1,
             y_mode: MODE_NEARESTMV,

@@ -106,11 +106,12 @@
 //! [`crate::cdf::PartitionWalker::decode_block`]: crate::cdf::PartitionWalker
 
 use crate::cdf::{
-    cfl_allowed_for_uv_mode, compute_tx_type, find_tx_size, get_plane_residual_size, get_tx_size,
-    inter_tx_type_set, intra_mode_ctx, intra_tx_type_set, is_inter_ctx, palette_tokens_args,
-    partition_ctx, partition_subsize, segment_id_ctx, size_group, skip_ctx, tx_size_sqr_index,
-    EncoderBlockSyntaxStamp, FrameInterOrderHints, InterpolationFilterReadout, MotionFieldMvs,
-    PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
+    block_height, block_width, cfl_allowed_for_uv_mode, compute_tx_type, find_tx_size,
+    get_plane_residual_size, get_tx_size, inter_tx_type_set, intra_mode_ctx, intra_tx_type_set,
+    is_inter_ctx, palette_tokens_args, partition_ctx, partition_subsize, segment_id_ctx,
+    size_group, skip_ctx, skip_mode_ctx, tx_size_sqr_index, EncoderBlockSyntaxStamp,
+    FrameInterOrderHints, InterpolationFilterReadout, MotionFieldMvs, PalettePlane,
+    PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
     BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, EIGHTTAP, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
     GM_TYPE_TRANSLATION, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
     MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV,
@@ -780,6 +781,17 @@ pub struct SyntaxInterBlock {
     /// `!enable_dual_filter` mirroring slot 0 into slot 1). Any other
     /// shape is rejected by the §5.11.x writer.
     pub interp_filter: [u8; 2],
+    /// r413 — §5.11.10 `skip_mode` (0 or 1). `1` selects the
+    /// §5.11.18/§5.11.23 skip-mode arm: requires
+    /// [`SyntaxInterFrameParams::skip_mode_present`], a block with
+    /// both dimensions >= 8, `skip == 1`, [`Self::ref_frame`] equal to
+    /// the frame's `SkipModeFrame[]` pair, [`Self::y_mode`] ==
+    /// `NEAREST_NEARESTMV`, `ref_mv_idx == 0`, and (per
+    /// `needs_interp_filter( ) == 0`) an `[EIGHTTAP, EIGHTTAP]`
+    /// committed filter pair. The §5.11.10 `skip_mode` S() against the
+    /// §8.3.2 neighbour ctx is the ONLY symbol the mode-info body
+    /// codes for such a block.
+    pub skip_mode: u8,
 }
 
 /// Frame-scope inter state for a §5.11.18 write walk (r411) — the
@@ -790,8 +802,10 @@ pub struct SyntaxInterBlock {
 /// `inter_frame_mode_info()` arm.
 #[derive(Debug, Clone)]
 pub struct SyntaxInterFrameParams {
-    /// §5.9.22 `skip_mode_present`. r411 scope: MUST be `false`
-    /// (the §5.11.10 skip-mode ctx threading is a follow-up arc).
+    /// §5.9.22 `skip_mode_present`. r413: `true` opens the per-block
+    /// §5.11.10 `skip_mode` S() (committed via
+    /// [`SyntaxInterBlock::skip_mode`]) on every >= 8×8 leaf; the
+    /// short-circuit arms still force `skip_mode = 0`.
     pub skip_mode_present: bool,
     /// §5.9.22 `SkipModeFrame[ 0..2 ]`.
     pub skip_mode_frame: [i8; 2],
@@ -1630,6 +1644,7 @@ pub fn write_block_syntax(
                 mi_col,
                 sub_size,
                 skip: block.skip,
+                skip_mode: 0,
                 segment_id: block.segment_id,
                 is_inter: 1,
                 y_mode: info.y_mode,
@@ -1846,6 +1861,7 @@ pub fn write_block_syntax(
             mi_col,
             sub_size,
             skip: block.skip,
+            skip_mode: 0,
             segment_id: block.segment_id,
             is_inter: 0,
             y_mode: block.y_mode,
@@ -1954,8 +1970,11 @@ pub fn write_block_syntax(
 /// * `params.segmentation_enabled` — the §5.11.19 predicted-segment-id
 ///   threading (§5.11.21 `get_segment_id` over `PrevSegmentIds`) is a
 ///   follow-up arc.
-/// * `ip.skip_mode_present` — the §5.11.10 skip-mode ctx walk is a
-///   follow-up arc.
+/// * (r413) `ip.skip_mode_present` is SUPPORTED: the §5.11.10
+///   `skip_mode` S() rides the §8.3.2 neighbour ctx from the mirror's
+///   `SkipModes[]` grid, and a `skip_mode == 1` leaf must commit the
+///   §5.11.18/§5.11.23 pure-derivation shape (see
+///   [`SyntaxInterBlock::skip_mode`]).
 /// * A committed MV that differs from the §5.11.26 `PredMv`
 ///   derivation on any non-NEWMV list (see [`SyntaxInterBlock`];
 ///   r412 lands compound pairs — both lists are §5.11.26-checked
@@ -1984,8 +2003,32 @@ fn write_block_syntax_inter_frame(
         return Err(Error::PartitionWalkOutOfRange);
     }
     // r411 scope rejects (see the doc comment).
-    if params.segmentation_enabled || ip.skip_mode_present {
+    if params.segmentation_enabled {
         return Err(Error::PartitionWalkOutOfRange);
+    }
+    // r413 — §5.11.10 skip-mode commitments. `skip_mode == 1` is a
+    // pure-derivation block: every §5.11.18/§5.11.23 value the reader
+    // infers must be pre-committed identically by the caller.
+    let skip_mode: u8 = block.inter.as_ref().map_or(0, |ib| ib.skip_mode);
+    if skip_mode > 1 {
+        return Err(Error::PartitionWalkOutOfRange);
+    }
+    if skip_mode == 1 {
+        let ib = block.inter.as_ref().expect("skip_mode implies inter");
+        // §5.11.10 gates: frame-level presence + both dims >= 8.
+        if !ip.skip_mode_present
+            || block_width(sub_size) < 8
+            || block_height(sub_size) < 8
+            // §5.11.18 line 13: `if ( skip_mode ) skip = 1`.
+            || block.skip != 1
+            // §5.11.25 arm 1: `RefFrame[] = SkipModeFrame[]`.
+            || ib.ref_frame != ip.skip_mode_frame
+            // §5.11.23 arm 1: `YMode = NEAREST_NEARESTMV`, `RefMvIdx = 0`.
+            || ib.y_mode != MODE_NEAREST_NEARESTMV
+            || ib.ref_mv_idx != 0
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
     }
 
     // §5.11.5 prologue (mirrors the intra arm).
@@ -2017,6 +2060,20 @@ fn write_block_syntax_inter_frame(
         0
     };
     let skip_ctx_v = skip_ctx(above_skip, left_skip);
+
+    // r413 — §8.3.2 `skip_mode` ctx from the mirror's `SkipModes[]`
+    // neighbours (sum of the two flags, §5.11.10).
+    let above_skip_mode = if avail_u {
+        state.mirror.skip_modes()[((mi_row - 1) * state.mi_cols + mi_col) as usize]
+    } else {
+        0
+    };
+    let left_skip_mode = if avail_l {
+        state.mirror.skip_modes()[(mi_row * state.mi_cols + mi_col - 1) as usize]
+    } else {
+        0
+    };
+    let skip_mode_ctx_v = skip_mode_ctx(above_skip_mode, left_skip_mode);
 
     // §8.3.2 `is_inter` ctx from the mirror's `IsInters[]` neighbours
     // (an unavailable neighbour reads as intra per §5.11.18).
@@ -2070,12 +2127,12 @@ fn write_block_syntax_inter_frame(
         cdfs,
         sub_size,
         block.segment_id,
-        /* skip_mode = */ 0,
+        skip_mode,
         block.skip,
         is_inter_flag,
         seg_pred,
         /* seg_id_predicted = */ 0,
-        /* skip_mode_ctx_val = */ 0,
+        skip_mode_ctx_v,
         skip_ctx_v,
         /* seg_id_read_ctx = */ seg_ctx,
         /* seg_pred_ctx = */ 0,
@@ -2218,14 +2275,19 @@ fn write_block_syntax_inter_frame(
             }
         } else {
             // `needs_interp_filter( )` per av1-spec p.75 on this arm's
-            // fixed scalars (`skip_mode = 0`, SIMPLE motion mode —
+            // fixed scalars (SIMPLE motion mode —
             // the r411 configuration): only the GLOBALMV-on-large
             // branch can gate the read off.
             let large = core::cmp::min(
                 NUM_4X4_BLOCKS_WIDE[sub_size] * MI_SIZE,
                 NUM_4X4_BLOCKS_HIGH[sub_size] * MI_SIZE,
             ) >= 8;
-            let needs = if large && ib.y_mode == MODE_GLOBALMV {
+            let needs = if skip_mode != 0 {
+                // §5.11.23 `needs_interp_filter( )`: `skip_mode` (and
+                // LOCALWARP, unreachable here) return 0 — the reader
+                // derives EIGHTTAP on both slots with no bits.
+                false
+            } else if large && ib.y_mode == MODE_GLOBALMV {
                 ip.gm_type[ib.ref_frame[0] as usize] == GM_TYPE_TRANSLATION
             } else if large && ib.y_mode == MODE_GLOBAL_GLOBALMV {
                 ip.gm_type[ib.ref_frame[0] as usize] == GM_TYPE_TRANSLATION
@@ -2266,7 +2328,7 @@ fn write_block_syntax_inter_frame(
             ib.ref_mv_idx,
             &stack,
             sub_size,
-            /* skip_mode = */ 0,
+            skip_mode,
             ip.skip_mode_frame,
             /* seg_ref_frame_active = */ false,
             /* seg_ref_frame_data = */ 0,
@@ -2294,6 +2356,7 @@ fn write_block_syntax_inter_frame(
                 mi_col,
                 sub_size,
                 skip: block.skip,
+                skip_mode,
                 segment_id: block.segment_id,
                 is_inter: 1,
                 y_mode: ib.y_mode,
@@ -2463,6 +2526,7 @@ fn write_block_syntax_inter_frame(
             mi_col,
             sub_size,
             skip: block.skip,
+            skip_mode: 0,
             segment_id: block.segment_id,
             is_inter: 0,
             y_mode: block.y_mode,
@@ -5855,6 +5919,7 @@ mod tests {
             mv: [mv, [0, 0]],
             ref_mv_idx: 0,
             interp_filter: [EIGHTTAP; 2],
+            skip_mode: 0,
         });
         b
     }
@@ -6071,6 +6136,7 @@ mod tests {
                 mv,
                 ref_mv_idx,
                 interp_filter: [EIGHTTAP; 2],
+                skip_mode: 0,
             });
             b
         };
@@ -6191,6 +6257,7 @@ mod tests {
             mi_col: 0,
             sub_size: BLOCK_32X32,
             skip: 1,
+            skip_mode: 0,
             segment_id: 0,
             is_inter: 1,
             y_mode: MODE_NEWMV,

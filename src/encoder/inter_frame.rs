@@ -281,7 +281,12 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     // r412: per-block single/compound choice (§5.9.23) — compound
     // COMPOUND_AVERAGE leaves need the comp_mode dispatch open.
     fh.reference_select = Some(true);
-    fh.skip_mode_present = Some(false);
+    // r413: §5.9.22 `skip_mode_present = 1` whenever skipModeAllowed —
+    // on this all-forward GOP that is the two-closest-DISTINCT-forward
+    // fallback (LAST at hint `k - 1`, GOLDEN at `k - 2`), i.e. every
+    // P-frame from `p_index = 2` on; `SkipModeFrame[] = { LAST_FRAME,
+    // GOLDEN_FRAME }` there (forwardIdx = 0, secondForwardIdx = 3).
+    fh.skip_mode_present = Some(last_hint != golden_hint);
     fh.allow_warped_motion = Some(false);
     let last_slot = (p_index & 1) as u8;
     let golden_slot = ((p_index - 1) & 1) as u8;
@@ -364,6 +369,16 @@ fn encode_p_frame_yuv420(
     // GOLDEN). All references are forward (`get_relative_dist < 0`),
     // so `RefFrameSignBias[]` stays all-zero (§7.8).
     ip.order_hints = gop_order_hints(p_index, seq.order_hint_bits);
+    // r413: §5.9.22 skip mode — present whenever the two rotated
+    // references carry DISTINCT forward hints (every P-frame from
+    // `p_index = 2`); `SkipModeFrame[] = { LAST_FRAME, GOLDEN_FRAME }`
+    // per the two-forward fallback (forwardIdx = 0, secondForwardIdx
+    // = 3). Must match the header derivation bit-for-bit.
+    {
+        let (last_hint, golden_hint) = gop_ref_hints(p_index);
+        ip.skip_mode_present = last_hint != golden_hint;
+        ip.skip_mode_frame = [1, 4];
+    }
 
     let params = SyntaxFrameParams {
         subsampling_x: 1,
@@ -699,6 +714,7 @@ impl PSearchCtx {
                 mi_col,
                 sub_size: b_size,
                 skip: block.skip,
+                skip_mode: ib.skip_mode,
                 segment_id: block.segment_id,
                 is_inter: 1,
                 y_mode: ib.y_mode,
@@ -720,6 +736,7 @@ impl PSearchCtx {
                 mi_col,
                 sub_size: b_size,
                 skip: block.skip,
+                skip_mode: 0,
                 segment_id: block.segment_id,
                 is_inter: 0,
                 y_mode: block.y_mode,
@@ -1073,6 +1090,117 @@ fn refine_mv_subpel(
 /// the lossless arm; chroma at the §5.11.38 size), `skip = 1` when
 /// every TU quantises to zero.
 fn encode_inter_leaf(
+    mi_r: u32,
+    mi_c: u32,
+    b_size: usize,
+    input: &Yuv420Frame,
+    recon: &mut ReconState,
+    ictx: &mut PSearchCtx,
+) -> Result<SyntaxBlock, Error> {
+    let leaf = encode_inter_leaf_modes(mi_r, mi_c, b_size, input, recon, ictx)?;
+
+    // r413 — §5.11.10 skip-mode trial: on a skip-mode frame, every
+    // >= 8×8 leaf additionally trials the pure-derivation skip-mode
+    // block (COMPOUND_AVERAGE over SkipModeFrame[] = { LAST, GOLDEN }
+    // at the compound-stack NEARESTMV pair, EIGHTTAP, `skip = 1`, no
+    // residual — ONE §5.11.10 S() total) against the fully-searched
+    // leaf. The comparison is exact on both sides: the normal leaf's
+    // residual-coded reconstruction vs the skip-mode leaf's bare
+    // prediction, each scored `D + λ·R` over all three planes.
+    if !ictx.ip.skip_mode_present
+        || crate::cdf::block_width(b_size) < 8
+        || crate::cdf::block_height(b_size) < 8
+    {
+        return Ok(leaf);
+    }
+    let sm_ref: [i8; 2] = ictx.ip.skip_mode_frame;
+    let stack = ictx.find_stack(mi_r, mi_c, b_size, sm_ref)?;
+    let sm_mv = [stack.ref_stack_mv[0][0], stack.ref_stack_mv[0][1]];
+    if sm_mv
+        .iter()
+        .any(|m| m[0].unsigned_abs() >= (1 << 14) || m[1].unsigned_abs() >= (1 << 14))
+    {
+        return Ok(leaf);
+    }
+    let bw4 = NUM_4X4_BLOCKS_WIDE[b_size];
+    let bh4 = NUM_4X4_BLOCKS_HIGH[b_size];
+    let lambda = lambda_for(&recon.qp);
+    let d_normal = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let score_normal = d_normal + lambda * p_leaf_rate(&leaf);
+    let after_normal = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
+
+    // Predict the skip-mode leaf (re-stamps the grid footprint) and
+    // stitch the bare prediction into the recon.
+    ictx.predict_leaf(
+        mi_r,
+        mi_c,
+        b_size,
+        sm_ref,
+        MODE_NEAREST_NEARESTMV,
+        sm_mv,
+        EIGHTTAP,
+    )?;
+    let (bw, bh) = (bw4 * 4, bh4 * 4);
+    let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
+    let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
+    let (cbw, cbh) = (bw / 2, bh / 2);
+    let width = recon.width;
+    let cw = recon.chroma_w;
+    for i in 0..bh {
+        for j in 0..bw {
+            recon.y[(row0 + i) * width + (col0 + j)] =
+                ictx.scratch[0][(row0 + i) * width + (col0 + j)] as u8;
+        }
+    }
+    for i in 0..cbh {
+        for j in 0..cbw {
+            recon.u[(crow0 + i) * cw + (ccol0 + j)] =
+                ictx.scratch[1][(crow0 + i) * cw + (ccol0 + j)] as u8;
+            recon.v[(crow0 + i) * cw + (ccol0 + j)] =
+                ictx.scratch[2][(crow0 + i) * cw + (ccol0 + j)] as u8;
+        }
+    }
+    tu_bd_stamp(&mut recon.bd, 0, col0, row0, bw, bh);
+    tu_bd_stamp(&mut recon.bd, 1, ccol0, crow0, cbw, cbh);
+    tu_bd_stamp(&mut recon.bd, 2, ccol0, crow0, cbw, cbh);
+
+    let mut sm_leaf = SyntaxBlock::skip_leaf(0, None);
+    sm_leaf.inter = Some(SyntaxInterBlock {
+        ref_frame: sm_ref,
+        y_mode: MODE_NEAREST_NEARESTMV,
+        mv: sm_mv,
+        ref_mv_idx: 0,
+        interp_filter: [EIGHTTAP; 2],
+        skip_mode: 1,
+    });
+    let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+    let score_sm = d_sm + lambda * p_leaf_rate(&sm_leaf);
+    if score_sm < score_normal {
+        return Ok(sm_leaf);
+    }
+    // Skip-mode loses: restore the residual-coded reconstruction and
+    // re-stamp the winner's grid footprint (predict_leaf writes only
+    // the scratch planes, never the recon).
+    restore_region(recon, mi_r, mi_c, &after_normal);
+    if let Some(ib) = leaf.inter.as_ref() {
+        ictx.predict_leaf(
+            mi_r,
+            mi_c,
+            b_size,
+            ib.ref_frame,
+            ib.y_mode,
+            ib.mv,
+            ib.interp_filter[0],
+        )?;
+    }
+    Ok(leaf)
+}
+
+/// r411/r412 fully-searched inter leaf (mode + filter + residual RD);
+/// the r413 [`encode_inter_leaf`] wrapper adds the skip-mode trial on
+/// top.
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_leaf_modes(
     mi_r: u32,
     mi_c: u32,
     b_size: usize,
@@ -1745,6 +1873,7 @@ fn encode_inter_leaf_residual(
         mv,
         ref_mv_idx,
         interp_filter: [filter; 2],
+        skip_mode: 0,
     });
     Ok(block)
 }
@@ -1754,6 +1883,12 @@ fn encode_inter_leaf_residual(
 /// small intra surcharge (intra blocks in inter frames also code
 /// `is_inter = 0` against a heavily-inter-biased context).
 fn p_leaf_rate(block: &SyntaxBlock) -> u64 {
+    // r413 — a skip-mode leaf codes ONE §5.11.10 S() and nothing else
+    // (every other value is derived); keep a small constant so the
+    // trial can actually win against coded leaves.
+    if block.inter.as_ref().is_some_and(|ib| ib.skip_mode != 0) {
+        return 2;
+    }
     let mut rate = leaf_rate(block);
     match &block.inter {
         Some(ib) => {
@@ -2501,6 +2636,98 @@ mod tests {
             assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
             assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
             assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+    }
+
+    /// r413 — static content on a skip-mode frame must select
+    /// §5.11.10 `skip_mode = 1` leaves (the one-symbol pure-derivation
+    /// block beats every coded candidate once the two reference
+    /// reconstructions have converged), and the resulting stream must
+    /// stay byte-exact through the spec driver.
+    #[test]
+    fn r413_p_search_selects_skip_mode_on_static_content() {
+        let f = moving_gradient(64, 64, 2, 3, 21);
+        let base_q_idx = 60u8;
+        let frames = vec![f.clone(), f.clone(), f.clone(), f.clone()];
+        let pre = encode_gop_yuv420_with_q(&frames[..3], base_q_idx).unwrap();
+
+        // Drive the P3 search directly (LAST = P2 recon, GOLDEN = P1
+        // recon; `p_index = 3` ⇒ skip_mode_present per §5.9.22).
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 3);
+        assert_eq!(fh.skip_mode_present, Some(true), "P3 header presence");
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = ReconState {
+            y: vec![0u8; 64 * 64],
+            u: vec![0u8; 32 * 32],
+            v: vec![0u8; 32 * 32],
+            width: 64,
+            height: 64,
+            chroma_w: 32,
+            chroma_h: 32,
+            mi_rows,
+            mi_cols,
+            lossless: false,
+            qp: QuantizerParams::neutral(base_q_idx, 8),
+            bd: BlockDecodedMirror::new(),
+        };
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.order_hints = gop_order_hints(3, pre.seq.order_hint_bits);
+        ip.skip_mode_present = true;
+        ip.skip_mode_frame = [1, 4];
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[2],
+            &pre.recon[1],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            3,
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f, &mut recon, &mut ictx).unwrap();
+        fn count_skip_mode(node: &SyntaxNode, sm: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, sm: &mut u32, other: &mut u32| {
+                if b.inter.as_ref().is_some_and(|ib| ib.skip_mode != 0) {
+                    *sm += 1;
+                } else {
+                    *other += 1;
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, sm, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count_skip_mode(ch, sm, other);
+                    }
+                }
+                SyntaxNode::Horz(blocks) | SyntaxNode::Vert(blocks) => {
+                    for b in blocks.iter() {
+                        leafc(b, sm, other);
+                    }
+                }
+            }
+        }
+        let (mut sm, mut other) = (0u32, 0u32);
+        count_skip_mode(&tree, &mut sm, &mut other);
+        assert!(
+            sm > 0,
+            "static content on a skip-mode frame must select skip_mode leaves \
+             (got SKIP_MODE={sm} OTHER={other})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&frames, base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 4);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
         }
     }
 
