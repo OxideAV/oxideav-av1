@@ -7553,6 +7553,196 @@ pub(crate) fn reconstruct_inter_leaf_at(
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// §7.9 motion field estimation (r413) — the shared core the decode
+// driver and the encoder's write-mirror both run so the §7.10.2.5
+// temporal scan sees identical `MotionFieldMvs` on both sides.
+// ---------------------------------------------------------------------
+
+/// One §7.20-stored reference slot's motion-field payload for
+/// [`motion_field_estimation_core`]: the §7.19 `SavedMvs` /
+/// `SavedRefFrames` filter output (one candidate per 4×4 cell), the
+/// frame's `SavedOrderHints[ 0..8 ]`, its mi extent and its
+/// `frame_is_intra` flag (§7.9.2 skips intra sources).
+#[derive(Debug, Clone, Copy)]
+pub struct MotionFieldSlot<'a> {
+    /// `SavedMvs` — `[ row, col ]` per cell, row-major over
+    /// `mi_rows * mi_cols` cells (2 entries per cell).
+    pub mf_mvs: &'a [i16],
+    /// `SavedRefFrames` — one `RefFrame` ordinal per cell (`-1` =
+    /// no stored candidate).
+    pub mf_ref_frames: &'a [i8],
+    /// `SavedOrderHints[ ref ]` for `ref` in `0..=ALTREF_FRAME`.
+    pub saved_order_hints: [i32; 8],
+    /// Stored frame's `MiRows`.
+    pub mi_rows: u32,
+    /// Stored frame's `MiCols`.
+    pub mi_cols: u32,
+    /// Stored frame's `FrameIsIntra`.
+    pub frame_is_intra: bool,
+}
+
+/// §7.9 `motion_field_estimation()` — project the §7.20-saved motion
+/// vectors of up to four reference frames onto the current frame's
+/// 8×8 motion-field grid, one projected MV per (destination
+/// reference, cell). `slots[ i ]` is physical slot `i`'s payload
+/// (`None` = empty slot); `ref_frame_idx` / `order_hints` /
+/// `order_hint` / `hint_bits` are the current frame's §5.9.2 scalars.
+#[must_use]
+pub fn motion_field_estimation_core(
+    slots: &[Option<MotionFieldSlot<'_>>; 8],
+    ref_frame_idx: &[u8; 7],
+    order_hints: &[i32; 8],
+    order_hint: i32,
+    hint_bits: u32,
+    mi_rows: u32,
+    mi_cols: u32,
+) -> crate::cdf::MotionFieldMvs {
+    use crate::cdf::MotionFieldMvs;
+    // §3 constants scoped to the §7.9 processes.
+    const MFMV_STACK_SIZE: i32 = 3;
+    const MAX_FRAME_DISTANCE: i32 = 31;
+    const MAX_OFFSET_WIDTH: i32 = 8;
+    const MAX_OFFSET_HEIGHT: i32 = 0;
+    /// §7.9.3 `Div_Mult[ 32 ]`.
+    const DIV_MULT: [i32; 32] = [
+        0, 16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638, 1489, 1365, 1260, 1170,
+        1092, 1024, 963, 910, 862, 819, 780, 744, 712, 682, 655, 630, 606, 585, 564, 546, 528,
+    ];
+    // Reference ordinals (§6.10.24): LAST=1, LAST2=2, GOLDEN=4,
+    // BWDREF=5, ALTREF2=6, ALTREF=7.
+    const LAST_FRAME: usize = 1;
+    const LAST2_FRAME: usize = 2;
+    const GOLDEN_FRAME: usize = 4;
+    const BWDREF_FRAME: usize = 5;
+    const ALTREF2_FRAME: usize = 6;
+    const ALTREF_FRAME: usize = 7;
+
+    let mut mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
+    let w8 = (mi_cols >> 1) as i32;
+    let h8 = (mi_rows >> 1) as i32;
+
+    // §7.9.2 projection for one source reference.
+    let project_ref = |src: usize, dst_sign: i32, mfmvs: &mut MotionFieldMvs| -> bool {
+        let src_idx = ref_frame_idx[src - LAST_FRAME] as usize;
+        let Some(slot) = slots[src_idx].as_ref() else {
+            return false;
+        };
+        if slot.mi_rows != mi_rows || slot.mi_cols != mi_cols || slot.frame_is_intra {
+            return false;
+        }
+        for y8 in 0..h8 {
+            for x8 in 0..w8 {
+                let row = (2 * y8 + 1) as usize;
+                let col = (2 * x8 + 1) as usize;
+                let cell = row * (mi_cols as usize) + col;
+                let src_ref = slot.mf_ref_frames[cell];
+                if src_ref <= 0 {
+                    continue;
+                }
+                let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
+                let ref_offset = get_relative_dist(
+                    order_hints[src],
+                    slot.saved_order_hints[src_ref as usize],
+                    hint_bits,
+                );
+                let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
+                    && ref_offset.abs() <= MAX_FRAME_DISTANCE
+                    && ref_offset > 0;
+                if !pos_valid {
+                    continue;
+                }
+                let mv = [
+                    i32::from(slot.mf_mvs[cell * 2]),
+                    i32::from(slot.mf_mvs[cell * 2 + 1]),
+                ];
+                // §7.9.3 get_mv_projection.
+                let mv_projection = |mv: [i32; 2], numerator: i32, denominator: i32| -> [i32; 2] {
+                    let clipped_den = denominator.min(MAX_FRAME_DISTANCE);
+                    let clipped_num = numerator.clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
+                    let mut out = [0i32; 2];
+                    for i in 0..2 {
+                        let v = mv[i] * clipped_num * DIV_MULT[clipped_den as usize];
+                        // Round2Signed(v, 14).
+                        let scaled = if v >= 0 {
+                            (v + (1 << 13)) >> 14
+                        } else {
+                            -((-v + (1 << 13)) >> 14)
+                        };
+                        out[i] = scaled.clamp(-(1 << 14) + 1, (1 << 14) - 1);
+                    }
+                    out
+                };
+                let proj_mv = mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
+                // §7.9.4 get_block_position.
+                let project = |v8: i32, delta: i32, max8: i32, max_off8: i32| -> (i32, bool) {
+                    let base8 = (v8 >> 3) << 3;
+                    let offset8 = if delta >= 0 {
+                        delta >> (3 + 1 + 2)
+                    } else {
+                        -((-delta) >> (3 + 1 + 2))
+                    };
+                    let v8 = v8 + dst_sign * offset8;
+                    let valid = !(v8 < 0
+                        || v8 >= max8
+                        || v8 < base8 - max_off8
+                        || v8 >= base8 + 8 + max_off8);
+                    (v8, valid)
+                };
+                let (pos_y8, vy) = project(y8, proj_mv[0], h8, MAX_OFFSET_HEIGHT);
+                let (pos_x8, vx) = project(x8, proj_mv[1], w8, MAX_OFFSET_WIDTH);
+                if !(vy && vx) {
+                    continue;
+                }
+                for (dst, &dst_hint) in order_hints
+                    .iter()
+                    .enumerate()
+                    .take(ALTREF_FRAME + 1)
+                    .skip(LAST_FRAME)
+                {
+                    let ref_to_dst = get_relative_dist(order_hint, dst_hint, hint_bits);
+                    let out = mv_projection(mv, ref_to_dst, ref_offset);
+                    mfmvs.set(
+                        dst,
+                        pos_y8 as u32,
+                        pos_x8 as u32,
+                        [out[0] as i16, out[1] as i16],
+                    );
+                }
+            }
+        }
+        true
+    };
+
+    // §7.9.1 source-selection order.
+    let last_idx = ref_frame_idx[0] as usize;
+    let cur_gold_order_hint = order_hints[GOLDEN_FRAME];
+    let last_alt_order_hint = slots[last_idx]
+        .as_ref()
+        .map_or(0, |s| s.saved_order_hints[ALTREF_FRAME]);
+    let use_last = last_alt_order_hint != cur_gold_order_hint;
+    if use_last {
+        project_ref(LAST_FRAME, -1, &mut mfmvs);
+    }
+    let mut ref_stamp = MFMV_STACK_SIZE - 2;
+    let use_bwd = get_relative_dist(order_hints[BWDREF_FRAME], order_hint, hint_bits) > 0;
+    if use_bwd && project_ref(BWDREF_FRAME, 1, &mut mfmvs) {
+        ref_stamp -= 1;
+    }
+    let use_alt2 = get_relative_dist(order_hints[ALTREF2_FRAME], order_hint, hint_bits) > 0;
+    if use_alt2 && project_ref(ALTREF2_FRAME, 1, &mut mfmvs) {
+        ref_stamp -= 1;
+    }
+    let use_alt = get_relative_dist(order_hints[ALTREF_FRAME], order_hint, hint_bits) > 0;
+    if use_alt && ref_stamp >= 0 && project_ref(ALTREF_FRAME, 1, &mut mfmvs) {
+        ref_stamp -= 1;
+    }
+    if ref_stamp >= 0 {
+        project_ref(LAST2_FRAME, -1, &mut mfmvs);
+    }
+    mfmvs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -315,7 +315,10 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         // frames simply carry `order_hint = 0`.
         enable_order_hint: true,
         enable_jnt_comp: false,
-        enable_ref_frame_mvs: false,
+        // r413: temporal MV prediction — GOP P-frames run §7.9
+        // motion-field estimation (`use_ref_frame_mvs = 1`); the
+        // seq-level gate must be open.
+        enable_ref_frame_mvs: true,
         seq_force_screen_content_tools: SELECT_SCREEN_CONTENT_TOOLS,
         seq_force_integer_mv: SELECT_INTEGER_MV,
         order_hint_bits: ENCODER_ORDER_HINT_BITS,

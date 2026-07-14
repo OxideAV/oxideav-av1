@@ -1130,10 +1130,11 @@ fn decode_frame_spec_full(
     })
 }
 
-/// §7.9 `motion_field_estimation()` — project the §7.20-saved motion
-/// vectors of up to four reference frames onto the current frame's
-/// 8×8 motion-field grid, one projected MV per (destination reference,
-/// cell).
+/// §7.9 `motion_field_estimation()` — adapter over the shared
+/// [`crate::inter_pred::motion_field_estimation_core`] (the encoder's
+/// write mirror runs the SAME core, so both sides project identical
+/// `MotionFieldMvs`): builds one [`MotionFieldSlot`] view per stored
+/// §7.20 slot plus the current frame's §5.9.2 scalars.
 fn motion_field_estimation(
     refs: &SpecRefState,
     fh: &FrameHeader,
@@ -1141,23 +1142,7 @@ fn motion_field_estimation(
     mi_rows: u32,
     mi_cols: u32,
 ) -> Result<MotionFieldMvs, Error> {
-    // §3 constants scoped to the §7.9 processes.
-    const MFMV_STACK_SIZE: i32 = 3;
-    const MAX_FRAME_DISTANCE: i32 = 31;
-    const MAX_OFFSET_WIDTH: i32 = 8;
-    const MAX_OFFSET_HEIGHT: i32 = 0;
-    /// §7.9.3 `Div_Mult[ 32 ]`.
-    const DIV_MULT: [i32; 32] = [
-        0, 16384, 8192, 5461, 4096, 3276, 2730, 2340, 2048, 1820, 1638, 1489, 1365, 1260, 1170,
-        1092, 1024, 963, 910, 862, 819, 780, 744, 712, 682, 655, 630, 606, 585, 564, 546, 528,
-    ];
-    // Reference ordinals (§6.10.24): LAST=1, LAST2=2, BWDREF=5,
-    // ALTREF2=6, ALTREF=7; GOLDEN=4.
-    const LAST2_FRAME: usize = 2;
-    const GOLDEN_FRAME: usize = 4;
-    const BWDREF_FRAME: usize = 5;
-    const ALTREF2_FRAME: usize = 6;
-
+    use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
     let ir = fh
         .inter_refs
         .as_ref()
@@ -1173,130 +1158,26 @@ fn motion_field_estimation(
     for i in 0..7 {
         order_hints[LAST_FRAME + i] = refs.info.order_hint[ir.ref_frame_idx[i] as usize] as i32;
     }
-
-    let mut mfmvs = MotionFieldMvs::new_invalid(mi_rows, mi_cols);
-    let w8 = (mi_cols >> 1) as i32;
-    let h8 = (mi_rows >> 1) as i32;
-
-    // §7.9.2 projection for one source reference.
-    let project_ref = |src: usize, dst_sign: i32, mfmvs: &mut MotionFieldMvs| -> bool {
-        let src_idx = ir.ref_frame_idx[src - LAST_FRAME] as usize;
-        let Some(slot) = refs.slots[src_idx].as_ref() else {
-            return false;
-        };
-        if slot.mi_rows != mi_rows || slot.mi_cols != mi_cols || slot.frame_is_intra {
-            return false;
-        }
-        for y8 in 0..h8 {
-            for x8 in 0..w8 {
-                let row = (2 * y8 + 1) as usize;
-                let col = (2 * x8 + 1) as usize;
-                let cell = row * (mi_cols as usize) + col;
-                let src_ref = slot.mf_ref_frames[cell];
-                if src_ref <= 0 {
-                    continue;
-                }
-                let ref_to_cur = get_relative_dist(order_hints[src], order_hint, hint_bits);
-                let ref_offset = get_relative_dist(
-                    order_hints[src],
-                    slot.saved_order_hints[src_ref as usize],
-                    hint_bits,
-                );
-                let pos_valid = ref_to_cur.abs() <= MAX_FRAME_DISTANCE
-                    && ref_offset.abs() <= MAX_FRAME_DISTANCE
-                    && ref_offset > 0;
-                if !pos_valid {
-                    continue;
-                }
-                let mv = [
-                    i32::from(slot.mf_mvs[cell * 2]),
-                    i32::from(slot.mf_mvs[cell * 2 + 1]),
-                ];
-                // §7.9.3 get_mv_projection.
-                let mv_projection = |mv: [i32; 2], numerator: i32, denominator: i32| -> [i32; 2] {
-                    let clipped_den = denominator.min(MAX_FRAME_DISTANCE);
-                    let clipped_num = numerator.clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
-                    let mut out = [0i32; 2];
-                    for i in 0..2 {
-                        let v = mv[i] * clipped_num * DIV_MULT[clipped_den as usize];
-                        // Round2Signed(v, 14).
-                        let scaled = if v >= 0 {
-                            (v + (1 << 13)) >> 14
-                        } else {
-                            -((-v + (1 << 13)) >> 14)
-                        };
-                        out[i] = scaled.clamp(-(1 << 14) + 1, (1 << 14) - 1);
-                    }
-                    out
-                };
-                let proj_mv = mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
-                // §7.9.4 get_block_position.
-                let project = |v8: i32, delta: i32, max8: i32, max_off8: i32| -> (i32, bool) {
-                    let base8 = (v8 >> 3) << 3;
-                    let offset8 = if delta >= 0 {
-                        delta >> (3 + 1 + 2)
-                    } else {
-                        -((-delta) >> (3 + 1 + 2))
-                    };
-                    let v8 = v8 + dst_sign * offset8;
-                    let valid = !(v8 < 0
-                        || v8 >= max8
-                        || v8 < base8 - max_off8
-                        || v8 >= base8 + 8 + max_off8);
-                    (v8, valid)
-                };
-                let (pos_y8, vy) = project(y8, proj_mv[0], h8, MAX_OFFSET_HEIGHT);
-                let (pos_x8, vx) = project(x8, proj_mv[1], w8, MAX_OFFSET_WIDTH);
-                if !(vy && vx) {
-                    continue;
-                }
-                for (dst, &dst_hint) in order_hints
-                    .iter()
-                    .enumerate()
-                    .take(ALTREF_FRAME + 1)
-                    .skip(LAST_FRAME)
-                {
-                    let ref_to_dst = get_relative_dist(order_hint, dst_hint, hint_bits);
-                    let out = mv_projection(mv, ref_to_dst, ref_offset);
-                    mfmvs.set(
-                        dst,
-                        pos_y8 as u32,
-                        pos_x8 as u32,
-                        [out[0] as i16, out[1] as i16],
-                    );
-                }
-            }
-        }
-        true
-    };
-
-    // §7.9.1 source-selection order.
-    let last_idx = ir.ref_frame_idx[0] as usize;
-    let cur_gold_order_hint = order_hints[GOLDEN_FRAME];
-    let last_alt_order_hint = refs.slots[last_idx]
-        .as_ref()
-        .map_or(0, |s| s.saved_order_hints[ALTREF_FRAME]);
-    let use_last = last_alt_order_hint != cur_gold_order_hint;
-    if use_last {
-        project_ref(LAST_FRAME, -1, &mut mfmvs);
+    let mut slots: [Option<MotionFieldSlot<'_>>; 8] = [None; 8];
+    for (i, slot) in refs.slots.iter().enumerate() {
+        slots[i] = slot.as_ref().map(|st| MotionFieldSlot {
+            mf_mvs: &st.mf_mvs,
+            mf_ref_frames: &st.mf_ref_frames,
+            saved_order_hints: st.saved_order_hints,
+            mi_rows: st.mi_rows,
+            mi_cols: st.mi_cols,
+            frame_is_intra: st.frame_is_intra,
+        });
     }
-    let mut ref_stamp = MFMV_STACK_SIZE - 2;
-    let use_bwd = get_relative_dist(order_hints[BWDREF_FRAME], order_hint, hint_bits) > 0;
-    if use_bwd && project_ref(BWDREF_FRAME, 1, &mut mfmvs) {
-        ref_stamp -= 1;
-    }
-    let use_alt2 = get_relative_dist(order_hints[ALTREF2_FRAME], order_hint, hint_bits) > 0;
-    if use_alt2 && project_ref(ALTREF2_FRAME, 1, &mut mfmvs) {
-        ref_stamp -= 1;
-    }
-    let use_alt = get_relative_dist(order_hints[ALTREF_FRAME], order_hint, hint_bits) > 0;
-    if use_alt && ref_stamp >= 0 && project_ref(ALTREF_FRAME, 1, &mut mfmvs) {
-        ref_stamp -= 1;
-    }
-    if ref_stamp >= 0 {
-        project_ref(LAST2_FRAME, -1, &mut mfmvs);
-    }
-    Ok(mfmvs)
+    Ok(motion_field_estimation_core(
+        &slots,
+        &ir.ref_frame_idx,
+        &order_hints,
+        order_hint,
+        hint_bits,
+        mi_rows,
+        mi_cols,
+    ))
 }
 
 /// Decode an AV1 IVF v0 buffer through the spec-faithful frame driver.

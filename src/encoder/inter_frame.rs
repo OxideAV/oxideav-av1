@@ -126,6 +126,35 @@ pub struct EncodedGop {
 /// GOP length bound (KEY + P-frames).
 pub const GOP_MAX_FRAMES: usize = 64;
 
+/// r413 — one §7.20 slot's stored motion-field payload on the encode
+/// side (the §7.19 `SavedMvs` / `SavedRefFrames` filter output plus
+/// `SavedOrderHints`), mirroring the decode driver's per-slot store so
+/// the §7.9 projection runs on identical inputs.
+#[derive(Debug, Clone)]
+struct SavedMotionField {
+    mf_mvs: Vec<i16>,
+    mf_ref_frames: Vec<i8>,
+    saved_order_hints: [i32; 8],
+    mi_rows: u32,
+    mi_cols: u32,
+    frame_is_intra: bool,
+}
+
+impl SavedMotionField {
+    /// The KEY frame's slot payload (`FrameIsIntra = 1` — §7.9.2
+    /// skips intra sources, so the grids stay empty).
+    fn intra(mi_rows: u32, mi_cols: u32) -> Self {
+        SavedMotionField {
+            mf_mvs: Vec::new(),
+            mf_ref_frames: Vec::new(),
+            saved_order_hints: [0; 8],
+            mi_rows,
+            mi_cols,
+            frame_is_intra: true,
+        }
+    }
+}
+
 /// Integer-pel motion-search radius (luma samples per axis).
 const SEARCH_RANGE: i32 = 16;
 
@@ -215,14 +244,29 @@ pub fn encode_gop_yuv420_with_q_seg(
         v: key.recon_v,
     }];
 
+    // r413 — encoder-side §7.20 motion-field store: the KEY frame's
+    // `allFrames` refresh fills every slot with an intra payload;
+    // each P-frame then refreshes its rotation slot with the §7.19
+    // filter of its committed Mvs[] / RefFrames[] grids.
+    let key_mi = {
+        let fh0 = build_intra_only_yuv420_8bit_fh_with_q(&seq, width, height, base_q_idx);
+        let fs0 = fh0.frame_size.expect("KEY builder always sizes");
+        (fs0.mi_rows, fs0.mi_cols)
+    };
+    let mut mf_store: [SavedMotionField; 8] =
+        core::array::from_fn(|_| SavedMotionField::intra(key_mi.0, key_mi.1));
+
     for (k, input) in frames[1..].iter().enumerate() {
         let p_index = (k + 1) as u32;
         let prev = recon.last().expect("at least the KEY recon");
         let prevprev = &recon[recon.len().saturating_sub(2)];
-        let (tu, rc) =
-            encode_p_frame_yuv420(input, prev, prevprev, &seq, base_q_idx, p_index, alt_q)?;
+        let (tu, rc, saved_mf) = encode_p_frame_yuv420(
+            input, prev, prevprev, &seq, base_q_idx, p_index, alt_q, &mf_store,
+        )?;
         temporal_units.push(tu);
         recon.push(rc);
+        // §7.20: this frame refreshed slot `(p_index - 1) & 1`.
+        mf_store[((p_index - 1) & 1) as usize] = saved_mf;
     }
 
     // IVF v0 wrap.
@@ -301,7 +345,10 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     // §5.9.2: `showable_frame = frame_type != KEY_FRAME` on the
     // `show_frame == 1` arm (derived, no bit).
     fh.showable_frame = true;
-    fh.error_resilient_mode = true;
+    // r413: error resilience OFF — §5.9.2 codes primary_ref_frame
+    // (kept at PRIMARY_REF_NONE: per-frame default CDFs, no
+    // load_previous()) and opens the use_ref_frame_mvs f(1).
+    fh.error_resilient_mode = false;
     fh.force_integer_mv = false;
     fh.primary_ref_frame = PRIMARY_REF_NONE;
     fh.refresh_frame_flags = 1 << ((p_index - 1) & 1);
@@ -318,6 +365,9 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     let mut hints = [0u32; 8];
     hints[(p_index & 1) as usize] = last_hint;
     hints[((p_index - 1) & 1) as usize] = golden_hint;
+    // r413: with error resilience off the ref_order_hint block is no
+    // longer coded, but the writer still needs the true per-slot
+    // hints as session state for the §5.9.22 skipModeAllowed twin.
     fh.ref_order_hints = Some(hints);
     // §5.9.21: ONLY_4X4 rides the CodedLossless arm; the lossy arm
     // codes TX_MODE_SELECT — intra leaves carry the §5.11.15
@@ -351,7 +401,10 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
         allow_high_precision_mv: false,
         interpolation_filter: InterpolationFilter::Switchable,
         is_motion_mode_switchable: false,
-        use_ref_frame_mvs: false,
+        // r413: §7.9 temporal MV prediction on every P-frame (the
+        // first P-frame's projections are empty — every slot still
+        // holds the intra KEY — which both sides derive identically).
+        use_ref_frame_mvs: true,
     });
     // r413: §5.9.14 SEG_LVL_ALT_Q segmentation — `PRIMARY_REF_NONE`
     // forces `update_map = 1`, `temporal_update = 0`,
@@ -391,7 +444,8 @@ fn encode_p_frame_yuv420(
     base_q_idx: u8,
     p_index: u32,
     alt_q: &[i16],
-) -> Result<(Vec<u8>, GopFrameRecon), Error> {
+    mf_store: &[SavedMotionField; 8],
+) -> Result<(Vec<u8>, GopFrameRecon, SavedMotionField), Error> {
     if input.width < 8
         || input.height < 8
         || input.width > KEY_FRAME_MAX_DIM
@@ -472,6 +526,40 @@ fn encode_p_frame_yuv420(
     if !alt_q.is_empty() {
         ip.segmentation_update_map = true;
         ip.segmentation_temporal_update = false;
+    }
+    // r413: §7.9 motion-field estimation over the encoder-side §7.20
+    // store — the SAME shared core the decode driver runs, so the
+    // §7.10.2.5 temporal scan sees identical `MotionFieldMvs` at
+    // search time, at write time and at decode time.
+    ip.use_ref_frame_mvs = true;
+    {
+        use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
+        let last_slot = (p_index & 1) as usize;
+        let golden_slot = ((p_index - 1) & 1) as usize;
+        let mut ref_frame_idx = [last_slot as u8; 7];
+        ref_frame_idx[3] = golden_slot as u8;
+        let mut order_hints = [0i32; 8];
+        order_hints.copy_from_slice(&ip.order_hints.order_hints_by_ref);
+        let mut slots: [Option<MotionFieldSlot<'_>>; 8] = [None; 8];
+        for (i, slot) in mf_store.iter().enumerate() {
+            slots[i] = Some(MotionFieldSlot {
+                mf_mvs: &slot.mf_mvs,
+                mf_ref_frames: &slot.mf_ref_frames,
+                saved_order_hints: slot.saved_order_hints,
+                mi_rows: slot.mi_rows,
+                mi_cols: slot.mi_cols,
+                frame_is_intra: slot.frame_is_intra,
+            });
+        }
+        ip.motion_field_mvs = motion_field_estimation_core(
+            &slots,
+            &ref_frame_idx,
+            &order_hints,
+            p_index as i32,
+            u32::from(seq.order_hint_bits),
+            mi_rows,
+            mi_cols,
+        );
     }
 
     let params = SyntaxFrameParams {
@@ -578,6 +666,52 @@ fn encode_p_frame_yuv420(
     // unit; §7.5 requires it once per coded video sequence).
     let temporal_unit = build_temporal_unit(None, &[ObuFrame::new(ObuType::Frame, frame_body)]);
 
+    // r413 — §7.19 motion field motion vector storage: filter the
+    // committed Mvs[] / RefFrames[] mirror grids down to the §7.20
+    // per-slot payload (per cell, the LAST candidate list whose
+    // reference lies in the past and whose components sit within
+    // REFMVS_LIMIT), exactly like the decode driver does after
+    // decoding this frame.
+    const REFMVS_LIMIT: i16 = (1 << 12) - 1;
+    let cells = (mi_rows as usize) * (mi_cols as usize);
+    let mut mf_ref_frames: Vec<i8> = vec![-1; cells];
+    let mut mf_mvs: Vec<i16> = vec![0; cells * 2];
+    {
+        let raw_refs = ictx.mirror.ref_frames();
+        let raw_mvs = ictx.mirror.mvs();
+        let hint_bits = u32::from(seq.order_hint_bits);
+        let by_ref = ictx.ip.order_hints.order_hints_by_ref;
+        for cell in 0..cells {
+            for list in 0..2usize {
+                let r = raw_refs[cell * 2 + list];
+                if r > 0 {
+                    let dist = crate::inter_pred::get_relative_dist(
+                        by_ref[r as usize],
+                        p_index as i32,
+                        hint_bits,
+                    );
+                    if dist < 0 {
+                        let mv_row = raw_mvs[(cell * 2 + list) * 2];
+                        let mv_col = raw_mvs[(cell * 2 + list) * 2 + 1];
+                        if mv_row.abs() <= REFMVS_LIMIT && mv_col.abs() <= REFMVS_LIMIT {
+                            mf_ref_frames[cell] = r;
+                            mf_mvs[cell * 2] = mv_row;
+                            mf_mvs[cell * 2 + 1] = mv_col;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let saved_mf = SavedMotionField {
+        mf_mvs,
+        mf_ref_frames,
+        saved_order_hints: ictx.ip.order_hints.order_hints_by_ref,
+        mi_rows,
+        mi_cols,
+        frame_is_intra: false,
+    };
+
     Ok((
         temporal_unit,
         GopFrameRecon {
@@ -585,6 +719,7 @@ fn encode_p_frame_yuv420(
             u: recon.u,
             v: recon.v,
         },
+        saved_mf,
     ))
 }
 
@@ -1372,7 +1507,11 @@ fn encode_inter_leaf(
     });
     let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
     let score_sm = d_sm + lambda * p_leaf_rate(&sm_leaf);
-    if score_sm < score_normal {
+    // On the CodedLossless configuration a skip-mode leaf (which can
+    // never code a residual) is only admissible when its bare
+    // prediction is already exact — the q = 0 contract is
+    // reconstruction == input.
+    if score_sm < score_normal && (!recon.lossless || d_sm == 0) {
         return Ok(sm_leaf);
     }
     // Skip-mode loses: restore the residual-coded reconstruction and
@@ -3324,6 +3463,102 @@ mod tests {
             assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
             assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
         }
+    }
+
+    /// r413 — use_ref_frame_mvs groundwork: on a moving GOP the
+    /// encoder-side §7.9 projection must produce VALID temporal
+    /// candidates from P2 on (P1's store holds only the intra KEY),
+    /// and the emitted streams (non-error-resilient headers,
+    /// `use_ref_frame_mvs = 1`) must stay byte-exact through the spec
+    /// driver — proving search mirror, write mirror and decoder all
+    /// derive the same motion field.
+    #[test]
+    fn r413_motion_field_estimation_projects_from_p2() {
+        let frames: Vec<Yuv420Frame> = (0..4)
+            .map(|k| moving_gradient(64, 64, k * 3, k * 2, 9))
+            .collect();
+        let enc = encode_gop_yuv420_with_q(&frames, 60).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 4);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+
+        // Recompute P2's projection from a rebuilt store (KEY intra in
+        // every slot, then P1's §7.19 payload in slot 0) and assert at
+        // least one valid cell — moving content stores real MVs.
+        let fh1 = build_p_frame_yuv420_8bit_fh_with_q(&enc.seq, 64, 64, 60, 1, &[]);
+        let fs = fh1.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let key_recon = GopFrameRecon {
+            y: enc.recon[0].y.clone(),
+            u: enc.recon[0].u.clone(),
+            v: enc.recon[0].v.clone(),
+        };
+        let mf_store: [SavedMotionField; 8] =
+            core::array::from_fn(|_| SavedMotionField::intra(mi_rows, mi_cols));
+        let (_, _, saved1) = encode_p_frame_yuv420(
+            &frames[1],
+            &key_recon,
+            &key_recon,
+            &enc.seq,
+            60,
+            1,
+            &[],
+            &mf_store,
+        )
+        .unwrap();
+        assert!(!saved1.frame_is_intra);
+        assert!(
+            saved1.mf_ref_frames.iter().any(|&r| r > 0),
+            "P1 must store §7.19 motion-field candidates on moving content"
+        );
+
+        use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
+        let mut slots: [Option<MotionFieldSlot<'_>>; 8] = [None; 8];
+        let intra = SavedMotionField::intra(mi_rows, mi_cols);
+        for (i, s) in slots.iter_mut().enumerate() {
+            let src = if i == 0 { &saved1 } else { &intra };
+            *s = Some(MotionFieldSlot {
+                mf_mvs: &src.mf_mvs,
+                mf_ref_frames: &src.mf_ref_frames,
+                saved_order_hints: src.saved_order_hints,
+                mi_rows: src.mi_rows,
+                mi_cols: src.mi_cols,
+                frame_is_intra: src.frame_is_intra,
+            });
+        }
+        // P2 reads LAST from slot 0 (p_index = 2), GOLDEN from slot 1.
+        let mut ref_frame_idx = [0u8; 7];
+        ref_frame_idx[3] = 1;
+        let hints2 = gop_order_hints(2, enc.seq.order_hint_bits);
+        let mut order_hints = [0i32; 8];
+        order_hints.copy_from_slice(&hints2.order_hints_by_ref);
+        let mfmvs = motion_field_estimation_core(
+            &slots,
+            &ref_frame_idx,
+            &order_hints,
+            2,
+            u32::from(enc.seq.order_hint_bits),
+            mi_rows,
+            mi_cols,
+        );
+        let mut valid = 0u32;
+        for r in 1..=7usize {
+            for y8 in 0..mfmvs.h8() {
+                for x8 in 0..mfmvs.w8() {
+                    if mfmvs.get(r, y8, x8)[0] != crate::cdf::MFMV_INVALID {
+                        valid += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            valid > 0,
+            "P2 §7.9 projection must land valid temporal candidates"
+        );
     }
 
     /// r412 — [`PSearchCtx::predict_leaf`] must thread the trial
