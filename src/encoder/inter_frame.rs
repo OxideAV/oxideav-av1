@@ -4311,6 +4311,16 @@ mod tests {
             assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
             assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
         }
+        // Env-gated fixture dump for external black-box validation /
+        // corpus pinning (no-op in normal runs).
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_WEDGE_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                format!("{dir}/self-gop-64x64-q60-wedge.ivf"),
+                &enc.ivf_bytes,
+            )
+            .unwrap();
+        }
     }
 
     /// r415 — §5.9.22 forward/backward skip mode on a B frame:
