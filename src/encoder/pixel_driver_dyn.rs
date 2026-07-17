@@ -305,7 +305,11 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         enable_filter_intra: false,
         enable_intra_edge_filter: false,
         enable_interintra_compound: false,
-        enable_masked_compound: false,
+        // r415: masked compound rides every stream this builder seeds
+        // — inter GOP compound leaves code the §5.11.29
+        // `comp_group_idx` cascade and may select COMPOUND_WEDGE /
+        // COMPOUND_DIFFWTD (intra-only frames are unaffected).
+        enable_masked_compound: true,
         enable_warped_motion: false,
         enable_dual_filter: false,
         // r413: §5.5.1 order hints ride every stream this builder

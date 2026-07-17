@@ -158,6 +158,29 @@ impl SavedMotionField {
 /// Integer-pel motion-search radius (luma samples per axis).
 const SEARCH_RANGE: i32 = 16;
 
+/// r415 — one leaf's committed §5.11.29 compound selection for the
+/// prediction driver ([`PSearchCtx::predict_leaf`] stamps it into the
+/// §5.11.5 side-data grids the decoder's leaf driver reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompoundSel {
+    ctype: u8,
+    wedge_index: u8,
+    wedge_sign: u8,
+    mask_type: u8,
+}
+
+impl CompoundSel {
+    /// The §5.11.29 line-1/2 pre-set shape (every single-reference
+    /// leaf and every compound leaf whose masked arms lost or are
+    /// gated shut).
+    const AVERAGE: CompoundSel = CompoundSel {
+        ctype: crate::inter_pred::COMPOUND_AVERAGE,
+        wedge_index: 0,
+        wedge_sign: 0,
+        mask_type: 0,
+    };
+}
+
 /// Lossless (`base_q_idx = 0`) GOP encode — see
 /// [`encode_gop_yuv420_with_q`].
 pub fn encode_gop_yuv420(frames: &[Yuv420Frame]) -> Result<EncodedGop, Error> {
@@ -606,6 +629,11 @@ pub(crate) fn encode_inter_frame_generic(
     // open exactly when the ladder carries a compound pair (matches
     // the header).
     ip.reference_select = !cfg.compound_pairs.is_empty();
+    // r415: §5.5.2 masked compound — compound leaves code the
+    // §5.11.29 comp_group_idx cascade and may commit COMPOUND_WEDGE /
+    // COMPOUND_DIFFWTD (the RD ladder trials both against the
+    // AVERAGE baseline).
+    ip.enable_masked_compound = seq.enable_masked_compound;
     // §5.9.2 order hints — `OrderHints[ ref ]` =
     // `RefOrderHint[ ref_frame_idx[ ref - LAST_FRAME ] ]` over the
     // config's slot state.
@@ -915,13 +943,17 @@ struct PSearchCtx {
     /// Shared all-zero grid for the compound / inter-intra side-data
     /// slices (never read at a single-reference SIMPLE leaf's origin).
     zeros: Vec<u8>,
-    /// r412 — `CompoundTypes[ .. ]` grid pinned at
-    /// [`crate::cdf::COMPOUND_AVERAGE`]: the §5.11.29 derivation on
-    /// this configuration (`enable_masked_compound ==
-    /// enable_jnt_comp == false` ⇒ `comp_group_idx = 0`,
-    /// `compound_idx = 1` ⇒ COMPOUND_AVERAGE, no bits); read only at
-    /// compound leaf origins.
-    comp_avg: Vec<u8>,
+    /// r415 — the §5.11.5 `CompoundTypes[ .. ]` grid (COMPOUND_AVERAGE
+    /// initial fill; [`Self::predict_leaf`] stamps each trial's
+    /// committed §5.11.29 selection over its footprint); read at
+    /// compound leaf origins by the decoder's leaf driver.
+    compound_types: Vec<u8>,
+    /// r415 — the §5.11.5 wedge / diffwtd side-data grids
+    /// (`wedge_index` / `wedge_sign` / `mask_type`), stamped alongside
+    /// [`Self::compound_types`].
+    wedge_indices: Vec<u8>,
+    wedge_signs: Vec<u8>,
+    mask_types: Vec<u8>,
     /// All-zero §7.11.3.8 per-cell warp-fit slice (never read on the
     /// all-SIMPLE configuration; sized per the [`crate::GridWarpContext`]
     /// contract).
@@ -1069,7 +1101,10 @@ impl PSearchCtx {
             motion_modes: vec![MOTION_MODE_SIMPLE; cells],
             y_modes: vec![0u8; cells],
             zeros: vec![0u8; cells],
-            comp_avg: vec![crate::cdf::COMPOUND_AVERAGE; cells],
+            compound_types: vec![crate::cdf::COMPOUND_AVERAGE; cells],
+            wedge_indices: vec![0u8; cells],
+            wedge_signs: vec![0u8; cells],
+            mask_types: vec![0u8; cells],
             local_warp: vec![0i32; cells * 6],
             scratch: [
                 vec![0u16; width * height],
@@ -1323,6 +1358,7 @@ impl PSearchCtx {
         y_mode: u8,
         mv: [[i32; 2]; 2],
         filter: u8,
+        comp: CompoundSel,
     ) -> Result<(), Error> {
         let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
         let bh4 = NUM_4X4_BLOCKS_HIGH[b_size] as u32;
@@ -1349,6 +1385,12 @@ impl PSearchCtx {
                 self.interp_filters[cell * 2 + 1] = filter;
                 self.motion_modes[cell] = MOTION_MODE_SIMPLE;
                 self.y_modes[cell] = y_mode;
+                // r415 — §5.11.29 side-data stamps (the decoder's leaf
+                // driver dispatches WEDGE / DIFFWTD masks from these).
+                self.compound_types[cell] = comp.ctype;
+                self.wedge_indices[cell] = comp.wedge_index;
+                self.wedge_signs[cell] = comp.wedge_sign;
+                self.mask_types[cell] = comp.mask_type;
             }
         }
 
@@ -1361,7 +1403,10 @@ impl PSearchCtx {
         let ref_frame_idx = self.ref_frame_idx;
         let PSearchCtx {
             ref_planes,
-            comp_avg,
+            compound_types,
+            wedge_indices,
+            wedge_signs,
+            mask_types,
             mi_sizes,
             is_inters,
             ref_frames,
@@ -1417,10 +1462,10 @@ impl PSearchCtx {
             ref_frames,
             mvs,
             interp_filters,
-            compound_types: comp_avg,
-            wedge_indices: zeros,
-            wedge_signs: zeros,
-            mask_types: zeros,
+            compound_types,
+            wedge_indices,
+            wedge_signs,
+            mask_types,
             interintra_modes: zeros,
             wedge_interintras: zeros,
             interintra_wedge_indices: zeros,
@@ -1603,6 +1648,7 @@ fn refine_mv_subpel(
             MODE_NEWMV,
             [mv, [0, 0]],
             EIGHTTAP,
+            CompoundSel::AVERAGE,
         )?;
         let mut ssd = 0u64;
         for i in 0..bh {
@@ -1690,6 +1736,7 @@ fn encode_inter_leaf(
         MODE_NEAREST_NEARESTMV,
         sm_mv,
         EIGHTTAP,
+        CompoundSel::AVERAGE,
     )?;
     let (bw, bh) = (bw4 * 4, bh4 * 4);
     let (row0, col0) = ((mi_r as usize) * 4, (mi_c as usize) * 4);
@@ -1752,6 +1799,12 @@ fn encode_inter_leaf(
             ib.y_mode,
             ib.mv,
             ib.interp_filter[0],
+            CompoundSel {
+                ctype: ib.compound_type,
+                wedge_index: ib.wedge_index,
+                wedge_sign: ib.wedge_sign,
+                mask_type: ib.mask_type,
+            },
         )?;
     }
     Ok(leaf)
@@ -1978,6 +2031,7 @@ fn encode_inter_leaf_modes(
 
     let lambda = lambda_for(&recon.qp);
     let mut best: Option<(u64, usize)> = None;
+    let mut best_compound: Option<(u64, usize)> = None;
     for (ci, cand) in cands.iter().enumerate() {
         ictx.predict_leaf(
             mi_r,
@@ -1987,6 +2041,7 @@ fn encode_inter_leaf_modes(
             cand.y_mode,
             cand.mv,
             EIGHTTAP,
+            CompoundSel::AVERAGE,
         )?;
         let mut ssd = 0u64;
         for i in 0..bh {
@@ -2000,8 +2055,72 @@ fn encode_inter_leaf_modes(
         if best.map_or(true, |(s, _)| score < s) {
             best = Some((score, ci));
         }
+        if cand.ref_frame[1] > 0 && best_compound.map_or(true, |(s, _)| score < s) {
+            best_compound = Some((score, ci));
+        }
     }
-    let (_, best_ci) = best.ok_or(Error::PartitionWalkOutOfRange)?;
+    let (mut best_score, mut best_ci) = best.ok_or(Error::PartitionWalkOutOfRange)?;
+
+    // r415 — §5.11.29 MASKED-compound trials on the best compound
+    // candidate: every WEDGE (index, sign) pair where
+    // `Wedge_Bits[ MiSize ] > 0` plus both DIFFWTD mask types, each
+    // predicted through the decoder's own §7.11.3.11/§7.11.3.12 mask
+    // blend and scored `D + λ·(rate + side-data bits)` against the
+    // running best (which keeps COMPOUND_AVERAGE when the masks lose).
+    let mut comp = CompoundSel::AVERAGE;
+    if ictx.ip.enable_masked_compound {
+        if let Some((_, cci)) = best_compound {
+            let (c_ref, c_mode, c_mv, c_rate) = {
+                let c = &cands[cci];
+                (c.ref_frame, c.y_mode, c.mv, c.rate)
+            };
+            let mut trials: Vec<(CompoundSel, u64)> = Vec::new();
+            if crate::cdf::wedge_bits(b_size) > 0 {
+                for wi in 0..16u8 {
+                    for ws in 0..=1u8 {
+                        trials.push((
+                            CompoundSel {
+                                ctype: crate::inter_pred::COMPOUND_WEDGE,
+                                wedge_index: wi,
+                                wedge_sign: ws,
+                                mask_type: 0,
+                            },
+                            /* comp_group_idx + wedge_index S() + sign L(1) */ 6,
+                        ));
+                    }
+                }
+            }
+            for mt in 0..=1u8 {
+                trials.push((
+                    CompoundSel {
+                        ctype: crate::inter_pred::COMPOUND_DIFFWTD,
+                        wedge_index: 0,
+                        wedge_sign: 0,
+                        mask_type: mt,
+                    },
+                    /* comp_group_idx (+ compound_type S()) + mask L(1) */ 3,
+                ));
+            }
+            for (sel, extra) in trials {
+                ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel)?;
+                let mut ssd = 0u64;
+                for i in 0..bh {
+                    for j in 0..bw {
+                        let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                            - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                        ssd += (d * d) as u64;
+                    }
+                }
+                let score = ssd + lambda * (c_rate + extra);
+                if score < best_score {
+                    best_score = score;
+                    best_ci = cci;
+                    comp = sel;
+                }
+            }
+        }
+    }
+    let _ = best_score;
     let ModeCand {
         ref_frame,
         y_mode,
@@ -2026,7 +2145,7 @@ fn encode_inter_leaf_modes(
         use crate::inter_pred::{EIGHTTAP_SHARP, EIGHTTAP_SMOOTH};
         let mut best_f = (u64::MAX, EIGHTTAP);
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
-            ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, f)?;
+            ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, f, comp)?;
             let mut ssd = 0u64;
             for i in 0..bh {
                 for j in 0..bw {
@@ -2041,7 +2160,7 @@ fn encode_inter_leaf_modes(
         }
         best_f.1
     };
-    ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, filter)?;
+    ictx.predict_leaf(mi_r, mi_c, b_size, ref_frame, y_mode, mv, filter, comp)?;
 
     // r413 — per-leaf segment (deterministic activity policy) and its
     // quantiser; a leaf that quantises to all-zero commits `skip = 1`
@@ -2053,8 +2172,8 @@ fn encode_inter_leaf_modes(
     if lossless {
         // §5.9.2 CodedLossless: TX_4X4 everywhere, no §5.11.17 trees.
         return encode_inter_leaf_residual(
-            mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter, 0,
-            segment_id, &seg_qp,
+            mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
+            comp, 0, segment_id, &seg_qp,
         );
     }
 
@@ -2073,7 +2192,7 @@ fn encode_inter_leaf_modes(
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
             mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
-            depth, segment_id, &seg_qp,
+            comp, depth, segment_id, &seg_qp,
         )?;
         let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
@@ -2253,6 +2372,7 @@ fn encode_inter_leaf_residual(
     mv: [[i32; 2]; 2],
     ref_mv_idx: u32,
     filter: u8,
+    comp: CompoundSel,
     depth: u32,
     segment_id: u8,
     seg_qp: &QuantizerParams,
@@ -2459,10 +2579,10 @@ fn encode_inter_leaf_residual(
         ref_mv_idx,
         interp_filter: [filter; 2],
         skip_mode: 0,
-        compound_type: crate::inter_pred::COMPOUND_AVERAGE,
-        wedge_index: 0,
-        wedge_sign: 0,
-        mask_type: 0,
+        compound_type: comp.ctype,
+        wedge_index: comp.wedge_index,
+        wedge_sign: comp.wedge_sign,
+        mask_type: comp.mask_type,
     });
     Ok(block)
 }
@@ -2485,6 +2605,12 @@ fn p_leaf_rate(block: &SyntaxBlock) -> u64 {
                 // §5.11.25 single-ref cascade surcharge on the
                 // non-LAST reference.
                 rate += 1;
+            }
+            // r415 — §5.11.29 masked side-data surcharge.
+            match ib.compound_type {
+                crate::inter_pred::COMPOUND_WEDGE => rate += 6,
+                crate::inter_pred::COMPOUND_DIFFWTD => rate += 3,
+                _ => {}
             }
             match ib.y_mode {
                 MODE_NEWMV => {
@@ -2967,6 +3093,7 @@ mod tests {
                     MODE_NEWMV,
                     [[0, 4], [0, 0]],
                     EIGHTTAP_SHARP,
+                    CompoundSel::AVERAGE,
                 )
                 .unwrap();
             for (dst, &src) in f1.y.iter_mut().zip(probe.scratch[0].iter()) {
@@ -3817,8 +3944,17 @@ mod tests {
         let mut ictx = PSearchCtx::new(&refr, &refr, 16, 16, 64, 64, ip, 1, 0, &[]).unwrap();
         let mut outs = Vec::new();
         for f in [EIGHTTAP, EIGHTTAP_SMOOTH, EIGHTTAP_SHARP] {
-            ictx.predict_leaf(2, 2, BLOCK_8X8, [1, -1], MODE_NEWMV, [[0, 4], [0, 0]], f)
-                .unwrap();
+            ictx.predict_leaf(
+                2,
+                2,
+                BLOCK_8X8,
+                [1, -1],
+                MODE_NEWMV,
+                [[0, 4], [0, 0]],
+                f,
+                CompoundSel::AVERAGE,
+            )
+            .unwrap();
             let mut v = Vec::new();
             for i in 8..16 {
                 for j in 8..16 {
@@ -4048,6 +4184,133 @@ mod tests {
             "future-matching content must select BWDREF single-reference \
              leaves (got BWD={bwd} OTHER={other})"
         );
+    }
+
+    /// r415 — §5.11.29 masked compound must actually be selected
+    /// where a wedge blend is the distortion winner: each 32x32
+    /// quadrant of the target frame is constructed as the decoder's
+    /// OWN §7.11.3.11 COMPOUND_WEDGE blend of the two references
+    /// (through [`PSearchCtx::predict_leaf`], the same kernel the
+    /// search scores with), so a WEDGE leaf predicts it exactly while
+    /// COMPOUND_AVERAGE misses along the wedge boundary — the search
+    /// tree must commit COMPOUND_WEDGE leaves, and a full GOP over
+    /// the same construction must round-trip byte-exact through the
+    /// spec driver (proving the coded §5.11.29 cascade end to end).
+    #[test]
+    fn r415_search_selects_wedge_compound_on_wedge_blend_content() {
+        use crate::cdf::BLOCK_32X32;
+        use crate::inter_pred::COMPOUND_WEDGE;
+        let f0 = moving_gradient(64, 64, 0, 0, 40);
+        let f1 = moving_gradient(64, 64, 0, 0, 140);
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+
+        // Target: per-quadrant WEDGE blend (index 7, sign 0) of the
+        // two reference reconstructions, through the real kernel.
+        let mut target = Yuv420Frame::filled(64, 64, 0);
+        {
+            let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
+            let mut probe =
+                PSearchCtx::new(&pre.recon[1], &pre.recon[0], 16, 16, 64, 64, ip, 2, 0, &[])
+                    .unwrap();
+            let sel = CompoundSel {
+                ctype: COMPOUND_WEDGE,
+                wedge_index: 7,
+                wedge_sign: 0,
+                mask_type: 0,
+            };
+            for (r, c) in [(0u32, 0u32), (0, 8), (8, 0), (8, 8)] {
+                probe
+                    .predict_leaf(
+                        r,
+                        c,
+                        BLOCK_32X32,
+                        [1, 4],
+                        MODE_NEW_NEWMV,
+                        [[0, 0], [0, 0]],
+                        EIGHTTAP,
+                        sel,
+                    )
+                    .unwrap();
+            }
+            for (dst, &src) in target.y.iter_mut().zip(probe.scratch[0].iter()) {
+                *dst = src as u8;
+            }
+            for (dst, &src) in target.u.iter_mut().zip(probe.scratch[1].iter()) {
+                *dst = src as u8;
+            }
+            for (dst, &src) in target.v.iter_mut().zip(probe.scratch[2].iter()) {
+                *dst = src as u8;
+            }
+        }
+
+        // Direct search drive (LAST = f1 recon, GOLDEN = f0 recon at
+        // p_index = 2), masked compound enabled.
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 2, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.enable_masked_compound = true;
+        ip.order_hints = gop_order_hints(2, pre.seq.order_hint_bits);
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[1],
+            &pre.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            2,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, wedge: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, wedge: &mut u32, other: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.compound_type == crate::inter_pred::COMPOUND_WEDGE {
+                        *wedge += 1;
+                    } else {
+                        *other += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, wedge, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, wedge, other);
+                    }
+                }
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
+                        leafc(b, wedge, other);
+                    }
+                }
+            }
+        }
+        let (mut wedge, mut other) = (0u32, 0u32);
+        count(&tree, &mut wedge, &mut other);
+        assert!(
+            wedge > 0,
+            "wedge-blend content must commit COMPOUND_WEDGE leaves \
+             (got WEDGE={wedge} OTHER={other})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
     }
 
     /// r415 — §5.9.22 forward/backward skip mode on a B frame:
