@@ -248,7 +248,12 @@ fn pyramid_external_sweep_dump() {
     std::fs::create_dir_all(&dir).unwrap();
     let geometries: [(u32, u32); 5] = [(64, 64), (96, 80), (176, 144), (64, 128), (120, 88)];
     let qs: [u8; 6] = [0, 30, 60, 100, 160, 255];
-    let contents = ["move", "static", "cut", "noise", "blend", "halfpel"];
+    // r416: "fine" (per-4x4-cell checkerboard motion — drives the
+    // sub-8x8 SPLIT leaves) and "bands" (4-row alternating shifts —
+    // drives the 16x4 / 8x4 strip alphabet) join the rotation.
+    let contents = [
+        "move", "static", "cut", "noise", "blend", "halfpel", "fine", "bands",
+    ];
     let lengths = [2usize, 3, 4, 5, 7, 9];
     let mut count = 0u32;
     for (gi, &(w, h)) in geometries.iter().enumerate() {
@@ -338,6 +343,60 @@ fn build_content(kind: &str, w: u32, h: u32, n: usize, seed: u32) -> Vec<Yuv420F
                         *o = mix(x, y);
                     }
                     out
+                })
+                .collect()
+        }
+        "fine" => {
+            // r416 — per-4x4-cell checkerboard motion over a dense
+            // texture: cell (i/4, j/4) alternates between (0, 0) and
+            // (+4k, +4k) sampling shifts frame over frame.
+            let tex = |i: usize, j: usize, s: u32| -> u8 {
+                ((i * 7 + j * 13 + (i / 4) * (j / 4) + s as usize) % 256) as u8
+            };
+            (0..n)
+                .map(|k| {
+                    let (wu, hu) = (w as usize, h as usize);
+                    let mut f = Yuv420Frame::filled(w, h, 0);
+                    for i in 0..hu {
+                        for j in 0..wu {
+                            let par = ((i / 4) + (j / 4)) & 1;
+                            let d = if par == 0 { 0 } else { 4 * k };
+                            f.y[i * wu + j] = tex(i + d, j + d, seed);
+                        }
+                    }
+                    for i in 0..hu / 2 {
+                        for j in 0..wu / 2 {
+                            f.u[i * (wu / 2) + j] = tex(i, j, seed) / 2 + 64;
+                            f.v[i * (wu / 2) + j] = tex(i + 3, j + 5, seed) / 2 + 32;
+                        }
+                    }
+                    f
+                })
+                .collect()
+        }
+        "bands" => {
+            // r416 — 4-row bands with alternating horizontal shifts
+            // (sub-8 strip motion).
+            let tex = |i: usize, j: usize, s: u32| -> u8 {
+                ((i * 5 + j * 11 + (i / 8) * (j / 8) + s as usize) % 256) as u8
+            };
+            (0..n)
+                .map(|k| {
+                    let (wu, hu) = (w as usize, h as usize);
+                    let mut f = Yuv420Frame::filled(w, h, 0);
+                    for i in 0..hu {
+                        for j in 0..wu {
+                            let dx = if (i / 4) & 1 == 0 { 0 } else { 5 * k };
+                            f.y[i * wu + j] = tex(i, j + dx, seed);
+                        }
+                    }
+                    for i in 0..hu / 2 {
+                        for j in 0..wu / 2 {
+                            f.u[i * (wu / 2) + j] = tex(i, j, seed) / 2 + 70;
+                            f.v[i * (wu / 2) + j] = tex(i + 9, j + 2, seed) / 2 + 40;
+                        }
+                    }
+                    f
                 })
                 .collect()
         }

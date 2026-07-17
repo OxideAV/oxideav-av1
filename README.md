@@ -543,6 +543,31 @@ black-box sweep plus P-GOP re-validation byte-exact in THREE
 independent reference decoders, and four more self-encoded streams
 pinned in the conformance corpus (57 total).
 
+### Inter encoder: jnt-comp + sub-8×8 leaves (r416)
+
+r416 works the r415 follow-up ladder. **Jnt-comp** (§7.11.3.15
+distance-weighted compound): every sequence header now opens
+`enable_jnt_comp` — compound leaves code the §5.11.29 `compound_idx`
+S() (per-block §8.3.2 `fwd == bck` order-hint ctx seed, derived
+identically at search, write and decode time) and the RD ladder
+trials the COMPOUND_DISTANCE blend (`Quant_Dist_Weight` /
+`Quant_Dist_Lookup` over the real frame order-hint deltas) against
+the coded-AVERAGE arm; distance-blend content provably commits
+DISTANCE leaves. **Sub-8×8 inter leaves**: the partition-search floor
+drops from BLOCK_8X8 to BLOCK_4X4 — HORZ / VERT at BLOCK_8X8 (8×4 /
+4×8), PARTITION_SPLIT to four BLOCK_4X4 leaves, and the 16×4 / 4×16
+HORZ_4 / VERT_4 strip alphabet at BLOCK_16X16. Sub-8 leaves are
+single-reference per the §5.11.25 `Min( bw4, bh4 ) >= 2` forcing;
+residual coding lands the §5.11.34 `HasChroma` gate (the bottom/right
+cell of each 2×2 group codes the WHOLE group's chroma at the §5.11.38
+plane residual size, predicted through the decoder's own §5.11.33
+per-luma-cell chroma tiling). Selection witnesses pin
+4×4-checkerboard motion → BLOCK_4X4 SPLIT leaves and 4-row band
+motion → HORZ_4 strips + HORZ 8×4 halves. The black-box sweep matrix
+gains `fine` / `bands` content kinds; the 30-config pyramid sweep and
+all three r416 self-encoded streams decode byte-exact in THREE
+independent reference decoders (corpus 60 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -556,12 +581,14 @@ pinned in the conformance corpus (57 total).
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
-  encoding beyond the r415 scope (palette/intrabc leaves in inter
-  frames, jnt-comp distance weights, sub-8×8 inter leaves — which
-  also gate HORZ_4/VERT_4 at BLOCK_16X16 — §5.11.19 temporal
-  segment-map update, deeper-than-two pyramid levels / adaptive
-  mini-GOP sizing, true bit-accounting rate costs, per-segment
-  lossless mixing) is the follow-up ladder.
+  encoding beyond the r416 scope (inter-intra blend modes — the
+  §5.11.28 write arm exists, the encoder-side §7.11.2 intra half
+  into search scratch is the missing piece — palette/intrabc leaves
+  in inter frames, sub-8×8 intra leaves in inter frames (the
+  §5.11.33 `someUseIntra` chroma split on the encode side),
+  §5.11.19 temporal segment-map update, deeper-than-two pyramid
+  levels / adaptive mini-GOP sizing, true bit-accounting rate
+  costs, per-segment lossless mixing) is the follow-up ladder.
 
 ## Module layout
 
