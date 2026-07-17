@@ -798,7 +798,11 @@ pub struct SyntaxInterBlock {
     /// also be [`crate::inter_pred::COMPOUND_WEDGE`] (requires
     /// `Wedge_Bits[ MiSize ] > 0`) or
     /// [`crate::inter_pred::COMPOUND_DIFFWTD`] — the writer codes the
-    /// §5.11.29 `comp_group_idx` / `compound_type` cascade.
+    /// §5.11.29 `comp_group_idx` / `compound_type` cascade. r416: with
+    /// [`SyntaxInterFrameParams::enable_jnt_comp`] set it may also be
+    /// [`crate::inter_pred::COMPOUND_DISTANCE`] — the writer codes
+    /// `comp_group_idx = 0` then `compound_idx = 0` (the §7.11.3.15
+    /// distance-weighted blend selection).
     pub compound_type: u8,
     /// r415 — §5.11.29 `wedge_index` in `0..16` (consulted only when
     /// `compound_type == COMPOUND_WEDGE`).
@@ -2505,10 +2509,14 @@ fn write_block_syntax_inter_frame(
         // committed compound selection. The masked arms
         // (COMPOUND_WEDGE / COMPOUND_DIFFWTD ⇒ `comp_group_idx = 1`)
         // are codable only on a compound non-skip-mode block with the
-        // sequence gate open; every other arm is bit-silent and only
-        // the §5.11.29 line-1/2 pre-set shape is committable.
+        // sequence gate open; r416 adds the `comp_group_idx == 0`
+        // distance arm (COMPOUND_DISTANCE ⇒ `compound_idx = 0`, gated
+        // on §5.5.2 `enable_jnt_comp`); every other arm is bit-silent
+        // and only the §5.11.29 line-1/2 pre-set shape is committable.
         {
-            use crate::inter_pred::{COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_WEDGE};
+            use crate::inter_pred::{
+                COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_WEDGE,
+            };
             let ct = ib.compound_type;
             let masked = ct == COMPOUND_WEDGE || ct == COMPOUND_DIFFWTD;
             let side_ok = match ct {
@@ -2516,7 +2524,9 @@ fn write_block_syntax_inter_frame(
                     ib.mask_type == 0 && (ib.wedge_index as usize) < 16 && ib.wedge_sign <= 1
                 }
                 COMPOUND_DIFFWTD => ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type <= 1,
-                COMPOUND_AVERAGE => ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type == 0,
+                COMPOUND_AVERAGE | COMPOUND_DISTANCE => {
+                    ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type == 0
+                }
                 _ => false,
             };
             if !side_ok {
@@ -2526,6 +2536,13 @@ fn write_block_syntax_inter_frame(
                 if masked && !ip.enable_masked_compound {
                     return Err(Error::PartitionWalkOutOfRange);
                 }
+                // r416 — §5.11.29 `comp_group_idx == 0` arm: the
+                // DISTANCE selection (`compound_idx = 0`) exists only
+                // when the sequence gate `enable_jnt_comp` opens the
+                // `compound_idx` S().
+                if ct == COMPOUND_DISTANCE && !ip.enable_jnt_comp {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
                 // §5.11.29: the WEDGE sub-branch only exists where
                 // `Wedge_Bits[ MiSize ] > 0`.
                 if ct == COMPOUND_WEDGE && crate::cdf::wedge_bits(sub_size) == 0 {
@@ -2533,12 +2550,32 @@ fn write_block_syntax_inter_frame(
                 }
                 tail.compound_type = crate::cdf::CompoundTypeReadout {
                     comp_group_idx: u8::from(masked),
-                    compound_idx: 1,
+                    compound_idx: u8::from(ct != COMPOUND_DISTANCE),
                     compound_type: ct,
                     wedge_index: (ct == COMPOUND_WEDGE).then_some(ib.wedge_index),
                     wedge_sign: (ct == COMPOUND_WEDGE).then_some(ib.wedge_sign),
                     mask_type: (ct == COMPOUND_DIFFWTD).then_some(ib.mask_type),
                 };
+                // r416 — the §8.3.2 `compound_idx` ctx seed: `fwd =
+                // Abs( get_relative_dist( OrderHints[ RefFrame[0] ],
+                // OrderHint ) )`, `bck = ..RefFrame[1]..`, `ctx +=
+                // ( fwd == bck ) ? 3 : 0` — derived per BLOCK from the
+                // committed reference pair, exactly as the decode
+                // walker derives it at its §5.11.29 read.
+                let oh = &ip.order_hints;
+                let fwd = crate::inter_pred::get_relative_dist(
+                    oh.order_hints_by_ref[ib.ref_frame[0] as usize],
+                    oh.current_order_hint,
+                    oh.order_hint_bits,
+                )
+                .abs();
+                let bck = crate::inter_pred::get_relative_dist(
+                    oh.order_hints_by_ref[ib.ref_frame[1] as usize],
+                    oh.current_order_hint,
+                    oh.order_hint_bits,
+                )
+                .abs();
+                tail.dist_equal = fwd == bck;
             } else if ct != COMPOUND_AVERAGE {
                 return Err(Error::PartitionWalkOutOfRange);
             }
@@ -2668,13 +2705,23 @@ fn write_block_syntax_inter_frame(
                 // r415 — §5.11.29 grid stamps mirror the decode
                 // walker's: the readout values on the compound arm,
                 // the line-1/2 pre-sets everywhere else (validated
-                // above: ib carries exactly that shape).
+                // above: ib carries exactly that shape). r416: only
+                // the MASKED ordinals set `comp_group_idx = 1`;
+                // COMPOUND_DISTANCE stays on the `comp_group_idx = 0`
+                // arm and stamps `compound_idx = 0`.
                 comp_group_idx: u8::from(
                     is_compound
                         && skip_mode == 0
-                        && ib.compound_type != crate::inter_pred::COMPOUND_AVERAGE,
+                        && matches!(
+                            ib.compound_type,
+                            crate::inter_pred::COMPOUND_WEDGE | crate::inter_pred::COMPOUND_DIFFWTD
+                        ),
                 ),
-                compound_idx: 1,
+                compound_idx: u8::from(
+                    !(is_compound
+                        && skip_mode == 0
+                        && ib.compound_type == crate::inter_pred::COMPOUND_DISTANCE),
+                ),
                 compound_type: if is_compound && skip_mode == 0 {
                     ib.compound_type
                 } else {
@@ -6657,6 +6704,143 @@ mod tests {
         // codable there (the `n == 0` arm forces DIFFWTD) — the
         // round-trip test's SPLIT keeps its wedge leaves at 32x32.
         assert_eq!(crate::cdf::wedge_bits(crate::cdf::BLOCK_64X64), 0);
+    }
+
+    /// r416 — jnt-comp round trip under `enable_jnt_comp = 1` (and
+    /// `enable_masked_compound = 1`): a SPLIT mixing a
+    /// COMPOUND_DISTANCE leaf (`comp_group_idx = 0` S() then
+    /// `compound_idx = 0` S()), a COMPOUND_AVERAGE leaf (the coded
+    /// `compound_idx = 1` arm), a COMPOUND_WEDGE leaf (the
+    /// `comp_group_idx = 1` branch bypassing `compound_idx`), and a
+    /// single-ref leaf — replayed bit-for-bit by the decode walker
+    /// under BOTH §8.3.2 `dist_equal` ctx seeds (real unequal order
+    /// hints and the all-zero identity), proving the writer's
+    /// per-block `fwd == bck` derivation and `CompoundIdxs[]` mirror
+    /// stamps track the reader's.
+    #[test]
+    fn r416_inter_syntax_round_trip_jnt_comp() {
+        use crate::inter_pred::{COMPOUND_AVERAGE, COMPOUND_DISTANCE, COMPOUND_WEDGE};
+        for identity_hints in [false, true] {
+            let mut params = inter_params_420(16, 16, /* lossless = */ true);
+            {
+                let ipp = params.inter.as_mut().expect("inter params");
+                ipp.interpolation_filter = SWITCHABLE;
+                ipp.reference_select = true;
+                ipp.enable_masked_compound = true;
+                ipp.enable_jnt_comp = true;
+                if !identity_hints {
+                    // LAST at distance 1, GOLDEN at distance 2 —
+                    // `dist_equal = false` on every compound leaf.
+                    ipp.order_hints = FrameInterOrderHints {
+                        order_hint_bits: 7,
+                        current_order_hint: 2,
+                        order_hints_by_ref: [0, 1, 0, 0, 4, 0, 0, 0],
+                    };
+                }
+            }
+            let comp_leaf = |ct: u8, wi: u8, ws: u8, mv: [[i32; 2]; 2]| -> SyntaxBlock {
+                let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+                b.inter = Some(SyntaxInterBlock {
+                    ref_frame: [1, 4],
+                    y_mode: MODE_NEW_NEWMV,
+                    mv,
+                    ref_mv_idx: 0,
+                    interp_filter: [EIGHTTAP; 2],
+                    skip_mode: 0,
+                    compound_type: ct,
+                    wedge_index: wi,
+                    wedge_sign: ws,
+                    mask_type: 0,
+                });
+                b
+            };
+            // NW: DISTANCE. NE: AVERAGE (coded compound_idx = 1).
+            // SW: WEDGE (comp_group_idx = 1 bypasses compound_idx).
+            // SE: single-ref (bit-silent pre-sets).
+            let nw = comp_leaf(COMPOUND_DISTANCE, 0, 0, [[8, 16], [-4, 24]]);
+            let ne = comp_leaf(COMPOUND_AVERAGE, 0, 0, [[8, 8], [0, 16]]);
+            let sw = comp_leaf(COMPOUND_WEDGE, 7, 1, [[0, 8], [8, 0]]);
+            let se = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+            let node = SyntaxNode::Split([
+                Box::new(SyntaxNode::Leaf(Box::new(nw))),
+                Box::new(SyntaxNode::Leaf(Box::new(ne))),
+                Box::new(SyntaxNode::Leaf(Box::new(sw))),
+                Box::new(SyntaxNode::Leaf(Box::new(se))),
+            ]);
+            let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0xD3);
+
+            let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+            // NW grids: comp_group_idx = 0, compound_idx = 0, DISTANCE.
+            assert_eq!(walker.comp_group_idxs()[cell(0, 0)], 0);
+            assert_eq!(walker.compound_idxs()[cell(0, 0)], 0);
+            assert_eq!(walker.compound_types()[cell(0, 0)], COMPOUND_DISTANCE);
+            // NE grids: the coded compound_idx = 1 AVERAGE arm.
+            assert_eq!(walker.comp_group_idxs()[cell(0, 8)], 0);
+            assert_eq!(walker.compound_idxs()[cell(0, 8)], 1);
+            assert_eq!(walker.compound_types()[cell(0, 8)], COMPOUND_AVERAGE);
+            // SW grids: masked arm keeps the compound_idx pre-set 1.
+            assert_eq!(walker.comp_group_idxs()[cell(8, 0)], 1);
+            assert_eq!(walker.compound_idxs()[cell(8, 0)], 1);
+            assert_eq!(walker.compound_types()[cell(8, 0)], COMPOUND_WEDGE);
+            // SE: single-ref pre-sets.
+            assert_eq!(walker.comp_group_idxs()[cell(8, 8)], 0);
+            assert_eq!(walker.compound_idxs()[cell(8, 8)], 1);
+        }
+    }
+
+    /// r416 — jnt-comp caller bugs are rejected: a DISTANCE leaf with
+    /// the sequence gate closed, DISTANCE with wedge/mask side data,
+    /// and DISTANCE on a single-reference block.
+    #[test]
+    fn r416_inter_syntax_rejects_inconsistent_jnt_comp() {
+        use crate::inter_pred::COMPOUND_DISTANCE;
+        let build = |enable_jnt: bool, ref1: i8, wi: u8, ws: u8, mt: u8| {
+            let mut params = inter_params_420(16, 16, /* lossless = */ true);
+            {
+                let ipp = params.inter.as_mut().expect("inter params");
+                ipp.interpolation_filter = SWITCHABLE;
+                ipp.reference_select = true;
+                ipp.enable_masked_compound = true;
+                ipp.enable_jnt_comp = enable_jnt;
+            }
+            let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+            b.inter = Some(SyntaxInterBlock {
+                ref_frame: [1, ref1],
+                y_mode: if ref1 > 0 { MODE_NEW_NEWMV } else { MODE_NEWMV },
+                mv: [[8, 8], [0, 0]],
+                ref_mv_idx: 0,
+                interp_filter: [EIGHTTAP; 2],
+                skip_mode: 0,
+                compound_type: COMPOUND_DISTANCE,
+                wedge_index: wi,
+                wedge_sign: ws,
+                mask_type: mt,
+            });
+            let node = SyntaxNode::Leaf(Box::new(b));
+            let mut writer = SymbolWriter::new(false);
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut state = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+            write_partition_tree_syntax(
+                &mut writer,
+                &mut cdfs,
+                &mut state,
+                &node,
+                0,
+                0,
+                BLOCK_32X32,
+                &params,
+            )
+        };
+        // Gate closed: DISTANCE not codable.
+        assert!(build(false, 4, 0, 0, 0).is_err());
+        // DISTANCE with wedge / mask side data is not a §5.11.29 shape.
+        assert!(build(true, 4, 3, 0, 0).is_err());
+        assert!(build(true, 4, 0, 1, 0).is_err());
+        assert!(build(true, 4, 0, 0, 1).is_err());
+        // DISTANCE on a single-reference block.
+        assert!(build(true, -1, 0, 0, 0).is_err());
+        // Control: the same DISTANCE leaf on the open gate is fine.
+        assert!(build(true, 4, 0, 0, 0).is_ok());
     }
 
     /// r412 — a committed filter pair inconsistent with the §5.11.x
