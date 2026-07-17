@@ -78,3 +78,27 @@ fn tile_group_start_beyond_end_is_rejected_not_panicking() {
     );
     let _ = oxideav_av1::decode_av1(&bytes);
 }
+
+/// 2026-07-11 scheduled-Fuzz crash `99736d56…` (red 2026-07-11 through
+/// 2026-07-16): a frame header whose §5.9.14 `segmentation_params()`
+/// derives `LastActiveSegId < 7`, combined with a §5.11.9
+/// `read_segment_id()` `S()` payload coding a symbol past that bound.
+/// The `S()` read runs against the full 8-symbol
+/// `Default_Segment_Id_Cdf` regardless of `LastActiveSegId`, so the
+/// attacker-chosen arithmetic payload forced `diff >
+/// last_active_seg_id` and tripped the `§5.11.9 diff is in
+/// 0..=last_active_seg_id` debug assertion (and, past it, would have
+/// driven `neg_deinterleave` outside its `diff < max` domain). Fixed
+/// by the §6.10.8 conformance reject surfacing
+/// [`oxideav_av1::Error::SegmentIdOutOfRange`].
+#[test]
+fn segment_id_symbol_past_last_active_seg_id_is_rejected() {
+    let bytes = hex(
+        "444b494600002000000020444b49464c8ccccccccccccccccccccc4b49420000\
+         20000000284c00cc4a9f554b0e46090000010046003c666137008f0000002800\
+         200000000000000000020000",
+    );
+    // Success and every typed error are both acceptable; only a panic
+    // is a finding.
+    let _ = oxideav_av1::decode_av1(&bytes);
+}

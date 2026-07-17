@@ -11253,9 +11253,13 @@ pub fn get_segment_id(
 ///
 /// All arguments are `u32`. Inputs are spec-bounded: `ref < max` and
 /// `diff < max` per the §5.11.9 surrounds (`ref` is `pred ∈
-/// 0..LastActiveSegId+1`; `diff` is the §8.2.6 `S()` value capped at
-/// `LastActiveSegId+1` by the alphabet size). The function panics on
-/// `max == 0` (a caller bug: `max = LastActiveSegId + 1 >= 1` always).
+/// 0..LastActiveSegId+1`; `diff` is the §8.2.6 `S()` value, which the
+/// [`PartitionWalker::decode_segment_id`] caller validates against
+/// `LastActiveSegId` per §6.10.8 — the raw 8-symbol alphabet can code
+/// values past `max` on a malformed stream, surfaced there as
+/// [`crate::Error::SegmentIdOutOfRange`] before this function runs).
+/// The function panics on `max == 0` (a caller bug:
+/// `max = LastActiveSegId + 1 >= 1` always).
 #[must_use]
 pub fn neg_deinterleave(diff: u32, r: u32, max: u32) -> u32 {
     debug_assert!(max >= 1, "max = LastActiveSegId + 1 >= 1");
@@ -22378,10 +22382,15 @@ impl PartitionWalker {
     /// success, or [`Error::PartitionWalkOutOfRange`] for caller-bug
     /// arguments (out-of-range `sub_size`, `mi_row` / `mi_col`
     /// outside the frame's mi extent, or `last_active_seg_id >=
-    /// MAX_SEGMENTS`). [`Error::UnexpectedEnd`] /
+    /// MAX_SEGMENTS`). [`Error::SegmentIdOutOfRange`] rejects a
+    /// malformed stream whose `S()` symbol exceeds
+    /// `last_active_seg_id` (the §6.10.8 conformance requirement on
+    /// the postprocessed id, checked on the raw symbol via the
+    /// `neg_deinterleave` bijection). [`Error::UnexpectedEnd`] /
     /// [`Error::SymbolExitUnderflow`] surface bitstream errors.
     ///
     /// [`Error::PartitionWalkOutOfRange`]: crate::Error::PartitionWalkOutOfRange
+    /// [`Error::SegmentIdOutOfRange`]: crate::Error::SegmentIdOutOfRange
     /// [`Error::UnexpectedEnd`]: crate::Error::UnexpectedEnd
     /// [`Error::SymbolExitUnderflow`]: crate::Error::SymbolExitUnderflow
     /// [`SegmentationParams::last_active_seg_id`]: crate::uncompressed_header_tail::SegmentationParams::last_active_seg_id
@@ -22480,15 +22489,26 @@ impl PartitionWalker {
             let cdf = cdfs.segment_id_cdf(ctx);
             // §8.2.6 S(): the read against `Default_Segment_Id_Cdf`
             // (length MAX_SEGMENTS + 1 = 9 including the counter slot)
-            // returns 0..=last_active_seg_id (the §5.11.9 spec relies
-            // on `max = LastActiveSegId + 1` as the upper bound; for
-            // the default 8-symbol CDF, the §5.9.14 derivation caps
-            // `last_active_seg_id` at 7).
+            // returns 0..=MAX_SEGMENTS-1 = 0..=7 — the full 8-symbol
+            // alphabet, regardless of the frame's
+            // `last_active_seg_id`.
             let diff = decoder.read_symbol(cdf)?;
-            debug_assert!(
-                diff <= last_active_seg_id as u32,
-                "§5.11.9 diff is in 0..=last_active_seg_id"
-            );
+            // §6.10.8 bitstream conformance: the postprocessed
+            // segment id (the `neg_deinterleave` return) must lie in
+            // `0..=LastActiveSegId`. Because `neg_deinterleave( diff,
+            // pred, max )` is a bijection on `0..max` for any fixed
+            // `pred < max` (with `max = last_active_seg_id + 1`),
+            // that requirement holds exactly when the raw symbol
+            // does; checking `diff` up front also keeps
+            // `neg_deinterleave` inside its documented `diff < max`
+            // domain (its `ref >= max - 1` arm computes
+            // `max - diff - 1`). A corrupt / adversarial stream can
+            // code `diff > last_active_seg_id` whenever
+            // `last_active_seg_id < 7` — reject it as a malformed
+            // stream rather than panicking.
+            if diff > last_active_seg_id as u32 {
+                return Err(crate::Error::SegmentIdOutOfRange);
+            }
             let max = last_active_seg_id as u32 + 1;
             let sid = neg_deinterleave(diff, pred as u32, max);
             debug_assert!(sid < max, "§5.11.9 neg_deinterleave bijects onto 0..max");
@@ -48550,6 +48570,58 @@ mod tests {
         }
         // Adjacent cells stay at -1.
         assert_eq!(walker.segment_ids()[2 * 16], -1);
+    }
+
+    /// §6.10.8 conformance reject: the `S()` alphabet is the full
+    /// 8-symbol `Default_Segment_Id_Cdf` regardless of the frame's
+    /// `last_active_seg_id`, so a malformed stream can code a symbol
+    /// past `last_active_seg_id`. The decoder must surface
+    /// [`crate::Error::SegmentIdOutOfRange`] (never panic, never
+    /// stamp the grid). Found by the scheduled `decode` fuzz target
+    /// (2026-07-11 crash `99736d56…`).
+    #[test]
+    fn decode_segment_id_symbol_past_last_active_is_rejected() {
+        let geom = TileGeometry {
+            mi_row_start: 0,
+            mi_row_end: 16,
+            mi_col_start: 0,
+            mi_col_end: 16,
+        };
+        let mut walker = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs = TileCdfContext::new_from_defaults();
+        // Rig every ctx row to force symbol 5 while the frame's
+        // §5.9.14 derivation says LastActiveSegId = 4.
+        let rigged = force_segment_id_cdf(5);
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs.segment_id[ctx_idx] = rigged;
+        }
+        let bytes = [0u8; 8];
+        let mut dec = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let err = walker
+            .decode_segment_id(&mut dec, &mut cdfs, 0, 0, BLOCK_8X8, 0, 4)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::SegmentIdOutOfRange),
+            "diff = 5 > last_active_seg_id = 4 must reject as a malformed stream, got {err:?}",
+        );
+        // The grid stays at the -1 sentinel: no partial stamp on the
+        // error path.
+        for &cell in walker.segment_ids() {
+            assert_eq!(cell, -1, "no grid stamp on the conformance reject");
+        }
+        // Boundary sanity: the same rigged symbol with
+        // last_active_seg_id = 5 is conformant and decodes
+        // (pred = 0 at the origin ⇒ neg_deinterleave(5, 0, 6) = 5).
+        let mut walker2 = PartitionWalker::new(16, 16, geom).unwrap();
+        let mut cdfs2 = TileCdfContext::new_from_defaults();
+        for ctx_idx in 0..SEGMENT_ID_CONTEXTS {
+            cdfs2.segment_id[ctx_idx] = rigged;
+        }
+        let mut dec2 = SymbolDecoder::init_symbol(&bytes, 8, true).unwrap();
+        let sid = walker2
+            .decode_segment_id(&mut dec2, &mut cdfs2, 0, 0, BLOCK_8X8, 0, 5)
+            .unwrap();
+        assert_eq!(sid, 5, "diff == last_active_seg_id is in range");
     }
 
     /// §5.11.9 non-skip path with a non-zero `pred`: drives the

@@ -2394,6 +2394,22 @@ pub enum Error {
     /// literals can code 15 on a corrupt / adversarial stream, which
     /// would index past the fixed-size point arrays.
     FilmGrainPointCountOverflow,
+    /// A §5.11.9 `read_segment_id()` `S()` read produced a raw
+    /// `segment_id` symbol greater than `LastActiveSegId`, violating
+    /// the §6.10.8 bitstream-conformance requirement that the
+    /// postprocessed segment id (the `neg_deinterleave` return) lie
+    /// in `0..=LastActiveSegId`. The two are equivalent:
+    /// `neg_deinterleave( diff, pred, max )` is a bijection on
+    /// `0..max` for any fixed `pred < max` (with
+    /// `max = LastActiveSegId + 1`), so the postprocessed value is
+    /// in range exactly when the raw symbol is. The §8.2.6 `S()`
+    /// read runs against the full 8-symbol `Default_Segment_Id_Cdf`
+    /// regardless of the frame's `LastActiveSegId`, so a corrupt /
+    /// adversarial stream can code an out-of-range symbol whenever
+    /// `LastActiveSegId < 7`; without this reject the
+    /// `neg_deinterleave` `ref >= max - 1` arm would compute
+    /// `max - diff - 1` outside its `diff < max` domain.
+    SegmentIdOutOfRange,
 }
 
 impl core::fmt::Display for Error {
@@ -2536,6 +2552,10 @@ impl core::fmt::Display for Error {
             Self::FilmGrainPointCountOverflow => write!(
                 f,
                 "oxideav-av1: §5.9.30 film-grain point count exceeds its conformance bound (num_y_points <= 14, num_cb/cr_points <= 10)"
+            ),
+            Self::SegmentIdOutOfRange => write!(
+                f,
+                "oxideav-av1: §5.11.9 segment_id symbol exceeds LastActiveSegId — §6.10.8 conformance violation (corrupt or adversarial stream)"
             ),
         }
     }
