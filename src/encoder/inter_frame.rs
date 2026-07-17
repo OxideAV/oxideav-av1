@@ -1258,6 +1258,23 @@ impl PSearchCtx {
                 palette_colors_v: &[],
                 cdef: None,
                 tx_size: tx_pre,
+                // r415 — the SAME §5.11.29 stamp values the write
+                // pass commits for this leaf (search mirror and write
+                // mirror must observe identical neighbour grids).
+                comp_group_idx: u8::from(
+                    ib.ref_frame[1] > 0
+                        && ib.skip_mode == 0
+                        && ib.compound_type != crate::inter_pred::COMPOUND_AVERAGE,
+                ),
+                compound_idx: 1,
+                compound_type: if ib.ref_frame[1] > 0 && ib.skip_mode == 0 {
+                    ib.compound_type
+                } else {
+                    crate::inter_pred::COMPOUND_AVERAGE
+                },
+                wedge_index: ib.wedge_index,
+                wedge_sign: ib.wedge_sign,
+                mask_type: ib.mask_type,
             },
             None => EncoderBlockSyntaxStamp {
                 mi_row,
@@ -1280,6 +1297,14 @@ impl PSearchCtx {
                 palette_colors_v: &block.palette.colors_v,
                 cdef: None,
                 tx_size: tx_pre,
+                // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+                // comp_group_idx/compound_idx, no side data).
+                comp_group_idx: 0,
+                compound_idx: 1,
+                compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
             },
         };
         self.mirror.stamp_encoder_block_syntax(&stamp);
@@ -1700,6 +1725,10 @@ fn encode_inter_leaf(
         ref_mv_idx: 0,
         interp_filter: [EIGHTTAP; 2],
         skip_mode: 1,
+        compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+        wedge_index: 0,
+        wedge_sign: 0,
+        mask_type: 0,
     });
     let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
     let score_sm = d_sm + lambda * p_leaf_rate(&sm_leaf);
@@ -2430,6 +2459,10 @@ fn encode_inter_leaf_residual(
         ref_mv_idx,
         interp_filter: [filter; 2],
         skip_mode: 0,
+        compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+        wedge_index: 0,
+        wedge_sign: 0,
+        mask_type: 0,
     });
     Ok(block)
 }

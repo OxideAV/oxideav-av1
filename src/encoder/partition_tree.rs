@@ -790,6 +790,23 @@ pub struct SyntaxInterBlock {
     /// §8.3.2 neighbour ctx is the ONLY symbol the mode-info body
     /// codes for such a block.
     pub skip_mode: u8,
+    /// r415 — §5.11.29 committed `compound_type` ordinal. MUST be
+    /// [`crate::inter_pred::COMPOUND_AVERAGE`] on single-reference
+    /// and skip-mode blocks (the bit-silent §5.11.29 arms); on a
+    /// compound block with
+    /// [`SyntaxInterFrameParams::enable_masked_compound`] set it may
+    /// also be [`crate::inter_pred::COMPOUND_WEDGE`] (requires
+    /// `Wedge_Bits[ MiSize ] > 0`) or
+    /// [`crate::inter_pred::COMPOUND_DIFFWTD`] — the writer codes the
+    /// §5.11.29 `comp_group_idx` / `compound_type` cascade.
+    pub compound_type: u8,
+    /// r415 — §5.11.29 `wedge_index` in `0..16` (consulted only when
+    /// `compound_type == COMPOUND_WEDGE`).
+    pub wedge_index: u8,
+    /// r415 — §5.11.29 `wedge_sign` (0/1; COMPOUND_WEDGE only).
+    pub wedge_sign: u8,
+    /// r415 — §5.11.29 `mask_type` (0/1; COMPOUND_DIFFWTD only).
+    pub mask_type: u8,
 }
 
 /// Frame-scope inter state for a §5.11.18 write walk (r411) — the
@@ -1858,6 +1875,14 @@ pub fn write_block_syntax(
                 palette_colors_v: &[],
                 cdef: cdef_committed,
                 tx_size: tx_size_blk as u8,
+                // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+                // comp_group_idx/compound_idx, no side data).
+                comp_group_idx: 0,
+                compound_idx: 1,
+                compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
             });
         // §5.11.49 `palette_tokens( )` — `PaletteSize{Y,UV} = 0` on
         // the intrabc arm ⇒ no-op.
@@ -2075,6 +2100,14 @@ pub fn write_block_syntax(
             palette_colors_v: &pal.colors_v,
             cdef: cdef_committed,
             tx_size: tx_size_blk as u8,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
 
     // §5.11.5 line `read_block_tx_size( )` — §5.11.16 write driver
@@ -2468,6 +2501,61 @@ fn write_block_syntax_inter_frame(
         tail.enable_interintra_compound = ip.enable_interintra_compound;
         tail.enable_masked_compound = ip.enable_masked_compound;
         tail.enable_jnt_comp = ip.enable_jnt_comp;
+        // r415 — §5.11.29 `read_compound_type()` readout from the
+        // committed compound selection. The masked arms
+        // (COMPOUND_WEDGE / COMPOUND_DIFFWTD ⇒ `comp_group_idx = 1`)
+        // are codable only on a compound non-skip-mode block with the
+        // sequence gate open; every other arm is bit-silent and only
+        // the §5.11.29 line-1/2 pre-set shape is committable.
+        {
+            use crate::inter_pred::{COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_WEDGE};
+            let ct = ib.compound_type;
+            let masked = ct == COMPOUND_WEDGE || ct == COMPOUND_DIFFWTD;
+            let side_ok = match ct {
+                COMPOUND_WEDGE => {
+                    ib.mask_type == 0 && (ib.wedge_index as usize) < 16 && ib.wedge_sign <= 1
+                }
+                COMPOUND_DIFFWTD => ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type <= 1,
+                COMPOUND_AVERAGE => ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type == 0,
+                _ => false,
+            };
+            if !side_ok {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            if is_compound && skip_mode == 0 {
+                if masked && !ip.enable_masked_compound {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                // §5.11.29: the WEDGE sub-branch only exists where
+                // `Wedge_Bits[ MiSize ] > 0`.
+                if ct == COMPOUND_WEDGE && crate::cdf::wedge_bits(sub_size) == 0 {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+                tail.compound_type = crate::cdf::CompoundTypeReadout {
+                    comp_group_idx: u8::from(masked),
+                    compound_idx: 1,
+                    compound_type: ct,
+                    wedge_index: (ct == COMPOUND_WEDGE).then_some(ib.wedge_index),
+                    wedge_sign: (ct == COMPOUND_WEDGE).then_some(ib.wedge_sign),
+                    mask_type: (ct == COMPOUND_DIFFWTD).then_some(ib.mask_type),
+                };
+            } else if ct != COMPOUND_AVERAGE {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            // §8.3.2 `comp_group_idx` / `compound_idx` neighbour ctx
+            // from the mirror's grids (identity 0 / 1 when
+            // unavailable — the bit_silent defaults).
+            if avail_u {
+                let cell = (((mi_row - 1) * state.mi_cols) + mi_col) as usize;
+                tail.above_comp_group_idx = state.mirror.comp_group_idxs()[cell];
+                tail.above_compound_idx = state.mirror.compound_idxs()[cell];
+            }
+            if avail_l {
+                let cell = ((mi_row * state.mi_cols) + mi_col - 1) as usize;
+                tail.left_comp_group_idx = state.mirror.comp_group_idxs()[cell];
+                tail.left_compound_idx = state.mirror.compound_idxs()[cell];
+            }
+        }
         tail.interp_filter = if ip.interpolation_filter != SWITCHABLE {
             // §5.11.x else-arm: both slots read the frame filter with
             // no bits — the committed pair must carry exactly that.
@@ -2577,6 +2665,24 @@ fn write_block_syntax_inter_frame(
                 palette_colors_v: &[],
                 cdef: cdef_committed,
                 tx_size: tx_pre as u8,
+                // r415 — §5.11.29 grid stamps mirror the decode
+                // walker's: the readout values on the compound arm,
+                // the line-1/2 pre-sets everywhere else (validated
+                // above: ib carries exactly that shape).
+                comp_group_idx: u8::from(
+                    is_compound
+                        && skip_mode == 0
+                        && ib.compound_type != crate::inter_pred::COMPOUND_AVERAGE,
+                ),
+                compound_idx: 1,
+                compound_type: if is_compound && skip_mode == 0 {
+                    ib.compound_type
+                } else {
+                    crate::inter_pred::COMPOUND_AVERAGE
+                },
+                wedge_index: ib.wedge_index,
+                wedge_sign: ib.wedge_sign,
+                mask_type: ib.mask_type,
             });
 
         // §5.11.16 + §5.11.34 (mirrors the intrabc arm: inter luma
@@ -2747,6 +2853,14 @@ fn write_block_syntax_inter_frame(
             palette_colors_v: &pal.colors_v,
             cdef: cdef_committed,
             tx_size: tx_pre as u8,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
 
     // §5.11.16 — intra ⇒ the §5.11.15 else arm.
@@ -6125,6 +6239,10 @@ mod tests {
             ref_mv_idx: 0,
             interp_filter: [EIGHTTAP; 2],
             skip_mode: 0,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
         b
     }
@@ -6342,6 +6460,10 @@ mod tests {
                 ref_mv_idx,
                 interp_filter: [EIGHTTAP; 2],
                 skip_mode: 0,
+                compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
             });
             b
         };
@@ -6411,6 +6533,132 @@ mod tests {
         assert_eq!(walker.ref_frames()[cell(8, 8) * 2 + 1], -1);
     }
 
+    /// r415 — MASKED-compound round trip under
+    /// `enable_masked_compound = 1`: a SPLIT mixing a COMPOUND_WEDGE
+    /// leaf (`comp_group_idx = 1` S(), `compound_type` S(),
+    /// `wedge_index` S() + `wedge_sign` L(1)), a COMPOUND_DIFFWTD
+    /// leaf (`mask_type` L(1)), a COMPOUND_AVERAGE leaf (the coded
+    /// `comp_group_idx = 0` arm — one extra S() vs the gate-closed
+    /// configuration), and a single-ref leaf (bit-silent §5.11.29
+    /// else-arm) — replayed bit-for-bit by the decode walker with the
+    /// §5.11.5 compound side-data grids checked, proving the write
+    /// mirror's `CompGroupIdxs[]` ctx stamps track the reader's.
+    #[test]
+    fn r415_inter_syntax_round_trip_masked_compound() {
+        use crate::inter_pred::{COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_WEDGE};
+        let mut params = inter_params_420(16, 16, /* lossless = */ true);
+        {
+            let ipp = params.inter.as_mut().expect("inter params");
+            ipp.interpolation_filter = SWITCHABLE;
+            ipp.reference_select = true;
+            ipp.enable_masked_compound = true;
+        }
+        let masked_leaf = |ct: u8, wi: u8, ws: u8, mt: u8, mv: [[i32; 2]; 2]| -> SyntaxBlock {
+            let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+            b.inter = Some(SyntaxInterBlock {
+                ref_frame: [1, 4],
+                y_mode: MODE_NEW_NEWMV,
+                mv,
+                ref_mv_idx: 0,
+                interp_filter: [EIGHTTAP; 2],
+                skip_mode: 0,
+                compound_type: ct,
+                wedge_index: wi,
+                wedge_sign: ws,
+                mask_type: mt,
+            });
+            b
+        };
+        // NW: WEDGE (index 7, sign 1). NE: DIFFWTD (mask 1).
+        // SW: AVERAGE (coded comp_group_idx = 0). SE: single-ref.
+        let nw = masked_leaf(COMPOUND_WEDGE, 7, 1, 0, [[8, 16], [-4, 24]]);
+        let ne = masked_leaf(COMPOUND_DIFFWTD, 0, 0, 1, [[8, 8], [0, 16]]);
+        let sw = masked_leaf(COMPOUND_AVERAGE, 0, 0, 0, [[0, 8], [8, 0]]);
+        let se = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0xC7);
+
+        let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+        // NW grids: comp_group_idx = 1, WEDGE + side data.
+        assert_eq!(walker.comp_group_idxs()[cell(0, 0)], 1);
+        assert_eq!(walker.compound_types()[cell(0, 0)], COMPOUND_WEDGE);
+        assert_eq!(walker.compound_wedge_indices()[cell(0, 0)], 7);
+        assert_eq!(walker.compound_wedge_signs()[cell(0, 0)], 1);
+        // NE grids: DIFFWTD + mask type.
+        assert_eq!(walker.comp_group_idxs()[cell(0, 8)], 1);
+        assert_eq!(walker.compound_types()[cell(0, 8)], COMPOUND_DIFFWTD);
+        assert_eq!(walker.compound_mask_types()[cell(0, 8)], 1);
+        // SW grids: the coded comp_group_idx = 0 AVERAGE arm.
+        assert_eq!(walker.comp_group_idxs()[cell(8, 0)], 0);
+        assert_eq!(walker.compound_types()[cell(8, 0)], COMPOUND_AVERAGE);
+        // SE: single-ref pre-sets.
+        assert_eq!(walker.comp_group_idxs()[cell(8, 8)], 0);
+        assert_eq!(walker.compound_idxs()[cell(8, 8)], 1);
+    }
+
+    /// r415 — masked-compound caller bugs are rejected: a WEDGE leaf
+    /// with the sequence gate closed, a WEDGE-with-mask-type mixed
+    /// shape, and a masked type on a single-reference block.
+    #[test]
+    fn r415_inter_syntax_rejects_inconsistent_masked_compound() {
+        use crate::inter_pred::{COMPOUND_DIFFWTD, COMPOUND_WEDGE};
+        let build = |enable: bool, ref1: i8, ct: u8, wi: u8, ws: u8, mt: u8| {
+            let mut params = inter_params_420(16, 16, /* lossless = */ true);
+            {
+                let ipp = params.inter.as_mut().expect("inter params");
+                ipp.interpolation_filter = SWITCHABLE;
+                ipp.reference_select = true;
+                ipp.enable_masked_compound = enable;
+            }
+            let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+            b.inter = Some(SyntaxInterBlock {
+                ref_frame: [1, ref1],
+                y_mode: if ref1 > 0 { MODE_NEW_NEWMV } else { MODE_NEWMV },
+                mv: [[8, 8], [0, 0]],
+                ref_mv_idx: 0,
+                interp_filter: [EIGHTTAP; 2],
+                skip_mode: 0,
+                compound_type: ct,
+                wedge_index: wi,
+                wedge_sign: ws,
+                mask_type: mt,
+            });
+            let node = SyntaxNode::Leaf(Box::new(b));
+            let mut writer = SymbolWriter::new(false);
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut state = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+            // BLOCK_32X32 — a §5.11.29 wedge-capable size
+            // (`Wedge_Bits[ MiSize ] > 0`).
+            write_partition_tree_syntax(
+                &mut writer,
+                &mut cdfs,
+                &mut state,
+                &node,
+                0,
+                0,
+                BLOCK_32X32,
+                &params,
+            )
+        };
+        // Gate closed: masked type not codable.
+        assert!(build(false, 4, COMPOUND_WEDGE, 3, 0, 0).is_err());
+        // WEDGE with a mask_type is not a §5.11.29 shape.
+        assert!(build(true, 4, COMPOUND_WEDGE, 3, 0, 1).is_err());
+        // Masked type on a single-reference block.
+        assert!(build(true, -1, COMPOUND_DIFFWTD, 0, 0, 1).is_err());
+        // Control: the same WEDGE leaf with the gate open is fine.
+        assert!(build(true, 4, COMPOUND_WEDGE, 3, 0, 0).is_ok());
+        // §5.11.29 `Wedge_Bits[ BLOCK_64X64 ] == 0`: WEDGE is not
+        // codable there (the `n == 0` arm forces DIFFWTD) — the
+        // round-trip test's SPLIT keeps its wedge leaves at 32x32.
+        assert_eq!(crate::cdf::wedge_bits(crate::cdf::BLOCK_64X64), 0);
+    }
+
     /// r412 — a committed filter pair inconsistent with the §5.11.x
     /// gates is a caller bug: a GLOBALMV leaf claiming a coded SHARP
     /// filter on the identity-warp configuration must be rejected
@@ -6478,6 +6726,14 @@ mod tests {
             palette_colors_v: &[],
             cdef: None,
             tx_size: TX_4X4 as u8,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
         let stack = scratch
             .find_mv_stack(

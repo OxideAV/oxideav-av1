@@ -16095,6 +16095,25 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     /// `MOTION_MODE_SIMPLE` initial-zero state. Read by the §5.11.33
     /// frame walk's OBMC / warp dispatch.
     pub motion_mode: u8,
+    /// r415 — §5.11.29 `comp_group_idx` (`0` on single-reference /
+    /// skip-mode / COMPOUND_AVERAGE blocks; `1` selects the masked
+    /// group). Stamped into `CompGroupIdxs[]` over the footprint only
+    /// when `is_inter != 0`, mirroring the decode walker.
+    pub comp_group_idx: u8,
+    /// r415 — §5.11.29 `compound_idx` (the line-2 pre-set `1` while
+    /// `enable_jnt_comp == 0`). Stamped into `CompoundIdxs[]` only
+    /// when `is_inter != 0`.
+    pub compound_idx: u8,
+    /// r415 — §5.11.29 `compound_type` ordinal (COMPOUND_AVERAGE on
+    /// every non-masked block). Stamped into `CompoundTypes[]` only
+    /// when `is_inter != 0`.
+    pub compound_type: u8,
+    /// r415 — §5.11.29 `wedge_index` / `wedge_sign` / `mask_type`
+    /// side data (`0` when the sub-branch did not fire), stamped into
+    /// their §5.11.5 grids only when `is_inter != 0`.
+    pub wedge_index: u8,
+    pub wedge_sign: u8,
+    pub mask_type: u8,
     /// §5.11.46 `PaletteSizeY` (0 = no luma palette).
     pub palette_size_y: u8,
     /// §5.11.46 `palette_colors_y[ 0..PaletteSizeY ]`.
@@ -16144,6 +16163,12 @@ pub(crate) struct EncoderStampSnapshot {
     delta_lfs: Vec<i32>,
     palette_sizes: Vec<u8>,
     palette_colors: Vec<u16>,
+    comp_group_idxs: Vec<u8>,
+    compound_idxs: Vec<u8>,
+    compound_types: Vec<u8>,
+    compound_wedge_indices: Vec<u8>,
+    compound_wedge_signs: Vec<u8>,
+    compound_mask_types: Vec<u8>,
 }
 
 /// Per-tile frame-constant parameters threaded into the §5.11.2
@@ -20863,6 +20888,16 @@ impl PartitionWalker {
                     // decode walker's per-footprint stamp). Drives the
                     // §5.11.33 frame walk's OBMC / warp dispatch.
                     self.motion_modes[cell] = s.motion_mode;
+                    // r415 — §5.11.29 / §8.3.2 grid-fill twins of the
+                    // decode walker's `CompGroupIdxs` / `CompoundIdxs`
+                    // / `CompoundTypes` (+ wedge/diffwtd side data)
+                    // stamps.
+                    self.comp_group_idxs[cell] = s.comp_group_idx;
+                    self.compound_idxs[cell] = s.compound_idx;
+                    self.compound_types[cell] = s.compound_type;
+                    self.compound_wedge_indices[cell] = s.wedge_index;
+                    self.compound_wedge_signs[cell] = s.wedge_sign;
+                    self.compound_mask_types[cell] = s.mask_type;
                 }
                 if s.palette_size_y > 0 {
                     self.palette_sizes[cell] = s.palette_size_y;
@@ -20981,6 +21016,12 @@ impl PartitionWalker {
             delta_lfs: Vec::with_capacity(cells * FRAME_LF_COUNT),
             palette_sizes: Vec::with_capacity(cells * 3),
             palette_colors: Vec::with_capacity(cells * 3 * PALETTE_COLORS),
+            comp_group_idxs: Vec::with_capacity(cells),
+            compound_idxs: Vec::with_capacity(cells),
+            compound_types: Vec::with_capacity(cells),
+            compound_wedge_indices: Vec::with_capacity(cells),
+            compound_wedge_signs: Vec::with_capacity(cells),
+            compound_mask_types: Vec::with_capacity(cells),
         };
         for rr in mi_row..r1 {
             for cc in mi_col..c1 {
@@ -21010,6 +21051,15 @@ impl PartitionWalker {
                         &self.palette_colors[pcell * PALETTE_COLORS..(pcell + 1) * PALETTE_COLORS],
                     );
                 }
+                snap.comp_group_idxs.push(self.comp_group_idxs[cell]);
+                snap.compound_idxs.push(self.compound_idxs[cell]);
+                snap.compound_types.push(self.compound_types[cell]);
+                snap.compound_wedge_indices
+                    .push(self.compound_wedge_indices[cell]);
+                snap.compound_wedge_signs
+                    .push(self.compound_wedge_signs[cell]);
+                snap.compound_mask_types
+                    .push(self.compound_mask_types[cell]);
             }
         }
         snap
@@ -21050,6 +21100,12 @@ impl PartitionWalker {
                                 ..(i * 3 + plane + 1) * PALETTE_COLORS],
                         );
                 }
+                self.comp_group_idxs[cell] = snap.comp_group_idxs[i];
+                self.compound_idxs[cell] = snap.compound_idxs[i];
+                self.compound_types[cell] = snap.compound_types[i];
+                self.compound_wedge_indices[cell] = snap.compound_wedge_indices[i];
+                self.compound_wedge_signs[cell] = snap.compound_wedge_signs[i];
+                self.compound_mask_types[cell] = snap.compound_mask_types[i];
                 i += 1;
             }
         }
@@ -61780,6 +61836,14 @@ mod tests {
             palette_colors_v: &[],
             cdef: None,
             tx_size: 0,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
 
         // Fresh walker: curr_frame[0] is unallocated; the frame bridge
@@ -61858,6 +61922,14 @@ mod tests {
             palette_colors_v: &[],
             cdef: None,
             tx_size: 0,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
         // Baseline stamp INSIDE the rect (the committed pre-trial leaf).
         let base = EncoderBlockSyntaxStamp {
@@ -61881,6 +61953,14 @@ mod tests {
             palette_colors_v: &[],
             cdef: None,
             tx_size: 0,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         };
         walker.stamp_encoder_block_syntax(&base);
 
@@ -61948,6 +62028,14 @@ mod tests {
             palette_colors_v: &[50, 60],
             cdef: None,
             tx_size: 4,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
         assert_ne!(
             stack_at(&walker).ref_stack_mv,
@@ -62105,6 +62193,14 @@ mod tests {
                 palette_colors_v: &[],
                 cdef: None,
                 tx_size: 0,
+                // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+                // comp_group_idx/compound_idx, no side data).
+                comp_group_idx: 0,
+                compound_idx: 1,
+                compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
             });
         }
 
@@ -62210,6 +62306,14 @@ mod tests {
                     palette_colors_v: &[],
                     cdef: None,
                     tx_size: 0,
+                    // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+                    // comp_group_idx/compound_idx, no side data).
+                    comp_group_idx: 0,
+                    compound_idx: 1,
+                    compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+                    wedge_index: 0,
+                    wedge_sign: 0,
+                    mask_type: 0,
                 });
             }
             let ref_spec = PlaneRefSpec {
@@ -62334,6 +62438,14 @@ mod tests {
             palette_colors_v: &[],
             cdef: None,
             tx_size: 0,
+            // r415 §5.11.29 compound defaults (AVERAGE, pre-set
+            // comp_group_idx/compound_idx, no side data).
+            comp_group_idx: 0,
+            compound_idx: 1,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
         });
         let good_spec = PlaneRefSpec {
             plane: 0,
