@@ -4,6 +4,83 @@ All notable changes to `oxideav-av1` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-av1/compare/v0.1.14...v0.2.0) - 2026-07-17
+
+### Other
+
+- av1 r416: README rollup + sweep matrix gains fine/bands sub-8 content kinds
+- av1 r416: pin two sub-8x8 GOP conformance streams — corpus 58 -> 60
+- av1 encoder r416: sub-8x8 inter leaves — 4x4/8x4/4x8 blocks + 16x4/4x16 strips in the partition search
+- av1 r416: pin jnt-comp GOP conformance stream — corpus 57 -> 58
+- av1 encoder r416: jnt-comp in the RD ladder — COMPOUND_DISTANCE leaves, sequence gate on
+- av1 encoder r416: §5.11.29 jnt-comp WRITE arm — COMPOUND_DISTANCE commitments, per-block dist_equal ctx seed, mirror grid parity
+- av1 r415: README + CHANGELOG rollup — B-pyramid GOPs, masked compound, corpus 57
+- av1 r415: pin masked-compound GOP conformance stream — corpus 56 -> 57
+- av1 encoder r415: masked compound in the RD ladder — COMPOUND_WEDGE / COMPOUND_DIFFWTD leaves, sequence gate on
+- av1 encoder r415: §5.11.29 masked-compound WRITE arm — comp_group_idx cascade, wedge/diffwtd commitments, mirror grid parity
+- av1 r415: pin three self-encoded B-pyramid conformance streams — corpus 53 -> 56
+- av1 encoder r415: selection-proving B-frame witnesses — bidirectional compound, backward single reference, forward/backward skip mode
+- av1 encoder r415: B-pyramid GOPs — backward references, out-of-order coding, show_existing_frame, bidirectional compound
+- av1 encoder r415: generalise inter reference plumbing — N-plane §7.20 slot map, ladder-driven mode search, full §5.9.22 derivation twin
+- av1 fuzz hardening: §5.11.9 segment-id symbol past LastActiveSegId rejects, never panics
+- mark internal spec-driver surface #[doc(hidden)]
+- av1 r413: pin three self-encoded GOP conformance streams — corpus 50 -> 53 (README + CHANGELOG r413 rollup)
+- av1 encoder r413: use_ref_frame_mvs P-frames — shared §7.9 motion-field estimation, non-error-resilient headers
+- av1 encoder r413: EXT-alphabet partitions — HORZ_A/HORZ_B/VERT_A/VERT_B T-shapes + HORZ_4/VERT_4 four-strip shapes
+- av1 encoder r413: SEG_LVL_ALT_Q segmentation-aware P-frames — spatial §5.11.19/§5.11.20 map coding + per-segment quantisation
+- av1 encoder r413: §5.11.10 skip-mode P-frames — header derivation, block syntax, RD trial
+- av1 encoder r413: §5.5.1 order hints on every encoded stream — 7-bit order_hint, true §5.9.2 ref_order_hint[] surfacing
+- av1 r412: pin three self-encoded GOP conformance streams — corpus 47 -> 50 (README + CHANGELOG r412 rollup)
+- av1 encoder r412: COMPOUND_AVERAGE two-reference prediction — {LAST, GOLDEN} compound leaves
+- av1 encoder r412: two-slot reference rotation — per-block LAST/GOLDEN selection
+- av1 encoder r412: HORZ/VERT rectangular partitions — SyntaxNode writer extension + rect inter leaves
+- av1 encoder r412: SWITCHABLE interpolation-filter signaling + per-leaf filter search
+- av1 encoder r412: NEARESTMV/NEARMV mode selection — snapshotable driver-side §7.10.2 MV-prediction mirror
+- av1 r411: pin three self-encoded KEY+P GOP conformance streams — corpus 44 -> 47 (README + CHANGELOG inter-encoder rollup)
+- av1 r411: reject tg_start > tg_end tile groups — 2026-07-11 scheduled-fuzz finding
+- av1 encoder r411: §5.11.47 inter transform-type RD search + §5.11.40 chroma inheritance + §7.12.3 step-3 flip remap
+- av1 encoder r411: TX_MODE_SELECT P-frames — §5.11.17 txfm_split trees + intra tx_depth in inter frames
+- av1 encoder r411: quarter-pel motion — sub-pel MV refinement through the §7.11.3.4 kernel
+- av1 encoder r411: conformance-grade single-reference inter P-frame GOP encoder
+- av1 encoder r411: §5.11.18 inter_frame_mode_info write arm — full-syntax inter-frame leaves
+- av1 encoder r410: §5.11.24 filter-intra encoding — the five §7.11.2.3 recursive modes join the luma picker
+- av1 encoder r410: dimension cap 512 -> 4096 per axis — HD/UHD keyframes
+- av1 encoder r410: §5.11.47 per-TU luma transform-type RD search — ADST/IDTX/V_DCT/H_DCT arms live
+- av1 r410: pin three self-encoded conformance-grade keyframe streams — corpus 41 -> 44 (README + CHANGELOG encoder-milestone rollup)
+- av1 encoder r410: TX_MODE_SELECT + §5.11.15 tx_depth RD search — lossy keyframes mix TX sizes across and within the partition tree
+- av1 encoder r410: §5.11.42/§5.11.43 angle-delta search on both mode pickers
+- av1 encoder r410: full square partition RD search + 13-mode intra + large transforms in the conformance-grade keyframe driver
+- av1 encoder r409: BLOCK_8X8 partition search — 8x8 leaf (4x TX_4X4 lossless / TX_8X8 lossy) vs 4x4 split by per-node RD trial with region snapshot/restore; all 7 black-box configs stay byte-exact
+- av1 encoder r409: public encode_av1 graduates to the conformance-grade keyframe driver — [8,512] lossless scope, conformant public encode/decode pair (roundtrip surfaces Frame::Spec)
+- av1 r409: pin two self-encoded conformance-grade keyframe streams — corpus 39 -> 41 (README + CHANGELOG encoder-milestone rollup)
+- av1 encoder r409: conformance-grade intra KEY-frame encoder — spec-faithful §5.11.7 keyframe syntax via write_partition_tree_syntax, §5.10 OBU_FRAME assembly, 7-mode SSD picker + chroma CFL, lossless WHT + lossy DCT arms (§5.11.40 Mode_To_Txfm chroma tx-types); 7 configs decode byte-exact in the spec driver AND two independent reference decoders
+- av1 encoder r409: §8.2.4-conformant arithmetic-coder termination — finish() lands the trailing one-bit at trailingBitPosition (last-15-bits 0x4000 in-interval adjustment, minimal emission); independent decoders enforce the check and rejected every prior tile
+- av1 encoder r409: bit-precise §5.3.4 trailing_bits in the OBU body writers — trailing one-bit in the first unused bit after the syntax (framer-appended 0x80 landed it a byte late on mid-byte syntax ends; black-box decoders reject such sequence headers)
+- av1 decoder r409: public decode_av1 parity with the spec driver — encoder-mirror path first (non-conformant own-stream round-trips preserved bit-exact), decode_av1_spec fallback surfacing Frame::Spec for every conformance-scope stream; per-fixture parity assertions across the 39-stream corpus
+- av1 decoder r408: four more spec-conformance root causes off the 54-config sweep — §5.11.2 clear_above_context() at every tile entry (second tile ROW desynced its coefficient contexts), §7.11.3.1 useWarp=2 on the INTER half of inter-intra blends (GLOBALMV interintra leaves translated where the spec warps), §7.20 film-grain forwarding (save_grain_params + §5.9.30 update_grain==0 predicted load + §7.18.3 grain on show_existing_frame outputs), §7.11.5 CfL luma TU-overhang store (spec CurrFrame extends past the mi grid; the MaxLumaW clamp reads it) — 54/54 sweep configs byte-exact incl. 10/12-bit, 4:4:4/4:2:2, monochrome, screen content, 2x2 tiles, S-frames, film grain, cpu-used=1; corpus 35 -> 39 pinned streams
+- av1 decoder r408: three ref-MV / warp / superres spec-conformance fixes — §7.10.2.12 single-pred global-MV stack fill (empty-stack NEARESTMV/NEARMV blocks on global-motion frames predicted zero MVs), §7.11.3.5 block-warp plain-Round2 rounding (Round2Signed picked the adjacent filter phase on negative shear, isolated ±1 diffs on compound GLOBAL_GLOBALMV blocks), §5.11.27 is_scaled divides by the COODED FrameWidth (superres inter frames desynchronised at the motion_mode/use_obmc read) — full-superres GOPs with LR at the upscaled extent, resize GOPs, and alt-ref-pyramid GOPs over textured content all byte-exact; 36-config black-box sweep clean; corpus 32 -> 35 pinned streams
+- av1 decoder r405: scaled-reference MC (luma-unit dim contract) + SIMPLE-GLOBALMV global-warp arm + delta-q trio (ReadDeltas lifecycle / per-tile qindex seed / per-block dequant) — 3 more streams pinned, 32 total
+- av1 decoder r405: §7.11.3 intra-block-copy prediction + §7.10.2.4 scan_point decoded-gate fix — the pinned 176x144 intra divergence closed, 3 intrabc streams byte-exact
+- av1 r394: document the QM / segmentation-inter / jnt-comp / registry round (README + CHANGELOG)
+- av1 decoder r394: clip CurrFrame stitches for §5.11.4 bottom/right overhanging inter blocks — 64x40 GOP byte-exact
+- av1 r394: registry decoder is the full spec-driver inter decoder — cross-packet SpecDecodeSession + per-temporal-unit packet framing
+- av1 decoder r394: segmentation-enabled inter frames — per-segment §5.11.14 feature gates + §5.11.21 segment-id prediction, cyclic-refresh GOPs byte-exact
+- av1 decoder r394: per-block §8.3.2 compound_idx distance ctx + three §7.11.3 inter fixes — dual-filter/OBMC/jnt-comp streams byte-exact
+- av1 decoder r394: §7.12.3 quantizer-matrix application in the spec driver — QM streams byte-exact (intra + inter GOP)
+- av1 r390: document the 16/16 byte-exact conformance corpus (README + CHANGELOG)
+- av1 decoder r390: 10/12-bit output surface — EVERY corpus stream byte-exact (16 of 16)
+- av1 decoder r390: §6.8.21 load_cdfs counter reset + §7.11.3.5 chroma-warp clamp — show-existing-frame byte-exact (all 8-bit corpus streams)
+- av1 r390: iterate order_hints for the §7.9.2 dst projection loop (clippy needless_range_loop)
+- av1 decoder r390: primary-ref CDF forwarding + §7.9 temporal MVs + §7.19/§7.20 motion-field store + §7.21 KEY show reload
+- av1 header r390: §5.9.2 load_previous() forwarding + §5.9.22 SkipModeFrame + KEY show_existing_frame semantics
+- av1 decoder r390: §5.11.5 inter YModes[] grid-fill — obu-with-extension-headers byte-exact (12 of 13)
+- add CI / crates.io / docs.rs / MIT-license badges
+- av1 decoder r387: bound the §5.9.30 film-grain point counts — fix the second Fuzz decode-target crash
+- av1 r387: document the inter-frame decode driver (README + CHANGELOG)
+- av1 decoder r387: inter-frame decode driver — KEY+P stream byte-exact (11 of 13 corpus streams)
+- av1 decoder r387: in-walk §5.11.33 inter prediction + §5.11.22 intra-in-inter + real inter-arm quantiser
+- av1 decoder r387: bound the §5.11.39 golomb chain — fix the scheduled-Fuzz decode-target overflow
+
 - av1 r416: **two more self-encoded streams pinned in the conformance corpus (58 → 60)** — `self-gop-64x64-q60-sub8-split` (PARTITION_SPLIT at BLOCK_8X8 coding BLOCK_4X4 inter leaves on 4×4-checkerboard motion: §5.11.5 `HasChroma` group-chroma coding at the bottom-right cell and the §5.11.33 chroma sub-block tiling over the four collocated luma MVs) and `self-gop-64x64-q60-sub8-strips` (PARTITION_HORZ_4 at BLOCK_16X16 coding BLOCK_16X4 strips plus PARTITION_HORZ at BLOCK_8X8 coding BLOCK_8X4 halves on 4-row band motion, odd-row strips carrying the two-row group's chroma at the §5.11.38 plane residual size); each digest pinned to the byte-identical output of THREE independent third-party decoders (black-box), the in-tree spec driver, and the encoder's own reconstruction. Fixtures + generation notes staged under `docs/video/av1/fixtures/`.
 
 - av1 encoder r416: **sub-8×8 inter leaves — 4×4 / 8×4 / 4×8 blocks and the 16×4 / 4×16 strip alphabet** — the P/B partition search floor drops from BLOCK_8X8 to BLOCK_4X4: BLOCK_8X8 nodes trial PARTITION_HORZ / PARTITION_VERT (8×4 / 4×8 leaves, the 4-value W8 partition alphabet) and PARTITION_SPLIT into four BLOCK_4X4 leaves, and the r413 HORZ_4 / VERT_4 sub-8 strip skip is lifted (16×4 / 4×16 strips at BLOCK_16X16 now searchable). Sub-8×8 leaves are single-reference by the §5.11.25 `Min( bw4, bh4 ) >= 2` forcing (the compound ladder empties there; §5.11.10 skip-mode and the §5.11.29 cascades stay bit-silent) and inter-only by encoder policy (intra stays available from BLOCK_8X8 up, keeping the §5.11.33 `someUseIntra` split out of emitted streams while the decoder handles it regardless). Residual coding grows the §5.11.34 `HasChroma` gate: a sub-8×8 leaf codes chroma only on the bottom/right cell of its 2×2 group, over the §5.11.38 plane residual size (the WHOLE group's chroma at the `(MiCol >> subX)` lifted origin, predicted through the decoder's own §5.11.33 per-luma-cell chroma tiling), with the §5.11.40 inter-chroma TxType lift's `Max( MiRow/MiCol, .. )` clip binding at the leaf origin; BLOCK_4X4 inter takes the §5.11.16 else arm (no var-tx trees); the depth-RD trial loop snapshots the group-aligned rect so group-chroma writes never leak between candidates. Selection witnesses: 4×4-checkerboard motion commits BLOCK_4X4 SPLIT leaves; 4-row band motion commits both HORZ_4 strip nodes and HORZ-at-8×8 halves — both GOPs round-trip byte-exact through the spec driver, and the 30-config pyramid sweep re-validates byte-identical in three independent decoders with the sub-8 alphabet live.
