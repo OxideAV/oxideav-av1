@@ -108,7 +108,7 @@ post-pass chain on mi-grid-padded planes — §7.14 deblock (gated on
 nonzero luma filter levels), §7.15 CDEF, §7.16 superres upscaling of
 both the CDEF output and the post-deblock frame, §7.17 loop restoration
 (Wiener / self-guided / switchable), the §7.18.2 crop, and §7.18.3 film
-grain. `tests/fixture_conformance.rs` pins 53 streams byte-exact against
+grain. `tests/fixture_conformance.rs` pins 57 streams byte-exact against
 independent-decoder output (the 16-stream corpus staged under
 `docs/video/av1/fixtures/` plus 10 r394 validator-produced streams —
 QM intra/inter, dual-filter + OBMC, jnt-comp pyramids, cyclic-refresh
@@ -514,6 +514,35 @@ sweep (5 geometries × 6 q × 7 contents + 20 segmentation configs)
 byte-exact in THREE independent reference decoders, and three more
 self-encoded streams pinned in the conformance corpus (53 total).
 
+### Inter encoder: B-pyramid GOPs + masked compound (r415)
+
+r415 lands the backward-reference arc. **B-pyramid GOPs**
+(`encoder::encode_pyramid_gop_yuv420{,_with_q}`): each mini-GOP of up
+to four frames codes OUT OF ORDER as a two-level pyramid — the last
+frame first as a decoded-not-shown ALT reference (`show_frame = 0`,
+coded `showable_frame = 1`), the midpoint as a not-shown MID
+reference predicting forward (LAST) and backward (BWDREF/ALTREF —
+§7.8 sign bias 1, §7.9 bidirectional temporal projection), shown B
+frames between the anchors with `{ LAST, BWDREF }` / `{ LAST,
+ALTREF }` bidirectional COMPOUND_AVERAGE pairs (the §5.11.25
+`BIDIR_COMP_REFERENCE` cascade) and §5.9.22 forward/backward skip
+mode, and §5.9.2 `show_existing_frame` short headers at each
+not-shown frame's display position. Order-hint-tracked three-slot
+§7.20 rotation hands the ALT slot to the next mini-GOP as its anchor;
+temporal units follow the "exactly one shown frame per unit"
+conformance rule (not-shown frames ride the next shown frame's unit).
+**Masked compound**: every sequence header now opens
+`enable_masked_compound` — compound leaves code the §5.11.29
+`comp_group_idx` cascade and the RD ladder trials all 32
+COMPOUND_WEDGE `(index, sign)` pairs plus both COMPOUND_DIFFWTD mask
+types through the decoder's own §7.11.3.11/§7.11.3.12 mask blends
+(wedge-blend content provably commits WEDGE leaves). Validated by
+selection-proving witnesses, spec-driver round trips over GOP
+lengths 1-9 × the full content/q matrix, a 30-config pyramid
+black-box sweep plus P-GOP re-validation byte-exact in THREE
+independent reference decoders, and four more self-encoded streams
+pinned in the conformance corpus (57 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -525,13 +554,14 @@ self-encoded streams pinned in the conformance corpus (53 total).
   streams (kept for their bit-exact self round-trip through
   `decode_av1`'s mirror arm); conformance-grade encoding lives on
   `encoder::encode_key_frame_yuv420` /
-  `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}`. Conformant
-  encoding beyond the r413 scope (palette/intrabc leaves in inter
-  frames, masked/jnt compound, sub-8×8 inter leaves — which also gate
-  HORZ_4/VERT_4 at BLOCK_16X16 — §5.11.19 temporal segment-map
-  update, backward references / B-pyramid GOPs on top of the r413
-  order-hint + motion-field groundwork, true bit-accounting rate
-  costs, per-segment lossless mixing) is the follow-up ladder.
+  `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
+  `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
+  encoding beyond the r415 scope (palette/intrabc leaves in inter
+  frames, jnt-comp distance weights, sub-8×8 inter leaves — which
+  also gate HORZ_4/VERT_4 at BLOCK_16X16 — §5.11.19 temporal
+  segment-map update, deeper-than-two pyramid levels / adaptive
+  mini-GOP sizing, true bit-accounting rate costs, per-segment
+  lossless mixing) is the follow-up ladder.
 
 ## Module layout
 
