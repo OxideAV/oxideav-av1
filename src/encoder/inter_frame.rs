@@ -3824,4 +3824,246 @@ mod tests {
             assert_eq!(f.planes[2], enc.recon[idx].v, "frame {idx} V");
         }
     }
+
+    /// r415 — a B-frame search context: `refs[ 0 ]` = the forward
+    /// anchor (LAST, hint 0), `refs[ 1 ]` = the backward reference
+    /// (BWDREF/ALTREF2/ALTREF, hint 2), current hint 1 — §7.8 sign
+    /// bias 1 on the backward ordinals.
+    fn b_frame_ctx<'a>(
+        anchor: &'a GopFrameRecon,
+        future: &'a GopFrameRecon,
+        mi_rows: u32,
+        mi_cols: u32,
+        base_q_idx: u8,
+        skip_mode: bool,
+    ) -> PSearchCtx {
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.order_hints = crate::cdf::FrameInterOrderHints {
+            order_hint_bits: 7,
+            current_order_hint: 1,
+            order_hints_by_ref: [0, 0, 0, 0, 0, 2, 2, 2],
+        };
+        for r in 5..=7usize {
+            ip.ref_frame_sign_bias[r] = 1;
+        }
+        ip.skip_mode_present = skip_mode;
+        ip.skip_mode_frame = [1, 5];
+        let mut slot_to_plane = [0usize; 8];
+        slot_to_plane[1] = 1;
+        let mut ref_frame_idx = [0u8; 7];
+        ref_frame_idx[4] = 1;
+        ref_frame_idx[5] = 1;
+        ref_frame_idx[6] = 1;
+        PSearchCtx::with_refs(
+            &[anchor, future],
+            slot_to_plane,
+            ref_frame_idx,
+            vec![1, 5],
+            vec![[1, 5]],
+            mi_rows,
+            mi_cols,
+            (mi_cols * 4) as usize,
+            (mi_rows * 4) as usize,
+            ip,
+            base_q_idx,
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn fresh_recon(w: usize, h: usize, q: u8) -> ReconState {
+        ReconState {
+            y: vec![0u8; w * h],
+            u: vec![0u8; (w / 2) * (h / 2)],
+            v: vec![0u8; (w / 2) * (h / 2)],
+            width: w,
+            height: h,
+            chroma_w: w / 2,
+            chroma_h: h / 2,
+            mi_rows: (h / 4) as u32,
+            mi_cols: (w / 4) as u32,
+            lossless: q == 0,
+            qp: QuantizerParams::neutral(q, 8),
+            bd: BlockDecodedMirror::new(),
+        }
+    }
+
+    /// r415 — bidirectional COMPOUND_AVERAGE must actually be selected
+    /// where the forward/backward mean is the distortion winner: the
+    /// target frame is the PIXELWISE AVERAGE of the anchor and the
+    /// future reference, so a { LAST, BWDREF } compound leaf predicts
+    /// it almost exactly while either single side misses by half the
+    /// delta.
+    #[test]
+    fn r415_b_search_selects_bidir_compound_on_blended_content() {
+        let f0 = moving_gradient(64, 64, 0, 0, 40);
+        let f2 = moving_gradient(64, 64, 0, 0, 140);
+        let base_q_idx = 60u8;
+        let k0 = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
+        let k2 = encode_key_frame_yuv420_with_q(&f2, base_q_idx).unwrap();
+        let anchor = GopFrameRecon {
+            y: k0.recon_y,
+            u: k0.recon_u,
+            v: k0.recon_v,
+        };
+        let future = GopFrameRecon {
+            y: k2.recon_y,
+            u: k2.recon_u,
+            v: k2.recon_v,
+        };
+        let mut target = Yuv420Frame::filled(64, 64, 0);
+        let avg = |a: &[u8], b: &[u8], out: &mut [u8]| {
+            for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
+                *o = (u16::from(x) + u16::from(y)).div_ceil(2) as u8;
+            }
+        };
+        avg(&anchor.y, &future.y, &mut target.y);
+        avg(&anchor.u, &future.u, &mut target.u);
+        avg(&anchor.v, &future.v, &mut target.v);
+
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ictx = b_frame_ctx(&anchor, &future, 16, 16, base_q_idx, false);
+        recon.bd.clear_for_sb(0, 0, 16, 16);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, compound: &mut u32, single: &mut u32) {
+            let leafc = |b: &SyntaxBlock, compound: &mut u32, single: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.ref_frame == [1, 5] {
+                        *compound += 1;
+                    } else {
+                        *single += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, compound, single),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, compound, single);
+                    }
+                }
+                other => {
+                    for b in other.asymmetric_blocks().iter() {
+                        leafc(b, compound, single);
+                    }
+                }
+            }
+        }
+        let (mut compound, mut single) = (0u32, 0u32);
+        count(&tree, &mut compound, &mut single);
+        assert!(
+            compound > 0,
+            "average-blend content must select {{ LAST, BWDREF }} bidirectional \
+             compound leaves (got COMPOUND={compound} SINGLE={single})"
+        );
+    }
+
+    /// r415 — the backward single reference must actually be selected
+    /// where the future frame matches: the target IS the future
+    /// reference's content, so BWDREF single-ref leaves dominate.
+    #[test]
+    fn r415_b_search_selects_backward_reference_on_future_matching_content() {
+        let f0 = moving_gradient(64, 64, 0, 0, 5);
+        let f2 = moving_gradient(64, 64, 9, 13, 505);
+        let base_q_idx = 60u8;
+        let k0 = encode_key_frame_yuv420_with_q(&f0, base_q_idx).unwrap();
+        let k2 = encode_key_frame_yuv420_with_q(&f2, base_q_idx).unwrap();
+        let anchor = GopFrameRecon {
+            y: k0.recon_y,
+            u: k0.recon_u,
+            v: k0.recon_v,
+        };
+        let future = GopFrameRecon {
+            y: k2.recon_y,
+            u: k2.recon_u,
+            v: k2.recon_v,
+        };
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ictx = b_frame_ctx(&anchor, &future, 16, 16, base_q_idx, false);
+        recon.bd.clear_for_sb(0, 0, 16, 16);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, bwd: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, bwd: &mut u32, other: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.ref_frame == [5, -1] {
+                        *bwd += 1;
+                    } else {
+                        *other += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, bwd, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, bwd, other);
+                    }
+                }
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
+                        leafc(b, bwd, other);
+                    }
+                }
+            }
+        }
+        let (mut bwd, mut other) = (0u32, 0u32);
+        count(&tree, &mut bwd, &mut other);
+        assert!(
+            bwd > 0,
+            "future-matching content must select BWDREF single-reference \
+             leaves (got BWD={bwd} OTHER={other})"
+        );
+    }
+
+    /// r415 — §5.9.22 forward/backward skip mode on a B frame:
+    /// identical converged references make the one-symbol skip-mode
+    /// block (compound NEAREST_NEARESTMV over
+    /// SkipModeFrame[] = {{ LAST, BWDREF }}) the RD winner.
+    #[test]
+    fn r415_b_search_selects_skip_mode_between_converged_references() {
+        let f = moving_gradient(64, 64, 2, 3, 21);
+        let base_q_idx = 60u8;
+        let k = encode_key_frame_yuv420_with_q(&f, base_q_idx).unwrap();
+        let anchor = GopFrameRecon {
+            y: k.recon_y,
+            u: k.recon_u,
+            v: k.recon_v,
+        };
+        let future = anchor.clone();
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ictx = b_frame_ctx(&anchor, &future, 16, 16, base_q_idx, true);
+        recon.bd.clear_for_sb(0, 0, 16, 16);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, sm: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, sm: &mut u32, other: &mut u32| {
+                if b.inter.as_ref().is_some_and(|ib| ib.skip_mode != 0) {
+                    *sm += 1;
+                } else {
+                    *other += 1;
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, sm, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, sm, other);
+                    }
+                }
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
+                        leafc(b, sm, other);
+                    }
+                }
+            }
+        }
+        let (mut sm, mut other) = (0u32, 0u32);
+        count(&tree, &mut sm, &mut other);
+        assert!(
+            sm > 0,
+            "converged references on a skip-mode B frame must select \
+             skip_mode leaves (got SKIP_MODE={sm} OTHER={other})"
+        );
+    }
 }
