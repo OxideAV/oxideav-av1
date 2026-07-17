@@ -618,6 +618,22 @@ pub(crate) fn skip_mode_allowed(
     order_hint: u32,
     order_hint_bits: u8,
 ) -> bool {
+    skip_mode_params_twin(ref_order_hints, ref_frame_idx, order_hint, order_hint_bits).0
+}
+
+/// r415 — the FULL §5.9.22 `skip_mode_params()` derivation twin:
+/// `( skipModeAllowed, SkipModeFrame[ 0..2 ] )`. On the
+/// forward/backward arm `SkipModeFrame[] = LAST_FRAME + Min/Max(
+/// forwardIdx, backwardIdx )`; the two-forward fallback substitutes
+/// `secondForwardIdx` (the closest hint strictly older than
+/// `forwardHint`). Returns `[ 0, 0 ]` when not allowed (the spec's
+/// untouched initialisation).
+pub(crate) fn skip_mode_params_twin(
+    ref_order_hints: &[u32; 8],
+    ref_frame_idx: &[u8; 7],
+    order_hint: u32,
+    order_hint_bits: u8,
+) -> (bool, [i8; 2]) {
     let mut forward_idx: i32 = -1;
     let mut backward_idx: i32 = -1;
     let mut forward_hint: u32 = 0;
@@ -637,20 +653,35 @@ pub(crate) fn skip_mode_allowed(
         }
     }
     if forward_idx < 0 {
-        return false;
+        return (false, [0, 0]);
     }
     if backward_idx >= 0 {
-        return true;
+        // §5.9.22: `SkipModeFrame[ i ] = LAST_FRAME + Min/Max(
+        // forwardIdx, backwardIdx )`.
+        let lo = forward_idx.min(backward_idx) as i8;
+        let hi = forward_idx.max(backward_idx) as i8;
+        return (true, [1 + lo, 1 + hi]);
     }
-    // Two-forward-reference fallback: a second forward hint strictly
-    // older than `forwardHint`.
-    ref_frame_idx.iter().any(|&slot| {
-        relative_dist(
-            ref_order_hints[slot as usize],
-            forward_hint,
-            order_hint_bits,
-        ) < 0
-    })
+    // Two-forward-reference fallback: the closest hint strictly older
+    // than `forwardHint`.
+    let mut second_forward_idx: i32 = -1;
+    let mut second_forward_hint: u32 = 0;
+    for (i, &slot) in ref_frame_idx.iter().enumerate() {
+        let ref_hint = ref_order_hints[slot as usize];
+        if relative_dist(ref_hint, forward_hint, order_hint_bits) < 0
+            && (second_forward_idx < 0
+                || relative_dist(ref_hint, second_forward_hint, order_hint_bits) > 0)
+        {
+            second_forward_idx = i as i32;
+            second_forward_hint = ref_hint;
+        }
+    }
+    if second_forward_idx < 0 {
+        return (false, [0, 0]);
+    }
+    let lo = forward_idx.min(second_forward_idx) as i8;
+    let hi = forward_idx.max(second_forward_idx) as i8;
+    (true, [1 + lo, 1 + hi])
 }
 
 fn encode_inter_global_motion_identity_only(bw: &mut BitWriter, gm: &GlobalMotionParams) {

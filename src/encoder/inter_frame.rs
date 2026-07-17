@@ -754,17 +754,27 @@ struct PSearchCtx {
     mi_cols: u32,
     luma_w: u32,
     luma_h: u32,
-    /// The two reference reconstructions, widened to the §7.11.3.4
-    /// sample type: `ref_planes[ 0 ]` = the previous frame
-    /// (LAST_FRAME), `ref_planes[ 1 ]` = the frame before it
-    /// (GOLDEN_FRAME).
-    ref_planes: [[Vec<u16>; 3]; 2],
-    /// §7.20 slot each of the two references occupies this frame
-    /// (`[ last_slot, golden_slot ]` — the r412 two-slot rotation).
-    ref_slots: [usize; 2],
+    /// r415 — the DISTINCT reference reconstructions this frame reads,
+    /// widened to the §7.11.3.4 sample type (one entry per distinct
+    /// coded frame; [`Self::slot_to_plane`] maps §7.20 slots onto
+    /// them).
+    ref_planes: Vec<[Vec<u16>; 3]>,
+    /// r415 — §7.20 slot → [`Self::ref_planes`] index. Slots never
+    /// resolved through `ref_frame_idx` may point anywhere (their
+    /// content is immaterial but must be sized like a real plane).
+    slot_to_plane: [usize; 8],
     /// §5.9.2 `ref_frame_idx[ 0..7 ]` — the header's slot map, fed
     /// verbatim to the decoder's leaf driver.
     ref_frame_idx: [u8; 7],
+    /// r415 — the single-reference ladder: each entry is a raw
+    /// `RefFrame` ordinal (`LAST_FRAME = 1 ..= ALTREF_FRAME = 7`) the
+    /// per-leaf §5.11.24 search trials with its own motion search.
+    single_refs: Vec<i8>,
+    /// r415 — the compound ladder: `[ fwd, bwd-or-second ]` pairs the
+    /// §5.11.25 cascade can code (slot 0 must be the §6.10.24 lower
+    /// ordinal); both members must appear in [`Self::single_refs`]
+    /// (NEW_NEWMV reuses their searched vectors).
+    compound_pairs: Vec<[i8; 2]>,
     // §5.11.5 grids (per mi cell).
     mi_sizes: Vec<usize>,
     is_inters: Vec<u8>,
@@ -818,6 +828,9 @@ struct PSearchCtx {
 }
 
 impl PSearchCtx {
+    /// r412 two-slot P-frame configuration: LAST = `prev`, GOLDEN =
+    /// `prevprev`, ladder `{ LAST, GOLDEN }` singles + the one
+    /// unidirectional compound pair.
     #[allow(clippy::too_many_arguments)]
     fn new(
         prev: &GopFrameRecon,
@@ -831,6 +844,57 @@ impl PSearchCtx {
         base_q_idx: u8,
         seg_alt_q: &[i16],
     ) -> Result<Self, Error> {
+        let last_slot = (p_index & 1) as usize;
+        let golden_slot = ((p_index - 1) & 1) as usize;
+        let mut slot_to_plane = [0usize; 8];
+        slot_to_plane[golden_slot] = 1;
+        let mut ref_frame_idx = [last_slot as u8; 7];
+        ref_frame_idx[3] = golden_slot as u8;
+        Self::with_refs(
+            &[prev, prevprev],
+            slot_to_plane,
+            ref_frame_idx,
+            vec![1, 4],
+            vec![[1, 4]],
+            mi_rows,
+            mi_cols,
+            width,
+            height,
+            ip,
+            base_q_idx,
+            seg_alt_q,
+        )
+    }
+
+    /// r415 — the general reference configuration: `refs` are the
+    /// distinct reference reconstructions, `slot_to_plane` the §7.20
+    /// slot map onto them, `ref_frame_idx` the §5.9.2 header slot map,
+    /// and `single_refs` / `compound_pairs` the RD ladder (see the
+    /// field docs).
+    #[allow(clippy::too_many_arguments)]
+    fn with_refs(
+        refs: &[&GopFrameRecon],
+        slot_to_plane: [usize; 8],
+        ref_frame_idx: [u8; 7],
+        single_refs: Vec<i8>,
+        compound_pairs: Vec<[i8; 2]>,
+        mi_rows: u32,
+        mi_cols: u32,
+        width: usize,
+        height: usize,
+        ip: SyntaxInterFrameParams,
+        base_q_idx: u8,
+        seg_alt_q: &[i16],
+    ) -> Result<Self, Error> {
+        if refs.is_empty()
+            || slot_to_plane.iter().any(|&p| p >= refs.len())
+            || single_refs.iter().any(|&r| !(1..=7).contains(&r))
+            || compound_pairs.iter().any(|pr| {
+                !single_refs.contains(&pr[0]) || !single_refs.contains(&pr[1]) || pr[0] >= pr[1]
+            })
+        {
+            return Err(Error::PartitionWalkOutOfRange);
+        }
         let cells = (mi_rows as usize) * (mi_cols as usize);
         let widen = |p: &[u8]| p.iter().map(|&v| u16::from(v)).collect::<Vec<u16>>();
         let mut gm_flat = [0i32; 48];
@@ -859,16 +923,14 @@ impl PSearchCtx {
             mi_cols,
             luma_w: width as u32,
             luma_h: height as u32,
-            ref_planes: [
-                [widen(&prev.y), widen(&prev.u), widen(&prev.v)],
-                [widen(&prevprev.y), widen(&prevprev.u), widen(&prevprev.v)],
-            ],
-            ref_slots: [(p_index & 1) as usize, ((p_index - 1) & 1) as usize],
-            ref_frame_idx: {
-                let mut idx = [(p_index & 1) as u8; 7];
-                idx[3] = ((p_index - 1) & 1) as u8;
-                idx
-            },
+            ref_planes: refs
+                .iter()
+                .map(|r| [widen(&r.y), widen(&r.u), widen(&r.v)])
+                .collect(),
+            slot_to_plane,
+            ref_frame_idx,
+            single_refs,
+            compound_pairs,
             mi_sizes: vec![BLOCK_4X4; cells],
             is_inters: vec![0u8; cells],
             ref_frames,
@@ -987,6 +1049,12 @@ impl PSearchCtx {
             prev_l
         };
         pred as u8
+    }
+
+    /// r415 — resolve a raw `RefFrame` ordinal to its
+    /// [`Self::ref_planes`] index through the header slot map.
+    fn plane_of_ref(&self, rf: i8) -> usize {
+        self.slot_to_plane[self.ref_frame_idx[(rf - 1) as usize] as usize]
     }
 
     /// §7.10.2 `find_mv_stack( 0 )` against the driver mirror for the
@@ -1134,7 +1202,7 @@ impl PSearchCtx {
         // scratch planes mutably.
         let (luma_w, luma_h) = (self.luma_w, self.luma_h);
         let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
-        let ref_slots = self.ref_slots;
+        let slot_to_plane = self.slot_to_plane;
         let ref_frame_idx = self.ref_frame_idx;
         let PSearchCtx {
             ref_planes,
@@ -1158,32 +1226,31 @@ impl PSearchCtx {
             ..
         } = &mut *self;
 
-        // §7.20 `FrameStore` views — the r412 two-slot rotation:
-        // `golden_slot` holds the frame-before-previous, every other
-        // slot the previous frame (only the two rotated slots are
-        // ever referenced through `ref_frame_idx`). Dimensions are
-        // LUMA extents per the r405 contract; strides are plane
-        // samples.
+        // §7.20 `FrameStore` views — r415: each slot resolves through
+        // `slot_to_plane` to its distinct reference reconstruction
+        // (slots outside the mapped roles point at plane 0, never
+        // resolved through `ref_frame_idx`). Dimensions are LUMA
+        // extents per the r405 contract; strides are plane samples.
         let store_y = make_store(
-            &ref_planes[0][0],
-            &ref_planes[1][0],
-            ref_slots[1],
+            ref_planes,
+            &slot_to_plane,
+            0,
             luma_w as usize,
             luma_w,
             luma_h,
         );
         let store_u = make_store(
-            &ref_planes[0][1],
-            &ref_planes[1][1],
-            ref_slots[1],
+            ref_planes,
+            &slot_to_plane,
+            1,
             (luma_w as usize) / 2,
             luma_w,
             luma_h,
         );
         let store_v = make_store(
-            &ref_planes[0][2],
-            &ref_planes[1][2],
-            ref_slots[1],
+            ref_planes,
+            &slot_to_plane,
+            2,
             (luma_w as usize) / 2,
             luma_w,
             luma_h,
@@ -1266,22 +1333,21 @@ impl PSearchCtx {
     }
 }
 
-/// One plane's §7.20 `FrameStore` view for the r412 two-slot
-/// rotation: `golden_slot` holds the frame-before-previous plane,
-/// every other slot the previous frame (extents in LUMA samples per
-/// the r405 contract, stride in this plane's own samples). Slots
-/// outside the two rotated ones are never resolved through
-/// `ref_frame_idx`, so their content is immaterial.
+/// One plane's §7.20 `FrameStore` view (r415 general form): slot `s`
+/// resolves to `ref_planes[ slot_to_plane[ s ] ][ plane ]` (extents in
+/// LUMA samples per the r405 contract, stride in this plane's own
+/// samples). Slots outside the frame's mapped roles are never resolved
+/// through `ref_frame_idx`, so their content is immaterial.
 fn make_store<'a>(
-    prev: &'a [u16],
-    prevprev: &'a [u16],
-    golden_slot: usize,
+    ref_planes: &'a [[Vec<u16>; 3]],
+    slot_to_plane: &[usize; 8],
+    plane: usize,
     stride: usize,
     luma_w: u32,
     luma_h: u32,
 ) -> [RefFrameStoreEntry<'a>; 8] {
     core::array::from_fn(|slot| RefFrameStoreEntry {
-        plane: if slot == golden_slot { prevprev } else { prev },
+        plane: &ref_planes[slot_to_plane[slot]][plane],
         stride,
         upscaled_width: luma_w,
         width: luma_w,
@@ -1588,13 +1654,18 @@ fn encode_inter_leaf_modes(
         b(mv[0] - pred[0]) + b(mv[1] - pred[1])
     };
     let mut cands: Vec<ModeCand> = Vec::with_capacity(18);
-    let mut searched_mv: [[i32; 2]; 2] = [[0, 0]; 2];
-    for (ref_ord, rf) in [(0usize, 1i8), (1, 4)] {
+    // r415 — per-reference searched vectors, keyed by the raw
+    // `RefFrame` ordinal (NEW_NEWMV compound candidates reuse them).
+    let mut searched_mv: [[i32; 2]; 8] = [[0, 0]; 8];
+    let single_refs = ictx.single_refs.clone();
+    let compound_pairs = ictx.compound_pairs.clone();
+    for (ref_ord, &rf) in single_refs.iter().enumerate() {
         let ref_bias = ref_ord as u64;
         let stack = ictx.find_stack(mi_r, mi_c, b_size, [rf, -1])?;
+        let ref_plane = ictx.plane_of_ref(rf);
         let mv_int = motion_search_luma(
             input,
-            &ictx.ref_planes[ref_ord][0],
+            &ictx.ref_planes[ref_plane][0],
             width,
             recon.height,
             row0,
@@ -1610,7 +1681,7 @@ fn encode_inter_leaf_modes(
         let mv_new = refine_mv_subpel(
             input, ictx, mi_r, mi_c, b_size, rf, row0, col0, bw, bh, width, mv_int,
         )?;
-        searched_mv[ref_ord] = mv_new;
+        searched_mv[rf as usize] = mv_new;
         let nfound = stack.num_mv_found;
         {
             // NEWMV: pick the reachable drl slot with the cheapest
@@ -1668,14 +1739,14 @@ fn encode_inter_leaf_modes(
         });
     }
 
-    // r412 — COMPOUND_AVERAGE candidates over the { LAST, GOLDEN }
-    // pair (§5.11.25 unidirectional compound; the §5.11.29 tail is
-    // bit-silent on this configuration and derives COMPOUND_AVERAGE):
-    // NEAREST_NEARESTMV / NEAR_NEARMV from the compound §7.10.2
-    // stack, GLOBAL_GLOBALMV at the identity derivation, and
-    // NEW_NEWMV re-using the two per-reference searched vectors.
-    {
-        let crf: [i8; 2] = [1, 4];
+    // r412 — COMPOUND_AVERAGE candidates over each ladder pair
+    // (§5.11.25 unidirectional or bidirectional compound; the
+    // §5.11.29 tail is bit-silent on this configuration and derives
+    // COMPOUND_AVERAGE): NEAREST_NEARESTMV / NEAR_NEARMV from the
+    // compound §7.10.2 stack, GLOBAL_GLOBALMV at the identity
+    // derivation, and NEW_NEWMV re-using the two per-reference
+    // searched vectors.
+    for &crf in &compound_pairs {
         let stack = ictx.find_stack(mi_r, mi_c, b_size, crf)?;
         let nfound = stack.num_mv_found;
         cands.push(ModeCand {
@@ -1715,14 +1786,15 @@ fn encode_inter_leaf_modes(
                 2 => 1,
                 _ => 2,
             };
+            let pair_mv = [searched_mv[crf[0] as usize], searched_mv[crf[1] as usize]];
             let mut best: Option<(u64, u32)> = None;
             for idx in 0..=window {
                 let pred0 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 0, idx)?;
                 let pred1 = assign_mv_pred_mv(&stack, MODE_NEW_NEWMV, 1, idx)?;
                 let rate = 8
                     + u64::from(idx)
-                    + diff_bits(searched_mv[0], pred0)
-                    + diff_bits(searched_mv[1], pred1);
+                    + diff_bits(pair_mv[0], pred0)
+                    + diff_bits(pair_mv[1], pred1);
                 if best.map_or(true, |(r, _)| rate < r) {
                     best = Some((rate, idx));
                 }
@@ -1731,7 +1803,7 @@ fn encode_inter_leaf_modes(
             cands.push(ModeCand {
                 ref_frame: crf,
                 y_mode: MODE_NEW_NEWMV,
-                mv: searched_mv,
+                mv: pair_mv,
                 ref_mv_idx: idx,
                 rate,
             });
