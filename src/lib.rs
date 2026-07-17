@@ -1519,27 +1519,60 @@
 use oxideav_core::RuntimeContext;
 
 mod bitreader;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cdef;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cdf;
 pub mod decoder;
 pub mod encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod film_grain;
 mod film_grain_tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod frame_header;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod inter_pred;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod loop_filter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod loop_restoration;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod obu;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod qmatrix;
 pub mod registry;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod scan;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sequence_header;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod superres;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod symbol_decoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tile_info;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod transform;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod uncompressed_header_tail;
 
+#[doc(hidden)]
 pub use cdf::{
     block_height, block_width, cfl_alpha_u_ctx, cfl_alpha_v_ctx, coeff_cdf_q_ctx,
     compound_mode_ctx, compute_tx_type, find_tx_size, get_br_ctx, get_coeff_base_ctx,
@@ -1623,6 +1656,7 @@ pub use cdf::{
     TX_WIDTH_LOG2, UNIDIR_COMP_REFS, UV_INTRA_MODES_CFL_ALLOWED, UV_INTRA_MODES_CFL_NOT_ALLOWED,
     V_ADST, V_DCT, V_FLIPADST, V_PRED, WEDGE_TYPES, ZERO_MV_CONTEXTS,
 };
+#[doc(hidden)]
 pub use cdf::{
     GM_TYPE_AFFINE, GM_TYPE_IDENTITY, GM_TYPE_ROTZOOM, GM_TYPE_TRANSLATION, MAX_REF_MV_STACK_SIZE,
     MODE_GLOBALMV, MODE_GLOBAL_GLOBALMV, MODE_NEARESTMV, MODE_NEAREST_NEARESTMV,
@@ -1631,6 +1665,7 @@ pub use cdf::{
 };
 // r205: §7.9 motion-field-estimation helpers + the §7.10.2.5 /
 // §7.10.2.6 temporal-scan grid + §3 constants.
+#[doc(hidden)]
 pub use cdf::{
     get_block_position, get_mv_projection, MotionFieldMvs, DIV_MULT, MAX_OFFSET_HEIGHT,
     MAX_OFFSET_WIDTH, MFMV_INVALID, MFMV_STACK_SIZE, MV_IN_USE_BITS,
@@ -1638,12 +1673,14 @@ pub use cdf::{
 // r178: §5.11.x `read_interpolation_filter` named ordinals + readout
 // aggregate, plus the §5.11.28 / §5.11.29 readout aggregates exposed
 // alongside (each `DecodedInterBlockModeInfo` field references them).
+#[doc(hidden)]
 pub use cdf::{
     CompoundTypeReadout, InterIntraReadout, InterpolationFilterReadout, BILINEAR, EIGHTTAP,
     EIGHTTAP_SHARP, EIGHTTAP_SMOOTH, SWITCHABLE,
 };
 // r179: §5.11.39 `coeffs` per-TU readout aggregate ([`cdf::CoefficientsReadout`])
 // surfaced through [`cdf::PartitionWalker::coefficients`].
+#[doc(hidden)]
 pub use cdf::CoefficientsReadout;
 // r180: §5.11.33 `compute_prediction()` per-plane dispatcher readout
 // ([`cdf::ComputePredictionReadout`] + [`cdf::PlanePredictionTask`])
@@ -1651,6 +1688,7 @@ pub use cdf::CoefficientsReadout;
 // the §7.11.2.5 DC-PRED sample-generation leaf
 // ([`cdf::predict_intra_dc_pred`]) and the §5.11.38
 // `get_plane_residual_size` / `SUBSAMPLED_SIZE` helpers.
+#[doc(hidden)]
 pub use cdf::{
     get_plane_residual_size, predict_intra_dc_pred, ComputePredictionReadout, PlanePredictionTask,
     COMPUTE_PRED_MODE_INTER, SUBSAMPLED_SIZE,
@@ -1661,6 +1699,7 @@ pub use cdf::{
 // is already exported via the r180 export block above); plus the
 // §7.11.2.1 `AboveRow[]` / `LeftCol[]` neighbour-array derivation
 // helpers that read `CurrFrame[plane]` and feed the leaves.
+#[doc(hidden)]
 pub use cdf::{
     derive_above_row, derive_left_col, predict_intra_h_pred, predict_intra_v_pred, DC_PRED, H_PRED,
 };
@@ -1668,6 +1707,7 @@ pub use cdf::{
 // sample-generation leaf that consumes the §5.11.49 `ColorMap{Y,UV}`
 // index map (surfaced on `DecodedBlock` in r325) plus the §5.11.46
 // `PaletteColors{Y,U,V}[ ]` table to write palette-predicted samples.
+#[doc(hidden)]
 pub use cdf::predict_palette;
 // r187: §7.11.2.2 PAETH_PRED + §7.11.2.6 SMOOTH / SMOOTH_V /
 // SMOOTH_H_PRED sample-generation leaves admitted to the dispatcher
@@ -1679,6 +1719,7 @@ pub use cdf::predict_palette;
 // §6.10.x intra-mode ordinals (`SMOOTH_PRED` / `SMOOTH_V_PRED` /
 // `SMOOTH_H_PRED` / `PAETH_PRED`) and the §7.11.2.6 `Sm_Weights_Tx_*`
 // weight tables verbatim from av1-spec p.508.
+#[doc(hidden)]
 pub use cdf::{
     derive_above_left, predict_intra_paeth_pred, predict_intra_smooth_h_pred,
     predict_intra_smooth_pred, predict_intra_smooth_v_pred, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED,
@@ -1701,6 +1742,7 @@ pub use cdf::{
 // produces the correct shape with the lower-quality un-filtered edges.
 // Plus the six named §6.10.x D-mode intra-mode ordinals (`D45_PRED` /
 // `D135_PRED` / `D113_PRED` / `D157_PRED` / `D203_PRED` / `D67_PRED`).
+#[doc(hidden)]
 pub use cdf::{
     filter_corner, intra_edge_filter, intra_edge_filter_strength_selection, intra_edge_upsample,
     intra_edge_upsample_selection, predict_intra_d_mode, predict_intra_directional, ANGLE_STEP,
@@ -1711,6 +1753,7 @@ pub use cdf::{
 // ([`cdf::ResidualReadout`] + [`cdf::ResidualTuTask`]) surfaced
 // through [`cdf::PartitionWalker::residual`], plus the §5.11.37
 // per-plane transform-size lookup [`cdf::get_tx_size`].
+#[doc(hidden)]
 pub use cdf::{get_tx_size, ResidualReadout, ResidualTuTask};
 // r183: §7.12.2 dequantization-function tables + helpers + §7.12.3
 // step-1 dequantization loop ([`cdf::dequantize_step1`]) + §5.11.47
@@ -1722,6 +1765,7 @@ pub use cdf::{get_tx_size, ResidualReadout, ResidualTuTask};
 // per-block [`cdf::ResidualContext`] aggregate bundles the
 // `base_q_idx` / segmentation / `delta_q_*` / `using_qmatrix` state
 // the dispatcher needs.
+#[doc(hidden)]
 pub use cdf::{
     ac_q, dc_q, dequant_denom, dequantize_step1, get_ac_quant, get_dc_quant, get_qindex,
     QuantizerParams, ResidualContext, TransformTypeReadout, AC_QLOOKUP, DC_QLOOKUP,
@@ -1737,26 +1781,33 @@ pub use cdf::{
 // `inverse_identity`) and the §7.13.2.1 butterfly building blocks
 // (`butterfly_b` / `butterfly_h` / `cos128` / `sin128` / `brev`)
 // are exposed standalone for bit-exact testing.
+#[doc(hidden)]
 pub use frame_header::{
     parse_frame_header, parse_frame_header_with_refs, FrameHeader, FrameSize, FrameType,
     InterFrameRefs, RefInfo, NUM_REF_FRAMES, PRIMARY_REF_NONE, SUPERRES_DENOM_BITS,
     SUPERRES_DENOM_MIN, SUPERRES_NUM,
 };
+#[doc(hidden)]
 pub use obu::{parse_leb128, parse_obu, ObuDescriptor, ObuIter, ObuType};
+#[doc(hidden)]
 pub use sequence_header::{
     parse_sequence_header, ColorConfig, DecoderModelInfo, OperatingParametersInfo, OperatingPoint,
     SequenceHeader, TimingInfo,
 };
+#[doc(hidden)]
 pub use superres::{
     upscale_frame, upscale_plane, upscale_sample, SuperresError, SuperresFrameContext,
     FILTER_BITS as SUPERRES_TAP_FILTER_BITS, SUPERRES_EXTRA_BITS, SUPERRES_FILTER_BITS,
     SUPERRES_FILTER_OFFSET, SUPERRES_FILTER_SHIFTS, SUPERRES_FILTER_TAPS, SUPERRES_SCALE_BITS,
     SUPERRES_SCALE_MASK, UPSCALE_FILTER,
 };
+#[doc(hidden)]
 pub use symbol_decoder::SymbolDecoder;
+#[doc(hidden)]
 pub use tile_info::{
     parse_tile_info, TileInfo, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS, MAX_TILE_WIDTH,
 };
+#[doc(hidden)]
 pub use transform::{
     brev, butterfly_b, butterfly_h, clip3, cos128, inverse_adst, inverse_adst16, inverse_adst4,
     inverse_adst8, inverse_adst_input_permute, inverse_adst_output_permute, inverse_dct,
@@ -1803,14 +1854,17 @@ pub use transform::{
 // against the caller-resolved [`inter_pred::ObmcParams`] context.
 // All four motion modes (SIMPLE / WARPED_CAUSAL / OBMC + compound)
 // are now driver-side complete.
+#[doc(hidden)]
 pub use cdef::{
     cdef_block, cdef_direction, cdef_filter_block, cdef_frame, constrain, CdefFrameContext,
     CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS, CDEF_UV_DIR, DIV_TABLE,
 };
+#[doc(hidden)]
 pub use film_grain::{
     add_noise_synthesis, film_grain_synthesis, generate_grain, scale_lut, scaling_lookup_init,
     GrainArrays, RandomRegister, ScalingLut, LUMA_GRAIN_H, LUMA_GRAIN_W, MC_IDENTITY,
 };
+#[doc(hidden)]
 pub use inter_pred::{
     block_inter_prediction, block_shape, block_warp, clip1_single_ref, compound_distance_blend,
     difference_weight_mask, distance_weights, get_relative_dist, intra_mode_variant_mask,
@@ -1835,11 +1889,13 @@ pub use inter_pred::{
     WEDGE_MASTER_OBLIQUE_ODD, WEDGE_MASTER_VERTICAL, WEDGE_OBLIQUE117, WEDGE_OBLIQUE153,
     WEDGE_OBLIQUE27, WEDGE_OBLIQUE63, WEDGE_VERTICAL,
 };
+#[doc(hidden)]
 pub use loop_filter::{
     adaptive_filter_strength, adaptive_filter_strength_selection, filter_mask, filter_size,
     loop_filter_edge, loop_filter_frame, narrow_filter, sample_filtering, wide_filter,
     FilterMaskOutput, FilterStrength, LoopFilterFrameContext, PlaneBuffer,
 };
+#[doc(hidden)]
 pub use loop_restoration::{
     count_units_in_frame, derive_block_geometry, get_source_sample, loop_restoration_frame,
     loop_restore_block, self_guided_filter, wiener_coefficients, wiener_filter,
@@ -1849,6 +1905,7 @@ pub use loop_restoration::{
     SGRPROJ_XQD_MIN, SGR_PARAMS, WIENER_COEFFS, WIENER_TAPS_K, WIENER_TAPS_MAX, WIENER_TAPS_MID,
     WIENER_TAPS_MIN,
 };
+#[doc(hidden)]
 pub use uncompressed_header_tail::{
     parse_cdef_params, parse_delta_lf_params, parse_delta_q_params, parse_film_grain_params,
     parse_global_motion_params, parse_interpolation_filter, parse_loop_filter_params,

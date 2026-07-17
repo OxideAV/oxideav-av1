@@ -242,90 +242,135 @@
 //! `frame_size_with_refs()` inverse + §5.9.24 `read_global_param`
 //! signed-subexp inverse for the remaining inter-frame paths.
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bitwriter;
+#[doc(hidden)]
 pub mod block_mode_info;
+#[doc(hidden)]
 pub mod coefficients;
+#[doc(hidden)]
 pub mod forward_adst;
+#[doc(hidden)]
 pub mod forward_identity;
+#[doc(hidden)]
 pub mod forward_quantize;
+#[doc(hidden)]
 pub mod forward_transform;
+#[doc(hidden)]
 pub mod forward_transform_2d;
+#[doc(hidden)]
 pub mod forward_wht;
+#[doc(hidden)]
 pub mod frame_obu;
+#[doc(hidden)]
 pub mod inter_frame;
+#[doc(hidden)]
 pub mod inter_predict;
+#[doc(hidden)]
 pub mod ivf;
+#[doc(hidden)]
 pub mod key_frame;
+#[doc(hidden)]
 pub mod loop_restoration_write;
+#[doc(hidden)]
 pub mod obu;
+#[doc(hidden)]
 pub mod partition;
+#[doc(hidden)]
 pub mod partition_tree;
+#[doc(hidden)]
 pub mod pixel_driver;
+#[doc(hidden)]
 pub mod pixel_driver_dyn;
+#[doc(hidden)]
 pub mod sequence_obu;
+#[doc(hidden)]
 pub mod symbol_writer;
+#[doc(hidden)]
 pub mod temporal_unit;
+#[doc(hidden)]
 pub mod tile_group_obu;
+#[doc(hidden)]
 pub mod transform_tree;
 
+#[doc(hidden)]
 pub use bitwriter::BitWriter;
+#[doc(hidden)]
 pub use block_mode_info::{
     write_inter_block_mode_info, write_inter_block_mode_info_bootstrap,
     write_intra_frame_intrabc_arm, write_intra_frame_y_mode, write_intra_segment_id,
     write_intra_uv_mode, write_palette_tokens_plane, write_skip, write_use_intrabc, write_y_mode,
     IntrabcArmInputs, IntrabcBlockInfo,
 };
+#[doc(hidden)]
 pub use coefficients::{
     write_coeff_base, write_coeff_base_eob, write_coeff_br, write_coefficients, write_dc_sign,
     write_eob_pt, write_golomb, write_txb_skip, GOLOMB_MAX_LENGTH,
 };
+#[doc(hidden)]
 pub use forward_adst::{
     forward_adst_16, forward_adst_16x16, forward_adst_4, forward_adst_4x4, forward_adst_8,
     forward_adst_8x8, forward_flipadst_16, forward_flipadst_16x16, forward_flipadst_4,
     forward_flipadst_4x4, forward_flipadst_8, forward_flipadst_8x8,
 };
+#[doc(hidden)]
 pub use forward_identity::{
     forward_idtx_16, forward_idtx_16x16, forward_idtx_32, forward_idtx_32x32, forward_idtx_4,
     forward_idtx_4x4, forward_idtx_8, forward_idtx_8x8,
 };
+#[doc(hidden)]
 pub use forward_quantize::forward_quantize;
+#[doc(hidden)]
 pub use forward_transform::{
     forward_dct_16, forward_dct_16x16, forward_dct_32, forward_dct_32x32, forward_dct_4,
     forward_dct_4x4, forward_dct_64, forward_dct_64x64, forward_dct_8, forward_dct_8x8,
 };
+#[doc(hidden)]
 pub use forward_transform_2d::forward_transform_2d;
+#[doc(hidden)]
 pub use forward_wht::{forward_wht4, forward_wht_4x4};
+#[doc(hidden)]
 pub use frame_obu::write_frame_header_obu;
 pub use inter_frame::{
     encode_gop_yuv420, encode_gop_yuv420_with_q, encode_gop_yuv420_with_q_seg, EncodedGop,
     GopFrameRecon, GOP_MAX_FRAMES,
 };
+#[doc(hidden)]
 pub use inter_predict::{
     encode_inter_block_residual_4x4, encode_inter_frame_y, encode_inter_frame_y_opt,
     encode_inter_frame_yuv, estimate_motion_4x4_full_search, estimate_motion_4x4_subpel,
     predict_inter_block_single, EncRefPlane, EncodedInterFrameY, EncodedInterFrameYuv,
     InterResidualLeaf,
 };
+#[doc(hidden)]
 pub use ivf::{parse_file_header, IvfFileHeader, IvfFrame, IvfReadError, IvfReader, IvfWriter};
 pub use key_frame::{
     encode_key_frame_yuv420, encode_key_frame_yuv420_with_q, EncodedKeyFrame, KEY_FRAME_MAX_DIM,
 };
+#[doc(hidden)]
 pub use loop_restoration_write::{write_lr, write_lr_unit, LrWriteState};
+#[doc(hidden)]
 pub use obu::{
     build_temporal_unit, obu_type_takes_trailing_bits, write_obu_with_size, write_temporal_unit,
     ObuExtensionHeader, ObuFrame, ObuHeader, ObuWriter,
 };
+#[doc(hidden)]
 pub use partition::{partition_none_only, partition_split_only, write_partition};
+#[doc(hidden)]
 pub use partition_tree::{
     write_block_syntax, write_partition_tree, write_partition_tree_syntax, EncodeBlock, EncodeNode,
     PartitionSyntaxWriter, PartitionTreeWriter, PlaneCoefficients, SyntaxBlock, SyntaxFrameParams,
     SyntaxInterBlock, SyntaxInterFrameParams, SyntaxNode, SyntaxPalette, VarTxSyntaxTree,
 };
+#[doc(hidden)]
 pub use pixel_driver::{
     dispatch_order_cells, encode_intra_frame_y, encode_intra_frame_yuv, CellCoord, EncodedFrame,
     EncodedFrameYuv, Yuv420Frame16x16, CELLS_HIGH, CELLS_WIDE, CHROMA_CELLS_HIGH,
     CHROMA_CELLS_WIDE, CHROMA_HEIGHT, CHROMA_WIDTH, FRAME_HEIGHT, FRAME_WIDTH, MI_COLS, MI_ROWS,
 };
+pub use pixel_driver_dyn::Yuv420Frame;
+#[doc(hidden)]
 pub use pixel_driver_dyn::{
     build_intra_only_y_8bit_fh, build_intra_only_y_8bit_fh_with_q, build_intra_only_y_8bit_seq,
     build_intra_only_yuv420_8bit_fh, build_intra_only_yuv420_8bit_fh_with_q,
@@ -335,14 +380,19 @@ pub use pixel_driver_dyn::{
     encode_intra_frame_yuv_dyn_multi_sb, encode_intra_frame_yuv_dyn_multi_sb_with_q,
     encode_intra_frame_yuv_dyn_with_q, root_super_block, sb_grid_dispatch_order_leaves,
     sb_grid_origins, EncodedFrameDyn, EncodedFrameDynY, EncodedFrameDynYMultiSb,
-    EncodedFrameDynYuvMultiSb, MonoYFrame, MonoYFrameMultiSb, Yuv420Frame, Yuv420FrameMultiSb,
-    MAX_DIM, MAX_DIM_YUV_MULTI_SB, MAX_DIM_Y_MULTI_SB, MIN_DIM, SB_SIZE4_64,
+    EncodedFrameDynYuvMultiSb, MonoYFrame, MonoYFrameMultiSb, Yuv420FrameMultiSb, MAX_DIM,
+    MAX_DIM_YUV_MULTI_SB, MAX_DIM_Y_MULTI_SB, MIN_DIM, SB_SIZE4_64,
 };
+#[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
+#[doc(hidden)]
 pub use symbol_writer::SymbolWriter;
+#[doc(hidden)]
 pub use temporal_unit::{encode_sequence_header_obu, encode_temporal_unit, TemporalUnitPlan};
+#[doc(hidden)]
 pub use tile_group_obu::{
     parse_tile_group_obu_body, write_tile_group_obu, ParsedTileGroup, TileGroupObu,
     TileGroupObuWriter, TilePayload,
 };
+#[doc(hidden)]
 pub use transform_tree::{write_block_tx_size, write_var_tx_size, VarTxNode, VarTxNodeKind};

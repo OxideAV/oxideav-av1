@@ -68,9 +68,19 @@
 //!   * §7.12.3 — `dequantize_step1`.
 //!   * §7.13 — Inverse transform.
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod frame_driver;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pixel_driver;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pixel_driver_dyn;
 
-pub use frame_driver::{decode_av1_spec, decode_frame_spec, SpecDecodeSession, SpecFrame};
-pub use pixel_driver::{decode_av1, decode_temporal_unit, Frame, TemporalUnitResult};
+pub use frame_driver::{decode_av1_spec, SpecFrame};
+#[doc(hidden)]
+pub use frame_driver::{decode_frame_spec, SpecDecodeSession};
+pub use pixel_driver::{decode_av1, Frame};
+#[doc(hidden)]
+pub use pixel_driver::{decode_temporal_unit, TemporalUnitResult};
