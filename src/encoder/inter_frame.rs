@@ -1885,7 +1885,14 @@ fn encode_inter_leaf_modes(
     // `RefFrame` ordinal (NEW_NEWMV compound candidates reuse them).
     let mut searched_mv: [[i32; 2]; 8] = [[0, 0]; 8];
     let single_refs = ictx.single_refs.clone();
-    let compound_pairs = ictx.compound_pairs.clone();
+    // r416 — §5.11.25 `Min( bw4, bh4 ) >= 2`: sub-8×8 blocks cannot
+    // code `comp_mode` (SINGLE_REFERENCE forced with no bit), so the
+    // compound ladder is empty there.
+    let compound_pairs = if bw4.min(bh4) >= 2 {
+        ictx.compound_pairs.clone()
+    } else {
+        Vec::new()
+    };
     for (ref_ord, &rf) in single_refs.iter().enumerate() {
         let ref_bias = ref_ord as u64;
         let stack = ictx.find_stack(mi_r, mi_c, b_size, [rf, -1])?;
@@ -2238,26 +2245,43 @@ fn encode_inter_leaf_modes(
         t = SPLIT_TX_SIZE[t];
         max_depth += 1;
     }
-    let before = save_region_wh(recon, mi_r, mi_c, bw4, bh4);
+    // r416 — sub-8×8 leaves write the GROUP's chroma (the §5.11.34
+    // `HasChroma` block covers the full 2×2-cell chroma area), which
+    // extends past the leaf's own mi rect: snapshot / restore / score
+    // over the group-aligned rect so no trial state leaks between
+    // depth candidates.
+    let (sr, sc, sw4, sh4) = {
+        let (mut sr, mut sc, mut sw4, mut sh4) = (mi_r, mi_c, bw4, bh4);
+        if bh4 == 1 {
+            sr = mi_r & !1;
+            sh4 = 2;
+        }
+        if bw4 == 1 {
+            sc = mi_c & !1;
+            sw4 = 2;
+        }
+        (sr, sc, sw4, sh4)
+    };
+    let before = save_region_wh(recon, sr, sc, sw4, sh4);
     let mut best: Option<(SyntaxBlock, RegionSnapshot, u64)> = None;
     for depth in 0..=max_depth {
         let leaf = encode_inter_leaf_residual(
             mi_r, mi_c, b_size, input, recon, ictx, ref_frame, y_mode, mv, ref_mv_idx, filter,
             comp, depth, segment_id, &seg_qp,
         )?;
-        let d = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
+        let d = region_distortion_wh(recon, input, sr, sc, sw4, sh4);
         let score = d + lambda * (p_leaf_rate(&leaf) + 2 * u64::from(depth));
         let improves = match best.as_ref() {
             Some((_, _, s)) => score < *s,
             None => true,
         };
         if improves {
-            best = Some((leaf, save_region_wh(recon, mi_r, mi_c, bw4, bh4), score));
+            best = Some((leaf, save_region_wh(recon, sr, sc, sw4, sh4), score));
         }
-        restore_region(recon, mi_r, mi_c, &before);
+        restore_region(recon, sr, sc, &before);
     }
     let (leaf, after, _) = best.expect("at least depth 0");
-    restore_region(recon, mi_r, mi_c, &after);
+    restore_region(recon, sr, sc, &after);
     Ok(leaf)
 }
 
@@ -2518,12 +2542,22 @@ fn encode_inter_leaf_residual(
         tu_type_grid[(ty / lth) * tu_cols + tx / ltw] = tt;
     }
 
-    // --- Chroma (every BLOCK_8X8+ leaf has chroma at 4:2:0). ---
-    // §5.11.34: the chroma TU size derives from the block's committed
-    // `TxSize` — on the §5.11.16 var-tx arm that is the recursion's
-    // last terminal-else `txSz` (the uniform TU size here).
+    // --- Chroma (§5.11.34 `HasChroma` gate — r416). ---
+    // A sub-8×8 leaf has chroma only on the bottom / right cell of
+    // its 2×2 group (`bh4 == 1 && even MiRow` or `bw4 == 1 && even
+    // MiCol` ⇒ no chroma planes); the `HasChroma` block's chroma
+    // region is the §5.11.38 plane residual size of the block —
+    // covering the WHOLE group at the `(MiCol >> subX) * MI_SIZE`
+    // lifted origin. §5.11.34: the chroma TU size derives from the
+    // block's committed `TxSize` — on the §5.11.16 var-tx arm that is
+    // the recursion's last terminal-else `txSz` (the uniform TU size
+    // here).
+    let has_chroma = (bh4 != 1 || (mi_r & 1) == 1) && (bw4 != 1 || (mi_c & 1) == 1);
     let (crow0, ccol0) = ((mi_r as usize >> 1) * 4, (mi_c as usize >> 1) * 4);
-    let (cbw, cbh) = (bw / 2, bh / 2);
+    let (cbw, cbh) = match crate::cdf::get_plane_residual_size(b_size, 1, 1, 1) {
+        Some(psz) => (NUM_4X4_BLOCKS_WIDE[psz] * 4, NUM_4X4_BLOCKS_HIGH[psz] * 4),
+        None => (0, 0),
+    };
     let chroma_tx = if lossless {
         TX_4X4
     } else {
@@ -2539,20 +2573,28 @@ fn encode_inter_leaf_residual(
     );
     let cw = recon.chroma_w;
     for plane in 1..=2usize {
+        if !has_chroma {
+            break;
+        }
         let mut ty = 0usize;
         while ty < cbh {
             let mut tx = 0usize;
             while tx < cbw {
                 let (tr, tc) = (crow0 + ty, ccol0 + tx);
                 // §5.11.40 inter-chroma `TxType`: the luma cell at the
-                // subsampling-lifted position (block-internal here —
-                // the `Max( MiCol, .. )` clip only binds at the grid
-                // origin), filtered by the chroma-size inter set.
+                // subsampling-lifted position `Max( MiRow/MiCol,
+                // blockY/blockX << sub )`, filtered by the chroma-size
+                // inter set. For >= 8×8 blocks the lift walks the
+                // block's own luma TUs; on a sub-8×8 `HasChroma` leaf
+                // the `Max` clip binds to the leaf origin (its own
+                // first TU).
                 let chroma_tt = if lossless || TX_SIZE_SQR_UP[chroma_tx] > crate::cdf::TX_32X32 {
                     DCT_DCT
                 } else {
+                    let lifted_x = ((tc >> 2) << 3).saturating_sub(col0);
+                    let lifted_y = ((tr >> 2) << 3).saturating_sub(row0);
                     let luma_tt =
-                        tu_type_grid[((ty * 2) / lth) * tu_cols + (tx * 2) / ltw] as usize;
+                        tu_type_grid[(lifted_y / lth) * tu_cols + lifted_x / ltw] as usize;
                     if crate::cdf::is_tx_type_in_set(true, chroma_set, luma_tt) {
                         luma_tt
                     } else {
@@ -2618,9 +2660,11 @@ fn encode_inter_leaf_residual(
     };
     block.residual_quant = residual_quant;
     block.residual_tx_type = luma_tx_types;
-    if !lossless && skip == 0 {
+    if !lossless && skip == 0 && b_size > crate::cdf::BLOCK_4X4 {
         // §5.11.16 var-tx arm: one uniform tree per max-TU position
-        // (square blocks ⇒ exactly one).
+        // (`Max_Tx_Size_Rect` covers every block this driver codes).
+        // BLOCK_4X4 takes the §5.11.16 else arm (`read_tx_size`) with
+        // no trees.
         block.var_tx_trees = vec![uniform_var_tx_tree(MAX_TX_SIZE_RECT[b_size], depth)];
     }
     block.inter = Some(SyntaxInterBlock {
@@ -2732,6 +2776,18 @@ fn build_p_search_tree(
     if r >= recon.mi_rows || c >= recon.mi_cols {
         return Ok(SyntaxNode::dummy_oob());
     }
+    // r416 — sub-8×8 floor: a BLOCK_4X4 node (reachable only through
+    // PARTITION_SPLIT at BLOCK_8X8, and always fully inside — dims
+    // are multiples of 8) is a single INTER leaf — the encoder policy
+    // keeps sub-8×8 cells inter-only (any deterministic mode policy
+    // is conformant; intra stays available from BLOCK_8X8 up), which
+    // also keeps the §5.11.33 `someUseIntra` chroma split out of the
+    // emitted streams.
+    if b_size == BLOCK_4X4 {
+        let leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx)?;
+        ictx.stamp_leaf(&leaf, r, c, b_size, recon.lossless);
+        return Ok(SyntaxNode::Leaf(Box::new(leaf)));
+    }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
     let half = n4 >> 1;
     let sub = crate::cdf::partition_subsize(crate::cdf::PARTITION_SPLIT, b_size)
@@ -2801,13 +2857,6 @@ fn build_p_search_tree(
         (intra_leaf, after_intra, m_after_intra, score_intra)
     };
 
-    if b_size <= BLOCK_8X8 {
-        // P-frame leaf floor — no split candidate.
-        restore_region(recon, r, c, &after_leaf);
-        ictx.mirror.restore_encoder_stamp_rect(&m_after_leaf);
-        return Ok(SyntaxNode::Leaf(Box::new(leaf)));
-    }
-
     // Running best over the non-split candidates: NONE-leaf first,
     // then the r412 HORZ / VERT rectangular trials.
     let mut best_node: (SyntaxNode, RegionSnapshot, _, u64) = (
@@ -2842,11 +2891,13 @@ fn build_p_search_tree(
             Some(sz) => sz,
             None => continue,
         };
-        // r413 scope: sub-8 inter leaves (the §5.11.33 someUseIntra
-        // chroma stitch) stay out of the search — skip shapes whose
-        // sub-blocks drop below 8 samples on either axis (HORZ_4 /
-        // VERT_4 at BLOCK_16X16 produce 16x4 / 4x16 strips).
-        if crate::cdf::block_width(psub) < 8 || crate::cdf::block_height(psub) < 8 {
+        // §5.11.4: the EXT alphabet (T-shapes + HORZ_4 / VERT_4) only
+        // exists above BLOCK_8X8 — the 8×8 partition symbol is the
+        // 4-value NONE / HORZ / VERT / SPLIT alphabet. (r416: the
+        // former sub-8 strip skip is lifted — HORZ / VERT at 8×8 code
+        // 8×4 / 4×8 leaves and HORZ_4 / VERT_4 at 16×16 code 16×4 /
+        // 4×16 strips.)
+        if b_size == BLOCK_8X8 && !matches!(part, PARTITION_HORZ | PARTITION_VERT) {
             continue;
         }
         // §5.11.4 sub-block geometry per partition, in dispatch order.
@@ -4509,6 +4560,277 @@ mod tests {
         if let Ok(dir) = std::env::var("OXIDEAV_AV1_JNT_FIXDIR") {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(format!("{dir}/self-gop-64x64-q60-jnt.ivf"), &enc.ivf_bytes).unwrap();
+        }
+    }
+
+    /// r416 — walk a committed search tree tracking each leaf's block
+    /// size: count sub-8×8 leaves (either axis < 8 samples), bare
+    /// BLOCK_4X4 leaves, and four-strip (HORZ_4 / VERT_4) nodes.
+    fn count_sub8(node: &SyntaxNode, b_size: usize, n_sub8: &mut u32, n_4x4: &mut u32) {
+        use crate::cdf::{
+            block_height, block_width, partition_subsize, BLOCK_4X4, PARTITION_HORZ,
+            PARTITION_HORZ_4, PARTITION_HORZ_A, PARTITION_HORZ_B, PARTITION_SPLIT, PARTITION_VERT,
+            PARTITION_VERT_4, PARTITION_VERT_A, PARTITION_VERT_B,
+        };
+        let leaf_hit = |sz: usize, n_sub8: &mut u32, n_4x4: &mut u32| {
+            if block_width(sz) < 8 || block_height(sz) < 8 {
+                *n_sub8 += 1;
+            }
+            if sz == BLOCK_4X4 {
+                *n_4x4 += 1;
+            }
+        };
+        match node {
+            SyntaxNode::Leaf(_) => leaf_hit(b_size, n_sub8, n_4x4),
+            SyntaxNode::Split(children) => {
+                let s = partition_subsize(PARTITION_SPLIT, b_size).unwrap();
+                for ch in children.iter() {
+                    count_sub8(ch, s, n_sub8, n_4x4);
+                }
+            }
+            SyntaxNode::Horz(_) | SyntaxNode::Vert(_) => {
+                let part = if matches!(node, SyntaxNode::Horz(_)) {
+                    PARTITION_HORZ
+                } else {
+                    PARTITION_VERT
+                };
+                let s = partition_subsize(part, b_size).unwrap();
+                for _b in node.asymmetric_blocks() {
+                    leaf_hit(s, n_sub8, n_4x4);
+                }
+            }
+            SyntaxNode::HorzA(_)
+            | SyntaxNode::HorzB(_)
+            | SyntaxNode::VertA(_)
+            | SyntaxNode::VertB(_) => {
+                // T-shapes: two splitSize quarters + one subSize half.
+                let (part, half_first) = match node {
+                    SyntaxNode::HorzA(_) => (PARTITION_HORZ_A, false),
+                    SyntaxNode::HorzB(_) => (PARTITION_HORZ_B, true),
+                    SyntaxNode::VertA(_) => (PARTITION_VERT_A, false),
+                    _ => (PARTITION_VERT_B, true),
+                };
+                let half = partition_subsize(part, b_size).unwrap();
+                let quarter = partition_subsize(PARTITION_SPLIT, b_size).unwrap();
+                let sizes: [usize; 3] = if half_first {
+                    [half, quarter, quarter]
+                } else {
+                    [quarter, quarter, half]
+                };
+                for (i, _b) in node.asymmetric_blocks().iter().enumerate() {
+                    leaf_hit(sizes[i], n_sub8, n_4x4);
+                }
+            }
+            SyntaxNode::Horz4(_) | SyntaxNode::Vert4(_) => {
+                let part = if matches!(node, SyntaxNode::Horz4(_)) {
+                    PARTITION_HORZ_4
+                } else {
+                    PARTITION_VERT_4
+                };
+                let s = partition_subsize(part, b_size).unwrap();
+                for _b in node.asymmetric_blocks() {
+                    leaf_hit(s, n_sub8, n_4x4);
+                }
+            }
+        }
+    }
+
+    /// r416 — sub-8×8 inter leaves must actually be selected where
+    /// motion has 4×4 granularity: the target frame samples the KEY
+    /// reconstruction with a per-4×4-cell alternating whole-sample
+    /// shift, so a BLOCK_8X8 leaf's single MV misses half its cells
+    /// while a PARTITION_SPLIT into four BLOCK_4X4 NEWMV leaves
+    /// predicts every cell exactly — the search tree must commit
+    /// BLOCK_4X4 leaves, and a full GOP over the same construction
+    /// must round-trip byte-exact through the spec driver (proving
+    /// the §5.11.34 `HasChroma` group-chroma coding end to end).
+    #[test]
+    fn r416_search_selects_sub8_split_on_fine_motion() {
+        let f0 = moving_gradient(64, 64, 0, 0, 71);
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
+        let kr = &pre.recon[0];
+
+        // Target: cell (ci, cj) reads the KEY recon shifted by
+        // (0, 0) / (4, 4) on the cell-parity checkerboard.
+        let mut target = Yuv420Frame::filled(64, 64, 0);
+        let at = |p: &[u8], w: usize, h: usize, i: i64, j: i64| -> u8 {
+            let ii = i.clamp(0, h as i64 - 1) as usize;
+            let jj = j.clamp(0, w as i64 - 1) as usize;
+            p[ii * w + jj]
+        };
+        for i in 0..64i64 {
+            for j in 0..64i64 {
+                let par = ((i / 4) + (j / 4)) & 1;
+                let (dy, dx) = if par == 0 { (0, 0) } else { (4, 4) };
+                target.y[(i * 64 + j) as usize] = at(&kr.y, 64, 64, i + dy, j + dx);
+            }
+        }
+        // Chroma: zero-motion copy (luma alone drives the witness;
+        // the group-chroma residual absorbs the tiled prediction).
+        target.u.copy_from_slice(&kr.u);
+        target.v.copy_from_slice(&kr.v);
+
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 1, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.enable_masked_compound = true;
+        ip.enable_jnt_comp = true;
+        ip.order_hints = gop_order_hints(1, pre.seq.order_hint_bits);
+        let key_recon = GopFrameRecon {
+            y: kr.y.clone(),
+            u: kr.u.clone(),
+            v: kr.v.clone(),
+        };
+        let mut ictx = PSearchCtx::new(
+            &key_recon,
+            &key_recon,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let (mut n_sub8, mut n_4x4) = (0u32, 0u32);
+        count_sub8(&tree, BLOCK_64X64, &mut n_sub8, &mut n_4x4);
+        assert!(
+            n_4x4 > 0,
+            "4×4-granular motion must commit BLOCK_4X4 leaves (sub8={n_sub8} 4x4={n_4x4})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, target], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+        // Env-gated fixture dump for external black-box validation /
+        // corpus pinning (no-op in normal runs).
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_SUB8_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                format!("{dir}/self-gop-64x64-q60-sub8-split.ivf"),
+                &enc.ivf_bytes,
+            )
+            .unwrap();
+        }
+    }
+
+    /// r416 — 4-sample-high band motion must commit sub-8 STRIPS: the
+    /// target samples the KEY recon with a per-4-row-band alternating
+    /// horizontal shift, so 16×4 (HORZ_4 at BLOCK_16X16) or 8×4
+    /// (HORZ at BLOCK_8X8) leaves predict each band exactly while any
+    /// 8-sample-high leaf straddles two bands — the tree must commit
+    /// height-4 leaves, and the full GOP round-trips byte-exact.
+    #[test]
+    fn r416_search_selects_sub8_strips_on_band_motion() {
+        let f0 = moving_gradient(64, 64, 0, 0, 93);
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
+        let kr = &pre.recon[0];
+
+        let mut target = Yuv420Frame::filled(64, 64, 0);
+        let at = |p: &[u8], w: usize, h: usize, i: i64, j: i64| -> u8 {
+            let ii = i.clamp(0, h as i64 - 1) as usize;
+            let jj = j.clamp(0, w as i64 - 1) as usize;
+            p[ii * w + jj]
+        };
+        for i in 0..64i64 {
+            for j in 0..64i64 {
+                let dx = if (i / 4) & 1 == 0 { 0 } else { 5 };
+                target.y[(i * 64 + j) as usize] = at(&kr.y, 64, 64, i, j + dx);
+            }
+        }
+        target.u.copy_from_slice(&kr.u);
+        target.v.copy_from_slice(&kr.v);
+
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 1, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.enable_masked_compound = true;
+        ip.enable_jnt_comp = true;
+        ip.order_hints = gop_order_hints(1, pre.seq.order_hint_bits);
+        let key_recon = GopFrameRecon {
+            y: kr.y.clone(),
+            u: kr.u.clone(),
+            v: kr.v.clone(),
+        };
+        let mut ictx = PSearchCtx::new(
+            &key_recon,
+            &key_recon,
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        let (mut n_sub8, mut n_4x4) = (0u32, 0u32);
+        count_sub8(&tree, BLOCK_64X64, &mut n_sub8, &mut n_4x4);
+        assert!(
+            n_sub8 > 0,
+            "band motion must commit sub-8 strip leaves (sub8={n_sub8} 4x4={n_4x4})"
+        );
+        fn shape_census(node: &SyntaxNode, h4: &mut u32, v4: &mut u32, hz: &mut u32, vt: &mut u32) {
+            match node {
+                SyntaxNode::Horz4(_) => *h4 += 1,
+                SyntaxNode::Vert4(_) => *v4 += 1,
+                SyntaxNode::Horz(_) => *hz += 1,
+                SyntaxNode::Vert(_) => *vt += 1,
+                SyntaxNode::Split(ch) => {
+                    for c in ch.iter() {
+                        shape_census(c, h4, v4, hz, vt);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (mut h4, mut v4, mut hz, mut vt) = (0u32, 0u32, 0u32, 0u32);
+        shape_census(&tree, &mut h4, &mut v4, &mut hz, &mut vt);
+        let _ = (v4, vt);
+        assert!(
+            h4 > 0 && hz > 0,
+            "band motion must commit both HORZ_4 strip nodes and HORZ-at-8x8 halves \
+             (horz4={h4} horz={hz} sub8={n_sub8} 4x4={n_4x4})"
+        );
+
+        let enc = encode_gop_yuv420_with_q(&[f0, target], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_SUB8_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                format!("{dir}/self-gop-64x64-q60-sub8-strips.ivf"),
+                &enc.ivf_bytes,
+            )
+            .unwrap();
         }
     }
 
