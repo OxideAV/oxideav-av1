@@ -131,7 +131,7 @@ pub const GOP_MAX_FRAMES: usize = 64;
 /// `SavedOrderHints`), mirroring the decode driver's per-slot store so
 /// the §7.9 projection runs on identical inputs.
 #[derive(Debug, Clone)]
-struct SavedMotionField {
+pub(crate) struct SavedMotionField {
     mf_mvs: Vec<i16>,
     mf_ref_frames: Vec<i8>,
     saved_order_hints: [i32; 8],
@@ -143,7 +143,7 @@ struct SavedMotionField {
 impl SavedMotionField {
     /// The KEY frame's slot payload (`FrameIsIntra = 1` — §7.9.2
     /// skips intra sources, so the grids stay empty).
-    fn intra(mi_rows: u32, mi_cols: u32) -> Self {
+    pub(crate) fn intra(mi_rows: u32, mi_cols: u32) -> Self {
         SavedMotionField {
             mf_mvs: Vec::new(),
             mf_ref_frames: Vec::new(),
@@ -313,6 +313,7 @@ fn gop_ref_hints(p_index: u32) -> (u32, u32) {
 /// §5.9.2-derived [`FrameInterOrderHints`] for P-frame `p_index` —
 /// `OrderHints[ ref ]` per raw `RefFrame` value (`LAST_FRAME..=
 /// ALTREF_FRAME` read the LAST slot except `GOLDEN_FRAME`).
+#[cfg(test)]
 fn gop_order_hints(p_index: u32, order_hint_bits: u8) -> crate::cdf::FrameInterOrderHints {
     let (last_hint, golden_hint) = gop_ref_hints(p_index);
     let mut by_ref = [0i32; crate::uncompressed_header_tail::ALTREF_FRAME + 1];
@@ -331,19 +332,56 @@ fn gop_order_hints(p_index: u32, order_hint_bits: u8) -> crate::cdf::FrameInterO
     }
 }
 
-fn build_p_frame_yuv420_8bit_fh_with_q(
+/// r415 — one INTER frame's reference/role configuration for the
+/// generic frame encoder ([`encode_inter_frame_generic`]): the §5.9.2
+/// header fields that vary per pyramid role, the §7.20 slot state,
+/// and the RD ladder.
+pub(crate) struct InterFrameConfig<'a> {
+    /// §5.9.2 `order_hint` — the frame's DISPLAY position.
+    pub order_hint: u32,
+    /// §5.9.2 `show_frame` (`false` = decoded-not-shown; a later
+    /// `show_existing_frame` header displays it).
+    pub show_frame: bool,
+    /// §5.9.2 `refresh_frame_flags`.
+    pub refresh_frame_flags: u8,
+    /// §5.9.2 `ref_frame_idx[ 0..7 ]` — per-reference §7.20 slot.
+    pub ref_frame_idx: [u8; 7],
+    /// The TRUE per-slot stored `RefOrderHint[ i ]` state at this
+    /// frame's header (drives the §5.9.22 twin + §7.8 sign bias).
+    pub slot_hints: [u32; 8],
+    /// RD ladder — see [`PSearchCtx::single_refs`] /
+    /// [`PSearchCtx::compound_pairs`].
+    pub single_refs: Vec<i8>,
+    pub compound_pairs: Vec<[i8; 2]>,
+    /// The distinct reference reconstructions + the §7.20 slot map
+    /// onto them — see [`PSearchCtx::slot_to_plane`].
+    pub refs: Vec<&'a GopFrameRecon>,
+    pub slot_to_plane: [usize; 8],
+}
+
+/// r415 generic §5.9.2 INTER frame header — every pyramid role
+/// (P / ALT / MID / B) shares this shape: non-error-resilient,
+/// `PRIMARY_REF_NONE` (per-frame default CDFs), identity global
+/// motion, SWITCHABLE frame filter, quarter-pel MVs,
+/// `use_ref_frame_mvs = 1`, order hints on, and the §5.9.22
+/// `skip_mode_present` derived from the true slot state via the
+/// write twin.
+fn build_inter_frame_fh(
     seq: &SequenceHeader,
     width: u32,
     height: u32,
     base_q_idx: u8,
-    p_index: u32,
+    cfg: &InterFrameConfig<'_>,
     alt_q: &[i16],
 ) -> FrameHeader {
     let mut fh = build_intra_only_yuv420_8bit_fh_with_q(seq, width, height, base_q_idx);
     fh.frame_type = FrameType::Inter;
     fh.frame_is_intra = false;
     // §5.9.2: `showable_frame = frame_type != KEY_FRAME` on the
-    // `show_frame == 1` arm (derived, no bit).
+    // `show_frame == 1` arm (derived, no bit); on the `show_frame == 0`
+    // arm it is CODED — a not-shown pyramid frame must be showable for
+    // its later `show_existing_frame` display.
+    fh.show_frame = cfg.show_frame;
     fh.showable_frame = true;
     // r413: error resilience OFF — §5.9.2 codes primary_ref_frame
     // (kept at PRIMARY_REF_NONE: per-frame default CDFs, no
@@ -351,24 +389,14 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     fh.error_resilient_mode = false;
     fh.force_integer_mv = false;
     fh.primary_ref_frame = PRIMARY_REF_NONE;
-    fh.refresh_frame_flags = 1 << ((p_index - 1) & 1);
-    // r413: §5.9.2 `order_hint` — the GOP output order (KEY = 0, this
-    // P-frame = `p_index`), `< GOP_MAX_FRAMES = 64` so the 7-bit
-    // modulus never wraps in-GOP.
-    fh.order_hint = p_index & ((1 << u32::from(seq.order_hint_bits)) - 1);
-    // r413: §5.9.2 `ref_order_hint[ i ]` (the error-resilient block
-    // fires on every P-frame) — the true stored hints under the
-    // two-slot rotation: `last_slot` holds frame `k - 1`, `golden_slot`
-    // frame `k - 2` (KEY for `k <= 2`), every other slot still the KEY
-    // frame (hint 0) from its `allFrames` refresh.
-    let (last_hint, golden_hint) = gop_ref_hints(p_index);
-    let mut hints = [0u32; 8];
-    hints[(p_index & 1) as usize] = last_hint;
-    hints[((p_index - 1) & 1) as usize] = golden_hint;
-    // r413: with error resilience off the ref_order_hint block is no
-    // longer coded, but the writer still needs the true per-slot
-    // hints as session state for the §5.9.22 skipModeAllowed twin.
-    fh.ref_order_hints = Some(hints);
+    fh.refresh_frame_flags = cfg.refresh_frame_flags;
+    // §5.9.2 `order_hint` — the DISPLAY order (KEY = 0), `<
+    // GOP_MAX_FRAMES = 64` so the 7-bit modulus never wraps in-GOP.
+    fh.order_hint = cfg.order_hint & ((1 << u32::from(seq.order_hint_bits)) - 1);
+    // The true stored per-slot hints — with error resilience off the
+    // §5.9.2 ref_order_hint block is not coded, but the writer needs
+    // them as session state for the §5.9.22 skipModeAllowed twin.
+    fh.ref_order_hints = Some(cfg.slot_hints);
     // §5.9.21: ONLY_4X4 rides the CodedLossless arm; the lossy arm
     // codes TX_MODE_SELECT — intra leaves carry the §5.11.15
     // `tx_depth` choice and inter leaves the §5.11.17 `txfm_split`
@@ -378,30 +406,30 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     } else {
         TxMode::TxModeSelect
     });
-    // r412: per-block single/compound choice (§5.9.23) — compound
-    // COMPOUND_AVERAGE leaves need the comp_mode dispatch open.
-    fh.reference_select = Some(true);
-    // r413: §5.9.22 `skip_mode_present = 1` whenever skipModeAllowed —
-    // on this all-forward GOP that is the two-closest-DISTINCT-forward
-    // fallback (LAST at hint `k - 1`, GOLDEN at `k - 2`), i.e. every
-    // P-frame from `p_index = 2` on; `SkipModeFrame[] = { LAST_FRAME,
-    // GOLDEN_FRAME }` there (forwardIdx = 0, secondForwardIdx = 3).
-    fh.skip_mode_present = Some(last_hint != golden_hint);
+    // §5.9.23: per-block single/compound choice whenever the ladder
+    // carries a compound pair.
+    let reference_select = !cfg.compound_pairs.is_empty();
+    fh.reference_select = Some(reference_select);
+    // §5.9.22 `skip_mode_present = 1` whenever skipModeAllowed (the
+    // full forward/backward derivation twin over the true slot state;
+    // `reference_select` and `enable_order_hint` gate the read).
+    let (skip_allowed, _) = crate::encoder::frame_obu::skip_mode_params_twin(
+        &cfg.slot_hints,
+        &cfg.ref_frame_idx,
+        fh.order_hint,
+        seq.order_hint_bits,
+    );
+    fh.skip_mode_present = Some(skip_allowed && reference_select && seq.enable_order_hint);
     fh.allow_warped_motion = Some(false);
-    let last_slot = (p_index & 1) as u8;
-    let golden_slot = ((p_index - 1) & 1) as u8;
-    let mut ref_frame_idx = [last_slot; REFS_PER_FRAME];
-    // GOLDEN_FRAME = 4 → ref_frame_idx[ GOLDEN_FRAME - LAST_FRAME = 3 ].
-    ref_frame_idx[3] = golden_slot;
     fh.inter_refs = Some(InterFrameRefs {
         frame_refs_short_signaling: false,
         last_frame_idx: None,
         gold_frame_idx: None,
-        ref_frame_idx,
+        ref_frame_idx: cfg.ref_frame_idx,
         allow_high_precision_mv: false,
         interpolation_filter: InterpolationFilter::Switchable,
         is_motion_mode_switchable: false,
-        // r413: §7.9 temporal MV prediction on every P-frame (the
+        // r413: §7.9 temporal MV prediction on every inter frame (the
         // first P-frame's projections are empty — every slot still
         // holds the intra KEY — which both sides derive identically).
         use_ref_frame_mvs: true,
@@ -430,6 +458,56 @@ fn build_p_frame_yuv420_8bit_fh_with_q(
     fh
 }
 
+/// The r412/r413 two-slot P-frame [`InterFrameConfig`] for P-frame
+/// `p_index` (see [`gop_ref_hints`] for the rotation).
+fn p_frame_config<'a>(
+    prev: &'a GopFrameRecon,
+    prevprev: &'a GopFrameRecon,
+    p_index: u32,
+) -> InterFrameConfig<'a> {
+    let last_slot = (p_index & 1) as usize;
+    let golden_slot = ((p_index - 1) & 1) as usize;
+    let (last_hint, golden_hint) = gop_ref_hints(p_index);
+    let mut slot_hints = [0u32; 8];
+    slot_hints[last_slot] = last_hint;
+    slot_hints[golden_slot] = golden_hint;
+    let mut ref_frame_idx = [last_slot as u8; REFS_PER_FRAME];
+    // GOLDEN_FRAME = 4 → ref_frame_idx[ GOLDEN_FRAME - LAST_FRAME = 3 ].
+    ref_frame_idx[3] = golden_slot as u8;
+    let mut slot_to_plane = [0usize; 8];
+    slot_to_plane[golden_slot] = 1;
+    InterFrameConfig {
+        order_hint: p_index,
+        show_frame: true,
+        refresh_frame_flags: 1 << ((p_index - 1) & 1),
+        ref_frame_idx,
+        slot_hints,
+        single_refs: vec![1, 4],
+        compound_pairs: vec![[1, 4]],
+        refs: vec![prev, prevprev],
+        slot_to_plane,
+    }
+}
+
+#[cfg(test)]
+fn build_p_frame_yuv420_8bit_fh_with_q(
+    seq: &SequenceHeader,
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    p_index: u32,
+    alt_q: &[i16],
+) -> FrameHeader {
+    // The refs are irrelevant to the header — reuse a dummy pair.
+    let dummy = GopFrameRecon {
+        y: Vec::new(),
+        u: Vec::new(),
+        v: Vec::new(),
+    };
+    let cfg = p_frame_config(&dummy, &dummy, p_index);
+    build_inter_frame_fh(seq, width, height, base_q_idx, &cfg, alt_q)
+}
+
 /// Encode one INTER P-frame against `prev` (the previous frame's
 /// reconstruction, LAST_FRAME) and `prevprev` (the frame before it,
 /// GOLDEN_FRAME — the KEY recon again for the first two P-frames).
@@ -446,6 +524,34 @@ fn encode_p_frame_yuv420(
     alt_q: &[i16],
     mf_store: &[SavedMotionField; 8],
 ) -> Result<(Vec<u8>, GopFrameRecon, SavedMotionField), Error> {
+    let cfg = p_frame_config(prev, prevprev, p_index);
+    let (obu, recon, saved) =
+        encode_inter_frame_generic(input, seq, base_q_idx, &cfg, alt_q, mf_store)?;
+    // §7.5 temporal unit: TD + OBU_FRAME (the SH rode the KEY frame's
+    // unit; §7.5 requires it once per coded video sequence). Every
+    // P-frame is shown, so the one-OBU unit satisfies the "exactly
+    // one shown frame per temporal unit" bitstream conformance rule.
+    Ok((build_temporal_unit(None, &[obu]), recon, saved))
+}
+
+/// r415 — the shared INTER frame encoder every pyramid role (P / ALT /
+/// MID / B) runs: builds the §5.9.2 header from an
+/// [`InterFrameConfig`], derives order hints / §7.8 sign bias /
+/// §5.9.22 skip mode / §7.9 temporal MVs from the config's true slot
+/// state, runs the r411-r413 RD search over the config's reference
+/// ladder, and writes the §5.10 `OBU_FRAME`. Returns
+/// `(frame OBU, reconstruction, §7.19 motion-field payload)` — the
+/// caller packs OBUs into §7.5 temporal units (each unit must carry
+/// exactly ONE shown frame, so pyramid drivers bundle
+/// decoded-not-shown frames with the next shown one).
+pub(crate) fn encode_inter_frame_generic(
+    input: &Yuv420Frame,
+    seq: &SequenceHeader,
+    base_q_idx: u8,
+    cfg: &InterFrameConfig<'_>,
+    alt_q: &[i16],
+    mf_store: &[SavedMotionField; 8],
+) -> Result<(ObuFrame, GopFrameRecon, SavedMotionField), Error> {
     if input.width < 8
         || input.height < 8
         || input.width > KEY_FRAME_MAX_DIM
@@ -459,7 +565,7 @@ fn encode_p_frame_yuv420(
     let height = input.height as usize;
     let chroma_w = width / 2;
     let chroma_h = height / 2;
-    for reference in [prev, prevprev] {
+    for reference in &cfg.refs {
         if reference.y.len() != width * height
             || reference.u.len() != chroma_w * chroma_h
             || reference.v.len() != chroma_w * chroma_h
@@ -468,14 +574,7 @@ fn encode_p_frame_yuv420(
         }
     }
 
-    let fh = build_p_frame_yuv420_8bit_fh_with_q(
-        seq,
-        input.width,
-        input.height,
-        base_q_idx,
-        p_index,
-        alt_q,
-    );
+    let fh = build_inter_frame_fh(seq, input.width, input.height, base_q_idx, cfg, alt_q);
     let fs = fh
         .frame_size
         .as_ref()
@@ -503,23 +602,47 @@ fn encode_p_frame_yuv420(
     // own §5.11.x interp_filter (the header writer emits
     // `is_filter_switchable = 1`).
     ip.interpolation_filter = SWITCHABLE;
-    // r412: per-block single/compound reference choice (§5.9.23).
-    ip.reference_select = true;
-    // r413: §5.9.2 order hints — `OrderHints[ ref ]` =
-    // `RefOrderHint[ ref_frame_idx[ ref - LAST_FRAME ] ]` under the
-    // two-slot rotation (every reference reads the LAST slot except
-    // GOLDEN). All references are forward (`get_relative_dist < 0`),
-    // so `RefFrameSignBias[]` stays all-zero (§7.8).
-    ip.order_hints = gop_order_hints(p_index, seq.order_hint_bits);
-    // r413: §5.9.22 skip mode — present whenever the two rotated
-    // references carry DISTINCT forward hints (every P-frame from
-    // `p_index = 2`); `SkipModeFrame[] = { LAST_FRAME, GOLDEN_FRAME }`
-    // per the two-forward fallback (forwardIdx = 0, secondForwardIdx
-    // = 3). Must match the header derivation bit-for-bit.
+    // r412: per-block single/compound reference choice (§5.9.23) —
+    // open exactly when the ladder carries a compound pair (matches
+    // the header).
+    ip.reference_select = !cfg.compound_pairs.is_empty();
+    // §5.9.2 order hints — `OrderHints[ ref ]` =
+    // `RefOrderHint[ ref_frame_idx[ ref - LAST_FRAME ] ]` over the
+    // config's slot state.
+    ip.order_hints = crate::cdf::FrameInterOrderHints {
+        order_hint_bits: u32::from(seq.order_hint_bits),
+        current_order_hint: fh.order_hint as i32,
+        order_hints_by_ref: {
+            let mut by_ref = [0i32; crate::uncompressed_header_tail::ALTREF_FRAME + 1];
+            for (i, hint) in by_ref.iter_mut().enumerate().skip(1) {
+                *hint = cfg.slot_hints[cfg.ref_frame_idx[i - 1] as usize] as i32;
+            }
+            by_ref
+        },
+    };
+    // §7.8 `RefFrameSignBias[ ref ]` = `get_relative_dist(
+    // OrderHints[ ref ], OrderHint ) > 0` — backward references (the
+    // pyramid's BWDREF/ALTREF roles) flip the bias.
+    for r in 1..=7usize {
+        ip.ref_frame_sign_bias[r] = i32::from(
+            crate::inter_pred::get_relative_dist(
+                ip.order_hints.order_hints_by_ref[r],
+                fh.order_hint as i32,
+                u32::from(seq.order_hint_bits),
+            ) > 0,
+        );
+    }
+    // §5.9.22 skip mode — the SAME write-twin derivation the header
+    // builder ran (presence AND the `SkipModeFrame[]` pair).
     {
-        let (last_hint, golden_hint) = gop_ref_hints(p_index);
-        ip.skip_mode_present = last_hint != golden_hint;
-        ip.skip_mode_frame = [1, 4];
+        let (allowed, pair) = crate::encoder::frame_obu::skip_mode_params_twin(
+            &cfg.slot_hints,
+            &cfg.ref_frame_idx,
+            fh.order_hint,
+            seq.order_hint_bits,
+        );
+        ip.skip_mode_present = fh.skip_mode_present == Some(true) && allowed;
+        ip.skip_mode_frame = pair;
     }
     // r413: spatial segmentation (PRIMARY_REF_NONE forces the map
     // update; the temporal arm stays out of scope).
@@ -534,10 +657,7 @@ fn encode_p_frame_yuv420(
     ip.use_ref_frame_mvs = true;
     {
         use crate::inter_pred::{motion_field_estimation_core, MotionFieldSlot};
-        let last_slot = (p_index & 1) as usize;
-        let golden_slot = ((p_index - 1) & 1) as usize;
-        let mut ref_frame_idx = [last_slot as u8; 7];
-        ref_frame_idx[3] = golden_slot as u8;
+        let ref_frame_idx = cfg.ref_frame_idx;
         let mut order_hints = [0i32; 8];
         order_hints.copy_from_slice(&ip.order_hints.order_hints_by_ref);
         let mut slots: [Option<MotionFieldSlot<'_>>; 8] = [None; 8];
@@ -555,7 +675,7 @@ fn encode_p_frame_yuv420(
             &slots,
             &ref_frame_idx,
             &order_hints,
-            p_index as i32,
+            fh.order_hint as i32,
             u32::from(seq.order_hint_bits),
             mi_rows,
             mi_cols,
@@ -605,8 +725,19 @@ fn encode_p_frame_yuv420(
         qp,
         bd: BlockDecodedMirror::new(),
     };
-    let mut ictx = PSearchCtx::new(
-        prev, prevprev, mi_rows, mi_cols, width, height, ip, p_index, base_q_idx, alt_q,
+    let mut ictx = PSearchCtx::with_refs(
+        &cfg.refs,
+        cfg.slot_to_plane,
+        cfg.ref_frame_idx,
+        cfg.single_refs.clone(),
+        cfg.compound_pairs.clone(),
+        mi_rows,
+        mi_cols,
+        width,
+        height,
+        ip,
+        base_q_idx,
+        alt_q,
     )?;
 
     let mut writer = SymbolWriter::new(fh.disable_cdf_update);
@@ -662,9 +793,7 @@ fn encode_p_frame_yuv420(
         body.extend_from_slice(&tile_group_body);
         body
     };
-    // §7.5 temporal unit: TD + OBU_FRAME (the SH rode the KEY frame's
-    // unit; §7.5 requires it once per coded video sequence).
-    let temporal_unit = build_temporal_unit(None, &[ObuFrame::new(ObuType::Frame, frame_body)]);
+    let frame_obu = ObuFrame::new(ObuType::Frame, frame_body);
 
     // r413 — §7.19 motion field motion vector storage: filter the
     // committed Mvs[] / RefFrames[] mirror grids down to the §7.20
@@ -687,7 +816,7 @@ fn encode_p_frame_yuv420(
                 if r > 0 {
                     let dist = crate::inter_pred::get_relative_dist(
                         by_ref[r as usize],
-                        p_index as i32,
+                        fh.order_hint as i32,
                         hint_bits,
                     );
                     if dist < 0 {
@@ -713,7 +842,7 @@ fn encode_p_frame_yuv420(
     };
 
     Ok((
-        temporal_unit,
+        frame_obu,
         GopFrameRecon {
             y: recon.y,
             u: recon.u,
@@ -831,6 +960,7 @@ impl PSearchCtx {
     /// r412 two-slot P-frame configuration: LAST = `prev`, GOLDEN =
     /// `prevprev`, ladder `{ LAST, GOLDEN }` singles + the one
     /// unidirectional compound pair.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn new(
         prev: &GopFrameRecon,

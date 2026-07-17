@@ -284,6 +284,8 @@ pub mod pixel_driver;
 #[doc(hidden)]
 pub mod pixel_driver_dyn;
 #[doc(hidden)]
+pub mod pyramid_gop;
+#[doc(hidden)]
 pub mod sequence_obu;
 #[doc(hidden)]
 pub mod symbol_writer;
@@ -383,6 +385,7 @@ pub use pixel_driver_dyn::{
     EncodedFrameDynYuvMultiSb, MonoYFrame, MonoYFrameMultiSb, Yuv420FrameMultiSb, MAX_DIM,
     MAX_DIM_YUV_MULTI_SB, MAX_DIM_Y_MULTI_SB, MIN_DIM, SB_SIZE4_64,
 };
+pub use pyramid_gop::{encode_pyramid_gop_yuv420, encode_pyramid_gop_yuv420_with_q};
 #[doc(hidden)]
 pub use sequence_obu::write_sequence_header_obu;
 #[doc(hidden)]
