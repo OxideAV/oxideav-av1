@@ -634,6 +634,11 @@ pub(crate) fn encode_inter_frame_generic(
     // COMPOUND_DIFFWTD (the RD ladder trials both against the
     // AVERAGE baseline).
     ip.enable_masked_compound = seq.enable_masked_compound;
+    // r416: §5.5.2 jnt-comp — compound leaves code the §5.11.29
+    // `compound_idx` S() and may commit COMPOUND_DISTANCE (the RD
+    // ladder trials the §7.11.3.15 distance-weighted blend against
+    // the AVERAGE baseline).
+    ip.enable_jnt_comp = seq.enable_jnt_comp;
     // §5.9.2 order hints — `OrderHints[ ref ]` =
     // `RefOrderHint[ ref_frame_idx[ ref - LAST_FRAME ] ]` over the
     // config's slot state.
@@ -1296,12 +1301,22 @@ impl PSearchCtx {
                 // r415 — the SAME §5.11.29 stamp values the write
                 // pass commits for this leaf (search mirror and write
                 // mirror must observe identical neighbour grids).
+                // r416: only the MASKED ordinals set
+                // `comp_group_idx = 1`; COMPOUND_DISTANCE stays on
+                // the `comp_group_idx = 0` arm with `compound_idx = 0`.
                 comp_group_idx: u8::from(
                     ib.ref_frame[1] > 0
                         && ib.skip_mode == 0
-                        && ib.compound_type != crate::inter_pred::COMPOUND_AVERAGE,
+                        && matches!(
+                            ib.compound_type,
+                            crate::inter_pred::COMPOUND_WEDGE | crate::inter_pred::COMPOUND_DIFFWTD
+                        ),
                 ),
-                compound_idx: 1,
+                compound_idx: u8::from(
+                    !(ib.ref_frame[1] > 0
+                        && ib.skip_mode == 0
+                        && ib.compound_type == crate::inter_pred::COMPOUND_DISTANCE),
+                ),
                 compound_type: if ib.ref_frame[1] > 0 && ib.skip_mode == 0 {
                     ib.compound_type
                 } else {
@@ -2117,6 +2132,42 @@ fn encode_inter_leaf_modes(
                     best_ci = cci;
                     comp = sel;
                 }
+            }
+        }
+    }
+
+    // r416 — §5.11.29 jnt-comp trial on the best compound candidate:
+    // the COMPOUND_DISTANCE leaf (`comp_group_idx = 0`,
+    // `compound_idx = 0`) predicted through the decoder's own
+    // §7.11.3.15 distance-weighted blend. Rate-neutral against the
+    // coded AVERAGE arm (both code the same two §5.11.29 symbols), so
+    // luma distortion alone decides; ties keep the running best.
+    if ictx.ip.enable_jnt_comp {
+        if let Some((_, cci)) = best_compound {
+            let (c_ref, c_mode, c_mv, c_rate) = {
+                let c = &cands[cci];
+                (c.ref_frame, c.y_mode, c.mv, c.rate)
+            };
+            let sel = CompoundSel {
+                ctype: crate::inter_pred::COMPOUND_DISTANCE,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
+            };
+            ictx.predict_leaf(mi_r, mi_c, b_size, c_ref, c_mode, c_mv, EIGHTTAP, sel)?;
+            let mut ssd = 0u64;
+            for i in 0..bh {
+                for j in 0..bw {
+                    let d = i64::from(input.y[(row0 + i) * width + col0 + j])
+                        - i64::from(ictx.scratch[0][(row0 + i) * width + col0 + j]);
+                    ssd += (d * d) as u64;
+                }
+            }
+            let score = ssd + lambda * c_rate;
+            if score < best_score {
+                best_score = score;
+                best_ci = cci;
+                comp = sel;
             }
         }
     }
@@ -4320,6 +4371,144 @@ mod tests {
                 &enc.ivf_bytes,
             )
             .unwrap();
+        }
+    }
+
+    /// r416 — §5.11.29 jnt-comp must actually be selected where the
+    /// §7.11.3.15 distance-weighted blend is the distortion winner:
+    /// the target frame is constructed as the decoder's OWN
+    /// COMPOUND_DISTANCE blend of the two references (through
+    /// [`PSearchCtx::predict_leaf`] under the real P-frame order
+    /// hints — LAST at distance 1, GOLDEN at distance 2 ⇒ the
+    /// asymmetric `(11, 5)/16` weight pair), so a DISTANCE leaf
+    /// predicts it exactly while COMPOUND_AVERAGE misses by the
+    /// weight asymmetry — the search tree must commit
+    /// COMPOUND_DISTANCE leaves, and a full GOP over the same
+    /// construction must round-trip byte-exact through the spec
+    /// driver (proving the coded `compound_idx` cascade end to end).
+    #[test]
+    fn r416_search_selects_distance_compound_on_weighted_blend_content() {
+        use crate::cdf::BLOCK_32X32;
+        use crate::inter_pred::COMPOUND_DISTANCE;
+        let f0 = moving_gradient(64, 64, 0, 0, 40);
+        let f1 = moving_gradient(64, 64, 0, 0, 140);
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+
+        // Target: the §7.11.3.15 DISTANCE blend of the two reference
+        // reconstructions through the real kernel under the frame-2
+        // order hints (the same hints the GOP encode derives).
+        let mut target = Yuv420Frame::filled(64, 64, 0);
+        {
+            let mut ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
+            ip.order_hints = gop_order_hints(2, pre.seq.order_hint_bits);
+            let mut probe =
+                PSearchCtx::new(&pre.recon[1], &pre.recon[0], 16, 16, 64, 64, ip, 2, 0, &[])
+                    .unwrap();
+            let sel = CompoundSel {
+                ctype: COMPOUND_DISTANCE,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
+            };
+            for (r, c) in [(0u32, 0u32), (0, 8), (8, 0), (8, 8)] {
+                probe
+                    .predict_leaf(
+                        r,
+                        c,
+                        BLOCK_32X32,
+                        [1, 4],
+                        MODE_NEW_NEWMV,
+                        [[0, 0], [0, 0]],
+                        EIGHTTAP,
+                        sel,
+                    )
+                    .unwrap();
+            }
+            for (dst, &src) in target.y.iter_mut().zip(probe.scratch[0].iter()) {
+                *dst = src as u8;
+            }
+            for (dst, &src) in target.u.iter_mut().zip(probe.scratch[1].iter()) {
+                *dst = src as u8;
+            }
+            for (dst, &src) in target.v.iter_mut().zip(probe.scratch[2].iter()) {
+                *dst = src as u8;
+            }
+        }
+
+        // Direct search drive (LAST = f1 recon, GOLDEN = f0 recon at
+        // p_index = 2), jnt-comp enabled.
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 2, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.enable_masked_compound = true;
+        ip.enable_jnt_comp = true;
+        ip.order_hints = gop_order_hints(2, pre.seq.order_hint_bits);
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[1],
+            &pre.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            2,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, dist: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, dist: &mut u32, other: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.compound_type == crate::inter_pred::COMPOUND_DISTANCE {
+                        *dist += 1;
+                    } else {
+                        *other += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, dist, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, dist, other);
+                    }
+                }
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
+                        leafc(b, dist, other);
+                    }
+                }
+            }
+        }
+        let (mut dist, mut other) = (0u32, 0u32);
+        count(&tree, &mut dist, &mut other);
+        assert!(
+            dist > 0,
+            "distance-blend content must commit COMPOUND_DISTANCE leaves \
+             (got DISTANCE={dist} OTHER={other})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+        // Env-gated fixture dump for external black-box validation /
+        // corpus pinning (no-op in normal runs).
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_JNT_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(format!("{dir}/self-gop-64x64-q60-jnt.ivf"), &enc.ivf_bytes).unwrap();
         }
     }
 

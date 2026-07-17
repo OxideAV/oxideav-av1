@@ -318,7 +318,11 @@ pub fn build_intra_only_yuv420_8bit_seq(max_width: u32, max_height: u32) -> Sequ
         // groundwork both key off `OrderHintBits > 0`. Intra-only
         // frames simply carry `order_hint = 0`.
         enable_order_hint: true,
-        enable_jnt_comp: false,
+        // r416: jnt-comp rides every stream this builder seeds — inter
+        // GOP compound leaves code the §5.11.29 `compound_idx` S() and
+        // may select the §7.11.3.15 COMPOUND_DISTANCE blend
+        // (intra-only frames are unaffected).
+        enable_jnt_comp: true,
         // r413: temporal MV prediction — GOP P-frames run §7.9
         // motion-field estimation (`use_ref_frame_mvs = 1`); the
         // seq-level gate must be open.
