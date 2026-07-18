@@ -568,6 +568,28 @@ gains `fine` / `bands` content kinds; the 30-config pyramid sweep and
 all three r416 self-encoded streams decode byte-exact in THREE
 independent reference decoders (corpus 60 total).
 
+### Inter encoder: inter-intra blends + sub-8×8 intra leaves (r417)
+
+r417 works the r416 follow-up ladder. **Inter-intra blends**
+(§7.11.3.14): every sequence header now opens
+`enable_interintra_compound` — single-reference 8×8..32×32 leaves
+code the §5.11.28 cascade, and the RD ladder trials all four
+§6.10.27 II modes through the §7.11.3.13 smooth intra-variant mask
+plus the 16 §7.11.3.11 wedge masks (where `Wedge_Bits > 0`), the
+intra half predicted into the search scratch through a
+buffer-parameterised split of the decode walker's own §7.11.2 core
+(one code path for decode and search — the r416 "missing piece").
+Blend content provably commits inter-intra leaves. **Sub-8×8 intra
+leaves in inter frames**: BLOCK_4X4 nodes RD-trial the §5.11.22
+intra arm against the searched inter leaf, and committed intra
+winners stamp `RefFrame[ 0 ] = INTRA_FRAME` into the driver grids so
+the §5.11.33 `someUseIntra` chroma arm (whole-region group chroma at
+the inter leaf's own MV) fires identically at search and decode
+time; mixed-group content provably commits intra 4×4 leaves beside
+inter ones. The sweep matrix gains the `iifade` kind; the 30-config
+pyramid sweep and both r417 self-encoded streams decode byte-exact
+in THREE independent reference decoders (corpus 62 total).
+
 ### Not yet supported
 
 - `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` / `SEG_LVL_GLOBALMV` inter
@@ -581,14 +603,14 @@ independent reference decoders (corpus 60 total).
   `encoder::encode_key_frame_yuv420` /
   `encoder::encode_gop_yuv420{,_with_q,_with_q_seg}` /
   `encoder::encode_pyramid_gop_yuv420{,_with_q}`. Conformant
-  encoding beyond the r416 scope (inter-intra blend modes — the
-  §5.11.28 write arm exists, the encoder-side §7.11.2 intra half
-  into search scratch is the missing piece — palette/intrabc leaves
-  in inter frames, sub-8×8 intra leaves in inter frames (the
-  §5.11.33 `someUseIntra` chroma split on the encode side),
+  encoding beyond the r417 scope (palette / intrabc leaves — the
+  §5.11.46/§5.11.49/§5.11.7 write arms exist, the encoder-side
+  colour-clustering / block-copy search is the missing piece —
   §5.11.19 temporal segment-map update, deeper-than-two pyramid
   levels / adaptive mini-GOP sizing, true bit-accounting rate
-  costs, per-segment lossless mixing) is the follow-up ladder.
+  costs, per-segment lossless mixing, OBMC / warped-motion /
+  filter-intra / CfL-in-inter mode search) is the follow-up
+  ladder.
 
 ## Module layout
 
