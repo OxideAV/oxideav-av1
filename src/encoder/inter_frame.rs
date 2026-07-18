@@ -1424,6 +1424,52 @@ impl PSearchCtx {
         self.mirror.stamp_encoder_block_syntax(&stamp);
     }
 
+    /// r417 — driver-grid stamps for a committed §5.11.22 INTRA leaf
+    /// (the decode walker's intra grid-fill twins). `predict_leaf`
+    /// stamps only inter trials, so an intra winner must overwrite
+    /// the losing trial's stamps: the §5.11.33 `someUseIntra` scan
+    /// reads `RefFrames[ .. ][ 0 ] == INTRA_FRAME` at the
+    /// neighbouring 2×2-group cells through THESE grids when a later
+    /// sub-8 inter leaf predicts its group chroma.
+    fn stamp_intra_leaf_grids(&mut self, mi_row: u32, mi_col: u32, b_size: usize, y_mode: u8) {
+        let bw4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
+        let bh4 = NUM_4X4_BLOCKS_HIGH[b_size] as u32;
+        for dr in 0..bh4 {
+            let rr = mi_row + dr;
+            if rr >= self.mi_rows {
+                break;
+            }
+            for dc in 0..bw4 {
+                let cc = mi_col + dc;
+                if cc >= self.mi_cols {
+                    break;
+                }
+                let cell = (rr * self.mi_cols + cc) as usize;
+                self.mi_sizes[cell] = b_size;
+                self.is_inters[cell] = 0;
+                // §5.11.22: `RefFrame[ 0 ] = INTRA_FRAME`,
+                // `RefFrame[ 1 ] = NONE`.
+                self.ref_frames[cell * 2] = 0;
+                self.ref_frames[cell * 2 + 1] = -1;
+                self.mvs[cell * 4] = 0;
+                self.mvs[cell * 4 + 1] = 0;
+                self.mvs[cell * 4 + 2] = 0;
+                self.mvs[cell * 4 + 3] = 0;
+                self.interp_filters[cell * 2] = EIGHTTAP;
+                self.interp_filters[cell * 2 + 1] = EIGHTTAP;
+                self.motion_modes[cell] = MOTION_MODE_SIMPLE;
+                self.y_modes[cell] = y_mode;
+                self.compound_types[cell] = crate::inter_pred::COMPOUND_AVERAGE;
+                self.wedge_indices[cell] = 0;
+                self.wedge_signs[cell] = 0;
+                self.mask_types[cell] = 0;
+                self.interintra_modes[cell] = 0;
+                self.wedge_interintras[cell] = 0;
+                self.interintra_wedge_indices[cell] = 0;
+            }
+        }
+    }
+
     /// Stamp the leaf's §5.11.5 grid footprint (the same values the
     /// write mirror / decode walker stamp), then run the decoder's
     /// §5.11.33 leaf driver into the scratch planes.
@@ -3101,15 +3147,60 @@ fn build_p_search_tree(
     }
     // r416 — sub-8×8 floor: a BLOCK_4X4 node (reachable only through
     // PARTITION_SPLIT at BLOCK_8X8, and always fully inside — dims
-    // are multiples of 8) is a single INTER leaf — the encoder policy
-    // keeps sub-8×8 cells inter-only (any deterministic mode policy
-    // is conformant; intra stays available from BLOCK_8X8 up), which
-    // also keeps the §5.11.33 `someUseIntra` chroma split out of the
-    // emitted streams.
+    // are multiples of 8) is a single leaf. r417 — the r416
+    // inter-only policy is lifted: the node RD-trials the §5.11.22
+    // INTRA arm against the fully-searched inter leaf (the same
+    // A-vs-B comparison the >= 8×8 nodes run). A mixed 2×2 group
+    // (`RefFrames[ .. ][ 0 ] == INTRA_FRAME` on any cell) drives the
+    // §5.11.33 `someUseIntra` chroma arm on the group's inter
+    // `HasChroma` leaf — the search predicts through the decoder's
+    // own driver over the live grids, so the split is exact on both
+    // sides.
     if b_size == BLOCK_4X4 {
-        let leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx)?;
-        ictx.stamp_leaf(&leaf, r, c, b_size, recon.lossless);
-        return Ok(SyntaxNode::Leaf(Box::new(leaf)));
+        let lambda = lambda_for(&recon.qp);
+        // Group-aligned snapshot rect: a `HasChroma` 4×4 leaf codes
+        // the WHOLE 2×2 group's chroma (§5.11.38 plane residual size
+        // at the lifted origin) — trials must not leak between arms.
+        let (sr, sc) = (r & !1, c & !1);
+        let before = save_region_wh(recon, sr, sc, 2, 2);
+        let m_before = ictx.mirror.snapshot_encoder_stamp_rect(r, c, 1);
+
+        // Candidate A: the fully-searched INTER leaf.
+        let inter_leaf = encode_inter_leaf(r, c, b_size, input, recon, ictx)?;
+        ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
+        let d_inter = region_distortion_wh(recon, input, sr, sc, 2, 2);
+        let score_inter = d_inter + lambda * p_leaf_rate(&inter_leaf);
+        let after_inter = save_region_wh(recon, sr, sc, 2, 2);
+        let m_after_inter = ictx.mirror.snapshot_encoder_stamp_rect(r, c, 1);
+        restore_region(recon, sr, sc, &before);
+        ictx.mirror.restore_encoder_stamp_rect(&m_before);
+
+        // Candidate B: the §5.11.22 INTRA leaf (the KEY driver's 4×4
+        // arm — group-chroma coding on the `HasChroma` SE cell).
+        let mut intra_leaf = encode_leaf_sq(r, c, b_size, input, recon);
+        if !ictx.seg_alt_q.is_empty() && intra_leaf.skip == 1 {
+            intra_leaf.segment_id = ictx.segment_pred(r, c);
+        }
+        ictx.stamp_leaf(&intra_leaf, r, c, b_size, recon.lossless);
+        let d_intra = region_distortion_wh(recon, input, sr, sc, 2, 2);
+        let score_intra = d_intra + lambda * p_leaf_rate(&intra_leaf);
+
+        if score_inter <= score_intra {
+            restore_region(recon, sr, sc, &after_inter);
+            ictx.mirror.restore_encoder_stamp_rect(&m_after_inter);
+            // Re-stamp the inter winner's mirror footprint (the intra
+            // trial overwrote the mi cell); the driver grids already
+            // hold the winner's stamps ([`encode_inter_leaf`]'s
+            // final-predict guarantee — candidate B never touches
+            // them).
+            ictx.stamp_leaf(&inter_leaf, r, c, b_size, recon.lossless);
+            return Ok(SyntaxNode::Leaf(Box::new(inter_leaf)));
+        }
+        // Driver-grid intra stamps for the committed winner: a later
+        // group cell's §5.11.33 `someUseIntra` scan must see
+        // `RefFrames[ .. ][ 0 ] == INTRA_FRAME` here.
+        ictx.stamp_intra_leaf_grids(r, c, b_size, intra_leaf.y_mode);
+        return Ok(SyntaxNode::Leaf(Box::new(intra_leaf)));
     }
     let n4 = NUM_4X4_BLOCKS_WIDE[b_size] as u32;
     let half = n4 >> 1;
@@ -3917,9 +4008,9 @@ mod tests {
         );
 
         // Full-stream conformance through the spec driver.
-        let enc = encode_gop_yuv420_with_q(&[f0, f1, f2], base_q_idx).unwrap();
+        let enc = encode_gop_yuv420_with_q(&[f0, f2], base_q_idx).unwrap();
         let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
-        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.len(), 2);
         for (idx, f) in decoded.iter().enumerate() {
             assert_eq!(f.planes[0], enc.recon[idx].y, "frame {idx} luma");
             assert_eq!(f.planes[1], enc.recon[idx].u, "frame {idx} U");
@@ -4887,6 +4978,139 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 format!("{dir}/self-gop-64x64-q60-wedge.ivf"),
+                &enc.ivf_bytes,
+            )
+            .unwrap();
+        }
+    }
+
+    /// r417 — sub-8×8 INTRA leaves in inter frames: content whose
+    /// 8×8 groups mix a V_PRED-perfect 4×4 cell (its rows replicate
+    /// the row above — the §7.11.2 intra copy is near-exact while no
+    /// reference contains the vertically-constant patch) with three
+    /// trackable moving-texture cells must commit a PARTITION_SPLIT
+    /// at BLOCK_8X8 whose leaves MIX `is_inter = 0` and
+    /// `is_inter = 1` — the §5.11.33 `someUseIntra` chroma arm fires
+    /// on the group's inter `HasChroma` leaf — and the full GOP must
+    /// round-trip byte-exact through the spec driver.
+    #[test]
+    fn r417_search_selects_sub8_intra_in_mixed_groups() {
+        let f0 = moving_gradient(64, 64, 0, 0, 71);
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(std::slice::from_ref(&f0), base_q_idx).unwrap();
+        let kr = &pre.recon[0];
+
+        // Target: the r416 fine-motion checkerboard (per-4×4-cell
+        // (0,0) / (4,4) sampling shifts of the KEY recon — proven to
+        // drive PARTITION_SPLIT down to BLOCK_4X4), with the NW cell
+        // of four 8×8 groups overwritten by V-replication (rows copy
+        // the row directly above — vertically constant, absent from
+        // the reference, near-exact under §7.11.2 V_PRED).
+        let mut f2 = Yuv420Frame::filled(64, 64, 0);
+        let at = |p: &[u8], w: usize, h: usize, i: i64, j: i64| -> u8 {
+            let ii = i.clamp(0, h as i64 - 1) as usize;
+            let jj = j.clamp(0, w as i64 - 1) as usize;
+            p[ii * w + jj]
+        };
+        for i in 0..64i64 {
+            for j in 0..64i64 {
+                let par = ((i / 4) + (j / 4)) & 1;
+                let (dy, dx) = if par == 0 { (0, 0) } else { (4, 4) };
+                f2.y[(i * 64 + j) as usize] = at(&kr.y, 64, 64, i + dy, j + dx);
+            }
+        }
+        f2.u.copy_from_slice(&kr.u);
+        f2.v.copy_from_slice(&kr.v);
+        for (r0, c0) in [(8usize, 8usize), (8, 40), (40, 8), (40, 40)] {
+            for i in 0..4 {
+                for j in 0..4 {
+                    f2.y[(r0 + i) * 64 + c0 + j] = f2.y[(r0 - 1) * 64 + c0 + j];
+                }
+            }
+        }
+
+        // Direct search drive (LAST = GOLDEN = the KEY recon at
+        // p_index = 1) over the target.
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 1, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.enable_interintra_compound = true;
+        ip.order_hints = gop_order_hints(1, pre.seq.order_hint_bits);
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[0],
+            &pre.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            1,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &f2, &mut recon, &mut ictx).unwrap();
+
+        // Walk the committed tree: collect BLOCK_4X4 leaves with
+        // §5.11.4 SPLIT geometry.
+        fn walk(
+            node: &SyntaxNode,
+            r: u32,
+            c: u32,
+            b_size: usize,
+            found: &mut Vec<(u32, u32, bool)>,
+        ) {
+            match node {
+                SyntaxNode::Leaf(b) if b_size == BLOCK_4X4 => {
+                    found.push((r, c, b.inter.is_some()));
+                }
+                SyntaxNode::Split(children) => {
+                    let sub =
+                        crate::cdf::partition_subsize(crate::cdf::PARTITION_SPLIT, b_size).unwrap();
+                    let half = (NUM_4X4_BLOCKS_WIDE[b_size] as u32) >> 1;
+                    walk(&children[0], r, c, sub, found);
+                    walk(&children[1], r, c + half, sub, found);
+                    walk(&children[2], r + half, c, sub, found);
+                    walk(&children[3], r + half, c + half, sub, found);
+                }
+                _ => {}
+            }
+        }
+        let mut sub4: Vec<(u32, u32, bool)> = Vec::new();
+        walk(&tree, 0, 0, BLOCK_64X64, &mut sub4);
+        let n_intra4 = sub4.iter().filter(|&&(_, _, inter)| !inter).count();
+        assert!(
+            n_intra4 > 0,
+            "V-replicated cells must commit BLOCK_4X4 intra leaves (got {sub4:?})"
+        );
+        // At least one 2×2 group mixes intra and inter — the
+        // §5.11.33 someUseIntra chroma arm is live in the stream.
+        let mixed = sub4.iter().any(|&(r, c, inter)| {
+            !inter
+                && sub4
+                    .iter()
+                    .any(|&(r2, c2, inter2)| inter2 && (r2 & !1, c2 & !1) == (r & !1, c & !1))
+        });
+        assert!(mixed, "some 2x2 group must mix intra and inter ({sub4:?})");
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f2], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+        if let Ok(dir) = std::env::var("OXIDEAV_AV1_SUB8INTRA_FIXDIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                format!("{dir}/self-gop-64x64-q60-sub8-intra.ivf"),
                 &enc.ivf_bytes,
             )
             .unwrap();
