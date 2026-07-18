@@ -4984,6 +4984,138 @@ mod tests {
         }
     }
 
+    /// r417 — the §5.11.28 WEDGE sub-arm must actually be selected
+    /// where a §7.11.3.11 wedge-masked inter-intra blend is the
+    /// distortion winner: the target quadrants are constructed
+    /// through the real driver with `wedge_interintra = 1` (wedge
+    /// index 7) — the same incremental neighbour-state technique as
+    /// the smooth witness — so a wedge inter-intra leaf predicts
+    /// each quadrant near-exactly while the smooth mask and every
+    /// plain arm miss the wedge boundary; the committed tree must
+    /// carry `wedge_interintra = 1` leaves and the GOP must
+    /// round-trip byte-exact through the spec driver.
+    #[test]
+    fn r417_search_selects_wedge_inter_intra_on_wedge_blend_content() {
+        use crate::cdf::{BLOCK_32X32, II_V_PRED};
+        let f0 = moving_gradient(64, 64, 0, 0, 40);
+        let f1 = moving_gradient(64, 64, 0, 0, 140);
+        let base_q_idx = 60u8;
+        let pre = encode_gop_yuv420_with_q(&[f0.clone(), f1.clone()], base_q_idx).unwrap();
+
+        let mut target = Yuv420Frame::filled(64, 64, 0);
+        {
+            let ip = SyntaxInterFrameParams::single_ref_baseline(16, 16, false);
+            let mut probe =
+                PSearchCtx::new(&pre.recon[1], &pre.recon[0], 16, 16, 64, 64, ip, 2, 0, &[])
+                    .unwrap();
+            let mut running = fresh_recon(64, 64, base_q_idx);
+            for (r, c) in [(0u32, 0u32), (0, 8), (8, 0), (8, 8)] {
+                probe
+                    .predict_leaf(
+                        r,
+                        c,
+                        BLOCK_32X32,
+                        [1, -1],
+                        MODE_NEARESTMV,
+                        [[0, 0], [0, 0]],
+                        EIGHTTAP,
+                        CompoundSel::AVERAGE,
+                        Some(InterIntraTrial {
+                            mode: II_V_PRED,
+                            wedge: Some(7),
+                            neigh: &running,
+                        }),
+                    )
+                    .unwrap();
+                let (row0, col0) = ((r as usize) * 4, (c as usize) * 4);
+                for i in 0..32usize {
+                    for j in 0..32usize {
+                        let v = probe.scratch[0][(row0 + i) * 64 + col0 + j] as u8;
+                        target.y[(row0 + i) * 64 + col0 + j] = v;
+                        running.y[(row0 + i) * 64 + col0 + j] = v;
+                    }
+                }
+                let (cr0, cc0) = (row0 / 2, col0 / 2);
+                for i in 0..16usize {
+                    for j in 0..16usize {
+                        let u = probe.scratch[1][(cr0 + i) * 32 + cc0 + j] as u8;
+                        let v = probe.scratch[2][(cr0 + i) * 32 + cc0 + j] as u8;
+                        target.u[(cr0 + i) * 32 + cc0 + j] = u;
+                        target.v[(cr0 + i) * 32 + cc0 + j] = v;
+                        running.u[(cr0 + i) * 32 + cc0 + j] = u;
+                        running.v[(cr0 + i) * 32 + cc0 + j] = v;
+                    }
+                }
+            }
+        }
+
+        let fh = build_p_frame_yuv420_8bit_fh_with_q(&pre.seq, 64, 64, base_q_idx, 2, &[]);
+        let fs = fh.frame_size.as_ref().unwrap();
+        let (mi_rows, mi_cols) = (fs.mi_rows, fs.mi_cols);
+        let mut recon = fresh_recon(64, 64, base_q_idx);
+        let mut ip = SyntaxInterFrameParams::single_ref_baseline(mi_rows, mi_cols, false);
+        ip.interpolation_filter = SWITCHABLE;
+        ip.reference_select = true;
+        ip.enable_interintra_compound = true;
+        ip.order_hints = gop_order_hints(2, pre.seq.order_hint_bits);
+        let mut ictx = PSearchCtx::new(
+            &pre.recon[1],
+            &pre.recon[0],
+            mi_rows,
+            mi_cols,
+            64,
+            64,
+            ip,
+            2,
+            base_q_idx,
+            &[],
+        )
+        .unwrap();
+        recon.bd.clear_for_sb(0, 0, mi_rows, mi_cols);
+        let tree = build_p_search_tree(0, 0, BLOCK_64X64, &target, &mut recon, &mut ictx).unwrap();
+        fn count(node: &SyntaxNode, wedge_ii: &mut u32, other: &mut u32) {
+            let leafc = |b: &SyntaxBlock, wedge_ii: &mut u32, other: &mut u32| {
+                if let Some(ib) = b.inter.as_ref() {
+                    if ib.interintra_mode.is_some() && ib.wedge_interintra == 1 {
+                        *wedge_ii += 1;
+                    } else {
+                        *other += 1;
+                    }
+                }
+            };
+            match node {
+                SyntaxNode::Leaf(b) => leafc(b, wedge_ii, other),
+                SyntaxNode::Split(children) => {
+                    for ch in children.iter() {
+                        count(ch, wedge_ii, other);
+                    }
+                }
+                rest => {
+                    for b in rest.asymmetric_blocks().iter() {
+                        leafc(b, wedge_ii, other);
+                    }
+                }
+            }
+        }
+        let (mut wedge_ii, mut other) = (0u32, 0u32);
+        count(&tree, &mut wedge_ii, &mut other);
+        assert!(
+            wedge_ii > 0,
+            "wedge inter-intra blend content must commit wedge_interintra = 1 leaves \
+             (got WEDGE_II={wedge_ii} OTHER={other})"
+        );
+
+        // Full-stream conformance through the spec driver.
+        let enc = encode_gop_yuv420_with_q(&[f0, f1, target], base_q_idx).unwrap();
+        let decoded = crate::decoder::decode_av1_spec(&enc.ivf_bytes).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (idx, fr) in decoded.iter().enumerate() {
+            assert_eq!(fr.planes[0], enc.recon[idx].y, "frame {idx} luma");
+            assert_eq!(fr.planes[1], enc.recon[idx].u, "frame {idx} U");
+            assert_eq!(fr.planes[2], enc.recon[idx].v, "frame {idx} V");
+        }
+    }
+
     /// r417 — sub-8×8 INTRA leaves in inter frames: content whose
     /// 8×8 groups mix a V_PRED-perfect 4×4 cell (its rows replicate
     /// the row above — the §7.11.2 intra copy is near-exact while no
