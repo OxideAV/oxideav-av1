@@ -16114,6 +16114,15 @@ pub(crate) struct EncoderBlockSyntaxStamp<'a> {
     pub wedge_index: u8,
     pub wedge_sign: u8,
     pub mask_type: u8,
+    /// r417 — §5.11.28 inter-intra side data (`interintra_mode` /
+    /// `wedge_interintra` / the interintra `wedge_index`; all `0`
+    /// when `interintra == 0` — the block class is recognisable from
+    /// `ref_frame[ 1 ] == INTRA_FRAME` with `is_inter == 1`), stamped
+    /// into the decode-walker-twin §5.11.5 grids only when
+    /// `is_inter != 0`.
+    pub interintra_mode: u8,
+    pub wedge_interintra: u8,
+    pub interintra_wedge_index: u8,
     /// §5.11.46 `PaletteSizeY` (0 = no luma palette).
     pub palette_size_y: u8,
     /// §5.11.46 `palette_colors_y[ 0..PaletteSizeY ]`.
@@ -16169,6 +16178,9 @@ pub(crate) struct EncoderStampSnapshot {
     compound_wedge_indices: Vec<u8>,
     compound_wedge_signs: Vec<u8>,
     compound_mask_types: Vec<u8>,
+    interintra_modes: Vec<u8>,
+    wedge_interintras: Vec<u8>,
+    interintra_wedge_indices: Vec<u8>,
 }
 
 /// Per-tile frame-constant parameters threaded into the §5.11.2
@@ -21040,6 +21052,11 @@ impl PartitionWalker {
                     self.compound_wedge_indices[cell] = s.wedge_index;
                     self.compound_wedge_signs[cell] = s.wedge_sign;
                     self.compound_mask_types[cell] = s.mask_type;
+                    // r417 — §5.11.28 inter-intra grid-fill twins of
+                    // the decode walker's stamps.
+                    self.interintra_modes[cell] = s.interintra_mode;
+                    self.wedge_interintras[cell] = s.wedge_interintra;
+                    self.interintra_wedge_indices[cell] = s.interintra_wedge_index;
                 }
                 if s.palette_size_y > 0 {
                     self.palette_sizes[cell] = s.palette_size_y;
@@ -21164,6 +21181,9 @@ impl PartitionWalker {
             compound_wedge_indices: Vec::with_capacity(cells),
             compound_wedge_signs: Vec::with_capacity(cells),
             compound_mask_types: Vec::with_capacity(cells),
+            interintra_modes: Vec::with_capacity(cells),
+            wedge_interintras: Vec::with_capacity(cells),
+            interintra_wedge_indices: Vec::with_capacity(cells),
         };
         for rr in mi_row..r1 {
             for cc in mi_col..c1 {
@@ -21202,6 +21222,10 @@ impl PartitionWalker {
                     .push(self.compound_wedge_signs[cell]);
                 snap.compound_mask_types
                     .push(self.compound_mask_types[cell]);
+                snap.interintra_modes.push(self.interintra_modes[cell]);
+                snap.wedge_interintras.push(self.wedge_interintras[cell]);
+                snap.interintra_wedge_indices
+                    .push(self.interintra_wedge_indices[cell]);
             }
         }
         snap
@@ -21248,6 +21272,9 @@ impl PartitionWalker {
                 self.compound_wedge_indices[cell] = snap.compound_wedge_indices[i];
                 self.compound_wedge_signs[cell] = snap.compound_wedge_signs[i];
                 self.compound_mask_types[cell] = snap.compound_mask_types[i];
+                self.interintra_modes[cell] = snap.interintra_modes[i];
+                self.wedge_interintras[cell] = snap.wedge_interintras[i];
+                self.interintra_wedge_indices[cell] = snap.interintra_wedge_indices[i];
                 i += 1;
             }
         }
@@ -62064,6 +62091,9 @@ mod tests {
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
 
         // Fresh walker: curr_frame[0] is unallocated; the frame bridge
@@ -62150,6 +62180,9 @@ mod tests {
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
         // Baseline stamp INSIDE the rect (the committed pre-trial leaf).
         let base = EncoderBlockSyntaxStamp {
@@ -62181,6 +62214,9 @@ mod tests {
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         };
         walker.stamp_encoder_block_syntax(&base);
 
@@ -62256,6 +62292,9 @@ mod tests {
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
         assert_ne!(
             stack_at(&walker).ref_stack_mv,
@@ -62421,6 +62460,9 @@ mod tests {
                 wedge_index: 0,
                 wedge_sign: 0,
                 mask_type: 0,
+                interintra_mode: 0,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
             });
         }
 
@@ -62534,6 +62576,9 @@ mod tests {
                     wedge_index: 0,
                     wedge_sign: 0,
                     mask_type: 0,
+                    interintra_mode: 0,
+                    wedge_interintra: 0,
+                    interintra_wedge_index: 0,
                 });
             }
             let ref_spec = PlaneRefSpec {
@@ -62666,6 +62711,9 @@ mod tests {
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
         let good_spec = PlaneRefSpec {
             plane: 0,

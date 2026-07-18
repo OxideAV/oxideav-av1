@@ -106,8 +106,8 @@ use crate::cdf::{
     get_plane_residual_size, get_tx_size, inter_tx_type_set, intra_mode_ctx, intra_tx_type_set,
     is_inter_ctx, palette_tokens_args, partition_ctx, partition_subsize, segment_id_ctx,
     size_group, skip_ctx, skip_mode_ctx, tx_size_sqr_index, EncoderBlockSyntaxStamp,
-    FrameInterOrderHints, InterpolationFilterReadout, MotionFieldMvs, PalettePlane,
-    PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
+    FrameInterOrderHints, InterIntraReadout, InterpolationFilterReadout, MotionFieldMvs,
+    PalettePlane, PartitionWalker, TileCdfContext, TileGeometry, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8,
     BLOCK_INVALID, BLOCK_SIZES, DCT_DCT, DC_PRED, EIGHTTAP, FRAME_LF_COUNT, GM_TYPE_IDENTITY,
     GM_TYPE_TRANSLATION, H_ADST, H_DCT, H_FLIPADST, MAX_SEGMENTS, MAX_TX_SIZE_RECT,
     MAX_VARTX_DEPTH, MI_HEIGHT_LOG2, MI_SIZE, MI_SIZE_LOG2, MI_WIDTH_LOG2, MODE_GLOBALMV,
@@ -811,6 +811,32 @@ pub struct SyntaxInterBlock {
     pub wedge_sign: u8,
     /// r415 — §5.11.29 `mask_type` (0/1; COMPOUND_DIFFWTD only).
     pub mask_type: u8,
+    /// r417 — §5.11.28 `interintra` commitment: `Some(m)` codes
+    /// `interintra = 1` with `interintra_mode = m` (a §6.10.27 II
+    /// ordinal `< INTERINTRA_MODES`); `None` codes `interintra = 0`
+    /// on the gate-open arm and is the only committable shape on
+    /// every gate-closed arm. `Some(_)` requires
+    /// [`SyntaxInterFrameParams::enable_interintra_compound`], a
+    /// single-reference non-skip-mode leaf, and `MiSize` in
+    /// `BLOCK_8X8..=BLOCK_32X32`; the §5.11.28 imperative override
+    /// then makes the block's grid `RefFrame[ 1 ] = INTRA_FRAME`
+    /// (commit [`Self::ref_frame`] as the §5.11.25 pre-override
+    /// single-reference pair `[ rf, -1 ]` — the writer applies the
+    /// override itself), silences §5.11.27 `motion_mode`, and the
+    /// bit-silent §5.11.29 arm derives `compound_type =
+    /// wedge_interintra ? COMPOUND_WEDGE : COMPOUND_INTRA`
+    /// ([`Self::compound_type`] MUST carry exactly that derived
+    /// value; the r415 compound side-data fields stay zero).
+    pub interintra_mode: Option<u8>,
+    /// r417 — §5.11.28 `wedge_interintra` (0/1; consulted only when
+    /// [`Self::interintra_mode`] is `Some`). `1` selects the
+    /// §7.11.3.11 wedge-mask blend (sign fixed `0` per §5.11.28).
+    pub wedge_interintra: u8,
+    /// r417 — §5.11.28 inter-intra `wedge_index` in `0..16`
+    /// (consulted only when `wedge_interintra == 1`; the committed
+    /// size must satisfy `Wedge_Bits[ MiSize ] > 0` — the encoder
+    /// never commits a wedge on a wedge-ineligible size).
+    pub interintra_wedge_index: u8,
 }
 
 /// Frame-scope inter state for a §5.11.18 write walk (r411) — the
@@ -1887,6 +1913,9 @@ pub fn write_block_syntax(
                 wedge_index: 0,
                 wedge_sign: 0,
                 mask_type: 0,
+                interintra_mode: 0,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
             });
         // §5.11.49 `palette_tokens( )` — `PaletteSize{Y,UV} = 0` on
         // the intrabc arm ⇒ no-op.
@@ -2112,6 +2141,9 @@ pub fn write_block_syntax(
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
 
     // §5.11.5 line `read_block_tx_size( )` — §5.11.16 write driver
@@ -2505,6 +2537,50 @@ fn write_block_syntax_inter_frame(
         tail.enable_interintra_compound = ip.enable_interintra_compound;
         tail.enable_masked_compound = ip.enable_masked_compound;
         tail.enable_jnt_comp = ip.enable_jnt_comp;
+        // r417 — §5.11.28 `read_interintra_mode()` readout from the
+        // committed inter-intra selection. `Some(mode)` is codable
+        // only where the reader's outer gate opens (non-skip-mode
+        // single-reference leaf, sequence gate on, `MiSize` in
+        // `BLOCK_8X8..=BLOCK_32X32`); every gate-closed arm reads no
+        // bits and only the all-`None` shape is committable (the
+        // [`InterBlockModeInfoTail::bit_silent`] default).
+        let interintra_on = if let Some(ii_mode) = ib.interintra_mode {
+            let gate_open = skip_mode == 0
+                && ip.enable_interintra_compound
+                && ib.ref_frame[1] == -1
+                && (crate::cdf::BLOCK_8X8..=crate::cdf::BLOCK_32X32).contains(&sub_size);
+            if !gate_open
+                || (ii_mode as usize) >= crate::cdf::INTERINTRA_MODES
+                || ib.wedge_interintra > 1
+            {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            if ib.wedge_interintra == 1 {
+                // §5.11.28 wedge sub-arm: a §7.11.3.11 mask exists
+                // only on the wedge-eligible sizes; the committed
+                // index rides the same `0..16` alphabet as the
+                // §5.11.29 COMPOUND_WEDGE branch.
+                if crate::cdf::wedge_bits(sub_size) == 0
+                    || (ib.interintra_wedge_index as usize) >= 16
+                {
+                    return Err(Error::PartitionWalkOutOfRange);
+                }
+            } else if ib.interintra_wedge_index != 0 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            tail.interintra = InterIntraReadout {
+                interintra: 1,
+                interintra_mode: Some(ii_mode),
+                wedge_interintra: Some(ib.wedge_interintra),
+                wedge_index: (ib.wedge_interintra == 1).then_some(ib.interintra_wedge_index),
+            };
+            true
+        } else {
+            if ib.wedge_interintra != 0 || ib.interintra_wedge_index != 0 {
+                return Err(Error::PartitionWalkOutOfRange);
+            }
+            false
+        };
         // r415 — §5.11.29 `read_compound_type()` readout from the
         // committed compound selection. The masked arms
         // (COMPOUND_WEDGE / COMPOUND_DIFFWTD ⇒ `comp_group_idx = 1`)
@@ -2518,17 +2594,46 @@ fn write_block_syntax_inter_frame(
                 COMPOUND_AVERAGE, COMPOUND_DIFFWTD, COMPOUND_DISTANCE, COMPOUND_WEDGE,
             };
             let ct = ib.compound_type;
-            let masked = ct == COMPOUND_WEDGE || ct == COMPOUND_DIFFWTD;
-            let side_ok = match ct {
-                COMPOUND_WEDGE => {
-                    ib.mask_type == 0 && (ib.wedge_index as usize) < 16 && ib.wedge_sign <= 1
+            // r417 — inter-intra leaves take the §5.11.29 bit-silent
+            // else-arm: the committed `compound_type` must be exactly
+            // the reader's derivation (`wedge_interintra ?
+            // COMPOUND_WEDGE : COMPOUND_INTRA`) and the r415 compound
+            // side-data fields stay zero (the interintra wedge index
+            // rides its own §5.11.28 field).
+            if interintra_on {
+                let derived = if ib.wedge_interintra == 1 {
+                    COMPOUND_WEDGE
+                } else {
+                    crate::inter_pred::COMPOUND_INTRA
+                };
+                if ct != derived || ib.wedge_index != 0 || ib.wedge_sign != 0 || ib.mask_type != 0 {
+                    return Err(Error::PartitionWalkOutOfRange);
                 }
-                COMPOUND_DIFFWTD => ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type <= 1,
-                COMPOUND_AVERAGE | COMPOUND_DISTANCE => {
-                    ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type == 0
-                }
-                _ => false,
-            };
+                // The §5.11.29 else-arm readout the writer verifies:
+                // line-1/2 pre-sets + the derived type, no side data.
+                tail.compound_type = crate::cdf::CompoundTypeReadout {
+                    comp_group_idx: 0,
+                    compound_idx: 1,
+                    compound_type: ct,
+                    wedge_index: None,
+                    wedge_sign: None,
+                    mask_type: None,
+                };
+            }
+            let masked = !interintra_on && (ct == COMPOUND_WEDGE || ct == COMPOUND_DIFFWTD);
+            let side_ok = interintra_on
+                || match ct {
+                    COMPOUND_WEDGE => {
+                        ib.mask_type == 0 && (ib.wedge_index as usize) < 16 && ib.wedge_sign <= 1
+                    }
+                    COMPOUND_DIFFWTD => {
+                        ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type <= 1
+                    }
+                    COMPOUND_AVERAGE | COMPOUND_DISTANCE => {
+                        ib.wedge_index == 0 && ib.wedge_sign == 0 && ib.mask_type == 0
+                    }
+                    _ => false,
+                };
             if !side_ok {
                 return Err(Error::PartitionWalkOutOfRange);
             }
@@ -2576,7 +2681,7 @@ fn write_block_syntax_inter_frame(
                 )
                 .abs();
                 tail.dist_equal = fwd == bck;
-            } else if ct != COMPOUND_AVERAGE {
+            } else if !interintra_on && ct != COMPOUND_AVERAGE {
                 return Err(Error::PartitionWalkOutOfRange);
             }
             // §8.3.2 `comp_group_idx` / `compound_idx` neighbour ctx
@@ -2690,7 +2795,17 @@ fn write_block_syntax_inter_frame(
                 segment_id: block.segment_id,
                 is_inter: 1,
                 y_mode: ib.y_mode,
-                ref_frame: ib.ref_frame,
+                // r417 — the §5.11.28 imperative override the decode
+                // walker stamps: `RefFrame[ 1 ] = INTRA_FRAME` on the
+                // `interintra == 1` arm.
+                ref_frame: if interintra_on {
+                    [
+                        ib.ref_frame[0],
+                        crate::uncompressed_header_tail::INTRA_FRAME as i8,
+                    ]
+                } else {
+                    ib.ref_frame
+                },
                 mv: ib.mv[0],
                 mv2: ib.mv[1],
                 interp_filter: committed_filters,
@@ -2722,7 +2837,10 @@ fn write_block_syntax_inter_frame(
                         && skip_mode == 0
                         && ib.compound_type == crate::inter_pred::COMPOUND_DISTANCE),
                 ),
-                compound_type: if is_compound && skip_mode == 0 {
+                compound_type: if interintra_on || (is_compound && skip_mode == 0) {
+                    // r417 — inter-intra leaves stamp the §5.11.29
+                    // bit-silent derivation (validated above to equal
+                    // `ib.compound_type`).
                     ib.compound_type
                 } else {
                     crate::inter_pred::COMPOUND_AVERAGE
@@ -2730,6 +2848,15 @@ fn write_block_syntax_inter_frame(
                 wedge_index: ib.wedge_index,
                 wedge_sign: ib.wedge_sign,
                 mask_type: ib.mask_type,
+                // r417 — §5.11.28 inter-intra grid stamps (the decode
+                // walker's grid-fill twins; zero outside the arm).
+                interintra_mode: ib.interintra_mode.unwrap_or(0),
+                wedge_interintra: if interintra_on {
+                    ib.wedge_interintra
+                } else {
+                    0
+                },
+                interintra_wedge_index: ib.interintra_wedge_index,
             });
 
         // §5.11.16 + §5.11.34 (mirrors the intrabc arm: inter luma
@@ -2908,6 +3035,9 @@ fn write_block_syntax_inter_frame(
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
 
     // §5.11.16 — intra ⇒ the §5.11.15 else arm.
@@ -6290,6 +6420,9 @@ mod tests {
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: None,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
         b
     }
@@ -6511,6 +6644,9 @@ mod tests {
                 wedge_index: 0,
                 wedge_sign: 0,
                 mask_type: 0,
+                interintra_mode: None,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
             });
             b
         };
@@ -6613,6 +6749,9 @@ mod tests {
                 wedge_index: wi,
                 wedge_sign: ws,
                 mask_type: mt,
+                interintra_mode: None,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
             });
             b
         };
@@ -6674,6 +6813,9 @@ mod tests {
                 wedge_index: wi,
                 wedge_sign: ws,
                 mask_type: mt,
+                interintra_mode: None,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
             });
             let node = SyntaxNode::Leaf(Box::new(b));
             let mut writer = SymbolWriter::new(false);
@@ -6751,6 +6893,9 @@ mod tests {
                     wedge_index: wi,
                     wedge_sign: ws,
                     mask_type: 0,
+                    interintra_mode: None,
+                    wedge_interintra: 0,
+                    interintra_wedge_index: 0,
                 });
                 b
             };
@@ -6815,6 +6960,9 @@ mod tests {
                 wedge_index: wi,
                 wedge_sign: ws,
                 mask_type: mt,
+                interintra_mode: None,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
             });
             let node = SyntaxNode::Leaf(Box::new(b));
             let mut writer = SymbolWriter::new(false);
@@ -6841,6 +6989,180 @@ mod tests {
         assert!(build(true, -1, 0, 0, 0).is_err());
         // Control: the same DISTANCE leaf on the open gate is fine.
         assert!(build(true, 4, 0, 0, 0).is_ok());
+    }
+
+    /// r417 — inter-intra round trip under
+    /// `enable_interintra_compound = 1`: a SPLIT mixing a smooth
+    /// (non-wedge) inter-intra leaf (`interintra` S() +
+    /// `interintra_mode` S() + `wedge_interintra` S()), a WEDGE
+    /// inter-intra leaf (+ `wedge_index` S()), a plain single-ref
+    /// leaf on the gate-open arm (the coded `interintra = 0` S()),
+    /// and a compound leaf (gate closed by `isCompound` — no
+    /// §5.11.28 bits) — replayed bit-for-bit by the decode walker
+    /// with the §5.11.28 grids checked: the `RefFrame[ 1 ] =
+    /// INTRA_FRAME` imperative override, the `InterIntraModes[]` /
+    /// `WedgeInterIntras[]` / wedge-index grid-fills, and the
+    /// §5.11.29 bit-silent `compound_type` derivation
+    /// (COMPOUND_INTRA / COMPOUND_WEDGE).
+    #[test]
+    fn r417_inter_syntax_round_trip_inter_intra() {
+        use crate::cdf::{II_DC_PRED, II_SMOOTH_PRED};
+        let mut params = inter_params_420(16, 16, /* lossless = */ true);
+        {
+            let ipp = params.inter.as_mut().expect("inter params");
+            ipp.interpolation_filter = SWITCHABLE;
+            ipp.reference_select = true;
+            ipp.enable_interintra_compound = true;
+        }
+        let ii_leaf = |mode: u8, wedge: Option<u8>, mv: [i32; 2]| -> SyntaxBlock {
+            let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+            b.inter = Some(SyntaxInterBlock {
+                ref_frame: [1, -1],
+                y_mode: MODE_NEWMV,
+                mv: [mv, [0, 0]],
+                ref_mv_idx: 0,
+                interp_filter: [EIGHTTAP; 2],
+                skip_mode: 0,
+                compound_type: if wedge.is_some() {
+                    crate::inter_pred::COMPOUND_WEDGE
+                } else {
+                    crate::inter_pred::COMPOUND_INTRA
+                },
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
+                interintra_mode: Some(mode),
+                wedge_interintra: u8::from(wedge.is_some()),
+                interintra_wedge_index: wedge.unwrap_or(0),
+            });
+            b
+        };
+        // NW: smooth inter-intra. NE: wedge inter-intra (index 5).
+        let nw = ii_leaf(II_SMOOTH_PRED, None, [8, 16]);
+        let ne = ii_leaf(II_DC_PRED, Some(5), [8, 8]);
+        // SW: plain single-ref on the gate-open arm (codes
+        // `interintra = 0`).
+        let sw = inter_skip_leaf(MODE_GLOBALMV, [0, 0]);
+        // SE: compound leaf — the §5.11.28 gate closes on
+        // `isCompound`, no bits.
+        let mut se = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+        se.inter = Some(SyntaxInterBlock {
+            ref_frame: [1, 4],
+            y_mode: MODE_NEW_NEWMV,
+            mv: [[0, 8], [8, 0]],
+            ref_mv_idx: 0,
+            interp_filter: [EIGHTTAP; 2],
+            skip_mode: 0,
+            compound_type: crate::inter_pred::COMPOUND_AVERAGE,
+            wedge_index: 0,
+            wedge_sign: 0,
+            mask_type: 0,
+            interintra_mode: None,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
+        });
+        let node = SyntaxNode::Split([
+            Box::new(SyntaxNode::Leaf(Box::new(nw))),
+            Box::new(SyntaxNode::Leaf(Box::new(ne))),
+            Box::new(SyntaxNode::Leaf(Box::new(sw))),
+            Box::new(SyntaxNode::Leaf(Box::new(se))),
+        ]);
+        let (_enc, walker) = syntax_round_trip_inter(&node, 16, 16, BLOCK_64X64, &params, 0xB3);
+
+        let cell = |r: u32, c: u32| (r * 16 + c) as usize;
+        // NW: the §5.11.28 override + smooth II grids.
+        assert_eq!(walker.ref_frames()[cell(0, 0) * 2], 1);
+        assert_eq!(
+            walker.ref_frames()[cell(0, 0) * 2 + 1],
+            crate::uncompressed_header_tail::INTRA_FRAME as i8,
+            "RefFrame[1] = INTRA_FRAME on the interintra arm"
+        );
+        assert_eq!(walker.interintra_modes()[cell(0, 0)], II_SMOOTH_PRED);
+        assert_eq!(walker.wedge_interintras()[cell(0, 0)], 0);
+        assert_eq!(
+            walker.compound_types()[cell(0, 0)],
+            crate::inter_pred::COMPOUND_INTRA
+        );
+        // NE: the wedge sub-arm.
+        assert_eq!(walker.ref_frames()[cell(0, 8) * 2 + 1], 0);
+        assert_eq!(walker.interintra_modes()[cell(0, 8)], II_DC_PRED);
+        assert_eq!(walker.wedge_interintras()[cell(0, 8)], 1);
+        assert_eq!(walker.interintra_wedge_indices()[cell(0, 8)], 5);
+        assert_eq!(
+            walker.compound_types()[cell(0, 8)],
+            crate::inter_pred::COMPOUND_WEDGE
+        );
+        // SW: coded `interintra = 0` — plain single-ref grids.
+        assert_eq!(walker.ref_frames()[cell(8, 0) * 2 + 1], -1);
+        assert_eq!(walker.interintra_modes()[cell(8, 0)], 0);
+        assert_eq!(walker.wedge_interintras()[cell(8, 0)], 0);
+        // SE: compound pair untouched by §5.11.28.
+        assert_eq!(walker.ref_frames()[cell(8, 8) * 2 + 1], 4);
+        assert_eq!(walker.interintra_modes()[cell(8, 8)], 0);
+    }
+
+    /// r417 — inter-intra caller bugs are rejected: the sequence gate
+    /// closed, a compound pair, an out-of-band block size, a wedge on
+    /// a wedge-ineligible size, a stale wedge index on the non-wedge
+    /// arm, and a `compound_type` that is not the §5.11.29 bit-silent
+    /// derivation.
+    #[test]
+    fn r417_inter_syntax_rejects_inconsistent_inter_intra() {
+        use crate::cdf::II_V_PRED;
+        let build = |enable: bool, ref1: i8, b_size: usize, wedge_ii: u8, wedge_idx: u8, ct: u8| {
+            let mut params = inter_params_420(16, 16, /* lossless = */ true);
+            {
+                let ipp = params.inter.as_mut().expect("inter params");
+                ipp.interpolation_filter = SWITCHABLE;
+                ipp.reference_select = true;
+                ipp.enable_interintra_compound = enable;
+            }
+            let mut b = SyntaxBlock::skip_leaf(DC_PRED as u8, None);
+            b.inter = Some(SyntaxInterBlock {
+                ref_frame: [1, ref1],
+                y_mode: if ref1 > 0 { MODE_NEW_NEWMV } else { MODE_NEWMV },
+                mv: [[8, 8], [0, 0]],
+                ref_mv_idx: 0,
+                interp_filter: [EIGHTTAP; 2],
+                skip_mode: 0,
+                compound_type: ct,
+                wedge_index: 0,
+                wedge_sign: 0,
+                mask_type: 0,
+                interintra_mode: Some(II_V_PRED),
+                wedge_interintra: wedge_ii,
+                interintra_wedge_index: wedge_idx,
+            });
+            let node = SyntaxNode::Leaf(Box::new(b));
+            let mut writer = SymbolWriter::new(false);
+            let mut cdfs = TileCdfContext::new_from_defaults();
+            let mut state = PartitionSyntaxWriter::new(16, 16, single_tile(16, 16)).unwrap();
+            write_partition_tree_syntax(
+                &mut writer,
+                &mut cdfs,
+                &mut state,
+                &node,
+                0,
+                0,
+                b_size,
+                &params,
+            )
+        };
+        use crate::inter_pred::{COMPOUND_AVERAGE, COMPOUND_INTRA, COMPOUND_WEDGE};
+        // Sequence gate closed.
+        assert!(build(false, -1, BLOCK_32X32, 0, 0, COMPOUND_INTRA).is_err());
+        // Compound pair: the reader's gate requires !isCompound.
+        assert!(build(true, 4, BLOCK_32X32, 0, 0, COMPOUND_INTRA).is_err());
+        // BLOCK_64X64 is past the §5.11.28 band.
+        assert!(build(true, -1, BLOCK_64X64, 0, 0, COMPOUND_INTRA).is_err());
+        // Stale wedge index on the non-wedge arm.
+        assert!(build(true, -1, BLOCK_32X32, 0, 3, COMPOUND_INTRA).is_err());
+        // compound_type must be the bit-silent derivation.
+        assert!(build(true, -1, BLOCK_32X32, 0, 0, COMPOUND_AVERAGE).is_err());
+        assert!(build(true, -1, BLOCK_32X32, 1, 3, COMPOUND_INTRA).is_err());
+        // Control: both derived shapes are fine.
+        assert!(build(true, -1, BLOCK_32X32, 0, 0, COMPOUND_INTRA).is_ok());
+        assert!(build(true, -1, BLOCK_32X32, 1, 3, COMPOUND_WEDGE).is_ok());
     }
 
     /// r412 — a committed filter pair inconsistent with the §5.11.x
@@ -6918,6 +7240,9 @@ mod tests {
             wedge_index: 0,
             wedge_sign: 0,
             mask_type: 0,
+            interintra_mode: 0,
+            wedge_interintra: 0,
+            interintra_wedge_index: 0,
         });
         let stack = scratch
             .find_mv_stack(

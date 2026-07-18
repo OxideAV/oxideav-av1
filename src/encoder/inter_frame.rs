@@ -1320,7 +1320,17 @@ impl PSearchCtx {
                 segment_id: block.segment_id,
                 is_inter: 1,
                 y_mode: ib.y_mode,
-                ref_frame: ib.ref_frame,
+                // r417 — the §5.11.28 imperative override the decode
+                // walker (and the write pass) stamp: `RefFrame[ 1 ] =
+                // INTRA_FRAME` on the `interintra == 1` arm.
+                ref_frame: if ib.interintra_mode.is_some() {
+                    [
+                        ib.ref_frame[0],
+                        crate::uncompressed_header_tail::INTRA_FRAME as i8,
+                    ]
+                } else {
+                    ib.ref_frame
+                },
                 mv: ib.mv[0],
                 mv2: ib.mv[1],
                 interp_filter: ib.interp_filter,
@@ -1351,7 +1361,12 @@ impl PSearchCtx {
                         && ib.skip_mode == 0
                         && ib.compound_type == crate::inter_pred::COMPOUND_DISTANCE),
                 ),
-                compound_type: if ib.ref_frame[1] > 0 && ib.skip_mode == 0 {
+                compound_type: if ib.interintra_mode.is_some()
+                    || (ib.ref_frame[1] > 0 && ib.skip_mode == 0)
+                {
+                    // r417 — inter-intra leaves carry the §5.11.29
+                    // bit-silent derivation in `ib.compound_type`
+                    // (the write pass validates the exact value).
                     ib.compound_type
                 } else {
                     crate::inter_pred::COMPOUND_AVERAGE
@@ -1359,6 +1374,13 @@ impl PSearchCtx {
                 wedge_index: ib.wedge_index,
                 wedge_sign: ib.wedge_sign,
                 mask_type: ib.mask_type,
+                // r417 — §5.11.28 side-data stamps (decode-walker
+                // grid-fill twins).
+                interintra_mode: ib.interintra_mode.unwrap_or(0),
+                wedge_interintra: u8::from(
+                    ib.interintra_mode.is_some() && ib.wedge_interintra == 1,
+                ),
+                interintra_wedge_index: ib.interintra_wedge_index,
             },
             None => EncoderBlockSyntaxStamp {
                 mi_row,
@@ -1389,6 +1411,9 @@ impl PSearchCtx {
                 wedge_index: 0,
                 wedge_sign: 0,
                 mask_type: 0,
+                interintra_mode: 0,
+                wedge_interintra: 0,
+                interintra_wedge_index: 0,
             },
         };
         self.mirror.stamp_encoder_block_syntax(&stamp);
@@ -1940,6 +1965,9 @@ fn encode_inter_leaf(
         wedge_index: 0,
         wedge_sign: 0,
         mask_type: 0,
+        interintra_mode: None,
+        wedge_interintra: 0,
+        interintra_wedge_index: 0,
     });
     let d_sm = region_distortion_wh(recon, input, mi_r, mi_c, bw4, bh4);
     let score_sm = d_sm + lambda * p_leaf_rate(&sm_leaf);
@@ -2831,6 +2859,9 @@ fn encode_inter_leaf_residual(
         wedge_index: comp.wedge_index,
         wedge_sign: comp.wedge_sign,
         mask_type: comp.mask_type,
+        interintra_mode: None,
+        wedge_interintra: 0,
+        interintra_wedge_index: 0,
     });
     Ok(block)
 }
